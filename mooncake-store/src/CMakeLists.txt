@@ -357,6 +357,10 @@ target_link_libraries(mooncake_client PRIVATE mooncake_store transfer_engine
 set_target_properties(mooncake_master mooncake_client
                       PROPERTIES POSITION_INDEPENDENT_CODE ON)
 
+if(STORE_USE_ETCD)
+  add_dependencies(mooncake_client build_etcd_wrapper)
+endif()
+
 # Optimize binary sizes only in Release mode
 string(TOUPPER "${CMAKE_BUILD_TYPE}" CMAKE_BUILD_TYPE_UPPER)
 if(CMAKE_BUILD_TYPE_UPPER STREQUAL "RELEASE")

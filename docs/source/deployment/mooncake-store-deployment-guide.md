@@ -147,6 +147,77 @@ mooncake_master \
 
 Each instance must specify its own reachable `--rpc_address`. The etcd cluster used for HA can be shared with or separate from the Transfer Engine's metadata etcd.
 
+**etcd TLS support:**
+
+When the HA etcd cluster requires TLS client authentication, provide certificate paths with the following flags:
+
+```bash
+mooncake_master \
+  --enable_ha=true \
+  --etcd_endpoints="https://10.0.0.1:2379;https://10.0.0.2:2379;https://10.0.0.3:2379" \
+  --etcd_ca_file=/etc/etcd/ca.pem \
+  --etcd_cert_file=/etc/etcd/client.pem \
+  --etcd_key_file=/etc/etcd/client-key.pem \
+  --rpc_address=10.0.0.1
+```
+
+- `--etcd_ca_file`: Path to the CA certificate file (required for verifying the etcd server).
+- `--etcd_cert_file`: Path to the client certificate file (required for mTLS).
+- `--etcd_key_file`: Path to the client private key file (required for mTLS).
+
+These flags may also be specified via the master's configuration file (see `etcd_ca_file` / `etcd_cert_file` / `etcd_key_file` keys). If none are provided, the connection falls back to plain-text (non-TLS), preserving backward compatibility. TLS configuration takes effect before the first etcd connection is established.
+
+**`mooncake_client` TLS support:**
+
+When running a `mooncake_client` in HA mode with TLS-protected etcd, supply the same certificate flags:
+
+```bash
+mooncake_client \
+  --global_segment_size="4GB" \
+  --master_server_address="etcd://10.0.0.1:2379;10.0.0.2:2379;10.0.0.3:2379" \
+  --metadata_server="etcd://10.0.0.1:2379;10.0.0.2:2379;10.0.0.3:2379" \
+  --port=50052 \
+  --etcd_ca_file=/etc/etcd/ca.pem \
+  --etcd_cert_file=/etc/etcd/client.pem \
+  --etcd_key_file=/etc/etcd/client-key.pem
+```
+
+> **Important:** The `--etcd_ca_file`, `--etcd_cert_file`, and `--etcd_key_file` flags are **only available when mooncake is built with `STORE_USE_ETCD=ON`**. The TLS configuration is applied to **both** the HA backend (leader election) and the Transfer Engine's metadata etcd connection. It must be provided **before** any etcd connection is made; `ParseCommandLineFlags` handles this automatically by calling the TLS init functions at the top of `main()`.
+
+**Python / C API TLS support:**
+
+The Python `MooncakeDistributedStore` and the C API (`mooncake_store_*`) also support etcd TLS. Configure it **before** calling `setup()`:
+
+```python
+from mooncake.store import MooncakeDistributedStore
+
+store = MooncakeDistributedStore()
+store.set_etcd_tls_config(
+    ca_file="/etc/etcd/ca.pem",
+    cert_file="/etc/etcd/client.pem",
+    key_file="/etc/etcd/client-key.pem"
+)
+store.setup(
+    local_hostname="node1",
+    metadata_server="etcd://10.0.0.1:2379;10.0.0.2:2379;10.0.0.3:2379",
+    global_segment_size=1073741824,
+    local_buffer_size=1073741824,
+    protocol="tcp",
+    rdma_devices="",
+    master_server_addr="etcd://10.0.0.1:2379;10.0.0.2:2379;10.0.0.3:2379"
+)
+```
+
+Alternatively, set environment variables to avoid code changes:
+```bash
+export MC_ETCD_CA_FILE=/etc/etcd/ca.pem
+export MC_ETCD_CERT_FILE=/etc/etcd/client.pem
+export MC_ETCD_KEY_FILE=/etc/etcd/client-key.pem
+python my_client_script.py
+```
+
+The `set_etcd_tls_config()` call is optional — if you skip it, the code falls back to the `MC_ETCD_CA_FILE`, `MC_ETCD_CERT_FILE`, and `MC_ETCD_KEY_FILE` environment variables, preserving backward compatibility.
+
 **Client addressing:** to reach an HA cluster, clients must use the `etcd://` master-address form (so they can discover the current leader) instead of a single `IP:Port` — set `master_server_addr` (Method A) / `MOONCAKE_MASTER` (Method B) / `--master_server_address` (Method C) to `etcd://10.0.0.1:2379;10.0.0.2:2379;...`.
 
 ---
@@ -497,6 +568,9 @@ mooncake_master \
 | `--ha_backend_type` | `etcd` | HA backend: `etcd`, `redis`, or `k8s` |
 | `--ha_backend_connstring` | empty | HA backend connection string |
 | `--etcd_endpoints` | empty | etcd endpoints, semicolon separated (when `--ha_backend_type=etcd`) |
+| `--etcd_ca_file` | empty | Path to CA certificate file for etcd TLS connections |
+| `--etcd_cert_file` | empty | Path to client certificate file for etcd TLS connections |
+| `--etcd_key_file` | empty | Path to client key file for etcd TLS connections |
 | `--cluster_id` | `mooncake_cluster` | Cluster ID for HA persistence |
 
 ```{caution}
@@ -654,6 +728,24 @@ Arguments of `MooncakeDistributedStore.setup(...)`:
 | `enable_client_http_server` | bool | `false` | Enable the client-side HTTP `/health`, `/metrics`, and `/metrics/summary` endpoints |
 | `client_http_port` | int | `9300` | Client-side HTTP endpoint port, used only when `enable_client_http_server=true` |
 
+**etcd TLS configuration (Method A):**
+
+Call `set_etcd_tls_config(ca_file, cert_file, key_file)` **before** `setup()`:
+
+```python
+store = MooncakeDistributedStore()
+store.set_etcd_tls_config(
+    ca_file="/etc/etcd/ca.pem",
+    cert_file="/etc/etcd/client.pem",
+    key_file="/etc/etcd/client-key.pem"
+)
+store.setup(...)
+```
+
+| Method | Arguments | Default | Description |
+|--------|-----------|---------|-------------|
+| `set_etcd_tls_config(ca_file, cert_file, key_file)` | 3 strings | empty | Configure etcd TLS certificates. All three default to `""`. If all are empty, environment variables `MC_ETCD_CA_FILE`, `MC_ETCD_CERT_FILE`, `MC_ETCD_KEY_FILE` are used as fallback. Must be called **before** `setup()`. |
+
 ```{note}
 The first seven arguments have **no Python default** — the C++ defaults are not exposed by the pybind binding, so they must all be supplied (a bare `setup(local_hostname, metadata_server)` raises `TypeError`). The later arguments (`engine`, SSD offload fields, `tenant_id`, and client HTTP endpoint fields) are optional. Also, in Method A the `MOONCAKE_*` variables used by `MooncakeConfig` are ignored; low-level runtime variables such as the `MC_*` engine variables below are still read by the C++ client.
 ```
@@ -685,6 +777,9 @@ The store service CLI only accepts `--config`, `-D/--define`, `--port`, and `--m
 | `MOONCAKE_ENABLE_CLIENT_HTTP_SERVER` | `enable_client_http_server` | `false` | Enable client-side `/health`, `/metrics`, and `/metrics/summary` endpoints |
 | `MOONCAKE_CLIENT_HTTP_PORT` | `client_http_port` | `9300` | Client-side HTTP endpoint port |
 | `MOONCAKE_CONFIG_PATH` | — | unset | Path to a JSON config file (takes precedence over the variables above) |
+| `MC_ETCD_CA_FILE` | `etcd_ca_file` | empty | etcd CA certificate path (TLS). Also read directly by the engine at setup time — the recommended way to configure TLS when env vars are accessible |
+| `MC_ETCD_CERT_FILE` | `etcd_cert_file` | empty | etcd client certificate path (TLS) |
+| `MC_ETCD_KEY_FILE` | `etcd_key_file` | empty | etcd client key path (TLS) |
 
 ```{note}
 `MooncakeConfig` (Method B) defaults `global_segment_size`/`local_buffer_size` to 3.125 GiB / 1 GiB. A direct `setup()` (Method A) has **no** default for these — they are required arguments. Unlike `MC_STORE_LOCAL_HOT_CACHE_SIZE` (raw bytes only), `MOONCAKE_GLOBAL_SEGMENT_SIZE` / `MOONCAKE_LOCAL_BUFFER_SIZE` accept human-readable suffixes (`kb`/`mb`/`gb`/…) because they are parsed by `MooncakeConfig`.
@@ -701,6 +796,14 @@ python -m mooncake.mooncake_store_service
 # HTTP metadata server
 MOONCAKE_MASTER=127.0.0.1:50051 \
 MOONCAKE_TE_META_DATA_SERVER=http://127.0.0.1:8080/metadata \
+python -m mooncake.mooncake_store_service
+
+# HA mode with etcd TLS
+MOONCAKE_MASTER=192.168.1.1:50051 \
+MOONCAKE_TE_META_DATA_SERVER=etcd://192.168.1.1:2379 \
+MC_ETCD_CA_FILE=/etc/etcd/ca.pem \
+MC_ETCD_CERT_FILE=/etc/etcd/client.pem \
+MC_ETCD_KEY_FILE=/etc/etcd/client-key.pem \
 python -m mooncake.mooncake_store_service
 ```
 
@@ -750,6 +853,9 @@ mooncake_client \
 | `--threads` | `1` | Client worker thread count |
 | `--tenant_id` | `default` | Tenant identifier |
 | `--enable_offload` | `false` | Enable client-side SSD offload |
+| `--etcd_ca_file` | empty | CA certificate file path for etcd TLS (HA mode) |
+| `--etcd_cert_file` | empty | Client certificate file path for etcd TLS (HA mode) |
+| `--etcd_key_file` | empty | Client key file path for etcd TLS (HA mode) |
 | `--start_offload_rpc_server` | `true` | Start the offload RPC server for dummy clients |
 | `--enable_http_server` | `false` | Enable client-side `/health`, `/metrics`, and `/metrics/summary` endpoints |
 | `--http_port` | `9300` | Client-side HTTP endpoint port |
