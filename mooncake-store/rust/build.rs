@@ -13,9 +13,9 @@
 // limitations under the License.
 
 // Everything below is used only by the `link` build path (see the two cfg'd
-// main()s). A `dlopen` build uses the no-op main and compiles none of it — and
-// bindgen is not a dependency there — so silence dead-code/unused-import warnings.
-#![allow(dead_code, unused_imports)]
+// main()s). Scope the allowances to non-`link` builds, where the helpers/imports
+// are unused, so the `link` build keeps normal warning hygiene.
+#![cfg_attr(not(feature = "link"), allow(dead_code, unused_imports))]
 
 use std::env;
 use std::fs;

@@ -81,7 +81,10 @@ pub fn load_library(path: impl AsRef<Path>) -> Result<(), StoreError> {
         return Err(StoreError::LibraryAlreadyLoaded);
     }
     let lib = load(path.as_ref().as_os_str())?;
-    let _ = API.set(lib); // holding INIT_LOCK, so this always succeeds
+    // Cannot fail: set under INIT_LOCK after the is_some() check above.
+    if API.set(lib).is_err() {
+        unreachable!("Mooncake API set while holding INIT_LOCK");
+    }
     Ok(())
 }
 
@@ -99,7 +102,10 @@ pub fn ensure_loaded() -> Result<(), StoreError> {
         return Ok(());
     }
     let lib = load(&library_path())?;
-    let _ = API.set(lib); // holding INIT_LOCK, so this always succeeds
+    // Cannot fail: set under INIT_LOCK after the is_some() check above.
+    if API.set(lib).is_err() {
+        unreachable!("Mooncake API set while holding INIT_LOCK");
+    }
     Ok(())
 }
 
