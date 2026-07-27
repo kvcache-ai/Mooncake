@@ -505,6 +505,55 @@ def test_structured_object_expands_group_id_for_chunk_batch_put() -> None:
     assert manifest_group_ids == ["rollout-group"]
 
 
+def test_structured_object_normalizes_string_group_id() -> None:
+    store, transfer = make_transfer()
+    config = GroupConfig("rollout-group")
+
+    ref = transfer.put_structured_object(
+        structured_payload({"kind": "grouped"}, value=b"payload"),
+        config=config,
+    )
+    result = transfer.materialize(transfer.read_spec(ref))
+
+    assert result.objects["value"] == b"payload"
+    assert _seen_group_ids(store.put_configs)[-1] == ["rollout-group"]
+    assert config.group_ids == "rollout-group"
+
+
+def test_structured_object_rejects_empty_group_ids() -> None:
+    _store, transfer = make_transfer()
+
+    with pytest.raises(ValueError, match="must not be empty"):
+        transfer.put_structured_object(
+            structured_payload({"kind": "bad"}, value=b"payload"),
+            config=GroupConfig([]),
+        )
+
+
+def test_structured_object_parallel_put_preserves_group_id() -> None:
+    store, transfer = make_transfer()
+    config = GroupConfig(["rollout-group"])
+    payload = structured_payload(
+        {"kind": "parallel"},
+        large=np.arange(128, dtype=np.uint8),
+    )
+
+    ref = transfer.put_structured_object(
+        payload,
+        chunk_bytes=8,
+        policy=BundleTransferPolicy(max_inflight_put=4, put_mode="parallel"),
+        config=config,
+    )
+    result = transfer.materialize(transfer.read_spec(ref))
+
+    assert np.array_equal(result.objects["large"], payload.buffers["large"])
+    assert store.max_active_puts > 1
+    batch_group_ids = _seen_group_ids(store.batch_put_from_configs)
+    assert batch_group_ids
+    assert all(set(group_ids) == {"rollout-group"} for group_ids in batch_group_ids)
+    assert config.group_ids == ["rollout-group"]
+
+
 def test_structured_object_multi_buffer_put_preserves_group_id() -> None:
     pool = FakeBufferPool()
     store, transfer = make_transfer(buffer_pool=pool)
