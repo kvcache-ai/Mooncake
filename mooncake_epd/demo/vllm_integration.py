@@ -243,6 +243,8 @@ class VLLMDisaggConfig:
     # explicitly and report that durability boundary in its artifact.
     enable_workflow_registry_wal: bool = True
     workflow_registry_wal_path: Optional[str] = None
+    workflow_registry_wal_fsync_interval_s: float = 0.25
+    workflow_registry_wal_max_pending_records: int = 64
     connector_metrics_dir: Optional[str] = None
     # Keep compiler artifacts off the usually space-constrained system volume.
     # This is not a serving cache: it only avoids failed/repeated compilation
@@ -251,6 +253,7 @@ class VLLMDisaggConfig:
     # Group-level connector accounting is written periodically and at terminal
     # boundaries; eager JSON snapshots are too expensive on the TCP P→D path.
     connector_metrics_flush_interval_ms: float = 250.0
+    connector_metrics_max_pending_records: int = 64
     mm_prefetch_mode: str = "asset_bytes"
     prefill_supports_feature_handles: bool = False
     encoder_service_url: Optional[str] = None
@@ -312,6 +315,9 @@ class VLLMDisaggConfig:
     # transport error after a non-idempotent Prefill POST cannot be retried
     # safely because the worker may have already produced a P->D KV handoff.
     prefill_http_keepalive: bool = False
+    upstream_max_connections: int = 64
+    upstream_max_keepalive_connections: int = 16
+    upstream_keepalive_expiry_s: float = 1.0
     allow_unverified_openai_prompt_only: bool = False
     feature_handle_store_url: Optional[str] = None
     feature_handle_store_id: Optional[str] = None
@@ -364,6 +370,10 @@ class VLLMDisaggConfig:
             extra_config["connector_metrics_flush_interval_ms"] = max(
                 0.0,
                 float(self.connector_metrics_flush_interval_ms),
+            )
+            extra_config["connector_metrics_max_pending_records"] = max(
+                1,
+                int(self.connector_metrics_max_pending_records),
             )
         return {
             "kv_connector": "MooncakeConnector",
@@ -866,6 +876,10 @@ def generate_configs(output_dir: str, config: Optional[VLLMDisaggConfig] = None)
         + f"--connector-metrics-dir {config.connector_metrics_dir} "
         + (
             f"--workflow-registry-wal {shlex.quote(str(config.workflow_registry_wal_path))} "
+            "--workflow-registry-wal-fsync-interval-s "
+            f"{max(0.0, float(config.workflow_registry_wal_fsync_interval_s))} "
+            "--workflow-registry-wal-max-pending "
+            f"{max(1, int(config.workflow_registry_wal_max_pending_records))} "
             if config.workflow_registry_wal_path
             else ""
         )
@@ -930,6 +944,15 @@ def generate_configs(output_dir: str, config: Optional[VLLMDisaggConfig] = None)
             "--prefill-http-keepalive "
             if config.prefill_http_keepalive
             else "--no-prefill-http-keepalive "
+        )
+        + f"--upstream-max-connections {max(1, int(config.upstream_max_connections))} "
+        + (
+            "--upstream-max-keepalive-connections "
+            f"{max(0, min(int(config.upstream_max_connections), int(config.upstream_max_keepalive_connections)))} "
+        )
+        + (
+            "--upstream-keepalive-expiry-s "
+            f"{max(0.0, float(config.upstream_keepalive_expiry_s))} "
         )
         + (
             "--allow-unverified-openai-prompt-only "

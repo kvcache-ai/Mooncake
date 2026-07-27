@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import sys
 from collections import OrderedDict
 from copy import deepcopy
 
@@ -16,8 +15,10 @@ from mooncake_epd.core.control.vllm_transfer_primitives import LayeredTransferWo
 from mooncake_epd.core.state import WorkflowStateRegistry
 from mooncake_epd.scripts.vllm_disagg_proxy import (
     ProxyConfig,
+    _copy_request_for_mm_url_rewrite,
     _make_client,
     _prune_proxy_direct_feature_handle_cache,
+    _set_image_url_on_item,
     _store_proxy_direct_feature_handles,
     _upstream_exception_summary,
     create_app,
@@ -355,20 +356,63 @@ def test_prefill_http_client_disables_idle_connection_reuse_by_default():
         )
         assert (
             decode_client._transport._pool._max_keepalive_connections  # noqa: SLF001
-            == sys.maxsize
+            == 16
         )
+        assert decode_client._transport._pool._max_connections == 64  # noqa: SLF001
+        assert decode_client._transport._pool._keepalive_expiry == 1.0  # noqa: SLF001
 
 
 def test_prefill_http_client_can_explicitly_reuse_idle_connections():
-    client = _make_client("http://prefill.local", keepalive=True)
+    client = _make_client(
+        "http://prefill.local",
+        keepalive=True,
+        max_connections=12,
+        max_keepalive_connections=5,
+        keepalive_expiry_s=0.75,
+    )
     try:
-        assert client._transport._pool._max_keepalive_connections == sys.maxsize  # noqa: SLF001
+        assert client._transport._pool._max_connections == 12  # noqa: SLF001
+        assert client._transport._pool._max_keepalive_connections == 5  # noqa: SLF001
+        assert client._transport._pool._keepalive_expiry == 0.75  # noqa: SLF001
     finally:
         # The client has no open sockets, but close it to preserve async-client
         # lifecycle discipline without depending on a test server.
         import asyncio
 
         asyncio.run(client.aclose())
+
+
+def test_structural_multimodal_copy_preserves_payload_and_input_immutability():
+    large_data_url = "data:image/png;base64," + ("A" * (1024 * 1024))
+    original = {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": large_data_url, "detail": "high"},
+                    },
+                    {"type": "text", "text": "describe"},
+                ],
+            }
+        ],
+        "metadata": {"workflow_id": "wf-copy"},
+    }
+
+    rewritten = _copy_request_for_mm_url_rewrite(original)
+    rewritten_item = rewritten["messages"][0]["content"][0]
+    original_item = original["messages"][0]["content"][0]
+
+    assert rewritten is not original
+    assert rewritten["metadata"] is original["metadata"]
+    assert rewritten_item is not original_item
+    assert rewritten_item["image_url"] is not original_item["image_url"]
+    assert rewritten_item["image_url"]["url"] is large_data_url
+
+    _set_image_url_on_item(rewritten_item, "data:image/png;base64,rewritten")
+    assert rewritten_item["image_url"]["url"].endswith("rewritten")
+    assert original_item["image_url"]["url"] is large_data_url
 
 
 

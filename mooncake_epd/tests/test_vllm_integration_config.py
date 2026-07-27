@@ -346,6 +346,30 @@ def test_generate_configs_can_enable_prefill_http_keepalive(tmp_path):
     assert "--no-prefill-http-keepalive" not in proxy_script
 
 
+def test_generate_configs_emits_bounded_http_and_batched_io_profiles(tmp_path):
+    config = VLLMDisaggConfig(
+        local_hostname="127.0.0.1",
+        upstream_max_connections=12,
+        upstream_max_keepalive_connections=5,
+        upstream_keepalive_expiry_s=0.75,
+        connector_metrics_flush_interval_ms=500.0,
+        connector_metrics_max_pending_records=96,
+        workflow_registry_wal_fsync_interval_s=0.5,
+        workflow_registry_wal_max_pending_records=48,
+    )
+    generate_configs(str(tmp_path), config)
+    prefill_script = (tmp_path / "start_prefill.sh").read_text(encoding="utf-8")
+    proxy_script = (tmp_path / "start_proxy.sh").read_text(encoding="utf-8")
+
+    assert '"connector_metrics_flush_interval_ms":500.0' in prefill_script
+    assert '"connector_metrics_max_pending_records":96' in prefill_script
+    assert "--workflow-registry-wal-fsync-interval-s 0.5" in proxy_script
+    assert "--workflow-registry-wal-max-pending 48" in proxy_script
+    assert "--upstream-max-connections 12" in proxy_script
+    assert "--upstream-max-keepalive-connections 5" in proxy_script
+    assert "--upstream-keepalive-expiry-s 0.75" in proxy_script
+
+
 def test_generate_configs_exposes_bounded_direct_release_batching(tmp_path):
     config = VLLMDisaggConfig(
         local_hostname="127.0.0.1",

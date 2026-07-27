@@ -18,6 +18,7 @@ from mooncake_epd.core.state import (
     RadixTree,
     StateLayer,
     StateMeta,
+    WorkflowStateRecord,
     WorkflowStateRegistry,
 )
 
@@ -1125,3 +1126,60 @@ def test_serving_snapshot_exposes_decode_engine_timing(tmp_path):
     assert metrics["decode_engine_kv_first_token_latency_ms_avg"] == 60.0
     assert metrics["decode_engine_kv_first_token_output_tokens"] == 3
     assert metrics["decode_engine_scheduler_update_calls"] == 12
+
+
+def test_serving_control_plane_closes_only_owned_workflow_registry(tmp_path):
+    external = WorkflowStateRegistry(
+        str(tmp_path / "external.jsonl"),
+        wal_fsync_interval_s=60.0,
+        wal_max_pending_records=64,
+    )
+    cp = ServingControlPlane(
+        ServingControlPlaneConfig(node_id="proxy-external-registry"),
+        workflow_registry=external,
+    )
+
+    cp.close()
+    external.upsert_record(
+        WorkflowStateRecord(
+            state_id="state-external",
+            workflow_id="workflow-external",
+            version_id="version-external",
+            parent_version_id=None,
+            snapshot_epoch=0,
+            step_index=0,
+            agent_id="agent-external",
+            status="ACTIVE",
+        )
+    )
+    assert external.wal_stats()["pending_records"] == 1
+    external.close()
+
+
+def test_serving_control_plane_flushes_owned_workflow_registry(tmp_path):
+    cp = ServingControlPlane(
+        ServingControlPlaneConfig(
+            node_id="proxy-owned-registry",
+            workflow_registry_wal_path=str(tmp_path / "owned.jsonl"),
+            workflow_registry_wal_fsync_interval_s=60.0,
+            workflow_registry_wal_max_pending_records=64,
+        )
+    )
+    assert cp.workflow_registry is not None
+    cp.workflow_registry.upsert_record(
+        WorkflowStateRecord(
+            state_id="state-owned",
+            workflow_id="workflow-owned",
+            version_id="version-owned",
+            parent_version_id=None,
+            snapshot_epoch=0,
+            step_index=0,
+            agent_id="agent-owned",
+            status="ACTIVE",
+        )
+    )
+    assert cp.snapshot()["workflow_registry"]["wal_io"]["pending_records"] == 1
+
+    cp.close()
+
+    assert cp.workflow_registry.wal_stats()["pending_records"] == 0

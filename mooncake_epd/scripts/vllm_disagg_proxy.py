@@ -209,6 +209,8 @@ class ProxyConfig:
     kv_directory_rpc_url: Optional[str] = None
     connector_metrics_dir: Optional[str] = None
     workflow_registry_wal_path: Optional[str] = None
+    workflow_registry_wal_fsync_interval_s: float = 0.25
+    workflow_registry_wal_max_pending_records: int = 64
     enable_mm_prefetch: bool = True
     mm_prefetch_mode: str = "asset_bytes"
     prefill_supports_feature_handles: bool = False
@@ -276,6 +278,9 @@ class ProxyConfig:
     # Keep Prefill idle-connection reuse disabled by default; deployments that
     # have validated their upstream keep-alive behavior may opt in explicitly.
     prefill_http_keepalive: bool = False
+    upstream_max_connections: int = 64
+    upstream_max_keepalive_connections: int = 16
+    upstream_keepalive_expiry_s: float = 1.0
     # ``openai_prompt_only`` has a lower control-plane cost, but has not shown
     # output equivalence for every real vLLM P-D continuation configuration.
     # Strict serving therefore requires an explicit compatibility override.
@@ -380,6 +385,16 @@ def parse_args() -> ProxyConfig:
     parser.add_argument("--kv-directory-rpc-url", type=str, default=None)
     parser.add_argument("--connector-metrics-dir", type=str, default=None)
     parser.add_argument("--workflow-registry-wal", type=str, default=None)
+    parser.add_argument(
+        "--workflow-registry-wal-fsync-interval-s",
+        type=float,
+        default=0.25,
+    )
+    parser.add_argument(
+        "--workflow-registry-wal-max-pending",
+        type=int,
+        default=64,
+    )
     parser.add_argument("--enable-mm-prefetch", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--mm-prefetch-mode", choices=["asset_bytes", "feature_handle"], default="asset_bytes")
     parser.add_argument("--prefill-supports-feature-handles", action=argparse.BooleanOptionalAction, default=False)
@@ -518,6 +533,17 @@ def parse_args() -> ProxyConfig:
             "unsafe to retry."
         ),
     )
+    parser.add_argument("--upstream-max-connections", type=int, default=64)
+    parser.add_argument(
+        "--upstream-max-keepalive-connections",
+        type=int,
+        default=16,
+    )
+    parser.add_argument(
+        "--upstream-keepalive-expiry-s",
+        type=float,
+        default=1.0,
+    )
     parser.add_argument(
         "--allow-unverified-openai-prompt-only",
         action=argparse.BooleanOptionalAction,
@@ -567,6 +593,23 @@ def parse_args() -> ProxyConfig:
         raise ValueError("Number of prefiller hosts must match number of prefiller ports")
     if len(args.decoder_hosts) != len(args.decoder_ports):
         raise ValueError("Number of decoder hosts must match number of decoder ports")
+    if args.workflow_registry_wal_fsync_interval_s < 0:
+        raise ValueError("workflow registry WAL fsync interval must be non-negative")
+    if args.workflow_registry_wal_max_pending < 1:
+        raise ValueError("workflow registry WAL max pending records must be positive")
+    if args.upstream_max_connections < 1:
+        raise ValueError("upstream max connections must be positive")
+    if not (
+        0
+        <= args.upstream_max_keepalive_connections
+        <= args.upstream_max_connections
+    ):
+        raise ValueError(
+            "upstream max keepalive connections must be between zero and max "
+            "connections"
+        )
+    if args.upstream_keepalive_expiry_s < 0:
+        raise ValueError("upstream keepalive expiry must be non-negative")
 
     return ProxyConfig(
         host=args.host,
@@ -586,6 +629,12 @@ def parse_args() -> ProxyConfig:
         kv_directory_rpc_url=args.kv_directory_rpc_url,
         connector_metrics_dir=args.connector_metrics_dir,
         workflow_registry_wal_path=args.workflow_registry_wal,
+        workflow_registry_wal_fsync_interval_s=(
+            args.workflow_registry_wal_fsync_interval_s
+        ),
+        workflow_registry_wal_max_pending_records=(
+            args.workflow_registry_wal_max_pending
+        ),
         enable_mm_prefetch=bool(args.enable_mm_prefetch),
         mm_prefetch_mode=str(args.mm_prefetch_mode),
         prefill_supports_feature_handles=bool(args.prefill_supports_feature_handles),
@@ -630,6 +679,11 @@ def parse_args() -> ProxyConfig:
         decode_dispatch_mode=str(args.decode_dispatch_mode),
         allow_decode_token_fallback=bool(args.allow_decode_token_fallback),
         prefill_http_keepalive=bool(args.prefill_http_keepalive),
+        upstream_max_connections=int(args.upstream_max_connections),
+        upstream_max_keepalive_connections=int(
+            args.upstream_max_keepalive_connections
+        ),
+        upstream_keepalive_expiry_s=float(args.upstream_keepalive_expiry_s),
         allow_unverified_openai_prompt_only=bool(args.allow_unverified_openai_prompt_only),
         strict_no_fallback=bool(args.strict_no_fallback),
         enable_agent_state_clone=bool(args.enable_agent_state_clone),
@@ -651,6 +705,9 @@ def _make_client(
     base_url: str,
     *,
     keepalive: bool = True,
+    max_connections: int = 64,
+    max_keepalive_connections: int = 16,
+    keepalive_expiry_s: float = 1.0,
 ) -> httpx.AsyncClient:
     """Build a stage client with an explicit idle-connection policy.
 
@@ -661,12 +718,27 @@ def _make_client(
     does not create the one-shot P->D handoff at this boundary.
     """
 
+    max_connections = int(max_connections)
+    max_keepalive_connections = int(max_keepalive_connections)
+    keepalive_expiry_s = float(keepalive_expiry_s)
+    if max_connections < 1:
+        raise ValueError("max_connections must be positive")
+    if not 0 <= max_keepalive_connections <= max_connections:
+        raise ValueError(
+            "max_keepalive_connections must be between zero and max_connections"
+        )
+    if keepalive_expiry_s < 0:
+        raise ValueError("keepalive_expiry_s must be non-negative")
+
     return httpx.AsyncClient(
         timeout=None,
         base_url=base_url,
         limits=httpx.Limits(
-            max_connections=None,
-            max_keepalive_connections=None if keepalive else 0,
+            max_connections=max_connections,
+            max_keepalive_connections=(
+                max_keepalive_connections if keepalive else 0
+            ),
+            keepalive_expiry=keepalive_expiry_s,
         ),
         trust_env=False,
     )
@@ -944,6 +1016,11 @@ async def _lifespan(app: FastAPI):
                 "client": _make_client(
                     f"http://{host}:{port}",
                     keepalive=bool(config.prefill_http_keepalive),
+                    max_connections=config.upstream_max_connections,
+                    max_keepalive_connections=(
+                        config.upstream_max_keepalive_connections
+                    ),
+                    keepalive_expiry_s=config.upstream_keepalive_expiry_s,
                 ),
                 "host": host,
                 "port": port,
@@ -958,7 +1035,14 @@ async def _lifespan(app: FastAPI):
     if decode_overrides is None:
         app.state.decode_clients = [
             {
-                "client": _make_client(f"http://{host}:{port}"),
+                "client": _make_client(
+                    f"http://{host}:{port}",
+                    max_connections=config.upstream_max_connections,
+                    max_keepalive_connections=(
+                        config.upstream_max_keepalive_connections
+                    ),
+                    keepalive_expiry_s=config.upstream_keepalive_expiry_s,
+                ),
                 "host": host,
                 "port": port,
                 "id": idx,
@@ -1073,6 +1157,8 @@ async def _lifespan(app: FastAPI):
             client = client_info.get("client")
             if client is not None:
                 await client.aclose()
+        if bool(getattr(app.state, "owns_control_plane", False)):
+            control_plane.close()
 
 
 def create_app(
@@ -1083,6 +1169,7 @@ def create_app(
     control_plane: Optional[ServingControlPlane] = None,
 ) -> FastAPI:
     config = config or ProxyConfig()
+    owns_control_plane = control_plane is None
     cp = control_plane or ServingControlPlane(
         ServingControlPlaneConfig(
             node_id=config.node_id,
@@ -1098,6 +1185,12 @@ def create_app(
             kv_directory_rpc_url=config.kv_directory_rpc_url,
             connector_metrics_dir=config.connector_metrics_dir,
             workflow_registry_wal_path=config.workflow_registry_wal_path,
+            workflow_registry_wal_fsync_interval_s=(
+                config.workflow_registry_wal_fsync_interval_s
+            ),
+            workflow_registry_wal_max_pending_records=(
+                config.workflow_registry_wal_max_pending_records
+            ),
             enable_mm_prefetch=config.enable_mm_prefetch,
             strict_no_fallback=config.strict_no_fallback,
             enable_agent_state_clone=config.enable_agent_state_clone,
@@ -1115,6 +1208,7 @@ def create_app(
     app = FastAPI(lifespan=_lifespan)
     app.state.proxy_config = config
     app.state.control_plane = cp
+    app.state.owns_control_plane = owns_control_plane
     app.state.prefill_client_overrides = list(prefill_clients) if prefill_clients is not None else None
     app.state.decode_client_overrides = list(decode_clients) if decode_clients is not None else None
     app.state.direct_feature_handle_cache = OrderedDict()
@@ -1220,6 +1314,14 @@ def create_app(
     @app.get("/metrics")
     async def metrics() -> Dict[str, Any]:
         payload = cp.snapshot()
+        payload["proxy_upstream_http_pool"] = {
+            "max_connections": int(config.upstream_max_connections),
+            "max_keepalive_connections": int(
+                config.upstream_max_keepalive_connections
+            ),
+            "keepalive_expiry_s": float(config.upstream_keepalive_expiry_s),
+            "prefill_keepalive": bool(config.prefill_http_keepalive),
+        }
         mm_store = getattr(app.state, "mm_store", None)
         if mm_store is not None:
             payload["mm_store"] = mm_store.stats()
@@ -4395,6 +4497,57 @@ async def _shutdown_direct_feature_release_dispatcher(app: FastAPI) -> None:
     workers.clear()
 
 
+def _copy_request_for_mm_url_rewrite(req_data: Dict[str, Any]) -> Dict[str, Any]:
+    """Copy only containers that multimodal URL rewriting mutates.
+
+    OpenAI-compatible multimodal requests can contain multi-megabyte data URL
+    strings. A full ``deepcopy`` walks the entire request and duplicates
+    container work even though those immutable strings can be shared safely.
+    """
+
+    rewritten = dict(req_data)
+
+    messages = req_data.get("messages")
+    if isinstance(messages, list):
+        copied_messages: List[Any] = []
+        for message in messages:
+            if not isinstance(message, dict):
+                copied_messages.append(message)
+                continue
+            copied_message = dict(message)
+            content = message.get("content")
+            if isinstance(content, list):
+                copied_content: List[Any] = []
+                for item in content:
+                    if not isinstance(item, dict):
+                        copied_content.append(item)
+                        continue
+                    copied_item = dict(item)
+                    image_url = item.get("image_url")
+                    if isinstance(image_url, dict):
+                        copied_item["image_url"] = dict(image_url)
+                    copied_content.append(copied_item)
+                copied_message["content"] = copied_content
+            copied_messages.append(copied_message)
+        rewritten["messages"] = copied_messages
+
+    prompt = req_data.get("prompt")
+    if isinstance(prompt, list):
+        copied_prompt: List[Any] = []
+        for item in prompt:
+            if not isinstance(item, dict):
+                copied_prompt.append(item)
+                continue
+            copied_item = dict(item)
+            image_url = item.get("image_url")
+            if isinstance(image_url, dict):
+                copied_item["image_url"] = dict(image_url)
+            copied_prompt.append(copied_item)
+        rewritten["prompt"] = copied_prompt
+
+    return rewritten
+
+
 async def _prefetch_and_rewrite_multimodal_assets(
     *,
     app: FastAPI,
@@ -4414,10 +4567,9 @@ async def _prefetch_and_rewrite_multimodal_assets(
     if not config.enable_mm_prefetch or mm_store is None or not getattr(ctx, "mm_hashes", None):
         return req_data
 
-    # Request bodies are already JSON-compatible dict/list trees. Avoid a JSON
-    # serialize/parse round trip on the E->P hot path while keeping the caller's
-    # payload immutable for the later Decode leg.
-    rewritten = deepcopy(req_data)
+    # Preserve the original request for the later Decode leg without walking
+    # immutable multi-megabyte media strings.
+    rewritten = _copy_request_for_mm_url_rewrite(req_data)
     items = list(_iter_mutable_mm_url_items(rewritten))
     if not items:
         return req_data

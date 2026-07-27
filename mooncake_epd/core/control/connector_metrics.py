@@ -64,6 +64,7 @@ class ConnectorMetricsSink:
         tp_rank: int | None = None,
         pid: int | None = None,
         flush_interval_s: float = 0.0,
+        max_pending_records: int = 0,
     ):
         self._lock = threading.RLock()
         self._totals = LayeredTransferWorkerMeta()
@@ -71,8 +72,17 @@ class ConnectorMetricsSink:
         # Keep standalone diagnostics eager by default. vLLM workers pass a
         # short interval so group-level transfer accounting stays in memory.
         self._flush_interval_s = max(0.0, float(flush_interval_s))
-        self._last_flush_monotonic = 0.0
+        self._max_pending_records = max(0, int(max_pending_records))
+        self._pending_records = 0
+        self._last_flush_monotonic = (
+            time.monotonic() if self._max_pending_records > 0 else 0.0
+        )
         self._dirty = False
+        self._io_stats = {
+            "records": 0,
+            "deferred_records": 0,
+            "flushes": 0,
+        }
         self._enabled = bool(metrics_dir)
         self._dir = Path(metrics_dir).expanduser() if metrics_dir else None
         self._path: Optional[Path] = None
@@ -107,6 +117,14 @@ class ConnectorMetricsSink:
     def path(self) -> Optional[Path]:
         return self._path
 
+    @property
+    def io_stats(self) -> Dict[str, int]:
+        with self._lock:
+            return {
+                str(key): int(value)
+                for key, value in self._io_stats.items()
+            }
+
     def record(
         self,
         meta: LayeredTransferWorkerMeta | None,
@@ -131,8 +149,21 @@ class ConnectorMetricsSink:
                 existing = self._path_totals.get(bucket, LayeredTransferWorkerMeta())
                 self._path_totals[bucket] = existing.aggregate(delta)
             self._dirty = True
-            if force or self._flush_due_locked():
+            self._pending_records += 1
+            self._io_stats["records"] += 1
+            should_flush = (
+                force
+                or self._flush_interval_s <= 0.0
+                or (
+                    self._max_pending_records > 0
+                    and self._pending_records >= self._max_pending_records
+                )
+                or self._flush_due_locked()
+            )
+            if should_flush:
                 self._flush_locked()
+            else:
+                self._io_stats["deferred_records"] += 1
 
     def flush(self, *, force: bool = True) -> bool:
         """Persist accumulated counters at an explicit terminal boundary.
@@ -151,6 +182,9 @@ class ConnectorMetricsSink:
                 return False
             self._flush_locked()
             return True
+
+    def close(self) -> None:
+        self.flush(force=True)
 
     def snapshot(self) -> ConnectorMetricsAggregate:
         with self._lock:
@@ -182,6 +216,10 @@ class ConnectorMetricsSink:
                 str(path): meta.to_dict()
                 for path, meta in sorted(self._path_totals.items())
             },
+            "io": {
+                **self.io_stats,
+                "flushes": int(self._io_stats["flushes"]) + 1,
+            },
         }
         tmp_path = self._path.with_suffix(f"{self._path.suffix}.tmp")
         tmp_path.write_text(
@@ -190,7 +228,9 @@ class ConnectorMetricsSink:
         )
         os.replace(tmp_path, self._path)
         self._dirty = False
+        self._pending_records = 0
         self._last_flush_monotonic = time.monotonic()
+        self._io_stats["flushes"] += 1
 
     def _cleanup_stale_worker_files(self) -> None:
         assert self._dir is not None

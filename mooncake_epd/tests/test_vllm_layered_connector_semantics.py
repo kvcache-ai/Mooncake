@@ -4,6 +4,7 @@ import asyncio
 import pickle
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -16,6 +17,7 @@ from mooncake_epd.core.control.vllm_mooncake_connector import (  # noqa: E402
     MooncakeConnectorMetadata,
     MooncakeXferResponseStatus,
     EPDMooncakeConnectorScheduler,
+    UpstreamMooncakeConnectorScheduler,
     UpstreamMooncakeConnectorWorker,
     _LayeredReceiveState,
     _LayeredSendState,
@@ -1027,6 +1029,122 @@ def test_scheduler_build_connector_meta_captures_routing_paths():
 
     assert meta.request_routing_paths["req-epd"] == "EPD"
     assert meta.transfer_routing_paths["xfer-epd"] == "EPD"
+
+
+def test_layered_producer_sends_full_allocated_prefix_cache_blocks(monkeypatch):
+    scheduler = object.__new__(EPDMooncakeConnectorScheduler)
+    scheduler.layered_kv_transfer = True
+    scheduler.is_kv_producer = True
+    scheduler.is_kv_consumer = False
+    scheduler._reqs_need_send = {}
+    scheduler.get_sw_clipped_blocks = lambda block_ids: list(block_ids)
+    monkeypatch.setattr(
+        UpstreamMooncakeConnectorScheduler,
+        "update_state_after_alloc",
+        lambda *_args, **_kwargs: None,
+    )
+
+    full_blocks = list(range(64))
+    blocks = SimpleNamespace(
+        get_block_ids=lambda: (full_blocks,),
+        get_unhashed_block_ids_all_groups=lambda: [[63]],
+    )
+    request = SimpleNamespace(
+        request_id="req-prefix-hit",
+        kv_transfer_params={
+            "transfer_id": "xfer-prefix-hit",
+            "do_remote_decode": True,
+        },
+    )
+
+    scheduler.update_state_after_alloc(request, blocks, num_external_tokens=0)
+
+    _, local_block_ids = scheduler._reqs_need_send["req-prefix-hit"]
+    assert local_block_ids == [full_blocks]
+
+
+def test_layered_producer_excludes_hybrid_cache_null_padding_blocks(monkeypatch):
+    scheduler = object.__new__(EPDMooncakeConnectorScheduler)
+    scheduler.layered_kv_transfer = True
+    scheduler.is_kv_producer = True
+    scheduler.is_kv_consumer = False
+    scheduler._reqs_need_send = {}
+    scheduler.get_sw_clipped_blocks = lambda block_ids: list(block_ids)
+    monkeypatch.setattr(
+        UpstreamMooncakeConnectorScheduler,
+        "update_state_after_alloc",
+        lambda *_args, **_kwargs: None,
+    )
+    blocks = SimpleNamespace(
+        blocks=(
+            [
+                SimpleNamespace(block_id=10, is_null=False),
+                SimpleNamespace(block_id=11, is_null=True),
+                SimpleNamespace(block_id=12, is_null=False),
+            ],
+        ),
+    )
+    request = SimpleNamespace(
+        request_id="req-hybrid-padding",
+        kv_transfer_params={
+            "transfer_id": "xfer-hybrid-padding",
+            "do_remote_decode": True,
+        },
+    )
+
+    scheduler.update_state_after_alloc(request, blocks, num_external_tokens=0)
+
+    _, local_block_ids = scheduler._reqs_need_send["req-hybrid-padding"]
+    assert local_block_ids == [[10, 12]]
+
+
+def test_connector_metrics_sink_batches_atomic_file_updates(tmp_path):
+    sink = ConnectorMetricsSink(
+        tmp_path,
+        engine_id="engine-batched",
+        role="producer",
+        hostname="host-batched",
+        rpc_port=9010,
+        tp_rank=0,
+        flush_interval_s=60.0,
+        max_pending_records=3,
+    )
+    delta = LayeredTransferWorkerMeta(
+        grouped_batches=1,
+        grouped_bytes=32,
+        grouped_descriptors=1,
+    )
+
+    sink.record(delta)
+    sink.record(delta)
+    assert sink.path is not None
+    assert sink.path.exists() is False
+
+    sink.record(delta)
+    assert sink.path.exists() is True
+    aggregate = ConnectorMetricsReader(tmp_path).aggregate()
+    assert aggregate.totals.grouped_batches == 3
+    assert sink.io_stats["flushes"] == 1
+    assert sink.io_stats["deferred_records"] == 2
+
+
+def test_connector_metrics_sink_force_flushes_deferred_snapshot(tmp_path):
+    sink = ConnectorMetricsSink(
+        tmp_path,
+        engine_id="engine-forced",
+        role="producer",
+        flush_interval_s=60.0,
+        max_pending_records=100,
+    )
+    sink.record(LayeredTransferWorkerMeta(grouped_batches=1, grouped_bytes=16))
+
+    assert sink.path is not None
+    assert sink.path.exists() is False
+    sink.flush()
+
+    assert sink.path.exists() is True
+    assert ConnectorMetricsReader(tmp_path).aggregate().totals.grouped_batches == 1
+    assert sink.io_stats["flushes"] == 1
 
 
 def test_batched_transfer_regions_uses_peer_buffer_direct_path():

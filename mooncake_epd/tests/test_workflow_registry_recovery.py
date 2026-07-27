@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+
 import torch
 
 from mooncake_epd.agent.coordination import Workflow
@@ -97,6 +99,31 @@ def test_workflow_registry_tracks_state_transitions(tmp_path):
     assert record is not None
     assert record.status == "RELEASED"
     assert record.released_at is not None
+
+
+def test_workflow_registry_batches_wal_and_writes_release_once(tmp_path):
+    registry_path = tmp_path / "registry-batched.jsonl"
+    registry = WorkflowStateRegistry(
+        str(registry_path),
+        wal_fsync_interval_s=60.0,
+        wal_max_pending_records=64,
+    )
+    sl = _make_state_layer(registry)
+    state = _build_state(sl, workflow_id="wf-registry-batched")
+
+    registry.mark_released(state.state_id)
+    before_close = registry.wal_stats()
+    assert before_close["records"] == 2
+    assert before_close["fsyncs"] == 0
+    assert before_close["pending_records"] == 2
+
+    registry.close()
+    after_close = registry.wal_stats()
+    assert after_close["fsyncs"] == 1
+    assert after_close["pending_records"] == 0
+
+    rows = [json.loads(line) for line in registry_path.read_text().splitlines()]
+    assert [row["event"] for row in rows].count("RELEASED") == 1
 
 
 def test_offload_recovery_rehydrates_state_from_registry(tmp_path):

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import os
+
 import torch
 
 from mooncake_epd.agent.coordination.offload import OffloadManager
+from mooncake_epd.core.control import JsonLineWAL
 from mooncake_epd.core.state import FeatureStore, PagedKVManager, RadixTree, StateLayer, StateMeta
 
 
@@ -39,6 +42,70 @@ def _build_state(sl: StateLayer, workflow_id: str = "wf-wal"):
             agent_id="agent-a",
         ),
     )
+
+
+def test_json_line_wal_keeps_immediate_fsync_as_default(monkeypatch, tmp_path):
+    fsync_calls = 0
+    real_fsync = os.fsync
+
+    def counting_fsync(fd):
+        nonlocal fsync_calls
+        fsync_calls += 1
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", counting_fsync)
+    wal = JsonLineWAL(tmp_path / "immediate.jsonl")
+    try:
+        for idx in range(3):
+            wal.append({"index": idx})
+        assert wal.stats() == {
+            "records": 3,
+            "fsyncs": 3,
+            "deferred_records": 0,
+            "pending_records": 0,
+            "fsync_interval_s": 0.0,
+            "max_pending_records": 1,
+        }
+        assert fsync_calls == 3
+    finally:
+        wal.close()
+
+
+def test_json_line_wal_batches_fsync_and_forces_pending_records_on_close(
+    monkeypatch,
+    tmp_path,
+):
+    fsync_calls = 0
+    real_fsync = os.fsync
+
+    def counting_fsync(fd):
+        nonlocal fsync_calls
+        fsync_calls += 1
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", counting_fsync)
+    wal_path = tmp_path / "batched.jsonl"
+    wal = JsonLineWAL(
+        wal_path,
+        fsync_interval_s=60.0,
+        max_pending_records=4,
+    )
+    for idx in range(9):
+        wal.append({"index": idx})
+
+    before_close = wal.stats()
+    assert before_close["records"] == 9
+    assert before_close["fsyncs"] == 2
+    assert before_close["deferred_records"] == 7
+    assert before_close["pending_records"] == 1
+    assert fsync_calls == 2
+
+    wal.close()
+    after_close = wal.stats()
+    assert after_close["fsyncs"] == 3
+    assert after_close["pending_records"] == 0
+    assert fsync_calls == 3
+    assert [row["index"] for row in wal.read_all()] == list(range(9))
 
 
 def test_handoff_wal_recovery_rolls_back_prepared_transaction(tmp_path):

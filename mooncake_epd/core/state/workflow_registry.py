@@ -141,10 +141,24 @@ class WorkflowStateRecord:
 class WorkflowStateRegistry:
     """Persistent state catalog keyed by `state_id`."""
 
-    def __init__(self, wal_path: Optional[str] = None):
+    def __init__(
+        self,
+        wal_path: Optional[str] = None,
+        *,
+        wal_fsync_interval_s: float = 0.0,
+        wal_max_pending_records: int = 1,
+    ):
         self._lock = threading.RLock()
         self._records: Dict[str, WorkflowStateRecord] = {}
-        self._wal = JsonLineWAL(wal_path) if wal_path else None
+        self._wal = (
+            JsonLineWAL(
+                wal_path,
+                fsync_interval_s=wal_fsync_interval_s,
+                max_pending_records=wal_max_pending_records,
+            )
+            if wal_path
+            else None
+        )
         if self._wal is not None:
             self.recover()
 
@@ -283,6 +297,22 @@ class WorkflowStateRegistry:
             snapshot = replace(record)
         self._append(event, snapshot)
         return snapshot
+
+    def close(self) -> None:
+        if self._wal is not None:
+            self._wal.close()
+
+    def wal_stats(self) -> Dict[str, Any]:
+        if self._wal is None:
+            return {
+                "records": 0,
+                "fsyncs": 0,
+                "deferred_records": 0,
+                "pending_records": 0,
+                "fsync_interval_s": 0.0,
+                "max_pending_records": 1,
+            }
+        return self._wal.stats()
 
     def get_record(self, state_id: str) -> Optional[WorkflowStateRecord]:
         with self._lock:

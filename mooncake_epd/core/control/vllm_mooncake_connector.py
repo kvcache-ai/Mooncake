@@ -661,10 +661,30 @@ class EPDMooncakeConnectorScheduler(UpstreamMooncakeConnectorScheduler):
             self.layered_kv_transfer
             and params.get("do_remote_decode")
             and not self.is_kv_consumer
-            and hasattr(blocks, "get_unhashed_block_ids_all_groups")
         ):
+            # Decode owns a distinct KV cache and may allocate the complete
+            # prompt even when Prefill reused hashed prefix-cache blocks.
+            # Sending only Prefill's unhashed suffix under-describes the valid
+            # KV topology and can make the consumer request more blocks than
+            # the producer exposes. Transfer every allocated, non-null block;
+            # retain compatibility fallbacks for older vLLM block containers.
+            if hasattr(blocks, "blocks"):
+                allocated_block_ids = tuple(
+                    [
+                        block.block_id
+                        for block in group
+                        if not bool(getattr(block, "is_null", False))
+                    ]
+                    for group in blocks.blocks
+                )
+            elif hasattr(blocks, "get_block_ids"):
+                allocated_block_ids = blocks.get_block_ids()
+            elif hasattr(blocks, "get_unhashed_block_ids_all_groups"):
+                allocated_block_ids = blocks.get_unhashed_block_ids_all_groups()
+            else:
+                allocated_block_ids = ()
             local_block_ids = self.get_sw_clipped_blocks(
-                blocks.get_unhashed_block_ids_all_groups()
+                allocated_block_ids or ()
             )
             self._reqs_need_send[request.request_id] = (request, local_block_ids)
         return result
@@ -1063,6 +1083,19 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
         self._connector_metrics_flush_interval_s = (
             connector_metrics_flush_interval_ms / 1000.0
         )
+        connector_metrics_max_pending_records = max(
+            1,
+            int(
+                extra.get(
+                    "connector_metrics_max_pending_records",
+                    os.getenv(
+                        "MOONCAKE_EPD_CONNECTOR_METRICS_MAX_PENDING",
+                        64,
+                    ),
+                )
+                or 1
+            ),
+        )
         # Do not move every layered-KV group through the cross-process metrics
         # sink. The counters remain in a bounded in-memory aggregate and are
         # persisted on a timer or at a terminal request boundary.
@@ -1079,6 +1112,7 @@ class EPDMooncakeConnectorWorker(UpstreamMooncakeConnectorWorker):
             rpc_port=getattr(self, "rpc_port", None),
             tp_rank=getattr(self, "tp_rank", None),
             flush_interval_s=self._connector_metrics_flush_interval_s,
+            max_pending_records=connector_metrics_max_pending_records,
         )
         self._peer_transfer_engine: PeerTransferEngine | None = None
         # The producer's sender executor can run several ready layer groups in

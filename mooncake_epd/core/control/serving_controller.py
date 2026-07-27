@@ -97,6 +97,8 @@ class ServingControlPlaneConfig:
     target_agent_id: str = "decode"
     connector_metrics_dir: Optional[str] = None
     workflow_registry_wal_path: Optional[str] = None
+    workflow_registry_wal_fsync_interval_s: float = 0.0
+    workflow_registry_wal_max_pending_records: int = 1
     # When unset, the catalog shares the workflow-registry WAL and uses a
     # distinct ``kind`` field.  Keeping one journal by default makes a serving
     # restart recover both aliases and page-ref facts atomically enough for the
@@ -235,6 +237,7 @@ class ServingControlPlane:
                 node_id=self.config.node_id,
             )
         self.workflow_registry = workflow_registry
+        self._owns_workflow_registry = False
         self.kv_state_store = kv_state_store
         self._vllm_kv_materializer = (
             VLLMKVMaterializer(
@@ -262,7 +265,16 @@ class ServingControlPlane:
             # even when the caller did not explicitly configure a WAL.  A
             # path-less registry remains process-local; a configured path keeps
             # the same recovery semantics as the serving request registry.
-            self.workflow_registry = WorkflowStateRegistry(self.config.workflow_registry_wal_path)
+            self.workflow_registry = WorkflowStateRegistry(
+                self.config.workflow_registry_wal_path,
+                wal_fsync_interval_s=(
+                    self.config.workflow_registry_wal_fsync_interval_s
+                ),
+                wal_max_pending_records=(
+                    self.config.workflow_registry_wal_max_pending_records
+                ),
+            )
+            self._owns_workflow_registry = True
         self.agent_state_catalog: Optional[AgentStateCatalog] = None
         if self.config.enable_agent_state_clone:
             catalog_wal = (
@@ -277,6 +289,12 @@ class ServingControlPlane:
                     and self.kv_state_store.kv_page_store is not None
                 )
                 else None,
+                wal_fsync_interval_s=(
+                    self.config.workflow_registry_wal_fsync_interval_s
+                ),
+                wal_max_pending_records=(
+                    self.config.workflow_registry_wal_max_pending_records
+                ),
             )
         if self.config.connector_metrics_dir is None:
             self.config.connector_metrics_dir = (
@@ -360,6 +378,14 @@ class ServingControlPlane:
                 "EPD": self._new_path_stats(),
             },
         }
+
+    def close(self) -> None:
+        """Flush durable state owned by this control-plane instance."""
+
+        if self.agent_state_catalog is not None:
+            self.agent_state_catalog.close()
+        if self._owns_workflow_registry and self.workflow_registry is not None:
+            self.workflow_registry.close()
 
     # ------------------------------------------------------------------
     # Worker registration / accounting
@@ -1215,6 +1241,12 @@ class ServingControlPlane:
                     "transport_backend": self.config.transport_backend,
                     "connector_metrics_dir": self.config.connector_metrics_dir,
                     "workflow_registry_wal_path": self.config.workflow_registry_wal_path,
+                    "workflow_registry_wal_fsync_interval_s": (
+                        self.config.workflow_registry_wal_fsync_interval_s
+                    ),
+                    "workflow_registry_wal_max_pending_records": (
+                        self.config.workflow_registry_wal_max_pending_records
+                    ),
                     "agent_state_catalog_wal_path": (
                         self.config.agent_state_catalog_wal_path
                         or self.config.workflow_registry_wal_path
@@ -4116,6 +4148,7 @@ class ServingControlPlane:
         reuse_summary = self.workflow_registry.reuse_telemetry_summary(rows)
         return {
             "enabled": True,
+            "wal_io": self.workflow_registry.wal_stats(),
             "tracked_states": len(rows),
             "active_state_ids": self.workflow_registry.active_state_ids(),
             "status_counts": status_counts,

@@ -128,6 +128,8 @@ class AgentStateCatalog:
         wal_path: Optional[str] = None,
         *,
         page_reclaimer: Optional[PageReclaimer] = None,
+        wal_fsync_interval_s: float = 0.0,
+        wal_max_pending_records: int = 1,
     ) -> None:
         self._lock = RLock()
         self._records: Dict[str, AgentStateCatalogRecord] = {}
@@ -135,9 +137,33 @@ class AgentStateCatalog:
         self._page_refs: Dict[str, CatalogPageRef] = {}
         self._workflow_fences: Dict[str, int] = {}
         self._page_reclaimer = page_reclaimer
-        self._wal = JsonLineWAL(wal_path) if wal_path else None
+        self._wal = (
+            JsonLineWAL(
+                wal_path,
+                fsync_interval_s=wal_fsync_interval_s,
+                max_pending_records=wal_max_pending_records,
+            )
+            if wal_path
+            else None
+        )
         if self._wal is not None:
             self.recover()
+
+    def close(self) -> None:
+        if self._wal is not None:
+            self._wal.close()
+
+    def wal_stats(self) -> Dict[str, Any]:
+        if self._wal is None:
+            return {
+                "records": 0,
+                "fsyncs": 0,
+                "deferred_records": 0,
+                "pending_records": 0,
+                "fsync_interval_s": 0.0,
+                "max_pending_records": 1,
+            }
+        return self._wal.stats()
 
     # ------------------------------------------------------------------
     # Public state transitions
