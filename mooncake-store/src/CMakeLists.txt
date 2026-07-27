@@ -270,6 +270,10 @@ endif()
 # The cache_allocator library
 include_directories(${Python3_INCLUDE_DIRS})
 add_library(mooncake_store ${MOONCAKE_STORE_SOURCES})
+if(BUILD_UNIT_TESTS)
+  target_compile_definitions(mooncake_store
+                             PUBLIC MOONCAKE_ENABLE_TEST_CHECKPOINTS=1)
+endif()
 if(KV_EVENTS_ZMQ_FOUND)
   target_compile_definitions(mooncake_store PRIVATE MOONCAKE_ENABLE_KV_EVENTS=1)
 endif()

@@ -62,9 +62,30 @@ if(ENABLE_KV_EVENTS)
                           PRIVATE ${KV_EVENT_TEST_ZMQ_LIBRARY})
   endif()
 endif()
-add_store_test(master_service_test master_service_test.cpp)
-add_store_test(master_service_tenant_quota_test
-               master_service_tenant_quota_test.cpp)
+add_store_test(
+  master_service_test
+  master_scenario.cpp
+  master_scenario_copy_move_test.cpp
+  master_scenario_group_tenant_test.cpp
+  master_scenario_lease_eviction_test.cpp
+  master_scenario_object_test.cpp
+  master_scenario_rpc_test.cpp
+  master_scenario_segment_test.cpp
+  master_scenario_task_disk_test.cpp
+  master_scenario_upsert_test.cpp
+  master_service_copy_move_stress_test.cpp
+  master_service_eviction_focused_test.cpp
+  master_service_group_rpc_focused_test.cpp
+  master_service_object_stress_test.cpp
+  master_service_segment_focused_test.cpp
+  master_service_task_disk_focused_test.cpp)
+add_store_test(master_scenario_test master_scenario_test.cpp
+               master_scenario.cpp)
+add_store_test(
+  master_service_tenant_quota_test
+  master_scenario.cpp
+  master_scenario_quota_test.cpp
+  master_service_quota_focused_test.cpp)
 add_store_test(batch_remove_test batch_remove_test.cpp)
 add_store_test(master_service_ssd_test master_service_ssd_test.cpp)
 add_store_test(offload_on_evict_test offload_on_evict_test.cpp)
