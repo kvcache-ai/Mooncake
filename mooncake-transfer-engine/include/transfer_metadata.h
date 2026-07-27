@@ -190,6 +190,16 @@ class TransferMetadata {
 
     ~TransferMetadata();
 
+   protected:
+    // Test-only seam: inject a storage plugin directly, bypassing the
+    // conn-string plugin factory (which LOG(FATAL)s without a real
+    // etcd/redis/http backend) and the P2P handshake daemon. Derived
+    // hardware-free unit tests substitute an in-memory
+    // MetadataStoragePlugin to exercise syncSegmentCache without RDMA/CUDA.
+    explicit TransferMetadata(
+        std::shared_ptr<MetadataStoragePlugin> storage_plugin);
+
+   public:
     std::shared_ptr<SegmentDesc> getSegmentDescByName(
         const std::string &segment_name, bool force_update = false);
 
@@ -272,6 +282,11 @@ class TransferMetadata {
     std::unordered_map<uint64_t, std::shared_ptr<SegmentDesc>>
         segment_id_to_desc_map_;
     std::unordered_map<std::string, uint64_t> segment_name_to_id_map_;
+    // Per-REMOTE-segment consecutive fetch-failure streak, guarded by
+    // segment_lock_. Bumped in syncSegmentCache's apply phase when a cached
+    // segment's backend fetch fails; reset to 0 on a successful fetch. Once it
+    // reaches kStaleSegmentFailureThreshold the cached entry is invalidated.
+    std::unordered_map<std::string, int> segment_failure_counts_;
 
     RWSpinlock notify_lock_;
     std::vector<NotifyDesc> notifys;

@@ -50,6 +50,14 @@ static inline std::string extractProtocolFromConnString(
     return "etcd";
 }
 
+// A cached REMOTE segment whose backend fetch keeps failing this many
+// consecutive sync cycles is treated as gone (peer unmounted / master expiry
+// cleanup removed its key) and invalidated from the local cache. The plugin
+// get() collapses "not found" and "transient error" into a single false, so a
+// single blip must not trigger a purge -- only a streak that persists across
+// cycles does.
+static constexpr int kStaleSegmentFailureThreshold = 2;
+
 struct TransferNotifyUtil {
     static Json::Value encode(const TransferMetadata::NotifyDesc &desc) {
         Json::Value root;
@@ -180,6 +188,20 @@ TransferMetadata::TransferMetadata(const std::string &conn_string) {
             << "Unable to create metadata storage plugin with conn string "
             << conn_string;
     }
+    startMetadataRefreshPollingIfNeeded();
+}
+
+TransferMetadata::TransferMetadata(
+    std::shared_ptr<MetadataStoragePlugin> storage_plugin) {
+    // Test-only seam (see header). Mirrors the conn-string ctor's key-prefix
+    // setup so getFullMetadataKey() yields "mooncake/ram/<name>" keys, but
+    // skips the plugin factory (no etcd/redis/http needed) and the P2P
+    // handshake daemon. The background refresh poller stays disabled when the
+    // caller configures a zero refresh interval.
+    next_segment_id_.store(1);
+    common_key_prefix_ = "mooncake/";
+    rpc_meta_prefix_ = common_key_prefix_ + "rpc_meta/";
+    storage_plugin_ = std::move(storage_plugin);
     startMetadataRefreshPollingIfNeeded();
 }
 
@@ -1069,9 +1091,14 @@ int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
     size_t updated_count = 0;
     size_t unchanged_count = 0;
     size_t skipped_count = 0;
+    size_t invalidated_count = 0;
 
     // Fetch updates without holding lock (may involve network I/O)
     std::vector<std::pair<std::string, std::shared_ptr<SegmentDesc>>> updates;
+    // Cached REMOTE segment names whose backend fetch failed this cycle.
+    // Resolved into per-segment failure streaks under the write lock below, so
+    // no shared state (segment_failure_counts_) is touched during network I/O.
+    std::vector<std::string> failed_names;
     for (const auto &name : names_to_sync) {
         auto segment_desc = getSegmentDesc(name);
         if (segment_desc) {
@@ -1079,6 +1106,7 @@ int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
             ++fetched_count;
         } else {
             ++failed_count;
+            failed_names.push_back(name);
             LOG(WARNING) << "segment " << name << " is now invalid";
         }
     }
@@ -1087,6 +1115,10 @@ int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
         // Apply updates with write lock
         RWSpinlock::WriteGuard guard(segment_lock_);
         for (const auto &[name, desc] : updates) {
+            // A successful fetch ends any prior failure streak for this
+            // segment; the entry stays cached. Done under the write lock
+            // because segment_failure_counts_ is guarded by segment_lock_.
+            segment_failure_counts_[name] = 0;
             auto it = segment_name_to_id_map_.find(name);
             if (it == segment_name_to_id_map_.end()) {
                 ++skipped_count;
@@ -1121,6 +1153,40 @@ int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
             LOG(INFO) << "New segment descriptor:";
             desc->dump();
         }
+
+        // Invalidate stale REMOTE segments. MetadataStoragePlugin::get()
+        // collapses "key removed" and "transient backend error" (curl timeout,
+        // etcd blip) into a single false, so erasing on the first failure
+        // would purge the whole cache during a transient blip and strand
+        // in-flight transfers whose callers still hold a shared_ptr copy of
+        // the descriptor. A consecutive-failure streak that persists across
+        // sync cycles is the signal that the segment is genuinely gone (the
+        // master removed its key on peer unmount/expiry); only then do we
+        // drop the cached entry, mirroring the erase pattern in
+        // removeSegmentDesc() (segment_id_to_desc_map_ + name map).
+        for (const auto &name : failed_names) {
+            ++segment_failure_counts_[name];
+        }
+        for (auto fit = segment_failure_counts_.begin();
+             fit != segment_failure_counts_.end();) {
+            if (fit->second < kStaleSegmentFailureThreshold) {
+                ++fit;
+                continue;
+            }
+            const auto &name = fit->first;
+            auto name_it = segment_name_to_id_map_.find(name);
+            // Only invalidate cached remote entries; LOCAL_SEGMENT_ID is
+            // skipped by the collect phase and must never be purged here.
+            if (name_it != segment_name_to_id_map_.end() &&
+                name_it->second != LOCAL_SEGMENT_ID) {
+                segment_id_to_desc_map_.erase(name_it->second);
+                segment_name_to_id_map_.erase(name_it);
+                ++invalidated_count;
+                LOG(WARNING)
+                    << "Invalidated stale segment cache entry, name=" << name;
+            }
+            fit = segment_failure_counts_.erase(fit);
+        }
     }
     const auto sync_duration_ms =
         std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -1132,6 +1198,7 @@ int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
               << ", fetched=" << fetched_count << ", updated=" << updated_count
               << ", unchanged=" << unchanged_count
               << ", failed=" << failed_count << ", skipped=" << skipped_count
+              << ", invalidated=" << invalidated_count
               << ", sync_duration_ms=" << sync_duration_ms;
     return 0;
 }
