@@ -8475,8 +8475,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
                     if (!enable_oplog_ && !it->second.IsGrouped()) {
                         PublishKvRemovedAfterEvict(
-                            c.key, evict_result.freed_bytes, "cpu",
-                            it->second, c.tenant_id);
+                            c.key, evict_result.freed_bytes, "cpu", it->second,
+                            c.tenant_id);
                     }
 
                     if (!enable_oplog_ && !it->second.IsValid()) {
