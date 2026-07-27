@@ -167,12 +167,27 @@ class FileStorage {
      * from deferred_keys alone would NACK such keys while the pool still
      * holds them — re-introducing the task-less drop.
      *
+     * Retention is void for a key re-drained this cycle (redrained_carried_
+     * keys): the collision handling in OffloadObjects dropped its pooled copy,
+     * so it is no longer waiting and the stale carried task must not be
+     * retained. Without the exclusion, a re-drained key the backend then
+     * skipped (e.g. re-PUT at a size over the bucket limit) is neither
+     * bucketed nor deferred, so the stale task would be retained forever as a
+     * zombie AND its presence in carried_tasks would suppress the NACK for the
+     * fresh task — losing the fresh task and leaking its source refcount.
+     * Note the exclusion cannot be expressed as "absent from
+     * task_by_storage_key": the carry merge inserts every non-collision
+     * carried task into that map, so such a test would void retention
+     * entirely.
+     *
      * @param task_by_storage_key All tasks known this cycle (drained +
      * carried).
      * @param all_bucket_keys Storage keys emitted in a bucket this cycle.
      * @param deferred_keys Storage keys the backend deferred this cycle.
      * @param previously_carried Carry map from the previous cycle; entries
      * not emitted this cycle are retained in carried_tasks.
+     * @param redrained_carried_keys Carried keys re-drained this cycle, whose
+     * pooled copies the caller already removed; excluded from retention.
      * @param failed_tasks Output: tasks to NACK (appended).
      * @param carried_tasks Output: tasks to carry to the next cycle.
      */
@@ -183,6 +198,7 @@ class FileStorage {
         const std::vector<std::string>& deferred_keys,
         const std::unordered_map<std::string, OffloadTaskItem>&
             previously_carried,
+        const std::unordered_set<std::string>& redrained_carried_keys,
         std::vector<OffloadTaskItem>& failed_tasks,
         std::unordered_map<std::string, OffloadTaskItem>& carried_tasks);
 

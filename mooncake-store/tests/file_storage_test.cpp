@@ -118,11 +118,13 @@ class FileStorageTest : public ::testing::Test {
         const std::vector<std::string>& deferred_keys,
         const std::unordered_map<std::string, OffloadTaskItem>&
             previously_carried,
+        const std::unordered_set<std::string>& redrained_carried_keys,
         std::vector<OffloadTaskItem>& failed_tasks,
         std::unordered_map<std::string, OffloadTaskItem>& carried_tasks) {
         FileStorage::PartitionUnbucketedTasks(
             task_by_storage_key, all_bucket_keys, deferred_keys,
-            previously_carried, failed_tasks, carried_tasks);
+            previously_carried, redrained_carried_keys, failed_tasks,
+            carried_tasks);
     }
 
     size_t GetUngroupedOffloadingObjectsSize(FileStorage& fileStorage) {
@@ -461,7 +463,7 @@ TEST_F(FileStorageTest, PartitionUnbucketedTasks_carries_deferred_not_nacked) {
     std::vector<OffloadTaskItem> failed_tasks;
     std::unordered_map<std::string, OffloadTaskItem> carried_tasks;
     FileStoragePartitionUnbucketedTasks(task_by_storage_key, all_bucket_keys,
-                                        deferred_keys, previously_carried,
+                                        deferred_keys, previously_carried, {},
                                         failed_tasks, carried_tasks);
 
     // The deferred key is carried with its original task; the un-emitted
@@ -477,6 +479,72 @@ TEST_F(FileStorageTest, PartitionUnbucketedTasks_carries_deferred_not_nacked) {
     }
     // Deliberately skipped keys are still NACKed.
     ASSERT_EQ(failed_tasks.size(), 2u);
+}
+
+// Regression (review follow-up on the re-drain collision path): a carried key
+// re-drained this cycle and then skipped outright by the backend — re-PUT at a
+// size over bucket_size_limit, which GroupOffloadingKeysByBucket drops without
+// bucketing OR deferring — must NACK the FRESH task and must not retain the
+// stale one. Retention here would be doubly wrong: the stale task is stranded
+// forever (its pooled copy was dropped on collision, so the pool can never
+// re-emit it) and its presence in carried_tasks suppresses the fresh task's
+// NACK, losing the task and leaking its source-replica refcount.
+TEST_F(FileStorageTest, PartitionUnbucketedTasks_redrained_then_skipped) {
+    OffloadTaskItem stale{.tenant_id = "default", .key = "x", .size = 1};
+    OffloadTaskItem fresh{.tenant_id = "default", .key = "x", .size = 5};
+    // The carry merge already resolved the collision: the fresh task won the
+    // task map, the pooled copy was removed, and "x" was recorded as
+    // re-drained.
+    const std::unordered_map<std::string, OffloadTaskItem> task_by_storage_key{
+        {"x", fresh}};
+    const std::unordered_map<std::string, OffloadTaskItem> previously_carried{
+        {"x", stale}};
+    const std::unordered_set<std::string> redrained_carried_keys{"x"};
+    // Over the size limit: neither bucketed nor deferred.
+    const std::unordered_set<std::string> all_bucket_keys{};
+    const std::vector<std::string> deferred_keys{};
+
+    std::vector<OffloadTaskItem> failed_tasks;
+    std::unordered_map<std::string, OffloadTaskItem> carried_tasks;
+    FileStoragePartitionUnbucketedTasks(
+        task_by_storage_key, all_bucket_keys, deferred_keys, previously_carried,
+        redrained_carried_keys, failed_tasks, carried_tasks);
+
+    EXPECT_TRUE(carried_tasks.empty())
+        << "a re-drained key has no pooled copy left to wait for; retaining "
+           "the stale task strands it and suppresses the fresh NACK";
+    ASSERT_EQ(failed_tasks.size(), 1u);
+    EXPECT_EQ(failed_tasks[0].key, "x");
+    EXPECT_EQ(failed_tasks[0].size, 5)
+        << "the fresh task must be the one NACKed";
+}
+
+// The exclusion must be keyed on "re-drained this cycle", NOT on "present in
+// task_by_storage_key": the carry merge inserts every non-collision carried
+// task into that map, so testing membership there would void retention for
+// every carried key and re-introduce the task-less drop this PR fixes. This
+// pins the distinction — same shape as above but WITHOUT the collision.
+TEST_F(FileStorageTest, PartitionUnbucketedTasks_merged_carry_still_retained) {
+    OffloadTaskItem carried{.tenant_id = "default", .key = "y", .size = 1};
+    // Post-merge state for a non-collision carried key: it IS in
+    // task_by_storage_key, but it was not re-drained.
+    const std::unordered_map<std::string, OffloadTaskItem> task_by_storage_key{
+        {"y", carried}};
+    const std::unordered_map<std::string, OffloadTaskItem> previously_carried{
+        {"y", carried}};
+    const std::unordered_set<std::string> all_bucket_keys{};
+    const std::vector<std::string> deferred_keys{};
+
+    std::vector<OffloadTaskItem> failed_tasks;
+    std::unordered_map<std::string, OffloadTaskItem> carried_tasks;
+    FileStoragePartitionUnbucketedTasks(task_by_storage_key, all_bucket_keys,
+                                        deferred_keys, previously_carried, {},
+                                        failed_tasks, carried_tasks);
+
+    ASSERT_EQ(carried_tasks.size(), 1u);
+    EXPECT_EQ(carried_tasks.count("y"), 1u);
+    EXPECT_TRUE(failed_tasks.empty())
+        << "the pool still holds this key; NACKing it re-introduces #3006";
 }
 
 // Regression (upstream #3006, integration): drive the deferral carry through
@@ -551,6 +619,12 @@ TEST_F(FileStorageTest, OffloadObjects_deferred_tail_tasks_carried) {
                                        "the stale carried/pooled copy";
         }
     }
+
+    // The remaining collision corner — a re-drained key the backend then skips
+    // outright (re-PUT over bucket_size_limit) — cannot be driven here: by
+    // construction it produces a NACK, and the NACK path dereferences the null
+    // client_ this fixture relies on. It is covered at unit level by
+    // PartitionUnbucketedTasks_redrained_then_skipped.
 }
 
 TEST_F(FileStorageTest, DefaultValuesWhenNoEnvSet) {

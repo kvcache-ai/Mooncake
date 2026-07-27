@@ -445,6 +445,7 @@ void FileStorage::PartitionUnbucketedTasks(
     const std::unordered_set<std::string>& all_bucket_keys,
     const std::vector<std::string>& deferred_keys,
     const std::unordered_map<std::string, OffloadTaskItem>& previously_carried,
+    const std::unordered_set<std::string>& redrained_carried_keys,
     std::vector<OffloadTaskItem>& failed_tasks,
     std::unordered_map<std::string, OffloadTaskItem>& carried_tasks) {
     for (const auto& storage_key : deferred_keys) {
@@ -466,8 +467,17 @@ void FileStorage::PartitionUnbucketedTasks(
     }
     // Retain previously carried keys the backend did not emit this cycle:
     // their pooled copies are still waiting (the pool only moves on a call
-    // with non-empty input), so their tasks must stay alive.
+    // with non-empty input), so their tasks must stay alive. Keys re-drained
+    // this cycle are excluded: the caller dropped their pooled copies on
+    // collision, so nothing is waiting for them and the fresh task — already
+    // in task_by_storage_key — is the only live one. Retaining a stale task
+    // here would both strand it forever and suppress the fresh task's NACK
+    // in the sweep below when the backend skipped the key outright.
     for (const auto& [storage_key, task] : previously_carried) {
+        if (redrained_carried_keys.find(storage_key) !=
+            redrained_carried_keys.end()) {
+            continue;
+        }
         if (all_bucket_keys.find(storage_key) == all_bucket_keys.end()) {
             carried_tasks.emplace(storage_key, task);
         }
@@ -507,13 +517,17 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     // fresh drain wins entirely -- drop the pooled copy so the key flows
     // through grouping as new input with its current size, under its fresh
     // task. Without this the fresh task would win the task map while the
-    // pooled stale size won the packing accounting.
+    // pooled stale size won the packing accounting. Collided keys are recorded
+    // so the partition below does not also retain their stale carried tasks —
+    // nothing is waiting for a key whose pooled copy we just dropped.
+    std::unordered_set<std::string> redrained_carried_keys;
     for (const auto& [storage_key, task] : deferred_task_by_storage_key_) {
         if (storage_object_sizes.find(storage_key) !=
             storage_object_sizes.end()) {
             if (bucket_backend) {
                 bucket_backend->RemoveUngroupedOffloadingObject(storage_key);
             }
+            redrained_carried_keys.insert(storage_key);
             VLOG(1) << "Deferred offload key re-drained before re-emission; "
                        "fresh task and size supersede the pooled copy: "
                     << storage_key;
@@ -714,7 +728,8 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     std::unordered_map<std::string, OffloadTaskItem> carried_tasks;
     PartitionUnbucketedTasks(task_by_storage_key, all_bucket_keys,
                              deferred_keys, deferred_task_by_storage_key_,
-                             failed_tasks, carried_tasks);
+                             redrained_carried_keys, failed_tasks,
+                             carried_tasks);
     if (!carried_tasks.empty()) {
         VLOG(1) << "Carrying " << carried_tasks.size()
                 << " deferred offload task(s) to the next cycle";
