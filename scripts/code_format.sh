@@ -14,7 +14,7 @@
 #   -b, --base <branch>   Base branch to compare against (default: origin/main)
 #   -c, --check           Check mode: only report files that need formatting
 #       --staged          Format only added/modified lines staged for commit
-#       --changed-lines   Format only lines changed relative to the base branch
+#       --changed-lines   Check lines changed relative to base (requires --check)
 #   -h, --help            Show this help message
 #
 # Examples:
@@ -109,20 +109,14 @@ find_clang_format() {
 }
 
 # Find the LLVM git integration helper. The versioned binary is preferred, but
-# a compatible unversioned helper is safe because clang-format 20 is supplied
-# explicitly through --binary.
+# an unversioned helper is safe because clang-format 20 is passed via --binary.
 find_git_clang_format() {
     local candidates=("git-clang-format-20" "git-clang-format")
     local candidate
     for candidate in "${candidates[@]}"; do
         if command -v "${candidate}" &> /dev/null; then
-            local help_output
-            help_output=$("${candidate}" -h 2>&1 || true)
-            if [[ "${help_output}" == *"--staged"* ]] &&
-                [[ "${help_output}" == *"--diff_from_common_commit"* ]]; then
-                echo "${candidate}"
-                return 0
-            fi
+            echo "${candidate}"
+            return 0
         fi
     done
 
@@ -189,6 +183,10 @@ parse_args() {
         print_error "--staged and --changed-lines cannot be used together."
         exit 1
     fi
+    if ${CHANGED_LINES_MODE} && ! ${CHECK_MODE}; then
+        print_error "--changed-lines requires --check."
+        exit 1
+    fi
 }
 
 # Delegate changed-line selection and index handling to LLVM's git integration.
@@ -199,6 +197,18 @@ format_selected_lines() {
     local git_clang_format="$2"
     shift 2
 
+    # With no explicit filenames, Git pathspecs select supported C/C++ files.
+    # Exclude pathspecs keep vendored sources out in both automatic and explicit
+    # modes without discovering and filtering files in this script.
+    if [[ $# -eq 0 ]]; then
+        set -- '*.c' '*.cc' '*.cpp' '*.cxx' '*.cu' '*.cuh' '*.h' '*.hpp'
+    fi
+    local paths=(
+        "$@"
+        ':(exclude,glob)**/cachelib_memory_allocator/**'
+        ':(exclude,glob)**/thirdparty/**'
+    )
+
     print_info "Using $(${clang_format} --version)"
     if ${STAGED_MODE}; then
         print_info "Formatting only staged C/C++ line ranges"
@@ -207,22 +217,21 @@ format_selected_lines() {
     fi
     echo ""
 
-    local file
-    for file in "$@"; do
-        if ${STAGED_MODE} &&
-            ! git -C "${PROJECT_ROOT}" diff --quiet --no-ext-diff -- "${file}"; then
-            print_error "Cannot process staged lines because '${file}' has unstaged changes."
+    if ${STAGED_MODE}; then
+        if ! git -C "${PROJECT_ROOT}" diff --quiet --no-ext-diff -- \
+            "${paths[@]}"; then
+            print_error "Cannot process staged lines because a selected file has unstaged changes."
             print_info "Stage or stash the unstaged changes, then retry."
             return 1
         fi
-
-        if ${CHANGED_LINES_MODE} &&
-            ! git -C "${PROJECT_ROOT}" diff --quiet --no-ext-diff HEAD -- "${file}"; then
-            print_error "Cannot process committed line ranges because '${file}' has uncommitted changes."
+    else
+        if ! git -C "${PROJECT_ROOT}" diff --quiet --no-ext-diff HEAD -- \
+            "${paths[@]}"; then
+            print_error "Cannot process committed lines because a selected file has uncommitted changes."
             print_info "Commit or stash the local changes, then retry."
             return 1
         fi
-    done
+    fi
 
     local command=(
         "${git_clang_format}"
@@ -236,19 +245,9 @@ format_selected_lines() {
     if ${STAGED_MODE}; then
         command+=(--staged)
     else
-        if ${CHECK_MODE}; then
-            command+=(--diff_from_common_commit "${BASE_BRANCH}" HEAD)
-        else
-            local merge_base
-            if ! merge_base=$(git -C "${PROJECT_ROOT}" merge-base \
-                "${BASE_BRANCH}" HEAD); then
-                print_error "Could not determine a merge base for '${BASE_BRANCH}' and HEAD."
-                return 1
-            fi
-            command+=("${merge_base}")
-        fi
+        command+=(--diff_from_common_commit "${BASE_BRANCH}" HEAD)
     fi
-    command+=(-- "$@")
+    command+=(-- "${paths[@]}")
 
     local status=0
     (
@@ -256,25 +255,11 @@ format_selected_lines() {
         "${command[@]}"
     ) || status=$?
 
-    echo ""
-    if [[ ${status} -eq 0 ]]; then
-        if ${CHECK_MODE}; then
-            print_info "All selected lines are properly formatted."
-        else
-            print_info "Selected lines are already formatted."
-        fi
+    # git-clang-format returns 1 after successfully applying a rewrite. Treat
+    # that as success in apply mode; in check mode it means a diff was found.
+    if ! ${CHECK_MODE} && [[ ${status} -eq 1 ]]; then
         return 0
     fi
-    if [[ ${status} -eq 1 ]]; then
-        if ${CHECK_MODE}; then
-            print_error "Selected lines need formatting."
-            return 1
-        fi
-        print_info "Formatted selected lines."
-        return 0
-    fi
-
-    print_error "git-clang-format failed with exit code ${status}."
     return "${status}"
 }
 
@@ -426,54 +411,12 @@ main() {
             exit 1
         fi
 
-        local selected_files=("${INPUT_FILES[@]}")
-        if [[ ${#selected_files[@]} -eq 0 ]]; then
-            local file
-            if ${STAGED_MODE}; then
-                while IFS= read -r -d '' file; do
-                    selected_files+=("${file}")
-                done < <(
-                    git -C "${PROJECT_ROOT}" diff --cached --name-only -z \
-                        --diff-filter=ACMR -- \
-                        '*.c' '*.cc' '*.cpp' '*.cxx' '*.cu' '*.cuh' '*.h' '*.hpp'
-                )
-            else
-                while IFS= read -r -d '' file; do
-                    selected_files+=("${file}")
-                done < <(
-                    git -C "${PROJECT_ROOT}" diff --name-only -z \
-                        --diff-filter=ACMR "${BASE_BRANCH}"...HEAD -- \
-                        '*.c' '*.cc' '*.cpp' '*.cxx' '*.cu' '*.cuh' '*.h' '*.hpp'
-                )
-            fi
-        fi
-
-        local filtered_files=()
-        local selected_file pattern excluded
-        for selected_file in "${selected_files[@]}"; do
-            excluded=false
-            for pattern in "${EXCLUDE_DIRS[@]}"; do
-                if [[ "${selected_file}" == *"${pattern}"* ]]; then
-                    excluded=true
-                    break
-                fi
-            done
-            if ! ${excluded}; then
-                filtered_files+=("${selected_file}")
-            fi
-        done
-
-        if [[ ${#filtered_files[@]} -eq 0 ]]; then
-            print_info "No selected C/C++ lines to format."
-            return
-        fi
-
         local git_clang_format
         if ! git_clang_format="$(find_git_clang_format)"; then
             exit 1
         fi
         format_selected_lines "${clang_format}" "${git_clang_format}" \
-            "${filtered_files[@]}"
+            "${INPUT_FILES[@]}"
         return
     fi
 
