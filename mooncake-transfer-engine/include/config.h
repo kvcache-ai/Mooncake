@@ -48,7 +48,12 @@ struct GlobalConfig {
     size_t max_inline = 64;
     ibv_mtu mtu_length = IBV_MTU_4096;
     uint16_t handshake_port = 12001;
-    int workers_per_ctx = 2;
+    int workers_per_ctx = 1;
+    // Default false restores the original worker model: every RDMA worker
+    // posts its shard and polls a disjoint CQ shard. When true and
+    // workers_per_ctx > 1, worker 0 is dedicated to polling and workers 1..N
+    // post sends.
+    bool rdma_dedicated_poller = false;
     size_t slice_size = 65536;
     int retry_cnt = 9;
     int auto_gid_max_retries = 2;

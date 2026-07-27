@@ -67,17 +67,19 @@ static int selectPeerDevice(RdmaTransport::SegmentDesc *peer_segment_desc,
 }
 
 static bool workerCanPost(int thread_id) {
-    return kTransferWorkerCount == 1 || thread_id != 0;
+    return kTransferWorkerCount == 1 || !globalConfig().rdma_dedicated_poller ||
+           thread_id != 0;
 }
 
 static bool workerCanPoll(int thread_id) {
-    return kTransferWorkerCount == 1 || thread_id == 0;
+    return kTransferWorkerCount == 1 || !globalConfig().rdma_dedicated_poller ||
+           thread_id == 0;
 }
 
 static void getPostingShardAssignment(int thread_id, int &post_tid,
                                       int &post_count) {
     assert(workerCanPost(thread_id));
-    if (kTransferWorkerCount > 1) {
+    if (kTransferWorkerCount > 1 && globalConfig().rdma_dedicated_poller) {
         post_tid = thread_id - 1;
         post_count = kTransferWorkerCount - 1;
     } else {
@@ -542,7 +544,14 @@ void WorkerPool::performPollCq(int thread_id) {
     bool recorded_local_context_failure = false;
     SliceList failed_slice_list;
     SliceList local_failed_slice_list;
-    for (int cq_index = 0; cq_index < context_.cqCount(); cq_index++) {
+    int poll_tid = 0;
+    int poll_count = 1;
+    if (kTransferWorkerCount > 1 && !globalConfig().rdma_dedicated_poller) {
+        poll_tid = thread_id;
+        poll_count = kTransferWorkerCount;
+    }
+    for (int cq_index = poll_tid; cq_index < context_.cqCount();
+         cq_index += poll_count) {
         ibv_wc wc[kPollCount];
         int nr_poll = context_.poll(kPollCount, wc, cq_index);
         if (nr_poll < 0) {
@@ -881,7 +890,14 @@ bool WorkerPool::tryHandoffToAnotherLocalWorker(Transport::Slice *slice) {
 
 bool WorkerPool::hasOutstandingCq(int thread_id) {
     if (!workerCanPoll(thread_id)) return false;
-    for (int cq_index = 0; cq_index < context_.cqCount(); ++cq_index) {
+    int poll_tid = 0;
+    int poll_count = 1;
+    if (kTransferWorkerCount > 1 && !globalConfig().rdma_dedicated_poller) {
+        poll_tid = thread_id;
+        poll_count = kTransferWorkerCount;
+    }
+    for (int cq_index = poll_tid; cq_index < context_.cqCount();
+         cq_index += poll_count) {
         if (context_.cqOutstandingCount(cq_index)->load(
                 std::memory_order_relaxed) > 0)
             return true;

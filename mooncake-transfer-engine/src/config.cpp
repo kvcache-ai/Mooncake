@@ -259,6 +259,14 @@ void loadGlobalConfig(GlobalConfig& config) {
                 << "Ignore value from environment variable MC_WORKERS_PER_CTX";
     }
 
+    const char* rdma_dedicated_poller_env =
+        std::getenv("MC_RDMA_DEDICATED_POLLER");
+    if (rdma_dedicated_poller_env) {
+        parseBoolConfigEnv(rdma_dedicated_poller_env,
+                           "MC_RDMA_DEDICATED_POLLER",
+                           config.rdma_dedicated_poller);
+    }
+
     const char* slice_size_env = std::getenv("MC_SLICE_SIZE");
     if (slice_size_env) {
         size_t val = atoi(slice_size_env);
@@ -707,6 +715,8 @@ void dumpGlobalConfig() {
     LOG(INFO) << "te_metadata_refresh_interval_seconds = "
               << config.te_metadata_refresh_interval_seconds;
     LOG(INFO) << "rdma_rail_pause_seconds = " << config.rdma_rail_pause_seconds;
+    LOG(INFO) << "rdma_dedicated_poller = "
+              << (config.rdma_dedicated_poller ? "true" : "false");
     {
         std::ostringstream oss;
         for (size_t i = 0; i < config.mlx5_qp_udp_sports.size(); ++i) {
