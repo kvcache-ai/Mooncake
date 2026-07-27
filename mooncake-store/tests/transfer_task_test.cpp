@@ -188,6 +188,10 @@ TEST_F(TransferTaskTest, TransferScatterWritesGpuDestinationDirectly) {
 
     std::shared_ptr<StorageBackend> backend;
     TransferSubmitter submitter(engine, backend, "localhost");
+    auto invalid_transfer = transfer;
+    invalid_transfer.remote_offsets = {};
+    EXPECT_TRUE(
+        submitter.transferScatter({invalid_transfer}).IsInvalidArgument());
     ASSERT_TRUE(submitter.transferScatter({transfer}).ok());
     std::vector<char> actual(kDestSize);
     ASSERT_EQ(cudaMemcpy(actual.data(), gpu_destination, kDestSize,

@@ -123,16 +123,24 @@ Status MultiTransport::submitTransfer(
             "Exceed the limitation of batch capacity");
     }
 
+    std::vector<Transport*> transports;
+    transports.reserve(entries.size());
+    for (const auto& request : entries) {
+        Transport* transport = nullptr;
+        auto status = selectTransport(request, transport);
+        if (!status.ok()) return status;
+        assert(transport);
+        transports.push_back(transport);
+    }
+
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
 
     std::unordered_map<Transport*, std::vector<Transport::TransferTask*> >
         submit_tasks;
-    for (auto& request : entries) {
-        Transport* transport = nullptr;
-        auto status = selectTransport(request, transport);
-        if (!status.ok()) return status;
-        assert(transport);
+    for (size_t i = 0; i < entries.size(); ++i) {
+        const auto& request = entries[i];
+        auto* transport = transports[i];
         auto& task = batch_desc.task_list[task_id];
         task.batch_id = batch_id;
         task.transport_ = transport;
