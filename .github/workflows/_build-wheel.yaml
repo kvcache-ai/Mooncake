@@ -1,7 +1,7 @@
 name: _build-wheel
 
-# Shared build for one wheel variant (matrixed over Python version), used by the
-# Release and Pre-Release workflows so both build identically.
+# Shared build for one wheel variant (matrixed over Python version), used by CI,
+# Release, and Pre-Release so validation and publication build identically.
 
 on:
   workflow_call:

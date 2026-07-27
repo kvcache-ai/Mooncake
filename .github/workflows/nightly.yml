@@ -58,7 +58,6 @@ jobs:
       container: pytorch/manylinux2_28-builder:cuda12.8
       python-versions: '["3.10", "3.12"]'
       cuda: container
-      build-with-ep: '1'
       torch-cuda-arch-list: '8.0;9.0'
       ep-torch-versions: '2.11.0;2.12.0;2.12.1'
       build-nvlink-allocator: true
@@ -73,12 +72,13 @@ jobs:
     uses: ./.github/workflows/_build-wheel.yaml
     with:
       runner: ubuntu-22.04-arm
+      container: pytorch/manylinuxaarch64-builder:cuda12.8
       python-versions: '["3.10", "3.12"]'
-      cuda: sbsa-12.8
+      cuda: container
       cmake-generator: Ninja
       torch-cuda-arch-list: '9.0'
       cmake-args: >-
-        -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=OFF
+        -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=OFF
         -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
       artifact-prefix: nightly-cuda128-arm64
       version-override: ${{ needs.version-stamp.outputs.nightly_version }}
@@ -91,7 +91,6 @@ jobs:
       container: pytorch/manylinux2_28-builder:cuda13.0
       python-versions: '["3.10", "3.12"]'
       cuda: container
-      build-with-ep: '1'
       variant-flag: CU13_BUILD
       torch-cuda-arch-list: '8.0;9.0'
       ep-torch-versions: '2.11.0;2.12.0;2.12.1'

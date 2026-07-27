@@ -262,24 +262,6 @@ jobs:
           echo "✅ Coverage collected successfully"
         fi
 
-    - name: Generate Python version tag
-      id: generate_tag_build
-      run: |
-        echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
-      shell: bash
-
-    # In CI, build_wheel.sh removes build/ to free disk (CI=true); set FREE_BUILD_DIR=1 locally to enable.
-    - name: Build Python wheel
-      run: |
-        PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ steps.generate_tag_build.outputs.python_version_tag }} ./scripts/build_wheel.sh
-      shell: bash
-
-    - name: Upload wheel for ZMQ test job
-      uses: actions/upload-artifact@v4
-      with:
-        name: wheel-build-py${{ steps.generate_tag_build.outputs.python_version_tag }}
-        path: mooncake-wheel/dist-py${{ steps.generate_tag_build.outputs.python_version_tag }}/*.whl
-
   build-musa:
     needs: [spell-check, clang-format, check-paths]
     if: >-
@@ -327,98 +309,51 @@ jobs:
        github.event_name == 'workflow_dispatch' ||
        github.event.action == 'opened' ||
        contains(github.event.pull_request.labels.*.name, 'run-ci'))
-    runs-on: ubuntu-22.04-arm
-    strategy:
-      matrix:
-        python-version: ['3.10', '3.12']
-    env:
-      CI: "true"
-      CU13_BUILD: "1"
-      TORCH_CUDA_ARCH_LIST: "9.0"
-      SCCACHE_GHA_ENABLED: "true"
-      CUDA_HOME: "/usr/local/cuda"
+    uses: ./.github/workflows/_build-wheel.yaml
+    with:
+      runner: ubuntu-22.04-arm
+      container: pytorch/manylinuxaarch64-builder:cuda13.0
+      python-versions: '["3.10", "3.12"]'
+      cuda: container
+      cmake-generator: Ninja
+      variant-flag: CU13_BUILD
+      torch-cuda-arch-list: '9.0'
+      cmake-args: >-
+        -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=OFF
+        -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
+      artifact-prefix: wheel-arm64-cuda13
+      version-override: 0.0.0.dev0
 
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        persist-credentials: false
-
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v5
-      with:
-        python-version: ${{ matrix.python-version }}
-
-    - name: Free up disk space
-      uses: ./.github/actions/free-disk-space
-
-    - name: Install CUDA Toolkit 13.0 (arm64 SBSA)
-      run: |
-        wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/sbsa/cuda-keyring_1.1-1_all.deb
-        sudo dpkg -i cuda-keyring_1.1-1_all.deb
-        sudo apt-get update
-        sudo apt-get install -y cuda-toolkit-13-0
-        echo "/usr/local/cuda/bin" >> $GITHUB_PATH
-        /usr/local/cuda/bin/nvcc --version
-      shell: bash
-
-    - name: Run sccache-cache
-      uses: mozilla-actions/sccache-action@v0.0.9
-
-    - name: Configure sccache
-      uses: actions/github-script@v7
-      with:
-        script: |
-          core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
-          core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
-    - name: Configure project
-      run: |
-        sudo apt update -y
-        sudo bash -x dependencies.sh -y
-        mkdir build
-        cd build
-        cmake -G Ninja .. -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=OFF -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
-      shell: bash
-
-    - name: Build project
-      run: |
-        export CUDA_HOME=/usr/local/cuda
-        for dir in /usr/local/cuda/lib64/stubs /usr/local/cuda/targets/*/lib/stubs; do
-          if [ -d "$dir" ]; then
-            export LIBRARY_PATH="$dir:${LIBRARY_PATH:-}"
-          fi
-        done
-        cd build
-        cmake --build .
-        sudo cmake --install .
-      shell: bash
-
-    - name: Run sccache stat for check
-      if: ${{ env.SCCACHE_PATH != '' }}
-      shell: bash
-      run: ${SCCACHE_PATH} --show-stats
-
-    - name: Generate Python version tag
-      id: generate_tag_arm64
-      run: |
-        echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
-      shell: bash
-
-    - name: Build Python wheel
-      run: |
-        PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ steps.generate_tag_arm64.outputs.python_version_tag }} ./scripts/build_wheel.sh
-      shell: bash
-
-    - name: Upload wheel artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: wheel-arm64-cuda13-py${{ steps.generate_tag_arm64.outputs.python_version_tag }}
-        path: mooncake-wheel/dist-py${{ steps.generate_tag_arm64.outputs.python_version_tag }}/*.whl
+  # Build the artifact tested below through the exact release wheel path. The
+  # Ubuntu jobs remain consumer tests, not an alternate wheel build environment.
+  build-wheel:
+    needs: [spell-check, clang-format, check-paths]
+    if: >-
+      (needs.check-paths.outputs.should-run-downstream == 'true' ||
+       github.event_name == 'workflow_dispatch') &&
+      (github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch' ||
+       github.event.action == 'opened' ||
+       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+    uses: ./.github/workflows/_build-wheel.yaml
+    with:
+      runner: ubuntu-22.04
+      container: pytorch/manylinux2_28-builder:cuda12.8
+      python-versions: '["3.10", "3.12"]'
+      cuda: container
+      torch-cuda-arch-list: '8.0;9.0'
+      ep-torch-versions: '2.11.0;2.12.0;2.12.1;2.13.0'
+      build-nvlink-allocator: true
+      cmake-args: >-
+        -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON
+        -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
+      artifact-prefix: mooncake-wheel-ci
+      version-override: 0.0.0.dev0
 
   test-wheel-ubuntu:
-    needs: [spell-check, clang-format, build-flags]
+    needs: [spell-check, clang-format, build-wheel]
     if: >-
-      needs.build-flags.result == 'success' &&
+      needs.build-wheel.result == 'success' &&
       (github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch' ||
        github.event.action == 'opened' ||
@@ -447,7 +382,7 @@ jobs:
     - name: Download wheel artifact
       uses: actions/download-artifact@v4
       with:
-        name: mooncake-wheel-ubuntu-py${{ steps.generate_tag_test.outputs.python_version_tag }}
+        name: mooncake-wheel-ci-py${{ steps.generate_tag_test.outputs.python_version_tag }}
         path: mooncake-wheel/dist
 
     - name: Verify wheel file exists
@@ -795,24 +730,6 @@ jobs:
       shell: bash
       run: ${SCCACHE_PATH} --show-stats
 
-    - name: Generate Python version tag
-      id: generate_tag_flags
-      run: |
-        echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
-      shell: bash
-
-    # In CI, build_wheel.sh removes build/ to free disk (CI=true); set FREE_BUILD_DIR=1 locally to enable.
-    - name: Build Python wheel
-      run: |
-        PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ steps.generate_tag_flags.outputs.python_version_tag }} ./scripts/build_wheel.sh
-      shell: bash
-
-    - name: Upload Python wheel artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: mooncake-wheel-ubuntu-py${{ steps.generate_tag_flags.outputs.python_version_tag }}
-        path: mooncake-wheel/dist-py${{ steps.generate_tag_flags.outputs.python_version_tag }}/*.whl
-
   build-docker:
     name: Build Docker Image
     needs: [spell-check, clang-format, check-paths]
@@ -1142,6 +1059,7 @@ jobs:
       - build
       - build-musa
       - build-arm64
+      - build-wheel
       - build-flags
       - build-docker
       - test-wheel-ubuntu
