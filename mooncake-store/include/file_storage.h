@@ -22,6 +22,8 @@ class FileStorage {
 
     tl::expected<void, ErrorCode> Init();
 
+    void RemoveAll();
+
     /**
      * @brief Result of BatchGet operation containing batch_id and buffer
      * pointers.
