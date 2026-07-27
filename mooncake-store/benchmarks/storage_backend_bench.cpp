@@ -136,6 +136,9 @@ DEFINE_string(cache_mode, "buffered",
               "Cache mode: buffered (page cache), direct (O_DIRECT), "
               "fadvise_dontneed (evict after use), drop_cache_external (print "
               "instructions)");
+DEFINE_string(bucket_persist_mode, "disabled",
+              "Bucket backend only: flush level applied to bucket data before "
+              "its metadata is committed (disabled/relaxed/strict)");
 DEFINE_bool(flush_between_ops, false,
             "Call fdatasync after each write (NOT IMPLEMENTED - requires "
             "backend Flush API)");
@@ -200,6 +203,15 @@ enum class CacheMode {
     FADVISE_DONTNEED,    // Buffered + evict after use
     DROP_CACHE_EXTERNAL  // Print instructions for external cache drop
 };
+
+mooncake::BucketPersistMode StringToBucketPersistMode(const std::string& str) {
+    if (str == "disabled") return mooncake::BucketPersistMode::kDisabled;
+    if (str == "relaxed") return mooncake::BucketPersistMode::kRelaxed;
+    if (str == "strict") return mooncake::BucketPersistMode::kStrict;
+    LOG(WARNING) << "Unknown bucket persist mode: " << str
+                 << ", using disabled";
+    return mooncake::BucketPersistMode::kDisabled;
+}
 
 CacheMode StringToCacheMode(const std::string& str) {
     if (str == "buffered") return CacheMode::BUFFERED;
@@ -819,6 +831,8 @@ std::shared_ptr<mooncake::StorageBackendInterface> CreateBackend(
             mooncake::BucketBackendConfig bucket_config;
             bucket_config.bucket_size_limit = 256 * MB;
             bucket_config.bucket_keys_limit = 500;
+            bucket_config.persist_mode =
+                StringToBucketPersistMode(FLAGS_bucket_persist_mode);
             return std::make_shared<mooncake::BucketStorageBackend>(
                 config, bucket_config);
         }

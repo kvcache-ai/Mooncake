@@ -11,7 +11,9 @@
 #include <thread>
 #include <atomic>
 #include <algorithm>
+#include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <mutex>
 #include <fcntl.h>
 #include <unistd.h>
@@ -132,6 +134,10 @@ class StorageBackendTest : public ::testing::Test {
     }
 
     void TearDown() override {
+        // The sync-failure injection is process-global and one-shot. A test
+        // that arms it and then fails a fatal assertion would otherwise leak it
+        // into an unrelated test in this binary.
+        StorageFile::SetSyncFailureForTest(StorageFile::SyncKind::kNone);
         google::ShutdownGoogleLogging();
         LOG(INFO) << "Clear test data...";
         // Clean up all test files and subdirectories
@@ -714,6 +720,301 @@ TEST_F(StorageBackendTest, BatchOffloadRollbackOnCompleteHandlerFailure) {
     }
     EXPECT_EQ(bucket_file_count, 0)
         << "No bucket data or metadata files should remain after rollback";
+}
+
+// Regression tests for the bucket write-ordering guarantee (issue #3089).
+// When a persist mode above kDisabled is configured, WriteBucket must flush the
+// bucket data before committing its metadata, and a failed flush must abort the
+// offload so metadata never points at data that was not persisted. This only
+// holds if the flush is actually issued on the (PosixFile) write path; if it is
+// skipped, the injected failure is never observed and the offload wrongly
+// succeeds.
+TEST_F(StorageBackendTest, BucketOffloadFailsWhenDataPersistFails) {
+    for (auto mode :
+         {BucketPersistMode::kRelaxed, BucketPersistMode::kStrict}) {
+        SCOPED_TRACE(::testing::Message() << "persist_mode=" << mode);
+
+        std::string test_dir = data_path + "/persist_fail_test_" +
+                               std::to_string(static_cast<int>(mode));
+        fs::create_directories(test_dir);
+
+        FileStorageConfig config;
+        config.storage_filepath = test_dir;
+        BucketBackendConfig bucket_config;
+        bucket_config.persist_mode = mode;
+        BucketStorageBackend storage_backend(config, bucket_config);
+        ASSERT_TRUE(storage_backend.Init());
+
+        const std::string key = "persist_fail_key";
+        std::string value = "durability_probe_value";
+        std::unordered_map<std::string, std::vector<Slice>> batched_slices;
+        batched_slices.emplace(
+            key, std::vector<Slice>{Slice{value.data(), value.size()}});
+
+        // Fail the next flush issued by any StorageFile. If WriteBucket does
+        // not issue one, this is never consumed and the offload succeeds,
+        // which is what makes this a regression test for the flush being on
+        // the write path at all.
+        StorageFile::SetSyncFailureForTest(StorageFile::SyncKind::kAny);
+
+        auto offload_res = storage_backend.BatchOffload(
+            batched_slices,
+            [](const std::vector<std::string>&,
+               std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+
+        // The failed flush must surface as an offload failure...
+        EXPECT_FALSE(offload_res.has_value())
+            << "offload must fail when the bucket-data flush fails";
+
+        // ...and the key must not be committed (no metadata pointing at data
+        // that was not persisted).
+        auto exist_res = storage_backend.IsExist(key);
+        ASSERT_TRUE(exist_res.has_value());
+        EXPECT_FALSE(exist_res.value())
+            << "key must not be committed when its data flush failed";
+
+        // No orphaned bucket data/metadata files should remain.
+        int bucket_file_count = 0;
+        for (const auto& entry : fs::directory_iterator(test_dir)) {
+            if (!entry.is_regular_file()) continue;
+            std::string ext = entry.path().extension().string();
+            if (ext == ".bucket" || ext == ".meta") bucket_file_count++;
+        }
+        EXPECT_EQ(bucket_file_count, 0)
+            << "no bucket files should remain after a failed-flush offload";
+
+        // Sanity: with the failure no longer injected, the same offload
+        // succeeds and the value reads back unchanged, so the flush itself does
+        // not disturb the write path.
+        auto ok_res = storage_backend.BatchOffload(
+            batched_slices,
+            [](const std::vector<std::string>&,
+               std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+        ASSERT_TRUE(ok_res.has_value())
+            << "offload should succeed once the flush is no longer forced to "
+               "fail";
+
+        auto load_buffer = std::make_unique<char[]>(value.size());
+        std::unordered_map<std::string, Slice> load_slices;
+        load_slices.emplace(key, Slice{load_buffer.get(), value.size()});
+        auto load_res = storage_backend.BatchLoad(load_slices);
+        ASSERT_TRUE(load_res.has_value());
+        EXPECT_EQ(std::string(load_buffer.get(), value.size()), value);
+    }
+}
+
+// The default (kDisabled) keeps today's behaviour: no flush is issued on the
+// write path, so the injected failure is never consumed and the offload
+// succeeds. This pins the setting as purely additive for existing deployments.
+TEST_F(StorageBackendTest, BucketOffloadIgnoresPersistFailureWhenDisabled) {
+    std::string test_dir = data_path + "/persist_disabled_test";
+    fs::create_directories(test_dir);
+
+    FileStorageConfig config;
+    config.storage_filepath = test_dir;
+    BucketBackendConfig bucket_config;
+    ASSERT_EQ(bucket_config.persist_mode, BucketPersistMode::kDisabled)
+        << "kDisabled must stay the default";
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    std::string value = "no_flush_value";
+    std::unordered_map<std::string, std::vector<Slice>> batched_slices;
+    batched_slices.emplace(
+        "persist_disabled_key",
+        std::vector<Slice>{Slice{value.data(), value.size()}});
+
+    StorageFile::SetSyncFailureForTest(StorageFile::SyncKind::kAny);
+
+    auto offload_res = storage_backend.BatchOffload(
+        batched_slices,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_TRUE(offload_res.has_value())
+        << "no flush is issued when persist mode is disabled, so the injected "
+           "failure must not be reached";
+
+    auto exist_res = storage_backend.IsExist("persist_disabled_key");
+    ASSERT_TRUE(exist_res.has_value());
+    EXPECT_TRUE(exist_res.value());
+
+    // Nothing consumed the injection, which is the point of this test.
+    EXPECT_TRUE(StorageFile::IsSyncFailureArmedForTest())
+        << "no flush should be issued when the persist mode is disabled";
+    StorageFile::SetSyncFailureForTest(StorageFile::SyncKind::kNone);
+}
+
+// The flush must run BEFORE the metadata is committed -- that ordering is the
+// whole point of the setting, and it is not observable from the outcome of a
+// single offload, since both orders fail the same way and CleanupOrphanedBucket
+// removes both files either way. It is observable from whether the one-shot
+// injection was consumed: make the metadata write fail, and if the flush ran
+// first it has already consumed the injection.
+TEST_F(StorageBackendTest, BucketDataFlushPrecedesMetadataCommit) {
+    std::string test_dir = data_path + "/persist_order_test";
+    fs::create_directories(test_dir);
+
+    FileStorageConfig config;
+    config.storage_filepath = test_dir;
+    BucketBackendConfig bucket_config;
+    bucket_config.persist_mode = BucketPersistMode::kStrict;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    std::string value = "order_probe_value";
+    auto offload = [&](const std::string& key) {
+        std::unordered_map<std::string, std::vector<Slice>> batch;
+        batch.emplace(key,
+                      std::vector<Slice>{Slice{value.data(), value.size()}});
+        return storage_backend.BatchOffload(
+            batch,
+            [](const std::vector<std::string>&,
+               std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    };
+
+    // BatchOffload returns the bucket id it used. Two warmups also confirm ids
+    // are consecutive, without which the blocked path below would target the
+    // wrong bucket and the test would pass vacuously.
+    auto warmup_first = offload("order_warmup_key_1");
+    ASSERT_TRUE(warmup_first.has_value());
+    auto warmup_second = offload("order_warmup_key_2");
+    ASSERT_TRUE(warmup_second.has_value());
+    ASSERT_EQ(warmup_second.value(), warmup_first.value() + 1)
+        << "bucket ids must be consecutive for this test to block the right "
+           "bucket";
+    const int64_t blocked_id = warmup_second.value() + 1;
+
+    // A directory at the .meta path makes StoreBucketMetadata's OpenFile fail
+    // with EISDIR; the file inside keeps CleanupOrphanedBucket's fs::remove
+    // from undoing it.
+    const auto meta_dir =
+        fs::path(test_dir) / (std::to_string(blocked_id) + ".meta");
+    ASSERT_TRUE(fs::create_directory(meta_dir));
+    {
+        std::ofstream blocker(meta_dir / "blocker");
+        ASSERT_TRUE(blocker.is_open());
+        blocker << "prevent directory removal";
+    }
+
+    StorageFile::SetSyncFailureForTest(StorageFile::SyncKind::kAny);
+    // Fails whichever order the two steps are in, so this is not what
+    // discriminates.
+    ASSERT_FALSE(offload("order_key").has_value());
+
+    EXPECT_FALSE(StorageFile::IsSyncFailureArmedForTest())
+        << "the injected flush failure was never consumed even though the "
+           "metadata write failed, so the flush is not issued before the "
+           "metadata commit";
+}
+
+// Each level must issue the call it advertises: kRelaxed writeback_wait(),
+// kStrict datasync(). Arming one kind and not the other separates them; with
+// a single "any sync" injection the two levels are indistinguishable and a
+// swapped or downgraded mapping would go unnoticed.
+TEST_F(StorageBackendTest, BucketPersistModeIssuesTheAdvertisedSyncCall) {
+    struct Case {
+        BucketPersistMode mode;
+        StorageFile::SyncKind armed;
+        bool expect_offload_failure;
+    };
+    const Case cases[] = {
+        {BucketPersistMode::kRelaxed, StorageFile::SyncKind::kWritebackWait,
+         true},
+        {BucketPersistMode::kRelaxed, StorageFile::SyncKind::kDatasync, false},
+        {BucketPersistMode::kStrict, StorageFile::SyncKind::kDatasync, true},
+        {BucketPersistMode::kStrict, StorageFile::SyncKind::kWritebackWait,
+         false},
+    };
+
+    int case_index = 0;
+    for (const auto& c : cases) {
+        SCOPED_TRACE(::testing::Message()
+                     << "persist_mode=" << c.mode
+                     << " armed=" << static_cast<int>(c.armed));
+        std::string test_dir =
+            data_path + "/persist_kind_test_" + std::to_string(case_index++);
+        fs::create_directories(test_dir);
+
+        FileStorageConfig config;
+        config.storage_filepath = test_dir;
+        BucketBackendConfig bucket_config;
+        bucket_config.persist_mode = c.mode;
+        BucketStorageBackend storage_backend(config, bucket_config);
+        ASSERT_TRUE(storage_backend.Init());
+
+        std::string value = "kind_probe_value";
+        std::unordered_map<std::string, std::vector<Slice>> batch;
+        batch.emplace("kind_probe_key",
+                      std::vector<Slice>{Slice{value.data(), value.size()}});
+
+        StorageFile::SetSyncFailureForTest(c.armed);
+        auto res = storage_backend.BatchOffload(
+            batch,
+            [](const std::vector<std::string>&,
+               std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+
+        if (c.expect_offload_failure) {
+            EXPECT_FALSE(res.has_value())
+                << "this level must issue the armed sync call";
+            EXPECT_FALSE(StorageFile::IsSyncFailureArmedForTest());
+        } else {
+            EXPECT_TRUE(res.has_value())
+                << "this level must not issue the other level's sync call";
+            EXPECT_TRUE(StorageFile::IsSyncFailureArmedForTest())
+                << "the other level's injection must still be armed";
+        }
+        StorageFile::SetSyncFailureForTest(StorageFile::SyncKind::kNone);
+    }
+}
+
+// Restores an environment variable on scope exit, so a fatal assertion cannot
+// leave the process environment modified for later tests in this binary.
+class ScopedEnvVar {
+   public:
+    explicit ScopedEnvVar(std::string name) : name_(std::move(name)) {
+        const char* previous = std::getenv(name_.c_str());
+        if (previous != nullptr) saved_ = previous;
+    }
+    void Set(const char* value) { ::setenv(name_.c_str(), value, 1); }
+    void Unset() { ::unsetenv(name_.c_str()); }
+    ~ScopedEnvVar() {
+        if (saved_.has_value()) {
+            ::setenv(name_.c_str(), saved_->c_str(), 1);
+        } else {
+            ::unsetenv(name_.c_str());
+        }
+    }
+
+   private:
+    std::string name_;
+    std::optional<std::string> saved_;
+};
+
+TEST_F(StorageBackendTest, BucketBackendConfigParsesPersistMode) {
+    struct Case {
+        const char* value;
+        BucketPersistMode expected;
+    };
+    const Case cases[] = {
+        {"disabled", BucketPersistMode::kDisabled},
+        {"relaxed", BucketPersistMode::kRelaxed},
+        {"strict", BucketPersistMode::kStrict},
+        {"STRICT", BucketPersistMode::kStrict},
+        // Unrecognized values fall back to the default rather than failing
+        // startup, matching MOONCAKE_OFFSET_PERSIST_MODE.
+        {"nonsense", BucketPersistMode::kDisabled},
+    };
+    ScopedEnvVar env("MOONCAKE_OFFLOAD_BUCKET_PERSIST_MODE");
+    for (const auto& c : cases) {
+        env.Set(c.value);
+        EXPECT_EQ(BucketBackendConfig::FromEnvironment().persist_mode,
+                  c.expected)
+            << "MOONCAKE_OFFLOAD_BUCKET_PERSIST_MODE=" << c.value;
+    }
+    env.Unset();
+    EXPECT_EQ(BucketBackendConfig::FromEnvironment().persist_mode,
+              BucketPersistMode::kDisabled)
+        << "unset must resolve to the default";
 }
 
 TEST_F(StorageBackendTest, AdaptorBatchOffloadAndBatchLoad) {
