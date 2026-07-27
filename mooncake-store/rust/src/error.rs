@@ -45,22 +45,18 @@ pub enum StoreError {
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
 
-    /// The Mooncake shared library could not be loaded at run time.
+    /// The Mooncake shared library could not be loaded, or it does not export
+    /// the expected `store_c.h` C ABI (a required symbol was missing).
     ///
     /// Only ever produced by the `dlopen` backend (see `load_library`), but
     /// always present so `StoreError` is identical across backends.
     #[error("failed to load Mooncake shared library: {0}")]
     LibraryLoad(String),
 
-    /// A required symbol was missing from the loaded Mooncake library, i.e. the
-    /// library does not export the expected `store_c.h` C ABI.
+    /// `load_library` was called after the library had already been loaded; it
+    /// must be called before creating any store.
     ///
     /// Only ever produced by the `dlopen` backend.
-    #[error("missing symbol `{symbol}` in Mooncake shared library: {detail}")]
-    SymbolLoad {
-        /// Name of the symbol that could not be resolved.
-        symbol: &'static str,
-        /// Underlying loader error message.
-        detail: String,
-    },
+    #[error("Mooncake shared library already loaded; load_library() must be called first")]
+    LibraryAlreadyLoaded,
 }

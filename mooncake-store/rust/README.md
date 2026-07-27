@@ -12,10 +12,12 @@ takes precedence:
   `build.rs` generates the FFI with bindgen and links the C++ dependency graph,
   so a built Mooncake tree (libraries + `store_c.h`) must be present at build
   time. Everything below assumes this backend.
-- **`dlopen`**: loads `libmooncake_store.so` at run time via `libloading`. The
-  crate builds with no Mooncake C++ toolchain, headers, or generated bindings
-  present; only the shared library is needed, and only at run time. Use it for a
-  lean build that defers Mooncake to a runtime dependency:
+- **`dlopen`**: loads `libmooncake_store.so` at run time via `libloading`.
+  `build.rs` still runs bindgen to generate the loader from `store_c.h` (so the
+  ABI is not hand-written), so the header + libclang are needed to *build* — but
+  it links no C++ libraries, and at run time only `libloading` + the shared
+  library are required. Use it for a lean build that defers the Mooncake C++
+  runtime to a shared object:
 
   ```toml
   mooncake_store = { version = "0.1", default-features = false, features = ["dlopen"] }

@@ -168,13 +168,36 @@ fn add_compiler_runtime_search_dir(search_dirs: &mut Vec<PathBuf>, file_name: &s
     false
 }
 
-// A pure `dlopen` build needs neither a Mooncake C++ tree nor bindgen-generated
-// bindings, and `bindgen` is not a dependency then, so it must generate no
-// link/bindgen work at all.
-#[cfg(not(feature = "link"))]
+// The `dlopen` backend links no C++ libraries, but still generates its loader
+// from store_c.h (via bindgen's dynamic_library_name) so the ABI is never
+// hand-written. It needs only the header (and libclang), not a built C++ tree.
+#[cfg(all(feature = "dlopen", not(feature = "link")))]
 fn main() {
-    println!("cargo:rerun-if-changed=build.rs");
+    let include_dir =
+        env::var("MOONCAKE_STORE_INCLUDE_DIR").unwrap_or_else(|_| "../include".to_string());
+    let header = format!("{include_dir}/store_c.h");
+
+    println!("cargo:rerun-if-changed={header}");
+    println!("cargo:rerun-if-env-changed=MOONCAKE_STORE_INCLUDE_DIR");
+
+    let bindings = bindgen::Builder::default()
+        .header(&header)
+        .allowlist_function("mooncake_store_.*")
+        .allowlist_type("mooncake_.*")
+        .dynamic_library_name("MooncakeStoreLib")
+        .dynamic_link_require_all(true)
+        .generate()
+        .expect("Unable to generate Mooncake Store dlopen bindings");
+
+    let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
+    bindings
+        .write_to_file(out_path.join("bindings.rs"))
+        .expect("Couldn't write Mooncake Store dlopen bindings");
 }
+
+// Neither backend: lib.rs emits a compile_error!; keep build.rs itself valid.
+#[cfg(not(any(feature = "link", feature = "dlopen")))]
+fn main() {}
 
 #[cfg(feature = "link")]
 fn main() {

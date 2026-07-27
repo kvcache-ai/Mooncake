@@ -468,7 +468,7 @@ if(WITH_STORE_C_SHARED)
                INSTALL_RPATH "$ORIGIN"
                # Relink when the version script changes (it is only a link flag).
                LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/store_c.map")
-  add_dependencies(mooncake_store_c mooncake_store)
+  add_dependencies(mooncake_store_c mooncake_store asio_static)
   # Whole-archive the static lib via its file path (which does not drag in
   # interface deps) and asio_static, absorbing their objects. Then link the
   # mooncake_store target for its transitive deps; --as-needed drops the
