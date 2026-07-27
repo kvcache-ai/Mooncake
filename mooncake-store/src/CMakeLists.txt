@@ -429,9 +429,9 @@ install(TARGETS mooncake_master mooncake_client DESTINATION bin)
 # dlopen the store at run time (e.g. the Rust crate's `dlopen` feature).
 #
 # Objects are -fPIC (see mooncake-common/common.cmake), so archiving them into a
-# .so is safe. Genuinely-shared transitive deps (asio, and the Go etcd/k8s HA
-# backends when enabled) plus system/toolkit libs (glog, cudart, ibverbs, ...)
-# remain ordinary DT_NEEDED dynamic dependencies.
+# .so is safe. Mooncake's own static libraries and asio (via asio_static) are
+# absorbed; only genuinely-external libs remain DT_NEEDED: system/toolkit libs
+# (glog, cudart, ibverbs, ...) and, when enabled, the Go etcd/k8s HA backends.
 # ---------------------------------------------------------------------------
 if(WITH_STORE_C_SHARED)
   # This target whole-archives mooncake_store and reuses its OUTPUT_NAME, both of
@@ -448,16 +448,25 @@ if(WITH_STORE_C_SHARED)
   endif()
 
   add_library(mooncake_store_c SHARED store_c_shared.cpp)
+  # $ORIGIN so an installed libmooncake_store.so finds any co-installed deps
+  # beside it (CMake strips the build-tree RUNPATH on install).
   set_target_properties(
-    mooncake_store_c PROPERTIES OUTPUT_NAME mooncake_store CXX_VISIBILITY_PRESET
-                                hidden VISIBILITY_INLINES_HIDDEN ON)
+    mooncake_store_c
+    PROPERTIES OUTPUT_NAME mooncake_store
+               CXX_VISIBILITY_PRESET hidden
+               VISIBILITY_INLINES_HIDDEN ON
+               INSTALL_RPATH "$ORIGIN")
   add_dependencies(mooncake_store_c mooncake_store)
   # Whole-archive the static lib via its file path (which does not drag in
-  # interface deps), then link the target once more for its transitive
-  # dependencies. Objects already loaded by --whole-archive are not re-added.
+  # interface deps) and asio_static, absorbing their objects. Then link the
+  # mooncake_store target for its transitive deps; --as-needed drops the
+  # transitive libasio.so, whose symbols asio_static now provides. Objects
+  # already loaded by --whole-archive are not re-added.
   target_link_libraries(
-    mooncake_store_c PRIVATE -Wl,--whole-archive "$<TARGET_FILE:mooncake_store>"
-                             -Wl,--no-whole-archive mooncake_store)
+    mooncake_store_c
+    PRIVATE -Wl,--whole-archive "$<TARGET_FILE:mooncake_store>"
+            "$<TARGET_FILE:asio_static>" -Wl,--no-whole-archive -Wl,--as-needed
+            mooncake_store)
   # Export only the C ABI; the version script localizes every other symbol
   # pulled from the static archives. Strip debug info in Release (it dominates
   # the .so size).

@@ -31,9 +31,11 @@ thiserror = "2.0"
 libc = "0.2"
 libloading = { version = "0.8", optional = true }
 
-# NOTE: bindgen is only invoked by build.rs under the `link` feature. It is kept
-# as a normal build-dependency (not optional) because Cargo build scripts do not
-# receive feature cfgs, so build.rs must be able to name `bindgen::` regardless;
-# under `dlopen` it is compiled but never called (no libclang needed at build).
+# NOTE: bindgen is only *invoked* by build.rs under the `link` feature, but it is
+# kept as a normal (non-optional) build-dependency because Cargo build scripts do
+# not receive feature cfgs, so build.rs must be able to name `bindgen::`
+# regardless. A `dlopen`-only build therefore still compiles the bindgen crate
+# (it is just never called); fully dropping it would need pre-generated bindings
+# or a separate `-sys` crate for the `link` backend.
 [build-dependencies]
 bindgen = "0.70"

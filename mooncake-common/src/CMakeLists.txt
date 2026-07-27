@@ -50,6 +50,19 @@ set_target_properties(asio_shared PROPERTIES
 
 target_link_libraries(asio_shared PUBLIC pthread)
 
+# Static, PIC twin of asio_shared for consumers that absorb asio into their own
+# shared object instead of taking a DT_NEEDED on libasio.so (see
+# WITH_STORE_C_SHARED). Same TU and definitions as asio_shared so the symbols
+# match what the rest of the tree was compiled against; only the linkage differs.
+if(WITH_STORE_C_SHARED)
+  add_library(asio_static STATIC asio_impl.cpp)
+  target_compile_definitions(asio_static PUBLIC ASIO_SEPARATE_COMPILATION
+                                                ASIO_DYN_LINK)
+  target_include_directories(asio_static PUBLIC ${ASIO_INCLUDE_DIR})
+  set_target_properties(asio_static PROPERTIES POSITION_INDEPENDENT_CODE ON)
+  target_link_libraries(asio_static PUBLIC pthread)
+endif()
+
 add_library(mooncake_common
     ${MOONCAKE_COMMON_SOURCES}
 )
