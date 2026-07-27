@@ -43,6 +43,11 @@ class BadDataProto:
         pass
 
 
+class GroupConfig:
+    def __init__(self, group_ids) -> None:
+        self.group_ids = group_ids
+
+
 class InMemoryStore:
     def __init__(self) -> None:
         self.objects: dict[str, bytes] = {}
@@ -451,6 +456,152 @@ def test_small_dict_sized_groups_enable_auto_parallel_put() -> None:
     groups = [[SizedBuffer(1024**2)] for _ in range(128)]
     policy = BundleTransferPolicy(max_inflight_put=8)
     assert transfer._transport._resolve_buffer_group_put_mode(groups, policy) == "parallel"
+
+
+def _seen_group_ids(configs: list[object]) -> list[list[str]]:
+    return [
+        list(config.group_ids)
+        for config in configs
+        if config is not None and hasattr(config, "group_ids")
+    ]
+
+
+def test_structured_object_expands_store_replicate_config() -> None:
+    mooncake_store = pytest.importorskip("mooncake.store")
+    store, transfer = make_transfer()
+    config = mooncake_store.ReplicateConfig()
+    config.replica_num = 2
+    config.group_ids = ["rollout-group"]
+    payload = structured_payload(
+        {"kind": "replicated"},
+        large=np.arange(64, dtype=np.uint8),
+    )
+
+    ref = transfer.put_structured_object(
+        payload,
+        chunk_bytes=8,
+        policy=BundleTransferPolicy(put_mode="batch"),
+        config=config,
+    )
+    result = transfer.materialize(transfer.read_spec(ref))
+
+    assert np.array_equal(result.objects["large"], payload.buffers["large"])
+    grouped_configs = [
+        seen_config
+        for seen_config in store.batch_put_from_configs
+        if seen_config is not None and hasattr(seen_config, "group_ids")
+    ]
+    assert any(len(seen_config.group_ids) > 1 for seen_config in grouped_configs)
+    assert all(
+        set(seen_config.group_ids) == {"rollout-group"}
+        for seen_config in grouped_configs
+    )
+    assert all(seen_config.replica_num == 2 for seen_config in grouped_configs)
+    assert config.group_ids == ["rollout-group"]
+
+
+def test_structured_object_expands_group_id_for_chunk_batch_put() -> None:
+    store, transfer = make_transfer()
+    config = GroupConfig(["rollout-group"])
+    payload = structured_payload(
+        {"kind": "grouped"},
+        large=np.arange(64, dtype=np.uint8),
+    )
+
+    ref = transfer.put_structured_object(
+        payload,
+        chunk_bytes=8,
+        policy=BundleTransferPolicy(put_mode="batch"),
+        config=config,
+    )
+    result = transfer.materialize(transfer.read_spec(ref))
+
+    assert np.array_equal(result.objects["large"], payload.buffers["large"])
+    batch_group_ids = _seen_group_ids(store.batch_put_from_configs)
+    assert any(len(group_ids) > 1 for group_ids in batch_group_ids)
+    assert all(set(group_ids) == {"rollout-group"} for group_ids in batch_group_ids)
+    manifest_group_ids = _seen_group_ids(store.put_configs)[-1]
+    assert manifest_group_ids == ["rollout-group"]
+
+
+def test_structured_object_multi_buffer_put_preserves_group_id() -> None:
+    pool = FakeBufferPool()
+    store, transfer = make_transfer(buffer_pool=pool)
+    config = GroupConfig(["rollout-group"])
+    first = np.arange(4, dtype=np.int32)
+    second = np.arange(4, 8, dtype=np.int32)
+    multi = sos._MultiBufferPayload(
+        buffers=(
+            memoryview(first.reshape(-1).data).cast("B"),
+            memoryview(second.reshape(-1).data).cast("B"),
+        ),
+        owners=(first, second),
+        dtype=first.dtype.str,
+        shape=(8,),
+    )
+
+    ref = transfer.put_structured_object(
+        structured_payload({"kind": "multi"}, values=multi),
+        chunk_bytes=64,
+        policy=BundleTransferPolicy(put_mode="batch"),
+        config=config,
+    )
+    result = transfer.materialize(transfer.read_spec(ref))
+
+    assert result.objects["values"].tolist() == list(range(8))
+    batch_group_ids = _seen_group_ids(store.batch_put_from_configs)
+    assert batch_group_ids
+    assert all(group_ids == ["rollout-group"] for group_ids in batch_group_ids)
+
+
+def test_dataproto_append_updates_manifest_with_grouped_config() -> None:
+    store, transfer = make_transfer()
+    config = GroupConfig(["rollout-group"])
+    ref = transfer.put(
+        {"input_ids": np.arange(6, dtype=np.int64).reshape(3, 2)},
+        type="dict",
+        stage="rollout",
+        chunk_bytes=16,
+        policy=BundleTransferPolicy(put_mode="batch"),
+        config=config,
+    )
+    old_manifest_key = ref.stage_refs["rollout"].manifest_key
+
+    ref = transfer.append_dataproto_fields(
+        ref,
+        SimpleDataProto(batch={"rewards": np.arange(3, dtype=np.float32)}),
+        stage="rollout",
+        chunk_bytes=16,
+        policy=BundleTransferPolicy(put_mode="batch"),
+        config=config,
+    )
+    result = transfer.get(ref, type="dict")
+    view = transfer.dataproto_manifest_view(ref)
+
+    assert ref.stage_refs["rollout"].manifest_key != old_manifest_key
+    assert np.array_equal(
+        result["input_ids"], np.arange(6, dtype=np.int64).reshape(3, 2)
+    )
+    assert np.array_equal(result["rewards"], np.arange(3, dtype=np.float32))
+    assert set(view["batch_fields"]) == {"input_ids", "rewards"}
+    stage_manifest = store.objects[ref.stage_refs["rollout"].manifest_key]
+    manifest = sos._decode_manifest(stage_manifest)
+    assert set(manifest["buffers"]) == {"batch.input_ids", "batch.rewards"}
+    assert old_manifest_key in manifest["cleanup_keys"]
+    assert all(
+        set(group_ids) == {"rollout-group"}
+        for group_ids in _seen_group_ids(store.batch_put_from_configs)
+    )
+
+
+def test_structured_object_rejects_ambiguous_group_ids() -> None:
+    _store, transfer = make_transfer()
+
+    with pytest.raises(ValueError, match="config.group_ids"):
+        transfer.put_structured_object(
+            structured_payload({"kind": "bad"}, value=b"payload"),
+            config=GroupConfig(["group-a", "group-b"]),
+        )
 
 
 def test_put_object_roundtrips_numpy_and_torch_tensor_fields() -> None:

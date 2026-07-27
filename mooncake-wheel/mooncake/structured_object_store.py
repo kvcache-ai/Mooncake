@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import ctypes
 import io
 import json
@@ -6001,15 +6002,71 @@ def _call_write_with_optional_config(fn: Any, *args: Any, config: Any = None) ->
     return fn(*args, config=config)
 
 
+def _config_for_grouped_keys(config: Any, key_count: int) -> Any:
+    """Return a write config whose group_ids match the physical key count."""
+    if config is None or key_count <= 0:
+        return config
+    group_ids = getattr(config, "group_ids", None)
+    if group_ids is None:
+        return config
+    normalize_to_list = isinstance(group_ids, str)
+    if normalize_to_list:
+        group_ids = [group_ids]
+    else:
+        group_ids = list(group_ids)
+    if len(group_ids) != 1:
+        raise ValueError(
+            "structured object store config.group_ids must contain exactly one "
+            "logical group id; it is expanded across internal Mooncake keys"
+        )
+    if key_count == 1 and not normalize_to_list:
+        return config
+    grouped_config = _copy_write_config(config)
+    grouped_config.group_ids = [group_ids[0]] * key_count
+    return grouped_config
+
+
+def _copy_write_config(config: Any) -> Any:
+    try:
+        return copy.copy(config)
+    except TypeError:
+        pass
+    try:
+        copied = type(config)()
+    except Exception as error:
+        raise TypeError(
+            "structured object store config must be copyable or default-constructible"
+        ) from error
+    for name in dir(config):
+        if name.startswith("_"):
+            continue
+        try:
+            value = getattr(config, name)
+        except Exception:
+            continue
+        if callable(value):
+            continue
+        try:
+            setattr(copied, name, value)
+        except Exception as error:
+            raise TypeError(
+                f"structured object store config field {name!r} is not writable"
+            ) from error
+    return copied
+
+
 def _put_with_optional_config(
     store: BundleStore, key: str, value: Any, config: Any = None
 ) -> int:
-    return _call_write_with_optional_config(store.put, key, value, config=config)
+    return _call_write_with_optional_config(
+        store.put, key, value, config=_config_for_grouped_keys(config, 1)
+    )
 
 
 def _put_from_with_optional_config(
     store: BundleStore, key: str, ptr: int, size: int, config: Any = None
 ) -> int:
+    config = _config_for_grouped_keys(config, 1)
     put_tensor_from = getattr(store, "put_tensor_from", None)
     if config is None and callable(put_tensor_from):
         return put_tensor_from(key, ptr, size)
@@ -6027,7 +6084,11 @@ def _batch_put_from_with_optional_config(
     config: Any = None,
 ) -> Sequence[int]:
     return _call_write_with_optional_config(
-        batch_put_from, list(keys), list(ptrs), list(sizes), config=config
+        batch_put_from,
+        list(keys),
+        list(ptrs),
+        list(sizes),
+        config=_config_for_grouped_keys(config, len(keys)),
     )
 
 
