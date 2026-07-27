@@ -1094,6 +1094,10 @@ class BucketStorageBackend : public StorageBackendInterface {
         std::vector<std::pair<int64_t, std::shared_ptr<BucketMetadata>>>
             buckets;  // (bucket_id, metadata) for file deletion
         std::vector<std::string> write_keys;
+        // Duplicates bypassed instead of failing the batch: already
+        // persisted, or being persisted by a concurrent offload. The
+        // commit phase must skip these (idempotent Put semantics).
+        std::vector<std::string> skipped_keys;
         int64_t evicted_size = 0;
         int64_t write_size = 0;
     };
