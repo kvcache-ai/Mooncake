@@ -245,7 +245,16 @@ format_selected_lines() {
     if ${STAGED_MODE}; then
         command+=(--staged)
     else
-        command+=(--diff_from_common_commit "${BASE_BRANCH}" HEAD)
+        # LLVM 20 implements --diff_from_common_commit with a triple-dot
+        # revision passed to diff-tree, which can produce an empty patch.
+        # Resolve the merge base first and pass two concrete commits instead.
+        local base_commit
+        if ! base_commit=$(git -C "${PROJECT_ROOT}" merge-base \
+            "${BASE_BRANCH}" HEAD); then
+            print_error "Could not determine a merge base for '${BASE_BRANCH}' and HEAD."
+            return 1
+        fi
+        command+=("${base_commit}" HEAD)
     fi
     command+=(-- "${paths[@]}")
 
