@@ -40,6 +40,7 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 # File extensions to format
 FILE_EXTENSIONS="\.(h|hpp|cpp|cu|cuh|c|cc|cxx)$"
+GIT_CLANG_FORMAT_EXTENSIONS="h,hpp,cpp,cu,cuh,c,cc,cxx"
 
 # Directories to exclude (add more patterns as needed)
 EXCLUDE_DIRS=(
@@ -107,6 +108,32 @@ find_clang_format() {
     return 1
 }
 
+# Find the LLVM git integration helper. The versioned binary is preferred, but
+# a compatible unversioned helper is safe because clang-format 20 is supplied
+# explicitly through --binary.
+find_git_clang_format() {
+    local candidates=("git-clang-format-20" "git-clang-format")
+    local candidate
+    for candidate in "${candidates[@]}"; do
+        if command -v "${candidate}" &> /dev/null; then
+            local help_output
+            help_output=$("${candidate}" -h 2>&1 || true)
+            if [[ "${help_output}" == *"--staged"* ]] &&
+                [[ "${help_output}" == *"--diff_from_common_commit"* ]]; then
+                echo "${candidate}"
+                return 0
+            fi
+        fi
+    done
+
+    {
+        print_error "A compatible git-clang-format helper was not found."
+        print_info "Install the clang-format 20 package, which provides git-clang-format-20."
+        echo "  sudo apt-get install -y clang-format-20"
+    } >&2
+    return 1
+}
+
 # Parse command line arguments
 parse_args() {
     while [[ $# -gt 0 ]]; do
@@ -164,42 +191,13 @@ parse_args() {
     fi
 }
 
-# Extract the new-file line ranges from a zero-context staged diff. A pure
-# deletion has a line count of zero and does not need formatting.
-get_staged_line_ranges() {
-    local file="$1"
-
-    git -C "${PROJECT_ROOT}" diff --cached --unified=0 \
-        --diff-filter=ACMR -- "${file}" |
-        sed -nE 's/^@@ -[0-9]+(,[0-9]+)? \+([0-9]+)(,([0-9]+))? @@.*/\2 \4/p'
-}
-
-# Extract the new-file line ranges changed between the base branch and HEAD.
-get_changed_line_ranges() {
-    local file="$1"
-
-    git -C "${PROJECT_ROOT}" diff --unified=0 --diff-filter=ACMR \
-        "${BASE_BRANCH}"...HEAD -- "${file}" |
-        sed -nE 's/^@@ -[0-9]+(,[0-9]+)? \+([0-9]+)(,([0-9]+))? @@.*/\2 \4/p'
-}
-
-get_selected_line_ranges() {
-    local file="$1"
-
-    if ${STAGED_MODE}; then
-        get_staged_line_ranges "${file}"
-    else
-        get_changed_line_ranges "${file}"
-    fi
-}
-
-# Format only selected added or modified lines. Pre-commit temporarily stashes
-# unstaged changes, so the working tree normally matches the staged snapshot.
-format_line_range_files() {
+# Delegate changed-line selection and index handling to LLVM's git integration.
+# A strict guard is retained because git-clang-format only checks for unstaged
+# changes when formatting would actually rewrite a file.
+format_selected_lines() {
     local clang_format="$1"
-    shift
-    local formatted_count=0
-    local failed_count=0
+    local git_clang_format="$2"
+    shift 2
 
     print_info "Using $(${clang_format} --version)"
     if ${STAGED_MODE}; then
@@ -211,32 +209,6 @@ format_line_range_files() {
 
     local file
     for file in "$@"; do
-        local excluded=false
-        local pattern
-        for pattern in "${EXCLUDE_DIRS[@]}"; do
-            if [[ "${file}" == *"${pattern}"* ]]; then
-                excluded=true
-                break
-            fi
-        done
-        if ${excluded}; then
-            continue
-        fi
-
-        local line_args=()
-        local start count end
-        while read -r start count; do
-            [[ -z "${start}" ]] && continue
-            count="${count:-1}"
-            [[ "${count}" -eq 0 ]] && continue
-            end=$((start + count - 1))
-            line_args+=("-lines=${start}:${end}")
-        done < <(get_selected_line_ranges "${file}")
-
-        if [[ ${#line_args[@]} -eq 0 ]]; then
-            continue
-        fi
-
         if ${STAGED_MODE} &&
             ! git -C "${PROJECT_ROOT}" diff --quiet --no-ext-diff -- "${file}"; then
             print_error "Cannot process staged lines because '${file}' has unstaged changes."
@@ -250,47 +222,60 @@ format_line_range_files() {
             print_info "Commit or stash the local changes, then retry."
             return 1
         fi
-
-        if [[ ! -f "${PROJECT_ROOT}/${file}" ]]; then
-            continue
-        fi
-
-        if ${CHECK_MODE}; then
-            if ! "${clang_format}" -style=file --dry-run -Werror \
-                "${line_args[@]}" "${PROJECT_ROOT}/${file}" 2>&1; then
-                print_warn "Selected lines need formatting: ${file}"
-                failed_count=$((failed_count + 1))
-            else
-                print_info "OK: ${file}"
-            fi
-        else
-            local before after
-            before=$(git hash-object "${PROJECT_ROOT}/${file}")
-            if "${clang_format}" -style=file -i "${line_args[@]}" \
-                "${PROJECT_ROOT}/${file}"; then
-                after=$(git hash-object "${PROJECT_ROOT}/${file}")
-                if [[ "${before}" == "${after}" ]]; then
-                    print_info "Already formatted: ${file}"
-                else
-                    print_info "Formatted selected lines: ${file}"
-                    formatted_count=$((formatted_count + 1))
-                fi
-            else
-                print_error "Failed to format selected lines: ${file}"
-                failed_count=$((failed_count + 1))
-            fi
-        fi
     done
 
+    local command=(
+        "${git_clang_format}"
+        --binary "${clang_format}"
+        --style file
+        --extensions "${GIT_CLANG_FORMAT_EXTENSIONS}"
+    )
+    if ${CHECK_MODE}; then
+        command+=(--diff)
+    fi
+    if ${STAGED_MODE}; then
+        command+=(--staged)
+    else
+        if ${CHECK_MODE}; then
+            command+=(--diff_from_common_commit "${BASE_BRANCH}" HEAD)
+        else
+            local merge_base
+            if ! merge_base=$(git -C "${PROJECT_ROOT}" merge-base \
+                "${BASE_BRANCH}" HEAD); then
+                print_error "Could not determine a merge base for '${BASE_BRANCH}' and HEAD."
+                return 1
+            fi
+            command+=("${merge_base}")
+        fi
+    fi
+    command+=(-- "$@")
+
+    local status=0
+    (
+        cd "${PROJECT_ROOT}"
+        "${command[@]}"
+    ) || status=$?
+
     echo ""
-    if ${CHECK_MODE} && [[ ${failed_count} -gt 0 ]]; then
-        print_error "${failed_count} file(s) have unformatted selected lines."
-        return 1
+    if [[ ${status} -eq 0 ]]; then
+        if ${CHECK_MODE}; then
+            print_info "All selected lines are properly formatted."
+        else
+            print_info "Selected lines are already formatted."
+        fi
+        return 0
     fi
-    if ! ${CHECK_MODE}; then
-        print_info "Formatted selected lines in ${formatted_count} file(s)."
+    if [[ ${status} -eq 1 ]]; then
+        if ${CHECK_MODE}; then
+            print_error "Selected lines need formatting."
+            return 1
+        fi
+        print_info "Formatted selected lines."
+        return 0
     fi
-    [[ ${failed_count} -eq 0 ]]
+
+    print_error "git-clang-format failed with exit code ${status}."
+    return "${status}"
 }
 
 # Get list of all C/C++ files in the project
@@ -462,7 +447,33 @@ main() {
                 )
             fi
         fi
-        format_line_range_files "${clang_format}" "${selected_files[@]}"
+
+        local filtered_files=()
+        local selected_file pattern excluded
+        for selected_file in "${selected_files[@]}"; do
+            excluded=false
+            for pattern in "${EXCLUDE_DIRS[@]}"; do
+                if [[ "${selected_file}" == *"${pattern}"* ]]; then
+                    excluded=true
+                    break
+                fi
+            done
+            if ! ${excluded}; then
+                filtered_files+=("${selected_file}")
+            fi
+        done
+
+        if [[ ${#filtered_files[@]} -eq 0 ]]; then
+            print_info "No selected C/C++ lines to format."
+            return
+        fi
+
+        local git_clang_format
+        if ! git_clang_format="$(find_git_clang_format)"; then
+            exit 1
+        fi
+        format_selected_lines "${clang_format}" "${git_clang_format}" \
+            "${filtered_files[@]}"
         return
     fi
 

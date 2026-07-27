@@ -78,7 +78,8 @@ git add .pre-commit-config.yaml
 git commit -m "chore: pre-commit autoupdate"
 ```
 
-If clang-format is missing, install it (Ubuntu example):
+If clang-format or its `git-clang-format` helper is missing, install the LLVM
+20 package (Ubuntu example):
 ```bash
 sudo apt-get update && sudo apt-get install -y clang-format-20
 ```
@@ -93,7 +94,8 @@ But please avoid using `--no-verify` for routine commits to keep code quality hi
 GitHub pull-request and push checks validate only added or modified C/C++ line
 ranges relative to the selected base revision. This avoids failing a focused
 change solely because an otherwise untouched part of the same file has older
-formatting.
+formatting. Changed-line selection is delegated to LLVM's `git-clang-format`
+helper so the local hook and CI use the same Git-aware behavior.
 
 The configuration also supports automatic fixing PRs via `pre-commit.ci` if
 enabled. To activate, add the repository in the pre-commit.ci dashboard; no
