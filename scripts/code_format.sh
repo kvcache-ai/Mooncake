@@ -218,9 +218,16 @@ format_selected_lines() {
     echo ""
 
     if ${STAGED_MODE}; then
-        if ! git -C "${PROJECT_ROOT}" diff --quiet --no-ext-diff -- \
-            "${paths[@]}"; then
-            print_error "Cannot process staged lines because a selected file has unstaged changes."
+        local git_status
+        if ! git_status=$(git -C "${PROJECT_ROOT}" status --porcelain=v1 \
+            --untracked-files=no -- "${paths[@]}"); then
+            print_error "Could not inspect staged and unstaged changes."
+            return 1
+        fi
+        # Both porcelain status columns are populated when the same file has
+        # changes in the index and the working tree.
+        if printf '%s\n' "${git_status}" | grep -q '^[^ ][^ ]'; then
+            print_error "Cannot process staged lines because a staged file also has unstaged changes."
             print_info "Stage or stash the unstaged changes, then retry."
             return 1
         fi
