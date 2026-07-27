@@ -3072,6 +3072,57 @@ def test_typed_ragged_fast_decodes_equal_shape_ndarray_views() -> None:
     assert [row.tolist() for row in decoded] == [row.tolist() for row in rows]
 
 
+def test_typed_ragged_single_ndarray_row_uses_general_layout() -> None:
+    rows = [np.arange(6, dtype=np.int32).reshape(2, 3)]
+
+    assert sos._encode_typed_ragged_regular_ndarray_rows(
+        rows, np.dtype(np.int32)
+    ) is None
+    payload, metadata = sos._encode_typed_ragged_values(rows, np.dtype(np.int32))
+    multi_buffer = payload["data"]
+    data = np.frombuffer(multi_buffer.buffers[0], dtype=np.int32)
+
+    decoded = sos._decode_typed_ragged_values({**payload, "data": data}, 1, metadata)
+
+    assert metadata["physical_layout"] == "contiguous_flat"
+    assert isinstance(decoded[0], np.ndarray)
+    assert np.shares_memory(decoded[0], data)
+    assert decoded[0].tolist() == rows[0].tolist()
+
+
+def test_typed_ragged_equal_shape_rows_with_nulls_use_general_layout() -> None:
+    rows = [
+        np.arange(6, dtype=np.int32).reshape(2, 3),
+        None,
+        np.arange(6, 12, dtype=np.int32).reshape(2, 3),
+    ]
+
+    assert sos._encode_typed_ragged_regular_ndarray_rows(
+        rows, np.dtype(np.int32)
+    ) is None
+    payload, metadata = sos._encode_typed_ragged_values(rows, np.dtype(np.int32))
+    multi_buffer = payload["data"]
+    data = np.concatenate(
+        [np.frombuffer(buf, dtype=np.int32) for buf in multi_buffer.buffers]
+    )
+
+    decoded = sos._decode_typed_ragged_values({**payload, "data": data}, 3, metadata)
+
+    assert metadata["physical_layout"] == "contiguous_flat"
+    assert decoded[1] is None
+    assert all(
+        row is None or isinstance(row, np.ndarray) for row in decoded
+    )
+    assert all(
+        row is None or np.shares_memory(row, data) for row in decoded
+    )
+    assert [None if row is None else row.tolist() for row in decoded] == [
+        rows[0].tolist(),
+        None,
+        rows[2].tolist(),
+    ]
+
+
 def test_dataproto_helper_rejects_unsupported_object_non_tensor() -> None:
     _store, transfer = make_transfer()
     data = SimpleDataProto(
