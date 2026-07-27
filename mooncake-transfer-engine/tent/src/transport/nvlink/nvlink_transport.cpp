@@ -335,6 +335,9 @@ void NVLinkTransport::startTransfer(std::vector<NVLinkTask*>& tasks,
 Status NVLinkTransport::getTransferStatus(SubBatchRef batch, int task_id,
                                           TransferStatus& status) {
     auto shm_batch = dynamic_cast<NVLinkSubBatch*>(batch);
+    if (!shm_batch) {
+        return Status::InvalidArgument("Invalid NVLink sub-batch" LOC_MARK);
+    }
     if (task_id < 0 || task_id >= (int)shm_batch->task_list.size()) {
         return Status::InvalidArgument("Invalid task id" LOC_MARK);
     }
