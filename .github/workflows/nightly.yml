@@ -1,0 +1,385 @@
+name: Nightly Build & Test
+
+on:
+  schedule:
+    - cron: '0 16 * * *'  # 00:00 Beijing Time (UTC+8)
+  workflow_dispatch:
+    inputs:
+      skip_publish:
+        description: 'Skip publishing to TestPyPI'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-${{ github.ref_name }}
+  cancel-in-progress: true
+
+# ── Workflow Design Notes ──────────────────────────────────────────────────────
+# 1. version-stamp computes a forward-looking nightly version (next patch + .devYYYYMMDD)
+#    that sorts AFTER the current release per PEP 440, e.g. "0.3.12.dev20260720".
+# 2. Build jobs pass the nightly version via `version-override` to _build-wheel.yaml
+#    so each wheel is stamped with the correct dev version for TestPyPI.
+# 3. publish-testpypi uploads all nightly-* artifacts to TestPyPI.
+# 4. nightly-gate aggregates ALL build + test results; notify-failure files an issue.
+# ──────────────────────────────────────────────────────────────────────────────
+
+env:
+  SCCACHE_GHA_ENABLED: "true"
+
+jobs:
+  version-stamp:
+    runs-on: ubuntu-22.04
+    outputs:
+      nightly_version: ${{ steps.version.outputs.nightly_version }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compute nightly version
+        id: version
+        run: |
+          BASE_VERSION=$(grep -Po '(?<=^version = ")[^"]+' mooncake-wheel/pyproject.toml)
+          # Strip .postN suffix if present, then bump patch for forward-looking version
+          CLEAN_VERSION=$(echo "$BASE_VERSION" | sed 's/\.post[0-9]*$//')
+          MAJOR=$(echo "$CLEAN_VERSION" | cut -d. -f1)
+          MINOR=$(echo "$CLEAN_VERSION" | cut -d. -f2)
+          PATCH=$(echo "$CLEAN_VERSION" | cut -d. -f3)
+          NEXT_PATCH=$((PATCH + 1))
+          NIGHTLY_VERSION="${MAJOR}.${MINOR}.${NEXT_PATCH}.dev$(date -u +%Y%m%d)"
+          echo "nightly_version=$NIGHTLY_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Nightly version: $NIGHTLY_VERSION"
+
+  build-cuda128-x86:
+    needs: version-stamp
+    uses: ./.github/workflows/_build-wheel.yaml
+    with:
+      runner: ubuntu-22.04
+      container: pytorch/manylinux2_28-builder:cuda12.8
+      python-versions: '["3.10", "3.12"]'
+      cuda: container
+      build-with-ep: '1'
+      torch-cuda-arch-list: '8.0;9.0'
+      ep-torch-versions: '2.11.0;2.12.0;2.12.1'
+      build-nvlink-allocator: true
+      cmake-args: >-
+        -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON
+        -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
+      artifact-prefix: nightly-cuda128-x86
+      version-override: ${{ needs.version-stamp.outputs.nightly_version }}
+
+  build-cuda128-arm64:
+    needs: version-stamp
+    uses: ./.github/workflows/_build-wheel.yaml
+    with:
+      runner: ubuntu-22.04-arm
+      python-versions: '["3.10", "3.12"]'
+      cuda: sbsa-12.8
+      cmake-generator: Ninja
+      torch-cuda-arch-list: '9.0'
+      cmake-args: >-
+        -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=OFF
+        -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
+      artifact-prefix: nightly-cuda128-arm64
+      version-override: ${{ needs.version-stamp.outputs.nightly_version }}
+
+  build-cuda13-x86:
+    needs: version-stamp
+    uses: ./.github/workflows/_build-wheel.yaml
+    with:
+      runner: ubuntu-22.04
+      container: pytorch/manylinux2_28-builder:cuda13.0
+      python-versions: '["3.10", "3.12"]'
+      cuda: container
+      build-with-ep: '1'
+      variant-flag: CU13_BUILD
+      torch-cuda-arch-list: '8.0;9.0'
+      ep-torch-versions: '2.11.0;2.12.0;2.12.1'
+      build-nvlink-allocator: true
+      cmake-args: >-
+        -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON
+        -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
+      artifact-prefix: nightly-cuda13-x86
+      version-override: ${{ needs.version-stamp.outputs.nightly_version }}
+
+  publish-testpypi:
+    needs: [version-stamp, build-cuda128-x86, build-cuda128-arm64, build-cuda13-x86]
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.skip_publish == 'true') }}
+    runs-on: ubuntu-22.04
+    environment: nightly
+    permissions:
+      contents: read
+    steps:
+      - name: Log nightly version
+        run: |
+          echo "Publishing nightly version: ${{ needs.version-stamp.outputs.nightly_version }}"
+
+      - name: Download all nightly wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-all
+          pattern: 'nightly-*'
+
+      - name: Collect and rename wheels with nightly version
+        run: |
+          mkdir -p dist-publish
+          find dist-all -name "*.whl" -exec cp {} dist-publish/ \;
+          echo "Collected wheels:"
+          ls -la dist-publish/
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install twine
+        run: pip install twine
+
+      - name: Validate wheels
+        run: twine check dist-publish/*.whl
+
+      - name: Publish to TestPyPI
+        env:
+          TWINE_USERNAME: __token__
+          TWINE_PASSWORD: ${{ secrets.TESTPYPI_API_TOKEN }}
+        run: |
+          twine upload --repository testpypi --skip-existing dist-publish/*.whl
+
+  nightly-test:
+    runs-on: ubuntu-22.04
+    env:
+      CI: "true"
+      SCCACHE_GHA_ENABLED: "true"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install and start etcd
+        run: |
+          wget -q https://github.com/etcd-io/etcd/releases/download/v3.6.1/etcd-v3.6.1-linux-amd64.tar.gz
+          tar xzf etcd-v3.6.1-linux-amd64.tar.gz
+          sudo mv etcd-v3.6.1-linux-amd64/etcd* /usr/local/bin/
+          etcd --advertise-client-urls http://127.0.0.1:2379 --listen-client-urls http://127.0.0.1:2379 &
+          sleep 3
+          ETCDCTL_API=3 etcdctl --endpoints=http://127.0.0.1:2379 endpoint health
+
+      - name: Free up disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/lib/android
+          df -h
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.24
+        with:
+          cuda: '12.8.1'
+          linux-local-args: '["--toolkit"]'
+          method: 'network'
+          sub-packages: '["nvcc"]'
+
+      - name: Install build utilities
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build
+
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Configure sccache
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Configure project (Release, no ASAN)
+        run: |
+          sudo apt update -y
+          sudo bash -x dependencies.sh -y
+          mkdir build && cd build
+          cmake -G Ninja .. \
+            -DUSE_HTTP=ON -DUSE_CXL=ON -DUSE_UB=ON -DUSE_ETCD=ON -DUSE_CUDA=ON \
+            -DSTORE_USE_ETCD=ON -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_UNIT_TESTS=ON -DENABLE_SCCACHE=ON
+
+      - name: Build project
+        run: |
+          cd build
+          cmake --build . -j$(nproc)
+          sudo cmake --install .
+
+      - name: Build nvlink_allocator.so
+        run: |
+          mkdir -p build/mooncake-transfer-engine/nvlink-allocator
+          cd mooncake-transfer-engine/nvlink-allocator
+          export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
+          bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
+
+      - name: Start Metadata Server
+        run: |
+          cd mooncake-transfer-engine/example/http-metadata-server-python
+          pip install aiohttp
+          python ./bootstrap_server.py &
+          sleep 2
+
+      - name: Run CTest unit tests
+        run: |
+          cd build
+          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+          MC_METADATA_SERVER=http://127.0.0.1:8080/metadata \
+          DEFAULT_KV_LEASE_TTL=500 \
+            ctest --parallel $(nproc) --output-on-failure
+
+      - name: Run Mooncake Store Rust smoke test
+        run: |
+          $GITHUB_WORKSPACE/build/mooncake-store/src/mooncake_master \
+            --eviction_high_watermark_ratio=0.95 \
+            --cluster_id=nightly_rust_cluster \
+            --port 50051 &
+          MASTER_PID=$!
+          sleep 3
+          cd mooncake-store/rust
+          export LD_LIBRARY_PATH=$GITHUB_WORKSPACE/build/mooncake-asio:$GITHUB_WORKSPACE/build/mooncake-store/src:$GITHUB_WORKSPACE/build/mooncake-store/src/cachelib_memory_allocator:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base:$GITHUB_WORKSPACE/build/mooncake-common/etcd:$LD_LIBRARY_PATH
+          export MOONCAKE_BUILD_DIR=$GITHUB_WORKSPACE/build
+          export MOONCAKE_STORE_LIB_DIR=$GITHUB_WORKSPACE/build/mooncake-store/src
+          export MOONCAKE_STORE_INCLUDE_DIR=$GITHUB_WORKSPACE/mooncake-store/include
+          export MC_METADATA_SERVER=http://127.0.0.1:8080/metadata
+          export MC_RUST_STORE_RUN_INTEGRATION=true
+          export MC_RUST_STORE_MASTER_ADDR=127.0.0.1:50051
+          export MC_RUST_STORE_LOCAL_HOSTNAME=127.0.0.1
+          export MC_RUST_STORE_PROTOCOL=tcp
+          export MC_RUST_STORE_DEVICE_NAME=
+          cargo test --test minimal_smoke -- --nocapture
+          MC_RUST_BENCH_ITERATIONS=4 \
+          MC_RUST_BENCH_VALUE_SIZE=4096 \
+          MC_RUST_BENCH_WARMUP=1 \
+            cargo run --release --example store_benchmark
+          kill $MASTER_PID 2>/dev/null || true
+
+      - name: Run Go store binding integration tests
+        run: |
+          $GITHUB_WORKSPACE/build/mooncake-store/src/mooncake_master \
+            --eviction_high_watermark_ratio=0.95 \
+            --cluster_id=nightly_go_cluster \
+            --port 50051 &
+          MASTER_PID=$!
+          sleep 3
+          cd mooncake-store/go
+          export LD_LIBRARY_PATH=$GITHUB_WORKSPACE/build/mooncake-common:$GITHUB_WORKSPACE/build/mooncake-store/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base:$GITHUB_WORKSPACE/build/mooncake-common/etcd
+          export CGO_ENABLED=1
+          export CGO_CFLAGS="-I$GITHUB_WORKSPACE/mooncake-store/include -I$GITHUB_WORKSPACE/mooncake-transfer-engine/include"
+          export CGO_LDFLAGS="-L$GITHUB_WORKSPACE/build/mooncake-store/src -L$GITHUB_WORKSPACE/build/mooncake-store/src/cachelib_memory_allocator -L$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src -L$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base -L$GITHUB_WORKSPACE/build/mooncake-common -L$GITHUB_WORKSPACE/build/mooncake-common/etcd -lmooncake_store -lcachelib_memory_allocator -ltransfer_engine -lbase -lasio -letcd_wrapper -lstdc++ -lnuma -lglog -lgflags -libverbs -lmlx5 -ljsoncpp -lzstd -lcurl -luring -lm -lxxhash -lyaml-cpp"
+          if [ -d /usr/local/cuda/lib64 ]; then export CGO_LDFLAGS="$CGO_LDFLAGS -L/usr/local/cuda/lib64 -lcudart"; fi
+          if ldconfig -p 2>/dev/null | grep -q libzmq; then export CGO_LDFLAGS="$CGO_LDFLAGS -lzmq"; fi
+          MC_METADATA_SERVER=http://127.0.0.1:8080/metadata go test -v ./tests/...
+          kill $MASTER_PID 2>/dev/null || true
+
+      - name: Build and install Python wheel for integration tests
+        run: |
+          export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
+          export CUDA_HOME=/usr/local/cuda
+          PYTHON_VERSION=3.12 OUTPUT_DIR=dist ./scripts/build_wheel.sh
+          pip install mooncake-wheel/dist/*.whl
+
+      - name: Run Python integration tests (full suite)
+        env:
+          MC_METADATA_SERVER: http://127.0.0.1:8080/metadata
+          DEFAULT_KV_LEASE_TTL: "500"
+          TEST_SSD_OFFLOAD_IN_EVICT: "1"
+          TEST_PROMOTION_ON_HIT: "1"
+        run: |
+          export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
+          bash scripts/run_tests.sh
+
+  nightly-gate:
+    if: always()
+    needs: [build-cuda128-x86, build-cuda128-arm64, build-cuda13-x86, publish-testpypi, nightly-test]
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Check results
+        run: |
+          echo "=== Nightly Gate Summary ==="
+          echo "Build CUDA 12.8 x86: ${{ needs.build-cuda128-x86.result }}"
+          echo "Build CUDA 12.8 arm64: ${{ needs.build-cuda128-arm64.result }}"
+          echo "Build CUDA 13 x86: ${{ needs.build-cuda13-x86.result }}"
+          echo "Publish: ${{ needs.publish-testpypi.result }}"
+          echo "Test: ${{ needs.nightly-test.result }}"
+          # Fail if any build job did not succeed
+          if [ "${{ needs.build-cuda128-x86.result }}" != "success" ]; then
+            echo "::error::Build CUDA 12.8 x86 failed!"
+            exit 1
+          fi
+          if [ "${{ needs.build-cuda128-arm64.result }}" != "success" ]; then
+            echo "::error::Build CUDA 12.8 arm64 failed!"
+            exit 1
+          fi
+          if [ "${{ needs.build-cuda13-x86.result }}" != "success" ]; then
+            echo "::error::Build CUDA 13 x86 failed!"
+            exit 1
+          fi
+          if [ "${{ needs.nightly-test.result }}" != "success" ]; then
+            echo "::error::Nightly tests failed!"
+            exit 1
+          fi
+          # publish-testpypi may be skipped (skip_publish=true) — only fail on actual failure
+          if [ "${{ needs.publish-testpypi.result }}" == "failure" ]; then
+            echo "::error::Nightly publish failed!"
+            exit 1
+          fi
+          echo "All nightly jobs passed!"
+
+  notify-failure:
+    if: ${{ always() && needs.nightly-gate.result == 'failure' }}
+    needs: [nightly-gate]
+    runs-on: ubuntu-22.04
+    permissions:
+      issues: write
+    steps:
+      - name: Create failure issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const labelName = 'nightly-failure';
+            // Ensure the label exists
+            try {
+              await github.rest.issues.getLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: labelName,
+              });
+            } catch (e) {
+              if (e.status === 404) {
+                await github.rest.issues.createLabel({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  name: labelName,
+                  color: 'd73a4a',
+                  description: 'Nightly CI workflow failure',
+                });
+              }
+            }
+            const title = `Nightly build/test failure - ${new Date().toISOString().slice(0, 10)}`;
+            const body = [
+              '## Nightly Failure Report',
+              '',
+              `**Run**: ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              `**Branch**: ${context.ref}`,
+              `**Timestamp**: ${new Date().toISOString()}`,
+              '',
+              'Please investigate the failed jobs in the workflow run linked above.',
+            ].join('\n');
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title,
+              body,
+              labels: [labelName],
+            });
