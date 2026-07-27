@@ -63,7 +63,9 @@ TEST_F(GdsContextTest, WriteRead_CpuBuffer) {
     ASSERT_EQ(value_off % RecordHeader::kValueAlignment, 0u);
 
     RecordHeader hdr{.key_len = klen, .value_len = vlen};
-    ASSERT_EQ(::pwrite(fd, &hdr, RecordHeader::SIZE, 0), RecordHeader::SIZE);
+    char hdr_buf[RecordHeader::SIZE];
+    hdr.WriteTo(hdr_buf);
+    ASSERT_EQ(::pwrite(fd, hdr_buf, RecordHeader::SIZE, 0), RecordHeader::SIZE);
     ASSERT_EQ(::pwrite(fd, key.data(), klen, RecordHeader::SIZE),
               static_cast<ssize_t>(klen));
     static const char kZeros[RecordHeader::kValueAlignment] = {};
@@ -74,9 +76,10 @@ TEST_F(GdsContextTest, WriteRead_CpuBuffer) {
               static_cast<ssize_t>(vlen));
 
     // Read back
-    RecordHeader read_hdr;
-    ASSERT_EQ(::pread(fd, &read_hdr, RecordHeader::SIZE, 0),
+    char read_hdr_buf[RecordHeader::SIZE];
+    ASSERT_EQ(::pread(fd, read_hdr_buf, RecordHeader::SIZE, 0),
               RecordHeader::SIZE);
+    RecordHeader read_hdr = RecordHeader::ReadFrom(read_hdr_buf);
     EXPECT_EQ(read_hdr.key_len, key.size());
     EXPECT_EQ(read_hdr.value_len, value.size());
 

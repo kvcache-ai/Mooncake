@@ -11,6 +11,8 @@
 #include <utility>
 #include <vector>
 
+#include "tenant_id.h"
+
 #include "Slab.h"
 #include "ylt/struct_json/json_reader.h"
 #include "ylt/struct_json/json_writer.h"
@@ -226,61 +228,6 @@ static constexpr size_t DEFAULT_LOCAL_BUFFER_SIZE = 1024 * 1024 * 16;    // 16MB
 constexpr const char* DEFAULT_PROTOCOL = "tcp";
 constexpr const char* DEFAULT_MASTER_SERVER_ADDR = "127.0.0.1:50051";
 static constexpr int DEFAULT_CLIENT_HTTP_PORT = 9300;
-
-// Original: returns a new string (copies when tenant_id is non-empty).
-// Kept for backward compatibility with callers that need an owned string.
-inline std::string NormalizeTenantId(const std::string& tenant_id) {
-    return tenant_id.empty() ? "default" : tenant_id;
-}
-
-inline bool IsValidTenantId(const std::string& tenant_id) {
-    if (tenant_id.empty() || tenant_id.front() == '_') {
-        return false;
-    }
-    for (unsigned char c : tenant_id) {
-        if (c < 0x20 || c == 0x7f) {
-            return false;
-        }
-    }
-    return true;
-}
-
-// Zero-copy variant: returns a const reference that is valid as long as
-// the input `tenant_id` is alive. When the input is empty, returns a
-// reference to a static "default" string. Use this in hot-path callers
-// (getMetadataShardIndex, getTenantQuotaShardIndex, MakeObjectIdentity, …)
-// to eliminate the string copy that NormalizeTenantId() would otherwise
-// perform on every invocation.
-//
-// WARNING: The returned reference must not outlive the input tenant_id.
-// Passing a temporary string (e.g., NormalizeTenantIdRef(get_temp_str()))
-// creates a dangling reference when the temporary is destroyed at the
-// semicolon. Callers that need an owned string should use NormalizeTenantId().
-inline const std::string& NormalizeTenantIdRef(const std::string& tenant_id) {
-    static const std::string kDefaultTenant = "default";
-    return tenant_id.empty() ? kDefaultTenant : tenant_id;
-}
-
-inline std::string MakeTenantScopedStorageKey(const std::string& tenant_id,
-                                              const std::string& key) {
-    const auto& normalized_tenant = NormalizeTenantIdRef(tenant_id);
-    std::string scoped_key;
-    scoped_key.reserve(normalized_tenant.size() + key.size() + 1);
-    scoped_key.append(normalized_tenant);
-    scoped_key.push_back('\0');
-    scoped_key.append(key);
-    return scoped_key;
-}
-
-inline std::pair<std::string, std::string> ParseTenantScopedStorageKey(
-    const std::string& storage_key) {
-    const auto separator = storage_key.find('\0');
-    if (separator == std::string::npos) {
-        return {"default", storage_key};
-    }
-    return {NormalizeTenantId(storage_key.substr(0, separator)),
-            storage_key.substr(separator + 1)};
-}
 
 struct OffloadTaskItem {
     std::string tenant_id;

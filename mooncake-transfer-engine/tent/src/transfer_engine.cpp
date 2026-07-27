@@ -178,5 +178,9 @@ Status TransferEngine::progressBatch(BatchID batch_id,
     return impl_->progressBatch(batch_id, overall_status);
 }
 
+Status TransferEngine::getNicLoadStats(std::vector<NicLoadStats>& stats) const {
+    return impl_->getNicLoadStats(stats);
+}
+
 }  // namespace tent
 }  // namespace mooncake

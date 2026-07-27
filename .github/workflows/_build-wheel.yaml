@@ -94,9 +94,7 @@ jobs:
 
       - name: Free up disk space
         if: ${{ inputs.container == '' }}
-        run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL /usr/local/lib/android
-          df -h
+        uses: ./.github/actions/free-disk-space
 
       - name: Install CUDA Toolkit (arm64 SBSA)
         if: ${{ startsWith(inputs.cuda, 'sbsa-') }}
@@ -134,6 +132,9 @@ jobs:
           cmake "${gen[@]}" .. $CMAKE_ARGS "${ep[@]}" -DPython3_EXECUTABLE="$(which python3)"
 
       - name: Build project
+        env:
+          # Bound the nested Ninja build used by torch.utils.cpp_extension.
+          MAX_JOBS: "2"
         run: |
           for dir in /usr/local/cuda/lib64/stubs /usr/local/cuda/targets/*/lib/stubs; do
             [ -d "$dir" ] && export LIBRARY_PATH="$dir:${LIBRARY_PATH:-}"

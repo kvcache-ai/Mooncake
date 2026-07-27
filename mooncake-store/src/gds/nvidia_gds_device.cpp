@@ -24,7 +24,8 @@ class NvidiaGdsDeviceOps final : public GdsDeviceOps {
 
     GdsDeviceError DriverOpen() override {
         CUfileError_t r = cuFileDriverOpen();
-        return GdsDeviceError{static_cast<int>(r.err)};
+        return GdsDeviceError{static_cast<int>(r.err),
+                              static_cast<int>(r.cu_err)};
     }
 
     GdsDeviceError FileHandleRegister(GdsDeviceFileHandle* out,
@@ -34,7 +35,8 @@ class NvidiaGdsDeviceOps final : public GdsDeviceOps {
         desc.handle.fd = fd;
         CUfileError_t r =
             cuFileHandleRegister(reinterpret_cast<CUfileHandle_t*>(out), &desc);
-        return GdsDeviceError{static_cast<int>(r.err)};
+        return GdsDeviceError{static_cast<int>(r.err),
+                              static_cast<int>(r.cu_err)};
     }
 
     void FileHandleDeregister(GdsDeviceFileHandle handle) override {
@@ -43,7 +45,8 @@ class NvidiaGdsDeviceOps final : public GdsDeviceOps {
 
     GdsDeviceError BufRegister(void* ptr, size_t size) override {
         CUfileError_t r = cuFileBufRegister(ptr, size, 0);
-        return GdsDeviceError{static_cast<int>(r.err)};
+        return GdsDeviceError{static_cast<int>(r.err),
+                              static_cast<int>(r.cu_err)};
     }
 
     void BufDeregister(void* ptr) override {

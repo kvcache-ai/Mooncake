@@ -15,9 +15,9 @@
 #pragma once
 
 #include <atomic>
+#include <map>
 #include <memory>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
 #include <glog/logging.h>
@@ -31,7 +31,8 @@ namespace mooncake {
 // On-disk record layout (single definition, shared by GDS and non-GDS
 // paths of OffsetAllocatorStorageBackend):
 //
-//   [u32 key_len][u32 value_len][key bytes][zero padding][value bytes]
+//   [u32 key_len][u32 value_len][u64 seq][u32 flags][u32 crc32]
+//   [key bytes][zero padding][value bytes]
 //
 // The value region always starts at a kValueAlignment boundary within the
 // record so that cuFile DMA operates on aligned file offsets.  cuFile
@@ -40,13 +41,50 @@ namespace mooncake {
 // would defeat the purpose of GDS.  The padding is a pure function of
 // key_len, so writer and reader derive the same layout independently.
 struct RecordHeader {
+    // Length of key in bytes
     uint32_t key_len;
+
+    // Length of value in bytes
     uint32_t value_len;
-    static constexpr size_t SIZE = sizeof(uint32_t) * 2;  // 8 bytes
+
+    // insert_seq_ stamp of this write (monotonic per BatchOffload entry).
+    // GDS DMA writes leave this as 0; recovery orders via checkpoint seq.
+    uint64_t seq;
+
+    // Record flags; see kFlag* constants below.
+    uint32_t flags;
+
+    // CRC-32C over [key_len|value_len|seq|flags] + key + value.
+    // Valid only when (flags & kFlagHasCrc).  GDS writes set this to 0.
+    uint32_t crc32;
+
+    // flags: crc32 field carries a valid CRC-32C of this record.
+    static constexpr uint32_t kFlagHasCrc = 1u << 0;
+
+    // flags: reservation placeholder.  ReserveOffloadSpace stamps a
+    // header with this bit at the allocated offset before the client
+    // DMA writes the real record.  Deliberately NOT part of kKnownFlags:
+    // recovery must reject any header still carrying this bit (the
+    // record was never written).
+    static constexpr uint32_t kFlagReservationPlaceholder = 1u << 31;
+
+    // All currently defined flag bits; recovery drops records with
+    // unknown bits set (written by a newer format).
+    static constexpr uint32_t kKnownFlags = kFlagHasCrc;
 
     // File-offset alignment for the value region.  4 KiB covers the
     // logical block size of all currently supported NVMe devices.
     static constexpr uint32_t kValueAlignment = 4096;
+
+    // Header size: 24 bytes on disk (fields are (de)serialized
+    // field-by-field; do NOT use sizeof(RecordHeader), which includes
+    // padding).
+    static constexpr size_t SIZE =
+        sizeof(uint32_t) * 2 + sizeof(uint64_t) + sizeof(uint32_t) * 2;
+
+    // Size of the crc-covered header prefix (everything before crc32).
+    static constexpr size_t PREFIX_SIZE =
+        sizeof(uint32_t) * 2 + sizeof(uint64_t) + sizeof(uint32_t);
 
     // Zero-padding between key and value for the given key length.
     static constexpr uint32_t ValuePadding(uint32_t key_len) {
@@ -63,6 +101,37 @@ struct RecordHeader {
     // Total on-disk record size including padding.
     static constexpr uint64_t RecordSize(uint32_t key_len, uint32_t value_len) {
         return ValueOffsetInRecord(key_len) + value_len;
+    }
+
+    bool HasCrc() const { return (flags & kFlagHasCrc) != 0; }
+
+    void WritePrefixTo(char* out) const {
+        std::memcpy(out, &key_len, sizeof(key_len));
+        std::memcpy(out + sizeof(key_len), &value_len, sizeof(value_len));
+        std::memcpy(out + sizeof(key_len) + sizeof(value_len), &seq,
+                    sizeof(seq));
+        std::memcpy(out + sizeof(key_len) + sizeof(value_len) + sizeof(seq),
+                    &flags, sizeof(flags));
+    }
+
+    void WriteTo(char* out) const {
+        WritePrefixTo(out);
+        std::memcpy(out + PREFIX_SIZE, &crc32, sizeof(crc32));
+    }
+
+    static RecordHeader ReadFrom(const char* buf) {
+        RecordHeader h{};
+        size_t off = 0;
+        std::memcpy(&h.key_len, buf + off, sizeof(h.key_len));
+        off += sizeof(h.key_len);
+        std::memcpy(&h.value_len, buf + off, sizeof(h.value_len));
+        off += sizeof(h.value_len);
+        std::memcpy(&h.seq, buf + off, sizeof(h.seq));
+        off += sizeof(h.seq);
+        std::memcpy(&h.flags, buf + off, sizeof(h.flags));
+        off += sizeof(h.flags);
+        std::memcpy(&h.crc32, buf + off, sizeof(h.crc32));
+        return h;
     }
 
     // Validate header against expected metadata
@@ -106,7 +175,8 @@ struct GdsContext {
     // EnsureBufferRegistered() to reuse registrations across multiple
     // I/O operations on the same GPU address.
     Mutex buf_mutex_;
-    std::unordered_map<void*, size_t> registered_buffers_;
+    // Buffer registration cache (range-aware, ordered).
+    std::map<void*, size_t> registered_buffers_;
 
     // Initialize GDS: probe -> open gds_fd_ -> fallocate ->
     // gds_device_ops::FileHandleRegister. Returns error on failure;
@@ -137,7 +207,8 @@ struct GdsContext {
     //   value (CPU slice) -> ::pwrite (fallback)
     tl::expected<void, ErrorCode> WriteRecord(const std::string& key,
                                               const std::vector<Slice>& slices,
-                                              uint64_t offset);
+                                              uint64_t offset,
+                                              uint64_t seq = 0);
 
     // Read one record from the data file:
     //   header + key -> ::pread (CPU) + verification
@@ -154,6 +225,10 @@ struct GdsContext {
     // registration is replaced. Registration failure does not block
     // I/O — cuFile falls back to an internal bounce buffer.
     bool EnsureBufferRegistered(void* gpu_ptr, size_t size);
+
+    bool IsRangeCovered(void* ptr, size_t size);
+
+    bool RegisterAndCache(void* gpu_ptr, size_t size);
 
     // Static check — uses gds_device_ops::ProbeDeviceNode().
     // Does not open/close the driver.

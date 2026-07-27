@@ -24,14 +24,18 @@
 #include <mutex>
 #include <glog/logging.h>
 
-#include "utils.h"  // GetEnvOr<>
+#include "utils.h"    // GetEnvOr<>
+#include <sys/uio.h>  // pwritev
 
 #ifdef USE_GDS_BACKEND
 #include "gds/gds_device_ops.h"
 #include "device/accelerator_registry.h"
+#include <cufile.h>
 #endif
 
 namespace mooncake {
+
+static constexpr size_t kMaxRegisteredBuffers = 8192;
 
 // ===================================================================
 // GdsContext::Init()
@@ -357,10 +361,14 @@ bool GdsContext::ProbeGdsAvailable(const std::string& data_dir) {
 }
 
 // ===================================================================
+
 // GdsContext::WriteRecord()
 // ===================================================================
+// Header-last: value DMA before header.  Any failure leaves the
+// placeholder intact, so recovery rejects the torn record.
 tl::expected<void, ErrorCode> GdsContext::WriteRecord(
-    const std::string& key, const std::vector<Slice>& slices, uint64_t offset) {
+    const std::string& key, const std::vector<Slice>& slices, uint64_t offset,
+    uint64_t seq) {
 #ifdef USE_GDS_BACKEND
     if (key.size() > UINT32_MAX) {
         LOG(ERROR) << "WriteRecord: key size " << key.size()
@@ -370,9 +378,6 @@ tl::expected<void, ErrorCode> GdsContext::WriteRecord(
     uint32_t klen = static_cast<uint32_t>(key.size());
     size_t t = 0;
     for (const auto& s : slices) t += s.size;
-    // Defensive: reject objects larger than 4 GiB. The caller
-    // (OffsetAllocatorStorageBackend::BatchOffload) also checks this
-    // but this guards against future direct callers.
     if (t > UINT32_MAX) {
         LOG(ERROR) << "WriteRecord: total value size " << t
                    << " exceeds UINT32_MAX for key " << key
@@ -381,69 +386,94 @@ tl::expected<void, ErrorCode> GdsContext::WriteRecord(
     }
     uint32_t vsz = static_cast<uint32_t>(t);
 
-    // Shared mode: concurrent records use explicit offsets and never
-    // interleave; Shutdown() takes the exclusive mode to drain us.
     SharedMutexLocker io_lock(&io_mutex_, shared_lock);
 
-    RecordHeader hdr{.key_len = klen, .value_len = vsz};
-
-    // header + key -> pwrite (CPU path, always)
-    if (::pwrite(gds_fd_, &hdr, RecordHeader::SIZE,
-                 static_cast<off_t>(offset)) != RecordHeader::SIZE)
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-    if (::pwrite(gds_fd_, key.data(), klen,
-                 static_cast<off_t>(offset + RecordHeader::SIZE)) !=
-        static_cast<ssize_t>(klen))
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-
-    // Zero the alignment padding so the record is fully initialized
-    // (the padding bytes are part of the allocated extent).
-    const uint32_t pad = RecordHeader::ValuePadding(klen);
-    if (pad > 0) {
-        static const char kZeroPad[RecordHeader::kValueAlignment] = {};
-        if (::pwrite(gds_fd_, kZeroPad, pad,
-                     static_cast<off_t>(offset + RecordHeader::SIZE + klen)) !=
-            static_cast<ssize_t>(pad))
-            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-    }
-
-    // value slices — value region starts at an aligned file offset.
+    // Value region (DMA/pwrite) BEFORE header+key+pad.
     GdsDeviceFileHandle cfh = cu_file_handle_;
     uint64_t vo = offset + RecordHeader::ValueOffsetInRecord(klen);
 
-    for (const auto& s : slices) {
+    size_t coalesced_start = 0;
+    size_t coalesced_size = 0;
+    bool coalescing_gpu = false;
+
+    static const bool no_merge = GetEnvOr<bool>("MOONCAKE_GDS_NO_MERGE", false);
+    auto runtime = device::GetAcceleratorRegistry().RuntimeAccelerators(true);
+
+    auto flush_coalesced_group =
+        [&](size_t upto) -> tl::expected<void, ErrorCode> {
+        if (!coalescing_gpu || coalesced_size == 0) return {};
+
+        bool buf_ok =
+            EnsureBufferRegistered(slices[coalesced_start].ptr, coalesced_size);
+        if (!buf_ok) {
+            VLOG(1) << "GDS WRITE: coalesced buffer not registered, relying on"
+                    << " cuFile bounce buffer for ptr="
+                    << slices[coalesced_start].ptr
+                    << " size=" << coalesced_size;
+        }
+
+        ssize_t w = ops_->Write(cfh, slices[coalesced_start].ptr,
+                                coalesced_size, static_cast<off_t>(vo));
+        const int saved_errno = (w == -1) ? errno : 0;
+        VLOG(1) << "[GDS WRITE] cuFileWrite DMA (coalesced "
+                << (upto - coalesced_start)
+                << " slices): size=" << coalesced_size << " offset=" << vo
+                << " ret=" << w;
+        if (w != static_cast<ssize_t>(coalesced_size)) {
+            if (w == -1) {
+                char err_buf[128];
+                VLOG(1) << "[GDS WRITE] cuFileWrite errno=" << saved_errno
+                        << " ("
+                        << strerror_r(saved_errno, err_buf, sizeof(err_buf))
+                        << ")" << " offset=" << vo
+                        << " size=" << coalesced_size;
+            } else if (w < 0) {
+                VLOG(1) << "[GDS WRITE] cuFileWrite cu_err=" << w << " ("
+                        << cufileop_status_error(static_cast<CUfileOpError>(w))
+                        << ")";
+            }
+            return tl::make_unexpected(ErrorCode::GDS_IO_FAIL);
+        }
+
+        ::posix_fadvise(gds_fd_, static_cast<off_t>(vo),
+                        static_cast<off_t>(coalesced_size),
+                        POSIX_FADV_DONTNEED);
+
+        vo += coalesced_size;
+        coalesced_size = 0;
+        coalescing_gpu = false;
+        return {};
+    };
+
+    for (size_t i = 0; i < slices.size(); ++i) {
+        const auto& s = slices[i];
         if (s.size == 0) continue;
         if (!s.ptr) return tl::make_unexpected(ErrorCode::FILE_INVALID_BUFFER);
 
-        auto wr_runtime =
-            device::GetAcceleratorRegistry().RuntimeAccelerators(true);
         device::PointerInfo wr_info;
-        const auto* wr_dev = wr_runtime.FindDeviceForPointer(s.ptr, &wr_info);
+        const auto* wr_dev = runtime.FindDeviceForPointer(s.ptr, &wr_info);
         if (wr_dev) {
             wr_dev->SetContext(wr_info.device_id);
 
-            // Use registration cache to avoid repeated Register/Deregister
-            // for the same GPU address across multiple I/O operations.
-            bool buf_ok = EnsureBufferRegistered(s.ptr, s.size);
-            if (!buf_ok) {
-                // Registration failed — cuFile will use internal bounce
-                // buffer. Fall through to Write which handles this.
-                VLOG(1) << "GDS WRITE: buffer not registered, relying on "
-                        << "cuFile bounce buffer for ptr=" << s.ptr
-                        << " size=" << s.size;
+            if (!no_merge && coalescing_gpu &&
+                static_cast<char*>(slices[coalesced_start].ptr) +
+                        coalesced_size ==
+                    static_cast<char*>(s.ptr)) {
+                coalesced_size += s.size;
+                continue;
             }
-
-            ssize_t w = ops_->Write(cfh, s.ptr, s.size, static_cast<off_t>(vo));
-            VLOG(1) << "[GDS WRITE] cuFileWrite DMA: size=" << s.size
-                    << " offset=" << vo << " ret=" << w;
-            if (w != static_cast<ssize_t>(s.size))
-                return tl::make_unexpected(ErrorCode::GDS_IO_FAIL);
+            {
+                auto rc = flush_coalesced_group(i);
+                if (!rc) return rc;
+            }
+            coalesced_start = i;
+            coalesced_size = s.size;
+            coalescing_gpu = true;
         } else {
-            // Safety: verify this is truly CPU memory before pwrite.
-            // A GPU pointer passed to pwrite would segfault.
-            auto safety_rt =
-                device::GetAcceleratorRegistry().RuntimeAccelerators(true);
-            if (safety_rt.FindDeviceForPointer(s.ptr) != nullptr) {
+            auto rc = flush_coalesced_group(i);
+            if (!rc) return rc;
+
+            if (runtime.FindDeviceForPointer(s.ptr) != nullptr) {
                 LOG(ERROR) << "GDS WRITE: device pointer " << s.ptr
                            << " not matched by main lookup but found"
                            << " by safety check; refusing pwrite";
@@ -454,19 +484,74 @@ tl::expected<void, ErrorCode> GdsContext::WriteRecord(
             if (::pwrite(gds_fd_, s.ptr, s.size, static_cast<off_t>(vo)) !=
                 static_cast<ssize_t>(s.size))
                 return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+            vo += s.size;
         }
-        vo += s.size;
     }
+    auto rc = flush_coalesced_group(slices.size());
+    if (!rc) return rc;
+
+    // Header + key + pad -> single pwritev (COMMIT POINT)
+    RecordHeader hdr{
+        .key_len = klen, .value_len = vsz, .seq = seq, .flags = 0, .crc32 = 0};
+    char hdr_buf[RecordHeader::SIZE];
+    hdr.WriteTo(hdr_buf);
+
+    const uint32_t pad = RecordHeader::ValuePadding(klen);
+    static const char kZeroPad[RecordHeader::kValueAlignment] = {};
+    struct iovec head_iovs[3] = {
+        {hdr_buf, RecordHeader::SIZE},
+        {const_cast<char*>(key.data()), static_cast<size_t>(klen)},
+        {const_cast<char*>(kZeroPad), static_cast<size_t>(pad)},
+    };
+    struct iovec* iovp = head_iovs;
+    int niov = (pad > 0) ? 3 : 2;
+    off_t head_off = static_cast<off_t>(offset);
+    const size_t head_total = RecordHeader::SIZE + klen + pad;
+    size_t head_written = 0;
+    while (niov > 0) {
+        ssize_t n = ::pwritev(gds_fd_, iovp, niov, head_off);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            {
+                RecordHeader t{
+                    .key_len = 0,
+                    .value_len = 0,
+                    .seq = 0,
+                    .flags = RecordHeader::kFlagReservationPlaceholder,
+                    .crc32 = 0};
+                char tb[RecordHeader::SIZE];
+                t.WriteTo(tb);
+                ssize_t tw = ::pwrite(gds_fd_, tb, RecordHeader::SIZE,
+                                      static_cast<off_t>(offset));
+                (void)tw;
+            }
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        if (n == 0) return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        head_written += static_cast<size_t>(n);
+        head_off += n;
+        while (niov > 0 && static_cast<size_t>(n) >= iovp[0].iov_len) {
+            n -= static_cast<ssize_t>(iovp[0].iov_len);
+            ++iovp;
+            --niov;
+        }
+        if (niov > 0 && n > 0) {
+            iovp[0].iov_base = static_cast<char*>(iovp[0].iov_base) + n;
+            iovp[0].iov_len -= static_cast<size_t>(n);
+        }
+    }
+    if (head_written != head_total)
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     return {};
 #else
     (void)key;
     (void)slices;
     (void)offset;
+    (void)seq;
     return tl::make_unexpected(ErrorCode::GDS_NOT_AVAILABLE);
 #endif
 }
 
-// ===================================================================
 // GdsContext::ReadRecord()
 // ===================================================================
 tl::expected<void, ErrorCode> GdsContext::ReadRecord(
@@ -477,10 +562,17 @@ tl::expected<void, ErrorCode> GdsContext::ReadRecord(
     // Shutdown() takes the exclusive mode to drain us.
     SharedMutexLocker io_lock(&io_mutex_, shared_lock);
 
-    RecordHeader hdr;
-    if (::pread(gds_fd_, &hdr, RecordHeader::SIZE,
-                static_cast<off_t>(offset)) != RecordHeader::SIZE ||
-        hdr.value_len != expected_value_size)
+    char hdr_buf[RecordHeader::SIZE];
+    if (::pread(gds_fd_, hdr_buf, RecordHeader::SIZE,
+                static_cast<off_t>(offset)) != RecordHeader::SIZE)
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    RecordHeader hdr = RecordHeader::ReadFrom(hdr_buf);
+    if ((hdr.flags & ~RecordHeader::kKnownFlags) != 0) {
+        LOG(ERROR) << "ReadRecord: unknown flags " << hdr.flags << " at offset "
+                   << offset;
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+    if (hdr.value_len != expected_value_size)
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
 
     if (hdr.key_len > 65536) {
@@ -582,7 +674,8 @@ void GdsContext::Shutdown() {
     // if Shutdown() is called while an I/O thread is still running.
     {
         MutexLocker lock(&buf_mutex_);
-        for (auto& [ptr, _] : registered_buffers_) {
+        for (auto& [ptr, size] : registered_buffers_) {
+            (void)size;
             ops_->BufDeregister(ptr);
         }
         registered_buffers_.clear();
@@ -610,20 +703,54 @@ void GdsContext::Shutdown() {
 }
 
 // ===================================================================
-// GdsContext::EnsureBufferRegistered()
-// ===================================================================
-// Cache GPU buffer registrations to avoid repeated cuFileBufRegister /
-// cuFileBufDeregister per-I/O. kv-cache blocks are reused across many
-// Put operations at the same GPU addresses, so hit rate is near 100%.
-bool GdsContext::EnsureBufferRegistered(void* gpu_ptr, size_t size) {
-#ifdef USE_GDS_BACKEND
-    MutexLocker lock(&buf_mutex_);
 
-    auto it = registered_buffers_.find(gpu_ptr);
-    if (it != registered_buffers_.end()) {
-        if (it->second == size) return true;  // already registered, same size
-        ops_->BufDeregister(gpu_ptr);         // size changed, re-register
-        registered_buffers_.erase(it);
+// GdsContext::IsRangeCovered()
+// ===================================================================
+bool GdsContext::IsRangeCovered(void* ptr, size_t size) {
+    auto it = registered_buffers_.upper_bound(ptr);
+    if (it == registered_buffers_.begin()) return false;
+    --it;
+    const char* base = static_cast<const char*>(it->first);
+    const char* p = static_cast<const char*>(ptr);
+    return p >= base && (p - base) + size <= it->second;
+}
+
+// ===================================================================
+// GdsContext::RegisterAndCache()
+// ===================================================================
+bool GdsContext::RegisterAndCache(void* gpu_ptr, size_t size) {
+#ifdef USE_GDS_BACKEND
+    // Overlap protection: evict fully-contained sub-ranges before registering.
+    {
+        const char* p = static_cast<const char*>(gpu_ptr);
+        const char* p_end = p + size;
+        auto it = registered_buffers_.lower_bound(gpu_ptr);
+        if (it != registered_buffers_.begin()) {
+            auto prev = std::prev(it);
+            const char* prev_base = static_cast<const char*>(prev->first);
+            if (prev_base + prev->second > p &&
+                prev_base + prev->second <= p_end) {
+                ops_->BufDeregister(prev->first);
+                registered_buffers_.erase(prev);
+            }
+        }
+        while (it != registered_buffers_.end()) {
+            const char* base = static_cast<const char*>(it->first);
+            if (base >= p_end) break;
+            if (base + it->second <= p_end) {
+                ops_->BufDeregister(it->first);
+                it = registered_buffers_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    // Soft-cap eviction.  begin() is lowest address, not oldest.
+    while (registered_buffers_.size() >= kMaxRegisteredBuffers) {
+        auto oldest = registered_buffers_.begin();
+        ops_->BufDeregister(oldest->first);
+        registered_buffers_.erase(oldest);
     }
 
     if (ops_->BufRegister(gpu_ptr, size).IsOk()) {
@@ -632,8 +759,36 @@ bool GdsContext::EnsureBufferRegistered(void* gpu_ptr, size_t size) {
     }
 
     VLOG(1) << "BufRegister failed for ptr=" << gpu_ptr << " size=" << size
-            << ", relying on cuFile bounce buffer";
+            << " (registered_buffers_ size=" << registered_buffers_.size()
+            << "), relying on cuFile bounce buffer";
     return false;
+#else
+    (void)gpu_ptr;
+    (void)size;
+    return false;
+#endif
+}
+
+// ===================================================================
+// GdsContext::EnsureBufferRegistered()
+// ===================================================================
+// Range-aware registration cache.  Lookup checks exact match, then range
+// containment (handles per-slice lookups after coalescing).
+bool GdsContext::EnsureBufferRegistered(void* gpu_ptr, size_t size) {
+#ifdef USE_GDS_BACKEND
+    MutexLocker lock(&buf_mutex_);
+
+    auto it = registered_buffers_.find(gpu_ptr);
+    if (it != registered_buffers_.end()) {
+        if (it->second == size) return true;
+        ops_->BufDeregister(gpu_ptr);
+        registered_buffers_.erase(it);
+        return RegisterAndCache(gpu_ptr, size);
+    }
+
+    if (IsRangeCovered(gpu_ptr, size)) return true;
+
+    return RegisterAndCache(gpu_ptr, size);
 #else
     (void)gpu_ptr;
     (void)size;

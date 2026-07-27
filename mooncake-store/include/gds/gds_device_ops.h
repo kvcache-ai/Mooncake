@@ -39,9 +39,10 @@ namespace mooncake {
 // IsOk()/IsErr(); no vendor types leak through this header.
 struct GdsDeviceError {
     int err = -1;
+    int cu_err = 0;  // CUDA driver error (NVIDIA only; 0 on other vendors)
     static constexpr int SUCCESS = 0;
 
-    bool IsOk() const { return err == SUCCESS; }
+    bool IsOk() const { return err == SUCCESS && cu_err == 0; }
     bool IsErr() const { return !IsOk(); }
 };
 
