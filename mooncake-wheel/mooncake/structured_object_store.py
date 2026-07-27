@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import ctypes
 import io
 import json
@@ -3385,6 +3386,7 @@ class _BundleManifestStore:
                         value,
                         target_chunk_bytes,
                         transfer_policy,
+                        config=config,
                     )
                 else:
                     payload_spec, payload_keys = self._put_payload(
@@ -3699,6 +3701,7 @@ class _BundleManifestStore:
         value: _MultiBufferPayload,
         chunk_bytes: int,
         transfer_policy: BundleTransferPolicy,
+        config: Any = None,
     ) -> tuple[dict[str, Any], list[str]]:
         total_bytes = value.nbytes
         if total_bytes == 0:
@@ -3710,6 +3713,7 @@ class _BundleManifestStore:
                 chunk_bytes,
                 transfer_policy,
                 pre_registered=False,
+                config=config,
             )
         chunk_groups = _split_multi_buffer_payload(value.buffers, chunk_bytes)
         chunk_keys = [
@@ -3720,6 +3724,7 @@ class _BundleManifestStore:
             chunk_keys,
             chunk_groups,
             transfer_policy,
+            config=config,
         )
         payload_spec = {
             "key": key,
@@ -3923,10 +3928,11 @@ class _MooncakePayloadTransport:
         chunk_keys: Sequence[str],
         chunk_groups: Sequence[Sequence[memoryview]],
         transfer_policy: BundleTransferPolicy,
+        config: Any = None,
     ) -> list[str]:
         def fallback_to_direct_put() -> list[str]:
             chunks = [memoryview(b"".join(group)) for group in chunk_groups]
-            return self._put_chunks_direct(chunk_keys, chunks)
+            return self._put_chunks_direct(chunk_keys, chunks, config=config)
 
         if transfer_policy.copy_mode == "zero_copy":
             # Joining one chunk group costs the same single copy the contiguous
@@ -3934,25 +3940,30 @@ class _MooncakePayloadTransport:
             # register-source-buffer zero-copy semantics of single-buffer puts.
             chunks = [memoryview(b"".join(group)) for group in chunk_groups]
             return self.put_payload_chunks(
-                chunk_keys, chunks, transfer_policy, pre_registered=False
+                chunk_keys,
+                chunks,
+                transfer_policy,
+                pre_registered=False,
+                config=config,
             )
         if transfer_policy.copy_mode == "copy" or self._ensure_buffer_pool() is None:
             return fallback_to_direct_put()
         if all(len(group) == 1 for group in chunk_groups):
             self.batch_put_buffer_groups_from(
-                chunk_keys, [[group[0]] for group in chunk_groups]
+                chunk_keys, [[group[0]] for group in chunk_groups], config=config
             )
             return list(chunk_keys)
         if not callable(self._batch_put_from):
             return fallback_to_direct_put()
         put_mode = self._resolve_buffer_group_put_mode(chunk_groups, transfer_policy)
         if put_mode == "batch":
-            self.batch_put_buffer_groups_from(chunk_keys, chunk_groups)
+            self.batch_put_buffer_groups_from(chunk_keys, chunk_groups, config=config)
             return list(chunk_keys)
         return self._put_buffer_groups_parallel(
             list(chunk_keys),
             [list(group) for group in chunk_groups],
             transfer_policy.max_inflight_put,
+            config=config,
         )
 
     def read_payload(self, payload_spec: Mapping[str, Any]) -> bytes:
@@ -4195,6 +4206,7 @@ class _MooncakePayloadTransport:
         self,
         chunk_keys: Sequence[str],
         chunk_groups: Sequence[Sequence[memoryview]],
+        config: Any = None,
     ) -> None:
         batch_put_from = self._batch_put_from
         if not callable(batch_put_from):
@@ -4209,7 +4221,9 @@ class _MooncakePayloadTransport:
             lease = pool.acquire(size)
             try:
                 _copy_memoryviews_to_lease(group, lease)
-                results = batch_put_from([chunk_key], [lease.ptr], [size])
+                results = _batch_put_from_with_optional_config(
+                    batch_put_from, [chunk_key], [lease.ptr], [size], config
+                )
                 self._check_batch_put_results(results, [chunk_key], "batch_put_from")
             except Exception:
                 _cleanup_keys(self._store, chunk_keys, strict=False)
@@ -4344,6 +4358,7 @@ class _MooncakePayloadTransport:
         chunk_keys: list[str],
         chunk_groups: list[Sequence[memoryview]],
         max_inflight_put: int,
+        config: Any = None,
     ) -> list[str]:
         groups = self._group_buffer_group_ranges(
             chunk_keys, chunk_groups, max_inflight_put
@@ -4358,6 +4373,7 @@ class _MooncakePayloadTransport:
                         self.batch_put_buffer_groups_from,
                         group_keys,
                         group_chunks,
+                        config,
                     )
                     for group_keys, group_chunks in groups
                 ]
@@ -5538,15 +5554,71 @@ def _call_write_with_optional_config(fn: Any, *args: Any, config: Any = None) ->
     return fn(*args, config=config)
 
 
+def _config_for_grouped_keys(config: Any, key_count: int) -> Any:
+    """Return a write config whose group_ids match the physical key count."""
+    if config is None or key_count <= 0:
+        return config
+    group_ids = getattr(config, "group_ids", None)
+    if group_ids is None:
+        return config
+    normalize_to_list = isinstance(group_ids, str)
+    if normalize_to_list:
+        group_ids = [group_ids]
+    else:
+        group_ids = list(group_ids)
+    if len(group_ids) != 1:
+        raise ValueError(
+            "structured object store config.group_ids must contain exactly one "
+            "logical group id; it is expanded across internal Mooncake keys"
+        )
+    if key_count == 1 and not normalize_to_list:
+        return config
+    grouped_config = _copy_write_config(config)
+    grouped_config.group_ids = [group_ids[0]] * key_count
+    return grouped_config
+
+
+def _copy_write_config(config: Any) -> Any:
+    try:
+        return copy.copy(config)
+    except TypeError:
+        pass
+    try:
+        copied = type(config)()
+    except Exception as error:
+        raise TypeError(
+            "structured object store config must be copyable or default-constructible"
+        ) from error
+    for name in dir(config):
+        if name.startswith("_"):
+            continue
+        try:
+            value = getattr(config, name)
+        except Exception:
+            continue
+        if callable(value):
+            continue
+        try:
+            setattr(copied, name, value)
+        except Exception as error:
+            raise TypeError(
+                f"structured object store config field {name!r} is not writable"
+            ) from error
+    return copied
+
+
 def _put_with_optional_config(
     store: BundleStore, key: str, value: Any, config: Any = None
 ) -> int:
-    return _call_write_with_optional_config(store.put, key, value, config=config)
+    return _call_write_with_optional_config(
+        store.put, key, value, config=_config_for_grouped_keys(config, 1)
+    )
 
 
 def _put_from_with_optional_config(
     store: BundleStore, key: str, ptr: int, size: int, config: Any = None
 ) -> int:
+    config = _config_for_grouped_keys(config, 1)
     put_tensor_from = getattr(store, "put_tensor_from", None)
     if config is None and callable(put_tensor_from):
         return put_tensor_from(key, ptr, size)
@@ -5564,7 +5636,11 @@ def _batch_put_from_with_optional_config(
     config: Any = None,
 ) -> Sequence[int]:
     return _call_write_with_optional_config(
-        batch_put_from, list(keys), list(ptrs), list(sizes), config=config
+        batch_put_from,
+        list(keys),
+        list(ptrs),
+        list(sizes),
+        config=_config_for_grouped_keys(config, len(keys)),
     )
 
 
