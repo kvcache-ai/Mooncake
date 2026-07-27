@@ -1536,6 +1536,19 @@ int RealClient::unmountSegment(const std::vector<std::string> &segment_ids,
     return first_error;
 }
 
+int RealClient::mountLocalDiskSegment(bool enable_offloading) {
+    if (!client_) {
+        LOG(ERROR) << "Client not initialized";
+        return -1;
+    }
+    auto result = client_->MountLocalDiskSegment(enable_offloading);
+    if (!result) {
+        LOG(ERROR) << "MountLocalDiskSegment failed: " << result.error();
+        return -1;
+    }
+    return 0;
+}
+
 int RealClient::allocateAndMountSegment(
     size_t size, const std::string &protocol, const std::string &location,
     std::vector<std::string> &out_segment_ids, size_t *out_allocated_size) {

@@ -653,6 +653,12 @@ inline std::vector<std::optional<std::string>> Replica::get_segment_names()
             segment_names.push_back(std::nullopt);
         }
         return segment_names;
+    } else if (is_local_disk_replica()) {
+        // LOCAL_DISK replicas use transport_endpoint as their segment
+        // identifier so that GetReplicaBySegmentName can locate them for
+        // drain-driven Move operations.
+        const auto& disk_data = std::get<LocalDiskReplicaData>(data_);
+        return {disk_data.transport_endpoint};
     }
     return std::vector<std::optional<std::string>>();
 }
