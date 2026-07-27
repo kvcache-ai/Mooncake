@@ -434,14 +434,14 @@ install(TARGETS mooncake_master mooncake_client DESTINATION bin)
 # (glog, cudart, ibverbs, ...) and, when enabled, the Go etcd/k8s HA backends.
 # ---------------------------------------------------------------------------
 if(WITH_STORE_C_SHARED)
-  # The link recipe below uses GNU-ld/ELF-specific features (--whole-archive,
-  # --as-needed, a version script, and $ORIGIN rpath). Fail early on platforms
-  # where they don't apply rather than at link time.
+  # The link recipe below uses ELF-specific features (--whole-archive,
+  # --as-needed, a version script, and $ORIGIN rpath), supported by GNU ld, gold,
+  # and lld. Gate on Linux/ELF and fail early elsewhere rather than at link time.
   if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
     message(
       FATAL_ERROR
-        "WITH_STORE_C_SHARED currently supports Linux/ELF with the GNU linker "
-        "only (got CMAKE_SYSTEM_NAME=${CMAKE_SYSTEM_NAME}).")
+        "WITH_STORE_C_SHARED currently supports Linux/ELF only "
+        "(got CMAKE_SYSTEM_NAME=${CMAKE_SYSTEM_NAME}).")
   endif()
 
   # This target whole-archives mooncake_store and reuses its OUTPUT_NAME, both of

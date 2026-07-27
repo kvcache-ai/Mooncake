@@ -203,7 +203,10 @@ fn library_path() -> OsString {
 /// library loads lazily on first store creation. Must be called before any
 /// store exists, and fails if a library is already loaded.
 pub fn load_library(path: impl AsRef<Path>) -> Result<(), StoreError> {
-    let _guard = INIT_LOCK.lock().unwrap();
+    // Recover on poison rather than panic a library call (the section only loads).
+    let _guard = INIT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let api = unsafe { Api::load(path.as_ref().as_os_str()) }?;
     API.set(api).map_err(|_| {
         StoreError::LibraryLoad(
@@ -221,7 +224,10 @@ pub fn ensure_loaded() -> Result<(), StoreError> {
         return Ok(());
     }
     // Double-checked under the lock so a concurrent race dlopen()s at most once.
-    let _guard = INIT_LOCK.lock().unwrap();
+    // Recover on poison rather than panic a library call (the section only loads).
+    let _guard = INIT_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if API.get().is_some() {
         return Ok(());
     }
