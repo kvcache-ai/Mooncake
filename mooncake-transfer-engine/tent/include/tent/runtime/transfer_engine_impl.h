@@ -161,6 +161,8 @@ class TransferEngineImpl {
 
     Status progressBatch(BatchID batch_id, TransferStatus& overall_status);
 
+    Status getNicLoadStats(std::vector<NicLoadStats>& stats) const;
+
     Status waitTransferCompletion(BatchID batch_id);
 
     Status transferSync(const std::vector<Request>& request_list);

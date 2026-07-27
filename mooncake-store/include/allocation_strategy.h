@@ -88,6 +88,33 @@ class AllocatorManager {
         return allocator_removed;
     }
 
+    struct Replacement {
+        std::string name;
+        std::shared_ptr<BufferAllocatorBase> expected;
+        std::shared_ptr<BufferAllocatorBase> replacement;
+    };
+
+    bool replaceAllocators(const std::vector<Replacement>& replacements) {
+        std::vector<decltype(allocators_)::mapped_type::iterator> targets;
+        targets.reserve(replacements.size());
+        for (const auto& replacement : replacements) {
+            auto it = allocators_.find(replacement.name);
+            if (it == allocators_.end() || !replacement.replacement) {
+                return false;
+            }
+            auto target = std::find(it->second.begin(), it->second.end(),
+                                    replacement.expected);
+            if (target == it->second.end()) {
+                return false;
+            }
+            targets.push_back(target);
+        }
+        for (size_t i = 0; i < replacements.size(); ++i) {
+            *targets[i] = replacements[i].replacement;
+        }
+        return true;
+    }
+
     /**
      * @brief Get the names of all segments. This returns a vector of the
      *        names so that we can randomly pick a segment without traversing.

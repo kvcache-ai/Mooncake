@@ -178,5 +178,5 @@ mooncake-conductor/
 +-- CMakeLists.txt
 ```
 
-See [Indexer API](./indexer-api-design.md) for the HTTP API and KV Events wire
+See [Indexer API](../../api-reference/http/conductor-indexer.md) for the HTTP API and KV Events wire
 format.

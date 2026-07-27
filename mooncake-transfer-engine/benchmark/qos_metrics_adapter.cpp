@@ -39,10 +39,17 @@ std::vector<QosClassSample> makeQosClassSamples(
 QosMetricsReport calculateQosMetricsFromBenchStats(
     size_t block_size, size_t batch_size, int num_threads,
     const std::vector<QosClassConfig>& classes,
-    std::vector<XferBenchStats>* stats, double link_capacity_gbps) {
+    std::vector<XferBenchStats>* stats, double link_capacity_gbps,
+    const std::vector<uint64_t>& bytes_per_operation) {
+    auto samples = makeQosClassSamples(classes, stats);
+    if (bytes_per_operation.size() == samples.size()) {
+        for (size_t i = 0; i < samples.size(); ++i) {
+            samples[i].transferred_bytes =
+                bytes_per_operation[i] * samples[i].operations;
+        }
+    }
     return calculateQosMetrics(block_size, batch_size, num_threads, classes,
-                               makeQosClassSamples(classes, stats),
-                               link_capacity_gbps);
+                               samples, link_capacity_gbps);
 }
 
 }  // namespace tent
