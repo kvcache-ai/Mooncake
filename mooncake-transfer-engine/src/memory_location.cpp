@@ -39,8 +39,7 @@ std::string genGpuNodeName(int node) {
 // buries real logs. Detect the absence once and skip the probe.
 static bool detectCudaDevicePresent() {
     int device_count = 0;
-    if (cudaGetDeviceCount(&device_count) != cudaSuccess ||
-        device_count == 0) {
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
         LOG(WARNING) << "No CUDA device detected; treating buffers as "
                         "host memory";
         return false;
