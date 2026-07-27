@@ -1148,6 +1148,11 @@ class BucketStorageBackend : public StorageBackendInterface {
     std::unordered_map<std::string, int64_t> GUARDED_BY(offloading_mutex_)
         ungrouped_offloading_objects_;
 
+    // Test-only fault injection: when set, the next WriteBucket data datasync()
+    // is treated as failed. Consumed (reset to false) on read. See
+    // SetDatasyncFailureForTest().
+    std::atomic<bool> test_datasync_failure_{false};
+
     // File handle cache for UringFile to avoid repeated open/close overhead
     mutable Mutex file_cache_mutex_;
     mutable std::unordered_map<std::string, std::shared_ptr<StorageFile>>
@@ -1159,6 +1164,15 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     // Clear file cache (called on destruction or when needed)
     void ClearFileCache();
+
+   public:
+    // ---- Test accessors ----
+    // Force the next bucket-data datasync() in WriteBucket to be treated as
+    // failed, so tests can verify that a failed durability flush aborts the
+    // offload and does not commit metadata. One-shot (consumed on use).
+    void SetDatasyncFailureForTest() {
+        test_datasync_failure_.store(true, std::memory_order_relaxed);
+    }
 };
 
 class OffsetAllocatorStorageBackend : public StorageBackendInterface {
