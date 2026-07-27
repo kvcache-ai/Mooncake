@@ -14,6 +14,7 @@
 #   -b, --base <branch>   Base branch to compare against (default: origin/main)
 #   -c, --check           Check mode: only report files that need formatting
 #       --staged          Format only added/modified lines staged for commit
+#       --changed-lines   Format only lines changed relative to the base branch
 #   -h, --help            Show this help message
 #
 # Examples:
@@ -22,6 +23,7 @@
 #   ./scripts/code_format.sh -b origin/dev      # Compare against origin/dev
 #   ./scripts/code_format.sh --check            # Check without modifying files
 #   ./scripts/code_format.sh --staged file.cpp  # Format staged lines (pre-commit)
+#   ./scripts/code_format.sh --changed-lines --check  # Check PR-changed lines
 # =============================================================================
 
 set -e
@@ -31,6 +33,7 @@ BASE_BRANCH="origin/main"
 CHECK_MODE=false
 ALL_MODE=false
 STAGED_MODE=false
+CHANGED_LINES_MODE=false
 INPUT_FILES=()
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
@@ -124,6 +127,10 @@ parse_args() {
                 STAGED_MODE=true
                 shift
                 ;;
+            --changed-lines)
+                CHANGED_LINES_MODE=true
+                shift
+                ;;
             -h|--help)
                 usage
                 ;;
@@ -147,6 +154,14 @@ parse_args() {
         print_error "--all and --staged cannot be used together."
         exit 1
     fi
+    if ${ALL_MODE} && ${CHANGED_LINES_MODE}; then
+        print_error "--all and --changed-lines cannot be used together."
+        exit 1
+    fi
+    if ${STAGED_MODE} && ${CHANGED_LINES_MODE}; then
+        print_error "--staged and --changed-lines cannot be used together."
+        exit 1
+    fi
 }
 
 # Extract the new-file line ranges from a zero-context staged diff. A pure
@@ -159,17 +174,39 @@ get_staged_line_ranges() {
         sed -nE 's/^@@ -[0-9]+(,[0-9]+)? \+([0-9]+)(,([0-9]+))? @@.*/\2 \4/p'
 }
 
-# Format only lines added or modified in the index. Pre-commit temporarily
-# stashes unstaged changes, so the working tree matches the staged snapshot
-# while this hook runs.
-format_staged_files() {
+# Extract the new-file line ranges changed between the base branch and HEAD.
+get_changed_line_ranges() {
+    local file="$1"
+
+    git -C "${PROJECT_ROOT}" diff --unified=0 --diff-filter=ACMR \
+        "${BASE_BRANCH}"...HEAD -- "${file}" |
+        sed -nE 's/^@@ -[0-9]+(,[0-9]+)? \+([0-9]+)(,([0-9]+))? @@.*/\2 \4/p'
+}
+
+get_selected_line_ranges() {
+    local file="$1"
+
+    if ${STAGED_MODE}; then
+        get_staged_line_ranges "${file}"
+    else
+        get_changed_line_ranges "${file}"
+    fi
+}
+
+# Format only selected added or modified lines. Pre-commit temporarily stashes
+# unstaged changes, so the working tree normally matches the staged snapshot.
+format_line_range_files() {
     local clang_format="$1"
     shift
     local formatted_count=0
     local failed_count=0
 
     print_info "Using $(${clang_format} --version)"
-    print_info "Formatting only staged C/C++ line ranges"
+    if ${STAGED_MODE}; then
+        print_info "Formatting only staged C/C++ line ranges"
+    else
+        print_info "Formatting only C/C++ line ranges changed against ${BASE_BRANCH}"
+    fi
     echo ""
 
     local file
@@ -186,10 +223,6 @@ format_staged_files() {
             continue
         fi
 
-        if [[ ! -f "${PROJECT_ROOT}/${file}" ]]; then
-            continue
-        fi
-
         local line_args=()
         local start count end
         while read -r start count; do
@@ -198,16 +231,34 @@ format_staged_files() {
             [[ "${count}" -eq 0 ]] && continue
             end=$((start + count - 1))
             line_args+=("-lines=${start}:${end}")
-        done < <(get_staged_line_ranges "${file}")
+        done < <(get_selected_line_ranges "${file}")
 
         if [[ ${#line_args[@]} -eq 0 ]]; then
+            continue
+        fi
+
+        if ${STAGED_MODE} &&
+            ! git -C "${PROJECT_ROOT}" diff --quiet --no-ext-diff -- "${file}"; then
+            print_error "Cannot process staged lines because '${file}' has unstaged changes."
+            print_info "Stage or stash the unstaged changes, then retry."
+            return 1
+        fi
+
+        if ${CHANGED_LINES_MODE} &&
+            ! git -C "${PROJECT_ROOT}" diff --quiet --no-ext-diff HEAD -- "${file}"; then
+            print_error "Cannot process committed line ranges because '${file}' has uncommitted changes."
+            print_info "Commit or stash the local changes, then retry."
+            return 1
+        fi
+
+        if [[ ! -f "${PROJECT_ROOT}/${file}" ]]; then
             continue
         fi
 
         if ${CHECK_MODE}; then
             if ! "${clang_format}" -style=file --dry-run -Werror \
                 "${line_args[@]}" "${PROJECT_ROOT}/${file}" 2>&1; then
-                print_warn "Staged lines need formatting: ${file}"
+                print_warn "Selected lines need formatting: ${file}"
                 failed_count=$((failed_count + 1))
             else
                 print_info "OK: ${file}"
@@ -221,11 +272,11 @@ format_staged_files() {
                 if [[ "${before}" == "${after}" ]]; then
                     print_info "Already formatted: ${file}"
                 else
-                    print_info "Formatted staged lines: ${file}"
+                    print_info "Formatted selected lines: ${file}"
                     formatted_count=$((formatted_count + 1))
                 fi
             else
-                print_error "Failed to format staged lines: ${file}"
+                print_error "Failed to format selected lines: ${file}"
                 failed_count=$((failed_count + 1))
             fi
         fi
@@ -233,11 +284,11 @@ format_staged_files() {
 
     echo ""
     if ${CHECK_MODE} && [[ ${failed_count} -gt 0 ]]; then
-        print_error "${failed_count} file(s) have unformatted staged lines."
+        print_error "${failed_count} file(s) have unformatted selected lines."
         return 1
     fi
     if ! ${CHECK_MODE}; then
-        print_info "Formatted staged lines in ${formatted_count} file(s)."
+        print_info "Formatted selected lines in ${formatted_count} file(s)."
     fi
     [[ ${failed_count} -eq 0 ]]
 }
@@ -383,19 +434,35 @@ main() {
         exit 1
     fi
 
-    if ${STAGED_MODE}; then
-        local staged_files=("${INPUT_FILES[@]}")
-        if [[ ${#staged_files[@]} -eq 0 ]]; then
-            local file
-            while IFS= read -r -d '' file; do
-                staged_files+=("${file}")
-            done < <(
-                git -C "${PROJECT_ROOT}" diff --cached --name-only -z \
-                    --diff-filter=ACMR -- \
-                    '*.c' '*.cc' '*.cpp' '*.cxx' '*.cu' '*.cuh' '*.h' '*.hpp'
-            )
+    if ${STAGED_MODE} || ${CHANGED_LINES_MODE}; then
+        if ${CHANGED_LINES_MODE} &&
+            ! git -C "${PROJECT_ROOT}" rev-parse --verify "${BASE_BRANCH}" &> /dev/null; then
+            print_error "Base branch '${BASE_BRANCH}' not found."
+            exit 1
         fi
-        format_staged_files "${clang_format}" "${staged_files[@]}"
+
+        local selected_files=("${INPUT_FILES[@]}")
+        if [[ ${#selected_files[@]} -eq 0 ]]; then
+            local file
+            if ${STAGED_MODE}; then
+                while IFS= read -r -d '' file; do
+                    selected_files+=("${file}")
+                done < <(
+                    git -C "${PROJECT_ROOT}" diff --cached --name-only -z \
+                        --diff-filter=ACMR -- \
+                        '*.c' '*.cc' '*.cpp' '*.cxx' '*.cu' '*.cuh' '*.h' '*.hpp'
+                )
+            else
+                while IFS= read -r -d '' file; do
+                    selected_files+=("${file}")
+                done < <(
+                    git -C "${PROJECT_ROOT}" diff --name-only -z \
+                        --diff-filter=ACMR "${BASE_BRANCH}"...HEAD -- \
+                        '*.c' '*.cc' '*.cpp' '*.cxx' '*.cu' '*.cuh' '*.h' '*.hpp'
+                )
+            fi
+        fi
+        format_line_range_files "${clang_format}" "${selected_files[@]}"
         return
     fi
 

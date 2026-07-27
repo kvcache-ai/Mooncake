@@ -90,7 +90,14 @@ git commit -m "wip: skipping hooks" --no-verify
 But please avoid using `--no-verify` for routine commits to keep code quality high.
 
 #### CI Integration
-The configuration supports automatic fixing PRs via `pre-commit.ci` if enabled. To activate, add the repository in the pre-commit.ci dashboard; no further changes are needed.
+GitHub pull-request and push checks validate only added or modified C/C++ line
+ranges relative to the selected base revision. This avoids failing a focused
+change solely because an otherwise untouched part of the same file has older
+formatting.
+
+The configuration also supports automatic fixing PRs via `pre-commit.ci` if
+enabled. To activate, add the repository in the pre-commit.ci dashboard; no
+further changes are needed.
 
 
 ## Code Quality
