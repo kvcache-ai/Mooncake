@@ -16,11 +16,14 @@
 
 #include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <atomic>
 #include <cerrno>
 #include <cstdint>
+#include <cstdio>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <thread>
@@ -53,6 +56,21 @@ class ShmTransportTestPeer {
         return transport.relocate_map_.find(target_id) !=
                transport.relocate_map_.end();
     }
+
+    static void* createSharedMemory(ShmTransport& transport,
+                                    const std::string& path, size_t size) {
+        return transport.createSharedMemory(path, size);
+    }
+
+    static void dropSegmentMappings(ShmTransport& transport,
+                                    SegmentID target_id) {
+        transport.dropSegmentMappings(target_id);
+    }
+
+    static void setCxlMountPath(ShmTransport& transport,
+                                const std::string& path) {
+        transport.cxl_mount_path_ = path;
+    }
 };
 
 namespace {
@@ -65,7 +83,9 @@ class ScopedShmFile {
         shm_unlink(name_.c_str());
         fd_ = shm_open(name_.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
         EXPECT_GE(fd_, 0);
-        if (fd_ >= 0) EXPECT_EQ(ftruncate(fd_, length_), 0);
+        if (fd_ >= 0) {
+            EXPECT_EQ(ftruncate(fd_, length_), 0);
+        }
     }
 
     ~ScopedShmFile() {
@@ -81,6 +101,26 @@ class ScopedShmFile {
     int fd_{-1};
 };
 
+Status installLocalSegmentWithShm(ControlService& metadata,
+                                  const std::string& shm_path,
+                                  uint64_t remote_addr, size_t length) {
+    return metadata.segmentManager().updateLocal(
+        [&](SegmentDesc& segment) -> Status {
+            segment.name = "shm_test_segment";
+            segment.machine_id = "shm_test_machine";
+            segment.type = SegmentType::Memory;
+            auto& memory = std::get<MemorySegmentDesc>(segment.detail);
+            memory.buffers.clear();
+            BufferDesc buffer;
+            buffer.addr = remote_addr;
+            buffer.length = length;
+            buffer.location = "cpu:0";
+            buffer.shm_path = shm_path;
+            memory.buffers.push_back(std::move(buffer));
+            return Status::OK();
+        });
+}
+
 TEST(ShmTransportTest, SharesAndReleasesRelocationAcrossThreads) {
     const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
     constexpr uint64_t kRemoteAddress = 0x10000000;
@@ -88,21 +128,8 @@ TEST(ShmTransportTest, SharesAndReleasesRelocationAcrossThreads) {
     ScopedShmFile shm_file(page_size);
 
     auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
-    ASSERT_TRUE(metadata->segmentManager()
-                    .updateLocal([&](SegmentDesc& segment) -> Status {
-                        segment.name = "shm_test_segment";
-                        segment.machine_id = "shm_test_machine";
-                        segment.type = SegmentType::Memory;
-                        auto& memory =
-                            std::get<MemorySegmentDesc>(segment.detail);
-                        BufferDesc buffer;
-                        buffer.addr = kRemoteAddress;
-                        buffer.length = page_size;
-                        buffer.location = "cpu:0";
-                        buffer.shm_path = shm_file.name();
-                        memory.buffers.push_back(std::move(buffer));
-                        return Status::OK();
-                    })
+    ASSERT_TRUE(installLocalSegmentWithShm(*metadata, shm_file.name(),
+                                           kRemoteAddress, page_size)
                     .ok());
 
     ShmTransport transport;
@@ -159,6 +186,185 @@ TEST(ShmTransportTest, SharesAndReleasesRelocationAcrossThreads) {
                                                address_after_uninstall,
                                                page_size, LOCAL_SEGMENT_ID)
                     .IsInvalidArgument());
+}
+
+// B1: consumer CXL path must not create a missing file (would SIGBUS later).
+TEST(ShmTransportTest, CxlConsumerDoesNotCreateMissingFile) {
+    const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    constexpr uint64_t kRemoteAddress = 0x20000000;
+
+    char tmpl[] = "/tmp/mooncake_shm_cxl_XXXXXX";
+    ASSERT_NE(mkdtemp(tmpl), nullptr);
+    const std::string cxl_dir(tmpl);
+    const std::string shm_name =
+        "mooncake_cxl_missing_" + std::to_string(getpid());
+    const std::string full_path = cxl_dir + "/" + shm_name;
+
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    ASSERT_TRUE(installLocalSegmentWithShm(*metadata, shm_name, kRemoteAddress,
+                                           page_size)
+                    .ok());
+
+    auto conf = std::make_shared<Config>();
+    conf->set("transports/shm/cxl_mount_path", cxl_dir);
+
+    ShmTransport transport;
+    std::string local_segment_name = "shm_test_segment";
+    ASSERT_TRUE(
+        transport.install(local_segment_name, metadata, nullptr, conf).ok());
+
+    uint64_t address = kRemoteAddress;
+    auto status = ShmTransportTestPeer::relocate(transport, address, page_size,
+                                                 LOCAL_SEGMENT_ID);
+    EXPECT_FALSE(status.ok());
+    EXPECT_TRUE(status.IsInternalError());
+
+    // The consumer must not have created the missing backing file.
+    struct stat st;
+    EXPECT_EQ(stat(full_path.c_str(), &st), -1);
+    EXPECT_EQ(errno, ENOENT);
+
+    ASSERT_TRUE(transport.uninstall().ok());
+    EXPECT_EQ(rmdir(cxl_dir.c_str()), 0);
+}
+
+// B2: creating with an existing name must not truncate the live object.
+TEST(ShmTransportTest, CreateSharedMemoryDoesNotTruncateExisting) {
+    const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    const std::string name = "mooncake_excl_test_" + std::to_string(getpid());
+    shm_unlink(name.c_str());
+
+    int fd = shm_open(name.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(ftruncate(fd, page_size), 0);
+    void* existing =
+        mmap(nullptr, page_size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    ASSERT_NE(existing, MAP_FAILED);
+    close(fd);
+    std::memset(existing, 0xAB, page_size);
+
+    ShmTransport transport;
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    std::string local_segment_name = "shm_test_segment";
+    ASSERT_TRUE(transport
+                    .install(local_segment_name, metadata, nullptr,
+                             std::make_shared<Config>())
+                    .ok());
+
+    errno = 0;
+    void* created =
+        ShmTransportTestPeer::createSharedMemory(transport, name, page_size);
+    EXPECT_EQ(created, nullptr);
+    EXPECT_EQ(errno, EEXIST);
+
+    // Existing mapping content must be intact (not truncated to zero).
+    auto* bytes = static_cast<unsigned char*>(existing);
+    EXPECT_EQ(bytes[0], 0xAB);
+    EXPECT_EQ(bytes[page_size - 1], 0xAB);
+
+    // allocateLocalMemory should still succeed by picking a different name.
+    MemoryOptions options;
+    options.location = "cpu:0";
+    void* allocated = nullptr;
+    ASSERT_TRUE(
+        transport.allocateLocalMemory(&allocated, page_size, options).ok());
+    ASSERT_NE(allocated, nullptr);
+    EXPECT_NE(options.shm_path, name);
+    ASSERT_TRUE(transport.freeLocalMemory(allocated, page_size).ok());
+
+    munmap(existing, page_size);
+    shm_unlink(name.c_str());
+    ASSERT_TRUE(transport.uninstall().ok());
+}
+
+// B3: stale relocate entries are dropped when a lookup misses after the
+// peer has unregistered its buffers (NeedsRefreshCache path).
+TEST(ShmTransportTest, DropsStaleMappingsOnNeedsRefreshCache) {
+    const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    constexpr uint64_t kRemoteAddress = 0x30000000;
+    ScopedShmFile shm_file(page_size);
+
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    ASSERT_TRUE(installLocalSegmentWithShm(*metadata, shm_file.name(),
+                                           kRemoteAddress, page_size)
+                    .ok());
+
+    ShmTransport transport;
+    std::string local_segment_name = "shm_test_segment";
+    ASSERT_TRUE(transport
+                    .install(local_segment_name, metadata, nullptr,
+                             std::make_shared<Config>())
+                    .ok());
+
+    uint64_t address = kRemoteAddress;
+    ASSERT_TRUE(ShmTransportTestPeer::relocate(transport, address, page_size,
+                                               LOCAL_SEGMENT_ID)
+                    .ok());
+    EXPECT_EQ(ShmTransportTestPeer::mappingCount(transport, LOCAL_SEGMENT_ID),
+              1u);
+    auto* mapped = reinterpret_cast<void*>(address);
+
+    // Unregister the buffer from metadata so the next relocate misses.
+    ASSERT_TRUE(metadata->segmentManager()
+                    .updateLocal([&](SegmentDesc& segment) -> Status {
+                        auto& memory =
+                            std::get<MemorySegmentDesc>(segment.detail);
+                        memory.buffers.clear();
+                        return Status::OK();
+                    })
+                    .ok());
+
+    // Probe an address outside the cached mapping so tryResolve misses and
+    // the NeedsRefreshCache path runs (which drops the whole segment's maps).
+    uint64_t missing_address = kRemoteAddress + page_size;
+    auto status = ShmTransportTestPeer::relocate(transport, missing_address,
+                                                 page_size, LOCAL_SEGMENT_ID);
+    EXPECT_TRUE(status.IsNeedsRefreshCache());
+    EXPECT_EQ(ShmTransportTestPeer::mappingCount(transport, LOCAL_SEGMENT_ID),
+              0u);
+    EXPECT_FALSE(ShmTransportTestPeer::hasTarget(transport, LOCAL_SEGMENT_ID));
+
+    unsigned char residency = 0;
+    errno = 0;
+    EXPECT_EQ(mincore(mapped, page_size, &residency), -1);
+    EXPECT_EQ(errno, ENOMEM);
+
+    ASSERT_TRUE(transport.uninstall().ok());
+}
+
+TEST(ShmTransportTest, DropSegmentMappingsReleasesMmap) {
+    const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    constexpr uint64_t kRemoteAddress = 0x40000000;
+    ScopedShmFile shm_file(page_size);
+
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    ASSERT_TRUE(installLocalSegmentWithShm(*metadata, shm_file.name(),
+                                           kRemoteAddress, page_size)
+                    .ok());
+
+    ShmTransport transport;
+    std::string local_segment_name = "shm_test_segment";
+    ASSERT_TRUE(transport
+                    .install(local_segment_name, metadata, nullptr,
+                             std::make_shared<Config>())
+                    .ok());
+
+    uint64_t address = kRemoteAddress;
+    ASSERT_TRUE(ShmTransportTestPeer::relocate(transport, address, page_size,
+                                               LOCAL_SEGMENT_ID)
+                    .ok());
+    auto* mapped = reinterpret_cast<void*>(address);
+
+    ShmTransportTestPeer::dropSegmentMappings(transport, LOCAL_SEGMENT_ID);
+    EXPECT_EQ(ShmTransportTestPeer::mappingCount(transport, LOCAL_SEGMENT_ID),
+              0u);
+
+    unsigned char residency = 0;
+    errno = 0;
+    EXPECT_EQ(mincore(mapped, page_size, &residency), -1);
+    EXPECT_EQ(errno, ENOMEM);
+
+    ASSERT_TRUE(transport.uninstall().ok());
 }
 
 }  // namespace
