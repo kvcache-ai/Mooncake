@@ -1479,16 +1479,20 @@ class MooncakeBundleTransfer:
             if collisions:
                 raise ValueError(f"structured members already exist: {collisions}")
             merged_buffers.update(new_manifest["buffers"])
+            cleanup_keys = [
+                *old_manifest.get("cleanup_keys", []),
+                self._bundle_store.manifest_key(old_stage_ref),
+                *self._bundle_store.payload_keys(old_manifest["meta"]),
+                self._bundle_store.manifest_key(new_stage_ref),
+                *self._bundle_store.payload_keys(new_manifest["meta"]),
+            ]
             merged_ref = self._bundle_store.put_bundle_manifest(
                 _encode_structured_metadata(merged_metadata),
                 merged_buffers,
                 partition=partition,
                 chunk_bytes=chunk_bytes,
                 policy=policy,
-                cleanup_keys=[
-                    self._bundle_store.manifest_key(old_stage_ref),
-                    *self._bundle_store.payload_keys(old_manifest["meta"]),
-                ],
+                cleanup_keys=cleanup_keys,
                 config=config,
             )
         except Exception:
@@ -3993,9 +3997,14 @@ class _BundleManifestStore:
         if not key.startswith(prefix):
             return None
         suffix = key[len(prefix) :]
-        for marker in ("/manifest", "/meta", "/buffer/"):
-            if marker in suffix:
-                return suffix.split(marker, 1)[0]
+        if suffix.endswith("/manifest"):
+            return suffix[: -len("/manifest")]
+        if suffix.endswith("/meta"):
+            return suffix[: -len("/meta")]
+        for marker in ("/meta/", "/buffer/"):
+            index = suffix.find(marker)
+            if index > 0:
+                return suffix[:index]
         return None
 
     def _validate_manifest(self, manifest: Mapping[str, Any]) -> None:
@@ -4422,6 +4431,8 @@ class _MooncakePayloadTransport:
         # Stream one chunk at a time: acquire -> memcpy -> put -> release.
         # This keeps pool pressure minimal and allows RDMA transfers to pipeline.
         for chunk_key, group, size in zip(chunk_keys, chunk_groups, sizes):
+            # Each pool lease maps to one physical key, so a single logical group id
+            # stays length-1 for each batch_put_from call in this path.
             lease = pool.acquire(size)
             try:
                 _copy_memoryviews_to_lease(group, lease)
@@ -6013,6 +6024,20 @@ def _call_write_with_optional_config(fn: Any, *args: Any, config: Any = None) ->
     return fn(*args, config=config)
 
 
+_WRITE_CONFIG_COPY_FIELDS = (
+    "data_type",
+    "group_ids",
+    "nof_replica_num",
+    "prefer_alloc_in_same_node",
+    "preferred_nof_segments",
+    "preferred_segment",
+    "preferred_segments",
+    "replica_num",
+    "with_hard_pin",
+    "with_soft_pin",
+)
+
+
 def _config_for_grouped_keys(config: Any, key_count: int) -> Any:
     """Return a write config whose group_ids match the physical key count."""
     if config is None or key_count <= 0:
@@ -6025,6 +6050,8 @@ def _config_for_grouped_keys(config: Any, key_count: int) -> Any:
         group_ids = [group_ids]
     else:
         group_ids = list(group_ids)
+    if not group_ids:
+        return config
     if len(group_ids) != 1:
         raise ValueError(
             "structured object store config.group_ids must contain exactly one "
@@ -6048,15 +6075,17 @@ def _copy_write_config(config: Any) -> Any:
         raise TypeError(
             "structured object store config must be copyable or default-constructible"
         ) from error
-    for name in dir(config):
-        if name.startswith("_"):
+    for name in _WRITE_CONFIG_COPY_FIELDS:
+        if not hasattr(config, name):
             continue
         try:
             value = getattr(config, name)
         except Exception:
             continue
-        if callable(value):
-            continue
+        if isinstance(value, list):
+            value = list(value)
+        elif isinstance(value, tuple):
+            value = tuple(value)
         try:
             setattr(copied, name, value)
         except Exception as error:
