@@ -35,7 +35,10 @@ takes precedence:
   cargo run --example generate_dlopen_bindings   # or: cmake --build build --target generate_store_rust_dlopen_bindings
   ```
 
-  CI should run this and `git diff --exit-code` to catch drift.
+  A pre-commit hook (on `store_c.h`/generator changes) and CI both enforce this
+  via `git diff --exit-code`, so stale bindings cannot merge. CI additionally
+  builds the packaged `.crate` with `--features dlopen` to confirm a published
+  consumer stays independent of `store_c.h`.
 
 ## Prerequisites
 
