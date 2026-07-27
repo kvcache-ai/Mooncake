@@ -39,8 +39,14 @@ class ClientCtl {
                 HandlePut(iss);
             } else if (cmd == "get") {
                 HandleGet(iss);
+            } else if (cmd == "delete") {
+                HandleDelete(iss);
+            } else if (cmd == "batch-smoke") {
+                HandleBatchSmoke(iss);
             } else if (cmd == "mount") {
                 HandleMount(iss);
+            } else if (cmd == "unmount") {
+                HandleUnmount(iss);
             } else if (cmd == "remove") {
                 HandleRemove(iss);
             } else if (cmd == "sleep") {
@@ -135,6 +141,53 @@ class ClientCtl {
         std::cout << "Get value: " << value << std::endl;
     }
 
+    void HandleDelete(std::istringstream& iss) {
+        std::string name, key;
+        iss >> name >> key;
+
+        auto it = clients_.find(name);
+        if (it == clients_.end()) {
+            std::cout << "Client not found: " << name << std::endl;
+            return;
+        }
+        if (key.empty()) {
+            std::cout << "Empty key" << std::endl;
+            return;
+        }
+
+        ErrorCode error_code = it->second.client->Delete(key);
+        if (error_code != ErrorCode::OK) {
+            std::cout << "Failed to delete value: " << toString(error_code)
+                      << std::endl;
+            return;
+        }
+        std::cout << "Successfully deleted value for key: " << key << std::endl;
+    }
+
+    void HandleBatchSmoke(std::istringstream& iss) {
+        std::string name, key_prefix;
+        iss >> name >> key_prefix;
+
+        auto it = clients_.find(name);
+        if (it == clients_.end()) {
+            std::cout << "Client not found: " << name << std::endl;
+            return;
+        }
+        if (key_prefix.empty()) {
+            std::cout << "Empty key prefix" << std::endl;
+            return;
+        }
+
+        ErrorCode error_code = it->second.client->BatchSmoke(key_prefix);
+        if (error_code != ErrorCode::OK) {
+            std::cout << "Failed batch smoke: " << toString(error_code)
+                      << std::endl;
+            return;
+        }
+        std::cout << "Successfully completed batch smoke: " << key_prefix
+                  << std::endl;
+    }
+
     void HandleMount(std::istringstream& iss) {
         std::string client_name;
         std::string segment_name;
@@ -173,6 +226,34 @@ class ClientCtl {
 
         std::cout << "Successfully mounted segment on client " << client_name
                   << std::endl;
+    }
+
+    void HandleUnmount(std::istringstream& iss) {
+        std::string client_name;
+        std::string segment_name;
+        iss >> client_name >> segment_name;
+
+        auto client_it = clients_.find(client_name);
+        if (client_it == clients_.end()) {
+            std::cout << "Client not found: " << client_name << std::endl;
+            return;
+        }
+        auto segment_it = client_it->second.segments.find(segment_name);
+        if (segment_it == client_it->second.segments.end()) {
+            std::cout << "Segment not found: " << segment_name << std::endl;
+            return;
+        }
+
+        ErrorCode error_code =
+            client_it->second.client->Unmount(segment_it->second);
+        if (error_code != ErrorCode::OK) {
+            std::cout << "Failed to unmount segment: " << toString(error_code)
+                      << std::endl;
+            return;
+        }
+        client_it->second.segments.erase(segment_it);
+        std::cout << "Successfully unmounted segment from client "
+                  << client_name << std::endl;
     }
 
     void HandleRemove(std::istringstream& iss) {
