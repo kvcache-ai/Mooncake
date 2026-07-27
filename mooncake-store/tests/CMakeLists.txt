@@ -174,6 +174,7 @@ add_ha_test(batch_oplog_snapshot_types_test
 add_store_test(master_service_test_for_snapshot
                ha/snapshot/master_service_test_for_snapshot.cpp)
 add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)
+add_store_test(nvme_kv_storage_backend_test nvme_kv_storage_backend_test.cpp)
 add_store_test(storage_backend_test storage_backend_test.cpp)
 add_store_test(client_storage_backend_test client_storage_backend_test.cpp)
 add_store_test(mutex_test mutex_test.cpp)
