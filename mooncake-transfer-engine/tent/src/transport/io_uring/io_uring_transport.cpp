@@ -235,6 +235,9 @@ Status IOUringTransport::submitTransferTasks(
 Status IOUringTransport::getTransferStatus(SubBatchRef batch, int task_id,
                                            TransferStatus& status) {
     auto io_uring_batch = dynamic_cast<IOUringSubBatch*>(batch);
+    if (!io_uring_batch) {
+        return Status::InvalidArgument("Invalid io_uring sub-batch" LOC_MARK);
+    }
     if (task_id < 0 || task_id >= (int)io_uring_batch->task_list.size())
         return Status::InvalidArgument("Invalid task ID");
     auto& task = io_uring_batch->task_list[task_id];
