@@ -237,6 +237,10 @@ ErrorCode ScopedSegmentAccess::MountLocalDiskSegment(const UUID& client_id,
 ErrorCode ScopedSegmentAccess::ReMountSegment(
     const std::vector<Segment>& segments, const UUID& client_id) {
     for (const auto& segment : segments) {
+        auto validation = ValidateRemountSegment(segment, client_id);
+        if (validation != ErrorCode::OK) {
+            return validation;
+        }
         ErrorCode err = MountSegment(segment, client_id);
         if (err == ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS ||
             err == ErrorCode::INTERNAL_ERROR) {
@@ -261,6 +265,74 @@ ErrorCode ScopedSegmentAccess::ReMountSegment(
     }
 
     return ErrorCode::OK;
+}
+
+ErrorCode ScopedSegmentAccess::ValidateRemountSegment(
+    const Segment& segment, const UUID& client_id) const {
+    auto mounted = segment_manager_->mounted_segments_.find(segment.id);
+    if (mounted == segment_manager_->mounted_segments_.end()) {
+        return ErrorCode::OK;
+    }
+    const auto owner = segment_manager_->client_segments_.find(client_id);
+    const bool owned = owner != segment_manager_->client_segments_.end() &&
+                       std::find(owner->second.begin(), owner->second.end(),
+                                 segment.id) != owner->second.end();
+    const auto& authoritative = mounted->second.segment;
+    if (!owned || authoritative.id != segment.id ||
+        authoritative.name != segment.name ||
+        authoritative.base != segment.base ||
+        authoritative.size != segment.size ||
+        authoritative.te_endpoint != segment.te_endpoint ||
+        authoritative.protocol != segment.protocol ||
+        authoritative.host_id != segment.host_id) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    return ErrorCode::OK;
+}
+
+bool ScopedSegmentAccess::GetSegment(const UUID& segment_id,
+                                     Segment& segment) const {
+    auto mounted = segment_manager_->mounted_segments_.find(segment_id);
+    if (mounted == segment_manager_->mounted_segments_.end()) {
+        return false;
+    }
+    segment = mounted->second.segment;
+    return true;
+}
+
+bool ScopedSegmentAccess::ReplaceAllocators(
+    const std::vector<AllocatorReplacement>& replacements) {
+    std::vector<AllocatorManager::Replacement> manager_replacements;
+    manager_replacements.reserve(replacements.size());
+    for (const auto& replacement : replacements) {
+        auto mounted =
+            segment_manager_->mounted_segments_.find(replacement.segment_id);
+        if (mounted == segment_manager_->mounted_segments_.end() ||
+            mounted->second.buf_allocator != replacement.expected ||
+            !replacement.replacement) {
+            return false;
+        }
+        manager_replacements.push_back({mounted->second.segment.name,
+                                        replacement.expected,
+                                        replacement.replacement});
+    }
+    if (!segment_manager_->allocator_manager_.replaceAllocators(
+            manager_replacements)) {
+        return false;
+    }
+    for (const auto& replacement : replacements) {
+        segment_manager_->mounted_segments_.at(replacement.segment_id)
+            .buf_allocator = replacement.replacement;
+    }
+    return true;
+}
+
+std::shared_ptr<BufferAllocatorBase> ScopedSegmentAccess::GetAllocator(
+    const UUID& segment_id) const {
+    auto mounted = segment_manager_->mounted_segments_.find(segment_id);
+    return mounted == segment_manager_->mounted_segments_.end()
+               ? nullptr
+               : mounted->second.buf_allocator;
 }
 
 ErrorCode ScopedSegmentAccess::PrepareUnmountSegment(
@@ -1502,18 +1574,50 @@ void SegmentManager::initializeCxlAllocator(const std::string& cxl_path,
 int64_t ScopedLocalDiskSegmentAccess::getSsdTotalCapacity(
     const std::string& segment_name) const {
     auto client_it = client_by_name_.find(segment_name);
-    if (client_it == client_by_name_.end()) return 0;
+    if (client_it == client_by_name_.end()) {
+        return 0;
+    }
     auto disk_it = client_local_disk_segment_.find(client_it->second);
-    if (disk_it == client_local_disk_segment_.end()) return 0;
+    if (disk_it == client_local_disk_segment_.end()) {
+        return 0;
+    }
     return disk_it->second->ssd_total_capacity_bytes;
 }
 
 int64_t ScopedLocalDiskSegmentAccess::getSsdUsedBytes(
     const std::string& segment_name) const {
     auto client_it = client_by_name_.find(segment_name);
-    if (client_it == client_by_name_.end()) return 0;
+    if (client_it == client_by_name_.end()) {
+        return 0;
+    }
     auto disk_it = client_local_disk_segment_.find(client_it->second);
-    if (disk_it == client_local_disk_segment_.end()) return 0;
+    if (disk_it == client_local_disk_segment_.end()) {
+        return 0;
+    }
     return disk_it->second->ssd_used_bytes.load(std::memory_order_relaxed);
+}
+
+bool SegmentManager::HasSegmentByEndpoint(const std::string& endpoint) const {
+    std::shared_lock<std::shared_mutex> lock(segment_mutex_);
+    for (const auto& [segment_id, mounted_segment] : mounted_segments_) {
+        if (mounted_segment.segment.te_endpoint == endpoint) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool SegmentManager::GetSegmentBasicInfo(const UUID& segment_id,
+                                         std::string& segment_name,
+                                         std::string& te_endpoint) const {
+    std::shared_lock<std::shared_mutex> lock(segment_mutex_);
+    auto it = mounted_segments_.find(segment_id);
+    if (it == mounted_segments_.end()) {
+        return false;
+    }
+    const Segment& seg = it->second.segment;
+    segment_name = seg.name;
+    te_endpoint = seg.te_endpoint;
+    return true;
 }
 }  // namespace mooncake

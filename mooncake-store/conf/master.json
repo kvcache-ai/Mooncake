@@ -13,6 +13,7 @@
   "eviction_ratio": 0.1,
   "eviction_high_watermark_ratio": 1.0,
   "enable_ha": false,
+  "enable_oplog": false,
   "etcd_endpoints": "http://localhost:2379",
   "root_fs_dir": "",
   "cluster_id": "mooncake_cluster",
