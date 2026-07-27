@@ -3710,7 +3710,7 @@ RealClient::get_into_ranges_internal(
                 prepared.results[i][j][k] = execute_ranged_read(
                     all_keys[i][j], buffers[i], all_dst_offsets[i][j][k],
                     all_src_offsets[i][j][k], all_sizes[i][j][k],
-                    metadata_result.value());
+                    metadata_result.value(), false, false);
             }
         }
     }
@@ -4520,7 +4520,8 @@ RealClient::batch_get_into_multi_buffers_dummy_helper(
 
 tl::expected<int64_t, ErrorCode> RealClient::get_into_range_shm_helper(
     const std::string &key, uint64_t dummy_buffer, size_t dst_offset,
-    size_t src_offset, size_t size, const UUID &client_id) {
+    size_t src_offset, size_t size, bool size_is_buffer_capacity,
+    bool verify_checksum, const UUID &client_id) {
     std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
@@ -4539,7 +4540,8 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_shm_helper(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    return get_into_range_internal(key, real_buffer, 0, src_offset, size);
+    return get_into_range_internal(key, real_buffer, 0, src_offset, size,
+                                   size_is_buffer_capacity, verify_checksum);
 }
 
 std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>

@@ -1000,7 +1000,7 @@ int64_t DummyClient::get_into(const std::string& key, void* buffer,
     const auto start_time = std::chrono::steady_clock::now();
     auto result = invoke_rpc<&RealClient::get_into_range_shm_helper,
                              tl::expected<int64_t, ErrorCode>>(
-        key, buf_addr, 0, 0, size, client_id_);
+        key, buf_addr, 0, 0, size, true, true, client_id_);
     if (!result) {
         return static_cast<int64_t>(toInt(result.error()));
     }
