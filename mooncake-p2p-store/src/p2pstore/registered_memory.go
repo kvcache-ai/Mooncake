@@ -103,6 +103,15 @@ func (memory *RegisteredMemory) Add(addr uintptr, length uint64, maxShardSize ui
 				log.Println("cascading error:", unregisterErr)
 			}
 		}
+		memory.mu.Lock()
+		for idx, entry := range memory.bufferList {
+			if entry.addr == addr && entry.length == length {
+				memory.bufferList = append(memory.bufferList[:idx],
+					memory.bufferList[idx+1:]...)
+				break
+			}
+		}
+		memory.mu.Unlock()
 		return err
 	}
 
@@ -116,20 +125,25 @@ func (memory *RegisteredMemory) Remove(addr uintptr, length uint64, maxShardSize
 
 	memory.mu.Lock()
 	found := false
+	lastRef := false
 	for idx, entry := range memory.bufferList {
 		if entry.addr == addr && entry.length == length {
 			found = true
 			memory.bufferList[idx].refCount--
 			if memory.bufferList[idx].refCount == 0 {
+				lastRef = true
 				memory.bufferList = append(memory.bufferList[:idx],
 					memory.bufferList[idx+1:]...)
-				break
 			}
+			break
 		}
 	}
 	memory.mu.Unlock()
 	if !found {
 		return ErrInvalidArgument
+	}
+	if !lastRef {
+		return nil
 	}
 
 	var wg sync.WaitGroup
