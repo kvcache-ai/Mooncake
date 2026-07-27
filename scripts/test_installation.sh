@@ -46,6 +46,7 @@ python tests/test_mooncake_config.py
 echo "Verifying mooncake_master entry point..."
 # Check if the mooncake_master entry point is installed and executable
 which mooncake_master || { echo "ERROR: mooncake_master entry point not found!"; exit 1; }
+mooncake_master --version
 echo "Success: mooncake_master entry point found"
 
 # Check if the mooncake_client entry point is installed and executable

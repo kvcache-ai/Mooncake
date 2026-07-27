@@ -22,14 +22,20 @@ namespace mooncake {
 // MooncakeBackend, which is defined below.
 class MooncakeBackend;
 
-// Lightweight Backend shim that delegates P2P send/recv back to the owning
+// Lightweight Backend shim that delegates operations back to the owning
 // MooncakeBackend.  PyTorch's P2P dispatch (batch_isend_irecv, isend, irecv)
 // requires getBackend() to return a registered c10d::Backend instance.
 // Since MooncakeBackend inherits from ProcessGroup (not Backend), we register
-// this shim in the ProcessGroup's deviceTypeToBackend_ map so that the P2P
-// path can find it.  The shim holds a non-owning pointer to its owner and
-// delegates only the operations that the P2P dispatch path calls (send, recv,
-// getBackendName, supportsCoalescing).
+// this shim in the ProcessGroup's deviceTypeToBackend_ map.  The shim holds a
+// non-owning pointer to its owner.
+//
+// PyTorch 2.13 added ProcessGroup::all_gather_single and
+// ProcessGroup::reduce_scatter_single, and the deprecated single-buffer
+// aliases now forward to those methods.  They dispatch through c10d/Ops.cpp
+// and ProcessGroup::getBackend(dev), so calls land on this registered shim
+// instead of MooncakeBackend's _allgather_base and _reduce_scatter_base
+// overrides.  Delegate every collective MooncakeBackend implements so the
+// shim exposes the same capabilities as its owner.
 class MooncakeP2PShim final : public ::c10d::Backend {
    public:
     explicit MooncakeP2PShim(MooncakeBackend* owner);
@@ -49,6 +55,50 @@ class MooncakeP2PShim final : public ::c10d::Backend {
 
     c10::intrusive_ptr<c10d::Work> barrier(
         const c10d::BarrierOptions& opts) override;
+
+    // Collective delegation to owner_ (see the class comment for the PyTorch
+    // 2.13 single-buffer dispatch rationale).  Signatures mirror
+    // MooncakeBackend's overrides so the shim re-exposes the same c10d
+    // virtuals.
+    c10::intrusive_ptr<c10d::Work> broadcast(
+        std::vector<at::Tensor>& tensors,
+        const c10d::BroadcastOptions& opts) override;
+
+    c10::intrusive_ptr<c10d::Work> allreduce(
+        std::vector<at::Tensor>& tensors,
+        const c10d::AllreduceOptions& opts) override;
+
+    c10::intrusive_ptr<c10d::Work> allgather(
+        std::vector<std::vector<at::Tensor>>& outputTensors,
+        std::vector<at::Tensor>& inputTensors,
+        const c10d::AllgatherOptions& opts) override;
+
+    c10::intrusive_ptr<c10d::Work> _allgather_base(
+        at::Tensor& outputBuffer, at::Tensor& inputBuffer,
+        const c10d::AllgatherOptions& opts) override;
+
+    c10::intrusive_ptr<c10d::Work> _reduce_scatter_base(
+        at::Tensor& outputBuffer, at::Tensor& inputBuffer,
+        const c10d::ReduceScatterOptions& opts) override;
+
+    c10::intrusive_ptr<c10d::Work> alltoall(
+        std::vector<at::Tensor>& outputTensors,
+        std::vector<at::Tensor>& inputTensors,
+        const c10d::AllToAllOptions& opts) override;
+
+    c10::intrusive_ptr<c10d::Work> reduce(
+        std::vector<at::Tensor>& tensors,
+        const c10d::ReduceOptions& opts) override;
+
+    c10::intrusive_ptr<c10d::Work> gather(
+        std::vector<std::vector<at::Tensor>>& outputTensors,
+        std::vector<at::Tensor>& inputTensors,
+        const c10d::GatherOptions& opts) override;
+
+    c10::intrusive_ptr<c10d::Work> scatter(
+        std::vector<at::Tensor>& outputTensors,
+        std::vector<std::vector<at::Tensor>>& inputTensors,
+        const c10d::ScatterOptions& opts) override;
 
    private:
     // Non-owning: the shim is stored in ProcessGroup's backend maps which are

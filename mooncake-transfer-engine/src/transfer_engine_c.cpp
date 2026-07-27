@@ -257,6 +257,24 @@ void enableGracefulShutdown(transfer_engine_t engine) {
     native->enableGracefulShutdown();
 }
 
+int getNicLoadStats(transfer_engine_t engine, nic_load_stat_t *stats,
+                    size_t *count) {
+    if (!engine || !stats || !count) return -1;
+    TransferEngine *native = (TransferEngine *)engine;
+    std::vector<NicLoadStats> native_stats;
+    Status s = native->getNicLoadStats(native_stats);
+    if (!s.ok()) return (int)s.code();
+    size_t to_copy = std::min(native_stats.size(), *count);
+    for (size_t i = 0; i < to_copy; ++i) {
+        snprintf(stats[i].device_name, sizeof(stats[i].device_name), "%s",
+                 native_stats[i].device_name.c_str());
+        stats[i].inflight_bytes = native_stats[i].inflight_bytes;
+        stats[i].ewma_bandwidth_bps = native_stats[i].ewma_bandwidth_bps;
+    }
+    *count = native_stats.size();
+    return 0;
+}
+
 int showLinks(transfer_engine_t engine, char *buf_out, size_t buf_len,
               int json) {
     if (!engine || !buf_out || buf_len == 0) return -1;
