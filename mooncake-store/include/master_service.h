@@ -423,7 +423,7 @@ class MasterService {
      */
     auto PutEnd(const UUID& client_id, const std::string& key,
                 const TenantId& tenant_id, ReplicaType replica_type,
-                std::optional<uint64_t> store_checksum = std::nullopt)
+                std::optional<uint64_t> object_checksum = std::nullopt)
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -449,9 +449,8 @@ class MasterService {
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
     std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
-        const UUID& client_id, const std::vector<std::string>& keys,
-        const TenantId& tenant_id, ReplicaType replica_type = ReplicaType::ALL,
-        const std::vector<std::optional<uint64_t>>& store_checksums = {});
+        const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
+        const TenantId& tenant_id, ReplicaType replica_type = ReplicaType::ALL);
 
     /**
      * @brief Revoke a batch of put operations
@@ -481,7 +480,7 @@ class MasterService {
      */
     auto UpsertEnd(const UUID& client_id, const std::string& key,
                    const TenantId& tenant_id, ReplicaType replica_type,
-                   std::optional<uint64_t> store_checksum = std::nullopt)
+                   std::optional<uint64_t> object_checksum = std::nullopt)
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -505,9 +504,8 @@ class MasterService {
      * @brief Complete a batch of upsert operations. Delegates to BatchPutEnd.
      */
     std::vector<tl::expected<void, ErrorCode>> BatchUpsertEnd(
-        const UUID& client_id, const std::vector<std::string>& keys,
-        const TenantId& tenant_id,
-        const std::vector<std::optional<uint64_t>>& store_checksums = {});
+        const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
+        const TenantId& tenant_id);
 
     /**
      * @brief Revoke a batch of upsert operations. Delegates to BatchPutRevoke.
@@ -965,7 +963,7 @@ class MasterService {
         // Updated by UpsertStart (Case B) to reset the discard timeout.
         std::chrono::system_clock::time_point put_start_time;
         const size_t size;
-        std::optional<uint64_t> store_checksum;
+        std::optional<uint64_t> object_checksum;
         const ObjectDataType data_type{ObjectDataType::UNKNOWN};
         const std::string group_id;
         const TenantId tenant_id;

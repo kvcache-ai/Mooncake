@@ -53,7 +53,7 @@ struct CatalogBackendParam {
 //   kDataTypeAndHardPinned:
 //                    9 + replica_count, data_type plus trailing hard_pinned
 //   kWithGroupId:    10 + replica_count, data_type + hard_pinned + group_id
-//   kWithStoreChecksum:
+//   kWithObjectChecksum:
 //                    11 + replica_count, current writer fields + checksum
 enum class SnapshotMetadataFormat {
     kLegacy,
@@ -61,7 +61,7 @@ enum class SnapshotMetadataFormat {
     kHardPinnedOnly,
     kDataTypeAndHardPinned,
     kWithGroupId,
-    kWithStoreChecksum,
+    kWithObjectChecksum,
 };
 
 class ScopedEnvVar {
@@ -181,23 +181,23 @@ inline std::vector<uint8_t> BuildMetadataPayloadWithClientIdString(
         format == SnapshotMetadataFormat::kDataTypeOnly ||
         format == SnapshotMetadataFormat::kDataTypeAndHardPinned ||
         format == SnapshotMetadataFormat::kWithGroupId ||
-        format == SnapshotMetadataFormat::kWithStoreChecksum;
+        format == SnapshotMetadataFormat::kWithObjectChecksum;
     const bool include_hard_pinned =
         format == SnapshotMetadataFormat::kHardPinnedOnly ||
         format == SnapshotMetadataFormat::kDataTypeAndHardPinned ||
         format == SnapshotMetadataFormat::kWithGroupId ||
-        format == SnapshotMetadataFormat::kWithStoreChecksum;
+        format == SnapshotMetadataFormat::kWithObjectChecksum;
     const bool include_group_id =
         format == SnapshotMetadataFormat::kWithGroupId ||
-        format == SnapshotMetadataFormat::kWithStoreChecksum;
-    const bool include_store_checksum =
-        format == SnapshotMetadataFormat::kWithStoreChecksum;
+        format == SnapshotMetadataFormat::kWithObjectChecksum;
+    const bool include_object_checksum =
+        format == SnapshotMetadataFormat::kWithObjectChecksum;
     constexpr uint32_t kReplicaCount = 1;
     // 7 leading fields + replicas + optional data_type/hard_pinned/group_id.
     const size_t array_size = 7 + kReplicaCount + (include_data_type ? 1 : 0) +
                               (include_hard_pinned ? 1 : 0) +
                               (include_group_id ? 1 : 0) +
-                              (include_store_checksum ? 1 : 0);
+                              (include_object_checksum ? 1 : 0);
 
     msgpack::sbuffer shard_buffer;
     MsgpackPacker shard_packer(&shard_buffer);
@@ -225,7 +225,7 @@ inline std::vector<uint8_t> BuildMetadataPayloadWithClientIdString(
     if (include_group_id) {
         shard_packer.pack(std::string("test-group"));
     }
-    if (include_store_checksum) {
+    if (include_object_checksum) {
         shard_packer.pack(uint64_t{0x123456789ABCDEF0ULL});
     }
 

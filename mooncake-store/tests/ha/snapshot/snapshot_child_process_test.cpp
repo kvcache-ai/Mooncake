@@ -640,7 +640,7 @@ TEST_F(SnapshotChildProcessTest, RestoreRebuildsGroupedObjectRouting) {
     EXPECT_FALSE(service_->ExistKey(key, TenantId::Default()).value_or(true));
 }
 
-TEST_F(SnapshotChildProcessTest, RestorePreservesStoreChecksum) {
+TEST_F(SnapshotChildProcessTest, RestorePreservesObjectChecksum) {
     auto make_config = [this]() {
         return MasterServiceConfigBuilder()
             .set_enable_snapshot(false)
@@ -665,7 +665,7 @@ TEST_F(SnapshotChildProcessTest, RestorePreservesStoreChecksum) {
     ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
 
     constexpr uint64_t kChecksum = 0x123456789ABCDEF0ULL;
-    const std::string key = "snapshot_store_checksum_key";
+    const std::string key = "snapshot_object_checksum_key";
     ReplicateConfig replicate_config;
     replicate_config.replica_num = 1;
     auto put_start = service_->PutStart(client_id, key, TenantId::Default(),
@@ -686,8 +686,8 @@ TEST_F(SnapshotChildProcessTest, RestorePreservesStoreChecksum) {
 
     auto restored = service_->GetReplicaList(key, TenantId::Default());
     ASSERT_TRUE(restored.has_value());
-    ASSERT_TRUE(restored->store_checksum.has_value());
-    EXPECT_EQ(*restored->store_checksum, kChecksum);
+    ASSERT_TRUE(restored->object_checksum.has_value());
+    EXPECT_EQ(*restored->object_checksum, kChecksum);
 }
 
 TEST_F(SnapshotChildProcessTest,

@@ -7,7 +7,6 @@
 
 #include <csignal>
 #include <algorithm>
-#include <array>
 #include <cassert>
 #include <cerrno>
 #include <chrono>
@@ -41,36 +40,21 @@
 #include "rpc_types.h"
 #include "local_hot_cache.h"
 #include "device/accelerator_registry.h"
-#include "store_checksum.h"
+#include "crc_checksum.h"
+#include "environ.h"
 
 namespace mooncake {
 
 namespace {
 
-constexpr size_t kStoreChecksumD2HChunkSize = 8 * 1024 * 1024;
-constexpr uint64_t kCrc64EcmaPolynomial = 0x42F0E1EBA9EA3693ULL;
+constexpr size_t kObjectChecksumD2HChunkSize = 8 * 1024 * 1024;
 
-constexpr std::array<uint64_t, 256> MakeCrc64EcmaTable() {
-    std::array<uint64_t, 256> table{};
-    for (size_t i = 0; i < table.size(); ++i) {
-        uint64_t crc = static_cast<uint64_t>(i) << 56;
-        for (int bit = 0; bit < 8; ++bit) {
-            crc = (crc & (1ULL << 63)) != 0 ? (crc << 1) ^ kCrc64EcmaPolynomial
-                                            : crc << 1;
-        }
-        table[i] = crc;
-    }
-    return table;
-}
-
-constexpr auto kCrc64EcmaTable = MakeCrc64EcmaTable();
-
-class ScopedStoreChecksumBuffer {
+class ScopedObjectChecksumBuffer {
    public:
-    ScopedStoreChecksumBuffer(PinnedBufferPool& pool, size_t size)
+    ScopedObjectChecksumBuffer(PinnedBufferPool& pool, size_t size)
         : pool_(pool), buffer_(pool_.Acquire(size)) {}
 
-    ~ScopedStoreChecksumBuffer() { pool_.Release(std::move(buffer_)); }
+    ~ScopedObjectChecksumBuffer() { pool_.Release(std::move(buffer_)); }
 
     char* data() const { return buffer_.data; }
 
@@ -285,25 +269,6 @@ FinalizeDecision DetermineFinalizeDecision(
 
 }  // namespace
 
-bool StoreChecksumEnabled() {
-    const char* value = std::getenv("MOONCAKE_STORE_CHECKSUM");
-    return value != nullptr && value[0] == '1' && value[1] == '\0';
-}
-
-void StoreChecksum::Update(const void* data, size_t size) {
-    const auto* bytes = static_cast<const uint8_t*>(data);
-    for (size_t i = 0; i < size; ++i) {
-        const auto index = static_cast<uint8_t>((crc_ >> 56) ^ bytes[i]);
-        crc_ = kCrc64EcmaTable[index] ^ (crc_ << 8);
-    }
-}
-
-uint64_t ComputeStoreChecksum(const void* data, size_t size) {
-    StoreChecksum checksum;
-    checksum.Update(data, size);
-    return checksum.Finalize();
-}
-
 [[nodiscard]] size_t CalculateSliceSize(const std::vector<Slice>& slices) {
     size_t slice_size = 0;
     for (const auto& slice : slices) {
@@ -334,7 +299,7 @@ Client::Client(const std::string& local_hostname,
       host_id_(ResolveMooncakeHostId(local_hostname)),
       metadata_connstring_(metadata_connstring),
       protocol_(protocol),
-      store_checksum_enabled_(StoreChecksumEnabled()),
+      object_checksum_enabled_(Environ::Get().GetStoreChecksumEnabled()),
       pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
       write_thread_pool_(2),
       task_thread_pool_(4) {
@@ -342,8 +307,8 @@ Client::Client(const std::string& local_hostname,
     if (!host_id_.empty()) {
         LOG(INFO) << "client_id=" << client_id_ << ", host_id=" << host_id_;
     }
-    if (store_checksum_enabled_) {
-        LOG(INFO) << "Store checksum validation is enabled";
+    if (object_checksum_enabled_) {
+        LOG(INFO) << "Object checksum validation is enabled";
     }
 
     if (metrics_) {
@@ -1120,7 +1085,7 @@ tl::expected<QueryResult, ErrorCode> Client::Query(
     return QueryResult(
         std::move(result.value().replicas),
         start_time + std::chrono::milliseconds(result.value().lease_ttl_ms),
-        result.value().store_checksum);
+        result.value().object_checksum);
 }
 
 std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
@@ -1154,7 +1119,7 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
                 std::move(response[i].value().replicas),
                 start_time +
                     std::chrono::milliseconds(response[i].value().lease_ttl_ms),
-                response[i].value().store_checksum));
+                response[i].value().object_checksum));
         } else {
             results.emplace_back(tl::unexpected(response[i].error()));
         }
@@ -1162,14 +1127,14 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
     return results;
 }
 
-tl::expected<uint64_t, ErrorCode> Client::ComputeStoreChecksumForSlices(
+tl::expected<uint64_t, ErrorCode> Client::ComputeObjectChecksumForSlices(
     const std::string& object_key, const std::vector<Slice>& slices,
     size_t object_size) {
-    StoreChecksum checksum;
+    CrcChecksum checksum;
     size_t remaining = object_size;
     auto runtime_accelerator =
         device::GetAcceleratorRegistry().RuntimeAccelerators();
-    std::unique_ptr<ScopedStoreChecksumBuffer> staging;
+    std::unique_ptr<ScopedObjectChecksumBuffer> staging;
 
     for (const auto& slice : slices) {
         const size_t bytes = std::min(slice.size, remaining);
@@ -1177,7 +1142,7 @@ tl::expected<uint64_t, ErrorCode> Client::ComputeStoreChecksumForSlices(
             continue;
         }
         if (slice.ptr == nullptr) {
-            LOG(ERROR) << "store_checksum_null_slice key=" << object_key;
+            LOG(ERROR) << "object_checksum_null_slice key=" << object_key;
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
 
@@ -1188,18 +1153,18 @@ tl::expected<uint64_t, ErrorCode> Client::ComputeStoreChecksumForSlices(
         }
 
         if (!staging) {
-            staging = std::make_unique<ScopedStoreChecksumBuffer>(
+            staging = std::make_unique<ScopedObjectChecksumBuffer>(
                 *pinned_buffer_pool_,
-                std::min(kStoreChecksumD2HChunkSize, object_size));
+                std::min(kObjectChecksumD2HChunkSize, object_size));
         }
         size_t offset = 0;
         while (offset < bytes) {
             const size_t chunk =
-                std::min(kStoreChecksumD2HChunkSize, bytes - offset);
+                std::min(kObjectChecksumD2HChunkSize, bytes - offset);
             const auto* source = static_cast<const char*>(slice.ptr) + offset;
             if (!runtime_accelerator.CopyToHost(staging->data(), source,
                                                 chunk)) {
-                LOG(ERROR) << "store_checksum_d2h_failed key=" << object_key
+                LOG(ERROR) << "object_checksum_d2h_failed key=" << object_key
                            << " size=" << chunk;
                 return tl::unexpected(ErrorCode::TRANSFER_FAIL);
             }
@@ -1210,31 +1175,31 @@ tl::expected<uint64_t, ErrorCode> Client::ComputeStoreChecksumForSlices(
     }
 
     if (remaining != 0) {
-        LOG(ERROR) << "store_checksum_slices_too_small key=" << object_key
+        LOG(ERROR) << "object_checksum_slices_too_small key=" << object_key
                    << " missing_bytes=" << remaining;
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     return checksum.Finalize();
 }
 
-tl::expected<void, ErrorCode> Client::VerifyStoreChecksum(
+tl::expected<void, ErrorCode> Client::VerifyObjectChecksum(
     const std::string& object_key, const std::vector<Slice>& slices,
     size_t object_size, std::optional<uint64_t> expected_checksum) {
-    if (!store_checksum_enabled_) {
+    if (!object_checksum_enabled_) {
         return {};
     }
     if (!expected_checksum.has_value()) {
-        VLOG(1) << "store_checksum_absent key=" << object_key;
+        VLOG(1) << "object_checksum_absent key=" << object_key;
         return {};
     }
 
     auto actual_checksum =
-        ComputeStoreChecksumForSlices(object_key, slices, object_size);
+        ComputeObjectChecksumForSlices(object_key, slices, object_size);
     if (!actual_checksum) {
         return tl::unexpected(actual_checksum.error());
     }
     if (*actual_checksum != *expected_checksum) {
-        LOG(ERROR) << "store_checksum_mismatch key=" << object_key
+        LOG(ERROR) << "object_checksum_mismatch key=" << object_key
                    << " expected=" << *expected_checksum
                    << " actual=" << *actual_checksum;
         return tl::unexpected(ErrorCode::CHECKSUM_MISMATCH);
@@ -1290,8 +1255,8 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     }
 
     auto checksum_result =
-        VerifyStoreChecksum(object_key, slices, calculate_total_size(replica),
-                            query_result.store_checksum);
+        VerifyObjectChecksum(object_key, slices, calculate_total_size(replica),
+                             query_result.object_checksum);
     if (!checksum_result) {
         return tl::unexpected(checksum_result.error());
     }
@@ -1464,10 +1429,10 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
                     hot_cache_->ReleaseHotKey(object_keys[index]);
                 }
 
-                auto checksum_result = VerifyStoreChecksum(
+                auto checksum_result = VerifyObjectChecksum(
                     object_keys[index], op.batched_slices[idx],
                     calculate_total_size(op.replicas[idx]),
-                    query_results[index].store_checksum);
+                    query_results[index].object_checksum);
                 if (!checksum_result) {
                     results[index] = tl::unexpected(checksum_result.error());
                     continue;
@@ -1621,9 +1586,9 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
                 results[index] = tl::unexpected(ErrorCode::INVALID_PARAMS);
                 continue;
             }
-            auto checksum_result = VerifyStoreChecksum(
+            auto checksum_result = VerifyObjectChecksum(
                 key, slices_it->second, calculate_total_size(stored_replica),
-                query_results[index].store_checksum);
+                query_results[index].object_checksum);
             if (!checksum_result) {
                 results[index] = tl::unexpected(checksum_result.error());
                 continue;
@@ -1699,14 +1664,14 @@ bool Client::RedirectToHotCache(const std::string& key,
 tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                           std::vector<Slice>& slices,
                                           const ReplicateConfig& config) {
-    std::optional<uint64_t> store_checksum;
-    if (store_checksum_enabled_) {
-        auto checksum_result = ComputeStoreChecksumForSlices(
+    std::optional<uint64_t> object_checksum;
+    if (object_checksum_enabled_) {
+        auto checksum_result = ComputeObjectChecksumForSlices(
             key, slices, CalculateSliceSize(slices));
         if (!checksum_result) {
             return tl::unexpected(checksum_result.error());
         }
-        store_checksum = *checksum_result;
+        object_checksum = *checksum_result;
     }
 
     // Prepare slice lengths
@@ -1792,7 +1757,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
 
     if (finalize_decision.end_type.has_value()) {
         auto end_result = master_client_.PutEnd(
-            key, *finalize_decision.end_type, store_checksum);
+            key, *finalize_decision.end_type, object_checksum);
         if (!end_result) {
             ErrorCode err = end_result.error();
             LOG(ERROR) << "Failed to end put operation: " << err;
@@ -1819,14 +1784,14 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
 tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
                                              std::vector<Slice>& slices,
                                              const ReplicateConfig& config) {
-    std::optional<uint64_t> store_checksum;
-    if (store_checksum_enabled_) {
-        auto checksum_result = ComputeStoreChecksumForSlices(
+    std::optional<uint64_t> object_checksum;
+    if (object_checksum_enabled_) {
+        auto checksum_result = ComputeObjectChecksumForSlices(
             key, slices, CalculateSliceSize(slices));
         if (!checksum_result) {
             return tl::unexpected(checksum_result.error());
         }
-        store_checksum = *checksum_result;
+        object_checksum = *checksum_result;
     }
 
     // Prepare slice lengths
@@ -1900,7 +1865,7 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
 
     // End upsert operation
     auto end_result =
-        master_client_.UpsertEnd(key, ReplicaType::MEMORY, store_checksum);
+        master_client_.UpsertEnd(key, ReplicaType::MEMORY, object_checksum);
     if (!end_result) {
         ErrorCode err = end_result.error();
         LOG(ERROR) << "Failed to end upsert operation: " << err;
@@ -1933,7 +1898,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     }
 
     std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
-    ComputeBatchStoreChecksums(ops);
+    ComputeBatchObjectChecksums(ops);
     StartBatchUpsert(ops, client_cfg);
 
     auto t0 = std::chrono::steady_clock::now();
@@ -1978,7 +1943,7 @@ class PutOperation {
 
     std::string key;
     std::vector<Slice> slices;
-    std::optional<uint64_t> store_checksum;
+    std::optional<uint64_t> object_checksum;
     std::vector<std::vector<Slice>> batched_slices;
 
     // Enhanced state tracking
@@ -2075,20 +2040,20 @@ std::vector<PutOperation> Client::CreatePutOperations(
     return ops;
 }
 
-void Client::ComputeBatchStoreChecksums(std::vector<PutOperation>& ops) {
-    if (!store_checksum_enabled_) {
+void Client::ComputeBatchObjectChecksums(std::vector<PutOperation>& ops) {
+    if (!object_checksum_enabled_) {
         return;
     }
     for (auto& op : ops) {
-        auto checksum_result = ComputeStoreChecksumForSlices(
+        auto checksum_result = ComputeObjectChecksumForSlices(
             op.key, op.slices, CalculateSliceSize(op.slices));
         if (!checksum_result) {
             op.SetTerminalError(checksum_result.error(),
                                 PutOperationState::MASTER_FAILED,
-                                "Store checksum calculation failed");
+                                "Object checksum calculation failed");
             continue;
         }
-        op.store_checksum = *checksum_result;
+        op.object_checksum = *checksum_result;
     }
 }
 
@@ -2454,13 +2419,13 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
         if (group.keys.empty()) {
             return;
         }
-        std::vector<std::optional<uint64_t>> store_checksums;
-        store_checksums.reserve(group.indices.size());
-        for (size_t index : group.indices) {
-            store_checksums.emplace_back(ops[index].store_checksum);
+        std::vector<ObjectMeta> object_metas;
+        object_metas.reserve(group.indices.size());
+        for (size_t i = 0; i < group.indices.size(); ++i) {
+            object_metas.emplace_back(ObjectMeta{
+                group.keys[i], ops[group.indices[i]].object_checksum});
         }
-        auto responses = master_client_.BatchPutEnd(group.keys, replica_type,
-                                                    store_checksums);
+        auto responses = master_client_.BatchPutEnd(object_metas, replica_type);
         if (responses.size() != group.keys.size()) {
             for (size_t idx : group.indices) {
                 finalize_rpc_errors[idx] = ErrorCode::RPC_FAIL;
@@ -2566,15 +2531,13 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
 }
 
 void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
-    std::vector<std::string> successful_keys;
+    std::vector<ObjectMeta> successful_object_metas;
     std::vector<size_t> successful_indices;
-    std::vector<std::optional<uint64_t>> successful_checksums;
     std::vector<std::string> failed_keys;
     std::vector<size_t> failed_indices;
 
-    successful_keys.reserve(ops.size());
+    successful_object_metas.reserve(ops.size());
     successful_indices.reserve(ops.size());
-    successful_checksums.reserve(ops.size());
     failed_keys.reserve(ops.size());
     failed_indices.reserve(ops.size());
 
@@ -2583,9 +2546,9 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
 
         if (!op.IsResolved() && !op.replicas.empty() &&
             !op.pending_transfers.empty()) {
-            successful_keys.emplace_back(op.key);
+            successful_object_metas.emplace_back(
+                ObjectMeta{op.key, op.object_checksum});
             successful_indices.emplace_back(i);
-            successful_checksums.emplace_back(op.store_checksum);
         } else if (op.state != PutOperationState::PENDING &&
                    !op.replicas.empty()) {
             failed_keys.emplace_back(op.key);
@@ -2595,13 +2558,13 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
 
     // Process successful operations
     std::vector<std::string> finalized_keys;
-    if (!successful_keys.empty()) {
-        finalized_keys.reserve(successful_keys.size());
-        auto end_responses = master_client_.BatchUpsertEnd(
-            successful_keys, successful_checksums);
-        if (end_responses.size() != successful_keys.size()) {
+    if (!successful_object_metas.empty()) {
+        finalized_keys.reserve(successful_object_metas.size());
+        auto end_responses =
+            master_client_.BatchUpsertEnd(successful_object_metas);
+        if (end_responses.size() != successful_object_metas.size()) {
             LOG(ERROR) << "BatchUpsertEnd response size mismatch: expected "
-                       << successful_keys.size() << ", got "
+                       << successful_object_metas.size() << ", got "
                        << end_responses.size();
             for (size_t idx : successful_indices) {
                 ops[idx].SetError(ErrorCode::RPC_FAIL,
@@ -2612,15 +2575,15 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
                 const size_t op_idx = successful_indices[i];
                 if (!end_responses[i]) {
                     LOG(ERROR) << "Failed to finalize upsert for key "
-                               << successful_keys[i] << ": "
+                               << successful_object_metas[i].key << ": "
                                << toString(end_responses[i].error());
                     ops[op_idx].SetError(end_responses[i].error(),
                                          "BatchUpsertEnd failed");
                 } else {
                     ops[op_idx].SetSuccess();
-                    finalized_keys.emplace_back(successful_keys[i]);
+                    finalized_keys.emplace_back(successful_object_metas[i].key);
                     VLOG(1) << "Successfully completed upsert for key "
-                            << successful_keys[i];
+                            << successful_object_metas[i].key;
                 }
             }
         }
@@ -2826,7 +2789,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
         client_cfg.preferred_segment = local_hostname_;
     }
     std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
-    ComputeBatchStoreChecksums(ops);
+    ComputeBatchObjectChecksums(ops);
     if (client_cfg.prefer_alloc_in_same_node) {
         if (client_cfg.nof_replica_num > 0) {
             LOG(ERROR) << "prefer_alloc_in_same_node is not supported with "
@@ -4275,7 +4238,7 @@ ErrorCode Client::InitLocalHotCache() {
     hot_cache_.reset();
     admission_sketch_.reset();
 
-    if (store_checksum_enabled_) {
+    if (object_checksum_enabled_) {
         return ErrorCode::OK;
     }
 

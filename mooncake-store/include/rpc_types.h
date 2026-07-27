@@ -8,6 +8,12 @@
 
 namespace mooncake {
 
+struct ObjectMeta {
+    std::string key;
+    std::optional<uint64_t> object_checksum;
+};
+YLT_REFL(ObjectMeta, key, object_checksum);
+
 /**
  * @brief Response structure for Ping operation
  */
@@ -34,18 +40,18 @@ YLT_REFL(PingResponse, view_version_id, client_status);
 struct GetReplicaListResponse {
     std::vector<Replica::Descriptor> replicas;
     uint64_t lease_ttl_ms;
-    std::optional<uint64_t> store_checksum;
+    std::optional<uint64_t> object_checksum;
 
     GetReplicaListResponse() : lease_ttl_ms(0) {}
     GetReplicaListResponse(
         std::vector<Replica::Descriptor>&& replicas_param,
         uint64_t lease_ttl_ms_param,
-        std::optional<uint64_t> store_checksum_param = std::nullopt)
+        std::optional<uint64_t> object_checksum_param = std::nullopt)
         : replicas(std::move(replicas_param)),
           lease_ttl_ms(lease_ttl_ms_param),
-          store_checksum(store_checksum_param) {}
+          object_checksum(object_checksum_param) {}
 };
-YLT_REFL(GetReplicaListResponse, replicas, lease_ttl_ms, store_checksum);
+YLT_REFL(GetReplicaListResponse, replicas, lease_ttl_ms, object_checksum);
 
 struct CachedQueryResultResponse {
     bool success;

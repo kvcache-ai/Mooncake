@@ -387,7 +387,7 @@ WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
 
 tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
     const UUID& client_id, const std::string& key, ReplicaType replica_type,
-    const std::string& tenant_id, std::optional<uint64_t> store_checksum) {
+    const std::string& tenant_id, std::optional<uint64_t> object_checksum) {
     return execute_rpc(
         "PutEnd",
         [&] {
@@ -397,7 +397,7 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
                                      [&](const TenantId& resolved_tenant_id) {
                                          return master_service_.PutEnd(
                                              client_id, key, resolved_tenant_id,
-                                             replica_type, store_checksum);
+                                             replica_type, object_checksum);
                                      });
         },
         [&](auto& timer) {
@@ -534,32 +534,19 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
 }
 
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
-    const UUID& client_id, const std::vector<std::string>& keys,
-    ReplicaType replica_type, const std::string& tenant_id,
-    const std::vector<std::optional<uint64_t>>& store_checksums) {
+    const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
+    ReplicaType replica_type, const std::string& tenant_id) {
     ScopedVLogTimer timer(1, "BatchPutEnd");
-    const size_t total_keys = keys.size();
+    const size_t total_keys = object_metas.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
     MasterMetricManager::instance().inc_batch_put_end_requests(total_keys);
-
-    if (!store_checksums.empty() && store_checksums.size() != keys.size()) {
-        return std::vector<tl::expected<void, ErrorCode>>(
-            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
-    }
 
     auto results = WithRequestTenantBatch(
         master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
                                                : TenantId::kDefaultValue,
-        keys.size(), [&](const TenantId& resolved_tenant_id) {
-            std::vector<tl::expected<void, ErrorCode>> batch_results;
-            batch_results.reserve(keys.size());
-            for (size_t i = 0; i < keys.size(); ++i) {
-                batch_results.emplace_back(master_service_.PutEnd(
-                    client_id, keys[i], resolved_tenant_id, replica_type,
-                    store_checksums.empty() ? std::nullopt
-                                            : store_checksums[i]));
-            }
-            return batch_results;
+        object_metas.size(), [&](const TenantId& resolved_tenant_id) {
+            return master_service_.BatchPutEnd(
+                client_id, object_metas, resolved_tenant_id, replica_type);
         });
 
     size_t failure_count = 0;
@@ -567,8 +554,8 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
         if (!results[i].has_value()) {
             failure_count++;
             auto error = results[i].error();
-            LOG(ERROR) << "BatchPutEnd failed for key[" << i << "] '" << keys[i]
-                       << "': " << toString(error);
+            LOG(ERROR) << "BatchPutEnd failed for key[" << i << "] '"
+                       << object_metas[i].key << "': " << toString(error);
         }
     }
 
@@ -657,7 +644,7 @@ WrappedMasterService::UpsertStart(const UUID& client_id, const std::string& key,
 
 tl::expected<void, ErrorCode> WrappedMasterService::UpsertEnd(
     const UUID& client_id, const std::string& key, ReplicaType replica_type,
-    const std::string& tenant_id, std::optional<uint64_t> store_checksum) {
+    const std::string& tenant_id, std::optional<uint64_t> object_checksum) {
     return execute_rpc(
         "UpsertEnd",
         [&] {
@@ -667,7 +654,7 @@ tl::expected<void, ErrorCode> WrappedMasterService::UpsertEnd(
                                      [&](const TenantId& resolved_tenant_id) {
                                          return master_service_.UpsertEnd(
                                              client_id, key, resolved_tenant_id,
-                                             replica_type, store_checksum);
+                                             replica_type, object_checksum);
                                      });
         },
         [&](auto& timer) {
@@ -760,20 +747,19 @@ WrappedMasterService::BatchUpsertStart(
 }
 
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchUpsertEnd(
-    const UUID& client_id, const std::vector<std::string>& keys,
-    const std::string& tenant_id,
-    const std::vector<std::optional<uint64_t>>& store_checksums) {
+    const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
+    const std::string& tenant_id) {
     ScopedVLogTimer timer(1, "BatchUpsertEnd");
-    const size_t total_keys = keys.size();
+    const size_t total_keys = object_metas.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
     MasterMetricManager::instance().inc_batch_put_end_requests(total_keys);
 
     auto results = WithRequestTenantBatch(
         master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
                                                : TenantId::kDefaultValue,
-        keys.size(), [&](const TenantId& resolved_tenant_id) {
-            return master_service_.BatchUpsertEnd(
-                client_id, keys, resolved_tenant_id, store_checksums);
+        object_metas.size(), [&](const TenantId& resolved_tenant_id) {
+            return master_service_.BatchUpsertEnd(client_id, object_metas,
+                                                  resolved_tenant_id);
         });
 
     size_t failure_count = 0;
@@ -782,7 +768,7 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchUpsertEnd(
             failure_count++;
             auto error = results[i].error();
             LOG(ERROR) << "BatchUpsertEnd failed for key[" << i << "] '"
-                       << keys[i] << "': " << toString(error);
+                       << object_metas[i].key << "': " << toString(error);
         }
     }
 

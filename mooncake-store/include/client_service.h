@@ -42,15 +42,15 @@ class QueryResult {
     const std::vector<Replica::Descriptor> replicas;
     /** @brief Time point when the lease for this key expires */
     const std::chrono::steady_clock::time_point lease_timeout;
-    /** @brief Optional store-level full-object checksum */
-    const std::optional<uint64_t> store_checksum;
+    /** @brief Optional full-object checksum */
+    const std::optional<uint64_t> object_checksum;
 
     QueryResult(std::vector<Replica::Descriptor>&& replicas_param,
                 std::chrono::steady_clock::time_point lease_timeout_param,
-                std::optional<uint64_t> store_checksum_param = std::nullopt)
+                std::optional<uint64_t> object_checksum_param = std::nullopt)
         : replicas(std::move(replicas_param)),
           lease_timeout(lease_timeout_param),
-          store_checksum(store_checksum_param) {}
+          object_checksum(object_checksum_param) {}
 
     bool IsLeaseExpired() const {
         return std::chrono::steady_clock::now() >= lease_timeout;
@@ -154,7 +154,7 @@ class Client {
         const std::vector<std::string>& object_keys,
         const std::string& tenant_id);
 
-    tl::expected<void, ErrorCode> VerifyStoreChecksum(
+    tl::expected<void, ErrorCode> VerifyObjectChecksum(
         const std::string& object_key, const std::vector<Slice>& slices,
         size_t object_size, std::optional<uint64_t> expected_checksum);
 
@@ -692,7 +692,7 @@ class Client {
     ErrorCode TransferReadRange(const Replica::Descriptor& replica_descriptor,
                                 std::vector<Slice>& slices,
                                 uint64_t src_offset);
-    tl::expected<uint64_t, ErrorCode> ComputeStoreChecksumForSlices(
+    tl::expected<uint64_t, ErrorCode> ComputeObjectChecksumForSlices(
         const std::string& object_key, const std::vector<Slice>& slices,
         size_t object_size);
 
@@ -774,7 +774,7 @@ class Client {
         const std::vector<std::vector<Slice>>& batched_slices);
     void StartBatchPut(std::vector<PutOperation>& ops,
                        const ReplicateConfig& config);
-    void ComputeBatchStoreChecksums(std::vector<PutOperation>& ops);
+    void ComputeBatchObjectChecksums(std::vector<PutOperation>& ops);
     void SubmitTransfers(std::vector<PutOperation>& ops);
     void WaitForTransfers(std::vector<PutOperation>& ops);
     void FinalizeBatchPut(std::vector<PutOperation>& ops);
@@ -835,7 +835,7 @@ class Client {
     const std::string host_id_;
     const std::string metadata_connstring_;
     const std::string protocol_;
-    const bool store_checksum_enabled_;
+    const bool object_checksum_enabled_;
 
     // Client persistent thread pool for async operations
     // Pinned host memory pool for GPU D2H staging (must outlive

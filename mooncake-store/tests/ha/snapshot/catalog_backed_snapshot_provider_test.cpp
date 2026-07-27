@@ -198,8 +198,8 @@ TEST_P(CatalogBackedSnapshotProviderTest, LoadLatestSnapshotWithGroupId) {
 }
 
 TEST_P(CatalogBackedSnapshotProviderTest,
-       LoadLatestSnapshotIgnoresStoreChecksum) {
-    PublishSnapshotPayload(SnapshotMetadataFormat::kWithStoreChecksum);
+       LoadLatestSnapshotIgnoresObjectChecksum) {
+    PublishSnapshotPayload(SnapshotMetadataFormat::kWithObjectChecksum);
     ExpectLoadsDefaultObject();
 }
 

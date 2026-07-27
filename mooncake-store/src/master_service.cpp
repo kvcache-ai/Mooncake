@@ -3040,7 +3040,7 @@ auto MasterService::GetReplicaList(const std::string& key,
 
         resp = GetReplicaListResponse(std::move(replica_list),
                                       default_kv_lease_ttl_,
-                                      metadata.store_checksum);
+                                      metadata.object_checksum);
     }
     // RO accessor released. Safe to take a fresh RW accessor now.
     if (promotion_eligible) {
@@ -3077,7 +3077,7 @@ auto MasterService::GetReplicaListForAdmin(const std::string& key,
 
     return GetReplicaListResponse(std::move(replica_list),
                                   default_kv_lease_ttl_,
-                                  metadata.store_checksum);
+                                  metadata.object_checksum);
 }
 
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
@@ -3201,7 +3201,7 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
 
                 results[original_idx] = GetReplicaListResponse(
                     std::move(replica_list), default_kv_lease_ttl_,
-                    metadata.store_checksum);
+                    metadata.object_checksum);
             }
         }
 
@@ -3295,7 +3295,7 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
 
                 results[original_idx] = GetReplicaListResponse(
                     std::move(replica_list), default_kv_lease_ttl_,
-                    metadata.store_checksum);
+                    metadata.object_checksum);
             }
         }
     }
@@ -3711,7 +3711,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
 
 auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
                            const TenantId& tenant_id, ReplicaType replica_type,
-                           std::optional<uint64_t> store_checksum)
+                           std::optional<uint64_t> object_checksum)
     -> tl::expected<void, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
@@ -3748,10 +3748,10 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
         },
         [](Replica& replica) { replica.mark_complete(); });
 
-    if (store_checksum.has_value() || replica_type == ReplicaType::ALL ||
+    if (object_checksum.has_value() || replica_type == ReplicaType::ALL ||
         replica_type == ReplicaType::MEMORY ||
         replica_type == ReplicaType::NOF_SSD) {
-        metadata.store_checksum = store_checksum;
+        metadata.object_checksum = object_checksum;
     }
 
     const bool has_memory_replica = metadata.HasMemReplica();
@@ -4037,20 +4037,14 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
-    const UUID& client_id, const std::vector<std::string>& keys,
-    const TenantId& tenant_id, ReplicaType replica_type,
-    const std::vector<std::optional<uint64_t>>& store_checksums) {
+    const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
+    const TenantId& tenant_id, ReplicaType replica_type) {
     assert(tenant_id.IsValid());
     std::vector<tl::expected<void, ErrorCode>> results;
-    results.reserve(keys.size());
-    if (!store_checksums.empty() && store_checksums.size() != keys.size()) {
-        return std::vector<tl::expected<void, ErrorCode>>(
-            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
-    }
-    for (size_t i = 0; i < keys.size(); ++i) {
-        results.emplace_back(PutEnd(
-            client_id, keys[i], tenant_id, replica_type,
-            store_checksums.empty() ? std::nullopt : store_checksums[i]));
+    results.reserve(object_metas.size());
+    for (const auto& object_meta : object_metas) {
+        results.emplace_back(PutEnd(client_id, object_meta.key, tenant_id,
+                                    replica_type, object_meta.object_checksum));
     }
     return results;
 }
@@ -4426,9 +4420,9 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
 auto MasterService::UpsertEnd(const UUID& client_id, const std::string& key,
                               const TenantId& tenant_id,
                               ReplicaType replica_type,
-                              std::optional<uint64_t> store_checksum)
+                              std::optional<uint64_t> object_checksum)
     -> tl::expected<void, ErrorCode> {
-    return PutEnd(client_id, key, tenant_id, replica_type, store_checksum);
+    return PutEnd(client_id, key, tenant_id, replica_type, object_checksum);
 }
 
 auto MasterService::UpsertRevoke(const UUID& client_id, const std::string& key,
@@ -4473,11 +4467,9 @@ MasterService::BatchUpsertStart(const UUID& client_id,
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchUpsertEnd(
-    const UUID& client_id, const std::vector<std::string>& keys,
-    const TenantId& tenant_id,
-    const std::vector<std::optional<uint64_t>>& store_checksums) {
-    return BatchPutEnd(client_id, keys, tenant_id, ReplicaType::ALL,
-                       store_checksums);
+    const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
+    const TenantId& tenant_id) {
+    return BatchPutEnd(client_id, object_metas, tenant_id, ReplicaType::ALL);
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchUpsertRevoke(
@@ -9509,7 +9501,7 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
 
         it->second.lease_timeout = metadata_ptr->lease_timeout;
         it->second.soft_pin_timeout = metadata_ptr->soft_pin_timeout;
-        it->second.store_checksum = metadata_ptr->store_checksum;
+        it->second.object_checksum = metadata_ptr->object_checksum;
 
         // Recompute disk_object_count for restored metadata
         if (it->second.HasReplica([](const Replica& r) {
@@ -9529,13 +9521,13 @@ MasterService::MetadataSerializer::SerializeMetadata(
     // Pack ObjectMetadata using array structure for efficiency
     // Format: [client_id, put_start_time, size, lease_timeout,
     // has_soft_pin_timeout, soft_pin_timeout, replicas_count, data_type,
-    // replicas..., hard_pinned, group_id, store_checksum?]
+    // replicas..., hard_pinned, group_id, object_checksum?]
 
     size_t array_size = 10;  // client_id, put_start_time, size, lease_timeout,
                              // has_soft_pin_timeout, soft_pin_timeout,
                              // replicas_count, data_type, hard_pinned, group_id
     array_size += metadata.CountReplicas();  // One element per replica
-    if (metadata.store_checksum.has_value()) {
+    if (metadata.object_checksum.has_value()) {
         ++array_size;
     }
     packer.pack_array(array_size);
@@ -9590,8 +9582,8 @@ MasterService::MetadataSerializer::SerializeMetadata(
 
     packer.pack(metadata.IsHardPinned());
     packer.pack(metadata.group_id);
-    if (metadata.store_checksum.has_value()) {
-        packer.pack(*metadata.store_checksum);
+    if (metadata.object_checksum.has_value()) {
+        packer.pack(*metadata.object_checksum);
     }
 
     return {};
@@ -9651,7 +9643,7 @@ MasterService::MetadataSerializer::DeserializeMetadata(
     //   v2: 8 + replicas_count, either data_type or hard_pinned
     //   v3: 9 + replicas_count, data_type + hard_pinned or hard_pinned +
     //   group_id v4: 10 + replicas_count, data_type + hard_pinned + group_id
-    //   v5: 11 + replicas_count, v4 + store_checksum
+    //   v5: 11 + replicas_count, v4 + object_checksum
     // 64-bit arithmetic keeps an attacker-controlled near-UINT32_MAX
     // replicas_count from wrapping the bounds and slipping an out-of-bounds
     // index past the size check.
@@ -9706,10 +9698,10 @@ MasterService::MetadataSerializer::DeserializeMetadata(
         group_id = array[index++].as<std::string>();
     }
 
-    std::optional<uint64_t> store_checksum;
+    std::optional<uint64_t> object_checksum;
     if (index < total_elements &&
         array[index].type == msgpack::type::POSITIVE_INTEGER) {
-        store_checksum = array[index++].as<uint64_t>();
+        object_checksum = array[index++].as<uint64_t>();
     }
     if (index != total_elements) {
         return tl::unexpected(SerializationError(
@@ -9725,7 +9717,7 @@ MasterService::MetadataSerializer::DeserializeMetadata(
             std::chrono::milliseconds(put_start_time_timestamp)),
         size, std::move(replicas), enable_soft_pin, is_hard_pinned, data_type,
         group_id);
-    metadata->store_checksum = store_checksum;
+    metadata->object_checksum = object_checksum;
     metadata->lease_timeout = std::chrono::system_clock::time_point(
         std::chrono::milliseconds(lease_timestamp));
 

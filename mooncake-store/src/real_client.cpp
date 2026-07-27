@@ -341,10 +341,10 @@ using mooncake::SelectBestReplica;
 // FindFirstCompleteReplica) cannot pick a different replica type.
 inline QueryResult FilterQueryResult(const QueryResult &qr,
                                      const Replica::Descriptor &replica,
-                                     bool include_store_checksum = true) {
+                                     bool include_object_checksum = true) {
     return QueryResult(
         {replica}, qr.lease_timeout,
-        include_store_checksum ? qr.store_checksum : std::nullopt);
+        include_object_checksum ? qr.object_checksum : std::nullopt);
 }
 }  // namespace
 
@@ -2758,8 +2758,8 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
             return nullptr;
         }
         auto checksum_result =
-            client_->VerifyStoreChecksum(key, objects.at(key), total_length,
-                                         query_result.value().store_checksum);
+            client_->VerifyObjectChecksum(key, objects.at(key), total_length,
+                                          query_result.value().object_checksum);
         if (!checksum_result) {
             LOG(ERROR) << "SSD checksum verification failed for key '" << key
                        << "': " << toString(checksum_result.error());
@@ -3172,9 +3172,9 @@ RealClient::batch_get_buffer_internal(
                 if (idx_it == disk_key_to_idx.end()) continue;
                 auto &op = disk_ops[idx_it->second];
                 if (read_result) {
-                    auto checksum_result = client_->VerifyStoreChecksum(
+                    auto checksum_result = client_->VerifyObjectChecksum(
                         key, slices, op.total_size,
-                        op.query_result.store_checksum);
+                        op.query_result.object_checksum);
                     if (!checksum_result) {
                         LOG(ERROR)
                             << "SSD checksum verification failed for key '"
@@ -3335,9 +3335,9 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
                 batch_get_into_offload_object_internal(endpoint, objects);
             if (!result) return tl::unexpected(result.error());
             if (verify_checksum) {
-                auto checksum_result = client_->VerifyStoreChecksum(
+                auto checksum_result = client_->VerifyObjectChecksum(
                     key, objects.at(key), total_size,
-                    query_result.store_checksum);
+                    query_result.object_checksum);
                 if (!checksum_result) {
                     return tl::unexpected(checksum_result.error());
                 }
@@ -4896,9 +4896,9 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         for (const auto &offload_object_it : offload_objects_it.second) {
             const auto &op =
                 valid_local_disk_operations.at(offload_object_it.first);
-            auto checksum_result = client_->VerifyStoreChecksum(
+            auto checksum_result = client_->VerifyObjectChecksum(
                 offload_object_it.first, offload_object_it.second,
-                op.total_size, op.query_result.store_checksum);
+                op.total_size, op.query_result.object_checksum);
             if (!checksum_result) {
                 results[op.original_index] =
                     tl::make_unexpected(checksum_result.error());
@@ -5324,9 +5324,9 @@ RealClient::batch_get_into_multi_buffers_internal(
                     auto disk_it = valid_local_disk_ops.find(key);
                     if (disk_it == valid_local_disk_ops.end()) continue;
                     auto &op = disk_it->second;
-                    auto checksum_result = client_->VerifyStoreChecksum(
+                    auto checksum_result = client_->VerifyObjectChecksum(
                         key, slices, op.total_size,
-                        op.query_result.store_checksum);
+                        op.query_result.object_checksum);
                     if (!checksum_result) {
                         results[op.original_index] =
                             tl::make_unexpected(checksum_result.error());

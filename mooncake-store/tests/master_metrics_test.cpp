@@ -541,7 +541,12 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     ASSERT_EQ(metrics.get_batch_get_replica_list_failed_items(), 3);
 
     // Test BatchPutEnd request
-    auto batch_put_end_result = service_.BatchPutEnd(client_id, keys);
+    std::vector<ObjectMeta> object_metas;
+    object_metas.reserve(keys.size());
+    for (const auto& key : keys) {
+        object_metas.emplace_back(ObjectMeta{key, std::nullopt});
+    }
+    auto batch_put_end_result = service_.BatchPutEnd(client_id, object_metas);
     ASSERT_EQ(batch_put_end_result.size(), 3);
     ASSERT_EQ(metrics.get_batch_put_end_requests(), 1);
     ASSERT_EQ(metrics.get_batch_put_end_partial_successes(), 0);

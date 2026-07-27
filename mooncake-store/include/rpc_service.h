@@ -84,7 +84,7 @@ class WrappedMasterService {
         const UUID& client_id, const std::string& key,
         ReplicaType replica_type = ReplicaType::ALL,
         const std::string& tenant_id = "default",
-        std::optional<uint64_t> store_checksum = std::nullopt);
+        std::optional<uint64_t> object_checksum = std::nullopt);
 
     tl::expected<void, ErrorCode> PutRevoke(
         const UUID& client_id, const std::string& key,
@@ -98,10 +98,9 @@ class WrappedMasterService {
                   const std::string& tenant_id = "default");
 
     std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
-        const UUID& client_id, const std::vector<std::string>& keys,
+        const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
         ReplicaType replica_type = ReplicaType::ALL,
-        const std::string& tenant_id = "default",
-        const std::vector<std::optional<uint64_t>>& store_checksums = {});
+        const std::string& tenant_id = "default");
 
     std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
         const UUID& client_id, const std::vector<std::string>& keys,
@@ -117,7 +116,7 @@ class WrappedMasterService {
         const UUID& client_id, const std::string& key,
         ReplicaType replica_type = ReplicaType::ALL,
         const std::string& tenant_id = "default",
-        std::optional<uint64_t> store_checksum = std::nullopt);
+        std::optional<uint64_t> object_checksum = std::nullopt);
 
     tl::expected<void, ErrorCode> UpsertRevoke(
         const UUID& client_id, const std::string& key,
@@ -132,9 +131,8 @@ class WrappedMasterService {
                      const std::string& tenant_id = "default");
 
     std::vector<tl::expected<void, ErrorCode>> BatchUpsertEnd(
-        const UUID& client_id, const std::vector<std::string>& keys,
-        const std::string& tenant_id = "default",
-        const std::vector<std::optional<uint64_t>>& store_checksums = {});
+        const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
+        const std::string& tenant_id = "default");
 
     std::vector<tl::expected<void, ErrorCode>> BatchUpsertRevoke(
         const UUID& client_id, const std::vector<std::string>& keys,

@@ -225,7 +225,7 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<void, ErrorCode> PutEnd(
         const std::string& key, ReplicaType replica_type,
-        std::optional<uint64_t> store_checksum = std::nullopt);
+        std::optional<uint64_t> object_checksum = std::nullopt);
 
     /**
      * @brief Ends a put operation for a batch of objects
@@ -233,9 +233,8 @@ class MasterClient {
      * @return ErrorCode indicating success/failure
      */
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
-        const std::vector<std::string>& keys,
-        ReplicaType replica_type = ReplicaType::ALL,
-        const std::vector<std::optional<uint64_t>>& store_checksums = {});
+        const std::vector<ObjectMeta>& object_metas,
+        ReplicaType replica_type = ReplicaType::ALL);
 
     /**
      * @brief Revokes a put operation
@@ -275,11 +274,10 @@ class MasterClient {
 
     [[nodiscard]] tl::expected<void, ErrorCode> UpsertEnd(
         const std::string& key, ReplicaType replica_type,
-        std::optional<uint64_t> store_checksum = std::nullopt);
+        std::optional<uint64_t> object_checksum = std::nullopt);
 
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchUpsertEnd(
-        const std::vector<std::string>& keys,
-        const std::vector<std::optional<uint64_t>>& store_checksums = {});
+        const std::vector<ObjectMeta>& object_metas);
 
     [[nodiscard]] tl::expected<void, ErrorCode> UpsertRevoke(
         const std::string& key, ReplicaType replica_type);

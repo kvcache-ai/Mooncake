@@ -305,6 +305,7 @@ target_link_libraries(
          gflags::gflags
          ${EXTRA_LIBS}
          ${SPDK_STATIC_LIBS}
+         mooncake_common
          yaml-cpp
          asio_shared
   PRIVATE transfer_engine)
