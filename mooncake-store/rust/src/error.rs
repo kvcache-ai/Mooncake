@@ -57,6 +57,6 @@ pub enum StoreError {
     /// must be called before creating any store.
     ///
     /// Only ever produced by the `dlopen` backend.
-    #[error("Mooncake shared library already loaded; load_library() must be called first")]
+    #[error("Mooncake shared library already loaded; call load_library() before creating a store")]
     LibraryAlreadyLoaded,
 }

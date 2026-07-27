@@ -420,23 +420,16 @@ endif()
 install(TARGETS mooncake_master mooncake_client DESTINATION bin)
 
 # ---------------------------------------------------------------------------
-# Optional self-contained shared library exposing only the store_c.h C ABI.
-#
-# `mooncake_store` is a static library and the Rust/Go bindings statically link
-# its whole dependency graph. WITH_STORE_C_SHARED instead emits a single
-# libmooncake_store.so that whole-archives mooncake_store (so the C entry points
-# survive) and exports ONLY the `mooncake_store_*` symbols, for consumers that
-# dlopen the store at run time (e.g. the Rust crate's `dlopen` feature).
-#
-# Objects are -fPIC (see mooncake-common/common.cmake), so archiving them into a
-# .so is safe. Mooncake's own static libraries and asio (via asio_static) are
-# absorbed; only genuinely-external libs remain DT_NEEDED: system/toolkit libs
-# (glog, cudart, ibverbs, ...) and, when enabled, the Go etcd/k8s HA backends.
+# Optional: a self-contained libmooncake_store.so exporting only the store_c.h
+# C ABI, for consumers that dlopen the store (e.g. the Rust crate's `dlopen`
+# feature). Whole-archives the static mooncake_store + asio_static (objects are
+# -fPIC, see mooncake-common/common.cmake) and localizes everything else via the
+# version script; only system/toolkit libs (and the Go etcd/k8s backends when
+# enabled) stay DT_NEEDED.
 # ---------------------------------------------------------------------------
 if(WITH_STORE_C_SHARED)
-  # The link recipe below uses ELF-specific features (--whole-archive,
-  # --as-needed, a version script, and $ORIGIN rpath), supported by GNU ld, gold,
-  # and lld. Gate on Linux/ELF and fail early elsewhere rather than at link time.
+  # ELF/GNU-ld features (--whole-archive, --as-needed, version script, $ORIGIN);
+  # supported by GNU ld, gold, and lld. Linux only.
   if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
     message(
       FATAL_ERROR
@@ -444,11 +437,9 @@ if(WITH_STORE_C_SHARED)
         "(got CMAKE_SYSTEM_NAME=${CMAKE_SYSTEM_NAME}).")
   endif()
 
-  # This target whole-archives mooncake_store and reuses its OUTPUT_NAME, both of
-  # which assume mooncake_store is a static archive. add_library(mooncake_store)
-  # follows BUILD_SHARED_LIBS, so guard against a shared mooncake_store (e.g. when
-  # BUILD_SHARED_LIBS=ON, which some backends force) to avoid a broken
-  # --whole-archive link and a libmooncake_store.so output-name collision.
+  # We whole-archive mooncake_store and reuse its name, so require it to be static
+  # (add_library(mooncake_store) follows BUILD_SHARED_LIBS, which some backends
+  # force ON).
   get_target_property(_mooncake_store_type mooncake_store TYPE)
   if(NOT _mooncake_store_type STREQUAL "STATIC_LIBRARY")
     message(
@@ -458,22 +449,21 @@ if(WITH_STORE_C_SHARED)
   endif()
 
   add_library(mooncake_store_c SHARED store_c_shared.cpp)
-  # $ORIGIN so an installed libmooncake_store.so finds any co-installed deps
-  # beside it (CMake strips the build-tree RUNPATH on install).
   set_target_properties(
     mooncake_store_c
     PROPERTIES OUTPUT_NAME mooncake_store
-               CXX_VISIBILITY_PRESET hidden
-               VISIBILITY_INLINES_HIDDEN ON
+               # Separate dir so this .so does not shadow the static
+               # libmooncake_store.a on the Rust `link` backend's -L path.
+               LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/shared"
+               # $ORIGIN so the installed .so finds co-installed deps (CMake
+               # strips the build RUNPATH on install).
                INSTALL_RPATH "$ORIGIN"
-               # Relink when the version script changes (it is only a link flag).
+               # Relink when the version script (a bare link flag) changes.
                LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/store_c.map")
   add_dependencies(mooncake_store_c mooncake_store asio_static)
-  # Whole-archive the static lib via its file path (which does not drag in
-  # interface deps) and asio_static, absorbing their objects. Then link the
-  # mooncake_store target for its transitive deps; --as-needed drops the
-  # transitive libasio.so, whose symbols asio_static now provides. Objects
-  # already loaded by --whole-archive are not re-added.
+  # Whole-archive the static lib + asio_static via file paths (no interface-dep
+  # propagation); re-list the mooncake_store target for its transitive deps.
+  # --as-needed drops the now-redundant transitive libasio.so.
   target_link_libraries(
     mooncake_store_c
     PRIVATE -Wl,--whole-archive "$<TARGET_FILE:mooncake_store>"

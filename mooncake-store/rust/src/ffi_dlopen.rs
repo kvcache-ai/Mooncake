@@ -14,16 +14,12 @@
 
 //! Runtime `dlopen` bindings for the Mooncake Store C API (`store_c.h`).
 //!
-//! Enabled by the `dlopen` feature. The raw bindings — types, struct layout
-//! checks, and a `libloading` loader for the `mooncake_store_*` symbols — are
-//! generated from `store_c.h` by bindgen (`dynamic_library_name`, see build.rs),
-//! so the C ABI is never hand-maintained. This module wraps the generated loader
-//! in a process-global handle plus thin free-function shims so that
-//! [`crate::store`] is identical across the `link` and `dlopen` backends.
-//!
-//! The library is resolved lazily on first [`crate::MooncakeStore`] creation
-//! from `MOONCAKE_STORE_LIBRARY` (default `libmooncake_store.so`, via the OS
-//! loader search path), or eagerly via [`load_library`].
+//! The raw loader (types, layout checks, all `mooncake_store_*` symbols) is
+//! bindgen-generated from `store_c.h` (`dynamic_library_name`, see build.rs), so
+//! the ABI is never hand-maintained; this module wraps it in a process-global
+//! plus free-function shims so `crate::store` is backend-agnostic. The library
+//! loads lazily on first store creation from `MOONCAKE_STORE_LIBRARY` (default
+//! `libmooncake_store.so`), or eagerly via [`load_library`].
 
 use std::ffi::{OsStr, OsString};
 use std::os::raw::{c_char, c_int, c_void};
@@ -214,8 +210,8 @@ mod tests {
         assert!(matches!(err, StoreError::LibraryLoad(_)), "got {err:?}");
     }
 
-    // MooncakeStore::new() must surface the load failure (not panic) when the
-    // configured library cannot be opened.
+    // new() must surface the load failure, not panic. Safe despite the shared
+    // env/global: no unit test loads a real library, so API stays unset.
     #[test]
     fn new_with_missing_library_reports_library_load_error() {
         std::env::set_var(

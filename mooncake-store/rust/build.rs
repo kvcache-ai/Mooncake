@@ -180,6 +180,8 @@ fn main() {
     println!("cargo:rerun-if-changed={header}");
     println!("cargo:rerun-if-env-changed=MOONCAKE_STORE_INCLUDE_DIR");
 
+    // require_all: the loader resolves every mooncake_store_* symbol up front, so
+    // a library missing any of them fails fast at load rather than on first call.
     let bindings = bindgen::Builder::default()
         .header(&header)
         .allowlist_function("mooncake_store_.*")
