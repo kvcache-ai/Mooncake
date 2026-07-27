@@ -1881,7 +1881,7 @@ TEST_F(StorageBackendTest,
 // BucketStorageBackend: Duplicate Key Detection Tests (Phase 0 - D0)
 //-----------------------------------------------------------------------------
 
-TEST_F(StorageBackendTest, BucketStorageBackend_DuplicateKeyRejected) {
+TEST_F(StorageBackendTest, BucketStorageBackend_DuplicateKeyIdempotentSkip) {
     FileStorageConfig config;
     config.storage_filepath = data_path;
     BucketBackendConfig bucket_config;
@@ -1903,7 +1903,8 @@ TEST_F(StorageBackendTest, BucketStorageBackend_DuplicateKeyRejected) {
            std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
     ASSERT_TRUE(result1.has_value()) << "First write should succeed";
 
-    // Attempt to write the same key again
+    // Re-offload the same key: an idempotent no-op (Put semantics), not an
+    // error. Nothing new is committed, so the complete handler must not fire.
     std::string value2 = "duplicate_value_data";
     auto buf2 = std::make_unique<char[]>(value2.size());
     std::memcpy(buf2.get(), value2.data(), value2.size());
@@ -1911,12 +1912,17 @@ TEST_F(StorageBackendTest, BucketStorageBackend_DuplicateKeyRejected) {
     std::unordered_map<std::string, std::vector<Slice>> batch2;
     batch2.emplace(key, std::vector<Slice>{Slice{buf2.get(), value2.size()}});
 
+    int handler_calls = 0;
     auto result2 = storage_backend.BatchOffload(
-        batch2,
-        [](const std::vector<std::string>&,
-           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
-    ASSERT_FALSE(result2.has_value()) << "Duplicate key should be rejected";
-    EXPECT_EQ(result2.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
+        batch2, [&handler_calls](const std::vector<std::string>&,
+                                 std::vector<StorageObjectMetadata>&) {
+            handler_calls++;
+            return ErrorCode::OK;
+        });
+    ASSERT_TRUE(result2.has_value())
+        << "Re-offloading a persisted key should succeed idempotently";
+    EXPECT_EQ(handler_calls, 0)
+        << "Complete handler must not fire for an all-duplicate batch";
 
     // Verify original data is still readable and not corrupted
     auto is_exist = storage_backend.IsExist(key);
@@ -1983,8 +1989,8 @@ TEST_F(StorageBackendTest,
         batch2,
         [](const std::vector<std::string>&,
            std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
-    ASSERT_FALSE(result2.has_value());
-    EXPECT_EQ(result2.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
+    ASSERT_TRUE(result2.has_value())
+        << "Duplicate re-offload should succeed as an idempotent no-op";
 
     // Count files after duplicate attempt - orphaned files should be cleaned up
     int file_count_after = 0;
@@ -2011,8 +2017,7 @@ TEST_F(StorageBackendTest,
 
 //-----------------------------------------------------------------------------
 
-TEST_F(StorageBackendTest,
-       BucketStorageBackend_DuplicateBatchPartialRejection) {
+TEST_F(StorageBackendTest, BucketStorageBackend_DuplicateBatchPartialSkip) {
     FileStorageConfig config;
     config.storage_filepath = data_path;
     BucketBackendConfig bucket_config;
@@ -2034,7 +2039,8 @@ TEST_F(StorageBackendTest,
            std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
     ASSERT_TRUE(result1.has_value());
 
-    // Attempt BatchOffload with batch containing ["keyA", "keyB"]
+    // BatchOffload a mix of ["keyA", "keyB"]: the duplicate is skipped, the
+    // new key is still committed.
     std::string keyB = "keyB";
     std::string valueA2 = "duplicate_value_A";
     std::string valueB = "value_for_keyB";
@@ -2049,20 +2055,29 @@ TEST_F(StorageBackendTest,
                    std::vector<Slice>{Slice{bufA2.get(), valueA2.size()}});
     batch2.emplace(keyB, std::vector<Slice>{Slice{bufB.get(), valueB.size()}});
 
+    std::vector<std::string> notified_keys;
     auto result2 = storage_backend.BatchOffload(
-        batch2,
-        [](const std::vector<std::string>&,
-           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+        batch2, [&notified_keys](const std::vector<std::string>& keys,
+                                 std::vector<StorageObjectMetadata>&) {
+            notified_keys = keys;
+            return ErrorCode::OK;
+        });
+    ASSERT_TRUE(result2.has_value())
+        << "Duplicates should be skipped, not reject the whole batch";
+    ASSERT_EQ(notified_keys.size(), 1u);
+    EXPECT_EQ(notified_keys[0], keyB)
+        << "Only the newly committed key should be handed to the handler";
 
-    // Entire batch should be rejected
-    ASSERT_FALSE(result2.has_value());
-    EXPECT_EQ(result2.error(), ErrorCode::OBJECT_ALREADY_EXISTS);
-
-    // Verify "keyB" was NOT written (batch is atomic)
+    // Verify "keyB" was committed and reads back its own value
     auto is_exist_B = storage_backend.IsExist(keyB);
     ASSERT_TRUE(is_exist_B.has_value());
-    EXPECT_FALSE(is_exist_B.value())
-        << "keyB should not exist - batch should be atomic";
+    EXPECT_TRUE(is_exist_B.value()) << "keyB should be committed";
+
+    auto read_buf_B = std::make_unique<char[]>(valueB.size());
+    std::unordered_map<std::string, Slice> load_B;
+    load_B.emplace(keyB, Slice{read_buf_B.get(), valueB.size()});
+    ASSERT_TRUE(storage_backend.BatchLoad(load_B).has_value());
+    EXPECT_EQ(std::string(read_buf_B.get(), valueB.size()), valueB);
 
     // Verify "keyA" still has original value
     auto read_buf = std::make_unique<char[]>(valueA.size());
@@ -3286,7 +3301,7 @@ TEST_F(StorageBackendTest,
                     .has_value());
 }
 
-TEST_F(StorageBackendTest, BucketPendingWriteRejectsReentrantDuplicate) {
+TEST_F(StorageBackendTest, BucketPendingWriteSkipsReentrantDuplicate) {
     FileStorageConfig config;
     config.storage_filepath = data_path;
 
@@ -3323,10 +3338,12 @@ TEST_F(StorageBackendTest, BucketPendingWriteRejectsReentrantDuplicate) {
             return ErrorCode::OK;
         });
 
+    // By the time the outer handler runs, shared_key is already committed,
+    // so the nested re-offload is an idempotent no-op, not an error.
     ASSERT_TRUE(outer_result.has_value());
     ASSERT_TRUE(nested_result.has_value());
-    ASSERT_FALSE(nested_result->has_value());
-    EXPECT_EQ(nested_result->error(), ErrorCode::OBJECT_ALREADY_EXISTS);
+    ASSERT_TRUE(nested_result->has_value())
+        << "Reentrant re-offload of a committed key should be skipped";
 
     std::vector<char> load_buffer(outer_value.size());
     std::unordered_map<std::string, Slice> load_batch;
