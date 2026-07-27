@@ -554,6 +554,37 @@ def test_structured_object_multi_buffer_put_preserves_group_id() -> None:
     assert all(group_ids == ["rollout-group"] for group_ids in batch_group_ids)
 
 
+def test_bundle_manifest_update_allows_meta_only_cleanup_keys() -> None:
+    store, transfer = make_transfer()
+    old_ref = transfer.put_structured_object(structured_payload({"kind": "old"}))
+    cleanup_keys = [
+        old_ref.manifest_key,
+        *transfer._bundle_store.payload_keys(old_ref.manifest["meta"]),
+    ]
+
+    merged_ref = transfer._bundle_store.put_bundle_manifest(
+        json.dumps({"kind": "merged"}, separators=(",", ":")).encode("utf-8"),
+        {},
+        partition="default",
+        chunk_bytes=None,
+        policy=None,
+        cleanup_keys=cleanup_keys,
+    )
+    result = transfer.materialize(transfer.read_spec(merged_ref))
+    manifest = sos._decode_manifest(store.objects[merged_ref.manifest_key])
+
+    assert result.metadata == {"kind": "merged"}
+    assert result.objects == {}
+    assert set(cleanup_keys).issubset(set(manifest["cleanup_keys"]))
+    assert old_ref.manifest["object_id"] in manifest["buffer_object_ids"]
+
+    transfer.remove_bundle(merged_ref)
+
+    assert old_ref.manifest_key not in store.objects
+    assert merged_ref.manifest_key not in store.objects
+    assert all(key not in store.objects for key in cleanup_keys)
+
+
 def test_dataproto_append_updates_manifest_with_grouped_config() -> None:
     store, transfer = make_transfer()
     config = GroupConfig(["rollout-group"])
