@@ -130,14 +130,15 @@ static PyObject *concat_arrays_into(PyObject *self, PyObject *args) {
         actual_threads++;
     }
 
-    Py_BEGIN_ALLOW_THREADS
+    Py_BEGIN_ALLOW_THREADS;
     if (actual_threads == 1) {
         copy_thread_func(&works[0]);
     } else {
         for (int t = 1; t < actual_threads; t++) {
             if (pthread_create(&threads[t], NULL, copy_thread_func,
                                &works[t]) != 0) {
-                /* Copy inline if worker creation fails after other workers start. */
+                /* Copy inline if worker creation fails after other workers
+                 * start. */
                 copy_thread_func(&works[t]);
             } else {
                 thread_started[t] = 1;
@@ -150,7 +151,7 @@ static PyObject *concat_arrays_into(PyObject *self, PyObject *args) {
             }
         }
     }
-    Py_END_ALLOW_THREADS
+    Py_END_ALLOW_THREADS;
 
     size_t total = 0;
     for (int t = 0; t < actual_threads; t++) total += works[t].bytes_copied;

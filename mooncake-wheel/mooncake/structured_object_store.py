@@ -3824,13 +3824,11 @@ class _BundleManifestStore:
             key if num_chunks == 1 else f"{key}/chunk/{idx}"
             for idx in range(num_chunks)
         ]
-        def _put_chunk_batch(keys, batches, nthreads=1):
+        def _put_chunk_batch(keys, batches):
             for ck, (start, count, size) in zip(keys, batches):
                 lease = pool.acquire(size)
                 try:
-                    copied = _concat_arrays_into(
-                        arrays, lease.ptr, size, start, count, nthreads
-                    )
+                    copied = _concat_arrays_into(arrays, lease.ptr, size, start, count)
                     if copied != size:
                         raise RuntimeError(
                             f"native fast-copy wrote {copied} bytes, expected {size}"
