@@ -2355,6 +2355,81 @@ TEST_F(StorageBackendTest, BucketStorageBackend_DuplicateBatchPartialSkip) {
 }
 
 //-----------------------------------------------------------------------------
+
+TEST_F(StorageBackendTest,
+       BucketEvictionDoesNotReportSkippedDuplicateKeys) {
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = 10;
+    bucket_config.bucket_size_limit = 8 * 1024;
+    bucket_config.max_total_size = 30 * 1024;
+    bucket_config.eviction_policy = BucketEvictionPolicy::LRU;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    // keyA is committed to the older bucket first.
+    std::string keyA = "keyA";
+    auto bufA = std::make_unique<char[]>(6 * 1024);
+    std::memset(bufA.get(), 'A', 6 * 1024);
+    std::unordered_map<std::string, std::vector<Slice>> batch1;
+    batch1.emplace(keyA, std::vector<Slice>{Slice{bufA.get(), 6 * 1024}});
+    auto result1 = storage_backend.BatchOffload(
+        batch1, [](const std::vector<std::string>&,
+                   std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_TRUE(result1.has_value());
+
+    // Re-offload keyA (skipped as a duplicate) together with keyB. The new
+    // bucket's keys list physically carries keyA, but keyA's index entry
+    // still points at the older bucket.
+    std::string keyB = "keyB";
+    auto bufB = std::make_unique<char[]>(6 * 1024);
+    std::memset(bufB.get(), 'B', 6 * 1024);
+    std::unordered_map<std::string, std::vector<Slice>> batch2;
+    batch2.emplace(keyA, std::vector<Slice>{Slice{bufA.get(), 6 * 1024}});
+    batch2.emplace(keyB, std::vector<Slice>{Slice{bufB.get(), 6 * 1024}});
+    auto result2 = storage_backend.BatchOffload(
+        batch2, [](const std::vector<std::string>&,
+                   std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_TRUE(result2.has_value());
+
+    // Read keyA so the older bucket is LRU-hotter than the new one.
+    auto read_buf = std::make_unique<char[]>(6 * 1024);
+    std::unordered_map<std::string, Slice> load;
+    load.emplace(keyA, Slice{read_buf.get(), 6 * 1024});
+    ASSERT_TRUE(storage_backend.BatchLoad(load).has_value());
+
+
+    // The new (now colder) bucket is evicted. keyA must NOT be reported to
+    // the master: its index entry points at the still-alive older bucket,
+    // and reporting it would drop a live replica record with no self-heal.
+    std::vector<std::string> notified_keys;
+    auto evict_result = storage_backend.EvictAboveDiskWatermark(
+        /*high_watermark_ratio=*/0.50, /*low_watermark_ratio=*/0.50,
+        [&](const std::vector<std::string>& evicted_keys) {
+            notified_keys.insert(notified_keys.end(), evicted_keys.begin(),
+                                 evicted_keys.end());
+            return tl::expected<void, ErrorCode>{};
+        });
+    ASSERT_TRUE(evict_result.has_value());
+    ASSERT_FALSE(evict_result.value().empty());
+    for (const auto& key : notified_keys) {
+        EXPECT_NE(key, keyA)
+            << "a key skipped as duplicate must not be reported as evicted";
+    }
+    EXPECT_NE(std::find(notified_keys.begin(), notified_keys.end(), keyB),
+              notified_keys.end());
+
+    // keyA still resolves from the older bucket; keyB is gone.
+    auto existA = storage_backend.IsExist(keyA);
+    ASSERT_TRUE(existA.has_value());
+    EXPECT_TRUE(existA.value());
+    auto existB = storage_backend.IsExist(keyB);
+    ASSERT_TRUE(existB.has_value());
+    EXPECT_FALSE(existB.value());
+}
+
+//-----------------------------------------------------------------------------
 // BucketReadGuard RAII Behavior Tests (Phase 1 - D2)
 //-----------------------------------------------------------------------------
 
@@ -3341,7 +3416,7 @@ TEST_F(StorageBackendTest, BucketWatermarkEvictionUsesHandlerAndKeepsNewest) {
 
     std::vector<std::string> notified_keys;
     auto evict_result = storage_backend.EvictAboveDiskWatermark(
-        /*high_watermark_ratio=*/0.50, /*low_watermark_ratio=*/0.25,
+        /*high_watermark_ratio=*/0.50, /*low_watermark_ratio=*/0.50,
         [&](const std::vector<std::string>& evicted_keys) {
             notified_keys.insert(notified_keys.end(), evicted_keys.begin(),
                                  evicted_keys.end());

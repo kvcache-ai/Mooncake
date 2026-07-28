@@ -3005,7 +3005,7 @@ BucketStorageBackend::PrepareEviction(
             // Watermark eviction passes a synthetic required_size to drive
             // quota-based cleanup. It is not a real incoming write, so it
             // should not be counted as physical disk free-space demand.
-            uint64_t req_sz = (!write_keys.empty() && required_size > 0)
+            uint64_t req_sz = (!result.write_keys.empty() && required_size > 0)
                                   ? static_cast<uint64_t>(required_size)
                                   : 0;
             initial_disk_full = actual_available < req_sz + kMinFreeSpace;
@@ -3088,7 +3088,10 @@ BucketStorageBackend::PrepareEviction(
         buckets_.erase(evict_it);
 
         int64_t evicted_size = evict_meta->meta_size;
-        // Remove all keys belonging to this bucket from the object map.
+        // Remove all keys belonging to this bucket from the object map, and
+        // report ONLY those to the master: a key skipped as a duplicate at
+        // commit time keeps pointing at its authoritative bucket, so
+        // reporting it here would make the master drop a live replica.
         for (const auto& key : evict_meta->keys) {
             auto obj_it = object_bucket_map_.find(key);
             if (obj_it != object_bucket_map_.end() &&
@@ -3098,16 +3101,13 @@ BucketStorageBackend::PrepareEviction(
                 total_size_ -= object_size;
                 evicted_size += object_size;
                 object_bucket_map_.erase(obj_it);
+                pending_eviction_keys_.insert(key);
+                result.keys.push_back(key);
             }
         }
         total_size_ -= evict_meta->meta_size;
         result.evicted_size += evicted_size;
 
-        // Collect for notification and file deletion.
-        for (const auto& key : evict_meta->keys) {
-            pending_eviction_keys_.insert(key);
-            result.keys.push_back(key);
-        }
         accumulated_freed_space +=
             static_cast<uint64_t>(evict_meta->data_size) +
             static_cast<uint64_t>(evict_meta->meta_size);
@@ -3124,7 +3124,7 @@ BucketStorageBackend::PrepareEviction(
     // rather than overrun the disk quota and get OOM-evicted.
     const bool phys_exceeded = phys_over_cap(accumulated_freed_space);
     pending_eviction_size_ += result.evicted_size;
-    if (!write_keys.empty() && (quota_exceeded || phys_exceeded)) {
+    if (!result.write_keys.empty() && (quota_exceeded || phys_exceeded)) {
         RestorePreparedEvictionLocked(std::move(result));
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
