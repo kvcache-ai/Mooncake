@@ -527,7 +527,7 @@ glog's standard flags (`--log_dir`, `--max_log_size`, `--logtostderr`, ...) cont
 
 ### KV Cache Event Publisher
 
-The master can publish RFC #1527 KV cache events over a ZMQ PUB socket for
+The master can publish KV cache lifecycle events over a ZMQ PUB socket for
 cache-aware indexers such as Mooncake Conductor. This feature is compiled out
 by default. Install `libzmq3-dev` and configure Mooncake Store with
 `-DENABLE_KV_EVENTS=ON` before enabling it at runtime.
@@ -550,7 +550,7 @@ master publisher <mooncake-store-master-publisher>` reference.
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--enable_kv_events` | `false` | Enable the RFC #1527 ZMQ publisher; requires a build with `ENABLE_KV_EVENTS=ON` |
+| `--enable_kv_events` | `false` | Enable the ZMQ KV cache event publisher; requires a build with `ENABLE_KV_EVENTS=ON` |
 | `--kv_events_bind_endpoint` | empty | ZMQ PUB bind endpoint, for example `tcp://0.0.0.0:5557`; required when enabled |
 | `--kv_events_backend_id` | empty | Cache-owner identity emitted as `backend_id`; required when enabled |
 | `--kv_events_emit_legacy_compat` | `true` | Include vLLM/SGLang-compatible aliases such as `type` and `block_hashes` |
