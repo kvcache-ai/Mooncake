@@ -95,37 +95,6 @@ Initializes the transfer engine with extended configuration including metadata t
 **Returns:**
 - `int`: 0 on success, negative value on failure
 
-#### RpcInterface.initialize()
-
-```python
-RpcInterface.initialize(
-    listen_address="",
-    thread_count=0,
-    timeout_seconds=30,
-    pool_size=100,
-)
-```
-
-Initializes the RPC communicator. `pool_size` is the maximum number of reusable
-RPC client connections cached for each target endpoint; it is not a limit on
-total concurrent connections. When `listen_address` is set, `thread_count`
-configures the RPC server I/O contexts.
-
-#### RpcInterface.initialize_client()
-
-```python
-RpcInterface.initialize_client(pool_size=100, timeout_seconds=30)
-```
-
-Initializes a client-only RPC communicator. `pool_size` has the same per-target
-connection cache semantics as `RpcInterface.initialize()`.
-
-Neither `pool_size` nor `thread_count` controls RPC client I/O threads. Set
-`MC_TE_RPC_CLIENT_IO_THREADS` to configure the Transfer Engine client I/O pool;
-if that value is unset, `0`, or invalid, it falls back to
-`MC_RPC_CLIENT_IO_THREADS`. Set these environment variables before starting the
-process; changes require a restart.
-
 ### Engine Information
 
 #### get_engine()
