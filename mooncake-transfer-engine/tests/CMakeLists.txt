@@ -50,6 +50,12 @@ target_link_libraries(rdma_loopback_test PUBLIC transfer_engine gtest
                                                 gtest_main)
 # add_test(NAME rdma_loopback_test COMMAND rdma_loopback_test)
 
+# Regression test for #2017 (registerLocalMemory must auto-chunk buffers larger
+# than the device max_mr_size; loopback WRITE past the boundary must succeed).
+add_executable(rdma_large_mr_test ${WORKSPACE}/rdma_large_mr_test.cpp)
+target_link_libraries(rdma_large_mr_test PUBLIC transfer_engine gtest gtest_main )
+# add_test(NAME rdma_large_mr_test COMMAND rdma_large_mr_test)  # needs an RDMA dev + metadata server
+
 # This test verifies endpoint re-establishment in RDMATransport.
 add_executable(rdma_endpoint_reestablish_test
                ${WORKSPACE}/rdma_endpoint_reestablish_test.cpp)
@@ -101,6 +107,15 @@ add_executable(tcp_address_validation_test
 target_link_libraries(tcp_address_validation_test PUBLIC gtest gtest_main)
 add_test(NAME tcp_address_validation_test COMMAND tcp_address_validation_test)
 
+# Hardware-free unit test for the active-connect circuit-breaker state
+# (ConnectPauseTracker is header-only and clock-injectable), runs on every CI
+# runner.
+add_executable(connect_pause_tracker_test
+               ${WORKSPACE}/connect_pause_tracker_test.cpp)
+target_link_libraries(connect_pause_tracker_test PUBLIC gtest gtest_main
+                                                        pthread)
+add_test(NAME connect_pause_tracker_test COMMAND connect_pause_tracker_test)
+
 # Hardware-free unit tests for DmabufExport struct and
 # RdmaContext::{exportDmabuf, closeDmabufExport}. Runs on every CI runner —
 # no RDMA device or GPU required (host-memory paths only).
@@ -108,10 +123,11 @@ add_executable(dmabuf_export_test ${WORKSPACE}/dmabuf_export_test.cpp)
 target_link_libraries(dmabuf_export_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME dmabuf_export_test COMMAND dmabuf_export_test)
 
-if (USE_MNNVL)
-    add_executable(nvlink_transport_test ${WORKSPACE}/nvlink_transport_test.cpp)
-    target_link_libraries(nvlink_transport_test PUBLIC transfer_engine gtest gtest_main )
-    add_test(NAME nvlink_transport_test COMMAND nvlink_transport_test)
+if(USE_MNNVL)
+  add_executable(nvlink_transport_test ${WORKSPACE}/nvlink_transport_test.cpp)
+  target_link_libraries(nvlink_transport_test PUBLIC transfer_engine gtest
+                                                     gtest_main)
+  add_test(NAME nvlink_transport_test COMMAND nvlink_transport_test)
 endif()
 
 if(USE_HIP)
@@ -282,6 +298,13 @@ add_executable(rdma_context_reprobe_test
 target_link_libraries(rdma_context_reprobe_test PUBLIC transfer_engine gtest
                                                        gtest_main)
 add_test(NAME rdma_context_reprobe_test COMMAND rdma_context_reprobe_test)
+
+add_executable(rdma_transport_submit_task_test
+               ${WORKSPACE}/rdma_transport_submit_task_test.cpp)
+target_link_libraries(rdma_transport_submit_task_test PUBLIC transfer_engine
+                                                             gtest gtest_main)
+add_test(NAME rdma_transport_submit_task_test
+         COMMAND rdma_transport_submit_task_test)
 
 add_executable(topology_test ${WORKSPACE}/topology_test.cpp)
 target_link_libraries(topology_test PUBLIC transfer_engine gtest gtest_main)
