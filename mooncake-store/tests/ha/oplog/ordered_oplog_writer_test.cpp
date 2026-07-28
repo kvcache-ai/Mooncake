@@ -20,9 +20,13 @@ namespace {
 
 class FakeBatchWriter {
    public:
+    using Clock = std::chrono::steady_clock;
+
     ErrorCode Write(const OpLogBatchRecord& batch,
                     const DurablePrefix& expected_prefix) {
         std::unique_lock<std::mutex> lock(mutex_);
+        attempt_times_.push_back(Clock::now());
+        attempt_cv_.notify_all();
         while (blocked_) {
             blocked_write_active_ = true;
             blocked_cv_.notify_all();
@@ -58,6 +62,18 @@ class FakeBatchWriter {
         std::unique_lock<std::mutex> lock(mutex_);
         return cv_.wait_for(lock, timeout,
                             [&] { return writes_.size() >= count; });
+    }
+
+    bool WaitForAttempts(size_t count, std::chrono::milliseconds timeout =
+                                           std::chrono::milliseconds(5000)) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return attempt_cv_.wait_for(
+            lock, timeout, [&] { return attempt_times_.size() >= count; });
+    }
+
+    std::vector<Clock::time_point> AttemptTimes() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return attempt_times_;
     }
 
     void FailNextWrite(ErrorCode err) {
@@ -100,8 +116,10 @@ class FakeBatchWriter {
 
     mutable std::mutex mutex_;
     std::condition_variable cv_;
+    std::condition_variable attempt_cv_;
     std::condition_variable blocked_cv_;
     std::vector<WriteRecord> writes_;
+    std::vector<Clock::time_point> attempt_times_;
     ErrorCode next_error_{ErrorCode::OK};
     ErrorCode repeated_error_{ErrorCode::OK};
     size_t failures_remaining_{0};
