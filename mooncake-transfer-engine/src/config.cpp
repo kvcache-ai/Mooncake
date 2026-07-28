@@ -97,9 +97,15 @@ void loadGlobalConfig(GlobalConfig& config) {
 
     const char* max_ep_per_ctx_env = std::getenv("MC_MAX_EP_PER_CTX");
     if (max_ep_per_ctx_env) {
-        size_t val = atoi(max_ep_per_ctx_env);
-        if (val > 0 && val <= UINT16_MAX)
-            config.max_ep_per_ctx = val;
+        // Ceiling is INT32_MAX, not UINT16_MAX: the field is an int whose
+        // default is already 65536, so a UINT16_MAX bound made the default
+        // value impossible to set explicitly.  The real RDMA constraint is
+        // enforced later against device_attr.max_qp; on EFA (SRD) this only
+        // sizes the AV table and the peer_map_ eviction cap, neither of which
+        // is 16-bit.
+        long long val = atoll(max_ep_per_ctx_env);
+        if (val > 0 && val <= INT32_MAX)
+            config.max_ep_per_ctx = static_cast<int>(val);
         else
             LOG(WARNING)
                 << "Ignore value from environment variable MC_MAX_EP_PER_CTX";

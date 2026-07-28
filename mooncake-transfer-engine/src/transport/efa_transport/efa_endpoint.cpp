@@ -165,6 +165,30 @@ void EfaEndPoint::disconnect() {
     disconnectUnlocked();
 }
 
+bool EfaEndPoint::hasOutstandingSlice() const {
+    RWSpinlock::ReadGuard guard(lock_);
+    return context_.slotHasInflight(peer_fi_addr_);
+}
+
+bool EfaEndPoint::disconnectIfIdle() {
+    // tryLock, never a blocking WriteGuard: this runs on the CQ-polling
+    // thread, and submitPostSend() holds the read lock while it spins waiting
+    // for CQ credit that only this poller can release.  Blocking for the
+    // write lock here deadlocks that pair outright (observed: submitter
+    // spinning in submitSlicesOnPeer under the read lock, poller queued for
+    // the write lock, neither able to advance).  Failing to acquire is
+    // reported as "still busy" so the caller retries on a later drain.
+    if (!lock_.tryLock()) return false;
+    // Holding the write lock means no submitter can be inside submitPostSend
+    // for THIS handle, so it is safe to release the AV slot.  Whether the slot
+    // itself may be retired is a separate question the context answers: the
+    // slot can still carry another endpoint's in-flight operations, and
+    // removePeerAddr() defers the fi_av_remove in that case.
+    disconnectUnlocked();
+    lock_.unlock();
+    return true;
+}
+
 void EfaEndPoint::disconnectUnlocked() {
     if (peer_fi_addr_ != FI_ADDR_UNSPEC) {
         context_.removePeerAddr(peer_fi_addr_);

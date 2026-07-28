@@ -17,6 +17,7 @@
 #include <fcntl.h>
 #include <sys/epoll.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -34,6 +35,45 @@
 #include "transport/transport.h"
 
 namespace mooncake {
+
+namespace {
+
+// A single unreachable peer can fail every slice of every batch aimed at it.
+// One production incident logged 147351 lines (56629 of them for a single
+// peer) in 35 minutes, which buried every other message in the log.  Sample
+// instead: the AV-teardown WARNING below is emitted once per affected peer and
+// carries the actionable information.
+constexpr int kCqErrorLogEveryN = 256;
+
+// Same reasoning for peer_map_ eviction: a saturated map on a 16-NIC host logs
+// 16 x 16 = 256 evictions for every single new peer.
+constexpr int kEvictLogEveryN = 256;
+
+// EFA provider errno values that mean "the address handle backing this peer is
+// gone" -- i.e. retrying on the same fi_addr_t can never succeed, but a fresh
+// handshake + fi_av_insert can.  These are provider-specific values from
+// libfabric's efa_io_comp_status (verified against libfabric 2.4.0amzn1.0 by
+// calling fi_cq_strerror() over the range); the EFA provider does not export
+// them in a public header, so they are reproduced here with the exact strings
+// fi_cq_strerror() returns for them.
+//
+// Deliberately NOT included: 5/7 (local/remote MR invalid), 13/15
+// (unresponsive/unreachable remote).  Those are either not AV-related or are
+// transient reachability problems where dropping the handle would just add
+// handshake churn on top of a network issue.
+inline bool isStalePeerCqError(int prov_errno) {
+    switch (prov_errno) {
+        case 4:   // "Invalid address handle (local)"
+        case 8:   // "Connection was reset by remote peer"
+        case 9:   // "Bad queue pair (QP) number (QP does not exist ...)"
+        case 14:  // "No valid address handle at remote side ..."
+            return true;
+        default:
+            return false;
+    }
+}
+
+}  // namespace
 
 // EfaContext implementation
 
@@ -181,7 +221,18 @@ int EfaContext::construct(size_t num_cq_list, size_t max_cqe,
     // cost), so we over-provision.
     struct fi_av_attr av_attr = {};
     av_attr.type = FI_AV_TABLE;
-    av_attr.count = max_endpoints;
+    // Size the AV with headroom over the peer_map_ cap rather than exactly at
+    // it.  peer_map_ may transiently exceed peer_map_max_ when every eviction
+    // candidate still has transfers in flight (see endpoint()), and an AV
+    // sized to the cap then overflows: fi_av_insert hands back an index past
+    // the table, and the next fi_write on it faults inside the provider
+    // (observed as a SIGSEGV in libfabric with dest_addr one past the end when
+    // MC_MAX_EP_PER_CTX=1).  AV entries cost a few bytes and no QP resources,
+    // so headroom is far cheaper than the crash it prevents.
+    const size_t kAvHeadroom = 64;
+    av_attr.count = max_endpoints > 0
+                        ? static_cast<size_t>(max_endpoints) + kAvHeadroom
+                        : kAvHeadroom;
 
     // peer_map_ is bounded to the same capacity as the AV: once that many
     // peers have been inserted, FIFO eviction kicks in (oldest entry
@@ -605,6 +656,9 @@ std::shared_ptr<EfaEndPoint> EfaContext::endpoint(
     std::shared_ptr<EfaEndPoint> evicted_ep;
     std::string evicted_path;
     size_t post_evict_size = 0;
+    // Set when the map is at capacity but every candidate victim still has
+    // operations in flight, so the map grows past peer_map_max_ instead.
+    bool over_capacity = false;
     {
         RWSpinlock::WriteGuard guard(peer_map_lock_);
         auto it = peer_map_.find(key);
@@ -618,13 +672,29 @@ std::shared_ptr<EfaEndPoint> EfaContext::endpoint(
         // construct()).
         if (peer_map_max_ > 0 && peer_map_.size() >= peer_map_max_ &&
             !peer_lru_.empty()) {
-            evicted_path = peer_lru_.front();
-            auto evict_it = peer_map_.find(evicted_path);
-            if (evict_it != peer_map_.end()) {
+            // Walk the LRU oldest-first for a victim with nothing in flight.
+            // fi_av_remove() on a slot that still has posted operations makes
+            // the EFA provider drop their completions entirely: the slices
+            // stay PENDING, wr_depth_ / cq outstanding never drain, and the
+            // caller's getTransferStatus() loop spins on WAITING forever.
+            // Skipping busy peers means the map can transiently exceed
+            // peer_map_max_ (see over_capacity below) -- correct, because an
+            // AV entry on EFA/SRD costs a few bytes and there is no hard QP
+            // limit, whereas a stranded transfer costs the whole request.
+            for (auto lru_it = peer_lru_.begin(); lru_it != peer_lru_.end();
+                 ++lru_it) {
+                auto evict_it = peer_map_.find(*lru_it);
+                if (evict_it == peer_map_.end()) continue;
+                if (evict_it->second.ep &&
+                    evict_it->second.ep->hasOutstandingSlice())
+                    continue;
+                evicted_path = *lru_it;
                 evicted_ep = evict_it->second.ep;
                 peer_map_.erase(evict_it);
+                peer_lru_.erase(lru_it);
+                break;
             }
-            peer_lru_.pop_front();
+            if (!evicted_ep) over_capacity = true;
         }
 
         peer_lru_.push_back(key);
@@ -634,11 +704,47 @@ std::shared_ptr<EfaEndPoint> EfaContext::endpoint(
     }
 
     if (evicted_ep) {
-        LOG(INFO) << "Evicting oldest EFA peer on " << nicPath()
-                  << " to make room: " << evicted_path << " -> "
-                  << peer_nic_path << " (peer_count=" << post_evict_size
-                  << ", peer_map_max=" << peer_map_max_ << ")";
-        evicted_ep->disconnect();  // fi_av_remove(old_fi_addr)
+        // WARNING, not INFO: reaching the cap means peer_map_ is saturated and
+        // every new peer now costs an eviction.  Rate-limited because a
+        // saturated map evicts once per (local NIC x remote NIC) pair per new
+        // peer -- 16x16 = 256 lines per peer on a 16-NIC host.
+        LOG_EVERY_N(WARNING, kEvictLogEveryN)
+            << "EFA peer_map_ is at capacity on " << nicPath()
+            << "; evicting oldest peer to make room: " << evicted_path << " -> "
+            << peer_nic_path << " (peer_count=" << post_evict_size
+            << ", peer_map_max=" << peer_map_max_
+            << ").  Raise MC_MAX_EP_PER_CTX or leave it unset if peers are"
+            << " still active; on EFA (SRD) an AV entry is a few bytes and"
+            << " there is no hard QP limit to protect."
+            << " [logged 1 of every " << kEvictLogEveryN << "]";
+        // disconnectIfIdle(), not disconnect(): it takes the victim's own write
+        // lock, so no submitter can be mid-post on that handle when the AV slot
+        // is released.  If the lock is contended it declines, and we put the
+        // entry back rather than tear down a handle in active use -- the map
+        // runs one over capacity until the next insert, which is far cheaper
+        // than a stranded transfer.  Any operations still outstanding against
+        // the underlying AV slot (possibly another endpoint's) keep it alive:
+        // removePeerAddr defers the fi_av_remove until they complete.
+        if (!evicted_ep->disconnectIfIdle()) {
+            RWSpinlock::WriteGuard guard(peer_map_lock_);
+            if (peer_map_.find(evicted_path) == peer_map_.end()) {
+                peer_lru_.push_back(evicted_path);
+                peer_map_[evicted_path] =
+                    PeerMapEntry{evicted_ep, std::prev(peer_lru_.end())};
+                over_capacity = true;
+            }
+        }
+    }
+    if (over_capacity) {
+        LOG_EVERY_N(WARNING, kEvictLogEveryN)
+            << "EFA peer_map_ is over capacity on " << nicPath()
+            << " and every eviction candidate still has transfers in flight;"
+            << " admitting " << peer_nic_path
+            << " anyway (peer_count=" << post_evict_size
+            << ", peer_map_max=" << peer_map_max_
+            << ").  MC_MAX_EP_PER_CTX is set too low for the number of"
+            << " concurrently active peers; raise it or leave it unset."
+            << " [logged 1 of every " << kEvictLogEveryN << "]";
     }
     return new_ep;
 }
@@ -663,6 +769,31 @@ int EfaContext::deleteEndpoint(const std::string& peer_nic_path) {
     }
     if (ep) ep->disconnect();  // runs fi_av_remove
     return 0;
+}
+
+bool EfaContext::deleteEndpointIfIdle(const std::string& peer_nic_path) {
+    // Two-phase so the fi_av_remove() happens outside peer_map_lock_ (it takes
+    // the endpoint's own lock), and so a busy peer keeps its map entry: we must
+    // not erase first and discover afterwards that we cannot retire it.
+    std::shared_ptr<EfaEndPoint> ep;
+    {
+        RWSpinlock::ReadGuard guard(peer_map_lock_);
+        auto it = peer_map_.find(peer_nic_path);
+        if (it == peer_map_.end()) return true;  // already gone
+        ep = it->second.ep;
+    }
+    if (ep && !ep->disconnectIfIdle()) return false;
+    {
+        RWSpinlock::WriteGuard guard(peer_map_lock_);
+        auto it = peer_map_.find(peer_nic_path);
+        // Only erase the entry we actually retired; a concurrent
+        // endpoint() call may have replaced it with a fresh handle.
+        if (it != peer_map_.end() && it->second.ep == ep) {
+            peer_lru_.erase(it->second.lru_it);
+            peer_map_.erase(it);
+        }
+    }
+    return true;
 }
 
 int EfaContext::disconnectAllEndpoints() {
@@ -809,16 +940,117 @@ int EfaContext::insertPeerAddrBytes(const uint8_t* addr, size_t len,
                    << (len > kPrefixBytes ? "..." : "");
         return ERR_ENDPOINT;
     }
+    // Claim a reference on the slot.  See av_slots_: the provider hands the
+    // same index back for the same peer address, so concurrent handles share
+    // it and only the last release may call fi_av_remove().
+    //
+    // A slot being re-inserted cancels any deferred removal: the address is
+    // live again, so retiring it would strand the new holder.
+    auto* slot = avSlot(out);
+    slot->refcount.fetch_add(1, std::memory_order_acq_rel);
+    slot->remove_pending.store(false, std::memory_order_release);
     return 0;
 }
 
-void EfaContext::removePeerAddr(fi_addr_t fi_addr) {
-    if (fi_addr == FI_ADDR_UNSPEC) return;
+EfaContext::AvSlotState* EfaContext::avSlot(fi_addr_t fi_addr) {
+    {
+        RWSpinlock::ReadGuard guard(av_ref_lock_);
+        auto it = av_slots_.find(fi_addr);
+        if (it != av_slots_.end()) return it->second.get();
+    }
+    RWSpinlock::WriteGuard guard(av_ref_lock_);
+    auto& entry = av_slots_[fi_addr];
+    if (!entry) entry = std::make_unique<AvSlotState>();
+    return entry.get();
+}
+
+EfaContext::AvSlotState* EfaContext::avSlotIfPresent(fi_addr_t fi_addr) {
+    RWSpinlock::ReadGuard guard(av_ref_lock_);
+    auto it = av_slots_.find(fi_addr);
+    if (it == av_slots_.end()) return nullptr;
+    return it->second.get();
+}
+
+bool EfaContext::slotHasInflight(fi_addr_t fi_addr) {
+    if (fi_addr == FI_ADDR_UNSPEC) return false;
+    auto* slot = avSlotIfPresent(fi_addr);
+    if (!slot) return false;
+    return slot->inflight.load(std::memory_order_acquire) > 0;
+}
+
+void EfaContext::retireSlotIfPending(AvSlotState* slot, fi_addr_t fi_addr) {
+    if (!slot || fi_addr == FI_ADDR_UNSPEC) return;
+    // Only the thread that both sees remove_pending and drains the last
+    // in-flight operation performs the removal, and the CAS makes sure exactly
+    // one of them does.  Re-check refcount too: a fresh handshake may have
+    // re-admitted this address, in which case insertPeerAddrBytes has already
+    // cleared remove_pending and the CAS below fails harmlessly.
+    if (!slot->remove_pending.load(std::memory_order_acquire)) return;
+    if (slot->inflight.load(std::memory_order_acquire) != 0) return;
+    if (slot->refcount.load(std::memory_order_acquire) != 0) return;
+    bool expected = true;
+    if (!slot->remove_pending.compare_exchange_strong(
+            expected, false, std::memory_order_acq_rel))
+        return;
+    removeSlotNow(fi_addr);
+}
+
+void EfaContext::removeSlotNow(fi_addr_t fi_addr) {
+    // Serialize the removal against the post burst on the same lock the
+    // submitters use.  Refcounting alone is not enough: fi_av_remove() frees
+    // the index for reuse, so a holder that has already latched peer_fi_addr_
+    // can call fi_write() on a number the provider has meanwhile handed to a
+    // different peer -- observed as SIGSEGV in libfabric with dest_addr=0.
+    // Taking post_lock_ means a removal can never land between a submitter's
+    // check and its fi_write, and any post already inside the burst finishes
+    // first.
+    while (post_lock_.test_and_set(std::memory_order_acquire)) {
+    }
     int ret = fi_av_remove(av_, &fi_addr, 1, 0);
+    post_lock_.clear(std::memory_order_release);
     if (ret) {
         LOG(WARNING) << "fi_av_remove failed on " << nicPath() << ": "
                      << fi_strerror(-ret) << " (fi_addr=" << fi_addr << ")";
     }
+}
+
+void EfaContext::removePeerAddr(fi_addr_t fi_addr) {
+    if (fi_addr == FI_ADDR_UNSPEC) return;
+
+    auto* slot = avSlotIfPresent(fi_addr);
+    if (!slot) {
+        // Not tracked: either already retired or inserted before this
+        // bookkeeping existed.  Removing again risks freeing a slot the
+        // provider has since handed to a different peer, so don't.
+        LOG(WARNING) << "EFA skipping fi_av_remove of untracked slot "
+                     << fi_addr << " on " << nicPath();
+        return;
+    }
+
+    // Drop our reference; only the last holder may retire the slot.  Removing
+    // it while another EfaEndPoint still posts against the same index faults
+    // inside the provider (see av_slots_).
+    if (slot->refcount.fetch_sub(1, std::memory_order_acq_rel) > 1) return;
+
+    // Last holder.  If operations are still posted against this slot, do NOT
+    // remove it now: the provider would drop their completions and the slices
+    // would sit in PENDING forever.  Mark it and let the CQ poller retire it
+    // once the last completion lands.
+    //
+    // Checking inflight here (a slot-wide count) rather than the endpoint's own
+    // counter is the whole point: one slot is shared by several endpoints, so
+    // an endpoint can be perfectly idle while the slot it is releasing still
+    // has a sibling's operations outstanding.
+    if (slot->inflight.load(std::memory_order_acquire) > 0) {
+        slot->remove_pending.store(true, std::memory_order_release);
+        // Re-check: the last completion may have landed between the load above
+        // and the store, in which case the poller has already walked away and
+        // nobody would ever retire the slot.
+        retireSlotIfPending(slot, fi_addr);
+        return;
+    }
+
+    removeSlotNow(fi_addr);
 }
 
 int EfaContext::submitPostSend(
@@ -884,8 +1116,18 @@ int EfaContext::submitPostSend(
         // Drop peer handle if it is no longer connected after submit,
         // freeing its AV entry for reuse.  Under the shared-endpoint model
         // this is cheap (no fid_ep to destroy).
+        //
+        // deleteEndpointIfIdle(), not deleteEndpoint(): this runs on a submit
+        // thread while OTHER submit threads may still have operations posted
+        // against the same AV slot (one slot is shared by every handle for the
+        // same peer address).  The unconditional variant fi_av_remove()s the
+        // slot regardless, and the provider then completes those live
+        // operations with prov_errno=1 "Flushed during queue pair destroy" --
+        // or faults inside fi_cq_read while doing so.  If the peer is still
+        // busy we simply leave the handle in place; the CQ poller's stale-peer
+        // path retires it once the slot quiesces.
         if (rc != 0 && !ep->connected()) {
-            deleteEndpoint(peer_nic_path);
+            deleteEndpointIfIdle(peer_nic_path);
         }
     }
 
@@ -895,6 +1137,10 @@ int EfaContext::submitPostSend(
 int EfaContext::submitSlicesOnPeer(
     fi_addr_t peer_fi_addr, std::vector<Transport::Slice*>& slice_list,
     std::vector<Transport::Slice*>& failed_slice_list) {
+    // In-flight accounting lives on the AV slot, not on the calling endpoint:
+    // several endpoints can share one slot, so only a slot-wide count can tell
+    // a teardown whether completions are still outstanding against it.
+    AvSlotState* slot = avSlot(peer_fi_addr);
     // Batched submission against the shared endpoint.  Mirrors the previous
     // per-endpoint submit path but uses context-level wr_depth / post_lock.
     //
@@ -917,12 +1163,46 @@ int EfaContext::submitSlicesOnPeer(
     // passes and are applied by rewinding the cursor.
     size_t cursor = 0;
     std::vector<Transport::Slice*> retry_slices;
+    // Escape hatch for a permanently un-postable batch.  Without one this loop
+    // spins forever when the provider keeps returning FI_EAGAIN and nothing
+    // ever completes -- e.g. the peer's AV slot was removed, so every fi_write
+    // against it is refused even though WR credit is free (observed as
+    // wr_depth=0 with unbroken FI_EAGAIN).
+    //
+    // Trigger on CONSECUTIVE waves that posted nothing, not on total waves and
+    // not on elapsed time.  Total waves fails healthy long-lived batches that
+    // retry while making progress, and a multi-second timer makes each stall a
+    // multi-second stall: the request layer can only re-handshake once these
+    // slices reach a terminal state, so failing fast is what lets the transfer
+    // recover (0.01 GB/s on a 10s timer vs ~10 GB/s failing promptly).
+    const int kMaxStalledWaves = 1024;
+    int stalled_waves = 0;
     while (cursor < slice_list.size() || !retry_slices.empty()) {
+        if (stalled_waves > kMaxStalledWaves) {
+            LOG(WARNING) << "EFA submitSlicesOnPeer: " << kMaxStalledWaves
+                         << " consecutive FI_EAGAIN waves posted nothing on "
+                         << nicPath() << "; failing "
+                         << (retry_slices.size() + slice_list.size() - cursor)
+                         << " slice(s) (wr_depth="
+                         << wr_depth_.load(std::memory_order_relaxed)
+                         << ", max=" << max_wr_depth_ << ")";
+            for (auto* slice : retry_slices) failed_slice_list.push_back(slice);
+            for (size_t i = cursor; i < slice_list.size(); ++i)
+                failed_slice_list.push_back(slice_list[i]);
+            slice_list.clear();
+            return 0;
+        }
         if (!retry_slices.empty()) {
-            // Splice retry slices back in at the current cursor so the next
-            // pass picks them up.  O(retry_slices.size()) per retry wave,
-            // which is bounded by valid_count of the last batch.
-            slice_list.insert(slice_list.begin() + cursor, retry_slices.begin(),
+            // Splice retry slices back in at the head of the un-consumed
+            // region so the next pass picks them up.  Drop the consumed prefix
+            // at the same time and rewind the cursor: re-inserting without
+            // trimming grew slice_list by one entry per retried slice per wave
+            // and was observed at 188 million entries in a hung process.
+            // Trimming keeps it bounded by the original batch size, at the same
+            // O(remaining) cost the insert already paid.
+            slice_list.erase(slice_list.begin(), slice_list.begin() + cursor);
+            cursor = 0;
+            slice_list.insert(slice_list.begin(), retry_slices.begin(),
                               retry_slices.end());
             retry_slices.clear();
             std::this_thread::yield();
@@ -1015,6 +1295,8 @@ int EfaContext::submitSlicesOnPeer(
             memset(op_ctx, 0, sizeof(EfaOpContext));
             op_ctx->slice = slice;
             op_ctx->wr_depth = &wr_depth_;
+            op_ctx->slot = slot;
+            op_ctx->slot_addr = peer_fi_addr;
             batch[valid_count++] = {slice, local_desc, op_ctx};
         }
 
@@ -1032,6 +1314,14 @@ int EfaContext::submitSlicesOnPeer(
             for (int i = 0; i < valid_count; i++) {
                 auto& entry = batch[i];
                 ssize_t ret;
+                // Count the operation BEFORE handing it to the provider: once
+                // fi_write returns, its completion may already have been reaped
+                // by the CQ poller on another thread.  Incrementing afterwards
+                // would let that poller decrement first (driving the count
+                // negative) and, worse, let a concurrent teardown see inflight
+                // == 0 and fi_av_remove a slot with a live operation on it.
+                // Rolled back below on every path that does not post.
+                slot->inflight.fetch_add(1, std::memory_order_acq_rel);
                 if (entry.slice->opcode == Transport::TransferRequest::READ) {
                     ret = fi_read(shared_ep_, (void*)entry.slice->source_addr,
                                   entry.slice->length, entry.local_desc,
@@ -1047,7 +1337,17 @@ int EfaContext::submitSlicesOnPeer(
                 }
                 if (ret == 0) {
                     entry.slice->status = Transport::Slice::PENDING;
+                    // Stamp the post time so MC_SLICE_TIMEOUT can fire.  EFA
+                    // used to leave ts at 0, which made
+                    // MultiTransport::checkSliceTimeout() skip the slice
+                    // unconditionally: any completion the provider dropped
+                    // (e.g. fi_av_remove of a slot with work in flight) hung
+                    // the caller's status loop forever with no escape.  RDMA
+                    // already stamps here (rdma_endpoint.cpp).
+                    entry.slice->ts = getCurrentTimeInNano();
                 } else if (ret == -FI_EAGAIN) {
+                    // Nothing was posted, so give the speculative count back.
+                    slot->inflight.fetch_sub(1, std::memory_order_acq_rel);
                     delete entry.op_ctx;
                     int not_posted = valid_count - i;
                     wr_depth_.fetch_sub(not_posted, std::memory_order_acq_rel);
@@ -1060,6 +1360,7 @@ int EfaContext::submitSlicesOnPeer(
                     }
                     break;
                 } else {
+                    slot->inflight.fetch_sub(1, std::memory_order_acq_rel);
                     LOG(ERROR)
                         << "fi_read/fi_write failed: " << fi_strerror(-ret)
                         << " (source=" << entry.slice->source_addr
@@ -1074,9 +1375,24 @@ int EfaContext::submitSlicesOnPeer(
                 }
             }
             post_lock_.clear(std::memory_order_release);
+            // The rollback paths above may have been the decrement that
+            // quiesced a slot whose last holder already released it.  Settle it
+            // here rather than leaking the AV entry until process exit.  Must
+            // be outside post_lock_: removeSlotNow() takes that same lock.
+            retireSlotIfPending(slot, peer_fi_addr);
         }
 
         cursor += batch_count;
+
+        // A wave made forward progress if any slice it claimed left the queue
+        // -- posted, MR-rejected, or hard-failed.  Only when every one bounced
+        // straight back onto retry_slices is submission genuinely stuck, so
+        // that is the only case that keeps the stall clock running.
+        if (batch_count > 0 &&
+            static_cast<int>(retry_slices.size()) >= batch_count)
+            ++stalled_waves;
+        else
+            stalled_waves = 0;
     }
 
     slice_list.clear();
@@ -1098,6 +1414,10 @@ int EfaContext::pollCq(int max_entries, int cq_index) {
 
     if (ret > 0) {
         std::unordered_map<std::atomic<int>*, int> wr_depth_set;
+        // Slots that just saw a completion; any whose deferred removal is now
+        // unblocked is retired after the loop (retireSlotIfPending takes
+        // post_lock_, so it must not run while we still hold CQ state).
+        std::vector<std::pair<AvSlotState*, fi_addr_t>> touched_slots;
         for (ssize_t i = 0; i < ret; i++) {
             EfaOpContext* op_ctx =
                 reinterpret_cast<EfaOpContext*>(entries[i].op_context);
@@ -1106,12 +1426,18 @@ int EfaContext::pollCq(int max_entries, int cq_index) {
                 if (op_ctx->wr_depth) {
                     wr_depth_set[op_ctx->wr_depth]++;
                 }
+                if (op_ctx->slot) {
+                    op_ctx->slot->inflight.fetch_sub(1,
+                                                     std::memory_order_acq_rel);
+                    touched_slots.emplace_back(op_ctx->slot, op_ctx->slot_addr);
+                }
                 delete op_ctx;
             }
         }
         for (auto& entry : wr_depth_set) {
             entry.first->fetch_sub(entry.second, std::memory_order_acq_rel);
         }
+        for (auto& s : touched_slots) retireSlotIfPending(s.first, s.second);
         cq_list_[cq_index]->outstanding.fetch_sub(static_cast<int>(ret),
                                                   std::memory_order_acq_rel);
         return static_cast<int>(ret);
@@ -1119,20 +1445,63 @@ int EfaContext::pollCq(int max_entries, int cq_index) {
         return 0;
     } else if (ret < 0) {
         int err_count = 0;
-        struct fi_cq_err_entry err_entry;
         std::unordered_map<std::atomic<int>*, int> wr_depth_set;
+        // Peers whose AV entry the provider says is gone; their handles are
+        // dropped after the drain loop so the next batch re-handshakes.
+        std::vector<std::string> stale_peers;
+        // See the success path: slots settled after the drain, not inside it.
+        std::vector<std::pair<AvSlotState*, fi_addr_t>> touched_slots;
 
-        while ((ret = fi_cq_readerr(cq, &err_entry, 0)) > 0) {
+        for (;;) {
+            // MUST be re-zeroed every iteration.  libfabric only copies
+            // provider error details into err_data when the caller supplies
+            // a buffer AND err_data_size; otherwise it hands back an internal
+            // pointer that is documented as valid only "until the next time
+            // the CQ is read".  Leaving the struct uninitialized made
+            // fi_cq_strerror() below format whatever stack garbage sat in
+            // err_data, producing unreadable log lines for every error after
+            // the first in a drain loop.
+            struct fi_cq_err_entry err_entry = {};
+            char err_data_buf[64] = {};
+            err_entry.err_data = err_data_buf;
+            err_entry.err_data_size = sizeof(err_data_buf);
+
+            ret = fi_cq_readerr(cq, &err_entry, 0);
+            if (ret <= 0) break;
+
             EfaOpContext* op_ctx =
                 reinterpret_cast<EfaOpContext*>(err_entry.op_context);
             if (op_ctx && op_ctx->slice) {
-                LOG(ERROR) << "EFA CQ error: "
-                           << fi_cq_strerror(cq, err_entry.prov_errno,
-                                             err_entry.err_data, nullptr, 0)
-                           << " for slice at " << op_ctx->slice->source_addr;
+                if (isStalePeerCqError(err_entry.prov_errno)) {
+                    // The AV slot backing this peer is no longer usable (peer
+                    // process restarted, or its address was removed on the
+                    // remote side).  Nothing in the async CQ path used to act
+                    // on this, so the endpoint stayed CONNECTED with a dead
+                    // fi_addr_t and every subsequent batch re-posted against
+                    // it -- an unbounded error loop that only ended when the
+                    // process was restarted.  Record the peer and tear the
+                    // handle down below.
+                    if (!op_ctx->slice->peer_nic_path.empty())
+                        stale_peers.push_back(op_ctx->slice->peer_nic_path);
+                }
+                LOG_EVERY_N(ERROR, kCqErrorLogEveryN)
+                    << "EFA CQ error on " << nicPath() << ": "
+                    << fi_cq_strerror(cq, err_entry.prov_errno,
+                                      err_entry.err_data, nullptr, 0)
+                    << " (prov_errno=" << err_entry.prov_errno << ", peer="
+                    << (op_ctx->slice->peer_nic_path.empty()
+                            ? "unknown"
+                            : op_ctx->slice->peer_nic_path)
+                    << ", slice at " << op_ctx->slice->source_addr
+                    << ") [logged 1 of every " << kCqErrorLogEveryN << "]";
                 op_ctx->slice->markFailed();
                 if (op_ctx->wr_depth) {
                     wr_depth_set[op_ctx->wr_depth]++;
+                }
+                if (op_ctx->slot) {
+                    op_ctx->slot->inflight.fetch_sub(1,
+                                                     std::memory_order_acq_rel);
+                    touched_slots.emplace_back(op_ctx->slot, op_ctx->slot_addr);
                 }
                 delete op_ctx;
             }
@@ -1142,9 +1511,36 @@ int EfaContext::pollCq(int max_entries, int cq_index) {
         for (auto& entry : wr_depth_set) {
             entry.first->fetch_sub(entry.second, std::memory_order_acq_rel);
         }
+        for (auto& s : touched_slots) retireSlotIfPending(s.first, s.second);
         if (err_count > 0) {
             cq_list_[cq_index]->outstanding.fetch_sub(
                 err_count, std::memory_order_acq_rel);
+        }
+
+        // Drop stale peer handles outside the drain loop: deleteEndpoint()
+        // takes peer_map_lock_ and calls fi_av_remove().  Duplicates within
+        // one drain are harmless -- deleteEndpoint() is a no-op once the
+        // entry is gone.
+        std::sort(stale_peers.begin(), stale_peers.end());
+        stale_peers.erase(std::unique(stale_peers.begin(), stale_peers.end()),
+                          stale_peers.end());
+        for (const auto& peer : stale_peers) {
+            // Same constraint as eviction: fi_av_remove() while operations are
+            // still posted against the slot loses their completions and hangs
+            // those slices.  Deferring is safe and converges -- every op aimed
+            // at a dead peer fails the same way, so a later drain sees the
+            // counter at zero and does the teardown then.
+            if (!deleteEndpointIfIdle(peer)) {
+                LOG_EVERY_N(WARNING, kCqErrorLogEveryN)
+                    << "EFA deferring peer-handle drop on " << nicPath()
+                    << " for " << peer << ": transfer(s) still in flight;"
+                    << " will retry when they complete [logged 1 of every "
+                    << kCqErrorLogEveryN << "]";
+                continue;
+            }
+            LOG(WARNING) << "EFA dropped peer handle on " << nicPath()
+                         << " after unrecoverable CQ error: " << peer
+                         << " (will re-handshake on next transfer)";
         }
         return err_count;
     }

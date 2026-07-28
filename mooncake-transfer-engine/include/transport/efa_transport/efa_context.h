@@ -71,6 +71,23 @@ struct EfaMemoryRegionMeta {
 //   * Scale-out is bounded only by AV capacity (65536) instead of 768/NIC.
 class EfaContext {
    public:
+    // Per-AV-slot bookkeeping.  Public because EfaOpContext holds a pointer to
+    // one so the CQ poller can settle the slot on completion; see av_slots_ for
+    // why both counters have to live on the slot rather than on the endpoint.
+    struct AvSlotState {
+        // Number of EfaEndPoint handles currently holding this slot.
+        std::atomic<int> refcount{0};
+        // Operations posted against this slot that have not yet produced a CQ
+        // entry.  fi_av_remove() while this is non-zero makes the provider drop
+        // those completions, stranding the slices in PENDING forever.
+        std::atomic<int> inflight{0};
+        // Set when the last holder released the slot while operations were
+        // still in flight.  The removal is deferred to the CQ poller, which
+        // retires the slot once inflight reaches zero -- so no completion is
+        // lost and the slot is not leaked either.
+        std::atomic<bool> remove_pending{false};
+    };
+
     EfaContext(EfaTransport& engine, const std::string& device_name);
 
     ~EfaContext();
@@ -111,6 +128,12 @@ class EfaContext {
     std::shared_ptr<EfaEndPoint> peekEndpoint(const std::string& peer_nic_path);
 
     int deleteEndpoint(const std::string& peer_nic_path);
+
+    // Like deleteEndpoint(), but refuses to fi_av_remove() a peer that still
+    // has operations posted against its AV slot (their completions would be
+    // lost, stranding the slices).  Returns false if the peer was left in
+    // place because it is busy; the caller should retry on a later CQ drain.
+    bool deleteEndpointIfIdle(const std::string& peer_nic_path);
     int disconnectAllEndpoints();
 
     // Number of live peer handles.  Historically named "QP number"; with the
@@ -129,9 +152,19 @@ class EfaContext {
     // shared endpoint.  Handles WR / CQ reservation, MR descriptor prep,
     // and the fi_write / fi_read burst under post_lock_.  Called by
     // EfaEndPoint::submitPostSend once the peer is connected.
+    //
+    // Operations posted here are counted against the AV slot itself (see
+    // AvSlotState::inflight), so any holder's teardown can tell whether the
+    // slot still has completions coming -- an endpoint-local counter cannot,
+    // because slot 1 may be shared by several endpoints.
     int submitSlicesOnPeer(fi_addr_t peer_fi_addr,
                            std::vector<Transport::Slice*>& slice_list,
                            std::vector<Transport::Slice*>& failed_slice_list);
+
+    // True if any operation posted against `fi_addr` is still awaiting a CQ
+    // entry.  Used by peer_map_ eviction / stale-peer teardown to avoid
+    // fi_av_remove()ing a slot whose completions are still outstanding.
+    bool slotHasInflight(fi_addr_t fi_addr);
 
     // Poll completion queue for completed operations
     int pollCq(int max_entries, int cq_index = 0);
@@ -245,6 +278,47 @@ class EfaContext {
     std::unordered_map<std::string, PeerMapEntry> peer_map_;
     // Insertion order — front = oldest.  Guarded by peer_map_lock_.
     std::list<std::string> peer_lru_;
+
+    // Per-AV-slot bookkeeping, keyed by fi_addr_t.
+    //
+    // fi_av_insert() returns the SAME table index for the same peer address,
+    // and fi_av_remove() frees that index for reuse.  Both mean several
+    // EfaEndPoint objects can legitimately hold one fi_addr_t at once: with a
+    // volatile peer key (ip:port:timestamp@nic) the same peer is re-admitted
+    // under a new key while the old handle is still alive, and each handshake
+    // inserts the same address.  Letting the first handle to be torn down call
+    // fi_av_remove() then invalidates the slot the others are still posting on
+    // -- observed as SIGSEGV inside libfabric from fi_write() with an in-range
+    // but freed dest_addr, with tracing showing insert/post/remove/post on one
+    // slot from three different threads within 60us.
+    //
+    // Both counters must live here, on the slot, rather than on the endpoint:
+    //   * refcount -- the slot is only really removed once the LAST holder
+    //     releases it.
+    //   * inflight -- fi_av_remove() on a slot with posted-but-uncompleted
+    //     operations makes the provider drop those completions on the floor,
+    //     so the slices stay PENDING and the caller's status loop spins on
+    //     WAITING forever.  A per-endpoint counter cannot answer "is this slot
+    //     quiesced?" because it only sees ONE holder's operations: an idle
+    //     endpoint retiring the slot still eats a sibling endpoint's
+    //     completions (observed as a hang in 5 of 8 saturated-peer_map_ runs).
+    //
+    // Entries are never erased, which keeps the AvSlotState* stored in each
+    // EfaOpContext valid for as long as libfabric may hand that context back.
+    // Bounded by the number of distinct AV indices the provider hands out
+    // (at most the AV size), and each entry is three ints.
+    mutable RWSpinlock av_ref_lock_;
+    std::unordered_map<fi_addr_t, std::unique_ptr<AvSlotState>> av_slots_;
+
+    // Get-or-create the state for a slot.  Never returns null.
+    AvSlotState* avSlot(fi_addr_t fi_addr);
+    // Look up existing slot state, or null if the slot was never inserted.
+    AvSlotState* avSlotIfPresent(fi_addr_t fi_addr);
+    // Retire a slot that has quiesced.  Called by the CQ poller for slots
+    // whose removal was deferred.
+    void retireSlotIfPending(AvSlotState* slot, fi_addr_t fi_addr);
+    // Unconditional fi_av_remove, serialized against the post burst.
+    void removeSlotNow(fi_addr_t fi_addr);
 
     RWSpinlock mr_lock_;
     std::map<uint64_t, EfaMemoryRegionMeta> mr_map_;

@@ -45,6 +45,16 @@ struct EfaOpContext {
     // std::atomic<int> (not volatile int) so the CQ-poller decrement
     // and the submit-path fetch_add play by the C++ memory model.
     std::atomic<int>* wr_depth;
+    // The AV slot this operation was posted against, plus the slot number
+    // itself.  On completion (success or error) the CQ poller decrements
+    // slot->inflight and, if the slot's last holder already released it,
+    // performs the deferred fi_av_remove().
+    //
+    // Deliberately NOT the owning EfaEndPoint's counter: one AV slot can be
+    // shared by several endpoints, so an endpoint-local count says nothing
+    // about whether the SLOT is safe to retire.
+    EfaContext::AvSlotState* slot;
+    fi_addr_t slot_addr;
 };
 
 // Per-peer handle in the shared-endpoint SRD model.
@@ -80,16 +90,28 @@ class EfaEndPoint {
     int setupConnectionsByPassive(const HandShakeDesc& peer_desc,
                                   HandShakeDesc& local_desc);
 
-    // Always false under the shared-endpoint model: outstanding work is
-    // tracked at the context (shared) level, not per-peer.  Retained for
-    // API compatibility with callers that still ask.
-    bool hasOutstandingSlice() const { return false; }
+    // True if the AV slot this handle points at still has operations awaiting a
+    // CQ entry.  Deliberately asks the context, not a member counter: one slot
+    // is shared by several endpoints (see EfaContext::av_slots_), so a
+    // per-endpoint count would report "idle" for a handle whose slot is still
+    // carrying a sibling's operations -- and retiring the slot then loses those
+    // completions.
+    bool hasOutstandingSlice() const;
 
     bool connected() const {
         return status_.load(std::memory_order_relaxed) == CONNECTED;
     }
 
     void disconnect();
+
+    // Atomic "retire if quiesced": drop the AV slot only if no posted
+    // operation is still awaiting a completion, and decide that under the
+    // same write lock that submitPostSend() holds (as a reader) while it
+    // posts.  A plain inflight() check followed by disconnect() is racy --
+    // a submitter can post between the two -- and losing that race means
+    // fi_av_remove() eats the new operations' completions.  Returns false
+    // if the peer is still busy and the caller must retry later.
+    bool disconnectIfIdle();
 
     // Called during EfaContext teardown: forget the AV slot WITHOUT calling
     // fi_av_remove().  The AV itself is about to be closed, which invalidates
@@ -121,7 +143,9 @@ class EfaEndPoint {
     EfaContext& context_;
     std::atomic<Status> status_;
 
-    RWSpinlock lock_;  // protects peer_nic_path_ and status_
+    // protects peer_nic_path_, status_ and peer_fi_addr_.  mutable so const
+    // observers (hasOutstandingSlice) can read peer_fi_addr_ safely.
+    mutable RWSpinlock lock_;
     std::string peer_nic_path_;
     fi_addr_t peer_fi_addr_;  // slot in context_.av()
     // Last peer EFA address successfully inserted into the AV.  Used to
