@@ -209,6 +209,11 @@ ErrorCode OpLogBatchStorage::ReadBatch(uint64_t batch_id,
         LOG(ERROR) << "Failed to decode OpLog batch record: " << reason;
         return ErrorCode::INTERNAL_ERROR;
     }
+    if (batch.batch_id != batch_id) {
+        LOG(ERROR) << "OpLog batch id does not match key: requested="
+                   << batch_id << ", payload=" << batch.batch_id;
+        return ErrorCode::INTERNAL_ERROR;
+    }
     return ErrorCode::OK;
 }
 

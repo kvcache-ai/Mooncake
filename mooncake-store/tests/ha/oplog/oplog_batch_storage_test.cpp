@@ -377,6 +377,17 @@ TEST(OpLogBatchStorageTest, ReadBatchRejectsCorruptedRecord) {
     EXPECT_EQ(ErrorCode::INTERNAL_ERROR, storage.ReadBatch(1, out));
 }
 
+TEST(OpLogBatchStorageTest, ReadBatchRejectsMismatchedPayloadBatchId) {
+    FakeHaKvBackend backend;
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put("/oplog/clusterA/batches/00000000000000000001",
+                          EncodeOpLogBatchRecord(MakeBatch(2, 1, 1))));
+    OpLogBatchStorage storage("clusterA", backend);
+
+    OpLogBatchRecord out;
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, storage.ReadBatch(1, out));
+}
+
 TEST(OpLogBatchStorageTest, ReadBatchesAfterReturnsOrderedBatches) {
     FakeHaKvBackend backend;
     ASSERT_EQ(ErrorCode::OK,
