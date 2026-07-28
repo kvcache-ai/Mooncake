@@ -370,9 +370,147 @@ jobs:
           export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
           bash scripts/run_tests.sh
 
+  nightly-coverage:
+    runs-on: ubuntu-22.04
+    env:
+      CI: "true"
+      SCCACHE_GHA_ENABLED: "true"
+      CXXFLAGS: --coverage
+      CFLAGS: --coverage
+      LDFLAGS: --coverage
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install and start etcd
+        run: |
+          wget -q https://github.com/etcd-io/etcd/releases/download/v3.6.1/etcd-v3.6.1-linux-amd64.tar.gz
+          tar xzf etcd-v3.6.1-linux-amd64.tar.gz
+          sudo mv etcd-v3.6.1-linux-amd64/etcd* /usr/local/bin/
+          etcd --advertise-client-urls http://127.0.0.1:2379 --listen-client-urls http://127.0.0.1:2379 &
+          sleep 3
+          ETCDCTL_API=3 etcdctl --endpoints=http://127.0.0.1:2379 endpoint health
+
+      - name: Free up disk space
+        uses: ./.github/actions/free-disk-space
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.24
+        with:
+          cuda: '12.8.1'
+          linux-local-args: '["--toolkit"]'
+          method: 'network'
+          sub-packages: '["nvcc"]'
+
+      - name: Install coverage tools and build utilities
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lcov gcovr ninja-build
+
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Configure sccache
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Configure project with coverage support
+        run: |
+          sudo apt update -y
+          sudo bash -x dependencies.sh -y
+          mkdir build
+          cd build
+          cmake -G Ninja .. -DUSE_HTTP=ON -DUSE_CXL=ON -DUSE_UB=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Debug -DENABLE_DEBUG_SYMBOLS=OFF
+
+      - name: Build project
+        run: |
+          cd build
+          cmake --build . --parallel 128
+          sudo cmake --install .
+
+      - name: Start Metadata Server
+        run: |
+          cd mooncake-transfer-engine/example/http-metadata-server-python
+          pip install aiohttp
+          python ./bootstrap_server.py &
+          sleep 2
+
+      - name: Run CTest with coverage
+        run: |
+          cd build
+          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+          MC_METADATA_SERVER=http://127.0.0.1:8080/metadata \
+          DEFAULT_KV_LEASE_TTL=500 \
+            ctest --parallel $(nproc) --output-on-failure
+
+      - name: Generate coverage report
+        id: coverage
+        run: |
+          cd build
+          echo "=== Starting coverage report generation ==="
+          echo "Current directory: $(pwd)"
+
+          echo "=== Looking for .gcda files ==="
+          find . -name "*.gcda" 2>/dev/null | head -10 || echo "No .gcda files found"
+
+          echo "=== Running lcov ==="
+          lcov --capture --directory . --output-file coverage.info 2>&1 || {
+            echo "WARNING: lcov failed to capture coverage data"
+            echo "Creating minimal lcov-compliant coverage file to allow CI to continue"
+            echo "TN:dummy" > coverage.filtered.info
+            echo "SF:/dev/null" >> coverage.filtered.info
+            echo "DA:0,0" >> coverage.filtered.info
+            echo "end_of_record" >> coverage.filtered.info
+            echo "coverage_failed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          echo "=== Processing coverage data ==="
+          lcov --remove coverage.info '/usr/*' '*/test/*' '*/third_party/*' '*/benchmarks/*' --output-file coverage.filtered.info 2>&1 || true
+
+          echo "=== Generating HTML report ==="
+          genhtml coverage.filtered.info --output-directory coverage_report 2>&1 || echo "genhtml failed, continuing..."
+
+          echo "=== Coverage summary ==="
+          lcov --list coverage.filtered.info 2>&1 || echo "lcov list failed"
+
+          echo "=== Coverage report generation completed ==="
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: build/coverage.filtered.info
+          flags: unittests
+          name: nightly-code-coverage-report
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+        continue-on-error: true
+
+      - name: Check coverage status
+        if: always()
+        run: |
+          if [ "${{ steps.coverage.outputs.coverage_failed }}" = "true" ]; then
+            echo "Coverage collection failed but the nightly workflow continued"
+            echo "::warning::Code coverage collection failed. Please check the logs."
+          else
+            echo "Coverage collected successfully"
+          fi
+
   nightly-gate:
     if: always()
-    needs: [build-cuda128-x86, build-cuda128-arm64, build-cuda13-x86, build-cuda13-arm64, build-musa, build-docker, ascend-test, publish-testpypi, nightly-test]
+    needs: [build-cuda128-x86, build-cuda128-arm64, build-cuda13-x86, build-cuda13-arm64, build-musa, build-docker, ascend-test, publish-testpypi, nightly-test, nightly-coverage]
     runs-on: ubuntu-22.04
     steps:
       - name: Check results
@@ -387,6 +525,7 @@ jobs:
           echo "Ascend test: ${{ needs.ascend-test.result }}"
           echo "Publish: ${{ needs.publish-testpypi.result }}"
           echo "Test: ${{ needs.nightly-test.result }}"
+          echo "Coverage: ${{ needs.nightly-coverage.result }}"
           # Fail if any build job did not succeed
           if [ "${{ needs.build-cuda128-x86.result }}" != "success" ]; then
             echo "::error::Build CUDA 12.8 x86 failed!"
@@ -418,6 +557,10 @@ jobs:
           fi
           if [ "${{ needs.nightly-test.result }}" != "success" ]; then
             echo "::error::Nightly tests failed!"
+            exit 1
+          fi
+          if [ "${{ needs.nightly-coverage.result }}" != "success" ]; then
+            echo "::error::Nightly coverage failed!"
             exit 1
           fi
           # publish-testpypi may be skipped (skip_publish=true) — only fail on actual failure
