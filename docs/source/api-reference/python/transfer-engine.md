@@ -58,57 +58,23 @@ TransferOpcode.READ   # Read operation
 TransferOpcode.WRITE  # Write operation
 ```
 
-### Class: RpcInterface
-
-The RPC communicator used to send data and tensors directly between endpoints.
-
-#### initialize()
+### RpcInterface client pool configuration
 
 ```python
-initialize(
-    listen_address="",
-    thread_count=0,
-    timeout_seconds=30,
-    pool_size=100,
-)
-```
-
-Initializes an RPC communicator that can act as a client, a server, or both.
-
-**Parameters:**
-- `listen_address` (str): Address on which the RPC server listens. Leave empty
-  for a client-only communicator.
-- `thread_count` (int): Number of RPC server worker threads. This parameter does
-  not control RPC client I/O threads.
-- `timeout_seconds` (int): RPC request timeout in seconds.
-- `pool_size` (int): Maximum number of cached RPC client connections for each
-  target endpoint.
-
-**Returns:**
-- `bool`: `True` when initialization succeeds, otherwise `False`.
-
-#### initialize_client()
-
-```python
+initialize(listen_address="", thread_count=0, timeout_seconds=30, pool_size=100)
 initialize_client(pool_size=100, timeout_seconds=30)
 ```
 
-Initializes a client-only RPC communicator.
+For both methods, `pool_size` is the maximum number of reusable RPC client
+connections cached for each target endpoint. It is not a limit on total
+concurrent connections and does not control RPC client I/O threads.
 
-**Parameters:**
-- `pool_size` (int): Maximum number of cached RPC client connections for each
-  target endpoint.
-- `timeout_seconds` (int): RPC request timeout in seconds.
-
-**Returns:**
-- `bool`: `True` when initialization succeeds, otherwise `False`.
-
-RPC client I/O threads are independent of `pool_size` and `thread_count`. Set
+For `initialize()`, `thread_count` configures the RPC server I/O contexts when
+`listen_address` is set; it does not configure client I/O threads. Set
 `MC_TE_RPC_CLIENT_IO_THREADS` to configure the Transfer Engine client I/O pool.
-If it is unset, `0`, or invalid, the value falls back to
-`MC_RPC_CLIENT_IO_THREADS`. These environment variables are read when the
-process environment configuration is first initialized, so changing them
-requires restarting the process.
+If that value is unset, `0`, or invalid, it falls back to
+`MC_RPC_CLIENT_IO_THREADS`. Set these environment variables before starting the
+process; changes require a restart.
 
 ### Initialization Methods
 
