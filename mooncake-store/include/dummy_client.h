@@ -281,7 +281,6 @@ class DummyClient : public PyClient {
     ShmHelper *shm_helper_ = nullptr;
     std::string ipc_socket_path_;
     void *local_buffer_base_ = nullptr;
-    std::mutex local_buffer_write_mutex_;
 
     // Hot cache shm mapping (obtained from real client via IPC)
     void *hot_cache_base_ = nullptr;

@@ -761,7 +761,6 @@ uint64_t DummyClient::alloc_from_mem_pool(size_t size) {
 
 int DummyClient::put(const std::string& key, std::span<const char> value,
                      const ReplicateConfig& config) {
-    std::lock_guard<std::mutex> lock(local_buffer_write_mutex_);
     return invoke_observed_void_rpc<&RealClient::put_dummy_helper>(
         TransferOperationKind::kWrite, "put", value.size_bytes(), false, key,
         value, config, client_id_);
@@ -770,7 +769,6 @@ int DummyClient::put(const std::string& key, std::span<const char> value,
 int DummyClient::put_batch(const std::vector<std::string>& keys,
                            const std::vector<std::span<const char>>& values,
                            const ReplicateConfig& config) {
-    std::lock_guard<std::mutex> lock(local_buffer_write_mutex_);
     return invoke_observed_void_rpc<&RealClient::put_batch_dummy_helper>(
         TransferOperationKind::kWrite, "put_batch", sum_value_sizes(values),
         true, keys, values, config, client_id_);
@@ -779,7 +777,6 @@ int DummyClient::put_batch(const std::vector<std::string>& keys,
 int DummyClient::put_parts(const std::string& key,
                            std::vector<std::span<const char>> values,
                            const ReplicateConfig& config) {
-    std::lock_guard<std::mutex> lock(local_buffer_write_mutex_);
     return invoke_observed_void_rpc<&RealClient::put_parts_dummy_helper>(
         TransferOperationKind::kWrite, "put_parts", sum_value_sizes(values),
         false, key, values, config, client_id_);
@@ -787,7 +784,6 @@ int DummyClient::put_parts(const std::string& key,
 
 int DummyClient::upsert(const std::string& key, std::span<const char> value,
                         const ReplicateConfig& config) {
-    std::lock_guard<std::mutex> lock(local_buffer_write_mutex_);
     return invoke_observed_void_rpc<&RealClient::upsert_dummy_helper>(
         TransferOperationKind::kWrite, "upsert", value.size_bytes(), false, key,
         value, config, client_id_);
@@ -795,7 +791,6 @@ int DummyClient::upsert(const std::string& key, std::span<const char> value,
 
 int DummyClient::upsert_from(const std::string& key, void* buffer, size_t size,
                              const ReplicateConfig& config) {
-    std::lock_guard<std::mutex> lock(local_buffer_write_mutex_);
     uint64_t dummy_addr = reinterpret_cast<uint64_t>(buffer);
     return invoke_observed_void_rpc<&RealClient::upsert_from_dummy_helper>(
         TransferOperationKind::kWrite, "upsert_from", size, false, key,
@@ -805,7 +800,6 @@ int DummyClient::upsert_from(const std::string& key, void* buffer, size_t size,
 std::vector<int> DummyClient::batch_upsert_from(
     const std::vector<std::string>& keys, const std::vector<void*>& buffer_ptrs,
     const std::vector<size_t>& sizes, const ReplicateConfig& config) {
-    std::lock_guard<std::mutex> lock(local_buffer_write_mutex_);
     std::vector<uint64_t> buffers;
     for (auto ptr : buffer_ptrs) {
         buffers.push_back(reinterpret_cast<uint64_t>(ptr));
@@ -831,7 +825,6 @@ std::vector<int> DummyClient::batch_upsert_from(
 int DummyClient::upsert_parts(const std::string& key,
                               std::vector<std::span<const char>> values,
                               const ReplicateConfig& config) {
-    std::lock_guard<std::mutex> lock(local_buffer_write_mutex_);
     return invoke_observed_void_rpc<&RealClient::upsert_parts_dummy_helper>(
         TransferOperationKind::kWrite, "upsert_parts", sum_value_sizes(values),
         false, key, values, config, client_id_);
@@ -840,7 +833,6 @@ int DummyClient::upsert_parts(const std::string& key,
 int DummyClient::upsert_batch(const std::vector<std::string>& keys,
                               const std::vector<std::span<const char>>& values,
                               const ReplicateConfig& config) {
-    std::lock_guard<std::mutex> lock(local_buffer_write_mutex_);
     return invoke_observed_void_rpc<&RealClient::upsert_batch_dummy_helper>(
         TransferOperationKind::kWrite, "upsert_batch", sum_value_sizes(values),
         true, keys, values, config, client_id_);
@@ -1123,7 +1115,6 @@ std::string DummyClient::get_hostname() const {
 std::vector<int> DummyClient::batch_put_from(
     const std::vector<std::string>& keys, const std::vector<void*>& buffer_ptrs,
     const std::vector<size_t>& sizes, const ReplicateConfig& config) {
-    std::lock_guard<std::mutex> lock(local_buffer_write_mutex_);
     std::vector<uint64_t> buffers = void_ptrs_to_u64(buffer_ptrs);
     const auto start_time = std::chrono::steady_clock::now();
     auto internal_results =
@@ -1190,7 +1181,6 @@ std::vector<int> DummyClient::batch_put_from_multi_buffers(
     const std::vector<std::vector<void*>>& all_buffer_ptrs,
     const std::vector<std::vector<size_t>>& all_sizes,
     const ReplicateConfig& config) {
-    std::lock_guard<std::mutex> lock(local_buffer_write_mutex_);
     std::vector<std::vector<uint64_t>> dummy_nested =
         void_ptr_rows_to_u64_nested(all_buffer_ptrs);
     const auto start_time = std::chrono::steady_clock::now();
