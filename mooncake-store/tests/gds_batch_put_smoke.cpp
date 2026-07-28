@@ -2,7 +2,9 @@
 #include "test_server_helpers.h"
 
 #include <gtest/gtest.h>
+#ifdef USE_CUDA
 #include <cuda_runtime.h>
+#endif
 #include <filesystem>
 
 namespace mooncake {
