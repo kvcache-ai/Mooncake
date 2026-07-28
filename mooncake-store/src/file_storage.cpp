@@ -597,8 +597,14 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         // is empty (those keys are already in failed_tasks). Skip BatchOffload,
         // which rejects an empty map as INVALID_KEY and would otherwise trip
         // the whole-cycle abort below for a bucket that has nothing left to
-        // persist.
+        // persist. staging_bufs can still be non-empty here (an object whose
+        // first slices copied fine but a later one failed), so hand those
+        // buffers back before continuing: the release loop after BatchOffload
+        // is unreachable on this path.
         if (host_batch_object.empty()) {
+            for (auto& buf : staging_bufs) {
+                pinned_buffer_pool_->Release(std::move(buf));
+            }
             continue;
         }
 
