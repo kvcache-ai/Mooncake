@@ -136,10 +136,10 @@ TEST_F(HAMetricManagerTest, TestSerializeMetrics) {
 }
 
 TEST_F(HAMetricManagerTest, TestHaFailureMetricsAreExported) {
-    M().set_election_is_leader(1);
-    M().set_oplog_async_workers_running(1);
-    M().set_standby_degraded(1);
-    M().set_primary_degraded(1);
+    M().set_election_is_leader(true);
+    M().set_oplog_async_workers_running(true);
+    M().set_standby_degraded(true);
+    M().set_primary_degraded(true);
     M().set_oplog_last_successful_poll_timestamp_ms(12345);
     M().observe_election_duration_ms(10);
     M().inc_election_attempts();

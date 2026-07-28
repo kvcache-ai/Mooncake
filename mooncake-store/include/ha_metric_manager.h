@@ -63,10 +63,10 @@ class HAMetricManager {
      */
     void set_oplog_async_queue_size(int64_t size);
     int64_t get_oplog_async_queue_size();
-    void set_election_is_leader(int64_t value);
-    void set_oplog_async_workers_running(int64_t value);
-    void set_standby_degraded(int64_t value);
-    void set_primary_degraded(int64_t value);
+    void set_election_is_leader(bool value);
+    void set_oplog_async_workers_running(bool value);
+    void set_standby_degraded(bool value);
+    void set_primary_degraded(bool value);
     void set_oplog_last_successful_poll_timestamp_ms(int64_t timestamp_ms);
 
     // ========== Error Counters ==========

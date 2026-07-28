@@ -208,20 +208,20 @@ int64_t HAMetricManager::get_oplog_async_queue_size() {
     return static_cast<int64_t>(oplog_async_queue_size_.value());
 }
 
-void HAMetricManager::set_election_is_leader(int64_t value) {
-    election_is_leader_.update(value);
+void HAMetricManager::set_election_is_leader(bool value) {
+    election_is_leader_.update(value ? 1 : 0);
 }
 
-void HAMetricManager::set_oplog_async_workers_running(int64_t value) {
-    oplog_async_workers_running_.update(value);
+void HAMetricManager::set_oplog_async_workers_running(bool value) {
+    oplog_async_workers_running_.update(value ? 1 : 0);
 }
 
-void HAMetricManager::set_standby_degraded(int64_t value) {
-    standby_degraded_.update(value);
+void HAMetricManager::set_standby_degraded(bool value) {
+    standby_degraded_.update(value ? 1 : 0);
 }
 
-void HAMetricManager::set_primary_degraded(int64_t value) {
-    primary_degraded_.update(value);
+void HAMetricManager::set_primary_degraded(bool value) {
+    primary_degraded_.update(value ? 1 : 0);
 }
 
 void HAMetricManager::set_oplog_last_successful_poll_timestamp_ms(

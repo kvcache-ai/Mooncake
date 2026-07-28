@@ -176,7 +176,7 @@ void RedisElectionHelper::ElectLeader(const std::string& master_address,
                 elected = TryElectOnce(master_address, version);
             }
             if (elected) {
-                HAMetricManager::instance().set_election_is_leader(1);
+                HAMetricManager::instance().set_election_is_leader(true);
                 HAMetricManager::instance().observe_election_duration_ms(
                     std::chrono::duration_cast<std::chrono::milliseconds>(
                         std::chrono::steady_clock::now() - election_start)
@@ -537,7 +537,7 @@ void RedisElectionHelper::KeepLeader(int lease_id) {
     }
 
     keep_alive_running_ = false;
-    HAMetricManager::instance().set_election_is_leader(0);
+    HAMetricManager::instance().set_election_is_leader(false);
     LOG(INFO) << "KeepLeader: exited renewal loop";
 }
 

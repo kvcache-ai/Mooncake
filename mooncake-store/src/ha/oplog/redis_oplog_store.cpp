@@ -244,7 +244,7 @@ void RedisOpLogStore::StartAsyncWorkers() {
     for (size_t i = 0; i < kAsyncWorkerCount; ++i) {
         async_workers_.emplace_back(&RedisOpLogStore::AsyncWriteLoop, this, i);
     }
-    HAMetricManager::instance().set_oplog_async_workers_running(1);
+    HAMetricManager::instance().set_oplog_async_workers_running(true);
 }
 
 void RedisOpLogStore::StopAsyncWorkers() {
@@ -259,7 +259,7 @@ void RedisOpLogStore::StopAsyncWorkers() {
         }
     }
     async_workers_.clear();
-    HAMetricManager::instance().set_oplog_async_workers_running(0);
+    HAMetricManager::instance().set_oplog_async_workers_running(false);
 
     std::lock_guard<std::mutex> lock(async_mutex_);
     size_t unfinished_count = 0;

@@ -801,7 +801,7 @@ ErrorCode P2PMasterService::RestoreFromStandbyMetadata(
     }
 
     if (skipped_replicas > 0 || skipped_objects > 0) {
-        HAMetricManager::instance().set_primary_degraded(1);
+        HAMetricManager::instance().set_primary_degraded(true);
         HAMetricManager::instance().inc_promotion_skipped_replicas(
             static_cast<int64_t>(skipped_replicas));
         HAMetricManager::instance().inc_promotion_skipped_objects(

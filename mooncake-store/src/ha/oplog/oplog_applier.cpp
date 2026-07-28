@@ -22,7 +22,7 @@ OpLogApplier::OpLogApplier(MetadataStore* metadata_store,
     if (metadata_store_ == nullptr) {
         LOG(FATAL) << "OpLogApplier: metadata_store cannot be null";
     }
-    HAMetricManager::instance().set_standby_degraded(0);
+    HAMetricManager::instance().set_standby_degraded(false);
     if (!NormalizeAndValidateClusterId(cluster_id_)) {
         LOG(FATAL) << "Invalid cluster_id for OpLogApplier: '" << cluster_id_
                    << "'. Allowed chars: [A-Za-z0-9_.-], max_len=128.";
@@ -206,7 +206,7 @@ bool OpLogApplier::HandleApplyFailure(const OpLogEntry& entry,
     failed_sequence_id_.store(entry.sequence_id);
     healthy_.store(false);
     HAMetricManager::instance().inc_oplog_apply_failures();
-    HAMetricManager::instance().set_standby_degraded(1);
+    HAMetricManager::instance().set_standby_degraded(true);
     LOG(ERROR) << "OpLogApplier: critical apply failure"
                << ", sequence_id=" << entry.sequence_id
                << ", op_type=" << static_cast<int>(entry.op_type)
