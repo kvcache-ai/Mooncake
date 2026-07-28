@@ -58,25 +58,7 @@ TransferOpcode.READ   # Read operation
 TransferOpcode.WRITE  # Write operation
 ```
 
-### RpcInterface client pool configuration
-
-```python
-initialize(listen_address="", thread_count=0, timeout_seconds=30, pool_size=100)
-initialize_client(pool_size=100, timeout_seconds=30)
-```
-
-For both methods, `pool_size` is the maximum number of reusable RPC client
-connections cached for each target endpoint. It is not a limit on total
-concurrent connections and does not control RPC client I/O threads.
-
-For `initialize()`, `thread_count` configures the RPC server I/O contexts when
-`listen_address` is set; it does not configure client I/O threads. Set
-`MC_TE_RPC_CLIENT_IO_THREADS` to configure the Transfer Engine client I/O pool.
-If that value is unset, `0`, or invalid, it falls back to
-`MC_RPC_CLIENT_IO_THREADS`. Set these environment variables before starting the
-process; changes require a restart.
-
-### Initialization Methods
+### TransferEngine Initialization Methods
 
 #### initialize()
 
@@ -112,6 +94,24 @@ Initializes the transfer engine with extended configuration including metadata t
 
 **Returns:**
 - `int`: 0 on success, negative value on failure
+
+### RpcInterface client pool configuration
+
+```python
+initialize(listen_address="", thread_count=0, timeout_seconds=30, pool_size=100)
+initialize_client(pool_size=100, timeout_seconds=30)
+```
+
+For both methods, `pool_size` is the maximum number of reusable RPC client
+connections cached for each target endpoint. It is not a limit on total
+concurrent connections and does not control RPC client I/O threads.
+
+For `initialize()`, `thread_count` configures the RPC server I/O contexts when
+`listen_address` is set; it does not configure client I/O threads. Set
+`MC_TE_RPC_CLIENT_IO_THREADS` to configure the Transfer Engine client I/O pool.
+If that value is unset, `0`, or invalid, it falls back to
+`MC_RPC_CLIENT_IO_THREADS`. Set these environment variables before starting the
+process; changes require a restart.
 
 ### Engine Information
 
