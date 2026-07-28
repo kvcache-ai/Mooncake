@@ -30,6 +30,8 @@ class LinkManager {
     LinkManager() = default;
 
     void init(GlobalRank rank, int max_world_size, TransferEngine* engine);
+    void start(uint64_t self_rank_epoch);
+    void stop();
 
     bool isInitialized() const {
         return initialized_.load(std::memory_order_acquire);
@@ -61,7 +63,8 @@ class LinkManager {
 
     void refreshPeerSegment(GlobalRank peer);
 
-    void publishLinkUp(GlobalRank peer, TransferMetadata::SegmentID target_id);
+    void publishLinkUp(GlobalRank peer, TransferMetadata::SegmentID target_id,
+                       uint64_t target_rank_epoch);
     void publishLinkDown(GlobalRank peer);
 
     ~LinkManager() { shutdown(); }
@@ -121,7 +124,7 @@ class LinkManager {
     std::string local_server_name_;
 
     // Warmup region
-    std::unique_ptr<int32_t[]> warmup_send_region_;
+    std::unique_ptr<int32_t> warmup_send_region_;
     std::unique_ptr<int32_t[]> warmup_recv_region_;
     bool skip_warmup_ = false;
 
@@ -135,6 +138,7 @@ class LinkManager {
     std::condition_variable wakeup_cv_;
 
     std::atomic<bool> initialized_{false};
+    std::atomic<bool> started_{false};
     std::atomic<bool> shutdown_{false};
 
     void pollerLoop();

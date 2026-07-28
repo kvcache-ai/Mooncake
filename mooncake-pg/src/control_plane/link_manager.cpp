@@ -67,13 +67,9 @@ void LinkManager::init(GlobalRank rank, int max_world_size,
     read_state_ = std::vector<PeerReadState>(max_world_size_);
 
     if (!skip_warmup_) {
-        warmup_send_region_ = std::make_unique<int32_t[]>(max_world_size_);
-        std::memset(warmup_send_region_.get(), 0,
-                    max_world_size_ * sizeof(int32_t));
-        warmup_send_region_[0] = 1;
-        int rc = engine_->registerLocalMemory(warmup_send_region_.get(),
-                                              max_world_size_ * sizeof(int32_t),
-                                              kWildcardLocation);
+        warmup_send_region_ = std::make_unique<int32_t>(1);
+        int rc = engine_->registerLocalMemory(
+            warmup_send_region_.get(), sizeof(int32_t), kWildcardLocation);
         if (rc != 0) {
             LOG(FATAL) << "LinkManager: failed to register warmup send region";
         }
@@ -90,52 +86,58 @@ void LinkManager::init(GlobalRank rank, int max_world_size,
                 << rc;
         }
     }
+}
 
-    // Bootstrap self: open local segment, mark Connected.
+void LinkManager::start(uint64_t self_rank_epoch) {
+    if (!initialized_.load(std::memory_order_acquire)) {
+        LOG(ERROR) << "LinkManager: start() called before init()";
+        return;
+    }
+    if (shutdown_.load(std::memory_order_acquire)) return;
+    if (started_.exchange(true, std::memory_order_acq_rel)) return;
+
     TransferMetadata::SegmentID self_target_id{};
     {
         std::lock_guard<std::mutex> lock(peers_mutex_);
         auto& link = peers_[rank_];
         link.state = PeerLinkState::Connected;
         link.is_candidate = false;
+        link.target_rank_epoch = self_rank_epoch;
         link.target_id = engine_->openSegment(local_server_name_);
         self_target_id = link.target_id.value();
     }
 
-    // Write read model for self.
-    publishLinkUp(rank_, self_target_id);
+    publishLinkUp(rank_, self_target_id, self_rank_epoch);
 
-    // Start poller thread.
     poller_running_.store(true, std::memory_order_release);
     poller_thread_ = std::thread([this] { pollerLoop(); });
 }
 
-void LinkManager::shutdown() {
-    if (shutdown_.exchange(true, std::memory_order_acq_rel)) return;
+void LinkManager::stop() {
+    if (!initialized_.load(std::memory_order_acquire)) return;
 
+    started_.store(false, std::memory_order_release);
     poller_running_.store(false, std::memory_order_release);
     wakeup();
     if (poller_thread_.joinable()) {
         poller_thread_.join();
     }
 
-    // Tear down all peer links.
     std::lock_guard<std::mutex> lock(peers_mutex_);
-    for (int i = 0; i < max_world_size_; ++i) {
-        if (i == rank_) continue;
-        auto& link = peers_[i];
-        if (link.target_id.has_value()) {
-            engine_->closeSegment(link.target_id.value());
-            link.target_id = std::nullopt;
-        }
-        if (link.probe_batch_id.has_value()) {
-            engine_->freeBatchID(link.probe_batch_id.value());
-            link.probe_batch_id = std::nullopt;
-        }
-        link.health_check_requested = false;
-        link.state = PeerLinkState::Idle;
-        link.is_candidate = false;
+    for (int peer = 0; peer < max_world_size_; ++peer) {
+        tearDownPeerLink(peer);
+        peers_[peer] = PeerLink{};
     }
+    if (warmup_recv_region_) {
+        std::memset(warmup_recv_region_.get(), 0,
+                    max_world_size_ * sizeof(int32_t));
+    }
+}
+
+void LinkManager::shutdown() {
+    if (shutdown_.exchange(true, std::memory_order_acq_rel)) return;
+
+    stop();
 
     // Release warmup regions.
     if (warmup_send_region_) {
@@ -273,11 +275,16 @@ void LinkManager::refreshPeerSegment(GlobalRank peer) {
 }
 
 void LinkManager::publishLinkUp(GlobalRank peer,
-                                TransferMetadata::SegmentID target_id) {
+                                TransferMetadata::SegmentID target_id,
+                                uint64_t target_rank_epoch) {
     if (!rankInRange(peer)) return;
     read_state_[peer].target_id.store(target_id, std::memory_order_relaxed);
     read_state_[peer].link_connected.store(1, std::memory_order_release);
     read_state_[peer].version.fetch_add(1, std::memory_order_release);
+    emit(TELinkUpEvent{
+        .peer = peer,
+        .target_rank_epoch = target_rank_epoch,
+    });
 }
 
 void LinkManager::publishLinkDown(GlobalRank peer) {
@@ -445,11 +452,7 @@ bool LinkManager::advanceConnection(GlobalRank peer) {
             if (link.skip_warmup) {
                 link.state = PeerLinkState::Connected;
                 link.probe_backoff = PeerLink::kProbeBackoffMin;
-                publishLinkUp(peer, segment_id);
-                emit(TELinkUpEvent{
-                    .peer = peer,
-                    .target_rank_epoch = link.target_rank_epoch,
-                });
+                publishLinkUp(peer, segment_id, link.target_rank_epoch);
                 return true;
             }
 
@@ -492,11 +495,8 @@ bool LinkManager::advanceConnection(GlobalRank peer) {
                 link.probe_batch_id = std::nullopt;
                 link.state = PeerLinkState::Connected;
                 link.probe_backoff = PeerLink::kProbeBackoffMin;
-                publishLinkUp(peer, link.target_id.value());
-                emit(TELinkUpEvent{
-                    .peer = peer,
-                    .target_rank_epoch = link.target_rank_epoch,
-                });
+                publishLinkUp(peer, link.target_id.value(),
+                              link.target_rank_epoch);
                 return true;
             }
 
@@ -532,11 +532,8 @@ bool LinkManager::advanceConnection(GlobalRank peer) {
                 *warmup_flag = 0;
                 link.state = PeerLinkState::Connected;
                 link.probe_backoff = PeerLink::kProbeBackoffMin;
-                publishLinkUp(peer, link.target_id.value());
-                emit(TELinkUpEvent{
-                    .peer = peer,
-                    .target_rank_epoch = link.target_rank_epoch,
-                });
+                publishLinkUp(peer, link.target_id.value(),
+                              link.target_rank_epoch);
                 return true;
             }
             return false;
