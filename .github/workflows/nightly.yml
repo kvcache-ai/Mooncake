@@ -510,65 +510,45 @@ jobs:
 
   nightly-gate:
     if: always()
-    needs: [build-cuda128-x86, build-cuda128-arm64, build-cuda13-x86, build-cuda13-arm64, build-musa, build-docker, ascend-test, publish-testpypi, nightly-test, nightly-coverage]
+    needs:
+      - version-stamp
+      - build-cuda128-x86
+      - build-cuda128-arm64
+      - build-cuda13-x86
+      - build-cuda13-arm64
+      - build-musa
+      - build-docker
+      - ascend-test
+      - publish-testpypi
+      - nightly-test
+      - nightly-coverage
     runs-on: ubuntu-22.04
     steps:
       - name: Check results
         run: |
           echo "=== Nightly Gate Summary ==="
-          echo "Build CUDA 12.8 x86: ${{ needs.build-cuda128-x86.result }}"
-          echo "Build CUDA 12.8 arm64: ${{ needs.build-cuda128-arm64.result }}"
-          echo "Build CUDA 13 x86: ${{ needs.build-cuda13-x86.result }}"
-          echo "Build CUDA 13 arm64: ${{ needs.build-cuda13-arm64.result }}"
-          echo "Build MUSA: ${{ needs.build-musa.result }}"
-          echo "Build Docker image: ${{ needs.build-docker.result }}"
-          echo "Ascend test: ${{ needs.ascend-test.result }}"
-          echo "Publish: ${{ needs.publish-testpypi.result }}"
-          echo "Test: ${{ needs.nightly-test.result }}"
-          echo "Coverage: ${{ needs.nightly-coverage.result }}"
-          # Fail if any build job did not succeed
-          if [ "${{ needs.build-cuda128-x86.result }}" != "success" ]; then
-            echo "::error::Build CUDA 12.8 x86 failed!"
-            exit 1
-          fi
-          if [ "${{ needs.build-cuda128-arm64.result }}" != "success" ]; then
-            echo "::error::Build CUDA 12.8 arm64 failed!"
-            exit 1
-          fi
-          if [ "${{ needs.build-cuda13-x86.result }}" != "success" ]; then
-            echo "::error::Build CUDA 13 x86 failed!"
-            exit 1
-          fi
-          if [ "${{ needs.build-cuda13-arm64.result }}" != "success" ]; then
-            echo "::error::Build CUDA 13 arm64 failed!"
-            exit 1
-          fi
-          if [ "${{ needs.build-musa.result }}" != "success" ]; then
-            echo "::error::Build MUSA failed!"
-            exit 1
-          fi
-          if [ "${{ needs.build-docker.result }}" != "success" ]; then
-            echo "::error::Build Docker image failed!"
-            exit 1
-          fi
-          if [ "${{ needs.ascend-test.result }}" != "success" ]; then
-            echo "::error::Ascend test failed!"
-            exit 1
-          fi
-          if [ "${{ needs.nightly-test.result }}" != "success" ]; then
-            echo "::error::Nightly tests failed!"
-            exit 1
-          fi
-          if [ "${{ needs.nightly-coverage.result }}" != "success" ]; then
-            echo "::error::Nightly coverage failed!"
-            exit 1
-          fi
-          # publish-testpypi may be skipped (skip_publish=true) — only fail on actual failure
-          if [ "${{ needs.publish-testpypi.result }}" == "failure" ]; then
-            echo "::error::Nightly publish failed!"
+          echo "$NEEDS_JSON" | jq -r '
+            to_entries[] | "\(.key): \(.value.result)"'
+
+          failing=$(echo "$NEEDS_JSON" | jq -r \
+            --arg allow_publish_skip "$ALLOW_PUBLISH_SKIP" '
+              to_entries[] |
+              select(
+                .value.result != "success" and
+                (.key != "publish-testpypi" or
+                 .value.result != "skipped" or
+                 $allow_publish_skip != "true")
+              ) |
+              "\(.key): \(.value.result)"')
+          if [ -n "$failing" ]; then
+            echo "::error::The following nightly jobs did not succeed:"
+            echo "$failing"
             exit 1
           fi
           echo "All nightly jobs passed!"
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          ALLOW_PUBLISH_SKIP: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.skip_publish == 'true' }}
 
   notify-failure:
     if: ${{ always() && needs.nightly-gate.result == 'failure' }}
