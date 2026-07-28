@@ -1,5 +1,6 @@
 #pragma once
 
+#include <compare>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -229,17 +230,80 @@ constexpr const char* DEFAULT_PROTOCOL = "tcp";
 constexpr const char* DEFAULT_MASTER_SERVER_ADDR = "127.0.0.1:50051";
 static constexpr int DEFAULT_CLIENT_HTTP_PORT = 9300;
 
+struct ObjectIncarnation {
+    uint64_t high{0};
+    uint64_t low{0};
+
+    [[nodiscard]] bool IsZero() const { return high == 0 && low == 0; }
+    auto operator<=>(const ObjectIncarnation&) const = default;
+};
+YLT_REFL(ObjectIncarnation, high, low);
+
+struct LocalDeleteTaskId {
+    uint64_t high{0};
+    uint64_t low{0};
+
+    auto operator<=>(const LocalDeleteTaskId&) const = default;
+};
+YLT_REFL(LocalDeleteTaskId, high, low);
+
+inline constexpr uint32_t kLocalDiskCapabilityObjectTombstoneV1 = 1U << 0;
+inline constexpr uint32_t kMaxLocalDeleteTasksPerBatch = 256;
+
+struct LocalDiskMountInfo {
+    uint64_t mount_epoch{0};
+    uint32_t capabilities{0};
+};
+YLT_REFL(LocalDiskMountInfo, mount_epoch, capabilities);
+
+struct LocalDeleteTask {
+    LocalDeleteTaskId task_id;
+    std::string local_disk_segment_id;
+    std::string tenant_id;
+    std::string key;
+    ObjectIncarnation object_incarnation;
+    int64_t expected_bucket_id{-1};
+    int64_t object_bytes{0};
+    uint64_t created_at_ms{0};
+
+    bool operator==(const LocalDeleteTask&) const = default;
+};
+YLT_REFL(LocalDeleteTask, task_id, local_disk_segment_id, tenant_id, key,
+         object_incarnation, expected_bucket_id, object_bytes, created_at_ms);
+
+struct LocalDeleteRemovePayloadV1 {
+    uint32_t schema_version{1};
+    ObjectIncarnation object_incarnation;
+    std::vector<LocalDeleteTask> delete_intents;
+};
+YLT_REFL(LocalDeleteRemovePayloadV1, schema_version, object_incarnation,
+         delete_intents);
+
+struct LocalDeleteAckPayloadV1 {
+    uint32_t schema_version{1};
+    std::string local_disk_segment_id;
+    std::vector<LocalDeleteTaskId> task_ids;
+};
+YLT_REFL(LocalDeleteAckPayloadV1, schema_version, local_disk_segment_id,
+         task_ids);
+
 struct OffloadTaskItem {
     std::string tenant_id;
     std::string key;
     int64_t size;
+    struct_pack::compatible<ObjectIncarnation, 1> object_incarnation{};
+
+    [[nodiscard]] ObjectIncarnation GetObjectIncarnation() const {
+        return object_incarnation.value_or(ObjectIncarnation{});
+    }
 
     bool operator==(const OffloadTaskItem& other) const {
         return tenant_id == other.tenant_id && key == other.key &&
-               size == other.size;
+               size == other.size &&
+               GetObjectIncarnation() == other.GetObjectIncarnation();
     }
 };
-YLT_REFL(OffloadTaskItem, tenant_id, key, size);
+YLT_REFL(OffloadTaskItem, tenant_id, key, size, object_incarnation);
 
 struct PromotionTaskItem {
     std::string tenant_id;
@@ -522,8 +586,14 @@ struct StorageObjectMetadata {
     int64_t key_size;
     int64_t data_size;
     std::string transport_endpoint;
+    struct_pack::compatible<ObjectIncarnation, 1> object_incarnation{};
+
+    [[nodiscard]] ObjectIncarnation GetObjectIncarnation() const {
+        return object_incarnation.value_or(ObjectIncarnation{});
+    }
+
     YLT_REFL(StorageObjectMetadata, bucket_id, offset, key_size, data_size,
-             transport_endpoint);
+             transport_endpoint, object_incarnation);
 };
 
 }  // namespace mooncake

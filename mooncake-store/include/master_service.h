@@ -39,6 +39,7 @@
 #include "ha/snapshot/object/snapshot_object_store.h"
 #include "task_manager.h"
 #include "kv_event/kv_event_publisher.h"
+#include "local_delete.h"
 #include "ha/oplog/oplog_types.h"
 #include "ha/oplog/ordered_oplog_writer.h"
 #include "allocator.h"
@@ -678,8 +679,11 @@ class MasterService {
      * @brief Mounts a file storage segment into the master.
      * @param enable_offloading If true, enables offloading (write-to-file).
      */
-    auto MountLocalDiskSegment(const UUID& client_id, bool enable_offloading)
-        -> tl::expected<void, ErrorCode>;
+    auto MountLocalDiskSegment(
+        const UUID& client_id, bool enable_offloading,
+        const std::string& local_disk_segment_id = std::string(),
+        uint32_t capabilities = 0)
+        -> tl::expected<LocalDiskMountInfo, ErrorCode>;
 
     /**
      * @brief Heartbeat call to collect object-level statistics and retrieve the
@@ -689,6 +693,23 @@ class MasterService {
      */
     auto OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading)
         -> tl::expected<std::vector<OffloadTaskItem>, ErrorCode>;
+
+    auto FetchLocalDeleteTasks(const UUID& client_id,
+                               const std::string& local_disk_segment_id,
+                               uint64_t mount_epoch, uint32_t limit)
+        -> tl::expected<std::vector<LocalDeleteTask>, ErrorCode>;
+
+    auto AckLocalDeleteTasks(const UUID& client_id,
+                             const std::string& local_disk_segment_id,
+                             uint64_t mount_epoch,
+                             const std::vector<LocalDeleteTaskId>& task_ids)
+        -> tl::expected<void, ErrorCode>;
+
+    auto ReconcileLocalDiskObjects(const UUID& client_id,
+                                   const std::string& local_disk_segment_id,
+                                   uint64_t mount_epoch,
+                                   const std::vector<OffloadTaskItem>& objects)
+        -> tl::expected<std::vector<uint8_t>, ErrorCode>;
 
     /**
      * @brief Client polls whether master has requested a full SSD clear
@@ -823,10 +844,11 @@ class MasterService {
      * @brief Restore primary state from standby promotion context.
      * Called once at promotion time before serving requests.
      */
-    void RestoreFromStandbySnapshot(
+    tl::expected<void, ErrorCode> RestoreFromStandbySnapshot(
         const std::vector<StandbyObjectEntry>& objects,
         uint64_t initial_oplog_sequence_id,
-        const std::vector<StandbySegmentInfo>& segments);
+        const std::vector<StandbySegmentInfo>& segments,
+        const std::vector<LocalDeleteTask>& pending_local_deletes = {});
 
     /**
      * @brief Query the status of a task
@@ -944,7 +966,8 @@ class MasterService {
             bool enable_soft_pin, bool enable_hard_pin = false,
             ObjectDataType data_type_ = ObjectDataType::UNKNOWN,
             std::string group_id_ = "", TenantId tenant_id_ = TenantId(),
-            std::string user_key_ = {})
+            std::string user_key_ = {},
+            std::optional<ObjectIncarnation> object_incarnation_ = std::nullopt)
             : client_id(client_id_),
               put_start_time(put_start_time_),
               size(value_length),
@@ -952,6 +975,8 @@ class MasterService {
               group_id(std::move(group_id_)),
               tenant_id(std::move(tenant_id_)),
               user_key(std::move(user_key_)),
+              object_incarnation(
+                  object_incarnation_.value_or(GenerateObjectIncarnation())),
               lease_timeout(),
               soft_pin_timeout(std::nullopt),
               hard_pinned(enable_hard_pin),
@@ -979,6 +1004,7 @@ class MasterService {
         const std::string group_id;
         const TenantId tenant_id;
         const std::string user_key;
+        const ObjectIncarnation object_incarnation;
 
         mutable SpinLock lock;
         // Default constructor, creates a time_point representing
@@ -1524,7 +1550,16 @@ class MasterService {
         MetadataShardAccessorRW* shard);
     void FinalizeRemovedReplicasAfterDurable(
         const OpLogEntry& durable_entry,
-        const std::vector<ReplicaID>& replica_ids, QuotaEraseMode quota_mode);
+        const std::vector<ReplicaID>& replica_ids, QuotaEraseMode quota_mode,
+        std::shared_ptr<LocalDeleteRegistry::Reservation> delete_reservation =
+            nullptr);
+    tl::expected<std::shared_ptr<LocalDeleteRegistry::Reservation>, ErrorCode>
+    ReserveLocalDeleteTasks(const ObjectIdentity& object_id,
+                            const ObjectMetadata& metadata);
+    void PublishLocalDeleteReservation(
+        const std::shared_ptr<LocalDeleteRegistry::Reservation>& reservation);
+    void RefreshLocalDeleteMetrics(
+        const std::vector<std::string>& local_disk_segment_ids);
     void FinalizeMetadataEraseAfterDurable(const OpLogEntry& durable_entry,
                                            QuotaEraseMode quota_mode);
     void FinalizeExpiredProcessingReplicasAfterDurable(
@@ -1592,7 +1627,8 @@ class MasterService {
                          std::string* error_reason);
 
     tl::expected<void, ErrorCode> PushOffloadingQueue(
-        const ObjectIdentity& object_id, Replica& replica);
+        const ObjectIdentity& object_id, Replica& replica,
+        ObjectIncarnation object_incarnation);
 
     struct GracefulUnmountDeadlineRecord {
         UUID segment_id;
@@ -2188,6 +2224,7 @@ class MasterService {
     std::list<DiscardedReplicas> discarded_replicas_
         GUARDED_BY(discarded_replicas_mutex_);
     size_t offloading_queue_limit_ = 50000;
+    LocalDeleteRegistry local_delete_registry_{50000};
     double offload_cap_ratio_ = 0.5;
 
     // Task manager
@@ -2278,10 +2315,8 @@ class MasterService {
     std::string SerializeMetadataForOpLogWithoutMemReplicas(
         const ObjectMetadata& metadata) const;
     std::string SerializeMetadataForOpLogFromReplicaDescriptors(
-        const UUID& client_id, uint64_t size,
-        const std::vector<Replica::Descriptor>& replicas,
-        const std::string& group_id = "",
-        ObjectDataType data_type = ObjectDataType::UNKNOWN) const;
+        const ObjectMetadata& metadata,
+        const std::vector<Replica::Descriptor>& replicas) const;
     ErrorCode InitializeBatchOpLogWriter(std::shared_ptr<HaKvBackend> backend);
     tl::expected<uint64_t, ErrorCode> AppendOpLogVisibleBeforeDurable(
         OpType type, const std::string& tenant_id, const std::string& key,

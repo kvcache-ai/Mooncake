@@ -49,6 +49,25 @@ MasterMetricManager::MasterMetricManager()
           "Total bytes currently allocated for file storage in 3fs/nfs"),
       file_total_capacity_("master_total_file_capacity_bytes",
                            "Total capacity for file storage in 3fs/nfs"),
+      pending_local_delete_tasks_(
+          "pending_local_delete_tasks",
+          "Durable local delete tasks awaiting acknowledgement",
+          {"storage_id"}),
+      local_delete_task_age_seconds_(
+          "local_delete_task_age_seconds",
+          "Age in seconds of the oldest durable local delete task"),
+      local_delete_fetch_total_(
+          "local_delete_fetch_total",
+          "Total durable local delete tasks delivered to holders"),
+      local_delete_ack_total_(
+          "local_delete_ack_total",
+          "Total durable local delete tasks acknowledged by holders"),
+      local_delete_abandoned_total_(
+          "local_delete_abandoned_total",
+          "Total durable local delete tasks abandoned administratively"),
+      local_delete_queue_rejected_total_(
+          "local_delete_queue_rejected_total",
+          "Total local delete task reservations rejected by queue limits"),
       key_count_("master_key_count",
                  "Total number of keys managed by the master"),
       soft_pin_key_count_(
@@ -614,6 +633,11 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     file_cache_hit_bytes_.inc(0);
     valid_get_nums_.inc(0);
     total_get_nums_.inc(0);
+    local_delete_task_age_seconds_.update(0);
+    local_delete_fetch_total_.inc(0);
+    local_delete_ack_total_.inc(0);
+    local_delete_abandoned_total_.inc(0);
+    local_delete_queue_rejected_total_.inc(0);
 
     // Update Eviction Counters
     eviction_success_.inc(0);
@@ -806,6 +830,31 @@ void MasterMetricManager::set_dfs_capacity_unlimited(bool unlimited) {
 
 bool MasterMetricManager::is_dfs_capacity_unlimited() const {
     return dfs_capacity_unlimited_;
+}
+
+void MasterMetricManager::set_pending_local_delete_tasks(
+    const std::string& storage_id, int64_t count) {
+    pending_local_delete_tasks_.update({storage_id}, count);
+}
+
+void MasterMetricManager::set_local_delete_task_age_seconds(int64_t seconds) {
+    local_delete_task_age_seconds_.update(seconds);
+}
+
+void MasterMetricManager::inc_local_delete_fetch_total(int64_t val) {
+    local_delete_fetch_total_.inc(val);
+}
+
+void MasterMetricManager::inc_local_delete_ack_total(int64_t val) {
+    local_delete_ack_total_.inc(val);
+}
+
+void MasterMetricManager::inc_local_delete_abandoned_total(int64_t val) {
+    local_delete_abandoned_total_.inc(val);
+}
+
+void MasterMetricManager::inc_local_delete_queue_rejected_total(int64_t val) {
+    local_delete_queue_rejected_total_.inc(val);
 }
 
 int64_t MasterMetricManager::get_allocated_file_size() {
@@ -1798,6 +1847,12 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(nof_total_capacity_per_segment_);
     serialize_metric(file_allocated_size_);
     serialize_metric(file_total_capacity_);
+    serialize_metric(pending_local_delete_tasks_);
+    serialize_metric(local_delete_task_age_seconds_);
+    serialize_metric(local_delete_fetch_total_);
+    serialize_metric(local_delete_ack_total_);
+    serialize_metric(local_delete_abandoned_total_);
+    serialize_metric(local_delete_queue_rejected_total_);
     serialize_metric(key_count_);
     serialize_metric(soft_pin_key_count_);
     serialize_metric(active_clients_);

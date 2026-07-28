@@ -219,18 +219,25 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
     return ErrorCode::OK;
 }
 
-ErrorCode ScopedSegmentAccess::MountLocalDiskSegment(const UUID& client_id,
-                                                     bool enable_offloading) {
+ErrorCode ScopedSegmentAccess::MountLocalDiskSegment(
+    const UUID& client_id, bool enable_offloading,
+    const std::string& local_disk_segment_id, uint64_t mount_epoch,
+    uint32_t capabilities) {
     auto exist_segment_it =
         segment_manager_->client_local_disk_segment_.find(client_id);
     if (exist_segment_it !=
         segment_manager_->client_local_disk_segment_.end()) {
-        LOG(WARNING) << "client_id=" << client_id
-                     << ", warn=local_disk_segment_already_exists";
-        return ErrorCode::SEGMENT_ALREADY_EXISTS;
+        MutexLocker locker(&exist_segment_it->second->offloading_mutex_);
+        exist_segment_it->second->enable_offloading = enable_offloading;
+        exist_segment_it->second->local_disk_segment_id = local_disk_segment_id;
+        exist_segment_it->second->mount_epoch = mount_epoch;
+        exist_segment_it->second->capabilities = capabilities;
+        return ErrorCode::OK;
     }
     segment_manager_->client_local_disk_segment_.emplace(
-        client_id, std::make_shared<LocalDiskSegment>(enable_offloading));
+        client_id, std::make_shared<LocalDiskSegment>(
+                       enable_offloading, local_disk_segment_id, mount_epoch,
+                       capabilities));
     return ErrorCode::OK;
 }
 
@@ -752,21 +759,26 @@ SegmentSerializer::Serialize() {
         }
         std::sort(sorted_keys.begin(), sorted_keys.end());
 
-        // Trailing ssd_total_capacity_bytes so a restored master keeps the
-        // client-reported SSD capacity across a snapshot restore (#2783).
-        packer.pack_array(2 + sorted_keys.size() * 2 + 1);
+        // Keep legacy fields first, then append storage identity and fencing.
+        packer.pack_array(2 + sorted_keys.size() * 2 + 4);
         packer.pack(segment->enable_offloading);
         packer.pack(static_cast<uint64_t>(sorted_keys.size()));
 
         for (const auto& key : sorted_keys) {
             packer.pack(key);
             const auto& task = segment->offloading_objects.at(key);
-            packer.pack_array(3);
+            packer.pack_array(5);
             packer.pack(task.tenant_id);
             packer.pack(task.key);
             packer.pack(task.size);
+            const auto incarnation = task.GetObjectIncarnation();
+            packer.pack(incarnation.high);
+            packer.pack(incarnation.low);
         }
         packer.pack(segment->ssd_total_capacity_bytes);
+        packer.pack(segment->local_disk_segment_id);
+        packer.pack(segment->mount_epoch);
+        packer.pack(segment->capabilities);
     }
 
     // Compress entire data
@@ -1126,7 +1138,8 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
                     client_value.via.array.ptr[key_idx].via.str.size);
                 const auto& task_obj = client_value.via.array.ptr[task_idx];
                 if (task_obj.type == msgpack::type::ARRAY &&
-                    task_obj.via.array.size == 3) {
+                    (task_obj.via.array.size == 3 ||
+                     task_obj.via.array.size == 5)) {
                     if (task_obj.via.array.ptr[0].type != msgpack::type::STR ||
                         task_obj.via.array.ptr[1].type != msgpack::type::STR) {
                         return tl::unexpected(SerializationError(
@@ -1145,6 +1158,11 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
                         task_obj.via.array.ptr[0].as<std::string>();
                     task.key = task_obj.via.array.ptr[1].as<std::string>();
                     task.size = task_obj.via.array.ptr[2].as<int64_t>();
+                    if (task_obj.via.array.size == 5) {
+                        task.object_incarnation = ObjectIncarnation{
+                            task_obj.via.array.ptr[3].as<uint64_t>(),
+                            task_obj.via.array.ptr[4].as<uint64_t>()};
+                    }
                     segment->offloading_objects[key] = std::move(task);
                 } else {
                     // Backward compatibility for snapshots whose
@@ -1159,7 +1177,8 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
                     segment->offloading_objects[key] =
                         OffloadTaskItem{.tenant_id = tenant_id.value(),
                                         .key = std::move(user_key),
-                                        .size = task_obj.as<int64_t>()};
+                                        .size = task_obj.as<int64_t>(),
+                                        .object_incarnation = {}};
                 }
             }
 
@@ -1172,6 +1191,15 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
                 IsMsgpackInteger(client_value.via.array.ptr[capacity_idx])) {
                 segment->ssd_total_capacity_bytes =
                     client_value.via.array.ptr[capacity_idx].as<int64_t>();
+            }
+            if (client_value.via.array.size > capacity_idx + 3) {
+                segment->local_disk_segment_id =
+                    client_value.via.array.ptr[capacity_idx + 1]
+                        .as<std::string>();
+                segment->mount_epoch =
+                    client_value.via.array.ptr[capacity_idx + 2].as<uint64_t>();
+                segment->capabilities =
+                    client_value.via.array.ptr[capacity_idx + 3].as<uint32_t>();
             }
 
             segment_manager_->client_local_disk_segment_[client_id] =

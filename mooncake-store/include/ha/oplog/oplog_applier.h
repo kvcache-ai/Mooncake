@@ -82,7 +82,8 @@ class OpLogApplier {
      * @brief Apply REMOVE operation
      * @param entry OpLog entry
      */
-    void ApplyRemove(const OpLogEntry& entry);
+    bool ApplyRemove(const OpLogEntry& entry);
+    bool ApplyLocalDeleteAck(const OpLogEntry& entry);
 
     MetadataStore* metadata_store_;
 

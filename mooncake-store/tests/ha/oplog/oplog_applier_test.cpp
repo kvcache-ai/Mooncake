@@ -51,6 +51,18 @@ std::string MakeValidPayload(uint64_t client_id_first = 1,
     return std::string(result.begin(), result.end());
 }
 
+LocalDeleteTask MakeLocalDeleteTask(const std::string& key) {
+    return LocalDeleteTask{
+        .task_id = GenerateLocalDeleteTaskId(),
+        .local_disk_segment_id = "disk-a",
+        .tenant_id = "default",
+        .key = key,
+        .object_incarnation = {11, 12},
+        .expected_bucket_id = 7,
+        .object_bytes = 1024,
+    };
+}
+
 class OpLogApplierTest : public ::testing::Test {
    protected:
     void SetUp() override {
@@ -108,6 +120,67 @@ TEST_F(OpLogApplierTest, TestApplyRemove) {
     EXPECT_TRUE(applier_->ApplyOpLogEntry(entry2));
     EXPECT_EQ(3u, applier_->GetExpectedSequenceId());
     EXPECT_FALSE(mock_metadata_store_->Exists("key1"));
+}
+
+TEST_F(OpLogApplierTest, RemoveAndAckReplicateLocalDeleteIntent) {
+    const auto task = MakeLocalDeleteTask("key1");
+    LocalDeleteRemovePayloadV1 remove_payload{
+        .schema_version = 1,
+        .object_incarnation = task.object_incarnation,
+        .delete_intents = {task},
+    };
+    const auto remove_bytes = struct_pack::serialize(remove_payload);
+    const std::string remove_data(remove_bytes.begin(), remove_bytes.end());
+
+    ASSERT_TRUE(applier_->ApplyOpLogEntry(
+        MakeEntry(1, OpType::PUT_END, "key1", MakeValidPayload())));
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(
+        MakeEntry(2, OpType::REMOVE, "key1", remove_data)));
+    EXPECT_FALSE(mock_metadata_store_->Exists("key1"));
+    ASSERT_EQ(mock_metadata_store_->SnapshotLocalDeleteTasks().size(), 1);
+    EXPECT_EQ(mock_metadata_store_->SnapshotLocalDeleteTasks().front(), task);
+
+    LocalDeleteAckPayloadV1 ack_payload{
+        .schema_version = 1,
+        .local_disk_segment_id = task.local_disk_segment_id,
+        .task_ids = {task.task_id},
+    };
+    const auto ack_bytes = struct_pack::serialize(ack_payload);
+    const std::string ack_data(ack_bytes.begin(), ack_bytes.end());
+    EXPECT_TRUE(applier_->ApplyOpLogEntry(
+        MakeEntry(3, OpType::LOCAL_DELETE_ACK, "", ack_data)));
+    EXPECT_TRUE(mock_metadata_store_->SnapshotLocalDeleteTasks().empty());
+}
+
+TEST_F(OpLogApplierTest, InvalidDeleteIntentDoesNotAdvanceSequence) {
+    auto task = MakeLocalDeleteTask("another-key");
+    LocalDeleteRemovePayloadV1 payload{
+        .schema_version = 1,
+        .object_incarnation = task.object_incarnation,
+        .delete_intents = {task},
+    };
+    const auto bytes = struct_pack::serialize(payload);
+    const std::string data(bytes.begin(), bytes.end());
+
+    EXPECT_FALSE(
+        applier_->ApplyOpLogEntry(MakeEntry(1, OpType::REMOVE, "key1", data)));
+    EXPECT_EQ(applier_->GetExpectedSequenceId(), 1);
+    EXPECT_TRUE(mock_metadata_store_->SnapshotLocalDeleteTasks().empty());
+}
+
+TEST_F(OpLogApplierTest, UnknownLocalDeleteAckVersionDoesNotAdvanceSequence) {
+    const auto task = MakeLocalDeleteTask("key1");
+    LocalDeleteAckPayloadV1 payload{
+        .schema_version = 2,
+        .local_disk_segment_id = task.local_disk_segment_id,
+        .task_ids = {task.task_id},
+    };
+    const auto bytes = struct_pack::serialize(payload);
+    const std::string data(bytes.begin(), bytes.end());
+
+    EXPECT_FALSE(applier_->ApplyOpLogEntry(
+        MakeEntry(1, OpType::LOCAL_DELETE_ACK, "", data)));
+    EXPECT_EQ(applier_->GetExpectedSequenceId(), 1);
 }
 
 TEST_F(OpLogApplierTest, TestApplyOpLogEntry_InvalidOpType) {

@@ -9,6 +9,7 @@ set(MOONCAKE_STORE_SOURCES
     client_service.cpp
     client_metric.cpp
     types.cpp
+    local_delete.cpp
     master_client.cpp
     utils.cpp
     mmap_arena.cpp

@@ -223,6 +223,26 @@ struct RpcNameTraits<&WrappedMasterService::OffloadObjectHeartbeat> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::MountLocalDiskSegmentV2> {
+    static constexpr const char* value = "MountLocalDiskSegmentV2";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::FetchLocalDeleteTasks> {
+    static constexpr const char* value = "FetchLocalDeleteTasks";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::AckLocalDeleteTasks> {
+    static constexpr const char* value = "AckLocalDeleteTasks";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::ReconcileLocalDiskObjects> {
+    static constexpr const char* value = "ReconcileLocalDiskObjects";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::ReportSsdCapacity> {
     static constexpr const char* value = "ReportSsdCapacity";
 };
@@ -929,15 +949,26 @@ MasterClient::GetStorageConfig() {
     return result;
 }
 
-tl::expected<void, ErrorCode> MasterClient::MountLocalDiskSegment(
-    const UUID& client_id, bool enable_offloading) {
+tl::expected<LocalDiskMountInfo, ErrorCode> MasterClient::MountLocalDiskSegment(
+    const UUID& client_id, bool enable_offloading,
+    const std::string& local_disk_segment_id, uint32_t capabilities) {
     ScopedVLogTimer timer(1, "MasterClient::MountLocalDiskSegment");
     timer.LogRequest("client_id=", client_id,
                      ", enable_offloading=", enable_offloading);
 
-    auto result =
-        invoke_rpc<&WrappedMasterService::MountLocalDiskSegment, void>(
-            client_id, enable_offloading);
+    auto result = invoke_rpc<&WrappedMasterService::MountLocalDiskSegmentV2,
+                             LocalDiskMountInfo>(
+        client_id, enable_offloading, local_disk_segment_id, capabilities);
+    if (!result && result.error() == ErrorCode::RPC_FAIL) {
+        auto legacy =
+            invoke_rpc<&WrappedMasterService::MountLocalDiskSegment, void>(
+                client_id, enable_offloading);
+        if (legacy) {
+            result = LocalDiskMountInfo{};
+        } else {
+            result = tl::unexpected(legacy.error());
+        }
+    }
     timer.LogResponseExpected(result);
     return result;
 }
@@ -992,6 +1023,31 @@ MasterClient::OffloadObjectHeartbeat(const UUID& client_id,
     return result;
 }
 
+tl::expected<std::vector<LocalDeleteTask>, ErrorCode>
+MasterClient::FetchLocalDeleteTasks(const UUID& client_id,
+                                    const std::string& local_disk_segment_id,
+                                    uint64_t mount_epoch, uint32_t limit) {
+    return invoke_rpc<&WrappedMasterService::FetchLocalDeleteTasks,
+                      std::vector<LocalDeleteTask>>(
+        client_id, local_disk_segment_id, mount_epoch, limit);
+}
+
+tl::expected<void, ErrorCode> MasterClient::AckLocalDeleteTasks(
+    const UUID& client_id, const std::string& local_disk_segment_id,
+    uint64_t mount_epoch, const std::vector<LocalDeleteTaskId>& task_ids) {
+    return invoke_rpc<&WrappedMasterService::AckLocalDeleteTasks, void>(
+        client_id, local_disk_segment_id, mount_epoch, task_ids);
+}
+
+tl::expected<std::vector<uint8_t>, ErrorCode>
+MasterClient::ReconcileLocalDiskObjects(
+    const UUID& client_id, const std::string& local_disk_segment_id,
+    uint64_t mount_epoch, const std::vector<OffloadTaskItem>& objects) {
+    return invoke_rpc<&WrappedMasterService::ReconcileLocalDiskObjects,
+                      std::vector<uint8_t>>(client_id, local_disk_segment_id,
+                                            mount_epoch, objects);
+}
+
 tl::expected<bool, ErrorCode> MasterClient::PollRemoveAll() {
     ScopedVLogTimer timer(1, "MasterClient::PollRemoveAll");
     timer.LogRequest("client_id=", client_id_);
@@ -1018,8 +1074,10 @@ tl::expected<void, ErrorCode> MasterClient::NotifyOffloadSuccess(
     std::vector<OffloadTaskItem> tasks;
     tasks.reserve(keys.size());
     for (const auto& key : keys) {
-        tasks.push_back(OffloadTaskItem{
-            .tenant_id = tenant_id_.value(), .key = key, .size = 0});
+        tasks.push_back(OffloadTaskItem{.tenant_id = tenant_id_.value(),
+                                        .key = key,
+                                        .size = 0,
+                                        .object_incarnation = {}});
     }
     return NotifyOffloadSuccess(client_id, tasks, metadatas);
 }

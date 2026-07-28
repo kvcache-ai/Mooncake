@@ -1660,16 +1660,22 @@ size_t MasterService::EraseReplicasWithCacheTotalAccounting(
 
 void MasterService::FinalizeRemovedReplicasAfterDurable(
     const OpLogEntry& durable_entry, const std::vector<ReplicaID>& replica_ids,
-    QuotaEraseMode quota_mode) {
+    QuotaEraseMode quota_mode,
+    std::shared_ptr<LocalDeleteRegistry::Reservation> delete_reservation) {
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     if (replica_ids.empty()) {
+        if (delete_reservation) {
+            PublishLocalDeleteReservation(delete_reservation);
+        }
         return;
     }
-
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const TenantId tenant_id(durable_entry.tenant_id);
     const size_t shard_idx =
         getMetadataShardIndex(tenant_id, durable_entry.object_key);
     MetadataShardAccessorRW shard(this, shard_idx);
+    if (delete_reservation) {
+        PublishLocalDeleteReservation(delete_reservation);
+    }
     auto tenant_it = shard->tenants.find(tenant_id);
     if (tenant_it == shard->tenants.end()) {
         return;
@@ -1711,6 +1717,89 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
             shard->tenants.erase(tenant_it);
         }
     }
+}
+
+tl::expected<std::shared_ptr<LocalDeleteRegistry::Reservation>, ErrorCode>
+MasterService::ReserveLocalDeleteTasks(const ObjectIdentity& object_id,
+                                       const ObjectMetadata& metadata) {
+    if (enable_ha_ && !enable_oplog_) {
+        return local_delete_registry_.Reserve({});
+    }
+    std::vector<LocalDeleteTask> tasks;
+    std::unordered_set<std::string> seen_storage_ids;
+    const auto created_at_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    metadata.VisitReplicas(
+        [](const Replica& replica) {
+            return replica.is_local_disk_replica() && replica.is_completed();
+        },
+        [&](const Replica& replica) {
+            const auto descriptor = replica.get_descriptor();
+            const auto* local_disk = std::get_if<LocalDiskDescriptor>(
+                &descriptor.descriptor_variant);
+            if (local_disk == nullptr ||
+                local_disk->GetLocalDiskSegmentId().empty() ||
+                (local_disk->GetCapabilities() &
+                 kLocalDiskCapabilityObjectTombstoneV1) == 0 ||
+                local_disk->GetObjectIncarnation() !=
+                    metadata.object_incarnation ||
+                !seen_storage_ids.insert(local_disk->GetLocalDiskSegmentId())
+                     .second) {
+                return;
+            }
+            tasks.push_back(LocalDeleteTask{
+                .task_id = GenerateLocalDeleteTaskId(),
+                .local_disk_segment_id = local_disk->GetLocalDiskSegmentId(),
+                .tenant_id = object_id.tenant_id.value(),
+                .key = object_id.user_key,
+                .object_incarnation = metadata.object_incarnation,
+                .expected_bucket_id = local_disk->GetBucketId(),
+                .object_bytes = static_cast<int64_t>(local_disk->object_size),
+                .created_at_ms = created_at_ms,
+            });
+        });
+    if (tasks.size() > kMaxLocalDeleteTasksPerBatch) {
+        MasterMetricManager::instance().inc_local_delete_queue_rejected_total();
+        return tl::unexpected(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED);
+    }
+    auto reservation = local_delete_registry_.Reserve(std::move(tasks));
+    if (!reservation &&
+        reservation.error() == ErrorCode::TASK_PENDING_LIMIT_EXCEEDED) {
+        MasterMetricManager::instance().inc_local_delete_queue_rejected_total();
+    }
+    return reservation;
+}
+
+void MasterService::PublishLocalDeleteReservation(
+    const std::shared_ptr<LocalDeleteRegistry::Reservation>& reservation) {
+    std::vector<std::string> storage_ids;
+    storage_ids.reserve(reservation->tasks().size());
+    for (const auto& task : reservation->tasks()) {
+        if (std::find(storage_ids.begin(), storage_ids.end(),
+                      task.local_disk_segment_id) == storage_ids.end()) {
+            storage_ids.push_back(task.local_disk_segment_id);
+        }
+    }
+    reservation->Publish();
+    RefreshLocalDeleteMetrics(storage_ids);
+}
+
+void MasterService::RefreshLocalDeleteMetrics(
+    const std::vector<std::string>& local_disk_segment_ids) {
+    auto& metrics = MasterMetricManager::instance();
+    for (const auto& storage_id : local_disk_segment_ids) {
+        metrics.set_pending_local_delete_tasks(
+            storage_id,
+            static_cast<int64_t>(local_delete_registry_.Size(storage_id)));
+    }
+    const auto now_ms = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+    metrics.set_local_delete_task_age_seconds(static_cast<int64_t>(
+        local_delete_registry_.OldestTaskAgeSeconds(now_ms)));
 }
 
 void MasterService::FinalizeMetadataEraseAfterDurable(
@@ -1836,11 +1925,9 @@ tl::expected<void, ErrorCode> MasterService::PersistStaleHandleCleanupForHA(
     const auto op_type =
         plan.would_invalidate ? OpType::REMOVE : OpType::PUT_END;
     const std::string payload =
-        plan.would_invalidate
-            ? std::string{}
-            : SerializeMetadataForOpLogFromReplicaDescriptors(
-                  metadata.client_id, metadata.size, plan.remaining,
-                  metadata.group_id, metadata.data_type);
+        plan.would_invalidate ? std::string{}
+                              : SerializeMetadataForOpLogFromReplicaDescriptors(
+                                    metadata, plan.remaining);
 
     auto reservation = ReserveBatchOpLogSlot();
     if (!reservation) {
@@ -2503,12 +2590,27 @@ auto MasterService::QuerySegmentStatusById(const UUID& segment_id)
     return status;
 }
 
-void MasterService::RestoreFromStandbySnapshot(
+tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
     const std::vector<StandbyObjectEntry>& objects,
     uint64_t initial_oplog_sequence_id,
-    const std::vector<StandbySegmentInfo>& segments) {
+    const std::vector<StandbySegmentInfo>& segments,
+    const std::vector<LocalDeleteTask>& pending_local_deletes) {
     // The ordered writer initializes its sequence from durable_prefix.
     (void)initial_oplog_sequence_id;
+    if (!local_delete_registry_.Restore(pending_local_deletes)) {
+        LOG(ERROR) << "Standby snapshot contains too many pending LOCAL_DISK "
+                      "delete tasks";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    std::vector<std::string> restored_storage_ids;
+    for (const auto& task : pending_local_deletes) {
+        if (std::find(restored_storage_ids.begin(), restored_storage_ids.end(),
+                      task.local_disk_segment_id) ==
+            restored_storage_ids.end()) {
+            restored_storage_ids.push_back(task.local_disk_segment_id);
+        }
+    }
+    RefreshLocalDeleteMetrics(restored_storage_ids);
 
     // 2. Build allocator keepalive map for standby segments.
     for (const auto& [segment, bytes] : standby_accounted_memory_bytes_) {
@@ -2570,6 +2672,8 @@ void MasterService::RestoreFromStandbySnapshot(
             const auto& entry = *entry_ptr;
             auto [tenant_id, user_key] = resolve_standby_object(entry);
             const auto& standby_meta = entry.metadata;
+            ObjectIncarnation restored_incarnation =
+                standby_meta.GetObjectIncarnation();
             std::vector<Replica> replicas;
             replicas.reserve(standby_meta.replicas.size());
 
@@ -2615,19 +2719,29 @@ void MasterService::RestoreFromStandbySnapshot(
                 } else if (desc.is_local_disk_replica()) {
                     const auto& local_disk_desc =
                         desc.get_local_disk_descriptor();
+                    if (restored_incarnation.IsZero()) {
+                        restored_incarnation =
+                            local_disk_desc.GetObjectIncarnation();
+                    }
                     replicas.emplace_back(
                         local_disk_desc.client_id, local_disk_desc.object_size,
-                        local_disk_desc.transport_endpoint, desc.status);
+                        local_disk_desc.transport_endpoint, desc.status,
+                        local_disk_desc.GetLocalDiskSegmentId(),
+                        local_disk_desc.GetMountEpoch(),
+                        local_disk_desc.GetCapabilities(),
+                        local_disk_desc.GetBucketId(),
+                        local_disk_desc.GetObjectIncarnation());
                 }
             }
 
             auto& tenant_state = shard->tenants[tenant_id];
             tenant_state.metadata.emplace(
                 std::piecewise_construct, std::forward_as_tuple(user_key),
-                std::forward_as_tuple(
-                    standby_meta.client_id, now, standby_meta.size,
-                    std::move(replicas), false, false, standby_meta.data_type,
-                    standby_meta.group_id, tenant_id, user_key));
+                std::forward_as_tuple(standby_meta.client_id, now,
+                                      standby_meta.size, std::move(replicas),
+                                      false, false, standby_meta.data_type,
+                                      standby_meta.group_id, tenant_id,
+                                      user_key, restored_incarnation));
             if (!standby_meta.group_id.empty()) {
                 RegisterGroupMember(tenant_state, tenant_id, user_key,
                                     standby_meta.group_id);
@@ -2641,6 +2755,7 @@ void MasterService::RestoreFromStandbySnapshot(
               << segments.size()
               << " segments, initial_seq_id=" << initial_oplog_sequence_id
               << ", invalid_endpoints=" << invalid_replica_endpoints_.size();
+    return {};
 }
 
 auto MasterService::QueryIp(const UUID& client_id)
@@ -2874,8 +2989,7 @@ auto MasterService::BatchReplicaClear(
                             std::move(reservation.value()), OpType::PUT_END,
                             normalized_tenant.value(), key,
                             SerializeMetadataForOpLogFromReplicaDescriptors(
-                                metadata.client_id, metadata.size, remaining,
-                                metadata.group_id, metadata.data_type),
+                                metadata, remaining),
                             [this, removed_ids = std::move(removed_ids)](
                                 const OpLogEntry& durable_entry) {
                                 FinalizeRemovedReplicasAfterDurable(
@@ -3830,8 +3944,10 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
             [](const Replica& replica) {
                 return replica.is_completed() && replica.is_memory_replica();
             },
-            [this, &object_id, &tenant_state, &task_created](Replica& replica) {
-                auto result = PushOffloadingQueue(object_id, replica);
+            [this, &object_id, &tenant_state, &task_created,
+             &metadata](Replica& replica) {
+                auto result = PushOffloadingQueue(object_id, replica,
+                                                  metadata.object_incarnation);
                 if (result) {
                     if (!task_created) {
                         replica.inc_refcnt();
@@ -3890,21 +4006,39 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const ObjectIdentity object_id{std::move(normalized_tenant), key};
     MetadataAccessorRW accessor(this, object_id);
-    if (!accessor.Exists()) {
-        accessor.Create(
-            client_id,
-            replica.get_descriptor().get_local_disk_descriptor().object_size,
-            std::vector<Replica>{}, false);
-    }
-    auto& metadata = accessor.Get();
     if (replica.type() != ReplicaType::LOCAL_DISK) {
         LOG(ERROR) << "Invalid replica type: " << replica.type()
                    << ". Expected ReplicaType::LOCAL_DISK.";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+    const auto incoming = replica.get_descriptor().get_local_disk_descriptor();
+    if (!accessor.Exists()) {
+        if ((incoming.GetCapabilities() &
+             kLocalDiskCapabilityObjectTombstoneV1) != 0) {
+            return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        }
+        accessor.Create(client_id, incoming.object_size, std::vector<Replica>{},
+                        false);
+    }
+    auto& metadata = accessor.Get();
+    if ((incoming.GetCapabilities() & kLocalDiskCapabilityObjectTombstoneV1) !=
+            0 &&
+        incoming.GetObjectIncarnation() != metadata.object_incarnation) {
+        return tl::make_unexpected(ErrorCode::INVALID_VERSION);
+    }
 
     const bool replacing_existing =
-        metadata.HasReplica(&Replica::fn_is_local_disk_replica);
+        metadata.HasReplica([&](const Replica& existing) {
+            if (!existing.is_local_disk_replica()) {
+                return false;
+            }
+            const auto descriptor =
+                existing.get_descriptor().get_local_disk_descriptor();
+            return !incoming.GetLocalDiskSegmentId().empty()
+                       ? descriptor.GetLocalDiskSegmentId() ==
+                             incoming.GetLocalDiskSegmentId()
+                       : descriptor.client_id == client_id;
+        });
 
     if (enable_oplog_ && ordered_oplog_writer_) {
         std::vector<Replica::Descriptor> post;
@@ -3912,9 +4046,14 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
             if (existing.status() != ReplicaStatus::COMPLETE) continue;
             if (replacing_existing &&
                 existing.type() == ReplicaType::LOCAL_DISK &&
-                existing.get_descriptor()
-                        .get_local_disk_descriptor()
-                        .client_id == client_id) {
+                (!incoming.GetLocalDiskSegmentId().empty()
+                     ? existing.get_descriptor()
+                               .get_local_disk_descriptor()
+                               .GetLocalDiskSegmentId() ==
+                           incoming.GetLocalDiskSegmentId()
+                     : existing.get_descriptor()
+                               .get_local_disk_descriptor()
+                               .client_id == client_id)) {
                 // Substitute with the updated descriptor.
                 Replica::Descriptor updated = existing.get_descriptor();
                 updated.get_local_disk_descriptor().transport_endpoint =
@@ -3925,6 +4064,10 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
                     replica.get_descriptor()
                         .get_local_disk_descriptor()
                         .object_size;
+                updated.get_local_disk_descriptor().SetDeleteMetadata(
+                    incoming.GetLocalDiskSegmentId(), incoming.GetMountEpoch(),
+                    incoming.GetCapabilities(), incoming.GetBucketId(),
+                    incoming.GetObjectIncarnation());
                 post.push_back(std::move(updated));
             } else {
                 post.push_back(existing.get_descriptor());
@@ -3937,9 +4080,7 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
 
         auto persist_result = AppendOpLogVisibleBeforeDurable(
             OpType::PUT_END, object_id.tenant_id.value(), key,
-            SerializeMetadataForOpLogFromReplicaDescriptors(
-                metadata.client_id, metadata.size, post, metadata.group_id,
-                metadata.data_type));
+            SerializeMetadataForOpLogFromReplicaDescriptors(metadata, post));
         if (!persist_result) {
             return tl::make_unexpected(persist_result.error());
         }
@@ -3956,21 +4097,25 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
     }
 
     metadata.VisitReplicas(
-        [client_id](const Replica& rep) {
-            return rep.type() == ReplicaType::LOCAL_DISK &&
-                   rep.get_descriptor().get_local_disk_descriptor().client_id ==
-                       client_id;
+        [&incoming, client_id](const Replica& rep) {
+            if (!rep.is_local_disk_replica()) {
+                return false;
+            }
+            const auto descriptor =
+                rep.get_descriptor().get_local_disk_descriptor();
+            return !incoming.GetLocalDiskSegmentId().empty()
+                       ? descriptor.GetLocalDiskSegmentId() ==
+                             incoming.GetLocalDiskSegmentId()
+                       : descriptor.client_id == client_id;
         },
         [&replica](Replica& rep) {
-            rep.get_descriptor()
-                .get_local_disk_descriptor()
-                .transport_endpoint = replica.get_descriptor()
-                                          .get_local_disk_descriptor()
-                                          .transport_endpoint;
-            rep.get_descriptor().get_local_disk_descriptor().object_size =
-                replica.get_descriptor()
-                    .get_local_disk_descriptor()
-                    .object_size;
+            const auto descriptor =
+                replica.get_descriptor().get_local_disk_descriptor();
+            rep.update_local_disk_location(
+                descriptor.object_size, descriptor.transport_endpoint,
+                descriptor.GetLocalDiskSegmentId(), descriptor.GetMountEpoch(),
+                descriptor.GetCapabilities(), descriptor.GetBucketId(),
+                descriptor.GetObjectIncarnation());
         });
     return false;
 }
@@ -4042,9 +4187,8 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
             persist_result = AppendReservedOpLogWithDurableFinalize(
                 std::move(reservation.value()), OpType::PUT_END,
                 tenant_id.value(), key,
-                SerializeMetadataForOpLogFromReplicaDescriptors(
-                    metadata.client_id, metadata.size, remaining,
-                    metadata.group_id, metadata.data_type),
+                SerializeMetadataForOpLogFromReplicaDescriptors(metadata,
+                                                                remaining),
                 [this, removed_ids = std::move(removed_ids)](
                     const OpLogEntry& durable_entry) {
                     FinalizeRemovedReplicasAfterDurable(
@@ -4601,9 +4745,8 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
                 persist_result = AppendReservedOpLogWithDurableFinalize(
                     std::move(reservation.value()), OpType::PUT_END,
                     metadata.tenant_id.value(), key,
-                    SerializeMetadataForOpLogFromReplicaDescriptors(
-                        metadata.client_id, metadata.size, remaining,
-                        metadata.group_id, metadata.data_type),
+                    SerializeMetadataForOpLogFromReplicaDescriptors(metadata,
+                                                                    remaining),
                     [this, removed_ids = std::move(removed_ids)](
                         const OpLogEntry& durable_entry) {
                         FinalizeRemovedReplicasAfterDurable(
@@ -4623,9 +4766,8 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
         } else {
             persist_result = AppendOpLogWithDurableFinalize(
                 OpType::PUT_END, metadata.tenant_id.value(), key,
-                SerializeMetadataForOpLogFromReplicaDescriptors(
-                    metadata.client_id, metadata.size, remaining,
-                    metadata.group_id, metadata.data_type),
+                SerializeMetadataForOpLogFromReplicaDescriptors(metadata,
+                                                                remaining),
                 nullptr);
         }
         if (!persist_result) {
@@ -4898,9 +5040,8 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
                                [&post](const Replica& replica) {
                                    post.push_back(replica.get_descriptor());
                                });
-        auto payload = SerializeMetadataForOpLogFromReplicaDescriptors(
-            metadata.client_id, metadata.size, post, metadata.group_id,
-            metadata.data_type);
+        auto payload =
+            SerializeMetadataForOpLogFromReplicaDescriptors(metadata, post);
         if (batch_reservation) {
             auto persist_result = AppendReservedOpLogWithDurableFinalize(
                 std::move(*batch_reservation), OpType::PUT_END,
@@ -5228,9 +5369,7 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
             persist_result = AppendReservedOpLogWithDurableFinalize(
                 std::move(reservation.value()), OpType::PUT_END,
                 metadata.tenant_id.value(), key,
-                SerializeMetadataForOpLogFromReplicaDescriptors(
-                    metadata.client_id, metadata.size, post, metadata.group_id,
-                    metadata.data_type),
+                SerializeMetadataForOpLogFromReplicaDescriptors(metadata, post),
                 [this, removed_ids = std::vector<ReplicaID>{source_id}](
                     const OpLogEntry& durable_entry) {
                     FinalizeRemovedReplicasAfterDurable(
@@ -5239,9 +5378,7 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
         } else {
             persist_result = AppendOpLogWithDurableFinalize(
                 OpType::PUT_END, metadata.tenant_id.value(), key,
-                SerializeMetadataForOpLogFromReplicaDescriptors(
-                    metadata.client_id, metadata.size, post, metadata.group_id,
-                    metadata.data_type),
+                SerializeMetadataForOpLogFromReplicaDescriptors(metadata, post),
                 nullptr);
         }
         if (!persist_result) {
@@ -5369,6 +5506,19 @@ auto MasterService::Remove(const std::string& key, const TenantId& tenant_id,
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
     }
 
+    auto delete_reservation = ReserveLocalDeleteTasks(object_id, metadata);
+    if (!delete_reservation) {
+        return tl::unexpected(delete_reservation.error());
+    }
+    const auto remove_payload_bytes =
+        struct_pack::serialize(LocalDeleteRemovePayloadV1{
+            .schema_version = 1,
+            .object_incarnation = metadata.object_incarnation,
+            .delete_intents = delete_reservation.value()->tasks(),
+        });
+    const std::string remove_payload(remove_payload_bytes.begin(),
+                                     remove_payload_bytes.end());
+
     if (enable_ha_) {
         if (enable_oplog_) {
             auto reservation = ReserveBatchOpLogSlot();
@@ -5383,18 +5533,26 @@ auto MasterService::Remove(const std::string& key, const TenantId& tenant_id,
                                    });
             auto persist_result = AppendReservedOpLogWithDurableFinalize(
                 std::move(reservation.value()), OpType::REMOVE,
-                object_id.tenant_id.value(), key, {},
-                [this, removed_ids = std::move(removed_ids)](
+                object_id.tenant_id.value(), key, remove_payload,
+                [this, removed_ids,
+                 delete_reservation = delete_reservation.value()](
                     const OpLogEntry& durable_entry) {
                     FinalizeRemovedReplicasAfterDurable(
-                        durable_entry, removed_ids, QuotaEraseMode::kFull);
+                        durable_entry, removed_ids, QuotaEraseMode::kFull,
+                        std::move(delete_reservation));
                 });
             if (!persist_result) {
+                for (const auto replica_id : removed_ids) {
+                    if (auto* replica = metadata.GetReplicaByID(replica_id)) {
+                        replica->restore_removed();
+                    }
+                }
                 return tl::make_unexpected(persist_result.error());
             }
             return {};
         }
     }
+    PublishLocalDeleteReservation(delete_reservation.value());
     PublishKvRemoved(key, metadata, object_id.tenant_id);
     accessor.Erase();
     return {};
@@ -5815,6 +5973,23 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                 continue;
             }
 
+            const auto object_id = MakeObjectIdentity(key, normalized_tenant);
+            auto delete_reservation =
+                ReserveLocalDeleteTasks(object_id, metadata);
+            if (!delete_reservation) {
+                results[original_idx] =
+                    tl::unexpected(delete_reservation.error());
+                continue;
+            }
+            const auto remove_payload_bytes =
+                struct_pack::serialize(LocalDeleteRemovePayloadV1{
+                    .schema_version = 1,
+                    .object_incarnation = metadata.object_incarnation,
+                    .delete_intents = delete_reservation.value()->tasks(),
+                });
+            const std::string remove_payload(remove_payload_bytes.begin(),
+                                             remove_payload_bytes.end());
+
             // Remove object metadata
             if (enable_ha_) {
                 if (enable_oplog_) {
@@ -5834,14 +6009,22 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                     auto persist_result =
                         AppendReservedOpLogWithDurableFinalize(
                             std::move(reservation.value()), OpType::REMOVE,
-                            normalized_tenant.value(), key, {},
-                            [this, removed_ids = std::move(removed_ids)](
+                            normalized_tenant.value(), key, remove_payload,
+                            [this, removed_ids,
+                             delete_reservation = delete_reservation.value()](
                                 const OpLogEntry& durable_entry) {
                                 FinalizeRemovedReplicasAfterDurable(
                                     durable_entry, removed_ids,
-                                    QuotaEraseMode::kFull);
+                                    QuotaEraseMode::kFull,
+                                    std::move(delete_reservation));
                             });
                     if (!persist_result) {
+                        for (const auto replica_id : removed_ids) {
+                            if (auto* replica =
+                                    metadata.GetReplicaByID(replica_id)) {
+                                replica->restore_removed();
+                            }
+                        }
                         results[original_idx] =
                             tl::make_unexpected(persist_result.error());
                         continue;
@@ -5850,6 +6033,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                     continue;
                 }
             }
+            PublishLocalDeleteReservation(delete_reservation.value());
             EraseMetadata(tenant_state, it, normalized_tenant,
                           QuotaEraseMode::kFull, &shard);
             if (tenant_state.Empty()) {
@@ -5950,21 +6134,33 @@ MasterService::GetStorageConfig() const {
     return GetStorageConfigResponse(fsdir, enable_disk_eviction_, quota_bytes_);
 }
 
-auto MasterService::MountLocalDiskSegment(const UUID& client_id,
-                                          bool enable_offloading)
-    -> tl::expected<void, ErrorCode> {
+auto MasterService::MountLocalDiskSegment(
+    const UUID& client_id, bool enable_offloading,
+    const std::string& local_disk_segment_id, uint32_t capabilities)
+    -> tl::expected<LocalDiskMountInfo, ErrorCode> {
     if (!enable_offload_) {
         LOG(ERROR) << "	The offload functionality is not enabled";
         return tl::make_unexpected(ErrorCode::UNABLE_OFFLOAD);
     }
+    const bool durable_delete_ack_supported = !enable_ha_ || enable_oplog_;
+    const uint32_t negotiated_capabilities =
+        local_disk_segment_id.empty() || !durable_delete_ack_supported
+            ? 0
+            : capabilities & kLocalDiskCapabilityObjectTombstoneV1;
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-
-    auto err =
-        segment_access.MountLocalDiskSegment(client_id, enable_offloading);
+    const auto mount_info = local_delete_registry_.Mount(
+        client_id, local_disk_segment_id, negotiated_capabilities);
+    auto err = ErrorCode::OK;
+    {
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
+        err = segment_access.MountLocalDiskSegment(
+            client_id, enable_offloading, local_disk_segment_id,
+            mount_info.mount_epoch, mount_info.capabilities);
+    }
     if (err == ErrorCode::SEGMENT_ALREADY_EXISTS) {
         // Return OK because this is an idempotent operation
-        return {};
+        return mount_info;
     } else if (err != ErrorCode::OK) {
         return tl::make_unexpected(err);
     }
@@ -5982,36 +6178,56 @@ auto MasterService::MountLocalDiskSegment(const UUID& client_id,
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
-    return {};
+    return mount_info;
 }
 
 auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
                                            bool enable_offloading)
     -> tl::expected<std::vector<OffloadTaskItem>, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    ScopedLocalDiskSegmentAccess local_disk_segment_access =
-        segment_manager_.getLocalDiskSegmentAccess();
-    auto& client_local_disk_segment =
-        local_disk_segment_access.getClientLocalDiskSegment();
-    auto local_disk_segment_it = client_local_disk_segment.find(client_id);
-    if (local_disk_segment_it == client_local_disk_segment.end()) {
-        LOG(ERROR) << "Local disk segment not found with client id = "
-                   << client_id;
+    std::shared_ptr<LocalDiskSegment> local_disk_segment;
+    {
+        ScopedLocalDiskSegmentAccess local_disk_segment_access =
+            segment_manager_.getLocalDiskSegmentAccess();
+        auto& client_local_disk_segment =
+            local_disk_segment_access.getClientLocalDiskSegment();
+        auto local_disk_segment_it = client_local_disk_segment.find(client_id);
+        if (local_disk_segment_it == client_local_disk_segment.end()) {
+            LOG(ERROR) << "Local disk segment not found with client id = "
+                       << client_id;
+            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        }
+        local_disk_segment = local_disk_segment_it->second;
+    }
+
+    std::string local_disk_segment_id;
+    uint64_t mount_epoch = 0;
+    uint32_t capabilities = 0;
+    {
+        MutexLocker locker(&local_disk_segment->offloading_mutex_);
+        local_disk_segment_id = local_disk_segment->local_disk_segment_id;
+        mount_epoch = local_disk_segment->mount_epoch;
+        capabilities = local_disk_segment->capabilities;
+    }
+    if ((capabilities & kLocalDiskCapabilityObjectTombstoneV1) != 0 &&
+        !local_delete_registry_
+             .ValidateMount(client_id, local_disk_segment_id, mount_epoch)
+             .has_value()) {
         return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
     }
+
     std::vector<OffloadTaskItem> result;
     std::unordered_map<std::string, OffloadTaskItem> offloading_objects_copy;
     {
-        MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
-        local_disk_segment_it->second->enable_offloading = enable_offloading;
+        MutexLocker locker(&local_disk_segment->offloading_mutex_);
+        local_disk_segment->enable_offloading = enable_offloading;
         if (enable_offloading) {
-            result.reserve(
-                local_disk_segment_it->second->offloading_objects.size());
+            result.reserve(local_disk_segment->offloading_objects.size());
             for (const auto& [_, task] :
-                 local_disk_segment_it->second->offloading_objects) {
+                 local_disk_segment->offloading_objects) {
                 result.push_back(task);
             }
-            local_disk_segment_it->second->offloading_objects.clear();
+            local_disk_segment->offloading_objects.clear();
             return result;
         }
         // Offloading is disabled: clear the pending queue to prevent
@@ -6024,7 +6240,7 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
         // must release offloading_mutex_ before taking shard locks via
         // MetadataAccessorRW.
         offloading_objects_copy =
-            std::move(local_disk_segment_it->second->offloading_objects);
+            std::move(local_disk_segment->offloading_objects);
     }
 
     for (auto& [_, task] : offloading_objects_copy) {
@@ -6046,6 +6262,97 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
         }
     }
     return result;
+}
+
+auto MasterService::FetchLocalDeleteTasks(
+    const UUID& client_id, const std::string& local_disk_segment_id,
+    uint64_t mount_epoch, uint32_t limit)
+    -> tl::expected<std::vector<LocalDeleteTask>, ErrorCode> {
+    auto tasks = local_delete_registry_.Fetch(
+        client_id, local_disk_segment_id, mount_epoch,
+        std::min(limit, kMaxLocalDeleteTasksPerBatch));
+    if (tasks) {
+        MasterMetricManager::instance().inc_local_delete_fetch_total(
+            static_cast<int64_t>(tasks->size()));
+        RefreshLocalDeleteMetrics({local_disk_segment_id});
+    }
+    return tasks;
+}
+
+auto MasterService::AckLocalDeleteTasks(
+    const UUID& client_id, const std::string& local_disk_segment_id,
+    uint64_t mount_epoch, const std::vector<LocalDeleteTaskId>& task_ids)
+    -> tl::expected<void, ErrorCode> {
+    auto validation = local_delete_registry_.ValidateMount(
+        client_id, local_disk_segment_id, mount_epoch);
+    if (!validation) {
+        return validation;
+    }
+    if (task_ids.empty()) {
+        return {};
+    }
+    if (task_ids.size() > kMaxLocalDeleteTasksPerBatch) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    if (enable_ha_ && enable_oplog_) {
+        LocalDeleteAckPayloadV1 payload{
+            .schema_version = 1,
+            .local_disk_segment_id = local_disk_segment_id,
+            .task_ids = task_ids,
+        };
+        const auto payload_bytes = struct_pack::serialize(payload);
+        auto append = AppendOpLogWithDurableFinalize(
+            OpType::LOCAL_DELETE_ACK, TenantId::Default().value(),
+            local_disk_segment_id,
+            std::string(payload_bytes.begin(), payload_bytes.end()),
+            [this, local_disk_segment_id, task_ids](const OpLogEntry&) {
+                std::shared_lock<std::shared_mutex> snapshot_lock(
+                    snapshot_mutex_);
+                const auto erased = local_delete_registry_.Erase(
+                    local_disk_segment_id, task_ids);
+                MasterMetricManager::instance().inc_local_delete_ack_total(
+                    static_cast<int64_t>(erased));
+                RefreshLocalDeleteMetrics({local_disk_segment_id});
+            });
+        if (!append) {
+            return tl::unexpected(append.error());
+        }
+        return {};
+    }
+
+    const auto erased =
+        local_delete_registry_.Erase(local_disk_segment_id, task_ids);
+    MasterMetricManager::instance().inc_local_delete_ack_total(
+        static_cast<int64_t>(erased));
+    RefreshLocalDeleteMetrics({local_disk_segment_id});
+    return {};
+}
+
+auto MasterService::ReconcileLocalDiskObjects(
+    const UUID& client_id, const std::string& local_disk_segment_id,
+    uint64_t mount_epoch, const std::vector<OffloadTaskItem>& objects)
+    -> tl::expected<std::vector<uint8_t>, ErrorCode> {
+    auto validation = local_delete_registry_.ValidateMount(
+        client_id, local_disk_segment_id, mount_epoch);
+    if (!validation) {
+        return tl::unexpected(validation.error());
+    }
+
+    std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+    std::vector<uint8_t> keep(objects.size(), 0);
+    for (size_t i = 0; i < objects.size(); ++i) {
+        const auto& object = objects[i];
+        const auto object_id =
+            MakeObjectIdentity(object.key, TenantId(object.tenant_id));
+        MetadataAccessorRO accessor(this, object_id);
+        if (!accessor.Exists() || accessor.Get().object_incarnation !=
+                                      object.GetObjectIncarnation()) {
+            continue;
+        }
+        keep[i] = 1;
+    }
+    return keep;
 }
 
 auto MasterService::PollRemoveAll(const UUID& client_id)
@@ -6111,6 +6418,9 @@ auto MasterService::NotifyOffloadSuccess(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     std::shared_ptr<LocalDiskSegment> local_disk_segment;
+    std::string local_disk_segment_id;
+    uint64_t mount_epoch = 0;
+    uint32_t capabilities = 0;
     {
         ScopedLocalDiskSegmentAccess ssd_access =
             segment_manager_.getLocalDiskSegmentAccess();
@@ -6118,6 +6428,17 @@ auto MasterService::NotifyOffloadSuccess(
         auto disk_it = client_segments.find(client_id);
         if (disk_it != client_segments.end()) {
             local_disk_segment = disk_it->second;
+            MutexLocker locker(&local_disk_segment->offloading_mutex_);
+            local_disk_segment_id = local_disk_segment->local_disk_segment_id;
+            mount_epoch = local_disk_segment->mount_epoch;
+            capabilities = local_disk_segment->capabilities;
+        }
+    }
+    if ((capabilities & kLocalDiskCapabilityObjectTombstoneV1) != 0) {
+        auto mount_validation = local_delete_registry_.ValidateMount(
+            client_id, local_disk_segment_id, mount_epoch);
+        if (!mount_validation) {
+            return tl::unexpected(mount_validation.error());
         }
     }
 
@@ -6152,7 +6473,9 @@ auto MasterService::NotifyOffloadSuccess(
         }
 
         Replica replica(client_id, metadata.data_size,
-                        metadata.transport_endpoint, ReplicaStatus::COMPLETE);
+                        metadata.transport_endpoint, ReplicaStatus::COMPLETE,
+                        local_disk_segment_id, mount_epoch, capabilities,
+                        metadata.bucket_id, task.GetObjectIncarnation());
         bool handled_existing_object = false;
         bool added_new_local_disk_replica = false;
         {
@@ -6161,6 +6484,12 @@ auto MasterService::NotifyOffloadSuccess(
             if (accessor.Exists()) {
                 auto& obj_metadata = accessor.Get();
                 auto& tenant_state = accessor.GetTenantState();
+                if ((capabilities & kLocalDiskCapabilityObjectTombstoneV1) !=
+                        0 &&
+                    task.GetObjectIncarnation() !=
+                        obj_metadata.object_incarnation) {
+                    return tl::make_unexpected(ErrorCode::INVALID_VERSION);
+                }
                 auto task_it = tenant_state.offloading_tasks.find(
                     request_object_id.user_key);
                 if (task_it != tenant_state.offloading_tasks.end() &&
@@ -6199,18 +6528,17 @@ auto MasterService::NotifyOffloadSuccess(
                                                .client_id == client_id;
                             },
                             [&replica](Replica& rep) {
-                                rep.get_descriptor()
-                                    .get_local_disk_descriptor()
-                                    .transport_endpoint =
+                                const auto descriptor =
                                     replica.get_descriptor()
-                                        .get_local_disk_descriptor()
-                                        .transport_endpoint;
-                                rep.get_descriptor()
-                                    .get_local_disk_descriptor()
-                                    .object_size =
-                                    replica.get_descriptor()
-                                        .get_local_disk_descriptor()
-                                        .object_size;
+                                        .get_local_disk_descriptor();
+                                rep.update_local_disk_location(
+                                    descriptor.object_size,
+                                    descriptor.transport_endpoint,
+                                    descriptor.GetLocalDiskSegmentId(),
+                                    descriptor.GetMountEpoch(),
+                                    descriptor.GetCapabilities(),
+                                    descriptor.GetBucketId(),
+                                    descriptor.GetObjectIncarnation());
                             });
                     }
                     handled_existing_object = true;
@@ -6253,7 +6581,8 @@ auto MasterService::NotifyOffloadSuccess(
 }
 
 tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
-    const ObjectIdentity& object_id, Replica& replica) {
+    const ObjectIdentity& object_id, Replica& replica,
+    ObjectIncarnation object_incarnation) {
     const auto& segment_names = replica.get_segment_names();
     if (segment_names.empty()) {
         return {};
@@ -6292,7 +6621,8 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
             object_id.tenant_id.MakeScopedKey(object_id.user_key),
             OffloadTaskItem{.tenant_id = object_id.tenant_id.value(),
                             .key = object_id.user_key,
-                            .size = size});
+                            .size = size,
+                            .object_incarnation = object_incarnation});
         if (!res.second) {
             return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
         }
@@ -6973,9 +7303,7 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
                                    });
 
             const auto payload =
-                SerializeMetadataForOpLogFromReplicaDescriptors(
-                    metadata.client_id, metadata.size, post, metadata.group_id,
-                    metadata.data_type);
+                SerializeMetadataForOpLogFromReplicaDescriptors(metadata, post);
             if (batch_reservation) {
                 auto persist_result = AppendReservedOpLogWithDurableFinalize(
                     std::move(*batch_reservation), OpType::PUT_END,
@@ -7249,10 +7577,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
                     } else {
                         persist_result = AppendOpLogWithDurableFinalize(
                             OpType::PUT_END, tenant_it->first.value(), *key_it,
-                            SerializeMetadataForOpLogFromReplicaDescriptors(
-                                metadata.client_id, metadata.size,
-                                post_descriptors, metadata.group_id,
-                                metadata.data_type),
+                            SerializeMetadataForOpLogFromReplicaDescriptors(metadata, post_descriptors),
                             enable_oplog_
                                 ? [this, ttl](const OpLogEntry& durable_entry) {
                                       FinalizeExpiredProcessingReplicasAfterDurable(
@@ -7351,9 +7676,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
                     persist_result = AppendOpLogWithDurableFinalize(
                         OpType::PUT_END, tenant_it->first.value(),
                         task_it->first,
-                        SerializeMetadataForOpLogFromReplicaDescriptors(
-                            metadata.client_id, metadata.size, post_descriptors,
-                            metadata.group_id, metadata.data_type),
+                        SerializeMetadataForOpLogFromReplicaDescriptors(metadata, post_descriptors),
                         enable_oplog_
                             ? [this, source_id,
                                target_ids = std::move(target_ids),
@@ -7799,13 +8122,14 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
             bool queued = false;
             metadata.VisitReplicas(
                 is_evictable_memory_replica,
-                [this, &key, &normalized_tenant, &tenant_state, &queued,
-                 &now](Replica& replica) {
+                [this, &key, &normalized_tenant, &tenant_state, &queued, &now,
+                 &metadata](Replica& replica) {
                     if (queued) {
                         return;
                     }
                     auto result = PushOffloadingQueue(
-                        MakeObjectIdentity(key, normalized_tenant), replica);
+                        MakeObjectIdentity(key, normalized_tenant), replica,
+                        metadata.object_incarnation);
                     if (result) {
                         replica.inc_refcnt();
                         tenant_state.offloading_tasks.emplace(
@@ -8056,11 +8380,12 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 return r.is_memory_replica() && r.is_completed() &&
                        r.get_refcnt() == 0;
             },
-            [this, &tenant_id, &key, &tenant_state, &queued,
-             &now](Replica& replica) {
+            [this, &tenant_id, &key, &tenant_state, &queued, &now,
+             &metadata](Replica& replica) {
                 if (queued) return;  // only need to pin one replica for offload
-                auto result = PushOffloadingQueue(
-                    MakeObjectIdentity(key, tenant_id), replica);
+                auto result =
+                    PushOffloadingQueue(MakeObjectIdentity(key, tenant_id),
+                                        replica, metadata.object_incarnation);
                 if (result) {
                     replica.inc_refcnt();
                     tenant_state.offloading_tasks.emplace(
@@ -8139,9 +8464,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 persist_result = AppendReservedOpLogWithDurableFinalize(
                     std::move(reservation.value()), OpType::PUT_END,
                     tenant_id.value(), key,
-                    SerializeMetadataForOpLogFromReplicaDescriptors(
-                        metadata.client_id, metadata.size, remaining,
-                        metadata.group_id, metadata.data_type),
+                    SerializeMetadataForOpLogFromReplicaDescriptors(metadata,
+                                                                    remaining),
                     [this, removed_ids = std::move(removed_ids)](
                         const OpLogEntry& durable_entry) {
                         FinalizeRemovedReplicasAfterDurable(
@@ -8165,9 +8489,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
         } else {
             persist_result = AppendOpLogWithDurableFinalize(
                 OpType::PUT_END, tenant_id.value(), key,
-                SerializeMetadataForOpLogFromReplicaDescriptors(
-                    metadata.client_id, metadata.size, remaining,
-                    metadata.group_id, metadata.data_type),
+                SerializeMetadataForOpLogFromReplicaDescriptors(metadata,
+                                                                remaining),
                 nullptr);
         }
         if (!persist_result) {
@@ -8902,9 +9225,7 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                                 std::move(reservation.value()), OpType::PUT_END,
                                 tenant_it->first.value(), it->first,
                                 SerializeMetadataForOpLogFromReplicaDescriptors(
-                                    metadata.client_id, metadata.size,
-                                    remaining, metadata.group_id,
-                                    metadata.data_type),
+                                    metadata, remaining),
                                 [this, removed_ids = std::move(removed_ids)](
                                     const OpLogEntry& durable_entry) {
                                     FinalizeRemovedReplicasAfterDurable(
@@ -8938,8 +9259,7 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                             OpType::PUT_END, tenant_it->first.value(),
                             it->first,
                             SerializeMetadataForOpLogFromReplicaDescriptors(
-                                metadata.client_id, metadata.size, remaining,
-                                metadata.group_id, metadata.data_type),
+                                metadata, remaining),
                             nullptr);
                     }
                     if (!persist_result) {
@@ -9108,9 +9428,13 @@ void MasterService::ClientMonitorFunc() {
                     segment_access.UnmountLocalDiskSegment(client_id);
                 }
             }
+            for (const auto& client_id : expired_clients) {
+                local_delete_registry_.Unmount(client_id);
+            }
             RecomputeTenantEffectiveQuotas();
         }
 
+        RefreshLocalDeleteMetrics({});
         std::this_thread::sleep_for(
             std::chrono::milliseconds(kClientMonitorSleepMs));
     }
@@ -9357,9 +9681,9 @@ MasterService::MetadataSerializer::Serialize() {
     msgpack::sbuffer sbuf;
     msgpack::packer<msgpack::sbuffer> packer(&sbuf);
 
-    // Create top-level map with 3 fields: "shards", "discarded_replicas",
-    // "replica_next_id"
-    packer.pack_map(3);
+    // Local delete intents are snapshot state: metadata removal may already be
+    // visible while the holder still needs to persist its tombstone.
+    packer.pack_map(4);
 
     // 1. Serialize metadata shards
     packer.pack("shards");
@@ -9440,6 +9764,13 @@ MasterService::MetadataSerializer::Serialize() {
     packer.pack("replica_next_id");
     packer.pack(static_cast<uint64_t>(Replica::next_id_.load()));
 
+    packer.pack("pending_local_deletes");
+    const auto pending_local_deletes =
+        struct_pack::serialize(service_->local_delete_registry_.Snapshot());
+    packer.pack_bin(pending_local_deletes.size());
+    packer.pack_bin_body(pending_local_deletes.data(),
+                         pending_local_deletes.size());
+
     return std::vector<uint8_t>(
         reinterpret_cast<const uint8_t*>(sbuf.data()),
         reinterpret_cast<const uint8_t*>(sbuf.data()) + sbuf.size());
@@ -9473,6 +9804,7 @@ MasterService::MetadataSerializer::Deserialize(
     const msgpack::object* shards_obj = nullptr;
     const msgpack::object* discarded_replicas_obj = nullptr;
     const msgpack::object* replica_next_id_obj = nullptr;
+    const msgpack::object* pending_local_deletes_obj = nullptr;
 
     // Extract fields from top-level map
     for (uint32_t i = 0; i < obj.via.map.size; ++i) {
@@ -9485,6 +9817,8 @@ MasterService::MetadataSerializer::Deserialize(
                 discarded_replicas_obj = &obj.via.map.ptr[i].val;
             } else if (key == "replica_next_id") {
                 replica_next_id_obj = &obj.via.map.ptr[i].val;
+            } else if (key == "pending_local_deletes") {
+                pending_local_deletes_obj = &obj.via.map.ptr[i].val;
             }
         }
     }
@@ -9566,6 +9900,34 @@ MasterService::MetadataSerializer::Deserialize(
     auto next_id = replica_next_id_obj->as<uint64_t>();
     Replica::next_id_.store(next_id);
     LOG(INFO) << "Restored Replica::next_id_ to " << next_id;
+
+    service_->local_delete_registry_.Reset();
+    std::vector<std::string> restored_storage_ids;
+    if (pending_local_deletes_obj != nullptr) {
+        if (pending_local_deletes_obj->type != msgpack::type::BIN) {
+            return tl::make_unexpected(SerializationError(
+                ErrorCode::DESERIALIZE_FAIL,
+                "Invalid pending_local_deletes snapshot field"));
+        }
+        std::vector<LocalDeleteTask> tasks;
+        const std::string_view bytes(pending_local_deletes_obj->via.bin.ptr,
+                                     pending_local_deletes_obj->via.bin.size);
+        if (struct_pack::deserialize_to(tasks, bytes) !=
+                struct_pack::errc::ok ||
+            !service_->local_delete_registry_.Restore(tasks)) {
+            return tl::make_unexpected(SerializationError(
+                ErrorCode::DESERIALIZE_FAIL,
+                "Failed to restore pending LOCAL_DISK delete tasks"));
+        }
+        for (const auto& task : tasks) {
+            if (std::find(
+                    restored_storage_ids.begin(), restored_storage_ids.end(),
+                    task.local_disk_segment_id) == restored_storage_ids.end()) {
+                restored_storage_ids.push_back(task.local_disk_segment_id);
+            }
+        }
+    }
+    service_->RefreshLocalDeleteMetrics(restored_storage_ids);
     service_->RebuildGroupRoutingIndex();
     service_->ClearCandidatesForReload();
     return {};
@@ -9585,6 +9947,7 @@ void MasterService::MetadataSerializer::Reset() {
         std::lock_guard lock(service_->discarded_replicas_mutex_);
         service_->discarded_replicas_.clear();
     }
+    service_->local_delete_registry_.Reset();
     Replica::next_id_.store(1);
     service_->ClearCandidatesForReload();
 }
@@ -9717,7 +10080,8 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
                 metadata_ptr->size, metadata_ptr->PopReplicas(),
                 metadata_ptr->soft_pin_timeout.has_value(),
                 metadata_ptr->IsHardPinned(), metadata_ptr->data_type,
-                metadata_ptr->group_id, tenant_id, user_key));
+                metadata_ptr->group_id, tenant_id, user_key,
+                metadata_ptr->object_incarnation));
 
         it->second.lease_timeout = metadata_ptr->lease_timeout;
         it->second.soft_pin_timeout = metadata_ptr->soft_pin_timeout;
@@ -9741,11 +10105,13 @@ MasterService::MetadataSerializer::SerializeMetadata(
     // Pack ObjectMetadata using array structure for efficiency
     // Format: [client_id, put_start_time, size, lease_timeout,
     // has_soft_pin_timeout, soft_pin_timeout, replicas_count, data_type,
-    // replicas..., hard_pinned, group_id, object_checksum?]
+    // replicas..., hard_pinned, group_id, object_checksum?,
+    // incarnation_high, incarnation_low]
 
-    size_t array_size = 10;  // client_id, put_start_time, size, lease_timeout,
+    size_t array_size = 12;  // client_id, put_start_time, size, lease_timeout,
                              // has_soft_pin_timeout, soft_pin_timeout,
-                             // replicas_count, data_type, hard_pinned, group_id
+                             // replicas_count, data_type, hard_pinned,
+                             // group_id, incarnation high/low
     array_size += metadata.CountReplicas();  // One element per replica
     if (metadata.object_checksum.has_value()) {
         ++array_size;
@@ -9805,6 +10171,8 @@ MasterService::MetadataSerializer::SerializeMetadata(
     if (metadata.object_checksum.has_value()) {
         packer.pack(*metadata.object_checksum);
     }
+    packer.pack(metadata.object_incarnation.high);
+    packer.pack(metadata.object_incarnation.low);
 
     return {};
 }
@@ -9864,11 +10232,13 @@ MasterService::MetadataSerializer::DeserializeMetadata(
     //   v3: 9 + replicas_count, data_type + hard_pinned or hard_pinned +
     //   group_id v4: 10 + replicas_count, data_type + hard_pinned + group_id
     //   v5: 11 + replicas_count, v4 + object_checksum
+    //   v6: v4 + object incarnation high/low, with an optional
+    //       object_checksum before the incarnation fields
     // 64-bit arithmetic keeps an attacker-controlled near-UINT32_MAX
     // replicas_count from wrapping the bounds and slipping an out-of-bounds
     // index past the size check.
     constexpr uint64_t kBaseFieldCount = 7;
-    constexpr uint64_t kMaxOptionalFieldCount = 4;
+    constexpr uint64_t kMaxOptionalFieldCount = 6;
     const uint64_t total_elements = obj.via.array.size;
     const uint64_t min_elements = kBaseFieldCount + replicas_count;
     if (total_elements < min_elements ||
@@ -9919,14 +10289,32 @@ MasterService::MetadataSerializer::DeserializeMetadata(
     }
 
     std::optional<uint64_t> object_checksum;
-    if (index < total_elements &&
-        array[index].type == msgpack::type::POSITIVE_INTEGER) {
+    uint64_t trailing_fields = total_elements - index;
+    if (trailing_fields == 1 || trailing_fields == 3) {
+        if (array[index].type != msgpack::type::POSITIVE_INTEGER) {
+            return tl::unexpected(SerializationError(
+                ErrorCode::DESERIALIZE_FAIL,
+                "deserialize ObjectMetadata checksum type mismatch"));
+        }
         object_checksum = array[index++].as<uint64_t>();
+        --trailing_fields;
+    }
+
+    ObjectIncarnation object_incarnation;
+    if (trailing_fields == 2) {
+        if (array[index].type != msgpack::type::POSITIVE_INTEGER ||
+            array[index + 1].type != msgpack::type::POSITIVE_INTEGER) {
+            return tl::unexpected(SerializationError(
+                ErrorCode::DESERIALIZE_FAIL,
+                "deserialize ObjectMetadata incarnation type mismatch"));
+        }
+        object_incarnation.high = array[index++].as<uint64_t>();
+        object_incarnation.low = array[index++].as<uint64_t>();
     }
     if (index != total_elements) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
-            "deserialize ObjectMetadata optional field type mismatch"));
+            "deserialize ObjectMetadata optional field count mismatch"));
     }
 
     // Create ObjectMetadata instance
@@ -9936,7 +10324,7 @@ MasterService::MetadataSerializer::DeserializeMetadata(
         std::chrono::system_clock::time_point(
             std::chrono::milliseconds(put_start_time_timestamp)),
         size, std::move(replicas), enable_soft_pin, is_hard_pinned, data_type,
-        group_id);
+        group_id, TenantId(), std::string(), object_incarnation);
     metadata->object_checksum = object_checksum;
     metadata->lease_timeout = std::chrono::system_clock::time_point(
         std::chrono::milliseconds(lease_timestamp));
@@ -10939,6 +11327,7 @@ std::string MasterService::SerializeMetadataForOpLog(
     payload.size = metadata.size;
     payload.group_id = metadata.group_id;
     payload.data_type = metadata.data_type;
+    payload.object_incarnation = metadata.object_incarnation;
 
     // Extract replica descriptors - get them all at once
     const auto& replicas = metadata.GetAllReplicas();
@@ -10964,6 +11353,7 @@ std::string MasterService::SerializeMetadataForOpLogWithoutMemReplicas(
     payload.size = metadata.size;
     payload.group_id = metadata.group_id;
     payload.data_type = metadata.data_type;
+    payload.object_incarnation = metadata.object_incarnation;
 
     const auto& replicas = metadata.GetAllReplicas();
     payload.replicas.reserve(replicas.size());
@@ -10979,15 +11369,15 @@ std::string MasterService::SerializeMetadataForOpLogWithoutMemReplicas(
 }
 
 std::string MasterService::SerializeMetadataForOpLogFromReplicaDescriptors(
-    const UUID& client_id, uint64_t size,
-    const std::vector<Replica::Descriptor>& replicas,
-    const std::string& group_id, ObjectDataType data_type) const {
+    const ObjectMetadata& metadata,
+    const std::vector<Replica::Descriptor>& replicas) const {
     MetadataPayload payload;
-    payload.client_id = client_id;
-    payload.size = size;
+    payload.client_id = metadata.client_id;
+    payload.size = metadata.size;
     payload.replicas = replicas;
-    payload.group_id = group_id;
-    payload.data_type = data_type;
+    payload.group_id = metadata.group_id;
+    payload.data_type = metadata.data_type;
+    payload.object_incarnation = metadata.object_incarnation;
     auto result = struct_pack::serialize(payload);
     return std::string(result.begin(), result.end());
 }

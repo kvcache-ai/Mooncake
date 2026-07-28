@@ -1479,7 +1479,21 @@ tl::expected<void, ErrorCode> WrappedMasterService::MountLocalDiskSegment(
               << ", enable offloading is: " << enable_offloading;
     auto result =
         master_service_.MountLocalDiskSegment(client_id, enable_offloading);
+    timer.LogResponseExpected(result);
+    if (!result) {
+        return tl::unexpected(result.error());
+    }
+    return {};
+}
 
+tl::expected<LocalDiskMountInfo, ErrorCode>
+WrappedMasterService::MountLocalDiskSegmentV2(
+    const UUID& client_id, bool enable_offloading,
+    const std::string& local_disk_segment_id, uint32_t capabilities) {
+    ScopedVLogTimer timer(1, "MountLocalDiskSegmentV2");
+    timer.LogRequest("action=mount_local_disk_segment_v2");
+    auto result = master_service_.MountLocalDiskSegment(
+        client_id, enable_offloading, local_disk_segment_id, capabilities);
     timer.LogResponseExpected(result);
     return result;
 }
@@ -1492,6 +1506,29 @@ WrappedMasterService::OffloadObjectHeartbeat(const UUID& client_id,
     auto result =
         master_service_.OffloadObjectHeartbeat(client_id, enable_offloading);
     return result;
+}
+
+tl::expected<std::vector<LocalDeleteTask>, ErrorCode>
+WrappedMasterService::FetchLocalDeleteTasks(
+    const UUID& client_id, const std::string& local_disk_segment_id,
+    uint64_t mount_epoch, uint32_t limit) {
+    return master_service_.FetchLocalDeleteTasks(
+        client_id, local_disk_segment_id, mount_epoch, limit);
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::AckLocalDeleteTasks(
+    const UUID& client_id, const std::string& local_disk_segment_id,
+    uint64_t mount_epoch, const std::vector<LocalDeleteTaskId>& task_ids) {
+    return master_service_.AckLocalDeleteTasks(client_id, local_disk_segment_id,
+                                               mount_epoch, task_ids);
+}
+
+tl::expected<std::vector<uint8_t>, ErrorCode>
+WrappedMasterService::ReconcileLocalDiskObjects(
+    const UUID& client_id, const std::string& local_disk_segment_id,
+    uint64_t mount_epoch, const std::vector<OffloadTaskItem>& objects) {
+    return master_service_.ReconcileLocalDiskObjects(
+        client_id, local_disk_segment_id, mount_epoch, objects);
 }
 
 tl::expected<bool, ErrorCode> WrappedMasterService::PollRemoveAll(
@@ -1626,12 +1663,13 @@ KvEventPublisher::Stats WrappedMasterService::GetKvEventStats() const {
     return master_service_.GetKvEventStats();
 }
 
-void WrappedMasterService::RestoreFromStandby(
+tl::expected<void, ErrorCode> WrappedMasterService::RestoreFromStandby(
     const std::vector<StandbyObjectEntry>& objects,
     uint64_t initial_oplog_sequence_id,
-    const std::vector<StandbySegmentInfo>& segments) {
-    master_service_.RestoreFromStandbySnapshot(
-        objects, initial_oplog_sequence_id, segments);
+    const std::vector<StandbySegmentInfo>& segments,
+    const std::vector<LocalDeleteTask>& pending_local_deletes) {
+    return master_service_.RestoreFromStandbySnapshot(
+        objects, initial_oplog_sequence_id, segments, pending_local_deletes);
 }
 
 void RegisterRpcService(
@@ -1723,7 +1761,19 @@ void RegisterRpcService(
         &mooncake::WrappedMasterService::MountLocalDiskSegment>(
         &wrapped_master_service);
     server.register_handler<
+        &mooncake::WrappedMasterService::MountLocalDiskSegmentV2>(
+        &wrapped_master_service);
+    server.register_handler<
         &mooncake::WrappedMasterService::OffloadObjectHeartbeat>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::FetchLocalDeleteTasks>(
+        &wrapped_master_service);
+    server
+        .register_handler<&mooncake::WrappedMasterService::AckLocalDeleteTasks>(
+            &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::ReconcileLocalDiskObjects>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::ReportSsdCapacity>(
         &wrapped_master_service);

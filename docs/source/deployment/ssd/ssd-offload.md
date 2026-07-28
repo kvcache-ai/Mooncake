@@ -85,6 +85,19 @@ store.setup_dummy(
 
 > **Note:** When using `bucket_storage_backend` or `file_per_key_storage_backend`, the real client scans existing SSD metadata on startup and reports it to the master automatically. `offset_allocator_storage_backend` is the exception: it truncates its data file during initialization and does not recover previously offloaded objects after a restart.
 
+### Upgrading an existing bucket storage directory
+
+`bucket_storage_backend` stores its stable identity in
+`.mooncake_local_disk_segment_id` and takes an advisory lock on the storage
+directory. Preserve the identity marker when moving or copying the bucket
+files, and do not mount the same directory from two real-client processes.
+
+A populated directory created by an older release has no identity marker and
+is rejected by default. After verifying that the directory belongs to this
+client, adopt it once with
+`MC_STORE_ADOPT_UNMARKED_LOCAL_DISK=1`. Unset the variable after the first
+successful start; subsequent starts reuse the synchronized marker.
+
 ---
 
 ## Real Client Parameters

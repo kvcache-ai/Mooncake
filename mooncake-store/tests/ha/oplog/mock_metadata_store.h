@@ -5,6 +5,7 @@
 #include <optional>
 #include <string>
 
+#include "local_delete.h"
 #include "metadata_store.h"
 #include "types.h"
 
@@ -97,8 +98,26 @@ class MockMetadataStore : public MetadataStore {
         return total;
     }
 
+    bool ApplyLocalDeleteTasks(
+        const std::vector<LocalDeleteTask>& tasks) override {
+        return local_delete_registry_.ApplyDurableTasks(tasks);
+    }
+
+    void AckLocalDeleteTasks(
+        const std::string& local_disk_segment_id,
+        const std::vector<LocalDeleteTaskId>& task_ids) override {
+        local_delete_registry_.Erase(local_disk_segment_id, task_ids);
+    }
+
+    std::vector<LocalDeleteTask> SnapshotLocalDeleteTasks() const override {
+        return local_delete_registry_.Snapshot();
+    }
+
     // Test helper methods
-    void Clear() { metadata_map_.clear(); }
+    void Clear() {
+        metadata_map_.clear();
+        local_delete_registry_.Reset();
+    }
 
     size_t Size() const { return GetKeyCount(); }
 
@@ -109,6 +128,7 @@ class MockMetadataStore : public MetadataStore {
    private:
     std::map<std::string, std::map<std::string, StandbyObjectMetadata>>
         metadata_map_;
+    LocalDeleteRegistry local_delete_registry_;
 };
 
 }  // namespace mooncake::test

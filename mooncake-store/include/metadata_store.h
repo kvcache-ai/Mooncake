@@ -26,6 +26,7 @@ inline std::string NormalizeTenantId(std::string_view tenant_id) {
 struct StandbyObjectMetadata {
     UUID client_id{0, 0};
     uint64_t size{0};
+    struct_pack::compatible<ObjectIncarnation, 1> object_incarnation{};
     std::vector<Replica::Descriptor> replicas;
     // NOTE: Lease information is NOT stored because:
     // 1. Standby does not perform eviction, so lease info is not used
@@ -38,6 +39,10 @@ struct StandbyObjectMetadata {
         ObjectDataType::UNKNOWN};  // Data type classification
 
     StandbyObjectMetadata() = default;
+
+    [[nodiscard]] ObjectIncarnation GetObjectIncarnation() const {
+        return object_incarnation.value_or(ObjectIncarnation{});
+    }
 
     // Check if this metadata has valid replicas
     bool HasReplicas() const { return !replicas.empty(); }
@@ -81,8 +86,15 @@ struct StandbySnapshot {
     uint64_t oplog_sequence_id{0};
     std::vector<StandbySegmentInfo> segments;
     std::vector<StandbyObjectEntry> objects;
+    struct_pack::compatible<std::vector<LocalDeleteTask>, 1>
+        pending_local_deletes{};
 
-    YLT_REFL(StandbySnapshot, oplog_sequence_id, segments, objects);
+    [[nodiscard]] std::vector<LocalDeleteTask> GetPendingLocalDeletes() const {
+        return pending_local_deletes.value_or(std::vector<LocalDeleteTask>{});
+    }
+
+    YLT_REFL(StandbySnapshot, oplog_sequence_id, segments, objects,
+             pending_local_deletes);
 };
 
 /**
@@ -97,14 +109,18 @@ struct MetadataPayload {
     std::vector<Replica::Descriptor> replicas;
     struct_pack::compatible<std::string, 1> group_id;      // Tenant group
     struct_pack::compatible<ObjectDataType, 1> data_type;  // Data type
+    struct_pack::compatible<ObjectIncarnation, 2> object_incarnation{};
 
-    YLT_REFL(MetadataPayload, client_id, size, replicas, group_id, data_type);
+    YLT_REFL(MetadataPayload, client_id, size, replicas, group_id, data_type,
+             object_incarnation);
 
     // Convert to StandbyObjectMetadata
     StandbyObjectMetadata ToStandbyMetadata(uint64_t sequence_id) const {
         StandbyObjectMetadata meta;
         meta.client_id = client_id;
         meta.size = size;
+        meta.object_incarnation =
+            object_incarnation.value_or(ObjectIncarnation{});
         meta.replicas = replicas;
         meta.last_sequence_id = sequence_id;
         meta.group_id = group_id.value_or("");
@@ -161,6 +177,26 @@ class MetadataStore {
     virtual bool Exists(const std::string& tenant_id,
                         const std::string& key) const = 0;
     virtual size_t GetKeyCountForTenant(const std::string& tenant_id) const = 0;
+
+    virtual bool ApplyLocalDeleteTasks(
+        const std::vector<LocalDeleteTask>& tasks) {
+        return true;
+    }
+    virtual bool ApplyRemoveWithLocalDeleteTasks(
+        const std::string& tenant_id, const std::string& key,
+        const std::vector<LocalDeleteTask>& tasks) {
+        if (!ApplyLocalDeleteTasks(tasks)) {
+            return false;
+        }
+        Remove(tenant_id, key);
+        return true;
+    }
+    virtual void AckLocalDeleteTasks(
+        const std::string& local_disk_segment_id,
+        const std::vector<LocalDeleteTaskId>& task_ids) {}
+    virtual std::vector<LocalDeleteTask> SnapshotLocalDeleteTasks() const {
+        return {};
+    }
 
     // DEPRECATED: key-only overloads delegate to tenant-aware with "default"
     virtual bool PutMetadata(const std::string& key,

@@ -259,6 +259,21 @@ class SnapshotChildProcessTest : public ::testing::Test {
         return false;
     }
 
+    void SeedLocalDeleteTask() {
+        LocalDeleteTask task{
+            .task_id = GenerateLocalDeleteTaskId(),
+            .local_disk_segment_id = "legacy-snapshot-disk",
+            .tenant_id = TenantId::Default().value(),
+            .key = "legacy-snapshot-key",
+            .object_incarnation = GenerateObjectIncarnation(),
+        };
+        ASSERT_TRUE(service_->local_delete_registry_.ApplyDurableTasks({task}));
+    }
+
+    size_t LocalDeleteTaskCount() const {
+        return service_->local_delete_registry_.Size();
+    }
+
     std::string FindGroupIdOnDifferentShard(MasterService* svc,
                                             const std::string& key) {
         const size_t key_shard = svc->getShardIndex(key);
@@ -692,6 +707,8 @@ TEST_F(SnapshotChildProcessTest, RestorePreservesObjectChecksum) {
 TEST_F(SnapshotChildProcessTest,
        DeserializeLegacyMetadataWithoutGroupIdRestoresUngroupedObject) {
     CreateDefaultService();
+    SeedLocalDeleteTask();
+    ASSERT_EQ(LocalDeleteTaskCount(), 1);
     const std::string key = "legacy_snapshot_no_group_id_key";
     const uint32_t shard_idx = GetShardIndexForTest(key);
     const UUID client_id = generate_uuid();
@@ -740,6 +757,9 @@ TEST_F(SnapshotChildProcessTest,
         << deserialize_result.error().message;
 
     EXPECT_FALSE(ObjectIsGroupedInMetadata(key, shard_idx));
+    EXPECT_EQ(LocalDeleteTaskCount(), 0)
+        << "A legacy snapshot without pending_local_deletes must restore an "
+           "empty registry";
 }
 
 TEST_F(SnapshotChildProcessTest, DeserializeMetadataSkipsInvalidClientId) {

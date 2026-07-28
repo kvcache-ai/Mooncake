@@ -117,6 +117,15 @@ class MasterMetricManager {
     void set_dfs_capacity_unlimited(bool unlimited);
     bool is_dfs_capacity_unlimited() const;
 
+    // Durable local-disk delete protocol metrics
+    void set_pending_local_delete_tasks(const std::string& storage_id,
+                                        int64_t count);
+    void set_local_delete_task_age_seconds(int64_t seconds);
+    void inc_local_delete_fetch_total(int64_t val = 1);
+    void inc_local_delete_ack_total(int64_t val = 1);
+    void inc_local_delete_abandoned_total(int64_t val = 1);
+    void inc_local_delete_queue_rejected_total(int64_t val = 1);
+
     // Key/Value Metrics
     void inc_key_count(int64_t val = 1);
     void dec_key_count(int64_t val = 1);
@@ -558,6 +567,12 @@ class MasterMetricManager {
     ylt::metric::gauge_t file_allocated_size_;
     ylt::metric::gauge_t file_total_capacity_;
     std::atomic<bool> dfs_capacity_unlimited_{false};
+    ylt::metric::dynamic_gauge_1t pending_local_delete_tasks_;
+    ylt::metric::gauge_t local_delete_task_age_seconds_;
+    ylt::metric::counter_t local_delete_fetch_total_;
+    ylt::metric::counter_t local_delete_ack_total_;
+    ylt::metric::counter_t local_delete_abandoned_total_;
+    ylt::metric::counter_t local_delete_queue_rejected_total_;
 
     // Key/Value Metrics
     ylt::metric::gauge_t key_count_;

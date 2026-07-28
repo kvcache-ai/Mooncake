@@ -181,6 +181,11 @@ struct LocalDiskReplicaData {
     UUID client_id;
     uint64_t object_size = 0;
     std::string transport_endpoint;
+    std::string local_disk_segment_id;
+    uint64_t mount_epoch{0};
+    uint32_t capabilities{0};
+    int64_t bucket_id{-1};
+    ObjectIncarnation object_incarnation;
 };
 
 struct MemoryDescriptor {
@@ -203,7 +208,46 @@ struct LocalDiskDescriptor {
     UUID client_id;
     uint64_t object_size = 0;
     std::string transport_endpoint;
-    YLT_REFL(LocalDiskDescriptor, client_id, object_size, transport_endpoint);
+    struct DeleteMetadataV1 {
+        std::string local_disk_segment_id;
+        uint64_t mount_epoch{0};
+        uint32_t capabilities{0};
+        int64_t bucket_id{-1};
+        ObjectIncarnation object_incarnation;
+
+        YLT_REFL(DeleteMetadataV1, local_disk_segment_id, mount_epoch,
+                 capabilities, bucket_id, object_incarnation);
+    };
+    struct_pack::compatible<DeleteMetadataV1, 1> delete_metadata{};
+
+    [[nodiscard]] const std::string& GetLocalDiskSegmentId() const {
+        static const std::string empty;
+        return delete_metadata ? delete_metadata->local_disk_segment_id : empty;
+    }
+    [[nodiscard]] uint64_t GetMountEpoch() const {
+        return delete_metadata ? delete_metadata->mount_epoch : 0;
+    }
+    [[nodiscard]] uint32_t GetCapabilities() const {
+        return delete_metadata ? delete_metadata->capabilities : 0;
+    }
+    [[nodiscard]] int64_t GetBucketId() const {
+        return delete_metadata ? delete_metadata->bucket_id : -1;
+    }
+    [[nodiscard]] ObjectIncarnation GetObjectIncarnation() const {
+        return delete_metadata ? delete_metadata->object_incarnation
+                               : ObjectIncarnation{};
+    }
+    void SetDeleteMetadata(std::string local_disk_segment_id,
+                           uint64_t mount_epoch, uint32_t capabilities,
+                           int64_t bucket_id,
+                           ObjectIncarnation object_incarnation) {
+        delete_metadata =
+            DeleteMetadataV1{std::move(local_disk_segment_id), mount_epoch,
+                             capabilities, bucket_id, object_incarnation};
+    }
+
+    YLT_REFL(LocalDiskDescriptor, client_id, object_size, transport_endpoint,
+             delete_metadata);
 };
 
 class Replica {
@@ -242,10 +286,15 @@ class Replica {
 
     // local disk replica constructor
     Replica(UUID client_id, uint64_t object_size,
-            std::string transport_endpoint, ReplicaStatus status)
+            std::string transport_endpoint, ReplicaStatus status,
+            std::string local_disk_segment_id = {}, uint64_t mount_epoch = 0,
+            uint32_t capabilities = 0, int64_t bucket_id = -1,
+            ObjectIncarnation object_incarnation = {})
         : id_(next_id_.fetch_add(1)),
-          data_(LocalDiskReplicaData{client_id, object_size,
-                                     std::move(transport_endpoint)}),
+          data_(LocalDiskReplicaData{
+              client_id, object_size, std::move(transport_endpoint),
+              std::move(local_disk_segment_id), mount_epoch, capabilities,
+              bucket_id, object_incarnation}),
           status_(status),
           refcnt_(0) {
         MasterMetricManager::instance().inc_allocated_file_size(object_size);
@@ -422,6 +471,25 @@ class Replica {
         return std::nullopt;
     }
 
+    void update_local_disk_location(uint64_t object_size,
+                                    std::string transport_endpoint,
+                                    std::string local_disk_segment_id,
+                                    uint64_t mount_epoch, uint32_t capabilities,
+                                    int64_t bucket_id,
+                                    ObjectIncarnation object_incarnation) {
+        if (!is_local_disk_replica()) {
+            return;
+        }
+        auto& data = std::get<LocalDiskReplicaData>(data_);
+        data.object_size = object_size;
+        data.transport_endpoint = std::move(transport_endpoint);
+        data.local_disk_segment_id = std::move(local_disk_segment_id);
+        data.mount_epoch = mount_epoch;
+        data.capabilities = capabilities;
+        data.bucket_id = bucket_id;
+        data.object_incarnation = object_incarnation;
+    }
+
     [[nodiscard]] size_t get_memory_buffer_size() const {
         if (is_memory_replica()) {
             const auto& mem_data = std::get<MemoryReplicaData>(data_);
@@ -461,6 +529,12 @@ class Replica {
             LOG(WARNING) << "Replica already marked as removed";
         } else {
             LOG(ERROR) << "Cannot mark_removed from status: " << status_;
+        }
+    }
+
+    void restore_removed() {
+        if (status_ == ReplicaStatus::REMOVED) {
+            status_ = ReplicaStatus::COMPLETE;
         }
     }
 
@@ -646,6 +720,10 @@ inline Replica::Descriptor Replica::get_descriptor() const {
         local_disk_desc.client_id = disk_data.client_id;
         local_disk_desc.object_size = disk_data.object_size;
         local_disk_desc.transport_endpoint = disk_data.transport_endpoint;
+        local_disk_desc.SetDeleteMetadata(
+            disk_data.local_disk_segment_id, disk_data.mount_epoch,
+            disk_data.capabilities, disk_data.bucket_id,
+            disk_data.object_incarnation);
         desc.descriptor_variant = std::move(local_disk_desc);
     }
 

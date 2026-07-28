@@ -1,6 +1,13 @@
 #include "file_storage.h"
 
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+
+#include <cerrno>
 #include <cmath>
+#include <cstring>
+#include <fstream>
 #include <locale>
 #include <memory>
 #include <optional>
@@ -10,9 +17,10 @@
 
 #include "aligned_client_buffer.h"
 #include "bool_parser.h"
-#include "environ.h"
-#include "storage_backend.h"
 #include "client_metric.h"
+#include "environ.h"
+#include "local_delete.h"
+#include "storage_backend.h"
 #include "utils.h"
 #include "device/accelerator_registry.h"
 #ifdef USE_URING
@@ -22,6 +30,127 @@
 namespace mooncake {
 
 namespace {
+
+constexpr std::string_view kLocalDiskSegmentIdMarker =
+    ".mooncake_local_disk_segment_id";
+
+const char* LocalDeleteResultLabel(LocalDeleteResult result) {
+    switch (result) {
+        case LocalDeleteResult::kRemoved:
+            return "removed";
+        case LocalDeleteResult::kAlreadyRemoved:
+            return "already_removed";
+        case LocalDeleteResult::kStaleVersion:
+            return "stale_version";
+        case LocalDeleteResult::kRetryableFailure:
+            return "retryable_failure";
+    }
+    return "unknown";
+}
+
+tl::expected<std::string, ErrorCode> ReadLocalDiskSegmentId(
+    const std::filesystem::path& marker_path) {
+    std::ifstream input(marker_path);
+    std::string id;
+    if (!input || !std::getline(input, id) || id.empty()) {
+        LOG(ERROR) << "Invalid LOCAL_DISK identity marker: " << marker_path;
+        return tl::unexpected(ErrorCode::PERSISTENT_FAIL);
+    }
+    return id;
+}
+
+tl::expected<std::string, ErrorCode> LoadOrCreateLocalDiskSegmentId(
+    const std::string& storage_path) {
+    namespace fs = std::filesystem;
+    const fs::path directory(storage_path);
+    const fs::path marker_path =
+        directory / fs::path(kLocalDiskSegmentIdMarker);
+    std::error_code ec;
+    if (fs::exists(marker_path, ec)) {
+        return ReadLocalDiskSegmentId(marker_path);
+    }
+    if (ec) {
+        return tl::unexpected(ErrorCode::PERSISTENT_FAIL);
+    }
+
+    bool has_unmarked_data = false;
+    for (const auto& entry : fs::directory_iterator(directory, ec)) {
+        if (entry.path() != marker_path) {
+            has_unmarked_data = true;
+            break;
+        }
+    }
+    if (ec) {
+        return tl::unexpected(ErrorCode::PERSISTENT_FAIL);
+    }
+    const char* adopt_unmarked =
+        std::getenv("MC_STORE_ADOPT_UNMARKED_LOCAL_DISK");
+    if (has_unmarked_data && (adopt_unmarked == nullptr ||
+                              std::string_view(adopt_unmarked) != "1")) {
+        LOG(ERROR) << "LOCAL_DISK path contains data without identity marker: "
+                   << storage_path
+                   << "; set MC_STORE_ADOPT_UNMARKED_LOCAL_DISK=1 once to "
+                      "adopt this directory";
+        return tl::unexpected(ErrorCode::PERSISTENT_FAIL);
+    }
+    if (has_unmarked_data) {
+        LOG(WARNING) << "Creating LOCAL_DISK identity marker for existing path "
+                     << storage_path;
+    }
+
+    const std::string id = UuidToString(generate_uuid());
+    const std::string contents = id + "\n";
+    const int fd =
+        ::open(marker_path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (fd < 0) {
+        if (errno == EEXIST) {
+            return ReadLocalDiskSegmentId(marker_path);
+        }
+        LOG(ERROR) << "Failed to create LOCAL_DISK identity marker: "
+                   << std::strerror(errno);
+        return tl::unexpected(ErrorCode::PERSISTENT_FAIL);
+    }
+
+    size_t written = 0;
+    while (written < contents.size()) {
+        const ssize_t n =
+            ::write(fd, contents.data() + written, contents.size() - written);
+        if (n <= 0) {
+            ::close(fd);
+            fs::remove(marker_path, ec);
+            return tl::unexpected(ErrorCode::PERSISTENT_FAIL);
+        }
+        written += static_cast<size_t>(n);
+    }
+    const bool file_synced = ::fsync(fd) == 0;
+    const bool file_closed = ::close(fd) == 0;
+    const int directory_fd = ::open(directory.c_str(), O_RDONLY | O_DIRECTORY);
+    const bool directory_synced =
+        directory_fd >= 0 && ::fsync(directory_fd) == 0;
+    if (directory_fd >= 0) {
+        ::close(directory_fd);
+    }
+    if (!file_synced || !file_closed || !directory_synced) {
+        fs::remove(marker_path, ec);
+        return tl::unexpected(ErrorCode::PERSISTENT_FAIL);
+    }
+    return id;
+}
+
+tl::expected<int, ErrorCode> AcquireLocalDiskLock(
+    const std::string& storage_path) {
+    const auto lock_path =
+        std::filesystem::path(storage_path) / ".mooncake_local_disk.lock";
+    const int fd = ::open(lock_path.c_str(), O_RDWR | O_CREAT, 0644);
+    if (fd < 0 || ::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        if (fd >= 0) {
+            ::close(fd);
+        }
+        LOG(ERROR) << "LOCAL_DISK path is already mounted: " << storage_path;
+        return tl::unexpected(ErrorCode::PERSISTENT_FAIL);
+    }
+    return fd;
+}
 
 double ParseEnvRatioOr(const std::string& raw_value, double default_value) {
     if (raw_value.empty()) {
@@ -73,9 +202,14 @@ std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
         auto [tenant_id, key] = TenantId::ParseScopedKey(storage_keys[i]);
         const int64_t size =
             i < metadatas.size() ? metadatas[i].data_size : int64_t{0};
-        tasks.push_back(OffloadTaskItem{.tenant_id = tenant_id.value(),
-                                        .key = std::move(key),
-                                        .size = size});
+        const ObjectIncarnation object_incarnation =
+            i < metadatas.size() ? metadatas[i].GetObjectIncarnation()
+                                 : ObjectIncarnation{};
+        tasks.push_back(
+            OffloadTaskItem{.tenant_id = tenant_id.value(),
+                            .key = std::move(key),
+                            .size = size,
+                            .object_incarnation = object_incarnation});
     }
     return tasks;
 }
@@ -307,6 +441,12 @@ FileStorage::~FileStorage() {
     if (client_buffer_gc_thread_.joinable()) {
         client_buffer_gc_thread_.join();
     }
+    storage_backend_.reset();
+    if (local_disk_lock_fd_ >= 0) {
+        ::flock(local_disk_lock_fd_, LOCK_UN);
+        ::close(local_disk_lock_fd_);
+        local_disk_lock_fd_ = -1;
+    }
 }
 
 tl::expected<void, ErrorCode> FileStorage::Init() {
@@ -316,11 +456,34 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
                    << register_memory_result.error();
         return register_memory_result;
     }
+    if (config_.storage_backend_type == StorageBackendType::kBucket) {
+        auto identity =
+            LoadOrCreateLocalDiskSegmentId(config_.storage_filepath);
+        if (!identity) {
+            return tl::unexpected(identity.error());
+        }
+        local_disk_segment_id_ = std::move(identity.value());
+        auto disk_lock = AcquireLocalDiskLock(config_.storage_filepath);
+        if (!disk_lock) {
+            return tl::unexpected(disk_lock.error());
+        }
+        local_disk_lock_fd_ = disk_lock.value();
+        local_disk_capabilities_ = kLocalDiskCapabilityObjectTombstoneV1;
+    }
     auto init_storage_backend_result = storage_backend_->Init();
     if (!init_storage_backend_result) {
         LOG(ERROR) << "Failed to init storage backend: "
                    << init_storage_backend_result.error();
+        if (local_disk_lock_fd_ >= 0) {
+            ::flock(local_disk_lock_fd_, LOCK_UN);
+            ::close(local_disk_lock_fd_);
+            local_disk_lock_fd_ = -1;
+        }
         return init_storage_backend_result;
+    }
+    if (ssd_metric_ != nullptr) {
+        ssd_metric_->bucket_reclaimable_bytes.update(
+            storage_backend_->GetReclaimableBytes());
     }
     auto enable_offloading_result = IsEnableOffloading();
     if (enable_offloading_result.has_value()) {
@@ -338,13 +501,16 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
     {
         MutexLocker locker(&offloading_mutex_);
         enable_offloading_ = enable_offloading_result.value();
-        auto mount_file_storage_result =
-            client_->MountLocalDiskSegment(enable_offloading_);
+        auto mount_file_storage_result = client_->MountLocalDiskSegment(
+            enable_offloading_, local_disk_segment_id_,
+            local_disk_capabilities_);
         if (!mount_file_storage_result) {
             LOG(ERROR) << "Failed to mount file storage: "
                        << mount_file_storage_result.error();
-            return mount_file_storage_result;
+            return tl::unexpected(mount_file_storage_result.error());
         }
+        local_disk_mount_epoch_ = mount_file_storage_result->mount_epoch;
+        local_disk_capabilities_ = mount_file_storage_result->capabilities;
     }
     // Report configured SSD capacity to Master so it can populate
     // file_total_capacity_ (the denominator in "SSD Storage: X / Y").
@@ -361,18 +527,7 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
     auto scan_meta_result = storage_backend_->ScanMeta(
         [this](const std::vector<std::string>& keys,
                std::vector<StorageObjectMetadata>& metadatas) {
-            for (auto& metadata : metadatas) {
-                metadata.transport_endpoint = local_rpc_addr_;
-            }
-            auto tasks = BuildOffloadTasksFromStorageKeys(keys, metadatas);
-            auto add_object_result =
-                client_->NotifyOffloadSuccess(tasks, metadatas);
-            if (!add_object_result) {
-                LOG(ERROR) << "Failed to add object to master: "
-                           << add_object_result.error();
-                return add_object_result.error();
-            }
-            return ErrorCode::OK;
+            return ReconcileScannedObjects(keys, metadatas);
         });
 
     if (!scan_meta_result) {
@@ -450,13 +605,16 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         return {};
     }
     std::unordered_map<std::string, int64_t> storage_object_sizes;
+    std::unordered_map<std::string, ObjectIncarnation> object_incarnations;
     std::unordered_map<std::string, OffloadTaskItem> task_by_storage_key;
     storage_object_sizes.reserve(offloading_objects.size());
+    object_incarnations.reserve(offloading_objects.size());
     task_by_storage_key.reserve(offloading_objects.size());
     for (const auto& task : offloading_objects) {
         const auto storage_key =
             TenantId(task.tenant_id).MakeScopedKey(task.key);
         storage_object_sizes.emplace(storage_key, task.size);
+        object_incarnations.emplace(storage_key, task.GetObjectIncarnation());
         task_by_storage_key.emplace(storage_key, task);
     }
 
@@ -464,7 +622,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     if (auto bucket_backend =
             std::dynamic_pointer_cast<BucketStorageBackend>(storage_backend_)) {
         auto allocate_res = bucket_backend->AllocateOffloadingBuckets(
-            storage_object_sizes, buckets_keys);
+            storage_object_sizes, buckets_keys, &object_incarnations);
         if (!allocate_res) {
             LOG(ERROR) << "AllocateOffloadingBuckets failed with error: "
                        << allocate_res.error();
@@ -484,18 +642,21 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             const std::vector<std::string>& keys,
             std::vector<StorageObjectMetadata>& metadatas) -> ErrorCode {
         VLOG(1) << "Success to store objects, keys count: " << keys.size();
-        for (auto& metadata : metadatas) {
-            metadata.transport_endpoint = local_rpc_addr_;
-        }
         std::vector<OffloadTaskItem> tasks;
         tasks.reserve(keys.size());
-        for (const auto& key : keys) {
+        for (size_t i = 0; i < keys.size(); ++i) {
+            const auto& key = keys[i];
             auto it = task_by_storage_key.find(key);
             if (it == task_by_storage_key.end()) {
                 LOG(ERROR) << "Offload task not found for storage key";
                 return ErrorCode::INVALID_KEY;
             }
             tasks.push_back(it->second);
+            if (i < metadatas.size()) {
+                metadatas[i].transport_endpoint = local_rpc_addr_;
+                metadatas[i].object_incarnation =
+                    it->second.GetObjectIncarnation();
+            }
         }
         auto result = client_->NotifyOffloadSuccess(tasks, metadatas);
         if (!result) {
@@ -684,7 +845,8 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         std::vector<StorageObjectMetadata> failed_metadatas;
         failed_metadatas.reserve(failed_tasks.size());
         for (size_t i = 0; i < failed_tasks.size(); ++i) {
-            failed_metadatas.push_back(StorageObjectMetadata{-1, 0, 0, -1, ""});
+            failed_metadatas.push_back(
+                StorageObjectMetadata{-1, 0, 0, -1, "", {}});
         }
         auto result =
             client_->NotifyOffloadSuccess(failed_tasks, failed_metadatas);
@@ -693,6 +855,10 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                             "returned error: "
                          << result.error() << " count: " << failed_tasks.size();
         }
+    }
+    if (ssd_metric_ != nullptr) {
+        ssd_metric_->bucket_reclaimable_bytes.update(
+            storage_backend_->GetReclaimableBytes());
     }
 
     if (abort_error) {
@@ -767,6 +933,10 @@ tl::expected<void, ErrorCode> FileStorage::RunDiskWatermarkEviction() {
     if (!eviction_result.value().empty()) {
         LOG(INFO) << "Disk watermark eviction removed "
                   << eviction_result.value().size() << " LOCAL_DISK key(s)";
+        if (ssd_metric_ != nullptr) {
+            ssd_metric_->bucket_reclaimable_bytes.update(
+                storage_backend_->GetReclaimableBytes());
+        }
     }
     return {};
 }
@@ -828,9 +998,12 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                              << "SEGMENT_NOT_FOUND, attempting to "
                              << "re-register local disk segment and "
                              << "re-register object metadata";
-                auto remount_result =
-                    client_->MountLocalDiskSegment(enable_offloading_);
+                auto remount_result = client_->MountLocalDiskSegment(
+                    enable_offloading_, local_disk_segment_id_,
+                    local_disk_capabilities_);
                 if (remount_result) {
+                    local_disk_mount_epoch_ = remount_result->mount_epoch;
+                    local_disk_capabilities_ = remount_result->capabilities;
                     // Report configured SSD capacity so the Master can
                     // restore file_total_capacity_ (the denominator in
                     // "SSD Storage: X / Y").  This was lost on restart;
@@ -900,6 +1073,12 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
     VLOG(1) << "Completed heartbeat with offloaded objects count: "
             << offloading_objects.size();
 
+    auto delete_result = ProcessLocalDeleteTasks();
+    if (!delete_result) {
+        LOG(WARNING) << "LOCAL_DISK delete processing failed: "
+                     << delete_result.error();
+    }
+
     // Drive any pending L2->L1 promotion work for this client. Failures
     // inside ProcessPromotionTasks are logged per-key and do not propagate;
     // promotion is best-effort and must never break offload.
@@ -916,6 +1095,119 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
     return {};
 }
 
+tl::expected<void, ErrorCode> FileStorage::ProcessLocalDeleteTasks() {
+    if (client_ == nullptr || local_disk_segment_id_.empty() ||
+        (local_disk_capabilities_ & kLocalDiskCapabilityObjectTombstoneV1) ==
+            0) {
+        return {};
+    }
+
+    constexpr uint32_t kDeleteBatchLimit = 128;
+    std::vector<LocalDeleteTask> tasks;
+    auto fetch = client_->FetchLocalDeleteTasks(local_disk_segment_id_,
+                                                local_disk_mount_epoch_,
+                                                kDeleteBatchLimit, tasks);
+    if (!fetch || tasks.empty()) {
+        return fetch;
+    }
+
+    for (auto& task : tasks) {
+        task.key = TenantId(task.tenant_id).MakeScopedKey(task.key);
+    }
+    const auto results = storage_backend_->BatchMarkDeleted(tasks);
+    if (results.size() != tasks.size()) {
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    std::vector<LocalDeleteTaskId> terminal_task_ids;
+    terminal_task_ids.reserve(results.size());
+    for (size_t i = 0; i < results.size(); ++i) {
+        const auto& result = results[i];
+        if (ssd_metric_ != nullptr) {
+            ssd_metric_->bucket_tombstone_total.inc(
+                {LocalDeleteResultLabel(result.result)});
+        }
+        const auto& task = tasks[i];
+        VLOG(1) << "LOCAL_DISK delete task=" << task.task_id.high << "-"
+                << task.task_id.low
+                << ", storage_id=" << task.local_disk_segment_id
+                << ", tenant=" << task.tenant_id
+                << ", key_hash=" << std::hash<std::string>{}(task.key)
+                << ", incarnation=" << task.object_incarnation.high << "-"
+                << task.object_incarnation.low
+                << ", bucket=" << task.expected_bucket_id
+                << ", result=" << LocalDeleteResultLabel(result.result);
+        if (result.IsTerminal()) {
+            terminal_task_ids.push_back(result.task_id);
+        }
+    }
+    if (ssd_metric_ != nullptr) {
+        ssd_metric_->bucket_reclaimable_bytes.update(
+            storage_backend_->GetReclaimableBytes());
+    }
+    if (terminal_task_ids.empty()) {
+        return {};
+    }
+    return client_->AckLocalDeleteTasks(
+        local_disk_segment_id_, local_disk_mount_epoch_, terminal_task_ids);
+}
+
+ErrorCode FileStorage::ReconcileScannedObjects(
+    const std::vector<std::string>& keys,
+    std::vector<StorageObjectMetadata>& metadatas) {
+    for (auto& metadata : metadatas) {
+        metadata.transport_endpoint = local_rpc_addr_;
+    }
+    auto objects = BuildOffloadTasksFromStorageKeys(keys, metadatas);
+    if (local_disk_segment_id_.empty() ||
+        (local_disk_capabilities_ & kLocalDiskCapabilityObjectTombstoneV1) ==
+            0) {
+        auto notify = client_->NotifyOffloadSuccess(objects, metadatas);
+        return notify ? ErrorCode::OK : notify.error();
+    }
+    auto decisions = client_->ReconcileLocalDiskObjects(
+        local_disk_segment_id_, local_disk_mount_epoch_, objects);
+    if (!decisions || decisions->size() != objects.size()) {
+        return decisions ? ErrorCode::INTERNAL_ERROR : decisions.error();
+    }
+
+    std::vector<LocalDeleteTask> stale;
+    std::vector<OffloadTaskItem> retained_objects;
+    std::vector<StorageObjectMetadata> retained_metadatas;
+    for (size_t i = 0; i < objects.size(); ++i) {
+        if ((*decisions)[i] != 0) {
+            retained_objects.push_back(objects[i]);
+            retained_metadatas.push_back(metadatas[i]);
+            continue;
+        }
+        stale.push_back(LocalDeleteTask{
+            .task_id = GenerateLocalDeleteTaskId(),
+            .local_disk_segment_id = local_disk_segment_id_,
+            .tenant_id = objects[i].tenant_id,
+            .key = TenantId(objects[i].tenant_id).MakeScopedKey(objects[i].key),
+            .object_incarnation = objects[i].GetObjectIncarnation(),
+            .expected_bucket_id = metadatas[i].bucket_id,
+            .object_bytes = metadatas[i].data_size,
+        });
+    }
+
+    for (const auto& result : storage_backend_->BatchMarkDeleted(stale)) {
+        if (!result.IsTerminal()) {
+            return result.error;
+        }
+    }
+    if (!stale.empty() && ssd_metric_ != nullptr) {
+        ssd_metric_->bucket_reclaimable_bytes.update(
+            storage_backend_->GetReclaimableBytes());
+    }
+    if (retained_objects.empty()) {
+        return ErrorCode::OK;
+    }
+    auto notify =
+        client_->NotifyOffloadSuccess(retained_objects, retained_metadatas);
+    return notify ? ErrorCode::OK : notify.error();
+}
+
 void FileStorage::RemoveAll() {
     // TODO(tenant-isolation): This performs a tenant-UNAWARE global wipe of the
     // storage directory. Storage backends store physical files without a
@@ -927,6 +1219,9 @@ void FileStorage::RemoveAll() {
     // physical isolation needs backend-level tenant-scoped layout (follow-up).
     if (storage_backend_) {
         storage_backend_->RemoveAll();
+    }
+    if (ssd_metric_ != nullptr) {
+        ssd_metric_->bucket_reclaimable_bytes.update(0);
     }
     LOG(INFO) << "FileStorage::RemoveAll: cleared storage backend";
 }
@@ -1283,33 +1578,24 @@ tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {
     storage_backend_->ResetScanIterator();
     LOG(INFO) << "ReRegisterOffloadedObjects: about to call "
                  "storage_backend_->ScanMeta()";
-    auto scan_meta_result =
-        storage_backend_->ScanMeta(
-            [this, &total_keys, &total_batches, &total_failures](
-                const std::vector<std::string>& keys,
-                std::vector<StorageObjectMetadata>& metadatas) {
-                total_batches++;
-                total_keys += keys.size();
-                for (auto& metadata : metadatas) {
-                    metadata.transport_endpoint = local_rpc_addr_;
-                }
-                auto tasks = BuildOffloadTasksFromStorageKeys(keys, metadatas);
-                auto add_object_result =
-                    client_->NotifyOffloadSuccess(tasks, metadatas);
-                if (!add_object_result) {
-                    total_failures++;
-                    LOG(ERROR)
-                        << "ReRegisterOffloadedObjects: NotifyOffloadSuccess "
-                        << "failed for batch " << total_batches << " with "
-                        << keys.size()
-                        << " keys, error: " << add_object_result.error();
-                    return add_object_result.error();
-                }
-                LOG(INFO) << "ReRegisterOffloadedObjects: NotifyOffloadSuccess "
-                          << "succeeded for batch " << total_batches << " with "
-                          << keys.size() << " keys";
-                return ErrorCode::OK;
-            });
+    auto scan_meta_result = storage_backend_->ScanMeta(
+        [this, &total_keys, &total_batches, &total_failures](
+            const std::vector<std::string>& keys,
+            std::vector<StorageObjectMetadata>& metadatas) {
+            total_batches++;
+            total_keys += keys.size();
+            const auto reconcile = ReconcileScannedObjects(keys, metadatas);
+            if (reconcile != ErrorCode::OK) {
+                total_failures++;
+                LOG(ERROR) << "ReRegisterOffloadedObjects: reconciliation "
+                           << "failed for batch " << total_batches << " with "
+                           << keys.size() << " keys, error: " << reconcile;
+                return reconcile;
+            }
+            LOG(INFO) << "ReRegisterOffloadedObjects: reconciled batch "
+                      << total_batches << " with " << keys.size() << " keys";
+            return ErrorCode::OK;
+        });
 
     LOG(INFO) << "ReRegisterOffloadedObjects: ScanMeta returned. success="
               << scan_meta_result.has_value();

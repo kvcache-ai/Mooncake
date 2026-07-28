@@ -31,8 +31,11 @@ struct BucketObjectMetadata {
     int64_t offset;
     int64_t key_size;
     int64_t data_size;
+    ObjectIncarnation object_incarnation;
+    bool tombstoned{false};
 };
-YLT_REFL(BucketObjectMetadata, offset, key_size, data_size);
+YLT_REFL(BucketObjectMetadata, offset, key_size, data_size, object_incarnation,
+         tombstoned);
 
 struct BucketMetadata {
     int64_t meta_size;
@@ -46,6 +49,7 @@ struct BucketMetadata {
     // Last access timestamp in nanoseconds; used by LRU eviction policy.
     // Updated on every read with relaxed ordering (approximate is sufficient).
     mutable std::atomic<int64_t> last_access_ns_{0};
+    mutable std::mutex operation_mutex_;
 
     // Default constructor
     BucketMetadata() = default;
@@ -93,6 +97,23 @@ struct BucketMetadata {
     }
 };
 YLT_REFL(BucketMetadata, data_size, keys, metadatas);
+
+enum class LocalDeleteResult {
+    kRemoved,
+    kAlreadyRemoved,
+    kStaleVersion,
+    kRetryableFailure,
+};
+
+struct LocalDeleteTaskResult {
+    LocalDeleteTaskId task_id;
+    LocalDeleteResult result{LocalDeleteResult::kRetryableFailure};
+    ErrorCode error{ErrorCode::OK};
+
+    [[nodiscard]] bool IsTerminal() const {
+        return result != LocalDeleteResult::kRetryableFailure;
+    }
+};
 
 /**
  * @brief RAII guard for tracking in-flight bucket reads.
@@ -394,6 +415,19 @@ class StorageBackendInterface {
                             EvictionHandler /* eviction_handler */ = nullptr) {
         return std::vector<std::string>{};
     }
+
+    virtual std::vector<LocalDeleteTaskResult> BatchMarkDeleted(
+        const std::vector<LocalDeleteTask>& tasks) {
+        std::vector<LocalDeleteTaskResult> results;
+        results.reserve(tasks.size());
+        for (const auto& task : tasks) {
+            results.push_back({task.task_id,
+                               LocalDeleteResult::kRetryableFailure,
+                               ErrorCode::UNAVAILABLE_IN_CURRENT_MODE});
+        }
+        return results;
+    }
+    virtual int64_t GetReclaimableBytes() const { return 0; }
 
     FileStorageConfig file_storage_config_;
 };
@@ -927,7 +961,9 @@ class BucketStorageBackend : public StorageBackendInterface {
      */
     tl::expected<void, ErrorCode> AllocateOffloadingBuckets(
         const std::unordered_map<std::string, int64_t>& offloading_objects,
-        std::vector<std::vector<std::string>>& buckets_keys);
+        std::vector<std::vector<std::string>>& buckets_keys,
+        const std::unordered_map<std::string, ObjectIncarnation>*
+            object_incarnations = nullptr);
 
     void ClearUngroupedOffloadingObjects();
 
@@ -981,6 +1017,10 @@ class BucketStorageBackend : public StorageBackendInterface {
         double high_watermark_ratio, double low_watermark_ratio,
         EvictionHandler eviction_handler = nullptr) override;
 
+    std::vector<LocalDeleteTaskResult> BatchMarkDeleted(
+        const std::vector<LocalDeleteTask>& tasks) override;
+    int64_t GetReclaimableBytes() const override;
+
    private:
     tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode> BuildBucket(
         int64_t bucket_id,
@@ -994,6 +1034,9 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     tl::expected<void, ErrorCode> StoreBucketMetadata(
         int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata);
+
+    tl::expected<void, ErrorCode> StoreBucketMetadataAtomically(
+        int64_t bucket_id, BucketMetadata& bucket_metadata);
 
     tl::expected<void, ErrorCode> LoadBucketMetadata(
         int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata);
@@ -1158,6 +1201,8 @@ class BucketStorageBackend : public StorageBackendInterface {
     mutable Mutex offloading_mutex_;
     std::unordered_map<std::string, int64_t> GUARDED_BY(offloading_mutex_)
         ungrouped_offloading_objects_;
+    std::unordered_map<std::string, ObjectIncarnation> GUARDED_BY(
+        offloading_mutex_) offloading_object_incarnations_;
 
     // File handle cache for UringFile to avoid repeated open/close overhead
     mutable Mutex file_cache_mutex_;

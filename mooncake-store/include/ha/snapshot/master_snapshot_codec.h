@@ -110,7 +110,7 @@ class MasterSnapshotCodec {
 
     // Canonical serializer identifiers embedded in the snapshot manifest.
     static constexpr const char* kSerializerType = "messagepack";
-    static constexpr const char* kSerializerVersion = "1.0.0";
+    static constexpr const char* kSerializerVersion = "1.1.0";
 
     /**
      * @brief Encode a snapshot manifest into its on-disk byte representation.

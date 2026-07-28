@@ -419,7 +419,10 @@ class Client {
      * @brief Mounts a local disk segment into the master.
      * @param enable_offloading If true, enables offloading (write-to-file).
      */
-    tl::expected<void, ErrorCode> MountLocalDiskSegment(bool enable_offloading);
+    tl::expected<LocalDiskMountInfo, ErrorCode> MountLocalDiskSegment(
+        bool enable_offloading,
+        const std::string& local_disk_segment_id = std::string(),
+        uint32_t capabilities = 0);
 
     /**
      * @brief Heartbeat call to collect object-level statistics and retrieve the
@@ -432,6 +435,18 @@ class Client {
     tl::expected<void, ErrorCode> OffloadObjectHeartbeat(
         bool enable_offloading,
         std::vector<OffloadTaskItem>& offloading_objects);
+
+    tl::expected<void, ErrorCode> FetchLocalDeleteTasks(
+        const std::string& local_disk_segment_id, uint64_t mount_epoch,
+        uint32_t limit, std::vector<LocalDeleteTask>& tasks);
+
+    tl::expected<void, ErrorCode> AckLocalDeleteTasks(
+        const std::string& local_disk_segment_id, uint64_t mount_epoch,
+        const std::vector<LocalDeleteTaskId>& task_ids);
+
+    tl::expected<std::vector<uint8_t>, ErrorCode> ReconcileLocalDiskObjects(
+        const std::string& local_disk_segment_id, uint64_t mount_epoch,
+        const std::vector<OffloadTaskItem>& objects);
 
     tl::expected<bool, ErrorCode> PollRemoveAll();
 

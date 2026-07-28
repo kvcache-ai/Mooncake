@@ -13,7 +13,8 @@ inline constexpr const char* kSnapshotLatestFile = "latest.txt";
 
 // Snapshot format
 inline constexpr const char* kSnapshotSerializerType = "messagepack";
-inline constexpr const char* kSnapshotSerializerVersion = "1.0.0";
+inline constexpr const char* kSnapshotSerializerVersion = "1.1.0";
+inline constexpr const char* kLegacySnapshotSerializerVersion = "1.0.0";
 
 // Backup directories
 inline constexpr const char* kSnapshotBackupSaveDir =

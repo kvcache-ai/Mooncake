@@ -3257,10 +3257,11 @@ std::vector<tl::expected<bool, ErrorCode>> Client::BatchIsExist(
 
 void* Client::GetBaseAddr() { return transfer_engine_->getBaseAddr(); }
 
-tl::expected<void, ErrorCode> Client::MountLocalDiskSegment(
-    bool enable_offloading) {
-    auto response =
-        master_client_.MountLocalDiskSegment(client_id_, enable_offloading);
+tl::expected<LocalDiskMountInfo, ErrorCode> Client::MountLocalDiskSegment(
+    bool enable_offloading, const std::string& local_disk_segment_id,
+    uint32_t capabilities) {
+    auto response = master_client_.MountLocalDiskSegment(
+        client_id_, enable_offloading, local_disk_segment_id, capabilities);
 
     if (!response) {
         LOG(ERROR) << "MountLocalDiskSegment failed, error code is "
@@ -3283,6 +3284,32 @@ tl::expected<void, ErrorCode> Client::OffloadObjectHeartbeat(
     }
     offloading_objects = std::move(response.value());
     return {};
+}
+
+tl::expected<void, ErrorCode> Client::FetchLocalDeleteTasks(
+    const std::string& local_disk_segment_id, uint64_t mount_epoch,
+    uint32_t limit, std::vector<LocalDeleteTask>& tasks) {
+    auto response = master_client_.FetchLocalDeleteTasks(
+        client_id_, local_disk_segment_id, mount_epoch, limit);
+    if (!response) {
+        return tl::unexpected(response.error());
+    }
+    tasks = std::move(response.value());
+    return {};
+}
+
+tl::expected<void, ErrorCode> Client::AckLocalDeleteTasks(
+    const std::string& local_disk_segment_id, uint64_t mount_epoch,
+    const std::vector<LocalDeleteTaskId>& task_ids) {
+    return master_client_.AckLocalDeleteTasks(client_id_, local_disk_segment_id,
+                                              mount_epoch, task_ids);
+}
+
+tl::expected<std::vector<uint8_t>, ErrorCode> Client::ReconcileLocalDiskObjects(
+    const std::string& local_disk_segment_id, uint64_t mount_epoch,
+    const std::vector<OffloadTaskItem>& objects) {
+    return master_client_.ReconcileLocalDiskObjects(
+        client_id_, local_disk_segment_id, mount_epoch, objects);
 }
 
 tl::expected<bool, ErrorCode> Client::PollRemoveAll() {

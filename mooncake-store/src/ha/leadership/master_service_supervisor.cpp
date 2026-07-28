@@ -393,10 +393,19 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         // Restore from standby if we have context
         if (promotion_ctx->applied_seq_id > 0 ||
             !promotion_ctx->objects.empty() ||
-            !promotion_ctx->segments.empty()) {
-            wrapped_master_service->RestoreFromStandby(
+            !promotion_ctx->segments.empty() ||
+            !promotion_ctx->pending_local_deletes.empty()) {
+            auto restore_result = wrapped_master_service->RestoreFromStandby(
                 promotion_ctx->objects, promotion_ctx->applied_seq_id,
-                promotion_ctx->segments);
+                promotion_ctx->segments, promotion_ctx->pending_local_deletes);
+            if (!restore_result) {
+                LOG(ERROR) << "Failed to restore promotion context: "
+                           << toString(restore_result.error());
+                LogLeadershipReleaseWarning(
+                    "promotion restore failure",
+                    leader_coordinator.ReleaseLeadership(*leadership_session));
+                return -1;
+            }
         }
 
         mooncake::RegisterRpcService(server, *wrapped_master_service);

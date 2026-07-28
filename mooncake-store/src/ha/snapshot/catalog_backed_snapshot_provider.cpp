@@ -26,7 +26,8 @@ namespace {
 constexpr char kSnapshotManifestFile[] = "manifest.txt";
 constexpr char kSnapshotMetadataFile[] = "metadata";
 constexpr char kSnapshotSegmentsFile[] = "segments";
-constexpr char kSnapshotSerializerVersion[] = "1.0.0";
+constexpr char kSnapshotSerializerVersion[] = "1.1.0";
+constexpr char kLegacySnapshotSerializerVersion[] = "1.0.0";
 constexpr char kSnapshotSerializerType[] = "messagepack";
 
 enum class SnapshotCatalogBackendKind {
@@ -87,10 +88,12 @@ ErrorCode ValidateManifest(std::string_view snapshot_id,
                    << ", expected=" << kSnapshotSerializerType;
         return ErrorCode::DESERIALIZE_FAIL;
     }
-    if (version != kSnapshotSerializerVersion) {
+    if (version != kSnapshotSerializerVersion &&
+        version != kLegacySnapshotSerializerVersion) {
         LOG(ERROR) << "Unsupported snapshot manifest version, snapshot_id="
                    << snapshot_id << ", version=" << version
-                   << ", expected=" << kSnapshotSerializerVersion;
+                   << ", expected=" << kSnapshotSerializerVersion << " or "
+                   << kLegacySnapshotSerializerVersion;
         return ErrorCode::DESERIALIZE_FAIL;
     }
 
@@ -142,11 +145,13 @@ DeserializeStandbyObjectMetadata(
         //       hard_pinned + group_id
         //   v4: 10 + replica_count, data_type + hard_pinned + group_id
         //   v5: 11 + replica_count, v4 + object_checksum (ignored here)
+        //   v6: v4 + object incarnation high/low, with an optional
+        //       object_checksum before the incarnation fields
         // 64-bit arithmetic keeps an attacker-controlled near-UINT32_MAX
         // replica_count from wrapping the bounds and slipping an out-of-bounds
         // index through.
         constexpr uint64_t kBaseFieldCount = 7;
-        constexpr uint64_t kMaxOptionalFieldCount = 4;
+        constexpr uint64_t kMaxOptionalFieldCount = 6;
         const uint64_t total_elements = object.via.array.size;
         const uint64_t min_elements = kBaseFieldCount + replica_count;
         if (total_elements < min_elements ||
@@ -224,9 +229,43 @@ DeserializeStandbyObjectMetadata(
             group_id = array[index++].as<std::string>();
         }
 
+        // The upstream v5 format may have one checksum field. The SSD delete
+        // branch independently added the two incarnation fields. Preserve
+        // both layouts and append incarnation after checksum in the combined
+        // format:
+        //   0 fields: legacy v4
+        //   1 field:  checksum only
+        //   2 fields: incarnation only
+        //   3 fields: checksum + incarnation
+        uint64_t trailing_fields = total_elements - index;
+        if (trailing_fields == 1 || trailing_fields == 3) {
+            if (array[index].type != msgpack::type::POSITIVE_INTEGER) {
+                LOG(ERROR) << "Snapshot metadata checksum type mismatch";
+                return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
+            }
+            ++index;  // object_checksum is not needed by the standby catalog
+            --trailing_fields;
+        }
+
+        ObjectIncarnation object_incarnation;
+        if (trailing_fields == 2) {
+            if (array[index].type != msgpack::type::POSITIVE_INTEGER ||
+                array[index + 1].type != msgpack::type::POSITIVE_INTEGER) {
+                LOG(ERROR) << "Snapshot metadata incarnation type mismatch";
+                return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
+            }
+            object_incarnation.high = array[index++].as<uint64_t>();
+            object_incarnation.low = array[index++].as<uint64_t>();
+        }
+        if (index != total_elements) {
+            LOG(ERROR) << "Snapshot metadata optional field count mismatch";
+            return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
+        }
+
         StandbyObjectMetadata metadata;
         metadata.client_id = client_id;
         metadata.size = size;
+        metadata.object_incarnation = object_incarnation;
         metadata.replicas = std::move(replicas);
         metadata.last_sequence_id = snapshot_sequence_id;
         metadata.data_type = data_type;
@@ -349,6 +388,31 @@ DeserializeStandbySnapshotMetadata(const std::vector<uint8_t>& data,
     }
 
     return snapshot;
+}
+
+tl::expected<std::vector<LocalDeleteTask>, ErrorCode>
+DeserializePendingLocalDeletes(const std::vector<uint8_t>& data) {
+    try {
+        auto root_handle = msgpack::unpack(
+            reinterpret_cast<const char*>(data.data()), data.size());
+        const auto* field =
+            FindMapField(root_handle.get(), "pending_local_deletes");
+        if (field == nullptr) {
+            return std::vector<LocalDeleteTask>{};
+        }
+        if (field->type != msgpack::type::BIN) {
+            return tl::unexpected(ErrorCode::DESERIALIZE_FAIL);
+        }
+        std::vector<LocalDeleteTask> tasks;
+        const std::string_view bytes(field->via.bin.ptr, field->via.bin.size);
+        if (struct_pack::deserialize_to(tasks, bytes) !=
+            struct_pack::errc::ok) {
+            return tl::unexpected(ErrorCode::DESERIALIZE_FAIL);
+        }
+        return tasks;
+    } catch (const std::exception&) {
+        return tl::unexpected(ErrorCode::DESERIALIZE_FAIL);
+    }
 }
 
 class CatalogBackedSnapshotProvider final : public SnapshotProvider {
@@ -495,6 +559,13 @@ class CatalogBackedSnapshotProvider final : public SnapshotProvider {
         snapshot.snapshot_id = descriptor.snapshot_id;
         snapshot.snapshot_sequence_id = descriptor.last_included_seq;
         snapshot.metadata = std::move(deserialize_metadata.value());
+        auto pending_local_deletes =
+            DeserializePendingLocalDeletes(metadata_content);
+        if (!pending_local_deletes) {
+            return tl::make_unexpected(pending_local_deletes.error());
+        }
+        snapshot.pending_local_deletes =
+            std::move(pending_local_deletes.value());
 
         // Extract standby segment registry entries from the deserialized
         // SegmentManager. The snapshot's SegmentSerializer::Serialize()
