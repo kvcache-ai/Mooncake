@@ -67,6 +67,7 @@ if(ENABLE_KV_EVENTS)
 endif()
 add_store_test(master_service_test master_service_test.cpp)
 add_store_test(master_service_config_test master_service_config_test.cpp)
+add_store_test(master_service_deadlock_test master_service_deadlock_test.cpp)
 add_store_test(master_service_tenant_quota_test
                master_service_tenant_quota_test.cpp)
 add_store_test(batch_remove_test batch_remove_test.cpp)

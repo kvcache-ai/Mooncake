@@ -7625,20 +7625,32 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
                 segment_name);
         }
 
-        ScopedSegmentAccess segment_access =
-            segment_manager_.getSegmentAccess();
+        // Gather segment data under the segment lock, then RELEASE it before
+        // calling UnmountSegment()/Ping() below. UnmountSegment acquires
+        // snapshot_mutex_ (shared) and Ping acquires client_mutex_; the
+        // documented lock order (see master_service.h) is client/snapshot
+        // BEFORE segment. Holding the segment lock here while calling them
+        // inverts that order (segment -> snapshot/client) and ABBA-deadlocks
+        // against snapshot->segment paths such as GracefulUnmountSegment.
+        // Reproducer: tests/master_service_deadlock_test.cpp.
         std::vector<std::pair<Segment, UUID>> unready_segments;
-        if (segment_access.GetUnreadySegments(unready_segments) ==
-            ErrorCode::OK) {
+        std::vector<std::pair<Segment, UUID>> all_segments;
+        ErrorCode unready_err;
+        ErrorCode all_err;
+        {
+            ScopedSegmentAccess segment_access =
+                segment_manager_.getSegmentAccess();
+            unready_err = segment_access.GetUnreadySegments(unready_segments);
+            all_err = segment_access.GetAllSegments(all_segments);
+        }
+
+        if (unready_err == ErrorCode::OK) {
             for (const auto& [segment, client_id] : unready_segments) {
                 UnmountSegment(segment.id, client_id);
             }
         }
 
-        std::vector<std::pair<Segment, UUID>> all_segments;
-        auto err = segment_access.GetAllSegments(all_segments);
-
-        if (err == ErrorCode::OK) {
+        if (all_err == ErrorCode::OK) {
             int64_t total_size = 0;
             for (const auto& [segment, client_id] : all_segments) {
                 Ping(client_id);
@@ -7650,7 +7662,7 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
                       << total_size;
         } else {
             LOG(ERROR) << "[Restore] Failed to get all segments, error: "
-                       << err;
+                       << all_err;
         }
     }
 

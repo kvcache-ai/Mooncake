@@ -78,6 +78,10 @@ class SnapshotChildProcessTest;
 class PromotionOnHitTest;
 class MasterServiceTenantQuotaTest;
 class MasterServiceHATest;
+// Friended so the lock-order deadlock reproduction test can drive the real
+// private snapshot_mutex_ / segment_manager_ locks in the exact orders used
+// by GracefulUnmountSegment and ApplySnapshotState.
+class MasterServiceDeadlockTest;
 }  // namespace test
 namespace benchmarks {
 class BatchEvictBench;
@@ -107,6 +111,7 @@ class MasterService {
     friend class test::PromotionOnHitTest;
     friend class benchmarks::BatchEvictBench;
     friend class test::MasterServiceTenantQuotaTest;
+    friend class test::MasterServiceDeadlockTest;  // lock-order ABBA repro
     friend class MasterSnapshotManager;    // Allow access to internal state for
                                            // snapshot
     friend class ha::MasterSnapshotCodec;  // Allow codec to access private
