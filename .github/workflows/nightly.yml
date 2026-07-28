@@ -452,7 +452,7 @@ jobs:
       - name: Build project
         run: |
           cd build
-          cmake --build . --parallel 128
+          cmake --build . --parallel "$(nproc)"
           sudo cmake --install .
 
       - name: Start Metadata Server
