@@ -324,6 +324,8 @@ static int encodeMultiProtocolSegmentDesc(
 
     Json::Value buffersJSON(Json::arrayValue);
     for (const auto &buffer : desc.buffers) {
+        if (buffer.protocol == "rdma" && buffer.rkey.empty()) continue;
+
         Json::Value bufferJSON;
         bufferJSON["name"] = buffer.name;
         bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
@@ -414,6 +416,8 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
 
         Json::Value buffersJSON(Json::arrayValue);
         for (const auto &buffer : desc.buffers) {
+            if (desc.protocol == "rdma" && buffer.rkey.empty()) continue;
+
             Json::Value bufferJSON;
             bufferJSON["name"] = buffer.name;
             bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
