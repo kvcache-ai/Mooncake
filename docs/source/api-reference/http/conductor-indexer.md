@@ -361,6 +361,7 @@ Registration metadata supplies fields such as `modelname`, `tenant_id`,
 `instance_id`, `block_size`, and `additionalsalt` when the engine event does
 not carry the full standardized envelope.
 
+(mooncake-store-master-publisher)=
 ### Mooncake Store master publisher
 
 `mooncake_master` can optionally publish RFC #1527 events when
