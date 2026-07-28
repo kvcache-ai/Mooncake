@@ -107,6 +107,24 @@ uint64_t SaturatingMultiply(uint64_t lhs, uint64_t rhs) {
     return lhs * rhs;
 }
 
+// Decides whether PutStart may proceed with the replicas that were
+// actually allocated. Three deliberately different policies apply:
+//
+//  - Memory-only (nof_replica_num == 0): best-effort. Fewer than
+//    config.replica_num replicas (but at least one) still succeed, even
+//    though DetermineReplicaWriteMode() classifies such configs as
+//    RELIABLE_MULTI_REPLICA. The shortfall is surfaced via a WARNING log
+//    (action=put_start_partial_allocation) and the
+//    master_put_start_partial_allocations_total metric.
+//  - FLEXIBLE_DUAL_REPLICA (1 memory + 1 NoF): allocating either side
+//    alone is sufficient.
+//  - Any other config with nof_replica_num > 0: strict. Both replica
+//    types must match the requested counts exactly, otherwise PutStart
+//    fails with NO_AVAILABLE_HANDLE.
+//
+// The "reliable" guarantee of RELIABLE_MULTI_REPLICA is enforced at the
+// transfer stage (all allocated replicas must complete or the put is
+// revoked), not at the allocation stage for memory-only configs.
 bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
                                   size_t allocated_memory_replicas,
                                   size_t allocated_nof_replicas) {
@@ -3464,6 +3482,21 @@ auto MasterService::AllocateAndInsertMetadata(
                 << ", allocated_nof_replicas=" << allocated_nof_replicas;
         abort_reserved_quota();
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+
+    // Best-effort / flexible modes may pass the check above with fewer
+    // replicas than requested (see HasExpectedReplicaAllocation). Surface
+    // the degradation so callers and operators can detect the reduced
+    // redundancy instead of failing silently.
+    if (allocated_memory_replicas < config.replica_num ||
+        allocated_nof_replicas < config.nof_replica_num) {
+        MasterMetricManager::instance().inc_put_start_partial_allocations();
+        LOG(WARNING) << "key=" << key << ", action=put_start_partial_allocation"
+                     << ", requested_memory_replicas=" << config.replica_num
+                     << ", allocated_memory_replicas="
+                     << allocated_memory_replicas
+                     << ", requested_nof_replicas=" << config.nof_replica_num
+                     << ", allocated_nof_replicas=" << allocated_nof_replicas;
     }
 
     if (use_disk_replica_) {

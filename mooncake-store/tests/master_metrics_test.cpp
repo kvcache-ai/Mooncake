@@ -64,6 +64,7 @@ TEST_F(MasterMetricsTest, InitialStatusTest) {
     ASSERT_EQ(metrics.get_put_start_requests(), 0);
     ASSERT_EQ(metrics.get_put_start_failures(), 0);
     ASSERT_EQ(metrics.get_put_start_alloc_failures(), 0);
+    ASSERT_EQ(metrics.get_put_start_partial_allocations(), 0);
     ASSERT_EQ(metrics.get_put_end_requests(), 0);
     ASSERT_EQ(metrics.get_put_end_failures(), 0);
     ASSERT_EQ(metrics.get_put_revoke_requests(), 0);
@@ -755,7 +756,7 @@ TEST_F(MasterMetricsTest, SummaryUsesWindowRatesAndCumulativeEviction) {
               std::string::npos);
     EXPECT_NE(
         window_summary.find("Eviction: Success/Attempts=1/2, AllocFail=0, "
-                            "keys=3, size=4.00 KB"),
+                            "PartialAlloc=0, keys=3, size=4.00 KB"),
         std::string::npos);
     EXPECT_NE(window_summary.find("Mem Eviction: Success/Attempts=1/2, "
                                   "keys=3, size=4.00 KB"),
@@ -768,7 +769,7 @@ TEST_F(MasterMetricsTest, SummaryUsesWindowRatesAndCumulativeEviction) {
         metrics.get_summary_string_and_update_snapshot();
     EXPECT_NE(
         reported_summary.find("Eviction: Success/Attempts=1/2, AllocFail=0, "
-                              "keys=3, size=4.00 KB"),
+                              "PartialAlloc=0, keys=3, size=4.00 KB"),
         std::string::npos);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -776,7 +777,8 @@ TEST_F(MasterMetricsTest, SummaryUsesWindowRatesAndCumulativeEviction) {
         metrics.get_summary_string_and_update_snapshot();
     EXPECT_NE(idle_summary.find("PutStart=0.00/0.00"), std::string::npos);
     EXPECT_NE(idle_summary.find("Eviction: Success/Attempts=1/2, "
-                                "AllocFail=0, keys=3, size=4.00 KB"),
+                                "AllocFail=0, PartialAlloc=0, keys=3, "
+                                "size=4.00 KB"),
               std::string::npos);
     EXPECT_NE(idle_summary.find("Mem Eviction: Success/Attempts=1/2, "
                                 "keys=3, size=4.00 KB"),
