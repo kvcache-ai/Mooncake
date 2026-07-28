@@ -12,6 +12,7 @@
 #include "ha/oplog/oplog_serializer.h"
 #include "ha/oplog/p2p_oplog_types.h"
 #include "ha/oplog/polling_oplog_change_notifier.h"
+#include "ha_metric_manager.h"
 
 namespace mooncake {
 
@@ -140,6 +141,8 @@ ErrorCode RedisOpLogStore::Init() {
         LOG(ERROR) << "RedisOpLogStore::Init: invalid latest value";
         return ErrorCode::INTERNAL_ERROR;
     }
+    HAMetricManager::instance().set_oplog_last_sequence_id(
+        static_cast<int64_t>(latest));
     {
         std::lock_guard<std::mutex> async_lock(async_mutex_);
         committed_sequence_id_ = latest;
@@ -193,6 +196,12 @@ ErrorCode RedisOpLogStore::EnqueueWrite(const OpLogEntry& entry, bool sync) {
                                 OpLogAsyncQueueOverflowMode::BYPASS
                             ? "bypass"
                             : "reject");
+                if (async_queue_overflow_mode_ ==
+                    OpLogAsyncQueueOverflowMode::BYPASS) {
+                    HAMetricManager::instance().inc_oplog_queue_bypassed();
+                } else {
+                    HAMetricManager::instance().inc_oplog_queue_rejected();
+                }
                 return async_queue_overflow_mode_ ==
                                OpLogAsyncQueueOverflowMode::BYPASS
                            ? ErrorCode::OK
@@ -201,6 +210,8 @@ ErrorCode RedisOpLogStore::EnqueueWrite(const OpLogEntry& entry, bool sync) {
             pending = std::make_shared<PendingWrite>(entry, sync);
             inflight_writes_[entry.sequence_id] = pending;
             pending_writes_.push_back(pending);
+            HAMetricManager::instance().set_oplog_async_queue_size(
+                static_cast<int64_t>(inflight_writes_.size()));
         }
     }
     async_cv_.notify_one();
@@ -214,6 +225,7 @@ ErrorCode RedisOpLogStore::EnqueueWrite(const OpLogEntry& entry, bool sync) {
         lock, std::chrono::milliseconds(kSyncWaitTimeoutMs),
         [&] { return pending->done || !async_running_.load(); });
     if (!completed) {
+        HAMetricManager::instance().inc_oplog_sync_wait_timeouts();
         // TODO(P2P HA): Return an explicit commit-unknown status; this entry
         // remains pending and may still be committed.
         LOG(ERROR) << "RedisOpLogStore::WriteOpLog: sync wait timed out"
@@ -232,6 +244,7 @@ void RedisOpLogStore::StartAsyncWorkers() {
     for (size_t i = 0; i < kAsyncWorkerCount; ++i) {
         async_workers_.emplace_back(&RedisOpLogStore::AsyncWriteLoop, this, i);
     }
+    HAMetricManager::instance().set_oplog_async_workers_running(true);
 }
 
 void RedisOpLogStore::StopAsyncWorkers() {
@@ -246,6 +259,7 @@ void RedisOpLogStore::StopAsyncWorkers() {
         }
     }
     async_workers_.clear();
+    HAMetricManager::instance().set_oplog_async_workers_running(false);
 
     std::lock_guard<std::mutex> lock(async_mutex_);
     size_t unfinished_count = 0;
@@ -313,9 +327,15 @@ void RedisOpLogStore::AsyncWriteLoop(size_t worker_id) {
                 std::chrono::milliseconds(kAsyncRetryDelayMs));
             continue;
         }
+        const auto write_start = std::chrono::steady_clock::now();
         ErrorCode err = ctx ? PersistEntryNoLatest(ctx, pending->entry)
                             : ErrorCode::INTERNAL_ERROR;
+        HAMetricManager::instance().observe_oplog_write_latency_us(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - write_start)
+                .count());
         if (err != ErrorCode::OK) {
+            HAMetricManager::instance().inc_oplog_write_failures();
             if (err == ErrorCode::INVALID_PARAMS) {
                 CompleteWrite(ctx, pending, err);
                 continue;
@@ -335,6 +355,9 @@ void RedisOpLogStore::AsyncWriteLoop(size_t worker_id) {
                     inflight_writes_.erase(pending->entry.sequence_id);
                     pending->done = true;
                     pending->result = ErrorCode::INTERNAL_ERROR;
+                    HAMetricManager::instance().inc_oplog_best_effort_dropped();
+                    HAMetricManager::instance().set_oplog_async_queue_size(
+                        static_cast<int64_t>(inflight_writes_.size()));
                     sync_cv_.notify_all();
                     LOG(ERROR) << "RedisOpLogStore: dropping best-effort oplog"
                                << ", sequence_id=" << pending->entry.sequence_id
@@ -350,6 +373,7 @@ void RedisOpLogStore::AsyncWriteLoop(size_t worker_id) {
                          << ", sequence_id=" << pending->entry.sequence_id
                          << ", attempts=" << attempts
                          << ", error=" << toString(err);
+            HAMetricManager::instance().inc_oplog_write_retries();
             std::this_thread::sleep_for(
                 std::chrono::milliseconds(kAsyncRetryDelayMs));
             {
@@ -421,6 +445,10 @@ ErrorCode RedisOpLogStore::AdvanceCommittedLatestUnlocked(redisContext* ctx) {
         }
     }
     committed_sequence_id_ = target;
+    HAMetricManager::instance().set_oplog_last_sequence_id(
+        static_cast<int64_t>(target));
+    HAMetricManager::instance().set_oplog_async_queue_size(
+        static_cast<int64_t>(inflight_writes_.size()));
     sync_cv_.notify_all();
     return ErrorCode::OK;
 }
@@ -433,6 +461,8 @@ void RedisOpLogStore::CompleteWrite(
         pending->done = true;
         pending->result = result;
         inflight_writes_.erase(pending->entry.sequence_id);
+        HAMetricManager::instance().set_oplog_async_queue_size(
+            static_cast<int64_t>(inflight_writes_.size()));
         sync_cv_.notify_all();
         return;
     }
@@ -441,6 +471,8 @@ void RedisOpLogStore::CompleteWrite(
         pending->done = true;
         pending->result = ErrorCode::OK;
         inflight_writes_.erase(pending->entry.sequence_id);
+        HAMetricManager::instance().set_oplog_async_queue_size(
+            static_cast<int64_t>(inflight_writes_.size()));
         sync_cv_.notify_all();
         return;
     }
@@ -536,6 +568,8 @@ ErrorCode RedisOpLogStore::ReadOpLogSinceWithProgress(
         LOG(ERROR) << "RedisOpLogStore::ReadOpLogSince: invalid latest value";
         return ErrorCode::INTERNAL_ERROR;
     }
+    HAMetricManager::instance().set_oplog_last_sequence_id(
+        static_cast<int64_t>(latest_sequence_id));
 
     uint64_t trimmed_sequence_id = 0;
     RedisReplyPtr trimmed_reply((redisReply*)redisCommand(
@@ -654,6 +688,7 @@ ErrorCode RedisOpLogStore::GetLatestSequenceId(uint64_t& sequence_id) {
     }
     if (reply->type == REDIS_REPLY_NIL) {
         sequence_id = 0;
+        HAMetricManager::instance().set_oplog_last_sequence_id(0);
         return ErrorCode::OK;
     }
     if (reply->type != REDIS_REPLY_STRING ||
@@ -661,6 +696,8 @@ ErrorCode RedisOpLogStore::GetLatestSequenceId(uint64_t& sequence_id) {
         LOG(ERROR) << "RedisOpLogStore::GetLatestSequenceId: invalid value";
         return ErrorCode::INTERNAL_ERROR;
     }
+    HAMetricManager::instance().set_oplog_last_sequence_id(
+        static_cast<int64_t>(sequence_id));
     return ErrorCode::OK;
 }
 

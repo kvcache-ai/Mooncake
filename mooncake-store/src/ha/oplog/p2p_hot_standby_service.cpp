@@ -6,6 +6,8 @@
 #include <utility>
 #include <vector>
 
+#include "ha_metric_manager.h"
+
 namespace mooncake {
 
 P2PHotStandbyService::P2PHotStandbyService(P2PHotStandbyConfig config)
@@ -157,6 +159,7 @@ ErrorCode P2PHotStandbyService::Promote(bool force) {
     }
 
     if (force_apply_failure) {
+        HAMetricManager::instance().inc_force_promotions();
         LOG(ERROR) << "P2PHotStandbyService: forcing promotion with unapplied "
                       "OpLog entry"
                    << ", failed_sequence_id="
@@ -231,6 +234,7 @@ ErrorCode P2PHotStandbyService::FinalCatchUpForPromotionLocked(
         ErrorCode read_err = catch_up_store->ReadOpLogSinceWithProgress(
             read_from_seq, kBatchSize, batch, progress);
         if (read_err != ErrorCode::OK) {
+            HAMetricManager::instance().inc_promotion_catchup_incomplete();
             LOG(WARNING) << "P2PHotStandbyService: final catch-up read failed"
                          << ", from_seq=" << read_from_seq
                          << ", error=" << toString(read_err)
@@ -261,6 +265,7 @@ ErrorCode P2PHotStandbyService::FinalCatchUpForPromotionLocked(
     }
 
     if (batch_count >= kMaxCatchUpBatches) {
+        HAMetricManager::instance().inc_promotion_catchup_incomplete();
         // Do not block promotion solely on the bounded catch-up loop. The
         // promoted primary continues from the best applied state in this phase.
         LOG(WARNING) << "P2PHotStandbyService: final catch-up reached batch "
@@ -297,6 +302,8 @@ P2PStandbySyncStatus P2PHotStandbyService::GetSyncStatus() const {
     if (status.primary_seq_id > status.applied_seq_id) {
         status.lag_entries = status.primary_seq_id - status.applied_seq_id;
     }
+    HAMetricManager::instance().set_oplog_standby_lag(
+        static_cast<int64_t>(status.lag_entries));
     return status;
 }
 
