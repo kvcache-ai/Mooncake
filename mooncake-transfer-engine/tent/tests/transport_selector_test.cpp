@@ -307,6 +307,81 @@ TEST(TopologyTest, UbDeviceAttributesRoundTripThroughJson) {
     EXPECT_EQ(round_tripped->device_attrs, ub.device_attrs);
 }
 
+TEST(ControlPlaneTest, UbBootstrapJsonRoundTripsNativeIdentity) {
+    UbBootstrapDesc source;
+    source.protocol_version = 1;
+    source.segment_name = "peer-segment";
+    source.local_nic_path = "local/ub-device-0/eid-2";
+    source.peer_nic_path = "peer/ub-device-1/eid-3";
+    source.local_device_name = "ub-device-0";
+    source.local_device_id = 7;
+    source.local_eid_index = 2;
+    source.local_eid = "e1:02:03:04:05:06:07:08";
+    source.jetty_ids = {11, 12};
+    source.jetty_uasids = {21, 22};
+    source.endpoint_generation = 41;
+    source.segment_generation = 42;
+    source.capabilities = {"read", "write"};
+    source.reply_msg = "ok";
+
+    const auto parsed = json(source).get<UbBootstrapDesc>();
+    EXPECT_EQ(parsed.protocol_version, source.protocol_version);
+    EXPECT_EQ(parsed.segment_name, source.segment_name);
+    EXPECT_EQ(parsed.local_nic_path, source.local_nic_path);
+    EXPECT_EQ(parsed.peer_nic_path, source.peer_nic_path);
+    EXPECT_EQ(parsed.local_device_name, source.local_device_name);
+    EXPECT_EQ(parsed.local_device_id, source.local_device_id);
+    EXPECT_EQ(parsed.local_eid_index, source.local_eid_index);
+    EXPECT_EQ(parsed.local_eid, source.local_eid);
+    EXPECT_EQ(parsed.jetty_ids, source.jetty_ids);
+    EXPECT_EQ(parsed.jetty_uasids, source.jetty_uasids);
+    EXPECT_EQ(parsed.endpoint_generation, source.endpoint_generation);
+    EXPECT_EQ(parsed.segment_generation, source.segment_generation);
+    EXPECT_EQ(parsed.capabilities, source.capabilities);
+    EXPECT_EQ(parsed.reply_msg, source.reply_msg);
+}
+
+TEST(ControlPlaneTest, UbBootstrapJsonDefaultsOptionalFields) {
+    const auto parsed = json{{"protocol_version", 1}}.get<UbBootstrapDesc>();
+    EXPECT_EQ(parsed.protocol_version, 1u);
+    EXPECT_TRUE(parsed.segment_name.empty());
+    EXPECT_TRUE(parsed.local_nic_path.empty());
+    EXPECT_TRUE(parsed.peer_nic_path.empty());
+    EXPECT_TRUE(parsed.local_device_name.empty());
+    EXPECT_EQ(parsed.local_device_id, -1);
+    EXPECT_EQ(parsed.local_eid_index, -1);
+    EXPECT_TRUE(parsed.local_eid.empty());
+    EXPECT_TRUE(parsed.jetty_ids.empty());
+    EXPECT_TRUE(parsed.jetty_uasids.empty());
+    EXPECT_EQ(parsed.endpoint_generation, 0u);
+    EXPECT_EQ(parsed.segment_generation, 0u);
+    EXPECT_TRUE(parsed.capabilities.empty());
+    EXPECT_TRUE(parsed.reply_msg.empty());
+}
+
+TEST(ControlPlaneTest, UbBootstrapJsonRejectsMissingOrUnknownVersion) {
+    EXPECT_THROW((void)json::object().get<UbBootstrapDesc>(),
+                 std::invalid_argument);
+    const json unknown_version{{"protocol_version", 2}};
+    EXPECT_THROW((void)unknown_version.get<UbBootstrapDesc>(),
+                 std::invalid_argument);
+}
+
+TEST(ControlPlaneTest, UbBootstrapRpcIdIsAppendedWithoutRenumbering) {
+    EXPECT_EQ(static_cast<int>(GetSegmentDesc), 1);
+    EXPECT_EQ(static_cast<int>(BootstrapRdma), 2);
+    EXPECT_EQ(static_cast<int>(SendData), 3);
+    EXPECT_EQ(static_cast<int>(RecvData), 4);
+    EXPECT_EQ(static_cast<int>(Notify), 5);
+    EXPECT_EQ(static_cast<int>(Probe), 6);
+    EXPECT_EQ(static_cast<int>(Delegate), 7);
+    EXPECT_EQ(static_cast<int>(Pin), 8);
+    EXPECT_EQ(static_cast<int>(Unpin), 9);
+    EXPECT_EQ(static_cast<int>(SubscribeSegmentUpdate), 10);
+    EXPECT_EQ(static_cast<int>(NotifySegmentUpdated), 11);
+    EXPECT_EQ(static_cast<int>(BootstrapUb), 12);
+}
+
 // ---------------------------------------------------------------------------
 // Test legacy mode
 // ---------------------------------------------------------------------------
@@ -653,6 +728,64 @@ TEST(TransportSelectorTest, ConfigBasedPolicySelection) {
     EXPECT_EQ(result.transport, RDMA);
 }
 
+TEST(TransportSelectorTest, PolicyCanPreferUb) {
+    auto conf = std::make_shared<Config>();
+    json policy;
+    policy["name"] = "ub-preferred";
+    policy["segment_type"] = "memory";
+    policy["transports"] = {"ub", "rdma"};
+    conf->set("policy", json::array({policy}));
+
+    TransportSelector selector(conf);
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[UB] = std::make_shared<FakeTransport>(UB);
+    transports[RDMA] = std::make_shared<FakeTransport>(RDMA);
+    static_cast<FakeTransport*>(transports[UB].get())->setDramToDram(true);
+    static_cast<FakeTransport*>(transports[RDMA].get())->setDramToDram(true);
+
+    std::vector<TransportType> buffer_transports = {RDMA, UB};
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = false;
+    ctx.local_memory_type = MTYPE_CPU;
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.transfer_size = 4096;
+    ctx.buffer_transports = &buffer_transports;
+    ctx.policy_name = "ub-preferred";
+
+    EXPECT_EQ(selector.select(ctx, transports).transport, UB);
+}
+
+TEST(TransportSelectorTest, PolicyFallsBackWhenUbIsIncapable) {
+    auto conf = std::make_shared<Config>();
+    json policy;
+    policy["name"] = "ub-with-rdma-fallback";
+    policy["segment_type"] = "memory";
+    policy["transports"] = {"ub", "rdma"};
+    conf->set("policy", json::array({policy}));
+
+    TransportSelector selector(conf);
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[UB] = std::make_shared<FakeTransport>(UB);
+    transports[RDMA] = std::make_shared<FakeTransport>(RDMA);
+    // UB is installed but deliberately lacks dram_to_dram capability.
+    static_cast<FakeTransport*>(transports[RDMA].get())->setDramToDram(true);
+
+    std::vector<TransportType> buffer_transports = {UB, RDMA};
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = false;
+    ctx.local_memory_type = MTYPE_CPU;
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.transfer_size = 4096;
+    ctx.buffer_transports = &buffer_transports;
+    ctx.policy_name = "ub-with-rdma-fallback";
+
+    EXPECT_EQ(selector.select(ctx, transports).transport, RDMA);
+}
+
 // ---------------------------------------------------------------------------
 // hint: per-request transport_hint hook on select()
 // ---------------------------------------------------------------------------
@@ -717,6 +850,36 @@ TEST(TransportSelectorTest, HintIsPrependedToCandidateList) {
     EXPECT_EQ(r0.transport, TCP);
     auto r1 = selector.select(ctx, transports, /*index=*/1, /*hint=*/TCP);
     EXPECT_EQ(r1.transport, RDMA);
+}
+
+TEST(TransportSelectorTest, UbHintIsPrependedAndThenFallsBackByIndex) {
+    auto conf = std::make_shared<Config>();
+    TransportSelector selector(conf);
+
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[UB] = std::make_shared<FakeTransport>(UB);
+    transports[RDMA] = std::make_shared<FakeTransport>(RDMA);
+    static_cast<FakeTransport*>(transports[UB].get())->setDramToDram(true);
+    static_cast<FakeTransport*>(transports[RDMA].get())->setDramToDram(true);
+
+    std::vector<TransportType> buffer_transports = {RDMA, UB};
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = false;
+    ctx.local_memory_type = MTYPE_CPU;
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.buffer_transports = &buffer_transports;
+
+    EXPECT_EQ(
+        selector.select(ctx, transports, /*index=*/0, /*hint=*/UB).transport,
+        UB);
+    EXPECT_EQ(
+        selector.select(ctx, transports, /*index=*/1, /*hint=*/UB).transport,
+        RDMA);
+    EXPECT_EQ(
+        selector.select(ctx, transports, /*index=*/2, /*hint=*/UB).transport,
+        UNSPEC);
 }
 
 TEST(TransportSelectorTest, HintNotInMatchingPolicyReturnsUnspec) {

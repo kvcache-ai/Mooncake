@@ -25,6 +25,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -57,6 +58,65 @@ struct BootstrapDesc {
                                    notify_qp_num);
 };
 
+// UB/URMA has Jetty, JFC and EID concepts that are not wire-compatible with
+// RDMA QPs, CQs and GIDs.  Keep a dedicated bootstrap envelope so neither
+// transport has to smuggle native identifiers through the other's fields.
+struct UbBootstrapDesc {
+    uint32_t protocol_version = 1;
+    std::string segment_name;
+    std::string local_nic_path;
+    std::string peer_nic_path;
+    std::string local_device_name;
+    int local_device_id = -1;
+    int local_eid_index = -1;
+    std::string local_eid;
+    std::vector<uint32_t> jetty_ids;
+    // UASID is part of urma_jetty_id_t on providers that use nonzero address
+    // spaces. Kept parallel to jetty_ids for protocol-v1 compatibility.
+    std::vector<uint32_t> jetty_uasids;
+    uint64_t endpoint_generation = 0;
+    uint64_t segment_generation = 0;
+    std::vector<std::string> capabilities;
+    std::string reply_msg;
+};
+
+inline void to_json(nlohmann::json& j, const UbBootstrapDesc& desc) {
+    j = nlohmann::json{{"protocol_version", desc.protocol_version},
+                       {"segment_name", desc.segment_name},
+                       {"local_nic_path", desc.local_nic_path},
+                       {"peer_nic_path", desc.peer_nic_path},
+                       {"local_device_name", desc.local_device_name},
+                       {"local_device_id", desc.local_device_id},
+                       {"local_eid_index", desc.local_eid_index},
+                       {"local_eid", desc.local_eid},
+                       {"jetty_ids", desc.jetty_ids},
+                       {"jetty_uasids", desc.jetty_uasids},
+                       {"endpoint_generation", desc.endpoint_generation},
+                       {"segment_generation", desc.segment_generation},
+                       {"capabilities", desc.capabilities},
+                       {"reply_msg", desc.reply_msg}};
+}
+
+inline void from_json(const nlohmann::json& j, UbBootstrapDesc& desc) {
+    desc.protocol_version = j.value("protocol_version", 0u);
+    if (desc.protocol_version != 1) {
+        throw std::invalid_argument("unsupported UB bootstrap version");
+    }
+    desc.segment_name = j.value("segment_name", "");
+    desc.local_nic_path = j.value("local_nic_path", "");
+    desc.peer_nic_path = j.value("peer_nic_path", "");
+    desc.local_device_name = j.value("local_device_name", "");
+    desc.local_device_id = j.value("local_device_id", -1);
+    desc.local_eid_index = j.value("local_eid_index", -1);
+    desc.local_eid = j.value("local_eid", "");
+    desc.jetty_ids = j.value("jetty_ids", std::vector<uint32_t>{});
+    desc.jetty_uasids = j.value("jetty_uasids", std::vector<uint32_t>{});
+    desc.endpoint_generation = j.value("endpoint_generation", uint64_t{0});
+    desc.segment_generation = j.value("segment_generation", uint64_t{0});
+    desc.capabilities = j.value("capabilities", std::vector<std::string>{});
+    desc.reply_msg = j.value("reply_msg", "");
+}
+
 struct XferDataDesc {
     uint64_t peer_mem_addr;
     size_t length;
@@ -64,6 +124,9 @@ struct XferDataDesc {
 
 using OnReceiveBootstrap =
     std::function<int(const BootstrapDesc& request, BootstrapDesc& response)>;
+
+using OnReceiveUbBootstrap = std::function<int(const UbBootstrapDesc& request,
+                                               UbBootstrapDesc& response)>;
 
 using OnNotify = std::function<int(const Notification&)>;
 
@@ -80,6 +143,10 @@ class ControlClient {
     static Status bootstrap(const std::string& server_addr,
                             const BootstrapDesc& request,
                             BootstrapDesc& response);
+
+    static Status bootstrapUb(const std::string& server_addr,
+                              const UbBootstrapDesc& request,
+                              UbBootstrapDesc& response);
 
     static Status sendData(const std::string& server_addr,
                            uint64_t peer_mem_addr, void* local_mem_addr,
@@ -136,6 +203,11 @@ class ControlService {
 
     void setBootstrapRdmaCallback(const OnReceiveBootstrap& callback);
 
+    void setBootstrapUbCallback(const OnReceiveUbBootstrap& callback) {
+        std::lock_guard<std::mutex> lock(ub_bootstrap_callback_mutex_);
+        ub_bootstrap_callback_ = callback;
+    }
+
     void setNotifyCallback(const OnNotify& callback);
 
     Status start(uint16_t& port, bool ipv6_ = false, size_t threads = 1);
@@ -146,6 +218,8 @@ class ControlService {
 
     void onBootstrapRdma(const std::string_view& request,
                          std::string& response);
+
+    void onBootstrapUb(const std::string_view& request, std::string& response);
 
     void onSendData(const std::string_view& request, std::string& response);
 
@@ -183,6 +257,9 @@ class ControlService {
     std::chrono::milliseconds callback_drain_timeout_{std::chrono::seconds(5)};
     OnReceiveBootstrap bootstrap_callback_;
     static thread_local const ControlService* active_bootstrap_service_;
+
+    std::mutex ub_bootstrap_callback_mutex_;
+    OnReceiveUbBootstrap ub_bootstrap_callback_;
 
     std::mutex notify_cb_mutex_;
     std::condition_variable notify_cb_cv_;
