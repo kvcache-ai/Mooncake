@@ -891,6 +891,10 @@ TEST_F(PromotionOnHitTest, HeartbeatBoundedBatchPreservesLeftovers) {
 TEST_F(PromotionOnHitTest, ReaperPopsStagedMemoryReplicaOnExpiry) {
     MasterServiceConfig config;
     config.enable_offload = true;
+    config.enable_multi_tenants = true;
+    config.tenant_quota_connector_type = "file";
+    config.tenant_quota_connector_uri =
+        WriteTenantQuotaPolicyFile({{TenantId::Default().value(), 4096}});
     config.promotion_on_hit = true;
     config.promotion_admission_threshold = 1;
     config.default_kv_lease_ttl = 2000;
@@ -919,6 +923,9 @@ TEST_F(PromotionOnHitTest, ReaperPopsStagedMemoryReplicaOnExpiry) {
     auto alloc = service->PromotionAllocStart(ctx.client_id, "k_cold",
                                               TenantId::Default(), 1024, {});
     ASSERT_TRUE(alloc.has_value());
+    ASSERT_EQ(
+        service->GetTenantQuotaSnapshot(TenantId::Default())->charged_bytes,
+        1024);
 
     // After AllocStart, the DRAM allocator must have committed bytes for
     // the staged PROCESSING MEMORY replica.
@@ -950,6 +957,8 @@ TEST_F(PromotionOnHitTest, ReaperPopsStagedMemoryReplicaOnExpiry) {
         << "be freed back to the DRAM allocator. If this fires, the "
         << "reaper is not popping the staged replica and the buffer "
         << "leaks until the object itself is removed or evicted.";
+    EXPECT_EQ(
+        service->GetTenantQuotaSnapshot(TenantId::Default())->charged_bytes, 0);
 
     // NotifyPromotionSuccess for a reaped task must not commit anything
     // and must return REPLICA_IS_NOT_READY (the task entry is gone, so
@@ -1199,6 +1208,48 @@ TEST_F(PromotionOnHitTest, NotifySuccessDecrementsCounter) {
         << "k_second is silently dropped.";
     EXPECT_EQ(CountPromotionTask(*pending, "k_second"), 1u);
 
+    service->RemoveAll();
+}
+
+TEST_F(PromotionOnHitTest, TenantQuotaChargesAtAllocStartAndSettlesLifecycle) {
+    const TenantId tenant_id("tenant-a");
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.enable_multi_tenants = true;
+    config.tenant_quota_connector_type = "file";
+    config.tenant_quota_connector_uri =
+        WriteTenantQuotaPolicyFile({{tenant_id.value(), 4096}});
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto seg =
+        PrepareSegment(*service, "seg_quota", kDefaultSegmentBase, seg_size);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "success", 1024,
+                                       seg.segment_name, tenant_id.value()));
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "failure", 1024,
+                                       seg.segment_name, tenant_id.value()));
+
+    ASSERT_TRUE(service->GetReplicaList("success", tenant_id));
+    ASSERT_TRUE(service->PromotionAllocStart(seg.client_id, "success",
+                                             tenant_id, 1024, {}));
+    ASSERT_EQ(service->GetTenantQuotaSnapshot(tenant_id)->charged_bytes, 1024);
+    ASSERT_TRUE(
+        service->NotifyPromotionSuccess(seg.client_id, "success", tenant_id));
+    EXPECT_EQ(service->GetTenantQuotaSnapshot(tenant_id)->charged_bytes, 1024);
+
+    ASSERT_TRUE(service->GetReplicaList("failure", tenant_id));
+    ASSERT_TRUE(service->PromotionAllocStart(seg.client_id, "failure",
+                                             tenant_id, 1024, {}));
+    ASSERT_EQ(service->GetTenantQuotaSnapshot(tenant_id)->charged_bytes, 2048);
+    ASSERT_TRUE(
+        service->NotifyPromotionFailure(seg.client_id, "failure", tenant_id));
+    EXPECT_EQ(service->GetTenantQuotaSnapshot(tenant_id)->charged_bytes, 1024);
+
+    ASSERT_TRUE(service->Remove("success", tenant_id, /*force=*/true));
+    EXPECT_EQ(service->GetTenantQuotaSnapshot(tenant_id)->charged_bytes, 0);
     service->RemoveAll();
 }
 

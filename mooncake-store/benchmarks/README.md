@@ -2,6 +2,96 @@
 
 This directory contains benchmark tools for Mooncake Store internals.
 
+## Tenant Quota Mutex versus CAS Benchmark
+
+`tenant_quota_bench` is a standalone microbenchmark for comparing the current
+mutex-based tenant quota state machine with the proposed unified
+`charged_bytes` CAS state.
+
+The mutex baseline models the current quota-table shard lock and
+`used_bytes`/`reserved_bytes` transitions. The CAS implementation models the
+proposed handle-based hot path, including the admission bit, effective-quota
+load, policy-sequence validation, guarded release, and CAS retry accounting.
+The benchmark uses direct tenant indexing, so the mutex result does not include
+tenant map lookup overhead. It also excludes metadata-object counter updates
+and all non-quota Master work, making it a conservative comparison focused on
+charge, settlement, and release.
+
+Build through CMake:
+
+```bash
+cmake --build build --target tenant_quota_bench -j$(nproc)
+```
+
+The source has no Mooncake runtime dependencies and can also be copied to
+another server and compiled directly:
+
+```bash
+g++ -O3 -DNDEBUG -std=c++17 -pthread \
+  mooncake-store/benchmarks/tenant_quota_bench.cpp \
+  -o tenant_quota_bench
+```
+
+Run a same-tenant, successful-lifecycle comparison:
+
+```bash
+./tenant_quota_bench \
+  --threads=32 \
+  --tenants=1 \
+  --workload=commit \
+  --iterations=1000000 \
+  --warmup=100000 \
+  --rounds=5 \
+  --pin-threads
+```
+
+Run an abort/refund comparison:
+
+```bash
+./tenant_quota_bench \
+  --threads=32 \
+  --tenants=1 \
+  --workload=abort \
+  --iterations=1000000 \
+  --rounds=5 \
+  --pin-threads
+```
+
+Sweep thread counts:
+
+```bash
+for threads in 1 2 4 8 16 32 64; do
+  ./tenant_quota_bench \
+    --threads="${threads}" \
+    --tenants=1 \
+    --workload=commit \
+    --iterations=1000000 \
+    --rounds=5 \
+    --pin-threads
+done
+```
+
+The `commit` workload runs `Reserve+Commit+Release` for the mutex baseline and
+`TryCharge+no-op settlement+Release` for CAS. The `abort` workload runs
+`Reserve+Abort` versus `TryCharge+Release`. `--work=N` adds CPU work between
+quota calls to model lower operation density.
+
+Use one tenant to measure maximum same-tenant contention. Use
+`--tenants=<thread count> --tenant-pattern=sticky` to measure the uncontended
+case, or `--tenant-pattern=round_robin` to distribute every worker across
+tenants. Keep `quota-bytes >= threads * charge-bytes` when measuring the hot
+success path; rejected admissions are reported separately.
+
+Each `RESULT` line reports lifecycle Mops, average ns/op, charge and release CAS
+retries, rejected admissions, accounting errors, and final charged bytes.
+`SUMMARY` reports median mutex and CAS throughput and the CAS speedup. A
+non-zero exit status indicates an accounting mismatch or leaked final charge.
+
+For cross-server comparisons, use the same compiler, optimization flags,
+thread affinity, NUMA placement, CPU frequency policy, and command line. The
+benchmark alternates mutex/CAS execution order between rounds to reduce
+order-dependent bias.
+
 ## Allocation Strategy Benchmark
 
 `allocation_strategy_bench` evaluates Store allocation behavior across segment

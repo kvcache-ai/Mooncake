@@ -8,7 +8,7 @@
 
 namespace mooncake {
 
-// Thread-safe production wrapper around TenantQuotaTable. Per-tenant
+// Thread-safe production wrapper around TenantQuotaShard. Per-tenant
 // operations lock only one shard; cross-shard policy, usage, and recompute
 // operations are serialized by recompute_mutex_.
 template <size_t NumShards = 1024>
@@ -22,36 +22,28 @@ class ShardedTenantQuotaTable {
                                          uint64_t allocatable_capacity_bytes);
     TenantQuotaPolicyResult DisableTenantPolicyIfEmpty(
         const TenantId& tenant_id);
-    void ApplyTenantPolicies(const TenantQuotaPolicyMap& policies,
-                             uint64_t allocatable_capacity_bytes);
+    TenantQuotaResult ApplyTenantPolicies(const TenantQuotaPolicyMap& policies,
+                                          uint64_t allocatable_capacity_bytes);
     TenantQuotaPolicyMap GetTenantPolicies() const;
 
     void RecomputeEffectiveQuotas(uint64_t allocatable_capacity_bytes);
 
     bool IsTenantRegistered(const TenantId& tenant_id) const;
+    // May create a stable closed tombstone for a previously unseen tenant.
+    TenantQuotaHandle GetOrCreateTenantHandle(const TenantId& tenant_id);
     std::optional<TenantQuotaSnapshot> GetTenantSnapshot(
         const TenantId& tenant_id) const;
     std::vector<TenantQuotaSnapshot> ListTenantSnapshots() const;
-    uint64_t ComputeDeficit(const TenantId& tenant_id,
-                            uint64_t incoming_bytes) const;
 
-    TenantQuotaResult Reserve(const TenantId& tenant_id, uint64_t bytes);
-    TenantQuotaResult Commit(const TenantId& tenant_id, uint64_t bytes);
-    TenantQuotaResult CommitAdditional(const TenantId& tenant_id,
-                                       uint64_t bytes);
-    TenantQuotaResult Abort(const TenantId& tenant_id, uint64_t bytes);
-    TenantQuotaResult Release(const TenantId& tenant_id, uint64_t bytes);
-    TenantQuotaResult ReleasePartial(const TenantId& tenant_id, uint64_t bytes);
-
-    void IncrementMetadataObjectCount(const TenantId& tenant_id);
-    TenantQuotaResult DecrementMetadataObjectCount(const TenantId& tenant_id);
-    void RebuildUsage(const TenantQuotaUsageMap& usage,
-                      uint64_t allocatable_capacity_bytes);
+    // Rebuild overwrites runtime accounting and must only run while data-plane
+    // charge/release operations are quiescent.
+    TenantQuotaResult RebuildUsage(const TenantQuotaUsageMap& usage,
+                                   uint64_t allocatable_capacity_bytes);
 
    private:
     struct Shard {
         mutable std::mutex mutex;
-        TenantQuotaTable table;
+        TenantQuotaShard table;
     };
 
     size_t GetShardIndex(const TenantId& tenant_id) const;
