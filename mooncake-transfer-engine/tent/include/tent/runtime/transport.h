@@ -59,6 +59,13 @@ class Transport {
         // no pool (default spray). Carried like device_mask, from the matched
         // SelectionPolicy down to each RdmaTask.
         std::string qp_pool;
+        // Runtime receiver-credit authorization bound to the next submitted
+        // task. Native transports copy this fence into their asynchronous
+        // work so a refreshed segment cannot post under a different receiver
+        // session than the one that granted capacity.
+        uint64_t receiver_credit_session_high{0};
+        uint64_t receiver_credit_session_low{0};
+        uint64_t receiver_credit_epoch{0};
         BatchID progress_batch_id{0};
         std::function<void(BatchID)> notify_progress;
     };

@@ -78,6 +78,30 @@ Status validateLimits(const QueueLimits& limits) {
 LocalTransferAdmissionQueue::LocalTransferAdmissionQueue(QueueLimits limits)
     : limits_(limits), limits_status_(validateLimits(limits)) {}
 
+void LocalTransferAdmissionQueue::enqueueOwner(QueueOwnerId owner_id) {
+    fifo_.push_back(owner_id);
+    if (!limits_.deadline_aware) return;
+
+    // Promotion and defer can both disturb the deque's prior global order.
+    // Re-establish the explicit (round, EDF) ordering on admission instead of
+    // passing a potentially rotated range to an ordered insertion algorithm.
+    // stable_sort preserves FIFO order for equal deadlines.
+    std::stable_sort(
+        fifo_.begin(), fifo_.end(), [this](QueueOwnerId lhs, QueueOwnerId rhs) {
+            const auto lhs_it = owners_.find(lhs);
+            const auto rhs_it = owners_.find(rhs);
+            if (lhs_it == owners_.end()) return false;
+            if (rhs_it == owners_.end()) return true;
+            const auto& lhs_owner = lhs_it->second;
+            const auto& rhs_owner = rhs_it->second;
+            if (lhs_owner.scheduling_round != rhs_owner.scheduling_round) {
+                return lhs_owner.scheduling_round < rhs_owner.scheduling_round;
+            }
+            return deadlineKey(lhs_owner.request.deadline_ns) <
+                   deadlineKey(rhs_owner.request.deadline_ns);
+        });
+}
+
 Status LocalTransferAdmissionQueue::tryAdmit(
     const QueueSubmit& submit, std::vector<QueueOwnerId>& admitted_owner_ids) {
     admitted_owner_ids.clear();
@@ -181,6 +205,17 @@ Status LocalTransferAdmissionQueue::tryAdmit(
         owner.kind = owner_input.kind;
         owner.transport = owner_input.transport;
         owner.degradation_eligible = owner_input.degradation_eligible;
+        if (limits_.deadline_aware) {
+            for (const auto queued_id : fifo_) {
+                auto queued_it = owners_.find(queued_id);
+                if (queued_it != owners_.end() &&
+                    queued_it->second.state == QueueState::Queued) {
+                    owner.scheduling_round =
+                        std::max(owner.scheduling_round,
+                                 queued_it->second.scheduling_round);
+                }
+            }
+        }
         owners_.emplace(owner_id, owner);
 
         public_to_owner_[{submit.batch_token, owner_input.owner_task_id}] =
@@ -189,26 +224,8 @@ Status LocalTransferAdmissionQueue::tryAdmit(
             public_to_owner_[{submit.batch_token, derived_task_id}] = owner_id;
         }
         // RFC #2519 step 2: keep fifo_ ordered on admission so pickForDispatch
-        // never has to re-sort. Default (deadline_aware == false) appends in
-        // strict FIFO. When deadline-aware, insert at the earliest-deadline-
-        // first position; upper_bound places a new owner *after* existing
-        // owners with the same deadline, preserving FIFO order among ties.
-        if (limits_.deadline_aware) {
-            const uint64_t key = deadlineKey(owner.request.deadline_ns);
-            auto pos = std::upper_bound(
-                fifo_.begin(), fifo_.end(), key,
-                [this](uint64_t k, QueueOwnerId id) {
-                    auto it = owners_.find(id);
-                    uint64_t d =
-                        (it == owners_.end())
-                            ? std::numeric_limits<uint64_t>::max()
-                            : deadlineKey(it->second.request.deadline_ns);
-                    return k < d;
-                });
-            fifo_.insert(pos, owner_id);
-        } else {
-            fifo_.push_back(owner_id);
-        }
+        // never has to re-sort.
+        enqueueOwner(owner_id);
         admitted_owner_ids.push_back(owner_id);
     }
 
@@ -271,16 +288,26 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
                              .count()))
             : 0;
 
-    // Deadline proximity promotion: partition fifo_ so owners with critical
-    // slack (deadline approaching within promotion_slack_ns) appear before
-    // owners with comfortable slack or no deadline. stable_partition preserves
-    // relative EDF order within each group.
+    // Deadline proximity promotion applies only inside the earliest
+    // scheduling round. A resource-starved owner that defer() moved to the
+    // next round must not jump back ahead of current-round waiters merely
+    // because its deadline is urgent.
     if (promotion_enabled) {
+        uint64_t current_round = std::numeric_limits<uint64_t>::max();
+        for (const auto owner_id : fifo_) {
+            auto owner_it = owners_.find(owner_id);
+            if (owner_it != owners_.end() &&
+                owner_it->second.state == QueueState::Queued) {
+                current_round =
+                    std::min(current_round, owner_it->second.scheduling_round);
+            }
+        }
         std::stable_partition(fifo_.begin(), fifo_.end(), [&](QueueOwnerId id) {
             auto it = owners_.find(id);
             if (it == owners_.end() || it->second.state != QueueState::Queued) {
                 return false;
             }
+            if (it->second.scheduling_round != current_round) return false;
             const uint64_t dl = it->second.request.deadline_ns;
             if (dl == 0 || dl <= now_ns) return false;
             return (dl - now_ns) < limits_.promotion_slack_ns;
@@ -381,6 +408,35 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
         used_bytes += owner.request.length;
     }
     return picked;
+}
+
+Status LocalTransferAdmissionQueue::defer(QueueOwnerId owner_id) {
+    if (owner_id == 0) {
+        return Status::InvalidArgument("invalid queue owner id" LOC_MARK);
+    }
+
+    auto owner_it = owners_.find(owner_id);
+    if (owner_it == owners_.end()) {
+        return Status::InvalidEntry("queue owner not found" LOC_MARK);
+    }
+    if (owner_it->second.state != QueueState::Dispatching) {
+        return Status::InvalidEntry("queue owner is not dispatching" LOC_MARK);
+    }
+
+    // A resource-deferred EDF owner advances one scheduling round. It yields
+    // to every owner already waiting in this round while retaining EDF order
+    // among owners that yielded into the next one.
+    if (limits_.deadline_aware) {
+        if (owner_it->second.scheduling_round ==
+            std::numeric_limits<uint64_t>::max()) {
+            return Status::InternalError(
+                "admission scheduling round exhausted" LOC_MARK);
+        }
+        ++owner_it->second.scheduling_round;
+    }
+    owner_it->second.state = QueueState::Queued;
+    enqueueOwner(owner_id);
+    return Status::OK();
 }
 
 Status LocalTransferAdmissionQueue::complete(

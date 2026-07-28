@@ -147,6 +147,12 @@ class LocalTransferAdmissionQueue {
         size_t max_owners, size_t max_bytes,
         std::vector<QueueOwnerId>* dropped_owner_ids = nullptr);
 
+    // Return an owner that could not be handed off to its selected transport
+    // from the dispatch window to the queue. Only a Dispatching owner can be
+    // deferred. Outstanding owner/byte accounting remains charged while the
+    // owner waits for a later dispatch attempt.
+    Status defer(QueueOwnerId owner_id);
+
     // Install the step-3 degradation policy inputs. Optional; without it the
     // queue never drops (default behavior). now defaults to steady_clock.
     void setDegradationPolicy(BandwidthProvider bandwidth_provider,
@@ -192,9 +198,15 @@ class LocalTransferAdmissionQueue {
         QueueOwnerKind kind{QueueOwnerKind::User};
         TransportType transport{UNSPEC};
         bool degradation_eligible{false};
+        // EDF owners that yield because a downstream resource is unavailable
+        // move to the next scheduling round. This preserves progress without
+        // relying on a rotated deque remaining globally deadline-sorted.
+        uint64_t scheduling_round{0};
         QueueState state{QueueState::Queued};
         TransferStatusEnum terminal_status{TransferStatusEnum::PENDING};
     };
+
+    void enqueueOwner(QueueOwnerId owner_id);
 
     QueueLimits limits_;
     Status limits_status_;

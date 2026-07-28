@@ -252,6 +252,193 @@ TEST(AdmissionQueueTest, KeepsAdmissionOrderForDispatch) {
     EXPECT_EQ(picked, expected_ids);
 }
 
+TEST(AdmissionQueueTest, DefersDispatchingOwnerToFifoTailWithoutReaccounting) {
+    LocalTransferAdmissionQueue queue({4, 128, 0, 0});
+    std::vector<QueueOwnerId> admitted_ids;
+    ASSERT_TRUE(queue
+                    .tryAdmit(makeSubmit(1, 3,
+                                         {makeOwner(0, 16), makeOwner(1, 24),
+                                          makeOwner(2, 32)}),
+                              admitted_ids)
+                    .ok());
+    ASSERT_EQ(admitted_ids.size(), 3u);
+
+    auto picked = queue.pickForDispatch(1, 128);
+    ASSERT_EQ(picked, std::vector<QueueOwnerId>({1}));
+    const size_t owners_before = queue.outstandingOwners();
+    const size_t bytes_before = queue.outstandingBytes();
+
+    EXPECT_TRUE(queue.defer(picked[0]).ok());
+    EXPECT_EQ(queue.outstandingOwners(), owners_before);
+    EXPECT_EQ(queue.outstandingBytes(), bytes_before);
+
+    picked = queue.pickForDispatch(3, 128);
+    const std::vector<QueueOwnerId> expected{2, 3, 1};
+    EXPECT_EQ(picked, expected);
+}
+
+TEST(AdmissionQueueTest, DeferredEdfOwnerYieldsToCurrentWaiters) {
+    QueueLimits limits{4, 128, 0, 0};
+    limits.deadline_aware = true;
+    LocalTransferAdmissionQueue queue(limits);
+    std::vector<QueueOwnerId> admitted_ids;
+    auto first = makeOwner(0, 16);
+    first.request.deadline_ns = 100;
+    auto second = makeOwner(1, 16);
+    second.request.deadline_ns = 100;
+    auto third = makeOwner(2, 16);
+    third.request.deadline_ns = 200;
+    ASSERT_TRUE(queue
+                    .tryAdmit(makeSubmit(1, 3,
+                                         {std::move(first), std::move(second),
+                                          std::move(third)}),
+                              admitted_ids)
+                    .ok());
+
+    auto picked = queue.pickForDispatch(1, 128);
+    ASSERT_EQ(picked, std::vector<QueueOwnerId>({1}));
+    EXPECT_TRUE(queue.defer(picked[0]).ok());
+
+    picked = queue.pickForDispatch(3, 128);
+    // A temporarily blocked earliest-deadline owner yields one round so it
+    // cannot starve later-deadline work that may have available resources.
+    const std::vector<QueueOwnerId> expected{2, 3, 1};
+    EXPECT_EQ(picked, expected);
+}
+
+TEST(AdmissionQueueTest, DeferredEdfOwnerKeepsRoundAheadOfNewAdmission) {
+    QueueLimits limits{4, 128, 0, 0};
+    limits.deadline_aware = true;
+    LocalTransferAdmissionQueue queue(limits);
+    std::vector<QueueOwnerId> admitted_ids;
+
+    auto first = makeOwner(0, 16);
+    first.request.deadline_ns = 100;
+    auto second = makeOwner(1, 16);
+    second.request.deadline_ns = 200;
+    auto third = makeOwner(2, 16);
+    third.request.deadline_ns = 300;
+    ASSERT_TRUE(queue
+                    .tryAdmit(makeSubmit(1, 3,
+                                         {std::move(first), std::move(second),
+                                          std::move(third)}),
+                              admitted_ids)
+                    .ok());
+
+    auto picked = queue.pickForDispatch(1, 128);
+    ASSERT_EQ(picked, std::vector<QueueOwnerId>({1}));
+    ASSERT_TRUE(queue.defer(picked[0]).ok());
+
+    auto newcomer = makeOwner(0, 16);
+    newcomer.request.deadline_ns = 150;
+    ASSERT_TRUE(
+        queue.tryAdmit(makeSubmit(2, 1, {std::move(newcomer)}), admitted_ids)
+            .ok());
+    ASSERT_EQ(admitted_ids, std::vector<QueueOwnerId>({4}));
+
+    picked = queue.pickForDispatch(4, 128);
+    // The deferred owner starts the next EDF round. A newly admitted owner is
+    // ordered within that round instead of jumping ahead of owners 2 and 3,
+    // which were already waiting when owner 1 yielded.
+    const std::vector<QueueOwnerId> expected{2, 3, 1, 4};
+    EXPECT_EQ(picked, expected);
+}
+
+TEST(AdmissionQueueTest, DeferredEdfRoundsStayOrderedAcrossAdmissions) {
+    QueueLimits limits{6, 256, 0, 0};
+    limits.deadline_aware = true;
+    LocalTransferAdmissionQueue queue(limits);
+    std::vector<QueueOwnerId> admitted_ids;
+
+    auto first = makeOwner(0, 16);
+    first.request.deadline_ns = 100;
+    auto second = makeOwner(1, 16);
+    second.request.deadline_ns = 200;
+    auto third = makeOwner(2, 16);
+    third.request.deadline_ns = 300;
+    ASSERT_TRUE(queue
+                    .tryAdmit(makeSubmit(1, 3,
+                                         {std::move(first), std::move(second),
+                                          std::move(third)}),
+                              admitted_ids)
+                    .ok());
+
+    auto picked = queue.pickForDispatch(1, 256);
+    ASSERT_EQ(picked, std::vector<QueueOwnerId>({1}));
+    ASSERT_TRUE(queue.defer(picked[0]).ok());
+
+    auto deadline_250 = makeOwner(0, 16);
+    deadline_250.request.deadline_ns = 250;
+    ASSERT_TRUE(
+        queue
+            .tryAdmit(makeSubmit(2, 1, {std::move(deadline_250)}), admitted_ids)
+            .ok());
+
+    picked = queue.pickForDispatch(1, 256);
+    ASSERT_EQ(picked, std::vector<QueueOwnerId>({2}));
+    ASSERT_TRUE(queue.defer(picked[0]).ok());
+
+    auto deadline_225 = makeOwner(0, 16);
+    deadline_225.request.deadline_ns = 225;
+    ASSERT_TRUE(
+        queue
+            .tryAdmit(makeSubmit(3, 1, {std::move(deadline_225)}), admitted_ids)
+            .ok());
+
+    picked = queue.pickForDispatch(5, 256);
+    const std::vector<QueueOwnerId> expected{3, 1, 2, 5, 4};
+    EXPECT_EQ(picked, expected);
+}
+
+TEST(AdmissionQueueTest, PromotionCannotUndoCreditDeferralRound) {
+    QueueLimits limits{2, 128, 0, 0};
+    limits.deadline_aware = true;
+    limits.promotion_slack_ns = 10;
+    LocalTransferAdmissionQueue queue(limits);
+    queue.setDegradationPolicy([] { return 1e9; }, DegradationHooks{},
+                               [] { return uint64_t{100}; });
+
+    auto starved = makeOwner(0, 16);
+    starved.request.deadline_ns = 105;
+    auto waiter = makeOwner(1, 16);
+    waiter.request.deadline_ns = 1000;
+    std::vector<QueueOwnerId> admitted_ids;
+    ASSERT_TRUE(
+        queue
+            .tryAdmit(makeSubmit(1, 2, {std::move(starved), std::move(waiter)}),
+                      admitted_ids)
+            .ok());
+
+    auto picked = queue.pickForDispatch(1, 128);
+    ASSERT_EQ(picked, std::vector<QueueOwnerId>({1}));
+    ASSERT_TRUE(queue.defer(picked[0]).ok());
+
+    // Owner 1 remains urgent, but it yielded into round 1. Promotion cannot
+    // move it ahead of owner 2, which is still waiting in round 0.
+    picked = queue.pickForDispatch(1, 128);
+    EXPECT_EQ(picked, std::vector<QueueOwnerId>({2}));
+}
+
+TEST(AdmissionQueueTest, RejectsDeferForNonDispatchingOwner) {
+    LocalTransferAdmissionQueue queue({2, 128, 0, 0});
+    std::vector<QueueOwnerId> admitted_ids;
+    ASSERT_TRUE(
+        queue.tryAdmit(makeSubmit(1, 1, {makeOwner(0, 16)}), admitted_ids)
+            .ok());
+    ASSERT_EQ(admitted_ids.size(), 1u);
+
+    EXPECT_TRUE(queue.defer(0).IsInvalidArgument());
+    EXPECT_TRUE(queue.defer(99).IsInvalidEntry());
+    EXPECT_TRUE(queue.defer(admitted_ids[0]).IsInvalidEntry());
+
+    auto picked = queue.pickForDispatch(1, 128);
+    ASSERT_EQ(picked.size(), 1u);
+    ASSERT_TRUE(queue.complete(picked[0], COMPLETED).ok());
+    EXPECT_TRUE(queue.defer(picked[0]).IsInvalidEntry());
+    EXPECT_EQ(queue.outstandingOwners(), 0u);
+    EXPECT_EQ(queue.outstandingBytes(), 0u);
+}
+
 TEST(AdmissionQueueTest, RequiresDispatchBeforeTerminalCompletion) {
     LocalTransferAdmissionQueue queue({2, 128, 0, 0});
     std::vector<QueueOwnerId> admitted_ids;
@@ -826,6 +1013,29 @@ TEST(AdmissionQueueTest,
     EXPECT_EQ(queue.dispatchingBytes(), 0u);
     ASSERT_EQ(queue.retireBatch(1).code(), Status::Code::kOk);
     EXPECT_EQ(queue.dispatchingBytes(), 0u);
+}
+
+TEST(AdmissionQueueTest, RejectsDeferForOwnerDroppedDuringDispatchPick) {
+    LocalTransferAdmissionQueue queue(step3Limits(1.5));
+    queue.setDegradationPolicy([] { return 1e9; }, DegradationHooks{},
+                               [] { return uint64_t{1'000'000'000}; });
+
+    std::vector<QueueOwnerId> admitted_ids;
+    ASSERT_TRUE(
+        queue
+            .tryAdmit(makeSubmit(1, 1,
+                                 {makeDegradationEligibleOwnerWithDeadline(
+                                     0, 16, 1'000'000'010)}),
+                      admitted_ids)
+            .ok());
+
+    std::vector<QueueOwnerId> dropped;
+    EXPECT_TRUE(queue.pickForDispatch(1, 128, &dropped).empty());
+    ASSERT_EQ(dropped, std::vector<QueueOwnerId>({1}));
+    EXPECT_TRUE(queue.defer(dropped[0]).IsInvalidEntry());
+    EXPECT_TRUE(queue.pickForDispatch(1, 128).empty());
+    EXPECT_EQ(queue.outstandingOwners(), 0u);
+    EXPECT_EQ(queue.outstandingBytes(), 0u);
 }
 
 TEST(AdmissionQueueTest, Step3DropsAlreadyExpiredDeadline) {

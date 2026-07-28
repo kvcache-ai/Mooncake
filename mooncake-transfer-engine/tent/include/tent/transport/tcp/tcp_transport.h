@@ -55,6 +55,9 @@ struct TcpTask {
     std::atomic<size_t> transferred_bytes{0};
     bool non_replayable_failure{false};  // Published by status_word.
     uint64_t target_addr = 0;
+    uint64_t receiver_credit_session_high{0};
+    uint64_t receiver_credit_session_low{0};
+    uint64_t receiver_credit_epoch{0};
 
     TcpTask() = default;
     TcpTask(TcpTask &&other) noexcept
@@ -65,7 +68,10 @@ struct TcpTask {
           transferred_bytes(
               other.transferred_bytes.load(std::memory_order_relaxed)),
           non_replayable_failure(other.non_replayable_failure),
-          target_addr(other.target_addr) {}
+          target_addr(other.target_addr),
+          receiver_credit_session_high(other.receiver_credit_session_high),
+          receiver_credit_session_low(other.receiver_credit_session_low),
+          receiver_credit_epoch(other.receiver_credit_epoch) {}
     TcpTask(const TcpTask &) = delete;
     TcpTask &operator=(const TcpTask &) = delete;
 };
@@ -122,8 +128,7 @@ class TcpTransport : public Transport {
 
     Status doTransferWithRetry(TcpTask *task);
 
-    Status findRemoteSegment(uint64_t dest_addr, uint64_t length,
-                             uint64_t target_id, std::string &rpc_server_addr);
+    Status findRemoteSegment(const TcpTask &task, std::string &rpc_server_addr);
 
    private:
     bool installed_;

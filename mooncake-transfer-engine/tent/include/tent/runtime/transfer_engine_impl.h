@@ -33,6 +33,7 @@
 #include "tent/common/status.h"
 #include "tent/common/types.h"
 #include "tent/runtime/admission_queue.h"
+#include "tent/runtime/receiver_credit.h"
 #include "tent/runtime/transport.h"
 #include "tent/runtime/transport_selector.h"
 #include "tent/runtime/hp_tcp_transport_config.h"
@@ -463,7 +464,7 @@ class TransferEngineImpl {
                            QueueOwnerKind owner_kind) const;
 
     Status prepareSubmit(Batch* batch, const std::vector<Request>& request_list,
-                         PreparedSubmit& prepared,
+                         QueueOwnerKind owner_kind, PreparedSubmit& prepared,
                          bool require_post_submit_cancellation = false);
 
     Status commitPreparedSubmit(Batch* batch, const PreparedSubmit& prepared);
@@ -481,6 +482,43 @@ class TransferEngineImpl {
     void notifyRuntimeQueueReady();
 
     Status dispatchQueuedOwner(QueueOwnerId owner_id);
+
+    struct ReceiverCreditTarget;
+    struct ReceiverCreditReservation;
+
+    Status resolveReceiverCreditTarget(const Request& request,
+                                       ReceiverCreditTarget& target) const;
+
+    Status acquireReceiverCredit(const Request& request,
+                                 ReceiverCreditReservation& reservation,
+                                 bool& acquired);
+
+    Status validateReceiverCreditCapacity(
+        const Request& request, const ReceiverCreditTarget& target) const;
+
+    void bindReceiverCreditFence(Transport::SubBatchRef,
+                                 const ReceiverCreditReservation&) const;
+
+    void bindReceiverCreditFence(Transport::SubBatchRef, const Request&) const;
+
+    void rollbackReceiverCredit(ReceiverCreditReservation& reservation);
+
+    void releaseReceiverCredit(ReceiverCreditReservation& reservation);
+
+    void scheduleReceiverCreditRelease(const CreditKey&, SegmentID,
+                                       const std::string&, uint64_t epoch);
+
+    bool tryReportReceiverCreditRelease(const CreditKey&);
+
+    void progressReceiverCreditReleases();
+
+    void observeReceiverCreditSession(SegmentID,
+                                      const ReceiverSessionId& session);
+
+    Status exchangeReceiverCredit(
+        SegmentID target_id, const std::string& rpc_server_addr,
+        const ReceiverCreditExchangeRequestV1& request,
+        ReceiverCreditExchangeReplyV1& reply);
 
     Status markQueuedOwnerSubmitted(QueueOwnerId owner_id);
 
@@ -578,12 +616,46 @@ class TransferEngineImpl {
         std::chrono::microseconds progress_fallback_interval{50000};
     };
 
+    struct ReceiverCreditConfig {
+        bool sender_enabled{false};
+        bool receiver_enabled{false};
+        ReceiverCreditLimits limits{};
+        size_t max_sender_entries{4096};
+        uint32_t max_freshness_ttl_ms{60000};
+    };
+
+    struct ReceiverCreditTarget {
+        bool required{false};
+        ReceiverCreditAdvertV1 advert{};
+        std::string rpc_server_addr;
+    };
+
+    struct ReceiverCreditReservation {
+        bool active{false};
+        bool committed{false};
+        CreditKey key{};
+        CreditCharge charge{};
+        SegmentID target_id{LOCAL_SEGMENT_ID};
+        std::string rpc_server_addr;
+        uint64_t epoch{0};
+    };
+
+    struct PendingReceiverCreditRelease {
+        SegmentID target_id{LOCAL_SEGMENT_ID};
+        std::string rpc_server_addr;
+        uint64_t epoch{0};
+        uint32_t attempts{0};
+        std::chrono::steady_clock::time_point retry_at{};
+    };
+
     struct QueuedOwnerState {
         Batch* batch{nullptr};
         size_t owner_task_id{0};
         std::vector<size_t> public_task_ids;
         size_t byte_charge{0};
         bool in_dispatch_window{false};
+        bool receiver_credit_exempt{false};
+        ReceiverCreditReservation credit;
     };
 
    private:
@@ -617,7 +689,14 @@ class TransferEngineImpl {
     bool notify_rpc_fallback_{true};
     bool enable_progress_worker_{false};
     RuntimeQueueConfig runtime_queue_config_;
+    ReceiverCreditConfig receiver_credit_config_;
     std::unique_ptr<LocalTransferAdmissionQueue> runtime_queue_;
+    SenderInstanceId sender_instance_id_;
+    std::unique_ptr<SenderCreditLedger> sender_credit_ledger_;
+    std::unique_ptr<ReceiverCreditAuthority> receiver_credit_authority_;
+    std::unordered_map<CreditKey, PendingReceiverCreditRelease, CreditKeyHash>
+        pending_credit_releases_;
+    std::unordered_map<SegmentID, ReceiverSessionId> receiver_credit_sessions_;
     std::unordered_map<QueueOwnerId, QueuedOwnerState> queued_owners_;
     size_t dispatch_inflight_owners_{0};
     size_t dispatch_inflight_bytes_{0};

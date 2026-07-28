@@ -107,6 +107,9 @@ struct RdmaTask {
     // no pool selected: slices spray across all data QPs as before. Resolved
     // from SelectionResult.qp_pool at task creation.
     std::string qp_pool;
+    uint64_t receiver_credit_session_high{0};
+    uint64_t receiver_credit_session_low{0};
+    uint64_t receiver_credit_epoch{0};
     volatile TransferStatusEnum status_word;
     volatile size_t transferred_bytes;
     std::atomic<int> success_slices{0};

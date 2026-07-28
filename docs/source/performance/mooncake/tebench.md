@@ -397,7 +397,8 @@ gpu_id + thread_id
 
 **Transport (TENT only)**
 
-* `--xport_type` : `rdma | shm | mnnvl | gds | iouring`. Selects a single
+* `--xport_type` : `rdma | tcp | shm | mnnvl | nvlink | gds | iouring | ub |
+  sunrise_link`. Selects a single
   transport to enable (all others are disabled). Empty means no transport
   is explicitly enabled or disabled by tebench — the engine reads the
   transport enable list from the `MC_TENT_CONF` config file (see Section

@@ -147,6 +147,9 @@ struct UbSliceSpec {
     size_t length{0};
     size_t request_offset{0};
     uint32_t max_retries{0};
+    uint64_t receiver_credit_session_high{0};
+    uint64_t receiver_credit_session_low{0};
+    uint64_t receiver_credit_epoch{0};
 };
 
 struct UbAttemptToken {
