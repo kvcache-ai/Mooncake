@@ -56,10 +56,10 @@ class OffloadOnEvictTest : public ::testing::Test {
         ReplicateConfig config;
         config.replica_num = 1;
         auto put_start =
-            service.PutStart(client_id, key, "default", size, config);
+            service.PutStart(client_id, key, TenantId::Default(), size, config);
         ASSERT_TRUE(put_start.has_value()) << "PutStart failed for key=" << key;
-        auto put_end =
-            service.PutEnd(client_id, key, "default", ReplicaType::MEMORY);
+        auto put_end = service.PutEnd(client_id, key, TenantId::Default(),
+                                      ReplicaType::MEMORY);
         ASSERT_TRUE(put_end.has_value()) << "PutEnd failed for key=" << key;
     }
 
@@ -103,10 +103,10 @@ class OffloadOnEvictTest : public ::testing::Test {
             std::string key = key_prefix + std::to_string(i);
             ReplicateConfig config;
             config.replica_num = 1;
-            auto result = service.PutStart(client_id, key, "default",
+            auto result = service.PutStart(client_id, key, TenantId::Default(),
                                            object_size, config);
             if (result.has_value()) {
-                auto end = service.PutEnd(client_id, key, "default",
+                auto end = service.PutEnd(client_id, key, TenantId::Default(),
                                           ReplicaType::MEMORY);
                 EXPECT_TRUE(end.has_value());
                 success_puts++;
@@ -228,10 +228,10 @@ TEST_F(OffloadOnEvictTest, ComboB_EvictionTriggersOffload) {
         std::string key = "evict_b_" + std::to_string(i);
         ReplicateConfig config;
         config.replica_num = 1;
-        auto result = service->PutStart(ctx.client_id, key, "default",
+        auto result = service->PutStart(ctx.client_id, key, TenantId::Default(),
                                         object_size, config);
         if (result.has_value()) {
-            auto end = service->PutEnd(ctx.client_id, key, "default",
+            auto end = service->PutEnd(ctx.client_id, key, TenantId::Default(),
                                        ReplicaType::MEMORY);
             ASSERT_TRUE(end.has_value());
             success_puts++;

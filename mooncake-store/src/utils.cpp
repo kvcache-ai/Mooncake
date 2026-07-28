@@ -528,7 +528,7 @@ void *allocate_buffer_numa_segments(size_t total_size,
     return ptr;
 }
 
-void free_memory(const std::string &protocol, void *ptr) {
+void free_memory(const std::string &protocol, void *ptr, bool use_spdk_dma) {
 #if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
     if (protocol == "ascend" || protocol == "ubshmem") {
         return ascend_free_memory(protocol, ptr);
@@ -542,6 +542,15 @@ void free_memory(const std::string &protocol, void *ptr) {
 #if defined(USE_UB)
     if (protocol == "ub") {
         mooncake::ub_free_memory(ptr);
+        return;
+    }
+#endif
+#ifdef USE_NOF
+    // Mirror allocate_buffer_allocator_memory(): a buffer taken from the SPDK
+    // hugepage pool (spdk_zmalloc) must be released with spdk_free, not glibc
+    // free(), which would abort with "free(): invalid pointer".
+    if (use_spdk_dma) {
+        mooncake::SpdkWrapper::GetInstance().Free(ptr);
         return;
     }
 #endif

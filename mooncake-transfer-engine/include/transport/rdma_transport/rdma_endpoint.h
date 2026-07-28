@@ -83,17 +83,21 @@ class RdmaEndPoint {
     int setupConnectionsByPassive(const HandShakeDesc &peer_desc,
                                   HandShakeDesc &local_desc);
 
-    bool active() const { return active_; }
+    bool active() const { return active_.load(std::memory_order_acquire); }
 
     void set_active(bool flag) {
         RWSpinlock::WriteGuard guard(lock_);
-        active_ = flag;
-        if (!flag) inactive_time_ = getCurrentTimeInNano();
+        if (!flag)
+            inactive_time_.store(getCurrentTimeInNano(),
+                                 std::memory_order_relaxed);
+        active_.store(flag, std::memory_order_release);
     }
 
     double inactiveTime() {
-        if (active_) return 0.0;
-        return (getCurrentTimeInNano() - inactive_time_) / 1000000000.0;
+        if (active_.load(std::memory_order_acquire)) return 0.0;
+        return (getCurrentTimeInNano() -
+                inactive_time_.load(std::memory_order_relaxed)) /
+               1000000000.0;
     }
 
    public:
@@ -214,14 +218,14 @@ class RdmaEndPoint {
     bool has_connected_;
     std::atomic<uint64_t> ready_wait_start_ts_;
 
-    volatile int *wr_depth_list_;
+    std::atomic<int> *wr_depth_list_;
     int max_wr_depth_;
     size_t max_sge_per_wr_;
     size_t max_inline_bytes_;
 
-    volatile bool active_;
-    volatile int *cq_outstanding_;
-    volatile uint64_t inactive_time_;
+    std::atomic<bool> active_;
+    std::atomic<int> *cq_outstanding_;
+    std::atomic<uint64_t> inactive_time_;
     int finish_destroy_retries_ = 0;
 };
 

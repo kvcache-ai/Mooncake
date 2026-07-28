@@ -22,7 +22,7 @@
 #include "transport/rpc_communicator/rpc_interface.h"
 
 #ifdef USE_TENT
-#include "tent/runtime/transport_selector.h"
+#include "tent/common/types.h"
 #endif
 
 #ifdef USE_EFA
@@ -361,7 +361,7 @@ int TransferEnginePy::freeManagedBuffer(uintptr_t buffer_addr, size_t length) {
 static int parseTransportHint(const std::string& name) {
 #ifdef USE_TENT
     if (name.empty()) return mooncake::tent::UNSPEC;
-    auto type = mooncake::tent::TransportSelector::parseTransportType(name);
+    auto type = mooncake::tent::parseTransportType(name);
     if (type == mooncake::tent::UNSPEC && name != "unspec") {
         throw std::invalid_argument(
             "Unknown transport_hint '" + name +

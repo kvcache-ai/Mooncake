@@ -13,6 +13,7 @@
 
 #include "kv_event/kv_event_config.h"
 #include "kv_event/key_util.h"
+#include "tenant_id.h"
 
 namespace mooncake {
 
@@ -30,13 +31,12 @@ class KvEventPublisher {
     bool enabled() const { return config_.enabled; }
 
     // Non-blocking enqueue into a bounded queue; drops oldest when full.
-    // tenant_id empty defaults to "default" on the wire.
     void PublishStored(const std::string& object_key, const std::string& medium,
-                       const std::string& tenant_id = "",
+                       const TenantId& tenant_id = TenantId::Default(),
                        const std::string& group_id = "");
     void PublishRemoved(const std::string& object_key,
                         const std::string& medium,
-                        const std::string& tenant_id = "",
+                        const TenantId& tenant_id = TenantId::Default(),
                         const std::string& group_id = "");
 
     struct Stats {
@@ -59,7 +59,7 @@ class KvEventPublisher {
         EventKind kind;
         std::string object_key;
         std::string medium;
-        std::string tenant_id;
+        TenantId tenant_id;
         std::string group_id;
     };
 
@@ -98,9 +98,11 @@ class KvEventPublisher {
     bool enabled() const { return false; }
 
     void PublishStored(const std::string&, const std::string&,
-                       const std::string& = "", const std::string& = "") {}
+                       const TenantId& = TenantId::Default(),
+                       const std::string& = "") {}
     void PublishRemoved(const std::string&, const std::string&,
-                        const std::string& = "", const std::string& = "") {}
+                        const TenantId& = TenantId::Default(),
+                        const std::string& = "") {}
 
     struct Stats {
         uint64_t published_batches{0};

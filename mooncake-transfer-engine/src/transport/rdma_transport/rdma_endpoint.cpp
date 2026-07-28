@@ -77,6 +77,18 @@ static std::string qpListToString(const std::vector<uint32_t> &qp_num) {
     return oss.str();
 }
 
+static std::string gidToString(const ibv_gid &gid) {
+    char buffer[48];
+    snprintf(buffer, sizeof(buffer),
+             "%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:"
+             "%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x",
+             gid.raw[0], gid.raw[1], gid.raw[2], gid.raw[3], gid.raw[4],
+             gid.raw[5], gid.raw[6], gid.raw[7], gid.raw[8], gid.raw[9],
+             gid.raw[10], gid.raw[11], gid.raw[12], gid.raw[13], gid.raw[14],
+             gid.raw[15]);
+    return buffer;
+}
+
 RdmaEndPoint::RdmaEndPoint(RdmaContext &context)
     : context_(context),
       status_(INITIALIZING),
@@ -105,19 +117,19 @@ int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
     }
 
     qp_list_.resize(num_qp_list);
-    cq_outstanding_ = (volatile int *)cq->cq_context;
+    cq_outstanding_ = static_cast<std::atomic<int> *>(cq->cq_context);
 
     max_wr_depth_ = (int)max_wr_depth;
     max_sge_per_wr_ = max_sge_per_wr;
     max_inline_bytes_ = max_inline_bytes;
 
-    wr_depth_list_ = new volatile int[num_qp_list]();
+    wr_depth_list_ = new std::atomic<int>[num_qp_list]();
     if (!wr_depth_list_) {
         LOG(ERROR) << "Failed to allocate memory for work request depth list";
         return ERR_MEMORY;
     }
     for (size_t i = 0; i < num_qp_list; ++i) {
-        wr_depth_list_[i] = 0;
+        wr_depth_list_[i].store(0, std::memory_order_relaxed);
         ibv_qp_init_attr attr;
         memset(&attr, 0, sizeof(attr));
         attr.send_cq = cq;
@@ -165,7 +177,7 @@ int RdmaEndPoint::reconstruct() {
     // Reconstruct with same parameters as original construction
     status_.store(INITIALIZING, std::memory_order_relaxed);
     ready_wait_start_ts_.store(0, std::memory_order_relaxed);
-    active_ = true;
+    active_.store(true, std::memory_order_release);
 
     return construct(cq, num_qp, max_sge_per_wr, max_wr_depth,
                      max_inline_bytes);
@@ -182,15 +194,16 @@ int RdmaEndPoint::deconstructLocked() {
     bool displayed = false;
     if (wr_depth_list_) {
         for (size_t i = 0; i < qp_list_.size(); ++i) {
-            if (wr_depth_list_[i] != 0) {
+            int wr_depth = wr_depth_list_[i].load(std::memory_order_relaxed);
+            if (wr_depth != 0) {
                 if (!displayed) {
                     LOG(WARNING)
                         << "Outstanding work requests found, CQ will not "
                            "be generated";
                     displayed = true;
                 }
-                __sync_fetch_and_sub(cq_outstanding_, wr_depth_list_[i]);
-                wr_depth_list_[i] = 0;
+                cq_outstanding_->fetch_sub(wr_depth, std::memory_order_acq_rel);
+                wr_depth_list_[i].store(0, std::memory_order_relaxed);
             }
         }
     }
@@ -198,8 +211,9 @@ int RdmaEndPoint::deconstructLocked() {
     int result = 0;
     for (size_t i = 0; i < qp_list_.size(); ++i) {
         if (!qp_list_[i]) continue;  // already destroyed in a previous call
-        if (ibv_destroy_qp(qp_list_[i])) {
-            PLOG(ERROR) << "Failed to destroy QP[" << i << "]";
+        int ret = ibv_destroy_qp(qp_list_[i]);
+        if (ret) {
+            LOG(ERROR) << "Failed to destroy QP[" << i << "]: " << strerror(ret);
             result = ERR_ENDPOINT;
         } else {
             qp_list_[i] = nullptr;
@@ -226,19 +240,28 @@ void RdmaEndPoint::beginDestroyLocked() {
     auto current_status = status_.load(std::memory_order_relaxed);
     if (current_status == DESTROYING || current_status == DESTROYED) return;
 
-    active_ = false;
-    inactive_time_ = getCurrentTimeInNano();
+    inactive_time_.store(getCurrentTimeInNano(), std::memory_order_relaxed);
+    active_.store(false, std::memory_order_release);
     status_.store(DESTROYING, std::memory_order_release);
     ready_wait_start_ts_.store(0, std::memory_order_relaxed);
 
-    // Transition QPs to ERR state so hardware flushes all inflight WRs to CQ.
-    // This allows performPollCq to drain them naturally.
-    ibv_qp_attr attr;
-    memset(&attr, 0, sizeof(attr));
-    attr.qp_state = IBV_QPS_ERR;
+    // Only endpoints that reached CONNECTED can have user WRs to flush. For
+    // pre-connected endpoints, skip RESET/INIT -> ERR because there are no WRs
+    // and some providers reject that state transition.
+    if (!has_connected_) return;
+
+    // Transition connected QPs to ERR state so hardware flushes inflight WRs to
+    // CQ. This allows performPollCq to drain them naturally.
     for (size_t i = 0; i < qp_list_.size(); ++i) {
-        if (ibv_modify_qp(qp_list_[i], &attr, IBV_QP_STATE)) {
-            PLOG(WARNING) << "Failed to modify QP to ERR during beginDestroy";
+        if (!qp_list_[i]) continue;
+
+        ibv_qp_attr attr;
+        memset(&attr, 0, sizeof(attr));
+        attr.qp_state = IBV_QPS_ERR;
+        int ret = ibv_modify_qp(qp_list_[i], &attr, IBV_QP_STATE);
+        if (ret) {
+            LOG(WARNING) << "Failed to modify QP[" << i
+                         << "] to ERR during beginDestroy: " << strerror(ret);
         }
     }
 }
@@ -257,7 +280,7 @@ bool RdmaEndPoint::finishDestroy() {
     // pre-two-phase predicate (!hasOutstandingSlice == !active_): only
     // inactive endpoints are eligible for reclaim; active ones must stay.
     if (current_status != DESTROYING) {
-        if (active_) return false;
+        if (active_.load(std::memory_order_acquire)) return false;
         // Endpoints that never reached construct() own no RDMA resources
         // and have wr_depth_list_ uninitialized; deconstructLocked() would
         // delete[] a wild pointer. Drop them directly.
@@ -275,13 +298,15 @@ bool RdmaEndPoint::finishDestroy() {
         // never be flushed; enforce a timeout to avoid leaking forever.
         bool has_outstanding = false;
         for (size_t i = 0; i < qp_list_.size(); ++i) {
-            if (wr_depth_list_[i] != 0) {
+            if (wr_depth_list_[i].load(std::memory_order_relaxed) != 0) {
                 has_outstanding = true;
                 break;
             }
         }
         if (has_outstanding) {
-            double elapsed = (getCurrentTimeInNano() - inactive_time_) / 1e9;
+            double elapsed = (getCurrentTimeInNano() -
+                              inactive_time_.load(std::memory_order_relaxed)) /
+                             1e9;
             if (elapsed < kFinishDestroyTimeoutSec) return false;
             LOG(WARNING) << "finishDestroy timed out after " << elapsed
                          << "s with outstanding WRs, forcing destruction";
@@ -802,33 +827,17 @@ int RdmaEndPoint::disconnectUnlocked() {
     ready_wait_start_ts_.store(0, std::memory_order_relaxed);
 
     if (!has_connected_) {
-        // Pre-connected handshake retries are allowed to reuse this endpoint:
-        // no user WR has been posted yet. eRDMA still needs fresh QPs because
-        // a QP that reached RTS cannot be reliably reset back to RTS.
-#ifdef CONFIG_ERDMA
+        // This endpoint has not posted user WRs yet, but its handshake may
+        // already have reached the peer. The peer can cache our QP numbers and
+        // rebuild its passive endpoint around them before the active side sees
+        // a setup failure. Reusing the same local QPs after RESET would make a
+        // later retry ambiguous with that partially processed handshake, so
+        // retry with fresh QP numbers instead.
         for (size_t i = 0; i < qp_list_.size(); ++i) {
-            CHECK_EQ(wr_depth_list_[i], 0)
+            CHECK_EQ(wr_depth_list_[i].load(std::memory_order_relaxed), 0)
                 << "Pre-connected endpoint must not have outstanding WRs";
         }
         return reconstruct();
-#else
-        ibv_qp_attr attr;
-        memset(&attr, 0, sizeof(attr));
-        attr.qp_state = IBV_QPS_RESET;
-        int ret = 0;
-        for (size_t i = 0; i < qp_list_.size(); ++i) {
-            int curr_ret = ibv_modify_qp(qp_list_[i], &attr, IBV_QP_STATE);
-            if (curr_ret) {
-                PLOG(ERROR) << "Failed to modify pre-connected QP to RESET";
-                ret = ERR_ENDPOINT;
-            }
-            CHECK_EQ(wr_depth_list_[i], 0)
-                << "Pre-connected endpoint must not have outstanding WRs";
-        }
-        peer_qp_num_list_.clear();
-        status_.store(UNCONNECTED, std::memory_order_release);
-        return ret;
-#endif
     }
 
     beginDestroyLocked();
@@ -907,7 +916,8 @@ int RdmaEndPoint::submitPostSend(
     std::vector<Transport::Slice *> &slice_list,
     std::vector<Transport::Slice *> &failed_slice_list) {
     RWSpinlock::WriteGuard guard(lock_);
-    if (!active_ || status_.load(std::memory_order_relaxed) != CONNECTED) {
+    if (!active_.load(std::memory_order_acquire) ||
+        status_.load(std::memory_order_relaxed) != CONNECTED) {
         for (auto &slice : slice_list) failed_slice_list.push_back(slice);
         slice_list.clear();
         return 0;
@@ -916,7 +926,8 @@ int RdmaEndPoint::submitPostSend(
     const size_t num_qp = qp_list_.size();
     if (slice_list.empty()) return 0;
     const size_t requested = slice_list.size();
-    int cq_remaining = int(globalConfig().max_cqe) - *cq_outstanding_;
+    int cq_remaining = int(globalConfig().max_cqe) -
+                       cq_outstanding_->load(std::memory_order_relaxed);
     if (cq_remaining <= 0) return 0;
 
     // Only allocate for the max number of WRs we can actually post per QP,
@@ -932,7 +943,8 @@ int RdmaEndPoint::submitPostSend(
     for (size_t qp_index = 0;
          qp_index < num_qp && cq_remaining > 0 && cursor < requested;
          ++qp_index) {
-        int qp_avail = max_wr_depth_ - wr_depth_list_[qp_index];
+        int qp_avail = max_wr_depth_ -
+                       wr_depth_list_[qp_index].load(std::memory_order_relaxed);
         if (qp_avail <= 0) continue;
 
         size_t remaining_qps = num_qp - qp_index;
@@ -970,14 +982,14 @@ int RdmaEndPoint::submitPostSend(
         }
 
         ibv_send_wr *bad_wr = nullptr;
-        __sync_fetch_and_add(&wr_depth_list_[qp_index], wr_count);
-        __sync_fetch_and_add(cq_outstanding_, wr_count);
+        wr_depth_list_[qp_index].fetch_add(wr_count, std::memory_order_acq_rel);
+        cq_outstanding_->fetch_add(wr_count, std::memory_order_acq_rel);
         // Register before ringing the doorbell. A fast completion may otherwise
         // be polled before the diagnostic registry sees the slice.
         context_.trackPostedSlices(slice_list, start, wr_count);
         int rc = ibv_post_send(qp_list_[qp_index], wr_list.data(), &bad_wr);
         if (rc) {
-            PLOG(ERROR) << "Failed to ibv_post_send";
+            LOG(ERROR) << "Failed to ibv_post_send: " << strerror(rc);
             const size_t first_failed =
                 bad_wr ? static_cast<size_t>(bad_wr - wr_list.data()) : 0;
             context_.untrackPostedSlices(slice_list, start + first_failed,
@@ -985,8 +997,9 @@ int RdmaEndPoint::submitPostSend(
             while (bad_wr) {
                 int i = bad_wr - wr_list.data();
                 failed_slice_list.push_back(slice_list[start + i]);
-                __sync_fetch_and_sub(&wr_depth_list_[qp_index], 1);
-                __sync_fetch_and_sub(cq_outstanding_, 1);
+                wr_depth_list_[qp_index].fetch_sub(1,
+                                                   std::memory_order_acq_rel);
+                cq_outstanding_->fetch_sub(1, std::memory_order_acq_rel);
                 bad_wr = bad_wr->next;
             }
             total_posted += wr_count;
@@ -1111,11 +1124,11 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
     int ret = ibv_modify_qp(qp, &attr, IBV_QP_STATE);
     if (ret) {
         std::string message = "Failed to modify QP to RESET";
-        PLOG(ERROR) << "[Handshake] " << message;
-        if (reply_msg) *reply_msg = message + ": " + strerror(errno);
+        LOG(ERROR) << "[Handshake] " << message << ": " << strerror(ret);
+        if (reply_msg) *reply_msg = message + ": " + strerror(ret);
         if (failure_info) {
             failure_info->stage = SetupConnectionFailureStage::kReset;
-            failure_info->sys_errno = errno;
+            failure_info->sys_errno = ret;
         }
         return ERR_ENDPOINT;
     }
@@ -1133,11 +1146,11 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
     if (ret) {
         std::string message =
             "Failed to modify QP to INIT, check local context port num";
-        PLOG(ERROR) << "[Handshake] " << message;
-        if (reply_msg) *reply_msg = message + ": " + strerror(errno);
+        LOG(ERROR) << "[Handshake] " << message << ": " << strerror(ret);
+        if (reply_msg) *reply_msg = message + ": " + strerror(ret);
         if (failure_info) {
             failure_info->stage = SetupConnectionFailureStage::kInit;
-            failure_info->sys_errno = errno;
+            failure_info->sys_errno = ret;
         }
         return ERR_ENDPOINT;
     }
@@ -1178,11 +1191,22 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
     if (ret) {
         std::string message =
             "Failed to modify QP to RTR, check mtu, gid, peer lid, peer qp num";
-        PLOG(ERROR) << "[Handshake] " << message;
-        if (reply_msg) *reply_msg = message + ": " + strerror(errno);
+        LOG(ERROR) << "[Handshake] " << message
+                   << ": local=" << context_.nicPath()
+                   << ", peer=" << peer_nic_path_ << ", qp_index=" << qp_index
+                   << ", local_qp=" << qp->qp_num
+                   << ", peer_qp=" << peer_qp_num
+                   << ", local_gid=" << context_.gid()
+                   << ", local_gid_index=" << local_gid_index
+                   << ", peer_gid=" << gidToString(peer_gid)
+                   << ", peer_lid=" << peer_lid
+                   << ", path_mtu=" << attr.path_mtu
+                   << ", port_num=" << static_cast<int>(context_.portNum())
+                   << ": " << strerror(ret);
+        if (reply_msg) *reply_msg = message + ": " + strerror(ret);
         if (failure_info) {
             failure_info->stage = SetupConnectionFailureStage::kRtr;
-            failure_info->sys_errno = errno;
+            failure_info->sys_errno = ret;
         }
         return ERR_ENDPOINT;
     }
@@ -1201,11 +1225,11 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
                             IBV_QP_MAX_QP_RD_ATOMIC);
     if (ret) {
         std::string message = "Failed to modify QP to RTS";
-        PLOG(ERROR) << "[Handshake] " << message;
-        if (reply_msg) *reply_msg = message + ": " + strerror(errno);
+        LOG(ERROR) << "[Handshake] " << message << ": " << strerror(ret);
+        if (reply_msg) *reply_msg = message + ": " + strerror(ret);
         if (failure_info) {
             failure_info->stage = SetupConnectionFailureStage::kRts;
-            failure_info->sys_errno = errno;
+            failure_info->sys_errno = ret;
         }
         return ERR_ENDPOINT;
     }

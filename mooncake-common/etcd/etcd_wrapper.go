@@ -792,6 +792,66 @@ func EtcdStoreBatchCreateWrapper(keys **C.char, values **C.char, count C.int, er
 	return 0
 }
 
+//export EtcdStoreTxnCompareAndPutWrapper
+func EtcdStoreTxnCompareAndPutWrapper(compareKeys **C.char, compareKeySizes *C.int, compareKinds *C.int, compareValues **C.char, compareValueSizes *C.int, compareCount C.int, putKeys **C.char, putKeySizes *C.int, putValues **C.char, putValueSizes *C.int, putCount C.int, errMsg **C.char) int {
+	cli := getStoreClient()
+	if cli == nil {
+		*errMsg = C.CString("etcd client not initialized")
+		return -1
+	}
+
+	cmpN := int(compareCount)
+	putN := int(putCount)
+
+	cmps := make([]clientv3.Cmp, 0, cmpN)
+	if cmpN > 0 {
+		compareKeyPtrs := (*[1 << 28]*C.char)(unsafe.Pointer(compareKeys))[:cmpN:cmpN]
+		compareKeySizeList := (*[1 << 28]C.int)(unsafe.Pointer(compareKeySizes))[:cmpN:cmpN]
+		compareKindList := (*[1 << 28]C.int)(unsafe.Pointer(compareKinds))[:cmpN:cmpN]
+		compareValuePtrs := (*[1 << 28]*C.char)(unsafe.Pointer(compareValues))[:cmpN:cmpN]
+		compareValueSizeList := (*[1 << 28]C.int)(unsafe.Pointer(compareValueSizes))[:cmpN:cmpN]
+		for i := 0; i < cmpN; i++ {
+			k := C.GoStringN(compareKeyPtrs[i], compareKeySizeList[i])
+			switch int(compareKindList[i]) {
+			case 0:
+				v := C.GoStringN(compareValuePtrs[i], compareValueSizeList[i])
+				cmps = append(cmps, clientv3.Compare(clientv3.Value(k), "=", v))
+			case 1:
+				cmps = append(cmps, clientv3.Compare(clientv3.CreateRevision(k), "=", 0))
+			default:
+				*errMsg = C.CString("unsupported compare kind")
+				return -1
+			}
+		}
+	}
+
+	ops := make([]clientv3.Op, 0, putN)
+	if putN > 0 {
+		putKeyPtrs := (*[1 << 28]*C.char)(unsafe.Pointer(putKeys))[:putN:putN]
+		putKeySizeList := (*[1 << 28]C.int)(unsafe.Pointer(putKeySizes))[:putN:putN]
+		putValuePtrs := (*[1 << 28]*C.char)(unsafe.Pointer(putValues))[:putN:putN]
+		putValueSizeList := (*[1 << 28]C.int)(unsafe.Pointer(putValueSizes))[:putN:putN]
+		for i := 0; i < putN; i++ {
+			k := C.GoStringN(putKeyPtrs[i], putKeySizeList[i])
+			v := C.GoStringN(putValuePtrs[i], putValueSizeList[i])
+			ops = append(ops, clientv3.OpPut(k, v))
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := cli.Txn(ctx).If(cmps...).Then(ops...).Commit()
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	if !resp.Succeeded {
+		*errMsg = C.CString("transaction compare failed")
+		return -2
+	}
+	return 0
+}
+
 //export EtcdStoreGetWithPrefixWrapper
 func EtcdStoreGetWithPrefixWrapper(prefix *C.char, prefixSize C.int, keys **C.char, keySizes **C.int, values **C.char, valueSizes **C.int, count *C.int, errMsg **C.char) int {
 	cli := getStoreClient()

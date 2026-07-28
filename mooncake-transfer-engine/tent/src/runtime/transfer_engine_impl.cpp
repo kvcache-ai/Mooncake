@@ -374,6 +374,30 @@ Status TransferEngineImpl::construct() {
 
     staging_proxy_ = std::make_unique<ProxyManager>(this);
 
+    if (runtime_queue_config_.limits.deadline_aware &&
+        runtime_queue_config_.limits.mlu_local_threshold > 0.0) {
+        auto rdma_xport =
+            transport_list_[static_cast<int>(TransportType::RDMA)];
+        if (rdma_xport) {
+            std::weak_ptr<Transport> weak_rdma = rdma_xport;
+            runtime_queue_->setDegradationPolicy(
+                [weak_rdma]() -> double {
+                    if (auto rdma = weak_rdma.lock()) {
+                        return rdma->getEstimatedBandwidth();
+                    }
+                    return -1.0;
+                },
+                DegradationHooks{}, nullptr);
+            LOG(INFO) << "Admission queue degradation: live RDMA bw"
+                      << ", theta_local="
+                      << runtime_queue_config_.limits.mlu_local_threshold;
+        } else {
+            LOG(WARNING) << "Admission queue degradation requested but RDMA "
+                            "transport is "
+                            "unavailable";
+        }
+    }
+
     if (enable_progress_worker_) {
         progress_worker_ = std::make_unique<ProgressWorker>(
             this, runtime_queue_config_.enabled
@@ -939,7 +963,7 @@ Status TransferEngineImpl::validateTransportHint(const Request& req,
     if (!transport_list_[req.transport_hint]) {
         return Status::InvalidArgument(
             "transport_hint=" +
-            TransportSelector::transportTypeName(req.transport_hint) +
+            std::string(transportTypeName(req.transport_hint)) +
             " is not enabled in config (request[" +
             std::to_string(request_index) + "])" LOC_MARK);
     }
@@ -1043,34 +1067,6 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
 
     return transport_selector_->select(ctx, transport_list_, transport_index,
                                        hint);
-}
-
-static const char* transportTypeName(TransportType type) {
-    switch (type) {
-        case UNSPEC:
-            return "UNSPEC";
-        case RDMA:
-            return "RDMA";
-        case MNNVL:
-            return "MNNVL";
-        case SHM:
-            return "SHM";
-        case NVLINK:
-            return "NVLINK";
-        case GDS:
-            return "GDS";
-        case IOURING:
-            return "IOURING";
-        case TCP:
-            return "TCP";
-        case AscendDirect:
-            return "AscendDirect";
-        case SUNRISE_LINK:
-            return "SUNRISE_LINK";
-        case TPU:
-            return "TPU";
-    }
-    return "UNKNOWN";
 }
 
 std::string printRequest(const Request& request) {
@@ -1589,6 +1585,8 @@ Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
         input.derived_task_ids = owner.derived_task_ids;
         input.request = owner.request;
         input.kind = owner_kind;
+        input.degradation_eligible =
+            owner.route.transport == RDMA && !owner.staging;
         submit.owners.push_back(std::move(input));
     }
 
@@ -2023,7 +2021,7 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
     LOG(INFO) << "Transport failover: " << transportTypeName(prev_type)
               << " -> " << transportTypeName(type) << " (attempt "
               << task.failover_count << "/" << max_failover_attempts_ << ")";
-    TENT_RECORD_TRANSPORT_FAILOVER();
+    TENT_RECORD_TRANSPORT_FAILOVER(prev_type, type);
 
     auto& transport = transport_list_[type];
     if (!batch->sub_batch[type]) {
@@ -2307,6 +2305,17 @@ Status TransferEngineImpl::progressBatch(BatchID batch_id,
     return getBatchStatus(batch_id, overall_status, true);
 }
 
+Status TransferEngineImpl::getNicLoadStats(
+    std::vector<NicLoadStats>& stats) const {
+    stats.clear();
+    for (const auto& transport : transport_list_) {
+        if (transport) {
+            CHECK_STATUS(transport->getNicLoadStats(stats));
+        }
+    }
+    return Status::OK();
+}
+
 void TransferEngineImpl::notifyBatchMaybeReady(BatchID batch_id) {
     if (progress_worker_) progress_worker_->notifyBatchMaybeReady(batch_id);
 }
@@ -2362,6 +2371,7 @@ Status TransferEngineImpl::unlockStageBuffer(uint64_t addr) {
 void TransferEngineImpl::recordTaskCompletionMetrics(
     TaskInfo& task, TransferStatusEnum prev_status,
     TransferStatusEnum new_status) {
+#if TENT_METRICS_ENABLED
     if (prev_status == PENDING && new_status != PENDING && !task.derived) {
         auto start_time = task.start_time;
         if (start_time.time_since_epoch().count() > 0) {
@@ -2371,12 +2381,11 @@ void TransferEngineImpl::recordTaskCompletionMetrics(
             if (new_status == COMPLETED) {
                 if (task.request.opcode == Request::READ) {
                     TentMetrics::instance().recordReadCompleted(
-                        task.request.length, latency_seconds);
+                        task.type, task.request.length, latency_seconds);
                 } else {
                     TentMetrics::instance().recordWriteCompleted(
-                        task.request.length, latency_seconds);
+                        task.type, task.request.length, latency_seconds);
                 }
-#if TENT_METRICS_ENABLED
                 // Causal chain stage decomposition
                 if (task.dispatch_time.time_since_epoch().count() > 0) {
                     double queue_wait_us =
@@ -2384,7 +2393,7 @@ void TransferEngineImpl::recordTaskCompletionMetrics(
                             task.dispatch_time - start_time)
                             .count();
                     TENT_RECORD_STAGE_LATENCY(TentMetrics::Stage::QueueWait,
-                                              queue_wait_us);
+                                              task.type, queue_wait_us);
                     if (task.post_time.time_since_epoch().count() > 0) {
                         double dispatch_us =
                             std::chrono::duration<double, std::micro>(
@@ -2395,45 +2404,48 @@ void TransferEngineImpl::recordTaskCompletionMetrics(
                                 end_time - task.post_time)
                                 .count();
                         TENT_RECORD_STAGE_LATENCY(TentMetrics::Stage::Dispatch,
-                                                  dispatch_us);
+                                                  task.type, dispatch_us);
                         TENT_RECORD_STAGE_LATENCY(TentMetrics::Stage::Transport,
-                                                  transport_us);
-                    }
-                }
-#endif
-                // Observability only (RFC #2519): if this transfer carried a
-                // deadline, emit the post-hoc feasibility ratio MLU =
-                // actual_transfer_time / available_window, where the window is
-                // (deadline - submit_time). MLU < 1 met the deadline; >= 1
-                // missed it. This does not drive any admission/scheduling yet.
-                if (task.request.deadline_ns != 0) {
-                    uint64_t start_ns = static_cast<uint64_t>(
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            start_time.time_since_epoch())
-                            .count());
-                    if (task.request.deadline_ns > start_ns) {
-                        double window_seconds =
-                            (task.request.deadline_ns - start_ns) / 1e9;
-                        TentMetrics::instance().recordDeadlineMLU(
-                            latency_seconds / window_seconds);
-                    } else {
-                        // Deadline already in the past at submit: infeasible.
-                        TentMetrics::instance().recordDeadlineMLU(5.0);
+                                                  task.type, transport_us);
                     }
                 }
             } else if (new_status == FAILED) {
                 if (task.request.opcode == Request::READ) {
-                    TentMetrics::instance().recordReadFailed(
-                        task.request.length);
+                    TentMetrics::instance().recordReadFailed(task.type);
                 } else {
-                    TentMetrics::instance().recordWriteFailed(
-                        task.request.length);
+                    TentMetrics::instance().recordWriteFailed(task.type);
+                }
+            }
+            // Observability only (RFC #2519): deadline feasibility. The
+            // infeasible-at-submit case (deadline already in the past when
+            // the transfer was submitted) is independent of whether the
+            // transfer ultimately completed or failed, so it is recorded for
+            // both outcomes. The feasible MLU ratio requires the actual
+            // transfer latency, so it is only recorded on COMPLETED.
+            if (task.request.deadline_ns != 0) {
+                uint64_t start_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        start_time.time_since_epoch())
+                        .count());
+                if (task.request.deadline_ns > start_ns) {
+                    if (new_status == COMPLETED) {
+                        double window_seconds =
+                            (task.request.deadline_ns - start_ns) / 1e9;
+                        TentMetrics::instance().recordDeadlineMLU(
+                            task.type, latency_seconds / window_seconds);
+                    }
+                } else {
+                    // Deadline already in the past at submit: infeasible.
+                    // Recorded into a dedicated counter so it does not
+                    // pollute the MLU histogram with a sentinel value.
+                    TentMetrics::instance().recordDeadlineInfeasible(task.type);
                 }
             }
             // Reset start_time to prevent duplicate recording
             task.start_time = std::chrono::steady_clock::time_point{};
         }
     }
+#endif  // TENT_METRICS_ENABLED
 }
 
 }  // namespace tent
