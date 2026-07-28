@@ -84,10 +84,6 @@ class ShmTransport : public Transport {
     Status relocateSharedMemoryAddress(uint64_t &dest_addr, uint64_t length,
                                        uint64_t target_id);
 
-    // Drop all mmap'd peer mappings for |target_id|. Safe to call when the
-    // peer has unregistered/freed the underlying shared-memory objects.
-    void dropSegmentMappings(SegmentID target_id);
-
    private:
     bool installed_;
     std::string local_segment_name_;

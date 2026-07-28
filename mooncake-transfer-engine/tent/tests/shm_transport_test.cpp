@@ -61,16 +61,6 @@ class ShmTransportTestPeer {
                                     const std::string& path, size_t size) {
         return transport.createSharedMemory(path, size);
     }
-
-    static void dropSegmentMappings(ShmTransport& transport,
-                                    SegmentID target_id) {
-        transport.dropSegmentMappings(target_id);
-    }
-
-    static void setCxlMountPath(ShmTransport& transport,
-                                const std::string& path) {
-        transport.cxl_mount_path_ = path;
-    }
 };
 
 namespace {
@@ -277,9 +267,10 @@ TEST(ShmTransportTest, CreateSharedMemoryDoesNotTruncateExisting) {
     ASSERT_TRUE(transport.uninstall().ok());
 }
 
-// B3: stale relocate entries are dropped when a lookup misses after the
-// peer has unregistered its buffers (NeedsRefreshCache path).
-TEST(ShmTransportTest, DropsStaleMappingsOnNeedsRefreshCache) {
+// NeedsRefreshCache must not munmap cached mappings: memcpy may still be
+// in flight on a previously resolved address after the relocate lock is
+// released (no transfer-level refcount/quiesce yet).
+TEST(ShmTransportTest, NeedsRefreshCacheKeepsExistingMappings) {
     const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
     constexpr uint64_t kRemoteAddress = 0x30000000;
     ScopedShmFile shm_file(page_size);
@@ -304,7 +295,6 @@ TEST(ShmTransportTest, DropsStaleMappingsOnNeedsRefreshCache) {
               1u);
     auto* mapped = reinterpret_cast<void*>(address);
 
-    // Unregister the buffer from metadata so the next relocate misses.
     ASSERT_TRUE(metadata->segmentManager()
                     .updateLocal([&](SegmentDesc& segment) -> Status {
                         auto& memory =
@@ -314,55 +304,18 @@ TEST(ShmTransportTest, DropsStaleMappingsOnNeedsRefreshCache) {
                     })
                     .ok());
 
-    // Probe an address outside the cached mapping so tryResolve misses and
-    // the NeedsRefreshCache path runs (which drops the whole segment's maps).
     uint64_t missing_address = kRemoteAddress + page_size;
     auto status = ShmTransportTestPeer::relocate(transport, missing_address,
                                                  page_size, LOCAL_SEGMENT_ID);
     EXPECT_TRUE(status.IsNeedsRefreshCache());
+    // Mapping must remain alive for any in-flight reader.
     EXPECT_EQ(ShmTransportTestPeer::mappingCount(transport, LOCAL_SEGMENT_ID),
-              0u);
-    EXPECT_FALSE(ShmTransportTestPeer::hasTarget(transport, LOCAL_SEGMENT_ID));
+              1u);
+    EXPECT_TRUE(ShmTransportTestPeer::hasTarget(transport, LOCAL_SEGMENT_ID));
 
     unsigned char residency = 0;
     errno = 0;
-    EXPECT_EQ(mincore(mapped, page_size, &residency), -1);
-    EXPECT_EQ(errno, ENOMEM);
-
-    ASSERT_TRUE(transport.uninstall().ok());
-}
-
-TEST(ShmTransportTest, DropSegmentMappingsReleasesMmap) {
-    const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
-    constexpr uint64_t kRemoteAddress = 0x40000000;
-    ScopedShmFile shm_file(page_size);
-
-    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
-    ASSERT_TRUE(installLocalSegmentWithShm(*metadata, shm_file.name(),
-                                           kRemoteAddress, page_size)
-                    .ok());
-
-    ShmTransport transport;
-    std::string local_segment_name = "shm_test_segment";
-    ASSERT_TRUE(transport
-                    .install(local_segment_name, metadata, nullptr,
-                             std::make_shared<Config>())
-                    .ok());
-
-    uint64_t address = kRemoteAddress;
-    ASSERT_TRUE(ShmTransportTestPeer::relocate(transport, address, page_size,
-                                               LOCAL_SEGMENT_ID)
-                    .ok());
-    auto* mapped = reinterpret_cast<void*>(address);
-
-    ShmTransportTestPeer::dropSegmentMappings(transport, LOCAL_SEGMENT_ID);
-    EXPECT_EQ(ShmTransportTestPeer::mappingCount(transport, LOCAL_SEGMENT_ID),
-              0u);
-
-    unsigned char residency = 0;
-    errno = 0;
-    EXPECT_EQ(mincore(mapped, page_size, &residency), -1);
-    EXPECT_EQ(errno, ENOMEM);
+    EXPECT_EQ(mincore(mapped, page_size, &residency), 0);
 
     ASSERT_TRUE(transport.uninstall().ok());
 }

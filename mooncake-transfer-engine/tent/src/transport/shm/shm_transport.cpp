@@ -280,18 +280,6 @@ bool ShmTransport::tryResolve(const RelocateMap &relocate_map,
     return false;
 }
 
-void ShmTransport::dropSegmentMappings(SegmentID target_id) {
-    RWSpinlock::WriteGuard guard(relocate_lock_);
-    auto target = relocate_map_.find(target_id);
-    if (target == relocate_map_.end()) {
-        return;
-    }
-    for (auto &entry : target->second) {
-        munmap(entry.second.shm_addr, entry.second.length);
-    }
-    relocate_map_.erase(target);
-}
-
 Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                                                  uint64_t length,
                                                  uint64_t target_id) {
@@ -319,30 +307,19 @@ Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
     // Owning reference: `buffer` is used after the lambda returns.
     SegmentDescRef pin;
     auto &segment_manager = metadata_->segmentManager();
-    Status lookup_status = segment_manager.withCachedSegment(
+    // Do not munmap relocate_map_ entries on NeedsRefreshCache: memcpy runs
+    // after this lock is released, and there is no transfer-level refcount /
+    // quiesce that proves no reader still holds a resolved address. POSIX
+    // shm_unlink already keeps the object alive for existing mappings; keep
+    // those mappings until uninstall().
+    CHECK_STATUS(segment_manager.withCachedSegment(
         target_id, pin, [&](SegmentDesc *segment) {
             buffer = segment->findBuffer(dest_addr, length);
             if (!buffer || buffer->shm_path.empty())
                 return Status::NeedsRefreshCache(
                     "Requested address is not in registered buffer" LOC_MARK);
             return Status::OK();
-        });
-    if (lookup_status.IsNeedsRefreshCache()) {
-        // Peer may have unregistered/freed the buffer. Drop stale mmap entries
-        // so we neither grow relocate_map_ unboundedly nor read freed memory.
-        // Unlock is not needed: we already hold the write lock; erase inline.
-        auto stale = relocate_map_.find(target_id);
-        if (stale != relocate_map_.end()) {
-            for (auto &entry : stale->second) {
-                munmap(entry.second.shm_addr, entry.second.length);
-            }
-            relocate_map_.erase(stale);
-        }
-        return lookup_status;
-    }
-    if (!lookup_status.ok()) {
-        return lookup_status;
-    }
+        }));
 
     void *shm_addr = nullptr;
     bool mapping_found = false;
