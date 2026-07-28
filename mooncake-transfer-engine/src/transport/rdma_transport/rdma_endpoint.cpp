@@ -213,7 +213,8 @@ int RdmaEndPoint::deconstructLocked() {
         if (!qp_list_[i]) continue;  // already destroyed in a previous call
         int ret = ibv_destroy_qp(qp_list_[i]);
         if (ret) {
-            LOG(ERROR) << "Failed to destroy QP[" << i << "]: " << strerror(ret);
+            LOG(ERROR) << "Failed to destroy QP[" << i
+                       << "]: " << strerror(ret);
             result = ERR_ENDPOINT;
         } else {
             qp_list_[i] = nullptr;
@@ -1194,8 +1195,7 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
         LOG(ERROR) << "[Handshake] " << message
                    << ": local=" << context_.nicPath()
                    << ", peer=" << peer_nic_path_ << ", qp_index=" << qp_index
-                   << ", local_qp=" << qp->qp_num
-                   << ", peer_qp=" << peer_qp_num
+                   << ", local_qp=" << qp->qp_num << ", peer_qp=" << peer_qp_num
                    << ", local_gid=" << context_.gid()
                    << ", local_gid_index=" << local_gid_index
                    << ", peer_gid=" << gidToString(peer_gid)

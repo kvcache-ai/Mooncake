@@ -476,6 +476,12 @@ tl::expected<size_t, ErrorCode> FileStorage::DirectGdsOffload(
     }
     if (keys.empty()) return 0;
 
+    // Serialise BatchOffload: the backend assumes single-threaded access
+    // (storage_backend.cpp SINGLE-WRITER precondition).  Acquired here so
+    // concurrent worker threads in the GDS pool never call BatchOffload
+    // concurrently.  Standalone-mode (WriteAtOffset) does not need this.
+    std::lock_guard<std::mutex> offload_lock(gds_offload_mutex_);
+
     std::unordered_map<std::string, std::vector<Slice>> batch_object;
     std::vector<OffloadTaskItem> tasks;
     tasks.reserve(keys.size());
@@ -858,6 +864,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             }
             return res;
         };
+        std::lock_guard<std::mutex> offload_lock(gds_offload_mutex_);
         auto offload_res = storage_backend_->BatchOffload(
             host_batch_object, bucket_complete_handler,
             [this](const std::vector<std::string>& evicted_keys) {

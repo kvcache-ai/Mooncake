@@ -931,11 +931,17 @@ class RealClient : public PyClient {
     bool gds_worker_started_ = false;
     int gds_num_workers_ = 1;  // real value set in the constructor
 
+    // -- GDS task in-flight cap (2.3) --
+    std::atomic<int> gds_tasks_in_flight_{0};
+    static constexpr int kGdsMaxInFlight = 8;
+
     // Enqueue a task on the GDS worker pool (started lazily on first
     // use).  Results are reported through promises captured by the task
-    // itself.  Tasks submitted after StopGdsWorker() are rejected (their
-    // promises break, so callers fail fast instead of hanging 120s).
-    void SubmitGdsTask(std::function<void()> task);
+    // itself.  Tasks submitted after StopGdsWorker() are rejected --
+    // on_complete() still fires (in-flight counter decrement), but the
+    // task body is NOT executed inline to avoid deadlocking the caller.
+    void SubmitGdsTask(std::function<void()> task,
+                       std::function<void()> on_complete = nullptr);
     // Signal all workers to drain and exit, then join them.  Called from
     // the destructor before any member teardown.
     void StopGdsWorker();

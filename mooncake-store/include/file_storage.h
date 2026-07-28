@@ -184,6 +184,10 @@ class FileStorage {
 
     std::shared_ptr<Client> client_;
     SsdMetric* ssd_metric_{nullptr};
+
+    // Serialises DirectGdsOffload -> BatchOffload: the backend assumes
+    // single-threaded access (see storage_backend.cpp SINGLE-WRITER).
+    std::mutex gds_offload_mutex_;
     std::string local_rpc_addr_;
     // Pinned host memory pool for GPU D2H staging in OffloadObjects
     std::unique_ptr<PinnedBufferPool> pinned_buffer_pool_;

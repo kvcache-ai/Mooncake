@@ -635,35 +635,45 @@ RealClient::~RealClient() {
     tearDownAll_internal();
 }
 
-void RealClient::SubmitGdsTask(std::function<void()> task) {
+void RealClient::SubmitGdsTask(std::function<void()> task,
+                               std::function<void()> on_complete) {
+    // Wrap task + on_complete so both fire on the worker thread, and
+    // on_complete fires on every exit path (success + exception).
+    auto wrapped = [t = std::move(task),
+                    c = std::move(on_complete)]() noexcept {
+        try {
+            t();
+        } catch (const std::exception &e) {
+            LOG(WARNING) << "GDS worker task threw: " << e.what()
+                         << " -- CompleteOffloadSpace may be skipped for"
+                         << " this task; store-side cleanup will reclaim"
+                         << " the reservations.";
+        } catch (...) {
+            LOG(WARNING) << "GDS worker task threw unknown exception";
+        }
+        if (c) c();
+    };
+
     {
-        std::lock_guard<std::mutex> lock(gds_worker_mutex_);
-        // Reject submissions after stop: no worker will ever consume the
-        // task, and the caller would otherwise sit out the full 120s
-        // future timeout.  Dropping the task destroys the captured
-        // promise, which makes the caller's future ready immediately
-        // with std::future_error (broken promise) -- a fast-fail
-        // surfaced in the caller's catch block.
+        std::unique_lock<std::mutex> lk(gds_worker_mutex_);
         if (gds_worker_stop_) {
-            LOG(WARNING) << "GDS worker pool stopped, rejecting task "
-                            "(caller fails fast via broken promise)";
+            // Workers joined -- do NOT execute task body inline.
+            LOG(WARNING) << "GDS worker pool stopped, rejecting task"
+                         << " (on_complete still fires to decrment counter)";
+            // The body may block on rdma_future.get() or a notify_barrier
+            // whose promise the caller has not yet satisfied (BatchPut
+            // has not run).  Only call on_complete (decr counter).
+            // unique_lock permits manual unlock.
+            if (on_complete) {
+                lk.unlock();
+                on_complete();
+            }
             return;
         }
         if (!gds_worker_started_) {
             for (int i = 0; i < gds_num_workers_; ++i) {
                 gds_worker_threads_.emplace_back([this]() {
 #ifdef USE_CUDA
-                    // CUDA context is thread-local.  A fresh std::thread
-                    // has no context, so cudaPointerGetAttributes()
-                    // (called by FindDeviceForPointer inside
-                    // WriteRecord/ReadRecord) would fail to recognise
-                    // GPU pointers and silently fall back to CPU pwrite.
-                    // cudaFree(nullptr) is a guaranteed no-op that
-                    // triggers lazy primary-context initialisation.
-                    // No cudaSetDevice here: WriteRecord switches
-                    // context per slice via FindDeviceForPointer +
-                    // SetContext (gds_context.cpp), so a fixed binding
-                    // is unnecessary.
                     cudaFree(nullptr);
 #endif
                     std::unique_lock<std::mutex> lk(gds_worker_mutex_);
@@ -686,7 +696,7 @@ void RealClient::SubmitGdsTask(std::function<void()> task) {
             }
             gds_worker_started_ = true;
         }
-        gds_worker_queue_.push_back(std::move(task));
+        gds_worker_queue_.push_back(std::move(wrapped));
     }
     gds_worker_cv_.notify_one();
 }
@@ -4043,12 +4053,12 @@ RealClient::batch_put_from_dummy_helper(
 }
 
 // ===================================================================
-// batch_put_with_store_reservation -- normal-mode + GDS
+// batch_put_with_store_reservation -- standalone-mode GDS
 //
 // vLLM has GPU pointers and a GDS-only file_storage_ with cuFile
 // handle on the shared kv_cache.data. Store_service owns the
 // OffsetAllocator and the master DISK-replica registration.
-// Flow: Reserve(RPC) -> DMA(WriteAtOffset) ∥ BatchPut(RDMA) ->
+// Flow: Reserve(RPC) -> DMA(WriteAtOffset) || BatchPut(RDMA) ->
 // Complete(RPC; store then notifies the master).
 // ===================================================================
 std::vector<tl::expected<void, ErrorCode>>
@@ -4064,10 +4074,7 @@ RealClient::batch_put_with_store_reservation(
         return client_->BatchPut(keys, mutable_slices, config);
     }
 
-    // Tenant-scope the keys exactly like the read path
-    // (batch_get_into_offload_object_internal) does, so the store's
-    // backend, the on-disk record keys and the master's object identity
-    // all agree on the same key form.
+    // Tenant-scope the keys.
     const std::string tenant_id = client_->tenant_id();
     std::vector<std::string> scoped_keys;
     scoped_keys.reserve(keys.size());
@@ -4080,6 +4087,7 @@ RealClient::batch_put_with_store_reservation(
         value_sizes.push_back(total);
     }
 
+    // -- Step 1: Reserve RPC (unchanged) --
     BatchReserveOffloadSpaceRequest req(scoped_keys, value_sizes);
     auto reserve_result = client_requester_->batch_reserve_offload_space(
         store_service_addr_, req);
@@ -4090,10 +4098,6 @@ RealClient::batch_put_with_store_reservation(
         return client_->BatchPut(keys, mutable_slices, config);
     }
     const auto &resp = reserve_result.value();
-    // Match reservations to keys by NAME: each reservation carries its
-    // scoped key, so a key missing from the map is a failed reservation.
-    // (Positional alignment against the request would silently corrupt
-    // data if either side's bookkeeping ever diverged.)
     auto offset_by_key =
         std::make_shared<const std::unordered_map<std::string, uint64_t>>(
             [&resp] {
@@ -4104,22 +4108,78 @@ RealClient::batch_put_with_store_reservation(
                 return m;
             }());
 
-    // Promise carries the set of DMA-succeeded indices.
-    // An empty set means all DMA writes failed (not an error — the
-    // caller treats it as "no keys to complete").
-    auto gds_promise =
-        std::make_shared<std::promise<std::unordered_set<size_t>>>();
-    auto gds_future = gds_promise->get_future();
-    // Capture file_storage_ shared_ptr so the worker task keeps the
-    // FileStorage (and its cuFile handle) alive for its lifetime.
+    // -- Step 2: Check in-flight cap; fall back to sync if saturated --
+    int prev_nf = gds_tasks_in_flight_.fetch_add(1, std::memory_order_acq_rel);
+    bool is_async = (prev_nf < kGdsMaxInFlight);
+    if (!is_async) {
+        gds_tasks_in_flight_.fetch_sub(1, std::memory_order_acq_rel);
+    }
+
+    using BatchResults = std::vector<tl::expected<void, ErrorCode>>;
+    std::shared_ptr<std::promise<std::shared_ptr<const BatchResults>>>
+        rdma_promise;
+    std::shared_future<std::shared_ptr<const BatchResults>> rdma_future;
+
     auto fs = file_storage_;
-    SubmitGdsTask(
-        [fs, scoped_keys, batched_slices, offset_by_key, p = gds_promise]() {
+
+    if (is_async) {
+        rdma_promise = std::make_shared<
+            std::promise<std::shared_ptr<const BatchResults>>>();
+        rdma_future = rdma_promise->get_future().share();
+        // -- Async path (common case) --
+        SubmitGdsTask(
+            // Task body
+            [fs, scoped_keys, batched_slices, offset_by_key,
+             store_addr = store_service_addr_,
+             client_requester = client_requester_, rdma_future]() {
+                std::unordered_set<size_t> dma_succeeded;
+                for (size_t i = 0; i < scoped_keys.size(); ++i) {
+                    auto it = offset_by_key->find(scoped_keys[i]);
+                    if (it == offset_by_key->end()) continue;
+                    auto wr = fs->WriteAtOffset(scoped_keys[i],
+                                                batched_slices[i], it->second);
+                    if (wr) dma_succeeded.insert(i);
+                }
+                // Block on caller's BatchPut results (caller already
+                // returned).  BatchPut is an RDMA round-trip (~ms).
+                auto results = rdma_future.get();
+                std::vector<std::string> succeeded;
+                for (size_t i = 0; i < scoped_keys.size(); ++i) {
+                    if (dma_succeeded.count(i) && (*results)[i].has_value())
+                        succeeded.push_back(scoped_keys[i]);
+                }
+                if (!succeeded.empty()) {
+                    BatchCompleteOffloadSpaceRequest complete_req(
+                        std::move(succeeded));
+                    auto cr = client_requester->batch_complete_offload_space(
+                        store_addr, complete_req);
+                    if (!cr)
+                        VLOG(1)
+                            << "GDS CompleteOffloadSpace (async) failed: "
+                            << cr.error()
+                            << " -- store-side cleanup will reclaim offsets";
+                }
+            },
+            // On-complete callback: decrement in-flight counter
+            [this]() {
+                gds_tasks_in_flight_.fetch_sub(1, std::memory_order_release);
+            });
+    }
+
+    // Step 3: If sync, submit DMA BEFORE BatchPut for DMA/RDMA overlap.
+    std::shared_ptr<std::promise<std::unordered_set<size_t>>> sync_gds_promise;
+    std::shared_future<std::unordered_set<size_t>> sync_gds_future;
+    if (!is_async) {
+        sync_gds_promise =
+            std::make_shared<std::promise<std::unordered_set<size_t>>>();
+        sync_gds_future = sync_gds_promise->get_future().share();
+        SubmitGdsTask([fs, scoped_keys, batched_slices, offset_by_key,
+                       p = sync_gds_promise]() {
             try {
                 std::unordered_set<size_t> dma_succeeded;
                 for (size_t i = 0; i < scoped_keys.size(); ++i) {
                     auto it = offset_by_key->find(scoped_keys[i]);
-                    if (it == offset_by_key->end()) continue;  // reserve failed
+                    if (it == offset_by_key->end()) continue;
                     auto wr = fs->WriteAtOffset(scoped_keys[i],
                                                 batched_slices[i], it->second);
                     if (wr) dma_succeeded.insert(i);
@@ -4129,26 +4189,40 @@ RealClient::batch_put_with_store_reservation(
                 p->set_exception(std::current_exception());
             }
         });
+    }
 
-    auto results = client_->BatchPut(keys, mutable_slices, config);
+    // Step 4: BatchPut (RDMA) -- common to both paths
+    std::vector<tl::expected<void, ErrorCode>> results;
+    try {
+        results = client_->BatchPut(keys, mutable_slices, config);
+    } catch (...) {
+        if (is_async) {
+            rdma_promise->set_exception(std::current_exception());
+        }
+        throw;
+    }
 
-    // Collect DMA-succeeded indices from the GDS worker.
-    // Default-empty set: if the task times out or crashes, no keys
-    // are considered DMA-complete → none will be completed.
+    if (is_async) {
+        // Async: publish RDMA results (non-blocking), return
+        rdma_promise->set_value(std::make_shared<const BatchResults>(results));
+        return results;
+    }
+
+    // Synchronous fallback (in-flight cap saturated)
+    // DMA was submitted BEFORE BatchPut above.  Wait + intersect.
     std::unordered_set<size_t> dma_succeeded;
-    if (gds_future.valid()) {
-        auto st = gds_future.wait_for(std::chrono::seconds(120));
+    if (sync_gds_future.valid()) {
+        auto st = sync_gds_future.wait_for(std::chrono::seconds(120));
         if (st == std::future_status::timeout) {
             LOG(ERROR) << "GDS DMA timed out after 120s.";
         } else {
             try {
-                dma_succeeded = gds_future.get();
-                LOG(INFO) << "GDS DMA completed: " << dma_succeeded.size()
-                          << "/" << offset_by_key->size()
-                          << " writes succeeded";
+                dma_succeeded = sync_gds_future.get();
+                VLOG(1) << "GDS DMA completed (sync fallback): "
+                        << dma_succeeded.size() << "/" << offset_by_key->size();
                 if (dma_succeeded.size() < offset_by_key->size()) {
                     LOG(WARNING)
-                        << "GDS: some DMA writes failed — "
+                        << "GDS: some DMA writes failed -- "
                         << "skipping CompleteOffloadSpace for those keys; "
                         << "their reserved offsets stay dirty and will be "
                         << "reclaimed by the store-side cleanup";
@@ -4222,7 +4296,7 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
     }
 
     // Call client BatchPut and return the vector<expected> directly
-    // ── GDS parallel offload ──
+    // -- GDS parallel offload -- (normal-mode: in-process BatchOffload)
     bool gds_enabled = (file_storage_ && file_storage_->config_.enable_gds &&
                         file_storage_->IsGdsEnabled());
 
@@ -4236,17 +4310,53 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
 
     std::string tenant_id_str = client_ ? client_->tenant_id() : "default";
 
+    int prev_nf = gds_tasks_in_flight_.fetch_add(1, std::memory_order_acq_rel);
+    bool is_async = (prev_nf < kGdsMaxInFlight);
+    if (!is_async) {
+        gds_tasks_in_flight_.fetch_sub(1, std::memory_order_acq_rel);
+    }
+
+    if (is_async) {
+        // -- Async: fire-and-forget --
+        // DirectGdsOffload acquires gds_offload_mutex_ around BatchOffload.
+        auto notify_barrier = std::make_shared<std::promise<bool>>();
+        auto fs = file_storage_;
+
+        SubmitGdsTask(
+            [fs, keys, slices = ordered_batched_slices, tenant = tenant_id_str,
+             barrier = notify_barrier]() {
+                auto r = fs->DirectGdsOffload(keys, slices, tenant, barrier);
+                if (!r)
+                    VLOG(1)
+                        << "GDS DirectGdsOffload (async) failed: " << r.error();
+            },
+            [this]() {
+                gds_tasks_in_flight_.fetch_sub(1, std::memory_order_release);
+            });
+
+        std::vector<tl::expected<void, ErrorCode>> results;
+        try {
+            results = client_->BatchPut(keys, ordered_batched_slices, config);
+        } catch (...) {
+            notify_barrier->set_value(false);
+            throw;
+        }
+        bool batch_put_ok =
+            std::all_of(results.begin(), results.end(),
+                        [](const auto &r) { return r.has_value(); });
+        notify_barrier->set_value(batch_put_ok);
+        return results;  // no wait on DMA
+    }
+
+    // -- Sync fallback (in-flight cap saturated) --
+    // Maintains the existing DMA/RDMA overlap: SubmitGdsTask first,
+    // then BatchPut.
     auto gds_promise =
         std::make_shared<std::promise<tl::expected<size_t, ErrorCode>>>();
     auto gds_future = gds_promise->get_future();
     auto notify_barrier = std::make_shared<std::promise<bool>>();
 
-    // Launch the GDS DMA on the persistent worker BEFORE BatchPut: the
-    // cuFile writes then overlap with the RDMA Submit+Wait inside
-    // BatchPut, which is the whole point of the parallel offload.
-    // ordered_batched_slices is captured by value — Slice is {ptr, size},
-    // a cheap struct copy; the GPU buffers themselves are not copied.
-    auto fs = file_storage_;  // shared_ptr, keeps FileStorage alive
+    auto fs = file_storage_;
     SubmitGdsTask([fs, keys, slices = ordered_batched_slices,
                    tenant = tenant_id_str, p = gds_promise,
                    barrier = notify_barrier]() {
@@ -4268,9 +4378,6 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
     bool batch_put_ok =
         std::all_of(results.begin(), results.end(),
                     [](const auto &r) { return r.has_value(); });
-    // If any BatchPut key failed, the GDS task skips
-    // NotifyOffloadSuccess via the barrier (checks batch_put_ok).
-    // This prevents orphan DISK replicas for failed keys.
     notify_barrier->set_value(batch_put_ok);
 
     if (gds_future.valid()) {
@@ -5503,16 +5610,50 @@ RealClient::batch_put_from_multi_buffers_internal(
 
     std::string tenant_id_str = client_ ? client_->tenant_id() : "default";
 
+    int prev_nf = gds_tasks_in_flight_.fetch_add(1, std::memory_order_acq_rel);
+    bool is_async = (prev_nf < kGdsMaxInFlight);
+    if (!is_async) {
+        gds_tasks_in_flight_.fetch_sub(1, std::memory_order_acq_rel);
+    }
+
+    if (is_async) {
+        // -- Async: fire-and-forget --
+        auto notify_barrier = std::make_shared<std::promise<bool>>();
+        auto fs = file_storage_;
+
+        SubmitGdsTask(
+            [fs, keys, slices = batched_slices, tenant = tenant_id_str,
+             barrier = notify_barrier]() {
+                auto r = fs->DirectGdsOffload(keys, slices, tenant, barrier);
+                if (!r)
+                    VLOG(1)
+                        << "GDS DirectGdsOffload (async) failed: " << r.error();
+            },
+            [this]() {
+                gds_tasks_in_flight_.fetch_sub(1, std::memory_order_release);
+            });
+
+        std::vector<tl::expected<void, ErrorCode>> results;
+        try {
+            results = client_->BatchPut(keys, batched_slices, config);
+        } catch (...) {
+            notify_barrier->set_value(false);
+            throw;
+        }
+        bool batch_put_ok =
+            std::all_of(results.begin(), results.end(),
+                        [](const auto &r) { return r.has_value(); });
+        notify_barrier->set_value(batch_put_ok);
+        return results;
+    }
+
+    // -- Sync fallback (in-flight cap saturated) --
     auto gds_promise =
         std::make_shared<std::promise<tl::expected<size_t, ErrorCode>>>();
     auto gds_future = gds_promise->get_future();
     auto notify_barrier = std::make_shared<std::promise<bool>>();
 
-    // Same orchestration as batch_put_from_internal: launch the GDS DMA
-    // on the persistent worker before BatchPut so the cuFile writes
-    // overlap with the RDMA Submit+Wait.  batched_slices is captured by
-    // value — Slice is {ptr, size}, a cheap struct copy.
-    auto fs = file_storage_;  // shared_ptr, keeps FileStorage alive
+    auto fs = file_storage_;
     SubmitGdsTask([fs, keys, slices = batched_slices, tenant = tenant_id_str,
                    p = gds_promise, barrier = notify_barrier]() {
         try {
@@ -5533,9 +5674,6 @@ RealClient::batch_put_from_multi_buffers_internal(
     bool batch_put_ok =
         std::all_of(results.begin(), results.end(),
                     [](const auto &r) { return r.has_value(); });
-    // If any BatchPut key failed, the GDS task skips
-    // NotifyOffloadSuccess via the barrier (checks batch_put_ok).
-    // This prevents orphan DISK replicas for failed keys.
     notify_barrier->set_value(batch_put_ok);
 
     if (gds_future.valid()) {
@@ -5547,7 +5685,11 @@ RealClient::batch_put_from_multi_buffers_internal(
         } else {
             try {
                 auto r = gds_future.get();
-                if (!r) LOG(WARNING) << "GDS offload failed: " << r.error();
+                if (!r)
+                    LOG(WARNING) << "GDS offload failed: " << r.error()
+                                 << " (DISK replica not registered; the "
+                                    "store-side offload may retry later "
+                                    "if it is enabled)";
             } catch (const std::exception &e) {
                 LOG(ERROR) << "GDS offload task crashed: " << e.what();
             }
