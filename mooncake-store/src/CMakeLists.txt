@@ -352,6 +352,10 @@ target_link_libraries(
           ${ETCD_WRAPPER_LIB}
           ${MASTER_EXTRA_LIBS}
           asio_shared)
+# mooncake_store is static and propagates optional runtime dependencies to its
+# consumers. The metadata-only master does not use accelerator staging, so drop
+# those dependencies when they do not satisfy any symbols in the final binary.
+target_link_options(mooncake_master PRIVATE "LINKER:--as-needed")
 if(USE_SUNRISE)
   target_link_directories(mooncake_master PRIVATE ${MC_TANGRT_ROOT}/lib)
 endif()
