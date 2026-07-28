@@ -58,6 +58,58 @@ TransferOpcode.READ   # Read operation
 TransferOpcode.WRITE  # Write operation
 ```
 
+### Class: RpcInterface
+
+The RPC communicator used to send data and tensors directly between endpoints.
+
+#### initialize()
+
+```python
+initialize(
+    listen_address="",
+    thread_count=0,
+    timeout_seconds=30,
+    pool_size=100,
+)
+```
+
+Initializes an RPC communicator that can act as a client, a server, or both.
+
+**Parameters:**
+- `listen_address` (str): Address on which the RPC server listens. Leave empty
+  for a client-only communicator.
+- `thread_count` (int): Number of RPC server worker threads. This parameter does
+  not control RPC client I/O threads.
+- `timeout_seconds` (int): RPC request timeout in seconds.
+- `pool_size` (int): Maximum number of cached RPC client connections for each
+  target endpoint.
+
+**Returns:**
+- `bool`: `True` when initialization succeeds, otherwise `False`.
+
+#### initialize_client()
+
+```python
+initialize_client(pool_size=100, timeout_seconds=30)
+```
+
+Initializes a client-only RPC communicator.
+
+**Parameters:**
+- `pool_size` (int): Maximum number of cached RPC client connections for each
+  target endpoint.
+- `timeout_seconds` (int): RPC request timeout in seconds.
+
+**Returns:**
+- `bool`: `True` when initialization succeeds, otherwise `False`.
+
+RPC client I/O threads are independent of `pool_size` and `thread_count`. Set
+`MC_TE_RPC_CLIENT_IO_THREADS` to configure the Transfer Engine client I/O pool.
+If it is unset, `0`, or invalid, the value falls back to
+`MC_RPC_CLIENT_IO_THREADS`. These environment variables are read when the
+process environment configuration is first initialized, so changing them
+requires restarting the process.
+
 ### Initialization Methods
 
 #### initialize()
