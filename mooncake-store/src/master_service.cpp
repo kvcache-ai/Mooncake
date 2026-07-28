@@ -586,6 +586,12 @@ MasterService::~MasterService() {
         MasterMetricManager::instance().dec_allocated_mem_size(
             segment, static_cast<int64_t>(bytes));
     }
+
+    // Segments still mounted here never went through CommitUnmountSegment;
+    // release their capacity contribution so the process-lifetime
+    // MasterMetricManager stays consistent when the next leadership term
+    // constructs a fresh MasterService and the clients remount.
+    segment_manager_.releaseCapacityMetrics();
 }
 
 ErrorCode MasterService::SetBatchOpLogBackendForTesting(
