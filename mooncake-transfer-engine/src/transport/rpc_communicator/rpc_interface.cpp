@@ -557,9 +557,35 @@ void bind_rpc_interface(pybind11::module_& m) {
     py::class_<RpcInterface>(m, "RpcInterface")
         .def(py::init<>())
         .def("initialize", &RpcInterface::initialize,
+             R"pbdoc(
+Initialize the RPC communicator.
+
+Args:
+    listen_address: Address on which the RPC server listens. Leave empty for
+        a client-only communicator.
+    thread_count: Number of RPC server worker threads. This does not control
+        RPC client I/O threads.
+    timeout_seconds: RPC request timeout in seconds.
+    pool_size: Maximum number of cached RPC client connections per target
+        endpoint.
+
+RPC client I/O threads are configured with MC_TE_RPC_CLIENT_IO_THREADS, which
+falls back to MC_RPC_CLIENT_IO_THREADS when unset or invalid.
+)pbdoc",
              py::arg("listen_address") = "", py::arg("thread_count") = 0,
              py::arg("timeout_seconds") = 30, py::arg("pool_size") = 100)
         .def("initialize_client", &RpcInterface::initializeClient,
+             R"pbdoc(
+Initialize a client-only RPC communicator.
+
+Args:
+    pool_size: Maximum number of cached RPC client connections per target
+        endpoint.
+    timeout_seconds: RPC request timeout in seconds.
+
+RPC client I/O threads are configured with MC_TE_RPC_CLIENT_IO_THREADS, which
+falls back to MC_RPC_CLIENT_IO_THREADS when unset or invalid.
+)pbdoc",
              py::arg("pool_size") = 100, py::arg("timeout_seconds") = 30)
         .def("initialize_server", &RpcInterface::initializeServer,
              py::arg("listen_address"), py::arg("thread_count") = 8,
