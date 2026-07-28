@@ -17,6 +17,13 @@ namespace {
 class FakeHaKvBackend : public HaKvBackend {
    public:
     ErrorCode Get(std::string_view key, std::string& value) override {
+        if (next_get_key_error_ != ErrorCode::OK &&
+            key == next_get_error_key_) {
+            ErrorCode err = next_get_key_error_;
+            next_get_key_error_ = ErrorCode::OK;
+            next_get_error_key_.clear();
+            return err;
+        }
         if (next_get_error_ != ErrorCode::OK) {
             ErrorCode err = next_get_error_;
             next_get_error_ = ErrorCode::OK;
@@ -93,6 +100,10 @@ class FakeHaKvBackend : public HaKvBackend {
         race_value_ = std::move(value);
     }
     void FailNextGet(ErrorCode err) { next_get_error_ = err; }
+    void FailNextGetForKey(std::string key, ErrorCode err) {
+        next_get_error_key_ = std::move(key);
+        next_get_key_error_ = err;
+    }
     void FailNextRange(ErrorCode err) { next_range_error_ = err; }
     void FailNextTxn(ErrorCode err) { next_txn_error_ = err; }
     const std::vector<size_t>& range_limits() const { return range_limits_; }
@@ -104,6 +115,8 @@ class FakeHaKvBackend : public HaKvBackend {
     std::string race_key_;
     std::string race_value_;
     ErrorCode next_get_error_{ErrorCode::OK};
+    std::string next_get_error_key_;
+    ErrorCode next_get_key_error_{ErrorCode::OK};
     ErrorCode next_range_error_{ErrorCode::OK};
     ErrorCode next_txn_error_{ErrorCode::OK};
     std::vector<size_t> range_limits_;
@@ -578,6 +591,39 @@ TEST(OpLogBatchStorageTest, ReadBatchesAfterHonorsLimit) {
 TEST(OpLogBatchStorageBackendErrorTest, PropagatesReadDurablePrefixError) {
     FakeHaKvBackend backend;
     backend.FailNextGet(ErrorCode::ETCD_OPERATION_ERROR);
+    OpLogBatchStorage storage("clusterA", backend);
+
+    DurablePrefix prefix;
+    EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR,
+              storage.InitDurablePrefix(prefix));
+}
+
+TEST(OpLogBatchStorageBackendErrorTest,
+     PropagatesZeroPrefixValidationRangeError) {
+    FakeHaKvBackend backend;
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put("/oplog/clusterA/durable_prefix",
+                          EncodeDurablePrefix({.batch_id = 0, .last_seq = 0})));
+    backend.FailNextRange(ErrorCode::ETCD_OPERATION_ERROR);
+    OpLogBatchStorage storage("clusterA", backend);
+
+    DurablePrefix prefix;
+    EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR,
+              storage.InitDurablePrefix(prefix));
+}
+
+TEST(OpLogBatchStorageBackendErrorTest,
+     PropagatesTerminalBatchReadErrorAtStartup) {
+    FakeHaKvBackend backend;
+    const std::string batch_key =
+        "/oplog/clusterA/batches/00000000000000000001";
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend.Put(batch_key, EncodeOpLogBatchRecord(MakeBatch(1, 1, 1))));
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put("/oplog/clusterA/durable_prefix",
+                          EncodeDurablePrefix({.batch_id = 1, .last_seq = 1})));
+    backend.FailNextGetForKey(batch_key, ErrorCode::ETCD_OPERATION_ERROR);
     OpLogBatchStorage storage("clusterA", backend);
 
     DurablePrefix prefix;
