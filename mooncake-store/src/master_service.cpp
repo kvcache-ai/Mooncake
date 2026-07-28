@@ -11,7 +11,6 @@
 #include <cstring>
 #include <future>
 #include <limits>
-#include <random>
 #include <shared_mutex>
 #include <sstream>
 #include <stdexcept>
@@ -49,6 +48,7 @@
 #include "ha/snapshot/snapshot_logger.h"
 #include "utils/zstd_util.h"
 #include "utils/file_util.h"
+#include "random.h"
 #include "utils.h"
 #include "kv_event/kv_event_config.h"
 #include "master_snapshot_manager.h"
@@ -85,12 +85,6 @@ tl::expected<SnapshotCatalogBackendKind, std::string> ParseSnapshotCatalogKind(
     }
     return tl::make_unexpected("unknown snapshot catalog store type: " +
                                std::string(store_type));
-}
-
-size_t RandomIndex(size_t upper_bound) {
-    static thread_local std::mt19937 generator(std::random_device{}());
-    std::uniform_int_distribution<size_t> dist(0, upper_bound - 1);
-    return dist(generator);
 }
 
 uint64_t SaturatingAdd(uint64_t lhs, uint64_t rhs) {
@@ -2309,7 +2303,7 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
         }
     }
 
-    const size_t start_shard = RandomIndex(kNumShards);
+    const size_t start_shard = randomIndex(kNumShards);
     for (size_t scanned = 0; scanned < kNumShards; ++scanned) {
         const size_t shard_idx =
             (start_shard + kNumShards - scanned) % kNumShards;
@@ -3112,7 +3106,7 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
         }
     }
 
-    const size_t start_shard = RandomIndex(kNumShards);
+    const size_t start_shard = randomIndex(kNumShards);
     for (size_t scanned = 0; scanned < kNumShards; ++scanned) {
         const size_t shard_idx =
             (start_shard + kNumShards - scanned) % kNumShards;
@@ -3244,7 +3238,7 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
         }
     }
 
-    const size_t start_shard = RandomIndex(kNumShards);
+    const size_t start_shard = randomIndex(kNumShards);
     for (size_t scanned = 0; scanned < kNumShards; ++scanned) {
         const size_t shard_idx =
             (start_shard + kNumShards - scanned) % kNumShards;
@@ -7812,7 +7806,7 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
     };
 
     auto pass = [&](bool allow_soft_pinned) {
-        const size_t start_shard = RandomIndex(kNumShards);
+        const size_t start_shard = randomIndex(kNumShards);
         for (size_t scanned = 0;
              scanned < kNumShards && total.freed_bytes < target_bytes;
              ++scanned) {
@@ -8195,7 +8189,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
     // Randomly select a starting shard to avoid imbalance eviction between
     // shards.
-    size_t start_idx = RandomIndex(kNumShards);
+    size_t start_idx = randomIndex(kNumShards);
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
 
     // ===== Phase 1: Parallel candidate collection =====
@@ -8587,7 +8581,7 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                replica.get_refcnt() == 0;
     };
 
-    size_t start_idx = RandomIndex(metadata_shards_.size());
+    size_t start_idx = randomIndex(metadata_shards_.size());
     for (size_t i = 0; i < metadata_shards_.size(); i++) {
         MetadataShardAccessorRW shard(
             this, (start_idx + i) % metadata_shards_.size());
@@ -9741,9 +9735,8 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
     }
 
     // Randomly pick a segment from the source replicas
-    static thread_local std::mt19937 gen(std::random_device{}());
-    std::uniform_int_distribution<size_t> dis(0, segment_names.size() - 1);
-    std::string selected_source_segment = segment_names[dis(gen)];
+    std::string selected_source_segment =
+        segment_names[randomIndex(segment_names.size())];
     UUID select_client;
     ErrorCode error = segment_accessor.GetClientIdBySegmentName(
         selected_source_segment, select_client);
