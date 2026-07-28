@@ -205,9 +205,14 @@ class TentMetrics {
     // Histograms - paired with their bucket boundaries in a single vector so
     // the two cannot drift out of sync (ylt histogram doesn't expose its
     // boundaries publicly, so we hold them alongside the pointer).
+    // Each entry also carries a parallel counter used to track the per-label
+    // sum, because ylt's basic_dynamic_histogram keeps sum_ private with no
+    // public accessor — without this counter, _sum could only be emitted as 0
+    // in the Prometheus endpoint, breaking _sum / _count queries.
     struct HistogramEntry {
         ylt::metric::basic_dynamic_histogram<int64_t, 1>* h;
         const std::vector<double>* boundaries;
+        ylt::metric::basic_dynamic_counter<int64_t, 1>* sum;
     };
     std::vector<HistogramEntry> histograms_;
 
@@ -262,8 +267,59 @@ class TentMetrics {
         "Causal chain: transport execution latency in microseconds",
         kStageBuckets, kTransportLabel};
 
+    // Parallel counters tracking per-label sum for each histogram. ylt's
+    // basic_dynamic_histogram keeps sum_ private with no public accessor, so
+    // we maintain these alongside observe() calls and read them back via
+    // copy() in the Prometheus serializer. Each counter's str_name is the
+    // histogram name suffixed with "_sum" so it emits as <name>_sum{...} in
+    // Prometheus output.
+    ylt::metric::basic_dynamic_counter<int64_t, 1> read_latency_sum_{
+        "tent_read_latency_us_sum",
+        "Sum of read latency observations (microseconds)", kTransportLabel};
+    ylt::metric::basic_dynamic_counter<int64_t, 1> write_latency_sum_{
+        "tent_write_latency_us_sum",
+        "Sum of write latency observations (microseconds)", kTransportLabel};
+    ylt::metric::basic_dynamic_counter<int64_t, 1> read_size_sum_{
+        "tent_read_size_bytes_sum", "Sum of read request sizes (bytes)",
+        kTransportLabel};
+    ylt::metric::basic_dynamic_counter<int64_t, 1> write_size_sum_{
+        "tent_write_size_bytes_sum", "Sum of write request sizes (bytes)",
+        kTransportLabel};
+    ylt::metric::basic_dynamic_counter<int64_t, 1> deadline_mlu_sum_{
+        "tent_deadline_mlu_permille_sum",
+        "Sum of deadline MLU (permille) observations", kTransportLabel};
+    ylt::metric::basic_dynamic_counter<int64_t, 1> stage_queue_wait_sum_{
+        "tent_stage_queue_wait_us_sum",
+        "Sum of queue wait latency observations (microseconds)",
+        kTransportLabel};
+    ylt::metric::basic_dynamic_counter<int64_t, 1> stage_dispatch_sum_{
+        "tent_stage_dispatch_us_sum",
+        "Sum of dispatch latency observations (microseconds)", kTransportLabel};
+    ylt::metric::basic_dynamic_counter<int64_t, 1> stage_transport_sum_{
+        "tent_stage_transport_us_sum",
+        "Sum of transport execution latency observations (microseconds)",
+        kTransportLabel};
+
     // Helper to register all metrics to the vectors
     void registerMetrics();
+
+    // Serialize a single histogram in Prometheus text format. Walks the
+    // same get_bucket_counts() / copy() data the JSON path uses, so the two
+    // endpoints can never drift. Unlike ylt's serialize(), this never
+    // silently drops a histogram that has observed >=1 sample — even when
+    // every observation landed in the first bucket (which makes sum_==0
+    // and causes ylt's serialize() to clear() its output string, taking the
+    // # HELP / # TYPE header with it). Reachable in production when
+    // sub-microsecond latencies truncate to 0 under int64_t observation.
+    //
+    // `boundaries` is the compile-time bucket boundary vector paired with
+    // the histogram in HistogramEntry. The caller (getPrometheusMetrics)
+    // emits the # HELP / # TYPE header so the format stays identical to ylt.
+    void serializeHistogramPrometheus(
+        ylt::metric::basic_dynamic_histogram<int64_t, 1>* hist,
+        const std::vector<double>& boundaries,
+        ylt::metric::basic_dynamic_counter<int64_t, 1>& sum,
+        std::string& out) const;
 #endif  // TENT_METRICS_ENABLED
 };
 
