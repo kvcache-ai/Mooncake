@@ -22,8 +22,9 @@ concurrency:
 #    that sorts AFTER the current release per PEP 440, e.g. "0.3.12.dev20260720".
 # 2. Build jobs pass the nightly version via `version-override` to _build-wheel.yaml
 #    so each wheel is stamped with the correct dev version for TestPyPI.
-# 3. publish-testpypi uploads all nightly-* artifacts to TestPyPI.
-# 4. nightly-gate aggregates ALL build + test results; notify-failure files an issue.
+# 3. Specialized platform and packaging checks run nightly instead of on every PR.
+# 4. publish-testpypi uploads all nightly-* artifacts to TestPyPI.
+# 5. nightly-gate aggregates ALL build + test results; notify-failure files an issue.
 # ──────────────────────────────────────────────────────────────────────────────
 
 env:
@@ -58,7 +59,6 @@ jobs:
       container: pytorch/manylinux2_28-builder:cuda12.8
       python-versions: '["3.10", "3.12"]'
       cuda: container
-      build-with-ep: '1'
       torch-cuda-arch-list: '8.0;9.0'
       ep-torch-versions: '2.11.0;2.12.0;2.12.1'
       build-nvlink-allocator: true
@@ -83,6 +83,22 @@ jobs:
       artifact-prefix: nightly-cuda128-arm64
       version-override: ${{ needs.version-stamp.outputs.nightly_version }}
 
+  build-cuda13-arm64:
+    needs: version-stamp
+    uses: ./.github/workflows/_build-wheel.yaml
+    with:
+      runner: ubuntu-22.04-arm
+      python-versions: '["3.10", "3.12"]'
+      cuda: sbsa-13.0
+      cmake-generator: Ninja
+      variant-flag: CU13_BUILD
+      torch-cuda-arch-list: '9.0'
+      cmake-args: >-
+        -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=OFF
+        -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
+      artifact-prefix: nightly-cuda13-arm64
+      version-override: ${{ needs.version-stamp.outputs.nightly_version }}
+
   build-cuda13-x86:
     needs: version-stamp
     uses: ./.github/workflows/_build-wheel.yaml
@@ -91,7 +107,6 @@ jobs:
       container: pytorch/manylinux2_28-builder:cuda13.0
       python-versions: '["3.10", "3.12"]'
       cuda: container
-      build-with-ep: '1'
       variant-flag: CU13_BUILD
       torch-cuda-arch-list: '8.0;9.0'
       ep-torch-versions: '2.11.0;2.12.0;2.12.1'
@@ -102,8 +117,64 @@ jobs:
       artifact-prefix: nightly-cuda13-x86
       version-override: ${{ needs.version-stamp.outputs.nightly_version }}
 
+  build-musa:
+    runs-on: ubuntu-22.04
+    container: registry.mthreads.com/mcconline/inference/pytorch:2.9.1.post1-py3.10-musa5.2.0-mp31-devel-ubuntu22.04-amd64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Mark repository as safe
+        run: git config --global --add safe.directory $GITHUB_WORKSPACE
+        shell: bash
+
+      - name: Configure project
+        run: |
+          apt update -y
+          apt install -y ninja-build
+          bash -x dependencies.sh -y
+          mkdir build
+          cd build
+          cmake -G Ninja .. -DUSE_MUSA=ON -DUSE_MNNVL=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DUSE_CXL=ON -DUSE_TCP=ON -DWITH_EP=ON -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DENABLE_DEBUG_SYMBOLS=OFF
+        shell: bash
+
+      - name: Build project
+        run: |
+          cd build
+          source ~/.bashrc
+          cmake --build . --parallel 1
+          cmake --install .
+        shell: bash
+
+  build-docker:
+    name: Build Docker Image
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Free up disk space
+        uses: ./.github/actions/free-disk-space
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        run: |
+          docker build -f docker/mooncake.Dockerfile \
+            --build-arg PYTHON_VERSION=3.10 \
+            --build-arg EP_TORCH_VERSIONS="2.13.0" \
+            --build-arg CLEAN_BUILD_ARTIFACTS=1 \
+            -t mooncake:from-source .
+
+  ascend-test:
+    uses: ./.github/workflows/ci_ascend.yml
+    secrets: inherit
+
   publish-testpypi:
-    needs: [version-stamp, build-cuda128-x86, build-cuda128-arm64, build-cuda13-x86]
+    needs: [version-stamp, build-cuda128-x86, build-cuda128-arm64, build-cuda13-x86, build-cuda13-arm64]
     if: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.skip_publish == 'true') }}
     runs-on: ubuntu-22.04
     environment: nightly
@@ -301,7 +372,7 @@ jobs:
 
   nightly-gate:
     if: always()
-    needs: [build-cuda128-x86, build-cuda128-arm64, build-cuda13-x86, publish-testpypi, nightly-test]
+    needs: [build-cuda128-x86, build-cuda128-arm64, build-cuda13-x86, build-cuda13-arm64, build-musa, build-docker, ascend-test, publish-testpypi, nightly-test]
     runs-on: ubuntu-22.04
     steps:
       - name: Check results
@@ -310,6 +381,10 @@ jobs:
           echo "Build CUDA 12.8 x86: ${{ needs.build-cuda128-x86.result }}"
           echo "Build CUDA 12.8 arm64: ${{ needs.build-cuda128-arm64.result }}"
           echo "Build CUDA 13 x86: ${{ needs.build-cuda13-x86.result }}"
+          echo "Build CUDA 13 arm64: ${{ needs.build-cuda13-arm64.result }}"
+          echo "Build MUSA: ${{ needs.build-musa.result }}"
+          echo "Build Docker image: ${{ needs.build-docker.result }}"
+          echo "Ascend test: ${{ needs.ascend-test.result }}"
           echo "Publish: ${{ needs.publish-testpypi.result }}"
           echo "Test: ${{ needs.nightly-test.result }}"
           # Fail if any build job did not succeed
@@ -323,6 +398,22 @@ jobs:
           fi
           if [ "${{ needs.build-cuda13-x86.result }}" != "success" ]; then
             echo "::error::Build CUDA 13 x86 failed!"
+            exit 1
+          fi
+          if [ "${{ needs.build-cuda13-arm64.result }}" != "success" ]; then
+            echo "::error::Build CUDA 13 arm64 failed!"
+            exit 1
+          fi
+          if [ "${{ needs.build-musa.result }}" != "success" ]; then
+            echo "::error::Build MUSA failed!"
+            exit 1
+          fi
+          if [ "${{ needs.build-docker.result }}" != "success" ]; then
+            echo "::error::Build Docker image failed!"
+            exit 1
+          fi
+          if [ "${{ needs.ascend-test.result }}" != "success" ]; then
+            echo "::error::Ascend test failed!"
             exit 1
           fi
           if [ "${{ needs.nightly-test.result }}" != "success" ]; then

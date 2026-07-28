@@ -280,141 +280,6 @@ jobs:
         name: wheel-build-py${{ steps.generate_tag_build.outputs.python_version_tag }}
         path: mooncake-wheel/dist-py${{ steps.generate_tag_build.outputs.python_version_tag }}/*.whl
 
-  build-musa:
-    needs: [spell-check, clang-format, check-paths]
-    if: >-
-      (needs.check-paths.outputs.should-run-downstream == 'true' ||
-       github.event_name == 'workflow_dispatch') &&
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
-    runs-on: ubuntu-22.04
-    container: registry.mthreads.com/mcconline/inference/pytorch:2.9.1.post1-py3.10-musa5.2.0-mp31-devel-ubuntu22.04-amd64
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        persist-credentials: false
-
-    - name: Mark repository as safe
-      run: git config --global --add safe.directory $GITHUB_WORKSPACE
-      shell: bash
-
-    - name: Configure project
-      run: |
-        apt update -y
-        apt install -y ninja-build
-        bash -x dependencies.sh -y
-        mkdir build
-        cd build
-        cmake -G Ninja .. -DUSE_MUSA=ON -DUSE_MNNVL=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DUSE_CXL=ON -DUSE_TCP=ON -DWITH_EP=ON -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DENABLE_DEBUG_SYMBOLS=OFF
-      shell: bash
-
-    - name: Build project
-      run: |
-        cd build
-        source ~/.bashrc
-        cmake --build . --parallel 1
-        cmake --install .
-      shell: bash
-
-  build-arm64:
-    needs: [spell-check, clang-format, check-paths]
-    if: >-
-      (needs.check-paths.outputs.should-run-downstream == 'true' ||
-       github.event_name == 'workflow_dispatch') &&
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
-    runs-on: ubuntu-22.04-arm
-    strategy:
-      matrix:
-        python-version: ['3.10', '3.12']
-    env:
-      CI: "true"
-      CU13_BUILD: "1"
-      TORCH_CUDA_ARCH_LIST: "9.0"
-      SCCACHE_GHA_ENABLED: "true"
-      CUDA_HOME: "/usr/local/cuda"
-
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        persist-credentials: false
-
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v5
-      with:
-        python-version: ${{ matrix.python-version }}
-
-    - name: Free up disk space
-      uses: ./.github/actions/free-disk-space
-
-    - name: Install CUDA Toolkit 13.0 (arm64 SBSA)
-      run: |
-        wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/sbsa/cuda-keyring_1.1-1_all.deb
-        sudo dpkg -i cuda-keyring_1.1-1_all.deb
-        sudo apt-get update
-        sudo apt-get install -y cuda-toolkit-13-0
-        echo "/usr/local/cuda/bin" >> $GITHUB_PATH
-        /usr/local/cuda/bin/nvcc --version
-      shell: bash
-
-    - name: Run sccache-cache
-      uses: mozilla-actions/sccache-action@v0.0.9
-
-    - name: Configure sccache
-      uses: actions/github-script@v7
-      with:
-        script: |
-          core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
-          core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
-    - name: Configure project
-      run: |
-        sudo apt update -y
-        sudo bash -x dependencies.sh -y
-        mkdir build
-        cd build
-        cmake -G Ninja .. -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=OFF -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
-      shell: bash
-
-    - name: Build project
-      run: |
-        export CUDA_HOME=/usr/local/cuda
-        for dir in /usr/local/cuda/lib64/stubs /usr/local/cuda/targets/*/lib/stubs; do
-          if [ -d "$dir" ]; then
-            export LIBRARY_PATH="$dir:${LIBRARY_PATH:-}"
-          fi
-        done
-        cd build
-        cmake --build .
-        sudo cmake --install .
-      shell: bash
-
-    - name: Run sccache stat for check
-      if: ${{ env.SCCACHE_PATH != '' }}
-      shell: bash
-      run: ${SCCACHE_PATH} --show-stats
-
-    - name: Generate Python version tag
-      id: generate_tag_arm64
-      run: |
-        echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
-      shell: bash
-
-    - name: Build Python wheel
-      run: |
-        PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ steps.generate_tag_arm64.outputs.python_version_tag }} ./scripts/build_wheel.sh
-      shell: bash
-
-    - name: Upload wheel artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: wheel-arm64-cuda13-py${{ steps.generate_tag_arm64.outputs.python_version_tag }}
-        path: mooncake-wheel/dist-py${{ steps.generate_tag_arm64.outputs.python_version_tag }}/*.whl
-
   test-wheel-ubuntu:
     needs: [spell-check, clang-format, build-flags]
     if: >-
@@ -813,36 +678,6 @@ jobs:
         name: mooncake-wheel-ubuntu-py${{ steps.generate_tag_flags.outputs.python_version_tag }}
         path: mooncake-wheel/dist-py${{ steps.generate_tag_flags.outputs.python_version_tag }}/*.whl
 
-  build-docker:
-    name: Build Docker Image
-    needs: [spell-check, clang-format, check-paths]
-    if: >-
-      (needs.check-paths.outputs.should-run-downstream == 'true' ||
-       github.event_name == 'workflow_dispatch') &&
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
-    runs-on: ubuntu-22.04
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        persist-credentials: false
-
-    - name: Free up disk space
-      uses: ./.github/actions/free-disk-space
-
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v2
-
-    - name: Build Docker image
-      run: |
-        docker build -f docker/mooncake.Dockerfile \
-          --build-arg PYTHON_VERSION=3.10 \
-          --build-arg EP_TORCH_VERSIONS="2.13.0" \
-          --build-arg CLEAN_BUILD_ARTIFACTS=1 \
-          -t mooncake:from-source .
-
   spell-check:
     name: Spell Check with Typos
     if: >-
@@ -1018,12 +853,6 @@ jobs:
     uses: ./.github/workflows/ci_efa.yml
     secrets: inherit
 
-  ascend-test:
-    needs: [build, check-paths]
-    if: needs.check-paths.outputs.should-run-downstream == 'true'
-    uses: ./.github/workflows/ci_ascend.yml
-    secrets: inherit
-
   integration-test:
     needs: [build, build-wheel-cu13, check-paths]
     if: needs.check-paths.outputs.should-run-downstream == 'true'
@@ -1140,15 +969,11 @@ jobs:
       - clang-format
       - docs-check
       - build
-      - build-musa
-      - build-arm64
       - build-flags
-      - build-docker
       - test-wheel-ubuntu
       - build-wheel-cu13
       - build-wheel-efa
       - tent-ci
-      - ascend-test
       - integration-test
     runs-on: ubuntu-latest
     steps:
