@@ -306,6 +306,47 @@ TEST(TransferMetadataPollingTest, PollingRefreshesCachedRemoteSegmentDesc) {
     FAIL() << "TE metadata refresh polling did not refresh cached descriptor";
 }
 
+TEST(TransferMetadataPublicationTest, OmitsBufferWithoutRkey) {
+    constexpr uint64_t kRemoteAddr = 0x1000;
+    constexpr uint64_t kLocalOnlyAddr = 0x2000;
+
+    TransferMetadata server(P2PHANDSHAKE);
+    TransferMetadata client(P2PHANDSHAKE);
+
+    int sockfd = -1;
+    const uint16_t port = findAvailableTcpPort(sockfd);
+    ASSERT_GT(port, 0);
+    const std::string remote_segment_name =
+        "127.0.0.1:" + std::to_string(port);
+
+    auto server_desc =
+        makeRdmaSegmentDesc(remote_segment_name, kRemoteAddr);
+    auto local_only_buffer = makeRdmaBufferDesc(kLocalOnlyAddr);
+    local_only_buffer.rkey.clear();
+    server_desc->buffers.push_back(local_only_buffer);
+    ASSERT_EQ(server.addLocalSegment(LOCAL_SEGMENT_ID, remote_segment_name,
+                                     std::move(server_desc)),
+              0);
+
+    TransferMetadata::RpcMetaDesc rpc_desc;
+    rpc_desc.ip_or_host_name = "127.0.0.1";
+    rpc_desc.rpc_port = port;
+    rpc_desc.sockfd = sockfd;
+    ASSERT_EQ(server.addRpcMetaEntry(remote_segment_name, rpc_desc), 0);
+
+    ASSERT_EQ(client.addLocalSegment(
+                  LOCAL_SEGMENT_ID, "127.0.0.1:0",
+                  makeRdmaSegmentDesc("127.0.0.1:0", 0x3000)),
+              0);
+
+    const auto segment_id = client.getSegmentID(remote_segment_name);
+    ASSERT_NE(segment_id, static_cast<TransferMetadata::SegmentID>(-1));
+    auto remote_desc = client.getSegmentDescByID(segment_id, true);
+    ASSERT_NE(remote_desc, nullptr);
+    ASSERT_EQ(remote_desc->buffers.size(), 1);
+    EXPECT_EQ(remote_desc->buffers[0].addr, kRemoteAddr);
+}
+
 TEST(HandshakeFrameTest, ValidFrameRoundTrips) {
     int fds[2];
     ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);

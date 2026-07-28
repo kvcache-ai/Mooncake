@@ -192,6 +192,30 @@ TEST_F(RdmaContextConstructionTest,
 #endif
 }
 
+TEST(RdmaMemoryRegistrationPolicyTest, LocalOnlyBufferHasNoPublishedRkey) {
+    auto metadata = std::make_shared<TransferMetadata>(P2PHANDSHAKE);
+    auto local_desc = std::make_shared<TransferMetadata::SegmentDesc>();
+    local_desc->name = "local-rdma-segment";
+    local_desc->protocol = "rdma";
+    ASSERT_EQ(metadata->addLocalSegment(LOCAL_SEGMENT_ID,
+                                        "local-rdma-segment",
+                                        std::move(local_desc)),
+              0);
+
+    RdmaTransport transport;
+    RdmaTransportTestPeer::bindMetadata(transport, metadata,
+                                        "local-rdma-segment");
+    std::array<char, 1> buffer{};
+    ASSERT_EQ(transport.registerLocalMemory(buffer.data(), buffer.size(),
+                                            "cpu:0", false, false),
+              0);
+
+    auto desc = metadata->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(desc, nullptr);
+    ASSERT_EQ(desc->buffers.size(), 1);
+    EXPECT_TRUE(desc->buffers[0].rkey.empty());
+}
+
 ibv_gid makeGid(const std::array<uint8_t, 16> &bytes) {
     ibv_gid gid = {};
     std::memcpy(gid.raw, bytes.data(), bytes.size());
