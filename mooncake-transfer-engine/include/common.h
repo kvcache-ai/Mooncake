@@ -36,6 +36,7 @@
 #include <sstream>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 #include "error.h"
 
@@ -61,6 +62,7 @@ enum class HandShakeRequestType {
     Metadata = 1,
     Notify = 2,
     Probe = 3,
+    Invalid = 0xfe,
     // placeholder for old protocol without RequestType
     OldProtocol = 0xff,
 };
@@ -366,9 +368,13 @@ static inline ssize_t readFully(int fd, void *buf, size_t len) {
     size_t nbytes = len;
     while (nbytes && std::chrono::steady_clock::now() < deadline) {
         ssize_t rc = read(fd, pos, nbytes);
-        if (rc < 0 && (errno == EAGAIN || errno == EINTR))
+        if (rc < 0 && errno == EINTR)
             continue;
-        else if (rc < 0) {
+        else if (rc < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+            LOG(WARNING) << "Socket read timed out: expected " << len
+                         << " bytes, actual " << len - nbytes << " bytes";
+            return len - nbytes;
+        } else if (rc < 0) {
             PLOG(ERROR) << "Socket read failed";
             return rc;
         } else if (rc == 0) {
@@ -443,13 +449,13 @@ static inline size_t getHandshakeMaxLength() {
 }
 
 static inline std::pair<HandShakeRequestType, std::string> readString(int fd) {
-    HandShakeRequestType type = HandShakeRequestType::Connection;
+    HandShakeRequestType type = HandShakeRequestType::Invalid;
 
     const size_t kMaxLength = getHandshakeMaxLength();
     uint64_t length = 0;
     ssize_t n = readFully(fd, &length, sizeof(length));
     if (n != (ssize_t)sizeof(length)) {
-        LOG(ERROR) << "readString: failed to read length, got: " << n;
+        LOG(WARNING) << "readString: incomplete handshake length, got: " << n;
         return {type, ""};
     }
 

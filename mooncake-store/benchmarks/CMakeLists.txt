@@ -45,3 +45,10 @@ add_executable(batch_evict_bench batch_evict_bench.cpp)
 target_link_libraries(
   batch_evict_bench PRIVATE mooncake_store cachelib_memory_allocator
                             gflags::gflags glog::glog pthread)
+
+if(STORE_USE_ETCD)
+  add_executable(oplog_batch_bench oplog_batch_bench.cpp)
+  target_link_libraries(
+    oplog_batch_bench PRIVATE mooncake_store glog::glog gflags::gflags
+                              JsonCpp::JsonCpp)
+endif()

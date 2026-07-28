@@ -25,6 +25,7 @@
 
 #include "common.h"
 #include "error.h"
+#include "rdma_test_peers.h"
 #include "transfer_metadata.h"
 #include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_transport/rdma_transport.h"
@@ -141,42 +142,6 @@ int ibv_close_device(ibv_context *) { return 0; }
 
 }  // extern "C"
 #endif  // __linux__
-
-namespace mooncake {
-
-class RdmaTransportTestPeer {
-   public:
-    static void bindMetadata(RdmaTransport &transport,
-                             std::shared_ptr<TransferMetadata> metadata,
-                             std::string local_server_name) {
-        transport.metadata_ = std::move(metadata);
-        transport.local_server_name_ = std::move(local_server_name);
-    }
-};
-
-class RdmaContextTestPeer {
-   public:
-    static bool hasEndpointStore(const RdmaContext &context) {
-        return context.endpoint_store_ != nullptr;
-    }
-
-    static void seedAutoGidState(RdmaContext &context, ibv_context *verbs_ctx,
-                                 uint8_t port, uint16_t lid, const ibv_gid &gid,
-                                 int gid_index) {
-        context.context_ = verbs_ctx;
-        context.port_ = port;
-        context.lid_ = lid;
-        context.gid_ = gid;
-        context.gid_index_ = gid_index;
-        context.auto_gid_selection_enabled_ = true;
-    }
-
-    static void disableContextForTeardown(RdmaContext &context) {
-        context.context_ = nullptr;
-    }
-};
-
-}  // namespace mooncake
 
 namespace {
 

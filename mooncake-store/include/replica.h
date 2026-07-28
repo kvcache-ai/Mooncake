@@ -376,6 +376,14 @@ class Replica {
         return false;  // DiskReplicaData does not have handles
     }
 
+    bool replace_memory_buffer(std::unique_ptr<AllocatedBuffer> buffer) {
+        if (!buffer || !is_memory_replica()) {
+            return false;
+        }
+        std::get<MemoryReplicaData>(data_).buffer = std::move(buffer);
+        return true;
+    }
+
     [[nodiscard]] bool has_invalid_nof_handle() const {
         if (is_nof_replica()) {
             const auto& nof_data = std::get<NoFReplicaData>(data_);
@@ -442,6 +450,17 @@ class Replica {
             status_ = ReplicaStatus::PROCESSING;
         } else {
             LOG(ERROR) << "Cannot mark_processing from status: " << status_;
+        }
+    }
+
+    void mark_removed() {
+        if (status_ == ReplicaStatus::COMPLETE ||
+            status_ == ReplicaStatus::PROCESSING) {
+            status_ = ReplicaStatus::REMOVED;
+        } else if (status_ == ReplicaStatus::REMOVED) {
+            LOG(WARNING) << "Replica already marked as removed";
+        } else {
+            LOG(ERROR) << "Cannot mark_removed from status: " << status_;
         }
     }
 
