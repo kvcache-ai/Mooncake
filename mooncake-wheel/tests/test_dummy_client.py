@@ -485,6 +485,78 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
             for cleanup_key in cleanup_keys:
                 self.store.remove(cleanup_key)
 
+    def test_00_mixed_put_and_put_tensor_concurrency(self):
+        """Regression test for regular put and tensor put sharing dummy SHM."""
+        if torch is None:
+            self.skipTest("PyTorch is not available")
+
+        prefix = f"test_dummy_mixed_put_tensor_{os.getpid()}"
+        iterations = 16
+        regular_keys = [f"{prefix}_regular_{i}" for i in range(iterations)]
+        tensor_keys = [f"{prefix}_tensor_{i}" for i in range(iterations)]
+        regular_values = [
+            (f"regular-payload-{i}-".encode() * 4096)
+            for i in range(iterations)
+        ]
+        tensors = [
+            (torch.arange(4096, dtype=torch.float32) + i).reshape(64, 64)
+            for i in range(iterations)
+        ]
+
+        start = threading.Event()
+        errors = []
+        errors_lock = threading.Lock()
+
+        def record_error(message):
+            with errors_lock:
+                errors.append(message)
+
+        def put_regular_values():
+            try:
+                start.wait()
+                for key, value in zip(regular_keys, regular_values):
+                    ret = self.store.put(key, value)
+                    if ret != 0:
+                        record_error(f"put({key}) failed with {ret}")
+            except Exception as exc:
+                record_error(f"put thread raised {exc!r}")
+
+        def put_tensors():
+            try:
+                start.wait()
+                for key, tensor in zip(tensor_keys, tensors):
+                    ret = self.store.put_tensor(key, tensor)
+                    if ret != 0:
+                        record_error(f"put_tensor({key}) failed with {ret}")
+            except Exception as exc:
+                record_error(f"put_tensor thread raised {exc!r}")
+
+        threads = [
+            threading.Thread(target=put_regular_values),
+            threading.Thread(target=put_tensors),
+        ]
+        try:
+            for thread in threads:
+                thread.start()
+            start.set()
+            for thread in threads:
+                thread.join()
+
+            self.assertEqual(errors, [])
+
+            for key, expected in zip(regular_keys, regular_values):
+                self.assertEqual(self.store.get(key), expected)
+            for key, expected in zip(tensor_keys, tensors):
+                actual = self.store.get_tensor(key)
+                self.assertIsNotNone(actual)
+                self.assertTrue(torch.equal(actual, expected))
+        finally:
+            for thread in threads:
+                if thread.is_alive():
+                    thread.join()
+            for key in [*regular_keys, *tensor_keys]:
+                self.store.remove(key, force=True)
+
     # Mark this test as zzz_ so that it is the last test to run
     def zzz_test_dict_fuzz_e2e(self):
          """End-to-end fuzz test comparing distributed store behavior with dict.
