@@ -214,7 +214,8 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
     segment_manager_->client_by_name_[segment.name] = client_id;
     segment_manager_->segment_id_by_name_[segment.name] = segment.id;
     AddHostSegment(segment_manager_->segments_by_host_, segment);
-    MasterMetricManager::instance().inc_total_mem_capacity(segment.name, size);
+    segment_manager_->AccountSegmentCapacityMetricLocked(
+        segment_manager_->mounted_segments_.at(segment.id));
 
     return ErrorCode::OK;
 }
@@ -298,6 +299,16 @@ bool ScopedSegmentAccess::GetSegment(const UUID& segment_id,
     }
     segment = mounted->second.segment;
     return true;
+}
+
+ErrorCode ScopedSegmentAccess::AccountSegmentCapacityMetric(
+    const UUID& segment_id) {
+    auto mounted = segment_manager_->mounted_segments_.find(segment_id);
+    if (mounted == segment_manager_->mounted_segments_.end()) {
+        return ErrorCode::SEGMENT_NOT_FOUND;
+    }
+    segment_manager_->AccountSegmentCapacityMetricLocked(mounted->second);
+    return ErrorCode::OK;
 }
 
 bool ScopedSegmentAccess::ReplaceAllocators(
@@ -440,7 +451,6 @@ ErrorCode ScopedSegmentAccess::CommitUnmountSegment(
 
     // segment_id -> segment_name
     std::string segment_name;
-    bool is_cxl = false;
     auto&& segment = segment_manager_->mounted_segments_.find(segment_id);
     if (segment != segment_manager_->mounted_segments_.end()) {
         segment_name = segment->second.segment.name;
@@ -454,16 +464,17 @@ ErrorCode ScopedSegmentAccess::CommitUnmountSegment(
             segment_manager_->segment_id_by_name_.erase(segment_id_by_name_it);
             segment_manager_->client_by_name_.erase(segment_name);
         }
-        is_cxl = (segment->second.segment.protocol == "cxl");
+        if (segment->second.capacity_metric_accounted &&
+            segment->second.segment.size != metrics_dec_capacity) {
+            LOG(WARNING) << "segment_id=" << segment_id
+                         << ", warn=capacity_metric_size_mismatch"
+                         << ", accounted_size=" << segment->second.segment.size
+                         << ", prepared_size=" << metrics_dec_capacity;
+        }
+        segment_manager_->ReleaseSegmentCapacityMetricLocked(segment->second);
     }
     // Remove from mounted_segments_
     segment_manager_->mounted_segments_.erase(segment_id);
-
-    // Decrease the total capacity
-    if (!is_cxl) {
-        MasterMetricManager::instance().dec_total_mem_capacity(
-            segment_name, metrics_dec_capacity);
-    }
 
     return ErrorCode::OK;
 }
@@ -822,6 +833,10 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
             ErrorCode::DESERIALIZE_FAIL,
             "deserialize SegmentManager segment_manager is null"));
     }
+
+    // Clear any live metric ownership before replacing the in-memory state.
+    // Deserialized entries themselves do not own metric contributions.
+    segment_manager_->ReleaseMountedCapacityMetricContributions();
 
     // Clear existing data
     segment_manager_->mounted_segments_.clear();
@@ -1183,6 +1198,7 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
 }
 
 void SegmentSerializer::Reset() {
+    segment_manager_->ReleaseMountedCapacityMetricContributions();
     segment_manager_->mounted_segments_.clear();
     segment_manager_->client_segments_.clear();
     segment_manager_->client_by_name_.clear();
@@ -1557,21 +1573,50 @@ void NoFSegmentManager::GetMountedSegmentsSnapshot(
     }
 }
 
-SegmentManager::~SegmentManager() {
-    // Segments that are still mounted here never went through
-    // CommitUnmountSegment, so their contribution to the capacity metrics
-    // has not been released. MasterMetricManager outlives MasterService
-    // instances (a new one is constructed per HA leadership term), so
-    // release it here to keep the gauges consistent with the segments
-    // that are actually mounted.
-    for (const auto& [segment_id, mounted_segment] : mounted_segments_) {
-        const auto& segment = mounted_segment.segment;
-        if (segment.protocol == "cxl") {
-            // CXL mounts do not contribute to total_mem_capacity.
-            continue;
-        }
-        MasterMetricManager::instance().dec_total_mem_capacity(segment.name,
-                                                               segment.size);
+SegmentManager::~SegmentManager() { ReleaseMetricContributions(); }
+
+void SegmentManager::AccountSegmentCapacityMetricLocked(
+    MountedSegment& mounted_segment) {
+    if (mounted_segment.capacity_metric_accounted ||
+        (enable_cxl_ && mounted_segment.segment.protocol == "cxl")) {
+        return;
+    }
+    MasterMetricManager::instance().inc_total_mem_capacity(
+        mounted_segment.segment.name,
+        static_cast<int64_t>(mounted_segment.segment.size));
+    mounted_segment.capacity_metric_accounted = true;
+}
+
+void SegmentManager::ReleaseSegmentCapacityMetricLocked(
+    MountedSegment& mounted_segment) {
+    if (!mounted_segment.capacity_metric_accounted) {
+        return;
+    }
+    MasterMetricManager::instance().dec_total_mem_capacity(
+        mounted_segment.segment.name,
+        static_cast<int64_t>(mounted_segment.segment.size));
+    mounted_segment.capacity_metric_accounted = false;
+}
+
+void SegmentManager::ReleaseMountedCapacityMetricContributionsLocked() {
+    for (auto& entry : mounted_segments_) {
+        ReleaseSegmentCapacityMetricLocked(entry.second);
+    }
+}
+
+void SegmentManager::ReleaseMountedCapacityMetricContributions() {
+    std::unique_lock<std::shared_mutex> lock(segment_mutex_);
+    ReleaseMountedCapacityMetricContributionsLocked();
+}
+
+void SegmentManager::ReleaseMetricContributions() {
+    std::unique_lock<std::shared_mutex> lock(segment_mutex_);
+    ReleaseMountedCapacityMetricContributionsLocked();
+    if (cxl_capacity_metric_contribution_) {
+        MasterMetricManager::instance().dec_total_mem_capacity(
+            cxl_capacity_metric_contribution_->segment_name,
+            cxl_capacity_metric_contribution_->bytes);
+        cxl_capacity_metric_contribution_.reset();
     }
 }
 
@@ -1586,7 +1631,10 @@ void SegmentManager::initializeCxlAllocator(const std::string& cxl_path,
 
     cxl_global_allocator_ = std::make_shared<CachelibBufferAllocator>(
         cxl_path, DEFAULT_CXL_BASE, cxl_size, cxl_path);
-    MasterMetricManager::instance().inc_total_mem_capacity(cxl_path, cxl_size);
+    MasterMetricManager::instance().inc_total_mem_capacity(
+        cxl_path, static_cast<int64_t>(cxl_size));
+    cxl_capacity_metric_contribution_ =
+        CapacityMetricContribution{cxl_path, static_cast<int64_t>(cxl_size)};
 }
 
 int64_t ScopedLocalDiskSegmentAccess::getSsdTotalCapacity(

@@ -300,6 +300,93 @@ TEST_F(MasterMetricsTest, ServiceTeardownReleasesSegmentCapacity) {
     ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name), 0);
 }
 
+TEST_F(MasterMetricsTest, SegmentManagerDestructorReleasesOwnedCapacity) {
+    auto& metrics = MasterMetricManager::instance();
+    const int64_t capacity_before = metrics.get_total_mem_capacity();
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "segment_manager_destructor_test_segment";
+    segment.base = 0x310000000;
+    segment.size = 1024 * 1024 * 16;
+
+    {
+        SegmentManager manager(BufferAllocatorType::OFFSET);
+        auto access = manager.getSegmentAccess();
+        ASSERT_EQ(access.MountSegment(segment, generate_uuid()), ErrorCode::OK);
+        ASSERT_EQ(metrics.get_total_mem_capacity(),
+                  capacity_before + static_cast<int64_t>(segment.size));
+    }
+
+    ASSERT_EQ(metrics.get_total_mem_capacity(), capacity_before);
+    ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name), 0);
+}
+
+TEST_F(MasterMetricsTest, CxlProtocolUsesRegularAccountingWhenCxlIsDisabled) {
+    auto& metrics = MasterMetricManager::instance();
+    const int64_t capacity_before = metrics.get_total_mem_capacity();
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "disabled_cxl_accounting_test_segment";
+    segment.base = 0x320000000;
+    segment.size = 1024 * 1024 * 16;
+    segment.protocol = "cxl";
+
+    {
+        SegmentManager manager(BufferAllocatorType::OFFSET, false);
+        auto access = manager.getSegmentAccess();
+        ASSERT_EQ(access.MountSegment(segment, generate_uuid()), ErrorCode::OK);
+        ASSERT_EQ(metrics.get_total_mem_capacity(),
+                  capacity_before + static_cast<int64_t>(segment.size));
+        ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name),
+                  static_cast<int64_t>(segment.size));
+    }
+
+    ASSERT_EQ(metrics.get_total_mem_capacity(), capacity_before);
+    ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name), 0);
+}
+
+TEST_F(MasterMetricsTest,
+       SnapshotDeserializationDoesNotOwnSegmentCapacityMetrics) {
+    auto& metrics = MasterMetricManager::instance();
+    const int64_t capacity_before = metrics.get_total_mem_capacity();
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "snapshot_metric_ownership_test_segment";
+    segment.base = 0x310000000;
+    segment.size = 1024 * 1024 * 16;
+    const UUID client_id = generate_uuid();
+
+    std::vector<uint8_t> serialized;
+    {
+        SegmentManager source(BufferAllocatorType::OFFSET);
+        {
+            auto access = source.getSegmentAccess();
+            ASSERT_EQ(access.MountSegment(segment, client_id), ErrorCode::OK);
+        }
+        SegmentSerializer serializer(&source);
+        auto result = serializer.Serialize();
+        ASSERT_TRUE(result.has_value()) << result.error().message;
+        serialized = std::move(result.value());
+    }
+    ASSERT_EQ(metrics.get_total_mem_capacity(), capacity_before);
+    ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name), 0);
+
+    {
+        SegmentManager restored(BufferAllocatorType::OFFSET);
+        SegmentSerializer serializer(&restored);
+        auto result = serializer.Deserialize(serialized);
+        ASSERT_TRUE(result.has_value()) << result.error().message;
+
+        // Destroying a deserialized container is a no-op for capacity metrics
+        // because deserialization did not register any contributions.
+    }
+    ASSERT_EQ(metrics.get_total_mem_capacity(), capacity_before);
+    ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name), 0);
+}
+
 TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
     const uint64_t default_kv_lease_ttl = 100;
     auto& metrics = MasterMetricManager::instance();

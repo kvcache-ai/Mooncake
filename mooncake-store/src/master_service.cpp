@@ -7637,8 +7637,14 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
             for (const auto& [segment, client_id] : all_segments) {
                 Ping(client_id);
                 total_size += static_cast<int64_t>(segment.size);
-                MasterMetricManager::instance().inc_total_mem_capacity(
-                    segment.name, segment.size);
+                auto account_err =
+                    segment_access.AccountSegmentCapacityMetric(segment.id);
+                if (account_err != ErrorCode::OK) {
+                    LOG(ERROR)
+                        << "[Restore] Failed to account segment capacity, "
+                        << "segment_name=" << segment.name
+                        << ", error=" << account_err;
+                }
             }
             LOG(INFO) << "[Restore] Total capacity size after restore: "
                       << total_size;

@@ -3,6 +3,7 @@
 #include <boost/functional/hash.hpp>
 #include <chrono>
 #include <map>
+#include <optional>
 #include <ostream>
 #include <set>
 #include <shared_mutex>
@@ -55,6 +56,10 @@ struct MountedSegment {
     Segment segment;
     SegmentStatus status;
     std::shared_ptr<BufferAllocatorBase> buf_allocator;
+    // Runtime-only ownership marker. Snapshot deserialization reconstructs
+    // segment state without registering capacity metrics, so this field is
+    // deliberately not serialized.
+    bool capacity_metric_accounted{false};
 };
 
 struct MountedNoFSegment {
@@ -152,6 +157,11 @@ class ScopedSegmentAccess {
                                      const UUID& client_id) const;
 
     bool GetSegment(const UUID& segment_id, Segment& segment) const;
+
+    /**
+     * @brief Register the capacity metric for an already-restored segment.
+     */
+    ErrorCode AccountSegmentCapacityMetric(const UUID& segment_id);
 
     struct AllocatorReplacement {
         UUID segment_id;
@@ -452,10 +462,10 @@ class SegmentManager {
         : memory_allocator_(memory_allocator), enable_cxl_(enable_cxl) {}
 
     /**
-     * @brief Destructor. Releases the capacity metric contribution of
-     *        segments that are still mounted, since MasterMetricManager
-     *        outlives MasterService instances (e.g. across HA leadership
-     *        changes).
+     * @brief Releases any capacity metric contributions still owned by this
+     *        manager. MasterService stops and joins its threads in its
+     *        destructor body before member destruction reaches this manager.
+     *        This also covers partial construction and standalone use.
      */
     ~SegmentManager();
 
@@ -500,6 +510,11 @@ class SegmentManager {
     // Used for unified allocation and recycling of CXL shared memory.
     const bool enable_cxl_;
     std::shared_ptr<BufferAllocatorBase> cxl_global_allocator_;
+    struct CapacityMetricContribution {
+        std::string segment_name;
+        int64_t bytes;
+    };
+    std::optional<CapacityMetricContribution> cxl_capacity_metric_contribution_;
     // allocator_manager_ only contains allocators whose segment status is OK.
     AllocatorManager allocator_manager_;
     std::unordered_map<UUID, MountedSegment, boost::hash<UUID>>
@@ -515,6 +530,12 @@ class SegmentManager {
     std::unordered_map<UUID, std::shared_ptr<LocalDiskSegment>,
                        boost::hash<UUID>>
         client_local_disk_segment_;  // client_id -> local_disk_segment
+
+    void AccountSegmentCapacityMetricLocked(MountedSegment& mounted_segment);
+    void ReleaseSegmentCapacityMetricLocked(MountedSegment& mounted_segment);
+    void ReleaseMountedCapacityMetricContributions();
+    void ReleaseMountedCapacityMetricContributionsLocked();
+    void ReleaseMetricContributions();
 
     friend class ScopedSegmentAccess;
     friend class SegmentTest;        // for unit tests
