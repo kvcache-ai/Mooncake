@@ -545,9 +545,8 @@ mooncake_master \
 
 Register an address reachable by the indexer, rather than the wildcard bind
 address, through the indexer's `POST /register` endpoint. For the event format,
-registration fields, and object-key behavior, see the
-[Mooncake Store master publisher](../api-reference/http/conductor-indexer.md#mooncake-store-master-publisher)
-reference.
+registration fields, and object-key behavior, see the {ref}`Mooncake Store
+master publisher <mooncake-store-master-publisher>` reference.
 
 | Flag | Default | Description |
 |------|---------|-------------|
