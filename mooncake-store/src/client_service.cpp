@@ -928,6 +928,7 @@ std::optional<std::shared_ptr<Client>> Client::Create(
                 }
             } else {
                 LOG(ERROR) << "Invalid fsdir format: " << dir_string;
+                return std::nullopt;
             }
         }
     } else {
@@ -959,6 +960,7 @@ std::optional<std::shared_ptr<Client>> Client::Create(
                 }
             } else {
                 LOG(ERROR) << "Invalid fsdir format: " << config.fsdir;
+                return std::nullopt;
             }
         }
     }
