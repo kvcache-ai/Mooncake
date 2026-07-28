@@ -218,6 +218,52 @@ TEST(ShmTransportTest, CxlConsumerDoesNotCreateMissingFile) {
     EXPECT_EQ(rmdir(cxl_dir.c_str()), 0);
 }
 
+// Stale/truncated backing files must be rejected before mmap; otherwise
+// access past EOF can SIGBUS even without O_CREAT.
+TEST(ShmTransportTest, RejectsBackingFileShorterThanBuffer) {
+    const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+    constexpr uint64_t kRemoteAddress = 0x21000000;
+
+    char tmpl[] = "/tmp/mooncake_shm_cxl_short_XXXXXX";
+    ASSERT_NE(mkdtemp(tmpl), nullptr);
+    const std::string cxl_dir(tmpl);
+    const std::string shm_name =
+        "mooncake_cxl_short_" + std::to_string(getpid());
+    const std::string full_path = cxl_dir + "/" + shm_name;
+
+    // Create a truncated backing file (half a page) while metadata claims
+    // a full page.
+    int fd = open(full_path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0600);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(ftruncate(fd, page_size / 2), 0);
+    close(fd);
+
+    auto metadata = std::make_shared<ControlService>("p2p", "", nullptr);
+    ASSERT_TRUE(installLocalSegmentWithShm(*metadata, shm_name, kRemoteAddress,
+                                           page_size)
+                    .ok());
+
+    auto conf = std::make_shared<Config>();
+    conf->set("transports/shm/cxl_mount_path", cxl_dir);
+
+    ShmTransport transport;
+    std::string local_segment_name = "shm_test_segment";
+    ASSERT_TRUE(
+        transport.install(local_segment_name, metadata, nullptr, conf).ok());
+
+    uint64_t address = kRemoteAddress;
+    auto status = ShmTransportTestPeer::relocate(transport, address, page_size,
+                                                 LOCAL_SEGMENT_ID);
+    EXPECT_FALSE(status.ok());
+    EXPECT_TRUE(status.IsInternalError());
+    EXPECT_EQ(ShmTransportTestPeer::mappingCount(transport, LOCAL_SEGMENT_ID),
+              0u);
+
+    ASSERT_TRUE(transport.uninstall().ok());
+    EXPECT_EQ(unlink(full_path.c_str()), 0);
+    EXPECT_EQ(rmdir(cxl_dir.c_str()), 0);
+}
+
 // B2: creating with an existing name must not truncate the live object.
 TEST(ShmTransportTest, CreateSharedMemoryDoesNotTruncateExisting) {
     const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));

@@ -19,6 +19,7 @@
 #include <fcntl.h>
 #include <glog/logging.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <algorithm>
@@ -350,6 +351,23 @@ Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
             if (shm_fd < 0) {
                 return Status::InternalError(
                     std::string("Failed to open shared memory file ") +
+                    buffer->shm_path + LOC_MARK);
+            }
+            // mmap can succeed even when the backing object is shorter than
+            // buffer->length; accessing past EOF then SIGBUS. Reject early.
+            struct stat st;
+            if (fstat(shm_fd, &st) != 0) {
+                close(shm_fd);
+                return Status::InternalError(
+                    std::string("Failed to fstat shared memory file ") +
+                    buffer->shm_path + LOC_MARK);
+            }
+            if (st.st_size < 0 ||
+                static_cast<uint64_t>(st.st_size) < buffer->length) {
+                close(shm_fd);
+                return Status::InternalError(
+                    std::string("Shared memory file shorter than registered "
+                                "buffer length: ") +
                     buffer->shm_path + LOC_MARK);
             }
             shm_addr = mmap(nullptr, buffer->length, PROT_READ | PROT_WRITE,
