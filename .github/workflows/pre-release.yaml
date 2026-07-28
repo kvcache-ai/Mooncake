@@ -41,6 +41,20 @@ jobs:
         -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
       artifact-prefix: mooncake-wheel-non-cuda-pre-release
 
+  build-non-cuda-arm64:
+    uses: ./.github/workflows/_build-wheel.yaml
+    with:
+      runner: ubuntu-22.04-arm
+      container: pytorch/manylinuxaarch64-builder:cuda12.8
+      cuda: container
+      cmake-generator: Ninja
+      variant-flag: NON_CUDA_BUILD
+      cmake-args: >-
+        -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=OFF -DWITH_EP=OFF
+        -DSTORE_USE_ETCD=ON -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON
+        -DCMAKE_BUILD_TYPE=Release
+      artifact-prefix: mooncake-wheel-non-cuda-arm64-pre-release
+
   build-cuda13:
     uses: ./.github/workflows/_build-wheel.yaml
     with:
@@ -85,7 +99,13 @@ jobs:
 
   validate-release:
     name: Validate release artifacts
-    needs: [build-cuda, build-non-cuda, build-cuda13, build-cuda-arm64, build-cuda13-arm64]
+    needs:
+      - build-cuda
+      - build-non-cuda
+      - build-non-cuda-arm64
+      - build-cuda13
+      - build-cuda-arm64
+      - build-cuda13-arm64
     runs-on: ubuntu-22.04
     permissions:
       contents: read
@@ -108,8 +128,8 @@ jobs:
           ls -la mooncake-wheel/dist-release/
           wheel_count=$(find mooncake-wheel/dist-release -name "*.whl" | wc -l)
           echo "wheel_count=${wheel_count}" >> "$GITHUB_ENV"
-          if [ "${wheel_count}" -lt 20 ]; then
-            echo "Expected at least 20 wheels (x86: 4 Python versions x 3 variants; arm64: 4 Python versions x 2 CUDA variants), found ${wheel_count}"
+          if [ "${wheel_count}" -lt 24 ]; then
+            echo "Expected at least 24 wheels (4 Python versions x 3 variants x 2 architectures), found ${wheel_count}"
             exit 1
           fi
 

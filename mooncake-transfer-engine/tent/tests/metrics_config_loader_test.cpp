@@ -188,6 +188,43 @@ TEST(MetricsConfigLoaderTest, LoadWithDefaultsEnvOverridesDefault) {
     EXPECT_EQ(config.http_port, 5555);
 }
 
+// Regression guard: the `metrics/latency_buckets` and `metrics/size_buckets`
+// keys were removed from the default config (bucket boundaries are now
+// compile-time constants in tent_metrics.h). The loader silently ignores
+// unknown keys, so a config still carrying these stale keys must (a) not
+// break loading and (b) still honor the real keys present alongside them.
+// If a future change re-introduces a buckets field on MetricsConfig, this
+// test should be extended with an explicit assertion on the loaded value.
+TEST(MetricsConfigLoaderTest, StaleBucketKeysAreSilentlyIgnored) {
+    Config file_config;
+    // Mirror the real transfer-engine.json structure: nested "metrics" object
+    // carrying both real keys and the removed stale bucket keys.
+    std::string json_content = R"({
+        "metrics": {
+            "enabled": true,
+            "http_port": 7777,
+            "http_host": "0.0.0.0",
+            "http_server_threads": 2,
+            "report_interval_seconds": 15,
+            "latency_buckets": [0.001, 0.002, 0.005],
+            "size_buckets": [1024, 4096, 16384]
+        }
+    })";
+    ASSERT_TRUE(file_config.load(json_content).ok());
+
+    auto mc = MetricsConfigLoader::loadWithDefaults(&file_config);
+
+    // Real keys must be honored despite the stale keys present above.
+    EXPECT_TRUE(mc.enabled);
+    EXPECT_EQ(mc.http_port, 7777);
+    EXPECT_EQ(mc.http_host, "0.0.0.0");
+    EXPECT_EQ(mc.http_server_threads, 2);
+    EXPECT_EQ(mc.report_interval_seconds, 15);
+    // The stale `latency_buckets` / `size_buckets` keys are silently
+    // ignored: MetricsConfig has no corresponding fields (see
+    // config_loader.h), so there is nothing to assert about their values.
+}
+
 //------------------------------------------------------------------------------
 // MetricsConfigLoader::validateConfig Tests
 //------------------------------------------------------------------------------

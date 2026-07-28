@@ -710,6 +710,125 @@ TEST_F(MetricsHttpTest, JsonEndpointValid) {
     EXPECT_TRUE(json.contains("tent_read_latency_us"));
 }
 
+// Regression guard for the silent-drop bug: ylt's
+// basic_dynamic_histogram::serialize() clears its output string (taking the
+// # HELP / # TYPE header with it) when every observed value truncates to 0
+// under int64_t. Sub-microsecond queue_wait latencies trigger this in
+// production — JSON reports a non-zero count but /metrics omits the metric
+// entirely. The custom serializer in getPrometheusMetrics() walks bucket
+// counts directly so the metric always appears when count > 0.
+TEST_F(MetricsHttpTest, PrometheusExposesHistogramWhenAllSamplesAreZero) {
+    // Reproduce the bug condition: observe 3 sub-microsecond latencies.
+    // recordStageLatency casts to int64_t (val=0), so sum_ stays 0 — exactly
+    // the case ylt's serialize() drops.
+    auto& m = TentMetrics::instance();
+    m.recordStageLatency(TentMetrics::Stage::QueueWait, UNSPEC, 0.3);
+    m.recordStageLatency(TentMetrics::Stage::QueueWait, UNSPEC, 0.5);
+    m.recordStageLatency(TentMetrics::Stage::QueueWait, UNSPEC, 0.9);
+
+    auto resp = retryGet("/metrics");
+    EXPECT_EQ(resp.http_status, 200);
+    // The bug: this substring was MISSING from Prometheus output even though
+    // JSON reported count=3. Must appear now.
+    EXPECT_NE(resp.body.find("tent_stage_queue_wait_us_bucket"),
+              std::string::npos)
+        << "stage_queue_wait_us silently dropped by ylt serialize() when all "
+           "samples truncate to 0 under int64_t";
+    // The +Inf bucket must carry the cumulative count of 3.
+    EXPECT_NE(
+        resp.body.find("tent_stage_queue_wait_us_bucket{transport=\"unspec\","
+                       "le=\"+Inf\"} 3"),
+        std::string::npos)
+        << "+Inf bucket must be cumulative (== total count)";
+    // _count line must be present with value 3.
+    EXPECT_NE(resp.body.find("tent_stage_queue_wait_us_count{transport=\""
+                             "unspec\"} 3"),
+              std::string::npos)
+        << "_count must match total observations";
+}
+
+// Same bug condition as above but with transport=TCP — this is what tebench
+// produces and what surfaced the original silent-drop bug in production.
+// Guard against a regression that only affects a subset of transports.
+TEST_F(MetricsHttpTest, PrometheusExposesZeroValuedHistogramForTcpTransport) {
+    auto& m = TentMetrics::instance();
+    m.recordStageLatency(TentMetrics::Stage::QueueWait, TCP, 0.3);
+    m.recordStageLatency(TentMetrics::Stage::QueueWait, TCP, 0.5);
+    m.recordStageLatency(TentMetrics::Stage::QueueWait, TCP, 0.9);
+
+    auto resp = retryGet("/metrics");
+    EXPECT_EQ(resp.http_status, 200);
+    EXPECT_NE(resp.body.find("tent_stage_queue_wait_us_bucket"),
+              std::string::npos)
+        << "stage_queue_wait_us (transport=tcp) silently dropped when all "
+           "samples truncate to 0 under int64_t";
+    EXPECT_NE(
+        resp.body.find("tent_stage_queue_wait_us_bucket{transport=\"tcp\","
+                       "le=\"+Inf\"} 3"),
+        std::string::npos)
+        << "+Inf bucket for transport=tcp must be cumulative (== total count)";
+}
+
+// Regression guard for Prometheus/JSON drift: both endpoints must agree on
+// the histogram count for a given metric. Previously they used two completely
+// different serialization paths (ylt serialize() vs. custom bucket walk),
+// so any ylt behavior change would silently desync them. Both now share the
+// bucket-walk code path.
+TEST_F(MetricsHttpTest, JsonAndPrometheusAgreeOnHistogramCount) {
+    // Snapshot before so the assertion is delta-based. TentMetrics is a
+    // process-wide singleton whose counter/histogram values are not reset
+    // across tests, so absolute values would be order-dependent.
+    auto json_before_resp = retryGet("/metrics/json");
+    ASSERT_EQ(json_before_resp.http_status, 200);
+    auto json_before_obj = nlohmann::json::parse(json_before_resp.body, nullptr,
+                                                 /*allow_exceptions=*/false);
+    ASSERT_FALSE(json_before_obj.is_discarded());
+    int64_t json_count_before =
+        json_before_obj["tent_stage_transport_us"]["count"];
+
+    // Parse the unspec _count line from Prometheus before-state too.
+    auto prom_before = retryGet("/metrics");
+    ASSERT_EQ(prom_before.http_status, 200);
+    auto count_before = [&]() -> int64_t {
+        std::string needle =
+            "tent_stage_transport_us_count{transport=\"unspec\"} ";
+        auto pos = prom_before.body.find(needle);
+        if (pos == std::string::npos) return 0;
+        return std::strtoll(prom_before.body.c_str() + pos + needle.size(),
+                            nullptr, 10);
+    }();
+
+    // Record 3 observations landing in distinct buckets.
+    auto& m = TentMetrics::instance();
+    m.recordStageLatency(TentMetrics::Stage::Transport, UNSPEC, 750.0);
+    m.recordStageLatency(TentMetrics::Stage::Transport, UNSPEC, 1200.0);
+    m.recordStageLatency(TentMetrics::Stage::Transport, UNSPEC, 50.0);
+    const int64_t kDelta = 3;
+
+    auto prom = retryGet("/metrics");
+    auto json_resp = retryGet("/metrics/json");
+    ASSERT_EQ(prom.http_status, 200);
+    ASSERT_EQ(json_resp.http_status, 200);
+
+    // JSON aggregates across all transport labels; its count must advance by
+    // exactly kDelta.
+    auto json = nlohmann::json::parse(json_resp.body, nullptr,
+                                      /*allow_exceptions=*/false);
+    ASSERT_FALSE(json.is_discarded()) << "invalid JSON: " << json_resp.body;
+    int64_t json_count_after = json["tent_stage_transport_us"]["count"];
+    EXPECT_EQ(json_count_after - json_count_before, kDelta)
+        << "JSON count delta must equal observations (" << kDelta
+        << "); before=" << json_count_before << " after=" << json_count_after;
+
+    // Prometheus: the unspec label's _count must have advanced by kDelta too.
+    std::string expected =
+        "tent_stage_transport_us_count{transport=\"unspec\"} " +
+        std::to_string(count_before + kDelta);
+    EXPECT_NE(prom.body.find(expected), std::string::npos)
+        << "Prometheus unspec _count (" << (count_before + kDelta)
+        << ") must match JSON delta. Body length=" << prom.body.size();
+}
+
 TEST_F(MetricsHttpTest, HealthEndpointOk) {
     auto resp = retryGet("/health");
     EXPECT_EQ(resp.http_status, 200);

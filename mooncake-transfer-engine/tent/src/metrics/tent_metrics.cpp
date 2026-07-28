@@ -16,8 +16,9 @@
 
 #include <glog/logging.h>
 #include <tent/thirdparty/nlohmann/json.h>
-#include <sstream>
 #include <iomanip>
+#include <sstream>
+#include <unordered_set>
 
 namespace mooncake::tent {
 
@@ -213,14 +214,14 @@ void TentMetrics::registerMetrics() {
     // histogram with its compile-time bucket boundaries; the struct keeps the
     // two in sync so getJsonMetrics() cannot mislabel buckets.
     histograms_ = {
-        {&read_latency_, &kLatencyBuckets},
-        {&write_latency_, &kLatencyBuckets},
-        {&read_size_, &kSizeBuckets},
-        {&write_size_, &kSizeBuckets},
-        {&deadline_mlu_, &kMluPerMilleBuckets},
-        {&stage_queue_wait_, &kStageBuckets},
-        {&stage_dispatch_, &kStageBuckets},
-        {&stage_transport_, &kStageBuckets},
+        {&read_latency_, &kLatencyBuckets, &read_latency_sum_},
+        {&write_latency_, &kLatencyBuckets, &write_latency_sum_},
+        {&read_size_, &kSizeBuckets, &read_size_sum_},
+        {&write_size_, &kSizeBuckets, &write_size_sum_},
+        {&deadline_mlu_, &kMluPerMilleBuckets, &deadline_mlu_sum_},
+        {&stage_queue_wait_, &kStageBuckets, &stage_queue_wait_sum_},
+        {&stage_dispatch_, &kStageBuckets, &stage_dispatch_sum_},
+        {&stage_transport_, &kStageBuckets, &stage_transport_sum_},
     };
 }
 
@@ -232,10 +233,13 @@ void TentMetrics::recordReadCompleted(TransportType tp, size_t bytes,
     auto label = std::array<std::string, 1>{transportTypeName(tp)};
     read_bytes_total_.inc(label, static_cast<int64_t>(bytes));
     read_requests_total_.inc(label);
-    read_size_.observe(label, static_cast<int64_t>(bytes));
+    auto bytes_val = static_cast<int64_t>(bytes);
+    read_size_.observe(label, bytes_val);
+    read_size_sum_.inc(label, bytes_val);
     if (latency_seconds > 0.0) {
         int64_t latency_us = static_cast<int64_t>(latency_seconds * 1000000.0);
         read_latency_.observe(label, latency_us);
+        read_latency_sum_.inc(label, latency_us);
     }
 }
 
@@ -247,10 +251,13 @@ void TentMetrics::recordWriteCompleted(TransportType tp, size_t bytes,
     auto label = std::array<std::string, 1>{transportTypeName(tp)};
     write_bytes_total_.inc(label, static_cast<int64_t>(bytes));
     write_requests_total_.inc(label);
-    write_size_.observe(label, static_cast<int64_t>(bytes));
+    auto bytes_val = static_cast<int64_t>(bytes);
+    write_size_.observe(label, bytes_val);
+    write_size_sum_.inc(label, bytes_val);
     if (latency_seconds > 0.0) {
         int64_t latency_us = static_cast<int64_t>(latency_seconds * 1000000.0);
         write_latency_.observe(label, latency_us);
+        write_latency_sum_.inc(label, latency_us);
     }
 }
 
@@ -259,7 +266,9 @@ void TentMetrics::recordDeadlineMLU(TransportType tp, double mlu) {
         return;
     if (mlu < 0.0) return;
     auto label = std::array<std::string, 1>{transportTypeName(tp)};
-    deadline_mlu_.observe(label, static_cast<int64_t>(mlu * 1000.0));
+    auto mlu_permille = static_cast<int64_t>(mlu * 1000.0);
+    deadline_mlu_.observe(label, mlu_permille);
+    deadline_mlu_sum_.inc(label, mlu_permille);
 }
 
 void TentMetrics::recordDeadlineInfeasible(TransportType tp) {
@@ -279,12 +288,15 @@ void TentMetrics::recordStageLatency(Stage stage, TransportType tp,
     switch (stage) {
         case Stage::QueueWait:
             stage_queue_wait_.observe(label, val);
+            stage_queue_wait_sum_.inc(label, val);
             break;
         case Stage::Dispatch:
             stage_dispatch_.observe(label, val);
+            stage_dispatch_sum_.inc(label, val);
             break;
         case Stage::Transport:
             stage_transport_.observe(label, val);
+            stage_transport_sum_.inc(label, val);
             break;
     }
 }
@@ -320,21 +332,27 @@ std::string TentMetrics::getPrometheusMetrics() {
         std::string result;
         result.reserve(kPrometheusBufferSize);
 
-        // Serialize each metric into a temporary buffer first, then append.
-        // ylt's basic_dynamic_histogram::serialize() calls str.clear() when
-        // all label combos have sum=0, which would wipe previous output if
-        // we serialized directly into `result`. Using a per-metric temporary
-        // isolates each serialize() call.
+        // Counters: ylt's counter_t::serialize() is reliable — no evidence of
+        // silent drops in practice. Kept as-is.
         for (auto* counter : counters_) {
             std::string tmp;
             counter->serialize(tmp);
             result += tmp;
         }
 
+        // Histograms: do NOT use ylt's basic_dynamic_histogram::serialize().
+        // It silently drops the entire metric (including the # HELP / # TYPE
+        // header it already wrote) whenever every label combo has sum_==0 —
+        // via `if (value == 0) continue; ... if (value_str.empty())
+        // str.clear();`. That condition is reachable in production: e.g.
+        // stage_queue_wait_us with sub-microsecond latencies that truncate to
+        // 0 under int64_t observation. The JSON endpoint's custom serializer
+        // walks get_bucket_counts() directly and is unaffected, which is why
+        // /metrics/json reported count=4846 while /metrics omitted the metric
+        // entirely. Using the same bucket-walk here closes that drift.
         for (const auto& entry : histograms_) {
-            std::string tmp;
-            entry.h->serialize(tmp);
-            result += tmp;
+            serializeHistogramPrometheus(entry.h, *entry.boundaries, *entry.sum,
+                                         result);
         }
 
         return result;
@@ -356,6 +374,118 @@ int64_t sumCounterValues(CounterPtr counter) {
     return total;
 }
 }  // namespace
+
+void TentMetrics::serializeHistogramPrometheus(
+    ylt::metric::basic_dynamic_histogram<int64_t, 1>* hist,
+    const std::vector<double>& boundaries,
+    ylt::metric::basic_dynamic_counter<int64_t, 1>& sum,
+    std::string& out) const {
+    // Walk the same data the JSON path uses (get_bucket_counts() + copy()),
+    // so the two endpoints cannot drift. Unlike ylt's serialize() this never
+    // silently drops a histogram that has observed >=1 sample: ylt clears its
+    // output string (taking the # HELP / # TYPE header with it) whenever
+    // every label combo has sum_==0, which is reachable in production when
+    // sub-microsecond latencies truncate to 0 under int64_t observation.
+    auto bucket_counts = hist->get_bucket_counts();
+    if (bucket_counts.empty()) return;
+
+    // Build the union of label combos across ALL buckets. ylt's observe()
+    // increments exactly one bucket per observation (the bucket containing
+    // the value), so no single bucket sees every combo: e.g. queue_wait
+    // (sub-us -> bucket[0]) and transport_us (>=100us -> higher buckets) live
+    // in disjoint buckets. ylt itself uses sum_->copy() for this, but sum_ is
+    // private. Unioning across buckets gives the same set without needing sum_.
+    std::vector<const std::array<std::string, 1>*> label_combos;
+    std::unordered_set<std::string_view> seen;
+    for (auto& bc : bucket_counts) {
+        for (auto& e : bc->copy()) {
+            std::string_view key(e->label[0]);
+            if (seen.insert(key).second) {
+                label_combos.push_back(&e->label);
+            }
+        }
+    }
+    if (label_combos.empty()) return;
+
+    // Pre-compute per-combo total counts so we can (a) skip totally-empty
+    // combos and (b) decide whether to emit the # HELP / # TYPE header at
+    // all. This mirrors ylt's "emit head only if value_map non-empty" but
+    // uses bucket counts instead of sum, so a combo with sum==0 but real
+    // observations is still emitted.
+    std::vector<std::pair<const std::array<std::string, 1>*, int64_t>>
+        active_combos;
+    for (auto* labels_value : label_combos) {
+        int64_t total_count = 0;
+        for (auto& bc : bucket_counts) {
+            total_count += bc->value(*labels_value);
+        }
+        if (total_count > 0) {
+            active_combos.emplace_back(labels_value, total_count);
+        }
+    }
+    if (active_combos.empty()) return;
+
+    // Read back the per-label sum from the parallel counter. ylt's histogram
+    // keeps sum_ private with no accessor, so we maintain a separate counter
+    // incremented alongside each observe() call. copy() returns a vector of
+    // {label, value} pairs; build a lookup map for O(1) access per combo.
+    std::unordered_map<std::string, int64_t> sum_by_label;
+    for (auto& e : sum.copy()) {
+        sum_by_label[e->label[0]] = e->value.load();
+    }
+
+    const std::string& name = hist->str_name();
+    const std::string help_str{hist->help()};
+    const std::string& label_name = hist->labels_name()[0];
+
+    // Emit the header once per metric (matches ylt's serialize_head()).
+    out.append("# HELP ").append(name).append(" ").append(help_str).append(
+        "\n");
+    out.append("# TYPE ").append(name).append(" histogram\n");
+
+    for (auto& [labels_value, total_count] : active_combos) {
+        int64_t cumulative = 0;
+        for (size_t i = 0; i < bucket_counts.size(); ++i) {
+            cumulative += bucket_counts[i]->value(*labels_value);
+            out.append(name).append("_bucket{");
+            out.append(label_name)
+                .append("=\"")
+                .append((*labels_value)[0])
+                .append("\",");
+            if (i < boundaries.size()) {
+                out.append("le=\"")
+                    .append(std::to_string(boundaries[i]))
+                    .append("\"} ");
+            } else {
+                out.append("le=\"+Inf\"} ");
+            }
+            out.append(std::to_string(cumulative)).append("\n");
+        }
+
+        // _sum: read from the parallel counter maintained alongside each
+        // observe() call. Falls back to 0 if the label is not yet in the
+        // counter (should not happen for active combos, but defensive).
+        int64_t total_sum = 0;
+        auto it = sum_by_label.find((*labels_value)[0]);
+        if (it != sum_by_label.end()) {
+            total_sum = it->second;
+        }
+        out.append(name).append("_sum{");
+        out.append(label_name)
+            .append("=\"")
+            .append((*labels_value)[0])
+            .append("\"} ")
+            .append(std::to_string(total_sum))
+            .append("\n");
+
+        out.append(name).append("_count{");
+        out.append(label_name)
+            .append("=\"")
+            .append((*labels_value)[0])
+            .append("\"} ");
+        out.append(std::to_string(total_count)).append("\n");
+    }
+}
 
 std::string TentMetrics::getJsonMetrics() {
     if (!initialized_) return "{}";
@@ -385,9 +515,11 @@ std::string TentMetrics::getJsonMetrics() {
         // Histograms: sum bucket counts across all transport labels.
         auto serializeHistogram =
             [&](ylt::metric::basic_dynamic_histogram<int64_t, 1>* hist,
-                const std::vector<double>& boundaries) {
+                const std::vector<double>& boundaries,
+                ylt::metric::basic_dynamic_counter<int64_t, 1>* sum) {
                 auto bucket_counts = hist->get_bucket_counts();
                 int64_t total_count = 0;
+                int64_t total_sum = 0;
                 nlohmann::json buckets_obj;
                 for (size_t i = 0; i < bucket_counts.size(); ++i) {
                     int64_t bucket_total = sumCounterValues(bucket_counts[i]);
@@ -397,20 +529,29 @@ std::string TentMetrics::getJsonMetrics() {
                             boundaries[i]))] = bucket_total;
                     }
                 }
+                for (auto& e : sum->copy()) {
+                    total_sum += e->value.load();
+                }
                 nlohmann::json hist_obj;
                 hist_obj["count"] = total_count;
+                hist_obj["sum"] = total_sum;
                 hist_obj["buckets"] = buckets_obj;
                 root[hist->str_name()] = hist_obj;
             };
 
-        serializeHistogram(&read_latency_, kLatencyBuckets);
-        serializeHistogram(&write_latency_, kLatencyBuckets);
-        serializeHistogram(&read_size_, kSizeBuckets);
-        serializeHistogram(&write_size_, kSizeBuckets);
-        serializeHistogram(&deadline_mlu_, kMluPerMilleBuckets);
-        serializeHistogram(&stage_queue_wait_, kStageBuckets);
-        serializeHistogram(&stage_dispatch_, kStageBuckets);
-        serializeHistogram(&stage_transport_, kStageBuckets);
+        serializeHistogram(&read_latency_, kLatencyBuckets, &read_latency_sum_);
+        serializeHistogram(&write_latency_, kLatencyBuckets,
+                           &write_latency_sum_);
+        serializeHistogram(&read_size_, kSizeBuckets, &read_size_sum_);
+        serializeHistogram(&write_size_, kSizeBuckets, &write_size_sum_);
+        serializeHistogram(&deadline_mlu_, kMluPerMilleBuckets,
+                           &deadline_mlu_sum_);
+        serializeHistogram(&stage_queue_wait_, kStageBuckets,
+                           &stage_queue_wait_sum_);
+        serializeHistogram(&stage_dispatch_, kStageBuckets,
+                           &stage_dispatch_sum_);
+        serializeHistogram(&stage_transport_, kStageBuckets,
+                           &stage_transport_sum_);
 
         return root.dump(2);  // Pretty print with 2-space indent
     } catch (const std::exception& e) {

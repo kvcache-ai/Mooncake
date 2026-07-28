@@ -117,6 +117,21 @@ jobs:
       artifact-prefix: nightly-cuda13-x86
       version-override: ${{ needs.version-stamp.outputs.nightly_version }}
 
+  build-non-cuda-x86:
+    needs: version-stamp
+    uses: ./.github/workflows/_build-wheel.yaml
+    with:
+      runner: ubuntu-22.04
+      container: pytorch/manylinux2_28-builder:cuda12.8
+      python-versions: '["3.10", "3.12"]'
+      cuda: container
+      variant-flag: NON_CUDA_BUILD
+      cmake-args: >-
+        -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=OFF -DWITH_EP=OFF
+        -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
+      artifact-prefix: nightly-non-cuda-x86
+      version-override: ${{ needs.version-stamp.outputs.nightly_version }}
+
   build-musa:
     runs-on: ubuntu-22.04
     container: registry.mthreads.com/mcconline/inference/pytorch:2.9.1.post1-py3.10-musa5.2.0-mp31-devel-ubuntu22.04-amd64
@@ -174,7 +189,7 @@ jobs:
     secrets: inherit
 
   publish-testpypi:
-    needs: [version-stamp, build-cuda128-x86, build-cuda128-arm64, build-cuda13-x86, build-cuda13-arm64]
+    needs: [version-stamp, build-cuda128-x86, build-cuda128-arm64, build-cuda13-x86, build-cuda13-arm64, build-non-cuda-x86]
     if: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.skip_publish == 'true') }}
     runs-on: ubuntu-22.04
     environment: nightly
@@ -516,6 +531,7 @@ jobs:
       - build-cuda128-arm64
       - build-cuda13-x86
       - build-cuda13-arm64
+      - build-non-cuda-x86
       - build-musa
       - build-docker
       - ascend-test
