@@ -171,7 +171,7 @@ export MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES=96636764160   # e.g. 90 GiB
 export MOONCAKE_ENABLE_GDS=1
 export MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=offset_allocator_storage_backend
 export MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/mnt/nvme/offload  # same path as store
-export MOONCAKE_GDS_STORE_SERVICE_ADDR=127.0.0.1:<port>      # store coro_rpc address
+export MOONCAKE_GDS_STORE_SERVICE_ADDR=127.0.0.1:PORT      # store coro_rpc address
 ```
 
 Engine ranks run with `global_segment_size=0` (normal mode: the rank
