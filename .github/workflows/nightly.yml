@@ -294,6 +294,7 @@ jobs:
           DEFAULT_KV_LEASE_TTL: "500"
           TEST_SSD_OFFLOAD_IN_EVICT: "1"
           TEST_PROMOTION_ON_HIT: "1"
+          TEST_CXL: "1"
         run: |
           export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
           bash scripts/run_tests.sh
