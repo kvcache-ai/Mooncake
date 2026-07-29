@@ -659,7 +659,7 @@ void RealClient::SubmitGdsTask(std::function<void()> task,
         if (gds_worker_stop_) {
             // Workers joined -- do NOT execute task body inline.
             LOG(WARNING) << "GDS worker pool stopped, rejecting task"
-                         << " (on_complete still fires to decrment counter)";
+                         << " (on_complete still fires to decrement counter)";
             // The body may block on rdma_future.get() or a notify_barrier
             // whose promise the caller has not yet satisfied (BatchPut
             // has not run).  Only call on_complete (decr counter).
