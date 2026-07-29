@@ -4092,6 +4092,43 @@ TEST_F(MasterServiceTest, ReadableAfterPartialUnmountWithReplication) {
         << "Object should remain accessible with surviving replica";
 }
 
+TEST_F(MasterServiceTest, PutStartPartialAllocationIsObservable) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+
+    // Mount two segments only
+    constexpr size_t buffer1 = 0x300000000;
+    constexpr size_t buffer2 = 0x400000000;
+    constexpr size_t segment_size = 1024 * 1024 * 64;  // 64MB
+
+    auto segment1 = MakeSegment("segment1", buffer1, segment_size);
+    auto segment2 = MakeSegment("segment2", buffer2, segment_size);
+    UUID client_id = generate_uuid();
+    ASSERT_TRUE(service_->MountSegment(segment1, client_id).has_value());
+    ASSERT_TRUE(service_->MountSegment(segment2, client_id).has_value());
+
+    auto& metrics = MasterMetricManager::instance();
+    const int64_t partial_before = metrics.get_put_start_partial_allocations();
+
+    // Request more replicas than available segments: best-effort keeps the
+    // put successful but the degradation must be recorded.
+    ReplicateConfig config;
+    config.replica_num = 3;
+    auto put_start_result = service_->PutStart(
+        client_id, "partial_alloc_key", TenantId::Default(), 1024, config);
+    ASSERT_TRUE(put_start_result.has_value());
+    ASSERT_EQ(2u, put_start_result->size());
+    ASSERT_EQ(metrics.get_put_start_partial_allocations(), partial_before + 1);
+
+    // A fully satisfied allocation must not be counted as partial.
+    ReplicateConfig full_config;
+    full_config.replica_num = 2;
+    auto full_result = service_->PutStart(
+        client_id, "full_alloc_key", TenantId::Default(), 1024, full_config);
+    ASSERT_TRUE(full_result.has_value());
+    ASSERT_EQ(2u, full_result->size());
+    ASSERT_EQ(metrics.get_put_start_partial_allocations(), partial_before + 1);
+}
+
 TEST_F(MasterServiceTest, UnmountSegmentPerformance) {
     std::unique_ptr<MasterService> service_(new MasterService());
     constexpr size_t kBufferAddress = 0x300000000;

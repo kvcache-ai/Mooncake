@@ -71,6 +71,10 @@ MasterMetricManager::MasterMetricManager()
           "master_put_start_alloc_failures_total",
           "Total number of PutStart failures caused by replica allocation "
           "failure"),
+      put_start_partial_allocations_(
+          "master_put_start_partial_allocations_total",
+          "Total number of PutStart requests that succeeded with fewer "
+          "replicas than requested (best-effort degradation)"),
       put_end_requests_("master_put_end_requests_total",
                         "Total number of PutEnd requests received"),
       put_end_failures_("master_put_end_failures_total",
@@ -513,6 +517,7 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     put_start_requests_.inc(0);
     put_start_failures_.inc(0);
     put_start_alloc_failures_.inc(0);
+    put_start_partial_allocations_.inc(0);
     put_end_requests_.inc(0);
     put_end_failures_.inc(0);
     put_revoke_requests_.inc(0);
@@ -924,6 +929,9 @@ void MasterMetricManager::inc_put_start_failures(int64_t val) {
 void MasterMetricManager::inc_put_start_alloc_failures(int64_t val) {
     put_start_alloc_failures_.inc(val);
 }
+void MasterMetricManager::inc_put_start_partial_allocations(int64_t val) {
+    put_start_partial_allocations_.inc(val);
+}
 void MasterMetricManager::inc_put_end_requests(int64_t val) {
     put_end_requests_.inc(val);
 }
@@ -1224,6 +1232,10 @@ int64_t MasterMetricManager::get_put_start_failures() {
 
 int64_t MasterMetricManager::get_put_start_alloc_failures() {
     return put_start_alloc_failures_.value();
+}
+
+int64_t MasterMetricManager::get_put_start_partial_allocations() {
+    return put_start_partial_allocations_.value();
 }
 
 int64_t MasterMetricManager::get_put_end_requests() {
@@ -1799,6 +1811,7 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(put_start_requests_);
     serialize_metric(put_start_failures_);
     serialize_metric(put_start_alloc_failures_);
+    serialize_metric(put_start_partial_allocations_);
     serialize_metric(put_end_requests_);
     serialize_metric(put_end_failures_);
     serialize_metric(put_revoke_requests_);
@@ -2060,6 +2073,7 @@ std::string MasterMetricManager::get_summary_string(
     int64_t put_starts = put_start_requests_.value();
     int64_t put_start_fails = put_start_failures_.value();
     int64_t put_start_alloc_fails = put_start_alloc_failures_.value();
+    int64_t put_start_partial_allocs = put_start_partial_allocations_.value();
     int64_t put_ends = put_end_requests_.value();
     int64_t put_end_fails = put_end_failures_.value();
     int64_t put_revoke_requests = put_revoke_requests_.value();
@@ -2181,6 +2195,7 @@ std::string MasterMetricManager::get_summary_string(
     current_counters.put_starts = put_starts;
     current_counters.put_start_fails = put_start_fails;
     current_counters.put_start_alloc_fails = put_start_alloc_fails;
+    current_counters.put_start_partial_allocs = put_start_partial_allocs;
     current_counters.put_ends = put_ends;
     current_counters.put_end_fails = put_end_fails;
     current_counters.put_revoke_requests = put_revoke_requests;
@@ -2559,6 +2574,8 @@ std::string MasterMetricManager::get_summary_string(
        << "Success/Attempts=" << eviction_success << "/" << eviction_attempts
        << ", "
        << "AllocFail=" << delta(&SummaryCounters::put_start_alloc_fails) << ", "
+       << "PartialAlloc=" << delta(&SummaryCounters::put_start_partial_allocs)
+       << ", "
        << "keys=" << evicted_key_count << ", "
        << "size=" << byte_size_to_string(evicted_size);
     // mem eviction
