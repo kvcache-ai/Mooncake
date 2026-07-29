@@ -119,6 +119,9 @@ class HAMetricManager {
     void inc_oplog_queue_bypassed(int64_t val = 1);
     void inc_oplog_sync_wait_timeouts(int64_t val = 1);
     void inc_oplog_read_failures(int64_t val = 1);
+    void inc_oplog_reader_reconnect_attempts(int64_t val = 1);
+    void inc_oplog_reader_reconnect_failures(int64_t val = 1);
+    void inc_oplog_reader_reconnects(int64_t val = 1);
     void inc_oplog_apply_failures(int64_t val = 1);
     void inc_oplog_best_effort_apply_skipped(int64_t val = 1);
     void inc_oplog_confirmed_holes(int64_t val = 1);
@@ -240,6 +243,9 @@ class HAMetricManager {
     ylt::metric::counter_t oplog_queue_bypassed_total_;
     ylt::metric::counter_t oplog_sync_wait_timeouts_total_;
     ylt::metric::counter_t oplog_read_failures_total_;
+    ylt::metric::counter_t oplog_reader_reconnect_attempts_total_;
+    ylt::metric::counter_t oplog_reader_reconnect_failures_total_;
+    ylt::metric::counter_t oplog_reader_reconnects_total_;
     ylt::metric::counter_t oplog_apply_failures_total_;
     ylt::metric::counter_t oplog_best_effort_apply_skipped_total_;
     ylt::metric::counter_t oplog_confirmed_holes_total_;

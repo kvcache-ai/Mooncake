@@ -154,6 +154,9 @@ TEST_F(HAMetricManagerTest, TestHaFailureMetricsAreExported) {
     M().inc_oplog_queue_bypassed();
     M().inc_oplog_sync_wait_timeouts();
     M().inc_oplog_read_failures();
+    M().inc_oplog_reader_reconnect_attempts();
+    M().inc_oplog_reader_reconnect_failures();
+    M().inc_oplog_reader_reconnects();
     M().inc_oplog_apply_failures();
     M().inc_oplog_best_effort_apply_skipped();
     M().inc_oplog_confirmed_holes();
@@ -181,6 +184,9 @@ TEST_F(HAMetricManagerTest, TestHaFailureMetricsAreExported) {
              "ha_oplog_queue_bypassed_total",
              "ha_oplog_sync_wait_timeouts_total",
              "ha_oplog_read_failures_total",
+             "ha_oplog_reader_reconnect_attempts_total",
+             "ha_oplog_reader_reconnect_failures_total",
+             "ha_oplog_reader_reconnects_total",
              "ha_oplog_apply_failures_total",
              "ha_oplog_best_effort_apply_skipped_total",
              "ha_oplog_confirmed_holes_total",
