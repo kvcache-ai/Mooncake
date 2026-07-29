@@ -23,6 +23,7 @@ distributed execution components.
 | [HiCache](hicache-design) | Hierarchical KV cache design. |
 | [Engram](engram) | Distributed serving and cache architecture. |
 | [Unified Parallel Tensor I/O](unified-parallel-tensor-io) | Parallel tensor storage and transfer model. |
+| [Weight Transfer Manifest](weight-transfer-manifest) | Logical weight placement, runtime binding, and lifecycle fencing contract. |
 | [SSD Offload](ssd-offload) | SSD-backed cache hierarchy design. |
 | [SSD Free-Ratio-First Allocation](ssd-free-ratio-first-allocation) | Capacity-aware replica placement strategy. |
 
