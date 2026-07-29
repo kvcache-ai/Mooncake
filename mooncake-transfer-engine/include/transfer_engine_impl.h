@@ -411,8 +411,7 @@ class TransferEngineImpl {
     bool hasOverlapInMapLocked(const MemoryRegionMap& regions, uintptr_t addr,
                                uint64_t length) const;
 
-    bool tryBumpLocalMemoryRegionRefs(
-        const std::vector<MemoryRegion>& regions);
+    bool tryBumpLocalMemoryRegionRefs(const std::vector<MemoryRegion>& regions);
 
     bool tryReserveMemoryRegions(const std::vector<MemoryRegion>& regions);
 

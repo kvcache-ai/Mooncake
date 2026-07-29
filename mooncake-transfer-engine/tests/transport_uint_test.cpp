@@ -418,11 +418,9 @@ TEST_F(TransportTest, RegisterLocalMemoryAllowsIdempotentDuplicate) {
     TransferEngineImplTestPeer::replaceTransports(engine, transport);
 
     std::array<char, 128> buffer{};
-    EXPECT_EQ(engine.registerLocalMemory(buffer.data(), buffer.size(),
-                                         "cpu:0"),
+    EXPECT_EQ(engine.registerLocalMemory(buffer.data(), buffer.size(), "cpu:0"),
               0);
-    EXPECT_EQ(engine.registerLocalMemory(buffer.data(), buffer.size(),
-                                         "cpu:0"),
+    EXPECT_EQ(engine.registerLocalMemory(buffer.data(), buffer.size(), "cpu:0"),
               0);
     EXPECT_EQ(transport->registrationCalls(), 1);
 
