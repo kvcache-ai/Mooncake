@@ -94,7 +94,7 @@ jobs:
           curl -sS https://bootstrap.pypa.io/get-pip.py | "python${PYV}"
           PYTHON_BIN="$(command -v python${PYV})"
           echo "PYTHON_BIN=${PYTHON_BIN}" >> "$GITHUB_ENV"
-          echo "PATH=/opt/rocm/bin:${PATH}" >> "$GITHUB_ENV"
+          echo "/opt/rocm/bin" >> "$GITHUB_PATH"
 
       - name: Install dependencies
         shell: bash
@@ -107,6 +107,7 @@ jobs:
         shell: bash
         run: |
           set -eo pipefail
+          export PATH="/opt/rocm/bin:$PATH"   # hipify-perl for USE_HIP
           rm -rf build && mkdir build && cd build
           cmake -G Ninja .. \
             -DUSE_HIP=ON -DUSE_CUDA=OFF -DWITH_EP=OFF \
@@ -119,6 +120,7 @@ jobs:
         shell: bash
         run: |
           set -eo pipefail
+          export PATH="/opt/rocm/bin:$PATH"
           cd build
           cmake --build . -j"$(nproc)"
           cmake --install .
@@ -132,6 +134,7 @@ jobs:
         shell: bash
         run: |
           set -eo pipefail
+          export PATH="/opt/rocm/bin:$PATH"
           export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:/usr/local/lib"
           HIP_BUILD=1 PYTHON_VERSION=${{ matrix.python-version }} \
             OUTPUT_DIR=dist-rocm-py${{ steps.generate_tag_release.outputs.python_version_tag }} \

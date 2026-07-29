@@ -66,7 +66,8 @@ jobs:
         PYTHON_BIN="$(command -v python${PYV})"
         echo "PYTHON_BIN=${PYTHON_BIN}" >> "$GITHUB_ENV"
         # hipify-perl lives in /opt/rocm/bin; CMake's USE_HIP path requires it.
-        echo "PATH=/opt/rocm/bin:${PATH}" >> "$GITHUB_ENV"
+        # Use GITHUB_PATH (setting PATH via GITHUB_ENV is not honored reliably).
+        echo "/opt/rocm/bin" >> "$GITHUB_PATH"
 
     - name: Run sccache-cache
       uses: mozilla-actions/sccache-action@v0.0.9
@@ -89,6 +90,7 @@ jobs:
       shell: bash
       run: |
         set -eo pipefail
+        export PATH="/opt/rocm/bin:$PATH"   # hipify-perl for USE_HIP
         rm -rf build && mkdir build && cd build
         cmake -G Ninja .. \
           -DUSE_HIP=ON -DUSE_CUDA=OFF -DWITH_EP=OFF \
@@ -101,6 +103,7 @@ jobs:
       shell: bash
       run: |
         set -eo pipefail
+        export PATH="/opt/rocm/bin:$PATH"
         cd build
         cmake --build . -j"$(nproc)"
         cmake --install .
@@ -119,6 +122,7 @@ jobs:
       shell: bash
       run: |
         set -eo pipefail
+        export PATH="/opt/rocm/bin:$PATH"
         export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:/usr/local/lib"
         HIP_BUILD=1 PYTHON_VERSION=${{ matrix.python-version }} \
           OUTPUT_DIR=dist-rocm-py${{ steps.generate_tag.outputs.python_version_tag }} \
