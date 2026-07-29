@@ -744,10 +744,93 @@ Status RdmaTransport::submitTransfer(
     return submitTransferTask(task_list);
 }
 
+void RdmaTransport::failQueuedSlicesForTask(
+    std::unordered_map<std::shared_ptr<RdmaContext>, std::vector<Slice *>>
+        &slices_to_post,
+    TransferTask *task) {
+    for (auto &entry : slices_to_post) {
+        auto &pending = entry.second;
+        std::vector<Slice *> keep;
+        keep.reserve(pending.size());
+        for (auto *s : pending) {
+            if (s->task == task)
+                s->markFailed();
+            else
+                keep.push_back(s);
+        }
+        pending.swap(keep);
+    }
+}
+
 Status RdmaTransport::submitTransferTask(
     const std::vector<TransferTask *> &task_list) {
     std::unordered_map<std::shared_ptr<RdmaContext>, std::vector<Slice *>>
         slices_to_post;
+
+    // Aborts submission of `task` (at `task_index` in task_list) after
+    // `failed_slice` -- already in task.slice_list but not yet counted --
+    // failed device selection. task's own slices still in slices_to_post
+    // never touched hardware and the whole task must be retried, so fail
+    // them in place instead of posting them; other tasks' queued slices
+    // are flushed normally. failed_slice itself is counted into
+    // slice_count and failed like any other slice, so every slice in
+    // slice_list is counted and terminal: failed_slice_count >= 1
+    // guarantees a FAILED report, and under USE_EVENT_DRIVEN_COMPLETION
+    // its markFailed() drives the task's is_finished /
+    // finished_task_count bookkeeping once all counted slices are
+    // terminal. Every not-yet-reached task after `task` is marked
+    // submit_failed so getTransferStatus() reports FAILED instead of
+    // misreading its slice_count == 0 as COMPLETED; `task` gets the flag
+    // too, as a uniform "submission aborted" marker.
+    //
+    // The sibling tasks have no slice passing through markFailed(), so
+    // under USE_EVENT_DRIVEN_COMPLETION the loop below replicates
+    // check_batch_completion()'s task-finished tail for them: account each
+    // as finished and, for the batch's last, publish completion and notify
+    // exactly the way the slice path does.
+    auto failTaskSubmission = [&](TransferTask &task, size_t task_index,
+                                  Slice *failed_slice) {
+        // Count failed_slice before any markFailed() below:
+        // check_batch_completion() compares completed_slice_count against
+        // slice_count, so the count must be final first or an earlier
+        // slice's markFailed() could prematurely declare the task
+        // complete.
+        __sync_fetch_and_add(&task.slice_count, 1);
+        failQueuedSlicesForTask(slices_to_post, &task);
+        for (auto &entry : slices_to_post)
+            if (!entry.second.empty())
+                entry.first->submitPostSend(entry.second);
+        slices_to_post.clear();
+        failed_slice->markFailed();
+
+        // Release stores paired with the acquire loads of submit_failed in
+        // getTransferStatus(): plain volatile gives no cross-core ordering
+        // on ARM/POWER, so submit_failed could otherwise become visible
+        // before markFailed()'s failed_slice_count increments above.
+        __atomic_store_n(&task.submit_failed, true, __ATOMIC_RELEASE);
+        for (size_t j = task_index + 1; j < task_list.size(); ++j) {
+            __atomic_store_n(&task_list[j]->submit_failed, true,
+                             __ATOMIC_RELEASE);
+            __atomic_store_n(&task_list[j]->is_finished, true,
+                             __ATOMIC_RELEASE);
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+            auto &batch_desc = toBatchDesc(task_list[j]->batch_id);
+            batch_desc.has_failure.store(true, std::memory_order_relaxed);
+            auto prev = batch_desc.finished_task_count.fetch_add(
+                1, std::memory_order_relaxed);
+            if (prev + 1 == batch_desc.batch_size) {
+                {
+                    std::lock_guard<std::mutex> lock(
+                        batch_desc.completion_mutex);
+                    batch_desc.is_finished.store(true,
+                                                 std::memory_order_release);
+                }
+                batch_desc.completion_cv.notify_all();
+            }
+#endif
+        }
+    };
+
     auto local_segment_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     assert(local_segment_desc.get());
     const size_t kBlockSize = globalConfig().slice_size;
@@ -835,6 +918,8 @@ Status RdmaTransport::submitTransferTask(
                 // Deallocating them again here double-frees them into
                 // ThreadLocalSliceCache, letting a later allocate() hand out
                 // the same Slice* to two unrelated transfers.
+                failTaskSubmission(task, index, slice);
+
                 LOG(ERROR)
                     << "Memory region not registered by any active device(s): "
                     << source_addr;
@@ -845,6 +930,7 @@ Status RdmaTransport::submitTransferTask(
                 auto &context = context_list_[device_id];
                 if (!context->active()) {
                     LOG(ERROR) << "Device " << device_id << " is not active";
+                    failTaskSubmission(task, index, slice);
                     return Status::InvalidArgument("Device " +
                                                    std::to_string(device_id) +
                                                    " is not active");
@@ -890,7 +976,12 @@ Status RdmaTransport::getTransferStatus(BatchID batch_id,
         uint64_t success_slice_count = task.success_slice_count;
         uint64_t failed_slice_count = task.failed_slice_count;
         if (success_slice_count + failed_slice_count == task.slice_count) {
-            if (failed_slice_count)
+            // submit_failed marks tasks whose submission was aborted or
+            // never started; needed for the never-started case, whose
+            // slice_count == 0 the counters alone misread as COMPLETED.
+            // Acquire pairs with the release store in failTaskSubmission().
+            if (failed_slice_count ||
+                __atomic_load_n(&task.submit_failed, __ATOMIC_ACQUIRE))
                 status[task_id].s = TransferStatusEnum::FAILED;
             else
                 status[task_id].s = TransferStatusEnum::COMPLETED;
@@ -916,7 +1007,8 @@ Status RdmaTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     uint64_t success_slice_count = task.success_slice_count;
     uint64_t failed_slice_count = task.failed_slice_count;
     if (success_slice_count + failed_slice_count == task.slice_count) {
-        if (failed_slice_count)
+        if (failed_slice_count ||
+            __atomic_load_n(&task.submit_failed, __ATOMIC_ACQUIRE))
             status.s = TransferStatusEnum::FAILED;
         else
             status.s = TransferStatusEnum::COMPLETED;

@@ -322,6 +322,14 @@ class Transport {
         volatile uint64_t failed_slice_count = 0;
         volatile uint64_t transferred_bytes = 0;
         volatile bool is_finished = false;
+        // Set when submitTransferTask() aborted this task's submission
+        // (device-selection failure / inactive device) or never reached
+        // it. Load-bearing for the never-reached case: its slice_count
+        // stays 0, which the counters alone misread as genuine completion,
+        // so getTransferStatus() consults this flag. The aborted task sets
+        // it too, as a uniform marker (its counted failed slices already
+        // force FAILED).
+        volatile bool submit_failed = false;
         uint64_t total_bytes = 0;
         BatchID batch_id = 0;
 

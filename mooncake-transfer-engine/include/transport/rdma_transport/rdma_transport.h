@@ -108,6 +108,15 @@ class RdmaTransport : public Transport {
 
     int preTouchMemory(void *addr, size_t length);
 
+    // Fails (via Slice::markFailed()) and removes every slice in
+    // `slices_to_post` that belongs to `task`, leaving other tasks'
+    // slices queued for the caller to post normally. Used by
+    // submitTransferTask() when `task`'s submission is aborted partway.
+    static void failQueuedSlicesForTask(
+        std::unordered_map<std::shared_ptr<RdmaContext>, std::vector<Slice *>>
+            &slices_to_post,
+        TransferTask *task);
+
    public:
     int onSetupRdmaConnections(const HandShakeDesc &peer_desc,
                                HandShakeDesc &local_desc);

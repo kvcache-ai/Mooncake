@@ -110,7 +110,7 @@ class RdmaContext {
 
     RdmaContext(RdmaTransport &engine, const std::string &device_name);
 
-    ~RdmaContext();
+    virtual ~RdmaContext();
 
     int construct(size_t num_cq_list = 1, size_t num_comp_channels = 1,
                   uint8_t port = 1, int gid_index = -1, size_t max_cqe = 4096,
@@ -284,7 +284,10 @@ class RdmaContext {
                                      int &gid_index);
 
    public:
-    int submitPostSend(const std::vector<Transport::Slice *> &slice_list);
+    // Virtual as a test seam: tests substitute a context that completes
+    // flushed slices without RDMA hardware.
+    virtual int submitPostSend(
+        const std::vector<Transport::Slice *> &slice_list);
 
     void trackPostedSlices(const std::vector<Transport::Slice *> &slice_list,
                            size_t first, size_t count);

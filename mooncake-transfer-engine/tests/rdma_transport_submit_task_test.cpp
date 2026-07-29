@@ -36,8 +36,13 @@
 
 #include <gtest/gtest.h>
 
+#include <atomic>
+#include <chrono>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "config.h"
 #include "rdma_test_peers.h"
@@ -52,13 +57,31 @@ namespace {
 using SegmentDesc = TransferMetadata::SegmentDesc;
 using BufferDesc = TransferMetadata::BufferDesc;
 
+// Test seam: completes every flushed slice immediately via markSuccess()
+// (the real CQE path), standing in for hardware. Lets submitTransferTask()
+// flush paths run end-to-end in this deviceless fixture, where the base
+// class would dereference its null worker_pool_.
+class FakeCompletionContext : public RdmaContext {
+   public:
+    using RdmaContext::RdmaContext;
+
+    int submitPostSend(
+        const std::vector<Transport::Slice *> &slice_list) override {
+        posted_ += slice_list.size();
+        for (auto *slice : slice_list) slice->markSuccess();
+        return 0;
+    }
+
+    size_t posted_ = 0;
+};
+
 class SubmitTransferTaskTest : public ::testing::Test {
    protected:
     static constexpr uint64_t kBufferAddr = 0x10000;
 
     std::shared_ptr<TransferMetadata> metadata_;
     std::unique_ptr<RdmaTransport> transport_;
-    std::shared_ptr<RdmaContext> context_;
+    std::shared_ptr<FakeCompletionContext> context_;
     uint64_t block_size_ = 0;
 
     void SetUp() override {
@@ -70,8 +93,10 @@ class SubmitTransferTaskTest : public ::testing::Test {
                                             "unit-test-server:1234");
 
         // construct() is never called: no real device is opened. active()
-        // defaults to true, which is all submitTransferTask() checks.
-        context_ = std::make_shared<RdmaContext>(*transport_, "mlx5_unit_test");
+        // defaults to true, and the only other context call these tests
+        // reach, submitPostSend(), is overridden by FakeCompletionContext.
+        context_ = std::make_shared<FakeCompletionContext>(*transport_,
+                                                           "mlx5_unit_test");
         RdmaTransportTestPeer::addContext(*transport_, context_);
 
         auto desc = std::make_shared<SegmentDesc>();
@@ -97,15 +122,21 @@ class SubmitTransferTaskTest : public ::testing::Test {
     // kBufferAddr. The first slice (offset 0) resolves inside the
     // registered buffer and succeeds; the second slice (offset
     // block_size_) starts past the buffer's end and fails every retry, so
-    // the call always returns early via the !found_device branch -- before
-    // ever reaching the end-of-function flush that would otherwise call
-    // into the (unconstructed, null) WorkerPool.
+    // the call always returns early via the !found_device branch.
     //
-    // `req`/`task` are owned by the caller and deliberately left alive on
-    // return, so the caller controls exactly when (if ever) the task's
-    // slices are returned to ThreadLocalSliceCache.
-    void triggerBug(Transport::TransferRequest &req,
-                    Transport::TransferTask &task) {
+    // `req`/`batch` are owned by the caller and left alive on return, so
+    // the caller controls when the task's slices go back to the cache.
+    // The task gets a valid batch_id: the fast-fail path's markFailed()
+    // dereferences toBatchDesc(batch_id) under USE_EVENT_DRIVEN_COMPLETION
+    // (production sets it in submitTransfer(); tests calling
+    // submitTransferTask() directly must too).
+    void submitFailingTask(Transport::TransferRequest &req,
+                           Transport::BatchDesc &batch) {
+        batch.batch_size = 1;
+        batch.task_list.resize(1);
+        auto &task = batch.task_list[0];
+        task.batch_id = reinterpret_cast<Transport::BatchID>(&batch);
+
         req.opcode = Transport::TransferRequest::WRITE;
         req.source = reinterpret_cast<void *>(kBufferAddr);
         req.length = 2 * block_size_;
@@ -116,11 +147,12 @@ class SubmitTransferTaskTest : public ::testing::Test {
         auto status = transport_->submitTransferTask({&task});
         EXPECT_FALSE(status.ok());
         EXPECT_TRUE(status.IsAddressNotRegistered());
-        // slice_list[0]: the first slice, in-buffer, succeeded and was
-        // queued into slices_to_post -- the victim of the bug.
-        // slice_list[1]: the second slice, out-of-buffer, failed and
-        // triggered the (buggy) cleanup; never added to slices_to_post,
-        // so it is not itself double-freed.
+        // slice_list[0]: the first slice, in-buffer, queued into
+        // slices_to_post; fast-failed by the abort path today, double-freed
+        // by the old bug.
+        // slice_list[1]: the second slice, out-of-buffer, the one that
+        // fails device selection; never added to slices_to_post, counted
+        // and fast-failed by the abort path.
         ASSERT_EQ(task.slice_list.size(), 2u);
     }
 };
@@ -149,20 +181,22 @@ TEST_F(SubmitTransferTaskTest, FoundDeviceFailureFreesSliceTwice) {
     Transport::Slice *original = nullptr;
     {
         Transport::TransferRequest req1;
-        Transport::TransferTask task1;
-        triggerBug(req1, task1);
-        original = task1.slice_list[0];
-        // task1 destroyed here: ~TransferTask() deallocate()s both of its
-        // slices, including `original` a second time -- immediately after
-        // the buggy manual deallocate() inside submitTransferTask() already
-        // did so once, with nothing else in between since this task's own
-        // second (failed) slice was never added to slices_to_post and so
-        // was never touched by the bug.
+        Transport::BatchDesc batch1;
+        submitFailingTask(req1, batch1);
+        original = batch1.task_list[0].slice_list[0];
+        // batch1 (and with it task1) destroyed here: ~TransferTask()
+        // deallocate()s both of its slices, exactly once each. Under the
+        // old bug, the manual deallocate() inside submitTransferTask() had
+        // already returned `original` to the cache, so this destruction
+        // registered it a second time -- with nothing else in between,
+        // since the task's second (failed) slice was never added to
+        // slices_to_post and so was never touched by that cleanup.
     }
 
     Transport::TransferRequest req2;
-    Transport::TransferTask task2;
-    triggerBug(req2, task2);
+    Transport::BatchDesc batch2;
+    submitFailingTask(req2, batch2);
+    auto &task2 = batch2.task_list[0];
 
     EXPECT_EQ(task2.slice_list[0], original)
         << "sanity check: the cache should have at least one legitimate "
@@ -175,5 +209,337 @@ TEST_F(SubmitTransferTaskTest, FoundDeviceFailureFreesSliceTwice) {
            "exact same, still-conceptually-owned pointer out twice in a "
            "row for what should have been two independent allocations";
 }
+
+// A slice already queued in slices_to_post when a later slice of the same
+// task fails device selection must be fast-failed via markFailed(): not
+// posted (the caller retries the whole task) and not left PENDING (the
+// task would never converge and the batch never be freeable). The task
+// must be immediately queryable as FAILED, with no RDMA completion
+// involved.
+TEST_F(SubmitTransferTaskTest,
+       FoundDeviceFailureFastFailsQueuedSliceOfSameTask) {
+    Transport::TransferRequest req;
+    Transport::BatchDesc batch;
+    submitFailingTask(req, batch);
+
+    auto &task = batch.task_list[0];
+    // slice_list[0]: in-buffer, device selection succeeded, was queued into
+    // slices_to_post -- must be fast-failed, not left PENDING.
+    // slice_list[1]: the slice that failed device selection -- must be
+    // counted into slice_count and fast-failed too, so every slice in
+    // slice_list is counted and terminal and, under
+    // USE_EVENT_DRIVEN_COMPLETION, its markFailed() drives the task's
+    // completion bookkeeping.
+    EXPECT_EQ(task.slice_list[0]->status, Transport::Slice::FAILED);
+    EXPECT_EQ(task.slice_list[1]->status, Transport::Slice::FAILED);
+    EXPECT_EQ(task.slice_count, 2u);
+    EXPECT_EQ(task.failed_slice_count, 2u);
+    EXPECT_EQ(task.success_slice_count, 0u);
+    EXPECT_TRUE(task.submit_failed);
+
+    Transport::TransferStatus ts;
+    auto batch_id = reinterpret_cast<Transport::BatchID>(&batch);
+    auto get_ret = transport_->getTransferStatus(batch_id, 0, ts);
+    ASSERT_TRUE(get_ret.ok());
+    EXPECT_EQ(ts.s, Transport::TransferStatusEnum::FAILED);
+    EXPECT_TRUE(task.is_finished);
+
+    // The batch-vector overload shares the same submit_failed check and
+    // must agree with the single-task overload above.
+    std::vector<Transport::TransferStatus> batch_status;
+    auto batch_get_ret = transport_->getTransferStatus(batch_id, batch_status);
+    ASSERT_TRUE(batch_get_ret.ok());
+    ASSERT_EQ(batch_status.size(), 1u);
+    EXPECT_EQ(batch_status[0].s, Transport::TransferStatusEnum::FAILED);
+}
+
+// A task whose very first slice fails device selection: nothing of its own
+// was ever queued into slices_to_post, so before the abort the task's
+// accounting is entirely empty (slice_count == 0). The abort path must
+// count and fail that first slice like any other, leaving the task with
+// one counted, terminal slice and an immediately queryable FAILED --
+// under USE_EVENT_DRIVEN_COMPLETION this is also what lets the failing
+// slice's markFailed() drive the task's completion bookkeeping, since
+// there is no other slice to do it.
+TEST_F(SubmitTransferTaskTest, FirstSliceDeviceSelectionFailureFailsTask) {
+    Transport::BatchDesc batch;
+    batch.batch_size = 1;
+    batch.task_list.resize(1);
+    auto &task = batch.task_list[0];
+    // See submitFailingTask() for why batch_id must be valid here.
+    task.batch_id = reinterpret_cast<Transport::BatchID>(&batch);
+
+    // Entirely outside the registered buffer: the first (and only) slice
+    // fails every device-selection retry.
+    Transport::TransferRequest req;
+    req.opcode = Transport::TransferRequest::WRITE;
+    req.source = reinterpret_cast<void *>(kBufferAddr + 2 * block_size_);
+    req.length = block_size_;
+    req.target_id = LOCAL_SEGMENT_ID;
+    req.target_offset = 0;
+    task.request = &req;
+
+    auto status = transport_->submitTransferTask({&task});
+    EXPECT_FALSE(status.ok());
+    EXPECT_TRUE(status.IsAddressNotRegistered());
+
+    // Nothing was ever queued, so nothing was flushed.
+    EXPECT_EQ(context_->posted_, 0u);
+    ASSERT_EQ(task.slice_list.size(), 1u);
+    EXPECT_EQ(task.slice_list[0]->status, Transport::Slice::FAILED);
+    EXPECT_EQ(task.slice_count, 1u);
+    EXPECT_EQ(task.failed_slice_count, 1u);
+    EXPECT_EQ(task.success_slice_count, 0u);
+    EXPECT_TRUE(task.submit_failed);
+
+    Transport::TransferStatus ts;
+    auto batch_id = reinterpret_cast<Transport::BatchID>(&batch);
+    ASSERT_TRUE(transport_->getTransferStatus(batch_id, 0, ts).ok());
+    EXPECT_EQ(ts.s, Transport::TransferStatusEnum::FAILED);
+    EXPECT_EQ(ts.transferred_bytes, 0u);
+    EXPECT_TRUE(task.is_finished);
+}
+
+// A task after the failing one in the same call is never processed: its
+// slice_count stays 0, which the slice counters alone would misreport as
+// COMPLETED. submit_failed must mark it FAILED so the caller knows to
+// resubmit it.
+TEST_F(SubmitTransferTaskTest,
+       SiblingTaskAfterFailureIsReportedFailedNotSilentlyCompleted) {
+    Transport::BatchDesc batch;
+    batch.batch_size = 2;
+    batch.task_list.resize(2);
+    // See submitFailingTask() for why batch_id must be valid here.
+    for (auto &task : batch.task_list)
+        task.batch_id = reinterpret_cast<Transport::BatchID>(&batch);
+
+    Transport::TransferRequest req1;
+    req1.opcode = Transport::TransferRequest::WRITE;
+    req1.source = reinterpret_cast<void *>(kBufferAddr);
+    req1.length = 2 * block_size_;  // triggers !found_device on its 2nd slice
+    req1.target_id = LOCAL_SEGMENT_ID;
+    req1.target_offset = 0;
+    batch.task_list[0].request = &req1;
+
+    // On its own this would be a perfectly valid, fully in-buffer request.
+    // It never gets a chance to run in this call because task 0 fails first.
+    Transport::TransferRequest req2;
+    req2.opcode = Transport::TransferRequest::WRITE;
+    req2.source = reinterpret_cast<void *>(kBufferAddr);
+    req2.length = block_size_;
+    req2.target_id = LOCAL_SEGMENT_ID;
+    req2.target_offset = 0;
+    batch.task_list[1].request = &req2;
+
+    auto status = transport_->submitTransferTask(
+        {&batch.task_list[0], &batch.task_list[1]});
+    EXPECT_FALSE(status.ok());
+    EXPECT_TRUE(status.IsAddressNotRegistered());
+
+    auto &task2 = batch.task_list[1];
+    EXPECT_TRUE(task2.slice_list.empty());
+    EXPECT_EQ(task2.slice_count, 0u);
+    EXPECT_TRUE(task2.submit_failed);
+
+    Transport::TransferStatus ts;
+    auto batch_id = reinterpret_cast<Transport::BatchID>(&batch);
+    auto get_ret = transport_->getTransferStatus(batch_id, 1, ts);
+    ASSERT_TRUE(get_ret.ok());
+    EXPECT_EQ(ts.s, Transport::TransferStatusEnum::FAILED)
+        << "task2 was never attempted in this call; without submit_failed, "
+           "slice_count == 0 trivially satisfies success_slice_count + "
+           "failed_slice_count == slice_count and this would be "
+           "misreported as COMPLETED";
+    EXPECT_TRUE(task2.is_finished);
+
+    // The batch-vector overload must agree for both tasks: task 0 (the one
+    // that actually hit !found_device) and task 1 (the untouched sibling).
+    std::vector<Transport::TransferStatus> batch_status;
+    auto batch_get_ret = transport_->getTransferStatus(batch_id, batch_status);
+    ASSERT_TRUE(batch_get_ret.ok());
+    ASSERT_EQ(batch_status.size(), 2u);
+    EXPECT_EQ(batch_status[0].s, Transport::TransferStatusEnum::FAILED);
+    EXPECT_EQ(batch_status[1].s, Transport::TransferStatusEnum::FAILED);
+}
+
+// Mixed-outcome batch in one live submitTransferTask() call: task1 (fully
+// in-buffer) is queued, kept by failQueuedSlicesForTask() when task2 fails
+// on its second slice, flushed to the FakeCompletionContext and completed;
+// task3 is never reached. getTransferStatus() must report COMPLETED /
+// FAILED / FAILED, with task1 untouched by the siblings' failure.
+TEST_F(SubmitTransferTaskTest, MixedBatchReportsPerTaskStatusAfterFailure) {
+    Transport::BatchDesc batch;
+    batch.batch_size = 3;
+    batch.task_list.resize(3);
+    // See submitFailingTask() for why batch_id must be valid here.
+    for (auto &task : batch.task_list)
+        task.batch_id = reinterpret_cast<Transport::BatchID>(&batch);
+    auto &task1 = batch.task_list[0];
+    auto &task2 = batch.task_list[1];
+    auto &task3 = batch.task_list[2];
+
+    Transport::TransferRequest req1;
+    req1.opcode = Transport::TransferRequest::WRITE;
+    req1.source = reinterpret_cast<void *>(kBufferAddr);
+    req1.length = block_size_;  // fully in-buffer: succeeds
+    req1.target_id = LOCAL_SEGMENT_ID;
+    req1.target_offset = 0;
+    task1.request = &req1;
+    Transport::TransferRequest req2 = req1;
+    req2.length = 2 * block_size_;  // fails on its second slice
+    task2.request = &req2;
+    Transport::TransferRequest req3 = req1;  // valid, but never reached
+    task3.request = &req3;
+
+    auto status = transport_->submitTransferTask({&task1, &task2, &task3});
+    EXPECT_TRUE(status.IsAddressNotRegistered());
+
+    // task1's queued slice was kept and flushed to the fake context, not
+    // fast-failed alongside task2's.
+    EXPECT_EQ(context_->posted_, 1u);
+    ASSERT_EQ(task1.slice_list.size(), 1u);
+    EXPECT_EQ(task1.slice_list[0]->status, Transport::Slice::SUCCESS);
+    EXPECT_FALSE(task1.submit_failed);
+
+    ASSERT_EQ(task2.slice_list.size(), 2u);
+    EXPECT_EQ(task2.slice_list[0]->status, Transport::Slice::FAILED);
+    EXPECT_EQ(task2.slice_list[1]->status, Transport::Slice::FAILED);
+    EXPECT_TRUE(task2.submit_failed);
+    EXPECT_TRUE(task3.slice_list.empty());
+    EXPECT_TRUE(task3.submit_failed);
+
+    auto batch_id = reinterpret_cast<Transport::BatchID>(&batch);
+    std::vector<Transport::TransferStatus> batch_status;
+    ASSERT_TRUE(transport_->getTransferStatus(batch_id, batch_status).ok());
+    ASSERT_EQ(batch_status.size(), 3u);
+    EXPECT_EQ(batch_status[0].s, Transport::TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(batch_status[0].transferred_bytes, block_size_);
+    EXPECT_EQ(batch_status[1].s, Transport::TransferStatusEnum::FAILED);
+    EXPECT_EQ(batch_status[2].s, Transport::TransferStatusEnum::FAILED);
+    EXPECT_TRUE(task1.is_finished);
+
+    Transport::TransferStatus ts;
+    ASSERT_TRUE(transport_->getTransferStatus(batch_id, 0, ts).ok());
+    EXPECT_EQ(ts.s, Transport::TransferStatusEnum::COMPLETED);
+    ASSERT_TRUE(transport_->getTransferStatus(batch_id, 1, ts).ok());
+    EXPECT_EQ(ts.s, Transport::TransferStatusEnum::FAILED);
+    ASSERT_TRUE(transport_->getTransferStatus(batch_id, 2, ts).ok());
+    EXPECT_EQ(ts.s, Transport::TransferStatusEnum::FAILED);
+}
+
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+// Event-driven completion for the same mixed-outcome batch: a waiter
+// blocked on the batch's completion_cv must be woken by the abort path
+// itself -- no getTransferStatus() polling involved -- with every task
+// accounted for in finished_task_count: task1 via its slice's
+// markSuccess(), task2 via its slices' markFailed() (including the
+// device-selection-failed slice, counted and failed by
+// failTaskSubmission()), task3 via the sibling bookkeeping in
+// failTaskSubmission() (it has no slice to drive
+// check_batch_completion()).
+TEST_F(SubmitTransferTaskTest, EventDrivenMixedBatchNotifiesWaiter) {
+    Transport::BatchDesc batch;
+    batch.batch_size = 3;
+    batch.task_list.resize(3);
+    for (auto &task : batch.task_list)
+        task.batch_id = reinterpret_cast<Transport::BatchID>(&batch);
+    auto &task1 = batch.task_list[0];
+    auto &task2 = batch.task_list[1];
+    auto &task3 = batch.task_list[2];
+
+    Transport::TransferRequest req1;
+    req1.opcode = Transport::TransferRequest::WRITE;
+    req1.source = reinterpret_cast<void *>(kBufferAddr);
+    req1.length = block_size_;  // fully in-buffer: succeeds
+    req1.target_id = LOCAL_SEGMENT_ID;
+    req1.target_offset = 0;
+    task1.request = &req1;
+    Transport::TransferRequest req2 = req1;
+    req2.length = 2 * block_size_;  // fails on its second slice
+    task2.request = &req2;
+    Transport::TransferRequest req3 = req1;  // valid, but never reached
+    task3.request = &req3;
+
+    // Start the waiter before submitting, mirroring
+    // TransferEngineOperationState::wait_for_completion(): predicate
+    // re-checked under completion_mutex, so either notify order is safe.
+    // The 10s cap turns a missing notification into a test failure
+    // instead of a hang.
+    std::atomic<bool> woken{false};
+    std::thread waiter([&] {
+        std::unique_lock<std::mutex> lock(batch.completion_mutex);
+        woken = batch.completion_cv.wait_for(
+            lock, std::chrono::seconds(10),
+            [&] { return batch.is_finished.load(std::memory_order_relaxed); });
+    });
+
+    auto status = transport_->submitTransferTask({&task1, &task2, &task3});
+    EXPECT_TRUE(status.IsAddressNotRegistered());
+    waiter.join();
+
+    EXPECT_TRUE(woken.load()) << "waiter on completion_cv was not notified";
+    EXPECT_EQ(batch.finished_task_count.load(), 3u);
+    EXPECT_TRUE(batch.is_finished.load());
+    EXPECT_TRUE(batch.has_failure.load());
+
+    // Per-task terminal states, all driven by the event chain itself:
+    EXPECT_TRUE(task1.is_finished);
+    EXPECT_EQ(task1.completed_slice_count, 1u);
+    EXPECT_TRUE(task2.is_finished);
+    EXPECT_EQ(task2.completed_slice_count, 2u);
+    EXPECT_TRUE(task3.is_finished);
+    EXPECT_EQ(task3.completed_slice_count, 0u);
+}
+
+// Event-driven completion when the very first slice fails device
+// selection: the task's only counted slice is the one failTaskSubmission()
+// counted and failed, so its markFailed() alone must complete the task and
+// the batch -- the waiter is notified with no polling involved, and the
+// subsequent status query agrees with the event outcome.
+TEST_F(SubmitTransferTaskTest, EventDrivenFirstSliceFailureNotifiesWaiter) {
+    Transport::BatchDesc batch;
+    batch.batch_size = 1;
+    batch.task_list.resize(1);
+    auto &task = batch.task_list[0];
+    // See submitFailingTask() for why batch_id must be valid here.
+    task.batch_id = reinterpret_cast<Transport::BatchID>(&batch);
+
+    // Entirely outside the registered buffer: the first (and only) slice
+    // fails every device-selection retry.
+    Transport::TransferRequest req;
+    req.opcode = Transport::TransferRequest::WRITE;
+    req.source = reinterpret_cast<void *>(kBufferAddr + 2 * block_size_);
+    req.length = block_size_;
+    req.target_id = LOCAL_SEGMENT_ID;
+    req.target_offset = 0;
+    task.request = &req;
+
+    std::atomic<bool> woken{false};
+    std::thread waiter([&] {
+        std::unique_lock<std::mutex> lock(batch.completion_mutex);
+        woken = batch.completion_cv.wait_for(
+            lock, std::chrono::seconds(10),
+            [&] { return batch.is_finished.load(std::memory_order_relaxed); });
+    });
+
+    auto status = transport_->submitTransferTask({&task});
+    EXPECT_TRUE(status.IsAddressNotRegistered());
+    waiter.join();
+
+    EXPECT_TRUE(woken.load()) << "waiter on completion_cv was not notified";
+    EXPECT_EQ(batch.finished_task_count.load(), 1u);
+    EXPECT_TRUE(batch.is_finished.load());
+    EXPECT_TRUE(batch.has_failure.load());
+    // Set by the event chain itself, before any status poll:
+    EXPECT_TRUE(task.is_finished);
+    EXPECT_EQ(task.completed_slice_count, 1u);
+
+    Transport::TransferStatus ts;
+    auto batch_id = reinterpret_cast<Transport::BatchID>(&batch);
+    ASSERT_TRUE(transport_->getTransferStatus(batch_id, 0, ts).ok());
+    EXPECT_EQ(ts.s, Transport::TransferStatusEnum::FAILED);
+    EXPECT_EQ(ts.transferred_bytes, 0u);
+}
+#endif  // USE_EVENT_DRIVEN_COMPLETION
 
 }  // namespace
