@@ -286,10 +286,15 @@ class RealClient : public PyClient {
 
     int upsert_from(const std::string &key, void *buffer, size_t size,
                     const ReplicateConfig &config = ReplicateConfig{});
-
     std::vector<int> batch_upsert_from(
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        const ReplicateConfig &config = ReplicateConfig{});
+
+    std::vector<int> batch_upsert_from_multi_buffers(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
         const ReplicateConfig &config = ReplicateConfig{});
 
     int upsert_parts(const std::string &key,
@@ -638,10 +643,16 @@ class RealClient : public PyClient {
     tl::expected<void, ErrorCode> upsert_from_internal(
         const std::string &key, void *buffer, size_t size,
         const ReplicateConfig &config = ReplicateConfig{});
-
     std::vector<tl::expected<void, ErrorCode>> batch_upsert_from_internal(
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        const ReplicateConfig &config = ReplicateConfig{});
+
+    std::vector<tl::expected<void, ErrorCode>>
+    batch_upsert_from_multi_buffers_internal(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
         const ReplicateConfig &config = ReplicateConfig{});
 
     tl::expected<void, ErrorCode> upsert_parts_internal(
