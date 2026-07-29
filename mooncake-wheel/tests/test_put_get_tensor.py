@@ -152,7 +152,6 @@ class TestDistributedObjectStore(unittest.TestCase):
             self.assertTrue(torch.equal(self.store.get_tensor(key), tensor))
             self.store.remove(key)
 
-
     @unittest.skipUnless(cuda_available(), "CUDA is not available")
     def test_cuda_local_copy_paths(self):
         """Test CUDA source writes and CUDA destination reads."""
@@ -169,6 +168,28 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.assertTrue(torch.equal(self.store.get_tensor(put_key), tensor.cpu()))
         self.assertTrue(torch.equal(self.store.get_tensor(upsert_key), tensor.cpu()))
 
+        batch_put_keys = [f"{prefix}_batch_put_{i}" for i in range(2)]
+        batch_upsert_keys = [f"{prefix}_batch_upsert_{i}" for i in range(2)]
+        batch_tensors = [
+            torch.arange(16, dtype=torch.float32, device="cuda").reshape(4, 4),
+            torch.arange(24, dtype=torch.int64, device="cuda").reshape(2, 3, 4),
+        ]
+        self.assertEqual(
+            self.store.batch_put_tensor(batch_put_keys, batch_tensors), [0, 0]
+        )
+        self.assertEqual(
+            self.store.batch_upsert_tensor(batch_upsert_keys, batch_tensors),
+            [0, 0],
+        )
+        for key, expected_tensor in zip(batch_put_keys, batch_tensors):
+            self.assertTrue(
+                torch.equal(self.store.get_tensor(key), expected_tensor.cpu())
+            )
+        for key, expected_tensor in zip(batch_upsert_keys, batch_tensors):
+            self.assertTrue(
+                torch.equal(self.store.get_tensor(key), expected_tensor.cpu())
+            )
+
         raw = bytes(range(32))
         self.assertEqual(self.store.put(raw_key, raw), 0)
 
@@ -179,6 +200,8 @@ class TestDistributedObjectStore(unittest.TestCase):
 
         self.store.remove(put_key)
         self.store.remove(upsert_key)
+        for key in batch_put_keys + batch_upsert_keys:
+            self.store.remove(key)
         self.store.remove(raw_key)
 
     def test_put_get_tensor_with_metadata(self):
