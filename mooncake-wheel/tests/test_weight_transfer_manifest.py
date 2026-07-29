@@ -935,3 +935,691 @@ def test_placement_inventory_normalizes_equivalent_single_axis_descriptors() -> 
 def test_placement_id_must_match_canonical_logical_content() -> None:
     with pytest.raises(ValueError, match="canonical logical content"):
         placement_manifest(placement_id="opaque-placement-id")
+
+
+def test_runtime_binding_inventory_retains_owner() -> None:
+    placement = placement_manifest()
+    inventory = {
+        "model_id": MODEL_ID,
+        "revision": REVISION,
+        "placement_id": placement.placement_id,
+        "placement_digest": placement.digest,
+        "instance_id": "instance",
+        "generation": 7,
+        "lease_id": "lease-7",
+        "fragments": (
+            {
+                "placement_fragment_id": "placement-0",
+                "fragment_id": "runtime-0",
+                "address": 0x1000,
+                "nbytes": 32,
+                "worker_id": "worker-0",
+                "endpoint": "worker-0:12345",
+                "device": "cuda:0",
+                "is_contiguous": True,
+            },
+        ),
+    }
+    owner = object()
+
+    binding = RuntimeBindingManifest.from_runtime_inventory(
+        inventory,
+        owner_resolver=lambda record: owner if record["fragment_id"] else None,
+    )
+
+    assert binding.fragments[0].owner is owner
+    assert binding.fragments[0].device == "cuda:0"
+
+
+def test_runtime_binding_inventory_requires_contiguous_proof() -> None:
+    placement = placement_manifest()
+    inventory = {
+        "model_id": MODEL_ID,
+        "revision": REVISION,
+        "placement_id": placement.placement_id,
+        "placement_digest": placement.digest,
+        "instance_id": "instance",
+        "generation": 7,
+        "lease_id": "lease-7",
+        "fragments": (
+            {
+                "placement_fragment_id": "placement-0",
+                "fragment_id": "runtime-0",
+                "address": 0x1000,
+                "nbytes": 32,
+                "worker_id": "worker-0",
+                "endpoint": "worker-0:12345",
+                "device": "cuda:0",
+            },
+        ),
+    }
+
+    with pytest.raises(ValueError, match="is_contiguous"):
+        RuntimeBindingManifest.from_runtime_inventory(inventory)
+
+
+def test_runtime_binding_inventory_rejects_fragment_generation_mismatch() -> None:
+    placement = placement_manifest()
+    inventory = {
+        "model_id": MODEL_ID,
+        "revision": REVISION,
+        "placement_id": placement.placement_id,
+        "placement_digest": placement.digest,
+        "instance_id": "instance",
+        "generation": 7,
+        "lease_id": "lease-7",
+        "fragments": (
+            {
+                "placement_fragment_id": "placement-0",
+                "fragment_id": "runtime-0",
+                "address": 0x1000,
+                "nbytes": 32,
+                "worker_id": "worker-0",
+                "endpoint": "worker-0:12345",
+                "device": "cuda:0",
+                "is_contiguous": True,
+                "lease_generation": 6,
+            },
+        ),
+    }
+
+    with pytest.raises(ValueError, match="lease generation"):
+        RuntimeBindingManifest.from_runtime_inventory(inventory)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    [
+        ("is_contiguous", False, "contiguous"),
+        ("storage_offset", -1, "storage_offset"),
+        ("device", "", "device"),
+    ],
+)
+def test_runtime_binding_inventory_rejects_unsafe_views(
+    field: str, value: object, message: str
+) -> None:
+    placement = placement_manifest()
+    fragment = {
+        "placement_fragment_id": "placement-0",
+        "fragment_id": "runtime-0",
+        "address": 0x1000,
+        "nbytes": 32,
+        "worker_id": "worker-0",
+        "endpoint": "worker-0:12345",
+        "device": "cuda:0",
+        "is_contiguous": True,
+        field: value,
+    }
+    inventory = {
+        "model_id": MODEL_ID,
+        "revision": REVISION,
+        "placement_id": placement.placement_id,
+        "placement_digest": placement.digest,
+        "instance_id": "instance",
+        "generation": 7,
+        "lease_id": "lease-7",
+        "fragments": (fragment,),
+    }
+
+    with pytest.raises(ValueError, match=message):
+        RuntimeBindingManifest.from_runtime_inventory(inventory)
+
+
+@pytest.mark.parametrize("offset_field", ["storage_offset", "byte_offset"])
+def test_runtime_binding_inventory_requires_explicit_view_address_semantics(
+    offset_field: str,
+) -> None:
+    placement = placement_manifest()
+    fragment = {
+        "placement_fragment_id": "placement-0",
+        "fragment_id": "runtime-0",
+        "address": 0x1000,
+        "nbytes": 32,
+        "worker_id": "worker-0",
+        "endpoint": "worker-0:12345",
+        "device": "cuda:0",
+        "is_contiguous": True,
+        offset_field: 7,
+    }
+    inventory = {
+        "model_id": MODEL_ID,
+        "revision": REVISION,
+        "placement_id": placement.placement_id,
+        "placement_digest": placement.digest,
+        "instance_id": "instance",
+        "generation": 7,
+        "lease_id": "lease-7",
+        "fragments": (fragment,),
+    }
+
+    with pytest.raises(ValueError, match="address_semantics"):
+        RuntimeBindingManifest.from_runtime_inventory(inventory)
+
+    binding = RuntimeBindingManifest.from_runtime_inventory(
+        inventory,
+        address_semantics="view",
+    )
+
+    assert binding.fragments[0].address == 0x1000
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"placement_digest": ""}, "placement_digest"),
+        ({"placement_digest": "g" * 64}, "SHA-256"),
+        ({"placement_digest": "a" * 63}, "SHA-256"),
+    ],
+)
+def test_runtime_binding_requires_content_attestation(
+    overrides: dict, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        binding_manifest(**overrides)
+
+
+@pytest.mark.parametrize(
+    "overrides, message",
+    [
+        ({"model_id": "other"}, "model_id"),
+        ({"revision": "other"}, "revision"),
+        ({"placement_id": "other"}, "placement_id"),
+    ],
+)
+def test_binding_rejects_identity_mismatch(overrides: dict, message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        bind_runtime_manifest(placement_manifest(), binding_manifest(**overrides))
+
+
+def test_binding_requires_exact_fragment_set_and_size() -> None:
+    placement = placement_manifest()
+
+    with pytest.raises(ValueError, match="missing placement fragment"):
+        bind_runtime_manifest(
+            placement,
+            binding_manifest(placement=placement, fragments=()),
+        )
+    with pytest.raises(ValueError, match="unknown placement fragment"):
+        bind_runtime_manifest(
+            placement,
+            binding_manifest(
+                placement=placement,
+                fragments=(binding_fragment(placement_fragment_id="unknown"),),
+            ),
+        )
+    with pytest.raises(ValueError, match="byte size"):
+        bind_runtime_manifest(
+            placement,
+            binding_manifest(
+                placement=placement,
+                fragments=(binding_fragment(nbytes=64),),
+            ),
+        )
+
+
+def test_binding_rejects_duplicate_fragment_ids() -> None:
+    fragment = binding_fragment()
+
+    with pytest.raises(ValueError, match="duplicate placement fragment"):
+        binding_manifest(fragments=(fragment, replace(fragment, fragment_id="other")))
+    with pytest.raises(ValueError, match="duplicate runtime fragment_id"):
+        binding_manifest(
+            fragments=(
+                fragment,
+                replace(
+                    fragment,
+                    placement_fragment_id="placement-other",
+                ),
+            )
+        )
+
+
+def test_binding_allows_one_rank_to_span_runtime_locations() -> None:
+    placement = placement_manifest(
+        fragments=(
+            placement_fragment(placement_fragment_id="left"),
+            placement_fragment(
+                placement_fragment_id="right",
+                global_offset=(4, 0),
+            ),
+        )
+    )
+    binding = binding_manifest(
+        placement=placement,
+        fragments=(
+            binding_fragment(placement_fragment_id="left"),
+            binding_fragment(
+                placement_fragment_id="right",
+                fragment_id="runtime-right",
+                address=0x2000,
+                worker_id="worker-1",
+                endpoint="worker-1:12345",
+            ),
+        ),
+    )
+
+    runtime = bind_runtime_manifest(placement, binding)
+
+    assert {fragment.worker_id for fragment in runtime.fragments} == {
+        "worker-0",
+        "worker-1",
+    }
+
+
+def test_binding_rejects_overlapping_runtime_ranges() -> None:
+    placement = placement_manifest(
+        tensors=(
+            descriptor(tensor_id="a.weight"),
+            descriptor(tensor_id="b.weight"),
+        ),
+        fragments=(
+            placement_fragment(
+                placement_fragment_id="a",
+                tensor_id="a.weight",
+                rank=ParallelRank(tp=0),
+            ),
+            placement_fragment(
+                placement_fragment_id="b",
+                tensor_id="b.weight",
+                rank=ParallelRank(tp=1),
+            ),
+        ),
+    )
+    binding = binding_manifest(
+        placement=placement,
+        fragments=(
+            binding_fragment(placement_fragment_id="a", fragment_id="runtime-a"),
+            binding_fragment(
+                placement_fragment_id="b",
+                fragment_id="runtime-b",
+                endpoint="worker-0:54321",
+            ),
+        ),
+    )
+
+    with pytest.raises(ValueError, match="address ranges overlap"):
+        bind_runtime_manifest(placement, binding)
+
+
+def test_binding_preserves_logical_and_physical_halves() -> None:
+    placement = placement_manifest()
+    binding = binding_manifest(placement=placement)
+
+    runtime = bind_runtime_manifest(placement, binding)
+
+    assert runtime.model_id == placement.model_id
+    assert runtime.revision == placement.revision
+    assert runtime.placement_id == placement.placement_id
+    assert runtime.instance_id == binding.instance_id
+    assert runtime.generation == binding.generation
+    assert runtime.lease_id == binding.lease_id
+    assert runtime.fragments[0].global_offset == placement.fragments[0].global_offset
+    assert runtime.fragments[0].address == binding.fragments[0].address
+    assert runtime.fragments[0].placement_fragment_id == "placement-0"
+
+
+def test_binding_order_does_not_change_runtime_manifest() -> None:
+    tensors = (
+        descriptor(tensor_id="a.weight"),
+        descriptor(tensor_id="b.weight"),
+    )
+    fragments = (
+        placement_fragment(
+            placement_fragment_id="a",
+            tensor_id="a.weight",
+            rank=ParallelRank(tp=0),
+        ),
+        placement_fragment(
+            placement_fragment_id="b",
+            tensor_id="b.weight",
+            rank=ParallelRank(tp=1),
+        ),
+    )
+    placement = placement_manifest(tensors=tensors, fragments=fragments)
+    bindings = (
+        binding_fragment(
+            placement_fragment_id="a",
+            fragment_id="runtime-a",
+            address=0x1000,
+        ),
+        binding_fragment(
+            placement_fragment_id="b",
+            fragment_id="runtime-b",
+            address=0x2000,
+        ),
+    )
+
+    first = bind_runtime_manifest(
+        placement,
+        binding_manifest(placement=placement, fragments=bindings),
+    )
+    second = bind_runtime_manifest(
+        placement,
+        binding_manifest(
+            placement=placement,
+            fragments=tuple(reversed(bindings)),
+        ),
+    )
+
+    assert first == second
+
+
+def test_empty_placement_binds_to_generation_scoped_empty_runtime() -> None:
+    placement = placement_manifest(tensors=(), fragments=())
+    binding = binding_manifest(
+        placement=placement,
+        fragments=(),
+        generation=11,
+        lease_id="lease-11",
+    )
+
+    runtime = bind_runtime_manifest(placement, binding)
+
+    assert runtime.fragments == ()
+    assert runtime.generation == 11
+    assert runtime.lease_id == "lease-11"
+
+
+def test_runtime_projection_round_trip_supports_rebinding() -> None:
+    owner = object()
+    runtime = RuntimeManifest(
+        model_id=MODEL_ID,
+        revision=REVISION,
+        instance_id="instance",
+        generation=7,
+        lease_id="lease-7",
+        tensors=(descriptor(),),
+        fragments=(runtime_fragment(owner=owner),),
+    )
+
+    placement = placement_manifest_from_runtime_manifest(runtime)
+    binding = runtime_binding_from_runtime_manifest(runtime)
+    rebound = bind_runtime_manifest(
+        placement,
+        replace(
+            binding,
+            instance_id="instance-2",
+            generation=8,
+            lease_id="lease-8",
+            fragments=(
+                replace(
+                    binding.fragments[0],
+                    address=0x2000,
+                    worker_id="worker-2",
+                    endpoint="worker-2:12345",
+                ),
+            ),
+        ),
+    )
+
+    assert binding.fragments[0].owner is owner
+    assert rebound.fragments[0].owner is owner
+    assert rebound.fragments[0].address == 0x2000
+    assert rebound.generation == 8
+    assert placement.digest == placement_manifest_from_runtime_manifest(rebound).digest
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda placement: replace(
+            placement,
+            fragments=(replace(placement.fragments[0], global_offset=(4, 0)),),
+        ),
+        lambda placement: replace(
+            placement,
+            fragments=(replace(placement.fragments[0], rank=ParallelRank(tp=1)),),
+        ),
+        lambda placement: replace(
+            placement,
+            fragments=(
+                replace(
+                    placement.fragments[0],
+                    aliases=("alias-a", "alias-b"),
+                ),
+            ),
+        ),
+        lambda placement: replace(
+            placement,
+            tensors=(replace(placement.tensors[0], dtype="float16"),),
+        ),
+        lambda placement: replace(
+            placement,
+            tensors=(
+                replace(
+                    placement.tensors[0],
+                    layout_fingerprint="test:qwen:packed:v2",
+                ),
+            ),
+        ),
+        lambda placement: replace(
+            placement,
+            tensors=(
+                replace(
+                    placement.tensors[0],
+                    partition_dim=None,
+                    shard_dims=(0, 1),
+                ),
+            ),
+            fragments=(
+                replace(
+                    placement.fragments[0],
+                    local_shape=(8, 2),
+                ),
+            ),
+        ),
+    ],
+)
+def test_placement_identity_attests_exact_logical_content(mutate) -> None:
+    placement = placement_manifest()
+
+    with pytest.raises(ValueError, match="canonical logical content"):
+        mutate(placement)
+
+
+def test_projection_identity_is_stable_across_runtime_restarts() -> None:
+    first = RuntimeManifest(
+        model_id=MODEL_ID,
+        revision=REVISION,
+        instance_id="instance-a",
+        generation=7,
+        lease_id="lease-7",
+        tensors=(descriptor(),),
+        fragments=(runtime_fragment(fragment_id="runtime-a"),),
+    )
+    second = replace(
+        first,
+        instance_id="instance-b",
+        generation=8,
+        lease_id="lease-8",
+        fragments=(
+            replace(
+                first.fragments[0],
+                fragment_id="runtime-b",
+                address=0x2000,
+                worker_id="worker-b",
+                endpoint="worker-b:12345",
+                lease_generation=8,
+            ),
+        ),
+    )
+
+    first_placement = placement_manifest_from_runtime_manifest(first)
+    second_placement = placement_manifest_from_runtime_manifest(second)
+
+    assert first_placement.placement_id == second_placement.placement_id
+    assert first_placement.digest == second_placement.digest
+    assert (
+        first_placement.fragments[0].placement_fragment_id
+        == second_placement.fragments[0].placement_fragment_id
+    )
+
+
+def test_projection_identity_normalizes_single_axis_shard_representations() -> None:
+    partitioned = RuntimeManifest(
+        model_id=MODEL_ID,
+        revision=REVISION,
+        instance_id="instance",
+        generation=7,
+        lease_id="lease-7",
+        tensors=(descriptor(shard_dims=None),),
+        fragments=(runtime_fragment(),),
+    )
+    nd_runtime = replace(
+        partitioned,
+        tensors=(descriptor(shard_dims=(0,)),),
+    )
+
+    partitioned_placement = placement_manifest_from_runtime_manifest(partitioned)
+    nd_placement = placement_manifest_from_runtime_manifest(nd_runtime)
+
+    assert partitioned_placement.placement_id == nd_placement.placement_id
+    assert partitioned_placement.digest == nd_placement.digest
+
+
+def test_runtime_projection_requires_lease_and_known_generation() -> None:
+    without_lease = RuntimeManifest(
+        model_id=MODEL_ID,
+        revision=REVISION,
+        instance_id="instance",
+        generation=7,
+        tensors=(descriptor(),),
+        fragments=(runtime_fragment(),),
+    )
+    without_generation = RuntimeManifest(
+        model_id=MODEL_ID,
+        revision=REVISION,
+        instance_id="instance",
+        lease_id="lease",
+        tensors=(),
+        fragments=(),
+    )
+
+    with pytest.raises(ValueError, match="lease_id"):
+        runtime_binding_from_runtime_manifest(without_lease)
+    with pytest.raises(ValueError, match="generation"):
+        runtime_binding_from_runtime_manifest(without_generation)
+
+
+@pytest.mark.parametrize(
+    "project",
+    [
+        placement_manifest_from_runtime_manifest,
+        runtime_binding_from_runtime_manifest,
+    ],
+)
+def test_runtime_projection_rejects_explicit_empty_placement_id(project) -> None:
+    runtime = RuntimeManifest(
+        model_id=MODEL_ID,
+        revision=REVISION,
+        instance_id="instance",
+        generation=7,
+        lease_id="lease-7",
+        tensors=(descriptor(),),
+        fragments=(runtime_fragment(),),
+    )
+
+    with pytest.raises(ValueError, match="placement_id"):
+        project(runtime, placement_id="")
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: ParallelRank(dp=True),
+        lambda: runtime_fragment(address=4096.0),
+        lambda: runtime_fragment(lease_generation=False),
+        lambda: binding_fragment(nbytes=32.0),
+        lambda: binding_manifest(generation=True),
+    ],
+)
+def test_contract_rejects_bool_and_float_integer_fields(factory) -> None:
+    with pytest.raises(ValueError, match="integer"):
+        factory()
+
+
+@pytest.mark.parametrize(
+    ("factory", "message"),
+    [
+        (lambda: placement_manifest(tensors=(object(),)), "tensors"),
+        (lambda: placement_manifest(fragments=(object(),)), "fragments"),
+        (lambda: binding_manifest(fragments=(object(),)), "fragments"),
+        (
+            lambda: RuntimeManifest(
+                model_id=MODEL_ID,
+                revision=REVISION,
+                instance_id="instance",
+                tensors=(object(),),
+                fragments=(),
+            ),
+            "tensors",
+        ),
+    ],
+)
+def test_manifest_collections_reject_wrong_element_types(factory, message: str) -> None:
+    with pytest.raises(ValueError, match=message):
+        factory()
+
+
+@pytest.mark.parametrize(
+    ("factory", "message"),
+    [
+        (lambda: placement_manifest(tensors=None), "tensors"),
+        (lambda: placement_manifest(fragments=None), "fragments"),
+        (lambda: binding_manifest(fragments=None), "fragments"),
+        (
+            lambda: RuntimeManifest(
+                model_id=MODEL_ID,
+                revision=REVISION,
+                instance_id="instance",
+                tensors=None,
+                fragments=(),
+            ),
+            "tensors",
+        ),
+        (
+            lambda: RuntimeManifest(
+                model_id=MODEL_ID,
+                revision=REVISION,
+                instance_id="instance",
+                tensors=(),
+                fragments=None,
+            ),
+            "fragments",
+        ),
+    ],
+)
+def test_manifest_collections_reject_wrong_container_types(
+    factory, message: str
+) -> None:
+    with pytest.raises(ValueError, match=message):
+        factory()
+
+
+@pytest.mark.parametrize(
+    "factory",
+    [
+        lambda: runtime_fragment(address=2**64),
+        lambda: runtime_fragment(address=2**64 - 16, nbytes=32),
+        lambda: runtime_fragment(nbytes=2**64),
+        lambda: binding_fragment(address=2**64),
+        lambda: binding_fragment(address=2**64 - 16, nbytes=32),
+        lambda: binding_manifest(generation=2**64),
+    ],
+)
+def test_physical_contract_rejects_values_outside_u64_abi(factory) -> None:
+    with pytest.raises(ValueError, match="64-bit"):
+        factory()
+
+
+def test_physical_contract_rejects_unrepresentable_exclusive_end() -> None:
+    with pytest.raises(ValueError, match="64-bit"):
+        runtime_fragment(address=2**64 - 4, nbytes=4)
+
+
+def test_inventory_missing_required_field_is_a_contract_error() -> None:
+    inventory = runtime_inventory()
+    del inventory["model_id"]
+
+    with pytest.raises(ValueError, match="missing required field: model_id"):
+        RuntimeManifest.from_runtime_inventory(inventory)
