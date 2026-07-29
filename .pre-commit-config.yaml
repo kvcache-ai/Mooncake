@@ -9,6 +9,9 @@ minimum_pre_commit_version: '3.6.0'
 ci:
   autofix_prs: true
   autoupdate_commit_msg: 'chore: pre-commit autoupdate'
+  # Needs Cargo + libclang, which the hosted pre-commit.ci image lacks;
+  # GitHub Actions is the authoritative check for this hook.
+  skip: [store-rust-dlopen-bindings]
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -32,6 +35,15 @@ repos:
         pass_filenames: false
         always_run: true
         require_serial: true
+      # Regenerate the committed dlopen bindings when store_c.h or the generator
+      # inputs change; a resulting diff fails the commit so they can't go stale.
+      - id: store-rust-dlopen-bindings
+        name: Regenerate Mooncake Store Rust dlopen bindings
+        entry: cargo run --locked --manifest-path mooncake-store/rust/Cargo.toml --example generate_dlopen_bindings
+        language: system
+        pass_filenames: false
+        require_serial: true
+        files: '^(mooncake-store/include/store_c\.h|mooncake-store/rust/(Cargo\.(toml|lock)|examples/generate_dlopen_bindings\.rs|src/generated/ffi_dlopen_bindings\.rs))$'
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.6.9

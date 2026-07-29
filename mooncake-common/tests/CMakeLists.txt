@@ -10,3 +10,13 @@ add_executable(crc_checksum_test crc_checksum_test.cpp)
 target_link_libraries(crc_checksum_test PUBLIC mooncake_common gtest gtest_main
                                                pthread)
 add_test(NAME crc_checksum_test COMMAND crc_checksum_test)
+
+add_executable(rpc_client_io_threads_test rpc_client_io_threads_test.cpp)
+target_link_libraries(rpc_client_io_threads_test PUBLIC mooncake_common gtest
+                                                        pthread)
+add_test(NAME rpc_client_io_threads_test COMMAND rpc_client_io_threads_test)
+
+add_executable(rpc_client_io_context_test rpc_client_io_context_test.cpp)
+target_link_libraries(rpc_client_io_context_test PUBLIC mooncake_common gtest
+                                                        ibverbs pthread)
+add_test(NAME rpc_client_io_context_test COMMAND rpc_client_io_context_test)

@@ -452,6 +452,14 @@ class SegmentManager {
         : memory_allocator_(memory_allocator), enable_cxl_(enable_cxl) {}
 
     /**
+     * @brief Destructor. Releases the capacity metric contribution of
+     *        segments that are still mounted, since MasterMetricManager
+     *        outlives MasterService instances (e.g. across HA leadership
+     *        changes).
+     */
+    ~SegmentManager();
+
+    /**
      * @brief Get RAII-style access to segment management operations
      * @return ScopedSegmentAccess object that holds the lock
      */

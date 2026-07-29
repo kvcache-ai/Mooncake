@@ -17,15 +17,19 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
 #include <sys/time.h>
+#include <unistd.h>
 
 #include <chrono>
 #include <cstdlib>
 #include <thread>
 
+#include "common.h"
 #include "config.h"
-#include "transport/transport.h"
 #include "transfer_metadata_plugin.h"
+#include "transport/transport.h"
 
 using namespace mooncake;
 
@@ -109,6 +113,75 @@ TEST_F(TransferMetadataTest, LocalMemoryBufferTest) {
     }
     re = metadata_client->removeLocalSegment("test_local_segment");
     ASSERT_EQ(re, 0);
+}
+
+TEST_F(TransferMetadataTest, NcclMetadataAndHandshakePayloadRoundTrip) {
+    TransferMetadata server(P2PHANDSHAKE);
+    int sockfd = -1;
+    const uint16_t port = findAvailableTcpPort(sockfd);
+    ASSERT_NE(port, 0);
+    const std::string host = globalConfig().use_ipv6 ? "::1" : "127.0.0.1";
+
+    auto server_segment = std::make_shared<TransferMetadata::SegmentDesc>();
+    server_segment->name = maybeWrapIpV6(host) + ":" + std::to_string(port);
+    server_segment->protocol = "nccl";
+    TransferMetadata::BufferDesc server_buffer;
+    server_buffer.name = "cuda:2";
+    server_buffer.addr = 0x10000;
+    server_buffer.length = 4096;
+    server_buffer.device_id = 2;
+    server_segment->buffers.push_back(server_buffer);
+    const std::string server_name = server_segment->name;
+    TransferMetadata::BufferDesc server_buffer_2;
+    server_buffer_2.name = "cuda:2-aux";
+    server_buffer_2.addr = 0x08000;
+    server_buffer_2.length = 8192;
+    server_buffer_2.device_id = 2;
+    server_segment->buffers.push_back(server_buffer_2);
+    ASSERT_EQ(server.addLocalSegment(LOCAL_SEGMENT_ID, server_name,
+                                     std::move(server_segment)),
+              0);
+
+    TransferMetadata::RpcMetaDesc rpc{};
+    rpc.ip_or_host_name = host;
+    rpc.rpc_port = port;
+    rpc.sockfd = sockfd;
+    ASSERT_EQ(server.addRpcMetaEntry("nccl-metadata-test", rpc), 0);
+    ASSERT_EQ(server.startHandshakeDaemon(
+                  [](const TransferMetadata::HandShakeDesc& peer,
+                     TransferMetadata::HandShakeDesc& local) {
+                      local.payload = "reply:" + peer.payload;
+                      return 0;
+                  },
+                  port, sockfd),
+              0);
+
+    TransferMetadata client(P2PHANDSHAKE);
+    auto client_segment = std::make_shared<TransferMetadata::SegmentDesc>();
+    client_segment->name = "client";
+    client_segment->protocol = "nccl";
+    ASSERT_EQ(client.addLocalSegment(LOCAL_SEGMENT_ID, "client",
+                                     std::move(client_segment)),
+              0);
+
+    auto peer_segment = client.getSegmentDesc(server_name);
+    ASSERT_NE(peer_segment, nullptr);
+    ASSERT_EQ(peer_segment->protocol, "nccl");
+    ASSERT_EQ(peer_segment->buffers.size(), 2U);
+    EXPECT_EQ(peer_segment->buffers[0].name, "cuda:2");
+    EXPECT_EQ(peer_segment->buffers[0].addr, 0x10000U);
+    EXPECT_EQ(peer_segment->buffers[0].length, 4096U);
+    EXPECT_EQ(peer_segment->buffers[0].device_id, 2);
+    EXPECT_EQ(peer_segment->buffers[1].name, "cuda:2-aux");
+    EXPECT_EQ(peer_segment->buffers[1].addr, 0x08000U);
+    EXPECT_EQ(peer_segment->buffers[1].length, 8192U);
+    EXPECT_EQ(peer_segment->buffers[1].device_id, 2);
+
+    TransferMetadata::HandShakeDesc request;
+    request.payload = "bootstrap";
+    TransferMetadata::HandShakeDesc response;
+    ASSERT_EQ(client.sendHandshake(server_name, request, response), 0);
+    EXPECT_EQ(response.payload, "reply:bootstrap");
 }
 
 // add, get and remove RPCMetaEntryMeta
@@ -231,6 +304,122 @@ TEST(TransferMetadataPollingTest, PollingRefreshesCachedRemoteSegmentDesc) {
     }
 
     FAIL() << "TE metadata refresh polling did not refresh cached descriptor";
+}
+
+TEST(HandshakeFrameTest, ValidFrameRoundTrips) {
+    int fds[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+
+    ASSERT_EQ(writeString(fds[0], HandShakeRequestType::Metadata,
+                          "{\"name\":\"segment\"}"),
+              0);
+    auto [type, payload] = readString(fds[1]);
+    EXPECT_EQ(type, HandShakeRequestType::Metadata);
+    EXPECT_EQ(payload, "{\"name\":\"segment\"}");
+
+    close(fds[0]);
+    close(fds[1]);
+}
+
+TEST(HandshakeFrameTest, ValidTypedFrameWithTlsLikeNativeEndianLength) {
+    int fds[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+
+    // 790 is encoded as 0x16 0x03 0x00 ... on little-endian machines, which
+    // collides with the first two bytes of a TLS ClientHello record. It is
+    // still a valid native-endian handshake frame length.
+    const std::string payload(789, 'x');
+    ASSERT_EQ(writeString(fds[0], HandShakeRequestType::Metadata, payload), 0);
+
+    auto [type, read_payload] = readString(fds[1]);
+    EXPECT_EQ(type, HandShakeRequestType::Metadata);
+    EXPECT_EQ(read_payload, payload);
+
+    close(fds[0]);
+    close(fds[1]);
+}
+
+TEST(HandshakeFrameTest, OldProtocolFrameStillWorks) {
+    int fds[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+
+    const std::string old_payload = "{\"name\":\"segment\"}";
+    uint64_t old_length = old_payload.size();
+    ASSERT_EQ(writeFully(fds[0], &old_length, sizeof(old_length)),
+              static_cast<ssize_t>(sizeof(old_length)));
+    ASSERT_EQ(writeFully(fds[0], old_payload.data(), old_payload.size()),
+              static_cast<ssize_t>(old_payload.size()));
+
+    auto [type, payload] = readString(fds[1]);
+    EXPECT_EQ(type, HandShakeRequestType::OldProtocol);
+    EXPECT_EQ(payload, old_payload);
+
+    close(fds[0]);
+    close(fds[1]);
+}
+
+TEST(HandshakeFrameTest, RejectsHttpProbe) {
+    int fds[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+
+    const std::string request = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    ASSERT_EQ(writeFully(fds[0], request.data(), request.size()),
+              static_cast<ssize_t>(request.size()));
+
+    auto [type, payload] = readString(fds[1]);
+    EXPECT_EQ(type, HandShakeRequestType::Invalid);
+    EXPECT_TRUE(payload.empty());
+
+    close(fds[0]);
+    close(fds[1]);
+}
+
+TEST(HandshakeFrameTest, RejectsTlsProbe) {
+    int fds[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+
+    const uint8_t client_hello_prefix[] = {0x16, 0x03, 0x01, 0x05,
+                                           0xc2, 0x01, 0x00, 0x05};
+
+    ASSERT_EQ(
+        writeFully(fds[0], client_hello_prefix, sizeof(client_hello_prefix)),
+        static_cast<ssize_t>(sizeof(client_hello_prefix)));
+
+    auto [read_type, payload] = readString(fds[1]);
+    EXPECT_EQ(read_type, HandShakeRequestType::Invalid);
+    EXPECT_TRUE(payload.empty());
+
+    close(fds[0]);
+    close(fds[1]);
+}
+
+TEST(HandshakeFrameTest, RejectsInvalidLength) {
+    int fds[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+
+    const uint64_t oversized_length = kMaxHandshakeMaxLength + 1;
+    ASSERT_EQ(writeFully(fds[0], &oversized_length, sizeof(oversized_length)),
+              static_cast<ssize_t>(sizeof(oversized_length)));
+
+    auto [oversized_type, oversized_payload] = readString(fds[1]);
+    EXPECT_EQ(oversized_type, HandShakeRequestType::Invalid);
+    EXPECT_TRUE(oversized_payload.empty());
+
+    close(fds[0]);
+    close(fds[1]);
+
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+
+    const uint64_t zero_length = 0;
+    ASSERT_EQ(writeFully(fds[0], &zero_length, sizeof(zero_length)),
+              static_cast<ssize_t>(sizeof(zero_length)));
+
+    auto [zero_type, zero_payload] = readString(fds[1]);
+    EXPECT_EQ(zero_type, HandShakeRequestType::Invalid);
+    EXPECT_TRUE(zero_payload.empty());
+
+    close(fds[0]);
+    close(fds[1]);
 }
 
 }  // namespace mooncake

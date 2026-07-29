@@ -102,8 +102,23 @@ jobs:
       artifact-prefix: nightly-cuda13-x86
       version-override: ${{ needs.version-stamp.outputs.nightly_version }}
 
+  build-non-cuda-x86:
+    needs: version-stamp
+    uses: ./.github/workflows/_build-wheel.yaml
+    with:
+      runner: ubuntu-22.04
+      container: pytorch/manylinux2_28-builder:cuda12.8
+      python-versions: '["3.10", "3.12"]'
+      cuda: container
+      variant-flag: NON_CUDA_BUILD
+      cmake-args: >-
+        -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=OFF -DWITH_EP=OFF
+        -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
+      artifact-prefix: nightly-non-cuda-x86
+      version-override: ${{ needs.version-stamp.outputs.nightly_version }}
+
   publish-testpypi:
-    needs: [version-stamp, build-cuda128-x86, build-cuda128-arm64, build-cuda13-x86]
+    needs: [version-stamp, build-cuda128-x86, build-cuda128-arm64, build-cuda13-x86, build-non-cuda-x86]
     if: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.skip_publish == 'true') }}
     runs-on: ubuntu-22.04
     environment: nightly
@@ -301,7 +316,7 @@ jobs:
 
   nightly-gate:
     if: always()
-    needs: [build-cuda128-x86, build-cuda128-arm64, build-cuda13-x86, publish-testpypi, nightly-test]
+    needs: [build-cuda128-x86, build-cuda128-arm64, build-cuda13-x86, build-non-cuda-x86, publish-testpypi, nightly-test]
     runs-on: ubuntu-22.04
     steps:
       - name: Check results
@@ -310,6 +325,7 @@ jobs:
           echo "Build CUDA 12.8 x86: ${{ needs.build-cuda128-x86.result }}"
           echo "Build CUDA 12.8 arm64: ${{ needs.build-cuda128-arm64.result }}"
           echo "Build CUDA 13 x86: ${{ needs.build-cuda13-x86.result }}"
+          echo "Build non-CUDA x86: ${{ needs.build-non-cuda-x86.result }}"
           echo "Publish: ${{ needs.publish-testpypi.result }}"
           echo "Test: ${{ needs.nightly-test.result }}"
           # Fail if any build job did not succeed
@@ -323,6 +339,10 @@ jobs:
           fi
           if [ "${{ needs.build-cuda13-x86.result }}" != "success" ]; then
             echo "::error::Build CUDA 13 x86 failed!"
+            exit 1
+          fi
+          if [ "${{ needs.build-non-cuda-x86.result }}" != "success" ]; then
+            echo "::error::Build non-CUDA x86 failed!"
             exit 1
           fi
           if [ "${{ needs.nightly-test.result }}" != "success" ]; then

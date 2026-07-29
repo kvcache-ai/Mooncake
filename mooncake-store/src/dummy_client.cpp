@@ -214,16 +214,12 @@ std::vector<tl::expected<ResultType, ErrorCode>> DummyClient::invoke_batch_rpc(
 }
 
 DummyClient::DummyClient()
-    : client_id_(generate_uuid()),
+    : client_accessor_(GetStoreRpcClientIoContextPool()),
+      client_id_(generate_uuid()),
       metrics_(ClientMetric::Create(merge_labels({{"client_mode", "dummy"}}),
                                     false)) {
     // Initialize logging severity (leave as before)
     mooncake::init_ylt_log_level();
-    // Initialize client pools
-    coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config pool_conf{};
-    client_pools_ =
-        std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(
-            pool_conf);
 }
 
 DummyClient::~DummyClient() { tearDownAll(); }
@@ -258,13 +254,9 @@ ErrorCode DummyClient::connect(const std::string& server_address) {
 
     MutexLocker lock(&connect_mutex_);
     if (client_addr_param_ != server_address) {
-        // WARNING: The existing client pool cannot be erased. So if there are a
-        // lot of different addresses, there will be resource leak problems.
-        auto client_pool = client_pools_->at(server_address);
-        client_accessor_.SetClientPool(client_pool);
+        client_accessor_.GetOrCreateClientPool(server_address);
         client_addr_param_ = server_address;
     }
-    auto pool = client_accessor_.GetClientPool();
     // The client pool does not have native connection check method, so we need
     // to use custom ServiceReady API.
     auto result = invoke_rpc<&RealClient::service_ready_internal, void>();
