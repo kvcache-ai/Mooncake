@@ -66,6 +66,27 @@ __global__ void instantiateNccl(NcclOps::Context ctx, int channel, int peer,
                                 void* destination, uint32_t bytes, int lane) {
     exchange<NcclOps>(ctx, channel, peer, qps_per_rank, source, destination,
                       bytes, lane);
+
+    auto* destination_bytes = static_cast<uint8_t*>(destination);
+    mc_nccl_put_value(ctx, channel, peer, qps_per_rank,
+                      reinterpret_cast<uint8_t*>(destination_bytes), uint8_t{1},
+                      lane);
+    mc_nccl_put_value(ctx, channel, peer, qps_per_rank,
+                      reinterpret_cast<uint16_t*>(destination_bytes),
+                      uint16_t{2}, lane);
+    mc_nccl_put_value(ctx, channel, peer, qps_per_rank,
+                      reinterpret_cast<uint32_t*>(destination_bytes),
+                      uint32_t{4}, lane);
+    mc_nccl_put_value(ctx, channel, peer, qps_per_rank,
+                      reinterpret_cast<uint64_t*>(destination_bytes),
+                      uint64_t{8}, lane);
+
+    auto* signal = reinterpret_cast<uint64_t*>(destination_bytes);
+    mc_nccl_gin_signal_add(ctx, peer, channel, qps_per_rank, signal, 1, lane);
+    const uint64_t observed = mc_nccl_gin_read_signal(ctx, channel, signal);
+    mc_nccl_gin_wait_signal(ctx, channel, signal, observed, lane);
+    const int context_count = mc_nccl_gin_context_count(ctx);
+    (void)context_count;
 }
 
 __global__ void instantiateIbgda(IbgdaOps::Context ctx, int channel, int peer,

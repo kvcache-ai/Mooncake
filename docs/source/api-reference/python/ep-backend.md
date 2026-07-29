@@ -412,6 +412,69 @@ matching dispatch `handle` and pass the resulting tensor back to `combine()` wit
 Reconnects EP peers after backend membership changes. Call it after PG recovery
 updates rank activeness so EP transport metadata and QPs can be refreshed.
 
+## Experimental NCCL backend for `ElasticBuffer`
+
+`mooncake.mooncake_elastic_buffer.ElasticBuffer` keeps IPC + IBGDA as its
+default transport. Source builds with the NCCL Device API enabled can opt into
+NCCL explicitly:
+
+```bash
+cmake .. -DWITH_EP=ON -DUSE_CUDA=ON -DUSE_NCCL_DEVICE=ON \
+  -DNCCL_ROOT=/path/to/nccl
+```
+
+```python
+import torch.distributed as dist
+
+from mooncake.mooncake_elastic_buffer import ElasticBuffer
+
+# Run this program with torchrun so rank metadata is available.
+dist.init_process_group(backend="nccl")
+buffer = ElasticBuffer(
+    dist.group.WORLD,
+    num_max_tokens_per_rank=128,
+    hidden=4096,
+    num_topk=8,
+    transport="nccl",
+    explicitly_destroy=True,
+)
+
+try:
+    # Call buffer.dispatch(...) and buffer.combine(...).
+    pass
+finally:
+    # This is collective for the NCCL backend.
+    buffer.destroy()
+
+dist.destroy_process_group()
+```
+
+The initial NCCL backend has the following constraints:
+
+- It requires NCCL 2.30.4 or newer with Device API and GIN support. The NCCL
+  headers used to build Mooncake must exactly match the loaded `libnccl`.
+  Rebuild Mooncake after an NCCL upgrade. If PyTorch would load another NCCL
+  first, configure or preload the matching runtime before initializing the
+  process group.
+- Process-group ranks must form contiguous, equal-sized NCCL LSA teams. A
+  single LSA team uses the existing two-rank or eight-rank compiled kernel
+  shapes. Multi-node execution requires hybrid mode and currently supports two
+  LSA teams of four or eight GPUs (`2x4` or `2x8`).
+- Groups with more than one rank currently request GIN resources, including
+  runs whose data path remains inside one LSA team.
+- Communicator membership is fixed. Create a new `ElasticBuffer` instead of
+  calling `update_ep_member()`.
+- Every rank must call `destroy()` after quiescing its work and before the
+  process group is destroyed. Rank-local garbage collection is not a safe
+  replacement for this collective teardown.
+- Rail GIN connectivity and general non-hybrid, cross-LSA kernels are not yet
+  supported.
+- A rank-local failure before the internal status collective is established
+  (for example, mismatched configuration/runtime or failure to allocate its
+  minimal CUDA control resources) is not recoverable in place and may require
+  restarting the process group. Use identical NCCL/CUDA configuration on every
+  rank.
+
 ## Active-rank tensors: PG vs EP
 
 There are two active-rank tensors in the API surface:

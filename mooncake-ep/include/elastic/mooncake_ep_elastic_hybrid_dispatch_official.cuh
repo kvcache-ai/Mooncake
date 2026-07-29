@@ -15,10 +15,10 @@
 namespace mooncake::elastic {
 
 template <
-    bool kDoCPUSync, bool kReuseSlotIndices, int kNumSMs, int kNumNotifyWarps,
-    int kNumScaleoutWarps, int kNumForwardWarps, int kNumScaleoutRanks,
-    int kNumScaleupRanks, int kNumHiddenBytes, int kNumSFPacks,
-    int kNumMaxTokensPerRank, int kNumExperts, int kNumTopk,
+    typename Ops, bool kDoCPUSync, bool kReuseSlotIndices, int kNumSMs,
+    int kNumNotifyWarps, int kNumScaleoutWarps, int kNumForwardWarps,
+    int kNumScaleoutRanks, int kNumScaleupRanks, int kNumHiddenBytes,
+    int kNumSFPacks, int kNumMaxTokensPerRank, int kNumExperts, int kNumTopk,
     int kExpertAlignment, int kNumQPs, int64_t kNumTimeoutCycles,
     int kNumScaleupRanksPerLane = math::constexpr_ceil_div(kNumScaleupRanks,
                                                            32),
@@ -44,7 +44,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                          int* token_metadata_at_forward, const int num_tokens,
                          const int sf_token_stride, const int sf_hidden_stride,
                          // TODO(NCCL): so many params, plans to optimize?
-                         const device::CommCtx comm_ctx, void* buffer,
+                         const typename Ops::Context comm_ctx, void* buffer,
                          void* workspace, void* mapped_host_workspace,
                          const int scaleout_rank_idx,
                          const int scaleup_rank_idx) {
@@ -92,14 +92,26 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                           (kNumNotifyWarps > 0)>(
             sm_idx, (warp_idx - kNumNotifyWarps) % kNumChannelsPerSM,
             warp_idx < kNumNotifyWarps);
-    const auto gin = transport::MooncakeGin(
-        comm_ctx, qp_idx, sharing_mode, kNumQPs, scaleout_rank_idx,
-        scaleup_rank_idx, kNumScaleupRanks, kNumRanks);
+    const auto gin =
+        Ops(comm_ctx, qp_idx, sharing_mode, kNumQPs, scaleout_rank_idx,
+            scaleup_rank_idx, kNumScaleupRanks, kNumRanks);
+
+    // NCCL completion tails are GIN-only VA signals. Reset each channel/source
+    // slot on its matching context before the opening cross-rank barrier; no
+    // producer can publish the next epoch until every receiver has reset.
+    if (warp_idx >= kNumNotifyWarps &&
+        warp_idx < kNumNotifyWarps + kNumScaleoutWarps &&
+        lane_idx < kNumScaleoutRanks) {
+        const int channel_idx =
+            sm_idx * kNumChannelsPerSM + warp_idx - kNumNotifyWarps;
+        gin.template reset_completion_tail<transport::ScaleoutTeam>(channel_idx,
+                                                                    lane_idx);
+    }
 
     // Global parallel barriers for scale-out subteam and scale-up subteam
-    comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks, kNumSMs,
+    comm::gpu_barrier<Ops, true, kNumScaleoutRanks, kNumScaleupRanks, kNumSMs,
                       kNumThreads, kNumQPs, kNumTimeoutCycles,
-                      comm::kHybridDispatchTag0, false, false, true>(
+                      comm::kHybridDispatchTag0, false, Ops::kIsNccl, true>(
         gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx,
         thread_idx);
 
@@ -226,13 +238,13 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                 "kNumScaleoutRanks must be less than kNumNotifyThreads");
             if (thread_idx < kNumScaleoutRanks) {
                 const auto dst_scaleout_rank_idx = thread_idx;
-                gin.put<transport::ScaleoutTeam>(
+                gin.template put<transport::ScaleoutTeam>(
                     workspace_layout.get_scaleout_rank_count_ptr<false>(
                         scaleout_rank_idx),
                     workspace_layout.get_scaleout_rank_count_ptr<true>(
                         dst_scaleout_rank_idx),
                     kNumScaleupRanks * sizeof(int), dst_scaleout_rank_idx, 0);
-                gin.put<transport::ScaleoutTeam>(
+                gin.template put<transport::ScaleoutTeam>(
                     workspace_layout.get_scaleout_expert_count_ptr<false>(
                         scaleout_rank_idx),
                     workspace_layout.get_scaleout_expert_count_ptr<true>(
@@ -294,7 +306,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                 // Write into the remote scale-up peer
                 const int64_t counter =
                     (static_cast<int64_t>(kNumScaleupRanks) << 32ll) | count;
-                gin.put_value<transport::ScaleupTeam>(
+                gin.template put_value<transport::ScaleupTeam>(
                     workspace_layout.get_scaleup_rank_count_ptr<false>() +
                         scaleup_rank_idx,
                     counter, i);
@@ -318,7 +330,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                 const int64_t counter = (1ll << 32ll) | count;
                 const auto dst_scaleup_rank_idx = i / kNumExpertsPerRank;
                 const auto expert_idx_in_dst_rank = i % kNumExpertsPerRank;
-                gin.red_add_rel<transport::ScaleupTeam>(
+                gin.template red_add_rel<transport::ScaleupTeam>(
                     workspace_layout.get_scaleup_expert_count_ptr<false>() +
                         expert_idx_in_dst_rank,
                     counter, dst_scaleup_rank_idx);
@@ -450,8 +462,9 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                 // NOTES: the "release" scope will be `sys` for the local rank
                 // (we may involve NVLink so not `gpu`) For RDMA requests,
                 // "release" is ensured by "atomic"
-                gin.red_add_rel<transport::ScaleoutTeam>(
-                    ptr, signaled_tail - old_signaled_tail, lane_idx,
+                gin.template publish_tail<transport::ScaleoutTeam>(
+                    ptr, channel_idx, signaled_tail,
+                    signaled_tail - old_signaled_tail, lane_idx,
                     transport::kRedAddReleaseLowWordLast);
                 stored_old_scaleout_tail = stored_scaleout_tail;
             }
@@ -585,7 +598,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
             // Issue IBGDA requests
             if (stored_dst_slot_idx >= 0 and
                 stored_dst_scaleout_rank_idx != scaleout_rank_idx) {
-                gin.put<transport::ScaleoutTeam>(
+                gin.template put<transport::ScaleoutTeam>(
                     scaleout_recv_buffer.get_token_buffer(stored_dst_slot_idx)
                         .get_base_ptr(),
                     scaleout_send_buffer.get_token_buffer(token_idx)
@@ -677,9 +690,13 @@ __global__ void __launch_bounds__(kNumThreads, 1)
 
                 // Read new signaled tails
                 if (lane_idx < kNumScaleoutRanks) {
-                    const auto signaled_tail = ptx::ld_acquire_sys<int64_t>(
-                        workspace_layout.get_scaleout_channel_signaled_tail_ptr(
-                            channel_idx, lane_idx));
+                    const auto signaled_tail =
+                        gin.template read_completion_tail<
+                            transport::ScaleoutTeam>(
+                            workspace_layout
+                                .get_scaleout_channel_signaled_tail_ptr(
+                                    channel_idx, lane_idx),
+                            channel_idx, lane_idx);
                     math::unpack2<int, int64_t>(signaled_tail,
                                                 stored_finish_flag,
                                                 stored_scaleout_tail_idx);
@@ -779,7 +796,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                 // Issue TMAs
                 if (stored_dst_slot_idx >= 0) {
                     const auto dst_ptr =
-                        gin.get_sym_ptr<transport::ScaleupTeam>(
+                        gin.template get_sym_ptr<transport::ScaleupTeam>(
                             scaleup_buffer.get_token_buffer(stored_dst_slot_idx)
                                 .get_base_ptr(),
                             stored_dst_scaleup_rank_idx);
@@ -848,7 +865,8 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                 if (const auto j = i * 32 + lane_idx;
                     i < (kNumScaleupRanksPerLane - 1) or j < kNumScaleupRanks) {
                     ptx::st_relaxed_sys(
-                        gin.get_sym_ptr<transport::ScaleupTeam>(tail_ptr, j),
+                        gin.template get_sym_ptr<transport::ScaleupTeam>(
+                            tail_ptr, j),
                         transform_linked_list_idx(
                             stored_scaleup_send_counters[i]));
                 }
@@ -857,16 +875,19 @@ __global__ void __launch_bounds__(kNumThreads, 1)
         __syncwarp();
 
         // Clean tails for next usages
-        if (lane_idx < kNumScaleoutRanks)
-            *workspace_layout.get_scaleout_channel_signaled_tail_ptr(
-                channel_idx, lane_idx) = 0;
+        if (lane_idx < kNumScaleoutRanks) {
+            gin.template clear_completion_tail<transport::ScaleoutTeam>(
+                workspace_layout.get_scaleout_channel_signaled_tail_ptr(
+                    channel_idx, lane_idx),
+                channel_idx, lane_idx);
+        }
         __syncwarp();
     }
 
     // Scale-up barrier to ensure data arrival
     // As scale-out tokens have already been consumed by forwarders, no need to
     // do scale-out barrier again
-    comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks, kNumSMs,
+    comm::gpu_barrier<Ops, true, kNumScaleoutRanks, kNumScaleupRanks, kNumSMs,
                       kNumThreads, kNumQPs, kNumTimeoutCycles,
                       comm::kHybridDispatchTag1, true, true, false>(
         gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx,

@@ -45,6 +45,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument("--iters", type=int, default=20)
     parser.add_argument(
+        "--transport",
+        choices=("ibgda", "nccl"),
+        default="ibgda",
+        help="Device transport used by the ElasticBuffer kernels.",
+    )
+    parser.add_argument(
         "--route",
         choices=("alltoall", "local", "cross"),
         default="alltoall",
@@ -96,7 +102,9 @@ def make_route_plan(
     local_experts = num_experts // world_size
     if local_experts <= 0:
         raise ValueError("num_experts must be at least world_size")
-    expert_offsets = torch.arange(num_topk, device="cuda", dtype=torch.long) % local_experts
+    expert_offsets = (
+        torch.arange(num_topk, device="cuda", dtype=torch.long) % local_experts
+    )
 
     if route == "cross" and buffer.num_scaleout_ranks > 1:
         dst_scaleout = (buffer.scaleout_rank_idx + 1) % buffer.num_scaleout_ranks
@@ -116,7 +124,9 @@ def make_route_plan(
             1,
         )
 
-    dst_ranks = (rank + torch.arange(num_topk, device="cuda", dtype=torch.long)) % world_size
+    dst_ranks = (
+        rank + torch.arange(num_topk, device="cuda", dtype=torch.long)
+    ) % world_size
     choices = dst_ranks * local_experts + expert_offsets
     unique_dst_ranks = int(torch.unique(dst_ranks).numel())
     return RoutePlan(
@@ -171,6 +181,8 @@ def main() -> None:
         deterministic=False,
         allow_hybrid_mode=True,
         allow_multiple_reduction=True,
+        transport=args.transport,
+        explicitly_destroy=args.transport == "nccl",
         num_gpu_timeout_secs=10,
     )
     route_plan = make_route_plan(
@@ -182,7 +194,9 @@ def main() -> None:
         num_experts=num_experts,
         route=args.route,
     )
-    weights = torch.ones((args.num_tokens, args.num_topk), device="cuda", dtype=torch.float32)
+    weights = torch.ones(
+        (args.num_tokens, args.num_topk), device="cuda", dtype=torch.float32
+    )
 
     def run_one(iteration: int, cached_handle):
         x = make_input(rank, iteration, args.num_tokens, args.hidden)
@@ -208,7 +222,9 @@ def main() -> None:
 
         actual_recv_tokens = route_plan.expected_recv_tokens
         if args.sync_actual_count:
-            actual_recv_tokens = int(handle.psum_num_recv_tokens_per_scaleup_rank[-1].item())
+            actual_recv_tokens = int(
+                handle.psum_num_recv_tokens_per_scaleup_rank[-1].item()
+            )
             if actual_recv_tokens != route_plan.expected_recv_tokens:
                 raise AssertionError(
                     f"rank={rank}: got {actual_recv_tokens} received tokens, "
@@ -230,8 +246,12 @@ def main() -> None:
         torch.cuda.synchronize()
 
         if args.check_correctness:
-            expected = (x.float() * route_plan.expected_combine_factor).to(torch.bfloat16)
-            check_output(rank=rank, route=args.route, combined=combined, expected=expected)
+            expected = (x.float() * route_plan.expected_combine_factor).to(
+                torch.bfloat16
+            )
+            check_output(
+                rank=rank, route=args.route, combined=combined, expected=expected
+            )
 
         return (
             handle,
@@ -259,32 +279,45 @@ def main() -> None:
     dist.barrier()
     wall_seconds = time.time() - wall_start
 
-    stats = torch.tensor(
-        [
-            sum(dispatch_ms) / len(dispatch_ms),
-            sum(combine_ms) / len(combine_ms),
-            min(dispatch_ms),
-            max(dispatch_ms),
-            min(combine_ms),
-            max(combine_ms),
-            sum(recv_tokens) / len(recv_tokens),
-            wall_seconds,
-        ],
+    samples = (
+        torch.tensor(
+            [dispatch_ms, combine_ms, recv_tokens],
+            device="cuda",
+            dtype=torch.float64,
+        )
+        .transpose(0, 1)
+        .contiguous()
+    )
+    gathered = [torch.empty_like(samples) for _ in range(world_size)]
+    dist.all_gather(gathered, samples)
+
+    max_wall_seconds = torch.tensor(
+        wall_seconds,
         device="cuda",
         dtype=torch.float64,
     )
-    gathered = [torch.empty_like(stats) for _ in range(world_size)]
-    dist.all_gather(gathered, stats)
+    dist.all_reduce(max_wall_seconds, op=dist.ReduceOp.MAX)
 
     if rank == 0:
         table = torch.stack(gathered).cpu()
-        payload_bytes = table[:, 6].mean().item() * args.hidden * 2
-        dispatch_avg_ms = table[:, 0].mean().item()
-        combine_avg_ms = table[:, 1].mean().item()
+        dispatch_samples = table[:, :, 0]
+        combine_samples = table[:, :, 1]
+        e2e_samples = dispatch_samples + combine_samples
+        payload_bytes = table[:, :, 2].mean().item() * args.hidden * 2
+        dispatch_avg_ms = dispatch_samples.mean().item()
+        combine_avg_ms = combine_samples.mean().item()
+        e2e_avg_ms = e2e_samples.mean().item()
+        dispatch_critical_samples = dispatch_samples.max(dim=0).values
+        combine_critical_samples = combine_samples.max(dim=0).values
+        dispatch_critical_ms = dispatch_critical_samples.mean().item()
+        combine_critical_ms = combine_critical_samples.mean().item()
+        e2e_critical_ms = e2e_samples.max(dim=0).values.mean().item()
+        wall_ms_per_iter = max_wall_seconds.item() * 1000 / args.iters
         print(
             "MOONCAKE_ELASTIC_PERF_OK",
             f"world={world_size}",
             f"route={args.route}",
+            f"transport={args.transport}",
             f"reuse_handle={int(args.reuse_handle)}",
             f"tokens={args.num_tokens}",
             f"hidden={args.hidden}",
@@ -293,13 +326,23 @@ def main() -> None:
             f"scaleup={buffer.num_scaleup_ranks}",
             f"dispatch_avg_ms={dispatch_avg_ms:.3f}",
             f"combine_avg_ms={combine_avg_ms:.3f}",
-            f"recv_tokens_avg={table[:, 6].mean().item():.1f}",
+            f"e2e_avg_ms={e2e_avg_ms:.3f}",
+            f"dispatch_critical_ms={dispatch_critical_ms:.3f}",
+            f"combine_critical_ms={combine_critical_ms:.3f}",
+            f"e2e_critical_ms={e2e_critical_ms:.3f}",
+            f"wall_ms_per_iter={wall_ms_per_iter:.3f}",
+            f"recv_tokens_avg={table[:, :, 2].mean().item():.1f}",
             f"effective_payload_MB_per_rank={payload_bytes / 1e6:.1f}",
             f"dispatch_effective_GBps={payload_bytes / dispatch_avg_ms / 1e6:.2f}",
             f"combine_effective_GBps={payload_bytes / combine_avg_ms / 1e6:.2f}",
+            "dispatch_critical_effective_GBps="
+            f"{payload_bytes / dispatch_critical_ms / 1e6:.2f}",
+            "combine_critical_effective_GBps="
+            f"{payload_bytes / combine_critical_ms / 1e6:.2f}",
             flush=True,
         )
 
+    buffer.destroy()
     dist.destroy_process_group()
 
 

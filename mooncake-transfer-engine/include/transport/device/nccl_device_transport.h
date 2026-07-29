@@ -69,6 +69,15 @@ struct NcclTransportProperties {
     int gin_context_count = 0;
 };
 
+// Coordinates of this rank in its contiguous LSA team. Kept separate from
+// NcclTransportProperties so extending the experimental API does not change
+// the size of the existing by-value properties return type.
+struct NcclLsaTopology {
+    int rank = -1;
+    int size = 0;
+    int first_rank = -1;
+};
+
 namespace detail {
 struct NcclDeviceContextAccess;
 }  // namespace detail
@@ -132,17 +141,20 @@ class NcclTransport {
     virtual void* allocateBuffer(size_t bytes) = 0;
     virtual int freeBuffer(void* ptr) = 0;
 
-    // Collectively register a symmetric buffer. Calls must occur in the same
-    // order on every rank. Deregistration is local after all device work and
-    // remote access have completed. The registration is invalidated on
-    // successful deregistration.
+    // Collectively register a symmetric, strictly ordered NCCL window. Calls
+    // must occur in the same order on every rank. Every pointer passed to a
+    // GIN helper through the returned context must be wholly contained in this
+    // buffer. Deregistration is local after all device work and remote access
+    // have completed. The registration is invalidated on successful
+    // deregistration.
     virtual int registerBuffer(void* ptr, size_t bytes,
                                NcclBufferRegistration* registration) = 0;
     virtual int deregisterBuffer(NcclBufferRegistration* registration) = 0;
 
-    // Safe common path: every rank allocates, collectively checks that all
-    // allocations succeeded, and only then enters registration. All ranks
-    // must call this method in the same order.
+    // Coordinated common path: every rank allocates and collectively checks all
+    // allocations, zero-initializes the allocation before it can contain GIN
+    // VA signals, and only then enters registration. All ranks must call this
+    // method in the same order.
     virtual int allocateAndRegisterBuffer(
         size_t bytes, void** ptr, NcclBufferRegistration* registration) = 0;
 
@@ -155,8 +167,21 @@ class NcclTransport {
     virtual bool initialized() const = 0;
 
     // The caller must first ensure that no kernel can access the context or
-    // any registered buffer.
+    // any registered buffer, then call shutdown in coordinated order on every
+    // communicator rank. Rank-local destructor cleanup is not a substitute for
+    // coordinated NCCL communicator teardown.
     virtual int shutdown() = 0;
+
+    // Host-side collective status agreement. Every rank must call this in the
+    // same order after initialize(), while the CUDA stream and NCCL
+    // communicator remain healthy. It returns true only when local_success is
+    // true on every communicator rank. This coordinates application status; it
+    // is not recovery from a CUDA/NCCL control-path failure. Use it before any
+    // rank throws from a collectively constructed object. Kept at the end to
+    // preserve the vtable slots of the interface introduced by the initial
+    // NCCL backend.
+    virtual bool allRanksSucceeded(bool local_success) = 0;
+    virtual NcclLsaTopology lsaTopology() const = 0;
 };
 
 // Create the CUDA-only NCCL LSA/GIN device transport.
