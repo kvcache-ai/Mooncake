@@ -396,10 +396,10 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
                 master_service_.IsTenantQuotaEnabled()
                     ? std::string_view(tenant_id)
                     : TenantId::kDefaultValue,
-                [&](const TenantId& resolved_tenant_id) {
+                [&](const TenantId& resolved_tenant_id)
+                    -> tl::expected<void, ErrorCode> {
                     if (replica_ids.empty()) {
-                        return tl::expected<void, ErrorCode>(
-                            tl::unexpect, ErrorCode::INVALID_REPLICA);
+                        return tl::unexpected(ErrorCode::INVALID_REPLICA);
                     }
                     return master_service_.PutEnd(client_id, key,
                                                   resolved_tenant_id,
@@ -425,10 +425,10 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutRevoke(
                 master_service_.IsTenantQuotaEnabled()
                     ? std::string_view(tenant_id)
                     : TenantId::kDefaultValue,
-                [&](const TenantId& resolved_tenant_id) {
+                [&](const TenantId& resolved_tenant_id)
+                    -> tl::expected<void, ErrorCode> {
                     if (replica_ids.empty()) {
-                        return tl::expected<void, ErrorCode>(
-                            tl::unexpect, ErrorCode::INVALID_REPLICA);
+                        return tl::unexpected(ErrorCode::INVALID_REPLICA);
                     }
                     return master_service_.PutRevoke(client_id, key,
                                                      resolved_tenant_id,
@@ -670,10 +670,10 @@ tl::expected<void, ErrorCode> WrappedMasterService::UpsertEnd(
                 master_service_.IsTenantQuotaEnabled()
                     ? std::string_view(tenant_id)
                     : TenantId::kDefaultValue,
-                [&](const TenantId& resolved_tenant_id) {
+                [&](const TenantId& resolved_tenant_id)
+                    -> tl::expected<void, ErrorCode> {
                     if (replica_ids.empty()) {
-                        return tl::expected<void, ErrorCode>(
-                            tl::unexpect, ErrorCode::INVALID_REPLICA);
+                        return tl::unexpected(ErrorCode::INVALID_REPLICA);
                     }
                     return master_service_.UpsertEnd(client_id, key,
                                                      resolved_tenant_id,
@@ -699,10 +699,10 @@ tl::expected<void, ErrorCode> WrappedMasterService::UpsertRevoke(
                 master_service_.IsTenantQuotaEnabled()
                     ? std::string_view(tenant_id)
                     : TenantId::kDefaultValue,
-                [&](const TenantId& resolved_tenant_id) {
+                [&](const TenantId& resolved_tenant_id)
+                    -> tl::expected<void, ErrorCode> {
                     if (replica_ids.empty()) {
-                        return tl::expected<void, ErrorCode>(
-                            tl::unexpect, ErrorCode::INVALID_REPLICA);
+                        return tl::unexpected(ErrorCode::INVALID_REPLICA);
                     }
                     return master_service_.UpsertRevoke(
                         client_id, key, resolved_tenant_id, replica_type,
