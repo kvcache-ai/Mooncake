@@ -57,6 +57,25 @@ cmake --build build-ssd-delete --target \
 如果测试机的标准构建参数与上面不同，以机器上已经验证过的 Mooncake
 构建参数为准，但必须保留 `BUILD_UNIT_TESTS=ON`。
 
+上述四个定向测试不要求真实 etcd。若还要运行
+`hot_standby_service_test` 等完整 HA/standby 回归，请使用独立构建目录并开启
+Mooncake Store 的 HA etcd 支持：
+
+```bash
+cmake -S . -B build-ssd-delete-ha -G Ninja \
+  -DWITH_STORE=ON \
+  -DWITH_EP=OFF \
+  -DUSE_CUDA=OFF \
+  -DBUILD_UNIT_TESTS=ON \
+  -DBUILD_EXAMPLES=OFF \
+  -DSTORE_USE_ETCD=ON \
+  -DMOONCAKE_ENABLE_TEST_FAILPOINTS=ON
+```
+
+这里必须是 `STORE_USE_ETCD`；`USE_ETCD` 是 Transfer Engine 的独立选项，
+不能替代前者。未开启 `STORE_USE_ETCD` 时，HotStandby 的 OpLog following
+按上游设计返回 `INTERNAL_ERROR`，因此不能据此判断本特性产生了 HA 回归。
+
 ## 4. 必跑自动化测试
 
 ```bash

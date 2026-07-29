@@ -2174,10 +2174,11 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                     !fs::is_regular_file(bucket_data_status)) {
                     LOG(ERROR) << "Bucket metadata has no valid data file: "
                                << entry.path().string()
-                               << "; preserving files for operator recovery";
+                               << "; removing stale metadata";
+                    CleanupOrphanedBucket(bucket_id);
                     lru_index_.erase({0LL, bucket_id});
                     buckets_.erase(bucket_id);
-                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                    continue;
                 }
                 auto& meta = *(metadata_it->second);
                 if (meta.data_size == 0 || meta.meta_size == 0 ||
