@@ -706,13 +706,18 @@ void GdsContext::Shutdown() {
 
 // GdsContext::IsRangeCovered()
 // ===================================================================
+// Caller must hold buf_mutex_.  Updates the extent's LRU tick on hit.
 bool GdsContext::IsRangeCovered(void* ptr, size_t size) {
     auto it = registered_buffers_.upper_bound(ptr);
     if (it == registered_buffers_.begin()) return false;
     --it;
     const char* base = static_cast<const char*>(it->first);
     const char* p = static_cast<const char*>(ptr);
-    return p >= base && (p - base) + size <= it->second;
+    if (p >= base && static_cast<size_t>(p - base) + size <= it->second.size) {
+        it->second.lru_tick = ++lru_clock_;
+        return true;
+    }
+    return false;
 }
 
 // ===================================================================
@@ -720,16 +725,44 @@ bool GdsContext::IsRangeCovered(void* ptr, size_t size) {
 // ===================================================================
 bool GdsContext::RegisterAndCache(void* gpu_ptr, size_t size) {
 #ifdef USE_GDS_BACKEND
-    // Overlap protection: evict fully-contained sub-ranges before registering.
+    // Snap the registration to the whole GPU allocation containing
+    // gpu_ptr.  Request-shaped registrations churn with coalescing
+    // boundaries (same base, different size -> dereg + re-register every
+    // few requests), which fragments the nvidia-fs driver's internal
+    // BAR1 mappings over long runs.  Allocation-snapped extents are
+    // disjoint and stable, so steady-state I/O is pure cache hits.
+    // Only snap when the requested span lies fully inside the reported
+    // allocation; a coalesced span crossing allocation boundaries keeps
+    // span-shaped registration.
+    void* reg_base = gpu_ptr;
+    size_t reg_size = size;
     {
-        const char* p = static_cast<const char*>(gpu_ptr);
-        const char* p_end = p + size;
-        auto it = registered_buffers_.lower_bound(gpu_ptr);
+        void* alloc_base = nullptr;
+        size_t alloc_size = 0;
+        if (ops_->GetAddressRange(gpu_ptr, &alloc_base, &alloc_size) &&
+            alloc_size > 0 &&
+            static_cast<char*>(alloc_base) <= static_cast<char*>(gpu_ptr) &&
+            static_cast<char*>(gpu_ptr) + size <=
+                static_cast<char*>(alloc_base) + alloc_size) {
+            reg_base = alloc_base;
+            reg_size = alloc_size;
+        }
+    }
+
+    // Overlap protection: deregister ALL extents intersecting the target
+    // range before registering (left-crossing, fully-contained, AND
+    // right-crossing — the old code skipped right-crossing extents, so
+    // the subsequent BufRegister overlapped a live registration and
+    // failed, silently degrading to the bounce buffer).  With
+    // allocation snapping this only fires for span-shaped leftovers.
+    {
+        const char* p = static_cast<const char*>(reg_base);
+        const char* p_end = p + reg_size;
+        auto it = registered_buffers_.lower_bound(reg_base);
         if (it != registered_buffers_.begin()) {
             auto prev = std::prev(it);
             const char* prev_base = static_cast<const char*>(prev->first);
-            if (prev_base + prev->second > p &&
-                prev_base + prev->second <= p_end) {
+            if (prev_base + prev->second.size > p) {
                 ops_->BufDeregister(prev->first);
                 registered_buffers_.erase(prev);
             }
@@ -737,30 +770,40 @@ bool GdsContext::RegisterAndCache(void* gpu_ptr, size_t size) {
         while (it != registered_buffers_.end()) {
             const char* base = static_cast<const char*>(it->first);
             if (base >= p_end) break;
-            if (base + it->second <= p_end) {
-                ops_->BufDeregister(it->first);
-                it = registered_buffers_.erase(it);
-            } else {
-                ++it;
-            }
+            ops_->BufDeregister(it->first);
+            it = registered_buffers_.erase(it);
         }
     }
 
-    // Soft-cap eviction.  begin() is lowest address, not oldest.
+    // Soft-cap LRU eviction.  With allocation snapping the live extent
+    // count equals the number of live GPU allocations and should never
+    // reach the cap — a firing eviction means snapping is not working
+    // (e.g. GetAddressRange unsupported), so make it visible.
     while (registered_buffers_.size() >= kMaxRegisteredBuffers) {
         auto oldest = registered_buffers_.begin();
+        for (auto it = registered_buffers_.begin();
+             it != registered_buffers_.end(); ++it) {
+            if (it->second.lru_tick < oldest->second.lru_tick) oldest = it;
+        }
+        LOG_EVERY_N(WARNING, 1000)
+            << "GDS buffer registration cache full (" << kMaxRegisteredBuffers
+            << "), evicting LRU extent base=" << oldest->first
+            << " size=" << oldest->second.size
+            << " — allocation snapping may be failing";
         ops_->BufDeregister(oldest->first);
         registered_buffers_.erase(oldest);
     }
 
-    if (ops_->BufRegister(gpu_ptr, size).IsOk()) {
-        registered_buffers_[gpu_ptr] = size;
+    if (ops_->BufRegister(reg_base, reg_size).IsOk()) {
+        registered_buffers_[reg_base] =
+            RegisteredExtent{reg_size, ++lru_clock_};
         return true;
     }
 
-    VLOG(1) << "BufRegister failed for ptr=" << gpu_ptr << " size=" << size
-            << " (registered_buffers_ size=" << registered_buffers_.size()
-            << "), relying on cuFile bounce buffer";
+    LOG_EVERY_N(WARNING, 100)
+        << "GDS BufRegister failed for ptr=" << reg_base << " size=" << reg_size
+        << " (registered_buffers_ size=" << registered_buffers_.size()
+        << "), relying on cuFile bounce buffer";
     return false;
 #else
     (void)gpu_ptr;
@@ -773,14 +816,20 @@ bool GdsContext::RegisterAndCache(void* gpu_ptr, size_t size) {
 // GdsContext::EnsureBufferRegistered()
 // ===================================================================
 // Range-aware registration cache.  Lookup checks exact match, then range
-// containment (handles per-slice lookups after coalescing).
+// containment (handles per-slice lookups after coalescing).  Misses are
+// registered allocation-snapped (see RegisterAndCache).
 bool GdsContext::EnsureBufferRegistered(void* gpu_ptr, size_t size) {
 #ifdef USE_GDS_BACKEND
     MutexLocker lock(&buf_mutex_);
 
     auto it = registered_buffers_.find(gpu_ptr);
     if (it != registered_buffers_.end()) {
-        if (it->second == size) return true;
+        if (it->second.size == size) {
+            it->second.lru_tick = ++lru_clock_;
+            return true;
+        }
+        // Same base with a different size: a span-shaped leftover —
+        // replace it with an allocation-snapped registration.
         ops_->BufDeregister(gpu_ptr);
         registered_buffers_.erase(it);
         return RegisterAndCache(gpu_ptr, size);

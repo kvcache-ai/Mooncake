@@ -70,6 +70,13 @@ class GdsDeviceOps {
     virtual GdsDeviceError BufRegister(void* ptr, size_t size) = 0;
     virtual void BufDeregister(void* ptr) = 0;
 
+    // Query the GPU allocation containing `ptr`. Returns false when the
+    // pointer is not device memory or the query is unsupported (vendors
+    // other than NVIDIA may stub this to false — callers then fall back
+    // to registering the requested span instead of the whole allocation).
+    virtual bool GetAddressRange(const void* ptr, void** base,
+                                 size_t* size) = 0;
+
     // DMA I/O
     virtual ssize_t Write(GdsDeviceFileHandle fh, void* buf, size_t size,
                           off_t file_offset) = 0;

@@ -21,6 +21,9 @@ class HygonGdsDeviceOps final : public GdsDeviceOps {
         return GdsDeviceError{-1};
     }
     void BufDeregister(void*) override {}
+    bool GetAddressRange(const void*, void**, size_t*) override {
+        return false;
+    }
     ssize_t Write(GdsDeviceFileHandle, void*, size_t, off_t) override {
         return -1;
     }

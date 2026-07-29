@@ -171,4 +171,166 @@ TEST_F(GdsContextTest, WriteReadRecord_EndToEnd) {
     ctx.Shutdown();
     EXPECT_FALSE(ctx.enabled_.load());
 }
+
+#ifdef USE_GDS_BACKEND
+// ── Registration-cache tests with an in-process fake GdsDeviceOps ──
+// These exercise EnsureBufferRegistered/RegisterAndCache without GDS
+// hardware: the fake records every register/deregister call and serves
+// configurable GetAddressRange answers.
+
+class FakeGdsDeviceOps final : public GdsDeviceOps {
+   public:
+    bool ProbeDeviceNode() override { return true; }
+    GdsDeviceError DriverOpen() override { return GdsDeviceError{0, 0}; }
+    GdsDeviceError FileHandleRegister(GdsDeviceFileHandle*, int) override {
+        return GdsDeviceError{0, 0};
+    }
+    void FileHandleDeregister(GdsDeviceFileHandle) override {}
+
+    GdsDeviceError BufRegister(void* ptr, size_t size) override {
+        register_calls.emplace_back(ptr, size);
+        return GdsDeviceError{0, 0};
+    }
+    void BufDeregister(void* ptr) override { deregister_calls.push_back(ptr); }
+
+    // Configurable allocation query.  When `address_range_ok` is false
+    // the call fails and GdsContext falls back to span registration.
+    bool GetAddressRange(const void* ptr, void** base, size_t* size) override {
+        if (!address_range_ok) return false;
+        *base = alloc_base;
+        *size = alloc_size;
+        last_query_ptr = ptr;
+        return true;
+    }
+
+    ssize_t Write(GdsDeviceFileHandle, void*, size_t, off_t) override {
+        return -1;
+    }
+    ssize_t Read(GdsDeviceFileHandle, void*, size_t, off_t) override {
+        return -1;
+    }
+    void* Malloc(size_t) override { return nullptr; }
+    void Free(void*) override {}
+    void Memset(void*, int, size_t) override {}
+    void SetDevice(int) override {}
+    void DeviceSynchronize() override {}
+    int GetDevice() override { return 0; }
+    void CopyDeviceToDevice(void*, const void*, size_t) override {}
+    void CopyDeviceToHost(void*, const void*, size_t) override {}
+
+    std::vector<std::pair<void*, size_t>> register_calls;
+    std::vector<void*> deregister_calls;
+    bool address_range_ok = true;
+    void* alloc_base = nullptr;
+    size_t alloc_size = 0;
+    const void* last_query_ptr = nullptr;
+};
+
+class GdsRegistrationTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        auto fake = std::make_unique<FakeGdsDeviceOps>();
+        fake_ = fake.get();
+        ctx_.ops_ = std::move(fake);
+    }
+
+    GdsContext ctx_;
+    FakeGdsDeviceOps* fake_;  // owned by ctx_.ops_
+};
+
+// Allocation snapping: the first I/O on an allocation registers the
+// whole allocation once; subsequent slices inside it are pure hits.
+TEST_F(GdsRegistrationTest, AllocationSnapping_SingleRegistration) {
+    char* alloc = reinterpret_cast<char*>(0x100000000ULL);
+    fake_->alloc_base = alloc;
+    fake_->alloc_size = 1 << 20;  // 1 MiB allocation
+
+    EXPECT_TRUE(ctx_.EnsureBufferRegistered(alloc + 4096, 4096));
+    ASSERT_EQ(fake_->register_calls.size(), 1u);
+    EXPECT_EQ(fake_->register_calls[0].first, alloc);
+    EXPECT_EQ(fake_->register_calls[0].second, 1u << 20);
+    ASSERT_EQ(ctx_.registered_buffers_.size(), 1u);
+    EXPECT_EQ(ctx_.registered_buffers_.begin()->first, alloc);
+
+    // Interior slices hit — no further driver calls.
+    EXPECT_TRUE(ctx_.EnsureBufferRegistered(alloc + 8192, 4096));
+    EXPECT_TRUE(ctx_.EnsureBufferRegistered(alloc, 1 << 20));
+    EXPECT_EQ(fake_->register_calls.size(), 1u);
+    EXPECT_TRUE(fake_->deregister_calls.empty());
+}
+
+// Same base with a different size replaces the old registration with a
+// fresh (allocation-snapped) one.
+TEST_F(GdsRegistrationTest, ExactBaseDifferentSize_Replaced) {
+    char* alloc = reinterpret_cast<char*>(0x100000000ULL);
+    fake_->address_range_ok = false;  // span mode for the first registration
+
+    EXPECT_TRUE(ctx_.EnsureBufferRegistered(alloc, 4096));
+    ASSERT_EQ(ctx_.registered_buffers_.size(), 1u);
+    EXPECT_EQ(ctx_.registered_buffers_.begin()->second.size, 4096u);
+
+    // Now the vendor reports allocation bounds: re-registration snaps.
+    // (A different size is required — an identical (base, size) pair is
+    // a plain cache hit and never reaches the replacement branch.)
+    fake_->address_range_ok = true;
+    fake_->alloc_base = alloc;
+    fake_->alloc_size = 1 << 20;
+    EXPECT_TRUE(ctx_.EnsureBufferRegistered(alloc, 8192));
+    ASSERT_EQ(fake_->deregister_calls.size(), 1u);
+    EXPECT_EQ(fake_->deregister_calls[0], alloc);
+    ASSERT_EQ(ctx_.registered_buffers_.size(), 1u);
+    EXPECT_EQ(ctx_.registered_buffers_.begin()->second.size, 1u << 20);
+}
+
+// Overlap cleanup must evict right-crossing extents too.  Old code kept
+// them, so BufRegister overlapped a live registration and failed,
+// silently degrading to the bounce buffer.
+TEST_F(GdsRegistrationTest, RightCrossingOverlap_Evicted) {
+    fake_->address_range_ok = false;  // span mode
+    char* a = reinterpret_cast<char*>(0x1000);
+    char* b = reinterpret_cast<char*>(0x1050);
+
+    EXPECT_TRUE(ctx_.EnsureBufferRegistered(b, 0x200));  // [0x1050, 0x1250)
+    ASSERT_EQ(ctx_.registered_buffers_.size(), 1u);
+
+    // [0x1000, 0x1100) crosses the right edge of the existing extent.
+    EXPECT_TRUE(ctx_.EnsureBufferRegistered(a, 0x100));
+    ASSERT_EQ(fake_->deregister_calls.size(), 1u);
+    EXPECT_EQ(fake_->deregister_calls[0], b);
+    ASSERT_EQ(ctx_.registered_buffers_.size(), 1u);
+    EXPECT_EQ(ctx_.registered_buffers_.begin()->first, a);
+}
+
+// Cap eviction picks the least-recently-used extent, not the lowest
+// address.  (Old comment admitted: "begin() is lowest address, not
+// oldest".)
+TEST_F(GdsRegistrationTest, CapEviction_IsLruNotLowestAddress) {
+    fake_->address_range_ok = false;  // span mode
+    constexpr size_t kCap = 8192;     // must match kMaxRegisteredBuffers
+    char* base = reinterpret_cast<char*>(0x100000000ULL);
+
+    // Fill the cache with DECREASING addresses, so the lowest address is
+    // the most recently registered extent.
+    for (size_t i = 0; i < kCap; ++i) {
+        char* p = base + (kCap - i) * 0x10000;
+        ASSERT_TRUE(ctx_.EnsureBufferRegistered(p, 0x1000)) << "i=" << i;
+    }
+    ASSERT_EQ(ctx_.registered_buffers_.size(), kCap);
+
+    // One more registration evicts exactly one extent.  The LRU victim
+    // must be the first-registered (never touched since) extent, NOT
+    // the lowest-address extent (which the old begin()-based eviction
+    // would have picked).
+    char* lowest_addr = base + 0x10000;           // registered last
+    char* oldest_unused = base + kCap * 0x10000;  // registered first
+    char* newcomer = base + (kCap + 1) * 0x10000;
+    EXPECT_TRUE(ctx_.EnsureBufferRegistered(newcomer, 0x1000));
+
+    ASSERT_EQ(fake_->deregister_calls.size(), 1u);
+    EXPECT_EQ(fake_->deregister_calls[0], oldest_unused);
+    EXPECT_EQ(ctx_.registered_buffers_.count(lowest_addr), 1u);
+    EXPECT_EQ(ctx_.registered_buffers_.count(newcomer), 1u);
+    EXPECT_EQ(ctx_.registered_buffers_.size(), kCap);
+}
+#endif  // USE_GDS_BACKEND
 }  // namespace mooncake

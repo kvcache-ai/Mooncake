@@ -436,7 +436,7 @@ if(USE_GDS_BACKEND)
             USE_GDS_BACKEND USE_GDS_NVIDIA)
         target_include_directories(cufile_gds INTERFACE ${CUFILE_INCLUDE})
         target_link_libraries(cufile_gds INTERFACE
-            ${CUFILE_LIB} CUDA::cudart)
+            ${CUFILE_LIB} CUDA::cudart CUDA::cuda_driver)
         target_link_libraries(mooncake_store PRIVATE cufile_gds)
         target_link_libraries(mooncake_client PRIVATE cufile_gds)
         target_link_libraries(mooncake_master PRIVATE cufile_gds)

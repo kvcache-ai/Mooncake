@@ -262,3 +262,7 @@ if(CUDAToolkit_FOUND)
 endif()
 
 add_store_test(gds_context_test gds_context_test.cpp)
+if(USE_GDS_BACKEND)
+    # Enables the fake-ops registration-cache tests in gds_context_test.cpp
+    target_compile_definitions(gds_context_test PRIVATE USE_GDS_BACKEND)
+endif()

@@ -175,8 +175,19 @@ struct GdsContext {
     // EnsureBufferRegistered() to reuse registrations across multiple
     // I/O operations on the same GPU address.
     Mutex buf_mutex_;
-    // Buffer registration cache (range-aware, ordered).
-    std::map<void*, size_t> registered_buffers_;
+    // Buffer registration cache (range-aware, ordered by base address).
+    // Registrations are snapped to the whole GPU allocation (via
+    // GdsDeviceOps::GetAddressRange) rather than the requested span, so
+    // steady-state I/O is pure IsRangeCovered() hits with zero
+    // register/deregister churn in the nvidia-fs driver.
+    struct RegisteredExtent {
+        size_t size;
+        uint64_t lru_tick;  // last-use tick, for cap eviction
+    };
+    std::map<void*, RegisteredExtent> registered_buffers_;
+    // Monotonic tick source for RegisteredExtent::lru_tick; incremented
+    // under buf_mutex_ on every cache access.
+    uint64_t lru_clock_ = 0;
 
     // Initialize GDS: probe -> open gds_fd_ -> fallocate ->
     // gds_device_ops::FileHandleRegister. Returns error on failure;
@@ -220,10 +231,12 @@ struct GdsContext {
         uint64_t offset, uint32_t expected_value_size);
 
     // Register a GPU buffer for GDS I/O. Checks the registration cache:
-    // if the same (ptr, size) is already registered, returns true
-    // immediately. If ptr is registered with a different size, the old
-    // registration is replaced. Registration failure does not block
-    // I/O — cuFile falls back to an internal bounce buffer.
+    // if (ptr, size) is already covered by a registered extent, returns
+    // true immediately. On a miss the registration is snapped to the
+    // whole GPU allocation containing ptr (GetAddressRange); when the
+    // vendor cannot report allocation bounds, the requested span is
+    // registered as-is. Registration failure does not block I/O —
+    // cuFile falls back to an internal bounce buffer.
     bool EnsureBufferRegistered(void* gpu_ptr, size_t size);
 
     bool IsRangeCovered(void* ptr, size_t size);

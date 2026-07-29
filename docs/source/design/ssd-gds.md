@@ -79,10 +79,53 @@ Put (engine rank)                                 store_service
 - **Slice coalescing.** Adjacent GPU slices from the same allocation
   (e.g. KV blocks inside one per-layer tensor) are merged and submitted
   as a single `cuFileWrite`, cutting DMA calls from O(blocks) to
-  O(layers), and cutting `cuFileBufRegister` calls likewise via
-  range-aware extent registration (one registration per merged extent
-  instead of one per slice). Set `MOONCAKE_GDS_NO_MERGE=1` to disable
-  merging and revert to per-slice writes (escape hatch / A-B comparison).
+  O(layers). Set `MOONCAKE_GDS_NO_MERGE=1` to disable merging and
+  revert to per-slice writes (escape hatch / A-B comparison).
+
+### Buffer registration
+
+`cuFile` DMA requires the GPU buffer to be registered with the kernel
+driver (`cuFileBufRegister`). Registering *request-shaped* spans churns:
+coalescing boundaries vary per request, so the same memory is
+deregistered and re-registered constantly, which fragments the
+`nvidia-fs` driver's internal mappings and eventually fails with ENOMEM
+on long runs. `GdsContext` therefore keeps a registration cache whose
+entries are **allocation-snapped**: on a cache miss the whole GPU
+allocation containing the slice (queried via `cuMemGetAddressRange`) is
+registered once and kept until shutdown, so steady-state I/O is pure
+cache hits with zero register/deregister calls. When the vendor driver
+cannot report allocation bounds, the requested span is registered as-is
+(legacy behavior).
+
+The design rests on three premises:
+
+1. **Stable arenas.** The DMA'd memory (KV cache tensors, staging
+   pools) is allocated at engine startup and not freed mid-run. CUDA
+   stream-level async execution does not affect this — kernels in
+   flight do not move virtual addresses. (Data *readiness* — not DMAing
+   bytes a kernel has not produced yet — is a separate concern owned by
+   the engine's stream synchronization.)
+2. **Reliable allocation queries.** `cuMemGetAddressRange` returns the
+   bounds of the whole `cudaMalloc` segment (larger than the tensor
+   carved from it — still valid VA), and also works for VMM
+   (`cuMemMap`) and IPC-imported pointers.
+3. **Few live allocations.** The live extent count equals the number of
+   `cudaMalloc` segments touched by GDS (tens), orders of magnitude
+   below the registration-cache cap (8192). The cap's LRU eviction is a
+   safety net that should never fire; it logs a warning when it does,
+   because firing means premise 1 is broken.
+
+Allocator configurations that weaken premise 1:
+
+- `PYTORCH_CUDA_ALLOC_CONF=backend:cudaMallocAsync` — the stream-ordered
+  mempool recycles virtual addresses. Keep the default native caching
+  allocator.
+- `expandable_segments:True` — VMM segments grow in place; each growth
+  triggers one deregister/re-register of that segment (bounded,
+  self-healing), not steady churn.
+- Engine sleep/wake cycles that free and re-allocate KV cache — stale
+  extents are never deregistered until shutdown; they accumulate until
+  the cap evicts them (with the warning above).
 
 ### Read path
 
@@ -211,6 +254,17 @@ store owns the memory pool and the SSD tier.
 - When diagnosing DMA failures (`cuFileWrite` errors), check
   `/proc/driver/nvidia-fs/stats` and run with `GLOG_v=1` — the write
   path logs coalescing decisions, registration failures, and `errno`.
+- In steady state the `BufRegister`/`BufDeregister` counters in
+  `/proc/driver/nvidia-fs/stats` should go **flat after warmup**
+  (allocations are registered once). Counters that keep climbing with
+  request rate mean allocation-snapping is failing (e.g. the vendor
+  driver cannot report allocation bounds) and the legacy span-shaped
+  registration path is active — watch for the
+  `allocation snapping may be failing` warning in the logs.
+- Keep the inference engine on PyTorch's default native caching
+  allocator — do **not** set `PYTORCH_CUDA_ALLOC_CONF` with
+  `backend:cudaMallocAsync` (recycled virtual addresses break the
+  stable-arena premise). See **Buffer registration** above.
 - Keep `MOONCAKE_GDS_NO_MERGE` **unset** in normal production. It exists
   for A/B comparison of the coalescing write path and as an escape
   hatch if a driver version misbehaves with merged writes; leaving it

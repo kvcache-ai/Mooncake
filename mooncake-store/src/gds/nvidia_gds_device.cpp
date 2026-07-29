@@ -7,6 +7,7 @@
 #ifdef USE_GDS_NVIDIA
 
 #include <cufile.h>
+#include <cuda.h>
 #include <cuda_runtime.h>
 #include <unistd.h>
 #include <sys/stat.h>
@@ -51,6 +52,19 @@ class NvidiaGdsDeviceOps final : public GdsDeviceOps {
 
     void BufDeregister(void* ptr) override {
         if (ptr) cuFileBufDeregister(ptr);
+    }
+
+    bool GetAddressRange(const void* ptr, void** base, size_t* size) override {
+        CUdeviceptr alloc_base = 0;
+        size_t alloc_size = 0;
+        if (cuMemGetAddressRange(&alloc_base, &alloc_size,
+                                 reinterpret_cast<CUdeviceptr>(ptr)) !=
+            CUDA_SUCCESS) {
+            return false;
+        }
+        *base = reinterpret_cast<void*>(alloc_base);
+        *size = alloc_size;
+        return true;
     }
 
     ssize_t Write(GdsDeviceFileHandle fh, void* buf, size_t size,
