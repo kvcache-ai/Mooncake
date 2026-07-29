@@ -1474,6 +1474,9 @@ class MasterService {
         std::unordered_map<std::string, ObjectMetadata>::iterator it,
         const TenantId& tenant_id);
     void ReleaseLocalDiskUsage(const std::vector<Replica>& replicas);
+    void ReleaseLocalDiskUsage(
+        const std::unordered_map<UUID, int64_t, boost::hash<UUID>>&
+            bytes_by_client);
     enum class QuotaEraseMode {
         kFull,
         kPreserveOld,

@@ -533,6 +533,58 @@ TEST_F(MasterServiceTenantQuotaTest,
 }
 
 TEST_F(MasterServiceTenantQuotaTest,
+       NotifyOffloadSuccessTransfersDiskReplicaAfterClientRestart) {
+    const std::string policy = WritePolicyFile({{TenantId("tenant-a"), 1000}});
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_multi_tenants(true)
+                      .set_enable_offload(true)
+                      .set_tenant_quota_connector_type("file")
+                      .set_tenant_quota_connector_uri(policy)
+                      .build();
+    MasterService service(config);
+    UUID old_client = MountSegment(service, 4096, "restart_segment_old");
+    UUID restarted_client =
+        MountSegment(service, 4096, "restart_segment_restarted");
+    ASSERT_TRUE(service.MountLocalDiskSegment(old_client, true).has_value());
+    ASSERT_TRUE(
+        service.MountLocalDiskSegment(restarted_client, true).has_value());
+
+    std::vector<OffloadTaskItem> tasks{
+        OffloadTaskItem{.tenant_id = "tenant-a", .key = "cold", .size = 128}};
+    StorageObjectMetadata metadata;
+    metadata.data_size = 128;
+    metadata.transport_endpoint = "stable-disk-endpoint";
+    ASSERT_TRUE(service.NotifyOffloadSuccess(old_client, tasks, {metadata})
+                    .has_value());
+    EXPECT_EQ(LocalDiskUsedBytes(service, old_client), 128);
+
+    ASSERT_TRUE(
+        service.NotifyOffloadSuccess(restarted_client, tasks, {metadata})
+            .has_value());
+    EXPECT_EQ(LocalDiskUsedBytes(service, old_client), 0);
+    EXPECT_EQ(LocalDiskUsedBytes(service, restarted_client), 128);
+
+    auto replicas = service.GetReplicaList("cold", TenantId("tenant-a"));
+    ASSERT_TRUE(replicas.has_value()) << toString(replicas.error());
+    ASSERT_EQ(replicas->replicas.size(), 1u);
+    const auto& local_disk =
+        replicas->replicas.front().get_local_disk_descriptor();
+    EXPECT_EQ(local_disk.client_id, restarted_client);
+    EXPECT_EQ(local_disk.transport_endpoint, "stable-disk-endpoint");
+
+    service.ClearInvalidHandles({restarted_client});
+    auto after_old_client_expiry =
+        service.GetReplicaList("cold", TenantId("tenant-a"));
+    ASSERT_TRUE(after_old_client_expiry.has_value())
+        << toString(after_old_client_expiry.error());
+    ASSERT_EQ(after_old_client_expiry->replicas.size(), 1u);
+    EXPECT_EQ(after_old_client_expiry->replicas.front()
+                  .get_local_disk_descriptor()
+                  .client_id,
+              restarted_client);
+}
+
+TEST_F(MasterServiceTenantQuotaTest,
        RegisteredTenantQuotaAdmissionDoesNotCreateImplicitTenants) {
     MasterService service(MakeConfig({{TenantId("tenant-a"), 100}}));
     UUID client_id = MountSegment(service);
