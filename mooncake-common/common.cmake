@@ -97,6 +97,7 @@ option(USE_SUNRISE
 option(USE_TPU
        "option for enabling TPU (PJRT) staging support in TENT; the PJRT adapter is loaded at runtime via dlopen, no build-time SDK required"
        OFF)
+option(USE_VRAM_SEGMENT "option for vram segment" OFF)
 
 if(USE_UB)
   add_compile_definitions(USE_UB)
@@ -200,6 +201,12 @@ if(USE_MNNVL)
   endif()
   add_compile_definitions(USE_MNNVL)
   message(STATUS "Multi-Node NVLink support is enabled")
+endif()
+
+if (USE_VRAM_SEGMENT)
+  set(USE_CUDA ON)
+  add_compile_definitions(USE_VRAM_SEGMENT)
+  message(STATUS "VRAM SEGMENT is ON")
 endif()
 
 if(USE_CUDA)
