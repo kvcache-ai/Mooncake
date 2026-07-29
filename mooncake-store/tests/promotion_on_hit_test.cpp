@@ -86,6 +86,13 @@ class PromotionOnHitTest : public ::testing::Test {
         return service->promotion_in_flight_.load(std::memory_order_relaxed);
     }
 
+    static void PrepareUnmountLocalDiskSegmentForTesting(
+        MasterService& service, const UUID& client_id) {
+        auto segment_access = service.segment_manager_.getSegmentAccess();
+        ASSERT_NE(nullptr,
+                  segment_access.PrepareUnmountLocalDiskSegment(client_id));
+    }
+
     static constexpr size_t kDefaultSegmentBase = 0x300000000;
 
     std::string WriteTenantQuotaPolicyFile(
@@ -1986,11 +1993,9 @@ TEST_F(PromotionOnHitTest, BatchRemoveErasesPromotionTask) {
     service->RemoveAll(/*force=*/true);
 }
 
-// BatchRemove stale-handle path on a key with an in-flight
-// PromotionTask must drop the task entry. The holder is mounted via
-// PrepareSegment only (no ReMount), so its client is absent from
-// ok_client_; BatchRemove's client-liveness cleanup then erases the
-// LOCAL_DISK replica and the stale-handle branch fires.
+// BatchRemove stale-handle path on a key with an in-flight PromotionTask must
+// drop the task entry. LOCAL_DISK staleness is represented by segment lifetime,
+// so explicitly invalidate the holder's LocalDiskSegment before BatchRemove.
 TEST_F(PromotionOnHitTest, BatchRemoveStaleHandleErasesPromotionTask) {
     MasterServiceConfig config;
     config.enable_offload = true;
@@ -2019,6 +2024,7 @@ TEST_F(PromotionOnHitTest, BatchRemoveStaleHandleErasesPromotionTask) {
         ASSERT_TRUE(pending.has_value());
         EXPECT_EQ(CountPromotionTask(*pending, "k_first"), 1u);
     }
+    PrepareUnmountLocalDiskSegmentForTesting(*service, holder.client_id);
 
     auto results =
         service->BatchRemove({"k_first"}, TenantId::Default(), /*force=*/true);

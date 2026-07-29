@@ -482,10 +482,8 @@ class MasterServiceHATest : public ::testing::Test {
         return service.ordered_oplog_writer_->Reserve();
     }
 
-    static void ClearInvalidHandlesForTesting(
-        MasterService& service,
-        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients) {
-        service.ClearInvalidHandles(alive_clients);
+    static void SweepUnavailableReplicasForTesting(MasterService& service) {
+        service.SweepUnavailableReplicas();
     }
 
     static size_t ReplicaCountForTesting(MasterService& service,
@@ -494,6 +492,26 @@ class MasterServiceHATest : public ::testing::Test {
         MasterService::MetadataAccessorRO accessor(
             &service, MasterService::ObjectIdentity{tenant_id, key});
         return accessor.Exists() ? accessor.Get().CountReplicas() : 0;
+    }
+
+    static std::vector<ReplicaStatus> RawReplicaStatusesForTesting(
+        MasterService& service, const TenantId& tenant_id,
+        const std::string& key) {
+        const size_t shard_idx = service.getMetadataShardIndex(tenant_id, key);
+        MasterService::MetadataShardAccessorRW shard(&service, shard_idx);
+        auto tenant_it = shard->tenants.find(tenant_id);
+        if (tenant_it == shard->tenants.end()) {
+            return {};
+        }
+        auto metadata_it = tenant_it->second.metadata.find(key);
+        if (metadata_it == tenant_it->second.metadata.end()) {
+            return {};
+        }
+        std::vector<ReplicaStatus> statuses;
+        for (const auto& replica : metadata_it->second.GetAllReplicas()) {
+            statuses.push_back(replica.status());
+        }
+        return statuses;
     }
 
     static std::vector<Replica::Descriptor> ReplicaDescriptorsForTesting(
@@ -520,7 +538,7 @@ class MasterServiceHATest : public ::testing::Test {
             return true;
         }
         for (const auto& replica : accessor.Get().GetAllReplicas()) {
-            if (replica.has_invalid_mem_handle()) {
+            if (replica.is_memory_replica() && !replica.is_available()) {
                 return true;
             }
         }
@@ -554,6 +572,13 @@ class MasterServiceHATest : public ::testing::Test {
         size_t metrics_dec_capacity = 0;
         ASSERT_EQ(ErrorCode::OK, segment_access.PrepareUnmountSegment(
                                      segment_id, metrics_dec_capacity));
+    }
+
+    static void PrepareUnmountLocalDiskSegmentForTesting(
+        MasterService& service, const UUID& client_id) {
+        auto segment_access = service.segment_manager_.getSegmentAccess();
+        ASSERT_NE(nullptr,
+                  segment_access.PrepareUnmountLocalDiskSegment(client_id));
     }
 
     static std::vector<ReplicaID> MarkCompletedReplicasRemovedForTesting(
@@ -1159,6 +1184,10 @@ TEST_F(MasterServiceHATest, GetReplicaListClassifiesRemovedReplicaStates) {
     auto removed = service.GetReplicaList(removed_key, kDefaultTenant);
     ASSERT_FALSE(removed.has_value());
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, removed.error());
+    auto removed_admin =
+        service.GetReplicaListForAdmin(removed_key, kDefaultTenant);
+    ASSERT_FALSE(removed_admin.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, removed_admin.error());
 
     const std::string processing_key = "get_readiness_processing_key";
     ReplicateConfig config;
@@ -1215,6 +1244,19 @@ TEST_F(MasterServiceHATest, BatchGetReplicaListClassifiesRemovedReplicaStates) {
     EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, results[2].error());
     ASSERT_FALSE(results[3].has_value());
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, results[3].error());
+
+    auto admin_results = service.BatchGetReplicaListForAdmin(
+        {complete_key, removed_key, processing_key,
+         "batch_get_readiness_missing_key"},
+        kDefaultTenant);
+    ASSERT_EQ(4u, admin_results.size());
+    EXPECT_TRUE(admin_results[0].has_value());
+    ASSERT_FALSE(admin_results[1].has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, admin_results[1].error());
+    ASSERT_FALSE(admin_results[2].has_value());
+    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, admin_results[2].error());
+    ASSERT_FALSE(admin_results[3].has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, admin_results[3].error());
 }
 
 TEST_F(MasterServiceHATest, ExistKeyRequiresCompletedReplica) {
@@ -1798,6 +1840,75 @@ TEST_F(MasterServiceBatchRecordE2ETest,
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
+    EXPECT_TRUE(after_finalize.has_value()) << toString(after_finalize.error());
+}
+
+TEST_F(MasterServiceBatchRecordE2ETest,
+       SweepUnavailableReplicasReleasesResourcesAfterDurable) {
+    const std::string cluster_id = "test_batch_record_sweep_finalize";
+    auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+    auto service_config =
+        MasterServiceConfig::builder()
+            .set_default_kv_lease_ttl(50)
+            .set_enable_ha(true)
+            .set_enable_oplog(true)
+            .set_cluster_id(cluster_id)
+            .set_oplog_batch_max_entries(1)
+            .set_enable_multi_tenants(true)
+            .set_tenant_quota_connector_type("file")
+            .set_tenant_quota_connector_uri(
+                WriteTenantPolicyFile({{kDefaultTenant.value(), 1024}}))
+            .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    auto mounted = PrepareSimpleSegment(service, "batch_sweep_finalize_seg");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+    auto spare =
+        PrepareSimpleSegment(service, "batch_sweep_finalize_spare",
+                             kDefaultSegmentBase + kDefaultSegmentSize);
+    ReadBatchEventually(storage, 2, batch);
+
+    const std::string key = "batch_sweep_finalize_key";
+    PutObjectOnSegment(service, mounted.client_id, key,
+                       "batch_sweep_finalize_seg");
+    ReadBatchEventually(storage, 3, batch);
+
+    PrepareUnmountSegmentForTesting(service, mounted.segment_id);
+    backend->BlockTxn();
+    SweepUnavailableReplicasForTesting(service);
+
+    auto raw_statuses =
+        RawReplicaStatusesForTesting(service, kDefaultTenant, key);
+    ASSERT_EQ(1u, raw_statuses.size());
+    EXPECT_EQ(ReplicaStatus::REMOVED, raw_statuses.front());
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segments = {"batch_sweep_finalize_spare"};
+    auto before_finalize =
+        service.PutStart(spare.client_id, "batch_sweep_before_finalize",
+                         kDefaultTenant, 1024, config);
+    EXPECT_FALSE(before_finalize.has_value());
+
+    backend->AllowTxn();
+    ReadRemoveBatchEventually(storage, 4, key, batch);
+
+    for (int i = 0; i < 50; ++i) {
+        if (RawReplicaStatusesForTesting(service, kDefaultTenant, key)
+                .empty()) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    EXPECT_TRUE(
+        RawReplicaStatusesForTesting(service, kDefaultTenant, key).empty());
+
+    auto after_finalize =
+        service.PutStart(spare.client_id, "batch_sweep_after_finalize",
+                         kDefaultTenant, 1024, config);
     EXPECT_TRUE(after_finalize.has_value()) << toString(after_finalize.error());
 }
 
@@ -3403,6 +3514,59 @@ TEST_F(MasterServiceHATest, EvictDiskReplicaReleasesLocalDiskAfterDurable) {
     backend->AllowTxn();
     ReadBatchEventually(storage, 4, batch);
     EXPECT_EQ(0, GetLocalDiskUsedBytesForTesting(service, segment_name));
+}
+
+TEST_F(MasterServiceHATest,
+       AddReplicaRebindsExistingLocalDiskReplicaAfterRemount) {
+    const std::string cluster_id = "test_batch_record_local_disk_rebind";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_enable_offload(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service
+                    .MountLocalDiskSegment(client_id,
+                                           /*enable_offloading=*/false)
+                    .has_value());
+
+    const std::string key = "local_disk_rebind_key";
+    Replica first(client_id, 1024, "old_local_disk_endpoint",
+                  ReplicaStatus::COMPLETE);
+    auto first_add = service.AddReplica(client_id, key, kDefaultTenant, first);
+    ASSERT_TRUE(first_add.has_value()) << toString(first_add.error());
+    EXPECT_TRUE(first_add.value());
+
+    PrepareUnmountLocalDiskSegmentForTesting(service, client_id);
+    ASSERT_TRUE(service
+                    .MountLocalDiskSegment(client_id,
+                                           /*enable_offloading=*/false)
+                    .has_value());
+
+    Replica replacement(client_id, 1024, "new_local_disk_endpoint",
+                        ReplicaStatus::COMPLETE);
+    auto replacement_add =
+        service.AddReplica(client_id, key, kDefaultTenant, replacement);
+    ASSERT_TRUE(replacement_add.has_value())
+        << toString(replacement_add.error());
+    EXPECT_FALSE(replacement_add.value());
+
+    SweepUnavailableReplicasForTesting(service);
+
+    auto replicas = service.GetReplicaList(key, kDefaultTenant);
+    ASSERT_TRUE(replicas.has_value()) << toString(replicas.error());
+    ASSERT_EQ(1u, replicas->replicas.size());
+    ASSERT_TRUE(replicas->replicas.front().is_local_disk_replica());
+    EXPECT_EQ("new_local_disk_endpoint", replicas->replicas.front()
+                                             .get_local_disk_descriptor()
+                                             .transport_endpoint);
 }
 
 #ifdef USE_NOF

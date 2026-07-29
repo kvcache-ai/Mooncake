@@ -401,26 +401,6 @@ class Replica {
         return true;
     }
 
-    bool update_local_disk_replica(uint64_t object_size,
-                                   std::string transport_endpoint,
-                                   const SegmentLifetime& segment_lifetime) {
-        if (!is_local_disk_replica()) {
-            return false;
-        }
-        auto& data = std::get<LocalDiskReplicaData>(data_);
-        if (object_size > data.object_size) {
-            MasterMetricManager::instance().inc_allocated_file_size(
-                object_size - data.object_size);
-        } else if (object_size < data.object_size) {
-            MasterMetricManager::instance().dec_allocated_file_size(
-                data.object_size - object_size);
-        }
-        data.object_size = object_size;
-        data.transport_endpoint = std::move(transport_endpoint);
-        data.segment_lifetime = segment_lifetime;
-        return true;
-    }
-
     [[nodiscard]] bool is_completed_and_available() const {
         return is_completed() && is_available();
     }
@@ -615,6 +595,26 @@ class Replica {
    private:
     void bind_local_disk_lifetime(const SegmentLifetime& lifetime) {
         std::get<LocalDiskReplicaData>(data_).segment_lifetime = lifetime;
+    }
+
+    bool update_local_disk_replica(uint64_t object_size,
+                                   std::string transport_endpoint,
+                                   const SegmentLifetime& lifetime) {
+        if (!is_local_disk_replica()) {
+            return false;
+        }
+        auto& data = std::get<LocalDiskReplicaData>(data_);
+        if (object_size > data.object_size) {
+            MasterMetricManager::instance().inc_allocated_file_size(
+                object_size - data.object_size);
+        } else if (data.object_size > object_size) {
+            MasterMetricManager::instance().dec_allocated_file_size(
+                data.object_size - object_size);
+        }
+        data.object_size = object_size;
+        data.transport_endpoint = std::move(transport_endpoint);
+        data.segment_lifetime = lifetime;
+        return true;
     }
 
     inline static std::atomic<ReplicaID> next_id_{1};

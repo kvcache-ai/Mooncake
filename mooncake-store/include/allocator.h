@@ -188,6 +188,9 @@ class DummyBufferAllocator final : public BufferAllocatorBase {
     }
     void deallocate(AllocatedBuffer* handle) override {}
     size_t capacity() const override { return kAllocatorUnknownFreeSpace; }
+    size_t getTotalFreeSpace() const override {
+        return kAllocatorUnknownFreeSpace;
+    }
     size_t getLargestFreeRegion() const override {
         return kAllocatorUnknownFreeSpace;
     }

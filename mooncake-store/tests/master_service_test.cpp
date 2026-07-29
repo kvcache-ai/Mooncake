@@ -1003,12 +1003,12 @@ TEST_F(MasterServiceTest, GetAllKeysFiltersUnavailableMetadataByDefault) {
     const std::string key =
         GenerateKeyForSegment(context.client_id, service, "listing_segment");
 
-    auto filtered_before = service->GetAllKeys("default");
+    auto filtered_before = service->GetAllKeys(TenantId::Default());
     ASSERT_TRUE(filtered_before.has_value());
     EXPECT_NE(std::find(filtered_before->begin(), filtered_before->end(), key),
               filtered_before->end());
 
-    auto unfiltered_before = service->GetAllKeys("default", false);
+    auto unfiltered_before = service->GetAllKeys(TenantId::Default(), false);
     ASSERT_TRUE(unfiltered_before.has_value());
     EXPECT_NE(
         std::find(unfiltered_before->begin(), unfiltered_before->end(), key),
@@ -1017,7 +1017,7 @@ TEST_F(MasterServiceTest, GetAllKeysFiltersUnavailableMetadataByDefault) {
     ASSERT_TRUE(service->UnmountSegment(context.segment_id, context.client_id)
                     .has_value());
 
-    auto filtered_after = service->GetAllKeys("default");
+    auto filtered_after = service->GetAllKeys(TenantId::Default());
     ASSERT_TRUE(filtered_after.has_value());
     EXPECT_EQ(std::find(filtered_after->begin(), filtered_after->end(), key),
               filtered_after->end());
@@ -4039,11 +4039,12 @@ TEST_F(MasterServiceTest, UnmountSegmentHidesUnavailableReplicas) {
     ASSERT_FALSE(get_result1.has_value());
     ASSERT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result1.error());
 
-    auto exist_result = service_->ExistKey(key1, "default");
+    auto exist_result = service_->ExistKey(key1, TenantId::Default());
     ASSERT_TRUE(exist_result.has_value());
     EXPECT_FALSE(exist_result.value());
 
-    auto batch_exist_result = service_->BatchExistKey({key1, key2}, "default");
+    auto batch_exist_result =
+        service_->BatchExistKey({key1, key2}, TenantId::Default());
     ASSERT_EQ(2u, batch_exist_result.size());
     ASSERT_TRUE(batch_exist_result[0].has_value());
     EXPECT_FALSE(batch_exist_result[0].value());
@@ -4051,13 +4052,14 @@ TEST_F(MasterServiceTest, UnmountSegmentHidesUnavailableReplicas) {
     EXPECT_TRUE(batch_exist_result[1].value());
 
     auto batch_get_result =
-        service_->BatchGetReplicaList({key1, key2}, "default");
+        service_->BatchGetReplicaList({key1, key2}, TenantId::Default());
     ASSERT_EQ(2u, batch_get_result.size());
     ASSERT_FALSE(batch_get_result[0].has_value());
     EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, batch_get_result[0].error());
     ASSERT_TRUE(batch_get_result[1].has_value());
 
-    auto regex_result = service_->GetReplicaListByRegex("key_.*", "default");
+    auto regex_result =
+        service_->GetReplicaListByRegex("key_.*", TenantId::Default());
     ASSERT_TRUE(regex_result.has_value());
     EXPECT_EQ(1u, regex_result->size());
     EXPECT_EQ(0u, regex_result->count(key1));

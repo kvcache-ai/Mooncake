@@ -64,9 +64,8 @@ class SegmentAllocator {
         return allocator_ == allocator;
     }
 
-    bool replaceAllocator(
-        const std::shared_ptr<BufferAllocatorBase>& expected,
-        std::shared_ptr<BufferAllocatorBase> replacement) {
+    bool replaceAllocator(const std::shared_ptr<BufferAllocatorBase>& expected,
+                          std::shared_ptr<BufferAllocatorBase> replacement) {
         if (!replacement || allocator_ != expected) {
             return false;
         }
@@ -161,8 +160,8 @@ class AllocatorManager {
             targets.push_back(*target);
         }
         for (size_t i = 0; i < replacements.size(); ++i) {
-            if (!targets[i]->replaceAllocator(
-                    replacements[i].expected, replacements[i].replacement)) {
+            if (!targets[i]->replaceAllocator(replacements[i].expected,
+                                              replacements[i].replacement)) {
                 return false;
             }
         }

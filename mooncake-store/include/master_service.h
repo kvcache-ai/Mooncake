@@ -1187,8 +1187,10 @@ class MasterService {
         bool IsGrouped() const { return !group_id.empty(); }
 
         bool HasAvailableReplica() const {
-            return HasReplica(
-                [](const Replica& replica) { return replica.is_available(); });
+            return HasReplica([](const Replica& replica) {
+                return replica.status() != ReplicaStatus::REMOVED &&
+                       replica.is_available();
+            });
         }
 
         bool HasCompletedAvailableReplica() const {
