@@ -2187,6 +2187,12 @@ void MasterService::ReleaseLocalDiskUsage(
             bytes_by_client[descriptor.client_id] += descriptor.object_size;
         }
     }
+    ReleaseLocalDiskUsage(bytes_by_client);
+}
+
+void MasterService::ReleaseLocalDiskUsage(
+    const std::unordered_map<UUID, int64_t, boost::hash<UUID>>&
+        bytes_by_client) {
     if (bytes_by_client.empty()) {
         return;
     }
@@ -4647,6 +4653,20 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    const auto& reported_local_disk =
+        replica.get_descriptor().get_local_disk_descriptor();
+    const auto matches_reported_local_disk =
+        [client_id, &reported_local_disk](const Replica& existing) {
+            if (existing.type() != ReplicaType::LOCAL_DISK) {
+                return false;
+            }
+            const auto& existing_local_disk =
+                existing.get_descriptor().get_local_disk_descriptor();
+            return existing_local_disk.client_id == client_id ||
+                   (!reported_local_disk.transport_endpoint.empty() &&
+                    existing_local_disk.transport_endpoint ==
+                        reported_local_disk.transport_endpoint);
+        };
     const bool replacing_existing =
         metadata.HasReplica(&Replica::fn_is_local_disk_replica);
 
@@ -4654,21 +4674,14 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
         std::vector<Replica::Descriptor> post;
         for (const auto& existing : metadata.GetAllReplicas()) {
             if (existing.status() != ReplicaStatus::COMPLETE) continue;
-            if (replacing_existing &&
-                existing.type() == ReplicaType::LOCAL_DISK &&
-                existing.get_descriptor()
-                        .get_local_disk_descriptor()
-                        .client_id == client_id) {
+            if (replacing_existing && matches_reported_local_disk(existing)) {
                 // Substitute with the updated descriptor.
                 Replica::Descriptor updated = existing.get_descriptor();
+                updated.get_local_disk_descriptor().client_id = client_id;
                 updated.get_local_disk_descriptor().transport_endpoint =
-                    replica.get_descriptor()
-                        .get_local_disk_descriptor()
-                        .transport_endpoint;
+                    reported_local_disk.transport_endpoint;
                 updated.get_local_disk_descriptor().object_size =
-                    replica.get_descriptor()
-                        .get_local_disk_descriptor()
-                        .object_size;
+                    reported_local_disk.object_size;
                 post.push_back(std::move(updated));
             } else {
                 post.push_back(existing.get_descriptor());
@@ -4699,24 +4712,28 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
         return true;
     }
 
+    bool transferred_ownership = false;
+    std::unordered_map<UUID, int64_t, boost::hash<UUID>> replaced_usage;
     metadata.VisitReplicas(
-        [client_id](const Replica& rep) {
-            return rep.type() == ReplicaType::LOCAL_DISK &&
-                   rep.get_descriptor().get_local_disk_descriptor().client_id ==
-                       client_id;
-        },
-        [&replica](Replica& rep) {
-            rep.get_descriptor()
-                .get_local_disk_descriptor()
-                .transport_endpoint = replica.get_descriptor()
-                                          .get_local_disk_descriptor()
-                                          .transport_endpoint;
-            rep.get_descriptor().get_local_disk_descriptor().object_size =
-                replica.get_descriptor()
-                    .get_local_disk_descriptor()
-                    .object_size;
+        matches_reported_local_disk,
+        [client_id, &reported_local_disk,
+         &transferred_ownership, &replaced_usage](Replica& existing) {
+            auto& existing_local_disk =
+                existing.get_descriptor().get_local_disk_descriptor();
+            if (existing_local_disk.client_id != client_id) {
+                transferred_ownership = true;
+                if (existing_local_disk.object_size > 0) {
+                    replaced_usage[existing_local_disk.client_id] +=
+                        existing_local_disk.object_size;
+                }
+            }
+            existing_local_disk.client_id = client_id;
+            existing_local_disk.transport_endpoint =
+                reported_local_disk.transport_endpoint;
+            existing_local_disk.object_size = reported_local_disk.object_size;
         });
-    return false;
+    ReleaseLocalDiskUsage(replaced_usage);
+    return transferred_ownership;
 }
 
 auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
