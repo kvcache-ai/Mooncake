@@ -287,8 +287,13 @@ Status UbTransport::submitTransferTask(
             }
             if (device_id < 0) {
                 auto source_addr = slice->source_addr;
-                for (auto& entry : slices_to_post)
-                    for (auto s : entry.second) getSliceCache().deallocate(s);
+                // Do not deallocate slices already queued in slices_to_post
+                // here: every slice is also recorded in its owning
+                // TransferTask::slice_list right after allocation, and
+                // ~TransferTask() returns everything in slice_list to the
+                // cache exactly once. Deallocating here double-frees them
+                // into ThreadLocalSliceCache, letting a later allocate()
+                // hand the same Slice* to two unrelated transfers.
                 LOG(ERROR)
                     << "UbTransport: Address not registered by any device(s) "
                     << source_addr;
