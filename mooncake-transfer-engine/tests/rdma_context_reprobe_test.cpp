@@ -197,8 +197,7 @@ TEST(RdmaMemoryRegistrationPolicyTest, LocalOnlyBufferHasNoPublishedRkey) {
     auto local_desc = std::make_shared<TransferMetadata::SegmentDesc>();
     local_desc->name = "local-rdma-segment";
     local_desc->protocol = "rdma";
-    ASSERT_EQ(metadata->addLocalSegment(LOCAL_SEGMENT_ID,
-                                        "local-rdma-segment",
+    ASSERT_EQ(metadata->addLocalSegment(LOCAL_SEGMENT_ID, "local-rdma-segment",
                                         std::move(local_desc)),
               0);
 

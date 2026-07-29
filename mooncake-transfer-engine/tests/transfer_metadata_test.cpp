@@ -316,11 +316,9 @@ TEST(TransferMetadataPublicationTest, OmitsBufferWithoutRkey) {
     int sockfd = -1;
     const uint16_t port = findAvailableTcpPort(sockfd);
     ASSERT_GT(port, 0);
-    const std::string remote_segment_name =
-        "127.0.0.1:" + std::to_string(port);
+    const std::string remote_segment_name = "127.0.0.1:" + std::to_string(port);
 
-    auto server_desc =
-        makeRdmaSegmentDesc(remote_segment_name, kRemoteAddr);
+    auto server_desc = makeRdmaSegmentDesc(remote_segment_name, kRemoteAddr);
     auto local_only_buffer = makeRdmaBufferDesc(kLocalOnlyAddr);
     local_only_buffer.rkey.clear();
     server_desc->buffers.push_back(local_only_buffer);
@@ -334,10 +332,10 @@ TEST(TransferMetadataPublicationTest, OmitsBufferWithoutRkey) {
     rpc_desc.sockfd = sockfd;
     ASSERT_EQ(server.addRpcMetaEntry(remote_segment_name, rpc_desc), 0);
 
-    ASSERT_EQ(client.addLocalSegment(
-                  LOCAL_SEGMENT_ID, "127.0.0.1:0",
-                  makeRdmaSegmentDesc("127.0.0.1:0", 0x3000)),
-              0);
+    ASSERT_EQ(
+        client.addLocalSegment(LOCAL_SEGMENT_ID, "127.0.0.1:0",
+                               makeRdmaSegmentDesc("127.0.0.1:0", 0x3000)),
+        0);
 
     const auto segment_id = client.getSegmentID(remote_segment_name);
     ASSERT_NE(segment_id, static_cast<TransferMetadata::SegmentID>(-1));
