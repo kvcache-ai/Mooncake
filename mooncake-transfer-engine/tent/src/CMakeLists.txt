@@ -28,7 +28,8 @@ if(USE_HIP)
   list(APPEND CMAKE_PREFIX_PATH "/opt/rocm/lib/cmake")
   find_package(HIP REQUIRED)
   message(STATUS "ROCm/HIP: Enabled")
-  target_compile_definitions(tent_interface INTERFACE USE_HIP __HIP_PLATFORM_AMD__)
+  target_compile_definitions(tent_interface INTERFACE USE_HIP
+                                                      __HIP_PLATFORM_AMD__)
   target_include_directories(tent_interface INTERFACE ${HIP_INCLUDE_DIRS})
   target_link_libraries(tent_interface INTERFACE hip::host)
 else()
@@ -80,9 +81,9 @@ endif()
 if(USE_SUNRISE)
   target_compile_definitions(tent_interface INTERFACE USE_SUNRISE)
   target_include_directories(tent_interface INTERFACE ${MC_TANGRT_ROOT}/include)
-  target_link_directories(tent_interface INTERFACE
-                          ${MC_TANGRT_ROOT}/lib/linux-x86_64
-                          ${MC_TANGRT_ROOT}/lib)
+  target_link_directories(
+    tent_interface INTERFACE ${MC_TANGRT_ROOT}/lib/linux-x86_64
+    ${MC_TANGRT_ROOT}/lib)
   target_link_libraries(tent_interface INTERFACE tangrt_shared ptml_shared dl)
 endif()
 
@@ -148,6 +149,14 @@ foreach(
     target_link_libraries(tent_link_group INTERFACE ${tgt})
   endif()
 endforeach()
+if(TARGET mooncake_common)
+  # Use the archive path so CMake does not de-duplicate mooncake_common against
+  # an earlier transitive occurrence. TENT RPC objects reference the Transfer
+  # Engine client I/O pool accessor and need the archive inside this rescan
+  # group when all components are linked statically.
+  target_link_libraries(tent_link_group
+                        INTERFACE "$<TARGET_FILE:mooncake_common>")
+endif()
 target_link_libraries(tent_link_group INTERFACE "-Wl,--end-group")
 install(
   TARGETS tent_shared

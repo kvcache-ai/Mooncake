@@ -52,7 +52,7 @@ bool RpcInterface::initializeClient(size_t pool_size, size_t timeout_seconds) {
 bool RpcInterface::initializeServer(const std::string& listen_address,
                                     size_t thread_count,
                                     size_t timeout_seconds) {
-    return initialize(listen_address, thread_count, timeout_seconds, 4);
+    return initialize(listen_address, thread_count, timeout_seconds, 100);
 }
 
 bool RpcInterface::startServer() {
@@ -558,9 +558,9 @@ void bind_rpc_interface(pybind11::module_& m) {
         .def(py::init<>())
         .def("initialize", &RpcInterface::initialize,
              py::arg("listen_address") = "", py::arg("thread_count") = 0,
-             py::arg("timeout_seconds") = 30, py::arg("pool_size") = 10)
+             py::arg("timeout_seconds") = 30, py::arg("pool_size") = 100)
         .def("initialize_client", &RpcInterface::initializeClient,
-             py::arg("pool_size") = 10, py::arg("timeout_seconds") = 30)
+             py::arg("pool_size") = 100, py::arg("timeout_seconds") = 30)
         .def("initialize_server", &RpcInterface::initializeServer,
              py::arg("listen_address"), py::arg("thread_count") = 8,
              py::arg("timeout_seconds") = 30)

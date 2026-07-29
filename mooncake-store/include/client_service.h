@@ -661,6 +661,17 @@ class Client {
            const std::map<std::string, std::string>& labels = {},
            const std::string& tenant_id = "default");
 
+    /**
+     * @brief Prepare and use the storage backend for persisting data.
+     * Exposed to subclasses for testing only.
+     * @return ErrorCode::OK on success. On failure no storage backend is
+     * retained, so persistence stays disabled.
+     */
+    ErrorCode PrepareStorageBackend(const std::string& storage_root_dir,
+                                    const std::string& fsdir,
+                                    bool enable_eviction = true,
+                                    uint64_t quota_bytes = 0);
+
    private:
     /**
      * @brief Internal helper functions for initialization and data transfer
@@ -684,14 +695,6 @@ class Client {
     ErrorCode TransferReadRange(const Replica::Descriptor& replica_descriptor,
                                 std::vector<Slice>& slices,
                                 uint64_t src_offset);
-
-    /**
-     * @brief Prepare and use the storage backend for persisting data
-     */
-    void PrepareStorageBackend(const std::string& storage_root_dir,
-                               const std::string& fsdir,
-                               bool enable_eviction = true,
-                               uint64_t quota_bytes = 0);
 
     void PutToLocalFile(const std::string& object_key,
                         const std::vector<Slice>& slices,

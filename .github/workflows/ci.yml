@@ -172,7 +172,7 @@ jobs:
         export LD_LIBRARY_PATH=$GITHUB_WORKSPACE/build/mooncake-common:$GITHUB_WORKSPACE/build/mooncake-store/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base:$GITHUB_WORKSPACE/build/mooncake-common/etcd
         export CGO_ENABLED=1
         export CGO_CFLAGS="-I$GITHUB_WORKSPACE/mooncake-store/include -I$GITHUB_WORKSPACE/mooncake-transfer-engine/include"
-        export CGO_LDFLAGS="-L$GITHUB_WORKSPACE/build/mooncake-store/src -L$GITHUB_WORKSPACE/build/mooncake-store/src/cachelib_memory_allocator -L$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src -L$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base -L$GITHUB_WORKSPACE/build/mooncake-common -L$GITHUB_WORKSPACE/build/mooncake-common/etcd -lmooncake_store -lcachelib_memory_allocator -ltransfer_engine -lbase -lasio -letcd_wrapper -lstdc++ -lnuma -lglog -lgflags -libverbs -lmlx5 -ljsoncpp -lzstd -lcurl -luring -lasan -lm -lxxhash -lyaml-cpp"
+        export CGO_LDFLAGS="-L$GITHUB_WORKSPACE/build/mooncake-store/src -L$GITHUB_WORKSPACE/build/mooncake-store/src/cachelib_memory_allocator -L$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src -L$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base -L$GITHUB_WORKSPACE/build/mooncake-common -L$GITHUB_WORKSPACE/build/mooncake-common/src -L$GITHUB_WORKSPACE/build/mooncake-common/etcd -Wl,--start-group -lmooncake_store -lcachelib_memory_allocator -ltransfer_engine -lbase -lmooncake_common -Wl,--end-group -lasio -letcd_wrapper -lstdc++ -lnuma -lglog -lgflags -libverbs -lmlx5 -ljsoncpp -lzstd -lcurl -luring -lasan -lm -lxxhash -lyaml-cpp"
         # Link cudart if CUDA is available (needed for D2H staging in mooncake_store)
         if [ -d /usr/local/cuda/lib64 ]; then export CGO_LDFLAGS="$CGO_LDFLAGS -L/usr/local/cuda/lib64 -lcudart"; fi
         # KV events publisher (optional; linked when libzmq is installed)
@@ -557,6 +557,21 @@ jobs:
         MOONCAKE_STORE_INCLUDE_DIR=$GITHUB_WORKSPACE/mooncake-store/include \
           cargo test --examples --tests --no-run
         cargo clean
+      shell: bash
+
+    - name: Verify Mooncake Store Rust dlopen bindings and packaging
+      run: |
+        cd mooncake-store/rust
+        # 1. Committed dlopen bindings must stay in sync with store_c.h.
+        cargo run --locked --example generate_dlopen_bindings
+        git diff --exit-code -- src/generated/ffi_dlopen_bindings.rs
+        # 2. The published dlopen crate must build with no header/bindgen: package
+        #    it, extract, and check the dlopen feature against the packaged files.
+        cargo package --no-verify --allow-dirty
+        crate=$(ls target/package/mooncake_store-*.crate | head -1)
+        dest=$(mktemp -d)
+        tar xzf "$crate" -C "$dest"
+        (cd "$dest"/mooncake_store-* && cargo check --no-default-features --features dlopen)
       shell: bash
 
     - name: Configure project

@@ -64,6 +64,7 @@ TEST_F(MasterMetricsTest, InitialStatusTest) {
     ASSERT_EQ(metrics.get_put_start_requests(), 0);
     ASSERT_EQ(metrics.get_put_start_failures(), 0);
     ASSERT_EQ(metrics.get_put_start_alloc_failures(), 0);
+    ASSERT_EQ(metrics.get_put_start_partial_allocations(), 0);
     ASSERT_EQ(metrics.get_put_end_requests(), 0);
     ASSERT_EQ(metrics.get_put_end_failures(), 0);
     ASSERT_EQ(metrics.get_put_revoke_requests(), 0);
@@ -268,6 +269,36 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     // check segment mem used ratio for non-existent segment
     ASSERT_DOUBLE_EQ(metrics.get_segment_mem_used_ratio(""), 0.0);
     ASSERT_DOUBLE_EQ(metrics.get_segment_mem_used_ratio("xxxxxx_segment"), 0.0);
+}
+
+TEST_F(MasterMetricsTest, ServiceTeardownReleasesSegmentCapacity) {
+    auto& metrics = MasterMetricManager::instance();
+    const int64_t capacity_before = metrics.get_total_mem_capacity();
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "teardown_test_segment";
+    segment.base = 0x300000000;
+    segment.size = 1024 * 1024 * 16;
+    UUID client_id = generate_uuid();
+
+    {
+        WrappedMasterServiceConfig service_config;
+        service_config.default_kv_lease_ttl = 100;
+        service_config.enable_metric_reporting = false;
+        WrappedMasterService service(service_config);
+        ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+        ASSERT_EQ(metrics.get_total_mem_capacity(),
+                  capacity_before + static_cast<int64_t>(segment.size));
+        ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name),
+                  static_cast<int64_t>(segment.size));
+    }
+
+    // Destroying the service while the segment is still mounted (as happens
+    // when a master loses leadership) must release the segment's capacity
+    // contribution; MasterMetricManager outlives the service instance.
+    ASSERT_EQ(metrics.get_total_mem_capacity(), capacity_before);
+    ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name), 0);
 }
 
 TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
@@ -755,7 +786,7 @@ TEST_F(MasterMetricsTest, SummaryUsesWindowRatesAndCumulativeEviction) {
               std::string::npos);
     EXPECT_NE(
         window_summary.find("Eviction: Success/Attempts=1/2, AllocFail=0, "
-                            "keys=3, size=4.00 KB"),
+                            "PartialAlloc=0, keys=3, size=4.00 KB"),
         std::string::npos);
     EXPECT_NE(window_summary.find("Mem Eviction: Success/Attempts=1/2, "
                                   "keys=3, size=4.00 KB"),
@@ -768,7 +799,7 @@ TEST_F(MasterMetricsTest, SummaryUsesWindowRatesAndCumulativeEviction) {
         metrics.get_summary_string_and_update_snapshot();
     EXPECT_NE(
         reported_summary.find("Eviction: Success/Attempts=1/2, AllocFail=0, "
-                              "keys=3, size=4.00 KB"),
+                              "PartialAlloc=0, keys=3, size=4.00 KB"),
         std::string::npos);
 
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -776,7 +807,8 @@ TEST_F(MasterMetricsTest, SummaryUsesWindowRatesAndCumulativeEviction) {
         metrics.get_summary_string_and_update_snapshot();
     EXPECT_NE(idle_summary.find("PutStart=0.00/0.00"), std::string::npos);
     EXPECT_NE(idle_summary.find("Eviction: Success/Attempts=1/2, "
-                                "AllocFail=0, keys=3, size=4.00 KB"),
+                                "AllocFail=0, PartialAlloc=0, keys=3, "
+                                "size=4.00 KB"),
               std::string::npos);
     EXPECT_NE(idle_summary.find("Mem Eviction: Success/Attempts=1/2, "
                                 "keys=3, size=4.00 KB"),

@@ -72,8 +72,7 @@
         },
         "shm": {
             "enable" : true,
-            "cxl_mount_path": "",
-            "async_memcpy_threshold": 4
+            "cxl_mount_path": ""
         },
         "mnnvl": {
             "enable" : false
