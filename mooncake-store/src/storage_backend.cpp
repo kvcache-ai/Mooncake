@@ -1356,6 +1356,22 @@ StorageBackendAdaptor::StorageBackendAdaptor(
       total_size(0) {}
 
 tl::expected<void, ErrorCode> StorageBackendAdaptor::Init() {
+    namespace fs = std::filesystem;
+    // Validate obviously invalid configuration up front. A missing root
+    // directory is fine: StorageBackend::Init() creates it on demand.
+    std::error_code ec;
+    const auto root_status =
+        fs::status(file_storage_config_.storage_filepath, ec);
+    if (!ec && fs::exists(root_status) && !fs::is_directory(root_status)) {
+        LOG(ERROR) << "Storage path exists but is not a directory: "
+                   << file_storage_config_.storage_filepath;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (file_per_key_config_.fsdir.empty()) {
+        LOG(ERROR) << "FSDIR cannot be empty";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
     std::string storage_root =
         file_storage_config_.storage_filepath + file_per_key_config_.fsdir;
 

@@ -917,10 +917,18 @@ std::optional<std::shared_ptr<Client>> Client::Create(
                 LOG(INFO) << "Storage root directory is: " << storage_root_dir;
                 LOG(INFO) << "Fs subdir is: " << fs_subdir;
                 // Initialize storage backend with default eviction settings
-                client->PrepareStorageBackend(storage_root_dir, fs_subdir, true,
-                                              0);
+                auto prep_err = client->PrepareStorageBackend(
+                    storage_root_dir, fs_subdir, true, 0);
+                if (prep_err != ErrorCode::OK) {
+                    LOG(ERROR)
+                        << "Failed to initialize storage backend: " << prep_err
+                        << ". Persistence was requested via fsdir but is "
+                           "unavailable.";
+                    return std::nullopt;
+                }
             } else {
                 LOG(ERROR) << "Invalid fsdir format: " << dir_string;
+                return std::nullopt;
             }
         }
     } else {
@@ -940,11 +948,19 @@ std::optional<std::shared_ptr<Client>> Client::Create(
                           << config.enable_disk_eviction;
                 LOG(INFO) << "Quota bytes: " << config.quota_bytes;
                 // Initialize storage backend with config from master
-                client->PrepareStorageBackend(storage_root_dir, fs_subdir,
-                                              config.enable_disk_eviction,
-                                              config.quota_bytes);
+                auto prep_err = client->PrepareStorageBackend(
+                    storage_root_dir, fs_subdir, config.enable_disk_eviction,
+                    config.quota_bytes);
+                if (prep_err != ErrorCode::OK) {
+                    LOG(ERROR)
+                        << "Failed to initialize storage backend: " << prep_err
+                        << ". Persistence was requested via storage config "
+                           "but is unavailable.";
+                    return std::nullopt;
+                }
             } else {
                 LOG(ERROR) << "Invalid fsdir format: " << config.fsdir;
+                return std::nullopt;
             }
         }
     }
@@ -3348,20 +3364,32 @@ tl::expected<void, ErrorCode> Client::MarkTaskToComplete(
     return master_client_.MarkTaskToComplete(update_request);
 }
 
-void Client::PrepareStorageBackend(const std::string& storage_root_dir,
-                                   const std::string& fsdir,
-                                   bool enable_eviction, uint64_t quota_bytes) {
+ErrorCode Client::PrepareStorageBackend(const std::string& storage_root_dir,
+                                        const std::string& fsdir,
+                                        bool enable_eviction,
+                                        uint64_t quota_bytes) {
     // Initialize storage backend
-    storage_backend_ =
+    auto backend_result =
         StorageBackend::Create(storage_root_dir, fsdir, enable_eviction);
-    if (!storage_backend_) {
-        LOG(INFO) << "Failed to initialize storage backend";
+    if (!backend_result) {
+        LOG(ERROR) << "Failed to create storage backend: "
+                   << backend_result.error();
+        return backend_result.error();
     }
-    auto init_result = storage_backend_->Init(quota_bytes);
+    // Initialize into a local first and only publish to storage_backend_
+    // after a successful Init(): users of storage_backend_ only null-check
+    // it, so it must never point to a backend whose Init() failed (using it
+    // before successful Init() is undefined behavior). If Init() throws,
+    // stack unwinding destroys the local and storage_backend_ stays clean.
+    auto backend = std::move(backend_result.value());
+    auto init_result = backend->Init(quota_bytes);
     if (!init_result) {
         LOG(ERROR) << "Failed to initialize StorageBackend. Error: "
                    << init_result.error() << ". The backend will be unusable.";
+        return init_result.error();
     }
+    storage_backend_ = std::move(backend);
+    return ErrorCode::OK;
 }
 
 void Client::PutToLocalFile(const std::string& key,

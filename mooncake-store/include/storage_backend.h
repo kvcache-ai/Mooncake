@@ -427,28 +427,39 @@ class StorageBackend {
      * @param fsdir  subdirectory name
      * @param enable_eviction Whether to enable disk eviction feature (default:
      * true) Note: Eviction is controlled by the enable_eviction parameter
-     * @return shared_ptr to new instance or nullptr if directory is invalid
+     * @return shared_ptr to new instance, or INVALID_PARAMS if the
+     * configuration is invalid
      *
      * Performs validation of the root directory before creating the instance:
      * - Verifies directory exists
      * - Verifies path is actually a directory
+     * - Verifies fsdir is not empty
      */
-    static std::shared_ptr<StorageBackend> Create(const std::string& root_dir,
-                                                  const std::string& fsdir,
-                                                  bool enable_eviction = true) {
+    static tl::expected<std::shared_ptr<StorageBackend>, ErrorCode> Create(
+        const std::string& root_dir, const std::string& fsdir,
+        bool enable_eviction = true) {
         namespace fs = std::filesystem;
-        if (!fs::exists(root_dir)) {
-            LOG(INFO) << "Root directory does not exist: " << root_dir;
-            return nullptr;
-        } else if (!fs::is_directory(root_dir)) {
-            LOG(INFO) << "Root path is not a directory: " << root_dir;
-            return nullptr;
-        } else if (fsdir.empty()) {
-            LOG(INFO) << "FSDIR cannot be empty";
-            return nullptr;
+        std::error_code ec;
+        const auto root_status = fs::status(root_dir, ec);
+        if (ec) {
+            LOG(ERROR) << "Failed to access root directory: " << root_dir
+                       << " (error: " << ec.message() << ")";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
-
-        fs::path root_path(root_dir);
+        if (!fs::exists(root_status)) {
+            LOG(ERROR) << "Root directory does not exist: " << root_dir
+                       << ". Please create it first or fix the configured "
+                          "storage root directory.";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if (!fs::is_directory(root_status)) {
+            LOG(ERROR) << "Root path is not a directory: " << root_dir;
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if (fsdir.empty()) {
+            LOG(ERROR) << "FSDIR cannot be empty";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
 
         std::string real_fsdir = "moon_" + fsdir;
         return std::make_shared<StorageBackend>(root_dir, real_fsdir,
