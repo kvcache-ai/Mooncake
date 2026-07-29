@@ -56,7 +56,6 @@ set(MOONCAKE_STORE_SOURCES
     ha/snapshot/object/backends/s3/s3_snapshot_object_store.cpp
     ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store.cpp
     ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store.cpp
-    utils/type_util.cpp
     utils/file_util.cpp
     task_manager.cpp
     local_hot_cache.cpp
@@ -307,7 +306,9 @@ target_link_libraries(
          ${SPDK_STATIC_LIBS}
          yaml-cpp
          asio_shared
-  PRIVATE transfer_engine)
+         mooncake_common
+         yalantinglibs::yalantinglibs
+  PRIVATE transfer_engine JsonCpp::JsonCpp)
 if(STORE_USE_ETCD)
   add_dependencies(mooncake_store build_etcd_wrapper)
 endif()

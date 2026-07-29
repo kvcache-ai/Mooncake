@@ -29,6 +29,8 @@ class EnvironTest : public ::testing::Test {
     void clearTestEnvVars() {
         unsetenv("MC_TEST_INT");
         unsetenv("MC_TEST_INT64");
+        unsetenv("MC_TEST_UINT32");
+        unsetenv("MC_TEST_UINT64");
         unsetenv("MC_TEST_SIZET");
         unsetenv("MC_TEST_BOOL");
         unsetenv("MC_TEST_STRING");
@@ -98,6 +100,11 @@ TEST_F(EnvironTest, GetIntMinValue) {
     EXPECT_EQ(Environ::GetInt("MC_TEST_INT", 0), INT_MIN);
 }
 
+TEST_F(EnvironTest, GetIntSupportsTrimmedLeadingPlus) {
+    setenv("MC_TEST_INT", " \t+42\r\n", 1);
+    EXPECT_EQ(Environ::GetInt("MC_TEST_INT", 0), 42);
+}
+
 // --- GetInt64 ---
 
 TEST_F(EnvironTest, GetInt64ValidValue) {
@@ -122,6 +129,13 @@ TEST_F(EnvironTest, GetInt64NonNumeric) {
 TEST_F(EnvironTest, GetInt64Overflow) {
     setenv("MC_TEST_INT64", "99999999999999999999999999", 1);
     EXPECT_EQ(Environ::GetInt64("MC_TEST_INT64", 555), 555);
+}
+
+TEST_F(EnvironTest, UnsignedGettersUseRequestedDefaultForInvalidValues) {
+    setenv("MC_TEST_UINT32", "4294967296", 1);
+    setenv("MC_TEST_UINT64", "-1", 1);
+    EXPECT_EQ(Environ::GetUInt32("MC_TEST_UINT32", 17), 17U);
+    EXPECT_EQ(Environ::GetUInt64("MC_TEST_UINT64", 23), 23U);
 }
 
 // --- AWS / S3 fields ---
@@ -211,18 +225,25 @@ TEST_F(EnvironTest, GetSizeTOverflow) {
 // --- GetBool ---
 
 TEST_F(EnvironTest, GetBoolTrue) {
-    for (const char* v :
-         {"1", "true", "TRUE", "True", "on", "ON", "yes", "YES"}) {
+    for (const char* v : {"1", "true", "TRUE", "True", "on", "ON", "yes", "YES",
+                          "enable", "EnAbLe", " true "}) {
         setenv("MC_TEST_BOOL", v, 1);
         EXPECT_TRUE(Environ::GetBool("MC_TEST_BOOL", false)) << "for: " << v;
     }
 }
 
 TEST_F(EnvironTest, GetBoolFalse) {
-    for (const char* v : {"0", "false", "FALSE", "off", "no", "whatever"}) {
+    for (const char* v :
+         {"0", "false", "FALSE", "off", "no", "disable", "DiSaBlE"}) {
         setenv("MC_TEST_BOOL", v, 1);
         EXPECT_FALSE(Environ::GetBool("MC_TEST_BOOL", false)) << "for: " << v;
     }
+}
+
+TEST_F(EnvironTest, GetBoolInvalidUsesRequestedDefault) {
+    setenv("MC_TEST_BOOL", "whatever", 1);
+    EXPECT_TRUE(Environ::GetBool("MC_TEST_BOOL", true));
+    EXPECT_FALSE(Environ::GetBool("MC_TEST_BOOL", false));
 }
 
 TEST_F(EnvironTest, GetBoolMissing) {
@@ -232,7 +253,8 @@ TEST_F(EnvironTest, GetBoolMissing) {
 
 TEST_F(EnvironTest, GetBoolEmpty) {
     setenv("MC_TEST_BOOL", "", 1);
-    EXPECT_FALSE(Environ::GetBool("MC_TEST_BOOL", true));
+    EXPECT_TRUE(Environ::GetBool("MC_TEST_BOOL", true));
+    EXPECT_FALSE(Environ::GetBool("MC_TEST_BOOL", false));
 }
 
 // --- GetString ---

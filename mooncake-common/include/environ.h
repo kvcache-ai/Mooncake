@@ -93,9 +93,12 @@ class Environ {
     // Helper method to get int from env
     static int GetInt(const char* name, int default_value);
     static int64_t GetInt64(const char* name, int64_t default_value);
+    static uint32_t GetUInt32(const char* name, uint32_t default_value);
+    static uint64_t GetUInt64(const char* name, uint64_t default_value);
     // Helper method to get size_t from env
     static size_t GetSizeT(const char* name, size_t default_value);
-    // Helper method to get bool from env (checks for "1", "true", "TRUE")
+    // Helper method to get a canonical boolean from env. Invalid values use the
+    // caller-provided default.
     static bool GetBool(const char* name, bool default_value);
     // Helper method to get string from env
     static std::string GetString(const char* name,
