@@ -38,15 +38,13 @@ namespace mooncake {
 
 namespace {
 
-// A single unreachable peer can fail every slice of every batch aimed at it.
-// One production incident logged 147351 lines (56629 of them for a single
-// peer) in 35 minutes, which buried every other message in the log.  Sample
-// instead: the AV-teardown WARNING below is emitted once per affected peer and
-// carries the actionable information.
+// Rate-limit CQ error logs: a single dead peer can fail every slice of every
+// batch aimed at it and flood the log.  The AV-teardown WARNING below is
+// emitted once per affected peer and carries the actionable information.
 constexpr int kCqErrorLogEveryN = 256;
 
-// Same reasoning for peer_map_ eviction: a saturated map on a 16-NIC host logs
-// 16 x 16 = 256 evictions for every single new peer.
+// Same reasoning for peer_map_ eviction: a saturated map evicts once per
+// (local NIC x remote NIC) pair for every new peer.
 constexpr int kEvictLogEveryN = 256;
 
 // EFA provider errno values that mean "the address handle backing this peer is
@@ -631,12 +629,13 @@ std::shared_ptr<EfaEndPoint> EfaContext::endpoint(
     // Key the peer map by the full peer_nic_path verbatim.  Each distinct
     // value (including sglang DP>1 workers that share a host but own
     // different RPC ports, or successive generations of the same process
-    // that encode a timestamp) gets its own EfaEndPoint + AV slot.  This
-    // preserves per-worker identity.  Growth is bounded by FIFO eviction
+    // that encode a timestamp) gets its own handle / peer_map slot; the AV
+    // index may be shared between them, which is why av_slots_ refcounts.
+    // This preserves per-worker identity.  Growth is bounded by FIFO eviction
     // when peer_map_.size() would exceed peer_map_max_ (sized from
-    // MC_MAX_EP_PER_CTX at construct()).  The oldest inserted entry is
-    // disconnected (fi_av_remove) and erased; this keeps the AV table
-    // bounded without aliasing concurrent peers onto a shared slot.
+    // MC_MAX_EP_PER_CTX at construct()): the oldest inserted entry is
+    // disconnected and erased, keeping the AV table bounded without aliasing
+    // concurrent peers onto a shared slot.
     const std::string& key = peer_nic_path;
 
     {
@@ -672,11 +671,8 @@ std::shared_ptr<EfaEndPoint> EfaContext::endpoint(
         // construct()).
         if (peer_map_max_ > 0 && peer_map_.size() >= peer_map_max_ &&
             !peer_lru_.empty()) {
-            // Walk the LRU oldest-first for a victim with nothing in flight.
-            // fi_av_remove() on a slot that still has posted operations makes
-            // the EFA provider drop their completions entirely: the slices
-            // stay PENDING, wr_depth_ / cq outstanding never drain, and the
-            // caller's getTransferStatus() loop spins on WAITING forever.
+            // Walk the FIFO list oldest-first for a victim with nothing in
+            // flight (see av_slots_ for why a busy slot must not be retired).
             // Skipping busy peers means the map can transiently exceed
             // peer_map_max_ (see over_capacity below) -- correct, because an
             // AV entry on EFA/SRD costs a few bytes and there is no hard QP
@@ -705,9 +701,7 @@ std::shared_ptr<EfaEndPoint> EfaContext::endpoint(
 
     if (evicted_ep) {
         // WARNING, not INFO: reaching the cap means peer_map_ is saturated and
-        // every new peer now costs an eviction.  Rate-limited because a
-        // saturated map evicts once per (local NIC x remote NIC) pair per new
-        // peer -- 16x16 = 256 lines per peer on a 16-NIC host.
+        // every new peer now costs an eviction.
         LOG_EVERY_N(WARNING, kEvictLogEveryN)
             << "EFA peer_map_ is at capacity on " << nicPath()
             << "; evicting oldest peer to make room: " << evicted_path << " -> "
@@ -717,14 +711,8 @@ std::shared_ptr<EfaEndPoint> EfaContext::endpoint(
             << " still active; on EFA (SRD) an AV entry is a few bytes and"
             << " there is no hard QP limit to protect."
             << " [logged 1 of every " << kEvictLogEveryN << "]";
-        // disconnectIfIdle(), not disconnect(): it takes the victim's own write
-        // lock, so no submitter can be mid-post on that handle when the AV slot
-        // is released.  If the lock is contended it declines, and we put the
-        // entry back rather than tear down a handle in active use -- the map
-        // runs one over capacity until the next insert, which is far cheaper
-        // than a stranded transfer.  Any operations still outstanding against
-        // the underlying AV slot (possibly another endpoint's) keep it alive:
-        // removePeerAddr defers the fi_av_remove until they complete.
+        // disconnectIfIdle: put the entry back if the victim turns out to be
+        // busy (see disconnectIfIdle / av_slots_).
         if (!evicted_ep->disconnectIfIdle()) {
             RWSpinlock::WriteGuard guard(peer_map_lock_);
             if (peer_map_.find(evicted_path) == peer_map_.end()) {
@@ -767,7 +755,7 @@ int EfaContext::deleteEndpoint(const std::string& peer_nic_path) {
         peer_lru_.erase(it->second.lru_it);
         peer_map_.erase(it);
     }
-    if (ep) ep->disconnect();  // runs fi_av_remove
+    if (ep) ep->disconnect();  // disconnect; AV remove may be deferred
     return 0;
 }
 
@@ -903,19 +891,13 @@ int EfaContext::insertPeerAddrBytes(const uint8_t* addr, size_t len,
         return ERR_INVALID_ARGUMENT;
     }
 
-    // Hold post_lock_ across the insert AND the reference claim below.  This is
-    // what makes "insert" atomic with respect to removeSlotNow(), which takes
-    // the same lock and re-validates the counters under it.  Without it the
-    // pair races: fi_av_insert can return a live index and, before the
+    // Hold post_lock_ across the insert AND the reference claim below, which is
+    // what makes "insert" atomic with respect to removeSlotNow().  Without it
+    // the pair races: fi_av_insert can return a live index and, before the
     // refcount.fetch_add lands, a concurrent last-holder release sees
-    // refcount == 0 and fi_av_remove()s the slot out from under the new holder
-    // -- the very failure this bookkeeping exists to prevent, just with a
-    // narrower window.  (Reported in review of PR #2063.)
-    //
-    // Cheap: this is the handshake path, not the hot post path, and an EFA AV
-    // insert is a table write -- address-handle creation is lazy.  Lock order
-    // is post_lock_ -> av_ref_lock_ (via avSlot below), and nothing takes them
-    // the other way round, so there is no cycle.
+    // refcount == 0 and fi_av_remove()s the slot out from under the new holder.
+    // Lock order is post_lock_ -> av_ref_lock_ (via avSlot below), never the
+    // reverse, so there is no cycle.
     while (post_lock_.test_and_set(std::memory_order_acquire)) {
     }
     int ret = fi_av_insert(av_, addr, 1, &out, 0, nullptr);
@@ -1023,13 +1005,8 @@ void EfaContext::retireSlotIfPending(AvSlotState* slot, fi_addr_t fi_addr) {
 
 void EfaContext::removeSlotNow(AvSlotState* slot, fi_addr_t fi_addr) {
     // Serialize the removal against the post burst on the same lock the
-    // submitters use.  Refcounting alone is not enough: fi_av_remove() frees
-    // the index for reuse, so a holder that has already latched peer_fi_addr_
-    // can call fi_write() on a number the provider has meanwhile handed to a
-    // different peer -- observed as SIGSEGV in libfabric with dest_addr=0.
-    // Taking post_lock_ means a removal can never land between a submitter's
-    // check and its fi_write, and any post already inside the burst finishes
-    // first.
+    // submitters use, so a removal can never land between a submitter's check
+    // and its fi_write (see av_slots_).
     while (post_lock_.test_and_set(std::memory_order_acquire)) {
     }
     // Re-validate under the lock; this is the authoritative gate, and callers
@@ -1039,19 +1016,16 @@ void EfaContext::removeSlotNow(AvSlotState* slot, fi_addr_t fi_addr) {
     if (slot) {
         if (slot->refcount.load(std::memory_order_acquire) != 0) {
             // A fresh handshake re-admitted this address between the caller's
-            // check and now (the provider returns the same index for the same
-            // peer, so this is expected, not an error).  Removing would strand
-            // the new holder -- exactly the SIGSEGV this bookkeeping prevents.
-            // The inserter already cleared remove_pending, so nothing to undo.
+            // check and now (expected: the provider returns the same index for
+            // the same peer).  Removing would strand the new holder.  The
+            // inserter already cleared remove_pending, so nothing to undo.
             post_lock_.clear(std::memory_order_release);
             return;
         }
         if (slot->inflight.load(std::memory_order_acquire) != 0) {
-            // Operations were posted after the caller looked.  Hand the slot
-            // back to the deferred path rather than dropping their completions;
-            // the CQ poller retires it once the last one lands.  Re-arming
-            // remove_pending here is what keeps the slot from leaking when the
-            // caller had already CAS'd it to false.
+            // Operations were posted after the caller looked.  Re-arm the
+            // deferred path so the CQ poller retires the slot once the last
+            // one lands, rather than leaking it here.
             slot->remove_pending.store(true, std::memory_order_release);
             post_lock_.clear(std::memory_order_release);
             return;
@@ -1078,20 +1052,13 @@ void EfaContext::removePeerAddr(fi_addr_t fi_addr) {
         return;
     }
 
-    // Drop our reference; only the last holder may retire the slot.  Removing
-    // it while another EfaEndPoint still posts against the same index faults
-    // inside the provider (see av_slots_).
+    // Drop our reference; only the last holder may retire the slot
+    // (see av_slots_).
     if (slot->refcount.fetch_sub(1, std::memory_order_acq_rel) > 1) return;
 
-    // Last holder.  If operations are still posted against this slot, do NOT
-    // remove it now: the provider would drop their completions and the slices
-    // would sit in PENDING forever.  Mark it and let the CQ poller retire it
-    // once the last completion lands.
-    //
-    // Checking inflight here (a slot-wide count) rather than the endpoint's own
-    // counter is the whole point: one slot is shared by several endpoints, so
-    // an endpoint can be perfectly idle while the slot it is releasing still
-    // has a sibling's operations outstanding.
+    // Last holder, but the slot-wide inflight count -- not this endpoint's --
+    // decides whether it can go now: a sibling's operations may still be
+    // posted.  Defer to the CQ poller in that case.
     if (slot->inflight.load(std::memory_order_acquire) > 0) {
         slot->remove_pending.store(true, std::memory_order_release);
         // Re-check: the last completion may have landed between the load above
@@ -1170,17 +1137,9 @@ int EfaContext::submitPostSend(
 
         // Drop peer handle if it is no longer connected after submit,
         // freeing its AV entry for reuse.  Under the shared-endpoint model
-        // this is cheap (no fid_ep to destroy).
-        //
-        // deleteEndpointIfIdle(), not deleteEndpoint(): this runs on a submit
-        // thread while OTHER submit threads may still have operations posted
-        // against the same AV slot (one slot is shared by every handle for the
-        // same peer address).  The unconditional variant fi_av_remove()s the
-        // slot regardless, and the provider then completes those live
-        // operations with prov_errno=1 "Flushed during queue pair destroy" --
-        // or faults inside fi_cq_read while doing so.  If the peer is still
-        // busy we simply leave the handle in place; the CQ poller's stale-peer
-        // path retires it once the slot quiesces.
+        // this is cheap (no fid_ep to destroy).  ...IfIdle so a peer another
+        // submit thread is still posting on is left in place; see
+        // deleteEndpointIfIdle / av_slots_.
         if (rc != 0 && !ep->connected()) {
             deleteEndpointIfIdle(peer_nic_path);
         }
@@ -1192,9 +1151,8 @@ int EfaContext::submitPostSend(
 int EfaContext::submitSlicesOnPeer(
     fi_addr_t peer_fi_addr, std::vector<Transport::Slice*>& slice_list,
     std::vector<Transport::Slice*>& failed_slice_list) {
-    // In-flight accounting lives on the AV slot, not on the calling endpoint:
-    // several endpoints can share one slot, so only a slot-wide count can tell
-    // a teardown whether completions are still outstanding against it.
+    // In-flight accounting lives on the AV slot, not the calling endpoint
+    // (see av_slots_).
     AvSlotState* slot = avSlot(peer_fi_addr);
     // Batched submission against the shared endpoint.  Mirrors the previous
     // per-endpoint submit path but uses context-level wr_depth / post_lock.
@@ -1572,19 +1530,19 @@ int EfaContext::pollCq(int max_entries, int cq_index) {
                 err_count, std::memory_order_acq_rel);
         }
 
-        // Drop stale peer handles outside the drain loop: deleteEndpoint()
-        // takes peer_map_lock_ and calls fi_av_remove().  Duplicates within
-        // one drain are harmless -- deleteEndpoint() is a no-op once the
-        // entry is gone.
+        // Drop stale peer handles outside the drain loop:
+        // deleteEndpointIfIdle() takes peer_map_lock_ and may call
+        // fi_av_remove().  Duplicates within one drain are harmless -- it is a
+        // no-op once the entry is gone.  A busy peer keeps its entry and
+        // nothing schedules a retry; teardown happens whenever a later call
+        // path reaches this peer again.
         std::sort(stale_peers.begin(), stale_peers.end());
         stale_peers.erase(std::unique(stale_peers.begin(), stale_peers.end()),
                           stale_peers.end());
         for (const auto& peer : stale_peers) {
-            // Same constraint as eviction: fi_av_remove() while operations are
-            // still posted against the slot loses their completions and hangs
-            // those slices.  Deferring is safe and converges -- every op aimed
-            // at a dead peer fails the same way, so a later drain sees the
-            // counter at zero and does the teardown then.
+            // Same constraint as eviction (see av_slots_).  Deferring
+            // converges here: every op aimed at a dead peer fails the same
+            // way, so a later drain sees the counter at zero and tears down.
             if (!deleteEndpointIfIdle(peer)) {
                 LOG_EVERY_N(WARNING, kCqErrorLogEveryN)
                     << "EFA deferring peer-handle drop on " << nicPath()

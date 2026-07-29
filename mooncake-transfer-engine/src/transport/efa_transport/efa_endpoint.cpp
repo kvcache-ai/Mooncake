@@ -128,7 +128,7 @@ int EfaEndPoint::setupConnectionsByPassive(const HandShakeDesc& peer_desc,
     //
     // Log semantics:
     //   * Same cached peer address → benign symmetric handshake under
-    //     bilateral traffic.  Demote to INFO to keep decode logs readable
+    //     bilateral traffic.  Demote to VLOG(1) to keep decode logs readable
     //     without hiding real reconnects.
     //   * Different cached peer address → genuine reconnect (peer
     //     restart, port reshuffle that reached disconnect first, etc.).
@@ -179,21 +179,12 @@ bool EfaEndPoint::disconnectIfIdle() {
     // the write lock, neither able to advance).  Failing to acquire is
     // reported as "still busy" so the caller retries on a later drain.
     if (!lock_.tryLock()) return false;
-    // Holding the write lock only means no submitter is inside submitPostSend
-    // for THIS handle -- it says nothing about operations already posted
-    // against the shared AV slot, possibly by a sibling endpoint holding the
-    // same fi_addr_t.  Check that too, so "Idle" means what callers assume it
-    // means.
-    //
-    // Tearing down here would still be memory-safe (removePeerAddr() defers the
-    // fi_av_remove while inflight > 0), but it drops the handle to UNCONNECTED
-    // and forces the next batch through a fresh handshake -- and both callers
-    // pass a peer they only want to touch if it is quiet: peer_map_ eviction
-    // walks the LRU precisely to skip busy peers, and the stale-peer path
-    // retries on a later drain.  Reporting "busy" costs one retry; tearing down
-    // a live peer costs a re-handshake on the hot path.  (Reported in review of
-    // PR #2063: the previous code erased the map entry whenever the lock
-    // happened to be free, even with inflight > 0.)
+    // Idle means BOTH: the write lock was free (no submitter inside
+    // submitPostSend for this handle) and the shared AV slot has no inflight
+    // operations, possibly a sibling endpoint's (see EfaContext::av_slots_).
+    // Tearing down a busy peer here stays memory-safe, but it drops the handle
+    // to UNCONNECTED and forces the next batch through a fresh handshake --
+    // both callers only want to touch a peer that is quiet.
     if (context_.slotHasInflight(peer_fi_addr_)) {
         lock_.unlock();
         return false;
