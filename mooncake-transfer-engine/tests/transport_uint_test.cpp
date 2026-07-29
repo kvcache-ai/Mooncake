@@ -187,6 +187,47 @@ class BlockingRegistrationTransport : public Transport {
     bool release_first_registration_ = false;
 };
 
+class CountingRegistrationTransport : public Transport {
+   public:
+    int registrationCalls() const { return registration_calls_; }
+    int unregisterCalls() const { return unregister_calls_; }
+
+    Status submitTransfer(BatchID,
+                          const std::vector<TransferRequest>&) override {
+        return Status::OK();
+    }
+
+    Status getTransferStatus(BatchID, size_t, TransferStatus&) override {
+        return Status::OK();
+    }
+
+   private:
+    int registerLocalMemory(void*, size_t, const std::string&, bool,
+                            bool) override {
+        ++registration_calls_;
+        return 0;
+    }
+
+    int unregisterLocalMemory(void*, bool) override {
+        ++unregister_calls_;
+        return 0;
+    }
+
+    int registerLocalMemoryBatch(const std::vector<BufferEntry>&,
+                                 const std::string&) override {
+        return 0;
+    }
+
+    int unregisterLocalMemoryBatch(const std::vector<void*>&) override {
+        return 0;
+    }
+
+    const char* getName() const override { return "counting"; }
+
+    int registration_calls_ = 0;
+    int unregister_calls_ = 0;
+};
+
 class TransportTest : public ::testing::Test {
    protected:
     void SetUp() override {
@@ -368,6 +409,50 @@ TEST_F(TransportTest, RegisterLocalMemoryBatchAllowsAdjacentBuffers) {
     };
 
     EXPECT_EQ(engine.registerLocalMemoryBatch(entries, "cpu:0"), 0);
+}
+
+TEST_F(TransportTest, RegisterLocalMemoryAllowsIdempotentDuplicate) {
+    TransferEngineImpl engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    auto transport = std::make_shared<CountingRegistrationTransport>();
+    TransferEngineImplTestPeer::replaceTransports(engine, transport);
+
+    std::array<char, 128> buffer{};
+    EXPECT_EQ(engine.registerLocalMemory(buffer.data(), buffer.size(),
+                                         "cpu:0"),
+              0);
+    EXPECT_EQ(engine.registerLocalMemory(buffer.data(), buffer.size(),
+                                         "cpu:0"),
+              0);
+    EXPECT_EQ(transport->registrationCalls(), 1);
+
+    EXPECT_EQ(engine.unregisterLocalMemory(buffer.data()), 0);
+    EXPECT_EQ(transport->unregisterCalls(), 0);
+    EXPECT_EQ(engine.unregisterLocalMemory(buffer.data()), 0);
+    EXPECT_EQ(transport->unregisterCalls(), 1);
+}
+
+TEST_F(TransportTest, RegisterLocalMemoryBatchAllowsIdempotentDuplicate) {
+    TransferEngineImpl engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    auto transport = std::make_shared<BatchResultTransport>();
+    TransferEngineImplTestPeer::replaceTransports(engine, transport);
+
+    std::array<char, 2> buffer{};
+    std::vector<BufferEntry> entries = {
+        {buffer.data(), 1},
+        {buffer.data() + 1, 1},
+    };
+    std::vector<void*> addrs = {buffer.data(), buffer.data() + 1};
+
+    EXPECT_EQ(engine.registerLocalMemoryBatch(entries, "cpu:0"), 0);
+    EXPECT_EQ(engine.registerLocalMemoryBatch(entries, "cpu:0"), 0);
+    EXPECT_EQ(transport->registeredBufferCount(), entries.size());
+
+    EXPECT_EQ(engine.unregisterLocalMemoryBatch(addrs), 0);
+    EXPECT_EQ(transport->unregisterBatchCalls(), 0);
+    EXPECT_EQ(engine.unregisterLocalMemoryBatch(addrs), 0);
+    EXPECT_EQ(transport->unregisterBatchCalls(), 1);
 }
 
 TEST_F(TransportTest, ConcurrentRegisterLocalMemoryRejectsOverlap) {

@@ -401,6 +401,7 @@ class TransferEngineImpl {
         uint64_t length;
         std::string location;
         bool remote_accessible;
+        uint64_t ref_count = 1;
     };
 
     using MemoryRegionMap = std::map<uintptr_t, MemoryRegion>;
@@ -410,11 +411,17 @@ class TransferEngineImpl {
     bool hasOverlapInMapLocked(const MemoryRegionMap& regions, uintptr_t addr,
                                uint64_t length) const;
 
+    bool tryBumpLocalMemoryRegionRefs(
+        const std::vector<MemoryRegion>& regions);
+
     bool tryReserveMemoryRegions(const std::vector<MemoryRegion>& regions);
 
     void commitMemoryRegions(const std::vector<MemoryRegion>& regions);
 
     void releaseMemoryRegions(const std::vector<MemoryRegion>& regions);
+
+    std::vector<void*> releaseLocalMemoryRegionRefs(
+        const std::vector<void*>& addr_list);
 
     void insertMemoryRegionLocked(const MemoryRegion& region);
 
