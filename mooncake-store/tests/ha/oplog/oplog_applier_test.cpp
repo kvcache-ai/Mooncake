@@ -59,7 +59,6 @@ LocalDeleteTask MakeLocalDeleteTask(const std::string& key) {
         .key = key,
         .object_incarnation = {11, 12},
         .expected_bucket_id = 7,
-        .object_bytes = 1024,
     };
 }
 

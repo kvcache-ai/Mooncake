@@ -208,7 +208,6 @@ bool OpLogApplier::ApplyRemove(const OpLogEntry& entry) {
             return false;
         }
         if (payload.schema_version != 1) {
-            HAMetricManager::instance().inc_oplog_schema_incompatibility();
             LOG(ERROR) << "OpLogApplier: unsupported LOCAL_DISK delete "
                           "schema, sequence_id="
                        << entry.sequence_id;
@@ -254,7 +253,6 @@ bool OpLogApplier::ApplyLocalDeleteAck(const OpLogEntry& entry) {
         return false;
     }
     if (payload.schema_version != 1) {
-        HAMetricManager::instance().inc_oplog_schema_incompatibility();
         LOG(ERROR) << "OpLogApplier: unsupported LOCAL_DELETE_ACK schema, "
                    << "sequence_id=" << entry.sequence_id;
         return false;

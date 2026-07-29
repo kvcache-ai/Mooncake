@@ -36,9 +36,6 @@ HAMetricManager::HAMetricManager()
       oplog_checksum_failures_total_(
           "ha_oplog_checksum_failures_total",
           "Total number of OpLog entries with checksum verification failures"),
-      oplog_schema_incompatibility_total_(
-          "ha_oplog_schema_incompatibility_total",
-          "Total number of OpLog payloads rejected for an unknown schema"),
       oplog_gap_resolve_attempts_total_(
           "ha_oplog_gap_resolve_attempts_total",
           "Total number of attempts to resolve missing OpLog entries"),
@@ -201,10 +198,6 @@ void HAMetricManager::inc_oplog_checksum_failures(int64_t val) {
 
 int64_t HAMetricManager::get_oplog_checksum_failures_total() {
     return static_cast<int64_t>(oplog_checksum_failures_total_.value());
-}
-
-void HAMetricManager::inc_oplog_schema_incompatibility(int64_t val) {
-    oplog_schema_incompatibility_total_.inc(val);
 }
 
 void HAMetricManager::inc_oplog_gap_resolve_attempts(int64_t val) {
@@ -414,7 +407,6 @@ std::string HAMetricManager::serialize_metrics() {
     // Counters
     serialize_metric(oplog_skipped_entries_total_);
     serialize_metric(oplog_checksum_failures_total_);
-    serialize_metric(oplog_schema_incompatibility_total_);
     serialize_metric(oplog_gap_resolve_attempts_total_);
     serialize_metric(oplog_gap_resolve_success_total_);
     serialize_metric(oplog_etcd_write_failures_total_);

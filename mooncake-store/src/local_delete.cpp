@@ -252,28 +252,6 @@ size_t LocalDeleteRegistry::Size() const {
     return PendingCount(pending_);
 }
 
-size_t LocalDeleteRegistry::Size(
-    const std::string& local_disk_segment_id) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto it = pending_.find(local_disk_segment_id);
-    return it == pending_.end() ? 0 : it->second.size();
-}
-
-uint64_t LocalDeleteRegistry::OldestTaskAgeSeconds(uint64_t now_ms) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    uint64_t oldest_ms = now_ms;
-    bool found = false;
-    for (const auto& [_, tasks] : pending_) {
-        for (const auto& [__, task] : tasks) {
-            if (task.created_at_ms != 0 && task.created_at_ms <= oldest_ms) {
-                oldest_ms = task.created_at_ms;
-                found = true;
-            }
-        }
-    }
-    return found ? (now_ms - oldest_ms) / 1000 : 0;
-}
-
 void LocalDeleteRegistry::ReleaseReservation(size_t count) {
     std::lock_guard<std::mutex> lock(mutex_);
     reserved_ -= std::min(reserved_, count);

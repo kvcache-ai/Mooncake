@@ -169,6 +169,9 @@ Applies when `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
 | `MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT` | `500` | Max keys per bucket |
 | `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` | `0` | Eviction threshold in bytes. When set to `0`, the backend uses **90% of the physical disk capacity** as the quota — it does not mean unlimited. Set an explicit value to control disk usage precisely. |
 | `MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY` | `fifo` | Eviction policy: `none` / `fifo` / `lru` |
+| `MOONCAKE_OFFLOAD_BUCKET_GC_ENABLE` | `true` | Enable the single background worker that reclaims tombstoned records |
+| `MOONCAKE_OFFLOAD_BUCKET_GC_INTERVAL_SECONDS` | `10` | Normal GC scan interval |
+| `MOONCAKE_OFFLOAD_BUCKET_GC_DELETED_RATIO` | `0.25` | Minimum deleted-byte ratio for normal GC; disk pressure bypasses this threshold |
 
 ### File-per-key backend settings
 
@@ -237,7 +240,7 @@ Eviction is two-phase: the bucket is removed from metadata and master is notifie
 
 ### Proactive watermark eviction
 
-When `MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION=true`, the FileStorage heartbeat asks the backend to check local-disk usage every `MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS` seconds. If usage exceeds `MOONCAKE_OFFLOAD_DISK_EVICTION_HIGH_WATERMARK_RATIO`, the backend evicts toward `MOONCAKE_OFFLOAD_DISK_EVICTION_LOW_WATERMARK_RATIO`.
+When `MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION=true`, the FileStorage heartbeat asks the backend to check local-disk usage every `MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS` seconds. If usage exceeds `MOONCAKE_OFFLOAD_DISK_EVICTION_HIGH_WATERMARK_RATIO`, the bucket backend first asks GC to reclaim tombstoned records toward the low watermark. Live-bucket eviction remains the fallback when GC is disabled or no reclaimable bytes remain.
 
 | Backend | Behavior |
 |---------|----------|

@@ -1727,10 +1727,6 @@ MasterService::ReserveLocalDeleteTasks(const ObjectIdentity& object_id,
     }
     std::vector<LocalDeleteTask> tasks;
     std::unordered_set<std::string> seen_storage_ids;
-    const auto created_at_ms = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch())
-            .count());
     metadata.VisitReplicas(
         [](const Replica& replica) {
             return replica.is_local_disk_replica() && replica.is_completed();
@@ -1756,50 +1752,17 @@ MasterService::ReserveLocalDeleteTasks(const ObjectIdentity& object_id,
                 .key = object_id.user_key,
                 .object_incarnation = metadata.object_incarnation,
                 .expected_bucket_id = local_disk->GetBucketId(),
-                .object_bytes = static_cast<int64_t>(local_disk->object_size),
-                .created_at_ms = created_at_ms,
             });
         });
     if (tasks.size() > kMaxLocalDeleteTasksPerBatch) {
-        MasterMetricManager::instance().inc_local_delete_queue_rejected_total();
         return tl::unexpected(ErrorCode::TASK_PENDING_LIMIT_EXCEEDED);
     }
-    auto reservation = local_delete_registry_.Reserve(std::move(tasks));
-    if (!reservation &&
-        reservation.error() == ErrorCode::TASK_PENDING_LIMIT_EXCEEDED) {
-        MasterMetricManager::instance().inc_local_delete_queue_rejected_total();
-    }
-    return reservation;
+    return local_delete_registry_.Reserve(std::move(tasks));
 }
 
 void MasterService::PublishLocalDeleteReservation(
     const std::shared_ptr<LocalDeleteRegistry::Reservation>& reservation) {
-    std::vector<std::string> storage_ids;
-    storage_ids.reserve(reservation->tasks().size());
-    for (const auto& task : reservation->tasks()) {
-        if (std::find(storage_ids.begin(), storage_ids.end(),
-                      task.local_disk_segment_id) == storage_ids.end()) {
-            storage_ids.push_back(task.local_disk_segment_id);
-        }
-    }
     reservation->Publish();
-    RefreshLocalDeleteMetrics(storage_ids);
-}
-
-void MasterService::RefreshLocalDeleteMetrics(
-    const std::vector<std::string>& local_disk_segment_ids) {
-    auto& metrics = MasterMetricManager::instance();
-    for (const auto& storage_id : local_disk_segment_ids) {
-        metrics.set_pending_local_delete_tasks(
-            storage_id,
-            static_cast<int64_t>(local_delete_registry_.Size(storage_id)));
-    }
-    const auto now_ms = static_cast<uint64_t>(
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            std::chrono::system_clock::now().time_since_epoch())
-            .count());
-    metrics.set_local_delete_task_age_seconds(static_cast<int64_t>(
-        local_delete_registry_.OldestTaskAgeSeconds(now_ms)));
 }
 
 void MasterService::FinalizeMetadataEraseAfterDurable(
@@ -2602,16 +2565,6 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
                       "delete tasks";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
-    std::vector<std::string> restored_storage_ids;
-    for (const auto& task : pending_local_deletes) {
-        if (std::find(restored_storage_ids.begin(), restored_storage_ids.end(),
-                      task.local_disk_segment_id) ==
-            restored_storage_ids.end()) {
-            restored_storage_ids.push_back(task.local_disk_segment_id);
-        }
-    }
-    RefreshLocalDeleteMetrics(restored_storage_ids);
-
     // 2. Build allocator keepalive map for standby segments.
     for (const auto& [segment, bytes] : standby_accounted_memory_bytes_) {
         MasterMetricManager::instance().dec_allocated_mem_size(
@@ -6268,15 +6221,9 @@ auto MasterService::FetchLocalDeleteTasks(
     const UUID& client_id, const std::string& local_disk_segment_id,
     uint64_t mount_epoch, uint32_t limit)
     -> tl::expected<std::vector<LocalDeleteTask>, ErrorCode> {
-    auto tasks = local_delete_registry_.Fetch(
+    return local_delete_registry_.Fetch(
         client_id, local_disk_segment_id, mount_epoch,
         std::min(limit, kMaxLocalDeleteTasksPerBatch));
-    if (tasks) {
-        MasterMetricManager::instance().inc_local_delete_fetch_total(
-            static_cast<int64_t>(tasks->size()));
-        RefreshLocalDeleteMetrics({local_disk_segment_id});
-    }
-    return tasks;
 }
 
 auto MasterService::AckLocalDeleteTasks(
@@ -6309,11 +6256,7 @@ auto MasterService::AckLocalDeleteTasks(
             [this, local_disk_segment_id, task_ids](const OpLogEntry&) {
                 std::shared_lock<std::shared_mutex> snapshot_lock(
                     snapshot_mutex_);
-                const auto erased = local_delete_registry_.Erase(
-                    local_disk_segment_id, task_ids);
-                MasterMetricManager::instance().inc_local_delete_ack_total(
-                    static_cast<int64_t>(erased));
-                RefreshLocalDeleteMetrics({local_disk_segment_id});
+                local_delete_registry_.Erase(local_disk_segment_id, task_ids);
             });
         if (!append) {
             return tl::unexpected(append.error());
@@ -6321,11 +6264,7 @@ auto MasterService::AckLocalDeleteTasks(
         return {};
     }
 
-    const auto erased =
-        local_delete_registry_.Erase(local_disk_segment_id, task_ids);
-    MasterMetricManager::instance().inc_local_delete_ack_total(
-        static_cast<int64_t>(erased));
-    RefreshLocalDeleteMetrics({local_disk_segment_id});
+    local_delete_registry_.Erase(local_disk_segment_id, task_ids);
     return {};
 }
 
@@ -7577,7 +7516,8 @@ void MasterService::DiscardExpiredProcessingReplicas(
                     } else {
                         persist_result = AppendOpLogWithDurableFinalize(
                             OpType::PUT_END, tenant_it->first.value(), *key_it,
-                            SerializeMetadataForOpLogFromReplicaDescriptors(metadata, post_descriptors),
+                            SerializeMetadataForOpLogFromReplicaDescriptors(
+                                metadata, post_descriptors),
                             enable_oplog_
                                 ? [this, ttl](const OpLogEntry& durable_entry) {
                                       FinalizeExpiredProcessingReplicasAfterDurable(
@@ -7676,7 +7616,8 @@ void MasterService::DiscardExpiredProcessingReplicas(
                     persist_result = AppendOpLogWithDurableFinalize(
                         OpType::PUT_END, tenant_it->first.value(),
                         task_it->first,
-                        SerializeMetadataForOpLogFromReplicaDescriptors(metadata, post_descriptors),
+                        SerializeMetadataForOpLogFromReplicaDescriptors(
+                            metadata, post_descriptors),
                         enable_oplog_
                             ? [this, source_id,
                                target_ids = std::move(target_ids),
@@ -9434,7 +9375,6 @@ void MasterService::ClientMonitorFunc() {
             RecomputeTenantEffectiveQuotas();
         }
 
-        RefreshLocalDeleteMetrics({});
         std::this_thread::sleep_for(
             std::chrono::milliseconds(kClientMonitorSleepMs));
     }
@@ -9902,7 +9842,6 @@ MasterService::MetadataSerializer::Deserialize(
     LOG(INFO) << "Restored Replica::next_id_ to " << next_id;
 
     service_->local_delete_registry_.Reset();
-    std::vector<std::string> restored_storage_ids;
     if (pending_local_deletes_obj != nullptr) {
         if (pending_local_deletes_obj->type != msgpack::type::BIN) {
             return tl::make_unexpected(SerializationError(
@@ -9919,15 +9858,7 @@ MasterService::MetadataSerializer::Deserialize(
                 ErrorCode::DESERIALIZE_FAIL,
                 "Failed to restore pending LOCAL_DISK delete tasks"));
         }
-        for (const auto& task : tasks) {
-            if (std::find(
-                    restored_storage_ids.begin(), restored_storage_ids.end(),
-                    task.local_disk_segment_id) == restored_storage_ids.end()) {
-                restored_storage_ids.push_back(task.local_disk_segment_id);
-            }
-        }
     }
-    service_->RefreshLocalDeleteMetrics(restored_storage_ids);
     service_->RebuildGroupRoutingIndex();
     service_->ClearCandidatesForReload();
     return {};

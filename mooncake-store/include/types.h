@@ -263,13 +263,11 @@ struct LocalDeleteTask {
     std::string key;
     ObjectIncarnation object_incarnation;
     int64_t expected_bucket_id{-1};
-    int64_t object_bytes{0};
-    uint64_t created_at_ms{0};
 
     bool operator==(const LocalDeleteTask&) const = default;
 };
 YLT_REFL(LocalDeleteTask, task_id, local_disk_segment_id, tenant_id, key,
-         object_incarnation, expected_bucket_id, object_bytes, created_at_ms);
+         object_incarnation, expected_bucket_id);
 
 struct LocalDeleteRemovePayloadV1 {
     uint32_t schema_version{1};

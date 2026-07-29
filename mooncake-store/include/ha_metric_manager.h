@@ -77,7 +77,6 @@ class HAMetricManager {
      */
     void inc_oplog_checksum_failures(int64_t val = 1);
     int64_t get_oplog_checksum_failures_total();
-    void inc_oplog_schema_incompatibility(int64_t val = 1);
 
     /**
      * @brief Increment counter for gap resolve attempts
@@ -217,7 +216,6 @@ class HAMetricManager {
     // Error Counters
     ylt::metric::counter_t oplog_skipped_entries_total_;
     ylt::metric::counter_t oplog_checksum_failures_total_;
-    ylt::metric::counter_t oplog_schema_incompatibility_total_;
     ylt::metric::counter_t oplog_gap_resolve_attempts_total_;
     ylt::metric::counter_t oplog_gap_resolve_success_total_;
     ylt::metric::counter_t oplog_etcd_write_failures_total_;

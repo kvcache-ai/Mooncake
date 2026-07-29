@@ -59,8 +59,6 @@ class LocalDeleteRegistry {
     bool Restore(const std::vector<LocalDeleteTask>& tasks);
     void Reset();
     size_t Size() const;
-    size_t Size(const std::string& local_disk_segment_id) const;
-    uint64_t OldestTaskAgeSeconds(uint64_t now_ms) const;
 
    private:
     struct MountState {

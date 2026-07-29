@@ -481,10 +481,6 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
         }
         return init_storage_backend_result;
     }
-    if (ssd_metric_ != nullptr) {
-        ssd_metric_->bucket_reclaimable_bytes.update(
-            storage_backend_->GetReclaimableBytes());
-    }
     auto enable_offloading_result = IsEnableOffloading();
     if (enable_offloading_result.has_value()) {
         LOG(INFO) << "IsEnableOffloading result: "
@@ -856,11 +852,6 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                          << result.error() << " count: " << failed_tasks.size();
         }
     }
-    if (ssd_metric_ != nullptr) {
-        ssd_metric_->bucket_reclaimable_bytes.update(
-            storage_backend_->GetReclaimableBytes());
-    }
-
     if (abort_error) {
         return tl::make_unexpected(*abort_error);
     }
@@ -921,6 +912,15 @@ tl::expected<void, ErrorCode> FileStorage::RunDiskWatermarkEviction() {
         return {};
     }
 
+    // Reclaim dead records before evicting live LOCAL_DISK replicas. The
+    // backend only signals its GC worker here; no compaction I/O runs on the
+    // heartbeat thread.
+    if (storage_backend_->GetReclaimableBytes() > 0 &&
+        storage_backend_->RequestGarbageCollection(
+            /* require_disk_pressure = */ true)) {
+        return {};
+    }
+
     auto eviction_result = storage_backend_->EvictAboveDiskWatermark(
         config_.disk_eviction_high_watermark_ratio,
         config_.disk_eviction_low_watermark_ratio,
@@ -933,10 +933,6 @@ tl::expected<void, ErrorCode> FileStorage::RunDiskWatermarkEviction() {
     if (!eviction_result.value().empty()) {
         LOG(INFO) << "Disk watermark eviction removed "
                   << eviction_result.value().size() << " LOCAL_DISK key(s)";
-        if (ssd_metric_ != nullptr) {
-            ssd_metric_->bucket_reclaimable_bytes.update(
-                storage_backend_->GetReclaimableBytes());
-        }
     }
     return {};
 }
@@ -1121,12 +1117,9 @@ tl::expected<void, ErrorCode> FileStorage::ProcessLocalDeleteTasks() {
 
     std::vector<LocalDeleteTaskId> terminal_task_ids;
     terminal_task_ids.reserve(results.size());
+    bool tombstone_created = false;
     for (size_t i = 0; i < results.size(); ++i) {
         const auto& result = results[i];
-        if (ssd_metric_ != nullptr) {
-            ssd_metric_->bucket_tombstone_total.inc(
-                {LocalDeleteResultLabel(result.result)});
-        }
         const auto& task = tasks[i];
         VLOG(1) << "LOCAL_DISK delete task=" << task.task_id.high << "-"
                 << task.task_id.low
@@ -1140,10 +1133,10 @@ tl::expected<void, ErrorCode> FileStorage::ProcessLocalDeleteTasks() {
         if (result.IsTerminal()) {
             terminal_task_ids.push_back(result.task_id);
         }
+        tombstone_created |= result.result == LocalDeleteResult::kRemoved;
     }
-    if (ssd_metric_ != nullptr) {
-        ssd_metric_->bucket_reclaimable_bytes.update(
-            storage_backend_->GetReclaimableBytes());
+    if (tombstone_created) {
+        storage_backend_->RequestGarbageCollection();
     }
     if (terminal_task_ids.empty()) {
         return {};
@@ -1187,18 +1180,18 @@ ErrorCode FileStorage::ReconcileScannedObjects(
             .key = TenantId(objects[i].tenant_id).MakeScopedKey(objects[i].key),
             .object_incarnation = objects[i].GetObjectIncarnation(),
             .expected_bucket_id = metadatas[i].bucket_id,
-            .object_bytes = metadatas[i].data_size,
         });
     }
 
+    bool tombstone_created = false;
     for (const auto& result : storage_backend_->BatchMarkDeleted(stale)) {
         if (!result.IsTerminal()) {
             return result.error;
         }
+        tombstone_created |= result.result == LocalDeleteResult::kRemoved;
     }
-    if (!stale.empty() && ssd_metric_ != nullptr) {
-        ssd_metric_->bucket_reclaimable_bytes.update(
-            storage_backend_->GetReclaimableBytes());
+    if (tombstone_created) {
+        storage_backend_->RequestGarbageCollection();
     }
     if (retained_objects.empty()) {
         return ErrorCode::OK;
@@ -1219,9 +1212,6 @@ void FileStorage::RemoveAll() {
     // physical isolation needs backend-level tenant-scoped layout (follow-up).
     if (storage_backend_) {
         storage_backend_->RemoveAll();
-    }
-    if (ssd_metric_ != nullptr) {
-        ssd_metric_->bucket_reclaimable_bytes.update(0);
     }
     LOG(INFO) << "FileStorage::RemoveAll: cleared storage backend";
 }

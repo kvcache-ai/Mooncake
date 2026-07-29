@@ -43,7 +43,6 @@ LocalDeleteTask MakeTask(std::string storage_id, std::string key) {
         .key = std::move(key),
         .object_incarnation = GenerateObjectIncarnation(),
         .expected_bucket_id = 7,
-        .object_bytes = 1024,
     };
 }
 
@@ -165,22 +164,6 @@ TEST(LocalDeleteRegistryTest, DuplicateDurableTasksDoNotConsumeCapacity) {
     EXPECT_EQ(registry.Size(), 1);
     EXPECT_FALSE(
         registry.ApplyDurableTasks({MakeTask("disk-a", "another-key")}));
-}
-
-TEST(LocalDeleteRegistryTest, ReportsPerStorageCountAndOldestTaskAge) {
-    LocalDeleteRegistry registry;
-    auto older = MakeTask("disk-a", "older");
-    older.created_at_ms = 1000;
-    auto newer = MakeTask("disk-b", "newer");
-    newer.created_at_ms = 2500;
-    ASSERT_TRUE(registry.ApplyDurableTasks({older, newer}));
-
-    EXPECT_EQ(registry.Size("disk-a"), 1);
-    EXPECT_EQ(registry.Size("disk-b"), 1);
-    EXPECT_EQ(registry.OldestTaskAgeSeconds(4500), 3);
-
-    registry.Erase("disk-a", {older.task_id});
-    EXPECT_EQ(registry.OldestTaskAgeSeconds(4500), 2);
 }
 
 TEST(LocalDeleteRegistryTest, InvalidTasksAreRejected) {

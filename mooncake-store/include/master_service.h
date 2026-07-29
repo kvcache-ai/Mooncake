@@ -1558,8 +1558,6 @@ class MasterService {
                             const ObjectMetadata& metadata);
     void PublishLocalDeleteReservation(
         const std::shared_ptr<LocalDeleteRegistry::Reservation>& reservation);
-    void RefreshLocalDeleteMetrics(
-        const std::vector<std::string>& local_disk_segment_ids);
     void FinalizeMetadataEraseAfterDurable(const OpLogEntry& durable_entry,
                                            QuotaEraseMode quota_mode);
     void FinalizeExpiredProcessingReplicasAfterDurable(
