@@ -306,7 +306,7 @@ TEST(TransferMetadataPollingTest, PollingRefreshesCachedRemoteSegmentDesc) {
     FAIL() << "TE metadata refresh polling did not refresh cached descriptor";
 }
 
-TEST(TransferMetadataPublicationTest, OmitsBufferWithoutRkey) {
+TEST(TransferMetadataPublicationTest, PreservesLocalOnlyBufferWithoutRkey) {
     constexpr uint64_t kRemoteAddr = 0x1000;
     constexpr uint64_t kLocalOnlyAddr = 0x2000;
 
@@ -341,8 +341,10 @@ TEST(TransferMetadataPublicationTest, OmitsBufferWithoutRkey) {
     ASSERT_NE(segment_id, static_cast<TransferMetadata::SegmentID>(-1));
     auto remote_desc = client.getSegmentDescByID(segment_id, true);
     ASSERT_NE(remote_desc, nullptr);
-    ASSERT_EQ(remote_desc->buffers.size(), 1);
+    ASSERT_EQ(remote_desc->buffers.size(), 2);
     EXPECT_EQ(remote_desc->buffers[0].addr, kRemoteAddr);
+    EXPECT_EQ(remote_desc->buffers[1].addr, kLocalOnlyAddr);
+    EXPECT_TRUE(remote_desc->buffers[1].rkey.empty());
 }
 
 TEST(HandshakeFrameTest, ValidFrameRoundTrips) {
