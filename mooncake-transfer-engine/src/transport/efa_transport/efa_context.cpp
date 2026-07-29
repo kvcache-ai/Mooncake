@@ -344,6 +344,50 @@ int EfaContext::deconstruct() {
     return 0;
 }
 
+#if defined(USE_CUDA)
+// Bind `device_ordinal`'s primary context to the calling thread if it has no
+// current context.
+//
+// fi_mr_regattr() on FI_HMEM_CUDA memory reaches libfabric's
+// cuda_get_dmabuf_fd() (hmem_cuda.c), which calls the *driver* API
+// cuMemGetHandleForAddressRange() with no context management of its own -- it
+// assumes the caller already has a current context.  A std::thread that has
+// only ever touched the runtime API has none, so the export returns
+// CUDA_ERROR_INVALID_CONTEXT.  libfabric then takes the no-fallback path
+// (efa_hmem.c never sets dmabuf_fallback_enabled for FI_HMEM_CUDA), reaches
+// efa_mr.c's `if (!errno) errno = ENOTSUP; return -errno;` and reports a bare
+// "Operation not supported" that names neither the real cause nor the thread.
+//
+// Two callers reach us on such a thread: registerLocalMemoryBatch() runs one
+// std::async(std::launch::async) per buffer, and registerLocalMemory() can fan
+// out one std::thread per NIC.  The failure is a race -- it only hits threads
+// that register before any CUDA call has bound a context on them -- so it looks
+// intermittent and scales with how many buffers are registered at once.  It is
+// not benign: registerLocalMemory() calls rollbackChunks() on error, so an
+// affected buffer ends up registered on *no* NIC, and the first KV transfer
+// that touches it fails with a misleading "remote mooncake session ... is not
+// alive". Observed on p6-b300 with a large hybrid-attention KV pool: 8 of ~1456
+// registrations failed, exactly one per rank, all of them the earliest
+// registrations in the process.
+//
+// cuDevicePrimaryCtxRetain() returns the same primary context the CUDA runtime
+// uses, so this binds the thread to the process's existing context rather than
+// creating a new one.  The retain is intentionally not released: the primary
+// context outlives every registration, and dropping the last reference here
+// would tear down the context the rest of the process is using.
+static void bindCudaContextIfNeeded(int device_ordinal) {
+    CUcontext cur = nullptr;
+    if (cuCtxGetCurrent(&cur) == CUDA_SUCCESS && cur != nullptr) return;
+
+    CUdevice dev;
+    if (cuDeviceGet(&dev, device_ordinal) != CUDA_SUCCESS) return;
+
+    CUcontext primary = nullptr;
+    if (cuDevicePrimaryCtxRetain(&primary, dev) != CUDA_SUCCESS) return;
+    cuCtxSetCurrent(primary);
+}
+#endif
+
 int EfaContext::registerMemoryRegionInternal(void* addr, size_t length,
                                              int access,
                                              EfaMemoryRegionMeta& mrMeta) {
@@ -388,6 +432,12 @@ int EfaContext::registerMemoryRegionInternal(void* addr, size_t length,
 
     int ret;
     if (iface != FI_HMEM_SYSTEM) {
+#if defined(USE_CUDA)
+        // Registering GPU memory needs a current CUDA context on this
+        // thread, and our callers may reach us on a freshly spawned one.
+        // See bindCudaContextIfNeeded().
+        bindCudaContextIfNeeded(device_ordinal);
+#endif
         // GPU memory: use fi_mr_regattr with explicit iface and device
         struct iovec iov = {.iov_base = addr, .iov_len = length};
         struct fi_mr_attr attr = {};
