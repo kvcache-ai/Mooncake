@@ -24,6 +24,7 @@ distributed execution components.
 | [Engram](engram) | Distributed serving and cache architecture. |
 | [Unified Parallel Tensor I/O](unified-parallel-tensor-io) | Parallel tensor storage and transfer model. |
 | [SSD Offload](ssd-offload) | SSD-backed cache hierarchy design. |
+| [SSD GDS Offload](ssd-gds) | GPU Direct Storage offload: GPU-to-NVMe DMA design and usage. |
 | [SSD Free-Ratio-First Allocation](ssd-free-ratio-first-allocation) | Capacity-aware replica placement strategy. |
 
 ## Distributed Execution and Routing

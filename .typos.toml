@@ -1,5 +1,5 @@
 [default]
-extend-ignore-words = ["CANN", "ASO", "fre", "wqs", "hsa", "ue"]
+extend-ignore-words = ["CANN", "ASO", "fre", "wqs", "hsa", "ue", "cuFile", "NVMe", "P2PDMA", "D2H", "pwrite", "pwritev", "fadvise", "DONTNEED", "FilePerKey", "ConcatSlicesToString", "BuildBucket", "WriteBucket"]
 
 [default.extend-words]
 CANN = "CANN"

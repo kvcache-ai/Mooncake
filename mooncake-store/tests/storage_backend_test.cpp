@@ -1,4 +1,5 @@
 #include "storage_backend.h"
+#include "gds/gds_context.h"  // complete type for unique_ptr<GdsContext>
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -4180,6 +4181,71 @@ TEST_F(StorageBackendTest,
     EXPECT_EQ(LoadOne(recovered, "key_c", value_c.size()),
               std::make_optional(value_c));
     EXPECT_FALSE(recovered.IsExist("key_missing").value_or(true));
+}
+
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_Reserve_StampsPlaceholderHeader) {
+    // ReserveOffloadSpace must stamp a placeholder header (unknown flag
+    // bit) at the reserved offset, so crash recovery can distinguish a
+    // never-written reservation from a real record.
+    auto config = MakeOffsetPersistConfig(data_path, 64 * 1024);
+    OffsetAllocatorBackendConfig backend_cfg;
+    backend_cfg.persist_mode = OffsetPersistMode::kStrict;
+
+    OffsetAllocatorStorageBackend backend(config, backend_cfg);
+    ASSERT_TRUE(backend.Init());
+    auto reservation = backend.ReserveOffloadSpace("key_reserved", 1000);
+    ASSERT_TRUE(reservation.has_value());
+
+    using RecordHeader = OffsetAllocatorStorageBackend::RecordHeader;
+    const std::string data_file =
+        (std::filesystem::path(data_path) / "kv_cache.data").string();
+    int fd = ::open(data_file.c_str(), O_RDONLY | O_CLOEXEC);
+    ASSERT_GE(fd, 0);
+    char hdr_buf[RecordHeader::SIZE];
+    ASSERT_EQ(::pread(fd, hdr_buf, RecordHeader::SIZE,
+                      static_cast<off_t>(reservation->offset)),
+              static_cast<ssize_t>(RecordHeader::SIZE));
+    ::close(fd);
+    RecordHeader hdr = RecordHeader::ReadFrom(hdr_buf);
+    EXPECT_NE(hdr.flags & RecordHeader::kFlagReservationPlaceholder, 0u);
+    EXPECT_NE((hdr.flags & ~RecordHeader::kKnownFlags), 0u)
+        << "placeholder must be rejected as an unknown flag on recovery";
+}
+
+TEST_F(StorageBackendTest,
+       OffsetAllocatorStorageBackend_Persist_ReservedPlaceholderNotRecovered) {
+    // A reserved-but-never-written extent is covered by the checkpoint
+    // (allocator state + FIFO entry) but holds no real record.  Recovery
+    // must skip it via the placeholder header instead of parsing whatever
+    // stale bytes occupy the extent as a valid record.
+    auto config = MakeOffsetPersistConfig(data_path, 64 * 1024);
+    OffsetAllocatorBackendConfig backend_cfg;
+    backend_cfg.eviction_policy = OffsetEvictionPolicy::FIFO;
+    backend_cfg.persist_mode = OffsetPersistMode::kStrict;
+
+    const std::string value_live(1000, 'L');
+    {
+        OffsetAllocatorStorageBackend backend(config, backend_cfg);
+        ASSERT_TRUE(backend.Init());
+        auto reservation = backend.ReserveOffloadSpace("key_reserved", 1000);
+        ASSERT_TRUE(reservation.has_value());
+        // kStrict: this batch checkpoints, covering the reservation's
+        // allocator extent and FIFO entry.  The client then crashes
+        // before WriteAtOffset / CompleteOffloadSpace -- nothing ever
+        // overwrites the placeholder header.
+        std::vector<std::unique_ptr<char[]>> buffers;
+        auto batch = MakeSingleKeyBatch("key_live", value_live, buffers);
+        auto res = backend.BatchOffload(batch, NoopCompleteHandler(), nullptr);
+        ASSERT_TRUE(res.has_value());
+        ASSERT_EQ(res.value(), 1);
+    }
+
+    OffsetAllocatorStorageBackend recovered(config, backend_cfg);
+    ASSERT_TRUE(recovered.Init());
+    EXPECT_EQ(LoadOne(recovered, "key_live", value_live.size()),
+              std::make_optional(value_live));
+    EXPECT_FALSE(recovered.IsExist("key_reserved").value_or(true));
 }
 
 TEST_F(StorageBackendTest,

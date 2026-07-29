@@ -84,4 +84,17 @@ struct TenantIdHash {
     }
 };
 
+// Compatibility wrappers for MakeTenantScopedStorageKey /
+// ParseTenantScopedStorageKey
+inline std::string MakeTenantScopedStorageKey(const std::string& tenant_id,
+                                              std::string_view key) {
+    return TenantId(tenant_id).MakeScopedKey(key);
+}
+
+inline std::pair<std::string, std::string> ParseTenantScopedStorageKey(
+    std::string_view scoped_key) {
+    auto [tid, uk] = TenantId::ParseScopedKey(scoped_key);
+    return {tid.value(), std::move(uk)};
+}
+
 }  // namespace mooncake
