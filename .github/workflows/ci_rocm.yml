@@ -59,9 +59,11 @@ jobs:
         if ! command -v "python${PYV}" >/dev/null 2>&1; then
           add-apt-repository -y ppa:deadsnakes/ppa
           apt-get update -y
-          apt-get install -y --no-install-recommends \
-            "python${PYV}" "python${PYV}-dev" "python${PYV}-venv"
         fi
+        # Always install -dev + -venv: the image's system python3.10 exists but
+        # ships without the venv module / dev headers.
+        apt-get install -y --no-install-recommends \
+          "python${PYV}" "python${PYV}-dev" "python${PYV}-venv"
         curl -sS https://bootstrap.pypa.io/get-pip.py | "python${PYV}"
         PYTHON_BIN="$(command -v python${PYV})"
         echo "PYTHON_BIN=${PYTHON_BIN}" >> "$GITHUB_ENV"
