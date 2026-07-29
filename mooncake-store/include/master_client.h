@@ -211,11 +211,13 @@ class MasterClient {
     /**
      * @brief Ends a put operation
      * @param key Object key
+     * @param replica_ids IDs returned by the matching PutStart
      * @param replica_type Type of replica (memory or disk)
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
     [[nodiscard]] tl::expected<void, ErrorCode> PutEnd(
-        const std::string& key, ReplicaType replica_type);
+        const std::string& key, const std::vector<ReplicaID>& replica_ids,
+        ReplicaType replica_type);
 
     /**
      * @brief Ends a put operation for a batch of objects
@@ -229,11 +231,13 @@ class MasterClient {
     /**
      * @brief Revokes a put operation
      * @param key Object key
+     * @param replica_ids IDs returned by the matching PutStart
      * @param replica_type Type of replica (memory or disk)
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
     [[nodiscard]] tl::expected<void, ErrorCode> PutRevoke(
-        const std::string& key, ReplicaType replica_type);
+        const std::string& key, const std::vector<ReplicaID>& replica_ids,
+        ReplicaType replica_type);
 
     /**
      * @brief Revokes a put operation for a batch of objects
@@ -263,13 +267,15 @@ class MasterClient {
                      const ReplicateConfig& config);
 
     [[nodiscard]] tl::expected<void, ErrorCode> UpsertEnd(
-        const std::string& key, ReplicaType replica_type);
+        const std::string& key, const std::vector<ReplicaID>& replica_ids,
+        ReplicaType replica_type);
 
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchUpsertEnd(
         const std::vector<std::string>& keys);
 
     [[nodiscard]] tl::expected<void, ErrorCode> UpsertRevoke(
-        const std::string& key, ReplicaType replica_type);
+        const std::string& key, const std::vector<ReplicaID>& replica_ids,
+        ReplicaType replica_type);
 
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchUpsertRevoke(
         const std::vector<std::string>& keys);

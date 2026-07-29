@@ -4982,9 +4982,11 @@ TEST_F(MasterServiceTest, WrappedBatchExistKeyUsesTenantAwareBatchPath) {
     auto default_put_start =
         service_.PutStart(client_id, default_only_key, 1024, config);
     ASSERT_TRUE(default_put_start.has_value());
-    ASSERT_TRUE(
-        service_.PutEnd(client_id, default_only_key, ReplicaType::MEMORY)
-            .has_value());
+    ASSERT_TRUE(service_
+                    .PutEnd(client_id, default_only_key,
+                            {default_put_start->front().id},
+                            ReplicaType::MEMORY)
+                    .has_value());
 
     auto& metrics = MasterMetricManager::instance();
     const auto base_requests = metrics.get_batch_exist_key_requests();

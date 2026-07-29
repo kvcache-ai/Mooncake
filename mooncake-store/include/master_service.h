@@ -422,7 +422,8 @@ class MasterService {
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
     auto PutEnd(const UUID& client_id, const std::string& key,
-                const TenantId& tenant_id, ReplicaType replica_type)
+                const TenantId& tenant_id, ReplicaType replica_type,
+                const std::vector<ReplicaID>& replica_ids = {})
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -439,7 +440,8 @@ class MasterService {
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
     auto PutRevoke(const UUID& client_id, const std::string& key,
-                   const TenantId& tenant_id, ReplicaType replica_type)
+                   const TenantId& tenant_id, ReplicaType replica_type,
+                   const std::vector<ReplicaID>& replica_ids = {})
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -478,14 +480,16 @@ class MasterService {
      * @brief Complete an upsert operation. Delegates to PutEnd.
      */
     auto UpsertEnd(const UUID& client_id, const std::string& key,
-                   const TenantId& tenant_id, ReplicaType replica_type)
+                   const TenantId& tenant_id, ReplicaType replica_type,
+                   const std::vector<ReplicaID>& replica_ids = {})
         -> tl::expected<void, ErrorCode>;
 
     /**
      * @brief Revoke an upsert operation. Delegates to PutRevoke.
      */
     auto UpsertRevoke(const UUID& client_id, const std::string& key,
-                      const TenantId& tenant_id, ReplicaType replica_type)
+                      const TenantId& tenant_id, ReplicaType replica_type,
+                      const std::vector<ReplicaID>& replica_ids = {})
         -> tl::expected<void, ErrorCode>;
 
     /**

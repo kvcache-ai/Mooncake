@@ -16,6 +16,7 @@
 
 #include "allocator.h"
 #include "client_service.h"
+#include "master_client.h"
 #include "types.h"
 #include "utils.h"
 #include "test_server_helpers.h"
@@ -1537,6 +1538,68 @@ TEST_F(EvictionNotificationTest, DiskReplicaRemovedAfterEviction) {
     EXPECT_TRUE(unmount.has_value()) << "UnmountSegment failed";
     std::free(seg_ptr_);
     seg_ptr_ = nullptr;
+}
+
+TEST_F(ClientIntegrationTest, ReplicaIdsFenceStalePutFinalization) {
+    MasterClient client(generate_uuid());
+    ASSERT_EQ(ErrorCode::OK, client.Connect(master_address_));
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    const std::vector<size_t> slice_lengths{1024};
+
+    const std::string end_key = "stale_put_end_over_rpc";
+    auto first_end_write = client.PutStart(end_key, slice_lengths, config);
+    ASSERT_TRUE(first_end_write.has_value());
+    ASSERT_EQ(1, first_end_write->size());
+
+    auto missing_ids = client.PutEnd(end_key, {}, ReplicaType::MEMORY);
+    ASSERT_FALSE(missing_ids.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_REPLICA, missing_ids.error());
+
+    auto second_end_write = client.UpsertStart(end_key, slice_lengths, config);
+    ASSERT_TRUE(second_end_write.has_value());
+    ASSERT_EQ(1, second_end_write->size());
+    ASSERT_NE(first_end_write->front().id, second_end_write->front().id);
+
+    auto stale_end = client.PutEnd(end_key, {first_end_write->front().id},
+                                   ReplicaType::MEMORY);
+    ASSERT_FALSE(stale_end.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_REPLICA, stale_end.error());
+
+    auto before_current_end = client.GetReplicaList(end_key);
+    ASSERT_FALSE(before_current_end.has_value());
+    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, before_current_end.error());
+
+    ASSERT_TRUE(client
+                    .PutEnd(end_key, {second_end_write->front().id},
+                            ReplicaType::MEMORY)
+                    .has_value());
+    ASSERT_TRUE(client.Remove(end_key, /*force=*/true).has_value());
+
+    const std::string revoke_key = "stale_put_revoke_over_rpc";
+    auto first_revoke_write =
+        client.PutStart(revoke_key, slice_lengths, config);
+    ASSERT_TRUE(first_revoke_write.has_value());
+    ASSERT_EQ(1, first_revoke_write->size());
+    auto second_revoke_write =
+        client.UpsertStart(revoke_key, slice_lengths, config);
+    ASSERT_TRUE(second_revoke_write.has_value());
+    ASSERT_EQ(1, second_revoke_write->size());
+    ASSERT_NE(first_revoke_write->front().id, second_revoke_write->front().id);
+
+    auto stale_revoke = client.PutRevoke(
+        revoke_key, {first_revoke_write->front().id}, ReplicaType::MEMORY);
+    ASSERT_FALSE(stale_revoke.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_REPLICA, stale_revoke.error());
+
+    ASSERT_TRUE(client
+                    .PutRevoke(revoke_key, {second_revoke_write->front().id},
+                               ReplicaType::MEMORY)
+                    .has_value());
+    auto exists_after_revoke = client.ExistKey(revoke_key);
+    ASSERT_TRUE(exists_after_revoke.has_value());
+    EXPECT_FALSE(exists_after_revoke.value());
 }
 
 // Test Upsert Case A: key does not exist — equivalent to Put

@@ -82,11 +82,13 @@ class WrappedMasterService {
 
     tl::expected<void, ErrorCode> PutEnd(
         const UUID& client_id, const std::string& key,
+        const std::vector<ReplicaID>& replica_ids,
         ReplicaType replica_type = ReplicaType::ALL,
         const std::string& tenant_id = "default");
 
     tl::expected<void, ErrorCode> PutRevoke(
         const UUID& client_id, const std::string& key,
+        const std::vector<ReplicaID>& replica_ids,
         ReplicaType replica_type = ReplicaType::ALL,
         const std::string& tenant_id = "default");
 
@@ -113,11 +115,13 @@ class WrappedMasterService {
 
     tl::expected<void, ErrorCode> UpsertEnd(
         const UUID& client_id, const std::string& key,
+        const std::vector<ReplicaID>& replica_ids,
         ReplicaType replica_type = ReplicaType::ALL,
         const std::string& tenant_id = "default");
 
     tl::expected<void, ErrorCode> UpsertRevoke(
         const UUID& client_id, const std::string& key,
+        const std::vector<ReplicaID>& replica_ids,
         ReplicaType replica_type = ReplicaType::ALL,
         const std::string& tenant_id = "default");
 

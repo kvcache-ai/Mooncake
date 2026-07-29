@@ -195,8 +195,14 @@ class BenchClient {
             return false;
         }
 
-        auto put_end_result =
-            master_client_.PutEnd(key, mooncake::ReplicaType::MEMORY);
+        std::vector<mooncake::ReplicaID> replica_ids;
+        for (const auto& replica : put_start_result.value()) {
+            if (replica.is_memory_replica()) {
+                replica_ids.emplace_back(replica.id);
+            }
+        }
+        auto put_end_result = master_client_.PutEnd(
+            key, replica_ids, mooncake::ReplicaType::MEMORY);
         if (!put_end_result.has_value()) {
             return false;
         }

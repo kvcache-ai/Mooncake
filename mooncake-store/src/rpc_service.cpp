@@ -386,19 +386,25 @@ WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
-    const UUID& client_id, const std::string& key, ReplicaType replica_type,
+    const UUID& client_id, const std::string& key,
+    const std::vector<ReplicaID>& replica_ids, ReplicaType replica_type,
     const std::string& tenant_id) {
     return execute_rpc(
         "PutEnd",
         [&] {
-            return WithRequestTenant(master_service_.IsTenantQuotaEnabled()
-                                         ? std::string_view(tenant_id)
-                                         : TenantId::kDefaultValue,
-                                     [&](const TenantId& resolved_tenant_id) {
-                                         return master_service_.PutEnd(
-                                             client_id, key, resolved_tenant_id,
-                                             replica_type);
-                                     });
+            return WithRequestTenant(
+                master_service_.IsTenantQuotaEnabled()
+                    ? std::string_view(tenant_id)
+                    : TenantId::kDefaultValue,
+                [&](const TenantId& resolved_tenant_id) {
+                    if (replica_ids.empty()) {
+                        return tl::expected<void, ErrorCode>(
+                            tl::unexpect, ErrorCode::INVALID_REPLICA);
+                    }
+                    return master_service_.PutEnd(client_id, key,
+                                                  resolved_tenant_id,
+                                                  replica_type, replica_ids);
+                });
         },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", key,
@@ -409,19 +415,25 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::PutRevoke(
-    const UUID& client_id, const std::string& key, ReplicaType replica_type,
+    const UUID& client_id, const std::string& key,
+    const std::vector<ReplicaID>& replica_ids, ReplicaType replica_type,
     const std::string& tenant_id) {
     return execute_rpc(
         "PutRevoke",
         [&] {
-            return WithRequestTenant(master_service_.IsTenantQuotaEnabled()
-                                         ? std::string_view(tenant_id)
-                                         : TenantId::kDefaultValue,
-                                     [&](const TenantId& resolved_tenant_id) {
-                                         return master_service_.PutRevoke(
-                                             client_id, key, resolved_tenant_id,
-                                             replica_type);
-                                     });
+            return WithRequestTenant(
+                master_service_.IsTenantQuotaEnabled()
+                    ? std::string_view(tenant_id)
+                    : TenantId::kDefaultValue,
+                [&](const TenantId& resolved_tenant_id) {
+                    if (replica_ids.empty()) {
+                        return tl::expected<void, ErrorCode>(
+                            tl::unexpect, ErrorCode::INVALID_REPLICA);
+                    }
+                    return master_service_.PutRevoke(client_id, key,
+                                                     resolved_tenant_id,
+                                                     replica_type, replica_ids);
+                });
         },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", key,
@@ -648,19 +660,25 @@ WrappedMasterService::UpsertStart(const UUID& client_id, const std::string& key,
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::UpsertEnd(
-    const UUID& client_id, const std::string& key, ReplicaType replica_type,
+    const UUID& client_id, const std::string& key,
+    const std::vector<ReplicaID>& replica_ids, ReplicaType replica_type,
     const std::string& tenant_id) {
     return execute_rpc(
         "UpsertEnd",
         [&] {
-            return WithRequestTenant(master_service_.IsTenantQuotaEnabled()
-                                         ? std::string_view(tenant_id)
-                                         : TenantId::kDefaultValue,
-                                     [&](const TenantId& resolved_tenant_id) {
-                                         return master_service_.UpsertEnd(
-                                             client_id, key, resolved_tenant_id,
-                                             replica_type);
-                                     });
+            return WithRequestTenant(
+                master_service_.IsTenantQuotaEnabled()
+                    ? std::string_view(tenant_id)
+                    : TenantId::kDefaultValue,
+                [&](const TenantId& resolved_tenant_id) {
+                    if (replica_ids.empty()) {
+                        return tl::expected<void, ErrorCode>(
+                            tl::unexpect, ErrorCode::INVALID_REPLICA);
+                    }
+                    return master_service_.UpsertEnd(client_id, key,
+                                                     resolved_tenant_id,
+                                                     replica_type, replica_ids);
+                });
         },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", key,
@@ -671,19 +689,25 @@ tl::expected<void, ErrorCode> WrappedMasterService::UpsertEnd(
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::UpsertRevoke(
-    const UUID& client_id, const std::string& key, ReplicaType replica_type,
+    const UUID& client_id, const std::string& key,
+    const std::vector<ReplicaID>& replica_ids, ReplicaType replica_type,
     const std::string& tenant_id) {
     return execute_rpc(
         "UpsertRevoke",
         [&] {
-            return WithRequestTenant(master_service_.IsTenantQuotaEnabled()
-                                         ? std::string_view(tenant_id)
-                                         : TenantId::kDefaultValue,
-                                     [&](const TenantId& resolved_tenant_id) {
-                                         return master_service_.UpsertRevoke(
-                                             client_id, key, resolved_tenant_id,
-                                             replica_type);
-                                     });
+            return WithRequestTenant(
+                master_service_.IsTenantQuotaEnabled()
+                    ? std::string_view(tenant_id)
+                    : TenantId::kDefaultValue,
+                [&](const TenantId& resolved_tenant_id) {
+                    if (replica_ids.empty()) {
+                        return tl::expected<void, ErrorCode>(
+                            tl::unexpect, ErrorCode::INVALID_REPLICA);
+                    }
+                    return master_service_.UpsertRevoke(
+                        client_id, key, resolved_tenant_id, replica_type,
+                        replica_ids);
+                });
         },
         [&](auto& timer) {
             timer.LogRequest("client_id=", client_id, ", key=", key,

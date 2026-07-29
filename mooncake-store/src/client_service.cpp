@@ -126,6 +126,29 @@ std::optional<ContiguousSliceRange> GetContiguousSliceRange(
                                 .size = total_size};
 }
 
+std::vector<ReplicaID> GetReplicaIdsForType(
+    const std::vector<Replica::Descriptor>& replicas,
+    ReplicaType replica_type) {
+    std::vector<ReplicaID> replica_ids;
+    replica_ids.reserve(replicas.size());
+    for (const auto& replica : replicas) {
+        const bool matches =
+            (replica_type == ReplicaType::ALL &&
+             (replica.is_memory_replica() || replica.is_nof_replica())) ||
+            (replica_type == ReplicaType::MEMORY &&
+             replica.is_memory_replica()) ||
+            (replica_type == ReplicaType::NOF_SSD &&
+             replica.is_nof_replica()) ||
+            (replica_type == ReplicaType::DISK && replica.is_disk_replica()) ||
+            (replica_type == ReplicaType::LOCAL_DISK &&
+             replica.is_local_disk_replica());
+        if (matches) {
+            replica_ids.emplace_back(replica.id);
+        }
+    }
+    return replica_ids;
+}
+
 struct ReplicaTransferSummary {
     size_t allocated_memory_replicas = 0;
     size_t allocated_nof_replicas = 0;
@@ -181,7 +204,7 @@ bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
 // success describes whether the overall put should succeed. Reliable modes
 // require all allocated replicas to complete. Flexible dual-replica mode only
 // requires one replica type to succeed, so success may be true while
-// revoke_type is also set for the failed side.
+// revoke_type is also set for an allocated but failed side.
 struct FinalizeDecision {
     std::optional<ReplicaType> end_type;
     std::optional<ReplicaType> revoke_type;
@@ -230,13 +253,17 @@ FinalizeDecision DetermineFinalizeDecision(
     }
     if (memory_succeeded) {
         return {.end_type = ReplicaType::MEMORY,
-                .revoke_type = ReplicaType::NOF_SSD,
+                .revoke_type = summary.allocated_nof_replicas > 0
+                                   ? std::make_optional(ReplicaType::NOF_SSD)
+                                   : std::optional<ReplicaType>{},
                 .success = true,
                 .error = ErrorCode::OK};
     }
     if (nof_succeeded) {
         return {.end_type = ReplicaType::NOF_SSD,
-                .revoke_type = ReplicaType::MEMORY,
+                .revoke_type = summary.allocated_memory_replicas > 0
+                                   ? std::make_optional(ReplicaType::MEMORY)
+                                   : std::optional<ReplicaType>{},
                 .success = true,
                 .error = ErrorCode::OK};
     }
@@ -1596,8 +1623,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
             const auto& replica = *it;
             if (replica.is_disk_replica()) {
                 // Store to local file if storage backend is available
-                auto disk_descriptor = replica.get_disk_descriptor();
-                PutToLocalFile(key, slices, disk_descriptor);
+                PutToLocalFile(key, slices, replica);
                 break;  // Only one disk replica is needed
             }
         }
@@ -1629,8 +1655,11 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         DetermineFinalizeDecision(config, transfer_summary);
 
     if (finalize_decision.end_type.has_value()) {
-        auto end_result =
-            master_client_.PutEnd(key, *finalize_decision.end_type);
+        auto end_result = master_client_.PutEnd(
+            key,
+            GetReplicaIdsForType(start_result.value(),
+                                 *finalize_decision.end_type),
+            *finalize_decision.end_type);
         if (!end_result) {
             ErrorCode err = end_result.error();
             LOG(ERROR) << "Failed to end put operation: " << err;
@@ -1639,8 +1668,11 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     }
 
     if (finalize_decision.revoke_type.has_value()) {
-        auto revoke_result =
-            master_client_.PutRevoke(key, *finalize_decision.revoke_type);
+        auto revoke_result = master_client_.PutRevoke(
+            key,
+            GetReplicaIdsForType(start_result.value(),
+                                 *finalize_decision.revoke_type),
+            *finalize_decision.revoke_type);
         if (!revoke_result) {
             LOG(ERROR) << "Failed to revoke put operation";
             return tl::unexpected(revoke_result.error());
@@ -1696,8 +1728,7 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
              it != start_result.value().rend(); ++it) {
             const auto& replica = *it;
             if (replica.is_disk_replica()) {
-                auto disk_descriptor = replica.get_disk_descriptor();
-                PutToLocalFile(key, slices, disk_descriptor);
+                PutToLocalFile(key, slices, replica);
                 break;
             }
         }
@@ -1708,8 +1739,11 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         if (replica.is_memory_replica()) {
             ErrorCode transfer_err = TransferWrite(replica, slices);
             if (transfer_err != ErrorCode::OK) {
-                auto revoke_result =
-                    master_client_.UpsertRevoke(key, ReplicaType::MEMORY);
+                auto revoke_result = master_client_.UpsertRevoke(
+                    key,
+                    GetReplicaIdsForType(start_result.value(),
+                                         ReplicaType::MEMORY),
+                    ReplicaType::MEMORY);
                 if (!revoke_result) {
                     LOG(ERROR) << "Failed to revoke upsert operation";
                     return tl::unexpected(revoke_result.error());
@@ -1727,7 +1761,9 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     }
 
     // End upsert operation
-    auto end_result = master_client_.UpsertEnd(key, ReplicaType::MEMORY);
+    auto end_result = master_client_.UpsertEnd(
+        key, GetReplicaIdsForType(start_result.value(), ReplicaType::MEMORY),
+        ReplicaType::MEMORY);
     if (!end_result) {
         ErrorCode err = end_result.error();
         LOG(ERROR) << "Failed to end upsert operation: " << err;
@@ -2051,8 +2087,7 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
                  ++it) {
                 const auto& replica = *it;
                 if (replica.is_disk_replica()) {
-                    auto disk_descriptor = replica.get_disk_descriptor();
-                    PutToLocalFile(op.key, op.slices, disk_descriptor);
+                    PutToLocalFile(op.key, op.slices, replica);
                     break;  // Only one disk replica is needed
                 }
             }
@@ -3394,8 +3429,11 @@ ErrorCode Client::PrepareStorageBackend(const std::string& storage_root_dir,
 
 void Client::PutToLocalFile(const std::string& key,
                             const std::vector<Slice>& slices,
-                            const DiskDescriptor& disk_descriptor) {
+                            const Replica::Descriptor& replica) {
     if (!storage_backend_) return;
+
+    const auto& disk_descriptor = replica.get_disk_descriptor();
+    const std::vector<ReplicaID> replica_ids{replica.id};
 
     size_t total_size = 0;
     for (const auto& slice : slices) {
@@ -3425,8 +3463,8 @@ void Client::PutToLocalFile(const std::string& key,
                            << ", triggering PutRevoke for disk replica";
                 pinned_buffer_pool_->Release(std::move(buf));
                 // Must revoke to avoid phantom replica in master
-                auto revoke_result =
-                    master_client_.PutRevoke(key, ReplicaType::DISK);
+                auto revoke_result = master_client_.PutRevoke(
+                    key, replica_ids, ReplicaType::DISK);
                 if (!revoke_result) {
                     LOG(ERROR)
                         << "Failed to revoke put operation for key: " << key;
@@ -3442,7 +3480,7 @@ void Client::PutToLocalFile(const std::string& key,
 
     // Async StoreObject + PutEnd (unchanged from original)
     write_thread_pool_.enqueue([this, backend = storage_backend_, key,
-                                value = std::move(value), path] {
+                                value = std::move(value), path, replica_ids] {
         ReplicaType replica_type = ReplicaType::DISK;
         // Store the object
         auto store_result = backend->StoreObject(
@@ -3475,7 +3513,8 @@ void Client::PutToLocalFile(const std::string& key,
         if (!store_result) {
             // If storage failed, revoke the put operation
             LOG(ERROR) << "Failed to store object for key: " << key;
-            auto revoke_result = master_client_.PutRevoke(key, replica_type);
+            auto revoke_result =
+                master_client_.PutRevoke(key, replica_ids, replica_type);
             if (!revoke_result) {
                 LOG(ERROR) << "Failed to revoke put operation for key: " << key;
             }
@@ -3483,7 +3522,7 @@ void Client::PutToLocalFile(const std::string& key,
         }
 
         // If storage succeeded, end the put operation
-        auto end_result = master_client_.PutEnd(key, replica_type);
+        auto end_result = master_client_.PutEnd(key, replica_ids, replica_type);
         if (!end_result) {
             LOG(ERROR) << "Failed to end put operation for key: " << key;
         }

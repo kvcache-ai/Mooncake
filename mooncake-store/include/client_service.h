@@ -698,7 +698,7 @@ class Client {
 
     void PutToLocalFile(const std::string& object_key,
                         const std::vector<Slice>& slices,
-                        const DiskDescriptor& disk_descriptor);
+                        const Replica::Descriptor& replica);
     /**
      * @brief Initialize local hot cache
      * @return ErrorCode::OK if use local hot cache,

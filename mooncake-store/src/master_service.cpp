@@ -3733,7 +3733,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
 }
 
 auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
-                           const TenantId& tenant_id, ReplicaType replica_type)
+                           const TenantId& tenant_id, ReplicaType replica_type,
+                           const std::vector<ReplicaID>& replica_ids)
     -> tl::expected<void, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
@@ -3750,25 +3751,40 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
 
-    metadata.VisitReplicas(
-        [replica_type](const Replica& replica) {
-            if (replica_type == ReplicaType::ALL) {
-                return (replica.is_memory_replica() &&
-                        !replica.has_invalid_mem_handle()) ||
-                       (replica.is_nof_replica() &&
-                        !replica.has_invalid_nof_handle());
-            }
-            if (replica_type == ReplicaType::MEMORY) {
-                return replica.is_memory_replica() &&
-                       !replica.has_invalid_mem_handle();
-            }
-            if (replica_type == ReplicaType::NOF_SSD) {
-                return replica.is_nof_replica() &&
-                       !replica.has_invalid_nof_handle();
-            }
-            return replica.type() == replica_type;
-        },
-        [](Replica& replica) { replica.mark_complete(); });
+    auto target_pred = [replica_type](const Replica& replica) {
+        if (replica_type == ReplicaType::ALL) {
+            return (replica.is_memory_replica() &&
+                    !replica.has_invalid_mem_handle()) ||
+                   (replica.is_nof_replica() &&
+                    !replica.has_invalid_nof_handle());
+        }
+        if (replica_type == ReplicaType::MEMORY) {
+            return replica.is_memory_replica() &&
+                   !replica.has_invalid_mem_handle();
+        }
+        if (replica_type == ReplicaType::NOF_SSD) {
+            return replica.is_nof_replica() &&
+                   !replica.has_invalid_nof_handle();
+        }
+        return replica.type() == replica_type;
+    };
+
+    if (!replica_ids.empty()) {
+        const std::unordered_set<ReplicaID> expected_ids(replica_ids.begin(),
+                                                         replica_ids.end());
+        std::unordered_set<ReplicaID> current_ids;
+        for (const auto& replica : metadata.GetAllReplicas()) {
+            if (target_pred(replica)) current_ids.insert(replica.id());
+        }
+        if (expected_ids.size() != replica_ids.size() ||
+            expected_ids != current_ids) {
+            LOG(WARNING) << "key=" << key << ", error=replica_id_mismatch";
+            return tl::make_unexpected(ErrorCode::INVALID_REPLICA);
+        }
+    }
+
+    metadata.VisitReplicas(target_pred,
+                           [](Replica& replica) { replica.mark_complete(); });
 
     const bool has_memory_replica = metadata.HasMemReplica();
     const bool should_settle_quota =
@@ -3948,7 +3964,8 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
 
 auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
                               const TenantId& tenant_id,
-                              ReplicaType replica_type)
+                              ReplicaType replica_type,
+                              const std::vector<ReplicaID>& replica_ids)
     -> tl::expected<void, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
@@ -3965,26 +3982,36 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
 
-    auto processing_rep = metadata.GetFirstReplica([replica_type](
-                                                       const Replica& replica) {
+    auto target_pred = [replica_type](const Replica& replica) {
         if (replica_type == ReplicaType::ALL) {
-            return (replica.is_memory_replica() || replica.is_nof_replica()) &&
-                   !replica.is_processing();
+            return replica.is_memory_replica() || replica.is_nof_replica();
         }
-        return replica.type() == replica_type && !replica.is_processing();
-    });
+        return replica.type() == replica_type;
+    };
+
+    if (!replica_ids.empty()) {
+        const std::unordered_set<ReplicaID> expected_ids(replica_ids.begin(),
+                                                         replica_ids.end());
+        std::unordered_set<ReplicaID> current_ids;
+        for (const auto& replica : metadata.GetAllReplicas()) {
+            if (target_pred(replica)) current_ids.insert(replica.id());
+        }
+        if (expected_ids.size() != replica_ids.size() ||
+            expected_ids != current_ids) {
+            LOG(WARNING) << "key=" << key << ", error=replica_id_mismatch";
+            return tl::make_unexpected(ErrorCode::INVALID_REPLICA);
+        }
+    }
+
+    auto processing_rep =
+        metadata.GetFirstReplica([&target_pred](const Replica& replica) {
+            return target_pred(replica) && !replica.is_processing();
+        });
     if (processing_rep != nullptr) {
         LOG(ERROR) << "key=" << key << ", status=" << processing_rep->status()
                    << ", error=invalid_replica_status";
         return tl::make_unexpected(ErrorCode::INVALID_WRITE);
     }
-
-    auto target_pred = [replica_type](const Replica& r) {
-        if (replica_type == ReplicaType::ALL) {
-            return r.is_memory_replica() || r.is_nof_replica();
-        }
-        return r.type() == replica_type;
-    };
 
     if (enable_oplog_ && ordered_oplog_writer_) {
         auto remaining =
@@ -4434,16 +4461,18 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
 
 auto MasterService::UpsertEnd(const UUID& client_id, const std::string& key,
                               const TenantId& tenant_id,
-                              ReplicaType replica_type)
+                              ReplicaType replica_type,
+                              const std::vector<ReplicaID>& replica_ids)
     -> tl::expected<void, ErrorCode> {
-    return PutEnd(client_id, key, tenant_id, replica_type);
+    return PutEnd(client_id, key, tenant_id, replica_type, replica_ids);
 }
 
 auto MasterService::UpsertRevoke(const UUID& client_id, const std::string& key,
                                  const TenantId& tenant_id,
-                                 ReplicaType replica_type)
+                                 ReplicaType replica_type,
+                                 const std::vector<ReplicaID>& replica_ids)
     -> tl::expected<void, ErrorCode> {
-    return PutRevoke(client_id, key, tenant_id, replica_type);
+    return PutRevoke(client_id, key, tenant_id, replica_type, replica_ids);
 }
 
 std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
