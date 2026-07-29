@@ -1142,9 +1142,9 @@ parallelism write wrappers.
 
 The real client owns the SHM buffer allocator. This keeps tensor writes and
 regular object writes from allocating overlapping offsets when they run
-concurrently through the same dummy client.
-Writes that stage through the dummy client's local SHM buffer are serialized
-per dummy client to keep the staged data alive until each write finishes.
+concurrently through the same dummy client. Writes staged through the dummy
+client's local SHM buffer keep their allocation alive until completion through
+the real-side active buffer handle and dummy-side RAII release path.
 
 Full materialized reconstruction reads for writer-sharded or reconstructed
 parallel tensors are still conservative for dummy clients. Use the corresponding
