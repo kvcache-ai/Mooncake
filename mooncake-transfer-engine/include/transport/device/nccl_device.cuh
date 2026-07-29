@@ -23,6 +23,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 #include "transport/device/nccl_device_transport.h"
 
@@ -89,6 +90,13 @@ __device__ __forceinline__ int mc_nccl_gin_context(const NcclDeviceContext& ctx,
     return static_cast<int>(channel % static_cast<unsigned int>(count));
 }
 
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 30, 5)
+using NcclStrongVaSignalAdd = ncclGin_StrongVASignalAdd;
+#else
+// NCCL 2.30.4 exposes only the legacy spelling, whose semantics are strong.
+using NcclStrongVaSignalAdd = ncclGin_VASignalAdd;
+#endif
+
 }  // namespace detail
 
 // Device operations in this header are intentionally unchecked, matching the
@@ -109,6 +117,13 @@ __device__ __forceinline__ bool mc_nccl_lsa_available(
 __device__ __forceinline__ bool mc_nccl_gin_available(
     const NcclDeviceContext& ctx) {
     return detail::NcclDeviceContextAccess::ginEnabled(ctx);
+}
+
+// Return the number of GIN contexts configured for ctx. Like the other device
+// helpers, this is unchecked: ctx must be live and GIN must be enabled.
+__device__ __forceinline__ int mc_nccl_gin_context_count(
+    const NcclDeviceContext& ctx) {
+    return detail::NcclDeviceContextAccess::ginContextCount(ctx);
 }
 
 __device__ __forceinline__ NcclDeviceRoute
@@ -206,8 +221,77 @@ __device__ __forceinline__ void mc_nccl_put_with_signal(
                           ctx, static_cast<unsigned int>(channel))};
     gin.put(ncclTeamWorld(comm), dst_rank, window, dst_offset, window,
             src_offset, nbytes,
-            ncclGin_VASignalAdd{window, completion_offset, completion_delta},
+            detail::NcclStrongVaSignalAdd{window, completion_offset,
+                                          completion_delta},
             ncclGin_None{}, ncclCoopThread{});
+}
+
+// Assign a 1-, 2-, 4-, or 8-byte scalar in the destination's matching
+// registered buffer using GIN inline data. recv_ptr is interpreted as an offset
+// in the peer's window; it is not a directly dereferenceable peer pointer.
+// The destination must be naturally aligned for T and wholly contained in the
+// symmetric registration bound to ctx. This operation does not signal remote
+// completion; pair ordered traffic with a strong GIN signal and receiver wait.
+template <typename T>
+__device__ __forceinline__ void mc_nccl_put_value(const NcclDeviceContext& ctx,
+                                                  int channel, int dst_rank,
+                                                  int qps_per_rank, T* recv_ptr,
+                                                  T value, int lane_id) {
+    static_assert(std::is_scalar<T>::value,
+                  "mc_nccl_put_value requires a scalar type");
+    static_assert(std::is_trivially_copyable<T>::value,
+                  "mc_nccl_put_value requires a trivially copyable type");
+    static_assert(
+        sizeof(T) == 1 || sizeof(T) == 2 || sizeof(T) == 4 || sizeof(T) == 8,
+        "mc_nccl_put_value supports only 1, 2, 4, or 8 bytes");
+    (void)qps_per_rank;
+    if (lane_id != 0) return;
+
+    const size_t dst_offset = detail::mc_nccl_pointer_offset(ctx, recv_ptr);
+    const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
+    const auto window = detail::NcclDeviceContextAccess::window(ctx);
+    ncclGin gin{comm, detail::mc_nccl_gin_context(
+                          ctx, static_cast<unsigned int>(channel))};
+    gin.putValue(ncclTeamWorld(comm), dst_rank, window, dst_offset, value,
+                 ncclGin_None{}, ncclCoopThread{});
+}
+
+// Add value to a GIN VA signal in the destination's matching buffer. Unlike
+// mc_nccl_signal_add(), this helper never routes through local/LSA atomics.
+// Signal visibility has strong semantics: it implies settlement of preceding
+// puts issued to the same peer on this context. signal_ptr must identify a
+// naturally aligned uint64_t wholly contained in the registration bound to ctx.
+__device__ __forceinline__ void mc_nccl_gin_signal_add(
+    const NcclDeviceContext& ctx, int dst_rank, int channel, int qps_per_rank,
+    uint64_t* signal_ptr, uint64_t value, int lane_id) {
+    (void)qps_per_rank;
+    if (lane_id != 0) return;
+
+    const size_t signal_offset =
+        detail::mc_nccl_pointer_offset(ctx, signal_ptr);
+    const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
+    const auto window = detail::NcclDeviceContextAccess::window(ctx);
+    ncclGin gin{comm, detail::mc_nccl_gin_context(
+                          ctx, static_cast<unsigned int>(channel))};
+    gin.signal(ncclTeamWorld(comm), dst_rank,
+               detail::NcclStrongVaSignalAdd{window, signal_offset, value},
+               ncclCoopThread{});
+}
+
+// Reset a local GIN VA signal through the context that owns it. The caller must
+// ensure that no remote signal operation can race this reset. Only lane 0 acts.
+__device__ __forceinline__ void mc_nccl_gin_reset_signal(
+    const NcclDeviceContext& ctx, int channel, uint64_t* signal_ptr,
+    int lane_id) {
+    if (lane_id != 0) return;
+
+    const size_t signal_offset =
+        detail::mc_nccl_pointer_offset(ctx, signal_ptr);
+    const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
+    const auto window = detail::NcclDeviceContextAccess::window(ctx);
+    ncclGin gin{comm, detail::mc_nccl_gin_context(
+                          ctx, static_cast<unsigned int>(channel))};
+    gin.resetSignal(window, signal_offset);
 }
 
 // Add value to a 64-bit signal in the destination's matching buffer. This is
@@ -238,14 +322,8 @@ __device__ __forceinline__ void mc_nccl_signal_add(
         return;
     }
 
-    const size_t signal_offset =
-        detail::mc_nccl_pointer_offset(ctx, signal_ptr);
-    const auto window = detail::NcclDeviceContextAccess::window(ctx);
-    ncclGin gin{comm, detail::mc_nccl_gin_context(
-                          ctx, static_cast<unsigned int>(channel))};
-    gin.signal(ncclTeamWorld(comm), dst_rank,
-               ncclGin_VASignalAdd{window, signal_offset, value},
-               ncclCoopThread{});
+    mc_nccl_gin_signal_add(ctx, dst_rank, channel, qps_per_rank, signal_ptr,
+                           value, 0);
 }
 
 __device__ __forceinline__ void mc_nccl_flush(const NcclDeviceContext& ctx,
@@ -257,6 +335,21 @@ __device__ __forceinline__ void mc_nccl_flush(const NcclDeviceContext& ctx,
     gin.flush(ncclCoopThread{});
 }
 
+// Read a GIN VA signal from the local matching window. This helper never falls
+// back to an ordinary CUDA atomic load. signal_ptr must be an aligned uint64_t
+// inside the registration bound to ctx, and channel must select the same GIN
+// context used by the remote producer.
+__device__ __forceinline__ uint64_t mc_nccl_gin_read_signal(
+    const NcclDeviceContext& ctx, int channel, const uint64_t* signal_ptr) {
+    const size_t signal_offset =
+        detail::mc_nccl_pointer_offset(ctx, signal_ptr);
+    const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
+    ncclGin gin{comm, detail::mc_nccl_gin_context(
+                          ctx, static_cast<unsigned int>(channel))};
+    return gin.readSignal(detail::NcclDeviceContextAccess::window(ctx),
+                          signal_offset);
+}
+
 __device__ __forceinline__ uint64_t mc_nccl_read_signal(
     const NcclDeviceContext& ctx, int channel, const uint64_t* signal_ptr) {
     if (!mc_nccl_gin_available(ctx)) {
@@ -265,13 +358,25 @@ __device__ __forceinline__ uint64_t mc_nccl_read_signal(
         return signal.load(cuda::memory_order_acquire);
     }
 
+    return mc_nccl_gin_read_signal(ctx, channel, signal_ptr);
+}
+
+// Wait on a GIN VA signal in the local matching window. This helper never
+// falls back to an ordinary CUDA atomic load. Only lane 0 waits; callers that
+// need a warp-wide dependency must synchronize after it returns. signal_ptr
+// and channel have the same preconditions as mc_nccl_gin_read_signal().
+__device__ __forceinline__ void mc_nccl_gin_wait_signal(
+    const NcclDeviceContext& ctx, int channel, const uint64_t* signal_ptr,
+    uint64_t least, int lane_id) {
+    if (lane_id != 0) return;
     const size_t signal_offset =
         detail::mc_nccl_pointer_offset(ctx, signal_ptr);
     const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
     ncclGin gin{comm, detail::mc_nccl_gin_context(
                           ctx, static_cast<unsigned int>(channel))};
-    return gin.readSignal(detail::NcclDeviceContextAccess::window(ctx),
-                          signal_offset);
+    gin.waitSignal(ncclCoopThread{},
+                   detail::NcclDeviceContextAccess::window(ctx), signal_offset,
+                   least);
 }
 
 // Only lane 0 waits. Callers that need a warp-wide dependency must synchronize
@@ -288,14 +393,7 @@ __device__ __forceinline__ void mc_nccl_wait_signal(
         return;
     }
 
-    const size_t signal_offset =
-        detail::mc_nccl_pointer_offset(ctx, signal_ptr);
-    const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
-    ncclGin gin{comm, detail::mc_nccl_gin_context(
-                          ctx, static_cast<unsigned int>(channel))};
-    gin.waitSignal(ncclCoopThread{},
-                   detail::NcclDeviceContextAccess::window(ctx), signal_offset,
-                   least);
+    mc_nccl_gin_wait_signal(ctx, channel, signal_ptr, least, 0);
 }
 
 }  // namespace device

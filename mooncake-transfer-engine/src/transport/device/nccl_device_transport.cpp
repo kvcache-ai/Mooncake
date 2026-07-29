@@ -153,28 +153,44 @@ class NcclDeviceTransportImpl final : public NcclTransport {
             return -1;
         }
 
-        ncclCommProperties_t comm_properties = NCCL_COMM_PROPERTIES_INITIALIZER;
-        if (reportNcclError(ncclCommQueryProperties(comm_, &comm_properties),
-                            "ncclCommQueryProperties") != 0) {
+        // Establish the smallest possible rank-wide status path immediately
+        // after communicator creation. While this CUDA/NCCL control path stays
+        // healthy, subsequent capability decisions can be made uniformly.
+        if (reportCudaError(cudaStreamCreateWithFlags(&control_stream_,
+                                                      cudaStreamNonBlocking),
+                            "cudaStreamCreateWithFlags(control)") != 0 ||
+            reportCudaError(
+                cudaMalloc(reinterpret_cast<void**>(&collective_status_),
+                           sizeof(int)),
+                "cudaMalloc(collective status)") != 0) {
             abortPartialInitialization();
             return -1;
         }
-        if (!comm_properties.deviceApiSupport) {
+
+        ncclCommProperties_t comm_properties = NCCL_COMM_PROPERTIES_INITIALIZER;
+        bool local_capabilities_valid =
+            reportNcclError(ncclCommQueryProperties(comm_, &comm_properties),
+                            "ncclCommQueryProperties") == 0;
+        if (local_capabilities_valid && !comm_properties.deviceApiSupport) {
             LOG(ERROR) << "[Device NCCL] communicator does not support the "
                           "device API";
-            abortPartialInitialization();
-            return -1;
+            local_capabilities_valid = false;
         }
-        if (config.require_lsa_multimem && !comm_properties.multimemSupport) {
+        if (local_capabilities_valid && config.require_lsa_multimem &&
+            !comm_properties.multimemSupport) {
             LOG(ERROR) << "[Device NCCL] LSA multimem was required but is "
                           "not supported";
-            abortPartialInitialization();
-            return -1;
+            local_capabilities_valid = false;
         }
-        if (config.enable_gin &&
+        if (local_capabilities_valid && config.enable_gin &&
             comm_properties.ginType == NCCL_GIN_TYPE_NONE) {
             LOG(ERROR) << "[Device NCCL] full GIN connectivity was requested "
                           "but GIN is unavailable";
+            local_capabilities_valid = false;
+        }
+        if (!collectiveAllSucceeded(local_capabilities_valid)) {
+            LOG(ERROR) << "[Device NCCL] required Device API capabilities are "
+                          "unavailable on one or more ranks";
             abortPartialInitialization();
             return -1;
         }
@@ -198,36 +214,52 @@ class NcclDeviceTransportImpl final : public NcclTransport {
             create_result = ncclDevCommCreate(comm_, &requirements, &dev_comm_);
             end_result = ncclGroupEnd();
         }
-        if (reportNcclError(start_result, "ncclGroupStart") != 0 ||
-            reportNcclError(create_result, "ncclDevCommCreate") != 0 ||
-            reportNcclError(end_result, "ncclGroupEnd") != 0) {
+        const bool start_valid =
+            reportNcclError(start_result, "ncclGroupStart") == 0;
+        const bool create_valid =
+            reportNcclError(create_result, "ncclDevCommCreate") == 0;
+        const bool end_valid = reportNcclError(end_result, "ncclGroupEnd") == 0;
+        const bool local_dev_comm_valid =
+            start_valid && create_valid && end_valid;
+        if (!collectiveAllSucceeded(local_dev_comm_valid)) {
+            LOG(ERROR) << "[Device NCCL] device communicator creation failed "
+                          "on one or more ranks";
             abortPartialInitialization();
             return -1;
         }
+        // Ownership begins only after every rank agrees that the grouped create
+        // completed. A mismatched partial create is discarded by comm abort.
         dev_comm_created_ = true;
 
-        if (config.enable_gin && (dev_comm_.ginConnectionCount == 0 ||
-                                  dev_comm_.ginContextCount == 0)) {
+        const bool local_gin_resources_valid =
+            !config.enable_gin ||
+            (dev_comm_.ginConnectionCount > 0 && dev_comm_.ginContextCount > 0);
+        if (!local_gin_resources_valid) {
             LOG(ERROR) << "[Device NCCL] communicator did not provide the "
                           "requested full GIN resources";
+        }
+        if (!collectiveAllSucceeded(local_gin_resources_valid)) {
+            LOG(ERROR) << "[Device NCCL] requested GIN resources are missing "
+                          "on one or more ranks";
             abortPartialInitialization();
             return -1;
         }
 
-        if (reportCudaError(cudaMalloc(reinterpret_cast<void**>(&device_comm_),
+        bool local_device_comm_ready =
+            reportCudaError(cudaMalloc(reinterpret_cast<void**>(&device_comm_),
                                        sizeof(dev_comm_)),
-                            "cudaMalloc(device communicator)") != 0 ||
-            reportCudaError(
-                cudaMemcpy(device_comm_, &dev_comm_, sizeof(dev_comm_),
-                           cudaMemcpyHostToDevice),
-                "cudaMemcpy(device communicator)") != 0 ||
-            reportCudaError(cudaStreamCreateWithFlags(&control_stream_,
-                                                      cudaStreamNonBlocking),
-                            "cudaStreamCreateWithFlags(control)") != 0 ||
-            reportCudaError(
-                cudaMalloc(reinterpret_cast<void**>(&collective_status_),
-                           sizeof(int)),
-                "cudaMalloc(collective status)") != 0) {
+                            "cudaMalloc(device communicator)") == 0;
+        if (local_device_comm_ready) {
+            local_device_comm_ready =
+                reportCudaError(
+                    cudaMemcpy(device_comm_, &dev_comm_, sizeof(dev_comm_),
+                               cudaMemcpyHostToDevice),
+                    "cudaMemcpy(device communicator)") == 0;
+        }
+
+        if (!collectiveAllSucceeded(local_device_comm_ready)) {
+            LOG(ERROR) << "[Device NCCL] device communicator setup failed on "
+                          "one or more ranks";
             abortPartialInitialization();
             return -1;
         }
@@ -240,6 +272,9 @@ class NcclDeviceTransportImpl final : public NcclTransport {
         properties_.multimem_supported = comm_properties.multimemSupport;
         properties_.lsa_multimem_enabled = config.require_lsa_multimem;
         properties_.lsa_team_count = comm_properties.nLsaTeams;
+        lsa_topology_.rank = dev_comm_.lsaRank;
+        lsa_topology_.size = dev_comm_.lsaSize;
+        lsa_topology_.first_rank = dev_comm_.rank - dev_comm_.lsaRank;
         properties_.lsa_barrier_count = config.lsa_barrier_count;
         properties_.gin_enabled = config.enable_gin;
         properties_.gin_backend = toGinBackend(comm_properties.ginType);
@@ -252,12 +287,24 @@ class NcclDeviceTransportImpl final : public NcclTransport {
                   << "/" << properties_.num_ranks
                   << " cuda_device=" << properties_.cuda_device
                   << " lsa_teams=" << properties_.lsa_team_count
+                  << " lsa_rank=" << lsa_topology_.rank << "/"
+                  << lsa_topology_.size
+                  << " lsa_first_rank=" << lsa_topology_.first_rank
                   << " multimem=" << properties_.lsa_multimem_enabled
                   << " lsa_barriers=" << properties_.lsa_barrier_count
                   << " gin_backend=" << ginBackendName(properties_.gin_backend)
                   << " gin_connections=" << properties_.gin_connection_count
                   << " gin_contexts=" << properties_.gin_context_count;
         return 0;
+    }
+
+    bool allRanksSucceeded(bool local_success) override {
+        if (!initialized_) {
+            LOG(ERROR) << "[Device NCCL] collective status agreement requires "
+                          "initialization";
+            return false;
+        }
+        return collectiveAllSucceeded(local_success);
     }
 
     void* allocateBuffer(size_t bytes) override {
@@ -312,9 +359,11 @@ class NcclDeviceTransportImpl final : public NcclTransport {
         }
 
         ncclWindow_t window = nullptr;
-        if (reportNcclError(ncclCommWindowRegister(comm_, ptr, bytes, &window,
-                                                   NCCL_WIN_COLL_SYMMETRIC),
-                            "ncclCommWindowRegister") != 0) {
+        if (reportNcclError(
+                ncclCommWindowRegister(
+                    comm_, ptr, bytes, &window,
+                    NCCL_WIN_COLL_SYMMETRIC | NCCL_WIN_STRICT_ORDERING),
+                "ncclCommWindowRegister") != 0) {
             return -1;
         }
 
@@ -357,17 +406,29 @@ class NcclDeviceTransportImpl final : public NcclTransport {
 
         *ptr = nullptr;
         void* local_ptr = allocateBuffer(bytes);
-        const bool all_allocated = collectiveAllSucceeded(local_ptr != nullptr);
+        const bool all_allocated = allRanksSucceeded(local_ptr != nullptr);
         if (!all_allocated) {
             if (local_ptr) freeBuffer(local_ptr);
+            return -1;
+        }
+
+        // A GIN VA-signal address must not be accessed through ordinary CUDA
+        // loads or stores after its window has been registered. Initialize the
+        // entire allocation while it is still plain NCCL memory so callers can
+        // safely reserve any subrange for GIN-only signals.
+        const int zero_status = reportCudaError(
+            cudaMemsetAsync(local_ptr, 0, bytes, control_stream_),
+            "cudaMemsetAsync(collective buffer)");
+        const bool all_zeroed = allRanksSucceeded(zero_status == 0);
+        if (!all_zeroed) {
+            freeBuffer(local_ptr);
             return -1;
         }
 
         NcclBufferRegistration local_registration;
         const int register_status =
             registerBuffer(local_ptr, bytes, &local_registration);
-        const bool all_registered =
-            collectiveAllSucceeded(register_status == 0);
+        const bool all_registered = allRanksSucceeded(register_status == 0);
         if (!all_registered) {
             if (local_registration.valid())
                 deregisterBuffer(&local_registration);
@@ -402,6 +463,8 @@ class NcclDeviceTransportImpl final : public NcclTransport {
     }
 
     NcclTransportProperties properties() const override { return properties_; }
+
+    NcclLsaTopology lsaTopology() const override { return lsa_topology_; }
 
     bool initialized() const override { return initialized_; }
 
@@ -467,6 +530,7 @@ class NcclDeviceTransportImpl final : public NcclTransport {
         initialized_ = false;
         next_registration_id_ = 1;
         properties_ = {};
+        lsa_topology_ = {};
         return status;
     }
 
@@ -535,6 +599,7 @@ class NcclDeviceTransportImpl final : public NcclTransport {
     std::unordered_map<uint64_t, WindowRecord> registrations_;
     std::unordered_set<void*> allocations_;
     NcclTransportProperties properties_;
+    NcclLsaTopology lsa_topology_;
 };
 
 std::unique_ptr<NcclTransport> createNcclDeviceTransport() {

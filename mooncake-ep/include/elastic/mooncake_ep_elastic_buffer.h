@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <string>
 #include <tuple>
 #include <vector>
 
@@ -13,6 +14,9 @@
 namespace mooncake {
 
 struct ElasticLaunchContext;
+struct NcclElasticState;
+
+std::vector<int32_t> create_elastic_nccl_unique_id();
 
 struct ElasticTopology {
     int rank_idx = 0;
@@ -24,6 +28,7 @@ struct ElasticTopology {
     int scaleout_rank_idx = 0;
     int scaleup_rank_idx = 0;
     bool hybrid_enabled = false;
+    bool scaleup_lsa = false;
 };
 
 struct ElasticConfig {
@@ -52,7 +57,23 @@ class MooncakeElasticBuffer {
                           int num_allocated_qps, int num_cpu_timeout_secs,
                           int num_gpu_timeout_secs);
 
+    MooncakeElasticBuffer(int rank, int num_ranks, int64_t num_buffer_bytes,
+                          int64_t num_max_tokens_per_rank, int64_t hidden,
+                          int64_t num_topk, bool use_fp8_dispatch,
+                          bool deterministic, bool allow_hybrid_mode,
+                          bool allow_multiple_reduction,
+                          bool prefer_overlap_with_compute, int sl_idx,
+                          int num_allocated_qps, int num_cpu_timeout_secs,
+                          int num_gpu_timeout_secs,
+                          const std::string& transport,
+                          const std::vector<int32_t>& nccl_unique_id);
+
     ~MooncakeElasticBuffer();
+
+    // For NCCL, the caller must first quiesce CUDA work and coordinate every
+    // communicator rank. The Python wrapper provides that collective protocol.
+    void destroy();
+    bool using_nccl() const { return nccl_state_ != nullptr; }
 
     static int64_t calculate_buffer_size(int num_ranks,
                                          int64_t num_max_tokens_per_rank,
@@ -90,56 +111,44 @@ class MooncakeElasticBuffer {
         int num_sms, bool async_with_compute_stream,
         uint64_t compute_stream_ptr, uint64_t combined_x_ptr);
 
-    MooncakeEpBuffer& native_buffer() { return *native_buffer_; }
+    MooncakeEpBuffer& native_buffer();
 
-    bool ibgda_disabled() const { return native_buffer_->ibgda_disabled(); }
-    bool use_fast_path() { return native_buffer_->use_fast_path(); }
-    void update_local_qpns() { native_buffer_->update_local_qpns(); }
-    bool is_roce() const { return native_buffer_->is_roce(); }
+    bool ibgda_disabled() const;
+    bool use_fast_path();
+    void update_local_qpns();
+    bool is_roce() const;
     void sync_ibgda_peers(const std::vector<int64_t>& remote_addrs,
                           const std::vector<int32_t>& remote_keys,
                           const std::vector<std::vector<int32_t>>& peer_qpns,
                           const std::vector<std::vector<int32_t>>& peer_lids,
                           const std::vector<int64_t>& subnet_prefixes,
                           const std::vector<int64_t>& interface_ids,
-                          const std::vector<int>& active_ranks_mask) {
-        native_buffer_->sync_ibgda_peers(remote_addrs, remote_keys, peer_qpns,
-                                         peer_lids, subnet_prefixes,
-                                         interface_ids, active_ranks_mask);
-    }
-    std::tuple<int64_t, int32_t> get_mr_info() {
-        return native_buffer_->get_mr_info();
-    }
-    std::tuple<int64_t, int64_t> get_gid() { return native_buffer_->get_gid(); }
-    std::vector<int32_t> get_local_qpns() {
-        return native_buffer_->get_local_qpns();
-    }
-    std::vector<int32_t> get_local_lids() {
-        return native_buffer_->get_local_lids();
-    }
-    std::vector<int32_t> get_ipc_handle() {
-        return native_buffer_->get_ipc_handle();
-    }
+                          const std::vector<int>& active_ranks_mask);
+    std::tuple<int64_t, int32_t> get_mr_info();
+    std::tuple<int64_t, int64_t> get_gid();
+    std::vector<int32_t> get_local_qpns();
+    std::vector<int32_t> get_local_lids();
+    std::vector<int32_t> get_ipc_handle();
     void sync_nvlink_ipc_handles(
         const std::vector<std::vector<int32_t>>& remote_handles,
-        const std::vector<int>& active_ranks_mask) {
-        native_buffer_->sync_nvlink_ipc_handles(remote_handles,
-                                                active_ranks_mask);
-    }
+        const std::vector<int>& active_ranks_mask);
 
    private:
     ElasticConfig config_;
     ElasticTopology topology_;
+    std::string transport_;
     std::unique_ptr<MooncakeEpBuffer> native_buffer_;
+    std::unique_ptr<NcclElasticState> nccl_state_;
     int64_t host_workspace_bytes_ = 0;
     void* host_workspace_ = nullptr;
     void* mapped_host_workspace_ = nullptr;
     std::shared_ptr<void> deterministic_rank_count_buffer_;
     int64_t deterministic_rank_count_buffer_bytes_ = 0;
+    bool destroyed_ = false;
 
-    static ElasticLaunchContext make_launch_context(
-        MooncakeEpBuffer& buffer, const ElasticTopology& topology,
-        void* mapped_host_workspace, int64_t timeout_cycles);
+    ElasticLaunchContext make_launch_context(int64_t timeout_cycles) const;
+    cudaStream_t communication_stream() const;
+    int clock_rate_khz() const;
     static ElasticTopology discover_topology(int rank, int num_ranks,
                                              bool allow_hybrid_mode);
     std::shared_ptr<void> ensure_deterministic_rank_count_buffer(int num_sms);

@@ -15,6 +15,7 @@ PYBIND11_MODULE(_ep, m) {
     m.def("get_ep_buffer_size_hint", &get_ep_buffer_size_hint);
     m.def("calculate_elastic_buffer_size",
           &MooncakeElasticBuffer::calculate_buffer_size);
+    m.def("create_nccl_unique_id", &create_elastic_nccl_unique_id);
 
     py::class_<EventHandle>(m, "EventHandle")
         .def(py::init<uint64_t>(), py::arg("stream_ptr") = 0)
@@ -47,7 +48,8 @@ PYBIND11_MODULE(_ep, m) {
 
     py::class_<MooncakeElasticBuffer>(m, "ElasticBuffer")
         .def(py::init<int, int, int64_t, int64_t, int64_t, int64_t, bool, bool,
-                      bool, bool, bool, int, int, int, int>(),
+                      bool, bool, bool, int, int, int, int, std::string,
+                      std::vector<int32_t>>(),
              py::arg("rank"), py::arg("num_ranks"), py::arg("num_buffer_bytes"),
              py::arg("num_max_tokens_per_rank"), py::arg("hidden"),
              py::arg("num_topk"), py::arg("use_fp8_dispatch"),
@@ -55,7 +57,10 @@ PYBIND11_MODULE(_ep, m) {
              py::arg("allow_multiple_reduction"),
              py::arg("prefer_overlap_with_compute"), py::arg("sl_idx"),
              py::arg("num_allocated_qps"), py::arg("num_cpu_timeout_secs"),
-             py::arg("num_gpu_timeout_secs"))
+             py::arg("num_gpu_timeout_secs"), py::arg("transport") = "ibgda",
+             py::arg("nccl_unique_id") = std::vector<int32_t>{})
+        .def("destroy", &MooncakeElasticBuffer::destroy)
+        .def("using_nccl", &MooncakeElasticBuffer::using_nccl)
         .def_static("calculate_buffer_size",
                     &MooncakeElasticBuffer::calculate_buffer_size)
         .def("get_physical_domain_size",

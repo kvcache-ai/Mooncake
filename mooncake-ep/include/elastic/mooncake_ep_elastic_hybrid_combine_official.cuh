@@ -14,10 +14,11 @@
 namespace mooncake::elastic {
 
 template <
-    bool kUseExpandedLayout, bool kAllowMultipleReduction, int kNumSMs,
-    int kNumScaleupWarps, int kNumForwardWarps, int kNumScaleoutRanks,
-    int kNumScaleupRanks, int kHidden, int kNumMaxTokensPerRank,
-    int kNumExperts, int kNumTopk, int kNumQPs, int64_t kNumTimeoutCycles,
+    typename Ops, bool kUseExpandedLayout, bool kAllowMultipleReduction,
+    int kNumSMs, int kNumScaleupWarps, int kNumForwardWarps,
+    int kNumScaleoutRanks, int kNumScaleupRanks, int kHidden,
+    int kNumMaxTokensPerRank, int kNumExperts, int kNumTopk, int kNumQPs,
+    int64_t kNumTimeoutCycles,
     int kNumScaleupRanksPerLane = math::constexpr_ceil_div(kNumScaleupRanks,
                                                            32),
     int kNumScaleupUpdateInterval = 3, int kNumChannelsPerSM = kNumForwardWarps,
@@ -41,7 +42,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                         int* psum_num_recv_tokens_per_scaleup_rank,
                         int* token_metadata_at_forward,
                         int* channel_linked_list,
-                        const device::CommCtx comm_ctx, void* buffer,
+                        const typename Ops::Context comm_ctx, void* buffer,
                         void* workspace, const int scaleout_rank_idx,
                         const int scaleup_rank_idx, int num_reduced_tokens) {
     // Utils
@@ -99,14 +100,23 @@ __global__ void __launch_bounds__(kNumThreads, 1)
     const auto [qp_idx, sharing_mode] =
         comm::get_qp_mode<kNumSMs, kNumQPs, kNumChannelsPerSM>(
             sm_idx, warp_idx % kNumChannelsPerSM);
-    const auto gin = transport::MooncakeGin(
-        comm_ctx, qp_idx, sharing_mode, kNumQPs, scaleout_rank_idx,
-        scaleup_rank_idx, kNumScaleupRanks, kNumRanks);
+    const auto gin =
+        Ops(comm_ctx, qp_idx, sharing_mode, kNumQPs, scaleout_rank_idx,
+            scaleup_rank_idx, kNumScaleupRanks, kNumRanks);
+
+    // Forward warps own the scale-out channels and their GIN contexts. Reset
+    // every remote completion slot before the opening barrier releases senders.
+    if (warp_idx >= kNumScaleupWarps && lane_idx < kNumScaleoutRanks) {
+        const int channel_idx =
+            sm_idx * kNumChannelsPerSM + warp_idx - kNumScaleupWarps;
+        gin.template reset_completion_tail<transport::ScaleoutTeam>(channel_idx,
+                                                                    lane_idx);
+    }
 
     // Global parallel barriers for scale-out subteam and scale-up subteam
     // NOTES: this barrier needs a grid sync, as there are channel scale-up tail
     // cleaning before
-    comm::gpu_barrier<true, kNumScaleoutRanks, kNumScaleupRanks, kNumSMs,
+    comm::gpu_barrier<Ops, true, kNumScaleoutRanks, kNumScaleupRanks, kNumSMs,
                       kNumThreads, kNumQPs, kNumTimeoutCycles,
                       comm::kHybridCombineTag0, false, true, true>(
         gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx,
@@ -164,8 +174,8 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                         if (stored_num_tokens_sent[i] !=
                             stored_old_num_tokens_sent[i])
                             ptx::st_release_sys(
-                                gin.get_sym_ptr<transport::ScaleupTeam>(
-                                    tail_ptr, j),
+                                gin.template get_sym_ptr<
+                                    transport::ScaleupTeam>(tail_ptr, j),
                                 stored_num_tokens_sent[i]);
                         stored_old_num_tokens_sent[i] =
                             stored_num_tokens_sent[i];
@@ -271,7 +281,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                     }
                 }();
                 token_buffer.set_base_ptr(
-                    gin.get_sym_ptr<transport::ScaleupTeam>(
+                    gin.template get_sym_ptr<transport::ScaleupTeam>(
                         token_buffer.get_base_ptr(), dst_scaleup_rank_idx));
 
                 // Some checks
@@ -377,7 +387,8 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                                                           kNumMaxTokensPerRank +
                                                       src_token_idx);
                             ptx::tma_store_1d(
-                                gin.get_sym_ptr<transport::ScaleupTeam>(
+                                gin.template get_sym_ptr<
+                                    transport::ScaleupTeam>(
                                     dst_token_buffer.get_base_ptr(),
                                     dst_scaleup_rank_idx),
                                 tma_buffer.get_base_ptr(),
@@ -464,7 +475,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
 
                 // Issue only if not local rank
                 if (last_src_scaleout_rank_idx != scaleout_rank_idx) {
-                    gin.put<transport::ScaleoutTeam>(
+                    gin.template put<transport::ScaleoutTeam>(
                         last_recv_token_buffer_ptr, last_send_token_buffer_ptr,
                         token_layout.get_num_bytes<false>(),
                         last_src_scaleout_rank_idx,
@@ -615,7 +626,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                         // Issue IBGDA
                         topk_valid_mask ^= 1u << k;
                         if (src_scaleout_rank_idx != scaleout_rank_idx) {
-                            gin.put<transport::ScaleoutTeam>(
+                            gin.template put<transport::ScaleoutTeam>(
                                 recv_buffer_ptr, send_buffer_ptr,
                                 token_layout.get_num_bytes<false>(),
                                 src_scaleout_rank_idx,
@@ -748,10 +759,10 @@ __global__ void __launch_bounds__(kNumThreads, 1)
         if (lane_idx < kNumScaleoutRanks) {
             // Update remote tails
             const auto expected_signal = math::pack2<int, int64_t>(1, 0);
-            gin.red_add_rel<transport::ScaleoutTeam>(
+            gin.template publish_tail<transport::ScaleoutTeam>(
                 workspace_layout.get_scaleout_channel_signaled_tail_ptr(
                     channel_idx, scaleout_rank_idx),
-                expected_signal, lane_idx);
+                channel_idx, expected_signal, expected_signal, lane_idx);
 
             // Wait tail arrival
             const auto wait_ptr =
@@ -759,10 +770,13 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                     channel_idx, lane_idx);
             comm::timeout_while<kNumTimeoutCycles>([=](const bool&
                                                            is_last_check) {
-                const auto signal = ptx::ld_acquire_sys<int64_t>(wait_ptr);
+                const auto signal =
+                    gin.template read_completion_tail<transport::ScaleoutTeam>(
+                        wait_ptr, channel_idx, lane_idx);
                 if (signal == expected_signal) {
                     // Clean for next usages
-                    *wait_ptr = 0;
+                    gin.template clear_completion_tail<transport::ScaleoutTeam>(
+                        wait_ptr, channel_idx, lane_idx);
                     return true;
                 }
 
@@ -781,7 +795,18 @@ __global__ void __launch_bounds__(kNumThreads, 1)
         __syncwarp();
     }
 
-    // No barrier at epilogue
+    // NCCL GIN puts retain registered source storage until their contexts are
+    // flushed. Quiesce the cooperative grid before returning so the next EP
+    // kernel can safely reuse the send buffers. IBGDA keeps its existing path.
+#ifdef USE_NCCL_DEVICE
+    if constexpr (Ops::kIsNccl) {
+        comm::gpu_barrier<Ops, true, kNumScaleoutRanks, kNumScaleupRanks,
+                          kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles,
+                          comm::kHybridCombineTag1, true, true, false>(
+            gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx,
+            thread_idx, false, false);
+    }
+#endif
 }
 
 }  // namespace mooncake::elastic

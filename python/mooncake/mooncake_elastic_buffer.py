@@ -21,7 +21,7 @@ def _dist_barrier(group: dist.ProcessGroup) -> None:
     if _using_musa_backend():
         dist.barrier(group=group, device_ids=[torch.cuda.current_device()])
     else:
-        group.barrier()
+        dist.barrier(group=group)
 
 
 def _ceil_div(x: int, y: int) -> int:
@@ -91,6 +91,11 @@ class ElasticBuffer:
     deliberately separate from Mooncake's legacy `Buffer` API, while reusing the
     existing Mooncake Device API transport/bootstrap path for the native data
     movement backend.
+
+    ``transport="nccl"`` requires ``explicitly_destroy=True``. Every rank in
+    the process group must call :meth:`destroy` before the process group is
+    destroyed; NCCL symmetric-window teardown cannot be made safe by
+    rank-local Python garbage collection.
     """
 
     # Mirrors DeepEP's fixed workspace assumptions closely enough for sizing and
@@ -100,6 +105,7 @@ class ElasticBuffer:
     _NUM_MAX_CHANNELS = 8 * 160
     _NUM_BARRIER_TAGS = 16
     _NUM_MAX_INFLIGHT_AGRS = 32
+    _NCCL_UNIQUE_ID_WORDS = 32
 
     def __init__(
         self,
@@ -118,15 +124,28 @@ class ElasticBuffer:
         num_cpu_timeout_secs: int = 300,
         num_gpu_timeout_secs: int = 100,
         explicitly_destroy: bool = False,
+        transport: str = "ibgda",
     ) -> None:
         if not allow_multiple_reduction:
             raise NotImplementedError(
                 "Mooncake ElasticBuffer currently supports only "
                 "allow_multiple_reduction=True"
             )
+        if transport not in {"ibgda", "nccl"}:
+            raise ValueError(
+                "ElasticBuffer transport must be either 'ibgda' or 'nccl', "
+                f"got {transport!r}"
+            )
+        if transport == "nccl" and not explicitly_destroy:
+            raise ValueError(
+                "transport='nccl' requires explicitly_destroy=True; call "
+                "ElasticBuffer.destroy() collectively on every group rank "
+                "before destroying the process group"
+            )
         self.group = group
         self.rank_idx = group.rank()
         self.num_ranks = group.size()
+        self.transport = transport
         self.allow_hybrid_mode = allow_hybrid_mode
         self.allow_multiple_reduction = allow_multiple_reduction
         self.prefer_overlap_with_compute = prefer_overlap_with_compute
@@ -170,6 +189,9 @@ class ElasticBuffer:
         # untouched while giving ElasticBuffer users a dedicated native entrypoint.
         from mooncake import ep
 
+        nccl_unique_id = (
+            self._exchange_nccl_unique_id(ep) if self.transport == "nccl" else []
+        )
         self.runtime = ep.ElasticBuffer(
             self.rank_idx,
             self.num_ranks,
@@ -186,7 +208,21 @@ class ElasticBuffer:
             num_allocated_qps,
             num_cpu_timeout_secs,
             num_gpu_timeout_secs,
+            self.transport,
+            nccl_unique_id,
         )
+        # NCCL's LSA team is the transport authority for the local domain; it
+        # may differ from the CUDA-visible-device heuristic used before native
+        # initialization. Keep the public topology fields in sync with the
+        # exact native launch topology for both backends.
+        self.num_rdma_ranks, self.num_nvlink_ranks = (
+            self.runtime.get_physical_domain_size()
+        )
+        self.num_scaleout_ranks, self.num_scaleup_ranks = (
+            self.runtime.get_logical_domain_size()
+        )
+        self.scaleout_rank_idx = self.rank_idx // self.num_scaleup_ranks
+        self.scaleup_rank_idx = self.rank_idx % self.num_scaleup_ranks
         self._connect_native()
 
         torch.cuda.synchronize()
@@ -207,6 +243,9 @@ class ElasticBuffer:
 
     def _connect_native(self, is_update: bool = False) -> None:
         from mooncake import ep
+
+        if self.transport == "nccl":
+            return
 
         if not bool(self.runtime.ibgda_disabled()):
             raddr, rkey = self.runtime.get_mr_info()
@@ -310,13 +349,97 @@ class ElasticBuffer:
                 stacklevel=2,
             )
 
+    def _exchange_nccl_unique_id(self, ep: Any) -> List[int]:
+        create_unique_id = getattr(ep, "create_nccl_unique_id", None)
+        backend = str(dist.get_backend(self.group)).lower()
+        collective_device = "cpu" if backend == "gloo" else "cuda"
+        root_global_rank = dist.get_global_rank(self.group, 0)
+
+        # NCCL requires ncclGetUniqueId to be called once per communicator.
+        # Catch root-side failures and broadcast the status first so every
+        # subgroup rank either receives the same ID or raises instead of
+        # waiting forever in the payload broadcast.
+        local_unique_id: List[int] = []
+        root_error: Optional[str] = None
+        if self.rank_idx == 0:
+            try:
+                if create_unique_id is None:
+                    raise RuntimeError(
+                        "Mooncake EP was built without NCCL Device API support"
+                    )
+                local_unique_id = list(create_unique_id())
+                if len(local_unique_id) != self._NCCL_UNIQUE_ID_WORDS:
+                    raise RuntimeError(
+                        "NCCL returned an invalid communicator unique ID: "
+                        f"expected {self._NCCL_UNIQUE_ID_WORDS} int32 words, "
+                        f"got {len(local_unique_id)}"
+                    )
+            except Exception as exc:
+                root_error = f"{type(exc).__name__}: {exc}"
+
+        status = torch.tensor(
+            [int(root_error is not None)],
+            dtype=torch.int32,
+            device=collective_device,
+        )
+        dist.broadcast(
+            status,
+            src=root_global_rank,
+            group=self.group,
+        )
+        if int(status.item()) != 0:
+            detail = f": {root_error}" if root_error is not None else ""
+            raise RuntimeError(
+                f"group root failed to create the NCCL communicator unique ID{detail}"
+            )
+
+        unique_id = torch.zeros(
+            self._NCCL_UNIQUE_ID_WORDS,
+            dtype=torch.int32,
+            device=collective_device,
+        )
+        if self.rank_idx == 0:
+            unique_id.copy_(
+                torch.tensor(
+                    local_unique_id,
+                    dtype=torch.int32,
+                    device=collective_device,
+                )
+            )
+        dist.broadcast(
+            unique_id,
+            src=root_global_rank,
+            group=self.group,
+        )
+        return unique_id.cpu().tolist()
+
     def update_ep_member(self) -> None:
+        if self.transport == "nccl":
+            raise RuntimeError(
+                "NCCL ElasticBuffer uses fixed communicator membership; "
+                "create a new buffer to change EP members"
+            )
         self._connect_native(True)
 
     def destroy(self) -> None:
-        # Existing Mooncake Buffer owns native resources through object lifetime.
-        # Keep the method to match the official ElasticBuffer API.
-        self.runtime = None
+        runtime = self.runtime
+        if runtime is None:
+            return
+        is_nccl = self.transport == "nccl"
+        if is_nccl:
+            # Quiesce every local CUDA stream before any rank deregisters the
+            # symmetric window. The following process-group barrier then makes
+            # that quiescence visible across all ranks.
+            torch.cuda.synchronize()
+            _dist_barrier(self.group)
+        try:
+            native_destroy = getattr(runtime, "destroy", None)
+            if native_destroy is not None:
+                native_destroy()
+        finally:
+            self.runtime = None
+            if is_nccl:
+                _dist_barrier(self.group)
 
     @staticmethod
     def _workspace_num_bytes() -> int:
@@ -342,8 +465,8 @@ class ElasticBuffer:
 
     @staticmethod
     def _atomic_scratch_num_bytes() -> int:
-        # Mirrors the native runtime: RDMA atomics need a local response area
-        # separate from the remote-visible workspace.
+        # Mirrors the native runtime: this is IBGDA response scratch or NCCL
+        # GIN-only signal storage, separate from the regular workspace signals.
         return ElasticBuffer._workspace_num_bytes()
 
     @staticmethod

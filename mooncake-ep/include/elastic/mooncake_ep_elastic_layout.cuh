@@ -3,6 +3,7 @@
 // transport references are replaced with Mooncake Device API adapters.
 #pragma once
 
+#include <mooncake_ep_configs.cuh>
 #include <elastic/mooncake_ep_elastic_compiled.cuh>
 #include <elastic/mooncake_ep_elastic_exception.cuh>
 #include <elastic/mooncake_ep_elastic_math.cuh>
@@ -36,6 +37,8 @@ struct WorkspaceLayout {
         sizeof(unsigned long long) + 2 * kNumMaxRanks * sizeof(int);
     static constexpr int64_t kNumBarrierSignalBytes =
         kNumBarrierTags * kNumBarrierBytesPerTag;
+    static constexpr int64_t kNumGinBarrierEpochBytes =
+        kNumBarrierTags * sizeof(uint64_t);
 
     __forceinline__ __device__ __host__
     WorkspaceLayout(void* workspace, const int& num_scaleout_ranks,
@@ -52,8 +55,8 @@ struct WorkspaceLayout {
         EP_UNIFIED_ASSERT(num_experts_per_rank <= kNumMaxExpertsPerRank);
     }
 
-    static int64_t get_num_bytes() {
-        // Pure NVLink scaleup barrier signals
+    __forceinline__ __device__ __host__ static int64_t get_num_bytes() {
+        // Pure NVLink scaleup barrier signals.
         int64_t num_bytes = 0;
         num_bytes += kNumBarrierSignalBytes;
 
@@ -85,7 +88,10 @@ struct WorkspaceLayout {
         // Rank send/recv count, for PP prev/next ranks
         num_bytes += 2 * 2 * sizeof(int64_t);
 
-        // AGRS signals
+        // All-gather/reduce-scatter signals
+        // Keep NCCL-only state after the established IBGDA workspace layout.
+        num_bytes += kNumGinBarrierEpochBytes;
+
         num_bytes += (kNumMaxInflightAGRS + 1) * kNumMaxRanks * sizeof(int);
 
         // Ensure LDG.256 work
@@ -107,6 +113,14 @@ struct WorkspaceLayout {
                                       tag * kNumBarrierBytesPerTag +
                                           sizeof(unsigned long long) +
                                           phase * kNumMaxRanks * sizeof(int));
+    }
+
+    __forceinline__ __device__ __host__ uint64_t* get_gin_barrier_epoch_ptr(
+        int tag) const {
+        EP_UNIFIED_ASSERT(tag >= 0 && tag < kNumBarrierTags);
+        return math::advance_ptr<uint64_t>(
+                   workspace, get_num_bytes() - kNumGinBarrierEpochBytes) +
+               tag;
     }
 
     __forceinline__ __device__ __host__ int64_t*
@@ -217,6 +231,69 @@ struct WorkspaceLayout {
             get_agrs_recv_signal_ptr(0, 0),
             kNumMaxInflightAGRS * kNumMaxRanks * sizeof(int));
         return base_ptr + rank_idx;
+    }
+};
+
+// Symmetric NCCL GIN-only signal storage. Unlike WorkspaceLayout, these words
+// are accessed only through NCCL GIN signal operations. Barrier signals are
+// monotonic; hybrid completion tails are reset through GIN before each kernel.
+struct GinSignalLayout {
+    uint64_t* base;
+    int num_ranks;
+    int gin_context_count;
+
+    __forceinline__ __device__ __host__ GinSignalLayout(void* base,
+                                                        int num_ranks,
+                                                        int gin_context_count)
+        : base(static_cast<uint64_t*>(base)),
+          num_ranks(num_ranks),
+          gin_context_count(gin_context_count) {}
+
+    __forceinline__ __device__ __host__ static int64_t get_barrier_num_bytes(
+        int num_ranks, int gin_context_count) {
+        const int64_t raw_bytes =
+            static_cast<int64_t>(WorkspaceLayout::kNumBarrierTags) * num_ranks *
+            gin_context_count * sizeof(uint64_t);
+        return math::align<int64_t>(raw_bytes, 32);
+    }
+
+    __forceinline__ __device__ __host__ static int64_t
+    get_completion_tail_num_bytes(int num_ranks) {
+        return static_cast<int64_t>(kNumMaxChannels) * num_ranks *
+               sizeof(uint64_t);
+    }
+
+    __forceinline__ __device__ __host__ static int64_t get_num_bytes(
+        int num_ranks, int gin_context_count) {
+        EP_UNIFIED_ASSERT(num_ranks > 0 &&
+                          num_ranks <= WorkspaceLayout::kNumMaxRanks);
+        EP_UNIFIED_ASSERT(gin_context_count > 0 &&
+                          gin_context_count <= MAX_QP_COUNT);
+        return math::align<int64_t>(
+            get_barrier_num_bytes(num_ranks, gin_context_count) +
+                get_completion_tail_num_bytes(num_ranks),
+            32);
+    }
+
+    __forceinline__ __device__ __host__ uint64_t* get_signal_ptr(
+        int tag, int sender_rank, int context_idx) const {
+        // Hot device lookup is intentionally unchecked. Host setup validates
+        // tag/rank/context bounds and reserved-prefix capacity once.
+        const int64_t idx =
+            (static_cast<int64_t>(tag) * num_ranks + sender_rank) *
+                gin_context_count +
+            context_idx;
+        return base + idx;
+    }
+
+    __forceinline__ __device__ __host__ uint64_t* get_completion_tail_ptr(
+        int channel_idx, int sender_world_rank) const {
+        // Hot device lookup is intentionally unchecked. The compiled channel
+        // count and validated communicator size bound both indices.
+        auto* tail_base = math::advance_ptr<uint64_t>(
+            base, get_barrier_num_bytes(num_ranks, gin_context_count));
+        return tail_base + static_cast<int64_t>(channel_idx) * num_ranks +
+               sender_world_rank;
     }
 };
 

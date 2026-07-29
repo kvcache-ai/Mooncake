@@ -4,9 +4,41 @@
 
 #include <cuda_alike.h>
 
+#ifdef USE_NCCL_DEVICE
+#include <transport/device/nccl_device_transport.h>
+#endif
+
 namespace mooncake {
 
+enum class ElasticTransportBackend : uint8_t {
+    kIbgda = 0,
+    kNccl = 1,
+};
+
+#ifdef USE_NCCL_DEVICE
+namespace elastic::transport {
+
+// Everything the NCCL kernel adapter needs in addition to NCCL's opaque
+// device context. The pointer fields identify offsets in the symmetric NCCL
+// registration; rank/team metadata is kept explicit so hot device paths do
+// not need capability queries.
+struct NcclContext {
+    device::NcclDeviceContext device;
+    void* gin_signal_base = nullptr;
+    int world_rank = 0;
+    int lsa_first_rank = 0;
+    int lsa_size = 1;
+    int gin_context_count = 0;
+};
+
+}  // namespace elastic::transport
+#endif
+
 struct ElasticLaunchContext {
+    ElasticTransportBackend backend = ElasticTransportBackend::kIbgda;
+#ifdef USE_NCCL_DEVICE
+    elastic::transport::NcclContext nccl;
+#endif
     void* gdr_buffer = nullptr;
     const int32_t* nvlink_available = nullptr;
     void* const* ipc_peer_ptrs = nullptr;

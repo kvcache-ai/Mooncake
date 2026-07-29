@@ -68,6 +68,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-topk", type=int, default=8)
     parser.add_argument("--num-sms", type=int, default=24)
     parser.add_argument(
+        "--transport",
+        choices=("ibgda", "nccl"),
+        default=os.getenv("MOONCAKE_EP_TRANSPORT", "ibgda"),
+        help="Device transport used by the ElasticBuffer kernels.",
+    )
+    parser.add_argument(
         "--route",
         choices=("alltoall", "local", "cross"),
         default="alltoall",
@@ -226,6 +232,8 @@ def main() -> None:
         deterministic=False,
         allow_hybrid_mode=args.allow_hybrid_mode,
         allow_multiple_reduction=True,
+        transport=args.transport,
+        explicitly_destroy=args.transport == "nccl",
         num_gpu_timeout_secs=10,
     )
 
@@ -409,12 +417,14 @@ def main() -> None:
             "MOONCAKE_ELASTIC_TEST_OK",
             f"world={world_size}",
             f"route={args.route}",
+            f"transport={args.transport}",
             f"recv={route_plan.expected_recv_tokens}",
             f"expanded={expanded_output}",
             f"scaleout={buffer.num_scaleout_ranks}",
             f"scaleup={buffer.num_scaleup_ranks}",
             flush=True,
         )
+    buffer.destroy()
     dist.destroy_process_group()
 
 
