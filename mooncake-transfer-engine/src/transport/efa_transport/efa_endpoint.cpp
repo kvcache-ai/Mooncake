@@ -179,11 +179,25 @@ bool EfaEndPoint::disconnectIfIdle() {
     // the write lock, neither able to advance).  Failing to acquire is
     // reported as "still busy" so the caller retries on a later drain.
     if (!lock_.tryLock()) return false;
-    // Holding the write lock means no submitter can be inside submitPostSend
-    // for THIS handle, so it is safe to release the AV slot.  Whether the slot
-    // itself may be retired is a separate question the context answers: the
-    // slot can still carry another endpoint's in-flight operations, and
-    // removePeerAddr() defers the fi_av_remove in that case.
+    // Holding the write lock only means no submitter is inside submitPostSend
+    // for THIS handle -- it says nothing about operations already posted
+    // against the shared AV slot, possibly by a sibling endpoint holding the
+    // same fi_addr_t.  Check that too, so "Idle" means what callers assume it
+    // means.
+    //
+    // Tearing down here would still be memory-safe (removePeerAddr() defers the
+    // fi_av_remove while inflight > 0), but it drops the handle to UNCONNECTED
+    // and forces the next batch through a fresh handshake -- and both callers
+    // pass a peer they only want to touch if it is quiet: peer_map_ eviction
+    // walks the LRU precisely to skip busy peers, and the stale-peer path
+    // retries on a later drain.  Reporting "busy" costs one retry; tearing down
+    // a live peer costs a re-handshake on the hot path.  (Reported in review of
+    // PR #2063: the previous code erased the map entry whenever the lock
+    // happened to be free, even with inflight > 0.)
+    if (context_.slotHasInflight(peer_fi_addr_)) {
+        lock_.unlock();
+        return false;
+    }
     disconnectUnlocked();
     lock_.unlock();
     return true;

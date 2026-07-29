@@ -903,8 +903,27 @@ int EfaContext::insertPeerAddrBytes(const uint8_t* addr, size_t len,
         return ERR_INVALID_ARGUMENT;
     }
 
+    // Hold post_lock_ across the insert AND the reference claim below.  This is
+    // what makes "insert" atomic with respect to removeSlotNow(), which takes
+    // the same lock and re-validates the counters under it.  Without it the
+    // pair races: fi_av_insert can return a live index and, before the
+    // refcount.fetch_add lands, a concurrent last-holder release sees
+    // refcount == 0 and fi_av_remove()s the slot out from under the new holder
+    // -- the very failure this bookkeeping exists to prevent, just with a
+    // narrower window.  (Reported in review of PR #2063.)
+    //
+    // Cheap: this is the handshake path, not the hot post path, and an EFA AV
+    // insert is a table write -- address-handle creation is lazy.  Lock order
+    // is post_lock_ -> av_ref_lock_ (via avSlot below), and nothing takes them
+    // the other way round, so there is no cycle.
+    while (post_lock_.test_and_set(std::memory_order_acquire)) {
+    }
     int ret = fi_av_insert(av_, addr, 1, &out, 0, nullptr);
     if (ret != 1) {
+        // Nothing was inserted, so there is no slot to protect; release before
+        // the (relatively expensive) diagnostic formatting below rather than
+        // holding the submit path off while we build a log line.
+        post_lock_.clear(std::memory_order_release);
         // libfabric's fi_av_insert returns three-valued:
         //   > 0 : number of addresses inserted (we expect 1)
         //   == 0 : request accepted but no address inserted — "silent refuse",
@@ -945,10 +964,13 @@ int EfaContext::insertPeerAddrBytes(const uint8_t* addr, size_t len,
     // it and only the last release may call fi_av_remove().
     //
     // A slot being re-inserted cancels any deferred removal: the address is
-    // live again, so retiring it would strand the new holder.
+    // live again, so retiring it would strand the new holder.  Still under
+    // post_lock_, so a remover cannot observe the intermediate state where the
+    // index is live but unreferenced.
     auto* slot = avSlot(out);
     slot->refcount.fetch_add(1, std::memory_order_acq_rel);
     slot->remove_pending.store(false, std::memory_order_release);
+    post_lock_.clear(std::memory_order_release);
     return 0;
 }
 
@@ -992,10 +1014,14 @@ void EfaContext::retireSlotIfPending(AvSlotState* slot, fi_addr_t fi_addr) {
     if (!slot->remove_pending.compare_exchange_strong(
             expected, false, std::memory_order_acq_rel))
         return;
-    removeSlotNow(fi_addr);
+    // The checks above are advisory -- they can all pass and then be
+    // invalidated before we take post_lock_.  removeSlotNow() re-validates
+    // under the lock and re-arms remove_pending if it has to back out, so
+    // losing this race costs one retry, not a lost completion or a leaked slot.
+    removeSlotNow(slot, fi_addr);
 }
 
-void EfaContext::removeSlotNow(fi_addr_t fi_addr) {
+void EfaContext::removeSlotNow(AvSlotState* slot, fi_addr_t fi_addr) {
     // Serialize the removal against the post burst on the same lock the
     // submitters use.  Refcounting alone is not enough: fi_av_remove() frees
     // the index for reuse, so a holder that has already latched peer_fi_addr_
@@ -1005,6 +1031,31 @@ void EfaContext::removeSlotNow(fi_addr_t fi_addr) {
     // check and its fi_write, and any post already inside the burst finishes
     // first.
     while (post_lock_.test_and_set(std::memory_order_acquire)) {
+    }
+    // Re-validate under the lock; this is the authoritative gate, and callers
+    // may have decided to remove based on counters read before they acquired
+    // it.  insertPeerAddrBytes() claims its reference while holding this same
+    // lock, so whatever we observe here is a settled state, not a torn one.
+    if (slot) {
+        if (slot->refcount.load(std::memory_order_acquire) != 0) {
+            // A fresh handshake re-admitted this address between the caller's
+            // check and now (the provider returns the same index for the same
+            // peer, so this is expected, not an error).  Removing would strand
+            // the new holder -- exactly the SIGSEGV this bookkeeping prevents.
+            // The inserter already cleared remove_pending, so nothing to undo.
+            post_lock_.clear(std::memory_order_release);
+            return;
+        }
+        if (slot->inflight.load(std::memory_order_acquire) != 0) {
+            // Operations were posted after the caller looked.  Hand the slot
+            // back to the deferred path rather than dropping their completions;
+            // the CQ poller retires it once the last one lands.  Re-arming
+            // remove_pending here is what keeps the slot from leaking when the
+            // caller had already CAS'd it to false.
+            slot->remove_pending.store(true, std::memory_order_release);
+            post_lock_.clear(std::memory_order_release);
+            return;
+        }
     }
     int ret = fi_av_remove(av_, &fi_addr, 1, 0);
     post_lock_.clear(std::memory_order_release);
@@ -1050,7 +1101,11 @@ void EfaContext::removePeerAddr(fi_addr_t fi_addr) {
         return;
     }
 
-    removeSlotNow(fi_addr);
+    // Both counters read zero, but neither read was atomic with the removal:
+    // a concurrent handshake may re-insert this address (and re-claim the slot)
+    // before we get the lock.  removeSlotNow() re-checks under post_lock_ and
+    // declines in that case, so the new holder is never stranded.
+    removeSlotNow(slot, fi_addr);
 }
 
 int EfaContext::submitPostSend(

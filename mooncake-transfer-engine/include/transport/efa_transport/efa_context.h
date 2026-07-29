@@ -317,8 +317,11 @@ class EfaContext {
     // Retire a slot that has quiesced.  Called by the CQ poller for slots
     // whose removal was deferred.
     void retireSlotIfPending(AvSlotState* slot, fi_addr_t fi_addr);
-    // Unconditional fi_av_remove, serialized against the post burst.
-    void removeSlotNow(fi_addr_t fi_addr);
+    // fi_av_remove serialized against the post burst.  Re-validates the slot's
+    // counters under post_lock_ and declines (re-arming remove_pending if
+    // needed) when a concurrent handshake re-claimed the slot or new operations
+    // were posted -- the callers' checks are advisory, this one is decisive.
+    void removeSlotNow(AvSlotState* slot, fi_addr_t fi_addr);
 
     RWSpinlock mr_lock_;
     std::map<uint64_t, EfaMemoryRegionMeta> mr_map_;
