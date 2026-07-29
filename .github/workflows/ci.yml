@@ -756,6 +756,21 @@ jobs:
         cargo clean
       shell: bash
 
+    - name: Verify Mooncake Store Rust dlopen bindings and packaging
+      run: |
+        cd mooncake-store/rust
+        # 1. Committed dlopen bindings must stay in sync with store_c.h.
+        cargo run --locked --example generate_dlopen_bindings
+        git diff --exit-code -- src/generated/ffi_dlopen_bindings.rs
+        # 2. The published dlopen crate must build with no header/bindgen: package
+        #    it, extract, and check the dlopen feature against the packaged files.
+        cargo package --no-verify --allow-dirty
+        crate=$(ls target/package/mooncake_store-*.crate | head -1)
+        dest=$(mktemp -d)
+        tar xzf "$crate" -C "$dest"
+        (cd "$dest"/mooncake_store-* && cargo check --no-default-features --features dlopen)
+      shell: bash
+
     - name: Configure project
       run: |
         cd build
