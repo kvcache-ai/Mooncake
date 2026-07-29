@@ -386,8 +386,8 @@ WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
-    const UUID& client_id, const std::string& key, ReplicaType replica_type,
-    const std::string& tenant_id, std::optional<uint64_t> object_checksum) {
+    const UUID& client_id, const ObjectMeta& object_meta,
+    ReplicaType replica_type, const std::string& tenant_id) {
     return execute_rpc(
         "PutEnd",
         [&] {
@@ -396,12 +396,12 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
                                          : TenantId::kDefaultValue,
                                      [&](const TenantId& resolved_tenant_id) {
                                          return master_service_.PutEnd(
-                                             client_id, key, resolved_tenant_id,
-                                             replica_type, object_checksum);
+                                             client_id, object_meta,
+                                             resolved_tenant_id, replica_type);
                                      });
         },
         [&](auto& timer) {
-            timer.LogRequest("client_id=", client_id, ", key=", key,
+            timer.LogRequest("client_id=", client_id, ", key=", object_meta.key,
                              ", replica_type=", replica_type);
         },
         [] { MasterMetricManager::instance().inc_put_end_requests(); },
@@ -643,8 +643,8 @@ WrappedMasterService::UpsertStart(const UUID& client_id, const std::string& key,
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::UpsertEnd(
-    const UUID& client_id, const std::string& key, ReplicaType replica_type,
-    const std::string& tenant_id, std::optional<uint64_t> object_checksum) {
+    const UUID& client_id, const ObjectMeta& object_meta,
+    ReplicaType replica_type, const std::string& tenant_id) {
     return execute_rpc(
         "UpsertEnd",
         [&] {
@@ -653,12 +653,12 @@ tl::expected<void, ErrorCode> WrappedMasterService::UpsertEnd(
                                          : TenantId::kDefaultValue,
                                      [&](const TenantId& resolved_tenant_id) {
                                          return master_service_.UpsertEnd(
-                                             client_id, key, resolved_tenant_id,
-                                             replica_type, object_checksum);
+                                             client_id, object_meta,
+                                             resolved_tenant_id, replica_type);
                                      });
         },
         [&](auto& timer) {
-            timer.LogRequest("client_id=", client_id, ", key=", key,
+            timer.LogRequest("client_id=", client_id, ", key=", object_meta.key,
                              ", replica_type=", replica_type);
         },
         [] { MasterMetricManager::instance().inc_put_end_requests(); },

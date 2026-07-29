@@ -348,8 +348,8 @@ TEST_F(MasterServiceTest, ObjectChecksumIsStoredAndClearedByUpsert) {
             .has_value());
     constexpr uint64_t kChecksum = 0;
     ASSERT_TRUE(service
-                    .PutEnd(segment.client_id, key, TenantId::Default(),
-                            ReplicaType::MEMORY, kChecksum)
+                    .PutEnd(segment.client_id, ObjectMeta{key, kChecksum},
+                            TenantId::Default(), ReplicaType::MEMORY)
                     .has_value());
 
     auto query = service.GetReplicaList(key, TenantId::Default());
@@ -362,8 +362,8 @@ TEST_F(MasterServiceTest, ObjectChecksumIsStoredAndClearedByUpsert) {
                                  1024, config)
                     .has_value());
     ASSERT_TRUE(service
-                    .UpsertEnd(segment.client_id, key, TenantId::Default(),
-                               ReplicaType::MEMORY, std::nullopt)
+                    .UpsertEnd(segment.client_id, ObjectMeta{key, std::nullopt},
+                               TenantId::Default(), ReplicaType::MEMORY)
                     .has_value());
     query = service.GetReplicaList(key, TenantId::Default());
     ASSERT_TRUE(query.has_value());
@@ -5030,9 +5030,11 @@ TEST_F(MasterServiceTest, WrappedBatchExistKeyUsesTenantAwareBatchPath) {
     auto default_put_start =
         service_.PutStart(client_id, default_only_key, 1024, config);
     ASSERT_TRUE(default_put_start.has_value());
-    ASSERT_TRUE(
-        service_.PutEnd(client_id, default_only_key, ReplicaType::MEMORY)
-            .has_value());
+    ASSERT_TRUE(service_
+                    .PutEnd(client_id,
+                            ObjectMeta{default_only_key, std::nullopt},
+                            ReplicaType::MEMORY)
+                    .has_value());
 
     auto& metrics = MasterMetricManager::instance();
     const auto base_requests = metrics.get_batch_exist_key_requests();

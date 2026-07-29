@@ -195,8 +195,8 @@ class BenchClient {
             return false;
         }
 
-        auto put_end_result =
-            master_client_.PutEnd(key, mooncake::ReplicaType::MEMORY);
+        auto put_end_result = master_client_.PutEnd(
+            {key, std::nullopt}, mooncake::ReplicaType::MEMORY);
         if (!put_end_result.has_value()) {
             return false;
         }

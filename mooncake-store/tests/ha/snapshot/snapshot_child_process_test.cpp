@@ -672,8 +672,8 @@ TEST_F(SnapshotChildProcessTest, RestorePreservesObjectChecksum) {
                                         1024, replicate_config);
     ASSERT_TRUE(put_start.has_value()) << toString(put_start.error());
     ASSERT_TRUE(service_
-                    ->PutEnd(client_id, key, TenantId::Default(),
-                             ReplicaType::MEMORY, kChecksum)
+                    ->PutEnd(client_id, ObjectMeta{key, kChecksum},
+                             TenantId::Default(), ReplicaType::MEMORY)
                     .has_value());
     ASSERT_TRUE(service_->ExistKey(key, TenantId::Default()).value_or(false));
 

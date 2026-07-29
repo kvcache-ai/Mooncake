@@ -1773,7 +1773,7 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
 
     if (finalize_decision.end_type.has_value()) {
         auto end_result = master_client_.PutEnd(
-            key, *finalize_decision.end_type, object_checksum);
+            ObjectMeta{key, object_checksum}, *finalize_decision.end_type);
         if (!end_result) {
             ErrorCode err = end_result.error();
             LOG(ERROR) << "Failed to end put operation: " << err;
@@ -1880,8 +1880,8 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     }
 
     // End upsert operation
-    auto end_result =
-        master_client_.UpsertEnd(key, ReplicaType::MEMORY, object_checksum);
+    auto end_result = master_client_.UpsertEnd(ObjectMeta{key, object_checksum},
+                                               ReplicaType::MEMORY);
     if (!end_result) {
         ErrorCode err = end_result.error();
         LOG(ERROR) << "Failed to end upsert operation: " << err;
@@ -3699,7 +3699,8 @@ void Client::PutToLocalFile(const std::string& key,
         }
 
         // If storage succeeded, end the put operation
-        auto end_result = master_client_.PutEnd(key, replica_type);
+        auto end_result =
+            master_client_.PutEnd(ObjectMeta{key, std::nullopt}, replica_type);
         if (!end_result) {
             LOG(ERROR) << "Failed to end put operation for key: " << key;
         }

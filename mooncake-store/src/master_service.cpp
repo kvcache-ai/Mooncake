@@ -3736,10 +3736,10 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
     return tl::make_unexpected(ErrorCode::TENANT_QUOTA_EXCEEDED);
 }
 
-auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
-                           const TenantId& tenant_id, ReplicaType replica_type,
-                           std::optional<uint64_t> object_checksum)
+auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
+                           const TenantId& tenant_id, ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
+    const auto& key = object_meta.key;
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     MetadataAccessorRW accessor(this, object_id);
@@ -3775,10 +3775,11 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
         },
         [](Replica& replica) { replica.mark_complete(); });
 
-    if (object_checksum.has_value() || replica_type == ReplicaType::ALL ||
+    if (object_meta.object_checksum.has_value() ||
+        replica_type == ReplicaType::ALL ||
         replica_type == ReplicaType::MEMORY ||
         replica_type == ReplicaType::NOF_SSD) {
-        metadata.object_checksum = object_checksum;
+        metadata.object_checksum = object_meta.object_checksum;
     }
 
     const bool has_memory_replica = metadata.HasMemReplica();
@@ -4063,6 +4064,13 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     return {};
 }
 
+auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
+                           const TenantId& tenant_id, ReplicaType replica_type)
+    -> tl::expected<void, ErrorCode> {
+    return PutEnd(client_id, ObjectMeta{key, std::nullopt}, tenant_id,
+                  replica_type);
+}
+
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
     const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
     const TenantId& tenant_id, ReplicaType replica_type) {
@@ -4070,8 +4078,8 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(object_metas.size());
     for (const auto& object_meta : object_metas) {
-        results.emplace_back(PutEnd(client_id, object_meta.key, tenant_id,
-                                    replica_type, object_meta.object_checksum));
+        results.emplace_back(
+            PutEnd(client_id, object_meta, tenant_id, replica_type));
     }
     return results;
 }
@@ -4444,12 +4452,20 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     return tl::make_unexpected(ErrorCode::TENANT_QUOTA_EXCEEDED);
 }
 
+auto MasterService::UpsertEnd(const UUID& client_id,
+                              const ObjectMeta& object_meta,
+                              const TenantId& tenant_id,
+                              ReplicaType replica_type)
+    -> tl::expected<void, ErrorCode> {
+    return PutEnd(client_id, object_meta, tenant_id, replica_type);
+}
+
 auto MasterService::UpsertEnd(const UUID& client_id, const std::string& key,
                               const TenantId& tenant_id,
-                              ReplicaType replica_type,
-                              std::optional<uint64_t> object_checksum)
+                              ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
-    return PutEnd(client_id, key, tenant_id, replica_type, object_checksum);
+    return UpsertEnd(client_id, ObjectMeta{key, std::nullopt}, tenant_id,
+                     replica_type);
 }
 
 auto MasterService::UpsertRevoke(const UUID& client_id, const std::string& key,

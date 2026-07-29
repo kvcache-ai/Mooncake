@@ -421,9 +421,12 @@ class MasterService {
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
+    auto PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
+                const TenantId& tenant_id, ReplicaType replica_type)
+        -> tl::expected<void, ErrorCode>;
+
     auto PutEnd(const UUID& client_id, const std::string& key,
-                const TenantId& tenant_id, ReplicaType replica_type,
-                std::optional<uint64_t> object_checksum = std::nullopt)
+                const TenantId& tenant_id, ReplicaType replica_type)
         -> tl::expected<void, ErrorCode>;
 
     /**
@@ -478,9 +481,12 @@ class MasterService {
     /**
      * @brief Complete an upsert operation. Delegates to PutEnd.
      */
+    auto UpsertEnd(const UUID& client_id, const ObjectMeta& object_meta,
+                   const TenantId& tenant_id, ReplicaType replica_type)
+        -> tl::expected<void, ErrorCode>;
+
     auto UpsertEnd(const UUID& client_id, const std::string& key,
-                   const TenantId& tenant_id, ReplicaType replica_type,
-                   std::optional<uint64_t> object_checksum = std::nullopt)
+                   const TenantId& tenant_id, ReplicaType replica_type)
         -> tl::expected<void, ErrorCode>;
 
     /**

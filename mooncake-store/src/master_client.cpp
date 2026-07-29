@@ -603,13 +603,12 @@ MasterClient::BatchPutStart(
 }
 
 tl::expected<void, ErrorCode> MasterClient::PutEnd(
-    const std::string& key, ReplicaType replica_type,
-    std::optional<uint64_t> object_checksum) {
+    const ObjectMeta& object_meta, ReplicaType replica_type) {
     ScopedVLogTimer timer(1, "MasterClient::PutEnd");
-    timer.LogRequest("key=", key);
+    timer.LogRequest("key=", object_meta.key);
 
     auto result = invoke_rpc<&WrappedMasterService::PutEnd, void>(
-        client_id_, key, replica_type, tenant_id_.value(), object_checksum);
+        client_id_, object_meta, replica_type, tenant_id_.value());
     timer.LogResponseExpected(result);
     return result;
 }
@@ -694,13 +693,12 @@ MasterClient::BatchUpsertStart(
 }
 
 tl::expected<void, ErrorCode> MasterClient::UpsertEnd(
-    const std::string& key, ReplicaType replica_type,
-    std::optional<uint64_t> object_checksum) {
+    const ObjectMeta& object_meta, ReplicaType replica_type) {
     ScopedVLogTimer timer(1, "MasterClient::UpsertEnd");
-    timer.LogRequest("key=", key);
+    timer.LogRequest("key=", object_meta.key);
 
     auto result = invoke_rpc<&WrappedMasterService::UpsertEnd, void>(
-        client_id_, key, replica_type, tenant_id_.value(), object_checksum);
+        client_id_, object_meta, replica_type, tenant_id_.value());
     timer.LogResponseExpected(result);
     return result;
 }
