@@ -282,17 +282,21 @@ RedisElectionHelper::ElectionAttemptResult RedisElectionHelper::TryElectOnce(
 
     if (!reply) {
         HAMetricManager::instance().inc_election_failures();
-        LOG(ERROR) << "TryElectOnce: election script failed (connection error)";
 
         // The script may have completed before the response was lost. After
         // reconnecting, identify our write by its per-attempt candidate ID.
         if (!Reconnect(election_ctx_)) {
+            LOG(WARNING) << "TryElectOnce: election script response was lost "
+                            "and reconnect failed";
             return ElectionAttemptResult::ERROR;
         }
         RedisReplyPtr current((redisReply*)redisCommand(
             election_ctx_, "GET %b", master_view_key_.data(),
             master_view_key_.size()));
         if (!current || current->type != REDIS_REPLY_STRING) {
+            LOG(WARNING)
+                << "TryElectOnce: failed to read the election result after "
+                   "reconnect";
             return ElectionAttemptResult::ERROR;
         }
         std::string value(current->str, current->len);
@@ -303,36 +307,60 @@ RedisElectionHelper::ElectionAttemptResult RedisElectionHelper::TryElectOnce(
             stored_candidate_id == candidate_id) {
             out_epoch = epoch;
             our_value_ = std::move(value);
-            LOG(INFO) << "TryElectOnce: confirmed election after reconnect";
+            LOG(WARNING) << "TryElectOnce: election script response was lost; "
+                            "confirmed election after reconnect";
             return ElectionAttemptResult::ELECTED;
         }
+        LOG(WARNING) << "TryElectOnce: election result after reconnect does "
+                        "not match this attempt";
         return ElectionAttemptResult::ERROR;
     }
 
+    const auto element_type = [&reply](size_t index) {
+        if (reply->type != REDIS_REPLY_ARRAY || index >= reply->elements ||
+            reply->element[index] == nullptr) {
+            return -1;
+        }
+        return reply->element[index]->type;
+    };
+
     if (reply->type != REDIS_REPLY_ARRAY || reply->elements < 2 ||
-        reply->element[0]->type != REDIS_REPLY_INTEGER) {
+        element_type(0) != REDIS_REPLY_INTEGER) {
         HAMetricManager::instance().inc_election_failures();
-        LOG(ERROR) << "TryElectOnce: unexpected election script reply";
+        LOG(WARNING) << "TryElectOnce: unexpected election script reply"
+                     << ", type=" << reply->type
+                     << ", elements=" << reply->elements
+                     << ", result_type=" << element_type(0);
         return ElectionAttemptResult::ERROR;
     }
 
     if (reply->element[0]->integer == 0) {
-        if (reply->element[1]->type != REDIS_REPLY_STRING) {
+        if (element_type(1) != REDIS_REPLY_STRING) {
+            LOG(WARNING)
+                << "TryElectOnce: contended election reply has an invalid "
+                   "leader value, leader_type="
+                << element_type(1);
             return ElectionAttemptResult::ERROR;
         }
         existing_value.assign(reply->element[1]->str, reply->element[1]->len);
         return ElectionAttemptResult::CONTENDED;
     }
 
-    if (reply->elements != 3 || reply->element[1]->type != REDIS_REPLY_STRING ||
-        reply->element[2]->type != REDIS_REPLY_STRING) {
+    if (reply->elements != 3 || element_type(1) != REDIS_REPLY_STRING ||
+        element_type(2) != REDIS_REPLY_STRING) {
+        LOG(WARNING) << "TryElectOnce: elected reply has an unexpected format"
+                     << ", elements=" << reply->elements
+                     << ", epoch_type=" << element_type(1)
+                     << ", value_type=" << element_type(2);
         return ElectionAttemptResult::ERROR;
     }
     try {
         out_epoch = std::stoll(
             std::string(reply->element[1]->str, reply->element[1]->len));
     } catch (const std::exception& error) {
-        LOG(ERROR) << "TryElectOnce: invalid epoch: " << error.what();
+        LOG(WARNING) << "TryElectOnce: invalid epoch"
+                     << ", length=" << reply->element[1]->len
+                     << ", error=" << error.what();
         return ElectionAttemptResult::ERROR;
     }
     our_value_.assign(reply->element[2]->str, reply->element[2]->len);
