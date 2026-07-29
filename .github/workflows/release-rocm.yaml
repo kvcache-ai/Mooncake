@@ -35,11 +35,22 @@ jobs:
       HIP_BUILD: "1"
 
     steps:
+      # git must exist BEFORE checkout so actions/checkout does a real clone
+      # (with .git + submodules); the rocm/dev image ships without git.
+      - name: Install git (pre-checkout)
+        shell: bash
+        run: |
+          set -eo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -y
+          apt-get install -y --no-install-recommends git ca-certificates
+
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
           fetch-depth: 0
+          submodules: recursive
 
       - name: Mark repository as safe
         shell: bash

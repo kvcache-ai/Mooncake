@@ -25,9 +25,22 @@ jobs:
       SCCACHE_GHA_ENABLED: "true"
 
     steps:
+    # git must exist BEFORE checkout so actions/checkout does a real clone
+    # (with .git + submodules). The rocm/dev image ships without git, which
+    # otherwise makes checkout fall back to a source tarball and breaks
+    # dependencies.sh's `git submodule` step.
+    - name: Install git (pre-checkout)
+      shell: bash
+      run: |
+        set -eo pipefail
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -y
+        apt-get install -y --no-install-recommends git ca-certificates
+
     - uses: actions/checkout@v4
       with:
         persist-credentials: false
+        submodules: recursive
 
     - name: Mark repository as safe
       run: git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
@@ -40,7 +53,7 @@ jobs:
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -y
         apt-get install -y --no-install-recommends \
-          git curl ca-certificates build-essential sudo pkg-config \
+          curl build-essential sudo pkg-config \
           ninja-build software-properties-common
         PYV="${{ matrix.python-version }}"
         if ! command -v "python${PYV}" >/dev/null 2>&1; then
