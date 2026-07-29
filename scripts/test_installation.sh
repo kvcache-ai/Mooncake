@@ -43,6 +43,10 @@ python tests/test_import_structure.py
 echo "Running mooncake config test..."
 python tests/test_mooncake_config.py
 
+echo "Running weight transfer manifest contract tests..."
+python -m pip install pytest
+python -m pytest tests/test_weight_transfer_manifest.py -q
+
 echo "Verifying mooncake_master entry point..."
 # Check if the mooncake_master entry point is installed and executable
 which mooncake_master || { echo "ERROR: mooncake_master entry point not found!"; exit 1; }
