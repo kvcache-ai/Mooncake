@@ -1486,13 +1486,14 @@ class MasterService {
     uint64_t CompletedMemoryQuotaCharge(const ObjectMetadata& metadata) const;
     uint64_t RequestedMemoryQuotaCharge(uint64_t value_length,
                                         const ReplicateConfig& config) const;
-    TenantQuotaHandle EnsureTenantQuotaHandle(TenantState& tenant_state,
-                                              const TenantId& tenant_id);
+    TenantState& GetOrCreateTenantState(MetadataShard& shard,
+                                        const TenantId& tenant_id);
+    TenantQuotaHandle GetBoundTenantQuotaHandle(
+        const TenantState& tenant_state) const;
     tl::expected<void, ErrorCode> ChargeTenantQuota(
-        TenantState& tenant_state, const TenantId& tenant_id, uint64_t bytes,
+        TenantQuotaHandle account, uint64_t bytes,
         uint64_t* deficit_bytes = nullptr);
-    void ReleaseTenantQuota(TenantState& tenant_state,
-                            const TenantId& tenant_id, uint64_t bytes);
+    void ReleaseTenantQuota(TenantQuotaHandle account, uint64_t bytes);
     void RecomputeTenantEffectiveQuotas();
     void RebuildTenantQuotaUsageFromMetadata();
     void LoadTenantQuotaPoliciesFromStoreOrThrow();
@@ -1624,13 +1625,13 @@ class MasterService {
     // Erase any in-flight PromotionTask for `key`, refund its pending charge,
     // and decrement the cluster-wide in-flight counter. Safe no-op if no task
     // exists.
-    void ErasePromotionTaskIfPresent(
-        TenantState& tenant_state, const std::string& key,
-        const TenantId& tenant_id) NO_THREAD_SAFETY_ANALYSIS {
+    void ErasePromotionTaskIfPresent(TenantState& tenant_state,
+                                     const std::string& key)
+        NO_THREAD_SAFETY_ANALYSIS {
         auto task_it = tenant_state.promotion_tasks.find(key);
         if (task_it != tenant_state.promotion_tasks.end()) {
             ReleaseTenantQuota(
-                tenant_state, tenant_id,
+                GetBoundTenantQuotaHandle(tenant_state),
                 std::exchange(task_it->second.pending_quota_charge_bytes, 0));
             tenant_state.promotion_tasks.erase(task_it);
             promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
@@ -1698,8 +1699,7 @@ class MasterService {
                                        : tenant_state_->replication_tasks.find(
                                              object_id_.user_key)) {
             if (tenant_state_ != nullptr) {
-                service_->EnsureTenantQuotaHandle(*tenant_state_,
-                                                  object_id_.tenant_id);
+                service_->GetBoundTenantQuotaHandle(*tenant_state_);
             }
             // Automatically clean up invalid handles (memory replicas only).
             // Note: We only check memory replicas here to avoid lock order
@@ -1724,8 +1724,7 @@ class MasterService {
                     before_charge > after_charge) {
                     auto release_result =
                         it_->second.quota_ledger.ReleaseCommitted(
-                            service_->EnsureTenantQuotaHandle(
-                                *tenant_state_, object_id_.tenant_id),
+                            service_->GetBoundTenantQuotaHandle(*tenant_state_),
                             before_charge - after_charge);
                     if (!release_result) {
                         LOG(ERROR)
@@ -1745,8 +1744,7 @@ class MasterService {
                     }
                     if (tenant_state_ != nullptr) {
                         service_->ErasePromotionTaskIfPresent(
-                            *tenant_state_, object_id_.user_key,
-                            object_id_.tenant_id);
+                            *tenant_state_, object_id_.user_key);
                         MaybeEraseEmptyTenant();
                     }
                 }
@@ -1838,12 +1836,9 @@ class MasterService {
             if (tenant_state_ != nullptr) {
                 return;
             }
-            auto result =
-                shard_guard_->tenants.try_emplace(object_id_.tenant_id);
-            tenant_it_ = result.first;
-            tenant_state_ = &tenant_it_->second;
-            service_->EnsureTenantQuotaHandle(*tenant_state_,
-                                              object_id_.tenant_id);
+            tenant_state_ = &service_->GetOrCreateTenantState(
+                shard_guard_.get(), object_id_.tenant_id);
+            tenant_it_ = shard_guard_->tenants.find(object_id_.tenant_id);
             it_ = tenant_state_->metadata.end();
             processing_it_ = tenant_state_->processing_keys.end();
             replication_task_it_ = tenant_state_->replication_tasks.end();

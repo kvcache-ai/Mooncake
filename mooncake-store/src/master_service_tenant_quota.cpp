@@ -236,26 +236,34 @@ void MasterService::RecomputeTenantEffectiveQuotas() {
     tenant_quota_table_.RecomputeEffectiveQuotas(capacity);
 }
 
-TenantQuotaHandle MasterService::EnsureTenantQuotaHandle(
-    TenantState& tenant_state, const TenantId& tenant_id) {
+MasterService::TenantState& MasterService::GetOrCreateTenantState(
+    MetadataShard& shard, const TenantId& tenant_id) {
+    auto it = shard.tenants.try_emplace(tenant_id).first;
+    if (enable_multi_tenants_ && it->second.quota_account == nullptr) {
+        it->second.quota_account =
+            tenant_quota_table_.GetOrCreateTenantHandle(tenant_id);
+    }
+    return it->second;
+}
+
+TenantQuotaHandle MasterService::GetBoundTenantQuotaHandle(
+    const TenantState& tenant_state) const {
     if (!enable_multi_tenants_) {
         return nullptr;
     }
-    if (tenant_state.quota_account == nullptr) {
-        tenant_state.quota_account =
-            tenant_quota_table_.GetOrCreateTenantHandle(tenant_id);
-    }
+    assert(tenant_state.quota_account != nullptr);
     return tenant_state.quota_account;
 }
 
 tl::expected<void, ErrorCode> MasterService::ChargeTenantQuota(
-    TenantState& tenant_state, const TenantId& tenant_id, uint64_t bytes,
-    uint64_t* deficit_bytes) {
+    TenantQuotaHandle account, uint64_t bytes, uint64_t* deficit_bytes) {
     if (!enable_multi_tenants_) {
         return {};
     }
-
-    auto* account = EnsureTenantQuotaHandle(tenant_state, tenant_id);
+    if (account == nullptr) {
+        LOG(ERROR) << "tenant quota charge attempted without a bound handle";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
     auto result = account->TryCharge(bytes);
     if (result) {
         if (deficit_bytes != nullptr) {
@@ -276,16 +284,18 @@ tl::expected<void, ErrorCode> MasterService::ChargeTenantQuota(
             : ErrorCode::INTERNAL_ERROR);
 }
 
-void MasterService::ReleaseTenantQuota(TenantState& tenant_state,
-                                       const TenantId& tenant_id,
+void MasterService::ReleaseTenantQuota(TenantQuotaHandle account,
                                        uint64_t bytes) {
     if (!enable_multi_tenants_ || bytes == 0) {
         return;
     }
-    auto* account = EnsureTenantQuotaHandle(tenant_state, tenant_id);
+    if (account == nullptr) {
+        LOG(ERROR) << "tenant quota release attempted without a bound handle"
+                   << ", bytes=" << bytes;
+        return;
+    }
     if (!account->Release(bytes)) {
-        LOG(ERROR) << "tenant quota release mismatch tenant="
-                   << tenant_id.value() << ", bytes=" << bytes;
+        LOG(ERROR) << "tenant quota release mismatch bytes=" << bytes;
     }
 }
 

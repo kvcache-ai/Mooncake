@@ -251,6 +251,25 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
                 : ErrorCode::INTERNAL_ERROR);
     }
 
+    TenantQuotaHandle GetOrCreateTenantStateHandleForTest(
+        MasterService& service, size_t shard_idx, const TenantId& tenant_id) {
+        MasterService::MetadataShardAccessorRW shard(&service, shard_idx);
+        auto& tenant_state =
+            service.GetOrCreateTenantState(shard.get(), tenant_id);
+        return service.GetBoundTenantQuotaHandle(tenant_state);
+    }
+
+    tl::expected<void, ErrorCode> ChargeBoundTenantQuotaForTest(
+        MasterService& service, TenantQuotaHandle account, uint64_t bytes) {
+        return service.ChargeTenantQuota(account, bytes);
+    }
+
+    void ReleaseBoundTenantQuotaForTest(MasterService& service,
+                                        TenantQuotaHandle account,
+                                        uint64_t bytes) {
+        service.ReleaseTenantQuota(account, bytes);
+    }
+
     std::unique_lock<std::shared_mutex> LockSnapshotForTest(
         MasterService& service) {
         return std::unique_lock<std::shared_mutex>(service.snapshot_mutex_);
@@ -355,6 +374,40 @@ TEST_F(MasterServiceTenantQuotaTest,
                 10);
 
     PutComplete(service, client_id, "ok", TenantId("tenant-a"), 10);
+}
+
+TEST_F(MasterServiceTenantQuotaTest,
+       SameTenantStatesAcrossMetadataShardsShareBoundHandle) {
+    const TenantId tenant_id("tenant-a");
+    MasterService service(MakeConfig({{tenant_id, 1000}}));
+    MountSegment(service);
+
+    auto* first_handle =
+        GetOrCreateTenantStateHandleForTest(service, 0, tenant_id);
+    auto* second_handle =
+        GetOrCreateTenantStateHandleForTest(service, 1, tenant_id);
+
+    ASSERT_NE(first_handle, nullptr);
+    EXPECT_EQ(first_handle, second_handle);
+
+    auto charge = ChargeBoundTenantQuotaForTest(service, first_handle, 128);
+    ASSERT_TRUE(charge.has_value()) << toString(charge.error());
+    EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 128);
+
+    ReleaseBoundTenantQuotaForTest(service, second_handle, 128);
+    EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 0);
+}
+
+TEST_F(MasterServiceTenantQuotaTest,
+       ChargeRejectsMissingHandleWhenQuotaIsEnabled) {
+    const TenantId tenant_id("tenant-a");
+    MasterService service(MakeConfig({{tenant_id, 1000}}));
+    MountSegment(service);
+
+    auto charge = ChargeBoundTenantQuotaForTest(service, nullptr, 1);
+    ASSERT_FALSE(charge.has_value());
+    EXPECT_EQ(charge.error(), ErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 0);
 }
 
 TEST_F(MasterServiceTenantQuotaTest,

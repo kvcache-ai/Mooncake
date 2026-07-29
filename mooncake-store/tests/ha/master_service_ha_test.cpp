@@ -430,7 +430,8 @@ class MasterServiceHATest : public ::testing::Test {
         const size_t shard_idx = service->getMetadataShardIndex(tenant, key);
         auto shard_access =
             MasterService::MetadataShardAccessorRW(service, shard_idx);
-        auto& tenant_state = shard_access->tenants[tenant];
+        auto& tenant_state =
+            service->GetOrCreateTenantState(shard_access.get(), tenant);
         tenant_state.promotion_tasks.emplace(
             key, MasterService::PromotionTask{
                      .source_id = 0,
