@@ -243,6 +243,13 @@ Example:
 
 * `--seg_name` : local segment name (typically left empty)
 * `--seg_type` : `DRAM | VRAM` (default: `DRAM`)
+* `--seg_type_mix` : comma-separated segment types for mixed DRAM+VRAM runs,
+  e.g. `dram,vram`. When set, the target registers buffers of each listed
+  type in one segment, and initiator threads round-robin across them so a
+  single tebench process drives traffic over multiple memory types (and
+  thus multiple transports — SHM for DRAM, NVLink for VRAM) concurrently.
+  Empty falls back to `--seg_type` (single type, existing behavior). See
+  Section 5.8 for usage and the multi-transport configuration it requires.
 * `--target_seg_name` : target segment name (empty → Target mode)
 
 **Scan ranges**
@@ -282,7 +289,11 @@ gpu_id + thread_id
 
 **Transport (TENT only)**
 
-* `--xport_type` : `rdma | shm | mnnvl | gds | iouring`
+* `--xport_type` : `rdma | shm | mnnvl | gds | iouring`. Selects a single
+  transport to enable (all others are disabled). Empty means no transport
+  is explicitly enabled or disabled by tebench — the engine reads the
+  transport enable list from the `MC_TENT_CONF` config file (see Section
+  5.8 for multi-transport scenarios).
 * `--tent_intent_type` : attach a standard transfer intent to every request,
   such as `foreground_get`, `background_prefetch`, or `checkpoint`. This is
   useful for validating intent-specific transport and QoS policy selection.
@@ -304,3 +315,59 @@ gpu_id + thread_id
 QoS mode intentionally requires a fixed thread count. Sweep offered load by
 running explicit cases with different class thread allocations so every output
 record has an unambiguous workload contract.
+
+### 5.8 Mixed DRAM+VRAM and Multi-Transport
+
+By default, tebench allocates buffers of a single `--seg_type` and enables a
+single `--xport_type` per run. To exercise a mixed-transport workload where
+the engine's transport selector naturally picks SHM for DRAM→DRAM transfers
+and NVLink for VRAM→VRAM transfers within one process, combine
+`--seg_type_mix` with the `MC_TENT_CONF` environment variable:
+
+1. **Enable multiple transports via `MC_TENT_CONF`** — point it at a JSON
+   config file (or inline JSON string) that enables the transports you want
+   active:
+
+   ```json
+   {
+       "transports": {
+           "shm":    {"enable": true},
+           "nvlink": {"enable": true}
+       }
+   }
+   ```
+
+   Leave `--xport_type` empty so tebench does not override the config's
+   enable list. `MC_TENT_CONF` is read by the engine's `ConfigHelper` and
+   applies to both target and initiator.
+
+2. **Register a mixed DRAM+VRAM segment via `--seg_type_mix`**:
+
+   ```bash
+   # Target: mixed DRAM+VRAM segment, all GPUs
+   MC_TENT_CONF=/path/to/config.json ./tebench --backend=tent \
+     --metadata_type=p2p --seg_name=tgtmix --seg_type_mix=dram,vram \
+     --local_gpu_id=-1 &
+
+   # Initiator: mixed DRAM+VRAM, 8 threads (4 DRAM→SHM, 4 VRAM→NVLink)
+   MC_TENT_CONF=/path/to/config.json ./tebench --backend=tent \
+     --metadata_type=p2p --target_seg_name=<SEG> --seg_type_mix=dram,vram \
+     --local_gpu_id=-1 --op_type=write --duration=30 \
+     --start_num_threads=8 --max_num_threads=8
+   ```
+
+   Initiator threads round-robin across the listed seg_types by `thread_id`
+   (even→DRAM, odd→VRAM). The engine selects transport based on the target
+   buffer's location — SHM for `cpu:N` buffers, NVLink for `cuda:N` buffers —
+   so `/metrics` will show both `transport="shm"` and `transport="nvlink"`
+   labels with non-zero counts from a single metrics endpoint.
+
+3. **`--local_gpu_id=-1`** is recommended for VRAM so each worker thread
+   gets its own GPU buffer. With the default `--local_gpu_id=0`, all VRAM
+   threads share one GPU buffer and contend, which underrepresents NVLink
+   throughput.
+
+Mixed mode requires `--start_num_threads` ≥ 2 (at least one thread per
+seg_type) and a build with `USE_CUDA=ON` (for VRAM/NVLink support). When
+`--seg_type_mix` is empty, tebench falls back to `--seg_type` (single type)
+and `--xport_type` (single transport) — the existing behavior.
