@@ -207,7 +207,7 @@ TEST_F(TenantQuotaLedgerTest, DuplicateReplacementOperationsAreRejected) {
 TEST_F(TenantQuotaLedgerTest, RebuildMatchesGlobalChargedBytes) {
     TenantQuotaLedger ledger;
     ASSERT_TRUE(ledger.Rebuild(account_, 90));
-    ASSERT_TRUE(table_.RebuildUsage({{tenant_id_, {.charged_bytes = 90}}}));
+    ASSERT_TRUE(table_.RebuildUsage({{tenant_id_, 90}}));
 
     EXPECT_EQ(ledger.PendingBytes(), 0);
     EXPECT_EQ(ledger.CommittedBytes(), 90);

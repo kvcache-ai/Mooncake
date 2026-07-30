@@ -127,17 +127,17 @@ ShardedTenantQuotaTable<NumShards>::ListTenantSnapshots() const {
 template <size_t NumShards>
 TenantQuotaResult ShardedTenantQuotaTable<NumShards>::RebuildUsage(
     const TenantQuotaUsageMap& usage, uint64_t allocatable_capacity_bytes) {
-    for (const auto& [_, tenant_usage] : usage) {
-        if (tenant_usage.charged_bytes > TenantQuotaAccount::kMaxChargedBytes) {
+    for (const auto& [_, charged_bytes] : usage) {
+        if (charged_bytes > TenantQuotaAccount::kMaxChargedBytes) {
             return tl::make_unexpected(TenantQuotaError::kInvalidArgument);
         }
     }
 
     std::lock_guard<std::mutex> recompute_lock(recompute_mutex_);
     std::array<TenantQuotaUsageMap, kNumShards> grouped_usage;
-    for (const auto& [tenant_id, tenant_usage] : usage) {
+    for (const auto& [tenant_id, charged_bytes] : usage) {
         grouped_usage[GetShardIndex(tenant_id)].emplace(tenant_id,
-                                                        tenant_usage);
+                                                        charged_bytes);
     }
 
     for (size_t i = 0; i < kNumShards; ++i) {

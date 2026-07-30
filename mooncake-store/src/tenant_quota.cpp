@@ -364,8 +364,8 @@ std::vector<TenantQuotaSnapshot> TenantQuotaTable::ListTenantSnapshots() const {
 
 TenantQuotaResult TenantQuotaTable::RebuildUsage(
     const TenantQuotaUsageMap& usage) {
-    for (const auto& [_, tenant_usage] : usage) {
-        if (tenant_usage.charged_bytes > TenantQuotaAccount::kMaxChargedBytes) {
+    for (const auto& [_, charged_bytes] : usage) {
+        if (charged_bytes > TenantQuotaAccount::kMaxChargedBytes) {
             return tl::make_unexpected(TenantQuotaError::kInvalidArgument);
         }
     }
@@ -376,14 +376,14 @@ TenantQuotaResult TenantQuotaTable::RebuildUsage(
         account->EndPolicyUpdate();
     }
 
-    for (const auto& [tenant_id, tenant_usage] : usage) {
+    for (const auto& [tenant_id, charged_bytes] : usage) {
         auto& account = GetOrCreateAccount(tenant_id);
         if (!account.has_explicit_policy_) {
             account.requested_quota_bytes_ = 0;
             account.effective_quota_bytes_.store(0, std::memory_order_release);
         }
         account.BeginPolicyUpdate();
-        account.SetChargedBytesForRebuild(tenant_usage.charged_bytes);
+        account.SetChargedBytesForRebuild(charged_bytes);
         account.EndPolicyUpdate();
     }
     return {};

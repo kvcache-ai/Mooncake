@@ -1437,15 +1437,15 @@ void MasterService::RebuildTenantQuotaUsageFromMetadata() {
         MetadataShardAccessorRO shard(this, i);
         for (const auto& [tenant_id, tenant_state] : shard->tenants) {
             for (const auto& [_, metadata] : tenant_state.metadata) {
-                auto& tenant_usage = usage[tenant_id];
+                auto& charged_bytes = usage[tenant_id];
                 const uint64_t charge = CompletedMemoryQuotaCharge(metadata);
                 if (charge > TenantQuotaAccount::kMaxChargedBytes ||
-                    tenant_usage.charged_bytes >
+                    charged_bytes >
                         TenantQuotaAccount::kMaxChargedBytes - charge) {
                     throw std::overflow_error(
                         "rebuilt tenant quota exceeds 2^63 - 1 bytes");
                 }
-                tenant_usage.charged_bytes += charge;
+                charged_bytes += charge;
             }
         }
     }

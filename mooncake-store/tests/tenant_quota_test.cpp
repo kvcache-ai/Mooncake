@@ -374,8 +374,8 @@ TEST(TenantQuotaTableTest, RebuildUsageCreatesAndRemovesOrphans) {
     ASSERT_TRUE(table.UpsertTenantPolicy(explicit_tenant, 100).has_value());
 
     TenantQuotaUsageMap usage{
-        {explicit_tenant, {.charged_bytes = 40}},
-        {orphan, {.charged_bytes = 20}},
+        {explicit_tenant, 40},
+        {orphan, 20},
     };
     ASSERT_TRUE(table.RebuildUsage(usage));
     table.RecomputeEffectiveQuotas(100);
@@ -394,7 +394,7 @@ TEST(TenantQuotaTableTest, OverflowChecksDoNotWrapAccounting) {
     const TenantId tenant_id("tenant-a");
     const uint64_t max = TenantQuotaAccount::kMaxChargedBytes;
     ASSERT_TRUE(table.UpsertTenantPolicy(tenant_id, max).has_value());
-    ASSERT_TRUE(table.RebuildUsage({{tenant_id, {.charged_bytes = max - 5}}}));
+    ASSERT_TRUE(table.RebuildUsage({{tenant_id, max - 5}}));
     table.RecomputeEffectiveQuotas(max);
 
     auto* account = table.GetOrCreateTenantHandle(tenant_id);
@@ -486,13 +486,9 @@ TEST(ShardedTenantQuotaTableTest,
     EXPECT_EQ(Snapshot(table, tenant_a.value()).requested_quota_bytes, 100);
     EXPECT_EQ(Snapshot(table, tenant_b.value()).requested_quota_bytes, 200);
 
-    ASSERT_TRUE(table.RebuildUsage(
-        {{tenant_a, {.charged_bytes = 40}}, {tenant_b, {.charged_bytes = 50}}},
-        300));
+    ASSERT_TRUE(table.RebuildUsage({{tenant_a, 40}, {tenant_b, 50}}, 300));
     auto invalid_usage = table.RebuildUsage(
-        {{tenant_a, {.charged_bytes = 60}},
-         {tenant_b,
-          {.charged_bytes = TenantQuotaAccount::kMaxChargedBytes + 1}}},
+        {{tenant_a, 60}, {tenant_b, TenantQuotaAccount::kMaxChargedBytes + 1}},
         300);
     ASSERT_FALSE(invalid_usage);
     EXPECT_EQ(Snapshot(table, tenant_a.value()).charged_bytes, 40);

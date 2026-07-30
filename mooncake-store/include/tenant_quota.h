@@ -26,13 +26,9 @@ struct TenantQuotaSnapshot {
     bool over_quota = false;
 };
 
-struct TenantQuotaUsage {
-    uint64_t charged_bytes = 0;
-};
-
 using TenantQuotaPolicyMap = std::map<TenantId, uint64_t>;
 using TenantQuotaUsageMap =
-    std::unordered_map<TenantId, TenantQuotaUsage, TenantIdHash>;
+    std::unordered_map<TenantId, uint64_t, TenantIdHash>;
 
 enum class TenantQuotaError {
     kQuotaExceeded,
