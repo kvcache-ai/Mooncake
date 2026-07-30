@@ -186,19 +186,19 @@ bool DecodeDurablePrefix(const std::string& value, DurablePrefix* prefix,
         SetReason(reason, "unsupported durable prefix schema_version");
         return false;
     }
-    uint64_t producer_view_version = 0;
+    DurablePrefix decoded;
     if (root.isMember("producer_view_version") &&
-        !GetUInt64Field(root, "producer_view_version", &producer_view_version,
-                        reason)) {
+        !GetUInt64Field(root, "producer_view_version",
+                        &decoded.producer_view_version, reason)) {
         return false;
     }
-    if (!GetUInt64Field(root, "batch_id", &prefix->batch_id, reason)) {
+    if (!GetUInt64Field(root, "batch_id", &decoded.batch_id, reason)) {
         return false;
     }
-    if (!GetUInt64Field(root, "last_seq", &prefix->last_seq, reason)) {
+    if (!GetUInt64Field(root, "last_seq", &decoded.last_seq, reason)) {
         return false;
     }
-    prefix->producer_view_version = producer_view_version;
+    *prefix = decoded;
     return true;
 }
 

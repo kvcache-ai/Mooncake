@@ -256,6 +256,19 @@ TEST(OpLogDurablePrefixCodecTest, InvalidProducerViewLeavesOutputUnchanged) {
     EXPECT_FALSE(reason.empty());
 }
 
+TEST(OpLogDurablePrefixCodecTest, InvalidLastSeqLeavesOutputUnchanged) {
+    DurablePrefix prefix{
+        .batch_id = 11, .last_seq = 22, .producer_view_version = 33};
+    std::string reason;
+    EXPECT_FALSE(DecodeDurablePrefix(
+        R"({"batch_id":9,"last_seq":"invalid","schema_version":1})", &prefix,
+        &reason));
+    EXPECT_EQ(11u, prefix.batch_id);
+    EXPECT_EQ(22u, prefix.last_seq);
+    EXPECT_EQ(33u, prefix.producer_view_version);
+    EXPECT_FALSE(reason.empty());
+}
+
 TEST(OpLogDurablePrefixCodecTest, RejectsMalformedPayload) {
     DurablePrefix out;
     std::string reason;
