@@ -1557,13 +1557,13 @@ void NoFSegmentManager::GetMountedSegmentsSnapshot(
     }
 }
 
-SegmentManager::~SegmentManager() {
+void SegmentManager::releaseCapacityMetrics() {
     // Segments that are still mounted here never went through
     // CommitUnmountSegment, so their contribution to the capacity metrics
     // has not been released. MasterMetricManager outlives MasterService
-    // instances (a new one is constructed per HA leadership term), so
-    // release it here to keep the gauges consistent with the segments
-    // that are actually mounted.
+    // instances (a new one is constructed per HA leadership term), so the
+    // serving instance releases it at teardown to keep the gauges
+    // consistent with the segments that are actually mounted.
     for (const auto& [segment_id, mounted_segment] : mounted_segments_) {
         const auto& segment = mounted_segment.segment;
         if (segment.protocol == "cxl") {

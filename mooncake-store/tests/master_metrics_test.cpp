@@ -13,6 +13,7 @@
 #include "utils.h"
 #include "master_admin_service.h"
 #include "master_service.h"
+#include "segment.h"
 #include "rpc_service.h"
 #include "types.h"
 #include "master_config.h"
@@ -301,6 +302,54 @@ TEST_F(MasterMetricsTest, ServiceTeardownReleasesSegmentCapacity) {
     // when a master loses leadership) must release the segment's capacity
     // contribution; MasterMetricManager outlives the service instance.
     ASSERT_EQ(metrics.get_total_mem_capacity(), capacity_before);
+    ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name), 0);
+}
+
+TEST_F(MasterMetricsTest, SnapshotReaderTeardownKeepsCapacityIntact) {
+    auto& metrics = MasterMetricManager::instance();
+
+    // Mount a segment through the accounted path so the gauge is non-zero.
+    SegmentManager source_manager(BufferAllocatorType::OFFSET);
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "snapshot_reader_segment";
+    segment.base = 0x300000000;
+    segment.size = 1024 * 1024 * 16;
+    UUID client_id = generate_uuid();
+    ASSERT_EQ(
+        source_manager.getSegmentAccess().MountSegment(segment, client_id),
+        ErrorCode::OK);
+    const int64_t capacity_after_mount = metrics.get_total_mem_capacity();
+    ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name),
+              static_cast<int64_t>(segment.size));
+
+    auto snapshot = SegmentSerializer(&source_manager).Serialize();
+    ASSERT_TRUE(snapshot.has_value());
+
+    {
+        // Deserialize into a temporary reader (as
+        // CatalogBackedSnapshotProvider does). The reader's records never
+        // contributed to the capacity metrics, so destroying it must leave
+        // the gauges untouched.
+        SegmentManager reader(BufferAllocatorType::OFFSET);
+        SegmentSerializer reader_serializer(&reader);
+        ASSERT_TRUE(
+            reader_serializer.Deserialize(snapshot.value()).has_value());
+    }
+    ASSERT_EQ(metrics.get_total_mem_capacity(), capacity_after_mount);
+    ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name),
+              static_cast<int64_t>(segment.size));
+
+    // Unmount to restore the gauges for the other tests.
+    {
+        auto access = source_manager.getSegmentAccess();
+        size_t dec_capacity = 0;
+        ASSERT_EQ(access.PrepareUnmountSegment(segment.id, dec_capacity),
+                  ErrorCode::OK);
+        ASSERT_EQ(
+            access.CommitUnmountSegment(segment.id, client_id, dec_capacity),
+            ErrorCode::OK);
+    }
     ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name), 0);
 }
 
