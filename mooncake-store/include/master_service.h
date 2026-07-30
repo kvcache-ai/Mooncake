@@ -1483,6 +1483,8 @@ class MasterService {
         TenantState& tenant_state,
         std::unordered_map<std::string, ObjectMetadata>::iterator it,
         const TenantId& tenant_id, QuotaEraseMode quota_mode);
+    tl::expected<void, ErrorCode> SettlePrimaryWriteQuotaIfReady(
+        TenantState& tenant_state, ObjectMetadata& metadata);
     uint64_t CompletedMemoryQuotaCharge(const ObjectMetadata& metadata) const;
     uint64_t RequestedMemoryQuotaCharge(uint64_t value_length,
                                         const ReplicateConfig& config) const;

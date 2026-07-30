@@ -270,6 +270,49 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         service.ReleaseTenantQuota(account, bytes);
     }
 
+    void DiscardExpiredProcessingForTest(MasterService& service,
+                                         const TenantId& tenant_id,
+                                         const std::string& key) {
+        const size_t shard_idx = service.getMetadataShardIndex(tenant_id, key);
+        MasterService::MetadataShardAccessorRW shard(&service, shard_idx);
+        service.DiscardExpiredProcessingReplicas(
+            shard, std::chrono::system_clock::time_point::max());
+    }
+
+    void FinalizeExpiredProcessingForTest(MasterService& service,
+                                          const TenantId& tenant_id,
+                                          const std::string& key) {
+        OpLogEntry entry;
+        entry.tenant_id = tenant_id.value();
+        entry.object_key = key;
+        service.FinalizeExpiredProcessingReplicasAfterDurable(
+            entry, std::chrono::system_clock::now());
+    }
+
+    void FinalizeRemovedMemoryReplicasForTest(MasterService& service,
+                                              const TenantId& tenant_id,
+                                              const std::string& key) {
+        std::vector<ReplicaID> removed_ids;
+        {
+            MasterService::MetadataAccessorRW accessor(
+                &service, MasterService::ObjectIdentity{tenant_id, key});
+            ASSERT_TRUE(accessor.Exists());
+            accessor.Get().VisitReplicas(
+                &Replica::fn_is_memory_replica,
+                [&removed_ids](Replica& replica) {
+                    removed_ids.push_back(replica.id());
+                    replica.mark_removed();
+                });
+        }
+        ASSERT_FALSE(removed_ids.empty());
+
+        OpLogEntry entry;
+        entry.tenant_id = tenant_id.value();
+        entry.object_key = key;
+        service.FinalizeRemovedReplicasAfterDurable(
+            entry, removed_ids, MasterService::QuotaEraseMode::kFull);
+    }
+
     std::unique_lock<std::shared_mutex> LockSnapshotForTest(
         MasterService& service) {
         return std::unique_lock<std::shared_mutex>(service.snapshot_mutex_);
@@ -683,6 +726,110 @@ TEST_F(MasterServiceTenantQuotaTest,
         service.UpsertRevoke(client_id, "key", tenant_id, ReplicaType::MEMORY);
     ASSERT_TRUE(revoke.has_value()) << toString(revoke.error());
     EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 0);
+}
+
+TEST_F(MasterServiceTenantQuotaTest,
+       PartialProcessingExpirySettlesPendingCharge) {
+    const TenantId tenant_id("tenant-a");
+    MasterService service(MakeConfig({{tenant_id, 1000}}));
+    UUID client_id = MountSegment(service);
+
+    auto start =
+        service.PutStart(client_id, "key", tenant_id, 100, MemoryConfig());
+    ASSERT_TRUE(start.has_value()) << toString(start.error());
+    Replica disk_replica(client_id, 100, "disk-endpoint",
+                         ReplicaStatus::COMPLETE);
+    auto add_result =
+        service.AddReplica(client_id, "key", tenant_id, disk_replica);
+    ASSERT_TRUE(add_result.has_value()) << toString(add_result.error());
+    EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 100);
+
+    DiscardExpiredProcessingForTest(service, tenant_id, "key");
+
+    EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 0);
+    auto replicas = service.GetReplicaList("key", tenant_id);
+    ASSERT_TRUE(replicas.has_value()) << toString(replicas.error());
+    ASSERT_EQ(replicas->replicas.size(), 1);
+    EXPECT_TRUE(replicas->replicas.front().is_local_disk_replica());
+}
+
+TEST_F(MasterServiceTenantQuotaTest,
+       DurablePartialProcessingExpirySettlesPendingCharge) {
+    const TenantId tenant_id("tenant-a");
+    MasterService service(MakeConfig({{tenant_id, 1000}}));
+    UUID client_id = MountSegment(service);
+
+    auto start =
+        service.PutStart(client_id, "key", tenant_id, 100, MemoryConfig());
+    ASSERT_TRUE(start.has_value()) << toString(start.error());
+    Replica disk_replica(client_id, 100, "disk-endpoint",
+                         ReplicaStatus::COMPLETE);
+    auto add_result =
+        service.AddReplica(client_id, "key", tenant_id, disk_replica);
+    ASSERT_TRUE(add_result.has_value()) << toString(add_result.error());
+    EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 100);
+
+    FinalizeExpiredProcessingForTest(service, tenant_id, "key");
+
+    EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 0);
+    auto replicas = service.GetReplicaList("key", tenant_id);
+    ASSERT_TRUE(replicas.has_value()) << toString(replicas.error());
+    ASSERT_EQ(replicas->replicas.size(), 1);
+    EXPECT_TRUE(replicas->replicas.front().is_local_disk_replica());
+}
+
+TEST_F(MasterServiceTenantQuotaTest,
+       PartialSizeChangingUpsertRevokeReleasesReplacementCharge) {
+    const TenantId tenant_id("tenant-a");
+    MasterService service(MakeConfig({{tenant_id, 1000}}));
+    UUID client_id = MountSegment(service);
+    PutComplete(service, client_id, "key", tenant_id, 100);
+
+    auto upsert =
+        service.UpsertStart(client_id, "key", tenant_id, 200, MemoryConfig());
+    ASSERT_TRUE(upsert.has_value()) << toString(upsert.error());
+    Replica disk_replica(client_id, 200, "disk-endpoint",
+                         ReplicaStatus::COMPLETE);
+    auto add_result =
+        service.AddReplica(client_id, "key", tenant_id, disk_replica);
+    ASSERT_TRUE(add_result.has_value()) << toString(add_result.error());
+    EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 300);
+
+    auto revoke =
+        service.UpsertRevoke(client_id, "key", tenant_id, ReplicaType::MEMORY);
+
+    ASSERT_TRUE(revoke.has_value()) << toString(revoke.error());
+    EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 0);
+    auto replicas = service.GetReplicaList("key", tenant_id);
+    ASSERT_TRUE(replicas.has_value()) << toString(replicas.error());
+    ASSERT_EQ(replicas->replicas.size(), 1);
+    EXPECT_TRUE(replicas->replicas.front().is_local_disk_replica());
+}
+
+TEST_F(MasterServiceTenantQuotaTest,
+       DurablePartialUpsertRevokeReleasesReplacementCharge) {
+    const TenantId tenant_id("tenant-a");
+    MasterService service(MakeConfig({{tenant_id, 1000}}));
+    UUID client_id = MountSegment(service);
+    PutComplete(service, client_id, "key", tenant_id, 100);
+
+    auto upsert =
+        service.UpsertStart(client_id, "key", tenant_id, 200, MemoryConfig());
+    ASSERT_TRUE(upsert.has_value()) << toString(upsert.error());
+    Replica disk_replica(client_id, 200, "disk-endpoint",
+                         ReplicaStatus::COMPLETE);
+    auto add_result =
+        service.AddReplica(client_id, "key", tenant_id, disk_replica);
+    ASSERT_TRUE(add_result.has_value()) << toString(add_result.error());
+    EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 300);
+
+    FinalizeRemovedMemoryReplicasForTest(service, tenant_id, "key");
+
+    EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 0);
+    auto replicas = service.GetReplicaList("key", tenant_id);
+    ASSERT_TRUE(replicas.has_value()) << toString(replicas.error());
+    ASSERT_EQ(replicas->replicas.size(), 1);
+    EXPECT_TRUE(replicas->replicas.front().is_local_disk_replica());
 }
 
 TEST_F(MasterServiceTenantQuotaTest, CopyStartRequiresQuotaForNewReplica) {

@@ -26,7 +26,7 @@ TEST_F(TenantQuotaLedgerTest, PendingFullyCommits) {
     Charge(100);
     ASSERT_TRUE(ledger.AdoptPendingCharge(account_, 100));
 
-    EXPECT_TRUE(ledger.SettleInitial(account_, 100));
+    EXPECT_TRUE(ledger.SettlePrimaryWrite(account_, 100));
     EXPECT_EQ(ledger.PendingBytes(), 0);
     EXPECT_EQ(ledger.CommittedBytes(), 100);
     EXPECT_EQ(ledger.TotalChargedBytes(), 100);
@@ -38,7 +38,7 @@ TEST_F(TenantQuotaLedgerTest, PendingPartiallyCommits) {
     Charge(100);
     ASSERT_TRUE(ledger.AdoptPendingCharge(account_, 100));
 
-    EXPECT_TRUE(ledger.SettleInitial(account_, 60));
+    EXPECT_TRUE(ledger.SettlePrimaryWrite(account_, 60));
     EXPECT_EQ(ledger.PendingBytes(), 0);
     EXPECT_EQ(ledger.CommittedBytes(), 60);
     EXPECT_EQ(account_->ChargedBytes(), 60);
@@ -58,7 +58,7 @@ TEST_F(TenantQuotaLedgerTest, SettlesAdditionalCharge) {
     TenantQuotaLedger ledger;
     Charge(40);
     ASSERT_TRUE(ledger.AdoptPendingCharge(account_, 40));
-    ASSERT_TRUE(ledger.SettleInitial(account_, 40));
+    ASSERT_TRUE(ledger.SettlePrimaryWrite(account_, 40));
     Charge(60);
     uint64_t task_pending_bytes = 60;
 
@@ -72,20 +72,20 @@ TEST_F(TenantQuotaLedgerTest, ReleasesCommittedBytesPartially) {
     TenantQuotaLedger ledger;
     Charge(100);
     ASSERT_TRUE(ledger.AdoptPendingCharge(account_, 100));
-    ASSERT_TRUE(ledger.SettleInitial(account_, 100));
+    ASSERT_TRUE(ledger.SettlePrimaryWrite(account_, 100));
 
     EXPECT_TRUE(ledger.ReleaseCommitted(account_, 40));
     EXPECT_EQ(ledger.CommittedBytes(), 60);
     EXPECT_EQ(account_->ChargedBytes(), 60);
 }
 
-TEST_F(TenantQuotaLedgerTest, TransfersAndReleasesReplacementCharge) {
+TEST_F(TenantQuotaLedgerTest, PrimaryWriteSettlementReleasesReplacementCharge) {
     TenantQuotaLedger old_ledger;
     TenantQuotaLedger replacement_owner;
     TenantQuotaLedger new_ledger;
     Charge(80);
     ASSERT_TRUE(old_ledger.AdoptPendingCharge(account_, 80));
-    ASSERT_TRUE(old_ledger.SettleInitial(account_, 80));
+    ASSERT_TRUE(old_ledger.SettlePrimaryWrite(account_, 80));
     Charge(120);
     ASSERT_TRUE(new_ledger.AdoptPendingCharge(account_, 120));
 
@@ -93,15 +93,44 @@ TEST_F(TenantQuotaLedgerTest, TransfersAndReleasesReplacementCharge) {
         old_ledger.TransferReplacementCharge(account_, replacement_owner));
     ASSERT_TRUE(
         replacement_owner.TransferReplacementCharge(account_, new_ledger));
-    ASSERT_TRUE(new_ledger.SettleInitial(account_, 100));
+    ASSERT_TRUE(new_ledger.SettlePrimaryWrite(account_, 100));
     EXPECT_EQ(new_ledger.PendingBytes(), 0);
     EXPECT_EQ(new_ledger.CommittedBytes(), 100);
-    EXPECT_EQ(new_ledger.ReplacedBytes(), 80);
-    EXPECT_EQ(account_->ChargedBytes(), 180);
-
-    EXPECT_TRUE(new_ledger.ReleaseReplacement(account_));
+    EXPECT_EQ(new_ledger.ReplacedBytes(), 0);
     EXPECT_EQ(new_ledger.TotalChargedBytes(), 100);
     EXPECT_EQ(account_->ChargedBytes(), 100);
+}
+
+TEST_F(TenantQuotaLedgerTest,
+       PrimaryWriteMismatchPreservesPendingAndReplacementCharge) {
+    TenantQuotaLedger old_ledger;
+    TenantQuotaLedger new_ledger;
+    Charge(30);
+    ASSERT_TRUE(old_ledger.AdoptPendingCharge(account_, 30));
+    ASSERT_TRUE(old_ledger.SettlePrimaryWrite(account_, 30));
+    ASSERT_TRUE(old_ledger.TransferReplacementCharge(account_, new_ledger));
+    Charge(70);
+    ASSERT_TRUE(new_ledger.AdoptPendingCharge(account_, 70));
+
+    auto settle_result = new_ledger.SettlePrimaryWrite(account_, 80);
+
+    ASSERT_FALSE(settle_result);
+    EXPECT_EQ(settle_result.error(), TenantQuotaError::kAccountingMismatch);
+    EXPECT_EQ(new_ledger.PendingBytes(), 70);
+    EXPECT_EQ(new_ledger.CommittedBytes(), 0);
+    EXPECT_EQ(new_ledger.ReplacedBytes(), 30);
+    EXPECT_EQ(new_ledger.TotalChargedBytes(), 100);
+    EXPECT_EQ(account_->ChargedBytes(), 100);
+
+    ASSERT_TRUE(account_->Release(80));
+    auto account_mismatch = new_ledger.SettlePrimaryWrite(account_, 50);
+    ASSERT_FALSE(account_mismatch);
+    EXPECT_EQ(account_mismatch.error(), TenantQuotaError::kAccountingMismatch);
+    EXPECT_EQ(new_ledger.PendingBytes(), 70);
+    EXPECT_EQ(new_ledger.CommittedBytes(), 0);
+    EXPECT_EQ(new_ledger.ReplacedBytes(), 30);
+    EXPECT_EQ(new_ledger.TotalChargedBytes(), 100);
+    EXPECT_EQ(account_->ChargedBytes(), 20);
 }
 
 TEST_F(TenantQuotaLedgerTest, RollsBackReplacementChargeOnFailure) {
@@ -109,7 +138,7 @@ TEST_F(TenantQuotaLedgerTest, RollsBackReplacementChargeOnFailure) {
     TenantQuotaLedger replacement_owner;
     Charge(80);
     ASSERT_TRUE(old_ledger.AdoptPendingCharge(account_, 80));
-    ASSERT_TRUE(old_ledger.SettleInitial(account_, 80));
+    ASSERT_TRUE(old_ledger.SettlePrimaryWrite(account_, 80));
     ASSERT_TRUE(
         old_ledger.TransferReplacementCharge(account_, replacement_owner));
 
@@ -123,13 +152,13 @@ TEST_F(TenantQuotaLedgerTest, AccountingMismatchDoesNotMutateState) {
     Charge(50);
     ASSERT_TRUE(ledger.AdoptPendingCharge(account_, 50));
 
-    auto settle_result = ledger.SettleInitial(account_, 51);
+    auto settle_result = ledger.SettlePrimaryWrite(account_, 51);
     ASSERT_FALSE(settle_result);
     EXPECT_EQ(settle_result.error(), TenantQuotaError::kAccountingMismatch);
     EXPECT_EQ(ledger.PendingBytes(), 50);
     EXPECT_EQ(account_->ChargedBytes(), 50);
 
-    ASSERT_TRUE(ledger.SettleInitial(account_, 50));
+    ASSERT_TRUE(ledger.SettlePrimaryWrite(account_, 50));
     auto release_result = ledger.ReleaseCommitted(account_, 51);
     ASSERT_FALSE(release_result);
     EXPECT_EQ(release_result.error(), TenantQuotaError::kAccountingMismatch);
@@ -156,7 +185,7 @@ TEST_F(TenantQuotaLedgerTest, DuplicateReplacementOperationsAreRejected) {
     TenantQuotaLedger destination;
     Charge(30);
     ASSERT_TRUE(source.AdoptPendingCharge(account_, 30));
-    ASSERT_TRUE(source.SettleInitial(account_, 30));
+    ASSERT_TRUE(source.SettlePrimaryWrite(account_, 30));
     ASSERT_TRUE(source.TransferReplacementCharge(account_, destination));
 
     auto duplicate_transfer =

@@ -22,10 +22,12 @@ class TenantQuotaLedger {
     TenantQuotaResult AdoptPendingCharge(TenantQuotaHandle account,
                                          uint64_t bytes);
 
-    // Settles the initial object allocation. Bytes not retained by
-    // actual_bytes are returned to the account.
-    TenantQuotaResult SettleInitial(TenantQuotaHandle account,
-                                    uint64_t actual_bytes);
+    // Completes a primary Put/Upsert lifecycle. The replacement bucket is
+    // always released; pending/committed bytes are reconciled to
+    // actual_committed_bytes. Validation and the account release complete
+    // before any local field is changed.
+    TenantQuotaResult SettlePrimaryWrite(TenantQuotaHandle account,
+                                         uint64_t actual_committed_bytes);
 
     // Settles a temporary task charge into this object's committed bytes. The
     // caller erases or clears the task field only after this succeeds.

@@ -32,27 +32,30 @@ TenantQuotaResult TenantQuotaLedger::AdoptPendingCharge(
     return {};
 }
 
-TenantQuotaResult TenantQuotaLedger::SettleInitial(TenantQuotaHandle account,
-                                                   uint64_t actual_bytes) {
+TenantQuotaResult TenantQuotaLedger::SettlePrimaryWrite(
+    TenantQuotaHandle account, uint64_t actual_committed_bytes) {
     if (account == nullptr ||
-        actual_bytes > TenantQuotaAccount::kMaxChargedBytes) {
+        actual_committed_bytes > TenantQuotaAccount::kMaxChargedBytes) {
         return InvalidArgument();
     }
     if (AddOverflows(pending_bytes_, committed_bytes_)) {
         return AccountingMismatch();
     }
-    const uint64_t accounted_bytes = pending_bytes_ + committed_bytes_;
-    if (actual_bytes > accounted_bytes) {
+    const uint64_t primary_bytes = pending_bytes_ + committed_bytes_;
+    if (actual_committed_bytes > primary_bytes ||
+        AddOverflows(primary_bytes, replaced_bytes_)) {
         return AccountingMismatch();
     }
 
-    const uint64_t refund_bytes = accounted_bytes - actual_bytes;
-    auto release_result = account->Release(refund_bytes);
+    const uint64_t total_bytes = primary_bytes + replaced_bytes_;
+    auto release_result =
+        account->Release(total_bytes - actual_committed_bytes);
     if (!release_result) {
         return release_result;
     }
     pending_bytes_ = 0;
-    committed_bytes_ = actual_bytes;
+    committed_bytes_ = actual_committed_bytes;
+    replaced_bytes_ = 0;
     return {};
 }
 
