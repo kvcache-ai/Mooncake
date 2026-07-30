@@ -218,9 +218,8 @@ std::vector<int> batch_write_tensor_impl(
         if (!valid_keys.empty()) {
             ReplicateConfig write_config =
                 MakeIndexedConfig(config, original_indices);
-            std::vector<int> op_results =
-                direct_batch_write(valid_keys, all_buffers, all_sizes,
-                                   write_config);
+            std::vector<int> op_results = direct_batch_write(
+                valid_keys, all_buffers, all_sizes, write_config);
             apply_tensor_batch_results(results, original_indices, op_results,
                                        operation_name);
         }

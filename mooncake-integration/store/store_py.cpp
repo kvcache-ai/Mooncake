@@ -164,12 +164,6 @@ py::tuple tensor_shape_tuple(const TensorMetadata &metadata) {
     return py::cast(shape_vec);
 }
 
-void append_tensor_payload_span(std::vector<std::span<const char>> &values,
-                                uintptr_t data_ptr, size_t tensor_size) {
-    if (tensor_size == 0) return;
-    values.emplace_back(reinterpret_cast<const char *>(data_ptr), tensor_size);
-}
-
 pybind11::object buffer_to_tensor(BufferHandle *buffer_handle, char *usr_buffer,
                                   int64_t data_length,
                                   bool own_user_buffer = false) {
@@ -918,24 +912,7 @@ class MooncakeStorePyWrapper {
                         const ReplicateConfig &config) {
         // Validation & Metadata extraction (GIL Held)
         auto info = extract_tensor_info(tensor, key);
-        if (!info.valid()) return to_py_ret(ErrorCode::INVALID_PARAMS);
-        if (use_dummy_client_) {
-            return put_tensor_info_impl(key, info, config);
-        }
-
-        // Prepare spans
-        std::vector<std::span<const char>> values;
-        values.emplace_back(reinterpret_cast<const char *>(&info.metadata),
-                            sizeof(TensorMetadata));
-        append_tensor_payload_span(values, info.data_ptr, info.tensor_size);
-
-        // Store (GIL Released)
-        py::gil_scoped_release release_gil;
-        int ret = store_->put_parts(key, values, config);
-        if (ret != 0)
-            LOG(ERROR) << "put_parts failed for key " << key << " with code "
-                       << ret;
-        return ret;
+        return put_tensor_info_impl(key, info, config);
     }
 
     int put_tensor(const std::string &key, pybind11::object tensor) {
@@ -1287,17 +1264,15 @@ class MooncakeStorePyWrapper {
                                    : results[0];
         }
 
-        std::vector<std::span<const char>> values;
-        values.emplace_back(reinterpret_cast<const char *>(&info.metadata),
-                            info.metadata.header.data_offset);
-        append_tensor_payload_span(values, info.data_ptr, info.tensor_size);
-
-        py::gil_scoped_release release_gil;
-        int ret = store_->put_parts(key, values, config);
-        if (ret != 0)
-            LOG(ERROR) << "put_parts failed for key " << key << " with code "
-                       << ret;
-        return ret;
+        auto results = batch_put_tensor_infos_impl(
+            std::vector<std::string>{key}, std::vector<PyTensorInfo>{info},
+            config);
+        if (results.size() != 1) {
+            LOG(ERROR) << "put returned unexpected result count for key "
+                       << key;
+            return to_py_ret(ErrorCode::RPC_FAIL);
+        }
+        return results[0];
     }
 
     int put_manifest_impl(const std::string &key,
@@ -1494,38 +1469,21 @@ class MooncakeStorePyWrapper {
                                    : results[0];
         }
 
-        std::vector<std::span<const char>> values;
-        values.emplace_back(reinterpret_cast<const char *>(&info.metadata),
-                            info.metadata.header.data_offset);
-        append_tensor_payload_span(values, info.data_ptr, info.tensor_size);
-
-        py::gil_scoped_release release_gil;
-        int ret = store_->upsert_parts(key, values, config);
-        if (ret != 0)
-            LOG(ERROR) << "upsert_parts failed for key " << key << " with code "
-                       << ret;
-        return ret;
+        auto results = batch_upsert_tensor_infos_impl(
+            std::vector<std::string>{key}, std::vector<PyTensorInfo>{info},
+            config);
+        if (results.size() != 1) {
+            LOG(ERROR) << "upsert returned unexpected result count for key "
+                       << key;
+            return to_py_ret(ErrorCode::RPC_FAIL);
+        }
+        return results[0];
     }
 
     int upsert_tensor_impl(const std::string &key, pybind11::object tensor,
                            const ReplicateConfig &config) {
         auto info = extract_tensor_info(tensor, key);
-        if (!info.valid()) return to_py_ret(ErrorCode::INVALID_PARAMS);
-        if (use_dummy_client_) {
-            return upsert_tensor_info_impl(key, info, config);
-        }
-
-        std::vector<std::span<const char>> values;
-        values.emplace_back(reinterpret_cast<const char *>(&info.metadata),
-                            sizeof(TensorMetadata));
-        append_tensor_payload_span(values, info.data_ptr, info.tensor_size);
-
-        py::gil_scoped_release release_gil;
-        int ret = store_->upsert_parts(key, values, config);
-        if (ret != 0)
-            LOG(ERROR) << "upsert_parts failed for key " << key << " with code "
-                       << ret;
-        return ret;
+        return upsert_tensor_info_impl(key, info, config);
     }
 
     int upsert_tensor(const std::string &key, pybind11::object tensor) {
@@ -1548,9 +1506,14 @@ class MooncakeStorePyWrapper {
                 return to_py_ret(ErrorCode::INVALID_PARAMS);
             }
 
+            std::vector<std::string> tp_keys;
+            tp_keys.reserve(tp_size);
             for (int rank = 0; rank < tp_size; ++rank) {
-                int ret = upsert_tensor_info_impl(get_tp_key_name(key, rank),
-                                                  (*infos)[rank], config);
+                tp_keys.push_back(get_tp_key_name(key, rank));
+            }
+            auto results =
+                batch_upsert_tensor_infos_impl(tp_keys, *infos, config);
+            for (int ret : results) {
                 if (ret != 0) return ret;
             }
             return 0;
@@ -1608,21 +1571,6 @@ class MooncakeStorePyWrapper {
         py::gil_scoped_release release_gil;
         return store_->batch_upsert_from(keys, buffers, sizes,
                                          ReplicateConfig{});
-    }
-
-    std::vector<int> batch_upsert_tensor_infos_impl(
-        const std::vector<std::string> &keys,
-        const std::vector<PyTensorInfo> &infos,
-        const ReplicateConfig &config = ReplicateConfig{}) {
-        return batch_write_tensor_impl(
-            keys, infos, config, "upsert",
-            [this](const std::vector<std::string> &write_keys,
-                   const std::vector<void *> &buffer_ptrs,
-                   const std::vector<size_t> &buffer_sizes,
-                   const ReplicateConfig &write_config) {
-                return store_->batch_upsert_from(write_keys, buffer_ptrs,
-                                                 buffer_sizes, write_config);
-            });
     }
 
     std::vector<int> batch_upsert_tensor_impl(
