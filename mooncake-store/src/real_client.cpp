@@ -3354,7 +3354,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         auto runtime_accelerator =
             device::GetAcceleratorRegistry().RuntimeAccelerators();
         void *dst = static_cast<char *>(buffer) + dst_offset;
-        if (runtime_accelerator.FindDeviceForPointer(dst)) {
+        if (runtime_accelerator.FindDeviceForPointer(dst) &&
+            !client_->CanUseLocalMemcpy(replica)) {
             if (!client_buffer_allocator_) {
                 LOG(ERROR) << "Client buffer allocator is not provided";
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -3491,7 +3492,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
     auto runtime_accelerator =
         device::GetAcceleratorRegistry().RuntimeAccelerators();
     void *dst = static_cast<char *>(buffer) + dst_offset;
-    if (runtime_accelerator.FindDeviceForPointer(dst)) {
+    if (runtime_accelerator.FindDeviceForPointer(dst) &&
+        !client_->CanUseLocalMemcpy(replica)) {
         if (!client_buffer_allocator_) {
             LOG(ERROR) << "Client buffer allocator is not provided";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
