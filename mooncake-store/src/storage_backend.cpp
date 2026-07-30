@@ -1861,25 +1861,27 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchQuery(
     return {};
 }
 
-BucketStorageBackend::BucketStorageBackend(
-    const FileStorageConfig& file_storage_config,
-    const BucketBackendConfig& bucket_backend_config)
-    : StorageBackendInterface(file_storage_config),
-      bucket_backend_config_(bucket_backend_config) {
-    const int n = std::max(batch_load_threads(), bucket_read_threads());
-    if (n > 1) {
-        batch_load_pool_ = std::make_unique<ThreadPool>(static_cast<size_t>(n));
-    }
-}
-
-int BucketStorageBackend::batch_load_threads() {
+int BucketStorageBackend::env_batch_load_threads() {
     const char* env = std::getenv("MC_BATCH_LOAD_THREADS");
     return env ? std::max(0, std::atoi(env)) : 0;
 }
 
-int BucketStorageBackend::bucket_read_threads() {
+int BucketStorageBackend::env_bucket_read_threads() {
     const char* env = std::getenv("MC_BUCKET_READ_THREADS");
     return env ? std::max(0, std::atoi(env)) : 0;
+}
+
+BucketStorageBackend::BucketStorageBackend(
+    const FileStorageConfig& file_storage_config,
+    const BucketBackendConfig& bucket_backend_config)
+    : StorageBackendInterface(file_storage_config),
+      bucket_backend_config_(bucket_backend_config),
+      batch_threads_(env_batch_load_threads()),
+      bucket_threads_(env_bucket_read_threads()) {
+    const int n = std::max(batch_threads_, bucket_threads_);
+    if (n > 1) {
+        batch_load_pool_ = std::make_unique<ThreadPool>(static_cast<size_t>(n));
+    }
 }
 
 tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
@@ -1958,10 +1960,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
     // Step 2: Perform IO without holding any locks.
     // When MC_BATCH_LOAD_THREADS > 1, dispatch each bucket's reads to a
     // thread pool for parallelism (buckets are independent files).
-    const int batch_threads = batch_load_threads();
-    const int bucket_threads = bucket_read_threads();
-
-    if (batch_threads > 1 && bucket_read_plans.size() > 1) {
+    if (batch_threads_ > 1 && bucket_read_plans.size() > 1) {
         ThreadPool& pool = *batch_load_pool_;
         std::vector<std::future<ErrorCode>> futures;
         futures.reserve(bucket_read_plans.size());
@@ -2087,14 +2086,14 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                            << filepath_res.value();
                 return tl::make_unexpected(file_res.error());
             }
-            if (bucket_threads > 1 && read_plans.size() > 1) {
+            if (bucket_threads_ > 1 && read_plans.size() > 1) {
                 // Intra-bucket chunked reads via thread pool.
                 // All chunks share the same fd (pread is thread-safe).
                 StorageFile* file_ptr = file_res->get();
                 ThreadPool& pool = *batch_load_pool_;
                 const size_t chunk_size =
-                    (read_plans.size() + bucket_threads - 1) /
-                    bucket_threads;
+                    (read_plans.size() + bucket_threads_ - 1) /
+                    bucket_threads_;
                 std::vector<std::future<ErrorCode>> futures;
                 for (size_t start = 0; start < read_plans.size();
                      start += chunk_size) {

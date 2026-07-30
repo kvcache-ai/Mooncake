@@ -1156,10 +1156,10 @@ class BucketStorageBackend : public StorageBackendInterface {
     int64_t GUARDED_BY(mutex_) next_bucket_ = -1;
     BucketBackendConfig bucket_backend_config_;
 
-    // Lazy-init thread pool for parallel BatchLoad.
-    // Created on first use when MC_BATCH_LOAD_THREADS > 1.
-    static int batch_load_threads();
-    static int bucket_read_threads();
+    static int env_batch_load_threads();
+    static int env_bucket_read_threads();
+    const int batch_threads_;
+    const int bucket_threads_;
     mutable std::unique_ptr<ThreadPool> batch_load_pool_;
 
     mutable Mutex offloading_mutex_;
