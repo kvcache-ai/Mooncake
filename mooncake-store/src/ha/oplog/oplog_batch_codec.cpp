@@ -153,6 +153,10 @@ std::string EncodeDurablePrefix(const DurablePrefix& prefix) {
         static_cast<Json::UInt>(kDurablePrefixSchemaVersion);
     root["batch_id"] = static_cast<Json::UInt64>(prefix.batch_id);
     root["last_seq"] = static_cast<Json::UInt64>(prefix.last_seq);
+    if (prefix.producer_view_version != 0) {
+        root["producer_view_version"] =
+            static_cast<Json::UInt64>(prefix.producer_view_version);
+    }
     return WriteJson(root);
 }
 
@@ -182,12 +186,19 @@ bool DecodeDurablePrefix(const std::string& value, DurablePrefix* prefix,
         SetReason(reason, "unsupported durable prefix schema_version");
         return false;
     }
+    uint64_t producer_view_version = 0;
+    if (root.isMember("producer_view_version") &&
+        !GetUInt64Field(root, "producer_view_version", &producer_view_version,
+                        reason)) {
+        return false;
+    }
     if (!GetUInt64Field(root, "batch_id", &prefix->batch_id, reason)) {
         return false;
     }
     if (!GetUInt64Field(root, "last_seq", &prefix->last_seq, reason)) {
         return false;
     }
+    prefix->producer_view_version = producer_view_version;
     return true;
 }
 

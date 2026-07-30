@@ -15,6 +15,7 @@ static constexpr int kOpLogBatchIdWidth = 20;
 struct DurablePrefix {
     uint64_t batch_id{0};
     uint64_t last_seq{0};
+    uint64_t producer_view_version{0};
 };
 
 struct BatchRecordRange {
