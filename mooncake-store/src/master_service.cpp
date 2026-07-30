@@ -2268,7 +2268,7 @@ auto MasterService::ExistKey(const std::string& key, const TenantId& tenant_id)
     }
 
     const auto& metadata = accessor.Get();
-    if (metadata.HasCompletedAvailableReplica()) {
+    if (HasReadableReplica(metadata)) {
         // Grant a lease to the object as it may be further used by the
         // client.
         auto* ts = accessor.GetTenantState();
@@ -2340,7 +2340,7 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
             }
 
             const auto& metadata = it->second;
-            if (metadata.HasCompletedAvailableReplica()) {
+            if (HasReadableReplica(metadata)) {
                 GrantLeaseForGroup(tenant_state, key, metadata);
                 results[i] = true;
             } else {
@@ -2356,6 +2356,7 @@ auto MasterService::GetAllKeys(const TenantId& tenant_id, bool filter_invalid)
     -> tl::expected<std::vector<std::string>, ErrorCode> {
     std::vector<std::string> all_keys;
     const TenantId& normalized_tenant = ResolveRequestTenantId(tenant_id);
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     for (size_t i = 0; i < kNumShards; i++) {
         MetadataShardAccessorRO shard(this, i);
         auto tenant_it = shard->tenants.find(normalized_tenant);
@@ -2363,7 +2364,7 @@ auto MasterService::GetAllKeys(const TenantId& tenant_id, bool filter_invalid)
             continue;
         }
         for (const auto& item : tenant_it->second.metadata) {
-            if (filter_invalid && !item.second.HasCompletedAvailableReplica()) {
+            if (filter_invalid && !HasReadableReplica(item.second)) {
                 continue;
             }
             all_keys.push_back(item.second.user_key.empty()
@@ -2915,6 +2916,25 @@ bool MasterService::IsReplicaReadable(const Replica& replica) const {
     return !endpoint || !invalid_replica_endpoints_.contains(*endpoint);
 }
 
+bool MasterService::HasReadableReplica(const ObjectMetadata& metadata) const {
+    return metadata.HasReplica(
+        [this](const Replica& replica) { return IsReplicaReadable(replica); });
+}
+
+std::vector<Replica::Descriptor> MasterService::GetReadableReplicaDescriptors(
+    const ObjectMetadata& metadata) const {
+    std::vector<Replica::Descriptor> descriptors;
+    metadata.VisitReplicas(
+        [this](const Replica& replica) { return IsReplicaReadable(replica); },
+        [&descriptors](const Replica& replica) {
+            auto descriptor = replica.get_available_descriptor();
+            if (descriptor) {
+                descriptors.emplace_back(std::move(*descriptor));
+            }
+        });
+    return descriptors;
+}
+
 auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
                                           const TenantId& tenant_id)
     -> tl::expected<
@@ -2941,8 +2961,7 @@ auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
         }
         for (const auto& [key, metadata] : tenant_it->second.metadata) {
             if (std::regex_search(key, pattern)) {
-                auto replica_list =
-                    metadata.GetCompletedAvailableReplicaDescriptors();
+                auto replica_list = GetReadableReplicaDescriptors(metadata);
 
                 if (replica_list.empty()) {
                     LOG(WARNING)
@@ -2979,7 +2998,7 @@ auto MasterService::GetReplicaList(const std::string& key,
         }
         const auto& metadata = accessor.Get();
 
-        auto replica_list = metadata.GetCompletedAvailableReplicaDescriptors();
+        auto replica_list = GetReadableReplicaDescriptors(metadata);
 
         if (replica_list.empty()) {
             if (!metadata.HasAvailableReplica()) {
@@ -3048,7 +3067,7 @@ auto MasterService::GetReplicaListForAdmin(const std::string& key,
     }
     const auto& metadata = accessor.Get();
 
-    auto replica_list = metadata.GetCompletedAvailableReplicaDescriptors();
+    auto replica_list = GetReadableReplicaDescriptors(metadata);
 
     if (replica_list.empty()) {
         if (!metadata.HasAvailableReplica()) {
@@ -3133,8 +3152,7 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                 }
 
                 const auto& metadata = metadata_it->second;
-                auto replica_list =
-                    metadata.GetCompletedAvailableReplicaDescriptors();
+                auto replica_list = GetReadableReplicaDescriptors(metadata);
 
                 if (replica_list.empty()) {
                     if (!metadata.HasAvailableReplica()) {
@@ -3253,8 +3271,7 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
                 }
 
                 const auto& metadata = metadata_it->second;
-                auto replica_list =
-                    metadata.GetCompletedAvailableReplicaDescriptors();
+                auto replica_list = GetReadableReplicaDescriptors(metadata);
 
                 if (replica_list.empty()) {
                     if (!metadata.HasAvailableReplica()) {

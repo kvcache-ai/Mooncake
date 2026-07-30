@@ -2292,6 +2292,9 @@ class MasterService {
     ErrorCode ValidateStandbyRemountSegment(const Segment& segment) const;
 
     bool IsReplicaReadable(const Replica& replica) const;
+    bool HasReadableReplica(const ObjectMetadata& metadata) const;
+    std::vector<Replica::Descriptor> GetReadableReplicaDescriptors(
+        const ObjectMetadata& metadata) const;
 
     /**
      * Segment lifecycle persist helper. Tries to durably persist the
