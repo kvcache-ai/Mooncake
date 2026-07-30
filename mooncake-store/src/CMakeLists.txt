@@ -19,6 +19,7 @@ set(MOONCAKE_STORE_SOURCES
     segment.cpp
     transfer_task.cpp
     tenant_quota.cpp
+    master_service_tenant_quota.cpp
     tenant_quota_policy_store.cpp
     rpc_service.cpp
     master_admin_service.cpp

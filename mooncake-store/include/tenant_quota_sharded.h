@@ -8,7 +8,7 @@
 
 namespace mooncake {
 
-// Thread-safe production wrapper around TenantQuotaTable. Per-tenant
+// Thread-safe production wrapper around TenantQuotaShard. Per-tenant
 // operations lock only one shard; cross-shard policy, usage, and recompute
 // operations are serialized by recompute_mutex_.
 template <size_t NumShards = 1024>
@@ -20,10 +20,9 @@ class ShardedTenantQuotaTable {
     TenantQuotaResult UpsertTenantPolicy(const TenantId& tenant_id,
                                          uint64_t requested_quota_bytes,
                                          uint64_t allocatable_capacity_bytes);
-    TenantQuotaPolicyResult DisableTenantPolicyIfEmpty(
-        const TenantId& tenant_id);
-    void ApplyTenantPolicies(const TenantQuotaPolicyMap& policies,
-                             uint64_t allocatable_capacity_bytes);
+    TenantQuotaResult DisableTenantPolicyIfEmpty(const TenantId& tenant_id);
+    TenantQuotaResult ApplyTenantPolicies(const TenantQuotaPolicyMap& policies,
+                                          uint64_t allocatable_capacity_bytes);
     TenantQuotaPolicyMap GetTenantPolicies() const;
 
     void RecomputeEffectiveQuotas(uint64_t allocatable_capacity_bytes);
@@ -45,13 +44,13 @@ class ShardedTenantQuotaTable {
 
     void IncrementMetadataObjectCount(const TenantId& tenant_id);
     TenantQuotaResult DecrementMetadataObjectCount(const TenantId& tenant_id);
-    void RebuildUsage(const TenantQuotaUsageMap& usage,
-                      uint64_t allocatable_capacity_bytes);
+    TenantQuotaResult RebuildUsage(const TenantQuotaUsageMap& usage,
+                                   uint64_t allocatable_capacity_bytes);
 
    private:
     struct Shard {
         mutable std::mutex mutex;
-        TenantQuotaTable table;
+        TenantQuotaShard table;
     };
 
     size_t GetShardIndex(const TenantId& tenant_id) const;

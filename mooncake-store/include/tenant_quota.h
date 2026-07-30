@@ -46,20 +46,18 @@ enum class TenantQuotaError {
 };
 
 using TenantQuotaResult = tl::expected<void, TenantQuotaError>;
-using TenantQuotaPolicyResult = tl::expected<uint64_t, TenantQuotaError>;
 
 template <size_t NumShards>
 class ShardedTenantQuotaTable;
 
-// Single-threaded tenant quota state machine. This class owns quota rules and
-// accounting invariants, but deliberately contains no locking or sharding.
-class TenantQuotaTable {
+// Single-shard tenant quota state machine. Callers must provide external
+// synchronization; ShardedTenantQuotaTable owns the production shard locks.
+class TenantQuotaShard {
    public:
     TenantQuotaResult UpsertTenantPolicy(const TenantId& tenant_id,
                                          uint64_t requested_quota_bytes);
-    TenantQuotaPolicyResult DisableTenantPolicyIfEmpty(
-        const TenantId& tenant_id);
-    void ApplyTenantPolicies(const TenantQuotaPolicyMap& policies);
+    TenantQuotaResult DisableTenantPolicyIfEmpty(const TenantId& tenant_id);
+    TenantQuotaResult ApplyTenantPolicies(const TenantQuotaPolicyMap& policies);
     TenantQuotaPolicyMap GetTenantPolicies() const;
 
     void RecomputeEffectiveQuotas(uint64_t allocatable_capacity_bytes);
@@ -81,7 +79,7 @@ class TenantQuotaTable {
 
     void IncrementMetadataObjectCount(const TenantId& tenant_id);
     TenantQuotaResult DecrementMetadataObjectCount(const TenantId& tenant_id);
-    void RebuildUsage(const TenantQuotaUsageMap& usage);
+    TenantQuotaResult RebuildUsage(const TenantQuotaUsageMap& usage);
 
    private:
     template <size_t>
@@ -108,6 +106,9 @@ class TenantQuotaTable {
     static std::map<TenantId, uint64_t> BuildEffectiveQuotaAssignments(
         const std::vector<TenantQuotaSnapshot>& tenants,
         uint64_t allocatable_capacity_bytes);
+    static TenantQuotaResult ValidatePolicies(
+        const TenantQuotaPolicyMap& policies);
+    static TenantQuotaResult ValidateUsage(const TenantQuotaUsageMap& usage);
     void ApplyEffectiveQuotas(
         const std::map<TenantId, uint64_t>& effective_quotas);
     void EraseIfLazyEmpty(StateMap::iterator it);

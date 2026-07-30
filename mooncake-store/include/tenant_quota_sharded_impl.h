@@ -25,7 +25,7 @@ TenantQuotaResult ShardedTenantQuotaTable<NumShards>::UpsertTenantPolicy(
 }
 
 template <size_t NumShards>
-TenantQuotaPolicyResult
+TenantQuotaResult
 ShardedTenantQuotaTable<NumShards>::DisableTenantPolicyIfEmpty(
     const TenantId& tenant_id) {
     std::lock_guard<std::mutex> recompute_lock(recompute_mutex_);
@@ -35,8 +35,13 @@ ShardedTenantQuotaTable<NumShards>::DisableTenantPolicyIfEmpty(
 }
 
 template <size_t NumShards>
-void ShardedTenantQuotaTable<NumShards>::ApplyTenantPolicies(
+TenantQuotaResult ShardedTenantQuotaTable<NumShards>::ApplyTenantPolicies(
     const TenantQuotaPolicyMap& policies, uint64_t allocatable_capacity_bytes) {
+    auto validation_result = TenantQuotaShard::ValidatePolicies(policies);
+    if (!validation_result) {
+        return validation_result;
+    }
+
     std::lock_guard<std::mutex> recompute_lock(recompute_mutex_);
     std::array<TenantQuotaPolicyMap, kNumShards> grouped_policies;
     for (const auto& [tenant_id, requested_quota_bytes] : policies) {
@@ -47,9 +52,13 @@ void ShardedTenantQuotaTable<NumShards>::ApplyTenantPolicies(
     for (size_t i = 0; i < kNumShards; ++i) {
         auto& shard = shards_[i];
         std::lock_guard<std::mutex> lock(shard.mutex);
-        shard.table.ApplyTenantPolicies(grouped_policies[i]);
+        auto result = shard.table.ApplyTenantPolicies(grouped_policies[i]);
+        if (!result) {
+            return result;
+        }
     }
     RecomputeEffectiveQuotasLocked(allocatable_capacity_bytes);
+    return {};
 }
 
 template <size_t NumShards>
@@ -179,8 +188,13 @@ ShardedTenantQuotaTable<NumShards>::DecrementMetadataObjectCount(
 }
 
 template <size_t NumShards>
-void ShardedTenantQuotaTable<NumShards>::RebuildUsage(
+TenantQuotaResult ShardedTenantQuotaTable<NumShards>::RebuildUsage(
     const TenantQuotaUsageMap& usage, uint64_t allocatable_capacity_bytes) {
+    auto validation_result = TenantQuotaShard::ValidateUsage(usage);
+    if (!validation_result) {
+        return validation_result;
+    }
+
     std::lock_guard<std::mutex> recompute_lock(recompute_mutex_);
     std::array<TenantQuotaUsageMap, kNumShards> grouped_usage;
     for (const auto& [tenant_id, tenant_usage] : usage) {
@@ -191,9 +205,13 @@ void ShardedTenantQuotaTable<NumShards>::RebuildUsage(
     for (size_t i = 0; i < kNumShards; ++i) {
         auto& shard = shards_[i];
         std::lock_guard<std::mutex> lock(shard.mutex);
-        shard.table.RebuildUsage(grouped_usage[i]);
+        auto result = shard.table.RebuildUsage(grouped_usage[i]);
+        if (!result) {
+            return result;
+        }
     }
     RecomputeEffectiveQuotasLocked(allocatable_capacity_bytes);
+    return {};
 }
 
 template <size_t NumShards>
@@ -225,7 +243,7 @@ void ShardedTenantQuotaTable<NumShards>::RecomputeEffectiveQuotasLocked(
                          shard_snapshots.end());
     }
 
-    auto effective_quotas = TenantQuotaTable::BuildEffectiveQuotaAssignments(
+    auto effective_quotas = TenantQuotaShard::BuildEffectiveQuotaAssignments(
         snapshots, allocatable_capacity_bytes);
     std::array<std::map<TenantId, uint64_t>, kNumShards> grouped_quotas;
     for (const auto& [tenant_id, effective_quota_bytes] : effective_quotas) {
