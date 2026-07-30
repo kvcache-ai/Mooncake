@@ -50,7 +50,6 @@ struct TenantQuotaChargeFailure {
 
 using TenantQuotaResult = tl::expected<void, TenantQuotaError>;
 using TenantQuotaChargeResult = tl::expected<void, TenantQuotaChargeFailure>;
-using TenantQuotaPolicyResult = tl::expected<uint64_t, TenantQuotaError>;
 
 class TenantQuotaAccount {
    public:
@@ -98,8 +97,7 @@ class TenantQuotaShard {
    public:
     TenantQuotaResult UpsertTenantPolicy(const TenantId& tenant_id,
                                          uint64_t requested_quota_bytes);
-    TenantQuotaPolicyResult DisableTenantPolicyIfEmpty(
-        const TenantId& tenant_id);
+    TenantQuotaResult DisableTenantPolicyIfEmpty(const TenantId& tenant_id);
     TenantQuotaResult ApplyTenantPolicies(const TenantQuotaPolicyMap& policies);
     TenantQuotaPolicyMap GetTenantPolicies() const;
 

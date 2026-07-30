@@ -1307,8 +1307,8 @@ tl::expected<void, ErrorCode> MasterService::SettlePrimaryWriteQuotaIfReady(
 }
 
 void MasterService::FinalizeRemovedReplicasAfterDurable(
-    const OpLogEntry& durable_entry, const std::vector<ReplicaID>& replica_ids,
-    QuotaEraseMode quota_mode) {
+    const OpLogEntry& durable_entry,
+    const std::vector<ReplicaID>& replica_ids) {
     if (replica_ids.empty()) {
         return;
     }
@@ -1368,7 +1368,7 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
         shard.OnDiskReplicaRemoved(erased_local_disk, metadata);
     }
     if (!metadata.IsValid()) {
-        EraseMetadata(tenant_state, metadata_it, tenant_id, quota_mode, &shard);
+        EraseMetadata(tenant_state, metadata_it, tenant_id, &shard);
         if (tenant_state.Empty()) {
             shard->tenants.erase(tenant_it);
         }
@@ -1382,7 +1382,7 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
 }
 
 void MasterService::FinalizeMetadataEraseAfterDurable(
-    const OpLogEntry& durable_entry, QuotaEraseMode quota_mode) {
+    const OpLogEntry& durable_entry) {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const TenantId tenant_id(durable_entry.tenant_id);
     const size_t shard_idx =
@@ -1397,7 +1397,7 @@ void MasterService::FinalizeMetadataEraseAfterDurable(
     if (metadata_it == tenant_state.metadata.end()) {
         return;
     }
-    EraseMetadata(tenant_state, metadata_it, tenant_id, quota_mode, &shard);
+    EraseMetadata(tenant_state, metadata_it, tenant_id, &shard);
     if (tenant_state.Empty()) {
         shard->tenants.erase(tenant_it);
     }
@@ -1528,8 +1528,7 @@ tl::expected<void, ErrorCode> MasterService::PersistStaleHandleCleanupForHA(
         payload,
         [this,
          removed_ids = plan.removed_ids](const OpLogEntry& durable_entry) {
-            FinalizeRemovedReplicasAfterDurable(durable_entry, removed_ids,
-                                                QuotaEraseMode::kFull);
+            FinalizeRemovedReplicasAfterDurable(durable_entry, removed_ids);
         });
     if (!result) {
         LOG(WARNING) << why
@@ -1545,15 +1544,7 @@ MasterService::EraseMetadata(
     TenantState& tenant_state,
     std::unordered_map<std::string, ObjectMetadata>::iterator it,
     const TenantId& tenant_id) {
-    return EraseMetadata(tenant_state, it, tenant_id, QuotaEraseMode::kFull);
-}
-
-std::unordered_map<std::string, MasterService::ObjectMetadata>::iterator
-MasterService::EraseMetadata(
-    TenantState& tenant_state,
-    std::unordered_map<std::string, ObjectMetadata>::iterator it,
-    const TenantId& tenant_id, QuotaEraseMode quota_mode) {
-    return EraseMetadata(tenant_state, it, tenant_id, quota_mode, nullptr);
+    return EraseMetadata(tenant_state, it, tenant_id, nullptr);
 }
 
 // EraseMetadata deletes the object metadata and also cleans up all
@@ -1564,8 +1555,8 @@ std::unordered_map<std::string, MasterService::ObjectMetadata>::iterator
 MasterService::EraseMetadata(
     TenantState& tenant_state,
     std::unordered_map<std::string, ObjectMetadata>::iterator it,
-    const TenantId& tenant_id, QuotaEraseMode quota_mode,
-    MetadataShardAccessorRW* shard) {
+    const TenantId& tenant_id, MetadataShardAccessorRW* shard,
+    QuotaEraseMode quota_mode) {
     bool had_completed_disk = it->second.HasReplica([](const Replica& r) {
         return r.is_local_disk_replica() && r.is_completed();
     });
@@ -1608,7 +1599,6 @@ MasterService::EraseMetadata(
             }
             break;
         case QuotaEraseMode::kPreserveOld:
-        case QuotaEraseMode::kAbortOnly:
             if (enable_multi_tenants_ &&
                 metadata.quota_ledger.PendingBytes() != 0) {
                 auto refund_result = metadata.quota_ledger.RefundPending(
@@ -1765,7 +1755,7 @@ void MasterService::ClearInvalidHandles(
                     if (CleanupStaleHandles(tenant_state, it->second,
                                             alive_clients, &shard)) {
                         it = EraseMetadata(tenant_state, it, tenant_it->first,
-                                           QuotaEraseMode::kFull, &shard);
+                                           &shard);
                     } else {
                         ++it;
                     }
@@ -1778,8 +1768,7 @@ void MasterService::ClearInvalidHandles(
                                     it->first, {},
                                     [this](const OpLogEntry& durable_entry) {
                                         FinalizeMetadataEraseAfterDurable(
-                                            durable_entry,
-                                            QuotaEraseMode::kFull);
+                                            durable_entry);
                                     });
                             if (!persist_result) {
                                 LOG(WARNING)
@@ -1795,7 +1784,7 @@ void MasterService::ClearInvalidHandles(
                         }
                     }
                     it = EraseMetadata(tenant_state, it, tenant_it->first,
-                                       QuotaEraseMode::kFull, &shard);
+                                       &shard);
                 } else {
                     ++it;
                 }
@@ -2459,8 +2448,7 @@ auto MasterService::BatchReplicaClear(
                             [this, removed_ids = std::move(removed_ids)](
                                 const OpLogEntry& durable_entry) {
                                 FinalizeRemovedReplicasAfterDurable(
-                                    durable_entry, removed_ids,
-                                    QuotaEraseMode::kFull);
+                                    durable_entry, removed_ids);
                             });
                     if (!persist_result) {
                         continue;
@@ -2546,8 +2534,7 @@ auto MasterService::BatchReplicaClear(
                             [this, removed_ids = std::move(removed_ids)](
                                 const OpLogEntry& durable_entry) {
                                 FinalizeRemovedReplicasAfterDurable(
-                                    durable_entry, removed_ids,
-                                    QuotaEraseMode::kFull);
+                                    durable_entry, removed_ids);
                             });
                     } else {
                         persist_result = AppendReservedOpLogWithDurableFinalize(
@@ -2559,8 +2546,7 @@ auto MasterService::BatchReplicaClear(
                             [this, removed_ids = std::move(removed_ids)](
                                 const OpLogEntry& durable_entry) {
                                 FinalizeRemovedReplicasAfterDurable(
-                                    durable_entry, removed_ids,
-                                    QuotaEraseMode::kFull);
+                                    durable_entry, removed_ids);
                             });
                     }
                     if (!persist_result) {
@@ -3330,7 +3316,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                     } else if (CleanupStaleHandles(tenant_state, it->second,
                                                    alive_clients, &shard)) {
                         EraseMetadata(tenant_state, it, object_id.tenant_id,
-                                      QuotaEraseMode::kFull, &shard);
+                                      &shard);
                         it = tenant_state.metadata.end();
                     }
                 }
@@ -3363,7 +3349,7 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                                 put_start_release_timeout_sec_);
                     }
                     EraseMetadata(tenant_state, it, object_id.tenant_id,
-                                  QuotaEraseMode::kFull, &shard);
+                                  &shard);
                     it = tenant_state.metadata.end();
                 }
             }
@@ -3674,8 +3660,8 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
                 tenant_id.value(), key, {},
                 [this, removed_ids = std::move(removed_ids)](
                     const OpLogEntry& durable_entry) {
-                    FinalizeRemovedReplicasAfterDurable(
-                        durable_entry, removed_ids, QuotaEraseMode::kFull);
+                    FinalizeRemovedReplicasAfterDurable(durable_entry,
+                                                        removed_ids);
                 });
         } else {
             persist_result = AppendReservedOpLogWithDurableFinalize(
@@ -3686,8 +3672,8 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
                     metadata.group_id, metadata.data_type),
                 [this, removed_ids = std::move(removed_ids)](
                     const OpLogEntry& durable_entry) {
-                    FinalizeRemovedReplicasAfterDurable(
-                        durable_entry, removed_ids, QuotaEraseMode::kFull);
+                    FinalizeRemovedReplicasAfterDurable(durable_entry,
+                                                        removed_ids);
                 });
         }
         if (!persist_result) {
@@ -3870,7 +3856,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                         // replication_tasks, offloading_tasks (with
                         // dec_refcnt), and promotion task cleanup.
                         EraseMetadata(tenant_state, it, object_id.tenant_id,
-                                      QuotaEraseMode::kFull, &shard);
+                                      &shard);
                         it = tenant_state.metadata.end();
                     }
                 }
@@ -3928,7 +3914,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     // effectively does not exist — fall through to Case A.
                     if (!metadata.HasReplica(&Replica::fn_is_completed)) {
                         EraseMetadata(tenant_state, it, object_id.tenant_id,
-                                      QuotaEraseMode::kFull, &shard);
+                                      &shard);
                         it = tenant_state.metadata.end();
                     } else {
                         auto settle_result = SettlePrimaryWriteQuotaIfReady(
@@ -4062,8 +4048,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                         std::move(old_replicas),
                         now + put_start_release_timeout_sec_);
                 }
-                EraseMetadata(tenant_state, it, object_id.tenant_id,
-                              QuotaEraseMode::kPreserveOld, &shard);
+                EraseMetadata(tenant_state, it, object_id.tenant_id, &shard,
+                              QuotaEraseMode::kPreserveOld);
 
                 VLOG(1) << "key=" << key
                         << ", action=upsert_start_case_c_reallocate";
@@ -4101,7 +4087,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                                                   "transfer_replacement_in",
                                                   object_id.tenant_id, key);
                         EraseMetadata(tenant_state, new_it, object_id.tenant_id,
-                                      QuotaEraseMode::kFull, &shard);
+                                      &shard);
                         if (replacement_charge.ReplacedBytes() != 0) {
                             auto rollback_result =
                                 replacement_charge.ReleaseReplacement(
@@ -4265,8 +4251,8 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
                     metadata.tenant_id.value(), key, {},
                     [this, removed_ids = std::move(removed_ids)](
                         const OpLogEntry& durable_entry) {
-                        FinalizeRemovedReplicasAfterDurable(
-                            durable_entry, removed_ids, QuotaEraseMode::kFull);
+                        FinalizeRemovedReplicasAfterDurable(durable_entry,
+                                                            removed_ids);
                     });
             } else {
                 persist_result = AppendReservedOpLogWithDurableFinalize(
@@ -4277,8 +4263,8 @@ auto MasterService::EvictDiskReplica(const UUID& client_id,
                         metadata.group_id, metadata.data_type),
                     [this, removed_ids = std::move(removed_ids)](
                         const OpLogEntry& durable_entry) {
-                        FinalizeRemovedReplicasAfterDurable(
-                            durable_entry, removed_ids, QuotaEraseMode::kFull);
+                        FinalizeRemovedReplicasAfterDurable(durable_entry,
+                                                            removed_ids);
                     });
             }
             if (!persist_result) {
@@ -4904,8 +4890,8 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
                     metadata.data_type),
                 [this, removed_ids = std::vector<ReplicaID>{source_id}](
                     const OpLogEntry& durable_entry) {
-                    FinalizeRemovedReplicasAfterDurable(
-                        durable_entry, removed_ids, QuotaEraseMode::kFull);
+                    FinalizeRemovedReplicasAfterDurable(durable_entry,
+                                                        removed_ids);
                 });
         } else {
             persist_result = AppendOpLogWithDurableFinalize(
@@ -5079,8 +5065,8 @@ auto MasterService::Remove(const std::string& key, const TenantId& tenant_id,
                 object_id.tenant_id.value(), key, {},
                 [this, removed_ids = std::move(removed_ids)](
                     const OpLogEntry& durable_entry) {
-                    FinalizeRemovedReplicasAfterDurable(
-                        durable_entry, removed_ids, QuotaEraseMode::kFull);
+                    FinalizeRemovedReplicasAfterDurable(durable_entry,
+                                                        removed_ids);
                 });
             if (!persist_result) {
                 return tl::make_unexpected(persist_result.error());
@@ -5173,8 +5159,7 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
                                 [this, removed_ids = std::move(removed_ids)](
                                     const OpLogEntry& durable_entry) {
                                     FinalizeRemovedReplicasAfterDurable(
-                                        durable_entry, removed_ids,
-                                        QuotaEraseMode::kFull);
+                                        durable_entry, removed_ids);
                                 });
                         if (!persist_result) {
                             ++it;
@@ -5185,8 +5170,7 @@ auto MasterService::RemoveByRegex(const std::string& regex_pattern,
                         continue;
                     }
                 }
-                it = EraseMetadata(tenant_state, it, normalized_tenant,
-                                   QuotaEraseMode::kFull, &shard);
+                it = EraseMetadata(tenant_state, it, normalized_tenant, &shard);
                 removed_count++;
             } else {
                 ++it;
@@ -5259,8 +5243,7 @@ long MasterService::RemoveAll(bool force) {
                                      removed_ids = std::move(removed_ids)](
                                         const OpLogEntry& durable_entry) {
                                         FinalizeRemovedReplicasAfterDurable(
-                                            durable_entry, removed_ids,
-                                            QuotaEraseMode::kFull);
+                                            durable_entry, removed_ids);
                                     });
                             if (!persist_result) {
                                 ++it;
@@ -5276,7 +5259,7 @@ long MasterService::RemoveAll(bool force) {
                     total_freed_size += it->second.size * mem_rep_count;
                     ErasePromotionTaskIfPresent(tenant_state, it->first);
                     it = EraseMetadata(tenant_state, it, tenant_it->first,
-                                       QuotaEraseMode::kFull, &shard);
+                                       &shard);
                     removed_count++;
                 } else {
                     ++it;
@@ -5351,8 +5334,7 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
                                 [this, removed_ids = std::move(removed_ids)](
                                     const OpLogEntry& durable_entry) {
                                     FinalizeRemovedReplicasAfterDurable(
-                                        durable_entry, removed_ids,
-                                        QuotaEraseMode::kFull);
+                                        durable_entry, removed_ids);
                                 });
                         if (!persist_result) {
                             ++it;
@@ -5366,8 +5348,7 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
                 }
                 total_freed_size += it->second.size * mem_rep_count;
                 ErasePromotionTaskIfPresent(tenant_state, it->first);
-                it = EraseMetadata(tenant_state, it, normalized_tenant,
-                                   QuotaEraseMode::kFull, &shard);
+                it = EraseMetadata(tenant_state, it, normalized_tenant, &shard);
                 removed_count++;
             } else {
                 ++it;
@@ -5466,8 +5447,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                     continue;
                 } else if (CleanupStaleHandles(tenant_state, it->second,
                                                alive_clients, &shard)) {
-                    EraseMetadata(tenant_state, it, normalized_tenant,
-                                  QuotaEraseMode::kFull, &shard);
+                    EraseMetadata(tenant_state, it, normalized_tenant, &shard);
                     if (tenant_state.Empty()) {
                         shard->tenants.erase(tenant_it);
                     }
@@ -5529,8 +5509,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                             [this, removed_ids = std::move(removed_ids)](
                                 const OpLogEntry& durable_entry) {
                                 FinalizeRemovedReplicasAfterDurable(
-                                    durable_entry, removed_ids,
-                                    QuotaEraseMode::kFull);
+                                    durable_entry, removed_ids);
                             });
                     if (!persist_result) {
                         results[original_idx] =
@@ -5541,8 +5520,7 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                     continue;
                 }
             }
-            EraseMetadata(tenant_state, it, normalized_tenant,
-                          QuotaEraseMode::kFull, &shard);
+            EraseMetadata(tenant_state, it, normalized_tenant, &shard);
             if (tenant_state.Empty()) {
                 shard->tenants.erase(tenant_it);
             }
@@ -6902,8 +6880,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
                 metadata.AllReplicas(&Replica::fn_is_completed)) {
                 if (!metadata.IsValid()) {
                     auto next_key_it = std::next(key_it);
-                    EraseMetadata(tenant_state, it, tenant_it->first,
-                                  QuotaEraseMode::kFull, &shard);
+                    EraseMetadata(tenant_state, it, tenant_it->first, &shard);
                     key_it = next_key_it;
                 } else {
                     auto settle_result =
@@ -6978,8 +6955,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
                 }
                 if (!metadata.IsValid()) {
                     auto next_key_it = std::next(key_it);
-                    EraseMetadata(tenant_state, it, tenant_it->first,
-                                  QuotaEraseMode::kFull, &shard);
+                    EraseMetadata(tenant_state, it, tenant_it->first, &shard);
                     key_it = next_key_it;
                 } else {
                     auto settle_result =
@@ -7094,7 +7070,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
             if (!metadata.IsValid()) {
                 auto next_task_it = std::next(task_it);
                 EraseMetadata(tenant_state, metadata_it, tenant_it->first,
-                              QuotaEraseMode::kFull, &shard);
+                              &shard);
                 task_it = next_task_it;
             } else {
                 ReleaseTenantQuota(GetBoundTenantQuotaHandle(tenant_state),
@@ -7843,8 +7819,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                     tenant_id.value(), key, {},
                     [this, removed_ids = std::move(removed_ids)](
                         const OpLogEntry& durable_entry) {
-                        FinalizeRemovedReplicasAfterDurable(
-                            durable_entry, removed_ids, QuotaEraseMode::kFull);
+                        FinalizeRemovedReplicasAfterDurable(durable_entry,
+                                                            removed_ids);
                     });
             } else {
                 persist_result = AppendReservedOpLogWithDurableFinalize(
@@ -7855,8 +7831,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         metadata.group_id, metadata.data_type),
                     [this, removed_ids = std::move(removed_ids)](
                         const OpLogEntry& durable_entry) {
-                        FinalizeRemovedReplicasAfterDurable(
-                            durable_entry, removed_ids, QuotaEraseMode::kFull);
+                        FinalizeRemovedReplicasAfterDurable(durable_entry,
+                                                            removed_ids);
                     });
             }
             if (!persist_result) {
@@ -7961,8 +7937,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
             }
             if (member_key != key && !enable_oplog_ &&
                 !member_metadata.IsValid()) {
-                EraseMetadata(tenant_state, member_it, tenant_id,
-                              QuotaEraseMode::kFull, &shard);
+                EraseMetadata(tenant_state, member_it, tenant_id, &shard);
             }
         }
         return result;
@@ -8121,8 +8096,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                                "cpu", it->second, c.tenant_id);
                 }
                 if (!enable_oplog_ && !it->second.IsValid()) {
-                    EraseMetadata(tenant_state, it, c.tenant_id,
-                                  QuotaEraseMode::kFull, &shard);
+                    EraseMetadata(tenant_state, it, c.tenant_id, &shard);
                 }
                 if (tenant_state.Empty()) {
                     shard->tenants.erase(tenant_it);
@@ -8186,9 +8160,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                         "cpu", it->second, tenant_it->first);
                                 }
                                 if (!enable_oplog_ && !it->second.IsValid()) {
-                                    it = EraseMetadata(
-                                        tenant_state, it, tenant_it->first,
-                                        QuotaEraseMode::kFull, &shard);
+                                    it =
+                                        EraseMetadata(tenant_state, it,
+                                                      tenant_it->first, &shard);
                                 } else {
                                     ++it;
                                 }
@@ -8251,9 +8225,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                         "cpu", it->second, tenant_it->first);
                                 }
                                 if (!enable_oplog_ && !it->second.IsValid()) {
-                                    it = EraseMetadata(
-                                        tenant_state, it, tenant_it->first,
-                                        QuotaEraseMode::kFull, &shard);
+                                    it =
+                                        EraseMetadata(tenant_state, it,
+                                                      tenant_it->first, &shard);
                                 } else {
                                     ++it;
                                 }
@@ -8445,8 +8419,7 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                                      removed_ids = std::move(removed_ids)](
                                         const OpLogEntry& durable_entry) {
                                         FinalizeRemovedReplicasAfterDurable(
-                                            durable_entry, removed_ids,
-                                            QuotaEraseMode::kFull);
+                                            durable_entry, removed_ids);
                                     });
                         } else {
                             persist_result = AppendReservedOpLogWithDurableFinalize(
@@ -8459,8 +8432,7 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                                 [this, removed_ids = std::move(removed_ids)](
                                     const OpLogEntry& durable_entry) {
                                     FinalizeRemovedReplicasAfterDurable(
-                                        durable_entry, removed_ids,
-                                        QuotaEraseMode::kFull);
+                                        durable_entry, removed_ids);
                                 });
                         }
                         if (!persist_result) {
@@ -8517,7 +8489,7 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                                            "disk", metadata, tenant_it->first);
                 if (!metadata.IsValid()) {
                     it = EraseMetadata(tenant_state, it, tenant_it->first,
-                                       QuotaEraseMode::kFull, &shard);
+                                       &shard);
                 } else {
                     ++it;
                 }

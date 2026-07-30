@@ -252,7 +252,7 @@ TenantQuotaResult TenantQuotaShard::UpsertTenantPolicy(
     return {};
 }
 
-TenantQuotaPolicyResult TenantQuotaShard::DisableTenantPolicyIfEmpty(
+TenantQuotaResult TenantQuotaShard::DisableTenantPolicyIfEmpty(
     const TenantId& tenant_id) {
     auto it = accounts_.find(tenant_id);
     if (it == accounts_.end() || !it->second->has_explicit_policy_) {
@@ -268,12 +268,11 @@ TenantQuotaPolicyResult TenantQuotaShard::DisableTenantPolicyIfEmpty(
         return tl::make_unexpected(TenantQuotaError::kTenantNotEmpty);
     }
 
-    const uint64_t requested_quota_bytes = account.requested_quota_bytes_;
     account.requested_quota_bytes_ = 0;
     account.effective_quota_bytes_.store(0, std::memory_order_release);
     account.has_explicit_policy_ = false;
     account.EndPolicyUpdate();
-    return requested_quota_bytes;
+    return {};
 }
 
 TenantQuotaResult TenantQuotaShard::ApplyTenantPolicies(

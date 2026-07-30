@@ -20,8 +20,7 @@ class ShardedTenantQuotaTable {
     TenantQuotaResult UpsertTenantPolicy(const TenantId& tenant_id,
                                          uint64_t requested_quota_bytes,
                                          uint64_t allocatable_capacity_bytes);
-    TenantQuotaPolicyResult DisableTenantPolicyIfEmpty(
-        const TenantId& tenant_id);
+    TenantQuotaResult DisableTenantPolicyIfEmpty(const TenantId& tenant_id);
     TenantQuotaResult ApplyTenantPolicies(const TenantQuotaPolicyMap& policies,
                                           uint64_t allocatable_capacity_bytes);
     TenantQuotaPolicyMap GetTenantPolicies() const;

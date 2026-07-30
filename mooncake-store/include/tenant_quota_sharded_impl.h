@@ -25,7 +25,7 @@ TenantQuotaResult ShardedTenantQuotaTable<NumShards>::UpsertTenantPolicy(
 }
 
 template <size_t NumShards>
-TenantQuotaPolicyResult
+TenantQuotaResult
 ShardedTenantQuotaTable<NumShards>::DisableTenantPolicyIfEmpty(
     const TenantId& tenant_id) {
     std::lock_guard<std::mutex> recompute_lock(recompute_mutex_);
