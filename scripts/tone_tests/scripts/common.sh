@@ -387,6 +387,58 @@ save_test_result() {
     echo "$test_case_name: $status"
 }
 
+parse_test_exit_code() {
+    local test_case_name=$1
+    local test_exit_code=$2
+
+    if [[ -z "$test_exit_code" || ! "$test_exit_code" =~ ^[0-9]+$ ]]; then
+        echo "Warning: Invalid exit code '$test_exit_code', treating as failure" >&2
+        test_exit_code=1
+    fi
+
+    echo "===== Parsing test results ====="
+    if [ "$test_exit_code" = "0" ]; then
+        save_test_result "$test_case_name" "Pass" "${BASE_DIR}/${TEST_CASE_RESULT_PATH}"
+        echo "✓ Test PASSED"
+        return 0
+    else
+        save_test_result "$test_case_name" "Fail" "${BASE_DIR}/${TEST_CASE_RESULT_PATH}"
+        echo "✗ Test FAILED"
+        return 1
+    fi
+}
+
+run_test_case_with_parse() {
+    local test_case_name=$1
+    local run_test_func=$2
+    local test_exit_code=0
+
+    if ! "$run_test_func"; then
+        test_exit_code=1
+    fi
+
+    parse_test_exit_code "$test_case_name" "$test_exit_code"
+}
+
+parse_model_results() {
+    local models_var_name=$1
+    local server_log_file=$2
+    local test_case_name=$3
+    local expected_pattern=${4:-}
+
+    echo "===== Parsing test results ====="
+
+    if collect_and_validate_model_results "$models_var_name" "$server_log_file" "$test_case_name" "$expected_pattern"; then
+        save_test_result "$test_case_name" "Pass" "${BASE_DIR}/${TEST_CASE_RESULT_PATH}"
+        echo "✓ Test PASSED"
+        return 0
+    else
+        save_test_result "$test_case_name" "Fail" "${BASE_DIR}/${TEST_CASE_RESULT_PATH}"
+        echo "✗ Test FAILED"
+        return 1
+    fi
+}
+
 cleanup_test_env() {
     local test_type=$1
     
