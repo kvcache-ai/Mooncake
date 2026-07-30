@@ -31,8 +31,11 @@ struct OrderedOpLogWriter::Impl {
 #endif
     };
 
-    explicit Impl(OrderedOpLogWriterConfig config, WriteBatchFn write_batch)
-        : config(std::move(config)), write_batch(std::move(write_batch)) {
+    explicit Impl(OrderedOpLogWriterConfig config, WriteBatchFn write_batch,
+                  TerminalCallback terminal_callback)
+        : config(std::move(config)),
+          write_batch(std::move(write_batch)),
+          terminal_callback(std::move(terminal_callback)) {
         if (this->config.max_entries_per_batch == 0) {
             this->config.max_entries_per_batch = 1;
         }
@@ -66,6 +69,8 @@ struct OrderedOpLogWriter::Impl {
 
     OrderedOpLogWriterConfig config;
     WriteBatchFn write_batch;
+    TerminalCallback terminal_callback;
+    std::optional<OrderedOpLogWriterTerminalState> terminal_state;
     mutable std::mutex mutex;
     std::condition_variable cv;
     bool accepting{true};
@@ -128,9 +133,10 @@ uint64_t OrderedOpLogWriter::PendingHandle::sequence_id() const {
 }
 
 OrderedOpLogWriter::OrderedOpLogWriter(OrderedOpLogWriterConfig config,
-                                       WriteBatchFn write_batch)
-    : impl_(std::make_unique<Impl>(std::move(config), std::move(write_batch))) {
-}
+                                       WriteBatchFn write_batch,
+                                       TerminalCallback terminal_callback)
+    : impl_(std::make_unique<Impl>(std::move(config), std::move(write_batch),
+                                   std::move(terminal_callback))) {}
 
 OrderedOpLogWriter::~OrderedOpLogWriter() { Stop(); }
 
@@ -210,6 +216,12 @@ bool OrderedOpLogWriter::IsAccepting() const {
 ErrorCode OrderedOpLogWriter::LastError() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     return impl_->last_error;
+}
+
+std::optional<OrderedOpLogWriterTerminalState>
+OrderedOpLogWriter::GetTerminalState() const {
+    std::lock_guard<std::mutex> lock(impl_->mutex);
+    return impl_->terminal_state;
 }
 
 void OrderedOpLogWriter::Start() {
