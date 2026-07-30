@@ -5,6 +5,8 @@
 
 #include <gtest/gtest.h>
 
+#include <chrono>
+#include <future>
 #include <map>
 #include <memory>
 #include <random>
@@ -283,6 +285,14 @@ class OffsetAllocatorTest : public ::testing::Test {
 
     void TearDown() override {}
 
+    void lockAllocator(const std::shared_ptr<OffsetAllocator>& allocator) {
+        allocator->m_mutex.lock();
+    }
+
+    void unlockAllocator(const std::shared_ptr<OffsetAllocator>& allocator) {
+        allocator->m_mutex.unlock();
+    }
+
     OffsetAllocationHandle copyHandleWithNewAllocator(
         const OffsetAllocationHandle& handle,
         const std::shared_ptr<OffsetAllocator>& new_allocator) {
@@ -306,6 +316,7 @@ class OffsetAllocatorTest : public ::testing::Test {
         ASSERT_EQ(a->m_capacity, b->m_capacity);
         ASSERT_EQ(a->m_allocated_size, b->m_allocated_size);
         ASSERT_EQ(a->m_allocated_num, b->m_allocated_num);
+        ASSERT_EQ(a->getLargestFreeRegion(), b->getLargestFreeRegion());
 
         // Compare __Allocator member variables
         ASSERT_EQ(a->m_allocator->m_size, b->m_allocator->m_size);
@@ -514,6 +525,50 @@ TEST_F(OffsetAllocatorTest, AllocationFailure) {
     auto handle =
         allocator->allocate(2 * ALLOCATOR_SIZE);  // 2GB > 1GB available
     EXPECT_FALSE(handle.has_value());
+}
+
+TEST_F(OffsetAllocatorTest, LargestFreeRegionCacheTracksMutations) {
+    constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;
+    constexpr uint32 MAX_ALLOCS = 1000;
+    auto allocator =
+        OffsetAllocator::create(0, ALLOCATOR_SIZE, MAX_ALLOCS, MAX_ALLOCS);
+
+    EXPECT_EQ(allocator->getLargestFreeRegion(),
+              allocator->storageReport().largestFreeRegion);
+
+    auto handle = allocator->allocate(ALLOCATOR_SIZE / 2);
+    ASSERT_TRUE(handle.has_value());
+    EXPECT_EQ(allocator->getLargestFreeRegion(),
+              allocator->storageReport().largestFreeRegion);
+
+    handle.reset();
+    EXPECT_EQ(allocator->getLargestFreeRegion(),
+              allocator->storageReport().largestFreeRegion);
+    EXPECT_EQ(allocator->getLargestFreeRegion(), ALLOCATOR_SIZE);
+}
+
+TEST_F(OffsetAllocatorTest, ImpossibleAllocationDoesNotAcquireMutex) {
+    constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;
+    constexpr uint32 MAX_ALLOCS = 1000;
+    auto allocator =
+        OffsetAllocator::create(0, ALLOCATOR_SIZE, MAX_ALLOCS, MAX_ALLOCS);
+    auto full_handle = allocator->allocate(ALLOCATOR_SIZE);
+    ASSERT_TRUE(full_handle.has_value());
+    ASSERT_EQ(allocator->getLargestFreeRegion(), 0);
+
+    lockAllocator(allocator);
+    std::promise<void> started;
+    auto started_future = started.get_future();
+    auto result = std::async(std::launch::async, [&] {
+        started.set_value();
+        return allocator->allocate(1);
+    });
+    started_future.wait();
+    const auto status = result.wait_for(std::chrono::seconds(1));
+    unlockAllocator(allocator);
+
+    EXPECT_EQ(status, std::future_status::ready);
+    EXPECT_FALSE(result.get().has_value());
 }
 
 // Test multiple allocations

@@ -377,19 +377,7 @@ size_t OffsetBufferAllocator::getLargestFreeRegion() const {
     if (!offset_allocator_) {
         return 0;
     }
-
-    try {
-        auto report = offset_allocator_->storageReport();
-        return report.largestFreeRegion;
-    } catch (const std::exception& e) {
-        LOG(ERROR) << "Failed to get storage report: " << e.what()
-                   << " segment=" << segment_name_;
-        return 0;
-    } catch (...) {
-        LOG(ERROR) << "Unknown error getting storage report"
-                   << " segment=" << segment_name_;
-        return 0;
-    }
+    return offset_allocator_->getLargestFreeRegion();
 }
 
 std::optional<RestoredOffsetBufferAllocator> RestoreOffsetBufferAllocator(

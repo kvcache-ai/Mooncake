@@ -555,6 +555,9 @@ OffsetAllocator::OffsetAllocator(uint64_t base, size_t size,
       m_capacity(size) {
     m_allocator = std::make_unique<__Allocator>(size >> m_multiplier_bits,
                                                 init_capacity, max_capacity);
+    m_largest_free_region.store(
+        m_allocator->storageReport().largestFreeRegion << m_multiplier_bits,
+        std::memory_order_relaxed);
 }
 
 OffsetAllocator::OffsetAllocator(uint64_t base, size_t size,
@@ -563,10 +566,22 @@ OffsetAllocator::OffsetAllocator(uint64_t base, size_t size,
     : m_allocator(std::move(allocator)),
       m_base(base),
       m_multiplier_bits(multiplier_bits),
-      m_capacity(size) {}
+      m_capacity(size) {
+    m_largest_free_region.store(
+        m_allocator->storageReport().largestFreeRegion << m_multiplier_bits,
+        std::memory_order_relaxed);
+}
 
 std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(size_t size) {
     if (size == 0) {
+        return std::nullopt;
+    }
+
+    // Free regions are grouped into size bins. A request larger than the
+    // highest free-bin boundary rounds up to a higher bin and cannot fit. The
+    // cached value is only a fast-fail hint: a stale larger value merely falls
+    // through to the mutex-protected allocator.
+    if (size > getLargestFreeRegion()) {
         return std::nullopt;
     }
 
@@ -594,6 +609,8 @@ std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(size_t size) {
                 << ", fake_size=" << fake_size << ", " << metrics;
         return std::nullopt;
     }
+
+    refreshLargestFreeRegion();
 
     // Update lightweight metrics
     m_allocated_size += size;
@@ -669,11 +686,20 @@ OffsetAllocatorMetrics OffsetAllocator::get_metrics() const {
     return get_metrics_internal();
 }
 
+void OffsetAllocator::refreshLargestFreeRegion() {
+    const uint64_t largest_free_region =
+        m_allocator ? m_allocator->storageReport().largestFreeRegion
+                          << m_multiplier_bits
+                    : 0;
+    m_largest_free_region.store(largest_free_region, std::memory_order_relaxed);
+}
+
 void OffsetAllocator::freeAllocation(const OffsetAllocation& allocation,
                                      uint64_t size) {
     MutexLocker lock(&m_mutex);
     if (m_allocator) {
         m_allocator->free(allocation);
+        refreshLargestFreeRegion();
         // Update lightweight metrics.  Saturate instead of wrapping:
         // recovery may free nodes whose exact requested size is unknown
         // (corrupt record), and an unsigned underflow would poison the
