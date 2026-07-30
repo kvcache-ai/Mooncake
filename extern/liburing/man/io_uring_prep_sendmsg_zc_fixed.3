@@ -1,0 +1,65 @@
+.\" Copyright (C) 2025 Jens Axboe <axboe@kernel.dk>
+.\"
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_prep_sendmsg_zc_fixed 3 "January 18, 2025" "liburing-2.10" "liburing Manual"
+.SH NAME
+io_uring_prep_sendmsg_zc_fixed \- prepare a zero-copy sendmsg using fixed buffers
+.SH SYNOPSIS
+.nf
+.B #include <liburing.h>
+.PP
+.BI "void io_uring_prep_sendmsg_zc_fixed(struct io_uring_sqe *" sqe ","
+.BI "                                    int " fd ","
+.BI "                                    const struct msghdr *" msg ","
+.BI "                                    unsigned " flags ","
+.BI "                                    unsigned " buf_index ");"
+.fi
+.SH DESCRIPTION
+.PP
+The
+.BR io_uring_prep_sendmsg_zc_fixed (3)
+function prepares a zero-copy sendmsg request using fixed (registered)
+buffers. The submission queue entry
+.I sqe
+is setup to send data on the socket indicated by the file descriptor
+.I fd
+using the message structure
+.IR msg .
+
+The
+.I flags
+argument contains flags for the sendmsg operation, as described in
+.BR sendmsg (2).
+
+The
+.I buf_index
+specifies the index of the registered buffer set to use. The buffers in
+.I msg
+must be part of the registered buffer set previously registered with
+.BR io_uring_register_buffers (3).
+
+Zero-copy sends avoid copying data from user to kernel space, improving
+performance for large transfers. Using fixed buffers additionally avoids
+the overhead of mapping buffers for each I/O operation.
+
+Note that zero-copy sends require the application to wait for a notification
+before reusing the buffer. See
+.BR io_uring_prep_send_zc (3)
+for more details on zero-copy semantics.
+
+.SH RETURN VALUE
+None
+.SH ERRORS
+The CQE
+.I res
+field will contain the result of the operation, the number of bytes sent
+on success. On error, a negative errno value is returned.
+.SH SEE ALSO
+.BR io_uring_get_sqe (3),
+.BR io_uring_submit (3),
+.BR io_uring_prep_sendmsg_zc (3),
+.BR io_uring_prep_sendmsg (3),
+.BR io_uring_prep_send_zc_fixed (3),
+.BR io_uring_register_buffers (3),
+.BR sendmsg (2)

@@ -1,0 +1,266 @@
+.\" Copyright (C) 2025 Jens Axboe <axboe@kernel.dk>
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_provided_buffers 7 "January 18, 2025" "Linux" "Linux Programmer's Manual"
+.SH NAME
+io_uring_provided_buffers \- io_uring provided buffer rings overview
+.SH DESCRIPTION
+Provided buffer rings allow applications to supply a pool of buffers to
+the kernel that can be dynamically selected at operation completion time.
+This is particularly useful for operations where the buffer requirements
+are not known upfront, such as receiving data from network sockets or
+reading from pipes.
+.SS Why use provided buffers?
+Traditional I/O operations require the application to specify a buffer
+when submitting the request. For receive operations on sockets or reads
+from pipes, this presents a challenge: the application doesn't know how
+much data will arrive, so it must either:
+.IP \(bu 2
+Allocate a large buffer for each pending operation, wasting memory
+.IP \(bu
+Use small buffers and potentially require multiple operations
+.IP \(bu
+Limit the number of pending operations to control memory usage
+.PP
+Provided buffer rings solve this by letting the kernel select an
+appropriately-sized buffer from a shared pool at completion time.
+Multiple operations can share the same buffer pool, and buffers are only
+consumed when data actually arrives.
+
+Provided buffers are most beneficial for:
+.IP \(bu 2
+Network servers with many concurrent connections
+.IP \(bu
+Applications receiving variable-length messages
+.IP \(bu
+Scenarios where memory efficiency is important
+.SS Buffer ring concepts
+A provided buffer ring is a circular buffer shared between the
+application and kernel:
+.IP \(bu 2
+The application adds buffers to the ring by writing entries and
+advancing the tail
+.IP \(bu
+The kernel consumes buffers from the ring by reading entries and
+advancing the head
+.IP \(bu
+Each buffer has a unique buffer ID (bid) within its buffer group
+.IP \(bu
+Buffer groups are identified by a buffer group ID (bgid)
+.PP
+Multiple buffer rings can exist simultaneously, each with a different
+buffer group ID. Operations specify which buffer group to use.
+.SS Setting up a buffer ring
+Buffer rings are set up using
+.BR io_uring_setup_buf_ring (3),
+which handles allocation, registration, and initialization:
+.PP
+.in +4n
+.EX
+struct io_uring_buf_ring *br;
+int bgid = 1;  /* buffer group ID */
+int err;
+
+br = io_uring_setup_buf_ring(ring, 128, bgid, 0, &err);
+if (!br) {
+    fprintf(stderr, "buffer ring setup failed: %d\\n", err);
+    return err;
+}
+.EE
+.in
+.PP
+The ring must have a power-of-two number of entries, up to a maximum of
+32768 (2^15).
+
+Alternatively, applications can use
+.BR io_uring_register_buf_ring (3)
+for more control over the setup process, including kernel-allocated
+rings using the
+.B IOU_PBUF_RING_MMAP
+flag.
+.SS Adding buffers to the ring
+Buffers are added using
+.BR io_uring_buf_ring_add (3)
+and made visible to the kernel with
+.BR io_uring_buf_ring_advance (3):
+.PP
+.in +4n
+.EX
+int mask = io_uring_buf_ring_mask(128);
+
+for (int i = 0; i < 128; i++) {
+    void *buf = malloc(4096);
+    io_uring_buf_ring_add(br, buf, 4096, i, mask, i);
+}
+io_uring_buf_ring_advance(br, 128);
+.EE
+.in
+.PP
+Each buffer is assigned a buffer ID (the third parameter). Buffer IDs
+should be unique within the buffer group but can be reused after a
+buffer is returned.
+.SS Using provided buffers in operations
+To use provided buffers, set the
+.B IOSQE_BUFFER_SELECT
+flag on the SQE and specify the buffer group ID:
+.PP
+.in +4n
+.EX
+struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+io_uring_prep_recv(sqe, sockfd, NULL, 4096, 0);
+io_uring_sqe_set_flags(sqe, IOSQE_BUFFER_SELECT);
+io_uring_sqe_set_buf_group(sqe, bgid);
+.EE
+.in
+.PP
+Note that
+.I addr
+is set to NULL (or ignored) since the kernel will select the buffer.
+The
+.I len
+field specifies the maximum amount of data to receive.
+
+Operations that support provided buffers include:
+.IP \(bu 2
+.B IORING_OP_READ
+/
+.B IORING_OP_RECV
+.IP \(bu
+.B IORING_OP_READV
+(single vector only)
+.IP \(bu
+.B IORING_OP_RECVMSG
+.SS Handling completions
+When an operation using provided buffers completes, the CQE indicates
+which buffer was used:
+.IP \(bu 2
+.B IORING_CQE_F_BUFFER
+is set in
+.I cqe->flags
+.IP \(bu
+The buffer ID is in the upper 16 bits of
+.IR cqe->flags ,
+extractable via
+.B cqe->flags >> IORING_CQE_BUFFER_SHIFT
+.IP \(bu
+.I cqe->res
+contains the number of bytes transferred
+.PP
+.in +4n
+.EX
+struct io_uring_cqe *cqe;
+io_uring_wait_cqe(ring, &cqe);
+
+if (cqe->flags & IORING_CQE_F_BUFFER) {
+    int bid = cqe->flags >> IORING_CQE_BUFFER_SHIFT;
+    void *buf = buffers[bid];  /* application's buffer tracking */
+    int len = cqe->res;
+
+    /* process data in buf */
+    process_data(buf, len);
+
+    /* return buffer to ring for reuse */
+    io_uring_buf_ring_add(br, buf, 4096, bid, mask, 0);
+    io_uring_buf_ring_advance(br, 1);
+}
+io_uring_cqe_seen(ring, cqe);
+.EE
+.in
+.PP
+If no buffer was available when the operation completed, the operation
+fails with
+.BR -ENOBUFS .
+.SS Multishot operations
+Provided buffers are particularly powerful with multishot operations
+like
+.BR io_uring_prep_recv_multishot (3).
+A single SQE can generate multiple completions, each consuming a buffer
+from the ring:
+.PP
+.in +4n
+.EX
+struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+io_uring_prep_recv_multishot(sqe, sockfd, NULL, 0, 0);
+io_uring_sqe_set_flags(sqe, IOSQE_BUFFER_SELECT);
+io_uring_sqe_set_buf_group(sqe, bgid);
+.EE
+.in
+.PP
+Completions with
+.B IORING_CQE_F_MORE
+set indicate more completions will follow. The multishot operation
+continues until an error occurs, the buffer ring is exhausted, or the
+operation is canceled.
+.SS Incremental buffer consumption
+Buffer rings can be set up with the
+.B IOU_PBUF_RING_INC
+flag to enable incremental consumption. With this mode, large buffers
+can be partially consumed across multiple operations:
+.IP \(bu 2
+Completions with
+.B IORING_CQE_F_BUF_MORE
+indicate the buffer will be used for more completions
+.IP \(bu
+Each completion picks up where the previous left off
+.IP \(bu
+The buffer is only returned when consumed completely or on error
+.PP
+This is useful for registering large buffer regions that are consumed
+in smaller chunks.
+.SS Returning buffers
+When finished with a buffer, return it to the ring using
+.BR io_uring_buf_ring_add (3)
+followed by
+.BR io_uring_buf_ring_advance (3).
+For efficiency when processing multiple CQEs, use
+.BR io_uring_buf_ring_cq_advance (3)
+to advance both the CQ and buffer ring in a single operation.
+.SS Buffer ring status
+Applications can query how many buffers are available using
+.BR io_uring_buf_ring_available (3),
+which returns the number of buffers the kernel has not yet consumed.
+The current kernel head position can be retrieved with
+.BR io_uring_buf_ring_head (3).
+.SS Cleaning up
+Buffer rings are freed using
+.BR io_uring_free_buf_ring (3),
+which unregisters the ring and frees the ring memory (if it was
+allocated by
+.BR io_uring_setup_buf_ring (3)).
+Applications must free the individual buffers themselves.
+.SH NOTES
+.IP \(bu 2
+Buffer ring entries must be a power of two, maximum 32768.
+.IP \(bu
+Buffer IDs are 16-bit values (0-65535).
+.IP \(bu
+If no buffer is available when an operation needs one, the operation
+fails with
+.BR -ENOBUFS .
+Applications should ensure the ring is adequately stocked.
+.IP \(bu
+Provided buffers cannot be used with registered (fixed) buffers. These
+are separate mechanisms.
+.IP \(bu
+For multishot receives, ensure buffers are returned to the ring promptly
+to avoid running out.
+.SS Legacy provided buffers
+Earlier kernels supported provided buffers via
+.B IORING_OP_PROVIDE_BUFFERS
+and
+.BR IORING_OP_REMOVE_BUFFERS .
+This mechanism required submitting SQEs to add or remove buffers,
+adding latency and overhead. The ring-based mechanism described above
+supersedes this approach and should be used for all new applications.
+The legacy interface remains for backwards compatibility.
+.SH SEE ALSO
+.BR io_uring (7),
+.BR io_uring_setup_buf_ring (3),
+.BR io_uring_free_buf_ring (3),
+.BR io_uring_register_buf_ring (3),
+.BR io_uring_unregister_buf_ring (3),
+.BR io_uring_buf_ring_add (3),
+.BR io_uring_buf_ring_advance (3),
+.BR io_uring_buf_ring_cq_advance (3),
+.BR io_uring_buf_ring_available (3),
+.BR io_uring_prep_recv_multishot (3)

@@ -1,9 +1,19 @@
-# Linker version script for libmooncake_store.so (WITH_STORE_C_SHARED).
-# Export only the store_c.h C ABI; localize every symbol pulled in from the
-# statically-archived C++ dependency graph (asio, glog, transfer_engine, ...).
+# Export the stable store_c.h C ABI and the existing Mooncake C++ SDK surface.
+# All bundled third-party implementation symbols remain local to the DSO.
 {
   global:
     mooncake_store_*;
+    _ZN8mooncake*;
+    _ZNK8mooncake*;
+    _ZNO8mooncake*;
+    _ZNR8mooncake*;
+    _ZTIN8mooncake*;
+    _ZTSN8mooncake*;
+    _ZTVN8mooncake*;
+    _ZTTN8mooncake*;
+    _ZTh*N8mooncake*;
+    _ZTv*N8mooncake*;
+    *hugepage_memory_*;
   local:
     *;
 };

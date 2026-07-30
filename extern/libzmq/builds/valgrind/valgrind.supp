@@ -1,0 +1,22 @@
+{
+   <socketcall_sendto>
+   Memcheck:Param
+   socketcall.sendto(msg)
+   fun:send
+   ...
+}
+{
+   <socketcall_sendto>
+   Memcheck:Param
+   socketcall.send(msg)
+   fun:send
+   ...
+}
+{
+   <glibc_freeres>
+   Memcheck:Free
+   fun:free
+   ...
+   fun:__libc_freeres
+   ...
+}

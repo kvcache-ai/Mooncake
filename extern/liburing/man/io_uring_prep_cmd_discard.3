@@ -1,0 +1,64 @@
+.\" Copyright (C) 2024 Pavel Begunkov <asml.silence@gmail.com>
+.\"
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_prep_cmd_discard 3 "Oct 13, 2024" "liburing-2.8" "liburing Manual"
+.SH NAME
+io_uring_prep_cmd_discard \- prepare a discard command
+.SH SYNOPSIS
+.nf
+.B #include <liburing.h>
+.PP
+.BI "void io_uring_prep_cmd_discard(struct io_uring_sqe *" sqe ","
+.BI "                          int " fd ","
+.BI "                          uint64_t " offset ","
+.BI "                          uint64_t " nbytes ");"
+.fi
+.SH DESCRIPTION
+The
+.BR io_uring_prep_cmd_discard (3)
+function prepares a discard command request. The submission queue entry
+.I sqe
+is setup to use the file descriptor
+.IR fd
+to start discarding
+.I nbytes
+at the specified
+.IR offset .
+
+The command is an asynchronous equivalent of
+.B BLOCK_URING_CMD_DISCARD
+ioctl with a few differences. It allows multiple parallel discards, and it does
+not exclude concurrent writes and reads. As a result, it may lead to races for
+the data on the disk, if the application has IO inflight for the same ranges
+that the discard operates on. It's the user's responsibility to account for that.
+Furthermore, only best efforts are done to invalidate page caches. The user has
+to make sure that no other inflight requests are modifying or reading the
+range(s). If that is the case, it might result in stale page cache and data
+inconsistencies.
+
+Available since 6.12.
+
+.SH RETURN VALUE
+None
+.SH ERRORS
+The CQE
+.I res
+field will contain the result of the operation. On success, this field will be
+set to
+.B 0 .
+On error, a negative error value is returned. Note that where synchronous
+system calls will return
+.B -1
+on failure and set
+.I errno
+to the actual error value, io_uring never uses
+.IR errno .
+Instead it returns the negated
+.I errno
+directly in the CQE
+.I res
+field.
+.SH SEE ALSO
+.BR io_uring_get_sqe (3),
+.BR io_uring_submit (3),

@@ -1,19 +1,75 @@
 #include "http_metadata_server.h"
 
+#include <async_simple/coro/SyncAwait.h>
+#include <chrono>
 #include <csignal>
+#include <iomanip>
+#include <sstream>
+#include <ylt/coro_http/coro_http_client.hpp>
 #include <ylt/coro_http/coro_http_server.hpp>
 #include <glog/logging.h>
 
 #include <mutex>
 #include <string>
+#include <unordered_map>
+#include <utility>
 
 namespace mooncake {
 
+class HttpMetadataServerImpl {
+   public:
+    HttpMetadataServerImpl(uint16_t port, std::string host)
+        : port(port),
+          host(std::move(host)),
+          server(std::make_unique<coro_http::coro_http_server>(4, port)) {}
+
+    uint16_t port;
+    std::string host;
+    std::unique_ptr<coro_http::coro_http_server> server;
+    std::unordered_map<std::string, std::string> store;
+    mutable std::mutex store_mutex;
+    bool running{false};
+};
+
+HttpMetadataClient::HttpMetadataClient(std::string metadata_uri)
+    : metadata_uri_(std::move(metadata_uri)) {}
+
+std::string HttpMetadataClient::encodeQueryValue(const std::string& value) {
+    std::ostringstream encoded;
+    encoded << std::uppercase << std::hex;
+    for (const unsigned char ch : value) {
+        if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+            (ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.' ||
+            ch == '~') {
+            encoded << static_cast<char>(ch);
+        } else {
+            encoded << '%' << std::setw(2) << std::setfill('0')
+                    << static_cast<unsigned int>(ch);
+        }
+    }
+    return encoded.str();
+}
+
+bool HttpMetadataClient::removeKey(const std::string& key) const {
+    try {
+        coro_http::coro_http_client client;
+        client.set_conn_timeout(std::chrono::milliseconds(1500));
+        client.set_req_timeout(std::chrono::milliseconds(3000));
+        const char separator =
+            metadata_uri_.find('?') == std::string::npos ? '?' : '&';
+        const std::string url =
+            metadata_uri_ + separator + "key=" + encodeQueryValue(key);
+        auto response = async_simple::coro::syncAwait(
+            client.async_delete(url, "", coro_http::req_content_type::json));
+        return response.status == 200;
+    } catch (const std::exception& error) {
+        LOG(ERROR) << "HTTP metadata DELETE failed: " << error.what();
+        return false;
+    }
+}
+
 HttpMetadataServer::HttpMetadataServer(uint16_t port, const std::string& host)
-    : port_(port),
-      host_(host),
-      server_(std::make_unique<coro_http::coro_http_server>(4, port)),
-      running_(false) {
+    : impl_(std::make_unique<HttpMetadataServerImpl>(port, host)) {
     init_server();
 }
 
@@ -23,7 +79,7 @@ void HttpMetadataServer::init_server() {
     using namespace coro_http;
 
     // GET /metadata?key=<key>
-    server_->set_http_handler<GET>(
+    impl_->server->set_http_handler<GET>(
         "/metadata", [this](coro_http_request& req, coro_http_response& resp) {
             auto key = req.get_query_value("key");
             if (key.empty()) {
@@ -32,9 +88,9 @@ void HttpMetadataServer::init_server() {
                 return;
             }
 
-            std::lock_guard<std::mutex> lock(store_mutex_);
-            auto it = store_.find(std::string(key));
-            if (it == store_.end()) {
+            std::lock_guard<std::mutex> lock(impl_->store_mutex);
+            auto it = impl_->store.find(std::string(key));
+            if (it == impl_->store.end()) {
                 resp.set_status_and_content(status_type::not_found,
                                             "metadata not found");
                 return;
@@ -45,7 +101,7 @@ void HttpMetadataServer::init_server() {
         });
 
     // PUT /metadata?key=<key>
-    server_->set_http_handler<PUT>(
+    impl_->server->set_http_handler<PUT>(
         "/metadata", [this](coro_http_request& req, coro_http_response& resp) {
             auto key = req.get_query_value("key");
             if (key.empty()) {
@@ -56,11 +112,11 @@ void HttpMetadataServer::init_server() {
 
             std::string body(req.get_body());
             {
-                std::lock_guard<std::mutex> lock(store_mutex_);
+                std::lock_guard<std::mutex> lock(impl_->store_mutex);
                 std::string key_str(key);
                 if (key_str.find("rpc_meta") != std::string::npos) {
-                    auto it = store_.find(key_str);
-                    if (it != store_.end()) {
+                    auto it = impl_->store.find(key_str);
+                    if (it != impl_->store.end()) {
                         if (it->second == body) {
                             resp.set_status_and_content(status_type::ok,
                                                         "metadata unchanged");
@@ -72,14 +128,14 @@ void HttpMetadataServer::init_server() {
                         return;
                     }
                 }
-                store_[std::move(key_str)] = body;
+                impl_->store[std::move(key_str)] = body;
             }
 
             resp.set_status_and_content(status_type::ok, "metadata updated");
         });
 
     // DELETE /metadata?key=<key>
-    server_->set_http_handler<coro_http::http_method::DEL>(
+    impl_->server->set_http_handler<coro_http::http_method::DEL>(
         "/metadata", [this](coro_http_request& req, coro_http_response& resp) {
             auto key = req.get_query_value("key");
             if (key.empty()) {
@@ -88,27 +144,27 @@ void HttpMetadataServer::init_server() {
                 return;
             }
 
-            std::lock_guard<std::mutex> lock(store_mutex_);
-            auto it = store_.find(std::string(key));
-            if (it == store_.end()) {
+            std::lock_guard<std::mutex> lock(impl_->store_mutex);
+            auto it = impl_->store.find(std::string(key));
+            if (it == impl_->store.end()) {
                 resp.set_status_and_content(status_type::not_found,
                                             "metadata not found");
                 return;
             }
 
-            store_.erase(it);
+            impl_->store.erase(it);
             resp.set_status_and_content(status_type::ok, "metadata deleted");
         });
 
     // Health check endpoint
-    server_->set_http_handler<GET>(
+    impl_->server->set_http_handler<GET>(
         "/health", [](coro_http_request& req, coro_http_response& resp) {
             resp.set_status_and_content(status_type::ok, "OK");
         });
 }
 
 bool HttpMetadataServer::start() {
-    if (running_) {
+    if (impl_->running) {
         return true;
     }
 
@@ -116,37 +172,40 @@ bool HttpMetadataServer::start() {
     // resolved (hasResult()) when the bind failed; otherwise the server keeps
     // running. Mirror MasterAdminServer::Start() so a failed bind is surfaced
     // instead of reporting a healthy server that never came up.
-    auto ec = server_->async_start();
+    auto ec = impl_->server->async_start();
     if (ec.hasResult()) {
-        LOG(ERROR) << "Failed to start HTTP metadata server on " << host_ << ":"
-                   << port_;
+        LOG(ERROR) << "Failed to start HTTP metadata server on " << impl_->host
+                   << ":" << impl_->port;
         return false;
     }
-    running_ = true;
-    LOG(INFO) << "HTTP metadata server started on " << host_ << ":" << port_;
+    impl_->running = true;
+    LOG(INFO) << "HTTP metadata server started on " << impl_->host << ":"
+              << impl_->port;
     return true;
 }
 
 void HttpMetadataServer::stop() {
-    if (!running_) {
+    if (!impl_->running) {
         return;
     }
 
-    server_->stop();
-    running_ = false;
+    impl_->server->stop();
+    impl_->running = false;
     LOG(INFO) << "HTTP metadata server stopped";
 }
 
 KVPoll HttpMetadataServer::poll() const {
-    if (!running_) {
+    if (!impl_->running) {
         return KVPoll::Failed;
     }
     return KVPoll::Success;
 }
 
+bool HttpMetadataServer::is_running() const { return impl_->running; }
+
 bool HttpMetadataServer::removeKey(const std::string& key) {
-    std::lock_guard<std::mutex> lock(store_mutex_);
-    if (store_.erase(key) > 0) {
+    std::lock_guard<std::mutex> lock(impl_->store_mutex);
+    if (impl_->store.erase(key) > 0) {
         LOG(INFO) << "HttpMetadataServer: removed key=" << key;
         return true;
     }
@@ -154,10 +213,10 @@ bool HttpMetadataServer::removeKey(const std::string& key) {
 }
 
 size_t HttpMetadataServer::removeKeys(const std::vector<std::string>& keys) {
-    std::lock_guard<std::mutex> lock(store_mutex_);
+    std::lock_guard<std::mutex> lock(impl_->store_mutex);
     size_t removed = 0;
     for (const auto& key : keys) {
-        if (store_.erase(key) > 0) {
+        if (impl_->store.erase(key) > 0) {
             LOG(INFO) << "HttpMetadataServer: removed key=" << key;
             ++removed;
         }

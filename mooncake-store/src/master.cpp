@@ -1528,7 +1528,9 @@ int main(int argc, char* argv[]) {
             master_config.rpc_enable_tcp_no_delay);
         const char* value = std::getenv("MC_RPC_PROTOCOL");
         if (value && std::string_view(value) == "rdma") {
-            server.init_ibv();
+            LOG(ERROR) << "MC_RPC_PROTOCOL=rdma is not supported by the "
+                          "dependency-isolated Store Master; use TCP";
+            return 1;
         }
         auto wrapped_master_service =
             std::make_shared<mooncake::WrappedMasterService>(

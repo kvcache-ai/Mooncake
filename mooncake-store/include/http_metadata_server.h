@@ -1,15 +1,25 @@
 #ifndef MOONCAKE_HTTP_METADATA_SERVER_H
 #define MOONCAKE_HTTP_METADATA_SERVER_H
 
-#include <csignal>
+#include <memory>
 #include <string>
-#include <unordered_map>
-#include <mutex>
 #include <vector>
 
-#include <ylt/coro_http/coro_http_server.hpp>
-
 namespace mooncake {
+
+class HttpMetadataServerImpl;
+
+class HttpMetadataClient {
+   public:
+    explicit HttpMetadataClient(std::string metadata_uri);
+
+    bool removeKey(const std::string& key) const;
+
+   private:
+    static std::string encodeQueryValue(const std::string& value);
+
+    std::string metadata_uri_;
+};
 
 enum class KVPoll {
     Failed = 0,
@@ -34,7 +44,7 @@ class HttpMetadataServer {
     KVPoll poll() const;
 
     // Check if the server is running
-    bool is_running() const { return running_; }
+    bool is_running() const;
 
     // Remove a key from the metadata store (for internal use by MasterService)
     // Returns true if key was found and removed, false if key did not exist
@@ -51,12 +61,7 @@ class HttpMetadataServer {
    private:
     void init_server();
 
-    uint16_t port_;
-    std::string host_;
-    std::unique_ptr<coro_http::coro_http_server> server_;
-    std::unordered_map<std::string, std::string> store_;
-    mutable std::mutex store_mutex_;
-    bool running_;
+    std::unique_ptr<HttpMetadataServerImpl> impl_;
 };
 
 }  // namespace mooncake

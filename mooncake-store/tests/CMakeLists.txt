@@ -7,7 +7,7 @@ function(add_store_test name)
            transfer_engine
            cachelib_memory_allocator
            ${ETCD_WRAPPER_LIB}
-           glog
+           Mooncake::glog
            ibverbs
            gtest
            gtest_main
@@ -24,8 +24,8 @@ function(add_ha_test name)
            transfer_engine
            cachelib_memory_allocator
            ${ETCD_WRAPPER_LIB}
-           glog
-           gflags
+           Mooncake::glog
+           Mooncake::gflags
            ibverbs
            gtest
            gtest_main
@@ -48,22 +48,9 @@ add_store_test(eviction_strategy_test eviction_strategy_test.cpp)
 add_store_test(deadline_scheduler_test deadline_scheduler_test.cpp)
 add_store_test(kv_event_publisher_test kv_event_publisher_test.cpp)
 if(ENABLE_KV_EVENTS)
-  find_library(
-    KV_EVENT_TEST_ZMQ_LIBRARY
-    NAMES zmq libzmq
-    PATHS /usr/lib /usr/local/lib /usr/lib64)
-  find_path(
-    KV_EVENT_TEST_ZMQ_INCLUDE_DIR
-    NAMES zmq.h
-    PATHS /usr/include /usr/local/include)
   target_compile_definitions(kv_event_publisher_test
                              PRIVATE MOONCAKE_ENABLE_KV_EVENTS=1)
-  if(KV_EVENT_TEST_ZMQ_LIBRARY AND KV_EVENT_TEST_ZMQ_INCLUDE_DIR)
-    target_include_directories(kv_event_publisher_test
-                               PRIVATE ${KV_EVENT_TEST_ZMQ_INCLUDE_DIR})
-    target_link_libraries(kv_event_publisher_test
-                          PRIVATE ${KV_EVENT_TEST_ZMQ_LIBRARY})
-  endif()
+  target_link_libraries(kv_event_publisher_test PRIVATE Mooncake::zmq)
 endif()
 add_store_test(master_service_test master_service_test.cpp)
 add_store_test(master_service_config_test master_service_config_test.cpp)
@@ -110,6 +97,7 @@ add_store_test(
   ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store_test.cpp
 )
 add_store_test(zstd_util_test zstd_util_test.cpp)
+target_link_libraries(zstd_util_test PRIVATE Mooncake::zstd)
 add_store_test(
   local_file_snapshot_object_store_test
   ha/snapshot/object/backends/local/local_file_snapshot_object_store_test.cpp)
@@ -131,7 +119,12 @@ add_store_test(task_integration_test task_integration_test.cpp)
 add_store_test(dummy_client_get_buffer_test dummy_client_get_buffer_test.cpp)
 add_store_test(uds_transport_test uds_transport_test.cpp)
 add_store_test(health_check_test health_check_test.cpp)
-add_store_test(http_metadata_server_test http_metadata_server_test.cpp)
+add_executable(http_metadata_server_test http_metadata_server_test.cpp)
+target_include_directories(http_metadata_server_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(http_metadata_server_test PRIVATE mooncake_store gtest
+                                                        gtest_main pthread)
+add_test(NAME http_metadata_server_test COMMAND http_metadata_server_test)
 add_store_test(mmap_arena_test mmap_arena_test.cpp)
 add_store_test(mmap_arena_fallback_test mmap_arena_fallback_test.cpp)
 add_store_test(object_data_type_test object_data_type_test.cpp)
@@ -144,29 +137,25 @@ if(STORE_USE_REDIS)
   target_sources(
     high_availability_test
     PRIVATE ha/leadership/backends/redis/high_availability_redis_test.cpp)
-  target_include_directories(high_availability_test
-                             PRIVATE ${MOONCAKE_STORE_HIREDIS_INCLUDE_DIR})
-  target_link_libraries(high_availability_test
-                        PRIVATE ${MOONCAKE_STORE_HIREDIS_LIBRARY})
+  target_link_libraries(high_availability_test PRIVATE Mooncake::hiredis)
 
   add_executable(
     redis_snapshot_catalog_store_test
     ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store_test.cpp)
-  target_include_directories(
-    redis_snapshot_catalog_store_test
-    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${MOONCAKE_STORE_HIREDIS_INCLUDE_DIR})
+  target_include_directories(redis_snapshot_catalog_store_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   target_link_libraries(
     redis_snapshot_catalog_store_test
     PUBLIC mooncake_store
            transfer_engine
            cachelib_memory_allocator
            ${ETCD_WRAPPER_LIB}
-           glog
-           gflags
+           Mooncake::glog
+           Mooncake::gflags
            ibverbs
            gtest
            pthread
-    PRIVATE ${MOONCAKE_STORE_HIREDIS_LIBRARY})
+    PRIVATE Mooncake::hiredis)
   add_test(NAME redis_snapshot_catalog_store_test
            COMMAND redis_snapshot_catalog_store_test)
 endif()
@@ -181,7 +170,7 @@ target_link_libraries(
          transfer_engine
          cachelib_memory_allocator
          ${ETCD_WRAPPER_LIB}
-         glog
+         Mooncake::glog
          gtest
          gtest_main
          pthread)
@@ -212,8 +201,8 @@ target_link_libraries(
          cachelib_memory_allocator
          ${ETCD_WRAPPER_LIB}
          mooncake_common
-         glog
-         gflags
+         Mooncake::glog
+         Mooncake::gflags
          pthread)
 
 # HA tests
@@ -240,8 +229,8 @@ add_executable(
                             ../src/ha/oplog/oplog_test_failpoint.cpp)
 target_compile_definitions(oplog_test_failpoint_test
                            PRIVATE MOONCAKE_ENABLE_TEST_FAILPOINTS)
-target_link_libraries(oplog_test_failpoint_test PRIVATE glog gtest gtest_main
-                                                        pthread)
+target_link_libraries(oplog_test_failpoint_test PRIVATE Mooncake::glog gtest
+                                                        gtest_main pthread)
 add_test(NAME oplog_test_failpoint_test COMMAND oplog_test_failpoint_test)
 add_ha_test(master_service_ha_test ha/master_service_ha_test.cpp)
 add_ha_test(catalog_backed_snapshot_provider_test
@@ -249,8 +238,6 @@ add_ha_test(catalog_backed_snapshot_provider_test
 if(STORE_USE_REDIS)
   foreach(target catalog_backed_snapshot_provider_test
                  hot_standby_snapshot_bootstrap_test)
-    target_include_directories(${target}
-                               PRIVATE ${MOONCAKE_STORE_HIREDIS_INCLUDE_DIR})
-    target_link_libraries(${target} PRIVATE ${MOONCAKE_STORE_HIREDIS_LIBRARY})
+    target_link_libraries(${target} PRIVATE Mooncake::hiredis)
   endforeach()
 endif()

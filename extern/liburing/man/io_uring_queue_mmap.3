@@ -1,0 +1,49 @@
+.\" Copyright (C) 2025 Jens Axboe <axboe@kernel.dk>
+.\"
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_queue_mmap 3 "January 18, 2025" "liburing-2.4" "liburing Manual"
+.SH NAME
+io_uring_queue_mmap \- mmap io_uring ring after setup
+.SH SYNOPSIS
+.nf
+.B #include <liburing.h>
+.PP
+.BI "int io_uring_queue_mmap(int " fd ", struct io_uring_params *" p ","
+.BI "                        struct io_uring *" ring ");"
+.fi
+.SH DESCRIPTION
+.PP
+The
+.BR io_uring_queue_mmap (3)
+function maps the io_uring ring file descriptor
+.I fd
+into memory using the parameters in
+.IR p .
+The resulting ring is stored in
+.IR ring .
+
+This function is a helper for applications that need to customize the ring
+setup process. Most applications should use
+.BR io_uring_queue_init (3)
+or
+.BR io_uring_queue_init_params (3)
+instead, which call
+.BR io_uring_setup (2)
+and this function automatically.
+
+The
+.I fd
+argument should be a file descriptor returned by
+.BR io_uring_setup (2),
+and
+.I p
+should contain the parameters returned by the setup call.
+
+.SH RETURN VALUE
+Returns 0 on success, or a negative errno value on error.
+.SH SEE ALSO
+.BR io_uring_setup (2),
+.BR io_uring_queue_init (3),
+.BR io_uring_queue_init_params (3),
+.BR io_uring_queue_exit (3)

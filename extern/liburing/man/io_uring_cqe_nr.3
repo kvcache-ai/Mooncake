@@ -1,0 +1,35 @@
+.\" Copyright (C) 2025 Jens Axboe <axboe@kernel.dk>
+.\"
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_cqe_nr 3 "January 18, 2025" "liburing-2.12" "liburing Manual"
+.SH NAME
+io_uring_cqe_nr \- return the number of CQ ring slots consumed by a CQE
+.SH SYNOPSIS
+.nf
+.B #include <liburing.h>
+.PP
+.BI "unsigned io_uring_cqe_nr(const struct io_uring_cqe *" cqe ");"
+.fi
+.SH DESCRIPTION
+.PP
+The
+.BR io_uring_cqe_nr (3)
+function returns the number of CQ ring slots consumed by
+.IR cqe .
+For normal 16-byte CQEs, this returns 1. For 32-byte CQEs (when
+.B IORING_CQE_F_32
+is set in the CQE flags), this returns 2.
+
+This function is useful when advancing the CQ ring with
+.BR io_uring_cq_advance (3)
+on rings that use
+.B IORING_SETUP_CQE_MIXED
+where both 16-byte and 32-byte CQEs may be present.
+
+.SH RETURN VALUE
+Returns 1 for normal CQEs, or 2 for 32-byte CQEs.
+.SH SEE ALSO
+.BR io_uring_cq_advance (3),
+.BR io_uring_cqe_seen (3),
+.BR io_uring_setup (2)

@@ -1,0 +1,165 @@
+.\" Copyright (C) 2024 Jens Axboe <axboe@kernel.dk>
+.\"
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_clone_buffers 3 "September 12, 2024" "liburing-2.9" "liburing Manual"
+.SH NAME
+io_uring_clone_buffers \- Clones registered buffers between rings
+.SH SYNOPSIS
+.nf
+.B #include <liburing.h>
+.PP
+.BI "int io_uring_clone_buffers(struct io_uring *" dst ","
+.BI "                           struct io_uring * " src ");"
+.PP
+.BI "int __io_uring_clone_buffers(struct io_uring *" dst ","
+.BI "                             struct io_uring * " src ","
+.BI "                             unsigned int " flags ");"
+.PP
+.BI "int io_uring_clone_buffers_offset(struct io_uring *" dst ","
+.BI "                                  struct io_uring * " src ","
+.BI "                                  unsigned int " dst_off ","
+.BI "                                  unsigned int " src_off ","
+.BI "                                  unsigned int " nr ","
+.BI "                                  unsigned int " flags ");"
+.PP
+.BI "int __io_uring_clone_buffers_offset(struct io_uring *" dst ","
+.BI "                                    struct io_uring * " src ","
+.BI "                                    unsigned int " dst_off ","
+.BI "                                    unsigned int " src_off ","
+.BI "                                    unsigned int " nr ","
+.BI "                                    unsigned int " flags ");"
+.PP
+.fi
+.SH DESCRIPTION
+.PP
+The
+.BR io_uring_clone_buffers (3)
+function clones registered buffers from the ring indicated by
+.IR src
+to the ring indicated by
+.IR dst .
+Upon successful completion of this operation,
+.IR src
+and
+.IR dst
+will have the same set of registered buffers. This operation is identical to
+performing a
+.BR io_uring_register_buffers (3)
+operation on the
+.IR dst
+ring, if the
+.IR src
+ring previously had that same buffer registration operating done.
+
+The
+.IR dst
+ring must not have any buffers currently registered. If buffers are currently
+registered on the destination ring, they must be unregistered with
+.BR io_uring_unregister_buffers (3)
+first.
+
+For
+.BR __io_uring_clone_buffers (3) ,
+the only difference is that it takes a
+.IR flags
+argument. By default, if the destination ring has a registered file descriptor
+through
+.BR io_uring_register_ring_fd (3)
+AND the calling application is not the thread that registered that ring, then
+the kernel doesn't know how to look up the destination. This is problematic
+as
+.BR io_uring_clone_buffers (3)
+defaults to using the registered index if the destination is setup as such.
+Use
+.BR __io_uring_clone_buffers (3)
+which doesn't set
+.B IORING_REGISTER_SRC_REGISTERED
+by default. This requires the application to still have the original ring file
+descriptor open. See below for the flag definition.
+
+Available since kernel 6.12.
+
+The
+.BR io_uring_clone_buffers_offset (3)
+function also clones buffers from the
+.IR src
+ring to the
+.IR dst
+ring, however it supports cloning only a subset of the buffers, where
+.BR io_uring_clone_buffers (3)
+always clones all of them.
+.IR dst_off
+indicates at what offset cloning should start in the destination,
+.IR src_off
+indicates at what offset cloning should start in the source, and
+.IR nr
+indicates how many buffers to clone at the given offset. If both
+.IR dst_off ,
+.IR src_off ,
+and
+.IR nr
+are given as
+.B 0 ,
+then
+.BR io_uring_clone_buffers_offset (3)
+performs the same action as
+.BR io_uring_clone_buffers (3) .
+
+While
+.BR io_uring_clone_buffers_offset (3)
+sets
+.B IORING_REGISTER_SRC_REGISTERED
+by default, the
+.BR __io_uring_clone_buffers_offset (3)
+does not. See the explanation for
+.BR __io_uring_clone_buffers (3)
+for details.
+
+.IR flags
+may be set to the following value:
+.TP
+.B IORING_REGISTER_SRC_REGISTERED
+If the source ring is registered AND the calling thread is the one that
+originally registered its ring fd, then this flag may be set to lookup the
+registered index rather than use the normal file descriptor. If the normal
+file descriptor wasn't closed after registering it, there's no need to set
+this flag.
+.TP
+.B IORING_REGISTER_DST_REPLACE
+If set, cloning may happen for a destination ring that already has a buffer
+table assigned. In that case, existing nodes that overlap with the specified
+range will be released and replaced.
+.PP
+
+Available since kernel 6.13.
+
+.SH NOTES
+The source and target ring must shared address spaces, and hence internal
+kernel accounting.
+.SH RETURN VALUE
+On success
+.BR io_uring_clone_buffers (3)
+and
+.BR io_uring_clone_buffers_offset (3)
+return 0.
+On failure, they returns
+.BR -errno ,
+specifically
+.TP
+.B -EBUSY
+The destination ring already has buffers registered, and
+.B IORING_REGISTER_DST_REPLACE
+wasn't set.
+.TP
+.B -ENOMEM
+The kernel ran out of memory.
+.TP
+.B -ENXIO
+The source ring doesn't have any buffers registered.
+.SH SEE ALSO
+.BR io_uring_register (2),
+.BR io_uring_unregister_buffers (3),
+.BR io_uring_register_buffers (3),
+.BR io_uring_prep_read_fixed (3),
+.BR io_uring_prep_write_fixed (3)

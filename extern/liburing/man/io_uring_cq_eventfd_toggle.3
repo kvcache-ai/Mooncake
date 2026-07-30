@@ -1,0 +1,48 @@
+.\" Copyright (C) 2025 Jens Axboe <axboe@kernel.dk>
+.\"
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_cq_eventfd_toggle 3 "January 18, 2025" "liburing-2.4" "liburing Manual"
+.SH NAME
+io_uring_cq_eventfd_toggle \- toggle eventfd notifications on or off
+.SH SYNOPSIS
+.nf
+.B #include <liburing.h>
+.PP
+.BI "int io_uring_cq_eventfd_toggle(struct io_uring *" ring ", bool " enabled ");"
+.fi
+.SH DESCRIPTION
+.PP
+The
+.BR io_uring_cq_eventfd_toggle (3)
+function toggles eventfd notifications for the io_uring instance specified by
+.IR ring .
+If
+.I enabled
+is
+.BR true ,
+eventfd notifications are enabled. If
+.I enabled
+is
+.BR false ,
+they are disabled.
+
+An eventfd must first be registered with the ring using
+.BR io_uring_register_eventfd (3)
+or
+.BR io_uring_register_eventfd_async (3)
+before this function can be used.
+
+This can be useful when the application wants to temporarily stop receiving
+eventfd notifications, for example during a batch processing phase.
+
+.SH RETURN VALUE
+Returns 0 on success. On error, a negative errno value is returned:
+.TP
+.B -EOPNOTSUPP
+The kernel does not support toggling eventfd notifications, or no eventfd
+is registered.
+.SH SEE ALSO
+.BR io_uring_register_eventfd (3),
+.BR io_uring_register_eventfd_async (3),
+.BR io_uring_cq_eventfd_enabled (3)

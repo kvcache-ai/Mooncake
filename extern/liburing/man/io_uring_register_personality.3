@@ -1,0 +1,34 @@
+.\" Copyright (C) 2025 Jens Axboe <axboe@kernel.dk>
+.\"
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_register_personality 3 "January 18, 2025" "liburing-2.4" "liburing Manual"
+.SH NAME
+io_uring_register_personality \- register credentials with io_uring
+.SH SYNOPSIS
+.nf
+.B #include <liburing.h>
+.PP
+.BI "int io_uring_register_personality(struct io_uring *" ring ");"
+.fi
+.SH DESCRIPTION
+.PP
+The
+.BR io_uring_register_personality (3)
+function registers the credentials of the calling application with the
+io_uring instance specified by
+.IR ring .
+This allows a ring to be shared between separate users or processes while
+maintaining credential separation.
+
+The returned personality ID can be used in the
+.I personality
+field of a submission queue entry to execute that request with the
+registered credentials.
+
+.SH RETURN VALUE
+Returns a positive personality ID on success that can be used in future
+operations. On error, a negative errno value is returned.
+.SH SEE ALSO
+.BR io_uring_unregister_personality (3),
+.BR io_uring_register (2)

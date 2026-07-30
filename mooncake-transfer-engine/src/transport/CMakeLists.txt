@@ -5,8 +5,8 @@ add_subdirectory(rpc_communicator)
 add_library(transport OBJECT ${XPORT_SOURCES} $<TARGET_OBJECTS:rdma_transport>
                              $<TARGET_OBJECTS:rpc_communicator>)
 target_link_libraries(
-  transport PRIVATE JsonCpp::JsonCpp yalantinglibs::yalantinglibs glog::glog
-                    pthread)
+  transport PRIVATE Mooncake::jsoncpp yalantinglibs::yalantinglibs
+                    Mooncake::glog pthread)
 
 if(USE_UB)
   add_subdirectory(kunpeng_transport)
@@ -92,7 +92,9 @@ if(USE_CXI)
   target_link_libraries(transport PRIVATE fabric)
 endif()
 
-if(USE_CUDA OR USE_MUSA OR USE_MACA)
+if(USE_CUDA
+   OR USE_MUSA
+   OR USE_MACA)
   add_subdirectory(device)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:device_transport>)
   # device_transport (ibgda_device_transport.cpp / mlx5gda.cpp) calls libmlx5

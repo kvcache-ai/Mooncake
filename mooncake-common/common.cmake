@@ -74,7 +74,8 @@ if(BUILD_UNIT_TESTS)
 endif()
 option(BUILD_BENCHMARK "Build benchmarks" ON)
 option(USE_CUDA "option for enabling gpu features for NVIDIA GPU" OFF)
-option(USE_NCCL_DEVICE "option for enabling the NCCL DeviceTransport backend" OFF)
+option(USE_NCCL_DEVICE "option for enabling the NCCL DeviceTransport backend"
+       OFF)
 option(USE_NCCL_HOST "option for enabling the NCCL host RMA transport" OFF)
 option(USE_MLU "option for enabling Cambricon MLU features" OFF)
 option(USE_MUSA "option for enabling gpu features for MTHREADS GPU" OFF)
@@ -96,9 +97,10 @@ option(USE_EFA "option for using AWS EFA transport" OFF)
 option(USE_UB "option for using UB protocol transport" OFF)
 option(USE_SUNRISE
        "option for enabling gpu features for Sunrise GPU with Tang runtime" OFF)
-option(USE_TPU
-       "option for enabling TPU (PJRT) staging support in TENT; the PJRT adapter is loaded at runtime via dlopen, no build-time SDK required"
-       OFF)
+option(
+  USE_TPU
+  "option for enabling TPU (PJRT) staging support in TENT; the PJRT adapter is loaded at runtime via dlopen, no build-time SDK required"
+  OFF)
 
 if(USE_UB)
   add_compile_definitions(USE_UB)
@@ -213,8 +215,7 @@ endif()
 
 if(USE_NCCL_DEVICE OR USE_NCCL_HOST)
   if(NOT USE_CUDA)
-    message(FATAL_ERROR
-      "USE_NCCL_DEVICE and USE_NCCL_HOST require USE_CUDA=ON")
+    message(FATAL_ERROR "USE_NCCL_DEVICE and USE_NCCL_HOST require USE_CUDA=ON")
   endif()
   list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_LIST_DIR})
   find_package(NCCLDevice 2.30.4 REQUIRED MODULE)
@@ -222,14 +223,15 @@ endif()
 
 if(USE_NCCL_DEVICE)
   add_compile_definitions(USE_NCCL_DEVICE)
-  message(STATUS
-    "NCCL DeviceTransport support is enabled (NCCL ${NCCLDevice_VERSION})")
+  message(
+    STATUS
+      "NCCL DeviceTransport support is enabled (NCCL ${NCCLDevice_VERSION})")
 endif()
 
 if(USE_NCCL_HOST)
   add_compile_definitions(USE_NCCL_HOST)
-  message(STATUS
-    "NCCL host RMA transport is enabled (NCCL ${NCCLDevice_VERSION})")
+  message(
+    STATUS "NCCL host RMA transport is enabled (NCCL ${NCCLDevice_VERSION})")
 endif()
 
 if(USE_TPU)
@@ -535,18 +537,16 @@ if(EXISTS "/usr/include/boost1.78")
   link_directories("/usr/lib64/boost1.78")
 endif()
 
-set(GFLAGS_USE_TARGET_NAMESPACE "true")
-find_package(yaml-cpp REQUIRED)
-find_package(gflags REQUIRED)
-if(NOT TARGET gflags::gflags)
-  foreach(_gflags_target gflags-shared gflags_shared gflags)
-    if(TARGET ${_gflags_target})
-      add_library(gflags::gflags INTERFACE IMPORTED)
-      set_target_properties(gflags::gflags PROPERTIES INTERFACE_LINK_LIBRARIES
-                                                      ${_gflags_target})
-      break()
-    endif()
-  endforeach()
+option(MOONCAKE_ENABLE_HTTPS_METADATA
+       "Enable TLS support for Store HTTP metadata clients" ON)
+if(WITH_STORE AND USE_HTTP)
+  set(YLT_ENABLE_SSL
+      ${MOONCAKE_ENABLE_HTTPS_METADATA}
+      CACHE BOOL "Enable YLT TLS support for Store HTTP metadata clients" FORCE)
 endif()
 find_package(yalantinglibs CONFIG REQUIRED)
-add_compile_definitions(YLT_ENABLE_IBV)
+target_link_libraries(yalantinglibs::yalantinglibs INTERFACE Mooncake::asio)
+if(YLT_ENABLE_SSL)
+  target_compile_definitions(mooncake_asio PRIVATE YLT_ENABLE_SSL)
+  target_link_libraries(mooncake_asio PUBLIC OpenSSL::SSL OpenSSL::Crypto)
+endif()

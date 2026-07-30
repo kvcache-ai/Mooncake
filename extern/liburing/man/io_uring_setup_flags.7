@@ -1,0 +1,430 @@
+.\" Copyright (C) 2025 Jens Axboe <axboe@kernel.dk>
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_setup_flags 7 "January 18, 2025" "Linux" "Linux Programmer's Manual"
+.SH NAME
+io_uring_setup_flags \- io_uring ring setup flags overview
+.SH DESCRIPTION
+When creating an io_uring instance with
+.BR io_uring_queue_init_params (3)
+or
+.BR io_uring_setup (2),
+various flags control the ring's behavior. These flags are set in the
+.I flags
+field of
+.IR "struct io_uring_params" .
+.PP
+Choosing the right flags can significantly impact performance. This page
+provides an overview of available flags, their purposes, and common
+combinations.
+.SS Polling flags
+These flags control how I/O completion and submission polling works.
+.PP
+.B IORING_SETUP_IOPOLL
+.RS 4
+Enable I/O polling mode for file descriptors that support it. Instead of
+relying on interrupts, the kernel polls for completions. This reduces
+latency for high-performance storage devices (NVMe, etc.) but requires:
+.IP \(bu 2
+Files opened with
+.B O_DIRECT
+.IP \(bu
+Hardware and drivers that support polling
+.IP \(bu
+The application to call
+.BR io_uring_enter (2)
+to reap completions (busy-polling)
+.IP \(bu
+Storage device configuration for polling support
+.PP
+IOPOLL rings cannot use IRQ-driven completion; the application must poll.
+Only request types that support polling may be issued on an IOPOLL ring.
+This mode is commonly used for scenarios that purely do polled I/O on
+storage devices like NVMe.
+.PP
+Using IOPOLL generally requires storage device setup. For NVMe devices,
+the kernel parameter
+.B nvme.poll_queues=X
+must be set, where X is the number of completion queues on the NVMe
+device to set aside for polling operations.
+.RE
+.PP
+.B IORING_SETUP_SQPOLL
+.RS 4
+Create a kernel thread that polls the submission queue. Eliminates the
+need for system calls to submit I/O. See
+.BR io_uring_sqpoll (7)
+for details.
+.RE
+.PP
+.B IORING_SETUP_SQ_AFF
+.RS 4
+Pin the SQPOLL thread to a specific CPU. Requires
+.BR IORING_SETUP_SQPOLL .
+The CPU is specified in
+.I sq_thread_cpu
+of
+.IR "struct io_uring_params" .
+.RE
+.PP
+.B IORING_SETUP_HYBRID_IOPOLL
+.RS 4
+Enable hybrid polling mode. Instead of pure busy-polling, the kernel
+uses an adaptive approach that may sleep briefly, reducing CPU usage
+while still providing low latency. This is a middle ground between
+interrupt-driven and pure polling modes.
+.RE
+.SS Task run flags
+These flags control when and how completion processing runs.
+.PP
+.B IORING_SETUP_COOP_TASKRUN
+.RS 4
+Disable interrupting the application for completion processing. Normally,
+the kernel signals the application when completions are ready, which can
+interrupt system calls. With this flag, completions are only processed
+when the application returns to userspace from any system call, not just
+io_uring-related ones. This means completions may be processed after
+.BR read (2),
+.BR write (2),
+.BR poll (2),
+or any other syscall returns.
+.PP
+This improves performance by eliminating asynchronous interrupts but
+requires the application to regularly enter the kernel to process
+completions. Recommended for most applications that have an event loop.
+.RE
+.PP
+.B IORING_SETUP_TASKRUN_FLAG
+.RS 4
+When completions are pending, set
+.B IORING_SQ_TASKRUN
+in the SQ ring flags. This allows applications to check if there is
+completion work to process without making a system call. Typically used
+with
+.BR IORING_SETUP_COOP_TASKRUN .
+.RE
+.PP
+.B IORING_SETUP_DEFER_TASKRUN
+.RS 4
+Defer completion task work to when the application explicitly enters the
+kernel via
+.BR io_uring_enter (2).
+Unlike
+.BR IORING_SETUP_COOP_TASKRUN ,
+completions are only processed during io_uring-related syscalls, not on
+return from arbitrary syscalls. This provides the tightest and most
+predictable control over when completion processing occurs, as well as
+optimal cache behavior since work runs in the application's context.
+.PP
+This flag should be considered the default mode for applications setting
+up a ring. It requires
+.B IORING_SETUP_SINGLE_ISSUER
+and a ring created per-thread. The application must regularly call
+.BR io_uring_enter (2)
+(via
+.BR io_uring_submit (3),
+.BR io_uring_wait_cqe (3),
+or similar) to process deferred work; failing to do so will stall
+completions.
+.PP
+Some features require this flag:
+.IP \(bu 2
+Ring resizing
+.RB ( io_uring_register_resize_rings (3))
+.IP \(bu
+Zero-copy receive
+.RB ( IORING_OP_RECV_ZC )
+.RE
+.PP
+.B IORING_SETUP_SINGLE_ISSUER
+.RS 4
+Hint that only one task will submit requests to this ring. Enables
+internal optimizations including reduced locking overhead. The first
+task to submit a request becomes the designated submitter; others
+attempting to submit will get
+.BR -EEXIST .
+.PP
+Each thread or task having its own ring is the idiomatic use case for
+io_uring. Sharing a ring between multiple threads or tasks is
+discouraged as it requires additional synchronization and prevents
+many optimizations. Applications should create a ring per thread rather
+than sharing rings.
+.RE
+.SS Ring sizing flags
+These flags control the size and layout of the submission and completion
+queues.
+.PP
+.B IORING_SETUP_CQSIZE
+.RS 4
+Override the default completion queue size. By default, the CQ has twice
+as many entries as the SQ. Set
+.I cq_entries
+in
+.I struct io_uring_params
+to specify a custom CQ size. Must be a power of 2.
+.PP
+Larger CQ sizes are useful when the application may submit many requests
+before processing completions, avoiding CQ overflow.
+.RE
+.PP
+.B IORING_SETUP_CLAMP
+.RS 4
+Clamp the SQ and CQ sizes to the maximum allowed values instead of
+returning
+.B -EINVAL
+if the requested sizes are too large. Useful when the application wants
+the largest possible rings without querying limits.
+.RE
+.PP
+.B IORING_SETUP_SQE128
+.RS 4
+Use 128-byte SQEs instead of the default 64 bytes. Required for some
+operations that need extra space, such as
+.B IORING_OP_URING_CMD
+passthrough commands.
+.RE
+.PP
+.B IORING_SETUP_CQE32
+.RS 4
+Use 32-byte CQEs instead of the default 16 bytes. Required for
+operations that return extra data, such as some passthrough commands
+or when using
+.BR IORING_OP_MSG_RING .
+.RE
+.PP
+.B IORING_SETUP_NO_SQARRAY
+.RS 4
+Do not create the SQ array. The SQ array is a level of indirection that
+allows SQEs to be submitted in a different order than they appear in
+the ring. Most applications submit SQEs in order and do not need this.
+This flag saves memory and is required for some modes like
+.BR IORING_SETUP_REGISTERED_FD_ONLY .
+.RE
+.PP
+.B IORING_SETUP_SQ_REWIND
+.RS 4
+Use non-circular submission queue mode. The kernel ignores the SQ head
+and tail pointers and instead fetches SQEs starting from index 0 on each
+submit. The application places all SQEs at the beginning of the ring
+before calling
+.BR io_uring_enter (2),
+and the
+.I sq_entries
+parameter determines how many SQEs are submitted.
+.PP
+Requires
+.BR IORING_SETUP_NO_SQARRAY .
+Not compatible with
+.BR IORING_SETUP_SQPOLL .
+.PP
+This mode keeps SQEs hot in cache by always accessing the same memory
+locations at the start of the ring, improving performance for workloads
+that submit small batches frequently.
+.RE
+.PP
+.B IORING_SETUP_CQE_MIXED
+.RS 4
+Allow the ring to return a mix of 16-byte and 32-byte CQEs, controlled
+per-request. When a request needs a 32-byte CQE, it sets
+.B IOSQE_BIG_CQE
+in its flags. Otherwise, a 16-byte CQE is used. Requires
+.BR IORING_SETUP_CQE32 .
+.PP
+This is useful when certain operations require 32-byte CQEs (such as
+some passthrough commands) but most operations do not. Using mixed mode
+instead of
+.B IORING_SETUP_CQE32
+alone provides efficiency benefits in terms of memory bandwidth and
+usage, since the smaller 16-byte CQEs are used for operations that do
+not need the extra space.
+.RE
+.PP
+.B IORING_SETUP_SQE_MIXED
+.RS 4
+Allow the ring to accept a mix of 64-byte and 128-byte SQEs. When a
+request needs a 128-byte SQE, it sets
+.B IOSQE_BIG_SQE
+in its flags. Requires
+.BR IORING_SETUP_SQE128 .
+.PP
+This is useful when certain operations require 128-byte SQEs (such as
+.BR IORING_OP_URING_CMD )
+but most operations do not. Using mixed mode instead of
+.B IORING_SETUP_SQE128
+alone provides efficiency benefits in terms of memory bandwidth and
+usage, since the smaller 64-byte SQEs are used for operations that do
+not need the extra space.
+.RE
+.SS Memory and setup flags
+These flags control memory allocation and ring initialization.
+.PP
+.B IORING_SETUP_NO_MMAP
+.RS 4
+The application provides its own memory for the rings instead of the
+kernel allocating and the application mmap'ing it. The application
+fills in
+.IR sq_off.user_addr ,
+.IR cq_off.user_addr ,
+and
+.I sq_sqes.user_addr
+in
+.I struct io_uring_params
+with addresses of application-allocated memory.
+.PP
+This is useful for placing rings in specific memory (huge pages, shared
+memory, etc.) or for creating rings without mmap.
+.RE
+.PP
+.B IORING_SETUP_REGISTERED_FD_ONLY
+.RS 4
+The ring file descriptor is not installed in the process's file
+descriptor table. Instead, a "registered ring" index is returned in
+.I ring_fd
+that can be used with
+.BR io_uring_enter (2)
+when
+.B IORING_ENTER_REGISTERED_RING
+is set. This reduces per-operation overhead.
+.PP
+Requires
+.BR IORING_SETUP_NO_SQARRAY .
+The application must use
+.BR io_uring_register_ring_fd (3)
+to use the ring or access it via the registered index.
+.RE
+.PP
+.B IORING_SETUP_R_DISABLED
+.RS 4
+Create the ring in a disabled state. The ring will not accept submissions
+until it is enabled via
+.BR io_uring_enable_rings (3).
+This is useful when setting up restrictions or registered resources
+before allowing I/O. See
+.BR io_uring_register_restrictions (3).
+.RE
+.SS Submission flags
+These flags control submission behavior.
+.PP
+.B IORING_SETUP_SUBMIT_ALL
+.RS 4
+Continue processing submissions even if one fails. Normally, if an
+SQE fails during submission (not execution), subsequent SQEs in the
+same submit call are not processed. With this flag, all SQEs are
+processed regardless of earlier failures.
+.PP
+The failed SQE still generates a CQE with the error; this flag only
+affects whether subsequent SQEs are submitted. This is probably the
+behavior most applications expect, since CQEs are generated for failed
+submissions anyway and the application must handle them regardless.
+.RE
+.SS Workqueue flags
+These flags control the async worker threads.
+.PP
+.B IORING_SETUP_ATTACH_WQ
+.RS 4
+Share the async worker thread pool with another ring. Set
+.I wq_fd
+in
+.I struct io_uring_params
+to the file descriptor of the ring to share with. This reduces resource
+usage when an application uses multiple rings.
+.PP
+When combined with
+.BR IORING_SETUP_SQPOLL ,
+the SQPOLL thread is also shared.
+.RE
+.SS Common flag combinations
+.PP
+.B High-performance single-threaded application:
+.RS 4
+.PP
+.in +4n
+.EX
+.flags = IORING_SETUP_SINGLE_ISSUER |
+        IORING_SETUP_DEFER_TASKRUN |
+        IORING_SETUP_COOP_TASKRUN
+.EE
+.in
+.PP
+This combination provides the best latency and throughput for applications
+where each thread has its own ring and processes completions in a dedicated
+event loop.
+.RE
+.PP
+.B Low-latency storage with polling:
+.RS 4
+.PP
+.in +4n
+.EX
+.flags = IORING_SETUP_IOPOLL |
+        IORING_SETUP_SINGLE_ISSUER |
+        IORING_SETUP_DEFER_TASKRUN
+.EE
+.in
+.PP
+For NVMe or other devices that support polling, this eliminates interrupt
+overhead. Combined with DEFER_TASKRUN for optimal completion handling.
+.RE
+.PP
+.B System call-free submission:
+.RS 4
+.PP
+.in +4n
+.EX
+.flags = IORING_SETUP_SQPOLL |
+        IORING_SETUP_SQ_AFF
+.sq_thread_cpu = preferred_cpu
+.sq_thread_idle = 1000
+.EE
+.in
+.PP
+For workloads that benefit from eliminating submission syscall overhead.
+See
+.BR io_uring_sqpoll (7).
+.RE
+.PP
+.B Multiple rings sharing resources:
+.RS 4
+.PP
+.in +4n
+.EX
+/* First ring */
+p1.flags = IORING_SETUP_SQPOLL;
+
+/* Subsequent rings */
+p2.flags = IORING_SETUP_SQPOLL | IORING_SETUP_ATTACH_WQ;
+p2.wq_fd = ring1_fd;
+.EE
+.in
+.PP
+Reduces kernel thread and workqueue overhead when using multiple rings.
+.RE
+.SH NOTES
+.IP \(bu 2
+Not all flag combinations are valid. The kernel returns
+.B -EINVAL
+for incompatible combinations.
+.IP \(bu
+Some flags require specific kernel versions. Check
+.BR io_uring_setup (2)
+for version requirements.
+.IP \(bu
+The
+.BR io_uring_queue_init_params (3)
+function handles the complexity of ring setup. Using the raw
+.BR io_uring_setup (2)
+syscall requires careful mmap setup.
+.IP \(bu
+For most applications with a proper event loop,
+.B IORING_SETUP_DEFER_TASKRUN
+combined with
+.B IORING_SETUP_SINGLE_ISSUER
+is the recommended default. This provides the best control over when
+completion work runs and optimal cache locality.
+.SH SEE ALSO
+.BR io_uring (7),
+.BR io_uring_sqpoll (7),
+.BR io_uring_setup (2),
+.BR io_uring_queue_init_params (3),
+.BR io_uring_register_restrictions (3),
+.BR io_uring_enable_rings (3)

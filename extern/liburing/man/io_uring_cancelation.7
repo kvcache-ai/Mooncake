@@ -1,0 +1,324 @@
+.\" Copyright (C) 2025 Jens Axboe <axboe@kernel.dk>
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_cancelation 7 "January 18, 2025" "Linux" "Linux Programmer's Manual"
+.SH NAME
+io_uring_cancelation \- io_uring request cancelation overview
+.SH DESCRIPTION
+io_uring provides mechanisms to cancel in-flight requests before they
+complete naturally. This is useful for implementing timeouts, handling
+connection drops, closing connections that go away, or when a request is no
+longer needed.
+.SS Why cancel requests?
+Common scenarios requiring cancelation:
+.IP \(bu 2
+.B Timeouts:
+Cancel a read or accept that has been pending too long
+.IP \(bu
+.B Connection management:
+Cancel pending operations when a connection is closed
+.IP \(bu
+.B Resource cleanup:
+Cancel operations on a file descriptor being closed
+.IP \(bu
+.B Multishot termination:
+Stop a multishot operation that is no longer needed
+.SS Basic cancelation
+The primary cancelation mechanism is
+.B IORING_OP_ASYNC_CANCEL
+(set up with
+.BR io_uring_prep_cancel (3)
+or related functions). By default, it cancels a request matching a
+specific
+.IR user_data :
+.PP
+.in +4n
+.EX
+/* Submit a read with user_data = 1234 */
+sqe = io_uring_get_sqe(ring);
+io_uring_prep_read(sqe, fd, buf, len, 0);
+io_uring_sqe_set_data64(sqe, 1234);
+io_uring_submit(ring);
+
+/* Later, cancel it */
+sqe = io_uring_get_sqe(ring);
+io_uring_prep_cancel64(sqe, 1234, 0);
+io_uring_submit(ring);
+.EE
+.in
+.SS Cancelation results
+When a cancelation is submitted, two CQEs are generated:
+.PP
+.B The canceled request's CQE:
+.RS 4
+.IP \(bu 2
+.I res
+is set to
+.B -ECANCELED
+(or occasionally
+.B -EINTR
+if the operation was already in progress)
+.IP \(bu
+The
+.I user_data
+identifies which request was canceled
+.RE
+.PP
+.B The cancel request's CQE:
+.RS 4
+.IP \(bu 2
+.I res
+is 0 on success (request was found and canceled)
+.IP \(bu
+.I res
+is
+.B -ENOENT
+if no matching request was found
+.IP \(bu
+.I res
+is
+.B -EALREADY
+if the request was found but already completing
+.RE
+.PP
+The order of these CQEs is not guaranteed. The application may receive
+the cancel CQE before or after the canceled request's CQE.
+.SS Cancelation flags
+Various flags modify cancelation behavior:
+.PP
+.B IORING_ASYNC_CANCEL_ALL
+.RS 4
+Cancel all matching requests, not just the first one found. The cancel
+CQE's
+.I res
+indicates how many requests were canceled.
+.RE
+.PP
+.B IORING_ASYNC_CANCEL_FD
+.RS 4
+Match requests by file descriptor instead of
+.IR user_data .
+Cancels requests operating on the specified fd:
+.PP
+.in +4n
+.EX
+io_uring_prep_cancel_fd(sqe, fd, IORING_ASYNC_CANCEL_FD);
+.EE
+.in
+.RE
+.PP
+.B IORING_ASYNC_CANCEL_ANY
+.RS 4
+Cancel any single request, ignoring
+.I user_data
+matching. Useful for draining a ring of all pending requests when
+combined with
+.BR IORING_ASYNC_CANCEL_ALL .
+.RE
+.PP
+.B IORING_ASYNC_CANCEL_FD_FIXED
+.RS 4
+The file descriptor is a fixed file (registered file index) rather
+than a regular fd.
+.RE
+.PP
+Flags can be combined:
+.PP
+.in +4n
+.EX
+/* Cancel all requests on a specific fd */
+io_uring_prep_cancel_fd(sqe, fd,
+    IORING_ASYNC_CANCEL_FD | IORING_ASYNC_CANCEL_ALL);
+
+/* Cancel all pending requests in the ring */
+io_uring_prep_cancel(sqe, NULL,
+    IORING_ASYNC_CANCEL_ANY | IORING_ASYNC_CANCEL_ALL);
+.EE
+.in
+.SS Race conditions
+Cancelation is inherently racy. Between submitting the cancel request
+and the kernel processing it:
+.IP \(bu 2
+The target request may complete successfully
+.IP \(bu
+The target request may fail for another reason
+.IP \(bu
+The target request may already be in a non-cancelable state
+.PP
+Applications must handle these cases:
+.PP
+.in +4n
+.EX
+io_uring_wait_cqe(ring, &cqe);
+
+if (cqe->user_data == cancel_user_data) {
+    /* This is the cancel operation's result */
+    if (cqe->res == -ENOENT) {
+        /* Request already completed or not found */
+    } else if (cqe->res == -EALREADY) {
+        /* Request was found but completing */
+    } else if (cqe->res >= 0) {
+        /* Successfully canceled res requests */
+    }
+} else {
+    /* This is the original request's result */
+    if (cqe->res == -ECANCELED) {
+        /* Request was canceled */
+    } else {
+        /* Request completed normally (or with error) */
+    }
+}
+.EE
+.in
+.SS Link timeouts
+For timing out a single operation, link timeouts are often simpler
+than explicit cancelation. See
+.BR io_uring_linked_requests (7)
+for details:
+.PP
+.in +4n
+.EX
+sqe = io_uring_get_sqe(ring);
+io_uring_prep_read(sqe, fd, buf, len, 0);
+sqe->flags |= IOSQE_IO_LINK;
+
+sqe = io_uring_get_sqe(ring);
+io_uring_prep_link_timeout(sqe, &timeout, 0);
+.EE
+.in
+.PP
+The kernel handles the cancelation automatically if the timeout
+expires.
+.SS Canceling multishot requests
+Multishot requests (see
+.BR io_uring_multishot (7))
+continue generating completions until canceled or an error occurs.
+To stop a multishot request:
+.PP
+.in +4n
+.EX
+/* Cancel a multishot accept */
+io_uring_prep_cancel64(sqe, accept_user_data, 0);
+.EE
+.in
+.PP
+After cancelation:
+.IP \(bu 2
+The multishot generates a final CQE with
+.B -ECANCELED
+.IP \(bu
+The
+.B IORING_CQE_F_MORE
+flag is not set on this final CQE
+.IP \(bu
+The cancel CQE indicates success
+.SS Canceling by file descriptor
+When a file descriptor is closed (either via
+.BR close (2)
+or
+.BR IORING_OP_CLOSE ),
+pending requests operating on that fd are
+.B not
+automatically canceled. This differs from synchronous I/O behavior
+and is a common source of confusion.
+
+In synchronous I/O, closing a file descriptor is typically the last
+reference to the underlying file, so the close completes any pending
+operations. However, io_uring holds its own reference to the file for
+each pending request. Closing the application's fd does not release
+these references \(em the pending read, recv, or other operation
+continues to hold a reference and will not automatically complete or
+fail.
+
+If an application expects a pending read on an fd to post a completion
+when the fd is closed, that will not happen. The request must be
+explicitly canceled:
+.PP
+.in +4n
+.EX
+/* Cancel all operations on fd before closing */
+sqe = io_uring_get_sqe(ring);
+io_uring_prep_cancel_fd(sqe, fd,
+    IORING_ASYNC_CANCEL_FD | IORING_ASYNC_CANCEL_ALL);
+io_uring_submit(ring);
+
+/* Wait for cancelations, then close */
+.EE
+.in
+.SS Shutdown cancelation
+When an io_uring instance is closed (via
+.BR io_uring_queue_exit (3)
+or closing the ring file descriptor), all pending requests are
+automatically canceled. Manual cancelation before shutdown is not
+required.
+
+However, if the application needs to ensure all requests are completed
+before proceeding (e.g., to process their results or free associated
+resources), explicit cancelation can be used:
+.PP
+.in +4n
+.EX
+/* Cancel everything */
+sqe = io_uring_get_sqe(ring);
+io_uring_prep_cancel(sqe, NULL,
+    IORING_ASYNC_CANCEL_ANY | IORING_ASYNC_CANCEL_ALL);
+io_uring_submit(ring);
+
+/* Wait for all CQEs */
+while (pending_count > 0) {
+    io_uring_wait_cqe(ring, &cqe);
+    pending_count--;
+    io_uring_cqe_seen(ring, cqe);
+}
+.EE
+.in
+.SS Synchronous cancelation
+For cases where the application needs to cancel requests and wait for
+the cancelation to complete in a single blocking call,
+.BR io_uring_register_sync_cancel (3)
+provides a synchronous interface:
+.PP
+.in +4n
+.EX
+struct io_uring_sync_cancel_reg reg = {
+    .addr = user_data,
+    .timeout.tv_sec = 5,
+};
+
+ret = io_uring_register_sync_cancel(ring, &reg);
+.EE
+.in
+.PP
+This blocks until the matching request is canceled or the timeout
+expires. It is useful when the application cannot easily integrate
+asynchronous cancelation into its event loop.
+.SH NOTES
+.IP \(bu 2
+Not all operations are cancelable. Operations that have already
+been submitted to hardware (e.g., disk I/O in progress) typically
+cannot be canceled.
+.IP \(bu
+Cancelation is asynchronous. The cancel request itself may take
+time to complete.
+.IP \(bu
+When using
+.BR IORING_ASYNC_CANCEL_ALL ,
+the cancel CQE's
+.I res
+field contains the count of canceled requests.
+.IP \(bu
+Fixed files can be canceled using
+.B IORING_ASYNC_CANCEL_FD_FIXED
+with the file index instead of a regular fd.
+.IP \(bu
+Poll operations and multishot requests are generally good candidates
+for cancelation. Completed disk I/O is not.
+.SH SEE ALSO
+.BR io_uring (7),
+.BR io_uring_linked_requests (7),
+.BR io_uring_multishot (7),
+.BR io_uring_prep_cancel (3),
+.BR io_uring_prep_cancel64 (3),
+.BR io_uring_prep_cancel_fd (3),
+.BR io_uring_prep_link_timeout (3),
+.BR io_uring_register_sync_cancel (3)

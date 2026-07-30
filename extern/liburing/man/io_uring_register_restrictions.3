@@ -1,0 +1,53 @@
+.\" Copyright (C) 2025 Jens Axboe <axboe@kernel.dk>
+.\"
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_register_restrictions 3 "January 18, 2025" "liburing-2.4" "liburing Manual"
+.SH NAME
+io_uring_register_restrictions \- register restrictions with io_uring
+.SH SYNOPSIS
+.nf
+.B #include <liburing.h>
+.PP
+.BI "int io_uring_register_restrictions(struct io_uring *" ring ","
+.BI "                                   struct io_uring_restriction *" res ","
+.BI "                                   unsigned int " nr_res ");"
+.fi
+.SH DESCRIPTION
+.PP
+The
+.BR io_uring_register_restrictions (3)
+function registers restrictions with the io_uring instance specified by
+.IR ring .
+The
+.I res
+argument is a pointer to an array of
+.I struct io_uring_restriction
+of
+.I nr_res
+entries.
+
+Restrictions allow limiting which opcodes, register operations, or SQE flags
+are allowed on a ring. This can be used to sandbox io_uring usage.
+
+Restrictions can only be registered if the io_uring ring was started in a
+disabled state (with
+.B IORING_SETUP_R_DISABLED
+specified in the call to
+.BR io_uring_setup (2)).
+All restrictions must be registered in a single call before enabling the
+ring with
+.BR io_uring_enable_rings (3).
+
+See
+.BR io_uring_register (2)
+for a description of the
+.B IORING_REGISTER_RESTRICTIONS
+operation and the restriction structure.
+
+.SH RETURN VALUE
+Returns 0 on success. On error, a negative errno value is returned.
+.SH SEE ALSO
+.BR io_uring_enable_rings (3),
+.BR io_uring_register (2),
+.BR io_uring_setup (2)

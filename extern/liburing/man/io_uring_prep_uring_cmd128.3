@@ -1,0 +1,38 @@
+.\" Copyright (C) 2022 Samuel Williams
+.\"
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_prep_uring_cmd128 3 "October 22, 2025" "liburing-2.13" "liburing Manual"
+.SH NAME
+io_uring_prep_uring_cmd128 \- prepare a uring_cmd request
+.SH SYNOPSIS
+.nf
+.B #include <liburing.h>
+.PP
+.BI "void io_uring_prep_uring_cmd128(struct io_uring_sqe *" sqe ","
+.BI "                                           int " cmd_op ","
+.BI "                                           int " fd ");"
+.fi
+.SH DESCRIPTION
+.PP
+The
+.BR io_uring_prep_uring_cmd128 (3)
+function prepares uring_cmd (fd specific) request for a 128 byte submission
+queue entry. The submission queue entry
+.I sqe
+is setup to use the filedescriptor
+.I fd
+to send file descriptor specific
+.IR cmd_op .
+
+The reserved fields are initialized to 0. Otherwise the caller has to set up
+any submission queue entry's operation specific fields.
+
+.SH RETURN VALUE
+None
+.SH ERRORS
+None
+.SH SEE ALSO
+.BR io_uring_prep_uring_cmd (3),
+.BR io_uring_get_sqe (3),
+.BR io_uring_submit (3),

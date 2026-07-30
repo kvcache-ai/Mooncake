@@ -1,0 +1,51 @@
+name: Build and Run Tests
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+
+concurrency:
+  group: test-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os:
+          - ubuntu-latest
+          # - macos-latest
+          # - windows-latest
+        cmake:
+          - '4.0'
+          - '3.31'
+      fail-fast: false
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout Project
+        uses: actions/checkout@v4
+      - name: Setup cmake
+        uses: jwlawson/actions-setup-cmake@802fa1a2c4e212495c05bf94dba2704a92a472be  # v2.0.2
+        with:
+          cmake-version: ${{ matrix.cmake }}
+      - name: Setup Ninja
+        uses: seanmiddleditch/gha-setup-ninja@3b1f8f94a2f8254bd26914c4ab9474d4f0015f67  # v6
+      - name: Configure CMake
+        run: |
+          cmake -B build -G Ninja \
+            -D CMAKE_CXX_COMPILER=clang++ \
+            -D CMAKE_BUILD_TYPE=Release \
+            -D GFLAGS_BUILD_SHARED_LIBS=ON \
+            -D GFLAGS_BUILD_STATIC_LIBS=ON \
+            -D GFLAGS_BUILD_TESTING=ON
+      - name: Build Tests
+        run: cmake --build build --config Release
+      - name: Run Tests
+        run: cd build && ctest

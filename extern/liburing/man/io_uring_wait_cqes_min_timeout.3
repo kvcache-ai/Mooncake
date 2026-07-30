@@ -1,0 +1,76 @@
+.\" Copyright (C) 2024 Jens Axboe <axboe@kernel.dk>
+.\"
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_wait_cqes_min_timeout 3 "Feb 13, 2024" "liburing-2.8" "liburing Manual"
+.SH NAME
+io_uring_wait_cqes_min_timeout \- wait for completions with both batch and normal timeout
+.SH SYNOPSIS
+.nf
+.B #include <liburing.h>
+.PP
+.BI "int io_uring_wait_cqes_min_timeout(struct io_uring *" ring ","
+.BI "                                   struct io_uring_cqe **" cqe_ptr ","
+.BI "                                   unsigned " wait_nr ","
+.BI "                                   struct __kernel_timespec *" ts ","
+.BI "                                   unsigned int " min_wait_usec ",
+.BI "                                   sigset_t *" sigmask ");"
+.fi
+.SH DESCRIPTION
+.PP
+The
+.BR io_uring_wait_cqes_min_timeout (3)
+waits for completions from the submission queue belonging to the
+.I ring
+and waits for
+.I wait_nr
+completion events, or until the timeout
+.I ts
+expires. The completion events are stored in the
+.I cqe_ptr
+array. If non-zero,
+.I min_wait_usec
+denotes a timeout for the
+.I wait_nr
+batch.
+
+The
+.I sigmask
+specifies the set of signals to block. If set, it is equivalent to atomically
+executing the following calls:
+.PP
+.in +4n
+.EX
+sigset_t origmask;
+
+pthread_sigmask(SIG_SETMASK, &sigmask, &origmask);
+ret = io_uring_wait_cqes_min_timeout(ring, cqe, wait_nr, ts, min_wait, NULL);
+pthread_sigmask(SIG_SETMASK, &origmask, NULL);
+.EE
+.in
+.PP
+This works like
+.BR io_uring_submit_and_wait_min_timeout (3)
+except that it doesn't submit requests. See that man page for a description
+for how the min timeout waiting works.
+
+Available since 6.12.
+
+.SH RETURN VALUE
+On success
+.BR io_uring_wait_cqes_min_timeout (3)
+returns the 0.On failure it returns
+.BR -errno .
+If the kernel doesn't support this functionality,
+.BR -EINVAL
+will be returned. See note on the feature flag.
+The most common failure case is not receiving a completion within the specified
+timeout,
+.B -ETIME
+is returned in this case.
+.SH SEE ALSO
+.BR io_uring_wait_cqe (3),
+.BR io_uring_wait_cqes (3),
+.BR io_uring_wait_cqe_timeout (3),
+.BR io_uring_wait_cqes (3),
+.BR io_uring_submit_and_wait_min_timeout (3)

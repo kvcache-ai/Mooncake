@@ -27,9 +27,6 @@
 #include "master_metric_manager.h"
 #include "common.h"
 #include "segment.h"
-#ifdef USE_HTTP
-#include "transfer_metadata_plugin.h"
-#endif
 #ifdef USE_NOF
 #include "spdk/spdk_wrapper.h"
 #endif
@@ -10595,13 +10592,13 @@ void MasterService::setHttpMetadataServer(HttpMetadataServer* server) {
 void MasterService::setHttpMetadataRemoteUrl(
     const std::string& metadata_connstring) {
 #ifdef USE_HTTP
-    // Only http(s) is supported; guard the scheme to avoid
-    // MetadataStoragePlugin::Create()'s LOG(FATAL) on other backends.
+    // Keep remote cleanup on Store's coro HTTP stack so the Master has no
+    // Transfer Engine or curl dependency.
     if (metadata_connstring.rfind("http://", 0) == 0 ||
         metadata_connstring.rfind("https://", 0) == 0) {
         try {
             http_metadata_remote_ =
-                MetadataStoragePlugin::Create(metadata_connstring);
+                std::make_shared<HttpMetadataClient>(metadata_connstring);
             LOG(INFO) << "HTTP metadata cleanup on client timeout: enabled "
                          "(remote metadata server "
                       << metadata_connstring << ")";
@@ -10691,14 +10688,14 @@ void MasterService::HttpMetadataCleanupThreadFunc() {
             bool ram_removed = false;
             bool rpc_removed = false;
             try {
-                ram_removed = http_metadata_remote_->remove(ram_key);
+                ram_removed = http_metadata_remote_->removeKey(ram_key);
             } catch (const std::exception& e) {
                 LOG(WARNING)
                     << "Remote HTTP metadata cleanup failed for ram_key: "
                     << ram_key << ": " << e.what();
             }
             try {
-                rpc_removed = http_metadata_remote_->remove(rpc_key);
+                rpc_removed = http_metadata_remote_->removeKey(rpc_key);
             } catch (const std::exception& e) {
                 LOG(WARNING)
                     << "Remote HTTP metadata cleanup failed for rpc_key: "

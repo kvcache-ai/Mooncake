@@ -27,8 +27,10 @@ DEFINE_bool(start_offload_rpc_server, true,
             "(batch_get_offload_object / release_offload_buffer). "
             "Effective only when --enable_offload is true. "
             "Disable for a write-only owner.");
-DECLARE_bool(enable_http_server);
-DECLARE_int32(http_port);
+DEFINE_bool(enable_http_server, false,
+            "Enable HTTP health and metrics endpoints for the client");
+DEFINE_int32(http_port, 9300,
+             "Port for the client HTTP health and metrics server");
 
 namespace mooncake {
 void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,

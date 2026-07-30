@@ -29,6 +29,10 @@ eggs/
 .eggs/
 lib/
 lib64/
+# Keep the fixed zstd source import visible despite the generic Python lib/
+# packaging ignore above.
+!extern/zstd/lib/
+!extern/zstd/lib/**
 parts/
 sdist/
 var/

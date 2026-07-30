@@ -7,9 +7,7 @@ target_include_directories(
             $<INSTALL_INTERFACE:include>)
 target_compile_features(tent_interface INTERFACE cxx_std_20)
 
-if(TARGET asio_shared)
-  target_link_libraries(tent_interface INTERFACE asio_shared)
-endif()
+target_link_libraries(tent_interface INTERFACE Mooncake::asio)
 
 # CUDA
 if(USE_CUDA)
@@ -66,16 +64,13 @@ else()
 endif()
 
 # io_uring
-find_library(URING_LIB uring PATHS /usr/lib /usr/lib64 /usr/local/lib
-                                   /usr/local/lib64)
-find_path(URING_INCLUDE liburing.h PATHS /usr/include /usr/local/include)
-if(URING_LIB AND URING_INCLUDE)
-  message(STATUS "Uring: Enabled")
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+  mooncake_enable_bundled_liburing()
+  message(STATUS "Uring: Enabled (bundled liburing)")
   target_compile_definitions(tent_interface INTERFACE USE_URING)
-  target_include_directories(tent_interface INTERFACE ${URING_INCLUDE})
-  target_link_libraries(tent_interface INTERFACE ${URING_LIB})
+  target_link_libraries(tent_interface INTERFACE Mooncake::uring)
 else()
-  message(STATUS "Uring: Disabled")
+  message(STATUS "Uring: Disabled (unsupported platform)")
 endif()
 
 if(USE_SUNRISE)

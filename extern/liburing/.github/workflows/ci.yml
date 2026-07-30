@@ -1,0 +1,331 @@
+name: CI
+
+on:
+  # Trigger the workflow on push or pull requests.
+  push:
+  pull_request:
+
+
+jobs:
+  get_commit_list:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get commit list
+        id: get_commit_list
+        run: |
+          git config core.abbrev 12;
+          ( \
+            ( \
+              git log --pretty="%h" --reverse ${{github.event.commits[0].id}}^...${{github.sha}} || \
+              (printf "%s" ${{github.sha}} | head -c 12) \
+            ) | awk '{ print "id" NR "=" $1 }' \
+          ) > $GITHUB_OUTPUT;
+          echo "List of tested commits:" > $GITHUB_STEP_SUMMARY;
+          cat $GITHUB_OUTPUT >> $GITHUB_STEP_SUMMARY;
+
+    outputs:
+      commit_list: ${{ toJson(steps.*.outputs.*) }}
+
+
+  build:
+    needs: get_commit_list
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        commit: ${{ fromJson(needs.get_commit_list.outputs.commit_list) }}
+        build_args:
+          # x86-64 gcc
+          - arch: x86_64
+            cc_pkg: gcc-x86-64-linux-gnu
+            cxx_pkg: g++-x86-64-linux-gnu
+            cc: x86_64-linux-gnu-gcc
+            cxx: x86_64-linux-gnu-g++
+            sanitize: 0
+            tsan: 0
+
+          # x86-64 gcc asan
+          - arch: x86_64
+            cc_pkg: gcc-x86-64-linux-gnu
+            cxx_pkg: g++-x86-64-linux-gnu
+            cc: x86_64-linux-gnu-gcc
+            cxx: x86_64-linux-gnu-g++
+            sanitize: 1
+            tsan: 0
+
+          # x86-64 clang asan
+          - arch: x86_64
+            cc_pkg: clang
+            cxx_pkg: clang
+            cc: clang
+            cxx: clang++
+            sanitize: 1
+            tsan: 0
+
+          # x86-64 clang tsan
+          - arch: x86_64
+            cc_pkg: clang
+            cxx_pkg: clang
+            cc: clang
+            cxx: clang++
+            sanitize: 0
+            tsan: 1
+
+          # x86-64 clang
+          - arch: x86_64
+            cc_pkg: clang
+            cxx_pkg: clang
+            cc: clang
+            cxx: clang++
+            liburing_extra_flags: -Wshorten-64-to-32
+            extra_flags: -Wmissing-prototypes -Wstrict-prototypes -Wunreachable-code-loop-increment -Wunreachable-code -Wmissing-variable-declarations -Wextra-semi-stmt
+            sanitize: 0
+            tsan: 0
+
+          # x86 (32-bit) gcc
+          - arch: i686
+            cc_pkg: gcc-i686-linux-gnu
+            cxx_pkg: g++-i686-linux-gnu
+            cc: i686-linux-gnu-gcc
+            cxx: i686-linux-gnu-g++
+            sanitize: 0
+            tsan: 0
+
+          # aarch64 gcc
+          - arch: aarch64
+            cc_pkg: gcc-aarch64-linux-gnu
+            cxx_pkg: g++-aarch64-linux-gnu
+            cc: aarch64-linux-gnu-gcc
+            cxx: aarch64-linux-gnu-g++
+            sanitize: 0
+            tsan: 0
+
+          # arm (32-bit) gcc
+          - arch: arm
+            cc_pkg: gcc-arm-linux-gnueabi
+            cxx_pkg: g++-arm-linux-gnueabi
+            cc: arm-linux-gnueabi-gcc
+            cxx: arm-linux-gnueabi-g++
+            sanitize: 0
+            tsan: 0
+
+          # riscv64
+          - arch: riscv64
+            cc_pkg: gcc-riscv64-linux-gnu
+            cxx_pkg: g++-riscv64-linux-gnu
+            cc: riscv64-linux-gnu-gcc
+            cxx: riscv64-linux-gnu-g++
+            sanitize: 0
+            tsan: 0
+
+          # powerpc64
+          - arch: powerpc64
+            cc_pkg: gcc-powerpc64-linux-gnu
+            cxx_pkg: g++-powerpc64-linux-gnu
+            cc: powerpc64-linux-gnu-gcc
+            cxx: powerpc64-linux-gnu-g++
+            sanitize: 0
+            tsan: 0
+
+          # powerpc
+          - arch: powerpc
+            cc_pkg: gcc-powerpc-linux-gnu
+            cxx_pkg: g++-powerpc-linux-gnu
+            cc: powerpc-linux-gnu-gcc
+            cxx: powerpc-linux-gnu-g++
+            sanitize: 0
+            tsan: 0
+
+          # alpha
+          - arch: alpha
+            cc_pkg: gcc-alpha-linux-gnu
+            cxx_pkg: g++-alpha-linux-gnu
+            cc: alpha-linux-gnu-gcc
+            cxx: alpha-linux-gnu-g++
+            sanitize: 0
+            tsan: 0
+
+          # mips64
+          - arch: mips64
+            cc_pkg: gcc-mips64-linux-gnuabi64
+            cxx_pkg: g++-mips64-linux-gnuabi64
+            cc: mips64-linux-gnuabi64-gcc
+            cxx: mips64-linux-gnuabi64-g++
+            sanitize: 0
+            tsan: 0
+
+          # mips
+          - arch: mips
+            cc_pkg: gcc-mips-linux-gnu
+            cxx_pkg: g++-mips-linux-gnu
+            cc: mips-linux-gnu-gcc
+            cxx: mips-linux-gnu-g++
+            sanitize: 0
+            tsan: 0
+
+          # hppa
+          - arch: hppa
+            cc_pkg: gcc-hppa-linux-gnu
+            cxx_pkg: g++-hppa-linux-gnu
+            cc: hppa-linux-gnu-gcc
+            cxx: hppa-linux-gnu-g++
+            sanitize: 0
+            tsan: 0
+
+    env:
+      FLAGS: -g -O3 -Wall -Wextra -Werror -Wno-sign-compare ${{matrix.build_args.extra_flags}}
+      SANITIZE: ${{matrix.build_args.sanitize}}
+      THREAD_SANITIZE: ${{matrix.build_args.tsan}}
+
+      # Flags for building sources in src/ dir only.
+      LIBURING_CFLAGS: ${{matrix.build_args.liburing_extra_flags}}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout commit
+        run: |
+          git checkout ${{ matrix.commit }};
+
+      - name: Install Compilers
+        run: |
+          sudo apt-get update -y;
+          sudo apt-get install -y ${{matrix.build_args.cc_pkg}} ${{matrix.build_args.cxx_pkg}};
+
+      - name: Display compiler versions
+        run: |
+          ${{matrix.build_args.cc}} --version;
+          ${{matrix.build_args.cxx}} --version;
+
+      - name: Build
+        if: ${{matrix.build_args.sanitize == '0' && matrix.build_args.tsan == '0'}}
+        run: |
+          ./configure --cc=${{matrix.build_args.cc}} --cxx=${{matrix.build_args.cxx}};
+          make -j$(nproc) V=1 CPPFLAGS="-Werror" CFLAGS="$FLAGS" CXXFLAGS="$FLAGS";
+
+      - name: Build
+        if: ${{matrix.build_args.sanitize == '1'}}
+        run: |
+          ./configure --cc=${{matrix.build_args.cc}} --cxx=${{matrix.build_args.cxx}} --enable-sanitizer;
+          make -j$(nproc) V=1 CPPFLAGS="-Werror" CFLAGS="$FLAGS" CXXFLAGS="$FLAGS";
+
+      - name: Build
+        if: ${{matrix.build_args.tsan == '1'}}
+        run: |
+          ./configure --cc=${{matrix.build_args.cc}} --cxx=${{matrix.build_args.cxx}} --enable-tsan;
+          make -j$(nproc) V=1 CPPFLAGS="-Werror" CFLAGS="$FLAGS" CXXFLAGS="$FLAGS";
+
+      - name: Test install command
+        run: |
+          sudo make install;
+
+      - name: Test build against the installed liburing
+        run: |
+          export TEST_FILE=".github/workflows/test_build.c";
+          if [ "$SANITIZE" -eq "1" ]; then
+            export SANITIZE_FLAGS="-fsanitize=address,undefined";
+          elif [ "$THREAD_SANITIZE" -eq "1" ]; then
+            export SANITIZE_FLAGS="-fsanitize=thread";
+          else
+            export SANITIZE_FLAGS="";
+          fi;
+          ${{matrix.build_args.cc}} -x c -o a.out $TEST_FILE -luring $SANITIZE_FLAGS;
+          ${{matrix.build_args.cxx}} -x c++ -o a.out $TEST_FILE -luring $SANITIZE_FLAGS;
+
+
+  alpine-musl-build:
+    needs: get_commit_list
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        commit: ${{ fromJson(needs.get_commit_list.outputs.commit_list) }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Checkout commit
+        run: |
+          git checkout ${{ matrix.commit }};
+
+      - name: Setup Alpine Environment
+        uses: jirutka/setup-alpine@v1
+        with:
+          branch: v3.15
+
+      - name: Display Alpine version
+        shell: alpine.sh {0}
+        run: cat /etc/alpine-release;
+
+      - name: Install build dependencies
+        shell: alpine.sh --root {0}
+        run: |
+          apk add --no-cache build-base musl-dev linux-headers;
+
+      - name: Build
+        shell: alpine.sh {0}
+        run: |
+          ./configure --cc=gcc --cxx=g++;
+          make -j$(nproc) V=1 CPPFLAGS="-Werror" CFLAGS="$FLAGS" CXXFLAGS="$FLAGS";
+
+      - name: Test install command
+        shell: alpine.sh --root {0}
+        run: |
+          make install;
+
+      - name: Test build against the installed liburing
+        shell: alpine.sh {0}
+        run: |
+          export TEST_FILE=".github/workflows/test_build.c";
+          gcc -x c -o a.out $TEST_FILE -luring;
+          g++ -x c++ -o a.out $TEST_FILE -luring;
+
+
+  codespell:
+    needs: get_commit_list
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        commit: ${{ fromJson(needs.get_commit_list.outputs.commit_list) }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Install codespell
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y codespell
+
+      - name: Display codespell version
+        run: codespell --version
+
+      - name: Execute codespell
+        run: codespell --ignore-words=.github/actions/codespell/stopwords .
+
+
+  shellcheck:
+    needs: get_commit_list
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        commit: ${{ fromJson(needs.get_commit_list.outputs.commit_list) }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Display shellcheck version
+        run: shellcheck --version
+
+      - name: Shellcheck execution
+        run: shellcheck test/runtest*.sh

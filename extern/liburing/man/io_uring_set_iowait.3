@@ -1,0 +1,57 @@
+.\" Copyright (C) 2025 Jens Axboe <axboe@kernel.dk>
+.\" Copyright (C) 2025 Ammar Faizi <ammarfaizi2@gnuweeb.org>
+.\"
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_set_iowait 3 "July 27, 2025" "liburing-2.12" "liburing Manual"
+.SH NAME
+io_uring_set_iowait \- toggle of iowait usage when waiting on CQEs
+.SH SYNOPSIS
+.nf
+.B #include <liburing.h>
+.PP
+.BI "int io_uring_set_iowait(struct io_uring *" ring ",
+.BI "                        bool " enable_iowait ");"
+.fi
+.SH DESCRIPTION
+.PP
+By default, io_uring marks a waiting task as being in iowait if it's
+sleeping waiting on events and there are pending requests. This isn't
+necessarily always useful, and may be confusing on non-storage setups
+where iowait isn't expected. It can also cause extra power usage by
+preventing the CPU from entering lower sleep states.
+
+The
+.BR io_uring_set_iowait (3)
+function allows the user to toggle this behavior. If
+.BI enable_iowait
+is set to true, the iowait behavior is enabled. If it is set to false,
+the iowait behavior is disabled. The iowait behavior is enabled by
+default when a ring is created.
+
+If the iowait is disabled, the submit functions will set
+.B IORING_ENTER_NO_IOWAIT
+in the
+.BI flags
+argument to
+.BR io_uring_enter (2).
+
+If the kernel supports this feature, it will be marked by having
+the
+.B IORING_FEAT_NO_IOWAIT
+feature flag set.
+
+Available since kernel 6.15.
+
+
+.SH RETURN VALUE
+On success,
+.BR io_uring_set_iowait (3)
+returns 0. On failure, it returns
+.BR -EOPNOTSUPP .
+
+
+.SH SEE ALSO
+.BR io_uring_enter (2),
+.BR io_uring_submit (3),
+.BR io_uring_submit_and_wait (3)

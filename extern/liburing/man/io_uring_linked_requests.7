@@ -1,0 +1,271 @@
+.\" Copyright (C) 2025 Jens Axboe <axboe@kernel.dk>
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_linked_requests 7 "January 18, 2025" "Linux" "Linux Programmer's Manual"
+.SH NAME
+io_uring_linked_requests \- io_uring linked requests overview
+.SH DESCRIPTION
+Linked requests allow applications to chain multiple io_uring operations
+together, creating dependencies between them. When requests are linked,
+they execute sequentially rather than concurrently, with each request
+starting only after the previous one in the chain completes.
+.SS Why use linked requests?
+Normal io_uring submissions are independent and may execute in any order
+or concurrently. However, some operations have natural dependencies:
+.IP \(bu 2
+Read from one file, then write to another
+.IP \(bu
+Connect to a server, then send a request
+.IP \(bu
+Accept a connection, then receive data
+.IP \(bu
+Perform an operation with a timeout
+.PP
+Without linking, applications would need to wait for completions and
+submit follow-up requests manually. Linked requests allow the entire
+chain to be submitted at once, reducing round trips between user space
+and the kernel.
+
+Linked requests are most beneficial when:
+.IP \(bu 2
+Operations must execute in a specific order
+.IP \(bu
+Later operations depend on earlier ones succeeding
+.IP \(bu
+You want to attach a timeout to an operation
+.IP \(bu
+Reducing submission latency is important
+.SS Creating linked requests
+Requests are linked by setting the
+.B IOSQE_IO_LINK
+flag on a request. This links it to the next request in the submission.
+The chain continues until a request without the link flag is encountered.
+.PP
+.in +4n
+.EX
+struct io_uring_sqe *sqe;
+
+/* First request in chain */
+sqe = io_uring_get_sqe(ring);
+io_uring_prep_read(sqe, fd_in, buf, len, 0);
+sqe->flags |= IOSQE_IO_LINK;
+
+/* Second request, linked to first */
+sqe = io_uring_get_sqe(ring);
+io_uring_prep_write(sqe, fd_out, buf, len, 0);
+sqe->flags |= IOSQE_IO_LINK;
+
+/* Third request, end of chain (no link flag) */
+sqe = io_uring_get_sqe(ring);
+io_uring_prep_fsync(sqe, fd_out, 0);
+
+io_uring_submit(ring);
+.EE
+.in
+.PP
+In this example, the read completes first, then the write, then the
+fsync. Each operation waits for the previous one to complete before
+starting.
+.SS Soft links vs hard links
+There are two types of links, which differ in how they handle errors:
+.PP
+.B Soft links (IOSQE_IO_LINK)
+.RS 4
+If a request in the chain fails (returns a negative error code), all
+subsequent requests in the chain are canceled with
+.BR -ECANCELED .
+This is useful when later operations depend on earlier ones succeeding.
+.RE
+.PP
+.B Hard links (IOSQE_IO_HARDLINK)
+.RS 4
+The chain continues executing even if a request fails. Each request
+runs regardless of the outcome of previous requests. This is useful
+when you want to attempt all operations even if some fail.
+.RE
+.PP
+.in +4n
+.EX
+/* Soft link: write is canceled if read fails */
+sqe = io_uring_get_sqe(ring);
+io_uring_prep_read(sqe, fd, buf, len, 0);
+sqe->flags |= IOSQE_IO_LINK;
+
+sqe = io_uring_get_sqe(ring);
+io_uring_prep_write(sqe, fd2, buf, len, 0);
+
+/* Hard link: write runs even if read fails */
+sqe = io_uring_get_sqe(ring);
+io_uring_prep_read(sqe, fd, buf, len, 0);
+sqe->flags |= IOSQE_IO_HARDLINK;
+
+sqe = io_uring_get_sqe(ring);
+io_uring_prep_write(sqe, fd2, buf, len, 0);
+.EE
+.in
+.SS Link timeouts
+A common use of linked requests is to add a timeout to an operation.
+The
+.B IORING_OP_LINK_TIMEOUT
+operation (set up with
+.BR io_uring_prep_link_timeout (3))
+is designed specifically for this:
+.PP
+.in +4n
+.EX
+struct __kernel_timespec ts = { .tv_sec = 5, .tv_nsec = 0 };
+
+/* The operation to be timed */
+sqe = io_uring_get_sqe(ring);
+io_uring_prep_read(sqe, fd, buf, len, 0);
+sqe->flags |= IOSQE_IO_LINK;
+
+/* The timeout, linked to the read */
+sqe = io_uring_get_sqe(ring);
+io_uring_prep_link_timeout(sqe, &ts, 0);
+
+io_uring_submit(ring);
+.EE
+.in
+.PP
+If the read completes before the timeout:
+.IP \(bu 2
+The read CQE has the actual result
+.IP \(bu
+The timeout CQE has
+.B -ECANCELED
+.PP
+If the timeout expires first:
+.IP \(bu 2
+The read CQE has
+.B -ECANCELED
+(or
+.B -EINTR
+if it was in progress)
+.IP \(bu
+The timeout CQE has
+.B -ETIME
+.PP
+Link timeouts only apply to the immediately preceding request in the
+chain. To timeout an entire chain, the timeout must be linked after
+the last operation.
+.SS Completion ordering
+Each request in a linked chain generates its own CQE. Completions for
+linked requests are ordered \(em the CQE for an earlier request in the
+chain will be posted before the CQE for a later request.
+
+Applications can rely on this ordering when processing completions.
+However, if other unlinked requests are in flight, their completions
+may be interleaved with the chain's completions.
+.SS Error handling
+For soft-linked chains, error handling is straightforward:
+.IP \(bu 2
+Check each CQE's result
+.IP \(bu
+If a request failed, all subsequent requests will have
+.B -ECANCELED
+.IP \(bu
+The first non-canceled error indicates where the chain broke
+.PP
+.in +4n
+.EX
+/* Processing a linked chain's completions */
+for (int i = 0; i < chain_length; i++) {
+    io_uring_wait_cqe(ring, &cqe);
+
+    if (cqe->res == -ECANCELED) {
+        /* Previous request in chain failed */
+    } else if (cqe->res < 0) {
+        /* This request failed, caused chain break */
+        handle_error(cqe->res);
+    } else {
+        /* Success */
+        handle_success(cqe->res);
+    }
+
+    io_uring_cqe_seen(ring, cqe);
+}
+.EE
+.in
+.SS Common patterns
+.PP
+.B Copy with sync:
+.RS 4
+Read data, write it elsewhere, then sync:
+.PP
+.in +4n
+.EX
+io_uring_prep_read(sqe1, src_fd, buf, len, 0);
+sqe1->flags |= IOSQE_IO_LINK;
+
+io_uring_prep_write(sqe2, dst_fd, buf, len, 0);
+sqe2->flags |= IOSQE_IO_LINK;
+
+io_uring_prep_fsync(sqe3, dst_fd, 0);
+.EE
+.in
+.RE
+.PP
+.B Connect with timeout:
+.RS 4
+Attempt connection with a time limit:
+.PP
+.in +4n
+.EX
+io_uring_prep_connect(sqe1, sockfd, addr, addrlen);
+sqe1->flags |= IOSQE_IO_LINK;
+
+io_uring_prep_link_timeout(sqe2, &timeout, 0);
+.EE
+.in
+.RE
+.PP
+.B Send after connect:
+.RS 4
+Connect then immediately send data:
+.PP
+.in +4n
+.EX
+io_uring_prep_connect(sqe1, sockfd, addr, addrlen);
+sqe1->flags |= IOSQE_IO_LINK;
+
+io_uring_prep_send(sqe2, sockfd, data, len, 0);
+.EE
+.in
+.RE
+.SH NOTES
+.IP \(bu 2
+Linked requests must be submitted together in the same
+.BR io_uring_submit (3)
+call. The chain is defined by the order of SQEs in the submission.
+.IP \(bu
+The link flag on the last request in a chain is ignored (it has
+nothing to link to).
+.IP \(bu
+Chains can be arbitrarily long, limited only by SQ ring size.
+.IP \(bu
+Mixing
+.B IOSQE_IO_LINK
+and
+.B IOSQE_IO_HARDLINK
+in the same chain is allowed. Each link's type determines what happens
+if that specific request fails.
+.IP \(bu
+Linked requests share the same
+.I personality
+if set, allowing credential inheritance through the chain.
+.IP \(bu
+If a request in a chain is canceled (e.g., via
+.BR io_uring_prep_cancel (3)),
+the chain breaks as if that request had failed.
+.IP \(bu
+Linked requests have performance implications: they force sequential
+execution, preventing the kernel from optimizing or parallelizing
+operations. Use links only when ordering is required. For independent
+operations, submitting them without links allows the kernel to execute
+them concurrently or reorder them for better performance.
+.SH SEE ALSO
+.BR io_uring (7),
+.BR io_uring_prep_link_timeout (3),
+.BR io_uring_prep_cancel (3),
+.BR io_uring_sqe_set_flags (3)

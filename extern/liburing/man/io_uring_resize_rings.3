@@ -1,0 +1,116 @@
+.\" Copyright (C) 2022 Jens Axboe <axboe@kernel.dk>
+.\"
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_resize_rings 3 "October 29, 2024" "liburing-2.9" "liburing Manual"
+.SH NAME
+io_uring_resize_rings \- resize the SQ and CQ rings
+.SH SYNOPSIS
+.nf
+.B #include <liburing.h>
+.PP
+.BI "int io_uring_resize_rings(struct io_uring *" ring ",
+.BI "                          struct io_uring_params *" p ");
+.PP
+.SH DESCRIPTION
+.PP
+The
+.BR io_uring_resize_rings (3)
+function performs resizes the SQ and/or CQ ring associated with
+.I ring
+by the parameters specified in
+.I p .
+
+The
+.I p
+argument must be filled in with the appropriate information for the resize
+operations, most notably the
+.IR sq_entries
+and
+.IR cq_entries
+fields must be filled out. The
+.IR flags
+field can also be set, see below for potential values that may be used with
+a resize operation.
+
+It's fairly uncommon to need to resize the SQ ring, but not that uncommon
+that the CQ ring would need resizing. For networked workloads, it can be
+hard to appropriately size the CQ ring upfront, as it's not always known what
+load a given ring will see. If overflow conditions are seen for the CQ ring,
+then resizing it larger may be a good idea.
+
+When a ring is resized, any pending SQ or CQ entries are copied along the
+way. It is not legal to resize a CQ ring that is in an overflow condition,
+and attempting to do so will fail.
+
+Currently doesn't support resizing rings setup with
+.B IORING_SETUP_NO_MMAP .
+This is purely a liburing limitation, the kernel does support it.
+
+Also note that ring resizing is currently only supported on rings setup
+with
+.B IORING_SETUP_DEFER_TASKRUN .
+Attempting to resize differently configured rings will result in an
+.BR -EINVAL
+error.
+
+Valid flags in
+.IR flags :
+.TP
+.B IORING_SETUP_CQSIZE
+If this isn't set, then the CQ ring size is set based on the specified
+SQ ring size. The default is twice as many CQ ring entries as there are
+SQ ring entries. If set, then
+.IR cq_entries
+will be used to size the CQ ring.
+.TP
+.B IORING_SETUP_CLAMP
+If set, then SQ and CQ ring entries are clamped to the maximum allowable
+size, if they exceed that. If not set, setting sizes too large will cause
+the operation to fail.
+.PP
+
+Other flags are inherited from the way the ring was setup, that includes flags
+like
+.B IORING_SETUP_NO_SQARRAY ,
+.B IORING_SETUP_SQE128 ,
+.B IORING_SETUP_CQE32 ,
+and
+.B IORING_SETUP_NO_MMAP .
+
+Other fields in
+.IR p
+should be cleared to zero.
+
+Available since kernel 6.13.
+
+Also see
+.BR io_uring_setup (2)
+for a detailed description of the setup flags.
+
+.SH RETURN VALUE
+.PP
+Returns 0 on success, and < 0 on failure. Potential common failure cases:
+.TP
+.B -EEXIST
+Attempting to resize a ring setup with
+.B IORING_SETUP_SINGLE_ISSUER
+and the resizing task is different from the one that created/enabled the ring.
+.TP
+.B -EFAULT
+Copying of
+.I p
+was unsuccessful.
+.TP
+.B -EINVAL
+Invalid flags were specified for the operation
+.TP
+.B -EINVAL
+Attempt to resize a ring not setup with
+.BR IORING_SETUP_DEFER_TASKRUN .
+.TP
+.B -EOVERFLOW
+The values specified for SQ or CQ entries would cause an overflow.
+
+.SH SEE ALSO
+.BR io_uring_setup (2)

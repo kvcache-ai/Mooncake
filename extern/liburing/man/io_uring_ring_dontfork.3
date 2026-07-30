@@ -1,0 +1,36 @@
+.\" Copyright (C) 2025 Jens Axboe <axboe@kernel.dk>
+.\"
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_ring_dontfork 3 "January 18, 2025" "liburing-2.4" "liburing Manual"
+.SH NAME
+io_uring_ring_dontfork \- prevent ring memory from being shared after fork
+.SH SYNOPSIS
+.nf
+.B #include <liburing.h>
+.PP
+.BI "int io_uring_ring_dontfork(struct io_uring *" ring ");"
+.fi
+.SH DESCRIPTION
+.PP
+The
+.BR io_uring_ring_dontfork (3)
+function ensures that the mmap'ed rings for the io_uring instance
+.I ring
+are not available to a child process after a
+.BR fork (2).
+
+This function uses
+.BR madvise (2)
+with
+.B MADV_DONTFORK
+on the mmap'ed ranges to prevent them from being shared with child
+processes. This is useful when the parent wants exclusive access to the
+ring and doesn't want the child to be able to access or interfere with it.
+
+.SH RETURN VALUE
+Returns 0 on success. On error, a negative errno value is returned.
+.SH SEE ALSO
+.BR io_uring_queue_init (3),
+.BR madvise (2),
+.BR fork (2)

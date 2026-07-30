@@ -1,0 +1,39 @@
+.\" Copyright (C) 2025 Jens Axboe <axboe@kernel.dk>
+.\"
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_get_probe_ring 3 "January 18, 2025" "liburing-2.4" "liburing Manual"
+.SH NAME
+io_uring_get_probe_ring \- get probe information from an existing ring
+.SH SYNOPSIS
+.nf
+.B #include <liburing.h>
+.PP
+.BI "struct io_uring_probe *io_uring_get_probe_ring(struct io_uring *" ring ");"
+.fi
+.SH DESCRIPTION
+.PP
+The
+.BR io_uring_get_probe_ring (3)
+function returns probe information for the io_uring instance specified by
+.IR ring .
+This allows the application to determine which opcodes are supported by
+the kernel.
+
+The returned probe structure and must be freed by the application using
+.BR io_uring_free_probe (3)
+when no longer needed.
+
+This function is similar to
+.BR io_uring_get_probe (3),
+except it uses an existing ring instead of creating a temporary one.
+
+.SH RETURN VALUE
+Returns a pointer to an allocated
+.I struct io_uring_probe
+on success, or NULL on failure.
+.SH SEE ALSO
+.BR io_uring_get_probe (3),
+.BR io_uring_free_probe (3),
+.BR io_uring_opcode_supported (3),
+.BR io_uring_register_probe (3)

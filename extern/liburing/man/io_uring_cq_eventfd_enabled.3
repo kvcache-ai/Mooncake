@@ -1,0 +1,38 @@
+.\" Copyright (C) 2025 Jens Axboe <axboe@kernel.dk>
+.\"
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_cq_eventfd_enabled 3 "January 18, 2025" "liburing-2.4" "liburing Manual"
+.SH NAME
+io_uring_cq_eventfd_enabled \- check if eventfd notifications are enabled
+.SH SYNOPSIS
+.nf
+.B #include <liburing.h>
+.PP
+.BI "bool io_uring_cq_eventfd_enabled(const struct io_uring *" ring ");"
+.fi
+.SH DESCRIPTION
+.PP
+The
+.BR io_uring_cq_eventfd_enabled (3)
+function returns whether eventfd notifications are currently enabled for
+the io_uring instance specified by
+.IR ring .
+
+An eventfd can be registered with a ring using
+.BR io_uring_register_eventfd (3)
+or
+.BR io_uring_register_eventfd_async (3).
+Once registered, notifications can be temporarily disabled using
+.BR io_uring_cq_eventfd_toggle (3).
+
+.SH RETURN VALUE
+Returns
+.B true
+if eventfd notifications are enabled, or
+.B false
+if disabled.
+.SH SEE ALSO
+.BR io_uring_register_eventfd (3),
+.BR io_uring_register_eventfd_async (3),
+.BR io_uring_cq_eventfd_toggle (3)

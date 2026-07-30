@@ -1,0 +1,78 @@
+.\" Copyright (C) 2022 Jens Axboe <axboe@kernel.dk>
+.\"
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_prep_futex_waitv 3 "Sep 29, 2023" "liburing-2.5" "liburing Manual"
+.SH NAME
+io_uring_prep_futex_waitv \- prepare a futex waitv request
+.SH SYNOPSIS
+.nf
+.B #include <linux/futex.h>
+.B #include <unistd.h>
+.B #include <liburing.h>
+.PP
+.BI "void io_uring_prep_futex_waitv(struct io_uring_sqe *" sqe ","
+.BI "                               const struct futex_waitv *" futexv ","
+.BI "                               uint32_t " nr_futex ","
+.BI "                               unsigned int " flags ");"
+.fi
+.SH DESCRIPTION
+.PP
+The
+.BR io_uring_prep_futex_waitv (3)
+function prepares a futex wait request for multiple futexes at the same time.
+The submission queue entry
+.I sqe
+is setup for waiting on all futexes given by
+.I futexv
+and
+.I nr_futex
+is the number of futexes in that array.
+.I flags
+must be set to the io_uring specific futex flags.
+
+Unlike
+.BR io_uring_prep_futex_wait (3),
+the desired bitset mask and values are passed in
+.IR futexv .
+
+.I flags
+are currently unused and hence
+.B 0
+must be passed.
+
+This function prepares an async
+.BR futex (2)
+waitv request. See that man page for details.
+
+Available since kernel 6.7.
+
+.SH RETURN VALUE
+None
+.SH ERRORS
+The CQE
+.I res
+field will contain the result of the operation. See the related man page for
+details on possible values. Note that where synchronous system calls will return
+.B -1
+on failure and set
+.I errno
+to the actual error value, io_uring never uses
+.IR errno .
+Instead it returns the negated
+.I errno
+directly in the CQE
+.I res
+field.
+.SH NOTES
+Unlike the sync futex syscalls that wait on a futex, io_uring does not support
+passing in a timeout for the request. Instead, applications are encouraged
+to use a linked timeout to abort the futex request at a given time, if desired.
+.SH SEE ALSO
+.BR io_uring_get_sqe (3),
+.BR io_uring_submit (3),
+.BR io_uring_prep_futex_wait (3),
+.BR io_uring_prep_futex_wake (3),
+.BR io_uring_prep_link_timeout (3),
+.BR futex (2)
+.BR futex2 (2)

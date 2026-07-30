@@ -1,0 +1,238 @@
+.\" Copyright (C) 2025 Jens Axboe <axboe@kernel.dk>
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_registered_buffers 7 "January 18, 2025" "Linux" "Linux Programmer's Manual"
+.SH NAME
+io_uring_registered_buffers \- io_uring registered buffers overview
+.SH DESCRIPTION
+Registered buffers are a performance optimization feature of
+.B io_uring
+that allows applications to pre-register a set of buffers with the kernel.
+When buffers are registered, the kernel pins the memory and creates
+long-term mappings, eliminating the overhead of mapping and unmapping
+buffer memory for each I/O operation.
+.SS Why use registered buffers?
+For every I/O operation that transfers data between user space and the
+kernel, the kernel must perform several operations on the buffer memory:
+.IP \(bu 2
+Verify the memory is accessible to the process
+.IP \(bu
+Pin the pages in memory to prevent them from being swapped out
+.IP \(bu
+Set up kernel mappings to access the memory
+.PP
+These operations, while individually fast, add up when performing many
+small I/O operations. By registering buffers once upfront, these costs
+are paid only once, and subsequent I/O operations can use the pre-mapped
+buffers directly.
+
+Registered buffers are most beneficial for applications that:
+.IP \(bu 2
+Perform many small I/O operations
+.IP \(bu
+Reuse the same buffers repeatedly
+.IP \(bu
+Need the lowest possible per-I/O overhead
+.SS Registering buffers
+Buffers are registered using
+.BR io_uring_register_buffers (3)
+or
+.BR io_uring_register_buffers_tags (3).
+The buffers are described using an array of
+.I struct iovec
+structures:
+.PP
+.in +4n
+.EX
+struct iovec iovecs[2];
+iovecs[0].iov_base = buf1;
+iovecs[0].iov_len = 4096;
+iovecs[1].iov_base = buf2;
+iovecs[1].iov_len = 8192;
+
+ret = io_uring_register_buffers(ring, iovecs, 2);
+.EE
+.in
+.PP
+The buffers must be anonymous memory (allocated via
+.BR malloc (3),
+.BR mmap (2)
+with
+.BR MAP_ANONYMOUS ,
+or similar). File-backed memory is not supported.
+
+There is a limit of 1 GiB per individual buffer. Huge pages are supported
+and the entire huge page will be pinned even if only part of it is used.
+
+The buffers are charged against the user's
+.B RLIMIT_MEMLOCK
+resource limit on kernels before 5.12. On kernel 5.12 and later with
+.B IORING_FEAT_NATIVE_WORKERS
+support, cgroup memory accounting is used instead and no memlock limit
+applies.
+.PP
+Unless running as root, if buffer registration fails with
+.BR ENOMEM ,
+the memlock limit may need to be increased. The current limit can be
+checked with:
+.PP
+.in +4n
+.EX
+ulimit -l
+.EE
+.in
+.PP
+The limit can be increased for the current shell session with:
+.PP
+.in +4n
+.EX
+ulimit -l unlimited
+.EE
+.in
+.PP
+For a permanent change, edit
+.I /etc/security/limits.conf
+or use
+.BR setrlimit (2)
+programmatically with
+.BR RLIMIT_MEMLOCK .
+.SS Using registered buffers
+To use a registered buffer in an I/O operation, use the fixed buffer
+variants of the prep functions:
+.IP \(bu 2
+.BR io_uring_prep_read_fixed (3)
+instead of
+.BR io_uring_prep_read (3)
+.IP \(bu
+.BR io_uring_prep_write_fixed (3)
+instead of
+.BR io_uring_prep_write (3)
+.IP \(bu
+.BR io_uring_prep_readv_fixed (3)
+instead of
+.BR io_uring_prep_readv (3)
+.IP \(bu
+.BR io_uring_prep_writev_fixed (3)
+instead of
+.BR io_uring_prep_writev (3)
+.PP
+Zero-copy send operations can also use registered buffers:
+.IP \(bu 2
+.BR io_uring_prep_send_zc (3)
+with
+.B IORING_RECVSEND_FIXED_BUF
+.IP \(bu
+.BR io_uring_prep_sendmsg_zc (3)
+with
+.B IORING_RECVSEND_FIXED_BUF
+.PP
+These functions take a
+.I buf_index
+parameter that specifies which registered buffer to use (0-indexed into
+the array passed to
+.BR io_uring_register_buffers (3)).
+
+The memory range used for the I/O operation must fall within the bounds
+of the registered buffer. It is valid to use only a portion of a
+registered buffer for an operation.
+.PP
+.in +4n
+.EX
+/* Use first 1024 bytes of registered buffer 0 */
+io_uring_prep_read_fixed(sqe, fd, buf1, 1024, offset, 0);
+
+/* Use registered buffer 1 */
+io_uring_prep_write_fixed(sqe, fd, buf2, 2048, offset, 1);
+.EE
+.in
+.SS Sparse buffer registration
+Applications can register a sparse buffer table using
+.BR io_uring_register_buffers_sparse (3).
+This creates a table with empty slots that can be filled in later using
+.BR io_uring_register_buffers_update_tag (3).
+This is useful when the full set of buffers is not known at registration
+time.
+.PP
+.in +4n
+.EX
+/* Create sparse table with 10 slots */
+ret = io_uring_register_buffers_sparse(ring, 10);
+
+/* Later, fill in slot 3 */
+struct iovec iov = { .iov_base = buf, .iov_len = 4096 };
+ret = io_uring_register_buffers_update_tag(ring, 3, &iov, NULL, 1);
+.EE
+.in
+.SS Buffer tagging
+When using
+.BR io_uring_register_buffers_tags (3)
+or
+.BR io_uring_register_buffers_update_tag (3),
+each buffer can be associated with a tag value. When a buffer is
+unregistered (either explicitly or by replacing it), and there are no
+more in-flight operations using that buffer, a completion queue entry
+is posted with
+.I user_data
+set to the tag value and all other fields zeroed.
+
+This allows applications to know when it is safe to free or reuse the
+buffer memory.
+.SS Updating registered buffers
+Registered buffers can be updated in place using
+.BR io_uring_register_buffers_update_tag (3).
+This can:
+.IP \(bu 2
+Replace an existing buffer with a new one
+.IP \(bu
+Fill in a sparse slot
+.IP \(bu
+Remove a buffer by setting the iovec to zero length
+.PP
+Updating buffers does not immediately free resources. The old buffer
+remains valid until all in-flight operations complete.
+.SS Unregistering buffers
+Buffers are unregistered using
+.BR io_uring_unregister_buffers (3).
+This releases all registered buffers. Buffers are also automatically
+unregistered when the io_uring instance is destroyed.
+
+Applications do not need to explicitly unregister buffers before
+shutting down the ring. However, page unpinning may happen asynchronously,
+so pages may not be immediately available after ring destruction.
+.SS Cloning buffers
+Registered buffers can be cloned from one ring to another using
+.BR io_uring_clone_buffers (3)
+or
+.BR io_uring_clone_buffers_offset (3).
+This allows multiple rings to share the same set of registered buffers
+without re-registering them.
+.SH NOTES
+.IP \(bu 2
+Registered buffers provide the most benefit for small, frequent I/O
+operations where the per-operation overhead is significant.
+.IP \(bu
+For large I/O operations, the buffer mapping overhead is small relative
+to the actual I/O time, so registered buffers may not provide much benefit.
+.IP \(bu
+The maximum number of registered buffers is limited by available kernel
+memory and the
+.B RLIMIT_MEMLOCK
+limit (on older kernels).
+.IP \(bu
+Registered buffers cannot be used with provided buffer rings
+.RB ( IOSQE_BUFFER_SELECT ).
+These are separate mechanisms for different use cases.
+.SH SEE ALSO
+.BR io_uring (7),
+.BR io_uring_registered_files (7),
+.BR setrlimit (2),
+.BR io_uring_register_buffers (3),
+.BR io_uring_register_buffers_tags (3),
+.BR io_uring_register_buffers_sparse (3),
+.BR io_uring_register_buffers_update_tag (3),
+.BR io_uring_unregister_buffers (3),
+.BR io_uring_prep_read_fixed (3),
+.BR io_uring_prep_write_fixed (3),
+.BR io_uring_prep_send_zc (3),
+.BR io_uring_prep_sendmsg_zc (3),
+.BR io_uring_clone_buffers (3)

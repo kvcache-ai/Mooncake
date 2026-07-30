@@ -1,0 +1,70 @@
+.\" Copyright (C) 2023 Jens Axboe <axboe@kernel.dk>
+.\"
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_prep_fixed_fd_install 3 "December 8, 2023" "liburing-2.6" "liburing Manual"
+.SH NAME
+io_uring_prep_fixed_fd_install \- prepare fixed file fd installation request
+.SH SYNOPSIS
+.nf
+.B #include <liburing.h>
+.PP
+.BI "void io_uring_prep_fixed_fd_install(struct io_uring_sqe *" sqe ","
+.BI "                                    int " fd ","
+.BI "                                    unsigned int " flags ");"
+.fi
+.SH DESCRIPTION
+.PP
+The
+.BR io_uring_prep_fixed_fd_install (3)
+helper prepares a fixed file descriptor installation. The submission queue entry
+.I sqe
+is setup to install the direct/fixed file descriptor
+.I fd
+with the specified
+.I flags
+file installation flags.
+
+One use case of direct/fixed file descriptors is to turn a regular file
+descriptor into a direct one, reducing the overhead of any request that
+needs to access this file. This helper provides a way to go the other way,
+turning a direct descriptor into a regular file descriptor that can then
+subsequently be used by regular system calls that take a normal file descriptor.
+This can be handy if no regular file descriptor exists for this direct
+descriptor. Either because it was instantiated directly as a fixed descriptor,
+or because the regular file was closed with
+.BR close (2)
+after being turned into a direct descriptor.
+
+Upon successful return of this request, both a normal and fixed file descriptor
+exists for the same file. Either one of them may be used to access the file.
+Either one of them may be closed without affecting the other one.
+
+.I flags
+may be either zero, or set to
+.B IORING_FIXED_FD_NO_CLOEXEC
+to indicate that the new regular file descriptor should not be closed during
+exec. By default,
+.B O_CLOEXEC
+will be set on the new descriptor otherwise. Setting this field to anything but
+those two values will result in the request being failed with
+.B -EINVAL
+in the CQE
+.I res
+field.
+
+.SH RETURN VALUE
+None
+.SH ERRORS
+The CQE
+.I res
+field will contain the result of the operation, which in this case will be the
+value of the new regular file descriptor. In case of failure, a negative value
+is returned.
+.SH SEE ALSO
+.BR io_uring_get_sqe (3),
+.BR io_uring_submit (3),
+.BR io_uring_register_files (3),
+.BR io_uring_unregister_files (3),
+.BR io_uring_prep_close_direct (3),
+.BR io_uring_prep_openat_direct (3)

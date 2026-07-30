@@ -1,6 +1,6 @@
 #include <gtest/gtest.h>
 
-#include <jsoncpp/json/json.h>
+#include <json/json.h>
 
 #include <algorithm>
 #include <sstream>

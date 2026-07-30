@@ -1,0 +1,246 @@
+.\" Copyright (C) 2025 Jens Axboe <axboe@kernel.dk>
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_multishot 7 "January 18, 2025" "Linux" "Linux Programmer's Manual"
+.SH NAME
+io_uring_multishot \- io_uring multishot requests overview
+.SH DESCRIPTION
+Multishot requests are a class of io_uring operations where a single
+submission queue entry (SQE) can generate multiple completion queue
+entries (CQEs). This is in contrast to normal "oneshot" operations where
+each SQE produces exactly one CQE.
+.SS Why use multishot requests?
+Traditional I/O operations require submitting a new request for each
+operation. For high-frequency operations like accepting connections or
+receiving data, this creates overhead:
+.IP \(bu 2
+CPU cycles spent preparing and submitting SQEs
+.IP \(bu
+Memory bandwidth for SQE/CQE processing
+.IP \(bu
+Potential for gaps between completions and new submissions
+.PP
+Multishot requests eliminate this overhead by keeping the operation
+active after each completion. The kernel automatically re-arms the
+operation, generating a new CQE when the next event occurs.
+Additionally, the internal poll mechanism remains persistent for the
+request, avoiding the need to manipulate poll state for each operation.
+
+Multishot operations are most beneficial for:
+.IP \(bu 2
+Network servers accepting many connections
+.IP \(bu
+Applications receiving data on long-lived connections
+.IP \(bu
+Event monitoring with poll
+.IP \(bu
+Any scenario with repeated identical operations
+.SS How multishot works
+When a multishot operation completes, the CQE has the
+.B IORING_CQE_F_MORE
+flag set in
+.IR cqe->flags .
+This indicates that the operation remains active and more completions
+will follow. The operation continues until:
+.IP \(bu 2
+An error occurs (the final CQE will not have
+.B IORING_CQE_F_MORE
+set)
+.IP \(bu
+The operation is explicitly canceled
+.IP \(bu
+A termination condition specific to the operation is met (e.g., buffer
+exhaustion for receives)
+.PP
+The final CQE for a multishot operation will not have
+.B IORING_CQE_F_MORE
+set, indicating the operation has terminated.
+.SS Multishot accept
+.BR io_uring_prep_multishot_accept (3)
+and
+.BR io_uring_prep_multishot_accept_direct (3)
+set up a multishot accept operation. Each incoming connection generates
+a CQE with the new file descriptor in
+.IR cqe->res .
+.PP
+.in +4n
+.EX
+struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+io_uring_prep_multishot_accept(sqe, listen_fd, NULL, NULL, 0);
+.EE
+.in
+.PP
+The operation continues accepting connections until an error occurs or
+it is canceled. Using the direct variant with
+.B IORING_FILE_INDEX_ALLOC
+allows accepted sockets to be placed directly into the fixed file table.
+.SS Multishot receive
+.BR io_uring_prep_recv_multishot (3)
+sets up a multishot receive operation. Each time data arrives on the
+socket, a CQE is generated. This is typically used with provided buffers
+(see
+.BR io_uring_provided_buffers (7)):
+.PP
+.in +4n
+.EX
+struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+io_uring_prep_recv_multishot(sqe, sockfd, NULL, 0, 0);
+sqe->buf_group = bgid;
+sqe->flags |= IOSQE_BUFFER_SELECT;
+.EE
+.in
+.PP
+Each completion includes:
+.IP \(bu 2
+.B IORING_CQE_F_MORE
+if more completions will follow
+.IP \(bu
+.B IORING_CQE_F_BUFFER
+indicating a buffer was selected
+.IP \(bu
+The buffer ID in the upper bits of
+.I cqe->flags
+.IP \(bu
+The number of bytes received in
+.I cqe->res
+.PP
+The multishot receive terminates when an error occurs, the connection
+closes, or the buffer ring is exhausted.
+.SS Multishot recvmsg
+.BR io_uring_prep_recvmsg_multishot (3)
+is similar to multishot receive but uses the
+.I msghdr
+structure for scatter/gather I/O and ancillary data. A provided buffer
+is used for each message, with the kernel writing a
+.I struct io_uring_recvmsg_out
+header at the start of the buffer containing the actual message
+parameters.
+.SS Multishot read
+.BR io_uring_prep_read_multishot (3)
+sets up a multishot read operation, typically used with pipes or other
+stream-oriented file descriptors. Like multishot receive, this is used
+with provided buffers:
+.PP
+.in +4n
+.EX
+struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+io_uring_prep_read_multishot(sqe, fd, 0, 0, bgid);
+.EE
+.in
+.PP
+The operation generates a CQE each time data becomes available to read.
+.SS Multishot poll
+.BR io_uring_prep_poll_multishot (3)
+sets up a multishot poll operation, or it can be done manually by
+setting the
+.B IORING_POLL_ADD_MULTI
+flag:
+.PP
+.in +4n
+.EX
+struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+io_uring_prep_poll_multishot(sqe, fd, POLLIN);
+/* or equivalently: */
+io_uring_prep_poll_add(sqe, fd, POLLIN);
+sqe->len |= IORING_POLL_ADD_MULTI;
+.EE
+.in
+.PP
+Each time the polled condition becomes true, a CQE is generated with
+the triggered events in
+.IR cqe->res .
+Unlike oneshot poll which is automatically removed after triggering,
+multishot poll remains active.
+
+For level-triggered events, the application should be careful to handle
+the event (e.g., read all available data) before the next poll
+completion, or spurious wakeups may occur.
+.SS Multishot waitid
+.BR io_uring_prep_waitid (3)
+can operate in multishot mode by setting
+.B IORING_ACCEPT_MULTISHOT
+in the flags. This allows waiting for multiple child process state
+changes with a single SQE.
+.SS Handling multishot completions
+Applications must check for
+.B IORING_CQE_F_MORE
+to determine if the operation is still active:
+.PP
+.in +4n
+.EX
+struct io_uring_cqe *cqe;
+
+while (io_uring_peek_cqe(ring, &cqe) == 0) {
+    if (cqe->res < 0) {
+        /* Error occurred, operation terminated */
+        handle_error(cqe->res);
+    } else {
+        process_completion(cqe);
+    }
+
+    if (!(cqe->flags & IORING_CQE_F_MORE)) {
+        /* Operation terminated, may need to resubmit */
+        rearm_if_needed();
+    }
+
+    io_uring_cqe_seen(ring, cqe);
+}
+.EE
+.in
+.SS Canceling multishot operations
+Multishot operations can be canceled using
+.BR io_uring_prep_cancel (3)
+or related functions. The cancellation request generates its own CQE,
+and the multishot operation generates a final CQE (typically with
+.BR -ECANCELED )
+without
+.B IORING_CQE_F_MORE
+set.
+.PP
+.in +4n
+.EX
+struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+io_uring_prep_cancel64(sqe, user_data, 0);
+.EE
+.in
+.SS Integration with provided buffers
+Multishot receive and read operations are designed to work with provided
+buffer rings (see
+.BR io_uring_provided_buffers (7)).
+Each completion consumes a buffer from the ring, and the application
+must return buffers to the ring to keep the operation running.
+
+If the buffer ring becomes empty, the multishot operation terminates
+with
+.BR -ENOBUFS .
+Applications should ensure adequate buffers are available and promptly
+return used buffers to the ring.
+.SH NOTES
+.IP \(bu 2
+Always check
+.B IORING_CQE_F_MORE
+to know if a multishot operation is still active.
+.IP \(bu
+Multishot operations may generate many CQEs quickly. Ensure the CQ ring
+is large enough to avoid overflow.
+.IP \(bu
+When using provided buffers with multishot receives, monitor buffer
+availability to prevent premature termination.
+.IP \(bu
+Multishot operations are edge-triggered conceptually \(em they generate
+completions when events occur, not continuously while conditions are
+true.
+.IP \(bu
+Error completions from multishot operations do not have
+.B IORING_CQE_F_MORE
+set, indicating termination.
+.SH SEE ALSO
+.BR io_uring (7),
+.BR io_uring_provided_buffers (7),
+.BR io_uring_prep_multishot_accept (3),
+.BR io_uring_prep_recv_multishot (3),
+.BR io_uring_prep_recvmsg_multishot (3),
+.BR io_uring_prep_read_multishot (3),
+.BR io_uring_prep_poll_add (3),
+.BR io_uring_prep_poll_multishot (3),
+.BR io_uring_prep_cancel (3)

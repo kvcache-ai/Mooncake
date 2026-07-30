@@ -1,11 +1,13 @@
 #include <gtest/gtest.h>
 
+#include <arpa/inet.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
 #include <chrono>
+#include <stdexcept>
 #include <string>
 #include <thread>
-
-#include <async_simple/coro/SyncAwait.h>
-#include <ylt/coro_http/coro_http_client.hpp>
 
 #include "http_metadata_server.h"
 #include "utils.h"
@@ -19,20 +21,79 @@ class HttpMetadataServerTest : public ::testing::Test {
         std::string body;
     };
 
+    HttpResponse Request(const std::string& method, int port,
+                         const std::string& path,
+                         const std::string& body = "") {
+        const int fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (fd < 0) {
+            throw std::runtime_error("failed to create HTTP test socket");
+        }
+
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_port = htons(static_cast<uint16_t>(port));
+        inet_pton(AF_INET, "127.0.0.1", &address.sin_addr);
+        if (connect(fd, reinterpret_cast<sockaddr*>(&address),
+                    sizeof(address)) != 0) {
+            close(fd);
+            throw std::runtime_error("failed to connect HTTP test socket");
+        }
+
+        std::string request = method + " " + path +
+                              " HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                              "Connection: close\r\n";
+        if (!body.empty()) {
+            request += "Content-Type: application/json\r\nContent-Length: " +
+                       std::to_string(body.size()) + "\r\n";
+        }
+        request += "\r\n" + body;
+
+        size_t sent = 0;
+        while (sent < request.size()) {
+            const ssize_t bytes =
+                send(fd, request.data() + sent, request.size() - sent, 0);
+            if (bytes <= 0) {
+                close(fd);
+                throw std::runtime_error("failed to send HTTP test request");
+            }
+            sent += static_cast<size_t>(bytes);
+        }
+
+        std::string raw_response;
+        char buffer[4096];
+        while (true) {
+            const ssize_t bytes = recv(fd, buffer, sizeof(buffer), 0);
+            if (bytes < 0) {
+                close(fd);
+                throw std::runtime_error("failed to read HTTP test response");
+            }
+            if (bytes == 0) {
+                break;
+            }
+            raw_response.append(buffer, static_cast<size_t>(bytes));
+        }
+        close(fd);
+
+        const size_t status_begin = raw_response.find(' ');
+        const size_t status_end = raw_response.find(' ', status_begin + 1);
+        const size_t body_begin = raw_response.find("\r\n\r\n");
+        if (status_begin == std::string::npos ||
+            status_end == std::string::npos ||
+            body_begin == std::string::npos) {
+            throw std::runtime_error("malformed HTTP test response");
+        }
+        return {std::stoi(raw_response.substr(status_begin + 1,
+                                              status_end - status_begin - 1)),
+                raw_response.substr(body_begin + 4)};
+    }
+
     HttpResponse Get(int port, const std::string& path) {
-        coro_http::coro_http_client client;
-        auto response = async_simple::coro::syncAwait(client.async_get(
-            "http://127.0.0.1:" + std::to_string(port) + path));
-        return {response.status, std::string(response.resp_body)};
+        return Request("GET", port, path);
     }
 
     HttpResponse Put(int port, const std::string& path,
                      const std::string& body) {
-        coro_http::coro_http_client client;
-        auto response = async_simple::coro::syncAwait(
-            client.async_put("http://127.0.0.1:" + std::to_string(port) + path,
-                             body, coro_http::req_content_type::json));
-        return {response.status, std::string(response.resp_body)};
+        return Request("PUT", port, path, body);
     }
 
     void WaitUntilReady(int port) {
@@ -92,6 +153,25 @@ TEST_F(HttpMetadataServerTest, RejectsChangedRpcMetaRepublish) {
     auto stored = Get(port, path);
     EXPECT_EQ(stored.status, 200);
     EXPECT_EQ(stored.body, original);
+
+    server.stop();
+}
+
+TEST_F(HttpMetadataServerTest, RemoteClientDeletesUrlEncodedKey) {
+    int port = getFreeTcpPort();
+    HttpMetadataServer server(static_cast<uint16_t>(port), "127.0.0.1");
+    ASSERT_TRUE(server.start());
+    WaitUntilReady(port);
+
+    const std::string key = "mooncake/ram/host name:123?x=1&y=2";
+    const std::string path =
+        "/metadata?key=mooncake%2Fram%2Fhost%20name%3A123%3Fx%3D1%26y%3D2";
+    ASSERT_EQ(Put(port, path, R"({"kind":"ram"})").status, 200);
+
+    HttpMetadataClient client("http://127.0.0.1:" + std::to_string(port) +
+                              "/metadata");
+    EXPECT_TRUE(client.removeKey(key));
+    EXPECT_EQ(Get(port, path).status, 404);
 
     server.stop();
 }

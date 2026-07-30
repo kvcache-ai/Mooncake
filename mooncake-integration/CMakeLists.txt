@@ -10,21 +10,6 @@ if("${PYTHON_SYS_PATH}" STREQUAL "")
   message(FATAL_ERROR "Python path is empty! Please check the python env.")
 endif()
 
-if(WITH_STORE)
-  include_directories("../mooncake-store/include")
-  include_directories("../mooncake-store/include/cachelib_memory_allocator")
-  include_directories("../mooncake-store/include/engram")
-
-  include_directories(
-    "../mooncake-store/include/cachelib_memory_allocator/include")
-  include_directories(
-    "../mooncake-store/include/cachelib_memory_allocator/fake_include")
-endif()
-
-include_directories("/usr/include/jsoncpp")
-include_directories("./")
-include_directories("../mooncake-transfer-engine/include")
-
 find_package(
   Python3
   COMPONENTS Interpreter Development.Module
@@ -64,12 +49,16 @@ if(WITH_TE)
   target_link_libraries(engine PRIVATE $<TARGET_OBJECTS:rpc_communicator>)
 
   target_include_directories(engine PRIVATE ${Python3_INCLUDE_DIRS})
+  target_include_directories(
+    engine
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}
+            ${CMAKE_CURRENT_SOURCE_DIR}/../mooncake-transfer-engine/include)
   if(USE_ASCEND_DIRECT)
-    target_link_libraries(engine PUBLIC ascendcl transfer_engine glog::glog
-                                        gflags::gflags)
+    target_link_libraries(engine PUBLIC ascendcl transfer_engine Mooncake::glog
+                                        Mooncake::gflags)
   else()
-    target_link_libraries(engine PUBLIC transfer_engine glog::glog
-                                        gflags::gflags)
+    target_link_libraries(engine PUBLIC transfer_engine Mooncake::glog
+                                        Mooncake::gflags)
   endif()
 
   if(USE_CUDA)
@@ -113,15 +102,8 @@ if(WITH_STORE)
     store/engram_store_py.cpp
     integration_utils.h)
   set_target_properties(store PROPERTIES INSTALL_RPATH "$ORIGIN")
-  if(USE_ASCEND_DIRECT)
-    target_link_libraries(
-      store PUBLIC ascendcl transfer_engine glog::glog gflags::gflags
-                   mooncake_store cachelib_memory_allocator)
-  else()
-    target_link_libraries(
-      store PUBLIC transfer_engine glog::glog gflags::gflags mooncake_store
-                   cachelib_memory_allocator)
-  endif()
+  target_include_directories(store PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  target_link_libraries(store PRIVATE mooncake_store)
 endif()
 
 message("${PYTHON_SYS_PATH}")
@@ -200,8 +182,6 @@ endif()
 
 if(WITH_TE)
   install(TARGETS engine DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
-  install(TARGETS asio_shared
-          DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
 endif()
 
 if(WITH_EP)

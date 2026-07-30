@@ -1,0 +1,119 @@
+.\" Copyright (C) 2024 Jens Axboe <axboe@kernel.dk>
+.\"
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_submit_and_wait_min_timeout 3 "Jan 11, 2024" "liburing-2.8" "liburing Manual"
+.SH NAME
+io_uring_submit_and_wait_min_timeout \- submit requests to the submission queue and
+wait for the completion with both batch and normal timeout
+.SH SYNOPSIS
+.nf
+.B #include <liburing.h>
+.PP
+.BI "int io_uring_submit_and_wait_min_timeout(struct io_uring *" ring ","
+.BI "                                         struct io_uring_cqe **" cqe_ptr ","
+.BI "                                         unsigned " wait_nr ","
+.BI "                                         struct __kernel_timespec *" ts ","
+.BI "                                         unsigned int " min_wait_usec ",
+.BI "                                         sigset_t *" sigmask ");"
+.fi
+.SH DESCRIPTION
+.PP
+The
+.BR io_uring_submit_and_wait_min_timeout (3)
+function submits the next requests from the submission queue belonging to the
+.I ring
+and waits for
+.I wait_nr
+completion events, or until the timeout
+.I ts
+expires. The completion events are stored in the
+.I cqe_ptr
+array. If non-zero,
+.I min_wait_usec
+denotes a timeout for the
+.I wait_nr
+batch.
+
+The
+.I sigmask
+specifies the set of signals to block. If set, it is equivalent to atomically
+executing the following calls:
+.PP
+.in +4n
+.EX
+sigset_t origmask;
+
+pthread_sigmask(SIG_SETMASK, &sigmask, &origmask);
+ret = io_uring_submit_and_wait_min_timeout(ring, cqe, wait_nr, ts, min_wait, NULL);
+pthread_sigmask(SIG_SETMASK, &origmask, NULL);
+.EE
+.in
+.PP
+This works like
+.BR io_uring_submit_and_wait_timeout (3)
+with the twist that it applies a minimum timeout for the requested batch size
+of requests to wait for. While
+.BR io_uring_submit_and_wait_timeout (3)
+waits for as long as
+.IR ts
+specifies, or until
+.IR wait_nr
+of request completions have been received, if
+.IR min_wait_usec
+is set, then this is the timeout for the
+.IR wait_nr
+number of requests. If the requested number of completions have been received
+within
+.IR min_wait_usec
+number of microseconds, then the function returns successfully. If that isn't
+the case, once
+.IR min_wait_usec
+time has passed, control is returned if any completions have been posted. If
+no completions have been posted, the kernel switches to a normal wait of up
+to
+.IR ts
+specified amount of time, subtracting the time already waited. If any
+completions are posted after this happens, control is returned immediately to
+the application.
+
+This differs from the normal timeout waiting in that waiting continues post
+the initial timeout, if and only if no completions have been posted. It's meant
+to be used to optimize batch waiting for requests, where the application
+allots a budget of
+.IR min_wait_usec
+amount of time to receive
+.IR wait_nr
+number of completions, but if none are received, then waiting can continue
+without incurring extra context switches or extra kernel/user transitions.
+
+Can be used with any ring, as long as the kernel supports it. Support is
+indicated by checking the
+.BR IORING_FEAT_MIN_TIMEOUT
+feature flag after the ring has been setup. Ideally used with a ring setup
+with
+.BR IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN
+as that will greatly reduce the number of context switches that an application
+will see waiting on multiple requests.
+
+Available since 6.12.
+
+.SH RETURN VALUE
+On success
+.BR io_uring_submit_and_wait_min_timeout (3)
+returns the number of submitted submission queue entries. On failure it returns
+.BR -errno .
+If the kernel doesn't support this functionality,
+.BR -EINVAL
+will be returned. See note on the feature flag.
+The most common failure case is not receiving a completion within the specified
+timeout,
+.B -ETIME
+is returned in this case.
+.SH SEE ALSO
+.BR io_uring_queue_init_params (3),
+.BR io_uring_get_sqe (3),
+.BR io_uring_submit (3),
+.BR io_uring_submit_and_wait (3),
+.BR io_uring_submit_and_wait_timeout (3),
+.BR io_uring_wait_cqe (3)

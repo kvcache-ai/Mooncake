@@ -1,0 +1,74 @@
+.\" Copyright (C) 2025 Jens Axboe <axboe@kernel.dk>
+.\"
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_prep_epoll_ctl 3 "January 18, 2025" "liburing-2.4" "liburing Manual"
+.SH NAME
+io_uring_prep_epoll_ctl \- prepare an epoll_ctl request
+.SH SYNOPSIS
+.nf
+.B #include <liburing.h>
+.PP
+.BI "void io_uring_prep_epoll_ctl(struct io_uring_sqe *" sqe ","
+.BI "                             int " epfd ","
+.BI "                             int " fd ","
+.BI "                             int " op ","
+.BI "                             const struct epoll_event *" ev ");"
+.fi
+.SH DESCRIPTION
+.PP
+The
+.BR io_uring_prep_epoll_ctl (3)
+function prepares an epoll control request. The submission queue entry
+.I sqe
+is setup to use the epoll instance referred to by
+.IR epfd ,
+performing the operation
+.I op
+on the file descriptor
+.IR fd .
+The
+.I ev
+argument points to an
+.I epoll_event
+structure as defined in
+.BR epoll_ctl (2).
+
+The
+.I op
+argument can be one of:
+.TP
+.B EPOLL_CTL_ADD
+Add
+.I fd
+to the epoll instance.
+.TP
+.B EPOLL_CTL_MOD
+Modify the settings for
+.IR fd .
+.TP
+.B EPOLL_CTL_DEL
+Remove
+.I fd
+from the epoll instance.
+.I ev
+is ignored for this operation.
+
+This function prepares an async
+.BR epoll_ctl (2)
+request. See that man page for details.
+
+.SH RETURN VALUE
+None
+.SH ERRORS
+The CQE
+.I res
+field will contain the result of the operation, 0 on success. On error,
+a negative errno value is returned. See
+.BR epoll_ctl (2)
+for possible error values.
+.SH SEE ALSO
+.BR io_uring_get_sqe (3),
+.BR io_uring_submit (3),
+.BR io_uring_prep_epoll_wait (3),
+.BR epoll_ctl (2)

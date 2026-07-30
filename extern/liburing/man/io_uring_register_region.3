@@ -1,0 +1,124 @@
+.\" Copyright (C) 2026 Pavel Begunkov <asml.silence@gmail.com>
+.\"
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_register_region 3 "Jan 13, 2026" "liburing-2.14" "liburing Manual"
+.SH NAME
+io_uring_register_region \- register a memory region
+.SH SYNOPSIS
+.nf
+.B #include <liburing.h>
+.PP
+.BI "int io_uring_register_region(struct io_uring *" ring ",
+.BI "                             struct io_uring_mem_region_reg *" reg ");"
+.fi
+.SH DESCRIPTION
+.PP
+The
+.BR io_uring_register_region (3)
+function registers a memory region to io_uring. Upon successful completion, the
+memory region may then be used, for example, to pass waiting parameters to the
+.BR io_uring_enter (2)
+system call in a more efficient manner as it avoids copying wait related data
+for each wait event. The
+.IR ring
+argument should point to the ring in question, and the
+.IR reg
+argument should be a pointer to a
+.B struct io_uring_mem_region_reg .
+
+The
+.IR reg
+argument must be filled in with the appropriate information. It looks as
+follows:
+.PP
+.in +4n
+.EX
+struct io_uring_mem_region_reg {
+    __u64 region_uptr;
+    __u64 flags;
+    __u64 __resv[2];
+};
+.EE
+.in
+.PP
+The
+.I region_uptr
+field must contain a pointer to an appropriately filled
+.B struct io_uring_region_desc.
+.PP
+The
+.I flags
+field must contain a bitmask of the following values:
+.TP
+.B IORING_MEM_REGION_REG_WAIT_ARG
+allows use of the region to pass waiting parameters to the
+.BR io_uring_enter (2)
+system call. If set, the registration is only allowed while the ring
+is in a disabled mode. See
+.B IORING_SETUP_R_DISABLED.
+.PP
+The __resv fields must be filled with zeroes.
+
+.PP
+.B struct io_uring_region_desc
+is defined as following:
+.PP
+.in +4n
+.EX
+struct io_uring_region_desc {
+    __u64 user_addr;
+    __u64 size;
+    __u32 flags;
+    __u32 id;
+    __u64 mmap_offset;
+    __u64 __resv[4];
+};
+.EE
+.in
+
+.PP
+The
+.I user_addr
+field must contain a pointer to the memory the user wants to register. It's
+valid only if
+.B IORING_MEM_REGION_TYPE_USER
+is set, and should be zero otherwise.
+
+.PP
+The
+.I size
+field should contain the size of the region.
+
+The
+.I flags
+field must contain a bitmask of the following values:
+.TP
+.B IORING_MEM_REGION_TYPE_USER
+tells the kernel to use memory specified by the
+.I user_addr
+field. If not set, the kernel will allocate memory for the region, which can
+then be mapped into the user space.
+
+.PP
+On successful registration of a region with kernel provided memory, the
+.I mmap_offset
+field will contain an offset that can be passed to the
+.B mmap(2)
+system call to map the region into the user space.
+
+The
+.I id
+field is reserved and must be set to zero.
+
+The
+.I __resv
+fields must be filled with zeroes.
+
+Available since kernel 6.13.
+
+.SH RETURN VALUE
+On success
+.BR io_uring_register_region (3)
+returns 0. On failure it returns
+.BR -errno .

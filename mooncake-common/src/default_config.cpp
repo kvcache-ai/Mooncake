@@ -2,13 +2,8 @@
 
 #include "duration_utils.h"
 
-#if __has_include(<jsoncpp/json/reader.h>)
-#include <jsoncpp/json/reader.h>
-#include <jsoncpp/json/value.h>  // Ubuntu
-#else
 #include <json/reader.h>
-#include <json/value.h>  // CentOS
-#endif
+#include <json/value.h>
 
 #include <yaml-cpp/yaml.h>
 

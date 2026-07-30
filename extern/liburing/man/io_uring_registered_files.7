@@ -1,0 +1,228 @@
+.\" Copyright (C) 2025 Jens Axboe <axboe@kernel.dk>
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_registered_files 7 "January 18, 2025" "Linux" "Linux Programmer's Manual"
+.SH NAME
+io_uring_registered_files \- io_uring registered files overview
+.SH DESCRIPTION
+Registered files (also known as fixed files) are a performance
+optimization feature of
+.B io_uring
+that allows applications to pre-register a set of file descriptors with
+the kernel. When files are registered, the kernel takes a reference to
+each file, avoiding the overhead of looking up file descriptors and
+taking references for each I/O operation.
+.SS Why use registered files?
+For every I/O operation that uses a file descriptor, the kernel must:
+.IP \(bu 2
+Look up the file descriptor in the process's file descriptor table
+.IP \(bu
+Take a reference to the file to ensure it remains valid during the
+operation
+.IP \(bu
+Release the reference when the operation completes
+.PP
+For applications performing many I/O operations, especially on threaded
+applications where the file table is shared (making reference counting
+more expensive), these overheads accumulate. By registering files once,
+the reference is held for the lifetime of the registration, and
+operations can use the file directly without per-operation lookups or
+reference counting.
+
+Registered files are most beneficial for applications that:
+.IP \(bu 2
+Perform many I/O operations on the same set of files
+.IP \(bu
+Are multi-threaded (where file table operations are more expensive)
+.IP \(bu
+Need the lowest possible per-I/O overhead
+.SS Registering files
+Files are registered using
+.BR io_uring_register_files (3)
+or
+.BR io_uring_register_files_tags (3).
+The files are described using an array of file descriptors:
+.PP
+.in +4n
+.EX
+int fds[3];
+fds[0] = open("file1", O_RDONLY);
+fds[1] = open("file2", O_RDONLY);
+fds[2] = open("file3", O_WRONLY | O_CREAT, 0644);
+
+ret = io_uring_register_files(ring, fds, 3);
+.EE
+.in
+.PP
+Once registered, the original file descriptors can be closed if desired.
+The kernel holds its own references to the underlying files.
+.SS Using registered files
+To use a registered file in an I/O operation, set the
+.B IOSQE_FIXED_FILE
+flag in the SQE's
+.I flags
+field, and use the index into the registered file array (not the original
+file descriptor) in the
+.I fd
+field:
+.PP
+.in +4n
+.EX
+struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+io_uring_prep_read(sqe, 0, buf, len, offset);  /* index 0, not fd */
+io_uring_sqe_set_flags(sqe, IOSQE_FIXED_FILE);
+.EE
+.in
+.PP
+The index is 0-based into the array passed to
+.BR io_uring_register_files (3).
+.SS Sparse file registration
+The file array can be sparse, meaning some slots can be empty. Empty
+slots are indicated by setting the file descriptor to \-1. Applications
+can create a fully sparse table using
+.BR io_uring_register_files_sparse (3)
+and fill in slots later:
+.PP
+.in +4n
+.EX
+/* Create sparse table with 100 slots */
+ret = io_uring_register_files_sparse(ring, 100);
+
+/* Later, fill in slot 5 */
+int fd = open("file", O_RDONLY);
+ret = io_uring_register_files_update(ring, 5, &fd, 1);
+.EE
+.in
+.SS Updating registered files
+Registered files can be updated using
+.BR io_uring_register_files_update (3)
+or
+.BR io_uring_register_files_update_tag (3).
+This can:
+.IP \(bu 2
+Replace an existing file with a new one
+.IP \(bu
+Fill in an empty slot
+.IP \(bu
+Remove a file by setting the descriptor to \-1
+.PP
+To skip updating certain slots while updating others, use the special
+value
+.BR IORING_REGISTER_FILES_SKIP .
+.PP
+.in +4n
+.EX
+int fds[3];
+fds[0] = new_fd;                        /* replace slot 0 */
+fds[1] = IORING_REGISTER_FILES_SKIP;    /* leave slot 1 unchanged */
+fds[2] = -1;                            /* remove slot 2 */
+
+ret = io_uring_register_files_update(ring, 0, fds, 3);
+.EE
+.in
+.PP
+Updates do not require the ring to be idle on kernels 5.13 and later.
+On older kernels, updates would wait for in-flight operations to complete.
+.SS File tagging
+When using
+.BR io_uring_register_files_tags (3)
+or
+.BR io_uring_register_files_update_tag (3),
+each file can be associated with a tag value. When a file is unregistered
+(either explicitly or by replacement), and there are no more in-flight
+operations using that file, a completion queue entry is posted with
+.I user_data
+set to the tag value and all other fields zeroed.
+
+This notification mechanism allows applications to know when it is safe
+to perform cleanup actions associated with the file.
+.SS Direct file descriptors
+Some io_uring operations can allocate file descriptors directly into the
+registered file table, avoiding the regular file descriptor table
+entirely. This is done by setting the
+.I file_index
+field in the SQE (using
+.BR io_uring_sqe_set_target_fixed_file (3))
+to the desired slot, or using
+.B IORING_FILE_INDEX_ALLOC
+to have io_uring allocate the next available slot.
+
+Operations that support direct descriptors include:
+.IP \(bu 2
+.B IORING_OP_OPENAT
+/
+.B IORING_OP_OPENAT2
+.IP \(bu
+.B IORING_OP_ACCEPT
+.IP \(bu
+.B IORING_OP_SOCKET
+.IP \(bu
+.B IORING_OP_PIPE
+.PP
+When using
+.BR IORING_FILE_INDEX_ALLOC ,
+the application should use
+.BR io_uring_register_file_alloc_range (3)
+to specify which range of the file table should be used for allocations.
+.PP
+.in +4n
+.EX
+/* Reserve slots 50-99 for dynamic allocation */
+io_uring_register_file_alloc_range(ring, 50, 50);
+
+/* Accept with direct descriptor allocation */
+struct io_uring_sqe *sqe = io_uring_get_sqe(ring);
+io_uring_prep_accept_direct(sqe, listen_fd, NULL, NULL, 0,
+                            IORING_FILE_INDEX_ALLOC);
+.EE
+.in
+.PP
+The allocated slot index is returned in the CQE
+.I res
+field on success.
+.SS Closing direct descriptors
+Direct descriptors (files that exist only in the registered file table)
+can be closed using
+.B IORING_OP_CLOSE
+with the
+.B IOSQE_FIXED_FILE
+flag set, or by updating the slot to \-1 using
+.BR io_uring_register_files_update (3).
+.SS Unregistering files
+Files are unregistered using
+.BR io_uring_unregister_files (3).
+This releases all registered files. Files are also automatically
+unregistered when the io_uring instance is destroyed.
+
+Applications do not need to explicitly unregister files before shutting
+down the ring.
+.SH NOTES
+.IP \(bu 2
+Registered files provide the most benefit for applications performing
+many operations on the same files, especially multi-threaded applications.
+.IP \(bu
+Direct descriptors (files that only exist in the registered table) are
+not visible to operations outside io_uring, such as
+.BR read (2)
+or
+.BR write (2).
+.IP \(bu
+The
+.B IOSQE_FIXED_FILE
+flag must be set when using a registered file index; without it, the
+.I fd
+field is interpreted as a regular file descriptor.
+.IP \(bu
+It is an error to use
+.B IOSQE_FIXED_FILE
+with an index that does not correspond to a registered file.
+.SH SEE ALSO
+.BR io_uring (7),
+.BR io_uring_registered_buffers (7),
+.BR io_uring_register_files (3),
+.BR io_uring_register_files_tags (3),
+.BR io_uring_register_files_sparse (3),
+.BR io_uring_register_files_update (3),
+.BR io_uring_register_files_update_tag (3),
+.BR io_uring_unregister_files (3),
+.BR io_uring_register_file_alloc_range (3)

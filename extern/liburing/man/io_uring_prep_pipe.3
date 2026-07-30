@@ -1,0 +1,91 @@
+.\" Copyright (C) 2022 Jens Axboe <axboe@kernel.dk>
+.\"
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_prep_pipe 3 "April 8, 2025" "liburing-2.10" "liburing Manual"
+.SH NAME
+io_uring_prep_pipe \- prepare a pipe creation request
+.SH SYNOPSIS
+.nf
+.B #include <liburing.h>
+.PP
+.BI "void io_uring_prep_pipe(struct io_uring_sqe *" sqe ","
+.BI "                        int *" fds ","
+.BI "                        int " pipe_flags ");"
+.BI "
+.BI "void io_uring_prep_pipe_direct(struct io_uring_sqe *" sqe ","
+.BI "                               int *" fds ","
+.BI "                               int " pipe_flags ","
+.BI "                               unsigned int " file_index ");"
+.PP
+.fi
+.SH DESCRIPTION
+.PP
+The
+.BR io_uring_prep_pipe (3)
+function prepares a pipe creation request. The submission queue entry
+.I sqe
+is setup to create a pipe with the created descriptors being copied to the
+array indicated by 
+.I fds
+and using
+.I pipe_flags
+as the pipe creation flags. See
+.BR pipe2(2)
+for details on the flags accepted.
+
+The
+.BR io_uring_prep_pipe_direct (3)
+function works in the same way, however it uses fixed/registered file
+descriptors rather than normal file descriptors. This helper takes an
+additional
+.I file_index
+argument, which can set to either an explicit direct descriptor offset to create
+the two pipe file descriptors at, or it can be set to
+.B IORING_FILE_INDEX_ALLOC
+to let io_uring pick any available descriptors for the read and write side
+of the pipe. If a specific index is given, the read side of the pipe will
+be created at that offset, if free, and the write side will be created at
+the next (+1) index. Both of these must be currently unused, or the
+operation will fail. Also see
+.BR io_uring_prep_accept_direct (3)
+or
+.BR io_uring_prep_socket_direct (3)
+for details on the
+.I file_index
+parameter.
+
+For both the direct and normal file descriptor pipe request, the resulting
+input/read side of the pipe will be stored in
+.I fds[0]
+and the output/write side of the pipe will be stored in
+.I fds[1]
+upon successful completion of this request.
+
+This function prepares an async
+.BR pipe2 (2)
+request. See that man page for details.
+
+.SH RETURN VALUE
+None
+.SH ERRORS
+The CQE
+.I res
+field will contain the result of the operation. See the related man page for
+details on possible values. Note that where synchronous system calls will return
+.B -1
+on failure and set
+.I errno
+to the actual error value, io_uring never uses
+.IR errno .
+Instead it returns the negated
+.I errno
+directly in the CQE
+.I res
+field.
+.SH SEE ALSO
+.BR io_uring_get_sqe (3),
+.BR io_uring_submit (3),
+.BR pipe2 (2),
+.BR io_uring_prep_accept_direct (3),
+.BR io_uring_prep_socket_direct (3)

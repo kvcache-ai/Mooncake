@@ -1,0 +1,259 @@
+.\" Copyright (C) 2025 Jens Axboe <axboe@kernel.dk>
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_sqpoll 7 "January 18, 2025" "Linux" "Linux Programmer's Manual"
+.SH NAME
+io_uring_sqpoll \- io_uring submission queue polling overview
+.SH DESCRIPTION
+Submission queue polling (SQPOLL) is a mode of operation where an
+io_uring created userspace thread that remains in the kernel monitors
+the submission queue and submits requests on behalf of the application. This eliminates the need for
+the application to make system calls to submit I/O, reducing latency
+and CPU overhead for high-throughput workloads.
+.SS Why use SQPOLL?
+In normal io_uring operation, applications must call
+.BR io_uring_enter (2)
+(typically via
+.BR io_uring_submit (3))
+to notify the kernel of new submissions. While efficient, this still
+incurs system call overhead.
+
+With SQPOLL enabled, the kernel thread continuously polls the
+submission queue for new entries. As soon as the application writes
+an SQE to the ring, the kernel thread picks it up and submits it.
+This provides:
+.IP \(bu 2
+Elimination of submission system call overhead
+.IP \(bu
+Lower and more predictable latency
+.IP \(bu
+Better CPU utilization for high-IOPS workloads
+.PP
+SQPOLL is most beneficial for:
+.IP \(bu 2
+High-throughput storage workloads (NVMe, etc.)
+.IP \(bu
+Latency-sensitive applications
+.IP \(bu
+Workloads with continuous I/O streams
+.IP \(bu
+Applications already running at high CPU utilization
+.SS When SQPOLL may not help
+SQPOLL is not universally beneficial and each use case should be
+benchmarked to determine if it provides value. Situations where
+SQPOLL may not help or may hurt performance:
+.IP \(bu 2
+.B Low-IOPS workloads:
+If the application submits I/O infrequently, the system call overhead
+being saved is negligible, and the polling thread wastes CPU cycles.
+.IP \(bu
+.B CPU-constrained systems:
+The polling thread consumes CPU. If the system is already CPU-bound,
+adding a polling thread may compete with the application for CPU
+resources, reducing overall performance.
+.IP \(bu
+.B Bursty workloads:
+If I/O comes in bursts with idle periods, the polling thread may
+frequently sleep and wake, adding latency when it needs to wake up.
+Regular submission may be more efficient.
+.IP \(bu
+.B Single-threaded applications on single-CPU systems:
+The polling thread and application will compete for the same CPU,
+potentially causing context switches that negate any benefits.
+.IP \(bu
+.B Workloads dominated by completion handling:
+SQPOLL only optimizes submissions. If the application spends most
+of its time processing completions, SQPOLL provides little benefit.
+.PP
+Always benchmark with and without SQPOLL under realistic conditions.
+The performance difference can vary significantly based on hardware,
+kernel version, and workload characteristics.
+.SS Enabling SQPOLL
+SQPOLL is enabled by setting the
+.B IORING_SETUP_SQPOLL
+flag when creating the ring:
+.PP
+.in +4n
+.EX
+struct io_uring ring;
+struct io_uring_params params = {
+    .flags = IORING_SETUP_SQPOLL,
+    .sq_thread_idle = 2000,  /* 2 seconds */
+};
+
+ret = io_uring_queue_init_params(entries, &ring, &params);
+.EE
+.in
+.PP
+The
+.I sq_thread_idle
+field specifies how long (in milliseconds) the kernel thread will
+poll before going to sleep if no submissions are pending. A value of
+0 means the thread never sleeps (uses more CPU but provides lowest
+latency).
+.SS The polling thread lifecycle
+When the ring is created with SQPOLL, a kernel thread is spawned to
+service it. The thread's behavior is:
+.IP 1. 4
+Poll the submission queue for new entries
+.IP 2.
+Submit any new requests found
+.IP 3.
+If no new entries are found for
+.I sq_thread_idle
+milliseconds, go to sleep
+.IP 4.
+Wake up when signaled by the application
+.PP
+The application can check if the thread is sleeping by examining
+.I sq->kflags
+for the
+.B IORING_SQ_NEED_WAKEUP
+flag using
+.BR io_uring_sq_ready (3).
+If set, the application must call
+.BR io_uring_enter (2)
+with
+.B IORING_ENTER_SQ_WAKEUP
+to wake the thread:
+.PP
+.in +4n
+.EX
+/* After adding SQEs */
+io_uring_smp_store_release(ring->sq.ktail, tail);
+
+if (IO_URING_READ_ONCE(*ring->sq.kflags) & IORING_SQ_NEED_WAKEUP)
+    io_uring_enter(ring->ring_fd, 0, 0, IORING_ENTER_SQ_WAKEUP, NULL);
+.EE
+.in
+.PP
+The
+.BR io_uring_submit (3)
+function handles this automatically.
+.SS CPU affinity
+By default, the kernel schedules the polling thread on any available
+CPU. For better cache locality and reduced latency, the thread can be
+pinned to a specific CPU:
+.PP
+.in +4n
+.EX
+struct io_uring_params params = {
+    .flags = IORING_SETUP_SQPOLL | IORING_SETUP_SQ_AFF,
+    .sq_thread_cpu = 3,  /* pin to CPU 3 */
+    .sq_thread_idle = 1000,
+};
+.EE
+.in
+.PP
+The
+.B IORING_SETUP_SQ_AFF
+flag enables CPU affinity, and
+.I sq_thread_cpu
+specifies which CPU to use.
+.SS Credential requirements
+Creating an SQPOLL ring traditionally required elevated privileges
+because the kernel thread runs on behalf of the application. The
+requirements have evolved:
+.IP \(bu 2
+Kernel 5.11 and earlier: requires
+.B CAP_SYS_ADMIN
+or
+.B CAP_SYS_NICE
+.IP \(bu
+Kernel 5.12 and later: unprivileged users can create SQPOLL rings,
+but the polling thread runs with reduced capabilities
+.IP \(bu
+The
+.B IORING_SETUP_NO_SQARRAY
+flag (kernel 6.6+) can simplify setup for SQPOLL-only rings
+.SS Sharing the polling thread
+Multiple rings can share a single polling thread using
+.BR IORING_SETUP_ATTACH_WQ .
+This reduces resource usage when an application uses multiple rings:
+.PP
+.in +4n
+.EX
+/* Create first ring with SQPOLL */
+struct io_uring_params p1 = { .flags = IORING_SETUP_SQPOLL };
+io_uring_queue_init_params(entries, &ring1, &p1);
+
+/* Create second ring, attach to first ring's thread */
+struct io_uring_params p2 = {
+    .flags = IORING_SETUP_SQPOLL | IORING_SETUP_ATTACH_WQ,
+    .wq_fd = ring1.ring_fd,
+};
+io_uring_queue_init_params(entries, &ring2, &p2);
+.EE
+.in
+.SS Completion handling
+SQPOLL only affects submissions. Completions are still handled
+normally \(em the application must either:
+.IP \(bu 2
+Poll the completion queue directly (busy-wait)
+.IP \(bu
+Use
+.BR io_uring_enter (2)
+with
+.B IORING_ENTER_GETEVENTS
+to wait for completions
+.IP \(bu
+Use an eventfd for notification
+.PP
+For full polling on both submission and completion, combine SQPOLL
+with completion queue polling using
+.BR io_uring_peek_cqe (3)
+or similar functions.
+.SS Performance considerations
+.IP \(bu 2
+.B CPU usage:
+The polling thread consumes CPU while active. If I/O is sporadic,
+the thread may waste cycles polling an empty queue. Set
+.I sq_thread_idle
+appropriately for your workload.
+.IP \(bu
+.B Idle timeout tradeoff:
+A shorter idle timeout saves CPU but may increase latency when the
+thread needs to wake up. A longer timeout (or 0 for never sleeping)
+uses more CPU but provides consistent low latency.
+.IP \(bu
+.B Batching:
+Even with SQPOLL, batching submissions by adding multiple SQEs before
+updating the tail pointer can improve throughput.
+.IP \(bu
+.B CPU affinity:
+Pinning the polling thread to a CPU near the application's CPU can
+improve cache behavior and reduce cross-CPU communication.
+.SH NOTES
+.IP \(bu 2
+The polling thread is per-ring (unless shared via
+.BR IORING_SETUP_ATTACH_WQ ).
+Creating many SQPOLL rings without sharing can consume significant
+kernel resources.
+.IP \(bu
+SQPOLL rings still require system calls for:
+.RS 4
+.IP \(bu 2
+Waiting for completions (unless busy-polling the CQ)
+.IP \(bu
+Waking the thread when it has gone idle
+.IP \(bu
+Registration operations
+.RE
+.IP \(bu
+The polling thread inherits resource limits and cgroup membership
+from the creating process.
+.IP \(bu
+If the polling thread encounters an error it cannot recover from,
+.B IORING_SQ_CQ_OVERFLOW
+may be set in
+.IR sq->kflags .
+.IP \(bu
+SQPOLL works well in combination with registered files and buffers,
+which further reduce per-I/O overhead.
+.SH SEE ALSO
+.BR io_uring (7),
+.BR io_uring_setup (2),
+.BR io_uring_enter (2),
+.BR io_uring_queue_init_params (3),
+.BR io_uring_register_files (3),
+.BR io_uring_registered_buffers (7)

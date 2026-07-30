@@ -1,0 +1,172 @@
+/* SPDX-License-Identifier: MPL-2.0 */
+
+#include "testutil.hpp"
+#include "testutil_unity.hpp"
+
+#if defined(ZMQ_HAVE_WINDOWS)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <stdexcept>
+#define close closesocket
+#else
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+#endif
+
+#include <stdlib.h>
+
+static void zap_handler (void *handler_)
+{
+    //  Process ZAP requests forever
+    while (true) {
+        char *version = s_recv (handler_);
+        if (!version)
+            break; //  Terminating
+
+        char *sequence = s_recv (handler_);
+        char *domain = s_recv (handler_);
+        char *address = s_recv (handler_);
+        char *routing_id = s_recv (handler_);
+        char *mechanism = s_recv (handler_);
+
+        TEST_ASSERT_EQUAL_STRING ("1.0", version);
+        TEST_ASSERT_EQUAL_STRING ("NULL", mechanism);
+
+        send_string_expect_success (handler_, version, ZMQ_SNDMORE);
+        send_string_expect_success (handler_, sequence, ZMQ_SNDMORE);
+        if (streq (domain, "TEST")) {
+            send_string_expect_success (handler_, "200", ZMQ_SNDMORE);
+            send_string_expect_success (handler_, "OK", ZMQ_SNDMORE);
+            send_string_expect_success (handler_, "anonymous", ZMQ_SNDMORE);
+            send_string_expect_success (handler_, "", 0);
+        } else {
+            send_string_expect_success (handler_, "400", ZMQ_SNDMORE);
+            send_string_expect_success (handler_, "BAD DOMAIN", ZMQ_SNDMORE);
+            send_string_expect_success (handler_, "", ZMQ_SNDMORE);
+            send_string_expect_success (handler_, "", 0);
+        }
+        free (version);
+        free (sequence);
+        free (domain);
+        free (address);
+        free (routing_id);
+        free (mechanism);
+    }
+    close_zero_linger (handler_);
+}
+
+void *zap_thread;
+
+static void setup_zap_handler ()
+{
+    //  Spawn ZAP handler
+    //  We create and bind ZAP socket in main thread to avoid case
+    //  where child thread does not start up fast enough.
+    void *handler = zmq_socket (get_test_context (), ZMQ_REP);
+    TEST_ASSERT_SUCCESS_ERRNO (zmq_bind (handler, "inproc://zeromq.zap.01"));
+    zap_thread = zmq_threadstart (&zap_handler, handler);
+}
+
+static void teardown_zap_handler ()
+{
+    //  Wait until ZAP handler terminates
+    zmq_threadclose (zap_thread);
+}
+
+void setUp ()
+{
+    setup_test_context ();
+    setup_zap_handler ();
+}
+
+void tearDown ()
+{
+    teardown_test_context ();
+    teardown_zap_handler ();
+}
+
+void test_no_domain ()
+{
+    //  We first test client/server with no ZAP domain
+    //  Libzmq does not call our ZAP handler, the connect must succeed
+    void *server = test_context_socket (ZMQ_DEALER);
+    void *client = test_context_socket (ZMQ_DEALER);
+    char my_endpoint[MAX_SOCKET_STRING];
+    bind_loopback_ipv4 (server, my_endpoint, sizeof my_endpoint);
+    TEST_ASSERT_SUCCESS_ERRNO (zmq_connect (client, my_endpoint));
+    bounce (server, client);
+    test_context_socket_close_zero_linger (client);
+    test_context_socket_close_zero_linger (server);
+}
+
+void test_wrong_domain_fails ()
+{
+    //  Now define a ZAP domain for the server; this enables
+    //  authentication. We're using the wrong domain so this test
+    //  must fail.
+    void *server = test_context_socket (ZMQ_DEALER);
+    void *client = test_context_socket (ZMQ_DEALER);
+    TEST_ASSERT_SUCCESS_ERRNO (
+      zmq_setsockopt (server, ZMQ_ZAP_DOMAIN, "WRONG", 5));
+    char my_endpoint[MAX_SOCKET_STRING];
+    bind_loopback_ipv4 (server, my_endpoint, sizeof my_endpoint);
+    TEST_ASSERT_SUCCESS_ERRNO (zmq_connect (client, my_endpoint));
+    expect_bounce_fail (server, client);
+    test_context_socket_close_zero_linger (client);
+    test_context_socket_close_zero_linger (server);
+}
+
+void test_success ()
+{
+    //  Now use the right domain, the test must pass
+    void *server = test_context_socket (ZMQ_DEALER);
+    void *client = test_context_socket (ZMQ_DEALER);
+    TEST_ASSERT_SUCCESS_ERRNO (
+      zmq_setsockopt (server, ZMQ_ZAP_DOMAIN, "TEST", 4));
+    char my_endpoint[MAX_SOCKET_STRING];
+    bind_loopback_ipv4 (server, my_endpoint, sizeof my_endpoint);
+    TEST_ASSERT_SUCCESS_ERRNO (zmq_connect (client, my_endpoint));
+    bounce (server, client);
+    test_context_socket_close_zero_linger (client);
+    test_context_socket_close_zero_linger (server);
+}
+
+void test_vanilla_socket ()
+{
+    // Unauthenticated messages from a vanilla socket shouldn't be received
+    void *server = test_context_socket (ZMQ_DEALER);
+    TEST_ASSERT_SUCCESS_ERRNO (
+      zmq_setsockopt (server, ZMQ_ZAP_DOMAIN, "WRONG", 5));
+    char my_endpoint[MAX_SOCKET_STRING];
+    bind_loopback_ipv4 (server, my_endpoint, sizeof my_endpoint);
+
+    fd_t s = connect_socket (my_endpoint);
+
+    // send anonymous ZMTP/1.0 greeting
+    send (s, "\x01\x00", 2, 0);
+    // send sneaky message that shouldn't be received
+    send (s, "\x08\x00sneaky\0", 9, 0);
+    int timeout = 250;
+    zmq_setsockopt (server, ZMQ_RCVTIMEO, &timeout, sizeof (timeout));
+    char *buf = s_recv (server);
+    if (buf != NULL) {
+        printf ("Received unauthenticated message: %s\n", buf);
+        TEST_ASSERT_NULL (buf);
+    }
+    close (s);
+    test_context_socket_close_zero_linger (server);
+}
+
+int main ()
+{
+    setup_test_environment ();
+
+    UNITY_BEGIN ();
+    RUN_TEST (test_no_domain);
+    RUN_TEST (test_wrong_domain_fails);
+    RUN_TEST (test_success);
+    RUN_TEST (test_vanilla_socket);
+    return UNITY_END ();
+}

@@ -376,7 +376,9 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             config.rpc_conn_timeout, config.rpc_enable_tcp_no_delay);
         const char* protocol = std::getenv("MC_RPC_PROTOCOL");
         if (protocol && std::string_view(protocol) == "rdma") {
-            server.init_ibv();
+            LOG(ERROR) << "MC_RPC_PROTOCOL=rdma is not supported by the "
+                          "dependency-isolated Store Master; use TCP";
+            return -1;
         }
 
         mooncake::WrappedMasterServiceConfig wrapped_config(

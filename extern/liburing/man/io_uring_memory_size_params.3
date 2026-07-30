@@ -1,0 +1,45 @@
+.\" Copyright (C) 2025 Jens Axboe <axboe@kernel.dk>
+.\"
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_memory_size_params 3 "January 18, 2025" "liburing-2.11" "liburing Manual"
+.SH NAME
+io_uring_memory_size_params \- get memory size needed for a ring with params
+.SH SYNOPSIS
+.nf
+.B #include <liburing.h>
+.PP
+.BI "ssize_t io_uring_memory_size_params(unsigned " entries ", struct io_uring_params *" p ");"
+.fi
+.SH DESCRIPTION
+.PP
+The
+.BR io_uring_memory_size_params (3)
+function returns the total memory size needed for an io_uring ring with
+.I entries
+entries and the parameters specified in
+.IR p .
+
+This is useful for applications that want to pre-allocate memory for a ring
+or want to know the memory footprint before creating a ring.
+
+This function provides more control than
+.BR io_uring_memory_size (3)
+by allowing the caller to specify full ring parameters including CQ size
+via
+.I p->cq_entries
+when
+.B IORING_SETUP_CQSIZE
+is set in
+.IR p->flags .
+
+.SH RETURN VALUE
+Returns the required memory size in bytes on success, or a negative errno
+value on error.
+.TP
+.B -EINVAL
+Invalid entries value (0 or too large without IORING_SETUP_CLAMP).
+.SH SEE ALSO
+.BR io_uring_memory_size (3),
+.BR io_uring_mlock_size_params (3),
+.BR io_uring_queue_init_params (3)

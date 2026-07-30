@@ -1,0 +1,94 @@
+.\" Copyright (C) 2022 Jens Axboe <axboe@kernel.dk>
+.\"
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_prep_futex_wait 3 "Sep 29, 2023" "liburing-2.5" "liburing Manual"
+.SH NAME
+io_uring_prep_futex_wait \- prepare a futex wait request
+.SH SYNOPSIS
+.nf
+.B #include <linux/futex.h>
+.B #include <unistd.h>
+.B #include <liburing.h>
+.PP
+.BI "void io_uring_prep_futex_wait(struct io_uring_sqe *" sqe ","
+.BI "                              const uint32_t *" futex ","
+.BI "                              uint64_t " val ","
+.BI "                              uint64_t " mask ","
+.BI "                              uint32_t " futex_flags ","
+.BI "                              unsigned int " flags ");"
+.fi
+.SH DESCRIPTION
+.PP
+The
+.BR io_uring_prep_futex_wait (3)
+function prepares a futex wait request. The submission queue entry
+.I sqe
+is setup for waiting on a futex at address
+.I futex
+and which still has the value
+.I val
+and with
+.BR futex2 (2)
+flags of
+.I futex_flags
+and io_uring futex flags of
+.I flags .
+
+.I mask
+can be set to a specific bitset mask, which will be matched by the waking
+side to decide who to wake up. To always get woken, an application may use
+.B FUTEX_BITSET_MATCH_ANY .
+
+.I futex_flags
+follows the
+.BR futex2 (2)
+flags, not the
+.BR futex (2)
+v1 interface flags.
+
+.I flags
+are currently unused and hence
+.B 0
+must be passed.
+
+This function prepares an async
+.BR futex (2)
+wait request. See that man page for details. Note that the io_uring futex
+wait request is similar to the
+.B FUTEX_WAIT_BITSET
+operation, as
+.B FUTEX_WAIT
+is a strict subset of that.
+
+Available since kernel 6.7.
+
+.SH RETURN VALUE
+None
+.SH ERRORS
+The CQE
+.I res
+field will contain the result of the operation. See the related man page for
+details on possible values. Note that where synchronous system calls will return
+.B -1
+on failure and set
+.I errno
+to the actual error value, io_uring never uses
+.IR errno .
+Instead it returns the negated
+.I errno
+directly in the CQE
+.I res
+field.
+.SH NOTES
+Unlike the sync futex syscalls that wait on a futex, io_uring does not support
+passing in a timeout for the request. Instead, applications are encouraged
+to use a linked timeout to abort the futex request at a given time, if desired.
+.SH SEE ALSO
+.BR io_uring_get_sqe (3),
+.BR io_uring_submit (3),
+.BR io_uring_prep_futex_waitv (3),
+.BR io_uring_prep_futex_wake (3),
+.BR io_uring_prep_link_timeout (3),
+.BR futex (2)
+.BR futex2 (2)

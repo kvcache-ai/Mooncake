@@ -1,0 +1,47 @@
+.\" Copyright (C) 2022 Jens Axboe <axboe@kernel.dk>
+.\"
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_buf_ring_available 3 "Jan 11, 2024" "liburing-2.6" "liburing Manual"
+.SH NAME
+io_uring_buf_ring_available \- return number of unconsumed provided ring buffer entries
+.SH SYNOPSIS
+.nf
+.B #include <liburing.h>
+.PP
+.BI "int io_uring_buf_ring_available(struct io_uring *" ring ",
+.BI "                                struct io_uring_buf_ring *" br ",
+.BI "                                unsigned short " bgid ");"
+.fi
+.SH DESCRIPTION
+.PP
+The
+.BR io_uring_buf_ring_available (3)
+helper returns the number of unconsumed (by the kernel) entries in the
+.IR br
+provided buffer group belonging to the io_uring
+.IR ring
+and identified by the buffer group ID
+.IR bgid.
+
+Since the head of the provided buffer ring is only visible to the kernel, it's
+impossible to otherwise know how many unconsumed entries exist in the given
+provided buffer ring. This function query the kernel to return that number.
+Available since kernel 6.8.
+
+.SH NOTES
+The returned number of entries reflect the amount of unconsumed entries at the
+time that it was queried. If inflight IO exists that may consume provided
+buffers from this buffer group, then the returned value is inherently racy.
+.SH RETURN VALUE
+Returns the number of unconsumed entries on success, which may be 0. In case
+of error, may return
+.BR -ENOENT
+if the specified buffer group doesn't exist, or
+.BR -EINVAL
+if the buffer group isn't of the correct type, or if the kernel doesn't
+support this feature.
+.SH SEE ALSO
+.BR io_uring_register_buf_ring (3),
+.BR io_uring_buf_ring_add (3),
+.BR io_uring_buf_ring_cq_advance (3)

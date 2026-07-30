@@ -10,12 +10,21 @@ if(USE_HIP)
   hipify_files(ENGINE_SOURCES)
 endif()
 
-add_library(transfer_engine ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>)
-if(BUILD_SHARED_LIBS)
+if(WITH_STORE)
+  # The Store SDK absorbs Transfer Engine into libmooncake_store.so so language
+  # bindings have one project-level shared-library boundary.
+  add_library(transfer_engine STATIC ${ENGINE_SOURCES}
+                                     $<TARGET_OBJECTS:transport>)
+else()
+  add_library(transfer_engine ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>)
+endif()
+set_target_properties(transfer_engine PROPERTIES POSITION_INDEPENDENT_CODE ON)
+if(BUILD_SHARED_LIBS AND NOT WITH_STORE)
   install(TARGETS transfer_engine DESTINATION lib)
 endif()
 
-add_compile_definitions(transfer_engine PUBLIC MOONCAKE_USE_ETCD CMAKE_INCLUDE)
+target_compile_definitions(transfer_engine PUBLIC MOONCAKE_USE_ETCD
+                                                  CMAKE_INCLUDE)
 if(USE_ETCD)
   if(USE_ETCD_LEGACY)
     if(USE_STATIC_ETCD_CPP_API)
@@ -37,7 +46,8 @@ if(USE_ETCD)
   endif()
 endif()
 if(USE_REDIS)
-  target_link_libraries(transfer_engine PUBLIC hiredis)
+  mooncake_enable_bundled_hiredis()
+  target_link_libraries(transfer_engine PUBLIC Mooncake::hiredis)
 endif()
 if(USE_HTTP)
   find_package(CURL REQUIRED)
@@ -50,12 +60,12 @@ target_link_libraries(
          rdma_transport
          mooncake_common
          ibverbs
-         glog::glog
-         gflags::gflags
+         Mooncake::glog
+         Mooncake::gflags
          pthread
-         JsonCpp::JsonCpp
+         Mooncake::jsoncpp
          numa
-         asio_shared
+         Mooncake::asio
          yalantinglibs::yalantinglibs)
 
 if(USE_BAREX)
@@ -115,9 +125,9 @@ if(USE_HIP)
       # compiled in the rdma_transport OBJECT library and pulled into
       # transfer_engine via $<TARGET_OBJECTS:transport>. A PRIVATE define on
       # transfer_engine never reaches that object compilation, so the dmabuf
-      # path is silently compiled out and GPU MRs fall back to plain
-      # ibv_reg_mr (EINVAL on device memory). Put the define (and the hsa
-      # include/link usage requirements) on the target that actually compiles
+      # path is silently compiled out and GPU MRs fall back to plain ibv_reg_mr
+      # (EINVAL on device memory). Put the define (and the hsa include/link
+      # usage requirements) on the target that actually compiles
       # rdma_context.cpp.
       target_compile_definitions(rdma_transport PRIVATE USE_HIP_DMABUF)
       target_link_libraries(rdma_transport PUBLIC hsa-runtime64::hsa-runtime64)

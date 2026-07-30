@@ -1,0 +1,30 @@
+.\" Copyright (C) 2022 Samuel Williams
+.\"
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_prep_nop128 3 "October 22, 2025" "liburing-2.13" "liburing Manual"
+.SH NAME
+io_uring_prep_nop128 \- prepare a nop request
+.SH SYNOPSIS
+.nf
+.B #include <liburing.h>
+.PP
+.BI "void io_uring_prep_nop128(struct io_uring_sqe *" sqe ");"
+.fi
+.SH DESCRIPTION
+.PP
+The
+.BR io_uring_prep_nop128 (3)
+function prepares nop (no operation) request for a 128-byte entry. The
+submission queue entry
+.I sqe
+does not require any additional setup.
+
+.SH RETURN VALUE
+None
+.SH ERRORS
+None
+.SH SEE ALSO
+.BR io_uring_prep_nop (3),
+.BR io_uring_get_sqe (3),
+.BR io_uring_submit (3),

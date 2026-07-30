@@ -1,0 +1,40 @@
+.\" Copyright (C) 2023 nick black <dankamongmen@gmail.com>
+.\"
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_enable_rings 3 "July 26, 2024" "liburing-2.7" "liburing Manual"
+.SH NAME
+io_uring_enable_rings \- enable a disabled ring
+.SH SYNOPSIS
+.nf
+.B #include <liburing.h>
+.PP
+.BI "int io_uring_enable_rings(struct io_uring *" ring ");"
+.fi
+.SH DESCRIPTION
+.PP
+The
+.BR io_uring_enable_rings (3)
+function enables a ring after having created it with the
+.B IORING_SETUP_R_DISABLED
+flag to
+.BR io_uring_queue_init (3)
+
+It is not possible to submit work to such a ring until this
+function has been successfully called.
+
+.SH RETURN VALUE
+.BR io_uring_enable_rings (3)
+returns 0 on success. It otherwise returns a negative error code.
+It does not write to
+.BR errno .
+
+.SH ERRORS
+.TP
+.B EBADFD
+The ring was not disabled.
+
+.SH SEE ALSO
+.BR io_uring_queue_init (3),
+.BR io_uring_register (2),
+.BR io_uring_setup (2)

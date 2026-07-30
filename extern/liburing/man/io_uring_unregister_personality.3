@@ -1,0 +1,33 @@
+.\" Copyright (C) 2025 Jens Axboe <axboe@kernel.dk>
+.\"
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_unregister_personality 3 "January 18, 2025" "liburing-2.4" "liburing Manual"
+.SH NAME
+io_uring_unregister_personality \- unregister a personality from io_uring
+.SH SYNOPSIS
+.nf
+.B #include <liburing.h>
+.PP
+.BI "int io_uring_unregister_personality(struct io_uring *" ring ", int " id ");"
+.fi
+.SH DESCRIPTION
+.PP
+The
+.BR io_uring_unregister_personality (3)
+function unregisters a previously registered personality from the io_uring
+instance specified by
+.IR ring .
+The
+.I id
+argument is the personality ID returned from a previous call to
+.BR io_uring_register_personality (3).
+
+After unregistering, the personality ID is no longer valid and must not be
+used in future submissions.
+
+.SH RETURN VALUE
+Returns 0 on success. On error, a negative errno value is returned.
+.SH SEE ALSO
+.BR io_uring_register_personality (3),
+.BR io_uring_register (2)

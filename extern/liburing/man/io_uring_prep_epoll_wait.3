@@ -1,0 +1,64 @@
+.\" Copyright (C) 2022 Jens Axboe <axboe@kernel.dk>
+.\"
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_prep_epoll_wait 3 "March 6, 2025" "liburing-2.10" "liburing Manual"
+.SH NAME
+io_uring_prep_epoll_wait \- prepare an epoll wait request
+.SH SYNOPSIS
+.nf
+.B #include <sys/epoll.h>
+.B #include <liburing.h>
+.PP
+.BI "void io_uring_prep_epoll_wait(struct io_uring_sqe *" sqe ","
+.BI "                              int " fd ","
+.BI "                              struct epoll_event *" events ","
+.BI "                              int " maxevents ","
+.BI "                              unsigned flags ");"
+.PP
+.fi
+.SH DESCRIPTION
+.PP
+The
+.BR io_uring_prep_epoll_wait (3)
+function prepares an epoll_wait request. The submission queue entry
+.I sqe
+is setup to wait on a maximum of
+.IR maxevents
+events on the epoll file descriptor indicated by
+.IR fd ,
+and filling the received events into the memory pointed to by
+.IR events .
+
+This function prepares an async
+.BR epoll_wait (2)
+request. See that man page for details. The use case is mostly for legacy
+event loops, where certain file descriptors may still be using epoll for
+readiness notifications. Normally this would necessitate using epoll_wait
+with the io_uring fd added to that set as well, which is suboptimal as
+epoll doesn't provide the same kind of fine grained batch control and
+wakeup reductions that io_uring does. By using io_uring to read epoll events,
+the event loop can be entirely switched to io_uring, and reap the benefits
+of batch waiting and context switch reductions.
+
+.SH RETURN VALUE
+None
+.SH ERRORS
+The CQE
+.I res
+field will contain the result of the operation. See the related man page for
+details on possible values. Note that where synchronous system calls will return
+.B -1
+on failure and set
+.I errno
+to the actual error value, io_uring never uses
+.IR errno .
+Instead it returns the negated
+.I errno
+directly in the CQE
+.I res
+field.
+.SH SEE ALSO
+.BR io_uring_get_sqe (3),
+.BR io_uring_submit (3),
+.BR epoll_wait (2)

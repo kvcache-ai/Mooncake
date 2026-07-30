@@ -1,0 +1,100 @@
+.\" Copyright (C) 2023 Jens Axboe <axboe@kernel.dk>
+.\"
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_prep_read_multishot 3 "September 12, 2023" "liburing-2.5" "liburing Manual"
+.SH NAME
+io_uring_prep_read_multishot \- prepare I/O read multishot request
+.SH SYNOPSIS
+.nf
+.B #include <liburing.h>
+.PP
+.BI "void io_uring_prep_read_multishot(struct io_uring_sqe *" sqe ","
+.BI "                                  int " fd ","
+.BI "                                  unsigned " nbytes ","
+.BI "                                  __u64 " offset ","
+.BI "                                  int " buf_group ");"
+.fi
+.SH DESCRIPTION
+.PP
+The
+.BR io_uring_prep_read_multishot (3)
+helper prepares an IO read multishot request. The submission queue entry
+.I sqe
+is setup to use the file descriptor
+.I fd
+to start reading
+into a buffer from the provided buffer group with ID
+.I buf_group
+at the specified
+.IR offset .
+
+.I nbytes
+must be set to zero, as the size read will be given by the size of the
+buffers in the indicated buffer group IO.
+
+On files that are not capable of seeking, the offset must be 0 or -1.
+
+If
+.I nbytes
+exceeds the size of the buffers in the specified buffer group, or if
+.I nbytes
+is
+.B 0 ,
+then the size of the buffer in that group will be used for the transfer.
+
+A multishot read request will repeatedly trigger a completion event
+whenever data is available to read from the file. Because of that,
+this type of request can only be used with a file type that is pollable.
+Examples of that include pipes, tun devices, etc. If used with a regular
+file, or a wrong file type in general, the request will fail with
+.B -EBADFD
+in the CQE
+.I res
+field.
+
+Since multishot requests repeatedly trigger completion events as data
+arrives, it must be used with provided buffers. With provided buffers, the
+application provides buffers to io_uring upfront, and then the kernel picks
+a buffer from the specified group in
+.I buf_group
+when the request is ready to transfer data.
+
+A multishot request will persist as long as no errors are encountered
+doing handling of the request. For each CQE posted on behalf of this request,
+the CQE
+.I flags
+will have
+.B IORING_CQE_F_MORE
+set if the application should expect more completions from this request.
+If this flag isn't set, then that signifies termination of the multishot
+read request.
+
+After the read has been prepared it can be submitted with one of the submit
+functions.
+
+Available since 6.7.
+
+.SH RETURN VALUE
+None
+.SH ERRORS
+The CQE
+.I res
+field will contain the result of the operation. See the related man page for
+details on possible values. Note that where synchronous system calls will return
+.B -1
+on failure and set
+.I errno
+to the actual error value, io_uring never uses
+.IR errno .
+Instead it returns the negated
+.I errno
+directly in the CQE
+.I res
+field.
+.SH SEE ALSO
+.BR io_uring_get_sqe (3),
+.BR io_uring_prep_read (3),
+.BR io_uring_buf_ring_init (3)
+.BR io_uring_buf_ring_add (3),
+.BR io_uring_submit (3)

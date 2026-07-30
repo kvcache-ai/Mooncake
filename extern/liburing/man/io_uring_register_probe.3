@@ -1,0 +1,47 @@
+.\" Copyright (C) 2025 Jens Axboe <axboe@kernel.dk>
+.\"
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_register_probe 3 "January 18, 2025" "liburing-2.4" "liburing Manual"
+.SH NAME
+io_uring_register_probe \- register probe with io_uring
+.SH SYNOPSIS
+.nf
+.B #include <liburing.h>
+.PP
+.BI "int io_uring_register_probe(struct io_uring *" ring ","
+.BI "                            struct io_uring_probe *" p ","
+.BI "                            unsigned " nr ");"
+.fi
+.SH DESCRIPTION
+.PP
+The
+.BR io_uring_register_probe (3)
+function queries the kernel for supported io_uring opcodes and fills in the
+probe structure
+.IR p .
+The
+.I ring
+argument specifies the io_uring instance to query, and
+.I nr
+specifies the maximum number of opcodes to query.
+
+The probe structure contains information about which opcodes are supported
+by the kernel. Applications can use
+.BR io_uring_opcode_supported (3)
+to check if a specific opcode is supported after calling this function.
+
+Most applications should use
+.BR io_uring_get_probe (3)
+or
+.BR io_uring_get_probe_ring (3)
+instead, which allocate and fill in the probe structure automatically.
+
+.SH RETURN VALUE
+Returns 0 on success. On error, a negative errno value is returned.
+.SH SEE ALSO
+.BR io_uring_get_probe (3),
+.BR io_uring_get_probe_ring (3),
+.BR io_uring_opcode_supported (3),
+.BR io_uring_free_probe (3),
+.BR io_uring_register (2)

@@ -6,7 +6,7 @@
 #include <map>
 #include <string_view>
 
-#include <jsoncpp/json/json.h>
+#include <json/json.h>
 
 #include "ha/oplog/oplog_batch_codec.h"
 #include "ha/oplog/oplog_types.h"

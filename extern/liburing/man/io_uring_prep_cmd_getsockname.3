@@ -1,0 +1,79 @@
+.\" Copyright (C) 2025 SUSE LLC.
+.\" Copyright (C) 2025 Jens Axboe <axboe@kernel.dk>
+.\"
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_prep_cmd_getsockname 3 "December 3, 2025" "liburing-2.13" "liburing Manual"
+.SH NAME
+io_uring_prep_cmd_getsockname \- prepare a getsockname or getpeername request
+.SH SYNOPSIS
+.nf
+.B #include <sys/socket.h>
+.B #include <liburing.h>
+.PP
+.BI "void io_uring_prep_cmd_getsockname(struct io_uring_sqe *" sqe ","
+.BI "                                   int " fd ","
+.BI "                                   struct sockaddr *" sockaddr ","
+.BI "                                   socklen_t *" sockaddr_len ","
+.BI "                                   int " peer ");"
+.fi
+.SH DESCRIPTION
+The
+.BR io_uring_prep_cmd_getsockname (3)
+function prepares a getsockname/getpeername request.
+The submission queue entry
+.I sqe
+is setup to fetch the locally bound address or peer address of the socket
+file descriptor pointed by
+.IR sockfd .
+The parameter
+.IR sockaddr
+points to a region of size
+.IR sockaddr_len
+where the output is written.
+.IR sockaddr_len
+is modified by the kernel on return  to indicate how many bytes were written.
+The output address is the locally bound address if
+.IR peer
+is set to
+.B 0
+or the peer address if
+.IR peer
+is set to
+.BR 1 .
+
+This function prepares an async
+.BR getsockname (2)
+or
+.BR getpeername (2)
+request. See those man pages for details.
+
+.SH RETURN VALUE
+None
+.SH ERRORS
+The CQE
+.I res
+field will contain the result of the operation. See the related man page for
+details on possible values. Note that where synchronous system calls will return
+.B -1
+on failure and set
+.I errno
+to the actual error value, io_uring never uses
+.IR errno .
+Instead it returns the negated
+.I errno
+directly in the CQE
+.I res
+field.
+.BR
+Differently from the equivalent system calls, if the user attempts to
+use this operation on a non-socket file descriptor, the CQE error result
+is
+.IR ENOTSUP
+instead of
+.IR ENOSOCK.
+.SH SEE ALSO
+.BR io_uring_get_sqe (3),
+.BR io_uring_submit (3),
+.BR getsockname (2),
+.BR getpeername (2)

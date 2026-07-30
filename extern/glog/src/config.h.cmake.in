@@ -1,0 +1,142 @@
+#ifndef GLOG_CONFIG_H
+#define GLOG_CONFIG_H
+
+/* Define if you have the `dladdr' function */
+#cmakedefine HAVE_DLADDR
+
+/* Define to 1 if you have the <dlfcn.h> header file. */
+#cmakedefine HAVE_DLFCN_H
+
+/* Define if you have the `backtrace' function in <execinfo.h> */
+#cmakedefine HAVE_EXECINFO_BACKTRACE
+
+/* Define if you have the `backtrace_symbols' function in <execinfo.h> */
+#cmakedefine HAVE_EXECINFO_BACKTRACE_SYMBOLS
+
+/* Define if you have the `fcntl' function */
+#cmakedefine HAVE_FCNTL
+
+/* Define to 1 if you have the <glob.h> header file. */
+#cmakedefine HAVE_GLOB_H
+
+/* define if you have google gmock library */
+#cmakedefine HAVE_LIB_GMOCK
+
+/* define if you have google gtest library */
+#cmakedefine HAVE_LIB_GTEST
+
+/* define if you have dbghelp library */
+#cmakedefine HAVE_DBGHELP
+
+/* Define if you have the 'pread' function */
+#cmakedefine HAVE_PREAD
+
+/* Define if you have the 'posix_fadvise' function in <fcntl.h> */
+#cmakedefine HAVE_POSIX_FADVISE
+
+/* Define to 1 if you have the <pwd.h> header file. */
+#cmakedefine HAVE_PWD_H
+
+/* Define if you have the 'pwrite' function */
+#cmakedefine HAVE_PWRITE
+
+/* Define if you have the 'sigaction' function */
+#cmakedefine HAVE_SIGACTION
+
+/* Define if you have the `sigaltstack' function */
+#cmakedefine HAVE_SIGALTSTACK
+
+/* Define to 1 if you have the <syscall.h> header file. */
+#cmakedefine HAVE_SYSCALL_H
+
+/* Define to 1 if you have the <syslog.h> header file. */
+#cmakedefine HAVE_SYSLOG_H
+
+/* Define to 1 if you have the <elf.h> header file. */
+#cmakedefine HAVE_ELF_H
+
+/* Define to 1 if you have the <sys/exec_elf.h> header file. */
+#cmakedefine HAVE_SYS_EXEC_ELF_H
+
+/* Define to 1 if you have the <link.h> header file. */
+#cmakedefine HAVE_LINK_H
+
+/* Define to 1 if you have the <sys/syscall.h> header file. */
+#cmakedefine HAVE_SYS_SYSCALL_H
+
+/* Define to 1 if you have the <sys/time.h> header file. */
+#cmakedefine HAVE_SYS_TIME_H
+
+/* Define to 1 if you have the <sys/types.h> header file. */
+#cmakedefine HAVE_SYS_TYPES_H
+
+/* Define to 1 if you have the <sys/ucontext.h> header file. */
+#cmakedefine HAVE_SYS_UCONTEXT_H
+
+/* Define to 1 if you have the <sys/utsname.h> header file. */
+#cmakedefine HAVE_SYS_UTSNAME_H
+
+/* Define to 1 if you have the <sys/wait.h> header file. */
+#cmakedefine HAVE_SYS_WAIT_H
+
+/* Define to 1 if you have the <ucontext.h> header file. */
+#cmakedefine HAVE_UCONTEXT_H
+
+/* Define to 1 if you have the <unistd.h> header file. */
+#cmakedefine HAVE_UNISTD_H ${HAVE_UNISTD_H}
+
+/* define if you have unwind */
+#cmakedefine HAVE_UNWIND
+
+/* define if you have libunwind */
+#cmakedefine HAVE_LIBUNWIND
+
+/* define if symbolize support is available */
+#cmakedefine HAVE_SYMBOLIZE
+
+/* define if localtime_r is available in time.h */
+#cmakedefine HAVE_LOCALTIME_R
+
+/* define if gmtime_r is available in time.h */
+#cmakedefine HAVE_GMTIME_R
+
+/* define if _chsize_s is available in io.h */
+#cmakedefine HAVE__CHSIZE_S
+
+/* define if ssize_t is defined */
+#cmakedefine HAVE_SSIZE_T
+
+/* define if mode_t is defined */
+#cmakedefine HAVE_MODE_T
+
+/* How to access the PC from a struct ucontext */
+#cmakedefine PC_FROM_UCONTEXT ${PC_FROM_UCONTEXT}
+
+/* define if we should print file offsets in traces instead of symbolizing. */
+#cmakedefine PRINT_UNSYMBOLIZED_STACK_TRACES
+
+/* The size of `void *', as computed by sizeof. */
+#cmakedefine SIZEOF_VOID_P ${SIZEOF_VOID_P}
+
+/* location of source code */
+#cmakedefine TEST_SRC_DIR ${TEST_SRC_DIR}
+
+/* Define if thread-local storage is enabled. */
+#cmakedefine GLOG_THREAD_LOCAL_STORAGE
+
+/* define if abi::__cxa_demangle is available in cxxabi.h */
+#cmakedefine HAVE___CXA_DEMANGLE
+
+/* define if __argv is available in cstdlib */
+#cmakedefine HAVE___ARGV
+
+/* define if __progname is available */
+#cmakedefine HAVE___PROGNAME
+
+/* define if getprogname is available in cstdlib */
+#cmakedefine HAVE_GETPROGNAME
+
+/* define if program_invocation_short_name is available in cerrno */
+#cmakedefine HAVE_PROGRAM_INVOCATION_SHORT_NAME
+
+#endif  // GLOG_CONFIG_H

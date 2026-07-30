@@ -1,0 +1,43 @@
+# Travis CI script
+
+language: c
+
+os:
+- linux
+
+dist: bionic
+
+cache: ccache
+
+env:
+  matrix:
+    - BUILD_TYPE=default
+  # tokens to deploy releases on OBS and create/delete temporary branch on Github.
+  # 1) Create a token on https://github.com/settings/tokens/new with "public_repo"
+  #    capability and encrypt it with travis encrypt --org -r zeromq/libzmq GH_TOKEN="<token>"
+  # 2) Create 2 OBS tokens with osc token --create network:messaging:zeromq:release-<stable|draft> libzmq
+  #    encrypt them with travis encrypt --org -r zeromq/libzmq OBS_<STABLE|DRAFT>_TOKEN="<token>"
+  global:
+    - secure: aaIs9Y44FYp9VFCqa6LLD4illBH4aUfbS0zzzbAQ5xJvD6NfBsMiKEIhf/kRNCHAtP+1VfQVOejTD6/i08ALsVr3cZD9oB/t7874tz2/jeZUIhRNo+1KwyaVqNg0yUSV6ASIoq4aOfuGnjBlezNQ8LQ2bjQB2m4Enl5wxoYcYdA=
+    - secure: YFrcedBIKe0NR1WC6qQi9phZgtnzOiBIXm40TirvCtstV4eVnSouKgtQfLLArZ4o2tjflq4grQQNo1rJatvyi5YPOXsMcndsni18S+4Ffu8qbECdtPrK52vBweuf7q9oV9Ydax0Fm4bEqEMOZ2/mRBy3nK+mgsE3upeMwyWR0Zw=
+    - secure: lbZSzmqN39QdJwewKOZgq/1ijPKuyx9MFrGzMqXj2+eOSlaZS/tNavHMdKJOev+qJGK9wxmwzxOxS10AiH+AvN7WBacXX4ZtudjScz2HKJRDWTKyzMbzyScq51afniItzrsm+Vo8NHkenNFkux0sSbh0aHlpkLwrGQu+WZWcDN4=
+    - secure: "ZFL7hLJlGwYix8fF835OnQYakBt/o5iS7IfSW7el44ejEvGAOM9O5/ufxCcqSqn8Np7nOaM3RriAVTqWPZD6S7tMeflGTSGYHPYwWUc83z4rUPyG2FWVKXdB8ufpebAwu3hCgLiSmVeoQG47dl6xNk1oKCd+3UIjgz33u1Ecfps="
+
+# Build and check this project according to the BUILD_TYPE
+script: ./ci_build.sh
+
+# Deploy tags
+before_deploy:
+- . ./ci_deploy.sh
+deploy:
+  provider: releases
+  api_key:
+    secure: vGB5E+A8wxm2J1GJZzmIgT9PrjEzvd9gE8iui8FyxSbxAsW9vFZFGZC/21sTtpVcmRarwQCHH1UEbtg+nJwN2iD9YzMRnSVks8xqP+b709YW+VXaMuhZgTzWa74IorQku7NuvLibvQk72/OSgdwPGaNJ6f5AX9pnWVWbEoW1svE=
+  file_glob: true
+  file: ${LIBZMQ_DEPLOYMENT}
+  skip_cleanup: true
+  on:
+    repo: zeromq/libzmq
+    branch: master
+    tags: true
+    condition: "$TRAVIS_OS_NAME =~ (linux) && $BUILD_TYPE =~ (default) && $CURVE =~ (libsodium) && -z $DRAFT"

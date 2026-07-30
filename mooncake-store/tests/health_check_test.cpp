@@ -18,9 +18,6 @@
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
 DEFINE_string(device_name, "", "Device name to use, valid if protocol=rdma");
 
-DECLARE_bool(enable_http_server);
-DECLARE_int32(http_port);
-
 namespace mooncake {
 namespace testing {
 
@@ -29,7 +26,6 @@ class HealthCheckTest : public ::testing::Test {
     static void SetUpTestSuite() {
         google::InitGoogleLogging("HealthCheckTest");
         FLAGS_logtostderr = 1;
-        FLAGS_enable_http_server = true;
         if (getenv("PROTOCOL")) FLAGS_protocol = getenv("PROTOCOL");
         if (getenv("DEVICE_NAME")) FLAGS_device_name = getenv("DEVICE_NAME");
     }
@@ -69,16 +65,17 @@ class HealthCheckTest : public ::testing::Test {
 
     // Start master and set up the client on the given port.
     // Returns 0 on success.
-    int StartMasterAndSetupClient(int port) {
+    int StartMasterAndSetupClient(int port, int http_port = 0) {
         if (!master_.Start(InProcMasterConfigBuilder().build())) return -1;
         master_address_ = master_.master_address();
 
         const std::string rdma_devices =
             (FLAGS_protocol == "rdma") ? FLAGS_device_name : "";
-        return py_client_->setup_real("localhost:" + std::to_string(port),
-                                      "P2PHANDSHAKE", 16 * 1024 * 1024,
-                                      16 * 1024 * 1024, FLAGS_protocol,
-                                      rdma_devices, master_address_);
+        return py_client_->setup_real(
+            "localhost:" + std::to_string(port), "P2PHANDSHAKE",
+            16 * 1024 * 1024, 16 * 1024 * 1024, FLAGS_protocol, rdma_devices,
+            master_address_, nullptr, "", false, "", "default", http_port > 0,
+            http_port);
     }
 
     bool WaitForHealthCode(
@@ -143,8 +140,8 @@ TEST_F(HealthCheckTest, ReturnsTwoWhenMasterDown) {
 // Test 5: HTTP /health returns 200 when healthy
 TEST_F(HealthCheckTest, HttpReturns200WhenHealthy) {
     int http_port = getFreeTcpPort();
-    FLAGS_http_port = http_port;
-    ASSERT_EQ(StartMasterAndSetupClient(18910), 0) << "setup_real failed";
+    ASSERT_EQ(StartMasterAndSetupClient(18910, http_port), 0)
+        << "setup_real failed";
 
     std::this_thread::sleep_for(std::chrono::seconds(2));
 
@@ -160,8 +157,7 @@ TEST_F(HealthCheckTest, HttpReturns200WhenHealthy) {
 // Test 6: HTTP /health returns 503 when master unreachable
 TEST_F(HealthCheckTest, HttpReturns503WhenMasterDown) {
     int http_port = getFreeTcpPort();
-    FLAGS_http_port = http_port;
-    ASSERT_EQ(StartMasterAndSetupClient(18911), 0);
+    ASSERT_EQ(StartMasterAndSetupClient(18911, http_port), 0);
 
     std::this_thread::sleep_for(std::chrono::seconds(2));
     EXPECT_EQ(py_client_->health_check(), HC_HEALTHY);
@@ -182,8 +178,8 @@ TEST_F(HealthCheckTest, HttpReturns503WhenMasterDown) {
 // transfer stats after put/get operations
 TEST_F(HealthCheckTest, MetricsEndpointsReturnCorrectData) {
     int http_port = getFreeTcpPort();
-    FLAGS_http_port = http_port;
-    ASSERT_EQ(StartMasterAndSetupClient(18920), 0) << "setup_real failed";
+    ASSERT_EQ(StartMasterAndSetupClient(18920, http_port), 0)
+        << "setup_real failed";
 
     std::this_thread::sleep_for(std::chrono::seconds(2));
 

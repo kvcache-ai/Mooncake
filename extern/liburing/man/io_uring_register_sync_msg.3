@@ -1,0 +1,74 @@
+.\" Copyright (C) 2025 Jens Axboe <axboe@kernel.dk>
+.\"
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_register_sync_msg 3 "July 10, 2025" "liburing-2.11" "liburing Manual"
+.SH NAME
+io_uring_register_sync_msg \- send a synchronous message to another ring
+.SH SYNOPSIS
+.nf
+.B #include <liburing.h>
+.PP
+.BI "int io_uring_register_sync_msg(struct io_uring_sqe *" sqe ");"
+.fi
+.SH DESCRIPTION
+.PP
+.BR io_uring_register_sync_msg (3)
+issues a synchronous MSG_RING request. The
+.I sqe
+parameter must have been cleared and initialized with
+.BR io_uring_prep_msg_ring (3) .
+
+Normally message requests are sent from one ring to another ring. But there
+are also cases where a source ring is not available, yet it would be
+convenient to send a message to a destination ring.
+.BR io_uring_register_sync_msg (3)
+exists for that purpose. A source ring is not required to send a message to
+another ring, instead the
+.I sqe
+parameter can be placed on the stack and filled in using the normal message
+helpers, and then
+.BR io_uring_register_sync_msg (3)
+can be called. Since a source ring does not exist, the results of the operation
+is returned directly rather than via a CQE. On the destination/receiving end,
+a CQE is posted, as it would have been with a non-sync request.
+
+Only data request are supported, sending files such as setup by
+.BR io_uring_prep_msg_ring_fd (3)
+is not supported. The given SQE should be initialized by
+.BR io_uring_prep_msg_ring (3)
+or
+.BR io_uring_prep_msg_ring_cqe_flags (3) ,
+or any other helper that sets up a non-fd message request.
+
+The targeted ring may be any ring that the user has access to, even the ring
+itself. This request can be used for simple message passing to another ring,
+allowing 32+64 bits of data to be transferred through the
+.I len
+and
+.I data
+fields. The use case may be anything from simply waking up someone waiting
+on the targeted ring, or it can be used to pass messages between the two
+rings.
+
+.BR io_uring_prep_msg_ring_cqe_flags (3)
+is similar to
+.BR io_uring_prep_msg_ring (3) .
+But has an addition
+.I cqe_flags
+parameter, which is used to set
+.I flags
+field on CQE side. That way, you can set the CQE flags field
+.I cqe->flags
+when sending a message. Be aware that io_uring could potentially set additional
+bits into this field.
+
+Available since kernel 6.13.
+
+.SH RETURN VALUE
+Returns 0 on success, or
+.BR -errno
+on error.
+.SH SEE ALSO
+.BR io_uring_prep_msg_ring_cqe_flags (3) ,
+.BR io_uring_prep_msg_ring (3)

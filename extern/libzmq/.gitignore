@@ -1,0 +1,128 @@
+syntax: glob # for hg-git users
+
+# Generated build scripts and IDE generating files
+## autotools
+/Makefile
+builds/Makefile
+builds/deprecated-msvc/Makefile
+doc/Makefile
+libtool
+### automake
+Makefile.in
+.deps/
+.dirstamp
+### autoconf
+autom4te.cache
+aclocal.m4
+config
+config.status
+config.log
+configure
+stamp-h1
+## CMake
+cmake-build-debug/
+build/
+## Android
+builds/android/prefix
+## IntelliJ
+.idea/
+## Visual Code
+.vscode/
+## other results-like folders
+bin/
+lib/
+obj/
+## Doxygen
+doxygen/
+## Packaging 
+packaging/nuget/*.nupkg
+
+# Test related build files
+libtestutil.a
+libunity.a
+
+# Some build outputs and temporal files
+*.o
+*.gcno
+*.gcda
+*.gcov
+*.ncb
+*.lo
+*.loT
+*.la
+*.exe
+*.html
+*.pdf
+*.ps
+*~
+.*~
+.libs
+
+# /src
+## Ignore generated files in configuration process
+src/platform.hpp*
+src/libzmq.pc
+
+# /tools
+## Executable binaries are ignored
+tools/curve_keygen
+## Executable source files must be tracked
+!tools/*.[ch]
+!tools/*.[ch]pp
+
+# /tests
+## Test binaries and logs are ignored
+tests/test*
+tests/test*.log
+tests/test*.trs
+## Test source files must be tracked
+!tests/test*.[ch]
+!tests/test*.[ch]pp
+## Build script and documentations must be tracked
+!tests/CMakeLists.txt
+!tests/README.md
+
+# /unittests
+## Unit test binaries and logs are ignored
+unittests/unittest_*
+unittests/unittest*.log
+unittests/unittest*.trs
+## Unit test source files must be tracked
+!unittests/unittest*.[ch]
+!unittests/unittest*.[ch]pp
+## Build script and documentations must be tracked
+!unittests/CMakeLists.txt
+!unittests/README.md
+
+# check test log files
+test-suite*.log
+
+# /perf
+## Benchmarking binaries and result files are ignored
+perf/*_lat
+perf/*_thr
+perf/benchmark_*
+perf/results
+## Benchmarking source files must be tracked
+!perf/*.[ch]
+!perf/*.[ch]pp
+## Benchmarking tool scripts must be tracked
+!perf/*.py
+!perf/*.sh
+
+# /doc
+## Generated document files 
+doc/*.[137]
+doc/*.html
+doc/*.xml
+
+# external libraries and release archive files
+foreign/openpgm/*
+!foreign/openpgm/*.tar.bz2
+!foreign/openpgm/*.tar.gz
+!foreign/openpgm/Makefile.am
+zeromq-*.tar.gz
+zeromq-*.zip
+core
+
+mybuild

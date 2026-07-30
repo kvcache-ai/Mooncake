@@ -1,14 +1,13 @@
-// ASIO separate compilation implementation
-// This file compiles all asio source code into a shared library
-// to avoid ODR violations when multiple shared libraries use asio
+// ASIO separate compilation implementation. This translation unit is compiled
+// into Mooncake's private static Asio target and absorbed by final artifacts.
 
 // Define ASIO macros before including headers to ensure proper compilation
 #ifndef ASIO_SEPARATE_COMPILATION
 #define ASIO_SEPARATE_COMPILATION
 #endif
 
-#ifndef ASIO_DYN_LINK
-#define ASIO_DYN_LINK
-#endif
-
 #include <asio/impl/src.hpp>
+
+#ifdef YLT_ENABLE_SSL
+#include <asio/ssl/impl/src.hpp>
+#endif

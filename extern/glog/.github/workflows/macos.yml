@@ -1,0 +1,76 @@
+name: macOS
+
+on: [push, pull_request]
+
+jobs:
+  build-macos:
+    name: AppleClang-C++${{matrix.std}}-${{matrix.build_type}}
+    runs-on: macos-12
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: true
+      matrix:
+        std: [14, 17, 20, 23]
+        include:
+          - generator: Xcode
+          - build_type: Debug
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Dependencies
+        run: |
+          brew install ninja
+
+      - name: Setup Coverage Dependencies
+        if: matrix.build_type == 'Debug'
+        run: |
+          brew install gcovr
+
+      - name: Setup Environment
+        if: matrix.build_type == 'Debug'
+        run: |
+          echo 'CXXFLAGS=--coverage' >> $GITHUB_ENV
+          echo 'LDFLAGS=--coverage' >> $GITHUB_ENV
+
+      - name: Configure
+        shell: bash
+        env:
+          CXXFLAGS: -Wall -Wextra -Wsign-conversion -Wtautological-compare -Wformat-nonliteral -Wundef -Werror -pedantic-errors ${{env.CXXFLAGS}}
+        run: |
+          cmake -S . -B build_${{matrix.build_type}} \
+                -DCMAKE_CXX_EXTENSIONS=OFF \
+                -DCMAKE_CXX_STANDARD=${{matrix.std}} \
+                -DCMAKE_CXX_STANDARD_REQUIRED=ON \
+                -G "${{matrix.generator}}" \
+                -Werror
+
+      - name: Build
+        run: |
+          cmake --build build_${{matrix.build_type}} \
+                --config ${{matrix.build_type}}
+
+      - name: Test
+        run: |
+          ctest --test-dir build_${{matrix.build_type}} \
+                --build-config ${{matrix.build_type}} \
+                --output-on-failure
+
+      - name: Generate Coverage
+        if: matrix.build_type == 'Debug'
+        run: |
+          cd build_${{matrix.build_type}}
+          rm -r Tests/
+          gcovr -r .. . -s --cobertura coverage.xml
+
+      - name: Upload Coverage to Codecov
+        if: matrix.build_type == 'Debug'
+        uses: codecov/codecov-action@v4
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: build_${{matrix.build_type}}/coverage.xml
+          fail_ci_if_error: true
+          verbose: true

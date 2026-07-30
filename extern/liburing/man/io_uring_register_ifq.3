@@ -1,0 +1,49 @@
+.\" Copyright (C) 2025 Jens Axboe <axboe@kernel.dk>
+.\"
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_register_ifq 3 "January 18, 2025" "liburing-2.10" "liburing Manual"
+.SH NAME
+io_uring_register_ifq \- register a zero-copy receive interface queue
+.SH SYNOPSIS
+.nf
+.B #include <liburing.h>
+.PP
+.BI "int io_uring_register_ifq(struct io_uring *" ring ","
+.BI "                          struct io_uring_zcrx_ifq_reg *" reg ");"
+.fi
+.SH DESCRIPTION
+.PP
+The
+.BR io_uring_register_ifq (3)
+function registers a zero-copy receive interface queue with the io_uring
+instance specified by
+.IR ring .
+Zero-copy receive allows the kernel to place incoming network data directly
+into application-provided memory without copying.
+
+The
+.I reg
+argument is a pointer to a
+.I struct io_uring_zcrx_ifq_reg
+that describes the interface queue to register. See
+.BR io_uring_register (2)
+for a description of the
+.B IORING_REGISTER_ZCRX_IFQ
+operation and the structure fields.
+
+The io_uring ring must have been created with
+.B IORING_SETUP_DEFER_TASKRUN
+and either
+.B IORING_SETUP_CQE32
+or
+.B IORING_SETUP_CQE_MIXED
+flags set. The caller must have the
+.B CAP_NET_ADMIN
+capability.
+
+.SH RETURN VALUE
+Returns 0 on success. On error, a negative errno value is returned.
+.SH SEE ALSO
+.BR io_uring_register (2),
+.BR io_uring_setup (2)

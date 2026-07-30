@@ -24,10 +24,9 @@ required-features = ["link"]
 
 [features]
 default = ["link"]
-# Statically link `libmooncake_store` at build time. build.rs generates the FFI
-# with bindgen and links the Mooncake C++ static-library graph, so a built
-# Mooncake tree (libraries + `store_c.h`) must be present at build time. This is
-# the historical behavior.
+# Link the canonical `libmooncake_store.so` SDK at build time. build.rs
+# generates the FFI with bindgen; callers need only the shared library and
+# `store_c.h`, not its C++ dependency graph.
 link = ["dep:bindgen"]
 # Load `libmooncake_store.so` at run time via `dlopen`. Uses committed,
 # pre-generated bindings (src/generated/ffi_dlopen_bindings.rs), so a consumer

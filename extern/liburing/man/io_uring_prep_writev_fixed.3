@@ -1,0 +1,67 @@
+.\" Copyright (C) 2025 Jens Axboe <axboe@kernel.dk>
+.\"
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_prep_writev_fixed 3 "January 18, 2025" "liburing-2.10" "liburing Manual"
+.SH NAME
+io_uring_prep_writev_fixed \- prepare a vectored write using fixed buffers
+.SH SYNOPSIS
+.nf
+.B #include <liburing.h>
+.PP
+.BI "void io_uring_prep_writev_fixed(struct io_uring_sqe *" sqe ","
+.BI "                                int " fd ","
+.BI "                                const struct iovec *" iovecs ","
+.BI "                                unsigned " nr_vecs ","
+.BI "                                __u64 " offset ","
+.BI "                                int " flags ","
+.BI "                                int " buf_index ");"
+.fi
+.SH DESCRIPTION
+.PP
+The
+.BR io_uring_prep_writev_fixed (3)
+function prepares a vectored write request using fixed (registered) buffers.
+The submission queue entry
+.I sqe
+is setup to use the file descriptor
+.I fd
+to start writing
+.I nr_vecs
+iovecs from the file position
+.IR offset .
+
+The
+.I iovecs
+argument points to an array of iovec structures describing the write
+buffers. All buffers must be part of the registered buffer set at index
+.IR buf_index ,
+previously registered with
+.BR io_uring_register_buffers (3).
+
+The
+.I flags
+argument can contain any per-request flags, such as
+.B RWF_APPEND
+or other flags supported by
+.BR pwritev2 (2).
+
+Using fixed buffers avoids the overhead of mapping buffers for each I/O
+operation, improving performance for applications that reuse the same
+buffers.
+
+.SH RETURN VALUE
+None
+.SH ERRORS
+The CQE
+.I res
+field will contain the result of the operation, the number of bytes written
+on success. On error, a negative errno value is returned.
+.SH SEE ALSO
+.BR io_uring_get_sqe (3),
+.BR io_uring_submit (3),
+.BR io_uring_prep_writev (3),
+.BR io_uring_prep_writev2 (3),
+.BR io_uring_prep_write_fixed (3),
+.BR io_uring_prep_readv_fixed (3),
+.BR io_uring_register_buffers (3)

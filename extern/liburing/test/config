@@ -1,0 +1,14 @@
+# Copy this to config.local, uncomment and define values
+#
+# NOTE: any files or devices added here will be used by tests that take
+# a file or device arguments This includes tests that are destructive with
+# respect to data contents. They may get erased or overwritten as part of tests.
+#
+# Define tests to exclude from running
+# TEST_EXCLUDE=""
+#
+# Define raw test devices (or files) for test cases, if any
+# declare -A TEST_MAP=()
+#
+# If no TEST_MAP entry exists for a test, use the ones given in TEST_FILES
+# TEST_FILES="/dev/somedevice /data/somefile"

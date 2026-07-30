@@ -1,0 +1,45 @@
+.\" Copyright (C) 2025 Jens Axboe <axboe@kernel.dk>
+.\"
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_register_wait_reg 3 "January 18, 2025" "liburing-2.9" "liburing Manual"
+.SH NAME
+io_uring_register_wait_reg \- register wait regions with io_uring
+.SH SYNOPSIS
+.nf
+.B #include <liburing.h>
+.PP
+.BI "int io_uring_register_wait_reg(struct io_uring *" ring ","
+.BI "                               struct io_uring_reg_wait *" reg ","
+.BI "                               int " nr ");"
+.fi
+.SH DESCRIPTION
+.PP
+The
+.BR io_uring_register_wait_reg (3)
+function registers wait regions with the io_uring instance specified by
+.IR ring .
+The
+.I reg
+argument is a pointer to an array of
+.I struct io_uring_reg_wait
+of
+.I nr
+entries.
+
+Wait regions allow registering timeout and signal mask information that can
+be reused across multiple wait operations without copying the data for each
+call. This is used in conjunction with
+.BR io_uring_submit_and_wait_reg (3)
+to reduce the overhead of wait operations.
+
+See
+.BR io_uring_register_region (3)
+for registering the underlying memory region.
+
+.SH RETURN VALUE
+Returns 0 on success. On error, a negative errno value is returned.
+.SH SEE ALSO
+.BR io_uring_submit_and_wait_reg (3),
+.BR io_uring_register_region (3),
+.BR io_uring_register (2)

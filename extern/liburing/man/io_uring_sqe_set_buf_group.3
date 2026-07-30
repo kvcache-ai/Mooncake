@@ -1,0 +1,32 @@
+.\" Copyright (C) 2024 Christian Mazakas <christian.mazakas@gmail.com>
+.\"
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_sqe_set_buf_group 3 "December 9, 2024" "liburing-2.9" "liburing Manual"
+.SH NAME
+io_uring_sqe_set_buf_group \- set buf group for submission queue event
+.SH SYNOPSIS
+.nf
+.B #include <liburing.h>
+.PP
+.BI "void io_uring_sqe_set_buf_group(struct io_uring_sqe *" sqe ","
+.BI "                                int " bgid ");"
+.fi
+.SH DESCRIPTION
+.PP
+The
+.BR io_uring_sqe_set_buf_group (3)
+function sets the associated buf_group of the
+.I sqe
+to
+.IR bgid .
+
+After the caller has requested a submission queue entry (SQE) with
+.BR io_uring_get_sqe (3) ,
+they can associate a buf_group with the SQE used for multishot operations.
+
+.SH RETURN VALUE
+None
+.SH SEE ALSO
+.BR io_uring_get_sqe (3),
+.BR io_uring_cqe_set_data (3)

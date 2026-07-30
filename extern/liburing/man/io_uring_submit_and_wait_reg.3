@@ -1,0 +1,64 @@
+.\" Copyright (C) 2024 Jens Axboe <axboe@kernel.dk>
+.\"
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_submit_and_wait_reg 3 "November 2, 2024" "liburing-2.9" "liburing Manual"
+.SH NAME
+io_uring_submit_and_wait_reg \- Sets up and registers fixed wait regions
+.SH SYNOPSIS
+.nf
+.B #include <liburing.h>
+.PP
+.BI "int io_uring_submit_and_wait_reg(struct io_uring *" ring ","
+.BI "                                 struct io_uring_cqe **"cqe_ptr ","
+.BI "                                 unsigned "wait_nr ","
+.BI "                                 int "reg_index ");"
+.PP
+.fi
+.SH DESCRIPTION
+.PP
+The
+.BR io_uring_submit_and_wait_reg (3)
+submits previously prepared requests in the ring
+.IR ring
+and waits for
+.IR wait_nr
+completions using the registered wait index of
+.IR reg_index .
+Upon successful return, the completion events are stored in the
+.IR cqe_ptr
+array.
+
+This function works like
+.BR io_uring_submit_and_wait_min_timeout (3)
+in that it supports all the features of that helper, but rather than pass in
+all the information in a struct that needs copying, it references a registered
+wait index for which previously registered wait region holds information
+about how the wait should be performed. That includes information such as
+the overall timeout, the minimum timeout to be used, and so forth. See
+.BR io_uring_setup_register_region (3)
+for the details on registered regions, specifically for registered wait
+regions.
+
+Using registered wait regions has less overhead then other wait methods, as
+no copying of data is needed.
+
+It's valid to use this function purely for waiting on events, even if no
+new requests should be submitted.
+
+.SH RETURN VALUE
+On success
+.BR io_uring_submit_and_wait_reg (3)
+returns the number of new requests submitted. On failure it returns
+.BR -errno .
+If the kernel doesn't support this functionality,
+.BR -EINVAL
+will be returned. If no events are submitted and the wait operation times
+out, then
+.BR -ETIME
+will be returned.
+
+.SH SEE ALSO
+.BR io_uring_register_region (3) ,
+.BR io_uring_submit_and_wait_min_timeout (3) ,
+.BR io_uring_submit_and_wait_timeout (3)

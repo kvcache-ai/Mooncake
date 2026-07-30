@@ -22,54 +22,19 @@ fi
 
 BUILD_DIR=$(cd "$1" && pwd)
 TARGET=$(cd "$2" && pwd)
-USE_ETCD=${3:-OFF}
-USE_REDIS=${4:-OFF}
-USE_HTTP=${5:-OFF}
-USE_ETCD_LEGACY=${6:-OFF}
+# Legacy feature arguments are accepted for command-line compatibility. Their
+# libraries are now owned by libmooncake_store.so.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # CGo compiler flags — point at the store_c.h header
 CGO_CFLAGS="-I${REPO_ROOT}/mooncake-store/include"
-CGO_CFLAGS+=" -I${REPO_ROOT}/mooncake-transfer-engine/include"
 
-# CGo linker flags — link against mooncake_store, transfer_engine, and deps
+# CGo links only the project-level Store SDK. Its portable and hardware/system
+# dependencies are owned by libmooncake_store.so rather than duplicated here.
 CGO_LDFLAGS="-L${BUILD_DIR}/mooncake-store/src"
-CGO_LDFLAGS+=" -L${BUILD_DIR}/mooncake-store/src/cachelib_memory_allocator"
-CGO_LDFLAGS+=" -L${BUILD_DIR}/mooncake-transfer-engine/src"
-CGO_LDFLAGS+=" -L${BUILD_DIR}/mooncake-transfer-engine/src/common/base"
-CGO_LDFLAGS+=" -L${BUILD_DIR}/mooncake-common"
-CGO_LDFLAGS+=" -L${BUILD_DIR}/mooncake-common/src"
-CGO_LDFLAGS+=" -Wl,--start-group -lmooncake_store -lcachelib_memory_allocator -ltransfer_engine -lbase -lmooncake_common -Wl,--end-group"
-CGO_LDFLAGS+=" -lasio -lxxhash -lyaml-cpp"
-CGO_LDFLAGS+=" -lstdc++ -lnuma -lglog -lgflags -libverbs -lmlx5 -ljsoncpp -lzstd -lcurl -lm"
-
-if [ -d "/usr/local/cuda/lib64" ]; then
-    CGO_LDFLAGS+=" -L/usr/local/cuda/lib64 -lcudart"
-fi
-
-CGO_LDFLAGS+=" -luring"
-
-# KV events publisher (optional; linked when libzmq is installed).
-if ldconfig -p 2>/dev/null | grep -q libzmq \
-    || [ -f /usr/lib/x86_64-linux-gnu/libzmq.so ] \
-    || [ -f /usr/lib/libzmq.so ]; then
-    CGO_LDFLAGS+=" -lzmq"
-fi
-
-if [ "$USE_ETCD" = "ON" ]; then
-    if [ "$USE_ETCD_LEGACY" = "ON" ]; then
-        CGO_LDFLAGS+=" -letcd-cpp-api -lprotobuf -lgrpc++ -lgrpc"
-    else
-        CGO_LDFLAGS+=" -L${BUILD_DIR}/mooncake-common/etcd -letcd_wrapper"
-    fi
-fi
-
-if [ "$USE_REDIS" = "ON" ]; then
-    CGO_LDFLAGS+=" -lhiredis"
-fi
-
+CGO_LDFLAGS+=" -Wl,-rpath,${BUILD_DIR}/mooncake-store/src -lmooncake_store"
 
 export CGO_CFLAGS
 export CGO_LDFLAGS

@@ -61,10 +61,10 @@ class MasterSnapshotCodecTest;  // test fixture, needs private state access
 class AllocationStrategy;
 class EvictionStrategy;
 class HaKvBackend;
+class HttpMetadataClient;
 class HttpMetadataServer;
 class OpLogBatchStorage;
 class OrderedOpLogWriter;
-struct MetadataStoragePlugin;
 
 // Forward declarations for test classes
 namespace test {
@@ -2084,7 +2084,7 @@ class MasterService {
 
     // Remote HTTP metadata client, used when the metadata server is deployed
     // separately. nullptr = no remote cleanup (co-located prefers the pointer).
-    std::shared_ptr<MetadataStoragePlugin> http_metadata_remote_;
+    std::shared_ptr<HttpMetadataClient> http_metadata_remote_;
 
     // Cached HTTP metadata key prefix (initialized once at startup)
     std::string http_metadata_prefix_;

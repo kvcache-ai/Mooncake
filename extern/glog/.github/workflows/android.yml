@@ -1,0 +1,69 @@
+name: Android
+
+on: [push, pull_request]
+
+jobs:
+  build-android:
+    name: NDK-C++${{matrix.std}}-${{matrix.abi}}-${{matrix.build_type}}
+    runs-on: ubuntu-22.04
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    defaults:
+      run:
+        shell: bash
+    env:
+      NDK_VERSION: 26.0.10792818
+    strategy:
+      fail-fast: true
+      matrix:
+        std: [14, 17, 20]
+        abi: [arm64-v8a, armeabi-v7a, x86_64, x86]
+        build_type: [Debug, Release]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: cpp
+
+      - name: Setup Dependencies
+        run: |
+          sudo apt-get update
+          DEBIAN_FRONTEND=noninteractive sudo apt-get install -y \
+            cmake \
+            ninja-build
+
+      - name: Setup NDK
+        env:
+          ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+        run: |
+          echo 'y' | ${{env.ANDROID_SDK_ROOT}}/cmdline-tools/latest/bin/sdkmanager --install 'ndk;${{env.NDK_VERSION}}'
+
+      - name: Configure
+        env:
+          CXXFLAGS: -Wall -Wextra -Wpedantic -Wsign-conversion -Wtautological-compare -Wformat-nonliteral -Wundef -Werror ${{env.CXXFLAGS}}
+        run: |
+          cmake -S . -B build_${{matrix.abi}} \
+                -DCMAKE_ANDROID_API=28 \
+                -DCMAKE_ANDROID_ARCH_ABI=${{matrix.abi}} \
+                -DCMAKE_ANDROID_NDK=/usr/local/lib/android/sdk/ndk/${{env.NDK_VERSION}} \
+                -DCMAKE_ANDROID_STL_TYPE=c++_shared \
+                -DCMAKE_BUILD_TYPE=${{matrix.build_type}} \
+                -DCMAKE_CXX_EXTENSIONS=OFF \
+                -DCMAKE_CXX_STANDARD=${{matrix.std}} \
+                -DCMAKE_CXX_STANDARD_REQUIRED=ON \
+                -DCMAKE_SYSTEM_NAME=Android \
+                -G Ninja \
+                -Werror
+
+      - name: Build
+        run: |
+          cmake --build build_${{matrix.abi}} \
+                --config ${{matrix.build_type}}
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3

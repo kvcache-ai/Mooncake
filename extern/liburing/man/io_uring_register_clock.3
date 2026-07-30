@@ -1,0 +1,72 @@
+.\" Copyright (C) 2024 Jens Axboe <axboe@kernel.dk>
+.\"
+.\" SPDX-License-Identifier: LGPL-2.0-or-later
+.\"
+.TH io_uring_register_clock 3 "Aug 18, 2024" "liburing-2.8" "liburing Manual"
+.SH NAME
+io_uring_register_clock \- set clock source for event waiting
+.SH SYNOPSIS
+.nf
+.B #include <liburing.h>
+.PP
+.BI "int io_uring_register_clock(struct io_uring *" ring ",
+.BI "                            struct io_uring_clock_register *" arg ");"
+.fi
+.SH DESCRIPTION
+.PP
+The
+.BR io_uring_register_clock (3)
+function registers which clock source should be used by io_uring, when an
+application waits for event completions. The
+.IR ring
+argument should point to the ring in question, and the
+.IR arg
+argument should be a pointer to a
+.B struct io_uring_clock_register .
+
+The
+.IR arg
+argument must be filled in with the appropriate information. It looks as
+follows:
+.PP
+.in +4n
+.EX
+struct io_uring_clock_register {
+    __u32 clockid;
+    __u32 __resv[3];
+};
+.EE
+.in
+.PP
+The
+.I clockid
+field must contain the clock source, with valid sources being:
+.TP
+.B CLOCK_MONOTONIC
+a nonsettable system-wide clock that represents monotonic time.
+.TP
+.B CLOCK_BOOTTIME
+A nonsettable system-wide clock that is identical to
+.B CLOCK_MONOTONIC ,
+except that is also icnludes any time that the system is suspended.
+.PP
+See
+.BR clock_gettime (3)
+for more details.
+
+The
+.I __resv
+fields must be filled with zeroes.
+
+Available since 6.12.
+
+.SH RETURN VALUE
+On success
+.BR io_uring_register_clock (3)
+returns 0. On failure it returns
+.BR -errno .
+.SH SEE ALSO
+.BR clock_gettime (3),
+.BR io_uring_register (2),
+.BR io_uring_wait_cqe (3),
+.BR io_uring_wait_cqe_timeout (3),
