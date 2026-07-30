@@ -113,6 +113,105 @@ TEST(RequestMergeTest, KeepsNonContiguousRequestsSplit) {
     EXPECT_EQ(merged.task_lookup.at(1), 1u);
 }
 
+TEST(RequestMergeTest, DoesNotMergeAcrossDifferentTransportHint) {
+    std::array<char, 2048> source{};
+    const auto source_addr =
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(source.data()));
+
+    std::vector<Request> requests = {
+        makeWriteRequest(source.data(), 0, 4096, 1024),
+        makeWriteRequest(source.data(), 1024, 5120, 1024),
+    };
+    requests[0].transport_hint = TransportType::RDMA;
+    requests[1].transport_hint = TransportType::TCP;
+
+    std::vector<RequestBoundaryInfo> boundaries = {
+        {makeBufferKey(source_addr, 2048), makeBufferKey(4096, 2048)},
+        {makeBufferKey(source_addr, 2048), makeBufferKey(4096, 2048)},
+    };
+
+    auto merged = mergeRequests(requests, boundaries, true);
+
+    // Mixed hints across an otherwise-contiguous run must stay split,
+    // otherwise the merged request would carry only one hint and the
+    // other half's pinning would silently disappear.
+    ASSERT_EQ(merged.request_list.size(), 2u);
+    EXPECT_EQ(merged.request_list[0].length, 1024u);
+    EXPECT_EQ(merged.request_list[1].length, 1024u);
+    EXPECT_NE(merged.request_list[0].transport_hint,
+              merged.request_list[1].transport_hint);
+}
+
+TEST(RequestMergeTest, MergesAdjacentRequestsWithSameTransportHint) {
+    std::array<char, 2048> source{};
+    const auto source_addr =
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(source.data()));
+
+    std::vector<Request> requests = {
+        makeWriteRequest(source.data(), 0, 4096, 1024),
+        makeWriteRequest(source.data(), 1024, 5120, 1024),
+    };
+    requests[0].transport_hint = TransportType::TCP;
+    requests[1].transport_hint = TransportType::TCP;
+
+    std::vector<RequestBoundaryInfo> boundaries = {
+        {makeBufferKey(source_addr, 2048), makeBufferKey(4096, 2048)},
+        {makeBufferKey(source_addr, 2048), makeBufferKey(4096, 2048)},
+    };
+
+    auto merged = mergeRequests(requests, boundaries, true);
+
+    // Regression guard: adding transport_hint must not break merging
+    // when the hint is the same on both sides.
+    ASSERT_EQ(merged.request_list.size(), 1u);
+    EXPECT_EQ(merged.request_list[0].length, 2048u);
+    EXPECT_EQ(merged.request_list[0].transport_hint, TransportType::TCP);
+    EXPECT_EQ(merged.task_lookup.at(0), 0u);
+    EXPECT_EQ(merged.task_lookup.at(1), 0u);
+}
+
+TEST(RequestMergeTest, MixedHintBatchStillMergesPerHint) {
+    std::array<char, 4096> source{};
+    const auto source_addr =
+        static_cast<uint64_t>(reinterpret_cast<uintptr_t>(source.data()));
+
+    // Four requests interleave RDMA / TCP in submission order, but within
+    // each hint group both source and target are contiguous. After the
+    // hint-aware sort, the two RDMA requests fold into one, and the two
+    // TCP requests fold into the other.
+    //
+    // RDMA source pair: bytes [0, 2048) -> target [4096, 6144)
+    // TCP  source pair: bytes [2048, 4096) -> target [8192, 10240)
+    std::vector<Request> requests = {
+        makeWriteRequest(source.data(), 0, 4096, 1024),     // RDMA
+        makeWriteRequest(source.data(), 2048, 8192, 1024),  // TCP
+        makeWriteRequest(source.data(), 1024, 5120, 1024),  // RDMA (contig)
+        makeWriteRequest(source.data(), 3072, 9216, 1024),  // TCP  (contig)
+    };
+    requests[0].transport_hint = TransportType::RDMA;
+    requests[1].transport_hint = TransportType::TCP;
+    requests[2].transport_hint = TransportType::RDMA;
+    requests[3].transport_hint = TransportType::TCP;
+
+    std::vector<RequestBoundaryInfo> boundaries = {
+        {makeBufferKey(source_addr, 4096), makeBufferKey(4096, 6144)},
+        {makeBufferKey(source_addr, 4096), makeBufferKey(8192, 2048)},
+        {makeBufferKey(source_addr, 4096), makeBufferKey(4096, 6144)},
+        {makeBufferKey(source_addr, 4096), makeBufferKey(8192, 2048)},
+    };
+
+    auto merged = mergeRequests(requests, boundaries, true);
+
+    ASSERT_EQ(merged.request_list.size(), 2u);
+    // 0,2 (RDMA, contiguous on src+target) → one merged request, len 2048.
+    // 1,3 (TCP, contiguous on src+target)  → one merged request, len 2048.
+    EXPECT_EQ(merged.request_list[0].length, 2048u);
+    EXPECT_EQ(merged.request_list[1].length, 2048u);
+    EXPECT_EQ(merged.task_lookup.at(0), merged.task_lookup.at(2));
+    EXPECT_EQ(merged.task_lookup.at(1), merged.task_lookup.at(3));
+    EXPECT_NE(merged.task_lookup.at(0), merged.task_lookup.at(1));
+}
+
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake

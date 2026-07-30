@@ -34,29 +34,74 @@ function(add_ha_test name)
 endfunction()
 
 add_store_test(buffer_allocator_test buffer_allocator_test.cpp)
+add_store_test(runtime_accelerator_test runtime_accelerator_test.cpp)
+add_store_test(registered_pinned_memory_test registered_pinned_memory_test.cpp)
 add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
+add_store_test(replica_selection_test replica_selection_test.cpp)
+add_test(
+  NAME replica_selection_env_opt_in_test
+  COMMAND replica_selection_test
+          --gtest_filter=ReplicaSelectionTest.EnvironmentOptInUsesBuiltinScorer)
+set_tests_properties(replica_selection_env_opt_in_test
+                     PROPERTIES ENVIRONMENT "MC_STORE_REPLICA_SCORING=1")
 add_store_test(eviction_strategy_test eviction_strategy_test.cpp)
+add_store_test(deadline_scheduler_test deadline_scheduler_test.cpp)
+add_store_test(kv_event_publisher_test kv_event_publisher_test.cpp)
+if(ENABLE_KV_EVENTS)
+  find_library(
+    KV_EVENT_TEST_ZMQ_LIBRARY
+    NAMES zmq libzmq
+    PATHS /usr/lib /usr/local/lib /usr/lib64)
+  find_path(
+    KV_EVENT_TEST_ZMQ_INCLUDE_DIR
+    NAMES zmq.h
+    PATHS /usr/include /usr/local/include)
+  target_compile_definitions(kv_event_publisher_test
+                             PRIVATE MOONCAKE_ENABLE_KV_EVENTS=1)
+  if(KV_EVENT_TEST_ZMQ_LIBRARY AND KV_EVENT_TEST_ZMQ_INCLUDE_DIR)
+    target_include_directories(kv_event_publisher_test
+                               PRIVATE ${KV_EVENT_TEST_ZMQ_INCLUDE_DIR})
+    target_link_libraries(kv_event_publisher_test
+                          PRIVATE ${KV_EVENT_TEST_ZMQ_LIBRARY})
+  endif()
+endif()
 add_store_test(master_service_test master_service_test.cpp)
+add_store_test(master_service_config_test master_service_config_test.cpp)
+add_store_test(master_service_tenant_quota_test
+               master_service_tenant_quota_test.cpp)
 add_store_test(batch_remove_test batch_remove_test.cpp)
 add_store_test(master_service_ssd_test master_service_ssd_test.cpp)
 add_store_test(offload_on_evict_test offload_on_evict_test.cpp)
+add_store_test(promotion_on_hit_test promotion_on_hit_test.cpp)
+add_store_test(file_storage_promotion_test file_storage_promotion_test.cpp)
 add_store_test(master_service_ssd_test_for_snapshot
                ha/snapshot/master_service_ssd_test_for_snapshot.cpp)
+add_store_test(master_service_promotion_test_for_snapshot
+               ha/snapshot/master_service_promotion_test_for_snapshot.cpp)
+if(USE_NOF)
+  add_store_test(nof_heartbeat_test nof_heartbeat_test.cpp)
+endif()
 add_store_test(client_integration_test client_integration_test.cpp)
+add_store_test(rpc_timeout_test rpc_timeout_test.cpp)
 if(USE_CXL)
   add_store_test(cxl_client_integration_test cxl_client_integration_test.cpp)
 endif()
 add_store_test(master_metrics_test master_metrics_test.cpp)
+add_store_test(master_admin_server_test master_admin_server_test.cpp)
 add_store_test(posix_file_test posix_file_test.cpp)
 add_store_test(thread_pool_test thread_pool_test.cpp)
 add_store_test(transfer_task_test transfer_task_test.cpp)
+add_store_test(tenant_quota_test tenant_quota_test.cpp)
+add_store_test(tenant_id_test tenant_id_test.cpp)
 add_store_test(segment_test segment_test.cpp)
 add_store_test(offset_allocator_test offset_allocator_test.cpp)
 add_store_test(utils_test utils_test.cpp)
 add_store_test(client_buffer_test client_buffer_test.cpp)
 add_store_test(client_local_hot_cache_test client_local_hot_cache_test.cpp)
+add_store_test(client_tcp_local_memcpy_test client_tcp_local_memcpy_test.cpp)
 add_store_test(pybind_client_test pybind_client_test.cpp)
 add_store_test(ipv6_client_test ipv6_client_test.cpp)
+add_store_test(host_port_fix_test host_port_fix_test.cpp)
 add_store_test(client_metrics_test client_metrics_test.cpp)
 add_store_test(ssd_metrics_test ssd_metrics_test.cpp)
 add_store_test(serializer_test serializer_test.cpp)
@@ -71,19 +116,25 @@ add_store_test(
 add_store_test(file_util_test file_util_test.cpp)
 add_store_test(snapshot_child_process_test
                ha/snapshot/snapshot_child_process_test.cpp)
+add_store_test(master_snapshot_codec_test
+               ha/snapshot/master_snapshot_codec_test.cpp)
 add_store_test(master_service_test_for_snapshot
                ha/snapshot/master_service_test_for_snapshot.cpp)
 add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)
 add_store_test(storage_backend_test storage_backend_test.cpp)
+add_store_test(client_storage_backend_test client_storage_backend_test.cpp)
 add_store_test(mutex_test mutex_test.cpp)
 add_store_test(file_storage_test file_storage_test.cpp)
 add_store_test(task_manager_test task_manager_test.cpp)
 add_store_test(task_executor_test task_executor_test.cpp)
 add_store_test(task_integration_test task_integration_test.cpp)
 add_store_test(dummy_client_get_buffer_test dummy_client_get_buffer_test.cpp)
+add_store_test(uds_transport_test uds_transport_test.cpp)
 add_store_test(health_check_test health_check_test.cpp)
+add_store_test(http_metadata_server_test http_metadata_server_test.cpp)
 add_store_test(mmap_arena_test mmap_arena_test.cpp)
 add_store_test(mmap_arena_fallback_test mmap_arena_fallback_test.cpp)
+add_store_test(object_data_type_test object_data_type_test.cpp)
 add_subdirectory(e2e)
 
 add_executable(high_availability_test ha/leadership/high_availability_test.cpp)
@@ -119,6 +170,11 @@ if(STORE_USE_REDIS)
   add_test(NAME redis_snapshot_catalog_store_test
            COMMAND redis_snapshot_catalog_store_test)
 endif()
+if(STORE_USE_K8S_LEASE)
+  target_sources(
+    high_availability_test
+    PRIVATE ha/leadership/backends/k8s/high_availability_k8s_test.cpp)
+endif()
 target_link_libraries(
   high_availability_test
   PUBLIC mooncake_store
@@ -129,9 +185,24 @@ target_link_libraries(
          gtest
          gtest_main
          pthread)
-if(STORE_USE_ETCD OR STORE_USE_REDIS)
+if(STORE_USE_K8S_LEASE)
+  target_link_libraries(high_availability_test PRIVATE ${K8S_LEASE_WRAPPER_LIB})
+endif()
+if(STORE_USE_ETCD
+   OR STORE_USE_REDIS
+   OR STORE_USE_K8S_LEASE)
   add_test(NAME high_availability_test COMMAND high_availability_test)
 endif()
+add_ha_test(ha_backend_availability_test
+            ha/leadership/ha_backend_availability_test.cpp)
+add_ha_test(leader_label_reconciler_test
+            ha/leadership/leader_label_reconciler_test.cpp)
+add_ha_test(oplog_batch_storage_test ha/oplog/oplog_batch_storage_test.cpp)
+add_ha_test(oplog_batch_auditor_test ha/oplog/oplog_batch_auditor_test.cpp)
+target_sources(oplog_batch_auditor_test
+               PRIVATE ../tools/oplog_batch_auditor.cpp)
+target_include_directories(oplog_batch_auditor_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/..)
 
 add_executable(stress_workload_test stress_workload_test.cpp)
 target_link_libraries(
@@ -153,14 +224,26 @@ add_ha_test(hot_standby_service_test ha/standby/hot_standby_service_test.cpp)
 add_ha_test(hot_standby_snapshot_bootstrap_test
             ha/standby/hot_standby_snapshot_bootstrap_test.cpp)
 add_ha_test(oplog_applier_test ha/oplog/oplog_applier_test.cpp)
-add_ha_test(oplog_manager_test ha/oplog/oplog_manager_test.cpp)
-add_ha_test(etcd_oplog_store_test ha/oplog/etcd_oplog_store_test.cpp)
-add_ha_test(oplog_replicator_test ha/oplog/oplog_replicator_test.cpp)
-add_ha_test(oplog_serializer_test ha/oplog/oplog_serializer_test.cpp)
-add_ha_test(localfs_oplog_store_test ha/oplog/localfs_oplog_store_test.cpp)
-add_ha_test(ha_recovery_test ha/oplog/ha_recovery_test.cpp)
-add_ha_test(localfs_hot_standby_integration_test
-            ha/oplog/localfs_hot_standby_integration_test.cpp)
+add_ha_test(oplog_types_test ha/oplog/oplog_types_test.cpp)
+add_ha_test(oplog_batch_codec_test ha/oplog/oplog_batch_codec_test.cpp)
+add_ha_test(oplog_batch_standby_reader_test
+            ha/oplog/oplog_batch_standby_reader_test.cpp)
+add_ha_test(ordered_oplog_writer_test ha/oplog/ordered_oplog_writer_test.cpp)
+if(MOONCAKE_ENABLE_OPLOG_PERF_METRICS)
+  target_compile_definitions(ha_metric_manager_test
+                             PRIVATE MOONCAKE_ENABLE_OPLOG_PERF_METRICS)
+  target_compile_definitions(ordered_oplog_writer_test
+                             PRIVATE MOONCAKE_ENABLE_OPLOG_PERF_METRICS)
+endif()
+add_executable(
+  oplog_test_failpoint_test ha/oplog/oplog_test_failpoint_test.cpp
+                            ../src/ha/oplog/oplog_test_failpoint.cpp)
+target_compile_definitions(oplog_test_failpoint_test
+                           PRIVATE MOONCAKE_ENABLE_TEST_FAILPOINTS)
+target_link_libraries(oplog_test_failpoint_test PRIVATE glog gtest gtest_main
+                                                        pthread)
+add_test(NAME oplog_test_failpoint_test COMMAND oplog_test_failpoint_test)
+add_ha_test(master_service_ha_test ha/master_service_ha_test.cpp)
 add_ha_test(catalog_backed_snapshot_provider_test
             ha/snapshot/catalog_backed_snapshot_provider_test.cpp)
 if(STORE_USE_REDIS)

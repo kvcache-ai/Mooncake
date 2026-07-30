@@ -80,7 +80,7 @@ Status BufIoTransport::install(std::string& local_segment_name,
 
     installed_ = true;
     caps.dram_to_file = true;
-    if (Platform::getLoader().type() == "cuda") {
+    if (Platform::getLoader().type() != "cpu") {
         caps.gpu_to_file = true;
     }
 

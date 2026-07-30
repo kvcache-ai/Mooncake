@@ -10,6 +10,8 @@
 #   TORCH_CUDA_ARCH_LIST - pipe-separated CUDA arch list forwarded to torch
 #   STAGING_DIR         - destination directory for the built .so files
 #   ENGINE_SO_PATH      - absolute path to the built engine.cpython-XYZ.so
+#   EP_USE_MUSA         - set to "1" when building for MUSA (MTLink path)
+#   EP_USE_MACA         - set to "1" when building for MACA (MTLink path)
 
 cmake_minimum_required(VERSION 3.16)
 
@@ -34,6 +36,21 @@ endif()
 set(ENV{MAKEFLAGS} "")
 set(ENV{MFLAGS} "")
 set(ENV{TORCH_CUDA_ARCH_LIST} "${TORCH_CUDA_ARCH_LIST}")
+if(EP_USE_MUSA)
+  set(ENV{MOONCAKE_EP_USE_MUSA} "1")
+else()
+  unset(ENV{MOONCAKE_EP_USE_MUSA})
+endif()
+if(EP_USE_MACA)
+  set(ENV{MOONCAKE_EP_USE_MACA} "1")
+  if(DEFINED ENV{MACA_PATH})
+    set(ENV{MACA_HOME} "$ENV{MACA_PATH}")
+  elseif(DEFINED ENV{MACA_HOME})
+    set(ENV{MACA_PATH} "$ENV{MACA_HOME}")
+  endif()
+else()
+  unset(ENV{MOONCAKE_EP_USE_MACA})
+endif()
 
 # ---------------------------------------------------------------------------
 # 2. Ensure engine.so exists in mooncake-wheel/mooncake/ for setup.py linking.

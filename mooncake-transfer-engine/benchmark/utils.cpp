@@ -20,6 +20,15 @@
 DEFINE_string(seg_name, "", "Memory segment name for the local side");
 DEFINE_string(seg_type, "DRAM",
               "Memory segment type for the target side: DRAM|VRAM");
+DEFINE_string(
+    seg_type_mix, "",
+    "Comma-separated segment types for mixed DRAM+VRAM runs, e.g. "
+    "\"dram,vram\". When set, target registers buffers of each listed type "
+    "in one segment, and initiator threads round-robin across them so a "
+    "single tebench process drives traffic over multiple memory types (and "
+    "thus multiple transports — SHM for DRAM, NVLink for VRAM) "
+    "concurrently. Empty falls back to --seg_type (single type, existing "
+    "behavior). Requires transports to be enabled via MC_TENT_CONF.");
 DEFINE_string(target_seg_name, "", "Memory segment name for the target side");
 DEFINE_string(op_type, "read", "Operation type to benchmark: read|write|mix");
 DEFINE_bool(check_consistency, false,
@@ -35,6 +44,32 @@ DEFINE_int32(start_num_threads, 1,
              "Start number of concurrent worker threads.");
 DEFINE_int32(max_num_threads, 1,
              "Maximum number of concurrent worker threads.");
+DEFINE_string(
+    qos_classes, "",
+    "QoS classes as name:threads:slo_us:weight[:isolated_gbps],...; "
+    "enables per-class QoS metrics and requires a fixed thread count.");
+DEFINE_string(qos_classes_json, "",
+              "QoS classes as a JSON array of objects with name, threads, "
+              "slo_us, weight, and optional isolated_gbps fields.");
+DEFINE_string(
+    workload_classes_json, "",
+    "Mixed traffic classes as a JSON array with name, threads, block_size, "
+    "batch_size, intent_type, slo_us, weight, and optional deadline_us and "
+    "isolated_gbps fields. Overrides the block/batch sweep.");
+DEFINE_double(qos_link_capacity_gbps, 0.0,
+              "Link capacity in GB/s for total utilization (0 reports N/A).");
+DEFINE_string(qos_output_jsonl, "",
+              "Append versioned QoS metric records to this JSONL file.");
+DEFINE_uint64(deadline_us, 0,
+              "tent only: relative per-transfer deadline in microseconds for "
+              "tight worker threads (0 disables deadline tagging); cannot be "
+              "combined with --workload_classes_json.");
+DEFINE_int32(deadline_tight_threads, 0,
+             "tent only: workers [0, N) that carry --deadline_us; remaining "
+             "workers have no deadline; cannot be combined with "
+             "--workload_classes_json.");
+DEFINE_bool(deadline_bw_arbitration, false,
+            "tent only: enable deadline-aware RDMA bandwidth arbitration.");
 DEFINE_int32(local_gpu_id, 0, "Local GPU ID to be used, -1 for all GPUs");
 DEFINE_int32(target_gpu_id, 0, "Target GPU ID to be used, -1 for all GPUs");
 DEFINE_string(metadata_type, "p2p",
@@ -44,15 +79,25 @@ DEFINE_string(metadata_url_list, "",
 DEFINE_int32(
     rpc_server_port, 0,
     "RPC server port used for p2p metadata service (0 = auto-select).");
-DEFINE_string(xport_type, "", "Transport type: rdma|shm|mnnvl|gds|iouring");
+DEFINE_string(xport_type, "",
+              "Transport type: rdma|shm|mnnvl|gds|iouring|sunrise_link");
 DEFINE_string(backend, "tent", "Transport backend: classic|tent");
 DEFINE_bool(notifi, false,
             "Enable RDMA notification for performance measurement.");
+DEFINE_string(
+    tent_transport_hint, "unspec",
+    "tent only: per-request transport_hint. "
+    "unspec|rdma|tcp|shm|nvlink|gds|io_uring|mnnvl|ascend|sunrise_link");
+DEFINE_string(tent_intent_type, "unspec",
+              "tent only: intent_type attached to every benchmark request. "
+              "unspec|foreground_get|background_prefetch|migration|checkpoint|"
+              "weight_loading|staging_internal");
 
 namespace mooncake {
 namespace tent {
 std::string XferBenchConfig::seg_name;
 std::string XferBenchConfig::seg_type;
+std::string XferBenchConfig::seg_type_mix;
 std::string XferBenchConfig::target_seg_name;
 std::string XferBenchConfig::op_type;
 bool XferBenchConfig::check_consistency = false;
@@ -65,6 +110,14 @@ size_t XferBenchConfig::max_batch_size = 0;
 int XferBenchConfig::duration = 0;
 int XferBenchConfig::max_num_threads = 0;
 int XferBenchConfig::start_num_threads = 0;
+std::string XferBenchConfig::qos_classes;
+std::string XferBenchConfig::qos_classes_json;
+std::string XferBenchConfig::workload_classes_json;
+double XferBenchConfig::qos_link_capacity_gbps = 0.0;
+std::string XferBenchConfig::qos_output_jsonl;
+uint64_t XferBenchConfig::deadline_us = 0;
+int XferBenchConfig::deadline_tight_threads = 0;
+bool XferBenchConfig::deadline_bw_arbitration = false;
 
 std::string XferBenchConfig::metadata_type;
 std::string XferBenchConfig::metadata_url_list;
@@ -72,12 +125,15 @@ int XferBenchConfig::rpc_server_port = 0;
 std::string XferBenchConfig::xport_type;
 std::string XferBenchConfig::backend;
 bool XferBenchConfig::notifi = false;
+std::string XferBenchConfig::tent_transport_hint;
+std::string XferBenchConfig::tent_intent_type;
 
 int XferBenchConfig::local_gpu_id = 0;
 int XferBenchConfig::target_gpu_id = 0;
 
 void XferBenchConfig::loadFromFlags() {
     seg_type = FLAGS_seg_type;
+    seg_type_mix = FLAGS_seg_type_mix;
     seg_name = FLAGS_seg_name;
     target_seg_name = FLAGS_target_seg_name;
     op_type = FLAGS_op_type;
@@ -90,6 +146,14 @@ void XferBenchConfig::loadFromFlags() {
     max_batch_size = FLAGS_max_batch_size;
     start_num_threads = FLAGS_start_num_threads;
     max_num_threads = FLAGS_max_num_threads;
+    qos_classes = FLAGS_qos_classes;
+    qos_classes_json = FLAGS_qos_classes_json;
+    workload_classes_json = FLAGS_workload_classes_json;
+    qos_link_capacity_gbps = FLAGS_qos_link_capacity_gbps;
+    qos_output_jsonl = FLAGS_qos_output_jsonl;
+    deadline_us = FLAGS_deadline_us;
+    deadline_tight_threads = FLAGS_deadline_tight_threads;
+    deadline_bw_arbitration = FLAGS_deadline_bw_arbitration;
     duration = FLAGS_duration;
 
     metadata_type = FLAGS_metadata_type;
@@ -99,6 +163,8 @@ void XferBenchConfig::loadFromFlags() {
     xport_type = FLAGS_xport_type;
     backend = FLAGS_backend;
     notifi = FLAGS_notifi;
+    tent_transport_hint = FLAGS_tent_transport_hint;
+    tent_intent_type = FLAGS_tent_intent_type;
 
     local_gpu_id = FLAGS_local_gpu_id;
     target_gpu_id = FLAGS_target_gpu_id;
@@ -159,6 +225,21 @@ void printStats(size_t block_size, size_t batch_size, XferBenchStats& stats,
               << std::setw(14) << stats.transfer_duration.p999()
               << std::endl;
     // clang-format on
+}
+
+void printDeadlineGroupStats(const char* group, size_t block_size,
+                             size_t batch_size, XferBenchStats& stats,
+                             int num_threads, uint64_t deadline_us) {
+    if (num_threads <= 0 || stats.transfer_duration.count() == 0) return;
+    const double duration_s = stats.total_duration.avg() / 1e6;
+    const double bytes = static_cast<double>(block_size) * batch_size *
+                         stats.transfer_duration.count();
+    const double throughput_gbs = bytes / 1e9 / duration_s;
+    std::cout << "  [deadline-" << group << "] threads=" << num_threads;
+    if (deadline_us != 0) std::cout << " deadline_us=" << deadline_us;
+    std::cout << " operations=" << stats.transfer_duration.count()
+              << " throughput=" << std::fixed << std::setprecision(6)
+              << throughput_gbs << " GB/s" << std::endl;
 }
 
 }  // namespace tent

@@ -19,10 +19,12 @@ ErrorCode ValidateObjectStore(SnapshotObjectStore* object_store) {
 }
 
 tl::expected<SnapshotDescriptor, ErrorCode> LoadSnapshotDescriptor(
-    SnapshotObjectStore* object_store, const SnapshotId& snapshot_id) {
+    SnapshotObjectStore* object_store, const std::string& snapshot_root,
+    const SnapshotId& snapshot_id) {
     std::string descriptor_payload;
     auto get_result = object_store->DownloadString(
-        snapshot_catalog_store_detail::BuildDescriptorKey(snapshot_id),
+        snapshot_catalog_store_detail::BuildDescriptorKey(snapshot_root,
+                                                          snapshot_id),
         descriptor_payload);
     if (!get_result) {
         return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
@@ -30,7 +32,7 @@ tl::expected<SnapshotDescriptor, ErrorCode> LoadSnapshotDescriptor(
 
     auto descriptor =
         snapshot_catalog_store_detail::DeserializeSnapshotDescriptor(
-            snapshot_id, descriptor_payload);
+            snapshot_root, snapshot_id, descriptor_payload);
     if (!descriptor) {
         return tl::make_unexpected(descriptor.error());
     }
@@ -40,8 +42,10 @@ tl::expected<SnapshotDescriptor, ErrorCode> LoadSnapshotDescriptor(
 }  // namespace
 
 EmbeddedSnapshotCatalogStore::EmbeddedSnapshotCatalogStore(
-    SnapshotObjectStore* object_store)
-    : object_store_(object_store) {}
+    SnapshotObjectStore* object_store, const std::string& cluster_id)
+    : object_store_(object_store),
+      snapshot_root_(
+          snapshot_catalog_store_detail::BuildSnapshotRoot(cluster_id)) {}
 
 ErrorCode EmbeddedSnapshotCatalogStore::Publish(
     const SnapshotDescriptor& snapshot) {
@@ -55,14 +59,16 @@ ErrorCode EmbeddedSnapshotCatalogStore::Publish(
     }
 
     auto descriptor_result = object_store_->UploadString(
-        snapshot_catalog_store_detail::BuildDescriptorKey(snapshot.snapshot_id),
+        snapshot_catalog_store_detail::BuildDescriptorKey(snapshot_root_,
+                                                          snapshot.snapshot_id),
         snapshot_catalog_store_detail::SerializeSnapshotDescriptor(snapshot));
     if (!descriptor_result) {
         return ErrorCode::PERSISTENT_FAIL;
     }
 
     auto publish_result = object_store_->UploadString(
-        snapshot_catalog_store_detail::BuildLatestKey(), snapshot.snapshot_id);
+        snapshot_catalog_store_detail::BuildLatestKey(snapshot_root_),
+        snapshot.snapshot_id);
     if (!publish_result) {
         return ErrorCode::PERSISTENT_FAIL;
     }
@@ -79,7 +85,8 @@ EmbeddedSnapshotCatalogStore::GetLatest() {
 
     std::string latest_snapshot_id;
     auto get_result = object_store_->DownloadString(
-        snapshot_catalog_store_detail::BuildLatestKey(), latest_snapshot_id);
+        snapshot_catalog_store_detail::BuildLatestKey(snapshot_root_),
+        latest_snapshot_id);
     if (!get_result) {
         if (object_store_->IsNotFoundError(get_result.error())) {
             return std::optional<SnapshotDescriptor>();
@@ -98,7 +105,8 @@ EmbeddedSnapshotCatalogStore::GetLatest() {
 
     std::string descriptor_payload;
     auto descriptor_result = object_store_->DownloadString(
-        snapshot_catalog_store_detail::BuildDescriptorKey(latest_snapshot_id),
+        snapshot_catalog_store_detail::BuildDescriptorKey(snapshot_root_,
+                                                          latest_snapshot_id),
         descriptor_payload);
     if (!descriptor_result) {
         return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
@@ -106,7 +114,7 @@ EmbeddedSnapshotCatalogStore::GetLatest() {
 
     auto descriptor =
         snapshot_catalog_store_detail::DeserializeSnapshotDescriptor(
-            latest_snapshot_id, descriptor_payload);
+            snapshot_root_, latest_snapshot_id, descriptor_payload);
     if (!descriptor) {
         return tl::make_unexpected(descriptor.error());
     }
@@ -121,22 +129,20 @@ EmbeddedSnapshotCatalogStore::List(size_t limit) {
     }
 
     std::vector<std::string> object_keys;
-    auto list_result = object_store_->ListObjectsWithPrefix(
-        std::string(snapshot_catalog_store_detail::kSnapshotRoot), object_keys);
+    auto list_result =
+        object_store_->ListObjectsWithPrefix(snapshot_root_, object_keys);
     if (!list_result) {
         return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
     }
 
     std::set<SnapshotId, std::greater<>> snapshot_ids;
     for (const auto& object_key : object_keys) {
-        if (object_key.size() <=
-            snapshot_catalog_store_detail::kSnapshotRoot.size()) {
+        if (object_key.size() <= snapshot_root_.size()) {
             continue;
         }
 
         std::string_view suffix(object_key);
-        suffix.remove_prefix(
-            snapshot_catalog_store_detail::kSnapshotRoot.size());
+        suffix.remove_prefix(snapshot_root_.size());
         const size_t slash_pos = suffix.find('/');
         if (slash_pos == std::string_view::npos) {
             continue;
@@ -163,7 +169,8 @@ EmbeddedSnapshotCatalogStore::List(size_t limit) {
         if (limit != 0 && snapshots.size() >= limit) {
             break;
         }
-        auto descriptor = LoadSnapshotDescriptor(object_store_, snapshot_id);
+        auto descriptor =
+            LoadSnapshotDescriptor(object_store_, snapshot_root_, snapshot_id);
         if (!descriptor) {
             LOG(WARNING) << "Skipping unreadable embedded snapshot descriptor, "
                          << "snapshot_id=" << snapshot_id
@@ -209,7 +216,8 @@ ErrorCode EmbeddedSnapshotCatalogStore::Delete(const SnapshotId& snapshot_id) {
     }
 
     auto delete_result = object_store_->DeleteObjectsWithPrefix(
-        snapshot_catalog_store_detail::BuildSnapshotPrefix(snapshot_id));
+        snapshot_catalog_store_detail::BuildSnapshotPrefix(snapshot_root_,
+                                                           snapshot_id));
     if (!delete_result) {
         return ErrorCode::PERSISTENT_FAIL;
     }
@@ -220,7 +228,7 @@ ErrorCode EmbeddedSnapshotCatalogStore::Delete(const SnapshotId& snapshot_id) {
 
     if (next_latest.has_value()) {
         auto publish_result = object_store_->UploadString(
-            snapshot_catalog_store_detail::BuildLatestKey(),
+            snapshot_catalog_store_detail::BuildLatestKey(snapshot_root_),
             next_latest->snapshot_id);
         if (!publish_result) {
             return ErrorCode::PERSISTENT_FAIL;
@@ -229,7 +237,7 @@ ErrorCode EmbeddedSnapshotCatalogStore::Delete(const SnapshotId& snapshot_id) {
     }
 
     auto clear_result = object_store_->DeleteObjectsWithPrefix(
-        snapshot_catalog_store_detail::BuildLatestKey());
+        snapshot_catalog_store_detail::BuildLatestKey(snapshot_root_));
     if (!clear_result) {
         return ErrorCode::PERSISTENT_FAIL;
     }

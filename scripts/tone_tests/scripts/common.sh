@@ -231,7 +231,7 @@ get_whl(){
 
     echo "get whl file from github action"
     rm -f "$whls_path/mooncake.zip"
-    rm -f "$whls_path/*.whl"
+    rm -f "$whls_path"/*.whl
 
     local max_retries=5
     local base_delay=5 # seconds
@@ -401,6 +401,139 @@ cleanup_test_env() {
     echo "Cleanup completed"
 }
 
+# Wait until GPU memory on the local host drains below a threshold.
+# Returns 0 once drained, 1 if it times out.
+wait_gpu_idle() {
+    local max_seconds=${1:-90}
+    local threshold_mb=${2:-1024}
+
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        echo "ERROR: nvidia-smi not available; cannot verify GPU drain" >&2
+        return 1
+    fi
+
+    echo "Waiting for GPU memory to drain (threshold ${threshold_mb}MB, timeout ${max_seconds}s)..."
+    local elapsed=0
+    local max_used=0
+    while [ $elapsed -lt $max_seconds ]; do
+        max_used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | sort -n | tail -n 1)
+        if ! [[ "$max_used" =~ ^[0-9]+$ ]]; then
+            echo "ERROR: nvidia-smi query failed; cannot verify GPU drain" >&2
+            return 1
+        fi
+        if [ "$max_used" -le "$threshold_mb" ]; then
+            echo "GPU memory drained (max used ${max_used}MB)"
+            return 0
+        fi
+        sleep 3
+        elapsed=$((elapsed + 3))
+    done
+    echo "GPU memory not drained within ${max_seconds}s (max used ${max_used}MB)"
+    return 1
+}
+
+# Kill only GPU processes whose cgroup still identifies them as belonging to
+# the reused test container. Unknown or unrelated processes must be left alone;
+# the caller will quarantine the environment if GPU memory remains occupied.
+gpu_pid_belongs_to_container() {
+    local pid=$1
+    local container_id=$2
+    [ -r "/proc/${pid}/cgroup" ] && grep -Fq "$container_id" "/proc/${pid}/cgroup"
+}
+
+force_kill_container_gpu_procs() {
+    command -v nvidia-smi >/dev/null 2>&1 || return 1
+
+    local container_id
+    container_id=$(docker inspect --format '{{.Id}}' "${CONTAINER_NAME}" 2>/dev/null) || {
+        echo "ERROR: Cannot inspect container ${CONTAINER_NAME}; refusing to kill host GPU processes" >&2
+        return 1
+    }
+    if [ -z "$container_id" ]; then
+        echo "ERROR: Empty container ID for ${CONTAINER_NAME}; refusing to kill host GPU processes" >&2
+        return 1
+    fi
+
+    local gpu_pids
+    gpu_pids=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | tr -cd '0-9\n' | grep -E '^[0-9]+$' | sort -u)
+    [ -z "$gpu_pids" ] && return 0
+
+    local container_pids=""
+    local pid
+    for pid in $gpu_pids; do
+        if gpu_pid_belongs_to_container "$pid" "$container_id"; then
+            container_pids="${container_pids} ${pid}"
+        else
+            echo "WARNING: GPU PID ${pid} is not owned by ${CONTAINER_NAME}; leaving it untouched" >&2
+        fi
+    done
+
+    if [ -z "$container_pids" ]; then
+        echo "No container-owned GPU processes are safe to kill"
+        return 0
+    fi
+
+    echo "Force-killing container-owned GPU PIDs:${container_pids}"
+    for pid in $container_pids; do
+        if ! kill -9 "$pid" 2>/dev/null; then
+            echo "ERROR: Failed to kill container-owned GPU PID ${pid}" >&2
+            return 1
+        fi
+    done
+    sleep 3
+}
+
+# Fully clear GPU memory on the current node: restart the container first, then
+# kill only container-owned GPU processes that survived the restart.
+# Restart the reused container to reset all in-container state (processes, GPU
+# memory, ERDMA queue-pairs / RDMA contexts). 'docker restart' keeps the
+# writable layer, so the mooncake wheel and ERDMA drivers are NOT reinstalled.
+drain_gpu_local() {
+    echo "Restarting container ${CONTAINER_NAME} to reset GPU/ERDMA state..."
+    if ! docker restart "${CONTAINER_NAME}" >/dev/null 2>&1; then
+        echo "ERROR: Failed to restart container ${CONTAINER_NAME}; environment is unhealthy" >&2
+        return 1
+    fi
+
+    if ! wait_gpu_idle 60; then
+        echo "GPU memory remains occupied; checking for container-owned processes..."
+        force_kill_container_gpu_procs || return 1
+        if ! wait_gpu_idle 45; then
+            echo "ERROR: GPU still occupied after bounded cleanup; environment is unhealthy" >&2
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
+# Between test cases in run-all the container is reused; reset in-container
+# state on both the local and (for double-machine runs) remote nodes via a
+# lightweight container restart (no wheel / ERDMA driver reinstall).
+drain_gpu_between_tests() {
+    echo "===== Resetting environment between test cases ====="
+    local reset_failed=false
+    if ! drain_gpu_local; then
+        echo "ERROR: Failed to reset the local test environment" >&2
+        reset_failed=true
+    fi
+
+    if [ -n "$REMOTE_IP" ]; then
+        echo "Resetting environment on remote node $REMOTE_IP..."
+        if ! ${SSH_CMD} "$REMOTE_IP" "
+            source ${REMOTE_TEST_DIR}/run/.shrc && \
+            source ${REMOTE_TEST_DIR}/scripts/common.sh && \
+            drain_gpu_local
+        "; then
+            echo "ERROR: Failed to reset the remote test environment on ${REMOTE_IP}" >&2
+            reset_failed=true
+        fi
+    fi
+
+    $reset_failed && return 1
+    return 0
+}
+
 setup_node_env() {
     local registry_addr=$1
     echo "===== Setting up docker environment ====="
@@ -416,6 +549,7 @@ setup_node_env() {
     fi
 
     local extra_args=""
+    extra_args="$extra_args -e NCCL_GIN_TYPE=0 "
     extra_args="$extra_args --device=/dev/infiniband/uverbs0 --device=/dev/infiniband/uverbs1 --device=/dev/infiniband/rdma_cm "
     if [ "${USE_HUGGINGFACE_MIRROR}" = "true" ]; then
         extra_args="$extra_args -e HF_ENDPOINT=${HUGGINGFACE_MIRROR} -e HF_HUB_ENABLE_HF_TRANSFER=1"
@@ -840,6 +974,19 @@ collect_and_validate_model_results() {
     fi
 }
 
+# Echo an offline env prefix when the given model already exists in the
+# container's HuggingFace cache, so servers use the local snapshot instead of
+# querying the hub (skips downloads and avoids hf-mirror 429 rate limiting).
+# Models are pre-cached under MODEL_CACHE (mounted at /root/.cache) on both nodes.
+hf_offline_prefix() {
+    local model_name=$1
+    [ -z "$model_name" ] && return 0
+    local cache_dir="models--$(echo "$model_name" | sed 's#/#--#g')"
+    if ${docker_exec} "ls /root/.cache/huggingface/hub/${cache_dir}/snapshots/*/config.json >/dev/null 2>&1"; then
+        echo "HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 "
+    fi
+}
+
 launch_sglang_server() {
     local model_path=$1
     local host=$2
@@ -855,7 +1002,8 @@ launch_sglang_server() {
         return 1
     fi
     
-    local sglang_cmd="${docker_exec} \"python -m sglang.launch_server --model-path ${model_path} --host ${host} --port ${port}"
+    local offline_prefix=$(hf_offline_prefix "$model_path")
+    local sglang_cmd="${docker_exec} \"${offline_prefix}python -m sglang.launch_server --model-path ${model_path} --host ${host} --port ${port}"
     if [ -n "$extra_args" ]; then
         sglang_cmd="${sglang_cmd} ${extra_args}"
     fi
@@ -905,6 +1053,7 @@ launch_vllm_server() {
     if [ -n "$env_vars" ]; then
         env_prefix="${env_vars} "
     fi
+    env_prefix="${env_prefix}$(hf_offline_prefix "$model_path")"
     
     local vllm_cmd="${docker_exec} \"${env_prefix}python3 -m vllm.entrypoints.openai.api_server --model '${model_path}' --host '${host}' --port ${port}"
     

@@ -17,22 +17,84 @@
 #include <glog/logging.h>
 
 #include <cassert>
+#include <cerrno>
 #include <cstddef>
 #include <chrono>
 #include <thread>
 #include <sstream>
 
+#ifdef USE_MLX5DV
+#include <infiniband/mlx5dv.h>
+#endif
+
 #include "common.h"
 #include "config.h"
+#include "transport/rdma_transport/rdma_gid_probe.h"
 
 namespace mooncake {
-const static uint8_t MAX_HOP_LIMIT = 16;
-const static uint8_t TIMEOUT = 14;
-const static uint8_t RETRY_CNT = 7;
+constexpr uint8_t kMaxHopLimit = 16;
+constexpr uint8_t kTimeout = 14;
+constexpr uint8_t kRetryCount = 7;
+
+static GidSelectionSnapshot fillLocalHandshakeDesc(
+    RdmaContext &context, const std::string &peer_nic,
+    const std::vector<uint32_t> &qp_num,
+    RdmaEndPoint::HandShakeDesc &local_desc) {
+    auto gid_selection = context.gidSelection();
+    local_desc.local_nic_path = context.nicPath();
+    local_desc.local_lid = context.lid();
+    local_desc.local_gid = gid_selection.gid;
+    local_desc.peer_nic_path = peer_nic;
+    local_desc.qp_num = qp_num;
+    local_desc.ready_ack = false;
+    local_desc.ready_ack_supported = true;
+    local_desc.reply_msg.clear();
+    return gid_selection;
+}
+
+static void rememberAutoGidSelection(
+    std::vector<AutoGidSelectionIdentity> &attempted_selections,
+    const GidSelectionSnapshot &selection) {
+    auto already_attempted =
+        std::any_of(attempted_selections.begin(), attempted_selections.end(),
+                    [&](const AutoGidSelectionIdentity &attempted) {
+                        return attempted.gid_index == selection.gid_index &&
+                               attempted.gid == selection.gid;
+                    });
+    if (!already_attempted) {
+        attempted_selections.push_back({selection.gid_index, selection.gid});
+    }
+}
+
+static std::string qpListToString(const std::vector<uint32_t> &qp_num) {
+    std::ostringstream oss;
+    oss << "[";
+    for (size_t i = 0; i < qp_num.size(); ++i) {
+        if (i) oss << ",";
+        oss << qp_num[i];
+    }
+    oss << "]";
+    return oss.str();
+}
+
+static std::string gidToString(const ibv_gid &gid) {
+    char buffer[48];
+    snprintf(buffer, sizeof(buffer),
+             "%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x:"
+             "%02x:%02x:%02x:%02x:%02x:%02x:%02x:%02x",
+             gid.raw[0], gid.raw[1], gid.raw[2], gid.raw[3], gid.raw[4],
+             gid.raw[5], gid.raw[6], gid.raw[7], gid.raw[8], gid.raw[9],
+             gid.raw[10], gid.raw[11], gid.raw[12], gid.raw[13], gid.raw[14],
+             gid.raw[15]);
+    return buffer;
+}
 
 RdmaEndPoint::RdmaEndPoint(RdmaContext &context)
     : context_(context),
       status_(INITIALIZING),
+      has_connected_(false),
+      ready_wait_start_ts_(0),
+      wr_depth_list_(nullptr),
       active_(true),
       cq_outstanding_(nullptr) {}
 
@@ -55,19 +117,19 @@ int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
     }
 
     qp_list_.resize(num_qp_list);
-    cq_outstanding_ = (volatile int *)cq->cq_context;
+    cq_outstanding_ = static_cast<std::atomic<int> *>(cq->cq_context);
 
     max_wr_depth_ = (int)max_wr_depth;
     max_sge_per_wr_ = max_sge_per_wr;
     max_inline_bytes_ = max_inline_bytes;
 
-    wr_depth_list_ = new volatile int[num_qp_list];
+    wr_depth_list_ = new std::atomic<int>[num_qp_list]();
     if (!wr_depth_list_) {
         LOG(ERROR) << "Failed to allocate memory for work request depth list";
         return ERR_MEMORY;
     }
     for (size_t i = 0; i < num_qp_list; ++i) {
-        wr_depth_list_[i] = 0;
+        wr_depth_list_[i].store(0, std::memory_order_relaxed);
         ibv_qp_init_attr attr;
         memset(&attr, 0, sizeof(attr));
         attr.send_cq = cq;
@@ -85,6 +147,7 @@ int RdmaEndPoint::construct(ibv_cq *cq, size_t num_qp_list,
         }
     }
 
+    ready_wait_start_ts_.store(0, std::memory_order_relaxed);
     status_.store(UNCONNECTED, std::memory_order_relaxed);
     return 0;
 }
@@ -113,7 +176,8 @@ int RdmaEndPoint::reconstruct() {
 
     // Reconstruct with same parameters as original construction
     status_.store(INITIALIZING, std::memory_order_relaxed);
-    active_ = true;
+    ready_wait_start_ts_.store(0, std::memory_order_relaxed);
+    active_.store(true, std::memory_order_release);
 
     return construct(cq, num_qp, max_sge_per_wr, max_wr_depth,
                      max_inline_bytes);
@@ -128,23 +192,28 @@ int RdmaEndPoint::deconstructLocked() {
     // Adjust cq_outstanding_ before destroying QPs, so the counter is
     // always corrected even if ibv_destroy_qp fails and we return early.
     bool displayed = false;
-    for (size_t i = 0; i < qp_list_.size(); ++i) {
-        if (wr_depth_list_[i] != 0) {
-            if (!displayed) {
-                LOG(WARNING) << "Outstanding work requests found, CQ will not "
-                                "be generated";
-                displayed = true;
+    if (wr_depth_list_) {
+        for (size_t i = 0; i < qp_list_.size(); ++i) {
+            int wr_depth = wr_depth_list_[i].load(std::memory_order_relaxed);
+            if (wr_depth != 0) {
+                if (!displayed) {
+                    LOG(WARNING)
+                        << "Outstanding work requests found, CQ will not "
+                           "be generated";
+                    displayed = true;
+                }
+                cq_outstanding_->fetch_sub(wr_depth, std::memory_order_acq_rel);
+                wr_depth_list_[i].store(0, std::memory_order_relaxed);
             }
-            __sync_fetch_and_sub(cq_outstanding_, wr_depth_list_[i]);
-            wr_depth_list_[i] = 0;
         }
     }
 
     int result = 0;
     for (size_t i = 0; i < qp_list_.size(); ++i) {
         if (!qp_list_[i]) continue;  // already destroyed in a previous call
-        if (ibv_destroy_qp(qp_list_[i])) {
-            PLOG(ERROR) << "Failed to destroy QP[" << i << "]";
+        int ret = ibv_destroy_qp(qp_list_[i]);
+        if (ret) {
+            LOG(ERROR) << "Failed to destroy QP[" << i << "]: " << strerror(ret);
             result = ERR_ENDPOINT;
         } else {
             qp_list_[i] = nullptr;
@@ -164,21 +233,35 @@ int RdmaEndPoint::destroyQP() { return deconstruct(); }
 
 void RdmaEndPoint::beginDestroy() {
     RWSpinlock::WriteGuard guard(lock_);
+    beginDestroyLocked();
+}
+
+void RdmaEndPoint::beginDestroyLocked() {
     auto current_status = status_.load(std::memory_order_relaxed);
     if (current_status == DESTROYING || current_status == DESTROYED) return;
 
-    active_ = false;
-    inactive_time_ = getCurrentTimeInNano();
+    inactive_time_.store(getCurrentTimeInNano(), std::memory_order_relaxed);
+    active_.store(false, std::memory_order_release);
     status_.store(DESTROYING, std::memory_order_release);
+    ready_wait_start_ts_.store(0, std::memory_order_relaxed);
 
-    // Transition QPs to ERR state so hardware flushes all inflight WRs to CQ.
-    // This allows performPollCq to drain them naturally.
-    ibv_qp_attr attr;
-    memset(&attr, 0, sizeof(attr));
-    attr.qp_state = IBV_QPS_ERR;
+    // Only endpoints that reached CONNECTED can have user WRs to flush. For
+    // pre-connected endpoints, skip RESET/INIT -> ERR because there are no WRs
+    // and some providers reject that state transition.
+    if (!has_connected_) return;
+
+    // Transition connected QPs to ERR state so hardware flushes inflight WRs to
+    // CQ. This allows performPollCq to drain them naturally.
     for (size_t i = 0; i < qp_list_.size(); ++i) {
-        if (ibv_modify_qp(qp_list_[i], &attr, IBV_QP_STATE)) {
-            PLOG(WARNING) << "Failed to modify QP to ERR during beginDestroy";
+        if (!qp_list_[i]) continue;
+
+        ibv_qp_attr attr;
+        memset(&attr, 0, sizeof(attr));
+        attr.qp_state = IBV_QPS_ERR;
+        int ret = ibv_modify_qp(qp_list_[i], &attr, IBV_QP_STATE);
+        if (ret) {
+            LOG(WARNING) << "Failed to modify QP[" << i
+                         << "] to ERR during beginDestroy: " << strerror(ret);
         }
     }
 }
@@ -197,7 +280,7 @@ bool RdmaEndPoint::finishDestroy() {
     // pre-two-phase predicate (!hasOutstandingSlice == !active_): only
     // inactive endpoints are eligible for reclaim; active ones must stay.
     if (current_status != DESTROYING) {
-        if (active_) return false;
+        if (active_.load(std::memory_order_acquire)) return false;
         // Endpoints that never reached construct() own no RDMA resources
         // and have wr_depth_list_ uninitialized; deconstructLocked() would
         // delete[] a wild pointer. Drop them directly.
@@ -215,13 +298,15 @@ bool RdmaEndPoint::finishDestroy() {
         // never be flushed; enforce a timeout to avoid leaking forever.
         bool has_outstanding = false;
         for (size_t i = 0; i < qp_list_.size(); ++i) {
-            if (wr_depth_list_[i] != 0) {
+            if (wr_depth_list_[i].load(std::memory_order_relaxed) != 0) {
                 has_outstanding = true;
                 break;
             }
         }
         if (has_outstanding) {
-            double elapsed = (getCurrentTimeInNano() - inactive_time_) / 1e9;
+            double elapsed = (getCurrentTimeInNano() -
+                              inactive_time_.load(std::memory_order_relaxed)) /
+                             1e9;
             if (elapsed < kFinishDestroyTimeoutSec) return false;
             LOG(WARNING) << "finishDestroy timed out after " << elapsed
                          << "s with outstanding WRs, forcing destruction";
@@ -247,9 +332,12 @@ bool RdmaEndPoint::finishDestroy() {
 
 void RdmaEndPoint::setPeerNicPath(const std::string &peer_nic_path) {
     RWSpinlock::WriteGuard guard(lock_);
-    if (connected()) {
-        LOG(WARNING) << "Previous connection will be discarded";
-        disconnectUnlocked();
+    auto curr_status = status_.load(std::memory_order_relaxed);
+    if (curr_status != INITIALIZING && curr_status != UNCONNECTED) {
+        LOG(ERROR) << "Cannot change peer NIC path after endpoint lifecycle "
+                      "has started: "
+                   << toString();
+        return;
     }
     peer_nic_path_ = peer_nic_path;
 }
@@ -258,22 +346,27 @@ int RdmaEndPoint::setupConnectionsByActive() {
     HandShakeDesc local_desc, peer_desc;
     std::string peer_server_name, peer_nic_name;
     bool do_rpc = false;
+    int auto_gid_retry_count = 0;
+    std::vector<AutoGidSelectionIdentity> attempted_auto_gid_selections;
 
     {
         RWSpinlock::WriteGuard guard(lock_);
-        if (connected()) {
+        if (readyToSend()) {
             LOG(INFO) << "Connection has been established";
             return 0;
         }
 
         // loopback mode
         if (context_.nicPath() == peer_nic_path_) {
-            return doSetupConnection(context_.gid(), context_.lid(), qpNum());
+            int ret =
+                doSetupConnection(context_.gid(), context_.lid(), qpNum());
+            if (ret == 0) {
+                ready_wait_start_ts_.store(0, std::memory_order_relaxed);
+            }
+            return ret;
         }
 
-        // Only proceed with RPC if we are the first to transition from
-        // UNCONNECTED. This prevents duplicate concurrent handshake attempts
-        // from the same endpoint.
+        // Only the first UNCONNECTED caller transitions to CONNECTING.
         auto current_status = status_.load(std::memory_order_relaxed);
         if (current_status == UNCONNECTED) {
             status_.store(CONNECTING, std::memory_order_relaxed);
@@ -286,12 +379,6 @@ int RdmaEndPoint::setupConnectionsByActive() {
                 disconnectUnlocked();
                 return ERR_INVALID_ARGUMENT;
             }
-
-            local_desc.local_nic_path = context_.nicPath();
-            local_desc.local_lid = context_.lid();
-            local_desc.local_gid = context_.gid();
-            local_desc.peer_nic_path = peer_nic_path_;
-            local_desc.qp_num = qpNum();
         }
     }
 
@@ -325,113 +412,280 @@ int RdmaEndPoint::setupConnectionsByActive() {
             }
         }
         RWSpinlock::ReadGuard guard(lock_);
+        if (readyToSend()) return 0;
         return connected() ? 0 : ERR_ENDPOINT;
     }
 
-    // Perform the RPC without holding the lock to avoid deadlock and allow
-    // "simultaneous open" handshake handling.
-    int rc = context_.engine().sendHandshake(peer_server_name, local_desc,
-                                             peer_desc);
+    for (;;) {
+        std::vector<uint32_t> local_qp_num;
+        {
+            RWSpinlock::ReadGuard guard(lock_);
+            local_qp_num = qpNum();
+        }
+        auto local_gid_selection = fillLocalHandshakeDesc(
+            context_, peer_nic_path_, local_qp_num, local_desc);
+        rememberAutoGidSelection(attempted_auto_gid_selections,
+                                 local_gid_selection);
+        peer_desc = HandShakeDesc();
 
-    // We should check the RPC return code before comparing `peer_qp_num_list_`
-    // with `peer_desc.qp_num`, since a failed RPC may result in an
-    // invalid `peer_desc.qp_num`.
-    //
-    // If the RPC is failed, even if the state is CONNECTED, (which means
-    // it is handled by setupConnectionsByPassive in another thread during the
-    // RPC, or "simultaneous open"), we should resetConnection to be safe.
-    // Because we're not sure whether the peer needs a connection
-    // re-establishment. (We don't know `peer_desc.qp_num`)
-    if (rc) {
-        RWSpinlock::WriteGuard write_guard(lock_);
-        resetConnection("handshake RPC failure");
-        return rc;
-    }
+        // Perform the RPC without holding the lock to avoid deadlock and allow
+        // "simultaneous open" handshake handling.
+        int rc = context_.engine().sendHandshake(peer_server_name, local_desc,
+                                                 peer_desc);
 
-    // Re-acquire lock after RPC to finalize state transition
-    RWSpinlock::WriteGuard guard(lock_);
+        // We should check the RPC return code before comparing
+        // `peer_qp_num_list_` with `peer_desc.qp_num`, since a failed RPC may
+        // result in an invalid `peer_desc.qp_num`.
+        //
+        // If the RPC failed but simultaneous-open passive setup has already
+        // made this endpoint CONNECTED with the same local QPs used by this
+        // RPC, reuse that connection. Otherwise reset because
+        // `peer_desc.qp_num` is invalid and we cannot safely infer the peer
+        // state.
+        if (rc) {
+            RWSpinlock::WriteGuard write_guard(lock_);
+            if (connected()) {
+                auto current_qp_num = qpNum();
+                if (current_qp_num == local_desc.qp_num) {
+                    LOG(WARNING)
+                        << "Active handshake RPC failed, but simultaneous-open "
+                           "passive setup already connected this endpoint. "
+                           "Reusing existing connection. rc="
+                        << rc << ", local_desc.qp_num="
+                        << qpListToString(local_desc.qp_num)
+                        << ", current_qp_num=" << qpListToString(current_qp_num)
+                        << ", endpoint=" << toString();
+                    return 0;
+                }
+            }
 
-    // Handle simultaneous open: if the peer initiates a connection during our
-    // RPC and it is passively established in setupConnectionsByPassive, simply
-    // reuse the existing endpoint.
-    if (connected()) {
-        if (peer_qp_num_list_ == peer_desc.qp_num) {
-            LOG(INFO) << "Received same peer QP numbers, reusing connection.";
-            return 0;
+            LOG(ERROR) << "Active handshake RPC failed; resetting endpoint. rc="
+                       << rc << ", local_desc.qp_num="
+                       << qpListToString(local_desc.qp_num)
+                       << ", endpoint=" << toString();
+            resetConnection("handshake RPC failure");
+            return rc;
         }
 
-        // This mismatch scenario should be rare. It may occur when a peer
-        // first sends us an Active RPC and establishes a connection,
-        // then restarts, and eventually accepts and responds to our
-        // Active RPC.
-        LOG(WARNING) << "Peer QP list mismatch on connected endpoint, "
-                        "re-establishing connection: "
-                     << toString();
+        bool retry_with_new_gid = false;
+        bool should_send_ready_ack = false;
+        HandShakeDesc ready_ack_desc;
+        {
+            // Re-acquire lock after RPC to finalize state transition
+            RWSpinlock::WriteGuard guard(lock_);
 
-        int ret = resetConnection("re-establishing connection (active)");
-        if (ret) return ret;
-    }
-
-    if (!peer_desc.reply_msg.empty()) {
-        LOG(ERROR) << "Rejected handshake request by peer "
-                   << local_desc.peer_nic_path;
-        disconnectUnlocked();
-        return ERR_REJECT_HANDSHAKE;
-    }
-
-    if (peer_desc.local_nic_path != peer_nic_path_ ||
-        peer_desc.peer_nic_path != local_desc.local_nic_path) {
-        LOG(ERROR) << "Invalid argument: received packet mismatch, "
-                      "local.local_nic_path: "
-                   << local_desc.local_nic_path
-                   << ", local.peer_nic_path: " << local_desc.peer_nic_path
-                   << ", peer.local_nic_path: " << peer_desc.local_nic_path
-                   << ", peer.peer_nic_path: " << peer_desc.peer_nic_path;
-        disconnectUnlocked();
-        return ERR_REJECT_HANDSHAKE;
-    }
-
-    if (!peer_desc.local_gid.empty()) {
-        int ret = doSetupConnection(peer_desc.local_gid, peer_desc.local_lid,
-                                    peer_desc.qp_num);
-        if (ret != 0) {
-            resetConnection("failed connection setup (active)");
-        }
-        return ret;
-    } else {
-        auto segment_desc =
-            context_.engine().meta()->getSegmentDescByName(peer_server_name);
-        if (segment_desc) {
-            for (auto &nic : segment_desc->devices) {
-                if (nic.name == peer_nic_name) {
-                    int ret =
-                        doSetupConnection(nic.gid, nic.lid, peer_desc.qp_num);
-                    if (ret != 0) {
-                        resetConnection("failed connection setup (active)");
+            // Handle simultaneous open: if the peer initiates a connection
+            // during our RPC and it is passively established in
+            // setupConnectionsByPassive, send an explicit ready ACK after this
+            // active RPC confirms that the peer's passive QPs are ready.
+            if (connected()) {
+                if (peer_qp_num_list_ == peer_desc.qp_num) {
+                    if (peer_desc.ready_ack_supported) {
+                        should_send_ready_ack = true;
+                        ready_ack_desc = local_desc;
+                        LOG(INFO) << "Received same peer QP numbers, sending "
+                                     "RDMA ready ACK.";
+                    } else {
+                        ready_wait_start_ts_.store(0,
+                                                   std::memory_order_relaxed);
+                        status_.store(CONNECTED, std::memory_order_relaxed);
+                        LOG(INFO) << "Peer does not support RDMA ready ACK, "
+                                     "reusing connection.";
+                        return 0;
                     }
-                    return ret;
+                } else {
+                    // This mismatch scenario should be rare. It may occur when
+                    // a peer first sends us an Active RPC and establishes a
+                    // connection, then restarts, and eventually accepts and
+                    // responds to our Active RPC.
+                    LOG(WARNING)
+                        << "Peer QP list mismatch on connected endpoint, "
+                           "re-establishing connection: "
+                        << toString();
+
+                    int ret =
+                        resetConnection("re-establishing connection (active)");
+                    if (ret) return ret;
+                }
+            }
+
+            if (!should_send_ready_ack) {
+                if (!peer_desc.reply_msg.empty()) {
+                    LOG(ERROR) << "Rejected handshake request by peer "
+                               << local_desc.peer_nic_path;
+                    disconnectUnlocked();
+                    return ERR_REJECT_HANDSHAKE;
+                }
+
+                if (peer_desc.local_nic_path != peer_nic_path_ ||
+                    peer_desc.peer_nic_path != local_desc.local_nic_path) {
+                    LOG(ERROR)
+                        << "Invalid argument: received packet mismatch, "
+                           "local.local_nic_path: "
+                        << local_desc.local_nic_path
+                        << ", local.peer_nic_path: " << local_desc.peer_nic_path
+                        << ", peer.local_nic_path: " << peer_desc.local_nic_path
+                        << ", peer.peer_nic_path: " << peer_desc.peer_nic_path;
+                    disconnectUnlocked();
+                    return ERR_REJECT_HANDSHAKE;
+                }
+
+                int ret = ERR_DEVICE_NOT_FOUND;
+                std::string failure_message;
+                SetupConnectionFailureInfo failure_info;
+                auto connected_status = peer_desc.ready_ack_supported
+                                            ? CONNECTED_WAIT_READY_ACK
+                                            : CONNECTED;
+                if (!peer_desc.local_gid.empty()) {
+                    ret = doSetupConnection(peer_desc.local_gid,
+                                            peer_desc.local_lid,
+                                            peer_desc.qp_num, connected_status,
+                                            &failure_message, &failure_info);
+                } else {
+                    auto segment_desc =
+                        context_.engine().meta()->getSegmentDescByName(
+                            peer_server_name);
+                    if (segment_desc) {
+                        for (auto &nic : segment_desc->devices) {
+                            if (nic.name == peer_nic_name) {
+                                ret = doSetupConnection(
+                                    nic.gid, nic.lid, peer_desc.qp_num,
+                                    connected_status, &failure_message,
+                                    &failure_info);
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                if (ret == 0) {
+                    if (peer_desc.ready_ack_supported) {
+                        should_send_ready_ack = true;
+                        ready_ack_desc = local_desc;
+                    } else {
+                        ready_wait_start_ts_.store(0,
+                                                   std::memory_order_relaxed);
+                        status_.store(CONNECTED, std::memory_order_relaxed);
+                        return 0;
+                    }
+                } else {
+                    if (shouldAttemptAutoGidHandshakeRetry(
+                            context_.autoGidSelectionEnabled(),
+                            auto_gid_retry_count,
+                            globalConfig().auto_gid_max_retries,
+                            failure_info.stage ==
+                                SetupConnectionFailureStage::kRtr,
+                            failure_info.sys_errno)) {
+                        std::string previous_gid;
+                        std::string next_gid;
+                        bool reprobe_changed = context_.reprobeAutoGid(
+                            local_gid_selection, attempted_auto_gid_selections,
+                            &previous_gid, &next_gid);
+                        auto current_gid_selection = context_.gidSelection();
+                        auto retry_action = decideAutoGidRetryAction(
+                            reprobe_changed, local_gid_selection.gid_index,
+                            local_gid_selection.gid,
+                            current_gid_selection.gid_index,
+                            current_gid_selection.gid);
+                        if (retry_action != AutoGidRetryAction::kDoNotRetry) {
+                            int reset_ret = resetConnection(
+                                retry_action == AutoGidRetryAction::
+                                                    kRetryWithReprobedGid
+                                    ? "retry after auto GID reprobe (active)"
+                                    : "retry with externally reprobed GID "
+                                      "(active)");
+                            if (reset_ret) return reset_ret;
+                            status_.store(CONNECTING,
+                                          std::memory_order_relaxed);
+                            ++auto_gid_retry_count;
+                            retry_with_new_gid = true;
+                            LOG(WARNING)
+                                << "Retry active handshake with updated local "
+                                   "GID on "
+                                << context_.deviceName() << ": "
+                                << local_gid_selection.gid << " -> "
+                                << current_gid_selection.gid << " (attempt "
+                                << auto_gid_retry_count << "/"
+                                << globalConfig().auto_gid_max_retries << ")";
+                        }
+                    }
+
+                    if (!retry_with_new_gid) {
+                        if (ret == ERR_DEVICE_NOT_FOUND) {
+                            LOG(ERROR) << "Peer NIC " << peer_nic_name
+                                       << " not found in " << peer_server_name;
+                            disconnectUnlocked();
+                        } else {
+                            resetConnection("failed connection setup (active)");
+                        }
+                        return ret;
+                    }
                 }
             }
         }
+
+        if (should_send_ready_ack) {
+            int ack_ret = sendReadyAck(peer_server_name, ready_ack_desc);
+            RWSpinlock::WriteGuard guard(lock_);
+            if (ack_ret) {
+                resetConnection("failed to send ready ACK");
+                return ack_ret;
+            }
+            if (!connected()) {
+                LOG(WARNING) << "Discarding RDMA ready ACK because endpoint "
+                             << "is no longer connected: " << toString();
+                ready_wait_start_ts_.store(0, std::memory_order_relaxed);
+                return ERR_ENDPOINT;
+            }
+            ready_wait_start_ts_.store(0, std::memory_order_relaxed);
+            status_.store(CONNECTED, std::memory_order_relaxed);
+            return 0;
+        }
     }
-    LOG(ERROR) << "Peer NIC " << peer_nic_name << " not found in "
-               << peer_server_name;
-    disconnectUnlocked();
-    return ERR_DEVICE_NOT_FOUND;
 }
 
 int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
                                             HandShakeDesc &local_desc) {
     RWSpinlock::WriteGuard guard(lock_);
+    if (peer_desc.ready_ack) {
+        if (!connected()) {
+            local_desc.reply_msg =
+                "Received RDMA ready ACK for unconnected endpoint";
+            LOG(ERROR) << local_desc.reply_msg << ": " << toString();
+            return ERR_REJECT_HANDSHAKE;
+        }
+
+        if (peer_qp_num_list_ != peer_desc.qp_num) {
+            local_desc.reply_msg =
+                "Received stale RDMA ready ACK with mismatched peer QP numbers";
+            LOG(WARNING) << local_desc.reply_msg << ", ack_peer_qp_num="
+                         << qpListToString(peer_desc.qp_num)
+                         << ", current_peer_qp_num="
+                         << qpListToString(peer_qp_num_list_) << ": "
+                         << toString();
+            return ERR_REJECT_HANDSHAKE;
+        }
+
+        ready_wait_start_ts_.store(0, std::memory_order_relaxed);
+        status_.store(CONNECTED, std::memory_order_relaxed);
+        LOG(INFO) << "Received RDMA ready ACK.";
+        return 0;
+    }
+
     if (connected()) {
         // If already connected with the same peer QP info, return success
         if (peer_qp_num_list_ == peer_desc.qp_num) {
-            local_desc.local_nic_path = context_.nicPath();
-            local_desc.local_lid = context_.lid();
-            local_desc.local_gid = context_.gid();
-            local_desc.peer_nic_path = peer_nic_path_;
-            local_desc.qp_num = qpNum();
-            LOG(INFO) << "Received same peer QP numbers, reusing connection.";
+            fillLocalHandshakeDesc(context_, peer_nic_path_, qpNum(),
+                                   local_desc);
+            if (!peer_desc.ready_ack_supported) {
+                ready_wait_start_ts_.store(0, std::memory_order_relaxed);
+                status_.store(CONNECTED, std::memory_order_relaxed);
+                LOG(INFO) << "Peer does not support RDMA ready ACK, "
+                             "reusing connection.";
+            } else {
+                LOG(INFO) << "Received same peer QP numbers, reusing "
+                             "connection while waiting for ready ACK.";
+            }
             return 0;
         }
         // Different peer (e.g., peer restarted)
@@ -446,9 +700,8 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
     // establish the connection on this same endpoint. Because we're holding
     // the lock, even if there are already Active RPCs sent to the same
     // peer nic path by setupConnectionsByActive on another thread, it will
-    // be blocked after the RPC return. Once the lock is released,
-    // they will simply observe the CONNECTED state and safely reuse the QP.
-    // This inherently handles simultaneous open.
+    // be blocked after the RPC return. Once the lock is released, active
+    // callers will confirm readiness before posting WRs.
 
     if (peer_desc.peer_nic_path != context_.nicPath() ||
         peer_desc.local_nic_path != peer_nic_path_) {
@@ -469,38 +722,96 @@ int RdmaEndPoint::setupConnectionsByPassive(const HandShakeDesc &peer_desc,
         return ERR_INVALID_ARGUMENT;
     }
 
-    local_desc.local_nic_path = context_.nicPath();
-    local_desc.local_lid = context_.lid();
-    local_desc.local_gid = context_.gid();
-    local_desc.peer_nic_path = peer_nic_path_;
-    local_desc.qp_num = qpNum();
+    status_.store(CONNECTING, std::memory_order_relaxed);
+
+    auto attempt_setup_with_peer = [&](const std::string &peer_gid,
+                                       uint16_t peer_lid) -> int {
+        int auto_gid_retry_count = 0;
+        std::vector<AutoGidSelectionIdentity> attempted_auto_gid_selections;
+        for (;;) {
+            auto local_gid_selection = fillLocalHandshakeDesc(
+                context_, peer_nic_path_, qpNum(), local_desc);
+            rememberAutoGidSelection(attempted_auto_gid_selections,
+                                     local_gid_selection);
+
+            SetupConnectionFailureInfo failure_info;
+            auto connected_status = peer_desc.ready_ack_supported
+                                        ? CONNECTED_WAIT_READY_ACK
+                                        : CONNECTED;
+            int ret = doSetupConnection(peer_gid, peer_lid, peer_desc.qp_num,
+                                        connected_status, &local_desc.reply_msg,
+                                        &failure_info);
+            if (ret == 0) {
+                if (peer_desc.ready_ack_supported) {
+                    ready_wait_start_ts_.store(getCurrentTimeInNano(),
+                                               std::memory_order_relaxed);
+                    status_.store(CONNECTED_WAIT_READY_ACK,
+                                  std::memory_order_relaxed);
+                } else {
+                    ready_wait_start_ts_.store(0, std::memory_order_relaxed);
+                    status_.store(CONNECTED, std::memory_order_relaxed);
+                }
+                return 0;
+            }
+
+            if (!shouldAttemptAutoGidHandshakeRetry(
+                    context_.autoGidSelectionEnabled(), auto_gid_retry_count,
+                    globalConfig().auto_gid_max_retries,
+                    failure_info.stage == SetupConnectionFailureStage::kRtr,
+                    failure_info.sys_errno)) {
+                resetConnection("failed connection setup (passive)");
+                return ret;
+            }
+
+            std::string previous_gid;
+            std::string next_gid;
+            bool reprobe_changed = context_.reprobeAutoGid(
+                local_gid_selection, attempted_auto_gid_selections,
+                &previous_gid, &next_gid);
+            auto current_gid_selection = context_.gidSelection();
+            auto retry_action = decideAutoGidRetryAction(
+                reprobe_changed, local_gid_selection.gid_index,
+                local_gid_selection.gid, current_gid_selection.gid_index,
+                current_gid_selection.gid);
+            if (retry_action == AutoGidRetryAction::kDoNotRetry) {
+                resetConnection("failed connection setup (passive)");
+                return ret;
+            }
+
+            int reset_ret = resetConnection(
+                retry_action == AutoGidRetryAction::kRetryWithReprobedGid
+                    ? "retry after auto GID reprobe (passive)"
+                    : "retry with externally reprobed GID (passive)");
+            if (reset_ret) return reset_ret;
+            status_.store(CONNECTING, std::memory_order_relaxed);
+            ++auto_gid_retry_count;
+            LOG(WARNING) << "Retry passive handshake with updated local GID on "
+                         << context_.deviceName() << ": "
+                         << local_gid_selection.gid << " -> "
+                         << current_gid_selection.gid << " (attempt "
+                         << auto_gid_retry_count << "/"
+                         << globalConfig().auto_gid_max_retries << ")";
+        }
+    };
 
     if (!peer_desc.local_gid.empty()) {
-        int ret = doSetupConnection(peer_desc.local_gid, peer_desc.local_lid,
-                                    peer_desc.qp_num, &local_desc.reply_msg);
-        if (ret != 0) {
-            resetConnection("failed connection setup (passive)");
-        }
-        return ret;
+        return attempt_setup_with_peer(peer_desc.local_gid,
+                                       peer_desc.local_lid);
     } else {
         auto segment_desc =
             context_.engine().meta()->getSegmentDescByName(peer_server_name);
         if (segment_desc) {
             for (auto &nic : segment_desc->devices) {
                 if (nic.name == peer_nic_name) {
-                    int ret =
-                        doSetupConnection(nic.gid, nic.lid, peer_desc.qp_num,
-                                          &local_desc.reply_msg);
-                    if (ret != 0) {
-                        resetConnection("failed connection setup (passive)");
-                    }
-                    return ret;
+                    return attempt_setup_with_peer(nic.gid, nic.lid);
                 }
             }
         }
     }
     local_desc.reply_msg =
         "Peer nic not found in that server: " + peer_nic_path_;
+    ready_wait_start_ts_.store(0, std::memory_order_relaxed);
+    status_.store(UNCONNECTED, std::memory_order_relaxed);
     LOG(ERROR) << local_desc.reply_msg;
     return ERR_DEVICE_NOT_FOUND;
 }
@@ -512,53 +823,76 @@ void RdmaEndPoint::disconnect() {
 
 int RdmaEndPoint::disconnectUnlocked() {
     auto curr_status = status_.load(std::memory_order_acquire);
-    if (curr_status != CONNECTED && curr_status != CONNECTING) return 0;
+    if (!isConnectedStatus(curr_status) && curr_status != CONNECTING) return 0;
+    ready_wait_start_ts_.store(0, std::memory_order_relaxed);
 
-    ibv_qp_attr attr;
-    memset(&attr, 0, sizeof(attr));
-    attr.qp_state = IBV_QPS_RESET;
-    int ret = 0;
-    for (size_t i = 0; i < qp_list_.size(); ++i) {
-        int curr_ret = ibv_modify_qp(qp_list_[i], &attr, IBV_QP_STATE);
-        if (curr_ret) {
-            PLOG(ERROR) << "Failed to modify QP to RESET";
-            ret = ERR_ENDPOINT;
+    if (!has_connected_) {
+        // This endpoint has not posted user WRs yet, but its handshake may
+        // already have reached the peer. The peer can cache our QP numbers and
+        // rebuild its passive endpoint around them before the active side sees
+        // a setup failure. Reusing the same local QPs after RESET would make a
+        // later retry ambiguous with that partially processed handshake, so
+        // retry with fresh QP numbers instead.
+        for (size_t i = 0; i < qp_list_.size(); ++i) {
+            CHECK_EQ(wr_depth_list_[i].load(std::memory_order_relaxed), 0)
+                << "Pre-connected endpoint must not have outstanding WRs";
         }
-        // After resetting QP, the wr_depth_list_ won't change
-        bool displayed = false;
-        if (wr_depth_list_[i] != 0) {
-            if (!displayed) {
-                LOG(WARNING) << "Outstanding work requests found, CQ will not "
-                                "be generated";
-                displayed = true;
-            }
-            __sync_fetch_and_sub(cq_outstanding_, wr_depth_list_[i]);
-            wr_depth_list_[i] = 0;
-        }
+        return reconstruct();
     }
-    peer_qp_num_list_.clear();
-    status_.store(UNCONNECTED, std::memory_order_release);
-    return ret;
+
+    beginDestroyLocked();
+    return 0;
 }
 
 int RdmaEndPoint::resetConnection(const std::string &reason) {
     auto curr_status = status_.load(std::memory_order_acquire);
-    if (curr_status != CONNECTING && curr_status != CONNECTED) return 0;
+    if (curr_status != CONNECTING && !isConnectedStatus(curr_status)) return 0;
+    ready_wait_start_ts_.store(0, std::memory_order_relaxed);
 
-#ifdef CONFIG_ERDMA
-    int ret = reconstruct();
-#else
-    int ret = disconnectUnlocked();
-#endif
-
-    if (ret) {
-        LOG(ERROR) << "Failed to reset the endpoint (triggered by: " << reason
-                   << "): error=" << ret;
-    } else {
-        LOG(INFO) << "Successfully reset the endpoint (triggered by: " << reason
-                  << ").";
+    if (!has_connected_) {
+        int ret = disconnectUnlocked();
+        if (ret) {
+            LOG(ERROR) << "Failed to reset pre-connected endpoint "
+                       << "(triggered by: " << reason << "): error=" << ret;
+        } else {
+            LOG(INFO) << "Successfully reset pre-connected endpoint "
+                      << "(triggered by: " << reason << ").";
+        }
+        return ret;
     }
-    return ret;
+
+    LOG(WARNING) << "Retiring endpoint instead of resetting it (triggered by: "
+                 << reason << "): " << toString();
+    beginDestroyLocked();
+    return ERR_ENDPOINT;
+}
+
+bool RdmaEndPoint::readyAckTimedOut() const {
+    if (status() != CONNECTED_WAIT_READY_ACK) return false;
+    uint64_t start_ts = ready_wait_start_ts_.load(std::memory_order_relaxed);
+    return start_ts != 0 &&
+           getCurrentTimeInNano() - start_ts > kReadyAckTimeoutNano;
+}
+
+int RdmaEndPoint::sendReadyAck(const std::string &peer_server_name,
+                               const HandShakeDesc &local_desc) {
+    HandShakeDesc ready_ack_desc = local_desc;
+    ready_ack_desc.ready_ack = true;
+
+    HandShakeDesc peer_desc;
+    int rc = context_.engine().sendHandshake(peer_server_name, ready_ack_desc,
+                                             peer_desc);
+    if (rc) {
+        LOG(ERROR) << "Failed to send RDMA ready ACK to " << peer_server_name
+                   << ": " << rc;
+        return rc;
+    }
+    if (!peer_desc.reply_msg.empty()) {
+        LOG(ERROR) << "RDMA ready ACK rejected by " << peer_server_name << ": "
+                   << peer_desc.reply_msg;
+        return ERR_REJECT_HANDSHAKE;
+    }
+    return 0;
 }
 
 const std::string RdmaEndPoint::toString() const {
@@ -566,6 +900,9 @@ const std::string RdmaEndPoint::toString() const {
     if (status == CONNECTED)
         return "EndPoint: local " + context_.nicPath() + ", peer " +
                peer_nic_path_;
+    else if (status == CONNECTED_WAIT_READY_ACK)
+        return "EndPoint: local " + context_.nicPath() + ", peer " +
+               peer_nic_path_ + " (waiting ready ACK)";
     else if (status == DESTROYING)
         return "EndPoint: local " + context_.nicPath() + ", peer " +
                peer_nic_path_ + " (destroying)";
@@ -579,7 +916,8 @@ int RdmaEndPoint::submitPostSend(
     std::vector<Transport::Slice *> &slice_list,
     std::vector<Transport::Slice *> &failed_slice_list) {
     RWSpinlock::WriteGuard guard(lock_);
-    if (!active_ || status_.load(std::memory_order_relaxed) != CONNECTED) {
+    if (!active_.load(std::memory_order_acquire) ||
+        status_.load(std::memory_order_relaxed) != CONNECTED) {
         for (auto &slice : slice_list) failed_slice_list.push_back(slice);
         slice_list.clear();
         return 0;
@@ -588,16 +926,25 @@ int RdmaEndPoint::submitPostSend(
     const size_t num_qp = qp_list_.size();
     if (slice_list.empty()) return 0;
     const size_t requested = slice_list.size();
-    int cq_remaining = int(globalConfig().max_cqe) - *cq_outstanding_;
-    std::vector<ibv_send_wr> wr_list(requested, ibv_send_wr{});
-    std::vector<ibv_sge> sge_list(requested);
+    int cq_remaining = int(globalConfig().max_cqe) -
+                       cq_outstanding_->load(std::memory_order_relaxed);
+    if (cq_remaining <= 0) return 0;
+
+    // Only allocate for the max number of WRs we can actually post per QP,
+    // not the entire requested slice count. Each QP iteration reuses the
+    // wr_list/sge_list from index 0, so we only need max_wr_depth_ entries.
+    size_t max_postable_per_qp =
+        std::min({(size_t)max_wr_depth_, (size_t)cq_remaining, requested});
+    std::vector<ibv_send_wr> wr_list(max_postable_per_qp, ibv_send_wr{});
+    std::vector<ibv_sge> sge_list(max_postable_per_qp);
     size_t total_posted = 0;
     size_t cursor = 0;
 
     for (size_t qp_index = 0;
          qp_index < num_qp && cq_remaining > 0 && cursor < requested;
          ++qp_index) {
-        int qp_avail = max_wr_depth_ - wr_depth_list_[qp_index];
+        int qp_avail = max_wr_depth_ -
+                       wr_depth_list_[qp_index].load(std::memory_order_relaxed);
         if (qp_avail <= 0) continue;
 
         size_t remaining_qps = num_qp - qp_index;
@@ -635,16 +982,24 @@ int RdmaEndPoint::submitPostSend(
         }
 
         ibv_send_wr *bad_wr = nullptr;
-        __sync_fetch_and_add(&wr_depth_list_[qp_index], wr_count);
-        __sync_fetch_and_add(cq_outstanding_, wr_count);
+        wr_depth_list_[qp_index].fetch_add(wr_count, std::memory_order_acq_rel);
+        cq_outstanding_->fetch_add(wr_count, std::memory_order_acq_rel);
+        // Register before ringing the doorbell. A fast completion may otherwise
+        // be polled before the diagnostic registry sees the slice.
+        context_.trackPostedSlices(slice_list, start, wr_count);
         int rc = ibv_post_send(qp_list_[qp_index], wr_list.data(), &bad_wr);
         if (rc) {
-            PLOG(ERROR) << "Failed to ibv_post_send";
+            LOG(ERROR) << "Failed to ibv_post_send: " << strerror(rc);
+            const size_t first_failed =
+                bad_wr ? static_cast<size_t>(bad_wr - wr_list.data()) : 0;
+            context_.untrackPostedSlices(slice_list, start + first_failed,
+                                         wr_count - first_failed);
             while (bad_wr) {
                 int i = bad_wr - wr_list.data();
                 failed_slice_list.push_back(slice_list[start + i]);
-                __sync_fetch_and_sub(&wr_depth_list_[qp_index], 1);
-                __sync_fetch_and_sub(cq_outstanding_, 1);
+                wr_depth_list_[qp_index].fetch_sub(1,
+                                                   std::memory_order_acq_rel);
+                cq_outstanding_->fetch_sub(1, std::memory_order_acq_rel);
                 bad_wr = bad_wr->next;
             }
             total_posted += wr_count;
@@ -710,13 +1065,19 @@ static int parseGidString(const std::string &gid_str, ibv_gid &gid_out) {
 int RdmaEndPoint::doSetupConnection(const std::string &peer_gid,
                                     uint16_t peer_lid,
                                     std::vector<uint32_t> peer_qp_num_list,
-                                    std::string *reply_msg) {
+                                    Status connected_status,
+                                    std::string *reply_msg,
+                                    SetupConnectionFailureInfo *failure_info) {
     if (qp_list_.size() != peer_qp_num_list.size()) {
         std::string message =
             "QP count mismatch in peer and local endpoints, check "
             "MC_MAX_EP_PER_CTX";
         LOG(ERROR) << "[Handshake] " << message;
         if (reply_msg) *reply_msg = message;
+        if (failure_info) {
+            failure_info->stage = SetupConnectionFailureStage::kPeerValidation;
+            failure_info->sys_errno = 0;
+        }
         return ERR_INVALID_ARGUMENT;
     }
 
@@ -727,24 +1088,32 @@ int RdmaEndPoint::doSetupConnection(const std::string &peer_gid,
         std::string message = "Invalid peer GID: " + peer_gid;
         LOG(ERROR) << "[Handshake] " << message;
         if (reply_msg) *reply_msg = message;
+        if (failure_info) {
+            failure_info->stage = SetupConnectionFailureStage::kPeerValidation;
+            failure_info->sys_errno = 0;
+        }
         return ret;
     }
 
+    int local_gid_index = context_.gidIndex();
     for (int qp_index = 0; qp_index < (int)qp_list_.size(); ++qp_index) {
         int ret = doSetupConnection(qp_index, peer_gid_raw, peer_lid,
-                                    peer_qp_num_list[qp_index], reply_msg);
+                                    peer_qp_num_list[qp_index], local_gid_index,
+                                    reply_msg, failure_info);
         if (ret) return ret;
     }
 
     peer_qp_num_list_ = std::move(peer_qp_num_list);
-    status_.store(CONNECTED, std::memory_order_relaxed);
+    has_connected_ = true;
+    status_.store(connected_status, std::memory_order_relaxed);
     return 0;
 }
 
 int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
                                     uint16_t peer_lid, uint32_t peer_qp_num,
-                                    std::string *reply_msg) {
-    if (qp_index < 0 || qp_index > (int)qp_list_.size())
+                                    int local_gid_index, std::string *reply_msg,
+                                    SetupConnectionFailureInfo *failure_info) {
+    if (qp_index < 0 || qp_index >= (int)qp_list_.size())
         return ERR_INVALID_ARGUMENT;
     auto &qp = qp_list_[qp_index];
 
@@ -755,8 +1124,12 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
     int ret = ibv_modify_qp(qp, &attr, IBV_QP_STATE);
     if (ret) {
         std::string message = "Failed to modify QP to RESET";
-        PLOG(ERROR) << "[Handshake] " << message;
-        if (reply_msg) *reply_msg = message + ": " + strerror(errno);
+        LOG(ERROR) << "[Handshake] " << message << ": " << strerror(ret);
+        if (reply_msg) *reply_msg = message + ": " + strerror(ret);
+        if (failure_info) {
+            failure_info->stage = SetupConnectionFailureStage::kReset;
+            failure_info->sys_errno = ret;
+        }
         return ERR_ENDPOINT;
     }
 
@@ -773,8 +1146,12 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
     if (ret) {
         std::string message =
             "Failed to modify QP to INIT, check local context port num";
-        PLOG(ERROR) << "[Handshake] " << message;
-        if (reply_msg) *reply_msg = message + ": " + strerror(errno);
+        LOG(ERROR) << "[Handshake] " << message << ": " << strerror(ret);
+        if (reply_msg) *reply_msg = message + ": " + strerror(ret);
+        if (failure_info) {
+            failure_info->stage = SetupConnectionFailureStage::kInit;
+            failure_info->sys_errno = ret;
+        }
         return ERR_ENDPOINT;
     }
 
@@ -786,15 +1163,19 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
         attr.path_mtu = globalConfig().mtu_length;
     attr.ah_attr.grh.dgid = peer_gid;
     // TODO gidIndex and portNum must fetch from REMOTE
-    attr.ah_attr.grh.sgid_index = context_.gidIndex();
-    attr.ah_attr.grh.hop_limit = MAX_HOP_LIMIT;
+    attr.ah_attr.grh.sgid_index = local_gid_index;
+    attr.ah_attr.grh.hop_limit = kMaxHopLimit;
     // Set traffic class if configured (-1 means use default)
     if (globalConfig().ib_traffic_class >= 0) {
         attr.ah_attr.grh.traffic_class =
             static_cast<uint8_t>(globalConfig().ib_traffic_class);
     }
     attr.ah_attr.dlid = peer_lid;
+    // Set service level if configured (-1 means use default)
     attr.ah_attr.sl = 0;
+    if (globalConfig().ib_service_level >= 0) {
+        attr.ah_attr.sl = static_cast<uint8_t>(globalConfig().ib_service_level);
+    }
     attr.ah_attr.src_path_bits = 0;
     attr.ah_attr.static_rate = 0;
     attr.ah_attr.is_global = 1;
@@ -810,16 +1191,31 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
     if (ret) {
         std::string message =
             "Failed to modify QP to RTR, check mtu, gid, peer lid, peer qp num";
-        PLOG(ERROR) << "[Handshake] " << message;
-        if (reply_msg) *reply_msg = message + ": " + strerror(errno);
+        LOG(ERROR) << "[Handshake] " << message
+                   << ": local=" << context_.nicPath()
+                   << ", peer=" << peer_nic_path_ << ", qp_index=" << qp_index
+                   << ", local_qp=" << qp->qp_num
+                   << ", peer_qp=" << peer_qp_num
+                   << ", local_gid=" << context_.gid()
+                   << ", local_gid_index=" << local_gid_index
+                   << ", peer_gid=" << gidToString(peer_gid)
+                   << ", peer_lid=" << peer_lid
+                   << ", path_mtu=" << attr.path_mtu
+                   << ", port_num=" << static_cast<int>(context_.portNum())
+                   << ": " << strerror(ret);
+        if (reply_msg) *reply_msg = message + ": " + strerror(ret);
+        if (failure_info) {
+            failure_info->stage = SetupConnectionFailureStage::kRtr;
+            failure_info->sys_errno = ret;
+        }
         return ERR_ENDPOINT;
     }
 
     // RTR -> RTS
     memset(&attr, 0, sizeof(attr));
     attr.qp_state = IBV_QPS_RTS;
-    attr.timeout = TIMEOUT;
-    attr.retry_cnt = RETRY_CNT;
+    attr.timeout = kTimeout;
+    attr.retry_cnt = kRetryCount;
     attr.rnr_retry = 7;  // or 7,RNR error
     attr.sq_psn = 0;
     attr.max_rd_atomic = 16;
@@ -829,11 +1225,76 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
                             IBV_QP_MAX_QP_RD_ATOMIC);
     if (ret) {
         std::string message = "Failed to modify QP to RTS";
-        PLOG(ERROR) << "[Handshake] " << message;
-        if (reply_msg) *reply_msg = message + ": " + strerror(errno);
+        LOG(ERROR) << "[Handshake] " << message << ": " << strerror(ret);
+        if (reply_msg) *reply_msg = message + ": " + strerror(ret);
+        if (failure_info) {
+            failure_info->stage = SetupConnectionFailureStage::kRts;
+            failure_info->sys_errno = ret;
+        }
         return ERR_ENDPOINT;
+    }
+
+    // Optional: pin QP to a specific LAG port for even traffic distribution
+    // across bonded physical ports. num_lag_ports is queried from hardware at
+    // context construction time; this block is a no-op on non-LAG devices.
+    if (globalConfig().mlx5_qp_lag_port_balance) {
+#ifdef USE_MLX5DV
+        uint8_t n = context_.numLagPorts();
+        if (n > 1) {
+            uint8_t target = (uint8_t)(qp_index % n) + 1;
+            int lag_ret = mlx5dv_modify_qp_lag_port(qp, target);
+            if (lag_ret) {
+                LOG_FIRST_N(WARNING, 4)
+                    << "[RDMA] mlx5dv_modify_qp_lag_port failed"
+                    << " (qp_index=" << qp_index
+                    << ", target_port=" << (int)target
+                    << "): " << strerror(lag_ret);
+            } else {
+                uint8_t cfg = 0, active = 0;
+                if (mlx5dv_query_qp_lag_port(qp, &cfg, &active) == 0) {
+                    VLOG(1)
+                        << "[RDMA] QP[" << qp_index << "] qpn=" << qp->qp_num
+                        << " lag_port cfg=" << (int)cfg
+                        << " active=" << (int)active;
+                } else {
+                    LOG_FIRST_N(WARNING, 4)
+                        << "[RDMA] mlx5dv_query_qp_lag_port failed"
+                        << " (qp_index=" << qp_index << ")";
+                }
+            }
+        }
+#else
+        LOG_FIRST_N(WARNING, 1)
+            << "MC_MLX5_QP_LAG_PORT_BALANCE is set but binary was not built "
+               "with USE_MLX5DV; ignoring";
+#endif
+    }
+
+    // Optional: override the RoCEv2 UDP source port to spread QPs across
+    // different ECMP/LAG paths. Empty list = leave whatever the driver
+    // picked. Failure is non-fatal so unsupported devices/firmware degrade
+    // gracefully.
+    const auto &sports = globalConfig().mlx5_qp_udp_sports;
+    if (!sports.empty()) {
+#ifdef USE_MLX5DV
+        uint16_t sport = sports[qp_index % sports.size()];
+        int sp_ret = mlx5dv_modify_qp_udp_sport(qp, sport);
+        if (sp_ret) {
+            LOG_FIRST_N(WARNING, 4)
+                << "[RDMA] mlx5dv_modify_qp_udp_sport failed (qp_index="
+                << qp_index << ", sport=" << sport << "): " << strerror(sp_ret);
+        } else {
+            VLOG(1) << "[RDMA] QP[" << qp_index << "] qpn=" << qp->qp_num
+                    << " udp_sport=" << sport;
+        }
+#else
+        LOG_FIRST_N(WARNING, 1)
+            << "MC_MLX5_QP_UDP_SPORTS is set but binary was not built with "
+               "USE_MLX5DV; ignoring";
+#endif
     }
 
     return 0;
 }
+
 }  // namespace mooncake

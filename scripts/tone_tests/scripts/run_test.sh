@@ -232,7 +232,10 @@ run_single_test(){
     source "$RUN_DIR/.shrc"
     cd "$TONE_TESTS_DIR/scripts"
     source "./$test_name"
-    
+
+    local log_dir="${BASE_DIR}/run/logs/$(basename "$test_name" .sh)"
+    setup_log_directory "$log_dir"
+
     local exit_code=0
     run_test "$@" || exit_code=1
     
@@ -263,7 +266,10 @@ run_all_tests(){
     cd "$TONE_TESTS_DIR/scripts"
     
     local all_passed=true
+    local test_index=0
+    local test_count=${#tests[@]}
     for test_name in "${tests[@]}"; do
+        test_index=$((test_index + 1))
         if [[ ! -f "./$test_name" ]]; then
             echo "WARNING: test case $test_name is not found, skipping"
             continue
@@ -282,6 +288,16 @@ run_all_tests(){
         fi
         
         [ $exit_code -ne 0 ] && all_passed=false
+
+        # Container is shared across cases in run-all. Do not schedule another
+        # case unless both nodes have been reset successfully.
+        if [ "$test_index" -lt "$test_count" ] && ! drain_gpu_between_tests; then
+            local remaining_count=$((test_count - test_index))
+            echo "ERROR: Shared test environment is unhealthy after ${test_name}." >&2
+            echo "ERROR: Skipping ${remaining_count} remaining test case(s); node intervention is required." >&2
+            all_passed=false
+            break
+        fi
     done
     
     cleanup_test_env "double"

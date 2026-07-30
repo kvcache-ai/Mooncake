@@ -1381,6 +1381,54 @@ class TestMooncakeFunctional(MooncakeTestBase):
                     )
                     self.assertNotEqual(rc, 0)
 
+    def test_27b_unified_parallelism_full_into_formula_all_split_dims_and_hetero_tp(self):
+        require_unified_parallelism_api(self)
+        cases = [
+            ((8, 12, 16), 0, 4, [2, 4, 8]),
+            ((8, 12, 16), 1, 4, [2, 3, 4, 6]),
+            ((8, 12, 16), 2, 4, [2, 4, 8, 16]),
+        ]
+        for case_index, (shape, split_dim, write_tp_size, read_tp_sizes) in enumerate(cases):
+            tensor = make_deterministic_tensor(shape)
+            for read_tp_size in read_tp_sizes:
+                with self.subTest(
+                    case=f"split_dim={split_dim},write_tp={write_tp_size},read_tp={read_tp_size}"
+                ):
+                    key = f"func_unified_formula_split_{case_index}_{read_tp_size}"
+                    self.assertEqual(shape[split_dim] % read_tp_size, 0)
+                    rc = put_uniform_full_tensor_with_unified_tp(
+                        self.store, key, tensor, write_tp_size, split_dim
+                    )
+                    self.assertEqual(rc, 0)
+                    target = make_read_target(
+                        "full",
+                        build_tp_parallelism(
+                            read_tp_size, split_dim, rank=read_tp_size - 1
+                        ),
+                    )
+                    full_result = self.store.get_tensor_with_parallelism(
+                        key, target
+                    )
+                    self.assertIsNotNone(full_result)
+                    self.assertTrue(torch.equal(full_result, tensor))
+
+                    buffer_spacing = max(
+                        serialized_tensor_size(tensor) + 4096, 1 * 1024 * 1024
+                    )
+                    buffer = (ctypes.c_ubyte * buffer_spacing)()
+                    buffer_ptr = ctypes.addressof(buffer)
+                    self.assertEqual(
+                        self.store.register_buffer(buffer_ptr, buffer_spacing), 0
+                    )
+                    try:
+                        into_result = self.store.get_tensor_with_parallelism_into(
+                            key, buffer_ptr, buffer_spacing, target=target
+                        )
+                        self.assertIsNotNone(into_result)
+                        self.assertTrue(torch.equal(into_result, tensor))
+                    finally:
+                        self.assertEqual(self.store.unregister_buffer(buffer_ptr), 0)
+
     def test_28_writer_shard_full_reconstruction(self):
         require_unified_parallelism_api(self)
         key = "func_writer_shard_full"
@@ -1941,6 +1989,16 @@ class TestMooncakeFunctional(MooncakeTestBase):
             (6, 3, [(0, 4, 2, "tp"), (1, 4, 2, "pp_tp"), (2, 4, 2, "ep_tp")]),
         ]
 
+        def expand_jobs(cases, worker_count):
+            jobs = list(enumerate(cases))
+            if worker_count <= len(cases):
+                return jobs
+            extra_jobs = worker_count - len(cases)
+            for extra_index in range(extra_jobs):
+                case_index = extra_index % len(cases)
+                jobs.append((case_index, cases[case_index]))
+            return jobs
+
         def put_worker(key, split_dim, put_tp_size, mode):
             return put_full_tensor_with_parallelism_mode(
                 self.store, key, original, split_dim, put_tp_size, mode
@@ -1965,23 +2023,46 @@ class TestMooncakeFunctional(MooncakeTestBase):
 
         for scenario_index, (put_workers, get_workers, cases) in enumerate(scenarios):
             with self.subTest(put_workers=put_workers, get_workers=get_workers):
-                keys = [
-                    f"func_unified_concurrency_{scenario_index}_{case_index}"
-                    for case_index in range(len(cases))
+                put_jobs = [
+                    (
+                        case_index,
+                        f"func_unified_concurrency_{scenario_index}_put_{job_index}_case_{case_index}",
+                        split_dim,
+                        put_tp_size,
+                        get_tp_size,
+                        mode,
+                    )
+                    for job_index, (case_index, (split_dim, put_tp_size, get_tp_size, mode)) in enumerate(
+                        expand_jobs(cases, put_workers)
+                    )
                 ]
+                case_keys = {}
+                for case_index, key, split_dim, put_tp_size, get_tp_size, mode in put_jobs:
+                    case_keys.setdefault(case_index, []).append(
+                        (key, split_dim, put_tp_size, get_tp_size, mode)
+                    )
+
+                get_jobs = []
+                case_read_counts = {}
+                for case_index, (split_dim, put_tp_size, get_tp_size, mode) in expand_jobs(cases, get_workers):
+                    read_index = case_read_counts.get(case_index, 0)
+                    key, _split_dim, _put_tp_size, _get_tp_size, _mode = case_keys[case_index][
+                        read_index % len(case_keys[case_index])
+                    ]
+                    get_jobs.append((key, split_dim, put_tp_size, get_tp_size, mode))
+                    case_read_counts[case_index] = read_index + 1
+
                 with concurrent.futures.ThreadPoolExecutor(max_workers=max(put_workers, get_workers)) as executor:
                     put_futures = [
                         executor.submit(put_worker, key, split_dim, put_tp_size, mode)
-                        for key, (split_dim, put_tp_size, _get_tp_size, mode) in zip(keys, cases)
-                        for _ in range(max(1, put_workers // len(cases)))
+                        for _case_index, key, split_dim, put_tp_size, _get_tp_size, mode in put_jobs
                     ]
                     for future in concurrent.futures.as_completed(put_futures):
                         self.assertEqual(future.result(), 0)
 
                     get_futures = [
                         executor.submit(get_worker, key, split_dim, get_tp_size, mode)
-                        for key, (split_dim, _put_tp_size, get_tp_size, mode) in zip(keys, cases)
-                        for _ in range(max(1, get_workers // len(cases)))
+                        for key, split_dim, _put_tp_size, get_tp_size, mode in get_jobs
                     ]
                     for future in concurrent.futures.as_completed(get_futures):
                         error = future.result()

@@ -1,11 +1,14 @@
 #include "ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store.h"
 
+#include <cstdlib>
 #include <exception>
 #include <memory>
 #include <optional>
 #include <string_view>
 
 #include <glog/logging.h>
+
+#include "types.h"
 #ifdef STORE_USE_REDIS
 #include <hiredis/hiredis.h>
 #endif
@@ -23,6 +26,8 @@ using common::redis::ConnectRedis;
 using common::redis::IsStringReply;
 using common::redis::RedisReplyPtr;
 using common::redis::SanitizeHashTagComponent;
+
+#ifdef STORE_USE_REDIS
 
 tl::expected<long long, ErrorCode> ParseSnapshotScore(
     std::string_view snapshot_id) {
@@ -46,14 +51,16 @@ tl::expected<long long, ErrorCode> ParseSnapshotScore(
 }
 
 tl::expected<SnapshotDescriptor, ErrorCode> LoadSnapshotDescriptor(
-    SnapshotObjectStore* object_store, const SnapshotId& snapshot_id) {
+    SnapshotObjectStore* object_store, const std::string& snapshot_root,
+    const SnapshotId& snapshot_id) {
     if (object_store == nullptr) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
     std::string descriptor_payload;
     auto get_result = object_store->DownloadString(
-        snapshot_catalog_store_detail::BuildDescriptorKey(snapshot_id),
+        snapshot_catalog_store_detail::BuildDescriptorKey(snapshot_root,
+                                                          snapshot_id),
         descriptor_payload);
     if (!get_result) {
         return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
@@ -61,14 +68,12 @@ tl::expected<SnapshotDescriptor, ErrorCode> LoadSnapshotDescriptor(
 
     auto descriptor =
         snapshot_catalog_store_detail::DeserializeSnapshotDescriptor(
-            snapshot_id, descriptor_payload);
+            snapshot_root, snapshot_id, descriptor_payload);
     if (!descriptor) {
         return tl::make_unexpected(descriptor.error());
     }
     return descriptor.value();
 }
-
-#ifdef STORE_USE_REDIS
 
 constexpr char kPublishSnapshotScript[] = R"LUA(
 redis.call('ZADD', KEYS[1], ARGV[1], ARGV[2])
@@ -99,6 +104,8 @@ RedisSnapshotCatalogStore::RedisSnapshotCatalogStore(
     : object_store_(object_store),
       connstring_(std::move(connstring)),
       cluster_namespace_(ResolveClusterNamespace(cluster_namespace)),
+      snapshot_root_(
+          snapshot_catalog_store_detail::BuildSnapshotRoot(cluster_namespace_)),
       latest_key_(BuildLatestKey(cluster_namespace_)),
       index_key_(BuildIndexKey(cluster_namespace_)) {}
 
@@ -152,7 +159,8 @@ ErrorCode RedisSnapshotCatalogStore::Publish(
     }
 
     auto descriptor_result = object_store_->UploadString(
-        snapshot_catalog_store_detail::BuildDescriptorKey(snapshot.snapshot_id),
+        snapshot_catalog_store_detail::BuildDescriptorKey(snapshot_root_,
+                                                          snapshot.snapshot_id),
         snapshot_catalog_store_detail::SerializeSnapshotDescriptor(snapshot));
     if (!descriptor_result) {
         return ErrorCode::PERSISTENT_FAIL;
@@ -215,7 +223,8 @@ RedisSnapshotCatalogStore::GetLatest() {
 
     std::string descriptor_payload;
     auto descriptor_result = object_store_->DownloadString(
-        snapshot_catalog_store_detail::BuildDescriptorKey(latest_snapshot_id),
+        snapshot_catalog_store_detail::BuildDescriptorKey(snapshot_root_,
+                                                          latest_snapshot_id),
         descriptor_payload);
     if (!descriptor_result) {
         return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
@@ -223,7 +232,7 @@ RedisSnapshotCatalogStore::GetLatest() {
 
     auto descriptor =
         snapshot_catalog_store_detail::DeserializeSnapshotDescriptor(
-            latest_snapshot_id, descriptor_payload);
+            snapshot_root_, latest_snapshot_id, descriptor_payload);
     if (!descriptor) {
         return tl::make_unexpected(descriptor.error());
     }
@@ -269,7 +278,8 @@ RedisSnapshotCatalogStore::List(size_t limit) {
             continue;
         }
 
-        auto descriptor = LoadSnapshotDescriptor(object_store_, snapshot_id);
+        auto descriptor =
+            LoadSnapshotDescriptor(object_store_, snapshot_root_, snapshot_id);
         if (!descriptor) {
             LOG(WARNING) << "Skipping unreadable Redis snapshot descriptor, "
                          << "snapshot_id=" << snapshot_id
@@ -302,7 +312,8 @@ ErrorCode RedisSnapshotCatalogStore::Delete(const SnapshotId& snapshot_id) {
     }
 
     auto delete_result = object_store_->DeleteObjectsWithPrefix(
-        snapshot_catalog_store_detail::BuildSnapshotPrefix(snapshot_id));
+        snapshot_catalog_store_detail::BuildSnapshotPrefix(snapshot_root_,
+                                                           snapshot_id));
     if (!delete_result) {
         LOG(ERROR) << "Failed to delete snapshot objects after Redis catalog "
                       "update, snapshot_id="
@@ -315,10 +326,15 @@ ErrorCode RedisSnapshotCatalogStore::Delete(const SnapshotId& snapshot_id) {
 
 ClusterNamespace RedisSnapshotCatalogStore::ResolveClusterNamespace(
     const ClusterNamespace& cluster_namespace) {
-    if (cluster_namespace.empty()) {
-        return "mooncake";
+    if (!cluster_namespace.empty()) {
+        return cluster_namespace;
     }
-    return cluster_namespace;
+
+    const char* env_cluster_id = std::getenv("MC_STORE_CLUSTER_ID");
+    if (env_cluster_id != nullptr && *env_cluster_id != '\0') {
+        return env_cluster_id;
+    }
+    return DEFAULT_CLUSTER_ID;
 }
 
 std::string RedisSnapshotCatalogStore::BuildLatestKey(

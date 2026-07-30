@@ -1,7 +1,9 @@
 #include "utils.h"
+#include "random.h"
 #include "mmap_arena.h"
 #include "config.h"
 #include "common.h"
+#include "ub_allocator.h"
 
 #include <Slab.h>
 #include <gflags/gflags.h>
@@ -16,15 +18,17 @@
 
 #include <algorithm>
 #include <atomic>
-#include <memory>
-#include <random>
 #include <cerrno>
 #include <csignal>
+#include <cstdlib>
 #include <cstring>
-#include <sys/mman.h>
+#include <memory>
+#include <mutex>
 #include <numa.h>
 #include <numaif.h>
-#include <mutex>
+#include <sys/mman.h>
+#include <thread>
+#include <vector>
 
 // Feature flag to enable/disable arena allocator. Disabled by default so the
 // library does not pre-map a large pool unless the operator opts in via gflag
@@ -41,6 +45,13 @@ DEFINE_uint64(mmap_arena_pool_size, 8ULL * 1024 * 1024 * 1024,
 #endif
 #if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
 #include "ascend_allocator.h"
+#endif
+#if defined(USE_SUNRISE)
+#include "sunrise_allocator.h"
+#endif
+
+#ifdef USE_NOF
+#include "spdk/spdk_wrapper.h"
 #endif
 
 #include <ylt/coro_http/coro_http_client.hpp>
@@ -68,12 +79,8 @@ bool isPortAvailable(int port) {
 // AutoPortBinder implementation
 AutoPortBinder::AutoPortBinder(int min_port, int max_port)
     : socket_fd_(-1), port_(-1) {
-    static std::random_device rand_gen;
-    std::mt19937 gen(rand_gen());
-    std::uniform_int_distribution<> rand_dist(min_port, max_port);
-
     for (int attempt = 0; attempt < 20; ++attempt) {
-        int port = rand_dist(gen);
+        int port = randomUniform(min_port, max_port);
 
         socket_fd_ = socket(AF_INET, SOCK_STREAM, 0);
         if (socket_fd_ < 0) continue;
@@ -101,7 +108,7 @@ AutoPortBinder::~AutoPortBinder() {
 
 void *allocate_buffer_allocator_memory(size_t total_size,
                                        const std::string &protocol,
-                                       size_t alignment) {
+                                       size_t alignment, bool use_spdk_dma) {
     const size_t default_alignment = facebook::cachelib::Slab::kSize;
     // Ensure total_size is a multiple of alignment
     if (alignment == default_alignment && total_size < alignment) {
@@ -113,7 +120,24 @@ void *allocate_buffer_allocator_memory(size_t total_size,
         return ascend_allocate_memory(total_size, protocol);
     }
 #endif
-
+#if defined(USE_SUNRISE)
+    if (protocol == "sunrise_link") {
+        return sunrise_allocate_memory(
+            total_size, alignment,
+            mooncake::globalConfig().sunrise_use_device_mem);
+    }
+#endif
+#if defined(USE_UB)
+    if (protocol == "ub") {
+        return mooncake::ub_allocate_memory(alignment, total_size);
+    }
+#endif
+#ifdef USE_NOF
+    if (use_spdk_dma && total_size > 0) {
+        return mooncake::SpdkWrapper::GetInstance().Alloc(total_size, alignment,
+                                                          -1);
+    }
+#endif
     // Allocate aligned memory
     return aligned_alloc(alignment, total_size);
 }
@@ -212,7 +236,133 @@ static inline size_t mmap_map_size(size_t total_size, size_t hugepage_size) {
     return align_up(total_size, page_size);
 }
 
+namespace {
+
+size_t touch_thread_count(size_t page_count) {
+    const unsigned int hardware_threads = std::thread::hardware_concurrency();
+    const size_t available_threads =
+        hardware_threads == 0 ? 1 : std::min<size_t>(hardware_threads, 16);
+    return std::min(available_threads, page_count);
+}
+
+void touch_page_range(volatile char *data, size_t page_size, size_t begin_page,
+                      size_t end_page, int numa_node) {
+    if (numa_node >= 0 && numa_run_on_node(numa_node) != 0) {
+        LOG(WARNING) << "Failed to bind HugeTLB population worker to NUMA node "
+                     << numa_node << ": " << std::strerror(errno);
+    }
+    for (size_t page = begin_page; page < end_page; ++page) {
+        data[page * page_size] = 0;
+    }
+}
+
+void touch_mmap_pages(void *ptr, size_t map_size, size_t page_size) {
+    if (ptr == nullptr || map_size == 0 || page_size == 0) {
+        return;
+    }
+
+    const size_t page_count = (map_size + page_size - 1) / page_size;
+    const size_t num_threads = touch_thread_count(page_count);
+
+    auto *data = static_cast<volatile char *>(ptr);
+    if (num_threads <= 1) {
+        touch_page_range(data, page_size, 0, page_count, -1);
+        return;
+    }
+
+    std::vector<std::jthread> threads;
+    threads.reserve(num_threads);
+    const size_t pages_per_thread =
+        (page_count + num_threads - 1) / num_threads;
+    for (size_t thread_index = 0; thread_index < num_threads; ++thread_index) {
+        const size_t begin_page = thread_index * pages_per_thread;
+        const size_t end_page =
+            std::min(begin_page + pages_per_thread, page_count);
+        if (begin_page >= end_page) {
+            break;
+        }
+        threads.emplace_back(touch_page_range, data, page_size, begin_page,
+                             end_page, -1);
+    }
+}
+
+void touch_numa_mmap_pages(void *ptr, size_t map_size, size_t page_size,
+                           const std::vector<int> &numa_nodes) {
+    if (ptr == nullptr || map_size == 0 || page_size == 0 ||
+        numa_nodes.empty()) {
+        return;
+    }
+
+    const size_t node_count = numa_nodes.size();
+    if (map_size % node_count != 0 ||
+        (map_size / node_count) % page_size != 0) {
+        LOG(ERROR) << "Invalid NUMA HugeTLB mapping layout: size=" << map_size
+                   << ", page_size=" << page_size << ", nodes=" << node_count;
+        return;
+    }
+
+    const size_t region_size = map_size / node_count;
+    const size_t pages_per_region = region_size / page_size;
+    const size_t page_count = pages_per_region * node_count;
+    const size_t num_threads =
+        std::max(node_count, touch_thread_count(page_count));
+    const size_t base_threads_per_node = num_threads / node_count;
+    const size_t extra_threads = num_threads % node_count;
+
+    auto *data = static_cast<volatile char *>(ptr);
+    std::vector<std::jthread> threads;
+    threads.reserve(num_threads);
+    for (size_t node_index = 0; node_index < node_count; ++node_index) {
+        const size_t node_threads =
+            base_threads_per_node + (node_index < extra_threads ? 1 : 0);
+        const size_t pages_per_thread =
+            (pages_per_region + node_threads - 1) / node_threads;
+        const size_t region_begin_page = node_index * pages_per_region;
+        for (size_t thread_index = 0; thread_index < node_threads;
+             ++thread_index) {
+            const size_t begin_page =
+                region_begin_page + thread_index * pages_per_thread;
+            const size_t end_page =
+                std::min(begin_page + pages_per_thread,
+                         region_begin_page + pages_per_region);
+            if (begin_page >= end_page) {
+                continue;
+            }
+            threads.emplace_back(touch_page_range, data, page_size, begin_page,
+                                 end_page, numa_nodes[node_index]);
+        }
+    }
+}
+
+}  // namespace
+
+void populate_hugetlb_mapping(void *ptr, size_t total_size) {
+    const size_t hugepage_size = get_hugepage_size_from_env();
+    if (ptr == nullptr || total_size == 0 || hugepage_size == 0) {
+        return;
+    }
+
+    touch_mmap_pages(ptr, mmap_map_size(total_size, hugepage_size),
+                     hugepage_size);
+}
+
+void populate_hugetlb_numa_mapping(void *ptr, size_t total_size,
+                                   const std::vector<int> &numa_nodes) {
+    const size_t hugepage_size = get_hugepage_size_from_env();
+    if (ptr == nullptr || total_size == 0 || hugepage_size == 0 ||
+        numa_nodes.empty()) {
+        return;
+    }
+
+    touch_numa_mmap_pages(ptr, total_size, hugepage_size, numa_nodes);
+}
+
 void *allocate_buffer_mmap_memory(size_t total_size, size_t alignment) {
+    return allocate_buffer_mmap_memory(total_size, alignment, false);
+}
+
+void *allocate_buffer_mmap_memory(size_t total_size, size_t alignment,
+                                  bool defer_hugetlb_population) {
     if (total_size == 0) {
         LOG(ERROR) << "Total size must be greater than 0 for mmap";
         return nullptr;
@@ -241,7 +391,12 @@ void *allocate_buffer_mmap_memory(size_t total_size, size_t alignment) {
     }
 
     // Traditional mmap allocation (fallback or arena disabled).
-    unsigned int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_POPULATE;
+    const bool defer_direct_population =
+        defer_hugetlb_population && get_hugepage_size_from_env() > 0;
+    unsigned int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+    if (!defer_direct_population) {
+        flags |= MAP_POPULATE;
+    }
     const size_t hugepage_size = get_hugepage_size_from_env(&flags);
     const size_t map_size = mmap_map_size(total_size, hugepage_size);
     const size_t guaranteed_alignment =
@@ -263,6 +418,11 @@ void *allocate_buffer_mmap_memory(size_t total_size, size_t alignment) {
 
     VLOG(1) << "Allocated " << total_size << " bytes via mmap() at " << ptr;
     return ptr;
+}
+
+bool is_mmap_arena_allocation(const void *ptr) {
+    return ptr != nullptr && g_mmap_arena && g_mmap_arena->isInitialized() &&
+           g_mmap_arena->owns(ptr);
 }
 
 void free_buffer_mmap_memory(void *ptr, size_t total_size) {
@@ -312,12 +472,21 @@ void *allocate_buffer_numa_segments(size_t total_size,
     size_t region_size = align_up(total_size / n, page_size);
     size_t map_size = region_size * n;
 
-    // reserve contiguous VMA, no physical pages yet
-    void *ptr = mmap(nullptr, map_size, PROT_READ | PROT_WRITE,
-                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    // reserve contiguous VMA; use hugepages if page_size indicates so
+    unsigned int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+    if (page_size == SZ_2MB) {
+        flags |= MAP_HUGETLB | MAP_HUGE_2MB;
+    } else if (page_size == SZ_1GB) {
+        flags |= MAP_HUGETLB | MAP_HUGE_1GB;
+    } else if (page_size != static_cast<size_t>(getpagesize())) {
+        flags |= MAP_HUGETLB;
+    }
+    void *ptr = mmap(nullptr, map_size, PROT_READ | PROT_WRITE, flags, -1, 0);
     if (ptr == MAP_FAILED) {
-        LOG(ERROR) << "mmap failed, size=" << map_size << ", errno=" << errno
-                   << " (" << strerror(errno) << ")";
+        LOG(ERROR) << "mmap failed (hugepage="
+                   << ((flags & MAP_HUGETLB) ? "yes" : "no")
+                   << "), size=" << map_size << ", errno=" << errno << " ("
+                   << strerror(errno) << ")";
         return nullptr;
     }
 
@@ -338,10 +507,9 @@ void *allocate_buffer_numa_segments(size_t total_size,
         }
     }
 
-    // No explicit prefault needed — ibv_reg_mr() will call get_user_pages()
-    // which triggers page faults that respect the mbind NUMA policy.
-    // Pages are allocated directly on the target NUMA during MR registration,
-    // avoiding a redundant full-buffer traversal.
+    // Leave the mapping lazy. The caller may explicitly populate it with
+    // NUMA-local workers before registration; otherwise ibv_reg_mr() calls
+    // get_user_pages(), whose faults respect the mbind policy.
 
     LOG(INFO) << "Allocated NUMA-segmented buffer: " << map_size << " bytes, "
               << n << " regions, page_size=" << page_size << ", nodes=[" <<
@@ -356,13 +524,32 @@ void *allocate_buffer_numa_segments(size_t total_size,
     return ptr;
 }
 
-void free_memory(const std::string &protocol, void *ptr) {
+void free_memory(const std::string &protocol, void *ptr, bool use_spdk_dma) {
 #if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
     if (protocol == "ascend" || protocol == "ubshmem") {
         return ascend_free_memory(protocol, ptr);
     }
 #endif
-
+#if defined(USE_SUNRISE)
+    if (protocol == "sunrise_link") {
+        return sunrise_free_memory(ptr);
+    }
+#endif
+#if defined(USE_UB)
+    if (protocol == "ub") {
+        mooncake::ub_free_memory(ptr);
+        return;
+    }
+#endif
+#ifdef USE_NOF
+    // Mirror allocate_buffer_allocator_memory(): a buffer taken from the SPDK
+    // hugepage pool (spdk_zmalloc) must be released with spdk_free, not glibc
+    // free(), which would abort with "free(): invalid pointer".
+    if (use_spdk_dma) {
+        mooncake::SpdkWrapper::GetInstance().Free(ptr);
+        return;
+    }
+#endif
     free(ptr);
 }
 
@@ -531,6 +718,35 @@ std::string GetEnvStringOr(const char *name, const std::string &default_value) {
     return env_val ? std::string(env_val) : default_value;
 }
 
+std::string ResolveMooncakeHostId(const std::string &local_hostname) {
+    auto trim = [](std::string value) {
+        const auto begin = value.find_first_not_of(" \t\r\n");
+        if (begin == std::string::npos) {
+            return std::string();
+        }
+        const auto end = value.find_last_not_of(" \t\r\n");
+        return value.substr(begin, end - begin + 1);
+    };
+
+    const std::string hostname = trim(local_hostname);
+    const std::string host_id = (hostname == "::1" || hostname == "::")
+                                    ? hostname
+                                    : trim(getHostNameWithoutPort(hostname));
+    if (host_id.empty()) {
+        return "";
+    }
+
+    std::string lower = host_id;
+    std::transform(lower.begin(), lower.end(), lower.begin(),
+                   [](unsigned char c) { return std::tolower(c); });
+    if (lower == "localhost" || lower == "127.0.0.1" || lower == "0.0.0.0" ||
+        lower == "::1" || lower == "[::1]" || lower == "::" ||
+        lower == "[::]") {
+        return "";
+    }
+    return host_id;
+}
+
 static std::string SanitizeKey(const std::string &key) {
     // Set of invalid filesystem characters to be replaced
     constexpr std::string_view kInvalidChars = "/\\:*?\"<>|";
@@ -539,8 +755,9 @@ static std::string SanitizeKey(const std::string &key) {
 
     for (char c : key) {
         // Replace invalid characters with underscore
-        sanitized_key.push_back(
-            kInvalidChars.find(c) != std::string_view::npos ? '_' : c);
+        const bool invalid =
+            c == '\0' || kInvalidChars.find(c) != std::string_view::npos;
+        sanitized_key.push_back(invalid ? '_' : c);
     }
     return sanitized_key;
 }

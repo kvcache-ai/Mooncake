@@ -28,9 +28,9 @@ void DefaultConfig::Load() {
         return path.size() >= ext.size() &&
                path.compare(path.size() - ext.size(), ext.size(), ext) == 0;
     };
-    if (check_extension(path_, ".yaml")) {
+    if (check_extension(path_, ".yaml") || check_extension(path_, ".yml")) {
         loadFromYAML();
-        type_ = ConfigType::YAML;  // YAML type
+        type_ = ConfigType::YAML;
     } else if (check_extension(path_, ".json")) {
         loadFromJSON();
         type_ = ConfigType::JSON;  // JSON type

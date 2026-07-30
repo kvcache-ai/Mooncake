@@ -1,35 +1,43 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
+#include <atomic>  // For std::atomic
 #include <chrono>  // For std::chrono
 #include <csignal>
-#include <memory>  // For std::unique_ptr
+#include <cstdlib>  // For std::getenv
+#include <fstream>  // For std::ifstream
+#include <memory>   // For std::unique_ptr
+#include <string>
 #include <thread>  // For std::thread
+#include <json/json.h>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/easylog/record.hpp>
 
 #include "default_config.h"
 #include "duration_utils.h"
 #include "ha/leadership/master_service_supervisor.h"
+
 #include "http_metadata_server.h"
+#include "master_admin_service.h"
 #include "rpc_service.h"
 #include "types.h"
 #include "utils.h"
 
 #include "master_config.h"
+#include "version.h"
 
 using namespace coro_rpc;
 using namespace async_simple;
 using namespace async_simple::coro;
 
-static_assert(mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL == 5000,
+static_assert(mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL == 10000,
               "Update kDefaultKvLeaseTtlFlagValue when "
               "DEFAULT_DEFAULT_KV_LEASE_TTL changes");
 static_assert(mooncake::DEFAULT_KV_SOFT_PIN_TTL_MS == 30 * 60 * 1000,
               "Update kDefaultKvSoftPinTtlFlagValue when "
               "DEFAULT_KV_SOFT_PIN_TTL_MS changes");
 
-constexpr char kDefaultKvLeaseTtlFlagValue[] = "5000";
+constexpr char kDefaultKvLeaseTtlFlagValue[] = "10000";
 constexpr char kDefaultKvSoftPinTtlFlagValue[] = "1800000";
 
 namespace {
@@ -56,13 +64,57 @@ uint64_t ParseDurationFlagOrDie(const char* flag_name,
     return parsed_value;
 }
 
+// Derive the metadata server address for cleanup when it is deployed
+// separately. Priority: MOONCAKE_TE_META_DATA_SERVER, then the
+// "metadata_server" field of MOONCAKE_CONFIG_PATH. Returns "" if none found;
+// the caller validates the scheme (only http(s) is supported).
+std::string ResolveMetadataServerForCleanup() {
+    if (const char* env = std::getenv("MOONCAKE_TE_META_DATA_SERVER")) {
+        std::string value(env);
+        // P2PHANDSHAKE has no central metadata server, nothing to clean up.
+        if (!value.empty() && value != "P2PHANDSHAKE") {
+            return value;
+        }
+    }
+
+    if (const char* cfg = std::getenv("MOONCAKE_CONFIG_PATH")) {
+        if (cfg[0] != '\0') {
+            try {
+                std::ifstream fin(cfg);
+                if (fin) {
+                    Json::CharReaderBuilder builder;
+                    Json::Value root;
+                    std::string errs;
+                    if (Json::parseFromStream(builder, fin, &root, &errs) &&
+                        root.isMember("metadata_server") &&
+                        root["metadata_server"].isString()) {
+                        return root["metadata_server"].asString();
+                    }
+                    if (!errs.empty()) {
+                        LOG(WARNING) << "Failed to parse MOONCAKE_CONFIG_PATH ("
+                                     << cfg << "): " << errs;
+                    }
+                } else {
+                    LOG(WARNING) << "Cannot open MOONCAKE_CONFIG_PATH (" << cfg
+                                 << "): file does not exist or is not readable";
+                }
+            } catch (const std::exception& e) {
+                LOG(WARNING) << "Error reading MOONCAKE_CONFIG_PATH (" << cfg
+                             << "): " << e.what();
+            }
+        }
+    }
+
+    return {};
+}
+
 }  // namespace
 
 DEFINE_string(config_path, "", "master service config file path");
 DEFINE_int32(port, 50051,
              "Port for master service to listen on (deprecated, use rpc_port)");
 DEFINE_int32(
-    max_threads, 4,
+    max_threads, 16,
     "Maximum number of threads to use (deprecated, use rpc_thread_num)");
 DEFINE_bool(enable_metric_reporting, true, "Enable periodic metric reporting");
 DEFINE_int32(metrics_port, 9003, "Port for HTTP metrics server to listen on");
@@ -78,10 +130,15 @@ DEFINE_bool(allow_evict_soft_pinned_objects,
 DEFINE_validator(default_kv_lease_ttl, ValidateDurationFlag);
 DEFINE_validator(default_kv_soft_pin_ttl, ValidateDurationFlag);
 DEFINE_double(eviction_ratio, mooncake::DEFAULT_EVICTION_RATIO,
-              "Ratio of objects to evict when storage space is full");
+              "Ratio of objects to evict when Memory space is full");
 DEFINE_double(eviction_high_watermark_ratio,
               mooncake::DEFAULT_EVICTION_HIGH_WATERMARK_RATIO,
-              "Ratio of high watermark trigger eviction");
+              "Ratio of high watermark trigger eviction in Memory");
+DEFINE_double(nof_eviction_ratio, mooncake::DEFAULT_NOF_EVICTION_RATIO,
+              "Ratio of objects to evict when NoF SSD space is full");
+DEFINE_double(nof_eviction_high_watermark_ratio,
+              mooncake::DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO,
+              "Ratio of high watermark trigger eviction in NoF SSD");
 // RPC server configuration parameters (new, preferred)
 // TODO: deprecate port and max_threads in the future
 DEFINE_int32(rpc_thread_num, 0,
@@ -101,29 +158,121 @@ DEFINE_bool(rpc_enable_tcp_no_delay, true,
             "Enable TCP_NODELAY for RPC connections");
 DEFINE_validator(eviction_ratio, [](const char* flagname, double value) {
     if (value < 0.0 || value > 1.0) {
-        LOG(FATAL) << "Eviction ratio must be between 0.0 and 1.0";
+        LOG(FATAL) << "Mem eviction ratio must be between 0.0 and 1.0";
+        return false;
+    }
+    return true;
+});
+DEFINE_validator(nof_eviction_ratio, [](const char* flagname, double value) {
+    if (value < 0.0 || value > 1.0) {
+        LOG(FATAL) << "NoF eviction ratio must be between 0.0 and 1.0";
         return false;
     }
     return true;
 });
 DEFINE_bool(enable_ha, false,
-            "Enable high availability, which depends on etcd");
+            "Enable high availability using the configured HA backend");
 DEFINE_bool(enable_offload, false, "Enable offload availability");
 DEFINE_bool(offload_on_evict, false,
             "Defer LOCAL_DISK offload to eviction time instead of PutEnd");
 DEFINE_bool(offload_force_evict, false,
             "Force-evict objects exceeding offload cap without disk offload");
+DEFINE_uint64(offloading_queue_limit, 50000,
+              "Maximum number of objects allowed in the offloading queue per "
+              "local disk segment. Increase to allow more objects to be "
+              "offloaded to SSD before force-eviction kicks in");
+DEFINE_validator(offloading_queue_limit, [](const char* flagname,
+                                            uint64_t value) {
+    // Zero would cause PushOffloadingQueue to always return
+    // KEYS_ULTRA_LIMIT, disabling offload entirely. The upper
+    // bound (1e8) keeps `offloading_queue_limit_ *
+    // offload_cap_ratio_` well within signed long range to
+    // avoid overflow when computing offload_cap in
+    // BatchEvict / EvictTenantMemoryForQuota.
+    if (value == 0) {
+        LOG(FATAL) << "offloading_queue_limit must be greater than 0";
+        return false;
+    }
+    if (value > 100'000'000ULL) {
+        LOG(FATAL) << "offloading_queue_limit must be <= "
+                      "100000000 to avoid overflow";
+        return false;
+    }
+    return true;
+});
+DEFINE_double(offload_cap_ratio, 0.5,
+              "Per-cycle offload cap as a fraction of offloading_queue_limit. "
+              "Controls how many objects can be queued for offload in a single "
+              "eviction cycle before falling back to force-evict");
+DEFINE_validator(offload_cap_ratio, [](const char* flagname, double value) {
+    if (value < 0.0 || value > 1.0) {
+        LOG(FATAL) << "offload_cap_ratio must be between 0.0 and 1.0";
+        return false;
+    }
+    return true;
+});
+DEFINE_bool(promotion_on_hit, false,
+            "Promote LOCAL_DISK-only keys to MEMORY on read access (mirror of "
+            "offload_on_evict)");
+DEFINE_uint32(promotion_admission_threshold, 2,
+              "Min CountMinSketch count for a key before promotion fires "
+              "(set 1 to disable second-touch gating)");
+DEFINE_uint32(promotion_queue_limit, 50000,
+              "Max in-flight promotion tasks across all shards");
+DEFINE_uint32(promotion_max_per_heartbeat, 1,
+              "Max promotion tasks returned to a single client per "
+              "PromotionObjectHeartbeat call. Each task is a synchronous "
+              "SSD-read + RDMA-write on the client; serializing them avoids "
+              "blocking past the client-liveness window. Default 1 is "
+              "conservative.");
+DEFINE_bool(enable_kv_events, false,
+            "Enable RFC #1527 KV cache event publisher over ZMQ");
+DEFINE_string(kv_events_bind_endpoint, "",
+              "ZMQ PUB bind endpoint for KV events, e.g. tcp://0.0.0.0:5557");
+DEFINE_string(kv_events_model_name, "",
+              "Deprecated: not emitted on events; use indexer POST /register");
+DEFINE_string(kv_events_backend_id, "",
+              "backend_id for published KV events (cache owner identity)");
+DEFINE_string(kv_events_tenant_id, "default",
+              "Deprecated: tenant_id comes from each object on events");
+DEFINE_string(kv_events_additional_salt, "",
+              "Deprecated: not emitted on events; use indexer POST /register");
+DEFINE_string(kv_events_lora_name, "",
+              "Deprecated: not emitted on events (no LoRA context in master)");
+DEFINE_uint32(kv_events_block_size, 0,
+              "Deprecated: not emitted on events; use indexer POST /register");
+DEFINE_uint32(kv_events_dp_rank, 0,
+              "Deprecated: not emitted on events; use indexer POST /register");
+DEFINE_bool(kv_events_emit_legacy_compat, true,
+            "Include vLLM/SGLang-compatible type/block_hashes fields");
+DEFINE_bool(kv_events_emit_object_key, true,
+            "Include Mooncake object_key in published KV events");
+DEFINE_uint32(kv_events_queue_capacity, 65536,
+              "Deprecated; ignored (event queue is unbounded)");
 DEFINE_string(ha_backend_type, "etcd",
               "HA backend type, e.g. etcd | redis | k8s");
 DEFINE_string(ha_backend_connstring, "",
-              "HA backend connection string. If unset, fallback to "
-              "etcd_endpoints for backward compatibility");
+              "HA backend connection string. If unset, only backend_type=etcd "
+              "falls back to etcd_endpoints for backward compatibility");
 DEFINE_string(
     etcd_endpoints, "",
     "Endpoints of ETCD server, separated by semicolon, required in HA mode");
-DEFINE_int64(client_ttl, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
-             "How long a client is considered alive after the last ping, only "
-             "used in HA mode");
+DEFINE_int64(
+    client_ttl, mooncake::DEFAULT_CLIENT_LIVE_TTL_SEC,
+    "Seconds a client stays considered alive after the last heartbeat. "
+    "If this TTL elapses without a refresh, the master treats the "
+    "client as disconnected and may unmount its segments");
+DEFINE_int64(nof_heartbeat_interval_sec,
+             mooncake::DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC,
+             "How often master probes each mounted NoF segment");
+DEFINE_uint32(nof_heartbeat_probe_timeout_ms,
+              mooncake::DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS,
+              "Timeout in milliseconds for a single NoF heartbeat probe");
+DEFINE_uint32(
+    nof_heartbeat_failures_threshold,
+    mooncake::DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD,
+    "Consecutive NoF heartbeat failures required before unmounting a NoF "
+    "segment");
 
 DEFINE_string(root_fs_dir, mooncake::DEFAULT_ROOT_FS_DIR,
               "Root directory for storage backend, used in HA mode");
@@ -134,17 +283,41 @@ DEFINE_string(cluster_id, mooncake::DEFAULT_CLUSTER_ID,
               "Cluster ID for the master service, used for kvcache persistence "
               "in HA mode");
 
+// OpLog store configuration
+DEFINE_bool(enable_oplog, false,
+            "Enable HA metadata replication through batch-record OpLog");
+DEFINE_int32(oplog_poll_interval_ms, 1000,
+             "Batch-record standby poll interval.");
+DEFINE_uint32(oplog_batch_max_entries, 1024,
+              "Maximum number of committed/reserved entries in the open "
+              "batch-record OpLog waiting batch.");
+DEFINE_uint32(batch_oplog_retry_timeout_sec, 180,
+              "Maximum time to retry transient batch OpLog standby errors.");
+
 DEFINE_string(memory_allocator, "offset",
               "Memory allocator for global segments, cachelib | offset");
 DEFINE_string(
     allocation_strategy, "random",
-    "Allocation strategy for segments, random | free_ratio_first | cxl");
+    "Allocation strategy for segments, random | free_ratio_first | cxl | "
+    "ssd_free_ratio_first | local_first");
 DEFINE_bool(enable_http_metadata_server, false,
             "Enable HTTP metadata server instead of etcd");
 DEFINE_int32(http_metadata_server_port, 8080,
              "Port for HTTP metadata server to listen on");
 DEFINE_string(http_metadata_server_host, "0.0.0.0",
               "Host for HTTP metadata server to bind to");
+DEFINE_bool(
+    enable_metadata_cleanup_on_timeout, false,
+    "Enable cleanup of HTTP metadata (mooncake/ram/*, mooncake/rpc_meta/*) "
+    "when client heartbeat times out. Works in two modes: (1) co-located "
+    "(enable_http_metadata_server=true) via in-process removal, or "
+    "(2) separately-deployed metadata server via async HTTP DELETE.");
+
+DEFINE_string(pod_name, "",
+              "Pod name for K8s label-based routing (default: $POD_NAME)");
+DEFINE_string(pod_namespace, "",
+              "Pod namespace for K8s label-based routing "
+              "(default: $POD_NAMESPACE)");
 
 DEFINE_uint64(put_start_discard_timeout_sec,
               mooncake::DEFAULT_PUT_START_DISCARD_TIMEOUT,
@@ -158,6 +331,12 @@ DEFINE_bool(enable_disk_eviction, true,
 DEFINE_uint64(
     quota_bytes, 0,
     "Quota for storage backend in bytes (0 = use default 90% of capacity)");
+DEFINE_bool(enable_multi_tenants, false,
+            "Enable strict multi-tenant namespace and quota admission");
+DEFINE_string(tenant_quota_connector_type, "file",
+              "Tenant quota policy connector type");
+DEFINE_string(tenant_quota_connector_uri, "",
+              "Tenant quota policy connector URI");
 
 // Snapshot related configuration flags (migrated from global_flags)
 DEFINE_string(snapshot_backup_dir, "",
@@ -214,10 +393,9 @@ namespace {
 
 std::string ResolveHABackendConnstring(
     const mooncake::MasterConfig& master_config) {
-    if (!master_config.ha_backend_connstring.empty()) {
-        return master_config.ha_backend_connstring;
-    }
-    return master_config.etcd_endpoints;
+    return mooncake::ResolveConfiguredHABackendConnstring(
+        master_config.ha_backend_type, master_config.ha_backend_connstring,
+        master_config.etcd_endpoints);
 }
 
 void ResolveRpcAddressFromInterfaceOrDie(
@@ -289,9 +467,24 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetDouble("eviction_high_watermark_ratio",
                              &master_config.eviction_high_watermark_ratio,
                              FLAGS_eviction_high_watermark_ratio);
+    default_config.GetDouble("nof_eviction_ratio",
+                             &master_config.nof_eviction_ratio,
+                             FLAGS_nof_eviction_ratio);
+    default_config.GetDouble("nof_eviction_high_watermark_ratio",
+                             &master_config.nof_eviction_high_watermark_ratio,
+                             FLAGS_nof_eviction_high_watermark_ratio);
     default_config.GetInt64("client_live_ttl_sec",
                             &master_config.client_live_ttl_sec,
                             FLAGS_client_ttl);
+    default_config.GetInt64("nof_heartbeat_interval_sec",
+                            &master_config.nof_heartbeat_interval_sec,
+                            FLAGS_nof_heartbeat_interval_sec);
+    default_config.GetUInt32("nof_heartbeat_probe_timeout_ms",
+                             &master_config.nof_heartbeat_probe_timeout_ms,
+                             FLAGS_nof_heartbeat_probe_timeout_ms);
+    default_config.GetUInt32("nof_heartbeat_failures_threshold",
+                             &master_config.nof_heartbeat_failures_threshold,
+                             FLAGS_nof_heartbeat_failures_threshold);
 
     default_config.GetBool("enable_ha", &master_config.enable_ha,
                            FLAGS_enable_ha);
@@ -302,6 +495,63 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetBool("offload_force_evict",
                            &master_config.offload_force_evict,
                            FLAGS_offload_force_evict);
+    {
+        uint64_t tmp_offloading_queue_limit = FLAGS_offloading_queue_limit;
+        default_config.GetUInt64("offloading_queue_limit",
+                                 &tmp_offloading_queue_limit,
+                                 FLAGS_offloading_queue_limit);
+        master_config.offloading_queue_limit =
+            static_cast<size_t>(tmp_offloading_queue_limit);
+    }
+    default_config.GetDouble("offload_cap_ratio",
+                             &master_config.offload_cap_ratio,
+                             FLAGS_offload_cap_ratio);
+    default_config.GetBool("promotion_on_hit", &master_config.promotion_on_hit,
+                           FLAGS_promotion_on_hit);
+    default_config.GetUInt32("promotion_admission_threshold",
+                             &master_config.promotion_admission_threshold,
+                             FLAGS_promotion_admission_threshold);
+    default_config.GetUInt32("promotion_queue_limit",
+                             &master_config.promotion_queue_limit,
+                             FLAGS_promotion_queue_limit);
+    default_config.GetUInt32("promotion_max_per_heartbeat",
+                             &master_config.promotion_max_per_heartbeat,
+                             FLAGS_promotion_max_per_heartbeat);
+    default_config.GetBool("enable_kv_events", &master_config.enable_kv_events,
+                           FLAGS_enable_kv_events);
+    default_config.GetString("kv_events_bind_endpoint",
+                             &master_config.kv_events_bind_endpoint,
+                             FLAGS_kv_events_bind_endpoint);
+    default_config.GetString("kv_events_model_name",
+                             &master_config.kv_events_model_name,
+                             FLAGS_kv_events_model_name);
+    default_config.GetString("kv_events_backend_id",
+                             &master_config.kv_events_backend_id,
+                             FLAGS_kv_events_backend_id);
+    default_config.GetString("kv_events_tenant_id",
+                             &master_config.kv_events_tenant_id,
+                             FLAGS_kv_events_tenant_id);
+    default_config.GetString("kv_events_additional_salt",
+                             &master_config.kv_events_additional_salt,
+                             FLAGS_kv_events_additional_salt);
+    default_config.GetString("kv_events_lora_name",
+                             &master_config.kv_events_lora_name,
+                             FLAGS_kv_events_lora_name);
+    default_config.GetUInt32("kv_events_block_size",
+                             &master_config.kv_events_block_size,
+                             FLAGS_kv_events_block_size);
+    default_config.GetUInt32("kv_events_dp_rank",
+                             &master_config.kv_events_dp_rank,
+                             FLAGS_kv_events_dp_rank);
+    default_config.GetBool("kv_events_emit_legacy_compat",
+                           &master_config.kv_events_emit_legacy_compat,
+                           FLAGS_kv_events_emit_legacy_compat);
+    default_config.GetBool("kv_events_emit_object_key",
+                           &master_config.kv_events_emit_object_key,
+                           FLAGS_kv_events_emit_object_key);
+    default_config.GetUInt32("kv_events_queue_capacity",
+                             &master_config.kv_events_queue_capacity,
+                             FLAGS_kv_events_queue_capacity);
     default_config.GetString("ha_backend_type", &master_config.ha_backend_type,
                              FLAGS_ha_backend_type);
     default_config.GetString("ha_backend_connstring",
@@ -311,6 +561,17 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                              FLAGS_etcd_endpoints);
     default_config.GetString("cluster_id", &master_config.cluster_id,
                              FLAGS_cluster_id);
+    default_config.GetBool("enable_oplog", &master_config.enable_oplog,
+                           FLAGS_enable_oplog);
+    default_config.GetInt32("oplog_poll_interval_ms",
+                            &master_config.oplog_poll_interval_ms,
+                            FLAGS_oplog_poll_interval_ms);
+    default_config.GetUInt32("oplog_batch_max_entries",
+                             &master_config.oplog_batch_max_entries,
+                             FLAGS_oplog_batch_max_entries);
+    default_config.GetUInt32("batch_oplog_retry_timeout_sec",
+                             &master_config.batch_oplog_retry_timeout_sec,
+                             FLAGS_batch_oplog_retry_timeout_sec);
     default_config.GetString("root_fs_dir", &master_config.root_fs_dir,
                              FLAGS_root_fs_dir);
     default_config.GetInt64("global_file_segment_size",
@@ -331,6 +592,13 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetString("http_metadata_server_host",
                              &master_config.http_metadata_server_host,
                              FLAGS_http_metadata_server_host);
+    default_config.GetString("pod_name", &master_config.pod_name,
+                             FLAGS_pod_name);
+    default_config.GetString("pod_namespace", &master_config.pod_namespace,
+                             FLAGS_pod_namespace);
+    default_config.GetBool("enable_metadata_cleanup_on_timeout",
+                           &master_config.enable_metadata_cleanup_on_timeout,
+                           FLAGS_enable_metadata_cleanup_on_timeout);
     default_config.GetUInt64("put_start_discard_timeout_sec",
                              &master_config.put_start_discard_timeout_sec,
                              FLAGS_put_start_discard_timeout_sec);
@@ -342,6 +610,15 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                            FLAGS_enable_disk_eviction);
     default_config.GetUInt64("quota_bytes", &master_config.quota_bytes,
                              FLAGS_quota_bytes);
+    default_config.GetBool("enable_multi_tenants",
+                           &master_config.enable_multi_tenants,
+                           FLAGS_enable_multi_tenants);
+    default_config.GetString("tenant_quota_connector_type",
+                             &master_config.tenant_quota_connector_type,
+                             FLAGS_tenant_quota_connector_type);
+    default_config.GetString("tenant_quota_connector_uri",
+                             &master_config.tenant_quota_connector_uri,
+                             FLAGS_tenant_quota_connector_uri);
 
     default_config.GetString("snapshot_backup_dir",
                              &master_config.snapshot_backup_dir,
@@ -412,7 +689,7 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
 
 void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
                            bool conf_set) {
-    if (FLAGS_max_threads != 4) {  // 4 is the default value
+    if (FLAGS_max_threads != 16) {  // 16 is the default value
         LOG(WARNING) << "max_threads is deprecated, use rpc_thread_num instead";
     }
     if (FLAGS_port != 50051) {  // 50051 is the default value
@@ -428,7 +705,7 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
     size_t rpc_thread_num;
     if (FLAGS_rpc_thread_num > 0) {
         rpc_thread_num = static_cast<size_t>(FLAGS_rpc_thread_num);
-        if (FLAGS_max_threads != 4) {  // 4 is the default value
+        if (FLAGS_max_threads != 16) {  // 16 is the default value
             LOG(WARNING) << "Both rpc_thread_num and max_threads are set. "
                          << "Using rpc_thread_num=" << FLAGS_rpc_thread_num
                          << ". Please migrate to use rpc_thread_num only.";
@@ -533,6 +810,18 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         master_config.eviction_high_watermark_ratio =
             FLAGS_eviction_high_watermark_ratio;
     }
+    if ((google::GetCommandLineFlagInfo("nof_eviction_ratio", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.nof_eviction_ratio = FLAGS_nof_eviction_ratio;
+    }
+    if ((google::GetCommandLineFlagInfo("nof_eviction_high_watermark_ratio",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.nof_eviction_high_watermark_ratio =
+            FLAGS_nof_eviction_high_watermark_ratio;
+    }
     if ((google::GetCommandLineFlagInfo("enable_ha", &info) &&
          !info.is_default) ||
         !conf_set) {
@@ -542,6 +831,127 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.enable_offload = FLAGS_enable_offload;
+    }
+    if ((google::GetCommandLineFlagInfo("offload_on_evict", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.offload_on_evict = FLAGS_offload_on_evict;
+    }
+    if ((google::GetCommandLineFlagInfo("offload_force_evict", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.offload_force_evict = FLAGS_offload_force_evict;
+    }
+    if ((google::GetCommandLineFlagInfo("offloading_queue_limit", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.offloading_queue_limit =
+            static_cast<size_t>(FLAGS_offloading_queue_limit);
+    }
+    if ((google::GetCommandLineFlagInfo("offload_cap_ratio", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.offload_cap_ratio = FLAGS_offload_cap_ratio;
+    }
+    if ((google::GetCommandLineFlagInfo("promotion_on_hit", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.promotion_on_hit = FLAGS_promotion_on_hit;
+    }
+    if ((google::GetCommandLineFlagInfo("promotion_admission_threshold",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.promotion_admission_threshold =
+            FLAGS_promotion_admission_threshold;
+    }
+    if ((google::GetCommandLineFlagInfo("promotion_queue_limit", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.promotion_queue_limit = FLAGS_promotion_queue_limit;
+    }
+    if ((google::GetCommandLineFlagInfo("promotion_max_per_heartbeat", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.promotion_max_per_heartbeat =
+            FLAGS_promotion_max_per_heartbeat;
+    }
+    if ((google::GetCommandLineFlagInfo("enable_kv_events", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_kv_events = FLAGS_enable_kv_events;
+    }
+    if ((google::GetCommandLineFlagInfo("kv_events_bind_endpoint", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.kv_events_bind_endpoint = FLAGS_kv_events_bind_endpoint;
+    }
+    if ((google::GetCommandLineFlagInfo("kv_events_model_name", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.kv_events_model_name = FLAGS_kv_events_model_name;
+    }
+    if ((google::GetCommandLineFlagInfo("kv_events_backend_id", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.kv_events_backend_id = FLAGS_kv_events_backend_id;
+    }
+    if ((google::GetCommandLineFlagInfo("kv_events_tenant_id", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.kv_events_tenant_id = FLAGS_kv_events_tenant_id;
+    }
+    if ((google::GetCommandLineFlagInfo("kv_events_additional_salt", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.kv_events_additional_salt =
+            FLAGS_kv_events_additional_salt;
+    }
+    if ((google::GetCommandLineFlagInfo("kv_events_lora_name", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.kv_events_lora_name = FLAGS_kv_events_lora_name;
+    }
+    if ((google::GetCommandLineFlagInfo("kv_events_block_size", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.kv_events_block_size = FLAGS_kv_events_block_size;
+    }
+    if ((google::GetCommandLineFlagInfo("kv_events_dp_rank", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.kv_events_dp_rank = FLAGS_kv_events_dp_rank;
+    }
+    if ((google::GetCommandLineFlagInfo("kv_events_emit_legacy_compat",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.kv_events_emit_legacy_compat =
+            FLAGS_kv_events_emit_legacy_compat;
+    }
+    if ((google::GetCommandLineFlagInfo("kv_events_emit_object_key", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.kv_events_emit_object_key =
+            FLAGS_kv_events_emit_object_key;
+    }
+    if ((google::GetCommandLineFlagInfo("kv_events_queue_capacity", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.kv_events_queue_capacity = FLAGS_kv_events_queue_capacity;
+    }
+    // Clamp promotion_admission_threshold into the sketch counter's
+    // representable range. The CountMinSketch uses 8-bit saturating
+    // counters (max 255) so any threshold beyond that would silently
+    // make the gate unreachable; clamping at parse time fails loudly and
+    // gives the gate a stable contract to compare uint8_t against.
+    if (master_config.promotion_admission_threshold > 255) {
+        LOG(WARNING) << "promotion_admission_threshold="
+                     << master_config.promotion_admission_threshold
+                     << " exceeds the CountMinSketch counter max (255). "
+                     << "Clamping to 255. Lower the configured value to "
+                     << "silence this warning.";
+        master_config.promotion_admission_threshold = 255;
     }
     if ((google::GetCommandLineFlagInfo("ha_backend_type", &info) &&
          !info.is_default) ||
@@ -563,10 +973,47 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.client_live_ttl_sec = FLAGS_client_ttl;
     }
+    if ((google::GetCommandLineFlagInfo("nof_heartbeat_interval_sec", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.nof_heartbeat_interval_sec =
+            FLAGS_nof_heartbeat_interval_sec;
+    }
+    if ((google::GetCommandLineFlagInfo("nof_heartbeat_probe_timeout_ms",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.nof_heartbeat_probe_timeout_ms =
+            FLAGS_nof_heartbeat_probe_timeout_ms;
+    }
+    if ((google::GetCommandLineFlagInfo("nof_heartbeat_failures_threshold",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.nof_heartbeat_failures_threshold =
+            FLAGS_nof_heartbeat_failures_threshold;
+    }
     if ((google::GetCommandLineFlagInfo("cluster_id", &info) &&
          !info.is_default) ||
         !conf_set) {
         master_config.cluster_id = FLAGS_cluster_id;
+    }
+    if ((google::GetCommandLineFlagInfo("enable_oplog", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_oplog = FLAGS_enable_oplog;
+    }
+    if ((google::GetCommandLineFlagInfo("oplog_batch_max_entries", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.oplog_batch_max_entries = FLAGS_oplog_batch_max_entries;
+    }
+    if ((google::GetCommandLineFlagInfo("batch_oplog_retry_timeout_sec",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.batch_oplog_retry_timeout_sec =
+            FLAGS_batch_oplog_retry_timeout_sec;
     }
     if ((google::GetCommandLineFlagInfo("root_fs_dir", &info) &&
          !info.is_default) ||
@@ -606,6 +1053,23 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         master_config.http_metadata_server_host =
             FLAGS_http_metadata_server_host;
     }
+    if ((google::GetCommandLineFlagInfo("pod_name", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.pod_name = FLAGS_pod_name;
+    }
+    if ((google::GetCommandLineFlagInfo("pod_namespace", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.pod_namespace = FLAGS_pod_namespace;
+    }
+    if ((google::GetCommandLineFlagInfo("enable_metadata_cleanup_on_timeout",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_metadata_cleanup_on_timeout =
+            FLAGS_enable_metadata_cleanup_on_timeout;
+    }
     if ((google::GetCommandLineFlagInfo("put_start_discard_timeout_sec",
                                         &info) &&
          !info.is_default) ||
@@ -629,6 +1093,23 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.quota_bytes = FLAGS_quota_bytes;
+    }
+    if ((google::GetCommandLineFlagInfo("enable_multi_tenants", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_multi_tenants = FLAGS_enable_multi_tenants;
+    }
+    if ((google::GetCommandLineFlagInfo("tenant_quota_connector_type", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.tenant_quota_connector_type =
+            FLAGS_tenant_quota_connector_type;
+    }
+    if ((google::GetCommandLineFlagInfo("tenant_quota_connector_uri", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.tenant_quota_connector_uri =
+            FLAGS_tenant_quota_connector_uri;
     }
     if ((google::GetCommandLineFlagInfo("max_total_finished_tasks", &info) &&
          !info.is_default) ||
@@ -805,10 +1286,21 @@ std::unique_ptr<mooncake::HttpMetadataServer> StartHttpMetadataServer(
 int main(int argc, char* argv[]) {
     mooncake::init_ylt_log_level();
     // Initialize gflags
+    gflags::SetVersionString(mooncake::MOONCAKE_DISPLAY_VERSION);
     gflags::ParseCommandLineFlags(&argc, &argv, true);
 
     if (!FLAGS_log_dir.empty()) {
         google::InitGoogleLogging(argv[0]);
+        // Merge all master logs into a single journal file in --log_dir,
+        // reusing glog: every record is already written to its own severity
+        // file and all lower ones, so the INFO sink is a complete journal.
+        // Disable the higher-severity files so everything lands in one file.
+        const std::string log_base = FLAGS_log_dir + "/mooncake_master.";
+        google::SetLogDestination(google::GLOG_INFO, log_base.c_str());
+        google::SetLogDestination(google::GLOG_WARNING, "");
+        google::SetLogDestination(google::GLOG_ERROR, "");
+        google::SetLogDestination(google::GLOG_FATAL, "");
+        google::SetLogSymlink(google::GLOG_INFO, "mooncake_master");
     }
 
     // Initialize the master configuration
@@ -828,11 +1320,32 @@ int main(int argc, char* argv[]) {
     LoadConfigFromCmdline(master_config, !conf_path.empty());
     ResolveRpcAddressFromInterfaceOrDie(master_config);
 
+    // Fall back to environment variables for pod identity (K8s Downward API)
+    if (master_config.pod_name.empty()) {
+        const char* env = std::getenv("POD_NAME");
+        if (env) master_config.pod_name = env;
+    }
+    if (master_config.pod_namespace.empty()) {
+        const char* env = std::getenv("POD_NAMESPACE");
+        if (env) master_config.pod_namespace = env;
+    }
+
     const std::string ha_backend_connstring =
         ResolveHABackendConnstring(master_config);
     if (master_config.enable_ha && ha_backend_connstring.empty()) {
         LOG(FATAL) << "HA backend connection string must be set when "
-                   << "enable_ha is true";
+                   << "enable_ha is true, backend_type="
+                   << master_config.ha_backend_type
+                   << ". Only backend_type=etcd may fall back to "
+                   << "etcd_endpoints";
+        return 1;
+    }
+    if (master_config.enable_oplog && !master_config.enable_ha) {
+        LOG(FATAL) << "enable_oplog requires enable_ha=true";
+        return 1;
+    }
+    if (master_config.enable_oplog && master_config.ha_backend_type != "etcd") {
+        LOG(FATAL) << "enable_oplog currently requires ha_backend_type=etcd";
         return 1;
     }
     if (!master_config.enable_ha && (!ha_backend_connstring.empty() ||
@@ -862,6 +1375,41 @@ int main(int argc, char* argv[]) {
     if (value && std::string_view(value) == "rdma") {
         protocol = "rdma";
     }
+
+    // enable_metadata_cleanup_on_timeout requires a reachable HTTP metadata
+    // server. Two topologies are supported:
+    //   1) Co-located: enable_http_metadata_server=true -> the master cleans
+    //      up via the in-process server (no network overhead).
+    //   2) Separately deployed: the master derives the metadata server address
+    //      from the cluster's existing configuration
+    //      (MOONCAKE_TE_META_DATA_SERVER, or MOONCAKE_CONFIG_PATH json's
+    //      "metadata_server") and cleans up via HTTP DELETE. Only http(s)
+    //      endpoints are supported for now (etcd/redis left for future work).
+    // If neither is available, cleanup is disabled with a warning so the main
+    // process is never affected.
+    std::string http_metadata_remote_url;
+    if (master_config.enable_metadata_cleanup_on_timeout &&
+        !master_config.enable_http_metadata_server) {
+        std::string derived = ResolveMetadataServerForCleanup();
+        if (derived.rfind("http://", 0) == 0 ||
+            derived.rfind("https://", 0) == 0) {
+            http_metadata_remote_url = std::move(derived);
+            LOG(INFO) << "enable_metadata_cleanup_on_timeout: HTTP metadata "
+                         "server is deployed separately; cleanup will target "
+                      << http_metadata_remote_url;
+        } else {
+            LOG(WARNING)
+                << "enable_metadata_cleanup_on_timeout is set to true but "
+                   "enable_http_metadata_server is false and no HTTP metadata "
+                   "server address could be derived from the cluster config "
+                   "(set "
+                   "MOONCAKE_TE_META_DATA_SERVER=http://host:port/metadata "
+                   "or MOONCAKE_CONFIG_PATH). Disabling metadata cleanup on "
+                   "timeout.";
+            master_config.enable_metadata_cleanup_on_timeout = false;
+        }
+    }
+
     LOG(INFO)
         << "Master service started on port " << master_config.rpc_port
         << ", max_threads=" << master_config.rpc_thread_num
@@ -875,9 +1423,15 @@ int main(int argc, char* argv[]) {
         << ", eviction_high_watermark_ratio="
         << master_config.eviction_high_watermark_ratio
         << ", enable_ha=" << master_config.enable_ha
+        << ", enable_oplog=" << master_config.enable_oplog
         << ", enable_offload=" << master_config.enable_offload
+        << ", enable_kv_events=" << master_config.enable_kv_events
+        << ", kv_events_bind_endpoint=" << master_config.kv_events_bind_endpoint
+        << ", kv_events_backend_id=" << master_config.kv_events_backend_id
         << ", offload_on_evict=" << master_config.offload_on_evict
         << ", offload_force_evict=" << master_config.offload_force_evict
+        << ", offloading_queue_limit=" << master_config.offloading_queue_limit
+        << ", offload_cap_ratio=" << master_config.offload_cap_ratio
         << ", ha_backend_type=" << master_config.ha_backend_type
         << ", ha_backend_connstring=" << ha_backend_connstring
         << ", etcd_endpoints=" << master_config.etcd_endpoints
@@ -901,6 +1455,8 @@ int main(int argc, char* argv[]) {
         << master_config.http_metadata_server_port
         << ", http_metadata_server_host="
         << master_config.http_metadata_server_host
+        << ", enable_metadata_cleanup_on_timeout="
+        << master_config.enable_metadata_cleanup_on_timeout
         << ", put_start_discard_timeout_sec="
         << master_config.put_start_discard_timeout_sec
         << ", put_start_release_timeout_sec="
@@ -946,9 +1502,20 @@ int main(int argc, char* argv[]) {
         std::this_thread::sleep_for(std::chrono::seconds(1));
     }
 
+    // Metadata cleanup on client timeout (used by both the HA and non-HA
+    // paths): prefer the co-located in-process server, else the separate URL.
+    mooncake::HttpMetadataServer* metadata_server_ptr = nullptr;
+    if (master_config.enable_metadata_cleanup_on_timeout &&
+        master_config.enable_http_metadata_server) {
+        metadata_server_ptr = http_metadata_server.get();
+    }
+
     if (master_config.enable_ha) {
-        mooncake::ha::MasterServiceSupervisor supervisor(
-            mooncake::MasterServiceSupervisorConfig{master_config});
+        mooncake::MasterServiceSupervisorConfig supervisor_config{
+            master_config};
+        supervisor_config.http_metadata_server = metadata_server_ptr;
+        supervisor_config.http_metadata_remote_url = http_metadata_remote_url;
+        mooncake::ha::MasterServiceSupervisor supervisor(supervisor_config);
         return supervisor.Start();
     } else {
         // version is not used in non-HA mode, just pass a dummy value
@@ -964,7 +1531,8 @@ int main(int argc, char* argv[]) {
         }
         auto wrapped_master_service =
             std::make_shared<mooncake::WrappedMasterService>(
-                mooncake::WrappedMasterServiceConfig(master_config, version));
+                mooncake::WrappedMasterServiceConfig(master_config, version),
+                metadata_server_ptr, http_metadata_remote_url);
         mooncake::MasterAdminServer admin_server(
             static_cast<uint16_t>(master_config.metrics_port),
             master_config.enable_metric_reporting);
@@ -978,6 +1546,32 @@ int main(int argc, char* argv[]) {
         admin_server.SetServiceAvailable(true);
 
         mooncake::RegisterRpcService(server, *wrapped_master_service);
-        return server.start();
+
+        static std::atomic<bool> shutdown_requested{false};
+        auto signal_handler = [](int /* signum */) {
+            shutdown_requested.store(true);
+        };
+        std::signal(SIGINT, signal_handler);
+        std::signal(SIGTERM, signal_handler);
+
+        int server_result = 0;
+        std::atomic<bool> server_done{false};
+        std::thread server_thread([&server, &server_result, &server_done]() {
+            server_result = server.start();
+            server_done.store(true);
+        });
+
+        while (!shutdown_requested.load() && !server_done.load()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+        server.stop();
+        server_thread.join();
+
+        if (shutdown_requested.load()) {
+            LOG(INFO) << "Shutdown signal received, exiting gracefully";
+            return 0;
+        }
+        return server_result;
     }
 }

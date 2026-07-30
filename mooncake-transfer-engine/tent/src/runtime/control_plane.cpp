@@ -156,26 +156,12 @@ Status ControlClient::unpinStageBuffer(const std::string& server_addr,
 ControlService::ControlService(const std::string& type,
                                const std::string& servers,
                                TransferEngineImpl* impl)
-    : ControlService(type, servers, "", "", 0, impl) {}
-
-ControlService::ControlService(const std::string& type,
-                               const std::string& servers,
-                               const std::string& password, uint8_t db_index,
-                               TransferEngineImpl* impl)
-    : ControlService(type, servers, "", password, db_index, impl) {}
-
-ControlService::ControlService(const std::string& type,
-                               const std::string& servers,
-                               const std::string& username,
-                               const std::string& password, uint8_t db_index,
-                               TransferEngineImpl* impl)
     : bootstrap_callback_(nullptr), notify_callback_(nullptr), impl_(impl) {
     if (type == "p2p") {
         auto agent = std::make_unique<PeerSegmentRegistry>();
         manager_ = std::make_unique<SegmentManager>(std::move(agent));
     } else {
-        auto agent = std::make_unique<CentralSegmentRegistry>(
-            type, servers, username, password, db_index);
+        auto agent = std::make_unique<CentralSegmentRegistry>(type, servers);
         manager_ = std::make_unique<SegmentManager>(std::move(agent));
     }
     rpc_server_ = std::make_shared<CoroRpcAgent>();
@@ -240,8 +226,9 @@ Status ControlService::start(uint16_t& port, bool ipv6_) {
 
 void ControlService::onGetSegmentDesc(const std::string_view& request,
                                       std::string& response) {
-    json j = *manager_->getLocal();
-    response = j.dump();
+    // Re-use the cached dump shared across concurrent peer fetches.
+    auto cached = manager_->getLocalDumpedJson();
+    response = *cached;
 }
 
 void ControlService::onBootstrapRdma(const std::string_view& request,
@@ -257,8 +244,12 @@ void ControlService::onBootstrapRdma(const std::string_view& request,
 
 void ControlService::onSendData(const std::string_view& request,
                                 std::string& response) {
+    if (request.size() < sizeof(XferDataDesc)) {
+        response = "SendData failed: request too short";
+        return;
+    }
     XferDataDesc* desc = (XferDataDesc*)request.data();
-    auto local_desc = manager_->getLocal().get();
+    auto local_desc = manager_->getLocal();
     auto peer_mem_addr = le64toh(desc->peer_mem_addr);
     auto length = le64toh(desc->length);
 
@@ -277,8 +268,12 @@ void ControlService::onSendData(const std::string_view& request,
 
 void ControlService::onRecvData(const std::string_view& request,
                                 std::string& response) {
+    if (request.size() < sizeof(XferDataDesc)) {
+        response = "RecvData failed: request too short";
+        return;
+    }
     XferDataDesc* desc = (XferDataDesc*)request.data();
-    auto local_desc = manager_->getLocal().get();
+    auto local_desc = manager_->getLocal();
     auto peer_mem_addr = le64toh(desc->peer_mem_addr);
     auto length = le64toh(desc->length);
 

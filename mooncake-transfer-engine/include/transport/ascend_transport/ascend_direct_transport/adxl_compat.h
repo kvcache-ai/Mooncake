@@ -16,10 +16,12 @@
 #ifndef ASCEND_DIRECT_TRANSPORT_ADXL_COMPAT_H
 #define ASCEND_DIRECT_TRANSPORT_ADXL_COMPAT_H
 
-#include <adxl/adxl_types.h>
+#include <graph/ascend_string.h>
 
-#include <memory>
+#include <cstddef>
+#include <cstdint>
 #include <map>
+#include <memory>
 #include <vector>
 
 #ifdef FUNC_VISIBILITY
@@ -29,6 +31,50 @@
 #endif
 
 namespace adxl {
+using Status = uint32_t;
+using AscendString = ge::AscendString;
+using TransferReq = void*;
+using MemHandle = void*;
+
+constexpr Status SUCCESS = 0U;
+constexpr Status PARAM_INVALID = 103900U;
+constexpr Status TIMEOUT = 103901U;
+constexpr Status NOT_CONNECTED = 103902U;
+constexpr Status ALREADY_CONNECTED = 103903U;
+constexpr Status NOTIFY_FAILED = 103904U;
+constexpr Status UNSUPPORTED = 103905U;
+constexpr Status FAILED = 503900U;
+constexpr Status RESOURCE_EXHAUSTED = 203900U;
+
+enum MemType { MEM_DEVICE, MEM_HOST };
+
+enum TransferOp { READ, WRITE };
+
+struct MemDesc {
+    uintptr_t addr;
+    size_t len;
+    uint8_t reserved[128] = {};
+};
+
+struct TransferOpDesc {
+    uintptr_t local_addr;
+    uintptr_t remote_addr;
+    size_t len;
+};
+
+enum class TransferStatus { WAITING, COMPLETED, TIMEOUT, FAILED };
+
+struct TransferArgs {
+    uint8_t reserved[128] = {};
+};
+
+// FeatureType values must be explicitly assigned. Append new capabilities at
+// the end only.
+enum FeatureType : int32_t {
+    AUTO_CONNECT = 0,
+    CLIENT_SERVER_COMM = 1,
+};
+
 class ASCEND_FUNC_VISIBILITY AdxlEngine {
    public:
     /**
@@ -145,10 +191,28 @@ class ASCEND_FUNC_VISIBILITY AdxlEngine {
      */
     __attribute__((weak)) static Status FreeMem(void* ptr);
 
+    /**
+     * @brief 查询库能力特性
+     * @param [in] feature_type 特性类型
+     * @param [out] value 1=支持，0=不支持
+     * @return 成功:SUCCESS；未知特性:UNSUPPORTED；参数非法:PARAM_INVALID
+     */
+    __attribute__((weak)) static Status GetCapability(FeatureType feature_type,
+                                                      int32_t& value);
+
    private:
     class AdxlEngineImpl;
     std::unique_ptr<AdxlEngineImpl> impl_;
 };
+
+inline bool IsAdxlFeatureSupported(FeatureType feature) {
+    if (&AdxlEngine::GetCapability == nullptr) {
+        return false;
+    }
+    int32_t val = 0;
+    const Status st = AdxlEngine::GetCapability(feature, val);
+    return st == SUCCESS && val == 1;
+}
 }  // namespace adxl
 
 #endif  // ASCEND_DIRECT_TRANSPORT_ADXL_COMPAT_H

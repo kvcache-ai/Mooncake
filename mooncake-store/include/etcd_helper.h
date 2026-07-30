@@ -27,6 +27,15 @@ class EtcdHelper {
         const std::string& etcd_endpoints);
 
     /*
+     * @brief Reset the global store etcd client and reconnect to the given
+     *        endpoints. This cancels active store watches/keepalives in the Go
+     *        wrapper and creates a fresh clientv3.Client.
+     * @param etcd_endpoints: The endpoints of the etcd store client.
+     * @return: Error code.
+     */
+    static ErrorCode ResetEtcdStoreClient(const std::string& etcd_endpoints);
+
+    /*
      * @brief Get the value of a key from the etcd.
      * @param key: The key to get the value of.
      * @param key_size: The size of the key in bytes.
@@ -61,6 +70,31 @@ class EtcdHelper {
      */
     static ErrorCode BatchCreate(const std::vector<std::string>& keys,
                                  const std::vector<std::string>& values);
+
+    enum class TxnCompareKind {
+        kValueEquals = 0,
+        kKeyNotExists = 1,
+    };
+
+    struct TxnCompare {
+        std::string key;
+        TxnCompareKind kind{TxnCompareKind::kValueEquals};
+        std::string expected_value;
+    };
+
+    struct TxnPut {
+        std::string key;
+        std::string value;
+    };
+
+    /*
+     * @brief Execute an etcd transaction with compare predicates and put
+     * operations.
+     * @return: OK on success; ETCD_TRANSACTION_FAIL when compare predicates
+     * fail.
+     */
+    static ErrorCode TxnCompareAndPut(const std::vector<TxnCompare>& compares,
+                                      const std::vector<TxnPut>& puts);
 
     /*
      * @brief Grant a lease from the etcd.

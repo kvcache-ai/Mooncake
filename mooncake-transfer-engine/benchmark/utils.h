@@ -30,8 +30,10 @@
 #include "tent/common/utils/os.h"
 #include "tent/common/utils/random.h"
 
-#ifdef USE_CUDA
+#if defined(USE_CUDA)
 #include <cuda_runtime.h>
+#elif defined(USE_SUNRISE)
+#include "cuda_alike.h"
 #endif
 
 #ifdef USE_HIP
@@ -54,6 +56,9 @@ struct XferBenchConfig {
 
     static std::string seg_name;
     static std::string seg_type;
+    // Comma-separated segment types for mixed DRAM+VRAM runs, e.g.
+    // "dram,vram". Empty falls back to --seg_type (single type).
+    static std::string seg_type_mix;
     static std::string target_seg_name;
     static std::string op_type;
     static bool check_consistency;
@@ -66,6 +71,14 @@ struct XferBenchConfig {
     static int duration;
     static int max_num_threads;
     static int start_num_threads;
+    static std::string qos_classes;
+    static std::string qos_classes_json;
+    static std::string workload_classes_json;
+    static double qos_link_capacity_gbps;
+    static std::string qos_output_jsonl;
+    static uint64_t deadline_us;
+    static int deadline_tight_threads;
+    static bool deadline_bw_arbitration;
 
     static std::string metadata_type;
     static std::string metadata_url_list;
@@ -73,6 +86,8 @@ struct XferBenchConfig {
     static std::string xport_type;
     static std::string backend;
     static bool notifi;
+    static std::string tent_transport_hint;
+    static std::string tent_intent_type;
 
     static int local_gpu_id;
     static int target_gpu_id;
@@ -104,7 +119,19 @@ struct XferMetricStats {
 
     double p999() { return percentile(99.9); }
 
+    double fractionAtOrBelow(double threshold) const {
+        if (samples.empty()) return 0.0;
+        const auto count = std::count_if(
+            samples.begin(), samples.end(),
+            [threshold](double value) { return value <= threshold; });
+        return static_cast<double>(count) / samples.size();
+    }
+
     void add(double value) { samples.push_back(value); }
+
+    void add(const std::vector<double>& values) {
+        samples.insert(samples.end(), values.begin(), values.end());
+    }
 
     void clear() { samples.clear(); }
 
@@ -150,7 +177,11 @@ void printStatsHeader();
 void printStats(size_t block_size, size_t batch_size, XferBenchStats& stats,
                 int num_threads);
 
-#ifdef USE_CUDA
+void printDeadlineGroupStats(const char* group, size_t block_size,
+                             size_t batch_size, XferBenchStats& stats,
+                             int num_threads, uint64_t deadline_us);
+
+#if defined(USE_CUDA) || defined(USE_SUNRISE)
 static inline bool isCudaMemory(void* ptr) {
     cudaPointerAttributes attr;
     auto ret = cudaPointerGetAttributes(&attr, ptr);
@@ -167,7 +198,7 @@ static inline bool isHipMemory(void* ptr) {
 #endif
 
 static inline bool isGpuMemory(void* ptr) {
-#ifdef USE_CUDA
+#if defined(USE_CUDA) || defined(USE_SUNRISE)
     if (isCudaMemory(ptr)) return true;
 #endif
 #ifdef USE_HIP
@@ -178,10 +209,19 @@ static inline bool isGpuMemory(void* ptr) {
 
 static inline uint8_t fillData(void* addr, size_t length) {
     uint8_t seed = (uint8_t)SimpleRandom::Get().next(256);
-#ifdef USE_CUDA
+#if defined(USE_CUDA)
     if (isCudaMemory(addr)) {
         std::vector<uint8_t> ref_data(length, seed);
         cudaMemcpy(addr, ref_data.data(), length, cudaMemcpyDefault);
+        return seed;
+    }
+#elif defined(USE_SUNRISE)
+    if (isCudaMemory(addr)) {
+        std::vector<uint8_t> ref_data(length, seed);
+        auto err =
+            cudaMemcpy(addr, ref_data.data(), length, cudaMemcpyHostToDevice);
+        LOG_ASSERT(err == cudaSuccess)
+            << "cudaMemcpy failed: " << cudaGetErrorString(err);
         return seed;
     }
 #endif
@@ -198,10 +238,22 @@ static inline uint8_t fillData(void* addr, size_t length) {
 
 static inline void verifyData(void* addr, size_t length, uint8_t seed) {
     std::vector<uint8_t> ref_data(length, seed);
-#ifdef USE_CUDA
+#if defined(USE_CUDA)
     if (isCudaMemory(addr)) {
         std::vector<uint8_t> act_data(length);
         cudaMemcpy(act_data.data(), addr, length, cudaMemcpyDefault);
+        if (memcmp(act_data.data(), ref_data.data(), length)) {
+            LOG(FATAL) << "Inconsistent data detected";
+        }
+        return;
+    }
+#elif defined(USE_SUNRISE)
+    if (isCudaMemory(addr)) {
+        std::vector<uint8_t> act_data(length);
+        auto err =
+            cudaMemcpy(act_data.data(), addr, length, cudaMemcpyDeviceToHost);
+        LOG_ASSERT(err == cudaSuccess)
+            << "cudaMemcpy failed: " << cudaGetErrorString(err);
         if (memcmp(act_data.data(), ref_data.data(), length)) {
             LOG(FATAL) << "Inconsistent data detected";
         }

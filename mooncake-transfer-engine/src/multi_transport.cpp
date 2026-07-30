@@ -14,10 +14,12 @@
 
 #include "multi_transport.h"
 #include <algorithm>
+#include <cstdlib>
 #include <sstream>
 #include <string>
 
 #include "config.h"
+#include "multi_transport_locality.h"
 #include "transport/rdma_transport/rdma_transport.h"
 #ifdef USE_BAREX
 #include "transport/barex_transport/barex_transport.h"
@@ -28,6 +30,9 @@
 #include "transport/transport.h"
 #ifdef USE_NVMEOF
 #include "transport/nvmeof_transport/nvmeof_transport.h"
+#endif
+#ifdef USE_NCCL_HOST
+#include "transport/nccl_transport/nccl_transport.h"
 #endif
 #ifdef USE_ASCEND_DIRECT
 #include "transport/ascend_transport/ascend_direct_transport/ascend_direct_transport.h"
@@ -58,6 +63,12 @@
 #endif
 #ifdef USE_EFA
 #include "transport/efa_transport/efa_transport.h"
+#endif
+#ifdef USE_CXI
+#include "transport/cxi_transport/cxi_transport.h"
+#endif
+#ifdef USE_SUNRISE
+#include "transport/sunrise_link_transport/sunrise_link_transport.h"
 #endif
 #ifdef USE_UB
 #include "transport/kunpeng_transport/ub_transport.h"
@@ -124,6 +135,7 @@ Status MultiTransport::submitTransfer(
         assert(transport);
         auto& task = batch_desc.task_list[task_id];
         task.batch_id = batch_id;
+        task.transport_ = transport;
 #ifdef USE_ASCEND_HETEROGENEOUS
         task.request = const_cast<Transport::TransferRequest*>(&request);
 #else
@@ -166,6 +178,7 @@ Status MultiTransport::mp_submitTransfer(
         assert(transport);
         auto& task = batch_desc.task_list[task_id];
         task.batch_id = batch_id;
+        task.transport_ = transport;
 #ifdef USE_ASCEND_HETEROGENEOUS
         task.request = const_cast<Transport::TransferRequest*>(&request);
 #else
@@ -195,6 +208,45 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
         return Status::InvalidArgument("Task ID out of range");
     }
     auto& task = batch_desc.task_list[task_id];
+
+    // Helper: check if any slice has exceeded the configured timeout.
+    // Returns true if a timeout was detected (and logs it).
+    auto checkSliceTimeout = [&](const Transport::TransferTask& t) -> bool {
+        if (globalConfig().slice_timeout <= 0) return false;
+        auto current_ts = getCurrentTimeInNano();
+        const int64_t kPacketDeliveryTimeout =
+            globalConfig().slice_timeout * 1000000000;
+        for (auto& slice : t.slice_list) {
+            auto ts = slice->ts;
+            if (ts > 0 && current_ts > ts &&
+                current_ts - ts > kPacketDeliveryTimeout) {
+                LOG(INFO) << "Slice timeout detected";
+                return true;
+            }
+        }
+        return false;
+    };
+
+    // If the task has an associated transport, delegate to its
+    // getTransferStatus() to trigger transport-specific completion
+    // polling. For example, the NVLink async transport polls CUDA
+    // streams via cudaStreamQuery() here; without this call the
+    // slice statuses (and therefore success/failed_slice_count)
+    // would never be updated.
+    if (task.transport_) {
+        auto ret =
+            task.transport_->getTransferStatus(batch_id, task_id, status);
+        if (!ret.ok()) return ret;
+
+        // Apply timeout check on top of the transport's result.
+        if (status.s == Transport::TransferStatusEnum::WAITING &&
+            checkSliceTimeout(task)) {
+            status.s = Transport::TransferStatusEnum::TIMEOUT;
+        }
+        return Status::OK();
+    }
+
+    // Fallback for tasks without a transport pointer (legacy path)
     status.transferred_bytes = task.transferred_bytes;
     uint64_t success_slice_count = task.success_slice_count;
     uint64_t failed_slice_count = task.failed_slice_count;
@@ -207,21 +259,11 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
         }
         task.is_finished = true;
     } else {
-        if (globalConfig().slice_timeout > 0) {
-            auto current_ts = getCurrentTimeInNano();
-            const int64_t kPacketDeliveryTimeout =
-                globalConfig().slice_timeout * 1000000000;
-            for (auto& slice : task.slice_list) {
-                auto ts = slice->ts;
-                if (ts > 0 && current_ts > ts &&
-                    current_ts - ts > kPacketDeliveryTimeout) {
-                    LOG(INFO) << "Slice timeout detected";
-                    status.s = Transport::TransferStatusEnum::TIMEOUT;
-                    return Status::OK();
-                }
-            }
+        if (checkSliceTimeout(task)) {
+            status.s = Transport::TransferStatusEnum::TIMEOUT;
+        } else {
+            status.s = Transport::TransferStatusEnum::WAITING;
         }
-        status.s = Transport::TransferStatusEnum::WAITING;
     }
     return Status::OK();
 }
@@ -274,6 +316,14 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
 
 Transport* MultiTransport::installTransport(const std::string& proto,
                                             std::shared_ptr<Topology> topo) {
+#ifdef USE_NCCL_HOST
+    if ((proto == "nccl" && !transport_map_.empty()) ||
+        (proto != "nccl" && transport_map_.count("nccl") != 0)) {
+        LOG(ERROR) << "NCCL host transport must be the only transport "
+                      "installed in a Transfer Engine instance";
+        return nullptr;
+    }
+#endif
     Transport* transport = nullptr;
     if (std::string(proto) == "rdma") {
         transport = new RdmaTransport();
@@ -296,6 +346,11 @@ Transport* MultiTransport::installTransport(const std::string& proto,
 #ifdef USE_NVMEOF
     else if (std::string(proto) == "nvmeof") {
         transport = new NVMeoFTransport();
+    }
+#endif
+#ifdef USE_NCCL_HOST
+    else if (std::string(proto) == "nccl") {
+        transport = new NcclHostTransport();
     }
 #endif
 #ifdef USE_ASCEND_DIRECT
@@ -350,6 +405,16 @@ Transport* MultiTransport::installTransport(const std::string& proto,
         transport = new EfaTransport();
     }
 #endif
+#ifdef USE_CXI
+    else if (std::string(proto) == "cxi") {
+        transport = new CxiTransport();
+    }
+#endif
+#ifdef USE_SUNRISE
+    else if (std::string(proto) == "sunrise_link") {
+        transport = new SunriseLinkTransport();
+    }
+#endif
 
     if (!transport) {
         LOG(ERROR) << "Unsupported transport " << proto
@@ -392,6 +457,7 @@ Transport* MultiTransport::installTransport(const std::string& proto,
     }
 #endif
     if (transport->install(local_server_name_, metadata_, topo)) {
+        delete transport;
         return nullptr;
     }
 
@@ -407,6 +473,73 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
                                        std::to_string(entry.target_id));
     }
     auto proto = target_segment_desc->protocol;
+#ifdef ENABLE_MULTI_PROTOCOL
+    // Multi-protocol segment (e.g. "rdma,hip"): a single batch may target
+    // buffers owned by different transports (the device KV pool via hip, the
+    // host aux/metadata buffers via rdma). Route each request to the transport
+    // that owns the buffer covering the target address. When a buffer is
+    // registered under more than one protocol (the device KV pool is registered
+    // by both rdma and hip), pick the highest-performance transport by a fixed
+    // priority instead of relying on buffer registration order.
+    if (proto.find(',') != std::string::npos) {
+        auto protocol_priority = [](const std::string& p) {
+            // hip is intra-node GPU-IPC only. On a cross-node request a
+            // hip+rdma segment must fall through to rdma; allow deployments
+            // that know they need the cross-node path to de-prioritize hip.
+            if (p == "hip") return std::getenv("MC_DISABLE_HIP") ? 0 : 4;
+            if (p == "maca") return std::getenv("MC_DISABLE_MACA") ? 0 : 4;
+            if (p == "cxl") return 3;
+            if (p == "rdma") return 2;
+            if (p == "tcp") return 1;
+            return 0;
+        };
+        // hip transport uses GPU IPC, which cannot reach a GPU on another host.
+        // The device KV pool is registered under both rdma and hip, so a
+        // cross-host target must skip its hip buffers and fall back to rdma.
+        // This makes the intra-node fast path (hip) and the cross-node path
+        // (rdma) work automatically from a single multi-protocol segment,
+        // without requiring the operator to set MC_DISABLE_HIP.
+        const bool hip_reachable =
+            isHipReachableTarget(target_segment_desc->name, local_server_name_);
+        std::string chosen;
+        int chosen_priority = -1;
+        for (const auto& buffer : target_segment_desc->buffers) {
+            // CXL buffers locate via offset + cxl_base_addr; all other
+            // protocols use the absolute virtual address in buffer.addr.
+            uint64_t start =
+                (buffer.protocol == "cxl")
+                    ? buffer.offset + target_segment_desc->cxl_base_addr
+                    : buffer.addr;
+            if (entry.target_offset >= start &&
+                entry.target_offset < start + buffer.length) {
+                if (buffer.protocol == "hip" && !hip_reachable) continue;
+                int priority = protocol_priority(buffer.protocol);
+                if (priority > chosen_priority) {
+                    chosen = buffer.protocol;
+                    chosen_priority = priority;
+                }
+            }
+        }
+        if (chosen.empty()) {
+            return Status::InvalidArgument(
+                "No matching buffer for target offset in multi-protocol "
+                "segment " +
+                std::to_string(entry.target_id));
+        }
+        if (!transport_map_.count(chosen)) {
+            return Status::NotSupportedTransport("Transport " + chosen +
+                                                 " not installed");
+        }
+        if (globalConfig().trace) {
+            LOG(INFO) << "MultiTransport::selectTransport route: target_id="
+                      << entry.target_id << " segment_protocol=\"" << proto
+                      << "\" hip_reachable=" << hip_reachable
+                      << " chosen=" << chosen;
+        }
+        transport = transport_map_[chosen].get();
+        return Status::OK();
+    }
+#endif
 #ifdef USE_ASCEND_HETEROGENEOUS
     // When USE_ASCEND_HETEROGENEOUS is enabled:
     // - Target side directly reuses RDMA Transport
@@ -438,6 +571,28 @@ Status MultiTransport::mp_selectTransport(const TransferRequest& entry,
     std::string item;
     while (std::getline(ss, item, ',')) {
         if (!item.empty()) protos.push_back(item);
+    }
+
+    // hip GPU IPC cannot reach a remote host; downgrade an explicit hip
+    // preference to a cross-host-capable transport for a cross-host target
+    // (mirrors the locality gate in selectTransport). Prefer rdma, then tcp.
+    if (preferred_proto == "hip" &&
+        !isHipReachableTarget(target_segment_desc->name, local_server_name_)) {
+        std::string fallback;
+        for (const char* candidate : {"rdma", "tcp"}) {
+            if (std::find(protos.begin(), protos.end(), candidate) !=
+                protos.end()) {
+                fallback = candidate;
+                break;
+            }
+        }
+        if (fallback.empty()) {
+            return Status::NotSupportedTransport(
+                "hip target is cross-host but segment " +
+                std::to_string(entry.target_id) +
+                " offers no cross-host transport (rdma/tcp)");
+        }
+        preferred_proto = fallback;
     }
 
 #ifdef USE_ASCEND_HETEROGENEOUS

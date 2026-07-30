@@ -62,7 +62,11 @@ std::string pickRdmaDevice() {
     if (override_name && *override_name) return override_name;
     int num_devices = 0;
     ibv_device **list = ibv_get_device_list(&num_devices);
-    if (!list || num_devices == 0) return "";
+    if (!list) return "";
+    if (num_devices == 0) {
+        ibv_free_device_list(list);
+        return "";
+    }
     std::string name = ibv_get_device_name(list[0]);
     ibv_free_device_list(list);
     return name;

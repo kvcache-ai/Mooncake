@@ -6,6 +6,7 @@ import torch.distributed as dist
 from pg_test_utils import (
     MooncakePGCPUBackendTestCase,
     MooncakePGCUDABackendTestCase,
+    MooncakePGMUSABackendTestCase,
     MooncakePGWorkerContext,
     wait_until,
 )
@@ -223,6 +224,10 @@ class TestMooncakePGCollectivesCPU(_CollectiveTestMixin, MooncakePGCPUBackendTes
 
 
 class TestMooncakePGCollectivesCUDA(_CollectiveTestMixin, MooncakePGCUDABackendTestCase):
+    world_size = 2
+
+
+class TestMooncakePGCollectivesMUSA(_CollectiveTestMixin, MooncakePGMUSABackendTestCase):
     world_size = 2
 
 

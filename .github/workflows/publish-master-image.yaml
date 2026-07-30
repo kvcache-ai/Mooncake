@@ -1,0 +1,255 @@
+name: Publish Master Image
+
+# Manual trigger only: this installs an already-published PyPI wheel, so it must be
+# run after that version's wheel is published — avoids racing release.yaml, which builds
+# and publishes the wheel in the same v* tag event.
+#
+# Two CUDA flavors are published from the same version input, because the wheel ships as
+# two PyPI projects that are versioned in lockstep:
+#   cuda12 -> mooncake-transfer-engine         -> :<version>            (and :latest)
+#   cuda13 -> mooncake-transfer-engine-cuda13  -> :<version>-cuda13     (and :latest-cuda13)
+# The cuda12 tag stays unsuffixed so existing pulls keep working. Each flavor is built
+# from its own Dockerfile (docker/master.Dockerfile, docker/master-cuda13.Dockerfile);
+# those two files must differ only in the CUDA-flavor lines, which `prepare` enforces.
+#
+# Publish flow: validate input -> check the Dockerfiles are in sync -> per flavor: confirm
+# amd64+arm64 wheels exist -> build multi-arch and push the :<version>[-cuda13] tag ->
+# smoke-test amd64 AND arm64 -> only then promote :latest[-cuda13] (when requested).
+# :latest is copied from the smoked :<version> digest, so the default pull tag can never
+# point at an image that failed smoke. A failed smoke still leaves the :<version> tag
+# public; since this is manual, delete it from Docker Hub by hand. The flavors run as
+# independent matrix legs with fail-fast disabled, so one flavor failing never cancels
+# the other mid-push.
+on:
+  workflow_dispatch:
+    inputs:
+      mooncake_version:
+        description: "Published wheel version (also the image tag), e.g. 0.3.11.post1. Both PyPI projects use the same version."
+        required: true
+        type: string
+      flavors:
+        description: "Which CUDA flavor(s) to publish. Keep 'both' unless backfilling a single flavor."
+        required: false
+        default: both
+        type: choice
+        options:
+          - both
+          - cuda12
+          - cuda13
+      tag_latest:
+        description: "Also move :latest (per flavor) to this build. Only enable when publishing the newest release (a backfill/retry of an older wheel must NOT move :latest)."
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+# Serialize publishes so two concurrent runs can't interleave and move :latest backwards.
+concurrency:
+  group: publish-master-image
+  cancel-in-progress: false
+
+jobs:
+  # Cheap gate: everything that is flavor-independent runs once, before any runner spends
+  # time on QEMU/buildx. Also emits the flavor matrix consumed by publish-master.
+  prepare:
+    runs-on: ubuntu-22.04
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    env:
+      # inputs.* placed in env (not interpolated into shell source) — injection-safe.
+      MOONCAKE_VERSION: ${{ inputs.mooncake_version }}
+      FLAVORS: ${{ inputs.flavors }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Validate mooncake_version
+        run: |
+          if ! printf '%s' "$MOONCAKE_VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(\.post[0-9]+)?$'; then
+            echo "Invalid mooncake_version '$MOONCAKE_VERSION': expected e.g. 0.3.11 or 0.3.11.post1" >&2
+            exit 1
+          fi
+
+      # The two flavors are the same image with a different CUDA runtime, so the two
+      # Dockerfiles are kept byte-identical apart from the CUDA-flavor lines. Normalize
+      # those lines and diff: any other divergence (a runtime package added to one file
+      # only, say) fails here instead of silently shipping one broken flavor.
+      - name: Check the two master Dockerfiles are in sync
+        run: |
+          norm() {
+            sed -E \
+              -e 's#^FROM nvidia/cuda:.* AS cudalibs$#FROM <CUDA_DEVEL> AS cudalibs#' \
+              -e 's#libcudart\.so\.[0-9]+#libcudart.so.<MAJOR>#g' \
+              -e 's#^        mooncake-transfer-engine(-cuda13)?==#        <MOONCAKE_PACKAGE>==#' \
+              "$1"
+          }
+          if ! diff -u <(norm docker/master.Dockerfile) <(norm docker/master-cuda13.Dockerfile); then
+            echo "::error::docker/master.Dockerfile and docker/master-cuda13.Dockerfile differ outside the CUDA-flavor lines" >&2
+            exit 1
+          fi
+          echo "Dockerfiles in sync (only the CUDA-flavor lines differ)"
+
+      - name: Build flavor matrix
+        id: matrix
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os, sys
+          FLAVORS = {
+              "cuda12": {
+                  "flavor": "cuda12",
+                  "package": "mooncake-transfer-engine",
+                  "dockerfile": "docker/master.Dockerfile",
+                  "tag_suffix": "",
+              },
+              "cuda13": {
+                  "flavor": "cuda13",
+                  "package": "mooncake-transfer-engine-cuda13",
+                  "dockerfile": "docker/master-cuda13.Dockerfile",
+                  "tag_suffix": "-cuda13",
+              },
+          }
+          sel = os.environ["FLAVORS"]
+          keys = list(FLAVORS) if sel == "both" else [sel]
+          if any(k not in FLAVORS for k in keys):
+              sys.exit(f"Unknown flavors input: {sel!r}")
+          print("matrix=" + json.dumps([FLAVORS[k] for k in keys]))
+          PY
+          cat "$GITHUB_OUTPUT"
+
+  publish-master:
+    needs: prepare
+    runs-on: ubuntu-22.04
+    strategy:
+      # One flavor failing must not cancel the other: a cancelled leg could be killed
+      # between its push and its smoke test, leaving an untested tag with no verdict.
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    env:
+      REPO: docker.io/kvcacheai/mooncake
+      # inputs.*/matrix.* placed in env (not interpolated into shell source) — injection-safe.
+      MOONCAKE_VERSION: ${{ inputs.mooncake_version }}
+      MOONCAKE_PACKAGE: ${{ matrix.package }}
+      IMAGE_TAG: ${{ inputs.mooncake_version }}${{ matrix.tag_suffix }}
+      TAG_SUFFIX: ${{ matrix.tag_suffix }}
+      # Pinned for the official image: provenance must always be the public PyPI index.
+      # Debug builds against another index belong in a separate workflow that does NOT
+      # push official kvcacheai/mooncake tags.
+      PIP_INDEX_URL: https://pypi.org/simple
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      # This image is intentionally the CPython 3.12 flavor: both master Dockerfiles pin
+      # python:3.12-slim-trixie, so only cp312 wheels are ABI-compatible. If that base
+      # Python is ever bumped (e.g. to 3.13), update the "cp312" match below to match —
+      # otherwise this preflight would green-light wheels the image cannot import.
+      - name: Confirm cp312 amd64+arm64 wheels are published on PyPI
+        run: |
+          python3 - <<'PY'
+          import json, os, sys, urllib.request
+          v = os.environ["MOONCAKE_VERSION"]
+          pkg = os.environ["MOONCAKE_PACKAGE"]
+          url = f"https://pypi.org/pypi/{pkg}/{v}/json"
+          try:
+              data = json.load(urllib.request.urlopen(url, timeout=30))
+          except Exception as e:
+              sys.exit(f"Cannot fetch PyPI metadata for {pkg} {v}: {e}")
+          arch_ok = {"x86_64": False, "aarch64": False}
+          for f in data.get("urls", []):
+              fn = f.get("filename", "")
+              if fn.endswith(".whl") and "cp312" in fn:
+                  for arch in arch_ok:
+                      if arch in fn:
+                          arch_ok[arch] = True
+          missing = [a for a, ok in arch_ok.items() if not ok]
+          if missing:
+              sys.exit(f"Missing cp312 wheel(s) for {pkg} {v}: {missing}. "
+                       "Both amd64 (x86_64) and arm64 (aarch64) must be published first.")
+          print(f"cp312 amd64+arm64 wheels present for {pkg} {v}")
+          PY
+
+      - name: Free up disk space
+        uses: ./.github/actions/free-disk-space
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          registry: docker.io
+          # For an org access token (OAT), the login username is the org name
+          # (Docker: docker login --username <ORG_NAME>) — not a secret.
+          username: kvcacheai
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Build multi-arch and push ONLY the immutable :<version>[-cuda13] tag. :latest is
+      # promoted in a later step, after smoke passes. provenance/sbom disabled to keep the
+      # index free of unknown/unknown attestation entries (they would otherwise show up in
+      # `imagetools inspect`).
+      - name: Build and push :<version>${{ matrix.tag_suffix }} (multi-arch)
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/amd64,linux/arm64
+          provenance: false
+          sbom: false
+          build-args: |
+            MOONCAKE_VERSION=${{ inputs.mooncake_version }}
+            PIP_INDEX_URL=${{ env.PIP_INDEX_URL }}
+          tags: ${{ env.REPO }}:${{ inputs.mooncake_version }}${{ matrix.tag_suffix }}
+          push: true
+
+      # Smoke tests run AFTER the :<version> push (a failed smoke leaves :<version> public
+      # — delete it from Docker Hub by hand; this manual workflow wires no auto-cleanup).
+      # :latest is NOT pushed yet, so a bad build can never poison the default pull tag.
+      # We exercise real entrypoints, not just imports: `mooncake_master --version` runs the
+      # compiled binary through the console-script/cli.py path and exits 0 (gflags
+      # SetVersionString) — note `--help` would exit 1 under gflags, so --version is used.
+      # `mooncake_http_metadata_server --help` (argparse) exits 0 and proves that entrypoint.
+      - name: Smoke test amd64 (entrypoints)
+        run: |
+          docker run --rm --platform linux/amd64 \
+            "${REPO}:${IMAGE_TAG}" bash -c '
+              set -euo pipefail
+              python3 -c "import mooncake.engine, mooncake.store"
+              mooncake_master --version
+              mooncake_http_metadata_server --help >/dev/null
+              echo "amd64 ok"
+            '
+
+      # arm64 is the riskier arch here: the aarch64 wheel is manylinux_2_39 (glibc >= 2.39),
+      # which is the whole reason the master Dockerfiles pin a trixie base. Smoke it under QEMU.
+      - name: Smoke test arm64 (entrypoints, QEMU)
+        run: |
+          docker run --rm --platform linux/arm64 \
+            "${REPO}:${IMAGE_TAG}" bash -c '
+              set -euo pipefail
+              python3 -c "import mooncake.engine, mooncake.store"
+              mooncake_master --version
+              mooncake_http_metadata_server --help >/dev/null
+              echo "arm64 ok"
+            '
+
+      # Promote :latest[-cuda13] ONLY after both arches pass smoke, and only when explicitly
+      # requested. imagetools create copies the tested :<version> manifest by digest
+      # (no rebuild), so :latest can never point at an image that didn't pass smoke.
+      # Each flavor promotes its own latest tag: cuda12 -> :latest, cuda13 -> :latest-cuda13.
+      - name: Promote :latest${{ matrix.tag_suffix }} (post-smoke)
+        if: ${{ inputs.tag_latest }}
+        run: |
+          docker buildx imagetools create \
+            --tag "${REPO}:latest${TAG_SUFFIX}" \
+            "${REPO}:${IMAGE_TAG}"

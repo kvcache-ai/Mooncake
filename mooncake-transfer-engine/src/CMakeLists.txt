@@ -48,6 +48,7 @@ target_link_libraries(
   PUBLIC base
          transport
          rdma_transport
+         mooncake_common
          ibverbs
          glog::glog
          gflags::gflags
@@ -63,10 +64,18 @@ endif()
 
 if(USE_CUDA)
   target_include_directories(transfer_engine PRIVATE /usr/local/cuda/include)
-  target_link_libraries(transfer_engine PUBLIC cuda cudart rt)
+  if(USE_CXI)
+    target_link_libraries(transfer_engine PUBLIC cuda cudart rt)
+  else()
+    target_link_libraries(transfer_engine PUBLIC cuda cudart rt mlx5)
+  endif()
   if(USE_NVMEOF)
     target_link_libraries(transfer_engine PUBLIC nvmeof_transport cufile)
   endif()
+endif()
+
+if(USE_NCCL_DEVICE OR USE_NCCL_HOST)
+  target_link_libraries(transfer_engine PUBLIC NCCL::nccl)
 endif()
 
 if(USE_MACA)
@@ -82,9 +91,45 @@ if(USE_MUSA)
   target_link_libraries(transfer_engine PUBLIC musa musart rt)
 endif()
 
+if(USE_HYGON)
+  target_include_directories(transfer_engine PRIVATE ${DTK_INCLUDE_DIR})
+  target_link_libraries(transfer_engine PUBLIC cuda cudart rt)
+endif()
+
+if(USE_COREX)
+  target_include_directories(transfer_engine PRIVATE ${COREX_INCLUDE_DIR})
+  target_link_libraries(transfer_engine PUBLIC cuda cudart rt)
+endif()
+
 if(USE_HIP)
   target_include_directories(transfer_engine PRIVATE ${HIP_INCLUDE_DIRS})
   target_link_libraries(transfer_engine PUBLIC hip::host rt)
+
+  # Optional dmabuf MR registration path (requires hsa-runtime64 and a kernel
+  # with CONFIG_PCI_P2PDMA + CONFIG_DMABUF_MOVE_NOTIFY).
+  option(USE_HIP_DMABUF "Enable HIP dmabuf RDMA MR registration" ON)
+  if(USE_HIP_DMABUF)
+    find_package(hsa-runtime64 CONFIG)
+    if(hsa-runtime64_FOUND)
+      # The dmabuf MR-registration code lives in rdma_context.cpp, which is
+      # compiled in the rdma_transport OBJECT library and pulled into
+      # transfer_engine via $<TARGET_OBJECTS:transport>. A PRIVATE define on
+      # transfer_engine never reaches that object compilation, so the dmabuf
+      # path is silently compiled out and GPU MRs fall back to plain
+      # ibv_reg_mr (EINVAL on device memory). Put the define (and the hsa
+      # include/link usage requirements) on the target that actually compiles
+      # rdma_context.cpp.
+      target_compile_definitions(rdma_transport PRIVATE USE_HIP_DMABUF)
+      target_link_libraries(rdma_transport PUBLIC hsa-runtime64::hsa-runtime64)
+      target_link_libraries(transfer_engine PUBLIC hsa-runtime64::hsa-runtime64)
+      message(STATUS "HIP dmabuf MR registration enabled (hsa-runtime64 found)")
+    else()
+      message(
+        STATUS "HIP dmabuf MR registration disabled (hsa-runtime64 not found)")
+    endif()
+  else()
+    message(STATUS "HIP dmabuf MR registration disabled (USE_HIP_DMABUF=OFF)")
+  endif()
 endif()
 
 if(USE_MLU)
@@ -122,10 +167,20 @@ if(USE_INTRA_NVLINK)
   target_compile_definitions(transfer_engine PUBLIC USE_INTRA_NVLINK)
 endif()
 
+if(USE_MLX5DV)
+  message(STATUS "Enabled USE_MLX5DV support (mlx5 direct verbs)")
+  target_link_libraries(transfer_engine PUBLIC mlx5)
+endif()
+
 if(USE_EFA)
   message(STATUS "Enabled USE_EFA (AWS Elastic Fabric Adapter) support")
   target_link_libraries(transfer_engine PUBLIC fabric efa_transport)
 endif()
+if(USE_CXI)
+  message(STATUS "Enabled USE_CXI (HPE Cray Slingshot) support")
+  target_link_libraries(transfer_engine PUBLIC fabric cxi_transport)
+endif()
+
 if(USE_UB)
   message(STATUS "Enabled USE_UB protocol support")
   target_link_libraries(transfer_engine PUBLIC ub_transport)

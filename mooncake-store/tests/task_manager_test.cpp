@@ -269,7 +269,7 @@ TEST_F(ClientTaskManagerTest, PruneExpiredTasksProcessingTimeoutFreesSlot) {
 }
 
 TEST_F(ClientTaskManagerTest, SerializerRoundTrip) {
-    ClientTaskManager manager({10000, 10000, 10000, 0, 0});
+    ClientTaskManager manager({10000, 10000, 10000, 0, 0, 0});
     UUID client_id1 = generate_uuid();
     UUID client_id2 = generate_uuid();
 
@@ -277,11 +277,13 @@ TEST_F(ClientTaskManagerTest, SerializerRoundTrip) {
     auto t1 =
         manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
             client_id1,
-            ReplicaCopyPayload{.key = "pending_key", .targets = {"seg1"}});
+            ReplicaCopyPayload{
+                .key = "pending_key", .source = "", .targets = {"seg1"}});
     auto t2 =
         manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
             client_id2,
-            ReplicaCopyPayload{.key = "processing_key", .targets = {"seg2"}});
+            ReplicaCopyPayload{
+                .key = "processing_key", .source = "", .targets = {"seg2"}});
     auto t3 =
         manager.get_write_access().submit_task_typed<TaskType::REPLICA_MOVE>(
             client_id1, ReplicaMovePayload{
@@ -303,9 +305,9 @@ TEST_F(ClientTaskManagerTest, SerializerRoundTrip) {
     manager.get_write_access().pop_tasks(client_id2, 2);
 
     // Complete t1 as SUCCESS, t2 as FAILED
-    auto ec1 = manager.get_write_access().complete_task(
+    std::ignore = manager.get_write_access().complete_task(
         client_id1, t1.value(), TaskStatus::SUCCESS, "Done");
-    auto ec2 = manager.get_write_access().complete_task(
+    std::ignore = manager.get_write_access().complete_task(
         client_id2, t2.value(), TaskStatus::FAILED, "Failed");
 
     // Get original tasks
@@ -320,7 +322,7 @@ TEST_F(ClientTaskManagerTest, SerializerRoundTrip) {
     ASSERT_TRUE(serialized.has_value());
 
     // Deserialize into new manager
-    ClientTaskManager manager2({10000, 10000, 10000, 0, 0});
+    ClientTaskManager manager2({10000, 10000, 10000, 0, 0, 0});
     TaskManagerSerializer serializer2(&manager2);
     auto result = serializer2.Deserialize(serialized.value());
     ASSERT_TRUE(result.has_value());
@@ -377,13 +379,13 @@ TEST_F(ClientTaskManagerTest, SerializerRoundTrip) {
 }
 
 TEST_F(ClientTaskManagerTest, SerializerEmptyManager) {
-    ClientTaskManager manager({10000, 10000, 10000, 0, 0});
+    ClientTaskManager manager({10000, 10000, 10000, 0, 0, 0});
 
     TaskManagerSerializer serializer(&manager);
     auto serialized = serializer.Serialize();
     ASSERT_TRUE(serialized.has_value());
 
-    ClientTaskManager manager2({10000, 10000, 10000, 0, 0});
+    ClientTaskManager manager2({10000, 10000, 10000, 0, 0, 0});
     TaskManagerSerializer serializer2(&manager2);
     auto result = serializer2.Deserialize(serialized.value());
     ASSERT_TRUE(result.has_value());
@@ -394,12 +396,13 @@ TEST_F(ClientTaskManagerTest, SerializerEmptyManager) {
 }
 
 TEST_F(ClientTaskManagerTest, SerializerReset) {
-    ClientTaskManager manager({10000, 10000, 10000, 0, 0});
+    ClientTaskManager manager({10000, 10000, 10000, 0, 0, 0});
     UUID client_id = generate_uuid();
 
     auto t1 =
         manager.get_write_access().submit_task_typed<TaskType::REPLICA_COPY>(
-            client_id, ReplicaCopyPayload{.key = "key1", .targets = {"seg1"}});
+            client_id, ReplicaCopyPayload{
+                           .key = "key1", .source = "", .targets = {"seg1"}});
     ASSERT_TRUE(t1.has_value());
 
     TaskManagerSerializer serializer(&manager);

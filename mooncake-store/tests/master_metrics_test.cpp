@@ -1,6 +1,9 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <csignal>
 #include <thread>
 #include <vector>
@@ -8,6 +11,7 @@
 #include <ylt/coro_http/coro_http_client.hpp>
 
 #include "utils.h"
+#include "master_admin_service.h"
 #include "master_service.h"
 #include "rpc_service.h"
 #include "types.h"
@@ -59,6 +63,8 @@ TEST_F(MasterMetricsTest, InitialStatusTest) {
     // Operation Statistics
     ASSERT_EQ(metrics.get_put_start_requests(), 0);
     ASSERT_EQ(metrics.get_put_start_failures(), 0);
+    ASSERT_EQ(metrics.get_put_start_alloc_failures(), 0);
+    ASSERT_EQ(metrics.get_put_start_partial_allocations(), 0);
     ASSERT_EQ(metrics.get_put_end_requests(), 0);
     ASSERT_EQ(metrics.get_put_end_failures(), 0);
     ASSERT_EQ(metrics.get_put_revoke_requests(), 0);
@@ -206,13 +212,13 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_EQ(metrics.get_put_end_failures(), 0);
 
     // Test ExistKey request
-    auto exist_result = service_.ExistKey(key);
+    auto exist_result = service_.ExistKey(key, "default");
     ASSERT_TRUE(exist_result.has_value() && exist_result.value());
     ASSERT_EQ(metrics.get_exist_key_requests(), 1);
     ASSERT_EQ(metrics.get_exist_key_failures(), 0);
 
     // Test GetReplicaList request
-    auto get_replica_result = service_.GetReplicaList(key);
+    auto get_replica_result = service_.GetReplicaList(key, "default");
     ASSERT_TRUE(get_replica_result.has_value());
     ASSERT_EQ(metrics.get_get_replica_list_requests(), 1);
     ASSERT_EQ(metrics.get_get_replica_list_failures(), 0);
@@ -220,7 +226,7 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     // Test Remove request
     std::this_thread::sleep_for(
         std::chrono::milliseconds(default_kv_lease_ttl));
-    auto remove_result = service_.Remove(key);
+    auto remove_result = service_.Remove(key, "default");
     ASSERT_TRUE(remove_result.has_value());
     ASSERT_EQ(metrics.get_remove_requests(), 1);
     ASSERT_EQ(metrics.get_remove_failures(), 0);
@@ -265,9 +271,88 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_DOUBLE_EQ(metrics.get_segment_mem_used_ratio("xxxxxx_segment"), 0.0);
 }
 
+TEST_F(MasterMetricsTest, ServiceTeardownReleasesSegmentCapacity) {
+    auto& metrics = MasterMetricManager::instance();
+    const int64_t capacity_before = metrics.get_total_mem_capacity();
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "teardown_test_segment";
+    segment.base = 0x300000000;
+    segment.size = 1024 * 1024 * 16;
+    UUID client_id = generate_uuid();
+
+    {
+        WrappedMasterServiceConfig service_config;
+        service_config.default_kv_lease_ttl = 100;
+        service_config.enable_metric_reporting = false;
+        WrappedMasterService service(service_config);
+        ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+        ASSERT_EQ(metrics.get_total_mem_capacity(),
+                  capacity_before + static_cast<int64_t>(segment.size));
+        ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name),
+                  static_cast<int64_t>(segment.size));
+    }
+
+    // Destroying the service while the segment is still mounted (as happens
+    // when a master loses leadership) must release the segment's capacity
+    // contribution; MasterMetricManager outlives the service instance.
+    ASSERT_EQ(metrics.get_total_mem_capacity(), capacity_before);
+    ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name), 0);
+}
+
 TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
     const uint64_t default_kv_lease_ttl = 100;
     auto& metrics = MasterMetricManager::instance();
+    using CacheHitStat = MasterMetricManager::CacheHitStat;
+
+    // These values are part of the RPC/API contract. New enum entries should
+    // be appended instead of renumbering existing values.
+    ASSERT_EQ(static_cast<int>(CacheHitStat::MEMORY_HITS), 0);
+    ASSERT_EQ(static_cast<int>(CacheHitStat::SSD_HITS), 1);
+    ASSERT_EQ(static_cast<int>(CacheHitStat::MEMORY_TOTAL), 2);
+    ASSERT_EQ(static_cast<int>(CacheHitStat::SSD_TOTAL), 3);
+    ASSERT_EQ(static_cast<int>(CacheHitStat::MEMORY_HIT_RATE), 4);
+    ASSERT_EQ(static_cast<int>(CacheHitStat::SSD_HIT_RATE), 5);
+    ASSERT_EQ(static_cast<int>(CacheHitStat::OVERALL_HIT_RATE), 6);
+    ASSERT_EQ(static_cast<int>(CacheHitStat::VALID_GET_RATE), 7);
+
+    auto round_to_2 = [](double value) {
+        return std::round(value * 100.0) / 100.0;
+    };
+    auto expected_ratio = [&round_to_2](double hits, double total) {
+        return total > 0.0 ? round_to_2(hits / total) : 0.0;
+    };
+    auto expect_aliases =
+        [](const MasterMetricManager::CacheHitStatDict& stats) {
+            ASSERT_EQ(stats.at(CacheHitStat::MEMORY_CURRENT_CACHED_OBJECTS),
+                      stats.at(CacheHitStat::MEMORY_TOTAL));
+            ASSERT_EQ(stats.at(CacheHitStat::SSD_CURRENT_CACHED_OBJECTS),
+                      stats.at(CacheHitStat::SSD_TOTAL));
+            ASSERT_EQ(
+                stats.at(CacheHitStat::MEMORY_HITS_PER_CURRENT_CACHED_OBJECT),
+                stats.at(CacheHitStat::MEMORY_HIT_RATE));
+            ASSERT_EQ(
+                stats.at(CacheHitStat::SSD_HITS_PER_CURRENT_CACHED_OBJECT),
+                stats.at(CacheHitStat::SSD_HIT_RATE));
+            ASSERT_EQ(
+                stats.at(CacheHitStat::OVERALL_HITS_PER_CURRENT_CACHED_OBJECT),
+                stats.at(CacheHitStat::OVERALL_HIT_RATE));
+        };
+    auto expect_reuse_ratios =
+        [&expected_ratio](const MasterMetricManager::CacheHitStatDict& stats) {
+            const double memory_hits = stats.at(CacheHitStat::MEMORY_HITS);
+            const double ssd_hits = stats.at(CacheHitStat::SSD_HITS);
+            const double memory_total = stats.at(CacheHitStat::MEMORY_TOTAL);
+            const double ssd_total = stats.at(CacheHitStat::SSD_TOTAL);
+            ASSERT_EQ(stats.at(CacheHitStat::MEMORY_HIT_RATE),
+                      expected_ratio(memory_hits, memory_total));
+            ASSERT_EQ(stats.at(CacheHitStat::SSD_HIT_RATE),
+                      expected_ratio(ssd_hits, ssd_total));
+            ASSERT_EQ(stats.at(CacheHitStat::OVERALL_HIT_RATE),
+                      expected_ratio(memory_hits + ssd_hits,
+                                     memory_total + ssd_total));
+        };
     // Use a wrapped master service to test the metrics manager
     WrappedMasterServiceConfig service_config;
     service_config.default_kv_lease_ttl = default_kv_lease_ttl;
@@ -290,17 +375,16 @@ TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
     ReplicateConfig config;
     config.replica_num = 1;
 
-    auto stats_dict = metrics.calculate_cache_stats();
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_HITS], 1);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_HITS], 0);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_TOTAL], 2);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_TOTAL], 0);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_HIT_RATE],
-              0.5);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_HIT_RATE], 0);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::OVERALL_HIT_RATE],
-              0.5);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::VALID_GET_RATE], 1);
+    // MasterMetricManager is a process-wide singleton and these counters do
+    // not have reset APIs, so assert deltas from the current baseline.
+    const auto base_stats = metrics.calculate_cache_stats();
+    expect_aliases(base_stats);
+    expect_reuse_ratios(base_stats);
+
+    const double base_memory_hits = base_stats.at(CacheHitStat::MEMORY_HITS);
+    const double base_memory_total = base_stats.at(CacheHitStat::MEMORY_TOTAL);
+    const double base_valid_get_rate =
+        base_stats.at(CacheHitStat::VALID_GET_RATE);
 
     auto mount_result = service_.MountSegment(segment, client_id);
     ASSERT_TRUE(mount_result.has_value());
@@ -309,26 +393,43 @@ TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
     ASSERT_TRUE(put_start_result1.has_value());
     auto put_end_result1 = service_.PutEnd(client_id, key, ReplicaType::MEMORY);
     ASSERT_TRUE(put_end_result1.has_value());
-    stats_dict = metrics.calculate_cache_stats();
+    auto stats_dict = metrics.calculate_cache_stats();
 
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_TOTAL], 3);
+    expect_aliases(stats_dict);
+    expect_reuse_ratios(stats_dict);
+    ASSERT_EQ(stats_dict[CacheHitStat::MEMORY_HITS], base_memory_hits);
+    ASSERT_EQ(stats_dict[CacheHitStat::MEMORY_TOTAL], base_memory_total + 1);
 
-    auto get_replica_result = service_.GetReplicaList(key);
+    auto get_replica_result = service_.GetReplicaList(key, "default");
+    ASSERT_TRUE(get_replica_result.has_value());
     stats_dict = metrics.calculate_cache_stats();
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_HITS], 2);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_HITS], 0);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_TOTAL], 3);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_TOTAL], 0);
-    ASSERT_NEAR(stats_dict[MasterMetricManager::CacheHitStat::MEMORY_HIT_RATE],
-                0.67, 0.01);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::SSD_HIT_RATE], 0);
-    ASSERT_NEAR(stats_dict[MasterMetricManager::CacheHitStat::OVERALL_HIT_RATE],
-                0.67, 0.01);
-    ASSERT_EQ(stats_dict[MasterMetricManager::CacheHitStat::VALID_GET_RATE], 1);
+    expect_aliases(stats_dict);
+    expect_reuse_ratios(stats_dict);
+    ASSERT_EQ(stats_dict[CacheHitStat::MEMORY_HITS], base_memory_hits + 1);
+    ASSERT_EQ(stats_dict[CacheHitStat::MEMORY_TOTAL], base_memory_total + 1);
+    ASSERT_GE(stats_dict[CacheHitStat::VALID_GET_RATE], base_valid_get_rate);
+    ASSERT_LE(stats_dict[CacheHitStat::VALID_GET_RATE], 1.0);
+
+    // This value is not a bounded hit ratio: hits are cumulative while cached
+    // objects are a current gauge.
+    // Keep fetching until cumulative hits exceed current cached objects.
+    const auto extra_gets = std::max<int64_t>(
+        1, static_cast<int64_t>(stats_dict[CacheHitStat::MEMORY_TOTAL] -
+                                stats_dict[CacheHitStat::MEMORY_HITS]) +
+               1);
+    for (int64_t i = 0; i < extra_gets; ++i) {
+        get_replica_result = service_.GetReplicaList(key, "default");
+        ASSERT_TRUE(get_replica_result.has_value());
+    }
+    stats_dict = metrics.calculate_cache_stats();
+    expect_aliases(stats_dict);
+    expect_reuse_ratios(stats_dict);
+    ASSERT_GT(stats_dict[CacheHitStat::MEMORY_HITS_PER_CURRENT_CACHED_OBJECT],
+              1.0);
 
     std::this_thread::sleep_for(
         std::chrono::milliseconds(default_kv_lease_ttl));
-    auto remove_result = service_.Remove(key);
+    auto remove_result = service_.Remove(key, "default");
     ASSERT_TRUE(remove_result.has_value());
 }
 
@@ -360,6 +461,11 @@ TEST_F(MasterMetricsTest, AdminServerExposesStandbyStateWithoutService) {
     auto segments_resp = FetchUrl(http_port, "/get_all_segments");
     EXPECT_EQ(segments_resp.http_status, 503);
     EXPECT_NE(segments_resp.body.find("service plane is not active"),
+              std::string::npos);
+
+    auto detail_resp = FetchUrl(http_port, "/get_segments_detail");
+    EXPECT_EQ(detail_resp.http_status, 503);
+    EXPECT_NE(detail_resp.body.find("service plane is not active"),
               std::string::npos);
 
     admin_server.Stop();
@@ -397,6 +503,16 @@ TEST_F(MasterMetricsTest, AdminServerRoutesServiceEndpointsWhenAvailable) {
     EXPECT_NE(query_resp.body.find(segment.name), std::string::npos);
     EXPECT_NE(query_resp.body.find("Capacity(bytes)"), std::string::npos);
 
+    auto detail_resp = FetchUrl(http_port, "/get_segments_detail");
+    EXPECT_EQ(detail_resp.http_status, 200);
+    EXPECT_NE(detail_resp.body.find("\"total_segments\""), std::string::npos);
+    EXPECT_NE(detail_resp.body.find("\"segments\""), std::string::npos);
+    EXPECT_NE(detail_resp.body.find(segment.name), std::string::npos);
+    EXPECT_NE(detail_resp.body.find("\"allocator_used_bytes\""),
+              std::string::npos);
+    EXPECT_NE(detail_resp.body.find("\"allocator_capacity_bytes\""),
+              std::string::npos);
+
     admin_server.Stop();
 }
 
@@ -428,7 +544,7 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     ASSERT_TRUE(mount_result.has_value());
 
     // Test BatchExistKey request (should all return false initially)
-    auto batch_exist_result = service_.BatchExistKey(keys);
+    auto batch_exist_result = service_.BatchExistKey(keys, "default");
     ASSERT_EQ(batch_exist_result.size(), 3);
     ASSERT_EQ(metrics.get_batch_exist_key_requests(), 1);
     ASSERT_EQ(metrics.get_batch_exist_key_partial_successes(), 0);
@@ -465,7 +581,7 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     ASSERT_EQ(metrics.get_batch_put_end_failed_items(), 0);
 
     // Test BatchExistKey again (should all return true now)
-    auto batch_exist_result2 = service_.BatchExistKey(keys);
+    auto batch_exist_result2 = service_.BatchExistKey(keys, "default");
     ASSERT_EQ(batch_exist_result2.size(), 3);
     ASSERT_EQ(metrics.get_batch_exist_key_requests(), 2);
     ASSERT_EQ(metrics.get_batch_exist_key_partial_successes(), 0);
@@ -524,14 +640,19 @@ static std::string PutKeyAndOffload(MasterService& svc, const UUID& client_id,
                                     const std::string& key) {
     ReplicateConfig cfg;
     cfg.replica_num = 1;
-    auto put_start = svc.PutStart(client_id, key, value_size, cfg);
+    auto put_start =
+        svc.PutStart(client_id, key, TenantId::Default(), value_size, cfg);
     if (!put_start) return "";
-    svc.PutEnd(client_id, key, ReplicaType::MEMORY);
+    svc.PutEnd(client_id, key, TenantId::Default(), ReplicaType::MEMORY);
 
     StorageObjectMetadata meta;
     meta.data_size = static_cast<int64_t>(value_size);
     meta.transport_endpoint = "127.0.0.1:9999";
-    svc.NotifyOffloadSuccess(client_id, {key}, {meta});
+    std::vector<OffloadTaskItem> tasks{
+        OffloadTaskItem{.tenant_id = "default",
+                        .key = key,
+                        .size = static_cast<int64_t>(value_size)}};
+    svc.NotifyOffloadSuccess(client_id, tasks, {meta});
     return key;
 }
 
@@ -567,7 +688,7 @@ TEST_F(MasterMetricsTest, LocalDiskReplicaAllocatedSize) {
     EXPECT_EQ(metrics.get_allocated_file_size(), baseline + kValueSize);
 
     // After removing the key the LocalDiskReplica is destroyed; gauge resets.
-    ASSERT_TRUE(svc.Remove(key).has_value());
+    ASSERT_TRUE(svc.Remove(key, TenantId::Default()).has_value());
     EXPECT_EQ(metrics.get_allocated_file_size(), baseline);
 }
 
@@ -609,6 +730,236 @@ TEST_F(MasterMetricsTest, LocalDiskSegmentCapacityHeartbeat) {
     // Idempotent: same capacity reported again — gauge must not change.
     ASSERT_TRUE(svc.ReportSsdCapacity(client_id, kCap2).has_value());
     EXPECT_EQ(metrics.get_total_file_capacity(), baseline + kCap2);
+}
+
+TEST_F(MasterMetricsTest, PutStartReplicaAllocationFailureMetric) {
+    const uint64_t default_kv_lease_ttl = 100;
+    auto& metrics = MasterMetricManager::instance();
+    WrappedMasterServiceConfig service_config;
+    service_config.default_kv_lease_ttl = default_kv_lease_ttl;
+    WrappedMasterService service_(service_config);
+
+    const int64_t allocation_failures_before =
+        metrics.get_put_start_alloc_failures();
+    const int64_t put_start_failures_before = metrics.get_put_start_failures();
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto put_start_result = service_.PutStart(
+        generate_uuid(), "allocation_failure_key", 1024, config);
+
+    ASSERT_FALSE(put_start_result.has_value());
+    ASSERT_EQ(put_start_result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    ASSERT_EQ(metrics.get_put_start_alloc_failures(),
+              allocation_failures_before + 1);
+    ASSERT_EQ(metrics.get_put_start_failures(), put_start_failures_before + 1);
+}
+
+TEST_F(MasterMetricsTest, SummaryUsesWindowRatesAndCumulativeEviction) {
+    auto& metrics = MasterMetricManager::instance();
+
+    const std::string baseline_summary =
+        metrics.get_summary_string_and_update_snapshot();
+    EXPECT_NE(baseline_summary.find("Requests (Success/Total per sec):"),
+              std::string::npos);
+    EXPECT_NE(baseline_summary.find("PutStart=0.00/0.00"), std::string::npos);
+
+    metrics.inc_put_start_requests(4);
+    metrics.inc_put_start_failures(1);
+    metrics.inc_batch_put_start_requests(5);
+    metrics.inc_batch_put_start_partial_success(2);
+    metrics.inc_eviction_success(3, 4096);
+    metrics.inc_eviction_fail();
+    metrics.inc_mem_eviction_success(3, 4096);
+    metrics.inc_mem_eviction_fail();
+    metrics.inc_nof_eviction_success(1, 2048);
+    metrics.inc_nof_eviction_fail();
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const std::string window_summary = metrics.get_summary_string();
+    EXPECT_NE(window_summary.find("Requests (Success/Total per sec):"),
+              std::string::npos);
+    EXPECT_NE(window_summary.find("PutStart="), std::string::npos);
+    EXPECT_EQ(window_summary.find("/s"), std::string::npos);
+    EXPECT_EQ(window_summary.find("PutStart=3/4"), std::string::npos);
+    EXPECT_NE(window_summary.find("Batch Requests (per sec"),
+              std::string::npos);
+    EXPECT_NE(
+        window_summary.find("Eviction: Success/Attempts=1/2, AllocFail=0, "
+                            "PartialAlloc=0, keys=3, size=4.00 KB"),
+        std::string::npos);
+    EXPECT_NE(window_summary.find("Mem Eviction: Success/Attempts=1/2, "
+                                  "keys=3, size=4.00 KB"),
+              std::string::npos);
+    EXPECT_NE(window_summary.find("NoF Eviction: Success/Attempts=1/2, "
+                                  "keys=1, size=2.00 KB"),
+              std::string::npos);
+
+    const std::string reported_summary =
+        metrics.get_summary_string_and_update_snapshot();
+    EXPECT_NE(
+        reported_summary.find("Eviction: Success/Attempts=1/2, AllocFail=0, "
+                              "PartialAlloc=0, keys=3, size=4.00 KB"),
+        std::string::npos);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const std::string idle_summary =
+        metrics.get_summary_string_and_update_snapshot();
+    EXPECT_NE(idle_summary.find("PutStart=0.00/0.00"), std::string::npos);
+    EXPECT_NE(idle_summary.find("Eviction: Success/Attempts=1/2, "
+                                "AllocFail=0, PartialAlloc=0, keys=3, "
+                                "size=4.00 KB"),
+              std::string::npos);
+    EXPECT_NE(idle_summary.find("Mem Eviction: Success/Attempts=1/2, "
+                                "keys=3, size=4.00 KB"),
+              std::string::npos);
+    EXPECT_NE(idle_summary.find("NoF Eviction: Success/Attempts=1/2, "
+                                "keys=1, size=2.00 KB"),
+              std::string::npos);
+}
+
+// Verify that the SSD Offload path (LOCAL_DISK replicas) is tracked
+// consistently by both cache-total accounting and hit counters.
+TEST_F(MasterMetricsTest, SsdOffloadCacheHitAndTotalConsistent) {
+    auto& metrics = MasterMetricManager::instance();
+    using CacheHitStat = MasterMetricManager::CacheHitStat;
+
+    WrappedMasterServiceConfig service_config;
+    service_config.default_kv_lease_ttl = 100;
+    service_config.enable_offload = true;
+    service_config.enable_metric_reporting = true;
+    WrappedMasterService service_(service_config);
+
+    constexpr size_t kBufferAddress = 0x300000000;
+    constexpr size_t kSegmentSize = 1024 * 1024 * 16;
+    std::string segment_name = "test_segment";
+    UUID segment_id = generate_uuid();
+    Segment segment;
+    segment.id = segment_id;
+    segment.name = segment_name;
+    segment.base = kBufferAddress;
+    segment.size = kSegmentSize;
+    UUID client_id = generate_uuid();
+
+    std::string key = "ssd_offload_key";
+    uint64_t value_length = 2048;
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    // Record baselines (singleton counters are not reset between tests).
+    const auto base_stats = metrics.calculate_cache_stats();
+    const int64_t base_mem_hit_nums =
+        static_cast<int64_t>(base_stats.at(CacheHitStat::MEMORY_HITS));
+    const int64_t base_ssd_hit_nums =
+        static_cast<int64_t>(base_stats.at(CacheHitStat::SSD_HITS));
+    const int64_t base_mem_total =
+        static_cast<int64_t>(base_stats.at(CacheHitStat::MEMORY_TOTAL));
+    const int64_t base_ssd_total =
+        static_cast<int64_t>(base_stats.at(CacheHitStat::SSD_TOTAL));
+    const int64_t base_mem_hit_bytes = metrics.get_mem_cache_hit_bytes();
+    const int64_t base_file_hit_bytes = metrics.get_file_cache_hit_bytes();
+    const int64_t base_mem_cache_nums = metrics.get_mem_cache_nums();
+    const int64_t base_file_cache_nums = metrics.get_file_cache_nums();
+
+    // Step 1: Mount segment and create a completed MEMORY replica.
+    auto mount_result = service_.MountSegment(segment, client_id);
+    ASSERT_TRUE(mount_result.has_value());
+    auto put_start_result =
+        service_.PutStart(client_id, key, value_length, config);
+    ASSERT_TRUE(put_start_result.has_value());
+    auto put_end_result = service_.PutEnd(client_id, key, ReplicaType::MEMORY);
+    ASSERT_TRUE(put_end_result.has_value());
+
+    // After PutEnd: MEMORY_TOTAL should increment by 1.
+    auto stats = metrics.calculate_cache_stats();
+    ASSERT_EQ(static_cast<int64_t>(stats.at(CacheHitStat::MEMORY_TOTAL)),
+              base_mem_total + 1);
+    ASSERT_EQ(static_cast<int64_t>(stats.at(CacheHitStat::SSD_TOTAL)),
+              base_ssd_total);
+    ASSERT_EQ(metrics.get_mem_cache_nums(), base_mem_cache_nums + 1);
+    ASSERT_EQ(metrics.get_file_cache_nums(), base_file_cache_nums);
+
+    // Step 2: Mount local disk segment and add LOCAL_DISK replica via
+    // NotifyOffloadSuccess.
+    auto mount_disk_result =
+        service_.MountLocalDiskSegment(client_id, /*enable_offloading=*/true);
+    ASSERT_TRUE(mount_disk_result.has_value());
+
+    OffloadTaskItem task{.tenant_id = "default",
+                         .key = key,
+                         .size = static_cast<int64_t>(value_length)};
+    StorageObjectMetadata obj_meta{
+        .bucket_id = 0,
+        .offset = 0,
+        .key_size = 0,
+        .data_size = static_cast<int64_t>(value_length),
+        .transport_endpoint = "tcp://127.0.0.1:9999"};
+    auto offload_result =
+        service_.NotifyOffloadSuccess(client_id, {task}, {obj_meta});
+    ASSERT_TRUE(offload_result.has_value());
+
+    // After offload: SSD_TOTAL should increment by 1, MEMORY_TOTAL unchanged.
+    stats = metrics.calculate_cache_stats();
+    ASSERT_EQ(static_cast<int64_t>(stats.at(CacheHitStat::MEMORY_TOTAL)),
+              base_mem_total + 1);
+    ASSERT_EQ(static_cast<int64_t>(stats.at(CacheHitStat::SSD_TOTAL)),
+              base_ssd_total + 1);
+    ASSERT_EQ(metrics.get_mem_cache_nums(), base_mem_cache_nums + 1);
+    ASSERT_EQ(metrics.get_file_cache_nums(), base_file_cache_nums + 1);
+
+    // Step 3: Remove the object (removes both MEMORY and LOCAL_DISK replicas).
+    // Wait for lease expiry so Remove succeeds.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    auto evict_result = service_.Remove(key, "default");
+    ASSERT_TRUE(evict_result.has_value());
+
+    // After Remove: both totals should return to baseline.
+    stats = metrics.calculate_cache_stats();
+    ASSERT_EQ(static_cast<int64_t>(stats.at(CacheHitStat::MEMORY_TOTAL)),
+              base_mem_total);
+    ASSERT_EQ(static_cast<int64_t>(stats.at(CacheHitStat::SSD_TOTAL)),
+              base_ssd_total);
+    ASSERT_EQ(metrics.get_mem_cache_nums(), base_mem_cache_nums);
+    ASSERT_EQ(metrics.get_file_cache_nums(), base_file_cache_nums);
+
+    // Step 4: Test SSD hit path by creating an object with only a LOCAL_DISK
+    // replica. Use NotifyOffloadSuccess with a key that has no existing
+    // metadata — AddReplica will create the metadata and add LOCAL_DISK.
+    std::string ssd_only_key = "ssd_only_key";
+    OffloadTaskItem task2{.tenant_id = "default",
+                          .key = ssd_only_key,
+                          .size = static_cast<int64_t>(value_length)};
+    StorageObjectMetadata obj_meta2{
+        .bucket_id = 0,
+        .offset = 0,
+        .key_size = 0,
+        .data_size = static_cast<int64_t>(value_length),
+        .transport_endpoint = "tcp://127.0.0.1:9998"};
+    auto offload_result2 =
+        service_.NotifyOffloadSuccess(client_id, {task2}, {obj_meta2});
+    ASSERT_TRUE(offload_result2.has_value());
+
+    // Verify SSD_TOTAL incremented for the new key.
+    stats = metrics.calculate_cache_stats();
+    ASSERT_EQ(static_cast<int64_t>(stats.at(CacheHitStat::SSD_TOTAL)),
+              base_ssd_total + 1);
+
+    // GetReplicaList should hit LOCAL_DISK, incrementing SSD hit counters.
+    auto get_result = service_.GetReplicaList(ssd_only_key, "default");
+    ASSERT_TRUE(get_result.has_value());
+
+    stats = metrics.calculate_cache_stats();
+    ASSERT_EQ(static_cast<int64_t>(stats.at(CacheHitStat::MEMORY_HITS)),
+              base_mem_hit_nums);
+    ASSERT_EQ(static_cast<int64_t>(stats.at(CacheHitStat::SSD_HITS)),
+              base_ssd_hit_nums + 1);
+    ASSERT_EQ(metrics.get_mem_cache_hit_bytes(), base_mem_hit_bytes);
+    ASSERT_EQ(metrics.get_file_cache_hit_bytes(),
+              base_file_hit_bytes + value_length);
+
+    // Clean up.
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    service_.Remove(ssd_only_key, "default");
 }
 
 }  // namespace mooncake::test

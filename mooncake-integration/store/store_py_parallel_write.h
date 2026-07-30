@@ -20,6 +20,12 @@ std::vector<int> batch_write_tensor_impl(const std::vector<std::string> &keys,
                                          const ReplicateConfig &config,
                                          const char *operation_name,
                                          BatchWriteFromFn &&batch_write_from) {
+    auto group_ids_error =
+        ValidateGroupIdsForBatchConfig(config, keys.size(), operation_name);
+    if (!group_ids_error.empty()) {
+        return group_ids_error;
+    }
+
     std::vector<int> results(keys.size(), 0);
 
     {
@@ -45,16 +51,18 @@ std::vector<int> batch_write_tensor_impl(const std::vector<std::string> &keys,
             if (!alloc_result) {
                 LOG(ERROR) << "Failed to allocate buffer for " << operation_name
                            << " key: " << keys[i];
-                results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
+                results[i] = to_py_ret(ErrorCode::NO_AVAILABLE_HANDLE);
                 continue;
             }
 
             char *dst = static_cast<char *>(alloc_result->ptr());
             std::memcpy(dst, &infos[i].metadata,
                         infos[i].metadata.header.data_offset);
-            std::memcpy(dst + infos[i].metadata.header.data_offset,
-                        reinterpret_cast<void *>(infos[i].data_ptr),
-                        infos[i].tensor_size);
+            if (infos[i].tensor_size > 0) {
+                std::memcpy(dst + infos[i].metadata.header.data_offset,
+                            reinterpret_cast<void *>(infos[i].data_ptr),
+                            infos[i].tensor_size);
+            }
 
             valid_keys.push_back(keys[i]);
             buffer_ptrs.push_back(alloc_result->ptr());
@@ -65,8 +73,10 @@ std::vector<int> batch_write_tensor_impl(const std::vector<std::string> &keys,
         }
 
         if (!valid_keys.empty()) {
-            std::vector<int> op_results =
-                batch_write_from(valid_keys, buffer_ptrs, buffer_sizes);
+            ReplicateConfig write_config =
+                MakeIndexedConfig(config, original_indices);
+            std::vector<int> op_results = batch_write_from(
+                valid_keys, buffer_ptrs, buffer_sizes, write_config);
             for (size_t i = 0; i < op_results.size(); ++i) {
                 results[original_indices[i]] = op_results[i];
             }
@@ -612,9 +622,11 @@ int execute_direct_parallelism_shard_write_from(
     std::vector<std::span<const char>> values;
     values.emplace_back(reinterpret_cast<const char *>(&*metadata),
                         metadata->header.data_offset);
-    values.emplace_back(
-        reinterpret_cast<const char *>(buffer_ptr + parsed->data_offset),
-        parsed->data_bytes);
+    if (parsed->data_bytes > 0) {
+        values.emplace_back(
+            reinterpret_cast<const char *>(buffer_ptr + parsed->data_offset),
+            parsed->data_bytes);
+    }
     return execute_tensor_parts_write(shard_key, values, config, ops,
                                       std::forward<WriteShardFn>(write_shard));
 }
@@ -905,6 +917,12 @@ std::vector<int> batch_put_tensor_with_parallelism(
     const py::object &parallelisms = py::none(),
     const ReplicateConfig &config = ReplicateConfig{},
     const py::object &writer_partitions = py::none()) {
+    auto group_ids_error = ValidateGroupIdsForBatchConfig(
+        config, keys.size(), "batch_put_tensor_with_parallelism");
+    if (!group_ids_error.empty()) {
+        return group_ids_error;
+    }
+
     return execute_batch_parallelism_write_requests(
         keys, tensors_list.size(), parallelisms, writer_partitions,
         "batch_put_tensor_with_parallelism",
@@ -921,14 +939,16 @@ std::vector<int> batch_put_tensor_with_parallelism(
         },
         [this, &keys, &tensors_list, &config](size_t i,
                                               const py::handle &parallelism) {
+            ReplicateConfig key_config = config.ForSingleKey(i);
             return put_tensor_with_parallelism(
                 keys[i], tensors_list[i],
-                py::reinterpret_borrow<py::object>(parallelism), config);
+                py::reinterpret_borrow<py::object>(parallelism), key_config);
         },
         [this, &keys, &tensors_list, &config](
             size_t i, const py::handle &writer_partition) {
+            ReplicateConfig key_config = config.ForSingleKey(i);
             return put_tensor_with_parallelism(
-                keys[i], tensors_list[i], py::none(), config,
+                keys[i], tensors_list[i], py::none(), key_config,
                 py::reinterpret_borrow<py::object>(writer_partition));
         });
 }
@@ -1029,6 +1049,12 @@ std::vector<int> batch_put_tensor_with_parallelism_from(
     const py::object &parallelisms = py::none(),
     const ReplicateConfig &config = ReplicateConfig{},
     const py::object &writer_partitions = py::none()) {
+    auto group_ids_error = ValidateGroupIdsForBatchConfig(
+        config, keys.size(), "batch_put_tensor_with_parallelism_from");
+    if (!group_ids_error.empty()) {
+        return group_ids_error;
+    }
+
     return execute_batch_parallelism_write_requests(
         keys, buffer_ptrs.size(), parallelisms, writer_partitions,
         "batch_put_tensor_with_parallelism_from",
@@ -1070,14 +1096,16 @@ std::vector<int> batch_put_tensor_with_parallelism_from(
         },
         [this, &keys, &buffer_ptrs, &sizes, &config](
             size_t i, const py::handle &parallelism) {
+            ReplicateConfig key_config = config.ForSingleKey(i);
             return put_tensor_with_parallelism_from(
                 keys[i], buffer_ptrs[i], sizes[i],
-                py::reinterpret_borrow<py::object>(parallelism), config);
+                py::reinterpret_borrow<py::object>(parallelism), key_config);
         },
         [this, &keys, &buffer_ptrs, &sizes, &config](
             size_t i, const py::handle &writer_partition) {
+            ReplicateConfig key_config = config.ForSingleKey(i);
             return put_tensor_with_parallelism_from(
-                keys[i], buffer_ptrs[i], sizes[i], py::none(), config,
+                keys[i], buffer_ptrs[i], sizes[i], py::none(), key_config,
                 py::reinterpret_borrow<py::object>(writer_partition));
         });
 }
@@ -1345,6 +1373,12 @@ std::vector<int> batch_upsert_tensor_with_parallelism(
     const py::object &parallelisms = py::none(),
     const ReplicateConfig &config = ReplicateConfig{},
     const py::object &writer_partitions = py::none()) {
+    auto group_ids_error = ValidateGroupIdsForBatchConfig(
+        config, keys.size(), "batch_upsert_tensor_with_parallelism");
+    if (!group_ids_error.empty()) {
+        return group_ids_error;
+    }
+
     return execute_batch_parallelism_write_requests(
         keys, tensors_list.size(), parallelisms, writer_partitions,
         "batch_upsert_tensor_with_parallelism",
@@ -1361,14 +1395,16 @@ std::vector<int> batch_upsert_tensor_with_parallelism(
         },
         [this, &keys, &tensors_list, &config](size_t i,
                                               const py::handle &parallelism) {
+            ReplicateConfig key_config = config.ForSingleKey(i);
             return upsert_tensor_with_parallelism(
                 keys[i], tensors_list[i],
-                py::reinterpret_borrow<py::object>(parallelism), config);
+                py::reinterpret_borrow<py::object>(parallelism), key_config);
         },
         [this, &keys, &tensors_list, &config](
             size_t i, const py::handle &writer_partition) {
+            ReplicateConfig key_config = config.ForSingleKey(i);
             return upsert_tensor_with_parallelism(
-                keys[i], tensors_list[i], py::none(), config,
+                keys[i], tensors_list[i], py::none(), key_config,
                 py::reinterpret_borrow<py::object>(writer_partition));
         });
 }
@@ -1379,6 +1415,12 @@ std::vector<int> batch_upsert_tensor_with_parallelism_from(
     const py::object &parallelisms = py::none(),
     const ReplicateConfig &config = ReplicateConfig{},
     const py::object &writer_partitions = py::none()) {
+    auto group_ids_error = ValidateGroupIdsForBatchConfig(
+        config, keys.size(), "batch_upsert_tensor_with_parallelism_from");
+    if (!group_ids_error.empty()) {
+        return group_ids_error;
+    }
+
     return execute_batch_parallelism_write_requests(
         keys, buffer_ptrs.size(), parallelisms, writer_partitions,
         "batch_upsert_tensor_with_parallelism_from",
@@ -1430,14 +1472,16 @@ std::vector<int> batch_upsert_tensor_with_parallelism_from(
         },
         [this, &keys, &buffer_ptrs, &sizes, &config](
             size_t i, const py::handle &parallelism) {
+            ReplicateConfig key_config = config.ForSingleKey(i);
             return upsert_tensor_with_parallelism_from(
                 keys[i], buffer_ptrs[i], sizes[i],
-                py::reinterpret_borrow<py::object>(parallelism), config);
+                py::reinterpret_borrow<py::object>(parallelism), key_config);
         },
         [this, &keys, &buffer_ptrs, &sizes, &config](
             size_t i, const py::handle &writer_partition) {
+            ReplicateConfig key_config = config.ForSingleKey(i);
             return upsert_tensor_with_parallelism_from(
-                keys[i], buffer_ptrs[i], sizes[i], py::none(), config,
+                keys[i], buffer_ptrs[i], sizes[i], py::none(), key_config,
                 py::reinterpret_borrow<py::object>(writer_partition));
         });
 }

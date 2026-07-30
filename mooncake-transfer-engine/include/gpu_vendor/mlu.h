@@ -23,7 +23,6 @@ using CUresult = CNresult;
 #define CU_MEMORYTYPE_HOST CN_MEMORYTYPE_HOST
 #define CU_MEMORYTYPE_DEVICE CN_MEMORYTYPE_DEVICE
 #define CU_POINTER_ATTRIBUTE_MEMORY_TYPE CN_MEM_ATTRIBUTE_TYPE
-#define CU_POINTER_ATTRIBUTE_RANGE_SIZE CN_MEM_ATTRIBUTE_RANGE_SIZE
 
 #define cudaSuccess cnrtSuccess
 #define cudaMemoryTypeUnregistered cnrtMemTypeUnregistered
@@ -158,16 +157,19 @@ static inline CUresult cuPointerGetAttribute(void *data, int attribute,
             }
             return CUDA_SUCCESS;
         }
-        case CU_POINTER_ATTRIBUTE_RANGE_SIZE: {
-            if (attributes.type != cudaMemoryTypeDevice) {
-                return CN_ERROR_INVALID_VALUE;
-            }
-            *static_cast<size_t *>(data) = attributes.size;
-            return CUDA_SUCCESS;
-        }
         default:
             return CN_ERROR_INVALID_VALUE;
     }
+}
+
+static inline CUresult cuMemGetAddressRange(CUdeviceptr *base, size_t *size,
+                                            CUdeviceptr ptr) {
+    cn_uint64_t bytes = 0;
+    auto ret = cnMemGetAddressRange(base, size ? &bytes : nullptr, ptr);
+    if (ret == CN_SUCCESS && size) {
+        *size = static_cast<size_t>(bytes);
+    }
+    return ret;
 }
 
 static inline CUresult cuMemGetHandleForAddressRange(void *handle,

@@ -13,10 +13,11 @@ OUTPUT_DIR=${OUTPUT_DIR:-${2:-"dist"}}
 # CMake build directory (default: build).  EP/PG extensions are staged under
 # ${BUILD_DIR}/ep_pg_staging when the project was built with -DWITH_EP=ON.
 BUILD_DIR="${BUILD_DIR:-build}"
+BUILD_DIR_ABS="$(pwd)/${BUILD_DIR}"
 echo "Building wheel for Python ${PYTHON_VERSION} with output directory ${OUTPUT_DIR}"
 
 # Ensure LD_LIBRARY_PATH includes /usr/local/lib
-export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/$(pwd)/build/mooncake-common:/usr/local/lib
+export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:${BUILD_DIR_ABS}/mooncake-common:${BUILD_DIR_ABS}/mooncake-common/etcd:${BUILD_DIR_ABS}/mooncake-common/k8s-lease:/usr/local/lib
 
 echo "Cleaning wheel-build directory"
 rm -rf mooncake-wheel/mooncake_transfer_engine*
@@ -29,20 +30,20 @@ echo "Creating directory structure..."
 cp mooncake-integration/fabric_allocator_utils.py mooncake-wheel/mooncake/fabric_allocator_utils.py
 
 # Copy engine.so to mooncake directory (will be imported by transfer module)
-cp build/mooncake-integration/engine.*.so mooncake-wheel/mooncake/engine.so
+cp ${BUILD_DIR}/mooncake-integration/engine.*.so mooncake-wheel/mooncake/engine.so
 
 # Copy libasio.so to mooncake directory (runtime dependency of engine.so)
-cp build/mooncake-common/libasio.so mooncake-wheel/mooncake/libasio.so
+cp ${BUILD_DIR}/mooncake-common/libasio.so mooncake-wheel/mooncake/libasio.so
 
 # Copy store.so to mooncake directory
-if [ -f build/mooncake-integration/store.*.so ]; then
+if compgen -G "${BUILD_DIR}/mooncake-integration/store.*.so" >/dev/null; then
     echo "Copying store.so..."
-    cp build/mooncake-integration/store.*.so mooncake-wheel/mooncake/store.so
+    cp ${BUILD_DIR}/mooncake-integration/store.*.so mooncake-wheel/mooncake/store.so
     echo "Copying master binary..."
     # Copy master binary
-    cp build/mooncake-store/src/mooncake_master mooncake-wheel/mooncake/
+    cp ${BUILD_DIR}/mooncake-store/src/mooncake_master mooncake-wheel/mooncake/
     # Copy client binary
-    cp build/mooncake-store/src/mooncake_client mooncake-wheel/mooncake/
+    cp ${BUILD_DIR}/mooncake-store/src/mooncake_client mooncake-wheel/mooncake/
     # Copy async_store.py
     cp mooncake-integration/store/async_store.py mooncake-wheel/mooncake/async_store.py
 else
@@ -50,36 +51,48 @@ else
 fi
 
 # Copy libmooncake_store.so to mooncake directory (only when BUILD_SHARED_LIBS is set)
-if [ -f build/mooncake-store/src/libmooncake_store.so ]; then
+if [ -f ${BUILD_DIR}/mooncake-store/src/libmooncake_store.so ]; then
     echo "Copying libmooncake_store.so..."
-    cp build/mooncake-store/src/libmooncake_store.so mooncake-wheel/mooncake/libmooncake_store.so
+    cp ${BUILD_DIR}/mooncake-store/src/libmooncake_store.so mooncake-wheel/mooncake/libmooncake_store.so
+fi
+
+# Copy libmooncake_common.so to mooncake directory (only when BUILD_SHARED_LIBS is set)
+if [ -f ${BUILD_DIR}/mooncake-common/src/libmooncake_common.so ]; then
+    echo "Copying libmooncake_common.so..."
+    cp ${BUILD_DIR}/mooncake-common/src/libmooncake_common.so mooncake-wheel/mooncake/libmooncake_common.so
 fi
 
 # Copy libtransfer_engine.so to mooncake directory (only when USE_ETCD is set)
-if [ -f build/mooncake-common/etcd/libetcd_wrapper.so ]; then
+if [ -f ${BUILD_DIR}/mooncake-common/etcd/libetcd_wrapper.so ]; then
     echo "Copying libetcd_wrapper.so..."
-    cp build/mooncake-common/etcd/libetcd_wrapper.so mooncake-wheel/mooncake/libetcd_wrapper.so
+    cp ${BUILD_DIR}/mooncake-common/etcd/libetcd_wrapper.so mooncake-wheel/mooncake/libetcd_wrapper.so
+fi
+
+# Copy libk8s_lease_wrapper.so to mooncake directory (only when STORE_USE_K8S_LEASE is set)
+if [ -f ${BUILD_DIR}/mooncake-common/k8s-lease/libk8s_lease_wrapper.so ]; then
+    echo "Copying libk8s_lease_wrapper.so..."
+    cp ${BUILD_DIR}/mooncake-common/k8s-lease/libk8s_lease_wrapper.so mooncake-wheel/mooncake/libk8s_lease_wrapper.so
 fi
 
 # Copy libtransfer_engine.so to mooncake directory (only when BUILD_SHARED_LIBS is set)
-if [ -f build/mooncake-transfer-engine/src/libtransfer_engine.so ]; then
+if [ -f ${BUILD_DIR}/mooncake-transfer-engine/src/libtransfer_engine.so ]; then
     echo "Copying libtransfer_engine.so..."
-    cp build/mooncake-transfer-engine/src/libtransfer_engine.so mooncake-wheel/mooncake/libtransfer_engine.so
+    cp ${BUILD_DIR}/mooncake-transfer-engine/src/libtransfer_engine.so mooncake-wheel/mooncake/libtransfer_engine.so
 fi
 
 # Copy ascend_transport.so to mooncake directory (only when USE_ASCEND_DIRECT is set)
-if [ -f build/mooncake-transfer-engine/src/transport/ascend_transport/ascend_transport.so ]; then
+if [ -f ${BUILD_DIR}/mooncake-transfer-engine/src/transport/ascend_transport/ascend_transport.so ]; then
     echo "Copying ascend_transport.so..."
-    cp build/mooncake-transfer-engine/src/transport/ascend_transport/ascend_transport.so mooncake-wheel/mooncake/ascend_transport.so
+    cp ${BUILD_DIR}/mooncake-transfer-engine/src/transport/ascend_transport/ascend_transport.so mooncake-wheel/mooncake/ascend_transport.so
 fi
 
 # Copy nvlink-allocator.so to mooncake directory (only if it exists - CUDA builds only)
-if [ -f build/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so ] \
+if [ -f ${BUILD_DIR}/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so ] \
    || [ -f /usr/lib/libaccl_barex.so ] \
    || [ -f /usr/lib64/libaccl_barex.so ]; then
-    if [ -f build/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so ]; then
+    if [ -f ${BUILD_DIR}/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so ]; then
      echo "Copying CUDA nvlink_allocator.so..."
-     cp build/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so mooncake-wheel/mooncake/nvlink_allocator.so
+     cp ${BUILD_DIR}/mooncake-transfer-engine/nvlink-allocator/nvlink_allocator.so mooncake-wheel/mooncake/nvlink_allocator.so
     fi
     echo "Copying allocator libraries..."
     # Copy allocator.py
@@ -89,9 +102,9 @@ else
 fi
 
 # Copy ubshmem_fabric_allocator.so to mooncake directory (only if it exists - NPU builds only)
-if [ -f build/mooncake-transfer-engine/ubshmem-allocator/ubshmem_fabric_allocator.so ]; then
+if [ -f ${BUILD_DIR}/mooncake-transfer-engine/ubshmem-allocator/ubshmem_fabric_allocator.so ]; then
     echo "Copying NPU ubshmem_fabric_allocator.so..."
-    cp build/mooncake-transfer-engine/ubshmem-allocator/ubshmem_fabric_allocator.so mooncake-wheel/mooncake/ubshmem_fabric_allocator.so
+    cp ${BUILD_DIR}/mooncake-transfer-engine/ubshmem-allocator/ubshmem_fabric_allocator.so mooncake-wheel/mooncake/ubshmem_fabric_allocator.so
     echo "Copying NPU allocator libraries..."
     # Copy allocator_ascend_npu.py
     cp mooncake-integration/allocator_ascend_npu.py mooncake-wheel/mooncake/allocator_ascend_npu.py
@@ -101,10 +114,10 @@ fi
 
 echo "Copying transfer_engine_bench..."
 # Copy transfer_engine_bench
-cp build/mooncake-transfer-engine/example/transfer_engine_bench mooncake-wheel/mooncake/
+cp ${BUILD_DIR}/mooncake-transfer-engine/example/transfer_engine_bench mooncake-wheel/mooncake/
 
-if [ -f "build/mooncake-transfer-engine/src/transport/ascend_transport/hccl_transport/ascend_transport_c/libascend_transport_mem.so" ]; then
-    cp build/mooncake-transfer-engine/src/transport/ascend_transport/hccl_transport/ascend_transport_c/libascend_transport_mem.so mooncake-wheel/mooncake/
+if [ -f "${BUILD_DIR}/mooncake-transfer-engine/src/transport/ascend_transport/hccl_transport/ascend_transport_c/libascend_transport_mem.so" ]; then
+    cp ${BUILD_DIR}/mooncake-transfer-engine/src/transport/ascend_transport/hccl_transport/ascend_transport_c/libascend_transport_mem.so mooncake-wheel/mooncake/
     echo "Copying ascend_transport_mem libraries..."
 else
     echo "Skipping libascend_transport_mem.so (not built - Ascend disabled)"
@@ -116,7 +129,7 @@ fi
 # so that patchelf never touches CUDA fatbins (see injection step below).
 # Use an absolute path: the script later `cd`s into mooncake-wheel/ and a
 # relative path would silently point to the wrong location.
-CUDA_EP_STAGING_DIR="$(pwd)/${BUILD_DIR}/ep_pg_staging"
+CUDA_EP_STAGING_DIR="${BUILD_DIR_ABS}/ep_pg_staging"
 
 # CI only: remove build/ to free disk before python -m build (set FREE_BUILD_DIR=1 to enable locally).
 # If EP/PG .so files were staged inside the build directory, preserve them in a
@@ -136,34 +149,114 @@ if [ "$CI" = "true" ] || [ "$FREE_BUILD_DIR" = "1" ]; then
     fi
 fi
 
+if [ "$NPU_BUILD" = "1" ]; then
+    echo "Stripping shared libraries to reduce wheel size..."
+    find mooncake-wheel/mooncake -name "*.so" -exec strip --strip-unneeded {} \;
+    echo "Pre-setting RPATH=\$ORIGIN on project ELF files so auditwheel resolves NEEDED from wheel-internal copies..."
+    find mooncake-wheel/mooncake -type f -exec sh -c 'file "$1" | grep -q ELF' _ {} \; -print0 | xargs -0 patchelf --force-rpath --set-rpath '$ORIGIN'
+fi
+
 echo "Building wheel package..."
 # Build the wheel package
 cd mooncake-wheel
 
-# Handle package name modification for non-CUDA builds
+# Materialize a local copy of the root README.md so that
+# `readme = "README.md"` resolves inside this directory. Modern
+# setuptools rejects `../`-traversal in the readme path. The file is
+# removed by the EXIT trap below.
+cp ../README.md README.md
+
+WHEEL_DIR="$(pwd)"
+cleanup_wheel_metadata_state() {
+    [[ -f "${WHEEL_DIR}/pyproject.toml.backup" ]] && mv "${WHEEL_DIR}/pyproject.toml.backup" "${WHEEL_DIR}/pyproject.toml"
+    rm -f "${WHEEL_DIR}/README.md"
+}
+trap cleanup_wheel_metadata_state EXIT
+
+BUILD_VARIANTS="NON_CUDA_BUILD CU13_BUILD NPU_BUILD EFA_BUILD EFA_NON_CUDA_BUILD MUSA_BUILD"
+BUILD_VARIANT_COUNT=0
+for build_variant in $BUILD_VARIANTS; do
+    if [ "${!build_variant}" = "1" ]; then
+        BUILD_VARIANT_COUNT=$((BUILD_VARIANT_COUNT + 1))
+    fi
+done
+if [ "$BUILD_VARIANT_COUNT" -gt 1 ]; then
+    echo "Error: only one of $BUILD_VARIANTS can be set"
+    exit 1
+fi
+
+# If a previous run was interrupted before the trailing restore (line ~481),
+# pyproject.toml is left in a renamed state and pyproject.toml.backup holds the
+# pristine original. Restore it first so the variant rename below always starts
+# from the clean file and the backup is never overwritten with modified content.
+if [ -f pyproject.toml.backup ]; then
+    echo "Restoring pyproject.toml from leftover backup of a previous run"
+    mv pyproject.toml.backup pyproject.toml
+fi
+
+# Handle package name modification for release build variants
 if [ "$NON_CUDA_BUILD" = "1" ]; then
     echo "Modifying package name for non-CUDA build"
     # Backup original pyproject.toml
     cp pyproject.toml pyproject.toml.backup
     # Replace package name and description
     sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-non-cuda"/' pyproject.toml
-    sed -i 's/description = "Python binding of a Mooncake library using pybind11"/description = "Python binding of a Mooncake library using pybind11 (Non-CUDA version)"/' pyproject.toml
-    sed -i 's/keywords = \["mooncake", "data transfer", "kv cache", "llm inference"\]/keywords = ["mooncake", "data transfer", "kv cache", "llm inference", "non-cuda"]/' pyproject.toml
+    sed -i 's/^description = "\(.*\)"$/description = "\1 (Non-CUDA version)"/' pyproject.toml
+    sed -i 's/^keywords = \[\(.*\)\]$/keywords = [\1, "non-cuda"]/' pyproject.toml
+    sed -i 's|"Environment :: GPU :: NVIDIA CUDA", ||' pyproject.toml
     echo "Package name modified to: mooncake-transfer-engine-non-cuda"
-else
-    echo "Using standard package name: mooncake-transfer-engine"
-fi
-
-# Handle package name modification for CU13 builds
-if [ "$CU13_BUILD" = "1" ]; then
+elif [ "$CU13_BUILD" = "1" ]; then
     echo "Modifying package name for CU13 build"
     # Backup original pyproject.toml
     cp pyproject.toml pyproject.toml.backup
     # Replace package name and description
     sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-cuda13"/' pyproject.toml
-    sed -i 's/description = "Python binding of a Mooncake library using pybind11"/description = "Python binding of a Mooncake library using pybind11 (CUDA 13 version)"/' pyproject.toml
-    sed -i 's/keywords = \["mooncake", "data transfer", "kv cache", "llm inference"\]/keywords = ["mooncake", "data transfer", "kv cache", "llm inference", "cuda13"]/' pyproject.toml
+    sed -i 's/^description = "\(.*\)"$/description = "\1 (CUDA 13 version)"/' pyproject.toml
+    sed -i 's/^keywords = \[\(.*\)\]$/keywords = [\1, "cuda13"]/' pyproject.toml
     echo "Package name modified to: mooncake-transfer-engine-cuda13"
+elif [ "$NPU_BUILD" = "1" ]; then
+    echo "Modifying package name for Ascend NPU build"
+    # Backup original pyproject.toml
+    cp pyproject.toml pyproject.toml.backup
+    # Replace package name and description
+    sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-npu"/' pyproject.toml
+    sed -i 's/^description = "\(.*\)"$/description = "\1 (Ascend NPU version)"/' pyproject.toml
+    sed -i 's/^keywords = \[\(.*\)\]$/keywords = [\1, "ascend", "npu"]/' pyproject.toml
+    sed -i 's/^requires-python = ">=3.10"$/requires-python = ">=3.9"/' pyproject.toml
+    sed -i 's|"Environment :: GPU :: NVIDIA CUDA"|"Environment :: GPU"|' pyproject.toml
+    sed -i 's|"Programming Language :: Python :: 3.10"|"Programming Language :: Python :: 3.9", "Programming Language :: Python :: 3.10"|' pyproject.toml
+    echo "Package name modified to: mooncake-transfer-engine-npu"
+elif [ "$EFA_BUILD" = "1" ]; then
+    echo "Modifying package name for AWS EFA build (CUDA)"
+    # Backup original pyproject.toml
+    cp pyproject.toml pyproject.toml.backup
+    # Replace package name and description
+    sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-efa"/' pyproject.toml
+    sed -i 's/^description = "\(.*\)"$/description = "\1 (AWS EFA, CUDA version)"/' pyproject.toml
+    sed -i 's/^keywords = \[\(.*\)\]$/keywords = [\1, "aws", "efa", "libfabric", "cuda"]/' pyproject.toml
+    echo "Package name modified to: mooncake-transfer-engine-efa"
+elif [ "$EFA_NON_CUDA_BUILD" = "1" ]; then
+    echo "Modifying package name for AWS EFA build (non-CUDA)"
+    # Backup original pyproject.toml
+    cp pyproject.toml pyproject.toml.backup
+    # Replace package name and description
+    sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-efa-non-cuda"/' pyproject.toml
+    sed -i 's/^description = "\(.*\)"$/description = "\1 (AWS EFA, Non-CUDA version)"/' pyproject.toml
+    sed -i 's/^keywords = \[\(.*\)\]$/keywords = [\1, "aws", "efa", "libfabric", "non-cuda"]/' pyproject.toml
+    sed -i 's|"Environment :: GPU :: NVIDIA CUDA", ||' pyproject.toml
+    echo "Package name modified to: mooncake-transfer-engine-efa-non-cuda"
+elif [ "$MUSA_BUILD" = "1" ]; then
+    echo "Modifying package name for MUSA build"
+    # Backup original pyproject.toml
+    cp pyproject.toml pyproject.toml.backup
+    # Replace package name and description
+    sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-musa"/' pyproject.toml
+    sed -i 's/^description = "\(.*\)"$/description = "\1 (MUSA version)"/' pyproject.toml
+    sed -i 's/^keywords = \[\(.*\)\]$/keywords = [\1, "musa", "moore-threads"]/' pyproject.toml
+    sed -i 's/^requires-python = ">=3.10"$/requires-python = ">=3.9"/' pyproject.toml
+    sed -i 's|"Environment :: GPU :: NVIDIA CUDA"|"Environment :: GPU"|' pyproject.toml
+    sed -i 's|"Programming Language :: Python :: 3.10"|"Programming Language :: Python :: 3.9", "Programming Language :: Python :: 3.10"|' pyproject.toml
+    echo "Package name modified to: mooncake-transfer-engine-musa"
 else
     echo "Using standard package name: mooncake-transfer-engine"
 fi
@@ -173,7 +266,27 @@ rm -rf ${OUTPUT_DIR}/
 mkdir -p ${OUTPUT_DIR}
 
 echo "Installing required build packages"
-if command -v pip &>/dev/null; then
+if [ "$NPU_BUILD" = "1" ]; then
+    PYTHON_CMD="python${PYTHON_VERSION}"
+    if ! command -v "$PYTHON_CMD" &>/dev/null; then
+        echo "Error: $PYTHON_CMD not found for NPU wheel build"
+        exit 1
+    fi
+    max_attempts=3
+    attempt=1
+    while [ $attempt -le $max_attempts ]; do
+        if "$PYTHON_CMD" -m pip install --upgrade pip build setuptools wheel auditwheel; then
+            break
+        fi
+        echo "pip install attempt $attempt/$max_attempts failed, retrying in 5s..."
+        sleep 5
+        attempt=$((attempt + 1))
+    done
+    if [ $attempt -gt $max_attempts ]; then
+        echo "Error: pip install failed after $max_attempts attempts"
+        exit 1
+    fi
+elif command -v pip &>/dev/null; then
     python${PYTHON_VERSION} -m pip install --upgrade pip build setuptools wheel auditwheel
 elif command -v uv &>/dev/null; then
     uv pip install --upgrade pip
@@ -242,9 +355,18 @@ echo "Detected glibc version: $GLIBC_VERSION"
 echo "Using platform tag: $PLATFORM_TAG"
 
 echo "Repairing wheel with auditwheel for platform: $PLATFORM_TAG"
-python${PYTHON_VERSION} -m build --wheel --outdir ${OUTPUT_DIR}
-auditwheel repair ${OUTPUT_DIR}/*.whl \
+if [ "$NPU_BUILD" = "1" ]; then
+    python${PYTHON_VERSION} -m build --wheel --no-isolation --outdir ${OUTPUT_DIR}
+    AUDITWHEEL_CMD="python${PYTHON_VERSION} -m auditwheel"
+else
+    python${PYTHON_VERSION} -m build --wheel --outdir ${OUTPUT_DIR}
+    AUDITWHEEL_CMD="auditwheel"
+fi
+
+${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude libcurl.so* \
+    --exclude libfabric.so* \
+    --exclude libefa.so* \
     --exclude libibverbs.so* \
     --exclude libmlx5.so* \
     --exclude libnuma.so* \
@@ -285,6 +407,8 @@ auditwheel repair ${OUTPUT_DIR}/*.whl \
     --exclude libffi.so* \
     --exclude libcuda.so* \
     --exclude libcudart.so* \
+    --exclude libmusa.so* \
+    --exclude libmusart.so* \
     --exclude libamdhip64.so* \
     --exclude libhsa-runtime64.so* \
     --exclude librocprofiler-register.so* \
@@ -328,6 +452,7 @@ auditwheel repair ${OUTPUT_DIR}/*.whl \
     --exclude libllm_datadist*.so \
     --exclude ascend_transport*.so \
     --exclude libaccl_barex.so* \
+    --exclude liburma.so* \
     -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
 
 # Inject CUDA extensions into the repaired wheel.  patchelf (used by auditwheel)
@@ -357,6 +482,41 @@ fi
 # Clean up the temporary EP/PG staging copy (used when FREE_BUILD_DIR or CI wiped the build dir).
 if [ -n "$CUDA_EP_STAGING_TEMP" ]; then
     rm -rf "$CUDA_EP_STAGING_TEMP"
+fi
+
+# NPU only: move auditwheel-vendored .libs into mooncake/ and set RPATH=$ORIGIN
+# on all ELF files so everything resolves from a single directory.
+if [ "$NPU_BUILD" = "1" ]; then
+    REPAIRED_WHEEL=$(ls ${REPAIRED_DIR}/*.whl 2>/dev/null | head -1)
+    if [ -n "$REPAIRED_WHEEL" ]; then
+        WHEEL_UNPACK_DIR=$(mktemp -d)
+        python${PYTHON_VERSION} -m wheel unpack "$REPAIRED_WHEEL" -d "$WHEEL_UNPACK_DIR"
+        UNPACKED_PKG_DIR=$(find "$WHEEL_UNPACK_DIR" -mindepth 1 -maxdepth 1 -type d | head -1)
+        VENDORED_LIBS_DIR=$(find "$UNPACKED_PKG_DIR" -mindepth 1 -maxdepth 1 -type d -name "*.libs" | head -1)
+        if [ -n "$VENDORED_LIBS_DIR" ]; then
+            echo "Moving vendored libraries into mooncake/..."
+            cp "$VENDORED_LIBS_DIR"/*.so* "${UNPACKED_PKG_DIR}/mooncake/" 2>/dev/null || true
+            rm -rf "$VENDORED_LIBS_DIR"
+            rm -f "${UNPACKED_PKG_DIR}/$(basename "$VENDORED_LIBS_DIR").pth"
+        fi
+        echo "Setting RPATH=\$ORIGIN for all ELF files..."
+        find "${UNPACKED_PKG_DIR}/mooncake/" -type f -exec sh -c 'file "$1" | grep -q ELF' _ {} \; -print0 | xargs -0 patchelf --force-rpath --set-rpath '$ORIGIN'
+        echo "Verifying RPATH..."
+        verify_failed=0
+        while IFS= read -r -d '' f; do
+            rpath=$(patchelf --print-rpath "$f")
+            if [ "$rpath" != '$ORIGIN' ]; then
+                echo "Error: RPATH verification failed for $(basename "$f"): got '${rpath}'"
+                verify_failed=1
+            fi
+        done < <(find "${UNPACKED_PKG_DIR}/mooncake/" -type f -exec sh -c 'file "$1" | grep -q ELF' _ {} \; -print0)
+        if [ "$verify_failed" -ne 0 ]; then
+            exit 1
+        fi
+        rm "$REPAIRED_WHEEL"
+        python${PYTHON_VERSION} -m wheel pack "$UNPACKED_PKG_DIR" -d "${REPAIRED_DIR}/"
+        rm -rf "$WHEEL_UNPACK_DIR"
+    fi
 fi
 
 # Replace original wheel with repaired wheel

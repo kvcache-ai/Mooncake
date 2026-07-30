@@ -37,10 +37,15 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::OBJECT_REPLICA_BUSY, "OBJECT_REPLICA_BUSY"},
         {ErrorCode::TRANSFER_FAIL, "TRANSFER_FAIL"},
         {ErrorCode::RPC_FAIL, "RPC_FAIL"},
+        {ErrorCode::RPC_TIMEOUT, "RPC_TIMEOUT"},
         {ErrorCode::ETCD_OPERATION_ERROR, "ETCD_OPERATION_ERROR"},
         {ErrorCode::ETCD_KEY_NOT_EXIST, "ETCD_KEY_NOT_EXIST"},
         {ErrorCode::ETCD_TRANSACTION_FAIL, "ETCD_TRANSACTION_FAIL"},
         {ErrorCode::ETCD_CTX_CANCELLED, "ETCD_CTX_CANCELLED"},
+        {ErrorCode::OPLOG_ENTRY_NOT_FOUND, "OPLOG_ENTRY_NOT_FOUND"},
+        {ErrorCode::K8S_LEASE_OPERATION_ERROR, "K8S_LEASE_OPERATION_ERROR"},
+        {ErrorCode::K8S_LEASE_NOT_FOUND, "K8S_LEASE_NOT_FOUND"},
+        {ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, "INCOMPLETE_OPLOG_CATCH_UP"},
         {ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS,
          "UNAVAILABLE_IN_CURRENT_STATUS"},
         {ErrorCode::UNAVAILABLE_IN_CURRENT_MODE, "UNAVAILABLE_IN_CURRENT_MODE"},
@@ -63,7 +68,16 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::PERSISTENT_FAIL, "PERSISTENT_FAIL"},
         {ErrorCode::TASK_NOT_FOUND, "TASK_NOT_FOUND"},
         {ErrorCode::TASK_PENDING_LIMIT_EXCEEDED, "TASK_PENDING_LIMIT_EXCEEDED"},
-        {ErrorCode::JOB_NOT_FOUND, "JOB_NOT_FOUND"}};
+        {ErrorCode::JOB_NOT_FOUND, "JOB_NOT_FOUND"},
+        {ErrorCode::DFS_NETWORK_TIMEOUT, "DFS_NETWORK_TIMEOUT"},
+        {ErrorCode::DFS_SERVICE_UNAVAILABLE, "DFS_SERVICE_UNAVAILABLE"},
+        {ErrorCode::DFS_QUOTA_EXCEEDED, "DFS_QUOTA_EXCEEDED"},
+        {ErrorCode::DFS_PERMISSION_DENIED, "DFS_PERMISSION_DENIED"},
+        {ErrorCode::DFS_STALE_HANDLE, "DFS_STALE_HANDLE"},
+        {ErrorCode::DFS_PARTIAL_WRITE, "DFS_PARTIAL_WRITE"},
+        {ErrorCode::TENANT_QUOTA_EXCEEDED, "TENANT_QUOTA_EXCEEDED"},
+        {ErrorCode::TENANT_NOT_REGISTERED, "TENANT_NOT_REGISTERED"},
+        {ErrorCode::TENANT_NOT_EMPTY, "TENANT_NOT_EMPTY"}};
 
     auto it = errorCodeMap.find(errorCode);
     static const std::string unknownError = "UNKNOWN_ERROR";

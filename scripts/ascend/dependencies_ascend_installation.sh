@@ -65,12 +65,11 @@ if command -v apt-get &> /dev/null; then
             wget \
             libibverbs-dev \
             libgoogle-glog-dev \
-            libgtest-dev \
             libjsoncpp-dev \
             libunwind-dev \
             libnuma-dev \
             libpython3-dev \
-            libboost-all-dev \
+            libboost-dev \
             libssl-dev \
             libgrpc-dev \
             libgrpc++-dev \
@@ -95,8 +94,6 @@ elif command -v yum &> /dev/null; then
             glog-devel \
             libibverbs-devel \
             numactl-devel \
-            gtest \
-            gtest-devel \
             boost-devel \
             openssl-devel \
             hiredis-devel \

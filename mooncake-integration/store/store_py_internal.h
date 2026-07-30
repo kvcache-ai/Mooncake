@@ -85,12 +85,27 @@ struct TensorIntoFragment {
     size_t size{0};
 };
 
+struct PlannedQueryResult {
+    std::string read_key;
+    std::optional<CachedQueryResultResponse> cached_query_result;
+};
+
+struct TensorIntoRegularFullFormulaPlan {
+    std::vector<std::string> read_keys;
+    std::vector<int64_t> global_shape;
+    int split_dim{0};
+    size_t element_size{0};
+    size_t data_offset{sizeof(TensorMetadata)};
+};
+
 struct TensorIntoPlan {
     uintptr_t user_buffer_ptr{0};
     uintptr_t registered_buffer_ptr{0};
     size_t registered_buffer_size{0};
     size_t total_length{0};
     std::vector<TensorIntoFragment> fragments;
+    std::optional<TensorIntoRegularFullFormulaPlan> regular_full_formula;
+    std::vector<PlannedQueryResult> query_results;
     std::optional<TensorMetadata> materialized_metadata;
 };
 
@@ -108,6 +123,7 @@ enum class ParallelismShardReadStorageRoute {
 struct ReconstructedShardSource {
     std::string read_key;
     ParsedTensorMetadata metadata;
+    std::optional<CachedQueryResultResponse> cached_query_result;
 };
 
 struct FullTensorReconstructionSources {
@@ -192,7 +208,7 @@ std::optional<ParsedWriterShardManifest> parse_writer_shard_manifest(
     parsed.global_shape = TensorShapeToVector(parsed.manifest.global_shape,
                                               parsed.manifest.header.ndim);
     for (auto dim : parsed.global_shape) {
-        if (dim <= 0) {
+        if (dim < 0) {
             return std::nullopt;
         }
     }
@@ -526,7 +542,7 @@ std::optional<py::object> materialize_shard_tensor(const py::handle &tensor,
         .attr("contiguous")();
 }
 
-std::optional<std::vector<PyTensorInfo>> build_tp_shard_infos(
+[[maybe_unused]] std::optional<std::vector<PyTensorInfo>> build_tp_shard_infos(
     const py::handle &tensor, int tp_size, int split_dim,
     const std::function<std::string(int)> &key_for_rank,
     const std::vector<ParallelAxisSpec> &axes = {}) {
@@ -848,7 +864,7 @@ bool is_default_replicate_config(const ReplicateConfig &config) {
     return config.replica_num == 1 && !config.with_soft_pin &&
            !config.with_hard_pin && config.preferred_segments.empty() &&
            config.preferred_segment.empty() &&
-           !config.prefer_alloc_in_same_node;
+           !config.prefer_alloc_in_same_node && !config.group_ids.has_value();
 }
 
 std::optional<ParallelAxisSpec> parse_parallel_axis_spec(
@@ -1334,9 +1350,10 @@ std::pair<int64_t, int64_t> calculate_shard_range(int64_t dim_size, int rank,
     return {start, end - start};
 }
 
-std::optional<ParsedTensorMetadata> parse_tensor_metadata_from_buffer(
-    BufferHandle *buffer_handle, char *usr_buffer, int64_t data_length,
-    bool *take_ownership, char **exported_data, size_t *total_length) {
+[[maybe_unused]] std::optional<ParsedTensorMetadata>
+parse_tensor_metadata_from_buffer(BufferHandle *buffer_handle, char *usr_buffer,
+                                  int64_t data_length, bool *take_ownership,
+                                  char **exported_data, size_t *total_length) {
     if (!buffer_handle && !usr_buffer) return std::nullopt;
     if (buffer_handle && usr_buffer) return std::nullopt;
 
@@ -1410,7 +1427,7 @@ std::optional<RawTensorShardWritePlan> build_raw_tensor_shard_write_plan(
     int64_t global_numel = 1;
     int64_t local_numel = 1;
     for (size_t dim = 0; dim < global_shape.size(); ++dim) {
-        if (global_shape[dim] <= 0 || local_shape[dim] < 0) {
+        if (global_shape[dim] < 0 || local_shape[dim] < 0) {
             LOG(ERROR) << operation_name << ": invalid tensor shape";
             return std::nullopt;
         }
@@ -1423,7 +1440,7 @@ std::optional<RawTensorShardWritePlan> build_raw_tensor_shard_write_plan(
             return std::nullopt;
         }
     }
-    if (local_numel < 0 || global_numel <= 0) {
+    if (local_numel < 0 || global_numel < 0) {
         LOG(ERROR) << operation_name << ": invalid tensor numel";
         return std::nullopt;
     }

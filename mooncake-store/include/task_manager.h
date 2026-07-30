@@ -92,18 +92,20 @@ struct Task {
 };
 
 struct ReplicaCopyPayload {
+    std::string tenant_id = "default";
     std::string key;
     std::string source;
     std::vector<std::string> targets;
 };
-YLT_REFL(ReplicaCopyPayload, key, source, targets);
+YLT_REFL(ReplicaCopyPayload, tenant_id, key, source, targets);
 
 struct ReplicaMovePayload {
+    std::string tenant_id = "default";
     std::string key;
     std::string source;
     std::string target;
 };
-YLT_REFL(ReplicaMovePayload, key, source, target);
+YLT_REFL(ReplicaMovePayload, tenant_id, key, source, target);
 
 template <TaskType T>
 struct TaskPayloadTraits;

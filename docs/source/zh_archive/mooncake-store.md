@@ -612,7 +612,7 @@ virtual tl::expected<std::vector<Replica>, ErrorCode> Allocate(
 
 ### 替换策略
 
-当 `PutStart` 请求因内存不足而失败，或者当后台线程检测到空间使用率达到配置的高水位线（默认 95%，可通过 `-eviction_high_watermark_ratio` 配置）时，会触发一次替换任务，通过换出一部分对象来释放空间（默认 5%，可通过 `-eviction_ratio` 配置）。与 `Remove` 类似，被换出的对象仅仅会被标记为已删除，不需要进行数据传输。
+当 `PutStart` 请求因内存不足而失败，或者当后台线程检测到空间使用率达到配置的高水位线（默认 90%，可通过 `-eviction_high_watermark_ratio` 配置）时，会触发一次替换任务，通过换出一部分对象来释放空间（默认 5%，可通过 `-eviction_ratio` 配置）。与 `Remove` 类似，被换出的对象仅仅会被标记为已删除，不需要进行数据传输。
 
 目前采用的是一种近似的 LRU 策略，即尽可能优先换出最近最少被访问的对象。为了避免数据竞争和数据损坏，正在被客户端读取或写入的对象不会被换出。因此，拥有租约或尚未被 `PutEnd` 请求标记为 complete 的对象不会被换出。
 
@@ -622,7 +622,7 @@ virtual tl::expected<std::vector<Replica>, ErrorCode> Allocate(
 
 然而，如果在 `Get` 操作完成读取数据之前租约已过期，该操作将被视为失败，并且不会返回任何数据，以防止潜在的数据损坏。
 
-默认的租约时间为 5 秒，并可通过 `master_service` 的启动参数进行配置。
+默认的租约时间为 10 秒，并可通过 `master_service` 的启动参数进行配置。
 
 ### 软固定机制
 
@@ -699,7 +699,10 @@ mooncake提供了DFS可用空间的配置，用户可以在启动master时指定
 
 启用持久化功能后，对于每次 `Put`或`BatchPut` 操作，都会发起一次同步的memory pool写入操作和一次异步的DFS持久化操作。之后执行 `Get`或 `BatchGet` 时，如果在memory pool中没有找到对应的kvcache，则会尝试从DFS中读取该文件数据，并返回给用户。
 
-#### 3FS USRBIO 插件
+#### 3FS USRBIO 插件（实验性 / 未完成）
+
+> **实验性功能：** HF3FS（3FS USRBIO）相关集成仍在开发中，尚未达到可视为生产就绪的程度；接口与行为可能变更，建议仅用于评估与测试。
+
 如需通过3FS原生接口（USRBIO）实现高性能持久化文件读写，请参阅本文档的配置说明。[3FS USRBIO 插件配置](/mooncake-store/src/hf3fs/README.md)。
 
 ### 内置元数据服务器
@@ -718,7 +721,7 @@ HTTP 元数据服务器可通过以下参数进行配置：
 
 #### 环境变量说明
 
-- **MC_STORE_CLUSTER_ID**: 在多集群复用 master 场景下标识元数据, 默认 'mooncake'
+- **MC_STORE_CLUSTER_ID**: 在多集群复用 master 场景下标识元数据, 默认 'mooncake_cluster'
 - **MC_STORE_MEMCPY**: 控制是否启用本地 memcpy 优化, 1/true 启用, 0/false 禁用
 - **MC_STORE_CLIENT_METRIC**: 启用客户端指标上报, 默认启用；设为 0/false 禁用
 - **MC_STORE_CLIENT_METRIC_INTERVAL**: 指标上报间隔(秒), 默认 0(仅收集不上报)
@@ -744,7 +747,7 @@ HTTP 元数据服务器可通过以下参数进行配置：
 
 ## Mooncake Store Python API
 
-**完整的 Python API 文档**: [https://kvcache-ai.github.io/Mooncake/python-api-reference/mooncake-store.html](https://kvcache-ai.github.io/Mooncake/python-api-reference/mooncake-store.html)
+**完整的 Python API 文档**: [https://kvcache-ai.github.io/Mooncake/api-reference/python/mooncake-store.html](https://kvcache-ai.github.io/Mooncake/api-reference/python/mooncake-store.html)
 
 
 ## 编译及使用方法

@@ -15,6 +15,12 @@
 #include "gpu_vendor/maca.h"
 #elif defined(USE_SUNRISE)
 #include "gpu_vendor/sunrise.h"
+#elif defined(USE_HYGON)
+#include <cuda.h>
+#include <cuda_runtime.h>
+#elif defined(USE_COREX)
+#include <cuda.h>
+#include <cuda_runtime.h>
 #endif
 
 #if !defined(USE_HIP) && !defined(USE_MUSA) && !defined(USE_MLU) && \

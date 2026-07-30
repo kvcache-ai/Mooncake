@@ -50,7 +50,7 @@ sudo apt-get install -y \
     libjsoncpp-dev \
     libnuma-dev \
     libibverbs-dev \
-    libboost-all-dev \
+    libboost-dev \
     libcurl4-openssl-dev \
     libgtest-dev \
     libmsgpack-dev \

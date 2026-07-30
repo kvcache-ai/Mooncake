@@ -16,6 +16,7 @@
 
 #include <dlfcn.h>
 #include <glog/logging.h>
+#include <unistd.h>
 
 #include <cassert>
 #include <cstddef>
@@ -44,6 +45,12 @@ namespace {
 
 // Default matches typical Tang RT install; override root and/or arch via env.
 static std::string TangRtSharedObjectPath(const char* soname) {
+    const char* lib_dir = std::getenv("MC_TANGRT_LIB_DIR");
+    if (lib_dir && lib_dir[0]) {
+        std::string d(lib_dir);
+        while (!d.empty() && d.back() == '/') d.pop_back();
+        return d + "/" + soname;
+    }
     const char* root = std::getenv("MC_TANGRT_ROOT");
     std::string r = (root && root[0]) ? std::string(root)
                                       : std::string("/usr/local/tangrt");
@@ -51,7 +58,9 @@ static std::string TangRtSharedObjectPath(const char* soname) {
     const char* arch = std::getenv("MC_TANGRT_LIB_ARCH");
     std::string arch_dir =
         (arch && arch[0]) ? std::string(arch) : std::string("linux-x86_64");
-    return r + "/lib/" + arch_dir + "/" + soname;
+    std::string arch_path = r + "/lib/" + arch_dir + "/" + soname;
+    if (access(arch_path.c_str(), R_OK) == 0) return arch_path;
+    return r + "/lib/" + soname;
 }
 
 constexpr int kMaxPhytopoPorts = 10;
@@ -90,24 +99,35 @@ static void NormalizeMappedHostPointer(void** ptr,
     }
 }
 
+struct SavedTangDevice {
+    int dev{-1};
+    SavedTangDevice() { tangGetDevice(&dev); }
+    ~SavedTangDevice() {
+        if (dev >= 0) tangSetDevice(dev);
+    }
+    SavedTangDevice(const SavedTangDevice&) = delete;
+    SavedTangDevice& operator=(const SavedTangDevice&) = delete;
+};
+
 static tangError_t QueryPointerAttrsBestEffort(void* ptr,
                                                tangPointerAttributes* attr,
                                                int preferred_dev) {
     if (!ptr || !attr) return tangErrorInvalidValue;
-    tangError_t ret = tangPointerGetAttributes(attr, ptr);
-    if (ret == tangSuccess) return ret;
+    SavedTangDevice saved;
 
     if (preferred_dev >= 0) {
         tangSetDevice(preferred_dev);
-        ret = tangPointerGetAttributes(attr, ptr);
-        if (ret == tangSuccess) return ret;
     }
+
+    tangError_t ret = tangPointerGetAttributes(attr, ptr);
+    if (ret == tangSuccess) return ret;
 
     int dev_count = 0;
     if (tangGetDeviceCount(&dev_count) != tangSuccess || dev_count <= 0) {
         return ret;
     }
     for (int d = 0; d < dev_count; ++d) {
+        if (d == preferred_dev) continue;
         tangSetDevice(d);
         ret = tangPointerGetAttributes(attr, ptr);
         if (ret == tangSuccess) return ret;

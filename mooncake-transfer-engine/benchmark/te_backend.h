@@ -69,7 +69,8 @@ class TEBenchRunner : public BenchRunner {
 
     double runSingleTransfer(uint64_t local_addr, uint64_t target_addr,
                              uint64_t block_size, uint64_t batch_size,
-                             OpCode opcode);
+                             OpCode opcode, uint64_t deadline_ns,
+                             IntentType intent_type);
 
    private:
     int allocateBuffers();
@@ -90,6 +91,7 @@ class TEBenchRunner : public BenchRunner {
     std::condition_variable cv_task_;
     std::condition_variable cv_done_;
     int pending_ = 0;
+    bool init_ok_ = true;
 };
 
 }  // namespace tent

@@ -142,13 +142,17 @@ int UbTransport::registerLocalMemoryBatch(
             }));
     }
 
+    int first_error = 0;
     for (size_t i = 0; i < buffer_list.size(); ++i) {
-        if (results[i].get()) {
+        int ret = results[i].get();
+        if (ret) {
             LOG(WARNING) << "UbTransport: Failed to register memory: addr "
                          << buffer_list[i].addr << " length "
                          << buffer_list[i].length;
+            if (!first_error) first_error = ret;
         }
     }
+    if (first_error) return first_error;
 
     return metadata_->updateLocalSegmentDesc();
 }
@@ -164,13 +168,17 @@ int UbTransport::unregisterLocalMemoryBatch(
             }));
     }
 
+    int first_error = 0;
     for (size_t i = 0; i < addr_list.size(); ++i) {
-        if (results[i].get())
+        int ret = results[i].get();
+        if (ret) {
             LOG(WARNING) << "UbTransport: Failed to unregister memory: addr "
                          << addr_list[i];
+            if (!first_error) first_error = ret;
+        }
     }
-
-    return metadata_->updateLocalSegmentDesc();
+    int metadata_ret = metadata_->updateLocalSegmentDesc();
+    return first_error ? first_error : metadata_ret;
 }
 
 Status UbTransport::submitTransfer(
@@ -186,8 +194,18 @@ Status UbTransport::submitTransfer(
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
     std::vector<TransferTask*> task_list;
-    task_list.reserve(batch_desc.task_list.size());
-    for (auto& task : batch_desc.task_list) task_list.push_back(&task);
+    task_list.reserve(entries.size());
+    for (auto& request : entries) {
+        auto& task = batch_desc.task_list[task_id];
+        ++task_id;
+        task.batch_id = batch_id;
+#ifdef USE_ASCEND_HETEROGENEOUS
+        task.request = const_cast<TransferRequest*>(&request);
+#else
+        task.request = &request;
+#endif
+        task_list.push_back(&task);
+    }
     return submitTransferTask(task_list);
 }
 
@@ -269,8 +287,13 @@ Status UbTransport::submitTransferTask(
             }
             if (device_id < 0) {
                 auto source_addr = slice->source_addr;
-                for (auto& entry : slices_to_post)
-                    for (auto s : entry.second) getSliceCache().deallocate(s);
+                // Do not deallocate slices already queued in slices_to_post
+                // here: every slice is also recorded in its owning
+                // TransferTask::slice_list right after allocation, and
+                // ~TransferTask() returns everything in slice_list to the
+                // cache exactly once. Deallocating here double-frees them
+                // into ThreadLocalSliceCache, letting a later allocate()
+                // hand the same Slice* to two unrelated transfers.
                 LOG(ERROR)
                     << "UbTransport: Address not registered by any device(s) "
                     << source_addr;

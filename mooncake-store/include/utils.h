@@ -171,14 +171,15 @@ std::string expected_to_str(const tl::expected<T, ErrorCode>& expected) {
 }
 
 /**
- * @brief Convert a string representation of size to bytes
+ * @brief Parse a string representation of size to bytes
  * @param str String representation of size (e.g., "1.5 GB", "1024 MB",
  * "1048576")
- * @return uint64_t Number of bytes, or 0 if parsing fails
+ * @return Parsed byte size, or std::nullopt if parsing fails
  */
-[[nodiscard]] inline uint64_t string_to_byte_size(const std::string& str) {
+[[nodiscard]] inline std::optional<uint64_t> try_string_to_byte_size(
+    const std::string& str) {
     if (str.empty()) {
-        return 0;
+        return std::nullopt;
     }
 
     // Create a copy for manipulation
@@ -189,7 +190,7 @@ std::string expected_to_str(const tl::expected<T, ErrorCode>& expected) {
     s.erase(s.find_last_not_of(" \t\r\n") + 1);
 
     if (s.empty()) {
-        return 0;
+        return std::nullopt;
     }
 
     // Handle special case for "infinite"
@@ -204,7 +205,10 @@ std::string expected_to_str(const tl::expected<T, ErrorCode>& expected) {
     try {
         value = std::stod(s, &pos);
     } catch (const std::exception&) {
-        return 0;  // Failed to parse number
+        return std::nullopt;  // Failed to parse number
+    }
+    if (value < 0) {
+        return std::nullopt;
     }
 
     if (pos >= s.length()) {
@@ -218,7 +222,8 @@ std::string expected_to_str(const tl::expected<T, ErrorCode>& expected) {
     unit.erase(0, unit.find_first_not_of(" \t\r\n"));
 
     // Convert to uppercase for comparison
-    std::transform(unit.begin(), unit.end(), unit.begin(), ::toupper);
+    std::transform(unit.begin(), unit.end(), unit.begin(),
+                   [](unsigned char c) -> char { return std::toupper(c); });
 
     // Apply unit multiplier
     const double KB = 1024.0;
@@ -238,8 +243,19 @@ std::string expected_to_str(const tl::expected<T, ErrorCode>& expected) {
         return static_cast<uint64_t>(value);
     } else {
         // Unknown unit
-        return 0;
+        return std::nullopt;
     }
+}
+
+/**
+ * @brief Convert a string representation of size to bytes
+ * @param str String representation of size (e.g., "1.5 GB", "1024 MB",
+ * "1048576")
+ * @return uint64_t Number of bytes, or 0 if parsing fails
+ */
+[[nodiscard]] inline uint64_t string_to_byte_size(const std::string& str) {
+    auto parsed = try_string_to_byte_size(str);
+    return parsed.value_or(0);
 }
 
 /**
@@ -294,7 +310,8 @@ constexpr double BYTES_PER_GIB = static_cast<double>(SZ_1GB);
  */
 void* allocate_buffer_allocator_memory(
     size_t total_size, const std::string& protocol = "",
-    size_t alignment = facebook::cachelib::Slab::kSize);
+    size_t alignment = facebook::cachelib::Slab::kSize,
+    bool use_spdk_dma = false);
 
 inline size_t align_up(size_t size, size_t alignment) {
     if (alignment == 0) {
@@ -361,6 +378,24 @@ inline size_t align_up(size_t size, size_t alignment) {
 }
 
 /**
+ * @brief Fault in a fresh HugeTLB mapping with parallel CPU writes.
+ *
+ * Touches one byte per configured hugepage. Call this only for a newly
+ * allocated mapping whose contents may be zeroed.
+ */
+void populate_hugetlb_mapping(void* ptr, size_t total_size);
+
+/**
+ * @brief Fault in an mbind-partitioned HugeTLB mapping with NUMA-local workers.
+ *
+ * The mapping is divided into equal regions in the same order as numa_nodes.
+ * Workers are scheduled on the corresponding node before touching that
+ * region.
+ */
+void populate_hugetlb_numa_mapping(void* ptr, size_t total_size,
+                                   const std::vector<int>& numa_nodes);
+
+/**
  * Allocate mmap-backed buffer memory for host KV / transfer buffers.
  *
  * When the global mmap arena is enabled, this function serves allocations
@@ -376,6 +411,24 @@ inline size_t align_up(size_t size, size_t alignment) {
  * @return Pointer to the allocation, or nullptr on failure.
  */
 void* allocate_buffer_mmap_memory(size_t total_size, size_t alignment);
+
+/**
+ * Allocate mmap-backed memory, optionally deferring direct HugeTLB population.
+ *
+ * When defer_hugetlb_population is true, a direct HugeTLB mmap omits
+ * MAP_POPULATE so the caller can populate the mapping later. Arena allocations
+ * retain their existing eager-population behavior.
+ */
+void* allocate_buffer_mmap_memory(size_t total_size, size_t alignment,
+                                  bool defer_hugetlb_population);
+
+/**
+ * @brief Return whether ptr is backed by the global mmap arena.
+ *
+ * Intended for callers that need to distinguish an eagerly populated arena
+ * allocation from a direct mmap fallback.
+ */
+[[nodiscard]] bool is_mmap_arena_allocation(const void* ptr);
 
 /**
  * Release memory previously returned by allocate_buffer_mmap_memory().
@@ -394,8 +447,9 @@ void free_buffer_mmap_memory(void* ptr, size_t total_size);
  *
  * Reserves a single VMA via mmap, divides it into N equal regions,
  * binds each region to the corresponding NUMA node via mbind(MPOL_BIND).
- * No explicit prefault — ibv_reg_mr() will fault and pin pages respecting
- * the mbind policy, allocating directly on the target NUMA node.
+ * The mapping remains lazy after allocation. The caller may populate it with
+ * NUMA-local workers or let ibv_reg_mr() fault and pin pages while respecting
+ * the mbind policy.
  *
  * @param total_size  Total buffer size in bytes
  * @param numa_nodes  NUMA node IDs to bind regions to (e.g., {1,3,5,7})
@@ -407,7 +461,8 @@ void* allocate_buffer_numa_segments(size_t total_size,
                                     const std::vector<int>& numa_nodes,
                                     size_t page_size = 0);
 
-void free_memory(const std::string& protocol, void* ptr);
+void free_memory(const std::string& protocol, void* ptr,
+                 bool use_spdk_dma = false);
 
 // Network utility functions
 
@@ -479,6 +534,8 @@ T GetEnvOr(const char* name, T default_value) {
 }
 
 std::string GetEnvStringOr(const char* name, const std::string& default_value);
+
+std::string ResolveMooncakeHostId(const std::string& local_hostname);
 
 std::string ResolvePathFromKey(const std::string& key,
                                const std::string& root_dir,

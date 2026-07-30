@@ -34,6 +34,7 @@
 #include "tent/transfer_engine.h"
 #include "tent/common/utils/random.h"
 #include "tent/common/utils/os.h"
+#include "tent/runtime/topology.h"  // LocationParser
 
 namespace mooncake {
 namespace tent {
@@ -59,20 +60,70 @@ class TENTBenchRunner : public BenchRunner {
 
     uint64_t getLocalBufferBase(int thread_id, uint64_t block_size,
                                 uint64_t batch_size) const {
-        const size_t num_buffers = pinned_buffer_list_.size();
-        return (uint64_t)pinned_buffer_list_[thread_id % num_buffers] +
-               block_size * batch_size * (thread_id / num_buffers);
+        if (seg_type_mix_.empty()) {
+            // Single seg_type mode: original behavior.
+            const size_t num_buffers = pinned_buffer_list_.size();
+            return (uint64_t)pinned_buffer_list_[thread_id % num_buffers] +
+                   block_size * batch_size * (thread_id / num_buffers);
+        }
+        // Mixed mode: pick this thread's seg_type by round-robin, then index
+        // into the subset of pinned_buffer_list_ matching that seg_type.
+        const std::string& seg_type =
+            seg_type_mix_[thread_id % seg_type_mix_.size()];
+        size_t base = 0, count = 0;
+        for (size_t i = 0; i < pinned_buffer_seg_type_.size(); ++i) {
+            if (pinned_buffer_seg_type_[i] == seg_type) {
+                if (count == 0) base = i;
+                ++count;
+            }
+        }
+        if (count == 0) {
+            LOG(FATAL) << "No local buffer of seg_type " << seg_type
+                       << " for thread " << thread_id;
+        }
+        size_t slot = (thread_id / seg_type_mix_.size()) % count;
+        return (uint64_t)pinned_buffer_list_[base + slot] +
+               block_size * batch_size *
+                   ((thread_id / seg_type_mix_.size()) / count);
     }
 
     uint64_t getTargetBufferBase(int thread_id, uint64_t block_size,
                                  uint64_t batch_size) const {
-        return info_.buffers[thread_id % info_.buffers.size()].base +
-               block_size * batch_size * (thread_id / info_.buffers.size());
+        if (seg_type_mix_.empty()) {
+            // Single seg_type mode: original behavior.
+            return info_.buffers[thread_id % info_.buffers.size()].base +
+                   block_size * batch_size * (thread_id / info_.buffers.size());
+        }
+        // Mixed mode: pick this thread's seg_type, then index into the
+        // subset of target segment buffers matching that seg_type. Use
+        // LocationParser to classify each buffer as host (cpu) vs device
+        // (cuda/rocm/supa/...) rather than hard-coding a vendor prefix.
+        const std::string& seg_type =
+            seg_type_mix_[thread_id % seg_type_mix_.size()];
+        bool want_device = (seg_type == "vram");
+        std::vector<size_t> matches;
+        for (size_t i = 0; i < info_.buffers.size(); ++i) {
+            const auto& loc = info_.buffers[i].location;
+            bool is_device =
+                LocationParser(loc).type() != "cpu" && loc != kWildcardLocation;
+            if (is_device == want_device) {
+                matches.push_back(i);
+            }
+        }
+        if (matches.empty()) {
+            LOG(FATAL) << "No target buffer of seg_type " << seg_type
+                       << " for thread " << thread_id;
+        }
+        size_t slot = (thread_id / seg_type_mix_.size()) % matches.size();
+        return info_.buffers[matches[slot]].base +
+               block_size * batch_size *
+                   ((thread_id / seg_type_mix_.size()) / matches.size());
     }
 
     double runSingleTransfer(uint64_t local_addr, uint64_t target_addr,
                              uint64_t block_size, uint64_t batch_size,
-                             OpCode opcode);
+                             OpCode opcode, uint64_t deadline_ns,
+                             IntentType intent_type);
 
    private:
     int allocateBuffers();
@@ -84,8 +135,17 @@ class TENTBenchRunner : public BenchRunner {
    private:
     std::unique_ptr<TransferEngine> engine_;
     std::vector<void*> pinned_buffer_list_;
+    // Parallel to pinned_buffer_list_: the seg_type each buffer belongs to
+    // ("dram" or "vram"). Populated by allocateBuffers; used by
+    // getLocalBufferBase to pick the right buffer per thread.
+    std::vector<std::string> pinned_buffer_seg_type_;
+    // Parsed --seg_type_mix (e.g. ["dram", "vram"]). Empty when --seg_type_mix
+    // is not set → single-seg_type mode (existing behavior).
+    std::vector<std::string> seg_type_mix_;
     SegmentID handle_;
     SegmentInfo info_;
+    TransportType transport_hint_{UNSPEC};
+    IntentType intent_type_{IntentType::INTENT_UNSPEC};
 
     std::vector<std::function<int(int)>> current_task_;
     std::vector<std::thread> threads_;

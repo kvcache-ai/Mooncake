@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
+  "name": "mooncake-troubleshoot",
+  "description": "Systematically diagnose Mooncake deployment and runtime issues (services, RDMA, env vars, connectivity, logs) and propose fixes.",
+  "author": {
+    "name": "Mooncake Team"
+  },
+  "homepage": "https://kvcache-ai.github.io/Mooncake/skills/mooncake-troubleshoot.html",
+  "repository": "https://github.com/kvcache-ai/Mooncake",
+  "license": "Apache-2.0",
+  "keywords": ["mooncake", "troubleshooting", "rdma", "deployment"]
+}

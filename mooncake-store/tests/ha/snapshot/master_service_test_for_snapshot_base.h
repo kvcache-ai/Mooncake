@@ -1,6 +1,7 @@
 #pragma once
 
 #include "master_service.h"
+#include "master_snapshot_manager.h"
 #include "master_metric_manager.h"
 #include "segment.h"
 #include "ha/snapshot/catalog/snapshot_catalog_store.h"
@@ -54,6 +55,7 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         // eviction behavior inconsistency and snapshot comparison failures
         MasterMetricManager::instance().reset_allocated_mem_size();
         MasterMetricManager::instance().reset_total_mem_capacity();
+        MasterMetricManager::instance().reset_cache_total_nums();
 
         // Create a unique temporary directory for this test
         namespace fs = std::filesystem;
@@ -72,8 +74,8 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
     // LocalDiskSegment state for comparison
     struct LocalDiskSegmentState {
         bool enable_offloading = false;
-        std::map<std::string, int64_t>
-            offloading_objects;  // key -> timestamp (sorted)
+        std::map<std::string, OffloadTaskItem>
+            offloading_objects;  // storage key -> task (sorted)
     };
 
     // Task state for comparison
@@ -158,11 +160,55 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
 
     // ==================== Snapshot Helper Methods ====================
 
-    // Wrapper method: Call MasterService's private method PersistState
-    // This class is a friend of MasterService, so it can access private members
+    // Wrapper method: Call MasterSnapshotManager's PersistState through
+    // MasterService This class is a friend of MasterService, so it can access
+    // private members
     static tl::expected<void, SerializationError> CallPersistState(
         MasterService* service, const std::string& snapshot_id) {
-        return service->PersistState(snapshot_id);
+        // If snapshot_manager_ exists, use it; otherwise create a temporary one
+        if (service->snapshot_manager_) {
+            return service->snapshot_manager_->PersistState(snapshot_id);
+        }
+
+        // For tests that don't have snapshot_manager_ initialized,
+        // we need to access the old implementation or create a temporary
+        // manager This is a temporary compatibility layer for tests
+        EnsureSnapshotStores(service);
+
+        MasterSnapshotManagerOptions options;
+        options.enable_snapshot = true;
+        options.snapshot_interval_seconds = 300;
+        options.snapshot_child_timeout_seconds = 300;
+        options.snapshot_retention_count = 3;
+        options.snapshot_backup_dir = "";
+        options.use_snapshot_backup_dir = false;
+        options.snapshot_catalog_store_type =
+            service->snapshot_catalog_store_type_;
+        options.snapshot_catalog_store_connstring =
+            service->snapshot_catalog_store_connstring_;
+        options.ha_backend_type = service->ha_backend_type_;
+        options.ha_backend_connstring = service->ha_backend_connstring_;
+        options.cluster_id = service->cluster_id_;
+        options.enable_ha = service->enable_ha_;
+
+        auto temp_manager = std::make_unique<MasterSnapshotManager>(
+            service, options, service->snapshot_mutex_,
+            service->snapshot_object_store_.get(),
+            service->snapshot_catalog_store_.get());
+
+        return temp_manager->PersistState(snapshot_id);
+    }
+
+    static void EnsureSnapshotStores(MasterService* service) {
+        if (!service->snapshot_object_store_) {
+            service->snapshot_object_store_ = SnapshotObjectStore::Create(
+                SnapshotObjectStoreType::LOCAL_FILE);
+        }
+        if (!service->snapshot_catalog_store_ &&
+            service->snapshot_object_store_) {
+            service->snapshot_catalog_store_ =
+                service->CreateSnapshotCatalogStore();
+        }
     }
 
     // Generate unique snapshot ID (timestamp format)
@@ -188,7 +234,10 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
 
     // Get msgpack snapshot directory path
     std::string GetSnapshotDir(const std::string& snapshot_id) const {
-        return tmp_dir() + "/mooncake_master_snapshot/" + snapshot_id + "/";
+        return tmp_dir() + "/" +
+               ha::snapshot_catalog_store_detail::BuildSnapshotRoot(
+                   DEFAULT_CLUSTER_ID) +
+               snapshot_id + "/";
     }
 
     // Get backup directory path
@@ -204,7 +253,7 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         ServiceStateSnapshot state;
 
         // === Basic State ===
-        auto keys_result = service->GetAllKeys();
+        auto keys_result = service->GetAllKeys(TenantId::Default());
         if (keys_result.has_value()) {
             state.all_keys = std::move(keys_result.value());
             std::sort(state.all_keys.begin(), state.all_keys.end());
@@ -217,7 +266,8 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         }
 
         for (const auto& key : state.all_keys) {
-            auto replica_result = service->GetReplicaList(key);
+            auto replica_result =
+                service->GetReplicaList(key, TenantId::Default());
             if (replica_result.has_value()) {
                 state.replica_lists[key] = std::move(replica_result.value());
             }
@@ -247,9 +297,8 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
                 seg_state.enable_offloading = segment->enable_offloading;
                 // Copy offloading_objects to sorted map
                 std::lock_guard<Mutex> lock(segment->offloading_mutex_);
-                for (const auto& [key, timestamp] :
-                     segment->offloading_objects) {
-                    seg_state.offloading_objects[key] = timestamp;
+                for (const auto& [key, task] : segment->offloading_objects) {
+                    seg_state.offloading_objects[key] = task;
                 }
                 state.local_disk_segments[client_id] = std::move(seg_state);
             }
@@ -530,8 +579,10 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         const std::string key = "snapshot_putstart_consistency_key";
         const uint64_t slice_length = 1024;
 
-        auto before = original->PutStart(client_id, key, slice_length, config);
-        auto after = restored->PutStart(client_id, key, slice_length, config);
+        auto before = original->PutStart(client_id, key, TenantId::Default(),
+                                         slice_length, config);
+        auto after = restored->PutStart(client_id, key, TenantId::Default(),
+                                        slice_length, config);
 
         ASSERT_EQ(before.has_value(), after.has_value())
             << "PutStart has_value mismatch between original and restored "
@@ -788,19 +839,10 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
             << "Use 'service_.reset(new MasterService(...))' instead of "
                "'std::unique_ptr<MasterService> service_(...)'";
 
-        // Ensure snapshot_object_store_ is initialized for PersistState
         // Some test configs may not enable snapshot/restore, so the backend
         // is not created in the constructor. We create it here for TearDown
         // validation.
-        if (!service_->snapshot_object_store_) {
-            service_->snapshot_object_store_ = SnapshotObjectStore::Create(
-                SnapshotObjectStoreType::LOCAL_FILE);
-        }
-        if (!service_->snapshot_catalog_store_ &&
-            service_->snapshot_object_store_) {
-            service_->snapshot_catalog_store_ =
-                service_->CreateSnapshotCatalogStore();
-        }
+        EnsureSnapshotStores(service_.get());
 
         // Test snapshot and restore functionality for all test cases
         TestSnapshotAndRestore(service_);

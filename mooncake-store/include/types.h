@@ -5,10 +5,13 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <limits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+#include "tenant_id.h"
 
 #include "Slab.h"
 #include "ylt/struct_json/json_reader.h"
@@ -82,14 +85,19 @@ inline bool IsValidClusterIdComponent(const std::string& cluster_id) {
     return true;
 }
 static constexpr uint64_t DEFAULT_DEFAULT_KV_LEASE_TTL =
-    5000;  // in milliseconds
+    10000;  // in milliseconds
 static constexpr uint64_t DEFAULT_KV_SOFT_PIN_TTL_MS =
     30 * 60 * 1000;  // 30 minutes
 static constexpr bool DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS = true;
 static constexpr double DEFAULT_EVICTION_RATIO = 0.05;
-static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.95;
+static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.90;
+static constexpr double DEFAULT_NOF_EVICTION_RATIO = 0.05;
+static constexpr double DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO = 0.90;
 static constexpr int64_t DEFAULT_MASTER_VIEW_LEASE_TTL_SEC = 5;  // in seconds
 static constexpr int64_t DEFAULT_CLIENT_LIVE_TTL_SEC = 10;       // in seconds
+static constexpr int64_t DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC = 10;
+static constexpr uint32_t DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS = 1000;
+static constexpr uint32_t DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD = 3;
 static constexpr uint64_t DEFAULT_SNAPSHOT_INTERVAL_SEC =
     60 * 10;  // in seconds
 static constexpr uint64_t DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC =
@@ -122,6 +130,46 @@ static constexpr uint64_t DEFAULT_PENDING_TASK_TIMEOUT_SEC =
 static constexpr uint64_t DEFAULT_PROCESSING_TASK_TIMEOUT_SEC =
     300;  // 0 to be no timeout
 static constexpr uint32_t DEFAULT_MAX_RETRY_ATTEMPTS = 10;
+
+/**
+ * @brief Data type classification for objects stored in Mooncake Store.
+ *
+ * This allows the store to track what kind of data each object holds,
+ * enabling future type-aware policies (eviction priority, replication
+ * strategies, etc.). Defaults to UNKNOWN for backward compatibility.
+ */
+enum class ObjectDataType : uint8_t {
+    UNKNOWN = 0,
+    KVCACHE = 1,
+    TENSOR = 2,
+    WEIGHT = 3,
+    SAMPLE = 4,
+    ACTIVATION = 5,
+    GRADIENT = 6,
+    OPTIMIZER_STATE = 7,
+    METADATA = 8,
+    GENERAL = 9,
+    // 10-255 reserved for future types
+};
+
+inline std::ostream& operator<<(std::ostream& os,
+                                const ObjectDataType& type) noexcept {
+    static const std::unordered_map<ObjectDataType, std::string_view>
+        type_strings{{ObjectDataType::UNKNOWN, "UNKNOWN"},
+                     {ObjectDataType::KVCACHE, "KVCACHE"},
+                     {ObjectDataType::TENSOR, "TENSOR"},
+                     {ObjectDataType::WEIGHT, "WEIGHT"},
+                     {ObjectDataType::SAMPLE, "SAMPLE"},
+                     {ObjectDataType::ACTIVATION, "ACTIVATION"},
+                     {ObjectDataType::GRADIENT, "GRADIENT"},
+                     {ObjectDataType::OPTIMIZER_STATE, "OPTIMIZER_STATE"},
+                     {ObjectDataType::METADATA, "METADATA"},
+                     {ObjectDataType::GENERAL, "GENERAL"}};
+
+    auto it = type_strings.find(type);
+    os << (it != type_strings.end() ? it->second : "UNKNOWN");
+    return os;
+}
 
 // Forward declarations
 class BufferAllocatorBase;
@@ -169,12 +217,41 @@ constexpr const char* CONFIG_KEY_PROTOCOL = "protocol";
 constexpr const char* CONFIG_KEY_RDMA_DEVICES = "rdma_devices";
 constexpr const char* CONFIG_KEY_MASTER_SERVER_ADDR = "master_server_addr";
 constexpr const char* CONFIG_KEY_IPC_SOCKET_PATH = "ipc_socket_path";
+constexpr const char* CONFIG_KEY_TENANT_ID = "tenant_id";
+constexpr const char* CONFIG_KEY_ENABLE_CLIENT_HTTP_SERVER =
+    "enable_client_http_server";
+constexpr const char* CONFIG_KEY_CLIENT_HTTP_PORT = "client_http_port";
 
 // Store client configuration defaults
 static constexpr size_t DEFAULT_GLOBAL_SEGMENT_SIZE = 1024 * 1024 * 16;  // 16MB
 static constexpr size_t DEFAULT_LOCAL_BUFFER_SIZE = 1024 * 1024 * 16;    // 16MB
 constexpr const char* DEFAULT_PROTOCOL = "tcp";
 constexpr const char* DEFAULT_MASTER_SERVER_ADDR = "127.0.0.1:50051";
+static constexpr int DEFAULT_CLIENT_HTTP_PORT = 9300;
+
+struct OffloadTaskItem {
+    std::string tenant_id;
+    std::string key;
+    int64_t size;
+
+    bool operator==(const OffloadTaskItem& other) const {
+        return tenant_id == other.tenant_id && key == other.key &&
+               size == other.size;
+    }
+};
+YLT_REFL(OffloadTaskItem, tenant_id, key, size);
+
+struct PromotionTaskItem {
+    std::string tenant_id;
+    std::string key;
+    int64_t size;
+
+    bool operator==(const PromotionTaskItem& other) const {
+        return tenant_id == other.tenant_id && key == other.key &&
+               size == other.size;
+    }
+};
+YLT_REFL(PromotionTaskItem, tenant_id, key, size);
 
 // Store client configuration validation limits
 static constexpr size_t MIN_SEGMENT_SIZE = 1024;                          // 1KB
@@ -261,7 +338,8 @@ enum class ErrorCode : int32_t {
     TRANSFER_FAIL = -800,  ///< Transfer operation failed.
 
     // RPC errors (Range: -900 to -999)
-    RPC_FAIL = -900,  ///< RPC operation failed.
+    RPC_FAIL = -900,     ///< RPC operation failed.
+    RPC_TIMEOUT = -901,  ///< RPC call timed out (client-side deadline hit).
 
     // High availability errors (Range: -1000 to -1099)
     ETCD_OPERATION_ERROR = -1000,   ///< etcd operation failed.
@@ -270,6 +348,12 @@ enum class ErrorCode : int32_t {
     ETCD_CTX_CANCELLED = -1003,     ///< etcd context cancelled.
     OPLOG_ENTRY_NOT_FOUND =
         -1004,  ///< OpLog entry not found (backend-agnostic).
+    K8S_LEASE_OPERATION_ERROR = -1005,  ///< K8s Lease operation failed.
+    K8S_LEASE_NOT_FOUND = -1006,        ///< K8s Lease not found.
+    INCOMPLETE_OPLOG_CATCH_UP =
+        -1007,  ///< Promotion catch-up could not prove all durable OpLog
+                ///< entries were applied, or unresolved skipped/missing
+                ///< gaps remain after final catch-up + second gap resolution.
     UNAVAILABLE_IN_CURRENT_STATUS =
         -1010,  ///< Request cannot be done in current status.
     UNAVAILABLE_IN_CURRENT_MODE =
@@ -300,6 +384,17 @@ enum class ErrorCode : int32_t {
     TASK_PENDING_LIMIT_EXCEEDED =
         -1401,              ///< Total pending tasks exceed the limit.
     JOB_NOT_FOUND = -1402,  ///< Job not found.
+
+    // DFS errors (Range: -1600 to -1699)
+    DFS_NETWORK_TIMEOUT = -1600,      ///< DFS network timeout.
+    DFS_SERVICE_UNAVAILABLE = -1601,  ///< DFS service unavailable.
+    DFS_QUOTA_EXCEEDED = -1602,       ///< DFS quota exceeded.
+    DFS_PERMISSION_DENIED = -1603,    ///< DFS permission denied.
+    DFS_STALE_HANDLE = -1604,         ///< DFS file handle expired.
+    DFS_PARTIAL_WRITE = -1605,        ///< DFS partial write success.
+    TENANT_QUOTA_EXCEEDED = -1700,    ///< Tenant memory quota exceeded.
+    TENANT_NOT_REGISTERED = -1701,    ///< Tenant has no quota policy.
+    TENANT_NOT_EMPTY = -1702,         ///< Tenant still owns objects or quota.
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;
@@ -346,18 +441,35 @@ struct Segment {
     // TE p2p endpoint (ip:port) for transport-only addressing
     std::string te_endpoint{};
     std::string protocol;
+    std::string host_id{};
     Segment() = default;
 };
-YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol);
+YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol, host_id);
 
 /**
  * @brief Allocation strategy type for segment allocation
  */
 enum class AllocationStrategyType {
-    RANDOM = 0,        // Pure random allocation
-    FREE_RATIO_FIRST,  // Free-ratio-first allocation
-    CXL,               // CXL-specific allocation
+    RANDOM = 0,            // Pure random allocation
+    FREE_RATIO_FIRST,      // Free-ratio-first allocation
+    CXL,                   // CXL-specific allocation
+    SSD_FREE_RATIO_FIRST,  // SSD free-ratio-first allocation
+    LOCAL_FIRST            // Prefer local host before ordered remote fallback
 };
+
+/**
+ * @brief Represents a contiguous NoF ssd region
+ */
+struct NoFSegment {
+    UUID id{0, 0};
+    std::string name{};  // Logical segment name used for preferred allocation
+    uintptr_t base{0};
+    size_t size{0};
+    // TE p2p endpoint (ip:port) for transport-only addressing
+    std::string te_endpoint{};
+    NoFSegment() = default;
+};
+YLT_REFL(NoFSegment, id, name, base, size, te_endpoint);
 
 /**
  * @brief Client status from the master's perspective

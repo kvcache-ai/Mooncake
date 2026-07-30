@@ -52,6 +52,33 @@ inline std::optional<HABackendType> ParseHABackendType(std::string_view type) {
     return std::nullopt;
 }
 
+inline ErrorCode ValidateHABackendAvailability(HABackendType type) {
+    switch (type) {
+        case HABackendType::UNKNOWN:
+            return ErrorCode::INVALID_PARAMS;
+        case HABackendType::ETCD:
+#ifdef STORE_USE_ETCD
+            return ErrorCode::OK;
+#else
+            return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
+#endif
+        case HABackendType::REDIS:
+#ifdef STORE_USE_REDIS
+            return ErrorCode::OK;
+#else
+            return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
+#endif
+        case HABackendType::K8S:
+#ifdef STORE_USE_K8S_LEASE
+            return ErrorCode::OK;
+#else
+            return ErrorCode::UNAVAILABLE_IN_CURRENT_MODE;
+#endif
+    }
+
+    return ErrorCode::INVALID_PARAMS;
+}
+
 struct HABackendSpec {
     HABackendType type = HABackendType::UNKNOWN;
     std::string connstring;

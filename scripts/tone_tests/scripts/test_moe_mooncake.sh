@@ -13,11 +13,14 @@ run_test()
     local log_file="${BASE_DIR}/${TEST_CASE_RESULT_PATH}/${test_case_name}.log"
 
     echo "Running tests in container and saving output to: $log_file"
-    
+
+    # Use local HF cache (offline) when the model is already downloaded.
+    local offline_prefix=$(hf_offline_prefix "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct")
+
     ${docker_exec} "\
         export PYTHONPATH=/sgl-workspace/sglang:\$PYTHONPATH && \
         cd /test_run/python && \
-        python3 -m pytest test_moe_mooncake.py -v -s --tb=long" | tee "$log_file"
+        ${offline_prefix}python3 -m pytest test_moe_mooncake.py -v -s --tb=long" | tee "$log_file"
 
     return ${PIPESTATUS[0]}
 }

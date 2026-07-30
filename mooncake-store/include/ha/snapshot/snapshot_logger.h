@@ -16,7 +16,7 @@ inline void SnapshotLogWrite(const char* level, const std::string& msg) {
     if (g_snapshot_log_pipe_fd < 0) return;
     std::string line = std::string("[") + level + "] " + msg + "\n";
     // write() is async-signal-safe, won't deadlock after fork
-    ::write(g_snapshot_log_pipe_fd, line.c_str(), line.size());
+    std::ignore = ::write(g_snapshot_log_pipe_fd, line.c_str(), line.size());
 }
 
 // Macros for child process logging - writes to pipe instead of glog

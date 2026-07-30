@@ -14,10 +14,14 @@ const static std::string GPU_PREFIX = "cuda:";
 
 #define cudaSetDevice tangSetDevice
 #define cudaGetDeviceCount tangGetDeviceCount
+#define cudaDeviceGetPCIBusId tangDeviceGetPCIBusId
 
 #define cudaMalloc tangMalloc
 #define cudaFree tangFree
 #define cudaMemset tangMemset
+#define cudaMemcpy tangMemcpy
+#define cudaMemcpyHostToDevice tangMemcpyHostToDevice
+#define cudaMemcpyDeviceToHost tangMemcpyDeviceToHost
 
 #define cudaPointerAttributes tangPointerAttributes
 #define cudaPointerGetAttributes tangPointerGetAttributes

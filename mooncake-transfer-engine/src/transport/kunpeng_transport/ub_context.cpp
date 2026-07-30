@@ -80,6 +80,29 @@ int UbSIEVEEndpointStore::deleteEndpoint(const std::string& peer_nic_path) {
     return 0;
 }
 
+int UbSIEVEEndpointStore::deleteEndpointByPtr(UbEndPoint* point_ptr) {
+    RWSpinlock::WriteGuard guard(endpoint_map_lock_);
+    for (auto iter = endpoint_map_.begin(); iter != endpoint_map_.end();
+         iter++) {
+        if (iter->second.first.get() == point_ptr) {
+            std::string peer_nic_path = iter->first;
+            iter->second.first->deconstruct();
+            waiting_list_len_++;
+            waiting_list_.insert(iter->second.first);
+            auto fifo_iter = fifo_map_[peer_nic_path];
+            if (hand_.has_value() && hand_.value() == fifo_iter) {
+                fifo_iter == fifo_list_.begin() ? hand_ = std::nullopt
+                                                : hand_ = std::prev(fifo_iter);
+            }
+            fifo_list_.erase(fifo_iter);
+            fifo_map_.erase(peer_nic_path);
+            endpoint_map_.erase(iter);
+            return 0;
+        }
+    }
+    return 0;
+}
+
 void UbSIEVEEndpointStore::evictEndpoint() {
     if (fifo_list_.empty()) {
         return;
@@ -246,8 +269,14 @@ int UbWorkerPool::submitPostSend(
         auto targetSegment =
             peer_segment_desc->buffers[buffer_id].tseg[device_id];
         slice->ub.r_seg = context_.retrieveRemoteSeg(targetSegment);
+        if (!slice->ub.r_seg) {
+            LOG(ERROR) << "[UB] retrieveRemoteSeg failed for target_id="
+                       << slice->target_id << " buffer_id=" << buffer_id
+                       << " device_id" << device_id
+                       << " dest_addr=" << slice->ub.dest_addr;
+        }
         auto peer_nic_path =
-            MakeNicPath(peer_segment_desc->name,
+            MakeNicPath(peer_segment_desc->nicPathServerName(),
                         peer_segment_desc->devices[device_id].name);
         slice->peer_nic_path = peer_nic_path;
         int shard_id = (slice->target_id * 10007 + device_id) % kShardCount;
@@ -333,7 +362,7 @@ void UbWorkerPool::performPostSend(int thread_id) {
         }
         if (!endpoint->active()) {
             if (endpoint->inactiveTime() > 1.0)
-                context_.deleteEndpoint(entry.first);
+                context_.deleteEndpointByPtr(endpoint.get());
             // enable for re-establishation
             for (auto& slice : entry.second) failed_slice_list.push_back(slice);
             entry.second.clear();
@@ -355,6 +384,10 @@ void UbWorkerPool::performPostSend(int thread_id) {
             entry.second.clear();
             continue;
         }
+        // Set endpoint pointer for each slice before submitting
+        for (auto& slice : entry.second) {
+            slice->ub.endpoint = endpoint.get();
+        }
         endpoint->submitPostSend(entry.second, failed_slice_list);
 #endif
     }
@@ -368,44 +401,42 @@ void UbWorkerPool::performPostSend(int thread_id) {
 void UbWorkerPool::performPoll(int thread_id) {
     int processed_slice_count = 0;
     const static size_t kPollCount = 64;
+    // context_.poll() aggregates each completion's jetty_depth here and
+    // calls markSuccess() on successful slices in place. Successful slices
+    // are NOT returned from poll(), so this worker never dereferences them
+    // after they may have been recycled by the submitting thread.
     std::unordered_map<volatile int*, int> jetty_depth_set;
+    std::vector<UbTransport::Slice*> failed_slices;
     for (int jfc_index = thread_id; jfc_index < context_.jfcCount();
          jfc_index += kTransferWorkerCount) {
-        UbTransport::Slice* cr[kPollCount];
-        int nr_poll = context_.poll(kPollCount, cr, jfc_index);
+        UbTransport::Slice* failed[kPollCount];
+        int num_failed = 0;
+        int nr_poll = context_.poll(kPollCount, failed, num_failed,
+                                    jetty_depth_set, jfc_index);
         if (nr_poll < 0) {
             LOG(ERROR) << "Worker: Failed to poll jetty for complete";
             continue;
         }
-        for (int i = 0; i < nr_poll; ++i) {
-            UbTransport::Slice* slice = cr[i];
+        int num_success = nr_poll - num_failed;
+        success_nr_polls += num_success;
+        processed_slice_count += num_success;
+        for (int i = 0; i < num_failed; ++i) {
+            UbTransport::Slice* slice = failed[i];
             assert(slice);
-            if (jetty_depth_set.count(slice->ub.jetty_depth))
-                jetty_depth_set[slice->ub.jetty_depth]++;
-            else
-                jetty_depth_set[slice->ub.jetty_depth] = 1;
-            if (cr[i]->status != Transport::Slice::SUCCESS) {
-                failed_nr_polls++;
-                if (context_.active() && failed_nr_polls > 32 &&
-                    !success_nr_polls) {
-                    LOG(WARNING) << "Too many errors found in local RNIC "
-                                 << context_.nicPath() << ", mark it inactive";
-                    context_.set_active(false);
-                }
-                context_.deleteEndpoint(slice->peer_nic_path);
-                slice->ub.retry_cnt++;
-                if (slice->ub.retry_cnt >= slice->ub.max_retry_cnt) {
-                    slice->markFailed();
-                    processed_slice_count_++;
-                } else {
-                    collective_slice_queue_[thread_id][slice->peer_nic_path]
-                        .push_back(slice);
-                    redispatch_counter_++;
-                }
+            failed_nr_polls++;
+            if (context_.active() && failed_nr_polls > 32 &&
+                !success_nr_polls) {
+                LOG(WARNING) << "Too many errors found in local RNIC "
+                             << context_.nicPath() << ", mark it inactive";
+                context_.set_active(false);
+            }
+            slice->ub.retry_cnt++;
+            if (slice->ub.retry_cnt >= slice->ub.max_retry_cnt) {
+                failed_slices.push_back(slice);
             } else {
-                // slice->markSuccess();
-                processed_slice_count++;
-                success_nr_polls++;
+                collective_slice_queue_[thread_id][slice->peer_nic_path]
+                    .push_back(slice);
+                redispatch_counter_++;
             }
         }
         if (nr_poll)
@@ -414,6 +445,18 @@ void UbWorkerPool::performPoll(int thread_id) {
 
     for (auto& entry : jetty_depth_set)
         __sync_fetch_and_sub(entry.first, entry.second);
+
+    // Slices that hit max_retry: final markFailed() after all reads (and the
+    // jetty depth returns above) are done. Failed slices were never published
+    // by poll(), so they remained safe to deref up to this point.
+    for (auto& slice : failed_slices) {
+        if (slice->ub.endpoint) {
+            auto ptr = static_cast<UbEndPoint*>(slice->ub.endpoint);
+            context_.deleteEndpointByPtr(ptr);
+        }
+        slice->markFailed();
+        processed_slice_count_++;
+    }
 
     if (processed_slice_count)
         processed_slice_count_.fetch_add(processed_slice_count);
@@ -450,7 +493,7 @@ void UbWorkerPool::redispatch(std::vector<Transport::Slice*>& slice_list,
                 peer_segment_desc->buffers[buffer_id].tseg[device_id];
             slice->ub.r_seg = context_.retrieveRemoteSeg(targetSegment);
             auto peer_nic_path =
-                MakeNicPath(peer_segment_desc->name,
+                MakeNicPath(peer_segment_desc->nicPathServerName(),
                             peer_segment_desc->devices[device_id].name);
             slice->peer_nic_path = peer_nic_path;
             collective_slice_queue_[thread_id][peer_nic_path].push_back(slice);

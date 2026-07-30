@@ -32,12 +32,17 @@ extern "C" {
 #define OPCODE_READ (0)
 #define OPCODE_WRITE (1)
 
+/* IMPORTANT: callers MUST zero-initialize this struct
+ * (e.g. `tent_request_t r = {0};`). transport_hint relies on
+ * UNSPEC == 0 for the no-hint default. */
 struct tent_request {
     int opcode;
     void* source;
     tent_segment_id_t target_id;
     uint64_t target_offset;
     uint64_t length;
+    int priority;       /* Request priority (0=HIGH, 1=MEDIUM, 2=LOW) */
+    int transport_hint; /* TRANSPORT_UNSPEC=follow policy, else pin transport */
 };
 
 typedef struct tent_request tent_request_t;
@@ -94,15 +99,16 @@ typedef struct tent_notifi_info tent_notifi_info;
 #define PERM_GLOBAL_READ_ONLY (1)
 #define PERM_GLOBAL_READ_WRITE (2)
 
-#define TRANSPORT_RDMA (0)
-#define TRANSPORT_MNNVL (1)
-#define TRANSPORT_SHM (2)
-#define TRANSPORT_NVLINK (3)
-#define TRANSPORT_GDS (4)
-#define TRANSPORT_IOURING (5)
-#define TRANSPORT_TCP (6)
-#define TRANSPORT_ASCEND_DIRECT (7)
-#define TRANSPORT_UNSPEC (8)
+#define TRANSPORT_UNSPEC (0)
+#define TRANSPORT_RDMA (1)
+#define TRANSPORT_MNNVL (2)
+#define TRANSPORT_SHM (3)
+#define TRANSPORT_NVLINK (4)
+#define TRANSPORT_GDS (5)
+#define TRANSPORT_IOURING (6)
+#define TRANSPORT_TCP (7)
+#define TRANSPORT_ASCEND_DIRECT (8)
+#define TRANSPORT_SUNRISE_LINK (9)
 
 struct tent_memory_options {
     char location[64];
@@ -168,6 +174,9 @@ void tent_free_notifs(tent_notifi_info* info);
 int tent_task_status(tent_engine_t engine, tent_batch_id_t batch_id,
                      size_t task_id, tent_status_t* status);
 
+int tent_cancel_task(tent_engine_t engine, tent_batch_id_t batch_id,
+                     size_t task_id);
+
 int tent_overall_status(tent_engine_t engine, tent_batch_id_t batch_id,
                         tent_status_t* status);
 
@@ -194,6 +203,17 @@ int tent_register_memory_batch_ex(tent_engine_t engine, void** addrs,
 
 int tent_task_status_list(tent_engine_t engine, tent_batch_id_t batch_id,
                           tent_status_t* statuses, size_t* count);
+
+struct tent_nic_load_stat {
+    char device_name[64];
+    uint64_t inflight_bytes;
+    double ewma_bandwidth_bps;
+};
+
+typedef struct tent_nic_load_stat tent_nic_load_stat_t;
+
+int tent_get_nic_load_stats(tent_engine_t engine, tent_nic_load_stat_t* stats,
+                            size_t* count);
 
 #ifdef __cplusplus
 }
@@ -293,6 +313,11 @@ class TransferEngine {
                           const std::vector<Request>& request_list,
                           const Notification& notifi);
 
+    // Best-effort task cancellation. Work that has not reached the transport
+    // is prevented from being submitted. Device work already posted may still
+    // complete, so callers must continue polling for a terminal status.
+    Status cancelTransfer(BatchID batch_id, size_t task_id);
+
     Status sendNotification(SegmentID target_id, const Notification& notifi);
 
     Status receiveNotification(std::vector<Notification>& notifi_list);
@@ -306,6 +331,16 @@ class TransferEngine {
                              std::vector<TransferStatus>& status_list);
 
     Status getTransferStatus(BatchID batch_id, TransferStatus& overall_status);
+
+    // Drive one progress step on a batch and return its aggregated status.
+    // Unlike getTransferStatus, this always allows internal failover/resubmit
+    // regardless of enable_auto_failover_on_poll. The call is non-blocking and
+    // performs at most one state-machine step per task; callers that want to
+    // wait for completion must invoke it in a loop. PENDING means "make
+    // progress later"; terminal states (COMPLETED/FAILED) will not be revived.
+    Status progressBatch(BatchID batch_id, TransferStatus& overall_status);
+
+    Status getNicLoadStats(std::vector<NicLoadStats>& stats) const;
 
    private:
     std::unique_ptr<TransferEngineImpl> impl_;

@@ -29,13 +29,18 @@
 #include <vector>
 
 #include "tent/runtime/segment.h"
+#include "tent/runtime/segment_manager.h"
 
 namespace mooncake {
 namespace tent {
+// Maintains the buffer list of the local SegmentDesc (ref-counted
+// registration / deregistration). All mutations are applied through
+// SegmentManager::updateLocal(), so concurrent readers of getLocal() always
+// observe consistent snapshots; SegmentTracker itself holds no state besides
+// the manager reference.
 class SegmentTracker {
    public:
-    SegmentTracker(const SegmentDescRef& local_desc)
-        : local_desc_(local_desc) {}
+    explicit SegmentTracker(SegmentManager& manager) : manager_(manager) {}
 
     ~SegmentTracker() {}
 
@@ -43,9 +48,6 @@ class SegmentTracker {
     SegmentTracker& operator==(const SegmentTracker&) = delete;
 
    public:
-    Status query(uint64_t base, size_t length,
-                 std::vector<BufferDesc*>& result);
-
     Status addInBatch(std::vector<BufferDesc>& desc_list,
                       std::function<Status(std::vector<BufferDesc>&)> callback);
 
@@ -55,11 +57,13 @@ class SegmentTracker {
     Status remove(uint64_t base, size_t length,
                   std::function<Status(BufferDesc&)> callback);
 
-    Status forEach(std::function<Status(BufferDesc&)> callback);
+    // Iterates over the current snapshot; entries are immutable. Callers
+    // needing a mutable copy (e.g. transports scrubbing keys during
+    // deregistration) must copy explicitly.
+    Status forEach(std::function<Status(const BufferDesc&)> callback);
 
    private:
-    SegmentDescRef local_desc_;
-    std::mutex mutex_;
+    SegmentManager& manager_;
 };
 }  // namespace tent
 }  // namespace mooncake

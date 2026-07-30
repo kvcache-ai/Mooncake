@@ -4,7 +4,7 @@ include(FetchContent)
 FetchContent_Declare(
         urma
         GIT_REPOSITORY https://atomgit.com/openeuler/umdk.git
-        GIT_TAG        v25.12.0
+        GIT_TAG        v25.12.0.B081
 )
 
 FetchContent_MakeAvailable(urma)

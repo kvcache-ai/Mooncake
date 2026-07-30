@@ -18,7 +18,16 @@ option(WITH_STORE_GO "build Go bindings for mooncake store" OFF)
 option(WITH_P2P_STORE "build p2p store library and sample code" OFF)
 option(WITH_RUST_EXAMPLE "build the Rust interface and sample code for the transfer engine" OFF)
 option(WITH_STORE_RUST "build the Rust bindings for the Mooncake Store" ON)
+option(WITH_STORE_C_SHARED "build a self-contained libmooncake_store.so exposing only the store_c.h C ABI (for dlopen consumers)" OFF)
 option(WITH_EP "build mooncake with expert parallelism support" OFF)
+option(USE_NOF "build mooncake store with NoF SSD pool support" OFF)
+option(MOONCAKE_ENABLE_TEST_FAILPOINTS
+       "Enable file-handshake failpoints for integration tests" OFF)
+if(MOONCAKE_ENABLE_TEST_FAILPOINTS)
+  add_compile_definitions(MOONCAKE_ENABLE_TEST_FAILPOINTS)
+endif()
+option(MOONCAKE_ENABLE_OPLOG_PERF_METRICS
+       "Enable detailed batch OpLog performance metrics" OFF)
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/mooncake-common/SetupPython.cmake)
 add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/extern/pybind11)
@@ -56,6 +65,12 @@ if (STORE_USE_K8S_LEASE)
   add_compile_definitions(STORE_USE_K8S_LEASE)
 endif()
 
+if (USE_NOF)
+  add_compile_definitions(USE_NOF)
+else()
+  message(STATUS "USE_NOF=OFF, NoF SSD pool support is disabled")
+endif()
+
 option(STORE_USE_JEMALLOC "Use jemalloc in mooncake store master" OFF)
 
 # Define ASIO macros before building targets that include ASIO headers.
@@ -63,6 +78,7 @@ add_compile_definitions(ASIO_SEPARATE_COMPILATION ASIO_DYN_LINK)
 
 add_subdirectory(mooncake-common)
 include_directories(mooncake-common/etcd)
+include_directories(mooncake-common/k8s-lease)
 include_directories(mooncake-common/include)
 
 if (WITH_TE)
@@ -94,8 +110,10 @@ if (WITH_EP)
     include_directories(mooncake-pg/include)
   else ()
     message(STATUS "WITH_EP enabled: building Mooncake EP and PG Python extensions")
-    find_package(CUDAToolkit REQUIRED)
-    message(STATUS "Detected CUDA version: ${CUDAToolkit_VERSION}")
+    if(USE_CUDA)
+      find_package(CUDAToolkit REQUIRED)
+      message(STATUS "Detected CUDA version: ${CUDAToolkit_VERSION}")
+    endif()
 
     # EP_TORCH_VERSIONS: semicolon-separated list of PyTorch versions to build for.
     # Can be set via -DEP_TORCH_VERSIONS="2.9.1;2.8.0" or the EP_TORCH_VERSIONS env var.
@@ -136,6 +154,9 @@ if (WITH_EP)
         "-DTORCH_CUDA_ARCH_LIST=${_torch_cuda_arch_list_pipe}"
         "-DSTAGING_DIR=${EP_PG_STAGING_DIR}"
         "-DENGINE_SO_PATH=$<TARGET_FILE:engine>"
+        "-DPython3_EXECUTABLE=${Python3_EXECUTABLE}"
+        "-DEP_USE_MUSA=$<IF:$<BOOL:${USE_MUSA}>,1,0>"
+        "-DEP_USE_MACA=$<IF:$<BOOL:${USE_MACA}>,1,0>"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-ep/BuildEpExt.cmake"
       COMMENT "Building Mooncake EP Python extension(s)"
       DEPENDS engine
@@ -152,6 +173,9 @@ if (WITH_EP)
         "-DTORCH_CUDA_ARCH_LIST=${_torch_cuda_arch_list_pipe}"
         "-DSTAGING_DIR=${EP_PG_STAGING_DIR}"
         "-DENGINE_SO_PATH=$<TARGET_FILE:engine>"
+        "-DPython3_EXECUTABLE=${Python3_EXECUTABLE}"
+        "-DEP_USE_MUSA=$<IF:$<BOOL:${USE_MUSA}>,1,0>"
+        "-DEP_USE_MACA=$<IF:$<BOOL:${USE_MACA}>,1,0>"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/BuildPgExt.cmake"
       COMMENT "Building Mooncake PG Python extension(s)"
       DEPENDS engine mooncake_ep_ext
