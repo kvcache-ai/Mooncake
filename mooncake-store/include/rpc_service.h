@@ -12,6 +12,7 @@
 #include "types.h"
 #include "rpc_types.h"
 #include "master_config.h"
+#include "kv_event/kv_event_publisher.h"
 #include "segment.h"
 
 namespace mooncake {
@@ -212,6 +213,8 @@ class WrappedMasterService {
     tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
     OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading);
 
+    tl::expected<bool, ErrorCode> PollRemoveAll(const UUID& client_id);
+
     tl::expected<void, ErrorCode> ReportSsdCapacity(
         const UUID& client_id, int64_t ssd_total_capacity_bytes);
 
@@ -247,6 +250,13 @@ class WrappedMasterService {
         const std::string& segment_name);
     tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatusById(
         const UUID& segment_id);
+
+    // Internal method called by supervisor during promotion; NOT an RPC
+    // endpoint.
+    void RestoreFromStandby(const std::vector<StandbyObjectEntry>& objects,
+                            uint64_t initial_oplog_sequence_id,
+                            const std::vector<StandbySegmentInfo>& segments);
+
     tl::expected<UUID, ErrorCode> CreateCopyTask(
         const std::string& key, const std::string& tenant_id,
         const std::vector<std::string>& targets);
@@ -298,6 +308,9 @@ class WrappedMasterService {
     std::vector<tl::expected<void, ErrorCode>> BatchEvictDiskReplica(
         const UUID& client_id, const std::vector<std::string>& keys,
         const std::string& tenant_id, ReplicaType replica_type);
+
+    bool KvEventsEnabled() const;
+    KvEventPublisher::Stats GetKvEventStats() const;
 
    private:
     MasterService master_service_;

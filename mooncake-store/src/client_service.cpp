@@ -917,10 +917,18 @@ std::optional<std::shared_ptr<Client>> Client::Create(
                 LOG(INFO) << "Storage root directory is: " << storage_root_dir;
                 LOG(INFO) << "Fs subdir is: " << fs_subdir;
                 // Initialize storage backend with default eviction settings
-                client->PrepareStorageBackend(storage_root_dir, fs_subdir, true,
-                                              0);
+                auto prep_err = client->PrepareStorageBackend(
+                    storage_root_dir, fs_subdir, true, 0);
+                if (prep_err != ErrorCode::OK) {
+                    LOG(ERROR)
+                        << "Failed to initialize storage backend: " << prep_err
+                        << ". Persistence was requested via fsdir but is "
+                           "unavailable.";
+                    return std::nullopt;
+                }
             } else {
                 LOG(ERROR) << "Invalid fsdir format: " << dir_string;
+                return std::nullopt;
             }
         }
     } else {
@@ -940,11 +948,19 @@ std::optional<std::shared_ptr<Client>> Client::Create(
                           << config.enable_disk_eviction;
                 LOG(INFO) << "Quota bytes: " << config.quota_bytes;
                 // Initialize storage backend with config from master
-                client->PrepareStorageBackend(storage_root_dir, fs_subdir,
-                                              config.enable_disk_eviction,
-                                              config.quota_bytes);
+                auto prep_err = client->PrepareStorageBackend(
+                    storage_root_dir, fs_subdir, config.enable_disk_eviction,
+                    config.quota_bytes);
+                if (prep_err != ErrorCode::OK) {
+                    LOG(ERROR)
+                        << "Failed to initialize storage backend: " << prep_err
+                        << ". Persistence was requested via storage config "
+                           "but is unavailable.";
+                    return std::nullopt;
+                }
             } else {
                 LOG(ERROR) << "Invalid fsdir format: " << config.fsdir;
+                return std::nullopt;
             }
         }
     }
@@ -2652,8 +2668,10 @@ tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
     }
 
     auto result = master_client_.RemoveAll(force);
-    if (result && storage_backend_) {
-        storage_backend_->RemoveAll();
+    if (result) {
+        if (storage_backend_) {
+            storage_backend_->RemoveAll();
+        }
     }
     if (result && result.value() > 0 && hot_cache_) {
         hot_cache_->RemoveAllHotKeys();
@@ -3043,6 +3061,10 @@ tl::expected<void, ErrorCode> Client::OffloadObjectHeartbeat(
     return {};
 }
 
+tl::expected<bool, ErrorCode> Client::PollRemoveAll() {
+    return master_client_.PollRemoveAll();
+}
+
 tl::expected<void, ErrorCode> Client::ReportSsdCapacity(
     int64_t ssd_total_capacity_bytes) {
     auto response =
@@ -3342,20 +3364,32 @@ tl::expected<void, ErrorCode> Client::MarkTaskToComplete(
     return master_client_.MarkTaskToComplete(update_request);
 }
 
-void Client::PrepareStorageBackend(const std::string& storage_root_dir,
-                                   const std::string& fsdir,
-                                   bool enable_eviction, uint64_t quota_bytes) {
+ErrorCode Client::PrepareStorageBackend(const std::string& storage_root_dir,
+                                        const std::string& fsdir,
+                                        bool enable_eviction,
+                                        uint64_t quota_bytes) {
     // Initialize storage backend
-    storage_backend_ =
+    auto backend_result =
         StorageBackend::Create(storage_root_dir, fsdir, enable_eviction);
-    if (!storage_backend_) {
-        LOG(INFO) << "Failed to initialize storage backend";
+    if (!backend_result) {
+        LOG(ERROR) << "Failed to create storage backend: "
+                   << backend_result.error();
+        return backend_result.error();
     }
-    auto init_result = storage_backend_->Init(quota_bytes);
+    // Initialize into a local first and only publish to storage_backend_
+    // after a successful Init(): users of storage_backend_ only null-check
+    // it, so it must never point to a backend whose Init() failed (using it
+    // before successful Init() is undefined behavior). If Init() throws,
+    // stack unwinding destroys the local and storage_backend_ stays clean.
+    auto backend = std::move(backend_result.value());
+    auto init_result = backend->Init(quota_bytes);
     if (!init_result) {
         LOG(ERROR) << "Failed to initialize StorageBackend. Error: "
                    << init_result.error() << ". The backend will be unusable.";
+        return init_result.error();
     }
+    storage_backend_ = std::move(backend);
+    return ErrorCode::OK;
 }
 
 void Client::PutToLocalFile(const std::string& key,
@@ -3409,9 +3443,34 @@ void Client::PutToLocalFile(const std::string& key,
     // Async StoreObject + PutEnd (unchanged from original)
     write_thread_pool_.enqueue([this, backend = storage_backend_, key,
                                 value = std::move(value), path] {
-        // Store the object
-        auto store_result = backend->StoreObject(path, value, key);
         ReplicaType replica_type = ReplicaType::DISK;
+        // Store the object
+        auto store_result = backend->StoreObject(
+            path, value, key,
+            [this, replica_type](const std::vector<std::string>& evicted_keys)
+                -> tl::expected<void, ErrorCode> {
+                auto evict_results = master_client_.BatchEvictDiskReplica(
+                    evicted_keys, replica_type);
+                if (evict_results.size() != evicted_keys.size()) {
+                    return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+                }
+                for (size_t i = 0; i < evict_results.size(); ++i) {
+                    if (!evict_results[i]) {
+                        if (evict_results[i].error() ==
+                            ErrorCode::OBJECT_NOT_FOUND) {
+                            VLOG(1) << "Master no longer tracks evicted key: "
+                                    << evicted_keys[i];
+                            continue;
+                        }
+                        LOG(WARNING)
+                            << "Failed to notify master about evicted key: "
+                            << evicted_keys[i]
+                            << ", error: " << evict_results[i].error();
+                        return tl::make_unexpected(evict_results[i].error());
+                    }
+                }
+                return {};
+            });
 
         if (!store_result) {
             // If storage failed, revoke the put operation
@@ -3421,21 +3480,6 @@ void Client::PutToLocalFile(const std::string& key,
                 LOG(ERROR) << "Failed to revoke put operation for key: " << key;
             }
             return;
-        }
-
-        // Notify master about any evicted disk replicas (batch)
-        if (!store_result.value().empty()) {
-            const auto& evicted_keys = store_result.value();
-            auto evict_results = master_client_.BatchEvictDiskReplica(
-                evicted_keys, replica_type);
-            for (size_t i = 0; i < evict_results.size(); ++i) {
-                if (!evict_results[i]) {
-                    LOG(WARNING)
-                        << "Failed to notify master about evicted key: "
-                        << evicted_keys[i]
-                        << ", error: " << evict_results[i].error();
-                }
-            }
         }
 
         // If storage succeeded, end the put operation

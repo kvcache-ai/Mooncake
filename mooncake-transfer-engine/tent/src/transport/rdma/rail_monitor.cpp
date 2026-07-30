@@ -323,10 +323,32 @@ void RailMonitor::updateBestMapping() {
             for (size_t i = 0; i < local_cnt; i++) {
                 int local_nic = local_devices[local_numa][i];
                 int remote_nic = -1;
-                if (local_numa == remote_numa)
+                if (local_numa == remote_numa) {
                     remote_nic = direct_rails_[local_nic];
-                else
-                    remote_nic = remote_devices[remote_numa][i % remote_cnt];
+                } else {
+                    // Cross-NUMA: prefer a same-name remote device (e.g.
+                    // mlx5_5 -> mlx5_5) before falling back to positional
+                    // assignment. loadDefault() already builds direct_rails_
+                    // via same-name matching (Priority 1); mirroring it here
+                    // avoids mapping a local NIC to an unrelated remote NIC on
+                    // a different physical/overlay network, which fails QP
+                    // modify-to-RTR with "transport retry counter exceeded" on
+                    // multi-bond dual-NUMA RoCEv2 fabrics (issues #2758/#2467).
+                    auto local_entry = local_->getNicEntry(local_nic);
+                    if (local_entry) {
+                        for (int cand : remote_devices[remote_numa]) {
+                            auto cand_entry = remote_->getNicEntry(cand);
+                            if (cand_entry &&
+                                cand_entry->name == local_entry->name) {
+                                remote_nic = cand;
+                                break;
+                            }
+                        }
+                    }
+                    if (remote_nic < 0)
+                        remote_nic =
+                            remote_devices[remote_numa][i % remote_cnt];
+                }
                 if (!available(local_nic, remote_nic)) {
                     bool found = false;
                     for (int cand : remote_devices[remote_numa]) {

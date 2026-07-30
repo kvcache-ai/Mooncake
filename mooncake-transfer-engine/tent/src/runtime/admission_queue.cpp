@@ -15,8 +15,10 @@
 #include "tent/runtime/admission_queue.h"
 
 #include <algorithm>
+#include <chrono>
 #include <limits>
 #include <set>
+#include <utility>
 
 namespace mooncake {
 namespace tent {
@@ -175,6 +177,7 @@ Status LocalTransferAdmissionQueue::tryAdmit(
         owner.batch_token = submit.batch_token;
         owner.request = owner_input.request;
         owner.kind = owner_input.kind;
+        owner.degradation_eligible = owner_input.degradation_eligible;
         owners_.emplace(owner_id, owner);
 
         public_to_owner_[{submit.batch_token, owner_input.owner_task_id}] =
@@ -213,8 +216,18 @@ Status LocalTransferAdmissionQueue::tryAdmit(
     return Status::OK();
 }
 
+void LocalTransferAdmissionQueue::setDegradationPolicy(
+    BandwidthProvider bandwidth_provider, DegradationHooks hooks,
+    NowProvider now_provider) {
+    bandwidth_provider_ = std::move(bandwidth_provider);
+    degradation_hooks_ = std::move(hooks);
+    now_provider_ = std::move(now_provider);
+}
+
 std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
-    size_t max_owners, size_t max_bytes) {
+    size_t max_owners, size_t max_bytes,
+    std::vector<QueueOwnerId>* dropped_owner_ids) {
+    if (dropped_owner_ids) dropped_owner_ids->clear();
     std::vector<QueueOwnerId> picked;
     if (max_owners == 0 || max_bytes == 0) return picked;
 
@@ -222,8 +235,73 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
     // deadline_aware, fifo_ is kept EDF-ordered at admission time (see
     // tryAdmit's ordered insert), so there is nothing to sort here — we just
     // consume from the front. This keeps the hot dispatch path O(picked)
-    // instead of re-sorting the whole queue (up to max_outstanding_owners) on
-    // every call. Default (deadline_aware == false) is plain FIFO.
+    // instead of re-sorting the whole queue on every call. Default
+    // (deadline_aware == false) is plain FIFO.
+    //
+    // RFC #2519 step 3 (opt-in): drop is active only when a positive threshold,
+    // deadline awareness, and a bandwidth provider are all present.
+    const bool drop_enabled = limits_.deadline_aware &&
+                              limits_.mlu_local_threshold > 0.0 &&
+                              static_cast<bool>(bandwidth_provider_);
+    const bool promotion_enabled =
+        limits_.deadline_aware && limits_.promotion_slack_ns > 0;
+    const bool need_now = drop_enabled || promotion_enabled;
+    const double bw_bps = drop_enabled ? bandwidth_provider_() : 0.0;
+    const uint64_t now_ns =
+        need_now
+            ? (now_provider_
+                   ? now_provider_()
+                   : static_cast<uint64_t>(
+                         std::chrono::duration_cast<std::chrono::nanoseconds>(
+                             std::chrono::steady_clock::now()
+                                 .time_since_epoch())
+                             .count()))
+            : 0;
+
+    // Deadline proximity promotion: partition fifo_ so owners with critical
+    // slack (deadline approaching within promotion_slack_ns) appear before
+    // owners with comfortable slack or no deadline. stable_partition preserves
+    // relative EDF order within each group.
+    if (promotion_enabled) {
+        std::stable_partition(fifo_.begin(), fifo_.end(), [&](QueueOwnerId id) {
+            auto it = owners_.find(id);
+            if (it == owners_.end() || it->second.state != QueueState::Queued) {
+                return false;
+            }
+            const uint64_t dl = it->second.request.deadline_ns;
+            if (dl == 0 || dl <= now_ns) return false;
+            return (dl - now_ns) < limits_.promotion_slack_ns;
+        });
+    }
+
+    // Predicted MLU = predicted_transfer_time / remaining_window. Returns true
+    // if the owner is predicted to miss its deadline hard enough to drop.
+    auto shouldDrop = [&](const QueueOwner& owner) -> bool {
+        if (!drop_enabled || !owner.degradation_eligible || bw_bps <= 0.0)
+            return false;
+        const uint64_t deadline_ns = owner.request.deadline_ns;
+        if (deadline_ns == 0) return false;      // no deadline
+        if (deadline_ns <= now_ns) return true;  // already past
+        const double window_s = (deadline_ns - now_ns) / 1e9;
+        const double predicted_time_s = owner.request.length / bw_bps;
+        const double mlu = predicted_time_s / window_s;
+        return mlu >= limits_.mlu_local_threshold;
+    };
+
+    auto dropOwner = [&](QueueOwnerId owner_id, QueueOwner& owner) {
+        owner.state = QueueState::Terminal;
+        owner.terminal_status = TransferStatusEnum::CANCELED;
+        --outstanding_owners_;
+        outstanding_bytes_ -= owner.request.length;
+        if (owner.kind == QueueOwnerKind::User) {
+            --outstanding_user_owners_;
+            outstanding_user_bytes_ -= owner.request.length;
+        }
+        if (dropped_owner_ids) dropped_owner_ids->push_back(owner_id);
+        if (degradation_hooks_.on_local_decode_suggested) {
+            degradation_hooks_.on_local_decode_suggested(owner.request);
+        }
+    };
 
     size_t used_owners = 0;
     size_t used_bytes = 0;
@@ -236,6 +314,16 @@ std::vector<QueueOwnerId> LocalTransferAdmissionQueue::pickForDispatch(
         if (owner_it == owners_.end() ||
             owner_it->second.state != QueueState::Queued) {
             fifo_.pop_front();
+            continue;
+        }
+
+        // Step 3: an owner predicted to miss its deadline is dropped (not
+        // dispatched) and does not consume the dispatch budget. Because the
+        // queue is EDF-ordered, later owners have looser deadlines, so we keep
+        // scanning rather than stopping.
+        if (shouldDrop(owner_it->second)) {
+            fifo_.pop_front();
+            dropOwner(owner_id, owner_it->second);
             continue;
         }
 
@@ -272,6 +360,37 @@ Status LocalTransferAdmissionQueue::complete(
 
     owner.state = QueueState::Terminal;
     owner.terminal_status = terminal_status;
+    --outstanding_owners_;
+    outstanding_bytes_ -= owner.request.length;
+    if (owner.kind == QueueOwnerKind::User) {
+        --outstanding_user_owners_;
+        outstanding_user_bytes_ -= owner.request.length;
+    }
+    return Status::OK();
+}
+
+Status LocalTransferAdmissionQueue::cancel(QueueOwnerId owner_id) {
+    if (owner_id == 0) {
+        return Status::InvalidArgument("invalid queue owner id" LOC_MARK);
+    }
+    auto owner_it = owners_.find(owner_id);
+    if (owner_it == owners_.end()) {
+        return Status::InvalidEntry("queue owner not found" LOC_MARK);
+    }
+    auto& owner = owner_it->second;
+    if (owner.state == QueueState::Terminal) {
+        return owner.terminal_status == TransferStatusEnum::CANCELED
+                   ? Status::OK()
+                   : Status::InvalidEntry(
+                         "queue owner is already terminal" LOC_MARK);
+    }
+    if (owner.state != QueueState::Queued) {
+        return Status::InvalidEntry(
+            "queue owner is already dispatching" LOC_MARK);
+    }
+
+    owner.state = QueueState::Terminal;
+    owner.terminal_status = TransferStatusEnum::CANCELED;
     --outstanding_owners_;
     outstanding_bytes_ -= owner.request.length;
     if (owner.kind == QueueOwnerKind::User) {

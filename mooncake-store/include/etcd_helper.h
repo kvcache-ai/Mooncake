@@ -71,6 +71,31 @@ class EtcdHelper {
     static ErrorCode BatchCreate(const std::vector<std::string>& keys,
                                  const std::vector<std::string>& values);
 
+    enum class TxnCompareKind {
+        kValueEquals = 0,
+        kKeyNotExists = 1,
+    };
+
+    struct TxnCompare {
+        std::string key;
+        TxnCompareKind kind{TxnCompareKind::kValueEquals};
+        std::string expected_value;
+    };
+
+    struct TxnPut {
+        std::string key;
+        std::string value;
+    };
+
+    /*
+     * @brief Execute an etcd transaction with compare predicates and put
+     * operations.
+     * @return: OK on success; ETCD_TRANSACTION_FAIL when compare predicates
+     * fail.
+     */
+    static ErrorCode TxnCompareAndPut(const std::vector<TxnCompare>& compares,
+                                      const std::vector<TxnPut>& puts);
+
     /*
      * @brief Grant a lease from the etcd.
      * @param lease_ttl: The ttl of the lease, in seconds.

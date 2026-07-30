@@ -23,11 +23,12 @@ namespace mooncake {
 // Tuned for RDMA: fine-grained in <1ms, with ms-scale tail up to 1s
 const std::vector<double> kLatencyBucket = {
     // sub-ms to 1ms region
-    125, 150, 200, 250, 300, 400, 500, 750, 1000,
+    50, 75, 125, 150, 200, 250, 300, 400, 500, 750, 1000,
     // ms-level tail for batch/occasional spikes
     1500, 2000, 3000, 5000, 7000, 15000, 20000,
     // safeguards for long tails
-    50000, 100000, 200000, 500000, 1000000};
+    50000, 100000, 200000, 500000, 1000000, 2000000, 5000000, 10000000,
+    20000000};
 
 static inline std::string get_env_or_default(
     const char* env_var, const std::string& default_val = "") {

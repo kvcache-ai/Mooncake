@@ -21,14 +21,13 @@ jobs:
       runner: ubuntu-22.04
       container: pytorch/manylinux2_28-builder:cuda12.8
       cuda: container
-      build-with-ep: '1'
       torch-cuda-arch-list: '8.0;9.0'
-      ep-torch-versions: '2.11.0;2.12.0;2.12.1'
+      ep-torch-versions: '2.11.0;2.12.0;2.12.1;2.13.0'
       build-nvlink-allocator: true
       cmake-args: >-
         -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON
         -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
-      artifact-prefix: pre-release-cuda
+      artifact-prefix: mooncake-wheel-pre-release
 
   build-non-cuda:
     uses: ./.github/workflows/_build-wheel.yaml
@@ -36,12 +35,25 @@ jobs:
       runner: ubuntu-22.04
       container: pytorch/manylinux2_28-builder:cuda12.8
       cuda: container
-      build-with-ep: '0'
       variant-flag: NON_CUDA_BUILD
       cmake-args: >-
-        -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=OFF -DWITH_EP=OFF
+        -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=OFF -DWITH_EP=OFF
         -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
-      artifact-prefix: pre-release-non-cuda
+      artifact-prefix: mooncake-wheel-non-cuda-pre-release
+
+  build-non-cuda-arm64:
+    uses: ./.github/workflows/_build-wheel.yaml
+    with:
+      runner: ubuntu-22.04-arm
+      container: pytorch/manylinuxaarch64-builder:cuda12.8
+      cuda: container
+      cmake-generator: Ninja
+      variant-flag: NON_CUDA_BUILD
+      cmake-args: >-
+        -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=OFF -DWITH_EP=OFF
+        -DSTORE_USE_ETCD=ON -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON
+        -DCMAKE_BUILD_TYPE=Release
+      artifact-prefix: mooncake-wheel-non-cuda-arm64-pre-release
 
   build-cuda13:
     uses: ./.github/workflows/_build-wheel.yaml
@@ -49,44 +61,51 @@ jobs:
       runner: ubuntu-22.04
       container: pytorch/manylinux2_28-builder:cuda13.0
       cuda: container
-      build-with-ep: '1'
       variant-flag: CU13_BUILD
       torch-cuda-arch-list: '8.0;9.0'
-      ep-torch-versions: '2.11.0;2.12.0;2.12.1'
+      ep-torch-versions: '2.11.0;2.12.0;2.12.1;2.13.0'
       build-nvlink-allocator: true
       cmake-args: >-
         -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON
         -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
-      artifact-prefix: pre-release-cuda13
+      artifact-prefix: mooncake-wheel-cuda13-pre-release
 
   build-cuda-arm64:
     uses: ./.github/workflows/_build-wheel.yaml
     with:
       runner: ubuntu-22.04-arm
-      cuda: sbsa-12.8
+      container: pytorch/manylinuxaarch64-builder:cuda12.8
+      cuda: container
       cmake-generator: Ninja
       torch-cuda-arch-list: '9.0'
       cmake-args: >-
-        -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=OFF
+        -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=OFF
         -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
-      artifact-prefix: pre-release-cuda-arm64
+      artifact-prefix: mooncake-wheel-arm64-pre-release
 
   build-cuda13-arm64:
     uses: ./.github/workflows/_build-wheel.yaml
     with:
       runner: ubuntu-22.04-arm
-      cuda: sbsa-13.0
+      container: pytorch/manylinuxaarch64-builder:cuda13.0
+      cuda: container
       cmake-generator: Ninja
       variant-flag: CU13_BUILD
       torch-cuda-arch-list: '9.0'
       cmake-args: >-
-        -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=OFF
+        -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=OFF
         -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
-      artifact-prefix: pre-release-cuda13-arm64
+      artifact-prefix: mooncake-wheel-cuda13-arm64-pre-release
 
   validate-release:
     name: Validate release artifacts
-    needs: [build-cuda, build-non-cuda, build-cuda13, build-cuda-arm64, build-cuda13-arm64]
+    needs:
+      - build-cuda
+      - build-non-cuda
+      - build-non-cuda-arm64
+      - build-cuda13
+      - build-cuda-arm64
+      - build-cuda13-arm64
     runs-on: ubuntu-22.04
     permissions:
       contents: read
@@ -98,7 +117,7 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: mooncake-wheel/dist-all
-          pattern: pre-release-*
+          pattern: mooncake-wheel*pre-release*
 
       - name: Prepare wheels for validation
         run: |
@@ -109,8 +128,8 @@ jobs:
           ls -la mooncake-wheel/dist-release/
           wheel_count=$(find mooncake-wheel/dist-release -name "*.whl" | wc -l)
           echo "wheel_count=${wheel_count}" >> "$GITHUB_ENV"
-          if [ "${wheel_count}" -lt 20 ]; then
-            echo "Expected at least 20 wheels (x86: 4 Python versions x 3 variants; arm64: 4 Python versions x 2 CUDA variants), found ${wheel_count}"
+          if [ "${wheel_count}" -lt 24 ]; then
+            echo "Expected at least 24 wheels (4 Python versions x 3 variants x 2 architectures), found ${wheel_count}"
             exit 1
           fi
 
@@ -127,7 +146,7 @@ jobs:
       - name: Upload validated wheels as workflow artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: pre-release-wheels-${{ github.ref_name }}
+          name: mooncake-wheels-pre-release-${{ github.ref_name }}
           path: mooncake-wheel/dist-release/*.whl
           retention-days: 14
 

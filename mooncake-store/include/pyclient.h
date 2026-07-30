@@ -225,7 +225,9 @@ class PyClient {
         const std::shared_ptr<TransferEngine> &transfer_engine,
         const std::string &ipc_socket_path, bool enable_ssd_offload = false,
         const std::string &ssd_offload_path = "",
-        const std::string &tenant_id = "default") = 0;
+        const std::string &tenant_id = "default",
+        bool enable_client_http_server = false,
+        int client_http_port = DEFAULT_CLIENT_HTTP_PORT) = 0;
 
     virtual int setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                             const std::string &server_address,

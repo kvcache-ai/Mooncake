@@ -161,7 +161,7 @@ The following video shows a normal run as described above, with the Target on th
 ## Transfer Engine C/C++ API
 Transfer Engine provides interfaces through the `TransferEngine` class (located in `mooncake-transfer-engine/include/transfer_engine.h`), where the specific data transfer functions for different backends are implemented by the `Transport` class, currently supporting `TcpTransport`, `RdmaTransport`, `EfaTransport` (for AWS EFA), `NVMeoFTransport`, `NvlinkTransport` (for NVIDIA GPUs), `IntraNodeNvlinkTransport` (for NVIDIA GPUs), and `HipTransport` (for AMD GPUs).
 
-For a complete C++ API reference, see [Transfer Engine C++ API Reference](cpp-api.md).
+For a complete C++ API reference, see [Transfer Engine C++ API Reference](../../api-reference/cpp/transfer-engine.md).
 
 ### Data Transfer
 Transfer Engine provides batch-based read/write transfers between segments (DRAM/VRAM/NVMeof). A typical flow is: register local memory, open a target segment, submit a batch, and poll status. Detailed function signatures and usage are documented in the C++ API reference.
@@ -435,7 +435,7 @@ if __name__ == "__main__":
 
 ::::
 
-For more Python APIs, see [Transfer Engine Python API](../../python-api-reference/transfer-engine.md).
+For more Python APIs, see [Transfer Engine Python API](../../api-reference/python/transfer-engine.md).
 
 ### Using C/C++ Interface
 After compiling Mooncake Store, you can move the compiled static library file `libtransfer_engine.a` and the C header file `transfer_engine_c.h` into your own project. There is no need to reference other files under `src/transfer_engine`.
@@ -476,6 +476,7 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_AUTO_GID_MAX_RETRIES` The maximum number of automatic local GID reprobe retries during classic RDMA handshake recovery. Default value 2. Set to 0 to disable automatic GID retry.
 - `MC_LOG_LEVEL` This option can be set as `TRACE`/`INFO`/`WARNING`/`ERROR` (see [glog doc](https://github.com/google/glog/blob/master/docs/logging.md)), and more detailed logs will be output during runtime
 - `MC_DISABLE_METACACHE` Disable local meta cache to prevent transfer failure due to dynamic memory registrations, which may downgrades the performance
+- `MC_TE_METADATA_REFRESH_INTERVAL_SECONDS` Periodically refresh Transfer Engine metadata-derived local caches. Currently refreshes cached remote segment descriptors from the metadata service. Default value 0 disables background polling; callers may still manually invoke `syncSegmentCache()`. Set a positive interval in seconds when peers may re-register the same segment name after restart and cached descriptors must converge automatically
 - `MC_HANDSHAKE_LISTEN_BACKLOG` The backlog size of socket listening for handshaking, default value is 128
 - `MC_HANDSHAKE_CONNECT_TIMEOUT` Connect timeout in seconds for outbound handshake-port requests (QP handshake, probe, notify, metadata exchange), default value is 5. Bounds the stall when the peer address is unreachable; without it, a connect to an unroutable address (e.g. a removed node) blocks for the kernel's full TCP SYN retry cycle, which can take minutes
 - `MC_HANDSHAKE_MAX_LENGTH` The maximum handshake message length in bytes for P2P mode. Valid range: 1MB to 128MB. Default value is 1MB (1048576 bytes). Increase this value when using a single RDMA instance with many registered memory buffers (>10,000) to avoid handshake failures. Example: set to 10485760 for 10MB
@@ -484,6 +485,7 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_REDIS_DB_INDEX` The database index for Redis storage plugin, must be an integer between 0 and 255. Only takes effect when Redis is specified as the metadata server. If not set or invalid, the default value is 0.
 - `MC_FRAGMENT_RATIO ` In RdmaTransport::submitTransferTask, if the last data piece after division is ≤ 1/MC_FRAGMENT_RATIO of the block size, it merges with the previous block to reduce overhead. The default value is 4
 - `MC_ENABLE_DEST_DEVICE_AFFINITY` Enable device affinity for RDMA performance optimization. When enabled, Transfer Engine will prioritize communication with remote NICs that have the same name as local NICs to reduce QP count and improve network performance in rail-optimized topologies. The default value is false
+- `MC_TRACK_RDMA_POSTED_SLICES` Enable RDMA posted-slice tracking for timeout diagnostics. When enabled, CQ timeout logs include stuck transfer groups by peer NIC path, slice count, bytes, oldest post age, and sample addresses. This adds synchronization on the RDMA post and poll hot paths, so it is disabled by default and should be enabled only while diagnosing stuck completions.
 - `MC_ENABLE_PARALLEL_REG_MR` Control parallel memory region registration across multiple RDMA NICs. Valid values: -1 (auto, default), 0 (disabled), 1 (enabled). When set to -1, parallel registration is automatically enabled when multiple RNICs exist and memory has been pre-touched. Note: If memory hasn't been touched before registration, parallel registration can be slower than sequential registration
 - `MC_FORCE_HCA` Force to use RDMA as the active transport, return error if no HCA has been found.
 - `MC_FORCE_MNNVL` Force to use Multi-Node NVLink as the active transport regardless whether RDMA devices are installed.
@@ -497,6 +499,7 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_ENDPOINT_STORE_TYPE` Choose FIFO Endpoint Store (`FIFO`) or Sieve Endpoint Store (`SIEVE`), default is `SIEVE`.
 - `MC_TCP_ENABLE_CONNECTION_POOL` Enable TCP Connection Pool to avoid excessive sockets.
 - `MC_TCP_SLICE_SIZE` The segmentation granularity (in bytes) of TCP transport for splitting large transfers into socket read/write operations. Corresponds to `MC_SLICE_SIZE` for RDMA. Default value 65536 (64KB).
+- `MC_TCP_PROTO` When set to `1`, TCP initiators use the legacy unacknowledged framing even against servers that support acknowledged framing (protocol v2). Under v2 (the default against v2-capable servers), a WRITE completes only after the receiver confirms the payload has been applied to destination memory, and server-side rejections surface as failed transfers instead of silent data loss. Use this variable only as a rollback escape hatch during mixed-version upgrades.
 
 ## C++ API Reference
 

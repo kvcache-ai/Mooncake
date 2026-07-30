@@ -7,6 +7,12 @@
 
 namespace mooncake {
 namespace device {
+
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
+    defined(USE_HYGON) || defined(USE_COREX)
+void EnsureCudaLikeAcceleratorDeviceLinked();
+#endif
+
 namespace {
 
 void RegisterStaticAcceleratorDevice(const AcceleratorDevice& device);
@@ -90,6 +96,10 @@ void RegisterStaticAcceleratorDevice(const AcceleratorDevice& device) {
 }  // namespace
 
 const AcceleratorRegistry& GetAcceleratorRegistry() {
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA) || \
+    defined(USE_HYGON) || defined(USE_COREX)
+    EnsureCudaLikeAcceleratorDeviceLinked();
+#endif
     return MutableRegistry();
 }
 

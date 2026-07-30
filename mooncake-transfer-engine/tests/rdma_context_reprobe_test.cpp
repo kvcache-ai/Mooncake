@@ -19,8 +19,13 @@
 #include <memory>
 #include <string>
 
+#ifdef __linux__
+#include <limits>
+#endif
+
 #include "common.h"
 #include "error.h"
+#include "rdma_test_peers.h"
 #include "transfer_metadata.h"
 #include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_transport/rdma_transport.h"
@@ -39,39 +44,176 @@
 
 using namespace mooncake;
 
-namespace mooncake {
+#ifdef __linux__
+namespace {
 
-class RdmaTransportTestPeer {
-   public:
-    static void bindMetadata(RdmaTransport &transport,
-                             std::shared_ptr<TransferMetadata> metadata,
-                             std::string local_server_name) {
-        transport.metadata_ = std::move(metadata);
-        transport.local_server_name_ = std::move(local_server_name);
-    }
+struct FakeVerbsDevice {
+    bool enabled = false;
+    ibv_device device = {};
+    ibv_device *device_list[2] = {&device, nullptr};
+    ibv_context context = {};
+    size_t alloc_pd_calls = 0;
 };
 
-class RdmaContextTestPeer {
+FakeVerbsDevice fake_verbs;
+
+class FakeVerbsDeviceScope {
    public:
-    static void seedAutoGidState(RdmaContext &context, ibv_context *verbs_ctx,
-                                 uint8_t port, uint16_t lid, const ibv_gid &gid,
-                                 int gid_index) {
-        context.context_ = verbs_ctx;
-        context.port_ = port;
-        context.lid_ = lid;
-        context.gid_ = gid;
-        context.gid_index_ = gid_index;
-        context.auto_gid_selection_enabled_ = true;
+    explicit FakeVerbsDeviceScope(int num_comp_vectors) {
+        fake_verbs.enabled = true;
+        fake_verbs.context = {};
+        fake_verbs.context.num_comp_vectors = num_comp_vectors;
+        fake_verbs.alloc_pd_calls = 0;
     }
 
-    static void disableContextForTeardown(RdmaContext &context) {
-        context.context_ = nullptr;
-    }
+    ~FakeVerbsDeviceScope() { fake_verbs.enabled = false; }
+
+    size_t allocPdCalls() const { return fake_verbs.alloc_pd_calls; }
 };
 
-}  // namespace mooncake
+}  // namespace
+
+#undef ibv_query_port
+
+// Interpose the libibverbs boundary for this test binary so construct() can
+// exercise device validation without RDMA hardware.
+extern "C" {
+
+ibv_device **ibv_get_device_list(int *num_devices) {
+    if (!fake_verbs.enabled) {
+        *num_devices = 0;
+        return nullptr;
+    }
+    *num_devices = 1;
+    return fake_verbs.device_list;
+}
+
+void ibv_free_device_list(ibv_device **) {}
+
+const char *ibv_get_device_name(ibv_device *device) {
+    if (fake_verbs.enabled && device == &fake_verbs.device)
+        return "nonexistent-device";
+    return "";
+}
+
+ibv_context *ibv_open_device(ibv_device *device) {
+    if (fake_verbs.enabled && device == &fake_verbs.device)
+        return &fake_verbs.context;
+    return nullptr;
+}
+
+int ibv_query_port(ibv_context *context, uint8_t,
+                   _compat_ibv_port_attr *compat_port_attr) {
+    if (!fake_verbs.enabled || context != &fake_verbs.context) return EINVAL;
+    auto *port_attr = reinterpret_cast<ibv_port_attr *>(compat_port_attr);
+    *port_attr = {};
+    port_attr->state = IBV_PORT_ACTIVE;
+    port_attr->lid = 1;
+    port_attr->active_mtu = IBV_MTU_4096;
+    return 0;
+}
+
+int ibv_query_device(ibv_context *context, ibv_device_attr *device_attr) {
+    if (!fake_verbs.enabled || context != &fake_verbs.context) return EINVAL;
+    *device_attr = {};
+    device_attr->max_qp = std::numeric_limits<int>::max();
+    device_attr->max_cq = std::numeric_limits<int>::max();
+    device_attr->max_qp_wr = std::numeric_limits<int>::max();
+    device_attr->max_sge = std::numeric_limits<int>::max();
+    device_attr->max_cqe = std::numeric_limits<int>::max();
+    device_attr->max_mr_size = std::numeric_limits<uint64_t>::max();
+    return 0;
+}
+
+int ibv_query_gid(ibv_context *context, uint8_t, int, ibv_gid *gid) {
+    if (!fake_verbs.enabled || context != &fake_verbs.context) return EINVAL;
+    *gid = {};
+    gid->raw[15] = 1;
+    return 0;
+}
+
+ibv_pd *ibv_alloc_pd(ibv_context *context) {
+    if (!fake_verbs.enabled || context != &fake_verbs.context) return nullptr;
+    ++fake_verbs.alloc_pd_calls;
+    return nullptr;
+}
+
+int ibv_close_device(ibv_context *) { return 0; }
+
+}  // extern "C"
+#endif  // __linux__
 
 namespace {
+
+class RdmaContextConstructionTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        // RdmaTransport teardown requires metadata initialized by install().
+        // These tests only need the constructor reference, so match the
+        // existing uninstalled-transport test setup below.
+        transport_ = new RdmaTransport();
+        MC_LSAN_IGNORE_OBJECT(transport_);
+        context_ =
+            std::make_unique<RdmaContext>(*transport_, "nonexistent-device");
+    }
+
+    RdmaTransport *transport_ = nullptr;
+    std::unique_ptr<RdmaContext> context_;
+};
+
+TEST_F(RdmaContextConstructionTest, RejectsZeroCompletionQueuesBeforeSetup) {
+    EXPECT_EQ(context_->construct(/*num_cq_list=*/0,
+                                  /*num_comp_channels=*/1),
+              ERR_INVALID_ARGUMENT);
+    EXPECT_FALSE(RdmaContextTestPeer::hasEndpointStore(*context_));
+}
+
+TEST_F(RdmaContextConstructionTest, RejectsZeroCompletionChannelsBeforeSetup) {
+    EXPECT_EQ(context_->construct(/*num_cq_list=*/1,
+                                  /*num_comp_channels=*/0),
+              ERR_INVALID_ARGUMENT);
+    EXPECT_FALSE(RdmaContextTestPeer::hasEndpointStore(*context_));
+}
+
+TEST_F(RdmaContextConstructionTest,
+       RejectsDeviceWithoutCompletionVectorsBeforeAllocatingResources) {
+#ifdef __linux__
+    FakeVerbsDeviceScope fake_device(/*num_comp_vectors=*/0);
+
+    EXPECT_EQ(context_->construct(/*num_cq_list=*/1,
+                                  /*num_comp_channels=*/1,
+                                  /*port=*/1,
+                                  /*gid_index=*/0),
+              ERR_CONTEXT);
+    EXPECT_EQ(fake_device.allocPdCalls(), 0);
+    RdmaContextTestPeer::disableContextForTeardown(*context_);
+#else
+    GTEST_SKIP() << "Requires Linux libibverbs symbol interposition";
+#endif
+}
+
+TEST(RdmaMemoryRegistrationPolicyTest, LocalOnlyBufferHasNoPublishedRkey) {
+    auto metadata = std::make_shared<TransferMetadata>(P2PHANDSHAKE);
+    auto local_desc = std::make_shared<TransferMetadata::SegmentDesc>();
+    local_desc->name = "local-rdma-segment";
+    local_desc->protocol = "rdma";
+    ASSERT_EQ(metadata->addLocalSegment(LOCAL_SEGMENT_ID, "local-rdma-segment",
+                                        std::move(local_desc)),
+              0);
+
+    RdmaTransport transport;
+    RdmaTransportTestPeer::bindMetadata(transport, metadata,
+                                        "local-rdma-segment");
+    std::array<char, 1> buffer{};
+    ASSERT_EQ(transport.registerLocalMemory(buffer.data(), buffer.size(),
+                                            "cpu:0", false, false),
+              0);
+
+    auto desc = metadata->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(desc, nullptr);
+    ASSERT_EQ(desc->buffers.size(), 1);
+    EXPECT_TRUE(desc->buffers[0].rkey.empty());
+}
 
 ibv_gid makeGid(const std::array<uint8_t, 16> &bytes) {
     ibv_gid gid = {};

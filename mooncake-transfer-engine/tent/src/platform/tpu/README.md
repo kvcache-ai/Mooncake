@@ -59,10 +59,22 @@ int mc_tpu_pjrt_device_numa(int index);
 - **Pointer tokens:** the `const void *` "device pointer" is the stable token the
   serving-engine integration registers with TENT for a TPU buffer (via a
   `tpu:N` location). The adapter owns the mapping from that token to the
-  underlying PJRT buffer.
+  underlying PJRT buffer. The token is **not** the buffer's data and must never
+  be dereferenced — on real PJRT it is an internal handle that is
+  host-readable but reads as unrelated bytes.
+- **Interior pointers:** `ProxyManager` stages a transfer in `chunk_size`
+  (4 MiB) pieces and passes `token + chunk_offset` for every chunk after the
+  first. Classification and copy entrypoints must therefore resolve an address
+  to the registered buffer whose range contains it. An adapter that only matches
+  base addresses makes TENT classify HBM as host memory, and — because the token
+  *is* readable — the staging copy degrades into a `memcpy` of unrelated bytes
+  that reports success. `TpuTransport` defends against this by requiring exactly
+  one TPU-device side per staging hop and failing loudly otherwise.
 
-A mock adapter and a unit test that exercise this ABI on any Linux host live in
-[`../../../tests/tpu/`](../../../tests/tpu/).
+A mock adapter and unit tests that exercise this ABI on any Linux host live in
+[`../../../tests/tpu/`](../../../tests/tpu/). The mock hands out poisoned tokens
+backed by shadow storage, so a copy that bypasses the adapter yields `0xDD`
+rather than accidentally producing the right answer.
 
 ## Not yet included (follow-ups)
 

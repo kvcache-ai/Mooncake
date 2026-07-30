@@ -15,12 +15,15 @@
 #ifndef MULTI_TRANSFER_ENGINE_H_
 #define MULTI_TRANSFER_ENGINE_H_
 
+#include <memory>
+
 #include "memory_location.h"
 #include "multi_transport.h"
 #include "transfer_metadata.h"
 #include "transport/transport.h"
 
 namespace mooncake {
+class ShutdownToken;
 class TransferEngineImpl;
 namespace tent {
 class TransferEngine;
@@ -32,6 +35,11 @@ class P2pTransport;
 class RdmaTransport;
 }  // namespace device
 #endif
+#ifdef USE_NCCL_DEVICE
+namespace device {
+class NcclTransport;
+}  // namespace device
+#endif
 using TransferRequest = Transport::TransferRequest;
 using TransferStatus = Transport::TransferStatus;
 using TransferStatusEnum = Transport::TransferStatusEnum;
@@ -40,6 +48,7 @@ using SegmentID = Transport::SegmentID;
 using BatchID = Transport::BatchID;
 const static BatchID INVALID_BATCH_ID = UINT64_MAX;
 using BufferEntry = Transport::BufferEntry;
+using NicLoadStats = Transport::NicLoadStats;
 
 enum class PeerLiveness : uint8_t {
     Alive = 0,
@@ -72,9 +81,9 @@ class TransferEngine {
 
     TransferEngine(bool auto_discover, const std::vector<std::string>& filter);
 
-    TransferEngine(TransferEngine&&) = default;
+    TransferEngine(TransferEngine&& other) noexcept;
 
-    TransferEngine& operator=(TransferEngine&&) = default;
+    TransferEngine& operator=(TransferEngine&& other) noexcept;
 
     ~TransferEngine();
 
@@ -161,6 +170,8 @@ class TransferEngine {
 
     Status getBatchTransferStatus(BatchID batch_id, TransferStatus& status);
 
+    Status getNicLoadStats(std::vector<NicLoadStats>& stats) const;
+
     Transport* getTransport(const std::string& proto);
 
 #if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
@@ -172,6 +183,10 @@ class TransferEngine {
     device::P2pTransport* getOrCreateP2pTransport(int num_ranks);
     device::RdmaTransport* getOrCreateRdmaTransport(
         const std::vector<std::string>& device_filter = {});
+#endif
+#ifdef USE_NCCL_DEVICE
+    // NCCL is CUDA-only and independent of the host network transport.
+    device::NcclTransport* getOrCreateNcclTransport();
 #endif
 
     /**
@@ -198,9 +213,13 @@ class TransferEngine {
 
     std::shared_ptr<Topology> getLocalTopology();
 
+    void enableGracefulShutdown();
+    std::string showLinks(bool json = false) const;
+
    private:
     std::shared_ptr<TransferEngineImpl> impl_;
     std::shared_ptr<mooncake::tent::TransferEngine> impl_tent_;
+    std::shared_ptr<ShutdownToken> shutdown_token_;
     bool use_tent_{false};
 };
 }  // namespace mooncake

@@ -80,7 +80,7 @@ ClientBufferAllocator::~ClientBufferAllocator() {
         if (use_hugepage_) {
             free_buffer_mmap_memory(buffer_, buffer_size_);
         } else {
-            free_memory(protocol, buffer_);
+            free_memory(protocol, buffer_, use_spdk_dma_);
         }
     }
 }
