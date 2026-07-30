@@ -60,8 +60,26 @@ Status CudaPlatform::copy(void* dst, void* src, size_t length) {
     // as the latter relies on the legacy default stream and can introduce
     // unintended synchronization or even deadlocks in downstream
     // components (e.g. mooncake-pg).
+    //
+    // The stream must live on the CUDA device that owns the device-side buffer.
+    // cudaMemcpyAsync routes the copy through its stream's device context, so a
+    // stream on the wrong device fails without peer access. Control-plane RPC
+    // worker threads default to cuda:0, but a registered buffer may live on
+    // cuda:R (R != 0); acquiring the stream on the buffer's device makes the
+    // copy route correctly without mutating the calling thread's current
+    // device. Fall back to the current device for host-to-host copies.
+    int device_id = CUDAStreamPool::kCurrentDevice;
+    cudaPointerAttributes attr{};
+    if (cudaPointerGetAttributes(&attr, dst) == cudaSuccess &&
+        attr.type == cudaMemoryTypeDevice) {
+        device_id = attr.device;
+    } else if (cudaPointerGetAttributes(&attr, src) == cudaSuccess &&
+               attr.type == cudaMemoryTypeDevice) {
+        device_id = attr.device;
+    }
+
     CUDAStreamHandle stream;
-    CHECK_STATUS(getStreamFromPool(stream));
+    CHECK_STATUS(getStreamFromPool(stream, device_id));
     CHECK_CUDA(
         cudaMemcpyAsync(dst, src, length, cudaMemcpyDefault, stream.get()));
     CHECK_CUDA(cudaStreamSynchronize(stream.get()));
