@@ -29,6 +29,34 @@ make -j
 sudo make install
 ```
 
+### Build with VRAM Segment
+
+To enable VRAM Segment, install CUDA toolkit and build Mooncake with 
+`USE_VRAM_SEGMENT` enabled:
+
+```bash
+sudo bash dependencies.sh 
+
+mkdir build
+cd build
+cmake .. -DUSE_VRAM_SEGMENT=ON
+make -j
+sudo make install
+```
+
+If NVLink is available in your environment, you can also enable it 
+with `-DUSE_INTRA_NVLINK=ON`:
+
+```bash
+sudo bash dependencies.sh
+
+mkdir build
+cd build
+cmake .. -DUSE_VRAM_SEGMENT=ON -DUSE_INTRA_NVLINK=ON
+make -j
+sudo make install
+```
+
 ### Build with NVMe-oF SSD Pool
 
 To enable the NVMe-oF SSD pool, install the SPDK dependencies and build
