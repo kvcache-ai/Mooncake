@@ -18,6 +18,7 @@
 #include "file_interface.h"
 #include "mutex.h"
 #include "offset_allocator/offset_allocator.h"
+#include "thread_pool.h"
 #include "types.h"
 
 namespace mooncake {
@@ -1154,6 +1155,12 @@ class BucketStorageBackend : public StorageBackendInterface {
     std::set<std::pair<int64_t, int64_t>> GUARDED_BY(mutex_) lru_index_;
     int64_t GUARDED_BY(mutex_) next_bucket_ = -1;
     BucketBackendConfig bucket_backend_config_;
+
+    // Lazy-init thread pool for parallel BatchLoad.
+    // Created on first use when MC_BATCH_LOAD_THREADS > 1.
+    static int batch_load_threads();
+    static int bucket_read_threads();
+    mutable std::unique_ptr<ThreadPool> batch_load_pool_;
 
     mutable Mutex offloading_mutex_;
     std::unordered_map<std::string, int64_t> GUARDED_BY(offloading_mutex_)

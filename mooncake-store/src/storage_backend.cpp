@@ -18,6 +18,9 @@
 #include <thread>
 #include <vector>
 #include <algorithm>
+#include <future>
+
+#include "thread_pool.h"
 #include <chrono>
 #include <unordered_set>
 
@@ -1858,6 +1861,27 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchQuery(
     return {};
 }
 
+BucketStorageBackend::BucketStorageBackend(
+    const FileStorageConfig& file_storage_config,
+    const BucketBackendConfig& bucket_backend_config)
+    : StorageBackendInterface(file_storage_config),
+      bucket_backend_config_(bucket_backend_config) {
+    const int n = std::max(batch_load_threads(), bucket_read_threads());
+    if (n > 1) {
+        batch_load_pool_ = std::make_unique<ThreadPool>(static_cast<size_t>(n));
+    }
+}
+
+int BucketStorageBackend::batch_load_threads() {
+    const char* env = std::getenv("MC_BATCH_LOAD_THREADS");
+    return env ? std::max(0, std::atoi(env)) : 0;
+}
+
+int BucketStorageBackend::bucket_read_threads() {
+    const char* env = std::getenv("MC_BUCKET_READ_THREADS");
+    return env ? std::max(0, std::atoi(env)) : 0;
+}
+
 tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
     std::unordered_map<std::string, Slice>& batch_object) {
     // Step 1: Build read plan by copying metadata under lock
@@ -1931,94 +1955,231 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
     // which remain alive until this function returns (~line bucket_guards
     // destructor), keeping inflight_reads_ > 0 throughout the I/O phase.
 
-    // Step 2: Perform IO without holding any locks
-    for (auto& [bucket_id, read_plans] : bucket_read_plans) {
-        // Open file for this bucket (cheap syscall, no lock needed)
-        auto filepath_res = GetBucketDataPath(bucket_id);
-        if (!filepath_res) {
-            LOG(ERROR) << "Failed to get bucket data path, bucket_id="
-                       << bucket_id;
-            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-        }
+    // Step 2: Perform IO without holding any locks.
+    // When MC_BATCH_LOAD_THREADS > 1, dispatch each bucket's reads to a
+    // thread pool for parallelism (buckets are independent files).
+    const int batch_threads = batch_load_threads();
+    const int bucket_threads = bucket_read_threads();
 
-        auto file_res = OpenFile(filepath_res.value(), FileMode::Read);
-        if (!file_res) {
-            LOG(ERROR) << "Failed to open bucket file: "
-                       << filepath_res.value();
-            return tl::make_unexpected(file_res.error());
-        }
-        auto& file = file_res.value();
+    if (batch_threads > 1 && bucket_read_plans.size() > 1) {
+        ThreadPool& pool = *batch_load_pool_;
+        std::vector<std::future<ErrorCode>> futures;
+        futures.reserve(bucket_read_plans.size());
 
-        // Read each key's data
-        for (const auto& plan : read_plans) {
-            int64_t actual_offset = plan.offset + plan.key_size;
-            tl::expected<size_t, ErrorCode> read_res;
-
-#ifdef USE_URING
-            // Try to use read_aligned for O_DIRECT I/O if file is UringFile
-            UringFile* uring_file = dynamic_cast<UringFile*>(file.get());
-            if (uring_file != nullptr) {
-                // Calculate aligned read range
-                int64_t aligned_offset =
-                    align_down(actual_offset, kDirectIOAlignment);
-                int64_t data_end =
-                    actual_offset + static_cast<int64_t>(plan.dest_slice.size);
-                int64_t aligned_end = static_cast<int64_t>(align_up(
-                    static_cast<size_t>(data_end), kDirectIOAlignment));
-                size_t aligned_size =
-                    static_cast<size_t>(aligned_end - aligned_offset);
-                int64_t offset_in_buffer = actual_offset - aligned_offset;
-
-                // Zero-copy path: read directly into the slice buffer.
-                // dest_slice.ptr is 4096-aligned and oversized (from
-                // AllocateBatch) to accommodate the full aligned read range.
-                read_res = uring_file->read_aligned(
-                    plan.dest_slice.ptr, aligned_size, aligned_offset);
-
-                if (read_res) {
-                    // Verify the aligned read returned enough bytes
-                    // to cover the actual data region.  read_aligned
-                    // reads the full aligned range [aligned_offset,
-                    // aligned_end); the caller-visible data starts at
-                    // offset_in_buffer into that buffer and spans
-                    // plan.dest_slice.size bytes.
-                    size_t min_required =
-                        static_cast<size_t>(offset_in_buffer) +
-                        plan.dest_slice.size;
-                    if (read_res.value() < min_required) {
-                        LOG(ERROR)
-                            << "read_aligned short read for key: " << plan.key
-                            << ", bucket_id=" << plan.bucket_id
-                            << ", expected at least: " << min_required
-                            << " (aligned_size=" << aligned_size
-                            << ", data_size=" << plan.dest_slice.size << ")"
-                            << ", got: " << read_res.value();
-                        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        for (auto& [bucket_id, read_plans] : bucket_read_plans) {
+            using task_type = std::packaged_task<ErrorCode()>;
+            auto task = std::make_shared<task_type>(
+                [this, bucket_id,
+                 plans = std::move(read_plans),
+                 &batch_object]() -> ErrorCode {
+                    auto filepath_res = GetBucketDataPath(bucket_id);
+                    if (!filepath_res) {
+                        LOG(ERROR) << "Failed to get bucket data path, bucket_id="
+                                   << bucket_id;
+                        return ErrorCode::INTERNAL_ERROR;
                     }
-                    // Adjust ptr to point to actual data start
-                    // (zero-copy: no memcpy, buffer was oversized by
-                    // AllocateBatch to accommodate the aligned read)
-                    batch_object.at(plan.key).ptr =
-                        static_cast<char*>(plan.dest_slice.ptr) +
-                        offset_in_buffer;
-                    // Normalize read_res so the common validation
-                    // below passes.  The real short-read check was
-                    // already done above (min_required).
-                    read_res = plan.dest_slice.size;
-                }
-            } else
+                    auto file_res = OpenFile(filepath_res.value(), FileMode::Read);
+                    if (!file_res) {
+                        LOG(ERROR) << "Failed to open bucket file: "
+                                   << filepath_res.value();
+                        return file_res.error();
+                    }
+                    auto& file = file_res.value();
+
+                    for (const auto& plan : plans) {
+                        int64_t actual_offset = plan.offset + plan.key_size;
+                        tl::expected<size_t, ErrorCode> read_res;
+#ifdef USE_URING
+                        UringFile* uring_file = dynamic_cast<UringFile*>(file.get());
+                        if (uring_file != nullptr) {
+                            int64_t aligned_offset =
+                                align_down(actual_offset, kDirectIOAlignment);
+                            int64_t data_end =
+                                actual_offset + static_cast<int64_t>(plan.dest_slice.size);
+                            int64_t aligned_end = static_cast<int64_t>(align_up(
+                                static_cast<size_t>(data_end), kDirectIOAlignment));
+                            size_t aligned_size =
+                                static_cast<size_t>(aligned_end - aligned_offset);
+                            int64_t offset_in_buffer = actual_offset - aligned_offset;
+                            read_res = uring_file->read_aligned(
+                                plan.dest_slice.ptr, aligned_size, aligned_offset);
+                            if (read_res) {
+                                // Verify the aligned read returned enough bytes
+                                // to cover the actual data region.  read_aligned
+                                // reads the full aligned range [aligned_offset,
+                                // aligned_end); the caller-visible data starts at
+                                // offset_in_buffer into that buffer and spans
+                                // plan.dest_slice.size bytes.
+                                size_t min_required =
+                                    static_cast<size_t>(offset_in_buffer) +
+                                    plan.dest_slice.size;
+                                if (read_res.value() < min_required) {
+                                    LOG(ERROR)
+                                        << "read_aligned short read for key: "
+                                        << plan.key
+                                        << ", bucket_id=" << plan.bucket_id
+                                        << ", expected at least: " << min_required
+                                        << " (aligned_size=" << aligned_size
+                                        << ", data_size=" << plan.dest_slice.size
+                                        << ")"
+                                        << ", got: " << read_res.value();
+                                    return tl::make_unexpected(
+                                        ErrorCode::FILE_READ_FAIL);
+                                }
+                                // Adjust ptr to point to actual data start
+                                // (zero-copy: no memcpy, buffer was oversized
+                                // by AllocateBatch to accommodate the aligned
+                                // read)
+                                batch_object.at(plan.key).ptr =
+                                    static_cast<char*>(plan.dest_slice.ptr) +
+                                    offset_in_buffer;
+                                // Normalize read_res so the common validation
+                                // below passes.  The real short-read check was
+                                // already done above (min_required).
+                                read_res = plan.dest_slice.size;
+                            }
+                        } else
 #endif
-            {
-                // Fallback to vector_read for non-UringFile
-                iovec iov{plan.dest_slice.ptr, plan.dest_slice.size};
-                read_res = file->vector_read(&iov, 1, actual_offset);
+                        {
+                            iovec iov{plan.dest_slice.ptr, plan.dest_slice.size};
+                            read_res = file->vector_read(&iov, 1, actual_offset);
+                        }
+                        if (!read_res) {
+                            LOG(ERROR) << "vector_read failed for key: " << plan.key
+                                       << ", bucket_id=" << plan.bucket_id
+                                       << ", error: " << read_res.error();
+                            return read_res.error();
+                        }
+                        if (read_res.value() != plan.dest_slice.size) {
+                            LOG(ERROR) << "Read size mismatch for key: " << plan.key
+                                       << ", expected: " << plan.dest_slice.size
+                                       << ", got: " << read_res.value();
+                            return ErrorCode::FILE_READ_FAIL;
+                        }
+                    }
+                    return ErrorCode::OK;
+                });
+            futures.push_back(task->get_future());
+            pool.enqueue([task]() { (*task)(); });
+        }
+
+        // Wait for all bucket reads to complete.
+        ErrorCode first_err = ErrorCode::OK;
+        for (auto& f : futures) {
+            ErrorCode err = f.get();
+            if (first_err == ErrorCode::OK && err != ErrorCode::OK)
+                first_err = err;
+        }
+        if (first_err != ErrorCode::OK)
+            return tl::make_unexpected(first_err);
+    } else {
+        for (auto& [bucket_id, read_plans] : bucket_read_plans) {
+            auto filepath_res = GetBucketDataPath(bucket_id);
+            if (!filepath_res) {
+                LOG(ERROR) << "Failed to get bucket data path, bucket_id="
+                           << bucket_id;
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
             }
 
-            if (!read_res) {
-                LOG(ERROR) << "vector_read failed for key: " << plan.key
-                           << ", bucket_id=" << plan.bucket_id
-                           << ", error: " << read_res.error();
-                return tl::make_unexpected(read_res.error());
+            auto file_res = OpenFile(filepath_res.value(), FileMode::Read);
+            if (!file_res) {
+                LOG(ERROR) << "Failed to open bucket file: "
+                           << filepath_res.value();
+                return tl::make_unexpected(file_res.error());
+            }
+            if (bucket_threads > 1 && read_plans.size() > 1) {
+                // Intra-bucket chunked reads via thread pool.
+                // All chunks share the same fd (pread is thread-safe).
+                StorageFile* file_ptr = file_res->get();
+                ThreadPool& pool = *batch_load_pool_;
+                const size_t chunk_size =
+                    (read_plans.size() + bucket_threads - 1) /
+                    bucket_threads;
+                std::vector<std::future<ErrorCode>> futures;
+                for (size_t start = 0; start < read_plans.size();
+                     start += chunk_size) {
+                    size_t end =
+                        std::min(start + chunk_size, read_plans.size());
+                    auto task = std::make_shared<
+                        std::packaged_task<ErrorCode()>>(
+                        [file_ptr, &read_plans, start, end,
+                         &batch_object,
+                         bucket_id]() -> ErrorCode {
+                            for (size_t j = start; j < end; ++j) {
+                                const auto& plan = read_plans[j];
+                                iovec iov{plan.dest_slice.ptr,
+                                          plan.dest_slice.size};
+                                auto rr = file_ptr->vector_read(
+                                    &iov, 1,
+                                    plan.offset + plan.key_size);
+                                if (!rr) {
+                                    LOG(ERROR) << "vector_read failed: "
+                                               << plan.key << " bucket_id="
+                                               << bucket_id
+                                               << " error=" << rr.error();
+                                    return rr.error();
+                                }
+                                if (rr.value() != plan.dest_slice.size) {
+                                    LOG(ERROR) << "Read size mismatch: "
+                                               << plan.key << " expected="
+                                               << plan.dest_slice.size
+                                               << " got=" << rr.value();
+                                    return ErrorCode::FILE_READ_FAIL;
+                                }
+                            }
+                            return ErrorCode::OK;
+                        });
+                    futures.push_back(task->get_future());
+                    pool.enqueue([task]() { (*task)(); });
+                }
+                ErrorCode first_err = ErrorCode::OK;
+                for (auto& f : futures) {
+                    ErrorCode err = f.get();
+                    if (first_err == ErrorCode::OK && err != ErrorCode::OK)
+                        first_err = err;
+                }
+                if (first_err != ErrorCode::OK)
+                    return tl::make_unexpected(first_err);
+            } else {
+                auto& file = file_res.value();
+
+            for (const auto& plan : read_plans) {
+                int64_t actual_offset = plan.offset + plan.key_size;
+                tl::expected<size_t, ErrorCode> read_res;
+
+#ifdef USE_URING
+                UringFile* uring_file = dynamic_cast<UringFile*>(file.get());
+                if (uring_file != nullptr) {
+                    int64_t aligned_offset =
+                        align_down(actual_offset, kDirectIOAlignment);
+                    int64_t data_end =
+                        actual_offset + static_cast<int64_t>(plan.dest_slice.size);
+                    int64_t aligned_end = static_cast<int64_t>(align_up(
+                        static_cast<size_t>(data_end), kDirectIOAlignment));
+                    size_t aligned_size =
+                        static_cast<size_t>(aligned_end - aligned_offset);
+                    int64_t offset_in_buffer = actual_offset - aligned_offset;
+                    read_res = uring_file->read_aligned(
+                        plan.dest_slice.ptr, aligned_size, aligned_offset);
+                    if (read_res) {
+                        batch_object.at(plan.key).ptr =
+                            static_cast<char*>(plan.dest_slice.ptr) +
+                            offset_in_buffer;
+                        read_res = plan.dest_slice.size;
+                    }
+                } else
+#endif
+                {
+                    iovec iov{plan.dest_slice.ptr, plan.dest_slice.size};
+                    read_res = file->vector_read(&iov, 1, actual_offset);
+                }
+
+                if (!read_res) {
+                    LOG(ERROR) << "vector_read failed for key: " << plan.key
+                               << ", bucket_id=" << plan.bucket_id
+                               << ", error: " << read_res.error();
+                    return tl::make_unexpected(read_res.error());
+                }
             }
 
             if (read_res.value() != plan.dest_slice.size) {
@@ -2026,6 +2187,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                            << ", expected: " << plan.dest_slice.size
                            << ", got: " << read_res.value();
                 return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            }
             }
         }
     }
