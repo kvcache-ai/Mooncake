@@ -9824,7 +9824,7 @@ MasterService::MetadataSerializer::DeserializeMetadata(
         std::chrono::system_clock::time_point(
             std::chrono::milliseconds(put_start_time_timestamp)),
         size, std::move(replicas), enable_soft_pin, is_hard_pinned, data_type,
-        group_id, "default", "", std::move(agent_hints));
+        group_id, TenantId::Default(), "", std::move(agent_hints));
     metadata->lease_timeout = std::chrono::system_clock::time_point(
         std::chrono::milliseconds(lease_timestamp));
 
