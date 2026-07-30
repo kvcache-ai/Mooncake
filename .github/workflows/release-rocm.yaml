@@ -7,7 +7,11 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing release tag to backfill (e.g. v0.3.12)'
+        # Only tags whose tree already contains ROCm support (the HIP_BUILD
+        # variant in scripts/build_wheel.sh, i.e. this PR onward) can be built.
+        # Tags predating ROCm support are rejected by the guard below, since
+        # they would produce a mislabeled default-named wheel.
+        description: 'Release tag to (re)build the ROCm wheel for (must contain HIP_BUILD support)'
         required: true
         type: string
 
@@ -211,14 +215,23 @@ jobs:
           echo "Collected wheels for release:"
           ls -la mooncake-wheel/dist-release/
 
-      - name: Upload wheels to GitHub Release
-        uses: softprops/action-gh-release@v1
-        with:
-          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
-          files: mooncake-wheel/dist-release/*.whl
-
+      # Publish to PyPI BEFORE attaching to the GitHub Release, so an
+      # authentication/config failure fails the job without leaving a
+      # dangling GitHub Release with no corresponding PyPI upload.
+      #
+      # PREREQUISITE (one-time, maintainer/PyPI-owner action): this uses OIDC
+      # (no API token), so PyPI must have a Trusted Publisher configured for
+      # the NEW project `mooncake-transfer-engine-rocm` with identity
+      # owner/repo `kvcache-ai/Mooncake`, workflow `release-rocm.yaml`, and
+      # environment `pypi`. Without it the publish step fails.
       - name: Publish package to PyPI
         if: github.repository == 'kvcache-ai/Mooncake'
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: mooncake-wheel/dist-release/
+
+      - name: Upload wheels to GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          files: mooncake-wheel/dist-release/*.whl
