@@ -344,6 +344,67 @@ int EfaContext::deconstruct() {
     return 0;
 }
 
+#if defined(USE_CUDA)
+// A silent failure here resurfaces as the provider's opaque "Operation not
+// supported" from fi_mr_regattr(), which is the attribution problem this whole
+// helper exists to remove -- so name the driver call that actually failed.
+static void logCudaFailure(const char* call, CUresult ret, int device_ordinal) {
+    const char* err = nullptr;
+    cuGetErrorString(ret, &err);
+    LOG(WARNING) << "EFA: " << call << " failed for CUDA device "
+                 << device_ordinal << ": " << (err ? err : "unknown") << " ("
+                 << ret
+                 << "); GPU memory registration may fail with a bare"
+                    " \"Operation not supported\"";
+}
+
+// Make `device_ordinal`'s primary context current on the calling thread, unless
+// a context for that same device already is.
+//
+// Why a context is needed at all: fi_mr_regattr() on FI_HMEM_CUDA memory
+// reaches libfabric's cuda_get_dmabuf_fd(), which calls the driver API
+// cuMemGetHandleForAddressRange() and does no context management of its own.
+// The export also runs against the CURRENT context, so a context belonging to
+// another device is no better than none -- both end up as a bare "Operation not
+// supported" from the provider.
+//
+// Who arrives here without the right context: registerLocalMemoryBatch() runs
+// one std::async(std::launch::async) per buffer and registerLocalMemory() can
+// fan out one std::thread per NIC, so a registering thread may have touched no
+// CUDA API at all; and since std::async may reuse threads, one thread can
+// register buffers on several devices in turn.
+//
+// cuDevicePrimaryCtxRetain() returns the same primary context the CUDA runtime
+// uses, so this attaches to the process's existing context rather than creating
+// another.  The retain is intentionally not released: the primary context
+// outlives every registration, and dropping the last reference here would tear
+// down the context the rest of the process is using.
+static void bindCudaContextIfNeeded(int device_ordinal) {
+    CUdevice want;
+    CUresult ret = cuDeviceGet(&want, device_ordinal);
+    if (ret != CUDA_SUCCESS) {
+        logCudaFailure("cuDeviceGet", ret, device_ordinal);
+        return;
+    }
+
+    CUcontext cur = nullptr;
+    CUdevice cur_dev;
+    if (cuCtxGetCurrent(&cur) == CUDA_SUCCESS && cur != nullptr &&
+        cuCtxGetDevice(&cur_dev) == CUDA_SUCCESS && cur_dev == want)
+        return;
+
+    CUcontext primary = nullptr;
+    ret = cuDevicePrimaryCtxRetain(&primary, want);
+    if (ret != CUDA_SUCCESS) {
+        logCudaFailure("cuDevicePrimaryCtxRetain", ret, device_ordinal);
+        return;
+    }
+    ret = cuCtxSetCurrent(primary);
+    if (ret != CUDA_SUCCESS)
+        logCudaFailure("cuCtxSetCurrent", ret, device_ordinal);
+}
+#endif
+
 int EfaContext::registerMemoryRegionInternal(void* addr, size_t length,
                                              int access,
                                              EfaMemoryRegionMeta& mrMeta) {
@@ -388,6 +449,9 @@ int EfaContext::registerMemoryRegionInternal(void* addr, size_t length,
 
     int ret;
     if (iface != FI_HMEM_SYSTEM) {
+#if defined(USE_CUDA)
+        bindCudaContextIfNeeded(device_ordinal);
+#endif
         // GPU memory: use fi_mr_regattr with explicit iface and device
         struct iovec iov = {.iov_base = addr, .iov_len = length};
         struct fi_mr_attr attr = {};

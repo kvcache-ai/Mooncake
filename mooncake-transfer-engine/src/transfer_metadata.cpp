@@ -673,8 +673,8 @@ decodeMultiProtocolSegmentDesc(Json::Value &segmentJSON,
                     static_cast<decltype(buffer.lkey)::value_type>(
                         lkeyJSON.asUInt64()));
             if (buffer.name.empty() || !buffer.addr || !buffer.length ||
-                buffer.rkey.empty() ||
-                buffer.rkey.size() != buffer.lkey.size()) {
+                (!buffer.rkey.empty() &&
+                 buffer.rkey.size() != buffer.lkey.size())) {
                 LOG(WARNING)
                     << "Corrupted segment descriptor, name " << segment_name
                     << " buffer_protocol " << buffer_protocol << ", "
@@ -797,8 +797,8 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
                     static_cast<decltype(buffer.lkey)::value_type>(
                         lkeyJSON.asUInt64()));
             if (buffer.name.empty() || !buffer.addr || !buffer.length ||
-                buffer.rkey.empty() ||
-                buffer.rkey.size() != buffer.lkey.size()) {
+                (!buffer.rkey.empty() &&
+                 buffer.rkey.size() != buffer.lkey.size())) {
                 LOG(WARNING)
                     << "Corrupted segment descriptor, name " << segment_name
                     << " protocol " << desc->protocol << ", " << buffer.name
