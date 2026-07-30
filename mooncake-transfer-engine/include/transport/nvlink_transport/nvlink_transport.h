@@ -11,12 +11,14 @@
 #include <mutex>
 #include <queue>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <utility>
 
 #include "common/hash_utils.h"
 #include "topology.h"
 #include "transfer_metadata.h"
+#include "transport/nvlink_transport/nvlink_host_numa_allocation.h"
 #include "transport/transport.h"
 
 namespace mooncake {
@@ -65,6 +67,8 @@ class NvlinkTransport : public Transport {
     const char* getName() const override { return "nvlink"; }
 
    private:
+    friend class NvlinkTransportTestPeer;
+
     std::atomic_bool running_;
 
     struct OpenedShmEntry {
@@ -78,6 +82,32 @@ class NvlinkTransport : public Transport {
     bool use_fabric_mem_;
 
     std::mutex register_mutex_;
+#if defined(USE_MNNVL) && defined(USE_CUDA) && CUDA_VERSION >= 12030
+    using AddLocalMemoryBufferOp = std::function<int(const BufferDesc&, bool)>;
+    using RemoveLocalMemoryBufferOp = std::function<int(void*, bool)>;
+    using UpdateLocalSegmentDescOp = std::function<int()>;
+
+    struct HostNumaRegistration {
+        CUmemGenericAllocationHandle handle;
+        NvlinkHostNumaAllocation::DriverApi api;
+        bool metadata_removed_locally = false;
+        bool metadata_cleanup_complete = false;
+    };
+    std::unordered_map<void*, HostNumaRegistration>
+        host_numa_registration_handles_;
+
+    int registerHostNumaMemoryLocked(
+        void* addr, size_t length, const std::string& location,
+        bool update_metadata,
+        const NvlinkHostNumaAllocation::DriverApi& driver_api,
+        const AddLocalMemoryBufferOp& add_buffer,
+        const RemoveLocalMemoryBufferOp& remove_buffer,
+        const UpdateLocalSegmentDescOp& update_segment);
+    int unregisterHostNumaMemoryLocked(
+        void* addr, bool update_metadata,
+        const RemoveLocalMemoryBufferOp& remove_buffer,
+        const UpdateLocalSegmentDescOp& update_segment);
+#endif
 };
 
 }  // namespace mooncake
