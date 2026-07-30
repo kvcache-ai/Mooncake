@@ -3,6 +3,8 @@
 #ifdef STORE_USE_REDIS
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -18,16 +20,15 @@ namespace mooncake {
  * @brief Redis helper for leader election, mirroring EtcdHelper's election
  * role.
  *
- * Uses SET NX EX for atomic election, Lua scripts for lease renewal,
- * and Pub/Sub + fallback polling for watching leader key expiration.
+ * Uses Lua scripts for atomic election and lease renewal, and Pub/Sub with
+ * fallback polling for watching leader key expiration.
  *
  * Only uses standard Redis commands + Lua scripts.
  *
  * Thread safety: election_ctx_ is shared between KeepLeader (background
  * thread) and GetMasterView (called from any thread). All accesses to
- * election_ctx_ are serialized via election_mutex_. The subscribe and
- * polling connections are used only from single threads and do not need
- * mutual exclusion.
+ * election_ctx_ are serialized via election_mutex_. subscribe_ctx_ is
+ * serialized via subscribe_mutex_; polling connections are thread-local.
  */
 class RedisElectionHelper {
    public:
@@ -74,6 +75,9 @@ class RedisElectionHelper {
      */
     void CancelElection();
 
+    /** Cancel blocking operations and wait until they have exited. */
+    void Shutdown();
+
     /**
      * @brief Get current leader's address and version from Redis.
      * @param master_address Output: leader address.
@@ -101,12 +105,15 @@ class RedisElectionHelper {
    private:
     // === Internal helpers ===
 
+    enum class ElectionAttemptResult { ELECTED, CONTENDED, ERROR };
+
     /**
-     * @brief Try to elect self once. Returns true if we won.
+     * @brief Atomically try to elect self once and return the outcome.
      *        Caller must hold election_mutex_.
      */
-    bool TryElectOnce(const std::string& master_address,
-                      ViewVersionId& out_epoch);
+    ElectionAttemptResult TryElectOnce(const std::string& master_address,
+                                       ViewVersionId& out_epoch,
+                                       std::string& existing_value);
 
     /**
      * @brief Watch leader key until it expires (replaces etcd
@@ -129,11 +136,9 @@ class RedisElectionHelper {
      */
     void WatchLeaderPolling();
 
-    /**
-     * @brief Publish a leader event on the notification channel.
-     *        Caller must hold election_mutex_.
-     */
-    void PublishLeaderEvent(const std::string& event);
+    /** Publish a best-effort wake-up after a successful election. */
+    void PublishLeaderEvent(const std::string& master_address,
+                            ViewVersionId epoch);
 
     /**
      * @brief Reconnect a broken redisContext.
@@ -141,19 +146,21 @@ class RedisElectionHelper {
      */
     bool Reconnect(redisContext*& ctx);
 
+    /** Caller must hold subscribe_mutex_. */
+    bool ReconnectSubscribeLocked(bool record_metric = true);
+
+    bool BeginBlockingOperation();
+    bool BeginKeepAliveOperation();
+    void EndBlockingOperation();
+    void EndKeepAliveOperation();
+    bool WaitForElectionCancellation(std::chrono::milliseconds timeout);
+    bool WaitForKeepAliveCancellation(std::chrono::milliseconds timeout);
+
     /**
      * @brief Create a new authenticated connection to Redis.
      *        Used internally by Connect and for the polling connection.
      */
     redisContext* CreateConnection();
-
-    /**
-     * @brief Drain any pending replies from a subscribe context.
-     *        After UNSUBSCRIBE, buffered message frames may remain in the
-     *        socket. This function reads and discards them so that the next
-     *        SUBSCRIBE command receives a clean reply.
-     */
-    void DrainSubscribeContext();
 
     // === Redis key naming ===
 
@@ -171,7 +178,18 @@ class RedisElectionHelper {
         nullptr;  // For election + keepalive + GetMasterView
     redisContext* subscribe_ctx_ =
         nullptr;  // Dedicated connection for SUBSCRIBE (single-threaded)
-    mutable std::mutex election_mutex_;  // Protects election_ctx_ access
+
+    // Locking policy:
+    // - Keep the Redis context locks separate because SUBSCRIBE may block for
+    //   a long time and must not stall election commands.
+    // - operation_mutex_ coordinates Connect/Shutdown with blocking-operation
+    //   lifetimes. When locks are nested, acquire it before a context lock.
+    // - cancel_mutex_ is only for cancellation waits and is never nested with
+    //   a context lock.
+    // These control-plane paths are low frequency; revisit the split only if
+    // profiling shows contention or the connection ownership model changes.
+    mutable std::mutex election_mutex_;   // Protects election_ctx_ access
+    mutable std::mutex subscribe_mutex_;  // Protects subscribe_ctx_ access
 
     // === Configuration ===
 
@@ -190,6 +208,14 @@ class RedisElectionHelper {
         false};  // Cancel ElectLeader/WatchLeader
     std::atomic<int> next_lease_id_{
         1};  // Local monotonic counter for lease IDs
+
+    std::mutex cancel_mutex_;
+    std::condition_variable cancel_cv_;
+    std::mutex operation_mutex_;
+    std::condition_variable operation_cv_;
+    size_t active_blocking_operations_{0};
+    bool keep_alive_operation_active_{false};
+    bool shutting_down_{false};
 };
 
 }  // namespace mooncake
