@@ -338,9 +338,35 @@ void OrderedOpLogWriter::Start() {
             constexpr auto kInitialRetryDelay = std::chrono::milliseconds(1);
             constexpr auto kMaxRetryDelay = std::chrono::milliseconds(1000);
             auto retry_delay = kInitialRetryDelay;
+            std::optional<std::chrono::steady_clock::time_point> retry_deadline;
+            bool retry_attempt = false;
 
             while (true) {
                 TestFailPoint::Wait("batch_before_txn");
+                if (retry_attempt) {
+                    TerminalCallback terminal_callback;
+                    std::optional<OrderedOpLogWriterTerminalState>
+                        terminal_state;
+                    std::unique_lock<std::mutex> lock(impl_->mutex);
+                    if (impl_->stop_requested) {
+                        return;
+                    }
+                    if (retry_deadline.has_value() &&
+                        std::chrono::steady_clock::now() >= *retry_deadline) {
+                        if (impl_->LatchTerminalState(
+                                impl_->last_error,
+                                OrderedOpLogWriterTerminalReason::
+                                    kRetryTimeout)) {
+                            terminal_callback = impl_->terminal_callback;
+                            terminal_state = impl_->terminal_state;
+                        }
+                        lock.unlock();
+                        if (terminal_callback) {
+                            terminal_callback(*terminal_state);
+                        }
+                        return;
+                    }
+                }
 #ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
                 const auto txn_started_at = Impl::Clock::now();
 #endif
@@ -428,6 +454,11 @@ void OrderedOpLogWriter::Start() {
 #endif
                     impl_->last_error = err;
                     impl_->accepting = false;
+                    if (!retry_deadline.has_value() &&
+                        impl_->config.retry_timeout.count() > 0) {
+                        retry_deadline = std::chrono::steady_clock::now() +
+                                         impl_->config.retry_timeout;
+                    }
                     if (impl_->stop_requested ||
                         impl_->cv.wait_for(lock, retry_delay, [this] {
                             return impl_->stop_requested;
@@ -436,6 +467,7 @@ void OrderedOpLogWriter::Start() {
                     }
                 }
                 retry_delay = std::min(retry_delay * 2, kMaxRetryDelay);
+                retry_attempt = true;
             }
         }
     });

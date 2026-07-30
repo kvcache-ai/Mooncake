@@ -839,6 +839,84 @@ TEST(OrderedOpLogWriterFailureTest,
     writer.Stop();
 }
 
+TEST(OrderedOpLogWriterFailureTest, RetryTimeoutStopsFurtherAttempts) {
+    using namespace std::chrono_literals;
+
+    FakeBatchWriter storage;
+    std::atomic<int> terminal_callbacks{0};
+    OrderedOpLogWriter writer(
+        OrderedOpLogWriterConfig{.max_entries_per_batch = 1,
+                                 .retry_timeout = 50ms},
+        [&](const OpLogBatchRecord& batch,
+            const DurablePrefix& expected_prefix) {
+            return storage.Write(batch, expected_prefix);
+        },
+        [&](const OrderedOpLogWriterTerminalState&) { ++terminal_callbacks; });
+    writer.Start();
+
+    storage.FailNextWrites(100000, ErrorCode::PERSISTENT_FAIL);
+    auto reservation = writer.Reserve();
+    ASSERT_TRUE(reservation.has_value());
+    ASSERT_TRUE(writer
+                    .Commit(std::move(*reservation), MakeEntry("k1"),
+                            [](const auto&) {})
+                    .has_value());
+
+    for (int i = 0; i < 200 && !writer.GetTerminalState().has_value(); ++i) {
+        std::this_thread::sleep_for(10ms);
+    }
+    const auto state = writer.GetTerminalState();
+    ASSERT_TRUE(state.has_value());
+    EXPECT_EQ(ErrorCode::PERSISTENT_FAIL, state->error);
+    EXPECT_EQ(OrderedOpLogWriterTerminalReason::kRetryTimeout, state->reason);
+    EXPECT_NE(0u, state->occurred_at_ms);
+    EXPECT_EQ(ErrorCode::PERSISTENT_FAIL, writer.LastError());
+    for (int i = 0; i < 100 && terminal_callbacks.load() != 1; ++i) {
+        std::this_thread::sleep_for(10ms);
+    }
+    EXPECT_EQ(1, terminal_callbacks.load());
+
+    const size_t attempts_after_terminal = storage.AttemptTimes().size();
+    std::this_thread::sleep_for(100ms);
+    EXPECT_EQ(attempts_after_terminal, storage.AttemptTimes().size());
+    writer.Stop();
+}
+
+TEST(OrderedOpLogWriterFailureTest,
+     SuccessBeforeRetryTimeoutDoesNotBecomeTerminal) {
+    using namespace std::chrono_literals;
+
+    FakeBatchWriter storage;
+    std::atomic<int> terminal_callbacks{0};
+    OrderedOpLogWriter writer(
+        OrderedOpLogWriterConfig{.max_entries_per_batch = 1,
+                                 .retry_timeout = 2s},
+        [&](const OpLogBatchRecord& batch,
+            const DurablePrefix& expected_prefix) {
+            return storage.Write(batch, expected_prefix);
+        },
+        [&](const OrderedOpLogWriterTerminalState&) { ++terminal_callbacks; });
+    writer.Start();
+
+    storage.FailNextWrites(1, ErrorCode::PERSISTENT_FAIL);
+    auto reservation = writer.Reserve();
+    ASSERT_TRUE(reservation.has_value());
+    ASSERT_TRUE(writer
+                    .Commit(std::move(*reservation), MakeEntry("k1"),
+                            [](const auto&) {})
+                    .has_value());
+
+    ASSERT_TRUE(storage.WaitForWrites(1));
+    for (int i = 0; i < 100 && !writer.IsAccepting(); ++i) {
+        std::this_thread::sleep_for(10ms);
+    }
+    EXPECT_FALSE(writer.GetTerminalState().has_value());
+    EXPECT_EQ(0, terminal_callbacks.load());
+    EXPECT_TRUE(writer.IsAccepting());
+    EXPECT_EQ(ErrorCode::OK, writer.LastError());
+    writer.Stop();
+}
+
 TEST(OrderedOpLogWriterFailureTest, RetriesSameBatchUntilSuccess) {
     FakeBatchWriter storage;
     OrderedOpLogWriter writer(
