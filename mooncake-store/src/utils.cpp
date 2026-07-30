@@ -144,6 +144,30 @@ void *allocate_buffer_allocator_memory(size_t total_size,
                                                           -1);
     }
 #endif
+#ifdef USE_VRAM_SEGMENT
+    cudaError_t res;
+    void * ptr = nullptr;
+    res = cudaSetDevice(0);  // always allocate on device 0. you can set env for other devices.
+    if (res != cudaSuccess) {
+        LOG(ERROR) << "VRAM Segment cudaSetDevice failed.";
+        return nullptr;
+    }
+    if (protocol == "nvlink_intra") {
+#ifdef USE_INTRA_NVLINK
+        ptr = allocateFabricMemory_intra(total_size);
+        return ptr;
+#else
+        LOG(ERROR) << "Protocol nvlink_intra need USE_INTRA_NVLINK=ON. Please rebuild mooncake from source.";
+        return nullptr;
+#endif
+    }
+    res = cudaMalloc((void**)&ptr, total_size);
+    if (res != cudaSuccess) {
+        LOG(ERROR) << "VRAM Segment cudaMalloc failed.";
+        return nullptr;
+    }
+    return ptr;
+#endif
     // Allocate aligned memory
     return aligned_alloc(alignment, total_size);
 }
