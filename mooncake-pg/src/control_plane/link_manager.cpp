@@ -125,8 +125,21 @@ void LinkManager::stop() {
 
     std::lock_guard<std::mutex> lock(peers_mutex_);
     for (int peer = 0; peer < max_world_size_; ++peer) {
-        tearDownPeerLink(peer);
-        peers_[peer] = PeerLink{};
+        if (peer == rank_) continue;
+        auto& link = peers_[peer];
+        if (link.target_id.has_value()) {
+            engine_->closeSegment(link.target_id.value());
+            link.target_id = std::nullopt;
+        }
+        if (link.probe_batch_id.has_value()) {
+            engine_->freeBatchID(link.probe_batch_id.value());
+            link.probe_batch_id = std::nullopt;
+        }
+        // Segment metadata belongs to the TransferEngine. removeLocalSegment
+        // is only valid while refreshing a live peer, not during shutdown.
+        link.health_check_requested = false;
+        link.state = PeerLinkState::Idle;
+        link.is_candidate = false;
     }
     if (warmup_recv_region_) {
         std::memset(warmup_recv_region_.get(), 0,
