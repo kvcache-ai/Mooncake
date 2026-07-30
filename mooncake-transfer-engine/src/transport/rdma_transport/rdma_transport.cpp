@@ -214,12 +214,9 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
                                                bool remote_accessible,
                                                bool update_metadata,
                                                bool force_sequential) {
-    (void)remote_accessible;
-    const int kBaseAccessRights = IBV_ACCESS_LOCAL_WRITE |
-                                  IBV_ACCESS_REMOTE_WRITE |
-                                  IBV_ACCESS_REMOTE_READ;
-
-    int access_rights = kBaseAccessRights;
+    int access_rights = IBV_ACCESS_LOCAL_WRITE;
+    if (remote_accessible)
+        access_rights |= IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
     if (MCIbRelaxedOrderingEnabled) {
         access_rights |= IBV_ACCESS_RELAXED_ORDERING;
     }
@@ -416,7 +413,8 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         BufferDesc buffer_desc;
         for (auto &context : context_list_) {
             buffer_desc.lkey.push_back(context->lkey(chunk_addr));
-            buffer_desc.rkey.push_back(context->rkey(chunk_addr));
+            if (remote_accessible)
+                buffer_desc.rkey.push_back(context->rkey(chunk_addr));
         }
         buffer_desc.name = resolved_name;
         buffer_desc.addr = (uint64_t)chunk_addr;

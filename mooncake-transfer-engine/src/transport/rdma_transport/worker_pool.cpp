@@ -54,16 +54,32 @@ static int selectPeerDevice(RdmaTransport::SegmentDesc *peer_segment_desc,
                             const std::string &local_hca, int &buffer_id,
                             int &device_id, int retry_count = 0) {
     const auto &config = globalConfig();
+    int ret = 0;
     if (config.enable_hca_peer_affinity) {
-        return RdmaTransport::selectDeviceByLocalHca(
+        ret = RdmaTransport::selectDeviceByLocalHca(
             peer_segment_desc, offset, length, local_hca, buffer_id, device_id,
             retry_count);
+    } else {
+        auto hint = config.enable_dest_device_affinity
+                        ? std::string_view(local_hca)
+                        : std::string_view();
+        ret =
+            RdmaTransport::selectDevice(peer_segment_desc, offset, length, hint,
+                                        buffer_id, device_id, retry_count);
     }
+    if (ret) return ret;
 
-    auto hint = config.enable_dest_device_affinity ? std::string_view(local_hca)
-                                                   : std::string_view();
-    return RdmaTransport::selectDevice(peer_segment_desc, offset, length, hint,
-                                       buffer_id, device_id, retry_count);
+    if (buffer_id < 0 ||
+        static_cast<size_t>(buffer_id) >= peer_segment_desc->buffers.size() ||
+        device_id < 0 ||
+        static_cast<size_t>(device_id) >=
+            peer_segment_desc->buffers[buffer_id].rkey.size()) {
+        LOG(ERROR) << "[RDMA] No rkey for MR access: seg="
+                   << (peer_segment_desc ? peer_segment_desc->name : "null")
+                   << " addr=" << (void *)offset << " len=" << length;
+        return ERR_ADDRESS_NOT_REGISTERED;
+    }
+    return 0;
 }
 
 static bool workerCanPost(int thread_id) {
