@@ -1477,7 +1477,12 @@ class MasterService {
     enum class QuotaEraseMode {
         kFull,
         kPreserveOld,
+        kAbortOnly,
     };
+    std::unordered_map<std::string, ObjectMetadata>::iterator EraseMetadata(
+        TenantState& tenant_state,
+        std::unordered_map<std::string, ObjectMetadata>::iterator it,
+        const TenantId& tenant_id, QuotaEraseMode quota_mode);
     tl::expected<void, ErrorCode> SettlePrimaryWriteQuotaIfReady(
         TenantState& tenant_state, ObjectMetadata& metadata);
     uint64_t CompletedMemoryQuotaCharge(const ObjectMetadata& metadata) const;
@@ -1499,12 +1504,13 @@ class MasterService {
     std::unordered_map<std::string, ObjectMetadata>::iterator EraseMetadata(
         TenantState& tenant_state,
         std::unordered_map<std::string, ObjectMetadata>::iterator it,
-        const TenantId& tenant_id, MetadataShardAccessorRW* shard,
-        QuotaEraseMode quota_mode = QuotaEraseMode::kFull);
+        const TenantId& tenant_id, QuotaEraseMode quota_mode,
+        MetadataShardAccessorRW* shard);
     void FinalizeRemovedReplicasAfterDurable(
         const OpLogEntry& durable_entry,
-        const std::vector<ReplicaID>& replica_ids);
-    void FinalizeMetadataEraseAfterDurable(const OpLogEntry& durable_entry);
+        const std::vector<ReplicaID>& replica_ids, QuotaEraseMode quota_mode);
+    void FinalizeMetadataEraseAfterDurable(const OpLogEntry& durable_entry,
+                                           QuotaEraseMode quota_mode);
     void FinalizeExpiredProcessingReplicasAfterDurable(
         const OpLogEntry& durable_entry,
         const std::chrono::system_clock::time_point& ttl);
@@ -1784,7 +1790,7 @@ class MasterService {
         // Delete current metadata (for PutRevoke or Remove operations)
         void Erase() NO_THREAD_SAFETY_ANALYSIS {
             service_->EraseMetadata(*tenant_state_, it_, object_id_.tenant_id,
-                                    &shard_guard_);
+                                    QuotaEraseMode::kFull, &shard_guard_);
             it_ = tenant_state_->metadata.end();
             MaybeEraseEmptyTenant();
         }

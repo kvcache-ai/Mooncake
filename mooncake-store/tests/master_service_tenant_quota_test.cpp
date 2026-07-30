@@ -298,7 +298,8 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         OpLogEntry entry;
         entry.tenant_id = tenant_id.value();
         entry.object_key = key;
-        service.FinalizeRemovedReplicasAfterDurable(entry, removed_ids);
+        service.FinalizeRemovedReplicasAfterDurable(
+            entry, removed_ids, MasterService::QuotaEraseMode::kFull);
     }
 
     void AddCompletedDiskReplica(MasterService& service, const UUID& client_id,

@@ -577,7 +577,8 @@ class MasterServiceHATest : public ::testing::Test {
     static void FinalizeRemovedReplicasForTesting(
         MasterService& service, const OpLogEntry& durable_entry,
         const std::vector<ReplicaID>& replica_ids) {
-        service.FinalizeRemovedReplicasAfterDurable(durable_entry, replica_ids);
+        service.FinalizeRemovedReplicasAfterDurable(
+            durable_entry, replica_ids, MasterService::QuotaEraseMode::kFull);
     }
 
     static void SetLocalDiskUsedBytesForTesting(MasterService& service,
