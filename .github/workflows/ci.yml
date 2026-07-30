@@ -207,6 +207,7 @@ jobs:
           -DUSE_UB=ON \
           -DUSE_ETCD=ON \
           -DUSE_CUDA=ON \
+          -DUSE_MNNVL=ON \
           -DWITH_P2P_STORE=ON \
           -DWITH_CONDUCTOR=ON \
           -DSTORE_USE_ETCD=ON \
@@ -242,6 +243,7 @@ jobs:
       uses: ./.github/actions/run-ctest
       with:
         junit-report: build/test-results/ctest.xml
+        label-exclude: '^nvlink_gpu$'
 
     - name: Preserve CTest diagnostics
       if: ${{ always() && steps.ctest.outcome == 'failure' }}
