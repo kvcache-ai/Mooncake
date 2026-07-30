@@ -181,7 +181,7 @@ void ShardedTenantQuotaTable<NumShards>::RecomputeEffectiveQuotasLocked(
                          shard_snapshots.end());
     }
 
-    auto effective_quotas = TenantQuotaShard::BuildEffectiveQuotaAssignments(
+    auto effective_quotas = TenantQuotaTable::BuildEffectiveQuotaAssignments(
         snapshots, allocatable_capacity_bytes);
     std::array<std::map<TenantId, uint64_t>, kNumShards> grouped_quotas;
     for (const auto& [tenant_id, effective_quota_bytes] : effective_quotas) {

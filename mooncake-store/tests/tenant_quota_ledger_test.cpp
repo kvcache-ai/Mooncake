@@ -17,7 +17,7 @@ class TenantQuotaLedgerTest : public ::testing::Test {
     void Charge(uint64_t bytes) { ASSERT_TRUE(account_->TryCharge(bytes)); }
 
     const TenantId tenant_id_{"ledger-test"};
-    TenantQuotaShard table_;
+    TenantQuotaTable table_;
     TenantQuotaHandle account_{nullptr};
 };
 

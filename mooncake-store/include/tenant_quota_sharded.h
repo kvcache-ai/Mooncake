@@ -8,7 +8,7 @@
 
 namespace mooncake {
 
-// Thread-safe production wrapper around TenantQuotaShard. Per-tenant
+// Thread-safe production wrapper around TenantQuotaTable. Per-tenant
 // operations lock only one shard; cross-shard policy, usage, and recompute
 // operations are serialized by recompute_mutex_.
 template <size_t NumShards = 1024>
@@ -42,7 +42,7 @@ class ShardedTenantQuotaTable {
    private:
     struct Shard {
         mutable std::mutex mutex;
-        TenantQuotaShard table;
+        TenantQuotaTable table;
     };
 
     size_t GetShardIndex(const TenantId& tenant_id) const;

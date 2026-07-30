@@ -100,7 +100,7 @@ void CleanupTenantQuotaEtcdCluster(const std::string& cluster_id) {
 }
 #endif
 
-void MakeOrphanTenant(TenantQuotaShard* table, const std::string& tenant_id,
+void MakeOrphanTenant(TenantQuotaTable* table, const std::string& tenant_id,
                       uint64_t bytes) {
     const TenantId canonical_tenant(tenant_id);
     ASSERT_TRUE(table->UpsertTenantPolicy(canonical_tenant, bytes).has_value());
@@ -111,8 +111,8 @@ void MakeOrphanTenant(TenantQuotaShard* table, const std::string& tenant_id,
     ASSERT_TRUE(table->ApplyTenantPolicies({}));
 }
 
-TEST(TenantQuotaShardTest, NormalizesEmptyExplicitTenantIdToDefault) {
-    TenantQuotaShard table;
+TEST(TenantQuotaTableTest, NormalizesEmptyExplicitTenantIdToDefault) {
+    TenantQuotaTable table;
 
     ASSERT_TRUE(table.UpsertTenantPolicy(TenantId(""), 1024).has_value());
     table.RecomputeEffectiveQuotas(4096);
@@ -124,8 +124,8 @@ TEST(TenantQuotaShardTest, NormalizesEmptyExplicitTenantIdToDefault) {
     EXPECT_EQ(snapshot.effective_quota_bytes, 1024);
 }
 
-TEST(TenantQuotaShardTest, RejectsZeroExplicitQuotaWithoutChangingState) {
-    TenantQuotaShard table;
+TEST(TenantQuotaTableTest, RejectsZeroExplicitQuotaWithoutChangingState) {
+    TenantQuotaTable table;
 
     const TenantId tenant_id("tenant-a");
     ASSERT_TRUE(table.UpsertTenantPolicy(tenant_id, 100).has_value());
@@ -138,8 +138,8 @@ TEST(TenantQuotaShardTest, RejectsZeroExplicitQuotaWithoutChangingState) {
     EXPECT_EQ(snapshot.requested_quota_bytes, 100);
 }
 
-TEST(TenantQuotaShardTest, RejectsPolicyAboveAtomicAccountingRange) {
-    TenantQuotaShard table;
+TEST(TenantQuotaTableTest, RejectsPolicyAboveAtomicAccountingRange) {
+    TenantQuotaTable table;
     const TenantId tenant_id("tenant-a");
     ASSERT_TRUE(table.UpsertTenantPolicy(tenant_id, 100));
 
@@ -155,8 +155,8 @@ TEST(TenantQuotaShardTest, RejectsPolicyAboveAtomicAccountingRange) {
     EXPECT_EQ(Snapshot(table, "tenant-a").requested_quota_bytes, 100);
 }
 
-TEST(TenantQuotaShardTest, ApplyPoliciesCreatesOrphanState) {
-    TenantQuotaShard table;
+TEST(TenantQuotaTableTest, ApplyPoliciesCreatesOrphanState) {
+    TenantQuotaTable table;
     MakeOrphanTenant(&table, "tenant-a", 40);
     table.RecomputeEffectiveQuotas(1000);
 
@@ -169,8 +169,8 @@ TEST(TenantQuotaShardTest, ApplyPoliciesCreatesOrphanState) {
     EXPECT_TRUE(snapshot.over_quota);
 }
 
-TEST(TenantQuotaShardTest, ClosedOrphanAccountCanDrain) {
-    TenantQuotaShard table;
+TEST(TenantQuotaTableTest, ClosedOrphanAccountCanDrain) {
+    TenantQuotaTable table;
     const TenantId tenant_id("tenant-a");
     MakeOrphanTenant(&table, tenant_id.value(), 40);
     auto* handle = table.GetOrCreateTenantHandle(tenant_id);
@@ -182,8 +182,8 @@ TEST(TenantQuotaShardTest, ClosedOrphanAccountCanDrain) {
     EXPECT_FALSE(table.GetTenantSnapshot(tenant_id).has_value());
 }
 
-TEST(TenantQuotaShardTest, ApplyPoliciesReplacesCanonicalPolicySet) {
-    TenantQuotaShard table;
+TEST(TenantQuotaTableTest, ApplyPoliciesReplacesCanonicalPolicySet) {
+    TenantQuotaTable table;
     const TenantId tenant_a("tenant-a");
     const TenantId tenant_b("tenant-b");
     const TenantId tenant_c("tenant-c");
@@ -201,8 +201,8 @@ TEST(TenantQuotaShardTest, ApplyPoliciesReplacesCanonicalPolicySet) {
               (TenantQuotaPolicyMap{{tenant_b, 300}, {tenant_c, 400}}));
 }
 
-TEST(TenantQuotaShardTest, DisableMissingPolicyDoesNotCreateLazyState) {
-    TenantQuotaShard table;
+TEST(TenantQuotaTableTest, DisableMissingPolicyDoesNotCreateLazyState) {
+    TenantQuotaTable table;
 
     auto result = table.DisableTenantPolicyIfEmpty(TenantId("missing"));
 
@@ -212,8 +212,8 @@ TEST(TenantQuotaShardTest, DisableMissingPolicyDoesNotCreateLazyState) {
     EXPECT_TRUE(table.ListTenantSnapshots().empty());
 }
 
-TEST(TenantQuotaShardTest, PolicyMutationDoesNotRecomputeEffectiveQuota) {
-    TenantQuotaShard table;
+TEST(TenantQuotaTableTest, PolicyMutationDoesNotRecomputeEffectiveQuota) {
+    TenantQuotaTable table;
     const TenantId tenant_id("tenant-a");
     ASSERT_TRUE(table.UpsertTenantPolicy(tenant_id, 100).has_value());
     table.RecomputeEffectiveQuotas(1000);
@@ -228,8 +228,8 @@ TEST(TenantQuotaShardTest, PolicyMutationDoesNotRecomputeEffectiveQuota) {
     EXPECT_FALSE(Snapshot(table, "tenant-a").admission_closed);
 }
 
-TEST(TenantQuotaShardTest, ListSnapshotsSortedAndCleansLazyEmptyTenants) {
-    TenantQuotaShard table;
+TEST(TenantQuotaTableTest, ListSnapshotsSortedAndCleansLazyEmptyTenants) {
+    TenantQuotaTable table;
     ASSERT_TRUE(table.UpsertTenantPolicy(TenantId("z-empty"), 10).has_value());
     ASSERT_TRUE(
         table.DisableTenantPolicyIfEmpty(TenantId("z-empty")).has_value());
@@ -243,8 +243,8 @@ TEST(TenantQuotaShardTest, ListSnapshotsSortedAndCleansLazyEmptyTenants) {
     EXPECT_EQ(snapshots[1].tenant_id, TenantId("b"));
 }
 
-TEST(TenantQuotaShardTest, ExplicitTenantsReceiveRequestedWhenCapacityFits) {
-    TenantQuotaShard table;
+TEST(TenantQuotaTableTest, ExplicitTenantsReceiveRequestedWhenCapacityFits) {
+    TenantQuotaTable table;
     ASSERT_TRUE(
         table.UpsertTenantPolicy(TenantId("tenant-a"), 100).has_value());
     ASSERT_TRUE(
@@ -257,8 +257,8 @@ TEST(TenantQuotaShardTest, ExplicitTenantsReceiveRequestedWhenCapacityFits) {
     EXPECT_EQ(SumEffectiveQuotas(table), 300);
 }
 
-TEST(TenantQuotaShardTest, OverCapacityScalesOnlyExplicitTenants) {
-    TenantQuotaShard table;
+TEST(TenantQuotaTableTest, OverCapacityScalesOnlyExplicitTenants) {
+    TenantQuotaTable table;
     MakeOrphanTenant(&table, "orphan", 20);
     ASSERT_TRUE(table.UpsertTenantPolicy(TenantId("b"), 200).has_value());
     ASSERT_TRUE(table.UpsertTenantPolicy(TenantId("a"), 100).has_value());
@@ -271,8 +271,8 @@ TEST(TenantQuotaShardTest, OverCapacityScalesOnlyExplicitTenants) {
     EXPECT_TRUE(Snapshot(table, "orphan").over_quota);
 }
 
-TEST(TenantQuotaShardTest, LazyEmptyOrphansDoNotAppearInList) {
-    TenantQuotaShard table;
+TEST(TenantQuotaTableTest, LazyEmptyOrphansDoNotAppearInList) {
+    TenantQuotaTable table;
     ASSERT_TRUE(table.UpsertTenantPolicy(TenantId("team-a"), 30).has_value());
     ASSERT_TRUE(table.UpsertTenantPolicy(TenantId("ghost"), 10).has_value());
     ASSERT_TRUE(
@@ -288,8 +288,8 @@ TEST(TenantQuotaShardTest, LazyEmptyOrphansDoNotAppearInList) {
     EXPECT_EQ(snapshots[0].tenant_id, TenantId("team-a"));
 }
 
-TEST(TenantQuotaShardTest, ChargeRequiresRegisteredTenantIncludingZeroBytes) {
-    TenantQuotaShard table;
+TEST(TenantQuotaTableTest, ChargeRequiresRegisteredTenantIncludingZeroBytes) {
+    TenantQuotaTable table;
     auto* account = table.GetOrCreateTenantHandle(TenantId("missing"));
 
     auto regular = account->TryCharge(1);
@@ -301,8 +301,8 @@ TEST(TenantQuotaShardTest, ChargeRequiresRegisteredTenantIncludingZeroBytes) {
     EXPECT_EQ(zero.error().error, TenantQuotaError::kTenantNotRegistered);
 }
 
-TEST(TenantQuotaShardTest, ChargeAndReleaseUpdateSingleCounter) {
-    TenantQuotaShard table;
+TEST(TenantQuotaTableTest, ChargeAndReleaseUpdateSingleCounter) {
+    TenantQuotaTable table;
     const TenantId tenant_id("tenant-a");
     ASSERT_TRUE(table.UpsertTenantPolicy(tenant_id, 300).has_value());
     table.RecomputeEffectiveQuotas(300);
@@ -316,8 +316,8 @@ TEST(TenantQuotaShardTest, ChargeAndReleaseUpdateSingleCounter) {
     EXPECT_FALSE(snapshot.admission_closed);
 }
 
-TEST(TenantQuotaShardTest, AccountingMismatchDoesNotMutateState) {
-    TenantQuotaShard table;
+TEST(TenantQuotaTableTest, AccountingMismatchDoesNotMutateState) {
+    TenantQuotaTable table;
     const TenantId tenant_id("tenant-a");
     ASSERT_TRUE(table.UpsertTenantPolicy(tenant_id, 100).has_value());
     table.RecomputeEffectiveQuotas(100);
@@ -330,8 +330,8 @@ TEST(TenantQuotaShardTest, AccountingMismatchDoesNotMutateState) {
     EXPECT_EQ(Snapshot(table, "tenant-a").charged_bytes, 10);
 }
 
-TEST(TenantQuotaShardTest, DisablePolicyRejectsNonEmptyTenant) {
-    TenantQuotaShard table;
+TEST(TenantQuotaTableTest, DisablePolicyRejectsNonEmptyTenant) {
+    TenantQuotaTable table;
     const TenantId tenant_id("tenant-a");
     ASSERT_TRUE(table.UpsertTenantPolicy(tenant_id, 100).has_value());
     table.RecomputeEffectiveQuotas(100);
@@ -347,8 +347,8 @@ TEST(TenantQuotaShardTest, DisablePolicyRejectsNonEmptyTenant) {
     EXPECT_TRUE(table.GetOrCreateTenantHandle(tenant_id)->TryCharge(1));
 }
 
-TEST(TenantQuotaShardTest, HandleRemainsStableAcrossPolicyLifecycle) {
-    TenantQuotaShard table;
+TEST(TenantQuotaTableTest, HandleRemainsStableAcrossPolicyLifecycle) {
+    TenantQuotaTable table;
     const TenantId tenant_id("tenant-a");
     ASSERT_TRUE(table.UpsertTenantPolicy(tenant_id, 100));
     table.RecomputeEffectiveQuotas(100);
@@ -367,8 +367,8 @@ TEST(TenantQuotaShardTest, HandleRemainsStableAcrossPolicyLifecycle) {
     EXPECT_EQ(Snapshot(table, "tenant-a").charged_bytes, 200);
 }
 
-TEST(TenantQuotaShardTest, RebuildUsageCreatesAndRemovesOrphans) {
-    TenantQuotaShard table;
+TEST(TenantQuotaTableTest, RebuildUsageCreatesAndRemovesOrphans) {
+    TenantQuotaTable table;
     const TenantId explicit_tenant("tenant-a");
     const TenantId orphan("orphan");
     ASSERT_TRUE(table.UpsertTenantPolicy(explicit_tenant, 100).has_value());
@@ -389,8 +389,8 @@ TEST(TenantQuotaShardTest, RebuildUsageCreatesAndRemovesOrphans) {
     EXPECT_TRUE(table.GetTenantSnapshot(explicit_tenant).has_value());
 }
 
-TEST(TenantQuotaShardTest, OverflowChecksDoNotWrapAccounting) {
-    TenantQuotaShard table;
+TEST(TenantQuotaTableTest, OverflowChecksDoNotWrapAccounting) {
+    TenantQuotaTable table;
     const TenantId tenant_id("tenant-a");
     const uint64_t max = TenantQuotaAccount::kMaxChargedBytes;
     ASSERT_TRUE(table.UpsertTenantPolicy(tenant_id, max).has_value());

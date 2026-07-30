@@ -65,7 +65,7 @@ class TenantQuotaAccount {
     bool AdmissionClosed() const;
 
    private:
-    friend class TenantQuotaShard;
+    friend class TenantQuotaTable;
 
     void BeginPolicyUpdate();
     void EndPolicyUpdate();
@@ -80,7 +80,7 @@ class TenantQuotaAccount {
     alignas(64) std::atomic<uint64_t> effective_quota_bytes_{0};
     std::atomic<uint64_t> policy_sequence_{0};
 
-    // Accessed only while the owning quota-table shard is locked.
+    // Accessed only under external control-plane synchronization.
     uint64_t requested_quota_bytes_{0};
     bool has_explicit_policy_{false};
 };
@@ -93,7 +93,7 @@ class ShardedTenantQuotaTable;
 // Control-plane registry for stable quota accounts. Callers must provide
 // external synchronization. Charge and release bypass this table and operate
 // directly on TenantQuotaHandle.
-class TenantQuotaShard {
+class TenantQuotaTable {
    public:
     TenantQuotaResult UpsertTenantPolicy(const TenantId& tenant_id,
                                          uint64_t requested_quota_bytes);
