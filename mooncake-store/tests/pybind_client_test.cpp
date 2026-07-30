@@ -1250,14 +1250,13 @@ TEST_F(RealClientTest, ErrBufferRegistrationErrors) {
         EXPECT_EQ(py_client_->register_buffer(buf, sizeof(buf)), 0)
             << "First registration should succeed";
 
-        // Second registration of the same memory
-        {
-            GLogMuter muter;
-            EXPECT_NE(py_client_->register_buffer(buf, sizeof(buf)), 0)
-                << "Duplicate registration of the same buffer should fail.";
-        }
+        EXPECT_EQ(py_client_->register_buffer(buf, sizeof(buf)), 0)
+            << "Duplicate registration of the same buffer should succeed "
+               "and increment the registration refcount.";
 
         // Cleanup
+        EXPECT_EQ(py_client_->unregister_buffer(buf), 0)
+            << "First unregistration should decrement the refcount";
         EXPECT_EQ(py_client_->unregister_buffer(buf), 0)
             << "Unregistration should succeed";
     }
