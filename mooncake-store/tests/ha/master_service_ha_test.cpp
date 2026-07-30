@@ -580,6 +580,11 @@ class MasterServiceHATest : public ::testing::Test {
         return service.ordered_oplog_writer_->Reserve();
     }
 
+    static bool IsBatchOpLogWriterAcceptingForTesting(MasterService& service) {
+        return service.ordered_oplog_writer_ &&
+               service.ordered_oplog_writer_->IsAccepting();
+    }
+
     static void ClearInvalidHandlesForTesting(
         MasterService& service,
         const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients) {
@@ -1760,6 +1765,204 @@ TEST_F(MasterServiceBatchRecordE2ETest, StandbyAppliesPrimaryBatchRecords) {
     EXPECT_EQ(2u, result.applied_entries);
     EXPECT_EQ(3u, applier.GetExpectedSequenceId());
     EXPECT_TRUE(standby_metadata.Exists(kDefaultTenant.value(), key));
+}
+
+TEST_F(MasterServiceBatchRecordE2ETest,
+       RestartedLocalDiskOwnerIsPersistedAndSurvivesStaleCleanup) {
+    const std::string cluster_id = "test_local_disk_restart_recovery";
+    auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_enable_offload(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    auto old_client =
+        PrepareSimpleSegment(service, "local_disk_restart_old_segment");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+    ASSERT_TRUE(
+        service.MountLocalDiskSegment(old_client.client_id, true).has_value());
+
+    const std::string key = "local_disk_restart_key";
+    PutObjectOnSegment(service, old_client.client_id, key,
+                       "local_disk_restart_old_segment");
+    ReadBatchEventually(storage, 2, batch);
+
+    OffloadTaskItem task{
+        .tenant_id = kDefaultTenant.value(), .key = key, .size = 1024};
+    StorageObjectMetadata metadata{};
+    metadata.data_size = 1024;
+    metadata.transport_endpoint = "stable-local-disk-endpoint";
+    ASSERT_TRUE(
+        service.NotifyOffloadSuccess(old_client.client_id, {task}, {metadata})
+            .has_value());
+    ReadBatchEventually(storage, 3, batch);
+
+    auto restarted_client =
+        PrepareSimpleSegment(service, "local_disk_restart_restarted_segment",
+                             kDefaultSegmentBase + kDefaultSegmentSize);
+    ReadBatchEventually(storage, 4, batch);
+    ASSERT_TRUE(service.MountLocalDiskSegment(restarted_client.client_id, true)
+                    .has_value());
+
+    ASSERT_TRUE(service
+                    .NotifyOffloadSuccess(restarted_client.client_id, {task},
+                                          {metadata})
+                    .has_value());
+    ReadBatchEventually(storage, 5, batch);
+    ASSERT_EQ(1u, batch.entries.size());
+    EXPECT_EQ(OpType::PUT_END, batch.entries[0].op_type);
+    EXPECT_EQ(key, batch.entries[0].object_key);
+
+    MetadataPayload payload;
+    ASSERT_EQ(struct_pack::errc::ok,
+              struct_pack::deserialize_to(payload, batch.entries[0].payload));
+    auto persisted_local_disk =
+        std::find_if(payload.replicas.begin(), payload.replicas.end(),
+                     [](const Replica::Descriptor& replica) {
+                         return replica.is_local_disk_replica();
+                     });
+    ASSERT_NE(payload.replicas.end(), persisted_local_disk);
+    EXPECT_EQ(restarted_client.client_id,
+              persisted_local_disk->get_local_disk_descriptor().client_id);
+    EXPECT_EQ(
+        "stable-local-disk-endpoint",
+        persisted_local_disk->get_local_disk_descriptor().transport_endpoint);
+
+    EXPECT_EQ(0, GetLocalDiskUsedBytesForTesting(
+                     service, "local_disk_restart_old_segment"));
+    EXPECT_EQ(1024, GetLocalDiskUsedBytesForTesting(
+                        service, "local_disk_restart_restarted_segment"));
+    ClearInvalidHandlesForTesting(service, {restarted_client.client_id});
+
+    auto replicas = service.GetReplicaList(key, kDefaultTenant);
+    ASSERT_TRUE(replicas.has_value()) << toString(replicas.error());
+    auto recovered_local_disk =
+        std::find_if(replicas->replicas.begin(), replicas->replicas.end(),
+                     [](const Replica::Descriptor& replica) {
+                         return replica.is_local_disk_replica();
+                     });
+    ASSERT_NE(replicas->replicas.end(), recovered_local_disk);
+    EXPECT_EQ(restarted_client.client_id,
+              recovered_local_disk->get_local_disk_descriptor().client_id);
+}
+
+TEST_F(MasterServiceBatchRecordE2ETest,
+       RestartedLocalDiskCreatesNewReplicaWhileOldRemovalIsPending) {
+    const std::string cluster_id = "test_local_disk_removed_recovery";
+    auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_enable_offload(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    auto old_client =
+        PrepareSimpleSegment(service, "local_disk_removed_old_segment");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+    ASSERT_TRUE(
+        service.MountLocalDiskSegment(old_client.client_id, true).has_value());
+    auto restarted_client =
+        PrepareSimpleSegment(service, "local_disk_removed_restarted_segment",
+                             kDefaultSegmentBase + kDefaultSegmentSize);
+    ReadBatchEventually(storage, 2, batch);
+    ASSERT_TRUE(service.MountLocalDiskSegment(restarted_client.client_id, true)
+                    .has_value());
+
+    const std::string key = "local_disk_removed_key";
+    OffloadTaskItem task{
+        .tenant_id = kDefaultTenant.value(), .key = key, .size = 1024};
+    StorageObjectMetadata metadata{};
+    metadata.data_size = 1024;
+    metadata.transport_endpoint = "stable-local-disk-endpoint";
+    ASSERT_TRUE(
+        service.NotifyOffloadSuccess(old_client.client_id, {task}, {metadata})
+            .has_value());
+    ReadBatchEventually(storage, 3, batch);
+
+    backend->BlockTxn();
+    ASSERT_TRUE(service
+                    .EvictDiskReplica(old_client.client_id, key, kDefaultTenant,
+                                      ReplicaType::LOCAL_DISK)
+                    .has_value());
+    ASSERT_TRUE(service
+                    .NotifyOffloadSuccess(restarted_client.client_id, {task},
+                                          {metadata})
+                    .has_value());
+
+    backend->AllowTxn();
+    ReadBatchEventually(storage, 4, batch);
+    ASSERT_EQ(1u, batch.entries.size());
+    EXPECT_EQ(OpType::REMOVE, batch.entries[0].op_type);
+    ReadBatchEventually(storage, 5, batch);
+    ASSERT_EQ(1u, batch.entries.size());
+    EXPECT_EQ(OpType::PUT_END, batch.entries[0].op_type);
+
+    for (int i = 0; i < 50; ++i) {
+        if (ReplicaCountForTesting(service, kDefaultTenant, key) == 1) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    EXPECT_EQ(1u, ReplicaCountForTesting(service, kDefaultTenant, key));
+    EXPECT_EQ(0, GetLocalDiskUsedBytesForTesting(
+                     service, "local_disk_removed_old_segment"));
+    EXPECT_EQ(1024, GetLocalDiskUsedBytesForTesting(
+                        service, "local_disk_removed_restarted_segment"));
+
+    auto replicas = service.GetReplicaList(key, kDefaultTenant);
+    ASSERT_TRUE(replicas.has_value()) << toString(replicas.error());
+    ASSERT_EQ(1u, replicas->replicas.size());
+    EXPECT_EQ(restarted_client.client_id,
+              replicas->replicas.front().get_local_disk_descriptor().client_id);
+}
+
+TEST_F(MasterServiceBatchRecordE2ETest,
+       LocalDiskRecoveryDoesNotCreateMetadataWhenOpLogRejectsWrite) {
+    const std::string cluster_id = "test_local_disk_recovery_oplog_failure";
+    auto backend = std::make_shared<FailingBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    backend->SetTxnError(ErrorCode::PERSISTENT_FAIL);
+    ASSERT_TRUE(AppendVisibleForTesting(service, OpType::PUT_END,
+                                        kDefaultTenant, "oplog_failure", {})
+                    .has_value());
+    ASSERT_TRUE(backend->WaitForTxnCalls(1));
+    for (int i = 0; i < 50 && IsBatchOpLogWriterAcceptingForTesting(service);
+         ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_FALSE(IsBatchOpLogWriterAcceptingForTesting(service));
+
+    const std::string key = "local_disk_recovery_oplog_failure";
+    Replica replica(generate_uuid(), 1024, "stable-local-disk-endpoint",
+                    ReplicaStatus::COMPLETE);
+    auto result =
+        service.AddReplica(generate_uuid(), key, kDefaultTenant, replica);
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS, result.error());
+    EXPECT_FALSE(service.GetReplicaList(key, kDefaultTenant).has_value());
+    backend->SetTxnError(ErrorCode::OK);
 }
 
 TEST_F(MasterServiceBatchRecordE2ETest, PromotionCatchesUpToDurablePrefix) {
