@@ -3811,10 +3811,25 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
                    << ". Expected ReplicaType::LOCAL_DISK.";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    auto normalized_tenant_result = ResolveTenantIdForWrite(tenant_id);
-    if (!normalized_tenant_result) {
-        return tl::make_unexpected(normalized_tenant_result.error());
+
+    TenantId normalized_tenant = TenantId::Default();
+    std::unique_lock<std::mutex> policy_lock(tenant_quota_policy_mutex_,
+                                             std::defer_lock);
+    if (enable_multi_tenants_) {
+        // Keep tenant admission and metadata creation under the same policy
+        // lock. Otherwise DeleteTenantQuotaPolicy can delete an apparently
+        // empty tenant after this call admits the write but before the
+        // LOCAL_DISK metadata is inserted. The policy lock must be acquired
+        // before snapshot_mutex_ per the global lock order.
+        policy_lock.lock();
+        auto normalized_tenant_result =
+            ResolveTenantIdForWriteLocked(tenant_id);
+        if (!normalized_tenant_result) {
+            return tl::make_unexpected(normalized_tenant_result.error());
+        }
+        normalized_tenant = std::move(normalized_tenant_result.value());
     }
+
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     SegmentLifetime local_disk_lifetime = SegmentLifetime::Available();
     {
@@ -3831,8 +3846,7 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
         }
     }
     replica.bind_local_disk_lifetime(local_disk_lifetime);
-    const ObjectIdentity object_id{std::move(normalized_tenant_result.value()),
-                                   key};
+    const ObjectIdentity object_id{std::move(normalized_tenant), key};
     const auto incoming_descriptor =
         replica.get_descriptor().get_local_disk_descriptor();
     MetadataAccessorRW accessor(this, object_id);
