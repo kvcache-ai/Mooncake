@@ -791,17 +791,19 @@ TEST_F(SegmentTest, MountLocalDiskSegmentDuplicate) {
 TEST_F(SegmentTest, MountLocalDiskSegmentIdentityChanged) {
     SegmentManager segment_manager;
     UUID client_id = generate_uuid();
-    auto segment_access = segment_manager.getSegmentAccess();
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        ASSERT_EQ(segment_access.MountLocalDiskSegment(
+                      client_id, true, "disk-a", 1, 1),
+                  ErrorCode::OK);
+        ASSERT_EQ(segment_access.MountLocalDiskSegment(
+                      client_id, true, "disk-b", 2, 1),
+                  ErrorCode::OK);
+    }
 
-    ASSERT_EQ(segment_access.MountLocalDiskSegment(client_id, true, "disk-a",
-                                                   1, 1),
-              ErrorCode::OK);
-    ASSERT_EQ(segment_access.MountLocalDiskSegment(client_id, true, "disk-b",
-                                                   2, 1),
-              ErrorCode::OK);
-
+    auto local_disk_access = segment_manager.getLocalDiskSegmentAccess();
     const auto& mounted =
-        segment_manager.client_local_disk_segment_.at(client_id);
+        local_disk_access.getClientLocalDiskSegment().at(client_id);
     EXPECT_EQ(mounted->local_disk_segment_id, "disk-b");
     EXPECT_EQ(mounted->mount_epoch, 2);
 }
