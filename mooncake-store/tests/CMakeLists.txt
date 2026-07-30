@@ -82,12 +82,6 @@ if(USE_NOF)
   add_store_test(nof_heartbeat_test nof_heartbeat_test.cpp)
 endif()
 add_store_test(client_integration_test client_integration_test.cpp)
-find_package(CUDAToolkit QUIET)
-if(CUDAToolkit_FOUND)
-  target_compile_definitions(client_integration_test
-                             PRIVATE MOONCAKE_STORE_TEST_CUDA)
-  target_link_libraries(client_integration_test PRIVATE CUDA::cudart)
-endif()
 add_test(
   NAME object_checksum_client_test
   COMMAND

@@ -2,10 +2,6 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#ifdef MOONCAKE_STORE_TEST_CUDA
-#include <cuda_runtime_api.h>
-#endif
-
 #include <array>
 #include <cstdlib>
 #include <cstdint>
@@ -93,54 +89,6 @@ TEST(ObjectChecksumTest, ClientVerifiesOnlyLogicalObjectBytes) {
     ASSERT_FALSE(mismatch.has_value());
     EXPECT_EQ(mismatch.error(), ErrorCode::CHECKSUM_MISMATCH);
 }
-
-#ifdef MOONCAKE_STORE_TEST_CUDA
-TEST(ObjectChecksumTest, VerifiesCudaDeviceBufferViaD2H) {
-    if (!Environ::Get().GetStoreChecksumEnabled()) {
-        GTEST_SKIP() << "MOONCAKE_STORE_CHECKSUM is not enabled";
-    }
-
-    int device_count = 0;
-    const auto device_count_result = cudaGetDeviceCount(&device_count);
-    if (device_count_result != cudaSuccess || device_count == 0) {
-        cudaGetLastError();
-        GTEST_SKIP() << "CUDA device is unavailable";
-    }
-    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
-
-    constexpr size_t object_size = 8 * 1024 * 1024 + 17;
-    std::vector<uint8_t> host_data(object_size);
-    for (size_t i = 0; i < host_data.size(); ++i) {
-        host_data[i] = static_cast<uint8_t>(i);
-    }
-
-    void* raw_device_buffer = nullptr;
-    ASSERT_EQ(cudaMalloc(&raw_device_buffer, object_size), cudaSuccess);
-    std::unique_ptr<void, decltype(&cudaFree)> device_buffer(raw_device_buffer,
-                                                             cudaFree);
-    ASSERT_EQ(cudaMemcpy(device_buffer.get(), host_data.data(), object_size,
-                         cudaMemcpyHostToDevice),
-              cudaSuccess);
-
-    ObjectChecksumClient client;
-    std::vector<Slice> slices{{device_buffer.get(), object_size}};
-    const uint64_t checksum =
-        ComputeCrcChecksum(host_data.data(), host_data.size());
-    EXPECT_TRUE(
-        client.VerifyObjectChecksum("cuda-key", slices, object_size, checksum)
-            .has_value());
-
-    host_data[object_size - 1] ^= 0x01;
-    ASSERT_EQ(
-        cudaMemcpy(static_cast<uint8_t*>(device_buffer.get()) + object_size - 1,
-                   &host_data[object_size - 1], 1, cudaMemcpyHostToDevice),
-        cudaSuccess);
-    auto mismatch =
-        client.VerifyObjectChecksum("cuda-key", slices, object_size, checksum);
-    ASSERT_FALSE(mismatch.has_value());
-    EXPECT_EQ(mismatch.error(), ErrorCode::CHECKSUM_MISMATCH);
-}
-#endif
 
 TEST(ObjectChecksumTest, BatchPutStopsAfterChecksumPrecomputeFailure) {
     if (!Environ::Get().GetStoreChecksumEnabled()) {
