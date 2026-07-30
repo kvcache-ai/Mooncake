@@ -41,6 +41,12 @@
 #include "acl/acl_rt.h"
 #include "transport/ascend_transport/ascend_direct_transport/context_manager.h"
 #endif
+#ifdef USE_CUDA
+#include <cuda_runtime.h>
+#endif
+#ifdef USE_INTRA_NVLINK
+#include "gpu_vendor/intra_nvlink.h"
+#endif
 
 DEFINE_bool(enable_http_server, false,
             "Enable embedded HTTP server for health check and metrics.");
@@ -866,8 +872,26 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                                                   get_hugepage_size_from_env(),
                                                   parallel_hugetlb_population);
             } else {
+#ifdef USE_VRAM_SEGMENT
+                cudaError_t res;
+                res = cudaSetDevice(0);  // always allocate on device 0. you can set env for other devices.
+                if (res != cudaSuccess) {
+                    LOG(ERROR) << "VRAM Segment cudaSetDevice failed.";
+                    return tl::unexpected(ErrorCode::INVALID_PARAMS);
+                }
+#ifdef USE_INTRA_NVLINK
+                ptr = allocateFabricMemory_intra(segment_size);
+#else
+                res = cudaMalloc((void**)&ptr, segment_size);
+                if (res != cudaSuccess) {
+                     LOG(ERROR) << "VRAM Segment cudaMalloc failed.";
+                     return tl::unexpected(ErrorCode::INVALID_PARAMS);;
+                }
+#endif
+#else
                 ptr = allocate_buffer_allocator_memory(segment_size,
                                                        this->protocol);
+#endif
             }
 
             if (!ptr) {
@@ -895,7 +919,11 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 hugepage_segment_ptrs_.emplace_back(
                     ptr, HugepageSegmentDeleter{mapped_size});
             } else {
+#ifdef USE_VRAM_SEGMENT
+                vram_segment_ptrs_.emplace_back(ptr);
+#else
                 segment_ptrs_.emplace_back(ptr);
+#endif
             }
 
             // Populate HugeTLB pages in parallel immediately before transfer-
@@ -1248,6 +1276,9 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     hugepage_segment_ptrs_.clear();
     segment_ptrs_.clear();
     ub_segment_ptrs_.clear();
+#ifdef USE_VRAM_SEGMENT
+    vram_segment_ptrs_.clear();
+#endif
 #if defined(USE_SUNRISE)
     sunrise_segment_ptrs_.clear();
 #endif
@@ -1589,7 +1620,22 @@ int RealClient::allocateAndMountSegment(
         size_t chunk_size = std::min(remaining, aligned_max_chunk);
         if (chunk_size == 0) break;
 
+#ifdef USE_VRAM_SEGMENT
+        void * ptr = nullptr;
+        cudaError_t res;
+        res = cudaSetDevice(0);  // always allocate on device 0. you can set env for other devices.
+        if (res != cudaSuccess) {
+            LOG(ERROR) << "VRAM Segment cudaSetDevice failed.";
+            return -1;
+        }
+        res = cudaMalloc((void**)&ptr, chunk_size);
+        if (res != cudaSuccess) {
+            LOG(ERROR) << "VRAM Segment cudaMalloc failed.";
+            return -1;
+        }
+#else
         void *ptr = allocate_buffer_allocator_memory(chunk_size, protocol);
+#endif
         if (!ptr) {
             LOG(ERROR) << "allocate_buffer_allocator_memory failed for size "
                        << chunk_size;

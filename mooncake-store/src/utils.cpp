@@ -29,6 +29,12 @@
 #include <sys/mman.h>
 #include <thread>
 #include <vector>
+#ifdef USE_CUDA
+#include <cuda_runtime.h>
+#endif
+#ifdef USE_INTRA_NVLINK
+#include "gpu_vendor/intra_nvlink.h"
+#endif
 
 // Feature flag to enable/disable arena allocator. Disabled by default so the
 // library does not pre-map a large pool unless the operator opts in via gflag
@@ -549,6 +555,14 @@ void free_memory(const std::string &protocol, void *ptr, bool use_spdk_dma) {
         mooncake::SpdkWrapper::GetInstance().Free(ptr);
         return;
     }
+#endif
+#ifdef USE_VRAM_SEGMENT
+#ifdef USE_INTRA_NVLINK
+    freeFabricMemory_intra(ptr);
+#else
+    cudaFree(ptr);
+#endif
+    return;
 #endif
     free(ptr);
 }
