@@ -213,6 +213,31 @@ pip install mooncake-transfer-engine
 pip install mooncake-transfer-engine-cuda13
 ```
 
+### Build wheel variants for Hygon HCU
+For Hygon HCU packaging (standard NIC / HyLink RPC / TianLong SHCA), build wheels with `scripts/variant_build.sh`.
+All variants enable `-DUSE_HYGON=ON`; `standard`/`shca` also set `-DUSE_FAKE_HIP_RPC=ON`, and `shca` sets `-DUSE_SHCA=ON`:
+
+```bash
+# Standard NIC, without HyLink
+bash scripts/variant_build.sh standard
+
+# Standard NIC, with HyLink (Hygon HCU RPC)
+bash scripts/variant_build.sh rpc
+
+# TianLong SHCA NIC, without HyLink
+bash scripts/variant_build.sh shca
+```
+
+Common options:
+
+```bash
+# Skip dependency installation
+bash scripts/variant_build.sh --skip-deps standard
+
+# Override parallel build jobs
+bash scripts/variant_build.sh --jobs 32 rpc
+```
+
 In addition to CUDA, Mooncake also supports other accelerator backends, along with flexible installation and deployment options. See the guides below for details:
 
 - [Quick Start](https://kvcache-ai.github.io/Mooncake/getting_started/quick-start.html)

@@ -159,19 +159,13 @@ def get_version_add(sha: Optional[str] = None) -> str:
     result = subprocess.run(command, shell=True, capture_output=False, text=True)
     deepep_root = os.path.dirname(os.path.abspath(__file__))
     add_version_path = os.path.join(os.path.join(deepep_root, "mooncake"), "version.py")
-
-    import torch
-    major, minor, _ = torch.__version__.split('.')
+    version = "das.opt1"
 
     if add_git_version:
         if sha != 'Unknown':
             if sha is None:
                 sha = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=deepep_root).decode('ascii').strip()
-            if (major, minor) >= ('2', '5'):
-                version = 'das.opt1.' + sha[:7]
-    else:
-        if (major, minor) >= ('2', '5'):
-            version = 'das.opt1'
+            version = f"{version}.{sha[:7]}"
 
     if os.getenv("ROCM_PATH"):
         rocm_path = os.getenv('ROCM_PATH', "")
