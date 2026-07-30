@@ -75,6 +75,20 @@ jobs:
             exit 1
           fi
 
+      - name: Ensure checked-out tree supports the ROCm wheel variant
+        shell: bash
+        run: |
+          set -eo pipefail
+          # Guard against backfilling a tag that predates ROCm support: its
+          # scripts/build_wheel.sh would ignore HIP_BUILD and emit the default
+          # "mooncake-transfer-engine" package, which the publish steps would
+          # then upload over the CUDA package on PyPI. Refuse such tags.
+          if ! grep -q 'HIP_BUILD' scripts/build_wheel.sh; then
+            echo "::error::Checked-out tree has no HIP_BUILD support in scripts/build_wheel.sh;"
+            echo "::error::refusing to build a mislabeled ROCm wheel. Use a tag at or after ROCm support landed."
+            exit 1
+          fi
+
       - name: Install toolchain and Python ${{ matrix.python-version }}
         shell: bash
         run: |
@@ -148,6 +162,19 @@ jobs:
           HIP_BUILD=1 PYTHON_VERSION=${{ matrix.python-version }} \
             OUTPUT_DIR=dist-rocm-py${{ steps.generate_tag_release.outputs.python_version_tag }} \
             ./scripts/build_wheel.sh
+
+      - name: Assert ROCm package name
+        shell: bash
+        run: |
+          set -eo pipefail
+          # Defense in depth: never let a wheel that was not renamed to the ROCm
+          # package (e.g. HIP_BUILD silently ignored) reach the publish steps.
+          dir="mooncake-wheel/dist-rocm-py${{ steps.generate_tag_release.outputs.python_version_tag }}"
+          if ! ls "${dir}"/mooncake_transfer_engine_rocm-*.whl >/dev/null 2>&1; then
+            echo "::error::Built wheel is not named mooncake-transfer-engine-rocm:"
+            ls -la "${dir}" || true
+            exit 1
+          fi
 
       - name: Upload Python wheel artifact
         uses: actions/upload-artifact@v4
