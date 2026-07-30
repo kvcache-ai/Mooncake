@@ -1038,6 +1038,7 @@ TEST(OrderedOpLogWriterFailureTest, StopInterruptsRetryBackoff) {
     const auto started_at = FakeBatchWriter::Clock::now();
     writer.Stop();
     EXPECT_LT(FakeBatchWriter::Clock::now() - started_at, 250ms);
+    EXPECT_FALSE(writer.GetTerminalState().has_value());
 }
 
 TEST(OrderedOpLogWriterFailureTest, SuccessAfterRetryRestoresAccepting) {
