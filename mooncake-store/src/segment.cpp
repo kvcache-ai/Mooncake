@@ -228,6 +228,16 @@ ErrorCode ScopedSegmentAccess::MountLocalDiskSegment(
     if (exist_segment_it !=
         segment_manager_->client_local_disk_segment_.end()) {
         MutexLocker locker(&exist_segment_it->second->offloading_mutex_);
+        if (exist_segment_it->second->enable_offloading ==
+                enable_offloading &&
+            exist_segment_it->second->local_disk_segment_id ==
+                local_disk_segment_id &&
+            exist_segment_it->second->mount_epoch == mount_epoch &&
+            exist_segment_it->second->capabilities == capabilities) {
+            LOG(WARNING) << "client_id=" << client_id
+                         << ", warn=local_disk_segment_already_exists";
+            return ErrorCode::SEGMENT_ALREADY_EXISTS;
+        }
         exist_segment_it->second->enable_offloading = enable_offloading;
         exist_segment_it->second->local_disk_segment_id = local_disk_segment_id;
         exist_segment_it->second->mount_epoch = mount_epoch;
