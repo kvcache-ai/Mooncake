@@ -610,6 +610,12 @@ class Client {
         return endpoints;
     }
 
+    bool CanUseLocalMemcpy(const Replica::Descriptor& replica) const {
+        return transfer_submitter_ && replica.is_memory_replica() &&
+               transfer_submitter_->CanUseLocalMemcpy(
+                   replica.get_memory_descriptor().buffer_descriptor);
+    }
+
     /**
      * @brief Check if local hot cache is enabled
      * @return true if hot cache is enabled, false otherwise

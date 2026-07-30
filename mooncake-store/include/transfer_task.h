@@ -587,6 +587,10 @@ class TransferSubmitter {
     static bool isSameProcessEndpoint(const std::string& handle_endpoint,
                                       const std::string& local_endpoint);
 
+    bool CanUseLocalMemcpy(const AllocatedBuffer::Descriptor& handle) const {
+        return memcpy_enabled_ && isLocalTransfer(handle);
+    }
+
    private:
     TransferEngine& engine_;
     // Cached at construction: the local transport endpoint never changes for
