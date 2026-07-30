@@ -1454,7 +1454,7 @@ TEST_F(MasterServiceBatchRecordE2ETest, StandbyAppliesPrimaryBatchRecords) {
 TEST_F(MasterServiceBatchRecordE2ETest,
        RestartedLocalDiskOwnerIsPersistedAndSurvivesStaleCleanup) {
     const std::string cluster_id = "test_local_disk_restart_recovery";
-    auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
     auto service_config = MasterServiceConfig::builder()
                               .set_enable_ha(true)
                               .set_enable_oplog(true)
