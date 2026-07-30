@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import logging
 import os
 import posixpath
@@ -16,20 +17,23 @@ FILE_NOT_FOUND = -1100
 PERSISTENT_FAIL = -1503
 
 _LOCAL_FILESYSTEM_SCHEMES = {"file", ""}
+_NATIVE_SAVE_SAFETENSOR_ATTR = "_mooncake_native_save_tensor_to_safetensor"
+_NATIVE_LOAD_SAFETENSOR_ATTR = "_mooncake_native_load_tensor_from_safetensor"
 
 # Lazily cached: whether torch.load accepts weights_only=.
 _TORCH_LOAD_SUPPORTS_WEIGHTS_ONLY: bool | None = None
 
 
-def _normalize_format(format_name: str, file_name: str) -> str:
+def _normalize_format(format_name: str | None, file_name: str) -> str:
     if format_name is None:
         format_name = "auto"
 
     normalized = format_name.lower().replace("-", "_")
     if normalized == "auto":
-        if str(file_name).lower().endswith(".safetensors"):
-            return "safetensors"
-        return "torch"
+        lower_file_name = str(file_name).lower()
+        if lower_file_name.endswith((".pt", ".pth")):
+            return "torch"
+        return "safetensors"
 
     if normalized in {"safetensors", "safe_tensors"}:
         return "safetensors"
@@ -92,6 +96,24 @@ def _is_remote_target(
     file_name: os.PathLike[str] | str, filesystem: str | None
 ) -> bool:
     return _filesystem_scheme(file_name, filesystem) not in _LOCAL_FILESYSTEM_SCHEMES
+
+
+def _can_use_native_safetensor_io(
+    file_name: os.PathLike[str] | str | None,
+    filesystem: str | None,
+    storage_options: dict[str, Any] | None,
+    tensor_name: str | None,
+    *,
+    map_location: Any = None,
+) -> bool:
+    """Return whether a call matches the original C++ local-only API."""
+    if storage_options or tensor_name is not None or map_location is not None:
+        return False
+    if _normalize_filesystem(filesystem) not in {"auto", "file"}:
+        return False
+    if file_name is None:
+        return True
+    return "://" not in os.fspath(file_name)
 
 
 def _supports_directory_creation(fs, scheme: str) -> bool:
@@ -246,6 +268,30 @@ def _torch_load_from_handle(handle, map_location: Any, weights_only: bool) -> An
     return _coerce_loaded_tensor(loaded)
 
 
+def _torch_save_to_handle(tensor: Any, handle: Any) -> None:
+    """Serialize with a seekable buffer when the target stream cannot seek."""
+    try:
+        import torch
+    except ImportError as exc:
+        raise ValueError(
+            "torch package is required for the 'torch' format. "
+            "Install with: pip install torch"
+        ) from exc
+
+    try:
+        is_seekable = bool(handle.seekable())
+    except (AttributeError, OSError):
+        is_seekable = False
+
+    if is_seekable:
+        torch.save(tensor, handle)
+        return
+
+    buffer = io.BytesIO()
+    torch.save(tensor, buffer)
+    handle.write(buffer.getvalue())
+
+
 def _apply_map_location(tensor, map_location):
     """Move a tensor (or dict of tensors) to the device given by *map_location*."""
     if map_location is None:
@@ -285,31 +331,24 @@ def _save_tensor_to_file(
         )
 
         if format_name == "torch":
-            try:
-                import torch
-            except ImportError:
-                raise ValueError(
-                    "torch package is required for the 'torch' format. "
-                    "Install with: pip install torch"
-                )
-            # Stream directly to the fsspec file handle -- avoids
-            # materialising the entire serialised tensor as an in-memory
-            # bytes object.
             with fs.open(path, "wb") as handle:
-                torch.save(tensor, handle)
+                _torch_save_to_handle(tensor, handle)
         else:
-            # safetensors.torch.save() returns bytes; write them straight
-            # to the open handle to avoid an extra intermediate copy.
             try:
                 from safetensors.torch import save as safetensors_save
+                from safetensors.torch import save_file as safetensors_save_file
             except ImportError:
                 raise ValueError(
                     "safetensors package is required for the 'safetensors' "
                     "format. Install with: pip install safetensors"
                 )
-            payload = safetensors_save({resolved_tensor_name: tensor})
-            with fs.open(path, "wb") as handle:
-                handle.write(payload)
+            tensors = {resolved_tensor_name: tensor}
+            if _is_remote_target(resolved_file_name, filesystem):
+                payload = safetensors_save(tensors)
+                with fs.open(path, "wb") as handle:
+                    handle.write(payload)
+            else:
+                safetensors_save_file(tensors, path)
 
         return 0
     except FileNotFoundError:
@@ -367,17 +406,19 @@ def _load_tensor_from_file(
         else:
             try:
                 from safetensors.torch import load as safetensors_load
+                from safetensors.torch import load_file as safetensors_load_file
             except ImportError:
                 raise ValueError(
                     "safetensors package is required for the 'safetensors' "
                     "format. Install with: pip install safetensors"
                 )
-            with fs.open(path, "rb") as handle:
-                payload = handle.read()
-            loaded_tensors = safetensors_load(payload)
-            tensor = _pick_tensor_entry(
-                loaded_tensors, tensor_name, target_store_key
-            )
+            if _is_remote_target(file_name, filesystem):
+                with fs.open(path, "rb") as handle:
+                    payload = handle.read()
+                loaded_tensors = safetensors_load(payload)
+            else:
+                loaded_tensors = safetensors_load_file(path)
+            tensor = _pick_tensor_entry(loaded_tensors, tensor_name, target_store_key)
             tensor = _apply_map_location(tensor, map_location)
 
         rc = self.put_tensor(target_store_key, tensor)
@@ -406,6 +447,15 @@ def _save_tensor_to_safetensor(
     storage_options: dict[str, Any] | None = None,
     tensor_name: str | None = None,
 ) -> int:
+    native_method = getattr(type(self), _NATIVE_SAVE_SAFETENSOR_ATTR, None)
+    if native_method is not None and _can_use_native_safetensor_io(
+        file_name,
+        filesystem,
+        storage_options,
+        tensor_name,
+    ):
+        return native_method(self, key, file_name)
+
     return self.save_tensor_to_file(
         key,
         file_name=file_name,
@@ -423,7 +473,22 @@ def _load_tensor_from_safetensor(
     filesystem: str = "auto",
     storage_options: dict[str, Any] | None = None,
     tensor_name: str | None = None,
+    map_location: Any = None,
 ):
+    native_method = getattr(type(self), _NATIVE_LOAD_SAFETENSOR_ATTR, None)
+    if (
+        native_method is not None
+        and file_name is not None
+        and _can_use_native_safetensor_io(
+            file_name,
+            filesystem,
+            storage_options,
+            tensor_name,
+            map_location=map_location,
+        )
+    ):
+        return native_method(self, key, file_name)
+
     return self.load_tensor_from_file(
         key=key,
         file_name=file_name,
@@ -431,6 +496,7 @@ def _load_tensor_from_safetensor(
         filesystem=filesystem,
         storage_options=storage_options,
         tensor_name=tensor_name,
+        map_location=map_location,
     )
 
 
@@ -447,6 +513,17 @@ def _save_tensor(
     tensor_name: str | None = None,
 ) -> int:
     """General save API: write to Store, export to file, or both."""
+    kind = None
+    if file_name is not None:
+        try:
+            kind = _normalize_artifact_kind(artifact_kind)
+            _build_target_url(file_name, filesystem)
+            if kind != "safetensor":
+                _normalize_format(format, os.fspath(file_name))
+        except (TypeError, ValueError):
+            LOGGER.exception("Invalid file request while saving tensor for key %s", key)
+            return INVALID_PARAMS
+
     if tensor is not None:
         rc = self.put_tensor(key, tensor)
         if rc != 0:
@@ -460,16 +537,6 @@ def _save_tensor(
             )
             return INVALID_PARAMS
         return 0
-
-    try:
-        kind = _normalize_artifact_kind(artifact_kind)
-    except ValueError:
-        LOGGER.exception(
-            "Invalid artifact_kind %r while saving tensor for key %s",
-            artifact_kind,
-            key,
-        )
-        return INVALID_PARAMS
 
     if kind == "safetensor":
         return self.save_tensor_to_safetensor(
@@ -531,6 +598,7 @@ def _load_tensor(
                 filesystem=filesystem,
                 storage_options=storage_options,
                 tensor_name=tensor_name,
+                map_location=map_location,
             )
         if kind == "kv_cache":
             return self.load_kv_cache_from_file(
@@ -587,6 +655,13 @@ def patch_store_file_io_support() -> None:
 
     if getattr(store_cls, "_mooncake_file_io_patched", False):
         return
+
+    native_save = getattr(store_cls, "save_tensor_to_safetensor", None)
+    if native_save is not None:
+        setattr(store_cls, _NATIVE_SAVE_SAFETENSOR_ATTR, native_save)
+    native_load = getattr(store_cls, "load_tensor_from_safetensor", None)
+    if native_load is not None:
+        setattr(store_cls, _NATIVE_LOAD_SAFETENSOR_ATTR, native_load)
 
     store_cls.save_tensor_to_file = _save_tensor_to_file
     store_cls.load_tensor_from_file = _load_tensor_from_file

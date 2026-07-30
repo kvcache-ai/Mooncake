@@ -26,8 +26,10 @@ tensor-parallel manifests), see [RFC #2868](https://github.com/kvcache-ai/Moonca
 
 Mooncake also ships C++ bindings for **local-only** safetensor export/import
 (`load_tensor_from_safetensor` / `save_tensor_to_safetensor` in
-`mooncake-integration/store/store_py.cpp`). When the Python patch is active,
-those methods delegate to the fsspec layer instead.
+`mooncake-integration/store/store_py.cpp`). The Python patch preserves those
+native methods for ordinary local-path calls. Extended calls, such as `file://`
+URIs, remote targets, explicit `tensor_name`, or `map_location`, use the Python
+filesystem-aware path.
 
 ## Dependencies
 
@@ -47,7 +49,8 @@ pip install "mooncake-transfer-engine[file-io]"
 ```text
 External file (local / file:// / s3://)
   → load_tensor_from_file()  [fsspec open]
-  → safetensors.torch.load / torch.load(weights_only=True)
+  → safetensors.torch.load_file (local) / load (remote)
+    or torch.load(weights_only=True)
   → put_tensor() into Mooncake Store
   → get_tensor() / RDMA transfer to peers
 ```
@@ -119,12 +122,15 @@ store.load_tensor_from_file(
 ) -> torch.Tensor | None
 ```
 
+With `format="auto"`, `.pt` and `.pth` select torch format. All other suffixes,
+including extensionless paths, default to safetensors.
+
 ### Safetensor helpers
 
-`save_tensor_to_safetensor` and `load_tensor_from_safetensor` are thin wrappers
-around the generic APIs with `format="safetensors"`. They accept the same
-`filesystem` and `storage_options` parameters as `save_tensor_to_file` /
-`load_tensor_from_file`.
+`save_tensor_to_safetensor` and `load_tensor_from_safetensor` preserve the
+original C++ implementation for ordinary local-path calls. Calls that use a URI,
+remote filesystem, `storage_options`, `tensor_name`, or `map_location` route to
+the generic APIs with `format="safetensors"`.
 
 ### KV cache aliases
 
@@ -153,6 +159,8 @@ loaded = store.load_tensor_from_safetensor("session/kv", "/tmp/kv.safetensors")
 ### S3 load (requires `s3fs`)
 
 ```python
+import os
+
 tensor = store.load_tensor_from_file(
     "weights/shard0",
     "s3://my-bucket/checkpoints/shard0.safetensors",
@@ -187,10 +195,12 @@ Missing optional packages (`torch`, `safetensors`) raise `ValueError` with an
 install hint; the patch catches these and maps them to error return codes on
 save, or `None` on load.
 
-**Safetensors entry selection:** if a file contains multiple named tensors and
-neither `tensor_name` nor the store key matches an entry, load fails instead of
-silently picking an arbitrary tensor. Single-entry files still accept a store-key
-mismatch and use the only tensor (with a warning).
+**Safetensors entry selection:** the filesystem-aware path fails when a file
+contains multiple named tensors and neither `tensor_name` nor the store key
+matches an entry. Single-entry files accept a store-key mismatch and use the
+only tensor (with a warning). Ordinary local
+`load_tensor_from_safetensor(key, path)` calls retain the legacy C++ behavior,
+which selects the first entry when `key` is absent.
 
 **Torch format safety:** `format="torch"` is blocked for remote schemes such as
 `s3://` unless callers pass `allow_unsafe_remote_torch_load=True`. That flag is

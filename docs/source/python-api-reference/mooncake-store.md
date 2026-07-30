@@ -2674,7 +2674,8 @@ def save_tensor_to_file(
 - `file_name` (str, optional): Destination path or URI. Defaults to `key` when
   omitted.
 - `format` (str): `auto`, `safetensors`, or `torch` (`.pt`/`.pth`). With
-  `auto`, `.safetensors` suffix selects safetensors; otherwise torch is used.
+  `auto`, `.pt` and `.pth` select torch; all other suffixes and extensionless
+  paths default to safetensors.
 - `filesystem` (str): `auto`, `file`, or a fsspec protocol name (`s3`, ...).
   When `file_name` already contains `://`, the URI scheme is used as-is.
 - `storage_options` (dict, optional): Backend credentials/options forwarded to
@@ -2767,12 +2768,15 @@ store.load_tensor_from_safetensor("kv/restored", path.as_uri(), tensor_name="kv_
 
 #### save_tensor_to_safetensor() / load_tensor_from_safetensor()
 
-Safetensors-specific wrappers around `save_tensor_to_file` /
-`load_tensor_from_file`. They accept `filesystem` and `storage_options` in
-addition to the original local-path parameters.
+Safetensors-specific compatibility wrappers. Ordinary local-path calls retain
+the original C++ `save_file` / `load_file` implementation and its entry-selection
+semantics. Calls using `file://`, a remote URI, `storage_options`,
+`tensor_name`, or `map_location` use the filesystem-aware Python
+`save_tensor_to_file` / `load_tensor_from_file` path instead.
 
-When the Python patch is **not** loaded, the C++ bindings still support
-**local paths only** for these two methods.
+The extended load wrapper accepts `map_location` and applies it after decoding.
+When the Python patch is **not** loaded, the C++ bindings support **local paths
+only** for these two methods.
 
 #### save_kv_cache_to_file() / load_kv_cache_from_file()
 

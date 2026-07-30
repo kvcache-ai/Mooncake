@@ -1,10 +1,22 @@
-import unittest
+import io
 import os
-import time
 import tempfile
+import time
+import unittest
 import uuid
 from pathlib import Path
+from unittest import mock
+
 from mooncake.store import MooncakeDistributedStore
+from mooncake.store_file_io import (
+    INVALID_PARAMS,
+    _load_tensor,
+    _load_tensor_from_safetensor,
+    _normalize_format,
+    _save_tensor,
+    _save_tensor_to_safetensor,
+    _torch_save_to_handle,
+)
 
 # The lease time of the kv object, should be set equal to
 # the master's value.
@@ -41,6 +53,140 @@ def get_client(store):
 
     if retcode:
         raise RuntimeError(f"Failed to setup store client. Return code: {retcode}")
+
+
+class TestStoreFileIOHelpers(unittest.TestCase):
+    def test_auto_format_defaults_ambiguous_paths_to_safetensors(self):
+        self.assertEqual(
+            _normalize_format("auto", "s3://bucket/checkpoint"), "safetensors"
+        )
+        self.assertEqual(_normalize_format(None, "checkpoint"), "safetensors")
+        self.assertEqual(_normalize_format("auto", "checkpoint.pt"), "torch")
+        self.assertEqual(_normalize_format("auto", "checkpoint.pth"), "torch")
+
+    def test_non_seekable_torch_save_uses_buffer(self):
+        import torch
+
+        class NonSeekableBuffer(io.BytesIO):
+            def seekable(self):
+                return False
+
+        tensor = torch.tensor([1.0, 2.0, 3.0])
+        target = NonSeekableBuffer()
+
+        _torch_save_to_handle(tensor, target)
+
+        restored = torch.load(
+            io.BytesIO(target.getvalue()),
+            map_location="cpu",
+            weights_only=True,
+        )
+        self.assertTrue(torch.equal(tensor, restored))
+
+    def test_local_legacy_safetensor_save_uses_native_method(self):
+        native_save = mock.Mock(return_value=0)
+
+        class FakeStore:
+            _mooncake_native_save_tensor_to_safetensor = native_save
+            save_tensor_to_file = mock.Mock(return_value=0)
+
+        store = FakeStore()
+        result = _save_tensor_to_safetensor(store, "key", "/tmp/tensor.safetensors")
+
+        self.assertEqual(result, 0)
+        native_save.assert_called_once_with(store, "key", "/tmp/tensor.safetensors")
+        store.save_tensor_to_file.assert_not_called()
+
+    def test_remote_safetensor_save_uses_filesystem_path(self):
+        native_save = mock.Mock(return_value=0)
+
+        class FakeStore:
+            _mooncake_native_save_tensor_to_safetensor = native_save
+
+            def __init__(self):
+                self.save_tensor_to_file = mock.Mock(return_value=0)
+
+        store = FakeStore()
+        result = _save_tensor_to_safetensor(
+            store, "key", "s3://bucket/tensor.safetensors"
+        )
+
+        self.assertEqual(result, 0)
+        native_save.assert_not_called()
+        store.save_tensor_to_file.assert_called_once_with(
+            "key",
+            file_name="s3://bucket/tensor.safetensors",
+            format="safetensors",
+            filesystem="auto",
+            storage_options=None,
+            tensor_name=None,
+        )
+
+    def test_safetensor_route_forwards_map_location(self):
+        store = mock.Mock()
+        store.load_tensor_from_safetensor.return_value = "loaded"
+
+        result = _load_tensor(
+            store,
+            "key",
+            file_name="/tmp/tensor.safetensors",
+            artifact_kind="safetensor",
+            map_location="cpu",
+        )
+
+        self.assertEqual(result, "loaded")
+        store.load_tensor_from_safetensor.assert_called_once_with(
+            key="key",
+            file_name="/tmp/tensor.safetensors",
+            filesystem="auto",
+            storage_options=None,
+            tensor_name=None,
+            map_location="cpu",
+        )
+
+    def test_safetensor_wrapper_forwards_map_location_to_file_loader(self):
+        native_load = mock.Mock(return_value="native")
+
+        class FakeStore:
+            _mooncake_native_load_tensor_from_safetensor = native_load
+
+            def __init__(self):
+                self.load_tensor_from_file = mock.Mock(return_value="loaded")
+
+        store = FakeStore()
+        result = _load_tensor_from_safetensor(
+            store,
+            "key",
+            "/tmp/tensor.safetensors",
+            map_location="cpu",
+        )
+
+        self.assertEqual(result, "loaded")
+        native_load.assert_not_called()
+        store.load_tensor_from_file.assert_called_once_with(
+            key="key",
+            file_name="/tmp/tensor.safetensors",
+            format="safetensors",
+            filesystem="auto",
+            storage_options=None,
+            tensor_name=None,
+            map_location="cpu",
+        )
+
+    def test_invalid_save_request_does_not_mutate_store(self):
+        store = mock.Mock()
+        tensor = object()
+
+        result = _save_tensor(
+            store,
+            "key",
+            tensor,
+            file_name="/tmp/tensor.safetensors",
+            artifact_kind="not-a-real-kind",
+        )
+
+        self.assertEqual(result, INVALID_PARAMS)
+        store.put_tensor.assert_not_called()
 
 
 class TestSafetensorFunctions(unittest.TestCase):
@@ -639,7 +785,6 @@ class TestSafetensorFunctions(unittest.TestCase):
     def test_save_tensor_invalid_artifact_kind(self):
         """Unsupported artifact_kind should map to INVALID_PARAMS, not raise."""
         import torch
-        from mooncake.store_file_io import INVALID_PARAMS
 
         tensor = torch.tensor([1.0], dtype=torch.float32)
         key_suffix = uuid.uuid4().hex
@@ -658,6 +803,7 @@ class TestSafetensorFunctions(unittest.TestCase):
                 artifact_kind="not-a-real-kind",
             )
             self.assertEqual(result, INVALID_PARAMS)
+            self.assertIsNone(self.store.get_tensor(key))
         finally:
             if os.path.exists(temp_filename):
                 os.remove(temp_filename)
