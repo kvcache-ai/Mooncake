@@ -180,28 +180,44 @@ jobs:
             exit 1
           fi
 
+      - name: Smoke test the exact release wheel
+        shell: bash
+        run: |
+          set -eo pipefail
+          # Install the actual per-matrix release artifact (cp310-cp313) into a
+          # fresh venv and exercise the packaged binary, so packaging/ELF-layout
+          # failures in any version are caught before this wheel reaches PyPI.
+          # No GPU is needed for `mooncake_master --version`.
+          smoke_venv=$(mktemp -d)
+          "${PYTHON_BIN}" -m venv "$smoke_venv"
+          "$smoke_venv/bin/python" -m pip install --no-deps \
+            mooncake-wheel/dist-rocm-py${{ steps.generate_tag_release.outputs.python_version_tag }}/*.whl
+          export LD_LIBRARY_PATH="/opt/rocm/lib:/usr/local/lib:${LD_LIBRARY_PATH:-}"
+          site="$("$smoke_venv/bin/python" -c 'import mooncake,os;print(os.path.dirname(mooncake.__file__))')"
+          "$site/mooncake_master" --version
+
       - name: Upload Python wheel artifact
         uses: actions/upload-artifact@v4
         with:
           name: mooncake-wheel-rocm-x86_64-py${{ steps.generate_tag_release.outputs.python_version_tag }}
           path: mooncake-wheel/dist-rocm-py${{ steps.generate_tag_release.outputs.python_version_tag }}/*.whl
 
-  publish-release:
+  # Publish to PyPI and attach to the GitHub Release in SEPARATE jobs, with the
+  # GitHub Release job depending on PyPI. PyPI uploads are immutable, so if a
+  # single combined job published to PyPI and then failed on the GitHub Release
+  # upload, "re-run failed jobs" would restart at the (now-rejected) PyPI step
+  # and could never reach the release upload. Split jobs let a transient GitHub
+  # Release failure be retried on its own without republishing PyPI files.
+  publish-pypi:
     if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.ref_name, '-') }}
     needs: build
     runs-on: ubuntu-22.04
     environment: pypi
 
     permissions:
-      contents: write
       id-token: write
 
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-        with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
-
       - name: Download all wheel artifacts
         uses: actions/download-artifact@v4
         with:
@@ -215,10 +231,6 @@ jobs:
           echo "Collected wheels for release:"
           ls -la mooncake-wheel/dist-release/
 
-      # Publish to PyPI BEFORE attaching to the GitHub Release, so an
-      # authentication/config failure fails the job without leaving a
-      # dangling GitHub Release with no corresponding PyPI upload.
-      #
       # PREREQUISITE (one-time, maintainer/PyPI-owner action): this uses OIDC
       # (no API token), so PyPI must have a Trusted Publisher configured for
       # the NEW project `mooncake-transfer-engine-rocm` with identity
@@ -229,6 +241,29 @@ jobs:
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: mooncake-wheel/dist-release/
+
+  publish-github-release:
+    # Runs only after PyPI succeeds; can be re-run on its own if the GitHub
+    # Release upload fails transiently, without touching the immutable PyPI files.
+    if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.ref_name, '-') }}
+    needs: publish-pypi
+    runs-on: ubuntu-22.04
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: mooncake-wheel/dist-all
+          pattern: mooncake-wheel-rocm-*
+
+      - name: Prepare wheels for release
+        run: |
+          mkdir -p mooncake-wheel/dist-release
+          find mooncake-wheel/dist-all -name "*.whl" -exec cp {} mooncake-wheel/dist-release/ \;
+          ls -la mooncake-wheel/dist-release/
 
       - name: Upload wheels to GitHub Release
         uses: softprops/action-gh-release@v1
