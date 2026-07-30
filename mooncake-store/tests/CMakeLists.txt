@@ -141,7 +141,7 @@ add_test(
   NAME dummy_client_object_checksum_test
   COMMAND
     dummy_client_get_buffer_test
-    "--gtest_filter=DummyClientGetBufferTest.GetIntoRejectsCorruptedObjectWithChecksum"
+    "--gtest_filter=DummyClientGetBufferTest.GetIntoRejectsCorruptedObjectWithChecksum:DummyClientGetBufferTest.BatchQueryPreservesObjectChecksum"
 )
 set_tests_properties(dummy_client_object_checksum_test
                      PROPERTIES ENVIRONMENT "MOONCAKE_STORE_CHECKSUM=1")

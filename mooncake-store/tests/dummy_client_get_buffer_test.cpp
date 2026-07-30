@@ -52,6 +52,7 @@ static void RegisterRpcHandlers(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::acquire_buffer_dummy>(&rc);
     server.register_handler<&RealClient::release_buffer_dummy>(&rc);
     server.register_handler<&RealClient::batch_acquire_buffer_dummy>(&rc);
+    server.register_handler<&RealClient::batch_get_query_results>(&rc);
 }
 
 static constexpr size_t kMB = 1024ULL * 1024;
@@ -405,6 +406,28 @@ TEST_F(DummyClientGetBufferTest, GetIntoRejectsCorruptedObjectWithChecksum) {
     stored_data[0] ^= 0x01;
     EXPECT_EQ(dummy_client_->unregister_buffer(target), 0);
     EXPECT_EQ(ShmHelper::getInstance()->free(target), 0);
+}
+
+TEST_F(DummyClientGetBufferTest, BatchQueryPreservesObjectChecksum) {
+    if (!Environ::Get().GetStoreChecksumEnabled()) {
+        GTEST_SKIP() << "MOONCAKE_STORE_CHECKSUM is not enabled";
+    }
+    ASSERT_TRUE(SetupStack()) << "Failed to bring up real+dummy stack";
+
+    const std::string key = "dummy_batch_query_checksum";
+    const std::string data = "0123456789abcdef";
+    PutData(key, data);
+
+    auto real_results = real_client_->batch_query({key});
+    ASSERT_EQ(real_results.size(), 1);
+    ASSERT_TRUE(real_results[0].has_value());
+    ASSERT_TRUE(real_results[0]->object_checksum.has_value());
+
+    auto dummy_results = dummy_client_->batch_query({key});
+    ASSERT_EQ(dummy_results.size(), 1);
+    ASSERT_TRUE(dummy_results[0].has_value());
+    EXPECT_EQ(dummy_results[0]->object_checksum,
+              real_results[0]->object_checksum);
 }
 
 // ---- Test: get_buffer via hot cache shm zero-copy path ----

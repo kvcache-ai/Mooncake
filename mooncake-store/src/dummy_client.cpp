@@ -1058,15 +1058,8 @@ std::vector<tl::expected<QueryResult, ErrorCode>> DummyClient::batch_query(
     results.reserve(keys.size());
     const auto now = std::chrono::steady_clock::now();
     for (const auto& cached_result : *cached_results) {
-        if (!cached_result.success) {
-            results.emplace_back(tl::unexpected(cached_result.error));
-            continue;
-        }
-        results.emplace_back(QueryResult(
-            std::vector<Replica::Descriptor>(
-                cached_result.value.replicas.begin(),
-                cached_result.value.replicas.end()),
-            now + std::chrono::milliseconds(cached_result.value.lease_ttl_ms)));
+        results.emplace_back(
+            from_cached_query_result_response(cached_result, now));
     }
     return results;
 }
