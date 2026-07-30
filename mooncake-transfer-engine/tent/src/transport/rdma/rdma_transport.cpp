@@ -834,6 +834,22 @@ int RdmaTransport::processNotifyCompletions() {
                 }
                 LOG(ERROR) << "Notification completion failed: " << wc[i].status
                            << ", qp_num=" << wc[i].qp_num;
+                // A completion error here (e.g. IBV_WC_WR_FLUSH_ERR after the
+                // peer restarted while we still consider the endpoint live)
+                // leaves this notify QP permanently unusable. Nothing else
+                // tears a notify endpoint down on its own: it stays EP_READY,
+                // so getEndpoint() keeps handing back the same broken QP and
+                // every future sendNotification() silently flushes. Reset the
+                // endpoint so it is removed from the endpoint store; the next
+                // getEndpoint() then rebuilds a fresh endpoint + notify QP.
+                //
+                // The notify_endpoint_map_lock_ ReadGuard was already released
+                // above, and resetConnection()'s teardown re-takes it via
+                // unregisterNotifyQp(); the locally held shared_ptr keeps the
+                // endpoint alive across the call.
+                if (endpoint) {
+                    endpoint->resetConnection("notify QP completion error");
+                }
                 continue;
             }
 
