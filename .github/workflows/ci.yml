@@ -853,7 +853,7 @@ jobs:
           fi
         fi
         echo "Comparing against: ${BASE_REF}"
-        ./scripts/code_format.sh --check --base "${BASE_REF}"
+        ./scripts/code_format.sh --check --changed-lines --base "${BASE_REF}"
       shell: bash
 
 
