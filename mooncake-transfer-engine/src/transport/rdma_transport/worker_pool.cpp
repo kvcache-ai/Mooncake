@@ -79,6 +79,19 @@ static int selectPeerDevice(RdmaTransport::SegmentDesc *peer_segment_desc,
                    << " addr=" << (void *)offset << " len=" << length;
         return ERR_ADDRESS_NOT_REGISTERED;
     }
+
+    // device_id comes from the peer-supplied topology, whose HCA list is
+    // independent of the peer 'devices' array, so bound it against that array
+    // too before the devices[device_id] accesses below. decodeSegmentDesc()
+    // now rejects a descriptor whose key count and device count disagree, which
+    // makes this check redundant for descriptors that arrived through the
+    // metadata path; it is kept as a local bound on the value actually used.
+    if (static_cast<size_t>(device_id) >= peer_segment_desc->devices.size()) {
+        LOG(ERROR) << "[RDMA] Peer device index out of range: seg="
+                   << peer_segment_desc->name << " device_id=" << device_id
+                   << " devices=" << peer_segment_desc->devices.size();
+        return ERR_ADDRESS_NOT_REGISTERED;
+    }
     return 0;
 }
 
