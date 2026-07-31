@@ -721,6 +721,32 @@ TEST_F(MasterServiceTenantQuotaTest,
 }
 
 TEST_F(MasterServiceTenantQuotaTest,
+       SizeChangingUpsertFromDiskOnlyObjectChargesNewReplica) {
+    const TenantId tenant_id("tenant-a");
+    MasterService service(MakeConfig({{tenant_id, 1000}}));
+    UUID client_id = MountSegment(service);
+
+    StorageObjectMetadata metadata;
+    metadata.data_size = 100;
+    metadata.transport_endpoint = "disk-endpoint";
+    std::vector<OffloadTaskItem> tasks{OffloadTaskItem{
+        .tenant_id = tenant_id.value(), .key = "key", .size = 100}};
+    ASSERT_TRUE(
+        service.NotifyOffloadSuccess(client_id, tasks, {metadata}).has_value());
+    ASSERT_EQ(Snapshot(service, tenant_id).charged_bytes, 0);
+
+    auto upsert =
+        service.UpsertStart(client_id, "key", tenant_id, 200, MemoryConfig());
+    ASSERT_TRUE(upsert.has_value()) << toString(upsert.error());
+    EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 200);
+
+    auto end =
+        service.UpsertEnd(client_id, "key", tenant_id, ReplicaType::MEMORY);
+    ASSERT_TRUE(end.has_value()) << toString(end.error());
+    EXPECT_EQ(Snapshot(service, tenant_id).charged_bytes, 200);
+}
+
+TEST_F(MasterServiceTenantQuotaTest,
        SizeChangingUpsertRevokeReleasesNewAndReplacementCharge) {
     const TenantId tenant_id("tenant-a");
     MasterService service(MakeConfig({{tenant_id, 1000}}));

@@ -630,6 +630,32 @@ TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesMemoryBufferDescriptor) {
     EXPECT_EQ(restored.transport_endpoint_, endpoint);
 }
 
+TEST_F(MasterServiceHATest, RestoreFromStandbyRebuildsTenantQuotaAccounting) {
+    const TenantId tenant_id("tenant_a");
+    constexpr uint64_t object_size = 1024;
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_multi_tenants(true)
+                      .set_tenant_quota_connector_type("file")
+                      .set_tenant_quota_connector_uri(WriteTenantPolicyFile(
+                          {{tenant_id.value(), object_size}}))
+                      .build();
+    MasterService service(config);
+
+    const std::string key = "standby_quota_key";
+    const std::string endpoint = "standby_quota_segment";
+    auto object = MakeStandbyObject(key, endpoint, object_size);
+    object.tenant_id = tenant_id.value();
+
+    service.RestoreFromStandbySnapshot({object}, 7,
+                                       {MakeStandbyMemorySegment(endpoint)});
+
+    auto snapshot = service.GetTenantQuotaSnapshot(tenant_id);
+    ASSERT_TRUE(snapshot.has_value());
+    EXPECT_EQ(snapshot->charged_bytes, object_size);
+    ASSERT_TRUE(service.Remove(key, tenant_id, /*force=*/true).has_value());
+    EXPECT_EQ(service.GetTenantQuotaSnapshot(tenant_id)->charged_bytes, 0);
+}
+
 TEST_F(MasterServiceHATest, RemountMakesRestoredMemoryReplicaReady) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());

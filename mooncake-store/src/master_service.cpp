@@ -2695,6 +2695,10 @@ void MasterService::RestoreFromStandbySnapshot(
         }
     }
 
+    if (enable_multi_tenants_) {
+        RebuildTenantQuotaUsageFromMetadata();
+    }
+
     // 4. Log the result.
     LOG(INFO) << "Restored from standby: " << objects.size() << " objects, "
               << segments.size()
@@ -4464,7 +4468,10 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 const std::string existing_group_id = metadata.group_id;
                 TenantQuotaLedger replacement_charge;
                 auto* quota_account = GetBoundTenantQuotaHandle(tenant_state);
-                if (enable_multi_tenants_) {
+                const bool has_replacement_charge =
+                    enable_multi_tenants_ &&
+                    metadata.quota_ledger.TotalChargedBytes() != 0;
+                if (has_replacement_charge) {
                     auto transfer_result =
                         metadata.quota_ledger.TransferReplacementCharge(
                             quota_account, replacement_charge);
@@ -4493,7 +4500,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     existing_group_id, object_id.tenant_id, now,
                     quota_deficit_bytes);
                 if (!allocate_result) {
-                    if (enable_multi_tenants_) {
+                    if (has_replacement_charge) {
                         auto rollback_result =
                             replacement_charge.ReleaseReplacement(
                                 quota_account);
@@ -4504,7 +4511,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     return allocate_result;
                 }
                 auto new_it = tenant_state.metadata.find(key);
-                if (enable_multi_tenants_) {
+                if (has_replacement_charge) {
                     if (new_it == tenant_state.metadata.end()) {
                         auto rollback_result =
                             replacement_charge.ReleaseReplacement(
