@@ -61,9 +61,17 @@ struct TaskInfo {
     bool cancel_requested{false};
     TransferStatusEnum status{TransferStatusEnum::PENDING};
     volatile TransferStatusEnum staging_status{TransferStatusEnum::PENDING};
-    std::chrono::steady_clock::time_point start_time{};     // Submit time
-    std::chrono::steady_clock::time_point dispatch_time{};  // Dispatch entry
-    std::chrono::steady_clock::time_point post_time{};      // Transport post
+    std::chrono::steady_clock::time_point start_time{};     // Request submit
+    std::chrono::steady_clock::time_point dispatch_time{};  // Initial dispatch
+    std::chrono::steady_clock::time_point post_time{};      // Initial post
+    // Current physical attempt. Replaced before each transport submission;
+    // post_time above intentionally remains the logical request's first post.
+    // attempt_type is captured at attempt start so the attempt is attributed to
+    // the transport that actually ran it, even if task.type is later
+    // overwritten by failover before the attempt is finished.
+    std::chrono::steady_clock::time_point attempt_post_time{};
+    TransportType attempt_type{UNSPEC};
+    bool attempt_active{false};
 };
 
 class TransferEngineImpl {
@@ -287,6 +295,12 @@ class TransferEngineImpl {
     void recordTaskCompletionMetrics(TaskInfo& task,
                                      TransferStatusEnum prev_status,
                                      TransferStatusEnum new_status);
+
+    void startTransportAttempt(TaskInfo& task, TransportType type,
+                               std::chrono::steady_clock::time_point post_time);
+
+    void finishTransportAttempt(TaskInfo& task, TransferStatusEnum status,
+                                std::chrono::steady_clock::time_point end_time);
 
    private:
     struct AllocatedMemory {

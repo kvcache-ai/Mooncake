@@ -227,6 +227,8 @@ Read: 1.00 MB (100 reqs, 2 fails) | Write: 512.00 KB (50 reqs, 1 fails)
 | `tent_read_failures_total` | Counter | `transport` | Total read failures via TENT |
 | `tent_write_failures_total` | Counter | `transport` | Total write failures via TENT |
 | `tent_transport_failover_total` | Counter | `from`, `to` | Total cross-transport failover events |
+| `tent_transport_attempts_total` | Counter | `transport`, `operation` | Physical transport attempts submitted for execution |
+| `tent_transport_attempt_failures_total` | Counter | `transport`, `operation` | Physical transport attempts that terminated with `FAILED` |
 | `tent_deadline_infeasible_total` | Counter | `transport` | Transfers whose deadline was already in the past at submit time |
 | `tent_read_latency_us` | Histogram | `transport` | Read latency distribution in microseconds |
 | `tent_write_latency_us` | Histogram | `transport` | Write latency distribution in microseconds |
@@ -236,35 +238,39 @@ Read: 1.00 MB (100 reqs, 2 fails) | Write: 512.00 KB (50 reqs, 1 fails)
 | `tent_stage_queue_wait_us` | Histogram | `transport` | Causal chain: queue wait latency in microseconds |
 | `tent_stage_dispatch_us` | Histogram | `transport` | Causal chain: dispatch latency in microseconds |
 | `tent_stage_transport_us` | Histogram | `transport` | Causal chain: transport execution latency in microseconds |
+| `tent_transport_attempt_latency_us` | Histogram | `transport`, `operation` | Observed latency of each physical transport attempt |
 
 **Notes**:
-- `*_requests_total` counts both successful and failed requests. To compute the success rate, use `1 - (failures / requests)`.
+- `*_requests_total` counts terminal logical/merged-transfer outcomes. Its `transport` label is the **final transport**: a request recovered by RDMA→TCP failover is counted once under `tcp`.
+- `tent_transport_attempts_total` and `tent_transport_attempt_failures_total` measure physical transport reliability. A recovered RDMA→TCP request contributes one failed RDMA attempt and one successful TCP attempt.
+- Attempt latency currently ends when polling or the progress worker observes the terminal status, so it may include completion-observation delay.
 - `*_failures_total` does not record bytes; failed transfers transfer no bytes.
 - `tent_deadline_infeasible_total` is a dedicated counter (not a histogram sentinel) so infeasible-at-submit cases are distinguishable from genuine high-MLU samples.
 - yalantinglibs omits zero-valued counters/histograms from the Prometheus output, so a metric only appears once it has been observed at least once.
 
 ### Labels
 
-All metrics carry a `transport` label (the `tent_transport_failover_total`
-counter uses `from` and `to` instead) so every metric can be sliced by
-transport without grepping logs. Label values come exclusively from the
-`TransportType` enum closed set — no arbitrary strings are accepted, and
-the closed set is enforced at the type level via a pre-built lookup table
-indexed by enum.
+Transfer and attempt metrics carry a `transport` label (the
+`tent_transport_failover_total` counter uses `from` and `to` instead) so they
+can be sliced by transport without grepping logs. Attempt metrics also carry
+an `operation` label. Label values come exclusively from the `TransportType`
+enum closed set — no arbitrary transport strings are accepted.
 
 | Label | Values | Description |
 |-------|--------|-------------|
 | `transport` | `unspec`, `rdma`, `mnnvl`, `shm`, `nvlink`, `gds`, `io_uring`, `tcp`, `ascend`, `sunrise_link`, `tpu` | The transport that handled the transfer |
+| `operation` | `read`, `write` | Attempt operation |
 | `from` | (same set) | Transport that failed before failover |
 | `to` | (same set) | Transport that the failover switched to |
 
-Label values are aligned with `TransportSelector::transportTypeName()`.
+Transport label values come from the shared `transportTypeName()` mapping.
 `unspec` covers transfers that failed before a transport was selected.
 
 **Cardinality**: the `transport` label has 11 values; the failover
 `from`/`to` pair has at most 11x11 = 121 combinations (in practice only a
-few pairs ever occur). Total series across all metrics is bounded at
-~1500.
+few pairs ever occur), and each attempt metric has at most 11x2 = 22
+transport/operation combinations. Total series across all metrics is bounded
+at ~1500.
 
 ## Integration with TransferEngine
 
@@ -285,8 +291,22 @@ Metrics are automatically recorded at the TENT layer:
 
 - **Latency tracking**: Start time is recorded when `submitTransfer` is called
 - **Metrics recording**: When `getTransferStatus` detects task completion, latency is calculated and metrics are recorded
+- **Attempt tracking**: Each concrete `Transport::submitTransferTasks()` call is counted as one attempt. A failed attempt is closed before failover changes the task's current transport, and the replacement attempt gets a fresh attempt timestamp. Synchronous submit failures are also closed as failed attempts. The transport is captured when the attempt starts, so it is attributed correctly even if failover overwrites the task's current transport afterwards. Staging is an orchestration step, not a transport attempt: `ProxyManager` chunks the transfer and issues the real transport submissions, which are the ones counted, so a staged transfer is not double-counted.
 
-This provides end-to-end latency measurement across all transport types (RDMA, TCP, NVLink, etc.).
+This provides two complementary views:
+
+- Logical request latency and outcome, attributed to the final transport for backward compatibility.
+- Physical attempt count, failure count, and latency, attributed to the transport that actually executed that attempt.
+
+For a recovered RDMA→TCP request, request metrics record one successful TCP
+outcome, while attempt metrics record one failed RDMA attempt and one successful
+TCP attempt. The causal-chain stage metrics (`tent_stage_queue_wait_us`,
+`tent_stage_dispatch_us`, `tent_stage_transport_us`) are unchanged by this
+addition: they remain attributed to the final transport and
+`tent_stage_transport_us` still spans the whole request, so existing dashboards
+keep their meaning. Use `tent_transport_attempt_latency_us` (labeled by the
+transport that actually ran each attempt) to inspect per-attempt latency in a
+multi-attempt request.
 
 **Note**: Remember to build with `-DTENT_METRICS_ENABLED=ON` to enable metrics collection.
 
@@ -427,4 +447,19 @@ histogram_quantile(0.99, rate(tent_read_latency_us_bucket{transport="rdma"}[5m])
 
 # Failover rate by transport pair
 rate(tent_transport_failover_total{from="rdma",to="tcp"}[5m])
+
+# RDMA physical-attempt failure rate
+sum(rate(tent_transport_attempt_failures_total{transport="rdma"}[5m]))
+/
+sum(rate(tent_transport_attempts_total{transport="rdma"}[5m]))
+
+# P99 latency of RDMA write attempts
+histogram_quantile(
+  0.99,
+  sum by (le) (
+    rate(tent_transport_attempt_latency_us_bucket{
+      transport="rdma",operation="write"
+    }[5m])
+  )
+) / 1000000
 ```

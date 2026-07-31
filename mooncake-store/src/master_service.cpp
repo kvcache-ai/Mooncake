@@ -11,7 +11,6 @@
 #include <cstring>
 #include <future>
 #include <limits>
-#include <random>
 #include <shared_mutex>
 #include <sstream>
 #include <stdexcept>
@@ -49,6 +48,7 @@
 #include "ha/snapshot/snapshot_logger.h"
 #include "utils/zstd_util.h"
 #include "utils/file_util.h"
+#include "random.h"
 #include "utils.h"
 #include "kv_event/kv_event_config.h"
 #include "master_snapshot_manager.h"
@@ -87,12 +87,6 @@ tl::expected<SnapshotCatalogBackendKind, std::string> ParseSnapshotCatalogKind(
                                std::string(store_type));
 }
 
-size_t RandomIndex(size_t upper_bound) {
-    static thread_local std::mt19937 generator(std::random_device{}());
-    std::uniform_int_distribution<size_t> dist(0, upper_bound - 1);
-    return dist(generator);
-}
-
 uint64_t SaturatingAdd(uint64_t lhs, uint64_t rhs) {
     if (lhs > std::numeric_limits<uint64_t>::max() - rhs) {
         return std::numeric_limits<uint64_t>::max();
@@ -107,6 +101,24 @@ uint64_t SaturatingMultiply(uint64_t lhs, uint64_t rhs) {
     return lhs * rhs;
 }
 
+// Decides whether PutStart may proceed with the replicas that were
+// actually allocated. Three deliberately different policies apply:
+//
+//  - Memory-only (nof_replica_num == 0): best-effort. Fewer than
+//    config.replica_num replicas (but at least one) still succeed, even
+//    though DetermineReplicaWriteMode() classifies such configs as
+//    RELIABLE_MULTI_REPLICA. The shortfall is surfaced via a WARNING log
+//    (action=put_start_partial_allocation) and the
+//    master_put_start_partial_allocations_total metric.
+//  - FLEXIBLE_DUAL_REPLICA (1 memory + 1 NoF): allocating either side
+//    alone is sufficient.
+//  - Any other config with nof_replica_num > 0: strict. Both replica
+//    types must match the requested counts exactly, otherwise PutStart
+//    fails with NO_AVAILABLE_HANDLE.
+//
+// The "reliable" guarantee of RELIABLE_MULTI_REPLICA is enforced at the
+// transfer stage (all allocated replicas must complete or the put is
+// revoked), not at the allocation stage for memory-only configs.
 bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
                                   size_t allocated_memory_replicas,
                                   size_t allocated_nof_replicas) {
@@ -604,6 +616,12 @@ MasterService::~MasterService() {
         MasterMetricManager::instance().dec_allocated_mem_size(
             segment, static_cast<int64_t>(bytes));
     }
+
+    // Segments still mounted here never went through CommitUnmountSegment;
+    // release their capacity contribution so the process-lifetime
+    // MasterMetricManager stays consistent when the next leadership term
+    // constructs a fresh MasterService and the clients remount.
+    segment_manager_.releaseCapacityMetrics();
 }
 
 ErrorCode MasterService::SetBatchOpLogBackendForTesting(
@@ -1934,6 +1952,17 @@ MasterService::EraseMetadata(
             source->dec_refcnt();
         }
         tenant_state.offloading_tasks.erase(offload_it);
+
+        // Mirror entry in local_disk_segment.offloading_objects must be
+        // dropped too, otherwise the next OffloadObjectHeartbeat drains a
+        // task-less key back to the client and produces an orphan bucket.
+        const std::string scoped_key = tenant_id.MakeScopedKey(key);
+        ScopedLocalDiskSegmentAccess ssd_access =
+            segment_manager_.getLocalDiskSegmentAccess();
+        for (auto& [_, segment] : ssd_access.getClientLocalDiskSegment()) {
+            MutexLocker locker(&segment->offloading_mutex_);
+            segment->offloading_objects.erase(scoped_key);
+        }
     }
     tenant_state.processing_keys.erase(key);
     auto replication_task_it = tenant_state.replication_tasks.find(key);
@@ -2368,7 +2397,7 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
         }
     }
 
-    const size_t start_shard = RandomIndex(kNumShards);
+    const size_t start_shard = randomIndex(kNumShards);
     for (size_t scanned = 0; scanned < kNumShards; ++scanned) {
         const size_t shard_idx =
             (start_shard + kNumShards - scanned) % kNumShards;
@@ -3098,7 +3127,8 @@ auto MasterService::GetReplicaList(const std::string& key,
         }
 
         resp = GetReplicaListResponse(std::move(replica_list),
-                                      default_kv_lease_ttl_);
+                                      default_kv_lease_ttl_,
+                                      metadata.object_checksum);
     }
     // RO accessor released. Safe to take a fresh RW accessor now.
     if (promotion_eligible) {
@@ -3134,7 +3164,8 @@ auto MasterService::GetReplicaListForAdmin(const std::string& key,
     }
 
     return GetReplicaListResponse(std::move(replica_list),
-                                  default_kv_lease_ttl_);
+                                  default_kv_lease_ttl_,
+                                  metadata.object_checksum);
 }
 
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
@@ -3171,7 +3202,7 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
         }
     }
 
-    const size_t start_shard = RandomIndex(kNumShards);
+    const size_t start_shard = randomIndex(kNumShards);
     for (size_t scanned = 0; scanned < kNumShards; ++scanned) {
         const size_t shard_idx =
             (start_shard + kNumShards - scanned) % kNumShards;
@@ -3257,7 +3288,8 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                 }
 
                 results[original_idx] = GetReplicaListResponse(
-                    std::move(replica_list), default_kv_lease_ttl_);
+                    std::move(replica_list), default_kv_lease_ttl_,
+                    metadata.object_checksum);
             }
         }
 
@@ -3303,7 +3335,7 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
         }
     }
 
-    const size_t start_shard = RandomIndex(kNumShards);
+    const size_t start_shard = randomIndex(kNumShards);
     for (size_t scanned = 0; scanned < kNumShards; ++scanned) {
         const size_t shard_idx =
             (start_shard + kNumShards - scanned) % kNumShards;
@@ -3350,7 +3382,8 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
                 }
 
                 results[original_idx] = GetReplicaListResponse(
-                    std::move(replica_list), default_kv_lease_ttl_);
+                    std::move(replica_list), default_kv_lease_ttl_,
+                    metadata.object_checksum);
             }
         }
     }
@@ -3527,6 +3560,21 @@ auto MasterService::AllocateAndInsertMetadata(
                 << ", allocated_nof_replicas=" << allocated_nof_replicas;
         refund_pending_quota();
         return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+
+    // Best-effort / flexible modes may pass the check above with fewer
+    // replicas than requested (see HasExpectedReplicaAllocation). Surface
+    // the degradation so callers and operators can detect the reduced
+    // redundancy instead of failing silently.
+    if (allocated_memory_replicas < config.replica_num ||
+        allocated_nof_replicas < config.nof_replica_num) {
+        MasterMetricManager::instance().inc_put_start_partial_allocations();
+        LOG(WARNING) << "key=" << key << ", action=put_start_partial_allocation"
+                     << ", requested_memory_replicas=" << config.replica_num
+                     << ", allocated_memory_replicas="
+                     << allocated_memory_replicas
+                     << ", requested_nof_replicas=" << config.nof_replica_num
+                     << ", allocated_nof_replicas=" << allocated_nof_replicas;
     }
 
     if (use_disk_replica_) {
@@ -3768,9 +3816,10 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
     return tl::make_unexpected(ErrorCode::TENANT_QUOTA_EXCEEDED);
 }
 
-auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
+auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
                            const TenantId& tenant_id, ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
+    const auto& key = object_meta.key;
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     MetadataAccessorRW accessor(this, object_id);
@@ -3805,6 +3854,13 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
             return replica.type() == replica_type;
         },
         [](Replica& replica) { replica.mark_complete(); });
+
+    if (object_meta.object_checksum.has_value() ||
+        replica_type == ReplicaType::ALL ||
+        replica_type == ReplicaType::MEMORY ||
+        replica_type == ReplicaType::NOF_SSD) {
+        metadata.object_checksum = object_meta.object_checksum;
+    }
 
     auto settle_result =
         SettlePrimaryWriteQuotaIfReady(accessor.GetTenantState(), metadata);
@@ -4079,14 +4135,22 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     return {};
 }
 
+auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
+                           const TenantId& tenant_id, ReplicaType replica_type)
+    -> tl::expected<void, ErrorCode> {
+    return PutEnd(client_id, ObjectMeta{key, std::nullopt}, tenant_id,
+                  replica_type);
+}
+
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
-    const UUID& client_id, const std::vector<std::string>& keys,
+    const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
     const TenantId& tenant_id, ReplicaType replica_type) {
     assert(tenant_id.IsValid());
     std::vector<tl::expected<void, ErrorCode>> results;
-    results.reserve(keys.size());
-    for (const auto& key : keys) {
-        results.emplace_back(PutEnd(client_id, key, tenant_id, replica_type));
+    results.reserve(object_metas.size());
+    for (const auto& object_meta : object_metas) {
+        results.emplace_back(
+            PutEnd(client_id, object_meta, tenant_id, replica_type));
     }
     return results;
 }
@@ -4506,11 +4570,20 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     return tl::make_unexpected(ErrorCode::TENANT_QUOTA_EXCEEDED);
 }
 
+auto MasterService::UpsertEnd(const UUID& client_id,
+                              const ObjectMeta& object_meta,
+                              const TenantId& tenant_id,
+                              ReplicaType replica_type)
+    -> tl::expected<void, ErrorCode> {
+    return PutEnd(client_id, object_meta, tenant_id, replica_type);
+}
+
 auto MasterService::UpsertEnd(const UUID& client_id, const std::string& key,
                               const TenantId& tenant_id,
                               ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
-    return PutEnd(client_id, key, tenant_id, replica_type);
+    return UpsertEnd(client_id, ObjectMeta{key, std::nullopt}, tenant_id,
+                     replica_type);
 }
 
 auto MasterService::UpsertRevoke(const UUID& client_id, const std::string& key,
@@ -4555,9 +4628,9 @@ MasterService::BatchUpsertStart(const UUID& client_id,
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchUpsertEnd(
-    const UUID& client_id, const std::vector<std::string>& keys,
+    const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
     const TenantId& tenant_id) {
-    return BatchPutEnd(client_id, keys, tenant_id);
+    return BatchPutEnd(client_id, object_metas, tenant_id, ReplicaType::ALL);
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchUpsertRevoke(
@@ -7949,7 +8022,7 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
     };
 
     auto pass = [&](bool allow_soft_pinned) {
-        const size_t start_shard = RandomIndex(kNumShards);
+        const size_t start_shard = randomIndex(kNumShards);
         for (size_t scanned = 0;
              scanned < kNumShards && total.freed_bytes < target_bytes;
              ++scanned) {
@@ -8336,7 +8409,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
     // Randomly select a starting shard to avoid imbalance eviction between
     // shards.
-    size_t start_idx = RandomIndex(kNumShards);
+    size_t start_idx = randomIndex(kNumShards);
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
 
     // ===== Phase 1: Parallel candidate collection =====
@@ -8728,7 +8801,7 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                replica.get_refcnt() == 0;
     };
 
-    size_t start_idx = RandomIndex(metadata_shards_.size());
+    size_t start_idx = randomIndex(metadata_shards_.size());
     for (size_t i = 0; i < metadata_shards_.size(); i++) {
         MetadataShardAccessorRW shard(
             this, (start_idx + i) % metadata_shards_.size());
@@ -9629,6 +9702,7 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
 
         it->second.lease_timeout = metadata_ptr->lease_timeout;
         it->second.soft_pin_timeout = metadata_ptr->soft_pin_timeout;
+        it->second.object_checksum = metadata_ptr->object_checksum;
 
         // Recompute disk_object_count for restored metadata
         if (it->second.HasReplica([](const Replica& r) {
@@ -9648,12 +9722,15 @@ MasterService::MetadataSerializer::SerializeMetadata(
     // Pack ObjectMetadata using array structure for efficiency
     // Format: [client_id, put_start_time, size, lease_timeout,
     // has_soft_pin_timeout, soft_pin_timeout, replicas_count, data_type,
-    // replicas..., hard_pinned, group_id]
+    // replicas..., hard_pinned, group_id, object_checksum?]
 
     size_t array_size = 10;  // client_id, put_start_time, size, lease_timeout,
                              // has_soft_pin_timeout, soft_pin_timeout,
                              // replicas_count, data_type, hard_pinned, group_id
     array_size += metadata.CountReplicas();  // One element per replica
+    if (metadata.object_checksum.has_value()) {
+        ++array_size;
+    }
     packer.pack_array(array_size);
 
     // Serialize client_id
@@ -9706,6 +9783,9 @@ MasterService::MetadataSerializer::SerializeMetadata(
 
     packer.pack(metadata.IsHardPinned());
     packer.pack(metadata.group_id);
+    if (metadata.object_checksum.has_value()) {
+        packer.pack(*metadata.object_checksum);
+    }
 
     return {};
 }
@@ -9764,11 +9844,12 @@ MasterService::MetadataSerializer::DeserializeMetadata(
     //   v2: 8 + replicas_count, either data_type or hard_pinned
     //   v3: 9 + replicas_count, data_type + hard_pinned or hard_pinned +
     //   group_id v4: 10 + replicas_count, data_type + hard_pinned + group_id
+    //   v5: 11 + replicas_count, v4 + object_checksum
     // 64-bit arithmetic keeps an attacker-controlled near-UINT32_MAX
     // replicas_count from wrapping the bounds and slipping an out-of-bounds
     // index past the size check.
     constexpr uint64_t kBaseFieldCount = 7;
-    constexpr uint64_t kMaxOptionalFieldCount = 3;
+    constexpr uint64_t kMaxOptionalFieldCount = 4;
     const uint64_t total_elements = obj.via.array.size;
     const uint64_t min_elements = kBaseFieldCount + replicas_count;
     if (total_elements < min_elements ||
@@ -9818,6 +9899,17 @@ MasterService::MetadataSerializer::DeserializeMetadata(
         group_id = array[index++].as<std::string>();
     }
 
+    std::optional<uint64_t> object_checksum;
+    if (index < total_elements &&
+        array[index].type == msgpack::type::POSITIVE_INTEGER) {
+        object_checksum = array[index++].as<uint64_t>();
+    }
+    if (index != total_elements) {
+        return tl::unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL,
+            "deserialize ObjectMetadata optional field type mismatch"));
+    }
+
     // Create ObjectMetadata instance
     bool enable_soft_pin = has_soft_pin_timeout;
     auto metadata = std::make_unique<ObjectMetadata>(
@@ -9826,6 +9918,7 @@ MasterService::MetadataSerializer::DeserializeMetadata(
             std::chrono::milliseconds(put_start_time_timestamp)),
         size, std::move(replicas), enable_soft_pin, is_hard_pinned, data_type,
         group_id);
+    metadata->object_checksum = object_checksum;
     metadata->lease_timeout = std::chrono::system_clock::time_point(
         std::chrono::milliseconds(lease_timestamp));
 
@@ -9882,9 +9975,8 @@ tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
     }
 
     // Randomly pick a segment from the source replicas
-    static thread_local std::mt19937 gen(std::random_device{}());
-    std::uniform_int_distribution<size_t> dis(0, segment_names.size() - 1);
-    std::string selected_source_segment = segment_names[dis(gen)];
+    std::string selected_source_segment =
+        segment_names[randomIndex(segment_names.size())];
     UUID select_client;
     ErrorCode error = segment_accessor.GetClientIdBySegmentName(
         selected_source_segment, select_client);

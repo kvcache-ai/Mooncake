@@ -44,6 +44,7 @@ class EnvironTest : public ::testing::Test {
         unsetenv("MOONCAKE_AWS_RESPONSE_CHECKSUM_VALIDATION");
         unsetenv("MOONCAKE_AWS_CONNECT_TIMEOUT_MS");
         unsetenv("MOONCAKE_AWS_REQUEST_TIMEOUT_MS");
+        unsetenv("MOONCAKE_STORE_CHECKSUM");
     }
 };
 
@@ -147,6 +148,7 @@ TEST_F(EnvironTest, AwsFieldsPopulateFromEnv) {
     setenv("MOONCAKE_AWS_CONNECT_TIMEOUT_MS", "5000", 1);
     // Bogus request timeout should fall back to the registered default.
     setenv("MOONCAKE_AWS_REQUEST_TIMEOUT_MS", "bogus", 1);
+    setenv("MOONCAKE_STORE_CHECKSUM", "1", 1);
 
     const auto& e = Environ::Get();
     EXPECT_EQ(e.GetAwsRegion(), "us-east-1");
@@ -160,6 +162,7 @@ TEST_F(EnvironTest, AwsFieldsPopulateFromEnv) {
     EXPECT_EQ(e.GetAwsResponseChecksumValidation(), "when_supported");
     EXPECT_EQ(e.GetAwsConnectTimeoutMs(), 5000);
     EXPECT_EQ(e.GetAwsRequestTimeoutMs(), 30000);
+    EXPECT_TRUE(e.GetStoreChecksumEnabled());
 }
 
 // --- GetSizeT ---

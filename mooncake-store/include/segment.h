@@ -452,6 +452,18 @@ class SegmentManager {
         : memory_allocator_(memory_allocator), enable_cxl_(enable_cxl) {}
 
     /**
+     * @brief Releases the capacity metric contribution of segments that
+     *        are still mounted. Intended to be called when the owning
+     *        MasterService is torn down: MasterMetricManager outlives
+     *        MasterService instances (e.g. across HA leadership changes).
+     *        This is deliberately not done in the destructor, because other
+     *        SegmentManager instances (such as the temporary snapshot
+     *        readers) hold deserialized records that never contributed to
+     *        the metrics and must not release them.
+     */
+    void releaseCapacityMetrics();
+
+    /**
      * @brief Get RAII-style access to segment management operations
      * @return ScopedSegmentAccess object that holds the lock
      */

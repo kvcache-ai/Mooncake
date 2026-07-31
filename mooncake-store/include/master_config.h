@@ -670,6 +670,10 @@ class WrappedMasterServiceConfig {
             config.nof_eviction_high_watermark_ratio;
         view_version = view_version_param;
         client_live_ttl_sec = config.client_live_ttl_sec;
+        nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;
+        nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
+        nof_heartbeat_failures_threshold =
+            config.nof_heartbeat_failures_threshold;
         enable_ha =
             true;  // This is used in HA mode, so enable_ha should be true
         enable_offload = config.enable_offload;
