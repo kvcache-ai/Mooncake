@@ -15,8 +15,12 @@
 #include "tent/transport/shm/shm_transport.h"
 
 #include <bits/stdint-uintn.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <glog/logging.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include <algorithm>
 #include <cassert>
@@ -165,7 +169,10 @@ Status ShmTransport::removeMemoryBuffer(BufferDesc &desc) {
 }
 
 static inline std::string randomFileName() {
-    std::string result = "mooncake_";
+    // Include pid so concurrent processes rarely collide and leftovers are
+    // easier to attribute during debugging.
+    std::string result =
+        "mooncake_" + std::to_string(static_cast<long>(getpid())) + "_";
     for (int i = 0; i < 8; ++i) result += 'a' + SimpleRandom::Get().next(26);
     return result;
 }
@@ -183,13 +190,20 @@ Status ShmTransport::allocateLocalMemory(void **addr, size_t size,
     if (location.type() != "cpu") {
         return Status::InvalidArgument("ShmTransport allocates DRAM only");
     }
-    options.shm_path = randomFileName();
     options.shm_offset = 0;
-    *addr = createSharedMemory(options.shm_path, size);
-    if (!(*addr)) {
-        return Status::InternalError("Failed to allocate shared memory");
+    for (int attempt = 0; attempt < kShmCreateMaxRetries; ++attempt) {
+        options.shm_path = randomFileName();
+        *addr = createSharedMemory(options.shm_path, size);
+        if (*addr) {
+            return Status::OK();
+        }
+        // createSharedMemory returns nullptr on EEXIST or other failures.
+        // Only retry when the name collided with an existing object.
+        if (errno != EEXIST) {
+            break;
+        }
     }
-    return Status::OK();
+    return Status::InternalError("Failed to allocate shared memory");
 }
 
 Status ShmTransport::freeLocalMemory(void *addr, size_t size) {
@@ -210,20 +224,29 @@ Status ShmTransport::freeLocalMemory(void *addr, size_t size) {
 
 void *ShmTransport::createSharedMemory(const std::string &path, size_t size) {
     int shm_fd = -1;
+    // O_EXCL prevents silently opening and truncating an existing object that
+    // another process may still be using (which would SIGBUS that peer).
     if (cxl_mount_path_.empty())
-        shm_fd = shm_open(path.c_str(), O_CREAT | O_RDWR, 0644);
+        shm_fd = shm_open(path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
     else {
         auto full_path = joinPath(cxl_mount_path_, path);
-        shm_fd = open(full_path.c_str(), O_CREAT | O_RDWR, 0644);
+        shm_fd = open(full_path.c_str(), O_CREAT | O_EXCL | O_RDWR, 0644);
     }
     if (shm_fd == -1) {
-        PLOG(ERROR) << "Failed to open shared memory file";
+        // Preserve errno for allocateLocalMemory retry decisions (EEXIST).
+        if (errno != EEXIST) {
+            PLOG(ERROR) << "Failed to open shared memory file";
+        }
         return nullptr;
     }
 
     if (ftruncate64(shm_fd, size) == -1) {
         PLOG(ERROR) << "Failed to truncate shared memory file";
         close(shm_fd);
+        if (cxl_mount_path_.empty())
+            shm_unlink(path.c_str());
+        else
+            unlink(joinPath(cxl_mount_path_, path).c_str());
         return nullptr;
     }
 
@@ -232,6 +255,10 @@ void *ShmTransport::createSharedMemory(const std::string &path, size_t size) {
     if (mapped_addr == MAP_FAILED) {
         PLOG(ERROR) << "Failed to map shared memory file";
         close(shm_fd);
+        if (cxl_mount_path_.empty())
+            shm_unlink(path.c_str());
+        else
+            unlink(joinPath(cxl_mount_path_, path).c_str());
         return nullptr;
     }
 
@@ -281,6 +308,11 @@ Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
     // Owning reference: `buffer` is used after the lambda returns.
     SegmentDescRef pin;
     auto &segment_manager = metadata_->segmentManager();
+    // Do not munmap relocate_map_ entries on NeedsRefreshCache: memcpy runs
+    // after this lock is released, and there is no transfer-level refcount /
+    // quiesce that proves no reader still holds a resolved address. POSIX
+    // shm_unlink already keeps the object alive for existing mappings; keep
+    // those mappings until uninstall().
     CHECK_STATUS(segment_manager.withCachedSegment(
         target_id, pin, [&](SegmentDesc *segment) {
             buffer = segment->findBuffer(dest_addr, length);
@@ -307,15 +339,35 @@ Status ShmTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
                 "CUDA supported not enabled in this package " LOC_MARK);
         } else {
             int shm_fd = -1;
+            // Consumer path must never create: a missing object means the peer
+            // has not published (or has already unlinked) the shared memory.
+            // Creating here would yield a 0-byte file and SIGBUS on access.
             if (cxl_mount_path_.empty())
                 shm_fd = shm_open(buffer->shm_path.c_str(), O_RDWR, 0644);
             else {
                 auto full_path = joinPath(cxl_mount_path_, buffer->shm_path);
-                shm_fd = open(full_path.c_str(), O_CREAT | O_RDWR, 0644);
+                shm_fd = open(full_path.c_str(), O_RDWR, 0644);
             }
             if (shm_fd < 0) {
                 return Status::InternalError(
                     std::string("Failed to open shared memory file ") +
+                    buffer->shm_path + LOC_MARK);
+            }
+            // mmap can succeed even when the backing object is shorter than
+            // buffer->length; accessing past EOF then SIGBUS. Reject early.
+            struct stat st;
+            if (fstat(shm_fd, &st) != 0) {
+                close(shm_fd);
+                return Status::InternalError(
+                    std::string("Failed to fstat shared memory file ") +
+                    buffer->shm_path + LOC_MARK);
+            }
+            if (st.st_size < 0 ||
+                static_cast<uint64_t>(st.st_size) < buffer->length) {
+                close(shm_fd);
+                return Status::InternalError(
+                    std::string("Shared memory file shorter than registered "
+                                "buffer length: ") +
                     buffer->shm_path + LOC_MARK);
             }
             shm_addr = mmap(nullptr, buffer->length, PROT_READ | PROT_WRITE,

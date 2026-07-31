@@ -82,6 +82,14 @@ if(USE_NOF)
   add_store_test(nof_heartbeat_test nof_heartbeat_test.cpp)
 endif()
 add_store_test(client_integration_test client_integration_test.cpp)
+add_test(
+  NAME object_checksum_client_test
+  COMMAND
+    client_integration_test
+    "--gtest_filter=ObjectChecksumTest.*:ClientIntegrationTest.ObjectChecksumRejectsCorruptedObject:ClientIntegrationTest.BatchPutPreservesObjectChecksumPairing"
+)
+set_tests_properties(object_checksum_client_test
+                     PROPERTIES ENVIRONMENT "MOONCAKE_STORE_CHECKSUM=1")
 add_store_test(rpc_timeout_test rpc_timeout_test.cpp)
 if(USE_CXL)
   add_store_test(cxl_client_integration_test cxl_client_integration_test.cpp)
@@ -122,12 +130,21 @@ add_store_test(master_service_test_for_snapshot
                ha/snapshot/master_service_test_for_snapshot.cpp)
 add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)
 add_store_test(storage_backend_test storage_backend_test.cpp)
+add_store_test(client_storage_backend_test client_storage_backend_test.cpp)
 add_store_test(mutex_test mutex_test.cpp)
 add_store_test(file_storage_test file_storage_test.cpp)
 add_store_test(task_manager_test task_manager_test.cpp)
 add_store_test(task_executor_test task_executor_test.cpp)
 add_store_test(task_integration_test task_integration_test.cpp)
 add_store_test(dummy_client_get_buffer_test dummy_client_get_buffer_test.cpp)
+add_test(
+  NAME dummy_client_object_checksum_test
+  COMMAND
+    dummy_client_get_buffer_test
+    "--gtest_filter=DummyClientGetBufferTest.GetIntoRejectsCorruptedObjectWithChecksum:DummyClientGetBufferTest.BatchQueryPreservesObjectChecksum"
+)
+set_tests_properties(dummy_client_object_checksum_test
+                     PROPERTIES ENVIRONMENT "MOONCAKE_STORE_CHECKSUM=1")
 add_store_test(uds_transport_test uds_transport_test.cpp)
 add_store_test(health_check_test health_check_test.cpp)
 add_store_test(http_metadata_server_test http_metadata_server_test.cpp)

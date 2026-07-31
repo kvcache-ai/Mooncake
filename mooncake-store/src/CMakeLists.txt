@@ -305,6 +305,7 @@ target_link_libraries(
          gflags::gflags
          ${EXTRA_LIBS}
          ${SPDK_STATIC_LIBS}
+         mooncake_common
          yaml-cpp
          asio_shared
   PRIVATE transfer_engine)
@@ -352,6 +353,10 @@ target_link_libraries(
           ${ETCD_WRAPPER_LIB}
           ${MASTER_EXTRA_LIBS}
           asio_shared)
+# mooncake_store is static and propagates optional runtime dependencies to its
+# consumers. The metadata-only master does not use accelerator staging, so drop
+# those dependencies when they do not satisfy any symbols in the final binary.
+target_link_options(mooncake_master PRIVATE "LINKER:--as-needed")
 if(USE_SUNRISE)
   target_link_directories(mooncake_master PRIVATE ${MC_TANGRT_ROOT}/lib)
 endif()
@@ -434,3 +439,63 @@ if(USE_SUNRISE)
 endif()
 
 install(TARGETS mooncake_master mooncake_client DESTINATION bin)
+
+# ---------------------------------------------------------------------------
+# Optional: a self-contained libmooncake_store.so exporting only the store_c.h
+# C ABI, for consumers that dlopen the store (e.g. the Rust crate's `dlopen`
+# feature). Whole-archives the static mooncake_store + asio_static (objects are
+# -fPIC, see mooncake-common/common.cmake) and localizes everything else via the
+# version script; only system/toolkit libs (and the Go etcd/k8s backends when
+# enabled) stay DT_NEEDED.
+# ---------------------------------------------------------------------------
+if(WITH_STORE_C_SHARED)
+  # ELF/GNU-ld features (--whole-archive, --as-needed, version script, $ORIGIN);
+  # supported by GNU ld, gold, and lld. Linux only.
+  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(
+      FATAL_ERROR
+        "WITH_STORE_C_SHARED currently supports Linux/ELF only "
+        "(got CMAKE_SYSTEM_NAME=${CMAKE_SYSTEM_NAME}).")
+  endif()
+
+  # We whole-archive mooncake_store and reuse its name, so require it to be static
+  # (add_library(mooncake_store) follows BUILD_SHARED_LIBS, which some backends
+  # force ON).
+  get_target_property(_mooncake_store_type mooncake_store TYPE)
+  if(NOT _mooncake_store_type STREQUAL "STATIC_LIBRARY")
+    message(
+      FATAL_ERROR
+        "WITH_STORE_C_SHARED requires mooncake_store to be a STATIC_LIBRARY "
+        "(got ${_mooncake_store_type}); configure with BUILD_SHARED_LIBS=OFF.")
+  endif()
+
+  add_library(mooncake_store_c SHARED store_c_shared.cpp)
+  set_target_properties(
+    mooncake_store_c
+    PROPERTIES OUTPUT_NAME mooncake_store
+               # Separate dir so this .so does not shadow the static
+               # libmooncake_store.a on the Rust `link` backend's -L path.
+               LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/shared"
+               # $ORIGIN so the installed .so finds co-installed deps (CMake
+               # strips the build RUNPATH on install).
+               INSTALL_RPATH "$ORIGIN"
+               # Relink when the version script (a bare link flag) changes.
+               LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/store_c.map")
+  add_dependencies(mooncake_store_c mooncake_store asio_static)
+  # Whole-archive the static lib + asio_static via file paths (no interface-dep
+  # propagation); re-list the mooncake_store target for its transitive deps.
+  # --as-needed drops the now-redundant transitive libasio.so.
+  target_link_libraries(
+    mooncake_store_c
+    PRIVATE -Wl,--whole-archive "$<TARGET_FILE:mooncake_store>"
+            "$<TARGET_FILE:asio_static>" -Wl,--no-whole-archive -Wl,--as-needed
+            mooncake_store)
+  # Export only the C ABI; the version script localizes every other symbol
+  # pulled from the static archives. Strip debug info in Release (it dominates
+  # the .so size).
+  target_link_options(
+    mooncake_store_c PRIVATE
+    "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/store_c.map"
+    "$<$<CONFIG:Release>:-Wl,-s>")
+  install(TARGETS mooncake_store_c DESTINATION lib)
+endif()

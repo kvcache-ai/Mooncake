@@ -56,6 +56,9 @@ struct XferBenchConfig {
 
     static std::string seg_name;
     static std::string seg_type;
+    // Comma-separated segment types for mixed DRAM+VRAM runs, e.g.
+    // "dram,vram". Empty falls back to --seg_type (single type).
+    static std::string seg_type_mix;
     static std::string target_seg_name;
     static std::string op_type;
     static bool check_consistency;

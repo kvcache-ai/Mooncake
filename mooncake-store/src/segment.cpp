@@ -1557,6 +1557,24 @@ void NoFSegmentManager::GetMountedSegmentsSnapshot(
     }
 }
 
+void SegmentManager::releaseCapacityMetrics() {
+    // Segments that are still mounted here never went through
+    // CommitUnmountSegment, so their contribution to the capacity metrics
+    // has not been released. MasterMetricManager outlives MasterService
+    // instances (a new one is constructed per HA leadership term), so the
+    // serving instance releases it at teardown to keep the gauges
+    // consistent with the segments that are actually mounted.
+    for (const auto& [segment_id, mounted_segment] : mounted_segments_) {
+        const auto& segment = mounted_segment.segment;
+        if (segment.protocol == "cxl") {
+            // CXL mounts do not contribute to total_mem_capacity.
+            continue;
+        }
+        MasterMetricManager::instance().dec_total_mem_capacity(segment.name,
+                                                               segment.size);
+    }
+}
+
 void SegmentManager::initializeCxlAllocator(const std::string& cxl_path,
                                             const size_t cxl_size) {
     LOG(INFO) << "Init CXL global allocator.";

@@ -389,6 +389,41 @@ TEST_F(OffloadOnEvictTest, ComboD_EvictionWorks) {
     service->RemoveAll();
 }
 
+// Regression: EraseMetadata must drop the mirror entry in
+// LocalDiskSegment::offloading_objects. Otherwise BatchRemove leaves a
+// task-less key in the offload queue which the next
+// OffloadObjectHeartbeat drains back to the client, producing an
+// orphan bucket on SSD.
+TEST_F(OffloadOnEvictTest, BatchRemoveDropsOffloadingObjectsMirror) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.default_kv_lease_ttl = 0;  // no lease so BatchRemove succeeds
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx =
+        PrepareSegment(*service, "test_segment", kDefaultSegmentBase, seg_size);
+    auto mount_ld = service->MountLocalDiskSegment(ctx.client_id, true);
+    ASSERT_TRUE(mount_ld.has_value());
+
+    const std::vector<std::string> keys = {"key_r1", "key_r2", "key_r3"};
+    for (const auto& k : keys) {
+        PutObject(*service, ctx.client_id, k);
+    }
+
+    // Remove before heartbeat drains the offload queue.
+    auto rm = service->BatchRemove(keys, TenantId::Default(), /*force=*/true);
+    for (const auto& r : rm) {
+        EXPECT_TRUE(r.has_value());
+    }
+
+    auto queued = DrainOffloadQueue(*service, ctx.client_id);
+    EXPECT_TRUE(queued.empty())
+        << "OffloadObjectHeartbeat returned " << queued.size()
+        << " stale entries after BatchRemove; EraseMetadata failed to clean "
+           "offloading_objects.";
+}
+
 }  // namespace mooncake::test
 
 int main(int argc, char** argv) {
