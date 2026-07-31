@@ -7,8 +7,6 @@ RUN apt-get update -y \
 
 RUN apt-get install -y libibverbs-dev \
     libunwind-dev \
-    libgoogle-glog-dev \
-    libjsoncpp-dev \
     libnuma-dev \
     libpython3-dev \
     libboost-dev \
@@ -17,15 +15,9 @@ RUN apt-get install -y libibverbs-dev \
     libgrpc++-dev \
     libprotobuf-dev \
     protobuf-compiler-grpc \
-    pybind11-dev \
     libcurl4-openssl-dev \
-    libhiredis-dev \
-    libyaml-cpp-dev \
     libjemalloc-dev \
-    libzstd-dev \
     libmsgpack-dev \
-    libgflags-dev \
-    libxxhash-dev \
     pkg-config \
     patchelf
 
@@ -37,14 +29,6 @@ RUN GO_VERSION="1.23.8" && \
     wget https://go.dev/dl/go${GO_VERSION}.linux-${GOARCH}.tar.gz \
     && tar -C /usr/local -xzf go${GO_VERSION}.linux-${GOARCH}.tar.gz \
     && rm go${GO_VERSION}.linux-${GOARCH}.tar.gz
-
-RUN git clone https://github.com/alibaba/yalantinglibs.git \
-    && cd yalantinglibs \
-    && mkdir -p build \
-    && cd build \
-    && cmake .. -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF -DBUILD_UNIT_TESTS=OFF \
-    && cmake --build . -j$(nproc) \
-    && cmake --install .
 
 ENV GOPROXY='https://goproxy.cn'
 ENV PATH=/usr/local/go/bin:$PATH

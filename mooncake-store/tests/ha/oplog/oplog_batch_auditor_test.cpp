@@ -1,10 +1,6 @@
 #include <gtest/gtest.h>
 
-#if __has_include(<jsoncpp/json/json.h>)
-#include <jsoncpp/json/json.h>  // Ubuntu
-#else
-#include <json/json.h>  // CentOS
-#endif
+#include <json/json.h>
 
 #include <algorithm>
 #include <sstream>

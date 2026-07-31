@@ -64,8 +64,6 @@ if command -v apt-get &> /dev/null; then
             git \
             wget \
             libibverbs-dev \
-            libgoogle-glog-dev \
-            libjsoncpp-dev \
             libunwind-dev \
             libnuma-dev \
             libpython3-dev \
@@ -74,45 +72,25 @@ if command -v apt-get &> /dev/null; then
             libgrpc-dev \
             libgrpc++-dev \
             libprotobuf-dev \
-            libyaml-cpp-dev \
             protobuf-compiler-grpc \
             libcurl4-openssl-dev \
-            libhiredis-dev \
             pkg-config \
             patchelf \
             mpich \
             libmpich-dev \
-            libzstd-dev \
-            libxxhash-dev \
             libmsgpack-dev
     apt purge -y openmpi-bin libopenmpi-dev || true
 elif command -v yum &> /dev/null; then
     echo "Detected yum. Using Red Hat-based package manager."
     yum makecache
     yum install -y cmake \
-            gflags-devel \
-            glog-devel \
             libibverbs-devel \
             numactl-devel \
             boost-devel \
             openssl-devel \
-            hiredis-devel \
             libcurl-devel \
-            jsoncpp-devel \
             mpich \
-            mpich-devel \
-            zstd-devel \
-            xxhash-devel
-    # Install yaml-cpp
-    cd "$TARGET_DIR"
-    clone_repo_if_not_exists "yaml-cpp" https://github.com/jbeder/yaml-cpp.git
-    cd yaml-cpp || exit
-    rm -rf build
-    mkdir -p build && cd build
-    cmake ..
-    make -j$(nproc)
-    make install
-    cd ../..
+            mpich-devel
 
     # Install msgpack-c
     clone_repo_if_not_exists "msgpack-c" "https://github.com/msgpack/msgpack-c.git"
@@ -133,16 +111,3 @@ check_success "Failed to install system packages"
 echo -e "system packages installed successfully."
 
 export CPLUS_INCLUDE_PATH=$(echo $CPLUS_INCLUDE_PATH | tr ':' '\n' | grep -v "/usr/local/Ascend" | paste -sd: -)
-
-# Install yalantinglibs
-clone_repo_if_not_exists "yalantinglibs" "https://github.com/alibaba/yalantinglibs.git"
-cd yalantinglibs || exit
-git checkout 0.5.5
-rm -rf build
-mkdir -p build && cd build
-cmake .. -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF -DBUILD_UNIT_TESTS=OFF
-make -j$(nproc)
-make install
-cd ../..
-
-echo -e "yalantinglibs installed successfully."

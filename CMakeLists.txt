@@ -4,8 +4,6 @@ project(mooncake CXX C)
 # indicates cmake is invoked from top-level dir
 set(GLOBAL_CONFIG "true")
 
-include(mooncake-common/FindJsonCpp.cmake)
-include(mooncake-common/FindGLOG.cmake)
 include(mooncake-common/common.cmake)
 # unit test
 if (BUILD_UNIT_TESTS)
@@ -28,9 +26,10 @@ if(MOONCAKE_ENABLE_TEST_FAILPOINTS)
 endif()
 option(MOONCAKE_ENABLE_OPLOG_PERF_METRICS
        "Enable detailed batch OpLog performance metrics" OFF)
+option(ENABLE_KV_EVENTS
+       "Build master KV events ZMQ publisher (requires libzmq when ON)" OFF)
 
 include(${CMAKE_CURRENT_SOURCE_DIR}/mooncake-common/SetupPython.cmake)
-add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/extern/pybind11)
 execute_process(
     COMMAND ${PYTHON_EXECUTABLE} -c "import sys; print(sys.path[-1])"
     OUTPUT_VARIABLE PYTHON_SYS_PATH
@@ -73,8 +72,8 @@ endif()
 
 option(STORE_USE_JEMALLOC "Use jemalloc in mooncake store master" OFF)
 
-# Define ASIO macros before building targets that include ASIO headers.
-add_compile_definitions(ASIO_SEPARATE_COMPILATION ASIO_DYN_LINK)
+include(cmake/dependencies/Dependencies.cmake)
+mooncake_provide_core_dependencies()
 
 add_subdirectory(mooncake-common)
 include_directories(mooncake-common/etcd)
@@ -155,6 +154,8 @@ if (WITH_EP)
         "-DSTAGING_DIR=${EP_PG_STAGING_DIR}"
         "-DENGINE_SO_PATH=$<TARGET_FILE:engine>"
         "-DPython3_EXECUTABLE=${Python3_EXECUTABLE}"
+        "-DASIO_INCLUDE_DIR=${ASIO_INCLUDE_DIR}"
+        "-DYALANTINGLIBS_INCLUDE_DIR=${MOONCAKE_YALANTINGLIBS_INCLUDE_DIR}"
         "-DEP_USE_MUSA=$<IF:$<BOOL:${USE_MUSA}>,1,0>"
         "-DEP_USE_MACA=$<IF:$<BOOL:${USE_MACA}>,1,0>"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-ep/BuildEpExt.cmake"
@@ -174,6 +175,8 @@ if (WITH_EP)
         "-DSTAGING_DIR=${EP_PG_STAGING_DIR}"
         "-DENGINE_SO_PATH=$<TARGET_FILE:engine>"
         "-DPython3_EXECUTABLE=${Python3_EXECUTABLE}"
+        "-DASIO_INCLUDE_DIR=${ASIO_INCLUDE_DIR}"
+        "-DYALANTINGLIBS_INCLUDE_DIR=${MOONCAKE_YALANTINGLIBS_INCLUDE_DIR}"
         "-DEP_USE_MUSA=$<IF:$<BOOL:${USE_MUSA}>,1,0>"
         "-DEP_USE_MACA=$<IF:$<BOOL:${USE_MACA}>,1,0>"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/BuildPgExt.cmake"
@@ -201,3 +204,5 @@ if (WITH_P2P_STORE)
   add_subdirectory(mooncake-p2p-store)
   message(STATUS "P2P Store will be built")
 endif()
+
+mooncake_finalize_third_party_notices()

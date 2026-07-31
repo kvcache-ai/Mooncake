@@ -10,8 +10,8 @@ if(USE_HIP)
 endif()
 
 add_executable(rdma_transport_test ${WORKSPACE}/rdma_transport_test.cpp)
-target_link_libraries(rdma_transport_test PUBLIC transfer_engine gflags::gflags
-                                                 glog::glog)
+target_link_libraries(rdma_transport_test
+                      PUBLIC transfer_engine Mooncake::Gflags Mooncake::Glog)
 # add_test(NAME rdma_transport_test COMMAND rdma_transport_test)
 
 add_executable(transport_uint_test ${WORKSPACE}/transport_uint_test.cpp)
@@ -157,11 +157,11 @@ if(USE_EFA)
   add_executable(efa_single_nic_large_mr_test
                  ${WORKSPACE}/efa_single_nic_large_mr_test.cpp)
   target_link_libraries(efa_single_nic_large_mr_test
-                        PUBLIC transfer_engine gflags::gflags glog::glog)
+                        PUBLIC transfer_engine Mooncake::Gflags Mooncake::Glog)
 
   add_executable(efa_transfer_test ${WORKSPACE}/efa_transfer_test.cpp)
-  target_link_libraries(efa_transfer_test PUBLIC transfer_engine gflags::gflags
-                                                 glog::glog)
+  target_link_libraries(efa_transfer_test
+                        PUBLIC transfer_engine Mooncake::Gflags Mooncake::Glog)
 
   # GPU (CUDA device memory) loopback test — reproduces the EFA SHM intra-node
   # segfault on FI_HMEM_CUDA buffers (ofiwg/libfabric#12328) and validates
@@ -206,8 +206,9 @@ endif()
 # UB transport test with URMA endpoint and mock support
 if(USE_UB)
   add_executable(ub_transport_test ${WORKSPACE}/ub_transport_test.cpp)
-  target_link_libraries(ub_transport_test PUBLIC transfer_engine gtest
-                                                 gtest_main glog::glog pthread)
+  target_link_libraries(
+    ub_transport_test PUBLIC transfer_engine gtest gtest_main Mooncake::Glog
+                             pthread)
   target_include_directories(ub_transport_test PRIVATE ${urma_INCLUDE_DIR})
   # Built but not registered with ctest: this test may still have race
   # conditions and other stability issues, so keep it out of CI for now. Run

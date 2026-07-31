@@ -37,7 +37,7 @@ if(USE_ETCD)
   endif()
 endif()
 if(USE_REDIS)
-  target_link_libraries(transfer_engine PUBLIC hiredis)
+  target_link_libraries(transfer_engine PUBLIC Mooncake::Hiredis)
 endif()
 if(USE_HTTP)
   find_package(CURL REQUIRED)
@@ -50,13 +50,13 @@ target_link_libraries(
          rdma_transport
          mooncake_common
          ibverbs
-         glog::glog
-         gflags::gflags
+         Mooncake::Glog
+         Mooncake::Gflags
          pthread
-         JsonCpp::JsonCpp
+         Mooncake::JsonCpp
          numa
-         asio_shared
-         yalantinglibs::yalantinglibs)
+         Mooncake::Asio
+         Mooncake::Yalantinglibs)
 
 if(USE_BAREX)
   target_link_libraries(transfer_engine PUBLIC barex_transport)

@@ -41,6 +41,14 @@ linker_flags=(
     "-L$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src"
     "-L$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base"
     "-L$GITHUB_WORKSPACE/build/mooncake-common"
+    "-L$GITHUB_WORKSPACE/build"
+    "-L$GITHUB_WORKSPACE/build/_deps/mooncake_gflags-build"
+    "-L$GITHUB_WORKSPACE/build/_deps/mooncake_glog-build"
+    "-L$GITHUB_WORKSPACE/build/_deps/mooncake_jsoncpp-build/src/lib_json"
+    "-L$GITHUB_WORKSPACE/build/_deps/mooncake_xxhash-build"
+    "-L$GITHUB_WORKSPACE/build/_deps/mooncake_yamlcpp-build"
+    "-L$GITHUB_WORKSPACE/build/_deps/mooncake_zstd-build/lib"
+    "-L$GITHUB_WORKSPACE/build/_deps/mooncake_liburing_source-src/src"
 )
 if $link_common; then
     linker_flags+=("-L$GITHUB_WORKSPACE/build/mooncake-common/src")
@@ -76,9 +84,9 @@ export CGO_LDFLAGS="${linker_flags[*]}"
 if [ -d /usr/local/cuda/lib64 ]; then
     export CGO_LDFLAGS="$CGO_LDFLAGS -L/usr/local/cuda/lib64 -lcudart"
 fi
-# The KV events publisher is optional and linked when libzmq is installed.
-if ldconfig -p 2>/dev/null | grep -q libzmq; then
-    export CGO_LDFLAGS="$CGO_LDFLAGS -lzmq"
+# The KV events publisher is optional and linked when its bundled target was built.
+if [ -f "$GITHUB_WORKSPACE/build/_deps/mooncake_libzmq-build/lib/libzmq.a" ]; then
+    export CGO_LDFLAGS="$CGO_LDFLAGS -L$GITHUB_WORKSPACE/build/_deps/mooncake_libzmq-build/lib -lzmq"
 fi
 
 test_env=(MC_METADATA_SERVER=http://127.0.0.1:8080/metadata)

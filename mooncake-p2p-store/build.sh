@@ -35,6 +35,11 @@ EXT_LDFLAGS="-L$BUILD_DIR/mooncake-transfer-engine/src"
 EXT_LDFLAGS+=" -L$BUILD_DIR/mooncake-transfer-engine/src/common/base"
 EXT_LDFLAGS+=" -L$BUILD_DIR/mooncake-common"
 EXT_LDFLAGS+=" -L$BUILD_DIR/mooncake-common/src"
+EXT_LDFLAGS+=" -L$BUILD_DIR"
+EXT_LDFLAGS+=" -L$BUILD_DIR/_deps/mooncake_gflags-build"
+EXT_LDFLAGS+=" -L$BUILD_DIR/_deps/mooncake_glog-build"
+EXT_LDFLAGS+=" -L$BUILD_DIR/_deps/mooncake_jsoncpp-build/src/lib_json"
+EXT_LDFLAGS+=" -L$BUILD_DIR/_deps/mooncake_yamlcpp-build"
 EXT_LDFLAGS+=" -ltransfer_engine -lbase -lasio -lstdc++ -lnuma -lglog -libverbs -lmlx5 -ljsoncpp -lmooncake_common -lm"
 
 if [ -d "/usr/local/cuda/lib64/stubs" ]; then
@@ -66,7 +71,7 @@ if [ "$USE_ETCD" = "ON" ]; then
 fi
 
 if [ "$USE_REDIS" = "ON" ]; then
-    EXT_LDFLAGS+=" -lhiredis"
+    EXT_LDFLAGS+=" -L$BUILD_DIR/_deps/mooncake_hiredis-build -lhiredis"
 fi
 
 if [ "$USE_HTTP" = "ON" ]; then

@@ -1,8 +1,5 @@
 project(MooncakeStore VERSION 2.0.0)
 
-option(ENABLE_KV_EVENTS
-       "Build master KV events ZMQ publisher (requires libzmq when ON)" OFF)
-
 # Extract version components for C++ usage
 set(MOONCAKE_STORE_VERSION ${PROJECT_VERSION})
 
@@ -47,8 +44,6 @@ if (STORE_USE_K8S_LEASE)
 endif()
 
 if (STORE_USE_REDIS)
-    find_path(MOONCAKE_STORE_HIREDIS_INCLUDE_DIR hiredis/hiredis.h REQUIRED)
-    find_library(MOONCAKE_STORE_HIREDIS_LIBRARY hiredis REQUIRED)
     message(STATUS "Redis HA backend: Enabled")
 endif()
 

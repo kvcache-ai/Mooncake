@@ -26,7 +26,7 @@ target_include_directories(ub_transport
 )
 target_link_libraries(ub_transport
         PRIVATE
-        JsonCpp::JsonCpp
-        glog::glog
+        Mooncake::JsonCpp
+        Mooncake::Glog
         pthread
 )

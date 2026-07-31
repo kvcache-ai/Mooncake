@@ -5,7 +5,7 @@ add_subdirectory(rpc_communicator)
 add_library(transport OBJECT ${XPORT_SOURCES} $<TARGET_OBJECTS:rdma_transport>
                              $<TARGET_OBJECTS:rpc_communicator>)
 target_link_libraries(
-  transport PRIVATE JsonCpp::JsonCpp yalantinglibs::yalantinglibs glog::glog
+  transport PRIVATE Mooncake::JsonCpp Mooncake::Yalantinglibs Mooncake::Glog
                     pthread)
 
 if(USE_UB)

@@ -3,7 +3,7 @@
 # Run manually on all files: pre-commit run --all-files
 # Format all C/C++ files explicitly: ./scripts/code_format.sh --all
 # Note: clang-format should already be available (installed via system packages or dependencies.sh)
-# Exclusions: build artifacts, vendored extern code, generated wheels.
+# Exclusions: build artifacts and generated wheels.
 
 minimum_pre_commit_version: '3.6.0'
 
@@ -19,9 +19,9 @@ repos:
     rev: v4.6.0
     hooks:
       - id: trailing-whitespace
-        exclude: '^(build/|extern/|mooncake-wheel/repaired_wheels_.*|.*/build/|FAST25-release/)'
+        exclude: '^(build/|mooncake-wheel/repaired_wheels_.*|.*/build/|FAST25-release/)'
       - id: end-of-file-fixer
-        exclude: '^(build/|extern/|mooncake-wheel/repaired_wheels_.*|.*/build/|FAST25-release/)'
+        exclude: '^(build/|mooncake-wheel/repaired_wheels_.*|.*/build/|FAST25-release/)'
       - id: check-yaml
       - id: check-merge-conflict
       - id: check-added-large-files
@@ -34,7 +34,7 @@ repos:
         entry: ./scripts/code_format.sh --staged
         language: system
         files: '\.(c|cc|cpp|cxx|cu|cuh|h|hpp)$'
-        exclude: '^(extern/|build/|.*/build/|FAST25-release/|.*cachelib_memory_allocator/|.*/thirdparty/.*)'
+        exclude: '^(build/|.*/build/|FAST25-release/|.*cachelib_memory_allocator/|.*/thirdparty/.*)'
         require_serial: true
       # Regenerate the committed dlopen bindings when store_c.h or the generator
       # inputs change; a resulting diff fails the commit so they can't go stale.
@@ -51,15 +51,15 @@ repos:
     hooks:
       - id: ruff
         args: ['--fix']
-        exclude: '^(extern/|FAST25-release/)'
+        exclude: '^(FAST25-release/)'
       - id: ruff-format
-        exclude: '^(extern/|FAST25-release/)'
+        exclude: '^(FAST25-release/)'
 
   - repo: https://github.com/codespell-project/codespell
     rev: v2.2.6
     hooks:
       - id: codespell
-        exclude: '^(extern/|FAST25-release/)'
+        exclude: '^(FAST25-release/)'
         args: ['--ignore-words-list=te,mooncake,KVCache,cann,hsa']
 
   - repo: https://github.com/cheshirekow/cmake-format-precommit
@@ -67,4 +67,4 @@ repos:
     hooks:
       - id: cmake-format
         files: 'CMakeLists\.txt|.*\.cmake'
-        exclude: '^(extern/|build/|.*/build/|FAST25-release/)'
+        exclude: '^(build/|.*/build/|FAST25-release/)'

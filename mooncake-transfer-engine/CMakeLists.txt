@@ -5,13 +5,10 @@ if (NOT GLOBAL_CONFIG)
   if (USE_ETCD)
     message(FATAL_ERROR "Cannot enable USE_ETCD while building transfer engine independently")
   endif()
-  include(../mooncake-common/FindJsonCpp.cmake)
-  include(../mooncake-common/FindGLOG.cmake)
   include(../mooncake-common/common.cmake)
+  include(../cmake/dependencies/Dependencies.cmake)
+  mooncake_provide_core_dependencies()
 
-  # Build asio_shared in mooncake-common for standalone builds.
-  # Set compile definitions before adding targets that include ASIO headers.
-  add_compile_definitions(ASIO_SEPARATE_COMPILATION ASIO_DYN_LINK)
   add_subdirectory(../mooncake-common/src
                    ${CMAKE_CURRENT_BINARY_DIR}/mooncake-common-src)
 endif() # GLOBAL_CONFIG
@@ -82,4 +79,8 @@ endif()
 # can be built without enabling USE_TENT.
 if (BUILD_BENCHMARK)
   add_subdirectory(benchmark)
+endif()
+
+if(NOT GLOBAL_CONFIG)
+  mooncake_finalize_third_party_notices()
 endif()

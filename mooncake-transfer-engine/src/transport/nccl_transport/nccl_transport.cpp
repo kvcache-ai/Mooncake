@@ -16,11 +16,7 @@
 
 #include <cuda_runtime.h>
 #include <glog/logging.h>
-#if __has_include(<jsoncpp/json/json.h>)
-#include <jsoncpp/json/json.h>
-#else
 #include <json/json.h>
-#endif
 #include <nccl.h>
 
 #include <algorithm>

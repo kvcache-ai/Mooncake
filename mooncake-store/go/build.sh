@@ -41,6 +41,14 @@ CGO_LDFLAGS+=" -L${BUILD_DIR}/mooncake-transfer-engine/src"
 CGO_LDFLAGS+=" -L${BUILD_DIR}/mooncake-transfer-engine/src/common/base"
 CGO_LDFLAGS+=" -L${BUILD_DIR}/mooncake-common"
 CGO_LDFLAGS+=" -L${BUILD_DIR}/mooncake-common/src"
+CGO_LDFLAGS+=" -L${BUILD_DIR}"
+CGO_LDFLAGS+=" -L${BUILD_DIR}/_deps/mooncake_gflags-build"
+CGO_LDFLAGS+=" -L${BUILD_DIR}/_deps/mooncake_glog-build"
+CGO_LDFLAGS+=" -L${BUILD_DIR}/_deps/mooncake_jsoncpp-build/src/lib_json"
+CGO_LDFLAGS+=" -L${BUILD_DIR}/_deps/mooncake_xxhash-build"
+CGO_LDFLAGS+=" -L${BUILD_DIR}/_deps/mooncake_yamlcpp-build"
+CGO_LDFLAGS+=" -L${BUILD_DIR}/_deps/mooncake_zstd-build/lib"
+CGO_LDFLAGS+=" -L${BUILD_DIR}/_deps/mooncake_liburing_source-src/src"
 CGO_LDFLAGS+=" -Wl,--start-group -lmooncake_store -lcachelib_memory_allocator -ltransfer_engine -lbase -lmooncake_common -Wl,--end-group"
 CGO_LDFLAGS+=" -lasio -lxxhash -lyaml-cpp"
 CGO_LDFLAGS+=" -lstdc++ -lnuma -lglog -lgflags -libverbs -lmlx5 -ljsoncpp -lzstd -lcurl -lm"
@@ -51,10 +59,9 @@ fi
 
 CGO_LDFLAGS+=" -luring"
 
-# KV events publisher (optional; linked when libzmq is installed).
-if ldconfig -p 2>/dev/null | grep -q libzmq \
-    || [ -f /usr/lib/x86_64-linux-gnu/libzmq.so ] \
-    || [ -f /usr/lib/libzmq.so ]; then
+# KV events publisher (optional; linked when its bundled target was built).
+if [ -f "${BUILD_DIR}/_deps/mooncake_libzmq-build/lib/libzmq.a" ]; then
+    CGO_LDFLAGS+=" -L${BUILD_DIR}/_deps/mooncake_libzmq-build/lib"
     CGO_LDFLAGS+=" -lzmq"
 fi
 
@@ -67,6 +74,7 @@ if [ "$USE_ETCD" = "ON" ]; then
 fi
 
 if [ "$USE_REDIS" = "ON" ]; then
+    CGO_LDFLAGS+=" -L${BUILD_DIR}/_deps/mooncake_hiredis-build"
     CGO_LDFLAGS+=" -lhiredis"
 fi
 

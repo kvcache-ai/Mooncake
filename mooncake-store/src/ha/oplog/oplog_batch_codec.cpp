@@ -5,11 +5,7 @@
 
 #include <xxhash.h>
 
-#if __has_include(<jsoncpp/json/json.h>)
-#include <jsoncpp/json/json.h>
-#else
 #include <json/json.h>
-#endif
 
 #include "utils/base64.h"
 

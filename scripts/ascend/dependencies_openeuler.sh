@@ -72,8 +72,7 @@ echo -e "${YELLOW}Mooncake openEuler Dependencies Installer${NC}"
 echo "Repository root: ${REPO_ROOT}"
 echo "This script installs (same scope as root dependencies.sh):"
 echo "  - openEuler/RHEL system packages (dnf/yum)"
-echo "  - Git submodules (pybind11, yalantinglibs, ...)"
-echo "  - yalantinglibs (from extern/ submodule)"
+echo "  - Bundled C/C++ dependencies (downloaded and hash-verified by CMake)"
 echo "  - Go ${GOVER} (for USE_ETCD / libetcd_wrapper.so)"
 echo "Run scripts/ascend/dependencies_ascend_installation.sh afterward for Ascend extras."
 echo
@@ -150,17 +149,16 @@ PKG_MGR="$(detect_pkg_manager)"
 # Core build dependencies aligned with root dependencies.sh (Debian names mapped to RHEL/openEuler).
 CORE_PACKAGES=(
     gcc gcc-c++ make cmake ninja-build git wget unzip
-    gflags-devel glog-devel libibverbs-devel numactl-devel
-    boost-devel openssl-devel hiredis-devel
-    libcurl-devel jsoncpp-devel libunwind-devel python3-devel
-    zstd-devel xxhash-devel pkgconf pkgconf-pkg-config patchelf
+    libibverbs-devel numactl-devel boost-devel openssl-devel
+    libcurl-devel libunwind-devel python3-devel
+    pkgconf pkgconf-pkg-config patchelf
     mpich mpich-devel glibc glibc-common
 )
 
 # Often provided by repos on openEuler; install best-effort.
 OPTIONAL_PACKAGES=(
     grpc-devel grpc-plugins protobuf-devel protobuf-compiler
-    liburing-devel jemalloc-devel
+    jemalloc-devel
 )
 
 install_rpm_packages "$PKG_MGR" "${CORE_PACKAGES[@]}"
@@ -174,66 +172,6 @@ print_success "System package installation finished"
 export CPLUS_INCLUDE_PATH="$(
     echo "${CPLUS_INCLUDE_PATH:-}" | tr ':' '\n' | grep -v "/usr/local/Ascend" | paste -sd: -
 )"
-
-print_section "Initializing Git submodules"
-cd "${REPO_ROOT}"
-if [ ! -f "${REPO_ROOT}/.gitmodules" ]; then
-    print_error "No .gitmodules found under ${REPO_ROOT}"
-fi
-
-submodule_updated=false
-if git submodule sync --recursive && git submodule update --init --recursive; then
-    submodule_updated=true
-elif [ -n "${ASCEND_GITHUB_MIRROR_URLS:-}" ]; then
-  while IFS= read -r raw; do
-    base="${raw#"${raw%%[![:space:]]*}"}"
-    base="${base%"${base##*[![:space:]]}"}"
-    [ -n "$base" ] || continue
-    [ "$base" = "https://github.com/" ] && continue
-    [ "$base" != "https://github.com/" ] && base="${base%/}/"
-    echo "Retrying submodule update with mirror ${base}"
-    if git -c url."${base}https://github.com/".insteadOf=https://github.com/ \
-        submodule sync --recursive && \
-       git -c url."${base}https://github.com/".insteadOf=https://github.com/ \
-        submodule update --init --recursive; then
-        submodule_updated=true
-        break
-    fi
-  done < <(printf '%s\n' "$ASCEND_GITHUB_MIRROR_URLS" | tr ',;' '\n')
-fi
-
-if [ "$submodule_updated" != true ]; then
-    print_error "git submodule update failed (direct GitHub and mirrors exhausted)"
-fi
-print_success "Git submodules initialized"
-
-print_section "Installing yalantinglibs from extern/ submodule"
-if [ -d "${REPO_ROOT}/extern/yalantinglibs" ]; then
-    cd "${REPO_ROOT}/extern/yalantinglibs"
-    rm -rf build
-    mkdir -p build && cd build
-    cmake .. -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF -DBUILD_UNIT_TESTS=OFF
-    check_success "Failed to configure yalantinglibs"
-    cmake --build . -j"$(nproc)"
-    check_success "Failed to build yalantinglibs"
-    cmake --install .
-    check_success "Failed to install yalantinglibs"
-    print_success "yalantinglibs installed from submodule"
-    cd "${REPO_ROOT}"
-else
-    print_warn "extern/yalantinglibs missing, building from upstream clone"
-    mkdir -p "${DEPS_BUILD_DIR}"
-    cd "${DEPS_BUILD_DIR}"
-    clone_repo_if_not_exists "yalantinglibs" "https://github.com/alibaba/yalantinglibs.git"
-    cd yalantinglibs
-    git checkout 0.5.5
-    rm -rf build && mkdir -p build && cd build
-    cmake .. -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF -DBUILD_UNIT_TESTS=OFF
-    cmake --build . -j"$(nproc)"
-    cmake --install .
-    cd "${REPO_ROOT}"
-    print_success "yalantinglibs installed from git clone"
-fi
 
 print_section "Verifying essential build tools"
 for tool in getconf ldd patchelf cmake git; do

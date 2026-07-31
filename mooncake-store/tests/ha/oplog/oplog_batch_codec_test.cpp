@@ -9,11 +9,7 @@
 #include <string>
 #include <vector>
 
-#if __has_include(<jsoncpp/json/json.h>)
-#include <jsoncpp/json/json.h>
-#else
 #include <json/json.h>
-#endif
 
 namespace mooncake::test {
 

@@ -25,11 +25,12 @@ fn main() {
     println!("cargo:rustc-link-search=native=../../build/mooncake-transfer-engine/src/common/base");
     println!("cargo:rustc-link-lib=static=base");
 
-    // The transfer_engine build uses ASIO_SEPARATE_COMPILATION + ASIO_DYN_LINK,
-    // so the asio symbols live in mooncake-asio/libasio.so.  Link it whenever
-    // we can find it (standalone cmake build places it alongside src/).
-    println!("cargo:rustc-link-search=native=../build/mooncake-asio");
-    println!("cargo:rustc-link-search=native=../../build/mooncake-asio");
+    // Bundled static libraries are emitted by the top-level CMake build.
+    println!("cargo:rustc-link-search=native=../../build");
+    println!("cargo:rustc-link-search=native=../../build/_deps/mooncake_gflags-build");
+    println!("cargo:rustc-link-search=native=../../build/_deps/mooncake_glog-build");
+    println!("cargo:rustc-link-search=native=../../build/_deps/mooncake_jsoncpp-build/src/lib_json");
+    println!("cargo:rustc-link-search=native=../../build/_deps/mooncake_yamlcpp-build");
     println!("cargo:rustc-link-lib=asio");
 
     // EFA on AWS installs libfabric under /opt/amazon/efa/lib.
@@ -54,6 +55,7 @@ fn main() {
     println!("cargo:rustc-link-lib=gflags");
     println!("cargo:rustc-link-lib=pthread");
     println!("cargo:rustc-link-lib=jsoncpp");
+    println!("cargo:rustc-link-lib=yaml-cpp");
     println!("cargo:rustc-link-lib=numa");
     println!("cargo:rustc-link-lib=curl");
 

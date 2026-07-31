@@ -2,13 +2,14 @@
 
 # TENT Metrics Example
 add_executable(tent_metrics_example tent_metrics_example.cpp)
-# asio_shared must be linked explicitly for executables:
+# Mooncake::Asio must be linked explicitly for executables:
 # ASIO_SEPARATE_COMPILATION mode requires that any binary using ASIO symbols
 # links against the shared asio implementation directly. Libraries
 # (tent_metrics, tent_interface) get it transitively; executables need it
 # explicit.
-target_link_libraries(tent_metrics_example PRIVATE tent_metrics tent_common
-                                                   asio_shared glog ibverbs)
+target_link_libraries(
+  tent_metrics_example PRIVATE tent_metrics tent_common Mooncake::Asio
+                               Mooncake::Glog ibverbs)
 target_include_directories(tent_metrics_example
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 
@@ -26,8 +27,8 @@ add_test(NAME metrics_config_loader_test COMMAND metrics_config_loader_test)
 add_executable(tent_metrics_http_server_test metrics_http_server_test.cpp)
 target_link_libraries(tent_metrics_http_server_test
                       PRIVATE tent_metrics tent_common gtest gtest_main glog)
-if(TARGET asio_shared)
-  target_link_libraries(tent_metrics_http_server_test PRIVATE asio_shared)
+if(TARGET Mooncake::Asio)
+  target_link_libraries(tent_metrics_http_server_test PRIVATE Mooncake::Asio)
 endif()
 target_include_directories(tent_metrics_http_server_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
@@ -42,8 +43,8 @@ add_test(NAME tent_metrics_http_server_test
 add_executable(tent_metrics_recording_test metrics_recording_test.cpp)
 target_link_libraries(tent_metrics_recording_test PRIVATE gtest gtest_main
                                                           tent_link_group glog)
-if(TARGET asio_shared)
-  target_link_libraries(tent_metrics_recording_test PRIVATE asio_shared)
+if(TARGET Mooncake::Asio)
+  target_link_libraries(tent_metrics_recording_test PRIVATE Mooncake::Asio)
 endif()
 target_include_directories(tent_metrics_recording_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
@@ -125,8 +126,8 @@ add_test(NAME tent_coalesce_regions_test COMMAND tent_coalesce_regions_test)
 add_executable(segment_manager_test segment_manager_test.cpp)
 target_link_libraries(segment_manager_test PRIVATE gtest gtest_main
                                                    tent_link_group)
-if(TARGET asio_shared)
-  target_link_libraries(segment_manager_test PRIVATE asio_shared)
+if(TARGET Mooncake::Asio)
+  target_link_libraries(segment_manager_test PRIVATE Mooncake::Asio)
 endif()
 target_include_directories(segment_manager_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
@@ -143,9 +144,9 @@ add_executable(transfer_engine_config_override_test
                transfer_engine_config_override_test.cpp)
 target_link_libraries(transfer_engine_config_override_test
                       PRIVATE gtest gtest_main tent_link_group)
-if(TARGET asio_shared)
+if(TARGET Mooncake::Asio)
   target_link_libraries(transfer_engine_config_override_test
-                        PRIVATE asio_shared)
+                        PRIVATE Mooncake::Asio)
 endif()
 target_include_directories(transfer_engine_config_override_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
@@ -251,8 +252,8 @@ add_test(NAME tent_transport_selector_test COMMAND tent_transport_selector_test)
 add_executable(tent_engine_failover_e2e_test engine_failover_e2e_test.cpp)
 target_link_libraries(tent_engine_failover_e2e_test PRIVATE gtest gtest_main
                                                             tent_link_group)
-if(TARGET asio_shared)
-  target_link_libraries(tent_engine_failover_e2e_test PRIVATE asio_shared)
+if(TARGET Mooncake::Asio)
+  target_link_libraries(tent_engine_failover_e2e_test PRIVATE Mooncake::Asio)
 endif()
 target_include_directories(tent_engine_failover_e2e_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
@@ -264,8 +265,8 @@ add_test(NAME tent_engine_failover_e2e_test
 add_executable(tent_transport_hint_test transport_hint_test.cpp)
 target_link_libraries(tent_transport_hint_test PRIVATE gtest gtest_main
                                                        tent_link_group)
-if(TARGET asio_shared)
-  target_link_libraries(tent_transport_hint_test PRIVATE asio_shared)
+if(TARGET Mooncake::Asio)
+  target_link_libraries(tent_transport_hint_test PRIVATE Mooncake::Asio)
 endif()
 target_include_directories(tent_transport_hint_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
@@ -283,8 +284,8 @@ add_test(NAME tent_intent_type_test COMMAND tent_intent_type_test)
 add_executable(tent_progress_worker_test progress_worker_test.cpp)
 target_link_libraries(tent_progress_worker_test PRIVATE gtest gtest_main
                                                         tent_link_group)
-if(TARGET asio_shared)
-  target_link_libraries(tent_progress_worker_test PRIVATE asio_shared)
+if(TARGET Mooncake::Asio)
+  target_link_libraries(tent_progress_worker_test PRIVATE Mooncake::Asio)
 endif()
 target_include_directories(tent_progress_worker_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
@@ -293,8 +294,8 @@ add_test(NAME tent_progress_worker_test COMMAND tent_progress_worker_test)
 add_executable(tent_runtime_queue_dispatch_test runtime_queue_dispatch_test.cpp)
 target_link_libraries(tent_runtime_queue_dispatch_test PRIVATE gtest gtest_main
                                                                tent_link_group)
-if(TARGET asio_shared)
-  target_link_libraries(tent_runtime_queue_dispatch_test PRIVATE asio_shared)
+if(TARGET Mooncake::Asio)
+  target_link_libraries(tent_runtime_queue_dispatch_test PRIVATE Mooncake::Asio)
 endif()
 target_include_directories(tent_runtime_queue_dispatch_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
@@ -306,8 +307,8 @@ add_test(NAME tent_runtime_queue_dispatch_test
 add_executable(causal_chain_test causal_chain_test.cpp)
 target_link_libraries(causal_chain_test PRIVATE gtest gtest_main
                                                 tent_link_group)
-if(TARGET asio_shared)
-  target_link_libraries(causal_chain_test PRIVATE asio_shared)
+if(TARGET Mooncake::Asio)
+  target_link_libraries(causal_chain_test PRIVATE Mooncake::Asio)
 endif()
 target_include_directories(causal_chain_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)

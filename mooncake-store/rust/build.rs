@@ -190,7 +190,7 @@ fn main() {
 
     println!("cargo:rustc-link-search=native={lib_dir}");
 
-    // mooncake_store depends on libasio.so (shared) built in mooncake-common.
+    // mooncake_store depends on the bundled static Asio implementation.
     let lib_path = PathBuf::from(&lib_dir);
     let build_dir = lib_path.ancestors().nth(2).map(PathBuf::from).unwrap_or_else(|| {
         println!("cargo:warning=MOONCAKE_STORE_LIB_DIR='{lib_dir}' does not have enough parent directories; using current directory");
@@ -198,7 +198,7 @@ fn main() {
     });
     println!(
         "cargo:rustc-link-search=native={}",
-        build_dir.join("mooncake-common").display()
+        build_dir.display()
     );
     // mooncake_common static library lives in the src/ subdirectory.
     println!(
@@ -244,7 +244,7 @@ fn main() {
     println!("cargo:rustc-link-lib=transfer_engine");
     println!("cargo:rustc-link-lib=mooncake_common"); // Environ::Get() and other common utilities
     println!("cargo:rustc-link-lib=base"); // mooncake::Status etc.
-    println!("cargo:rustc-link-lib=asio"); // shared library built by mooncake-common
+    println!("cargo:rustc-link-lib=asio");
     println!("cargo:rustc-link-lib=jsoncpp"); // transfer_engine dependency
     println!("cargo:rustc-link-lib=cachelib_memory_allocator"); // static
     println!("cargo:rustc-link-lib=stdc++");
@@ -277,8 +277,16 @@ fn main() {
             build_dir.join("mooncake-store/src/cachelib_memory_allocator"),
             build_dir.join("mooncake-transfer-engine/src"),
             build_dir.join("mooncake-transfer-engine/src/common/base"),
-            build_dir.join("mooncake-asio"),
             build_dir.join("mooncake-common/etcd"),
+            build_dir.join("_deps/mooncake_gflags-build"),
+            build_dir.join("_deps/mooncake_glog-build"),
+            build_dir.join("_deps/mooncake_jsoncpp-build/src/lib_json"),
+            build_dir.join("_deps/mooncake_xxhash-build"),
+            build_dir.join("_deps/mooncake_yamlcpp-build"),
+            build_dir.join("_deps/mooncake_zstd-build/lib"),
+            build_dir.join("_deps/mooncake_liburing_source-src/src"),
+            build_dir.join("_deps/mooncake_hiredis-build"),
+            build_dir.join("_deps/mooncake_libzmq-build/lib"),
         ] {
             push_existing_dir(&mut search_dirs, dir);
         }
@@ -291,9 +299,17 @@ fn main() {
         default_build_dir.join("mooncake-store/src/cachelib_memory_allocator"),
         default_build_dir.join("mooncake-transfer-engine/src"),
         default_build_dir.join("mooncake-transfer-engine/src/common/base"),
-        default_build_dir.join("mooncake-asio"),
         default_build_dir.join("mooncake-common"),
         default_build_dir.join("mooncake-common/etcd"),
+        default_build_dir.join("_deps/mooncake_gflags-build"),
+        default_build_dir.join("_deps/mooncake_glog-build"),
+        default_build_dir.join("_deps/mooncake_jsoncpp-build/src/lib_json"),
+        default_build_dir.join("_deps/mooncake_xxhash-build"),
+        default_build_dir.join("_deps/mooncake_yamlcpp-build"),
+        default_build_dir.join("_deps/mooncake_zstd-build/lib"),
+        default_build_dir.join("_deps/mooncake_liburing_source-src/src"),
+        default_build_dir.join("_deps/mooncake_hiredis-build"),
+        default_build_dir.join("_deps/mooncake_libzmq-build/lib"),
         PathBuf::from("/usr/local/lib"),
         PathBuf::from("/usr/lib/x86_64-linux-gnu"),
         PathBuf::from("/lib/x86_64-linux-gnu"),

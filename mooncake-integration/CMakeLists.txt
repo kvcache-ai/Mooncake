@@ -21,7 +21,6 @@ if(WITH_STORE)
     "../mooncake-store/include/cachelib_memory_allocator/fake_include")
 endif()
 
-include_directories("/usr/include/jsoncpp")
 include_directories("./")
 include_directories("../mooncake-transfer-engine/include")
 
@@ -65,11 +64,11 @@ if(WITH_TE)
 
   target_include_directories(engine PRIVATE ${Python3_INCLUDE_DIRS})
   if(USE_ASCEND_DIRECT)
-    target_link_libraries(engine PUBLIC ascendcl transfer_engine glog::glog
-                                        gflags::gflags)
+    target_link_libraries(engine PUBLIC ascendcl transfer_engine Mooncake::Glog
+                                        Mooncake::Gflags)
   else()
-    target_link_libraries(engine PUBLIC transfer_engine glog::glog
-                                        gflags::gflags)
+    target_link_libraries(engine PUBLIC transfer_engine Mooncake::Glog
+                                        Mooncake::Gflags)
   endif()
 
   if(USE_CUDA)
@@ -115,12 +114,12 @@ if(WITH_STORE)
   set_target_properties(store PROPERTIES INSTALL_RPATH "$ORIGIN")
   if(USE_ASCEND_DIRECT)
     target_link_libraries(
-      store PUBLIC ascendcl transfer_engine glog::glog gflags::gflags
+      store PUBLIC ascendcl transfer_engine Mooncake::Glog Mooncake::Gflags
                    mooncake_store cachelib_memory_allocator)
   else()
     target_link_libraries(
-      store PUBLIC transfer_engine glog::glog gflags::gflags mooncake_store
-                   cachelib_memory_allocator)
+      store PUBLIC transfer_engine Mooncake::Glog Mooncake::Gflags
+                   mooncake_store cachelib_memory_allocator)
   endif()
 endif()
 
@@ -200,8 +199,6 @@ endif()
 
 if(WITH_TE)
   install(TARGETS engine DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
-  install(TARGETS asio_shared
-          DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
 endif()
 
 if(WITH_EP)

@@ -4,5 +4,5 @@ target_include_directories(
   PRIVATE ${CMAKE_CURRENT_LIST_DIR}/../../../include)
 target_link_libraries(
   nccl_host_transport
-  PRIVATE NCCL::nccl CUDA::cudart JsonCpp::JsonCpp glog::glog pthread)
+  PRIVATE NCCL::nccl CUDA::cudart Mooncake::JsonCpp Mooncake::Glog pthread)
 target_compile_features(nccl_host_transport PRIVATE cxx_std_17)

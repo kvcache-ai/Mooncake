@@ -32,7 +32,8 @@ ENV PYTHON_VERSION=${PYTHON_VERSION} \
 WORKDIR /workspace
 COPY . /workspace
 
-# Install Mooncake dependencies (submodules, yalantinglibs, Go, etc.)
+# Install Mooncake system build prerequisites and Go. Bundled C/C++
+# dependencies are fetched and hash-verified during CMake configure.
 RUN bash dependencies.sh -y
 
 # Configure & build Mooncake

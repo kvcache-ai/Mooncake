@@ -56,7 +56,7 @@ if(USE_SUNRISE)
   target_link_libraries(tebench PUBLIC tangrt_shared)
 endif()
 
-# Set RPATH for finding libasio.so at runtime
+# Set the runtime path for other optional shared dependencies.
 if(USE_SUNRISE AND MC_TANGRT_ROOT)
   set(TANGRT_RPATH ":${MC_TANGRT_ROOT}/lib")
 else()

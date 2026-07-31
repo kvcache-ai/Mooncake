@@ -89,7 +89,7 @@ if(USE_CUDA AND BUILD_DEVICE_TRANSPORT_EXAMPLE)
   target_include_directories(device_transport_example PRIVATE
     ${CMAKE_SOURCE_DIR}/mooncake-transfer-engine/include)
   target_link_libraries(device_transport_example PUBLIC
-    transfer_engine gflags::gflags glog::glog)
+    transfer_engine Mooncake::Gflags Mooncake::Glog)
   # common.h (pulled in via transfer_engine.h) uses C++20 std::string APIs
   # such as starts_with; nvcc does not inherit CMAKE_CXX_STANDARD, so set the
   # CUDA standard explicitly on this target.  CUDA_EXTENSIONS OFF requests
@@ -113,8 +113,8 @@ if(USE_CUDA AND BUILD_DEVICE_TRANSPORT_EXAMPLE)
 endif()
 
 add_executable(show_link ${WORKSPACE}/show_link.cpp)
-target_link_libraries(show_link PUBLIC transfer_engine gflags::gflags
-                                       glog::glog)
+target_link_libraries(show_link PUBLIC transfer_engine Mooncake::Gflags
+                                       Mooncake::Glog)
 
 # NCCL DeviceTransport example. This is a manual two-rank validation because
 # communicator initialization and symmetric-window registration are collective.
@@ -128,7 +128,7 @@ if(USE_NCCL_DEVICE AND BUILD_NCCL_DEVICE_TRANSPORT_EXAMPLE)
   target_include_directories(nccl_device_transport_example PRIVATE
     ${CMAKE_SOURCE_DIR}/mooncake-transfer-engine/include)
   target_link_libraries(nccl_device_transport_example PRIVATE
-    transfer_engine NCCL::nccl gflags::gflags glog::glog)
+    transfer_engine NCCL::nccl Mooncake::Gflags Mooncake::Glog)
   target_compile_options(nccl_device_transport_example PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
   set_target_properties(nccl_device_transport_example PROPERTIES
@@ -159,5 +159,5 @@ if(USE_NCCL_HOST AND BUILD_NCCL_HOST_TRANSPORT_EXAMPLE)
   target_include_directories(nccl_host_transport_example PRIVATE
     ${CMAKE_SOURCE_DIR}/mooncake-transfer-engine/include)
   target_link_libraries(nccl_host_transport_example PRIVATE
-    transfer_engine NCCL::nccl glog::glog gflags::gflags)
+    transfer_engine NCCL::nccl Mooncake::Glog Mooncake::Gflags)
 endif()

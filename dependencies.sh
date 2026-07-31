@@ -110,7 +110,7 @@ echo -e "${YELLOW}Mooncake Dependencies Installer${NC}"
 echo -e "This script will install all required dependencies for Mooncake."
 echo -e "The following components will be installed:"
 echo -e "  - System packages (build tools, libraries)"
-echo -e "  - Git submodules (including pybind11 and yalantinglibs)"
+echo -e "  - Bundled C/C++ dependencies (downloaded and hash-verified by CMake)"
 echo -e "  - Go $GOVER"
 if [ "$INSTALL_SPDK" = true ]; then
     echo -e "  - SPDK (for NVMe-oF support)"
@@ -157,8 +157,6 @@ if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
                      wget \
                      unzip \
                      libibverbs-dev \
-                     libgoogle-glog-dev \
-                     libjsoncpp-dev \
                      libunwind-dev \
                      libnuma-dev \
                      libpython3-dev \
@@ -167,17 +165,10 @@ if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
                      libgrpc-dev \
                      libgrpc++-dev \
                      libprotobuf-dev \
-                     libyaml-cpp-dev \
                      protobuf-compiler-grpc \
                      libcurl4-openssl-dev \
-                     libhiredis-dev \
-                     liburing-dev \
                      libjemalloc-dev \
                      libmsgpack-dev \
-                     libzmq3-dev \
-                     libzstd-dev \
-                     libasio-dev \
-                     libxxhash-dev \
                      pkg-config \
                      patchelf \
                      libc6-dev \
@@ -193,26 +184,18 @@ elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS
                      git \
                      wget \
                      rdma-core-devel \
-                     glog-devel \
-                     gflags-devel \
-                     jsoncpp-devel \
                      libunwind-devel \
                      numactl-devel \
                      python3-devel \
                      boost1.78-devel \
                      openssl-devel \
                      protobuf-devel \
-                     yaml-cpp-devel \
                      libcurl-devel \
-                     hiredis-devel \
-                     liburing-devel \
                      jemalloc-devel \
                      msgpack-devel \
-                     libzstd-devel \
                      pkgconf-pkg-config \
                      elfutils-libelf-devel \
                      patchelf  \
-                     xxhash-devel \
                      libbsd-devel"
 
     yum install -y $SYSTEM_PACKAGES
@@ -223,51 +206,8 @@ fi
 
 print_success "System packages installed successfully"
 
-# Initialize and update git submodules
-print_section "Initializing Git Submodules"
-
-# Check if .gitmodules exists
-if [ -f "${REPO_ROOT}/.gitmodules" ]; then
-    echo "Enter repository root: ${REPO_ROOT}"
-    cd "${REPO_ROOT}"
-    check_success "Failed to change to repository root directory"
-
-    echo "Initializing git submodules..."
-    git submodule sync --recursive
-    check_success "Failed to sync git submodules"
-    git submodule update --init --recursive
-    check_success "Failed to initialize git submodules"
-
-    print_success "Git submodules initialized and updated successfully"
-else
-    echo -e "${YELLOW}No .gitmodules file found. Skipping...${NC}"
-    exit 1
-fi
-
-# Build and install yalantinglibs from submodule
-print_section "Installing yalantinglibs"
-cd "${REPO_ROOT}/extern/yalantinglibs"
-check_success "Failed to change to yalantinglibs submodule directory"
-
-mkdir -p build
-check_success "Failed to create build directory"
-cd build
-check_success "Failed to change to build directory"
-
-echo "Configuring yalantinglibs..."
-cmake .. -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF -DBUILD_UNIT_TESTS=OFF
-check_success "Failed to configure yalantinglibs"
-
-echo "Building yalantinglibs (using $(nproc) cores)..."
-cmake --build . -j$(nproc)
-check_success "Failed to build yalantinglibs"
-
-echo "Installing yalantinglibs..."
-cmake --install .
-check_success "Failed to install yalantinglibs"
-
-print_success "yalantinglibs installed successfully"
-cd "${REPO_ROOT}"
+print_section "Bundled C/C++ dependencies"
+echo "CMake downloads pinned archives into the build tree and verifies SHA256 hashes."
 
 print_section "Verifying essential build tools"
 
@@ -373,6 +313,7 @@ fi
 if [ "$INSTALL_SPDK" = true ]; then
     print_section "Installing SPDK"
 
+    mkdir -p "${REPO_ROOT}/extern"
     cd "${REPO_ROOT}/extern"
     check_success "Failed to change to extern directory"
 
@@ -440,8 +381,7 @@ print_section "Installation Complete"
 echo -e "${GREEN}All dependencies have been successfully installed!${NC}"
 echo -e "The following components were installed:"
 echo -e "  ${GREEN}✓${NC} System packages"
-echo -e "  ${GREEN}✓${NC} yalantinglibs"
-echo -e "  ${GREEN}✓${NC} Git submodules"
+echo -e "  ${GREEN}✓${NC} CMake prerequisites for bundled dependencies"
 echo -e "  ${GREEN}✓${NC} Go $GOVER"
 if [ "$INSTALL_SPDK" = true ]; then
     echo -e "  ${GREEN}✓${NC} SPDK (v23.01.1)"

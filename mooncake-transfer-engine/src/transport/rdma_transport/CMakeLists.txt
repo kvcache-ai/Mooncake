@@ -1,7 +1,7 @@
 file(GLOB RDMA_SOURCES "*.cpp")
 
 add_library(rdma_transport OBJECT ${RDMA_SOURCES})
-target_link_libraries(rdma_transport PRIVATE JsonCpp::JsonCpp glog::glog
+target_link_libraries(rdma_transport PRIVATE Mooncake::JsonCpp Mooncake::Glog
                                              pthread)
 
 if(USE_MLX5DV)

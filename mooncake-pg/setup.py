@@ -65,12 +65,15 @@ cuda_library_dirs = []
 include_dirs = [
     os.path.join(current_dir, "include"),
     os.path.join(current_dir, "../mooncake-transfer-engine/include"),
-    os.path.join(current_dir, "../extern/yalantinglibs/include"),
+    os.environ["MOONCAKE_ASIO_INCLUDE_DIR"],
+    os.environ["MOONCAKE_YALANTINGLIBS_INCLUDE_DIR"],
 ]
-use_maca = (
-    os.getenv("MOONCAKE_EP_USE_MACA", "").upper() in {"1", "ON", "TRUE", "YES"}
-    or (hasattr(torch.version, "maca") and torch.version.maca is not None)
-)
+use_maca = os.getenv("MOONCAKE_EP_USE_MACA", "").upper() in {
+    "1",
+    "ON",
+    "TRUE",
+    "YES",
+} or (hasattr(torch.version, "maca") and torch.version.maca is not None)
 
 if use_musa:
     musa_defines = ["-DUSE_MUSA", "-DMOONCAKE_EP_USE_MUSA=1", "-DYLT_ENABLE_IBV"]

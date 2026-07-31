@@ -15,7 +15,7 @@
 
 # If git clone fails, you can place dependencies and Mooncake source code in a directory for compilation and installation.
 
-# ASCEND TRANSPORT is scheduled for deprecation, please use ASCEND DIRECT TRANSPORT on ASCEND platform. 
+# ASCEND TRANSPORT is scheduled for deprecation, please use ASCEND DIRECT TRANSPORT on ASCEND platform.
 # Use dependencies_ascend_installation.sh to install dependencies instead.
 
 #!/bin/bash
@@ -54,21 +54,16 @@ if command -v apt-get &> /dev/null; then
             git \
             wget \
             libibverbs-dev \
-            libgoogle-glog-dev \
-            libjsoncpp-dev \
             libunwind-dev \
             libnuma-dev \
             libpython3-dev \
             libboost-dev \
             libssl-dev \
-            libzstd-dev \
             libgrpc-dev \
             libgrpc++-dev \
             libprotobuf-dev \
-            libyaml-cpp-dev \
             protobuf-compiler-grpc \
             libcurl4-openssl-dev \
-            libhiredis-dev \
             pkg-config \
             patchelf \
             mpich \
@@ -78,28 +73,13 @@ elif command -v yum &> /dev/null; then
     echo "Detected yum. Using Red Hat-based package manager."
     yum makecache
     yum install -y cmake \
-            gflags-devel \
-            glog-devel \
             libibverbs-devel \
             numactl-devel \
             boost-devel \
             openssl-devel \
-            hiredis-devel \
             libcurl-devel \
-            jsoncpp-devel \
-            zstd-devel \
             mpich \
             mpich-devel
-    # Install yaml-cpp
-    cd "$TARGET_DIR"
-    clone_repo_if_not_exists "yaml-cpp" https://github.com/jbeder/yaml-cpp.git
-    cd yaml-cpp || exit
-    rm -rf build
-    mkdir -p build && cd build
-    cmake ..
-    make -j$(nproc)
-    make install
-    cd ../..
 else
     echo "Unsupported package manager. Please install the dependencies manually."
     exit 1
@@ -113,39 +93,13 @@ export CPLUS_INCLUDE_PATH=$(echo $CPLUS_INCLUDE_PATH | tr ':' '\n' | grep -v "/u
 cd "$TARGET_DIR"
 pwd
 
-# Install yalantinglibs
-clone_repo_if_not_exists "yalantinglibs" "https://github.com/alibaba/yalantinglibs.git"
-cd yalantinglibs || exit
-git checkout 0.5.5
-rm -rf build
-mkdir -p build && cd build
-cmake .. -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF -DBUILD_UNIT_TESTS=OFF
-make -j$(nproc)
-make install
-cd ../..
-
-echo -e "yalantinglibs installed successfully."
-
 # Install Mooncake
 cd Mooncake || exit
-if ! git submodule update --init --recursive; then
-    if [ ! -d "extern/pybind11" ] || [ -z "$(ls -A 'extern/pybind11' 2>/dev/null)" ]; then
-        echo "git submodule update failed, try to cp pybind11..."
-        if [ -d "../pybind11" ]; then
-            cp -r ../pybind11 extern/
-        else
-            echo "Error: ../pybind11 does not exist. Cannot copy pybind11."
-            exit 1
-        fi
-    else
-        echo "Detected that extern/pybind11 already exists, continuing execution...."
-    fi
-fi
 rm -rf build
 mkdir -p build
 cd build
 cmake -DCMAKE_POLICY_VERSION_MINIMUM=3.5 ..
-make -j 
+make -j
 make install -j
 cd ..
 

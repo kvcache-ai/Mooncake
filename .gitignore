@@ -182,6 +182,9 @@ cython_debug/
 *.pb.h
 
 thirdparties
+# Optional tools such as SPDK are cloned here by dependencies.sh. Bundled
+# libraries managed by CMake live in the build tree instead.
+extern/
 
 # JetBrains IDEs
 .idea

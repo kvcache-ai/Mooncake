@@ -23,6 +23,8 @@ echo "Cleaning wheel-build directory"
 rm -rf mooncake-wheel/mooncake_transfer_engine*
 rm -rf mooncake-wheel/build/
 rm -f mooncake-wheel/mooncake/*.so
+rm -f mooncake-wheel/mooncake/THIRD-PARTY-NOTICES.txt
+rm -rf mooncake-wheel/mooncake/licenses
 
 echo "Creating directory structure..."
 
@@ -32,8 +34,9 @@ cp mooncake-integration/fabric_allocator_utils.py mooncake-wheel/mooncake/fabric
 # Copy engine.so to mooncake directory (will be imported by transfer module)
 cp ${BUILD_DIR}/mooncake-integration/engine.*.so mooncake-wheel/mooncake/engine.so
 
-# Copy libasio.so to mooncake directory (runtime dependency of engine.so)
-cp ${BUILD_DIR}/mooncake-common/libasio.so mooncake-wheel/mooncake/libasio.so
+# Bundle the generated dependency notice and verified upstream license texts.
+cp ${BUILD_DIR}/third-party/THIRD-PARTY-NOTICES.txt mooncake-wheel/mooncake/
+cp -r ${BUILD_DIR}/third-party/licenses mooncake-wheel/mooncake/
 
 # Copy store.so to mooncake directory
 if compgen -G "${BUILD_DIR}/mooncake-integration/store.*.so" >/dev/null; then
