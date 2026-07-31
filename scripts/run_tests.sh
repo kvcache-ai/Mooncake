@@ -7,6 +7,88 @@ set -e  # Exit immediately if a command exits with a non-zero status
 # Ensure LD_LIBRARY_PATH includes /usr/local/lib
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
 
+METADATA_SERVER_PID=""
+
+metadata_port_is_listening() {
+    ss -H -ltn 'sport = :8080' | grep -q .
+}
+
+start_metadata_server() {
+    local attempt
+
+    echo "Starting standalone HTTP metadata server..."
+    mooncake_http_metadata_server --port 8080 &
+    METADATA_SERVER_PID=$!
+
+    for attempt in {1..50}; do
+        if ! kill -0 "$METADATA_SERVER_PID" 2>/dev/null; then
+            echo "ERROR: metadata server exited before listening on port 8080"
+            wait "$METADATA_SERVER_PID" 2>/dev/null || true
+            METADATA_SERVER_PID=""
+            return 1
+        fi
+
+        if metadata_port_is_listening; then
+            echo "Standalone HTTP metadata server is ready (pid=$METADATA_SERVER_PID)"
+            return 0
+        fi
+        sleep 0.1
+    done
+
+    echo "ERROR: metadata server did not listen on port 8080 within 5 seconds"
+    ss -ltnp | grep ':8080' || true
+    return 1
+}
+
+stop_metadata_server() {
+    local attempt
+    local pid="${METADATA_SERVER_PID:-}"
+
+    if [ -z "$pid" ]; then
+        return 0
+    fi
+
+    echo "Stopping standalone HTTP metadata server (pid=$pid)..."
+    kill -TERM "$pid" 2>/dev/null || true
+
+    for attempt in {1..50}; do
+        if ! metadata_port_is_listening; then
+            wait "$pid" 2>/dev/null || true
+            METADATA_SERVER_PID=""
+            echo "Standalone HTTP metadata server stopped"
+            return 0
+        fi
+        sleep 0.1
+    done
+
+    echo "WARNING: metadata server did not release port 8080 after SIGTERM; sending SIGKILL"
+    ps -fp "$pid" || true
+    ss -ltnp | grep ':8080' || true
+    kill -KILL "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    METADATA_SERVER_PID=""
+
+    for attempt in {1..50}; do
+        if ! metadata_port_is_listening; then
+            echo "Standalone HTTP metadata server was force-stopped"
+            return 0
+        fi
+        sleep 0.1
+    done
+
+    echo "ERROR: port 8080 is still occupied after stopping metadata server"
+    ps -ef | grep '[m]ooncake' || true
+    ss -ltnp | grep ':8080' || true
+    return 1
+}
+
+cleanup_metadata_server() {
+    stop_metadata_server || true
+}
+
+trap cleanup_metadata_server EXIT
+start_metadata_server
+
 echo "Running transfer_engine tests..."
 cd mooncake-wheel/tests
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata MC_FORCE_TCP=true python transfer_engine_target.py &
@@ -124,7 +206,7 @@ echo "CXL protocol test completed successfully!"
 echo "Running CLI entry point tests..."
 python test_cli.py
 
-killall mooncake_http_metadata_server || true
+stop_metadata_server
 killall mooncake_master || true
 killall mooncake_client || true
 mooncake_master --default_kv_lease_ttl=500 --enable_http_metadata_server=true &
