@@ -446,7 +446,8 @@ jobs:
         mooncake_master \
           --eviction_high_watermark_ratio=0.95 \
           --cluster_id=ci_test_cluster \
-          --port 50051 &
+          --port 50051 \
+          --enable_http_metadata_server=true &
         sleep 3
       shell: bash
 
