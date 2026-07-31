@@ -3824,6 +3824,7 @@ class _BundleManifestStore:
             key if num_chunks == 1 else f"{key}/chunk/{idx}"
             for idx in range(num_chunks)
         ]
+
         def _put_chunk_batch(keys, batches):
             for ck, (start, count, size) in zip(keys, batches):
                 lease = pool.acquire(size)
@@ -3837,9 +3838,6 @@ class _BundleManifestStore:
                         batch_put_from, [ck], [lease.ptr], [size], config
                     )
                     transport._check_batch_put_results(results, [ck], "batch_put_from")
-                except Exception:
-                    _cleanup_keys(self._store, [ck], strict=False)
-                    raise
                 finally:
                     lease.release()
 
@@ -3850,17 +3848,17 @@ class _BundleManifestStore:
             and num_chunks >= AUTO_PARALLEL_MIN_CHUNKS
             and total_bytes >= AUTO_PARALLEL_MIN_BYTES
         )
-        if not use_parallel:
-            _put_chunk_batch(chunk_keys, chunk_batches)
-        else:
-            group_count = max(1, min(max_inflight, num_chunks))
-            group_size = (num_chunks + group_count - 1) // group_count
-            groups = [
-                (chunk_keys[s:s + group_size], chunk_batches[s:s + group_size])
-                for s in range(0, num_chunks, group_size)
-            ]
-            futures: list = []
-            try:
+        futures: list = []
+        try:
+            if not use_parallel:
+                _put_chunk_batch(chunk_keys, chunk_batches)
+            else:
+                group_count = max(1, min(max_inflight, num_chunks))
+                group_size = (num_chunks + group_count - 1) // group_count
+                groups = [
+                    (chunk_keys[s:s + group_size], chunk_batches[s:s + group_size])
+                    for s in range(0, num_chunks, group_size)
+                ]
                 with ThreadPoolExecutor(max_workers=len(groups)) as executor:
                     futures = [
                         executor.submit(_put_chunk_batch, gk, gb)
@@ -3868,11 +3866,11 @@ class _BundleManifestStore:
                     ]
                     for f in as_completed(futures):
                         f.result()
-            except Exception:
-                for f in futures:
-                    f.cancel()
-                _cleanup_keys(self._store, chunk_keys, strict=False)
-                raise
+        except Exception:
+            for f in futures:
+                f.cancel()
+            _cleanup_keys(self._store, chunk_keys, strict=False)
+            raise
         payload_spec = {
             "key": key,
             "bytes": total_bytes,

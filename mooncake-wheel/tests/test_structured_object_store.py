@@ -2938,6 +2938,33 @@ def test_dataproto_helper_typed_ragged_fast_copy_put() -> None:
     assert rows[0].nbytes + rows[2].nbytes in pool.acquire_sizes
 
 
+def test_direct_copy_put_rolls_back_all_chunks_on_late_failure() -> None:
+    if sos._concat_arrays_into is None:
+        pytest.skip("native fast-copy extension is unavailable")
+    store = FailingBatchPutStore(fail_on_call=2)
+    pool = FakeBufferPool()
+    _, transfer = make_transfer(store=store, buffer_pool=pool)
+    arrays = [
+        np.asarray([1, 2], dtype=np.int32),
+        np.asarray([3, 4], dtype=np.int32),
+        np.asarray([5, 6], dtype=np.int32),
+    ]
+    payload = sos._DirectCopyPayload.from_flat_arrays(
+        arrays, np.dtype(np.int32), total_elems=6
+    )
+
+    with pytest.raises(RuntimeError, match="batch_put_from"):
+        transfer._bundle_store._put_direct_copy_payload(
+            "payload",
+            payload,
+            chunk_bytes=8,
+            transfer_policy=BundleTransferPolicy(),
+        )
+
+    assert store.objects == {}
+    assert pool.acquire_count == pool.release_count == 2
+
+
 def test_dataproto_helper_typed_ragged_rejects_short_fast_copy(monkeypatch) -> None:
     pool = FakeBufferPool()
     _store, transfer = make_transfer(buffer_pool=pool)
