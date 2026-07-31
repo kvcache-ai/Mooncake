@@ -1912,6 +1912,17 @@ MasterService::EraseMetadata(
             source->dec_refcnt();
         }
         tenant_state.offloading_tasks.erase(offload_it);
+
+        // Mirror entry in local_disk_segment.offloading_objects must be
+        // dropped too, otherwise the next OffloadObjectHeartbeat drains a
+        // task-less key back to the client and produces an orphan bucket.
+        const std::string scoped_key = tenant_id.MakeScopedKey(key);
+        ScopedLocalDiskSegmentAccess ssd_access =
+            segment_manager_.getLocalDiskSegmentAccess();
+        for (auto& [_, segment] : ssd_access.getClientLocalDiskSegment()) {
+            MutexLocker locker(&segment->offloading_mutex_);
+            segment->offloading_objects.erase(scoped_key);
+        }
     }
     tenant_state.processing_keys.erase(key);
     tenant_state.replication_tasks.erase(key);
