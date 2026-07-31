@@ -16,6 +16,7 @@
 #define MULTI_TRANSFER_ENGINE_H_
 
 #include <memory>
+#include <string>
 
 #include "memory_location.h"
 #include "multi_transport.h"
@@ -53,6 +54,11 @@ using NicLoadStats = Transport::NicLoadStats;
 enum class PeerLiveness : uint8_t {
     Alive = 0,
     Unreachable = 1,
+};
+
+struct AutoDiscoverConfig {
+    bool enabled = false;
+    std::string protocol;
 };
 
 class TransferEngine {
@@ -204,6 +210,7 @@ class TransferEngine {
     bool checkOverlap(void* addr, uint64_t length);
 
     void setAutoDiscover(bool auto_discover);
+    void setAutoDiscover(const AutoDiscoverConfig& config);
 
     void* getBaseAddr();
 

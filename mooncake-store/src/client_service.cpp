@@ -13,7 +13,6 @@
 #include <cstdint>
 #include <cstring>
 #include <cstdlib>
-#include <fstream>
 #include <iomanip>
 #include <limits>
 #ifdef USE_NOF
@@ -23,7 +22,6 @@
 #include <ranges>
 #include <span>
 #include <sched.h>
-#include <sstream>
 #include <thread>
 #include <set>
 #include <utility>
@@ -38,7 +36,6 @@
 #include "ha/leadership/leader_coordinator_factory.h"
 #include "types.h"
 #include "client_buffer.h"
-#include "client_transport_config.h"
 #include "utils.h"
 #include "rpc_types.h"
 #include "local_hot_cache.h"
@@ -487,52 +484,6 @@ static std::vector<std::string> get_auto_discover_filters() {
     return whitelst_filters;
 }
 
-static int discover_efa_topology(
-    const std::shared_ptr<TransferEngine>& transfer_engine,
-    const std::vector<std::string>& filters) {
-    auto topology = transfer_engine->getLocalTopology();
-    if (!topology) {
-        LOG(ERROR) << "EFA topology discovery failed: topology is unavailable";
-        return -1;
-    }
-
-    const char* custom_topology_path = std::getenv("MC_CUSTOM_TOPO_JSON");
-    int rc = 0;
-    if (custom_topology_path) {
-        LOG(INFO) << "Using custom topology from: " << custom_topology_path;
-        std::ifstream file(custom_topology_path);
-        if (file.is_open()) {
-            std::stringstream buffer;
-            buffer << file.rdbuf();
-            const std::string topology_json = buffer.str();
-            if (!topology_json.empty()) {
-                rc = topology->parse(topology_json);
-            } else {
-                LOG(WARNING)
-                    << "Custom topology file is empty: " << custom_topology_path
-                    << ", falling back to auto-detect.";
-                rc = topology->discover(filters);
-            }
-        } else {
-            LOG(WARNING) << "Failed to load custom topology from "
-                         << custom_topology_path
-                         << ", falling back to auto-detect.";
-            rc = topology->discover(filters);
-        }
-    } else {
-        rc = topology->discover(filters);
-    }
-
-    if (rc != 0) {
-        LOG(ERROR) << "EFA topology discovery failed, rc=" << rc;
-        return rc;
-    }
-
-    LOG(INFO) << "EFA topology discovery complete. Found "
-              << topology->getHcaList().size() << " HCAs";
-    return 0;
-}
-
 tl::expected<std::optional<ha::HABackendSpec>, ErrorCode> ParseHABackendSpec(
     const std::string& master_server_entry) {
     const auto delimiter_pos = master_server_entry.find("://");
@@ -740,11 +691,6 @@ ErrorCode Client::InitTransferEngine(
     bool use_tent = transfer_engine_->isUsingTent();
 
     bool auto_discover = false;
-    internal::TransportDiscoveryPlan discovery_plan = {
-        .transfer_engine_auto_discover = false,
-        .explicitly_discover_efa = false,
-    };
-    std::vector<std::string> efa_discovery_filters;
     if (!use_tent) {
         // Get auto_discover and filters from env (non-TENT only)
         std::optional<bool> env_auto_discover = get_auto_discover();
@@ -760,10 +706,8 @@ ErrorCode Client::InitTransferEngine(
                 auto_discover = true;
             }
         }
-        discovery_plan = internal::MakeTransportDiscoveryPlan(
-            protocol, auto_discover, std::getenv("MC_FORCE_TCP") != nullptr);
         transfer_engine_->setAutoDiscover(
-            discovery_plan.transfer_engine_auto_discover);
+            {.enabled = auto_discover, .protocol = protocol});
 
         // Honor filters when auto-discovery is enabled; otherwise warn once
         if (auto_discover) {
@@ -771,11 +715,7 @@ ErrorCode Client::InitTransferEngine(
                 << "Transfer engine auto discovery is enabled for protocol: "
                 << protocol;
             auto filters = get_auto_discover_filters();
-            if (discovery_plan.explicitly_discover_efa) {
-                efa_discovery_filters = std::move(filters);
-            } else {
-                transfer_engine_->setWhitelistFilters(std::move(filters));
-            }
+            transfer_engine_->setWhitelistFilters(std::move(filters));
         } else {
             const char* env_filters = std::getenv("MC_MS_FILTERS");
             if (env_filters && *env_filters != '\0') {
@@ -803,13 +743,6 @@ ErrorCode Client::InitTransferEngine(
         }
     }
     auto [hostname, port] = parseHostNameWithPort(local_hostname);
-    if (discovery_plan.explicitly_discover_efa) {
-        int rc = discover_efa_topology(transfer_engine_, efa_discovery_filters);
-        if (rc != 0) {
-            return ErrorCode::INTERNAL_ERROR;
-        }
-    }
-
     int rc = transfer_engine_->init(metadata_connstring, local_hostname,
                                     hostname, port);
     if (rc != 0) {
@@ -831,16 +764,7 @@ ErrorCode Client::InitTransferEngine(
         return ErrorCode::OK;
     }
 
-    if (discovery_plan.explicitly_discover_efa) {
-        Transport* transport =
-            transfer_engine_->installTransport("efa", nullptr);
-        if (!transport) {
-            LOG(ERROR) << "Failed to install EFA transport after topology "
-                          "discovery";
-            return ErrorCode::INTERNAL_ERROR;
-        }
-        LOG(INFO) << "EFA transport installed after topology discovery";
-    } else if (!auto_discover) {
+    if (!auto_discover) {
         LOG(INFO) << "Transfer engine auto discovery is disabled for protocol: "
                   << protocol;
 
@@ -848,14 +772,13 @@ ErrorCode Client::InitTransferEngine(
 
         if (protocol == "rdma" || protocol == "efa") {
             if (!device_names.has_value() || device_names->empty()) {
-                LOG(ERROR) << protocol
-                           << " protocol requires device names when auto "
+                LOG(ERROR) << "RDMA protocol requires device names when auto "
                               "discovery is disabled";
                 return ErrorCode::INVALID_PARAMS;
             }
 
-            LOG(INFO) << "Using specified " << protocol
-                      << " devices: " << device_names.value();
+            LOG(INFO) << "Using specified RDMA devices: "
+                      << device_names.value();
 
             std::vector<std::string> devices =
                 splitString(device_names.value(), ',', /*skip_empty=*/true);
@@ -871,8 +794,8 @@ ErrorCode Client::InitTransferEngine(
 
             transport = transfer_engine_->installTransport(protocol, nullptr);
             if (!transport) {
-                LOG(ERROR) << "Failed to install " << protocol
-                           << " transport with specified devices";
+                LOG(ERROR) << "Failed to install RDMA transport with specified "
+                              "devices";
                 return ErrorCode::INTERNAL_ERROR;
             }
         } else if (protocol == "tcp") {

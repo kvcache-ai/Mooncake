@@ -138,11 +138,11 @@ print(f'Initialize result: {result}')  # Should be 0
 ```
 
 Mooncake Store also auto-discovers topology when `protocol="efa"` and no
-device names are supplied. The Store discovers the topology without generic
-transport installation, then installs the EFA transport explicitly. This
-prevents EFA devices from being passed to the RDMA transport. Use
-`MC_MS_FILTERS` to restrict discovery to a comma-separated device whitelist. To
-disable discovery, set `MC_MS_AUTO_DISC=0` and provide device names explicitly.
+device names are supplied. The Store passes the requested protocol to the
+Transfer Engine, which uses its normal topology discovery and installs the EFA
+transport instead of RDMA. Use `MC_MS_FILTERS` to restrict discovery to a
+comma-separated device whitelist. To disable discovery, set
+`MC_MS_AUTO_DISC=0` and provide device names explicitly.
 
 ## Unit Tests
 

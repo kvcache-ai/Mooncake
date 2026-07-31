@@ -292,6 +292,10 @@ void TransferEngine::setAutoDiscover(bool auto_discover) {
     impl_->setAutoDiscover(auto_discover);
 }
 
+void TransferEngine::setAutoDiscover(const AutoDiscoverConfig& config) {
+    impl_->setAutoDiscover(config);
+}
+
 void* TransferEngine::getBaseAddr() { return impl_->getBaseAddr(); }
 
 void TransferEngine::setWhitelistFilters(std::vector<std::string>&& filters) {
@@ -835,6 +839,10 @@ bool TransferEngine::checkOverlap(void* addr, uint64_t length) {
 
 void TransferEngine::setAutoDiscover(bool auto_discover) {
     if (!use_tent_) impl_->setAutoDiscover(auto_discover);
+}
+
+void TransferEngine::setAutoDiscover(const AutoDiscoverConfig& config) {
+    if (!use_tent_) impl_->setAutoDiscover(config);
 }
 
 void TransferEngine::setWhitelistFilters(std::vector<std::string>&& filters) {

@@ -75,8 +75,8 @@ class Client {
      * @brief Creates and initializes a new Client instance
      * @param local_hostname Local host address (IP:Port)
      * @param metadata_connstring Connection string for metadata service
-     * @param protocol Transfer protocol (for example, "tcp", "rdma", or "efa")
-     * @param device_names Comma-separated RDMA/EFA device names.
+     * @param protocol Transfer protocol ("rdma" or "tcp")
+     * @param device_names Comma-separated RDMA device names.
      *        Optional with default auto-discovery. Only required when
      *        auto-discovery is disabled (set env `MC_MS_AUTO_DISC=0`).
      * @param master_server_entry The entry of master server (IP:Port of master
