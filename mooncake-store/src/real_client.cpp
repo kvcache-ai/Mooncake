@@ -878,7 +878,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             } else {
 #ifdef USE_VRAM_SEGMENT
                 cudaError_t res;
-                res = cudaSetDevice(0);  // always allocate on device 0. you can set env for other devices.
+                res = cudaSetDevice(0);  // always allocate on device 0. you can
+                                         // set env for other devices.
                 if (res != cudaSuccess) {
                     LOG(ERROR) << "VRAM Segment cudaSetDevice failed.";
                     return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -886,10 +887,11 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 #ifdef USE_INTRA_NVLINK
                 ptr = allocateFabricMemory_intra(segment_size);
 #else
-                res = cudaMalloc((void**)&ptr, segment_size);
+                res = cudaMalloc((void **)&ptr, segment_size);
                 if (res != cudaSuccess) {
-                     LOG(ERROR) << "VRAM Segment cudaMalloc failed.";
-                     return tl::unexpected(ErrorCode::INVALID_PARAMS);;
+                    LOG(ERROR) << "VRAM Segment cudaMalloc failed.";
+                    return tl::unexpected(ErrorCode::INVALID_PARAMS);
+                    ;
                 }
 #endif
 #else
@@ -1625,14 +1627,15 @@ int RealClient::allocateAndMountSegment(
         if (chunk_size == 0) break;
 
 #ifdef USE_VRAM_SEGMENT
-        void * ptr = nullptr;
+        void *ptr = nullptr;
         cudaError_t res;
-        res = cudaSetDevice(0);  // always allocate on device 0. you can set env for other devices.
+        res = cudaSetDevice(0);  // always allocate on device 0. you can set env
+                                 // for other devices.
         if (res != cudaSuccess) {
             LOG(ERROR) << "VRAM Segment cudaSetDevice failed.";
             return -1;
         }
-        res = cudaMalloc((void**)&ptr, chunk_size);
+        res = cudaMalloc((void **)&ptr, chunk_size);
         if (res != cudaSuccess) {
             LOG(ERROR) << "VRAM Segment cudaMalloc failed.";
             return -1;

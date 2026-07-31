@@ -884,14 +884,16 @@ ErrorCode Client::InitTransferEngine(
         } else if (protocol == "nvlink_intra") {
 #ifdef USE_INTRA_NVLINK
             LOG(INFO) << "Using intra-NVLink protocol.";
-            transport = transfer_engine_->installTransport("nvlink_intra", nullptr);
+            transport =
+                transfer_engine_->installTransport("nvlink_intra", nullptr);
             if (!transport) {
                 LOG(ERROR) << "Failed to install nvlink_intra transport.";
                 return ErrorCode::INTERNAL_ERROR;
             }
 #else
             LOG(ERROR)
-                << "--protocol=nvlink_intra requires USE_INTRA_NVLINK=ON, please rebuild mooncake from source.";
+                << "--protocol=nvlink_intra requires USE_INTRA_NVLINK=ON, "
+                   "please rebuild mooncake from source.";
             return ErrorCode::INVALID_PARAMS;
 #endif
         } else {
