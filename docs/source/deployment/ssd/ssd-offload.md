@@ -252,6 +252,28 @@ The watermark ratios apply to each backend's quota. For `bucket_storage_backend`
 
 For watermark eviction, the real client notifies the master before deleting local files. If the notification fails, the selected files remain tracked locally and are retried by a later heartbeat.
 
+### Object deletion and bucket GC
+
+For `bucket_storage_backend`, `Remove` and `BatchRemove` also schedule deletion
+for completed `LOCAL_DISK` replicas. The master stops exposing the logical
+object first. During a subsequent real-client heartbeat, the SSD holder
+persists a tombstone for the matching object incarnation and acknowledges the
+task. A delayed task for an older incarnation cannot delete a newly created
+object with the same key.
+
+Tombstoning makes the deleted object unavailable but does not immediately
+shrink its immutable bucket file. The single background GC worker reclaims that
+space by unlinking fully dead buckets or merging live records from up to eight
+partially dead buckets. Normal GC uses
+`MOONCAKE_OFFLOAD_BUCKET_GC_DELETED_RATIO`; after disk usage reaches the high
+watermark, GC bypasses that ratio and works toward the low watermark.
+
+Deletion tasks survive HA failover through the master OpLog. Interrupted local
+bucket replacement is recovered independently from `.bucket_gc_intent`. Keep
+that file with the bucket data when inspecting or recovering an SSD directory.
+See [Reliable SSD Object Deletion and Bucket Garbage Collection](../../design/ssd-object-deletion-and-gc.md)
+for protocol, crash-recovery, and validation details.
+
 ---
 
 ## Example
