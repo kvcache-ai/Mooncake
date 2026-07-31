@@ -1,0 +1,18 @@
+{
+  "backend": "cuda",
+  "num_ranks": 8,
+  "num_experts": 256,
+  "hidden_size": 7168,
+  "top_k": 8,
+  "num_tokens": 4096,
+  "dtype": "bf16",
+  "routing_mode": "k_hot",
+  "hot_experts": 32,
+  "hot_fraction": 0.9,
+  "zero_copy": true,
+  "async_finish": true,
+  "return_recv_hook": false,
+  "pg_backend": "nccl",
+  "warmup_iters": 20,
+  "iters": 100
+}
