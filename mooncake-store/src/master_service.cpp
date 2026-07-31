@@ -4248,6 +4248,13 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                         ErrorCode::OBJECT_HAS_REPLICATION_TASK);
                 }
 
+                if (tenant_state.promotion_tasks.count(key) > 0) {
+                    LOG(INFO)
+                        << "key=" << key << ", error=object_has_promotion_task";
+                    return tl::make_unexpected(
+                        ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+                }
+
                 // Reject if an offload-to-disk task is in progress (same
                 // reason).
                 if (tenant_state.offloading_tasks.count(key) > 0) {

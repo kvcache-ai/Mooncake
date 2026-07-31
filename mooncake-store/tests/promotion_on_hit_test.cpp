@@ -1253,6 +1253,47 @@ TEST_F(PromotionOnHitTest, TenantQuotaChargesAtAllocStartAndSettlesLifecycle) {
     service->RemoveAll();
 }
 
+TEST_F(PromotionOnHitTest, UpsertStartRejectsActivePromotionTask) {
+    const TenantId tenant_id("tenant-a");
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.enable_multi_tenants = true;
+    config.tenant_quota_connector_type = "file";
+    config.tenant_quota_connector_uri =
+        WriteTenantQuotaPolicyFile({{tenant_id.value(), 4096}});
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    constexpr uint64_t object_size = 1024;
+    auto seg =
+        PrepareSegment(*service, "seg_quota", kDefaultSegmentBase, seg_size);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "key",
+                                       object_size, seg.segment_name,
+                                       tenant_id.value()));
+
+    ASSERT_TRUE(service->GetReplicaList("key", tenant_id));
+    ASSERT_TRUE(service->PromotionAllocStart(seg.client_id, "key", tenant_id,
+                                             object_size, {}));
+    ASSERT_EQ(service->GetTenantQuotaSnapshot(tenant_id)->charged_bytes,
+              object_size);
+
+    ReplicateConfig replicate_config;
+    replicate_config.replica_num = 1;
+    auto upsert = service->UpsertStart(seg.client_id, "key", tenant_id,
+                                       object_size, replicate_config);
+    ASSERT_FALSE(upsert.has_value());
+    EXPECT_EQ(upsert.error(), ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+
+    ASSERT_TRUE(
+        service->NotifyPromotionSuccess(seg.client_id, "key", tenant_id));
+    EXPECT_EQ(service->GetTenantQuotaSnapshot(tenant_id)->charged_bytes,
+              object_size);
+    service->RemoveAll();
+}
+
 // PromotionAllocStart must reject when the in-flight task has been
 // reaped between the holder's heartbeat and the AllocStart RPC arriving
 // (e.g. client stall past put_start_release_timeout_sec_). Without the
