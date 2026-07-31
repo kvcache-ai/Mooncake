@@ -24,7 +24,6 @@ CentralizedCoordinatorStateMachine::CentralizedCoordinatorStateMachine(
     endpoint_epochs_.assign(max_world_size_, 0);
     for (int r = 0; r < max_world_size_; ++r) {
         ranks_[r].link_status.assign(max_world_size_, 0);
-        ranks_[r].link_status[r] = 1;
     }
 }
 
@@ -87,7 +86,6 @@ CentralizedCoordinatorStateMachine::handleRegisterAgent(
     for (auto& peer : ranks_) {
         peer.link_status[req.rank] = 0;
     }
-    info.link_status[req.rank] = 1;
     info.last_link_event_report_id = 0;
 
     for (auto& [group_id, view] : group_views_) {
@@ -753,7 +751,6 @@ void CentralizedCoordinatorStateMachine::tryConfirmShutdown(
 bool CentralizedCoordinatorStateMachine::isMutuallyConnected(
     GlobalRank a, GlobalRank b) const {
     assert(rankInRange(a) && rankInRange(b));
-    if (a == b) return true;
     if (ranks_[a].state == RankState::Offline ||
         ranks_[b].state == RankState::Offline)
         return false;
@@ -767,7 +764,8 @@ std::vector<GlobalRank> CentralizedCoordinatorStateMachine::extendHealthySet()
     //  Collect current Healthy ranks.
     std::vector<GlobalRank> result;
     for (int i = 0; i < max_world_size_; ++i) {
-        if (ranks_[i].state == RankState::Healthy) {
+        if (ranks_[i].state == RankState::Healthy &&
+            isMutuallyConnected(i, i)) {
             result.push_back(i);
         }
     }
@@ -820,6 +818,9 @@ std::vector<GlobalRank> CentralizedCoordinatorStateMachine::extendHealthySet()
     // Extend with new mutually-connected candidates.
     for (int i = 0; i < max_world_size_; ++i) {
         if (ranks_[i].state == RankState::Offline) continue;
+        // The diagonal is local data-plane readiness. A registered Agent
+        // remains Synced until its LinkManager reports the self-link up.
+        if (!isMutuallyConnected(i, i)) continue;
         if (std::find(result.begin(), result.end(), i) != result.end())
             continue;
         bool connected_to_all = true;

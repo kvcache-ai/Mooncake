@@ -125,6 +125,7 @@ void AgentHost::shutdown() {
     // Finish operations that callers already submitted, including explicit
     // unregisterGroup calls, before releasing process-level rank ownership.
     executor_.shutdown();
+    link_manager_.stop();
     unregisterAgent();
     if (rpc_client_) {
         rpc_client_->shutdown();
@@ -490,6 +491,7 @@ void AgentHost::startAgentRegistration(bool start_new_session) {
         return;
     }
     if (start_new_session) {
+        link_manager_.stop();
         ++agent_session_id_;
         agent_session_initialized_ = false;
     }
@@ -546,6 +548,8 @@ void AgentHost::startAgentRegistration(bool start_new_session) {
                 if (agent_.getCoordinatorConnection() !=
                     AgentStateMachine::CoordinatorConnection::Connected)
                     return;
+
+                link_manager_.start(agent_.getRankEpoch());
 
                 if (!agent_registration_done_) {
                     agent_registration_done_ = true;

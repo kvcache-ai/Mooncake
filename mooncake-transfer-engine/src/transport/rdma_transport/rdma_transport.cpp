@@ -54,8 +54,80 @@ static std::string resolveBufferLocation(
     return location;
 }
 
+// Calculate remaining bytes in buffer for 'address'.
+// Caches 'last_buffer_idx' across sequential slices to avoid rescanning
+// buffers.
+static uint64_t bytesUntilBufferEnd(
+    const TransferMetadata::SegmentDesc *segment_desc, uint64_t address,
+    bool require_remote_key, size_t *last_buffer_idx = nullptr) {
+    if (!segment_desc || segment_desc->buffers.empty()) return 0;
+
+    auto is_valid_buffer = [&](const TransferMetadata::BufferDesc &buffer) {
+#ifdef ENABLE_MULTI_PROTOCOL
+        if (!buffer.protocol.empty() && buffer.protocol != "rdma") return false;
+#endif
+        if (require_remote_key ? buffer.rkey.empty() : buffer.lkey.empty())
+            return false;
+        if (address < buffer.addr || address - buffer.addr >= buffer.length)
+            return false;
+        return true;
+    };
+
+    if (last_buffer_idx && *last_buffer_idx < segment_desc->buffers.size()) {
+        const auto &buffer = segment_desc->buffers[*last_buffer_idx];
+        if (is_valid_buffer(buffer)) {
+            return buffer.length - (address - buffer.addr);
+        }
+    }
+
+    uint64_t max_remaining = 0;
+    for (size_t i = 0; i < segment_desc->buffers.size(); ++i) {
+        const auto &buffer = segment_desc->buffers[i];
+        if (is_valid_buffer(buffer)) {
+            uint64_t remaining = buffer.length - (address - buffer.addr);
+            if (remaining > max_remaining) {
+                max_remaining = remaining;
+                if (last_buffer_idx) *last_buffer_idx = i;
+            }
+        }
+    }
+    return max_remaining;
+}
+
+// Calculate slice length capped at MR boundary to avoid multi-MR WRs.
+// Caches source and target buffer indices across slices for a single request.
+struct SliceLengthCalculator {
+    const Transport::TransferRequest &request;
+    size_t block_size;
+    size_t fragment_size;
+    const TransferMetadata::SegmentDesc *local_desc;
+    const TransferMetadata::SegmentDesc *target_desc;
+
+    size_t src_buffer_idx = 0;
+    size_t tgt_buffer_idx = 0;
+
+    inline size_t calculate(uint64_t offset) {
+        const size_t remaining = request.length - offset;
+        size_t slice_length =
+            remaining <= block_size + fragment_size ? remaining : block_size;
+
+        const uint64_t src_rem = bytesUntilBufferEnd(
+            local_desc, reinterpret_cast<uint64_t>(request.source) + offset,
+            false, &src_buffer_idx);
+        if (src_rem > 0)
+            slice_length = std::min<uint64_t>(slice_length, src_rem);
+
+        const uint64_t tgt_rem = bytesUntilBufferEnd(
+            target_desc, request.target_offset + offset, true, &tgt_buffer_idx);
+        if (tgt_rem > 0)
+            slice_length = std::min<uint64_t>(slice_length, tgt_rem);
+
+        return slice_length;
+    }
+};
+
 // Mode definition for MC_IB_PCI_RELAXED_ORDERING env.
-// 0 - disabled, 1 - enabled if supported, 2 - auto (default, same as 1 today).
+// 0 - disabled, 1 - enabled if supported (default), 2 - auto (same as 1 today).
 static int getIbRelaxedOrderingMode() {
     int val = globalConfig().ib_pci_relaxed_ordering_mode;
     if (val < 0 || val > 2) {
@@ -214,12 +286,9 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
                                                bool remote_accessible,
                                                bool update_metadata,
                                                bool force_sequential) {
-    (void)remote_accessible;
-    const int kBaseAccessRights = IBV_ACCESS_LOCAL_WRITE |
-                                  IBV_ACCESS_REMOTE_WRITE |
-                                  IBV_ACCESS_REMOTE_READ;
-
-    int access_rights = kBaseAccessRights;
+    int access_rights = IBV_ACCESS_LOCAL_WRITE;
+    if (remote_accessible)
+        access_rights |= IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
     if (MCIbRelaxedOrderingEnabled) {
         access_rights |= IBV_ACCESS_RELAXED_ORDERING;
     }
@@ -416,7 +485,8 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         BufferDesc buffer_desc;
         for (auto &context : context_list_) {
             buffer_desc.lkey.push_back(context->lkey(chunk_addr));
-            buffer_desc.rkey.push_back(context->rkey(chunk_addr));
+            if (remote_accessible)
+                buffer_desc.rkey.push_back(context->rkey(chunk_addr));
         }
         buffer_desc.name = resolved_name;
         buffer_desc.addr = (uint64_t)chunk_addr;
@@ -748,6 +818,8 @@ Status RdmaTransport::submitTransferTask(
     const std::vector<TransferTask *> &task_list) {
     std::unordered_map<std::shared_ptr<RdmaContext>, std::vector<Slice *>>
         slices_to_post;
+    std::unordered_map<SegmentID, std::shared_ptr<SegmentDesc>>
+        target_segment_descs;
     auto local_segment_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     assert(local_segment_desc.get());
     const size_t kBlockSize = globalConfig().slice_size;
@@ -755,6 +827,38 @@ Status RdmaTransport::submitTransferTask(
     const size_t kFragmentSize = globalConfig().fragment_limit;
     const size_t kSubmitWatermark =
         globalConfig().max_wr * globalConfig().num_qp_per_ep;
+    auto fail_unposted_slices = [&]() {
+        for (auto &entry : slices_to_post)
+            for (auto *slice : entry.second) slice->markFailed();
+        slices_to_post.clear();
+    };
+
+    // Fabricate a zero-length failed slice for unstarted tasks so that the
+    // existing success + failed == slice_count terminal check can drive the
+    // task to FAILED without special-casing, and ~TransferTask reclaims the
+    // slice.
+    auto fail_unstarted_tasks = [&](size_t first_task_index) {
+        for (size_t i = first_task_index; i < task_list.size(); ++i) {
+            auto &task = *task_list[i];
+            Slice *slice = getSliceCache().allocate();
+            assert(slice);
+            slice->source_addr = nullptr;
+            slice->length = 0;
+            slice->task = &task;
+            slice->status = Slice::PENDING;
+            task.slice_list.push_back(slice);
+            __sync_fetch_and_add(&task.slice_count, 1);
+            slice->markFailed();
+        }
+    };
+    auto fail_task_and_cleanup = [&](TransferTask &task, Slice *slice,
+                                     size_t task_index) {
+        task.total_bytes += slice->length;
+        __sync_fetch_and_add(&task.slice_count, 1);
+        slice->markFailed();
+        fail_unposted_slices();
+        fail_unstarted_tasks(task_index + 1);
+    };
     uint64_t nr_slices;
     for (size_t index = 0; index < task_list.size(); ++index) {
         assert(task_list[index]);
@@ -762,6 +866,15 @@ Status RdmaTransport::submitTransferTask(
         nr_slices = 0;
         assert(task.request);
         auto &request = *task.request;
+        auto target_desc_it = target_segment_descs.find(request.target_id);
+        if (target_desc_it == target_segment_descs.end()) {
+            target_desc_it =
+                target_segment_descs
+                    .emplace(request.target_id,
+                             metadata_->getSegmentDescByID(request.target_id))
+                    .first;
+        }
+        const auto &target_segment_desc = target_desc_it->second;
 
         auto request_buffer_id = -1, request_device_id = -1;
         if (selectDevice(local_segment_desc.get(), (uint64_t)request.source,
@@ -771,20 +884,20 @@ Status RdmaTransport::submitTransferTask(
             request_device_id = -1;
         }
 
-        for (uint64_t offset = 0; offset < request.length;
-             offset += kBlockSize) {
+        SliceLengthCalculator slice_calc{request, kBlockSize, kFragmentSize,
+                                         local_segment_desc.get(),
+                                         target_segment_desc.get()};
+        for (uint64_t offset = 0; offset < request.length;) {
+            size_t slice_length = slice_calc.calculate(offset);
+
             Slice *slice = getSliceCache().allocate();
             assert(slice);
             if (!slice->from_cache) {
                 nr_slices++;
             }
 
-            bool merge_final_slice =
-                request.length - offset <= kBlockSize + kFragmentSize;
-
             slice->source_addr = (char *)request.source + offset;
-            slice->length =
-                merge_final_slice ? request.length - offset : kBlockSize;
+            slice->length = slice_length;
             slice->source_location.clear();
             slice->opcode = request.opcode;
             slice->rdma.dest_addr = request.target_offset + offset;
@@ -827,14 +940,7 @@ Status RdmaTransport::submitTransferTask(
             }
             if (!found_device) {
                 auto source_addr = slice->source_addr;
-                // Do not deallocate slices already queued in slices_to_post
-                // here: every slice, including those, is already recorded in
-                // its owning TransferTask::slice_list (unconditionally,
-                // right after allocation above), and ~TransferTask() returns
-                // everything in slice_list to the cache exactly once.
-                // Deallocating them again here double-frees them into
-                // ThreadLocalSliceCache, letting a later allocate() hand out
-                // the same Slice* to two unrelated transfers.
+                fail_task_and_cleanup(task, slice, index);
                 LOG(ERROR)
                     << "Memory region not registered by any active device(s): "
                     << source_addr;
@@ -844,6 +950,7 @@ Status RdmaTransport::submitTransferTask(
             } else {
                 auto &context = context_list_[device_id];
                 if (!context->active()) {
+                    fail_task_and_cleanup(task, slice, index);
                     LOG(ERROR) << "Device " << device_id << " is not active";
                     return Status::InvalidArgument("Device " +
                                                    std::to_string(device_id) +
@@ -868,9 +975,7 @@ Status RdmaTransport::submitTransferTask(
                 nr_slices = 0;
             }
 
-            if (merge_final_slice) {
-                break;
-            }
+            offset += slice->length;
         }
     }
 

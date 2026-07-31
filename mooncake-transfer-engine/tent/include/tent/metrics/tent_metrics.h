@@ -76,9 +76,9 @@ class TentMetrics {
         return runtime_enabled_.load(std::memory_order_relaxed);
     }
 
-    // Record transfer operations. The TransportType argument labels the
-    // metric with the transport that handled (or attempted) the transfer,
-    // so Prometheus queries can break down traffic by transport.
+    // Record logical transfer outcomes. The TransportType argument is the
+    // terminal transport: after failover, a recovered request is attributed to
+    // the transport that completed it.
     void recordReadCompleted(TransportType tp, size_t bytes,
                              double latency_seconds = 0.0);
     void recordWriteCompleted(TransportType tp, size_t bytes,
@@ -88,6 +88,18 @@ class TentMetrics {
     // Failover counter is labeled with both the source and destination
     // transport types so failover flows (e.g. rdma->tcp) are queryable.
     void recordTransportFailover(TransportType from, TransportType to);
+
+    // Record physical transport attempts separately from logical requests.
+    // "Started" means the engine is about to call submitTransferTasks (or the
+    // staging equivalent). "Finished" records the observed attempt duration
+    // and, for a FAILED status (including synchronous submit failure),
+    // increments the attempt-failure counter.
+    void recordTransportAttemptStarted(TransportType tp,
+                                       Request::OpCode operation);
+    void recordTransportAttemptFinished(TransportType tp,
+                                        Request::OpCode operation,
+                                        TransferStatusEnum status,
+                                        double latency_us);
 
     // Record the deadline feasibility ratio (MLU) for a completed transfer
     // that carried a deadline. mlu = actual_transfer_seconds / window_seconds,
@@ -163,16 +175,18 @@ class TentMetrics {
     std::condition_variable metric_report_cv_;
 
     // Counters — stored as base pointers (metric_t*) so that counters with
-    // different label arities (N=1 for per-transport, N=2 for failover
-    // from→to) share one vector for Prometheus serialize(). The concrete
-    // typed members below are used directly for JSON/summary aggregation
-    // (which need to iterate label values via copy()).
+    // different label arities (N=1 for per-transport, N=2 for failover and
+    // transport-attempt operation labels) share one vector for Prometheus
+    // serialize(). The concrete typed members below are used directly for
+    // JSON/summary aggregation (which need to iterate label values via copy()).
     std::vector<ylt::metric::metric_t*> counters_;
 
     // Label name arrays for dynamic metric construction.
     static inline const std::array<std::string, 1> kTransportLabel{"transport"};
     static inline const std::array<std::string, 2> kFailoverLabels{"from",
                                                                    "to"};
+    static inline const std::array<std::string, 2> kAttemptLabels{"transport",
+                                                                  "operation"};
 
     // Per-transport counters (label: transport). Values are int64_t.
     ylt::metric::basic_dynamic_counter<int64_t, 1> read_bytes_total_{
@@ -197,6 +211,15 @@ class TentMetrics {
     ylt::metric::basic_dynamic_counter<int64_t, 2> failover_total_{
         "tent_transport_failover_total",
         "Total cross-transport failover events", kFailoverLabels};
+    ylt::metric::basic_dynamic_counter<int64_t, 2> transport_attempts_total_{
+        "tent_transport_attempts_total",
+        "Total physical transport attempts submitted for execution",
+        kAttemptLabels};
+    ylt::metric::basic_dynamic_counter<int64_t, 2>
+        transport_attempt_failures_total_{
+            "tent_transport_attempt_failures_total",
+            "Physical transport attempts that terminated with FAILED",
+            kAttemptLabels};
     ylt::metric::basic_dynamic_counter<int64_t, 1> deadline_infeasible_total_{
         "tent_deadline_infeasible_total",
         "Transfers whose deadline was already in the past at submit",
@@ -209,6 +232,9 @@ class TentMetrics {
     // sum, because ylt's basic_dynamic_histogram keeps sum_ private with no
     // public accessor — without this counter, _sum could only be emitted as 0
     // in the Prometheus endpoint, breaking _sum / _count queries.
+    // Only N=1 (per-transport) histograms live here; the N=2
+    // transport_attempt_latency_ histogram is serialized separately (see
+    // getPrometheusMetrics / getJsonMetrics) via the same templated helpers.
     struct HistogramEntry {
         ylt::metric::basic_dynamic_histogram<int64_t, 1>* h;
         const std::vector<double>* boundaries;
@@ -266,6 +292,10 @@ class TentMetrics {
         "tent_stage_transport_us",
         "Causal chain: transport execution latency in microseconds",
         kStageBuckets, kTransportLabel};
+    ylt::metric::basic_dynamic_histogram<int64_t, 2> transport_attempt_latency_{
+        "tent_transport_attempt_latency_us",
+        "Observed physical transport attempt latency in microseconds",
+        kLatencyBuckets, kAttemptLabels};
 
     // Parallel counters tracking per-label sum for each histogram. ylt's
     // basic_dynamic_histogram keeps sum_ private with no public accessor, so
@@ -299,6 +329,14 @@ class TentMetrics {
         "tent_stage_transport_us_sum",
         "Sum of transport execution latency observations (microseconds)",
         kTransportLabel};
+    // Parallel sum counter for the N=2 transport-attempt latency histogram
+    // (labels: transport, operation). Same rationale as the N=1 sum counters
+    // above — ylt keeps the histogram's sum_ private.
+    ylt::metric::basic_dynamic_counter<int64_t, 2>
+        transport_attempt_latency_sum_{"tent_transport_attempt_latency_us_sum",
+                                       "Sum of physical transport attempt "
+                                       "latency observations (microseconds)",
+                                       kAttemptLabels};
 
     // Helper to register all metrics to the vectors
     void registerMetrics();
@@ -315,10 +353,13 @@ class TentMetrics {
     // `boundaries` is the compile-time bucket boundary vector paired with
     // the histogram in HistogramEntry. The caller (getPrometheusMetrics)
     // emits the # HELP / # TYPE header so the format stays identical to ylt.
+    // Templated over label arity N so both the per-transport (N=1) histograms
+    // and the transport-attempt (N=2) histogram share one implementation.
+    template <uint8_t N>
     void serializeHistogramPrometheus(
-        ylt::metric::basic_dynamic_histogram<int64_t, 1>* hist,
+        ylt::metric::basic_dynamic_histogram<int64_t, N>* hist,
         const std::vector<double>& boundaries,
-        ylt::metric::basic_dynamic_counter<int64_t, 1>& sum,
+        ylt::metric::basic_dynamic_counter<int64_t, N>& sum,
         std::string& out) const;
 #endif  // TENT_METRICS_ENABLED
 };
