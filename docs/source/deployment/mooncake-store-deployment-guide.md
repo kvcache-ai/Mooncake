@@ -525,6 +525,45 @@ glog's standard flags (`--log_dir`, `--max_log_size`, `--logtostderr`, ...) cont
 | `--enable_metric_reporting` | `true` | Periodically log master metrics |
 | `--metrics_port` | `9003` | HTTP port for `/metrics` endpoints |
 
+### KV Cache Event Publisher
+
+The master can publish KV cache lifecycle events over a ZMQ PUB socket for
+cache-aware indexers such as Mooncake Conductor. This feature is compiled out
+by default. Install `libzmq3-dev` and configure Mooncake Store with
+`-DENABLE_KV_EVENTS=ON` before enabling it at runtime.
+
+Both `--kv_events_bind_endpoint` and `--kv_events_backend_id` are required when
+the publisher is enabled. If either value is empty, or the ZMQ socket cannot
+bind, the master logs an error and continues with event publishing disabled.
+
+```bash
+mooncake_master \
+  --enable_kv_events=true \
+  --kv_events_bind_endpoint=tcp://0.0.0.0:5557 \
+  --kv_events_backend_id=store-node-1
+```
+
+Register an address reachable by the indexer, rather than the wildcard bind
+address, through the indexer's `POST /register` endpoint. For the event format,
+registration fields, and object-key behavior, see the {ref}`Mooncake Store
+master publisher <mooncake-store-master-publisher>` reference.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--enable_kv_events` | `false` | Enable the ZMQ KV cache event publisher; requires a build with `ENABLE_KV_EVENTS=ON` |
+| `--kv_events_bind_endpoint` | empty | ZMQ PUB bind endpoint, for example `tcp://0.0.0.0:5557`; required when enabled |
+| `--kv_events_backend_id` | empty | Cache-owner identity emitted as `backend_id`; required when enabled |
+| `--kv_events_emit_legacy_compat` | `true` | Include vLLM/SGLang-compatible aliases such as `type` and `block_hashes` |
+| `--kv_events_emit_object_key` | `true` | Include the Mooncake `object_key`; unparsable sequence hashes are still published when this is enabled |
+| `--kv_events_queue_capacity` | `65536` | Maximum pending events; the publisher drops the oldest event when the queue is full. Set to `0` for an unbounded queue |
+
+The legacy flags `--kv_events_model_name`, `--kv_events_tenant_id`,
+`--kv_events_additional_salt`, `--kv_events_lora_name`,
+`--kv_events_block_size`, and `--kv_events_dp_rank` are retained for config
+compatibility but are not emitted in event payloads. Supply model, block-size,
+hash-namespace, LoRA, and data-parallel metadata when registering the publisher
+with the indexer; each event carries its object's tenant ID.
+
 ### HTTP Metadata Server (Embedded)
 
 | Flag | Default | Description |

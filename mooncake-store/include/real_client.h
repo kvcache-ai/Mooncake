@@ -389,6 +389,9 @@ class RealClient : public PyClient {
     batch_acquire_buffer_dummy(const std::vector<std::string> &keys,
                                const UUID &client_id);
 
+    tl::expected<std::tuple<uint64_t, size_t>, ErrorCode> allocate_buffer_dummy(
+        size_t size, const UUID &client_id);
+
     tl::expected<void, ErrorCode> put_dummy_helper(
         const std::string &key, std::span<const char> value,
         const ReplicateConfig &config, const UUID &client_id);

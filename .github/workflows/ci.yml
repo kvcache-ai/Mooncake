@@ -22,7 +22,7 @@ concurrency:
 jobs:
   build:
     needs: [spell-check, clang-format, check-paths]
-    if: >-
+    if: &run-ci-for-source-changes >-
       (needs.check-paths.outputs.should-run-downstream == 'true' ||
        github.event_name == 'workflow_dispatch') &&
       (github.event_name == 'push' ||
@@ -136,57 +136,18 @@ jobs:
       shell: bash
 
     - name: Run Mooncake Store Rust smoke test and benchmark
-      run: |
-        $GITHUB_WORKSPACE/build/mooncake-store/src/mooncake_master \
-          --eviction_high_watermark_ratio=0.95 \
-          --cluster_id=ci_rust_test_cluster \
-          --port 50051 &
-        MASTER_PID=$!
-        sleep 3
-        cd mooncake-store/rust
-        export LD_LIBRARY_PATH=$GITHUB_WORKSPACE/build/mooncake-asio:$GITHUB_WORKSPACE/build/mooncake-store/src:$GITHUB_WORKSPACE/build/mooncake-store/src/cachelib_memory_allocator:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base:$GITHUB_WORKSPACE/build/mooncake-common/etcd:$LD_LIBRARY_PATH
-        export MOONCAKE_BUILD_DIR=$GITHUB_WORKSPACE/build
-        export MOONCAKE_STORE_LIB_DIR=$GITHUB_WORKSPACE/build/mooncake-store/src
-        export MOONCAKE_STORE_INCLUDE_DIR=$GITHUB_WORKSPACE/mooncake-store/include
-        # This job builds Mooncake with -DENABLE_ASAN=ON, so the C++ libraries
-        # the Rust package links against carry undefined __asan_* references. Opt
-        # in to linking the ASan runtime; build.rs emits -lasan first, which
-        # keeps libasan first in the initial library list as ASan requires.
-        # Non-sanitized builds leave this unset and link without ASan.
-        export MOONCAKE_LINK_ASAN=1
-        export MC_METADATA_SERVER=http://127.0.0.1:8080/metadata
-        export MC_RUST_STORE_RUN_INTEGRATION=true
-        export MC_RUST_STORE_MASTER_ADDR=127.0.0.1:50051
-        export MC_RUST_STORE_LOCAL_HOSTNAME=127.0.0.1
-        export MC_RUST_STORE_PROTOCOL=tcp
-        export MC_RUST_STORE_DEVICE_NAME=
-        cargo test --test minimal_smoke -- --nocapture
-        MC_RUST_BENCH_ITERATIONS=4 \
-        MC_RUST_BENCH_VALUE_SIZE=4096 \
-        MC_RUST_BENCH_WARMUP=1 \
-          cargo run --release --example store_benchmark
-        kill $MASTER_PID 2>/dev/null || true
+      env:
+        MOONCAKE_STORE_CLUSTER_ID: ci_rust_test_cluster
+        MOONCAKE_STORE_RUST_LINK_ASAN: "1"
+      run: ./scripts/ci/run_store_rust_smoke.sh
       shell: bash
 
     - name: Run Go store binding integration tests
-      run: |
-        $GITHUB_WORKSPACE/build/mooncake-store/src/mooncake_master \
-          --eviction_high_watermark_ratio=0.95 \
-          --cluster_id=ci_go_test_cluster \
-          --port 50051 &
-        MASTER_PID=$!
-        sleep 3
-        cd mooncake-store/go
-        export LD_LIBRARY_PATH=$GITHUB_WORKSPACE/build/mooncake-common:$GITHUB_WORKSPACE/build/mooncake-store/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base:$GITHUB_WORKSPACE/build/mooncake-common/etcd
-        export CGO_ENABLED=1
-        export CGO_CFLAGS="-I$GITHUB_WORKSPACE/mooncake-store/include -I$GITHUB_WORKSPACE/mooncake-transfer-engine/include"
-        export CGO_LDFLAGS="-L$GITHUB_WORKSPACE/build/mooncake-store/src -L$GITHUB_WORKSPACE/build/mooncake-store/src/cachelib_memory_allocator -L$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src -L$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base -L$GITHUB_WORKSPACE/build/mooncake-common -L$GITHUB_WORKSPACE/build/mooncake-common/src -L$GITHUB_WORKSPACE/build/mooncake-common/etcd -Wl,--start-group -lmooncake_store -lcachelib_memory_allocator -ltransfer_engine -lbase -lmooncake_common -Wl,--end-group -lasio -letcd_wrapper -lstdc++ -lnuma -lglog -lgflags -libverbs -lmlx5 -ljsoncpp -lzstd -lcurl -luring -lasan -lm -lgcov -lxxhash -lyaml-cpp"
-        # Link cudart if CUDA is available (needed for D2H staging in mooncake_store)
-        if [ -d /usr/local/cuda/lib64 ]; then export CGO_LDFLAGS="$CGO_LDFLAGS -L/usr/local/cuda/lib64 -lcudart"; fi
-        # KV events publisher (optional; linked when libzmq is installed)
-        if ldconfig -p 2>/dev/null | grep -q libzmq; then export CGO_LDFLAGS="$CGO_LDFLAGS -lzmq"; fi
-        ASAN_OPTIONS=detect_leaks=0:verify_asan_link_order=0 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata go test -v ./tests/...
-        kill $MASTER_PID 2>/dev/null || true
+      env:
+        MOONCAKE_STORE_CLUSTER_ID: ci_go_test_cluster
+        MOONCAKE_STORE_GO_LINK_COMMON: "1"
+        MOONCAKE_STORE_GO_SANITIZED: "1"
+      run: ./scripts/ci/run_store_go_integration.sh
       shell: bash
 
     - name: Test (in build env) with coverage
@@ -282,13 +243,7 @@ jobs:
 
   build-musa:
     needs: [spell-check, clang-format, check-paths]
-    if: >-
-      (needs.check-paths.outputs.should-run-downstream == 'true' ||
-       github.event_name == 'workflow_dispatch') &&
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+    if: *run-ci-for-source-changes
     runs-on: ubuntu-22.04
     container: registry.mthreads.com/mcconline/inference/pytorch:2.9.1.post1-py3.10-musa5.2.0-mp31-devel-ubuntu22.04-amd64
     steps:
@@ -320,13 +275,7 @@ jobs:
 
   build-arm64:
     needs: [spell-check, clang-format, check-paths]
-    if: >-
-      (needs.check-paths.outputs.should-run-downstream == 'true' ||
-       github.event_name == 'workflow_dispatch') &&
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+    if: *run-ci-for-source-changes
     runs-on: ubuntu-22.04-arm
     strategy:
       matrix:
@@ -593,13 +542,7 @@ jobs:
 
   build-flags:
     needs: [spell-check, clang-format, check-paths]
-    if: >-
-      (needs.check-paths.outputs.should-run-downstream == 'true' ||
-       github.event_name == 'workflow_dispatch') &&
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+    if: *run-ci-for-source-changes
     runs-on: ubuntu-22.04
     strategy:
       matrix:
@@ -831,13 +774,7 @@ jobs:
   build-docker:
     name: Build Docker Image
     needs: [spell-check, clang-format, check-paths]
-    if: >-
-      (needs.check-paths.outputs.should-run-downstream == 'true' ||
-       github.event_name == 'workflow_dispatch') &&
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+    if: *run-ci-for-source-changes
     runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4
@@ -860,7 +797,7 @@ jobs:
 
   spell-check:
     name: Spell Check with Typos
-    if: >-
+    if: &run-ci >-
       (github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch' ||
        github.event.action == 'opened' ||
@@ -876,11 +813,7 @@ jobs:
 
   clang-format:
     name: Check code format
-    if: >-
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+    if: *run-ci
     runs-on: ubuntu-22.04
     steps:
     - name: Checkout Actions Repository
@@ -920,17 +853,13 @@ jobs:
           fi
         fi
         echo "Comparing against: ${BASE_REF}"
-        ./scripts/code_format.sh --check --base "${BASE_REF}"
+        ./scripts/code_format.sh --check --changed-lines --base "${BASE_REF}"
       shell: bash
 
 
   docs-check:
     name: Check Sphinx docs build
-    if: >-
-      github.event_name == 'push' ||
-      github.event_name == 'workflow_dispatch' ||
-      github.event.action == 'opened' ||
-      contains(github.event.pull_request.labels.*.name, 'run-ci')
+    if: *run-ci
     runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4
@@ -967,11 +896,7 @@ jobs:
 
 
   check-paths:
-    if: >-
-      github.event_name == 'push' ||
-      github.event_name == 'workflow_dispatch' ||
-      github.event.action == 'opened' ||
-      contains(github.event.pull_request.labels.*.name, 'run-ci')
+    if: *run-ci
     runs-on: ubuntu-latest
     outputs:
       should-run-downstream: ${{ steps.dispatch-override.outputs.src || steps.filter.outputs.src }}
@@ -1011,25 +936,13 @@ jobs:
 
   build-wheel-cu13:
     needs: [spell-check, clang-format, check-paths]
-    if: >-
-      (needs.check-paths.outputs.should-run-downstream == 'true' ||
-       github.event_name == 'workflow_dispatch') &&
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+    if: *run-ci-for-source-changes
     uses: ./.github/workflows/ci_cu13.yml
     secrets: inherit
 
   build-wheel-efa:
     needs: [spell-check, clang-format, check-paths]
-    if: >-
-      (needs.check-paths.outputs.should-run-downstream == 'true' ||
-       github.event_name == 'workflow_dispatch') &&
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+    if: *run-ci-for-source-changes
     uses: ./.github/workflows/ci_efa.yml
     secrets: inherit
 
