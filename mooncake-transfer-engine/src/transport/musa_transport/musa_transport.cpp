@@ -61,15 +61,10 @@ bool openOnMetadataDevice() {
         const char* value = std::getenv("MC_MUSA_IPC_OPEN_DEVICE");
         if (value && std::string(value) == "metadata") {
             const char* musa_visible = std::getenv("MUSA_VISIBLE_DEVICES");
-            const char* mthreads_visible =
-                std::getenv("MTHREADS_VISIBLE_DEVICES");
             LOG(INFO) << "MusaTransport: opening IPC handles on the metadata "
-                         "device; peers must use identical ordered physical "
-                         "device lists (MUSA_VISIBLE_DEVICES="
-                      << (musa_visible ? musa_visible : "(not set)")
-                      << ", MTHREADS_VISIBLE_DEVICES="
-                      << (mthreads_visible ? mthreads_visible : "(not set)")
-                      << ")";
+                         "device; peers must use identical runtime-visible "
+                         "logical device mappings (MUSA_VISIBLE_DEVICES="
+                      << (musa_visible ? musa_visible : "(not set)") << ")";
             return true;
         }
         if (!value || std::string(value) == "current") {
@@ -82,17 +77,6 @@ bool openOnMetadataDevice() {
         return false;
     }();
     return enabled;
-}
-
-bool localVisibilityMappingIsConsistent() {
-    const char* musa_visible = std::getenv("MUSA_VISIBLE_DEVICES");
-    const char* mthreads_visible = std::getenv("MTHREADS_VISIBLE_DEVICES");
-    if (!musa_visible || !mthreads_visible) return true;
-    if (std::string(musa_visible) == std::string(mthreads_visible)) return true;
-    LOG(ERROR) << "MusaTransport: MUSA_VISIBLE_DEVICES=" << musa_visible
-               << " differs from MTHREADS_VISIBLE_DEVICES=" << mthreads_visible
-               << "; refusing metadata-device IPC mapping";
-    return false;
 }
 
 enum class MusaCopyApi { Auto, Default, TransferBatch };
@@ -270,8 +254,6 @@ class MusaTransportPolicy final : public GpuIpcTransportPolicy {
         if (openOnMetadataDevice()) {
             const int metadata_device = deviceFromLocation(location);
             if (metadata_device >= 0) {
-                if (!localVisibilityMappingIsConsistent())
-                    return musaErrorInvalidDevice;
                 opened_device = metadata_device;
             } else if (location == kWildcardLocation) {
                 // Older peers may still advertise the wildcard location. A

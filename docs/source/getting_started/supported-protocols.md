@@ -219,9 +219,8 @@ context rules.
 
 **Configuration:**
 ```bash
-# Use the identical ordered physical-device list in every peer process.
-export MTHREADS_VISIBLE_DEVICES=4,5
-export MUSA_VISIBLE_DEVICES=4,5
+# Use the same runtime-visible logical-device mapping in every peer process.
+export MUSA_VISIBLE_DEVICES=0,1
 export MC_FORCE_MUSA=1
 
 # Safe defaults shown explicitly. Opt in to metadata after checking the
@@ -229,21 +228,23 @@ export MC_FORCE_MUSA=1
 export MC_MUSA_IPC_OPEN_DEVICE=current
 export MC_MUSA_COPY_API=auto
 
-# Performance path after both peers use the same ordered physical IDs.
+# Performance path after both peers use the same logical device mapping.
 export MC_MUSA_IPC_OPEN_DEVICE=metadata
 ```
 
-`MTHREADS_VISIBLE_DEVICES` and `MUSA_VISIBLE_DEVICES` must contain the same
-physical IDs in the same order in every container/process. Buffer metadata uses
-logical ordinals such as `musa:0`; using `MTHREADS_VISIBLE_DEVICES=4,5` together
-with `MUSA_VISIBLE_DEVICES=0,1` can select physical GPUs outside the intended
-pair and is rejected locally. Both peers must run a version that recognizes the
-`musa` protocol; rolling interoperability with an older peer advertising only
-`nvlink` is not supported. `MC_MUSA_IPC_OPEN_DEVICE=current` is the safe
-default; select `metadata` only when both peers satisfy the ordered visibility
-contract above. Python bindings that register the default wildcard
-location (`*`) resolve the owning MUSA device during registration; an older
-peer that still advertises `*` falls back to the current-device open path.
+`MTHREADS_VISIBLE_DEVICES` is consumed by mt-container-toolkit when the
+container is created; Mooncake does not use it to infer the MUSA runtime's
+logical device mapping. Buffer metadata uses runtime-visible logical ordinals
+such as `musa:0`. With `metadata`, every peer must map each logical ordinal to
+the same physical GPU. Mooncake validates that the advertised ordinal exists
+locally, but it cannot prove cross-peer identity from environment variables.
+Both peers must run a version that recognizes the `musa` protocol; rolling
+interoperability with an older peer advertising only `nvlink` is not supported.
+`MC_MUSA_IPC_OPEN_DEVICE=current` is the safe default; select `metadata` only
+when peers satisfy the logical mapping contract above. Python bindings that
+register the default wildcard location (`*`) resolve the owning MUSA device
+during registration; an older peer that still advertises `*` falls back to the
+current-device open path.
 
 In `auto` mode, batches whose copies are at least 1 MiB use
 `muMemoryTransferBatchAsync`; set `MC_MUSA_TRANSFER_BATCH_MIN_BYTES` to tune the
