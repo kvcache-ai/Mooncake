@@ -14,8 +14,6 @@ import sys
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
-from mooncake.mooncake_ep_buffer import Buffer
-
 from metrics import (
     assemble_json_output,
     compute_global_expert_load,
@@ -23,10 +21,28 @@ from metrics import (
 )
 from routing import ROUTING_MODES
 
+from mooncake.mooncake_ep_buffer import Buffer
+
 
 def parse_args():
+    # Pre-parse --config to load JSON defaults before full parsing
+    pre_parser = argparse.ArgumentParser(add_help=False)
+    pre_parser.add_argument("--config", default=None)
+    pre_args, _ = pre_parser.parse_known_args()
+
+    config_defaults = {}
+    if pre_args.config:
+        with open(pre_args.config) as f:
+            config_defaults = json.load(f)
+
     parser = argparse.ArgumentParser(
         description="Mooncake EP dispatch/combine benchmark"
+    )
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to JSON config file (CLI flags override config values)",
     )
     parser.add_argument(
         "--backend",
@@ -61,7 +77,7 @@ def parse_args():
     parser.add_argument(
         "--num-tokens",
         type=int,
-        default=4096,
+        default=1024,
         help="Number of tokens per rank",
     )
     parser.add_argument(
@@ -151,6 +167,10 @@ def parse_args():
         default=29500,
         help="Master port for process group (default: 29500)",
     )
+
+    if config_defaults:
+        parser.set_defaults(**config_defaults)
+
     return parser.parse_args()
 
 
@@ -162,6 +182,10 @@ def validate_args(args):
         )
     if args.async_finish and args.return_recv_hook:
         raise ValueError("async_finish and return_recv_hook are mutually exclusive")
+    if args.dtype == "fp8" and args.hidden_size % 128 != 0:
+        raise ValueError(
+            f"hidden_size ({args.hidden_size}) must be divisible by 128 for fp8 dtype"
+        )
 
 
 def dequantize_fp8(x_fp8, scales):
@@ -185,9 +209,6 @@ class EPBenchmarkWorker:
         self.timeout_us = -1
 
         torch.cuda.set_device(local_rank)
-
-        if args.pg_backend == "mooncake":
-            pass
 
         dist.init_process_group(
             backend=args.pg_backend, rank=rank, world_size=args.num_ranks
@@ -216,6 +237,7 @@ class EPBenchmarkWorker:
         self.active_ranks = torch.ones(
             (args.num_ranks,), dtype=torch.int32, device="cuda"
         )
+        self.out_tensor = torch.zeros_like(self.x)
 
     def run_dispatch(self):
         recv_x, recv_count, handle, event, hook = self.buf.dispatch(
@@ -235,15 +257,15 @@ class EPBenchmarkWorker:
             event.current_stream_wait()
         return recv_x, recv_count, handle
 
-    def run_combine(self, expert_out, handle):
+    def prepare_combine(self, expert_out, handle):
         if self.args.zero_copy:
             cb_buf = self.buf.get_next_combine_buffer(handle)
             cb_buf.copy_(expert_out)
-            expert_to_pass = cb_buf.contiguous()
+            return cb_buf.contiguous(), handle
         else:
-            expert_to_pass = expert_out.contiguous()
+            return expert_out.contiguous(), handle
 
-        out_tensor = torch.zeros_like(self.x)
+    def run_combine(self, expert_to_pass, handle):
         combined_x, event, hook = self.buf.combine(
             expert_to_pass,
             self.topk_idx,
@@ -254,7 +276,7 @@ class EPBenchmarkWorker:
             zero_copy=self.args.zero_copy,
             async_finish=self.args.async_finish,
             return_recv_hook=self.args.return_recv_hook,
-            out=out_tensor,
+            out=self.out_tensor,
         )
         if self.args.return_recv_hook:
             hook()
@@ -278,7 +300,8 @@ class EPBenchmarkWorker:
         for _ in range(self.args.warmup_iters):
             recv_x, _, handle = self.run_dispatch()
             expert_out = self.mock_expert_forward(recv_x)
-            self.run_combine(expert_out, handle)
+            expert_to_pass, handle = self.prepare_combine(expert_out, handle)
+            self.run_combine(expert_to_pass, handle)
         torch.cuda.synchronize()
 
     def run_measured(self):
@@ -296,10 +319,11 @@ class EPBenchmarkWorker:
             dispatch_ends[i].record()
 
             expert_out = self.mock_expert_forward(recv_x)
+            expert_to_pass, handle = self.prepare_combine(expert_out, handle)
 
             combine_starts[i].record()
 
-            self.run_combine(expert_out, handle)
+            self.run_combine(expert_to_pass, handle)
 
             combine_ends[i].record()
 
@@ -311,6 +335,7 @@ class EPBenchmarkWorker:
         combine_latencies = [
             combine_starts[i].elapsed_time(combine_ends[i]) for i in range(n)
         ]
+        # e2e includes dispatch + mock_expert_forward + combine (full cycle)
         e2e_latencies = [
             dispatch_starts[i].elapsed_time(combine_ends[i]) for i in range(n)
         ]
@@ -391,7 +416,8 @@ class EPBenchmarkWorker:
         self.warmup()
         dispatch_latencies, combine_latencies, e2e_latencies = self.run_measured()
         self.aggregate_and_output(dispatch_latencies, combine_latencies, e2e_latencies)
-        os._exit(0)
+        dist.barrier()
+        dist.destroy_process_group()
 
 
 def _worker_entry(rank, args):

@@ -10,7 +10,7 @@ Single-node (uses `mp.spawn` internally):
 ```bash
 python benchmarks/ep_benchmark/run_ep_benchmark.py \
     --num-ranks 8 --num-experts 256 --hidden-size 7168 \
-    --top-k 8 --num-tokens 4096 --dtype bf16 \
+    --top-k 8 --num-tokens 1024 --dtype bf16 \
     --routing-mode k_hot --hot-experts 32 --hot-fraction 0.9 \
     --zero-copy --async-finish \
     --warmup-iters 20 --iters 100 \
@@ -25,22 +25,31 @@ torchrun --nnodes=2 --nproc_per_node=4 --rdzv_backend=c10d \
     --rdzv_endpoint=$HEAD_NODE \
     benchmarks/ep_benchmark/run_ep_benchmark.py \
     --num-experts 256 --hidden-size 7168 \
-    --top-k 8 --num-tokens 4096 --dtype bf16 \
+    --top-k 8 --num-tokens 1024 --dtype bf16 \
     --routing-mode k_hot --hot-experts 32 --hot-fraction 0.9 \
     --zero-copy --async-finish \
     --pg-backend nccl \
     --json-output results/khot_8node.json
 ```
 
+Using a config file (CLI flags override config values):
+
+```bash
+python benchmarks/ep_benchmark/run_ep_benchmark.py \
+    --config benchmarks/ep_benchmark/configs/cuda_zipfian.json \
+    --num-ranks 8
+```
+
 ## Parameters
 
 | Flag | Default | Description |
 |------|---------|-------------|
+| `--config` | None | Path to JSON config file (CLI flags override) |
 | `--num-ranks` | `8` | Number of EP ranks / GPUs |
 | `--num-experts` | `256` | Total experts across all ranks |
 | `--hidden-size` | `7168` | Hidden dimension |
 | `--top-k` | `8` | Experts per token |
-| `--num-tokens` | `4096` | Tokens per rank |
+| `--num-tokens` | `1024` | Tokens per rank |
 | `--dtype` | `bf16` | Dispatch data type (`bf16` or `fp8`) |
 | `--routing-mode` | `uniform` | `uniform`, `k_hot`, or `zipf` |
 | `--hot-experts` | `32` | Hot expert count (k_hot mode) |
@@ -58,6 +67,8 @@ torchrun --nnodes=2 --nproc_per_node=4 --rdzv_backend=c10d \
 | `--master-port` | `29500` | Process group master port |
 
 `num_experts` must be divisible by `num_ranks`.
+
+`end_to_end_latency_ms` measures the full dispatch → mock expert forward → combine cycle, not dispatch + combine alone.
 
 ## Output
 

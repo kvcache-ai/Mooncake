@@ -4,7 +4,7 @@
   "num_experts": 256,
   "hidden_size": 7168,
   "top_k": 8,
-  "num_tokens": 4096,
+  "num_tokens": 1024,
   "dtype": "bf16",
   "routing_mode": "zipf",
   "zipf_alpha": 1.0,
