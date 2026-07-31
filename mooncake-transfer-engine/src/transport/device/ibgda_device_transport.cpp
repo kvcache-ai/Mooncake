@@ -222,18 +222,27 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     }
 
     int allocateControlBuffer() override {
+        if (Environ::Get().GetWithNvidiaPeermem()) {
+            LOG(INFO) << "[EP IBGDA] Selected legacy GPU-VA control buffer "
+                         "because WITH_NVIDIA_PEERMEM is enabled";
+            return allocateControlBuffer(ControlMemoryMode::kGpuVa);
+        }
 #if defined(USE_CUDA) && defined(MOONCAKE_HAVE_MLX5_DMABUF_UMEM)
-        if (Environ::GetBool("MOONCAKE_EP_IBGDA_DISABLE_DMABUF_CTRL", false)) {
-            LOG(INFO) << "[EP IBGDA] DMA-BUF control UMEM disabled by env";
-        } else if (cudaSupportsDmabuf()) {
+        if (cudaSupportsDmabuf()) {
             ctrl_buf_mode_ = ControlMemoryMode::kGpuDmabuf;
             LOG(INFO) << "[EP IBGDA] Selected per-QP GPU DMA-BUF control "
                          "regions";
             return 0;
         }
+        LOG(ERROR) << "[EP IBGDA] CUDA DMA-BUF control memory is unavailable; "
+                      "set WITH_NVIDIA_PEERMEM=1 to select the legacy GPU-VA "
+                      "path";
+        return -1;
 #elif defined(USE_CUDA)
-        LOG(INFO) << "[EP IBGDA] DMA-BUF control UMEM was unavailable at "
-                     "build time";
+        LOG(ERROR) << "[EP IBGDA] DMA-BUF control UMEM was unavailable at "
+                      "build time; set WITH_NVIDIA_PEERMEM=1 to select the "
+                      "legacy GPU-VA path";
+        return -1;
 #endif
         return allocateControlBuffer(ControlMemoryMode::kGpuVa);
     }
@@ -254,8 +263,6 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
                 stream, allocator);
             if (!qp) {
                 LOG(ERROR) << "[EP IBGDA] mlx5gda_create_rc_qp failed at " << i;
-                if (retryWithLegacyGpuControlBuffer())
-                    return createQueuePairs(stream_ptr);
                 if (retryWithHostControlBuffer())
                     return createQueuePairs(stream_ptr);
                 return -1;
@@ -605,7 +612,8 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
 
     bool retryWithHostControlBuffer() {
         auto failure = mlx5gda_last_create_qp_failure();
-        if (ctrl_buf_mode_ == ControlMemoryMode::kHostMapped ||
+        if (Environ::Get().GetWithNvidiaPeermem() ||
+            ctrl_buf_mode_ == ControlMemoryMode::kHostMapped ||
             !isCreateQpBadParam(failure))
             return false;
 
@@ -618,19 +626,6 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
         destroyQueuePairs();
         freeControlBuffer();
         return allocateControlBuffer(ControlMemoryMode::kHostMapped) == 0;
-    }
-
-    bool retryWithLegacyGpuControlBuffer() {
-        auto failure = mlx5gda_last_create_qp_failure();
-        if (ctrl_buf_mode_ != ControlMemoryMode::kGpuDmabuf || failure.valid)
-            return false;
-
-        LOG(WARNING) << "[EP IBGDA] Per-QP DMA-BUF control region setup "
-                        "failed before CREATE_QP; retrying with GPU VA "
-                        "registration";
-        destroyQueuePairs();
-        freeControlBuffer();
-        return allocateControlBuffer(ControlMemoryMode::kGpuVa) == 0;
     }
 
     void destroyQueuePairs() {
