@@ -53,13 +53,15 @@ struct CatalogBackendParam {
 //   kDataTypeAndHardPinned:
 //                    9 + replica_count, data_type plus trailing hard_pinned
 //   kWithGroupId:    10 + replica_count, data_type + hard_pinned + group_id
-//                    (the current writer format)
+//   kWithObjectChecksum:
+//                    11 + replica_count, current writer fields + checksum
 enum class SnapshotMetadataFormat {
     kLegacy,
     kDataTypeOnly,
     kHardPinnedOnly,
     kDataTypeAndHardPinned,
     kWithGroupId,
+    kWithObjectChecksum,
 };
 
 class ScopedEnvVar {
@@ -167,8 +169,9 @@ inline std::vector<uint8_t> WrapShardIntoMetadataRoot(
     return ToByteVector(root_buffer);
 }
 
-inline std::vector<uint8_t> BuildMetadataPayload(
-    const UUID& client_id, std::string_view object_key = kDefaultTestObjectKey,
+inline std::vector<uint8_t> BuildMetadataPayloadWithClientIdString(
+    std::string_view client_id,
+    std::string_view object_key = kDefaultTestObjectKey,
     std::string_view disk_file_path = kDefaultTestDiskFilePath,
     uint64_t object_size = kDefaultTestObjectSize,
     uint64_t put_start_time_ms = kDefaultTestPutStartTimeMs,
@@ -177,18 +180,24 @@ inline std::vector<uint8_t> BuildMetadataPayload(
     const bool include_data_type =
         format == SnapshotMetadataFormat::kDataTypeOnly ||
         format == SnapshotMetadataFormat::kDataTypeAndHardPinned ||
-        format == SnapshotMetadataFormat::kWithGroupId;
+        format == SnapshotMetadataFormat::kWithGroupId ||
+        format == SnapshotMetadataFormat::kWithObjectChecksum;
     const bool include_hard_pinned =
         format == SnapshotMetadataFormat::kHardPinnedOnly ||
         format == SnapshotMetadataFormat::kDataTypeAndHardPinned ||
-        format == SnapshotMetadataFormat::kWithGroupId;
+        format == SnapshotMetadataFormat::kWithGroupId ||
+        format == SnapshotMetadataFormat::kWithObjectChecksum;
     const bool include_group_id =
-        format == SnapshotMetadataFormat::kWithGroupId;
+        format == SnapshotMetadataFormat::kWithGroupId ||
+        format == SnapshotMetadataFormat::kWithObjectChecksum;
+    const bool include_object_checksum =
+        format == SnapshotMetadataFormat::kWithObjectChecksum;
     constexpr uint32_t kReplicaCount = 1;
     // 7 leading fields + replicas + optional data_type/hard_pinned/group_id.
     const size_t array_size = 7 + kReplicaCount + (include_data_type ? 1 : 0) +
                               (include_hard_pinned ? 1 : 0) +
-                              (include_group_id ? 1 : 0);
+                              (include_group_id ? 1 : 0) +
+                              (include_object_checksum ? 1 : 0);
 
     msgpack::sbuffer shard_buffer;
     MsgpackPacker shard_packer(&shard_buffer);
@@ -199,7 +208,7 @@ inline std::vector<uint8_t> BuildMetadataPayload(
     shard_packer.pack(std::string(object_key));
 
     shard_packer.pack_array(array_size);
-    shard_packer.pack(UuidToString(client_id));
+    shard_packer.pack(std::string(client_id));
     shard_packer.pack(put_start_time_ms);
     shard_packer.pack(object_size);
     shard_packer.pack(lease_timeout_ms);
@@ -216,8 +225,23 @@ inline std::vector<uint8_t> BuildMetadataPayload(
     if (include_group_id) {
         shard_packer.pack(std::string("test-group"));
     }
+    if (include_object_checksum) {
+        shard_packer.pack(uint64_t{0x123456789ABCDEF0ULL});
+    }
 
     return WrapShardIntoMetadataRoot(shard_buffer);
+}
+
+inline std::vector<uint8_t> BuildMetadataPayload(
+    const UUID& client_id, std::string_view object_key = kDefaultTestObjectKey,
+    std::string_view disk_file_path = kDefaultTestDiskFilePath,
+    uint64_t object_size = kDefaultTestObjectSize,
+    uint64_t put_start_time_ms = kDefaultTestPutStartTimeMs,
+    uint64_t lease_timeout_ms = kDefaultTestLeaseTimeoutMs,
+    SnapshotMetadataFormat format = SnapshotMetadataFormat::kLegacy) {
+    return BuildMetadataPayloadWithClientIdString(
+        UuidToString(client_id), object_key, disk_file_path, object_size,
+        put_start_time_ms, lease_timeout_ms, format);
 }
 
 // Builds a metadata payload whose declared replica_count field is set to

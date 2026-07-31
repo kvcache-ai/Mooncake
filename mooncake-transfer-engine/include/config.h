@@ -107,7 +107,7 @@ struct GlobalConfig {
     // mode the setting is a no-op. Requires USE_MLX5DV.
     bool mlx5_qp_lag_port_balance = false;
     // ib_pci_relaxed_ordering_mode: 0: off, 1: on if supported, 2: auto
-    int ib_pci_relaxed_ordering_mode = 0;
+    int ib_pci_relaxed_ordering_mode = 1;
     bool ascend_use_fabric_mem = false;
     bool ascend_agent_mode = false;
     bool sunrise_use_device_mem = false;
@@ -131,7 +131,10 @@ struct RpcCommunicatorConfig {
     std::string listen_address;
     size_t thread_count = 0;
     size_t timeout_seconds = 30;
-    size_t pool_size = 10;
+    // Maximum number of cached RPC client connections per target endpoint.
+    // RPC client I/O threads are configured by
+    // MC_TE_RPC_CLIENT_IO_THREADS/MC_RPC_CLIENT_IO_THREADS.
+    size_t pool_size = 100;
 };
 
 void loadGlobalConfig(GlobalConfig& config);
