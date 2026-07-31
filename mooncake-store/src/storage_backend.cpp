@@ -1701,10 +1701,14 @@ BucketStorageBackend::BucketStorageBackend(
     if (batch_threads_ > 1) {
         batch_load_pool_ =
             std::make_unique<ThreadPool>(static_cast<size_t>(batch_threads_));
+        LOG(INFO) << "BucketStorageBackend: bucket-level read pool created, "
+                  << batch_threads_ << " threads";
     }
     if (bucket_threads_ > 1) {
         intra_bucket_pool_ =
             std::make_unique<ThreadPool>(static_cast<size_t>(bucket_threads_));
+        LOG(INFO) << "BucketStorageBackend: intra-bucket read pool created, "
+                  << bucket_threads_ << " threads";
     }
 }
 
@@ -2177,7 +2181,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
 #ifdef USE_URING
             UringFile* uring_file = dynamic_cast<UringFile*>(file.get());
 #else
-            [[maybe_unused]] UringFile* const uring_file = nullptr;
+            [[maybe_unused]] void* uring_file = nullptr;
 #endif
 
             for (const auto& plan : read_plans) {
