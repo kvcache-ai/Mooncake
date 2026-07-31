@@ -14,6 +14,71 @@ int write_manifest_impl(const std::string &key,
     return ret;
 }
 
+std::optional<std::vector<int>> try_dummy_cuda_ipc_batch_put_tensor_impl(
+    const std::vector<std::string> &keys,
+    const std::vector<PyTensorInfo> &infos, const ReplicateConfig &config) {
+    if (!use_dummy_client_ || keys.size() != infos.size()) return std::nullopt;
+
+    std::vector<int> results(keys.size(), 0);
+    py::gil_scoped_release release_gil;
+
+    std::vector<std::string> valid_keys;
+    std::vector<void *> metadata_buffers;
+    std::vector<size_t> metadata_sizes;
+    std::vector<CudaIpcBufferHandle> payloads;
+    std::vector<size_t> original_indices;
+    std::vector<std::unique_ptr<BufferHandle>> metadata_allocations;
+    valid_keys.reserve(infos.size());
+    metadata_buffers.reserve(infos.size());
+    metadata_sizes.reserve(infos.size());
+    payloads.reserve(infos.size());
+    original_indices.reserve(infos.size());
+    metadata_allocations.reserve(infos.size());
+
+    for (size_t i = 0; i < infos.size(); ++i) {
+        if (!infos[i].valid()) {
+            results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
+            continue;
+        }
+        if (infos[i].tensor_size == 0) return std::nullopt;
+
+        auto payload = mooncake::device::ExportCudaIpcBuffer(
+            reinterpret_cast<const void *>(infos[i].data_ptr),
+            infos[i].tensor_size);
+        if (!payload) return std::nullopt;
+
+        size_t metadata_size = infos[i].metadata.header.data_offset;
+        auto metadata = store_->allocate_client_buffer(metadata_size);
+        if (!metadata) {
+            results[i] = to_py_ret(ErrorCode::NO_AVAILABLE_HANDLE);
+            continue;
+        }
+
+        std::memcpy(metadata->ptr(), &infos[i].metadata, metadata_size);
+        valid_keys.push_back(keys[i]);
+        metadata_buffers.push_back(metadata->ptr());
+        metadata_sizes.push_back(metadata_size);
+        payloads.push_back(*payload);
+        original_indices.push_back(i);
+        metadata_allocations.push_back(
+            std::make_unique<BufferHandle>(std::move(*metadata)));
+    }
+
+    if (!valid_keys.empty()) {
+        ReplicateConfig write_config =
+            MakeIndexedConfig(config, original_indices);
+        auto dummy_client = std::static_pointer_cast<DummyClient>(store_);
+        std::vector<int> op_results = dummy_client->batch_put_from_cuda_ipc(
+            valid_keys, metadata_buffers, metadata_sizes, payloads,
+            write_config);
+        if (!apply_indexed_results("put", op_results, original_indices,
+                                   results)) {
+            return results;
+        }
+    }
+    return results;
+}
+
 template <typename BatchWriteFromFn>
 std::vector<int> batch_write_tensor_impl(const std::vector<std::string> &keys,
                                          const std::vector<PyTensorInfo> &infos,
@@ -97,18 +162,9 @@ std::vector<int> batch_write_tensor_impl(const std::vector<std::string> &keys,
                 MakeIndexedConfig(config, original_indices);
             std::vector<int> op_results = batch_write_from(
                 valid_keys, buffer_ptrs, buffer_sizes, write_config);
-            if (op_results.size() != original_indices.size()) {
-                LOG(ERROR) << operation_name
-                           << ": unexpected batch write result count "
-                           << op_results.size() << ", expected "
-                           << original_indices.size();
-                for (size_t index : original_indices) {
-                    results[index] = to_py_ret(ErrorCode::INTERNAL_ERROR);
-                }
+            if (!apply_indexed_results(operation_name, op_results,
+                                       original_indices, results)) {
                 return results;
-            }
-            for (size_t i = 0; i < op_results.size(); ++i) {
-                results[original_indices[i]] = op_results[i];
             }
         }
     }

@@ -33,6 +33,7 @@
 #include "device/accelerator_registry.h"
 #include "default_config.h"
 #include "uds_transport.h"
+#include "device/cuda_ipc_buffer.h"
 #include "shm_helper.h"
 #include "memory_location.h"
 #ifdef USE_NOF
@@ -4515,6 +4516,157 @@ RealClient::batch_put_from_multi_buffers_dummy_helper(
 
     return batch_put_from_multi_buffers_internal(
         keys, real_buffers_result.value(), all_sizes, config);
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+RealClient::batch_put_from_cuda_ipc_dummy_helper(
+    const std::vector<std::string> &keys,
+    const std::vector<uint64_t> &dummy_metadata_buffers,
+    const std::vector<size_t> &metadata_sizes,
+    const std::vector<CudaIpcBufferHandle> &payloads,
+    const ReplicateConfig &config, const UUID &client_id) {
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+
+    const ShmContext &context = it->second;
+    if (keys.size() != dummy_metadata_buffers.size() ||
+        keys.size() != metadata_sizes.size() ||
+        keys.size() != payloads.size()) {
+        LOG(ERROR) << "Invalid cuda ipc tensor write batch sizes";
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+
+    const bool has_metadata = !metadata_sizes.empty() && metadata_sizes[0] != 0;
+    for (size_t metadata_size : metadata_sizes) {
+        if ((metadata_size != 0) != has_metadata) {
+            LOG(ERROR) << "Mixed cuda ipc metadata batches are not supported";
+            return std::vector<tl::expected<void, ErrorCode>>(
+                keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+        }
+    }
+
+    std::vector<void *> metadata_buffers;
+    if (has_metadata) {
+        auto metadata_result = map_dummy_addrs_to_real_ptrs(
+            context, dummy_metadata_buffers, metadata_sizes, client_id);
+        if (!metadata_result) {
+            return std::vector<tl::expected<void, ErrorCode>>(
+                keys.size(), tl::unexpected(metadata_result.error()));
+        }
+        metadata_buffers = std::move(*metadata_result);
+    }
+
+    std::vector<device::CudaIpcBufferMapping> payload_mappings;
+    std::vector<std::vector<void *>> all_buffers;
+    std::vector<std::vector<size_t>> all_sizes;
+    payload_mappings.reserve(keys.size());
+    all_buffers.reserve(keys.size());
+    all_sizes.reserve(keys.size());
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto mapping = device::CudaIpcBufferMapping::Open(payloads[i]);
+        if (!mapping) {
+            return std::vector<tl::expected<void, ErrorCode>>(
+                keys.size(), tl::unexpected(mapping.error()));
+        }
+        payload_mappings.push_back(std::move(*mapping));
+        void *payload_ptr = payload_mappings.back().ptr();
+        if (has_metadata) {
+            all_buffers.push_back({metadata_buffers[i], payload_ptr});
+            all_sizes.push_back(
+                {metadata_sizes[i], static_cast<size_t>(payloads[i].size)});
+        } else {
+            all_buffers.push_back({payload_ptr});
+            all_sizes.push_back({static_cast<size_t>(payloads[i].size)});
+        }
+    }
+
+    return batch_put_from_multi_buffers_internal(keys, all_buffers, all_sizes,
+                                                 config);
+}
+
+std::vector<tl::expected<int64_t, ErrorCode>>
+RealClient::batch_get_into_cuda_ipc_dummy_helper(
+    const std::vector<std::string> &keys,
+    const std::vector<CudaIpcBufferHandle> &dst_buffers,
+    const std::vector<size_t> &src_offsets, const std::vector<size_t> &sizes,
+    const UUID &client_id) {
+    if (keys.size() != dst_buffers.size() ||
+        keys.size() != src_offsets.size() || keys.size() != sizes.size()) {
+        LOG(ERROR) << "Invalid cuda ipc tensor read batch sizes";
+        return std::vector<tl::expected<int64_t, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+
+    {
+        std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+        if (shm_contexts_.find(client_id) == shm_contexts_.end()) {
+            LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+            return std::vector<tl::expected<int64_t, ErrorCode>>(
+                keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+        }
+    }
+
+    std::vector<tl::expected<int64_t, ErrorCode>> results(
+        keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    std::vector<device::CudaIpcBufferMapping> mappings;
+    std::vector<void *> buffers;
+    std::vector<std::vector<std::string>> all_keys;
+    std::vector<std::vector<std::vector<size_t>>> all_dst_offsets;
+    std::vector<std::vector<std::vector<size_t>>> all_src_offsets;
+    std::vector<std::vector<std::vector<size_t>>> all_sizes;
+    std::vector<size_t> buffer_capacities;
+    std::vector<size_t> original_indices;
+    mappings.reserve(keys.size());
+    buffers.reserve(keys.size());
+    all_keys.reserve(keys.size());
+    all_dst_offsets.reserve(keys.size());
+    all_src_offsets.reserve(keys.size());
+    all_sizes.reserve(keys.size());
+    buffer_capacities.reserve(keys.size());
+    original_indices.reserve(keys.size());
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto mapping = device::CudaIpcBufferMapping::Open(dst_buffers[i]);
+        if (!mapping) {
+            results[i] = tl::unexpected(mapping.error());
+            continue;
+        }
+        mappings.push_back(std::move(*mapping));
+        buffers.push_back(mappings.back().ptr());
+        all_keys.push_back({keys[i]});
+        all_dst_offsets.push_back({{0}});
+        all_src_offsets.push_back({{src_offsets[i]}});
+        all_sizes.push_back({{sizes[i]}});
+        buffer_capacities.push_back(sizes[i]);
+        original_indices.push_back(i);
+    }
+
+    if (buffers.empty()) {
+        return results;
+    }
+
+    auto range_results = get_into_ranges_internal(
+        buffers, all_keys, all_dst_offsets, all_src_offsets, all_sizes,
+        &buffer_capacities, nullptr, nullptr, nullptr);
+    for (size_t i = 0; i < original_indices.size(); ++i) {
+        if (i < range_results.size() && range_results[i].size() == 1 &&
+            range_results[i][0].size() == 1) {
+            results[original_indices[i]] = range_results[i][0][0];
+        } else {
+            LOG(ERROR) << "Invalid cuda ipc tensor read result shape for key "
+                       << keys[original_indices[i]];
+            results[original_indices[i]] =
+                tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+    }
+    return results;
 }
 
 std::vector<tl::expected<int64_t, ErrorCode>>
