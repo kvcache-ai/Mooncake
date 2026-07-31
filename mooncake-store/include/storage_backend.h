@@ -1156,11 +1156,42 @@ class BucketStorageBackend : public StorageBackendInterface {
     int64_t GUARDED_BY(mutex_) next_bucket_ = -1;
     BucketBackendConfig bucket_backend_config_;
 
-    static int env_batch_load_threads();
-    static int env_bucket_read_threads();
+    // Read plan for a single key within a bucket. Built under lock in
+    // BatchLoad Step 1, then consumed by the I/O phase (Step 2) where
+    // per-bucket plans are dispatched to batch_read (URing) or
+    // vector_read (POSIX).
+    struct ReadPlan {
+        std::string key;
+        int64_t bucket_id;
+        int64_t offset;
+        int64_t key_size;
+        int64_t data_size;
+        Slice dest_slice;
+    };
+
+#ifdef USE_URING
+    // Issue one io_uring batch_read for all plans sharing a bucket file.
+    // Computes O_DIRECT alignment, submits the batch, and adjusts each
+    // dest_slice.ptr to skip the alignment padding on success.
+    static tl::expected<void, ErrorCode> UringBatchReadBucket(
+        UringFile* uf, const std::vector<ReadPlan>& plans,
+        std::unordered_map<std::string, Slice>& batch_object,
+        int64_t bucket_id);
+#endif
+
+    // Intra-bucket POSIX parallel read: split plans into chunks and
+    // dispatch to intra_bucket_pool_.  Returns ErrorCode::OK or the
+    // first error encountered.
+    ErrorCode IntraBucketReadChunked(StorageFile* sf,
+                                     const std::vector<ReadPlan>& plans,
+                                     int64_t bucket_id);
+
+    static int EnvBatchLoadThreads();
+    static int EnvBucketReadThreads();
     const int batch_threads_;
     const int bucket_threads_;
-    mutable std::unique_ptr<ThreadPool> batch_load_pool_;
+    std::unique_ptr<ThreadPool> batch_load_pool_;    // bucket-level
+    std::unique_ptr<ThreadPool> intra_bucket_pool_;  // intra-bucket (POSIX)
 
     mutable Mutex offloading_mutex_;
     std::unordered_map<std::string, int64_t> GUARDED_BY(offloading_mutex_)
