@@ -37,8 +37,8 @@ else()
 endif()
 
 # GDS
-find_library(CUFILE_LIB cufile PATHS /usr/local/cuda/lib64)
-find_path(CUFILE_INCLUDE cufile.h PATHS /usr/local/cuda/include)
+find_library(CUFILE_LIB cufile HINTS ${CUDAToolkit_LIBRARY_DIR})
+find_path(CUFILE_INCLUDE cufile.h HINTS ${CUDAToolkit_INCLUDE_DIRS})
 if(USE_CUDA
    AND CUDAToolkit_FOUND
    AND CUFILE_LIB

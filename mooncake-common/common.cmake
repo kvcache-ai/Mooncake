@@ -205,10 +205,11 @@ if(USE_MNNVL)
 endif()
 
 if(USE_CUDA)
+  find_package(CUDAToolkit REQUIRED)
   add_compile_definitions(USE_CUDA)
   message(STATUS "CUDA support is enabled")
-  include_directories(/usr/local/cuda/include)
-  link_directories(/usr/local/cuda/lib /usr/local/cuda/lib64)
+  include_directories(${CUDAToolkit_INCLUDE_DIRS})
+  link_directories(${CUDAToolkit_LIBRARY_DIR})
 endif()
 
 if(USE_NCCL_DEVICE OR USE_NCCL_HOST)
