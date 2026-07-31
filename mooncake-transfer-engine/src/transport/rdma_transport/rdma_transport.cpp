@@ -127,7 +127,7 @@ struct SliceLengthCalculator {
 };
 
 // Mode definition for MC_IB_PCI_RELAXED_ORDERING env.
-// 0 - disabled, 1 - enabled if supported, 2 - auto (default, same as 1 today).
+// 0 - disabled, 1 - enabled if supported (default), 2 - auto (same as 1 today).
 static int getIbRelaxedOrderingMode() {
     int val = globalConfig().ib_pci_relaxed_ordering_mode;
     if (val < 0 || val > 2) {
