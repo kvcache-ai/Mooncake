@@ -348,5 +348,56 @@ TEST_F(MaxConcurrentRegMrEnvTest, EmptyStringKeepsDefault) {
     EXPECT_EQ(config.max_concurrent_reg_mr, 17u);
 }
 
+class EfaNicSelectionEnvTest : public ::testing::Test {
+   protected:
+    void TearDown() override { ::unsetenv("MC_EFA_NIC_SELECTION"); }
+};
+
+TEST_F(EfaNicSelectionEnvTest, DefaultsToAll) {
+    ::unsetenv("MC_EFA_NIC_SELECTION");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.efa_nic_selection, EfaNicSelection::ALL);
+}
+
+TEST_F(EfaNicSelectionEnvTest, LocalIsApplied) {
+    ASSERT_EQ(::setenv("MC_EFA_NIC_SELECTION", "local", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.efa_nic_selection, EfaNicSelection::LOCAL);
+}
+
+TEST_F(EfaNicSelectionEnvTest, AllIsAcceptedExplicitly) {
+    ASSERT_EQ(::setenv("MC_EFA_NIC_SELECTION", "all", 1), 0);
+    GlobalConfig config;
+    config.efa_nic_selection = EfaNicSelection::LOCAL;  // must be overwritten
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.efa_nic_selection, EfaNicSelection::ALL);
+}
+
+TEST_F(EfaNicSelectionEnvTest, CaseIsIgnored) {
+    ASSERT_EQ(::setenv("MC_EFA_NIC_SELECTION", "LOCAL", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.efa_nic_selection, EfaNicSelection::LOCAL);
+}
+
+TEST_F(EfaNicSelectionEnvTest, UnknownValueKeepsDefault) {
+    // A typo must not silently pick a policy: registering buffers on the wrong
+    // NIC set is a correctness-adjacent surprise, not a perf knob.
+    ASSERT_EQ(::setenv("MC_EFA_NIC_SELECTION", "topology", 1), 0);
+    GlobalConfig config;
+    config.efa_nic_selection = EfaNicSelection::LOCAL;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.efa_nic_selection, EfaNicSelection::LOCAL);
+}
+
+TEST_F(EfaNicSelectionEnvTest, EmptyStringKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_EFA_NIC_SELECTION", "", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.efa_nic_selection, EfaNicSelection::ALL);
+}
+
 }  // namespace
 }  // namespace mooncake
