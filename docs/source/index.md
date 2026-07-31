@@ -99,6 +99,7 @@ getting_started/quick-start
 :maxdepth: 1
 
 deployment/mooncake-store-deployment-guide
+deployment/store-warmup
 deployment/kubernetes-deployment-guide/index
 deployment/integrations/sglang/index
 deployment/integrations/vllm/index

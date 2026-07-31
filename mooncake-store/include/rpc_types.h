@@ -83,6 +83,23 @@ struct NoFSegmentOwnerInfo {
 };
 YLT_REFL(NoFSegmentOwnerInfo, segment_id, client_id);
 
+struct WarmupTarget {
+    // Store warmup is transport connection warmup, not KV data warmup. The
+    // master only returns eligible targets; the requesting Store Client issues
+    // the READ-only probe.
+    std::string segment_name;
+    UUID segment_id{0, 0};
+    UUID client_id{0, 0};
+    std::string protocol;
+    bool is_local{false};
+    bool allow_warmup{true};
+    uint64_t priority{0};
+
+    WarmupTarget() = default;
+};
+YLT_REFL(WarmupTarget, segment_name, segment_id, client_id, protocol, is_local,
+         allow_warmup, priority);
+
 /**
  * @brief Response structure for CopyStart operation
  */

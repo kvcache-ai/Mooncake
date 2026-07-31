@@ -66,6 +66,12 @@ if(ENABLE_KV_EVENTS)
   endif()
 endif()
 add_store_test(master_service_test master_service_test.cpp)
+add_store_test(store_warmup_test store_warmup_test.cpp)
+target_include_directories(store_warmup_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+add_store_test(store_warmup_integration_test
+               store_warmup_integration_test.cpp)
+set_tests_properties(store_warmup_integration_test PROPERTIES TIMEOUT 45)
 add_store_test(master_service_config_test master_service_config_test.cpp)
 add_store_test(master_service_tenant_quota_test
                master_service_tenant_quota_test.cpp)
