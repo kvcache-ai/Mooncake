@@ -793,11 +793,11 @@ TEST_F(SegmentTest, MountLocalDiskSegmentIdentityChanged) {
     UUID client_id = generate_uuid();
     {
         auto segment_access = segment_manager.getSegmentAccess();
-        ASSERT_EQ(segment_access.MountLocalDiskSegment(
-                      client_id, true, "disk-a", 1, 1),
+        ASSERT_EQ(segment_access.MountLocalDiskSegment(client_id, true,
+                                                       "disk-a", 1, 1),
                   ErrorCode::OK);
-        ASSERT_EQ(segment_access.MountLocalDiskSegment(
-                      client_id, true, "disk-b", 2, 1),
+        ASSERT_EQ(segment_access.MountLocalDiskSegment(client_id, true,
+                                                       "disk-b", 2, 1),
                   ErrorCode::OK);
     }
 

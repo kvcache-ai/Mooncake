@@ -318,12 +318,10 @@ TEST_F(StorageBackendBucketDeleteTest,
         for (int bucket_index = 0; bucket_index < 3; ++bucket_index) {
             const std::string deleted_key =
                 "deleted-" + std::to_string(bucket_index);
-            const std::string live_key =
-                "live-" + std::to_string(bucket_index);
+            const std::string live_key = "live-" + std::to_string(bucket_index);
             std::string deleted_value(7 * 1024,
                                       static_cast<char>('a' + bucket_index));
-            std::string live_value(1024,
-                                   static_cast<char>('A' + bucket_index));
+            std::string live_value(1024, static_cast<char>('A' + bucket_index));
             live_values.emplace(live_key, live_value);
 
             const ObjectIncarnation deleted_incarnation{
@@ -341,17 +339,14 @@ TEST_F(StorageBackendBucketDeleteTest,
             ASSERT_EQ(grouped.size(), 1);
 
             std::unordered_map<std::string, std::vector<Slice>> batch;
-            batch.emplace(
-                deleted_key,
-                std::vector<Slice>{
-                    Slice{deleted_value.data(), deleted_value.size()}});
-            batch.emplace(live_key,
-                          std::vector<Slice>{
-                              Slice{live_value.data(), live_value.size()}});
+            batch.emplace(deleted_key,
+                          std::vector<Slice>{Slice{deleted_value.data(),
+                                                   deleted_value.size()}});
+            batch.emplace(live_key, std::vector<Slice>{Slice{
+                                        live_value.data(), live_value.size()}});
             ASSERT_TRUE(backend.BatchOffload(
-                batch,
-                [&](const std::vector<std::string>& keys,
-                    std::vector<StorageObjectMetadata>& metadatas) {
+                batch, [&](const std::vector<std::string>& keys,
+                           std::vector<StorageObjectMetadata>& metadatas) {
                     for (size_t i = 0; i < keys.size(); ++i) {
                         locations[keys[i]] = metadatas[i];
                     }
@@ -434,11 +429,10 @@ TEST_F(StorageBackendBucketDeleteTest,
     for (int i = 0; i < 10; ++i) {
         const std::string key = "key-" + std::to_string(i);
         auto [value_it, _] = values.emplace(key, std::string(940, 'A' + i));
-        batch.emplace(
-            key, std::vector<Slice>{Slice{value_it->second.data(),
-                                          value_it->second.size()}});
-        incarnations.emplace(key, ObjectIncarnation{300,
-                                                    static_cast<uint64_t>(i)});
+        batch.emplace(key, std::vector<Slice>{Slice{value_it->second.data(),
+                                                    value_it->second.size()}});
+        incarnations.emplace(key,
+                             ObjectIncarnation{300, static_cast<uint64_t>(i)});
         sizes.emplace(key, static_cast<int64_t>(value_it->second.size()));
     }
     std::vector<std::vector<std::string>> grouped;
@@ -448,9 +442,8 @@ TEST_F(StorageBackendBucketDeleteTest,
 
     std::unordered_map<std::string, StorageObjectMetadata> locations;
     ASSERT_TRUE(backend.BatchOffload(
-        batch,
-        [&](const std::vector<std::string>& keys,
-            std::vector<StorageObjectMetadata>& metadatas) {
+        batch, [&](const std::vector<std::string>& keys,
+                   std::vector<StorageObjectMetadata>& metadatas) {
             for (size_t i = 0; i < keys.size(); ++i) {
                 locations[keys[i]] = metadatas[i];
             }
@@ -459,9 +452,8 @@ TEST_F(StorageBackendBucketDeleteTest,
     const auto before_delete = backend.GetStoreMetadata();
     ASSERT_TRUE(before_delete);
     ASSERT_GT(before_delete->total_size,
-              static_cast<int64_t>(
-                  bucket_config.max_total_size *
-                  config.disk_eviction_high_watermark_ratio));
+              static_cast<int64_t>(bucket_config.max_total_size *
+                                   config.disk_eviction_high_watermark_ratio));
 
     std::vector<LocalDeleteTask> tasks;
     for (int i = 0; i < 3; ++i) {
@@ -494,9 +486,8 @@ TEST_F(StorageBackendBucketDeleteTest,
     ASSERT_TRUE(after_gc);
     EXPECT_LT(after_gc->total_size, before_delete->total_size);
     EXPECT_LE(after_gc->total_size,
-              static_cast<int64_t>(
-                  bucket_config.max_total_size *
-                  config.disk_eviction_low_watermark_ratio));
+              static_cast<int64_t>(bucket_config.max_total_size *
+                                   config.disk_eviction_low_watermark_ratio));
 }
 
 TEST_F(StorageBackendBucketDeleteTest,
@@ -577,7 +568,8 @@ TEST_F(StorageBackendBucketDeleteTest,
                 StorageObjectMetadata location;
                 ASSERT_TRUE(backend.BatchOffload(
                     {{key,
-                      {Slice{value.data(), static_cast<size_t>(value.size())}}}},
+                      {Slice{value.data(),
+                             static_cast<size_t>(value.size())}}}},
                     [&](const std::vector<std::string>&,
                         std::vector<StorageObjectMetadata>& metadatas) {
                         location = metadatas.front();
@@ -602,8 +594,7 @@ TEST_F(StorageBackendBucketDeleteTest,
         ASSERT_TRUE(recovered.Init());
         EXPECT_EQ(recovered.IsExist("source").value_or(false), !committed);
         EXPECT_EQ(recovered.IsExist("target").value_or(false), committed);
-        EXPECT_FALSE(
-            std::filesystem::exists(case_path / ".bucket_gc_intent"));
+        EXPECT_FALSE(std::filesystem::exists(case_path / ".bucket_gc_intent"));
         EXPECT_EQ(CountBucketFiles(case_path, ".meta"), 1);
         EXPECT_EQ(CountBucketFiles(case_path, ".bucket"), 1);
     };

@@ -2172,9 +2172,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                 }
                 if (bucket_data_ec == std::errc::no_such_file_or_directory ||
                     !fs::is_regular_file(bucket_data_status)) {
-                    LOG(ERROR) << "Bucket metadata has no valid data file: "
-                               << entry.path().string()
-                               << "; removing stale metadata";
+                    LOG(ERROR)
+                        << "Bucket metadata has no valid data file: "
+                        << entry.path().string() << "; removing stale metadata";
                     CleanupOrphanedBucket(bucket_id);
                     lru_index_.erase({0LL, bucket_id});
                     buckets_.erase(bucket_id);

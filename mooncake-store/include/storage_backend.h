@@ -1042,8 +1042,7 @@ class BucketStorageBackend : public StorageBackendInterface {
     std::vector<LocalDeleteTaskResult> BatchMarkDeleted(
         const std::vector<LocalDeleteTask>& tasks) override;
     int64_t GetReclaimableBytes() const override;
-    bool RequestGarbageCollection(
-        bool require_disk_pressure = false) override;
+    bool RequestGarbageCollection(bool require_disk_pressure = false) override;
 
    private:
     tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode> BuildBucket(
@@ -1074,14 +1073,11 @@ class BucketStorageBackend : public StorageBackendInterface {
     };
 
     std::vector<GcCandidate> SelectGcCandidates(bool under_pressure);
-    tl::expected<bool, ErrorCode> RunGarbageCollectionOnce(
-        bool under_pressure);
-    tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode>
-    WriteGcReplacement(int64_t target_bucket_id,
-                       const std::vector<GcCandidate>& sources);
+    tl::expected<bool, ErrorCode> RunGarbageCollectionOnce(bool under_pressure);
+    tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode> WriteGcReplacement(
+        int64_t target_bucket_id, const std::vector<GcCandidate>& sources);
     tl::expected<void, ErrorCode> RecoverGarbageCollection();
-    tl::expected<void, ErrorCode> StoreGcIntent(
-        const BucketGcIntent& intent);
+    tl::expected<void, ErrorCode> StoreGcIntent(const BucketGcIntent& intent);
     tl::expected<void, ErrorCode> RemoveGcIntent();
     tl::expected<void, ErrorCode> SyncStorageDirectory() const;
     bool FinalizeGcSource(const GcCandidate& source);
