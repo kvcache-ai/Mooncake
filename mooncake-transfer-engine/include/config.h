@@ -107,7 +107,7 @@ struct GlobalConfig {
     // mode the setting is a no-op. Requires USE_MLX5DV.
     bool mlx5_qp_lag_port_balance = false;
     // ib_pci_relaxed_ordering_mode: 0: off, 1: on if supported, 2: auto
-    int ib_pci_relaxed_ordering_mode = 0;
+    int ib_pci_relaxed_ordering_mode = 1;
     bool ascend_use_fabric_mem = false;
     bool ascend_agent_mode = false;
     bool sunrise_use_device_mem = false;

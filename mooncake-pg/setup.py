@@ -48,6 +48,19 @@ sysroot_library_dirs = existing_dirs(
 
 abi_define = f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}"
 
+ylt_include_dirs = existing_dirs(*os.getenv("MOONCAKE_YLT_INCLUDE_DIRS", "").split("|"))
+if not ylt_include_dirs:
+    raise RuntimeError(
+        "MOONCAKE_YLT_INCLUDE_DIRS is unset or contains no existing directory"
+    )
+
+asio_library_path = os.getenv("MOONCAKE_ASIO_LIBRARY_PATH", "")
+if not os.path.isfile(asio_library_path):
+    raise RuntimeError(
+        "MOONCAKE_ASIO_LIBRARY_PATH is unset or does not name the bundled "
+        "Asio static library"
+    )
+
 # Match the yalantinglibs configuration used by engine.so / store.so so that
 # header-only types like coro_io::socket_wrapper_t have the same layout across
 # all shared objects loaded in the same process.
@@ -58,15 +71,22 @@ abi_define = f"-D_GLIBCXX_USE_CXX11_ABI={abi_flag}"
 # etc.) diverges between the C++ targets and this file, template types
 # instantiated into both pg_*.so and store.so will have different layouts,
 #  leading to silent crashes. :(
-cxx_args = [abi_define, "-DYLT_ENABLE_IBV", "-std=c++20", "-O3", "-g0"]
+cxx_args = [
+    abi_define,
+    "-DYLT_ENABLE_IBV",
+    "-DASIO_SEPARATE_COMPILATION",
+    "-DASIO_STANDALONE",
+    "-std=c++20",
+    "-O3",
+    "-g0",
+]
 
 cuda_libraries = ["ibverbs", "mlx5"]
 cuda_library_dirs = []
 include_dirs = [
     os.path.join(current_dir, "include"),
     os.path.join(current_dir, "../mooncake-transfer-engine/include"),
-    os.environ["MOONCAKE_ASIO_INCLUDE_DIR"],
-    os.environ["MOONCAKE_YALANTINGLIBS_INCLUDE_DIR"],
+    *ylt_include_dirs,
 ]
 use_maca = os.getenv("MOONCAKE_EP_USE_MACA", "").upper() in {
     "1",
@@ -142,6 +162,7 @@ setup(
                 "-L" + os.path.join(current_dir, "../mooncake-wheel/mooncake"),
                 "-Wl,--push-state,--no-as-needed",
                 "-l:engine.so",
+                asio_library_path,
                 "-Wl,--pop-state",
             ],
         )

@@ -672,15 +672,20 @@ decodeMultiProtocolSegmentDesc(Json::Value &segmentJSON,
                 buffer.lkey.push_back(
                     static_cast<decltype(buffer.lkey)::value_type>(
                         lkeyJSON.asUInt64()));
+            // The same topology-derived device_id indexes both rkey and
+            // devices, and a publisher emits exactly one key per device, so a
+            // key vector longer than the device list lets that index run past
+            // the end of devices[]. See the comment in decodeSegmentDesc.
             if (buffer.name.empty() || !buffer.addr || !buffer.length ||
                 (!buffer.rkey.empty() &&
-                 buffer.rkey.size() != buffer.lkey.size())) {
+                 (buffer.rkey.size() != buffer.lkey.size() ||
+                  buffer.rkey.size() != desc->devices.size()))) {
                 LOG(WARNING)
                     << "Corrupted segment descriptor, name " << segment_name
                     << " buffer_protocol " << buffer_protocol << ", "
                     << buffer.name << ", " << buffer.addr << ", "
                     << buffer.length << ", " << buffer.rkey.size() << ", "
-                    << buffer.lkey.size();
+                    << buffer.lkey.size() << ", " << desc->devices.size();
                 return nullptr;
             }
             desc->buffers.push_back(buffer);
@@ -783,6 +788,19 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             desc->devices.push_back(device);
         }
 
+        // rdma, efa and cxi pick a device with topology.selectDevice() and
+        // then use that one device_id to index both buffers[].rkey and
+        // devices[] (RdmaTransport::selectDevice / WorkerPool::selectPeerDevice
+        // and their efa/cxi counterparts). A publisher emits exactly one key
+        // per device, so a descriptor whose key vector is longer than its
+        // device list can drive device_id past the end of devices[]. barex is
+        // excluded: it hands the whole rkey vector to the peer rather than
+        // indexing it by device_id, and its key count comes from the mempool
+        // MR set rather than the device list.
+        const bool keys_indexed_by_device = desc->protocol == "rdma" ||
+                                            desc->protocol == "efa" ||
+                                            desc->protocol == "cxi";
+
         for (const auto &bufferJSON : segmentJSON["buffers"]) {
             BufferDesc buffer;
             buffer.name = bufferJSON["name"].asString();
@@ -798,12 +816,15 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
                         lkeyJSON.asUInt64()));
             if (buffer.name.empty() || !buffer.addr || !buffer.length ||
                 (!buffer.rkey.empty() &&
-                 buffer.rkey.size() != buffer.lkey.size())) {
+                 (buffer.rkey.size() != buffer.lkey.size() ||
+                  (keys_indexed_by_device &&
+                   buffer.rkey.size() != desc->devices.size())))) {
                 LOG(WARNING)
                     << "Corrupted segment descriptor, name " << segment_name
                     << " protocol " << desc->protocol << ", " << buffer.name
                     << ", " << buffer.addr << ", " << buffer.length << ", "
-                    << buffer.rkey.size() << ", " << buffer.lkey.size();
+                    << buffer.rkey.size() << ", " << buffer.lkey.size() << ", "
+                    << desc->devices.size();
                 return nullptr;
             }
             desc->buffers.push_back(buffer);
