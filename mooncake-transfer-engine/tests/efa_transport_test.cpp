@@ -425,17 +425,15 @@ TEST(EFARegistrationOrderTest, AscendingBySize) {
     std::vector<BufferEntry> desc{{(void *)0x1000, 400 << 20},
                                   {(void *)0x2000, 4 << 20},
                                   {(void *)0x3000, 2048}};
-    EXPECT_EQ(lengths(desc),
-              (std::vector<size_t>{2048, 4 << 20, 400u << 20}));
+    EXPECT_EQ(lengths(desc), (std::vector<size_t>{2048, 4 << 20, 400u << 20}));
     // Every index appears exactly once: it is a permutation, not a filter.
     auto perm = EfaTransport::registrationOrder(desc);
     std::sort(perm.begin(), perm.end());
     EXPECT_EQ(perm, (std::vector<size_t>{0, 1, 2}));
 
     // Already ascending stays put.
-    std::vector<BufferEntry> asc{{(void *)0x1000, 1024},
-                                 {(void *)0x2000, 4096},
-                                 {(void *)0x3000, 8192}};
+    std::vector<BufferEntry> asc{
+        {(void *)0x1000, 1024}, {(void *)0x2000, 4096}, {(void *)0x3000, 8192}};
     EXPECT_EQ(EfaTransport::registrationOrder(asc),
               (std::vector<size_t>{0, 1, 2}));
 
