@@ -7,6 +7,7 @@
 
 #include <chrono>
 #include <future>
+#include <limits>
 #include <map>
 #include <memory>
 #include <random>
@@ -293,6 +294,35 @@ class OffsetAllocatorTest : public ::testing::Test {
         allocator->m_mutex.unlock();
     }
 
+    bool canAllocateWithoutFastFail(
+        const std::shared_ptr<OffsetAllocator>& allocator, size_t size) {
+        MutexLocker lock(&allocator->m_mutex);
+        const uint64_t quantum = uint64_t{1} << allocator->m_multiplier_bits;
+        if (size == 0 ||
+            size > std::numeric_limits<uint64_t>::max() - (quantum - 1)) {
+            return false;
+        }
+        const uint64_t normalized_size = (size + quantum - 1) / quantum;
+        if (!allocator->m_allocator ||
+            normalized_size > allocator->m_allocator->m_size) {
+            return false;
+        }
+
+        auto allocation = allocator->m_allocator->allocate(
+            static_cast<uint32>(normalized_size));
+        if (allocation.isNoSpace()) {
+            return false;
+        }
+        allocator->m_allocator->free(allocation);
+        allocator->refreshLargestFreeRegion();
+        return true;
+    }
+
+    uint64_t multiplierBits(
+        const std::shared_ptr<OffsetAllocator>& allocator) const {
+        return allocator->m_multiplier_bits;
+    }
+
     OffsetAllocationHandle copyHandleWithNewAllocator(
         const OffsetAllocationHandle& handle,
         const std::shared_ptr<OffsetAllocator>& new_allocator) {
@@ -316,7 +346,15 @@ class OffsetAllocatorTest : public ::testing::Test {
         ASSERT_EQ(a->m_capacity, b->m_capacity);
         ASSERT_EQ(a->m_allocated_size, b->m_allocated_size);
         ASSERT_EQ(a->m_allocated_num, b->m_allocated_num);
-        ASSERT_EQ(a->getLargestFreeRegion(), b->getLargestFreeRegion());
+        const uint64_t actual_largest_a =
+            a->m_allocator->storageReport().largestFreeRegion
+            << a->m_multiplier_bits;
+        const uint64_t actual_largest_b =
+            b->m_allocator->storageReport().largestFreeRegion
+            << b->m_multiplier_bits;
+        ASSERT_EQ(actual_largest_a, actual_largest_b);
+        ASSERT_GE(a->getLargestFreeRegion(), actual_largest_a);
+        ASSERT_GE(b->getLargestFreeRegion(), actual_largest_b);
 
         // Compare __Allocator member variables
         ASSERT_EQ(a->m_allocator->m_size, b->m_allocator->m_size);
@@ -527,19 +565,30 @@ TEST_F(OffsetAllocatorTest, AllocationFailure) {
     EXPECT_FALSE(handle.has_value());
 }
 
-TEST_F(OffsetAllocatorTest, LargestFreeRegionCacheTracksMutations) {
+TEST_F(OffsetAllocatorTest,
+       LargestFreeRegionHintTightensOnFailureAndRefreshesOnFree) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;
     constexpr uint32 MAX_ALLOCS = 1000;
     auto allocator =
         OffsetAllocator::create(0, ALLOCATOR_SIZE, MAX_ALLOCS, MAX_ALLOCS);
 
-    EXPECT_EQ(allocator->getLargestFreeRegion(),
-              allocator->storageReport().largestFreeRegion);
+    const uint64_t initial_largest = allocator->getLargestFreeRegion();
+    EXPECT_EQ(initial_largest, allocator->storageReport().largestFreeRegion);
 
     auto handle = allocator->allocate(ALLOCATOR_SIZE / 2);
     ASSERT_TRUE(handle.has_value());
-    EXPECT_EQ(allocator->getLargestFreeRegion(),
-              allocator->storageReport().largestFreeRegion);
+    const uint64_t actual_largest =
+        allocator->storageReport().largestFreeRegion;
+    ASSERT_LT(actual_largest, initial_largest);
+
+    // A successful allocation can leave the hint conservatively high so the
+    // success path does not need to publish a new atomic value.
+    EXPECT_EQ(allocator->getLargestFreeRegion(), initial_largest);
+
+    // The first request that passes the hint but fails in the allocator
+    // tightens it for subsequent requests.
+    EXPECT_FALSE(allocator->allocate(actual_largest + 1).has_value());
+    EXPECT_EQ(allocator->getLargestFreeRegion(), actual_largest);
 
     handle.reset();
     EXPECT_EQ(allocator->getLargestFreeRegion(),
@@ -554,6 +603,10 @@ TEST_F(OffsetAllocatorTest, ImpossibleAllocationDoesNotAcquireMutex) {
         OffsetAllocator::create(0, ALLOCATOR_SIZE, MAX_ALLOCS, MAX_ALLOCS);
     auto full_handle = allocator->allocate(ALLOCATOR_SIZE);
     ASSERT_TRUE(full_handle.has_value());
+
+    // The first failed request observes the exact allocator state and tightens
+    // the conservative hint.
+    ASSERT_FALSE(allocator->allocate(1).has_value());
     ASSERT_EQ(allocator->getLargestFreeRegion(), 0);
 
     lockAllocator(allocator);
@@ -569,6 +622,46 @@ TEST_F(OffsetAllocatorTest, ImpossibleAllocationDoesNotAcquireMutex) {
 
     EXPECT_EQ(status, std::future_status::ready);
     EXPECT_FALSE(result.get().has_value());
+}
+
+TEST_F(OffsetAllocatorTest, FastFailMatchesAllocatorAcrossBinBoundaries) {
+    constexpr uint32 MAX_ALLOCS = 8;
+    for (uint32 i = 16; i + 1 < NUM_BINS; ++i) {
+        const uint64_t capacity = static_cast<uint64_t>(bin_sizes[i + 1]) - 1;
+        const uint64_t request_size = static_cast<uint64_t>(bin_sizes[i]) + 1;
+        auto allocator =
+            OffsetAllocator::create(0, capacity, MAX_ALLOCS, MAX_ALLOCS);
+
+        ASSERT_EQ(allocator->getLargestFreeRegion(), bin_sizes[i])
+            << "bin index=" << i;
+        ASSERT_FALSE(canAllocateWithoutFastFail(allocator, request_size))
+            << "bin index=" << i;
+        EXPECT_FALSE(allocator->allocate(request_size).has_value())
+            << "bin index=" << i;
+    }
+}
+
+TEST_F(OffsetAllocatorTest, FastFailMatchesAllocatorWithMultipliers) {
+    constexpr uint32 MAX_ALLOCS = 8;
+    constexpr uint32 PREVIOUS_BIN_INDEX = NUM_BINS - 2;
+    const uint64_t INTERNAL_CAPACITY =
+        static_cast<uint64_t>(bin_sizes[NUM_BINS - 1]) - 1;
+
+    for (uint64_t multiplier_bits = 1; multiplier_bits <= 4;
+         ++multiplier_bits) {
+        const uint64_t capacity = INTERNAL_CAPACITY << multiplier_bits;
+        auto allocator =
+            OffsetAllocator::create(0, capacity, MAX_ALLOCS, MAX_ALLOCS);
+        const uint64_t largest_free_region =
+            static_cast<uint64_t>(bin_sizes[PREVIOUS_BIN_INDEX])
+            << multiplier_bits;
+        const uint64_t request_size = largest_free_region + 1;
+
+        ASSERT_EQ(multiplierBits(allocator), multiplier_bits);
+        ASSERT_EQ(allocator->getLargestFreeRegion(), largest_free_region);
+        ASSERT_FALSE(canAllocateWithoutFastFail(allocator, request_size));
+        EXPECT_FALSE(allocator->allocate(request_size).has_value());
+    }
 }
 
 // Test multiple allocations

@@ -602,6 +602,10 @@ std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(size_t size) {
 
     OffsetAllocation allocation = m_allocator->allocate(fake_size);
     if (allocation.isNoSpace()) {
+        // A request can pass the conservative hint but still fail because
+        // the allocator state changed concurrently. Tighten the hint after
+        // observing the authoritative state under the mutex.
+        refreshLargestFreeRegion();
         // Log metrics to help understand why allocation failed
         // Note: We're already holding m_mutex, so use internal method
         OffsetAllocatorMetrics metrics = get_metrics_internal();
@@ -609,8 +613,6 @@ std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(size_t size) {
                 << ", fake_size=" << fake_size << ", " << metrics;
         return std::nullopt;
     }
-
-    refreshLargestFreeRegion();
 
     // Update lightweight metrics
     m_allocated_size += size;

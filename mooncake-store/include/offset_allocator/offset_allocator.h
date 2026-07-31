@@ -171,7 +171,10 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     // the request cannot be represented by this allocator.
     [[nodiscard]] uint64_t normalizedAllocationSize(size_t size) const;
 
-    // Returns a lock-free snapshot of the largest allocatable free region.
+    // Returns a mutex-free atomic upper-bound hint for the largest allocatable
+    // free region. The hint may be larger than the current value after a
+    // successful allocation and is tightened on a locked allocation failure
+    // or after free.
     [[nodiscard]] uint64_t getLargestFreeRegion() const noexcept {
         return m_largest_free_region.load(std::memory_order_relaxed);
     }
