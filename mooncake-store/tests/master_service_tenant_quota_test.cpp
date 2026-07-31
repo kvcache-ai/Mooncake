@@ -547,8 +547,8 @@ TEST_F(MasterServiceTenantQuotaTest,
 
     Replica replacement(client_b, 128, "disk-endpoint-b",
                         ReplicaStatus::COMPLETE, "disk-a", 2);
-    auto replacement_result = service.AddReplica(
-        client_b, "cold", TenantId("tenant-a"), replacement);
+    auto replacement_result =
+        service.AddReplica(client_b, "cold", TenantId("tenant-a"), replacement);
     ASSERT_TRUE(replacement_result.has_value())
         << toString(replacement_result.error());
     EXPECT_FALSE(replacement_result.value());

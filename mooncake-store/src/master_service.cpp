@@ -4041,16 +4041,15 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
         return true;
     }
 
-    metadata.VisitReplicas(
-        matches_incoming, [&replica](Replica& rep) {
-            const auto descriptor =
-                replica.get_descriptor().get_local_disk_descriptor();
-            rep.update_local_disk_location(
-                descriptor.object_size, descriptor.transport_endpoint,
-                descriptor.GetLocalDiskSegmentId(), descriptor.GetMountEpoch(),
-                descriptor.GetCapabilities(), descriptor.GetBucketId(),
-                descriptor.GetObjectIncarnation());
-        });
+    metadata.VisitReplicas(matches_incoming, [&replica](Replica& rep) {
+        const auto descriptor =
+            replica.get_descriptor().get_local_disk_descriptor();
+        rep.update_local_disk_location(
+            descriptor.object_size, descriptor.transport_endpoint,
+            descriptor.GetLocalDiskSegmentId(), descriptor.GetMountEpoch(),
+            descriptor.GetCapabilities(), descriptor.GetBucketId(),
+            descriptor.GetObjectIncarnation());
+    });
     return false;
 }
 
