@@ -10,7 +10,6 @@ jobs:
       matrix:
         python-version: ['3.10', '3.12']
     env:
-      BUILD_WITH_EP: "1"
       CU13_BUILD: "1"
       TORCH_CUDA_ARCH_LIST: "8.0;9.0"
       SCCACHE_GHA_ENABLED: "true"
@@ -66,7 +65,7 @@ jobs:
           -DWITH_STORE=ON \
           -DWITH_P2P_STORE=ON \
           -DWITH_EP=ON \
-          -DEP_TORCH_VERSIONS="2.11.0;2.12.0;2.12.1" \
+          -DEP_TORCH_VERSIONS="2.11.0;2.12.0;2.12.1;2.13.0" \
           -DWITH_METRICS=ON \
           -DBUILD_UNIT_TESTS=OFF \
           -DBUILD_EXAMPLES=ON \

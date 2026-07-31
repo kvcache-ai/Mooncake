@@ -25,6 +25,7 @@
 
 #include "common.h"
 #include "error.h"
+#include "rdma_test_peers.h"
 #include "transfer_metadata.h"
 #include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_transport/rdma_transport.h"
@@ -142,42 +143,6 @@ int ibv_close_device(ibv_context *) { return 0; }
 }  // extern "C"
 #endif  // __linux__
 
-namespace mooncake {
-
-class RdmaTransportTestPeer {
-   public:
-    static void bindMetadata(RdmaTransport &transport,
-                             std::shared_ptr<TransferMetadata> metadata,
-                             std::string local_server_name) {
-        transport.metadata_ = std::move(metadata);
-        transport.local_server_name_ = std::move(local_server_name);
-    }
-};
-
-class RdmaContextTestPeer {
-   public:
-    static bool hasEndpointStore(const RdmaContext &context) {
-        return context.endpoint_store_ != nullptr;
-    }
-
-    static void seedAutoGidState(RdmaContext &context, ibv_context *verbs_ctx,
-                                 uint8_t port, uint16_t lid, const ibv_gid &gid,
-                                 int gid_index) {
-        context.context_ = verbs_ctx;
-        context.port_ = port;
-        context.lid_ = lid;
-        context.gid_ = gid;
-        context.gid_index_ = gid_index;
-        context.auto_gid_selection_enabled_ = true;
-    }
-
-    static void disableContextForTeardown(RdmaContext &context) {
-        context.context_ = nullptr;
-    }
-};
-
-}  // namespace mooncake
-
 namespace {
 
 class RdmaContextConstructionTest : public ::testing::Test {
@@ -225,6 +190,29 @@ TEST_F(RdmaContextConstructionTest,
 #else
     GTEST_SKIP() << "Requires Linux libibverbs symbol interposition";
 #endif
+}
+
+TEST(RdmaMemoryRegistrationPolicyTest, LocalOnlyBufferHasNoPublishedRkey) {
+    auto metadata = std::make_shared<TransferMetadata>(P2PHANDSHAKE);
+    auto local_desc = std::make_shared<TransferMetadata::SegmentDesc>();
+    local_desc->name = "local-rdma-segment";
+    local_desc->protocol = "rdma";
+    ASSERT_EQ(metadata->addLocalSegment(LOCAL_SEGMENT_ID, "local-rdma-segment",
+                                        std::move(local_desc)),
+              0);
+
+    RdmaTransport transport;
+    RdmaTransportTestPeer::bindMetadata(transport, metadata,
+                                        "local-rdma-segment");
+    std::array<char, 1> buffer{};
+    ASSERT_EQ(transport.registerLocalMemory(buffer.data(), buffer.size(),
+                                            "cpu:0", false, false),
+              0);
+
+    auto desc = metadata->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    ASSERT_NE(desc, nullptr);
+    ASSERT_EQ(desc->buffers.size(), 1);
+    EXPECT_TRUE(desc->buffers[0].rkey.empty());
 }
 
 ibv_gid makeGid(const std::array<uint8_t, 16> &bytes) {

@@ -612,7 +612,7 @@ virtual tl::expected<std::vector<Replica>, ErrorCode> Allocate(
 
 ### 替换策略
 
-当 `PutStart` 请求因内存不足而失败，或者当后台线程检测到空间使用率达到配置的高水位线（默认 95%，可通过 `-eviction_high_watermark_ratio` 配置）时，会触发一次替换任务，通过换出一部分对象来释放空间（默认 5%，可通过 `-eviction_ratio` 配置）。与 `Remove` 类似，被换出的对象仅仅会被标记为已删除，不需要进行数据传输。
+当 `PutStart` 请求因内存不足而失败，或者当后台线程检测到空间使用率达到配置的高水位线（默认 90%，可通过 `-eviction_high_watermark_ratio` 配置）时，会触发一次替换任务，通过换出一部分对象来释放空间（默认 5%，可通过 `-eviction_ratio` 配置）。与 `Remove` 类似，被换出的对象仅仅会被标记为已删除，不需要进行数据传输。
 
 目前采用的是一种近似的 LRU 策略，即尽可能优先换出最近最少被访问的对象。为了避免数据竞争和数据损坏，正在被客户端读取或写入的对象不会被换出。因此，拥有租约或尚未被 `PutEnd` 请求标记为 complete 的对象不会被换出。
 
@@ -622,7 +622,7 @@ virtual tl::expected<std::vector<Replica>, ErrorCode> Allocate(
 
 然而，如果在 `Get` 操作完成读取数据之前租约已过期，该操作将被视为失败，并且不会返回任何数据，以防止潜在的数据损坏。
 
-默认的租约时间为 5 秒，并可通过 `master_service` 的启动参数进行配置。
+默认的租约时间为 10 秒，并可通过 `master_service` 的启动参数进行配置。
 
 ### 软固定机制
 
