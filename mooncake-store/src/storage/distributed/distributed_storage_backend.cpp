@@ -267,7 +267,7 @@ DistributedStorageBackend::LookupDescriptor(
     if (!desc_cache_) return std::nullopt;
     if (auto desc = desc_cache_->Get(storage_key)) return desc;
 
-    auto [tenant_id, user_key] = ParseTenantScopedStorageKey(storage_key);
+    auto [tenant_id, user_key] = TenantId::ParseScopedKey(storage_key);
     (void)tenant_id;
     if (user_key != storage_key) {
         return desc_cache_->Get(user_key);

@@ -504,8 +504,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             std::vector<std::string> user_keys;
             user_keys.reserve(keys.size());
             for (const auto& storage_key : keys) {
-                auto [tenant_id, key] =
-                    ParseTenantScopedStorageKey(storage_key);
+                auto [tenant_id, key] = TenantId::ParseScopedKey(storage_key);
                 (void)tenant_id;
                 user_keys.push_back(std::move(key));
             }
@@ -837,6 +836,19 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                 auto remount_result =
                     client_->MountLocalDiskSegment(enable_offloading_);
                 if (remount_result) {
+                    // Report configured SSD capacity so the Master can
+                    // restore file_total_capacity_ (the denominator in
+                    // "SSD Storage: X / Y").  This was lost on restart;
+                    // re-reporting it here avoids the 0 B display.
+                    if (config_.total_size_limit > 0) {
+                        auto cap_result = client_->ReportSsdCapacity(
+                            config_.total_size_limit);
+                        if (!cap_result) {
+                            LOG(WARNING)
+                                << "ReportSsdCapacity failed during "
+                                << "heartbeat recovery: " << cap_result.error();
+                        }
+                    }
                     heartbeat_result = fetch_offload_tasks();
                     if (!heartbeat_result) {
                         LOG(ERROR) << "Heartbeat failed after re-registration: "
@@ -873,7 +885,13 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         }
     }
 
-    // === STEP 2: Persist offloaded objects (trigger actual data migration) ===
+    // === STEP 2: Poll whether master requested a full SSD clear ===
+    auto remove_all_result = client_->PollRemoveAll();
+    if (remove_all_result && remove_all_result.value()) {
+        RemoveAll();
+    }
+
+    // === STEP 3: Persist offloaded objects (trigger actual data migration) ===
     if (!offloading_objects.empty()) {
         auto offload_result = OffloadObjects(offloading_objects);
         if (!offload_result) {
@@ -900,6 +918,21 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                      << disk_eviction_result.error();
     }
     return {};
+}
+
+void FileStorage::RemoveAll() {
+    // TODO(tenant-isolation): This performs a tenant-UNAWARE global wipe of the
+    // storage directory. Storage backends store physical files without a
+    // tenant dimension, so a tenant-scoped master RemoveAll("tenant_A") that
+    // signals this client will also delete tenant_B's SSD files here, while
+    // master still holds valid metadata for tenant_B (subsequent reads get
+    // OBJECT_NOT_FOUND on this node). Safe for the global RemoveAll(force) and
+    // for single-tenant / shared-nothing deployments. Proper per-tenant
+    // physical isolation needs backend-level tenant-scoped layout (follow-up).
+    if (storage_backend_) {
+        storage_backend_->RemoveAll();
+    }
+    LOG(INFO) << "FileStorage::RemoveAll: cleared storage backend";
 }
 
 tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {

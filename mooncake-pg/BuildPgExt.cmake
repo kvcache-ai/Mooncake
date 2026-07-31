@@ -11,6 +11,8 @@
 #   TORCH_CUDA_ARCH_LIST - pipe-separated CUDA arch list forwarded to torch
 #   STAGING_DIR         - destination directory for the built .so files
 #   ENGINE_SO_PATH      - absolute path to the built engine.cpython-XYZ.so
+#   ASIO_SO_PATH        - absolute path to the libasio.so used by engine.so
+#   YLT_INCLUDE_DIRS    - pipe-separated YLT include directories used by CMake
 #   EP_USE_MUSA         - set to "1" when building for MUSA (MTLink path)
 #   EP_USE_MACA         - set to "1" when building for MACA (MTLink path)
 
@@ -37,6 +39,14 @@ endif()
 set(ENV{MAKEFLAGS} "")
 set(ENV{MFLAGS} "")
 set(ENV{TORCH_CUDA_ARCH_LIST} "${TORCH_CUDA_ARCH_LIST}")
+if(NOT YLT_INCLUDE_DIRS)
+  message(FATAL_ERROR "[PG] YLT_INCLUDE_DIRS was not provided by CMake")
+endif()
+if(NOT ASIO_SO_PATH OR NOT EXISTS "${ASIO_SO_PATH}")
+  message(FATAL_ERROR "[PG] ASIO_SO_PATH is missing or does not exist: ${ASIO_SO_PATH}")
+endif()
+set(ENV{MOONCAKE_YLT_INCLUDE_DIRS} "${YLT_INCLUDE_DIRS}")
+set(ENV{MOONCAKE_ASIO_SO_PATH} "${ASIO_SO_PATH}")
 if(EP_USE_MUSA)
   set(ENV{MOONCAKE_EP_USE_MUSA} "1")
 else()

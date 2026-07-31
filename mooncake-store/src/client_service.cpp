@@ -40,10 +40,28 @@
 #include "rpc_types.h"
 #include "local_hot_cache.h"
 #include "device/accelerator_registry.h"
+#include "crc_checksum.h"
+#include "environ.h"
 
 namespace mooncake {
 
 namespace {
+
+constexpr size_t kObjectChecksumD2HChunkSize = 8 * 1024 * 1024;
+
+class ScopedObjectChecksumBuffer {
+   public:
+    ScopedObjectChecksumBuffer(PinnedBufferPool& pool, size_t size)
+        : pool_(pool), buffer_(pool_.Acquire(size)) {}
+
+    ~ScopedObjectChecksumBuffer() { pool_.Release(std::move(buffer_)); }
+
+    char* data() const { return buffer_.data; }
+
+   private:
+    PinnedBufferPool& pool_;
+    PinnedBufferPool::Buffer buffer_;
+};
 
 #ifdef USE_NOF
 std::optional<int> GetConfiguredNumaSocketId() {
@@ -285,12 +303,16 @@ Client::Client(const std::string& local_hostname,
       host_id_(ResolveMooncakeHostId(local_hostname)),
       metadata_connstring_(metadata_connstring),
       protocol_(protocol),
+      object_checksum_enabled_(Environ::Get().GetStoreChecksumEnabled()),
       pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
       write_thread_pool_(2),
       task_thread_pool_(4) {
     LOG(INFO) << "client_id=" << client_id_;
     if (!host_id_.empty()) {
         LOG(INFO) << "client_id=" << client_id_ << ", host_id=" << host_id_;
+    }
+    if (object_checksum_enabled_) {
+        LOG(INFO) << "Object checksum validation is enabled";
     }
 
     if (metrics_) {
@@ -921,10 +943,18 @@ std::optional<std::shared_ptr<Client>> Client::Create(
                 LOG(INFO) << "Storage root directory is: " << storage_root_dir;
                 LOG(INFO) << "Fs subdir is: " << fs_subdir;
                 // Initialize storage backend with default eviction settings
-                client->PrepareStorageBackend(storage_root_dir, fs_subdir, true,
-                                              0);
+                auto prep_err = client->PrepareStorageBackend(
+                    storage_root_dir, fs_subdir, true, 0);
+                if (prep_err != ErrorCode::OK) {
+                    LOG(ERROR)
+                        << "Failed to initialize storage backend: " << prep_err
+                        << ". Persistence was requested via fsdir but is "
+                           "unavailable.";
+                    return std::nullopt;
+                }
             } else {
                 LOG(ERROR) << "Invalid fsdir format: " << dir_string;
+                return std::nullopt;
             }
         }
     } else {
@@ -944,11 +974,19 @@ std::optional<std::shared_ptr<Client>> Client::Create(
                           << config.enable_disk_eviction;
                 LOG(INFO) << "Quota bytes: " << config.quota_bytes;
                 // Initialize storage backend with config from master
-                client->PrepareStorageBackend(storage_root_dir, fs_subdir,
-                                              config.enable_disk_eviction,
-                                              config.quota_bytes);
+                auto prep_err = client->PrepareStorageBackend(
+                    storage_root_dir, fs_subdir, config.enable_disk_eviction,
+                    config.quota_bytes);
+                if (prep_err != ErrorCode::OK) {
+                    LOG(ERROR)
+                        << "Failed to initialize storage backend: " << prep_err
+                        << ". Persistence was requested via storage config "
+                           "but is unavailable.";
+                    return std::nullopt;
+                }
             } else {
                 LOG(ERROR) << "Invalid fsdir format: " << config.fsdir;
+                return std::nullopt;
             }
         }
     }
@@ -1067,7 +1105,8 @@ tl::expected<QueryResult, ErrorCode> Client::Query(
     CacheDfsDescriptors(object_key, result.value().replicas);
     return QueryResult(
         std::move(result.value().replicas),
-        start_time + std::chrono::milliseconds(result.value().lease_ttl_ms));
+        start_time + std::chrono::milliseconds(result.value().lease_ttl_ms),
+        result.value().object_checksum);
 }
 
 std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
@@ -1100,13 +1139,94 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
             CacheDfsDescriptors(object_keys[i], response[i].value().replicas);
             results.emplace_back(QueryResult(
                 std::move(response[i].value().replicas),
-                start_time + std::chrono::milliseconds(
-                                 response[i].value().lease_ttl_ms)));
+                start_time +
+                    std::chrono::milliseconds(response[i].value().lease_ttl_ms),
+                response[i].value().object_checksum));
         } else {
             results.emplace_back(tl::unexpected(response[i].error()));
         }
     }
     return results;
+}
+
+tl::expected<uint64_t, ErrorCode> Client::ComputeObjectChecksumForSlices(
+    const std::string& object_key, const std::vector<Slice>& slices,
+    size_t object_size) {
+    CrcChecksum checksum;
+    size_t remaining = object_size;
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
+    std::unique_ptr<ScopedObjectChecksumBuffer> staging;
+
+    for (const auto& slice : slices) {
+        const size_t bytes = std::min(slice.size, remaining);
+        if (bytes == 0) {
+            continue;
+        }
+        if (slice.ptr == nullptr) {
+            LOG(ERROR) << "object_checksum_null_slice key=" << object_key;
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+
+        if (!runtime_accelerator.FindDeviceForPointer(slice.ptr)) {
+            checksum.Update(slice.ptr, bytes);
+            remaining -= bytes;
+            continue;
+        }
+
+        if (!staging) {
+            staging = std::make_unique<ScopedObjectChecksumBuffer>(
+                *pinned_buffer_pool_,
+                std::min(kObjectChecksumD2HChunkSize, object_size));
+        }
+        size_t offset = 0;
+        while (offset < bytes) {
+            const size_t chunk =
+                std::min(kObjectChecksumD2HChunkSize, bytes - offset);
+            const auto* source = static_cast<const char*>(slice.ptr) + offset;
+            if (!runtime_accelerator.CopyToHost(staging->data(), source,
+                                                chunk)) {
+                LOG(ERROR) << "object_checksum_d2h_failed key=" << object_key
+                           << " size=" << chunk;
+                return tl::unexpected(ErrorCode::TRANSFER_FAIL);
+            }
+            checksum.Update(staging->data(), chunk);
+            offset += chunk;
+        }
+        remaining -= bytes;
+    }
+
+    if (remaining != 0) {
+        LOG(ERROR) << "object_checksum_slices_too_small key=" << object_key
+                   << " missing_bytes=" << remaining;
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    return checksum.Finalize();
+}
+
+tl::expected<void, ErrorCode> Client::VerifyObjectChecksum(
+    const std::string& object_key, const std::vector<Slice>& slices,
+    size_t object_size, std::optional<uint64_t> expected_checksum) {
+    if (!object_checksum_enabled_) {
+        return {};
+    }
+    if (!expected_checksum.has_value()) {
+        VLOG(1) << "object_checksum_absent key=" << object_key;
+        return {};
+    }
+
+    auto actual_checksum =
+        ComputeObjectChecksumForSlices(object_key, slices, object_size);
+    if (!actual_checksum) {
+        return tl::unexpected(actual_checksum.error());
+    }
+    if (*actual_checksum != *expected_checksum) {
+        LOG(ERROR) << "object_checksum_mismatch key=" << object_key
+                   << " expected=" << *expected_checksum
+                   << " actual=" << *actual_checksum;
+        return tl::unexpected(ErrorCode::CHECKSUM_MISMATCH);
+    }
+    return {};
 }
 
 tl::expected<std::vector<std::string>, ErrorCode> Client::BatchReplicaClear(
@@ -1158,6 +1278,13 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "transfer_read_failed key=" << object_key;
         return tl::unexpected(err);
+    }
+
+    auto checksum_result =
+        VerifyObjectChecksum(object_key, slices, calculate_total_size(replica),
+                             query_result.object_checksum);
+    if (!checksum_result) {
+        return tl::unexpected(checksum_result.error());
     }
 
     // Frequency admission: only promote frequently accessed keys to hot cache.
@@ -1320,7 +1447,6 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
                 auto index = op.key_indexes[idx];
                 VLOG(1) << "Transfer completed successfully for key: "
                         << object_keys[index];
-                results[index] = {};
 
                 // Release the cache block after transfer completes (memcpy is
                 // done)
@@ -1328,6 +1454,16 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGetWhenPreferSameNode(
                     op.cache_used[idx]) {
                     hot_cache_->ReleaseHotKey(object_keys[index]);
                 }
+
+                auto checksum_result = VerifyObjectChecksum(
+                    object_keys[index], op.batched_slices[idx],
+                    calculate_total_size(op.replicas[idx]),
+                    query_results[index].object_checksum);
+                if (!checksum_result) {
+                    results[index] = tl::unexpected(checksum_result.error());
+                    continue;
+                }
+                results[index] = {};
 
                 // Frequency admission: only promote frequently accessed keys.
                 // Skip when cache was used (data served from local cache).
@@ -1478,6 +1614,19 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             results[index] = tl::unexpected(result);
         } else {
             VLOG(1) << "Transfer completed successfully for key: " << key;
+
+            auto slices_it = slices.find(key);
+            if (slices_it == slices.end()) {
+                results[index] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+                continue;
+            }
+            auto checksum_result = VerifyObjectChecksum(
+                key, slices_it->second, calculate_total_size(stored_replica),
+                query_results[index].object_checksum);
+            if (!checksum_result) {
+                results[index] = tl::unexpected(checksum_result.error());
+                continue;
+            }
             results[index] = {};
 
             // Frequency admission: only promote frequently accessed keys.
@@ -1549,6 +1698,16 @@ bool Client::RedirectToHotCache(const std::string& key,
 tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
                                           std::vector<Slice>& slices,
                                           const ReplicateConfig& config) {
+    std::optional<uint64_t> object_checksum;
+    if (object_checksum_enabled_) {
+        auto checksum_result = ComputeObjectChecksumForSlices(
+            key, slices, CalculateSliceSize(slices));
+        if (!checksum_result) {
+            return tl::unexpected(checksum_result.error());
+        }
+        object_checksum = *checksum_result;
+    }
+
     // Prepare slice lengths
     std::vector<size_t> slice_lengths;
     for (size_t i = 0; i < slices.size(); ++i) {
@@ -1632,8 +1791,8 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
         DetermineFinalizeDecision(config, transfer_summary);
 
     if (finalize_decision.end_type.has_value()) {
-        auto end_result =
-            master_client_.PutEnd(key, *finalize_decision.end_type);
+        auto end_result = master_client_.PutEnd(
+            ObjectMeta{key, object_checksum}, *finalize_decision.end_type);
         if (!end_result) {
             ErrorCode err = end_result.error();
             LOG(ERROR) << "Failed to end put operation: " << err;
@@ -1660,6 +1819,16 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
 tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
                                              std::vector<Slice>& slices,
                                              const ReplicateConfig& config) {
+    std::optional<uint64_t> object_checksum;
+    if (object_checksum_enabled_) {
+        auto checksum_result = ComputeObjectChecksumForSlices(
+            key, slices, CalculateSliceSize(slices));
+        if (!checksum_result) {
+            return tl::unexpected(checksum_result.error());
+        }
+        object_checksum = *checksum_result;
+    }
+
     // Prepare slice lengths
     std::vector<size_t> slice_lengths;
     for (size_t i = 0; i < slices.size(); ++i) {
@@ -1732,7 +1901,8 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     }
 
     // End upsert operation
-    auto end_result = master_client_.UpsertEnd(key, ReplicaType::MEMORY);
+    auto end_result = master_client_.UpsertEnd(ObjectMeta{key, object_checksum},
+                                               ReplicaType::MEMORY);
     if (!end_result) {
         ErrorCode err = end_result.error();
         LOG(ERROR) << "Failed to end upsert operation: " << err;
@@ -1765,6 +1935,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     }
 
     std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
+    ComputeBatchObjectChecksums(ops);
     StartBatchUpsert(ops, client_cfg);
 
     auto t0 = std::chrono::steady_clock::now();
@@ -1809,6 +1980,7 @@ class PutOperation {
 
     std::string key;
     std::vector<Slice> slices;
+    std::optional<uint64_t> object_checksum;
     std::vector<std::vector<Slice>> batched_slices;
 
     // Enhanced state tracking
@@ -1905,13 +2077,32 @@ std::vector<PutOperation> Client::CreatePutOperations(
     return ops;
 }
 
+void Client::ComputeBatchObjectChecksums(std::vector<PutOperation>& ops) {
+    if (!object_checksum_enabled_) {
+        return;
+    }
+    for (auto& op : ops) {
+        auto checksum_result = ComputeObjectChecksumForSlices(
+            op.key, op.slices, CalculateSliceSize(op.slices));
+        if (!checksum_result) {
+            op.SetTerminalError(checksum_result.error(),
+                                PutOperationState::MASTER_FAILED,
+                                "Object checksum calculation failed");
+            continue;
+        }
+        op.object_checksum = *checksum_result;
+    }
+}
+
 void Client::StartBatchPut(std::vector<PutOperation>& ops,
                            const ReplicateConfig& config) {
     std::vector<std::string> keys;
     std::vector<std::vector<uint64_t>> slice_lengths;
+    std::vector<size_t> active_indices;
 
     keys.reserve(ops.size());
     slice_lengths.reserve(ops.size());
+    active_indices.reserve(ops.size());
 
     if (hot_cache_) {
         std::vector<std::string> hot_keys;
@@ -1920,7 +2111,12 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
         hot_cache_->RemoveHotKeys(hot_keys);
     }
 
-    for (const auto& op : ops) {
+    for (size_t i = 0; i < ops.size(); ++i) {
+        const auto& op = ops[i];
+        if (op.IsResolved()) {
+            continue;
+        }
+        active_indices.emplace_back(i);
         keys.emplace_back(op.key);
 
         std::vector<uint64_t> slice_sizes;
@@ -1931,14 +2127,20 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
         slice_lengths.emplace_back(std::move(slice_sizes));
     }
 
+    if (active_indices.empty()) {
+        return;
+    }
+
     auto start_responses =
         master_client_.BatchPutStart(keys, slice_lengths, config);
 
     // Ensure response size matches request size
-    if (start_responses.size() != ops.size()) {
+    if (start_responses.size() != active_indices.size()) {
         LOG(ERROR) << "BatchPutStart response size mismatch: expected "
-                   << ops.size() << ", got " << start_responses.size();
-        for (auto& op : ops) {
+                   << active_indices.size() << ", got "
+                   << start_responses.size();
+        for (size_t index : active_indices) {
+            auto& op = ops[index];
             op.SetError(ErrorCode::RPC_FAIL,
                         "BatchPutStart response size mismatch");
         }
@@ -1946,28 +2148,28 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
     }
 
     // Process individual responses with robust error handling
-    for (size_t i = 0; i < ops.size(); ++i) {
-        ops[i].InitializeRequestedReplicas(config);
+    for (size_t i = 0; i < active_indices.size(); ++i) {
+        auto& op = ops[active_indices[i]];
+        op.InitializeRequestedReplicas(config);
         if (!start_responses[i]) {
-            ops[i].SetTerminalError(start_responses[i].error(),
-                                    PutOperationState::MASTER_FAILED,
-                                    "Master failed to start put operation");
+            op.SetTerminalError(start_responses[i].error(),
+                                PutOperationState::MASTER_FAILED,
+                                "Master failed to start put operation");
         } else {
-            ops[i].replicas = start_responses[i].value();
-            CacheDfsDescriptors(ops[i].key, ops[i].replicas);
-            ops[i].RecordAllocatedReplicas();
-            if (!HasExpectedReplicaAllocation(config,
-                                              ops[i].transfer_summary)) {
-                ops[i].SetTerminalError(ErrorCode::NO_AVAILABLE_HANDLE,
-                                        PutOperationState::MASTER_FAILED,
-                                        "Allocated replicas do not satisfy "
-                                        "requested replica policy");
+            op.replicas = start_responses[i].value();
+            CacheDfsDescriptors(op.key, op.replicas);
+            op.RecordAllocatedReplicas();
+            if (!HasExpectedReplicaAllocation(config, op.transfer_summary)) {
+                op.SetTerminalError(ErrorCode::NO_AVAILABLE_HANDLE,
+                                    PutOperationState::MASTER_FAILED,
+                                    "Allocated replicas do not satisfy "
+                                    "requested replica policy");
                 continue;
             }
             // Operation continues to next stage - result remains INTERNAL_ERROR
             // until fully successful
-            VLOG(1) << "Successfully started put for key " << ops[i].key
-                    << " with " << ops[i].replicas.size() << " replicas";
+            VLOG(1) << "Successfully started put for key " << op.key << " with "
+                    << op.replicas.size() << " replicas";
         }
     }
 }
@@ -1976,9 +2178,11 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
                               const ReplicateConfig& config) {
     std::vector<std::string> keys;
     std::vector<std::vector<uint64_t>> slice_lengths;
+    std::vector<size_t> active_indices;
 
     keys.reserve(ops.size());
     slice_lengths.reserve(ops.size());
+    active_indices.reserve(ops.size());
 
     if (hot_cache_) {
         std::vector<std::string> hot_keys;
@@ -1987,7 +2191,12 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
         hot_cache_->RemoveHotKeys(hot_keys);
     }
 
-    for (const auto& op : ops) {
+    for (size_t i = 0; i < ops.size(); ++i) {
+        const auto& op = ops[i];
+        if (op.IsResolved()) {
+            continue;
+        }
+        active_indices.emplace_back(i);
         keys.emplace_back(op.key);
 
         std::vector<uint64_t> slice_sizes;
@@ -1998,14 +2207,20 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
         slice_lengths.emplace_back(std::move(slice_sizes));
     }
 
+    if (active_indices.empty()) {
+        return;
+    }
+
     auto start_responses =
         master_client_.BatchUpsertStart(keys, slice_lengths, config);
 
     // Ensure response size matches request size
-    if (start_responses.size() != ops.size()) {
+    if (start_responses.size() != active_indices.size()) {
         LOG(ERROR) << "BatchUpsertStart response size mismatch: expected "
-                   << ops.size() << ", got " << start_responses.size();
-        for (auto& op : ops) {
+                   << active_indices.size() << ", got "
+                   << start_responses.size();
+        for (size_t index : active_indices) {
+            auto& op = ops[index];
             op.SetError(ErrorCode::RPC_FAIL,
                         "BatchUpsertStart response size mismatch");
         }
@@ -2013,23 +2228,31 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
     }
 
     // Process individual responses with robust error handling
-    for (size_t i = 0; i < ops.size(); ++i) {
+    for (size_t i = 0; i < active_indices.size(); ++i) {
+        auto& op = ops[active_indices[i]];
         if (!start_responses[i]) {
-            ops[i].SetError(start_responses[i].error(),
-                            "Master failed to start upsert operation");
+            op.SetError(start_responses[i].error(),
+                        "Master failed to start upsert operation");
         } else {
-            ops[i].replicas = start_responses[i].value();
-            CacheDfsDescriptors(ops[i].key, ops[i].replicas);
-            VLOG(1) << "Successfully started upsert for key " << ops[i].key
-                    << " with " << ops[i].replicas.size() << " replicas";
+            op.replicas = start_responses[i].value();
+            CacheDfsDescriptors(op.key, op.replicas);
+            VLOG(1) << "Successfully started upsert for key " << op.key
+                    << " with " << op.replicas.size() << " replicas";
         }
     }
 }
 
 void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
+    if (std::all_of(ops.begin(), ops.end(),
+                    [](const PutOperation& op) { return op.IsResolved(); })) {
+        return;
+    }
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
         for (auto& op : ops) {
+            if (op.IsResolved()) {
+                continue;
+            }
             op.SetTerminalError(ErrorCode::INVALID_PARAMS,
                                 PutOperationState::TRANSFER_FAILED,
                                 "TransferSubmitter not initialized");
@@ -2235,7 +2458,13 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
         if (group.keys.empty()) {
             return;
         }
-        auto responses = master_client_.BatchPutEnd(group.keys, replica_type);
+        std::vector<ObjectMeta> object_metas;
+        object_metas.reserve(group.indices.size());
+        for (size_t i = 0; i < group.indices.size(); ++i) {
+            object_metas.emplace_back(ObjectMeta{
+                group.keys[i], ops[group.indices[i]].object_checksum});
+        }
+        auto responses = master_client_.BatchPutEnd(object_metas, replica_type);
         if (responses.size() != group.keys.size()) {
             for (size_t idx : group.indices) {
                 finalize_rpc_errors[idx] = ErrorCode::RPC_FAIL;
@@ -2341,12 +2570,12 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
 }
 
 void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
-    std::vector<std::string> successful_keys;
+    std::vector<ObjectMeta> successful_object_metas;
     std::vector<size_t> successful_indices;
     std::vector<std::string> failed_keys;
     std::vector<size_t> failed_indices;
 
-    successful_keys.reserve(ops.size());
+    successful_object_metas.reserve(ops.size());
     successful_indices.reserve(ops.size());
     failed_keys.reserve(ops.size());
     failed_indices.reserve(ops.size());
@@ -2356,7 +2585,8 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
 
         if (!op.IsResolved() && !op.replicas.empty() &&
             !op.pending_transfers.empty()) {
-            successful_keys.emplace_back(op.key);
+            successful_object_metas.emplace_back(
+                ObjectMeta{op.key, op.object_checksum});
             successful_indices.emplace_back(i);
         } else if (op.state != PutOperationState::PENDING &&
                    !op.replicas.empty()) {
@@ -2367,12 +2597,13 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
 
     // Process successful operations
     std::vector<std::string> finalized_keys;
-    if (!successful_keys.empty()) {
-        finalized_keys.reserve(successful_keys.size());
-        auto end_responses = master_client_.BatchUpsertEnd(successful_keys);
-        if (end_responses.size() != successful_keys.size()) {
+    if (!successful_object_metas.empty()) {
+        finalized_keys.reserve(successful_object_metas.size());
+        auto end_responses =
+            master_client_.BatchUpsertEnd(successful_object_metas);
+        if (end_responses.size() != successful_object_metas.size()) {
             LOG(ERROR) << "BatchUpsertEnd response size mismatch: expected "
-                       << successful_keys.size() << ", got "
+                       << successful_object_metas.size() << ", got "
                        << end_responses.size();
             for (size_t idx : successful_indices) {
                 ops[idx].SetError(ErrorCode::RPC_FAIL,
@@ -2383,15 +2614,15 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
                 const size_t op_idx = successful_indices[i];
                 if (!end_responses[i]) {
                     LOG(ERROR) << "Failed to finalize upsert for key "
-                               << successful_keys[i] << ": "
+                               << successful_object_metas[i].key << ": "
                                << toString(end_responses[i].error());
                     ops[op_idx].SetError(end_responses[i].error(),
                                          "BatchUpsertEnd failed");
                 } else {
                     ops[op_idx].SetSuccess();
-                    finalized_keys.emplace_back(successful_keys[i]);
+                    finalized_keys.emplace_back(successful_object_metas[i].key);
                     VLOG(1) << "Successfully completed upsert for key "
-                            << successful_keys[i];
+                            << successful_object_metas[i].key;
                 }
             }
         }
@@ -2597,6 +2828,7 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
         client_cfg.preferred_segment = local_hostname_;
     }
     std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
+    ComputeBatchObjectChecksums(ops);
     if (client_cfg.prefer_alloc_in_same_node) {
         if (client_cfg.nof_replica_num > 0) {
             LOG(ERROR) << "prefer_alloc_in_same_node is not supported with "
@@ -2675,8 +2907,10 @@ tl::expected<long, ErrorCode> Client::RemoveAll(bool force) {
     }
 
     auto result = master_client_.RemoveAll(force);
-    if (result && storage_backend_) {
-        storage_backend_->RemoveAll();
+    if (result) {
+        if (storage_backend_) {
+            storage_backend_->RemoveAll();
+        }
     }
     if (result && result.value() > 0 && hot_cache_) {
         hot_cache_->RemoveAllHotKeys();
@@ -3083,6 +3317,10 @@ tl::expected<void, ErrorCode> Client::PullDfsOffloadTasks(
     return {};
 }
 
+tl::expected<bool, ErrorCode> Client::PollRemoveAll() {
+    return master_client_.PollRemoveAll();
+}
+
 tl::expected<void, ErrorCode> Client::ReportSsdCapacity(
     int64_t ssd_total_capacity_bytes) {
     auto response =
@@ -3131,7 +3369,12 @@ tl::expected<void, ErrorCode> Client::NotifyOffloadSuccess(
 
 tl::expected<void, ErrorCode> Client::BatchPutEnd(
     const std::vector<std::string>& keys, ReplicaType replica_type) {
-    auto responses = master_client_.BatchPutEnd(keys, replica_type);
+    std::vector<ObjectMeta> object_metas;
+    object_metas.reserve(keys.size());
+    for (const auto& key : keys) {
+        object_metas.emplace_back(ObjectMeta{key, std::nullopt});
+    }
+    auto responses = master_client_.BatchPutEnd(object_metas, replica_type);
     if (responses.size() != keys.size()) {
         return tl::make_unexpected(ErrorCode::RPC_FAIL);
     }
@@ -3407,20 +3650,32 @@ tl::expected<void, ErrorCode> Client::MarkTaskToComplete(
     return master_client_.MarkTaskToComplete(update_request);
 }
 
-void Client::PrepareStorageBackend(const std::string& storage_root_dir,
-                                   const std::string& fsdir,
-                                   bool enable_eviction, uint64_t quota_bytes) {
+ErrorCode Client::PrepareStorageBackend(const std::string& storage_root_dir,
+                                        const std::string& fsdir,
+                                        bool enable_eviction,
+                                        uint64_t quota_bytes) {
     // Initialize storage backend
-    storage_backend_ =
+    auto backend_result =
         StorageBackend::Create(storage_root_dir, fsdir, enable_eviction);
-    if (!storage_backend_) {
-        LOG(INFO) << "Failed to initialize storage backend";
+    if (!backend_result) {
+        LOG(ERROR) << "Failed to create storage backend: "
+                   << backend_result.error();
+        return backend_result.error();
     }
-    auto init_result = storage_backend_->Init(quota_bytes);
+    // Initialize into a local first and only publish to storage_backend_
+    // after a successful Init(): users of storage_backend_ only null-check
+    // it, so it must never point to a backend whose Init() failed (using it
+    // before successful Init() is undefined behavior). If Init() throws,
+    // stack unwinding destroys the local and storage_backend_ stays clean.
+    auto backend = std::move(backend_result.value());
+    auto init_result = backend->Init(quota_bytes);
     if (!init_result) {
         LOG(ERROR) << "Failed to initialize StorageBackend. Error: "
                    << init_result.error() << ". The backend will be unusable.";
+        return init_result.error();
     }
+    storage_backend_ = std::move(backend);
+    return ErrorCode::OK;
 }
 
 void Client::PutToLocalFile(const std::string& key,
@@ -3514,7 +3769,8 @@ void Client::PutToLocalFile(const std::string& key,
         }
 
         // If storage succeeded, end the put operation
-        auto end_result = master_client_.PutEnd(key, replica_type);
+        auto end_result =
+            master_client_.PutEnd(ObjectMeta{key, std::nullopt}, replica_type);
         if (!end_result) {
             LOG(ERROR) << "Failed to end put operation for key: " << key;
         }
@@ -4132,6 +4388,10 @@ ErrorCode Client::InitLocalHotCache() {
     UnregisterLocalHotCacheMemory();
     hot_cache_.reset();
     admission_sketch_.reset();
+
+    if (object_checksum_enabled_) {
+        return ErrorCode::OK;
+    }
 
     // Defaults: hot cache is disabled unless MC_STORE_LOCAL_HOT_CACHE_SIZE is
     // set to a positive value; when enabled, default block size is 16MB and

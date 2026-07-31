@@ -8,6 +8,21 @@ This document lists common errors that may occur when using Mooncake Store and p
 > - [ ] Incorrect RDMA device name and connection status is not active.
 > - [ ] etcd is not started normally and it is not bind with `0.0.0.0`.
 
+## Corrupted Data or Garbled Output
+
+Use object-level checksum diagnostics when a full-object Mooncake Store read returns corrupted data or the application produces garbled output that may originate from stored data. Deploy checksum-capable Mooncake Store client, primary master, and standby master binaries from the same version, then set `MOONCAKE_STORE_CHECKSUM=1` before starting every writer and reader client process:
+
+```bash
+export MOONCAKE_STORE_CHECKSUM=1
+```
+
+Reproduce the issue with full-object `put`/`upsert` and `get` operations. The writer computes a CRC-64 checksum over the source object before transfer, and the reader verifies the logical `object_size` bytes returned by `get`. Range reads, including `get_into_ranges`, are not verified.
+
+`CHECKSUM_MISMATCH` (-801) proves that the bytes returned by the covered `get` differ from the bytes checksummed before the corresponding write. Treat the read as failed and do not use the destination buffer. It does not identify whether the corruption occurred during transfer, storage, or another covered Store stage.
+
+An enabled reader skips verification when the object's metadata has no checksum, such as an object written by a client with the switch disabled or restored from an older snapshot. This case is logged as `object_checksum_absent` at VLOG(1). A successful read without a mismatch therefore does not prove that checksum verification occurred, and a verified Store read does not rule out corruption introduced elsewhere in the application.
+
+Checksum diagnostics add a full data scan to writes and reads, perform device-to-host staging for GPU buffers, and disable the local hot cache. Disable the switch after diagnosis. See the [Mooncake Store Deployment and Tuning Guide](../deployment/mooncake-store-deployment-guide.md) for deployment and snapshot compatibility details.
 
 ## Metadata and Out-of-Band Communication
 1. At startup, a `TransferMetadata` object is constructed according to the incoming `metadata_server` parameter. During program execution, this object is used to communicate with the etcd server to maintain internal data required for connection.

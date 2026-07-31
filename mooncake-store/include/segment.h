@@ -102,6 +102,11 @@ struct LocalDiskSegment {
     // offloading_objects (offloading_mutex_).
     std::unordered_map<std::string, PromotionTaskItem> GUARDED_BY(
         offloading_mutex_) promotion_objects;
+    // Set by master's RemoveAll. When the client sees this flag via
+    // PollRemoveAll, it calls FileStorage::RemoveAll() to physically
+    // delete all SSD files. Same locking as offloading_objects
+    // (offloading_mutex_).
+    bool GUARDED_BY(offloading_mutex_) pending_remove_all = false;
     explicit LocalDiskSegment(bool enable_offloading)
         : enable_offloading(enable_offloading) {}
 
@@ -144,6 +149,22 @@ class ScopedSegmentAccess {
      */
     ErrorCode ReMountSegment(const std::vector<Segment>& segments,
                              const UUID& client_id);
+
+    ErrorCode ValidateRemountSegment(const Segment& segment,
+                                     const UUID& client_id) const;
+
+    bool GetSegment(const UUID& segment_id, Segment& segment) const;
+
+    struct AllocatorReplacement {
+        UUID segment_id;
+        std::shared_ptr<BufferAllocatorBase> expected;
+        std::shared_ptr<BufferAllocatorBase> replacement;
+    };
+    bool ReplaceAllocators(
+        const std::vector<AllocatorReplacement>& replacements);
+
+    std::shared_ptr<BufferAllocatorBase> GetAllocator(
+        const UUID& segment_id) const;
 
     /**
      * @brief Prepare to unmount a segment by deleting its allocator
@@ -433,6 +454,18 @@ class SegmentManager {
         : memory_allocator_(memory_allocator), enable_cxl_(enable_cxl) {}
 
     /**
+     * @brief Releases the capacity metric contribution of segments that
+     *        are still mounted. Intended to be called when the owning
+     *        MasterService is torn down: MasterMetricManager outlives
+     *        MasterService instances (e.g. across HA leadership changes).
+     *        This is deliberately not done in the destructor, because other
+     *        SegmentManager instances (such as the temporary snapshot
+     *        readers) hold deserialized records that never contributed to
+     *        the metrics and must not release them.
+     */
+    void releaseCapacityMetrics();
+
+    /**
      * @brief Get RAII-style access to segment management operations
      * @return ScopedSegmentAccess object that holds the lock
      */
@@ -458,6 +491,11 @@ class SegmentManager {
 
     void initializeCxlAllocator(const std::string& cxl_path,
                                 const size_t cxl_size);
+
+    // Endpoint-based segment queries (for standby restore)
+    bool HasSegmentByEndpoint(const std::string& endpoint) const;
+    bool GetSegmentBasicInfo(const UUID& segment_id, std::string& segment_name,
+                             std::string& te_endpoint) const;
 
    private:
     mutable std::shared_mutex segment_mutex_;

@@ -166,9 +166,10 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     [[nodiscard]] std::optional<OffsetAllocationHandle> createHandleAtNode(
         uint32_t node_index, uint64_t real_offset, uint64_t requested_size);
 
-    // ===== Recovery helpers =====
+    // Returns the actual region size consumed by allocate(size), or zero when
+    // the request cannot be represented by this allocator.
+    [[nodiscard]] uint64_t normalizedAllocationSize(size_t size) const;
 
-    // Visit every used (allocated) node in the allocator.
     // Get storage report (thread-safe)
     [[nodiscard]]
     OffsetAllocStorageReport storageReport() const;

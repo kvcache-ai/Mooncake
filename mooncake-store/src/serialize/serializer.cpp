@@ -1038,6 +1038,17 @@ auto Serializer<OffsetBufferAllocator>::deserialize(const msgpack::object &obj)
         allocator->offset_allocator_ = offset_allocator_result.value();
         allocator->cur_size_ = cur_size;
 
+        // The snapshot restores cur_size_ directly from persisted data
+        // without going through the live allocate()/adoptImportedBuffer()
+        // paths, so no inc_allocated_mem_size() was paired with it. The
+        // allocator destructor still calls dec_allocated_mem_size(cur_size_)
+        // to undo its contribution to the global metric; without a matching
+        // inc the gauge would go negative and wrap to ~16M TB when formatted
+        // as uint64. Pair it here so the accounting stays symmetric and the
+        // gauge ends at 0 after this (often throwaway) allocator is destroyed.
+        MasterMetricManager::instance().inc_allocated_mem_size(
+            segment_name, static_cast<int64_t>(cur_size));
+
         return allocator;
     } catch (const std::exception &e) {
         return tl::unexpected(SerializationError(

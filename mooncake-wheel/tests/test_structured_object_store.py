@@ -809,6 +809,49 @@ def test_structured_object_multi_buffer_put_cleans_all_chunk_keys_on_failure() -
     assert pool.release_count == 2
 
 
+def test_structured_object_multi_buffer_zero_copy_put_uses_batch_put() -> None:
+    store, transfer = make_transfer()
+    parts = [bytearray(b"ab"), bytearray(b"cd"), bytearray(b"ef")]
+    payload = StructuredObjectPayload(
+        metadata={},
+        buffers={
+            "raw": sos._MultiBufferPayload(
+                buffers=tuple(memoryview(part) for part in parts),
+                owners=tuple(parts),
+            )
+        },
+    )
+
+    ref = transfer.put_structured_object(
+        payload, chunk_bytes=4, policy=BundleTransferPolicy(copy_mode="zero_copy")
+    )
+    result = transfer.materialize(transfer.read_spec(ref))
+
+    raw = result.objects["raw"]
+    raw_bytes = raw if isinstance(raw, bytes) else raw.tobytes()
+    assert raw_bytes == b"abcdef"
+    assert store.batch_put_from_calls > 0
+
+
+def test_structured_object_multi_buffer_zero_copy_requires_batch_put_support() -> None:
+    _store, transfer = make_transfer(MinimalStore())
+    parts = [bytearray(b"ab"), bytearray(b"cd")]
+    payload = StructuredObjectPayload(
+        metadata={},
+        buffers={
+            "raw": sos._MultiBufferPayload(
+                buffers=tuple(memoryview(part) for part in parts),
+                owners=tuple(parts),
+            )
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="zero-copy put requested"):
+        transfer.put_structured_object(
+            payload, policy=BundleTransferPolicy(copy_mode="zero_copy")
+        )
+
+
 def test_structured_object_slice_member_uses_partial_range_reads() -> None:
     store, transfer = make_transfer()
     array = np.arange(96, dtype=np.int16).reshape(12, 8)
@@ -1740,6 +1783,18 @@ def test_dataproto_field_schema_validates_schema_errors() -> None:
                 )
             },
         )
+    for bad_key in ["", "image/data", "image\\data"]:
+        rows[:] = [{bad_key: object()}]
+        with pytest.raises(ValueError, match="must not"):
+            transfer.put_dataproto(
+                _schema_test_data("mm", rows),
+                field_schemas={
+                    "mm": FieldSchema(
+                        codec="ragged_tensor_dict",
+                        metadata={"section": "non_tensor_batch"},
+                    )
+                },
+            )
 
     values = np.empty(2, dtype=object)
     values[:] = ["ok", None]
@@ -2925,6 +2980,15 @@ def test_dataproto_helper_object_non_tensor_codecs_roundtrip() -> None:
     assert result["non_tensor_batch"]["nullable_int"].tolist() == [1, None, 3, 4]
 
 
+def test_msgpack_ragged_decode_validates_row_count() -> None:
+    payload, _metadata = sos._encode_msgpack_ragged_values(
+        "json", [{"a": 1}, {"b": 2}]
+    )
+
+    with pytest.raises(ValueError, match="offsets length"):
+        sos._decode_msgpack_ragged_values(payload, 1)
+
+
 def test_dataproto_helper_typed_ragged_uses_multi_buffer_put() -> None:
     pool = FakeBufferPool()
     _store, transfer = make_transfer(buffer_pool=pool)
@@ -2944,6 +3008,23 @@ def test_dataproto_helper_typed_ragged_uses_multi_buffer_put() -> None:
     assert rows[0].nbytes + rows[2].nbytes in pool.acquire_sizes
 
 
+def test_dataproto_helper_typed_ragged_zero_copy_put() -> None:
+    store, transfer = make_transfer()
+    rows = np.empty(3, dtype=object)
+    rows[:] = [
+        np.asarray([1, 2], dtype=np.int32),
+        None,
+        np.asarray([3, 4, 5], dtype=np.int32),
+    ]
+    data = SimpleDataProto(non_tensor_batch={"tokens": rows})
+
+    ref = transfer.put_dataproto(data, policy=BundleTransferPolicy(copy_mode="zero_copy"))
+    result = transfer.get_dataproto(ref)
+
+    assert result["non_tensor_batch"]["tokens"].tolist() == [[1, 2], None, [3, 4, 5]]
+    assert store.batch_put_from_calls > 0
+
+
 def test_dataproto_helper_rejects_unsupported_object_non_tensor() -> None:
     _store, transfer = make_transfer()
     data = SimpleDataProto(
@@ -2952,6 +3033,12 @@ def test_dataproto_helper_rejects_unsupported_object_non_tensor() -> None:
 
     with pytest.raises(ValueError, match="unsupported structured non-tensor field"):
         transfer.put_dataproto(data)
+    with pytest.raises(ValueError, match="unable to infer a safe codec"):
+        sos._encode_with_schema(
+            "non_tensor_batch.fallback",
+            data.non_tensor_batch["fallback"],
+            FieldSchema(codec="auto"),
+        )
 
 
 def test_dataproto_helper_ragged_tensor_non_tensor_roundtrip() -> None:
@@ -2977,6 +3064,14 @@ def test_dataproto_helper_ragged_tensor_non_tensor_roundtrip() -> None:
     assert actual[1] is None
     assert torch.equal(actual[2], ragged[2])
     assert torch.equal(actual[3], ragged[3])
+
+    mixed = np.empty(2, dtype=object)
+    mixed[:] = [
+        torch.arange(1, dtype=torch.float32),
+        torch.arange(1, dtype=torch.int64),
+    ]
+    with pytest.raises(ValueError, match="mixed tensor dtype"):
+        transfer.put_dataproto(SimpleDataProto(non_tensor_batch={"ragged": mixed}))
 
 
 def _assert_tensor_object_equal(actual, expected) -> None:
@@ -3067,6 +3162,7 @@ def test_dataproto_helper_nested_tensor_object_array_rows() -> None:
             {"images": [{"pixels": torch.arange(2)}], "meta": {"rank": 0}},
             {"images": [{"pixels": torch.arange(3)}, {"pixels": None}], "meta": {}},
             {"images": [], "meta": {"rank": None}},
+            {"images": [], "meta": None},
         ],
         dtype=object,
     )
