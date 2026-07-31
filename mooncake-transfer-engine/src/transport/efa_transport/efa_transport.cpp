@@ -633,46 +633,26 @@ int EfaTransport::allocateLocalSegmentID() {
 // via MC_MAX_CONCURRENT_REG_MR. Unset (0) means unbounded -- one thread per
 // buffer, which is what these entry points have always done.
 //
-// Do not turn this into a built-in default: the cap is per process, and its
-// effect depends on the order the caller passes buffers in -- something this
-// function cannot see and callers do not know matters.
+// The cap is PER PROCESS, and registration is CPU-bound page-pinning, so what
+// matters is cap x processes against the core count. Measured on p5.48xlarge
+// (192 cores) replaying Kimi-K3's KV registration as SGLang issues it -- one
+// TransferEngine per TP rank, 182 GPU buffers of 2.5 KB to 391 MB each, slowest
+// rank -- the optimum tracks the cores and not the cap:
 //
-// Measured on p5.48xlarge (32 NICs) replaying Kimi-K3's KV registration the way
-// SGLang issues it -- 8 processes (one TransferEngine per TP rank, so 8
-// libfabric domains), 182 GPU buffers of 2.5 KB to 391 MB per process,
-// barrier-synchronized. Slowest rank, since nothing serves until all 8 finish:
+//   8 ranks, 192 cores -> cap 16 (99.8 s);  cap 64 is 1.8x slower
+//   4 ranks, 192 cores -> cap 32 (89.2 s);  same 128 threads as above
+//   8 ranks,  64 cores -> cap  8 (121.3 s); 64 threads, tracks the budget
 //
-//   per-proc cap   size-descending   pool order (SGLang's)   size-ascending
-//   unset          108 / 99 / 128s   112s                    120s
-//   64             184 / 208s        101s                     60s
-//   16              95 /  98 /  97s   43s                     36 / 37s
-//    8             107s               --                       44s
-//    4             157s               --                       --
+// So a good value is roughly cores/processes. Oversubscribing costs more than
+// undersubscribing. This cannot be a built-in default because a single engine
+// does not know how many peer processes share the node; picking one from the
+// core count alone would oversubscribe by exactly the rank count.
 //
-// So the cap is worth 2.6x on the order SGLang actually uses (112s -> 43s), but
-// only 1.1x on size-descending, and the order alone swings the capped result by
-// 2.7x. Unbounded is order-insensitive (99-128s) because every buffer gets its
-// own thread and there is no queue to schedule; the ordering effect exists only
-// once tasks queue behind a cap. Counterintuitively, largest-first is the worst
-// order, backwards from longest-processing-time scheduling. Unexplained, so no
-// sort is applied here yet.
-//
-// An earlier single-process replay of the same shape (1456 buffers, one domain)
-// reported the opposite conclusion at 239s unbounded vs 1051s capped. That
-// topology does not exist in practice; disregard it.
-//
-// Host memory on the same p5 (fi_mr_reg rather than fi_mr_regattr), 128 x 2 GiB
-// of 4 KB-page memory, also prefers a cap: unbounded 274 s, cap 64 120 s,
-// cap 32 89.6 s, cap 16 59.1 s (best), cap 8 70.9 s, cap 4 257 s.
-//
-// A 2x p6-b300 run (16 NICs/rank, 138 GPU buffers per batch) put the optimum
-// much lower -- unbounded 138.7 s, cap 128 130.1 s, cap 32 51.0 s, cap 8 20.7 s
-// (best), cap 4 24.8 s -- but that was a full K3 server run, so both the NIC
-// count and the buffer order differ from the table above. Read it as "the
-// optimum is platform-specific", not as a second opinion on the same setup.
-//
-// Hence: keep the historical unbounded behavior and let an operator who has
-// measured their own platform and knows their own buffer order opt in.
+// Input order matters as much as the cap: at cap 16 the same batch takes 43 s
+// in SGLang's pool order but 95-98 s largest-first. Unbounded ignores order
+// (99-128 s) since nothing queues. Largest-first being worst is backwards from
+// longest-processing-time scheduling and is unexplained, so no sort is applied
+// here yet -- another reason the cap stays opt-in rather than a default.
 static size_t maxConcurrentRegMr() {
     size_t configured = globalConfig().max_concurrent_reg_mr;
     // 0 (unset) means unbounded, i.e. one thread per buffer as before.
@@ -689,9 +669,8 @@ static size_t maxConcurrentRegMr() {
 // 192-core node peaks at ~1400 runnable threads inside fi_mr_regattr, and the
 // per-buffer duration this logs inflates with the queueing delay of the ones
 // ahead of it -- on 2x p6-b300 the median reached 106 s while the whole batch
-// took 138 s. That inflation is not by itself a reason to cap: see
-// maxConcurrentRegMr() for a platform where capping made the same workload 4.4x
-// slower.
+// took 138 s. That inflation is not by itself a reason to cap: a badly chosen
+// cap is slower still, see maxConcurrentRegMr().
 //
 // A plain thread pool rather than a semaphore over std::async, because if a cap
 // is set the point is to avoid the thread *creation*, not just to gate entry
