@@ -246,10 +246,16 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
             task.transport_->getTransferStatus(batch_id, task_id, status);
         if (!ret.ok()) return ret;
 
-        // Apply timeout check on top of the transport's result.
+        // Apply timeout check on top of the transport result. Timeout is a
+        // terminal state for the legacy batch lifecycle; otherwise freeBatchID
+        // can stay BatchBusy forever after a timed-out slice.
         if (status.s == Transport::TransferStatusEnum::WAITING &&
             checkSliceTimeout(task)) {
             status.s = Transport::TransferStatusEnum::TIMEOUT;
+        }
+        if (status.s == Transport::TransferStatusEnum::TIMEOUT) {
+            task.is_finished = true;
+            batch_desc.has_failure.store(true, std::memory_order_release);
         }
         return Status::OK();
     }
@@ -269,6 +275,8 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     } else {
         if (checkSliceTimeout(task)) {
             status.s = Transport::TransferStatusEnum::TIMEOUT;
+            task.is_finished = true;
+            batch_desc.has_failure.store(true, std::memory_order_release);
         } else {
             status.s = Transport::TransferStatusEnum::WAITING;
         }
@@ -303,7 +311,8 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
         if (task_status.s == Transport::TransferStatusEnum::COMPLETED) {
             status.transferred_bytes += task_status.transferred_bytes;
             success_count++;
-        } else if (task_status.s == Transport::TransferStatusEnum::FAILED) {
+        } else if (task_status.s == Transport::TransferStatusEnum::FAILED ||
+                   task_status.s == Transport::TransferStatusEnum::TIMEOUT) {
             status.s = Transport::TransferStatusEnum::FAILED;
             return Status::OK();
         }

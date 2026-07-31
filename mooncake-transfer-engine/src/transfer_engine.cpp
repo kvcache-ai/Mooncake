@@ -1016,12 +1016,10 @@ Status TransferEngine::transferScatter(
     }
 
     bool abort_requested = false;
-    Status abort_status;
     auto request_abort = [&](const Status& status) {
         remember(status);
         if (abort_requested) return;
         abort_requested = true;
-        abort_status = status;
 #ifdef USE_TENT
         if (use_tent_) {
             for (size_t i = 0; i < requests.size(); ++i) {
@@ -1037,23 +1035,9 @@ Status TransferEngine::transferScatter(
     };
     Status result = submitTransfer(batch_id, requests);
     if (!result.ok()) {
-        // TENT submit failures occur before tasks are published.
-        if (use_tent_) {
-            fail_pending(result);
-            remember(freeBatchID(batch_id));
-            return segment_cache.close(aggregate_status);
-        }
-        request_abort(result);
-        auto free_status = freeBatchID(batch_id);
-        if (free_status.ok()) {
-            fail_pending(abort_status);
-            return segment_cache.close(aggregate_status);
-        }
-        if (!free_status.IsBatchBusy()) {
-            remember(free_status);
-            fail_pending(abort_status);
-            return segment_cache.close(aggregate_status);
-        }
+        fail_pending(result);
+        remember(freeBatchID(batch_id));
+        return segment_cache.close(aggregate_status);
     }
 
     constexpr auto poll_interval = std::chrono::microseconds(10);
@@ -1063,30 +1047,23 @@ Status TransferEngine::transferScatter(
             if (done[i]) continue;
             TransferStatus status;
             result = getTransferStatus(batch_id, i, status);
-            if (!result.ok()) {
-                request_abort(result);
-                continue;
-            }
-
             const auto [range_index, fragment_index] = request_fragments[i];
-            if (status.s == TransferStatusEnum::COMPLETED) {
-                complete(range_index, fragment_index,
-                         abort_requested ? abort_status : Status::OK());
+            Status fragment_status;
+            if (!result.ok()) {
+                fragment_status = result;
+            } else if (status.s == TransferStatusEnum::COMPLETED) {
+                fragment_status = Status::OK();
             } else if (status.s == TransferStatusEnum::WAITING ||
-                       status.s == TransferStatusEnum::PENDING ||
-                       (status.s == TransferStatusEnum::TIMEOUT &&
-                        !use_tent_)) {
-                if (status.s == TransferStatusEnum::TIMEOUT) {
-                    request_abort(Status::Socket("scatter transfer timed out"));
-                }
+                       status.s == TransferStatusEnum::PENDING) {
                 continue;
+            } else if (status.s == TransferStatusEnum::TIMEOUT) {
+                fragment_status = Status::Socket("scatter transfer timed out");
             } else {
-                complete(
-                    range_index, fragment_index,
-                    abort_requested
-                        ? abort_status
-                        : Status::Socket("scatter transfer fragment failed"));
+                fragment_status =
+                    Status::Socket("scatter transfer fragment failed");
             }
+            if (!fragment_status.ok()) request_abort(fragment_status);
+            complete(range_index, fragment_index, fragment_status);
             done[i] = true;
             --remaining;
         }
