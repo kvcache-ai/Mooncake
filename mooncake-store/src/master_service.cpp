@@ -3980,33 +3980,25 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::INVALID_VERSION);
     }
 
-    const bool replacing_existing =
-        metadata.HasReplica([&](const Replica& existing) {
-            if (!existing.is_local_disk_replica()) {
-                return false;
-            }
-            const auto descriptor =
-                existing.get_descriptor().get_local_disk_descriptor();
-            return !incoming.GetLocalDiskSegmentId().empty()
-                       ? descriptor.GetLocalDiskSegmentId() ==
-                             incoming.GetLocalDiskSegmentId()
-                       : descriptor.client_id == client_id;
-        });
+    const auto matches_incoming = [&](const Replica& existing) {
+        if (!existing.is_local_disk_replica()) {
+            return false;
+        }
+        const auto descriptor =
+            existing.get_descriptor().get_local_disk_descriptor();
+        return descriptor.client_id == client_id ||
+               (!incoming.GetLocalDiskSegmentId().empty() &&
+                descriptor.GetLocalDiskSegmentId() ==
+                    incoming.GetLocalDiskSegmentId());
+    };
+    const bool has_existing_local_disk =
+        metadata.HasReplica(&Replica::fn_is_local_disk_replica);
 
     if (enable_oplog_ && ordered_oplog_writer_) {
         std::vector<Replica::Descriptor> post;
         for (const auto& existing : metadata.GetAllReplicas()) {
             if (existing.status() != ReplicaStatus::COMPLETE) continue;
-            if (replacing_existing &&
-                existing.type() == ReplicaType::LOCAL_DISK &&
-                (!incoming.GetLocalDiskSegmentId().empty()
-                     ? existing.get_descriptor()
-                               .get_local_disk_descriptor()
-                               .GetLocalDiskSegmentId() ==
-                           incoming.GetLocalDiskSegmentId()
-                     : existing.get_descriptor()
-                               .get_local_disk_descriptor()
-                               .client_id == client_id)) {
+            if (has_existing_local_disk && matches_incoming(existing)) {
                 // Substitute with the updated descriptor.
                 Replica::Descriptor updated = existing.get_descriptor();
                 updated.get_local_disk_descriptor().transport_endpoint =
@@ -4026,7 +4018,7 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
                 post.push_back(existing.get_descriptor());
             }
         }
-        if (!replacing_existing) {
+        if (!has_existing_local_disk) {
             // The new LOCAL_DISK replica is COMPLETE upon AddReplica.
             post.push_back(replica.get_descriptor());
         }
@@ -4039,7 +4031,7 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
         }
     }
 
-    if (!replacing_existing) {
+    if (!has_existing_local_disk) {
         std::vector<Replica> replicas;
         replicas.emplace_back(std::move(replica));
         metadata.AddReplicas(std::move(replicas));
@@ -4050,18 +4042,7 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
     }
 
     metadata.VisitReplicas(
-        [&incoming, client_id](const Replica& rep) {
-            if (!rep.is_local_disk_replica()) {
-                return false;
-            }
-            const auto descriptor =
-                rep.get_descriptor().get_local_disk_descriptor();
-            return !incoming.GetLocalDiskSegmentId().empty()
-                       ? descriptor.GetLocalDiskSegmentId() ==
-                             incoming.GetLocalDiskSegmentId()
-                       : descriptor.client_id == client_id;
-        },
-        [&replica](Replica& rep) {
+        matches_incoming, [&replica](Replica& rep) {
             const auto descriptor =
                 replica.get_descriptor().get_local_disk_descriptor();
             rep.update_local_disk_location(
