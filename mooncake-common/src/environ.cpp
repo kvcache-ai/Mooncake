@@ -192,6 +192,8 @@ Environ::Environ(const EnvironSource& source) {
     path_roundrobin_ = ReadBool(source, "MC_PATH_ROUNDROBIN", false);
     with_nvidia_peermem_ = ReadBool(source, "WITH_NVIDIA_PEERMEM", true);
     efa_cq_threads_ = ReadInt(source, "MC_EFA_CQ_THREADS", 1);
+    store_checksum_enabled_ =
+        ReadBool(source, "MOONCAKE_STORE_CHECKSUM", false);
 
     // AWS / S3 client configuration (consumed by s3_helper.cpp)
     aws_region_ = ReadString(source, "MOONCAKE_AWS_REGION", "");

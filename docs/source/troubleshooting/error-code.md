@@ -49,6 +49,7 @@ Mooncake Store may generate various types of errors during execution. For most A
 |                          | OBJECT_HAS_LEASE (-706)        | Object has lease                                                                                          |
 |                          | LEASE_EXPIRED (-707)           | Lease expired before data transfer completed                                                              |
 | Transfer                 | TRANSFER_FAIL (-800)           | Transfer operation failed                                                                                 |
+| Checksum                 | CHECKSUM_MISMATCH (-801)       | Retrieved object data does not match its stored checksum                                                  |
 | RPC                      | RPC_FAIL (-900)                | RPC operation failed                                                                                      |
 | High Availability        | ETCD_OPERATION_ERROR (-1000)   | etcd operation failed                                                                                     |
 |                          | ETCD_KEY_NOT_EXIST (-1001)     | Key not found in etcd                                                                                    |

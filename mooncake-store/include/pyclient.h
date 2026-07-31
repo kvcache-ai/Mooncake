@@ -408,7 +408,8 @@ inline CachedQueryResultResponse to_cached_query_result_response(
     return CachedQueryResultResponse(GetReplicaListResponse(
         std::vector<Replica::Descriptor>(query_result->replicas.begin(),
                                          query_result->replicas.end()),
-        remaining_lease_ttl_ms(*query_result, now)));
+        remaining_lease_ttl_ms(*query_result, now),
+        query_result->object_checksum));
 }
 
 inline tl::expected<QueryResult, ErrorCode> from_cached_query_result_response(
@@ -420,7 +421,8 @@ inline tl::expected<QueryResult, ErrorCode> from_cached_query_result_response(
     return QueryResult(
         std::vector<Replica::Descriptor>(cached_result.value.replicas.begin(),
                                          cached_result.value.replicas.end()),
-        now + std::chrono::milliseconds(cached_result.value.lease_ttl_ms));
+        now + std::chrono::milliseconds(cached_result.value.lease_ttl_ms),
+        cached_result.value.object_checksum);
 }
 
 inline PyClient::QueryResultCache build_query_result_cache_from_cached_results(

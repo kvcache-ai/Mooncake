@@ -1020,7 +1020,7 @@ int64_t DummyClient::get_into(const std::string& key, void* buffer,
     const auto start_time = std::chrono::steady_clock::now();
     auto result = invoke_rpc<&RealClient::get_into_range_shm_helper,
                              tl::expected<int64_t, ErrorCode>>(
-        key, buf_addr, 0, 0, size, client_id_);
+        key, buf_addr, 0, 0, size, true, true, client_id_);
     if (!result) {
         return static_cast<int64_t>(toInt(result.error()));
     }
@@ -1086,15 +1086,8 @@ std::vector<tl::expected<QueryResult, ErrorCode>> DummyClient::batch_query(
     results.reserve(keys.size());
     const auto now = std::chrono::steady_clock::now();
     for (const auto& cached_result : *cached_results) {
-        if (!cached_result.success) {
-            results.emplace_back(tl::unexpected(cached_result.error));
-            continue;
-        }
-        results.emplace_back(QueryResult(
-            std::vector<Replica::Descriptor>(
-                cached_result.value.replicas.begin(),
-                cached_result.value.replicas.end()),
-            now + std::chrono::milliseconds(cached_result.value.lease_ttl_ms)));
+        results.emplace_back(
+            from_cached_query_result_response(cached_result, now));
     }
     return results;
 }

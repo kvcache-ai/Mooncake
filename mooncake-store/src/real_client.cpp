@@ -341,8 +341,11 @@ using mooncake::SelectBestReplica;
 // Client::Get / Client::BatchGet (which internally call
 // FindFirstCompleteReplica) cannot pick a different replica type.
 inline QueryResult FilterQueryResult(const QueryResult &qr,
-                                     const Replica::Descriptor &replica) {
-    return QueryResult({replica}, qr.lease_timeout);
+                                     const Replica::Descriptor &replica,
+                                     bool include_object_checksum = true) {
+    return QueryResult(
+        {replica}, qr.lease_timeout,
+        include_object_checksum ? qr.object_checksum : std::nullopt);
 }
 }  // namespace
 
@@ -2755,6 +2758,14 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
                        << "': " << toString(read_result.error());
             return nullptr;
         }
+        auto checksum_result =
+            client_->VerifyObjectChecksum(key, objects.at(key), total_length,
+                                          query_result.value().object_checksum);
+        if (!checksum_result) {
+            LOG(ERROR) << "SSD checksum verification failed for key '" << key
+                       << "': " << toString(checksum_result.error());
+            return nullptr;
+        }
         return buffer_handle;
     }
 
@@ -3196,6 +3207,16 @@ RealClient::batch_get_buffer_internal(
                 if (idx_it == disk_key_to_idx.end()) continue;
                 auto &op = disk_ops[idx_it->second];
                 if (read_result) {
+                    auto checksum_result = client_->VerifyObjectChecksum(
+                        key, slices, op.total_size,
+                        op.query_result.object_checksum);
+                    if (!checksum_result) {
+                        LOG(ERROR)
+                            << "SSD checksum verification failed for key '"
+                            << key
+                            << "': " << toString(checksum_result.error());
+                        continue;
+                    }
                     final_results[op.original_index] =
                         std::make_shared<BufferHandle>(
                             std::move(*op.buffer_handle));
@@ -3316,7 +3337,7 @@ RealClient::resolve_ranged_read_metadata(const std::string &key) {
 tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
     const std::string &key, void *buffer, size_t dst_offset, size_t src_offset,
     size_t size, const RangedReadMetadata &metadata,
-    bool size_is_buffer_capacity) {
+    bool size_is_buffer_capacity, bool verify_checksum) {
     const auto &query_result = metadata.query_result;
     const auto &replica = metadata.replica;
     const uint64_t total_size = metadata.total_size;
@@ -3348,6 +3369,14 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             auto result =
                 batch_get_into_offload_object_internal(endpoint, objects);
             if (!result) return tl::unexpected(result.error());
+            if (verify_checksum) {
+                auto checksum_result = client_->VerifyObjectChecksum(
+                    key, objects.at(key), total_size,
+                    query_result.object_checksum);
+                if (!checksum_result) {
+                    return tl::unexpected(checksum_result.error());
+                }
+            }
             return static_cast<int64_t>(total_size);
         }
 
@@ -3363,7 +3392,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             BufferHandle tmp_handle(std::move(*alloc_result));
             std::vector<mooncake::Slice> tmp_slices;
             allocateSlices(tmp_slices, replica, tmp_handle.ptr());
-            auto filtered_qr = FilterQueryResult(query_result, replica);
+            auto filtered_qr =
+                FilterQueryResult(query_result, replica, verify_checksum);
             auto get_result = client_->Get(key, filtered_qr, tmp_slices);
             if (!get_result) {
                 LOG(ERROR) << "DISK Get failed for key: " << key
@@ -3398,7 +3428,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             std::vector<mooncake::Slice> tmp_slices;
             allocateSlices(tmp_slices, replica, tmp_handle.ptr());
 
-            auto filtered_qr = FilterQueryResult(query_result, replica);
+            auto filtered_qr =
+                FilterQueryResult(query_result, replica, verify_checksum);
             auto get_result = client_->Get(key, filtered_qr, tmp_slices);
             if (!get_result) {
                 LOG(ERROR) << "Get failed for key: " << key
@@ -3417,7 +3448,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         std::vector<mooncake::Slice> slices;
         allocateSlices(slices, replica, dst);
 
-        auto filtered_qr = FilterQueryResult(query_result, replica);
+        auto filtered_qr =
+            FilterQueryResult(query_result, replica, verify_checksum);
         auto get_result = client_->Get(key, filtered_qr, slices);
         if (!get_result) {
             LOG(ERROR) << "Get failed for key: " << key
@@ -3481,7 +3513,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             [&](void *tmp_buf) -> tl::expected<void, ErrorCode> {
                 std::vector<mooncake::Slice> tmp_slices;
                 allocateSlices(tmp_slices, replica, tmp_buf);
-                auto filtered_qr = FilterQueryResult(query_result, replica);
+                auto filtered_qr =
+                    FilterQueryResult(query_result, replica, false);
                 auto get_result = client_->Get(key, filtered_qr, tmp_slices);
                 if (!get_result) {
                     LOG(ERROR)
@@ -3542,7 +3575,7 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
 
 tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
     const std::string &key, void *buffer, size_t dst_offset, size_t src_offset,
-    size_t size, bool size_is_buffer_capacity) {
+    size_t size, bool size_is_buffer_capacity, bool verify_checksum) {
     auto metadata_result = resolve_ranged_read_metadata(key);
     if (!metadata_result) {
         if ((metadata_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
@@ -3554,15 +3587,15 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
     }
 
     return execute_ranged_read(key, buffer, dst_offset, src_offset, size,
-                               metadata_result.value(),
-                               size_is_buffer_capacity);
+                               metadata_result.value(), size_is_buffer_capacity,
+                               verify_checksum);
 }
 
 int64_t RealClient::get_into(const std::string &key, void *buffer,
                              size_t size) {
     auto result = execute_timed_operation<tl::expected<int64_t, ErrorCode>>(
         [&]() {
-            return get_into_range_internal(key, buffer, 0, 0, size, true);
+            return get_into_range_internal(key, buffer, 0, 0, size, true, true);
         },
         [](const auto &ret) { return ret.has_value(); },
         [&](uint64_t latency_us, const auto &ret) {
@@ -3712,7 +3745,7 @@ RealClient::get_into_ranges_internal(
                 prepared.results[i][j][k] = execute_ranged_read(
                     all_keys[i][j], buffers[i], all_dst_offsets[i][j][k],
                     all_src_offsets[i][j][k], all_sizes[i][j][k],
-                    metadata_result.value());
+                    metadata_result.value(), false, false);
             }
         }
     }
@@ -4522,7 +4555,8 @@ RealClient::batch_get_into_multi_buffers_dummy_helper(
 
 tl::expected<int64_t, ErrorCode> RealClient::get_into_range_shm_helper(
     const std::string &key, uint64_t dummy_buffer, size_t dst_offset,
-    size_t src_offset, size_t size, const UUID &client_id) {
+    size_t src_offset, size_t size, bool size_is_buffer_capacity,
+    bool verify_checksum, const UUID &client_id) {
     std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
@@ -4541,7 +4575,8 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_shm_helper(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    return get_into_range_internal(key, real_buffer, 0, src_offset, size);
+    return get_into_range_internal(key, real_buffer, 0, src_offset, size,
+                                   size_is_buffer_capacity, verify_checksum);
 }
 
 std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
@@ -4892,6 +4927,18 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                 results[valid_local_disk_operations.at(offload_object_it.first)
                             .original_index] =
                     tl::make_unexpected(batch_get_offload_result.error());
+            }
+            continue;
+        }
+        for (const auto &offload_object_it : offload_objects_it.second) {
+            const auto &op =
+                valid_local_disk_operations.at(offload_object_it.first);
+            auto checksum_result = client_->VerifyObjectChecksum(
+                offload_object_it.first, offload_object_it.second,
+                op.total_size, op.query_result.object_checksum);
+            if (!checksum_result) {
+                results[op.original_index] =
+                    tl::make_unexpected(checksum_result.error());
             }
         }
     }
@@ -5307,6 +5354,19 @@ RealClient::batch_get_into_multi_buffers_internal(
                                    << "': " << toString(read_result.error());
                         results[disk_it->second.original_index] =
                             tl::make_unexpected(read_result.error());
+                    }
+                    continue;
+                }
+                for (auto &[key, slices] : objects) {
+                    auto disk_it = valid_local_disk_ops.find(key);
+                    if (disk_it == valid_local_disk_ops.end()) continue;
+                    auto &op = disk_it->second;
+                    auto checksum_result = client_->VerifyObjectChecksum(
+                        key, slices, op.total_size,
+                        op.query_result.object_checksum);
+                    if (!checksum_result) {
+                        results[op.original_index] =
+                            tl::make_unexpected(checksum_result.error());
                     }
                 }
             }

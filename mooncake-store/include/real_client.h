@@ -458,7 +458,8 @@ class RealClient : public PyClient {
 
     tl::expected<int64_t, ErrorCode> get_into_range_shm_helper(
         const std::string &key, uint64_t buffer, size_t dst_offset,
-        size_t src_offset, size_t size, const UUID &client_id);
+        size_t src_offset, size_t size, bool size_is_buffer_capacity,
+        bool verify_checksum, const UUID &client_id);
 
     std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
     get_into_ranges_shm_helper(
@@ -556,11 +557,12 @@ class RealClient : public PyClient {
     tl::expected<int64_t, ErrorCode> execute_ranged_read(
         const std::string &key, void *buffer, size_t dst_offset,
         size_t src_offset, size_t size, const RangedReadMetadata &metadata,
-        bool size_is_buffer_capacity = false);
+        bool size_is_buffer_capacity, bool verify_checksum);
 
     tl::expected<int64_t, ErrorCode> get_into_range_internal(
         const std::string &key, void *buffer, size_t dst_offset,
-        size_t src_offset, size_t size, bool size_is_buffer_capacity = false);
+        size_t src_offset, size_t size, bool size_is_buffer_capacity,
+        bool verify_checksum);
 
     std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
     get_into_ranges_internal(

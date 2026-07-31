@@ -61,6 +61,7 @@ class Environ {
     bool GetPathRoundrobin() const { return path_roundrobin_; }
     bool GetWithNvidiaPeermem() const { return with_nvidia_peermem_; }
     int GetEfaCqThreads() const { return efa_cq_threads_; }
+    bool GetStoreChecksumEnabled() const { return store_checksum_enabled_; }
 
     // AWS / S3 client configuration
     std::string GetAwsRegion() const { return aws_region_; }
@@ -140,6 +141,7 @@ class Environ {
     bool path_roundrobin_;
     bool with_nvidia_peermem_;
     int efa_cq_threads_;
+    bool store_checksum_enabled_;
     uint32_t rpc_client_io_threads_;
     uint32_t store_rpc_client_io_threads_;
     uint32_t transfer_engine_rpc_client_io_threads_;
