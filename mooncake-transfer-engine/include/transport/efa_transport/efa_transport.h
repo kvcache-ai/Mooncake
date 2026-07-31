@@ -70,6 +70,12 @@ class EfaTransport : public Transport {
     int unregisterLocalMemoryBatch(
         const std::vector<void*>& addr_list) override;
 
+    // Indices into `buffer_list` ordered by ascending length -- the order
+    // registerLocalMemoryBatch() hands the batch to its workers. Exposed for
+    // testing; see the definition for why ascending is optimal.
+    static std::vector<size_t> registrationOrder(
+        const std::vector<BufferEntry>& buffer_list);
+
     // Eagerly populate the address vector with every (local_ctx, peer_nic)
     // handshake for `segment_name`.
     //

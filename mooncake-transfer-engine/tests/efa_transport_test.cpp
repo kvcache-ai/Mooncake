@@ -17,8 +17,10 @@
 #include <gtest/gtest.h>
 #include <sys/time.h>
 
+#include <algorithm>
 #include <cstdlib>
 #include <memory>
+#include <vector>
 
 #include "transfer_engine.h"
 #include "transport/efa_transport/efa_transport.h"
@@ -403,6 +405,48 @@ TEST_F(EFATransportTest, RegisterMemoryBatch) {
     EXPECT_EQ(rc, 0) << "unregisterLocalMemoryBatch should succeed";
 
     for (void *a : addrs) freeMemoryPool(a, kBufSize);
+}
+
+// Batch registration hands buffers to its workers smallest-first, because an
+// EFA registration costs in proportion to the bytes already registered on the
+// domain. Pure index permutation, so no hardware needed.
+TEST(EFARegistrationOrderTest, AscendingBySize) {
+    using BufferEntry = Transport::BufferEntry;
+    auto lengths = [](const std::vector<BufferEntry> &bufs) {
+        std::vector<size_t> out;
+        for (size_t i : EfaTransport::registrationOrder(bufs))
+            out.push_back(bufs[i].length);
+        return out;
+    };
+
+    EXPECT_TRUE(EfaTransport::registrationOrder({}).empty());
+
+    // Descending input -- the worst case, and the one the sort exists for.
+    std::vector<BufferEntry> desc{{(void *)0x1000, 400 << 20},
+                                  {(void *)0x2000, 4 << 20},
+                                  {(void *)0x3000, 2048}};
+    EXPECT_EQ(lengths(desc),
+              (std::vector<size_t>{2048, 4 << 20, 400u << 20}));
+    // Every index appears exactly once: it is a permutation, not a filter.
+    auto perm = EfaTransport::registrationOrder(desc);
+    std::sort(perm.begin(), perm.end());
+    EXPECT_EQ(perm, (std::vector<size_t>{0, 1, 2}));
+
+    // Already ascending stays put.
+    std::vector<BufferEntry> asc{{(void *)0x1000, 1024},
+                                 {(void *)0x2000, 4096},
+                                 {(void *)0x3000, 8192}};
+    EXPECT_EQ(EfaTransport::registrationOrder(asc),
+              (std::vector<size_t>{0, 1, 2}));
+
+    // Equal lengths keep the caller's order, so dispatch stays a stable
+    // function of the input.
+    std::vector<BufferEntry> ties{{(void *)0x1000, 4096},
+                                  {(void *)0x2000, 4096},
+                                  {(void *)0x3000, 1024},
+                                  {(void *)0x4000, 4096}};
+    EXPECT_EQ(EfaTransport::registrationOrder(ties),
+              (std::vector<size_t>{2, 0, 1, 3}));
 }
 
 // Test 9: Larger transfer (64 MB total split into 1 MB slices) to exercise

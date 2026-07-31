@@ -703,12 +703,53 @@ static int runBoundedParallel(size_t count,
     return first_error.load();
 }
 
+// Smallest buffer first, because registering DEVICE memory on EFA costs roughly
+// k x (bytes of device memory already registered on this domain): measured at
+// ~260 ms/GiB on p5.48xlarge, flat from 0 to 19 GiB, and nearly independent of
+// the buffer's own size. The same 2.79 MB CUDA buffer takes 70 ms on an empty
+// domain but 2505 ms once 9.17 GiB is in.
+//
+// So a buffer's bytes are charged once per buffer registered after it, and the
+// total is minimized by registering the large ones last. Ascending is a
+// well-defined optimum, not a heuristic: registering the same 48 GPU buffers
+// (9.23 GiB) serially takes 35.5 s ascending against 93.3 s descending.
+//
+// Host memory does not accumulate -- the same sweep on mmap'd host buffers is
+// flat (a 391 MB buffer costs ~500-600 ms whether it is 1st or 48th) and order
+// makes no difference (14-16 s either way, ordering within run-to-run spread).
+// Sorting is therefore a no-op there rather than a regression, so it is applied
+// unconditionally instead of only for VRAM.
+//
+// Only matters when MC_MAX_CONCURRENT_REG_MR is set. Unbounded, every buffer
+// gets its own thread and nothing queues, so this order does not reach the
+// provider (measured 112 s vs 120 s, i.e. noise). With a cap it is worth 3.1x
+// on a descending batch.
+//
+// Ties keep the caller's relative order so the dispatch order stays a stable
+// function of the input.
+std::vector<size_t> EfaTransport::registrationOrder(
+    const std::vector<EfaTransport::BufferEntry>& buffer_list) {
+    std::vector<size_t> order(buffer_list.size());
+    for (size_t i = 0; i < order.size(); ++i) order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        return buffer_list[a].length < buffer_list[b].length;
+    });
+    return order;
+}
+
 int EfaTransport::registerLocalMemoryBatch(
     const std::vector<EfaTransport::BufferEntry>& buffer_list,
     const std::string& location) {
     auto start = std::chrono::steady_clock::now();
 
-    int first_error = runBoundedParallel(buffer_list.size(), [&](size_t i) {
+    // Dispatch order only, nothing observable changes. A buffer's NIC set is
+    // derived from its own length and the NIC count, so no buffer lands
+    // anywhere else; and segment_desc->buffers was already in whatever order
+    // the workers happened to finish in, since they append concurrently.
+    const std::vector<size_t> order = registrationOrder(buffer_list);
+
+    int first_error = runBoundedParallel(buffer_list.size(), [&](size_t k) {
+        const size_t i = order[k];
         int ret = registerLocalMemoryInternal(buffer_list[i].addr,
                                               buffer_list[i].length, location,
                                               true, false, true);
