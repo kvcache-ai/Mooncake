@@ -463,6 +463,14 @@ class RealClient : public PyClient {
     batch_get_into_cuda_ipc_dummy_helper(
         const std::vector<CudaIpcReadRequest> &requests, const UUID &client_id);
 
+    std::vector<tl::expected<void, ErrorCode>>
+    batch_upsert_from_multi_buffers_dummy_helper(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<uint64_t>> &dummy_all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const ReplicateConfig &config, int32_t device_id,
+        const UUID &client_id);
+
     std::vector<tl::expected<int64_t, ErrorCode>>
     batch_get_into_multi_buffers_dummy_helper(
         const std::vector<std::string> &keys,
