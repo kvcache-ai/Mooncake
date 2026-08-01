@@ -4,6 +4,7 @@
 #include "client_buffer.h"
 #include "storage_backend.h"
 #include "pinned_buffer_pool.h"
+#include "thread_pool.h"
 
 namespace mooncake {
 
@@ -174,6 +175,11 @@ class FileStorage {
     std::thread client_buffer_gc_thread_;
     std::future<void> rescan_future_;
     std::atomic<bool> metadata_resync_pending_{false};
+
+    // Optional thread pool for parallel bucket writes during offload.
+    // Created when MC_OFFLOAD_WRITE_THREADS > 1; when nullptr (default),
+    // buckets are written sequentially (original behavior).
+    std::unique_ptr<ThreadPool> offload_write_pool_;
 };
 
 }  // namespace mooncake
