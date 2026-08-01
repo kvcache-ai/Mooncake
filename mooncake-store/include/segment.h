@@ -440,6 +440,19 @@ class SegmentSerializer {
     SegmentManager* segment_manager_;
 };
 
+struct MemoryUsageSnapshot {
+    size_t used_bytes{0};
+    size_t capacity_bytes{0};
+
+    [[nodiscard]] double used_ratio() const noexcept {
+        if (capacity_bytes == 0) {
+            return 0.0;
+        }
+        return static_cast<double>(used_bytes) /
+               static_cast<double>(capacity_bytes);
+    }
+};
+
 class SegmentManager {
    public:
     /**
@@ -486,6 +499,14 @@ class SegmentManager {
     }
 
     SegmentView getView() const { return SegmentView(this); }
+
+    /**
+     * @brief Return current DRAM usage derived from mounted allocators.
+     *
+     * Shared allocators (for example the global CXL allocator) are counted
+     * once even when they are referenced by multiple mounted segments.
+     */
+    [[nodiscard]] MemoryUsageSnapshot GetMemoryUsageSnapshot() const;
 
     void initializeCxlAllocator(const std::string& cxl_path,
                                 const size_t cxl_size);

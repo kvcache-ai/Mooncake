@@ -163,6 +163,63 @@ TEST_F(SegmentTest, MountSegmentSuccess) {
     ValidateMountedSegment(segment_manager, segment, client_id);
 }
 
+TEST_F(SegmentTest, MemoryUsageSnapshotTracksMountedAllocatorState) {
+    SegmentManager segment_manager(BufferAllocatorType::OFFSET);
+    constexpr size_t kSegmentSize = 16 * 1024 * 1024;
+    constexpr size_t kAllocationSize = 4 * 1024 * 1024;
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "usage_snapshot_segment";
+    segment.size = kSegmentSize;
+    segment.base = 0x100000000;
+    UUID client_id = generate_uuid();
+
+    std::shared_ptr<BufferAllocatorBase> allocator;
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        ASSERT_EQ(segment_access.MountSegment(segment, client_id),
+                  ErrorCode::OK);
+        allocator = segment_access.GetAllocator(segment.id);
+    }
+    ASSERT_NE(allocator, nullptr);
+
+    auto buffer = allocator->allocate(kAllocationSize);
+    ASSERT_NE(buffer, nullptr);
+
+    auto snapshot = segment_manager.GetMemoryUsageSnapshot();
+    EXPECT_EQ(snapshot.used_bytes, kAllocationSize);
+    EXPECT_EQ(snapshot.capacity_bytes, kSegmentSize);
+    EXPECT_DOUBLE_EQ(snapshot.used_ratio(), 0.25);
+
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        ASSERT_EQ(segment_access.SetSegmentStatusByName(
+                      segment.name, SegmentStatus::DRAINING),
+                  ErrorCode::OK);
+    }
+    snapshot = segment_manager.GetMemoryUsageSnapshot();
+    EXPECT_EQ(snapshot.used_bytes, kAllocationSize);
+    EXPECT_EQ(snapshot.capacity_bytes, kSegmentSize);
+
+    buffer.reset();
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        size_t metrics_dec_capacity = 0;
+        ASSERT_EQ(segment_access.PrepareUnmountSegment(
+                      segment.id, metrics_dec_capacity),
+                  ErrorCode::OK);
+        ASSERT_EQ(segment_access.CommitUnmountSegment(
+                      segment.id, client_id, metrics_dec_capacity),
+                  ErrorCode::OK);
+    }
+
+    snapshot = segment_manager.GetMemoryUsageSnapshot();
+    EXPECT_EQ(snapshot.used_bytes, 0u);
+    EXPECT_EQ(snapshot.capacity_bytes, 0u);
+    EXPECT_DOUBLE_EQ(snapshot.used_ratio(), 0.0);
+}
+
 // MountSegmentDuplicate Tests:
 // 1. MountSegment with the same segment id. The second mount operation return
 // SEGMENT_ALREADY_EXISTS.

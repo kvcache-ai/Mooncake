@@ -109,6 +109,29 @@ std::vector<std::string> ScopedAllocatorAccess::GetHostOrderedSegments(
     return BuildHostOrderedSegments(*segments_by_host_, writer_host_id, key);
 }
 
+MemoryUsageSnapshot SegmentManager::GetMemoryUsageSnapshot() const {
+    std::shared_lock<std::shared_mutex> lock(segment_mutex_);
+    MemoryUsageSnapshot snapshot;
+    bool counted_cxl_allocator = false;
+
+    for (const auto& [segment_id, mounted_segment] : mounted_segments_) {
+        (void)segment_id;
+        const auto& allocator = mounted_segment.buf_allocator;
+        if (!allocator) {
+            continue;
+        }
+        if (allocator == cxl_global_allocator_) {
+            if (counted_cxl_allocator) {
+                continue;
+            }
+            counted_cxl_allocator = true;
+        }
+        snapshot.used_bytes += allocator->size();
+        snapshot.capacity_bytes += allocator->capacity();
+    }
+    return snapshot;
+}
+
 ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
                                             const UUID& client_id) {
     const uintptr_t buffer = segment.base;
