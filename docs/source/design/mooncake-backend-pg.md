@@ -82,7 +82,11 @@ By default, Mooncake Backend initializes its own Transfer Engine. Advanced
 integrations may call `pg.set_transfer_engine(engine)` before
 `init_process_group()` to inject an external Transfer Engine. In that mode, the
 caller owns the engine and must keep it alive until all Mooncake process groups
-using it are destroyed.
+using it are destroyed. The injected, initialized engine's local endpoint also
+supplies the default control-plane host identity, so integrations do not need
+to configure `pg.set_host_ip()` separately. `set_host_ip()` remains an explicit
+override for PG-owned engines and specialized deployments when called after
+the engine is injected.
 
 ## Initialization lifecycle
 

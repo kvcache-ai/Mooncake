@@ -1,4 +1,5 @@
 #include <mooncake_backend.h>
+#include <common.h>
 #include <pybind11/gil.h>
 #include <pybind11/stl.h>
 #include <torch/csrc/utils/pybind.h>
@@ -241,6 +242,12 @@ void setTransferEnginePy(pybind11::object engine_obj) {
     g_ctx.external_engine = reinterpret_cast<TransferEngine*>(ptr);
     g_ctx.engine = g_ctx.external_engine;
     g_ctx.engine_initialized = true;
+    const auto endpoint = g_ctx.engine->getLocalIpAndPort();
+    const auto host_ip = getHostNameWithoutPort(endpoint);
+    TORCH_CHECK(!host_ip.empty(),
+                "set_transfer_engine requires an initialized TransferEngine "
+                "with a local endpoint");
+    g_ctx.host_ip = host_ip;
 }
 
 void shutdownProcessContext() {
@@ -283,7 +290,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("set_transfer_engine", &setTransferEnginePy, py::arg("engine"),
           "Set an external TransferEngine to be used by MooncakeBackend. "
           "Must be called before init_process_group(). The engine must already "
-          "be initialized. Pass None to reset to default behavior. "
+          "be initialized. Its local endpoint supplies the default PG "
+          "control-plane host; set_host_ip() called afterward overrides it. "
+          "Pass None to reset to default engine behavior. "
           "The caller must ensure the TransferEngine object outlives all "
           "MooncakeBackend instances.");
     m.def("get_preferred_hca", &getPreferredHca);
