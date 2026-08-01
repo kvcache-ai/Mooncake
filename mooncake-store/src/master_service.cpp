@@ -7018,7 +7018,7 @@ MasterService::PromotionQueueResult MasterService::TryPushPromotionQueue(
     // pressure. The check is best-effort (state can change between this
     // sample and the actual allocation in PromotionAllocStart).
     const double used_ratio =
-        MasterMetricManager::instance().get_global_mem_used_ratio();
+        segment_manager_.GetMemoryUsageSnapshot().used_ratio();
     if (used_ratio >= eviction_high_watermark_ratio_) {
         MasterMetricManager::instance().inc_promotion_rejected_watermark();
         if (record_candidate) {
@@ -7498,7 +7498,7 @@ void MasterService::EvictionThreadFunc() {
     while (eviction_running_) {
         const auto now = std::chrono::system_clock::now();
         double used_ratio =
-            MasterMetricManager::instance().get_global_mem_used_ratio();
+            segment_manager_.GetMemoryUsageSnapshot().used_ratio();
         if (used_ratio > eviction_high_watermark_ratio_ ||
             (need_mem_eviction_ && eviction_ratio_ > 0.0)) {
             LOG(INFO) << "[EVICT-TRIGGER] memory_ratio=" << used_ratio
