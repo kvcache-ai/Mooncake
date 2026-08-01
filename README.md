@@ -230,7 +230,7 @@ Mooncake ships a set of **built-in skills** under [`.claude/skills`](.claude/ski
 | Skill | Description |
 |-------|-------------|
 | `/mooncake-troubleshoot` | Diagnose Mooncake deployment and runtime issues (services, RDMA, env vars, logs). |
-| `/mooncake-ci-local` | Run pre-PR local validation via `scripts/run_ci_test.sh`. |
+| `/mooncake-ci-local` | Select and run relevant pre-PR checks using existing repository commands. |
 | `/mooncake-api` | Work with the Mooncake Store, Transfer Engine, and EP/Backend Python APIs. |
 
 Install them without cloning the repository via the [Claude Code plugin marketplace](https://code.claude.com/docs/en/plugin-marketplaces):

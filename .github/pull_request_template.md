@@ -33,7 +33,7 @@
 
 **Test commands:**
 ```bash
-# Example: bash scripts/run_ci_test.sh
+# Example: pre-commit run --from-ref origin/main --to-ref HEAD
 ```
 
 **Test results:**

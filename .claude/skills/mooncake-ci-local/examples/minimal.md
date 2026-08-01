@@ -8,23 +8,21 @@ User prompt:
 
 Expected action:
 
-```bash
-bash scripts/run_ci_test.sh
+```console
+git diff --name-only origin/main...HEAD
+pre-commit run --from-ref origin/main --to-ref HEAD
 ```
 
-Force a full rerun even if `paths-filter` would skip downstream stages:
+If the branch contains C or C++ changes, also run:
 
-```bash
-bash scripts/run_ci_test.sh --skip-path-filter
+```console
+./scripts/code_format.sh --changed-lines --check --base origin/main
 ```
-
-Result location:
-
-- `local_test/run-ci-logs/<timestamp>/`
 
 Typical report format:
 
-- passed stages
-- failed or blocked stages
-- unsupported stages
-- first actionable failure and its log path
+- changed areas
+- checks that passed
+- checks that failed or were blocked
+- checks not run because the local platform does not support them
+- the first actionable failure, if any

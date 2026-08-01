@@ -1,159 +1,102 @@
 ---
 name: mooncake-ci-local
-description: Run Mooncake pre-PR local validation through scripts/run_ci_test.sh. Use this skill whenever the user wants to validate a branch before opening or submitting a PR, run local CI, run ci test, check changes before PR, reproduce GitHub Actions locally, or force a full pre-submit verification. Trigger on phrases like "提交 PR 前验证", "run ci test", "run local CI", "check my branch", "test before PR", "pre-submit validation", and "reproduce CI locally".
+description: Run Mooncake pre-PR validation with existing repository commands. Use this skill whenever the user wants to validate a branch before opening or submitting a PR, run local CI, run CI tests, check changes before a PR, or reproduce a GitHub Actions failure. Trigger on phrases like "提交 PR 前验证", "run ci test", "run local CI", "check my branch", "test before PR", "pre-submit validation", and "reproduce CI locally".
 ---
 
 # Mooncake Pre-PR Local Validation
 
-Use `bash scripts/run_ci_test.sh` as the default entry point. This is the single local lane for PR-before-submit validation, and it already coordinates the reproducible parts of GitHub Actions.
+GitHub Actions is the authoritative full validation environment. There is no
+single local command that reproduces every job, so select checks based on the
+changed files and the available platform. Always report checks that could not
+run locally.
 
-## Default Entry Point
+## Default Workflow
 
-When the user asks for any of the following, run the repo script first instead of reconstructing the workflow by hand:
+1. Inspect the branch diff against `origin/main`:
 
-- 提交 PR 前本地验证
-- run ci test
-- run local CI
-- check my branch before PR
-- reproduce CI locally
-
-Default command:
-
-```bash
-bash scripts/run_ci_test.sh
+```console
+git diff --stat origin/main...HEAD
+git diff --name-only origin/main...HEAD
 ```
 
-What this script already covers:
+2. Run pre-commit on the committed branch diff:
 
-- GitHub-like `paths-filter` against `origin/main`
-- `typos`
-- `scripts/code_format.sh --check`
-- default CMake configure/build/install in `build-ci-local`
-- `ctest`
-- wheel build in `build-wheel-local`
-- wheel installation validation
-- `scripts/run_tests.sh`
-- selected Python API and integration tests
-- per-stage summary and logs under `local_test/run-ci-logs/<timestamp>/`
-
-## Standard Agent Workflow
-
-1. Run `bash scripts/run_ci_test.sh` from the repo root unless the user explicitly asks for a narrower subset.
-2. Read the stage summary instead of dumping raw terminal output.
-3. Report these items back to the user:
-   - passed stages
-   - failed stages
-   - blocked stages
-   - unsupported stages
-   - whether `paths-filter` skipped downstream stages
-   - the log directory under `local_test/run-ci-logs/...`
-4. If there is a failure, inspect the corresponding stage log and summarize the root cause.
-
-## Common Options
-
-Force a full lane even if `paths-filter` would skip downstream stages:
-
-```bash
-bash scripts/run_ci_test.sh --skip-path-filter
+```console
+pre-commit run --from-ref origin/main --to-ref HEAD
 ```
 
-Use another base ref:
+For uncommitted changes, pass the changed paths explicitly instead:
 
-```bash
-bash scripts/run_ci_test.sh --base origin/main
+```console
+pre-commit run --files <changed-file> [<changed-file> ...]
 ```
 
-Auto-install missing dependencies:
+3. If C or C++ files changed, check only the lines changed from the base branch:
 
-```bash
-bash scripts/run_ci_test.sh --install-deps
+```console
+./scripts/code_format.sh --changed-lines --check --base origin/main
 ```
 
-Keep services running for follow-up debugging:
+4. Run the relevant build or test lane below. Do not claim full local coverage
+when hardware, services, or a Linux environment are unavailable.
 
-```bash
-bash scripts/run_ci_test.sh --keep-services
+## C++ Tests
+
+If the appropriate build directory is already configured, build and run its
+tests directly:
+
+```console
+cmake --build build
+ctest --test-dir build -j --output-on-failure
 ```
 
-## Minimal Example
+Use `ctest -R <pattern>` for a targeted rerun. Match the CMake flags in
+`.github/workflows/ci.yml` when reproducing a specific CI job.
 
-User prompt:
+## TENT Tests
 
-- 提交 PR 前，帮我跑一遍本地 CI 验证当前分支。
+The CPU-only TENT lane used by CI can be reproduced on Linux:
 
-Expected action:
-
-```bash
-bash scripts/run_ci_test.sh
+```console
+cmake -S . -B build-tent -G Ninja \
+  -DUSE_TENT=ON -DUSE_HTTP=ON \
+  -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON
+cmake --build build-tent
+ctest --test-dir build-tent/mooncake-transfer-engine/tent/tests \
+  -j --output-on-failure
 ```
 
-If the user wants to ignore changed-path optimization and force the full lane:
+## Python Wheel Tests
 
-```bash
-bash scripts/run_ci_test.sh --skip-path-filter
-```
+After building and installing the wheel in a Linux test environment and
+starting the required metadata service, run:
 
-See also `.claude/skills/mooncake-ci-local/examples/minimal.md`.
-
-## How To Interpret Results
-
-- `passed`: the stage succeeded locally.
-- `failed`: the stage reproduced a real local failure and needs investigation.
-- `blocked`: local environment or dependency issue prevented execution.
-- `unsupported`: intentionally not run in the local lane because it needs external platforms, special hardware, or a non-default build.
-
-If `paths-filter` skips downstream stages, explain that the current branch changed only non-source paths relative to the selected base.
-
-## Current Local Coverage
-
-Included by default:
-
-- spell check
-- code format check
-- default ASan CMake lane in `build-ci-local`
-- `ctest`
-- wheel build and installation test
-- `scripts/run_tests.sh`
-- selected Python API tests
-
-Unsupported by design in the default local lane:
-
-- Ascend jobs
-- T-one integration jobs
-- MUSA jobs
-- Docker image build jobs
-- CUDA 13 wheel jobs
-- PG-backend tests absent from the default wheel build
-- Python drain-http API stage in the local ASan lane
-
-## Targeted Reruns For Debugging
-
-Use targeted reruns only after the full script identifies a failing area, or when the user explicitly asks for a smaller scope.
-
-Rerun a specific C++ test pattern:
-
-```bash
-cd build-ci-local
-MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 ctest -R <pattern> --output-on-failure
-```
-
-Rerun the Python wheel integration lane:
-
-```bash
+```console
 source test_env/bin/activate
 MC_STORE_MEMCPY=false TEST_SSD_OFFLOAD_IN_EVICT=true ./scripts/run_tests.sh
 ```
 
-Rerun the safetensor unittest:
+The wheel and integration jobs install additional dependencies and services.
+Use the corresponding steps in `.github/workflows/ci.yml` when reproducing a
+failure instead of assuming they are already present.
 
-```bash
-source test_env/bin/activate
-python -m unittest mooncake-wheel.tests.test_safetensor_functions
-```
+## Platform Limits
 
-## Notes For The Agent
+- Native macOS is suitable for lightweight pre-commit and documentation checks.
+- Run C++ builds, wheel tests, and service-based integration tests in a Linux
+  container or VM when working from macOS.
+- Ascend, MUSA, EFA, CUDA, and other hardware-specific jobs require their
+  matching CI runner or hardware.
 
-- Prefer the repo script over rebuilding the CI workflow step by step.
-- Preserve the separation between `build-ci-local` and `build-wheel-local`.
-- Summarize failing stages from their logs instead of pasting raw output.
-- If the user only asks whether the branch is safe before opening a PR, the default answer path is `bash scripts/run_ci_test.sh`.
+## Report Format
+
+Report:
+
+- changed areas detected from the diff;
+- commands that passed;
+- commands that failed and the first actionable error;
+- checks blocked by missing dependencies;
+- checks not run because the local platform does not support them.
+
+See `.claude/skills/mooncake-ci-local/examples/minimal.md` for a minimal
+pre-PR example.

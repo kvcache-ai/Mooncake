@@ -1,7 +1,7 @@
 {
   "$schema": "https://json.schemastore.org/claude-code-plugin-manifest.json",
   "name": "mooncake-ci-local",
-  "description": "Run Mooncake pre-PR local validation via scripts/run_ci_test.sh, reproducing the reproducible parts of GitHub Actions.",
+  "description": "Run relevant Mooncake pre-PR checks using existing repository commands.",
   "author": {
     "name": "Mooncake Team"
   },
