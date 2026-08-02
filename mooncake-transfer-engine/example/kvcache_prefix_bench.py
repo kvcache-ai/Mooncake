@@ -27,10 +27,8 @@ import argparse
 import ctypes
 import ctypes.util
 import json
-import os
 import signal
 import statistics
-import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 

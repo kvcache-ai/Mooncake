@@ -31,7 +31,6 @@ if __name__ == "__main__":
     etcd_host = sys.argv[1]
     segment_name = "mooncake/nvmeof/" + sys.argv[2]
     files = sys.argv[3:]
-    local_server_name = socket.gethostname()
 
     server_name = socket.gethostname()
     etcd = etcd3.client(host=etcd_host, port=2379)

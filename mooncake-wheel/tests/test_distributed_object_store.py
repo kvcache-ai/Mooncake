@@ -2,7 +2,6 @@ import unittest
 import os
 import time
 import threading
-import random
 from mooncake.store import MooncakeDistributedStore
 
 # The lease time of the kv object, should be set equal to

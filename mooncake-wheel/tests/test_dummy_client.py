@@ -2,7 +2,6 @@ import unittest
 import os
 import time
 import threading
-import random
 
 try:
     import torch
@@ -372,7 +371,6 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         self.assertGreater(buffer_size, 0)
         buffer_ptr = self.store.alloc_from_mem_pool(buffer_size)
         self.assertNotEqual(buffer_ptr, 0)
-        buffer = (ctypes.c_ubyte * buffer_size).from_address(buffer_ptr)
         self.assertEqual(self.store.register_buffer(buffer_ptr, buffer_size), 0)
         try:
             ctypes.memset(buffer_ptr, 0, buffer_size)

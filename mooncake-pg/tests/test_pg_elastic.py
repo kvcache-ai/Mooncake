@@ -663,7 +663,6 @@ def _fault_detection_worker(
 ) -> None:
     """Worker for testing fault detection - survivors can continue without broken rank."""
     device = ctx.init_group()
-    backend = ctx.get_backend()
 
     # Step 1: All ranks participate in first collective
     tensor = torch.tensor([ctx.rank], dtype=torch.int32, device=device)
