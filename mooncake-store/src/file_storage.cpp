@@ -74,10 +74,10 @@ std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
     std::vector<OffloadTaskItem> tasks;
     tasks.reserve(storage_keys.size());
     for (size_t i = 0; i < storage_keys.size(); ++i) {
-        auto [tenant_id, key] = ParseTenantScopedStorageKey(storage_keys[i]);
+        auto [tenant_id, key] = TenantId::ParseScopedKey(storage_keys[i]);
         const int64_t size =
             i < metadatas.size() ? metadatas[i].data_size : int64_t{0};
-        tasks.push_back(OffloadTaskItem{.tenant_id = std::move(tenant_id),
+        tasks.push_back(OffloadTaskItem{.tenant_id = tenant_id.value(),
                                         .key = std::move(key),
                                         .size = size});
     }
@@ -467,7 +467,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     task_by_storage_key.reserve(offloading_objects.size());
     for (const auto& task : offloading_objects) {
         const auto storage_key =
-            MakeTenantScopedStorageKey(task.tenant_id, task.key);
+            TenantId(task.tenant_id).MakeScopedKey(task.key);
         storage_object_sizes.emplace(storage_key, task.size);
         task_by_storage_key.emplace(storage_key, task);
     }
@@ -685,14 +685,15 @@ tl::expected<void, ErrorCode> FileStorage::NotifyEvictedDiskReplicas(
     if (evicted_keys.empty()) return {};
 
     std::optional<ErrorCode> first_error;
-    std::unordered_map<std::string, std::vector<std::string>> keys_by_tenant;
+    std::unordered_map<TenantId, std::vector<std::string>, TenantIdHash>
+        keys_by_tenant;
     for (const auto& storage_key : evicted_keys) {
-        auto [tenant_id, key] = ParseTenantScopedStorageKey(storage_key);
+        auto [tenant_id, key] = TenantId::ParseScopedKey(storage_key);
         keys_by_tenant[tenant_id].push_back(key);
     }
 
     for (const auto& [tenant_id, keys] : keys_by_tenant) {
-        auto results = client_->BatchEvictDiskReplica(keys, tenant_id,
+        auto results = client_->BatchEvictDiskReplica(keys, tenant_id.value(),
                                                       ReplicaType::LOCAL_DISK);
         if (results.size() != keys.size()) {
             LOG(ERROR) << "BatchEvictDiskReplica returned " << results.size()
@@ -814,6 +815,19 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                 auto remount_result =
                     client_->MountLocalDiskSegment(enable_offloading_);
                 if (remount_result) {
+                    // Report configured SSD capacity so the Master can
+                    // restore file_total_capacity_ (the denominator in
+                    // "SSD Storage: X / Y").  This was lost on restart;
+                    // re-reporting it here avoids the 0 B display.
+                    if (config_.total_size_limit > 0) {
+                        auto cap_result = client_->ReportSsdCapacity(
+                            config_.total_size_limit);
+                        if (!cap_result) {
+                            LOG(WARNING)
+                                << "ReportSsdCapacity failed during "
+                                << "heartbeat recovery: " << cap_result.error();
+                        }
+                    }
                     heartbeat_result = client_->OffloadObjectHeartbeat(
                         enable_offloading_, offloading_objects);
                     if (!heartbeat_result) {
@@ -851,7 +865,13 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         }
     }
 
-    // === STEP 2: Persist offloaded objects (trigger actual data migration) ===
+    // === STEP 2: Poll whether master requested a full SSD clear ===
+    auto remove_all_result = client_->PollRemoveAll();
+    if (remove_all_result && remove_all_result.value()) {
+        RemoveAll();
+    }
+
+    // === STEP 3: Persist offloaded objects (trigger actual data migration) ===
     if (!offloading_objects.empty()) {
         auto offload_result = OffloadObjects(offloading_objects);
         if (!offload_result) {
@@ -878,6 +898,21 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                      << disk_eviction_result.error();
     }
     return {};
+}
+
+void FileStorage::RemoveAll() {
+    // TODO(tenant-isolation): This performs a tenant-UNAWARE global wipe of the
+    // storage directory. Storage backends store physical files without a
+    // tenant dimension, so a tenant-scoped master RemoveAll("tenant_A") that
+    // signals this client will also delete tenant_B's SSD files here, while
+    // master still holds valid metadata for tenant_B (subsequent reads get
+    // OBJECT_NOT_FOUND on this node). Safe for the global RemoveAll(force) and
+    // for single-tenant / shared-nothing deployments. Proper per-tenant
+    // physical isolation needs backend-level tenant-scoped layout (follow-up).
+    if (storage_backend_) {
+        storage_backend_->RemoveAll();
+    }
+    LOG(INFO) << "FileStorage::RemoveAll: cleared storage backend";
 }
 
 tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
@@ -920,7 +955,7 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
         const auto& key = task.key;
         const auto& tenant_id = task.tenant_id;
         const int64_t size = task.size;
-        const auto storage_key = MakeTenantScopedStorageKey(tenant_id, key);
+        const auto storage_key = TenantId(tenant_id).MakeScopedKey(key);
         if (size <= 0) {
             LOG(WARNING) << "Skipping promotion for key=" << key
                          << " with non-positive size=" << size;
