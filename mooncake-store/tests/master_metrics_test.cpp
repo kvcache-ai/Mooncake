@@ -51,7 +51,6 @@ TEST_F(MasterMetricsTest, InitialStatusTest) {
     // Mem Storage Metrics
     ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
     ASSERT_EQ(metrics.get_total_mem_capacity(), 0);
-    ASSERT_DOUBLE_EQ(metrics.get_global_mem_used_ratio(), 0.0);
 
     // File Storage Metrics
     ASSERT_EQ(metrics.get_allocated_file_size(), 0);
@@ -166,11 +165,9 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_TRUE(mount_result.has_value());
     ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
     ASSERT_EQ(metrics.get_total_mem_capacity(), kSegmentSize);
-    ASSERT_DOUBLE_EQ(metrics.get_global_mem_used_ratio(), 0.0);
     ASSERT_EQ(metrics.get_segment_allocated_mem_size(segment.name), 0);
     ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name),
               kSegmentSize);
-    ASSERT_DOUBLE_EQ(metrics.get_segment_mem_used_ratio(segment.name), 0.0);
     ASSERT_EQ(metrics.get_mount_segment_requests(), 1);
     ASSERT_EQ(metrics.get_mount_segment_failures(), 0);
 
@@ -265,14 +262,8 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     ASSERT_EQ(metrics.get_key_count(), 0);
     ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
     ASSERT_EQ(metrics.get_total_mem_capacity(), 0);
-    ASSERT_DOUBLE_EQ(metrics.get_global_mem_used_ratio(), 0.0);
     ASSERT_EQ(metrics.get_segment_allocated_mem_size(segment.name), 0);
     ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name), 0);
-    ASSERT_DOUBLE_EQ(metrics.get_segment_mem_used_ratio(segment.name), 0.0);
-
-    // check segment mem used ratio for non-existent segment
-    ASSERT_DOUBLE_EQ(metrics.get_segment_mem_used_ratio(""), 0.0);
-    ASSERT_DOUBLE_EQ(metrics.get_segment_mem_used_ratio("xxxxxx_segment"), 0.0);
 }
 
 TEST_F(MasterMetricsTest, ServiceTeardownReleasesSegmentCapacity) {
@@ -323,6 +314,16 @@ TEST_F(MasterMetricsTest, SnapshotReaderTeardownKeepsCapacityIntact) {
     ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name),
               static_cast<int64_t>(segment.size));
 
+    constexpr size_t kAllocationSize = 4 * 1024 * 1024;
+    std::shared_ptr<BufferAllocatorBase> source_allocator;
+    {
+        auto access = source_manager.getSegmentAccess();
+        source_allocator = access.GetAllocator(segment.id);
+    }
+    ASSERT_NE(source_allocator, nullptr);
+    auto source_buffer = source_allocator->allocate(kAllocationSize);
+    ASSERT_NE(source_buffer, nullptr);
+
     auto snapshot = SegmentSerializer(&source_manager).Serialize();
     ASSERT_TRUE(snapshot.has_value());
 
@@ -335,12 +336,20 @@ TEST_F(MasterMetricsTest, SnapshotReaderTeardownKeepsCapacityIntact) {
         SegmentSerializer reader_serializer(&reader);
         ASSERT_TRUE(
             reader_serializer.Deserialize(snapshot.value()).has_value());
+        const auto restored_usage = reader.GetMemoryUsageSnapshot();
+        EXPECT_EQ(restored_usage.used_bytes, kAllocationSize);
+        EXPECT_EQ(restored_usage.capacity_bytes, segment.size);
+        EXPECT_DOUBLE_EQ(restored_usage.used_ratio(), 0.25);
+        ASSERT_EQ(restored_usage.segments.size(), 1u);
+        EXPECT_EQ(restored_usage.segments.at(segment.name).used_bytes,
+                  kAllocationSize);
     }
     ASSERT_EQ(metrics.get_total_mem_capacity(), capacity_after_mount);
     ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name),
               static_cast<int64_t>(segment.size));
 
     // Unmount to restore the gauges for the other tests.
+    source_buffer.reset();
     {
         auto access = source_manager.getSegmentAccess();
         size_t dec_capacity = 0;
@@ -487,6 +496,14 @@ TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
 }
 
 TEST_F(MasterMetricsTest, AdminServerExposesStandbyStateWithoutService) {
+    TieredStorageUsageSnapshot stale_storage;
+    stale_storage.memory.used_bytes = 4096;
+    stale_storage.memory.capacity_bytes = 8192;
+    stale_storage.memory.segments["stale_leader_segment"] = {4096, 8192};
+    auto& metrics = MasterMetricManager::instance();
+    metrics.project_storage_usage(stale_storage);
+    ASSERT_EQ(metrics.get_allocated_mem_size(), 4096);
+
     const int http_port = getFreeTcpPort();
     MasterAdminServer admin_server(static_cast<uint16_t>(http_port),
                                    /*enable_metric_reporting=*/false);
@@ -504,6 +521,15 @@ TEST_F(MasterMetricsTest, AdminServerExposesStandbyStateWithoutService) {
     auto status_resp = FetchUrl(http_port, "/ha_status");
     EXPECT_EQ(status_resp.http_status, 200);
     EXPECT_EQ(status_resp.body, "standby");
+
+    auto metrics_resp = FetchUrl(http_port, "/metrics");
+    EXPECT_EQ(metrics_resp.http_status, 200);
+    EXPECT_EQ(metrics.get_allocated_mem_size(), 0);
+    EXPECT_EQ(metrics.get_total_mem_capacity(), 0);
+    EXPECT_EQ(metrics.get_segment_allocated_mem_size("stale_leader_segment"),
+              0);
+    EXPECT_EQ(metrics.get_segment_total_mem_capacity("stale_leader_segment"),
+              0);
 
     auto leader_resp = FetchUrl(http_port, "/leader");
     EXPECT_EQ(leader_resp.http_status, 200);
@@ -537,6 +563,13 @@ TEST_F(MasterMetricsTest, AdminServerRoutesServiceEndpointsWhenAvailable) {
     segment.size = 8 * 1024 * 1024;
     UUID client_id = generate_uuid();
     ASSERT_TRUE(service->MountSegment(segment, client_id).has_value());
+    ReplicateConfig config;
+    config.replica_num = 1;
+    constexpr size_t kAllocationSize = 4096;
+    ASSERT_TRUE(service
+                    ->PutStart(client_id, "admin_metrics_projection_key",
+                               kAllocationSize, config)
+                    .has_value());
 
     const int http_port = getFreeTcpPort();
     MasterAdminServer admin_server(static_cast<uint16_t>(http_port),
@@ -545,6 +578,27 @@ TEST_F(MasterMetricsTest, AdminServerRoutesServiceEndpointsWhenAvailable) {
     admin_server.SetRuntimeState(ha::MasterRuntimeState::kServing);
     admin_server.SetServiceDelegate(service);
     admin_server.SetServiceAvailable(true);
+
+    auto& metrics = MasterMetricManager::instance();
+    metrics.reset_allocated_mem_size();
+    metrics.reset_total_mem_capacity();
+    metrics.reset_segment_allocated_mem_size(segment.name);
+    metrics.reset_segment_total_mem_capacity(segment.name);
+    ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
+    ASSERT_EQ(metrics.get_total_mem_capacity(), 0);
+
+    auto metrics_resp = FetchUrl(http_port, "/metrics");
+    EXPECT_EQ(metrics_resp.http_status, 200);
+    EXPECT_NE(metrics_resp.body.find("master_allocated_bytes 4096"),
+              std::string::npos);
+    EXPECT_NE(metrics_resp.body.find("master_total_capacity_bytes 8388608"),
+              std::string::npos);
+    EXPECT_EQ(metrics.get_allocated_mem_size(), kAllocationSize);
+    EXPECT_EQ(metrics.get_total_mem_capacity(), segment.size);
+    EXPECT_EQ(metrics.get_segment_allocated_mem_size(segment.name),
+              kAllocationSize);
+    EXPECT_EQ(metrics.get_segment_total_mem_capacity(segment.name),
+              segment.size);
 
     auto segments_resp = FetchUrl(http_port, "/get_all_segments");
     EXPECT_EQ(segments_resp.http_status, 200);
@@ -565,6 +619,12 @@ TEST_F(MasterMetricsTest, AdminServerRoutesServiceEndpointsWhenAvailable) {
               std::string::npos);
     EXPECT_NE(detail_resp.body.find("\"allocator_capacity_bytes\""),
               std::string::npos);
+
+    ASSERT_TRUE(service
+                    ->PutRevoke(client_id, "admin_metrics_projection_key",
+                                ReplicaType::MEMORY)
+                    .has_value());
+    ASSERT_TRUE(service->UnmountSegment(segment.id, client_id).has_value());
 
     admin_server.Stop();
 }

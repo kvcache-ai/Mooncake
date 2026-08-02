@@ -149,6 +149,7 @@ class MasterService {
     bool IsNoFSegmentMountedForTesting(const UUID& segment_id);
     std::optional<uint32_t> GetNoFHeartbeatFailureCountForTesting(
         const UUID& segment_id);
+    [[nodiscard]] TieredStorageUsageSnapshot GetStorageUsageSnapshot() const;
     bool IsTenantQuotaEnabled() const;
     std::vector<TenantQuotaSnapshot> ListTenantQuotaSnapshots() const;
     std::optional<TenantQuotaSnapshot> GetTenantQuotaSnapshot(
