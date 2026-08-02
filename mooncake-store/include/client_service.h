@@ -187,7 +187,7 @@ class Client {
                                       const QueryResult& query_result,
                                       std::vector<Slice>& slices,
                                       uint64_t src_offset);
-    Status TransferScatter(
+    std::optional<TransferEngine::ScatterTransferOperation> SubmitScatter(
         const std::vector<TransferEngine::ScatterTransferRange>& transfers);
 
     /**

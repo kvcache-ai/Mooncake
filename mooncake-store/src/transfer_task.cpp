@@ -1077,9 +1077,9 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
     return future;
 }
 
-Status TransferSubmitter::transferScatter(
+TransferEngine::ScatterTransferOperation TransferSubmitter::submitScatter(
     const std::vector<TransferEngine::ScatterTransferRange>& transfers) {
-    return engine_.transferScatter(transfers);
+    return engine_.submitScatter(transfers);
 }
 
 std::optional<TransferFuture>

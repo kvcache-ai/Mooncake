@@ -186,13 +186,12 @@ TEST_F(TransferTaskTest, TransferScatterWritesGpuDestinationDirectly) {
         .on_fragment_complete = {},
     };
 
-    std::shared_ptr<StorageBackend> backend;
-    TransferSubmitter submitter(engine, backend, "localhost");
     auto invalid_transfer = transfer;
     invalid_transfer.remote_offsets = {};
-    EXPECT_TRUE(
-        submitter.transferScatter({invalid_transfer}).IsInvalidArgument());
-    ASSERT_TRUE(submitter.transferScatter({transfer}).ok());
+    EXPECT_TRUE(engine.transferScatter({invalid_transfer}).IsInvalidArgument());
+    auto operation = engine.submitScatter({transfer});
+    ASSERT_EQ(engine.freeEngine(), 0);
+    ASSERT_TRUE(operation.wait().ok());
     std::vector<char> actual(kDestSize);
     ASSERT_EQ(cudaMemcpy(actual.data(), gpu_destination, kDestSize,
                          cudaMemcpyDeviceToHost),
@@ -203,8 +202,6 @@ TEST_F(TransferTaskTest, TransferScatterWritesGpuDestinationDirectly) {
                   0);
     }
 
-    EXPECT_EQ(engine.unregisterLocalMemory(gpu_destination), 0);
-    EXPECT_EQ(engine.unregisterLocalMemory(source.data()), 0);
     EXPECT_EQ(cudaFree(gpu_destination), cudaSuccess);
 }
 #endif

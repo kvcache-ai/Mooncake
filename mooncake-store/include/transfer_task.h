@@ -560,7 +560,7 @@ class TransferSubmitter {
         const Replica::Descriptor& replica, std::vector<Slice>& slices,
         uint64_t src_offset);
 
-    Status transferScatter(
+    TransferEngine::ScatterTransferOperation submitScatter(
         const std::vector<TransferEngine::ScatterTransferRange>& transfers);
 
     std::optional<TransferFuture> submit_batch(

@@ -3581,6 +3581,11 @@ RealClient::get_into_ranges_internal(
             .first->second;
     };
 
+    struct ScatterLease {
+        std::chrono::steady_clock::time_point expires_at;
+        std::optional<ErrorCode> error;
+    };
+    std::unordered_map<std::string, ScatterLease> scatter_leases;
     std::vector<TransferEngine::ScatterTransferRange> memory_transfers;
     for (size_t i = 0; i < buffer_count; ++i) {
         if (!buffers[i] || (!buffer_capacities && capacities[i] == 0)) {
@@ -3616,6 +3621,10 @@ RealClient::get_into_ranges_internal(
             if (metadata.replica.is_memory_replica()) {
                 const auto &handle =
                     metadata.replica.get_memory_descriptor().buffer_descriptor;
+                auto [lease_it, inserted] = scatter_leases.try_emplace(keys[j]);
+                if (inserted)
+                    lease_it->second.expires_at =
+                        metadata.query_result.lease_timeout;
                 memory_transfers.push_back(TransferEngine::ScatterTransferRange{
                     .opcode = TransferRequest::READ,
                     .remote_segment = handle.transport_endpoint_,
@@ -3628,17 +3637,19 @@ RealClient::get_into_ranges_internal(
                     .lengths = sizes,
                     .on_fragment_complete =
                         [results = &range_results, sizes = &sizes,
-                         query_result = &metadata.query_result](
-                            size_t k, const Status &status) {
-                            if (status.ok() &&
-                                !query_result->IsLeaseExpired()) {
+                         lease = &lease_it->second](size_t k,
+                                                    const Status &status) {
+                            if (status.ok() && !lease->error.has_value() &&
+                                std::chrono::steady_clock::now() <
+                                    lease->expires_at) {
                                 (*results)[k] =
                                     static_cast<int64_t>((*sizes)[k]);
                                 return;
                             }
-                            (*results)[k] = tl::unexpected(
+                            const auto error = lease->error.value_or(
                                 status.ok() ? ErrorCode::LEASE_EXPIRED
                                             : scatter_transfer_error(status));
+                            (*results)[k] = tl::unexpected(error);
                         },
                 });
                 continue;
@@ -3658,7 +3669,55 @@ RealClient::get_into_ranges_internal(
         }
     }
 
-    client_->TransferScatter(memory_transfers);
+    auto operation = client_->SubmitScatter(memory_transfers);
+    if (!operation.has_value()) {
+        const auto failure =
+            Status::InvalidArgument("TransferSubmitter not initialized");
+        for (const auto &transfer : memory_transfers) {
+            for (size_t i = 0; i < transfer.lengths.size(); ++i)
+                transfer.on_fragment_complete(i, failure);
+        }
+        return results;
+    }
+
+    auto next_refresh_delay = [&]() {
+        const auto now = std::chrono::steady_clock::now();
+        auto delay = std::chrono::nanoseconds::max();
+        for (const auto &[key, lease] : scatter_leases) {
+            (void)key;
+            if (lease.error.has_value()) continue;
+            const auto remaining =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    lease.expires_at - now);
+            delay = std::min(delay, std::max(remaining / 2,
+                                             std::chrono::nanoseconds::zero()));
+        }
+        return delay;
+    };
+    auto refresh_leases = [&]() {
+        std::vector<std::string> keys;
+        keys.reserve(scatter_leases.size());
+        for (const auto &[key, lease] : scatter_leases)
+            if (!lease.error.has_value()) keys.push_back(key);
+        auto refreshed = client_->BatchQuery(keys);
+        for (size_t i = 0; i < refreshed.size(); ++i) {
+            auto &lease = scatter_leases.at(keys[i]);
+            if (!refreshed[i]) {
+                lease.error = refreshed[i].error();
+                continue;
+            }
+            lease.expires_at = refreshed[i]->lease_timeout;
+        }
+    };
+
+    while (true) {
+        const auto delay = next_refresh_delay();
+        const auto status = delay == std::chrono::nanoseconds::max()
+                                ? operation->wait()
+                                : operation->waitFor(delay);
+        if (!status.IsClock()) break;
+        refresh_leases();
+    }
     return results;
 }
 

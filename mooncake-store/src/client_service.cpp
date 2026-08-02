@@ -1337,14 +1337,13 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     return {};
 }
 
-Status Client::TransferScatter(
+std::optional<TransferEngine::ScatterTransferOperation> Client::SubmitScatter(
     const std::vector<TransferEngine::ScatterTransferRange>& transfers) {
-    if (transfers.empty()) return Status::OK();
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
-        return Status::InvalidArgument("TransferSubmitter not initialized");
+        return std::nullopt;
     }
-    return transfer_submitter_->transferScatter(transfers);
+    return transfer_submitter_->submitScatter(transfers);
 }
 
 struct BatchGetOperation {
