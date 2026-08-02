@@ -208,7 +208,12 @@ if(USE_CUDA)
   add_compile_definitions(USE_CUDA)
   message(STATUS "CUDA support is enabled")
   include_directories(/usr/local/cuda/include)
-  link_directories(/usr/local/cuda/lib /usr/local/cuda/lib64)
+  # Include stubs directory so the linker can find libcuda.so on machines that
+  # have the CUDA toolkit but not a GPU driver (e.g. CI builders).  On
+  # production systems with a driver the real libcuda.so in the system library
+  # path takes precedence at both link and runtime.
+  link_directories(/usr/local/cuda/lib /usr/local/cuda/lib64
+                   /usr/local/cuda/lib64/stubs)
 endif()
 
 if(USE_NCCL_DEVICE OR USE_NCCL_HOST)
