@@ -193,9 +193,48 @@ Mooncake integrates with [vLLM](https://github.com/vllm-project/vllm) to acceler
 
 Mooncake integrates with inference engines, middleware frameworks, and RL post-training systems across the LLM ecosystem. See the [ecosystem support matrix](docs/source/design/ecosystem-support.md) for component-level adoption details (Transfer, Store, EP/Torch Backend, Ckpt Engine).
 
-| **Inference** | **Middleware** | **RL Post-Training** |
-| :---: | :---: | :---: |
-| <a href="https://github.com/vllm-project/vllm"><img src="image/software/vllm.png" width="52" alt="vLLM"/><br><sub>vLLM</sub></a><br><a href="https://github.com/sgl-project/sglang"><img src="image/software/sglang.png" width="52" alt="SGLang"/><br><sub>SGLang</sub></a><br><a href="https://github.com/InternLM/lmdeploy"><img src="image/software/lmdeploy.png" width="52" alt="LMDeploy"/><br><sub>LMDeploy</sub></a><br><a href="https://github.com/NVIDIA/TensorRT-LLM"><img src="image/software/tensorrt-llm.png" width="52" alt="TensorRT-LLM"/><br><sub>TensorRT-LLM</sub></a><br><a href="https://github.com/thu-pacman/chitu"><img src="image/software/chitu.png" width="52" alt="Chitu"/><br><sub>Chitu</sub></a><br><a href="https://github.com/jd-opensource/xllm"><img src="image/software/xllm.png" width="52" alt="xLLM"/><br><sub>xLLM</sub></a><br><a href="https://github.com/alibaba/rtp-llm"><img src="image/software/alibaba.png" width="52" alt="RTP"/><br><sub>RTP</sub></a> | <a href="https://github.com/alibaba"><img src="image/software/alibaba.png" width="52" alt="KVCM"/><br><sub>KVCM</sub></a><br><a href="https://github.com/antgroup"><img src="image/software/antgroup.png" width="52" alt="TBase"/><br><sub>TBase</sub></a><br><a href="https://github.com/ai-dynamo/dynamo"><img src="image/software/dynamo.png" width="52" alt="Dynamo"/><br><sub>Dynamo</sub></a><br><a href="https://github.com/LMCache/LMCache"><img src="image/software/lmcache.png" width="52" alt="LMCache"/><br><sub>LMCache</sub></a><br><a href="https://github.com/Ascend/TransferQueue"><img src="image/software/ascend.png" width="52" alt="TransferQueue"/><br><sub>TransferQueue</sub></a> | <a href="https://github.com/THUDM/slime"><img src="image/software/thudm.png" width="52" alt="Slime"/><br><sub>Slime/Miles</sub></a><br><a href="https://github.com/alibaba/ROLL"><img src="image/software/alibaba.png" width="52" alt="ROLL"/><br><sub>ROLL</sub></a><br><a href="https://github.com/volcengine/verl"><img src="image/software/volcengine.png" width="52" alt="Verl"/><br><sub>Verl</sub></a> |
+<table>
+<tr>
+<th width="34%" align="center">Inference</th>
+<th width="33%" align="center">Middleware</th>
+<th width="33%" align="center">RL Post-Training</th>
+</tr>
+<tr>
+<td align="center" valign="top">
+
+<a href="https://github.com/vllm-project/vllm"><img src="https://github.com/vllm-project.png" height="28" alt="vLLM"/></a>
+<a href="https://github.com/sgl-project/sglang"><img src="https://github.com/sgl-project.png" height="28" alt="SGLang"/></a>
+<a href="https://github.com/InternLM/lmdeploy"><img src="https://github.com/InternLM.png" height="28" alt="LMDeploy"/></a>
+<a href="https://github.com/NVIDIA/TensorRT-LLM"><img src="image/partners/nvidia_logo.png" height="28" alt="TensorRT-LLM"/></a>
+<a href="https://github.com/thu-pacman/chitu"><img src="https://github.com/thu-pacman.png" height="28" alt="Chitu"/></a>
+<a href="https://github.com/jd-opensource/xllm"><img src="https://github.com/jd-opensource.png" height="28" alt="xLLM"/></a>
+<a href="https://github.com/alibaba/rtp-llm"><img src="image/partners/aliyun_logo.png" height="28" alt="RTP"/></a>
+<br/>
+<sub>vLLM · SGLang · LMDeploy · TensorRT-LLM · Chitu · xLLM · RTP</sub>
+
+</td>
+<td align="center" valign="top">
+
+<a href="https://github.com/alibaba"><img src="image/partners/aliyun_logo.png" height="28" alt="KVCM"/></a>
+<a href="https://github.com/antgroup"><img src="image/partners/ant_group_logo.png" height="28" alt="TBase"/></a>
+<a href="https://github.com/ai-dynamo/dynamo"><img src="https://github.com/ai-dynamo.png" height="28" alt="Dynamo"/></a>
+<a href="https://github.com/LMCache/LMCache"><img src="https://github.com/LMCache.png" height="28" alt="LMCache"/></a>
+<a href="https://github.com/Ascend/TransferQueue"><img src="image/partners/huawei_logo.png" height="28" alt="TransferQueue"/></a>
+<br/>
+<sub>KVCM · TBase · Dynamo · LMCache · TransferQueue</sub>
+
+</td>
+<td align="center" valign="top">
+
+<a href="https://github.com/THUDM/slime"><img src="https://github.com/THUDM.png" height="28" alt="Slime"/></a>
+<a href="https://github.com/alibaba/ROLL"><img src="image/partners/aliyun_logo.png" height="28" alt="ROLL"/></a>
+<a href="https://github.com/volcengine/verl"><img src="image/partners/volcengine_logo.png" height="28" alt="Verl"/></a>
+<br/>
+<sub>Slime/Miles · ROLL · Verl</sub>
+
+</td>
+</tr>
+</table>
 
 <h2 id="supported-hardware">🖥️ Supported Hardware</h2>
 

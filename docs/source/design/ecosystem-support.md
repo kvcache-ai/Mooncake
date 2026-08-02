@@ -4,7 +4,7 @@ This page summarizes how Mooncake's components are adopted across the LLM infere
 
 **Legend:** ✅ Supported · 🚧 Work in progress · ❌ Not supported · — Not applicable
 
-| <sub>Feature</sub> | <sub>Project</sub> | <sub>Type</sub> | <sub>Transfer</sub> | <sub>EP/Torch Backend</sub> | <sub>Store</sub> | <sub>Ckpt Engine</sub> |
+| <sub>Category</sub> | <sub>Project</sub> | <sub>Type</sub> | <sub>Transfer</sub> | <sub>EP/Torch Backend</sub> | <sub>Store</sub> | <sub>Ckpt Engine</sub> |
 | --- | --- | --- | :---: | :---: | :---: | :---: |
 | <sub>**Inference**</sub> | <img src="https://github.com/vllm-project.png" width="16" height="16" alt="vLLM"/><br><sub>[vLLM V0](https://github.com/vllm-project/vllm)</sub> | <sub>Inference</sub> | <sub>✅</sub> | <sub>❌</sub> | <sub>✅</sub> | <sub>✅</sub> |
 | | <img src="https://github.com/vllm-project.png" width="16" height="16" alt="vLLM"/><br><sub>[vLLM V1 (Omni)](https://github.com/vllm-project/vllm)</sub> | <sub>Inference</sub> | <sub>✅</sub> | <sub>🚧</sub> | <sub>✅ (native / LMCache / Nixl)</sub> | <sub>❌</sub> |

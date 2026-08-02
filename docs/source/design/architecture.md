@@ -64,7 +64,8 @@ flowchart LR
 
     User -- prompt --> VE
     KV -- prefix KV --> PF
-    DEC <-->|hidden states| AM
+    DEC <-->|hidden states| ATT
+    DEC <-->|hidden states| EXP
     DEC -- tokens --> ANS
     DEC -- rollouts --> TR
     ANS -- rewards --> UW
