@@ -961,47 +961,57 @@ void WorkerPool::transferWorker(int thread_id) {
 }
 
 int WorkerPool::doProcessContextEvents() {
-    ibv_async_event event;
-    bool event_acked = false;
-    if (ibv_get_async_event(context_.context(), &event) < 0) return ERR_CONTEXT;
-    LOG(WARNING) << "Worker: Received context async event "
-                 << ibv_event_type_str(event.event_type) << " for context "
-                 << context_.deviceName();
-    if (event.event_type == IBV_EVENT_QP_FATAL) {
-        auto endpoint_ptr = (RdmaEndPoint *)event.element.qp->qp_context;
+    // The async fd is edge-triggered (joinNonblockingPollList) and
+    // ibv_get_async_event() returns one record per read, so anything left
+    // queued here waits for an unrelated later event to release it. Bursts
+    // are routine -- IBV_EVENT_COMM_EST fires once per connection -- and a
+    // backlog delays every event behind it, port and device errors included.
+    while (true) {
+        ibv_async_event event;
+        bool event_acked = false;
+        errno = 0;
+        if (ibv_get_async_event(context_.context(), &event) < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;  // drained
+            if (errno == EINTR) continue;
+            return ERR_CONTEXT;
+        }
+        LOG(WARNING) << "Worker: Received context async event "
+                     << ibv_event_type_str(event.event_type) << " for context "
+                     << context_.deviceName();
+        if (event.event_type == IBV_EVENT_QP_FATAL) {
+            auto endpoint_ptr = (RdmaEndPoint *)event.element.qp->qp_context;
 
-        /**
-         * There might be a deadlock if we call endpoint->set_active(false)
-         * before ack the event:
-         *
-         * Thread A:
-         *     Holding endpoint->lock_ and calling ibv_destroy_qp (if using
-         * eRDMA), ibv_destroy_qp will block until the event is acked.
-         *
-         * Thread B (this thread):
-         *     Calling endpoint->set_active(false), which blocks as
-         * endpoint->lock_ is held by Thread A.
-         */
-        ibv_ack_async_event(&event);
-        event_acked = true;
+            /**
+             * There might be a deadlock if we call endpoint->set_active(false)
+             * before ack the event:
+             *
+             * Thread A:
+             *     Holding endpoint->lock_ and calling ibv_destroy_qp (if using
+             * eRDMA), ibv_destroy_qp will block until the event is acked.
+             *
+             * Thread B (this thread):
+             *     Calling endpoint->set_active(false), which blocks as
+             * endpoint->lock_ is held by Thread A.
+             */
+            ibv_ack_async_event(&event);
+            event_acked = true;
 
-        /**
-         * After ack the event, the endpoint might be destroyed if it happened
-         * to be destroying event.element.qp. Therefore, we cannot just
-         * dereference endpoint_ptr. Instead, we need to get the shared_ptr of
-         * the endpoint from context_ and use that shared_ptr to access the
-         * endpoint.
-         */
-        context_.deleteEndpointByPtr(endpoint_ptr);
-    } else if (handleContextEvent(event.event_type, false, &event)) {
-        event_acked = true;
+            /**
+             * After ack the event, the endpoint might be destroyed if it
+             * happened to be destroying event.element.qp. Therefore, we cannot
+             * just dereference endpoint_ptr. Instead, we need to get the
+             * shared_ptr of the endpoint from context_ and use that shared_ptr
+             * to access the endpoint.
+             */
+            context_.deleteEndpointByPtr(endpoint_ptr);
+        } else if (handleContextEvent(event.event_type, false, &event)) {
+            event_acked = true;
+        }
+
+        if (!event_acked) {
+            ibv_ack_async_event(&event);
+        }
     }
-
-    if (!event_acked) {
-        ibv_ack_async_event(&event);
-    }
-
-    return 0;
 }
 
 void WorkerPool::processContextEventForTest(ibv_event_type event_type) {
