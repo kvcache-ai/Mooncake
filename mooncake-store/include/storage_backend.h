@@ -465,8 +465,7 @@ class StorageBackend {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
 
-        std::string real_fsdir = "moon_" + fsdir;
-        return std::make_shared<StorageBackend>(root_dir, real_fsdir,
+        return std::make_shared<StorageBackend>(root_dir, fsdir,
                                                 enable_eviction);
     }
 
@@ -553,7 +552,12 @@ class StorageBackend {
         double high_watermark_ratio, double low_watermark_ratio,
         StorageBackendInterface::EvictionHandler eviction_handler = nullptr);
 
-    void UpdateFileRecordKey(const std::string& path, const std::string& key);
+    // Reconcile eviction membership and space accounting with a fully
+    // validated metadata scan. Retained paths keep their FIFO order; newly
+    // discovered paths are appended in scan order. The caller must serialize
+    // this commit against concurrent storage mutations; StorageBackendAdaptor
+    // does so with its scan mutex.
+    void ReconcileFileRecords(const std::vector<FileRecord>& scanned_records);
 
     /**
      * @brief Loads an object into slices
@@ -733,13 +737,6 @@ class StorageBackend {
     void RecalculateAvailableSpace();
 
     /**
-     * @brief Gets the actual filesystem directory name by removing "moon_"
-     * prefix if present.
-     * @return The actual directory name without "moon_" prefix.
-     */
-    std::string GetActualFsdir() const;
-
-    /**
      * @brief Checks if disk eviction is enabled for this storage backend.
      * @return true if eviction is enabled, false otherwise.
      */
@@ -822,6 +819,10 @@ class StorageBackendAdaptor : public StorageBackendInterface {
 
     tl::expected<bool, ErrorCode> IsEnableOffloading() override;
 
+    // The handler runs synchronously while this adaptor's scan lock is held.
+    // It must not synchronously call ScanMeta, RemoveAll, BatchOffload, or
+    // EvictAboveDiskWatermark on this adaptor, nor directly mutate its managed
+    // filesystem tree.
     tl::expected<void, ErrorCode> ScanMeta(
         const std::function<ErrorCode(
             const std::vector<std::string>& keys,
@@ -849,6 +850,11 @@ class StorageBackendAdaptor : public StorageBackendInterface {
     std::function<bool(const std::string& key)> test_failure_predicate_;
 
     std::atomic<bool> meta_scanned_{false};
+
+    // Eviction-enabled backends expose mount capability before their first
+    // metadata scan. Once recovery begins, a failed or incomplete scan gates
+    // the data plane until a full retry succeeds.
+    std::atomic<bool> metadata_recovery_started_{false};
 
     std::unique_ptr<StorageBackend> storage_backend_;
 

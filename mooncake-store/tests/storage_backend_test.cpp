@@ -210,6 +210,7 @@ TEST_F(StorageBackendTest, CreateAcceptsValidConfig) {
     auto result = StorageBackend::Create(data_path, "fsdir", true);
     ASSERT_TRUE(result.has_value());
     EXPECT_NE(result.value(), nullptr);
+    EXPECT_EQ(result.value()->fsdir_, "fsdir");
 }
 
 // Regression tests for StorageBackendAdaptor::Init validation (issue #3134
@@ -1831,12 +1832,13 @@ TEST_F(StorageBackendTest, AdaptorScanMetaFailsClosedOnMalformedFiles) {
 
     FilePerKeyConfig backend_config;
     backend_config.fsdir = "file_per_key_malformed_scan";
-    backend_config.enable_eviction = false;
+    backend_config.enable_eviction = true;
 
     const auto corrupt_dir =
         fs::path(cfg.storage_filepath) / backend_config.fsdir / "a" / "b";
+    const auto corrupt_path = corrupt_dir / "corrupt";
     fs::create_directories(corrupt_dir);
-    std::ofstream corrupt_file(corrupt_dir / "corrupt", std::ios::binary);
+    std::ofstream corrupt_file(corrupt_path, std::ios::binary);
     ASSERT_TRUE(corrupt_file.is_open());
     corrupt_file << std::string(8, static_cast<char>(0xff));
     corrupt_file.close();
@@ -1853,11 +1855,281 @@ TEST_F(StorageBackendTest, AdaptorScanMetaFailsClosedOnMalformedFiles) {
     ASSERT_FALSE(enable_result);
     EXPECT_EQ(enable_result.error(), ErrorCode::INTERNAL_ERROR);
 
-    ASSERT_TRUE(fs::remove(corrupt_dir / "corrupt"));
+    ASSERT_TRUE(fs::remove(corrupt_path));
     ASSERT_TRUE(adaptor.ScanMeta(
         [](const std::vector<std::string>&,
            std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
     EXPECT_TRUE(adaptor.IsEnableOffloading().value_or(false));
+
+    // Init tracked the malformed file. A successful retry must discard that
+    // stale record and its bytes. Re-create the old path as a non-empty
+    // directory after the retry so stale watermark state would fail loudly.
+    std::error_code repair_ec;
+    fs::create_directories(corrupt_path, repair_ec);
+    ASSERT_FALSE(repair_ec) << repair_ec.message();
+    std::ofstream child_file(corrupt_path / "child");
+    ASSERT_TRUE(child_file.is_open());
+    child_file << "keep-directory-non-empty";
+    ASSERT_TRUE(child_file.good());
+    child_file.close();
+    auto eviction_result = adaptor.EvictAboveDiskWatermark(0.0, 0.0, nullptr);
+    ASSERT_TRUE(eviction_result);
+    EXPECT_TRUE(eviction_result->empty());
+}
+
+TEST_F(StorageBackendTest,
+       AdaptorScanMetaHandlerFailureCommitsNothingUntilFullRetry) {
+    FileStorageConfig cfg;
+    cfg.storage_filepath = data_path;
+    cfg.scanmeta_iterator_keys_limit = 1;
+    cfg.total_keys_limit = 16;
+    cfg.total_size_limit = 1 << 20;
+
+    FilePerKeyConfig backend_config;
+    backend_config.fsdir = "scan_handler_failure";
+    backend_config.enable_eviction = true;
+
+    std::unordered_map<std::string, std::string> test_data = {
+        {"first-key", "first-value"},
+        {"second-key", "second-value"},
+    };
+    {
+        StorageBackendAdaptor writer(cfg, backend_config);
+        ASSERT_TRUE(writer.Init());
+        ASSERT_TRUE(writer.IsEnableOffloading().value_or(false));
+
+        std::unordered_map<std::string, std::vector<Slice>> batch;
+        for (auto& [key, value] : test_data) {
+            batch.emplace(
+                key, std::vector<Slice>{Slice{value.data(), value.size()}});
+        }
+        auto offload_result = writer.BatchOffload(
+            batch,
+            [](const std::vector<std::string>&,
+               std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+        ASSERT_TRUE(offload_result);
+        EXPECT_EQ(offload_result.value(), 2);
+    }
+
+    StorageBackendAdaptor restarted(cfg, backend_config);
+    ASSERT_TRUE(restarted.Init());
+    ASSERT_TRUE(restarted.IsEnableOffloading().value_or(false));
+
+    int failed_scan_batches = 0;
+    auto failed_scan =
+        restarted.ScanMeta([&](const std::vector<std::string>& keys,
+                               std::vector<StorageObjectMetadata>&) {
+            EXPECT_EQ(keys.size(), 1);
+            ++failed_scan_batches;
+            return failed_scan_batches == 1 ? ErrorCode::OK
+                                            : ErrorCode::INTERNAL_ERROR;
+        });
+    ASSERT_FALSE(failed_scan);
+    EXPECT_EQ(failed_scan.error(), ErrorCode::INTERNAL_ERROR);
+    EXPECT_EQ(failed_scan_batches, 2);
+
+    auto enable_result = restarted.IsEnableOffloading();
+    ASSERT_FALSE(enable_result);
+    EXPECT_EQ(enable_result.error(), ErrorCode::INTERNAL_ERROR);
+
+    std::string blocked_value = "blocked-value";
+    std::unordered_map<std::string, std::vector<Slice>> blocked_batch = {
+        {"blocked-key", {Slice{blocked_value.data(), blocked_value.size()}}}};
+    auto blocked_offload = restarted.BatchOffload(
+        blocked_batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_FALSE(blocked_offload);
+    EXPECT_EQ(blocked_offload.error(), ErrorCode::INTERNAL_ERROR);
+    EXPECT_FALSE(fs::exists(ResolveFilePerKeyPathFromKey(
+        "blocked-key", cfg.storage_filepath, backend_config.fsdir)));
+
+    bool eviction_handler_called = false;
+    auto blocked_eviction = restarted.EvictAboveDiskWatermark(
+        0.0, 0.0,
+        [&](const std::vector<std::string>&) -> tl::expected<void, ErrorCode> {
+            eviction_handler_called = true;
+            return {};
+        });
+    ASSERT_FALSE(blocked_eviction);
+    EXPECT_EQ(blocked_eviction.error(), ErrorCode::INTERNAL_ERROR);
+    EXPECT_FALSE(eviction_handler_called);
+
+    int retry_batches = 0;
+    std::vector<std::string> recovered_keys;
+    auto retry_scan =
+        restarted.ScanMeta([&](const std::vector<std::string>& keys,
+                               std::vector<StorageObjectMetadata>&) {
+            EXPECT_EQ(keys.size(), 1);
+            ++retry_batches;
+            recovered_keys.insert(recovered_keys.end(), keys.begin(),
+                                  keys.end());
+            return ErrorCode::OK;
+        });
+    ASSERT_TRUE(retry_scan);
+    EXPECT_EQ(retry_batches, 2);
+    std::sort(recovered_keys.begin(), recovered_keys.end());
+    EXPECT_EQ(recovered_keys,
+              std::vector<std::string>({"first-key", "second-key"}));
+    EXPECT_TRUE(restarted.IsEnableOffloading().value_or(false));
+}
+
+TEST_F(StorageBackendTest, AdaptorScanMetaRejectsEmbeddedKeyPathMismatch) {
+    FileStorageConfig cfg;
+    cfg.storage_filepath = data_path;
+    cfg.scanmeta_iterator_keys_limit = 16;
+
+    FilePerKeyConfig backend_config;
+    backend_config.fsdir = "file_per_key_path_mismatch";
+    backend_config.enable_eviction = true;
+
+    const std::string key = "embedded-key";
+    std::string value = "valid-protobuf-value";
+    {
+        StorageBackendAdaptor writer(cfg, backend_config);
+        ASSERT_TRUE(writer.Init());
+        std::unordered_map<std::string, std::vector<Slice>> batch = {
+            {key, {Slice{value.data(), value.size()}}}};
+        ASSERT_TRUE(writer.BatchOffload(
+            batch,
+            [](const std::vector<std::string>&,
+               std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+    }
+
+    const fs::path expected_path = ResolveFilePerKeyPathFromKey(
+        key, cfg.storage_filepath, backend_config.fsdir);
+    const fs::path misplaced_path = fs::path(cfg.storage_filepath) /
+                                    backend_config.fsdir / "a" / "b" /
+                                    "misplaced-record";
+    std::error_code directory_ec;
+    fs::create_directories(misplaced_path.parent_path(), directory_ec);
+    ASSERT_FALSE(directory_ec) << directory_ec.message();
+    std::error_code rename_ec;
+    fs::rename(expected_path, misplaced_path, rename_ec);
+    ASSERT_FALSE(rename_ec) << rename_ec.message();
+
+    StorageBackendAdaptor restarted(cfg, backend_config);
+    ASSERT_TRUE(restarted.Init());
+    bool handler_called = false;
+    auto scan_result =
+        restarted.ScanMeta([&](const std::vector<std::string>&,
+                               std::vector<StorageObjectMetadata>&) {
+            handler_called = true;
+            return ErrorCode::OK;
+        });
+    ASSERT_FALSE(scan_result);
+    EXPECT_EQ(scan_result.error(), ErrorCode::FILE_READ_FAIL);
+    EXPECT_FALSE(handler_called);
+
+    auto enable_result = restarted.IsEnableOffloading();
+    ASSERT_FALSE(enable_result);
+    EXPECT_EQ(enable_result.error(), ErrorCode::INTERNAL_ERROR);
+
+    rename_ec.clear();
+    fs::rename(misplaced_path, expected_path, rename_ec);
+    ASSERT_FALSE(rename_ec) << rename_ec.message();
+    ASSERT_TRUE(restarted.ScanMeta(
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+
+    std::vector<std::string> notified_keys;
+    auto eviction_result = restarted.EvictAboveDiskWatermark(
+        0.0, 0.0,
+        [&](const std::vector<std::string>& keys)
+            -> tl::expected<void, ErrorCode> {
+            notified_keys = keys;
+            return {};
+        });
+    ASSERT_TRUE(eviction_result);
+    EXPECT_EQ(eviction_result.value(), std::vector<std::string>({key}));
+    EXPECT_EQ(notified_keys, std::vector<std::string>({key}));
+}
+
+TEST_F(StorageBackendTest, AdaptorScanMetaRejectsUnexpectedLayout) {
+    FileStorageConfig cfg;
+    cfg.storage_filepath = data_path;
+
+    auto expect_rejected = [&](const std::string& fsdir, auto setup_layout) {
+        FilePerKeyConfig backend_config;
+        backend_config.fsdir = fsdir;
+        backend_config.enable_eviction = false;
+
+        StorageBackendAdaptor adaptor(cfg, backend_config);
+        ASSERT_TRUE(adaptor.Init());
+        const fs::path managed_root = fs::path(cfg.storage_filepath) / fsdir;
+        std::error_code setup_ec;
+        fs::create_directories(managed_root, setup_ec);
+        ASSERT_FALSE(setup_ec) << setup_ec.message();
+        setup_layout(managed_root);
+
+        auto scan_result = adaptor.ScanMeta(
+            [](const std::vector<std::string>&,
+               std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+        ASSERT_FALSE(scan_result) << fsdir;
+        EXPECT_EQ(scan_result.error(), ErrorCode::FILE_READ_FAIL) << fsdir;
+        auto enable_result = adaptor.IsEnableOffloading();
+        ASSERT_FALSE(enable_result) << fsdir;
+        EXPECT_EQ(enable_result.error(), ErrorCode::INTERNAL_ERROR) << fsdir;
+
+        std::error_code cleanup_ec;
+        fs::remove_all(managed_root, cleanup_ec);
+        EXPECT_FALSE(cleanup_ec) << cleanup_ec.message();
+    };
+
+    expect_rejected("unexpected_root_file", [](const fs::path& root) {
+        std::ofstream file(root / "regular-file");
+        ASSERT_TRUE(file.is_open());
+        file << "unexpected";
+        ASSERT_TRUE(file.good());
+    });
+    expect_rejected("unexpected_d1_file", [](const fs::path& root) {
+        std::error_code directory_ec;
+        fs::create_directories(root / "a", directory_ec);
+        ASSERT_FALSE(directory_ec) << directory_ec.message();
+        std::ofstream file(root / "a" / "regular-file");
+        ASSERT_TRUE(file.is_open());
+        file << "unexpected";
+        ASSERT_TRUE(file.good());
+    });
+    expect_rejected("unexpected_leaf_directory", [](const fs::path& root) {
+        std::error_code directory_ec;
+        fs::create_directories(root / "a" / "b" / "directory", directory_ec);
+        ASSERT_FALSE(directory_ec) << directory_ec.message();
+    });
+
+    FilePerKeyConfig source_config;
+    source_config.fsdir = "valid_symlink_source";
+    source_config.enable_eviction = false;
+    StorageBackendAdaptor source_adaptor(cfg, source_config);
+    ASSERT_TRUE(source_adaptor.Init());
+    ASSERT_TRUE(source_adaptor.ScanMeta(
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+    const std::string symlink_key = "valid-symlink-key";
+    std::string symlink_value = "valid-symlink-value";
+    std::unordered_map<std::string, std::vector<Slice>> source_batch = {
+        {symlink_key, {Slice{symlink_value.data(), symlink_value.size()}}}};
+    auto source_result = source_adaptor.BatchOffload(
+        source_batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_TRUE(source_result);
+    EXPECT_EQ(source_result.value(), 1);
+
+    const std::string symlink_fsdir = "unexpected_leaf_symlink";
+    const fs::path symlink_target = ResolveFilePerKeyPathFromKey(
+        symlink_key, cfg.storage_filepath, source_config.fsdir);
+    const fs::path symlink_path = ResolveFilePerKeyPathFromKey(
+        symlink_key, cfg.storage_filepath, symlink_fsdir);
+    ASSERT_TRUE(fs::is_regular_file(symlink_target));
+    expect_rejected(symlink_fsdir, [&](const fs::path&) {
+        std::error_code directory_ec;
+        fs::create_directories(symlink_path.parent_path(), directory_ec);
+        ASSERT_FALSE(directory_ec) << directory_ec.message();
+        std::error_code symlink_ec;
+        fs::create_symlink(symlink_target, symlink_path, symlink_ec);
+        ASSERT_FALSE(symlink_ec) << symlink_ec.message();
+    });
 }
 
 TEST_F(StorageBackendTest, AdaptorScanMetaAndBatchLoadAcrossRestart) {
@@ -4028,14 +4300,79 @@ TEST_F(StorageBackendTest, StoreObjectOverwriteReleasesPreviousReservation) {
     EXPECT_EQ(loaded, replacement_value);
 }
 
+TEST_F(StorageBackendTest, ReconcileFileRecordsCorrectsQuotaBeforeNextWrite) {
+    constexpr size_t kUnit = 1024;
+    const std::string fsdir = "reconcile_quota";
+    StorageBackend backend(data_path, fsdir, true);
+    ASSERT_TRUE(backend.Init(2 * kUnit));
+
+    const fs::path managed_root = fs::path(data_path) / fsdir;
+    const std::string retained_path = (managed_root / "retained").string();
+    const std::string incoming_path = (managed_root / "incoming").string();
+    ASSERT_TRUE(
+        backend.StoreObject(retained_path, std::string(kUnit, 'A'), "retained")
+            .has_value());
+
+    std::error_code resize_ec;
+    fs::resize_file(retained_path, kUnit / 2, resize_ec);
+    ASSERT_FALSE(resize_ec) << resize_ec.message();
+    backend.ReconcileFileRecords(
+        {{retained_path, static_cast<uint64_t>(kUnit / 2), "retained"}});
+
+    std::vector<std::string> notified_keys;
+    auto incoming_result = backend.StoreObject(
+        incoming_path, std::string(3 * kUnit / 2, 'B'), "incoming",
+        [&](const std::vector<std::string>& keys)
+            -> tl::expected<void, ErrorCode> {
+            notified_keys = keys;
+            return {};
+        });
+    ASSERT_TRUE(incoming_result);
+    EXPECT_TRUE(incoming_result->empty());
+    EXPECT_TRUE(notified_keys.empty());
+    EXPECT_TRUE(fs::exists(retained_path));
+    EXPECT_TRUE(fs::exists(incoming_path));
+}
+
+TEST_F(StorageBackendTest, StorageBackendInitUsesExactMoonPrefixedDirectory) {
+    const fs::path configured_root = fs::path(data_path) / "moon_cache";
+    const fs::path similarly_named_root = fs::path(data_path) / "cache";
+    std::error_code directory_ec;
+    fs::create_directories(configured_root, directory_ec);
+    ASSERT_FALSE(directory_ec) << directory_ec.message();
+    fs::create_directories(similarly_named_root, directory_ec);
+    ASSERT_FALSE(directory_ec) << directory_ec.message();
+
+    const fs::path managed_file = configured_root / "managed";
+    const fs::path sentinel = similarly_named_root / "sentinel";
+    std::ofstream managed_stream(managed_file, std::ios::binary);
+    ASSERT_TRUE(managed_stream.is_open());
+    managed_stream << std::string(512, 'M');
+    ASSERT_TRUE(managed_stream.good());
+    managed_stream.close();
+    std::ofstream sentinel_stream(sentinel, std::ios::binary);
+    ASSERT_TRUE(sentinel_stream.is_open());
+    sentinel_stream << std::string(512, 'S');
+    ASSERT_TRUE(sentinel_stream.good());
+    sentinel_stream.close();
+
+    StorageBackend backend(data_path, "moon_cache", true);
+    ASSERT_TRUE(backend.Init(4096));
+    auto eviction_result = backend.EvictAboveDiskWatermark(0.0, 0.0);
+    ASSERT_TRUE(eviction_result);
+    EXPECT_TRUE(eviction_result->empty());
+    EXPECT_FALSE(fs::exists(managed_file));
+    EXPECT_TRUE(fs::exists(sentinel));
+}
+
 TEST_F(StorageBackendTest,
-       AdaptorWatermarkEvictionNotifiesRecoveredKeysAfterRestart) {
+       AdaptorWatermarkEvictionUsesExactMoonPrefixedDirectoryAfterRestart) {
     FileStorageConfig cfg;
     cfg.storage_filepath = data_path + "/";
     cfg.scanmeta_iterator_keys_limit = 16;
 
     FilePerKeyConfig file_per_key_config;
-    file_per_key_config.fsdir = "file_per_key_watermark_restart";
+    file_per_key_config.fsdir = "moon_cache";
     file_per_key_config.enable_eviction = true;
 
     std::unordered_map<std::string, std::string> test_data = {
@@ -4043,6 +4380,16 @@ TEST_F(StorageBackendTest,
         {"restart_key_2", std::string(512, 'b')},
         {"restart_key_3", std::string(512, 'c')},
     };
+
+    const fs::path similarly_named_root = fs::path(data_path) / "cache";
+    std::error_code sentinel_ec;
+    fs::create_directories(similarly_named_root, sentinel_ec);
+    ASSERT_FALSE(sentinel_ec) << sentinel_ec.message();
+    std::ofstream sentinel_file(similarly_named_root / "sentinel");
+    ASSERT_TRUE(sentinel_file.is_open());
+    sentinel_file << "must-survive";
+    ASSERT_TRUE(sentinel_file.good());
+    sentinel_file.close();
 
     {
         StorageBackendAdaptor adaptor(cfg, file_per_key_config);
@@ -4074,8 +4421,8 @@ TEST_F(StorageBackendTest,
 
     std::vector<std::string> notified_keys;
     auto evict_result = restart_adaptor.EvictAboveDiskWatermark(
-        /*high_watermark_ratio=*/1e-12,
-        /*low_watermark_ratio=*/0.5e-12,
+        /*high_watermark_ratio=*/0.0,
+        /*low_watermark_ratio=*/0.0,
         [&](const std::vector<std::string>& evicted_keys)
             -> tl::expected<void, ErrorCode> {
             notified_keys = evicted_keys;
@@ -4090,6 +4437,7 @@ TEST_F(StorageBackendTest,
                                               "restart_key_3"};
     EXPECT_EQ(returned_keys, expected_keys);
     EXPECT_EQ(notified_keys, expected_keys);
+    EXPECT_TRUE(fs::exists(similarly_named_root / "sentinel"));
 }
 
 TEST_F(StorageBackendTest, BucketWatermarkEvictionUsesHandlerAndKeepsNewest) {
