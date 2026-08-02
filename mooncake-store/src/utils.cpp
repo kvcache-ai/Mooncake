@@ -112,6 +112,36 @@ AutoPortBinder::~AutoPortBinder() {
     }
 }
 
+#ifdef USE_VRAM_SEGMENT
+tl::expected<void *, std::string> allocate_vram_memory(
+    size_t total_size, const std::string &protocol) {
+    cudaError_t res;
+    int device;
+    void *ptr = nullptr;
+    res = cudaGetDevice(&device);
+    if (res != cudaSuccess) {
+        LOG(ERROR) << "VRAM Segment cudaGetDevice failed.";
+        return tl::make_unexpected("VRAM Segment cudaGetDevice failed.");
+    }
+    if (protocol == "nvlink_intra") {
+#ifdef USE_INTRA_NVLINK
+        ptr = allocateFabricMemory_intra(total_size);
+        return ptr;
+#else
+        LOG(ERROR) << "Protocol nvlink_intra need USE_INTRA_NVLINK=ON. Please "
+                      "rebuild mooncake from source.";
+        return tl::make_unexpected("Protocol not supported");
+#endif
+    }
+    res = cudaMalloc((void **)&ptr, total_size);
+    if (res != cudaSuccess) {
+        LOG(ERROR) << "VRAM Segment cudaMalloc failed.";
+        return tl::make_unexpected("VRAM Segment cudaMalloc failed.");
+    }
+    return ptr;
+}
+#endif
+
 void *allocate_buffer_allocator_memory(size_t total_size,
                                        const std::string &protocol,
                                        size_t alignment, bool use_spdk_dma) {
@@ -145,30 +175,12 @@ void *allocate_buffer_allocator_memory(size_t total_size,
     }
 #endif
 #ifdef USE_VRAM_SEGMENT
-    cudaError_t res;
-    void *ptr = nullptr;
-    res = cudaSetDevice(
-        0);  // always allocate on device 0. you can set env for other devices.
-    if (res != cudaSuccess) {
-        LOG(ERROR) << "VRAM Segment cudaSetDevice failed.";
+    auto ret = allocate_vram_memory(total_size, protocol);
+    if (!ret) {
+        LOG(ERROR) << ret.error();
         return nullptr;
     }
-    if (protocol == "nvlink_intra") {
-#ifdef USE_INTRA_NVLINK
-        ptr = allocateFabricMemory_intra(total_size);
-        return ptr;
-#else
-        LOG(ERROR) << "Protocol nvlink_intra need USE_INTRA_NVLINK=ON. Please "
-                      "rebuild mooncake from source.";
-        return nullptr;
-#endif
-    }
-    res = cudaMalloc((void **)&ptr, total_size);
-    if (res != cudaSuccess) {
-        LOG(ERROR) << "VRAM Segment cudaMalloc failed.";
-        return nullptr;
-    }
-    return ptr;
+    return *ret;
 #endif
     // Allocate aligned memory
     return aligned_alloc(alignment, total_size);

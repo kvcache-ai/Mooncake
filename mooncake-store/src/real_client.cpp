@@ -876,28 +876,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                                                   get_hugepage_size_from_env(),
                                                   parallel_hugetlb_population);
             } else {
-#ifdef USE_VRAM_SEGMENT
-                cudaError_t res;
-                res = cudaSetDevice(0);  // always allocate on device 0. you can
-                                         // set env for other devices.
-                if (res != cudaSuccess) {
-                    LOG(ERROR) << "VRAM Segment cudaSetDevice failed.";
-                    return tl::unexpected(ErrorCode::INVALID_PARAMS);
-                }
-#ifdef USE_INTRA_NVLINK
-                ptr = allocateFabricMemory_intra(segment_size);
-#else
-                res = cudaMalloc((void **)&ptr, segment_size);
-                if (res != cudaSuccess) {
-                    LOG(ERROR) << "VRAM Segment cudaMalloc failed.";
-                    return tl::unexpected(ErrorCode::INVALID_PARAMS);
-                    ;
-                }
-#endif
-#else
                 ptr = allocate_buffer_allocator_memory(segment_size,
                                                        this->protocol);
-#endif
             }
 
             if (!ptr) {
@@ -1626,23 +1606,7 @@ int RealClient::allocateAndMountSegment(
         size_t chunk_size = std::min(remaining, aligned_max_chunk);
         if (chunk_size == 0) break;
 
-#ifdef USE_VRAM_SEGMENT
-        void *ptr = nullptr;
-        cudaError_t res;
-        res = cudaSetDevice(0);  // always allocate on device 0. you can set env
-                                 // for other devices.
-        if (res != cudaSuccess) {
-            LOG(ERROR) << "VRAM Segment cudaSetDevice failed.";
-            return -1;
-        }
-        res = cudaMalloc((void **)&ptr, chunk_size);
-        if (res != cudaSuccess) {
-            LOG(ERROR) << "VRAM Segment cudaMalloc failed.";
-            return -1;
-        }
-#else
         void *ptr = allocate_buffer_allocator_memory(chunk_size, protocol);
-#endif
         if (!ptr) {
             LOG(ERROR) << "allocate_buffer_allocator_memory failed for size "
                        << chunk_size;
