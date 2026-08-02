@@ -84,7 +84,7 @@ For multi-process environments, TENT implements global time-sliced coordination 
 Time slices rotate every N milliseconds:
 
 Slot 0 (0-Nms):     Only HIGH priority requests allowed
-Slot 1 (N-2Nms):    MEDIUM + HIGH priority requests allowed  
+Slot 1 (N-2Nms):    MEDIUM + HIGH priority requests allowed
 Slot 2 (2N-3Nms):   All priorities allowed
 ...repeats...
 ```
@@ -407,4 +407,4 @@ Monitor queue depths for each priority level (requires instrumentation).
 
 - [TENT Overview](overview.md)
 - [TENT Slice Spraying](slice-spraying.md)
-- [TENT C++ API](cpp-api.md)
+- [TENT C++ API](../../api-reference/cpp/tent.md)

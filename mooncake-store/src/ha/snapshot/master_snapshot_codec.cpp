@@ -55,29 +55,50 @@ tl::expected<void, SerializationError> MasterSnapshotCodec::Decode(
             ErrorCode::INVALID_PARAMS, "master_service is null"));
     }
 
-    // 1. Decode segments first. A MEMORY replica's allocator is bound to its
-    //    mounted segment, so the segment/allocator must be restored before
-    //    metadata; otherwise GetMountedSegment() returns SEGMENT_NOT_FOUND
-    //    while deserializing the replica.
-    auto segments_result = DecodeSegments(master_service, payloads.segments);
-    if (!segments_result) {
-        return tl::make_unexpected(segments_result.error());
-    }
+    // Decode() is the codec-level exception boundary for restore. Most
+    // serializer failures are already reported as SerializationError, but a
+    // few MessagePack conversions (e.g. TaskManagerSerializer::Deserialize()
+    // calling arr[0].as<std::string>() on a structurally valid but
+    // wrongly-typed field) can still throw msgpack::type_error outside their
+    // local try blocks. Since the caller RestoreState() no longer wraps each
+    // candidate in a try/catch, any escaping exception would abort restore and
+    // prevent fallback to an older healthy snapshot. Converting all exceptions
+    // here into SerializationError preserves that per-candidate fallback.
+    try {
+        // 1. Decode segments first. A MEMORY replica's allocator is bound to
+        //    its mounted segment, so the segment/allocator must be restored
+        //    before metadata; otherwise GetMountedSegment() returns
+        //    SEGMENT_NOT_FOUND while deserializing the replica.
+        auto segments_result =
+            DecodeSegments(master_service, payloads.segments);
+        if (!segments_result) {
+            return tl::make_unexpected(segments_result.error());
+        }
 
-    // 2. Decode metadata (shards, discarded replicas, replica_next_id)
-    auto metadata_result = DecodeMetadata(master_service, payloads.metadata);
-    if (!metadata_result) {
-        return tl::make_unexpected(metadata_result.error());
-    }
+        // 2. Decode metadata (shards, discarded replicas, replica_next_id)
+        auto metadata_result =
+            DecodeMetadata(master_service, payloads.metadata);
+        if (!metadata_result) {
+            return tl::make_unexpected(metadata_result.error());
+        }
 
-    // 3. Decode task manager
-    auto task_manager_result =
-        DecodeTaskManager(master_service, payloads.task_manager);
-    if (!task_manager_result) {
-        return tl::make_unexpected(task_manager_result.error());
-    }
+        // 3. Decode task manager
+        auto task_manager_result =
+            DecodeTaskManager(master_service, payloads.task_manager);
+        if (!task_manager_result) {
+            return tl::make_unexpected(task_manager_result.error());
+        }
 
-    return {};
+        return {};
+    } catch (const std::exception& e) {
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL,
+            std::string("exception during snapshot decode: ") + e.what()));
+    } catch (...) {
+        return tl::make_unexpected(
+            SerializationError(ErrorCode::DESERIALIZE_FAIL,
+                               "unknown exception during snapshot decode"));
+    }
 }
 
 tl::expected<std::vector<uint8_t>, SerializationError>

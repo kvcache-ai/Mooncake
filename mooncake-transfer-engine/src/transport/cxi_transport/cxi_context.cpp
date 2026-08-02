@@ -667,6 +667,20 @@ int CxiContext::submitPostSend(
             }
         }
 
+        // device_id comes from the peer-supplied topology, whose HCA list is
+        // independent of the peer 'devices' array, and selectDevice() bounds it
+        // against rkey only. decodeSegmentDesc() now rejects a descriptor whose
+        // key count and device count disagree; bound the value used to index
+        // devices[] locally as well.
+        if (static_cast<size_t>(device_id) >=
+            peer_segment_desc->devices.size()) {
+            LOG(ERROR) << "Peer device index out of range for target "
+                       << slice->target_id << ": device_id=" << device_id
+                       << " devices=" << peer_segment_desc->devices.size();
+            slice->markFailed();
+            continue;
+        }
+
         // no FI_VIRT_ADDR support on slingshot, must be offset of memory region
         slice->rdma.dest_addr -= peer_segment_desc->buffers[buffer_id].addr;
         slice->rdma.dest_rkey =

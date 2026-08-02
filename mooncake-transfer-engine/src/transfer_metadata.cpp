@@ -68,6 +68,7 @@ struct TransferNotifyUtil {
 struct TransferHandshakeUtil {
     static Json::Value encode(const TransferMetadata::HandShakeDesc &desc) {
         Json::Value root;
+        root["payload"] = desc.payload;
         root["local_nic_path"] = desc.local_nic_path;
         root["local_lid"] = desc.local_lid;
         root["local_gid"] = desc.local_gid;
@@ -100,6 +101,7 @@ struct TransferHandshakeUtil {
     }
 
     static int decode(Json::Value root, TransferMetadata::HandShakeDesc &desc) {
+        desc.payload = root["payload"].asString();
         desc.local_nic_path = root["local_nic_path"].asString();
         if (root.isMember("local_lid") && root["local_lid"].isUInt()) {
             desc.local_lid = root["local_lid"].asUInt();
@@ -459,6 +461,17 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
             buffersJSON.append(bufferJSON);
         }
         segmentJSON["buffers"] = buffersJSON;
+    } else if (segmentJSON["protocol"] == "nccl") {
+        Json::Value buffersJSON(Json::arrayValue);
+        for (const auto &buffer : desc.buffers) {
+            Json::Value bufferJSON;
+            bufferJSON["name"] = buffer.name;
+            bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
+            bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
+            bufferJSON["device_id"] = buffer.device_id;
+            buffersJSON.append(bufferJSON);
+        }
+        segmentJSON["buffers"] = buffersJSON;
     } else if (segmentJSON["protocol"] == "ascend") {
         Json::Value devicesJSON(Json::arrayValue);
         for (const auto &device : desc.devices) {
@@ -659,15 +672,20 @@ decodeMultiProtocolSegmentDesc(Json::Value &segmentJSON,
                 buffer.lkey.push_back(
                     static_cast<decltype(buffer.lkey)::value_type>(
                         lkeyJSON.asUInt64()));
+            // The same topology-derived device_id indexes both rkey and
+            // devices, and a publisher emits exactly one key per device, so a
+            // key vector longer than the device list lets that index run past
+            // the end of devices[]. See the comment in decodeSegmentDesc.
             if (buffer.name.empty() || !buffer.addr || !buffer.length ||
-                buffer.rkey.empty() ||
-                buffer.rkey.size() != buffer.lkey.size()) {
+                (!buffer.rkey.empty() &&
+                 (buffer.rkey.size() != buffer.lkey.size() ||
+                  buffer.rkey.size() != desc->devices.size()))) {
                 LOG(WARNING)
                     << "Corrupted segment descriptor, name " << segment_name
                     << " buffer_protocol " << buffer_protocol << ", "
                     << buffer.name << ", " << buffer.addr << ", "
                     << buffer.length << ", " << buffer.rkey.size() << ", "
-                    << buffer.lkey.size();
+                    << buffer.lkey.size() << ", " << desc->devices.size();
                 return nullptr;
             }
             desc->buffers.push_back(buffer);
@@ -727,10 +745,11 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
                 }
             }
             if (!is_multi_protocol) {
-                LOG(ERROR)
-                    << "Unsupported multi-protocol combination in segment: "
-                    << segment_name
-                    << ". Only cxl, tcp, rdma, hip and maca may be combined.";
+                LOG(ERROR) << "Unsupported multi-protocol combination in "
+                              "segment: "
+                           << segment_name
+                           << ". Only cxl, tcp, rdma, hip and maca may be "
+                              "combined.";
                 return nullptr;
             }
         }
@@ -769,6 +788,19 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             desc->devices.push_back(device);
         }
 
+        // rdma, efa and cxi pick a device with topology.selectDevice() and
+        // then use that one device_id to index both buffers[].rkey and
+        // devices[] (RdmaTransport::selectDevice / WorkerPool::selectPeerDevice
+        // and their efa/cxi counterparts). A publisher emits exactly one key
+        // per device, so a descriptor whose key vector is longer than its
+        // device list can drive device_id past the end of devices[]. barex is
+        // excluded: it hands the whole rkey vector to the peer rather than
+        // indexing it by device_id, and its key count comes from the mempool
+        // MR set rather than the device list.
+        const bool keys_indexed_by_device = desc->protocol == "rdma" ||
+                                            desc->protocol == "efa" ||
+                                            desc->protocol == "cxi";
+
         for (const auto &bufferJSON : segmentJSON["buffers"]) {
             BufferDesc buffer;
             buffer.name = bufferJSON["name"].asString();
@@ -783,13 +815,16 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
                     static_cast<decltype(buffer.lkey)::value_type>(
                         lkeyJSON.asUInt64()));
             if (buffer.name.empty() || !buffer.addr || !buffer.length ||
-                buffer.rkey.empty() ||
-                buffer.rkey.size() != buffer.lkey.size()) {
+                (!buffer.rkey.empty() &&
+                 (buffer.rkey.size() != buffer.lkey.size() ||
+                  (keys_indexed_by_device &&
+                   buffer.rkey.size() != desc->devices.size())))) {
                 LOG(WARNING)
                     << "Corrupted segment descriptor, name " << segment_name
                     << " protocol " << desc->protocol << ", " << buffer.name
                     << ", " << buffer.addr << ", " << buffer.length << ", "
-                    << buffer.rkey.size() << ", " << buffer.lkey.size();
+                    << buffer.rkey.size() << ", " << buffer.lkey.size() << ", "
+                    << desc->devices.size();
                 return nullptr;
             }
             desc->buffers.push_back(buffer);
@@ -844,6 +879,23 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             buffer.addr = bufferJSON["addr"].asUInt64();
             buffer.length = bufferJSON["length"].asUInt64();
             if (buffer.name.empty() || !buffer.addr || !buffer.length) {
+                LOG(WARNING) << "Corrupted segment descriptor, name "
+                             << segment_name << " protocol " << desc->protocol;
+                return nullptr;
+            }
+            desc->buffers.push_back(buffer);
+        }
+    } else if (desc->protocol == "nccl") {
+        for (const auto &bufferJSON : segmentJSON["buffers"]) {
+            BufferDesc buffer;
+            buffer.name = bufferJSON["name"].asString();
+            buffer.addr = bufferJSON["addr"].asUInt64();
+            buffer.length = bufferJSON["length"].asUInt64();
+            buffer.device_id = bufferJSON.isMember("device_id")
+                                   ? bufferJSON["device_id"].asInt()
+                                   : -1;
+            if (buffer.name.empty() || !buffer.addr || !buffer.length ||
+                buffer.device_id < 0) {
                 LOG(WARNING) << "Corrupted segment descriptor, name "
                              << segment_name << " protocol " << desc->protocol;
                 return nullptr;
@@ -1411,7 +1463,18 @@ int TransferMetadata::startHandshakeDaemon(
             TransferHandshakeUtil::decode(peer, peer_desc);
             if (on_receive_handshake) {
                 int ret = on_receive_handshake(peer_desc, local_desc);
-                if (ret) return ret;
+                if (ret) {
+                    if (local_desc.reply_msg.empty()) {
+                        local_desc.reply_msg =
+                            "Handshake callback failed: " + std::to_string(ret);
+                    }
+                    // The callback failure is a handshake-level rejection, not
+                    // an RPC handler failure. Return a structured reply so the
+                    // peer can report the rejection reason instead of seeing an
+                    // empty/undecodable handshake response.
+                    local = TransferHandshakeUtil::encode(local_desc);
+                    return 0;
+                }
             }
             local = TransferHandshakeUtil::encode(local_desc);
             return 0;

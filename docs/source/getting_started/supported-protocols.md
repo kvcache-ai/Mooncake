@@ -400,5 +400,5 @@ If a protocol fails to initialize:
 - [Quick Start](quick-start.md) - Start with Mooncake integrations for serving frameworks
 - [Transfer Engine Design](../design/transfer-engine/index.md) - Detailed architecture
 - [Transfer Engine Benchmark](../design/transfer-engine/transfer-engine-bench-tuning.md) - Performance tuning
-- [Python API Reference](../python-api-reference/transfer-engine.md) - API documentation
+- [Python API Reference](../api-reference/python/transfer-engine.md) - API documentation
 - [Deployment Guide](../deployment/mooncake-store-deployment-guide.md) - Production deployment

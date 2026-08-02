@@ -1,12 +1,31 @@
 #ifndef MOONCAKE_WORKER_KERNELS_CUH
 #define MOONCAKE_WORKER_KERNELS_CUH
 
-// Include the main worker header for struct definitions (Task, SegmentInfo,
-// TransferGroupMeta). When compiled by mcc (__MUSA__ defined), the torch-
-// dependent parts are guarded out, making this safe for the MUSA compiler.
-#include <mooncake_worker.cuh>
+#include <cuda_alike.h>
+#include <transfer_engine.h>
+#include <cstddef>
+#include <cstdint>
 
 namespace mooncake {
+
+struct TransferGroupMeta;
+
+#if defined(__CUDACC__) || defined(__MUSA__)
+__global__
+#endif
+    struct Task {
+    volatile bool active = false;
+    int opType =
+        0;  // c10d::OpType as int, for ABI compatibility with kernel code
+    size_t tensorSize;  // In bytes
+    int64_t broadcastRoot;
+    int bufferOffset;
+    uint64_t submitSequence = 0;
+    uint64_t hintRouteId = 0;
+    bool resetFailedRanksHint = false;
+    BatchID batchID;
+    void* transferGroupMeta;
+};
 
 // Kernel function declarations — guarded so g++ doesn't see __global__
 // which it can't parse. Parameters use plain C++ types (int instead of
@@ -15,10 +34,9 @@ namespace mooncake {
 #if defined(__CUDACC__) || defined(__MUSA__)
 __global__ void enqueueTaskKernel(int opType, size_t tensorSize,
                                   int64_t broadcastRoot, int bufferOffset,
-                                  uint64_t submitSequence, void* meta,
-                                  Task* tasks, int numRanks,
-                                  const bool* activeRanks,
-                                  int* activeRanksTensor, size_t taskId);
+                                  uint64_t submitSequence, uint64_t hintRouteId,
+                                  bool resetFailedRanksHint, void* meta,
+                                  Task* tasks, size_t taskId);
 
 template <typename scalar_t>
 __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
@@ -34,10 +52,9 @@ __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
 
 void launchEnqueueTaskKernel(int opType, size_t tensorSize,
                              int64_t broadcastRoot, int bufferOffset,
-                             uint64_t submitSequence, void* meta, Task* tasks,
-                             int numRanks, const bool* activeRanks,
-                             int* activeRanksTensor, size_t taskId,
-                             cudaStream_t stream);
+                             uint64_t submitSequence, uint64_t hintRouteId,
+                             bool resetFailedRanksHint, void* meta, Task* tasks,
+                             size_t taskId, cudaStream_t stream);
 
 void launchReduceKernel_uint8(uint8_t* dst, const uint8_t* src,
                               size_t numElements, size_t numRanks, int op,
