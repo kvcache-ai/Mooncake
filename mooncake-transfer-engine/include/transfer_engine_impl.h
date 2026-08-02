@@ -446,10 +446,13 @@ class TransferEngineImpl {
         notifies_to_send_;
 
     std::string autoDiscoverTransport() const {
+        if (use_barex_) {
+            return "barex";
+        }
         if (auto_discover_config_.protocol == "efa") {
             return "efa";
         }
-        return use_barex_ ? "barex" : "rdma";
+        return "rdma";
     }
 
     // Discover topology and install transports automatically when enabled.

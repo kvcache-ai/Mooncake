@@ -63,6 +63,10 @@ class TransferEngineImplTestPeer {
     static std::string autoDiscoverTransport(const TransferEngineImpl& engine) {
         return engine.autoDiscoverTransport();
     }
+
+    static void setUseBarex(TransferEngineImpl& engine, bool use_barex) {
+        engine.use_barex_ = use_barex;
+    }
 };
 
 TEST(TransferEngineAutoDiscoverTest, SelectsEfaForEfaProtocol) {
@@ -73,6 +77,15 @@ TEST(TransferEngineAutoDiscoverTest, SelectsEfaForEfaProtocol) {
     EXPECT_TRUE(config.enabled);
     EXPECT_EQ(config.protocol, "efa");
     EXPECT_EQ(TransferEngineImplTestPeer::autoDiscoverTransport(engine), "efa");
+}
+
+TEST(TransferEngineAutoDiscoverTest, BarexOverrideTakesPrecedence) {
+    TransferEngineImpl engine(false);
+    engine.setAutoDiscover({.enabled = true, .protocol = "efa"});
+    TransferEngineImplTestPeer::setUseBarex(engine, true);
+
+    EXPECT_EQ(TransferEngineImplTestPeer::autoDiscoverTransport(engine),
+              "barex");
 }
 
 TEST(TransferEngineAutoDiscoverTest, BoolSetterPreservesDefaultSelection) {
