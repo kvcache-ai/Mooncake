@@ -798,18 +798,18 @@ TEST_F(MasterMetricsTest,
     ASSERT_TRUE(
         InjectLocalDiskReplica(svc, client_id, segment.name, kValueSize, key));
 
-    auto local_disk_get = svc.GetReplicaList(key, "default");
+    auto local_disk_get = svc.GetReplicaList(key, TenantId::Default());
     ASSERT_TRUE(local_disk_get.has_value());
     ASSERT_EQ(local_disk_get->replicas.size(), 1);
     ASSERT_TRUE(local_disk_get->replicas[0].is_local_disk_replica());
 
-    auto alloc_result =
-        svc.PromotionAllocStart(client_id, key, "default", kValueSize, {});
+    auto alloc_result = svc.PromotionAllocStart(
+        client_id, key, TenantId::Default(), kValueSize, {});
     ASSERT_TRUE(alloc_result.has_value());
-    ASSERT_TRUE(
-        svc.NotifyPromotionSuccess(client_id, key, "default").has_value());
+    ASSERT_TRUE(svc.NotifyPromotionSuccess(client_id, key, TenantId::Default())
+                    .has_value());
 
-    auto get_replica_result = svc.GetReplicaList(key, "default");
+    auto get_replica_result = svc.GetReplicaList(key, TenantId::Default());
     ASSERT_TRUE(get_replica_result.has_value());
     ASSERT_EQ(get_replica_result->replicas.size(), 2);
     ASSERT_TRUE(get_replica_result->replicas[0].is_local_disk_replica());
