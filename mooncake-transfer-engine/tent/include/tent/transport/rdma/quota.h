@@ -131,6 +131,8 @@ class DeviceSelector {
 
     Status release(int dev_id, uint64_t length, double latency);
 
+    Status getNicLoadStats(std::vector<NicLoadStats> &stats) const;
+
     void updateTrafficStats(int dev_id, uint64_t length) {
         auto it = devices_.find(dev_id);
         if (it != devices_.end()) {

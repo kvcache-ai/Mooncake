@@ -175,7 +175,7 @@ ClassId MemoryPool::getAllocationClassId(const void* memory) const {
   const auto classId = header->classId;
   if (classId >= static_cast<ClassId>(ac_.size()) || classId < 0) {
     // at this point, the slab indicates that it belongs to a bogus classId and
-    // things are corrupt and the caller cant do anything about it. so throw an
+    // things are corrupt and the caller can't do anything about it. so throw an
     // exception to abort.
     throw std::runtime_error(fmt::format(
         "corrupt slab header/memory pool with class id {}", classId));
@@ -263,6 +263,23 @@ void MemoryPool::free(void* alloc) {
   auto& ac = getAllocationClassFor(alloc);
   ac.free(alloc);
   currAllocSize_ -= ac.getAllocSize();
+}
+
+bool MemoryPool::importSlab(Slab* slab,
+                            ClassId classId,
+                            const std::vector<uint32_t>& occupiedChunkIndexes) {
+  auto& ac = getAllocationClassFor(classId);
+  if (!ac.importSlab(slab, occupiedChunkIndexes)) {
+    return false;
+  }
+  currSlabAllocSize_ += Slab::kSize;
+  currAllocSize_ += occupiedChunkIndexes.size() * ac.getAllocSize();
+  return true;
+}
+
+void MemoryPool::importFreeSlab(Slab* slab) {
+  std::unique_lock l(lock_);
+  freeSlabs_.push_back(slab);
 }
 
 void MemoryPool::releaseSlab(SlabReleaseMode mode,

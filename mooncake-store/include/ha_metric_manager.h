@@ -146,6 +146,30 @@ class HAMetricManager {
      */
     void observe_oplog_apply_latency_us(int64_t latency_us);
 
+    // ========== Batch-record OpLog Metrics ==========
+
+    void inc_batch_record_durable_batches(int64_t val = 1);
+    int64_t get_batch_record_durable_batches_total();
+    void inc_batch_record_durable_entries(int64_t val = 1);
+    int64_t get_batch_record_durable_entries_total();
+    void inc_batch_record_retries(int64_t val = 1);
+    int64_t get_batch_record_retries_total();
+
+    void set_batch_record_committed_queue_depth(int64_t depth);
+    int64_t get_batch_record_committed_queue_depth();
+    void set_batch_record_callback_queue_depth(int64_t depth);
+    int64_t get_batch_record_callback_queue_depth();
+    void set_batch_record_last_batch_id(int64_t batch_id);
+    int64_t get_batch_record_last_batch_id();
+    void set_batch_record_durable_sequence(int64_t sequence_id);
+    int64_t get_batch_record_durable_sequence();
+
+    void observe_batch_record_batch_entries(int64_t entries);
+    void observe_batch_record_batch_bytes(int64_t bytes);
+    void observe_batch_record_txn_latency_us(int64_t latency_us);
+    void observe_batch_record_commit_to_durable_us(int64_t latency_us);
+    void observe_batch_record_callback_latency_us(int64_t latency_us);
+
     // ========== State Machine Metrics ==========
 
     /**
@@ -206,6 +230,19 @@ class HAMetricManager {
     // 10ms, 50ms, 100ms, 500ms, 1s)
     ylt::metric::histogram_t oplog_etcd_write_latency_us_;
     ylt::metric::histogram_t oplog_apply_latency_us_;
+
+    ylt::metric::counter_t batch_record_durable_batches_total_;
+    ylt::metric::counter_t batch_record_durable_entries_total_;
+    ylt::metric::counter_t batch_record_retry_total_;
+    ylt::metric::gauge_t batch_record_committed_queue_depth_;
+    ylt::metric::gauge_t batch_record_callback_queue_depth_;
+    ylt::metric::gauge_t batch_record_last_batch_id_;
+    ylt::metric::gauge_t batch_record_durable_sequence_;
+    ylt::metric::histogram_t batch_record_batch_entries_;
+    ylt::metric::histogram_t batch_record_batch_bytes_;
+    ylt::metric::histogram_t batch_record_txn_latency_us_;
+    ylt::metric::histogram_t batch_record_commit_to_durable_us_;
+    ylt::metric::histogram_t batch_record_callback_latency_us_;
 
     // State Machine
     ylt::metric::gauge_t standby_state_;
