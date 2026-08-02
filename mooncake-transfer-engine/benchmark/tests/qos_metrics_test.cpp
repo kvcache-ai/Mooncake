@@ -22,6 +22,7 @@
 #include <gtest/gtest.h>
 
 #include "tent/thirdparty/nlohmann/json.h"
+#include "workload_config.h"
 
 namespace mooncake {
 namespace tent {
@@ -90,6 +91,45 @@ TEST(QosMetricsTest, RejectsAmbiguousOrInvalidContracts) {
     EXPECT_FALSE(validateQosClasses(classes, 2, &error));
 }
 
+TEST(QosMetricsTest, ParsesMixedWorkloadClasses) {
+    std::vector<WorkloadClassConfig> classes;
+    std::string error;
+    ASSERT_TRUE(parseWorkloadClassesJson(
+        R"json([
+          {"name":"foreground","threads":2,"block_size":4096,"batch_size":1,
+           "intent_type":"foreground_get","deadline_us":250,
+           "slo_us":300,"weight":4},
+          {"name":"migration","threads":6,"block_size":4194304,"batch_size":2,
+           "intent_type":"migration","slo_us":0,"weight":1}
+        ])json",
+        &classes, &error))
+        << error;
+    ASSERT_EQ(classes.size(), 2);
+    EXPECT_EQ(classes[0].qos.name, "foreground");
+    EXPECT_EQ(classes[0].block_size, 4096u);
+    EXPECT_EQ(classes[0].deadline_us, 250u);
+    EXPECT_EQ(classes[0].intent_type, IntentType::FOREGROUND_GET);
+    EXPECT_EQ(classes[1].intent_type, IntentType::MIGRATION);
+    EXPECT_TRUE(validateWorkloadClasses(classes, 8, 1UL << 30, &error))
+        << error;
+    const auto qos_classes = qosClassesFromWorkload(classes);
+    ASSERT_EQ(qos_classes.size(), 2);
+    EXPECT_EQ(qos_classes[1].threads, 6);
+}
+
+TEST(QosMetricsTest, RejectsInvalidMixedWorkloadClasses) {
+    std::vector<WorkloadClassConfig> classes;
+    std::string error;
+    EXPECT_FALSE(parseWorkloadClassesJson(
+        R"json([{"name":"fg","threads":1,"block_size":0,"batch_size":1,
+                 "intent_type":"foreground_get","slo_us":100,"weight":1}])json",
+        &classes, &error));
+    EXPECT_FALSE(parseWorkloadClassesJson(
+        R"json([{"name":"fg","threads":1,"block_size":4096,"batch_size":1,
+                 "intent_type":"unknown","slo_us":100,"weight":1}])json",
+        &classes, &error));
+}
+
 TEST(QosMetricsTest, CalculatesSloFairnessIsolationAndUtilization) {
     std::vector<QosClassConfig> classes = {
         {"foreground", 1, 100, 2.0, 0.006},
@@ -128,6 +168,26 @@ TEST(QosMetricsTest, CalculatesSloFairnessIsolationAndUtilization) {
     EXPECT_NEAR(*foreground.isolated_throughput_gbps, 0.006, 1e-12);
 
     EXPECT_FALSE(report.classes[1].slo_attainment);
+}
+
+TEST(QosMetricsTest, UsesPerClassTransferredBytes) {
+    std::vector<QosClassConfig> classes = {
+        {"foreground", 1, 0, 1.0, std::nullopt},
+        {"migration", 1, 0, 1.0, std::nullopt},
+    };
+    std::vector<XferBenchStats> stats(2);
+    for (auto& class_stats : stats) {
+        class_stats.total_duration.add(1000.0);
+        class_stats.transfer_duration.add(100.0);
+    }
+
+    const auto report = calculateQosMetricsFromBenchStats(
+        0, 0, 2, classes, &stats, 0.0, {4096, 4UL << 20});
+    ASSERT_EQ(report.classes.size(), 2);
+    EXPECT_EQ(report.classes[0].transferred_bytes, 4096u);
+    EXPECT_EQ(report.classes[1].transferred_bytes, 4UL << 20);
+    EXPECT_NEAR(report.classes[0].throughput_gbps, 0.004096, 1e-12);
+    EXPECT_NEAR(report.classes[1].throughput_gbps, 4.194304, 1e-12);
 }
 
 TEST(QosMetricsTest, UsesNullForUnavailableJsonMetrics) {

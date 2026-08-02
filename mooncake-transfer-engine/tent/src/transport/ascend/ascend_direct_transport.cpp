@@ -433,8 +433,10 @@ Status AscendDirectTransport::getTransferStatus(SubBatchRef batch, int task_id,
             disconnect(task.remote_hixl, 10);
             task.status_word = TransferStatusEnum::FAILED;
         }
-        req_map_[task.req_handle] =
-            std::make_pair(task.status_word, task.batch_size - 1);
+        if (task.batch_size > 1) {
+            req_map_[task.req_handle] =
+                std::make_pair(task.status_word, task.batch_size - 1);
+        }
     }
     // Read status AFTER the poll so a just-observed completion/failure is
     // reported on this call rather than one poll cycle late.

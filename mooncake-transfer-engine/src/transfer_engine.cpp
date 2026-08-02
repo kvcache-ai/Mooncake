@@ -247,6 +247,11 @@ Status TransferEngine::getBatchTransferStatus(BatchID batch_id,
     return impl_->getBatchTransferStatus(batch_id, status);
 }
 
+Status TransferEngine::getNicLoadStats(std::vector<NicLoadStats>& stats) const {
+    stats.clear();
+    return Status::OK();
+}
+
 Transport* TransferEngine::getTransport(const std::string& proto) {
     return impl_->getTransport(proto);
 }
@@ -260,6 +265,12 @@ device::P2pTransport* TransferEngine::getOrCreateP2pTransport(int num_ranks) {
 device::RdmaTransport* TransferEngine::getOrCreateRdmaTransport(
     const std::vector<std::string>& device_filter) {
     return impl_->getOrCreateRdmaTransport(device_filter);
+}
+#endif
+
+#ifdef USE_NCCL_DEVICE
+device::NcclTransport* TransferEngine::getOrCreateNcclTransport() {
+    return impl_->getOrCreateNcclTransport();
 }
 #endif
 
@@ -747,6 +758,24 @@ Status TransferEngine::getBatchTransferStatus(BatchID batch_id,
         return impl_->getBatchTransferStatus(batch_id, status);
 }
 
+Status TransferEngine::getNicLoadStats(std::vector<NicLoadStats>& stats) const {
+    stats.clear();
+    if (use_tent_) {
+        std::vector<mooncake::tent::NicLoadStats> tent_stats;
+        auto status = impl_tent_->getNicLoadStats(tent_stats);
+        if (!status.ok()) return Status::Context(status.ToString());
+        stats.reserve(tent_stats.size());
+        for (const auto& stat : tent_stats) {
+            NicLoadStats load_stats;
+            load_stats.device_name = stat.device_name;
+            load_stats.inflight_bytes = stat.inflight_bytes;
+            load_stats.ewma_bandwidth_bps = stat.ewma_bandwidth_bps;
+            stats.push_back(load_stats);
+        }
+    }
+    return Status::OK();
+}
+
 Transport* TransferEngine::getTransport(const std::string& proto) {
     if (use_tent_)
         return nullptr;
@@ -765,6 +794,13 @@ device::RdmaTransport* TransferEngine::getOrCreateRdmaTransport(
     const std::vector<std::string>& device_filter) {
     if (use_tent_) return nullptr;
     return impl_->getOrCreateRdmaTransport(device_filter);
+}
+#endif
+
+#ifdef USE_NCCL_DEVICE
+device::NcclTransport* TransferEngine::getOrCreateNcclTransport() {
+    if (use_tent_) return nullptr;
+    return impl_->getOrCreateNcclTransport();
 }
 #endif
 
