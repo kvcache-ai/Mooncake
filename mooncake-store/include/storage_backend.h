@@ -4,14 +4,18 @@
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstring>
 #include <filesystem>
 #include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <set>
+#include <shared_mutex>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -461,8 +465,7 @@ class StorageBackend {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
 
-        std::string real_fsdir = "moon_" + fsdir;
-        return std::make_shared<StorageBackend>(root_dir, real_fsdir,
+        return std::make_shared<StorageBackend>(root_dir, fsdir,
                                                 enable_eviction);
     }
 
@@ -474,9 +477,9 @@ class StorageBackend {
      * Idempotency: This method is idempotent; calling it multiple times has the
      * same effect as calling it once.
      *
-     * Existing files: If there are existing files in the storage directory,
-     * they will be scanned and incorporated into the internal state. No files
-     * are deleted or overwritten during initialization.
+     * Existing files: Committed files are scanned and incorporated into the
+     * internal state. Uncommitted files in the reserved staging directory are
+     * removed before quota reconstruction.
      *
      * Thread-safety: This method is not thread-safe and should not be called
      * concurrently from multiple threads. It is recommended to call Init() from
@@ -531,11 +534,30 @@ class StorageBackend {
         const std::string& key = "",
         StorageBackendInterface::EvictionHandler eviction_handler = nullptr);
 
+    /**
+     * @brief Atomically stores a guard file and conditionally retires another
+     * file while holding both path locks
+     * @return true when the retired file was validated but its unlink failed;
+     * false when it was removed, absent, or rejected by the validator
+     */
+    tl::expected<bool, ErrorCode> StoreObjectAndRemoveFileIf(
+        const std::string& path, std::span<const char> data,
+        const std::string& key, const std::string& retire_path,
+        const std::function<tl::expected<bool, ErrorCode>(
+            const std::string& retire_path, const std::string& guard_path)>&
+            validator,
+        StorageBackendInterface::EvictionHandler eviction_handler = nullptr);
+
     tl::expected<std::vector<std::string>, ErrorCode> EvictAboveDiskWatermark(
         double high_watermark_ratio, double low_watermark_ratio,
         StorageBackendInterface::EvictionHandler eviction_handler = nullptr);
 
-    void UpdateFileRecordKey(const std::string& path, const std::string& key);
+    // Reconcile eviction membership and space accounting with a fully
+    // validated metadata scan. Retained paths keep their FIFO order; newly
+    // discovered paths are appended in scan order. The caller must serialize
+    // this commit against concurrent storage mutations; StorageBackendAdaptor
+    // does so with its scan mutex.
+    void ReconcileFileRecords(const std::vector<FileRecord>& scanned_records);
 
     /**
      * @brief Loads an object into slices
@@ -563,6 +585,28 @@ class StorageBackend {
      * @param path Path to the file to remove
      */
     void RemoveFile(const std::string& path);
+
+    /**
+     * @brief Deletes a file only when a caller-provided validator accepts it
+     * @param path Path to the file to inspect and remove
+     * @param guard_path A second path that must remain stable during validation
+     * @param guard_key Key assigned to guard_path after successful validation
+     * @param validator Validation callback invoked while both path locks are
+     * held
+     * @return true if the file was removed, false if it was absent or rejected
+     */
+    tl::expected<bool, ErrorCode> RemoveFileIf(
+        const std::string& path, const std::string& guard_path,
+        const std::string& guard_key,
+        const std::function<tl::expected<bool, ErrorCode>(
+            const std::string& path, const std::string& guard_path)>&
+            validator);
+
+    /**
+     * @brief Removes uncommitted atomic-write files from the reserved staging
+     * directory and updates eviction accounting
+     */
+    tl::expected<void, ErrorCode> CleanupStagingFiles();
 
     /**
      * @brief Removes objects from the storage backend whose keys match a regex
@@ -594,6 +638,8 @@ class StorageBackend {
     std::unordered_map<std::string, std::list<FileRecord>::iterator>
         file_queue_map_;
     std::unordered_set<std::string> pending_eviction_paths_;
+    std::unordered_map<std::string, size_t> eviction_protected_path_counts_;
+    std::condition_variable_any pending_eviction_cv_;
     mutable std::shared_mutex
         file_queue_mutex_;  // Mutex to protect file queue operations
     static constexpr size_t kFilePathLockCount = 64;
@@ -629,7 +675,13 @@ class StorageBackend {
      */
     FileRecord EvictFile();
 
-    FileRecord PopFileToEvictByFIFO();
+    FileRecord PopFileToEvictByFIFO(
+        const std::unordered_set<std::string>& excluded_paths = {});
+
+    bool ProtectPathsFromEviction(const std::unordered_set<std::string>& paths);
+
+    void UnprotectPathsFromEviction(
+        const std::unordered_set<std::string>& paths);
 
     void RestoreFileToWriteQueueFront(const FileRecord& record);
 
@@ -668,7 +720,8 @@ class StorageBackend {
      */
     tl::expected<std::vector<std::string>, ErrorCode> EnsureDiskSpace(
         size_t required_size,
-        StorageBackendInterface::EvictionHandler eviction_handler = nullptr);
+        StorageBackendInterface::EvictionHandler eviction_handler = nullptr,
+        const std::unordered_set<std::string>& excluded_paths = {});
 
     /**
      * @brief Releases a specified amount of disk space and updates internal
@@ -682,13 +735,6 @@ class StorageBackend {
      * used_space_. Must be called with space_mutex_ locked.
      */
     void RecalculateAvailableSpace();
-
-    /**
-     * @brief Gets the actual filesystem directory name by removing "moon_"
-     * prefix if present.
-     * @return The actual directory name without "moon_" prefix.
-     */
-    std::string GetActualFsdir() const;
 
     /**
      * @brief Checks if disk eviction is enabled for this storage backend.
@@ -773,6 +819,10 @@ class StorageBackendAdaptor : public StorageBackendInterface {
 
     tl::expected<bool, ErrorCode> IsEnableOffloading() override;
 
+    // The handler runs synchronously while this adaptor's scan lock is held.
+    // It must not synchronously call ScanMeta, RemoveAll, BatchOffload, or
+    // EvictAboveDiskWatermark on this adaptor, nor directly mutate its managed
+    // filesystem tree.
     tl::expected<void, ErrorCode> ScanMeta(
         const std::function<ErrorCode(
             const std::vector<std::string>& keys,
@@ -801,15 +851,27 @@ class StorageBackendAdaptor : public StorageBackendInterface {
 
     std::atomic<bool> meta_scanned_{false};
 
+    // Eviction-enabled backends expose mount capability before their first
+    // metadata scan. Once recovery begins, a failed or incomplete scan gates
+    // the data plane until a full retry succeeds.
+    std::atomic<bool> metadata_recovery_started_{false};
+
     std::unique_ptr<StorageBackend> storage_backend_;
 
     static std::string ConcatSlicesToString(const std::vector<Slice>& slices);
+
+    // Allows concurrent writes while isolating a full metadata scan from file
+    // changes made through this adaptor.
+    mutable std::shared_mutex scan_mutex_;
 
     mutable Mutex mutex_;
 
     int64_t total_keys GUARDED_BY(mutex_);
 
     int64_t total_size GUARDED_BY(mutex_);
+
+    std::unordered_map<std::string, int64_t> accounted_size_by_key_
+        GUARDED_BY(mutex_);
 
     struct KVEntry {
         std::string key;    // K tensor or its storage identifier
@@ -822,6 +884,19 @@ class StorageBackendAdaptor : public StorageBackendInterface {
 
         YLT_REFL(KVEntry, key, value);
     };
+
+    struct LoadedKVEntry {
+        KVEntry kv;
+        int64_t serialized_size;
+    };
+
+    tl::expected<std::optional<LoadedKVEntry>, ErrorCode> TryLoadKvEntry(
+        const std::string& path, bool unrepresentable_is_missing = false);
+
+    tl::expected<bool, ErrorCode> CleanupLegacyFile(const std::string& key);
+
+    void UpsertKeyAccounting(const std::string& key, int64_t serialized_size)
+        REQUIRES(mutex_);
 };
 
 class BucketStorageBackend : public StorageBackendInterface {
