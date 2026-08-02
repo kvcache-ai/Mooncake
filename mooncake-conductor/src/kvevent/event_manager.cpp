@@ -64,6 +64,14 @@ bool JsonInt64(const Json::Value& value, int64_t* out) {
     return false;
 }
 
+// The HTTP registration contract intentionally exposes only the two vLLM v1
+// recipes.  Validate this at the request boundary before invoking root
+// derivation so an unsupported selector cannot trigger any hash work or state
+// mutation, and so the error is attributed to the algorithm field.
+bool IsSupportedHashAlgorithm(std::string_view algorithm) {
+    return algorithm == "sha256" || algorithm == "sha256_cbor";
+}
+
 // Writes an error response: text/plain body with trailing \n.
 void HttpError(coro_http_response& resp, status_type status,
                const std::string& message) {
@@ -219,12 +227,22 @@ bool ParseHashProfileConfig(const Json::Value& body, coro_http_response& resp,
         return false;
     }
 
+    if (!IsSupportedHashAlgorithm(source.algorithm)) {
+        HttpJsonError(resp, "invalid_value",
+                      "unsupported hash algorithm: " + source.algorithm,
+                      "algorithm");
+        return false;
+    }
+
+    // Resolve the selected recipe before ParseServiceConfigRequest returns.
+    // SubscribeToService (and thus prefix-index/ZMQ state mutation) is only
+    // reached after this derived profile has been validated.
     if (std::string error = prefixindex::ResolveHashProfile(source, profile);
         !error.empty()) {
         const char* field = "python_hash_seed";
         if (source.strategy != "vllm_v1") {
             field = "strategy";
-        } else if (source.algorithm != "sha256_cbor") {
+        } else if (!IsSupportedHashAlgorithm(source.algorithm)) {
             field = "algorithm";
         } else if (source.index_projection != "low64_be") {
             field = "index_projection";
@@ -504,6 +522,20 @@ Json::Value CacheHitResultToJson(const prefixindex::CacheHitResult& result) {
     return out;
 }
 
+Json::Value HashProfileToJson(const common::ResolvedHashProfile& profile) {
+    Json::Value out(Json::objectValue);
+    // Keep the resolved profile fields in one place so /services and
+    // /global_view cannot drift when a new recipe is added.  root_digest is
+    // intentionally emitted here only as a derived diagnostic; it is not
+    // accepted by ParseHashProfileConfig as registration input.
+    out["strategy"] = profile.strategy;
+    out["algorithm"] = profile.algorithm;
+    out["python_hash_seed"] = profile.python_hash_seed;
+    out["root_digest"] = profile.root_digest;
+    out["index_projection"] = profile.index_projection;
+    return out;
+}
+
 Json::Value ServiceConfigToJson(const common::ServiceConfig& svc) {
     // Field names are the exported struct-field names of
     // common.ServiceConfig (fixed JSON wire contract).
@@ -522,13 +554,7 @@ Json::Value ServiceConfigToJson(const common::ServiceConfig& svc) {
     } else {
         out["CacheGroup"] = Json::Value(Json::nullValue);
     }
-    Json::Value profile(Json::objectValue);
-    profile["strategy"] = svc.hash_profile.strategy;
-    profile["algorithm"] = svc.hash_profile.algorithm;
-    profile["python_hash_seed"] = svc.hash_profile.python_hash_seed;
-    profile["root_digest"] = svc.hash_profile.root_digest;
-    profile["index_projection"] = svc.hash_profile.index_projection;
-    out["HashProfile"] = profile;
+    out["HashProfile"] = HashProfileToJson(svc.hash_profile);
     return out;
 }
 

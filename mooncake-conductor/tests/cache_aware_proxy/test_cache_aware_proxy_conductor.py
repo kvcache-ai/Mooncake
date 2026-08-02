@@ -51,6 +51,28 @@ class ConductorClientTest(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("replay_endpoint", payload)
             self.assertNotIn("cache_salt", payload)
 
+    async def test_registration_payloads_preserve_selected_hash_algorithm(self) -> None:
+        for algorithm in ("sha256", "sha256_cbor"):
+            with self.subTest(algorithm=algorithm):
+                raw = __import__("_support").cloned_config_dict()
+                raw["prefill"]["config"]["hash_profile"]["algorithm"] = algorithm
+                config = proxy.parse_config(raw)
+                factory = RecordingClientFactory(registration_success_handler)
+                client = factory(
+                    config.conductor.address, config.conductor.query_timeout_seconds
+                )
+                conductor = proxy.ConductorClient(
+                    config.conductor, config.prefill.config, client
+                )
+                self.addAsyncCleanup(client.aclose)
+
+                payloads = conductor.registration_payloads(config.prefill.instances)
+
+                self.assertEqual(
+                    {algorithm},
+                    {payload["hash_profile"]["algorithm"] for payload in payloads},
+                )
+
     async def test_runtime_registers_all_ranks_and_does_not_unregister(self) -> None:
         config = valid_config()
         factory = RecordingClientFactory(registration_success_handler)

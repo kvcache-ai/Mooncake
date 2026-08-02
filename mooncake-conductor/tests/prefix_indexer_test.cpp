@@ -38,6 +38,8 @@ constexpr char kRootDigest[] =
     "4e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e";
 constexpr char kPaddedSeedRootDigest[] =
     "8d912e4e62b3cc377b1d1c7a14ef61dffbdaa0990237035c05401c29414c4172";
+constexpr char kPickleRootDigest[] =
+    "1973e23848344dc43a988a9b478663803cfffe1243480253f9a3cf004b14aa7c";
 
 ContextKey TestContext(int64_t block_size = 16) {
     return {.tenant_id = "tenant-a",
@@ -59,6 +61,14 @@ HashProfile PaddedSeedProfile() {
             .algorithm = "sha256_cbor",
             .python_hash_seed = "00",
             .root_digest = kPaddedSeedRootDigest,
+            .index_projection = "low64_be"};
+}
+
+HashProfile PickleProfile() {
+    return {.strategy = "vllm_v1",
+            .algorithm = "sha256",
+            .python_hash_seed = "0",
+            .root_digest = kPickleRootDigest,
             .index_projection = "low64_be"};
 }
 
@@ -312,6 +322,43 @@ TEST(Registration, ProfileBindingValidationIsExactAndLookupOnly) {
     const HashProfile conflict = PaddedSeedProfile();
     EXPECT_FALSE(table.ValidateProfileBinding(TestContext(), conflict).empty());
     EXPECT_EQ(PrefixCacheTableTestPeer::Snapshot(table), registered);
+}
+
+TEST(Registration, MixedAlgorithmsUnderOneContextAreRejected) {
+    // The resolved profile is immutable per ContextKey: the same seed under
+    // the other supported algorithm is still a conflict, in both orders.
+    {
+        PrefixCacheTable table;
+        RegisterOrFail(table, Registration());
+        const auto before = PrefixCacheTableTestPeer::Snapshot(table);
+
+        auto conflicting = Registration("instance-b", 1);
+        conflicting.profile = PickleProfile();
+        const auto result = table.Register(conflicting);
+        EXPECT_FALSE(result.error.empty());
+        EXPECT_FALSE(result.inserted);
+        EXPECT_EQ(PrefixCacheTableTestPeer::Snapshot(table), before);
+
+        EXPECT_FALSE(
+            table.ValidateProfileBinding(TestContext(), PickleProfile())
+                .empty());
+        EXPECT_EQ(PrefixCacheTableTestPeer::Snapshot(table), before);
+    }
+    {
+        PrefixCacheTable table;
+        auto pickle_registration = Registration();
+        pickle_registration.profile = PickleProfile();
+        RegisterOrFail(table, pickle_registration);
+        const auto before = PrefixCacheTableTestPeer::Snapshot(table);
+        EXPECT_EQ(table.ValidateProfileBinding(TestContext(), PickleProfile()),
+                  "");
+
+        auto conflicting = Registration("instance-b", 1);
+        const auto result = table.Register(conflicting);
+        EXPECT_FALSE(result.error.empty());
+        EXPECT_FALSE(result.inserted);
+        EXPECT_EQ(PrefixCacheTableTestPeer::Snapshot(table), before);
+    }
 }
 
 TEST(Mutations, StoreRequiresKnownContextAndRegisteredGpuRank) {

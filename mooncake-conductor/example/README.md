@@ -112,9 +112,62 @@ CLI mode expresses the same mapping as follows:
   per publisher rank, including multiple ranks for one instance when needed;
 - `--prefiller-registration` may reference only an ID listed by
   `--prefiller-instance-ids`;
-- the hash strategy, algorithm, and projection are fixed to `vllm_v1`,
-  `sha256_cbor`, and `low64_be`; supply the deployment-specific seed with
-  `--python-hash-seed`.
+- the hash strategy and projection are fixed to `vllm_v1` and `low64_be`;
+  select the hash algorithm with `--hash-algorithm sha256` or
+  `--hash-algorithm sha256_cbor` (legacy CLI default: `sha256_cbor`), and
+  supply the deployment-specific seed with `--python-hash-seed`.
+
+### Hash Algorithm Compatibility
+
+Conductor reproduces vLLM v1 prefix-cache block hashes and supports exactly
+two recipes, selected by `hash_profile.algorithm`:
+
+- `sha256`: SHA-256 over CPython Pickle protocol-5 serialization. This is the
+  current vLLM default (`--prefix-caching-hash-algo sha256`).
+- `sha256_cbor`: SHA-256 over canonical CBOR. This remains the proxy's legacy
+  CLI default so existing deployments keep their cache compatibility
+  implicitly.
+
+The registered algorithm must match the `--prefix-caching-hash-algo` of every
+vLLM producer sharing the context, and every producer must run with the same
+explicit fixed seed:
+
+```bash
+export PYTHONHASHSEED=0
+```
+
+An unset producer seed is random per process and cannot be reconstructed by
+Conductor. Never mix algorithms under one active context
+(tenant/model/LoRA/block size): projected keys from the two recipes are
+unrelated, Conductor rejects the conflicting registration, and switching
+requires unregistering the old profile and repopulating cache presence.
+
+Conductor trusts the registered profile as the compatibility contract: KV
+events carry no algorithm or protocol metadata, so a producer whose actual
+`--prefix-caching-hash-algo` disagrees with the registered value publishes
+hashes Conductor cannot match, and queries silently return zero hits. A
+producer-side handshake/canary check is tracked as follow-up work.
+
+The supported input boundary is plain token blocks with an optional LoRA name
+and a first-block cache salt. vLLM multimodal and prompt-embedding extra hash
+keys are not reconstructible by Conductor's query contract; requests whose
+cache identity depends on them are not compatible with this routing example.
+
+For a vLLM deployment using its defaults, register `sha256`:
+
+```jsonc
+"hash_profile": {
+  "strategy": "vllm_v1",
+  "algorithm": "sha256",
+  "python_hash_seed": "0",
+  "index_projection": "low64_be"
+}
+```
+
+and drop `--prefix-caching-hash-algo sha256_cbor` from the vLLM launch flags
+below (or pass `--prefix-caching-hash-algo sha256` explicitly). To keep the
+opt-in CBOR recipe, leave both the vLLM flag and the registered profile at
+`sha256_cbor` as shown in the sample configuration.
 
 The example intentionally does not configure replay. It omits
 `replay_endpoint` from every registration request, and vLLM KV-event
@@ -159,7 +212,9 @@ at or after commit `5b3807e862fe70f51139ac518a5dd361e57de2e5` (PR #42892,
 events can register successfully but are rejected during event decoding, so
 queries remain at zero hits.
 
-For the first sample prefill, the relevant flags are:
+For the first sample prefill, the relevant flags are (CBOR recipe shown; for
+a vLLM-default `sha256` deployment, drop `--prefix-caching-hash-algo` or pass
+`sha256` and register the matching algorithm as described above):
 
 ```bash
 export PYTHONHASHSEED=0

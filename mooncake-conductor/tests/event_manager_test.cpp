@@ -76,13 +76,16 @@ using conductor::zmq::VllmStoredEvent;
 
 constexpr std::string_view kRootDigest =
     "4e1195df020de59e0d65a33a4279f1183e7ae4e5d980e309f8b55adff2e61c3e";
+constexpr std::string_view kPickleRootDigest =
+    "1973e23848344dc43a988a9b478663803cfffe1243480253f9a3cf004b14aa7c";
 constexpr std::string_view kOtherRootDigest =
     "0000000000000000000000000000000000000000000000000000000000000000";
 
-HashProfile TestProfile(std::string python_hash_seed = "0") {
+HashProfile TestProfile(std::string python_hash_seed = "0",
+                        std::string algorithm = "sha256_cbor") {
     const conductor::common::HashProfileConfig source{
         .strategy = "vllm_v1",
-        .algorithm = "sha256_cbor",
+        .algorithm = std::move(algorithm),
         .python_hash_seed = std::move(python_hash_seed),
         .index_projection = "low64_be",
     };
@@ -551,6 +554,45 @@ TEST_F(QueryHttpTest, ReturnsExactSharedCacheResponse) {
     ASSERT_NO_FATAL_FAILURE(ExpectRankMapsAligned(body["instances"]["2"]));
 }
 
+TEST_F(QueryHttpTest, PickleProfileResolvesQueryHashes) {
+    auto service = VllmService("pickle", "default", 0, 16);
+    service.model_name = "pickle-model";
+    service.hash_profile = TestProfile("0", "sha256");
+    ASSERT_TRUE(manager_->GetIndexer()
+                    ->Register(RegistrationFor(service))
+                    .error.empty());
+
+    const ContextKey context = ContextFor(service);
+    const auto prefixes =
+        ProjectedFor(context, TestProfile("0", "sha256"), tokens_);
+    ASSERT_EQ(prefixes.size(), 3u);
+    ASSERT_TRUE(manager_->GetIndexer()
+                    ->StoreGpu({.context = context,
+                                .prefixes = {prefixes[0], prefixes[1]},
+                                .owner = {.source_stream = "engine-pickle",
+                                          .instance_id = "pickle",
+                                          .dp_rank = 0},
+                                .effective_block_size = 16})
+                    .empty());
+
+    Json::Value body;
+    ASSERT_NO_FATAL_FAILURE(
+        ExpectJsonStatus(Post(QueryJson(context, tokens_)), 200, &body));
+    ASSERT_TRUE(body["instances"].isMember("pickle"));
+    const Json::Value& instance = body["instances"]["pickle"];
+    EXPECT_EQ(instance["longest_matched"].asInt64(), 32);
+    EXPECT_EQ(instance["gpu"].asInt64(), 32);
+    EXPECT_EQ(instance["dp"]["0"].asInt64(), 32);
+    ASSERT_NO_FATAL_FAILURE(ExpectRankMapsAligned(instance));
+
+    // The CBOR-bound context is unaffected: its instances still resolve with
+    // their own registered profile.
+    Json::Value cbor_body;
+    ASSERT_NO_FATAL_FAILURE(
+        ExpectJsonStatus(Post(ValidQuery()), 200, &cbor_body));
+    EXPECT_EQ(cbor_body["instances"]["1"]["gpu"].asInt64(), 32);
+}
+
 TEST_F(QueryHttpTest, ReturnsOrderedFourBlockTierBoundaries) {
     auto service = VllmService("ordered", "default", 0, 16);
     service.model_name = "ordered-model";
@@ -865,6 +907,77 @@ TEST_F(RegistrationHttpTest, ResolvesReportsAndRetriesSeedProfile) {
     const Json::Value& context_profile = view["contexts"][0]["hash_profile"];
     EXPECT_EQ(context_profile["python_hash_seed"].asString(), "0");
     EXPECT_EQ(context_profile["root_digest"].asString(), kRootDigest);
+}
+
+TEST_F(RegistrationHttpTest, ResolvesAndReportsPickleProfile) {
+    auto service = VllmService();
+    service.hash_profile = TestProfile("0", "sha256");
+    ASSERT_EQ(Register(service).status, 200);
+    ASSERT_EQ(Register(service).status, 200);
+    EXPECT_EQ(EventManagerTestPeer::SubscriberCount(*manager_), 1u);
+
+    const HttpResponse services_response = HttpGet(port_, "/services");
+    ASSERT_EQ(services_response.status, 200);
+    const Json::Value services = ParseJsonResponse(services_response);
+    ASSERT_EQ(services["count"].asInt(), 1);
+    ASSERT_EQ(services["services"].size(), 1u);
+    const Json::Value& service_profile = services["services"][0]["HashProfile"];
+    EXPECT_EQ(service_profile["strategy"].asString(), "vllm_v1");
+    EXPECT_EQ(service_profile["algorithm"].asString(), "sha256");
+    EXPECT_EQ(service_profile["python_hash_seed"].asString(), "0");
+    EXPECT_EQ(service_profile["root_digest"].asString(), kPickleRootDigest);
+    EXPECT_EQ(service_profile["index_projection"].asString(), "low64_be");
+
+    const HttpResponse view_response = HttpGet(port_, "/global_view");
+    ASSERT_EQ(view_response.status, 200);
+    const Json::Value view = ParseJsonResponse(view_response);
+    ASSERT_EQ(view["context_count"].asInt(), 1);
+    ASSERT_EQ(view["contexts"].size(), 1u);
+    const Json::Value& context_profile = view["contexts"][0]["hash_profile"];
+    EXPECT_EQ(context_profile["algorithm"].asString(), "sha256");
+    EXPECT_EQ(context_profile["python_hash_seed"].asString(), "0");
+    EXPECT_EQ(context_profile["root_digest"].asString(), kPickleRootDigest);
+
+    // The registered ContextKey resolves the query profile: an empty query
+    // for the registered context succeeds.
+    const Json::Value query = QueryEmpty(service);
+    EXPECT_TRUE(query.isMember("instances"));
+}
+
+TEST_F(RegistrationHttpTest, RejectsUnsupportedAlgorithmWithoutMutation) {
+    for (const std::string algorithm : {"md5", "sha512", "xxhash", "SHA256"}) {
+        SCOPED_TRACE(algorithm);
+        Json::Value body = ServiceJson(VllmService());
+        body["hash_profile"]["algorithm"] = algorithm;
+        const HttpResponse response =
+            HttpPostJson(port_, "/register", JsonDocument(body));
+        EXPECT_EQ(response.status, 400);
+        const Json::Value error = ParseJsonResponse(response);
+        EXPECT_EQ(error["reason"].asString(), "invalid_value");
+        EXPECT_EQ(error["field"].asString(), "algorithm");
+        EXPECT_EQ(EventManagerTestPeer::SubscriberCount(*manager_), 0u);
+        EXPECT_EQ(manager_->GetIndexer()->GetGlobalView().context_count, 0);
+    }
+}
+
+TEST_F(RegistrationHttpTest, MixedAlgorithmConflictIsAtomic) {
+    const auto original = VllmService("instance-1");
+    ASSERT_EQ(Register(original).status, 200);
+
+    auto conflicting = VllmService("instance-2");
+    conflicting.hash_profile = TestProfile("0", "sha256");
+    const HttpResponse response = Register(conflicting);
+    ASSERT_EQ(response.status, 400);
+    EXPECT_EQ(ParseJsonResponse(response)["reason"].asString(),
+              "invalid_registration");
+
+    EXPECT_EQ(EventManagerTestPeer::SubscriberCount(*manager_), 1u);
+    const auto view = manager_->GetIndexer()->GetGlobalView();
+    ASSERT_EQ(view.contexts.size(), 1u);
+    EXPECT_EQ(view.contexts[0].profile, TestProfile());
+    EXPECT_EQ(view.contexts[0].instance_ranks.size(), 1u);
+    EXPECT_TRUE(view.contexts[0].instance_ranks.contains("instance-1"));
+    EXPECT_FALSE(view.contexts[0].instance_ranks.contains("instance-2"));
 }
 
 TEST_F(RegistrationHttpTest, RejectsInvalidSeedProfilesWithoutMutation) {
@@ -2065,6 +2178,48 @@ TEST(ParseConfig, RejectsLegacyMissingMalformedAndUnknownProfiles) {
     EXPECT_EQ(services[0].instance_id, "valid");
     EXPECT_EQ(services[0].hash_profile, TestProfile("00"));
     EXPECT_NE(services[0].hash_profile.root_digest, kRootDigest);
+    std::remove(path.c_str());
+}
+
+TEST(ParseConfig, AcceptsPickleAlgorithmAndRejectsUnsupportedAlgorithms) {
+    ConfigEnvGuard guard;
+    const std::string path =
+        ::testing::TempDir() + "conductor_cfg_pickle_profile.json";
+    {
+        std::ofstream out(path);
+        out << R"({
+          "kvevent_instance": {
+            "pickle": {
+              "endpoint": "tcp://127.0.0.1:5561", "type": "vLLM",
+              "modelname": "m1", "block_size": 16, "dp_rank": 0,
+              "hash_profile": {
+                "strategy": "vllm_v1", "algorithm": "sha256",
+                "python_hash_seed": "0", "index_projection": "low64_be"}},
+            "bad-md5": {
+              "endpoint": "tcp://127.0.0.1:5562", "type": "vLLM",
+              "modelname": "m1", "block_size": 16, "dp_rank": 0,
+              "hash_profile": {
+                "strategy": "vllm_v1", "algorithm": "md5",
+                "python_hash_seed": "0", "index_projection": "low64_be"}},
+            "bad-xxhash": {
+              "endpoint": "tcp://127.0.0.1:5563", "type": "vLLM",
+              "modelname": "m1", "block_size": 16, "dp_rank": 0,
+              "hash_profile": {
+                "strategy": "vllm_v1", "algorithm": "xxhash",
+                "python_hash_seed": "0", "index_projection": "low64_be"}}
+          }
+        })";
+    }
+    guard.SetPath(path);
+
+    int port = 13333;
+    const auto services = conductor::kvevent::ParseConfig(&port);
+    ASSERT_EQ(services.size(), 1u);
+    EXPECT_EQ(services[0].instance_id, "pickle");
+    // Static configuration and HTTP registration must resolve identical
+    // profiles from identical fields.
+    EXPECT_EQ(services[0].hash_profile, TestProfile("0", "sha256"));
+    EXPECT_EQ(services[0].hash_profile.root_digest, kPickleRootDigest);
     std::remove(path.c_str());
 }
 
