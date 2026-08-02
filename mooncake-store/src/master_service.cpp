@@ -671,6 +671,13 @@ std::optional<uint32_t> MasterService::GetNoFHeartbeatFailureCountForTesting(
     return it->second.consecutive_failures;
 }
 
+TieredStorageUsageSnapshot MasterService::GetStorageUsageSnapshot() const {
+    return {
+        .memory = segment_manager_.GetMemoryUsageSnapshot(),
+        .nof = nof_segment_manager_.GetUsageSnapshot(),
+    };
+}
+
 bool MasterService::IsTenantQuotaEnabled() const {
     return enable_multi_tenants_;
 }
@@ -7164,7 +7171,7 @@ void MasterService::EvictionThreadFunc() {
 
 #ifdef USE_NOF
         double nof_used_ratio =
-            MasterMetricManager::instance().get_global_nof_used_ratio();
+            nof_segment_manager_.GetUsageSnapshot().used_ratio();
         if (nof_used_ratio > nof_eviction_high_watermark_ratio_ ||
             (need_nof_eviction_ && nof_eviction_ratio_ > 0.0)) {
             double nof_evict_ratio_target =
@@ -7687,7 +7694,7 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
         }
 
         LOG(INFO) << "[Restore] Total allocated size after restore: "
-                  << MasterMetricManager::instance().get_allocated_mem_size();
+                  << segment_manager_.GetMemoryUsageSnapshot().used_bytes;
     }
 
     // Rebuild total capacity metrics

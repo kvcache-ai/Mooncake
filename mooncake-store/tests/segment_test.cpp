@@ -1,5 +1,7 @@
 #include "segment.h"
 
+#include "master_metric_manager.h"
+
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
@@ -141,6 +143,25 @@ class SegmentTest : public ::testing::Test {
         client_ids.push_back(client_id);
         ValidateMountedLocalDiskSegments(segment_manager, segments, client_ids);
     }
+
+    void InstallSharedCxlAllocatorForTesting(
+        SegmentManager& segment_manager,
+        const std::shared_ptr<BufferAllocatorBase>& allocator,
+        const std::vector<Segment>& segments) {
+        segment_manager.cxl_global_allocator_ = allocator;
+        for (const auto& segment : segments) {
+            segment_manager.mounted_segments_[segment.id] = {
+                segment, SegmentStatus::OK, allocator};
+        }
+    }
+
+    std::shared_ptr<BufferAllocatorBase> GetNoFAllocatorForTesting(
+        NoFSegmentManager& segment_manager, const UUID& segment_id) {
+        auto it = segment_manager.mounted_segments_.find(segment_id);
+        return it == segment_manager.mounted_segments_.end()
+                   ? nullptr
+                   : it->second.buf_allocator;
+    }
 };
 
 // Mount Segment Operations Tests:
@@ -191,6 +212,9 @@ TEST_F(SegmentTest, MemoryUsageSnapshotTracksMountedAllocatorState) {
     EXPECT_EQ(snapshot.used_bytes, kAllocationSize);
     EXPECT_EQ(snapshot.capacity_bytes, kSegmentSize);
     EXPECT_DOUBLE_EQ(snapshot.used_ratio(), 0.25);
+    ASSERT_EQ(snapshot.segments.size(), 1u);
+    EXPECT_EQ(snapshot.segments.at(segment.name).used_bytes, kAllocationSize);
+    EXPECT_EQ(snapshot.segments.at(segment.name).capacity_bytes, kSegmentSize);
 
     {
         auto segment_access = segment_manager.getSegmentAccess();
@@ -206,11 +230,11 @@ TEST_F(SegmentTest, MemoryUsageSnapshotTracksMountedAllocatorState) {
     {
         auto segment_access = segment_manager.getSegmentAccess();
         size_t metrics_dec_capacity = 0;
-        ASSERT_EQ(segment_access.PrepareUnmountSegment(
-                      segment.id, metrics_dec_capacity),
+        ASSERT_EQ(segment_access.PrepareUnmountSegment(segment.id,
+                                                       metrics_dec_capacity),
                   ErrorCode::OK);
-        ASSERT_EQ(segment_access.CommitUnmountSegment(
-                      segment.id, client_id, metrics_dec_capacity),
+        ASSERT_EQ(segment_access.CommitUnmountSegment(segment.id, client_id,
+                                                      metrics_dec_capacity),
                   ErrorCode::OK);
     }
 
@@ -218,6 +242,97 @@ TEST_F(SegmentTest, MemoryUsageSnapshotTracksMountedAllocatorState) {
     EXPECT_EQ(snapshot.used_bytes, 0u);
     EXPECT_EQ(snapshot.capacity_bytes, 0u);
     EXPECT_DOUBLE_EQ(snapshot.used_ratio(), 0.0);
+}
+
+TEST_F(SegmentTest, MemoryUsageSnapshotCountsSharedCxlAllocatorOnce) {
+    SegmentManager segment_manager(BufferAllocatorType::OFFSET,
+                                   /*enable_cxl=*/true);
+    constexpr size_t kSegmentSize = 16 * 1024 * 1024;
+    constexpr size_t kAllocationSize = 4 * 1024 * 1024;
+    auto allocator = std::make_shared<OffsetBufferAllocator>(
+        "cxl_pool", 0x200000000, kSegmentSize, "cxl_pool");
+    InstallSharedCxlAllocatorForTesting(segment_manager, allocator, {});
+
+    auto buffer = allocator->allocate(kAllocationSize);
+    ASSERT_NE(buffer, nullptr);
+
+    auto snapshot = segment_manager.GetMemoryUsageSnapshot();
+    EXPECT_EQ(snapshot.used_bytes, kAllocationSize);
+    EXPECT_EQ(snapshot.capacity_bytes, kSegmentSize);
+
+    Segment first;
+    first.id = generate_uuid();
+    first.name = "cxl_client_a";
+    first.protocol = "cxl";
+    Segment second;
+    second.id = generate_uuid();
+    second.name = "cxl_client_b";
+    second.protocol = "cxl";
+    InstallSharedCxlAllocatorForTesting(segment_manager, allocator,
+                                        {first, second});
+
+    snapshot = segment_manager.GetMemoryUsageSnapshot();
+    EXPECT_EQ(snapshot.used_bytes, kAllocationSize);
+    EXPECT_EQ(snapshot.capacity_bytes, kSegmentSize);
+    ASSERT_EQ(snapshot.segments.size(), 1u);
+    EXPECT_EQ(snapshot.segments.at("cxl_pool").used_bytes, kAllocationSize);
+    EXPECT_EQ(snapshot.segments.at("cxl_pool").capacity_bytes, kSegmentSize);
+}
+
+TEST_F(SegmentTest, NoFUsageSnapshotSurvivesMetricsReset) {
+    NoFSegmentManager segment_manager(BufferAllocatorType::OFFSET);
+    constexpr size_t kSegmentSize = 16 * 1024 * 1024;
+    constexpr size_t kAllocationSize = 4 * 1024 * 1024;
+
+    NoFSegment segment;
+    segment.id = generate_uuid();
+    segment.name = "nof_usage_snapshot_segment";
+    segment.size = kSegmentSize;
+    segment.base = 0x300000000;
+    segment.te_endpoint = "nof_usage_snapshot_endpoint";
+    UUID client_id = generate_uuid();
+
+    {
+        auto segment_access = segment_manager.getNoFSegmentAccess();
+        ASSERT_EQ(segment_access.MountSegment(segment, client_id),
+                  ErrorCode::OK);
+    }
+    auto allocator = GetNoFAllocatorForTesting(segment_manager, segment.id);
+    ASSERT_NE(allocator, nullptr);
+    auto buffer = allocator->allocate(kAllocationSize);
+    ASSERT_NE(buffer, nullptr);
+
+    auto snapshot = segment_manager.GetUsageSnapshot();
+    EXPECT_EQ(snapshot.used_bytes, kAllocationSize);
+    EXPECT_EQ(snapshot.capacity_bytes, kSegmentSize);
+    EXPECT_DOUBLE_EQ(snapshot.used_ratio(), 0.25);
+
+    auto& metrics = MasterMetricManager::instance();
+    metrics.reset_allocated_nof_size();
+    metrics.reset_total_nof_capacity();
+    EXPECT_EQ(metrics.get_allocated_nof_size(), 0);
+    EXPECT_EQ(metrics.get_total_nof_capacity(), 0);
+
+    snapshot = segment_manager.GetUsageSnapshot();
+    EXPECT_EQ(snapshot.used_bytes, kAllocationSize);
+    EXPECT_EQ(snapshot.capacity_bytes, kSegmentSize);
+    EXPECT_DOUBLE_EQ(snapshot.used_ratio(), 0.25);
+
+    // Restore global gauges before teardown because allocator and segment
+    // cleanup still emit their matching decrements.
+    metrics.inc_allocated_nof_size("", kAllocationSize);
+    metrics.inc_total_nof_capacity("", kSegmentSize);
+    buffer.reset();
+    {
+        auto segment_access = segment_manager.getNoFSegmentAccess();
+        size_t metrics_dec_capacity = 0;
+        ASSERT_EQ(segment_access.PrepareUnmountSegment(segment.id,
+                                                       metrics_dec_capacity),
+                  ErrorCode::OK);
+        ASSERT_EQ(segment_access.CommitUnmountSegment(segment.id, client_id,
+                                                      metrics_dec_capacity),
+                  ErrorCode::OK);
+    }
 }
 
 // MountSegmentDuplicate Tests:

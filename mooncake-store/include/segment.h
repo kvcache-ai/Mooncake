@@ -440,7 +440,7 @@ class SegmentSerializer {
     SegmentManager* segment_manager_;
 };
 
-struct MemoryUsageSnapshot {
+struct StorageUsage {
     size_t used_bytes{0};
     size_t capacity_bytes{0};
 
@@ -451,6 +451,15 @@ struct MemoryUsageSnapshot {
         return static_cast<double>(used_bytes) /
                static_cast<double>(capacity_bytes);
     }
+};
+
+struct StorageUsageSnapshot : StorageUsage {
+    std::map<std::string, StorageUsage> segments;
+};
+
+struct TieredStorageUsageSnapshot {
+    StorageUsageSnapshot memory;
+    StorageUsageSnapshot nof;
 };
 
 class SegmentManager {
@@ -506,7 +515,7 @@ class SegmentManager {
      * Shared allocators (for example the global CXL allocator) are counted
      * once even when they are referenced by multiple mounted segments.
      */
-    [[nodiscard]] MemoryUsageSnapshot GetMemoryUsageSnapshot() const;
+    [[nodiscard]] StorageUsageSnapshot GetMemoryUsageSnapshot() const;
 
     void initializeCxlAllocator(const std::string& cxl_path,
                                 const size_t cxl_size);
@@ -584,6 +593,11 @@ class NoFSegmentManager {
 
     void GetMountedSegmentsSnapshot(
         std::vector<MountedNoFSegmentSnapshot>& segments) const;
+
+    /**
+     * @brief Return current NoF usage derived from mounted allocators.
+     */
+    [[nodiscard]] StorageUsageSnapshot GetUsageSnapshot() const;
 
     tl::expected<std::vector<NoFSegmentOwnerInfo>, ErrorCode> GetSegmentsByName(
         const std::string& segment_name) const {

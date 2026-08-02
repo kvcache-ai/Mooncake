@@ -105,6 +105,7 @@ class MasterAdminServer {
                          coro_http::coro_http_response& resp);
 
     void RegisterHandler();
+    void RefreshStorageMetrics() const;
 
     uint16_t http_port_;
     bool enable_metric_reporting_ = false;

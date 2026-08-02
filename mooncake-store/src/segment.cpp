@@ -4,6 +4,7 @@
 #include "utils/zstd_util.h"
 
 #include <functional>
+#include <unordered_set>
 
 namespace mooncake {
 namespace {
@@ -99,6 +100,27 @@ std::vector<std::string> BuildHostOrderedSegments(
     return ordered_segments;
 }
 
+void AddAllocatorUsage(
+    StorageUsageSnapshot& snapshot,
+    const std::shared_ptr<BufferAllocatorBase>& allocator,
+    std::unordered_set<const BufferAllocatorBase*>& counted_allocators) {
+    if (!allocator || !counted_allocators.insert(allocator.get()).second) {
+        return;
+    }
+
+    const size_t used_bytes = allocator->size();
+    const size_t capacity_bytes = allocator->capacity();
+    snapshot.used_bytes += used_bytes;
+    snapshot.capacity_bytes += capacity_bytes;
+
+    const std::string segment_name = allocator->getSegmentName();
+    if (!segment_name.empty()) {
+        auto& segment = snapshot.segments[segment_name];
+        segment.used_bytes += used_bytes;
+        segment.capacity_bytes += capacity_bytes;
+    }
+}
+
 }  // namespace
 
 std::vector<std::string> ScopedAllocatorAccess::GetHostOrderedSegments(
@@ -109,25 +131,19 @@ std::vector<std::string> ScopedAllocatorAccess::GetHostOrderedSegments(
     return BuildHostOrderedSegments(*segments_by_host_, writer_host_id, key);
 }
 
-MemoryUsageSnapshot SegmentManager::GetMemoryUsageSnapshot() const {
+StorageUsageSnapshot SegmentManager::GetMemoryUsageSnapshot() const {
     std::shared_lock<std::shared_mutex> lock(segment_mutex_);
-    MemoryUsageSnapshot snapshot;
-    bool counted_cxl_allocator = false;
+    StorageUsageSnapshot snapshot;
+    std::unordered_set<const BufferAllocatorBase*> counted_allocators;
+
+    // The CXL allocator is owned by SegmentManager independently of client
+    // mounts and may be shared by multiple mounted segment records.
+    AddAllocatorUsage(snapshot, cxl_global_allocator_, counted_allocators);
 
     for (const auto& [segment_id, mounted_segment] : mounted_segments_) {
         (void)segment_id;
-        const auto& allocator = mounted_segment.buf_allocator;
-        if (!allocator) {
-            continue;
-        }
-        if (allocator == cxl_global_allocator_) {
-            if (counted_cxl_allocator) {
-                continue;
-            }
-            counted_cxl_allocator = true;
-        }
-        snapshot.used_bytes += allocator->size();
-        snapshot.capacity_bytes += allocator->capacity();
+        AddAllocatorUsage(snapshot, mounted_segment.buf_allocator,
+                          counted_allocators);
     }
     return snapshot;
 }
@@ -1578,6 +1594,18 @@ void NoFSegmentManager::GetMountedSegmentsSnapshot(
             segment_id, mounted_segment.client_id, mounted_segment.segment,
             mounted_segment.status});
     }
+}
+
+StorageUsageSnapshot NoFSegmentManager::GetUsageSnapshot() const {
+    std::shared_lock<std::shared_mutex> lock(segment_mutex_);
+    StorageUsageSnapshot snapshot;
+    std::unordered_set<const BufferAllocatorBase*> counted_allocators;
+    for (const auto& [segment_id, mounted_segment] : mounted_segments_) {
+        (void)segment_id;
+        AddAllocatorUsage(snapshot, mounted_segment.buf_allocator,
+                          counted_allocators);
+    }
+    return snapshot;
 }
 
 void SegmentManager::releaseCapacityMetrics() {

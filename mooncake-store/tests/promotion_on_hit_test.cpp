@@ -2223,12 +2223,12 @@ TEST_F(PromotionOnHitTest, WatermarkUsesAllocatorStateAfterMetricsReset) {
     metrics.reset_total_mem_capacity();
     metrics.reset_segment_allocated_mem_size(segment_name);
     metrics.reset_segment_total_mem_capacity(segment_name);
-    EXPECT_DOUBLE_EQ(metrics.get_global_mem_used_ratio(), 0.0);
+    EXPECT_EQ(metrics.get_allocated_mem_size(), 0);
+    EXPECT_EQ(metrics.get_total_mem_capacity(), 0);
 
-    const int64_t rejected_before =
-        metrics.get_promotion_rejected_watermark();
-    auto get_result = service->GetReplicaList("allocator_watermark_key",
-                                              TenantId::Default());
+    const int64_t rejected_before = metrics.get_promotion_rejected_watermark();
+    auto get_result =
+        service->GetReplicaList("allocator_watermark_key", TenantId::Default());
     EXPECT_TRUE(get_result.has_value());
     EXPECT_EQ(metrics.get_promotion_rejected_watermark() - rejected_before, 1);
 

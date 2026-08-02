@@ -278,6 +278,7 @@ bool MasterAdminServer::Start() {
         metric_report_running_.store(true);
         metric_report_thread_ = std::thread([this]() {
             while (metric_report_running_.load()) {
+                RefreshStorageMetrics();
                 const auto snapshot = SnapshotState();
                 std::ostringstream log_stream;
                 log_stream << "Master Admin Metrics: role="
@@ -359,6 +360,7 @@ MasterAdminServer::RuntimeSnapshot MasterAdminServer::SnapshotState() const {
 }
 
 std::string MasterAdminServer::BuildMetricsText() const {
+    RefreshStorageMetrics();
     std::string metrics = AppendMetricSections(
         MasterMetricManager::instance().serialize_metrics(),
         HAMetricManager::instance().serialize_metrics());
@@ -454,6 +456,7 @@ std::string MasterAdminServer::BuildTenantQuotaMetricsText() const {
 }
 
 std::string MasterAdminServer::BuildMetricsSummaryText() const {
+    RefreshStorageMetrics();
     const auto snapshot = SnapshotState();
     std::ostringstream oss;
     oss << "role=" << ha::MasterRuntimeRoleToString(snapshot.state)
@@ -520,6 +523,14 @@ std::shared_ptr<WrappedMasterService> MasterAdminServer::GetActiveService()
         return nullptr;
     }
     return snapshot.service;
+}
+
+void MasterAdminServer::RefreshStorageMetrics() const {
+    const auto runtime = SnapshotState();
+    const auto storage = runtime.service
+                             ? runtime.service->GetStorageUsageSnapshot()
+                             : TieredStorageUsageSnapshot{};
+    MasterMetricManager::instance().project_storage_usage(storage);
 }
 
 template <typename Handler>
