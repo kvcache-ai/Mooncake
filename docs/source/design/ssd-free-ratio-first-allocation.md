@@ -54,7 +54,7 @@ This document describes `SsdFreeRatioFirstAllocationStrategy`, an allocation str
 
 The flow follows the same high-level structure as the existing `FreeRatioFirstAllocationStrategy`: sample a subset of candidates, compute a ranking metric, sort, and allocate from the top. The key difference is that the ranking metric is SSD free ratio rather than DRAM free ratio.
 
-`MasterService` only passes an `SsdMetricsProvider` when the effective allocation strategy is `SSD_FREE_RATIO_FIRST`. Non-SSD strategies receive `nullptr`, so they avoid unnecessary local-disk segment access.
+`MasterService` only passes an `SsdUsageProvider` when the effective allocation strategy is `SSD_FREE_RATIO_FIRST`. Non-SSD strategies receive `nullptr`, so they avoid unnecessary local-disk segment access.
 
 ---
 
@@ -74,7 +74,7 @@ ssd_free_ratio = (ssd_total_capacity - ssd_used_bytes) / ssd_total_capacity
 
 A segment with 1 TB total SSD capacity and 200 GB used has an SSD free ratio of 0.80. A segment whose SSD is full has a ratio of 0.0.
 
-Before calculating the ratio, `ssd_used_bytes` is clamped to `[0, ssd_total_capacity]`. This keeps transient concurrent accounting drift from producing a negative free ratio or a value greater than 1.0. If no SSD metrics provider is available, or if the reported total capacity is not positive, the strategy treats the segment as fully free.
+Before calculating the ratio, `ssd_used_bytes` is clamped to `[0, ssd_total_capacity]`. This keeps transient concurrent accounting drift from producing a negative free ratio or a value greater than 1.0. If no SSD usage view is available, or if the reported total capacity is not positive, the strategy treats the segment as fully free.
 
 ### Sorting
 
@@ -86,7 +86,7 @@ As with other allocation strategies, segments marked as preferred by the caller 
 
 ### Fallback to random allocation
 
-After allocating from the SSD-ranked candidates, any remaining replicas that could not be satisfied are allocated using the standard random strategy as a fallback. This ensures that allocation succeeds even when SSD metrics are unavailable (for example, on segments without SSD offload configured).
+After allocating from the SSD-ranked candidates, any remaining replicas that could not be satisfied are allocated using the standard random strategy as a fallback. This ensures that allocation succeeds even when SSD usage state is unavailable (for example, on segments without SSD offload configured).
 
 ---
 
@@ -101,16 +101,16 @@ After allocating from the SSD-ranked candidates, any remaining replicas that cou
 
 The counter is atomic to allow concurrent updates from multiple RPC handler threads without requiring a separate lock. The allocation strategy treats it as an eventually consistent placement signal and clamps it before computing the free ratio.
 
-### `SsdMetricsProvider` interface
+### `SsdUsageProvider` interface
 
-`ScopedLocalDiskSegmentAccess` implements the `SsdMetricsProvider` interface, which exposes two methods:
+`ScopedLocalDiskSegmentAccess` implements the `SsdUsageProvider` interface, which exposes two methods:
 
 | Method | Return type | Description |
 |--------|-------------|-------------|
-| `getSsdTotalCapacity` | `int64_t` | Total SSD capacity configured for the segment, in bytes |
-| `getSsdUsedBytes` | `int64_t` | Current SSD usage, read from `ssd_used_bytes` |
+| `GetSsdTotalCapacityBytes` | `int64_t` | Total SSD capacity configured for the segment, in bytes |
+| `GetSsdUsedBytes` | `int64_t` | Current SSD usage, read from `ssd_used_bytes` |
 
-The allocation strategy queries these methods through the `SsdMetricsProvider` interface, keeping the strategy decoupled from the concrete segment implementation.
+The allocation strategy queries these methods through the `SsdUsageProvider` interface, keeping the strategy decoupled from the concrete segment implementation. The former metrics-oriented name was misleading: these values are authoritative domain state and are independent of Prometheus or other telemetry backends.
 
 ---
 
@@ -129,10 +129,10 @@ The parameter is passed as a gflag to the master process at startup.
 | File | Change |
 |------|--------|
 | `mooncake-store/include/types.h` | Add `SSD_FREE_RATIO_FIRST` enum value to the allocation strategy enum |
-| `mooncake-store/include/allocation_strategy.h` | Add `SsdMetricsProvider` interface and `SsdFreeRatioFirstAllocationStrategy` class |
-| `mooncake-store/include/segment.h` | Add `ssd_total_capacity_bytes` and `ssd_used_bytes` fields to `LocalDiskSegment`; inherit `SsdMetricsProvider` |
-| `mooncake-store/src/segment.cpp` | Implement `getSsdTotalCapacity` and `getSsdUsedBytes` |
-| `mooncake-store/src/master_service.cpp` | Pass SSD metrics only to `SSD_FREE_RATIO_FIRST`; update `ssd_used_bytes` after successful `NotifyOffloadSuccess` metadata insertion; release usage when `LOCAL_DISK` replicas are erased |
+| `mooncake-store/include/allocation_strategy.h` | Add `SsdUsageProvider` interface and `SsdFreeRatioFirstAllocationStrategy` class |
+| `mooncake-store/include/segment.h` | Add `ssd_total_capacity_bytes` and `ssd_used_bytes` fields to `LocalDiskSegment`; inherit `SsdUsageProvider` |
+| `mooncake-store/src/segment.cpp` | Implement `GetSsdTotalCapacityBytes` and `GetSsdUsedBytes` |
+| `mooncake-store/src/master_service.cpp` | Pass the SSD usage view only to `SSD_FREE_RATIO_FIRST`; update `ssd_used_bytes` after successful `NotifyOffloadSuccess` metadata insertion; release usage when `LOCAL_DISK` replicas are erased |
 
 ---
 

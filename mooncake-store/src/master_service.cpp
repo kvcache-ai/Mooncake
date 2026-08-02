@@ -3413,18 +3413,18 @@ auto MasterService::AllocateAndInsertMetadata(
             }
         }
 
-        const SsdMetricsProvider* ssd_provider = nullptr;
+        const SsdUsageProvider* ssd_usage = nullptr;
         std::optional<ScopedLocalDiskSegmentAccess> ssd_access;
         if (allocation_strategy_type_ ==
             AllocationStrategyType::SSD_FREE_RATIO_FIRST) {
             ssd_access.emplace(segment_manager_.getLocalDiskSegmentAccess());
-            ssd_provider = &*ssd_access;
+            ssd_usage = &*ssd_access;
         }
 
         auto allocation_result = allocation_strategy_->Allocate(
             allocator_manager, value_length, config.replica_num,
             preferred_segments, std::set<std::string>(), ReplicaType::MEMORY,
-            ssd_provider);
+            ssd_usage);
 
         if (!allocation_result.has_value()) {
             VLOG(1) << "Failed to allocate replicas for key=" << key

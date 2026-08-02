@@ -84,8 +84,8 @@ class BlockingAllocationStrategy final : public AllocationStrategy {
         const std::vector<std::string>& preferred_segments,
         const std::set<std::string>& excluded_segments,
         const ReplicaType replica_type,
-        const SsdMetricsProvider* ssd_provider) override {
-        (void)ssd_provider;
+        const SsdUsageProvider* ssd_usage) override {
+        (void)ssd_usage;
         return Allocate(allocator_manager, slice_length, replica_num,
                         preferred_segments, excluded_segments, replica_type);
     }
