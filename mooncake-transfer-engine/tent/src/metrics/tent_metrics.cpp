@@ -31,6 +31,19 @@ TentMetrics::~TentMetrics() { shutdown(); }
 #if TENT_METRICS_ENABLED
 
 Status TentMetrics::initialize(const MetricsConfig& config) {
+    // Validate configuration before touching initialized_. An invalid config
+    // (e.g. port 0, zero HTTP threads) would otherwise cause confusing
+    // failures inside initHttpServer(); fail fast with a clear error instead.
+    // Validating before the compare_exchange avoids a window where
+    // initialized_ is set to true and then rolled back on failure.
+    std::string error_msg;
+    if (!MetricsConfigLoader::validateConfig(config, &error_msg)) {
+        LOG(ERROR) << "Invalid TENT metrics config: " << error_msg
+                   << "; metrics disabled";
+        return Status::InvalidArgument(
+            "Invalid TENT metrics config: " + error_msg + LOC_MARK);
+    }
+
     // Use compare_exchange to prevent race condition during initialization
     bool expected = false;
     if (!initialized_.compare_exchange_strong(expected, true)) {
@@ -42,40 +55,20 @@ Status TentMetrics::initialize(const MetricsConfig& config) {
     // Set runtime enabled state from config
     runtime_enabled_.store(config_.enabled, std::memory_order_relaxed);
 
-    // Configure histogram buckets if provided (recreate histograms)
-    // Note: config latency_buckets are in seconds, convert to microseconds for
-    // histogram
-    if (!config_.latency_buckets.empty()) {
-        // Convert seconds to microseconds for histogram buckets
-        std::vector<double> latency_buckets_us;
-        latency_buckets_us.reserve(config_.latency_buckets.size());
-        for (double bucket_sec : config_.latency_buckets) {
-            latency_buckets_us.push_back(bucket_sec *
-                                         1000000.0);  // seconds -> microseconds
-        }
-        read_latency_ = ylt::metric::histogram_t(
-            "tent_read_latency_us", "Read latency distribution in microseconds",
-            latency_buckets_us);
-        write_latency_ = ylt::metric::histogram_t(
-            "tent_write_latency_us",
-            "Write latency distribution in microseconds", latency_buckets_us);
-    }
-
-    // Configure size histogram buckets if provided
-    if (!config_.size_buckets.empty()) {
-        read_size_ = ylt::metric::histogram_t(
-            "tent_read_size_bytes", "Read request size distribution in bytes",
-            config_.size_buckets);
-        write_size_ = ylt::metric::histogram_t(
-            "tent_write_size_bytes", "Write request size distribution in bytes",
-            config_.size_buckets);
-    }
-
     // Register all metrics to vectors for unified serialization
     registerMetrics();
 
-    // Initialize and start HTTP server
-    initHttpServer();
+    // Initialize and start HTTP server on the configured port. If the port is
+    // busy (e.g. another rank was given the same port), degrade to log-only
+    // metrics rather than falsely reporting a listening endpoint.
+    Status http_status = initHttpServer();
+    const bool http_ok = http_status.ok();
+    if (!http_ok) {
+        LOG(WARNING) << "TENT metrics HTTP endpoint unavailable on "
+                     << config_.http_host << ":" << config_.http_port << " ("
+                     << http_status.ToString()
+                     << "); continuing with log-only metrics";
+    }
 
     // Start periodic metric reporting thread if interval > 0
     if (config_.report_interval_seconds > 0) {
@@ -94,19 +87,53 @@ Status TentMetrics::initialize(const MetricsConfig& config) {
         });
     }
 
-    LOG(INFO)
-        << "TENT metrics initialized successfully, HTTP server listening on "
-        << config_.http_host << ":" << config_.http_port
-        << ", runtime_enabled=" << (runtime_enabled_.load() ? "true" : "false");
+    if (http_ok) {
+        LOG(INFO) << "TENT metrics initialized successfully, HTTP server "
+                     "listening on "
+                  << config_.http_host << ":"
+                  << bound_http_port_.load(std::memory_order_relaxed)
+                  << ", runtime_enabled="
+                  << (runtime_enabled_.load() ? "true" : "false");
+    } else {
+        LOG(INFO) << "TENT metrics initialized in log-only mode (HTTP endpoint "
+                     "disabled), runtime_enabled="
+                  << (runtime_enabled_.load() ? "true" : "false");
+    }
     return Status::OK();
 }
 
-void TentMetrics::initHttpServer() {
+Status TentMetrics::initHttpServer() {
     using namespace coro_http;
 
-    // Create HTTP server with configurable threads
+    // Create HTTP server with configurable threads on the configured port.
+    // Port assignment is intentionally deterministic: co-located ranks should
+    // be given distinct ports explicitly (e.g. base_port + local_rank), not
+    // auto-scanned, so a rank's metrics port stays predictable.
     http_server_ = std::make_unique<coro_http_server>(
         config_.http_server_threads, config_.http_port);
+
+    registerHttpHandlers();
+
+    // Start the HTTP server asynchronously. async_start() returns a future that
+    // already holds a result ONLY when startup failed (e.g. the port is already
+    // in use); on success the future stays pending while the server keeps
+    // running. Same idiom as mooncake-store's rpc_service.cpp /
+    // real_client.cpp.
+    auto ec = http_server_->async_start();
+    if (ec.hasResult()) {
+        http_server_.reset();
+        return Status::RpcServiceError(
+            "Failed to start TENT metrics HTTP server" LOC_MARK);
+    }
+
+    // Record the bound port (read by httpPort() from other threads, so it must
+    // be the atomic, not config_).
+    bound_http_port_.store(config_.http_port, std::memory_order_relaxed);
+    return Status::OK();
+}
+
+void TentMetrics::registerHttpHandlers() {
+    using namespace coro_http;
 
     // Register /metrics endpoint for Prometheus
     http_server_->set_http_handler<GET>(
@@ -140,9 +167,6 @@ void TentMetrics::initHttpServer() {
             resp.add_header("Content-Type", "text/plain");
             resp.set_status_and_content(status_type::ok, "OK");
         });
-
-    // Start the HTTP server asynchronously
-    http_server_->async_start();
 }
 
 void TentMetrics::shutdown() {
@@ -164,34 +188,32 @@ void TentMetrics::shutdown() {
     // Clear metric vectors
     counters_.clear();
     histograms_.clear();
-    histogram_boundaries_.clear();
 
     initialized_ = false;
     LOG(INFO) << "TENT metrics shutdown complete";
 }
 
 void TentMetrics::registerMetrics() {
-    // Pre-allocate vectors to avoid reallocation
-    counters_.reserve(7);
-    histograms_.reserve(8);
-    histogram_boundaries_.reserve(8);
-
     // Register all counters - add new counters here
     counters_ = {
-        &read_bytes_total_,     &write_bytes_total_,   &read_requests_total_,
-        &write_requests_total_, &read_failures_total_, &write_failures_total_,
-        &failover_total_,
+        &read_bytes_total_,    &write_bytes_total_,
+        &read_requests_total_, &write_requests_total_,
+        &read_failures_total_, &write_failures_total_,
+        &failover_total_,      &deadline_infeasible_total_,
     };
 
-    // Register all histograms - add new histograms here
-    // Note: histogram_boundaries_ must match the order of histograms_
+    // Register all histograms - add new histograms here. Each entry pairs the
+    // histogram with its compile-time bucket boundaries; the struct keeps the
+    // two in sync so getJsonMetrics() cannot mislabel buckets.
     histograms_ = {
-        &read_latency_, &write_latency_,    &read_size_,      &write_size_,
-        &deadline_mlu_, &stage_queue_wait_, &stage_dispatch_, &stage_transport_,
-    };
-    histogram_boundaries_ = {
-        kLatencyBuckets,     kLatencyBuckets, kSizeBuckets,  kSizeBuckets,
-        kMluPerMilleBuckets, kStageBuckets,   kStageBuckets, kStageBuckets,
+        {&read_latency_, &kLatencyBuckets},
+        {&write_latency_, &kLatencyBuckets},
+        {&read_size_, &kSizeBuckets},
+        {&write_size_, &kSizeBuckets},
+        {&deadline_mlu_, &kMluPerMilleBuckets},
+        {&stage_queue_wait_, &kStageBuckets},
+        {&stage_dispatch_, &kStageBuckets},
+        {&stage_transport_, &kStageBuckets},
     };
 }
 
@@ -234,6 +256,12 @@ void TentMetrics::recordDeadlineMLU(double mlu) {
     deadline_mlu_.observe(static_cast<int64_t>(mlu * 1000.0));
 }
 
+void TentMetrics::recordDeadlineInfeasible() {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    deadline_infeasible_total_.inc();
+}
+
 void TentMetrics::recordStageLatency(Stage stage, double latency_us) {
     if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
         return;
@@ -252,7 +280,7 @@ void TentMetrics::recordStageLatency(Stage stage, double latency_us) {
     }
 }
 
-void TentMetrics::recordReadFailed(size_t bytes) {
+void TentMetrics::recordReadFailed() {
     // Fast path: check runtime switch first
     if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
         return;
@@ -261,7 +289,7 @@ void TentMetrics::recordReadFailed(size_t bytes) {
     read_requests_total_.inc();  // Count failed requests too
 }
 
-void TentMetrics::recordWriteFailed(size_t bytes) {
+void TentMetrics::recordWriteFailed() {
     // Fast path: check runtime switch first
     if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
         return;
@@ -291,8 +319,8 @@ std::string TentMetrics::getPrometheusMetrics() {
         }
 
         // Serialize all histograms
-        for (auto* histogram : histograms_) {
-            histogram->serialize(result);
+        for (const auto& entry : histograms_) {
+            entry.h->serialize(result);
         }
 
         return result;
@@ -314,9 +342,9 @@ std::string TentMetrics::getJsonMetrics() {
         }
 
         // Serialize all histograms
-        for (size_t h = 0; h < histograms_.size(); ++h) {
-            auto* histogram = histograms_[h];
-            const auto& boundaries = histogram_boundaries_[h];
+        for (const auto& entry : histograms_) {
+            auto* histogram = entry.h;
+            const auto& boundaries = *entry.boundaries;
 
             auto bucket_counts = histogram->get_bucket_counts();
 
@@ -404,10 +432,11 @@ void TentMetrics::shutdown() { initialized_ = false; }
 
 void TentMetrics::recordReadCompleted(size_t, double) {}
 void TentMetrics::recordWriteCompleted(size_t, double) {}
-void TentMetrics::recordReadFailed(size_t) {}
-void TentMetrics::recordWriteFailed(size_t) {}
+void TentMetrics::recordReadFailed() {}
+void TentMetrics::recordWriteFailed() {}
 void TentMetrics::recordTransportFailover() {}
 void TentMetrics::recordDeadlineMLU(double) {}
+void TentMetrics::recordDeadlineInfeasible() {}
 void TentMetrics::recordStageLatency(Stage, double) {}
 
 std::string TentMetrics::getPrometheusMetrics() {

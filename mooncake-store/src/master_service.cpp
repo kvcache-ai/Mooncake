@@ -5233,9 +5233,312 @@ tl::expected<void, ErrorCode> MasterService::PushPromotionQueue(
     return {};
 }
 
-void MasterService::TryPushPromotionQueue(const ObjectIdentity& object_id) {
-    if (!promotion_on_hit_ || !promotion_sketch_) {
+// --- Promotion retry candidate helpers ---
+
+void MasterService::DecrementCandidateCount() {
+    uint64_t count = promotion_candidate_count_.load(std::memory_order_relaxed);
+    while (count > 0) {
+        if (promotion_candidate_count_.compare_exchange_weak(
+                count, count - 1, std::memory_order_relaxed)) {
+            return;
+        }
+    }
+}
+
+void MasterService::EraseCandidate(TenantState& tenant_state,
+                                   const std::string& key) {
+    if (tenant_state.promotion_candidates.erase(key) > 0) {
+        DecrementCandidateCount();
+    }
+}
+
+void MasterService::EraseCandidate(const ObjectIdentity& object_id) {
+    MetadataShardAccessorRW shard(
+        this, getMetadataShardIndex(object_id.tenant_id, object_id.user_key));
+    auto tenant_it = shard->tenants.find(object_id.tenant_id);
+    if (tenant_it == shard->tenants.end()) return;
+    EraseCandidate(tenant_it->second, object_id.user_key);
+    if (tenant_it->second.Empty()) {
+        shard->tenants.erase(tenant_it);
+    }
+}
+
+void MasterService::RecordOrUpdateCandidate(TenantState& tenant_state,
+                                            const std::string& key,
+                                            uint8_t sketch_score,
+                                            PromotionCandidateReason reason,
+                                            ErrorCode last_error) {
+    const auto now = std::chrono::steady_clock::now();
+    auto it = tenant_state.promotion_candidates.find(key);
+    if (it != tenant_state.promotion_candidates.end()) {
+        // Update existing entry: refresh last_seen, reset
+        // retry_after/retry_count.
+        it->second.last_seen = now;
+        it->second.last_reason = reason;
+        it->second.last_error = last_error;
+        if (sketch_score > it->second.sketch_score) {
+            it->second.sketch_score = sketch_score;
+        }
+        it->second.retry_after = now;
+        it->second.retry_count = 0;
         return;
+    }
+
+    // Reserve a slot in the global candidate limit.
+    uint64_t count = promotion_candidate_count_.load(std::memory_order_relaxed);
+    while (count < kPromotionCandidateLimit) {
+        if (promotion_candidate_count_.compare_exchange_weak(
+                count, count + 1, std::memory_order_relaxed)) {
+            break;
+        }
+    }
+    if (count >= kPromotionCandidateLimit) {
+        VLOG(1) << "promotion_candidate_dropped key=" << key
+                << " reason=global_limit";
+        MasterMetricManager::instance().inc_promotion_candidate_dropped_limit();
+        return;
+    }
+
+    auto [emplace_it, inserted] = tenant_state.promotion_candidates.emplace(
+        key, PromotionCandidate{.sketch_score = sketch_score,
+                                .first_seen = now,
+                                .last_seen = now,
+                                .retry_after = now,
+                                .last_reason = reason,
+                                .last_error = last_error,
+                                .retry_count = 0});
+    if (inserted) {
+        MasterMetricManager::instance().inc_promotion_candidate_recorded();
+        VLOG(1) << "promotion_candidate_recorded key=" << key;
+    } else {
+        DecrementCandidateCount();
+    }
+}
+
+std::chrono::milliseconds MasterService::CandidateBackoff(
+    uint32_t retry_count) const {
+    uint64_t backoff_ms =
+        static_cast<uint64_t>(kPromotionCandidateInitialBackoff.count());
+    for (uint32_t i = 1; i < retry_count; ++i) {
+        backoff_ms = std::min<uint64_t>(
+            backoff_ms * 2,
+            static_cast<uint64_t>(kPromotionCandidateMaxBackoff.count()));
+    }
+    return std::chrono::milliseconds(backoff_ms);
+}
+
+bool MasterService::IsTransientResult(PromotionQueueResult result) const {
+    return result == PromotionQueueResult::kWatermarkRejected ||
+           result == PromotionQueueResult::kQueueCapRejected ||
+           result == PromotionQueueResult::kPushFailed;
+}
+
+void MasterService::BackoffCandidate(const ObjectIdentity& object_id,
+                                     PromotionQueueResult result) {
+    const auto now = std::chrono::steady_clock::now();
+    MetadataShardAccessorRW shard(
+        this, getMetadataShardIndex(object_id.tenant_id, object_id.user_key));
+    auto tenant_it = shard->tenants.find(object_id.tenant_id);
+    if (tenant_it == shard->tenants.end()) return;
+    auto& tenant_state = tenant_it->second;
+    auto candidate_it =
+        tenant_state.promotion_candidates.find(object_id.user_key);
+    if (candidate_it == tenant_state.promotion_candidates.end()) return;
+
+    auto& c = candidate_it->second;
+    c.retry_count++;
+    if (result == PromotionQueueResult::kWatermarkRejected) {
+        c.last_reason = PromotionCandidateReason::kWatermark;
+        c.last_error = ErrorCode::OK;
+    } else if (result == PromotionQueueResult::kQueueCapRejected) {
+        c.last_reason = PromotionCandidateReason::kQueueCap;
+        c.last_error = ErrorCode::OK;
+    } else {
+        c.last_reason = PromotionCandidateReason::kPushFailed;
+    }
+
+    const bool ttl_expired = now - c.last_seen >= kPromotionCandidateTtl;
+    if (ttl_expired || c.retry_count >= kPromotionCandidateMaxRetries) {
+        VLOG(1) << "promotion_candidate_gave_up key=" << object_id.user_key
+                << " retries=" << c.retry_count;
+        EraseCandidate(tenant_state, object_id.user_key);
+        MasterMetricManager::instance()
+            .inc_promotion_candidate_expired_evaluated();
+    } else {
+        c.retry_after = now + CandidateBackoff(c.retry_count);
+    }
+
+    if (tenant_state.Empty()) {
+        shard->tenants.erase(tenant_it);
+    }
+}
+
+void MasterService::ClearCandidatesForReload() {
+    for (size_t i = 0; i < kNumShards; ++i) {
+        MetadataShardAccessorRW shard(this, i);
+        for (auto& [tenant_id, tenant_state] : shard->tenants) {
+            (void)tenant_id;
+            tenant_state.promotion_candidates.clear();
+        }
+    }
+    promotion_candidate_count_.store(0, std::memory_order_relaxed);
+    promotion_retry_cursor_.store(0, std::memory_order_relaxed);
+    promotion_in_flight_.store(0, std::memory_order_relaxed);
+}
+
+size_t MasterService::RunPromotionCandidateRetry() {
+    return RunPromotionCandidateRetry(kPromotionRetryShardBatch);
+}
+
+size_t MasterService::RunPromotionCandidateRetryForTesting() {
+    return RunPromotionCandidateRetry(kNumShards);
+}
+
+size_t MasterService::CountCandidatesForTesting(const std::string& tenant_id) {
+    const auto normalized = NormalizeTenantId(tenant_id);
+    size_t count = 0;
+    std::shared_lock<std::shared_mutex> lock(snapshot_mutex_);
+    for (size_t i = 0; i < kNumShards; i++) {
+        MetadataShardAccessorRO shard(this, i);
+        auto it = shard->tenants.find(normalized);
+        if (it != shard->tenants.end()) {
+            count += it->second.promotion_candidates.size();
+        }
+    }
+    return count;
+}
+
+void MasterService::ResetCandidateBackoffsForTesting() {
+    const auto epoch = std::chrono::steady_clock::time_point{};
+    for (size_t i = 0; i < kNumShards; i++) {
+        MetadataShardAccessorRW shard(this, i);
+        for (auto& [tenant_id, tenant_state] : shard->tenants) {
+            (void)tenant_id;
+            for (auto& [key, candidate] : tenant_state.promotion_candidates) {
+                (void)key;
+                candidate.retry_after = epoch;
+            }
+        }
+    }
+}
+
+size_t MasterService::RunPromotionCandidateRetry(size_t max_shards_to_scan) {
+    if (!promotion_on_hit_ ||
+        promotion_candidate_count_.load(std::memory_order_relaxed) == 0) {
+        return 0;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    std::vector<ObjectIdentity> due_candidates;
+    due_candidates.reserve(kPromotionRetryBatchSize);
+
+    const size_t shards_to_scan = std::min(max_shards_to_scan, kNumShards);
+    if (shards_to_scan == 0) return 0;
+    const size_t start_shard = promotion_retry_cursor_.fetch_add(
+                                   shards_to_scan, std::memory_order_relaxed) %
+                               kNumShards;
+
+    {
+        std::shared_lock<std::shared_mutex> snap_lock(snapshot_mutex_);
+        for (size_t scanned = 0;
+             scanned < shards_to_scan &&
+             due_candidates.size() < kPromotionRetryBatchSize;
+             ++scanned) {
+            const size_t i = (start_shard + scanned) % kNumShards;
+            MetadataShardAccessorRW shard(this, i);
+            for (auto tenant_it = shard->tenants.begin();
+                 tenant_it != shard->tenants.end() &&
+                 due_candidates.size() < kPromotionRetryBatchSize;) {
+                auto& tenant_state = tenant_it->second;
+                for (auto cit = tenant_state.promotion_candidates.begin();
+                     cit != tenant_state.promotion_candidates.end() &&
+                     due_candidates.size() < kPromotionRetryBatchSize;) {
+                    const auto& key = cit->first;
+                    auto& c = cit->second;
+
+                    const bool ttl_expired =
+                        now - c.last_seen >= kPromotionCandidateTtl;
+                    if (ttl_expired ||
+                        c.retry_count >= kPromotionCandidateMaxRetries) {
+                        VLOG(1) << "promotion_candidate_expired key=" << key
+                                << " retry_count=" << c.retry_count;
+                        const uint32_t saved_retry_count = c.retry_count;
+                        cit = tenant_state.promotion_candidates.erase(cit);
+                        DecrementCandidateCount();
+                        // retry_count == 0: scheduler never reached this
+                        // candidate before TTL elapsed — scan budget was
+                        // too small. retry_count > 0: scheduler evaluated
+                        // it but gave up after retries or TTL.
+                        if (saved_retry_count == 0) {
+                            MasterMetricManager::instance()
+                                .inc_promotion_candidate_expired_unevaluated();
+                        } else {
+                            MasterMetricManager::instance()
+                                .inc_promotion_candidate_expired_evaluated();
+                        }
+                        continue;
+                    }
+                    if (c.retry_after > now) {
+                        ++cit;
+                        continue;
+                    }
+
+                    // Quick pre-filter under shard lock to avoid adding
+                    // candidates that are obviously ineligible.
+                    auto meta_it = tenant_state.metadata.find(key);
+                    if (meta_it == tenant_state.metadata.end() ||
+                        !meta_it->second.IsValid() ||
+                        tenant_state.promotion_tasks.count(key) > 0 ||
+                        meta_it->second.HasReplica(
+                            &Replica::fn_is_memory_replica) ||
+                        !meta_it->second.HasReplica(
+                            &Replica::fn_is_local_disk_replica)) {
+                        cit = tenant_state.promotion_candidates.erase(cit);
+                        DecrementCandidateCount();
+                        continue;
+                    }
+
+                    due_candidates.push_back(ObjectIdentity{
+                        .tenant_id = tenant_it->first, .user_key = key});
+                    ++cit;
+                }
+
+                if (tenant_state.Empty()) {
+                    tenant_it = shard->tenants.erase(tenant_it);
+                } else {
+                    ++tenant_it;
+                }
+            }
+        }
+    }
+
+    size_t queued = 0;
+    {
+        std::shared_lock<std::shared_mutex> snap_lock(snapshot_mutex_);
+        for (const auto& object_id : due_candidates) {
+            const auto result =
+                TryPushPromotionQueue(object_id, /*record_candidate=*/false);
+            if (result == PromotionQueueResult::kQueued) {
+                queued++;
+                MasterMetricManager::instance()
+                    .inc_promotion_candidate_admitted();
+            } else if (IsTransientResult(result)) {
+                MasterMetricManager::instance()
+                    .inc_promotion_candidate_admission_rejected();
+                BackoffCandidate(object_id, result);
+            } else {
+                EraseCandidate(object_id);
+            }
+        }
+    }
+
+    return queued;
+}
+
+MasterService::PromotionQueueResult MasterService::TryPushPromotionQueue(
+    const ObjectIdentity& object_id, bool record_candidate) {
+    if (!promotion_on_hit_ || !promotion_sketch_) {
+        return PromotionQueueResult::kDisabled;
     }
     const auto& key = object_id.user_key;
     const auto admission_key =
@@ -5249,7 +5552,7 @@ void MasterService::TryPushPromotionQueue(const ObjectIdentity& object_id) {
     const uint8_t freq = promotion_sketch_->increment(admission_key);
     if (freq < promotion_admission_threshold_) {
         MasterMetricManager::instance().inc_promotion_rejected_frequency();
-        return;
+        return PromotionQueueResult::kFrequencyRejected;
     }
 
     // Watermark gate: don't promote if DRAM is already under eviction
@@ -5259,7 +5562,15 @@ void MasterService::TryPushPromotionQueue(const ObjectIdentity& object_id) {
         MasterMetricManager::instance().get_global_mem_used_ratio();
     if (used_ratio >= eviction_high_watermark_ratio_) {
         MasterMetricManager::instance().inc_promotion_rejected_watermark();
-        return;
+        if (record_candidate) {
+            MetadataAccessorRW accessor(this, object_id);
+            if (accessor.Exists()) {
+                RecordOrUpdateCandidate(accessor.GetTenantState(), key, freq,
+                                        PromotionCandidateReason::kWatermark,
+                                        ErrorCode::OK);
+            }
+        }
+        return PromotionQueueResult::kWatermarkRejected;
     }
 
     // Acquire a fresh RW shard accessor for dedup, refcnt-pin, and task
@@ -5267,7 +5578,7 @@ void MasterService::TryPushPromotionQueue(const ObjectIdentity& object_id) {
     // its RO accessor.
     MetadataAccessorRW accessor(this, object_id);
     if (!accessor.Exists()) {
-        return;
+        return PromotionQueueResult::kNotFound;
     }
     auto& metadata = accessor.Get();
     auto& tenant_state = accessor.GetTenantState();
@@ -5275,10 +5586,23 @@ void MasterService::TryPushPromotionQueue(const ObjectIdentity& object_id) {
     // Dedup: don't queue twice if a promotion is already in flight or if a
     // MEMORY replica has appeared since GetReplicaList observed only-disk.
     if (tenant_state.promotion_tasks.count(key) > 0) {
-        return;
+        EraseCandidate(tenant_state, key);
+        return PromotionQueueResult::kAlreadyInFlight;
     }
     if (metadata.HasReplica(&Replica::fn_is_memory_replica)) {
-        return;
+        EraseCandidate(tenant_state, key);
+        return PromotionQueueResult::kMemoryReplicaPresent;
+    }
+
+    // Find the LOCAL_DISK source replica.
+    Replica* source = nullptr;
+    metadata.VisitReplicas(&Replica::fn_is_local_disk_replica,
+                           [&source](Replica& r) {
+                               if (source == nullptr) source = &r;
+                           });
+    if (source == nullptr) {
+        EraseCandidate(tenant_state, key);
+        return PromotionQueueResult::kNoLocalDiskSource;
     }
 
     // Cap gate: read the cluster-wide in-flight count. Soft cap — a
@@ -5291,17 +5615,12 @@ void MasterService::TryPushPromotionQueue(const ObjectIdentity& object_id) {
     if (promotion_in_flight_.load(std::memory_order_relaxed) >=
         promotion_queue_limit_) {
         MasterMetricManager::instance().inc_promotion_rejected_cap();
-        return;
-    }
-
-    // Find the LOCAL_DISK source replica.
-    Replica* source = nullptr;
-    metadata.VisitReplicas(&Replica::fn_is_local_disk_replica,
-                           [&source](Replica& r) {
-                               if (source == nullptr) source = &r;
-                           });
-    if (source == nullptr) {
-        return;
+        if (record_candidate) {
+            RecordOrUpdateCandidate(tenant_state, key, freq,
+                                    PromotionCandidateReason::kQueueCap,
+                                    ErrorCode::OK);
+        }
+        return PromotionQueueResult::kQueueCapRejected;
     }
 
     // Pin the source replica.
@@ -5315,7 +5634,21 @@ void MasterService::TryPushPromotionQueue(const ObjectIdentity& object_id) {
         source->dec_refcnt();
         VLOG(1) << "promotion_push_failed key=" << key
                 << " error=" << push_result.error();
-        return;
+        if (push_result.error() == ErrorCode::OBJECT_ALREADY_EXISTS) {
+            EraseCandidate(tenant_state, key);
+            return PromotionQueueResult::kAlreadyInFlight;
+        }
+        if (push_result.error() == ErrorCode::SEGMENT_NOT_FOUND ||
+            push_result.error() == ErrorCode::INVALID_PARAMS) {
+            EraseCandidate(tenant_state, key);
+            return PromotionQueueResult::kNoLocalDiskSource;
+        }
+        if (record_candidate) {
+            RecordOrUpdateCandidate(tenant_state, key, freq,
+                                    PromotionCandidateReason::kPushFailed,
+                                    push_result.error());
+        }
+        return PromotionQueueResult::kPushFailed;
     }
 
     // Capture the holder client_id so NotifyPromotionSuccess can reject
@@ -5325,6 +5658,7 @@ void MasterService::TryPushPromotionQueue(const ObjectIdentity& object_id) {
 
     // Record the in-flight task. alloc_id is filled in by
     // PromotionAllocStart once the new MEMORY replica is staged.
+    EraseCandidate(tenant_state, key);
     tenant_state.promotion_tasks.emplace(
         key, PromotionTask{.source_id = source->id(),
                            .alloc_id = 0,
@@ -5335,6 +5669,7 @@ void MasterService::TryPushPromotionQueue(const ObjectIdentity& object_id) {
     MasterMetricManager::instance().inc_promotion_in_flight();
     MasterMetricManager::instance().inc_promotion_admitted();
     VLOG(1) << "promotion_queued key=" << key << " size=" << object_size;
+    return PromotionQueueResult::kQueued;
 }
 
 auto MasterService::PromotionObjectHeartbeat(const UUID& client_id)
@@ -5698,6 +6033,10 @@ void MasterService::EvictionThreadFunc() {
             NoFBatchEvict(nof_evict_ratio_target, nof_evict_ratio_lowerbound);
         }
 #endif
+
+        if (promotion_candidate_count_.load(std::memory_order_relaxed) > 0) {
+            RunPromotionCandidateRetry();
+        }
 
         std::this_thread::sleep_for(
             std::chrono::milliseconds(kEvictionThreadSleepMs));
@@ -7594,6 +7933,7 @@ MasterService::MetadataSerializer::Deserialize(
     Replica::next_id_.store(next_id);
     LOG(INFO) << "Restored Replica::next_id_ to " << next_id;
     service_->RebuildGroupRoutingIndex();
+    service_->ClearCandidatesForReload();
     return {};
 }
 
@@ -7612,6 +7952,7 @@ void MasterService::MetadataSerializer::Reset() {
         service_->discarded_replicas_.clear();
     }
     Replica::next_id_.store(1);
+    service_->ClearCandidatesForReload();
 }
 
 tl::expected<void, SerializationError>
