@@ -6695,7 +6695,7 @@ TEST_F(MasterServiceTest,
     ASSERT_TRUE(segment_status.has_value());
     EXPECT_EQ(segment_status.value(), SegmentStatus::OK);
 
-    auto replicas = service_->GetReplicaList(key, "default");
+    auto replicas = service_->GetReplicaList(key, TenantId::Default());
     ASSERT_TRUE(replicas.has_value());
     bool has_source_memory = false;
     bool has_target_memory = false;

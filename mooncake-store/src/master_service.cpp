@@ -10140,7 +10140,7 @@ std::string MasterService::MakeDrainUnitKey(
 }
 
 std::string MasterService::MakeDrainLocalDiskUnitKey(
-    const std::string& tenant_id, const std::string& key,
+    const TenantId& tenant_id, const std::string& key,
     const UUID& client_id) const {
     return "local-disk:" + UuidToString(client_id) + ":" +
            MakeDrainUnitKey(tenant_id, key, "");

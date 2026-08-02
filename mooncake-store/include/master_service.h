@@ -2240,7 +2240,7 @@ class MasterService {
     std::string MakeDrainUnitKey(const TenantId& tenant_id,
                                  const std::string& key,
                                  const std::string& source_segment) const;
-    std::string MakeDrainLocalDiskUnitKey(const std::string& tenant_id,
+    std::string MakeDrainLocalDiskUnitKey(const TenantId& tenant_id,
                                           const std::string& key,
                                           const UUID& client_id) const;
     void VisitDrainSourceLocalDiskReplicas(
