@@ -935,7 +935,7 @@ TEST_F(StorageBackendTest, AdaptorScanMetaAndIsEnableOffloading) {
     EXPECT_FALSE(enable_strict.value());
 }
 
-TEST_F(StorageBackendTest, AdaptorScanMetaSkipsMalformedFiles) {
+TEST_F(StorageBackendTest, AdaptorScanMetaFailsClosedOnMalformedFiles) {
     FileStorageConfig cfg;
     cfg.storage_filepath = data_path;
     cfg.total_keys_limit = 1;
@@ -945,21 +945,6 @@ TEST_F(StorageBackendTest, AdaptorScanMetaSkipsMalformedFiles) {
     backend_config.fsdir = "file_per_key_malformed_scan";
     backend_config.enable_eviction = false;
 
-    StorageBackendAdaptor adaptor(cfg, backend_config);
-    ASSERT_TRUE(adaptor.Init());
-    ASSERT_TRUE(adaptor.ScanMeta(
-        [](const std::vector<std::string>&,
-           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
-
-    std::string value(128, 'v');
-    std::unordered_map<std::string, std::vector<Slice>> batch = {
-        {"valid_key", {{value.data(), value.size()}}},
-    };
-    ASSERT_TRUE(adaptor.BatchOffload(
-        batch,
-        [](const std::vector<std::string>&,
-           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
-
     const auto corrupt_dir =
         fs::path(cfg.storage_filepath) / backend_config.fsdir / "a" / "b";
     fs::create_directories(corrupt_dir);
@@ -968,19 +953,23 @@ TEST_F(StorageBackendTest, AdaptorScanMetaSkipsMalformedFiles) {
     corrupt_file << std::string(8, static_cast<char>(0xff));
     corrupt_file.close();
 
-    std::vector<std::string> scanned_keys;
-    auto scan_result =
-        adaptor.ScanMeta([&](const std::vector<std::string>& keys,
-                             std::vector<StorageObjectMetadata>&) {
-            scanned_keys.insert(scanned_keys.end(), keys.begin(), keys.end());
-            return ErrorCode::OK;
-        });
-    ASSERT_TRUE(scan_result);
-    EXPECT_EQ(scanned_keys, std::vector<std::string>{"valid_key"});
+    StorageBackendAdaptor adaptor(cfg, backend_config);
+    ASSERT_TRUE(adaptor.Init());
+    auto scan_result = adaptor.ScanMeta(
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_FALSE(scan_result);
+    EXPECT_EQ(scan_result.error(), ErrorCode::FILE_READ_FAIL);
 
     auto enable_result = adaptor.IsEnableOffloading();
-    ASSERT_TRUE(enable_result);
-    EXPECT_TRUE(enable_result.value());
+    ASSERT_FALSE(enable_result);
+    EXPECT_EQ(enable_result.error(), ErrorCode::INTERNAL_ERROR);
+
+    ASSERT_TRUE(fs::remove(corrupt_dir / "corrupt"));
+    ASSERT_TRUE(adaptor.ScanMeta(
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; }));
+    EXPECT_TRUE(adaptor.IsEnableOffloading().value_or(false));
 }
 
 TEST_F(StorageBackendTest, AdaptorScanMetaAndBatchLoadAcrossRestart) {

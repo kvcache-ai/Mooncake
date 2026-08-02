@@ -1564,9 +1564,21 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
     namespace fs = std::filesystem;
     std::unique_lock<std::shared_mutex> scan_lock(scan_mutex_);
 
+    // A scan is authoritative only after the complete traversal and handler
+    // callbacks succeed. Keep offloading disabled while the on-disk snapshot
+    // is incomplete or cannot be validated.
+    meta_scanned_.store(false, std::memory_order_release);
+
     fs::path root = fs::path(file_storage_config_.storage_filepath) /
                     file_per_key_config_.fsdir;
-    if (!fs::exists(root)) {
+    std::error_code root_status_ec;
+    const bool root_exists = fs::exists(root, root_status_ec);
+    if (root_status_ec) {
+        LOG(ERROR) << "Failed to inspect metadata root " << root << ": "
+                   << root_status_ec.message();
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+    if (!root_exists) {
         MutexLocker lock(&mutex_);
         total_keys = 0;
         total_size = 0;
@@ -1598,7 +1610,12 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
         if (ec_root) break;
         std::error_code ec_entry;
         const bool is_directory = it1->is_directory(ec_entry);
-        if (ec_entry || !is_directory) continue;
+        if (ec_entry) {
+            LOG(ERROR) << "Failed to inspect metadata entry " << it1->path()
+                       << ": " << ec_entry.message();
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+        if (!is_directory) continue;
 
         const auto& d1 = it1->path();
 
@@ -1608,7 +1625,12 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
             if (ec_d1) break;
             std::error_code ec_entry;
             const bool is_directory = it2->is_directory(ec_entry);
-            if (ec_entry || !is_directory) continue;
+            if (ec_entry) {
+                LOG(ERROR) << "Failed to inspect metadata entry " << it2->path()
+                           << ": " << ec_entry.message();
+                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            }
+            if (!is_directory) continue;
 
             const auto& leaf = it2->path();
 
@@ -1620,30 +1642,41 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
                 const auto& p = it->path();
                 std::error_code ec_file;
                 const bool is_regular_file = it->is_regular_file(ec_file);
-                if (ec_file || !is_regular_file) continue;
+                if (ec_file) {
+                    LOG(ERROR) << "Failed to inspect metadata entry " << p
+                               << ": " << ec_file.message();
+                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                }
+                if (!is_regular_file) continue;
 
                 uintmax_t sz = fs::file_size(p, ec_file);
-                if (ec_file) continue;
+                if (ec_file) {
+                    LOG(ERROR) << "Failed to read metadata file size " << p
+                               << ": " << ec_file.message();
+                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                }
 
                 std::string buf;
                 auto r =
                     storage_backend_->LoadObject(p.string(), buf, (int64_t)sz);
-                if (!r) continue;
+                if (!r) {
+                    LOG(ERROR) << "Failed to read metadata file " << p
+                               << ", error: " << r.error();
+                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                }
 
                 KVEntry kv;
                 try {
                     // struct_pb::from_pb reports malformed input by throwing.
                     struct_pb::from_pb(kv, buf);
                 } catch (const std::exception& e) {
-                    LOG(WARNING) << "Skipping malformed file during metadata "
-                                    "scan: "
-                                 << p << ", error: " << e.what();
-                    continue;
+                    LOG(ERROR) << "Failed to decode metadata file " << p << ": "
+                               << e.what();
+                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
                 }
                 if (kv.key.empty()) {
-                    LOG(WARNING)
-                        << "Skipping metadata file with an empty key: " << p;
-                    continue;
+                    LOG(ERROR) << "Metadata file has an empty key: " << p;
+                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
                 }
                 storage_backend_->UpdateFileRecordKey(p.string(), kv.key);
 
@@ -1692,6 +1725,8 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
 }
 
 void StorageBackendAdaptor::RemoveAll() {
+    std::unique_lock<std::shared_mutex> scan_lock(scan_mutex_);
+
     if (storage_backend_) {
         storage_backend_->RemoveAll();
     }
