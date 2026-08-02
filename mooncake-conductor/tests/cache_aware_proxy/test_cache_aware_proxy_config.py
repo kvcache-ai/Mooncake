@@ -10,8 +10,8 @@ from pathlib import Path
 from _support import EXAMPLE_DIR, cloned_config_dict, proxy, valid_config_dict
 
 
-def valid_cli_args() -> list[str]:
-    return [
+def valid_cli_args(hash_algorithm: str | None = None) -> list[str]:
+    args = [
         "--prefiller-hosts",
         "prefill-a.test",
         "prefill-b.test",
@@ -56,6 +56,9 @@ def valid_cli_args() -> list[str]:
         "--registration-timeout-seconds",
         "2.0",
     ]
+    if hash_algorithm is not None:
+        args.extend(["--hash-algorithm", hash_algorithm])
+    return args
 
 
 class ConfigTest(unittest.TestCase):
@@ -96,6 +99,16 @@ class ConfigTest(unittest.TestCase):
             config.prefill.instances[0].http_endpoint,
         )
 
+    def test_json_accepts_each_supported_hash_algorithm(self) -> None:
+        for algorithm in ("sha256", "sha256_cbor"):
+            with self.subTest(algorithm=algorithm):
+                raw = cloned_config_dict()
+                raw["prefill"]["config"]["hash_profile"]["algorithm"] = algorithm
+                config = proxy.parse_config(raw)
+                self.assertEqual(
+                    algorithm, config.prefill.config.hash_profile.algorithm
+                )
+
     def test_json_and_cli_configuration_are_equivalent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "proxy.json"
@@ -119,6 +132,18 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual("0.0.0.0", json_args.host)
         self.assertEqual(9000, json_args.port)
         self.assertEqual("DEBUG", json_args.log_level)
+
+    def test_json_and_cli_sha256_selection_are_equivalent(self) -> None:
+        raw = cloned_config_dict()
+        raw["prefill"]["config"]["hash_profile"]["algorithm"] = "sha256"
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "proxy.json"
+            config_path.write_text(json.dumps(raw), encoding="utf-8")
+            json_config = proxy.parse_args(["--config", str(config_path)]).proxy_config
+
+        cli_config = proxy.parse_args(valid_cli_args("sha256")).proxy_config
+        self.assertEqual(json_config, cli_config)
+        self.assertEqual("sha256", cli_config.prefill.config.hash_profile.algorithm)
 
     def test_cli_mode_preserves_proxy_defaults_and_aliases(self) -> None:
         config = proxy.parse_args(
@@ -146,6 +171,7 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(
             "http://localhost:8200", config.decode.instances[0].http_endpoint
         )
+        self.assertEqual("sha256_cbor", config.prefill.config.hash_profile.algorithm)
 
         alias_args = [
             {
@@ -366,6 +392,9 @@ class ConfigTest(unittest.TestCase):
         for index, raw in enumerate(cases):
             with self.subTest(index=index), self.assertRaises(proxy.ConfigError):
                 proxy.parse_config(raw)
+
+    def test_cli_rejects_unsupported_hash_algorithm(self) -> None:
+        self.assert_cli_error(valid_cli_args("xxh64"), "hash_profile.algorithm")
 
     def test_load_config_reports_invalid_json(self) -> None:
         invalid = Path(__file__).with_name("invalid-config.json")

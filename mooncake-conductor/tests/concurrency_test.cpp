@@ -73,6 +73,18 @@ HashProfile RaceProfile() {
     return profile;
 }
 
+HashProfile RacePickleProfile() {
+    const conductor::common::HashProfileConfig source{
+        .strategy = "vllm_v1",
+        .algorithm = "sha256",
+        .python_hash_seed = "0",
+        .index_projection = "low64_be",
+    };
+    HashProfile profile;
+    EXPECT_EQ(ResolveHashProfile(source, &profile), "");
+    return profile;
+}
+
 ServiceConfig RaceService(const std::string& instance_id, int endpoint_slot,
                           int dp_rank = 0) {
     ServiceConfig svc;
@@ -233,6 +245,57 @@ TEST(Concurrency, ConcurrentRegisterUnregister) {
               0u);
     EXPECT_EQ(conductor::kvevent::EventManagerTestPeer::ActiveConfigCount(mgr),
               0u);
+    mgr.Stop();
+}
+
+TEST(Concurrency, ConcurrentMixedAlgorithmRegistrationKeepsSingleProfile) {
+    // Threads race to bind the same ContextKey under both supported
+    // algorithms.  Exactly one resolved profile must win; every registration
+    // naming the other algorithm must fail without mutating state.
+    EventManager mgr({}, 0);
+
+    constexpr int kThreads = 8;
+    std::atomic<int> subscribed{0};
+    std::atomic<int> conflicts{0};
+    std::atomic<int> unexpected{0};
+    std::barrier start(kThreads);
+    std::vector<std::thread> workers;
+    for (int w = 0; w < kThreads; ++w) {
+        workers.emplace_back([&mgr, &start, &subscribed, &conflicts,
+                              &unexpected, w] {
+            ServiceConfig svc =
+                RaceService("instance-" + std::to_string(w), 200 + w);
+            svc.hash_profile =
+                (w % 2 == 0) ? RaceProfile() : RacePickleProfile();
+            start.arrive_and_wait();
+            const auto result =
+                conductor::kvevent::EventManagerTestPeer::Subscribe(mgr, svc);
+            if (result.first) {
+                subscribed.fetch_add(1);
+                return;
+            }
+            if (result.second.find("conflict") != std::string::npos) {
+                conflicts.fetch_add(1);
+                return;
+            }
+            unexpected.fetch_add(1);
+        });
+    }
+    for (auto& t : workers) t.join();
+
+    EXPECT_EQ(unexpected.load(), 0);
+    EXPECT_EQ(subscribed.load() + conflicts.load(), kThreads);
+    EXPECT_GE(subscribed.load(), 1);
+
+    const auto view = mgr.GetIndexer()->GetGlobalView();
+    ASSERT_EQ(view.context_count, 1);
+    ASSERT_EQ(view.contexts.size(), 1u);
+    const HashProfile winner = view.contexts[0].profile;
+    EXPECT_TRUE(winner == RaceProfile() || winner == RacePickleProfile());
+    EXPECT_EQ(static_cast<int>(view.contexts[0].instance_ranks.size()),
+              subscribed.load());
+    EXPECT_EQ(conductor::kvevent::EventManagerTestPeer::SubscriberCount(mgr),
+              static_cast<size_t>(subscribed.load()));
     mgr.Stop();
 }
 

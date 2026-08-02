@@ -8,6 +8,7 @@
 #include <fstream>
 #include <limits>
 #include <set>
+#include <string_view>
 
 #include "conductor/common/utils.h"
 #include "conductor/prefixindex/hash_strategy.h"
@@ -44,6 +45,15 @@ bool JsonInt64(const Json::Value& value, int64_t* out) {
         return true;
     }
     return false;
+}
+
+// Keep the configuration boundary deliberately narrower than the internal
+// hash-strategy implementation.  The registration contract currently
+// exposes exactly the two recipes that vLLM supports for v1 prefix caching;
+// rejecting anything else here also guarantees that an invalid algorithm
+// cannot cause root derivation or any later subscription side effects.
+bool IsSupportedHashAlgorithm(std::string_view algorithm) {
+    return algorithm == "sha256" || algorithm == "sha256_cbor";
 }
 
 bool ParseHashProfile(const Json::Value& raw,
@@ -88,6 +98,14 @@ bool ParseHashProfile(const Json::Value& raw,
         return false;
     }
 
+    if (!IsSupportedHashAlgorithm(source.algorithm)) {
+        *error = "unsupported hash algorithm: " + source.algorithm;
+        return false;
+    }
+
+    // Resolve (and therefore derive) the recipe-specific root while parsing
+    // the immutable static configuration.  No service is returned until this
+    // succeeds, so callers cannot subscribe with an unresolved/forged root.
     *error = prefixindex::ResolveHashProfile(source, profile);
     return error->empty();
 }

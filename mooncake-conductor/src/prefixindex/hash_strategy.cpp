@@ -16,6 +16,44 @@ namespace {
 constexpr size_t kSha256DigestSize = 32;
 constexpr uint64_t kMaxPythonHashSeed = std::numeric_limits<uint32_t>::max();
 
+// ---------------------------------------------------------------------------
+// Recipe boundary
+//
+// The vLLM v1 chain (complete-block selection, full-32-byte parent
+// advancement, SHA-256 digesting, and the low64_be projection) is shared by
+// every supported algorithm.  Each algorithm name selects exactly one value
+// codec that owns serialization of the seed root and of each
+// (parent, token tuple, extra keys) block value.  The codec receives the
+// already-computed extra-key ordering (non-empty LoRA on every block,
+// non-empty cache salt after LoRA only on the first block) and never sees
+// value shapes outside the Conductor query contract.
+//
+// Multimodal and prompt-embedding vLLM extra keys are deliberately NOT
+// representable here: the Conductor query API cannot express them, so the
+// codecs reject that shape by construction instead of approximating it.
+// ---------------------------------------------------------------------------
+
+struct VllmBlockValues {
+    std::span<const uint8_t> parent_digest;  // full 32-byte parent digest
+    std::span<const int32_t> token_ids;      // exactly one complete block
+    const std::string* lora_name;            // nullptr when no LoRA extra key
+    const std::string* cache_salt;           // nullptr when no salt extra key
+};
+
+class VllmValueCodec {
+   public:
+    virtual ~VllmValueCodec() = default;
+
+    virtual void EncodeSeed(std::string_view seed,
+                            std::vector<uint8_t>* out) const = 0;
+    virtual void EncodeBlock(const VllmBlockValues& values,
+                             std::vector<uint8_t>* out) const = 0;
+};
+
+// ---------------------------------------------------------------------------
+// Canonical-CBOR codec (sha256_cbor)
+// ---------------------------------------------------------------------------
+
 void AppendTypeAndLength(uint8_t major_type, uint64_t value,
                          std::vector<uint8_t>* out) {
     const uint8_t initial = static_cast<uint8_t>(major_type << 5);
@@ -70,6 +108,332 @@ void AppendSignedInteger(int32_t value, std::vector<uint8_t>* out) {
     }
     const int64_t signed_value = value;
     AppendTypeAndLength(1, static_cast<uint64_t>(-1 - signed_value), out);
+}
+
+class CborVllmCodec final : public VllmValueCodec {
+   public:
+    void EncodeSeed(std::string_view seed,
+                    std::vector<uint8_t>* out) const override {
+        out->clear();
+        AppendText(seed, out);
+    }
+
+    void EncodeBlock(const VllmBlockValues& values,
+                     std::vector<uint8_t>* out) const override {
+        out->clear();
+        AppendArrayHeader(3, out);
+        AppendBytes(values.parent_digest, out);
+
+        AppendArrayHeader(values.token_ids.size(), out);
+        for (const int32_t token : values.token_ids) {
+            AppendSignedInteger(token, out);
+        }
+
+        const bool has_lora = values.lora_name != nullptr;
+        const bool has_salt = values.cache_salt != nullptr;
+        if (!has_lora && !has_salt) {
+            out->push_back(0xf6U);
+        } else {
+            AppendArrayHeader(
+                static_cast<size_t>(has_lora) + static_cast<size_t>(has_salt),
+                out);
+            if (has_lora) {
+                AppendText(*values.lora_name, out);
+            }
+            if (has_salt) {
+                AppendText(*values.cache_salt, out);
+            }
+        }
+    }
+};
+
+// ---------------------------------------------------------------------------
+// CPython Pickle protocol-5 codec (sha256)
+//
+// Restricted encoder for the value types the Conductor query contract can
+// express: UTF-8 seed strings, full parent bytes, signed int32 token IDs,
+// None, tuple containers, and LoRA/cache-salt strings.  It reproduces the
+// CPython pickler byte-for-byte for those shapes:
+//   * \x80\x05 protocol header and protocol-4+ framing (frames committed at
+//     the start of every object save once the pending frame reaches 64 KiB,
+//     and one final forced frame before/around STOP);
+//   * SHORT_BINUNICODE/BINUNICODE/BINUNICODE8 and SHORT_BINBYTES/BINBYTES/
+//     BINBYTES8 length thresholds;
+//   * BININT1/BININT2/BININT integer thresholds;
+//   * EMPTY_TUPLE/TUPLE1/TUPLE2/TUPLE3/MARK+TUPLE arity opcodes;
+//   * MEMOIZE markers after every non-empty bytes/str/tuple object;
+//   * the \x2e STOP terminator inside the final frame.
+//
+// Values are always emitted fresh (no BINGET back-references).  That matches
+// CPython whenever the memoized objects are distinct, which is the only case
+// the Conductor contract can produce; Python object-identity aliasing between
+// equal strings is an explicitly unsupported shape, as are multimodal and
+// prompt-embedding extra-key object graphs.
+// ---------------------------------------------------------------------------
+
+constexpr uint8_t kPickleMark = 0x28;             // MARK
+constexpr uint8_t kPickleStop = 0x2e;             // STOP
+constexpr uint8_t kPickleEmptyTuple = 0x29;       // EMPTY_TUPLE
+constexpr uint8_t kPickleBinbytes = 0x42;         // BINBYTES
+constexpr uint8_t kPickleShortBinbytes = 0x43;    // SHORT_BINBYTES
+constexpr uint8_t kPickleBinint = 0x4a;           // BININT
+constexpr uint8_t kPickleBinint1 = 0x4b;          // BININT1
+constexpr uint8_t kPickleBinint2 = 0x4d;          // BININT2
+constexpr uint8_t kPickleNone = 0x4e;             // NONE
+constexpr uint8_t kPickleBinunicode = 0x58;       // BINUNICODE
+constexpr uint8_t kPickleTuple = 0x74;            // TUPLE
+constexpr uint8_t kPickleProto = 0x80;            // PROTO
+constexpr uint8_t kPickleTuple1 = 0x85;           // TUPLE1
+constexpr uint8_t kPickleTuple2 = 0x86;           // TUPLE2
+constexpr uint8_t kPickleTuple3 = 0x87;           // TUPLE3
+constexpr uint8_t kPickleShortBinunicode = 0x8c;  // SHORT_BINUNICODE
+constexpr uint8_t kPickleBinunicode8 = 0x8d;      // BINUNICODE8
+constexpr uint8_t kPickleBinbytes8 = 0x8e;        // BINBYTES8
+constexpr uint8_t kPickleMemoize = 0x94;          // MEMOIZE
+constexpr uint8_t kPickleFrame = 0x95;            // FRAME
+constexpr uint8_t kPickleProtocol5 = 0x05;
+
+// CPython _Framer._FRAME_SIZE_TARGET: a pending frame is committed before the
+// next object save once it reaches this size.
+constexpr size_t kPickleFrameTarget = 64 * 1024;
+
+// Emulates CPython's protocol-4+ _Framer: object bytes accumulate in
+// frame_bytes_; Checkpoint() flushes a full frame at the start of each object
+// save, and Finish() emits the final forced frame.
+class PickleStream {
+   public:
+    // Bytes written before framing starts (the protocol header).
+    void WriteRaw(uint8_t value) { out_.push_back(value); }
+
+    void Write(uint8_t value) { frame_.push_back(value); }
+
+    void Write(std::span<const uint8_t> bytes) {
+        frame_.insert(frame_.end(), bytes.begin(), bytes.end());
+    }
+
+    // Mirrors _Framer.commit_frame() at the start of Pickler.save().
+    void Checkpoint() {
+        if (frame_.size() >= kPickleFrameTarget) {
+            FlushFrame();
+        }
+    }
+
+    // Mirrors _Framer.write_large_bytes: the current frame is force-committed
+    // and the large payload is written with its length header but without a
+    // frame opcode.  `header` is the already-packed little-endian length.
+    void WriteLargePayload(uint8_t opcode, std::span<const uint8_t> header,
+                           std::span<const uint8_t> payload) {
+        FlushFrame();
+        out_.push_back(opcode);
+        out_.insert(out_.end(), header.begin(), header.end());
+        out_.insert(out_.end(), payload.begin(), payload.end());
+    }
+
+    // Mirrors _Framer.end_framing(): force-commit whatever remains.
+    void Finish() { FlushFrame(); }
+
+    const std::vector<uint8_t>& bytes() const { return out_; }
+
+   private:
+    void FlushFrame() {
+        if (frame_.empty()) {
+            return;
+        }
+        out_.push_back(kPickleFrame);
+        AppendLittleEndian(static_cast<uint64_t>(frame_.size()), &out_);
+        out_.insert(out_.end(), frame_.begin(), frame_.end());
+        frame_.clear();
+    }
+
+    static void AppendLittleEndian(uint64_t value, std::vector<uint8_t>* out) {
+        for (int shift = 0; shift < 64; shift += 8) {
+            out->push_back(static_cast<uint8_t>(value >> shift));
+        }
+    }
+
+    std::vector<uint8_t> out_;
+    std::vector<uint8_t> frame_;
+};
+
+void PickleAppendLittleEndian(uint64_t value, size_t byte_count,
+                              std::vector<uint8_t>* out) {
+    for (size_t index = 0; index < byte_count; ++index) {
+        out->push_back(static_cast<uint8_t>(value >> (index * 8)));
+    }
+}
+
+void PickleEncodeBytes(std::span<const uint8_t> value, PickleStream* stream) {
+    const uint64_t length = value.size();
+    if (length <= 0xffU) {
+        stream->Write(kPickleShortBinbytes);
+        stream->Write(static_cast<uint8_t>(length));
+        stream->Write(value);
+    } else if (length > std::numeric_limits<uint32_t>::max()) {
+        std::vector<uint8_t> header;
+        PickleAppendLittleEndian(length, 8, &header);
+        stream->WriteLargePayload(kPickleBinbytes8, header, value);
+    } else if (length >= kPickleFrameTarget) {
+        std::vector<uint8_t> header;
+        PickleAppendLittleEndian(length, 4, &header);
+        stream->WriteLargePayload(kPickleBinbytes, header, value);
+    } else {
+        stream->Write(kPickleBinbytes);
+        for (int shift = 0; shift < 32; shift += 8) {
+            stream->Write(static_cast<uint8_t>(length >> shift));
+        }
+        stream->Write(value);
+    }
+    stream->Write(kPickleMemoize);
+}
+
+void PickleEncodeString(std::string_view value, PickleStream* stream) {
+    const auto* bytes = reinterpret_cast<const uint8_t*>(value.data());
+    const std::span<const uint8_t> encoded(bytes, value.size());
+    const uint64_t length = encoded.size();
+    if (length <= 0xffU) {
+        stream->Write(kPickleShortBinunicode);
+        stream->Write(static_cast<uint8_t>(length));
+        stream->Write(encoded);
+    } else if (length > std::numeric_limits<uint32_t>::max()) {
+        std::vector<uint8_t> header;
+        PickleAppendLittleEndian(length, 8, &header);
+        stream->WriteLargePayload(kPickleBinunicode8, header, encoded);
+    } else if (length >= kPickleFrameTarget) {
+        std::vector<uint8_t> header;
+        PickleAppendLittleEndian(length, 4, &header);
+        stream->WriteLargePayload(kPickleBinunicode, header, encoded);
+    } else {
+        stream->Write(kPickleBinunicode);
+        for (int shift = 0; shift < 32; shift += 8) {
+            stream->Write(static_cast<uint8_t>(length >> shift));
+        }
+        stream->Write(encoded);
+    }
+    stream->Write(kPickleMemoize);
+}
+
+void PickleEncodeInt(int32_t value, PickleStream* stream) {
+    if (value >= 0 && value <= 0xff) {
+        stream->Write(kPickleBinint1);
+        stream->Write(static_cast<uint8_t>(value));
+        return;
+    }
+    if (value >= 0 && value <= 0xffff) {
+        stream->Write(kPickleBinint2);
+        const uint16_t narrow = static_cast<uint16_t>(value);
+        stream->Write(static_cast<uint8_t>(narrow));
+        stream->Write(static_cast<uint8_t>(narrow >> 8));
+        return;
+    }
+    stream->Write(kPickleBinint);
+    const uint32_t bits = static_cast<uint32_t>(value);
+    for (int shift = 0; shift < 32; shift += 8) {
+        stream->Write(static_cast<uint8_t>(bits >> shift));
+    }
+}
+
+// Encodes the token tuple: per-element save checkpoints, the CPython tuple
+// arity opcodes, and the trailing MEMOIZE marker for non-empty tuples.
+void PickleEncodeTokenTuple(std::span<const int32_t> tokens,
+                            PickleStream* stream) {
+    if (tokens.empty()) {
+        stream->Write(kPickleEmptyTuple);
+        return;
+    }
+    if (tokens.size() > 3) {
+        stream->Write(kPickleMark);
+    }
+    for (const int32_t token : tokens) {
+        stream->Checkpoint();
+        PickleEncodeInt(token, stream);
+    }
+    switch (tokens.size()) {
+        case 1:
+            stream->Write(kPickleTuple1);
+            break;
+        case 2:
+            stream->Write(kPickleTuple2);
+            break;
+        case 3:
+            stream->Write(kPickleTuple3);
+            break;
+        default:
+            stream->Write(kPickleTuple);
+            break;
+    }
+    stream->Write(kPickleMemoize);
+}
+
+// Encodes the extras slot: Python None when there are no extra keys,
+// otherwise the (LoRA, salt) string tuple in vLLM's ordering.  The caller
+// must have executed the save-entry checkpoint for this value already.
+void PickleEncodeExtras(const VllmBlockValues& values, PickleStream* stream) {
+    const bool has_lora = values.lora_name != nullptr;
+    const bool has_salt = values.cache_salt != nullptr;
+    if (!has_lora && !has_salt) {
+        stream->Write(kPickleNone);
+        return;
+    }
+    if (has_lora) {
+        stream->Checkpoint();
+        PickleEncodeString(*values.lora_name, stream);
+    }
+    if (has_salt) {
+        stream->Checkpoint();
+        PickleEncodeString(*values.cache_salt, stream);
+    }
+    stream->Write(has_lora && has_salt ? kPickleTuple2 : kPickleTuple1);
+    stream->Write(kPickleMemoize);
+}
+
+class PickleVllmCodec final : public VllmValueCodec {
+   public:
+    void EncodeSeed(std::string_view seed,
+                    std::vector<uint8_t>* out) const override {
+        PickleStream stream;
+        stream.WriteRaw(kPickleProto);
+        stream.WriteRaw(kPickleProtocol5);
+        stream.Checkpoint();
+        PickleEncodeString(seed, &stream);
+        stream.Write(kPickleStop);
+        stream.Finish();
+        *out = stream.bytes();
+    }
+
+    void EncodeBlock(const VllmBlockValues& values,
+                     std::vector<uint8_t>* out) const override {
+        PickleStream stream;
+        stream.WriteRaw(kPickleProto);
+        stream.WriteRaw(kPickleProtocol5);
+
+        // Outer (parent, tokens, extras) tuple: TUPLE3.  Each Checkpoint()
+        // mirrors Pickler.save() entry for the corresponding value.
+        stream.Checkpoint();  // save((parent, tokens, extras))
+        stream.Checkpoint();  // save(parent bytes)
+        PickleEncodeBytes(values.parent_digest, &stream);
+        stream.Checkpoint();  // save(token tuple)
+        PickleEncodeTokenTuple(values.token_ids, &stream);
+        stream.Checkpoint();  // save(extras)
+        PickleEncodeExtras(values, &stream);
+        stream.Write(kPickleTuple3);
+        stream.Write(kPickleMemoize);
+
+        stream.Write(kPickleStop);
+        stream.Finish();
+        *out = stream.bytes();
+    }
+};
+
+const VllmValueCodec* CodecForAlgorithm(std::string_view algorithm) {
+    static const CborVllmCodec kCborCodec;
+    static const PickleVllmCodec kPickleCodec;
+    if (algorithm == "sha256_cbor") {
+        return &kCborCodec;
+    }
+    if (algorithm == "sha256") {
+        return &kPickleCodec;
+    }
+    return nullptr;
 }
 
 bool IsContinuationByte(uint8_t value) { return (value & 0xc0U) == 0x80U; }
@@ -161,7 +525,7 @@ std::string ValidateProfileSelectors(std::string_view strategy,
     if (strategy != "vllm_v1") {
         return "unsupported hash strategy: " + std::string(strategy);
     }
-    if (algorithm != "sha256_cbor") {
+    if (algorithm != "sha256" && algorithm != "sha256_cbor") {
         return "unsupported hash algorithm: " + std::string(algorithm);
     }
     if (index_projection != "low64_be") {
@@ -246,9 +610,9 @@ ProjectedPrefix ProjectDigest(
 
 class VllmV1HashStrategy final : public HashStrategy {
    public:
-    explicit VllmV1HashStrategy(
-        std::array<uint8_t, kSha256DigestSize> root_digest)
-        : root_digest_(std::move(root_digest)) {}
+    VllmV1HashStrategy(const VllmValueCodec* codec,
+                       std::array<uint8_t, kSha256DigestSize> root_digest)
+        : codec_(codec), root_digest_(std::move(root_digest)) {}
 
     std::string Compute(const ContextKey& context,
                         std::span<const int32_t> token_ids,
@@ -278,34 +642,19 @@ class VllmV1HashStrategy final : public HashStrategy {
 
         std::array<uint8_t, kSha256DigestSize> parent = root_digest_;
         for (size_t block_index = 0; block_index < block_count; ++block_index) {
-            std::vector<uint8_t> encoded;
-            AppendArrayHeader(3, &encoded);
-            AppendBytes(parent, &encoded);
-
-            AppendArrayHeader(block_size, &encoded);
-            const size_t token_offset = block_index * block_size;
-            for (size_t token_index = 0; token_index < block_size;
-                 ++token_index) {
-                AppendSignedInteger(token_ids[token_offset + token_index],
-                                    &encoded);
-            }
-
             const bool has_lora = !context.lora_name.empty();
             const bool has_salt = block_index == 0 && cache_salt.has_value() &&
                                   !cache_salt->empty();
-            if (!has_lora && !has_salt) {
-                encoded.push_back(0xf6U);
-            } else {
-                AppendArrayHeader(static_cast<size_t>(has_lora) +
-                                      static_cast<size_t>(has_salt),
-                                  &encoded);
-                if (has_lora) {
-                    AppendText(context.lora_name, &encoded);
-                }
-                if (has_salt) {
-                    AppendText(*cache_salt, &encoded);
-                }
-            }
+            const VllmBlockValues values{
+                .parent_digest = parent,
+                .token_ids =
+                    token_ids.subspan(block_index * block_size, block_size),
+                .lora_name = has_lora ? &context.lora_name : nullptr,
+                .cache_salt = has_salt ? &*cache_salt : nullptr,
+            };
+
+            std::vector<uint8_t> encoded;
+            codec_->EncodeBlock(values, &encoded);
 
             HashBlock block;
             if (std::string error = Sha256(encoded, &block.digest);
@@ -322,6 +671,7 @@ class VllmV1HashStrategy final : public HashStrategy {
     }
 
    private:
+    const VllmValueCodec* codec_;
     std::array<uint8_t, kSha256DigestSize> root_digest_;
 };
 
@@ -344,8 +694,13 @@ std::string ResolveHashProfile(const common::HashProfileConfig& config,
         return error;
     }
 
+    const VllmValueCodec* codec = CodecForAlgorithm(config.algorithm);
+    if (codec == nullptr) {
+        return "unsupported hash algorithm: " + config.algorithm;
+    }
+
     std::vector<uint8_t> encoded_seed;
-    AppendText(config.python_hash_seed, &encoded_seed);
+    codec->EncodeSeed(config.python_hash_seed, &encoded_seed);
     std::array<uint8_t, kSha256DigestSize> root_digest{};
     if (auto error = Sha256(encoded_seed, &root_digest); !error.empty()) {
         return error;
@@ -391,8 +746,15 @@ std::unique_ptr<HashStrategy> CreateHashStrategy(const HashProfile& profile,
     if (!validation_error.empty()) {
         return nullptr;
     }
+    const VllmValueCodec* codec = CodecForAlgorithm(profile.algorithm);
+    if (codec == nullptr) {
+        if (error != nullptr) {
+            *error = "unsupported hash algorithm: " + profile.algorithm;
+        }
+        return nullptr;
+    }
     return std::make_unique<VllmV1HashStrategy>(
-        DecodeRootDigest(profile.root_digest));
+        codec, DecodeRootDigest(profile.root_digest));
 }
 
 std::string DigestToHex(const std::array<uint8_t, 32>& digest) {

@@ -16,7 +16,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
-from typing import Any
+from typing import Any, Literal, cast
 from urllib.parse import urlsplit, urlunsplit
 
 import httpx
@@ -25,9 +25,16 @@ from fastapi.responses import StreamingResponse
 
 logger = logging.getLogger(__name__)
 
+HashAlgorithm = Literal["sha256", "sha256_cbor"]
+
+# Keep the profile shape stable while allowing the recipe to be selected by
+# registration.  The CBOR recipe remains the default for the legacy CLI mode;
+# JSON configurations must state the algorithm explicitly in their profile.
+SUPPORTED_HASH_ALGORITHMS: frozenset[str] = frozenset({"sha256", "sha256_cbor"})
+DEFAULT_HASH_ALGORITHM: HashAlgorithm = "sha256_cbor"
 SUPPORTED_HASH_PROFILE = {
     "strategy": "vllm_v1",
-    "algorithm": "sha256_cbor",
+    "algorithm": DEFAULT_HASH_ALGORITHM,
     "index_projection": "low64_be",
 }
 MAX_DP_RANK = (1 << 31) - 1
@@ -50,6 +57,7 @@ CLI_CONFIG_OPTIONS = (
     ("block_size", "--block-size"),
     ("tenant_id", "--tenant-id"),
     ("lora_name", "--lora-name"),
+    ("hash_algorithm", "--hash-algorithm"),
     ("python_hash_seed", "--python-hash-seed"),
     ("query_timeout_seconds", "--query-timeout-seconds"),
     ("registration_timeout_seconds", "--registration-timeout-seconds"),
@@ -67,7 +75,7 @@ class ConductorProtocolError(RuntimeError):
 @dataclass(frozen=True)
 class HashProfileConfig:
     strategy: str
-    algorithm: str
+    algorithm: HashAlgorithm
     python_hash_seed: str
     index_projection: str
 
@@ -211,10 +219,23 @@ def _parse_hash_profile(raw: Any, path: str) -> HashProfileConfig:
         "index_projection",
     }
     _reject_unknown_fields(value, allowed, path)
-    for field, expected in SUPPORTED_HASH_PROFILE.items():
-        actual = _require_nonempty_string(value, field, path)
-        if actual != expected:
-            raise ConfigError(f"{path}.{field} must be {expected!r}")
+    strategy = _require_nonempty_string(value, "strategy", path)
+    if strategy != SUPPORTED_HASH_PROFILE["strategy"]:
+        raise ConfigError(
+            f"{path}.strategy must be {SUPPORTED_HASH_PROFILE['strategy']!r}"
+        )
+
+    algorithm = _require_nonempty_string(value, "algorithm", path)
+    if algorithm not in SUPPORTED_HASH_ALGORITHMS:
+        supported = ", ".join(sorted(SUPPORTED_HASH_ALGORITHMS))
+        raise ConfigError(f"{path}.algorithm must be one of: {supported}")
+
+    index_projection = _require_nonempty_string(value, "index_projection", path)
+    if index_projection != SUPPORTED_HASH_PROFILE["index_projection"]:
+        raise ConfigError(
+            f"{path}.index_projection must be "
+            f"{SUPPORTED_HASH_PROFILE['index_projection']!r}"
+        )
 
     seed = _require_nonempty_string(value, "python_hash_seed", path)
     if seed != "random":
@@ -226,10 +247,10 @@ def _parse_hash_profile(raw: Any, path: str) -> HashProfileConfig:
             raise ConfigError(f"{path}.python_hash_seed must be in the uint32 range")
 
     return HashProfileConfig(
-        strategy=value["strategy"],
-        algorithm=value["algorithm"],
+        strategy=strategy,
+        algorithm=cast(HashAlgorithm, algorithm),
         python_hash_seed=seed,
-        index_projection=value["index_projection"],
+        index_projection=index_projection,
     )
 
 
@@ -485,6 +506,11 @@ def _cli_config_dict(args: argparse.Namespace) -> dict[str, Any]:
     python_hash_seed = _required_cli_value(
         args, "python_hash_seed", "--python-hash-seed"
     )
+    hash_algorithm = (
+        args.hash_algorithm
+        if args.hash_algorithm is not None
+        else DEFAULT_HASH_ALGORITHM
+    )
 
     return {
         "conductor": {
@@ -510,7 +536,7 @@ def _cli_config_dict(args: argparse.Namespace) -> dict[str, Any]:
                 "lora_name": args.lora_name if args.lora_name is not None else "",
                 "hash_profile": {
                     "strategy": SUPPORTED_HASH_PROFILE["strategy"],
-                    "algorithm": SUPPORTED_HASH_PROFILE["algorithm"],
+                    "algorithm": hash_algorithm,
                     "python_hash_seed": python_hash_seed,
                     "index_projection": SUPPORTED_HASH_PROFILE["index_projection"],
                 },
@@ -1048,6 +1074,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--block-size", type=int)
     parser.add_argument("--tenant-id")
     parser.add_argument("--lora-name")
+    parser.add_argument(
+        "--hash-algorithm",
+        "--hash-algo",
+        "--prefix-caching-hash-algo",
+        dest="hash_algorithm",
+        help=(
+            "vLLM prefix-cache hash recipe (sha256 or sha256_cbor); "
+            "legacy CLI default: sha256_cbor"
+        ),
+    )
     parser.add_argument("--python-hash-seed")
     parser.add_argument("--query-timeout-seconds", type=float)
     parser.add_argument("--registration-timeout-seconds", type=float)
