@@ -66,6 +66,51 @@ inline TransportType c_to_transport_hint(int v) {
     return static_cast<TransportType>(v);
 }
 
+inline const char* transportTypeName(TransportType type) {
+    switch (type) {
+        case UNSPEC:
+            return "unspec";
+        case RDMA:
+            return "rdma";
+        case MNNVL:
+            return "mnnvl";
+        case SHM:
+            return "shm";
+        case NVLINK:
+            return "nvlink";
+        case GDS:
+            return "gds";
+        case IOURING:
+            return "io_uring";
+        case TCP:
+            return "tcp";
+        case AscendDirect:
+            return "ascend";
+        case SUNRISE_LINK:
+            return "sunrise_link";
+        case TPU:
+            return "tpu";
+        case kNumTransportTypes:
+            return "unknown";
+    }
+    return "unknown";
+}
+
+inline TransportType parseTransportType(const std::string& str) {
+    if (str == "unspec") return UNSPEC;
+    if (str == "rdma") return RDMA;
+    if (str == "mnnvl") return MNNVL;
+    if (str == "shm") return SHM;
+    if (str == "nvlink") return NVLINK;
+    if (str == "gds") return GDS;
+    if (str == "io_uring") return IOURING;
+    if (str == "tcp") return TCP;
+    if (str == "ascend") return AscendDirect;
+    if (str == "sunrise_link") return SUNRISE_LINK;
+    if (str == "tpu") return TPU;
+    return UNSPEC;
+}
+
 enum class IntentType : int {
     INTENT_UNSPEC = 0,
     FOREGROUND_GET,
@@ -112,6 +157,12 @@ enum TransferStatusEnum {
 struct TransferStatus {
     TransferStatusEnum s;
     size_t transferred_bytes;
+};
+
+struct NicLoadStats {
+    std::string device_name;
+    uint64_t inflight_bytes{0};
+    double ewma_bandwidth_bps{0.0};
 };
 
 enum Permission {

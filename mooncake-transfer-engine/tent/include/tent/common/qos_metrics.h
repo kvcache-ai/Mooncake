@@ -49,6 +49,7 @@ struct QosClassMetrics {
     double weighted_goodput_gbps = 0.0;
     std::optional<double> isolated_throughput_gbps;
     std::optional<double> isolation_leakage;
+    uint64_t transferred_bytes = 0;
 };
 
 struct QosClassSample {
@@ -56,6 +57,7 @@ struct QosClassSample {
     double total_duration_us = 0.0;
     double p99_us = 0.0;
     std::optional<double> slo_attainment;
+    std::optional<uint64_t> transferred_bytes;
 };
 
 struct QosMetricsReport {

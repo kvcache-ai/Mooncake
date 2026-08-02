@@ -5,122 +5,18 @@ on:
 
 jobs:
   build-wheel-cu13:
-    runs-on: ubuntu-22.04
-    strategy:
-      matrix:
-        python-version: ['3.10', '3.12']
-    env:
-      BUILD_WITH_EP: "1"
-      CU13_BUILD: "1"
-      TORCH_CUDA_ARCH_LIST: "8.0;9.0"
-      SCCACHE_GHA_ENABLED: "true"
-
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        persist-credentials: false
-
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v5
-      with:
-        python-version: ${{ matrix.python-version }}
-
-    - name: Free up disk space
-      run: |
-        sudo rm -rf /usr/share/dotnet
-        sudo rm -rf /opt/ghc
-        sudo rm -rf /opt/hostedtoolcache/CodeQL
-        sudo rm -rf /usr/local/lib/android
-        df -h
-
-    - name: Install CUDA Toolkit
-      uses: Jimver/cuda-toolkit@v0.2.29
-      with:
-        cuda: '13.0.2'
-        linux-local-args: '["--toolkit"]'
-        method: 'network'
-        sub-packages: '["nvcc", "nvrtc-dev"]'
-        non-cuda-sub-packages: '["libcusparse-dev", "libcublas-dev", "libcusolver-dev"]'
-
-    - name: Run sccache-cache
-      uses: mozilla-actions/sccache-action@v0.0.9
-
-    - name: Configure sccache
-      uses: actions/github-script@v7
-      with:
-        script: |
-          core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
-          core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
-    - name: Install dependencies
-      run: |
-        sudo apt update -y
-        sudo apt install -y ninja-build
-        sudo bash -x dependencies.sh -y
-        df -h
-      shell: bash
-
-    - name: Configure project
-      run: |
-        mkdir build
-        cd build
-        cmake -G Ninja .. \
-          -DUSE_ETCD=ON \
-          -DUSE_REDIS=ON \
-          -DUSE_HTTP=ON \
-          -DWITH_STORE=ON \
-          -DWITH_P2P_STORE=ON \
-          -DWITH_EP=ON \
-          -DEP_TORCH_VERSIONS="2.11.0;2.12.0;2.12.1" \
-          -DWITH_METRICS=ON \
-          -DBUILD_UNIT_TESTS=OFF \
-          -DBUILD_EXAMPLES=ON \
-          -DENABLE_SCCACHE=ON \
-          -DBUILD_BENCHMARK=ON \
-          -DUSE_CUDA=ON \
-          -DCMAKE_BUILD_TYPE=Release \
-          -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs" \
-          -DENABLE_DEBUG_SYMBOLS=OFF
-      shell: bash
-
-    - name: Build project
-      run: |
-        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
-        export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
-        cd build
-        cmake --build .
-        sudo cmake --install .
-        df -h
-      shell: bash
-
-    - name: Build nvlink_allocator.so
-      run: |
-        mkdir -p build/mooncake-transfer-engine/nvlink-allocator
-        cd mooncake-transfer-engine/nvlink-allocator
-        export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
-        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
-        export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
-        bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
-      shell: bash
-
-    - name: Run sccache stat for check
-      if: ${{ env.SCCACHE_PATH != '' }}
-      shell: bash
-      run: ${SCCACHE_PATH} --show-stats
-
-    - name: Generate Python version tag
-      id: generate_tag
-      run: |
-        echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
-      shell: bash
-
-    - name: Build Python wheel
-      run: |
-        PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ steps.generate_tag.outputs.python_version_tag }} ./scripts/build_wheel.sh
-      shell: bash
-
-    - name: Upload Python wheel artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: mooncake-wheel-cu130-ubuntu-py${{ steps.generate_tag.outputs.python_version_tag }}
-        path: mooncake-wheel/dist-py${{ steps.generate_tag.outputs.python_version_tag }}/*.whl
+    uses: ./.github/workflows/_build-wheel.yaml
+    with:
+      runner: ubuntu-22.04
+      container: pytorch/manylinux2_28-builder:cuda13.0
+      python-versions: '["3.10", "3.12"]'
+      cuda: container
+      variant-flag: CU13_BUILD
+      torch-cuda-arch-list: '8.0;9.0'
+      ep-torch-versions: '2.11.0;2.12.0;2.12.1;2.13.0'
+      build-nvlink-allocator: true
+      cmake-args: >-
+        -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON
+        -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
+      artifact-prefix: mooncake-wheel-cu130
+      version-override: 0.0.0.dev0
