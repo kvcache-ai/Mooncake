@@ -13,6 +13,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -852,6 +853,10 @@ class StorageBackendAdaptor : public StorageBackendInterface {
     std::unique_ptr<StorageBackend> storage_backend_;
 
     static std::string ConcatSlicesToString(const std::vector<Slice>& slices);
+
+    // Allows concurrent writes while isolating a full metadata scan from file
+    // changes made through this adaptor.
+    mutable std::shared_mutex scan_mutex_;
 
     mutable Mutex mutex_;
 

@@ -1978,6 +1978,12 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
         return tl::make_unexpected(ErrorCode::INVALID_KEY);
     }
 
+    std::shared_lock<std::shared_mutex> scan_lock(scan_mutex_);
+
+    auto enable_offloading_res = IsEnableOffloading();
+    if (!enable_offloading_res) {
+        return tl::make_unexpected(enable_offloading_res.error());
+    }
     std::vector<StorageObjectMetadata> metadatas;
     std::vector<std::string> keys;
     metadatas.reserve(batch_object.size());
@@ -2118,6 +2124,8 @@ tl::expected<std::vector<std::string>, ErrorCode>
 StorageBackendAdaptor::EvictAboveDiskWatermark(
     double high_watermark_ratio, double low_watermark_ratio,
     EvictionHandler eviction_handler) {
+    std::shared_lock<std::shared_mutex> scan_lock(scan_mutex_);
+
     auto eviction_result = storage_backend_->EvictAboveDiskWatermark(
         high_watermark_ratio, low_watermark_ratio, eviction_handler);
     if (!eviction_result) {
@@ -2251,26 +2259,27 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
         ErrorCode(const std::vector<std::string>& keys,
                   std::vector<StorageObjectMetadata>& metadatas)>& handler) {
     namespace fs = std::filesystem;
+    std::unique_lock<std::shared_mutex> scan_lock(scan_mutex_);
 
-    MutexLocker lock(&mutex_);
-
-    // Rebuild accounting from the current on-disk snapshot. Offloading remains
-    // disabled until the whole scan and any legacy cleanup succeed.
+    // A scan is authoritative only after the complete traversal and handler
+    // callbacks succeed. Keep offloading disabled while the on-disk snapshot
+    // is incomplete or cannot be validated.
     meta_scanned_.store(false, std::memory_order_release);
-    accounted_size_by_key_.clear();
-    total_keys = 0;
-    total_size = 0;
 
     fs::path root = fs::path(file_storage_config_.storage_filepath) /
                     file_per_key_config_.fsdir;
-    std::error_code root_ec;
-    const bool root_exists = fs::exists(root, root_ec);
-    if (root_ec) {
+    std::error_code root_status_ec;
+    const bool root_exists = fs::exists(root, root_status_ec);
+    if (root_status_ec) {
         LOG(ERROR) << "Failed to inspect file-per-key root: " << root
-                   << ", error: " << root_ec.message();
+                   << ", error: " << root_status_ec.message();
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     }
     if (!root_exists) {
+        MutexLocker lock(&mutex_);
+        accounted_size_by_key_.clear();
+        total_keys = 0;
+        total_size = 0;
         meta_scanned_.store(true, std::memory_order_release);
         return {};
     }
@@ -2283,7 +2292,13 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
     std::vector<std::string> keys;
     std::vector<StorageObjectMetadata> metas;
     std::vector<std::string> legacy_keys_to_cleanup;
-    std::unordered_set<std::string> registered_keys;
+    std::unordered_map<std::string, int64_t> scanned_size_by_key;
+    int64_t scanned_size = 0;
+
+    // Accounting is committed only after the full traversal, handler calls,
+    // and legacy cleanup all succeed. A handler may have consumed earlier
+    // batches before a later error; FileStorage retries the full scan and
+    // master replica registration is idempotent.
 
     auto flush = [&]() -> tl::expected<void, ErrorCode> {
         if (keys.empty()) return {};
@@ -2297,12 +2312,18 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
     auto register_entry =
         [&](const std::string& key, int64_t value_size, int64_t serialized_size,
             const std::string& path) -> tl::expected<void, ErrorCode> {
-        if (!registered_keys.emplace(key).second) {
+        if (!scanned_size_by_key.emplace(key, serialized_size).second) {
             return {};
+        }
+        if (serialized_size < 0 ||
+            serialized_size >
+                std::numeric_limits<int64_t>::max() - scanned_size) {
+            LOG(ERROR) << "File-per-key accounting overflow for key: " << key;
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
         }
 
         storage_backend_->UpdateFileRecordKey(path, key);
-        UpsertKeyAccounting(key, serialized_size);
+        scanned_size += serialized_size;
         keys.emplace_back(key);
         metas.emplace_back(StorageObjectMetadata{
             -1, 0, static_cast<int64_t>(key.size()), value_size, ""});
@@ -2318,9 +2339,14 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
     for (auto it1 = fs::directory_iterator(root, ec_root);
          !ec_root && it1 != fs::directory_iterator(); it1.increment(ec_root)) {
         if (ec_root) break;
-        const bool is_first_level_directory = it1->is_directory(ec_root);
-        if (ec_root) break;
-        if (!is_first_level_directory) continue;
+        std::error_code ec_entry;
+        const bool is_directory = it1->is_directory(ec_entry);
+        if (ec_entry) {
+            LOG(ERROR) << "Failed to inspect file-per-key entry: "
+                       << it1->path() << ", error: " << ec_entry.message();
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+        if (!is_directory) continue;
 
         const auto& d1 = it1->path();
 
@@ -2328,9 +2354,14 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
         for (auto it2 = fs::directory_iterator(d1, ec_d1);
              !ec_d1 && it2 != fs::directory_iterator(); it2.increment(ec_d1)) {
             if (ec_d1) break;
-            const bool is_second_level_directory = it2->is_directory(ec_d1);
-            if (ec_d1) break;
-            if (!is_second_level_directory) continue;
+            std::error_code ec_entry;
+            const bool is_directory = it2->is_directory(ec_entry);
+            if (ec_entry) {
+                LOG(ERROR) << "Failed to inspect file-per-key entry: "
+                           << it2->path() << ", error: " << ec_entry.message();
+                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            }
+            if (!is_directory) continue;
 
             const auto& leaf = it2->path();
 
@@ -2340,16 +2371,32 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
                  it.increment(ec_leaf)) {
                 if (ec_leaf) break;
                 const auto& p = it->path();
-                const bool is_regular_file = it->is_regular_file(ec_leaf);
-                if (ec_leaf) break;
+                std::error_code ec_file;
+                const bool is_regular_file = it->is_regular_file(ec_file);
+                if (ec_file) {
+                    LOG(ERROR) << "Failed to inspect file-per-key entry: " << p
+                               << ", error: " << ec_file.message();
+                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                }
                 if (!is_regular_file) continue;
 
-                uintmax_t sz = fs::file_size(p, ec_leaf);
-                if (ec_leaf) break;
+                uintmax_t sz = fs::file_size(p, ec_file);
+                if (ec_file) {
+                    LOG(ERROR)
+                        << "Failed to read file-per-key entry size: " << p
+                        << ", error: " << ec_file.message();
+                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                }
+                if (sz > static_cast<uintmax_t>(
+                             std::numeric_limits<int64_t>::max())) {
+                    LOG(ERROR)
+                        << "File-per-key entry is too large to scan: " << p;
+                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                }
 
                 std::string buf;
-                auto r =
-                    storage_backend_->LoadObject(p.string(), buf, (int64_t)sz);
+                auto r = storage_backend_->LoadObject(p.string(), buf,
+                                                      static_cast<int64_t>(sz));
                 if (!r) {
                     LOG(ERROR) << "Failed to read file-per-key metadata: " << p
                                << ", error: " << r.error();
@@ -2357,7 +2404,18 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
                 }
 
                 KVEntry kv;
-                struct_pb::from_pb(kv, buf);
+                try {
+                    // struct_pb::from_pb reports malformed input by throwing.
+                    struct_pb::from_pb(kv, buf);
+                } catch (const std::exception& e) {
+                    LOG(ERROR) << "Failed to decode file-per-key entry: " << p
+                               << ", error: " << e.what();
+                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                }
+                if (kv.key.empty()) {
+                    LOG(ERROR) << "File-per-key entry has an empty key: " << p;
+                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                }
 
                 const auto canonical_path = ResolveFilePerKeyPathFromKey(
                     kv.key, file_storage_config_.storage_filepath,
@@ -2447,11 +2505,19 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
         }
     }
 
+    {
+        MutexLocker lock(&mutex_);
+        accounted_size_by_key_ = std::move(scanned_size_by_key);
+        total_keys = static_cast<int64_t>(accounted_size_by_key_.size());
+        total_size = scanned_size;
+    }
     meta_scanned_.store(true, std::memory_order_release);
     return {};
 }
 
 void StorageBackendAdaptor::RemoveAll() {
+    std::unique_lock<std::shared_mutex> scan_lock(scan_mutex_);
+
     if (storage_backend_) {
         storage_backend_->RemoveAll();
     }
@@ -2461,6 +2527,7 @@ void StorageBackendAdaptor::RemoveAll() {
     // metadata and rebuilds them). Applies to the kFilePerKey path; the
     // OffsetAllocator backend resets its own atomics internally.
     MutexLocker lock(&mutex_);
+    accounted_size_by_key_.clear();
     total_keys = 0;
     total_size = 0;
 }
