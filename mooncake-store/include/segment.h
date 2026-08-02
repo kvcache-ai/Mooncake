@@ -368,7 +368,7 @@ class ScopedAllocatorAccess {
  * @brief RAII-style access to LocalDiskOffloadingQueues for thread-safe
  * LocalDiskOffloadingQueue usage
  */
-class ScopedLocalDiskSegmentAccess : public SsdMetricsProvider {
+class ScopedLocalDiskSegmentAccess : public SsdUsageProvider {
    public:
     explicit ScopedLocalDiskSegmentAccess(
         std::unordered_map<std::string, UUID>& client_by_name,
@@ -389,8 +389,9 @@ class ScopedLocalDiskSegmentAccess : public SsdMetricsProvider {
         return client_local_disk_segment_;
     }
 
-    int64_t getSsdTotalCapacity(const std::string& segment_name) const override;
-    int64_t getSsdUsedBytes(const std::string& segment_name) const override;
+    int64_t GetSsdTotalCapacityBytes(
+        const std::string& segment_name) const override;
+    int64_t GetSsdUsedBytes(const std::string& segment_name) const override;
 
    private:
     const std::unordered_map<std::string, UUID>&

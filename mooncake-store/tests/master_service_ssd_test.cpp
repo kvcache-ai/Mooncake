@@ -823,7 +823,7 @@ TEST_F(MasterServiceSSDTest, EvictDiskReplicaDecrementsFileCacheNums) {
 // three configurations:
 //   (A) RANDOM, no offload        — baseline, original behavior
 //   (B) RANDOM, with offload      — isolates disk-replica creation overhead
-//   (C) SSD_FREE_RATIO_FIRST, with offload — adds SSD metrics lock + sorting
+//   (C) SSD_FREE_RATIO_FIRST, with offload — adds SSD usage lock + sorting
 //
 // Comparing A→B separates the cost of mounting LocalDisk segments.
 // Comparing B→C isolates the pure SSD-ranking strategy overhead.

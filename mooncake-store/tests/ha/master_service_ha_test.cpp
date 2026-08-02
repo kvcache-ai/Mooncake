@@ -680,7 +680,7 @@ class MasterServiceHATest : public ::testing::Test {
     static int64_t GetLocalDiskUsedBytesForTesting(
         MasterService& service, const std::string& segment_name) {
         auto access = service.segment_manager_.getLocalDiskSegmentAccess();
-        return access.getSsdUsedBytes(segment_name);
+        return access.GetSsdUsedBytes(segment_name);
     }
 
     std::vector<std::string> policy_files_;

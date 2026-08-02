@@ -146,12 +146,19 @@ class AllocatorManager {
     friend class SegmentSerializer;  // for fork serialize
 };
 
-class SsdMetricsProvider {
+/**
+ * Read-only domain view of client-local SSD capacity and occupancy.
+ *
+ * Values come from LocalDiskSegment state. Implementations must return zero
+ * for unknown segments; callers clamp transient occupancy drift to the
+ * reported capacity before making placement decisions.
+ */
+class SsdUsageProvider {
    public:
-    virtual ~SsdMetricsProvider() = default;
-    virtual int64_t getSsdTotalCapacity(
+    virtual ~SsdUsageProvider() = default;
+    virtual int64_t GetSsdTotalCapacityBytes(
         const std::string& segment_name) const = 0;
-    virtual int64_t getSsdUsedBytes(const std::string& segment_name) const = 0;
+    virtual int64_t GetSsdUsedBytes(const std::string& segment_name) const = 0;
 };
 
 /**
@@ -206,9 +213,8 @@ class AllocationStrategy {
         const size_t replica_num,
         const std::vector<std::string>& preferred_segments,
         const std::set<std::string>& excluded_segments,
-        const ReplicaType replica_type,
-        const SsdMetricsProvider* ssd_provider) {
-        (void)ssd_provider;
+        const ReplicaType replica_type, const SsdUsageProvider* ssd_usage) {
+        (void)ssd_usage;
         return Allocate(allocator_manager, slice_length, replica_num,
                         preferred_segments, excluded_segments, replica_type);
     }
@@ -582,7 +588,7 @@ class SsdFreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
         const std::vector<std::string>& preferred_segments,
         const std::set<std::string>& excluded_segments,
         const ReplicaType replica_type,
-        const SsdMetricsProvider* ssd_provider) override {
+        const SsdUsageProvider* ssd_usage) override {
         if (slice_length == 0 || replica_num == 0) {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
@@ -639,7 +645,7 @@ class SsdFreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
                 continue;
             }
 
-            double ssd_free_ratio = getSegmentSsdFreeRatio(name, ssd_provider);
+            double ssd_free_ratio = getSegmentSsdFreeRatio(name, ssd_usage);
             candidates.push_back({idx, ssd_free_ratio});
         }
 
@@ -703,12 +709,12 @@ class SsdFreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
     static constexpr size_t kMaxRetryLimit = 100;
     static constexpr size_t kCandidateMultiplier = 6;
 
-    double getSegmentSsdFreeRatio(
-        const std::string& name, const SsdMetricsProvider* ssd_provider) const {
-        if (!ssd_provider) return 1.0;
-        int64_t total = ssd_provider->getSsdTotalCapacity(name);
+    double getSegmentSsdFreeRatio(const std::string& name,
+                                  const SsdUsageProvider* ssd_usage) const {
+        if (!ssd_usage) return 1.0;
+        int64_t total = ssd_usage->GetSsdTotalCapacityBytes(name);
         if (total <= 0) return 1.0;
-        int64_t used = ssd_provider->getSsdUsedBytes(name);
+        int64_t used = ssd_usage->GetSsdUsedBytes(name);
         used = std::clamp<int64_t>(used, 0, total);
         int64_t free_bytes = total - used;
         return static_cast<double>(free_bytes) / static_cast<double>(total);

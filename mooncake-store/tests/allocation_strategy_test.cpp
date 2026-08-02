@@ -755,18 +755,18 @@ TEST_F(AllocationStrategyTest, PerformanceTest) {
 // public API. The functionality is now encapsulated within the Allocate()
 // method.
 
-// Mock SsdMetricsProvider for testing SSD-aware allocation
-class MockSsdMetricsProvider : public SsdMetricsProvider {
+// Mock SsdUsageProvider for testing SSD-aware allocation
+class MockSsdUsageProvider : public SsdUsageProvider {
    public:
     std::unordered_map<std::string, int64_t> total_capacity;
     std::unordered_map<std::string, int64_t> used_bytes;
 
-    int64_t getSsdTotalCapacity(const std::string& name) const override {
+    int64_t GetSsdTotalCapacityBytes(const std::string& name) const override {
         auto it = total_capacity.find(name);
         return it != total_capacity.end() ? it->second : 0;
     }
 
-    int64_t getSsdUsedBytes(const std::string& name) const override {
+    int64_t GetSsdUsedBytes(const std::string& name) const override {
         auto it = used_bytes.find(name);
         return it != used_bytes.end() ? it->second : 0;
     }
@@ -788,18 +788,17 @@ TEST_F(AllocationStrategyTest, SsdFreeRatioFirstChoosesHighestFreeRatio) {
     }
 
     // SSD free ratios: segment 0 = 20%, segment 1 = 60%, segment 2 = 90%
-    MockSsdMetricsProvider ssd_provider;
+    MockSsdUsageProvider ssd_usage;
     for (int i = 0; i < kNumSegments; i++) {
         const auto name = std::to_string(i) + "-segment";
-        ssd_provider.total_capacity[name] = 1000 * MiB;
+        ssd_usage.total_capacity[name] = 1000 * MiB;
     }
-    ssd_provider.used_bytes["0-segment"] = 800 * MiB;  // 20% free
-    ssd_provider.used_bytes["1-segment"] = 400 * MiB;  // 60% free
-    ssd_provider.used_bytes["2-segment"] = 100 * MiB;  // 90% free
+    ssd_usage.used_bytes["0-segment"] = 800 * MiB;  // 20% free
+    ssd_usage.used_bytes["1-segment"] = 400 * MiB;  // 60% free
+    ssd_usage.used_bytes["2-segment"] = 100 * MiB;  // 90% free
 
-    auto result =
-        ssd_strategy->Allocate(allocator_manager, 64 * 1024, 1, {}, {},
-                               ReplicaType::MEMORY, &ssd_provider);
+    auto result = ssd_strategy->Allocate(allocator_manager, 64 * 1024, 1, {},
+                                         {}, ReplicaType::MEMORY, &ssd_usage);
     ASSERT_TRUE(result.has_value());
     ASSERT_EQ(result.value().size(), 1u);
 
@@ -811,9 +810,8 @@ TEST_F(AllocationStrategyTest, SsdFreeRatioFirstChoosesHighestFreeRatio) {
 }
 
 // Test that SsdFreeRatioFirstAllocationStrategy works without an
-// SsdMetricsProvider (delegates to base class random allocation).
-TEST_F(AllocationStrategyTest,
-       SsdFreeRatioFirstWithoutMetricsProviderAllocates) {
+// SsdUsageProvider (delegates to base class random allocation).
+TEST_F(AllocationStrategyTest, SsdFreeRatioFirstWithoutUsageProviderAllocates) {
     auto ssd_strategy = std::make_unique<SsdFreeRatioFirstAllocationStrategy>();
 
     auto allocator = std::make_shared<OffsetBufferAllocator>(
@@ -844,21 +842,21 @@ TEST_F(AllocationStrategyTest, SsdFreeRatioFirstExcludedSegmentsSkipped) {
     }
 
     // SSD free ratios: 0-segment=95%, 1-segment=50%, 2-segment=30%
-    MockSsdMetricsProvider ssd_provider;
+    MockSsdUsageProvider ssd_usage;
     for (int i = 0; i < kNumSegments; i++) {
         const auto name = std::to_string(i) + "-segment";
-        ssd_provider.total_capacity[name] = 1000 * MiB;
+        ssd_usage.total_capacity[name] = 1000 * MiB;
     }
-    ssd_provider.used_bytes["0-segment"] = 50 * MiB;   // 95% free (highest)
-    ssd_provider.used_bytes["1-segment"] = 500 * MiB;  // 50% free
-    ssd_provider.used_bytes["2-segment"] = 700 * MiB;  // 30% free
+    ssd_usage.used_bytes["0-segment"] = 50 * MiB;   // 95% free (highest)
+    ssd_usage.used_bytes["1-segment"] = 500 * MiB;  // 50% free
+    ssd_usage.used_bytes["2-segment"] = 700 * MiB;  // 30% free
 
     // Exclude 0-segment which has the highest SSD free ratio
     std::set<std::string> excluded = {"0-segment"};
 
     auto result =
         ssd_strategy->Allocate(allocator_manager, 64 * 1024, 1, {}, excluded,
-                               ReplicaType::MEMORY, &ssd_provider);
+                               ReplicaType::MEMORY, &ssd_usage);
     ASSERT_TRUE(result.has_value());
     ASSERT_EQ(result.value().size(), 1u);
 
@@ -889,15 +887,14 @@ TEST_F(AllocationStrategyTest, SsdFreeRatioFirstUsedExceedsTotalIsClamped) {
 
     // 0-segment: used exceeds total (concurrent drift) → clamped to 0% free
     // 1-segment: used=100, total=1000 → 90% free
-    MockSsdMetricsProvider ssd_provider;
-    ssd_provider.total_capacity["0-segment"] = 1000 * MiB;
-    ssd_provider.total_capacity["1-segment"] = 1000 * MiB;
-    ssd_provider.used_bytes["0-segment"] = 1500 * MiB;  // exceeds total
-    ssd_provider.used_bytes["1-segment"] = 100 * MiB;   // 90% free
+    MockSsdUsageProvider ssd_usage;
+    ssd_usage.total_capacity["0-segment"] = 1000 * MiB;
+    ssd_usage.total_capacity["1-segment"] = 1000 * MiB;
+    ssd_usage.used_bytes["0-segment"] = 1500 * MiB;  // exceeds total
+    ssd_usage.used_bytes["1-segment"] = 100 * MiB;   // 90% free
 
-    auto result =
-        ssd_strategy->Allocate(allocator_manager, 64 * 1024, 1, {}, {},
-                               ReplicaType::MEMORY, &ssd_provider);
+    auto result = ssd_strategy->Allocate(allocator_manager, 64 * 1024, 1, {},
+                                         {}, ReplicaType::MEMORY, &ssd_usage);
     ASSERT_TRUE(result.has_value());
     ASSERT_EQ(result.value().size(), 1u);
 
@@ -911,7 +908,7 @@ TEST_F(AllocationStrategyTest, SsdFreeRatioFirstUsedExceedsTotalIsClamped) {
 
 // Strategy-level performance comparison: Random vs SsdFreeRatioFirst.
 // Uses OffsetBufferAllocator (real physical memory via aligned_alloc) and
-// MockSsdMetricsProvider. Measures pure strategy overhead without MasterService
+// MockSsdUsageProvider. Measures pure strategy overhead without MasterService
 // locking, reflecting only the allocation algorithm cost.
 TEST_F(AllocationStrategyTest, SsdFreeRatioFirstVsRandomStrategyPerformance) {
     constexpr size_t kNumSegments = 64;
@@ -931,12 +928,12 @@ TEST_F(AllocationStrategyTest, SsdFreeRatioFirstVsRandomStrategyPerformance) {
     }
 
     // SSD free ratios vary uniformly from ~10% to ~90% across segments
-    MockSsdMetricsProvider ssd_provider;
+    MockSsdUsageProvider ssd_usage;
     for (size_t i = 0; i < kNumSegments; i++) {
         const auto name = "perf_seg_" + std::to_string(i);
-        ssd_provider.total_capacity[name] = 1000 * MiB;
+        ssd_usage.total_capacity[name] = 1000 * MiB;
         // used: 100 MiB (10% used) to 900 MiB (90% used)
-        ssd_provider.used_bytes[name] =
+        ssd_usage.used_bytes[name] =
             static_cast<int64_t>((100 + i * 800 / kNumSegments)) * MiB;
     }
 
@@ -967,8 +964,7 @@ TEST_F(AllocationStrategyTest, SsdFreeRatioFirstVsRandomStrategyPerformance) {
         // Warmup
         for (int i = 0; i < kWarmupRounds; i++) {
             (void)ssd_strategy->Allocate(allocator_manager, kAllocSize, 1, {},
-                                         {}, ReplicaType::MEMORY,
-                                         &ssd_provider);
+                                         {}, ReplicaType::MEMORY, &ssd_usage);
         }
     }
     std::vector<std::vector<Replica>> ssd_replicas;
@@ -977,7 +973,7 @@ TEST_F(AllocationStrategyTest, SsdFreeRatioFirstVsRandomStrategyPerformance) {
     auto t_ssd_start = std::chrono::steady_clock::now();
     for (int i = 0; i < kBenchmarkRounds; i++) {
         auto r = ssd_strategy->Allocate(allocator_manager, kAllocSize, 1, {},
-                                        {}, ReplicaType::MEMORY, &ssd_provider);
+                                        {}, ReplicaType::MEMORY, &ssd_usage);
         ASSERT_TRUE(r.has_value());
         ssd_replicas.emplace_back(std::move(r.value()));
     }

@@ -1646,7 +1646,7 @@ void SegmentManager::initializeCxlAllocator(const std::string& cxl_path,
     MasterMetricManager::instance().inc_total_mem_capacity(cxl_path, cxl_size);
 }
 
-int64_t ScopedLocalDiskSegmentAccess::getSsdTotalCapacity(
+int64_t ScopedLocalDiskSegmentAccess::GetSsdTotalCapacityBytes(
     const std::string& segment_name) const {
     auto client_it = client_by_name_.find(segment_name);
     if (client_it == client_by_name_.end()) {
@@ -1659,7 +1659,7 @@ int64_t ScopedLocalDiskSegmentAccess::getSsdTotalCapacity(
     return disk_it->second->ssd_total_capacity_bytes;
 }
 
-int64_t ScopedLocalDiskSegmentAccess::getSsdUsedBytes(
+int64_t ScopedLocalDiskSegmentAccess::GetSsdUsedBytes(
     const std::string& segment_name) const {
     auto client_it = client_by_name_.find(segment_name);
     if (client_it == client_by_name_.end()) {
