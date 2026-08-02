@@ -564,7 +564,26 @@ void WorkerPool::performPollCq(int thread_id) {
         }
     }
 
+    // Slices this loop drove to a terminal state, successes and
+    // retry-exhausted failures alike; folded into processed_slice_count_,
+    // which gates worker parking. Every terminal outcome below goes through
+    // finalize_slice() so it is counted exactly once. Slices handed to
+    // redispatch() are not terminal here and are accounted for there.
     int processed_slice_count = 0;
+    // Successful completions only, kept apart because it clears the context
+    // health counter. A completion error is no evidence that this RNIC can
+    // still move data -- including IBV_WC_WR_FLUSH_ERR, which only reports
+    // WRs the hardware discarded after the QP had already entered ERR.
+    int succeeded_slice_count = 0;
+    auto finalize_slice = [&](Transport::Slice *slice, bool success) {
+        if (success) {
+            slice->markSuccess();
+            succeeded_slice_count++;
+        } else {
+            slice->markFailed();
+        }
+        processed_slice_count++;
+    };
     const static size_t kPollCount = 64;
     std::unordered_map<std::atomic<int> *, int> qp_depth_set;
     std::unordered_set<RdmaEndPoint *> local_failed_endpoints;
@@ -610,10 +629,8 @@ void WorkerPool::performPollCq(int thread_id) {
                                 << "), handing off if retry allows";
                         if (shouldRetrySlice(slice))
                             local_failed_slice_list.push_back(slice);
-                        else {
-                            slice->markFailed();
-                            processed_slice_count++;
-                        }
+                        else
+                            finalize_slice(slice, false);
                     } else {
                         if (globalConfig().trace)
                             LOG(INFO) << "Worker: WR flush error (peer_nic: "
@@ -621,10 +638,8 @@ void WorkerPool::performPollCq(int thread_id) {
                                       << "), redispatching if retry allows";
                         if (shouldRetrySlice(slice))
                             failed_slice_list.push_back(slice);
-                        else {
-                            slice->markFailed();
-                            processed_slice_count++;
-                        }
+                        else
+                            finalize_slice(slice, false);
                     }
                     continue;
                 }
@@ -671,12 +686,10 @@ void WorkerPool::performPollCq(int thread_id) {
                 if (shouldRetrySlice(slice)) {
                     retry_list->push_back(slice);
                 } else {
-                    slice->markFailed();
-                    processed_slice_count_++;
+                    finalize_slice(slice, false);
                 }
             } else {
-                slice->markSuccess();
-                processed_slice_count++;
+                finalize_slice(slice, true);
             }
         }
         if (nr_poll)
@@ -687,10 +700,12 @@ void WorkerPool::performPollCq(int thread_id) {
     for (auto &entry : qp_depth_set)
         entry.first->fetch_sub(entry.second, std::memory_order_acq_rel);
 
-    if (processed_slice_count) {
+    if (processed_slice_count)
         processed_slice_count_.fetch_add(processed_slice_count);
-        markContextSuccess();
-    }
+    // Clear the consecutive-failure counter only on proven data movement, so
+    // that repeated local completion failures can still reach the threshold
+    // and retire this RNIC (see handleLocalFailure()).
+    if (succeeded_slice_count) markContextSuccess();
 
     if (!local_failed_slice_list.empty()) {
         redispatch(local_failed_slice_list, thread_id, true);
