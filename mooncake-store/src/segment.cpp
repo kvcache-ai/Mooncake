@@ -237,6 +237,10 @@ ErrorCode ScopedSegmentAccess::MountLocalDiskSegment(const UUID& client_id,
 ErrorCode ScopedSegmentAccess::ReMountSegment(
     const std::vector<Segment>& segments, const UUID& client_id) {
     for (const auto& segment : segments) {
+        auto validation = ValidateRemountSegment(segment, client_id);
+        if (validation != ErrorCode::OK) {
+            return validation;
+        }
         ErrorCode err = MountSegment(segment, client_id);
         if (err == ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS ||
             err == ErrorCode::INTERNAL_ERROR) {
@@ -261,6 +265,74 @@ ErrorCode ScopedSegmentAccess::ReMountSegment(
     }
 
     return ErrorCode::OK;
+}
+
+ErrorCode ScopedSegmentAccess::ValidateRemountSegment(
+    const Segment& segment, const UUID& client_id) const {
+    auto mounted = segment_manager_->mounted_segments_.find(segment.id);
+    if (mounted == segment_manager_->mounted_segments_.end()) {
+        return ErrorCode::OK;
+    }
+    const auto owner = segment_manager_->client_segments_.find(client_id);
+    const bool owned = owner != segment_manager_->client_segments_.end() &&
+                       std::find(owner->second.begin(), owner->second.end(),
+                                 segment.id) != owner->second.end();
+    const auto& authoritative = mounted->second.segment;
+    if (!owned || authoritative.id != segment.id ||
+        authoritative.name != segment.name ||
+        authoritative.base != segment.base ||
+        authoritative.size != segment.size ||
+        authoritative.te_endpoint != segment.te_endpoint ||
+        authoritative.protocol != segment.protocol ||
+        authoritative.host_id != segment.host_id) {
+        return ErrorCode::INVALID_PARAMS;
+    }
+    return ErrorCode::OK;
+}
+
+bool ScopedSegmentAccess::GetSegment(const UUID& segment_id,
+                                     Segment& segment) const {
+    auto mounted = segment_manager_->mounted_segments_.find(segment_id);
+    if (mounted == segment_manager_->mounted_segments_.end()) {
+        return false;
+    }
+    segment = mounted->second.segment;
+    return true;
+}
+
+bool ScopedSegmentAccess::ReplaceAllocators(
+    const std::vector<AllocatorReplacement>& replacements) {
+    std::vector<AllocatorManager::Replacement> manager_replacements;
+    manager_replacements.reserve(replacements.size());
+    for (const auto& replacement : replacements) {
+        auto mounted =
+            segment_manager_->mounted_segments_.find(replacement.segment_id);
+        if (mounted == segment_manager_->mounted_segments_.end() ||
+            mounted->second.buf_allocator != replacement.expected ||
+            !replacement.replacement) {
+            return false;
+        }
+        manager_replacements.push_back({mounted->second.segment.name,
+                                        replacement.expected,
+                                        replacement.replacement});
+    }
+    if (!segment_manager_->allocator_manager_.replaceAllocators(
+            manager_replacements)) {
+        return false;
+    }
+    for (const auto& replacement : replacements) {
+        segment_manager_->mounted_segments_.at(replacement.segment_id)
+            .buf_allocator = replacement.replacement;
+    }
+    return true;
+}
+
+std::shared_ptr<BufferAllocatorBase> ScopedSegmentAccess::GetAllocator(
+    const UUID& segment_id) const {
+    auto mounted = segment_manager_->mounted_segments_.find(segment_id);
+    return mounted == segment_manager_->mounted_segments_.end()
+               ? nullptr
+               : mounted->second.buf_allocator;
 }
 
 ErrorCode ScopedSegmentAccess::PrepareUnmountSegment(
@@ -680,7 +752,9 @@ SegmentSerializer::Serialize() {
         }
         std::sort(sorted_keys.begin(), sorted_keys.end());
 
-        packer.pack_array(2 + sorted_keys.size() * 2);
+        // Trailing ssd_total_capacity_bytes so a restored master keeps the
+        // client-reported SSD capacity across a snapshot restore (#2783).
+        packer.pack_array(2 + sorted_keys.size() * 2 + 1);
         packer.pack(segment->enable_offloading);
         packer.pack(static_cast<uint64_t>(sorted_keys.size()));
 
@@ -692,6 +766,7 @@ SegmentSerializer::Serialize() {
             packer.pack(task.key);
             packer.pack(task.size);
         }
+        packer.pack(segment->ssd_total_capacity_bytes);
     }
 
     // Compress entire data
@@ -1080,13 +1155,23 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
                             "deserialize local_disk_segments legacy "
                             "offloading size is not integer"));
                     }
-                    auto [tenant_id, user_key] =
-                        ParseTenantScopedStorageKey(key);
+                    auto [tenant_id, user_key] = TenantId::ParseScopedKey(key);
                     segment->offloading_objects[key] =
-                        OffloadTaskItem{.tenant_id = std::move(tenant_id),
+                        OffloadTaskItem{.tenant_id = tenant_id.value(),
                                         .key = std::move(user_key),
                                         .size = task_obj.as<int64_t>()};
                 }
+            }
+
+            // ssd_total_capacity_bytes is appended after the offloading
+            // objects. Pre-#2783 snapshots omit it, so read it only when
+            // present; otherwise it keeps the default 0 until the client
+            // re-reports capacity.
+            size_t capacity_idx = 2 + count * 2;
+            if (client_value.via.array.size > capacity_idx &&
+                IsMsgpackInteger(client_value.via.array.ptr[capacity_idx])) {
+                segment->ssd_total_capacity_bytes =
+                    client_value.via.array.ptr[capacity_idx].as<int64_t>();
             }
 
             segment_manager_->client_local_disk_segment_[client_id] =
@@ -1472,6 +1557,24 @@ void NoFSegmentManager::GetMountedSegmentsSnapshot(
     }
 }
 
+void SegmentManager::releaseCapacityMetrics() {
+    // Segments that are still mounted here never went through
+    // CommitUnmountSegment, so their contribution to the capacity metrics
+    // has not been released. MasterMetricManager outlives MasterService
+    // instances (a new one is constructed per HA leadership term), so the
+    // serving instance releases it at teardown to keep the gauges
+    // consistent with the segments that are actually mounted.
+    for (const auto& [segment_id, mounted_segment] : mounted_segments_) {
+        const auto& segment = mounted_segment.segment;
+        if (segment.protocol == "cxl") {
+            // CXL mounts do not contribute to total_mem_capacity.
+            continue;
+        }
+        MasterMetricManager::instance().dec_total_mem_capacity(segment.name,
+                                                               segment.size);
+    }
+}
+
 void SegmentManager::initializeCxlAllocator(const std::string& cxl_path,
                                             const size_t cxl_size) {
     LOG(INFO) << "Init CXL global allocator.";
@@ -1489,18 +1592,50 @@ void SegmentManager::initializeCxlAllocator(const std::string& cxl_path,
 int64_t ScopedLocalDiskSegmentAccess::getSsdTotalCapacity(
     const std::string& segment_name) const {
     auto client_it = client_by_name_.find(segment_name);
-    if (client_it == client_by_name_.end()) return 0;
+    if (client_it == client_by_name_.end()) {
+        return 0;
+    }
     auto disk_it = client_local_disk_segment_.find(client_it->second);
-    if (disk_it == client_local_disk_segment_.end()) return 0;
+    if (disk_it == client_local_disk_segment_.end()) {
+        return 0;
+    }
     return disk_it->second->ssd_total_capacity_bytes;
 }
 
 int64_t ScopedLocalDiskSegmentAccess::getSsdUsedBytes(
     const std::string& segment_name) const {
     auto client_it = client_by_name_.find(segment_name);
-    if (client_it == client_by_name_.end()) return 0;
+    if (client_it == client_by_name_.end()) {
+        return 0;
+    }
     auto disk_it = client_local_disk_segment_.find(client_it->second);
-    if (disk_it == client_local_disk_segment_.end()) return 0;
+    if (disk_it == client_local_disk_segment_.end()) {
+        return 0;
+    }
     return disk_it->second->ssd_used_bytes.load(std::memory_order_relaxed);
+}
+
+bool SegmentManager::HasSegmentByEndpoint(const std::string& endpoint) const {
+    std::shared_lock<std::shared_mutex> lock(segment_mutex_);
+    for (const auto& [segment_id, mounted_segment] : mounted_segments_) {
+        if (mounted_segment.segment.te_endpoint == endpoint) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool SegmentManager::GetSegmentBasicInfo(const UUID& segment_id,
+                                         std::string& segment_name,
+                                         std::string& te_endpoint) const {
+    std::shared_lock<std::shared_mutex> lock(segment_mutex_);
+    auto it = mounted_segments_.find(segment_id);
+    if (it == mounted_segments_.end()) {
+        return false;
+    }
+    const Segment& seg = it->second.segment;
+    segment_name = seg.name;
+    te_endpoint = seg.te_endpoint;
+    return true;
 }
 }  // namespace mooncake

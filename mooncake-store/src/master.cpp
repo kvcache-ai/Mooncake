@@ -30,14 +30,14 @@ using namespace coro_rpc;
 using namespace async_simple;
 using namespace async_simple::coro;
 
-static_assert(mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL == 5000,
+static_assert(mooncake::DEFAULT_DEFAULT_KV_LEASE_TTL == 10000,
               "Update kDefaultKvLeaseTtlFlagValue when "
               "DEFAULT_DEFAULT_KV_LEASE_TTL changes");
 static_assert(mooncake::DEFAULT_KV_SOFT_PIN_TTL_MS == 30 * 60 * 1000,
               "Update kDefaultKvSoftPinTtlFlagValue when "
               "DEFAULT_KV_SOFT_PIN_TTL_MS changes");
 
-constexpr char kDefaultKvLeaseTtlFlagValue[] = "5000";
+constexpr char kDefaultKvLeaseTtlFlagValue[] = "10000";
 constexpr char kDefaultKvSoftPinTtlFlagValue[] = "1800000";
 
 namespace {
@@ -114,7 +114,7 @@ DEFINE_string(config_path, "", "master service config file path");
 DEFINE_int32(port, 50051,
              "Port for master service to listen on (deprecated, use rpc_port)");
 DEFINE_int32(
-    max_threads, 4,
+    max_threads, 16,
     "Maximum number of threads to use (deprecated, use rpc_thread_num)");
 DEFINE_bool(enable_metric_reporting, true, "Enable periodic metric reporting");
 DEFINE_int32(metrics_port, 9003, "Port for HTTP metrics server to listen on");
@@ -248,7 +248,8 @@ DEFINE_bool(kv_events_emit_legacy_compat, true,
 DEFINE_bool(kv_events_emit_object_key, true,
             "Include Mooncake object_key in published KV events");
 DEFINE_uint32(kv_events_queue_capacity, 65536,
-              "Deprecated; ignored (event queue is unbounded)");
+              "Maximum pending KV events; oldest events are dropped when "
+              "the queue is full (0 = unbounded)");
 DEFINE_string(ha_backend_type, "etcd",
               "HA backend type, e.g. etcd | redis | k8s");
 DEFINE_string(ha_backend_connstring, "",
@@ -282,6 +283,17 @@ DEFINE_int64(global_file_segment_size,
 DEFINE_string(cluster_id, mooncake::DEFAULT_CLUSTER_ID,
               "Cluster ID for the master service, used for kvcache persistence "
               "in HA mode");
+
+// OpLog store configuration
+DEFINE_bool(enable_oplog, false,
+            "Enable HA metadata replication through batch-record OpLog");
+DEFINE_int32(oplog_poll_interval_ms, 1000,
+             "Batch-record standby poll interval.");
+DEFINE_uint32(oplog_batch_max_entries, 1024,
+              "Maximum number of committed/reserved entries in the open "
+              "batch-record OpLog waiting batch.");
+DEFINE_uint32(batch_oplog_retry_timeout_sec, 180,
+              "Maximum time to retry transient batch OpLog standby errors.");
 
 DEFINE_string(memory_allocator, "offset",
               "Memory allocator for global segments, cachelib | offset");
@@ -550,6 +562,17 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                              FLAGS_etcd_endpoints);
     default_config.GetString("cluster_id", &master_config.cluster_id,
                              FLAGS_cluster_id);
+    default_config.GetBool("enable_oplog", &master_config.enable_oplog,
+                           FLAGS_enable_oplog);
+    default_config.GetInt32("oplog_poll_interval_ms",
+                            &master_config.oplog_poll_interval_ms,
+                            FLAGS_oplog_poll_interval_ms);
+    default_config.GetUInt32("oplog_batch_max_entries",
+                             &master_config.oplog_batch_max_entries,
+                             FLAGS_oplog_batch_max_entries);
+    default_config.GetUInt32("batch_oplog_retry_timeout_sec",
+                             &master_config.batch_oplog_retry_timeout_sec,
+                             FLAGS_batch_oplog_retry_timeout_sec);
     default_config.GetString("root_fs_dir", &master_config.root_fs_dir,
                              FLAGS_root_fs_dir);
     default_config.GetInt64("global_file_segment_size",
@@ -667,7 +690,7 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
 
 void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
                            bool conf_set) {
-    if (FLAGS_max_threads != 4) {  // 4 is the default value
+    if (FLAGS_max_threads != 16) {  // 16 is the default value
         LOG(WARNING) << "max_threads is deprecated, use rpc_thread_num instead";
     }
     if (FLAGS_port != 50051) {  // 50051 is the default value
@@ -683,7 +706,7 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
     size_t rpc_thread_num;
     if (FLAGS_rpc_thread_num > 0) {
         rpc_thread_num = static_cast<size_t>(FLAGS_rpc_thread_num);
-        if (FLAGS_max_threads != 4) {  // 4 is the default value
+        if (FLAGS_max_threads != 16) {  // 16 is the default value
             LOG(WARNING) << "Both rpc_thread_num and max_threads are set. "
                          << "Using rpc_thread_num=" << FLAGS_rpc_thread_num
                          << ". Please migrate to use rpc_thread_num only.";
@@ -975,6 +998,23 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.cluster_id = FLAGS_cluster_id;
+    }
+    if ((google::GetCommandLineFlagInfo("enable_oplog", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.enable_oplog = FLAGS_enable_oplog;
+    }
+    if ((google::GetCommandLineFlagInfo("oplog_batch_max_entries", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.oplog_batch_max_entries = FLAGS_oplog_batch_max_entries;
+    }
+    if ((google::GetCommandLineFlagInfo("batch_oplog_retry_timeout_sec",
+                                        &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.batch_oplog_retry_timeout_sec =
+            FLAGS_batch_oplog_retry_timeout_sec;
     }
     if ((google::GetCommandLineFlagInfo("root_fs_dir", &info) &&
          !info.is_default) ||
@@ -1301,6 +1341,14 @@ int main(int argc, char* argv[]) {
                    << "etcd_endpoints";
         return 1;
     }
+    if (master_config.enable_oplog && !master_config.enable_ha) {
+        LOG(FATAL) << "enable_oplog requires enable_ha=true";
+        return 1;
+    }
+    if (master_config.enable_oplog && master_config.ha_backend_type != "etcd") {
+        LOG(FATAL) << "enable_oplog currently requires ha_backend_type=etcd";
+        return 1;
+    }
     if (!master_config.enable_ha && (!ha_backend_connstring.empty() ||
                                      !master_config.etcd_endpoints.empty())) {
         LOG(WARNING)
@@ -1376,6 +1424,7 @@ int main(int argc, char* argv[]) {
         << ", eviction_high_watermark_ratio="
         << master_config.eviction_high_watermark_ratio
         << ", enable_ha=" << master_config.enable_ha
+        << ", enable_oplog=" << master_config.enable_oplog
         << ", enable_offload=" << master_config.enable_offload
         << ", enable_kv_events=" << master_config.enable_kv_events
         << ", kv_events_bind_endpoint=" << master_config.kv_events_bind_endpoint

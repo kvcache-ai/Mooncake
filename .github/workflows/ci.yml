@@ -2,9 +2,13 @@ name: 'Build & Test (Linux)'
 
 on:
   push:
-    branches: [ "main" ]
+    branches:
+      - "main"
+      - "release/**"
   pull_request:
-    branches: [ "main" ]
+    branches:
+      - "main"
+      - "release/**"
     types: [opened, synchronize, reopened, labeled]
   workflow_dispatch: {}
 
@@ -18,7 +22,7 @@ concurrency:
 jobs:
   build:
     needs: [spell-check, clang-format, check-paths]
-    if: >-
+    if: &run-ci-for-source-changes >-
       (needs.check-paths.outputs.should-run-downstream == 'true' ||
        github.event_name == 'workflow_dispatch') &&
       (github.event_name == 'push' ||
@@ -57,10 +61,7 @@ jobs:
       shell: bash
 
     - name: Free up disk space
-      run: |
-        sudo rm -rf /usr/share/dotnet
-        sudo rm -rf /opt/ghc
-        sudo rm -rf /opt/hostedtoolcache/CodeQL
+      uses: ./.github/actions/free-disk-space
 
     - name: Install CUDA Toolkit
       uses: Jimver/cuda-toolkit@v0.2.24
@@ -135,57 +136,18 @@ jobs:
       shell: bash
 
     - name: Run Mooncake Store Rust smoke test and benchmark
-      run: |
-        $GITHUB_WORKSPACE/build/mooncake-store/src/mooncake_master \
-          --eviction_high_watermark_ratio=0.95 \
-          --cluster_id=ci_rust_test_cluster \
-          --port 50051 &
-        MASTER_PID=$!
-        sleep 3
-        cd mooncake-store/rust
-        export LD_LIBRARY_PATH=$GITHUB_WORKSPACE/build/mooncake-asio:$GITHUB_WORKSPACE/build/mooncake-store/src:$GITHUB_WORKSPACE/build/mooncake-store/src/cachelib_memory_allocator:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base:$GITHUB_WORKSPACE/build/mooncake-common/etcd:$LD_LIBRARY_PATH
-        export MOONCAKE_BUILD_DIR=$GITHUB_WORKSPACE/build
-        export MOONCAKE_STORE_LIB_DIR=$GITHUB_WORKSPACE/build/mooncake-store/src
-        export MOONCAKE_STORE_INCLUDE_DIR=$GITHUB_WORKSPACE/mooncake-store/include
-        # This job builds Mooncake with -DENABLE_ASAN=ON, so the C++ libraries
-        # the Rust package links against carry undefined __asan_* references. Opt
-        # in to linking the ASan runtime; build.rs emits -lasan first, which
-        # keeps libasan first in the initial library list as ASan requires.
-        # Non-sanitized builds leave this unset and link without ASan.
-        export MOONCAKE_LINK_ASAN=1
-        export MC_METADATA_SERVER=http://127.0.0.1:8080/metadata
-        export MC_RUST_STORE_RUN_INTEGRATION=true
-        export MC_RUST_STORE_MASTER_ADDR=127.0.0.1:50051
-        export MC_RUST_STORE_LOCAL_HOSTNAME=127.0.0.1
-        export MC_RUST_STORE_PROTOCOL=tcp
-        export MC_RUST_STORE_DEVICE_NAME=
-        cargo test --test minimal_smoke -- --nocapture
-        MC_RUST_BENCH_ITERATIONS=4 \
-        MC_RUST_BENCH_VALUE_SIZE=4096 \
-        MC_RUST_BENCH_WARMUP=1 \
-          cargo run --release --example store_benchmark
-        kill $MASTER_PID 2>/dev/null || true
+      env:
+        MOONCAKE_STORE_CLUSTER_ID: ci_rust_test_cluster
+        MOONCAKE_STORE_RUST_LINK_ASAN: "1"
+      run: ./scripts/ci/run_store_rust_smoke.sh
       shell: bash
 
     - name: Run Go store binding integration tests
-      run: |
-        $GITHUB_WORKSPACE/build/mooncake-store/src/mooncake_master \
-          --eviction_high_watermark_ratio=0.95 \
-          --cluster_id=ci_go_test_cluster \
-          --port 50051 &
-        MASTER_PID=$!
-        sleep 3
-        cd mooncake-store/go
-        export LD_LIBRARY_PATH=$GITHUB_WORKSPACE/build/mooncake-common:$GITHUB_WORKSPACE/build/mooncake-store/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src:$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base:$GITHUB_WORKSPACE/build/mooncake-common/etcd
-        export CGO_ENABLED=1
-        export CGO_CFLAGS="-I$GITHUB_WORKSPACE/mooncake-store/include -I$GITHUB_WORKSPACE/mooncake-transfer-engine/include"
-        export CGO_LDFLAGS="-L$GITHUB_WORKSPACE/build/mooncake-store/src -L$GITHUB_WORKSPACE/build/mooncake-store/src/cachelib_memory_allocator -L$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src -L$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src/common/base -L$GITHUB_WORKSPACE/build/mooncake-common -L$GITHUB_WORKSPACE/build/mooncake-common/etcd -lmooncake_store -lcachelib_memory_allocator -ltransfer_engine -lbase -lasio -letcd_wrapper -lstdc++ -lnuma -lglog -lgflags -libverbs -lmlx5 -ljsoncpp -lzstd -lcurl -luring -lasan -lm -lgcov -lxxhash -lyaml-cpp"
-        # Link cudart if CUDA is available (needed for D2H staging in mooncake_store)
-        if [ -d /usr/local/cuda/lib64 ]; then export CGO_LDFLAGS="$CGO_LDFLAGS -L/usr/local/cuda/lib64 -lcudart"; fi
-        # KV events publisher (optional; linked when libzmq is installed)
-        if ldconfig -p 2>/dev/null | grep -q libzmq; then export CGO_LDFLAGS="$CGO_LDFLAGS -lzmq"; fi
-        ASAN_OPTIONS=detect_leaks=0:verify_asan_link_order=0 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata go test -v ./tests/...
-        kill $MASTER_PID 2>/dev/null || true
+      env:
+        MOONCAKE_STORE_CLUSTER_ID: ci_go_test_cluster
+        MOONCAKE_STORE_GO_LINK_COMMON: "1"
+        MOONCAKE_STORE_GO_SANITIZED: "1"
+      run: ./scripts/ci/run_store_go_integration.sh
       shell: bash
 
     - name: Test (in build env) with coverage
@@ -261,35 +223,11 @@ jobs:
           echo "✅ Coverage collected successfully"
         fi
 
-    - name: Generate Python version tag
-      id: generate_tag_build
-      run: |
-        echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
-      shell: bash
-
-    # In CI, build_wheel.sh removes build/ to free disk (CI=true); set FREE_BUILD_DIR=1 locally to enable.
-    - name: Build Python wheel
-      run: |
-        PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ steps.generate_tag_build.outputs.python_version_tag }} ./scripts/build_wheel.sh
-      shell: bash
-
-    - name: Upload wheel for ZMQ test job
-      uses: actions/upload-artifact@v4
-      with:
-        name: wheel-build-py${{ steps.generate_tag_build.outputs.python_version_tag }}
-        path: mooncake-wheel/dist-py${{ steps.generate_tag_build.outputs.python_version_tag }}/*.whl
-
   build-musa:
     needs: [spell-check, clang-format, check-paths]
-    if: >-
-      (needs.check-paths.outputs.should-run-downstream == 'true' ||
-       github.event_name == 'workflow_dispatch') &&
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+    if: *run-ci-for-source-changes
     runs-on: ubuntu-22.04
-    container: mthreads/musa:rc4.3.0-devel-ubuntu22.04-amd64
+    container: registry.mthreads.com/mcconline/inference/pytorch:2.9.1.post1-py3.10-musa5.2.0-mp31-devel-ubuntu22.04-amd64
     steps:
     - uses: actions/checkout@v4
       with:
@@ -306,121 +244,59 @@ jobs:
         bash -x dependencies.sh -y
         mkdir build
         cd build
-        cmake -G Ninja .. -DUSE_MUSA=ON -DUSE_MNNVL=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DUSE_CXL=ON -DUSE_TCP=ON -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DENABLE_DEBUG_SYMBOLS=OFF
+        cmake -G Ninja .. -DUSE_MUSA=ON -DUSE_MNNVL=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DUSE_CXL=ON -DUSE_TCP=ON -DWITH_EP=ON -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DENABLE_DEBUG_SYMBOLS=OFF
       shell: bash
 
     - name: Build project
       run: |
         cd build
         source ~/.bashrc
-        cmake --build .
+        cmake --build . --parallel 1
         cmake --install .
       shell: bash
 
   build-arm64:
     needs: [spell-check, clang-format, check-paths]
-    if: >-
-      (needs.check-paths.outputs.should-run-downstream == 'true' ||
-       github.event_name == 'workflow_dispatch') &&
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
-    runs-on: ubuntu-22.04-arm
-    strategy:
-      matrix:
-        python-version: ['3.10', '3.12']
-    env:
-      CI: "true"
-      CU13_BUILD: "1"
-      TORCH_CUDA_ARCH_LIST: "9.0"
-      SCCACHE_GHA_ENABLED: "true"
-      CUDA_HOME: "/usr/local/cuda"
+    if: *run-ci-for-source-changes
+    uses: ./.github/workflows/_build-wheel.yaml
+    with:
+      runner: ubuntu-22.04-arm
+      container: pytorch/manylinuxaarch64-builder:cuda13.0
+      python-versions: '["3.10", "3.12"]'
+      cuda: container
+      cmake-generator: Ninja
+      variant-flag: CU13_BUILD
+      torch-cuda-arch-list: '9.0'
+      cmake-args: >-
+        -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=OFF
+        -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
+      artifact-prefix: wheel-arm64-cuda13
+      version-override: 0.0.0.dev0
 
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        persist-credentials: false
-
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v5
-      with:
-        python-version: ${{ matrix.python-version }}
-
-    - name: Free up disk space
-      run: |
-        sudo rm -rf /usr/share/dotnet
-        sudo rm -rf /opt/ghc
-        sudo rm -rf /opt/hostedtoolcache/CodeQL
-
-    - name: Install CUDA Toolkit 13.0 (arm64 SBSA)
-      run: |
-        wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/sbsa/cuda-keyring_1.1-1_all.deb
-        sudo dpkg -i cuda-keyring_1.1-1_all.deb
-        sudo apt-get update
-        sudo apt-get install -y cuda-toolkit-13-0
-        echo "/usr/local/cuda/bin" >> $GITHUB_PATH
-        /usr/local/cuda/bin/nvcc --version
-      shell: bash
-
-    - name: Run sccache-cache
-      uses: mozilla-actions/sccache-action@v0.0.9
-
-    - name: Configure sccache
-      uses: actions/github-script@v7
-      with:
-        script: |
-          core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
-          core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
-    - name: Configure project
-      run: |
-        sudo apt update -y
-        sudo bash -x dependencies.sh -y
-        mkdir build
-        cd build
-        cmake -G Ninja .. -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=OFF -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
-      shell: bash
-
-    - name: Build project
-      run: |
-        export CUDA_HOME=/usr/local/cuda
-        for dir in /usr/local/cuda/lib64/stubs /usr/local/cuda/targets/*/lib/stubs; do
-          if [ -d "$dir" ]; then
-            export LIBRARY_PATH="$dir:${LIBRARY_PATH:-}"
-          fi
-        done
-        cd build
-        cmake --build .
-        sudo cmake --install .
-      shell: bash
-
-    - name: Run sccache stat for check
-      if: ${{ env.SCCACHE_PATH != '' }}
-      shell: bash
-      run: ${SCCACHE_PATH} --show-stats
-
-    - name: Generate Python version tag
-      id: generate_tag_arm64
-      run: |
-        echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
-      shell: bash
-
-    - name: Build Python wheel
-      run: |
-        PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ steps.generate_tag_arm64.outputs.python_version_tag }} ./scripts/build_wheel.sh
-      shell: bash
-
-    - name: Upload wheel artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: wheel-arm64-cuda13-py${{ steps.generate_tag_arm64.outputs.python_version_tag }}
-        path: mooncake-wheel/dist-py${{ steps.generate_tag_arm64.outputs.python_version_tag }}/*.whl
+  # Build the artifact tested below through the exact release wheel path. The
+  # Ubuntu jobs remain consumer tests, not an alternate wheel build environment.
+  build-wheel:
+    needs: [spell-check, clang-format, check-paths]
+    if: *run-ci-for-source-changes
+    uses: ./.github/workflows/_build-wheel.yaml
+    with:
+      runner: ubuntu-22.04
+      container: pytorch/manylinux2_28-builder:cuda12.8
+      python-versions: '["3.10", "3.12"]'
+      cuda: container
+      torch-cuda-arch-list: '8.0;9.0'
+      ep-torch-versions: '2.11.0;2.12.0;2.12.1;2.13.0'
+      build-nvlink-allocator: true
+      cmake-args: >-
+        -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON
+        -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
+      artifact-prefix: mooncake-wheel-ci
+      version-override: 0.0.0.dev0
 
   test-wheel-ubuntu:
-    needs: [spell-check, clang-format, build-flags]
+    needs: [spell-check, clang-format, build-wheel]
     if: >-
-      needs.build-flags.result == 'success' &&
+      needs.build-wheel.result == 'success' &&
       (github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch' ||
        github.event.action == 'opened' ||
@@ -449,7 +325,7 @@ jobs:
     - name: Download wheel artifact
       uses: actions/download-artifact@v4
       with:
-        name: mooncake-wheel-ubuntu-py${{ steps.generate_tag_test.outputs.python_version_tag }}
+        name: mooncake-wheel-ci-py${{ steps.generate_tag_test.outputs.python_version_tag }}
         path: mooncake-wheel/dist
 
     - name: Verify wheel file exists
@@ -462,12 +338,7 @@ jobs:
       shell: bash
 
     - name: Free up disk space
-      run: |
-        sudo rm -rf /usr/share/dotnet
-        sudo rm -rf /opt/ghc
-        sudo rm -rf /opt/hostedtoolcache/CodeQL
-        sudo rm -rf /usr/local/lib/android
-        df -h
+      uses: ./.github/actions/free-disk-space
 
     - name: Install CUDA Toolkit
       uses: Jimver/cuda-toolkit@v0.2.24
@@ -577,6 +448,20 @@ jobs:
         python mooncake-pg/tests/test_pg_collectives.py
       shell: bash
 
+    - name: Test PyTorch 2.13 Single-Buffer Collectives (CPU Only)
+      if: matrix.ubuntu-version == 'ubuntu-22.04' && matrix.python-version == '3.10'
+      env:
+        MC_FORCE_TCP: "true"
+      run: |
+        source test_env/bin/activate
+        python -m pip install --force-reinstall "torch==2.13.0" \
+          --index-url https://download.pytorch.org/whl/cu126 \
+          --extra-index-url https://pypi.org/simple
+        python mooncake-pg/tests/test_pg_collectives.py \
+          TestMooncakePGCollectivesCPU.test_all_gather_into_tensor \
+          TestMooncakePGCollectivesCPU.test_reduce_scatter_sum
+      shell: bash
+
     - name: Test Safetensor Functions
       run: |
         source test_env/bin/activate
@@ -586,23 +471,19 @@ jobs:
 
   build-flags:
     needs: [spell-check, clang-format, check-paths]
-    if: >-
-      (needs.check-paths.outputs.should-run-downstream == 'true' ||
-       github.event_name == 'workflow_dispatch') &&
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+    if: *run-ci-for-source-changes
     runs-on: ubuntu-22.04
     strategy:
       matrix:
         python-version: ['3.10', '3.12']
     env:
       CI: "true"
-      BUILD_WITH_EP: "1"
       TORCH_CUDA_ARCH_LIST: "8.0;9.0"
       SCCACHE_GHA_ENABLED: "true"
       PIP_NO_CACHE_DIR: "1"
+      MAX_JOBS: "2"
+      EP_TORCH_VERSIONS: "2.11.0;2.12.0;2.12.1;2.13.0"
+      CMAKE_RELWITHDEBINFO_FLAGS: "-O2 -DNDEBUG"
 
     steps:
     - uses: actions/checkout@v4
@@ -615,12 +496,7 @@ jobs:
         python-version: ${{ matrix.python-version }}
 
     - name: Free up disk space
-      run: |
-        sudo rm -rf /usr/share/dotnet
-        sudo rm -rf /opt/ghc
-        sudo rm -rf /opt/hostedtoolcache/CodeQL
-        sudo rm -rf /usr/local/lib/android
-        df -h
+      uses: ./.github/actions/free-disk-space
 
     - name: Install CUDA Toolkit
       uses: Jimver/cuda-toolkit@v0.2.24
@@ -659,9 +535,27 @@ jobs:
         cd build
         export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
         export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
-        cmake -G Ninja .. -DUSE_ETCD=OFF -DUSE_CXL=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=OFF -DUSE_MNNVL=OFF -DUSE_UB=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs" -DENABLE_DEBUG_SYMBOLS=OFF
+        cmake -G Ninja .. \
+          -DUSE_ETCD=OFF \
+          -DUSE_CXL=ON \
+          -DUSE_REDIS=ON \
+          -DUSE_HTTP=ON \
+          -DWITH_METRICS=ON \
+          -DBUILD_UNIT_TESTS=ON \
+          -DBUILD_EXAMPLES=ON \
+          -DENABLE_SCCACHE=ON \
+          -DUSE_CUDA=OFF \
+          -DUSE_MNNVL=OFF \
+          -DUSE_UB=OFF \
+          -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs" \
+          "-DCMAKE_C_FLAGS_RELWITHDEBINFO=${CMAKE_RELWITHDEBINFO_FLAGS}" \
+          "-DCMAKE_CXX_FLAGS_RELWITHDEBINFO=${CMAKE_RELWITHDEBINFO_FLAGS}" \
+          -DENABLE_DEBUG_SYMBOLS=OFF
         cmake --build .
         sudo cmake --install .
+        df -h
+        cd ..
+        rm -rf build
         df -h
       shell: bash
 
@@ -669,7 +563,25 @@ jobs:
       run: |
         mkdir build
         cd build
-        cmake -G Ninja .. -DUSE_ETCD=ON -DUSE_CXL=ON -DUSE_REDIS=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_P2P_STORE=ON -DWITH_METRICS=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_SCCACHE=ON -DUSE_CUDA=ON -DUSE_MNNVL=OFF -DUSE_UB=OFF -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs" -DENABLE_DEBUG_SYMBOLS=OFF
+        # ENABLE_DEBUG_SYMBOLS=OFF alone still leaves CMake's RelWithDebInfo -g.
+        cmake -G Ninja .. \
+          -DUSE_ETCD=ON \
+          -DUSE_CXL=ON \
+          -DUSE_REDIS=ON \
+          -DUSE_HTTP=ON \
+          -DWITH_STORE=ON \
+          -DWITH_P2P_STORE=ON \
+          -DWITH_METRICS=ON \
+          -DBUILD_UNIT_TESTS=ON \
+          -DBUILD_EXAMPLES=ON \
+          -DENABLE_SCCACHE=ON \
+          -DUSE_CUDA=ON \
+          -DUSE_MNNVL=OFF \
+          -DUSE_UB=OFF \
+          -DCMAKE_EXE_LINKER_FLAGS="-L/usr/local/cuda/lib64/stubs" \
+          "-DCMAKE_C_FLAGS_RELWITHDEBINFO=${CMAKE_RELWITHDEBINFO_FLAGS}" \
+          "-DCMAKE_CXX_FLAGS_RELWITHDEBINFO=${CMAKE_RELWITHDEBINFO_FLAGS}" \
+          -DENABLE_DEBUG_SYMBOLS=OFF
       shell: bash
       # TODO: lack USE_NVMEOF,USE_MNNVL
 
@@ -713,13 +625,37 @@ jobs:
         MOONCAKE_STORE_LIB_DIR=$GITHUB_WORKSPACE/build/mooncake-store/src \
         MOONCAKE_STORE_INCLUDE_DIR=$GITHUB_WORKSPACE/mooncake-store/include \
           cargo test --examples --tests --no-run
+        cargo clean
+      shell: bash
+
+    - name: Verify Mooncake Store Rust dlopen bindings and packaging
+      run: |
+        cd mooncake-store/rust
+        # 1. Committed dlopen bindings must stay in sync with store_c.h.
+        cargo run --locked --example generate_dlopen_bindings
+        git diff --exit-code -- src/generated/ffi_dlopen_bindings.rs
+        # 2. The published dlopen crate must build with no header/bindgen: package
+        #    it, extract, and check the dlopen feature against the packaged files.
+        cargo package --no-verify --allow-dirty
+        crate=$(ls target/package/mooncake_store-*.crate | head -1)
+        dest=$(mktemp -d)
+        tar xzf "$crate" -C "$dest"
+        (cd "$dest"/mooncake_store-* && cargo check --no-default-features --features dlopen)
       shell: bash
 
     - name: Configure project
       run: |
         cd build
         rm -r */tests
-        cmake -G Ninja .. -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DUSE_CXL=ON -DWITH_EP=ON -DEP_TORCH_VERSIONS="2.11.0;2.12.0;2.12.1" -DENABLE_DEBUG_SYMBOLS=OFF
+        cmake -G Ninja .. \
+          -DBUILD_UNIT_TESTS=OFF \
+          -DBUILD_EXAMPLES=OFF \
+          -DUSE_HTTP=ON \
+          -DENABLE_SCCACHE=ON \
+          -DUSE_CXL=ON \
+          -DWITH_EP=ON \
+          "-DEP_TORCH_VERSIONS=${EP_TORCH_VERSIONS}" \
+          -DENABLE_DEBUG_SYMBOLS=OFF
       shell: bash
 
     - name: Build project
@@ -746,39 +682,18 @@ jobs:
       shell: bash
       run: ${SCCACHE_PATH} --show-stats
 
-    - name: Generate Python version tag
-      id: generate_tag_flags
-      run: |
-        echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
-      shell: bash
-
-    # In CI, build_wheel.sh removes build/ to free disk (CI=true); set FREE_BUILD_DIR=1 locally to enable.
-    - name: Build Python wheel
-      run: |
-        PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ steps.generate_tag_flags.outputs.python_version_tag }} ./scripts/build_wheel.sh
-      shell: bash
-
-    - name: Upload Python wheel artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: mooncake-wheel-ubuntu-py${{ steps.generate_tag_flags.outputs.python_version_tag }}
-        path: mooncake-wheel/dist-py${{ steps.generate_tag_flags.outputs.python_version_tag }}/*.whl
-
   build-docker:
     name: Build Docker Image
     needs: [spell-check, clang-format, check-paths]
-    if: >-
-      (needs.check-paths.outputs.should-run-downstream == 'true' ||
-       github.event_name == 'workflow_dispatch') &&
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+    if: *run-ci-for-source-changes
     runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4
       with:
         persist-credentials: false
+
+    - name: Free up disk space
+      uses: ./.github/actions/free-disk-space
 
     - name: Set up Docker Buildx
       uses: docker/setup-buildx-action@v2
@@ -787,12 +702,13 @@ jobs:
       run: |
         docker build -f docker/mooncake.Dockerfile \
           --build-arg PYTHON_VERSION=3.10 \
-          --build-arg EP_TORCH_VERSIONS="2.12.1" \
+          --build-arg EP_TORCH_VERSIONS="2.13.0" \
+          --build-arg CLEAN_BUILD_ARTIFACTS=1 \
           -t mooncake:from-source .
 
   spell-check:
     name: Spell Check with Typos
-    if: >-
+    if: &run-ci >-
       (github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch' ||
        github.event.action == 'opened' ||
@@ -808,11 +724,7 @@ jobs:
 
   clang-format:
     name: Check code format
-    if: >-
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+    if: *run-ci
     runs-on: ubuntu-22.04
     steps:
     - name: Checkout Actions Repository
@@ -852,17 +764,13 @@ jobs:
           fi
         fi
         echo "Comparing against: ${BASE_REF}"
-        ./scripts/code_format.sh --check --base "${BASE_REF}"
+        ./scripts/code_format.sh --check --changed-lines --base "${BASE_REF}"
       shell: bash
 
 
   docs-check:
     name: Check Sphinx docs build
-    if: >-
-      github.event_name == 'push' ||
-      github.event_name == 'workflow_dispatch' ||
-      github.event.action == 'opened' ||
-      contains(github.event.pull_request.labels.*.name, 'run-ci')
+    if: *run-ci
     runs-on: ubuntu-22.04
     steps:
     - uses: actions/checkout@v4
@@ -899,11 +807,7 @@ jobs:
 
 
   check-paths:
-    if: >-
-      github.event_name == 'push' ||
-      github.event_name == 'workflow_dispatch' ||
-      github.event.action == 'opened' ||
-      contains(github.event.pull_request.labels.*.name, 'run-ci')
+    if: *run-ci
     runs-on: ubuntu-latest
     outputs:
       should-run-downstream: ${{ steps.dispatch-override.outputs.src || steps.filter.outputs.src }}
@@ -932,6 +836,7 @@ jobs:
               - 'CMakeLists.txt'
               - 'dependencies.sh'
               - 'scripts/**'
+              - '.github/actions/**'
               - '.github/workflows/**'
             tent:
               - 'mooncake-transfer-engine/**'
@@ -942,25 +847,13 @@ jobs:
 
   build-wheel-cu13:
     needs: [spell-check, clang-format, check-paths]
-    if: >-
-      (needs.check-paths.outputs.should-run-downstream == 'true' ||
-       github.event_name == 'workflow_dispatch') &&
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+    if: *run-ci-for-source-changes
     uses: ./.github/workflows/ci_cu13.yml
     secrets: inherit
 
   build-wheel-efa:
     needs: [spell-check, clang-format, check-paths]
-    if: >-
-      (needs.check-paths.outputs.should-run-downstream == 'true' ||
-       github.event_name == 'workflow_dispatch') &&
-      (github.event_name == 'push' ||
-       github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
-       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+    if: *run-ci-for-source-changes
     uses: ./.github/workflows/ci_efa.yml
     secrets: inherit
 
@@ -971,7 +864,7 @@ jobs:
     secrets: inherit
 
   integration-test:
-    needs: [build, check-paths]
+    needs: [build, build-wheel-cu13, check-paths]
     if: needs.check-paths.outputs.should-run-downstream == 'true'
     uses: ./.github/workflows/integration-test.yml
     secrets: inherit
@@ -993,9 +886,15 @@ jobs:
           - name: cuda-on
             cmake_flags: '-DUSE_CUDA=ON -DCMAKE_EXE_LINKER_FLAGS=-L/usr/local/cuda/lib64/stubs'
             need_cuda: true
+            metrics_flags: ''
           - name: cuda-off
             cmake_flags: '-DUSE_CUDA=OFF'
             need_cuda: false
+            metrics_flags: ''
+          - name: cuda-off-metrics-on
+            cmake_flags: '-DUSE_CUDA=OFF'
+            need_cuda: false
+            metrics_flags: '-DTENT_METRICS_ENABLED=ON'
     name: tent-ci (${{ matrix.name }})
     env:
       CI: "true"
@@ -1008,12 +907,7 @@ jobs:
 
     - name: Free up disk space
       if: matrix.need_cuda
-      run: |
-        sudo rm -rf /usr/share/dotnet
-        sudo rm -rf /opt/ghc
-        sudo rm -rf /opt/hostedtoolcache/CodeQL
-        sudo rm -rf /usr/local/lib/android
-        df -h
+      uses: ./.github/actions/free-disk-space
 
     - name: Install CUDA Toolkit
       if: matrix.need_cuda
@@ -1046,7 +940,7 @@ jobs:
       run: |
         mkdir build-tent
         cd build-tent
-        cmake -G Ninja .. -DUSE_TENT=ON -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_DEBUG_SYMBOLS=OFF ${{ matrix.cmake_flags }}
+        cmake -G Ninja .. -DUSE_TENT=ON -DUSE_HTTP=ON -DENABLE_SCCACHE=ON -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DENABLE_DEBUG_SYMBOLS=OFF ${{ matrix.cmake_flags }} ${{ matrix.metrics_flags }}
       shell: bash
 
     - name: Build project with TENT
@@ -1087,6 +981,7 @@ jobs:
       - build
       - build-musa
       - build-arm64
+      - build-wheel
       - build-flags
       - build-docker
       - test-wheel-ubuntu

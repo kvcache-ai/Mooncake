@@ -15,30 +15,16 @@
 #include "master_snapshot_repository.h"
 #include "ha/snapshot/catalog/snapshot_catalog_store.h"
 #include "ha/snapshot/object/snapshot_object_store.h"
+#include "ha/snapshot/snapshot_constants.h"
 #include "ha/snapshot/snapshot_logger.h"
+#include "ha/oplog/oplog_batch_storage.h"
 #include "serialize/serializer.h"
 #include "segment.h"
 #include "task_manager.h"
 #include "utils/file_util.h"
 #include "utils/zstd_util.h"
 
-#ifdef STORE_USE_ETCD
-#include "ha/oplog/etcd_oplog_store.h"
-#include "etcd_helper.h"
-#endif
-
 namespace mooncake {
-
-// Snapshot file names (moved from master_service.cpp)
-static const std::string SNAPSHOT_METADATA_FILE = "metadata";
-static const std::string SNAPSHOT_SEGMENTS_FILE = "segments";
-static const std::string SNAPSHOT_TASK_MANAGER_FILE = "task_manager";
-static const std::string SNAPSHOT_MANIFEST_FILE = "manifest.txt";
-static const std::string SNAPSHOT_LATEST_FILE = "latest.txt";
-static const std::string SNAPSHOT_BACKUP_SAVE_DIR =
-    "mooncake_snapshot_save_backup";
-static const std::string SNAPSHOT_SERIALIZER_VERSION = "1.0.0";
-static const std::string SNAPSHOT_SERIALIZER_TYPE = "messagepack";
 
 namespace {
 int64_t CurrentTimeMs() {
@@ -146,7 +132,8 @@ void MasterSnapshotManager::SnapshotThreadFunc() {
         const std::string& snapshot_root =
             snapshot_catalog_store_->GetSnapshotRoot();
         const std::string path_prefix = snapshot_root + snapshot_id + "/";
-        const std::string manifest_path = path_prefix + SNAPSHOT_MANIFEST_FILE;
+        const std::string manifest_path =
+            path_prefix + ha::kSnapshotManifestFile;
         auto descriptor =
             BuildSnapshotDescriptor(snapshot_id, manifest_path, path_prefix);
         if (!descriptor) {
@@ -375,7 +362,7 @@ void MasterSnapshotManager::HandleChildExit(pid_t pid, int status,
 
 tl::expected<ha::OpLogSequenceId, SerializationError>
 MasterSnapshotManager::ResolveSnapshotSequenceId() const {
-    if (!options_.enable_ha || options_.ha_backend_type != "etcd") {
+    if (!options_.enable_ha || !master_service_->enable_oplog_) {
         // OpLog sequence ids start at 1. Returning 0 here is a sentinel that
         // means "no persisted OpLog boundary", so a standby that later calls
         // Recover(0) will replay from the first entry when oplog following is
@@ -383,66 +370,27 @@ MasterSnapshotManager::ResolveSnapshotSequenceId() const {
         return ha::OpLogSequenceId{0};
     }
 
-#ifndef STORE_USE_ETCD
-    return tl::make_unexpected(SerializationError(
-        ErrorCode::UNAVAILABLE_IN_CURRENT_MODE,
-        "etcd snapshot sequence resolution is unavailable in this build"));
-#else
-    auto oplog_store = GetSnapshotBoundaryOpLogStore();
-    if (!oplog_store) {
-        return tl::make_unexpected(oplog_store.error());
+    if (!master_service_->batch_oplog_storage_) {
+        return tl::make_unexpected(SerializationError(
+            ErrorCode::INTERNAL_ERROR,
+            "snapshot sequence resolution requires batch OpLog storage"));
     }
-
-    uint64_t sequence_id = 0;
-    auto err = oplog_store.value()->GetLatestSequenceId(sequence_id);
-    if (err == ErrorCode::OPLOG_ENTRY_NOT_FOUND) {
+    DurablePrefix prefix;
+    ErrorCode err =
+        master_service_->batch_oplog_storage_->ReadDurablePrefix(prefix);
+    if (err == ErrorCode::ETCD_KEY_NOT_EXIST ||
+        err == ErrorCode::OPLOG_ENTRY_NOT_FOUND) {
         return ha::OpLogSequenceId{0};
     }
     if (err != ErrorCode::OK) {
         return tl::make_unexpected(SerializationError(
-            err, fmt::format("failed to resolve snapshot sequence boundary: {}",
-                             toString(err))));
+            err,
+            fmt::format("failed to resolve batch snapshot sequence boundary: "
+                        "{}",
+                        toString(err))));
     }
-
-    return static_cast<ha::OpLogSequenceId>(sequence_id);
-#endif
+    return static_cast<ha::OpLogSequenceId>(prefix.last_seq);
 }
-
-#ifdef STORE_USE_ETCD
-tl::expected<EtcdOpLogStore*, SerializationError>
-MasterSnapshotManager::GetSnapshotBoundaryOpLogStore() const {
-    if (options_.ha_backend_connstring.empty()) {
-        return tl::make_unexpected(SerializationError(
-            ErrorCode::INVALID_PARAMS,
-            "etcd snapshot sequence resolution requires a backend connstring"));
-    }
-
-    std::lock_guard<std::mutex> lock(snapshot_boundary_oplog_store_mutex_);
-    if (snapshot_boundary_oplog_store_ != nullptr) {
-        return snapshot_boundary_oplog_store_.get();
-    }
-
-    auto err = EtcdHelper::ConnectToEtcdStoreClient(
-        options_.ha_backend_connstring.c_str());
-    if (err != ErrorCode::OK) {
-        return tl::make_unexpected(SerializationError(
-            err, fmt::format("failed to connect to etcd for snapshot boundary: "
-                             "{}",
-                             toString(err))));
-    }
-
-    auto oplog_store = std::make_unique<EtcdOpLogStore>(options_.cluster_id);
-    err = oplog_store->Init();
-    if (err != ErrorCode::OK) {
-        return tl::make_unexpected(SerializationError(
-            err, fmt::format("failed to initialize etcd oplog store: {}",
-                             toString(err))));
-    }
-
-    snapshot_boundary_oplog_store_ = std::move(oplog_store);
-    return snapshot_boundary_oplog_store_.get();
-}
-#endif
 
 tl::expected<ha::SnapshotDescriptor, SerializationError>
 MasterSnapshotManager::BuildSnapshotDescriptor(
@@ -470,7 +418,7 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
     const std::string& snapshot_root =
         snapshot_catalog_store_->GetSnapshotRoot();
     const std::string path_prefix = snapshot_root + snapshot_id + "/";
-    const std::string manifest_path = path_prefix + SNAPSHOT_MANIFEST_FILE;
+    const std::string manifest_path = path_prefix + ha::kSnapshotManifestFile;
     auto descriptor =
         BuildSnapshotDescriptor(snapshot_id, manifest_path, path_prefix);
     if (!descriptor) {
@@ -495,56 +443,33 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
         SNAP_LOG_INFO(
             "[Snapshot] action=persisting_state start, snapshot_id={}, "
             "serializer_type={}, version={}",
-            snapshot_id, SNAPSHOT_SERIALIZER_TYPE, SNAPSHOT_SERIALIZER_VERSION);
-        MasterService::MetadataSerializer metadata_serializer(master_service_);
-        SegmentSerializer segment_serializer(
-            &master_service_->segment_manager_);
-        TaskManagerSerializer task_manager_serializer(
-            &master_service_->task_manager_);
+            snapshot_id, ha::kSnapshotSerializerType,
+            ha::kSnapshotSerializerVersion);
 
-        auto metadata_result = metadata_serializer.Serialize();
-        if (!metadata_result) {
+        // Use the new MasterSnapshotCodec to encode all state
+        ha::MasterSnapshotCodec codec;
+        ha::MasterSnapshotStateView state_view(
+            *master_service_, master_service_->segment_manager_,
+            master_service_->nof_segment_manager_,
+            master_service_->task_manager_);
+
+        auto encode_result = codec.Encode(state_view);
+        if (!encode_result) {
             SNAP_LOG_ERROR(
-                "[Snapshot] metadata serialization failed, snapshot_id={}, "
+                "[Snapshot] state encoding failed, snapshot_id={}, "
                 "code={}, msg={}",
-                snapshot_id, toString(metadata_result.error().code),
-                metadata_result.error().message);
-
-            return tl::make_unexpected(metadata_result.error());
+                snapshot_id, toString(encode_result.error().code),
+                encode_result.error().message);
+            return tl::make_unexpected(encode_result.error());
         }
-        SNAP_LOG_INFO(
-            "[Snapshot] metadata serialization_successful, snapshot_id={}",
-            snapshot_id);
 
-        auto segment_result = segment_serializer.Serialize();
-        if (!segment_result) {
-            SNAP_LOG_ERROR(
-                "[Snapshot] segment serialization failed, snapshot_id={}, "
-                "code={}, msg={}",
-                snapshot_id, toString(segment_result.error().code),
-                segment_result.error().message);
-            return tl::make_unexpected(segment_result.error());
-        }
-        SNAP_LOG_INFO(
-            "[Snapshot] segment serialization_successful, snapshot_id={}",
-            snapshot_id);
+        SNAP_LOG_INFO("[Snapshot] state encoding successful, snapshot_id={}",
+                      snapshot_id);
 
-        auto task_manager_result = task_manager_serializer.Serialize();
-        if (!task_manager_result) {
-            SNAP_LOG_ERROR(
-                "[Snapshot] task manager serialization failed, snapshot_id={}, "
-                "code={}, msg={}",
-                snapshot_id, toString(task_manager_result.error().code),
-                task_manager_result.error().message);
-            return tl::make_unexpected(task_manager_result.error());
-        }
-        SNAP_LOG_INFO(
-            "[Snapshot] task manager serialization_successful, snapshot_id={}",
-            snapshot_id);
-
-        const auto& serialized_metadata = metadata_result.value();
-        const auto& serialized_segment = segment_result.value();
-        const auto& serialized_task_manager = task_manager_result.value();
+        const auto& payloads = encode_result.value();
+        const auto& serialized_metadata = payloads.metadata;
+        const auto& serialized_segment = payloads.segments;
+        const auto& serialized_task_manager = payloads.task_manager;
 
         // When backup_dir is enabled, try all uploads to ensure complete backup
         // When backup_dir is disabled, use fail-fast mode
@@ -554,10 +479,10 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
                       repository_->GetObjectStoreConnectionInfo());
 
         // Upload metadata
-        std::string metadata_path = path_prefix + SNAPSHOT_METADATA_FILE;
-        auto upload_result =
-            repository_->UploadPayloadFile(serialized_metadata, metadata_path,
-                                           SNAPSHOT_METADATA_FILE, snapshot_id);
+        std::string metadata_path = path_prefix + ha::kSnapshotMetadataFile;
+        auto upload_result = repository_->UploadPayloadFile(
+            serialized_metadata, metadata_path, ha::kSnapshotMetadataFile,
+            snapshot_id);
         if (!upload_result) {
             SNAP_LOG_ERROR(
                 "[Snapshot] metadata upload failed, snapshot_id={}, "
@@ -573,10 +498,10 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
         }
 
         // Upload segment
-        std::string segment_path = path_prefix + SNAPSHOT_SEGMENTS_FILE;
-        upload_result =
-            repository_->UploadPayloadFile(serialized_segment, segment_path,
-                                           SNAPSHOT_SEGMENTS_FILE, snapshot_id);
+        std::string segment_path = path_prefix + ha::kSnapshotSegmentsFile;
+        upload_result = repository_->UploadPayloadFile(
+            serialized_segment, segment_path, ha::kSnapshotSegmentsFile,
+            snapshot_id);
         if (!upload_result) {
             SNAP_LOG_ERROR(
                 "[Snapshot] segment upload failed, snapshot_id={}, "
@@ -592,10 +517,10 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
 
         // Upload task manager
         std::string task_manager_path =
-            path_prefix + SNAPSHOT_TASK_MANAGER_FILE;
+            path_prefix + ha::kSnapshotTaskManagerFile;
         upload_result = repository_->UploadPayloadFile(
             serialized_task_manager, task_manager_path,
-            SNAPSHOT_TASK_MANAGER_FILE, snapshot_id);
+            ha::kSnapshotTaskManagerFile, snapshot_id);
         if (!upload_result) {
             SNAP_LOG_ERROR(
                 "[Snapshot] task_manager upload failed, snapshot_id={}, "
@@ -611,13 +536,13 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
         }
 
         // Upload manifest
-        std::string manifest_content =
-            fmt::format("{}|{}|{}", SNAPSHOT_SERIALIZER_TYPE,
-                        SNAPSHOT_SERIALIZER_VERSION, snapshot_id);
-        std::vector<uint8_t> manifest_bytes(manifest_content.begin(),
-                                            manifest_content.end());
+        std::vector<uint8_t> manifest_bytes =
+            ha::MasterSnapshotCodec::EncodeManifest(
+                ha::kSnapshotSerializerType, ha::kSnapshotSerializerVersion,
+                snapshot_id);
         upload_result = repository_->UploadPayloadFile(
-            manifest_bytes, manifest_path, SNAPSHOT_MANIFEST_FILE, snapshot_id);
+            manifest_bytes, manifest_path, ha::kSnapshotManifestFile,
+            snapshot_id);
         if (!upload_result) {
             SNAP_LOG_ERROR(
                 "[Snapshot] manifest upload failed, snapshot_id={}, "
@@ -638,8 +563,8 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
         }
 
         // Publish snapshot catalog entry and advance the latest marker.
-        std::string latest_path =
-            snapshot_catalog_store_->GetSnapshotRoot() + SNAPSHOT_LATEST_FILE;
+        std::string latest_path = snapshot_catalog_store_->GetSnapshotRoot() +
+                                  ha::kSnapshotLatestFile;
         std::string latest_content = snapshot_id;
 
         auto publish_result = repository_->PublishSnapshot(descriptor);
@@ -650,8 +575,8 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
                 snapshot_id, latest_path, toString(publish_result));
             if (options_.use_snapshot_backup_dir) {
                 auto save_path = fs::path(options_.snapshot_backup_dir) /
-                                 SNAPSHOT_BACKUP_SAVE_DIR /
-                                 SNAPSHOT_LATEST_FILE;
+                                 ha::kSnapshotBackupSaveDir /
+                                 ha::kSnapshotLatestFile;
                 auto save_result =
                     FileUtil::SaveStringToFile(latest_content, save_path);
                 if (!save_result) {
@@ -694,19 +619,6 @@ tl::expected<void, SerializationError> MasterSnapshotManager::PersistState(
                                "Unknown exception during state persistent"));
     }
     return {};
-}
-
-tl::expected<void, SerializationError>
-MasterSnapshotManager::UploadSnapshotPayloadFile(
-    const std::vector<uint8_t>& data, const std::string& path,
-    const std::string& local_filename, const std::string& snapshot_id) {
-    return repository_->UploadPayloadFile(data, path, local_filename,
-                                          snapshot_id);
-}
-
-void MasterSnapshotManager::CleanupOldSnapshot(size_t keep_count,
-                                               const std::string& snapshot_id) {
-    repository_->CleanupOldSnapshots(keep_count, snapshot_id);
 }
 
 }  // namespace mooncake

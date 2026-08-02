@@ -15,7 +15,11 @@
 use std::ffi::NulError;
 
 /// Errors returned by Mooncake Store operations.
+///
+/// `#[non_exhaustive]` so adding variants (e.g. backend-specific ones) is not a
+/// breaking change; downstream matches must include a wildcard arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum StoreError {
     /// A required pointer argument was null (e.g. the store handle has not
     /// been initialised yet, or an internal allocation failed).
@@ -44,4 +48,19 @@ pub enum StoreError {
     /// One or more arguments are invalid (e.g. mismatched array lengths).
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+
+    /// The Mooncake shared library could not be loaded, or it does not export
+    /// the expected `store_c.h` C ABI (a required symbol was missing).
+    ///
+    /// Only ever produced by the `dlopen` backend (see `load_library`), but
+    /// always present so `StoreError` is identical across backends.
+    #[error("failed to load Mooncake shared library: {0}")]
+    LibraryLoad(String),
+
+    /// `load_library` was called after the library had already been loaded; it
+    /// must be called before creating any store.
+    ///
+    /// Only ever produced by the `dlopen` backend.
+    #[error("Mooncake shared library already loaded; call load_library() before creating a store")]
+    LibraryAlreadyLoaded,
 }

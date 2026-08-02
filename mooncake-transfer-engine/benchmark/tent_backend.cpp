@@ -51,6 +51,8 @@ std::shared_ptr<Config> loadConfig() {
     config->set("metadata_type", XferBenchConfig::metadata_type);
     config->set("metadata_servers", XferBenchConfig::metadata_url_list);
     config->set("rpc_server_port", XferBenchConfig::rpc_server_port);
+    config->set("transports/rdma/deadline_bw_arbitration",
+                XferBenchConfig::deadline_bw_arbitration);
 
     // Configure transport types based on xport_type parameter
     if (!XferBenchConfig::xport_type.empty()) {
@@ -112,20 +114,16 @@ static IntentType getIntentType(const std::string& intent_type) {
     return it->second;
 }
 
-int TENTBenchRunner::allocateBuffers() {
-    const auto total_buffer_size = XferBenchConfig::total_buffer_size;
-    const auto& seg_type = XferBenchConfig::seg_type;
-    const auto& xport_type = XferBenchConfig::xport_type;
-
-    // Resolve device prefix, start index, and buffer count per seg_type
-    std::string device_prefix;
-    int start_idx = 0, num_buffers = 0;
-
-    if (seg_type == "DRAM") {
+// Resolve device prefix, start index, and buffer count for a single seg_type.
+// Returns 0 on success, -1 on failure.
+static int resolveSegTypeParams(const std::string& seg_type,
+                                std::string& device_prefix, int& start_idx,
+                                int& num_buffers) {
+    if (seg_type == "DRAM" || seg_type == "dram") {
         device_prefix = "cpu";
         num_buffers = numa_num_configured_nodes();
 #if defined(USE_CUDA) || defined(USE_SUNRISE)
-    } else if (seg_type == "VRAM") {
+    } else if (seg_type == "VRAM" || seg_type == "vram") {
         device_prefix = "cuda";
         int gpu_count = 0;
         auto err = cudaGetDeviceCount(&gpu_count);
@@ -141,7 +139,7 @@ int TENTBenchRunner::allocateBuffers() {
                 << gpu_count << ")";
         }
 #elif defined(USE_HIP)
-    } else if (seg_type == "VRAM") {
+    } else if (seg_type == "VRAM" || seg_type == "vram") {
         device_prefix = "rocm";
         int gpu_count = 0;
         hipGetDeviceCount(&gpu_count);
@@ -159,48 +157,123 @@ int TENTBenchRunner::allocateBuffers() {
         LOG(ERROR) << "Unknown seg_type: " << seg_type;
         return -1;
     }
+    return 0;
+}
 
-    pinned_buffer_list_.resize(num_buffers, nullptr);
-    uint64_t alloc_ns = 0, reg_ns = 0;
-    for (int i = 0; i < num_buffers; ++i) {
-        auto location = device_prefix + ":" + std::to_string(start_idx + i);
-        MemoryOptions options;
-        if (!xport_type.empty()) {
-            options.type = getTransportType(xport_type);
-            options.location = location;
-        }
+// Parse a comma-separated list (e.g. "dram,vram") into a vector of lowercased
+// seg_type names. Empty input returns an empty vector.
+static std::vector<std::string> parseSegTypeMix(const std::string& mix) {
+    std::vector<std::string> result;
+    if (mix.empty()) return result;
+    std::stringstream ss(mix);
+    std::string token;
+    while (std::getline(ss, token, ',')) {
+        size_t b = token.find_first_not_of(" \t");
+        size_t e = token.find_last_not_of(" \t");
+        if (b == std::string::npos) continue;
+        std::string name = token.substr(b, e - b + 1);
+        for (auto& c : name) c = to_lower(c);
+        result.push_back(name);
+    }
+    return result;
+}
 
-        auto t0 = getCurrentTimeInNano();
-        if (!xport_type.empty()) {
-            options.location = location;
-            CHECK_FAIL(engine_->allocateLocalMemory(
-                &pinned_buffer_list_[i], total_buffer_size, options));
-        } else {
-            CHECK_FAIL(engine_->allocateLocalMemory(
-                &pinned_buffer_list_[i], total_buffer_size, location));
-        }
-        auto t1 = getCurrentTimeInNano();
+int TENTBenchRunner::allocateBuffers() {
+    const auto total_buffer_size = XferBenchConfig::total_buffer_size;
+    const auto& xport_type = XferBenchConfig::xport_type;
 
-#ifdef USE_SUNRISE
-        if (seg_type == "VRAM") {
-            auto err = cudaSetDevice(start_idx + i);
-            CHECK_FAIL(err == cudaSuccess ? Status::OK()
-                                          : Status::InternalError(
-                                                "Failed to set Sunrise device "
-                                                "before registerLocalMemory"));
-        }
-#endif
-        CHECK_FAIL(engine_->registerLocalMemory(pinned_buffer_list_[i],
-                                                total_buffer_size, options));
-        auto t2 = getCurrentTimeInNano();
-
-        alloc_ns += (t1 - t0);
-        reg_ns += (t2 - t1);
+    // Determine the list of seg_types to allocate. --seg_type_mix wins over
+    // --seg_type when set; otherwise fall back to --seg_type (single type).
+    seg_type_mix_ = parseSegTypeMix(XferBenchConfig::seg_type_mix);
+    std::vector<std::string> seg_types;
+    if (!seg_type_mix_.empty()) {
+        seg_types = seg_type_mix_;
+    } else {
+        std::string s = XferBenchConfig::seg_type;
+        for (auto& c : s) c = to_lower(c);
+        seg_types.push_back(s);
     }
 
-    LOG(INFO) << "Allocated " << total_buffer_size * num_buffers << " bytes "
-              << seg_type << " buffers in " << alloc_ns / 1e6
-              << " ms, registered in " << reg_ns / 1e6 << " ms";
+    pinned_buffer_list_.clear();
+    pinned_buffer_seg_type_.clear();
+    uint64_t alloc_ns = 0, reg_ns = 0;
+    uint64_t total_bytes = 0;
+
+    for (const auto& seg_type : seg_types) {
+        std::string device_prefix;
+        int start_idx = 0, num_buffers = 0;
+        if (resolveSegTypeParams(seg_type, device_prefix, start_idx,
+                                 num_buffers) != 0) {
+            return -1;
+        }
+
+        for (int i = 0; i < num_buffers; ++i) {
+            auto location = device_prefix + ":" + std::to_string(start_idx + i);
+            MemoryOptions options;
+            options.location = location;
+            if (!xport_type.empty()) {
+                // Explicit single transport: honor it for both allocate and
+                // register (existing behavior).
+                options.type = getTransportType(xport_type);
+            } else if (!seg_type_mix_.empty()) {
+                // Multi-transport mode (--seg_type_mix set, transports
+                // enabled via MC_TENT_CONF). Pick the allocate transport
+                // based on seg_type so the right transport-specific allocator
+                // runs (e.g. SHM sets shm_path, NVLink sets up GPU memory
+                // handle). registerLocalMemory below then resets options.type
+                // to UNSPEC so the buffer registers to ALL enabled transports,
+                // not just this one.
+                options.type = (seg_type == "vram") ? NVLINK : SHM;
+            }
+            // else: single-seg_type fallback (--seg_type without
+            // --seg_type_mix, no --xport_type). Leave options.type as UNSPEC
+            // so the engine picks the default transport (original behavior).
+
+            auto t0 = getCurrentTimeInNano();
+            void* buf = nullptr;
+            CHECK_FAIL(
+                engine_->allocateLocalMemory(&buf, total_buffer_size, options));
+            pinned_buffer_list_.push_back(buf);
+            pinned_buffer_seg_type_.push_back(seg_type);
+            auto t1 = getCurrentTimeInNano();
+
+#ifdef USE_SUNRISE
+            if (seg_type == "vram") {
+                auto err = cudaSetDevice(start_idx + i);
+                CHECK_FAIL(err == cudaSuccess
+                               ? Status::OK()
+                               : Status::InternalError("Failed to set Sunrise "
+                                                       "device before "
+                                                       "registerLocalMemory"));
+            }
+#endif
+            // Reset options.type to UNSPEC so registerLocalMemory registers
+            // the buffer to ALL enabled transports (via
+            // getSupportedTransports(UNSPEC)), not just the one that
+            // allocated it. This is what makes multi-transport work: the
+            // buffer ends up registered to both SHM (which has shm_path set
+            // by the allocate call above) and TCP/NVLink (which don't need
+            // it), so requests targeting this buffer resolve regardless of
+            // which transport the engine picks. Only applies in multi-transport
+            // mode (--seg_type_mix set, no --xport_type); single-seg_type
+            // fallback keeps options.type as set above (UNSPEC or explicit).
+            if (xport_type.empty() && !seg_type_mix_.empty()) {
+                options.type = UNSPEC;
+            }
+            CHECK_FAIL(
+                engine_->registerLocalMemory(buf, total_buffer_size, options));
+            auto t2 = getCurrentTimeInNano();
+
+            alloc_ns += (t1 - t0);
+            reg_ns += (t2 - t1);
+            total_bytes += total_buffer_size;
+        }
+    }
+
+    LOG(INFO) << "Allocated " << total_bytes << " bytes across "
+              << pinned_buffer_list_.size() << " buffers (" << seg_types.size()
+              << " seg_types) in " << alloc_ns / 1e6 << " ms, registered in "
+              << reg_ns / 1e6 << " ms";
     return 0;
 }
 
@@ -219,8 +292,7 @@ TENTBenchRunner::TENTBenchRunner() {
     signal(SIGINT, signalHandlerV1);
     signal(SIGTERM, signalHandlerV1);
     engine_ = std::make_unique<TransferEngine>(loadConfig());
-    transport_hint_ = TransportSelector::parseTransportType(
-        XferBenchConfig::tent_transport_hint);
+    transport_hint_ = parseTransportType(XferBenchConfig::tent_transport_hint);
     intent_type_ = getIntentType(XferBenchConfig::tent_intent_type);
     allocateBuffers();
 }
@@ -358,7 +430,9 @@ int TENTBenchRunner::runInitiatorTasks(
 double TENTBenchRunner::runSingleTransfer(uint64_t local_addr,
                                           uint64_t target_addr,
                                           uint64_t block_size,
-                                          uint64_t batch_size, OpCode opcode) {
+                                          uint64_t batch_size, OpCode opcode,
+                                          uint64_t deadline_ns,
+                                          IntentType intent_type) {
     auto batch_id = engine_->allocateBatch(batch_size);
     std::vector<Request> requests;
     for (uint64_t i = 0; i < batch_size; ++i) {
@@ -369,7 +443,10 @@ double TENTBenchRunner::runSingleTransfer(uint64_t local_addr,
         entry.target_id = handle_;
         entry.target_offset = target_addr + block_size * i;
         entry.transport_hint = transport_hint_;
-        entry.intent_type = intent_type_;
+        entry.deadline_ns = deadline_ns;
+        entry.intent_type = intent_type == IntentType::INTENT_UNSPEC
+                                ? intent_type_
+                                : intent_type;
         requests.emplace_back(entry);
     }
     XferBenchTimer timer;

@@ -14,6 +14,7 @@
 
 #include "config.h"
 
+#include <charconv>
 #include <cstring>
 #include <cstdio>
 #include <cstdlib>
@@ -367,6 +368,24 @@ void loadGlobalConfig(GlobalConfig& config) {
                             "MC_HANDSHAKE_CONNECT_TIMEOUT";
     }
 
+    const char* rdma_rail_pause_seconds =
+        std::getenv("MC_RDMA_RAIL_PAUSE_SECONDS");
+    if (rdma_rail_pause_seconds) {
+        try {
+            int val = std::stoi(rdma_rail_pause_seconds);
+            if (val > 0 && val < 3600) {
+                config.rdma_rail_pause_seconds = static_cast<uint64_t>(val);
+            } else {
+                LOG(WARNING) << "Ignore value from environment variable "
+                                "MC_RDMA_RAIL_PAUSE_SECONDS";
+            }
+        } catch (const std::exception& e) {
+            LOG(WARNING) << "Invalid MC_RDMA_RAIL_PAUSE_SECONDS environment "
+                            "value: "
+                         << rdma_rail_pause_seconds << ". Error: " << e.what();
+        }
+    }
+
     const char* log_level = std::getenv("MC_LOG_LEVEL");
     config.trace = false;
     if (log_level) {
@@ -391,6 +410,31 @@ void loadGlobalConfig(GlobalConfig& config) {
         else
             LOG(WARNING)
                 << "Ignore value from environment variable MC_SLICE_TIMEOUT";
+    }
+
+    const char* conn_pause_ttl_env = std::getenv("MC_CONN_PAUSE_TTL_MS");
+    if (conn_pause_ttl_env) {
+        // Robust parse (not atoi): a non-numeric typo must keep the default
+        // rather than silently resolve to 0. 0 is a valid explicit "disable";
+        // negative / out-of-range / garbage are rejected, preserving the
+        // default.
+        int val = 0;
+        const char* end = conn_pause_ttl_env + strlen(conn_pause_ttl_env);
+        auto [ptr, ec] = std::from_chars(conn_pause_ttl_env, end, val);
+        if (ec == std::errc() && ptr == end) {
+            if (val >= 0 && val <= 600000) {
+                config.conn_pause_ttl_ms = val;
+            } else {
+                LOG(WARNING) << "Ignore value from environment variable "
+                                "MC_CONN_PAUSE_TTL_MS, value "
+                             << conn_pause_ttl_env
+                             << " out of range (should be 0-600000)";
+            }
+        } else {
+            LOG(WARNING) << "Invalid MC_CONN_PAUSE_TTL_MS environment value: "
+                         << conn_pause_ttl_env
+                         << ". Expected an integer in range 0-600000";
+        }
     }
 
     const char* log_dir_path = std::getenv("MC_LOG_DIR");
@@ -662,6 +706,7 @@ void dumpGlobalConfig() {
     LOG(INFO) << "ib_service_level = " << config.ib_service_level;
     LOG(INFO) << "te_metadata_refresh_interval_seconds = "
               << config.te_metadata_refresh_interval_seconds;
+    LOG(INFO) << "rdma_rail_pause_seconds = " << config.rdma_rail_pause_seconds;
     {
         std::ostringstream oss;
         for (size_t i = 0; i < config.mlx5_qp_udp_sports.size(); ++i) {

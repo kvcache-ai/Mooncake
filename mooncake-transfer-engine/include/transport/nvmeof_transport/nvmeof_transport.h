@@ -30,6 +30,8 @@
 
 namespace mooncake {
 
+class NVMeoFTransportTestPeer;
+
 struct NVMeoFBatchDesc {
     int desc_idx_;
     std::vector<TransferStatus> transfer_status;
@@ -37,6 +39,8 @@ struct NVMeoFBatchDesc {
 };
 
 class NVMeoFTransport : public Transport {
+    friend class NVMeoFTransportTestPeer;
+
    public:
     NVMeoFTransport();
 
@@ -60,6 +64,16 @@ class NVMeoFTransport : public Transport {
                         TransferTask &task, const char *file_path);
 
    private:
+    explicit NVMeoFTransport(std::shared_ptr<CUFileDescPool> desc_pool);
+
+    static TransferStatus aggregateTransferStatus(
+        const std::vector<TransferStatus> &slice_statuses, bool &is_finished);
+
+    void collectSliceStatuses(int desc_idx, size_t slice_id, size_t slice_num,
+                              std::vector<TransferStatus> &slice_statuses);
+
+    static bool isTerminalFailure(TransferStatusEnum status);
+
     void startTransfer(Slice *slice);
 
    private:

@@ -1,4 +1,5 @@
 #include "utils.h"
+#include "random.h"
 #include "mmap_arena.h"
 #include "config.h"
 #include "common.h"
@@ -25,7 +26,6 @@
 #include <mutex>
 #include <numa.h>
 #include <numaif.h>
-#include <random>
 #include <sys/mman.h>
 #include <thread>
 #include <vector>
@@ -79,12 +79,8 @@ bool isPortAvailable(int port) {
 // AutoPortBinder implementation
 AutoPortBinder::AutoPortBinder(int min_port, int max_port)
     : socket_fd_(-1), port_(-1) {
-    static std::random_device rand_gen;
-    std::mt19937 gen(rand_gen());
-    std::uniform_int_distribution<> rand_dist(min_port, max_port);
-
     for (int attempt = 0; attempt < 20; ++attempt) {
-        int port = rand_dist(gen);
+        int port = randomUniform(min_port, max_port);
 
         socket_fd_ = socket(AF_INET, SOCK_STREAM, 0);
         if (socket_fd_ < 0) continue;
@@ -528,7 +524,7 @@ void *allocate_buffer_numa_segments(size_t total_size,
     return ptr;
 }
 
-void free_memory(const std::string &protocol, void *ptr) {
+void free_memory(const std::string &protocol, void *ptr, bool use_spdk_dma) {
 #if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
     if (protocol == "ascend" || protocol == "ubshmem") {
         return ascend_free_memory(protocol, ptr);
@@ -542,6 +538,15 @@ void free_memory(const std::string &protocol, void *ptr) {
 #if defined(USE_UB)
     if (protocol == "ub") {
         mooncake::ub_free_memory(ptr);
+        return;
+    }
+#endif
+#ifdef USE_NOF
+    // Mirror allocate_buffer_allocator_memory(): a buffer taken from the SPDK
+    // hugepage pool (spdk_zmalloc) must be released with spdk_free, not glibc
+    // free(), which would abort with "free(): invalid pointer".
+    if (use_spdk_dma) {
+        mooncake::SpdkWrapper::GetInstance().Free(ptr);
         return;
     }
 #endif

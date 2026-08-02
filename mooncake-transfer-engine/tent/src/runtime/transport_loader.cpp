@@ -52,7 +52,8 @@ Status TransferEngineImpl::loadTransports() {
     if (conf_->get("transports/tcp/enable", true))
         transport_list_[TCP] = std::make_shared<TcpTransport>();
 
-    // TODO affect the end-to-end performance because it is not numa aware
+    // SHM is opt-in: default false because the current path is not NUMA-aware
+    // (see tent/config/transfer-engine.json for an example that enables it).
     if (conf_->get("transports/shm/enable", false))
         transport_list_[SHM] = std::make_shared<ShmTransport>();
 

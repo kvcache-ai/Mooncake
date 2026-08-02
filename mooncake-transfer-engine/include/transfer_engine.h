@@ -35,6 +35,11 @@ class P2pTransport;
 class RdmaTransport;
 }  // namespace device
 #endif
+#ifdef USE_NCCL_DEVICE
+namespace device {
+class NcclTransport;
+}  // namespace device
+#endif
 using TransferRequest = Transport::TransferRequest;
 using TransferStatus = Transport::TransferStatus;
 using TransferStatusEnum = Transport::TransferStatusEnum;
@@ -43,6 +48,7 @@ using SegmentID = Transport::SegmentID;
 using BatchID = Transport::BatchID;
 const static BatchID INVALID_BATCH_ID = UINT64_MAX;
 using BufferEntry = Transport::BufferEntry;
+using NicLoadStats = Transport::NicLoadStats;
 
 enum class PeerLiveness : uint8_t {
     Alive = 0,
@@ -164,6 +170,8 @@ class TransferEngine {
 
     Status getBatchTransferStatus(BatchID batch_id, TransferStatus& status);
 
+    Status getNicLoadStats(std::vector<NicLoadStats>& stats) const;
+
     Transport* getTransport(const std::string& proto);
 
 #if (defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_MACA)) && \
@@ -175,6 +183,10 @@ class TransferEngine {
     device::P2pTransport* getOrCreateP2pTransport(int num_ranks);
     device::RdmaTransport* getOrCreateRdmaTransport(
         const std::vector<std::string>& device_filter = {});
+#endif
+#ifdef USE_NCCL_DEVICE
+    // NCCL is CUDA-only and independent of the host network transport.
+    device::NcclTransport* getOrCreateNcclTransport();
 #endif
 
     /**

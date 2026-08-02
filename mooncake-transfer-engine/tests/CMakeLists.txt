@@ -50,6 +50,12 @@ target_link_libraries(rdma_loopback_test PUBLIC transfer_engine gtest
                                                 gtest_main)
 # add_test(NAME rdma_loopback_test COMMAND rdma_loopback_test)
 
+# Regression test for #2017 (registerLocalMemory must auto-chunk buffers larger
+# than the device max_mr_size; loopback WRITE past the boundary must succeed).
+add_executable(rdma_large_mr_test ${WORKSPACE}/rdma_large_mr_test.cpp)
+target_link_libraries(rdma_large_mr_test PUBLIC transfer_engine gtest gtest_main )
+# add_test(NAME rdma_large_mr_test COMMAND rdma_large_mr_test)  # needs an RDMA dev + metadata server
+
 # This test verifies endpoint re-establishment in RDMATransport.
 add_executable(rdma_endpoint_reestablish_test
                ${WORKSPACE}/rdma_endpoint_reestablish_test.cpp)
@@ -72,6 +78,11 @@ if(USE_CXL)
 endif()
 
 if(USE_NVMEOF)
+  add_executable(nvmeof_status_test ${WORKSPACE}/nvmeof_status_test.cpp)
+  target_link_libraries(nvmeof_status_test PUBLIC transfer_engine gtest
+                                                  gtest_main)
+  add_test(NAME nvmeof_status_test COMMAND nvmeof_status_test)
+
   add_executable(nvmeof_transport_test ${WORKSPACE}/nvmeof_transport_test.cpp)
   target_link_libraries(nvmeof_transport_test PUBLIC transfer_engine gtest
                                                      gtest_main)
@@ -95,6 +106,22 @@ add_executable(tcp_address_validation_test
                ${WORKSPACE}/tcp_address_validation_test.cpp)
 target_link_libraries(tcp_address_validation_test PUBLIC gtest gtest_main)
 add_test(NAME tcp_address_validation_test COMMAND tcp_address_validation_test)
+
+# Hardware-free unit test for the active-connect circuit-breaker state
+# (ConnectPauseTracker is header-only and clock-injectable), runs on every CI
+# runner.
+add_executable(connect_pause_tracker_test
+               ${WORKSPACE}/connect_pause_tracker_test.cpp)
+target_link_libraries(connect_pause_tracker_test PUBLIC gtest gtest_main
+                                                        pthread)
+add_test(NAME connect_pause_tracker_test COMMAND connect_pause_tracker_test)
+
+# Hardware-free unit tests for DmabufExport struct and
+# RdmaContext::{exportDmabuf, closeDmabufExport}. Runs on every CI runner —
+# no RDMA device or GPU required (host-memory paths only).
+add_executable(dmabuf_export_test ${WORKSPACE}/dmabuf_export_test.cpp)
+target_link_libraries(dmabuf_export_test PUBLIC transfer_engine gtest gtest_main)
+add_test(NAME dmabuf_export_test COMMAND dmabuf_export_test)
 
 if(USE_MNNVL)
   add_executable(nvlink_transport_test ${WORKSPACE}/nvlink_transport_test.cpp)
@@ -193,20 +220,22 @@ if(USE_SUNRISE)
                  ${WORKSPACE}/sunrise_link_transport_test.cpp)
   target_include_directories(sunrise_link_transport_test
                              PRIVATE ${MC_TANGRT_ROOT}/include)
-  target_link_libraries(sunrise_link_transport_test PUBLIC transfer_engine
-                                                           gtest gtest_main
-                                                           ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
-                                                           ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
+  target_link_libraries(
+    sunrise_link_transport_test
+    PUBLIC transfer_engine gtest gtest_main
+           ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
+           ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
   add_test(NAME sunrise_link_transport_test COMMAND sunrise_link_transport_test)
 
   add_executable(sunrise_link_transport_runtime_test
                  ${WORKSPACE}/sunrise_link_transport_runtime_test.cpp)
   target_include_directories(sunrise_link_transport_runtime_test
                              PRIVATE ${MC_TANGRT_ROOT}/include)
-  target_link_libraries(sunrise_link_transport_runtime_test
-                        PUBLIC transfer_engine gtest gtest_main
-                               ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
-                               ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
+  target_link_libraries(
+    sunrise_link_transport_runtime_test
+    PUBLIC transfer_engine gtest gtest_main
+           ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
+           ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
   add_test(NAME sunrise_link_transport_runtime_test
            COMMAND sunrise_link_transport_runtime_test)
 
@@ -214,31 +243,32 @@ if(USE_SUNRISE)
                  ${WORKSPACE}/sunrise_link_transport_unit_test.cpp)
   target_include_directories(sunrise_link_transport_unit_test
                              PRIVATE ${MC_TANGRT_ROOT}/include)
-  target_link_libraries(sunrise_link_transport_unit_test
-                        PUBLIC transfer_engine gtest gtest_main
-                               ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
-                               ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
+  target_link_libraries(
+    sunrise_link_transport_unit_test
+    PUBLIC transfer_engine gtest gtest_main
+           ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
+           ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
   add_test(NAME sunrise_link_transport_unit_test
            COMMAND sunrise_link_transport_unit_test)
 
-  add_executable(sunrise_allocator_test
-                 ${WORKSPACE}/sunrise_allocator_test.cpp)
+  add_executable(sunrise_allocator_test ${WORKSPACE}/sunrise_allocator_test.cpp)
   target_include_directories(sunrise_allocator_test
                              PRIVATE ${MC_TANGRT_ROOT}/include)
-  target_link_libraries(sunrise_allocator_test
-                        PUBLIC transfer_engine gtest gtest_main
-                               ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
-                               ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
+  target_link_libraries(
+    sunrise_allocator_test
+    PUBLIC transfer_engine gtest gtest_main
+           ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
+           ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
   add_test(NAME sunrise_allocator_test COMMAND sunrise_allocator_test)
 
-  add_executable(sunrise_link_copy_test
-                 ${WORKSPACE}/sunrise_link_copy_test.cpp)
+  add_executable(sunrise_link_copy_test ${WORKSPACE}/sunrise_link_copy_test.cpp)
   target_include_directories(sunrise_link_copy_test
                              PRIVATE ${MC_TANGRT_ROOT}/include)
-  target_link_libraries(sunrise_link_copy_test
-                        PUBLIC transfer_engine gtest gtest_main
-                               ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
-                               ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
+  target_link_libraries(
+    sunrise_link_copy_test
+    PUBLIC transfer_engine gtest gtest_main
+           ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
+           ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
   add_test(NAME sunrise_link_copy_test COMMAND sunrise_link_copy_test)
 endif()
 
@@ -258,8 +288,8 @@ add_test(NAME rdma_gid_probe_test COMMAND rdma_gid_probe_test)
 
 add_executable(multi_transport_locality_test
                ${WORKSPACE}/multi_transport_locality_test.cpp)
-target_link_libraries(multi_transport_locality_test PUBLIC transfer_engine gtest
-                                                           gtest_main)
+target_link_libraries(multi_transport_locality_test PUBLIC transfer_engine
+                                                           gtest gtest_main)
 add_test(NAME multi_transport_locality_test
          COMMAND multi_transport_locality_test)
 
@@ -268,6 +298,13 @@ add_executable(rdma_context_reprobe_test
 target_link_libraries(rdma_context_reprobe_test PUBLIC transfer_engine gtest
                                                        gtest_main)
 add_test(NAME rdma_context_reprobe_test COMMAND rdma_context_reprobe_test)
+
+add_executable(rdma_transport_submit_task_test
+               ${WORKSPACE}/rdma_transport_submit_task_test.cpp)
+target_link_libraries(rdma_transport_submit_task_test PUBLIC transfer_engine
+                                                             gtest gtest_main)
+add_test(NAME rdma_transport_submit_task_test
+         COMMAND rdma_transport_submit_task_test)
 
 add_executable(topology_test ${WORKSPACE}/topology_test.cpp)
 target_link_libraries(topology_test PUBLIC transfer_engine gtest gtest_main)
@@ -307,9 +344,42 @@ endif()
 
 add_executable(graceful_shutdown_test ${WORKSPACE}/graceful_shutdown_test.cpp)
 target_link_libraries(graceful_shutdown_test PUBLIC transfer_engine gtest
-                                                   gtest_main)
+                                                    gtest_main)
 add_test(NAME graceful_shutdown_test COMMAND graceful_shutdown_test)
 
 add_executable(show_links_test ${WORKSPACE}/show_links_test.cpp)
 target_link_libraries(show_links_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME show_links_test COMMAND show_links_test)
+
+# The NCCL transport library target compiles only host-side setup, while the
+# CUDA example that includes the device helpers is opt-in. This probe instantiates
+# one consumer kernel against both header-only NCCL and IBGDA helpers so a
+# call-shape regression fails the build. Keep nvcc optional for host-only
+# DeviceTransport builds that consume JIT kernels.
+if(USE_NCCL_DEVICE AND NOT USE_CXI)
+  if(CMAKE_VERSION VERSION_LESS 3.18)
+    message(STATUS
+      "Skipping NCCL/IBGDA device API compatibility compile test: "
+      "CMake 3.18+ is required for CUDA C++17")
+  else()
+    include(CheckLanguage)
+    check_language(CUDA)
+    if(CMAKE_CUDA_COMPILER)
+      enable_language(CUDA)
+      add_library(device_backend_api_compatibility_test OBJECT
+                  ${WORKSPACE}/device_backend_api_compatibility_test.cu)
+      target_include_directories(device_backend_api_compatibility_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+      target_link_libraries(device_backend_api_compatibility_test PRIVATE
+        NCCL::nccl)
+      target_compile_options(device_backend_api_compatibility_test PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--expt-relaxed-constexpr>)
+      set_target_properties(device_backend_api_compatibility_test PROPERTIES
+        CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON CUDA_EXTENSIONS OFF)
+    else()
+      message(STATUS
+        "Skipping NCCL/IBGDA device API compatibility compile test: "
+        "nvcc not found")
+    endif()
+  endif()
+endif()
