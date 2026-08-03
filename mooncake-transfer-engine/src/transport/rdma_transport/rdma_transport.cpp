@@ -1106,6 +1106,16 @@ int RdmaTransport::initializeRdmaResources() {
         if (ret) {
             local_topology_->disableDevice(device_name);
             LOG(WARNING) << "Disable device " << device_name;
+            // Keep context_list_ index-aligned with getHcaList(): both it and
+            // BufferDesc::lkey are subscripted by the HCA index, which
+            // disableDevice() leaves in place. Dropping a slot would make a
+            // later device_id name the wrong RNIC or run off the end. A
+            // never-constructed context is an inert placeholder; the partially
+            // built one is released so it does not pin an open uverbs fd.
+            auto placeholder =
+                std::make_shared<RdmaContext>(*this, device_name);
+            placeholder->set_active(false);
+            context_list_.push_back(std::move(placeholder));
         } else {
             context_list_.push_back(context);
         }
