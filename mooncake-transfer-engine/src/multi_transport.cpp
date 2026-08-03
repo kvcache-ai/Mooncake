@@ -136,8 +136,14 @@ Status MultiTransport::submitTransfer(
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
 
+    struct TaskGroup {
+        uint64_t id;
+        Transport* transport;
+        std::vector<Transport::TransferTask*> tasks;
+    };
     std::unordered_map<Transport*, std::vector<Transport::TransferTask*> >
         submit_tasks;
+    std::vector<TaskGroup> task_groups;
     for (size_t i = 0; i < entries.size(); ++i) {
         const auto& request = entries[i];
         auto* transport = transports[i];
@@ -150,7 +156,15 @@ Status MultiTransport::submitTransfer(
         task.request = &request;
 #endif
         ++task_id;
-        submit_tasks[transport].push_back(&task);
+        if (request.task_group_id == TransferRequest::kNoTaskGroup) {
+            submit_tasks[transport].push_back(&task);
+        } else if (!task_groups.empty() &&
+                   task_groups.back().id == request.task_group_id &&
+                   task_groups.back().transport == transport) {
+            task_groups.back().tasks.push_back(&task);
+        } else {
+            task_groups.push_back({request.task_group_id, transport, {&task}});
+        }
     }
     Status overall_status = Status::OK();
     for (auto& entry : submit_tasks) {
@@ -160,6 +174,10 @@ Status MultiTransport::submitTransfer(
             //            << entry.first->getName();
             overall_status = status;
         }
+    }
+    for (auto& group : task_groups) {
+        auto status = group.transport->submitTransferTaskGroup(group.tasks);
+        if (!status.ok()) overall_status = status;
     }
     return overall_status;
 }
