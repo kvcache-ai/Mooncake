@@ -5,6 +5,8 @@
 #include <utility>
 
 #if defined(USE_CUDA)
+#include <dlfcn.h>
+
 #include "cuda_alike.h"
 #endif
 
@@ -22,6 +24,35 @@ bool AddOverflows(uint64_t a, uint64_t b) {
 }
 
 void ClearCudaError() { cudaGetLastError(); }
+
+using CuMemGetAddressRangeFn = CUresult (*)(CUdeviceptr *, size_t *,
+                                            CUdeviceptr);
+
+CuMemGetAddressRangeFn LoadCuMemGetAddressRange() {
+    static CuMemGetAddressRangeFn fn = [] {
+        void *handle = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_LOCAL);
+        if (handle == nullptr) {
+            handle = dlopen("libcuda.so", RTLD_LAZY | RTLD_LOCAL);
+        }
+        void *symbol = handle != nullptr
+                           ? dlsym(handle, "cuMemGetAddressRange_v2")
+                           : dlsym(RTLD_DEFAULT, "cuMemGetAddressRange_v2");
+        if (symbol == nullptr) {
+            symbol = handle != nullptr
+                         ? dlsym(handle, "cuMemGetAddressRange")
+                         : dlsym(RTLD_DEFAULT, "cuMemGetAddressRange");
+        }
+        return reinterpret_cast<CuMemGetAddressRangeFn>(symbol);
+    }();
+    return fn;
+}
+
+CUresult GetCudaAllocationRange(CUdeviceptr *base, size_t *size,
+                                CUdeviceptr ptr) {
+    auto fn = LoadCuMemGetAddressRange();
+    if (fn == nullptr) return CUDA_ERROR_NOT_FOUND;
+    return fn(base, size, ptr);
+}
 #endif
 
 }  // namespace
@@ -47,7 +78,7 @@ tl::expected<CudaIpcBufferHandle, ErrorCode> ExportCudaIpcBuffer(
     CUdeviceptr base_ptr = 0;
     size_t allocation_size = 0;
     CUresult cu_ret =
-        cuMemGetAddressRange(&base_ptr, &allocation_size, (CUdeviceptr)ptr);
+        GetCudaAllocationRange(&base_ptr, &allocation_size, (CUdeviceptr)ptr);
     if (cu_ret != CUDA_SUCCESS || base_ptr == 0 || allocation_size == 0) {
         ClearCudaError();
         return UnsupportedCudaIpc();
@@ -137,7 +168,7 @@ tl::expected<CudaIpcBufferMapping, ErrorCode> CudaIpcBufferMapping::Open(
     CUdeviceptr allocation_base = 0;
     size_t allocation_size = 0;
     if (ret == cudaSuccess && base != nullptr) {
-        CUresult cu_ret = cuMemGetAddressRange(
+        CUresult cu_ret = GetCudaAllocationRange(
             &allocation_base, &allocation_size, (CUdeviceptr)base);
         if (cu_ret != CUDA_SUCCESS || allocation_base != (CUdeviceptr)base ||
             allocation_size == 0 || AddOverflows(handle.offset, handle.size) ||
