@@ -1876,11 +1876,11 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchQuery(
 }
 
 int BucketStorageBackend::EnvBatchLoadThreads() {
-    return GetEnvOr<int>("MC_BATCH_LOAD_THREADS", 0);
+    return Environ::GetInt("MC_BATCH_LOAD_THREADS", 0);
 }
 
 int BucketStorageBackend::EnvBucketReadThreads() {
-    return GetEnvOr<int>("MC_BUCKET_READ_THREADS", 0);
+    return Environ::GetInt("MC_BUCKET_READ_THREADS", 0);
 }
 
 #ifdef USE_URING
@@ -1891,7 +1891,12 @@ tl::expected<void, ErrorCode> BucketStorageBackend::UringBatchReadBucket(
     std::vector<int64_t> buf_offsets;
     descs.reserve(plans.size());
     buf_offsets.reserve(plans.size());
-    size_t expected_bytes = 0;
+    // Minimum aggregated bytes that must be returned so every key's actual
+    // data region is present.  Mirrors #3066's per-key min_required: the
+    // aligned descriptor may extend past EOF (tail padding) when a bucket
+    // file is not 4096-padded, so the check must only require
+    // offset_in_buffer + data_size per key, not the full aligned_size.
+    size_t required_bytes = 0;
 
     for (const auto& plan : plans) {
         int64_t actual_offset = plan.offset + plan.key_size;
@@ -1902,8 +1907,10 @@ tl::expected<void, ErrorCode> BucketStorageBackend::UringBatchReadBucket(
             align_up(static_cast<size_t>(data_end), kDirectIOAlignment));
         size_t aligned_size = static_cast<size_t>(aligned_end - aligned_offset);
         descs.push_back({plan.dest_slice.ptr, aligned_size, aligned_offset});
-        buf_offsets.push_back(actual_offset - aligned_offset);
-        expected_bytes += aligned_size;
+        int64_t offset_in_buffer = actual_offset - aligned_offset;
+        buf_offsets.push_back(offset_in_buffer);
+        required_bytes +=
+            static_cast<size_t>(offset_in_buffer) + plan.dest_slice.size;
     }
 
     auto result = uf->batch_read(descs.data(), static_cast<int>(descs.size()));
@@ -1916,11 +1923,11 @@ tl::expected<void, ErrorCode> BucketStorageBackend::UringBatchReadBucket(
     // Guard against silent short reads (community #3066/#3073): the
     // underlying collect() only flags cqe->res < 0, so a short read
     // returns fewer bytes without surfacing an error.  Verify the
-    // aggregated byte count covers every aligned descriptor before
-    // exposing the zero-copy pointers.
-    if (result.value() < expected_bytes) {
+    // aggregated byte count covers every key's actual data region
+    // (offset_in_buffer + data_size) before exposing the pointers.
+    if (result.value() < required_bytes) {
         LOG(ERROR) << "batch_read short read for bucket_id=" << bucket_id
-                   << ", expected at least: " << expected_bytes
+                   << ", expected at least: " << required_bytes
                    << ", got: " << result.value();
         return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
     }
@@ -1972,8 +1979,16 @@ ErrorCode BucketStorageBackend::IntraBucketReadChunked(
 
     ErrorCode first_err = ErrorCode::OK;
     for (auto& f : futures) {
-        ErrorCode err = f.get();
-        if (first_err == ErrorCode::OK && err != ErrorCode::OK) first_err = err;
+        try {
+            ErrorCode err = f.get();
+            if (first_err == ErrorCode::OK && err != ErrorCode::OK)
+                first_err = err;
+        } catch (...) {
+            // Still wait on every future so no queued task keeps running
+            // against captured references after this function returns.
+            if (first_err == ErrorCode::OK)
+                first_err = ErrorCode::INTERNAL_ERROR;
+        }
     }
     return first_err;
 }
@@ -2117,12 +2132,19 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
             pool.enqueue([task]() { (*task)(); });
         }
 
-        // Wait for all bucket reads to complete.
+        // Wait for all bucket reads to complete.  Keep draining every
+        // future even if one throws, so no queued task keeps running
+        // against captured references after this function returns.
         ErrorCode first_err = ErrorCode::OK;
         for (auto& f : futures) {
-            ErrorCode err = f.get();
-            if (first_err == ErrorCode::OK && err != ErrorCode::OK)
-                first_err = err;
+            try {
+                ErrorCode err = f.get();
+                if (first_err == ErrorCode::OK && err != ErrorCode::OK)
+                    first_err = err;
+            } catch (...) {
+                if (first_err == ErrorCode::OK)
+                    first_err = ErrorCode::INTERNAL_ERROR;
+            }
         }
         if (first_err != ErrorCode::OK) return tl::make_unexpected(first_err);
     } else {
@@ -2218,13 +2240,14 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                             plan.dest_slice.size;
                         if (read_res.value() < min_required) {
                             LOG(ERROR)
-                                << "read_aligned short read for key: " << plan.key
-                                << ", bucket_id=" << plan.bucket_id
+                                << "read_aligned short read for key: "
+                                << plan.key << ", bucket_id=" << plan.bucket_id
                                 << ", expected at least: " << min_required
                                 << " (aligned_size=" << aligned_size
                                 << ", data_size=" << plan.dest_slice.size << ")"
                                 << ", got: " << read_res.value();
-                            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                            return tl::make_unexpected(
+                                ErrorCode::FILE_READ_FAIL);
                         }
                         // Adjust ptr to point to actual data start
                         // (zero-copy: no memcpy, buffer was oversized by
