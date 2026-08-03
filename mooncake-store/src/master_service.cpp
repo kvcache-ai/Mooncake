@@ -3787,34 +3787,51 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
 
-    // Promotion stages PROCESSING replicas without registering a primary
-    // Put/Upsert operation. End is valid only after a successful primary
-    // Start installed the processing marker for this key.
+    auto is_target_replica = [replica_type](const Replica& replica) {
+        if (replica_type == ReplicaType::ALL) {
+            return (replica.is_memory_replica() &&
+                    !replica.has_invalid_mem_handle()) ||
+                   (replica.is_nof_replica() &&
+                    !replica.has_invalid_nof_handle());
+        }
+        if (replica_type == ReplicaType::MEMORY) {
+            return replica.is_memory_replica() &&
+                   !replica.has_invalid_mem_handle();
+        }
+        if (replica_type == ReplicaType::NOF_SSD) {
+            return replica.is_nof_replica() &&
+                   !replica.has_invalid_nof_handle();
+        }
+        return replica.type() == replica_type;
+    };
+
+    // A successful End removes the processing marker. Treat a retry as a
+    // no-op only when every replica targeted by that End is already COMPLETE.
+    // In particular, a promotion-owned PROCESSING replica keeps this check
+    // from accepting a MEMORY/ALL End and is never modified here.
     if (!accessor.InProcessing()) {
+        bool has_target_replica = false;
+        bool all_target_replicas_complete = true;
+        for (const auto& replica : metadata.GetAllReplicas()) {
+            if (!is_target_replica(replica)) {
+                continue;
+            }
+            has_target_replica = true;
+            if (!replica.is_completed()) {
+                all_target_replicas_complete = false;
+                break;
+            }
+        }
+        if (has_target_replica && all_target_replicas_complete) {
+            return {};
+        }
         LOG(ERROR) << "key=" << key << ", error=no_primary_write_in_progress";
         return tl::make_unexpected(ErrorCode::INVALID_WRITE);
     }
 
     metadata.VisitReplicas(
-        [replica_type](const Replica& replica) {
-            if (!replica.is_processing()) {
-                return false;
-            }
-            if (replica_type == ReplicaType::ALL) {
-                return (replica.is_memory_replica() &&
-                        !replica.has_invalid_mem_handle()) ||
-                       (replica.is_nof_replica() &&
-                        !replica.has_invalid_nof_handle());
-            }
-            if (replica_type == ReplicaType::MEMORY) {
-                return replica.is_memory_replica() &&
-                       !replica.has_invalid_mem_handle();
-            }
-            if (replica_type == ReplicaType::NOF_SSD) {
-                return replica.is_nof_replica() &&
-                       !replica.has_invalid_nof_handle();
-            }
-            return replica.type() == replica_type;
+        [&is_target_replica](const Replica& replica) {
+            return replica.is_processing() && is_target_replica(replica);
         },
         [](Replica& replica) { replica.mark_complete(); });
 

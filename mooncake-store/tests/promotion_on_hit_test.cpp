@@ -13,8 +13,10 @@
 #include <fstream>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 #include <unistd.h>
@@ -33,6 +35,22 @@ size_t CountPromotionTask(const std::vector<PromotionTaskItem>& tasks,
 
 class PromotionOnHitTest : public ::testing::Test {
    protected:
+    struct EndStateForTesting {
+        bool in_processing{false};
+        std::optional<uint64_t> object_checksum;
+        std::chrono::system_clock::time_point lease_timeout;
+        std::optional<std::chrono::system_clock::time_point> soft_pin_timeout;
+        uint64_t reserved_quota_charge_bytes{0};
+        uint64_t committed_quota_charge_bytes{0};
+        uint64_t pending_replaced_quota_charge_bytes{0};
+        std::vector<std::tuple<ReplicaID, ReplicaStatus, uint32_t>> replicas;
+        std::optional<std::tuple<ReplicaID, ReplicaID, uint64_t>>
+            promotion_task;
+        uint64_t promotion_in_flight{0};
+
+        bool operator==(const EndStateForTesting&) const = default;
+    };
+
     void SetUp() override {
         google::InitGoogleLogging("PromotionOnHitTest");
         FLAGS_logtostderr = true;
@@ -106,6 +124,49 @@ class PromotionOnHitTest : public ::testing::Test {
         auto* replica = accessor.Get().GetReplicaByID(replica_id);
         ASSERT_NE(replica, nullptr);
         replica->mark_complete();
+    }
+
+    static EndStateForTesting CaptureEndStateForTesting(
+        MasterService* service, const TenantId& tenant_id,
+        const std::string& key) {
+        MasterService::MetadataAccessorRW accessor(
+            service, MasterService::ObjectIdentity{.tenant_id = tenant_id,
+                                                   .user_key = key});
+        EXPECT_TRUE(accessor.Exists());
+
+        EndStateForTesting state;
+        if (!accessor.Exists()) {
+            return state;
+        }
+        auto& metadata = accessor.Get();
+        state.in_processing = accessor.InProcessing();
+        state.object_checksum = metadata.object_checksum;
+        {
+            SpinLocker locker(&metadata.lock);
+            state.lease_timeout = metadata.lease_timeout;
+            state.soft_pin_timeout = metadata.soft_pin_timeout;
+        }
+        state.reserved_quota_charge_bytes =
+            metadata.reserved_quota_charge_bytes;
+        state.committed_quota_charge_bytes =
+            metadata.committed_quota_charge_bytes;
+        state.pending_replaced_quota_charge_bytes =
+            metadata.pending_replaced_quota_charge_bytes;
+        for (const auto& replica : metadata.GetAllReplicas()) {
+            state.replicas.emplace_back(replica.id(), replica.status(),
+                                        replica.get_refcnt());
+        }
+
+        auto& tenant_state = accessor.GetTenantState();
+        auto task_it = tenant_state.promotion_tasks.find(key);
+        if (task_it != tenant_state.promotion_tasks.end()) {
+            state.promotion_task.emplace(
+                task_it->second.source_id, task_it->second.alloc_id,
+                task_it->second.reserved_quota_charge_bytes);
+        }
+        state.promotion_in_flight =
+            service->promotion_in_flight_.load(std::memory_order_relaxed);
+        return state;
     }
 
     static constexpr size_t kDefaultSegmentBase = 0x300000000;
@@ -448,6 +509,100 @@ TEST_F(PromotionOnHitTest, AllocStartUnknownKey) {
                                              TenantId::Default(), 1024, {});
     ASSERT_FALSE(resp.has_value());
     EXPECT_EQ(resp.error(), ErrorCode::OBJECT_NOT_FOUND);
+}
+
+TEST_F(PromotionOnHitTest, PrimaryEndRetryIsIdempotent) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    Segment holder_segment =
+        MakeSegment("end_retry", kDefaultSegmentBase, seg_size);
+    const UUID holder_id = generate_uuid();
+    ASSERT_TRUE(service->MountSegment(holder_segment, holder_id).has_value());
+    ASSERT_TRUE(service->MountLocalDiskSegment(holder_id, true).has_value());
+    ASSERT_TRUE(
+        service->ReMountSegment({holder_segment}, holder_id).has_value());
+    const MountedSegmentContext holder{.segment_id = holder_segment.id,
+                                       .client_id = holder_id,
+                                       .segment_name = holder_segment.name};
+
+    // A completed PutEnd retry must be a pure no-op.
+    ReplicateConfig put_config;
+    put_config.replica_num = 1;
+    auto put_start = service->PutStart(holder.client_id, "k_memory",
+                                       TenantId::Default(), 1024, put_config);
+    ASSERT_TRUE(put_start.has_value());
+    ObjectMeta put_meta{"k_memory", 42};
+    ASSERT_TRUE(service
+                    ->PutEnd(holder.client_id, put_meta, TenantId::Default(),
+                             ReplicaType::MEMORY)
+                    .has_value());
+    const auto put_state_before = CaptureEndStateForTesting(
+        service.get(), TenantId::Default(), "k_memory");
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    ASSERT_TRUE(service
+                    ->PutEnd(holder.client_id, put_meta, TenantId::Default(),
+                             ReplicaType::MEMORY)
+                    .has_value());
+    EXPECT_EQ(CaptureEndStateForTesting(service.get(), TenantId::Default(),
+                                        "k_memory"),
+              put_state_before);
+
+    // Establish a completed LOCAL_DISK Upsert lifecycle, then start a
+    // promotion. Retrying that same UpsertEnd must succeed without touching
+    // the promotion-owned PROCESSING MEMORY replica or its accounting.
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, holder.client_id, "k_cold",
+                                       1024, holder.segment_name));
+    auto upsert_start = service->UpsertStart(
+        holder.client_id, "k_cold", TenantId::Default(), 1024, put_config);
+    ASSERT_TRUE(upsert_start.has_value());
+    ASSERT_EQ(upsert_start->size(), 1u);
+    EXPECT_TRUE(upsert_start->front().is_local_disk_replica());
+    ASSERT_TRUE(service
+                    ->UpsertEnd(holder.client_id, "k_cold", TenantId::Default(),
+                                ReplicaType::LOCAL_DISK)
+                    .has_value());
+
+    const auto completed_disk_state =
+        CaptureEndStateForTesting(service.get(), TenantId::Default(), "k_cold");
+    ASSERT_EQ(completed_disk_state.replicas.size(), 1u);
+    EXPECT_FALSE(completed_disk_state.in_processing);
+    EXPECT_EQ(std::get<1>(completed_disk_state.replicas.front()),
+              ReplicaStatus::COMPLETE);
+
+    auto read = service->GetReplicaList("k_cold", TenantId::Default());
+    ASSERT_TRUE(read.has_value());
+    auto alloc = service->PromotionAllocStart(holder.client_id, "k_cold",
+                                              TenantId::Default(), 1024, {});
+    ASSERT_TRUE(alloc.has_value());
+
+    const auto promotion_state_before =
+        CaptureEndStateForTesting(service.get(), TenantId::Default(), "k_cold");
+    const auto promoted_replica_it = std::find_if(
+        promotion_state_before.replicas.begin(),
+        promotion_state_before.replicas.end(), [&alloc](const auto& replica) {
+            return std::get<0>(replica) == alloc->memory_descriptor.id;
+        });
+    ASSERT_NE(promoted_replica_it, promotion_state_before.replicas.end());
+    EXPECT_EQ(std::get<1>(*promoted_replica_it), ReplicaStatus::PROCESSING);
+
+    ASSERT_TRUE(service
+                    ->UpsertEnd(holder.client_id, "k_cold", TenantId::Default(),
+                                ReplicaType::LOCAL_DISK)
+                    .has_value());
+    EXPECT_EQ(
+        CaptureEndStateForTesting(service.get(), TenantId::Default(), "k_cold"),
+        promotion_state_before);
+
+    ASSERT_TRUE(service
+                    ->NotifyPromotionSuccess(holder.client_id, "k_cold",
+                                             TenantId::Default())
+                    .has_value());
+    service->RemoveAll();
 }
 
 TEST_F(PromotionOnHitTest, InvalidPrimaryEndCannotCompletePromotionReplica) {
