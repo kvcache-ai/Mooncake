@@ -3669,17 +3669,6 @@ RealClient::get_into_ranges_internal(
         }
     }
 
-    auto operation = client_->SubmitScatter(memory_transfers);
-    if (!operation.has_value()) {
-        const auto failure =
-            Status::InvalidArgument("TransferSubmitter not initialized");
-        for (const auto &transfer : memory_transfers) {
-            for (size_t i = 0; i < transfer.lengths.size(); ++i)
-                transfer.on_fragment_complete(i, failure);
-        }
-        return results;
-    }
-
     auto next_refresh_delay = [&]() {
         const auto now = std::chrono::steady_clock::now();
         auto delay = std::chrono::nanoseconds::max();
@@ -3709,6 +3698,19 @@ RealClient::get_into_ranges_internal(
             lease.expires_at = refreshed[i]->lease_timeout;
         }
     };
+
+    // Planning may consume most of a short lease; renew before submission.
+    if (!scatter_leases.empty()) refresh_leases();
+    auto operation = client_->SubmitScatter(memory_transfers);
+    if (!operation.has_value()) {
+        const auto failure =
+            Status::InvalidArgument("TransferSubmitter not initialized");
+        for (const auto &transfer : memory_transfers) {
+            for (size_t i = 0; i < transfer.lengths.size(); ++i)
+                transfer.on_fragment_complete(i, failure);
+        }
+        return results;
+    }
 
     while (true) {
         const auto delay = next_refresh_delay();
