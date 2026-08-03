@@ -67,22 +67,31 @@ struct OrderedOpLogWriter::Impl {
         batch_busy = true;
     }
 
-    bool LatchTerminalState(ErrorCode error,
+    void EnterTerminalState(ErrorCode error,
                             OrderedOpLogWriterTerminalReason reason) {
-        if (terminal_state.has_value()) {
-            return false;
+        TerminalCallback callback;
+        std::optional<OrderedOpLogWriterTerminalState> state;
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            if (stop_requested || terminal_state.has_value()) {
+                return;
+            }
+            terminal_state = {
+                .error = error,
+                .reason = reason,
+                .durable_prefix = durable_prefix,
+                .occurred_at_ms = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::now().time_since_epoch())
+                        .count())};
+            accepting = false;
+            last_error = error;
+            callback = terminal_callback;
+            state = terminal_state;
         }
-        terminal_state = {
-            .error = error,
-            .reason = reason,
-            .durable_prefix = durable_prefix,
-            .occurred_at_ms = static_cast<uint64_t>(
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch())
-                    .count())};
-        accepting = false;
-        last_error = error;
-        return true;
+        if (callback) {
+            callback(*state);
+        }
     }
 
     OrderedOpLogWriterConfig config;
@@ -194,24 +203,22 @@ OrderedOpLogWriter::Commit(Reservation&& reservation, OpLogEntry entry,
         impl_->active_reservations.erase(reservation.id_) == 0) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    if (impl_->terminal_state.has_value()) {
+    auto reject_reservation =
+        [&](ErrorCode error) -> tl::expected<PendingHandle, ErrorCode> {
         --impl_->open_waiting_slots;
         reservation.writer_ = nullptr;
         reservation.id_ = 0;
-        return tl::make_unexpected(impl_->terminal_state->error);
+        return tl::make_unexpected(error);
+    };
+    if (impl_->terminal_state.has_value()) {
+        return reject_reservation(impl_->terminal_state->error);
     }
     if (impl_->stop_requested) {
-        --impl_->open_waiting_slots;
-        reservation.writer_ = nullptr;
-        reservation.id_ = 0;
-        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        return reject_reservation(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
     std::string reason;
     if (!ValidateOpLogBatchEntry(entry, &reason)) {
-        --impl_->open_waiting_slots;
-        reservation.writer_ = nullptr;
-        reservation.id_ = 0;
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        return reject_reservation(ErrorCode::INVALID_PARAMS);
     }
     reservation.writer_ = nullptr;
     reservation.id_ = 0;
@@ -344,26 +351,22 @@ void OrderedOpLogWriter::Start() {
             while (true) {
                 TestFailPoint::Wait("batch_before_txn");
                 if (retry_attempt) {
-                    TerminalCallback terminal_callback;
-                    std::optional<OrderedOpLogWriterTerminalState>
-                        terminal_state;
-                    std::unique_lock<std::mutex> lock(impl_->mutex);
-                    if (impl_->stop_requested) {
-                        return;
+                    std::optional<ErrorCode> timeout_error;
+                    {
+                        std::lock_guard<std::mutex> lock(impl_->mutex);
+                        if (impl_->stop_requested) {
+                            return;
+                        }
+                        if (retry_deadline.has_value() &&
+                            std::chrono::steady_clock::now() >=
+                                *retry_deadline) {
+                            timeout_error = impl_->last_error;
+                        }
                     }
-                    if (retry_deadline.has_value() &&
-                        std::chrono::steady_clock::now() >= *retry_deadline) {
-                        if (impl_->LatchTerminalState(
-                                impl_->last_error,
-                                OrderedOpLogWriterTerminalReason::
-                                    kRetryTimeout)) {
-                            terminal_callback = impl_->terminal_callback;
-                            terminal_state = impl_->terminal_state;
-                        }
-                        lock.unlock();
-                        if (terminal_callback) {
-                            terminal_callback(*terminal_state);
-                        }
+                    if (timeout_error.has_value()) {
+                        impl_->EnterTerminalState(
+                            *timeout_error,
+                            OrderedOpLogWriterTerminalReason::kRetryTimeout);
                         return;
                     }
                 }
@@ -426,27 +429,18 @@ void OrderedOpLogWriter::Start() {
                     break;
                 }
 
-                TerminalCallback terminal_callback;
-                std::optional<OrderedOpLogWriterTerminalState> terminal_state;
+                if (!IsRetryableWriteError(err)) {
+                    const auto reason =
+                        err == ErrorCode::ETCD_TRANSACTION_FAIL
+                            ? OrderedOpLogWriterTerminalReason::kFenced
+                            : OrderedOpLogWriterTerminalReason::
+                                  kNonRetryableWriteError;
+                    impl_->EnterTerminalState(err, reason);
+                    return;
+                }
                 {
                     std::unique_lock<std::mutex> lock(impl_->mutex);
                     if (impl_->stop_requested) {
-                        return;
-                    }
-                    if (!IsRetryableWriteError(err)) {
-                        const auto reason =
-                            err == ErrorCode::ETCD_TRANSACTION_FAIL
-                                ? OrderedOpLogWriterTerminalReason::kFenced
-                                : OrderedOpLogWriterTerminalReason::
-                                      kNonRetryableWriteError;
-                        if (impl_->LatchTerminalState(err, reason)) {
-                            terminal_callback = impl_->terminal_callback;
-                            terminal_state = impl_->terminal_state;
-                        }
-                        lock.unlock();
-                        if (terminal_callback) {
-                            terminal_callback(*terminal_state);
-                        }
                         return;
                     }
 #ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
