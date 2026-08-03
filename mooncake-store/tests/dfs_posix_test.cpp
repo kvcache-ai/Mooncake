@@ -8,6 +8,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -602,10 +603,12 @@ class DfsBackendTest : public ::testing::Test {
     std::shared_ptr<DfsDescriptorCache> desc_cache_;
 };
 
-class ControlledWritePosixFsAdapter : public PosixFsAdapter {
+class ControlledPosixFsAdapter : public PosixFsAdapter {
    public:
     void FailWriteCall(int call) { fail_write_call_ = call; }
     void ShortWriteCall(int call) { short_write_call_ = call; }
+    int WriteCallCount() const { return write_calls_.load(); }
+    int ReadCallCount() const { return read_calls_.load(); }
 
     tl::expected<size_t, ErrorCode> WriteAt(int fd, const iovec* iov,
                                             int iovcnt,
@@ -624,8 +627,15 @@ class ControlledWritePosixFsAdapter : public PosixFsAdapter {
         return PosixFsAdapter::WriteAt(fd, iov, iovcnt, offset);
     }
 
+    tl::expected<size_t, ErrorCode> ReadAt(int fd, iovec* iov, int iovcnt,
+                                           int64_t offset) override {
+        ++read_calls_;
+        return PosixFsAdapter::ReadAt(fd, iov, iovcnt, offset);
+    }
+
    private:
     std::atomic<int> write_calls_{0};
+    std::atomic<int> read_calls_{0};
     int fail_write_call_ = -1;
     int short_write_call_ = -1;
 };
@@ -675,7 +685,7 @@ TEST_F(DfsBackendTest, BatchWritePreservesPerKeyWriteErrors) {
     distributed_config.shard_capacity = 64 * 1024 * 1024;
     distributed_config.alignment = 4096;
 
-    auto adapter = std::make_unique<ControlledWritePosixFsAdapter>();
+    auto adapter = std::make_unique<ControlledPosixFsAdapter>();
     auto* controlled_adapter = adapter.get();
     auto backend = std::make_unique<DistributedStorageBackend>(
         file_config, distributed_config, std::move(adapter));
@@ -703,6 +713,70 @@ TEST_F(DfsBackendTest, BatchWritePreservesPerKeyWriteErrors) {
     EXPECT_EQ(results[1].error(), ErrorCode::FILE_WRITE_FAIL);
     ASSERT_FALSE(results[2].has_value());
     EXPECT_EQ(results[2].error(), ErrorCode::FILE_WRITE_FAIL);
+}
+
+TEST_F(DfsBackendTest, RejectsInvalidDescriptorRangesBeforeIo) {
+    constexpr uint64_t kShardCapacity = 64 * 1024 * 1024;
+
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = tmp_->path();
+
+    DistributedStorageConfig distributed_config;
+    distributed_config.fsdir = tmp_->path();
+    distributed_config.fs_adapter_type = "posix";
+    distributed_config.shard_count = 4;
+    distributed_config.shard_capacity = kShardCapacity;
+    distributed_config.alignment = 4096;
+
+    auto adapter = std::make_unique<ControlledPosixFsAdapter>();
+    auto* controlled_adapter = adapter.get();
+    auto backend = std::make_unique<DistributedStorageBackend>(
+        file_config, distributed_config, std::move(adapter));
+    auto desc_cache = std::make_shared<DfsDescriptorCache>();
+    backend->SetDescriptorCache(desc_cache);
+    ASSERT_TRUE(backend->Init().has_value());
+
+    AlignedBuffer small_buf(4096);
+    AlignedBuffer large_buf(8192);
+    ASSERT_NE(small_buf.data(), nullptr);
+    ASSERT_NE(large_buf.data(), nullptr);
+
+    std::vector<DfsWriteRequest> requests{
+        {"past_capacity",
+         {ShardPath(0), kShardCapacity, 4096, 4096, 0},
+         {{small_buf.data(), small_buf.size()}}},
+        {"object_exceeds_allocation",
+         {ShardPath(0), 0, 8192, 4096, 0},
+         {{large_buf.data(), large_buf.size()}}},
+        {"overflow",
+         {ShardPath(0), std::numeric_limits<uint64_t>::max() - 4095, 4096, 4096,
+          0},
+         {{small_buf.data(), small_buf.size()}}},
+        {"unaligned_offset",
+         {ShardPath(0), 1, 4096, 4096, 0},
+         {{small_buf.data(), small_buf.size()}}},
+    };
+
+    auto write_results = backend->BatchWrite(requests);
+    ASSERT_EQ(write_results.size(), requests.size());
+    for (const auto& result : write_results) {
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    }
+    EXPECT_EQ(controlled_adapter->WriteCallCount(), 0);
+
+    AlignedBuffer read_buf(8192);
+    ASSERT_NE(read_buf.data(), nullptr);
+    for (const auto& request : requests) {
+        desc_cache->Put(request.key, request.descriptor);
+        std::unordered_map<std::string, Slice> load_batch;
+        load_batch[request.key] = {read_buf.data(), read_buf.size()};
+        auto result = backend->BatchLoad(load_batch);
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
+    }
+    EXPECT_EQ(controlled_adapter->ReadCallCount(), 0);
 }
 
 TEST_F(DfsBackendTest, BatchOffloadAndBatchLoad) {

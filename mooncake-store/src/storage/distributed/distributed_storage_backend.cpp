@@ -10,6 +10,29 @@
 
 namespace mooncake {
 
+namespace {
+
+bool IsDfsDescriptorRangeValid(const DistributedFSDescriptor& desc,
+                               const DistributedStorageConfig& config) {
+    if (config.alignment == 0 || desc.object_size == 0 ||
+        desc.aligned_size < desc.object_size ||
+        desc.offset % config.alignment != 0 ||
+        desc.aligned_size % config.alignment != 0) {
+        return false;
+    }
+    if (desc.offset > config.shard_capacity ||
+        desc.aligned_size > config.shard_capacity - desc.offset) {
+        return false;
+    }
+
+    constexpr uint64_t kMaxFileOffset =
+        static_cast<uint64_t>(std::numeric_limits<int64_t>::max());
+    return desc.offset <= kMaxFileOffset &&
+           desc.aligned_size <= kMaxFileOffset - desc.offset;
+}
+
+}  // namespace
+
 bool DistributedStorageConfig::Validate() const {
     if (fsdir.empty()) {
         LOG(ERROR) << "DistributedStorageConfig: fsdir is empty";
@@ -223,6 +246,17 @@ DistributedStorageBackend::BatchWrite(
                 tl::make_unexpected(ErrorCode::INVALID_PARAMS));
             continue;
         }
+        if (!IsDfsDescriptorRangeValid(desc, distributed_config_)) {
+            LOG(ERROR) << "Invalid DFS descriptor range for key " << request.key
+                       << ", offset=" << desc.offset
+                       << ", object_size=" << desc.object_size
+                       << ", aligned_size=" << desc.aligned_size
+                       << ", shard_capacity="
+                       << distributed_config_.shard_capacity;
+            results.emplace_back(
+                tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+            continue;
+        }
 
         std::vector<iovec> iovs;
         iovs.reserve(request.slices.size());
@@ -288,6 +322,15 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::BatchLoad(
             LOG(ERROR) << "DFS path mismatch for key " << key
                        << ", descriptor=" << desc->file_path << ", configured="
                        << shard_files_[desc->shard_idx]->path;
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if (!IsDfsDescriptorRangeValid(*desc, distributed_config_)) {
+            LOG(ERROR) << "Invalid DFS descriptor range for key " << key
+                       << ", offset=" << desc->offset
+                       << ", object_size=" << desc->object_size
+                       << ", aligned_size=" << desc->aligned_size
+                       << ", shard_capacity="
+                       << distributed_config_.shard_capacity;
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
         if (slice.size < desc->object_size || !slice.ptr) {
