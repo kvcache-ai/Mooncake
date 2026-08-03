@@ -808,6 +808,20 @@ int EfaContext::submitPostSend(
             continue;
         }
 
+        // device_id comes from the peer-supplied topology, whose HCA list is
+        // independent of the peer 'devices' array, and selectDevice() bounds it
+        // against rkey only. decodeSegmentDesc() now rejects a descriptor whose
+        // key count and device count disagree; bound the value used to index
+        // devices[] locally as well.
+        if (static_cast<size_t>(device_id) >=
+            peer_segment_desc->devices.size()) {
+            LOG(ERROR) << "Peer device index out of range for target "
+                       << slice->target_id << ": device_id=" << device_id
+                       << " devices=" << peer_segment_desc->devices.size();
+            slice->markFailed();
+            continue;
+        }
+
         slice->rdma.dest_rkey =
             peer_segment_desc->buffers[buffer_id].rkey[device_id];
 

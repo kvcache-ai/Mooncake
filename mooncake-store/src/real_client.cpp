@@ -11,8 +11,6 @@
 #include <dlfcn.h>  // for dlsym (Python detection)
 #include <cstdlib>  // for atexit
 #include <algorithm>
-#include <cctype>
-#include <charconv>
 #include <functional>
 #include <limits>
 #include <optional>
@@ -25,6 +23,9 @@
 #include "common.h"
 #include "config.h"
 #include "store_rpc_client_io_context.h"
+#include "bool_parser.h"
+#include "environ.h"
+#include "integer_parser.h"
 #include "mutex.h"
 #include "types.h"
 #include "utils.h"
@@ -341,8 +342,11 @@ using mooncake::SelectBestReplica;
 // Client::Get / Client::BatchGet (which internally call
 // FindFirstCompleteReplica) cannot pick a different replica type.
 inline QueryResult FilterQueryResult(const QueryResult &qr,
-                                     const Replica::Descriptor &replica) {
-    return QueryResult({replica}, qr.lease_timeout);
+                                     const Replica::Descriptor &replica,
+                                     bool include_object_checksum = true) {
+    return QueryResult(
+        {replica}, qr.lease_timeout,
+        include_object_checksum ? qr.object_checksum : std::nullopt);
 }
 }  // namespace
 
@@ -701,9 +705,11 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     } else {
         // Auto port binding with retry on metadata registration failure
         const int kMaxRetries =
-            GetEnvOr<int>("MC_STORE_CLIENT_SETUP_RETRIES", 20);
-        const int rawMinPort = GetEnvOr<int>("MC_STORE_CLIENT_MIN_PORT", 12300);
-        const int rawMaxPort = GetEnvOr<int>("MC_STORE_CLIENT_MAX_PORT", 14300);
+            Environ::GetInt("MC_STORE_CLIENT_SETUP_RETRIES", 20);
+        const int rawMinPort =
+            Environ::GetInt("MC_STORE_CLIENT_MIN_PORT", 12300);
+        const int rawMaxPort =
+            Environ::GetInt("MC_STORE_CLIENT_MAX_PORT", 14300);
         constexpr int kDefaultMinPort = 12300;
         constexpr int kDefaultMaxPort = 14300;
         auto [minPort, maxPort] = ValidatePortRange(
@@ -794,10 +800,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         size_t cxl_dev_size = 0;
         const char *env = std::getenv("MC_CXL_DEV_SIZE");
         if (env) {
-            char *end = nullptr;
-            unsigned long long val = strtoull(env, &end, 10);
-            if (end != env && *end == '\0')
-                cxl_dev_size = static_cast<size_t>(val);
+            cxl_dev_size =
+                TryParseInteger<size_t>(env, {.trim_ascii_whitespace = true,
+                                              .allow_leading_plus = true})
+                    .value_or(0);
         } else {
             LOG(FATAL) << "MC_CXL_DEV_SIZE not set";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -1043,15 +1049,6 @@ inline std::optional<size_t> get_config_size(const ConfigDict &config,
     return static_cast<size_t>(parsed_size_opt.value());
 }
 
-inline std::string trim(const std::string &value) {
-    auto start = value.find_first_not_of(" \t\r\n");
-    if (start == std::string::npos) {
-        return "";
-    }
-    auto end = value.find_last_not_of(" \t\r\n");
-    return value.substr(start, end - start + 1);
-}
-
 inline bool get_config_bool(const ConfigDict &config, const std::string &key,
                             bool default_value) {
     auto it = config.find(key);
@@ -1059,16 +1056,9 @@ inline bool get_config_bool(const ConfigDict &config, const std::string &key,
         return default_value;
     }
 
-    std::string value = trim(it->second);
-    std::transform(value.begin(), value.end(), value.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
-    if (value == "true" || value == "1" || value == "yes" || value == "on" ||
-        value == "enable") {
-        return true;
-    }
-    if (value == "false" || value == "0" || value == "no" || value == "off" ||
-        value == "disable") {
-        return false;
+    const auto parsed = TryParseBool(it->second);
+    if (parsed.has_value()) {
+        return *parsed;
     }
 
     LOG(WARNING) << "Invalid boolean value for config key '" << key
@@ -1084,17 +1074,14 @@ inline std::optional<int> get_config_int(const ConfigDict &config,
         return default_value;
     }
 
-    std::string value = trim(it->second);
-    int parsed_value = 0;
-    const char *begin = value.data();
-    const char *end = begin + value.size();
-    auto [ptr, ec] = std::from_chars(begin, end, parsed_value);
-    if (ec != std::errc{} || ptr != end) {
+    const auto parsed_value =
+        TryParseInteger<int>(it->second, {.trim_ascii_whitespace = true});
+    if (!parsed_value.has_value()) {
         LOG(ERROR) << "Invalid integer value for config key '" << key
                    << "': " << it->second;
         return std::nullopt;
     }
-    return parsed_value;
+    return *parsed_value;
 }
 }  // namespace
 
@@ -2755,6 +2742,14 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
                        << "': " << toString(read_result.error());
             return nullptr;
         }
+        auto checksum_result =
+            client_->VerifyObjectChecksum(key, objects.at(key), total_length,
+                                          query_result.value().object_checksum);
+        if (!checksum_result) {
+            LOG(ERROR) << "SSD checksum verification failed for key '" << key
+                       << "': " << toString(checksum_result.error());
+            return nullptr;
+        }
         return buffer_handle;
     }
 
@@ -2869,6 +2864,40 @@ tl::expected<void, ErrorCode> RealClient::release_buffer_dummy(
 
     it->second.active_handles.erase(dummy_addr);
     return {};
+}
+
+tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>
+RealClient::allocate_buffer_dummy(size_t size, const UUID &client_id) {
+    std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto &context = it->second;
+    if (!context.client_buffer_allocator) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto alloc_result = context.client_buffer_allocator->allocate(size);
+    if (!alloc_result) {
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+
+    auto handle = std::make_shared<BufferHandle>(std::move(*alloc_result));
+    const uint64_t real_addr = reinterpret_cast<uint64_t>(handle->ptr());
+    const size_t allocated_size = handle->size();
+    for (const auto &shm : context.mapped_shms) {
+        const uint64_t shm_start = reinterpret_cast<uint64_t>(shm.shm_buffer);
+        const uint64_t shm_end = shm_start + shm.shm_size;
+        if (real_addr >= shm_start && allocated_size <= shm_end - real_addr) {
+            const uint64_t dummy_addr = real_addr - shm.shm_addr_offset;
+            context.active_handles[dummy_addr] = std::move(handle);
+            return std::make_tuple(dummy_addr, allocated_size);
+        }
+    }
+
+    return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
 }
 
 std::vector<tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>>
@@ -3162,6 +3191,16 @@ RealClient::batch_get_buffer_internal(
                 if (idx_it == disk_key_to_idx.end()) continue;
                 auto &op = disk_ops[idx_it->second];
                 if (read_result) {
+                    auto checksum_result = client_->VerifyObjectChecksum(
+                        key, slices, op.total_size,
+                        op.query_result.object_checksum);
+                    if (!checksum_result) {
+                        LOG(ERROR)
+                            << "SSD checksum verification failed for key '"
+                            << key
+                            << "': " << toString(checksum_result.error());
+                        continue;
+                    }
                     final_results[op.original_index] =
                         std::make_shared<BufferHandle>(
                             std::move(*op.buffer_handle));
@@ -3282,7 +3321,7 @@ RealClient::resolve_ranged_read_metadata(const std::string &key) {
 tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
     const std::string &key, void *buffer, size_t dst_offset, size_t src_offset,
     size_t size, const RangedReadMetadata &metadata,
-    bool size_is_buffer_capacity) {
+    bool size_is_buffer_capacity, bool verify_checksum) {
     const auto &query_result = metadata.query_result;
     const auto &replica = metadata.replica;
     const uint64_t total_size = metadata.total_size;
@@ -3314,6 +3353,14 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             auto result =
                 batch_get_into_offload_object_internal(endpoint, objects);
             if (!result) return tl::unexpected(result.error());
+            if (verify_checksum) {
+                auto checksum_result = client_->VerifyObjectChecksum(
+                    key, objects.at(key), total_size,
+                    query_result.object_checksum);
+                if (!checksum_result) {
+                    return tl::unexpected(checksum_result.error());
+                }
+            }
             return static_cast<int64_t>(total_size);
         }
 
@@ -3329,7 +3376,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             BufferHandle tmp_handle(std::move(*alloc_result));
             std::vector<mooncake::Slice> tmp_slices;
             allocateSlices(tmp_slices, replica, tmp_handle.ptr());
-            auto filtered_qr = FilterQueryResult(query_result, replica);
+            auto filtered_qr =
+                FilterQueryResult(query_result, replica, verify_checksum);
             auto get_result = client_->Get(key, filtered_qr, tmp_slices);
             if (!get_result) {
                 LOG(ERROR) << "DISK Get failed for key: " << key
@@ -3364,7 +3412,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             std::vector<mooncake::Slice> tmp_slices;
             allocateSlices(tmp_slices, replica, tmp_handle.ptr());
 
-            auto filtered_qr = FilterQueryResult(query_result, replica);
+            auto filtered_qr =
+                FilterQueryResult(query_result, replica, verify_checksum);
             auto get_result = client_->Get(key, filtered_qr, tmp_slices);
             if (!get_result) {
                 LOG(ERROR) << "Get failed for key: " << key
@@ -3383,7 +3432,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         std::vector<mooncake::Slice> slices;
         allocateSlices(slices, replica, dst);
 
-        auto filtered_qr = FilterQueryResult(query_result, replica);
+        auto filtered_qr =
+            FilterQueryResult(query_result, replica, verify_checksum);
         auto get_result = client_->Get(key, filtered_qr, slices);
         if (!get_result) {
             LOG(ERROR) << "Get failed for key: " << key
@@ -3447,7 +3497,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             [&](void *tmp_buf) -> tl::expected<void, ErrorCode> {
                 std::vector<mooncake::Slice> tmp_slices;
                 allocateSlices(tmp_slices, replica, tmp_buf);
-                auto filtered_qr = FilterQueryResult(query_result, replica);
+                auto filtered_qr =
+                    FilterQueryResult(query_result, replica, false);
                 auto get_result = client_->Get(key, filtered_qr, tmp_slices);
                 if (!get_result) {
                     LOG(ERROR)
@@ -3508,7 +3559,7 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
 
 tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
     const std::string &key, void *buffer, size_t dst_offset, size_t src_offset,
-    size_t size, bool size_is_buffer_capacity) {
+    size_t size, bool size_is_buffer_capacity, bool verify_checksum) {
     auto metadata_result = resolve_ranged_read_metadata(key);
     if (!metadata_result) {
         if ((metadata_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
@@ -3520,15 +3571,15 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
     }
 
     return execute_ranged_read(key, buffer, dst_offset, src_offset, size,
-                               metadata_result.value(),
-                               size_is_buffer_capacity);
+                               metadata_result.value(), size_is_buffer_capacity,
+                               verify_checksum);
 }
 
 int64_t RealClient::get_into(const std::string &key, void *buffer,
                              size_t size) {
     auto result = execute_timed_operation<tl::expected<int64_t, ErrorCode>>(
         [&]() {
-            return get_into_range_internal(key, buffer, 0, 0, size, true);
+            return get_into_range_internal(key, buffer, 0, 0, size, true, true);
         },
         [](const auto &ret) { return ret.has_value(); },
         [&](uint64_t latency_us, const auto &ret) {
@@ -3678,7 +3729,7 @@ RealClient::get_into_ranges_internal(
                 prepared.results[i][j][k] = execute_ranged_read(
                     all_keys[i][j], buffers[i], all_dst_offsets[i][j][k],
                     all_src_offsets[i][j][k], all_sizes[i][j][k],
-                    metadata_result.value());
+                    metadata_result.value(), false, false);
             }
         }
     }
@@ -4488,7 +4539,8 @@ RealClient::batch_get_into_multi_buffers_dummy_helper(
 
 tl::expected<int64_t, ErrorCode> RealClient::get_into_range_shm_helper(
     const std::string &key, uint64_t dummy_buffer, size_t dst_offset,
-    size_t src_offset, size_t size, const UUID &client_id) {
+    size_t src_offset, size_t size, bool size_is_buffer_capacity,
+    bool verify_checksum, const UUID &client_id) {
     std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
@@ -4507,7 +4559,8 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_shm_helper(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    return get_into_range_internal(key, real_buffer, 0, src_offset, size);
+    return get_into_range_internal(key, real_buffer, 0, src_offset, size,
+                                   size_is_buffer_capacity, verify_checksum);
 }
 
 std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
@@ -4858,6 +4911,18 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                 results[valid_local_disk_operations.at(offload_object_it.first)
                             .original_index] =
                     tl::make_unexpected(batch_get_offload_result.error());
+            }
+            continue;
+        }
+        for (const auto &offload_object_it : offload_objects_it.second) {
+            const auto &op =
+                valid_local_disk_operations.at(offload_object_it.first);
+            auto checksum_result = client_->VerifyObjectChecksum(
+                offload_object_it.first, offload_object_it.second,
+                op.total_size, op.query_result.object_checksum);
+            if (!checksum_result) {
+                results[op.original_index] =
+                    tl::make_unexpected(checksum_result.error());
             }
         }
     }
@@ -5273,6 +5338,19 @@ RealClient::batch_get_into_multi_buffers_internal(
                                    << "': " << toString(read_result.error());
                         results[disk_it->second.original_index] =
                             tl::make_unexpected(read_result.error());
+                    }
+                    continue;
+                }
+                for (auto &[key, slices] : objects) {
+                    auto disk_it = valid_local_disk_ops.find(key);
+                    if (disk_it == valid_local_disk_ops.end()) continue;
+                    auto &op = disk_it->second;
+                    auto checksum_result = client_->VerifyObjectChecksum(
+                        key, slices, op.total_size,
+                        op.query_result.object_checksum);
+                    if (!checksum_result) {
+                        results[op.original_index] =
+                            tl::make_unexpected(checksum_result.error());
                     }
                 }
             }

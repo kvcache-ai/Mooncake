@@ -89,6 +89,11 @@ struct GlobalConfig {
     bool log_rdma_slice_affinity = false;
     bool track_rdma_posted_slices = false;
     int parallel_reg_mr = -1;
+    // Cap on concurrent buffer registrations in registerLocalMemoryBatch().
+    // 0 (default) = unbounded, one thread per buffer. Set via
+    // MC_MAX_CONCURRENT_REG_MR; the best value is platform-specific, see the
+    // measured tables in efa_transport.cpp before choosing one.
+    size_t max_concurrent_reg_mr = 0;
     size_t eic_max_block_size = 64UL * 1024 * 1024;
     EndpointStoreType endpoint_store_type = EndpointStoreType::SIEVE;
     int ib_traffic_class = -1;
@@ -107,7 +112,7 @@ struct GlobalConfig {
     // mode the setting is a no-op. Requires USE_MLX5DV.
     bool mlx5_qp_lag_port_balance = false;
     // ib_pci_relaxed_ordering_mode: 0: off, 1: on if supported, 2: auto
-    int ib_pci_relaxed_ordering_mode = 0;
+    int ib_pci_relaxed_ordering_mode = 1;
     bool ascend_use_fabric_mem = false;
     bool ascend_agent_mode = false;
     bool sunrise_use_device_mem = false;

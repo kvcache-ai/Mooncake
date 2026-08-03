@@ -40,7 +40,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <memory>
+#include <vector>
 
+#if defined(USE_CUDA) || defined(USE_HIP)
+#include "cuda_alike.h"
+#endif
+#include "config.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
 
@@ -64,11 +69,12 @@ class RDMALargeMrTest : public ::testing::Test {
 
    protected:
     void SetUp() override {
-        // Force a small device max_mr_size cap (config caps to min(env,
-        // device)).
-        setenv("MC_MAX_MR_SIZE", std::to_string(kMaxMrSize).c_str(), 1);
         engine = std::make_unique<TransferEngine>(true);
-        engine->init(FLAGS_metadata_server, "test_node_large_mr");
+        const char *env_meta = std::getenv("MC_METADATA_SERVER");
+        std::string metadata_server = env_meta ? env_meta : "P2PHANDSHAKE";
+        ASSERT_EQ(engine->init(metadata_server, "test_node_large_mr"), 0);
+        ASSERT_EQ(globalConfig().max_mr_size, kMaxMrSize)
+            << "Launch this test process with MC_MAX_MR_SIZE=" << kMaxMrSize;
         addr = numa_alloc_onnode(kBufferSize, 0);
         ASSERT_NE(addr, nullptr);
         // Register a buffer LARGER than max_mr_size. Pre-fix this silently
@@ -136,9 +142,10 @@ TEST_F(RDMALargeMrTest, WriteStraddlesChunkBoundary) {
     const size_t kDataLength = 1ull << 20;  // 1 MiB
     // Center the target on the first chunk boundary: half in chunk 0, half in
     // chunk 1.
-    const size_t kTargetOffset = kMaxMrSize - kDataLength / 2;
+    const size_t kTargetOffset = kMaxMrSize - kDataLength / 2 + 1;
     ASSERT_LT(kTargetOffset, kMaxMrSize);                // starts in chunk 0
     ASSERT_GT(kTargetOffset + kDataLength, kMaxMrSize);  // ends in chunk 1
+    ASSERT_NE(kTargetOffset % globalConfig().slice_size, 0u);
 
     // Distinct source bytes, and poison the destination so a dropped/partial
     // write past the seam is caught by the memcmp below.
@@ -173,6 +180,39 @@ TEST_F(RDMALargeMrTest, WriteStraddlesChunkBoundary) {
         << "RDMA WRITE straddling a chunk boundary failed -- a cross-chunk "
            "transfer was not split across the two chunks' MRs (issue #2017).";
     ASSERT_EQ(0, memcmp(addr, (char *)addr + kTargetOffset, kDataLength));
+}
+
+// Verify RDMA WRITE when local source buffer range straddles an MR boundary.
+TEST_F(RDMALargeMrTest, WriteWithSourceStraddlingChunkBoundary) {
+    const size_t kDataLength = 1ull << 20;
+    const size_t kSourceOffset = kMaxMrSize - kDataLength / 2 + 1;
+    const size_t kTargetOffset = 2 * kMaxMrSize;
+    ASSERT_NE(kSourceOffset % globalConfig().slice_size, 0u);
+
+    for (size_t i = 0; i < kDataLength; ++i)
+        *((char *)addr + kSourceOffset + i) = (char)('A' + (lrand48() % 26));
+    memset((char *)addr + kTargetOffset, 0, kDataLength);
+
+    auto batch_id = engine->allocateBatchID(1);
+    TransferRequest entry;
+    entry.opcode = TransferRequest::WRITE;
+    entry.length = kDataLength;
+    entry.source = (uint8_t *)addr + kSourceOffset;
+    entry.target_id = LOCAL_SEGMENT_ID;
+    entry.target_offset = (uint64_t)addr + kTargetOffset;
+
+    Status s = engine->submitTransfer(batch_id, {entry});
+    ASSERT_TRUE(s.ok());
+
+    TransferStatus status;
+    while (true) {
+        ASSERT_EQ(engine->getTransferStatus(batch_id, 0, status), Status::OK());
+        if (status.s != TransferStatusEnum::WAITING) break;
+    }
+    ASSERT_EQ(engine->freeBatchID(batch_id), Status::OK());
+    ASSERT_EQ(status.s, TransferStatusEnum::COMPLETED);
+    ASSERT_EQ(0, memcmp((char *)addr + kSourceOffset,
+                        (char *)addr + kTargetOffset, kDataLength));
 }
 
 }  // namespace mooncake

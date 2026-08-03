@@ -20,12 +20,15 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
 #include <fstream>
+#include <functional>
 #include <future>
+#include <limits>
 #include <set>
 #include <thread>
 
@@ -471,19 +474,21 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
                                                                   reg_start)
                 .count();
 
+        // Per-chunk detail is trace-only: a batch registration emits one of
+        // these per chunk, which is ~1450 lines at Kimi-K3 startup. Note that
+        // reg_duration_ms is the wall time this thread spent in the call, so
+        // when several buffers register concurrently it includes time waiting
+        // on the provider's locks, not just this chunk's own work -- compare it
+        // against the batch total logged by registerLocalMemoryBatch().
         if (globalConfig().trace) {
-            LOG(INFO) << "EFA registerMemoryRegion: chunk " << ci
-                      << ", addr=" << chunk_addr << ", length=" << chunk_len
+            LOG(INFO) << "EFA registerMemoryRegion: chunk " << ci << "/"
+                      << chunks.size() << ", addr=" << chunk_addr
+                      << ", length=" << chunk_len
                       << ", nics=" << assigned_nics.size() << "/"
                       << context_list_.size()
                       << ", parallel=" << (use_parallel_reg ? "true" : "false")
                       << ", duration=" << reg_duration_ms << "ms";
         }
-
-        LOG(WARNING) << "Chunk " << ci << "/" << chunks.size()
-                     << " registered on " << assigned_nics.size() << " NICs"
-                     << ", addr=" << chunk_addr << ", length=" << chunk_len
-                     << ", duration=" << reg_duration_ms << "ms";
 
         // Collect keys: assigned NICs have valid keys, others get 0
         BufferDesc buffer_desc;
@@ -624,28 +629,105 @@ int EfaTransport::allocateLocalSegmentID() {
     return 0;
 }
 
+// Optional concurrency cap for the batch register/unregister fan-out below, set
+// via MC_MAX_CONCURRENT_REG_MR. Unset (0) means unbounded -- one thread per
+// buffer, which is what these entry points have always done.
+//
+// The cap is PER PROCESS, and registration is CPU-bound page-pinning, so what
+// matters is cap x processes against the core count. Measured on p5.48xlarge
+// (192 cores) replaying Kimi-K3's KV registration as SGLang issues it -- one
+// TransferEngine per TP rank, 182 GPU buffers of 2.5 KB to 391 MB each, slowest
+// rank -- the optimum tracks the cores and not the cap:
+//
+//   8 ranks, 192 cores -> cap 16 (99.8 s);  cap 64 is 1.8x slower
+//   4 ranks, 192 cores -> cap 32 (89.2 s);  same 128 threads as above
+//   8 ranks,  64 cores -> cap  8 (121.3 s); 64 threads, tracks the budget
+//
+// So a good value is roughly cores/processes. Oversubscribing costs more than
+// undersubscribing. This cannot be a built-in default because a single engine
+// does not know how many peer processes share the node; picking one from the
+// core count alone would oversubscribe by exactly the rank count.
+//
+// Input order matters as much as the cap: at cap 16 the same batch takes 43 s
+// in SGLang's pool order but 95-98 s largest-first. Unbounded ignores order
+// (99-128 s) since nothing queues. Largest-first being worst is backwards from
+// longest-processing-time scheduling and is unexplained, so no sort is applied
+// here yet -- another reason the cap stays opt-in rather than a default.
+static size_t maxConcurrentRegMr() {
+    size_t configured = globalConfig().max_concurrent_reg_mr;
+    // 0 (unset) means unbounded, i.e. one thread per buffer as before.
+    return configured > 0 ? configured : std::numeric_limits<size_t>::max();
+}
+
+// Run `fn(i)` for i in [0, count) on at most maxConcurrentRegMr() threads,
+// returning the first non-zero result (all items are still attempted).
+//
+// With no cap set this spawns count-1 threads and runs the caller as a worker,
+// which reproduces what both batch entry points did before: one
+// std::async(std::launch::async) per buffer, which libstdc++ honours literally
+// as one fresh thread each. Kimi-K3 registers ~1450 KV buffers at once, so a
+// 192-core node peaks at ~1400 runnable threads inside fi_mr_regattr, and the
+// per-buffer duration this logs inflates with the queueing delay of the ones
+// ahead of it -- on 2x p6-b300 the median reached 106 s while the whole batch
+// took 138 s. That inflation is not by itself a reason to cap: a badly chosen
+// cap is slower still, see maxConcurrentRegMr().
+//
+// A plain thread pool rather than a semaphore over std::async, because if a cap
+// is set the point is to avoid the thread *creation*, not just to gate entry
+// into the provider -- admission control after the thread already exists would
+// leave that cost in place.
+static int runBoundedParallel(size_t count,
+                              const std::function<int(size_t)>& fn) {
+    if (count == 0) return 0;
+
+    size_t workers = std::min(count, maxConcurrentRegMr());
+    std::atomic<size_t> next{0};
+    std::atomic<int> first_error{0};
+
+    auto worker = [&]() {
+        for (size_t i = next.fetch_add(1); i < count; i = next.fetch_add(1)) {
+            int ret = fn(i);
+            if (ret) {
+                int expected = 0;
+                first_error.compare_exchange_strong(expected, ret);
+            }
+        }
+    };
+
+    std::vector<std::thread> threads;
+    threads.reserve(workers - 1);
+    for (size_t w = 1; w < workers; ++w) threads.emplace_back(worker);
+    worker();  // the caller is a worker too
+    for (auto& t : threads) t.join();
+
+    return first_error.load();
+}
+
 int EfaTransport::registerLocalMemoryBatch(
     const std::vector<EfaTransport::BufferEntry>& buffer_list,
     const std::string& location) {
-    std::vector<std::future<int>> results;
-    for (auto& buffer : buffer_list) {
-        results.emplace_back(
-            std::async(std::launch::async, [this, buffer, location]() -> int {
-                return registerLocalMemoryInternal(buffer.addr, buffer.length,
-                                                   location, true, false, true);
-            }));
-    }
+    auto start = std::chrono::steady_clock::now();
 
-    int first_error = 0;
-    for (size_t i = 0; i < buffer_list.size(); ++i) {
-        int ret = results[i].get();
+    int first_error = runBoundedParallel(buffer_list.size(), [&](size_t i) {
+        int ret = registerLocalMemoryInternal(buffer_list[i].addr,
+                                              buffer_list[i].length, location,
+                                              true, false, true);
         if (ret) {
             LOG(WARNING) << "EfaTransport: Failed to register memory: addr "
                          << buffer_list[i].addr << " length "
                          << buffer_list[i].length;
-            if (!first_error) first_error = ret;
         }
-    }
+        return ret;
+    });
+
+    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                       std::chrono::steady_clock::now() - start)
+                       .count();
+    LOG(INFO) << "EfaTransport: registered " << buffer_list.size()
+              << " buffers on "
+              << std::min(buffer_list.size(), maxConcurrentRegMr())
+              << " threads in " << elapsed << "ms";
+
     if (first_error) return first_error;
 
     return metadata_->updateLocalSegmentDesc();
@@ -653,23 +735,15 @@ int EfaTransport::registerLocalMemoryBatch(
 
 int EfaTransport::unregisterLocalMemoryBatch(
     const std::vector<void*>& addr_list) {
-    std::vector<std::future<int>> results;
-    for (auto& addr : addr_list) {
-        results.emplace_back(
-            std::async(std::launch::async, [this, addr]() -> int {
-                return unregisterLocalMemoryInternal(addr, false, true);
-            }));
-    }
-
-    int first_error = 0;
-    for (size_t i = 0; i < addr_list.size(); ++i) {
-        int ret = results[i].get();
+    int first_error = runBoundedParallel(addr_list.size(), [&](size_t i) {
+        int ret = unregisterLocalMemoryInternal(addr_list[i], false, true);
         if (ret) {
             LOG(WARNING) << "EfaTransport: Failed to unregister memory: addr "
                          << addr_list[i];
-            if (!first_error) first_error = ret;
         }
-    }
+        return ret;
+    });
+
     int metadata_ret = metadata_->updateLocalSegmentDesc();
     return first_error ? first_error : metadata_ret;
 }

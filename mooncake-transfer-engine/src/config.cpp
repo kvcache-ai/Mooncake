@@ -538,6 +538,25 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
+    const char* max_concurrent_reg_mr = std::getenv("MC_MAX_CONCURRENT_REG_MR");
+    if (max_concurrent_reg_mr) {
+        // Robust parse (not atol): a non-numeric typo must keep the default
+        // rather than silently resolve to 0, which here means "no cap" and so
+        // would read as a deliberate request for the old unbounded behavior.
+        // 0 is a valid explicit way to ask for no cap; negative and garbage are
+        // rejected.
+        size_t val = 0;
+        const char* end = max_concurrent_reg_mr + strlen(max_concurrent_reg_mr);
+        auto [ptr, ec] = std::from_chars(max_concurrent_reg_mr, end, val);
+        if (ec == std::errc() && ptr == end) {
+            config.max_concurrent_reg_mr = val;
+        } else {
+            LOG(WARNING) << "Invalid MC_MAX_CONCURRENT_REG_MR environment "
+                            "value: "
+                         << max_concurrent_reg_mr << ", keeping default";
+        }
+    }
+
     const char* endpoint_store_type_env = std::getenv("MC_ENDPOINT_STORE_TYPE");
     if (endpoint_store_type_env) {
         if (strcmp(endpoint_store_type_env, "FIFO") == 0) {
