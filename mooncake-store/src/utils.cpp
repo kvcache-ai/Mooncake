@@ -5,6 +5,10 @@
 #include "common.h"
 #include "ub_allocator.h"
 
+#include "ascii_string.h"
+#include "bool_parser.h"
+#include "environ.h"
+
 #include <Slab.h>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
@@ -14,8 +18,6 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
-#include <boost/algorithm/string.hpp>
-
 #include <algorithm>
 #include <atomic>
 #include <cerrno>
@@ -150,12 +152,13 @@ static std::atomic<uint64_t> g_arena_noop_free_count{0};
 
 static void initializeGlobalArena() {
     const std::string env_pool_size =
-        GetEnvStringOr("MC_MMAP_ARENA_POOL_SIZE", "");
+        Environ::GetString("MC_MMAP_ARENA_POOL_SIZE", "");
     // Allow env var to override the gflag (useful when loaded as .so from
     // Python). An explicit pool-size env var is also treated as an opt-in,
     // because pybind11 users cannot easily pass gflags.
-    const std::string env_disable = GetEnvStringOr("MC_DISABLE_MMAP_ARENA", "");
-    const std::optional<bool> disable_override = string_to_bool(env_disable);
+    const std::string env_disable =
+        Environ::GetString("MC_DISABLE_MMAP_ARENA", "");
+    const std::optional<bool> disable_override = TryParseBool(env_disable);
     if (!env_disable.empty() && !disable_override.has_value()) {
         LOG(WARNING) << "Ignoring invalid MC_DISABLE_MMAP_ARENA='"
                      << env_disable
@@ -553,41 +556,6 @@ void free_memory(const std::string &protocol, void *ptr, bool use_spdk_dma) {
     free(ptr);
 }
 
-std::string formatDeviceNames(const std::string &device_names) {
-    std::stringstream ss(device_names);
-    std::string item;
-    std::vector<std::string> tokens;
-    while (getline(ss, item, ',')) {
-        tokens.push_back(item);
-    }
-
-    std::string formatted;
-    for (size_t i = 0; i < tokens.size(); ++i) {
-        formatted += "\"" + tokens[i] + "\"";
-        if (i < tokens.size() - 1) {
-            formatted += ",";
-        }
-    }
-    return formatted;
-}
-
-std::vector<std::string> splitString(const std::string &str, char delimiter,
-                                     bool trim_spaces, bool keep_empty) {
-    std::vector<std::string> result;
-
-    boost::split(
-        result, str, boost::is_any_of(std::string(1, delimiter)),
-        keep_empty ? boost::token_compress_off : boost::token_compress_on);
-
-    if (trim_spaces) {
-        for (auto &token : result) {
-            boost::trim(token);
-        }
-    }
-
-    return result;
-}
-
 tl::expected<std::string, int> httpGet(const std::string &url) {
     coro_http::coro_http_client client;
     auto res = client.get(url);
@@ -713,35 +681,19 @@ int64_t time_gen() {
         .count();
 }
 
-std::string GetEnvStringOr(const char *name, const std::string &default_value) {
-    const char *env_val = std::getenv(name);
-    return env_val ? std::string(env_val) : default_value;
-}
-
 std::string ResolveMooncakeHostId(const std::string &local_hostname) {
-    auto trim = [](std::string value) {
-        const auto begin = value.find_first_not_of(" \t\r\n");
-        if (begin == std::string::npos) {
-            return std::string();
-        }
-        const auto end = value.find_last_not_of(" \t\r\n");
-        return value.substr(begin, end - begin + 1);
-    };
-
-    const std::string hostname = trim(local_hostname);
+    const std::string hostname(TrimAsciiWhitespace(local_hostname));
     const std::string host_id = (hostname == "::1" || hostname == "::")
                                     ? hostname
-                                    : trim(getHostNameWithoutPort(hostname));
+                                    : std::string(TrimAsciiWhitespace(
+                                          getHostNameWithoutPort(hostname)));
     if (host_id.empty()) {
         return "";
     }
 
-    std::string lower = host_id;
-    std::transform(lower.begin(), lower.end(), lower.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
-    if (lower == "localhost" || lower == "127.0.0.1" || lower == "0.0.0.0" ||
-        lower == "::1" || lower == "[::1]" || lower == "::" ||
-        lower == "[::]") {
+    if (AsciiCaseInsensitiveEquals(host_id, "localhost") ||
+        host_id == "127.0.0.1" || host_id == "0.0.0.0" || host_id == "::1" ||
+        host_id == "[::1]" || host_id == "::" || host_id == "[::]") {
         return "";
     }
     return host_id;

@@ -9,6 +9,8 @@
 #include <vector>
 
 #include "aligned_client_buffer.h"
+#include "bool_parser.h"
+#include "environ.h"
 #include "storage_backend.h"
 #include "client_metric.h"
 #include "utils.h"
@@ -41,13 +43,13 @@ double ParseEnvRatioOr(const std::string& raw_value, double default_value) {
 }
 
 double GetEnvRatioOr(const char* name, double default_value) {
-    const auto raw_value = GetEnvStringOr(name, "");
+    const auto raw_value = Environ::GetString(name, "");
     return ParseEnvRatioOr(raw_value, default_value);
 }
 
 double GetEnvRatioOr(const char* preferred_name, const char* fallback_name,
                      double default_value) {
-    const auto preferred_value = GetEnvStringOr(preferred_name, "");
+    const auto preferred_value = Environ::GetString(preferred_name, "");
     if (!preferred_value.empty()) {
         return ParseEnvRatioOr(preferred_value, default_value);
     }
@@ -56,16 +58,10 @@ double GetEnvRatioOr(const char* preferred_name, const char* fallback_name,
 
 bool GetEnvBoolStringOr(const char* name, bool default_value) {
     const auto raw_value =
-        GetEnvStringOr(name, default_value ? "true" : "false");
-    if (raw_value == "1" || raw_value == "true" || raw_value == "TRUE" ||
-        raw_value == "True") {
-        return true;
-    }
-    if (raw_value == "0" || raw_value == "false" || raw_value == "FALSE" ||
-        raw_value == "False") {
-        return false;
-    }
-    return default_value;
+        Environ::GetString(name, default_value ? "true" : "false");
+    return TryParseBool(raw_value, {.token_set = BoolTokenSet::kTrueFalse,
+                                    .trim_ascii_whitespace = false})
+        .value_or(default_value);
 }
 
 std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
@@ -90,8 +86,8 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
     FileStorageConfig config;
 
     auto storage_backend_descriptor =
-        GetEnvStringOr("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
-                       "bucket_storage_backend");
+        Environ::GetString("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                           "bucket_storage_backend");
 
     if (storage_backend_descriptor == "bucket_storage_backend") {
         config.storage_backend_type = StorageBackendType::kBucket;
@@ -106,32 +102,32 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
         LOG(ERROR) << "Unknown storage backend.";
     }
 
-    config.storage_filepath = GetEnvStringOr(
+    config.storage_filepath = Environ::GetString(
         "MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", config.storage_filepath);
 
-    config.local_buffer_size = GetEnvOr<int64_t>(
+    config.local_buffer_size = Environ::GetInt64(
         "MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", config.local_buffer_size);
 
-    config.scanmeta_iterator_keys_limit = GetEnvOr<int64_t>(
+    config.scanmeta_iterator_keys_limit = Environ::GetInt64(
         "MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT",
-        GetEnvOr<int64_t>("MOONCAKE_SCANMETA_ITERATOR_KEYS_LIMIT",
+        Environ::GetInt64("MOONCAKE_SCANMETA_ITERATOR_KEYS_LIMIT",
                           config.scanmeta_iterator_keys_limit));
 
-    config.total_keys_limit = GetEnvOr<int64_t>(
+    config.total_keys_limit = Environ::GetInt64(
         "MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT", config.total_keys_limit);
 
-    config.total_size_limit = GetEnvOr<int64_t>(
+    config.total_size_limit = Environ::GetInt64(
         "MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES", config.total_size_limit);
 
     config.heartbeat_interval_seconds =
-        GetEnvOr<uint32_t>("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS",
+        Environ::GetUInt32("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS",
                            config.heartbeat_interval_seconds);
     config.client_buffer_gc_interval_seconds =
-        GetEnvOr<uint32_t>("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS",
+        Environ::GetUInt32("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS",
                            config.client_buffer_gc_interval_seconds);
 
     config.client_buffer_gc_ttl_ms =
-        GetEnvOr<uint64_t>("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS",
+        Environ::GetUInt64("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS",
                            config.client_buffer_gc_ttl_ms);
 
     config.enable_disk_watermark_eviction =
@@ -146,10 +142,13 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
                       "MOONCAKE_DISK_EVICTION_LOW_WATERMARK_RATIO",
                       config.disk_eviction_low_watermark_ratio);
 
-    auto use_uring_str =
-        GetEnvStringOr("MOONCAKE_OFFLOAD_USE_URING",
-                       GetEnvStringOr("MOONCAKE_USE_URING", "false"));
-    config.use_uring = (use_uring_str == "true" || use_uring_str == "1");
+    const auto use_uring_str =
+        Environ::GetString("MOONCAKE_OFFLOAD_USE_URING",
+                           Environ::GetString("MOONCAKE_USE_URING", "false"));
+    config.use_uring =
+        TryParseBool(use_uring_str, {.token_set = BoolTokenSet::kTrueFalse,
+                                     .trim_ascii_whitespace = false})
+            .value_or(false);
 
     return config;
 }

@@ -6,7 +6,8 @@
 
 #include <glog/logging.h>
 
-#include "utils/type_util.h"
+#include "ascii_string.h"
+#include "integer_parser.h"
 
 #if defined(USE_CUDA)
 #include <cuda_runtime_api.h>
@@ -15,26 +16,18 @@
 namespace mooncake {
 namespace {
 
-std::string_view TrimAsciiWhitespace(std::string_view value) {
-    constexpr std::string_view whitespace = " \t\r\n\f\v";
-    size_t begin = value.find_first_not_of(whitespace);
-    if (begin == std::string_view::npos) return {};
-    size_t end = value.find_last_not_of(whitespace);
-    return value.substr(begin, end - begin + 1);
-}
-
 std::pair<bool, uint64_t> ParsePinnedMemoryConfig() {
     const char* raw_value = std::getenv("MC_STORE_PIN_MEMORY_MAX_BYTES");
     if (!raw_value || raw_value[0] == '\0') return {false, 0};
 
-    uint64_t limit = 0;
-    auto value = TrimAsciiWhitespace(raw_value);
-    if (value.empty() || !TypeUtil::ParseUint64(value, limit)) {
+    const auto limit =
+        TryParseInteger<uint64_t>(TrimAsciiWhitespace(raw_value));
+    if (!limit.has_value()) {
         LOG(WARNING) << "Invalid MC_STORE_PIN_MEMORY_MAX_BYTES='" << raw_value
                      << "', disabling Store segment pinning";
         return {false, 0};
     }
-    return {limit != 0, limit};
+    return {*limit != 0, *limit};
 }
 
 void LogPinSkip(const std::string& owner, const char* reason, size_t size) {
