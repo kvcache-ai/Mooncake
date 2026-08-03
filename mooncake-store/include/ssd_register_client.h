@@ -16,7 +16,7 @@ class NoFRegisterClient {
 
     int set_register(const std::string &nqn, size_t nsid,
                      const std::string &traddr, size_t trsvcid, uintptr_t base,
-                     size_t size, const std::string &master_server_addr);
+                     size_t size, uint32_t block_size, const std::string &master_server_addr);
 
     /**
      * @brief Unregister a NoF SSD segment by its te_endpoint
