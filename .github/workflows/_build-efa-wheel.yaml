@@ -8,7 +8,7 @@ on:
   workflow_call:
     inputs:
       variant:
-        # cuda | non-cuda
+        # cuda | cuda13 | non-cuda
         type: string
         required: true
       use-cuda:
@@ -29,6 +29,9 @@ on:
         # build_wheel.sh package variant, e.g. EFA_BUILD.
         type: string
         required: true
+      cuda-version:
+        type: string
+        default: '12.8.1'
       torch-cuda-arch-list:
         type: string
         default: ''
@@ -51,6 +54,7 @@ jobs:
       EFA_VARIANT: ${{ inputs.variant }}
       USE_CUDA: ${{ inputs.use-cuda }}
       VARIANT_FLAG: ${{ inputs.variant-flag }}
+      CUDA_VERSION: ${{ inputs.cuda-version }}
 
     steps:
       - name: Validate build inputs
@@ -61,7 +65,7 @@ jobs:
           esac
 
           case "$EFA_VARIANT:$USE_CUDA:$VARIANT_FLAG" in
-            cuda:true:EFA_BUILD|non-cuda:false:EFA_NON_CUDA_BUILD) ;;
+            cuda:true:EFA_BUILD|cuda13:true:EFA_CU13_BUILD|non-cuda:false:EFA_NON_CUDA_BUILD) ;;
             *) echo "::error::Inconsistent EFA variant inputs"; exit 1 ;;
           esac
         shell: bash
@@ -88,9 +92,9 @@ jobs:
 
       - name: Install CUDA Toolkit
         if: ${{ inputs.use-cuda }}
-        uses: Jimver/cuda-toolkit@v0.2.24
+        uses: Jimver/cuda-toolkit@v0.2.29
         with:
-          cuda: '12.8.1'
+          cuda: ${{ inputs.cuda-version }}
           method: 'network'
           sub-packages: '["nvcc", "nvrtc-dev"]'
           non-cuda-sub-packages: '["libcusparse-dev", "libcublas-dev", "libcusolver-dev"]'
@@ -194,6 +198,22 @@ jobs:
             exit 1
           fi
           echo "OK: libfabric/libefa correctly excluded (resolve to system EFA at runtime)"
+        shell: bash
+
+      - name: Verify CUDA runtime dependency
+        if: ${{ inputs.use-cuda }}
+        run: |
+          WHL=$(ls mooncake-wheel/dist-py${{ steps.python-tag.outputs.python_version_tag }}/*.whl | head -1)
+          inspect_dir=$(mktemp -d)
+          unzip -q "$WHL" mooncake/engine.so -d "$inspect_dir"
+          cuda_major=${CUDA_VERSION%%.*}
+          if ! readelf -d "$inspect_dir/mooncake/engine.so" | \
+              grep -Fq "Shared library: [libcudart.so.${cuda_major}]"; then
+            echo "::error::EFA wheel does not depend on libcudart.so.${cuda_major}"
+            readelf -d "$inspect_dir/mooncake/engine.so" | grep NEEDED
+            exit 1
+          fi
+          echo "OK: EFA wheel depends on libcudart.so.${cuda_major}"
         shell: bash
 
       - name: Upload Python wheel artifact
