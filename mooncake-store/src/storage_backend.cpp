@@ -26,6 +26,9 @@
 #include "mutex.h"
 #include "utils.h"
 #include "crc32c.h"
+#include "ascii_string.h"
+#include "bool_parser.h"
+#include "environ.h"
 
 #include <ylt/util/tl/expected.hpp>
 
@@ -78,11 +81,11 @@ bool BucketBackendConfig::Validate() const {
 FilePerKeyConfig FilePerKeyConfig::FromEnvironment() {
     FilePerKeyConfig config;
 
-    config.fsdir = GetEnvStringOr("MOONCAKE_OFFLOAD_FSDIR", config.fsdir);
+    config.fsdir = Environ::GetString("MOONCAKE_OFFLOAD_FSDIR", config.fsdir);
 
-    config.enable_eviction = GetEnvOr<bool>(
+    config.enable_eviction = Environ::GetBool(
         "MOONCAKE_OFFLOAD_ENABLE_EVICTION",
-        GetEnvOr<bool>("ENABLE_EVICTION", config.enable_eviction));
+        Environ::GetBool("ENABLE_EVICTION", config.enable_eviction));
 
     return config;
 }
@@ -90,20 +93,20 @@ FilePerKeyConfig FilePerKeyConfig::FromEnvironment() {
 BucketBackendConfig BucketBackendConfig::FromEnvironment() {
     BucketBackendConfig config;
 
-    config.bucket_keys_limit = GetEnvOr<int64_t>(
+    config.bucket_keys_limit = Environ::GetInt64(
         "MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", config.bucket_keys_limit);
 
-    config.bucket_size_limit = GetEnvOr<int64_t>(
+    config.bucket_size_limit = Environ::GetInt64(
         "MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES", config.bucket_size_limit);
 
     config.max_total_size =
-        GetEnvOr<int64_t>("MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE",
-                          GetEnvOr<int64_t>("MOONCAKE_BUCKET_MAX_TOTAL_SIZE",
+        Environ::GetInt64("MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE",
+                          Environ::GetInt64("MOONCAKE_BUCKET_MAX_TOTAL_SIZE",
                                             config.max_total_size));
 
-    const auto policy_str = GetEnvStringOr(
+    const auto policy_str = Environ::GetString(
         "MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY",
-        GetEnvStringOr("MOONCAKE_BUCKET_EVICTION_POLICY", "fifo"));
+        Environ::GetString("MOONCAKE_BUCKET_EVICTION_POLICY", "fifo"));
     if (policy_str == "fifo") {
         config.eviction_policy = BucketEvictionPolicy::FIFO;
     } else if (policy_str == "lru") {
@@ -177,8 +180,7 @@ OffsetAllocatorBackendConfig OffsetAllocatorBackendConfig::FromEnvironment() {
 
     const char* pol = std::getenv("MOONCAKE_OFFSET_EVICTION_POLICY");
     if (pol) {
-        std::string s(pol);
-        if (s == "fifo" || s == "FIFO" || s == "Fifo") {
+        if (AsciiCaseInsensitiveEquals(pol, "fifo")) {
             cfg.eviction_policy = OffsetEvictionPolicy::FIFO;
         }
         // NONE is default; LRU reserved for phase 2
@@ -191,13 +193,13 @@ OffsetAllocatorBackendConfig OffsetAllocatorBackendConfig::FromEnvironment() {
     cfg.keys_high_ratio = cfg.high_ratio;
     cfg.keys_low_ratio = cfg.low_ratio;
 
-    cfg.max_capacity_nodes = GetEnvOr<int64_t>(
+    cfg.max_capacity_nodes = Environ::GetInt64(
         "MOONCAKE_OFFSET_MAX_CAPACITY_NODES", cfg.max_capacity_nodes);
 
     // Read eviction cap as int64_t to guard against negative env values
-    // which would wrap to SIZE_MAX with GetEnvOr<size_t>.
+    // which would wrap to SIZE_MAX with an unsigned parser.
     auto max_evict_raw =
-        GetEnvOr<int64_t>("MOONCAKE_OFFSET_MAX_EVICT_PER_OFFLOAD",
+        Environ::GetInt64("MOONCAKE_OFFSET_MAX_EVICT_PER_OFFLOAD",
                           static_cast<int64_t>(cfg.max_evict_per_offload));
     if (max_evict_raw > 0) {
         cfg.max_evict_per_offload = static_cast<size_t>(max_evict_raw);
@@ -211,11 +213,11 @@ OffsetAllocatorBackendConfig OffsetAllocatorBackendConfig::FromEnvironment() {
     const char* persist = std::getenv("MOONCAKE_OFFSET_PERSIST_MODE");
     if (persist) {
         std::string s(persist);
-        if (s == "disabled" || s == "DISABLED") {
+        if (AsciiCaseInsensitiveEquals(s, "disabled")) {
             cfg.persist_mode = OffsetPersistMode::kDisabled;
-        } else if (s == "relaxed" || s == "RELAXED") {
+        } else if (AsciiCaseInsensitiveEquals(s, "relaxed")) {
             cfg.persist_mode = OffsetPersistMode::kRelaxed;
-        } else if (s == "strict" || s == "STRICT") {
+        } else if (AsciiCaseInsensitiveEquals(s, "strict")) {
             cfg.persist_mode = OffsetPersistMode::kStrict;
         } else {
             LOG(WARNING) << "Unknown MOONCAKE_OFFSET_PERSIST_MODE=" << s
@@ -224,15 +226,14 @@ OffsetAllocatorBackendConfig OffsetAllocatorBackendConfig::FromEnvironment() {
     }
 
     cfg.persist_interval_seconds =
-        GetEnvOr<int64_t>("MOONCAKE_OFFSET_PERSIST_INTERVAL_SECONDS",
+        Environ::GetInt64("MOONCAKE_OFFSET_PERSIST_INTERVAL_SECONDS",
                           cfg.persist_interval_seconds);
 
     // Record CRC-32C: "0"/"false"/"off" disables per-record checksums.
     const char* crc_env = std::getenv("MOONCAKE_OFFSET_RECORD_CRC");
     if (crc_env) {
-        std::string s(crc_env);
-        for (auto& c : s) c = static_cast<char>(std::tolower(c));
-        if (s == "0" || s == "false" || s == "off") {
+        const auto parsed = TryParseBool(crc_env);
+        if (parsed.has_value() && !*parsed) {
             cfg.enable_record_crc = false;
         }
     }

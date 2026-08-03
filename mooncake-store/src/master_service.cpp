@@ -26,6 +26,7 @@
 #include "http_metadata_server.h"
 #include "master_metric_manager.h"
 #include "common.h"
+#include "environ.h"
 #include "segment.h"
 #ifdef USE_HTTP
 #include "transfer_metadata_plugin.h"
@@ -515,8 +516,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
 }
 
 void MasterService::InitDfsAllocatorFromEnvironment() {
-    enable_dfs_ = GetEnvOr<bool>("MOONCAKE_ENABLE_DFS",
-                                 GetEnvOr<bool>("MOONCAKE_DFS_ENABLED", false));
+    enable_dfs_ = Environ::GetBool(
+        "MOONCAKE_ENABLE_DFS", Environ::GetBool("MOONCAKE_DFS_ENABLED", false));
     if (!enable_dfs_) return;
 
     if (enable_snapshot_ || enable_snapshot_restore_ || enable_oplog_) {
@@ -527,7 +528,7 @@ void MasterService::InitDfsAllocatorFromEnvironment() {
     }
 
     const bool single_tenant =
-        GetEnvOr<bool>("MOONCAKE_DFS_SINGLE_TENANT", true);
+        Environ::GetBool("MOONCAKE_DFS_SINGLE_TENANT", true);
     if (!single_tenant) {
         LOG(ERROR) << "Currently, DFS backend is not supported in "
                       "multi-tenant mode";
@@ -535,14 +536,15 @@ void MasterService::InitDfsAllocatorFromEnvironment() {
         return;
     }
 
-    const std::string root_dir = GetEnvStringOr(
-        "MOONCAKE_DFS_ROOT_DIR",
-        GetEnvStringOr("MOONCAKE_DISTRIBUTED_ROOT_DIR", "/mnt/3fs/mooncake"));
-    const int shard_count = GetEnvOr<int>("MOONCAKE_DFS_SHARD_COUNT", 64);
-    const uint64_t shard_capacity = GetEnvOr<uint64_t>(
+    const std::string root_dir =
+        Environ::GetString("MOONCAKE_DFS_ROOT_DIR",
+                           Environ::GetString("MOONCAKE_DISTRIBUTED_ROOT_DIR",
+                                              "/mnt/3fs/mooncake"));
+    const int shard_count = Environ::GetInt("MOONCAKE_DFS_SHARD_COUNT", 64);
+    const uint64_t shard_capacity = Environ::GetUInt64(
         "MOONCAKE_DFS_SHARD_CAPACITY", 4ULL * 1024 * 1024 * 1024);
     const uint64_t alignment =
-        GetEnvOr<uint64_t>("MOONCAKE_DFS_ALIGNMENT", 4096);
+        Environ::GetUInt64("MOONCAKE_DFS_ALIGNMENT", 4096);
 
     dfs_allocator_ = std::make_unique<DfsGlobalAllocator>();
     if (!dfs_allocator_->Init(root_dir, shard_count, shard_capacity,

@@ -20,9 +20,13 @@ namespace {
 
 class FakeBatchWriter {
    public:
+    using Clock = std::chrono::steady_clock;
+
     ErrorCode Write(const OpLogBatchRecord& batch,
                     const DurablePrefix& expected_prefix) {
         std::unique_lock<std::mutex> lock(mutex_);
+        attempt_times_.push_back(Clock::now());
+        attempt_cv_.notify_all();
         while (blocked_) {
             blocked_write_active_ = true;
             blocked_cv_.notify_all();
@@ -58,6 +62,18 @@ class FakeBatchWriter {
         std::unique_lock<std::mutex> lock(mutex_);
         return cv_.wait_for(lock, timeout,
                             [&] { return writes_.size() >= count; });
+    }
+
+    bool WaitForAttempts(size_t count, std::chrono::milliseconds timeout =
+                                           std::chrono::milliseconds(5000)) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        return attempt_cv_.wait_for(
+            lock, timeout, [&] { return attempt_times_.size() >= count; });
+    }
+
+    std::vector<Clock::time_point> AttemptTimes() const {
+        std::lock_guard<std::mutex> lock(mutex_);
+        return attempt_times_;
     }
 
     void FailNextWrite(ErrorCode err) {
@@ -100,8 +116,10 @@ class FakeBatchWriter {
 
     mutable std::mutex mutex_;
     std::condition_variable cv_;
+    std::condition_variable attempt_cv_;
     std::condition_variable blocked_cv_;
     std::vector<WriteRecord> writes_;
+    std::vector<Clock::time_point> attempt_times_;
     ErrorCode next_error_{ErrorCode::OK};
     ErrorCode repeated_error_{ErrorCode::OK};
     size_t failures_remaining_{0};
@@ -745,6 +763,102 @@ TEST(OrderedOpLogWriterFailureTest, RetriesSameBatchUntilSuccess) {
     EXPECT_EQ(1u, batches[0].first_seq);
     EXPECT_EQ(1u, batches[0].last_seq);
     writer.Stop();
+}
+
+TEST(OrderedOpLogWriterFailureTest, RetryBackoffGrowsAndCaps) {
+    using namespace std::chrono_literals;
+
+    FakeBatchWriter storage;
+    OrderedOpLogWriter writer(
+        OrderedOpLogWriterConfig{.max_entries_per_batch = 2},
+        [&](const OpLogBatchRecord& batch,
+            const DurablePrefix& expected_prefix) {
+            return storage.Write(batch, expected_prefix);
+        });
+    writer.Start();
+
+    storage.FailNextWrites(12, ErrorCode::PERSISTENT_FAIL);
+    auto reservation = writer.Reserve();
+    ASSERT_TRUE(reservation.has_value());
+    ASSERT_TRUE(writer
+                    .Commit(std::move(*reservation), MakeEntry("k1"),
+                            [](const auto&) {})
+                    .has_value());
+
+    ASSERT_TRUE(storage.WaitForAttempts(13));
+    const auto attempts = storage.AttemptTimes();
+    ASSERT_GE(attempts.size(), 13u);
+    EXPECT_GE(attempts[9] - attempts[0], 400ms);
+    EXPECT_GE(attempts[11] - attempts[10], 800ms);
+    EXPECT_LT(attempts[12] - attempts[11], 1500ms);
+    writer.Stop();
+}
+
+TEST(OrderedOpLogWriterFailureTest, RetryBackoffResetsAfterSuccess) {
+    using namespace std::chrono_literals;
+
+    FakeBatchWriter storage;
+    OrderedOpLogWriter writer(
+        OrderedOpLogWriterConfig{.max_entries_per_batch = 2},
+        [&](const OpLogBatchRecord& batch,
+            const DurablePrefix& expected_prefix) {
+            return storage.Write(batch, expected_prefix);
+        });
+    writer.Start();
+
+    auto first = writer.Reserve();
+    auto second = writer.Reserve();
+    ASSERT_TRUE(first.has_value());
+    ASSERT_TRUE(second.has_value());
+
+    storage.FailNextWrites(10, ErrorCode::PERSISTENT_FAIL);
+    ASSERT_TRUE(
+        writer.Commit(std::move(*first), MakeEntry("k1"), [](const auto&) {})
+            .has_value());
+    ASSERT_TRUE(storage.WaitForWrites(1, 5s));
+    const auto first_batch_attempts = storage.AttemptTimes();
+    ASSERT_GE(first_batch_attempts.size(), 11u);
+    EXPECT_GE(first_batch_attempts[9] - first_batch_attempts[0], 400ms);
+
+    storage.FailNextWrites(1, ErrorCode::PERSISTENT_FAIL);
+    ASSERT_TRUE(
+        writer.Commit(std::move(*second), MakeEntry("k2"), [](const auto&) {})
+            .has_value());
+    ASSERT_TRUE(storage.WaitForAttempts(13));
+
+    const auto attempts = storage.AttemptTimes();
+    ASSERT_GE(attempts.size(), 13u);
+    EXPECT_LT(attempts[12] - attempts[11], 250ms);
+    writer.Stop();
+}
+
+TEST(OrderedOpLogWriterFailureTest, StopInterruptsRetryBackoff) {
+    using namespace std::chrono_literals;
+
+    FakeBatchWriter storage;
+    OrderedOpLogWriter writer(
+        OrderedOpLogWriterConfig{.max_entries_per_batch = 1},
+        [&](const OpLogBatchRecord& batch,
+            const DurablePrefix& expected_prefix) {
+            return storage.Write(batch, expected_prefix);
+        });
+    writer.Start();
+
+    storage.FailNextWrites(100000, ErrorCode::PERSISTENT_FAIL);
+    auto reservation = writer.Reserve();
+    ASSERT_TRUE(reservation.has_value());
+    ASSERT_TRUE(writer
+                    .Commit(std::move(*reservation), MakeEntry("k1"),
+                            [](const auto&) {})
+                    .has_value());
+    ASSERT_TRUE(storage.WaitForAttempts(11));
+    const auto attempts = storage.AttemptTimes();
+    ASSERT_GE(attempts.size(), 11u);
+    EXPECT_GE(attempts[10] - attempts[0], 800ms);
+
+    const auto started_at = FakeBatchWriter::Clock::now();
+    writer.Stop();
+    EXPECT_LT(FakeBatchWriter::Clock::now() - started_at, 250ms);
 }
 
 TEST(OrderedOpLogWriterFailureTest, SuccessAfterRetryRestoresAccepting) {

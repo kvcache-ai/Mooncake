@@ -9,6 +9,8 @@
 #include <vector>
 
 #include "aligned_client_buffer.h"
+#include "bool_parser.h"
+#include "environ.h"
 #include "storage_backend.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "client_metric.h"
@@ -42,13 +44,13 @@ double ParseEnvRatioOr(const std::string& raw_value, double default_value) {
 }
 
 double GetEnvRatioOr(const char* name, double default_value) {
-    const auto raw_value = GetEnvStringOr(name, "");
+    const auto raw_value = Environ::GetString(name, "");
     return ParseEnvRatioOr(raw_value, default_value);
 }
 
 double GetEnvRatioOr(const char* preferred_name, const char* fallback_name,
                      double default_value) {
-    const auto preferred_value = GetEnvStringOr(preferred_name, "");
+    const auto preferred_value = Environ::GetString(preferred_name, "");
     if (!preferred_value.empty()) {
         return ParseEnvRatioOr(preferred_value, default_value);
     }
@@ -57,16 +59,10 @@ double GetEnvRatioOr(const char* preferred_name, const char* fallback_name,
 
 bool GetEnvBoolStringOr(const char* name, bool default_value) {
     const auto raw_value =
-        GetEnvStringOr(name, default_value ? "true" : "false");
-    if (raw_value == "1" || raw_value == "true" || raw_value == "TRUE" ||
-        raw_value == "True") {
-        return true;
-    }
-    if (raw_value == "0" || raw_value == "false" || raw_value == "FALSE" ||
-        raw_value == "False") {
-        return false;
-    }
-    return default_value;
+        Environ::GetString(name, default_value ? "true" : "false");
+    return TryParseBool(raw_value, {.token_set = BoolTokenSet::kTrueFalse,
+                                    .trim_ascii_whitespace = false})
+        .value_or(default_value);
 }
 
 std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
@@ -91,8 +87,8 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
     FileStorageConfig config;
 
     auto storage_backend_descriptor =
-        GetEnvStringOr("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
-                       "bucket_storage_backend");
+        Environ::GetString("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                           "bucket_storage_backend");
 
     if (storage_backend_descriptor == "bucket_storage_backend") {
         config.storage_backend_type = StorageBackendType::kBucket;
@@ -108,32 +104,32 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
         LOG(ERROR) << "Unknown storage backend.";
     }
 
-    config.storage_filepath = GetEnvStringOr(
+    config.storage_filepath = Environ::GetString(
         "MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", config.storage_filepath);
 
-    config.local_buffer_size = GetEnvOr<int64_t>(
+    config.local_buffer_size = Environ::GetInt64(
         "MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", config.local_buffer_size);
 
-    config.scanmeta_iterator_keys_limit = GetEnvOr<int64_t>(
+    config.scanmeta_iterator_keys_limit = Environ::GetInt64(
         "MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT",
-        GetEnvOr<int64_t>("MOONCAKE_SCANMETA_ITERATOR_KEYS_LIMIT",
+        Environ::GetInt64("MOONCAKE_SCANMETA_ITERATOR_KEYS_LIMIT",
                           config.scanmeta_iterator_keys_limit));
 
-    config.total_keys_limit = GetEnvOr<int64_t>(
+    config.total_keys_limit = Environ::GetInt64(
         "MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT", config.total_keys_limit);
 
-    config.total_size_limit = GetEnvOr<int64_t>(
+    config.total_size_limit = Environ::GetInt64(
         "MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES", config.total_size_limit);
 
     config.heartbeat_interval_seconds =
-        GetEnvOr<uint32_t>("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS",
+        Environ::GetUInt32("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS",
                            config.heartbeat_interval_seconds);
     config.client_buffer_gc_interval_seconds =
-        GetEnvOr<uint32_t>("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS",
+        Environ::GetUInt32("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS",
                            config.client_buffer_gc_interval_seconds);
 
     config.client_buffer_gc_ttl_ms =
-        GetEnvOr<uint64_t>("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS",
+        Environ::GetUInt64("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS",
                            config.client_buffer_gc_ttl_ms);
 
     config.enable_disk_watermark_eviction =
@@ -148,10 +144,13 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
                       "MOONCAKE_DISK_EVICTION_LOW_WATERMARK_RATIO",
                       config.disk_eviction_low_watermark_ratio);
 
-    auto use_uring_str =
-        GetEnvStringOr("MOONCAKE_OFFLOAD_USE_URING",
-                       GetEnvStringOr("MOONCAKE_USE_URING", "false"));
-    config.use_uring = (use_uring_str == "true" || use_uring_str == "1");
+    const auto use_uring_str =
+        Environ::GetString("MOONCAKE_OFFLOAD_USE_URING",
+                           Environ::GetString("MOONCAKE_USE_URING", "false"));
+    config.use_uring =
+        TryParseBool(use_uring_str, {.token_set = BoolTokenSet::kTrueFalse,
+                                     .trim_ascii_whitespace = false})
+            .value_or(false);
 
     return config;
 }
@@ -466,6 +465,11 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
     return batch_result;
 }
 
+bool FileStorage::IsPerBucketSoftOffloadError(ErrorCode error) {
+    return error == ErrorCode::INVALID_READ ||
+           error == ErrorCode::OBJECT_ALREADY_EXISTS;
+}
+
 tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     const std::vector<OffloadTaskItem>& offloading_objects) {
     if (offloading_objects.empty()) {
@@ -533,6 +537,10 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     // orphaned offloading_tasks and release source replica refcounts.
     std::vector<OffloadTaskItem> failed_tasks;
     std::unordered_set<std::string> all_bucket_keys;
+    // Set when a whole-cycle error aborts the bucket loop early. We still fall
+    // through to the NACK flush below before returning it, so no drained key is
+    // left waiting on the TTL reaper.
+    std::optional<ErrorCode> abort_error;
 
     for (const auto& keys : buckets_keys) {
         for (const auto& k : keys) all_bucket_keys.insert(k);
@@ -610,6 +618,21 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             }
         }
 
+        // If every object in this bucket failed D2H staging, host_batch_object
+        // is empty (those keys are already in failed_tasks). Skip BatchOffload,
+        // which rejects an empty map as INVALID_KEY and would otherwise trip
+        // the whole-cycle abort below for a bucket that has nothing left to
+        // persist. staging_bufs can still be non-empty here (an object whose
+        // first slices copied fine but a later one failed), so hand those
+        // buffers back before continuing: the release loop after BatchOffload
+        // is unreachable on this path.
+        if (host_batch_object.empty()) {
+            for (auto& buf : staging_bufs) {
+                pinned_buffer_pool_->Release(std::move(buf));
+            }
+            continue;
+        }
+
         auto offload_start = std::chrono::steady_clock::now();
         auto bucket_complete_handler =
             [this, offload_start, complete_handler](
@@ -649,18 +672,29 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         if (!offload_res) {
             LOG(ERROR) << "Failed to store objects with error: "
                        << offload_res.error();
+            // This bucket did not persist, so report its keys back to the
+            // master as failed regardless of whether we continue or abort.
+            // Doing it here (rather than only on the soft path) keeps their
+            // offloading tasks and source-replica refcounts from leaking until
+            // the put_start_release_timeout_sec_ TTL reaper fires.
+            for (const auto& [key, _] : host_batch_object) {
+                failed_tasks.push_back(task_by_storage_key.at(key));
+            }
             if (offload_res.error() == ErrorCode::KEYS_ULTRA_LIMIT) {
+                // Disk is over the key-count limit: stop offloading entirely.
                 MutexLocker locker(&offloading_mutex_);
                 enable_offloading_ = false;
-                return tl::make_unexpected(offload_res.error());
             }
-            if (offload_res.error() == ErrorCode::INVALID_READ) {
-                for (const auto& [key, _] : host_batch_object) {
-                    failed_tasks.push_back(task_by_storage_key.at(key));
-                }
-            } else {
-                return tl::make_unexpected(offload_res.error());
+            if (!IsPerBucketSoftOffloadError(offload_res.error())) {
+                // Whole-cycle error (KEYS_ULTRA_LIMIT or any hard failure):
+                // stop processing further buckets, but fall through to the NACK
+                // flush below so every drained key is released. Unvisited
+                // buckets are not yet in all_bucket_keys, so the sweep NACKs
+                // them too; this bucket's keys were just pushed above.
+                abort_error = offload_res.error();
+                break;
             }
+            // Soft per-bucket error: keep processing the remaining buckets.
         }
     }
 
@@ -687,6 +721,9 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         }
     }
 
+    if (abort_error) {
+        return tl::make_unexpected(*abort_error);
+    }
     return {};
 }
 

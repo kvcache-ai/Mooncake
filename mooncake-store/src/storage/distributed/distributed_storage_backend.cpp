@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <limits>
 
+#include "environ.h"
 #include "storage/distributed/dfs_global_allocator.h"
 #include "types.h"
 #include "utils.h"
@@ -51,25 +52,26 @@ bool DistributedStorageConfig::Validate() const {
 
 DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
     DistributedStorageConfig config;
-    config.fsdir = GetEnvStringOr(
+    config.fsdir = Environ::GetString(
         "MOONCAKE_DFS_ROOT_DIR",
-        GetEnvStringOr("MOONCAKE_DISTRIBUTED_ROOT_DIR", config.fsdir));
+        Environ::GetString("MOONCAKE_DISTRIBUTED_ROOT_DIR", config.fsdir));
     if (!std::filesystem::path(config.fsdir).is_absolute()) {
         config.fsdir = std::filesystem::absolute(config.fsdir).string();
     }
-    config.fs_adapter_type = GetEnvStringOr(
-        "MOONCAKE_DFS_FS_ADAPTER",
-        GetEnvStringOr("MOONCAKE_DISTRIBUTED_FS_TYPE", config.fs_adapter_type));
+    config.fs_adapter_type =
+        Environ::GetString("MOONCAKE_DFS_FS_ADAPTER",
+                           Environ::GetString("MOONCAKE_DISTRIBUTED_FS_TYPE",
+                                              config.fs_adapter_type));
     config.enable_health_check =
-        GetEnvOr<bool>("MOONCAKE_DISTRIBUTED_HEALTH_CHECK", false);
+        Environ::GetBool("MOONCAKE_DISTRIBUTED_HEALTH_CHECK", false);
     config.shard_count =
-        GetEnvOr<int>("MOONCAKE_DFS_SHARD_COUNT", config.shard_count);
-    config.shard_capacity = GetEnvOr<uint64_t>("MOONCAKE_DFS_SHARD_CAPACITY",
+        Environ::GetInt("MOONCAKE_DFS_SHARD_COUNT", config.shard_count);
+    config.shard_capacity = Environ::GetUInt64("MOONCAKE_DFS_SHARD_CAPACITY",
                                                config.shard_capacity);
     config.alignment =
-        GetEnvOr<uint64_t>("MOONCAKE_DFS_ALIGNMENT", config.alignment);
+        Environ::GetUInt64("MOONCAKE_DFS_ALIGNMENT", config.alignment);
     config.single_tenant =
-        GetEnvOr<bool>("MOONCAKE_DFS_SINGLE_TENANT", config.single_tenant);
+        Environ::GetBool("MOONCAKE_DFS_SINGLE_TENANT", config.single_tenant);
     return config;
 }
 

@@ -6,6 +6,7 @@
 #include <limits>
 #include <sstream>
 
+#include "environ.h"
 #include "storage/distributed/fs_adapter.h"
 #include "storage/distributed/posix_fs_adapter.h"
 #include "utils.h"
@@ -14,6 +15,20 @@
 #endif
 
 namespace mooncake {
+
+namespace {
+
+std::optional<double> GetEnvDouble(const char* name) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') return std::nullopt;
+    try {
+        return std::stod(value);
+    } catch (...) {
+        return std::nullopt;
+    }
+}
+
+}  // namespace
 
 DfsGlobalAllocator::~DfsGlobalAllocator() {
     {
@@ -41,15 +56,15 @@ bool DfsGlobalAllocator::Init(const std::string& mount_path, int shard_count,
     shards_.clear();
     shards_.resize(shard_count_);
 
-    eviction_enabled_ = GetEnvOr<bool>("MOONCAKE_DFS_EVICTION_ENABLED", true);
+    eviction_enabled_ = Environ::GetBool("MOONCAKE_DFS_EVICTION_ENABLED", true);
     eviction_high_watermark_ =
-        GetEnvOr<double>("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", 0.9);
+        GetEnvDouble("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK").value_or(0.9);
     eviction_low_watermark_ =
-        GetEnvOr<double>("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", 0.7);
+        GetEnvDouble("MOONCAKE_DFS_EVICTION_LOW_WATERMARK").value_or(0.7);
     deferred_free_duration_ = std::chrono::seconds(
-        GetEnvOr<int>("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", 30));
+        Environ::GetInt("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", 30));
     eviction_check_interval_ = std::chrono::seconds(
-        GetEnvOr<int>("MOONCAKE_DFS_EVICTION_CHECK_INTERVAL", 5));
+        Environ::GetInt("MOONCAKE_DFS_EVICTION_CHECK_INTERVAL", 5));
 
     std::error_code ec;
     std::filesystem::create_directories(mount_path_, ec);
@@ -59,9 +74,9 @@ bool DfsGlobalAllocator::Init(const std::string& mount_path, int shard_count,
         return false;
     }
 
-    const auto adapter_type =
-        GetEnvStringOr("MOONCAKE_DFS_FS_ADAPTER",
-                       GetEnvStringOr("MOONCAKE_DISTRIBUTED_FS_TYPE", "hf3fs"));
+    const auto adapter_type = Environ::GetString(
+        "MOONCAKE_DFS_FS_ADAPTER",
+        Environ::GetString("MOONCAKE_DISTRIBUTED_FS_TYPE", "hf3fs"));
     if (adapter_type == "posix") {
         fs_adapter_ = std::make_unique<PosixFsAdapter>();
     } else if (adapter_type == "hf3fs") {

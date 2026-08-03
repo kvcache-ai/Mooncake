@@ -108,45 +108,6 @@ TEST(UtilsTest, StringToByteSize) {
     EXPECT_EQ(string_to_byte_size("-5"), 0);
 }
 
-TEST(UtilsTest, StringToBool) {
-    EXPECT_EQ(string_to_bool("1"), true);
-    EXPECT_EQ(string_to_bool("true"), true);
-    EXPECT_EQ(string_to_bool("YES"), true);
-    EXPECT_EQ(string_to_bool(" on "), true);
-    EXPECT_EQ(string_to_bool("0"), false);
-    EXPECT_EQ(string_to_bool("false"), false);
-    EXPECT_EQ(string_to_bool("No"), false);
-    EXPECT_EQ(string_to_bool(" off "), false);
-    EXPECT_EQ(string_to_bool("maybe"), std::nullopt);
-    EXPECT_EQ(string_to_bool(""), std::nullopt);
-}
-
-TEST(UtilsTest, GetEnvOrParsesBoolStrings) {
-    constexpr const char* kEnvName = "MOONCAKE_TEST_GET_ENV_OR_BOOL";
-
-    unsetenv(kEnvName);
-    EXPECT_TRUE(GetEnvOr<bool>(kEnvName, true));
-    EXPECT_FALSE(GetEnvOr<bool>(kEnvName, false));
-
-    setenv(kEnvName, "false", 1);
-    EXPECT_FALSE(GetEnvOr<bool>(kEnvName, true));
-
-    setenv(kEnvName, "true", 1);
-    EXPECT_TRUE(GetEnvOr<bool>(kEnvName, false));
-
-    setenv(kEnvName, "0", 1);
-    EXPECT_FALSE(GetEnvOr<bool>(kEnvName, true));
-
-    setenv(kEnvName, "1", 1);
-    EXPECT_TRUE(GetEnvOr<bool>(kEnvName, false));
-
-    setenv(kEnvName, "invalid", 1);
-    EXPECT_TRUE(GetEnvOr<bool>(kEnvName, true));
-    EXPECT_FALSE(GetEnvOr<bool>(kEnvName, false));
-
-    unsetenv(kEnvName);
-}
-
 TEST(UtilsTest, IsPortAvailable) {
     // Find an available port
     int test_port = -1;
@@ -243,17 +204,6 @@ TEST(UtilsTest, AutoPortBinderMultipleInstances) {
 
     // If both successfully bound, they should have different ports
     EXPECT_NE(port1, port2);
-}
-
-TEST(UtilsTest, SplitStringBasic) {
-    std::string input = "a, b ,c, d";
-    auto tokens = splitString(input, ',', true, false);
-
-    ASSERT_EQ(tokens.size(), 4);
-    EXPECT_EQ(tokens[0], "a");
-    EXPECT_EQ(tokens[1], "b");
-    EXPECT_EQ(tokens[2], "c");
-    EXPECT_EQ(tokens[3], "d");
 }
 
 TEST(UtilsTest, GetInterfaceIPv4AddressLoopback) {

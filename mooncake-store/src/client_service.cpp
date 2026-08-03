@@ -1,7 +1,9 @@
 #include "client_service.h"
 
+#include <boost/algorithm/string.hpp>
 #include <glog/logging.h>
 
+#include "ascii_string.h"
 #include "allocator.h"
 #include "segment.h"
 
@@ -466,42 +468,30 @@ static std::optional<bool> get_auto_discover() {
     return std::nullopt;
 }
 
-static inline void ltrim(std::string& s) {
-    s.erase(s.begin(), std::find_if(s.begin(), s.end(), [](unsigned char ch) {
-                return !std::isspace(ch);
-            }));
-}
-
-static inline void rtrim(std::string& s) {
-    s.erase(std::find_if(s.rbegin(), s.rend(),
-                         [](unsigned char ch) { return !std::isspace(ch); })
-                .base(),
-            s.end());
-}
-
 static std::vector<std::string> get_auto_discover_filters() {
-    std::vector<std::string> whitelst_filters;
-    char* ev_ad = std::getenv("MC_MS_FILTERS");
-    if (ev_ad) {
-        LOG(INFO) << "whitelist filters: " << ev_ad;
-        char delimiter = ',';
-        char* end = ev_ad + std::strlen(ev_ad);
-        char *start = ev_ad, *pos = ev_ad;
-        while ((pos = std::find(start, end, delimiter)) != end) {
-            std::string str(start, pos);
-            ltrim(str);
-            rtrim(str);
-            whitelst_filters.emplace_back(std::move(str));
-            start = pos + 1;
-        }
-        if (start != (end + 1)) {
-            std::string str(start, end);
-            ltrim(str);
-            rtrim(str);
-            whitelst_filters.emplace_back(std::move(str));
-        }
+    const char* raw_filters = std::getenv("MC_MS_FILTERS");
+    if (raw_filters == nullptr) {
+        return {};
     }
-    return whitelst_filters;
+
+    LOG(INFO) << "whitelist filters: " << raw_filters;
+    std::vector<std::string> filters;
+    boost::split(filters, std::string(raw_filters), boost::is_any_of(","),
+                 boost::token_compress_off);
+    for (auto& filter : filters) {
+        filter = std::string(TrimAsciiWhitespace(filter));
+    }
+    return filters;
+}
+
+static std::vector<std::string> ParseDeviceNames(std::string_view value) {
+    std::vector<std::string> devices;
+    boost::split(devices, std::string(value), boost::is_any_of(","),
+                 boost::token_compress_on);
+    for (auto& device : devices) {
+        device = std::string(TrimAsciiWhitespace(device));
+    }
+    return devices;
 }
 
 tl::expected<std::optional<ha::HABackendSpec>, ErrorCode> ParseHABackendSpec(
@@ -802,7 +792,7 @@ ErrorCode Client::InitTransferEngine(
                       << device_names.value();
 
             std::vector<std::string> devices =
-                splitString(device_names.value(), ',', /*skip_empty=*/true);
+                ParseDeviceNames(device_names.value());
 
             // Manually discover topology with specified devices only
             auto topology = transfer_engine_->getLocalTopology();
@@ -884,7 +874,7 @@ ErrorCode Client::InitTransferEngine(
         } else if (protocol == "ub") {
             auto deviceName = device_names.value_or("bonding_dev_0");
             LOG(ERROR) << "ub protocol entable device names is " << deviceName;
-            auto devices = splitString(deviceName, ',', true);
+            auto devices = ParseDeviceNames(deviceName);
             auto topology = transfer_engine_->getLocalTopology();
             if (topology) {
                 topology->discover(devices);

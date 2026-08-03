@@ -72,12 +72,13 @@ jobs:
     uses: ./.github/workflows/_build-wheel.yaml
     with:
       runner: ubuntu-22.04-arm
+      container: pytorch/manylinuxaarch64-builder:cuda12.8
       python-versions: '["3.10", "3.12"]'
-      cuda: sbsa-12.8
+      cuda: container
       cmake-generator: Ninja
       torch-cuda-arch-list: '9.0'
       cmake-args: >-
-        -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=OFF
+        -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=OFF
         -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
       artifact-prefix: nightly-cuda128-arm64
       version-override: ${{ needs.version-stamp.outputs.nightly_version }}
@@ -116,7 +117,7 @@ jobs:
       version-override: ${{ needs.version-stamp.outputs.nightly_version }}
 
   publish-testpypi:
-    needs: [version-stamp, build-cuda128-x86, build-cuda128-arm64, build-cuda13-x86, build-non-cuda-x86]
+    needs: [version-stamp, build-cuda128-x86, build-cuda128-arm64, build-cuda13-x86, build-non-cuda-x86, nightly-test]
     if: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.skip_publish == 'true') }}
     runs-on: ubuntu-22.04
     environment: nightly
@@ -217,6 +218,7 @@ jobs:
         run: |
           sudo apt update -y
           sudo bash -x dependencies.sh -y
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
           mkdir build && cd build
           cmake -G Ninja .. \
             -DUSE_HTTP=ON -DUSE_CXL=ON -DUSE_UB=ON -DUSE_ETCD=ON -DUSE_CUDA=ON \
@@ -277,6 +279,7 @@ jobs:
           DEFAULT_KV_LEASE_TTL: "500"
           TEST_SSD_OFFLOAD_IN_EVICT: "1"
           TEST_PROMOTION_ON_HIT: "1"
+          TEST_CXL: "1"
         run: |
           export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
           bash scripts/run_tests.sh
