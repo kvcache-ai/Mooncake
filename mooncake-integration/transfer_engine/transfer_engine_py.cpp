@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Modified by Hygon Information Technology Co., Ltd., 2026.
+
 #include "transfer_engine_py.h"
 
 #include <cassert>
@@ -182,7 +186,7 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
                                     const char* device_name,
                                     const char* metadata_type) {
     if (strcmp(protocol, "xgmi") == 0) {
-        LOG(ERROR) << "Protocol 'xgmi' is not exposed in the Python API. "
+        LOG(ERROR) << "This protocol alias is not exposed in the Python API. "
                    << "Use 'hip' instead.";
         return -1;
     }

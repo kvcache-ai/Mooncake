@@ -105,27 +105,6 @@ print(data.decode())  # Output: Hello, Mooncake Store!
 store.close()
 ```
 
-## AI Coding Assistant Skills
-
-If you use Claude Code or another coding assistant that supports reusable
-skills, Mooncake provides built-in playbooks for common development tasks:
-
-| Skill | Use it for |
-|-------|------------|
-| `/mooncake-troubleshoot` | Diagnose services, RDMA, environment variables, and runtime logs. |
-| `/mooncake-ci-local` | Run pre-PR local validation with Mooncake's CI script. |
-| `/mooncake-api` | Work with Mooncake Store, Transfer Engine, and EP/Backend Python APIs. |
-
-Install them from the Claude Code plugin marketplace without cloning the full
-repository:
-
-```text
-/plugin marketplace add kvcache-ai/Mooncake --sparse .claude-plugin
-/plugin install mooncake-troubleshoot@mooncake
-/plugin install mooncake-ci-local@mooncake
-/plugin install mooncake-api@mooncake
-```
-
 ## Next Steps
 
 For production deployment, standalone store services, high availability,

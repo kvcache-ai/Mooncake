@@ -32,6 +32,21 @@
 Mooncake is the serving platform for  <a href="https://kimi.ai/"><img src="image/kimi.png" alt="icon" style="height: 16px; vertical-align: middle;"> Kimi</a>, a leading LLM service provided by <a href="https://www.moonshot.cn/"><img src="image/moonshot.jpg" alt="icon" style="height: 16px; vertical-align: middle;"> Moonshot AI</a>.
 Under real workloads, Mooncake’s innovative architecture enables Kimi to handle 75% more requests while adhering to SLOs.
 
+<h2 id="attribution">🏷️ Attribution</h2>
+
+This project is based on upstream [Mooncake](https://github.com/kvcache-ai/Mooncake).
+
+- Upstream repository: https://github.com/kvcache-ai/Mooncake
+- Upstream branch: `main`
+- Upstream Commit: `6041a609a8c3af35e778f70db344f145c2914980`
+- Upstream license: Apache-2.0
+
+Modified by Hygon Information Technology Co., Ltd.
+
+Third-party source code vendored in this repository is documented in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
+
 <h2 id="updates">🔄 Updates</h2>
 
 - **Jul 2, 2026**: [DSpark](https://x.com/mgoin_/status/2072785822231728363) scales fully online training on a GB300 NVL72 system with Speculators and Mooncake: 9 vLLM nodes serve the GLM 5.2 FP8 verifier through Mooncake RDMA Store to 6 FSDP training nodes (DP=24), achieving 125k prefill tokens/s and 1.5 steps/s.
@@ -243,33 +258,6 @@ In addition to CUDA, Mooncake also supports other accelerator backends, along wi
 - [Quick Start](https://kvcache-ai.github.io/Mooncake/getting_started/quick-start.html)
 - [Build from Source](https://kvcache-ai.github.io/Mooncake/getting_started/build.html)
 - [Deployment Guide](https://kvcache-ai.github.io/Mooncake/deployment/mooncake-store-deployment-guide.html)
-
-
-### Skills for AI Assistants
-
-Mooncake ships a set of **built-in skills** under [`.claude/skills`](.claude/skills) — reusable, task-focused playbooks that an AI coding assistant (such as Claude Code) invokes automatically when your request matches, or that you can run as a slash command.
-
-<details>
-<summary>Details</summary>
-
-| Skill | Description |
-|-------|-------------|
-| `/mooncake-troubleshoot` | Diagnose Mooncake deployment and runtime issues (services, RDMA, env vars, logs). |
-| `/mooncake-ci-local` | Run pre-PR local validation via `scripts/run_ci_test.sh`. |
-| `/mooncake-api` | Work with the Mooncake Store, Transfer Engine, and EP/Backend Python APIs. |
-
-Install them without cloning the repository via the [Claude Code plugin marketplace](https://code.claude.com/docs/en/plugin-marketplaces):
-
-```text
-/plugin marketplace add kvcache-ai/Mooncake --sparse .claude-plugin
-/plugin install mooncake-troubleshoot@mooncake
-/plugin install mooncake-ci-local@mooncake
-/plugin install mooncake-api@mooncake
-```
-
-The `--sparse .claude-plugin` flag fetches only the marketplace catalog, and each plugin is published as a `git-subdir` source, so installing one fetches only that single skill directory — never the whole repo. If you are already working inside a Mooncake checkout, the skills under `.claude/skills/` load automatically with no setup.
-
-</details>
 
 <h2 id="trace">📦 Open Source Traces and Tools </h2>
 

@@ -1,4 +1,7 @@
 #!/bin/bash
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Hygon Information Technology Co., Ltd., 2026.
 
 set -e
 
@@ -46,7 +49,15 @@ elif [ "$USE_NVCC" = true ]; then
     nvcc "$CPP_FILE" -o "$OUTPUT_DIR/nvlink_allocator.so" -shared -Xcompiler -fPIC -lcuda -I/usr/local/cuda/include ${INCLUDE_FLAGS} -DUSE_CUDA=1
 elif [ "$USE_HIPCC" = true ]; then
     hipify-perl "$CPP_FILE" > "${OUTPUT_DIR}/nvlink_allocator.cpp"
-    hipcc "$OUTPUT_DIR/nvlink_allocator.cpp" -o "$OUTPUT_DIR/nvlink_allocator.so" -shared -fPIC -lamdhip64 -I/opt/rocm/include ${INCLUDE_FLAGS} -DUSE_HIP=1 -DUSE_HYGON=1
+    HIPCC_ERR=$(mktemp)
+    if ! hipcc "$OUTPUT_DIR/nvlink_allocator.cpp" -o "$OUTPUT_DIR/nvlink_allocator.so" -shared -fPIC -lamdhip64 -I/opt/rocm/include ${INCLUDE_FLAGS} -DUSE_HIP=1 -DUSE_HYGON=1 >"$HIPCC_ERR" 2>&1; then
+        grep -vE 'amdhip64|libamdhip64' "$HIPCC_ERR" >&2 || true
+        rm -f "$HIPCC_ERR"
+        echo "Failed to build nvlink_allocator.so (HIP link error)"
+        exit 1
+    fi
+    grep -vE 'amdhip64|libamdhip64' "$HIPCC_ERR" >&2 || true
+    rm -f "$HIPCC_ERR"
 elif [ "$USE_MCC" = true ]; then
     mcc "$CPP_FILE" -o "$OUTPUT_DIR/nvlink_allocator.so" --shared -fPIC -lmusa -I/usr/local/musa/include ${INCLUDE_FLAGS} -DUSE_MUSA=1
 elif [ "$USE_MACA" = true ]; then

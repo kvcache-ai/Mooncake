@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CUDA_STANDARD 20)
@@ -393,6 +397,9 @@ if(USE_HIP)
   find_package(HIP REQUIRED)
   include_directories(${HIP_INCLUDE_DIRS})
   add_compile_definitions(USE_HIP __HIP_PLATFORM_AMD__)
+  if (USE_HYGON)
+    set(CMAKE_VERBOSE_MAKEFILE OFF CACHE BOOL "" FORCE)
+  endif()
   message(STATUS "HIP support is enabled")
 
   find_program(HIPIFY_PERL_EXECUTABLE hipify-perl)

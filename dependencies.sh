@@ -13,6 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 # Color definitions
 GREEN="\033[0;32m"
 BLUE="\033[0;34m"
@@ -296,6 +300,7 @@ install_go() {
     fi
 
     GO_TARBALL="go$GOVER.linux-$ARCH.tar.gz"
+    GO_LOCAL_TARBALL="/tmp/go-install.tar.gz"
 
     # Try multiple download mirrors with fallback
     GO_DOWNLOAD_URLS=(
@@ -305,18 +310,20 @@ install_go() {
     )
 
     DOWNLOAD_SUCCESS=false
+    mirror_idx=0
     for url in "${GO_DOWNLOAD_URLS[@]}"; do
-        echo "Downloading Go $GOVER from ${url}..."
-        if wget -q --show-progress --timeout=30 --tries=2 -O "${GO_TARBALL}" "${url}"; then
+        mirror_idx=$((mirror_idx + 1))
+        echo "Downloading Go $GOVER (mirror ${mirror_idx}/${#GO_DOWNLOAD_URLS[@]})..."
+        if wget -q --timeout=30 --tries=2 -O "${GO_LOCAL_TARBALL}" "${url}"; then
             DOWNLOAD_SUCCESS=true
             if [[ "$url" != "https://go.dev/dl/${GO_TARBALL}" ]]; then
                 USED_CN_MIRROR=true
             fi
-            print_success "Downloaded Go $GOVER from ${url}"
+            print_success "Downloaded Go $GOVER"
             break
         else
-            echo -e "${YELLOW}Failed to download from ${url}, trying next mirror...${NC}"
-            rm -f "${GO_TARBALL}"
+            echo -e "${YELLOW}Download failed, trying next mirror...${NC}"
+            rm -f "${GO_LOCAL_TARBALL}"
         fi
     done
 
@@ -325,10 +332,11 @@ install_go() {
     fi
 
     echo "Installing Go $GOVER..."
-    tar -C /usr/local -xzf "${GO_TARBALL}"
+    tar -C /usr/local -xzf "${GO_LOCAL_TARBALL}"
     check_success "Failed to install Go $GOVER"
 
-    rm -f "${GO_TARBALL}"
+    # Clean up downloaded file
+    rm -f "${GO_LOCAL_TARBALL}"
     check_success "Failed to clean up Go installation file"
 
     print_success "Go $GOVER installed successfully"

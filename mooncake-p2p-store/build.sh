@@ -13,6 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 if [ "$#" -ne 6 ]; then
     echo "Usage: $0 TARGET_PATH USE_ETCD USE_REDIS USE_HTTP USE_ETCD_LEGACY BUILD_DIR"
     exit 1
@@ -74,10 +78,13 @@ if [ "$USE_HTTP" = "ON" ]; then
 fi
 
 go get
-go build -o "$TARGET/p2p-store-example" -ldflags="-extldflags '$EXT_LDFLAGS'" "../example/p2p-store-example.go"
-if [ $? -ne 0 ]; then
-    echo "Error: Failed to build the example."
+BUILD_ERR=$(mktemp)
+if ! go build -o "$TARGET/p2p-store-example" -ldflags="-extldflags '$EXT_LDFLAGS'" "../example/p2p-store-example.go" >"$BUILD_ERR" 2>&1; then
+    grep -vE 'amdhip64|libamdhip64' "$BUILD_ERR" >&2 || true
+    echo "Error: Failed to build the example (HIP/GPU link failed)."
+    rm -f "$BUILD_ERR"
     exit 1
 fi
+rm -f "$BUILD_ERR"
 
 echo "P2P Store: build successfully"
