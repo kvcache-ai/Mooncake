@@ -111,6 +111,7 @@ ret = store.MooncakeDistributedNoFRegister().real_register(
     int("$TARGET_PORT"),
     0,
     int("$NOF_SIZE"),
+    4096,
     "$MASTER_RPC",
 )
 print(f"register_ret {ret}", flush=True)

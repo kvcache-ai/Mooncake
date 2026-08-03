@@ -3413,7 +3413,7 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         auto runtime_accelerator =
             device::GetAcceleratorRegistry().RuntimeAccelerators();
         void *dst = static_cast<char *>(buffer) + dst_offset;
-        if (runtime_accelerator.FindDeviceForPointer(dst)) {
+        if (!replica.is_nof_replica() && runtime_accelerator.FindDeviceForPointer(dst)) {
             if (!client_buffer_allocator_) {
                 LOG(ERROR) << "Client buffer allocator is not provided";
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -3527,9 +3527,18 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             total_size);
     }
 
-    if (!replica.is_memory_replica()) {
-        LOG(ERROR) << "ranged reads only support memory/disk replicas";
-        return tl::unexpected(ErrorCode::INVALID_REPLICA);
+    if (replica.is_nof_replica()) {
+        void* dst = static_cast<char*>(buffer) + dst_offset;
+        std::vector<Slice> slices{Slice{dst, size}};
+        auto filtered_qr = FilterQueryResult(query_result, replica);
+        auto get_result =
+            client_->Get(key, filtered_qr, slices, src_offset);
+        if (!get_result) {
+            LOG(ERROR) << "NoF ranged Get failed for key: " << key
+                       << ", error=" << toString(get_result.error());
+            return tl::unexpected(get_result.error());
+        }
+        return static_cast<int64_t>(size);
     }
 
     auto runtime_accelerator =

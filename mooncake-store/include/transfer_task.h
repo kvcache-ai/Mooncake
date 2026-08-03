@@ -4,6 +4,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -347,21 +348,33 @@ class MemcpyWorkerPool {
 };
 
 #ifdef USE_NOF
-// struct SpdkNofSubTask;
+
 struct SpdkNofQos;
 
+struct SpdkNofSge {
+    void* address{nullptr};
+    uint64_t length{0};
+
+    static SpdkNofSge Data(void* address, uint64_t length) {
+        SpdkNofSge result;
+        result.address = address;
+        result.length = length;
+        return result;
+    }
+};
 /**
  * @brief Spdk nvmf operation descriptor
  */
 struct SpdkNofTask {
     nof_seg_handle* seg_handle;
-    void* ptr;
+    std::vector<SpdkNofSge> sgl;
+    std::vector<std::shared_ptr<void>> buffer_owners;
     uint64_t lba;
     uint32_t lba_count;
-    int remaining_lba;
+    uint64_t sgl_size;
+    uint32_t remaining_lba;
     int outstanding_sub_io;
     int op;   // kSpdkNofOpRead or kSpdkNofOpWrite
-    int idx;  // subop idx
     bool failed;
     bool on_chain;
     std::shared_ptr<SpdkNofOperationState> state;
@@ -369,28 +382,47 @@ struct SpdkNofTask {
     SpdkNofQos* nof_qos;
     SpdkNofTask* nxt;
 
-    SpdkNofTask(nof_seg_handle* handle, void* buf, uint64_t off, uint32_t len,
-                int op_code, std::shared_ptr<SpdkNofOperationState> s)
+    SpdkNofTask(
+        nof_seg_handle* handle, std::vector<SpdkNofSge> entries,
+        uint64_t off, uint32_t len, int op_code,
+        std::shared_ptr<SpdkNofOperationState> operation_state,
+        std::vector<std::shared_ptr<void>> owners = {})
         : seg_handle(handle),
-          ptr(buf),
+          sgl(std::move(entries)),
+          buffer_owners(std::move(owners)),
           lba(off),
           lba_count(len),
+          sgl_size(0),
           remaining_lba(lba_count),
           outstanding_sub_io(0),
           op(op_code),
-          idx(0),
           failed(false),
           on_chain(false),
-          state(std::move(s)),
+          state(std::move(operation_state)),
           io_count(nullptr),
           nof_qos(nullptr),
-          nxt(nullptr) {}
+          nxt(nullptr) {
+        for (const auto& entry : sgl) {
+            if (entry.length >
+                std::numeric_limits<uint64_t>::max() - sgl_size) {
+                sgl_size = 0;
+                break;
+            }
+            sgl_size += entry.length;
+        }
+    }
 };
 
 struct SpdkNofSubTask {
-    SpdkNofTask* task;
-    int submit_lba_count;
-    std::stack<SpdkNofSubTask*>* sub_task_pool;
+    SpdkNofTask* task{nullptr};
+    uint32_t submit_lba_count{0};
+    uint64_t payload_offset{0};
+    uint64_t payload_size{0};
+    size_t cursor_sge_index{0};
+    uint64_t cursor_sge_offset{0};
+    uint64_t cursor_remaining{0};
+    bool cursor_valid{false};
+    std::stack<SpdkNofSubTask*>* sub_task_pool{nullptr};
 };
 
 constexpr int kDefaultSpdkNofSubmitChunkBytes = (1 << 17);    // 128k
@@ -423,6 +455,9 @@ struct SpdkNofQos {
     void PopTask(int op) {
         if (head[op]) {
             head[op] = head[op]->nxt;
+            if (head[op] == nullptr) {
+                tail[op] = nullptr;
+            }
         }
     }
 };
@@ -631,6 +666,9 @@ class TransferSubmitter {
     std::optional<TransferFuture> submitSpdkNofOperation(
         const AllocatedBuffer::Descriptor& handle, void* ptr, size_t size,
         const TransferRequest::OpCode op_code);
+    std::optional<TransferFuture> submitSpdkNofRangeReadOperation(
+        const NoFDescriptor& descriptor, void* ptr, size_t size,
+        uint64_t src_offset);
 #endif
 
     /**

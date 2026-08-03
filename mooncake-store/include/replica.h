@@ -627,10 +627,14 @@ inline Replica::Descriptor Replica::get_descriptor() const {
         NoFDescriptor nof_desc;
         if (nof_data.buffer) {
             nof_desc.buffer_descriptor = nof_data.buffer->get_descriptor();
+            nof_desc.object_size = nof_data.object_size;
+            nof_desc.block_size = nof_data.block_size;
         } else {
             nof_desc.buffer_descriptor.size_ = 0;
             nof_desc.buffer_descriptor.buffer_address_ = 0;
             nof_desc.buffer_descriptor.transport_endpoint_ = "";
+            nof_desc.object_size = 0;
+            nof_desc.block_size = 0;
             LOG(ERROR) << "Trying to get invalid nof replica descriptor";
         }
         desc.descriptor_variant = std::move(nof_desc);

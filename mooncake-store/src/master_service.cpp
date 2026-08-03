@@ -3445,11 +3445,19 @@ auto MasterService::AllocateAndInsertMetadata(
             nof_segment_manager_.getAllocatorAccess();
         const auto& allocator_manager = allocator_access.getAllocatorManager();
 
+        const uint32_t nof_block_size = nof_segment_manager_.getBlockSize(); 
+        if (value_length > std::numeric_limits<uint64_t>::max() -(nof_block_size - 1)) {
+            abort_reserved_quota();
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        const uint64_t nof_allocation_length = ((value_length + nof_block_size - 1) / nof_block_size) * nof_block_size;
+        
+
         std::vector<std::string> preferred_segments =
             config.preferred_nof_segments;
 
         auto allocation_result = allocation_strategy_->Allocate(
-            allocator_manager, value_length, config.nof_replica_num,
+            allocator_manager, nof_allocation_length, config.nof_replica_num,
             preferred_segments, std::set<std::string>(), ReplicaType::NOF_SSD);
 
         if (!allocation_result.has_value()) {

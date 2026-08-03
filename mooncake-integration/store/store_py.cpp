@@ -1959,11 +1959,11 @@ PYBIND11_MODULE(store, m) {
              [](MooncakeDistributedNoFRegisterPyWrapper &self,
                 const std::string &nqn = "", size_t nsid = 1,
                 const std::string &traddr = "", size_t trsvcid = 4420,
-                uintptr_t base = 0x0, size_t size = 1024,
+                uintptr_t base = 0x0, size_t size = 1024, uint32_t block_size = 512, 
                 const std::string &master_server_addr = "127.0.0.1:50051") {
                  self.register_ = std::make_shared<NoFRegisterClient>();
                  return self.register_->set_register(nqn, nsid, traddr, trsvcid,
-                                                     base, size,
+                                                     base, size, block_size,
                                                      master_server_addr);
              })
         .def("real_unregister_by_endpoint",

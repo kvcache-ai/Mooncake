@@ -1304,6 +1304,14 @@ ErrorCode ScopedNoFSegmentAccess::MountSegment(const NoFSegment& segment,
         return ErrorCode::INVALID_PARAMS;
     }
 
+    if (nof_segment_manager_->block_size_ != 0 &&
+        nof_segment_manager_->block_size_ != block_size) {
+        LOG(ERROR) << "NoF segment block size differs from pool"
+                   << ", segment=" << block_size
+                   << ", pool=" << nof_segment_manager_->block_size_;
+        return ErrorCode::INVALID_PARAMS;
+    }
+
     if (nof_segment_manager_->memory_allocator_ ==
             BufferAllocatorType::CACHELIB &&
         (buffer % facebook::cachelib::Slab::kSize ||
@@ -1381,6 +1389,9 @@ ErrorCode ScopedNoFSegmentAccess::MountSegment(const NoFSegment& segment,
     nof_segment_manager_->mounted_segments_[segment.id] = {
         segment, client_id, SegmentStatus::OK, std::move(allocator)};
     nof_segment_manager_->client_by_name_[segment.name] = client_id;
+    if (nof_segment_manager_->block_size_ == 0) {
+        nof_segment_manager_->block_size_ = block_size;
+    }
     MasterMetricManager::instance().inc_total_nof_capacity(segment.name, size);
 
     return ErrorCode::OK;
@@ -1472,6 +1483,9 @@ ErrorCode ScopedNoFSegmentAccess::CommitUnmountSegment(
     }
 
     nof_segment_manager_->mounted_segments_.erase(segment_id);
+    if (nof_segment_manager_->mounted_segments_.empty()) {
+        nof_segment_manager_->block_size_ = 0;
+    }
     MasterMetricManager::instance().dec_total_nof_capacity(
         segment_name, metrics_dec_capacity);
 
