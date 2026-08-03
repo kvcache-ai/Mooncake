@@ -857,6 +857,18 @@ jobs:
     uses: ./.github/workflows/ci_efa.yml
     secrets: inherit
 
+  build-wheel-rocm:
+    needs: [spell-check, clang-format, check-paths]
+    if: >-
+      (needs.check-paths.outputs.should-run-downstream == 'true' ||
+       github.event_name == 'workflow_dispatch') &&
+      (github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch' ||
+       github.event.action == 'opened' ||
+       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+    uses: ./.github/workflows/ci_rocm.yml
+    secrets: inherit
+
   ascend-test:
     needs: [build, check-paths]
     if: needs.check-paths.outputs.should-run-downstream == 'true'
@@ -987,6 +999,7 @@ jobs:
       - test-wheel-ubuntu
       - build-wheel-cu13
       - build-wheel-efa
+      - build-wheel-rocm
       - tent-ci
       - ascend-test
       - integration-test

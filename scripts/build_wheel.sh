@@ -173,7 +173,7 @@ cleanup_wheel_metadata_state() {
 }
 trap cleanup_wheel_metadata_state EXIT
 
-BUILD_VARIANTS="NON_CUDA_BUILD CU13_BUILD NPU_BUILD EFA_BUILD EFA_NON_CUDA_BUILD MUSA_BUILD"
+BUILD_VARIANTS="NON_CUDA_BUILD CU13_BUILD NPU_BUILD EFA_BUILD EFA_NON_CUDA_BUILD MUSA_BUILD HIP_BUILD"
 BUILD_VARIANT_COUNT=0
 for build_variant in $BUILD_VARIANTS; do
     if [ "${!build_variant}" = "1" ]; then
@@ -257,6 +257,16 @@ elif [ "$MUSA_BUILD" = "1" ]; then
     sed -i 's|"Environment :: GPU :: NVIDIA CUDA"|"Environment :: GPU"|' pyproject.toml
     sed -i 's|"Programming Language :: Python :: 3.10"|"Programming Language :: Python :: 3.9", "Programming Language :: Python :: 3.10"|' pyproject.toml
     echo "Package name modified to: mooncake-transfer-engine-musa"
+elif [ "$HIP_BUILD" = "1" ]; then
+    echo "Modifying package name for AMD ROCm/HIP build"
+    # Backup original pyproject.toml
+    cp pyproject.toml pyproject.toml.backup
+    # Replace package name and description
+    sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-rocm"/' pyproject.toml
+    sed -i 's/^description = "\(.*\)"$/description = "\1 (AMD ROCm version)"/' pyproject.toml
+    sed -i 's/^keywords = \[\(.*\)\]$/keywords = [\1, "rocm", "amd", "hip"]/' pyproject.toml
+    sed -i 's|"Environment :: GPU :: NVIDIA CUDA"|"Environment :: GPU"|' pyproject.toml
+    echo "Package name modified to: mooncake-transfer-engine-rocm"
 else
     echo "Using standard package name: mooncake-transfer-engine"
 fi
