@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 
 #include <cstdlib>
+#include <map>
 #include <string>
 
 #include "client_metric.h"
@@ -85,9 +86,9 @@ TEST_F(ClientMetricsTest, MasterClientMetricsSummaryTest) {
     summary = metrics.summary_metrics();
 
     // Check that RPC calls are recorded
-    EXPECT_TRUE(summary.find("GetReplicaList: count=2") != std::string::npos);
-    EXPECT_TRUE(summary.find("MountSegment: count=1") != std::string::npos);
-    EXPECT_TRUE(summary.find("UnmountSegment: count=1") != std::string::npos);
+    EXPECT_TRUE(summary.find("GetReplicaList: total=2") != std::string::npos);
+    EXPECT_TRUE(summary.find("MountSegment: total=1") != std::string::npos);
+    EXPECT_TRUE(summary.find("UnmountSegment: total=1") != std::string::npos);
 
     // Check percentiles are present for RPCs with data
     EXPECT_TRUE(summary.find("p95<") != std::string::npos);
@@ -118,7 +119,7 @@ TEST_F(ClientMetricsTest, ClientMetricsSummaryTest) {
     EXPECT_TRUE(summary.find("RPC Metrics Summary") != std::string::npos);
     EXPECT_TRUE(summary.find("Total Read: 5.00 MB") != std::string::npos);
     EXPECT_TRUE(summary.find("Total Write: 10.00 MB") != std::string::npos);
-    EXPECT_TRUE(summary.find("ExistKey: count=1") != std::string::npos);
+    EXPECT_TRUE(summary.find("ExistKey: total=1") != std::string::npos);
 
     std::cout << "Full Client Metrics Summary:\n" << summary << std::endl;
 }
@@ -281,35 +282,35 @@ TEST_F(ClientMetricsTest, P2PClientMetricBasicTest) {
                 std::string::npos);
 
     // Add put data
-    metrics.local_request.put_requests.inc();
-    metrics.local_request.put_requests.inc();
-    metrics.local_request.put_failures.inc();
-    metrics.local_request.put_bytes.inc(1024 * 1024);  // 1 MB
-    metrics.local_request.put_latency_success.observe(200);
-    metrics.local_request.put_latency_success.observe(300);
-    metrics.local_request.put_latency_failure.observe(500);
+    metrics.total_request.put_requests.inc();
+    metrics.total_request.put_requests.inc();
+    metrics.total_request.put_failures.inc();
+    metrics.total_request.put_bytes.inc(1024 * 1024);  // 1 MB
+    metrics.total_request.put_latency_success.observe(200);
+    metrics.total_request.put_latency_success.observe(300);
+    metrics.total_request.put_latency_failure.observe(500);
 
-    metrics.local_request.write_revoke_requests.inc(3);
-    metrics.local_request.write_revoke_failures.inc(1);
-    metrics.local_request.write_revoke_latency_success.observe(80);
-    metrics.local_request.write_revoke_latency_failure.observe(120);
+    metrics.rollback.write_revoke_requests.inc(3);
+    metrics.rollback.write_revoke_failures.inc(1);
+    metrics.rollback.write_revoke_latency_success.observe(80);
+    metrics.rollback.write_revoke_latency_failure.observe(120);
 
-    metrics.local_request.unpin_key_requests.inc(5);
-    metrics.local_request.unpin_key_failures.inc(2);
-    metrics.local_request.unpin_key_latency_success.observe(60);
-    metrics.local_request.unpin_key_latency_failure.observe(90);
+    metrics.rollback.unpin_key_requests.inc(5);
+    metrics.rollback.unpin_key_failures.inc(2);
+    metrics.rollback.unpin_key_latency_success.observe(60);
+    metrics.rollback.unpin_key_latency_failure.observe(90);
 
     // Add get data
-    metrics.local_request.get_requests.inc();
-    metrics.local_request.get_requests.inc();
-    metrics.local_request.get_requests.inc();
-    metrics.local_request.get_failures.inc();
-    metrics.local_request.get_misses.inc();
-    metrics.local_request.get_hits.inc();
-    metrics.local_request.get_bytes.inc(2 * 1024 * 1024);  // 2 MB
-    metrics.local_request.get_latency_success.observe(100);
-    metrics.local_request.get_latency_success.observe(150);
-    metrics.local_request.get_latency_failure.observe(400);
+    metrics.total_request.get_requests.inc();
+    metrics.total_request.get_requests.inc();
+    metrics.total_request.get_requests.inc();
+    metrics.total_request.get_failures.inc();
+    metrics.total_request.get_misses.inc();
+    metrics.total_request.get_hits.inc();
+    metrics.total_request.get_bytes.inc(2 * 1024 * 1024);  // 2 MB
+    metrics.total_request.get_latency_success.observe(100);
+    metrics.total_request.get_latency_success.observe(150);
+    metrics.total_request.get_latency_failure.observe(400);
 
     summary = metrics.summary_metrics();
     EXPECT_TRUE(summary.find("Put: 2 requests") != std::string::npos);
@@ -330,55 +331,55 @@ TEST_F(ClientMetricsTest, P2PClientMetricSerializeTest) {
     P2PClientMetric metrics;
 
     // Add some data
-    metrics.local_request.put_requests.inc(100);
-    metrics.local_request.put_bytes.inc(50 * 1024 * 1024);  // 50 MB
-    metrics.local_request.get_requests.inc(500);
-    metrics.local_request.get_misses.inc(20);
-    metrics.local_request.get_hits.inc(480);
-    metrics.local_request.get_bytes.inc(100 * 1024 * 1024);  // 100 MB
+    metrics.total_request.put_requests.inc(100);
+    metrics.total_request.put_bytes.inc(50 * 1024 * 1024);  // 50 MB
+    metrics.total_request.get_requests.inc(500);
+    metrics.total_request.get_misses.inc(20);
+    metrics.total_request.get_hits.inc(480);
+    metrics.total_request.get_bytes.inc(100 * 1024 * 1024);  // 100 MB
 
     // Add latency data to test histogram output
-    metrics.local_request.put_latency_success.observe(200);
-    metrics.local_request.put_latency_success.observe(300);
-    metrics.local_request.put_latency_failure.observe(500);
-    metrics.local_request.get_latency_success.observe(100);
-    metrics.local_request.get_latency_failure.observe(400);
-    metrics.local_request.write_revoke_requests.inc(4);
-    metrics.local_request.unpin_key_requests.inc(6);
+    metrics.total_request.put_latency_success.observe(200);
+    metrics.total_request.put_latency_success.observe(300);
+    metrics.total_request.put_latency_failure.observe(500);
+    metrics.total_request.get_latency_success.observe(100);
+    metrics.total_request.get_latency_failure.observe(400);
+    metrics.rollback.write_revoke_requests.inc(4);
+    metrics.rollback.unpin_key_requests.inc(6);
 
     std::string serialized;
     metrics.serialize(serialized);
 
     // Verify Prometheus format output
-    EXPECT_TRUE(serialized.find("mooncake_p2p_local_put_requests_total 100") !=
+    EXPECT_TRUE(serialized.find("mooncake_p2p_total_put_requests_total 100") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find(
+                    "mooncake_p2p_rollback_write_revoke_requests_total 4") !=
                 std::string::npos);
     EXPECT_TRUE(
-        serialized.find("mooncake_p2p_local_write_revoke_requests_total 4") !=
+        serialized.find("mooncake_p2p_rollback_unpin_key_requests_total 6") !=
         std::string::npos);
     EXPECT_TRUE(
-        serialized.find("mooncake_p2p_local_unpin_key_requests_total 6") !=
+        serialized.find("mooncake_p2p_total_put_bytes_total 52428800") !=
         std::string::npos);
-    EXPECT_TRUE(
-        serialized.find("mooncake_p2p_local_put_bytes_total 52428800") !=
-        std::string::npos);
-    EXPECT_TRUE(serialized.find("mooncake_p2p_local_get_requests_total 500") !=
+    EXPECT_TRUE(serialized.find("mooncake_p2p_total_get_requests_total 500") !=
                 std::string::npos);
-    EXPECT_TRUE(serialized.find("mooncake_p2p_local_get_misses_total 20") !=
+    EXPECT_TRUE(serialized.find("mooncake_p2p_total_get_misses_total 20") !=
                 std::string::npos);
-    EXPECT_TRUE(serialized.find("mooncake_p2p_local_get_hits_total 480") !=
+    EXPECT_TRUE(serialized.find("mooncake_p2p_total_get_hits_total 480") !=
                 std::string::npos);
     EXPECT_TRUE(
-        serialized.find("mooncake_p2p_local_get_bytes_total 104857600") !=
+        serialized.find("mooncake_p2p_total_get_bytes_total 104857600") !=
         std::string::npos);
 
     // Verify histogram metrics are present (only output when data exists)
-    EXPECT_TRUE(serialized.find("mooncake_p2p_local_put_latency_success_us") !=
+    EXPECT_TRUE(serialized.find("mooncake_p2p_total_put_latency_success_us") !=
                 std::string::npos);
-    EXPECT_TRUE(serialized.find("mooncake_p2p_local_put_latency_failure_us") !=
+    EXPECT_TRUE(serialized.find("mooncake_p2p_total_put_latency_failure_us") !=
                 std::string::npos);
-    EXPECT_TRUE(serialized.find("mooncake_p2p_local_get_latency_success_us") !=
+    EXPECT_TRUE(serialized.find("mooncake_p2p_total_get_latency_success_us") !=
                 std::string::npos);
-    EXPECT_TRUE(serialized.find("mooncake_p2p_local_get_latency_failure_us") !=
+    EXPECT_TRUE(serialized.find("mooncake_p2p_total_get_latency_failure_us") !=
                 std::string::npos);
 
     std::cout << "P2P Client Serialized Metrics:\n" << serialized << std::endl;
@@ -390,8 +391,8 @@ TEST_F(ClientMetricsTest, P2PClientMetricWithLabelsTest) {
 
     auto metrics = P2PClientMetric::Create(labels);
     ASSERT_NE(metrics, nullptr);
-    metrics->local_request.put_requests.inc();
-    metrics->local_request.get_requests.inc();
+    metrics->total_request.put_requests.inc();
+    metrics->total_request.get_requests.inc();
 
     std::string serialized;
     metrics->serialize(serialized);
@@ -412,8 +413,8 @@ TEST_F(ClientMetricsTest, P2PClientMetricInheritanceTest) {
     p2p_metrics->transfer_metric.total_read_bytes.inc(1024 * 1024);  // 1 MB
     p2p_metrics->transfer_metric.total_write_bytes.inc(2 * 1024 *
                                                        1024);  // 2 MB
-    p2p_metrics->local_request.get_requests.inc(100);
-    p2p_metrics->local_request.put_requests.inc(50);
+    p2p_metrics->total_request.get_requests.inc(100);
+    p2p_metrics->total_request.put_requests.inc(50);
 
     // Test serialize includes both base and P2P metrics
     std::string serialized;
@@ -422,18 +423,18 @@ TEST_F(ClientMetricsTest, P2PClientMetricInheritanceTest) {
                 std::string::npos);  // Base class metric
     EXPECT_TRUE(serialized.find("mooncake_transfer_write_bytes") !=
                 std::string::npos);  // Base class metric
-    EXPECT_TRUE(serialized.find("mooncake_p2p_local_get_requests_total") !=
+    EXPECT_TRUE(serialized.find("mooncake_p2p_total_get_requests_total") !=
                 std::string::npos);  // P2P-specific metric
-    EXPECT_TRUE(serialized.find("mooncake_p2p_local_put_requests_total") !=
+    EXPECT_TRUE(serialized.find("mooncake_p2p_total_put_requests_total") !=
                 std::string::npos);  // P2P-specific metric
 
-    // Test summary_metrics includes both base and P2P metrics
+    // Test summary_metrics includes both base and P2P metrics.
+    // Note: transfer metrics are not recorded in P2P mode, so the P2P
+    // summary intentionally skips the transfer section.
     std::string summary = p2p_metrics->summary_metrics();
-    EXPECT_TRUE(summary.find("Transfer Metrics Summary") !=
-                std::string::npos);  // Base class summary
     EXPECT_TRUE(summary.find("RPC Metrics Summary") !=
                 std::string::npos);  // Base class summary
-    EXPECT_TRUE(summary.find("P2P Local Request Metrics") !=
+    EXPECT_TRUE(summary.find("P2P Total (per-request)") !=
                 std::string::npos);  // P2P-specific summary
     EXPECT_TRUE(summary.find("Get: 100 requests") != std::string::npos);
     EXPECT_TRUE(summary.find("Put: 50 requests") != std::string::npos);
@@ -492,15 +493,15 @@ TEST_F(ClientMetricsTest, P2PClientMetricPeerRequestTest) {
     EXPECT_TRUE(summary.find("PreWrite: 20 requests") != std::string::npos);
 }
 
-// Test both local_request and peer_request_metrics together
+// Test both total_request and peer_request_metrics together
 TEST_F(ClientMetricsTest, P2PClientMetricBothLocalAndPeerTest) {
     P2PClientMetric metrics;
 
-    metrics.local_request.get_requests.inc(1000);
-    metrics.local_request.get_hits.inc(900);
-    metrics.local_request.get_misses.inc(50);
-    metrics.local_request.get_failures.inc(50);
-    metrics.local_request.get_bytes.inc(100 * 1024 * 1024);  // 100 MB
+    metrics.total_request.get_requests.inc(1000);
+    metrics.total_request.get_hits.inc(900);
+    metrics.total_request.get_misses.inc(50);
+    metrics.total_request.get_failures.inc(50);
+    metrics.total_request.get_bytes.inc(100 * 1024 * 1024);  // 100 MB
 
     metrics.peer_request_metrics.pin_key.requests.inc(500);
     metrics.peer_request_metrics.pin_key.hits.inc(400);
@@ -508,18 +509,18 @@ TEST_F(ClientMetricsTest, P2PClientMetricBothLocalAndPeerTest) {
     std::string serialized;
     metrics.serialize(serialized);
 
-    EXPECT_TRUE(serialized.find("mooncake_p2p_local_get_requests_total 1000") !=
+    EXPECT_TRUE(serialized.find("mooncake_p2p_total_get_requests_total 1000") !=
                 std::string::npos);
     EXPECT_TRUE(
         serialized.find("mooncake_p2p_peer_pin_key_requests_total 500") !=
         std::string::npos);
-    EXPECT_TRUE(serialized.find("mooncake_p2p_local_get_hits_total 900") !=
+    EXPECT_TRUE(serialized.find("mooncake_p2p_total_get_hits_total 900") !=
                 std::string::npos);
     EXPECT_TRUE(serialized.find("mooncake_p2p_peer_pin_key_hits_total 400") !=
                 std::string::npos);
 
     std::string summary = metrics.summary_metrics();
-    EXPECT_TRUE(summary.find("P2P Local Request Metrics") != std::string::npos);
+    EXPECT_TRUE(summary.find("P2P Total (per-request)") != std::string::npos);
     EXPECT_TRUE(summary.find("P2P Peer Request Metrics") != std::string::npos);
 
     std::cout << "P2P Both Local and Peer Metrics Summary:\n"
@@ -537,6 +538,108 @@ TEST_F(ClientMetricsTest, P2PClientMetricCreateReturnsInstance) {
     auto p2p_metrics = P2PClientMetric::Create({});
     EXPECT_NE(p2p_metrics, nullptr);
     EXPECT_EQ(p2p_metrics->GetReportingInterval(), 0u);
+}
+
+TEST_F(ClientMetricsTest, DataMetricRecordGetSemanticsTest) {
+    DataMetric dm("mooncake_p2p_test");
+
+    // Success: hit + bytes + success latency sample.
+    dm.RecordGet(100, ErrorCode::OK, 64);
+    EXPECT_EQ(dm.get_requests.value(), 1);
+    EXPECT_EQ(dm.get_hits.value(), 1);
+    EXPECT_EQ(dm.get_bytes.value(), 64);
+
+    // Miss: counted, but no latency sample.
+    dm.RecordGet(120, ErrorCode::OBJECT_NOT_FOUND, 0);
+    EXPECT_EQ(dm.get_requests.value(), 2);
+    EXPECT_EQ(dm.get_misses.value(), 1);
+    EXPECT_EQ(dm.get_failures.value(), 0);
+
+    // Other errors: failure + failure latency sample.
+    dm.RecordGet(200, ErrorCode::INTERNAL_ERROR, 0);
+    EXPECT_EQ(dm.get_requests.value(), 3);
+    EXPECT_EQ(dm.get_failures.value(), 1);
+
+    std::string summary = dm.summary_metrics();
+    EXPECT_TRUE(summary.find("Get: 3 requests, 1 hits, 1 misses, 1 failures") !=
+                std::string::npos);
+    // Only the OK sample landed in the success histogram.
+    EXPECT_TRUE(summary.find("success: count=1") != std::string::npos);
+}
+
+TEST_F(ClientMetricsTest, DataMetricRecordPutSemanticsTest) {
+    DataMetric dm("mooncake_p2p_test");
+
+    // Success: bytes + success latency sample.
+    dm.RecordPut(100, ErrorCode::OK, 128);
+    EXPECT_EQ(dm.put_requests.value(), 1);
+    EXPECT_EQ(dm.put_bytes.value(), 128);
+    EXPECT_EQ(dm.put_failures.value(), 0);
+
+    // Failure: failure counter + failure latency sample, no bytes.
+    dm.RecordPut(300, ErrorCode::INTERNAL_ERROR, 128);
+    EXPECT_EQ(dm.put_requests.value(), 2);
+    EXPECT_EQ(dm.put_failures.value(), 1);
+    EXPECT_EQ(dm.put_bytes.value(), 128);
+
+    // Already-exists errors are ignored entirely: no counters, no latency.
+    const ErrorCode already_exists[] = {ErrorCode::OBJECT_ALREADY_EXISTS,
+                                        ErrorCode::REPLICA_ALREADY_EXISTS,
+                                        ErrorCode::REPLICA_NUM_EXCEEDED};
+    for (auto err : already_exists) {
+        dm.RecordPut(50, err, 10);
+    }
+    EXPECT_EQ(dm.put_requests.value(), 2);
+    EXPECT_EQ(dm.put_failures.value(), 1);
+    EXPECT_EQ(dm.put_bytes.value(), 128);
+
+    std::string summary = dm.summary_metrics();
+    EXPECT_TRUE(summary.find("Put: 2 requests, 1 failures") !=
+                std::string::npos);
+    EXPECT_TRUE(summary.find("written") != std::string::npos);
+}
+
+TEST_F(ClientMetricsTest, FormatLatencySummarySingleSampleTest) {
+    // A single sample in a high bucket must not be reported as p95 of the
+    // first bucket (p95_target rounds to at least 1).
+    ylt::metric::histogram_t hist("test_single_sample_hist", "test",
+                                  kLatencyBucket,
+                                  std::map<std::string, std::string>{});
+    hist.observe(5000);
+
+    std::string summary = format_latency_summary(hist);
+    EXPECT_TRUE(summary.find("count=1") != std::string::npos);
+    EXPECT_TRUE(summary.find("p95<5000μs") != std::string::npos);
+    EXPECT_TRUE(summary.find("max<5000μs") != std::string::npos);
+    EXPECT_TRUE(summary.find("p95<125μs") == std::string::npos);
+
+    // Same boundary through the labeled RPC histogram path.
+    MasterClientMetric master_metrics;
+    std::array<std::string, 1> label = {"GetReplicaList"};
+    master_metrics.rpc_count.inc(label);
+    master_metrics.rpc_latency.observe(label, 5000);
+
+    std::string rpc_summary = master_metrics.summary_metrics();
+    EXPECT_TRUE(
+        rpc_summary.find("GetReplicaList: total=1, success=1, p95<5000μs") !=
+        std::string::npos);
+    EXPECT_TRUE(rpc_summary.find("p95<125μs") == std::string::npos);
+}
+
+TEST_F(ClientMetricsTest, P2PClientMetricRetryCountersTest) {
+    P2PClientMetric metrics;
+    metrics.remote_request.write_retries.inc(3);
+    metrics.remote_request.read_retries.inc(2);
+
+    std::string serialized;
+    metrics.serialize(serialized);
+    EXPECT_TRUE(serialized.find("mooncake_p2p_remote_write_retries_total 3") !=
+                std::string::npos);
+    EXPECT_TRUE(serialized.find("mooncake_p2p_remote_read_retries_total 2") !=
+                std::string::npos);
+
+    std::string summary = metrics.summary_metrics();
+    EXPECT_TRUE(summary.find("Retries: write=3, read=2") != std::string::npos);
 }
 
 }  // namespace mooncake::test

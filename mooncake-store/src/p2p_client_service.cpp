@@ -27,12 +27,6 @@ namespace {
 // success; a missing owner record is already OK (idempotent).
 constexpr int kRevokeRetryMaxCnt = 3;
 
-inline bool IsAlreadyExistsError(ErrorCode err) {
-    return err == ErrorCode::REPLICA_NUM_EXCEEDED ||
-           err == ErrorCode::REPLICA_ALREADY_EXISTS ||
-           err == ErrorCode::OBJECT_ALREADY_EXISTS;
-}
-
 }  // namespace
 
 // ============================================================================
@@ -261,7 +255,7 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
     }
 
     // 9. Start P2P client RPC service
-    client_rpc_service_.emplace(*data_manager_, metrics_.get());
+    client_rpc_service_.emplace(*data_manager_, metrics_);
     client_rpc_server_ = std::make_unique<coro_rpc::coro_rpc_server>(
         config.rpc_thread_num, client_rpc_port_);
     RegisterClientRpcService(*client_rpc_server_, *client_rpc_service_);
@@ -652,9 +646,9 @@ void P2PClientService::OnHAEvent(HAEvent event) {
 void P2PClientService::RecordLocalInflight(bool entering) {
     if (!metrics_) return;
     if (entering) {
-        metrics_->local_request.inflight.inc();
+        metrics_->total_request.inflight.inc();
     } else {
-        metrics_->local_request.inflight.dec();
+        metrics_->total_request.inflight.dec();
     }
 }
 
@@ -691,10 +685,11 @@ std::vector<tl::expected<void, ErrorCode>> P2PClientService::BatchPut(
     ScopedVLogTimer timer(1, "P2PClientService::BatchPut");
     timer.LogRequest("batch_size=", keys.size());
 
-    Stopwatch stopwatch;
-    if (metrics_) {
-        metrics_->local_request.put_requests.inc(keys.size());
-    }
+    auto batch_start = std::chrono::steady_clock::now();
+
+    // Compute sizes once after validation; reused by routing and metric
+    // recording. Empty on invalid-input paths.
+    std::vector<size_t> sizes;
 
     auto guard = AcquireInflightGuard();
     const auto* route_cfg_ptr = std::get_if<WriteRouteRequestConfig>(&config);
@@ -715,34 +710,35 @@ std::vector<tl::expected<void, ErrorCode>> P2PClientService::BatchPut(
         std::fill(results.begin(), results.end(),
                   tl::unexpected(ErrorCode::INVALID_PARAMS));
     } else {
-        results = InnerBatchPut(keys, batched_slices, *route_cfg_ptr);
+        sizes.resize(keys.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            sizes[i] = ClientService::CalculateSliceSize(batched_slices[i]);
+        }
+        results = InnerBatchPut(keys, batched_slices, sizes, *route_cfg_ptr);
     }
 
+    // Record batch-level metric and count successes in one pass.
+    auto batch_elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - batch_start)
+                             .count();
     size_t success_count = 0;
     for (size_t i = 0; i < results.size(); ++i) {
+        if (metrics_) {
+            ErrorCode err =
+                results[i].has_value() ? ErrorCode::OK : results[i].error();
+            // sizes is only populated on the valid-input path; bytes are
+            // counted for successful puts only anyway.
+            uint64_t bytes = i < sizes.size() ? sizes[i] : 0;
+            metrics_->total_request.RecordPut(batch_elapsed, err, bytes);
+        }
+        // An idempotent rewrite (already exists) surfaces as success to the
+        // caller but is ignored in all metric layers.
+        if (!results[i].has_value() &&
+            IsAlreadyExistsError(results[i].error())) {
+            results[i] = {};
+        }
         if (results[i].has_value()) {
             success_count++;
-        }
-    }
-
-    if (metrics_) {
-        const auto elapsed = stopwatch.elapsed_us();
-        const double avg_latency =
-            keys.empty() ? 0.0 : static_cast<double>(elapsed) / keys.size();
-        for (size_t i = 0; i < results.size(); ++i) {
-            if (results[i].has_value()) {
-                metrics_->local_request.put_bytes.inc(
-                    ClientService::CalculateSliceSize(batched_slices[i]));
-                metrics_->local_request.put_latency_success.observe(
-                    avg_latency);
-            } else {
-                metrics_->local_request.put_latency_failure.observe(
-                    avg_latency);
-            }
-        }
-        const size_t failure_count = keys.size() - success_count;
-        if (failure_count > 0) {
-            metrics_->local_request.put_failures.inc(failure_count);
         }
     }
 
@@ -798,18 +794,26 @@ bool P2PClientService::IsBelowLocalWaterline(
 std::vector<tl::expected<void, ErrorCode>> P2PClientService::InnerBatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
+    const std::vector<size_t>& sizes,
     const WriteRouteRequestConfig& route_config) {
     if (IsLocalWrite(route_config)) {
-        return InnerBatchPutLocalOnly(keys, batched_slices);
+        return InnerBatchPutLocalOnly(keys, batched_slices, sizes);
     }
-    return InnerBatchPutNormal(keys, batched_slices, route_config);
+    return InnerBatchPutNormal(keys, batched_slices, sizes, route_config);
 }
 
 std::vector<tl::expected<void, ErrorCode>>
 P2PClientService::InnerBatchPutLocalOnly(
     const std::vector<ObjectKey>& keys,
-    std::vector<std::vector<Slice>>& batched_slices) {
-    // Phase 1: dispatch all local writes.
+    std::vector<std::vector<Slice>>& batched_slices,
+    const std::vector<size_t>& sizes) {
+    if (!data_manager_.has_value()) {
+        LOG(ERROR) << "Data manager not initialized";
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INTERNAL_ERROR));
+    }
+
+    // Phase 1: dispatch all local writes in parallel.
     std::vector<tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>>
         handles;
     handles.reserve(keys.size());
@@ -818,7 +822,7 @@ P2PClientService::InnerBatchPutLocalOnly(
     }
 
     // Phase 2: wait each handle and collect results.
-    return CollectResults(handles, keys);
+    return CollectResults(handles, keys, metrics_.get(), &sizes);
 }
 
 tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>
@@ -843,31 +847,54 @@ P2PClientService::CreatePutHandleFromLocal(std::string_view key,
 std::vector<tl::expected<void, ErrorCode>> P2PClientService::CollectResults(
     std::vector<tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>>&
         handles,
-    const std::vector<ObjectKey>& keys) {
+    const std::vector<ObjectKey>& keys, P2PClientMetric* metrics,
+    const std::vector<size_t>* sizes) {
     std::vector<tl::expected<void, ErrorCode>> results(
         keys.size(), tl::unexpected(ErrorCode::INTERNAL_ERROR));
     for (size_t i = 0; i < handles.size(); ++i) {
+        auto io_start = std::chrono::steady_clock::now();
         if (!handles[i]) {
-            if (!IsAlreadyExistsError(handles[i].error())) {
+            if (IsAlreadyExistsError(handles[i].error())) {
+                LOG(WARNING) << "Put skipped (already exists), key: " << keys[i]
+                             << ", error: " << handles[i].error();
+            } else {
                 LOG(ERROR) << "Failed to put key: " << keys[i]
                            << ", error: " << handles[i].error();
-                results[i] = tl::unexpected(handles[i].error());
-            } else {
-                results[i] = {};
             }
+            results[i] = tl::unexpected(handles[i].error());
         } else if (!handles[i].value()) {
             LOG(ERROR) << "put task handle is null for key: " << keys[i];
             results[i] = tl::unexpected(ErrorCode::INTERNAL_ERROR);
         } else {
             auto wait_result = handles[i].value()->Wait();
-
-            if (wait_result || IsAlreadyExistsError(wait_result.error())) {
-                results[i] = {};
-            } else {
-                LOG(ERROR) << "Failed to put key: " << keys[i]
-                           << ", error: " << wait_result.error();
-                results[i] = tl::unexpected(wait_result.error());
+            if (!wait_result) {
+                if (IsAlreadyExistsError(wait_result.error())) {
+                    LOG(WARNING)
+                        << "Put skipped (already exists), key: " << keys[i]
+                        << ", error: " << wait_result.error();
+                } else {
+                    LOG(ERROR) << "Failed to put key: " << keys[i]
+                               << ", error: " << wait_result.error();
+                }
             }
+            // Keep the raw error (including already-exists); BatchPut
+            // normalizes it for the caller after metric recording.
+            results[i] = wait_result;
+        }
+        if (metrics && sizes) {
+            // TODO(metric): local write per-op latency is timed around Wait().
+            // This is not fully accurate: for TE mode the transfer is submitted
+            // at Dispatch() and Wait() only polls, so elapsed may undercount;
+            // in a serial wait loop later keys may also undercount because
+            // their I/O makes progress while earlier keys are being waited on.
+            // Will be fixed once TE supports a completion callback.
+            auto elapsed =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - io_start)
+                    .count();
+            ErrorCode err =
+                results[i].has_value() ? ErrorCode::OK : results[i].error();
+            metrics->local_request.RecordPut(elapsed, err, (*sizes)[i]);
         }
     }
     return results;
@@ -877,12 +904,8 @@ std::vector<tl::expected<void, ErrorCode>>
 P2PClientService::InnerBatchPutNormal(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
+    const std::vector<size_t>& sizes,
     const WriteRouteRequestConfig& route_config) {
-    std::vector<size_t> sizes(keys.size());
-    for (size_t i = 0; i < keys.size(); ++i) {
-        sizes[i] = ClientService::CalculateSliceSize(batched_slices[i]);
-    }
-
     // Phase 1: fetch write routes from master.
     auto batch_routes = BatchFetchWriteRoutes(keys, sizes, route_config);
     if (!batch_routes) {
@@ -928,7 +951,7 @@ P2PClientService::CreatePutHandlesFromRoute(
     BatchGetWriteRouteResponse& batch_resp) {
     struct WriteTask {
         std::unique_ptr<TaskHandle<void>> first_task;
-        std::string first_route;
+        std::unique_ptr<WriteOp> first_op;
         std::vector<std::unique_ptr<WriteOp>> retry_op_list;
     };
 
@@ -967,7 +990,7 @@ P2PClientService::CreatePutHandlesFromRoute(
             continue;
         }
         tasks.push_back(WriteTask{std::move(first_task),
-                                  std::move(first_route),
+                                  std::move(ops->front()),
                                   {std::make_move_iterator(ops->begin() + 1),
                                    std::make_move_iterator(ops->end())}});
     }
@@ -986,8 +1009,8 @@ P2PClientService::CreatePutHandlesFromRoute(
             async_simple::Promise<tl::expected<void, ErrorCode>>>();
         auto future = promise->getFuture();
         RunWriteWithRetry(std::move(promise), std::move(task.first_task),
-                          std::move(task.first_route),
-                          std::move(task.retry_op_list), keys[i])
+                          std::move(task.first_op),
+                          std::move(task.retry_op_list), keys[i], sizes[i])
             .start([](auto&&) {});
         handles.push_back(FutureHandle<void>::Create(std::shared_ptr<void>{},
                                                      std::move(future)));
@@ -1049,7 +1072,7 @@ auto P2PClientService::BuildWriteOps(std::string_view key,
                                             Transport::TransferRequest::WRITE);
                 };
                 write_ops.push_back(std::make_unique<RemoteForwardWriteOp>(
-                    peer, metrics_.get(), write_req, endpoint, &slices,
+                    peer, metrics_, write_req, endpoint, &slices,
                     std::move(te_transfer)));
             } else {
                 // segment_id is intentionally left unset: the write route is
@@ -1091,6 +1114,7 @@ std::unique_ptr<TaskHandle<void>> P2PClientService::LocalWriteOp::Dispatch() {
                 return tl::unexpected(ErrorCode::INTERNAL_ERROR);
             });
     }
+    dispatch_start = std::chrono::steady_clock::now();
     auto handle = data_manager->Put(key, *slices);
     if (!handle) {
         if (!IsAlreadyExistsError(handle.error())) {
@@ -1107,6 +1131,7 @@ std::unique_ptr<TaskHandle<void>> P2PClientService::LocalWriteOp::Dispatch() {
 
 std::unique_ptr<TaskHandle<void>>
 P2PClientService::RemoteForwardWriteOp::Dispatch() {
+    dispatch_start = std::chrono::steady_clock::now();
     if (!peer_ptr || !te_transfer || !write_req || !slices) {
         LOG(ERROR) << "Forward remote write missing peer, transfer callback, "
                       "request, or slices";
@@ -1125,6 +1150,7 @@ P2PClientService::RemoteForwardWriteOp::Dispatch() {
 
 std::unique_ptr<TaskHandle<void>>
 P2PClientService::RemoteReverseWriteOp::Dispatch() {
+    dispatch_start = std::chrono::steady_clock::now();
     if (!peer_ptr || !write_req) {
         LOG(ERROR) << "Reverse remote write missing peer or request";
         return CallableTaskHandle<void>::Create(
@@ -1178,46 +1204,74 @@ P2PClientService::RemoteReverseWriteOp::Dispatch() {
 async_simple::coro::Lazy<void> P2PClientService::RunWriteWithRetry(
     std::shared_ptr<async_simple::Promise<tl::expected<void, ErrorCode>>>
         promise,
-    std::unique_ptr<TaskHandle<void>> current_task, std::string current_route,
-    std::vector<std::unique_ptr<WriteOp>> retry_op_list, std::string_view key) {
+    std::unique_ptr<TaskHandle<void>> current_task,
+    std::unique_ptr<WriteOp> current_op,
+    std::vector<std::unique_ptr<WriteOp>> retry_op_list, std::string_view key,
+    size_t object_size) {
     size_t retry_cnt = 0;
     tl::expected<void, ErrorCode> result;
+    // we assume that current_task non-null implies current_op non-null
     while (current_task) {
         try {
             result = co_await current_task->WaitAsync();
         } catch (const std::exception& e) {
             LOG(ERROR) << "Wait threw, key: " << key
-                       << ", route: " << current_route
+                       << ", route: " << current_op->route()
                        << ", what: " << e.what();
             result = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         } catch (...) {
             LOG(ERROR) << "Wait threw unknown, key: " << key
-                       << ", route: " << current_route;
+                       << ", route: " << current_op->route();
             result = tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
+
+        // Per-attempt metric: elapsed from dispatch to completion.
+        if (metrics_) {
+            auto elapsed =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() -
+                    current_op->dispatch_start)
+                    .count();
+            bool is_local = (current_op->route() == "local");
+            ErrorCode err = result.has_value() ? ErrorCode::OK : result.error();
+            if (is_local) {
+                metrics_->local_request.RecordPut(elapsed, err, object_size);
+            } else {
+                metrics_->remote_request.RecordPut(elapsed, err, object_size);
+            }
+        }
+
         if (result.has_value() || IsAlreadyExistsError(result.error())) {
             promise->setValue(std::move(result));
             co_return;
         }
         LOG(ERROR) << "Write candidate failed, key: " << key
-                   << ", route: " << current_route
+                   << ", route: " << current_op->route()
                    << ", retry_cnt: " << retry_cnt
                    << ", error: " << result.error();
         current_task.reset();
+        current_op.reset();
         while (retry_cnt < retry_op_list.size() && !current_task) {
             auto& op = retry_op_list[retry_cnt];
-            current_route = std::string(op->route());
+            current_op = std::move(op);
+            // Count every retry attempt, including ones whose Dispatch
+            // throws below.
+            if (metrics_) {
+                metrics_->remote_request.write_retries.inc();
+            }
             try {
-                current_task = op->Dispatch();
+                current_task = current_op->Dispatch();
             } catch (const std::exception& e) {
                 LOG(ERROR) << "Dispatch threw, key: " << key
-                           << ", route: " << current_route
+                           << ", route: " << current_op->route()
                            << ", retry_cnt: " << retry_cnt
                            << ", what: " << e.what();
+                current_op.reset();
             } catch (...) {
                 LOG(ERROR) << "Dispatch threw unknown, key: " << key
                            << ", retry_cnt: " << retry_cnt
-                           << ", route: " << current_route;
+                           << ", route: " << current_op->route();
+                current_op.reset();
             }
             retry_cnt++;
         }
@@ -1301,15 +1355,12 @@ std::vector<tl::expected<ResultT, ErrorCode>> P2PClientService::BatchGetImpl(
     ScopedVLogTimer timer(1, "P2PClientService::BatchGet");
     timer.LogRequest("batch_size=", keys.size());
 
-    if (metrics_) {
-        metrics_->local_request.get_requests.inc(keys.size());
-    }
+    auto batch_start = std::chrono::steady_clock::now();
 
     std::vector<tl::expected<ResultT, ErrorCode>> results(
         keys.size(), tl::unexpected(ErrorCode::INTERNAL_ERROR));
     std::vector<tl::expected<ReadTaskHandle, ErrorCode>> handles;
 
-    Stopwatch stopwatch;
     auto guard = AcquireInflightGuard();
     if (!guard.is_valid()) {
         LOG(ERROR) << "client is shutting down";
@@ -1331,7 +1382,12 @@ std::vector<tl::expected<ResultT, ErrorCode>> P2PClientService::BatchGetImpl(
                     }
                     results[i] = tl::unexpected(handles[i].error());
                 } else {
+                    auto io_start = std::chrono::steady_clock::now();
                     auto wait_result = handles[i]->task_handle->Wait();
+                    auto elapsed =
+                        std::chrono::duration_cast<std::chrono::microseconds>(
+                            std::chrono::steady_clock::now() - io_start)
+                            .count();
                     if (!wait_result) {
                         if (wait_result.error() !=
                             ErrorCode::OBJECT_NOT_FOUND) {
@@ -1344,35 +1400,42 @@ std::vector<tl::expected<ResultT, ErrorCode>> P2PClientService::BatchGetImpl(
                     } else {
                         results[i] = extract(handles[i].value());
                     }
+                    // Record per-key local read metric.
+                    if (metrics_ && handles[i]->is_local) {
+                        // TODO(wanyue.wy):
+                        // Currently the latency of local read per-op is not
+                        // accurate. Before the Wait() function is executed, the
+                        // data may have already been transferred to the target
+                        // buffer. This issue will be fixed once TE supports a
+                        // completion callback.
+                        ErrorCode err = results[i].has_value()
+                                            ? ErrorCode::OK
+                                            : results[i].error();
+                        uint64_t bytes =
+                            results[i].has_value() ? handles[i]->data_size : 0;
+                        metrics_->local_request.RecordGet(elapsed, err, bytes);
+                    }
                 }
             }  // end for
         }
     }
 
+    // Record batch-level metric and count successes in one pass.
+    auto batch_elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - batch_start)
+                             .count();
     size_t success_count = 0;
     for (size_t i = 0; i < results.size(); ++i) {
         if (results[i].has_value()) {
             success_count++;
         }
-    }
-
-    if (metrics_) {
-        const auto elapsed = stopwatch.elapsed_us();
-        const double avg_latency =
-            keys.empty() ? 0.0 : static_cast<double>(elapsed) / keys.size();
-        for (size_t i = 0; i < results.size(); ++i) {
-            if (results[i].has_value()) {
-                metrics_->local_request.get_bytes.inc(handles[i]->data_size);
-                metrics_->local_request.get_latency_success.observe(
-                    avg_latency);
-            } else {
-                metrics_->local_request.get_latency_failure.observe(
-                    avg_latency);
-            }
-        }
-        const size_t failure_count = keys.size() - success_count;
-        if (failure_count > 0) {
-            metrics_->local_request.get_failures.inc(failure_count);
+        if (metrics_) {
+            ErrorCode err =
+                results[i].has_value() ? ErrorCode::OK : results[i].error();
+            uint64_t bytes = results[i].has_value()
+                                 ? static_cast<uint64_t>(handles[i]->data_size)
+                                 : 0;
+            metrics_->total_request.RecordGet(batch_elapsed, err, bytes);
         }
     }
 
@@ -1436,23 +1499,29 @@ P2PClientService::BatchCreateGetHandlesImpl(
     // Phase A: try local for all keys; collect indices that need remote fetch.
     std::vector<size_t> miss_indices;
     for (size_t i = 0; i < keys.size(); ++i) {
+        auto start = std::chrono::steady_clock::now();
         auto local = local_get(keys[i], i);
+        auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                           std::chrono::steady_clock::now() - start)
+                           .count();
         if (local.has_value()) {
             handles[i] = std::move(local.value());
-            // Count local cache hits
-            if (metrics_) {
-                metrics_->local_request.get_hits.inc();
-            }
+            handles[i]->is_local = true;
+            // Local hit: per-attempt metric recorded after Wait() in
+            // BatchGetImpl.
         } else if (local.error() != ErrorCode::OBJECT_NOT_FOUND) {
             LOG(ERROR) << "Failed to get from local, key: " << keys[i]
                        << ", error: " << local.error();
             handles[i] = tl::unexpected(local.error());
-        } else {
-            miss_indices.push_back(i);
-            // Count local cache misses
             if (metrics_) {
-                metrics_->local_request.get_misses.inc();
+                metrics_->local_request.RecordGet(elapsed, local.error(), 0);
             }
+        } else {
+            if (metrics_) {
+                metrics_->local_request.RecordGet(
+                    elapsed, ErrorCode::OBJECT_NOT_FOUND, 0);
+            }
+            miss_indices.push_back(i);
         }
     }
 
@@ -1737,7 +1806,7 @@ async_simple::coro::Lazy<ErrorCode> P2PClientService::RunForwardReadOnRoute(
         tl::expected<void, ErrorCode> cleanup_unpin;
         for (int attempt = 0; attempt < kRevokeRetryMaxCnt; ++attempt) {
             if (metrics_) {
-                metrics_->local_request.unpin_key_requests.inc();
+                metrics_->rollback.unpin_key_requests.inc();
             }
             cleanup_unpin = co_await route.peer->AsyncUnPinKey(cleanup);
             if (cleanup_unpin) {
@@ -1756,11 +1825,11 @@ async_simple::coro::Lazy<ErrorCode> P2PClientService::RunForwardReadOnRoute(
         }
         if (metrics_) {
             if (cleanup_unpin) {
-                metrics_->local_request.unpin_key_latency_success.observe(
+                metrics_->rollback.unpin_key_latency_success.observe(
                     rollback_sw.elapsed_us());
             } else {
-                metrics_->local_request.unpin_key_failures.inc();
-                metrics_->local_request.unpin_key_latency_failure.observe(
+                metrics_->rollback.unpin_key_failures.inc();
+                metrics_->rollback.unpin_key_latency_failure.observe(
                     rollback_sw.elapsed_us());
             }
         }
@@ -1782,9 +1851,17 @@ async_simple::coro::Lazy<void> P2PClientService::RunReadWithRetry(
     RouteIterator iter, std::shared_ptr<RemoteReadRequest> req,
     std::shared_ptr<async_simple::Promise<tl::expected<void, ErrorCode>>>
         promise) {
+    const uint64_t object_size = iter.object_size();
     ErrorCode final_result = ErrorCode::OBJECT_NOT_FOUND;
     try {
+        bool first_attempt = true;
         while (auto route = co_await iter.AsyncNext()) {
+            // Every route iteration after the first is a retry.
+            if (!first_attempt && metrics_) {
+                metrics_->remote_request.read_retries.inc();
+            }
+            first_attempt = false;
+            auto attempt_start = std::chrono::steady_clock::now();
             try {
                 const bool forward_read =
                     transfer_direction_mode_ == TransferDirectionMode::FORWARD;
@@ -1797,6 +1874,15 @@ async_simple::coro::Lazy<void> P2PClientService::RunReadWithRetry(
                         co_await route->peer->AsyncReadRemoteData(*req);
                     route_result =
                         result.has_value() ? ErrorCode::OK : result.error();
+                }
+
+                auto elapsed =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - attempt_start)
+                        .count();
+                if (metrics_) {
+                    metrics_->remote_request.RecordGet(elapsed, route_result,
+                                                       object_size);
                 }
 
                 if (route_result == ErrorCode::OK) {
@@ -1815,8 +1901,6 @@ async_simple::coro::Lazy<void> P2PClientService::RunReadWithRetry(
                         << ", client_id: " << route->proxy.client_id
                         << ", segment_id: " << route->proxy.segment_id
                         << ", is_cached: " << route->is_cached;
-                    // Request/local constraint errors; another route cannot
-                    // help.
                     if (route_result == ErrorCode::INVALID_PARAMS ||
                         route_result == ErrorCode::NOT_IMPLEMENTED) {
                         promise->setValue(tl::expected<void, ErrorCode>(
@@ -1827,6 +1911,15 @@ async_simple::coro::Lazy<void> P2PClientService::RunReadWithRetry(
 
                 final_result = route_result;
             } catch (const std::exception& e) {
+                auto elapsed =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - attempt_start)
+                        .count();
+                if (metrics_) {
+                    metrics_->remote_request.RecordGet(
+                        elapsed, ErrorCode::INTERNAL_ERROR, object_size);
+                }
+
                 final_result = ErrorCode::INTERNAL_ERROR;
                 LOG(ERROR) << "Failed to get from remote, key: " << req->key
                            << ", exception: " << e.what()
@@ -1836,6 +1929,14 @@ async_simple::coro::Lazy<void> P2PClientService::RunReadWithRetry(
                            << ", segment_id: " << route->proxy.segment_id
                            << ", is_cached: " << route->is_cached;
             } catch (...) {
+                auto elapsed =
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - attempt_start)
+                        .count();
+                if (metrics_) {
+                    metrics_->remote_request.RecordGet(
+                        elapsed, ErrorCode::INTERNAL_ERROR, object_size);
+                }
                 final_result = ErrorCode::INTERNAL_ERROR;
                 LOG(ERROR) << "Failed to get from remote, key: " << req->key
                            << ", unknown exception"
@@ -2293,7 +2394,7 @@ PeerClient& P2PClientService::GetOrCreatePeerClient(
 async_simple::coro::Lazy<void>
 P2PClientService::RemoteForwardWriteOp::RunForwardRemotePut(
     std::shared_ptr<WritePromise> promise, PeerClient* peer,
-    P2PClientMetric* metrics, TeTransferFn te_transfer,
+    std::shared_ptr<P2PClientMetric> metrics, TeTransferFn te_transfer,
     std::shared_ptr<RemoteWriteRequest> write_req, std::vector<Slice>* slices) {
     if (!peer || !te_transfer || !write_req || !slices) {
         promise->setValue(tl::expected<void, ErrorCode>(
@@ -2337,7 +2438,7 @@ P2PClientService::RemoteForwardWriteOp::RunForwardRemotePut(
         tl::expected<void, ErrorCode> revoke_res;
         for (int attempt = 0; attempt < kRevokeRetryMaxCnt; ++attempt) {
             if (metrics) {
-                metrics->local_request.write_revoke_requests.inc();
+                metrics->rollback.write_revoke_requests.inc();
             }
             revoke_res = co_await peer->AsyncWriteRevoke(revoke_req);
             if (revoke_res) {
@@ -2355,11 +2456,11 @@ P2PClientService::RemoteForwardWriteOp::RunForwardRemotePut(
         }
         if (metrics) {
             if (revoke_res) {
-                metrics->local_request.write_revoke_latency_success.observe(
+                metrics->rollback.write_revoke_latency_success.observe(
                     rollback_sw.elapsed_us());
             } else {
-                metrics->local_request.write_revoke_failures.inc();
-                metrics->local_request.write_revoke_latency_failure.observe(
+                metrics->rollback.write_revoke_failures.inc();
+                metrics->rollback.write_revoke_latency_failure.observe(
                     rollback_sw.elapsed_us());
             }
         }

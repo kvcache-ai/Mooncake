@@ -52,7 +52,7 @@ bool IsValidRequest(const RemoteWriteRequest& request) {
 }  // anonymous namespace
 
 ClientRpcService::ClientRpcService(DataManager& data_manager,
-                                   P2PClientMetric* metrics)
+                                   std::shared_ptr<P2PClientMetric> metrics)
     : data_manager_(data_manager),
       metrics_(metrics),
       peer_tracker_(

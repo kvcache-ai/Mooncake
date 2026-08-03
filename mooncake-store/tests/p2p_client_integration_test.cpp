@@ -20,6 +20,7 @@
 #include <thread>
 #include <vector>
 
+#include "p2p_client_metric.h"
 #include "p2p_client_service.h"
 #include "test_p2p_server_helpers.h"
 #include "types.h"
@@ -329,7 +330,7 @@ TEST_F(P2PClientIntegrationTest, GetMissMetrics) {
     ASSERT_TRUE(metrics_after.has_value());
     // The miss count should have increased
     EXPECT_TRUE(
-        metrics_after.value().find("mooncake_p2p_local_get_misses_total") !=
+        metrics_after.value().find("mooncake_p2p_total_get_misses_total") !=
         std::string::npos);
 }
 
@@ -1064,6 +1065,382 @@ TEST_F(P2PClientIntegrationTest, UnregisterSwitchesToLocalOnly) {
 
     c->Stop();
     c->Destroy();
+}
+
+// ============================================================================
+// Metric integration tests (delta-based, direct counter assertions)
+// ============================================================================
+
+static P2PClientMetric* GetP2PMetrics(P2PClientService* c) {
+    return dynamic_cast<P2PClientMetric*>(c->GetMetrics());
+}
+
+TEST_F(P2PClientIntegrationTest, MetricLocalPutGet_TE) {
+    auto* m = GetP2PMetrics(client_.get());
+    ASSERT_NE(m, nullptr);
+
+    const std::string key = "metric_local_te_key";
+    const std::string data = "metric_te_payload_data";
+
+    // Snapshot before
+    auto before_total_put_req = m->total_request.put_requests.value();
+    auto before_total_put_bytes = m->total_request.put_bytes.value();
+    auto before_local_put_req = m->local_request.put_requests.value();
+    auto before_local_put_bytes = m->local_request.put_bytes.value();
+    auto before_remote_put_req = m->remote_request.put_requests.value();
+
+    // Put (default config -> local write)
+    std::vector<Slice> put_slices;
+    put_slices.emplace_back(Slice{const_cast<char*>(data.data()), data.size()});
+    auto put_result = client_->Put(key, put_slices, WriteRouteRequestConfig{});
+    ASSERT_TRUE(put_result.has_value())
+        << "Put failed: " << static_cast<int>(put_result.error());
+
+    // Verify put metrics
+    EXPECT_EQ(m->total_request.put_requests.value(), before_total_put_req + 1);
+    EXPECT_EQ(m->total_request.put_bytes.value(),
+              before_total_put_bytes + static_cast<int64_t>(data.size()));
+    EXPECT_EQ(m->local_request.put_requests.value(), before_local_put_req + 1);
+    EXPECT_EQ(m->local_request.put_bytes.value(),
+              before_local_put_bytes + static_cast<int64_t>(data.size()));
+    EXPECT_EQ(m->remote_request.put_requests.value(), before_remote_put_req);
+
+    // Snapshot before get
+    auto before_total_get_req = m->total_request.get_requests.value();
+    auto before_total_get_hits = m->total_request.get_hits.value();
+    auto before_total_get_bytes = m->total_request.get_bytes.value();
+    auto before_local_get_req = m->local_request.get_requests.value();
+    auto before_local_get_hits = m->local_request.get_hits.value();
+    auto before_remote_get_req = m->remote_request.get_requests.value();
+
+    // Get (local hit)
+    std::vector<char> buf(data.size(), 0);
+    auto get_result = client_->Get(key, {(void*)buf.data()}, {buf.size()});
+    ASSERT_TRUE(get_result.has_value())
+        << "Get failed: " << static_cast<int>(get_result.error());
+    EXPECT_EQ(std::string(buf.data(), buf.size()), data);
+
+    // Verify get metrics
+    EXPECT_EQ(m->total_request.get_requests.value(), before_total_get_req + 1);
+    EXPECT_EQ(m->total_request.get_hits.value(), before_total_get_hits + 1);
+    EXPECT_EQ(m->total_request.get_bytes.value(),
+              before_total_get_bytes + static_cast<int64_t>(data.size()));
+    EXPECT_EQ(m->local_request.get_requests.value(), before_local_get_req + 1);
+    EXPECT_EQ(m->local_request.get_hits.value(), before_local_get_hits + 1);
+    EXPECT_EQ(m->remote_request.get_requests.value(), before_remote_get_req);
+}
+
+TEST_F(P2PClientIntegrationTest, MetricLocalPutGet_Memcpy) {
+    auto c = CreateP2PClient("localhost:18830", 0, "memcpy");
+    ASSERT_NE(c, nullptr);
+
+    auto* m = GetP2PMetrics(c.get());
+    ASSERT_NE(m, nullptr);
+
+    const std::string key = "metric_local_memcpy_key";
+    const std::string data = "metric_memcpy_payload";
+
+    // Put
+    std::vector<Slice> put_slices;
+    put_slices.emplace_back(Slice{const_cast<char*>(data.data()), data.size()});
+    auto put_result = c->Put(key, put_slices, WriteRouteRequestConfig{});
+    ASSERT_TRUE(put_result.has_value())
+        << "Memcpy Put failed: " << static_cast<int>(put_result.error());
+
+    EXPECT_EQ(m->total_request.put_requests.value(), 1);
+    EXPECT_EQ(m->total_request.put_bytes.value(),
+              static_cast<int64_t>(data.size()));
+    EXPECT_EQ(m->local_request.put_requests.value(), 1);
+    EXPECT_EQ(m->local_request.put_bytes.value(),
+              static_cast<int64_t>(data.size()));
+    EXPECT_EQ(m->remote_request.put_requests.value(), 0);
+
+    // Get
+    std::vector<char> buf(data.size(), 0);
+    auto get_result = c->Get(key, {(void*)buf.data()}, {buf.size()});
+    ASSERT_TRUE(get_result.has_value())
+        << "Memcpy Get failed: " << static_cast<int>(get_result.error());
+    EXPECT_EQ(std::string(buf.data(), buf.size()), data);
+
+    EXPECT_EQ(m->total_request.get_requests.value(), 1);
+    EXPECT_EQ(m->total_request.get_hits.value(), 1);
+    EXPECT_EQ(m->total_request.get_bytes.value(),
+              static_cast<int64_t>(data.size()));
+    EXPECT_EQ(m->local_request.get_requests.value(), 1);
+    EXPECT_EQ(m->local_request.get_hits.value(), 1);
+    EXPECT_EQ(m->remote_request.get_requests.value(), 0);
+
+    c->Stop();
+    c->Destroy();
+}
+
+TEST_F(P2PClientIntegrationTest, MetricRemotePut) {
+    auto* m_writer = GetP2PMetrics(client_.get());
+    auto* m_owner = GetP2PMetrics(client2_.get());
+    ASSERT_NE(m_writer, nullptr);
+    ASSERT_NE(m_owner, nullptr);
+
+    const std::string key = "metric_remote_put_key";
+    const std::string data = "metric_remote_put_payload";
+
+    // Snapshot writer metrics
+    auto before_total_put = m_writer->total_request.put_requests.value();
+    auto before_remote_put = m_writer->remote_request.put_requests.value();
+    auto before_remote_put_bytes = m_writer->remote_request.put_bytes.value();
+    auto before_local_put = m_writer->local_request.put_requests.value();
+    // Snapshot owner peer metrics
+    auto before_peer_write =
+        m_owner->peer_request_metrics.write_remote_data.requests.value();
+
+    // Force remote write
+    WriteRouteRequestConfig cfg;
+    cfg.remote_weight = 1.0;
+    cfg.local_write_waterline = 0.0;
+    cfg.max_candidates = WriteRouteRequestConfig::RETURN_ALL_CANDIDATES;
+
+    std::vector<Slice> slices;
+    slices.emplace_back(Slice{const_cast<char*>(data.data()), data.size()});
+    auto put_result = client_->Put(key, slices, cfg);
+    ASSERT_TRUE(put_result.has_value())
+        << "Remote Put failed: " << static_cast<int>(put_result.error());
+
+    // Verify writer metrics: should go through remote path
+    EXPECT_EQ(m_writer->total_request.put_requests.value(),
+              before_total_put + 1);
+    EXPECT_EQ(m_writer->remote_request.put_requests.value(),
+              before_remote_put + 1);
+    EXPECT_EQ(m_writer->remote_request.put_bytes.value(),
+              before_remote_put_bytes + static_cast<int64_t>(data.size()));
+    EXPECT_EQ(m_writer->local_request.put_requests.value(), before_local_put);
+
+    // Verify owner received the write via peer RPC
+    EXPECT_EQ(m_owner->peer_request_metrics.write_remote_data.requests.value(),
+              before_peer_write + 1);
+}
+
+TEST_F(P2PClientIntegrationTest, MetricRemoteGet) {
+    auto* m_reader = GetP2PMetrics(client2_.get());
+    ASSERT_NE(m_reader, nullptr);
+    auto* m_owner = GetP2PMetrics(client_.get());
+    ASSERT_NE(m_owner, nullptr);
+
+    const std::string key = "metric_remote_get_key";
+    const std::string data = "metric_remote_get_payload";
+
+    // First: client_ puts locally
+    std::vector<Slice> put_slices;
+    put_slices.emplace_back(Slice{const_cast<char*>(data.data()), data.size()});
+    auto put_result = client_->Put(key, put_slices, WriteRouteRequestConfig{});
+    ASSERT_TRUE(put_result.has_value());
+
+    // Snapshot reader (client2_) metrics
+    auto before_total_get = m_reader->total_request.get_requests.value();
+    auto before_total_hits = m_reader->total_request.get_hits.value();
+    auto before_local_get = m_reader->local_request.get_requests.value();
+    auto before_local_misses = m_reader->local_request.get_misses.value();
+    auto before_remote_get = m_reader->remote_request.get_requests.value();
+    auto before_remote_hits = m_reader->remote_request.get_hits.value();
+    auto before_remote_bytes = m_reader->remote_request.get_bytes.value();
+    // Snapshot owner peer metrics (reverse mode: owner serves ReadRemoteData)
+    auto before_peer_read_req =
+        m_owner->peer_request_metrics.read_remote_data.requests.value();
+    auto before_peer_read_hits =
+        m_owner->peer_request_metrics.read_remote_data.hits.value();
+
+    // client2_ reads -> local miss -> remote read from client_
+    std::vector<char> buf(data.size(), 0);
+    auto get_result = client2_->Get(key, {(void*)buf.data()}, {buf.size()});
+    ASSERT_TRUE(get_result.has_value())
+        << "Remote Get failed: " << static_cast<int>(get_result.error());
+    EXPECT_EQ(std::string(buf.data(), buf.size()), data);
+
+    // Verify reader metrics
+    EXPECT_EQ(m_reader->total_request.get_requests.value(),
+              before_total_get + 1);
+    EXPECT_EQ(m_reader->total_request.get_hits.value(), before_total_hits + 1);
+    // Local attempt: miss
+    EXPECT_EQ(m_reader->local_request.get_requests.value(),
+              before_local_get + 1);
+    EXPECT_EQ(m_reader->local_request.get_misses.value(),
+              before_local_misses + 1);
+    // Remote attempt: hit
+    EXPECT_EQ(m_reader->remote_request.get_requests.value(),
+              before_remote_get + 1);
+    EXPECT_EQ(m_reader->remote_request.get_hits.value(),
+              before_remote_hits + 1);
+    EXPECT_EQ(m_reader->remote_request.get_bytes.value(),
+              before_remote_bytes + static_cast<int64_t>(data.size()));
+
+    // Verify owner served the read via peer RPC
+    EXPECT_EQ(m_owner->peer_request_metrics.read_remote_data.requests.value(),
+              before_peer_read_req + 1);
+    EXPECT_EQ(m_owner->peer_request_metrics.read_remote_data.hits.value(),
+              before_peer_read_hits + 1);
+}
+
+TEST_F(P2PClientIntegrationTest, MetricGetMiss) {
+    auto* m = GetP2PMetrics(client_.get());
+    ASSERT_NE(m, nullptr);
+
+    const std::string key =
+        "metric_nonexistent_key_" +
+        std::to_string(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+
+    auto before_total_get = m->total_request.get_requests.value();
+    auto before_total_misses = m->total_request.get_misses.value();
+    auto before_total_hits = m->total_request.get_hits.value();
+    auto before_local_get = m->local_request.get_requests.value();
+    auto before_local_misses = m->local_request.get_misses.value();
+
+    std::vector<char> buf(64, 0);
+    auto get_result = client_->Get(key, {(void*)buf.data()}, {buf.size()});
+    EXPECT_FALSE(get_result.has_value());
+    EXPECT_EQ(get_result.error(), ErrorCode::OBJECT_NOT_FOUND);
+
+    EXPECT_EQ(m->total_request.get_requests.value(), before_total_get + 1);
+    EXPECT_EQ(m->total_request.get_misses.value(), before_total_misses + 1);
+    EXPECT_EQ(m->total_request.get_hits.value(), before_total_hits);
+    EXPECT_EQ(m->local_request.get_requests.value(), before_local_get + 1);
+    EXPECT_EQ(m->local_request.get_misses.value(), before_local_misses + 1);
+}
+
+TEST_F(P2PClientIntegrationTest, MetricBatchPutGet) {
+    auto* m = GetP2PMetrics(client_.get());
+    ASSERT_NE(m, nullptr);
+
+    const int batch_size = 3;
+    std::vector<std::string> keys;
+    std::vector<std::string> payloads;
+    std::vector<std::vector<Slice>> batched_slices;
+    int64_t total_bytes = 0;
+
+    for (int i = 0; i < batch_size; ++i) {
+        keys.push_back("metric_batch_key_" + std::to_string(i));
+        payloads.push_back("metric_batch_payload_" + std::to_string(i));
+        total_bytes += static_cast<int64_t>(payloads[i].size());
+    }
+    for (int i = 0; i < batch_size; ++i) {
+        std::vector<Slice> s;
+        s.emplace_back(
+            Slice{const_cast<char*>(payloads[i].data()), payloads[i].size()});
+        batched_slices.push_back(std::move(s));
+    }
+
+    // Snapshot before batch put
+    auto before_total_put_req = m->total_request.put_requests.value();
+    auto before_total_put_bytes = m->total_request.put_bytes.value();
+    auto before_local_put_req = m->local_request.put_requests.value();
+
+    auto put_results =
+        client_->BatchPut(keys, batched_slices, WriteRouteRequestConfig{});
+    ASSERT_EQ(put_results.size(), static_cast<size_t>(batch_size));
+    for (auto& r : put_results) {
+        ASSERT_TRUE(r.has_value())
+            << "BatchPut failed: " << static_cast<int>(r.error());
+    }
+
+    EXPECT_EQ(m->total_request.put_requests.value(),
+              before_total_put_req + batch_size);
+    EXPECT_EQ(m->total_request.put_bytes.value(),
+              before_total_put_bytes + total_bytes);
+    EXPECT_EQ(m->local_request.put_requests.value(),
+              before_local_put_req + batch_size);
+
+    // Snapshot before batch get
+    auto before_total_get_req = m->total_request.get_requests.value();
+    auto before_total_get_hits = m->total_request.get_hits.value();
+    auto before_local_get_req = m->local_request.get_requests.value();
+    auto before_local_get_hits = m->local_request.get_hits.value();
+
+    std::vector<std::vector<char>> bufs(batch_size);
+    std::vector<std::vector<void*>> all_buffers(batch_size);
+    std::vector<std::vector<size_t>> all_sizes(batch_size);
+    for (int i = 0; i < batch_size; ++i) {
+        bufs[i].resize(payloads[i].size(), 0);
+        all_buffers[i].push_back(bufs[i].data());
+        all_sizes[i].push_back(bufs[i].size());
+    }
+
+    auto get_results =
+        client_->BatchGet(keys, all_buffers, all_sizes, ReadRouteConfig{});
+    ASSERT_EQ(get_results.size(), static_cast<size_t>(batch_size));
+    for (int i = 0; i < batch_size; ++i) {
+        ASSERT_TRUE(get_results[i].has_value())
+            << "BatchGet failed: " << static_cast<int>(get_results[i].error());
+    }
+
+    EXPECT_EQ(m->total_request.get_requests.value(),
+              before_total_get_req + batch_size);
+    EXPECT_EQ(m->total_request.get_hits.value(),
+              before_total_get_hits + batch_size);
+    EXPECT_EQ(m->local_request.get_requests.value(),
+              before_local_get_req + batch_size);
+    EXPECT_EQ(m->local_request.get_hits.value(),
+              before_local_get_hits + batch_size);
+}
+
+TEST_F(P2PClientIntegrationTest, MetricPutAlreadyExists) {
+    auto* m = GetP2PMetrics(client_.get());
+    ASSERT_NE(m, nullptr);
+
+    const std::string key = "metric_already_exists_key";
+    const std::string data = "metric_already_exists_payload";
+
+    std::vector<Slice> slices;
+    slices.emplace_back(Slice{const_cast<char*>(data.data()), data.size()});
+    auto first_put = client_->Put(key, slices, WriteRouteRequestConfig{});
+    ASSERT_TRUE(first_put.has_value());
+
+    // Snapshot before the duplicate put
+    auto before_total_put_req = m->total_request.put_requests.value();
+    auto before_total_put_bytes = m->total_request.put_bytes.value();
+    auto before_local_put_req = m->local_request.put_requests.value();
+    auto before_local_put_bytes = m->local_request.put_bytes.value();
+    auto before_remote_put_req = m->remote_request.put_requests.value();
+
+    // Duplicate put is surfaced as success (idempotent rewrite).
+    auto second_put = client_->Put(key, slices, WriteRouteRequestConfig{});
+    ASSERT_TRUE(second_put.has_value());
+
+    // The already-exists write is ignored in every metric layer.
+    EXPECT_EQ(m->total_request.put_requests.value(), before_total_put_req);
+    EXPECT_EQ(m->total_request.put_bytes.value(), before_total_put_bytes);
+    EXPECT_EQ(m->local_request.put_requests.value(), before_local_put_req);
+    EXPECT_EQ(m->local_request.put_bytes.value(), before_local_put_bytes);
+    EXPECT_EQ(m->remote_request.put_requests.value(), before_remote_put_req);
+}
+
+TEST_F(P2PClientIntegrationTest, MetricPutFailure) {
+    auto* m = GetP2PMetrics(client_.get());
+    ASSERT_NE(m, nullptr);
+
+    // Snapshot before
+    auto before_total_put_req = m->total_request.put_requests.value();
+    auto before_total_put_fail = m->total_request.put_failures.value();
+    auto before_local_put_req = m->local_request.put_requests.value();
+
+    // Mismatched keys/slices sizes fail validation with INVALID_PARAMS for
+    // every key.
+    std::vector<std::string> keys = {"metric_fail_key_0", "metric_fail_key_1"};
+    std::string payload = "metric_fail_payload";
+    std::vector<std::vector<Slice>> slices;
+    slices.emplace_back(std::vector<Slice>{
+        Slice{const_cast<char*>(payload.data()), payload.size()}});
+
+    auto results = client_->BatchPut(keys, slices, WriteRouteRequestConfig{});
+    ASSERT_EQ(results.size(), keys.size());
+    for (auto& r : results) {
+        EXPECT_FALSE(r.has_value());
+        EXPECT_EQ(r.error(), ErrorCode::INVALID_PARAMS);
+    }
+
+    EXPECT_EQ(m->total_request.put_requests.value(),
+              before_total_put_req + static_cast<int64_t>(keys.size()));
+    EXPECT_EQ(m->total_request.put_failures.value(),
+              before_total_put_fail + static_cast<int64_t>(keys.size()));
+    // Validation failed before any local write was attempted.
+    EXPECT_EQ(m->local_request.put_requests.value(), before_local_put_req);
 }
 
 }  // namespace testing
