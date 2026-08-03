@@ -519,6 +519,13 @@ void MasterService::InitDfsAllocatorFromEnvironment() {
                                  GetEnvOr<bool>("MOONCAKE_DFS_ENABLED", false));
     if (!enable_dfs_) return;
 
+    if (enable_snapshot_ || enable_snapshot_restore_ || enable_oplog_) {
+        LOG(ERROR) << "DFS cannot be enabled with snapshot or oplog recovery "
+                      "until DFS allocator state restoration is supported";
+        throw std::invalid_argument(
+            "DFS is incompatible with snapshot/oplog recovery");
+    }
+
     const bool single_tenant =
         GetEnvOr<bool>("MOONCAKE_DFS_SINGLE_TENANT", true);
     if (!single_tenant) {
@@ -2559,6 +2566,10 @@ void MasterService::RestoreFromStandbySnapshot(
     const std::vector<StandbyObjectEntry>& objects,
     uint64_t initial_oplog_sequence_id,
     const std::vector<StandbySegmentInfo>& segments) {
+    if (enable_dfs_) {
+        throw std::runtime_error(
+            "DFS standby restore requires DFS allocator state restoration");
+    }
     // The ordered writer initializes its sequence from durable_prefix.
     (void)initial_oplog_sequence_id;
 
@@ -3582,12 +3593,14 @@ auto MasterService::AllocateAndInsertMetadata(
         if (!dfs_allocator_ || !dfs_allocator_->IsInitialized()) {
             LOG(ERROR) << "Failed to allocate DFS replica for key=" << key
                        << ", error=dfs_allocator_not_initialized";
+            abort_reserved_quota();
             return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
         }
         auto alloc = dfs_allocator_->Allocate(key, value_length);
         if (!alloc) {
             LOG(ERROR) << "Failed to allocate DFS replica for key=" << key
                        << ", error=" << alloc.error();
+            abort_reserved_quota();
             return tl::make_unexpected(alloc.error());
         }
         replicas.emplace_back(std::move(*alloc), ReplicaStatus::PROCESSING);
@@ -3876,7 +3889,8 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
                 return (replica.is_memory_replica() &&
                         !replica.has_invalid_mem_handle()) ||
                        (replica.is_nof_replica() &&
-                        !replica.has_invalid_nof_handle());
+                        !replica.has_invalid_nof_handle()) ||
+                       replica.is_dfs_replica();
             }
             if (replica_type == ReplicaType::MEMORY) {
                 return replica.is_memory_replica() &&
@@ -3925,48 +3939,6 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         ReleaseTenantQuota(object_id.tenant_id,
                            metadata.pending_replaced_quota_charge_bytes);
         metadata.pending_replaced_quota_charge_bytes = 0;
-    }
-
-    if (replica_type == ReplicaType::DFS) {
-        auto& tenant_state = accessor.GetTenantState();
-        auto task_it = tenant_state.offloading_tasks.find(object_id.user_key);
-        if (task_it != tenant_state.offloading_tasks.end()) {
-            auto source = metadata.GetReplicaByID(task_it->second.source_id);
-            if (source != nullptr) {
-                source->dec_refcnt();
-            }
-            tenant_state.offloading_tasks.erase(task_it);
-        }
-    }
-
-    if (replica_type != ReplicaType::DFS && enable_dfs_ && dfs_allocator_ &&
-        metadata.HasReplica([](const Replica& replica) {
-            return replica.is_dfs_replica() && replica.is_processing();
-        })) {
-        auto& tenant_state = accessor.GetTenantState();
-        if (!tenant_state.offloading_tasks.contains(object_id.user_key)) {
-            auto* source = metadata.GetFirstReplica([](const Replica& replica) {
-                return replica.is_memory_replica() && replica.is_completed() &&
-                       !replica.has_invalid_mem_handle();
-            });
-            if (source == nullptr) {
-                LOG(WARNING) << "key=" << key
-                             << ", error=no_completed_memory_replica_for_dfs";
-            } else {
-                auto result = PushDfsOffloadQueue(object_id, *source);
-                if (result) {
-                    source->inc_refcnt();
-                    tenant_state.offloading_tasks.emplace(
-                        object_id.user_key,
-                        OffloadingTask{source->id(),
-                                       std::chrono::system_clock::now()});
-                } else if (result.error() != ErrorCode::OBJECT_ALREADY_EXISTS) {
-                    LOG(ERROR)
-                        << "Failed to push DFS offload queue for key=" << key
-                        << ", error=" << result.error();
-                }
-            }
-        }
     }
 
     if (replica_type != ReplicaType::DFS && enable_offload_ &&
@@ -4516,6 +4488,33 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     // hard_pinned is const and preserved automatically — upsert
                     // does not change the eviction protection level of an
                     // existing object.
+                    const size_t existing_dfs_replicas =
+                        metadata.CountReplicas(&Replica::fn_is_dfs_replica);
+                    if (config.dfs_replica_num > 0 ||
+                        existing_dfs_replicas > 0) {
+                        const size_t existing_memory_replicas =
+                            metadata.CountReplicas(
+                                &Replica::fn_is_memory_replica);
+                        const size_t existing_nof_replicas =
+                            metadata.CountReplicas(&Replica::fn_is_nof_replica);
+                        if (existing_memory_replicas != config.replica_num ||
+                            existing_nof_replicas != config.nof_replica_num ||
+                            existing_dfs_replicas != config.dfs_replica_num) {
+                            LOG(ERROR)
+                                << "key=" << key
+                                << ", error=dfs_upsert_topology_mismatch"
+                                << ", existing_memory="
+                                << existing_memory_replicas
+                                << ", requested_memory=" << config.replica_num
+                                << ", existing_nof=" << existing_nof_replicas
+                                << ", requested_nof=" << config.nof_replica_num
+                                << ", existing_dfs=" << existing_dfs_replicas
+                                << ", requested_dfs=" << config.dfs_replica_num;
+                            return tl::make_unexpected(
+                                ErrorCode::INVALID_PARAMS);
+                        }
+                    }
+
                     metadata.client_id = client_id;
                     metadata.put_start_time = now;
 
@@ -6273,32 +6272,6 @@ auto MasterService::PollRemoveAll(const UUID& client_id)
     return result;
 }
 
-auto MasterService::PullDfsOffloadTasks(const UUID& client_id)
-    -> tl::expected<std::vector<OffloadTaskItem>, ErrorCode> {
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    ScopedLocalDiskSegmentAccess local_disk_segment_access =
-        segment_manager_.getLocalDiskSegmentAccess();
-    auto& client_local_disk_segment =
-        local_disk_segment_access.getClientLocalDiskSegment();
-    auto local_disk_segment_it = client_local_disk_segment.find(client_id);
-    if (local_disk_segment_it == client_local_disk_segment.end()) {
-        LOG(ERROR) << "Local disk segment not found with client id = "
-                   << client_id;
-        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
-    }
-
-    MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
-    std::vector<OffloadTaskItem> result;
-    result.reserve(
-        local_disk_segment_it->second->dfs_offloading_objects.size());
-    for (const auto& [_, task] :
-         local_disk_segment_it->second->dfs_offloading_objects) {
-        result.push_back(task);
-    }
-    local_disk_segment_it->second->dfs_offloading_objects.clear();
-    return result;
-}
-
 auto MasterService::ReportSsdCapacity(const UUID& client_id,
                                       int64_t ssd_total_capacity_bytes)
     -> tl::expected<void, ErrorCode> {
@@ -6524,56 +6497,6 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
             OffloadTaskItem{.tenant_id = object_id.tenant_id.value(),
                             .key = object_id.user_key,
                             .size = size});
-        if (!res.second) {
-            return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
-        }
-    }
-    return {};
-}
-
-tl::expected<void, ErrorCode> MasterService::PushDfsOffloadQueue(
-    const ObjectIdentity& object_id, Replica& replica) {
-    const auto& segment_names = replica.get_segment_names();
-    if (segment_names.empty()) {
-        return {};
-    }
-    for (const auto& segment_name_it : segment_names) {
-        if (!segment_name_it.has_value()) {
-            continue;
-        }
-        ScopedLocalDiskSegmentAccess local_disk_segment_access =
-            segment_manager_.getLocalDiskSegmentAccess();
-        const auto& client_by_name =
-            local_disk_segment_access.getClientByName();
-        auto client_id_it = client_by_name.find(segment_name_it.value());
-        if (client_id_it == client_by_name.end()) {
-            LOG(ERROR) << "Segment " << segment_name_it.value() << " not found";
-            return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
-        }
-        auto& client_local_disk_segment =
-            local_disk_segment_access.getClientLocalDiskSegment();
-        auto local_disk_segment_it =
-            client_local_disk_segment.find(client_id_it->second);
-        if (local_disk_segment_it == client_local_disk_segment.end()) {
-            return tl::make_unexpected(ErrorCode::UNABLE_OFFLOADING);
-        }
-        MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
-        if (!local_disk_segment_it->second->enable_offloading) {
-            return tl::make_unexpected(ErrorCode::UNABLE_OFFLOADING);
-        }
-        if (local_disk_segment_it->second->dfs_offloading_objects.size() >=
-            offloading_queue_limit_) {
-            return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
-        }
-        const int64_t size = replica.get_descriptor()
-                                 .get_memory_descriptor()
-                                 .buffer_descriptor.size_;
-        auto res =
-            local_disk_segment_it->second->dfs_offloading_objects.emplace(
-                object_id.tenant_id.MakeScopedKey(object_id.user_key),
-                OffloadTaskItem{.tenant_id = object_id.tenant_id.value(),
-                                .key = object_id.user_key,
-                                .size = size});
         if (!res.second) {
             return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
         }

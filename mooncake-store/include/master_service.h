@@ -688,9 +688,6 @@ class MasterService {
     auto OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading)
         -> tl::expected<std::vector<OffloadTaskItem>, ErrorCode>;
 
-    auto PullDfsOffloadTasks(const UUID& client_id)
-        -> tl::expected<std::vector<OffloadTaskItem>, ErrorCode>;
-
     /**
      * @brief Client polls whether master has requested a full SSD clear
      * (triggered by RemoveAll). Atomically checks and clears the flag.
@@ -1580,9 +1577,6 @@ class MasterService {
     void RemoveDfsReplicaByOffset(const std::string& key, int shard_idx,
                                   uint64_t offset);
     void InitDfsAllocatorFromEnvironment();
-    tl::expected<void, ErrorCode> PushDfsOffloadQueue(
-        const ObjectIdentity& object_id, Replica& replica);
-
     /**
      * @brief Helper to release space of expired discarded replicas.
      * @return Number of released objects that have memory replicas

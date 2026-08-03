@@ -213,9 +213,6 @@ class WrappedMasterService {
     tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
     OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading);
 
-    tl::expected<std::vector<OffloadTaskItem>, ErrorCode> PullDfsOffloadTasks(
-        const UUID& client_id);
-
     tl::expected<bool, ErrorCode> PollRemoveAll(const UUID& client_id);
 
     tl::expected<void, ErrorCode> ReportSsdCapacity(

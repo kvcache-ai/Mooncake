@@ -256,18 +256,6 @@ class HiCacheStorageMooncakePosixDfsBackendMixin(HiCacheStorageBaseMixin):
                     remaining -= len(chunk)
         return shard_paths, payload_shards
 
-    @classmethod
-    def _wait_for_dfs_payload(cls, timeout: int = 45):
-        deadline = time.time() + timeout
-        shard_paths = []
-        payload_shards = []
-        while time.time() < deadline:
-            shard_paths, payload_shards = cls._dfs_shards_with_payload()
-            if payload_shards:
-                return shard_paths, payload_shards
-            time.sleep(1)
-        return shard_paths, payload_shards
-
 
 class TestMooncakePosixDfsBackend(
     HiCacheStorageMooncakePosixDfsBackendMixin, CustomTestCase
@@ -277,7 +265,7 @@ class TestMooncakePosixDfsBackend(
     def test_basic_backup_and_prefetch(self):
         super().test_basic_backup_and_prefetch()
 
-        shard_paths, payload_shards = self._wait_for_dfs_payload()
+        shard_paths, payload_shards = self._dfs_shards_with_payload()
         self.assertGreater(
             len(shard_paths), 0, f"Expected DFS shard files under {self.dfs_root}"
         )

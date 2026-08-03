@@ -602,6 +602,109 @@ class DfsBackendTest : public ::testing::Test {
     std::shared_ptr<DfsDescriptorCache> desc_cache_;
 };
 
+class ControlledWritePosixFsAdapter : public PosixFsAdapter {
+   public:
+    void FailWriteCall(int call) { fail_write_call_ = call; }
+    void ShortWriteCall(int call) { short_write_call_ = call; }
+
+    tl::expected<size_t, ErrorCode> WriteAt(int fd, const iovec* iov,
+                                            int iovcnt,
+                                            int64_t offset) override {
+        const int call = ++write_calls_;
+        if (call == fail_write_call_) {
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        if (call == short_write_call_) {
+            size_t total_size = 0;
+            for (int i = 0; i < iovcnt; ++i) {
+                total_size += iov[i].iov_len;
+            }
+            return total_size == 0 ? 0 : total_size - 1;
+        }
+        return PosixFsAdapter::WriteAt(fd, iov, iovcnt, offset);
+    }
+
+   private:
+    std::atomic<int> write_calls_{0};
+    int fail_write_call_ = -1;
+    int short_write_call_ = -1;
+};
+
+TEST_F(DfsBackendTest, BatchWriteUsesExplicitDescriptors) {
+    AlignedBuffer write_buf(4096);
+    ASSERT_NE(write_buf.data(), nullptr);
+    write_buf.Fill('E');
+
+    std::vector<DfsWriteRequest> requests{
+        {"explicit",
+         {ShardPath(1), 0, 4096, 4096, 1},
+         {{write_buf.data(), write_buf.size()}}},
+        {"bad_path",
+         {tmp_->file("wrong.data"), 4096, 4096, 4096, 0},
+         {{write_buf.data(), write_buf.size()}}},
+        {"bad_size",
+         {ShardPath(0), 4096, 2048, 4096, 0},
+         {{write_buf.data(), write_buf.size()}}},
+    };
+    auto results = backend_->BatchWrite(requests);
+    ASSERT_EQ(results.size(), 3);
+    EXPECT_TRUE(results[0].has_value());
+    ASSERT_FALSE(results[1].has_value());
+    EXPECT_EQ(results[1].error(), ErrorCode::INVALID_PARAMS);
+    ASSERT_FALSE(results[2].has_value());
+    EXPECT_EQ(results[2].error(), ErrorCode::INVALID_PARAMS);
+
+    desc_cache_->Put("explicit", requests[0].descriptor);
+    AlignedBuffer read_buf(4096);
+    std::unordered_map<std::string, Slice> load_batch;
+    load_batch["explicit"] = {read_buf.data(), read_buf.size()};
+    ASSERT_TRUE(backend_->BatchLoad(load_batch).has_value());
+    EXPECT_EQ(std::memcmp(write_buf.data(), read_buf.data(), write_buf.size()),
+              0);
+}
+
+TEST_F(DfsBackendTest, BatchWritePreservesPerKeyWriteErrors) {
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = tmp_->path();
+
+    DistributedStorageConfig distributed_config;
+    distributed_config.fsdir = tmp_->path();
+    distributed_config.fs_adapter_type = "posix";
+    distributed_config.shard_count = 4;
+    distributed_config.shard_capacity = 64 * 1024 * 1024;
+    distributed_config.alignment = 4096;
+
+    auto adapter = std::make_unique<ControlledWritePosixFsAdapter>();
+    auto* controlled_adapter = adapter.get();
+    auto backend = std::make_unique<DistributedStorageBackend>(
+        file_config, distributed_config, std::move(adapter));
+    ASSERT_TRUE(backend->Init().has_value());
+    controlled_adapter->FailWriteCall(2);
+    controlled_adapter->ShortWriteCall(3);
+
+    AlignedBuffer write_buf(4096);
+    ASSERT_NE(write_buf.data(), nullptr);
+    std::vector<DfsWriteRequest> requests{
+        {"ok",
+         {ShardPath(0), 0, 4096, 4096, 0},
+         {{write_buf.data(), write_buf.size()}}},
+        {"failed",
+         {ShardPath(0), 4096, 4096, 4096, 0},
+         {{write_buf.data(), write_buf.size()}}},
+        {"short",
+         {ShardPath(0), 8192, 4096, 4096, 0},
+         {{write_buf.data(), write_buf.size()}}},
+    };
+    auto results = backend->BatchWrite(requests);
+    ASSERT_EQ(results.size(), 3);
+    EXPECT_TRUE(results[0].has_value());
+    ASSERT_FALSE(results[1].has_value());
+    EXPECT_EQ(results[1].error(), ErrorCode::FILE_WRITE_FAIL);
+    ASSERT_FALSE(results[2].has_value());
+    EXPECT_EQ(results[2].error(), ErrorCode::FILE_WRITE_FAIL);
+}
+
 TEST_F(DfsBackendTest, BatchOffloadAndBatchLoad) {
     AlignedBuffer write_buf(4096);
     ASSERT_NE(write_buf.data(), nullptr);

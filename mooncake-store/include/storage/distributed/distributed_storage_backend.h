@@ -24,6 +24,12 @@ struct DistributedStorageConfig {
     static DistributedStorageConfig FromEnvironment();
 };
 
+struct DfsWriteRequest {
+    std::string key;
+    DistributedFSDescriptor descriptor;
+    std::vector<Slice> slices;
+};
+
 /**
  * @brief Distributed filesystem storage backend.
  *
@@ -46,6 +52,9 @@ class DistributedStorageBackend : public StorageBackendInterface {
                                 std::vector<StorageObjectMetadata>& metadatas)>
             complete_handler,
         EvictionHandler eviction_handler = nullptr) override;
+
+    std::vector<tl::expected<void, ErrorCode>> BatchWrite(
+        const std::vector<DfsWriteRequest>& requests);
 
     tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batched_slices) override;

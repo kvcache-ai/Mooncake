@@ -32,6 +32,7 @@
 namespace mooncake {
 
 class PutOperation;
+class DistributedStorageBackend;
 
 /**
  * @brief Result of a query operation containing replica information and lease
@@ -434,9 +435,6 @@ class Client {
         bool enable_offloading,
         std::vector<OffloadTaskItem>& offloading_objects);
 
-    tl::expected<void, ErrorCode> PullDfsOffloadTasks(
-        std::vector<OffloadTaskItem>& offloading_objects);
-
     tl::expected<bool, ErrorCode> PollRemoveAll();
 
     tl::expected<void, ErrorCode> ReportSsdCapacity(
@@ -525,11 +523,9 @@ class Client {
     tl::expected<void, ErrorCode> NotifyOffloadSuccess(
         const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas);
-    tl::expected<void, ErrorCode> BatchPutEnd(
-        const std::vector<std::string>& keys, ReplicaType replica_type);
-
     void SetDfsDescriptorCache(std::shared_ptr<DfsDescriptorCache> cache);
-    void SetDfsStorageBackend(std::shared_ptr<StorageBackendInterface> backend);
+    void SetDfsStorageBackend(
+        std::shared_ptr<DistributedStorageBackend> backend);
 
     /**
      * @brief Fetch tasks assigned to a client
@@ -796,12 +792,18 @@ class Client {
     void ComputeBatchObjectChecksums(std::vector<PutOperation>& ops);
     void SubmitTransfers(std::vector<PutOperation>& ops);
     void WaitForTransfers(std::vector<PutOperation>& ops);
+    void SubmitDfsWrites(std::vector<PutOperation>& ops);
     void FinalizeBatchPut(std::vector<PutOperation>& ops);
     void StartBatchUpsert(std::vector<PutOperation>& ops,
                           const ReplicateConfig& config);
     void FinalizeBatchUpsert(std::vector<PutOperation>& ops);
     std::vector<tl::expected<void, ErrorCode>> CollectResults(
         const std::vector<PutOperation>& ops);
+
+    std::vector<ErrorCode> WriteDfsReplicas(
+        const std::vector<std::string>& keys,
+        const std::vector<const std::vector<Slice>*>& slice_lists,
+        const std::vector<DistributedFSDescriptor>& descriptors);
 
     std::vector<tl::expected<void, ErrorCode>> BatchPutWhenPreferSameNode(
         std::vector<PutOperation>& ops);
@@ -862,7 +864,7 @@ class Client {
     std::unique_ptr<PinnedBufferPool> pinned_buffer_pool_;
     ThreadPool write_thread_pool_;
     std::shared_ptr<StorageBackend> storage_backend_;
-    std::shared_ptr<StorageBackendInterface> dfs_storage_backend_;
+    std::shared_ptr<DistributedStorageBackend> dfs_storage_backend_;
     std::shared_ptr<DfsDescriptorCache> dfs_desc_cache_;
 
     // For high availability

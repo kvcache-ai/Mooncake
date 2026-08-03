@@ -286,7 +286,7 @@ FileStorage::FileStorage(const FileStorageConfig& config,
         if (client_) {
             client_->SetDfsDescriptorCache(
                 distributed_backend->GetDescriptorCache());
-            client_->SetDfsStorageBackend(storage_backend_);
+            client_->SetDfsStorageBackend(distributed_backend);
         }
     }
 
@@ -336,6 +336,12 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
         LOG(ERROR) << "Failed to init storage backend: "
                    << init_storage_backend_result.error();
         return init_storage_backend_result;
+    }
+    if (config_.enable_dfs) {
+        client_buffer_gc_running_.store(true);
+        client_buffer_gc_thread_ =
+            std::thread(&FileStorage::ClientBufferGCThreadFunc, this);
+        return {};
     }
     auto enable_offloading_result = IsEnableOffloading();
     if (enable_offloading_result.has_value()) {
@@ -500,22 +506,6 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             const std::vector<std::string>& keys,
             std::vector<StorageObjectMetadata>& metadatas) -> ErrorCode {
         VLOG(1) << "Success to store objects, keys count: " << keys.size();
-        if (config_.enable_dfs) {
-            std::vector<std::string> user_keys;
-            user_keys.reserve(keys.size());
-            for (const auto& storage_key : keys) {
-                auto [tenant_id, key] = TenantId::ParseScopedKey(storage_key);
-                (void)tenant_id;
-                user_keys.push_back(std::move(key));
-            }
-            auto result = client_->BatchPutEnd(user_keys, ReplicaType::DFS);
-            if (!result) {
-                LOG(ERROR) << "BatchPutEnd(DFS) failed with error: "
-                           << result.error();
-                return result.error();
-            }
-            return ErrorCode::OK;
-        }
         for (auto& metadata : metadatas) {
             metadata.transport_endpoint = local_rpc_addr_;
         }
@@ -816,9 +806,6 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
     {
         MutexLocker locker(&offloading_mutex_);
         auto fetch_offload_tasks = [&]() -> tl::expected<void, ErrorCode> {
-            if (config_.enable_dfs) {
-                return client_->PullDfsOffloadTasks(offloading_objects);
-            }
             return client_->OffloadObjectHeartbeat(enable_offloading_,
                                                    offloading_objects);
         };

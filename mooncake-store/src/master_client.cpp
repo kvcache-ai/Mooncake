@@ -223,11 +223,6 @@ struct RpcNameTraits<&WrappedMasterService::OffloadObjectHeartbeat> {
 };
 
 template <>
-struct RpcNameTraits<&WrappedMasterService::PullDfsOffloadTasks> {
-    static constexpr const char* value = "PullDfsOffloadTasks";
-};
-
-template <>
 struct RpcNameTraits<&WrappedMasterService::ReportSsdCapacity> {
     static constexpr const char* value = "ReportSsdCapacity";
 };
@@ -995,15 +990,6 @@ MasterClient::OffloadObjectHeartbeat(const UUID& client_id,
         invoke_rpc<&WrappedMasterService::OffloadObjectHeartbeat,
                    std::vector<OffloadTaskItem>>(client_id, enable_offloading);
     return result;
-}
-
-tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
-MasterClient::PullDfsOffloadTasks(const UUID& client_id) {
-    ScopedVLogTimer timer(1, "MasterClient::PullDfsOffloadTasks");
-    timer.LogRequest("client_id=", client_id);
-
-    return invoke_rpc<&WrappedMasterService::PullDfsOffloadTasks,
-                      std::vector<OffloadTaskItem>>(client_id);
 }
 
 tl::expected<bool, ErrorCode> MasterClient::PollRemoveAll() {

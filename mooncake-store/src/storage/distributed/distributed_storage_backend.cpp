@@ -1,6 +1,7 @@
 #include "storage/distributed/distributed_storage_backend.h"
 
 #include <filesystem>
+#include <limits>
 
 #include "storage/distributed/dfs_global_allocator.h"
 #include "types.h"
@@ -150,58 +151,34 @@ tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
                "handler";
     }
 
-    std::vector<std::string> success_keys;
-    std::vector<StorageObjectMetadata> success_metas;
-
+    std::vector<DfsWriteRequest> requests;
+    requests.reserve(batch_object.size());
     for (const auto& [storage_key, slices] : batch_object) {
         auto desc = LookupDescriptor(storage_key);
         if (!desc) {
             LOG(WARNING) << "DFS descriptor cache miss for key " << storage_key;
             continue;
         }
-        if (desc->shard_idx < 0 ||
-            desc->shard_idx >= static_cast<int>(shard_files_.size())) {
-            LOG(ERROR) << "Invalid DFS shard_idx " << desc->shard_idx
-                       << " for key " << storage_key;
+        requests.push_back(
+            DfsWriteRequest{storage_key, std::move(*desc), slices});
+    }
+
+    const auto write_results = BatchWrite(requests);
+    std::vector<std::string> success_keys;
+    std::vector<StorageObjectMetadata> success_metas;
+    for (size_t i = 0; i < requests.size(); ++i) {
+        if (!write_results[i]) {
+            LOG(WARNING) << "DFS write failed for key " << requests[i].key
+                         << ", error=" << write_results[i].error();
             continue;
         }
-
-        std::vector<iovec> iovs;
-        iovs.reserve(slices.size());
-        uint64_t total_size = 0;
-        bool invalid = false;
-        for (const auto& slice : slices) {
-            if (!slice.ptr && slice.size > 0) {
-                invalid = true;
-                break;
-            }
-            total_size += slice.size;
-            iovs.push_back({slice.ptr, slice.size});
-        }
-        if (invalid) continue;
-        if (total_size != desc->object_size) {
-            LOG(WARNING) << "DFS size mismatch for key " << storage_key
-                         << ", expected=" << desc->object_size
-                         << ", actual=" << total_size;
-            continue;
-        }
-
-        auto& shard = *shard_files_[desc->shard_idx];
-        std::lock_guard lock(shard.mutex);
-        auto result = fs_adapter_->WriteAt(shard.fd, iovs.data(), iovs.size(),
-                                           static_cast<int64_t>(desc->offset));
-        if (!result || *result != total_size) {
-            LOG(WARNING) << "DFS write failed for key " << storage_key
-                         << ", expected=" << total_size
-                         << ", actual=" << (result ? *result : 0);
-            continue;
-        }
-
-        success_keys.push_back(storage_key);
+        const auto& request = requests[i];
+        const auto& desc = request.descriptor;
+        success_keys.push_back(request.key);
         success_metas.push_back(
-            StorageObjectMetadata{-1, static_cast<int64_t>(desc->offset),
-                                  static_cast<int64_t>(storage_key.size()),
-                                  static_cast<int64_t>(desc->object_size), ""});
+            StorageObjectMetadata{-1, static_cast<int64_t>(desc.offset),
+                                  static_cast<int64_t>(request.key.size()),
+                                  static_cast<int64_t>(desc.object_size), ""});
     }
 
     if (!success_keys.empty() && complete_handler) {
@@ -209,6 +186,86 @@ tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
         if (err != ErrorCode::OK) return tl::make_unexpected(err);
     }
     return static_cast<int64_t>(success_keys.size());
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+DistributedStorageBackend::BatchWrite(
+    const std::vector<DfsWriteRequest>& requests) {
+    std::vector<tl::expected<void, ErrorCode>> results;
+    results.reserve(requests.size());
+
+    if (!initialized_) {
+        LOG(ERROR) << "DistributedStorageBackend is not initialized";
+        results.assign(requests.size(),
+                       tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE));
+        return results;
+    }
+
+    for (const auto& request : requests) {
+        const auto& desc = request.descriptor;
+        if (desc.shard_idx < 0 ||
+            desc.shard_idx >= static_cast<int>(shard_files_.size())) {
+            LOG(ERROR) << "Invalid DFS shard_idx " << desc.shard_idx
+                       << " for key " << request.key;
+            results.emplace_back(
+                tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+            continue;
+        }
+
+        auto& shard = *shard_files_[desc.shard_idx];
+        if (desc.file_path != shard.path) {
+            LOG(ERROR) << "DFS path mismatch for key " << request.key
+                       << ", descriptor=" << desc.file_path
+                       << ", configured=" << shard.path;
+            results.emplace_back(
+                tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+            continue;
+        }
+
+        std::vector<iovec> iovs;
+        iovs.reserve(request.slices.size());
+        uint64_t total_size = 0;
+        bool invalid = false;
+        for (const auto& slice : request.slices) {
+            if ((!slice.ptr && slice.size > 0) ||
+                slice.size >
+                    std::numeric_limits<uint64_t>::max() - total_size) {
+                invalid = true;
+                break;
+            }
+            total_size += slice.size;
+            iovs.push_back({slice.ptr, slice.size});
+        }
+        if (invalid || total_size != desc.object_size) {
+            LOG(WARNING) << "Invalid DFS write request for key " << request.key
+                         << ", expected=" << desc.object_size
+                         << ", actual=" << total_size;
+            results.emplace_back(
+                tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+            continue;
+        }
+
+        std::lock_guard lock(shard.mutex);
+        auto write_result =
+            fs_adapter_->WriteAt(shard.fd, iovs.data(), iovs.size(),
+                                 static_cast<int64_t>(desc.offset));
+        if (!write_result) {
+            LOG(WARNING) << "DFS write failed for key " << request.key
+                         << ", error=" << write_result.error();
+            results.emplace_back(tl::make_unexpected(write_result.error()));
+            continue;
+        }
+        if (*write_result != total_size) {
+            LOG(WARNING) << "DFS short write for key " << request.key
+                         << ", expected=" << total_size
+                         << ", actual=" << *write_result;
+            results.emplace_back(
+                tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL));
+            continue;
+        }
+        results.emplace_back();
+    }
+    return results;
 }
 
 tl::expected<void, ErrorCode> DistributedStorageBackend::BatchLoad(
@@ -223,6 +280,12 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::BatchLoad(
         if (!desc) return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
         if (desc->shard_idx < 0 ||
             desc->shard_idx >= static_cast<int>(shard_files_.size())) {
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if (desc->file_path != shard_files_[desc->shard_idx]->path) {
+            LOG(ERROR) << "DFS path mismatch for key " << key
+                       << ", descriptor=" << desc->file_path << ", configured="
+                       << shard_files_[desc->shard_idx]->path;
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
         if (slice.size < desc->object_size || !slice.ptr) {
