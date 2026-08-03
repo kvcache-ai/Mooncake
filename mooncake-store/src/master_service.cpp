@@ -3476,6 +3476,7 @@ auto MasterService::AllocateAndInsertMetadata(
         } else {
             allocated_nof_replicas = allocation_result->size();
             for (auto& replica : allocation_result.value()) {
+                replica.set_nof_metadata(value_length, nof_block_size);
                 replicas.push_back(std::move(replica));
             }
         }

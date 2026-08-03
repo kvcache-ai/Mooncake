@@ -457,6 +457,17 @@ class Replica {
         }
     }
 
+    void set_nof_metadata(uint64_t object_size, uint32_t block_size) {
+        if (!is_nof_replica()) {
+        LOG(ERROR) << "Cannot set NoF metadata on non-NoF replica";
+        return;
+        }
+
+        auto& nof_data = std::get<NoFReplicaData>(data_);
+        nof_data.object_size = object_size;
+        nof_data.block_size = block_size;
+    }
+
     void mark_removed() {
         if (status_ == ReplicaStatus::COMPLETE ||
             status_ == ReplicaStatus::PROCESSING) {
