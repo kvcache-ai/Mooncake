@@ -9,26 +9,41 @@ jobs:
   # manylinux2_28 for the toolchain only (USE_CUDA=OFF); keeps the glibc floor
   # aligned with the CUDA wheels.
   build:
+    if: ${{ !contains(github.ref_name, '-') }}
     uses: ./.github/workflows/_build-wheel.yaml
     with:
       runner: ubuntu-22.04
       container: pytorch/manylinux2_28-builder:cuda12.8
       cuda: container
-      build-with-ep: '0'
       variant-flag: NON_CUDA_BUILD
       cmake-args: >-
         -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=OFF -DWITH_EP=OFF
         -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
       artifact-prefix: mooncake-wheel-non-cuda
 
+  build-arm64:
+    if: ${{ !contains(github.ref_name, '-') }}
+    uses: ./.github/workflows/_build-wheel.yaml
+    with:
+      runner: ubuntu-22.04-arm
+      container: pytorch/manylinuxaarch64-builder:cuda12.8
+      cuda: container
+      cmake-generator: Ninja
+      variant-flag: NON_CUDA_BUILD
+      cmake-args: >-
+        -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=OFF -DWITH_EP=OFF
+        -DSTORE_USE_ETCD=ON -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON
+        -DCMAKE_BUILD_TYPE=Release
+      artifact-prefix: mooncake-wheel-non-cuda-arm64
+
   publish-release:
     if: ${{ !contains(github.ref_name, '-') }}
-    needs: build
+    needs: [build, build-arm64]
     permissions:
       contents: write
       id-token: write
     uses: ./.github/workflows/_publish-wheel.yaml
     with:
-      artifact-pattern: 'mooncake-wheel-non-cuda*'
+      artifact-pattern: 'mooncake-wheel-non-cuda-*'
     secrets:
       pypi-token: ${{ secrets.PYPI_API_TOKEN }}

@@ -544,8 +544,9 @@ TEST_F(MasterAdminServerTest, TenantQuotaAdminLifecycleEndpoints) {
         service->PutStart(client_id, "quota_admin_key", 100, cfg, "tenant-a");
     ASSERT_TRUE(put.has_value()) << toString(put.error());
     ASSERT_TRUE(service
-                    ->PutEnd(client_id, "quota_admin_key", ReplicaType::MEMORY,
-                             "tenant-a")
+                    ->PutEnd(client_id,
+                             ObjectMeta{"quota_admin_key", std::nullopt},
+                             ReplicaType::MEMORY, "tenant-a")
                     .has_value());
 
     auto delete_non_empty =
@@ -661,7 +662,9 @@ class MasterAdminServerWithServiceTest : public ::testing::Test {
         cfg.replica_num = 1;
         auto ps = service_->PutStart(client_id, kDefaultKey, 1024, cfg);
         if (ps.has_value()) {
-            (void)service_->PutEnd(client_id, kDefaultKey, ReplicaType::MEMORY);
+            (void)service_->PutEnd(client_id,
+                                   ObjectMeta{kDefaultKey, std::nullopt},
+                                   ReplicaType::MEMORY);
         }
 
         port_ = getFreeTcpPort();
@@ -730,7 +733,8 @@ TEST_F(MasterAdminServerWithServiceTest, GetAllKeysExcludesRemovedKey) {
     cfg.replica_num = 1;
     auto ps = service_->PutStart(client_id, key, 1024, cfg);
     if (ps.has_value()) {
-        (void)service_->PutEnd(client_id, key, ReplicaType::MEMORY);
+        (void)service_->PutEnd(client_id, ObjectMeta{key, std::nullopt},
+                               ReplicaType::MEMORY);
     }
     (void)service_->Remove(key, "default");
 
@@ -1002,7 +1006,9 @@ TEST_F(MasterAdminServerWithServiceTest, BatchQueryKeysMultipleKeys) {
     cfg.replica_num = 1;
     auto ps = service_->PutStart(client_id, "second_key", 512, cfg);
     if (ps.has_value()) {
-        (void)service_->PutEnd(client_id, "second_key", ReplicaType::MEMORY);
+        (void)service_->PutEnd(client_id,
+                               ObjectMeta{"second_key", std::nullopt},
+                               ReplicaType::MEMORY);
     }
 
     auto resp = HttpGet("/batch_query_keys?keys=" + std::string(kDefaultKey) +
@@ -1146,11 +1152,13 @@ TEST_F(MasterAdminServerTest, MultipleSegmentsAndKeys) {
     cfg.replica_num = 1;
     auto ps1 = service->PutStart(client_id, "key_one", 1024, cfg);
     if (ps1.has_value()) {
-        (void)service->PutEnd(client_id, "key_one", ReplicaType::MEMORY);
+        (void)service->PutEnd(client_id, ObjectMeta{"key_one", std::nullopt},
+                              ReplicaType::MEMORY);
     }
     auto ps2 = service->PutStart(client_id, "key_two", 2048, cfg);
     if (ps2.has_value()) {
-        (void)service->PutEnd(client_id, "key_two", ReplicaType::MEMORY);
+        (void)service->PutEnd(client_id, ObjectMeta{"key_two", std::nullopt},
+                              ReplicaType::MEMORY);
     }
 
     int port = getFreeTcpPort();

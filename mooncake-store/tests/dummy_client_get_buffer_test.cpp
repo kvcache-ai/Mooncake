@@ -16,6 +16,7 @@
 #include <vector>
 
 #include "dummy_client.h"
+#include "environ.h"
 #include "real_client.h"
 #include "default_config.h"
 #include "test_server_helpers.h"
@@ -41,9 +42,9 @@ static void RegisterRpcHandlers(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::removeAll_internal>(&rc);
     server.register_handler<&RealClient::isExist_internal>(&rc);
     server.register_handler<&RealClient::getSize_internal>(&rc);
+    server.register_handler<&RealClient::get_into_range_shm_helper>(&rc);
     server.register_handler<&RealClient::batch_get_into_dummy_helper>(&rc);
     server.register_handler<&RealClient::batch_put_from_dummy_helper>(&rc);
-    server.register_handler<&RealClient::put_from_dummy_helper>(&rc);
     server.register_handler<&RealClient::acquire_hot_cache>(&rc);
     server.register_handler<&RealClient::release_hot_cache>(&rc);
     server.register_handler<&RealClient::batch_acquire_hot_cache>(&rc);
@@ -51,6 +52,7 @@ static void RegisterRpcHandlers(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::acquire_buffer_dummy>(&rc);
     server.register_handler<&RealClient::release_buffer_dummy>(&rc);
     server.register_handler<&RealClient::batch_acquire_buffer_dummy>(&rc);
+    server.register_handler<&RealClient::batch_get_query_results>(&rc);
 }
 
 static constexpr size_t kMB = 1024ULL * 1024;
@@ -374,6 +376,58 @@ TEST_F(DummyClientGetBufferTest, GetBuffer_AllocatorFallback) {
 
     std::string got(static_cast<const char *>(buf->ptr()), buf->size());
     EXPECT_EQ(got, data) << "Data mismatch on allocator fallback path";
+}
+
+TEST_F(DummyClientGetBufferTest, GetIntoRejectsCorruptedObjectWithChecksum) {
+    if (!Environ::Get().GetStoreChecksumEnabled()) {
+        GTEST_SKIP() << "MOONCAKE_STORE_CHECKSUM is not enabled";
+    }
+    ASSERT_TRUE(SetupStack()) << "Failed to bring up real+dummy stack";
+
+    const std::string key = "dummy_checksum_corruption";
+    const std::string data = "0123456789abcdef";
+    PutData(key, data);
+
+    auto replicas = real_client_->get_replica_desc(key);
+    ASSERT_EQ(replicas.size(), 1);
+    ASSERT_TRUE(replicas[0].is_memory_replica());
+    auto &descriptor = replicas[0].get_memory_descriptor().buffer_descriptor;
+    auto *stored_data = reinterpret_cast<char *>(descriptor.buffer_address_);
+    stored_data[0] ^= 0x01;
+
+    const uint64_t target_addr =
+        dummy_client_->alloc_from_mem_pool(data.size());
+    ASSERT_NE(target_addr, 0);
+    void *target = reinterpret_cast<void *>(target_addr);
+    ASSERT_EQ(dummy_client_->register_buffer(target, data.size()), 0);
+    EXPECT_EQ(dummy_client_->get_into(key, target, data.size()),
+              toInt(ErrorCode::CHECKSUM_MISMATCH));
+
+    stored_data[0] ^= 0x01;
+    EXPECT_EQ(dummy_client_->unregister_buffer(target), 0);
+    EXPECT_EQ(ShmHelper::getInstance()->free(target), 0);
+}
+
+TEST_F(DummyClientGetBufferTest, BatchQueryPreservesObjectChecksum) {
+    if (!Environ::Get().GetStoreChecksumEnabled()) {
+        GTEST_SKIP() << "MOONCAKE_STORE_CHECKSUM is not enabled";
+    }
+    ASSERT_TRUE(SetupStack()) << "Failed to bring up real+dummy stack";
+
+    const std::string key = "dummy_batch_query_checksum";
+    const std::string data = "0123456789abcdef";
+    PutData(key, data);
+
+    auto real_results = real_client_->batch_query({key});
+    ASSERT_EQ(real_results.size(), 1);
+    ASSERT_TRUE(real_results[0].has_value());
+    ASSERT_TRUE(real_results[0]->object_checksum.has_value());
+
+    auto dummy_results = dummy_client_->batch_query({key});
+    ASSERT_EQ(dummy_results.size(), 1);
+    ASSERT_TRUE(dummy_results[0].has_value());
+    EXPECT_EQ(dummy_results[0]->object_checksum,
+              real_results[0]->object_checksum);
 }
 
 // ---- Test: get_buffer via hot cache shm zero-copy path ----

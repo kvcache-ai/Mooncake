@@ -29,6 +29,7 @@
 namespace mooncake {
 
 class RealClient;
+class RegisteredPinnedRegion;
 class UdsAcceptor;
 class UdsConnection;
 
@@ -388,6 +389,9 @@ class RealClient : public PyClient {
     batch_acquire_buffer_dummy(const std::vector<std::string> &keys,
                                const UUID &client_id);
 
+    tl::expected<std::tuple<uint64_t, size_t>, ErrorCode> allocate_buffer_dummy(
+        size_t size, const UUID &client_id);
+
     tl::expected<void, ErrorCode> put_dummy_helper(
         const std::string &key, std::span<const char> value,
         const ReplicateConfig &config, const UUID &client_id);
@@ -436,11 +440,6 @@ class RealClient : public PyClient {
         const std::vector<size_t> &sizes, const ReplicateConfig &config,
         int32_t device_id, const UUID &client_id);
 
-    tl::expected<void, ErrorCode> put_from_dummy_helper(
-        const std::string &key, uint64_t dummy_buffer, size_t size,
-        const ReplicateConfig &config, int32_t device_id,
-        const UUID &client_id);
-
     std::vector<tl::expected<void, ErrorCode>>
     batch_put_from_multi_buffers_dummy_helper(
         const std::vector<std::string> &keys,
@@ -459,7 +458,8 @@ class RealClient : public PyClient {
 
     tl::expected<int64_t, ErrorCode> get_into_range_shm_helper(
         const std::string &key, uint64_t buffer, size_t dst_offset,
-        size_t src_offset, size_t size, const UUID &client_id);
+        size_t src_offset, size_t size, bool size_is_buffer_capacity,
+        bool verify_checksum, const UUID &client_id);
 
     std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
     get_into_ranges_shm_helper(
@@ -557,11 +557,12 @@ class RealClient : public PyClient {
     tl::expected<int64_t, ErrorCode> execute_ranged_read(
         const std::string &key, void *buffer, size_t dst_offset,
         size_t src_offset, size_t size, const RangedReadMetadata &metadata,
-        bool size_is_buffer_capacity = false);
+        bool size_is_buffer_capacity, bool verify_checksum);
 
     tl::expected<int64_t, ErrorCode> get_into_range_internal(
         const std::string &key, void *buffer, size_t dst_offset,
-        size_t src_offset, size_t size, bool size_is_buffer_capacity = false);
+        size_t src_offset, size_t size, bool size_is_buffer_capacity,
+        bool verify_checksum);
 
     std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
     get_into_ranges_internal(
@@ -761,7 +762,10 @@ class RealClient : public PyClient {
         void *base = nullptr;
         size_t size = 0;
         std::string protocol;
+        std::shared_ptr<RegisteredPinnedRegion> pinned_region;
     };
+
+    void FreeAllocatedStoreSegment(AllocatedSegmentRecord &record);
 
     std::unique_ptr<AutoPortBinder> port_binder_ = nullptr;
 
@@ -821,6 +825,9 @@ class RealClient : public PyClient {
     std::vector<std::unique_ptr<void, SunriseSegmentDeleter>>
         sunrise_segment_ptrs_;
 #endif
+    std::vector<std::shared_ptr<RegisteredPinnedRegion>>
+        setup_segment_pinned_regions_;
+    bool setup_segment_memory_must_leak_ = false;
     std::string protocol;
     std::string device_name;
     std::string local_hostname;

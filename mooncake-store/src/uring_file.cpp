@@ -434,7 +434,8 @@ UringFile::~UringFile() {
         if (close(fd_) != 0) {
             LOG(WARNING) << "[UringFile] close failed: " << filename_;
         }
-        if (error_code_ == ErrorCode::FILE_WRITE_FAIL) {
+        if (delete_on_write_fail_ &&
+            error_code_ == ErrorCode::FILE_WRITE_FAIL) {
             if (::unlink(filename_.c_str()) == -1)
                 LOG(ERROR) << "[UringFile] failed to delete corrupted file: "
                            << filename_;
@@ -679,7 +680,7 @@ tl::expected<void, ErrorCode> UringFile::datasync() {
     auto res = SharedUringRing::instance().fsync(fd_);
     if (!res) {
         LOG(ERROR) << "[UringFile::datasync] fsync failed for: " << filename_;
-        return make_error<void>(ErrorCode::FILE_WRITE_FAIL);
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
     return {};
 }

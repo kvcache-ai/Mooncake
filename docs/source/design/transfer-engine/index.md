@@ -161,7 +161,7 @@ The following video shows a normal run as described above, with the Target on th
 ## Transfer Engine C/C++ API
 Transfer Engine provides interfaces through the `TransferEngine` class (located in `mooncake-transfer-engine/include/transfer_engine.h`), where the specific data transfer functions for different backends are implemented by the `Transport` class, currently supporting `TcpTransport`, `RdmaTransport`, `EfaTransport` (for AWS EFA), `NVMeoFTransport`, `NvlinkTransport` (for NVIDIA GPUs), `IntraNodeNvlinkTransport` (for NVIDIA GPUs), and `HipTransport` (for AMD GPUs).
 
-For a complete C++ API reference, see [Transfer Engine C++ API Reference](cpp-api.md).
+For a complete C++ API reference, see [Transfer Engine C++ API Reference](../../api-reference/cpp/transfer-engine.md).
 
 ### Data Transfer
 Transfer Engine provides batch-based read/write transfers between segments (DRAM/VRAM/NVMeof). A typical flow is: register local memory, open a target segment, submit a batch, and poll status. Detailed function signatures and usage are documented in the C++ API reference.
@@ -435,7 +435,7 @@ if __name__ == "__main__":
 
 ::::
 
-For more Python APIs, see [Transfer Engine Python API](../../python-api-reference/transfer-engine.md).
+For more Python APIs, see [Transfer Engine Python API](../../api-reference/python/transfer-engine.md).
 
 ### Using C/C++ Interface
 After compiling Mooncake Store, you can move the compiled static library file `libtransfer_engine.a` and the C header file `transfer_engine_c.h` into your own project. There is no need to reference other files under `src/transfer_engine`.
@@ -456,7 +456,7 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_IB_PORT` The IB port number used per device instance, default value 1
 - `MC_IB_TC` Adjust RDMA NIC Traffic Class when switch/NIC defaults differ or for traffic planning. Default value -1
 - `MC_IB_SL` Set the InfiniBand Service Level (0-15) of RDMA QPs. The switch maps SL to a Virtual Lane for QoS isolation, e.g. to steer KV-cache traffic into a different VL than Expert-Parallel all-to-all traffic that shares the same NIC. -1 keeps the default (0). Default value -1
-- `MC_IB_PCI_RELAXED_ORDERING` Setting the PCIe ordering to relaxed for the network adapter sometimes results in better performance. Can set 1 to enable RO function. Default value 0
+- `MC_IB_PCI_RELAXED_ORDERING` Controls PCIe Relaxed Ordering (RO) for RDMA memory regions. `0`: disabled, `1`: enabled if supported by hardware (default), `2`: auto. Requires `ibv_reg_mr_iova2` (libibverbs ≥ 1.8); falls back to strict ordering if unavailable.
 - `MC_MLX5_QP_UDP_SPORTS` Comma-separated list of UDP source ports (0-65535) used to override the RoCEv2 UDP source port of each QP, for spreading traffic across different ECMP/LAG paths. QP at index *i* uses `list[i % size]`. Default empty (driver chooses). **Requires** an mlx5 NIC + RoCEv2, and the binary built with `-DUSE_MLX5DV=ON`. Recommend ports in the dynamic range 49152-65535. Example: `MC_MLX5_QP_UDP_SPORTS="49152,49153,49154,49155"`
 - `MC_MLX5_QP_LAG_PORT_BALANCE` Set to `1` or `true` to enable automatic LAG port balancing across bonded physical ports. QP at index *i* is pinned to port `(i % num_lag_ports) + 1`; the number of LAG ports is queried from hardware via `mlx5dv_query_device` at startup and printed in the device log. If the device is not in LAG mode the setting is a no-op. Default: disabled. **Requires** the binary built with `-DUSE_MLX5DV=ON`. Example: `MC_MLX5_QP_LAG_PORT_BALANCE=1`
 - `MC_GID_INDEX` The GID index used per device instance, default value 3 (or the maximum value supported by the platform)
