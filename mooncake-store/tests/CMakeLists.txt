@@ -68,6 +68,8 @@ endif()
 add_store_test(master_service_test master_service_test.cpp)
 add_store_test(batch_evict_test batch_evict_test.cpp)
 add_store_test(master_service_config_test master_service_config_test.cpp)
+add_store_test(master_service_processing_key_double_erase_test
+               master_service_processing_key_double_erase_test.cpp)
 add_store_test(master_service_tenant_quota_test
                master_service_tenant_quota_test.cpp)
 add_store_test(batch_remove_test batch_remove_test.cpp)
