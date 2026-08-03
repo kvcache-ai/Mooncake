@@ -157,33 +157,19 @@ class MemcpyOperationState : public OperationState {
  */
 class SpdkNofOperationState : public OperationState {
    public:
-    explicit SpdkNofOperationState(size_t pending_tasks = 1)
-        : pending_tasks_(pending_tasks) {
-        assert(pending_tasks_ > 0);
-    }
 
     bool is_completed() override {
         std::lock_guard<std::mutex> lock(mutex_);
         return result_.has_value();
     }
     void set_completed(ErrorCode error_code) {
-        bool notify = false;
 
         {
             std::lock_guard<std::mutex> lock(mutex_);
             assert(!result_.has_value());
-            assert(pending_tasks_ > 0);
-            if (error_code != ErrorCode::OK && first_error_ == ErrorCode::OK) {
-                first_error_ = error_code;
-            }
-            --pending_tasks_;
-            if (pending_tasks_ == 0) {
-                result_.emplace(first_error_);
-                notify = true;
-            }
+            result_.emplace(first_error_);
         }
-        if (notify) {
-            cv_.notify_all();
+        cv_.notify_all();
         }
     }
 
@@ -196,9 +182,6 @@ class SpdkNofOperationState : public OperationState {
         return TransferStrategy::SPDK_NVMF;
     }
 
-   private:
-    size_t pending_tasks_;
-    ErrorCode first_error_{ErrorCode::OK};
 };
 
 class FilereadOperationState : public OperationState {

@@ -1610,7 +1610,7 @@ std::optional<TransferFuture> TransferSubmitter::submitSpdkNofOperation(
         return std::nullopt;
     }
 
-    auto state = std::make_shared<SpdkNofOperationState>(1);
+    auto state = std::make_shared<SpdkNofOperationState>();
     SpdkNofTask task(seg_handle, std::move(sgl),
                      handle.buffer_address_ / block_size, lba_count, op_code,
                      state, std::move(owners));
@@ -1757,7 +1757,7 @@ TransferSubmitter::submitSpdkNofRangeReadOperation(
     const uint64_t start_lba =
         handle.buffer_address_ / block_size +
         physical_relative_start / block_size;
-    auto state = std::make_shared<SpdkNofOperationState>(1);
+    auto state = std::make_shared<SpdkNofOperationState>();
     SpdkNofTask task(seg_handle, std::move(sgl), start_lba, lba_count,
                      TransferRequest::READ, state, std::move(owners));
     spdk_nvmf_pool_->submitTask(std::move(task));
