@@ -38,6 +38,8 @@ class RdmaTransport;
 class DeviceSelector;
 
 class Workers {
+    friend class RdmaTransportTestPeer;
+
    public:
     static constexpr size_t kCapacity = 1024 * 8;
     using BoundedSliceQueue = BoundedMPSCQueue<RdmaSliceList, kCapacity>;
@@ -74,6 +76,11 @@ class Workers {
     void releaseSliceQuota(RdmaSlice* slice, double latency = 0.0);
 
     void monitorThread();
+
+    // 1 Hz heartbeat from monitorThread(): drains every context's retiring
+    // endpoints so reclaim is not gated on new insertions, which stall under
+    // failure load.
+    void reclaimEndpoints();
 
     int handleContextEvents(std::shared_ptr<RdmaContext>& context);
 
