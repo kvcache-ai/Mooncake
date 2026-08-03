@@ -82,6 +82,7 @@ inline std::ostream& operator<<(
        << ", segment.name=" << snapshot.segment.name
        << ", segment.base=" << snapshot.segment.base
        << ", segment.size=" << snapshot.segment.size
+       << ", segment.block_size=" << snapshot.segment.block_size
        << ", segment.te_endpoint=" << snapshot.segment.te_endpoint
        << ", status=" << snapshot.status << "}";
     return os;
@@ -560,7 +561,10 @@ class NoFSegmentManager {
         std::shared_lock<std::shared_mutex> lock(segment_mutex_);
         return mounted_segments_.size();
     }
-
+    uint32_t getBlockSize() const {
+        std::shared_lock<std::shared_mutex> lock(segment_mutex_);
+        return block_size_;
+    }
     void GetMountedSegmentsSnapshot(
         std::vector<MountedNoFSegmentSnapshot>& segments) const;
 
@@ -593,7 +597,7 @@ class NoFSegmentManager {
 
     std::unordered_map<std::string, UUID>
         client_by_name_;  // segment name -> client_id
-
+    uint32_t block_size_{0};
     friend class ScopedNoFSegmentAccess;
     friend class SegmentTest;
 };

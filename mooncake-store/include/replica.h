@@ -170,6 +170,8 @@ struct MemoryReplicaData {
 
 struct NoFReplicaData {
     std::unique_ptr<AllocatedBuffer> buffer;
+    uint64_t object_size{0};
+    uint32_t block_size{0};
 };
 
 struct DiskReplicaData {
