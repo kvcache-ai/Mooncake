@@ -3528,16 +3528,36 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
     }
 
     if (replica.is_nof_replica()) {
-        void* dst = static_cast<char*>(buffer) + dst_offset;
-        std::vector<Slice> slices{Slice{dst, size}};
+        if (!client_buffer_allocator_) {
+            LOG(ERROR) << "Client buffer allocator is not provided";
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+
+        auto alloc_result = client_buffer_allocator_->allocate(size);
+        if (!alloc_result) {
+            LOG(ERROR) << "Failed to allocate temporary DMA buffer for NoF "
+                        "ranged read"
+                        << ", key=" << key << ", size=" << size;
+            return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+
+        BufferHandle tmp_handle(std::move(*alloc_result));
+        std::vector<Slice> tmp_slices{Slice{tmp_handle.ptr(), size},};
+
         auto filtered_qr = FilterQueryResult(query_result, replica);
-        auto get_result =
-            client_->Get(key, filtered_qr, slices, src_offset);
+        auto get_result = client_->Get(key, filtered_qr, tmp_slices, src_offset);
         if (!get_result) {
             LOG(ERROR) << "NoF ranged Get failed for key: " << key
-                       << ", error=" << toString(get_result.error());
+                   << ", error=" << toString(get_result.error());
             return tl::unexpected(get_result.error());
         }
+
+        void* dst = static_cast<char*>(buffer) + dst_offset;
+        auto copy_result = scatter_host_to_maybe_device(dst, tmp_handle.ptr(), size, "NoF ranged read, key: " + key);
+        if (!copy_result) {
+            return tl::unexpected(copy_result.error());
+        }
+
         return static_cast<int64_t>(size);
     }
 
