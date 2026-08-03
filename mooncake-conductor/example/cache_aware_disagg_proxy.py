@@ -10,6 +10,7 @@ import json
 import logging
 import math
 import os
+import struct
 import uuid
 from collections.abc import AsyncIterator, Callable, Mapping
 from contextlib import asynccontextmanager
@@ -638,12 +639,13 @@ class ConductorClient:
         for payload in self.registration_payloads(prefills):
             response = await self.client.post(
                 "/register",
-                json=payload,
+                content=_msgpack_encode(payload),
+                headers={"Content-Type": "application/msgpack"},
                 timeout=self.conductor_config.registration_timeout_seconds,
             )
             try:
                 response.raise_for_status()
-                body = _response_object(response, "Conductor register")
+                body = _response_msgpack(response, "Conductor register")
                 if (
                     body.get("status") != "registered successfully"
                     or body.get("instance_id") != payload["instance_id"]
@@ -669,10 +671,12 @@ class ConductorClient:
         model = request_data.get("model")
         if not isinstance(model, str) or not model:
             raise ConductorProtocolError("request model is missing or invalid")
+        # /query is msgpack-only: token_ids travel as a bin of little-endian
+        # int32 (4 bytes/token, no per-element JSON parsing on the server).
         payload: dict[str, Any] = {
             "model": model,
             "block_size": self.prefill_config.block_size,
-            "token_ids": token_ids,
+            "token_ids": _pack_token_ids(token_ids),
             "tenant_id": self.prefill_config.tenant_id,
             "lora_name": self.prefill_config.lora_name,
         }
@@ -681,25 +685,41 @@ class ConductorClient:
 
         response = await self.client.post(
             "/query",
-            json=payload,
-            headers={"X-Request-Id": request_id},
+            content=_msgpack_encode(payload),
+            headers={
+                "Content-Type": "application/msgpack",
+                "X-Request-Id": request_id,
+            },
             timeout=self.conductor_config.query_timeout_seconds,
         )
         try:
             response.raise_for_status()
-            return _response_object(response, "Conductor query")
+            return _response_msgpack(response, "Conductor query")
         finally:
             await response.aclose()
 
 
-def _response_object(response: httpx.Response, operation: str) -> dict[str, Any]:
+def _response_msgpack(response: httpx.Response, operation: str) -> dict[str, Any]:
+    import msgpack
+
     try:
-        body = response.json()
+        body = msgpack.unpackb(response.content, raw=False)
     except ValueError as exc:
-        raise ConductorProtocolError(f"{operation} returned invalid JSON") from exc
+        raise ConductorProtocolError(f"{operation} returned invalid msgpack") from exc
     if not isinstance(body, dict):
-        raise ConductorProtocolError(f"{operation} response must be a JSON object")
+        raise ConductorProtocolError(f"{operation} response must be a msgpack map")
     return body
+
+
+def _pack_token_ids(token_ids: list[int]) -> bytes:
+    """Packs token ids as little-endian int32 for the msgpack bin channel."""
+    return struct.pack(f"<{len(token_ids)}i", *token_ids)
+
+
+def _msgpack_encode(payload: Mapping[str, Any]) -> bytes:
+    import msgpack
+
+    return msgpack.packb(payload, use_bin_type=True)
 
 
 class ProxyRuntime:

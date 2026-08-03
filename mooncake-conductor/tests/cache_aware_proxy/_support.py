@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import struct
 import sys
 from collections.abc import Awaitable, Callable
 from pathlib import Path
@@ -77,6 +78,23 @@ def request_json(request: httpx.Request) -> dict[str, Any]:
     return body
 
 
+def request_msgpack(request: httpx.Request) -> dict[str, Any]:
+    """Decodes a msgpack /query request body.
+
+    token_ids travel as a bin of little-endian int32; they are converted back
+    to a list[int] so assertions read like the old JSON payloads.
+    """
+    import msgpack
+
+    body = msgpack.unpackb(request.content, raw=False)
+    assert isinstance(body, dict)
+    token_ids = body.get("token_ids")
+    if isinstance(token_ids, bytes):
+        count = len(token_ids) // 4
+        body["token_ids"] = list(struct.unpack(f"<{count}i", token_ids))
+    return body
+
+
 Handler = Callable[[httpx.Request], Awaitable[httpx.Response]]
 
 
@@ -103,13 +121,24 @@ class RecordingClientFactory:
         return client
 
 
+def msgpack_response(status: int, payload: dict[str, Any]) -> httpx.Response:
+    """Builds an httpx response with a msgpack body (conductor wire format)."""
+    import msgpack
+
+    return httpx.Response(
+        status,
+        content=msgpack.packb(payload, use_bin_type=True),
+        headers={"Content-Type": "application/msgpack"},
+    )
+
+
 async def registration_success_handler(request: httpx.Request) -> httpx.Response:
     if request.url.path != "/register":
         raise AssertionError(f"unexpected request: {request.method} {request.url}")
-    payload = request_json(request)
-    return httpx.Response(
+    payload = request_msgpack(request)
+    return msgpack_response(
         200,
-        json={
+        {
             "status": "registered successfully",
             "instance_id": payload["instance_id"],
         },

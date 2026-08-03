@@ -20,12 +20,13 @@ current parser and serializer.
 
 ## Common request and response rules
 
-All `POST` bodies are JSON objects. Unknown fields are rejected. Successful
-responses use `application/json`; JSON object key order is not part of the
-contract.
+Every endpoint speaks **msgpack only**. `POST` bodies are msgpack maps sent
+with `Content-Type: application/msgpack`; success responses and error bodies
+are msgpack maps with `Content-Type: application/msgpack`. `GET` endpoints
+(`/services`, `/global_view`) also return msgpack. Unknown fields are rejected
+on every endpoint. Map key order is not part of the contract.
 
-Most validation failures return status `400` with an
-`application/json` object:
+Most validation failures return status `400` with a msgpack map:
 
 ```json
 {
@@ -35,9 +36,9 @@ Most validation failures return status `400` with an
 }
 ```
 
-`field` is present when one field caused the error. `index` is also present
-when one array element caused it. The [error formats](#understand-errors)
-section lists the cases that return plain text instead.
+(`json` is used here only for readability; on the wire this is a msgpack map
+with the same keys.) `field` is present when one field caused the error.
+`index` is also present when one array element caused it.
 
 ## `POST /register`
 
@@ -95,26 +96,35 @@ HTTP endpoint.
 
 ### Minimal request
 
-```bash
-curl -sS -X POST http://127.0.0.1:13333/register \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "endpoint": "tcp://127.0.0.1:5557",
-    "type": "vLLM",
-    "modelname": "test-model",
-    "instance_id": "engine-a",
-    "block_size": 16,
-    "dp_rank": 0,
-    "hash_profile": {
-      "strategy": "vllm_v1",
-      "algorithm": "sha256_cbor",
-      "python_hash_seed": "0",
-      "index_projection": "low64_be"
-    }
-  }'
+```python
+import msgpack
+import httpx
+
+body = msgpack.packb(
+    {
+        "endpoint": "tcp://127.0.0.1:5557",
+        "type": "vLLM",
+        "modelname": "test-model",
+        "instance_id": "engine-a",
+        "block_size": 16,
+        "dp_rank": 0,
+        "hash_profile": {
+            "strategy": "vllm_v1",
+            "algorithm": "sha256_cbor",
+            "python_hash_seed": "0",
+            "index_projection": "low64_be",
+        },
+    },
+    use_bin_type=True,
+)
+response = httpx.post(
+    "http://127.0.0.1:13333/register",
+    content=body,
+    headers={"Content-Type": "application/msgpack"},
+)
 ```
 
-Status `200` returns:
+Status `200` returns a msgpack map equivalent to:
 
 ```json
 {
@@ -125,8 +135,9 @@ Status `200` returns:
 
 Submitting the exact same active registration again returns the same success
 without starting another subscriber. A conflicting service key, endpoint, or
-hash profile returns a JSON `400` with `reason` `invalid_registration`.
-Failure to start the local subscription client returns plain-text `500`.
+hash profile returns a msgpack `400` with `reason` `invalid_registration`.
+Failure to start the local subscription client returns a msgpack `500` error
+map.
 
 ## `POST /unregister`
 
@@ -145,13 +156,19 @@ No other fields are accepted.
 
 ### Minimal request
 
-```bash
-curl -sS -X POST http://127.0.0.1:13333/unregister \
-  -H 'Content-Type: application/json' \
-  -d '{"instance_id":"engine-a","dp_rank":0}'
+```python
+import msgpack
+import httpx
+
+body = msgpack.packb({"instance_id": "engine-a", "dp_rank": 0}, use_bin_type=True)
+response = httpx.post(
+    "http://127.0.0.1:13333/unregister",
+    content=body,
+    headers={"Content-Type": "application/msgpack"},
+)
 ```
 
-Status `200` returns the exact service key that was removed:
+Status `200` returns a msgpack map with the exact service key that was removed:
 
 ```json
 {
@@ -162,10 +179,10 @@ Status `200` returns the exact service key that was removed:
 }
 ```
 
-An unknown service key returns plain-text status `404`. A cleanup failure after
-the subscriber stops returns plain-text status `500`. Conductor keeps that
-service key and endpoint reserved, so neither can be registered again. Retry
-the same `/unregister` request until cleanup succeeds.
+An unknown service key returns a msgpack error map with status `404`. A
+cleanup failure after the subscriber stops returns status `500`. Conductor
+keeps that service key and endpoint reserved, so neither can be registered
+again. Retry the same `/unregister` request until cleanup succeeds.
 
 ## `POST /query`
 
@@ -174,16 +191,23 @@ for the requested tenant, model, LoRA name, and block size. The request cannot
 override the strategy, algorithm, `python_hash_seed`, derived root digest, or
 final-eight-byte lookup rule.
 
+**The request body is msgpack, like every other endpoint.** Send a msgpack
+map with `Content-Type: application/msgpack`; any other content type is
+rejected with `unsupported_content_type`. `token_ids` may be a msgpack `bin`
+of little-endian signed 32-bit integers (preferred: 4 bytes per token, no
+per-element parsing) or a msgpack array of integers. The response is a
+msgpack map as well.
+
 ### Request fields
 
 | Field | Required | Accepted value and when it matters |
 |---|---|---|
-| `model` | Yes | Non-empty model name. It must match registration `modelname`. |
+| `model` | Yes | Non-empty model name string. It must match registration `modelname`. |
 | `block_size` | Yes | Positive integer. Only complete groups of this many tokens are hashed. |
-| `token_ids` | Yes | JSON array of signed 32-bit integers. An empty array is valid and reports zero hits for compatible registered ranks. |
+| `token_ids` | Yes | msgpack `bin` of little-endian int32, or an array of signed 32-bit integers. An empty value is valid and reports zero hits for compatible registered ranks. |
 | `tenant_id` | No | String. Omitted or `""` becomes `"default"`. |
 | `lora_name` | No | String. Defaults to `""` for the base model. |
-| `cache_salt` | No | String, `null`, or omitted. `null`, `""`, and omission all select the no-salt hash path; a non-empty value must match the producer. |
+| `cache_salt` | No | String, `nil`, or omitted. `nil`, `""`, and omission all select the no-salt hash path; a non-empty value must match the producer. |
 | `instance_id` | No | String filter. A matching registered instance is returned alone; an unknown value returns an empty `instances` object. |
 
 No hash-profile override fields are accepted. A missing cache-sharing group
@@ -192,14 +216,25 @@ state.
 
 ### Minimal request
 
-```bash
-curl -sS -X POST http://127.0.0.1:13333/query \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "test-model",
-    "block_size": 16,
-    "token_ids": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
-  }'
+```python
+import msgpack
+import struct
+import httpx
+
+token_ids = list(range(16))
+body = msgpack.packb(
+    {
+        "model": "test-model",
+        "block_size": 16,
+        "token_ids": struct.pack(f"<{len(token_ids)}i", *token_ids),
+    },
+    use_bin_type=True,
+)
+response = httpx.post(
+    "http://127.0.0.1:13333/query",
+    content=body,
+    headers={"Content-Type": "application/msgpack"},
+)
 ```
 
 If `engine-a` rank `0` is registered and no matching cache event has arrived,
@@ -341,12 +376,17 @@ It takes no request body.
 
 ### Minimal request
 
-```bash
-curl -sS http://127.0.0.1:13333/global_view
+```python
+import msgpack
+import httpx
+
+view = msgpack.unpackb(
+    httpx.get("http://127.0.0.1:13333/global_view").content, raw=False
+)
 ```
 
 After registering `engine-a` ranks `0` and `1`, before cache events arrive, a
-one-context response has this shape:
+one-context response (msgpack map, rendered as JSON here) has this shape:
 
 ```json
 {
@@ -391,11 +431,16 @@ the register request.
 
 ### Minimal request
 
-```bash
-curl -sS http://127.0.0.1:13333/services
+```python
+import msgpack
+import httpx
+
+services = msgpack.unpackb(
+    httpx.get("http://127.0.0.1:13333/services").content, raw=False
+)
 ```
 
-After the minimal register example, status `200` returns:
+After the minimal register example, status `200` returns a msgpack map:
 
 ```json
 {
@@ -433,30 +478,28 @@ cache-producing traffic.
 
 ## Understand errors
 
-Conductor deliberately uses both JSON validation errors and plain-text
-operational errors:
+All error responses are msgpack maps; the JSON rendering below is for
+readability only. Validation failures carry a stable `reason`, operational
+failures carry only `error`:
 
-| Situation | Status | Content type and body |
+| Situation | Status | Body |
 |---|---|---|
-| Field validation for any `POST` endpoint | `400` | `application/json` with `error`, `reason`, and applicable `field` or `index`. |
-| Malformed `/query` JSON or a non-object body | `400` | `application/json` with `{"error":"Invalid JSON object","reason":"invalid_json"}`. |
-| Malformed `/register` or `/unregister` JSON, or a non-object body | `400` | `text/plain; charset=utf-8` with `Invalid JSON\n`. |
-| `/unregister` service key not found | `404` | `text/plain; charset=utf-8`, for example `service not found: engine-a\|default\|0\n`. |
-| `GET` on `/register`, `/unregister`, or `/query`; `POST` on `/global_view` or `/services` | `405` | `text/plain; charset=utf-8` with `Method not allowed\n`. |
-| `/register` cannot start the local subscription client | `500` | `text/plain; charset=utf-8` beginning `Failed to subscribe: failed to start ZMQ client:`. |
-| `/unregister` stops the subscriber but cache cleanup fails | `500` | `text/plain; charset=utf-8` beginning `Failed to unregister prefix context:`. |
+| Field validation for any `POST` endpoint | `400` | `error`, `reason`, and applicable `field` or `index`. |
+| Any `POST` endpoint with a non-msgpack `Content-Type` | `400` | `{"error":"Content-Type must be application/msgpack","reason":"unsupported_content_type"}`. |
+| Malformed msgpack body or a non-map body on any `POST` endpoint | `400` | `{"error":"Invalid msgpack object","reason":"invalid_msgpack"}`. |
+| `/unregister` service key not found | `404` | `{"error":"service not found: engine-a\|default\|0"}`. |
+| `GET` on `/register`, `/unregister`, or `/query`; `POST` on `/global_view` or `/services` | `405` | `{"error":"Method not allowed"}`. |
+| `/register` cannot start the local subscription client | `500` | `error` beginning `Failed to subscribe: failed to start ZMQ client:`. |
+| `/unregister` stops the subscriber but cache cleanup fails | `500` | `error` beginning `Failed to unregister prefix context:`. |
 
-For example, a string in `token_ids` produces an element-specific JSON error:
+For example, a string element in a `token_ids` array produces an
+element-specific error:
 
 ```json
 {
-  "error": "token_ids element must be a JSON integer",
+  "error": "token_ids element must be an integer",
   "reason": "invalid_type",
   "field": "token_ids",
   "index": 0
 }
 ```
-
-Conductor-generated JSON responses end with a newline except `/services`,
-whose compact JSON body has no trailing newline. Plain-text errors shown with
-`\n` above include that trailing newline.

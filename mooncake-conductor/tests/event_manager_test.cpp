@@ -5,6 +5,7 @@
 #include <glog/logging.h>
 #include <asio.hpp>
 #include <json/json.h>
+#include <msgpack.hpp>
 #include <ylt/coro_http/coro_http_client.hpp>
 #include <ylt/coro_http/coro_http_server.hpp>
 
@@ -198,12 +199,60 @@ HttpResponse ToHttpResponse(const Result& result) {
     return response;
 }
 
-HttpResponse HttpPostJson(uint16_t port, const std::string& path,
-                          const std::string& body) {
+// The conductor HTTP layer is msgpack-only. Tests still build bodies as
+// Json::Value for readability; MsgpackDocument converts them on the way out.
+void MsgpackPackValue(const Json::Value& value,
+                      msgpack::packer<msgpack::sbuffer>& packer) {
+    switch (value.type()) {
+        case Json::nullValue:
+            packer.pack_nil();
+            return;
+        case Json::intValue:
+            packer.pack(value.asInt64());
+            return;
+        case Json::uintValue:
+            packer.pack(value.asUInt64());
+            return;
+        case Json::realValue:
+            packer.pack(value.asDouble());
+            return;
+        case Json::stringValue:
+            packer.pack(value.asString());
+            return;
+        case Json::booleanValue:
+            packer.pack(value.asBool());
+            return;
+        case Json::arrayValue:
+            packer.pack_array(static_cast<uint32_t>(value.size()));
+            for (const auto& element : value) {
+                MsgpackPackValue(element, packer);
+            }
+            return;
+        case Json::objectValue:
+            packer.pack_map(
+                static_cast<uint32_t>(value.getMemberNames().size()));
+            for (const auto& name : value.getMemberNames()) {
+                packer.pack(name);
+                MsgpackPackValue(value[name], packer);
+            }
+            return;
+    }
+}
+
+std::string MsgpackDocument(const Json::Value& value) {
+    msgpack::sbuffer buffer;
+    msgpack::packer<msgpack::sbuffer> packer(&buffer);
+    MsgpackPackValue(value, packer);
+    return std::string(buffer.data(), buffer.size());
+}
+
+HttpResponse HttpPostMsgpack(uint16_t port, const std::string& path,
+                             const std::string& body) {
     coro_http::coro_http_client client;
     const std::string url = "http://127.0.0.1:" + std::to_string(port) + path;
     return ToHttpResponse(
-        client.post(url, body, coro_http::req_content_type::json));
+        client.post(url, body, coro_http::req_content_type::none,
+                    {{"Content-Type", "application/msgpack"}}));
 }
 
 HttpResponse HttpGet(uint16_t port, const std::string& path) {
@@ -218,12 +267,6 @@ bool ParseJsonDocument(const std::string& document, Json::Value* value,
     std::unique_ptr<Json::CharReader> reader(builder.newCharReader());
     return reader->parse(document.data(), document.data() + document.size(),
                          value, errors);
-}
-
-std::string JsonDocument(const Json::Value& value) {
-    Json::StreamWriterBuilder builder;
-    builder["indentation"] = "";
-    return Json::writeString(builder, value);
 }
 
 Json::Value TokenArray(const std::vector<int32_t>& tokens) {
@@ -287,11 +330,65 @@ Json::Value ServiceJson(const ServiceConfig& service) {
     return value;
 }
 
-Json::Value ParseJsonResponse(const HttpResponse& response) {
-    Json::Value body;
-    std::string errors;
-    EXPECT_TRUE(ParseJsonDocument(response.body, &body, &errors)) << errors;
-    return body;
+// Decodes a msgpack response body into Json::Value so assertions stay
+// readable. The conductor HTTP layer is msgpack-only; Json::Value is used
+// here purely as a convenient assertion representation.
+Json::Value MsgpackObjectToJson(const msgpack::object& object) {
+    switch (object.type) {
+        case msgpack::type::NIL:
+            return Json::Value(Json::nullValue);
+        case msgpack::type::BOOLEAN:
+            return Json::Value(object.via.boolean);
+        case msgpack::type::POSITIVE_INTEGER:
+            // Match JsonCpp literal parsing, which produces intValue for
+            // in-range positives, so EXPECT_EQ stays type-consistent.
+            return Json::Value(Json::Int64(object.via.u64));
+        case msgpack::type::NEGATIVE_INTEGER:
+            return Json::Value(Json::Int64(object.via.i64));
+        case msgpack::type::FLOAT32:
+        case msgpack::type::FLOAT64:
+            return Json::Value(object.via.f64);
+        case msgpack::type::STR:
+            return Json::Value(
+                std::string(object.via.str.ptr, object.via.str.size));
+        case msgpack::type::BIN:
+            return Json::Value(
+                std::string(object.via.bin.ptr, object.via.bin.size));
+        case msgpack::type::ARRAY: {
+            Json::Value array(Json::arrayValue);
+            for (uint32_t i = 0; i < object.via.array.size; ++i) {
+                array.append(MsgpackObjectToJson(object.via.array.ptr[i]));
+            }
+            return array;
+        }
+        case msgpack::type::MAP: {
+            Json::Value map(Json::objectValue);
+            for (uint32_t i = 0; i < object.via.map.size; ++i) {
+                const auto& kv = object.via.map.ptr[i];
+                std::string key;
+                if (kv.key.type == msgpack::type::STR) {
+                    key.assign(kv.key.via.str.ptr, kv.key.via.str.size);
+                } else {
+                    key = "<non-string-key>";
+                }
+                map[key] = MsgpackObjectToJson(kv.val);
+            }
+            return map;
+        }
+        default:
+            return Json::Value(Json::nullValue);
+    }
+}
+
+Json::Value ParseMsgpackResponse(const HttpResponse& response) {
+    try {
+        const auto handle =
+            msgpack::unpack(response.body.data(), response.body.size());
+        return MsgpackObjectToJson(handle.get());
+    } catch (const std::exception& e) {
+        ADD_FAILURE() << "failed to decode msgpack response: " << e.what();
+        return Json::Value(Json::nullValue);
+    }
 }
 
 TEST(MakeServiceKey, IncludesRank) {
@@ -511,21 +608,20 @@ class QueryHttpTest : public ::testing::Test {
 
     HttpResponse Post(const Json::Value& body,
                       const std::string& path = "/query") const {
-        return HttpPostJson(port_, path, JsonDocument(body));
+        return HttpPostMsgpack(port_, path, MsgpackDocument(body));
     }
 
     Json::Value ValidQuery() const {
         return QueryJson(ContextFor(instance_one_), tokens_);
     }
 
-    void ExpectJsonStatus(const HttpResponse& response, int status,
-                          Json::Value* body) const {
+    void ExpectMsgpackStatus(const HttpResponse& response, int status,
+                             Json::Value* body) const {
         EXPECT_EQ(response.status, status);
         const auto content_type = response.headers.find("content-type");
         ASSERT_NE(content_type, response.headers.end());
-        EXPECT_EQ(content_type->second, "application/json");
-        std::string errors;
-        ASSERT_TRUE(ParseJsonDocument(response.body, body, &errors)) << errors;
+        EXPECT_EQ(content_type->second, "application/msgpack");
+        *body = ParseMsgpackResponse(response);
         ASSERT_TRUE(body->isObject());
     }
 
@@ -538,7 +634,8 @@ class QueryHttpTest : public ::testing::Test {
 
 TEST_F(QueryHttpTest, ReturnsExactSharedCacheResponse) {
     Json::Value body;
-    ASSERT_NO_FATAL_FAILURE(ExpectJsonStatus(Post(ValidQuery()), 200, &body));
+    ASSERT_NO_FATAL_FAILURE(
+        ExpectMsgpackStatus(Post(ValidQuery()), 200, &body));
 
     Json::Value expected;
     std::string errors;
@@ -577,7 +674,7 @@ TEST_F(QueryHttpTest, PickleProfileResolvesQueryHashes) {
 
     Json::Value body;
     ASSERT_NO_FATAL_FAILURE(
-        ExpectJsonStatus(Post(QueryJson(context, tokens_)), 200, &body));
+        ExpectMsgpackStatus(Post(QueryJson(context, tokens_)), 200, &body));
     ASSERT_TRUE(body["instances"].isMember("pickle"));
     const Json::Value& instance = body["instances"]["pickle"];
     EXPECT_EQ(instance["longest_matched"].asInt64(), 32);
@@ -589,7 +686,7 @@ TEST_F(QueryHttpTest, PickleProfileResolvesQueryHashes) {
     // their own registered profile.
     Json::Value cbor_body;
     ASSERT_NO_FATAL_FAILURE(
-        ExpectJsonStatus(Post(ValidQuery()), 200, &cbor_body));
+        ExpectMsgpackStatus(Post(ValidQuery()), 200, &cbor_body));
     EXPECT_EQ(cbor_body["instances"]["1"]["gpu"].asInt64(), 32);
 }
 
@@ -632,7 +729,7 @@ TEST_F(QueryHttpTest, ReturnsOrderedFourBlockTierBoundaries) {
                     .empty());
 
     const Json::Value body =
-        ParseJsonResponse(Post(QueryJson(ContextFor(service), tokens)));
+        ParseMsgpackResponse(Post(QueryJson(ContextFor(service), tokens)));
     Json::Value expected;
     std::string errors;
     ASSERT_TRUE(ParseJsonDocument(
@@ -645,24 +742,24 @@ TEST_F(QueryHttpTest, ReturnsOrderedFourBlockTierBoundaries) {
 }
 
 TEST_F(QueryHttpTest, FiltersCompatibleInstanceAndDropsUnknownFilter) {
-    const Json::Value unfiltered = ParseJsonResponse(Post(ValidQuery()));
+    const Json::Value unfiltered = ParseMsgpackResponse(Post(ValidQuery()));
     Json::Value query = ValidQuery();
     query["instance_id"] = "1";
-    const Json::Value selected = ParseJsonResponse(Post(query));
+    const Json::Value selected = ParseMsgpackResponse(Post(query));
     ASSERT_EQ(selected["instances"].getMemberNames(),
               (std::vector<std::string>{"1"}));
     EXPECT_EQ(selected["instances"]["1"], unfiltered["instances"]["1"]);
     ASSERT_NO_FATAL_FAILURE(ExpectRankMapsAligned(selected["instances"]["1"]));
 
     query["instance_id"] = "missing";
-    const Json::Value missing = ParseJsonResponse(Post(query));
+    const Json::Value missing = ParseMsgpackResponse(Post(query));
     EXPECT_TRUE(missing["instances"].isObject());
     EXPECT_TRUE(missing["instances"].empty());
 }
 
 TEST_F(QueryHttpTest, KeepsZeroHitRegisteredRanksInBothRankMaps) {
     const std::vector<int32_t> miss_tokens = Sequence(5000, 16);
-    const Json::Value body = ParseJsonResponse(
+    const Json::Value body = ParseMsgpackResponse(
         Post(QueryJson(ContextFor(instance_one_), miss_tokens)));
     ASSERT_EQ(body["instances"].getMemberNames(),
               (std::vector<std::string>{"1", "2"}));
@@ -687,19 +784,19 @@ TEST_F(QueryHttpTest, MissingContextReturnsEmptyWithoutCreatingState) {
     Json::Value query = ValidQuery();
     query["model"] = "missing-model";
     const auto before = manager_->GetIndexer()->GetGlobalView().context_count;
-    const Json::Value response = ParseJsonResponse(Post(query));
+    const Json::Value response = ParseMsgpackResponse(Post(query));
     EXPECT_TRUE(response["instances"].empty());
     EXPECT_EQ(manager_->GetIndexer()->GetGlobalView().context_count, before);
 
     query = ValidQuery();
     query["tenant_id"] = "other-tenant";
-    EXPECT_TRUE(ParseJsonResponse(Post(query))["instances"].empty());
+    EXPECT_TRUE(ParseMsgpackResponse(Post(query))["instances"].empty());
     query = ValidQuery();
     query["lora_name"] = "other-lora";
-    EXPECT_TRUE(ParseJsonResponse(Post(query))["instances"].empty());
+    EXPECT_TRUE(ParseMsgpackResponse(Post(query))["instances"].empty());
     query = ValidQuery();
     query["block_size"] = 32;
-    EXPECT_TRUE(ParseJsonResponse(Post(query))["instances"].empty());
+    EXPECT_TRUE(ParseMsgpackResponse(Post(query))["instances"].empty());
     EXPECT_EQ(manager_->GetIndexer()->GetGlobalView().context_count, before);
 }
 
@@ -723,22 +820,22 @@ TEST_F(QueryHttpTest, SaltIsRequestOnlyAndNullEmptyOmittedMeanNoSalt) {
 
     Json::Value query = QueryJson(ContextFor(salted_service), tokens);
     query["cache_salt"] = "pepper";
-    EXPECT_EQ(
-        ParseJsonResponse(Post(query))["instances"]["salted"]["gpu"].asInt64(),
-        8);
+    EXPECT_EQ(ParseMsgpackResponse(Post(query))["instances"]["salted"]["gpu"]
+                  .asInt64(),
+              8);
 
     query.removeMember("cache_salt");
-    EXPECT_EQ(
-        ParseJsonResponse(Post(query))["instances"]["salted"]["gpu"].asInt64(),
-        0);
+    EXPECT_EQ(ParseMsgpackResponse(Post(query))["instances"]["salted"]["gpu"]
+                  .asInt64(),
+              0);
     query["cache_salt"] = "";
-    EXPECT_EQ(
-        ParseJsonResponse(Post(query))["instances"]["salted"]["gpu"].asInt64(),
-        0);
+    EXPECT_EQ(ParseMsgpackResponse(Post(query))["instances"]["salted"]["gpu"]
+                  .asInt64(),
+              0);
     query["cache_salt"] = Json::Value(Json::nullValue);
-    EXPECT_EQ(
-        ParseJsonResponse(Post(query))["instances"]["salted"]["gpu"].asInt64(),
-        0);
+    EXPECT_EQ(ParseMsgpackResponse(Post(query))["instances"]["salted"]["gpu"]
+                  .asInt64(),
+              0);
 }
 
 TEST_F(QueryHttpTest, RejectsMalformedInputsBeforeLookup) {
@@ -785,32 +882,32 @@ TEST_F(QueryHttpTest, RejectsMalformedInputsBeforeLookup) {
     override_root["root_digest"] = std::string(kRootDigest);
 
     const std::vector<Case> cases = {
-        {"malformed JSON", "{not-json", "invalid_json"},
-        {"missing model", JsonDocument(missing_model), "missing"},
-        {"empty model", JsonDocument(empty_model), "invalid_value"},
-        {"wrong model", JsonDocument(wrong_model), "invalid_type"},
-        {"missing block", JsonDocument(missing_block), "missing"},
-        {"zero block", JsonDocument(zero_block), "out_of_range"},
-        {"fractional block", JsonDocument(fractional_block), "invalid_type"},
-        {"missing tokens", JsonDocument(missing_tokens), "missing"},
-        {"string token", JsonDocument(string_token), "invalid_type"},
-        {"large token", JsonDocument(large_token), "out_of_range"},
-        {"small token", JsonDocument(small_token), "out_of_range"},
-        {"bad salt", JsonDocument(bad_salt), "invalid_type"},
-        {"bad tenant", JsonDocument(bad_tenant), "invalid_type"},
-        {"bad lora", JsonDocument(bad_lora), "invalid_type"},
-        {"bad instance", JsonDocument(bad_instance), "invalid_type"},
-        {"seed override", JsonDocument(override_seed), "unknown_field"},
-        {"root override", JsonDocument(override_root), "unknown_field"},
+        {"malformed msgpack", std::string("\xc1", 1), "invalid_msgpack"},
+        {"missing model", MsgpackDocument(missing_model), "missing"},
+        {"empty model", MsgpackDocument(empty_model), "invalid_value"},
+        {"wrong model", MsgpackDocument(wrong_model), "invalid_type"},
+        {"missing block", MsgpackDocument(missing_block), "missing"},
+        {"zero block", MsgpackDocument(zero_block), "out_of_range"},
+        {"fractional block", MsgpackDocument(fractional_block), "invalid_type"},
+        {"missing tokens", MsgpackDocument(missing_tokens), "missing"},
+        {"string token", MsgpackDocument(string_token), "invalid_type"},
+        {"large token", MsgpackDocument(large_token), "out_of_range"},
+        {"small token", MsgpackDocument(small_token), "out_of_range"},
+        {"bad salt", MsgpackDocument(bad_salt), "invalid_type"},
+        {"bad tenant", MsgpackDocument(bad_tenant), "invalid_type"},
+        {"bad lora", MsgpackDocument(bad_lora), "invalid_type"},
+        {"bad instance", MsgpackDocument(bad_instance), "invalid_type"},
+        {"seed override", MsgpackDocument(override_seed), "unknown_field"},
+        {"root override", MsgpackDocument(override_root), "unknown_field"},
     };
 
     const auto before = manager_->GetIndexer()->GetGlobalView();
     for (const auto& test_case : cases) {
         SCOPED_TRACE(test_case.name);
         const HttpResponse response =
-            HttpPostJson(port_, "/query", test_case.body);
+            HttpPostMsgpack(port_, "/query", test_case.body);
         EXPECT_EQ(response.status, 400);
-        const Json::Value error = ParseJsonResponse(response);
+        const Json::Value error = ParseMsgpackResponse(response);
         EXPECT_EQ(error["reason"].asString(), test_case.reason);
         const auto after = manager_->GetIndexer()->GetGlobalView();
         EXPECT_EQ(after.context_count, before.context_count);
@@ -825,7 +922,7 @@ TEST_F(QueryHttpTest, RejectsMalformedInputsBeforeLookup) {
 TEST_F(QueryHttpTest, AcceptsEmptyTokensAndSignedInt32Boundaries) {
     Json::Value query = ValidQuery();
     query["token_ids"] = Json::Value(Json::arrayValue);
-    Json::Value empty = ParseJsonResponse(Post(query));
+    Json::Value empty = ParseMsgpackResponse(Post(query));
     EXPECT_EQ(empty["instances"]["1"]["dp"]["0"].asInt64(), 0);
     EXPECT_EQ(empty["instances"]["2"]["dp"]["1"].asInt64(), 0);
     ASSERT_NO_FATAL_FAILURE(ExpectRankMapsAligned(empty["instances"]["1"]));
@@ -860,8 +957,8 @@ class RegistrationHttpTest : public ::testing::Test {
     }
 
     HttpResponse Register(const ServiceConfig& service) const {
-        return HttpPostJson(port_, "/register",
-                            JsonDocument(ServiceJson(service)));
+        return HttpPostMsgpack(port_, "/register",
+                               MsgpackDocument(ServiceJson(service)));
     }
 
     HttpResponse Unregister(const std::string& instance_id, int dp_rank) const {
@@ -869,12 +966,13 @@ class RegistrationHttpTest : public ::testing::Test {
         body["instance_id"] = instance_id;
         body["tenant_id"] = "default";
         body["dp_rank"] = dp_rank;
-        return HttpPostJson(port_, "/unregister", JsonDocument(body));
+        return HttpPostMsgpack(port_, "/unregister", MsgpackDocument(body));
     }
 
     Json::Value QueryEmpty(const ServiceConfig& service) const {
-        return ParseJsonResponse(HttpPostJson(
-            port_, "/query", JsonDocument(QueryJson(ContextFor(service), {}))));
+        return ParseMsgpackResponse(HttpPostMsgpack(
+            port_, "/query",
+            MsgpackDocument(QueryJson(ContextFor(service), {}))));
     }
 
     std::unique_ptr<EventManager> manager_;
@@ -889,7 +987,7 @@ TEST_F(RegistrationHttpTest, ResolvesReportsAndRetriesSeedProfile) {
 
     const HttpResponse services_response = HttpGet(port_, "/services");
     ASSERT_EQ(services_response.status, 200);
-    const Json::Value services = ParseJsonResponse(services_response);
+    const Json::Value services = ParseMsgpackResponse(services_response);
     ASSERT_EQ(services["count"].asInt(), 1);
     ASSERT_EQ(services["services"].size(), 1u);
     const Json::Value& service_profile = services["services"][0]["HashProfile"];
@@ -901,7 +999,7 @@ TEST_F(RegistrationHttpTest, ResolvesReportsAndRetriesSeedProfile) {
 
     const HttpResponse view_response = HttpGet(port_, "/global_view");
     ASSERT_EQ(view_response.status, 200);
-    const Json::Value view = ParseJsonResponse(view_response);
+    const Json::Value view = ParseMsgpackResponse(view_response);
     ASSERT_EQ(view["context_count"].asInt(), 1);
     ASSERT_EQ(view["contexts"].size(), 1u);
     const Json::Value& context_profile = view["contexts"][0]["hash_profile"];
@@ -918,7 +1016,7 @@ TEST_F(RegistrationHttpTest, ResolvesAndReportsPickleProfile) {
 
     const HttpResponse services_response = HttpGet(port_, "/services");
     ASSERT_EQ(services_response.status, 200);
-    const Json::Value services = ParseJsonResponse(services_response);
+    const Json::Value services = ParseMsgpackResponse(services_response);
     ASSERT_EQ(services["count"].asInt(), 1);
     ASSERT_EQ(services["services"].size(), 1u);
     const Json::Value& service_profile = services["services"][0]["HashProfile"];
@@ -930,7 +1028,7 @@ TEST_F(RegistrationHttpTest, ResolvesAndReportsPickleProfile) {
 
     const HttpResponse view_response = HttpGet(port_, "/global_view");
     ASSERT_EQ(view_response.status, 200);
-    const Json::Value view = ParseJsonResponse(view_response);
+    const Json::Value view = ParseMsgpackResponse(view_response);
     ASSERT_EQ(view["context_count"].asInt(), 1);
     ASSERT_EQ(view["contexts"].size(), 1u);
     const Json::Value& context_profile = view["contexts"][0]["hash_profile"];
@@ -950,9 +1048,9 @@ TEST_F(RegistrationHttpTest, RejectsUnsupportedAlgorithmWithoutMutation) {
         Json::Value body = ServiceJson(VllmService());
         body["hash_profile"]["algorithm"] = algorithm;
         const HttpResponse response =
-            HttpPostJson(port_, "/register", JsonDocument(body));
+            HttpPostMsgpack(port_, "/register", MsgpackDocument(body));
         EXPECT_EQ(response.status, 400);
-        const Json::Value error = ParseJsonResponse(response);
+        const Json::Value error = ParseMsgpackResponse(response);
         EXPECT_EQ(error["reason"].asString(), "invalid_value");
         EXPECT_EQ(error["field"].asString(), "algorithm");
         EXPECT_EQ(EventManagerTestPeer::SubscriberCount(*manager_), 0u);
@@ -968,7 +1066,7 @@ TEST_F(RegistrationHttpTest, MixedAlgorithmConflictIsAtomic) {
     conflicting.hash_profile = TestProfile("0", "sha256");
     const HttpResponse response = Register(conflicting);
     ASSERT_EQ(response.status, 400);
-    EXPECT_EQ(ParseJsonResponse(response)["reason"].asString(),
+    EXPECT_EQ(ParseMsgpackResponse(response)["reason"].asString(),
               "invalid_registration");
 
     EXPECT_EQ(EventManagerTestPeer::SubscriberCount(*manager_), 1u);
@@ -1036,10 +1134,10 @@ TEST_F(RegistrationHttpTest, RejectsInvalidSeedProfilesWithoutMutation) {
 
     for (const auto& test_case : cases) {
         SCOPED_TRACE(test_case.name);
-        const HttpResponse response =
-            HttpPostJson(port_, "/register", JsonDocument(test_case.body));
+        const HttpResponse response = HttpPostMsgpack(
+            port_, "/register", MsgpackDocument(test_case.body));
         EXPECT_EQ(response.status, 400);
-        const Json::Value error = ParseJsonResponse(response);
+        const Json::Value error = ParseMsgpackResponse(response);
         EXPECT_EQ(error["reason"].asString(), test_case.reason);
         EXPECT_EQ(error["field"].asString(), test_case.field);
         EXPECT_EQ(EventManagerTestPeer::SubscriberCount(*manager_), 0u);
@@ -1055,7 +1153,7 @@ TEST_F(RegistrationHttpTest, ContextProfileConflictIsAtomic) {
     conflicting.hash_profile = TestProfile("1");
     const HttpResponse response = Register(conflicting);
     ASSERT_EQ(response.status, 400);
-    EXPECT_EQ(ParseJsonResponse(response)["reason"].asString(),
+    EXPECT_EQ(ParseMsgpackResponse(response)["reason"].asString(),
               "invalid_registration");
 
     EXPECT_EQ(EventManagerTestPeer::SubscriberCount(*manager_), 1u);
@@ -1103,22 +1201,25 @@ TEST_F(RegistrationHttpTest, RejectsProfileConflictAndMalformedGroup) {
 
     Json::Value invalid = ServiceJson(VllmService("bad-group"));
     invalid["cache_group"] = 1;
-    EXPECT_EQ(HttpPostJson(port_, "/register", JsonDocument(invalid)).status,
-              400);
+    EXPECT_EQ(
+        HttpPostMsgpack(port_, "/register", MsgpackDocument(invalid)).status,
+        400);
     EXPECT_EQ(manager_->GetIndexer()->GetGlobalView().context_count, 1);
 
     invalid = ServiceJson(VllmService("mixed-group"));
     invalid["cache_group"] = Json::Value(Json::arrayValue);
     invalid["cache_group"].append(0);
     invalid["cache_group"].append(1);
-    EXPECT_EQ(HttpPostJson(port_, "/register", JsonDocument(invalid)).status,
-              400);
+    EXPECT_EQ(
+        HttpPostMsgpack(port_, "/register", MsgpackDocument(invalid)).status,
+        400);
     EXPECT_EQ(manager_->GetIndexer()->GetGlobalView().context_count, 1);
 
     invalid = ServiceJson(VllmService("bad-profile"));
     invalid["hash_profile"]["python_hash_seed"] = "not-a-seed";
-    EXPECT_EQ(HttpPostJson(port_, "/register", JsonDocument(invalid)).status,
-              400);
+    EXPECT_EQ(
+        HttpPostMsgpack(port_, "/register", MsgpackDocument(invalid)).status,
+        400);
     EXPECT_EQ(manager_->GetIndexer()->GetGlobalView().context_count, 1);
 }
 
