@@ -167,11 +167,11 @@ class SpdkNofOperationState : public OperationState {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             assert(!result_.has_value());
-            result_.emplace(first_error_);
+            result_.emplace(error_code);
         }
         cv_.notify_all();
-        }
     }
+    
 
     void wait_for_completion() override {
         std::unique_lock<std::mutex> lock(mutex_);
