@@ -8,7 +8,8 @@ from _support import (
     RecordingClientFactory,
     proxy,
     registration_success_handler,
-    request_json,
+    msgpack_response,
+    request_msgpack,
     valid_config,
 )
 
@@ -98,7 +99,7 @@ class ConductorClientTest(unittest.IsolatedAsyncioTestCase):
             nonlocal calls
             calls += 1
             if calls == 2:
-                return httpx.Response(400, json={"reason": "invalid_registration"})
+                return msgpack_response(400, {"reason": "invalid_registration"})
             return await registration_success_handler(request)
 
         factory = RecordingClientFactory(handler)
@@ -134,10 +135,9 @@ class ConductorClientTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_registration_rejects_unexpected_success_body(self) -> None:
         async def handler(request: httpx.Request) -> httpx.Response:
-            payload = request_json(request)
-            return httpx.Response(
-                200,
-                json={"status": "ok", "instance_id": payload["instance_id"]},
+            payload = request_msgpack(request)
+            return msgpack_response(
+                200, {"status": "ok", "instance_id": payload["instance_id"]}
             )
 
         factory = RecordingClientFactory(handler)
@@ -149,7 +149,7 @@ class ConductorClientTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_query_payload_forwards_optional_cache_salt_and_timeout(self) -> None:
         async def handler(request: httpx.Request) -> httpx.Response:
-            return httpx.Response(200, json={"instances": {}})
+            return msgpack_response(200, {"instances": {}})
 
         config = valid_config()
         factory = RecordingClientFactory(handler)
@@ -172,8 +172,8 @@ class ConductorClientTest(unittest.IsolatedAsyncioTestCase):
             "request-2",
         )
 
-        salted = request_json(factory.requests[0])
-        unsalted = request_json(factory.requests[1])
+        salted = request_msgpack(factory.requests[0])
+        unsalted = request_msgpack(factory.requests[1])
         self.assertEqual(
             {
                 "model": "test-model",

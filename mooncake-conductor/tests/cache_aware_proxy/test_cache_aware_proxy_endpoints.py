@@ -6,7 +6,14 @@ from unittest.mock import patch
 
 import httpx
 
-from _support import RecordingClientFactory, proxy, request_json, valid_config
+from _support import (
+    RecordingClientFactory,
+    msgpack_response,
+    proxy,
+    request_json,
+    request_msgpack,
+    valid_config,
+)
 
 
 class EndpointTest(unittest.IsolatedAsyncioTestCase):
@@ -20,18 +27,18 @@ class EndpointTest(unittest.IsolatedAsyncioTestCase):
             outbound.append(request)
             path = request.url.path
             if request.url.host == "conductor.test" and path == "/register":
-                payload = request_json(request)
-                return httpx.Response(
+                payload = request_msgpack(request)
+                return msgpack_response(
                     200,
-                    json={
+                    {
                         "status": "registered successfully",
                         "instance_id": payload["instance_id"],
                     },
                 )
             if request.url.host == "conductor.test" and path == "/query":
-                return httpx.Response(
+                return msgpack_response(
                     200,
-                    json={
+                    {
                         "instances": {
                             "prefill-a": {
                                 "longest_matched": 16,
@@ -125,7 +132,7 @@ class EndpointTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, tokenize_body["max_tokens"])
         self.assertNotIn("stream_options", tokenize_body)
 
-        self.assertEqual("salt-a", request_json(query)["cache_salt"])
+        self.assertEqual("salt-a", request_msgpack(query)["cache_salt"])
 
         prefill_body = request_json(prefill)
         self.assertFalse(prefill_body["stream"])
@@ -156,18 +163,18 @@ class EndpointTest(unittest.IsolatedAsyncioTestCase):
             outbound.append(request)
             path = request.url.path
             if request.url.host == "conductor.test" and path == "/register":
-                payload = request_json(request)
-                return httpx.Response(
+                payload = request_msgpack(request)
+                return msgpack_response(
                     200,
-                    json={
+                    {
                         "status": "registered successfully",
                         "instance_id": payload["instance_id"],
                     },
                 )
             if request.url.host == "conductor.test" and path == "/query":
-                return httpx.Response(
+                return msgpack_response(
                     200,
-                    json={
+                    {
                         "instances": {
                             "prefill-a": {"longest_matched": 0},
                             "prefill-b": {"longest_matched": 0},

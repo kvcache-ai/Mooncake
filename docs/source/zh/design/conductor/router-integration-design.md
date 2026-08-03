@@ -132,7 +132,9 @@ endpoint 映射都以 Router 自己的状态为准；Conductor 不执行这些�
 
 ## 如何理解查询结果
 
-Router 使用真实执行所需的 token IDs 调用 `POST /query`：
+Router 使用真实执行所需的 token IDs 调用 `POST /query`。请求体为 msgpack map
+（`Content-Type: application/msgpack`），`token_ids` 以小端 int32 的 `bin`
+（或整数数组）承载，字段含义与下表一致：
 
 ```json
 {

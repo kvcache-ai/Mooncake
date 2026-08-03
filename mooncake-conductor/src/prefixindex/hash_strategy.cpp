@@ -509,6 +509,24 @@ std::string Sha256(std::span<const uint8_t> input,
     return "";
 }
 
+// Same as Sha256 but reuses a caller-owned context across invocations,
+// avoiding an EVP_MD_CTX allocation per hashed block in long hash chains.
+std::string Sha256Reuse(EVP_MD_CTX* context, std::span<const uint8_t> input,
+                        std::array<uint8_t, kSha256DigestSize>* digest) {
+    if (EVP_MD_CTX_reset(context) != 1 ||
+        EVP_DigestInit_ex(context, EVP_sha256(), nullptr) != 1 ||
+        EVP_DigestUpdate(context, input.data(), input.size()) != 1) {
+        return "OpenSSL EVP SHA-256 initialization failed";
+    }
+
+    unsigned int digest_size = 0;
+    if (EVP_DigestFinal_ex(context, digest->data(), &digest_size) != 1 ||
+        digest_size != digest->size()) {
+        return "OpenSSL EVP SHA-256 finalization failed";
+    }
+    return "";
+}
+
 int LowerHexValue(char value) {
     if (value >= '0' && value <= '9') {
         return value - '0';
@@ -640,6 +658,20 @@ class VllmV1HashStrategy final : public HashStrategy {
         std::vector<HashBlock> computed;
         computed.reserve(block_count);
 
+        // Reused across blocks: every codec clears the buffer at the start of
+        // EncodeBlock, so a single allocation with worst-case capacity avoids
+        // a malloc/free per block (dominant cost at large block counts).
+        std::vector<uint8_t> encoded;
+        encoded.reserve(64 + block_size * 9);
+
+        // One EVP context for the whole chain, reset per block.
+        using EvpContext =
+            std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>;
+        EvpContext evp(EVP_MD_CTX_new(), EVP_MD_CTX_free);
+        if (!evp) {
+            return "OpenSSL EVP MD context allocation failed";
+        }
+
         std::array<uint8_t, kSha256DigestSize> parent = root_digest_;
         for (size_t block_index = 0; block_index < block_count; ++block_index) {
             const bool has_lora = !context.lora_name.empty();
@@ -653,11 +685,11 @@ class VllmV1HashStrategy final : public HashStrategy {
                 .cache_salt = has_salt ? &*cache_salt : nullptr,
             };
 
-            std::vector<uint8_t> encoded;
             codec_->EncodeBlock(values, &encoded);
 
             HashBlock block;
-            if (std::string error = Sha256(encoded, &block.digest);
+            if (std::string error =
+                    Sha256Reuse(evp.get(), encoded, &block.digest);
                 !error.empty()) {
                 return error;
             }

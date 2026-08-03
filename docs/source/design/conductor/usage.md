@@ -178,13 +178,34 @@ subscriptions:
 }
 ```
 
+All examples call this small msgpack helper, since every Conductor
+endpoint speaks msgpack only:
+
+```python
+import msgpack
+import httpx
+
+BASE = "http://127.0.0.1:13333"
+
+def conductor(path, payload=None):
+    if payload is None:
+        r = httpx.get(BASE + path, timeout=5)
+    else:
+        r = httpx.post(
+            BASE + path,
+            content=msgpack.packb(payload, use_bin_type=True),
+            headers={"Content-Type": "application/msgpack"},
+            timeout=5,
+        )
+    r.raise_for_status()
+    return msgpack.unpackb(r.content, raw=False)
+```
+
 After starting the binary, register every vLLM rank. This first request
 registers rank `0`:
 
-```bash
-curl -sS -X POST http://127.0.0.1:13333/register \
-  -H 'Content-Type: application/json' \
-  -d '{
+```python
+conductor("/register", {
     "endpoint": "tcp://127.0.0.1:5557",
     "replay_endpoint": "tcp://127.0.0.1:5558",
     "type": "vLLM",
@@ -196,21 +217,19 @@ curl -sS -X POST http://127.0.0.1:13333/register \
     "dp_rank": 0,
     "cache_group": 0,
     "hash_profile": {
-      "strategy": "vllm_v1",
-      "algorithm": "sha256_cbor",
-      "python_hash_seed": "0",
-      "index_projection": "low64_be"
-    }
-  }'
+        "strategy": "vllm_v1",
+        "algorithm": "sha256_cbor",
+        "python_hash_seed": "0",
+        "index_projection": "low64_be",
+    },
+})
 ```
 
 Register rank `1` with its own event endpoint and the same engine and hash
 settings:
 
-```bash
-curl -sS -X POST http://127.0.0.1:13333/register \
-  -H 'Content-Type: application/json' \
-  -d '{
+```python
+conductor("/register", {
     "endpoint": "tcp://127.0.0.1:5567",
     "replay_endpoint": "tcp://127.0.0.1:5568",
     "type": "vLLM",
@@ -222,19 +241,19 @@ curl -sS -X POST http://127.0.0.1:13333/register \
     "dp_rank": 1,
     "cache_group": 0,
     "hash_profile": {
-      "strategy": "vllm_v1",
-      "algorithm": "sha256_cbor",
-      "python_hash_seed": "0",
-      "index_projection": "low64_be"
-    }
-  }'
+        "strategy": "vllm_v1",
+        "algorithm": "sha256_cbor",
+        "python_hash_seed": "0",
+        "index_projection": "low64_be",
+    },
+})
 ```
 
 Each successful request returns `registered successfully`. Confirm the engine
 context before allowing cache-producing traffic:
 
-```bash
-curl -sS http://127.0.0.1:13333/global_view
+```python
+conductor("/global_view")
 ```
 
 The matching context must show `tenant_id` `default`, `model_name`
@@ -251,10 +270,8 @@ start the Mooncake Master publisher as described in the
 [Mooncake publisher guide](../kv-event/publisher-design.md), then register its
 live endpoint:
 
-```bash
-curl -sS -X POST http://127.0.0.1:13333/register \
-  -H 'Content-Type: application/json' \
-  -d '{
+```python
+conductor("/register", {
     "endpoint": "tcp://127.0.0.1:6557",
     "replay_endpoint": "",
     "type": "Mooncake",
@@ -266,12 +283,12 @@ curl -sS -X POST http://127.0.0.1:13333/register \
     "dp_rank": 0,
     "cache_group": 0,
     "hash_profile": {
-      "strategy": "vllm_v1",
-      "algorithm": "sha256_cbor",
-      "python_hash_seed": "0",
-      "index_projection": "low64_be"
-    }
-  }'
+        "strategy": "vllm_v1",
+        "algorithm": "sha256_cbor",
+        "python_hash_seed": "0",
+        "index_projection": "low64_be",
+    },
+})
 ```
 
 Configure the Mooncake publisher so each event carries the same tenant, model,
@@ -288,8 +305,8 @@ event checks.
 Confirm that `/services` contains both vLLM ranks and the Mooncake subscription
 before releasing traffic:
 
-```bash
-curl -sS http://127.0.0.1:13333/services
+```python
+conductor("/services")
 ```
 
 For static configuration, use the other safe choice: keep cache-producing
@@ -309,8 +326,8 @@ not resend that earlier state.
 
 Inspect the active subscriptions:
 
-```bash
-curl -sS http://127.0.0.1:13333/services
+```python
+conductor("/services")
 ```
 
 For the dynamic example, success means `count` is `3`, the two `vLLM` entries
@@ -320,8 +337,8 @@ match, including `python_hash_seed` `"0"` and its derived `root_digest`.
 
 Inspect the cache-sharing groups and registered inference ranks:
 
-```bash
-curl -sS http://127.0.0.1:13333/global_view
+```python
+conductor("/global_view")
 ```
 
 Success means one matching context shows `"engine-a":[0,1]`. Mooncake does not
@@ -331,19 +348,33 @@ each block.
 
 ## Query
 
-Send token IDs produced by the tokenizer for the registered model. This
-example contains one complete 16-token block:
+`/query` is msgpack-only: send a msgpack map with
+`Content-Type: application/msgpack`. Carry `token_ids` as a msgpack `bin` of
+little-endian int32 (or an integer array). Use token IDs produced by the
+tokenizer for the registered model. This example contains one complete
+16-token block:
 
-```bash
-curl -sS -X POST http://127.0.0.1:13333/query \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "test-model",
-    "lora_name": "",
-    "tenant_id": "default",
-    "block_size": 16,
-    "token_ids": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
-  }'
+```python
+import msgpack
+import struct
+import httpx
+
+token_ids = list(range(16))
+body = msgpack.packb(
+    {
+        "model": "test-model",
+        "lora_name": "",
+        "tenant_id": "default",
+        "block_size": 16,
+        "token_ids": struct.pack(f"<{len(token_ids)}i", *token_ids),
+    },
+    use_bin_type=True,
+)
+response = httpx.post(
+    "http://127.0.0.1:13333/query",
+    content=body,
+    headers={"Content-Type": "application/msgpack"},
+)
 ```
 
 A successful response has an `instances.engine-a` object with DP rank keys
@@ -363,22 +394,15 @@ formed from `instance_id`, normalized `tenant_id`, and `dp_rank`.
 
 Remove the Mooncake subscription:
 
-```bash
-curl -sS -X POST http://127.0.0.1:13333/unregister \
-  -H 'Content-Type: application/json' \
-  -d '{"instance_id":"shared-pool","tenant_id":"default","dp_rank":0}'
+```python
+conductor("/unregister", {"instance_id": "shared-pool", "tenant_id": "default", "dp_rank": 0})
 ```
 
 Remove each vLLM rank separately:
 
-```bash
-curl -sS -X POST http://127.0.0.1:13333/unregister \
-  -H 'Content-Type: application/json' \
-  -d '{"instance_id":"engine-a","tenant_id":"default","dp_rank":1}'
-
-curl -sS -X POST http://127.0.0.1:13333/unregister \
-  -H 'Content-Type: application/json' \
-  -d '{"instance_id":"engine-a","tenant_id":"default","dp_rank":0}'
+```python
+conductor("/unregister", {"instance_id": "engine-a", "tenant_id": "default", "dp_rank": 1})
+conductor("/unregister", {"instance_id": "engine-a", "tenant_id": "default", "dp_rank": 0})
 ```
 
 Each successful response contains `unregistered successfully` and the exact

@@ -142,12 +142,33 @@ export CONDUCTOR_LOG_LEVEL=INFO
 }
 ```
 
+以下示例统一调用这个 msgpack 小工具函数，因为 Conductor 的所有端点都只接受
+msgpack：
+
+```python
+import msgpack
+import httpx
+
+BASE = "http://127.0.0.1:13333"
+
+def conductor(path, payload=None):
+    if payload is None:
+        r = httpx.get(BASE + path, timeout=5)
+    else:
+        r = httpx.post(
+            BASE + path,
+            content=msgpack.packb(payload, use_bin_type=True),
+            headers={"Content-Type": "application/msgpack"},
+            timeout=5,
+        )
+    r.raise_for_status()
+    return msgpack.unpackb(r.content, raw=False)
+```
+
 启动可执行文件后，注册每个 vLLM rank。第一个请求注册 rank `0`：
 
-```bash
-curl -sS -X POST http://127.0.0.1:13333/register \
-  -H 'Content-Type: application/json' \
-  -d '{
+```python
+conductor("/register", {
     "endpoint": "tcp://127.0.0.1:5557",
     "replay_endpoint": "tcp://127.0.0.1:5558",
     "type": "vLLM",
@@ -159,20 +180,18 @@ curl -sS -X POST http://127.0.0.1:13333/register \
     "dp_rank": 0,
     "cache_group": 0,
     "hash_profile": {
-      "strategy": "vllm_v1",
-      "algorithm": "sha256_cbor",
-      "python_hash_seed": "0",
-      "index_projection": "low64_be"
-    }
-  }'
+        "strategy": "vllm_v1",
+        "algorithm": "sha256_cbor",
+        "python_hash_seed": "0",
+        "index_projection": "low64_be",
+    },
+})
 ```
 
 用该 rank 自己的事件 endpoint 注册 rank `1`，引擎和哈希设置保持不变：
 
-```bash
-curl -sS -X POST http://127.0.0.1:13333/register \
-  -H 'Content-Type: application/json' \
-  -d '{
+```python
+conductor("/register", {
     "endpoint": "tcp://127.0.0.1:5567",
     "replay_endpoint": "tcp://127.0.0.1:5568",
     "type": "vLLM",
@@ -184,18 +203,18 @@ curl -sS -X POST http://127.0.0.1:13333/register \
     "dp_rank": 1,
     "cache_group": 0,
     "hash_profile": {
-      "strategy": "vllm_v1",
-      "algorithm": "sha256_cbor",
-      "python_hash_seed": "0",
-      "index_projection": "low64_be"
-    }
-  }'
+        "strategy": "vllm_v1",
+        "algorithm": "sha256_cbor",
+        "python_hash_seed": "0",
+        "index_projection": "low64_be",
+    },
+})
 ```
 
 每个成功请求都会返回 `registered successfully`。放开会产生缓存的业务流量前，先确认引擎信息：
 
-```bash
-curl -sS http://127.0.0.1:13333/global_view
+```python
+conductor("/global_view")
 ```
 
 对应结果必须显示 `tenant_id` 为 `default`、`model_name` 为 `test-model`、`lora_name` 为空、`block_size` 为 `16`、`python_hash_seed` 为 `"0"`、根摘要为上文的派生值，并且 `"engine-a":[0,1]` 位于 `instances` 下。还要检查 `/services`：其中应包含两个 vLLM 订阅，并显示相同的种子和派生根摘要。如果部署中只有 vLLM，现在可以开始产生缓存的业务流量。
@@ -204,10 +223,8 @@ curl -sS http://127.0.0.1:13333/global_view
 
 添加共享缓存池时，先不要放开会产生缓存的业务流量。按照 [Mooncake 发布端指南](../kv-event/publisher-design.md)启用并启动 Mooncake Master 发布端，然后注册它的实时事件地址：
 
-```bash
-curl -sS -X POST http://127.0.0.1:13333/register \
-  -H 'Content-Type: application/json' \
-  -d '{
+```python
+conductor("/register", {
     "endpoint": "tcp://127.0.0.1:6557",
     "replay_endpoint": "",
     "type": "Mooncake",
@@ -219,20 +236,20 @@ curl -sS -X POST http://127.0.0.1:13333/register \
     "dp_rank": 0,
     "cache_group": 0,
     "hash_profile": {
-      "strategy": "vllm_v1",
-      "algorithm": "sha256_cbor",
-      "python_hash_seed": "0",
-      "index_projection": "low64_be"
-    }
-  }'
+        "strategy": "vllm_v1",
+        "algorithm": "sha256_cbor",
+        "python_hash_seed": "0",
+        "index_projection": "low64_be",
+    },
+})
 ```
 
 配置 Mooncake 发布端，使每个事件携带的租户、模型、LoRA 名称和块大小与 vLLM 的缓存信息一致。`hash_profile` 来自 Mooncake 注册项，并且必须与该事件对应的缓存信息已经绑定的哈希配置相同。注册时也使用同样的缓存信息，这样更容易对照 `/services` 和发布端。Mooncake 的 `instance_id` 和 `dp_rank` 只用于在 `/services` 中标识订阅，以及通过 `/unregister` 注销；它们不会创建查询实例，也不会覆盖事件中的缓存信息。`stored` 事件还必须带有对象 key 和可用的完整连接器哈希；事件检查规则请参阅[订阅兼容指南](../kv-event/subscriber-guide.md)。
 
 放开业务流量前，确认 `/services` 同时包含两个 vLLM rank 和 Mooncake 订阅：
 
-```bash
-curl -sS http://127.0.0.1:13333/services
+```python
+conductor("/services")
 ```
 
 如果使用静态配置，则采用另一种稳妥做法：在 `/global_view` 显示预期的 vLLM 缓存信息、引擎、rank、配置种子和派生根摘要，并且 `/services` 显示所有预期订阅和同一份已解析 hash profile 前，保持会产生缓存的业务流量暂停。静态订阅会同时启动，与 JSON 中的排列顺序无关。
@@ -243,34 +260,47 @@ curl -sS http://127.0.0.1:13333/services
 
 查看当前订阅：
 
-```bash
-curl -sS http://127.0.0.1:13333/services
+```python
+conductor("/services")
 ```
 
 对于上面的动态注册示例，`count` 为 `3` 才表示成功。两个 `vLLM` 项的 `InstanceID` 都应为 `engine-a`，`DPRank` 分别为 `0` 和 `1`；`Mooncake` 项的 `InstanceID` 应为 `shared-pool`。三个 `HashProfile` 必须相同，包括 `python_hash_seed` `"0"` 及其派生的 `root_digest`。
 
 查看缓存共享组合和已注册的推理 rank：
 
-```bash
-curl -sS http://127.0.0.1:13333/global_view
+```python
+conductor("/global_view")
 ```
 
 对应结果中出现 `"engine-a":[0,1]`，说明检查成功。Mooncake 不会作为另一个推理实例出现。收到实时事件后，`prefix_count` 可能增加，但仅凭这个计数无法判断每个块来自哪个缓存位置。
 
 ## 查询
 
-发送已注册模型的分词器（tokenizer）生成的 token IDs。下面的示例包含一个完整的 16-token 块：
+`/query` 仅接受 msgpack：以 `Content-Type: application/msgpack` 发送一个 msgpack
+map，`token_ids` 使用小端 int32 的 msgpack `bin`（或整数数组）承载。发送已注册
+模型的分词器（tokenizer）生成的 token IDs。下面的示例包含一个完整的 16-token 块：
 
-```bash
-curl -sS -X POST http://127.0.0.1:13333/query \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "test-model",
-    "lora_name": "",
-    "tenant_id": "default",
-    "block_size": 16,
-    "token_ids": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
-  }'
+```python
+import msgpack
+import struct
+import httpx
+
+token_ids = list(range(16))
+body = msgpack.packb(
+    {
+        "model": "test-model",
+        "lora_name": "",
+        "tenant_id": "default",
+        "block_size": 16,
+        "token_ids": struct.pack(f"<{len(token_ids)}i", *token_ids),
+    },
+    use_bin_type=True,
+)
+response = httpx.post(
+    "http://127.0.0.1:13333/query",
+    content=body,
+    headers={"Content-Type": "application/msgpack"},
+)
 ```
 
 成功响应中会有 `instances.engine-a` 对象，其中 DP rank key 为 `"0"` 和 `"1"`。在收到匹配的实时事件前，命中值可能为零。查询只计算完整块。如果事件生产端使用缓存盐值（cache salt）计算请求哈希，请在这次查询中添加取值相同的 `cache_salt` 字符串，不要把它加入注册项。
@@ -283,22 +313,15 @@ curl -sS -X POST http://127.0.0.1:13333/query \
 
 删除 Mooncake 订阅：
 
-```bash
-curl -sS -X POST http://127.0.0.1:13333/unregister \
-  -H 'Content-Type: application/json' \
-  -d '{"instance_id":"shared-pool","tenant_id":"default","dp_rank":0}'
+```python
+conductor("/unregister", {"instance_id": "shared-pool", "tenant_id": "default", "dp_rank": 0})
 ```
 
 分别删除每个 vLLM rank：
 
-```bash
-curl -sS -X POST http://127.0.0.1:13333/unregister \
-  -H 'Content-Type: application/json' \
-  -d '{"instance_id":"engine-a","tenant_id":"default","dp_rank":1}'
-
-curl -sS -X POST http://127.0.0.1:13333/unregister \
-  -H 'Content-Type: application/json' \
-  -d '{"instance_id":"engine-a","tenant_id":"default","dp_rank":0}'
+```python
+conductor("/unregister", {"instance_id": "engine-a", "tenant_id": "default", "dp_rank": 1})
+conductor("/unregister", {"instance_id": "engine-a", "tenant_id": "default", "dp_rank": 0})
 ```
 
 每个成功响应都包含 `unregistered successfully` 和准确的已删除 service key，例如 `engine-a|default|0`。检查 `/services`，确认对应订阅已经消失。注销一个 vLLM rank 只删除该 rank 的 GPU 信息；注销 Mooncake 只删除由该 Mooncake endpoint 报告的对象。

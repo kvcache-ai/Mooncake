@@ -26,7 +26,7 @@ Build Conductor as described in the main
 the proxy's Python dependencies:
 
 ```bash
-python3 -m pip install fastapi httpx uvicorn
+python3 -m pip install fastapi httpx uvicorn msgpack
 ```
 
 The proxy does not load a tokenizer model. It uses the root-level `/tokenize`
@@ -288,7 +288,7 @@ is accepted by Conductor's idempotent API.
 List the active event subscriptions:
 
 ```bash
-curl -sS http://127.0.0.1:13333/services
+python3 -c "import msgpack, httpx; print(msgpack.unpackb(httpx.get('http://127.0.0.1:13333/services').content, raw=False))"
 ```
 
 The response must contain every configured `InstanceID`, `DPRank`, `Endpoint`,
@@ -299,7 +299,7 @@ arrived.
 Inspect the instance/rank grouping:
 
 ```bash
-curl -sS http://127.0.0.1:13333/global_view
+python3 -c "import msgpack, httpx; print(msgpack.unpackb(httpx.get('http://127.0.0.1:13333/global_view').content, raw=False))"
 ```
 
 The expected context must show `prefill-a` and `prefill-b` with their configured
@@ -333,18 +333,34 @@ request_id=... cache_aware_fallback reason=all_cache_hits_zero selected_instance
 ## Diagnose Empty Or Zero Hits
 
 Tokenize a representative prompt through one prefill, then send those token IDs
-to Conductor directly:
+to Conductor directly. `/query` is msgpack-only; carry the token IDs as a bin
+of little-endian int32:
 
 ```bash
-curl -sS -X POST http://127.0.0.1:13333/query \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "Qwen/Qwen2.5-7B-Instruct",
-    "block_size": 16,
-    "tenant_id": "default",
-    "lora_name": "",
-    "token_ids": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
-  }'
+python3 - <<'EOF'
+import msgpack
+import struct
+import httpx
+
+token_ids = list(range(16))
+body = msgpack.packb(
+    {
+        "model": "Qwen/Qwen2.5-7B-Instruct",
+        "block_size": 16,
+        "tenant_id": "default",
+        "lora_name": "",
+        "token_ids": struct.pack(f"<{len(token_ids)}i", *token_ids),
+    },
+    use_bin_type=True,
+)
+print(
+    httpx.post(
+        "http://127.0.0.1:13333/query",
+        content=body,
+        headers={"Content-Type": "application/msgpack"},
+    ).json()
+)
+EOF
 ```
 
 If `instances` is empty or every `longest_matched` is zero, compare the request
@@ -367,9 +383,25 @@ first created an idempotent registration.
 Unregister a rank only when its publisher is removed or replaced:
 
 ```bash
-curl -sS -X POST http://127.0.0.1:13333/unregister \
-  -H 'Content-Type: application/json' \
-  -d '{"instance_id":"prefill-a","tenant_id":"default","dp_rank":0}'
+python3 - <<'EOF'
+import msgpack
+import httpx
+
+body = msgpack.packb(
+    {"instance_id": "prefill-a", "tenant_id": "default", "dp_rank": 0},
+    use_bin_type=True,
+)
+print(
+    msgpack.unpackb(
+        httpx.post(
+            "http://127.0.0.1:13333/unregister",
+            content=body,
+            headers={"Content-Type": "application/msgpack"},
+        ).content,
+        raw=False,
+    )
+)
+EOF
 ```
 
 Repeat the command for every rank being removed. Before registering a new

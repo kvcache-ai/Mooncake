@@ -1,7 +1,7 @@
 #include "conductor/kvevent/event_manager.h"
 
 #include <glog/logging.h>
-#include <json/json.h>
+#include <msgpack.hpp>
 #include <csignal>
 #include <ylt/coro_http/coro_http_server.hpp>
 
@@ -24,8 +24,11 @@ using coro_http::coro_http_request;
 using coro_http::coro_http_response;
 using coro_http::status_type;
 
-constexpr const char* kTextPlain = "text/plain; charset=utf-8";
-constexpr const char* kApplicationJson = "application/json";
+// Every endpoint speaks msgpack only: request bodies, success responses, and
+// error envelopes are all msgpack maps. There is no JSON wire path.
+constexpr const char* kApplicationMsgpack = "application/msgpack";
+
+using MsgpackPacker = msgpack::packer<msgpack::sbuffer>;
 
 prefixindex::ContextKey ContextFromService(
     const common::ServiceConfig& service) {
@@ -50,15 +53,17 @@ prefixindex::EngineRegistration RegistrationFromService(
             .cache_group = service.cache_group};
 }
 
-bool JsonInt64(const Json::Value& value, int64_t* out) {
-    if (value.type() == Json::intValue) {
-        *out = value.asInt64();
+bool MsgpackInt64(const msgpack::object& value, int64_t* out) {
+    if (value.type == msgpack::type::POSITIVE_INTEGER) {
+        if (value.via.u64 >
+            static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+            return false;
+        }
+        *out = static_cast<int64_t>(value.via.u64);
         return true;
     }
-    if (value.type() == Json::uintValue &&
-        value.asUInt64() <=
-            static_cast<Json::UInt64>(std::numeric_limits<int64_t>::max())) {
-        *out = static_cast<int64_t>(value.asUInt64());
+    if (value.type == msgpack::type::NEGATIVE_INTEGER) {
+        *out = value.via.i64;
         return true;
     }
     return false;
@@ -72,165 +77,249 @@ bool IsSupportedHashAlgorithm(std::string_view algorithm) {
     return algorithm == "sha256" || algorithm == "sha256_cbor";
 }
 
-// Writes an error response: text/plain body with trailing \n.
+// ---------------------------------------------------------------------------
+// Response writers
+// ---------------------------------------------------------------------------
+
+void HttpMsgpack(coro_http_response& resp, status_type status,
+                 const msgpack::sbuffer& body) {
+    resp.add_header("Content-Type", kApplicationMsgpack);
+    resp.set_status_and_content(status, std::string(body.data(), body.size()));
+}
+
+// Writes an error response: msgpack map {"error": message}.
 void HttpError(coro_http_response& resp, status_type status,
                const std::string& message) {
-    resp.add_header("Content-Type", kTextPlain);
-    resp.set_status_and_content(status, message + "\n");
+    msgpack::sbuffer body;
+    MsgpackPacker packer(&body);
+    packer.pack_map(1);
+    packer.pack("error");
+    packer.pack(message);
+    HttpMsgpack(resp, status, body);
 }
 
-void HttpJson(coro_http_response& resp, status_type status,
-              const Json::Value& value) {
-    Json::StreamWriterBuilder wb;
-    wb["indentation"] = "";
-    // JSON-encoded output terminates with a trailing '\n' (wire contract).
-    resp.add_header("Content-Type", kApplicationJson);
-    resp.set_status_and_content(status, Json::writeString(wb, value) + "\n");
-}
-
-void HttpJson(coro_http_response& resp, const Json::Value& value) {
-    HttpJson(resp, status_type::ok, value);
-}
-
-void HttpJsonError(coro_http_response& resp, const char* reason,
-                   const std::string& message, const char* field = nullptr,
-                   std::optional<size_t> index = std::nullopt) {
-    Json::Value error(Json::objectValue);
-    error["error"] = message;
-    error["reason"] = reason;
+void HttpValidationError(coro_http_response& resp, const char* reason,
+                         const std::string& message,
+                         const char* field = nullptr,
+                         std::optional<size_t> index = std::nullopt) {
+    msgpack::sbuffer body;
+    MsgpackPacker packer(&body);
+    uint32_t size = 2;
     if (field != nullptr) {
-        error["field"] = field;
+        ++size;
     }
     if (index.has_value()) {
-        error["index"] = Json::Value::UInt64(*index);
+        ++size;
     }
-    HttpJson(resp, status_type::bad_request, error);
+    packer.pack_map(size);
+    packer.pack("error");
+    packer.pack(message);
+    packer.pack("reason");
+    packer.pack(reason);
+    if (field != nullptr) {
+        packer.pack("field");
+        packer.pack(field);
+    }
+    if (index.has_value()) {
+        packer.pack("index");
+        packer.pack(static_cast<uint64_t>(*index));
+    }
+    HttpMsgpack(resp, status_type::bad_request, body);
 }
 
-bool RejectUnknownFields(const Json::Value& body,
+// ---------------------------------------------------------------------------
+// Request helpers (msgpack-native)
+// ---------------------------------------------------------------------------
+
+std::string_view ObjectStr(const msgpack::object& object) {
+    return std::string_view(object.via.str.ptr, object.via.str.size);
+}
+
+// Finds a string-keyed member in a msgpack map; nullptr when absent.
+const msgpack::object* MapFind(const msgpack::object_map& map,
+                               std::string_view key) {
+    for (uint32_t i = 0; i < map.size; ++i) {
+        const msgpack::object& k = map.ptr[i].key;
+        if (k.type == msgpack::type::STR && ObjectStr(k) == key) {
+            return &map.ptr[i].val;
+        }
+    }
+    return nullptr;
+}
+
+// Parses the request body as a msgpack map. Returns false (and writes the
+// error response) on a wrong content type, malformed payload, or non-map root.
+// The returned object_map points into the handle's zone; keep handle alive.
+bool ParseMsgpackBody(coro_http_request& req, coro_http_response& resp,
+                      const char* what, msgpack::object_handle* handle,
+                      msgpack::object_map* out) {
+    const std::string_view content_type = req.get_header_value("content-type");
+    if (content_type.find(kApplicationMsgpack) == std::string_view::npos) {
+        HttpValidationError(resp, "unsupported_content_type",
+                            "Content-Type must be application/msgpack");
+        return false;
+    }
+    const auto body = req.get_body();
+    try {
+        *handle = msgpack::unpack(body.data(), body.size());
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Failed to decode " << what
+                   << " msgpack err=" << e.what();
+        HttpValidationError(resp, "invalid_msgpack", "Invalid msgpack object");
+        return false;
+    }
+    const msgpack::object root = handle->get();
+    if (root.type != msgpack::type::MAP) {
+        HttpValidationError(resp, "invalid_msgpack",
+                            "request body must be a msgpack map");
+        return false;
+    }
+    *out = root.via.map;
+    return true;
+}
+
+bool RejectUnknownFields(const msgpack::object_map& body,
                          const std::set<std::string>& allowed,
                          coro_http_response& resp) {
-    for (const std::string& name : body.getMemberNames()) {
+    for (uint32_t i = 0; i < body.size; ++i) {
+        const msgpack::object& key = body.ptr[i].key;
+        if (key.type != msgpack::type::STR) {
+            HttpValidationError(resp, "invalid_msgpack",
+                                "map keys must be strings");
+            return false;
+        }
+        const std::string name(ObjectStr(key));
         if (!allowed.contains(name)) {
-            HttpJsonError(resp, "unknown_field",
-                          "unsupported request field: " + name, name.c_str());
+            HttpValidationError(resp, "unknown_field",
+                                "unsupported request field: " + name,
+                                name.c_str());
             return false;
         }
     }
     return true;
 }
 
-bool RequiredString(const Json::Value& body, const char* field,
+bool RequiredString(const msgpack::object_map& body, const char* field,
                     coro_http_response& resp, std::string* out) {
-    if (!body.isMember(field)) {
-        HttpJsonError(resp, "missing", std::string(field) + " is required",
-                      field);
+    const msgpack::object* value = MapFind(body, field);
+    if (value == nullptr) {
+        HttpValidationError(resp, "missing",
+                            std::string(field) + " is required", field);
         return false;
     }
-    if (!body[field].isString()) {
-        HttpJsonError(resp, "invalid_type",
-                      std::string(field) + " must be a string", field);
+    if (value->type != msgpack::type::STR) {
+        HttpValidationError(resp, "invalid_type",
+                            std::string(field) + " must be a string", field);
         return false;
     }
-    *out = body[field].asString();
+    *out = std::string(ObjectStr(*value));
     if (out->empty()) {
-        HttpJsonError(resp, "invalid_value",
-                      std::string(field) + " must not be empty", field);
+        HttpValidationError(resp, "invalid_value",
+                            std::string(field) + " must not be empty", field);
         return false;
     }
     return true;
 }
 
-bool OptionalStringStrict(const Json::Value& body, const char* field,
+bool OptionalStringStrict(const msgpack::object_map& body, const char* field,
                           const std::string& fallback, coro_http_response& resp,
                           std::string* out) {
-    if (!body.isMember(field)) {
+    const msgpack::object* value = MapFind(body, field);
+    if (value == nullptr) {
         *out = fallback;
         return true;
     }
-    if (!body[field].isString()) {
-        HttpJsonError(resp, "invalid_type",
-                      std::string(field) + " must be a string", field);
+    if (value->type != msgpack::type::STR) {
+        HttpValidationError(resp, "invalid_type",
+                            std::string(field) + " must be a string", field);
         return false;
     }
-    *out = body[field].asString();
+    *out = std::string(ObjectStr(*value));
     return true;
 }
 
-bool RequiredPositiveInt64(const Json::Value& body, const char* field,
+bool RequiredPositiveInt64(const msgpack::object_map& body, const char* field,
                            coro_http_response& resp, int64_t* out) {
-    if (!body.isMember(field)) {
-        HttpJsonError(resp, "missing", std::string(field) + " is required",
-                      field);
+    const msgpack::object* value = MapFind(body, field);
+    if (value == nullptr) {
+        HttpValidationError(resp, "missing",
+                            std::string(field) + " is required", field);
         return false;
     }
-    if (!JsonInt64(body[field], out)) {
-        HttpJsonError(resp, "invalid_type",
-                      std::string(field) + " must be an integer", field);
+    if (!MsgpackInt64(*value, out)) {
+        HttpValidationError(resp, "invalid_type",
+                            std::string(field) + " must be an integer", field);
         return false;
     }
     if (*out <= 0) {
-        HttpJsonError(resp, "out_of_range",
-                      std::string(field) + " must be greater than zero", field);
+        HttpValidationError(resp, "out_of_range",
+                            std::string(field) + " must be greater than zero",
+                            field);
         return false;
     }
     return true;
 }
 
-bool ParseOptionalCacheGroup(const Json::Value& body, coro_http_response& resp,
+bool ParseOptionalCacheGroup(const msgpack::object_map& body,
+                             coro_http_response& resp,
                              std::optional<int64_t>* cache_group) {
-    if (!body.isMember("cache_group") || body["cache_group"].isNull()) {
+    const msgpack::object* value = MapFind(body, "cache_group");
+    if (value == nullptr || value->type == msgpack::type::NIL) {
         cache_group->reset();
         return true;
     }
-    int64_t value = 0;
-    if (!JsonInt64(body["cache_group"], &value)) {
-        HttpJsonError(resp, "invalid_type",
-                      "cache_group must be an integer or null", "cache_group");
+    int64_t parsed = 0;
+    if (!MsgpackInt64(*value, &parsed)) {
+        HttpValidationError(resp, "invalid_type",
+                            "cache_group must be an integer or null",
+                            "cache_group");
         return false;
     }
-    if (value != 0) {
-        HttpJsonError(resp, "unsupported", "only cache group zero is supported",
-                      "cache_group");
+    if (parsed != 0) {
+        HttpValidationError(resp, "unsupported",
+                            "only cache group zero is supported",
+                            "cache_group");
         return false;
     }
-    *cache_group = value;
+    *cache_group = parsed;
     return true;
 }
 
-bool ParseHashProfileConfig(const Json::Value& body, coro_http_response& resp,
+bool ParseHashProfileConfig(const msgpack::object_map& body,
+                            coro_http_response& resp,
                             common::ResolvedHashProfile* profile) {
-    if (!body.isMember("hash_profile")) {
-        HttpJsonError(resp, "missing", "hash_profile is required",
-                      "hash_profile");
+    const msgpack::object* value = MapFind(body, "hash_profile");
+    if (value == nullptr) {
+        HttpValidationError(resp, "missing", "hash_profile is required",
+                            "hash_profile");
         return false;
     }
-    const Json::Value& value = body["hash_profile"];
-    if (!value.isObject()) {
-        HttpJsonError(resp, "invalid_type", "hash_profile must be an object",
-                      "hash_profile");
+    if (value->type != msgpack::type::MAP) {
+        HttpValidationError(resp, "invalid_type", "hash_profile must be a map",
+                            "hash_profile");
         return false;
     }
+    const msgpack::object_map& profile_map = value->via.map;
     static const std::set<std::string> kAllowedProfileFields = {
         "algorithm", "index_projection", "python_hash_seed", "strategy"};
-    if (!RejectUnknownFields(value, kAllowedProfileFields, resp)) {
+    if (!RejectUnknownFields(profile_map, kAllowedProfileFields, resp)) {
         return false;
     }
 
     common::HashProfileConfig source;
-    if (!RequiredString(value, "strategy", resp, &source.strategy) ||
-        !RequiredString(value, "algorithm", resp, &source.algorithm) ||
-        !RequiredString(value, "python_hash_seed", resp,
+    if (!RequiredString(profile_map, "strategy", resp, &source.strategy) ||
+        !RequiredString(profile_map, "algorithm", resp, &source.algorithm) ||
+        !RequiredString(profile_map, "python_hash_seed", resp,
                         &source.python_hash_seed) ||
-        !RequiredString(value, "index_projection", resp,
+        !RequiredString(profile_map, "index_projection", resp,
                         &source.index_projection)) {
         return false;
     }
 
     if (!IsSupportedHashAlgorithm(source.algorithm)) {
-        HttpJsonError(resp, "invalid_value",
-                      "unsupported hash algorithm: " + source.algorithm,
-                      "algorithm");
+        HttpValidationError(resp, "invalid_value",
+                            "unsupported hash algorithm: " + source.algorithm,
+                            "algorithm");
         return false;
     }
 
@@ -247,7 +336,7 @@ bool ParseHashProfileConfig(const Json::Value& body, coro_http_response& resp,
         } else if (source.index_projection != "low64_be") {
             field = "index_projection";
         }
-        HttpJsonError(resp, "invalid_value", error, field);
+        HttpValidationError(resp, "invalid_value", error, field);
         return false;
     }
     return true;
@@ -286,100 +375,6 @@ std::string ValidateServiceConfig(const common::ServiceConfig& service) {
     return "unsupported publisher kind";
 }
 
-bool ParseJsonObject(coro_http_request& req, Json::Value* out,
-                     std::string* errors, bool strict = false) {
-    Json::CharReaderBuilder rb;
-    if (strict) {
-        rb["allowComments"] = false;
-        rb["allowTrailingCommas"] = false;
-        rb["failIfExtra"] = true;
-    }
-    const auto body = req.get_body();
-    std::unique_ptr<Json::CharReader> reader(rb.newCharReader());
-    if (!reader->parse(body.data(), body.data() + body.size(), out, errors)) {
-        return false;
-    }
-    if (!out->isObject()) {
-        *errors = "request body must be a JSON object";
-        return false;
-    }
-    return true;
-}
-
-// Parses a request body as a JSON object. Returns false (and writes the
-// 400 response) on malformed JSON.
-bool ParseJsonBody(coro_http_request& req, coro_http_response& resp,
-                   const char* what, Json::Value* out) {
-    std::string errs;
-    if (!ParseJsonObject(req, out, &errs)) {
-        LOG(ERROR) << "Failed to decode " << what << " JSON err=" << errs;
-        HttpError(resp, status_type::bad_request, "Invalid JSON");
-        return false;
-    }
-    return true;
-}
-
-bool ParseQueryJsonBody(coro_http_request& req, coro_http_response& resp,
-                        Json::Value* out) {
-    std::string errs;
-    if (!ParseJsonObject(req, out, &errs, true)) {
-        LOG(ERROR) << "Failed to decode query JSON err=" << errs;
-        HttpJsonError(resp, "invalid_json", "Invalid JSON object");
-        return false;
-    }
-    return true;
-}
-
-bool ParseQueryTokenIds(const Json::Value& body, coro_http_response& resp,
-                        std::vector<int32_t>* token_ids) {
-    if (!body.isMember("token_ids")) {
-        HttpJsonError(resp, "missing", "token_ids is required", "token_ids");
-        return false;
-    }
-
-    const Json::Value& values = body["token_ids"];
-    if (!values.isArray()) {
-        HttpJsonError(resp, "not_array", "token_ids must be an array",
-                      "token_ids");
-        return false;
-    }
-
-    token_ids->clear();
-    token_ids->reserve(values.size());
-    for (Json::ArrayIndex index = 0; index < values.size(); ++index) {
-        const Json::Value& value = values[index];
-        int32_t token_id = 0;
-        if (value.type() == Json::intValue) {
-            const Json::Int64 signed_value = value.asInt64();
-            if (signed_value < std::numeric_limits<int32_t>::min() ||
-                signed_value > std::numeric_limits<int32_t>::max()) {
-                HttpJsonError(resp, "out_of_range",
-                              "token_ids element is outside the int32 range",
-                              "token_ids", index);
-                return false;
-            }
-            token_id = static_cast<int32_t>(signed_value);
-        } else if (value.type() == Json::uintValue) {
-            const Json::UInt64 unsigned_value = value.asUInt64();
-            if (unsigned_value > static_cast<Json::UInt64>(
-                                     std::numeric_limits<int32_t>::max())) {
-                HttpJsonError(resp, "out_of_range",
-                              "token_ids element is outside the int32 range",
-                              "token_ids", index);
-                return false;
-            }
-            token_id = static_cast<int32_t>(unsigned_value);
-        } else {
-            HttpJsonError(resp, "invalid_type",
-                          "token_ids element must be a JSON integer",
-                          "token_ids", index);
-            return false;
-        }
-        token_ids->push_back(token_id);
-    }
-    return true;
-}
-
 struct QueryRequest {
     prefixindex::ContextKey context;
     std::vector<int32_t> token_ids;
@@ -387,55 +382,225 @@ struct QueryRequest {
     std::optional<std::string> instance_filter;
 };
 
-bool ParseQueryRequest(const Json::Value& body, coro_http_response& resp,
-                       QueryRequest* request) {
-    static const std::set<std::string> kAllowedFields = {
-        "block_size", "cache_salt", "instance_id", "lora_name",
-        "model",      "tenant_id",  "token_ids"};
-    if (!RejectUnknownFields(body, kAllowedFields, resp)) {
+// Decodes one little-endian int32 from a msgpack bin token_ids element.
+int32_t DecodeLeInt32(const char* p) {
+    const uint32_t v =
+        static_cast<uint32_t>(static_cast<unsigned char>(p[0])) |
+        (static_cast<uint32_t>(static_cast<unsigned char>(p[1])) << 8) |
+        (static_cast<uint32_t>(static_cast<unsigned char>(p[2])) << 16) |
+        (static_cast<uint32_t>(static_cast<unsigned char>(p[3])) << 24);
+    return static_cast<int32_t>(v);
+}
+
+// Parses a /query request body encoded as msgpack (Content-Type:
+// application/msgpack). Same schema and validation semantics as
+// ParseQueryRequest; token_ids may be a msgpack bin of little-endian int32
+// (preferred: 4 bytes/token, no per-element parsing) or an array of integers.
+// Errors are reported as JSON regardless of request encoding.
+bool ParseQueryMsgpackRequest(coro_http_request& req, coro_http_response& resp,
+                              QueryRequest* request) {
+    const auto body = req.get_body();
+    msgpack::object_handle handle;
+    try {
+        handle = msgpack::unpack(body.data(), body.size());
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Failed to decode query msgpack err=" << e.what();
+        HttpValidationError(resp, "invalid_msgpack", "Invalid msgpack object");
+        return false;
+    }
+    const msgpack::object root = handle.get();
+    if (root.type != msgpack::type::MAP) {
+        HttpValidationError(resp, "invalid_msgpack",
+                            "request body must be a msgpack map");
         return false;
     }
 
-    if (!RequiredString(body, "model", resp, &request->context.model_name) ||
-        !RequiredPositiveInt64(body, "block_size", resp,
-                               &request->context.block_size) ||
-        !ParseQueryTokenIds(body, resp, &request->token_ids) ||
-        !OptionalStringStrict(body, "tenant_id", "default", resp,
-                              &request->context.tenant_id) ||
-        !OptionalStringStrict(body, "lora_name", "", resp,
-                              &request->context.lora_name)) {
+    bool have_model = false;
+    bool have_block_size = false;
+    bool have_token_ids = false;
+    request->cache_salt.reset();
+    request->instance_filter.reset();
+
+    const msgpack::object_map& map = root.via.map;
+    for (uint32_t i = 0; i < map.size; ++i) {
+        const msgpack::object_kv& kv = map.ptr[i];
+        if (kv.key.type != msgpack::type::STR) {
+            HttpValidationError(resp, "invalid_msgpack",
+                                "map keys must be strings");
+            return false;
+        }
+        const std::string_view key(kv.key.via.str.ptr, kv.key.via.str.size);
+        const msgpack::object& value = kv.val;
+
+        if (key == "model") {
+            if (value.type != msgpack::type::STR) {
+                HttpValidationError(resp, "invalid_type",
+                                    "model must be a string", "model");
+                return false;
+            }
+            request->context.model_name.assign(value.via.str.ptr,
+                                               value.via.str.size);
+            if (request->context.model_name.empty()) {
+                HttpValidationError(resp, "invalid_value",
+                                    "model must not be empty", "model");
+                return false;
+            }
+            have_model = true;
+        } else if (key == "block_size") {
+            if (value.type == msgpack::type::POSITIVE_INTEGER) {
+                if (value.via.u64 == 0 ||
+                    value.via.u64 > static_cast<uint64_t>(
+                                        std::numeric_limits<int64_t>::max())) {
+                    HttpValidationError(resp, "out_of_range",
+                                        "block_size must be a positive integer",
+                                        "block_size");
+                    return false;
+                }
+                request->context.block_size =
+                    static_cast<int64_t>(value.via.u64);
+                have_block_size = true;
+            } else if (value.type == msgpack::type::NEGATIVE_INTEGER) {
+                HttpValidationError(resp, "out_of_range",
+                                    "block_size must be a positive integer",
+                                    "block_size");
+                return false;
+            } else {
+                HttpValidationError(resp, "invalid_type",
+                                    "block_size must be an integer",
+                                    "block_size");
+                return false;
+            }
+        } else if (key == "token_ids") {
+            request->token_ids.clear();
+            if (value.type == msgpack::type::BIN) {
+                const msgpack::object_bin& bin = value.via.bin;
+                if (bin.size % sizeof(int32_t) != 0) {
+                    HttpValidationError(
+                        resp, "invalid_value",
+                        "token_ids bin size must be a multiple of 4",
+                        "token_ids");
+                    return false;
+                }
+                const size_t count = bin.size / sizeof(int32_t);
+                request->token_ids.reserve(count);
+                for (size_t t = 0; t < count; ++t) {
+                    request->token_ids.push_back(
+                        DecodeLeInt32(bin.ptr + t * sizeof(int32_t)));
+                }
+            } else if (value.type == msgpack::type::ARRAY) {
+                const msgpack::object_array& array = value.via.array;
+                request->token_ids.reserve(array.size);
+                for (uint32_t t = 0; t < array.size; ++t) {
+                    const msgpack::object& element = array.ptr[t];
+                    int64_t token_id = 0;
+                    if (element.type == msgpack::type::POSITIVE_INTEGER) {
+                        if (element.via.u64 >
+                            static_cast<uint64_t>(
+                                std::numeric_limits<int32_t>::max())) {
+                            HttpValidationError(
+                                resp, "out_of_range",
+                                "token_ids element is outside the int32 range",
+                                "token_ids", t);
+                            return false;
+                        }
+                        token_id = static_cast<int64_t>(element.via.u64);
+                    } else if (element.type ==
+                               msgpack::type::NEGATIVE_INTEGER) {
+                        if (element.via.i64 <
+                            std::numeric_limits<int32_t>::min()) {
+                            HttpValidationError(
+                                resp, "out_of_range",
+                                "token_ids element is outside the int32 range",
+                                "token_ids", t);
+                            return false;
+                        }
+                        token_id = element.via.i64;
+                    } else {
+                        HttpValidationError(
+                            resp, "invalid_type",
+                            "token_ids element must be an integer", "token_ids",
+                            t);
+                        return false;
+                    }
+                    request->token_ids.push_back(
+                        static_cast<int32_t>(token_id));
+                }
+            } else {
+                HttpValidationError(resp, "invalid_type",
+                                    "token_ids must be a bin or an array",
+                                    "token_ids");
+                return false;
+            }
+            have_token_ids = true;
+        } else if (key == "tenant_id") {
+            if (value.type != msgpack::type::STR) {
+                HttpValidationError(resp, "invalid_type",
+                                    "tenant_id must be a string", "tenant_id");
+                return false;
+            }
+            request->context.tenant_id.assign(value.via.str.ptr,
+                                              value.via.str.size);
+        } else if (key == "lora_name") {
+            if (value.type != msgpack::type::STR) {
+                HttpValidationError(resp, "invalid_type",
+                                    "lora_name must be a string", "lora_name");
+                return false;
+            }
+            request->context.lora_name.assign(value.via.str.ptr,
+                                              value.via.str.size);
+        } else if (key == "cache_salt") {
+            if (value.type == msgpack::type::NIL) {
+                // no salt
+            } else if (value.type == msgpack::type::STR) {
+                const std::string salt(value.via.str.ptr, value.via.str.size);
+                if (!salt.empty()) {
+                    request->cache_salt = salt;
+                }
+            } else {
+                HttpValidationError(resp, "invalid_type",
+                                    "cache_salt must be a string or null",
+                                    "cache_salt");
+                return false;
+            }
+        } else if (key == "instance_id") {
+            if (value.type != msgpack::type::STR) {
+                HttpValidationError(resp, "invalid_type",
+                                    "instance_id must be a string",
+                                    "instance_id");
+                return false;
+            }
+            request->instance_filter =
+                std::string(value.via.str.ptr, value.via.str.size);
+        } else {
+            const std::string field(key);
+            HttpValidationError(resp, "unknown_field",
+                                "unsupported request field: " + field,
+                                field.c_str());
+            return false;
+        }
+    }
+
+    if (!have_model) {
+        HttpValidationError(resp, "missing", "model is required", "model");
+        return false;
+    }
+    if (!have_block_size) {
+        HttpValidationError(resp, "missing", "block_size is required",
+                            "block_size");
+        return false;
+    }
+    if (!have_token_ids) {
+        HttpValidationError(resp, "missing", "token_ids is required",
+                            "token_ids");
         return false;
     }
     if (request->context.tenant_id.empty()) {
         request->context.tenant_id = "default";
     }
-
-    request->cache_salt.reset();
-    if (body.isMember("cache_salt") && !body["cache_salt"].isNull()) {
-        if (!body["cache_salt"].isString()) {
-            HttpJsonError(resp, "invalid_type",
-                          "cache_salt must be a string or null", "cache_salt");
-            return false;
-        }
-        const std::string value = body["cache_salt"].asString();
-        if (!value.empty()) {
-            request->cache_salt = value;
-        }
-    }
-
-    request->instance_filter.reset();
-    if (body.isMember("instance_id")) {
-        if (!body["instance_id"].isString()) {
-            HttpJsonError(resp, "invalid_type", "instance_id must be a string",
-                          "instance_id");
-            return false;
-        }
-        request->instance_filter = body["instance_id"].asString();
-    }
     return true;
 }
 
-bool ParseServiceConfigRequest(const Json::Value& body,
+bool ParseServiceConfigRequest(const msgpack::object_map& body,
                                coro_http_response& resp,
                                common::ServiceConfig* service) {
     static const std::set<std::string> kAllowedFields = {
@@ -462,8 +627,8 @@ bool ParseServiceConfigRequest(const Json::Value& body,
     }
     const auto publisher_kind = common::ParsePublisherKind(publisher_type);
     if (!publisher_kind.has_value()) {
-        HttpJsonError(resp, "invalid_value", "type must be vLLM or Mooncake",
-                      "type");
+        HttpValidationError(resp, "invalid_value",
+                            "type must be vLLM or Mooncake", "type");
         return false;
     }
     service->publisher_kind = *publisher_kind;
@@ -471,91 +636,116 @@ bool ParseServiceConfigRequest(const Json::Value& body,
         service->tenant_id = "default";
     }
 
-    if (!body.isMember("dp_rank")) {
-        HttpJsonError(resp, "missing", "dp_rank is required", "dp_rank");
+    const msgpack::object* dp_rank_value = MapFind(body, "dp_rank");
+    if (dp_rank_value == nullptr) {
+        HttpValidationError(resp, "missing", "dp_rank is required", "dp_rank");
         return false;
     }
     int64_t dp_rank = 0;
-    if (!JsonInt64(body["dp_rank"], &dp_rank)) {
-        HttpJsonError(resp, "invalid_type", "dp_rank must be an integer",
-                      "dp_rank");
+    if (!MsgpackInt64(*dp_rank_value, &dp_rank)) {
+        HttpValidationError(resp, "invalid_type", "dp_rank must be an integer",
+                            "dp_rank");
         return false;
     }
     if (dp_rank < 0 ||
         dp_rank > static_cast<int64_t>(std::numeric_limits<int>::max())) {
-        HttpJsonError(resp, "out_of_range",
-                      "dp_rank must be a non-negative int", "dp_rank");
+        HttpValidationError(resp, "out_of_range",
+                            "dp_rank must be a non-negative int", "dp_rank");
         return false;
     }
     service->dp_rank = static_cast<int>(dp_rank);
 
     if (const std::string error = ValidateServiceConfig(*service);
         !error.empty()) {
-        HttpJsonError(resp, "invalid_registration", error);
+        HttpValidationError(resp, "invalid_registration", error);
         return false;
     }
     return true;
 }
 
-Json::Value CacheHitResultToJson(const prefixindex::CacheHitResult& result) {
-    Json::Value out(Json::objectValue);
-    out["longest_matched"] = Json::Value::Int64(result.longest_match_tokens);
-    Json::Value dp(Json::objectValue);
+void PackCacheHitResult(MsgpackPacker& packer,
+                        const prefixindex::CacheHitResult& result) {
+    packer.pack_map(6);
+    packer.pack("longest_matched");
+    packer.pack(result.longest_match_tokens);
+    packer.pack("dp");
+    packer.pack_map(static_cast<uint32_t>(result.dp.size()));
     for (const auto& [rank, tokens] : result.dp) {
-        // map<int64,int64> is serialised with decimal-string keys (JSON wire
-        // contract).
-        dp[std::to_string(rank)] = Json::Value::Int64(tokens);
+        // Rank keys keep their decimal-string form from the previous wire
+        // contract.
+        packer.pack(std::to_string(rank));
+        packer.pack(tokens);
     }
-    out["dp"] = dp;
-    Json::Value rank_matches(Json::objectValue);
+    packer.pack("rank_matches");
+    packer.pack_map(static_cast<uint32_t>(result.rank_matches.size()));
     for (const auto& [rank, match] : result.rank_matches) {
-        Json::Value rank_match(Json::objectValue);
-        rank_match["gpu"] = Json::Value::Int64(match.gpu);
-        rank_match["cpu"] = Json::Value::Int64(match.cpu);
-        rank_match["disk"] = Json::Value::Int64(match.disk);
-        rank_matches[std::to_string(rank)] = rank_match;
+        packer.pack(std::to_string(rank));
+        packer.pack_map(3);
+        packer.pack("gpu");
+        packer.pack(match.gpu);
+        packer.pack("cpu");
+        packer.pack(match.cpu);
+        packer.pack("disk");
+        packer.pack(match.disk);
     }
-    out["rank_matches"] = rank_matches;
-    out["gpu"] = Json::Value::Int64(result.gpu);
-    out["cpu"] = Json::Value::Int64(result.cpu);
-    out["disk"] = Json::Value::Int64(result.disk);
-    return out;
+    packer.pack("gpu");
+    packer.pack(result.gpu);
+    packer.pack("cpu");
+    packer.pack(result.cpu);
+    packer.pack("disk");
+    packer.pack(result.disk);
 }
 
-Json::Value HashProfileToJson(const common::ResolvedHashProfile& profile) {
-    Json::Value out(Json::objectValue);
+void PackHashProfile(MsgpackPacker& packer,
+                     const common::ResolvedHashProfile& profile) {
     // Keep the resolved profile fields in one place so /services and
     // /global_view cannot drift when a new recipe is added.  root_digest is
     // intentionally emitted here only as a derived diagnostic; it is not
     // accepted by ParseHashProfileConfig as registration input.
-    out["strategy"] = profile.strategy;
-    out["algorithm"] = profile.algorithm;
-    out["python_hash_seed"] = profile.python_hash_seed;
-    out["root_digest"] = profile.root_digest;
-    out["index_projection"] = profile.index_projection;
-    return out;
+    packer.pack_map(5);
+    packer.pack("strategy");
+    packer.pack(profile.strategy);
+    packer.pack("algorithm");
+    packer.pack(profile.algorithm);
+    packer.pack("python_hash_seed");
+    packer.pack(profile.python_hash_seed);
+    packer.pack("root_digest");
+    packer.pack(profile.root_digest);
+    packer.pack("index_projection");
+    packer.pack(profile.index_projection);
 }
 
-Json::Value ServiceConfigToJson(const common::ServiceConfig& svc) {
+void PackServiceConfig(MsgpackPacker& packer,
+                       const common::ServiceConfig& svc) {
     // Field names are the exported struct-field names of
-    // common.ServiceConfig (fixed JSON wire contract).
-    Json::Value out(Json::objectValue);
-    out["Endpoint"] = svc.endpoint;
-    out["ReplayEndpoint"] = svc.replay_endpoint;
-    out["Type"] = std::string(common::PublisherKindName(svc.publisher_kind));
-    out["ModelName"] = svc.model_name;
-    out["LoraName"] = svc.lora_name;
-    out["TenantID"] = svc.tenant_id;
-    out["InstanceID"] = svc.instance_id;
-    out["BlockSize"] = Json::Value::Int64(svc.block_size);
-    out["DPRank"] = svc.dp_rank;
+    // common.ServiceConfig (fixed wire contract).
+    packer.pack_map(11);
+    packer.pack("Endpoint");
+    packer.pack(svc.endpoint);
+    packer.pack("ReplayEndpoint");
+    packer.pack(svc.replay_endpoint);
+    packer.pack("Type");
+    packer.pack(std::string(common::PublisherKindName(svc.publisher_kind)));
+    packer.pack("ModelName");
+    packer.pack(svc.model_name);
+    packer.pack("LoraName");
+    packer.pack(svc.lora_name);
+    packer.pack("TenantID");
+    packer.pack(svc.tenant_id);
+    packer.pack("InstanceID");
+    packer.pack(svc.instance_id);
+    packer.pack("BlockSize");
+    packer.pack(svc.block_size);
+    packer.pack("DPRank");
+    packer.pack(svc.dp_rank);
+    packer.pack("CacheGroup");
     if (svc.cache_group.has_value()) {
-        out["CacheGroup"] = Json::Value::Int64(*svc.cache_group);
+        packer.pack(*svc.cache_group);
     } else {
-        out["CacheGroup"] = Json::Value(Json::nullValue);
+        packer.pack_nil();
     }
-    out["HashProfile"] = HashProfileToJson(svc.hash_profile);
-    return out;
+    packer.pack("HashProfile");
+    PackHashProfile(packer, svc.hash_profile);
 }
 
 }  // namespace
@@ -862,31 +1052,41 @@ void EventManager::RegisterHttpHandlers() {
     auto* server = http_server_.get();
 
     // ---- /query ---------------------------------------------------------
+    // msgpack-only protocol (JSON support was dropped during development:
+    // JsonCpp DOM parsing dominates cost at long context). token_ids may be
+    // a bin of little-endian int32 or an integer array. Responses and error
+    // bodies remain JSON.
     server->set_http_handler<POST>(
         "/query", [this](coro_http_request& req, coro_http_response& resp) {
             VLOG(1) << "receive req method=POST path=/query";
 
-            Json::Value body;
-            if (!ParseQueryJsonBody(req, resp, &body)) {
+            const std::string_view content_type =
+                req.get_header_value("content-type");
+            if (content_type.find("application/msgpack") ==
+                std::string_view::npos) {
+                HttpValidationError(resp, "unsupported_content_type",
+                                    "Content-Type must be application/msgpack");
                 return;
             }
 
             QueryRequest query;
-            if (!ParseQueryRequest(body, resp, &query)) {
+            if (!ParseQueryMsgpackRequest(req, resp, &query)) {
                 return;
             }
 
             const auto results =
                 indexer_.Query(query.context, query.token_ids, query.cache_salt,
                                query.instance_filter);
-            Json::Value instances(Json::objectValue);
+            msgpack::sbuffer body;
+            MsgpackPacker packer(&body);
+            packer.pack_map(1);
+            packer.pack("instances");
+            packer.pack_map(static_cast<uint32_t>(results.size()));
             for (const auto& [instance_id, result] : results) {
-                instances[instance_id] = CacheHitResultToJson(result);
+                packer.pack(instance_id);
+                PackCacheHitResult(packer, result);
             }
-
-            Json::Value response_result(Json::objectValue);
-            response_result["instances"] = instances;
-            HttpJson(resp, response_result);
+            HttpMsgpack(resp, status_type::ok, body);
         });
     server->set_http_handler<GET>("/query", [](coro_http_request&,
                                                coro_http_response& resp) {
@@ -896,8 +1096,9 @@ void EventManager::RegisterHttpHandlers() {
     // ---- /register ------------------------------------------------------
     server->set_http_handler<POST>(
         "/register", [this](coro_http_request& req, coro_http_response& resp) {
-            Json::Value body;
-            if (!ParseJsonBody(req, resp, "register", &body)) {
+            msgpack::object_handle handle;
+            msgpack::object_map body{};
+            if (!ParseMsgpackBody(req, resp, "register", &handle, &body)) {
                 return;
             }
 
@@ -917,7 +1118,7 @@ void EventManager::RegisterHttpHandlers() {
                         HttpError(resp, status_type::internal_server_error,
                                   "Failed to subscribe: " + err);
                     } else {
-                        HttpJsonError(resp, "invalid_registration", err);
+                        HttpValidationError(resp, "invalid_registration", err);
                     }
                     return;
                 }
@@ -926,10 +1127,14 @@ void EventManager::RegisterHttpHandlers() {
                 }
             }
 
-            Json::Value out(Json::objectValue);
-            out["status"] = "registered successfully";
-            out["instance_id"] = svc.instance_id;
-            HttpJson(resp, out);
+            msgpack::sbuffer response_body;
+            MsgpackPacker packer(&response_body);
+            packer.pack_map(2);
+            packer.pack("status");
+            packer.pack("registered successfully");
+            packer.pack("instance_id");
+            packer.pack(svc.instance_id);
+            HttpMsgpack(resp, status_type::ok, response_body);
         });
     server->set_http_handler<GET>("/register", [](coro_http_request&,
                                                   coro_http_response& resp) {
@@ -940,8 +1145,9 @@ void EventManager::RegisterHttpHandlers() {
     server->set_http_handler<POST>(
         "/unregister",
         [this](coro_http_request& req, coro_http_response& resp) {
-            Json::Value body;
-            if (!ParseJsonBody(req, resp, "unregister", &body)) {
+            msgpack::object_handle handle;
+            msgpack::object_map body{};
+            if (!ParseMsgpackBody(req, resp, "unregister", &handle, &body)) {
                 return;
             }
 
@@ -960,17 +1166,20 @@ void EventManager::RegisterHttpHandlers() {
             if (target_tenant.empty()) {
                 target_tenant = "default";
             }
-            if (!body.isMember("dp_rank")) {
-                HttpJsonError(resp, "missing", "dp_rank is required",
-                              "dp_rank");
+            const msgpack::object* dp_rank_value = MapFind(body, "dp_rank");
+            if (dp_rank_value == nullptr) {
+                HttpValidationError(resp, "missing", "dp_rank is required",
+                                    "dp_rank");
                 return;
             }
             int64_t parsed_rank = 0;
-            if (!JsonInt64(body["dp_rank"], &parsed_rank) || parsed_rank < 0 ||
+            if (!MsgpackInt64(*dp_rank_value, &parsed_rank) ||
+                parsed_rank < 0 ||
                 parsed_rank >
                     static_cast<int64_t>(std::numeric_limits<int>::max())) {
-                HttpJsonError(resp, "invalid_value",
-                              "dp_rank must be a non-negative int", "dp_rank");
+                HttpValidationError(resp, "invalid_value",
+                                    "dp_rank must be a non-negative int",
+                                    "dp_rank");
                 return;
             }
             const int dp_rank = static_cast<int>(parsed_rank);
@@ -991,12 +1200,15 @@ void EventManager::RegisterHttpHandlers() {
                 return;
             }
 
-            Json::Value out(Json::objectValue);
-            out["status"] = "unregistered successfully";
-            Json::Value removed(Json::arrayValue);
-            removed.append(target_key);
-            out["removed_instances"] = removed;
-            HttpJson(resp, out);
+            msgpack::sbuffer response_body;
+            MsgpackPacker packer(&response_body);
+            packer.pack_map(2);
+            packer.pack("status");
+            packer.pack("unregistered successfully");
+            packer.pack("removed_instances");
+            packer.pack_array(1);
+            packer.pack(target_key);
+            HttpMsgpack(resp, status_type::ok, response_body);
         });
     server->set_http_handler<GET>("/unregister", [](coro_http_request&,
                                                     coro_http_response& resp) {
@@ -1008,38 +1220,40 @@ void EventManager::RegisterHttpHandlers() {
         "/global_view", [this](coro_http_request&, coro_http_response& resp) {
             const auto global_view = indexer_.GetGlobalView();
 
-            Json::Value out(Json::objectValue);
-            out["context_count"] = global_view.context_count;
-            Json::Value contexts(Json::arrayValue);
+            msgpack::sbuffer body;
+            MsgpackPacker packer(&body);
+            packer.pack_map(2);
+            packer.pack("context_count");
+            packer.pack(static_cast<uint64_t>(global_view.context_count));
+            packer.pack("contexts");
+            packer.pack_array(
+                static_cast<uint32_t>(global_view.contexts.size()));
             for (const auto& view : global_view.contexts) {
-                Json::Value c(Json::objectValue);
-                c["model_name"] = view.context.model_name;
-                c["lora_name"] = view.context.lora_name;
-                c["block_size"] = Json::Value::Int64(view.context.block_size);
-                c["tenant_id"] = view.context.tenant_id;
-                c["prefix_count"] = Json::Value::UInt64(view.prefix_count);
-
-                Json::Value profile(Json::objectValue);
-                profile["strategy"] = view.profile.strategy;
-                profile["algorithm"] = view.profile.algorithm;
-                profile["python_hash_seed"] = view.profile.python_hash_seed;
-                profile["root_digest"] = view.profile.root_digest;
-                profile["index_projection"] = view.profile.index_projection;
-                c["hash_profile"] = profile;
-
-                Json::Value instances(Json::objectValue);
+                packer.pack_map(7);
+                packer.pack("model_name");
+                packer.pack(view.context.model_name);
+                packer.pack("lora_name");
+                packer.pack(view.context.lora_name);
+                packer.pack("block_size");
+                packer.pack(view.context.block_size);
+                packer.pack("tenant_id");
+                packer.pack(view.context.tenant_id);
+                packer.pack("prefix_count");
+                packer.pack(static_cast<uint64_t>(view.prefix_count));
+                packer.pack("hash_profile");
+                PackHashProfile(packer, view.profile);
+                packer.pack("instances");
+                packer.pack_map(
+                    static_cast<uint32_t>(view.instance_ranks.size()));
                 for (const auto& [instance_id, ranks] : view.instance_ranks) {
-                    Json::Value rank_values(Json::arrayValue);
+                    packer.pack(instance_id);
+                    packer.pack_array(static_cast<uint32_t>(ranks.size()));
                     for (const int64_t rank : ranks) {
-                        rank_values.append(Json::Value::Int64(rank));
+                        packer.pack(rank);
                     }
-                    instances[instance_id] = rank_values;
                 }
-                c["instances"] = instances;
-                contexts.append(c);
             }
-            out["contexts"] = contexts;
-            HttpJson(resp, out);
+            HttpMsgpack(resp, status_type::ok, body);
         });
     server->set_http_handler<POST>(
         "/global_view", [](coro_http_request&, coro_http_response& resp) {
@@ -1052,26 +1266,21 @@ void EventManager::RegisterHttpHandlers() {
         "/services", [this](coro_http_request&, coro_http_response& resp) {
             VLOG(1) << "receive req method=GET path=/services";
 
-            Json::Value services(Json::arrayValue);
-            int count = 0;
+            msgpack::sbuffer body;
+            MsgpackPacker packer(&body);
+            packer.pack_map(2);
+            packer.pack("count");
             {
                 std::shared_lock lock(mu_);
+                packer.pack(static_cast<uint64_t>(active_configs_.size()));
+                packer.pack("services");
+                packer.pack_array(
+                    static_cast<uint32_t>(active_configs_.size()));
                 for (const auto& [key, svc] : active_configs_) {
-                    services.append(ServiceConfigToJson(svc));
-                    ++count;
+                    PackServiceConfig(packer, svc);
                 }
             }
-
-            Json::Value out(Json::objectValue);
-            out["count"] = count;
-            out["services"] = services;
-            // This endpoint writes the JSON body with no trailing newline,
-            // unlike the other endpoints (fixed wire contract).
-            Json::StreamWriterBuilder wb;
-            wb["indentation"] = "";
-            resp.add_header("Content-Type", kApplicationJson);
-            resp.set_status_and_content(status_type::ok,
-                                        Json::writeString(wb, out));
+            HttpMsgpack(resp, status_type::ok, body);
         });
     server->set_http_handler<POST>("/services", [](coro_http_request&,
                                                    coro_http_response& resp) {

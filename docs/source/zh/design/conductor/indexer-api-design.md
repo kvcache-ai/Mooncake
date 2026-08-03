@@ -19,10 +19,12 @@
 
 ## 通用请求和响应规则
 
-所有 `POST` 请求体都必须是 JSON 对象。Conductor 会拒绝未知字段。成功响应使用
-`application/json`；JSON 对象中各字段的顺序不属于接口约定。
+所有端点**仅使用 msgpack**。`POST` 请求体是以 `Content-Type: application/msgpack`
+发送的 msgpack map；成功响应和错误响应也是以 `Content-Type: application/msgpack`
+返回的 msgpack map。`GET` 端点（`/services`、`/global_view`）同样返回 msgpack。
+所有接口都会拒绝未知字段。map 中各字段的顺序不属于接口约定。
 
-大多数参数检查错误返回状态码 `400` 和一个 `application/json` 对象：
+大多数参数检查错误返回状态码 `400` 和一个 msgpack map（此处以 JSON 形式展示）：
 
 ```json
 {
@@ -33,7 +35,7 @@
 ```
 
 如果错误由某个字段引起，响应会包含 `field`。如果错误来自数组中的某个元素，
-响应还会包含 `index`。[错误格式](#理解错误)一节列出了改为返回纯文本的情况。
+响应还会包含 `index`。
 
 ## `POST /register`
 
@@ -87,23 +89,32 @@ HTTP 接口不接受该字段。
 
 ### 最小请求
 
-```bash
-curl -sS -X POST http://127.0.0.1:13333/register \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "endpoint": "tcp://127.0.0.1:5557",
-    "type": "vLLM",
-    "modelname": "test-model",
-    "instance_id": "engine-a",
-    "block_size": 16,
-    "dp_rank": 0,
-    "hash_profile": {
-      "strategy": "vllm_v1",
-      "algorithm": "sha256_cbor",
-      "python_hash_seed": "0",
-      "index_projection": "low64_be"
-    }
-  }'
+```python
+import msgpack
+import httpx
+
+body = msgpack.packb(
+    {
+        "endpoint": "tcp://127.0.0.1:5557",
+        "type": "vLLM",
+        "modelname": "test-model",
+        "instance_id": "engine-a",
+        "block_size": 16,
+        "dp_rank": 0,
+        "hash_profile": {
+            "strategy": "vllm_v1",
+            "algorithm": "sha256_cbor",
+            "python_hash_seed": "0",
+            "index_projection": "low64_be",
+        },
+    },
+    use_bin_type=True,
+)
+response = httpx.post(
+    "http://127.0.0.1:13333/register",
+    content=body,
+    headers={"Content-Type": "application/msgpack"},
+)
 ```
 
 状态码 `200` 返回：
@@ -137,10 +148,16 @@ curl -sS -X POST http://127.0.0.1:13333/register \
 
 ### 最小请求
 
-```bash
-curl -sS -X POST http://127.0.0.1:13333/unregister \
-  -H 'Content-Type: application/json' \
-  -d '{"instance_id":"engine-a","dp_rank":0}'
+```python
+import msgpack
+import httpx
+
+body = msgpack.packb({"instance_id": "engine-a", "dp_rank": 0}, use_bin_type=True)
+response = httpx.post(
+    "http://127.0.0.1:13333/unregister",
+    content=body,
+    headers={"Content-Type": "application/msgpack"},
+)
 ```
 
 状态码 `200` 返回实际删除的服务键：
@@ -154,7 +171,7 @@ curl -sS -X POST http://127.0.0.1:13333/unregister \
 }
 ```
 
-服务键不存在时返回纯文本 `404`。如果订阅客户端停止后清理失败，则返回纯文本
+服务键不存在时返回 msgpack 错误 map 和状态码 `404`。如果订阅客户端停止后清理失败，则返回状态码
 `500`。此时 Conductor 会继续占用该服务键和 endpoint，二者都不能重新注册。
 请重复发送相同的 `/unregister` 请求，直到清理成功。
 
@@ -164,16 +181,21 @@ curl -sS -X POST http://127.0.0.1:13333/unregister \
 租户、模型、LoRA 名称和块大小必须能找到对应的注册信息。请求不能覆盖算法、
 策略、`python_hash_seed`、派生根摘要或最后八字节的查询规则。
 
+**请求体使用 msgpack 而不是 JSON。** 以 `Content-Type: application/msgpack`
+发送一个 msgpack map；其他内容类型会被 `unsupported_content_type` 拒绝。
+`token_ids` 可以是小端 int32 组成的 msgpack `bin`（推荐：每个 token 4 字节，
+服务端无需逐元素解析），也可以是整数数组。响应同样是 msgpack map。
+
 ### 请求字段
 
 | 字段 | 必填 | 可接受的值和用途 |
 |---|---|---|
 | `model` | 是 | 非空的模型名，必须与注册信息中的 `modelname` 一致。 |
 | `block_size` | 是 | 正整数。只有包含足够 token 的完整块会参与哈希计算。 |
-| `token_ids` | 是 | 由有符号 32 位整数组成的 JSON 数组。空数组有效，并会为匹配的已注册 rank 返回零命中。 |
+| `token_ids` | 是 | 小端 int32 组成的 msgpack `bin`，或由有符号 32 位整数组成的数组。空值有效，并会为匹配的已注册 rank 返回零命中。 |
 | `tenant_id` | 否 | 字符串。省略或传入 `""` 都会变成 `"default"`。 |
 | `lora_name` | 否 | 字符串。默认值是 `""`，表示基础模型。 |
-| `cache_salt` | 否 | 字符串、`null` 或省略。`null`、`""` 和省略都表示不加 salt；非空值必须与生产方一致。 |
+| `cache_salt` | 否 | 字符串、`nil` 或省略。`nil`、`""` 和省略都表示不加 salt；非空值必须与生产方一致。 |
 | `instance_id` | 否 | 字符串过滤条件。匹配时只返回指定实例；未知值返回空的 `instances` 对象。 |
 
 请求不能包含覆盖哈希配置的字段。如果找不到对应的缓存共享范围，也会返回状态码
@@ -181,14 +203,25 @@ curl -sS -X POST http://127.0.0.1:13333/unregister \
 
 ### 最小请求
 
-```bash
-curl -sS -X POST http://127.0.0.1:13333/query \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "model": "test-model",
-    "block_size": 16,
-    "token_ids": [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
-  }'
+```python
+import msgpack
+import struct
+import httpx
+
+token_ids = list(range(16))
+body = msgpack.packb(
+    {
+        "model": "test-model",
+        "block_size": 16,
+        "token_ids": struct.pack(f"<{len(token_ids)}i", *token_ids),
+    },
+    use_bin_type=True,
+)
+response = httpx.post(
+    "http://127.0.0.1:13333/query",
+    content=body,
+    headers={"Content-Type": "application/msgpack"},
+)
 ```
 
 如果已经注册 `engine-a` 的 rank `0`，但还没有收到匹配的缓存事件，响应如下：
@@ -323,8 +356,13 @@ longest_matched == disk
 
 ### 最小请求
 
-```bash
-curl -sS http://127.0.0.1:13333/global_view
+```python
+import msgpack
+import httpx
+
+view = msgpack.unpackb(
+    httpx.get("http://127.0.0.1:13333/global_view").content, raw=False
+)
 ```
 
 注册 `engine-a` 的 rank `0` 和 `1` 后，在收到缓存事件前，单个缓存范围的响应
@@ -371,8 +409,13 @@ CPU 或 Disk 记录的不同查询值；这里的查询值是完整摘要的最�
 
 ### 最小请求
 
-```bash
-curl -sS http://127.0.0.1:13333/services
+```python
+import msgpack
+import httpx
+
+services = msgpack.unpackb(
+    httpx.get("http://127.0.0.1:13333/services").content, raw=False
+)
 ```
 
 发送上面的最小注册请求后，状态码 `200` 返回：
@@ -412,28 +455,27 @@ curl -sS http://127.0.0.1:13333/services
 
 ## 理解错误
 
-Conductor 会根据错误类型返回 JSON 参数错误或纯文本运行错误：
+所有错误响应都是 msgpack map（此处以 JSON 形式展示以便阅读）。参数错误带有稳定的
+`reason`，运行错误只带 `error`：
 
 | 情况 | 状态码 | Content type 和响应体 |
 |---|---|---|
-| 任意 `POST` 接口的字段检查失败 | `400` | `application/json`，包含 `error`、`reason`，以及适用时的 `field` 或 `index`。 |
-| `/query` 的 JSON 格式错误，或请求体不是对象 | `400` | `application/json`，内容为 `{"error":"Invalid JSON object","reason":"invalid_json"}`。 |
-| `/register` 或 `/unregister` 的 JSON 格式错误，或请求体不是对象 | `400` | `text/plain; charset=utf-8`，内容为 `Invalid JSON\n`。 |
-| `/unregister` 找不到服务键 | `404` | `text/plain; charset=utf-8`，例如 `service not found: engine-a\|default\|0\n`。 |
-| 使用 `GET` 请求 `/register`、`/unregister` 或 `/query`；使用 `POST` 请求 `/global_view` 或 `/services` | `405` | `text/plain; charset=utf-8`，内容为 `Method not allowed\n`。 |
-| `/register` 无法启动本地订阅客户端 | `500` | `text/plain; charset=utf-8`，开头是 `Failed to subscribe: failed to start ZMQ client:`。 |
-| `/unregister` 已停止订阅客户端，但缓存清理失败 | `500` | `text/plain; charset=utf-8`，开头是 `Failed to unregister prefix context:`。 |
+| 任意 `POST` 接口的字段检查失败 | `400` | 包含 `error`、`reason`，以及适用时的 `field` 或 `index`。 |
+| 任意 `POST` 接口的 `Content-Type` 不是 msgpack | `400` | `{"error":"Content-Type must be application/msgpack","reason":"unsupported_content_type"}`。 |
+| 任意 `POST` 接口的 msgpack 格式错误，或请求体不是 map | `400` | `{"error":"Invalid msgpack object","reason":"invalid_msgpack"}`。 |
+| `/unregister` 找不到服务键 | `404` | msgpack map，例如 `service not found: engine-a\|default\|0`。 |
+| 使用 `GET` 请求 `/register`、`/unregister` 或 `/query`；使用 `POST` 请求 `/global_view` 或 `/services` | `405` | msgpack map，内容为 `Method not allowed`。 |
+| `/register` 无法启动本地订阅客户端 | `500` | msgpack map，开头是 `Failed to subscribe: failed to start ZMQ client:`。 |
+| `/unregister` 已停止订阅客户端，但缓存清理失败 | `500` | msgpack map，开头是 `Failed to unregister prefix context:`。 |
 
-例如，`token_ids` 中出现字符串时，会返回精确到数组元素的 JSON 错误：
+例如，`token_ids` 数组中出现字符串元素时，会返回精确到元素的错误（此处以
+JSON 形式展示）：
 
 ```json
 {
-  "error": "token_ids element must be a JSON integer",
+  "error": "token_ids element must be an integer",
   "reason": "invalid_type",
   "field": "token_ids",
   "index": 0
 }
 ```
-
-除 `/services` 外，Conductor 生成的 JSON 响应都以换行符结尾；该紧凑 JSON
-响应没有结尾换行。上表中用 `\n` 表示的纯文本错误会带有该结尾换行。
