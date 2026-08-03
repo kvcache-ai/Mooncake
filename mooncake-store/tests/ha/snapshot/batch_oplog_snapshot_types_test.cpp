@@ -71,19 +71,16 @@ std::string WriteJson(const Json::Value& root) {
 }
 
 void ExpectDescriptorRejected(const std::string& json) {
-    BatchOpLogSnapshotDescriptor descriptor;
-    std::string reason;
-    EXPECT_FALSE(
-        DecodeBatchOpLogSnapshotDescriptor(json, &descriptor, &reason));
-    EXPECT_FALSE(reason.empty());
+    auto decoded = DecodeBatchOpLogSnapshotDescriptor(json);
+    ASSERT_FALSE(decoded.has_value());
+    EXPECT_FALSE(decoded.error().empty());
 }
 
 void ExpectManifestRejected(const std::string& json) {
     SCOPED_TRACE(json);
-    BatchOpLogSnapshotManifest manifest;
-    std::string reason;
-    EXPECT_FALSE(DecodeBatchOpLogSnapshotManifest(json, &manifest, &reason));
-    EXPECT_FALSE(reason.empty());
+    auto decoded = DecodeBatchOpLogSnapshotManifest(json);
+    ASSERT_FALSE(decoded.has_value());
+    EXPECT_FALSE(decoded.error().empty());
 }
 
 }  // namespace
@@ -95,62 +92,57 @@ TEST(BatchOpLogSnapshotTypesTest, DescriptorRoundTripsCompactJson) {
     auto json = ParseJson(encoded);
     json["future_optional_field"] = true;
 
-    BatchOpLogSnapshotDescriptor decoded;
-    std::string reason;
-    ASSERT_TRUE(
-        DecodeBatchOpLogSnapshotDescriptor(WriteJson(json), &decoded, &reason))
-        << reason;
-    EXPECT_EQ(decoded.schema_version, kBatchOpLogSnapshotSchemaVersion);
-    EXPECT_EQ(decoded.snapshot_format, kBatchOpLogSnapshotFormat);
-    EXPECT_EQ(decoded.snapshot_id, "9-12345");
-    EXPECT_EQ(decoded.last_included_seq, 42u);
-    EXPECT_EQ(decoded.last_included_batch_id, 9u);
-    EXPECT_EQ(decoded.producer_view_version, 7u);
-    EXPECT_EQ(decoded.manifest_key,
+    auto decoded = DecodeBatchOpLogSnapshotDescriptor(WriteJson(json));
+    ASSERT_TRUE(decoded.has_value()) << decoded.error();
+    EXPECT_EQ(decoded->schema_version, kBatchOpLogSnapshotSchemaVersion);
+    EXPECT_EQ(decoded->snapshot_format, kBatchOpLogSnapshotFormat);
+    EXPECT_EQ(decoded->snapshot_id, "9-12345");
+    EXPECT_EQ(decoded->last_included_seq, 42u);
+    EXPECT_EQ(decoded->last_included_batch_id, 9u);
+    EXPECT_EQ(decoded->producer_view_version, 7u);
+    EXPECT_EQ(decoded->manifest_key,
               "snapshots/batch-oplog/9-12345/manifest.json");
-    EXPECT_EQ(decoded.manifest_size, 128u);
-    EXPECT_EQ(decoded.manifest_crc32c, 17u);
-    EXPECT_EQ(decoded.created_at_ms, 1700000000000);
+    EXPECT_EQ(decoded->manifest_size, 128u);
+    EXPECT_EQ(decoded->manifest_crc32c, 17u);
+    EXPECT_EQ(decoded->created_at_ms, 1700000000000);
 }
 
 TEST(BatchOpLogSnapshotTypesTest, ManifestRoundTripsChunksAndAllowsEmptySet) {
-    BatchOpLogSnapshotManifest decoded;
-    std::string reason;
     auto encoded = EncodeBatchOpLogSnapshotManifest(MakeManifest());
     EXPECT_EQ(encoded.find('\n'), std::string::npos);
     auto json = ParseJson(encoded);
     json["future_optional_field"] = true;
-    ASSERT_TRUE(
-        DecodeBatchOpLogSnapshotManifest(WriteJson(json), &decoded, &reason))
-        << reason;
-    ASSERT_EQ(decoded.object_chunks.size(), 2u);
-    EXPECT_EQ(decoded.segments.stored_size, 64u);
-    EXPECT_EQ(decoded.object_chunks[1].chunk_index, 1u);
-    EXPECT_EQ(decoded.object_chunks[1].object_count, 50u);
+    auto decoded = DecodeBatchOpLogSnapshotManifest(WriteJson(json));
+    ASSERT_TRUE(decoded.has_value()) << decoded.error();
+    ASSERT_EQ(decoded->object_chunks.size(), 2u);
+    EXPECT_EQ(decoded->segments.stored_size, 64u);
+    EXPECT_EQ(decoded->object_chunks[1].chunk_index, 1u);
+    EXPECT_EQ(decoded->object_chunks[1].object_count, 50u);
 
     auto empty = MakeManifest();
     empty.object_chunks.clear();
-    ASSERT_TRUE(DecodeBatchOpLogSnapshotManifest(
-        EncodeBatchOpLogSnapshotManifest(empty), &decoded, &reason));
-    EXPECT_TRUE(decoded.object_chunks.empty());
+    auto decoded_empty = DecodeBatchOpLogSnapshotManifest(
+        EncodeBatchOpLogSnapshotManifest(empty));
+    ASSERT_TRUE(decoded_empty.has_value()) << decoded_empty.error();
+    EXPECT_TRUE(decoded_empty->object_chunks.empty());
 }
 
 TEST(BatchOpLogSnapshotTypesTest, JsonRoundTripPreservesEscapedKeys) {
     auto descriptor = MakeDescriptor();
     descriptor.manifest_key = R"(snapshots/"quoted"/manifest\key.json)";
-    BatchOpLogSnapshotDescriptor decoded_descriptor;
-    ASSERT_TRUE(DecodeBatchOpLogSnapshotDescriptor(
-        EncodeBatchOpLogSnapshotDescriptor(descriptor), &decoded_descriptor));
-    EXPECT_EQ(decoded_descriptor.manifest_key, descriptor.manifest_key);
+    auto decoded_descriptor = DecodeBatchOpLogSnapshotDescriptor(
+        EncodeBatchOpLogSnapshotDescriptor(descriptor));
+    ASSERT_TRUE(decoded_descriptor.has_value()) << decoded_descriptor.error();
+    EXPECT_EQ(decoded_descriptor->manifest_key, descriptor.manifest_key);
 
     auto manifest = MakeManifest();
     manifest.segments.key = R"(snapshots/"quoted"/segments\key.bin)";
     manifest.object_chunks[0].key = R"(snapshots/"quoted"/objects\0.bin)";
-    BatchOpLogSnapshotManifest decoded_manifest;
-    ASSERT_TRUE(DecodeBatchOpLogSnapshotManifest(
-        EncodeBatchOpLogSnapshotManifest(manifest), &decoded_manifest));
-    EXPECT_EQ(decoded_manifest.segments.key, manifest.segments.key);
-    EXPECT_EQ(decoded_manifest.object_chunks[0].key,
+    auto decoded_manifest = DecodeBatchOpLogSnapshotManifest(
+        EncodeBatchOpLogSnapshotManifest(manifest));
+    ASSERT_TRUE(decoded_manifest.has_value()) << decoded_manifest.error();
+    EXPECT_EQ(decoded_manifest->segments.key, manifest.segments.key);
+    EXPECT_EQ(decoded_manifest->object_chunks[0].key,
               manifest.object_chunks[0].key);
 }
 
@@ -206,11 +198,9 @@ TEST(BatchOpLogSnapshotTypesTest, AcceptsAnEmptyCursor) {
     descriptor.last_included_seq = 0;
     descriptor.last_included_batch_id = 0;
 
-    BatchOpLogSnapshotDescriptor decoded;
-    std::string reason;
-    EXPECT_TRUE(DecodeBatchOpLogSnapshotDescriptor(
-        EncodeBatchOpLogSnapshotDescriptor(descriptor), &decoded, &reason))
-        << reason;
+    auto decoded = DecodeBatchOpLogSnapshotDescriptor(
+        EncodeBatchOpLogSnapshotDescriptor(descriptor));
+    ASSERT_TRUE(decoded.has_value()) << decoded.error();
 }
 
 TEST(BatchOpLogSnapshotTypesTest, RejectsInvalidManifestJson) {
