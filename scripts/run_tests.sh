@@ -131,6 +131,19 @@ python test_cli.py
 killall mooncake_http_metadata_server || true
 killall mooncake_master || true
 killall mooncake_client || true
+# killall only sends SIGTERM and returns immediately; the next master enables
+# the embedded HTTP metadata server and must bind 8080, which the Python
+# mooncake_http_metadata_server may still hold while it shuts down. Poll until
+# nothing listens on 8080 anymore instead of racing it (bounded to ~10s).
+for i in $(seq 1 100); do
+    ss -tlnp 2>/dev/null | grep -q ':8080 ' || break
+    sleep 0.1
+done
+if ss -tlnp 2>/dev/null | grep -q ':8080 '; then
+    echo "ERROR: port 8080 is still in use after 10s, cannot start master with embedded HTTP metadata server"
+    ss -tlnp | grep ':8080 ' || true
+    exit 1
+fi
 mooncake_master --default_kv_lease_ttl=500 --enable_http_metadata_server=true &
 MASTER_PID=$!
 sleep 1
