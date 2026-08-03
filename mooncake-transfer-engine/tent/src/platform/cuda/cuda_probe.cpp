@@ -36,6 +36,7 @@
 #include <unordered_set>
 
 #include <algorithm>
+#include <mutex>
 
 namespace mooncake {
 namespace tent {
@@ -262,10 +263,26 @@ Status CudaPlatform::probe(std::vector<Topology::NicEntry>& nic_list,
     return Status::OK();
 }
 
+namespace {
+void checkCudartAbiOnce() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        int runtime_version = 0;
+        if (cudaRuntimeGetVersion(&runtime_version) != cudaSuccess) return;
+        if (runtime_version / 1000 != CUDART_VERSION / 1000) {
+            LOG(ERROR) << "CUDA ABI mismatch: built against CUDART "
+                       << CUDART_VERSION << ", loaded libcudart is "
+                       << runtime_version
+                       << "; rebuild against a matching CUDA toolkit.";
+        }
+    });
+}
+}  // namespace
+
 MemoryType CudaPlatform::getMemoryType(void* addr) {
-    cudaPointerAttributes attributes;
-    cudaError_t result;
-    result = cudaPointerGetAttributes(&attributes, addr);
+    checkCudartAbiOnce();
+    cudaPointerAttributes attributes{};
+    cudaError_t result = cudaPointerGetAttributes(&attributes, addr);
     if (result != cudaSuccess) {
         LOG(WARNING) << "cudaPointerGetAttributes: "
                      << cudaGetErrorString(result);
@@ -296,10 +313,9 @@ const std::vector<RangeLocation> CudaPlatform::getLocation(void* start,
     const static size_t kPageSize = 4096;
     std::vector<RangeLocation> entries;
 
-    cudaPointerAttributes attributes;
-    cudaError_t result;
-
-    result = cudaPointerGetAttributes(&attributes, start);
+    checkCudartAbiOnce();
+    cudaPointerAttributes attributes{};
+    cudaError_t result = cudaPointerGetAttributes(&attributes, start);
     if (result != cudaSuccess) {
         LOG(WARNING) << "cudaPointerGetAttributes: "
                      << cudaGetErrorString(result);
