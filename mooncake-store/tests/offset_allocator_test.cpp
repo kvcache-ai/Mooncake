@@ -294,6 +294,12 @@ class OffsetAllocatorTest : public ::testing::Test {
         allocator->m_mutex.unlock();
     }
 
+    bool isLargestFreeRegionHintTightened(
+        const std::shared_ptr<OffsetAllocator>& allocator) {
+        MutexLocker lock(&allocator->m_mutex);
+        return allocator->m_largest_free_region_tightened;
+    }
+
     bool canAllocateWithoutFastFail(
         const std::shared_ptr<OffsetAllocator>& allocator, size_t size) {
         MutexLocker lock(&allocator->m_mutex);
@@ -565,8 +571,41 @@ TEST_F(OffsetAllocatorTest, AllocationFailure) {
     EXPECT_FALSE(handle.has_value());
 }
 
+TEST_F(OffsetAllocatorTest, FreeReturnsMergedRegionSize) {
+    constexpr uint32 ALLOCATOR_SIZE = 1024;
+    constexpr uint32 MAX_ALLOCS = 8;
+    constexpr uint32 BLOCK_SIZE = 128;
+    __Allocator allocator(ALLOCATOR_SIZE, MAX_ALLOCS, MAX_ALLOCS);
+
+    const auto first = allocator.allocate(BLOCK_SIZE);
+    const auto second = allocator.allocate(BLOCK_SIZE);
+    const auto third = allocator.allocate(BLOCK_SIZE);
+    ASSERT_FALSE(first.isNoSpace());
+    ASSERT_FALSE(second.isNoSpace());
+    ASSERT_FALSE(third.isNoSpace());
+
+    EXPECT_EQ(allocator.free(first), BLOCK_SIZE);
+    EXPECT_EQ(allocator.free(third), ALLOCATOR_SIZE - 2 * BLOCK_SIZE);
+    EXPECT_EQ(allocator.free(second), ALLOCATOR_SIZE);
+}
+
+TEST_F(OffsetAllocatorTest, FreeReturnsZeroWhenMetadataCapacityIsExhausted) {
+    constexpr uint32 ALLOCATOR_SIZE = 384;
+    constexpr uint32 MAX_ALLOCS = 3;
+    constexpr uint32 BLOCK_SIZE = 128;
+    __Allocator allocator(ALLOCATOR_SIZE, MAX_ALLOCS, MAX_ALLOCS);
+
+    const auto first = allocator.allocate(BLOCK_SIZE);
+    const auto second = allocator.allocate(BLOCK_SIZE);
+    ASSERT_FALSE(first.isNoSpace());
+    ASSERT_FALSE(second.isNoSpace());
+
+    EXPECT_EQ(allocator.free(first), 0);
+    EXPECT_EQ(allocator.storageReport().largestFreeRegion, 0);
+}
+
 TEST_F(OffsetAllocatorTest,
-       LargestFreeRegionHintTightensOnFailureAndRefreshesOnFree) {
+       LargestFreeRegionHintTightensOnFailureAndRaisesOnFree) {
     constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;
     constexpr uint32 MAX_ALLOCS = 1000;
     auto allocator =
@@ -594,6 +633,50 @@ TEST_F(OffsetAllocatorTest,
     EXPECT_EQ(allocator->getLargestFreeRegion(),
               allocator->storageReport().largestFreeRegion);
     EXPECT_EQ(allocator->getLargestFreeRegion(), ALLOCATOR_SIZE);
+}
+
+TEST_F(OffsetAllocatorTest, HintMaintenanceActivatesOnlyAfterFailure) {
+    constexpr uint32 ALLOCATOR_SIZE = 1024 * 1024;
+    constexpr uint32 MAX_ALLOCS = 1000;
+    auto allocator =
+        OffsetAllocator::create(0, ALLOCATOR_SIZE, MAX_ALLOCS, MAX_ALLOCS);
+
+    EXPECT_FALSE(isLargestFreeRegionHintTightened(allocator));
+    auto handle = allocator->allocate(ALLOCATOR_SIZE / 2);
+    ASSERT_TRUE(handle.has_value());
+    EXPECT_FALSE(isLargestFreeRegionHintTightened(allocator));
+
+    const uint64_t actual_largest =
+        allocator->storageReport().largestFreeRegion;
+    ASSERT_FALSE(allocator->allocate(actual_largest + 1).has_value());
+    EXPECT_TRUE(isLargestFreeRegionHintTightened(allocator));
+
+    handle.reset();
+    EXPECT_FALSE(isLargestFreeRegionHintTightened(allocator));
+    EXPECT_EQ(allocator->getLargestFreeRegion(), ALLOCATOR_SIZE);
+}
+
+TEST_F(OffsetAllocatorTest,
+       HintMaintenanceUsesScaledAllocatorCapacityWhenFullyFreed) {
+    const uint64_t internal_capacity = bin_sizes[NUM_BINS - 1];
+    const uint64_t allocator_size = 2 * internal_capacity + 1;
+    constexpr uint32 MAX_ALLOCS = 1000;
+    auto allocator =
+        OffsetAllocator::create(0, allocator_size, MAX_ALLOCS, MAX_ALLOCS);
+
+    const uint64_t maximum_free_region = allocator->getLargestFreeRegion();
+    ASSERT_LT(maximum_free_region, allocator_size);
+    auto handle = allocator->allocate(maximum_free_region / 2);
+    ASSERT_TRUE(handle.has_value());
+
+    const uint64_t actual_largest =
+        allocator->storageReport().largestFreeRegion;
+    ASSERT_FALSE(allocator->allocate(actual_largest + 1).has_value());
+    ASSERT_TRUE(isLargestFreeRegionHintTightened(allocator));
+
+    handle.reset();
+    EXPECT_FALSE(isLargestFreeRegionHintTightened(allocator));
+    EXPECT_EQ(allocator->getLargestFreeRegion(), maximum_free_region);
 }
 
 TEST_F(OffsetAllocatorTest, ImpossibleAllocationDoesNotAcquireMutex) {

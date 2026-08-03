@@ -173,8 +173,8 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
 
     // Returns a mutex-free atomic upper-bound hint for the largest allocatable
     // free region. The hint may be larger than the current value after a
-    // successful allocation and is tightened on a locked allocation failure
-    // or after free.
+    // successful allocation, is tightened on a locked allocation failure, and
+    // is raised when free creates a larger region.
     [[nodiscard]] uint64_t getLargestFreeRegion() const noexcept {
         return m_largest_free_region.load(std::memory_order_relaxed);
     }
@@ -223,6 +223,7 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     uint64_t m_allocated_size GUARDED_BY(m_mutex) = 0;
     uint64_t m_allocated_num GUARDED_BY(m_mutex) = 0;
     std::atomic<uint64_t> m_largest_free_region{0};
+    bool m_largest_free_region_tightened GUARDED_BY(m_mutex) = false;
 
     // Private constructor - use create() factory method instead
     OffsetAllocator(uint64_t base, size_t size, uint32 init_capacity,
@@ -251,7 +252,9 @@ class __Allocator {
     void reset();
 
     OffsetAllocation allocate(uint32 size);
-    void free(OffsetAllocation allocation);
+    // Returns the size of the newly merged free region, or zero if allocator
+    // metadata capacity still prevents another allocation.
+    uint32 free(OffsetAllocation allocation);
 
     uint32 allocationSize(OffsetAllocation allocation) const;
     OffsetAllocStorageReport storageReport() const;

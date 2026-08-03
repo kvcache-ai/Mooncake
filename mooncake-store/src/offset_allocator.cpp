@@ -284,9 +284,9 @@ OffsetAllocation __Allocator::allocate(uint32 size) {
     return OffsetAllocation(node.dataOffset, nodeIndex);
 }
 
-void __Allocator::free(OffsetAllocation allocation) {
+uint32 __Allocator::free(OffsetAllocation allocation) {
     ASSERT(allocation.metadata != OffsetAllocation::NO_SPACE);
-    if (m_nodes.empty()) return;
+    if (m_nodes.empty()) return 0;
 
     uint32 nodeIndex = allocation.metadata;
     Node& node = m_nodes[nodeIndex];
@@ -348,6 +348,8 @@ void __Allocator::free(OffsetAllocation allocation) {
         m_nodes[combinedNodeIndex].neighborPrev = neighborPrev;
         m_nodes[neighborPrev].neighborNext = combinedNodeIndex;
     }
+
+    return m_freeOffset < m_max_capacity ? size : 0;
 }
 
 uint32 __Allocator::insertNodeIntoBin(uint32 size, uint32 dataOffset) {
@@ -585,12 +587,7 @@ std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(size_t size) {
         return std::nullopt;
     }
 
-    MutexLocker guard(&m_mutex);
-    if (!m_allocator) {
-        return std::nullopt;
-    }
-
-    size_t fake_size =
+    const size_t fake_size =
         m_multiplier_bits > 0
             ? ((size + (static_cast<uint64_t>(1) << m_multiplier_bits) - 1u) >>
                m_multiplier_bits)
@@ -600,17 +597,23 @@ std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(size_t size) {
         return std::nullopt;
     }
 
+    MutexLocker guard(&m_mutex);
+    if (!m_allocator) {
+        return std::nullopt;
+    }
+
     OffsetAllocation allocation = m_allocator->allocate(fake_size);
     if (allocation.isNoSpace()) {
         // A request can pass the conservative hint but still fail because
         // the allocator state changed concurrently. Tighten the hint after
         // observing the authoritative state under the mutex.
         refreshLargestFreeRegion();
-        // Log metrics to help understand why allocation failed
-        // Note: We're already holding m_mutex, so use internal method
-        OffsetAllocatorMetrics metrics = get_metrics_internal();
-        VLOG(1) << "OffsetAllocator allocation failed: size=" << size
-                << ", fake_size=" << fake_size << ", " << metrics;
+        if (VLOG_IS_ON(1)) {
+            // We're already holding m_mutex, so use the internal method.
+            const OffsetAllocatorMetrics metrics = get_metrics_internal();
+            VLOG(1) << "OffsetAllocator allocation failed: size=" << size
+                    << ", fake_size=" << fake_size << ", " << metrics;
+        }
         return std::nullopt;
     }
 
@@ -618,10 +621,14 @@ std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(size_t size) {
     m_allocated_size += size;
     m_allocated_num++;
 
-    // Use shared_from_this to get a shared_ptr to this OffsetAllocator
-    return OffsetAllocationHandle(
-        shared_from_this(), allocation,
-        m_base + (allocation.getOffset() << m_multiplier_bits), size);
+    const uint64_t real_base =
+        m_base + (allocation.getOffset() << m_multiplier_bits);
+    guard.unlock();
+
+    // Handle construction and shared_ptr reference-counting do not access
+    // allocator state and should not extend the serialized critical section.
+    return OffsetAllocationHandle(shared_from_this(), allocation, real_base,
+                                  size);
 }
 
 uint64_t OffsetAllocator::normalizedAllocationSize(size_t size) const {
@@ -694,14 +701,36 @@ void OffsetAllocator::refreshLargestFreeRegion() {
                           << m_multiplier_bits
                     : 0;
     m_largest_free_region.store(largest_free_region, std::memory_order_relaxed);
+    const uint64_t allocator_capacity =
+        m_allocator
+            ? static_cast<uint64_t>(m_allocator->m_size) << m_multiplier_bits
+            : 0;
+    m_largest_free_region_tightened =
+        m_allocator && largest_free_region < allocator_capacity;
 }
 
 void OffsetAllocator::freeAllocation(const OffsetAllocation& allocation,
                                      uint64_t size) {
     MutexLocker lock(&m_mutex);
     if (m_allocator) {
-        m_allocator->free(allocation);
-        refreshLargestFreeRegion();
+        const uint64_t freed_region =
+            static_cast<uint64_t>(m_allocator->free(allocation))
+            << m_multiplier_bits;
+        if (m_largest_free_region_tightened) {
+            // Before free, the hint is an upper bound for every existing free
+            // region. Only the newly merged region can raise that bound.
+            const uint64_t current_hint =
+                m_largest_free_region.load(std::memory_order_relaxed);
+            if (freed_region > current_hint) {
+                m_largest_free_region.store(freed_region,
+                                            std::memory_order_relaxed);
+            }
+            const uint64_t allocator_capacity =
+                static_cast<uint64_t>(m_allocator->m_size) << m_multiplier_bits;
+            if (freed_region >= allocator_capacity) {
+                m_largest_free_region_tightened = false;
+            }
+        }
         // Update lightweight metrics.  Saturate instead of wrapping:
         // recovery may free nodes whose exact requested size is unknown
         // (corrupt record), and an unsigned underflow would poison the
