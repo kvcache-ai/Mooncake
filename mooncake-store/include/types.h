@@ -472,7 +472,7 @@ struct NoFSegment {
     std::string te_endpoint{};
     NoFSegment() = default;
 };
-YLT_REFL(NoFSegment, id, name, base, size, te_endpoint);
+YLT_REFL(NoFSegment, id, name, base, size, block_size, te_endpoint);
 
 /**
  * @brief Client status from the master's perspective
