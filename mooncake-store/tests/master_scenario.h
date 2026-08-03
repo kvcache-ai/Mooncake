@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <optional>
@@ -34,6 +35,8 @@ struct PutStartAction {
     uint64_t size;
     std::string actor{"default"};
     std::optional<ErrorCode> expected_error{};
+    std::optional<size_t> expected_replica_count{};
+    std::optional<ReplicaStatus> expected_replica_status{};
 
     PutStartAction& By(std::string value) {
         actor = std::move(value);
@@ -42,6 +45,16 @@ struct PutStartAction {
 
     PutStartAction& ExpectError(ErrorCode value) {
         expected_error = value;
+        return *this;
+    }
+
+    PutStartAction& ExpectReplicas(size_t value) {
+        expected_replica_count = value;
+        return *this;
+    }
+
+    PutStartAction& ExpectStatus(ReplicaStatus value) {
+        expected_replica_status = value;
         return *this;
     }
 };
@@ -66,12 +79,65 @@ struct PutEndAction {
 
 PutEndAction PutEnd(std::string key);
 
-struct ObjectSpec {
+struct PutRevokeAction {
     std::string key;
-    bool expected_readable{false};
+    std::string actor{"default"};
+    std::optional<ErrorCode> expected_error{};
+
+    PutRevokeAction& By(std::string value) {
+        actor = std::move(value);
+        return *this;
+    }
+
+    PutRevokeAction& ExpectError(ErrorCode value) {
+        expected_error = value;
+        return *this;
+    }
+};
+
+PutRevokeAction PutRevoke(std::string key);
+
+struct RemoveAction {
+    std::string key;
+    std::optional<ErrorCode> expected_error{};
+
+    RemoveAction& ExpectError(ErrorCode value) {
+        expected_error = value;
+        return *this;
+    }
+};
+
+RemoveAction Remove(std::string key);
+
+struct ObjectSpec {
+    enum class Readability {
+        UNSPECIFIED,
+        READABLE,
+        NOT_READY,
+    };
+
+    std::string key;
+    Readability readability{Readability::UNSPECIFIED};
+    std::optional<size_t> expected_replica_count{};
+    std::optional<size_t> expected_complete_replica_count{};
 
     ObjectSpec& IsReadable() {
-        expected_readable = true;
+        readability = Readability::READABLE;
+        return *this;
+    }
+
+    ObjectSpec& IsNotReady() {
+        readability = Readability::NOT_READY;
+        return *this;
+    }
+
+    ObjectSpec& HasReplicas(size_t value) {
+        expected_replica_count = value;
+        return *this;
+    }
+
+    ObjectSpec& HasCompleteReplicas(size_t value) {
+        expected_complete_replica_count = value;
         return *this;
     }
 };
@@ -89,6 +155,8 @@ class MasterScenario {
     MasterScenario& Given(MemoryNodeSpec node);
     MasterScenario& When(PutStartAction action);
     MasterScenario& When(PutEndAction action);
+    MasterScenario& When(PutRevokeAction action);
+    MasterScenario& When(RemoveAction action);
     MasterScenario& Then(ObjectSpec object);
 
    private:

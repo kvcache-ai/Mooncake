@@ -42,6 +42,10 @@ PutStartAction PutStart(std::string key, uint64_t size) {
 
 PutEndAction PutEnd(std::string key) { return {.key = std::move(key)}; }
 
+PutRevokeAction PutRevoke(std::string key) { return {.key = std::move(key)}; }
+
+RemoveAction Remove(std::string key) { return {.key = std::move(key)}; }
+
 ObjectSpec Object(std::string key) { return {.key = std::move(key)}; }
 
 MasterScenario::MasterScenario(std::string name) : name_(std::move(name)) {}
@@ -85,6 +89,21 @@ MasterScenario& MasterScenario::When(PutStartAction action) {
     ValidateActionResult("PutStart(" + action.key + ")", action.expected_error,
                          result.has_value(),
                          result ? ErrorCode::OK : result.error());
+    if (!result) {
+        return *this;
+    }
+    if (action.expected_replica_count.has_value() &&
+        result->size() != *action.expected_replica_count) {
+        Fail("PutStart(" + action.key + ") returned " +
+             std::to_string(result->size()) + " replicas; expected " +
+             std::to_string(*action.expected_replica_count));
+    }
+    if (action.expected_replica_status.has_value() &&
+        std::any_of(result->begin(), result->end(), [&](const auto& replica) {
+            return replica.status != *action.expected_replica_status;
+        })) {
+        Fail("PutStart(" + action.key + ") replica status mismatch");
+    }
     return *this;
 }
 
@@ -102,22 +121,77 @@ MasterScenario& MasterScenario::When(PutEndAction action) {
     return *this;
 }
 
+MasterScenario& MasterScenario::When(PutRevokeAction action) {
+    if (!EnsureService()) {
+        return *this;
+    }
+
+    const auto result =
+        service_->PutRevoke(ActorId(action.actor), action.key,
+                            TenantId::Default(), ReplicaType::MEMORY);
+    ValidateActionResult("PutRevoke(" + action.key + ")", action.expected_error,
+                         result.has_value(),
+                         result ? ErrorCode::OK : result.error());
+    return *this;
+}
+
+MasterScenario& MasterScenario::When(RemoveAction action) {
+    if (!EnsureService()) {
+        return *this;
+    }
+
+    const auto result = service_->Remove(action.key, TenantId::Default());
+    ValidateActionResult("Remove(" + action.key + ")", action.expected_error,
+                         result.has_value(),
+                         result ? ErrorCode::OK : result.error());
+    return *this;
+}
+
 MasterScenario& MasterScenario::Then(ObjectSpec object) {
     if (!EnsureService()) {
         return *this;
     }
-    if (!object.expected_readable) {
+    if (object.readability == ObjectSpec::Readability::UNSPECIFIED &&
+        !object.expected_replica_count.has_value() &&
+        !object.expected_complete_replica_count.has_value()) {
         Fail("Object(" + object.key + ") has no assertion");
         return *this;
     }
 
     const auto result =
         service_->GetReplicaList(object.key, TenantId::Default());
+    if (object.readability == ObjectSpec::Readability::NOT_READY) {
+        if (result || result.error() != ErrorCode::REPLICA_IS_NOT_READY) {
+            Fail("Object(" + object.key + ") was expected to be not ready");
+        }
+        return *this;
+    }
     if (!result) {
         Fail("Object(" + object.key +
              ") is not readable: " + toString(result.error()));
-    } else if (result->replicas.empty()) {
+        return *this;
+    }
+    if (object.readability == ObjectSpec::Readability::READABLE &&
+        result->replicas.empty()) {
         Fail("Object(" + object.key + ") has no readable replicas");
+    }
+    if (object.expected_replica_count.has_value() &&
+        result->replicas.size() != *object.expected_replica_count) {
+        Fail("Object(" + object.key + ") has " +
+             std::to_string(result->replicas.size()) + " replicas; expected " +
+             std::to_string(*object.expected_replica_count));
+    }
+    if (object.expected_complete_replica_count.has_value()) {
+        const size_t complete =
+            std::count_if(result->replicas.begin(), result->replicas.end(),
+                          [](const auto& replica) {
+                              return replica.status == ReplicaStatus::COMPLETE;
+                          });
+        if (complete != *object.expected_complete_replica_count) {
+            Fail("Object(" + object.key + ") has " + std::to_string(complete) +
+                 " complete replicas; expected " +
+                 std::to_string(*object.expected_complete_replica_count));
+        }
     }
     return *this;
 }
