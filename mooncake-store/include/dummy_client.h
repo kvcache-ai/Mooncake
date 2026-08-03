@@ -76,10 +76,7 @@ class DummyClient : public PyClient {
                                         const std::vector<size_t> &sizes);
 
     std::vector<int64_t> batch_get_into_cuda_ipc(
-        const std::vector<std::string> &keys,
-        const std::vector<CudaIpcBufferHandle> &dst_buffers,
-        const std::vector<size_t> &src_offsets,
-        const std::vector<size_t> &sizes);
+        const std::vector<CudaIpcReadRequest> &requests);
 
     std::vector<int> batch_get_into_multi_buffers(
         const std::vector<std::string> &keys,
@@ -107,10 +104,7 @@ class DummyClient : public PyClient {
         const ReplicateConfig &config = ReplicateConfig{});
 
     std::vector<int> batch_put_from_cuda_ipc(
-        const std::vector<std::string> &keys,
-        const std::vector<void *> &metadata_buffers,
-        const std::vector<size_t> &metadata_sizes,
-        const std::vector<CudaIpcBufferHandle> &payloads,
+        const std::vector<CudaIpcWriteRequest> &requests,
         const ReplicateConfig &config = ReplicateConfig{});
 
     std::shared_ptr<BufferHandle> get_buffer(const std::string &key);

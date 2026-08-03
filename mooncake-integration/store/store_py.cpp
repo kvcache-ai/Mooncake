@@ -816,15 +816,9 @@ class MooncakeStorePyWrapper {
         }
 
         auto metadata = batch_get_tensor_metadata_prefixes(keys, context);
-        std::vector<std::string> valid_keys;
-        std::vector<CudaIpcBufferHandle> dst_buffers;
-        std::vector<size_t> src_offsets;
-        std::vector<size_t> sizes;
+        std::vector<CudaIpcReadRequest> read_requests;
         std::vector<size_t> original_indices;
-        valid_keys.reserve(keys.size());
-        dst_buffers.reserve(keys.size());
-        src_offsets.reserve(keys.size());
-        sizes.reserve(keys.size());
+        read_requests.reserve(keys.size());
         original_indices.reserve(keys.size());
 
         for (size_t i = 0; i < keys.size(); ++i) {
@@ -847,21 +841,23 @@ class MooncakeStorePyWrapper {
                            << "for key " << keys[i];
                 continue;
             }
-            valid_keys.push_back(keys[i]);
-            dst_buffers.push_back(*dst_buffer);
-            src_offsets.push_back(metadata[i]->data_offset);
-            sizes.push_back(metadata[i]->data_bytes);
+            read_requests.push_back(CudaIpcReadRequest{
+                .key = keys[i],
+                .destination = *dst_buffer,
+                .source_offset = metadata[i]->data_offset,
+                .size = metadata[i]->data_bytes,
+            });
             original_indices.push_back(i);
         }
 
-        if (!valid_keys.empty()) {
+        if (!read_requests.empty()) {
             std::vector<int64_t> op_results;
             {
                 py::gil_scoped_release release_gil;
                 auto dummy_client =
                     std::static_pointer_cast<DummyClient>(store_);
-                op_results = dummy_client->batch_get_into_cuda_ipc(
-                    valid_keys, dst_buffers, src_offsets, sizes);
+                op_results =
+                    dummy_client->batch_get_into_cuda_ipc(read_requests);
             }
             apply_indexed_results(context.c_str(), op_results, original_indices,
                                   results);

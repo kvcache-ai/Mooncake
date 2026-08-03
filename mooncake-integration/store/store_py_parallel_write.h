@@ -22,16 +22,10 @@ std::optional<std::vector<int>> try_dummy_cuda_ipc_batch_put_tensor_impl(
     std::vector<int> results(keys.size(), 0);
     py::gil_scoped_release release_gil;
 
-    std::vector<std::string> valid_keys;
-    std::vector<void *> metadata_buffers;
-    std::vector<size_t> metadata_sizes;
-    std::vector<CudaIpcBufferHandle> payloads;
+    std::vector<CudaIpcWriteRequest> write_requests;
     std::vector<size_t> original_indices;
     std::vector<std::unique_ptr<BufferHandle>> metadata_allocations;
-    valid_keys.reserve(infos.size());
-    metadata_buffers.reserve(infos.size());
-    metadata_sizes.reserve(infos.size());
-    payloads.reserve(infos.size());
+    write_requests.reserve(infos.size());
     original_indices.reserve(infos.size());
     metadata_allocations.reserve(infos.size());
 
@@ -55,22 +49,26 @@ std::optional<std::vector<int>> try_dummy_cuda_ipc_batch_put_tensor_impl(
         }
 
         std::memcpy(metadata->ptr(), &infos[i].metadata, metadata_size);
-        valid_keys.push_back(keys[i]);
-        metadata_buffers.push_back(metadata->ptr());
-        metadata_sizes.push_back(metadata_size);
-        payloads.push_back(*payload);
+        write_requests.push_back(CudaIpcWriteRequest{
+            .key = keys[i],
+            .metadata =
+                CudaIpcShmBufferRef{
+                    .ptr = reinterpret_cast<uint64_t>(metadata->ptr()),
+                    .size = static_cast<uint64_t>(metadata_size),
+                },
+            .payload = *payload,
+        });
         original_indices.push_back(i);
         metadata_allocations.push_back(
             std::make_unique<BufferHandle>(std::move(*metadata)));
     }
 
-    if (!valid_keys.empty()) {
+    if (!write_requests.empty()) {
         ReplicateConfig write_config =
             MakeIndexedConfig(config, original_indices);
         auto dummy_client = std::static_pointer_cast<DummyClient>(store_);
-        std::vector<int> op_results = dummy_client->batch_put_from_cuda_ipc(
-            valid_keys, metadata_buffers, metadata_sizes, payloads,
-            write_config);
+        std::vector<int> op_results =
+            dummy_client->batch_put_from_cuda_ipc(write_requests, write_config);
         if (!apply_indexed_results("put", op_results, original_indices,
                                    results)) {
             return results;
