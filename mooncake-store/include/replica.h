@@ -192,7 +192,9 @@ struct MemoryDescriptor {
 
 struct NoFDescriptor {
     AllocatedBuffer::Descriptor buffer_descriptor;
-    YLT_REFL(NoFDescriptor, buffer_descriptor);
+    uint64_t object_size{0};
+    uint32_t block_size{0};
+    YLT_REFL(NoFDescriptor, buffer_descriptor, object_size, block_size);
 };
 
 struct DiskDescriptor {

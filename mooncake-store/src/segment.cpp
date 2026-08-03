@@ -1305,9 +1305,9 @@ ErrorCode ScopedNoFSegmentAccess::MountSegment(const NoFSegment& segment,
     }
 
     if (nof_segment_manager_->block_size_ != 0 &&
-        nof_segment_manager_->block_size_ != block_size) {
+        nof_segment_manager_->block_size_ != segment.block_size) {
         LOG(ERROR) << "NoF segment block size differs from pool"
-                   << ", segment=" << block_size
+                   << ", segment=" << segment.block_size
                    << ", pool=" << nof_segment_manager_->block_size_;
         return ErrorCode::INVALID_PARAMS;
     }
@@ -1390,7 +1390,7 @@ ErrorCode ScopedNoFSegmentAccess::MountSegment(const NoFSegment& segment,
         segment, client_id, SegmentStatus::OK, std::move(allocator)};
     nof_segment_manager_->client_by_name_[segment.name] = client_id;
     if (nof_segment_manager_->block_size_ == 0) {
-        nof_segment_manager_->block_size_ = block_size;
+        nof_segment_manager_->block_size_ = segment.block_size;
     }
     MasterMetricManager::instance().inc_total_nof_capacity(segment.name, size);
 
