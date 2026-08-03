@@ -12,27 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Regression test for RdmaTransport::submitTransferTask()'s
-// "memory region not registered" (!found_device) error path: a slice that
+// Regression tests for RdmaTransport::submitTransferTask()'s
+// "memory region not registered" (!found_device) error path. A slice that
 // already succeeded device selection and was queued into the function-local
-// slices_to_post accumulator must not be deallocated a second time when a
-// later slice in the same call fails device selection, since it is already
-// owned (and will be freed exactly once) by its TransferTask::slice_list.
-//
-// This exercises the real, unmodified RdmaTransport::submitTransferTask()
-// entry point. It avoids needing a real RDMA device by using a bare
-// RdmaContext (construct() never called): submitTransferTask() only checks
-// RdmaContext::active(), which defaults to true, for slices that fail device
-// selection.
-//
-// Every request here is a *single* TransferTask whose length spans two
-// slice_size blocks: the first offset resolves inside the registered
-// buffer (succeeds, queued into slices_to_post), and the second offset
-// starts exactly at the buffer's end (fails every retry). This reproduces
-// the bug with a single task instead of a task pair, so the only slices
-// touching ThreadLocalSliceCache belong to the one task under test -- no
-// second task's own slice churns through the shared cache and disturbs the
-// recycling queue's ordering.
+// slices_to_post accumulator remains owned by TransferTask::slice_list. It
+// must not be deallocated twice, and it must reach a terminal FAILED state if
+// a later slice causes submitTransferTask() to return an error.
 
 #include <gtest/gtest.h>
 
@@ -80,9 +65,6 @@ class SubmitTransferTaskTest : public ::testing::Test {
         BufferDesc buffer;
         buffer.name = "cpu:0";
         buffer.addr = kBufferAddr;
-        // Exactly one slice_size: a request longer than this has its first
-        // slice land fully inside the buffer and its second slice start
-        // exactly at the (unregistered) byte past the end.
         buffer.length = block_size_;
         buffer.lkey = {1};
         buffer.rkey = {1};
@@ -93,19 +75,8 @@ class SubmitTransferTaskTest : public ::testing::Test {
                                    std::move(desc));
     }
 
-    // Submits one task whose request spans 2 slice_size blocks starting at
-    // kBufferAddr. The first slice (offset 0) resolves inside the
-    // registered buffer and succeeds; the second slice (offset
-    // block_size_) starts past the buffer's end and fails every retry, so
-    // the call always returns early via the !found_device branch -- before
-    // ever reaching the end-of-function flush that would otherwise call
-    // into the (unconstructed, null) WorkerPool.
-    //
-    // `req`/`task` are owned by the caller and deliberately left alive on
-    // return, so the caller controls exactly when (if ever) the task's
-    // slices are returned to ThreadLocalSliceCache.
-    void triggerBug(Transport::TransferRequest &req,
-                    Transport::TransferTask &task) {
+    void triggerError(Transport::TransferRequest &req,
+                      Transport::TransferTask &task) {
         req.opcode = Transport::TransferRequest::WRITE;
         req.source = reinterpret_cast<void *>(kBufferAddr);
         req.length = 2 * block_size_;
@@ -113,67 +84,85 @@ class SubmitTransferTaskTest : public ::testing::Test {
         req.target_offset = 0;
         task.request = &req;
 
+        // markFailed() needs a valid BatchDesc in event-driven builds. The
+        // direct task is deliberately not inserted into that BatchDesc; the ID
+        // is only used by Slice::check_batch_completion().
+        task.batch_id = transport_->allocateBatchID(1);
         auto status = transport_->submitTransferTask({&task});
         EXPECT_FALSE(status.ok());
         EXPECT_TRUE(status.IsAddressNotRegistered());
-        // slice_list[0]: the first slice, in-buffer, succeeded and was
-        // queued into slices_to_post -- the victim of the bug.
-        // slice_list[1]: the second slice, out-of-buffer, failed and
-        // triggered the (buggy) cleanup; never added to slices_to_post,
-        // so it is not itself double-freed.
         ASSERT_EQ(task.slice_list.size(), 2u);
+        EXPECT_EQ(transport_->freeBatchID(task.batch_id), Status::OK());
     }
 };
 
-// task1's first slice is queued for reuse twice in a row, with nothing else
-// touching the cache in between: once by the buggy manual deallocate()
-// inside submitTransferTask() (while task1 is still alive), and again by
-// task1's own ~TransferTask() moments later. The recycling cache now holds
-// two entries for that single object.
-//
-// task2's own call then draws from that corrupted cache twice in a row (its
-// offset-0 slice, then its offset-block_size slice): with a correctly
-// single-registered cache, task1's two slices (each freed exactly once)
-// supply exactly two distinct pool entries, so task2's two independent
-// draws come back as two distinct Slice objects -- one reusing task1's
-// first slice, the other reusing its second. With the duplicate
-// registration, both draws instead return task1's original object --
-// proving it was freed more than once, purely by pointer comparison, with
-// no forced crash or process teardown required. EXPECT_EQ(task2[0], original)
-// is not itself the bug signal (a *single* legitimate free of `original`
-// would also make the very next allocation reuse it); it exists to
-// document that task2 is
-// indeed the one hitting the corrupted state before the discriminating
-// check below.
-TEST_F(SubmitTransferTaskTest, FoundDeviceFailureFreesSliceTwice) {
+TEST_F(SubmitTransferTaskTest, NoDuplicateSlice) {
     Transport::Slice *original = nullptr;
     {
-        Transport::TransferRequest req1;
-        Transport::TransferTask task1;
-        triggerBug(req1, task1);
-        original = task1.slice_list[0];
-        // task1 destroyed here: ~TransferTask() deallocate()s both of its
-        // slices, including `original` a second time -- immediately after
-        // the buggy manual deallocate() inside submitTransferTask() already
-        // did so once, with nothing else in between since this task's own
-        // second (failed) slice was never added to slices_to_post and so
-        // was never touched by the bug.
+        Transport::TransferRequest req;
+        Transport::TransferTask task;
+        triggerError(req, task);
+        original = task.slice_list[0];
     }
 
-    Transport::TransferRequest req2;
-    Transport::TransferTask task2;
-    triggerBug(req2, task2);
+    Transport::TransferRequest req;
+    Transport::TransferTask task;
+    triggerError(req, task);
 
-    EXPECT_EQ(task2.slice_list[0], original)
-        << "sanity check: the cache should have at least one legitimate "
-           "reuse of `original` queued up regardless of the bug";
-    EXPECT_NE(task2.slice_list[0], task2.slice_list[1])
-        << "task2's two slices cover disjoint offsets of the same request "
-           "and must never be backed by the same Slice object; "
-           "submitTransferTask() double-freed task1's slice on its "
-           "!found_device error path, so the recycling cache handed the "
-           "exact same, still-conceptually-owned pointer out twice in a "
-           "row for what should have been two independent allocations";
+    EXPECT_EQ(task.slice_list[0], original)
+        << "the cache should legitimately reuse the first released slice";
+    EXPECT_NE(task.slice_list[0], task.slice_list[1])
+        << "two independent slices must never share the same Slice object";
+}
+
+TEST_F(SubmitTransferTaskTest, PartialSubmitFailsBatch) {
+    auto batch_id = transport_->allocateBatchID(1);
+    Transport::TransferRequest request;
+    request.opcode = Transport::TransferRequest::WRITE;
+    request.source = reinterpret_cast<void *>(kBufferAddr);
+    request.length = 2 * block_size_;
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = 0;
+
+    auto submit_status = transport_->submitTransfer(batch_id, {request});
+    ASSERT_FALSE(submit_status.ok());
+    ASSERT_TRUE(submit_status.IsAddressNotRegistered());
+
+    Transport::TransferStatus transfer_status;
+    ASSERT_EQ(transport_->getTransferStatus(batch_id, 0, transfer_status),
+              Status::OK());
+    EXPECT_EQ(transfer_status.s, Transport::TransferStatusEnum::FAILED);
+    EXPECT_EQ(transport_->freeBatchID(batch_id), Status::OK());
+}
+
+TEST_F(SubmitTransferTaskTest, PartialSubmitFailsAllTasks) {
+    auto batch_id = transport_->allocateBatchID(2);
+    Transport::TransferRequest failing_request;
+    failing_request.opcode = Transport::TransferRequest::WRITE;
+    failing_request.source = reinterpret_cast<void *>(kBufferAddr);
+    failing_request.length = 2 * block_size_;
+    failing_request.target_id = LOCAL_SEGMENT_ID;
+    failing_request.target_offset = 0;
+
+    Transport::TransferRequest unstarted_request;
+    unstarted_request.opcode = Transport::TransferRequest::WRITE;
+    unstarted_request.source = reinterpret_cast<void *>(kBufferAddr);
+    unstarted_request.length = block_size_;
+    unstarted_request.target_id = LOCAL_SEGMENT_ID;
+    unstarted_request.target_offset = kBufferAddr;
+
+    auto submit_status = transport_->submitTransfer(
+        batch_id, {failing_request, unstarted_request});
+    ASSERT_FALSE(submit_status.ok());
+    ASSERT_TRUE(submit_status.IsAddressNotRegistered());
+
+    std::vector<Transport::TransferStatus> transfer_status;
+    ASSERT_EQ(transport_->getTransferStatus(batch_id, transfer_status),
+              Status::OK());
+    ASSERT_EQ(transfer_status.size(), 2u);
+    EXPECT_EQ(transfer_status[0].s, Transport::TransferStatusEnum::FAILED);
+    EXPECT_EQ(transfer_status[1].s, Transport::TransferStatusEnum::FAILED);
+    EXPECT_EQ(transport_->freeBatchID(batch_id), Status::OK());
 }
 
 }  // namespace

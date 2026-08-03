@@ -347,6 +347,98 @@ TEST(TransferMetadataPublicationTest, PreservesLocalOnlyBufferWithoutRkey) {
     EXPECT_TRUE(remote_desc->buffers[1].rkey.empty());
 }
 
+// A peer descriptor whose key vector is longer than its device list lets the
+// topology-selected device_id pass the rkey bound in selectPeerDevice() and
+// still index devices[] out of bounds. Such a descriptor must be rejected at
+// decode time.
+TEST(TransferMetadataValidationTest, RejectsMoreKeysThanDevices) {
+    constexpr uint64_t kRemoteAddr = 0x1000;
+    constexpr size_t kKeyCount = 64;
+
+    TransferMetadata server(P2PHANDSHAKE);
+    TransferMetadata client(P2PHANDSHAKE);
+
+    int sockfd = -1;
+    const uint16_t port = findAvailableTcpPort(sockfd);
+    ASSERT_GT(port, 0);
+    const std::string remote_segment_name = "127.0.0.1:" + std::to_string(port);
+
+    auto server_desc = makeRdmaSegmentDesc(remote_segment_name, kRemoteAddr);
+    ASSERT_EQ(server_desc->devices.size(), 1u);
+    auto& buffer = server_desc->buffers[0];
+    while (buffer.rkey.size() < kKeyCount) {
+        buffer.lkey.push_back(1);
+        buffer.rkey.push_back(2);
+    }
+    ASSERT_EQ(server.addLocalSegment(LOCAL_SEGMENT_ID, remote_segment_name,
+                                     std::move(server_desc)),
+              0);
+
+    TransferMetadata::RpcMetaDesc rpc_desc;
+    rpc_desc.ip_or_host_name = "127.0.0.1";
+    rpc_desc.rpc_port = port;
+    rpc_desc.sockfd = sockfd;
+    ASSERT_EQ(server.addRpcMetaEntry(remote_segment_name, rpc_desc), 0);
+
+    ASSERT_EQ(
+        client.addLocalSegment(LOCAL_SEGMENT_ID, "127.0.0.1:0",
+                               makeRdmaSegmentDesc("127.0.0.1:0", 0x3000)),
+        0);
+
+    EXPECT_EQ(client.getSegmentID(remote_segment_name),
+              static_cast<TransferMetadata::SegmentID>(-1));
+}
+
+// The multi-NIC case a real publisher produces: one key per device. It must
+// still decode.
+TEST(TransferMetadataValidationTest, AcceptsOneKeyPerDevice) {
+    constexpr uint64_t kRemoteAddr = 0x1000;
+    constexpr size_t kDeviceCount = 4;
+
+    TransferMetadata server(P2PHANDSHAKE);
+    TransferMetadata client(P2PHANDSHAKE);
+
+    int sockfd = -1;
+    const uint16_t port = findAvailableTcpPort(sockfd);
+    ASSERT_GT(port, 0);
+    const std::string remote_segment_name = "127.0.0.1:" + std::to_string(port);
+
+    auto server_desc = makeRdmaSegmentDesc(remote_segment_name, kRemoteAddr);
+    auto& buffer = server_desc->buffers[0];
+    while (server_desc->devices.size() < kDeviceCount) {
+        TransferMetadata::DeviceDesc device_desc;
+        device_desc.name =
+            "mlx5_" + std::to_string(server_desc->devices.size());
+        device_desc.lid = 1;
+        device_desc.gid = "00000000000000000000ffff7f000001";
+        server_desc->devices.push_back(device_desc);
+        buffer.lkey.push_back(1);
+        buffer.rkey.push_back(2);
+    }
+    ASSERT_EQ(buffer.rkey.size(), kDeviceCount);
+    ASSERT_EQ(server.addLocalSegment(LOCAL_SEGMENT_ID, remote_segment_name,
+                                     std::move(server_desc)),
+              0);
+
+    TransferMetadata::RpcMetaDesc rpc_desc;
+    rpc_desc.ip_or_host_name = "127.0.0.1";
+    rpc_desc.rpc_port = port;
+    rpc_desc.sockfd = sockfd;
+    ASSERT_EQ(server.addRpcMetaEntry(remote_segment_name, rpc_desc), 0);
+
+    ASSERT_EQ(
+        client.addLocalSegment(LOCAL_SEGMENT_ID, "127.0.0.1:0",
+                               makeRdmaSegmentDesc("127.0.0.1:0", 0x3000)),
+        0);
+
+    const auto segment_id = client.getSegmentID(remote_segment_name);
+    ASSERT_NE(segment_id, static_cast<TransferMetadata::SegmentID>(-1));
+    auto remote_desc = client.getSegmentDescByID(segment_id, true);
+    ASSERT_NE(remote_desc, nullptr);
+    EXPECT_EQ(remote_desc->devices.size(), kDeviceCount);
+    EXPECT_EQ(remote_desc->buffers[0].rkey.size(), kDeviceCount);
+}
+
 TEST(HandshakeFrameTest, ValidFrameRoundTrips) {
     int fds[2];
     ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);

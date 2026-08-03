@@ -243,7 +243,24 @@ void setTransferEnginePy(pybind11::object engine_obj) {
     g_ctx.engine_initialized = true;
 }
 
+void shutdownProcessContext() {
+    if (g_ctx.agent_host) g_ctx.agent_host->shutdown();
+    // AgentHost::shutdown stops the control plane. Finish LinkManager's
+    // resource release before Python tears down an injected TransferEngine.
+    g_ctx.link_manager.shutdown();
+    g_ctx.agent_host.reset();
+    if (g_ctx.coordinator_host) g_ctx.coordinator_host->shutdown();
+    g_ctx.coordinator_host.reset();
+    g_ctx.external_engine = nullptr;
+    g_ctx.engine = nullptr;
+}
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    // Python atexit handlers run while module globals still own an injected
+    // TransferEngine. Py_AtExit is too late: CPython may have already decref'd
+    // the Python TE wrapper before invoking its native exit handlers.
+    py::module_::import("atexit").attr("register")(
+        py::cpp_function(&shutdownProcessContext));
     m.def("createMooncakeBackend", &createMooncakeBackend);
     m.def("createMooncakeCpuBackend", &createMooncakeCpuBackend);
     m.def("set_host_ip", [](const std::string& host) { g_ctx.host_ip = host; });

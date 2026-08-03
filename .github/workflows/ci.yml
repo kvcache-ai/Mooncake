@@ -161,28 +161,30 @@ jobs:
         DEFAULT_KV_LEASE_TTL=500 ./mooncake-store/tests/task_integration_test --gtest_filter='TaskExecutorIntegrationTest.DrainJobCompleteFlow'
       shell: bash
 
-    - name: Generate Python version tag
-      id: generate_tag_build
-      run: |
-        echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
-      shell: bash
-
-    # In CI, build_wheel.sh removes build/ to free disk (CI=true); set FREE_BUILD_DIR=1 locally to enable.
-    - name: Build Python wheel
-      run: |
-        PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ steps.generate_tag_build.outputs.python_version_tag }} ./scripts/build_wheel.sh
-      shell: bash
-
-    - name: Upload wheel for ZMQ test job
-      uses: actions/upload-artifact@v4
-      with:
-        name: wheel-build-py${{ steps.generate_tag_build.outputs.python_version_tag }}
-        path: mooncake-wheel/dist-py${{ steps.generate_tag_build.outputs.python_version_tag }}/*.whl
+  # Build the artifact tested below through the exact release wheel path. The
+  # Ubuntu jobs remain consumer tests, not an alternate wheel build environment.
+  build-wheel:
+    needs: [spell-check, clang-format, check-paths]
+    if: *run-ci-for-source-changes
+    uses: ./.github/workflows/_build-wheel.yaml
+    with:
+      runner: ubuntu-22.04
+      container: pytorch/manylinux2_28-builder:cuda12.8
+      python-versions: '["3.10", "3.12"]'
+      cuda: container
+      torch-cuda-arch-list: '8.0;9.0'
+      ep-torch-versions: '2.11.0;2.12.0;2.12.1;2.13.0'
+      build-nvlink-allocator: true
+      cmake-args: >-
+        -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON
+        -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
+      artifact-prefix: mooncake-wheel-ci
+      version-override: 0.0.0.dev0
 
   test-wheel-ubuntu:
-    needs: [spell-check, clang-format, build-flags]
+    needs: [spell-check, clang-format, build-wheel]
     if: >-
-      needs.build-flags.result == 'success' &&
+      needs.build-wheel.result == 'success' &&
       (github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch' ||
        github.event.action == 'opened' ||
@@ -211,7 +213,7 @@ jobs:
     - name: Download wheel artifact
       uses: actions/download-artifact@v4
       with:
-        name: mooncake-wheel-ubuntu-py${{ steps.generate_tag_test.outputs.python_version_tag }}
+        name: mooncake-wheel-ci-py${{ steps.generate_tag_test.outputs.python_version_tag }}
         path: mooncake-wheel/dist
 
     - name: Verify wheel file exists
@@ -568,23 +570,6 @@ jobs:
       shell: bash
       run: ${SCCACHE_PATH} --show-stats
 
-    - name: Generate Python version tag
-      id: generate_tag_flags
-      run: |
-        echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> $GITHUB_OUTPUT
-      shell: bash
-
-    # In CI, build_wheel.sh removes build/ to free disk (CI=true); set FREE_BUILD_DIR=1 locally to enable.
-    - name: Build Python wheel
-      run: |
-        PYTHON_VERSION=${{ matrix.python-version }} OUTPUT_DIR=dist-py${{ steps.generate_tag_flags.outputs.python_version_tag }} ./scripts/build_wheel.sh
-      shell: bash
-
-    - name: Upload Python wheel artifact
-      uses: actions/upload-artifact@v4
-      with:
-        name: mooncake-wheel-ubuntu-py${{ steps.generate_tag_flags.outputs.python_version_tag }}
-        path: mooncake-wheel/dist-py${{ steps.generate_tag_flags.outputs.python_version_tag }}/*.whl
 
   spell-check:
     name: Spell Check with Typos
@@ -644,7 +629,7 @@ jobs:
           fi
         fi
         echo "Comparing against: ${BASE_REF}"
-        ./scripts/code_format.sh --check --base "${BASE_REF}"
+        ./scripts/code_format.sh --check --changed-lines --base "${BASE_REF}"
       shell: bash
 
 
@@ -735,6 +720,18 @@ jobs:
     needs: [spell-check, clang-format, check-paths]
     if: *run-ci-for-source-changes
     uses: ./.github/workflows/ci_efa.yml
+    secrets: inherit
+
+  build-wheel-rocm:
+    needs: [spell-check, clang-format, check-paths]
+    if: >-
+      (needs.check-paths.outputs.should-run-downstream == 'true' ||
+       github.event_name == 'workflow_dispatch') &&
+      (github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch' ||
+       github.event.action == 'opened' ||
+       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+    uses: ./.github/workflows/ci_rocm.yml
     secrets: inherit
 
   integration-test:
@@ -853,10 +850,12 @@ jobs:
       - clang-format
       - docs-check
       - build
+      - build-wheel
       - build-flags
       - test-wheel-ubuntu
       - build-wheel-cu13
       - build-wheel-efa
+      - build-wheel-rocm
       - tent-ci
       - integration-test
     runs-on: ubuntu-latest

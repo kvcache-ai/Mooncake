@@ -386,8 +386,8 @@ WrappedMasterService::PutStart(const UUID& client_id, const std::string& key,
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
-    const UUID& client_id, const std::string& key, ReplicaType replica_type,
-    const std::string& tenant_id) {
+    const UUID& client_id, const ObjectMeta& object_meta,
+    ReplicaType replica_type, const std::string& tenant_id) {
     return execute_rpc(
         "PutEnd",
         [&] {
@@ -396,12 +396,12 @@ tl::expected<void, ErrorCode> WrappedMasterService::PutEnd(
                                          : TenantId::kDefaultValue,
                                      [&](const TenantId& resolved_tenant_id) {
                                          return master_service_.PutEnd(
-                                             client_id, key, resolved_tenant_id,
-                                             replica_type);
+                                             client_id, object_meta,
+                                             resolved_tenant_id, replica_type);
                                      });
         },
         [&](auto& timer) {
-            timer.LogRequest("client_id=", client_id, ", key=", key,
+            timer.LogRequest("client_id=", client_id, ", key=", object_meta.key,
                              ", replica_type=", replica_type);
         },
         [] { MasterMetricManager::instance().inc_put_end_requests(); },
@@ -534,24 +534,19 @@ WrappedMasterService::BatchPutStart(const UUID& client_id,
 }
 
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
-    const UUID& client_id, const std::vector<std::string>& keys,
+    const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
     ReplicaType replica_type, const std::string& tenant_id) {
     ScopedVLogTimer timer(1, "BatchPutEnd");
-    const size_t total_keys = keys.size();
+    const size_t total_keys = object_metas.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
     MasterMetricManager::instance().inc_batch_put_end_requests(total_keys);
 
     auto results = WithRequestTenantBatch(
         master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
                                                : TenantId::kDefaultValue,
-        keys.size(), [&](const TenantId& resolved_tenant_id) {
-            std::vector<tl::expected<void, ErrorCode>> batch_results;
-            batch_results.reserve(keys.size());
-            for (const auto& key : keys) {
-                batch_results.emplace_back(master_service_.PutEnd(
-                    client_id, key, resolved_tenant_id, replica_type));
-            }
-            return batch_results;
+        object_metas.size(), [&](const TenantId& resolved_tenant_id) {
+            return master_service_.BatchPutEnd(
+                client_id, object_metas, resolved_tenant_id, replica_type);
         });
 
     size_t failure_count = 0;
@@ -559,8 +554,8 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutEnd(
         if (!results[i].has_value()) {
             failure_count++;
             auto error = results[i].error();
-            LOG(ERROR) << "BatchPutEnd failed for key[" << i << "] '" << keys[i]
-                       << "': " << toString(error);
+            LOG(ERROR) << "BatchPutEnd failed for key[" << i << "] '"
+                       << object_metas[i].key << "': " << toString(error);
         }
     }
 
@@ -648,8 +643,8 @@ WrappedMasterService::UpsertStart(const UUID& client_id, const std::string& key,
 }
 
 tl::expected<void, ErrorCode> WrappedMasterService::UpsertEnd(
-    const UUID& client_id, const std::string& key, ReplicaType replica_type,
-    const std::string& tenant_id) {
+    const UUID& client_id, const ObjectMeta& object_meta,
+    ReplicaType replica_type, const std::string& tenant_id) {
     return execute_rpc(
         "UpsertEnd",
         [&] {
@@ -658,12 +653,12 @@ tl::expected<void, ErrorCode> WrappedMasterService::UpsertEnd(
                                          : TenantId::kDefaultValue,
                                      [&](const TenantId& resolved_tenant_id) {
                                          return master_service_.UpsertEnd(
-                                             client_id, key, resolved_tenant_id,
-                                             replica_type);
+                                             client_id, object_meta,
+                                             resolved_tenant_id, replica_type);
                                      });
         },
         [&](auto& timer) {
-            timer.LogRequest("client_id=", client_id, ", key=", key,
+            timer.LogRequest("client_id=", client_id, ", key=", object_meta.key,
                              ", replica_type=", replica_type);
         },
         [] { MasterMetricManager::instance().inc_put_end_requests(); },
@@ -752,18 +747,18 @@ WrappedMasterService::BatchUpsertStart(
 }
 
 std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchUpsertEnd(
-    const UUID& client_id, const std::vector<std::string>& keys,
+    const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
     const std::string& tenant_id) {
     ScopedVLogTimer timer(1, "BatchUpsertEnd");
-    const size_t total_keys = keys.size();
+    const size_t total_keys = object_metas.size();
     timer.LogRequest("client_id=", client_id, ", keys_count=", total_keys);
     MasterMetricManager::instance().inc_batch_put_end_requests(total_keys);
 
     auto results = WithRequestTenantBatch(
         master_service_.IsTenantQuotaEnabled() ? std::string_view(tenant_id)
                                                : TenantId::kDefaultValue,
-        keys.size(), [&](const TenantId& resolved_tenant_id) {
-            return master_service_.BatchUpsertEnd(client_id, keys,
+        object_metas.size(), [&](const TenantId& resolved_tenant_id) {
+            return master_service_.BatchUpsertEnd(client_id, object_metas,
                                                   resolved_tenant_id);
         });
 
@@ -773,7 +768,7 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchUpsertEnd(
             failure_count++;
             auto error = results[i].error();
             LOG(ERROR) << "BatchUpsertEnd failed for key[" << i << "] '"
-                       << keys[i] << "': " << toString(error);
+                       << object_metas[i].key << "': " << toString(error);
         }
     }
 

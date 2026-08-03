@@ -1,7 +1,7 @@
-"""Guard the glibc floor of released wheels.
+"""Guard the glibc floor of CI and release wheels.
 
-Release wheels must take their manylinux platform tag from a pinned container
-image, never from the GitHub runner. ``scripts/build_wheel.sh`` derives
+Distributable wheels must take their manylinux platform tag from a pinned
+container image, never from the GitHub runner. ``scripts/build_wheel.sh`` derives
 ``PLATFORM_TAG`` from the *build host's* glibc (``detect_glibc_version``), so a
 job running on a bare runner silently re-tags itself whenever GitHub bumps the
 runner image. That is not hypothetical: the published aarch64 floor moved from
@@ -9,8 +9,9 @@ runner image. That is not hypothetical: the published aarch64 floor moved from
 which stops ARM Ubuntu 22.04 from resolving any wheel and contradicts the
 "OS: Ubuntu 22.04 LTS+" contract in docs/source/getting_started/build.md.
 
-Running inside a manylinux container makes the detected glibc a constant of the
-image instead of a property of the runner. See #2858.
+Running CI and release builds through the same manylinux workflow makes the
+detected glibc a constant of the image instead of a property of the runner. See
+#2858.
 """
 
 from __future__ import annotations
@@ -22,8 +23,9 @@ import pytest
 
 yaml = pytest.importorskip("yaml")
 
-# Jobs delegating to this reusable workflow are the ones that publish wheels.
-# release-{efa,efa-non-cuda,musa,npu}.yaml do not call it and are out of scope.
+# Jobs delegating to this reusable workflow produce the standard CUDA and
+# non-CUDA wheel artifacts. Hardware-specific release-{efa,efa-non-cuda,musa,
+# npu}.yaml workflows do not call it and are out of scope.
 SHARED_BUILD_WORKFLOW = "_build-wheel.yaml"
 
 # The floor must come from a named manylinux image, matched to the runner's
@@ -84,19 +86,19 @@ def test_shared_build_workflow_still_has_callers() -> None:
     """
     assert BUILD_JOBS, (
         f"no job delegates to {SHARED_BUILD_WORKFLOW}; it was renamed or the "
-        "release workflows stopped using it, so this guard is disarmed"
+        "wheel workflows stopped using it, so this guard is disarmed"
     )
 
 
 @pytest.mark.parametrize("with_block", BUILD_JOBS)
-def test_release_build_pins_glibc_floor_to_a_container(with_block: dict) -> None:
+def test_wheel_build_pins_glibc_floor_to_a_container(with_block: dict) -> None:
     runner = str(with_block.get("runner", ""))
     container = with_block.get("container", "")
     arch = _runner_arch(runner)
     expected = ARCH_CONTAINER[arch]
 
     assert container, (
-        "job builds release wheels on a bare runner, so its manylinux tag "
+        "job builds wheels on a bare runner, so its manylinux tag "
         "follows the runner's glibc and drifts when GitHub bumps the image; "
         f"set container to a {expected.pattern} image"
     )
