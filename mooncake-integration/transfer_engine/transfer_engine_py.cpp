@@ -50,7 +50,7 @@ static void (*freeMemory)(void*) = nullptr;
 static std::string g_protocol;
 
 //  Handle allocateMemory function pointer based on protocol
-bool initMemoryAllocator(const char* protocol) {
+static bool initMemoryAllocator(const char* protocol) {
     if (allocateMemory != nullptr) {
         LOG(WARNING) << "Memory allocator already initialized with: "
                      << g_protocol;
