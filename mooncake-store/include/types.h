@@ -227,6 +227,14 @@ inline std::ostream& operator<<(std::ostream& os,
     return os << toString(errorCode);
 }
 
+// Error codes that mean "the object/replica already exists", i.e. an
+// idempotent rewrite whose failure is surfaced as success end-to-end.
+inline bool IsAlreadyExistsError(ErrorCode err) {
+    return err == ErrorCode::REPLICA_NUM_EXCEEDED ||
+           err == ErrorCode::REPLICA_ALREADY_EXISTS ||
+           err == ErrorCode::OBJECT_ALREADY_EXISTS;
+}
+
 enum class DeploymentMode {
     UNKNOWN = -1,
     CENTRALIZATION = 0,

@@ -283,15 +283,18 @@ class P2PClientService final : public ClientService {
     std::vector<tl::expected<void, ErrorCode>> InnerBatchPut(
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
+        const std::vector<size_t>& sizes,
         const WriteRouteRequestConfig& route_config);
 
     std::vector<tl::expected<void, ErrorCode>> InnerBatchPutLocalOnly(
         const std::vector<ObjectKey>& keys,
-        std::vector<std::vector<Slice>>& batched_slices);
+        std::vector<std::vector<Slice>>& batched_slices,
+        const std::vector<size_t>& sizes);
 
     std::vector<tl::expected<void, ErrorCode>> InnerBatchPutNormal(
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
+        const std::vector<size_t>& sizes,
         const WriteRouteRequestConfig& route_config);
 
     std::vector<tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>>
@@ -307,7 +310,8 @@ class P2PClientService final : public ClientService {
     std::vector<tl::expected<void, ErrorCode>> CollectResults(
         std::vector<tl::expected<std::unique_ptr<TaskHandle<void>>, ErrorCode>>&
             handles,
-        const std::vector<ObjectKey>& keys);
+        const std::vector<ObjectKey>& keys, P2PClientMetric* metrics = nullptr,
+        const std::vector<size_t>* sizes = nullptr);
 
     tl::expected<BatchGetWriteRouteResponse, ErrorCode> BatchFetchWriteRoutes(
         const std::vector<ObjectKey>& keys, const std::vector<size_t>& sizes,
@@ -318,6 +322,8 @@ class P2PClientService final : public ClientService {
         virtual std::string_view route() const = 0;
         // starts an async write task, then generate a wait task handle
         virtual std::unique_ptr<TaskHandle<void>> Dispatch() = 0;
+        // Set by Dispatch() before the actual I/O begins.
+        std::chrono::steady_clock::time_point dispatch_start{};
     };
 
     struct LocalWriteOp : WriteOp {
@@ -340,13 +346,13 @@ class P2PClientService final : public ClientService {
             const std::vector<RemoteBufferDesc>& dest_buffers)>;
 
         PeerClient* peer_ptr;
-        P2PClientMetric* metrics;
+        std::shared_ptr<P2PClientMetric> metrics;
         std::shared_ptr<RemoteWriteRequest> write_req;
         std::string endpoint;
         std::vector<Slice>* slices;
         TeTransferFn te_transfer;
 
-        RemoteForwardWriteOp(PeerClient* p, P2PClientMetric* m,
+        RemoteForwardWriteOp(PeerClient* p, std::shared_ptr<P2PClientMetric> m,
                              std::shared_ptr<RemoteWriteRequest> wr,
                              std::string ep, std::vector<Slice>* s,
                              TeTransferFn transfer)
@@ -363,7 +369,7 @@ class P2PClientService final : public ClientService {
        private:
         static async_simple::coro::Lazy<void> RunForwardRemotePut(
             std::shared_ptr<WritePromise> promise, PeerClient* peer,
-            P2PClientMetric* metrics, TeTransferFn te_transfer,
+            std::shared_ptr<P2PClientMetric> metrics, TeTransferFn te_transfer,
             std::shared_ptr<RemoteWriteRequest> write_req,
             std::vector<Slice>* slices);
     };
@@ -398,9 +404,9 @@ class P2PClientService final : public ClientService {
         std::shared_ptr<async_simple::Promise<tl::expected<void, ErrorCode>>>
             promise,
         std::unique_ptr<TaskHandle<void>> current_task,
-        std::string current_route,
+        std::unique_ptr<WriteOp> current_op,
         std::vector<std::unique_ptr<WriteOp>> retry_op_list,
-        std::string_view key);
+        std::string_view key, size_t object_size);
 
    private:
     struct ResolvedRoute {
@@ -524,7 +530,7 @@ class P2PClientService final : public ClientService {
     void RecordLocalInflight(bool entering) override;
 
    private:
-    std::unique_ptr<P2PClientMetric> metrics_;
+    std::shared_ptr<P2PClientMetric> metrics_;
     P2PMasterClient master_client_;
     uint16_t client_rpc_port_ = 12345;
 

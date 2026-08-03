@@ -2,8 +2,12 @@
 
 namespace mooncake {
 
-RequestMetric::RequestMetric(const std::string& prefix,
-                             const std::map<std::string, std::string>& labels)
+// ============================================================================
+// DataMetric
+// ============================================================================
+
+DataMetric::DataMetric(const std::string& prefix,
+                       const std::map<std::string, std::string>& labels)
     : get_requests(prefix + "_get_requests_total",
                    "Total number of Get requests", labels),
       get_hits(prefix + "_get_hits_total", "Total number of Get hits (found)",
@@ -30,8 +34,126 @@ RequestMetric::RequestMetric(const std::string& prefix,
                           kLatencyBucket, labels),
       put_latency_failure(prefix + "_put_latency_failure_us",
                           "Put latency for failed requests (us)",
-                          kLatencyBucket, labels),
-      write_revoke_requests(prefix + "_write_revoke_requests_total",
+                          kLatencyBucket, labels) {}
+
+void DataMetric::serialize(std::string& str) {
+    get_requests.serialize(str);
+    get_hits.serialize(str);
+    get_misses.serialize(str);
+    get_failures.serialize(str);
+    get_bytes.serialize(str);
+    get_latency_success.serialize(str);
+    get_latency_failure.serialize(str);
+    put_requests.serialize(str);
+    put_failures.serialize(str);
+    put_bytes.serialize(str);
+    put_latency_success.serialize(str);
+    put_latency_failure.serialize(str);
+}
+
+void DataMetric::RecordGet(int64_t elapsed_us, ErrorCode err, uint64_t bytes) {
+    get_requests.inc();
+    if (err == ErrorCode::OK) {
+        get_hits.inc();
+        get_bytes.inc(bytes);
+        get_latency_success.observe(elapsed_us);
+    } else if (err == ErrorCode::OBJECT_NOT_FOUND) {
+        get_misses.inc();
+    } else {
+        get_failures.inc();
+        get_latency_failure.observe(elapsed_us);
+    }
+}
+
+void DataMetric::RecordPut(int64_t elapsed_us, ErrorCode err, uint64_t bytes) {
+    if (IsAlreadyExistsError(err)) {
+        // ignore the exist writing
+        return;
+    }
+    put_requests.inc();
+    if (err == ErrorCode::OK) {
+        put_bytes.inc(bytes);
+        put_latency_success.observe(elapsed_us);
+    } else {
+        put_failures.inc();
+        put_latency_failure.observe(elapsed_us);
+    }
+}
+
+void DataMetric::append_get_put_summary(std::ostream& ss) {
+    ss << "Get: " << get_requests.value() << " requests, " << get_hits.value()
+       << " hits, " << get_misses.value() << " misses, " << get_failures.value()
+       << " failures, " << byte_size_to_string(get_bytes.value()) << " read"
+       << " | success: " << format_latency_summary(get_latency_success)
+       << " | failure: " << format_latency_summary(get_latency_failure) << "\n";
+    ss << "Put: " << put_requests.value() << " requests, "
+       << put_failures.value() << " failures, "
+       << byte_size_to_string(put_bytes.value()) << " written"
+       << " | success: " << format_latency_summary(put_latency_success)
+       << " | failure: " << format_latency_summary(put_latency_failure) << "\n";
+}
+
+std::string DataMetric::summary_metrics() {
+    std::stringstream ss;
+    append_get_put_summary(ss);
+    return ss.str();
+}
+
+// ============================================================================
+// RequestMetric
+// ============================================================================
+
+RequestMetric::RequestMetric(const std::string& prefix,
+                             const std::map<std::string, std::string>& labels)
+    : DataMetric(prefix, labels),
+      inflight(prefix + "_inflight", "Number of currently in-flight requests",
+               labels) {}
+
+void RequestMetric::serialize(std::string& str) {
+    DataMetric::serialize(str);
+    inflight.serialize(str);
+}
+
+std::string RequestMetric::summary_metrics() {
+    std::stringstream ss;
+    append_get_put_summary(ss);
+    ss << "In-flight: " << inflight.value() << " requests\n";
+    return ss.str();
+}
+
+// ============================================================================
+// RemoteRequestMetric
+// ============================================================================
+
+RemoteRequestMetric::RemoteRequestMetric(
+    const std::string& prefix, const std::map<std::string, std::string>& labels)
+    : DataMetric(prefix, labels),
+      write_retries(prefix + "_write_retries_total",
+                    "Total write attempts beyond the first candidate", labels),
+      read_retries(prefix + "_read_retries_total",
+                   "Total read attempts beyond the first route", labels) {}
+
+void RemoteRequestMetric::serialize(std::string& str) {
+    DataMetric::serialize(str);
+    write_retries.serialize(str);
+    read_retries.serialize(str);
+}
+
+std::string RemoteRequestMetric::summary_metrics() {
+    std::stringstream ss;
+    append_get_put_summary(ss);
+    ss << "Retries: write=" << write_retries.value()
+       << ", read=" << read_retries.value() << "\n";
+    return ss.str();
+}
+
+// ============================================================================
+// RollbackMetric
+// ============================================================================
+
+RollbackMetric::RollbackMetric(const std::string& prefix,
+                               const std::map<std::string, std::string>& labels)
+    : write_revoke_requests(prefix + "_write_revoke_requests_total",
                             "Total outgoing WriteRevoke rollback RPCs", labels),
       write_revoke_failures(prefix + "_write_revoke_failures_total",
                             "Total failed WriteRevoke rollback RPCs", labels),
@@ -54,23 +176,9 @@ RequestMetric::RequestMetric(const std::string& prefix,
       unpin_key_latency_failure(prefix + "_unpin_key_latency_failure_us",
                                 "UnPinKey rollback RPC latency for failed "
                                 "requests (us)",
-                                kLatencyBucket, labels),
-      inflight(prefix + "_inflight", "Number of currently in-flight requests",
-               labels) {}
+                                kLatencyBucket, labels) {}
 
-void RequestMetric::serialize(std::string& str) {
-    get_requests.serialize(str);
-    get_hits.serialize(str);
-    get_misses.serialize(str);
-    get_failures.serialize(str);
-    get_bytes.serialize(str);
-    get_latency_success.serialize(str);
-    get_latency_failure.serialize(str);
-    put_requests.serialize(str);
-    put_failures.serialize(str);
-    put_bytes.serialize(str);
-    put_latency_success.serialize(str);
-    put_latency_failure.serialize(str);
+void RollbackMetric::serialize(std::string& str) {
     write_revoke_requests.serialize(str);
     write_revoke_failures.serialize(str);
     write_revoke_latency_success.serialize(str);
@@ -79,28 +187,20 @@ void RequestMetric::serialize(std::string& str) {
     unpin_key_failures.serialize(str);
     unpin_key_latency_success.serialize(str);
     unpin_key_latency_failure.serialize(str);
-    inflight.serialize(str);
 }
 
-std::string RequestMetric::summary_metrics() {
+std::string RollbackMetric::summary_metrics() {
     std::stringstream ss;
-    ss << "Get: " << get_requests.value() << " requests, " << get_hits.value()
-       << " hits, " << get_misses.value() << " misses, " << get_failures.value()
-       << " failures, " << byte_size_to_string(get_bytes.value()) << " read\n";
-
-    ss << "Put: " << put_requests.value() << " requests, "
-       << put_failures.value() << " failures, "
-       << byte_size_to_string(put_bytes.value()) << " written\n";
-
     ss << "WriteRevoke rollback: " << write_revoke_requests.value()
        << " requests, " << write_revoke_failures.value() << " failures\n";
     ss << "UnPinKey rollback: " << unpin_key_requests.value() << " requests, "
        << unpin_key_failures.value() << " failures\n";
-
-    ss << "In-flight: " << inflight.value() << " requests\n";
-
     return ss.str();
 }
+
+// ============================================================================
+// RpcHandlerMetric / ReadRpcHandlerMetric
+// ============================================================================
 
 RpcHandlerMetric::RpcHandlerMetric(
     const std::string& metric_prefix, const std::string& rpc_name,
@@ -126,7 +226,8 @@ void RpcHandlerMetric::serialize(std::string& str) {
 std::string RpcHandlerMetric::summary_line(const std::string& display_name) {
     std::stringstream ss;
     ss << display_name << ": " << requests.value() << " requests, "
-       << failures.value() << " failures\n";
+       << failures.value() << " failures, "
+       << format_latency_summary(latency_success) << "\n";
     return ss.str();
 }
 
@@ -150,9 +251,14 @@ std::string ReadRpcHandlerMetric::summary_line(
     std::stringstream ss;
     ss << display_name << ": " << requests.value() << " requests, "
        << hits.value() << " hits, " << misses.value() << " misses, "
-       << failures.value() << " failures\n";
+       << failures.value() << " failures, "
+       << format_latency_summary(latency_success) << "\n";
     return ss.str();
 }
+
+// ============================================================================
+// PeerRequestMetrics
+// ============================================================================
 
 PeerRequestMetrics::PeerRequestMetrics(
     const std::string& prefix, const std::map<std::string, std::string>& labels)
@@ -163,8 +269,8 @@ PeerRequestMetrics::PeerRequestMetrics(
       write_revoke(prefix, "write_revoke", labels),
       pin_key(prefix, "pin_key", labels),
       unpin_key(prefix, "unpin_key", labels),
-      inflight(prefix + "_inflight", "Number of currently in-flight requests",
-               labels) {}
+      inflight(prefix + "_inflight",
+               "Number of currently in-flight incoming peer RPCs", labels) {}
 
 void PeerRequestMetrics::serialize(std::string& str) {
     read_remote_data.serialize(str);
@@ -190,29 +296,45 @@ std::string PeerRequestMetrics::summary_metrics() {
     return ss.str();
 }
 
+// ============================================================================
+// P2PClientMetric
+// ============================================================================
+
 P2PClientMetric::P2PClientMetric(
     uint64_t interval_seconds, const std::map<std::string, std::string>& labels)
     : ClientMetric(interval_seconds, labels),
+      total_request("mooncake_p2p_total", labels),
       local_request("mooncake_p2p_local", labels),
+      remote_request("mooncake_p2p_remote", labels),
+      rollback("mooncake_p2p_rollback", labels),
       peer_request_metrics("mooncake_p2p_peer", labels) {}
 
 void P2PClientMetric::serialize(std::string& str) {
-    // Call base class serialize first
     ClientMetric::serialize(str);
-
-    // Then serialize P2P-specific metrics
+    total_request.serialize(str);
     local_request.serialize(str);
+    remote_request.serialize(str);
+    rollback.serialize(str);
     peer_request_metrics.serialize(str);
 }
 
 std::string P2PClientMetric::summary_metrics() {
     std::stringstream ss;
-    // Include base class metrics first
-    ss << ClientMetric::summary_metrics();
+    ss << "Client Metrics Summary\n";
 
-    // Then add P2P-specific metrics
-    ss << "=== P2P Local Request Metrics ===\n";
+    ss << master_client_metric.summary_metrics();
+
+    ss << "=== P2P Total (per-request) ===\n";
+    ss << total_request.summary_metrics();
+
+    ss << "=== P2P Local (per-attempt) ===\n";
     ss << local_request.summary_metrics();
+
+    ss << "=== P2P Remote (per-attempt) ===\n";
+    ss << remote_request.summary_metrics();
+
+    ss << "=== P2P Rollback ===\n";
+    ss << rollback.summary_metrics();
 
     ss << "=== P2P Peer Request Metrics ===\n";
     ss << peer_request_metrics.summary_metrics();

@@ -38,6 +38,9 @@ struct ReadTaskHandle {
     // if user use zero-copy get(), the var is useless;
     // if user provides allocator, the var is the buffer allocated by allocator;
     std::shared_ptr<BufferHandle> read_buf;
+
+    // Whether this handle was served from local storage.
+    bool is_local = false;
 };
 
 /**

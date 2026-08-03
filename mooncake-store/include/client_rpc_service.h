@@ -31,8 +31,9 @@ class ClientRpcService {
      * @param metrics Optional pointer to P2PClientMetric for recording peer
      * request metrics
      */
-    explicit ClientRpcService(DataManager& data_manager,
-                              P2PClientMetric* metrics = nullptr);
+    explicit ClientRpcService(
+        DataManager& data_manager,
+        std::shared_ptr<P2PClientMetric> metrics = nullptr);
 
     /**
      * @brief Stop serving peer RPCs: reject new incoming handlers and block
@@ -83,7 +84,8 @@ class ClientRpcService {
 
    private:
     DataManager& data_manager_;  // Reference: owned by Client, same lifetime
-    P2PClientMetric* metrics_;   // Optional: owned by P2PClientService
+    std::shared_ptr<P2PClientMetric>
+        metrics_;  // Optional: shared from P2PClientService
 
     InflightTracker peer_tracker_;
 };
