@@ -5,6 +5,8 @@
 #include <string_view>
 #include <vector>
 
+#include <ylt/util/tl/expected.hpp>
+
 #include "types.h"
 
 namespace mooncake::ha {
@@ -53,15 +55,13 @@ struct BatchOpLogSnapshotManifest {
 
 std::string EncodeBatchOpLogSnapshotDescriptor(
     const BatchOpLogSnapshotDescriptor& descriptor);
-bool DecodeBatchOpLogSnapshotDescriptor(
-    std::string_view value, BatchOpLogSnapshotDescriptor* descriptor,
-    std::string* reason = nullptr);
+tl::expected<BatchOpLogSnapshotDescriptor, std::string>
+DecodeBatchOpLogSnapshotDescriptor(std::string_view value);
 
 std::string EncodeBatchOpLogSnapshotManifest(
     const BatchOpLogSnapshotManifest& manifest);
-bool DecodeBatchOpLogSnapshotManifest(std::string_view value,
-                                      BatchOpLogSnapshotManifest* manifest,
-                                      std::string* reason = nullptr);
+tl::expected<BatchOpLogSnapshotManifest, std::string>
+DecodeBatchOpLogSnapshotManifest(std::string_view value);
 
 std::string BuildBatchOpLogSnapshotId(uint64_t last_included_batch_id,
                                       int64_t maintenance_lease_id);
