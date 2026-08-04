@@ -2,7 +2,10 @@ file(GLOB CXI_SOURCES "*.cpp")
 add_library(cxi_transport OBJECT ${CXI_SOURCES})
 
 # Link against libfabric (fabric) instead of ibverbs for AWS EFA
-target_link_libraries(cxi_transport PUBLIC gflags::gflags glog::glog PRIVATE fabric)
+target_link_libraries(
+  cxi_transport
+  PUBLIC glog::glog
+  PRIVATE fabric)
 
 target_include_directories(
   cxi_transport
