@@ -13,6 +13,7 @@
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include <ylt/easylog/record.hpp>
 
+#include "crash_handler.h"
 #include "default_config.h"
 #include "duration_utils.h"
 #include "ha/leadership/master_service_supervisor.h"
@@ -1285,6 +1286,7 @@ std::unique_ptr<mooncake::HttpMetadataServer> StartHttpMetadataServer(
 }
 
 int main(int argc, char* argv[]) {
+    mooncake::InstallCrashHandler();
     mooncake::init_ylt_log_level();
     // Initialize gflags
     gflags::SetVersionString(mooncake::MOONCAKE_DISPLAY_VERSION);
