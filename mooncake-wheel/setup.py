@@ -1,5 +1,7 @@
 import sys
 import platform
+
+import numpy as np
 from setuptools import setup, Distribution, Extension
 from wheel.bdist_wheel import bdist_wheel
 
@@ -166,8 +168,6 @@ class CustomBdistWheel(bdist_wheel):
 # ---------------------------------------------------------------------------
 # C extensions
 # ---------------------------------------------------------------------------
-import numpy as np
-
 _fast_copy_ext = Extension(
     "mooncake._fast_copy",
     sources=["mooncake/_fast_copy.c"],

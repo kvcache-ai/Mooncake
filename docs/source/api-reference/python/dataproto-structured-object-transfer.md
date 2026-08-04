@@ -118,7 +118,7 @@ Tensor fields are stored through the best available Mooncake path:
 3. If a tensor-native path is unavailable, Mooncake falls back to a serialized tensor payload.
 4. Scalar tensors use a correctness fallback until the native tensor codec preserves zero-dimensional shape.
 
-Numeric numpy arrays are stored as structured ndarray members. Contiguous arrays can be passed through without copying; non-contiguous arrays are made contiguous before storage. Row slices are materialized through structured range reads when the backend supports them.
+Numeric numpy arrays are stored as structured ndarray members. Non-tensor ndarray PUTs are staged and copied before being written to Mooncake; non-contiguous arrays are made contiguous as part of that staging path. Row slices are materialized through structured range reads when the backend supports them, and `destinations` can still be used on GET to materialize selected fields into caller-provided buffers.
 
 `non_tensor_batch` object arrays are structured-encoded according to their contents. Numeric scalar object arrays, ragged tensors, bytes, strings, JSON-like values, and selected media payloads have explicit codecs. These fields are serialized by design and should not be treated as zero-copy tensor data.
 
