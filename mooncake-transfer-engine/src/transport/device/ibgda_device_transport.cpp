@@ -21,6 +21,7 @@
 #include "transport/device/device_transport.h"
 
 #include <arpa/inet.h>
+#include <dlfcn.h>
 #include <glog/logging.h>
 #include <infiniband/mlx5dv.h>
 #include <infiniband/verbs.h>
@@ -59,6 +60,28 @@ static const char* controlMemoryModeName(ControlMemoryMode mode) {
     }
     return "unknown";
 }
+
+#if defined(USE_CUDA) && defined(MOONCAKE_HAVE_MLX5_DMABUF_UMEM)
+using Mlx5DevxUmemRegEx = mlx5dv_devx_umem* (*)(ibv_context*,
+                                                mlx5dv_devx_umem_in*);
+
+static Mlx5DevxUmemRegEx dmabufUmemRegEx() {
+    static const Mlx5DevxUmemRegEx reg_ex = [] {
+        dlerror();
+        void* symbol =
+            dlvsym(RTLD_DEFAULT, "mlx5dv_devx_umem_reg_ex", "MLX5_1.19");
+        if (!symbol) {
+            const char* error = dlerror();
+            LOG(WARNING) << "[EP IBGDA] Runtime libmlx5 does not provide "
+                            "mlx5dv_devx_umem_reg_ex@MLX5_1.19; disabling "
+                            "DMA-BUF control memory"
+                         << (error ? std::string(": ") + error : "");
+        }
+        return reinterpret_cast<Mlx5DevxUmemRegEx>(symbol);
+    }();
+    return reg_ex;
+}
+#endif
 
 // Check if IPv6 address is IPv4-mapped (::ffff:x.x.x.x)
 static bool isIpv4Mapped(const struct in6_addr* a) {
@@ -384,7 +407,8 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     }
 
     bool cudaSupportsDmabuf() const {
-#if defined(USE_CUDA)
+#if defined(USE_CUDA) && defined(MOONCAKE_HAVE_MLX5_DMABUF_UMEM)
+        if (!dmabufUmemRegEx()) return false;
         CUdevice device;
         CUresult result = cuCtxGetDevice(&device);
         if (result != CUDA_SUCCESS) {
@@ -408,6 +432,9 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
         }
         return supported != 0;
 #else
+        LOG(WARNING) << "[EP IBGDA] DMA-BUF control memory was not compiled: "
+                        "the build-time mlx5 headers or libmlx5 lack the "
+                        "required DevX UMEM API";
         return false;
 #endif
     }
@@ -427,7 +454,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
 
     int allocateDmabufControlRegion(size_t requested_size,
                                     mlx5gda_control_region* region) {
-#if defined(USE_CUDA)
+#if defined(USE_CUDA) && defined(MOONCAKE_HAVE_MLX5_DMABUF_UMEM)
         if (!region || requested_size == 0) {
             errno = EINVAL;
             return -1;
@@ -488,7 +515,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
         input.comp_mask = MLX5DV_UMEM_MASK_DMABUF;
         input.dmabuf_fd = dmabuf_fd;
 
-        mlx5dv_devx_umem* umem = mlx5dv_devx_umem_reg_ex(ctx_, &input);
+        mlx5dv_devx_umem* umem = dmabufUmemRegEx()(ctx_, &input);
         const int registration_errno = errno;
         if (close(dmabuf_fd) != 0) {
             PLOG(WARNING) << "[EP IBGDA] Failed to close control DMA-BUF fd";

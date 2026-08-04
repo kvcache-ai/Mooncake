@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
 project(mooncake-transfer-engine)
 
+include(CheckCXXSourceCompiles)
+
 if (NOT GLOBAL_CONFIG)
   if (USE_ETCD)
     message(FATAL_ERROR "Cannot enable USE_ETCD while building transfer engine independently")
@@ -15,6 +17,31 @@ if (NOT GLOBAL_CONFIG)
   add_subdirectory(../mooncake-common/src
                    ${CMAKE_CURRENT_BINARY_DIR}/mooncake-common-src)
 endif() # GLOBAL_CONFIG
+
+if (USE_CUDA)
+  set(CMAKE_REQUIRED_LIBRARIES mlx5)
+  check_cxx_source_compiles(
+    "#include <infiniband/mlx5dv.h>
+     #include <infiniband/verbs.h>
+     int main() {
+       mlx5dv_devx_umem_in input{};
+       input.comp_mask = MLX5DV_UMEM_MASK_DMABUF;
+       input.dmabuf_fd = -1;
+       auto reg_ex = &mlx5dv_devx_umem_reg_ex;
+       (void)reg_ex;
+       return 0;
+     }"
+    MOONCAKE_HAVE_MLX5_DMABUF_UMEM)
+  unset(CMAKE_REQUIRED_LIBRARIES)
+
+  if (MOONCAKE_HAVE_MLX5_DMABUF_UMEM)
+    add_compile_definitions(MOONCAKE_HAVE_MLX5_DMABUF_UMEM)
+    message(STATUS "CUDA IBGDA DMA-BUF DevX UMEM support enabled")
+  else()
+    message(WARNING
+      "CUDA IBGDA DMA-BUF DevX UMEM support disabled: the installed mlx5 headers or libmlx5 do not provide MLX5DV_UMEM_MASK_DMABUF, mlx5dv_devx_umem_in::dmabuf_fd, and mlx5dv_devx_umem_reg_ex. Update rdma-core/libmlx5 to enable DMA-BUF control memory; Device API will use GPU-VA and host-mapped fallback.")
+  endif()
+endif()
 
 if (USE_ASCEND)
   include(../mooncake-common/FindMpi.cmake)
