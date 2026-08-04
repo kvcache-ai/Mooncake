@@ -258,6 +258,119 @@ TEST_F(P2PHotStandbyServiceTest, ReplicatesMasterWrittenP2POplog) {
     EXPECT_EQ(desc.rpc_port, 50051);
 }
 
+TEST_F(P2PHotStandbyServiceTest, BootstrapsFromStandbySnapshotSource) {
+    P2PMasterService master(MakeMasterConfig());
+    const UUID client_id{11, 11};
+    const UUID segment_id{12, 12};
+    RegisterClient(master, client_id, MakeSegment(segment_id));
+    AddReplica(master, "snapshot-key", client_id, segment_id, 8192);
+
+    auto source_config = MakeStandbyConfig();
+    source_config.snapshot_service_port =
+        static_cast<uint16_t>(49000 + (::getpid() % 1000));
+    P2PHotStandbyService source(source_config);
+    ASSERT_EQ(source.Start(), ErrorCode::OK);
+    ASSERT_TRUE(
+        source.WaitForAppliedSequence(2, std::chrono::milliseconds(2000)));
+
+    auto target_config = MakeStandbyConfig();
+    target_config.snapshot_source_endpoints = {
+        "127.0.0.1:" + std::to_string(source_config.snapshot_service_port)};
+    target_config.snapshot_chunk_size = 1;
+    P2PHotStandbyService target(target_config);
+    ASSERT_EQ(target.Start(), ErrorCode::OK);
+    ASSERT_GE(target.GetLatestAppliedSequenceId(), 2);
+
+    auto exported = target.ExportMetadata();
+    ASSERT_NE(exported.clients.find(client_id), exported.clients.end());
+    auto object = exported.objects.find("snapshot-key");
+    ASSERT_NE(object, exported.objects.end());
+    EXPECT_EQ(object->second.size, 8192);
+    ASSERT_EQ(object->second.replicas.size(), 1);
+
+    target.Stop();
+    source.Stop();
+}
+
+TEST_F(P2PHotStandbyServiceTest,
+       SnapshotKeepsFixedInventoryWhileSourceContinuesApplying) {
+    P2PMasterService master(MakeMasterConfig());
+    const UUID client_id{21, 21};
+    const UUID segment_id{22, 22};
+    RegisterClient(master, client_id, MakeSegment(segment_id));
+    AddReplica(master, "before-snapshot", client_id, segment_id, 4096);
+
+    P2PHotStandbyService source(MakeStandbyConfig());
+    ASSERT_EQ(source.Start(), ErrorCode::OK);
+    ASSERT_TRUE(
+        source.WaitForAppliedSequence(2, std::chrono::milliseconds(2000)));
+
+    P2PStandbySnapshotService snapshot(&source);
+    auto begin = snapshot.BeginSnapshot({kClusterId});
+    ASSERT_EQ(fromInt(begin.error_code), ErrorCode::OK);
+    EXPECT_EQ(begin.baseline_sequence_id, 2);
+
+    AddReplica(master, "after-snapshot", client_id, segment_id, 8192);
+    ASSERT_TRUE(
+        source.WaitForAppliedSequence(3, std::chrono::milliseconds(2000)));
+
+    auto chunk = snapshot.GetSnapshotChunk(
+        {begin.session_id, /*object_offset=*/0, /*client_offset=*/0,
+         /*limit=*/100});
+    ASSERT_EQ(fromInt(chunk.error_code), ErrorCode::OK);
+    ASSERT_TRUE(chunk.done);
+    ASSERT_EQ(chunk.objects.size(), 1);
+    EXPECT_EQ(chunk.objects.front().key, "before-snapshot");
+    EXPECT_EQ(snapshot.EndSnapshot({begin.session_id}), toInt(ErrorCode::OK));
+}
+
+TEST_F(P2PHotStandbyServiceTest,
+       SnapshotRejectsInvalidChunksAndLimitsSessions) {
+    P2PHotStandbyService source(MakeStandbyConfig());
+    ASSERT_EQ(source.Start(), ErrorCode::OK);
+
+    P2PStandbySnapshotService snapshot(&source);
+    std::vector<std::string> session_ids;
+    for (size_t i = 0; i < kMaxStandbySnapshotSessions; ++i) {
+        auto begin = snapshot.BeginSnapshot({kClusterId});
+        ASSERT_EQ(fromInt(begin.error_code), ErrorCode::OK);
+        session_ids.push_back(std::move(begin.session_id));
+    }
+
+    auto excess_session = snapshot.BeginSnapshot({kClusterId});
+    EXPECT_EQ(fromInt(excess_session.error_code),
+              ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+
+    auto oversized_chunk = snapshot.GetSnapshotChunk(
+        {session_ids.front(), 0, 0, kMaxStandbySnapshotChunkSize + 1});
+    EXPECT_EQ(fromInt(oversized_chunk.error_code), ErrorCode::INVALID_PARAMS);
+
+    auto invalid_offset =
+        snapshot.GetSnapshotChunk({session_ids.front(), 1, 0, 1});
+    EXPECT_EQ(fromInt(invalid_offset.error_code), ErrorCode::INVALID_PARAMS);
+
+    ASSERT_EQ(snapshot.EndSnapshot({session_ids.front()}),
+              toInt(ErrorCode::OK));
+    auto replacement_session = snapshot.BeginSnapshot({kClusterId});
+    EXPECT_EQ(fromInt(replacement_session.error_code), ErrorCode::OK);
+    source.Stop();
+}
+
+TEST_F(P2PHotStandbyServiceTest, SnapshotServerRejectsOccupiedPort) {
+    auto config = MakeStandbyConfig();
+    config.snapshot_service_port =
+        static_cast<uint16_t>(50000 + (::getpid() % 1000));
+
+    P2PHotStandbyService first(config);
+    ASSERT_EQ(first.Start(), ErrorCode::OK);
+
+    P2PHotStandbyService second(config);
+    EXPECT_EQ(second.Start(), ErrorCode::INTERNAL_ERROR);
+
+    second.Stop();
+    first.Stop();
+}
+
 TEST_F(P2PHotStandbyServiceTest, ReconnectsFromLastAppliedSequence) {
     std::mutex states_mutex;
     std::vector<std::shared_ptr<ControlledNotifierState>> states;

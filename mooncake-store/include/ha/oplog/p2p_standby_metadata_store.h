@@ -10,6 +10,7 @@
 #include <vector>
 
 #include <boost/functional/hash.hpp>
+#include <ylt/reflection/user_reflect_macro.hpp>
 
 #include "ha/oplog/oplog_manager.h"
 #include "metadata_store.h"
@@ -25,6 +26,8 @@ struct P2PStandbyClientInfo {
     uint16_t rpc_port = 0;
     // Segments owned by this client.
     std::vector<Segment> segments;
+
+    YLT_REFL(P2PStandbyClientInfo, client_id, ip_address, rpc_port, segments);
 };
 
 /// P2P-specific standby metadata store.
@@ -111,6 +114,13 @@ class P2PStandbyMetadataStore : public MetadataStore {
     };
 
     ExportedMetadata ExportMetadata() const;
+
+    std::vector<std::string> ListObjectKeys() const;
+    std::vector<UUID> ListClientIds() const;
+    std::optional<P2PStandbyClientInfo> GetClientInfo(
+        const UUID& client_id) const;
+    void RestoreMetadata(const std::string& key,
+                         const StandbyObjectMetadata& metadata);
 
     // ========================================================================
     // Query helpers
