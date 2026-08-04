@@ -36,7 +36,6 @@
 #include <unordered_set>
 
 #include <algorithm>
-#include <mutex>
 
 namespace mooncake {
 namespace tent {
@@ -264,23 +263,34 @@ Status CudaPlatform::probe(std::vector<Topology::NicEntry>& nic_list,
 }
 
 namespace {
-void checkCudartAbiOnce() {
-    static std::once_flag once;
-    std::call_once(once, [] {
+bool cudaProbeUsable() {
+    static const bool usable = [] {
+        int device_count = 0;
+        if (cudaGetDeviceCount(&device_count) != cudaSuccess ||
+            device_count == 0) {
+            LOG(WARNING) << "No CUDA device detected; treating buffers as "
+                            "host memory";
+            return false;
+        }
         int runtime_version = 0;
-        if (cudaRuntimeGetVersion(&runtime_version) != cudaSuccess) return;
-        if (runtime_version / 1000 != CUDART_VERSION / 1000) {
+        // Major version only: struct layout changes across CUDA majors.
+        if (cudaRuntimeGetVersion(&runtime_version) == cudaSuccess &&
+            runtime_version / 1000 != CUDART_VERSION / 1000) {
             LOG(ERROR) << "CUDA ABI mismatch: built against CUDART "
                        << CUDART_VERSION << ", loaded libcudart is "
                        << runtime_version
-                       << "; rebuild against a matching CUDA toolkit.";
+                       << "; skipping pointer probe, rebuild against a "
+                          "matching CUDA toolkit.";
+            return false;
         }
-    });
+        return true;
+    }();
+    return usable;
 }
 }  // namespace
 
 MemoryType CudaPlatform::getMemoryType(void* addr) {
-    checkCudartAbiOnce();
+    if (!cudaProbeUsable()) return MTYPE_CPU;
     cudaPointerAttributes attributes{};
     cudaError_t result = cudaPointerGetAttributes(&attributes, addr);
     if (result != cudaSuccess) {
@@ -313,7 +323,10 @@ const std::vector<RangeLocation> CudaPlatform::getLocation(void* start,
     const static size_t kPageSize = 4096;
     std::vector<RangeLocation> entries;
 
-    checkCudartAbiOnce();
+    if (!cudaProbeUsable()) {
+        entries.push_back({(uint64_t)start, len, kWildcardLocation});
+        return entries;
+    }
     cudaPointerAttributes attributes{};
     cudaError_t result = cudaPointerGetAttributes(&attributes, start);
     if (result != cudaSuccess) {
