@@ -42,6 +42,9 @@
 #include "rpc_types.h"
 #include "local_hot_cache.h"
 #include "device/accelerator_registry.h"
+#ifdef USE_INTRA_NVLINK
+#include "gpu_vendor/intra_nvlink.h"
+#endif
 #include "crc_checksum.h"
 #include "environ.h"
 
@@ -868,6 +871,21 @@ ErrorCode Client::InitTransferEngine(
                               "devices";
                 return ErrorCode::INTERNAL_ERROR;
             }
+        } else if (protocol == "nvlink_intra") {
+#ifdef USE_INTRA_NVLINK
+            LOG(INFO) << "Using intra-NVLink protocol.";
+            transport =
+                transfer_engine_->installTransport("nvlink_intra", nullptr);
+            if (!transport) {
+                LOG(ERROR) << "Failed to install nvlink_intra transport.";
+                return ErrorCode::INTERNAL_ERROR;
+            }
+#else
+            LOG(ERROR)
+                << "--protocol=nvlink_intra requires USE_INTRA_NVLINK=ON, "
+                   "please rebuild mooncake from source.";
+            return ErrorCode::INVALID_PARAMS;
+#endif
         } else {
             LOG(ERROR) << "unsupported_protocol protocol=" << protocol;
             return ErrorCode::INVALID_PARAMS;
