@@ -208,6 +208,9 @@ if(TARGET tent_xport_gds)
   add_executable(tent_gds_transport_status_test gds_transport_status_test.cpp)
   target_link_libraries(tent_gds_transport_status_test PRIVATE gtest gtest_main
                                                                tent_link_group)
+  target_link_options(
+    tent_gds_transport_status_test PRIVATE "-Wl,--wrap=cuFileDriverOpen"
+    "-Wl,--wrap=cuFileBatchIOGetStatus")
   target_include_directories(tent_gds_transport_status_test
                              PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
   add_test(NAME tent_gds_transport_status_test

@@ -546,9 +546,12 @@ Status GdsTransport::getTransferStatus(SubBatchRef batch, int task_id,
         }
     }
 
+    // Expose partial progress while the task is still pending, and keep the
+    // reported byte count monotonic across repeated polls.
+    range.transferred_bytes =
+        std::max(range.transferred_bytes, task_status.transferred_bytes);
     if (task_status.s != PENDING) {
         range.status = task_status.s;
-        range.transferred_bytes = task_status.transferred_bytes;
     }
     status = TransferStatus{range.status, range.transferred_bytes};
     return Status::OK();

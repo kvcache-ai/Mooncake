@@ -14,10 +14,37 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <vector>
 
 #include "tent/transport/gds/gds_transport.h"
+
+namespace {
+
+std::vector<CUfileIOEvents_t> reported_events;
+
+}  // namespace
+
+extern "C" CUfileError_t __wrap_cuFileDriverOpen() {
+    CUfileError_t result{};
+    result.err = CU_FILE_SUCCESS;
+    return result;
+}
+
+extern "C" CUfileError_t __wrap_cuFileBatchIOGetStatus(CUfileBatchHandle_t,
+                                                       unsigned,
+                                                       unsigned* num_events,
+                                                       CUfileIOEvents_t* events,
+                                                       timespec*) {
+    const auto count = std::min<size_t>(*num_events, reported_events.size());
+    std::copy_n(reported_events.begin(), count, events);
+    *num_events = static_cast<unsigned>(count);
+
+    CUfileError_t result{};
+    result.err = CU_FILE_SUCCESS;
+    return result;
+}
 
 namespace mooncake {
 namespace tent {
@@ -33,10 +60,12 @@ class GdsTransportTestPeer {
 
 namespace {
 
-CUfileIOEvents_t makeEvent(CUfileStatus_t status, int64_t bytes = 0) {
+CUfileIOEvents_t makeEvent(CUfileStatus_t status, int64_t bytes = 0,
+                           size_t slice_id = 0) {
     CUfileIOEvents_t event{};
     event.status = status;
     event.ret = bytes;
+    event.cookie = reinterpret_cast<void*>(slice_id + 1);
     return event;
 }
 
@@ -58,6 +87,26 @@ TEST(GdsTransportStatusTest, ReportsPendingWhenNoFailureIsKnown) {
     EXPECT_EQ(status.s, PENDING);
     EXPECT_EQ(status.transferred_bytes, 1024);
     EXPECT_FALSE(all_terminal);
+}
+
+TEST(GdsTransportStatusTest, PublicStatusReportsCompletedBytesWhilePending) {
+    GdsTransport transport;
+    GdsSubBatch batch;
+    BatchHandle batch_handle{};
+    batch.batch_handle = &batch_handle;
+    batch.io_params.resize(2);
+    batch.io_events.resize(2);
+    batch.cached_events = {makeEvent(CUFILE_PENDING, 0, 0),
+                           makeEvent(CUFILE_PENDING, 0, 1)};
+    batch.io_param_ranges.push_back(IOParamRange{0, 2, 0, PENDING});
+    reported_events = {makeEvent(CUFILE_COMPLETE, 1024, 0),
+                       makeEvent(CUFILE_PENDING, 0, 1)};
+
+    TransferStatus status{INITIAL, 0};
+    ASSERT_TRUE(transport.getTransferStatus(&batch, 0, status).ok());
+    EXPECT_EQ(status.s, PENDING);
+    EXPECT_EQ(status.transferred_bytes, 1024);
+    EXPECT_EQ(batch.io_param_ranges[0].transferred_bytes, 1024);
 }
 
 TEST(GdsTransportStatusTest, AggregatesCompletedBytes) {
