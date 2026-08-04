@@ -661,6 +661,8 @@ For important and frequently used objects, such as system prompts, Mooncake Stor
 
 The soft-pin lifetime starts when the first replica becomes readable. When its deadline is reached, the object becomes ordinary cache; later reads grant only an ordinary read lease and do not reactivate soft pinning. A later write can explicitly enable it again.
 
+Soft pin is runtime-only eviction-priority state. It is not persisted in snapshots or the HA OpLog, so recovery and Standby promotion downgrade restored objects to ordinary cache. Existing snapshot fields are retained only for format compatibility and ignored during recovery.
+
 There are three startup parameters in `master_service` related to the soft pin mechanism:
 
 - `default_kv_soft_pin_ttl`: The fixed soft-pin lifetime (in milliseconds) used when an `ENABLE` request omits `soft_pin_ttl_ms`. The default value is `30 minutes`; reads do not extend it.

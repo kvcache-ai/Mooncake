@@ -31,14 +31,13 @@ struct StandbyObjectMetadata {
     // 1. Standby does not perform eviction, so lease info is not used
     // 2. After promotion, new Primary should grant fresh leases, not restore
     // old ones
+    // Soft pin is also omitted because it is runtime-only eviction-priority
+    // state; promoted objects resume as ordinary cache.
     uint64_t last_sequence_id{
         0};                // Last OpLog sequence ID that modified this key
     std::string group_id;  // Tenant group identifier
     ObjectDataType data_type{
         ObjectDataType::UNKNOWN};  // Data type classification
-    // Absolute system_clock deadline in milliseconds since Unix epoch.
-    // Missing means the object is not soft-pinned.
-    struct_pack::compatible<uint64_t, 2> soft_pin_deadline_ms;
 
     StandbyObjectMetadata() = default;
 
@@ -100,13 +99,8 @@ struct MetadataPayload {
     std::vector<Replica::Descriptor> replicas;
     struct_pack::compatible<std::string, 1> group_id;      // Tenant group
     struct_pack::compatible<ObjectDataType, 1> data_type;  // Data type
-    // Authoritative committed deadline update. Missing means this PUT_END only
-    // changes replica metadata and must preserve the standby's current value;
-    // zero explicitly clears the deadline.
-    struct_pack::compatible<uint64_t, 2> soft_pin_deadline_ms;
 
-    YLT_REFL(MetadataPayload, client_id, size, replicas, group_id, data_type,
-             soft_pin_deadline_ms);
+    YLT_REFL(MetadataPayload, client_id, size, replicas, group_id, data_type);
 
     // Convert to StandbyObjectMetadata
     StandbyObjectMetadata ToStandbyMetadata(uint64_t sequence_id) const {
@@ -117,9 +111,6 @@ struct MetadataPayload {
         meta.last_sequence_id = sequence_id;
         meta.group_id = group_id.value_or("");
         meta.data_type = data_type.value_or(ObjectDataType::UNKNOWN);
-        if (soft_pin_deadline_ms.has_value() && *soft_pin_deadline_ms != 0) {
-            meta.soft_pin_deadline_ms = *soft_pin_deadline_ms;
-        }
         return meta;
     }
 };

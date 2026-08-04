@@ -101,18 +101,6 @@ uint64_t SaturatingMultiply(uint64_t lhs, uint64_t rhs) {
     return lhs * rhs;
 }
 
-uint64_t EncodeSoftPinDeadlineMs(
-    const std::optional<std::chrono::system_clock::time_point>& deadline) {
-    if (!deadline.has_value()) {
-        return 0;
-    }
-    const auto timestamp_ms =
-        std::chrono::duration_cast<std::chrono::milliseconds>(
-            deadline->time_since_epoch())
-            .count();
-    return timestamp_ms > 0 ? static_cast<uint64_t>(timestamp_ms) : 0;
-}
-
 // Decides whether PutStart may proceed with the replicas that were
 // actually allocated. Three deliberately different policies apply:
 //
@@ -2217,18 +2205,6 @@ void MasterService::RegisterCommittedSoftPin(const ObjectMetadata& metadata,
         *deadline);
 }
 
-void MasterService::RebuildSoftPinDeadlineIndex() {
-    soft_pin_deadline_index_.Clear();
-    for (size_t shard_idx = 0; shard_idx < kNumShards; ++shard_idx) {
-        auto& shard = metadata_shards_[shard_idx];
-        for (const auto& [tenant_id, tenant_state] : shard.tenants) {
-            for (const auto& [key, metadata] : tenant_state.metadata) {
-                RegisterCommittedSoftPin(metadata, shard_idx);
-            }
-        }
-    }
-}
-
 bool MasterService::IsSoftPinActive(
     const ObjectMetadata& metadata,
     const std::chrono::system_clock::time_point& now) const {
@@ -2893,42 +2869,13 @@ void MasterService::RestoreFromStandbySnapshot(
             }
 
             auto& tenant_state = shard->tenants[tenant_id];
-            std::optional<std::chrono::system_clock::time_point>
-                committed_soft_pin_timeout;
-            if (standby_meta.soft_pin_deadline_ms.has_value() &&
-                *standby_meta.soft_pin_deadline_ms != 0) {
-                const auto max_timestamp_ms =
-                    std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::system_clock::time_point::max()
-                            .time_since_epoch())
-                        .count();
-                if (max_timestamp_ms < 0 ||
-                    *standby_meta.soft_pin_deadline_ms >
-                        static_cast<uint64_t>(max_timestamp_ms)) {
-                    LOG(WARNING)
-                        << "RestoreFromStandbySnapshot: soft-pin deadline "
-                           "exceeds system_clock range, tenant_id="
-                        << tenant_id << ", key=" << user_key;
-                } else {
-                    const auto deadline = std::chrono::system_clock::time_point(
-                        std::chrono::milliseconds(
-                            *standby_meta.soft_pin_deadline_ms));
-                    if (deadline > now) {
-                        committed_soft_pin_timeout = deadline;
-                    }
-                }
-            }
-
-            auto [metadata_it, inserted] = tenant_state.metadata.emplace(
+            tenant_state.metadata.emplace(
                 std::piecewise_construct, std::forward_as_tuple(user_key),
                 std::forward_as_tuple(
                     standby_meta.client_id, now, standby_meta.size,
-                    std::move(replicas), std::move(committed_soft_pin_timeout),
-                    false, standby_meta.data_type, standby_meta.group_id,
-                    tenant_id, user_key));
-            if (inserted) {
-                RegisterCommittedSoftPin(metadata_it->second, shard_idx);
-            }
+                    std::move(replicas), std::nullopt, false,
+                    standby_meta.data_type, standby_meta.group_id, tenant_id,
+                    user_key));
             if (!standby_meta.group_id.empty()) {
                 RegisterGroupMember(tenant_state, tenant_id, user_key,
                                     standby_meta.group_id);
@@ -8075,12 +8022,9 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
                     auto& tenant_state = tenant_it->second;
                     for (auto it = tenant_state.metadata.begin();
                          it != tenant_state.metadata.end();) {
-                        const bool soft_pin_active =
-                            IsSoftPinActive(it->second, cleanup_now);
                         if (it->second.HasDiffRepStatus(
                                 ReplicaStatus::COMPLETE) ||
-                            (it->second.IsLeaseExpired(cleanup_now) &&
-                             !soft_pin_active)) {
+                            it->second.IsLeaseExpired(cleanup_now)) {
                             VLOG(1) << "clear metadata key=" << it->first;
                             it = EraseMetadata(tenant_state, it,
                                                tenant_it->first);
@@ -8136,11 +8080,8 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
                   << MasterMetricManager::instance().get_allocated_mem_size();
     }
 
-    // The deadline index is derived runtime state. Rebuild it only after the
-    // restored metadata has gone through the existing expiration and lease
-    // survival rules. Tests that intentionally skip cleanup still register
-    // expired deadlines so the next sweep can normalize them.
-    RebuildSoftPinDeadlineIndex();
+    // Soft pin is runtime-only and is never restored from a snapshot.
+    soft_pin_deadline_index_.Clear();
 
     // Rebuild total capacity metrics
     {
@@ -10168,8 +10109,7 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
             std::piecewise_construct, std::forward_as_tuple(std::move(key)),
             std::forward_as_tuple(
                 metadata_ptr->client_id, metadata_ptr->put_start_time,
-                metadata_ptr->size, metadata_ptr->PopReplicas(),
-                metadata_ptr->GetCommittedSoftPinTimeout(),
+                metadata_ptr->size, metadata_ptr->PopReplicas(), std::nullopt,
                 metadata_ptr->IsHardPinned(), metadata_ptr->data_type,
                 metadata_ptr->group_id, tenant_id, user_key));
 
@@ -10225,19 +10165,10 @@ MasterService::MetadataSerializer::SerializeMetadata(
             .count();
     packer.pack(lease_timestamp);
 
-    // Serialize soft_pin_timeout (if exists)
-    const auto soft_pin_timeout = metadata.GetCommittedSoftPinTimeout();
-    if (soft_pin_timeout.has_value()) {
-        packer.pack(true);  // Mark soft_pin_timeout exists
-        auto soft_pin_timestamp =
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                soft_pin_timeout.value().time_since_epoch())
-                .count();
-        packer.pack(soft_pin_timestamp);
-    } else {
-        packer.pack(false);        // Mark soft_pin_timeout does not exist
-        packer.pack(uint64_t(0));  // Placeholder
-    }
+    // Keep the legacy snapshot slots for format compatibility, but soft pin is
+    // runtime-only state and is intentionally not persisted.
+    packer.pack(false);
+    packer.pack(uint64_t(0));
 
     // Serialize replicas count
     packer.pack(static_cast<uint32_t>(metadata.CountReplicas()));
@@ -10303,11 +10234,10 @@ MasterService::MetadataSerializer::DeserializeMetadata(
     // Deserialize lease_timeout
     uint64_t lease_timestamp = array[index++].as<uint64_t>();
 
-    // Deserialize soft_pin_timeout flag
-    bool has_soft_pin_timeout = array[index++].as<bool>();
-
-    // Deserialize soft_pin_timeout value
-    uint64_t soft_pin_timestamp = array[index++].as<uint64_t>();
+    // Parse and discard the legacy soft-pin fields. Recovered objects always
+    // become ordinary cache.
+    (void)array[index++].as<bool>();
+    (void)array[index++].as<uint64_t>();
 
     const auto max_timestamp =
         std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -10315,9 +10245,7 @@ MasterService::MetadataSerializer::DeserializeMetadata(
             .count();
     if (max_timestamp < 0 ||
         put_start_time_timestamp > static_cast<uint64_t>(max_timestamp) ||
-        lease_timestamp > static_cast<uint64_t>(max_timestamp) ||
-        (has_soft_pin_timeout &&
-         soft_pin_timestamp > static_cast<uint64_t>(max_timestamp))) {
+        lease_timestamp > static_cast<uint64_t>(max_timestamp)) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
             "ObjectMetadata timestamp exceeds system_clock range"));
@@ -10397,17 +10325,13 @@ MasterService::MetadataSerializer::DeserializeMetadata(
             "deserialize ObjectMetadata optional field type mismatch"));
     }
 
-    // Create ObjectMetadata instance
-    std::optional<std::chrono::system_clock::time_point> soft_pin_timeout;
-    if (has_soft_pin_timeout) {
-        soft_pin_timeout.emplace(std::chrono::milliseconds(soft_pin_timestamp));
-    }
+    // Create ObjectMetadata instance. Soft pin is not restored.
     auto metadata = std::make_unique<ObjectMetadata>(
         client_id,
         std::chrono::system_clock::time_point(
             std::chrono::milliseconds(put_start_time_timestamp)),
-        size, std::move(replicas), std::move(soft_pin_timeout), is_hard_pinned,
-        data_type, group_id);
+        size, std::move(replicas), std::nullopt, is_hard_pinned, data_type,
+        group_id);
     metadata->object_checksum = object_checksum;
     metadata->lease_timeout = std::chrono::system_clock::time_point(
         std::chrono::milliseconds(lease_timestamp));
@@ -11403,8 +11327,6 @@ std::string MasterService::SerializeMetadataForOpLog(
     payload.size = metadata.size;
     payload.group_id = metadata.group_id;
     payload.data_type = metadata.data_type;
-    payload.soft_pin_deadline_ms =
-        EncodeSoftPinDeadlineMs(metadata.GetCommittedSoftPinTimeout());
 
     // Extract replica descriptors - get them all at once
     const auto& replicas = metadata.GetAllReplicas();
@@ -11430,8 +11352,6 @@ std::string MasterService::SerializeMetadataForOpLogWithoutMemReplicas(
     payload.size = metadata.size;
     payload.group_id = metadata.group_id;
     payload.data_type = metadata.data_type;
-    payload.soft_pin_deadline_ms =
-        EncodeSoftPinDeadlineMs(metadata.GetCommittedSoftPinTimeout());
 
     const auto& replicas = metadata.GetAllReplicas();
     payload.replicas.reserve(replicas.size());
@@ -11456,8 +11376,6 @@ std::string MasterService::SerializeMetadataForOpLogFromReplicaDescriptors(
     payload.replicas = replicas;
     payload.group_id = group_id;
     payload.data_type = data_type;
-    // Replica-only updates intentionally omit soft_pin_deadline_ms so the
-    // standby preserves its currently committed deadline.
     auto result = struct_pack::serialize(payload);
     return std::string(result.begin(), result.end());
 }

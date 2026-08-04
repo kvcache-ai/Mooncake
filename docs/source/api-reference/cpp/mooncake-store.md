@@ -60,6 +60,9 @@ lifetime: reads do not extend it. `PRESERVE` keeps the committed deadline on an
 Upsert, `ENABLE` starts a new lifetime, and `DISABLE` removes it when the write
 commits. `soft_pin_ttl_ms` is valid only with `ENABLE`; zero commits ordinary
 cache, and values above the Master's configured maximum are rejected.
+Soft-pin state is not persisted in snapshots or the HA OpLog; after recovery or
+Standby promotion, restored objects are ordinary cache until a later write
+explicitly enables soft pinning again.
 
 ### Upsert
 

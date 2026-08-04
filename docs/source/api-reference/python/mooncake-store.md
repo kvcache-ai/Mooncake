@@ -624,6 +624,8 @@ config.soft_pin_ttl_ms = 60_000  # Optional; omitted uses the Master default
 
 `soft_pin_ttl_ms` is valid only with `ENABLE`. The Master rejects TTLs above
 `max_kv_soft_pin_ttl`; a value of zero commits the object as ordinary cache.
+Soft-pin state is not persisted in snapshots or the HA OpLog. Restored objects
+therefore become ordinary cache after recovery or Standby promotion.
 
 #### with_hard_pin
 **Type:** `bool`

@@ -160,16 +160,6 @@ void OpLogApplier::ApplyPutEnd(const OpLogEntry& entry) {
     // Convert to StandbyObjectMetadata and store
     StandbyObjectMetadata metadata =
         payload.ToStandbyMetadata(entry.sequence_id);
-    if (!payload.soft_pin_deadline_ms.has_value()) {
-        // Replica-only PUT_END records intentionally omit the field. Preserve
-        // the committed deadline learned from the snapshot or an earlier
-        // authoritative PUT_END instead of silently downgrading the object.
-        auto previous =
-            metadata_store_->GetMetadata(entry.tenant_id, entry.object_key);
-        if (previous.has_value()) {
-            metadata.soft_pin_deadline_ms = previous->soft_pin_deadline_ms;
-        }
-    }
 
     if (!metadata_store_->PutMetadata(entry.tenant_id, entry.object_key,
                                       metadata)) {

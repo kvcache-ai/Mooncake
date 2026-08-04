@@ -127,8 +127,8 @@ DeserializeStandbyObjectMetadata(
         (void)array[index++].as<uint64_t>();  // put_start_time
         const auto size = static_cast<size_t>(array[index++].as<uint64_t>());
         const auto lease_timestamp_ms = array[index++].as<uint64_t>();
-        const bool has_soft_pin_timeout = array[index++].as<bool>();
-        const auto soft_pin_timestamp_ms = array[index++].as<uint64_t>();
+        (void)array[index++].as<bool>();      // legacy soft-pin flag
+        (void)array[index++].as<uint64_t>();  // legacy soft-pin deadline
         const auto replica_count = array[index++].as<uint32_t>();
 
         const auto max_timestamp_ms =
@@ -136,9 +136,7 @@ DeserializeStandbyObjectMetadata(
                 std::chrono::system_clock::time_point::max().time_since_epoch())
                 .count();
         if (max_timestamp_ms < 0 ||
-            lease_timestamp_ms > static_cast<uint64_t>(max_timestamp_ms) ||
-            (has_soft_pin_timeout &&
-             soft_pin_timestamp_ms > static_cast<uint64_t>(max_timestamp_ms))) {
+            lease_timestamp_ms > static_cast<uint64_t>(max_timestamp_ms)) {
             LOG(ERROR) << "Snapshot metadata timestamp exceeds system_clock "
                           "range";
             return tl::make_unexpected(ErrorCode::DESERIALIZE_FAIL);
@@ -180,15 +178,7 @@ DeserializeStandbyObjectMetadata(
 
         const auto lease_timeout = std::chrono::system_clock::time_point(
             std::chrono::milliseconds(lease_timestamp_ms));
-        std::optional<std::chrono::system_clock::time_point> soft_pin_timeout;
-        if (has_soft_pin_timeout) {
-            soft_pin_timeout.emplace(
-                std::chrono::milliseconds(soft_pin_timestamp_ms));
-        }
-
-        if (size == 0 ||
-            (lease_timeout <= now && (!soft_pin_timeout.has_value() ||
-                                      soft_pin_timeout.value() <= now))) {
+        if (size == 0 || lease_timeout <= now) {
             return std::optional<StandbyObjectMetadata>();
         }
 
@@ -244,9 +234,6 @@ DeserializeStandbyObjectMetadata(
         metadata.last_sequence_id = snapshot_sequence_id;
         metadata.data_type = data_type;
         metadata.group_id = std::move(group_id);
-        if (soft_pin_timeout.has_value() && *soft_pin_timeout > now) {
-            metadata.soft_pin_deadline_ms = soft_pin_timestamp_ms;
-        }
         return std::optional<StandbyObjectMetadata>(std::move(metadata));
     } catch (const std::exception& ex) {
         LOG(ERROR) << "Failed to parse snapshot metadata entry: " << ex.what();

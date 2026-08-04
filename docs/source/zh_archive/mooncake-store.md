@@ -631,6 +631,8 @@ virtual tl::expected<std::vector<Replica>, ErrorCode> Allocate(
 
 soft pin 生命周期从首个副本变为可读时开始。deadline 到达后，对象降级为普通 Cache；后续访问只授予普通读租约，不会重新启用 soft pin。后续写入仍可显式重新启用。
 
+soft pin 是仅在运行时生效的淘汰优先级状态，不会持久化到快照或 HA OpLog。恢复或 Standby 提升后，恢复出的对象将降级为普通 Cache；快照中的兼容字段仅用于保持格式，恢复时会被忽略。
+
 `master_service` 中有三个与软固定机制相关的启动参数：
 
 * `default_kv_soft_pin_ttl`：未显式传入 TTL 时使用的固定软固定生命周期。默认值为 `30 分钟`，访问不会续期。
