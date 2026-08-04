@@ -426,6 +426,7 @@ ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude libffi.so* \
     --exclude libcuda.so* \
     --exclude libcudart.so* \
+    --exclude libnccl.so* \
     --exclude libmusa.so* \
     --exclude libmusart.so* \
     --exclude libamdhip64.so* \

@@ -17,6 +17,7 @@ jobs:
       build-nvlink-allocator: true
       cmake-args: >-
         -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON
+        -DUSE_NCCL_HOST=ON -DUSE_NCCL_DEVICE=ON
         -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
       artifact-prefix: mooncake-wheel-cu130
       version-override: 0.0.0.dev0
