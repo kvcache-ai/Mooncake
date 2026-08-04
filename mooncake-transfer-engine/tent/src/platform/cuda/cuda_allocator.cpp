@@ -22,6 +22,25 @@
 
 namespace mooncake {
 namespace tent {
+namespace {
+
+// Return the owning CUDA device for a device pointer. Host and unregistered
+// pointers deliberately return -1 so host-only copies avoid CUDA entirely.
+int getCudaDeviceId(const void* ptr) {
+    cudaPointerAttributes attributes{};
+    auto status = cudaPointerGetAttributes(&attributes, ptr);
+    if (status != cudaSuccess) {
+        // cudaPointerGetAttributes may report an unregistered host pointer as
+        // an error on older runtimes. Clear the sticky error before falling
+        // back to a CPU copy.
+        cudaGetLastError();
+        return -1;
+    }
+    return attributes.type == cudaMemoryTypeDevice ? attributes.device : -1;
+}
+
+}  // namespace
+
 Status CudaPlatform::allocate(void** pptr, size_t size,
                               MemoryOptions& options) {
     LocationParser location(options.location);
@@ -56,12 +75,31 @@ Status CudaPlatform::free(void* ptr, size_t size) {
 }
 
 Status CudaPlatform::copy(void* dst, void* src, size_t length) {
+    if (length == 0) return Status::OK();
+
+    const int dst_device = getCudaDeviceId(dst);
+    const int src_device = getCudaDeviceId(src);
+    const int copy_device = dst_device >= 0 ? dst_device : src_device;
+    if (copy_device >= 0) {
+        // Transport worker threads start on CUDA's default device (GPU 0).
+        // Select the device that owns the transfer buffer before acquiring a
+        // stream or issuing the copy, otherwise the runtime implicitly creates
+        // a GPU 0 primary context even when the payload belongs elsewhere.
+        CHECK_CUDA(cudaSetDevice(copy_device));
+        // Keep the selected device current on this worker. Restoring its
+        // implicit default would initialize the GPU 0 context we are avoiding.
+    }
+
     // Use cudaMemcpyAsync with a non-blocking stream instead of cudaMemcpy(),
     // as the latter relies on the legacy default stream and can introduce
     // unintended synchronization or even deadlocks in downstream
     // components (e.g. mooncake-pg).
     CUDAStreamHandle stream;
-    CHECK_STATUS(getStreamFromPool(stream));
+    if (copy_device >= 0) {
+        CHECK_STATUS(getStreamFromPool(stream, copy_device));
+    } else {
+        CHECK_STATUS(getStreamFromPool(stream));
+    }
     CHECK_CUDA(
         cudaMemcpyAsync(dst, src, length, cudaMemcpyDefault, stream.get()));
     CHECK_CUDA(cudaStreamSynchronize(stream.get()));
