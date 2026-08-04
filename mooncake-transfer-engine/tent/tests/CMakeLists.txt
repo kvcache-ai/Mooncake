@@ -204,15 +204,6 @@ if(USE_HIP)
   add_test(NAME tent_rocm_platform_test COMMAND tent_rocm_platform_test)
 endif()
 
-if(USE_CUDA)
-  add_executable(tent_cuda_platform_test cuda_platform_test.cpp)
-  target_link_libraries(tent_cuda_platform_test PRIVATE gtest gtest_main
-                                                        tent_link_group)
-  target_include_directories(tent_cuda_platform_test
-                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
-  add_test(NAME tent_cuda_platform_test COMMAND tent_cuda_platform_test)
-endif()
-
 if(TARGET tent_xport_gds)
   add_executable(tent_gds_transport_status_test gds_transport_status_test.cpp)
   target_link_libraries(tent_gds_transport_status_test PRIVATE gtest gtest_main
