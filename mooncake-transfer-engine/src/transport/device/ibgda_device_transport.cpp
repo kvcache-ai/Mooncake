@@ -32,7 +32,6 @@
 #include <unistd.h>
 
 #include "cuda_alike.h"
-#include "environ.h"
 #include "transport/device/ibgda/memheap.h"
 #include "transport/device/ibgda/mlx5_ifc.h"
 #include "transport/device/ibgda/mlx5gda.h"
@@ -222,11 +221,6 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     }
 
     int allocateControlBuffer() override {
-        if (Environ::Get().GetWithNvidiaPeermem()) {
-            LOG(INFO) << "[EP IBGDA] Selected legacy GPU-VA control buffer "
-                         "because WITH_NVIDIA_PEERMEM is enabled";
-            return allocateControlBuffer(ControlMemoryMode::kGpuVa);
-        }
 #if defined(USE_CUDA) && defined(MOONCAKE_HAVE_MLX5_DMABUF_UMEM)
         if (cudaSupportsDmabuf()) {
             ctrl_buf_mode_ = ControlMemoryMode::kGpuDmabuf;
@@ -234,15 +228,13 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
                          "regions";
             return 0;
         }
-        LOG(ERROR) << "[EP IBGDA] CUDA DMA-BUF control memory is unavailable; "
-                      "set WITH_NVIDIA_PEERMEM=1 to select the legacy GPU-VA "
-                      "path";
-        return -1;
+        LOG(WARNING) << "[EP IBGDA] CUDA DMA-BUF control memory is unavailable; "
+                        "trying GPU-VA control buffer";
+        return allocateGpuVaOrHostControlBuffer();
 #elif defined(USE_CUDA)
-        LOG(ERROR) << "[EP IBGDA] DMA-BUF control UMEM was unavailable at "
-                      "build time; set WITH_NVIDIA_PEERMEM=1 to select the "
-                      "legacy GPU-VA path";
-        return -1;
+        LOG(WARNING) << "[EP IBGDA] DMA-BUF control UMEM was unavailable at "
+                        "build time; trying GPU-VA control buffer";
+        return allocateGpuVaOrHostControlBuffer();
 #endif
         return allocateControlBuffer(ControlMemoryMode::kGpuVa);
     }
@@ -262,8 +254,9 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
                 mpd_, ctrl_buf_, ctrl_buf_umem_, ctrl_buf_heap_, pd_, 16384, 1,
                 stream, allocator);
             if (!qp) {
+                const int qp_errno = errno;
                 LOG(ERROR) << "[EP IBGDA] mlx5gda_create_rc_qp failed at " << i;
-                if (retryWithHostControlBuffer())
+                if (retryControlBuffer(qp_errno))
                     return createQueuePairs(stream_ptr);
                 return -1;
             }
@@ -610,18 +603,37 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
         return 0;
     }
 
-    bool retryWithHostControlBuffer() {
+    int allocateGpuVaOrHostControlBuffer() {
+        if (allocateControlBuffer(ControlMemoryMode::kGpuVa) == 0) return 0;
+
+        LOG(WARNING) << "[EP IBGDA] GPU-VA control buffer is unavailable; "
+                        "trying host-backed mapped control buffer";
+        return allocateControlBuffer(ControlMemoryMode::kHostMapped);
+    }
+
+    bool retryControlBuffer(int failure_errno) {
         auto failure = mlx5gda_last_create_qp_failure();
-        if (Environ::Get().GetWithNvidiaPeermem() ||
-            ctrl_buf_mode_ == ControlMemoryMode::kHostMapped ||
-            !isCreateQpBadParam(failure))
+        const bool dmabuf_control_region_failure =
+            ctrl_buf_mode_ == ControlMemoryMode::kGpuDmabuf;
+        if (ctrl_buf_mode_ == ControlMemoryMode::kHostMapped ||
+            (!isCreateQpBadParam(failure) && !dmabuf_control_region_failure))
             return false;
 
-        LOG(WARNING) << "[EP IBGDA] GPU-backed control buffer was rejected by "
-                        "DevX CREATE_QP"
-                     << " (status=0x" << std::hex << failure.status
-                     << " syndrome=0x" << failure.syndrome << std::dec
-                     << "); retrying with host-backed mapped control buffer";
+        if (dmabuf_control_region_failure) {
+            LOG(WARNING) << "[EP IBGDA] DMA-BUF control-region creation failed "
+                            "(errno="
+                         << failure_errno
+                         << "); retrying with GPU-VA control buffer";
+            destroyQueuePairs();
+            freeControlBuffer();
+            return allocateGpuVaOrHostControlBuffer() == 0;
+        } else {
+            LOG(WARNING) << "[EP IBGDA] GPU-backed control buffer was rejected "
+                            "by DevX CREATE_QP"
+                         << " (status=0x" << std::hex << failure.status
+                         << " syndrome=0x" << failure.syndrome << std::dec
+                         << "); retrying with host-backed mapped control buffer";
+        }
 
         destroyQueuePairs();
         freeControlBuffer();
