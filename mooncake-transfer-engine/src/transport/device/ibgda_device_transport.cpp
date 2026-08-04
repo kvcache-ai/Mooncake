@@ -228,8 +228,9 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
                          "regions";
             return 0;
         }
-        LOG(WARNING) << "[EP IBGDA] CUDA DMA-BUF control memory is unavailable; "
-                        "trying GPU-VA control buffer";
+        LOG(WARNING)
+            << "[EP IBGDA] CUDA DMA-BUF control memory is unavailable; "
+               "trying GPU-VA control buffer";
         return allocateGpuVaOrHostControlBuffer();
 #endif
         return allocateControlBuffer(ControlMemoryMode::kGpuVa);
@@ -624,11 +625,12 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
             freeControlBuffer();
             return allocateGpuVaOrHostControlBuffer() == 0;
         } else {
-            LOG(WARNING) << "[EP IBGDA] GPU-backed control buffer was rejected "
-                            "by DevX CREATE_QP"
-                         << " (status=0x" << std::hex << failure.status
-                         << " syndrome=0x" << failure.syndrome << std::dec
-                         << "); retrying with host-backed mapped control buffer";
+            LOG(WARNING)
+                << "[EP IBGDA] GPU-backed control buffer was rejected "
+                   "by DevX CREATE_QP"
+                << " (status=0x" << std::hex << failure.status << " syndrome=0x"
+                << failure.syndrome << std::dec
+                << "); retrying with host-backed mapped control buffer";
         }
 
         destroyQueuePairs();
