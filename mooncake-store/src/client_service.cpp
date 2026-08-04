@@ -3343,6 +3343,11 @@ tl::expected<void, ErrorCode> Client::NotifyOffloadSuccess(
     return master_client_.NotifyOffloadSuccess(client_id_, tasks, metadatas);
 }
 
+tl::expected<std::vector<uint8_t>, ErrorCode> Client::ValidateOffloadGenerations(
+    const std::vector<OffloadTaskItem>& tasks) {
+    return master_client_.ValidateOffloadGenerations(tasks);
+}
+
 tl::expected<void, ErrorCode> Client::PromotionObjectHeartbeat(
     std::vector<PromotionTaskItem>& promotion_objects) {
     auto response = master_client_.PromotionObjectHeartbeat(client_id_);

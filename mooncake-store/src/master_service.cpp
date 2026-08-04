@@ -3831,16 +3831,19 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
                 return replica.is_completed() && replica.is_memory_replica();
             },
             [this, &object_id, &tenant_state, &task_created](Replica& replica) {
-                auto result = PushOffloadingQueue(object_id, replica);
+                if (task_created) return;
+                const uint64_t gen =
+                    next_offload_generation_.fetch_add(
+                        1, std::memory_order_relaxed);
+                auto result = PushOffloadingQueue(object_id, replica, gen);
                 if (result) {
-                    if (!task_created) {
-                        replica.inc_refcnt();
-                        tenant_state.offloading_tasks.emplace(
-                            object_id.user_key,
-                            OffloadingTask{replica.id(),
-                                           std::chrono::system_clock::now()});
-                        task_created = true;
-                    }
+                    replica.inc_refcnt();
+                    tenant_state.offloading_tasks.emplace(
+                        object_id.user_key,
+                        OffloadingTask{replica.id(),
+                                       std::chrono::system_clock::now(),
+                                       gen});
+                    task_created = true;
                 }
             });
     }
@@ -4265,13 +4268,50 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                         ErrorCode::OBJECT_HAS_REPLICATION_TASK);
                 }
 
-                // Reject if an offload-to-disk task is in progress (same
-                // reason).
-                if (tenant_state.offloading_tasks.count(key) > 0) {
+                // Preempt any in-progress offload for this key. QUEUED and
+                // IN-FLIGHT tasks are cancelled the same way: erase the task
+                // marker, drop the source refcnt, and clear every segment
+                // mirror. For IN-FLIGHT tasks the worker keeps reading the
+                // old buffer, but its late completion carries the pre-
+                // preempt generation and is dropped by
+                // ValidateOffloadGenerations (pre-SSD-IO) and
+                // NotifyOffloadSuccess (defence in depth). To ensure the
+                // worker's in-flight read never races with the upsert's
+                // RDMA write, move the existing memory replicas into
+                // discarded_replicas_ and fall through to Case A so the
+                // upsert allocates fresh buffers.
+                auto offload_it = tenant_state.offloading_tasks.find(key);
+                if (offload_it != tenant_state.offloading_tasks.end()) {
                     LOG(INFO) << "key=" << key
-                              << ", error=object_has_offloading_task";
-                    return tl::make_unexpected(
-                        ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+                              << ", action=upsert_preempts_offload"
+                              << ", cancelled_generation="
+                              << offload_it->second.generation;
+                    auto source =
+                        metadata.GetReplicaByID(offload_it->second.source_id);
+                    if (source != nullptr) {
+                        source->dec_refcnt();
+                    }
+                    tenant_state.offloading_tasks.erase(offload_it);
+                    const std::string scoped_key =
+                        object_id.tenant_id.MakeScopedKey(key);
+                    ScopedLocalDiskSegmentAccess ssd_access =
+                        segment_manager_.getLocalDiskSegmentAccess();
+                    for (auto& [_, segment] :
+                         ssd_access.getClientLocalDiskSegment()) {
+                        MutexLocker locker(&segment->offloading_mutex_);
+                        segment->offloading_objects.erase(scoped_key);
+                    }
+                    auto old_replicas =
+                        PopReplicasWithCacheTotalAccounting(metadata);
+                    if (!old_replicas.empty()) {
+                        std::lock_guard lock(discarded_replicas_mutex_);
+                        discarded_replicas_.emplace_back(
+                            std::move(old_replicas),
+                            now + put_start_release_timeout_sec_);
+                    }
+                    EraseMetadata(tenant_state, it, object_id.tenant_id,
+                                  QuotaEraseMode::kFull, &shard);
+                    it = tenant_state.metadata.end();
                 }
 
                 // Preempt an in-progress Put/Upsert on the same key.  The
@@ -4280,7 +4320,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 // the old writer may still be doing RDMA writes.  Unlike
                 // PutStart (which only preempts after a timeout), UpsertStart
                 // preempts immediately.
-                if (tenant_state.processing_keys.count(key) > 0) {
+                if (it != tenant_state.metadata.end() &&
+                    tenant_state.processing_keys.count(key) > 0) {
                     auto processing_replicas =
                         metadata.PopReplicas(&Replica::fn_is_processing);
                     if (!processing_replicas.empty()) {
@@ -6174,6 +6215,18 @@ auto MasterService::NotifyOffloadSuccess(
                 // for a master-admitted offload completion. Without this task
                 // marker, fall through to the regular registration check.
                 if (task_it != tenant_state.offloading_tasks.end()) {
+                    // Defence in depth: reject late completions whose wire
+                    // generation no longer matches. Sentinel 0 keeps the
+                    // orphan-fallback path for pre-generation payloads.
+                    if (task.generation != 0 &&
+                        task.generation != task_it->second.generation) {
+                        LOG(INFO)
+                            << "key=" << request_object_id.user_key
+                            << ", action=drop_stale_offload_notify"
+                            << ", task_gen=" << task.generation
+                            << ", current_gen=" << task_it->second.generation;
+                        continue;
+                    }
                     auto source =
                         obj_metadata.GetReplicaByID(task_it->second.source_id);
                     if (source != nullptr) {
@@ -6219,6 +6272,16 @@ auto MasterService::NotifyOffloadSuccess(
         }
 
         if (!handled_existing_object) {
+            // Orphan-fallback: no task marker. A non-zero wire generation
+            // means UpsertStart cancelled the task after it was dispatched,
+            // so the completion is stale. Sentinel 0 keeps the historical
+            // AddReplica path for pre-generation payloads.
+            if (task.generation != 0) {
+                LOG(INFO) << "key=" << request_object_id.user_key
+                          << ", action=drop_stale_offload_notify_orphan"
+                          << ", task_gen=" << task.generation;
+                continue;
+            }
             auto normalized_tenant_result =
                 ResolveTenantIdForWrite(request_object_id.tenant_id);
             if (!normalized_tenant_result) {
@@ -6252,8 +6315,43 @@ auto MasterService::NotifyOffloadSuccess(
     return {};
 }
 
+auto MasterService::ValidateOffloadGenerations(
+    const std::vector<OffloadTaskItem>& tasks)
+    -> tl::expected<std::vector<uint8_t>, ErrorCode> {
+    std::vector<uint8_t> results;
+    results.reserve(tasks.size());
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    for (const auto& task : tasks) {
+        // Sentinel 0: pre-generation payload (HA restore, older workers).
+        // Report valid to preserve the historical orphan-fallback path.
+        if (task.generation == 0) {
+            results.push_back(1);
+            continue;
+        }
+        const TenantId task_tenant = enable_multi_tenants_
+                                         ? TenantId(task.tenant_id)
+                                         : TenantId::Default();
+        const auto request_object_id =
+            MakeObjectIdentityForRequest(task.key, task_tenant);
+        MetadataAccessorRW accessor(this, request_object_id);
+        if (!accessor.Exists()) {
+            results.push_back(0);
+            continue;
+        }
+        auto& tenant_state = accessor.GetTenantState();
+        auto task_it =
+            tenant_state.offloading_tasks.find(request_object_id.user_key);
+        results.push_back(
+            task_it != tenant_state.offloading_tasks.end() &&
+                    task_it->second.generation == task.generation
+                ? 1
+                : 0);
+    }
+    return results;
+}
+
 tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
-    const ObjectIdentity& object_id, Replica& replica) {
+    const ObjectIdentity& object_id, Replica& replica, uint64_t generation) {
     const auto& segment_names = replica.get_segment_names();
     if (segment_names.empty()) {
         return {};
@@ -6292,7 +6390,8 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
             object_id.tenant_id.MakeScopedKey(object_id.user_key),
             OffloadTaskItem{.tenant_id = object_id.tenant_id.value(),
                             .key = object_id.user_key,
-                            .size = size});
+                            .size = size,
+                            .generation = generation});
         if (!res.second) {
             return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
         }
@@ -7804,12 +7903,15 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                     if (queued) {
                         return;
                     }
+                    const uint64_t gen = next_offload_generation_.fetch_add(
+                        1, std::memory_order_relaxed);
                     auto result = PushOffloadingQueue(
-                        MakeObjectIdentity(key, normalized_tenant), replica);
+                        MakeObjectIdentity(key, normalized_tenant), replica,
+                        gen);
                     if (result) {
                         replica.inc_refcnt();
                         tenant_state.offloading_tasks.emplace(
-                            key, OffloadingTask{replica.id(), now});
+                            key, OffloadingTask{replica.id(), now, gen});
                         queued = true;
                     }
                 });
@@ -8059,12 +8161,14 @@ void MasterService::BatchEvict(double evict_ratio_target,
             [this, &tenant_id, &key, &tenant_state, &queued,
              &now](Replica& replica) {
                 if (queued) return;  // only need to pin one replica for offload
+                const uint64_t gen = next_offload_generation_.fetch_add(
+                    1, std::memory_order_relaxed);
                 auto result = PushOffloadingQueue(
-                    MakeObjectIdentity(key, tenant_id), replica);
+                    MakeObjectIdentity(key, tenant_id), replica, gen);
                 if (result) {
                     replica.inc_refcnt();
                     tenant_state.offloading_tasks.emplace(
-                        key, OffloadingTask{replica.id(), now});
+                        key, OffloadingTask{replica.id(), now, gen});
                     queued = true;
                 }
             });

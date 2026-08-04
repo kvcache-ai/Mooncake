@@ -526,6 +526,14 @@ class Client {
         const std::vector<StorageObjectMetadata>& metadatas);
 
     /**
+     * @brief Pre-SSD-IO check that pending offload tasks are still current
+     * on master. Callers must drop stale entries from the batch before
+     * writing bucket data to SSD.
+     */
+    tl::expected<std::vector<uint8_t>, ErrorCode> ValidateOffloadGenerations(
+        const std::vector<OffloadTaskItem>& tasks);
+
+    /**
      * @brief Fetch tasks assigned to a client
      * @param batch_size Number of tasks to fetch
      * @return tl::expected<std::vector<TaskAssignment>, ErrorCode> list of

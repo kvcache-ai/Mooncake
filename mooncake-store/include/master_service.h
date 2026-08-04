@@ -86,6 +86,10 @@ class MasterServiceHATest;
 // invalidate a segment allocator via PrepareUnmountSegment WITHOUT the
 // ClearInvalidHandles sweep that MasterService::UnmountSegment performs.
 class MasterServiceProcessingKeyDoubleEraseTest;
+// Friended so multi-segment tests inject a second mirror into
+// LocalDiskSegment::offloading_objects without relying on allocator-
+// driven cross-segment placement.
+class OffloadOnEvictTest;
 }  // namespace test
 namespace benchmarks {
 class BatchEvictBench;
@@ -118,6 +122,7 @@ class MasterService {
     friend class test::BatchEvictTest;
     // double-erase processing_keys UAF repro (2026-08-03 prod segfault)
     friend class test::MasterServiceProcessingKeyDoubleEraseTest;
+    friend class test::OffloadOnEvictTest;
     friend class MasterSnapshotManager;    // Allow access to internal state for
                                            // snapshot
     friend class ha::MasterSnapshotCodec;  // Allow codec to access private
@@ -722,6 +727,19 @@ class MasterService {
         -> tl::expected<void, ErrorCode>;
 
     /**
+     * @brief Check that each pending offload task is still current. Called
+     * by the worker right before writing a bucket to SSD; stale entries
+     * (result[i] == 0) must be dropped.
+     *
+     * Sentinel: task.generation == 0 always reports valid so pre-generation
+     * wire payloads (HA restore / older workers) keep the orphan-fallback
+     * path. uint8_t is used instead of bool for struct-pack compatibility.
+     */
+    auto ValidateOffloadGenerations(
+        const std::vector<OffloadTaskItem>& tasks)
+        -> tl::expected<std::vector<uint8_t>, ErrorCode>;
+
+    /**
      * @brief Heartbeat-driven pull of pending promotion work for a client.
      * Returns tenant-scoped promotion tasks for the holder client and clears
      * its per-client promotion_objects queue. The per-shard promotion_tasks
@@ -1253,6 +1271,10 @@ class MasterService {
     struct OffloadingTask {
         ReplicaID source_id;
         std::chrono::system_clock::time_point start_time;
+        // Monotonic id stamped at task creation. UpsertStart preemption
+        // erases this entry; late completions carrying an older value are
+        // rejected by ValidateOffloadGenerations / NotifyOffloadSuccess.
+        uint64_t generation{0};
     };
 
     // Tracks an in-flight LOCAL_DISK -> MEMORY copy. The source
@@ -1598,7 +1620,7 @@ class MasterService {
                          std::string* error_reason);
 
     tl::expected<void, ErrorCode> PushOffloadingQueue(
-        const ObjectIdentity& object_id, Replica& replica);
+        const ObjectIdentity& object_id, Replica& replica, uint64_t generation);
 
     struct GracefulUnmountDeadlineRecord {
         UUID segment_id;
@@ -2057,6 +2079,11 @@ class MasterService {
     // promotion task reaper after the task entry is erased. Relaxed memory
     // order is safe — the value is an advisory soft cap, not a barrier.
     std::atomic<uint64_t> promotion_in_flight_{0};
+    // Generation stamped on every offload task. UpsertStart bumps the value
+    // for a key by cancelling the current marker; late completions with the
+    // old generation are dropped. Starts at 1 so 0 stays reserved as the
+    // wire sentinel for pre-generation payloads.
+    std::atomic<uint64_t> next_offload_generation_{1};
     // Promotion retry candidate state.
     std::atomic<uint64_t> promotion_candidate_count_{0};
     std::atomic<size_t> promotion_retry_cursor_{0};

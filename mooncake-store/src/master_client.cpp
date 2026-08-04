@@ -233,6 +233,11 @@ struct RpcNameTraits<&WrappedMasterService::NotifyOffloadSuccess> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::ValidateOffloadGenerations> {
+    static constexpr const char* value = "ValidateOffloadGenerations";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::PromotionObjectHeartbeat> {
     static constexpr const char* value = "PromotionObjectHeartbeat";
 };
@@ -1033,6 +1038,18 @@ tl::expected<void, ErrorCode> MasterClient::NotifyOffloadSuccess(
 
     auto result = invoke_rpc<&WrappedMasterService::NotifyOffloadSuccess, void>(
         client_id, tasks, metadatas);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<std::vector<uint8_t>, ErrorCode>
+MasterClient::ValidateOffloadGenerations(
+    const std::vector<OffloadTaskItem>& tasks) {
+    ScopedVLogTimer timer(1, "MasterClient::ValidateOffloadGenerations");
+    timer.LogRequest("tasks_count=", tasks.size());
+    auto result =
+        invoke_rpc<&WrappedMasterService::ValidateOffloadGenerations,
+                   std::vector<uint8_t>>(tasks);
     timer.LogResponseExpected(result);
     return result;
 }

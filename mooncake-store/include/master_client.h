@@ -446,6 +446,16 @@ class MasterClient {
         const std::vector<StorageObjectMetadata>& metadatas);
 
     /**
+     * @brief Pre-SSD-IO check that a batch of pending offload tasks is still
+     * current. Callers must drop stale entries (result[i] == false) from
+     * the batch before writing bucket data to SSD; otherwise a late
+     * completion can attach a stale LOCAL_DISK replica if UpsertStart
+     * cancelled the task after the mirror was drained.
+     */
+    [[nodiscard]] tl::expected<std::vector<uint8_t>, ErrorCode>
+    ValidateOffloadGenerations(const std::vector<OffloadTaskItem>& tasks);
+
+    /**
      * @brief Heartbeat-driven pull of pending L2->L1 promotion work for a
      * client. Returns tenant-scoped tasks the caller should read from local
      * SSD and stage as MEMORY replicas via PromotionAllocStart +

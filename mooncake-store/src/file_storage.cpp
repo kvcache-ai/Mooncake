@@ -555,6 +555,47 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             continue;
         }
 
+        // Pre-SSD-IO generation check. UpsertStart may have preempted an
+        // offload after its mirror was drained: the master marker is gone
+        // and OffloadTaskItem.generation no longer matches. Route stale
+        // keys through failed_tasks so the NACK flush releases the source
+        // refcount and no SSD bucket is written.
+        {
+            std::vector<OffloadTaskItem> validate_tasks;
+            std::vector<std::string> validate_keys;
+            validate_tasks.reserve(batch_object.size());
+            validate_keys.reserve(batch_object.size());
+            for (const auto& [obj_key, _] : batch_object) {
+                validate_tasks.push_back(task_by_storage_key.at(obj_key));
+                validate_keys.push_back(obj_key);
+            }
+            auto validation =
+                client_->ValidateOffloadGenerations(validate_tasks);
+            if (!validation) {
+                // Master-side gate still applies in NotifyOffloadSuccess.
+                LOG(WARNING)
+                    << "[OFFLOAD] ValidateOffloadGenerations failed, "
+                       "skipping pre-SSD-IO check: "
+                    << validation.error();
+            } else {
+                const auto& results = validation.value();
+                for (size_t i = 0; i < validate_keys.size(); ++i) {
+                    if (i >= results.size() || !results[i]) {
+                        const auto& obj_key = validate_keys[i];
+                        const auto& task = task_by_storage_key.at(obj_key);
+                        LOG(INFO) << "[OFFLOAD] drop stale key, key="
+                                  << task.key
+                                  << ", generation=" << task.generation;
+                        failed_tasks.push_back(task);
+                        batch_object.erase(obj_key);
+                    }
+                }
+            }
+            if (batch_object.empty()) {
+                continue;
+            }
+        }
+
         // D2H staging: replace device slices with host memory slices
         // so that storage_backend (ConcatSlicesToString / BuildBucket /
         // WriteBucket) always receives host pointers.

@@ -1538,6 +1538,16 @@ tl::expected<void, ErrorCode> WrappedMasterService::NotifyOffloadSuccess(
     return result;
 }
 
+tl::expected<std::vector<uint8_t>, ErrorCode>
+WrappedMasterService::ValidateOffloadGenerations(
+    const std::vector<OffloadTaskItem>& tasks) {
+    ScopedVLogTimer timer(1, "ValidateOffloadGenerations");
+    timer.LogRequest("action=validate_offload_generations");
+    auto result = master_service_.ValidateOffloadGenerations(tasks);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<std::vector<PromotionTaskItem>, ErrorCode>
 WrappedMasterService::PromotionObjectHeartbeat(const UUID& client_id) {
     ScopedVLogTimer timer(1, "PromotionObjectHeartbeat");
@@ -1729,6 +1739,9 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::NotifyOffloadSuccess>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::ValidateOffloadGenerations>(
         &wrapped_master_service);
     server.register_handler<
         &mooncake::WrappedMasterService::PromotionObjectHeartbeat>(
