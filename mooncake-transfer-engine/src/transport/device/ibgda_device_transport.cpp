@@ -221,7 +221,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     }
 
     int allocateControlBuffer() override {
-#if defined(USE_CUDA) && defined(MOONCAKE_HAVE_MLX5_DMABUF_UMEM)
+#if defined(USE_CUDA)
         if (cudaSupportsDmabuf()) {
             ctrl_buf_mode_ = ControlMemoryMode::kGpuDmabuf;
             LOG(INFO) << "[EP IBGDA] Selected per-QP GPU DMA-BUF control "
@@ -230,10 +230,6 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
         }
         LOG(WARNING) << "[EP IBGDA] CUDA DMA-BUF control memory is unavailable; "
                         "trying GPU-VA control buffer";
-        return allocateGpuVaOrHostControlBuffer();
-#elif defined(USE_CUDA)
-        LOG(WARNING) << "[EP IBGDA] DMA-BUF control UMEM was unavailable at "
-                        "build time; trying GPU-VA control buffer";
         return allocateGpuVaOrHostControlBuffer();
 #endif
         return allocateControlBuffer(ControlMemoryMode::kGpuVa);
@@ -387,7 +383,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     }
 
     bool cudaSupportsDmabuf() const {
-#if defined(USE_CUDA) && defined(MOONCAKE_HAVE_MLX5_DMABUF_UMEM)
+#if defined(USE_CUDA)
         CUdevice device;
         CUresult result = cuCtxGetDevice(&device);
         if (result != CUDA_SUCCESS) {
@@ -430,7 +426,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
 
     int allocateDmabufControlRegion(size_t requested_size,
                                     mlx5gda_control_region* region) {
-#if defined(USE_CUDA) && defined(MOONCAKE_HAVE_MLX5_DMABUF_UMEM)
+#if defined(USE_CUDA)
         if (!region || requested_size == 0) {
             errno = EINVAL;
             return -1;
