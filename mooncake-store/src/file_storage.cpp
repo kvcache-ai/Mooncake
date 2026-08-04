@@ -1138,9 +1138,15 @@ tl::expected<void, ErrorCode> FileStorage::BatchQuerySegmentSlices(
 }
 
 tl::expected<void, ErrorCode> FileStorage::RegisterLocalMemory() {
+    // The buffer pool backs SSD-offload read results that are fetched by
+    // remote peers via RDMA READ.  It must therefore be registered with
+    // remote_accessible=true so its BufferDesc publishes an rkey; otherwise
+    // every remote read of an offloaded object fails with "No rkey for MR
+    // access" (the pool is only reachable through the address-range lookup,
+    // and with remote_accessible=false the rkey array is left empty).
     auto error_code = client_->RegisterLocalMemory(
         client_buffer_allocator_->getBase(), config_.local_buffer_size,
-        kWildcardLocation, false, true);
+        kWildcardLocation, true, true);
     if (!error_code) {
         LOG(ERROR) << "Failed to register local memory: " << error_code.error();
         return error_code;
