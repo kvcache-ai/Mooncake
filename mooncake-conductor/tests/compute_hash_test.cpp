@@ -690,4 +690,97 @@ TEST(HashStrategy, DigestToHexPreservesLeadingZerosAndUsesLowercase) {
     EXPECT_EQ(encoded.substr(60), "cdef");
 }
 
+TEST(HashChain, MatchesEagerCompute) {
+    for (const HashProfile& profile : {ValidProfile(), ValidPickleProfile()}) {
+        SCOPED_TRACE(profile.algorithm);
+        std::string factory_error;
+        auto strategy = CreateHashStrategy(profile, &factory_error);
+        ASSERT_NE(strategy, nullptr) << factory_error;
+
+        ContextKey context{
+            .tenant_id = "default",
+            .model_name = "model",
+            .lora_name = "lora-a",
+            .block_size = 4,
+        };
+        const std::vector<int32_t> tokens{1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+        const std::string salt = "salty";
+
+        std::vector<HashBlock> eager;
+        ASSERT_TRUE(strategy->Compute(context, tokens, salt, &eager).empty());
+        ASSERT_EQ(eager.size(), 2u);
+
+        std::string chain_error;
+        auto chain = strategy->CreateChain(context, tokens, salt, &chain_error);
+        ASSERT_NE(chain, nullptr) << chain_error;
+        EXPECT_EQ(chain->BlockCount(), eager.size());
+        for (size_t index = 0; index < eager.size(); ++index) {
+            const HashBlock* block = chain->At(index, &chain_error);
+            ASSERT_NE(block, nullptr) << chain_error;
+            EXPECT_EQ(*block, eager[index]) << "block=" << index;
+        }
+    }
+}
+
+TEST(HashChain, ComputesOnlyRequestedPrefix) {
+    std::string factory_error;
+    auto strategy = CreateHashStrategy(ValidProfile(), &factory_error);
+    ASSERT_NE(strategy, nullptr) << factory_error;
+
+    ContextKey context{
+        .tenant_id = "default",
+        .model_name = "model",
+        .lora_name = "",
+        .block_size = 4,
+    };
+    const std::vector<int32_t> tokens(400, 7);  // 100 complete blocks
+
+    std::string chain_error;
+    auto chain =
+        strategy->CreateChain(context, tokens, std::nullopt, &chain_error);
+    ASSERT_NE(chain, nullptr) << chain_error;
+    EXPECT_EQ(chain->BlockCount(), 100u);
+    EXPECT_EQ(chain->ComputedCount(), 0u);
+
+    ASSERT_NE(chain->At(0, &chain_error), nullptr) << chain_error;
+    EXPECT_EQ(chain->ComputedCount(), 1u);
+
+    ASSERT_NE(chain->At(2, &chain_error), nullptr) << chain_error;
+    EXPECT_EQ(chain->ComputedCount(), 3u);
+
+    // Already-computed blocks must not be rehashed.
+    ASSERT_NE(chain->At(2, &chain_error), nullptr) << chain_error;
+    EXPECT_EQ(chain->ComputedCount(), 3u);
+
+    EXPECT_EQ(chain->At(100, &chain_error), nullptr);
+    EXPECT_FALSE(chain_error.empty());
+    EXPECT_EQ(chain->ComputedCount(), 3u);
+}
+
+TEST(HashChain, RejectsInvalidInputsAtSetup) {
+    std::string factory_error;
+    auto strategy = CreateHashStrategy(ValidProfile(), &factory_error);
+    ASSERT_NE(strategy, nullptr) << factory_error;
+
+    ContextKey context{
+        .tenant_id = "default",
+        .model_name = "model",
+        .lora_name = "",
+        .block_size = 0,
+    };
+    const std::vector<int32_t> tokens{1, 2, 3, 4};
+
+    std::string chain_error;
+    EXPECT_EQ(
+        strategy->CreateChain(context, tokens, std::nullopt, &chain_error),
+        nullptr);
+    EXPECT_FALSE(chain_error.empty());
+
+    context.block_size = 4;
+    const std::string invalid_salt("\xed\xa0\x80", 3);
+    EXPECT_EQ(
+        strategy->CreateChain(context, tokens, invalid_salt, &chain_error),
+        nullptr);
+}
+
 }  // namespace

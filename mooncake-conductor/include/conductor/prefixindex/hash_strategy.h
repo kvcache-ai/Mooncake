@@ -20,6 +20,25 @@ struct HashBlock {
     bool operator==(const HashBlock&) const = default;
 };
 
+// A lazily-evaluated block-hash chain. Blocks are hashed on demand: asking
+// for block i hashes (and caches) every block up to i, so a caller that
+// stops early — e.g. a prefix-index walk whose cursors have all stalled —
+// never pays for the untouched tail.
+class HashChain {
+   public:
+    virtual ~HashChain() = default;
+
+    // Number of complete blocks the chain can produce.
+    virtual size_t BlockCount() const = 0;
+
+    // Number of blocks hashed so far (observability/testing hook).
+    virtual size_t ComputedCount() const = 0;
+
+    // Returns block index, hashing any uncomputed prefix first. Returns
+    // nullptr and sets error on failure; the error is sticky across calls.
+    virtual const HashBlock* At(size_t index, std::string* error) = 0;
+};
+
 class HashStrategy {
    public:
     virtual ~HashStrategy() = default;
@@ -30,6 +49,13 @@ class HashStrategy {
                                 std::span<const int32_t> token_ids,
                                 std::optional<std::string> cache_salt,
                                 std::vector<HashBlock>* out) const = 0;
+
+    // Creates a lazy hash chain over the same inputs as Compute. The chain
+    // borrows token_ids; the caller must keep it alive for the chain's
+    // lifetime. Returns nullptr and sets error when the inputs are invalid.
+    virtual std::unique_ptr<HashChain> CreateChain(
+        const ContextKey& context, std::span<const int32_t> token_ids,
+        std::optional<std::string> cache_salt, std::string* error) const = 0;
 };
 
 // Resolves a supported source profile and derives its root digest. Returns an

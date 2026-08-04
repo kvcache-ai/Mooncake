@@ -410,17 +410,26 @@ std::map<std::string, CacheHitResult> PrefixCacheTable::Query(
         return results;
     }
 
-    std::vector<HashBlock> hashes;
-    if (auto error = strategy->Compute(context, token_ids,
-                                       std::move(cache_salt), &hashes);
-        !error.empty()) {
-        LOG(ERROR) << "Query hash computation failed: " << error;
+    std::string chain_error;
+    auto chain = strategy->CreateChain(context, token_ids,
+                                       std::move(cache_salt), &chain_error);
+    if (!chain) {
+        LOG(ERROR) << "Query hash chain setup failed: " << chain_error;
         return results;
     }
+    const size_t block_count = chain->BlockCount();
 
+    // The chain hashes lazily: blocks are only hashed as cursors reach them,
+    // so queries that stall early (cold or short-matching prefixes) never
+    // pay for hashing the untouched tail.
     auto advance_cursor = [&](size_t& cursor, const auto& present) {
-        while (cursor < hashes.size()) {
-            auto block = state->blocks.find(hashes[cursor].projected);
+        while (cursor < block_count) {
+            const HashBlock* hashed = chain->At(cursor, &chain_error);
+            if (hashed == nullptr) {
+                cursor = block_count;  // stall every remaining walk
+                return;
+            }
+            auto block = state->blocks.find(hashed->projected);
             if (block == state->blocks.end() || !present(block->second)) {
                 break;
             }
@@ -465,6 +474,10 @@ std::map<std::string, CacheHitResult> PrefixCacheTable::Query(
         }
         result.longest_match_tokens = result.disk;
         results.emplace(instance_id, std::move(result));
+    }
+    if (!chain_error.empty()) {
+        LOG(ERROR) << "Query hash computation failed: " << chain_error;
+        return {};
     }
     return results;
 }
