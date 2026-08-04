@@ -573,6 +573,26 @@ jobs:
     - name: Spell Check Repo
       uses: crate-ci/typos@v1.30.2
 
+  reshard-type-check:
+    name: Check reshard manifest types
+    if: *run-ci
+    runs-on: ubuntu-22.04
+    steps:
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - name: Set up Python 3.12
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.12'
+
+    - name: Check canonical reshard contract types
+      run: |
+        python -m pip install --disable-pip-version-check pyright==1.1.411
+        bash scripts/check_reshard_types.sh
+      shell: bash
+
   clang-format:
     name: Check code format
     if: *run-ci
