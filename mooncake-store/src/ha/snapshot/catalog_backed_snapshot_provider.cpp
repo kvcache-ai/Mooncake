@@ -244,6 +244,9 @@ DeserializeStandbyObjectMetadata(
         metadata.last_sequence_id = snapshot_sequence_id;
         metadata.data_type = data_type;
         metadata.group_id = std::move(group_id);
+        if (soft_pin_timeout.has_value() && *soft_pin_timeout > now) {
+            metadata.soft_pin_deadline_ms = soft_pin_timestamp_ms;
+        }
         return std::optional<StandbyObjectMetadata>(std::move(metadata));
     } catch (const std::exception& ex) {
         LOG(ERROR) << "Failed to parse snapshot metadata entry: " << ex.what();

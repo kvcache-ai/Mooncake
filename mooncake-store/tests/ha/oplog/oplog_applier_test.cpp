@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -41,12 +42,16 @@ OpLogEntry MakeEntry(uint64_t seq, OpType type, const std::string& key,
 }
 
 // Helper function to create a valid struct_pack payload for PUT_END
-std::string MakeValidPayload(uint64_t client_id_first = 1,
-                             uint64_t client_id_second = 2,
-                             uint64_t size = 1024) {
+std::string MakeValidPayload(
+    uint64_t client_id_first = 1, uint64_t client_id_second = 2,
+    uint64_t size = 1024,
+    std::optional<uint64_t> soft_pin_deadline_ms = std::nullopt) {
     mooncake::MetadataPayload payload;
     payload.client_id = {client_id_first, client_id_second};
     payload.size = size;
+    if (soft_pin_deadline_ms.has_value()) {
+        payload.soft_pin_deadline_ms = *soft_pin_deadline_ms;
+    }
     auto result = struct_pack::serialize(payload);
     return std::string(result.begin(), result.end());
 }
@@ -289,6 +294,39 @@ TEST_F(OpLogApplierTest, TestApplyPutEnd_ValidPayload) {
     EXPECT_EQ(1u, meta->client_id.first);
     EXPECT_EQ(2u, meta->client_id.second);
     EXPECT_EQ(2048u, meta->size);
+}
+
+TEST_F(OpLogApplierTest, PutEndExplicitlyClearsSoftPinDeadline) {
+    constexpr uint64_t kSoftPinDeadlineMs = 4102444799000ULL;
+    ASSERT_TRUE(applier_->ApplyOpLogEntry(
+        MakeEntry(1, OpType::PUT_END, "key1",
+                  MakeValidPayload(1, 2, 1024, kSoftPinDeadlineMs))));
+
+    ASSERT_TRUE(applier_->ApplyOpLogEntry(
+        MakeEntry(2, OpType::PUT_END, "key1",
+                  MakeValidPayload(1, 2, 1024, uint64_t{0}))));
+    auto meta = mock_metadata_store_->GetMetadata("key1");
+    ASSERT_TRUE(meta.has_value());
+    EXPECT_FALSE(meta->soft_pin_deadline_ms.has_value());
+}
+
+TEST_F(OpLogApplierTest, PutEndAppliesAndReplicaOnlyPreservesSoftPinDeadline) {
+    constexpr uint64_t kSoftPinDeadlineMs = 4102444799000ULL;
+    ASSERT_TRUE(applier_->ApplyOpLogEntry(
+        MakeEntry(1, OpType::PUT_END, "key1",
+                  MakeValidPayload(1, 2, 1024, kSoftPinDeadlineMs))));
+    auto meta = mock_metadata_store_->GetMetadata("key1");
+    ASSERT_TRUE(meta.has_value());
+    ASSERT_TRUE(meta->soft_pin_deadline_ms.has_value());
+    EXPECT_EQ(*meta->soft_pin_deadline_ms, kSoftPinDeadlineMs);
+
+    ASSERT_TRUE(applier_->ApplyOpLogEntry(
+        MakeEntry(2, OpType::PUT_END, "key1", MakeValidPayload(1, 2, 2048))));
+    meta = mock_metadata_store_->GetMetadata("key1");
+    ASSERT_TRUE(meta.has_value());
+    EXPECT_EQ(meta->size, 2048u);
+    ASSERT_TRUE(meta->soft_pin_deadline_ms.has_value());
+    EXPECT_EQ(*meta->soft_pin_deadline_ms, kSoftPinDeadlineMs);
 }
 
 TEST_F(OpLogApplierTest, TestApplyPutEnd_InvalidPayload) {

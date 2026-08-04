@@ -2,6 +2,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <limits>
@@ -60,11 +61,12 @@ class CatalogBackedSnapshotProviderTest
     }
 
     void PublishSnapshotPayload(
-        SnapshotMetadataFormat format = SnapshotMetadataFormat::kLegacy) {
+        SnapshotMetadataFormat format = SnapshotMetadataFormat::kLegacy,
+        std::optional<uint64_t> soft_pin_deadline_ms = std::nullopt) {
         auto result = mooncake::test::PublishSnapshotPayload(
             *object_store_, *catalog_store_, descriptor_, UUID{1, 2},
             kDefaultTestObjectKey, kDefaultTestDiskFilePath,
-            kDefaultTestObjectSize, format);
+            kDefaultTestObjectSize, format, soft_pin_deadline_ms);
         ASSERT_TRUE(result.has_value()) << result.error();
         snapshot_published_ = true;
     }
@@ -201,6 +203,43 @@ TEST_P(CatalogBackedSnapshotProviderTest,
        LoadLatestSnapshotIgnoresObjectChecksum) {
     PublishSnapshotPayload(SnapshotMetadataFormat::kWithObjectChecksum);
     ExpectLoadsDefaultObject();
+}
+
+TEST_P(CatalogBackedSnapshotProviderTest,
+       LoadLatestSnapshotPreservesActiveSoftPinDeadline) {
+    constexpr uint64_t kSoftPinDeadlineMs = 4102444799000ULL;
+    PublishSnapshotPayload(SnapshotMetadataFormat::kLegacy, kSoftPinDeadlineMs);
+
+    auto provider = CreateProvider();
+    ASSERT_TRUE(provider.has_value()) << toString(provider.error());
+    auto snapshot = provider.value()->LoadLatestSnapshot(cluster_id_);
+    ASSERT_TRUE(snapshot.has_value()) << toString(snapshot.error());
+    ASSERT_TRUE(snapshot->has_value());
+    ASSERT_EQ(snapshot->value().metadata.size(), 1u);
+    const auto& deadline =
+        snapshot->value().metadata.front().metadata.soft_pin_deadline_ms;
+    ASSERT_TRUE(deadline.has_value());
+    EXPECT_EQ(*deadline, kSoftPinDeadlineMs);
+}
+
+TEST_P(CatalogBackedSnapshotProviderTest,
+       LoadLatestSnapshotNormalizesExpiredSoftPinDeadline) {
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count();
+    ASSERT_GT(now_ms, 0);
+    PublishSnapshotPayload(SnapshotMetadataFormat::kLegacy,
+                           static_cast<uint64_t>(now_ms - 1));
+
+    auto provider = CreateProvider();
+    ASSERT_TRUE(provider.has_value()) << toString(provider.error());
+    auto snapshot = provider.value()->LoadLatestSnapshot(cluster_id_);
+    ASSERT_TRUE(snapshot.has_value()) << toString(snapshot.error());
+    ASSERT_TRUE(snapshot->has_value());
+    ASSERT_EQ(snapshot->value().metadata.size(), 1u);
+    EXPECT_FALSE(snapshot->value()
+                     .metadata.front()
+                     .metadata.soft_pin_deadline_ms.has_value());
 }
 
 TEST_P(CatalogBackedSnapshotProviderTest, RejectsOverflowingReplicaCount) {

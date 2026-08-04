@@ -101,6 +101,18 @@ uint64_t SaturatingMultiply(uint64_t lhs, uint64_t rhs) {
     return lhs * rhs;
 }
 
+uint64_t EncodeSoftPinDeadlineMs(
+    const std::optional<std::chrono::system_clock::time_point>& deadline) {
+    if (!deadline.has_value()) {
+        return 0;
+    }
+    const auto timestamp_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline->time_since_epoch())
+            .count();
+    return timestamp_ms > 0 ? static_cast<uint64_t>(timestamp_ms) : 0;
+}
+
 // Decides whether PutStart may proceed with the replicas that were
 // actually allocated. Three deliberately different policies apply:
 //
@@ -2881,13 +2893,42 @@ void MasterService::RestoreFromStandbySnapshot(
             }
 
             auto& tenant_state = shard->tenants[tenant_id];
-            tenant_state.metadata.emplace(
+            std::optional<std::chrono::system_clock::time_point>
+                committed_soft_pin_timeout;
+            if (standby_meta.soft_pin_deadline_ms.has_value() &&
+                *standby_meta.soft_pin_deadline_ms != 0) {
+                const auto max_timestamp_ms =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::system_clock::time_point::max()
+                            .time_since_epoch())
+                        .count();
+                if (max_timestamp_ms < 0 ||
+                    *standby_meta.soft_pin_deadline_ms >
+                        static_cast<uint64_t>(max_timestamp_ms)) {
+                    LOG(WARNING)
+                        << "RestoreFromStandbySnapshot: soft-pin deadline "
+                           "exceeds system_clock range, tenant_id="
+                        << tenant_id << ", key=" << user_key;
+                } else {
+                    const auto deadline = std::chrono::system_clock::time_point(
+                        std::chrono::milliseconds(
+                            *standby_meta.soft_pin_deadline_ms));
+                    if (deadline > now) {
+                        committed_soft_pin_timeout = deadline;
+                    }
+                }
+            }
+
+            auto [metadata_it, inserted] = tenant_state.metadata.emplace(
                 std::piecewise_construct, std::forward_as_tuple(user_key),
                 std::forward_as_tuple(
                     standby_meta.client_id, now, standby_meta.size,
-                    std::move(replicas), std::nullopt, false,
-                    standby_meta.data_type, standby_meta.group_id, tenant_id,
-                    user_key));
+                    std::move(replicas), std::move(committed_soft_pin_timeout),
+                    false, standby_meta.data_type, standby_meta.group_id,
+                    tenant_id, user_key));
+            if (inserted) {
+                RegisterCommittedSoftPin(metadata_it->second, shard_idx);
+            }
             if (!standby_meta.group_id.empty()) {
                 RegisterGroupMember(tenant_state, tenant_id, user_key,
                                     standby_meta.group_id);
@@ -11362,6 +11403,8 @@ std::string MasterService::SerializeMetadataForOpLog(
     payload.size = metadata.size;
     payload.group_id = metadata.group_id;
     payload.data_type = metadata.data_type;
+    payload.soft_pin_deadline_ms =
+        EncodeSoftPinDeadlineMs(metadata.GetCommittedSoftPinTimeout());
 
     // Extract replica descriptors - get them all at once
     const auto& replicas = metadata.GetAllReplicas();
@@ -11387,6 +11430,8 @@ std::string MasterService::SerializeMetadataForOpLogWithoutMemReplicas(
     payload.size = metadata.size;
     payload.group_id = metadata.group_id;
     payload.data_type = metadata.data_type;
+    payload.soft_pin_deadline_ms =
+        EncodeSoftPinDeadlineMs(metadata.GetCommittedSoftPinTimeout());
 
     const auto& replicas = metadata.GetAllReplicas();
     payload.replicas.reserve(replicas.size());
@@ -11411,6 +11456,8 @@ std::string MasterService::SerializeMetadataForOpLogFromReplicaDescriptors(
     payload.replicas = replicas;
     payload.group_id = group_id;
     payload.data_type = data_type;
+    // Replica-only updates intentionally omit soft_pin_deadline_ms so the
+    // standby preserves its currently committed deadline.
     auto result = struct_pack::serialize(payload);
     return std::string(result.begin(), result.end());
 }

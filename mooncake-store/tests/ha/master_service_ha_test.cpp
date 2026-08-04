@@ -11,6 +11,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -511,6 +512,20 @@ class MasterServiceHATest : public ::testing::Test {
         return descriptors;
     }
 
+    static std::optional<std::chrono::system_clock::time_point>
+    SoftPinDeadlineForTesting(MasterService& service, const TenantId& tenant_id,
+                              const std::string& key) {
+        MasterService::MetadataAccessorRO accessor(
+            &service, MasterService::ObjectIdentity{tenant_id, key});
+        return accessor.Exists() ? accessor.Get().GetCommittedSoftPinTimeout()
+                                 : std::nullopt;
+    }
+
+    static size_t SoftPinRegistrationCountForTesting(
+        const MasterService& service) {
+        return service.soft_pin_deadline_index_.RegistrationCountForTest();
+    }
+
     static bool HasInvalidMemoryHandleForTesting(MasterService& service,
                                                  const TenantId& tenant_id,
                                                  const std::string& key) {
@@ -627,6 +642,41 @@ TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesMemoryBufferDescriptor) {
     EXPECT_EQ(restored.buffer_address_, address);
     EXPECT_EQ(restored.protocol_, "tcp");
     EXPECT_EQ(restored.transport_endpoint_, endpoint);
+}
+
+TEST_F(MasterServiceHATest,
+       RestoreFromStandbyRestoresOnlyActiveSoftPinDeadlines) {
+    const auto metric_before =
+        MasterMetricManager::instance().get_soft_pin_key_count();
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string active_key = "standby_restore_active_soft_pin_key";
+    const std::string expired_key = "standby_restore_expired_soft_pin_key";
+    const std::string endpoint = "standby_restore_soft_pin_segment";
+    const auto active_deadline =
+        std::chrono::time_point_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now() + std::chrono::hours(1));
+    const auto expired_deadline =
+        std::chrono::time_point_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now() - std::chrono::seconds(1));
+    auto active_object = MakeStandbyObject(active_key, endpoint);
+    active_object.metadata.soft_pin_deadline_ms =
+        static_cast<uint64_t>(active_deadline.time_since_epoch().count());
+    auto expired_object = MakeStandbyObject(expired_key, endpoint);
+    expired_object.metadata.soft_pin_deadline_ms =
+        static_cast<uint64_t>(expired_deadline.time_since_epoch().count());
+
+    service.RestoreFromStandbySnapshot({active_object, expired_object}, 7,
+                                       {MakeStandbyMemorySegment(endpoint)});
+
+    EXPECT_EQ(SoftPinDeadlineForTesting(service, kDefaultTenant, active_key),
+              active_deadline);
+    EXPECT_FALSE(SoftPinDeadlineForTesting(service, kDefaultTenant, expired_key)
+                     .has_value());
+    EXPECT_EQ(SoftPinRegistrationCountForTesting(service), 1u);
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              metric_before + 1);
 }
 
 TEST_F(MasterServiceHATest, RemountMakesRestoredMemoryReplicaReady) {
@@ -2204,6 +2254,8 @@ TEST_F(MasterServiceHATest, PutEndWritesBatchRecordOpLog) {
     ReplicateConfig config;
     config.replica_num = 1;
     config.preferred_segments = {"batch_put_end_segment"};
+    config.soft_pin_action = SoftPinAction::ENABLE;
+    config.soft_pin_ttl_ms = 5000;
     const std::string key = "batch_put_end_key";
     auto put_start =
         service.PutStart(mounted.client_id, key, kDefaultTenant, 1024, config);
@@ -2226,6 +2278,19 @@ TEST_F(MasterServiceHATest, PutEndWritesBatchRecordOpLog) {
     EXPECT_EQ(kDefaultTenant.value(), batch.entries[0].tenant_id);
     EXPECT_EQ(key, batch.entries[0].object_key);
     EXPECT_EQ(2u, batch.entries[0].sequence_id);
+
+    MetadataPayload payload;
+    ASSERT_EQ(struct_pack::errc::ok,
+              struct_pack::deserialize_to(payload, batch.entries[0].payload));
+    ASSERT_TRUE(payload.soft_pin_deadline_ms.has_value());
+    const auto committed_deadline =
+        SoftPinDeadlineForTesting(service, kDefaultTenant, key);
+    ASSERT_TRUE(committed_deadline.has_value());
+    EXPECT_EQ(*payload.soft_pin_deadline_ms,
+              static_cast<uint64_t>(
+                  std::chrono::duration_cast<std::chrono::milliseconds>(
+                      committed_deadline->time_since_epoch())
+                      .count()));
 
     DurablePrefix prefix;
     ASSERT_EQ(ErrorCode::OK, storage.ReadDurablePrefix(prefix));
