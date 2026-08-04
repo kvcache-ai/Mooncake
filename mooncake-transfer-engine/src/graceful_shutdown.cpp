@@ -15,6 +15,7 @@
 #include "graceful_shutdown.h"
 
 #include <errno.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -103,9 +104,30 @@ bool startSignalWatcherLocked(pid_t current_pid) {
 
     if (pipe(g_signal_pipe) != 0) return false;
 
+    // The watcher must never take SIGTERM/SIGINT itself: the handler writes
+    // to the pipe and then pauses forever, so if it ran on the watcher
+    // thread no reader would be left and cleanup would never run. Block both
+    // signals around thread creation so the watcher inherits the mask, and
+    // restore the caller's original mask on every path (it may have had its
+    // own reasons to block these signals).
+    sigset_t watcher_block_set;
+    sigset_t saved_mask;
+    sigemptyset(&watcher_block_set);
+    sigaddset(&watcher_block_set, SIGTERM);
+    sigaddset(&watcher_block_set, SIGINT);
+    const bool mask_blocked =
+        pthread_sigmask(SIG_BLOCK, &watcher_block_set, &saved_mask) == 0;
+
+    bool watcher_started = false;
     try {
         std::thread(signalWatcher).detach();
+        watcher_started = true;
     } catch (...) {
+    }
+
+    if (mask_blocked) pthread_sigmask(SIG_SETMASK, &saved_mask, nullptr);
+
+    if (!watcher_started) {
         close(g_signal_pipe[0]);
         close(g_signal_pipe[1]);
         g_signal_pipe[0] = -1;
