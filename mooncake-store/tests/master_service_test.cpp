@@ -5506,7 +5506,13 @@ TEST_F(MasterServiceTest, PutStartExpiringTest) {
     }
 
     // Put key_2 again, should fail because eviction has not been triggered. And
-    // this PutStart should trigger the eviction.
+    // this PutStart should trigger the eviction. Only BatchEvict moves the
+    // eviction attempt counter, so take the baseline before the trigger: the
+    // eviction thread polls every 10 ms, and sampling after the failing
+    // PutStart could race a completed BatchEvict and wait for a second one
+    // that never comes.
+    const int64_t eviction_attempts_before =
+        MasterMetricManager::instance().get_mem_eviction_attempts();
     put_start_result = service_->PutStart(client_id, key_2, TenantId::Default(),
                                           slice_length, config);
     EXPECT_FALSE(put_start_result.has_value());
@@ -5517,17 +5523,16 @@ TEST_F(MasterServiceTest, PutStartExpiringTest) {
     // to put_start_release_timeout_sec cannot tell that path apart from the
     // periodic DiscardExpiredProcessingReplicas fallback, which releases the
     // same replicas on the same 5 s scale and would pass the test without
-    // exercising the immediate eviction. Only BatchEvict moves the eviction
-    // attempt counter, so wait on that and then retry once.
-    const int64_t eviction_attempts_before =
-        MasterMetricManager::instance().get_mem_eviction_attempts();
+    // exercising the immediate eviction, and the periodic path never touches
+    // the attempt counter.
     WaitUntil([&] {
         return MasterMetricManager::instance().get_mem_eviction_attempts() >
                eviction_attempts_before;
     });
     put_start_result = service_->PutStart(client_id, key_2, TenantId::Default(),
                                           slice_length, config);
-    ASSERT_TRUE(put_start_result.has_value());
+    ASSERT_TRUE(put_start_result.has_value())
+        << toString(put_start_result.error());
     replica_list = put_start_result.value();
     EXPECT_EQ(replica_list.size(), kReplicaCnt);
     for (size_t i = 0; i < kReplicaCnt; i++) {
