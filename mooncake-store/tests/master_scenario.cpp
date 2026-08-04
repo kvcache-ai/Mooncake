@@ -36,8 +36,8 @@ MemoryNodeSpec MemoryNode(std::string name) {
     return {.name = std::move(name)};
 }
 
-PutStartAction PutStart(std::string key, uint64_t size) {
-    return {.key = std::move(key), .size = size};
+PutStartAction<> PutStart(std::string key, uint64_t size) {
+    return PutStartAction<>(std::move(key), size);
 }
 
 PutEndAction PutEnd(std::string key) { return {.key = std::move(key)}; }
@@ -46,7 +46,7 @@ PutRevokeAction PutRevoke(std::string key) { return {.key = std::move(key)}; }
 
 RemoveAction Remove(std::string key) { return {.key = std::move(key)}; }
 
-ObjectSpec Object(std::string key) { return {.key = std::move(key)}; }
+ObjectSpec<> Object(std::string key) { return ObjectSpec<>(std::move(key)); }
 
 MasterScenario::MasterScenario(std::string name) : name_(std::move(name)) {}
 
@@ -76,7 +76,7 @@ MasterScenario& MasterScenario::Given(MemoryNodeSpec node) {
     return *this;
 }
 
-MasterScenario& MasterScenario::When(PutStartAction action) {
+MasterScenario& MasterScenario::WhenPutStart(PutStartActionData action) {
     if (!EnsureService()) {
         return *this;
     }
@@ -147,20 +147,15 @@ MasterScenario& MasterScenario::When(RemoveAction action) {
     return *this;
 }
 
-MasterScenario& MasterScenario::Then(ObjectSpec object) {
+MasterScenario& MasterScenario::ThenObject(ObjectSpecData object,
+                                           ObjectExpectation expectation) {
     if (!EnsureService()) {
-        return *this;
-    }
-    if (object.readability == ObjectSpec::Readability::UNSPECIFIED &&
-        !object.expected_replica_count.has_value() &&
-        !object.expected_complete_replica_count.has_value()) {
-        Fail("Object(" + object.key + ") has no assertion");
         return *this;
     }
 
     const auto result =
         service_->GetReplicaList(object.key, TenantId::Default());
-    if (object.readability == ObjectSpec::Readability::NOT_READY) {
+    if (expectation == ObjectExpectation::NOT_READY) {
         if (result || result.error() != ErrorCode::REPLICA_IS_NOT_READY) {
             Fail("Object(" + object.key + ") was expected to be not ready");
         }
@@ -171,8 +166,7 @@ MasterScenario& MasterScenario::Then(ObjectSpec object) {
              ") is not readable: " + toString(result.error()));
         return *this;
     }
-    if (object.readability == ObjectSpec::Readability::READABLE &&
-        result->replicas.empty()) {
+    if (result->replicas.empty()) {
         Fail("Object(" + object.key + ") has no readable replicas");
     }
     if (object.expected_replica_count.has_value() &&

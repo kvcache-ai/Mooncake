@@ -30,36 +30,66 @@ struct MemoryNodeSpec {
 
 MemoryNodeSpec MemoryNode(std::string name);
 
-struct PutStartAction {
+enum class PutStartExpectation {
+    UNSPECIFIED,
+    SUCCESS,
+    ERROR,
+};
+
+struct PutStartActionData {
     std::string key;
     uint64_t size;
     std::string actor{"default"};
     std::optional<ErrorCode> expected_error{};
     std::optional<size_t> expected_replica_count{};
     std::optional<ReplicaStatus> expected_replica_status{};
+};
+
+template <PutStartExpectation expectation = PutStartExpectation::UNSPECIFIED>
+struct PutStartAction : PutStartActionData {
+    PutStartAction(std::string key, uint64_t size)
+        requires(expectation == PutStartExpectation::UNSPECIFIED)
+        : PutStartActionData{.key = std::move(key), .size = size} {}
 
     PutStartAction& By(std::string value) {
         actor = std::move(value);
         return *this;
     }
 
-    PutStartAction& ExpectError(ErrorCode value) {
-        expected_error = value;
-        return *this;
+    auto ExpectError(ErrorCode value) const
+        requires(expectation == PutStartExpectation::UNSPECIFIED)
+    {
+        PutStartAction<PutStartExpectation::ERROR> action(*this);
+        action.expected_error = value;
+        return action;
     }
 
-    PutStartAction& ExpectReplicas(size_t value) {
-        expected_replica_count = value;
-        return *this;
+    auto ExpectReplicas(size_t value) const
+        requires(expectation != PutStartExpectation::ERROR)
+    {
+        PutStartAction<PutStartExpectation::SUCCESS> action(*this);
+        action.expected_replica_count = value;
+        return action;
     }
 
-    PutStartAction& ExpectStatus(ReplicaStatus value) {
-        expected_replica_status = value;
-        return *this;
+    auto ExpectStatus(ReplicaStatus value) const
+        requires(expectation != PutStartExpectation::ERROR)
+    {
+        PutStartAction<PutStartExpectation::SUCCESS> action(*this);
+        action.expected_replica_status = value;
+        return action;
     }
+
+   private:
+    template <PutStartExpectation other>
+    friend struct PutStartAction;
+
+    template <PutStartExpectation other>
+    PutStartAction(const PutStartAction<other>& action)
+        : PutStartActionData(action) {}
 };
 
-PutStartAction PutStart(std::string key, uint64_t size);
+PutStartAction<> PutStart(std::string key, uint64_t size);
 
 struct PutEndAction {
     std::string key;
@@ -109,40 +139,61 @@ struct RemoveAction {
 
 RemoveAction Remove(std::string key);
 
-struct ObjectSpec {
-    enum class Readability {
-        UNSPECIFIED,
-        READABLE,
-        NOT_READY,
-    };
-
-    std::string key;
-    Readability readability{Readability::UNSPECIFIED};
-    std::optional<size_t> expected_replica_count{};
-    std::optional<size_t> expected_complete_replica_count{};
-
-    ObjectSpec& IsReadable() {
-        readability = Readability::READABLE;
-        return *this;
-    }
-
-    ObjectSpec& IsNotReady() {
-        readability = Readability::NOT_READY;
-        return *this;
-    }
-
-    ObjectSpec& HasReplicas(size_t value) {
-        expected_replica_count = value;
-        return *this;
-    }
-
-    ObjectSpec& HasCompleteReplicas(size_t value) {
-        expected_complete_replica_count = value;
-        return *this;
-    }
+enum class ObjectExpectation {
+    UNSPECIFIED,
+    READABLE,
+    NOT_READY,
 };
 
-ObjectSpec Object(std::string key);
+struct ObjectSpecData {
+    std::string key;
+    std::optional<size_t> expected_replica_count{};
+    std::optional<size_t> expected_complete_replica_count{};
+};
+
+template <ObjectExpectation expectation = ObjectExpectation::UNSPECIFIED>
+struct ObjectSpec : ObjectSpecData {
+    explicit ObjectSpec(std::string key)
+        requires(expectation == ObjectExpectation::UNSPECIFIED)
+        : ObjectSpecData{.key = std::move(key)} {}
+
+    auto IsReadable() const
+        requires(expectation != ObjectExpectation::NOT_READY)
+    {
+        return ObjectSpec<ObjectExpectation::READABLE>(*this);
+    }
+
+    auto IsNotReady() const
+        requires(expectation == ObjectExpectation::UNSPECIFIED)
+    {
+        return ObjectSpec<ObjectExpectation::NOT_READY>(*this);
+    }
+
+    auto HasReplicas(size_t value) const
+        requires(expectation != ObjectExpectation::NOT_READY)
+    {
+        ObjectSpec<ObjectExpectation::READABLE> object(*this);
+        object.expected_replica_count = value;
+        return object;
+    }
+
+    auto HasCompleteReplicas(size_t value) const
+        requires(expectation != ObjectExpectation::NOT_READY)
+    {
+        ObjectSpec<ObjectExpectation::READABLE> object(*this);
+        object.expected_complete_replica_count = value;
+        return object;
+    }
+
+   private:
+    template <ObjectExpectation other>
+    friend struct ObjectSpec;
+
+    template <ObjectExpectation other>
+    ObjectSpec(const ObjectSpec<other>& object) : ObjectSpecData(object) {}
+};
+
+ObjectSpec<> Object(std::string key);
 
 class MasterScenario {
    public:
@@ -153,13 +204,25 @@ class MasterScenario {
     MasterScenario& operator=(const MasterScenario&) = delete;
 
     MasterScenario& Given(MemoryNodeSpec node);
-    MasterScenario& When(PutStartAction action);
+    template <PutStartExpectation expectation>
+    MasterScenario& When(PutStartAction<expectation> action) {
+        return WhenPutStart(std::move(action));
+    }
+
     MasterScenario& When(PutEndAction action);
     MasterScenario& When(PutRevokeAction action);
     MasterScenario& When(RemoveAction action);
-    MasterScenario& Then(ObjectSpec object);
+
+    template <ObjectExpectation expectation>
+        requires(expectation != ObjectExpectation::UNSPECIFIED)
+    MasterScenario& Then(ObjectSpec<expectation> object) {
+        return ThenObject(std::move(object), expectation);
+    }
 
    private:
+    MasterScenario& WhenPutStart(PutStartActionData action);
+    MasterScenario& ThenObject(ObjectSpecData object,
+                               ObjectExpectation expectation);
     bool EnsureService();
     UUID ActorId(std::string_view actor);
     void ValidateActionResult(std::string_view action,
