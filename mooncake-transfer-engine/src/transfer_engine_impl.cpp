@@ -239,7 +239,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
         LOG(ERROR) << "Failed to install UBShmem transport";
         return -1;
     }
-    auto_discover_ = false;
+    auto_discover_config_.enabled = false;
 #endif
 
 #if defined(USE_CXL) && !defined(USE_ASCEND) && \
@@ -254,7 +254,7 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
     }
 #endif
 
-    if (auto_discover_) {
+    if (auto_discover_config_.enabled) {
         LOG(INFO) << "Auto-discovering topology...";
         if (getenv("MC_CUSTOM_TOPO_JSON")) {
             auto path = getenv("MC_CUSTOM_TOPO_JSON");
@@ -366,27 +366,26 @@ int TransferEngineImpl::init(const std::string& metadata_conn_string,
         if ((local_topology_->getHcaList().size() > 0 &&
              !getenv("MC_FORCE_TCP")) ||
             getenv("MC_FORCE_HCA")) {
-            // only install RDMA transport when there is at least one HCA
-            Transport* rdma_transport = nullptr;
-            if (use_barex_) {
+            const std::string transport_type = autoDiscoverTransport();
+            Transport* transport = nullptr;
+            if (transport_type == "barex") {
 #ifdef USE_BAREX
-                rdma_transport = multi_transports_->installTransport(
+                transport = multi_transports_->installTransport(
                     "barex", local_topology_);
 #else
                 LOG(ERROR) << "Set USE BAREX while barex not compiled";
                 return -1;
 #endif
             } else {
-                rdma_transport = multi_transports_->installTransport(
-                    "rdma", local_topology_);
+                transport = multi_transports_->installTransport(
+                    transport_type, local_topology_);
             }
-            if (rdma_transport == nullptr) {
-                LOG(ERROR) << "Failed to install RDMA transport, type="
-                           << (use_barex_ ? "barex" : "rdma");
+            if (transport == nullptr) {
+                LOG(ERROR) << "Failed to install transport, type="
+                           << transport_type;
                 return -1;
             } else {
-                LOG(INFO) << "installTransport, type="
-                          << (use_barex_ ? "barex" : "rdma");
+                LOG(INFO) << "installTransport, type=" << transport_type;
             }
         } else {
             Transport* tcp_transport =

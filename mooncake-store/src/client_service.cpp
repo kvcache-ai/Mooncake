@@ -691,17 +691,16 @@ ErrorCode Client::InitTransferEngine(
             // Use user-specified auto-discover setting
             auto_discover = env_auto_discover.value();
         } else {
-            // Enable auto-discover for RDMA if no devices are specified
+            // Enable auto-discover for RDMA/EFA if no devices are specified
             if ((protocol == "rdma" || protocol == "efa") &&
                 !device_names.has_value()) {
-                LOG(INFO)
-                    << "Set auto discovery ON by default for RDMA protocol, "
-                       "since no "
-                       "device names provided";
+                LOG(INFO) << "Set auto discovery ON by default for " << protocol
+                          << " protocol, since no device names provided";
                 auto_discover = true;
             }
         }
-        transfer_engine_->setAutoDiscover(auto_discover);
+        transfer_engine_->setAutoDiscover(
+            {.enabled = auto_discover, .protocol = protocol});
 
         // Honor filters when auto-discovery is enabled; otherwise warn once
         if (auto_discover) {
