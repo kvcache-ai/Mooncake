@@ -10,6 +10,7 @@
 #                         (empty = use the currently-installed torch)
 #   STAGING_DIR         - destination directory for the built .so files
 #   PG_CORE_SO_PATH     - absolute path to the built libmooncake_pg.so
+#   PG_DEVICE_SO_PATH   - absolute path to libmooncake_pg_device.so
 #   EP_USE_MUSA         - set to "1" when building for MUSA (MTLink path)
 #   EP_USE_MACA         - set to "1" when building for MACA (MTLink path)
 
@@ -35,6 +36,10 @@ set(ENV{MFLAGS} "")
 if(NOT PG_CORE_SO_PATH OR NOT EXISTS "${PG_CORE_SO_PATH}")
   message(FATAL_ERROR
     "[PG] PG_CORE_SO_PATH is missing or does not exist: ${PG_CORE_SO_PATH}")
+endif()
+if(NOT PG_DEVICE_SO_PATH OR NOT EXISTS "${PG_DEVICE_SO_PATH}")
+  message(FATAL_ERROR
+    "[PG] PG_DEVICE_SO_PATH is missing or does not exist: ${PG_DEVICE_SO_PATH}")
 endif()
 set(ENV{MOONCAKE_PG_CORE_SO_PATH} "${PG_CORE_SO_PATH}")
 if(EP_USE_MUSA)
@@ -83,11 +88,12 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
-# 3. Copy the core and extension .so files to the staging directory.
+# 3. Stage only fatbin-bearing device and extension .so files. The host-only
+#    core is packaged before auditwheel so its dependencies are repaired.
 # ---------------------------------------------------------------------------
 file(MAKE_DIRECTORY "${STAGING_DIR}")
 file(GLOB _so_files "${SOURCE_DIR}/mooncake/*.so")
-list(APPEND _so_files "${PG_CORE_SO_PATH}")
+list(APPEND _so_files "${PG_DEVICE_SO_PATH}")
 foreach(_so IN LISTS _so_files)
   get_filename_component(_fname "${_so}" NAME)
   message(STATUS "[PG] Staging ${_fname} -> ${STAGING_DIR}")

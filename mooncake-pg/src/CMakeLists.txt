@@ -82,6 +82,41 @@ else()
           "Mooncake PG currently requires one of USE_CUDA, USE_MUSA, or USE_MACA")
 endif()
 
+# Keep the GPU fatbin out of the host core so auditwheel can safely repair the
+# core while the device library is added to the wheel afterwards.
+add_library(mooncake_pg_device SHARED "${_pg_device_input}")
+target_include_directories(
+  mooncake_pg_device
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include
+          ${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/include)
+
+if(USE_CUDA)
+  set_target_properties(
+    mooncake_pg_device
+    PROPERTIES CUDA_STANDARD 20
+               CUDA_STANDARD_REQUIRED ON
+               CUDA_EXTENSIONS OFF
+               CUDA_RUNTIME_LIBRARY Shared)
+  target_compile_options(
+    mooncake_pg_device PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
+  target_link_libraries(mooncake_pg_device PRIVATE CUDA::cudart)
+elseif(USE_MUSA)
+  set_target_properties(mooncake_pg_device PROPERTIES LINKER_LANGUAGE CXX)
+  target_link_libraries(mooncake_pg_device PRIVATE musa musart rt)
+elseif(USE_MACA)
+  if(NOT DEFINED MACA_RUNTIME_LIBS)
+    set(MACA_RUNTIME_LIBS mcruntime mxc-runtime64 rt)
+  endif()
+  set_target_properties(mooncake_pg_device PROPERTIES LINKER_LANGUAGE CXX)
+  target_link_libraries(mooncake_pg_device PRIVATE ${MACA_RUNTIME_LIBS})
+endif()
+
+set_target_properties(
+  mooncake_pg_device
+  PROPERTIES POSITION_INDEPENDENT_CODE ON
+             BUILD_RPATH "$ORIGIN"
+             BUILD_RPATH_USE_ORIGIN YES)
+
 add_library(mooncake_pg SHARED
     control_plane/link_manager.cpp
     control_plane/coordinator.cpp
@@ -92,28 +127,17 @@ add_library(mooncake_pg SHARED
     gpu_runtime.cpp
     mooncake_communicator.cpp
     mooncake_pg.cpp
-    "${_pg_device_input}"
     mooncake_worker_host.cpp
     mooncake_worker_thread.cpp
     p2p_proxy.cpp
 )
 
 target_compile_features(mooncake_pg PRIVATE cxx_std_20)
-if(USE_CUDA)
-  set_target_properties(
-    mooncake_pg
-    PROPERTIES CUDA_STANDARD 20
-               CUDA_STANDARD_REQUIRED ON
-               CUDA_EXTENSIONS OFF
-               CUDA_RUNTIME_LIBRARY Shared)
-  target_compile_options(
-    mooncake_pg PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:-O3>)
-endif()
 target_include_directories(
   mooncake_pg
   PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
          $<INSTALL_INTERFACE:include>)
-target_link_libraries(mooncake_pg PRIVATE transfer_engine)
+target_link_libraries(mooncake_pg PRIVATE transfer_engine mooncake_pg_device)
 
 set_target_properties(
   mooncake_pg

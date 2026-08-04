@@ -184,12 +184,13 @@ if (WITH_EP)
         "-DEP_TORCH_VERSIONS=${_ep_torch_versions_pipe}"
         "-DSTAGING_DIR=${EP_PG_STAGING_DIR}"
         "-DPG_CORE_SO_PATH=$<TARGET_FILE:mooncake_pg>"
+        "-DPG_DEVICE_SO_PATH=$<TARGET_FILE:mooncake_pg_device>"
         "-DPython3_EXECUTABLE=${Python3_EXECUTABLE}"
         "-DEP_USE_MUSA=$<IF:$<BOOL:${USE_MUSA}>,1,0>"
         "-DEP_USE_MACA=$<IF:$<BOOL:${USE_MACA}>,1,0>"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/torch/BuildPgExt.cmake"
       COMMENT "Building Mooncake PG Python extension(s)"
-      DEPENDS mooncake_pg mooncake_ep_ext
+      DEPENDS mooncake_pg mooncake_pg_device mooncake_ep_ext
       VERBATIM
     )
   endif ()
