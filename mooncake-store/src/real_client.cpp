@@ -49,6 +49,9 @@
 #ifdef USE_INTRA_NVLINK
 #include "gpu_vendor/intra_nvlink.h"
 #endif
+#if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
+#include "ascend_allocator.h"
+#endif
 
 DEFINE_bool(enable_http_server, false,
             "Enable embedded HTTP server for health check and metrics.");
@@ -854,9 +857,6 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         while (global_segment_size > 0) {
             size_t segment_size = std::min(global_segment_size, max_mr_size);
             global_segment_size -= segment_size;
-            current_glbseg_size += segment_size;
-            LOG(INFO) << "Mounting segment: " << segment_size << " bytes, "
-                      << current_glbseg_size << " of " << total_glbseg_size;
 
             size_t mapped_size = segment_size;
             void *ptr = nullptr;
@@ -878,6 +878,16 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 ptr = allocate_buffer_mmap_memory(mapped_size,
                                                   get_hugepage_size_from_env(),
                                                   parallel_hugetlb_population);
+#if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
+            } else if ((protocol == "ascend" || protocol == "ubshmem") &&
+                       globalConfig().ascend_use_fabric_mem) {
+                size_t actual_size = 0;
+                ptr = ascend_allocate_memory_best_effort(
+                    segment_size, this->protocol, &actual_size);
+                if (ptr) {
+                    mapped_size = actual_size;
+                }
+#endif
             } else {
                 ptr = allocate_buffer_allocator_memory(segment_size,
                                                        this->protocol);
@@ -887,6 +897,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 LOG(ERROR) << "Failed to allocate segment memory";
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
             }
+            current_glbseg_size += mapped_size;
+            LOG(INFO) << "Mounting segment: " << mapped_size << " bytes, "
+                      << current_glbseg_size << " of " << total_glbseg_size;
+
             if (this->protocol == "ascend" || this->protocol == "ubshmem") {
                 ascend_segment_ptrs_.emplace_back(
                     ptr, AscendSegmentDeleter{this->protocol});
