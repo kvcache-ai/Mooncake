@@ -5512,13 +5512,17 @@ TEST_F(MasterServiceTest, PutStartExpiringTest) {
     EXPECT_FALSE(put_start_result.has_value());
     EXPECT_EQ(put_start_result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 
-    // Wait a moment for the eviction to complete.
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-    // Put key_2 again, should success because the previous one has been
-    // discarded and released.
-    put_start_result = service_->PutStart(client_id, key_2, TenantId::Default(),
-                                          slice_length, config);
+    // The eviction runs asynchronously, so poll for it instead of sleeping a
+    // fixed 50 ms that a loaded CI runner can overrun (it took ~59 ms in the
+    // failure from #3245).
+    const auto eviction_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    do {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        put_start_result = service_->PutStart(
+            client_id, key_2, TenantId::Default(), slice_length, config);
+    } while (!put_start_result.has_value() &&
+             std::chrono::steady_clock::now() < eviction_deadline);
     EXPECT_TRUE(put_start_result.has_value());
     replica_list = put_start_result.value();
     EXPECT_EQ(replica_list.size(), kReplicaCnt);
