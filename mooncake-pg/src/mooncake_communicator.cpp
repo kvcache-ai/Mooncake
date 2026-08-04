@@ -11,6 +11,7 @@
 
 #include <glog/logging.h>
 
+#include "common.h"
 #include "error_types.h"
 #include "gpu_runtime.h"
 #include "memory_location.h"
@@ -245,6 +246,15 @@ PGResult<void> MooncakePGContext::setExternalEngine(
     if (!initialized_) {
         engine = requested_engine;
         engine_initialized = transfer_engine != nullptr;
+        if (transfer_engine) {
+            const auto endpoint = engine->getLocalIpAndPort();
+            const auto derived_host = getHostNameWithoutPort(endpoint);
+            PG_VALIDATE_STATE(
+                !derived_host.empty(),
+                "set_transfer_engine requires an initialized TransferEngine "
+                "with a local endpoint");
+            host_ip = derived_host;
+        }
     }
     return {};
 }
