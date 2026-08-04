@@ -71,13 +71,6 @@ struct ReplicateConfig {
 };
 ```
 
-`agent_hints` is optional Store-side metadata for agentic workloads. In the
-current implementation, `reuse_hint="keep"` requests soft-pin retention and
-`cache_ttl_ms` can extend the soft-pin timeout. `reuse_hint="neutral"` and
-`reuse_hint="discard"` do not add retention by themselves, and `workflow_id` is
-stored as metadata only. Mooncake Store does not automatically map
-`workflow_id` to `group_ids`.
-
 ### Upsert
 
 ```C++

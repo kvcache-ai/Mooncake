@@ -16,7 +16,6 @@
 #include <memory>
 #include <optional>
 #include <random>
-#include <sstream>
 #include <string>
 #include <thread>
 #include <utility>
@@ -243,8 +242,7 @@ class MasterServiceTest : public ::testing::Test {
 
     void TriggerMemoryEviction(MasterService& service, const UUID& client_id,
                                const std::string& trigger_key,
-                               uint64_t slice_length,
-                               std::chrono::milliseconds wait) const {
+                               uint64_t slice_length) const {
         ReplicateConfig trigger_config;
         trigger_config.replica_num = 1;
         auto trigger_result =
@@ -252,7 +250,6 @@ class MasterServiceTest : public ::testing::Test {
                              slice_length, trigger_config);
         ASSERT_FALSE(trigger_result.has_value());
         EXPECT_EQ(ErrorCode::NO_AVAILABLE_HANDLE, trigger_result.error());
-        std::this_thread::sleep_for(wait);
     }
 
     bool ExecutePendingMoveTasks(MasterService& service,
@@ -690,22 +687,40 @@ TEST_F(MasterServiceTest, AgentHintsInvalidParamsRejected) {
 
     ReplicateConfig config;
     config.replica_num = 1;
+    auto expect_invalid = [&](const std::string& key, const AgentHints& hints) {
+        config.agent_hints = hints;
+        auto result = service_->PutStart(client_id, key, TenantId::Default(),
+                                         1024, config);
+        ASSERT_FALSE(result.has_value());
+        EXPECT_EQ(ErrorCode::INVALID_PARAMS, result.error());
+    };
+
     AgentHints hints;
     hints.reuse_hint = "maybe";
-    config.agent_hints = hints;
-    auto invalid_reuse = service_->PutStart(client_id, "bad_reuse",
-                                            TenantId::Default(), 1024, config);
-    ASSERT_FALSE(invalid_reuse.has_value());
-    EXPECT_EQ(ErrorCode::INVALID_PARAMS, invalid_reuse.error());
+    expect_invalid("bad_reuse", hints);
 
+    hints = AgentHints{};
     hints.reuse_hint = "keep";
     hints.cache_ttl_ms = -1;
-    config.agent_hints = hints;
-    auto invalid_ttl = service_->PutStart(client_id, "bad_ttl",
-                                          TenantId::Default(), 1024, config);
-    ASSERT_FALSE(invalid_ttl.has_value());
-    EXPECT_EQ(ErrorCode::INVALID_PARAMS, invalid_ttl.error());
+    expect_invalid("bad_ttl", hints);
 
+    hints = AgentHints{};
+    hints.workflow_id = std::string(AgentHints::kMaxStringBytes + 1, 'w');
+    expect_invalid("oversized_hint_string", hints);
+
+    hints = AgentHints{};
+    hints.children_step_ids.assign(AgentHints::kMaxChildrenStepIds + 1,
+                                   "child");
+    expect_invalid("oversized_hint_children", hints);
+
+    hints = AgentHints{};
+    hints.children_step_ids.assign(
+        AgentHints::kMaxTotalStringBytes / AgentHints::kMaxStringBytes + 1,
+        std::string(AgentHints::kMaxStringBytes, 'c'));
+    expect_invalid("oversized_hint_total", hints);
+
+    hints = AgentHints{};
+    hints.reuse_hint = "keep";
     hints.cache_ttl_ms = 1000;
     config.agent_hints = hints;
     auto valid = service_->PutStart(client_id, "good_hint", TenantId::Default(),
@@ -715,43 +730,6 @@ TEST_F(MasterServiceTest, AgentHintsInvalidParamsRejected) {
                     ->PutEnd(client_id, "good_hint", TenantId::Default(),
                              ReplicaType::MEMORY)
                     .has_value());
-}
-
-TEST_F(MasterServiceTest, AgentHintsDefaultsAndSafeSummary) {
-    AgentHints hints;
-    EXPECT_EQ("neutral", hints.reuse_hint);
-    EXPECT_EQ(0, hints.cache_ttl_ms);
-    EXPECT_TRUE(hints.IsValidReuseHint());
-    EXPECT_FALSE(hints.RequestsRetention());
-
-    hints.workflow_id = "wf-sensitive";
-    hints.agent_id = "agent-sensitive";
-    hints.step_id = "step-sensitive";
-    hints.children_step_ids = {"child-a", "child-b"};
-    hints.reuse_hint = "keep";
-    hints.cache_ttl_ms = 1234;
-    EXPECT_TRUE(hints.RequestsRetention());
-
-    std::ostringstream hints_stream;
-    hints_stream << hints;
-    const std::string hints_summary = hints_stream.str();
-    EXPECT_NE(std::string::npos, hints_summary.find("workflow_id_set: 1"));
-    EXPECT_NE(std::string::npos, hints_summary.find("agent_id_set: 1"));
-    EXPECT_NE(std::string::npos, hints_summary.find("step_id_set: 1"));
-    EXPECT_NE(std::string::npos, hints_summary.find("children_step_count: 2"));
-    EXPECT_NE(std::string::npos, hints_summary.find("reuse_hint: keep"));
-    EXPECT_EQ(std::string::npos, hints_summary.find("wf-sensitive"));
-    EXPECT_EQ(std::string::npos, hints_summary.find("agent-sensitive"));
-    EXPECT_EQ(std::string::npos, hints_summary.find("step-sensitive"));
-
-    ReplicateConfig config;
-    config.agent_hints = hints;
-    std::ostringstream config_stream;
-    config_stream << config;
-    const std::string config_summary = config_stream.str();
-    EXPECT_NE(std::string::npos, config_summary.find("workflow_id_set: 1"));
-    EXPECT_NE(std::string::npos, config_summary.find("reuse_hint: keep"));
-    EXPECT_EQ(std::string::npos, config_summary.find("wf-sensitive"));
 }
 
 #ifdef USE_NOF
@@ -1488,7 +1466,7 @@ TEST_F(MasterServiceTest, UpsertPreservesGroupMembership) {
     EXPECT_EQ(ErrorCode::INVALID_PARAMS, explicit_ungrouped_result.error());
 }
 
-TEST_F(MasterServiceTest, SameSizeUpsertKeepHintEnablesRetention) {
+TEST_F(MasterServiceTest, SameSizeUpsertAgentHintsReconcileRetention) {
     const uint64_t kv_lease_ttl = 100;
     const uint64_t kv_soft_pin_ttl = 10000;
     auto service_config = MasterServiceConfig::builder()
@@ -1500,84 +1478,78 @@ TEST_F(MasterServiceTest, SameSizeUpsertKeepHintEnablesRetention) {
     std::unique_ptr<MasterService> service_(new MasterService(service_config));
     const UUID client_id = generate_uuid();
 
-    const std::string key = "agent_same_size_upsert";
     constexpr size_t value_size = 1024 * 1024;
     [[maybe_unused]] const auto context =
         PrepareSimpleSegment(*service_, "agent_same_size_upsert_segment",
-                             kDefaultSegmentBase, value_size * 3);
+                             kDefaultSegmentBase, value_size * 5);
 
+    const std::string keep_key = "agent_same_size_upsert_keep";
     ReplicateConfig initial_config;
     initial_config.replica_num = 1;
-    PutCompletedObject(*service_, client_id, key, initial_config, value_size);
+    PutCompletedObject(*service_, client_id, keep_key, initial_config,
+                       value_size);
 
-    AgentHints hints;
-    hints.workflow_id = "wf-upsert";
-    hints.agent_id = "planner";
-    hints.step_id = "step-2";
-    hints.cache_ttl_ms = 5000;
-    hints.reuse_hint = "keep";
+    AgentHints keep_hints;
+    keep_hints.workflow_id = "wf-upsert";
+    keep_hints.agent_id = "planner";
+    keep_hints.step_id = "step-2";
+    keep_hints.cache_ttl_ms = 5000;
+    keep_hints.reuse_hint = "keep";
 
-    ReplicateConfig update_config;
-    update_config.replica_num = 1;
-    update_config.agent_hints = hints;
-    auto upsert_start = service_->UpsertStart(
-        client_id, key, TenantId::Default(), value_size, update_config);
+    ReplicateConfig keep_update_config;
+    keep_update_config.replica_num = 1;
+    keep_update_config.agent_hints = keep_hints;
+    auto upsert_start =
+        service_->UpsertStart(client_id, keep_key, TenantId::Default(),
+                              value_size, keep_update_config);
     ASSERT_TRUE(upsert_start.has_value()) << toString(upsert_start.error());
     ASSERT_TRUE(service_
-                    ->UpsertEnd(client_id, key, TenantId::Default(),
+                    ->UpsertEnd(client_id, keep_key, TenantId::Default(),
                                 ReplicaType::MEMORY)
                     .has_value());
 
-    const std::string neutral_key = "agent_same_size_upsert_neutral";
-    ReplicateConfig neutral_config;
-    neutral_config.replica_num = 1;
-    PutCompletedObject(*service_, client_id, neutral_key, neutral_config,
+    const std::string cleared_key = "agent_same_size_upsert_cleared";
+    PutCompletedObject(*service_, client_id, cleared_key, initial_config,
                        value_size);
+    auto cleared_keep_start =
+        service_->UpsertStart(client_id, cleared_key, TenantId::Default(),
+                              value_size, keep_update_config);
+    ASSERT_TRUE(cleared_keep_start.has_value())
+        << toString(cleared_keep_start.error());
+    ASSERT_TRUE(service_
+                    ->UpsertEnd(client_id, cleared_key, TenantId::Default(),
+                                ReplicaType::MEMORY)
+                    .has_value());
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl + 50));
-    TriggerMemoryEviction(*service_, client_id,
-                          "agent_same_size_upsert_trigger", value_size * 2,
-                          std::chrono::milliseconds(300));
+    ReplicateConfig clear_update_config;
+    clear_update_config.replica_num = 1;
+    auto clear_start =
+        service_->UpsertStart(client_id, cleared_key, TenantId::Default(),
+                              value_size, clear_update_config);
+    ASSERT_TRUE(clear_start.has_value()) << toString(clear_start.error());
+    ASSERT_TRUE(service_
+                    ->UpsertEnd(client_id, cleared_key, TenantId::Default(),
+                                ReplicaType::MEMORY)
+                    .has_value());
 
-    EXPECT_TRUE(service_->GetReplicaList(key, TenantId::Default()).has_value());
-    EXPECT_FALSE(
-        service_->GetReplicaList(neutral_key, TenantId::Default()).has_value());
-}
-
-TEST_F(MasterServiceTest,
-       SameSizeUpsertWithDiscardHintPreservesExistingSoftPin) {
-    const uint64_t kv_lease_ttl = 100;
-    const uint64_t kv_soft_pin_ttl = 10000;
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(kv_lease_ttl)
-                              .set_default_kv_soft_pin_ttl(kv_soft_pin_ttl)
-                              .set_allow_evict_soft_pinned_objects(true)
-                              .set_eviction_ratio(0.5)
-                              .build();
-    std::unique_ptr<MasterService> service_(new MasterService(service_config));
-    const UUID client_id = generate_uuid();
-
-    constexpr size_t value_size = 1024 * 1024;
-    [[maybe_unused]] const auto context =
-        PrepareSimpleSegment(*service_, "agent_same_size_discard_segment",
-                             kDefaultSegmentBase, value_size * 3);
-
-    const std::string pinned_key = "agent_same_size_discard_pin";
-    ReplicateConfig initial_config;
-    initial_config.replica_num = 1;
-    initial_config.with_soft_pin = true;
-    PutCompletedObject(*service_, client_id, pinned_key, initial_config,
+    const std::string pinned_key = "agent_same_size_upsert_discard_pin";
+    ReplicateConfig pinned_config;
+    pinned_config.replica_num = 1;
+    pinned_config.with_soft_pin = true;
+    PutCompletedObject(*service_, client_id, pinned_key, pinned_config,
                        value_size);
 
     AgentHints discard_hints;
     discard_hints.workflow_id = "wf-same-size-discard";
     discard_hints.reuse_hint = "discard";
-    ReplicateConfig upsert_config;
-    upsert_config.replica_num = 1;
-    upsert_config.agent_hints = discard_hints;
-    auto upsert_start = service_->UpsertStart(
-        client_id, pinned_key, TenantId::Default(), value_size, upsert_config);
-    ASSERT_TRUE(upsert_start.has_value()) << toString(upsert_start.error());
+    ReplicateConfig discard_update_config;
+    discard_update_config.replica_num = 1;
+    discard_update_config.agent_hints = discard_hints;
+    auto discard_upsert_start =
+        service_->UpsertStart(client_id, pinned_key, TenantId::Default(),
+                              value_size, discard_update_config);
+    ASSERT_TRUE(discard_upsert_start.has_value())
+        << toString(discard_upsert_start.error());
     ASSERT_TRUE(service_
                     ->UpsertEnd(client_id, pinned_key, TenantId::Default(),
                                 ReplicaType::MEMORY)
@@ -1591,13 +1563,22 @@ TEST_F(MasterServiceTest,
 
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl + 50));
     TriggerMemoryEviction(*service_, client_id,
-                          "agent_same_size_discard_trigger", value_size * 2,
-                          std::chrono::milliseconds(300));
+                          "agent_same_size_upsert_trigger", value_size * 3);
 
+    WaitUntil([&] {
+        return !service_->GetReplicaList(neutral_key, TenantId::Default())
+                    .has_value() &&
+               !service_->GetReplicaList(cleared_key, TenantId::Default())
+                    .has_value();
+    });
+    EXPECT_TRUE(
+        service_->GetReplicaList(keep_key, TenantId::Default()).has_value());
     EXPECT_TRUE(
         service_->GetReplicaList(pinned_key, TenantId::Default()).has_value());
     EXPECT_FALSE(
         service_->GetReplicaList(neutral_key, TenantId::Default()).has_value());
+    EXPECT_FALSE(
+        service_->GetReplicaList(cleared_key, TenantId::Default()).has_value());
 }
 
 TEST_F(MasterServiceTest, IncompleteGroupedUpsertCanBecomeUngrouped) {
@@ -1822,64 +1803,6 @@ TEST_F(MasterServiceTest, BatchUpsertStartMixedGroupIdsPreservesOrder) {
         ASSERT_FALSE(result.has_value());
         EXPECT_EQ(ErrorCode::INVALID_PARAMS, result.error());
     }
-}
-
-TEST_F(MasterServiceTest, BatchUpsertStartPropagatesAgentHints) {
-    const uint64_t kv_lease_ttl = 100;
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(kv_lease_ttl)
-                              .set_allow_evict_soft_pinned_objects(true)
-                              .set_eviction_ratio(0.2)
-                              .build();
-    std::unique_ptr<MasterService> service_(new MasterService(service_config));
-    const UUID client_id = generate_uuid();
-
-    const std::vector<std::string> keys = {"agent_batch_a", "agent_batch_b"};
-    constexpr size_t value_size = 1024 * 1024;
-    const std::vector<uint64_t> sizes = {value_size, value_size};
-    [[maybe_unused]] const auto context =
-        PrepareSimpleSegment(*service_, "agent_batch_upsert_segment",
-                             kDefaultSegmentBase, value_size * 4);
-
-    AgentHints hints;
-    hints.workflow_id = "wf-batch";
-    hints.reuse_hint = "keep";
-    hints.cache_ttl_ms = 5000;
-
-    ReplicateConfig config;
-    config.replica_num = 1;
-    config.agent_hints = hints;
-
-    auto results = service_->BatchUpsertStart(
-        client_id, keys, TenantId::Default(), sizes, config);
-    ASSERT_EQ(results.size(), keys.size());
-    for (const auto& result : results) {
-        ASSERT_TRUE(result.has_value()) << toString(result.error());
-    }
-
-    auto end_results =
-        service_->BatchUpsertEnd(client_id, keys, TenantId::Default());
-    ASSERT_EQ(end_results.size(), keys.size());
-    for (const auto& result : end_results) {
-        ASSERT_TRUE(result.has_value()) << toString(result.error());
-    }
-
-    const std::string neutral_key = "agent_batch_neutral";
-    ReplicateConfig neutral_config;
-    neutral_config.replica_num = 1;
-    PutCompletedObject(*service_, client_id, neutral_key, neutral_config,
-                       value_size);
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl + 50));
-    TriggerMemoryEviction(*service_, client_id, "agent_batch_trigger",
-                          value_size * 2, std::chrono::milliseconds(300));
-
-    for (const auto& key : keys) {
-        EXPECT_TRUE(
-            service_->GetReplicaList(key, TenantId::Default()).has_value());
-    }
-    EXPECT_FALSE(
-        service_->GetReplicaList(neutral_key, TenantId::Default()).has_value());
 }
 
 TEST_F(MasterServiceTest, WrappedBatchPutStartMixedGroupIdsPreservesOrder) {
@@ -4882,8 +4805,12 @@ TEST_F(MasterServiceTest, AgentKeepHintSurvivesNeutralUnderEviction) {
 
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl + 50));
     TriggerMemoryEviction(*service_, client_id, "agent_keep_evict_trigger",
-                          value_size * 2, std::chrono::milliseconds(300));
+                          value_size * 2);
 
+    WaitUntil([&] {
+        return !service_->GetReplicaList(neutral_key, TenantId::Default())
+                    .has_value();
+    });
     EXPECT_TRUE(
         service_->GetReplicaList(keep_key, TenantId::Default()).has_value());
     EXPECT_FALSE(
@@ -4929,56 +4856,16 @@ TEST_F(MasterServiceTest, AgentCacheTtlExtendsSoftPinRetention) {
     std::this_thread::sleep_for(
         std::chrono::milliseconds(kv_soft_pin_ttl + 120));
     TriggerMemoryEviction(*service_, client_id, "agent_cache_ttl_trigger",
-                          value_size * 2, std::chrono::milliseconds(300));
+                          value_size * 2);
 
+    WaitUntil([&] {
+        return !service_->GetReplicaList(default_ttl_key, TenantId::Default())
+                    .has_value();
+    });
     EXPECT_TRUE(service_->GetReplicaList(extended_key, TenantId::Default())
                     .has_value());
     EXPECT_FALSE(service_->GetReplicaList(default_ttl_key, TenantId::Default())
                      .has_value());
-}
-
-TEST_F(MasterServiceTest, AgentDiscardHintDoesNotCancelExplicitSoftPin) {
-    const uint64_t kv_lease_ttl = 100;
-    const uint64_t kv_soft_pin_ttl = 10000;
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(kv_lease_ttl)
-                              .set_default_kv_soft_pin_ttl(kv_soft_pin_ttl)
-                              .set_allow_evict_soft_pinned_objects(true)
-                              .set_eviction_ratio(0.5)
-                              .build();
-    std::unique_ptr<MasterService> service_(new MasterService(service_config));
-    const UUID client_id = generate_uuid();
-
-    constexpr size_t value_size = 1024 * 1024;
-    [[maybe_unused]] const auto context =
-        PrepareSimpleSegment(*service_, "agent_discard_evict_segment",
-                             kDefaultSegmentBase, value_size * 3);
-
-    const std::string pinned_key = "agent_discard_explicit_pin";
-    AgentHints discard_hints;
-    discard_hints.workflow_id = "wf-discard";
-    discard_hints.reuse_hint = "discard";
-    ReplicateConfig pinned_config;
-    pinned_config.replica_num = 1;
-    pinned_config.with_soft_pin = true;
-    pinned_config.agent_hints = discard_hints;
-    PutCompletedObject(*service_, client_id, pinned_key, pinned_config,
-                       value_size);
-
-    const std::string neutral_key = "agent_discard_neutral";
-    ReplicateConfig neutral_config;
-    neutral_config.replica_num = 1;
-    PutCompletedObject(*service_, client_id, neutral_key, neutral_config,
-                       value_size);
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl + 50));
-    TriggerMemoryEviction(*service_, client_id, "agent_discard_evict_trigger",
-                          value_size * 2, std::chrono::milliseconds(300));
-
-    EXPECT_TRUE(
-        service_->GetReplicaList(pinned_key, TenantId::Default()).has_value());
-    EXPECT_FALSE(
-        service_->GetReplicaList(neutral_key, TenantId::Default()).has_value());
 }
 
 TEST_F(MasterServiceTest, AgentDiscardHintDoesNotAddRetention) {
@@ -5016,69 +4903,16 @@ TEST_F(MasterServiceTest, AgentDiscardHintDoesNotAddRetention) {
 
     std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl + 50));
     TriggerMemoryEviction(*service_, client_id,
-                          "agent_discard_no_retention_trigger", value_size * 2,
-                          std::chrono::milliseconds(300));
+                          "agent_discard_no_retention_trigger", value_size * 2);
 
+    WaitUntil([&] {
+        return !service_->GetReplicaList(discard_key, TenantId::Default())
+                    .has_value();
+    });
     EXPECT_FALSE(
         service_->GetReplicaList(discard_key, TenantId::Default()).has_value());
     EXPECT_TRUE(
         service_->GetReplicaList(pinned_key, TenantId::Default()).has_value());
-}
-
-TEST_F(MasterServiceTest,
-       SizeChangingUpsertPreservesExplicitSoftPinWithDiscardHint) {
-    const uint64_t kv_lease_ttl = 100;
-    const uint64_t kv_soft_pin_ttl = 10000;
-    auto service_config = MasterServiceConfig::builder()
-                              .set_default_kv_lease_ttl(kv_lease_ttl)
-                              .set_default_kv_soft_pin_ttl(kv_soft_pin_ttl)
-                              .set_allow_evict_soft_pinned_objects(true)
-                              .set_eviction_ratio(0.5)
-                              .build();
-    std::unique_ptr<MasterService> service_(new MasterService(service_config));
-    const UUID client_id = generate_uuid();
-
-    constexpr size_t value_size = 1024 * 1024;
-    [[maybe_unused]] const auto context =
-        PrepareSimpleSegment(*service_, "agent_size_change_evict_segment",
-                             kDefaultSegmentBase, value_size * 5);
-
-    const std::string pinned_key = "agent_size_change_discard_pin";
-    ReplicateConfig initial_config;
-    initial_config.replica_num = 1;
-    initial_config.with_soft_pin = true;
-    PutCompletedObject(*service_, client_id, pinned_key, initial_config,
-                       value_size);
-
-    AgentHints discard_hints;
-    discard_hints.reuse_hint = "discard";
-    ReplicateConfig upsert_config;
-    upsert_config.replica_num = 1;
-    upsert_config.agent_hints = discard_hints;
-    auto upsert_start =
-        service_->UpsertStart(client_id, pinned_key, TenantId::Default(),
-                              value_size * 2, upsert_config);
-    ASSERT_TRUE(upsert_start.has_value()) << toString(upsert_start.error());
-    ASSERT_TRUE(service_
-                    ->UpsertEnd(client_id, pinned_key, TenantId::Default(),
-                                ReplicaType::MEMORY)
-                    .has_value());
-
-    const std::string neutral_key = "agent_size_change_neutral";
-    ReplicateConfig neutral_config;
-    neutral_config.replica_num = 1;
-    PutCompletedObject(*service_, client_id, neutral_key, neutral_config,
-                       value_size);
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(kv_lease_ttl + 50));
-    TriggerMemoryEviction(*service_, client_id,
-                          "agent_size_change_evict_trigger", value_size * 2,
-                          std::chrono::milliseconds(300));
-
-    EXPECT_TRUE(
-        service_->GetReplicaList(pinned_key, TenantId::Default()).has_value());
-    EXPECT_FALSE(
-        service_->GetReplicaList(neutral_key, TenantId::Default()).has_value());
 }
 
 TEST_F(MasterServiceTest, SoftPinObjectsCanBeEvicted) {

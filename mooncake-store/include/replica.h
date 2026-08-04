@@ -5,6 +5,7 @@
 #include <boost/functional/hash.hpp>
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -82,6 +83,10 @@ inline std::ostream& operator<<(std::ostream& os,
  * persists the remaining fields as annotations.
  */
 struct AgentHints {
+    static constexpr size_t kMaxStringBytes = 1024;
+    static constexpr size_t kMaxChildrenStepIds = 64;
+    static constexpr size_t kMaxTotalStringBytes = 4096;
+
     std::string workflow_id{};
     std::string agent_id{};
     std::string step_id{};
@@ -95,23 +100,42 @@ struct AgentHints {
     std::string shared_prefix_hash{};
     std::string reuse_hint{"neutral"};
 
-    bool IsValidReuseHint() const noexcept {
-        return reuse_hint == "keep" || reuse_hint == "discard" ||
-               reuse_hint == "neutral";
-    }
-
     bool RequestsRetention() const noexcept { return reuse_hint == "keep"; }
 
-    // Log only a shape summary; workflow/agent/step IDs may contain user data.
-    friend std::ostream& operator<<(std::ostream& os,
-                                    const AgentHints& hints) noexcept {
-        os << "AgentHints: { workflow_id_set: " << (!hints.workflow_id.empty())
-           << ", agent_id_set: " << (!hints.agent_id.empty())
-           << ", step_id_set: " << (!hints.step_id.empty())
-           << ", children_step_count: " << hints.children_step_ids.size()
-           << ", reuse_hint: " << hints.reuse_hint
-           << ", cache_ttl_ms: " << hints.cache_ttl_ms << " }";
-        return os;
+    bool FitsSizeLimits() const noexcept {
+        size_t total_string_bytes = 0;
+        auto add_string_size = [&](const std::string& value) noexcept {
+            if (total_string_bytes > kMaxTotalStringBytes ||
+                value.size() > kMaxStringBytes ||
+                value.size() > kMaxTotalStringBytes - total_string_bytes) {
+                return false;
+            }
+            total_string_bytes += value.size();
+            return true;
+        };
+
+        if (!add_string_size(workflow_id) || !add_string_size(agent_id) ||
+            !add_string_size(step_id) || !add_string_size(parent_step_id) ||
+            !add_string_size(tool_name) ||
+            !add_string_size(shared_prefix_hash) ||
+            !add_string_size(reuse_hint)) {
+            return false;
+        }
+        if (children_step_ids.size() > kMaxChildrenStepIds) {
+            return false;
+        }
+        for (const auto& child_step_id : children_step_ids) {
+            if (!add_string_size(child_step_id)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool IsValid() const noexcept {
+        return (reuse_hint == "keep" || reuse_hint == "discard" ||
+                reuse_hint == "neutral") &&
+               cache_ttl_ms >= 0 && FitsSizeLimits();
     }
 };
 

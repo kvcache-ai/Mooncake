@@ -248,6 +248,37 @@ class SnapshotChildProcessTest : public ::testing::Test {
         return serializer.Deserialize(data);
     }
 
+    template <typename PackOptionalTail>
+    std::vector<uint8_t> BuildMetadataPayloadWithOptionalTail(
+        const std::string& key, uint32_t shard_idx, const UUID& client_id,
+        uint32_t array_size, std::string_view group_id,
+        PackOptionalTail&& pack_optional_tail) {
+        msgpack::sbuffer shard_buffer;
+        MsgpackPacker shard_packer(&shard_buffer);
+        shard_packer.pack_map(1);
+        shard_packer.pack(std::string("metadata"));
+        shard_packer.pack_array(1);
+        shard_packer.pack_array(2);
+        shard_packer.pack(key);
+
+        shard_packer.pack_array(array_size);
+        shard_packer.pack(UuidToString(client_id));
+        shard_packer.pack(kDefaultTestPutStartTimeMs);
+        shard_packer.pack(kDefaultTestObjectSize);
+        shard_packer.pack(kDefaultTestLeaseTimeoutMs);
+        shard_packer.pack(false);
+        shard_packer.pack(uint64_t{0});
+        shard_packer.pack(uint32_t{1});
+        shard_packer.pack(static_cast<uint8_t>(ObjectDataType::KVCACHE));
+        PackDiskReplica(shard_packer, kDefaultTestDiskFilePath,
+                        kDefaultTestObjectSize);
+        shard_packer.pack(false);
+        shard_packer.pack(std::string(group_id));
+        pack_optional_tail(shard_packer);
+
+        return WrapShardIntoMasterMetadataRoot(shard_buffer, shard_idx);
+    }
+
     bool ObjectIsGroupedInMetadata(const std::string& key, size_t shard_idx) {
         auto& shard = service_->metadata_shards_[shard_idx];
         SharedMutexLocker lock(&shard.mutex, shared_lock_t{});
@@ -821,32 +852,12 @@ TEST_F(SnapshotChildProcessTest,
     const uint32_t shard_idx = GetShardIndexForTest(key);
     const UUID client_id = generate_uuid();
 
-    msgpack::sbuffer shard_buffer;
-    MsgpackPacker shard_packer(&shard_buffer);
-    shard_packer.pack_map(1);
-    shard_packer.pack(std::string("metadata"));
-    shard_packer.pack_array(1);
-    shard_packer.pack_array(2);
-    shard_packer.pack(key);
-
     // Previous writer shape: data_type + replica + hard_pinned + group_id,
     // with no trailing agent_hints field.
-    shard_packer.pack_array(11);
-    shard_packer.pack(UuidToString(client_id));
-    shard_packer.pack(kDefaultTestPutStartTimeMs);
-    shard_packer.pack(kDefaultTestObjectSize);
-    shard_packer.pack(kDefaultTestLeaseTimeoutMs);
-    shard_packer.pack(false);
-    shard_packer.pack(uint64_t{0});
-    shard_packer.pack(uint32_t{1});
-    shard_packer.pack(static_cast<uint8_t>(ObjectDataType::KVCACHE));
-    PackDiskReplica(shard_packer, kDefaultTestDiskFilePath,
-                    kDefaultTestObjectSize);
-    shard_packer.pack(false);
-    shard_packer.pack(std::string("legacy-group"));
-
-    auto deserialize_result = DeserializeMetadataForTest(
-        WrapShardIntoMasterMetadataRoot(shard_buffer, shard_idx));
+    auto deserialize_result =
+        DeserializeMetadataForTest(BuildMetadataPayloadWithOptionalTail(
+            key, shard_idx, client_id, 11, "legacy-group",
+            [](MsgpackPacker&) {}));
     ASSERT_TRUE(deserialize_result.has_value())
         << deserialize_result.error().message;
 
@@ -861,38 +872,19 @@ TEST_F(SnapshotChildProcessTest,
     const uint32_t shard_idx = GetShardIndexForTest(key);
     const UUID client_id = generate_uuid();
 
-    msgpack::sbuffer shard_buffer;
-    MsgpackPacker shard_packer(&shard_buffer);
-    shard_packer.pack_map(1);
-    shard_packer.pack(std::string("metadata"));
-    shard_packer.pack_array(1);
-    shard_packer.pack_array(2);
-    shard_packer.pack(key);
-
-    shard_packer.pack_array(12);
-    shard_packer.pack(UuidToString(client_id));
-    shard_packer.pack(kDefaultTestPutStartTimeMs);
-    shard_packer.pack(kDefaultTestObjectSize);
-    shard_packer.pack(kDefaultTestLeaseTimeoutMs);
-    shard_packer.pack(false);
-    shard_packer.pack(uint64_t{0});
-    shard_packer.pack(uint32_t{1});
-    shard_packer.pack(static_cast<uint8_t>(ObjectDataType::KVCACHE));
-    PackDiskReplica(shard_packer, kDefaultTestDiskFilePath,
-                    kDefaultTestObjectSize);
-    shard_packer.pack(false);
-    shard_packer.pack(std::string("future-group"));
-
-    shard_packer.pack_array(13);
-    PackAgentHintsV1Fields(
-        shard_packer, "wf-future", "agent-future", "step-future", int64_t{4},
-        int64_t{9}, "parent-future",
-        std::vector<std::string>{"child-a", "child-b"}, "future-tool",
-        int64_t{321}, int64_t{654321}, "future-prefix", "keep");
-    shard_packer.pack(std::string("future-v2-field"));
-
-    auto deserialize_result = DeserializeMetadataForTest(
-        WrapShardIntoMasterMetadataRoot(shard_buffer, shard_idx));
+    auto deserialize_result =
+        DeserializeMetadataForTest(BuildMetadataPayloadWithOptionalTail(
+            key, shard_idx, client_id, 12, "future-group",
+            [](MsgpackPacker& packer) {
+                packer.pack_array(13);
+                PackAgentHintsV1Fields(
+                    packer, "wf-future", "agent-future", "step-future",
+                    int64_t{4}, int64_t{9}, "parent-future",
+                    std::vector<std::string>{"child-a", "child-b"},
+                    "future-tool", int64_t{321}, int64_t{654321},
+                    "future-prefix", "keep");
+                packer.pack(std::string("future-v2-field"));
+            }));
     ASSERT_TRUE(deserialize_result.has_value())
         << deserialize_result.error().message;
 
@@ -919,44 +911,47 @@ TEST_F(SnapshotChildProcessTest, DeserializeMalformedAgentHintsSkipsEntry) {
     const uint32_t shard_idx = GetShardIndexForTest(key);
     const UUID client_id = generate_uuid();
 
-    msgpack::sbuffer shard_buffer;
-    MsgpackPacker shard_packer(&shard_buffer);
-    shard_packer.pack_map(1);
-    shard_packer.pack(std::string("metadata"));
-    shard_packer.pack_array(1);
-    shard_packer.pack_array(2);
-    shard_packer.pack(key);
+    auto deserialize_result =
+        DeserializeMetadataForTest(BuildMetadataPayloadWithOptionalTail(
+            key, shard_idx, client_id, 12, "malformed-group",
+            [](MsgpackPacker& packer) {
+                packer.pack_array(12);
+                packer.pack(std::string("wf-malformed"));
+                packer.pack(std::string("agent"));
+                packer.pack(std::string("step"));
+                packer.pack(int64_t{1});
+                packer.pack(int64_t{1});
+                packer.pack(std::string("parent"));
+                packer.pack(std::vector<std::string>{"child"});
+                packer.pack(std::string("tool"));
+                packer.pack(int64_t{100});
+                packer.pack(std::string("bad-ttl"));
+                packer.pack(std::string("prefix"));
+                packer.pack(std::string("keep"));
+            }));
+    ASSERT_TRUE(deserialize_result.has_value())
+        << deserialize_result.error().message;
+    EXPECT_FALSE(KeyExistsInMetadata(service_.get(), key));
+    EXPECT_FALSE(AgentHintsInMetadata(key).has_value());
+}
 
-    shard_packer.pack_array(12);
-    shard_packer.pack(UuidToString(client_id));
-    shard_packer.pack(kDefaultTestPutStartTimeMs);
-    shard_packer.pack(kDefaultTestObjectSize);
-    shard_packer.pack(kDefaultTestLeaseTimeoutMs);
-    shard_packer.pack(false);
-    shard_packer.pack(uint64_t{0});
-    shard_packer.pack(uint32_t{1});
-    shard_packer.pack(static_cast<uint8_t>(ObjectDataType::KVCACHE));
-    PackDiskReplica(shard_packer, kDefaultTestDiskFilePath,
-                    kDefaultTestObjectSize);
-    shard_packer.pack(false);
-    shard_packer.pack(std::string("malformed-group"));
+TEST_F(SnapshotChildProcessTest, DeserializeOversizedAgentHintsSkipsEntry) {
+    CreateDefaultService();
+    const std::string key = "oversized_agent_hints_snapshot_key";
+    const uint32_t shard_idx = GetShardIndexForTest(key);
+    const UUID client_id = generate_uuid();
 
-    shard_packer.pack_array(12);
-    shard_packer.pack(std::string("wf-malformed"));
-    shard_packer.pack(std::string("agent"));
-    shard_packer.pack(std::string("step"));
-    shard_packer.pack(int64_t{1});
-    shard_packer.pack(int64_t{1});
-    shard_packer.pack(std::string("parent"));
-    shard_packer.pack(std::vector<std::string>{"child"});
-    shard_packer.pack(std::string("tool"));
-    shard_packer.pack(int64_t{100});
-    shard_packer.pack(std::string("bad-ttl"));
-    shard_packer.pack(std::string("prefix"));
-    shard_packer.pack(std::string("keep"));
-
-    auto deserialize_result = DeserializeMetadataForTest(
-        WrapShardIntoMasterMetadataRoot(shard_buffer, shard_idx));
+    auto deserialize_result =
+        DeserializeMetadataForTest(BuildMetadataPayloadWithOptionalTail(
+            key, shard_idx, client_id, 12, "oversized-group",
+            [](MsgpackPacker& packer) {
+                packer.pack_array(12);
+                PackAgentHintsV1Fields(
+                    packer, std::string(AgentHints::kMaxStringBytes + 1, 'w'),
+                    "agent", "step", int64_t{1}, int64_t{1}, "parent",
+                    std::vector<std::string>{"child"}, "tool", int64_t{100},
+                    int64_t{1000}, "prefix", "keep");
+            }));
     ASSERT_TRUE(deserialize_result.has_value())
         << deserialize_result.error().message;
     EXPECT_FALSE(KeyExistsInMetadata(service_.get(), key));

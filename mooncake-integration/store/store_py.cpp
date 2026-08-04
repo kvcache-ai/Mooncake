@@ -1481,19 +1481,6 @@ class MooncakeStorePyWrapper {
                        << ")";
             return to_py_ret(ErrorCode::INVALID_PARAMS);
         }
-        if (config.agent_hints.has_value()) {
-            const auto &hints = config.agent_hints.value();
-            if (!hints.IsValidReuseHint()) {
-                LOG(ERROR) << "reuse_hint_size=" << hints.reuse_hint.size()
-                           << ", error=invalid_agent_reuse_hint";
-                return to_py_ret(ErrorCode::INVALID_PARAMS);
-            }
-            if (hints.cache_ttl_ms < 0) {
-                LOG(ERROR) << "cache_ttl_ms=" << hints.cache_ttl_ms
-                           << ", error=invalid_agent_cache_ttl";
-                return to_py_ret(ErrorCode::INVALID_PARAMS);
-            }
-        }
         return 0;
     }
 
@@ -1760,12 +1747,7 @@ PYBIND11_MODULE(store, m) {
                        &AgentHints::expected_tool_duration_ms)
         .def_readwrite("cache_ttl_ms", &AgentHints::cache_ttl_ms)
         .def_readwrite("shared_prefix_hash", &AgentHints::shared_prefix_hash)
-        .def_readwrite("reuse_hint", &AgentHints::reuse_hint)
-        .def("__str__", [](const AgentHints &hints) {
-            std::ostringstream oss;
-            oss << hints;
-            return oss.str();
-        });
+        .def_readwrite("reuse_hint", &AgentHints::reuse_hint);
 
     // Define the ReplicateConfig class
     py::class_<ReplicateConfig>(m, "ReplicateConfig")

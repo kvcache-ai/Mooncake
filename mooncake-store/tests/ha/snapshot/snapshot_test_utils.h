@@ -151,7 +151,7 @@ inline void PackAgentHintsV1Fields(
     std::string_view agent_id = "agent-1", std::string_view step_id = "step-1",
     int64_t step_index = 1, int64_t total_steps = 2,
     std::string_view parent_step_id = "parent-step",
-    std::vector<std::string> children_step_ids = {"child-step"},
+    const std::vector<std::string>& children_step_ids = {"child-step"},
     std::string_view tool_name = "search",
     int64_t expected_tool_duration_ms = 1000, int64_t cache_ttl_ms = 60000,
     std::string_view shared_prefix_hash = "prefix-hash",

@@ -706,9 +706,14 @@ struct AgentHints {
 The initial Store-side behavior is intentionally narrow: `reuse_hint="keep"`
 maps to the existing soft-pin retention path, and `cache_ttl_ms` can extend the
 soft-pin timeout. `reuse_hint="neutral"` and `reuse_hint="discard"` do not add
-retention by themselves. `workflow_id` remains an annotation in this layer and
-is not mapped to `group_ids`, because groups also affect sharding, lease refresh,
-and grouped eviction.
+retention by themselves, and they do not cancel an existing soft pin. On a
+same-size upsert, callers can clear AgentHints-based retention by omitting
+`agent_hints` and leaving `with_soft_pin=false`. `workflow_id` remains an
+annotation in this layer and is not mapped to `group_ids`, because groups also
+affect sharding, lease refresh, and grouped eviction. Agent hint annotations are
+bounded before admission and snapshot restore: each string field is capped at
+1024 bytes, `children_step_ids` is capped at 64 entries, and the total string
+payload is capped at 4096 bytes.
 
 ## Zombie Object Cleanup
 

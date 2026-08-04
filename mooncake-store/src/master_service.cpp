@@ -162,14 +162,16 @@ tl::expected<void, ErrorCode> ValidateAgentHints(
         return {};
     }
     const auto& hints = config.agent_hints.value();
-    if (!hints.IsValidReuseHint()) {
+    if (!hints.IsValid()) {
         LOG(ERROR) << "reuse_hint_size=" << hints.reuse_hint.size()
-                   << ", error=invalid_agent_reuse_hint";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    if (hints.cache_ttl_ms < 0) {
-        LOG(ERROR) << "cache_ttl_ms=" << hints.cache_ttl_ms
-                   << ", error=invalid_agent_cache_ttl";
+                   << ", cache_ttl_ms=" << hints.cache_ttl_ms
+                   << ", children_step_count=" << hints.children_step_ids.size()
+                   << ", max_children_step_ids="
+                   << AgentHints::kMaxChildrenStepIds
+                   << ", max_string_bytes=" << AgentHints::kMaxStringBytes
+                   << ", max_total_string_bytes="
+                   << AgentHints::kMaxTotalStringBytes
+                   << ", error=invalid_agent_hints";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     return {};
@@ -235,10 +237,10 @@ tl::expected<std::optional<AgentHints>, SerializationError> UnpackAgentHints(
             "deserialize AgentHints: " + std::string(e.what())));
     }
 
-    if (!hints.IsValidReuseHint() || hints.cache_ttl_ms < 0) {
+    if (!hints.IsValid()) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
-            "deserialize AgentHints: invalid reuse_hint or cache_ttl_ms"));
+            "deserialize AgentHints: invalid fields or size limits exceeded"));
     }
     return std::optional<AgentHints>{std::move(hints)};
 }
