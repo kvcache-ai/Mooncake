@@ -1,4 +1,8 @@
 file(GLOB ENGINE_SOURCES "*.cpp")
+set(TRANSFER_METADATA_PLUGIN_SOURCES config.cpp transfer_metadata_plugin.cpp)
+list(REMOVE_ITEM ENGINE_SOURCES
+     "${CMAKE_CURRENT_SOURCE_DIR}/config.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/transfer_metadata_plugin.cpp")
 add_subdirectory(common)
 add_subdirectory(transport)
 
@@ -10,12 +14,18 @@ if(USE_HIP)
   hipify_files(ENGINE_SOURCES)
 endif()
 
-add_library(transfer_engine ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>)
-if(BUILD_SHARED_LIBS)
-  install(TARGETS transfer_engine DESTINATION lib)
-endif()
-
-add_compile_definitions(transfer_engine PUBLIC MOONCAKE_USE_ETCD CMAKE_INCLUDE)
+add_library(transfer_metadata_plugin STATIC ${TRANSFER_METADATA_PLUGIN_SOURCES})
+set_target_properties(transfer_metadata_plugin
+                      PROPERTIES POSITION_INDEPENDENT_CODE ON)
+target_include_directories(
+  transfer_metadata_plugin
+  PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
+         $<INSTALL_INTERFACE:include>)
+target_compile_definitions(transfer_metadata_plugin PRIVATE MOONCAKE_USE_ETCD
+                                                            CMAKE_INCLUDE)
+target_link_libraries(transfer_metadata_plugin PUBLIC glog::glog
+                                                      JsonCpp::JsonCpp
+                                               PRIVATE pthread)
 if(USE_ETCD)
   if(USE_ETCD_LEGACY)
     if(USE_STATIC_ETCD_CPP_API)
@@ -23,26 +33,34 @@ if(USE_ETCD)
       pkg_check_modules(GRPCPP REQUIRED grpc++)
       pkg_check_modules(GRPC REQUIRED grpc)
       target_link_libraries(
-        transfer_engine PUBLIC etcd-cpp-api-core protobuf ${GRPC_LDFLAGS}
-                               ${GRPCPP_LDFLAGS})
+        transfer_metadata_plugin PRIVATE etcd-cpp-api-core protobuf
+                                         ${GRPC_LDFLAGS} ${GRPCPP_LDFLAGS})
     else()
-      target_link_libraries(transfer_engine PUBLIC etcd-cpp-api)
+      target_link_libraries(transfer_metadata_plugin PRIVATE etcd-cpp-api)
     endif()
   else()
-    add_dependencies(transfer_engine build_etcd_wrapper)
+    add_dependencies(transfer_metadata_plugin build_etcd_wrapper)
     set(ETCD_WRAPPER_LIB
         ${CMAKE_CURRENT_BINARY_DIR}/../../mooncake-common/etcd/libetcd_wrapper.so
     )
-    target_link_libraries(transfer_engine PRIVATE ${ETCD_WRAPPER_LIB})
+    target_link_libraries(transfer_metadata_plugin PRIVATE ${ETCD_WRAPPER_LIB})
   endif()
 endif()
 if(USE_REDIS)
-  target_link_libraries(transfer_engine PUBLIC hiredis)
+  target_link_libraries(transfer_metadata_plugin PRIVATE hiredis::hiredis)
 endif()
 if(USE_HTTP)
   find_package(CURL REQUIRED)
-  target_link_libraries(transfer_engine PUBLIC ${CURL_LIBRARIES})
+  target_link_libraries(transfer_metadata_plugin PRIVATE ${CURL_LIBRARIES})
 endif()
+
+add_library(transfer_engine ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>)
+target_include_directories(
+  transfer_engine
+  PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
+         $<INSTALL_INTERFACE:include>)
+target_compile_definitions(transfer_engine PRIVATE MOONCAKE_USE_ETCD
+                                                   CMAKE_INCLUDE)
 target_link_libraries(
   transfer_engine
   PUBLIC base
@@ -56,7 +74,11 @@ target_link_libraries(
          JsonCpp::JsonCpp
          numa
          asio_shared
-         yalantinglibs::yalantinglibs)
+         yalantinglibs::yalantinglibs
+  PRIVATE transfer_metadata_plugin)
+if(BUILD_SHARED_LIBS)
+  install(TARGETS transfer_engine DESTINATION lib)
+endif()
 
 if(USE_BAREX)
   target_link_libraries(transfer_engine PUBLIC barex_transport)

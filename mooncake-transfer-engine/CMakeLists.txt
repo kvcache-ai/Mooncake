@@ -9,12 +9,25 @@ if (NOT GLOBAL_CONFIG)
   include(../mooncake-common/FindGLOG.cmake)
   include(../mooncake-common/common.cmake)
 
+  add_subdirectory(../extern/pybind11
+                   ${CMAKE_CURRENT_BINARY_DIR}/extern/pybind11)
+
   # Build asio_shared in mooncake-common for standalone builds.
   # Set compile definitions before adding targets that include ASIO headers.
   add_compile_definitions(ASIO_SEPARATE_COMPILATION ASIO_DYN_LINK)
   add_subdirectory(../mooncake-common/src
                    ${CMAKE_CURRENT_BINARY_DIR}/mooncake-common-src)
 endif() # GLOBAL_CONFIG
+
+if(USE_REDIS)
+  find_path(HIREDIS_INCLUDE_DIR hiredis/hiredis.h REQUIRED)
+  find_library(HIREDIS_LIBRARY hiredis REQUIRED)
+  add_library(hiredis::hiredis UNKNOWN IMPORTED)
+  set_target_properties(
+    hiredis::hiredis
+    PROPERTIES IMPORTED_LOCATION "${HIREDIS_LIBRARY}"
+               INTERFACE_INCLUDE_DIRECTORIES "${HIREDIS_INCLUDE_DIR}")
+endif()
 
 if (USE_ASCEND)
   include(../mooncake-common/FindMpi.cmake)

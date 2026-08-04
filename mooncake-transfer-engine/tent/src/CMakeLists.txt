@@ -66,14 +66,18 @@ else()
 endif()
 
 # io_uring
-find_library(URING_LIB uring PATHS /usr/lib /usr/lib64 /usr/local/lib
-                                   /usr/local/lib64)
-find_path(URING_INCLUDE liburing.h PATHS /usr/include /usr/local/include)
-if(URING_LIB AND URING_INCLUDE)
+find_library(URING_LIBRARY uring PATHS /usr/lib /usr/lib64 /usr/local/lib
+                                       /usr/local/lib64)
+find_path(URING_INCLUDE_DIR liburing.h PATHS /usr/include /usr/local/include)
+if(URING_LIBRARY AND URING_INCLUDE_DIR)
+  add_library(liburing::liburing UNKNOWN IMPORTED)
+  set_target_properties(
+    liburing::liburing
+    PROPERTIES IMPORTED_LOCATION "${URING_LIBRARY}"
+               INTERFACE_INCLUDE_DIRECTORIES "${URING_INCLUDE_DIR}")
   message(STATUS "Uring: Enabled")
   target_compile_definitions(tent_interface INTERFACE USE_URING)
-  target_include_directories(tent_interface INTERFACE ${URING_INCLUDE})
-  target_link_libraries(tent_interface INTERFACE ${URING_LIB})
+  target_link_libraries(tent_interface INTERFACE liburing::liburing)
 else()
   message(STATUS "Uring: Disabled")
 endif()

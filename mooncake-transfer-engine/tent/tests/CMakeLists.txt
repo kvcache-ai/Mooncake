@@ -8,14 +8,14 @@ add_executable(tent_metrics_example tent_metrics_example.cpp)
 # (tent_metrics, tent_interface) get it transitively; executables need it
 # explicit.
 target_link_libraries(tent_metrics_example PRIVATE tent_metrics tent_common
-                                                   asio_shared glog ibverbs)
+                                                   asio_shared glog::glog ibverbs)
 target_include_directories(tent_metrics_example
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 
 # TENT Metrics Config Loader Unit Test
 add_executable(metrics_config_loader_test metrics_config_loader_test.cpp)
 target_link_libraries(metrics_config_loader_test
-                      PRIVATE tent_metrics tent_common gtest gtest_main glog)
+                      PRIVATE tent_metrics tent_common gtest gtest_main glog::glog)
 target_include_directories(metrics_config_loader_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME metrics_config_loader_test COMMAND metrics_config_loader_test)
@@ -41,7 +41,7 @@ add_test(NAME tent_metrics_http_server_test
 # compile time.
 add_executable(tent_metrics_recording_test metrics_recording_test.cpp)
 target_link_libraries(tent_metrics_recording_test PRIVATE gtest gtest_main
-                                                          tent_link_group glog)
+                                                          tent_link_group glog::glog)
 if(TARGET asio_shared)
   target_link_libraries(tent_metrics_recording_test PRIVATE asio_shared)
 endif()

@@ -29,10 +29,20 @@ else()
     message(STATUS "Http metastore support: Disabled")
 endif()
 
-find_library(HIREDIS_LIB hiredis)
-if(HIREDIS_LIB)
+if(NOT TARGET hiredis::hiredis)
+    find_path(HIREDIS_INCLUDE_DIR hiredis/hiredis.h)
+    find_library(HIREDIS_LIBRARY hiredis)
+    if(HIREDIS_INCLUDE_DIR AND HIREDIS_LIBRARY)
+        add_library(hiredis::hiredis UNKNOWN IMPORTED)
+        set_target_properties(
+            hiredis::hiredis
+            PROPERTIES IMPORTED_LOCATION "${HIREDIS_LIBRARY}"
+                       INTERFACE_INCLUDE_DIRECTORIES "${HIREDIS_INCLUDE_DIR}")
+    endif()
+endif()
+if(TARGET hiredis::hiredis)
     message(STATUS "Redis metastore support: Enabled")
-    add_metastore_module(redis DEPS ${HIREDIS_LIB})
+    add_metastore_module(redis DEPS hiredis::hiredis)
 else()
     message(STATUS "Redis metastore support: Disabled")
 endif()
