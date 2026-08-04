@@ -5512,18 +5512,22 @@ TEST_F(MasterServiceTest, PutStartExpiringTest) {
     EXPECT_FALSE(put_start_result.has_value());
     EXPECT_EQ(put_start_result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 
-    // The eviction runs asynchronously, so poll for it instead of sleeping a
-    // fixed 50 ms that a loaded CI runner can overrun (it took ~59 ms in the
-    // failure from #3245).
-    const auto eviction_deadline =
-        std::chrono::steady_clock::now() + std::chrono::seconds(5);
-    do {
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        put_start_result = service_->PutStart(
-            client_id, key_2, TenantId::Default(), slice_length, config);
-    } while (!put_start_result.has_value() &&
-             std::chrono::steady_clock::now() < eviction_deadline);
-    EXPECT_TRUE(put_start_result.has_value());
+    // The failed PutStart above sets need_mem_eviction_, and the eviction
+    // thread answers with an asynchronous BatchEvict. Polling PutStart for up
+    // to put_start_release_timeout_sec cannot tell that path apart from the
+    // periodic DiscardExpiredProcessingReplicas fallback, which releases the
+    // same replicas on the same 5 s scale and would pass the test without
+    // exercising the immediate eviction. Only BatchEvict moves the eviction
+    // attempt counter, so wait on that and then retry once.
+    const int64_t eviction_attempts_before =
+        MasterMetricManager::instance().get_mem_eviction_attempts();
+    WaitUntil([&] {
+        return MasterMetricManager::instance().get_mem_eviction_attempts() >
+               eviction_attempts_before;
+    });
+    put_start_result = service_->PutStart(client_id, key_2, TenantId::Default(),
+                                          slice_length, config);
+    ASSERT_TRUE(put_start_result.has_value());
     replica_list = put_start_result.value();
     EXPECT_EQ(replica_list.size(), kReplicaCnt);
     for (size_t i = 0; i < kReplicaCnt; i++) {
