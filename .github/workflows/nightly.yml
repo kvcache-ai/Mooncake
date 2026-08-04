@@ -29,6 +29,7 @@ concurrency:
 env:
   SCCACHE_GHA_ENABLED: "true"
 
+# Gate the dependency root so all downstream jobs are skipped in forks.
 jobs:
   version-stamp:
     if: github.repository == 'kvcache-ai/Mooncake'
@@ -52,7 +53,6 @@ jobs:
           echo "Nightly version: $NIGHTLY_VERSION"
 
   build-cuda128-x86:
-    if: github.repository == 'kvcache-ai/Mooncake'
     needs: version-stamp
     uses: ./.github/workflows/_build-wheel.yaml
     with:
@@ -70,7 +70,6 @@ jobs:
       version-override: ${{ needs.version-stamp.outputs.nightly_version }}
 
   build-cuda128-arm64:
-    if: github.repository == 'kvcache-ai/Mooncake'
     needs: version-stamp
     uses: ./.github/workflows/_build-wheel.yaml
     with:
@@ -87,7 +86,6 @@ jobs:
       version-override: ${{ needs.version-stamp.outputs.nightly_version }}
 
   build-cuda13-x86:
-    if: github.repository == 'kvcache-ai/Mooncake'
     needs: version-stamp
     uses: ./.github/workflows/_build-wheel.yaml
     with:
@@ -106,7 +104,6 @@ jobs:
       version-override: ${{ needs.version-stamp.outputs.nightly_version }}
 
   build-non-cuda-x86:
-    if: github.repository == 'kvcache-ai/Mooncake'
     needs: version-stamp
     uses: ./.github/workflows/_build-wheel.yaml
     with:
@@ -123,7 +120,7 @@ jobs:
 
   publish-testpypi:
     needs: [version-stamp, build-cuda128-x86, build-cuda128-arm64, build-cuda13-x86, build-non-cuda-x86, nightly-test]
-    if: ${{ github.repository == 'kvcache-ai/Mooncake' && !(github.event_name == 'workflow_dispatch' && github.event.inputs.skip_publish == 'true') }}
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.skip_publish == 'true') }}
     runs-on: ubuntu-22.04
     environment: nightly
     permissions:
@@ -165,7 +162,7 @@ jobs:
           twine upload --repository testpypi --skip-existing dist-publish/*.whl
 
   nightly-test:
-    if: github.repository == 'kvcache-ai/Mooncake'
+    needs: version-stamp
     runs-on: ubuntu-22.04
     env:
       CI: "true"
@@ -291,6 +288,7 @@ jobs:
           bash scripts/run_tests.sh
 
   nightly-gate:
+    # always() bypasses skipped dependencies, so this job needs its own guard.
     if: ${{ always() && github.repository == 'kvcache-ai/Mooncake' }}
     needs: [build-cuda128-x86, build-cuda128-arm64, build-cuda13-x86, build-non-cuda-x86, publish-testpypi, nightly-test]
     runs-on: ubuntu-22.04
@@ -333,7 +331,7 @@ jobs:
           echo "All nightly jobs passed!"
 
   notify-failure:
-    if: ${{ always() && github.repository == 'kvcache-ai/Mooncake' && needs.nightly-gate.result == 'failure' }}
+    if: ${{ always() && needs.nightly-gate.result == 'failure' }}
     needs: [nightly-gate]
     runs-on: ubuntu-22.04
     permissions:
