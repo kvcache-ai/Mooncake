@@ -969,19 +969,3 @@ mooncakePgResult_t mooncakePgCommGetNumSyncedRanks(mooncakePgComm_t comm,
         return {};
     });
 }
-
-mooncakePgResult_t mooncakePgCommGetPreferredHca(mooncakePgComm_t comm,
-                                                 const char* location,
-                                                 char* hca_buf,
-                                                 size_t hca_buf_size) {
-    return asCApiResult([&]() -> PGResult<void> {
-        PG_VALIDATE_ARG(comm && comm->impl, "invalid communicator");
-        PG_VALIDATE_ARG(location && hca_buf && hca_buf_size != 0,
-                        "invalid preferred-HCA output arguments");
-        PG_TRY(auto value, comm->impl->getPreferredHca(location));
-        PG_VALIDATE_ARG(value.size() < hca_buf_size,
-                        "preferred-HCA output is too small");
-        std::memcpy(hca_buf, value.c_str(), value.size() + 1);
-        return {};
-    });
-}

@@ -7,7 +7,6 @@
 #include <c10/util/env.h>
 #include <torch/csrc/distributed/c10d/Backend.hpp>
 
-#include <array>
 #include <exception>
 #include <functional>
 #include <numeric>
@@ -21,8 +20,6 @@ namespace {
 constexpr const char* kSingleTensorError =
     "Expecting one tensor only but got multiple.";
 constexpr const char* kSparseError = "Sparse op not supported.";
-constexpr size_t kPreferredHcaBytes = 256;
-
 mooncakePgDataType_t tensorType(const at::Tensor& tensor) {
     switch (tensor.scalar_type()) {
         case at::kChar:
@@ -710,15 +707,6 @@ void MooncakeBackend::shutdown() {
     const auto result = comm ? mooncakePgCommDestroy(comm) : mooncakePgSuccess;
     work_tracker_->shutdown();
     checkResult(result, "mooncakePgCommDestroy");
-}
-
-std::string MooncakeBackend::getPreferredHca(
-    const std::string& location) const {
-    std::array<char, kPreferredHcaBytes> hca_buf{};
-    checkResult(mooncakePgCommGetPreferredHca(comm_, location.c_str(),
-                                              hca_buf.data(), hca_buf.size()),
-                "mooncakePgCommGetPreferredHca");
-    return hca_buf.data();
 }
 
 void MooncakeBackend::extendGroupSizeTo(int) {

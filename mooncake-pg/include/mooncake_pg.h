@@ -321,9 +321,6 @@ MOONCAKE_PG_EXPORT mooncakePgResult_t
 mooncakePgCommGetEpoch(mooncakePgComm_t comm, uint64_t* epoch);
 MOONCAKE_PG_EXPORT mooncakePgResult_t
 mooncakePgCommGetNumSyncedRanks(mooncakePgComm_t comm, int* numSyncedRanks);
-MOONCAKE_PG_EXPORT mooncakePgResult_t
-mooncakePgCommGetPreferredHca(mooncakePgComm_t comm, const char* location,
-                              char* hcaBuf, size_t hcaBufSize);
 
 #ifdef __cplusplus
 }

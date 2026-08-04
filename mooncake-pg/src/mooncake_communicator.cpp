@@ -1323,39 +1323,6 @@ PGResult<void> MooncakeCommunicator::shutdown() {
     return {};
 }
 
-PGResult<std::string> MooncakeCommunicator::getPreferredHca(
-    const std::string& location) const {
-    static std::once_flag topology_once;
-    static std::shared_ptr<Topology> topology;
-    static TopologyMatrix matrix;
-    std::call_once(topology_once, [this] {
-        // FIXME: getLocalTopology is deprecated in TENT
-        topology = context_.engine->getLocalTopology();
-        if (topology) matrix = topology->getMatrix();
-        if (!topology || matrix.empty()) {
-            topology = std::make_shared<Topology>();
-            topology->discover();
-            matrix = topology->getMatrix();
-        }
-    });
-    const auto entry = matrix.find(location);
-    if (entry == matrix.end()) {
-        LOG(INFO) << "Topology is " << topology->toJson();
-        LOG(ERROR) << "Topology entry not found for location: " << location;
-        return makePGError(
-            PGErrorCode::NotSupported,
-            "topology entry not found for location: " + location);
-    }
-    if (entry->second.preferred_hca.empty()) {
-        LOG(INFO) << "Topology is " << topology->toJson();
-        LOG(ERROR) << "Preferred HCA list is empty for location: " << location;
-        return makePGError(
-            PGErrorCode::NotSupported,
-            "preferred HCA list is empty for location: " + location);
-    }
-    return entry->second.preferred_hca.front();
-}
-
 std::vector<int32_t> MooncakeCommunicator::getActiveRanks() const {
     std::vector<int32_t> result(max_group_size_, 0);
     if (!meta_ || !meta_->activeRanks) return result;

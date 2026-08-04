@@ -209,7 +209,6 @@ class MooncakeCommunicator {
                               size_t failed_ranks_hint_count);
 
     PGResult<void> shutdown();
-    PGResult<std::string> getPreferredHca(const std::string& location) const;
     std::vector<int32_t> getActiveRanks() const;
     int getNumSyncedRanks() const;
     PGResult<std::vector<bool>> getPeerState(

@@ -147,7 +147,6 @@ class MooncakeBackend final : public ::c10d::ProcessGroup {
 
     void shutdown() override;
 
-    std::string getPreferredHca(const std::string& location) const;
     at::Tensor getActiveRanksTensor() { return activeRanks_; }
     int getNumSyncedRanks();
     void extendGroupSizeTo(int size);

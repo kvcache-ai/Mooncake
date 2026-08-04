@@ -126,13 +126,6 @@ __attribute__((constructor)) static void MooncakeBackendConstructor() {
 #endif
 }
 
-std::string getPreferredHca(c10::intrusive_ptr<c10d::ProcessGroup> backend,
-                            std::string location) {
-    auto mooncakeBackend =
-        c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
-    return mooncakeBackend->getPreferredHca(location);
-}
-
 at::Tensor getActiveRanks(c10::intrusive_ptr<c10d::ProcessGroup> backend) {
     auto mooncakeBackend =
         c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
@@ -311,7 +304,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "be initialized. Pass None to reset to default behavior. "
           "The caller must ensure the TransferEngine object outlives all "
           "MooncakeBackend instances.");
-    m.def("get_preferred_hca", &getPreferredHca);
     m.def("get_active_ranks", &getActiveRanks);
     m.def("get_num_synced_ranks", &getNumSyncedRanks);
     m.def("extend_group_size_to", &extendGroupSizeTo);
