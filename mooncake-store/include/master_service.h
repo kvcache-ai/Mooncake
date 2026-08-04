@@ -1771,8 +1771,6 @@ class MasterService {
     void ApplySoftPinEvaluation(
         const ObjectMetadata& metadata,
         const ObjectMetadata::SoftPinEvaluation& result) const;
-    void RegisterCommittedSoftPin(const ObjectMetadata& metadata,
-                                  size_t shard_idx) const;
     bool IsSoftPinActive(
         const ObjectMetadata& metadata,
         const std::chrono::system_clock::time_point& now) const;

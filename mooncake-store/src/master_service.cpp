@@ -2194,17 +2194,6 @@ void MasterService::ApplySoftPinEvaluation(
     ApplySoftPinMetricDelta(result.metric_delta);
 }
 
-void MasterService::RegisterCommittedSoftPin(const ObjectMetadata& metadata,
-                                             size_t shard_idx) const {
-    const auto deadline = metadata.GetCommittedSoftPinTimeout();
-    if (!deadline) {
-        return;
-    }
-    soft_pin_deadline_index_.Upsert(
-        metadata.tenant_id.MakeScopedKey(metadata.user_key), shard_idx,
-        *deadline);
-}
-
 bool MasterService::IsSoftPinActive(
     const ObjectMetadata& metadata,
     const std::chrono::system_clock::time_point& now) const {

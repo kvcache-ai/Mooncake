@@ -127,7 +127,8 @@ class MasterServiceTest : public ::testing::Test {
             SpinLocker locker(&metadata.lock);
             metadata.soft_pin_timeout = deadline;
         }
-        service.RegisterCommittedSoftPin(metadata, shard_idx);
+        service.soft_pin_deadline_index_.Upsert(
+            normalized_tenant.MakeScopedKey(key), shard_idx, deadline);
     }
 
     size_t SoftPinDeadlineHeapSize(MasterService& service) {
