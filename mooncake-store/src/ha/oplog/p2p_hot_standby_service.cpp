@@ -61,6 +61,7 @@ ErrorCode P2PHotStandbyService::Start(uint64_t baseline_sequence_id) {
         !config_.snapshot_source_endpoints.empty() ||
         !discovered_snapshot_sources.empty() ||
         baseline_sequence_id < trimmed_sequence_id;
+    bool snapshot_bootstrap_succeeded = false;
     if (bootstrap_requested) {
         ErrorCode bootstrap_err = ErrorCode::INTERNAL_ERROR;
         const bool bootstrap_required =
@@ -105,6 +106,8 @@ ErrorCode P2PHotStandbyService::Start(uint64_t baseline_sequence_id) {
             }
             LOG(WARNING) << "P2PHotStandbyService: optional peer bootstrap "
                             "failed; falling back to OpLog replay";
+        } else {
+            snapshot_bootstrap_succeeded = true;
         }
     }
     auto latest_err = probe_store->GetLatestSequenceId(initial_sync_target);
@@ -112,6 +115,11 @@ ErrorCode P2PHotStandbyService::Start(uint64_t baseline_sequence_id) {
         LOG(ERROR) << "P2PHotStandbyService: failed to get initial sync target";
         state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
         return latest_err;
+    }
+    if (snapshot_bootstrap_succeeded) {
+        HAMetricManager::instance()
+            .set_p2p_bootstrap_catchup_target_sequence_id(
+                static_cast<int64_t>(initial_sync_target));
     }
     LOG(INFO) << "P2PHotStandbyService: initial OpLog catch-up started"
               << ", baseline_sequence_id=" << baseline_sequence_id
@@ -546,6 +554,13 @@ ErrorCode P2PHotStandbyService::BootstrapFromSnapshotSources(
                                     config_.snapshot_chunk_size);
         if (err == ErrorCode::OK) {
             baseline_sequence_id = source_sequence_id;
+            // Counts only the snapshot restore RPC. The surrounding
+            // bootstrap/resync flow can still fail during trim validation or
+            // OpLog catch-up and is tracked by the resync failure counters.
+            HAMetricManager::instance().inc_p2p_snapshot_bootstrap_success();
+            HAMetricManager::instance()
+                .set_p2p_snapshot_bootstrap_baseline_sequence_id(
+                    static_cast<int64_t>(baseline_sequence_id));
             LOG(INFO) << "P2PHotStandbyService: snapshot bootstrap succeeded"
                       << ", source=" << endpoint
                       << ", baseline_sequence_id=" << baseline_sequence_id;
@@ -560,6 +575,7 @@ ErrorCode P2PHotStandbyService::BootstrapFromSnapshotSources(
     LOG(ERROR) << "P2PHotStandbyService: all snapshot sources failed"
                << ", cluster_id=" << config_.cluster_id
                << ", source_count=" << endpoints.size();
+    HAMetricManager::instance().inc_p2p_snapshot_bootstrap_failures();
     return ErrorCode::INTERNAL_ERROR;
 }
 
@@ -572,6 +588,7 @@ ErrorCode P2PHotStandbyService::ResyncFromSnapshotLocked() {
         LOG(ERROR) << "P2PHotStandbyService: snapshot resync bootstrap failed"
                    << ", cluster_id=" << config_.cluster_id
                    << ", error=" << toString(err);
+        HAMetricManager::instance().inc_p2p_snapshot_resync_failures();
         return err;
     }
 
@@ -581,6 +598,7 @@ ErrorCode P2PHotStandbyService::ResyncFromSnapshotLocked() {
                       "while validating snapshot resync trim horizon"
                    << ", cluster_id=" << config_.cluster_id
                    << ", baseline_sequence_id=" << baseline_sequence_id;
+        HAMetricManager::instance().inc_p2p_snapshot_resync_failures();
         return ErrorCode::OPLOG_TRIMMED;
     }
     uint64_t trimmed_sequence_id = 0;
@@ -591,6 +609,7 @@ ErrorCode P2PHotStandbyService::ResyncFromSnapshotLocked() {
                    << ", cluster_id=" << config_.cluster_id
                    << ", baseline_sequence_id=" << baseline_sequence_id
                    << ", error=" << toString(err);
+        HAMetricManager::instance().inc_p2p_snapshot_resync_failures();
         return ErrorCode::OPLOG_TRIMMED;
     }
     if (baseline_sequence_id < trimmed_sequence_id) {
@@ -599,6 +618,7 @@ ErrorCode P2PHotStandbyService::ResyncFromSnapshotLocked() {
                    << ", cluster_id=" << config_.cluster_id
                    << ", baseline_sequence_id=" << baseline_sequence_id
                    << ", trimmed_sequence_id=" << trimmed_sequence_id;
+        HAMetricManager::instance().inc_p2p_snapshot_resync_failures();
         return ErrorCode::OPLOG_TRIMMED;
     }
 
@@ -614,8 +634,11 @@ ErrorCode P2PHotStandbyService::ResyncFromSnapshotLocked() {
                    << ", cluster_id=" << config_.cluster_id
                    << ", baseline_sequence_id=" << baseline_sequence_id
                    << ", error=" << toString(err);
+        HAMetricManager::instance().inc_p2p_snapshot_resync_failures();
         return err;
     }
+    HAMetricManager::instance().set_p2p_bootstrap_catchup_target_sequence_id(
+        static_cast<int64_t>(catch_up_target));
     err = StartOplogFollowingLocked(baseline_sequence_id);
     if (err != ErrorCode::OK) {
         LOG(ERROR) << "P2PHotStandbyService: failed to restart OpLog "
@@ -624,6 +647,7 @@ ErrorCode P2PHotStandbyService::ResyncFromSnapshotLocked() {
                    << ", baseline_sequence_id=" << baseline_sequence_id
                    << ", catch_up_target=" << catch_up_target
                    << ", error=" << toString(err);
+        HAMetricManager::instance().inc_p2p_snapshot_resync_failures();
         return err;
     }
     if (!WaitForAppliedSequenceLocked(catch_up_target)) {
@@ -633,8 +657,10 @@ ErrorCode P2PHotStandbyService::ResyncFromSnapshotLocked() {
                    << ", applied_sequence_id="
                    << GetLocalLastAppliedSequenceIdLocked();
         ResetOplogFollowingLocked();
+        HAMetricManager::instance().inc_p2p_snapshot_resync_failures();
         return ErrorCode::INTERNAL_ERROR;
     }
+    HAMetricManager::instance().inc_p2p_snapshot_resync_success();
     LOG(INFO) << "P2PHotStandbyService: snapshot resync completed"
               << ", baseline_sequence_id=" << baseline_sequence_id
               << ", applied_sequence_id="

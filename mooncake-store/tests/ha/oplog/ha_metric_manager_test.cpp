@@ -141,6 +141,8 @@ TEST_F(HAMetricManagerTest, TestHaFailureMetricsAreExported) {
     M().set_standby_degraded(true);
     M().set_primary_degraded(true);
     M().set_oplog_last_successful_poll_timestamp_ms(12345);
+    M().set_p2p_snapshot_bootstrap_baseline_sequence_id(101);
+    M().set_p2p_bootstrap_catchup_target_sequence_id(120);
     M().observe_election_duration_ms(10);
     M().inc_election_attempts();
     M().inc_election_failures();
@@ -165,6 +167,10 @@ TEST_F(HAMetricManagerTest, TestHaFailureMetricsAreExported) {
     M().inc_promotion_restore_failures();
     M().inc_promotion_skipped_replicas();
     M().inc_promotion_skipped_objects();
+    M().inc_p2p_snapshot_bootstrap_success();
+    M().inc_p2p_snapshot_bootstrap_failures();
+    M().inc_p2p_snapshot_resync_success();
+    M().inc_p2p_snapshot_resync_failures();
 
     const std::string text = M().serialize_metrics();
     for (const char* name : {
@@ -173,6 +179,8 @@ TEST_F(HAMetricManagerTest, TestHaFailureMetricsAreExported) {
              "ha_standby_degraded",
              "ha_primary_degraded",
              "ha_oplog_last_successful_poll_timestamp_ms",
+             "ha_p2p_snapshot_bootstrap_baseline_sequence_id",
+             "ha_p2p_bootstrap_catchup_target_sequence_id",
              "ha_election_failures_total",
              "ha_election_leadership_lost_total",
              "ha_election_reconnects_total",
@@ -196,6 +204,10 @@ TEST_F(HAMetricManagerTest, TestHaFailureMetricsAreExported) {
              "ha_promotion_restore_failures_total",
              "ha_promotion_skipped_replicas_total",
              "ha_promotion_skipped_objects_total",
+             "ha_p2p_snapshot_bootstrap_success_total",
+             "ha_p2p_snapshot_bootstrap_failures_total",
+             "ha_p2p_snapshot_resync_success_total",
+             "ha_p2p_snapshot_resync_failures_total",
          }) {
         EXPECT_NE(std::string::npos, text.find(name)) << name;
     }

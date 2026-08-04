@@ -92,6 +92,7 @@ class OpLogApplier {
     // sequence_ids from etcd. If an entry arrives late:
     // - REMOVE / PUT_REVOKE: delete the key
     // - PUT_END: discard
+    // - delete-like custom entries: handled by subclasses
     //
     // This is used during Standby promotion so we don't block promotion on
     // gaps, but still best-effort clean up potentially stale metadata.
@@ -108,6 +109,12 @@ class OpLogApplier {
     virtual bool ApplyCustomOpLogEntry(const OpLogEntry& entry);
 
     virtual bool IsBestEffortOpLogEntry(const OpLogEntry& entry) const;
+
+    // Late entries for skipped sequence IDs are only safe to apply when they
+    // cannot resurrect old state. The base class treats generic deletes as
+    // delete-like; subclasses can include backend-specific delete operations.
+    virtual bool IsLateSkippedDeleteLikeOpLogEntry(
+        const OpLogEntry& entry) const;
 
    private:
     bool ApplyOpLogEntryInternal(const OpLogEntry& entry);
@@ -144,6 +151,8 @@ class OpLogApplier {
      */
     bool RequestMissingOpLog(uint64_t missing_seq_id);
 
+    bool ApplyLateSkippedDeleteLikeOpLogEntry(const OpLogEntry& entry);
+
     bool HandleApplyFailure(const OpLogEntry& entry, const char* reason);
 
     MetadataStore* metadata_store_;
@@ -166,8 +175,8 @@ class OpLogApplier {
     std::set<uint64_t> confirmed_missing_sequence_ids_;
 
     // Sequence IDs we chose to skip (gap-timeout). If the late entry arrives:
-    // - REMOVE / PUT_REVOKE: delete the key (safe)
-    // - PUT_END: discard (do not resurrect potentially stale metadata)
+    // - delete-like entries: apply to avoid stale metadata
+    // - PUT_END / add-like entries: discard to avoid resurrecting stale state
     std::map<uint64_t, std::chrono::steady_clock::time_point>
         skipped_sequence_ids_;
 

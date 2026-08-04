@@ -40,6 +40,16 @@ bool P2POpLogApplier::IsBestEffortOpLogEntry(const OpLogEntry& entry) const {
     return IsBestEffortP2POpLog(entry.op_type);
 }
 
+bool P2POpLogApplier::IsLateSkippedDeleteLikeOpLogEntry(
+    const OpLogEntry& entry) const {
+    // TODO(P2P HA): Add per-replica/segment/client sequence guards so a stale
+    // late delete cannot remove newer same-target state after a re-add.
+    return OpLogApplier::IsLateSkippedDeleteLikeOpLogEntry(entry) ||
+           entry.op_type == OpType_REMOVE_REPLICA ||
+           entry.op_type == OpType_UNMOUNT_SEGMENT ||
+           entry.op_type == OpType_UNREGISTER_CLIENT;
+}
+
 bool P2POpLogApplier::ApplyAddReplica(const OpLogEntry& entry) {
     AddReplicaPayload payload;
     if (!DeserializeP2PPayload(entry.payload, payload)) {

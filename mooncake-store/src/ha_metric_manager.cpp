@@ -40,6 +40,12 @@ HAMetricManager::HAMetricManager()
       oplog_last_successful_poll_timestamp_ms_(
           "ha_oplog_last_successful_poll_timestamp_ms",
           "Unix timestamp of the latest successful Standby OpLog poll"),
+      p2p_snapshot_bootstrap_baseline_sequence_id_(
+          "ha_p2p_snapshot_bootstrap_baseline_sequence_id",
+          "Latest baseline sequence ID restored by P2P snapshot bootstrap"),
+      p2p_bootstrap_catchup_target_sequence_id_(
+          "ha_p2p_bootstrap_catchup_target_sequence_id",
+          "Latest OpLog target sequence ID used after P2P snapshot bootstrap"),
 
       // Error Counters
       oplog_skipped_entries_total_(
@@ -119,6 +125,18 @@ HAMetricManager::HAMetricManager()
       promotion_skipped_objects_total_(
           "ha_promotion_skipped_objects_total",
           "Total objects left without replicas during promotion restore"),
+      p2p_snapshot_bootstrap_success_total_(
+          "ha_p2p_snapshot_bootstrap_success_total",
+          "Total successful P2P snapshot bootstrap attempts"),
+      p2p_snapshot_bootstrap_failures_total_(
+          "ha_p2p_snapshot_bootstrap_failures_total",
+          "Total failed P2P snapshot bootstrap attempts"),
+      p2p_snapshot_resync_success_total_(
+          "ha_p2p_snapshot_resync_success_total",
+          "Total successful P2P snapshot resync attempts"),
+      p2p_snapshot_resync_failures_total_(
+          "ha_p2p_snapshot_resync_failures_total",
+          "Total failed P2P snapshot resync attempts"),
       oplog_watch_disconnections_total_(
           "ha_oplog_watch_disconnections_total",
           "Total number of OpLog watch disconnections"),
@@ -172,6 +190,8 @@ HAMetricManager::HAMetricManager()
     standby_degraded_.update(0);
     primary_degraded_.update(0);
     oplog_last_successful_poll_timestamp_ms_.update(0);
+    p2p_snapshot_bootstrap_baseline_sequence_id_.update(0);
+    p2p_bootstrap_catchup_target_sequence_id_.update(0);
     standby_state_.update(0);
 }
 
@@ -236,6 +256,16 @@ void HAMetricManager::set_primary_degraded(bool value) {
 void HAMetricManager::set_oplog_last_successful_poll_timestamp_ms(
     int64_t timestamp_ms) {
     oplog_last_successful_poll_timestamp_ms_.update(timestamp_ms);
+}
+
+void HAMetricManager::set_p2p_snapshot_bootstrap_baseline_sequence_id(
+    int64_t seq_id) {
+    p2p_snapshot_bootstrap_baseline_sequence_id_.update(seq_id);
+}
+
+void HAMetricManager::set_p2p_bootstrap_catchup_target_sequence_id(
+    int64_t seq_id) {
+    p2p_bootstrap_catchup_target_sequence_id_.update(seq_id);
 }
 
 // ========== Error Counters ==========
@@ -355,6 +385,22 @@ void HAMetricManager::inc_promotion_skipped_objects(int64_t val) {
     promotion_skipped_objects_total_.inc(val);
 }
 
+void HAMetricManager::inc_p2p_snapshot_bootstrap_success(int64_t val) {
+    p2p_snapshot_bootstrap_success_total_.inc(val);
+}
+
+void HAMetricManager::inc_p2p_snapshot_bootstrap_failures(int64_t val) {
+    p2p_snapshot_bootstrap_failures_total_.inc(val);
+}
+
+void HAMetricManager::inc_p2p_snapshot_resync_success(int64_t val) {
+    p2p_snapshot_resync_success_total_.inc(val);
+}
+
+void HAMetricManager::inc_p2p_snapshot_resync_failures(int64_t val) {
+    p2p_snapshot_resync_failures_total_.inc(val);
+}
+
 void HAMetricManager::inc_oplog_watch_disconnections(int64_t val) {
     oplog_watch_disconnections_total_.inc(val);
 }
@@ -450,6 +496,8 @@ std::string HAMetricManager::serialize_metrics() {
     serialize_metric(standby_degraded_);
     serialize_metric(primary_degraded_);
     serialize_metric(oplog_last_successful_poll_timestamp_ms_);
+    serialize_metric(p2p_snapshot_bootstrap_baseline_sequence_id_);
+    serialize_metric(p2p_bootstrap_catchup_target_sequence_id_);
     serialize_metric(standby_state_);
 
     // Counters
@@ -481,6 +529,10 @@ std::string HAMetricManager::serialize_metrics() {
     serialize_metric(promotion_restore_failures_total_);
     serialize_metric(promotion_skipped_replicas_total_);
     serialize_metric(promotion_skipped_objects_total_);
+    serialize_metric(p2p_snapshot_bootstrap_success_total_);
+    serialize_metric(p2p_snapshot_bootstrap_failures_total_);
+    serialize_metric(p2p_snapshot_resync_success_total_);
+    serialize_metric(p2p_snapshot_resync_failures_total_);
     serialize_metric(oplog_watch_disconnections_total_);
     serialize_metric(oplog_applied_entries_total_);
     serialize_metric(oplog_dropped_put_end_total_);

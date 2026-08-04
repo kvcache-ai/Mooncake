@@ -63,8 +63,8 @@ bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
     //   pending_entries_ can grow and the applier may appear stuck.
     const uint64_t expected = expected_sequence_id_.load();
     if (IsSequenceOlder(entry.sequence_id, expected)) {
-        // Late arrival of a previously-skipped gap entry: apply only if it's a
-        // delete/revoke.
+        // Late arrival of a previously-skipped gap entry: apply only if it
+        // cannot resurrect old state.
         bool was_skipped = false;
         {
             std::lock_guard<std::mutex> lock(pending_mutex_);
@@ -75,19 +75,21 @@ bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
             }
         }
         if (was_skipped) {
-            // TODO(P2P HA): Define type-aware handling for late P2P entries as
-            // part of the standby out-of-order/error-handling work.
-            if (entry.op_type == OpType::REMOVE ||
-                entry.op_type == OpType::PUT_REVOKE) {
-                // Safe: ensure we don't keep stale metadata.
-                if (entry.op_type == OpType::REMOVE) {
-                    ApplyRemove(entry);
-                } else {
-                    ApplyPutRevoke(entry);
+            if (IsLateSkippedDeleteLikeOpLogEntry(entry)) {
+                if (!ApplyLateSkippedDeleteLikeOpLogEntry(entry)) {
+                    LOG(ERROR)
+                        << "OpLogApplier: failed to apply late skipped "
+                           "delete-like entry"
+                        << ", op_type=" << static_cast<int>(entry.op_type)
+                        << ", sequence_id=" << entry.sequence_id
+                        << ", key=" << entry.object_key;
+                    return HandleApplyFailure(
+                        entry, "late skipped delete-like apply failed");
                 }
                 return true;
             }
-            // PUT_END (or others): discard to avoid resurrecting stale state.
+            // PUT_END / add-like entries: discard to avoid resurrecting stale
+            // state.
             if (entry.op_type == OpType::PUT_END) {
                 HAMetricManager::instance().inc_oplog_dropped_put_end();
             }
@@ -168,6 +170,12 @@ bool OpLogApplier::ApplyOpLogEntryInternal(const OpLogEntry& entry) {
 
 bool OpLogApplier::IsBestEffortOpLogEntry(const OpLogEntry&) const {
     return false;
+}
+
+bool OpLogApplier::IsLateSkippedDeleteLikeOpLogEntry(
+    const OpLogEntry& entry) const {
+    return entry.op_type == OpType::REMOVE ||
+           entry.op_type == OpType::PUT_REVOKE;
 }
 
 std::string OpLogApplier::GetFailureReason() const {
@@ -488,17 +496,22 @@ OpLogApplier::GapResolveResult OpLogApplier::TryResolveGapsOnceForPromotion(
         }
         r.fetched++;
 
-        // Apply policy: only delete/revoke; drop PUT_END.
-        if (e.op_type == OpType::REMOVE) {
-            ApplyRemove(e);
-            r.applied_deletes++;
-            successfully_processed.push_back(seq);
-        } else if (e.op_type == OpType::PUT_REVOKE) {
-            ApplyPutRevoke(e);
+        // Apply policy: only delete-like entries; drop PUT_END/add-like ops.
+        if (IsLateSkippedDeleteLikeOpLogEntry(e)) {
+            if (!ApplyLateSkippedDeleteLikeOpLogEntry(e)) {
+                LOG(ERROR) << "Promotion gap resolve: failed to apply "
+                              "delete-like seq="
+                           << seq
+                           << ", op_type=" << static_cast<int>(e.op_type);
+                (void)HandleApplyFailure(
+                    e, "promotion gap delete-like apply failed");
+                continue;
+            }
             r.applied_deletes++;
             successfully_processed.push_back(seq);
         } else {
-            // PUT_END or others: mark as processed (dropped) so we don't retry.
+            // PUT_END / add-like entries: mark as processed (dropped) so we
+            // don't retry.
             successfully_processed.push_back(seq);
         }
     }
@@ -514,6 +527,19 @@ OpLogApplier::GapResolveResult OpLogApplier::TryResolveGapsOnceForPromotion(
         }
     }
     return r;
+}
+
+bool OpLogApplier::ApplyLateSkippedDeleteLikeOpLogEntry(
+    const OpLogEntry& entry) {
+    if (entry.op_type == OpType::REMOVE) {
+        ApplyRemove(entry);
+        return true;
+    }
+    if (entry.op_type == OpType::PUT_REVOKE) {
+        ApplyPutRevoke(entry);
+        return true;
+    }
+    return ApplyCustomOpLogEntry(entry);
 }
 
 bool OpLogApplier::CheckSequenceOrder(const OpLogEntry& entry) {
