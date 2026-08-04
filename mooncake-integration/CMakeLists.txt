@@ -21,7 +21,6 @@ if(WITH_STORE)
     "../mooncake-store/include/cachelib_memory_allocator/fake_include")
 endif()
 
-include_directories("/usr/include/jsoncpp")
 include_directories("./")
 include_directories("../mooncake-transfer-engine/include")
 
