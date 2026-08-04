@@ -626,6 +626,131 @@ ProjectedPrefix ProjectDigest(
     return ProjectedPrefix{value};
 }
 
+// Lazily-hashed vLLM v1 block chain. Hashing is incremental: block i is
+// computed only when first requested via At(), and every block up to i is
+// cached, so prefix-index walks that stall early never hash the tail.
+class VllmV1HashChain final : public HashChain {
+   public:
+    VllmV1HashChain(const VllmValueCodec* codec,
+                    std::array<uint8_t, kSha256DigestSize> root_digest,
+                    const ContextKey& context,
+                    std::span<const int32_t> token_ids,
+                    std::optional<std::string> cache_salt)
+        : codec_(codec),
+          parent_(std::move(root_digest)),
+          lora_name_(context.lora_name),
+          cache_salt_(std::move(cache_salt)),
+          token_ids_(token_ids),
+          block_size_(static_cast<size_t>(context.block_size)),
+          block_count_(token_ids.size() / block_size_) {
+        computed_.reserve(block_count_);
+        // Reused across blocks: every codec clears the buffer at the start of
+        // EncodeBlock, so a single allocation with worst-case capacity avoids
+        // a malloc/free per block (dominant cost at large block counts).
+        encoded_.reserve(64 + block_size_ * 9);
+    }
+
+    // Validates inputs eagerly (same contract as Compute). Returns an empty
+    // string on success.
+    static std::string ValidateInputs(const ContextKey& context,
+                                      std::optional<std::string> cache_salt) {
+        if (context.block_size <= 0 ||
+            static_cast<uint64_t>(context.block_size) >
+                std::numeric_limits<size_t>::max()) {
+            return "block_size must be a positive size_t value";
+        }
+        if (!IsValidUtf8(context.lora_name)) {
+            return "lora_name must contain valid UTF-8";
+        }
+        if (cache_salt.has_value() && !IsValidUtf8(*cache_salt)) {
+            return "cache_salt must contain valid UTF-8";
+        }
+        return "";
+    }
+
+    size_t BlockCount() const override { return block_count_; }
+
+    size_t ComputedCount() const override { return computed_.size(); }
+
+    const HashBlock* At(size_t index, std::string* error) override {
+        if (index >= block_count_) {
+            if (error != nullptr) {
+                *error = "hash chain index out of range";
+            }
+            return nullptr;
+        }
+        if (!sticky_error_.empty()) {
+            if (error != nullptr) {
+                *error = sticky_error_;
+            }
+            return nullptr;
+        }
+        if (!EnsureEvp()) {
+            if (error != nullptr) {
+                *error = sticky_error_;
+            }
+            return nullptr;
+        }
+        while (computed_.size() <= index) {
+            const size_t block_index = computed_.size();
+            const bool has_lora = !lora_name_.empty();
+            const bool has_salt = block_index == 0 && cache_salt_.has_value() &&
+                                  !cache_salt_->empty();
+            const VllmBlockValues values{
+                .parent_digest = parent_,
+                .token_ids =
+                    token_ids_.subspan(block_index * block_size_, block_size_),
+                .lora_name = has_lora ? &lora_name_ : nullptr,
+                .cache_salt = has_salt ? &*cache_salt_ : nullptr,
+            };
+
+            codec_->EncodeBlock(values, &encoded_);
+
+            HashBlock block;
+            if (std::string hash_error =
+                    Sha256Reuse(evp_.get(), encoded_, &block.digest);
+                !hash_error.empty()) {
+                sticky_error_ = std::move(hash_error);
+                if (error != nullptr) {
+                    *error = sticky_error_;
+                }
+                return nullptr;
+            }
+            block.projected = ProjectDigest(block.digest);
+            parent_ = block.digest;
+            computed_.push_back(std::move(block));
+        }
+        return &computed_[index];
+    }
+
+   private:
+    bool EnsureEvp() {
+        if (evp_) {
+            return true;
+        }
+        evp_ = EvpContext(EVP_MD_CTX_new(), EVP_MD_CTX_free);
+        if (!evp_) {
+            sticky_error_ = "OpenSSL EVP MD context allocation failed";
+            return false;
+        }
+        return true;
+    }
+
+    using EvpContext = std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>;
+
+    const VllmValueCodec* codec_;
+    std::array<uint8_t, kSha256DigestSize> parent_;
+    std::string lora_name_;
+    std::optional<std::string> cache_salt_;
+    std::span<const int32_t> token_ids_;
+    size_t block_size_;
+    size_t block_count_;
+    std::vector<HashBlock> computed_;
+    std::vector<uint8_t> encoded_;
+    EvpContext evp_{nullptr, EVP_MD_CTX_free};
+    std::string sticky_error_;
+};
+
 class VllmV1HashStrategy final : public HashStrategy {
    public:
     VllmV1HashStrategy(const VllmValueCodec* codec,
@@ -641,65 +766,40 @@ class VllmV1HashStrategy final : public HashStrategy {
         }
         out->clear();
 
-        if (context.block_size <= 0 ||
-            static_cast<uint64_t>(context.block_size) >
-                std::numeric_limits<size_t>::max()) {
-            return "block_size must be a positive size_t value";
+        std::string error;
+        auto chain =
+            CreateChain(context, token_ids, std::move(cache_salt), &error);
+        if (!chain) {
+            return error;
         }
-        if (!IsValidUtf8(context.lora_name)) {
-            return "lora_name must contain valid UTF-8";
-        }
-        if (cache_salt.has_value() && !IsValidUtf8(*cache_salt)) {
-            return "cache_salt must contain valid UTF-8";
-        }
-
-        const size_t block_size = static_cast<size_t>(context.block_size);
-        const size_t block_count = token_ids.size() / block_size;
         std::vector<HashBlock> computed;
-        computed.reserve(block_count);
-
-        // Reused across blocks: every codec clears the buffer at the start of
-        // EncodeBlock, so a single allocation with worst-case capacity avoids
-        // a malloc/free per block (dominant cost at large block counts).
-        std::vector<uint8_t> encoded;
-        encoded.reserve(64 + block_size * 9);
-
-        // One EVP context for the whole chain, reset per block.
-        using EvpContext =
-            std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>;
-        EvpContext evp(EVP_MD_CTX_new(), EVP_MD_CTX_free);
-        if (!evp) {
-            return "OpenSSL EVP MD context allocation failed";
-        }
-
-        std::array<uint8_t, kSha256DigestSize> parent = root_digest_;
-        for (size_t block_index = 0; block_index < block_count; ++block_index) {
-            const bool has_lora = !context.lora_name.empty();
-            const bool has_salt = block_index == 0 && cache_salt.has_value() &&
-                                  !cache_salt->empty();
-            const VllmBlockValues values{
-                .parent_digest = parent,
-                .token_ids =
-                    token_ids.subspan(block_index * block_size, block_size),
-                .lora_name = has_lora ? &context.lora_name : nullptr,
-                .cache_salt = has_salt ? &*cache_salt : nullptr,
-            };
-
-            codec_->EncodeBlock(values, &encoded);
-
-            HashBlock block;
-            if (std::string error =
-                    Sha256Reuse(evp.get(), encoded, &block.digest);
-                !error.empty()) {
+        computed.reserve(chain->BlockCount());
+        for (size_t index = 0; index < chain->BlockCount(); ++index) {
+            const HashBlock* block = chain->At(index, &error);
+            if (block == nullptr) {
                 return error;
             }
-            block.projected = ProjectDigest(block.digest);
-            parent = block.digest;
-            computed.push_back(std::move(block));
+            computed.push_back(*block);
         }
 
         *out = std::move(computed);
         return "";
+    }
+
+    std::unique_ptr<HashChain> CreateChain(
+        const ContextKey& context, std::span<const int32_t> token_ids,
+        std::optional<std::string> cache_salt,
+        std::string* error) const override {
+        if (std::string validation_error =
+                VllmV1HashChain::ValidateInputs(context, cache_salt);
+            !validation_error.empty()) {
+            if (error != nullptr) {
+                *error = std::move(validation_error);
+            }
+            return nullptr;
+        }
+        return std::make_unique<VllmV1HashChain>(
+            codec_, root_digest_, context, token_ids, std::move(cache_salt));
     }
 
    private:
