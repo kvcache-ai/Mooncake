@@ -34,6 +34,7 @@
 #include "device/accelerator_registry.h"
 #include "default_config.h"
 #include "uds_transport.h"
+#include "device/cuda_ipc_buffer.h"
 #include "shm_helper.h"
 #include "memory_location.h"
 #ifdef USE_NOF
@@ -4512,6 +4513,145 @@ RealClient::batch_put_from_multi_buffers_dummy_helper(
 
     return batch_put_from_multi_buffers_internal(
         keys, real_buffers_result.value(), all_sizes, config);
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+RealClient::batch_put_from_cuda_ipc_dummy_helper(
+    const std::vector<CudaIpcWriteRequest> &requests,
+    const ReplicateConfig &config, const UUID &client_id) {
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+        return std::vector<tl::expected<void, ErrorCode>>(
+            requests.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+
+    const ShmContext &context = it->second;
+    const bool has_metadata =
+        !requests.empty() && requests[0].metadata.size != 0;
+    for (const auto &request : requests) {
+        if ((request.metadata.size != 0) != has_metadata) {
+            LOG(ERROR) << "Mixed cuda ipc metadata batches are not supported";
+            return std::vector<tl::expected<void, ErrorCode>>(
+                requests.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+        }
+    }
+
+    std::vector<device::CudaIpcBufferMapping> payload_mappings;
+    std::vector<std::string> keys;
+    std::vector<std::vector<void *>> all_buffers;
+    std::vector<std::vector<size_t>> all_sizes;
+    payload_mappings.reserve(requests.size());
+    keys.reserve(requests.size());
+    all_buffers.reserve(requests.size());
+    all_sizes.reserve(requests.size());
+
+    const MappedShm *last_hit_shm = nullptr;
+    for (const auto &request : requests) {
+        auto mapping = device::CudaIpcBufferMapping::Open(request.payload);
+        if (!mapping) {
+            return std::vector<tl::expected<void, ErrorCode>>(
+                requests.size(), tl::unexpected(mapping.error()));
+        }
+        payload_mappings.push_back(std::move(*mapping));
+        void *payload_ptr = payload_mappings.back().ptr();
+        keys.push_back(request.key);
+        if (has_metadata) {
+            void *metadata_ptr = nullptr;
+            if (!map_dummy_buffer_to_real(
+                    context, request.metadata.ptr,
+                    static_cast<size_t>(request.metadata.size), last_hit_shm,
+                    metadata_ptr)) {
+                LOG(ERROR) << "Dummy metadata buffer at "
+                           << request.metadata.ptr << " (size "
+                           << request.metadata.size
+                           << ") not found in any mapped shared memory, "
+                           << "client_id=" << client_id;
+                return std::vector<tl::expected<void, ErrorCode>>(
+                    requests.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+            }
+            all_buffers.push_back({metadata_ptr, payload_ptr});
+            all_sizes.push_back({static_cast<size_t>(request.metadata.size),
+                                 static_cast<size_t>(request.payload.size)});
+        } else {
+            all_buffers.push_back({payload_ptr});
+            all_sizes.push_back({static_cast<size_t>(request.payload.size)});
+        }
+    }
+
+    return batch_put_from_multi_buffers_internal(keys, all_buffers, all_sizes,
+                                                 config);
+}
+
+std::vector<tl::expected<int64_t, ErrorCode>>
+RealClient::batch_get_into_cuda_ipc_dummy_helper(
+    const std::vector<CudaIpcReadRequest> &requests, const UUID &client_id) {
+    {
+        std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+        if (shm_contexts_.find(client_id) == shm_contexts_.end()) {
+            LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+            return std::vector<tl::expected<int64_t, ErrorCode>>(
+                requests.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+        }
+    }
+
+    std::vector<tl::expected<int64_t, ErrorCode>> results(
+        requests.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    std::vector<device::CudaIpcBufferMapping> mappings;
+    std::vector<void *> buffers;
+    std::vector<std::vector<std::string>> all_keys;
+    std::vector<std::vector<std::vector<size_t>>> all_dst_offsets;
+    std::vector<std::vector<std::vector<size_t>>> all_src_offsets;
+    std::vector<std::vector<std::vector<size_t>>> all_sizes;
+    std::vector<size_t> buffer_capacities;
+    std::vector<size_t> original_indices;
+    mappings.reserve(requests.size());
+    buffers.reserve(requests.size());
+    all_keys.reserve(requests.size());
+    all_dst_offsets.reserve(requests.size());
+    all_src_offsets.reserve(requests.size());
+    all_sizes.reserve(requests.size());
+    buffer_capacities.reserve(requests.size());
+    original_indices.reserve(requests.size());
+
+    for (size_t i = 0; i < requests.size(); ++i) {
+        const auto &request = requests[i];
+        auto mapping = device::CudaIpcBufferMapping::Open(request.destination);
+        if (!mapping) {
+            results[i] = tl::unexpected(mapping.error());
+            continue;
+        }
+        mappings.push_back(std::move(*mapping));
+        buffers.push_back(mappings.back().ptr());
+        all_keys.push_back({request.key});
+        all_dst_offsets.push_back({{0}});
+        all_src_offsets.push_back(
+            {{static_cast<size_t>(request.source_offset)}});
+        all_sizes.push_back({{static_cast<size_t>(request.size)}});
+        buffer_capacities.push_back(static_cast<size_t>(request.size));
+        original_indices.push_back(i);
+    }
+
+    if (buffers.empty()) {
+        return results;
+    }
+
+    auto range_results = get_into_ranges_internal(
+        buffers, all_keys, all_dst_offsets, all_src_offsets, all_sizes,
+        &buffer_capacities, nullptr, nullptr, nullptr);
+    for (size_t i = 0; i < original_indices.size(); ++i) {
+        if (i < range_results.size() && range_results[i].size() == 1 &&
+            range_results[i][0].size() == 1) {
+            results[original_indices[i]] = range_results[i][0][0];
+        } else {
+            LOG(ERROR) << "Invalid cuda ipc tensor read result shape for key "
+                       << requests[original_indices[i]].key;
+            results[original_indices[i]] =
+                tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+    }
+    return results;
 }
 
 std::vector<tl::expected<int64_t, ErrorCode>>
