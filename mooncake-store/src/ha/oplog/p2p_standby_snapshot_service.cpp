@@ -38,12 +38,28 @@ P2PStandbySnapshotService::~P2PStandbySnapshotService() {
 BeginStandbySnapshotResponse P2PStandbySnapshotService::BeginSnapshot(
     const BeginStandbySnapshotRequest& request) {
     BeginStandbySnapshotResponse response;
-    if (!standby_ || request.cluster_id != standby_->GetClusterId() ||
-        !standby_->IsReadyForSnapshot()) {
+    const bool has_standby = standby_ != nullptr;
+    const std::string local_cluster_id =
+        has_standby ? standby_->GetClusterId() : "";
+    const bool snapshot_ready = has_standby &&
+                                request.cluster_id == local_cluster_id &&
+                                standby_->IsReadyForSnapshot();
+    if (!snapshot_ready) {
+        LOG(WARNING) << "Standby snapshot: BeginSnapshot rejected"
+                     << ", request_cluster_id=" << request.cluster_id
+                     << ", local_cluster_id=" << local_cluster_id
+                     << ", has_standby=" << has_standby;
         response.error_code = toInt(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
         return response;
     }
 
+    // NOTE: This snapshot is a bootstrap seed, not a consistent image of the
+    // source metadata at baseline_sequence_id. The source standby may keep
+    // applying OpLogs while chunks are fetched; entries deleted during the
+    // fetch can be absent from the restored state, while newly-created keys
+    // are not added unless they were already in the captured key set.
+    // Correctness depends on idempotent OpLog replay, and the restored node
+    // must catch up from baseline_sequence_id to converge to the final state.
     Session session;
     session.baseline_sequence_id = standby_->GetLatestAppliedSequenceId();
     auto* store = standby_->GetMetadataStore();
@@ -54,6 +70,10 @@ BeginStandbySnapshotResponse P2PStandbySnapshotService::BeginSnapshot(
     std::lock_guard<std::mutex> lock(mutex_);
     CleanupExpiredSessionsLocked();
     if (sessions_.size() >= kMaxStandbySnapshotSessions) {
+        LOG(WARNING) << "Standby snapshot: BeginSnapshot rejected, too many "
+                        "active sessions"
+                     << ", active_sessions=" << sessions_.size()
+                     << ", max_sessions=" << kMaxStandbySnapshotSessions;
         response.error_code = toInt(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
         return response;
     }
@@ -75,6 +95,12 @@ StandbySnapshotChunkResponse P2PStandbySnapshotService::GetSnapshotChunk(
     StandbySnapshotChunkResponse response;
     if (!standby_ || request.limit == 0 ||
         request.limit > kMaxStandbySnapshotChunkSize) {
+        LOG(WARNING) << "Standby snapshot: GetSnapshotChunk rejected, invalid "
+                        "request"
+                     << ", session_id=" << request.session_id
+                     << ", has_standby=" << (standby_ != nullptr)
+                     << ", limit=" << request.limit
+                     << ", max_limit=" << kMaxStandbySnapshotChunkSize;
         response.error_code = toInt(ErrorCode::INVALID_PARAMS);
         return response;
     }
@@ -83,6 +109,10 @@ StandbySnapshotChunkResponse P2PStandbySnapshotService::GetSnapshotChunk(
     CleanupExpiredSessionsLocked();
     auto session_it = sessions_.find(request.session_id);
     if (session_it == sessions_.end()) {
+        LOG(WARNING) << "Standby snapshot: GetSnapshotChunk rejected, unknown "
+                        "session"
+                     << ", session_id=" << request.session_id
+                     << ", active_sessions=" << sessions_.size();
         response.error_code = toInt(ErrorCode::INVALID_PARAMS);
         return response;
     }
@@ -90,6 +120,13 @@ StandbySnapshotChunkResponse P2PStandbySnapshotService::GetSnapshotChunk(
     auto& session = session_it->second;
     if (request.object_offset > session.object_keys.size() ||
         request.client_offset > session.client_ids.size()) {
+        LOG(WARNING) << "Standby snapshot: GetSnapshotChunk rejected, invalid "
+                        "offsets"
+                     << ", session_id=" << request.session_id
+                     << ", object_offset=" << request.object_offset
+                     << ", object_count=" << session.object_keys.size()
+                     << ", client_offset=" << request.client_offset
+                     << ", client_count=" << session.client_ids.size();
         response.error_code = toInt(ErrorCode::INVALID_PARAMS);
         return response;
     }
@@ -182,12 +219,21 @@ ErrorCode P2PStandbySnapshotClient::Bootstrap(const std::string& endpoint,
                                               uint32_t chunk_size) {
     if (!target || chunk_size == 0 ||
         chunk_size > kMaxStandbySnapshotChunkSize) {
+        LOG(WARNING) << "Standby snapshot: bootstrap rejected, invalid "
+                        "request"
+                     << ", endpoint=" << endpoint
+                     << ", has_target=" << (target != nullptr)
+                     << ", chunk_size=" << chunk_size
+                     << ", max_chunk_size=" << kMaxStandbySnapshotChunkSize;
         return ErrorCode::INVALID_PARAMS;
     }
 
     std::string host;
     std::string port;
     if (!ParseEndpoint(endpoint, host, port)) {
+        LOG(WARNING) << "Standby snapshot: bootstrap rejected, invalid "
+                        "endpoint"
+                     << ", endpoint=" << endpoint;
         return ErrorCode::INVALID_PARAMS;
     }
 
@@ -205,6 +251,10 @@ ErrorCode P2PStandbySnapshotClient::Bootstrap(const std::string& endpoint,
         client.call_for<&P2PStandbySnapshotService::BeginSnapshot>(
             std::chrono::seconds(10), BeginStandbySnapshotRequest{cluster_id}));
     if (!begin || fromInt(begin->error_code) != ErrorCode::OK) {
+        LOG(WARNING) << "Standby snapshot: BeginSnapshot RPC failed"
+                     << ", endpoint=" << endpoint << ", error="
+                     << (begin ? toString(fromInt(begin->error_code))
+                               : toString(ErrorCode::RPC_FAIL));
         return begin ? fromInt(begin->error_code) : ErrorCode::RPC_FAIL;
     }
 
@@ -232,6 +282,13 @@ ErrorCode P2PStandbySnapshotClient::Bootstrap(const std::string& endpoint,
                 std::chrono::seconds(30), request));
         if (!chunk || fromInt(chunk->error_code) != ErrorCode::OK) {
             result = chunk ? fromInt(chunk->error_code) : ErrorCode::RPC_FAIL;
+            LOG(WARNING) << "Standby snapshot: GetSnapshotChunk RPC failed"
+                         << ", endpoint=" << endpoint
+                         << ", session_id=" << session_id
+                         << ", object_offset=" << object_offset
+                         << ", client_offset=" << client_offset
+                         << ", limit=" << request.limit
+                         << ", error=" << toString(result);
             break;
         }
         for (const auto& record : chunk->clients) {
@@ -258,9 +315,6 @@ ErrorCode P2PStandbySnapshotClient::Bootstrap(const std::string& endpoint,
         }
     }
 
-    async_simple::coro::syncAwait(
-        client.call_for<&P2PStandbySnapshotService::EndSnapshot>(
-            std::chrono::seconds(5), EndStandbySnapshotRequest{session_id}));
     if (result != ErrorCode::OK) {
         LOG(ERROR) << "Standby snapshot: bootstrap failed"
                    << ", endpoint=" << endpoint << ", session_id=" << session_id
@@ -277,6 +331,19 @@ ErrorCode P2PStandbySnapshotClient::Bootstrap(const std::string& endpoint,
                   << ", baseline_sequence_id=" << baseline_sequence_id
                   << ", chunks=" << chunk_count
                   << ", elapsed_ms=" << elapsed.count();
+    }
+
+    // EndSnapshot is best-effort; the server-side CleanupLoop removes idle
+    // sessions by timeout if this cleanup RPC fails.
+    auto end = async_simple::coro::syncAwait(
+        client.call_for<&P2PStandbySnapshotService::EndSnapshot>(
+            std::chrono::seconds(5), EndStandbySnapshotRequest{session_id}));
+    const ErrorCode end_result = end ? fromInt(*end) : ErrorCode::RPC_FAIL;
+    if (end_result != ErrorCode::OK) {
+        LOG(WARNING) << "Standby snapshot: EndSnapshot RPC failed"
+                     << ", endpoint=" << endpoint
+                     << ", session_id=" << session_id
+                     << ", error=" << toString(end_result);
     }
     return result;
 }

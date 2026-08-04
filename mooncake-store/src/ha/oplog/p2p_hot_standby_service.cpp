@@ -3,6 +3,7 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <random>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -419,7 +420,13 @@ bool P2PHotStandbyService::WaitForAppliedSequence(
 ErrorCode P2PHotStandbyService::BootstrapFromSnapshotSources(
     uint64_t& baseline_sequence_id) {
     P2PStandbySnapshotClient client;
-    for (const auto& endpoint : config_.snapshot_source_endpoints) {
+    auto snapshot_source_endpoints = config_.snapshot_source_endpoints;
+    if (snapshot_source_endpoints.size() > 1) {
+        static thread_local std::mt19937 generator(std::random_device{}());
+        std::shuffle(snapshot_source_endpoints.begin(),
+                     snapshot_source_endpoints.end(), generator);
+    }
+    for (const auto& endpoint : snapshot_source_endpoints) {
         uint64_t source_sequence_id = 0;
         auto err = client.Bootstrap(endpoint, config_.cluster_id,
                                     metadata_store_.get(), source_sequence_id,
@@ -434,6 +441,9 @@ ErrorCode P2PHotStandbyService::BootstrapFromSnapshotSources(
         LOG(WARNING) << "P2PHotStandbyService: snapshot source failed"
                      << ", source=" << endpoint << ", error=" << toString(err);
     }
+    LOG(ERROR) << "P2PHotStandbyService: all snapshot sources failed"
+               << ", cluster_id=" << config_.cluster_id
+               << ", source_count=" << snapshot_source_endpoints.size();
     return ErrorCode::INTERNAL_ERROR;
 }
 
@@ -441,6 +451,9 @@ ErrorCode P2PHotStandbyService::GetLatestOpLogSequenceId(
     uint64_t& sequence_id) const {
     auto store = CreateReaderStore();
     if (!store) {
+        LOG(ERROR) << "P2PHotStandbyService: failed to create OpLog reader "
+                      "store when fetching latest sequence id"
+                   << ", cluster_id=" << config_.cluster_id;
         return ErrorCode::INTERNAL_ERROR;
     }
     return store->GetLatestSequenceId(sequence_id);
