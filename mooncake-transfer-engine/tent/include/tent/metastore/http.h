@@ -45,8 +45,8 @@ class HttpMetaStore : public MetaStore {
         return size * nmemb;
     }
 
-    std::string encodeUrl(const std::string &key) {
-        char *newkey = curl_easy_escape(nullptr, key.c_str(), key.size());
+    std::string encodeUrl(CURL *curl, const std::string &key) {
+        char *newkey = curl_easy_escape(curl, key.c_str(), key.size());
         std::string encodedKey(newkey ? newkey : "");
         std::string url = endpoint_ + "?key=" + encodedKey;
         if (newkey) curl_free(newkey);

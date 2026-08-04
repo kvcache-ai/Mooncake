@@ -75,7 +75,7 @@ Status HttpMetaStore::get(const std::string &key, std::string &value) {
     }
     curl_easy_setopt(client.h, CURLOPT_TIMEOUT_MS, 3000);  // 3s timeout
 
-    std::string url = encodeUrl(key);
+    std::string url = encodeUrl(client.h, key);
     curl_easy_setopt(client.h, CURLOPT_URL, url.c_str());
     curl_easy_setopt(client.h, CURLOPT_WRITEFUNCTION, writeCallback);
 
@@ -116,7 +116,7 @@ Status HttpMetaStore::set(const std::string &key, const std::string &value) {
     }
     curl_easy_setopt(client.h, CURLOPT_TIMEOUT_MS, 3000);  // 3s timeout
 
-    std::string url = encodeUrl(key);
+    std::string url = encodeUrl(client.h, key);
     curl_easy_setopt(client.h, CURLOPT_URL, url.c_str());
     curl_easy_setopt(client.h, CURLOPT_WRITEFUNCTION, writeCallback);
     curl_easy_setopt(client.h, CURLOPT_POSTFIELDS, value.c_str());
@@ -163,7 +163,7 @@ Status HttpMetaStore::remove(const std::string &key) {
     }
     curl_easy_setopt(client.h, CURLOPT_TIMEOUT_MS, 3000);  // 3s timeout
 
-    std::string url = encodeUrl(key);
+    std::string url = encodeUrl(client.h, key);
     curl_easy_setopt(client.h, CURLOPT_URL, url.c_str());
     curl_easy_setopt(client.h, CURLOPT_WRITEFUNCTION, writeCallback);
     curl_easy_setopt(client.h, CURLOPT_CUSTOMREQUEST, "DELETE");
