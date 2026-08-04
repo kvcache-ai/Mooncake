@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <cstring>
 #include <memory>
@@ -281,6 +282,72 @@ TEST_F(RdmaContextReprobeTest,
     EXPECT_EQ(context_->gid(), formatGid(kCurrentGid));
     auto after_desc = localDesc();
     EXPECT_EQ(after_desc.get(), before_desc.get());
+}
+
+// Regression tests for the HCA-index / context_list_ alignment invariant.
+// An HCA's id is its position in getHcaList(), and disableDevice() keeps the
+// surviving ids there. initializeRdmaResources() used to append a context only
+// for devices that came up, compacting context_list_ so a later device_id
+// named the wrong RNIC or ran past its end.
+
+constexpr const char *kAlignmentTopologyJson =
+    R"({"cpu:0": [["mlx5_0", "mlx5_1", "mlx5_2"], []]})";
+
+TEST(RdmaHcaIndexAlignmentTest, ContextListKeepsOneSlotPerHcaWhenInitFails) {
+#ifndef __linux__
+    GTEST_SKIP() << "Requires Linux libibverbs symbol interposition";
+#else
+    // No FakeVerbsDeviceScope: the interposed ibv_get_device_list reports zero
+    // devices, so every construct() fails regardless of the host's hardware.
+    auto topology = std::make_shared<Topology>();
+    ASSERT_EQ(topology->parse(kAlignmentTopologyJson), 0);
+    const auto hca_list = topology->getHcaList();
+    ASSERT_EQ(hca_list.size(), static_cast<size_t>(3));
+
+    auto metadata = std::make_shared<TransferMetadata>(P2PHANDSHAKE);
+    RdmaTransport transport;
+    RdmaTransportTestPeer::bindMetadata(transport, metadata,
+                                        "local-rdma-segment");
+    RdmaTransportTestPeer::bindTopology(transport, topology);
+
+    // Every device fails, so the topology ends up empty -- the slot layout
+    // must line up with getHcaList() anyway.
+    EXPECT_EQ(RdmaTransportTestPeer::initializeResources(transport),
+              ERR_DEVICE_NOT_FOUND);
+
+    const auto &contexts = transport.getContextList();
+    ASSERT_EQ(contexts.size(), hca_list.size());
+    for (size_t i = 0; i < contexts.size(); ++i) {
+        ASSERT_NE(contexts[i], nullptr) << "slot " << i << " must be occupied";
+        EXPECT_EQ(contexts[i]->deviceName(), hca_list[i])
+            << "slot " << i << " names the wrong RNIC";
+        EXPECT_FALSE(contexts[i]->active())
+            << "placeholder for a failed RNIC must not report itself active";
+    }
+#endif  // __linux__
+}
+
+// Characterizes the contract the fix above relies on.
+TEST(RdmaHcaIndexAlignmentTest, DisabledDeviceKeepsRemainingHcaIndexesStable) {
+    Topology topology;
+    ASSERT_EQ(topology.parse(kAlignmentTopologyJson), 0);
+    const auto hca_list = topology.getHcaList();
+    ASSERT_EQ(hca_list.size(), static_cast<size_t>(3));
+    ASSERT_NE(std::find(hca_list.begin(), hca_list.end(), "mlx5_1"),
+              hca_list.end());
+
+    ASSERT_EQ(topology.disableDevice("mlx5_1"), 0);
+    // getHcaList() must not shrink: ids are positions in it.
+    ASSERT_EQ(topology.getHcaList().size(), hca_list.size());
+
+    for (int retry_count = 0; retry_count < 16; ++retry_count) {
+        const int device_id = topology.selectDevice("cpu:0", retry_count);
+        ASSERT_GE(device_id, 0);
+        ASSERT_LT(static_cast<size_t>(device_id), hca_list.size())
+            << "device_id must index an hca_list-sized context array";
+        EXPECT_NE(hca_list[device_id], "mlx5_1")
+            << "a disabled device must never be selected";
+    }
 }
 
 }  // namespace

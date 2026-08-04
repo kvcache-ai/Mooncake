@@ -607,6 +607,8 @@ int RdmaContext::registerMemoryRegionInternal(void *addr, size_t length,
 
 int RdmaContext::registerMemoryRegion(void *addr, size_t length, int access,
                                       const DmabufExport &exp) {
+    // Placeholder context for a failed RNIC: no PD to register against.
+    if (!pd_) return 0;
     MemoryRegionMeta mrMeta;
     int ret = registerMemoryRegionInternal(addr, length, access, exp, mrMeta);
     if (ret != 0) {
@@ -618,6 +620,7 @@ int RdmaContext::registerMemoryRegion(void *addr, size_t length, int access,
 }
 
 int RdmaContext::registerMemoryRegion(void *addr, size_t length, int access) {
+    if (!pd_) return 0;  // placeholder context: skip the dma_buf export too
     // Single-NIC convenience path: export, register, and close the fd here.
     // The shared-fd benefit only matters when a buffer is registered against
     // multiple NICs (see RdmaTransport::registerLocalMemoryInternal).
@@ -646,6 +649,7 @@ int RdmaContext::unregisterMemoryRegion(void *addr) {
 }
 
 int RdmaContext::preTouchMemory(void *addr, size_t length) {
+    if (!pd_) return 0;  // placeholder context
     DmabufExport exp;
     int ret = exportDmabuf(addr, exp);
     if (ret != 0) {
@@ -664,6 +668,8 @@ int RdmaContext::preTouchMemory(void *addr, size_t length) {
 }
 
 uint32_t RdmaContext::rkey(void *addr) {
+    // Placeholder context holds no MRs; its zero key is never selected.
+    if (!pd_) return 0;
     RWSpinlock::ReadGuard guard(memory_regions_lock_);
     auto iter = findMemoryRegionContaining(reinterpret_cast<uintptr_t>(addr));
     if (iter != memory_region_map_.end()) return iter->second.mr->rkey;
@@ -673,6 +679,7 @@ uint32_t RdmaContext::rkey(void *addr) {
 }
 
 uint32_t RdmaContext::lkey(void *addr) {
+    if (!pd_) return 0;  // see rkey()
     RWSpinlock::ReadGuard guard(memory_regions_lock_);
     auto iter = findMemoryRegionContaining(reinterpret_cast<uintptr_t>(addr));
     if (iter != memory_region_map_.end()) return iter->second.mr->lkey;
