@@ -27,6 +27,7 @@ class PkeyIndexEnvTest : public ::testing::Test {
         ::unsetenv("MC_PKEY_INDEX");
         ::unsetenv("MC_AUTO_GID_MAX_RETRIES");
         ::unsetenv("MC_IB_SL");
+        ::unsetenv("MC_TE_METADATA_REFRESH_INTERVAL_SECONDS");
     }
 };
 
@@ -156,6 +157,246 @@ TEST_F(PkeyIndexEnvTest, IbSlNonNumericKeepsDefault) {
     config.ib_service_level = 9;
     loadGlobalConfig(config);
     EXPECT_EQ(config.ib_service_level, 9);
+}
+
+TEST_F(PkeyIndexEnvTest, TeMetadataRefreshIntervalDefaultsToZeroWhenUnset) {
+    ::unsetenv("MC_TE_METADATA_REFRESH_INTERVAL_SECONDS");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.te_metadata_refresh_interval_seconds, 0);
+}
+
+TEST_F(PkeyIndexEnvTest, TeMetadataRefreshIntervalAcceptsValidOverride) {
+    ASSERT_EQ(::setenv("MC_TE_METADATA_REFRESH_INTERVAL_SECONDS", "5", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.te_metadata_refresh_interval_seconds, 5);
+}
+
+TEST_F(PkeyIndexEnvTest, TeMetadataRefreshIntervalAcceptsZeroAsDisabled) {
+    ASSERT_EQ(::setenv("MC_TE_METADATA_REFRESH_INTERVAL_SECONDS", "0", 1), 0);
+    GlobalConfig config;
+    config.te_metadata_refresh_interval_seconds = 123;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.te_metadata_refresh_interval_seconds, 0);
+}
+
+TEST_F(PkeyIndexEnvTest, TeMetadataRefreshIntervalRejectsNegativeOverride) {
+    ASSERT_EQ(::setenv("MC_TE_METADATA_REFRESH_INTERVAL_SECONDS", "-1", 1), 0);
+    GlobalConfig config;
+    config.te_metadata_refresh_interval_seconds = 123;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.te_metadata_refresh_interval_seconds, 123);
+}
+
+TEST_F(PkeyIndexEnvTest, TeMetadataRefreshIntervalRejectsNonNumericOverride) {
+    ASSERT_EQ(::setenv("MC_TE_METADATA_REFRESH_INTERVAL_SECONDS", "abc", 1), 0);
+    GlobalConfig config;
+    config.te_metadata_refresh_interval_seconds = 456;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.te_metadata_refresh_interval_seconds, 456);
+}
+
+// MC_CONN_PAUSE_TTL_MS arms the active-connect circuit-breaker: after an
+// endpoint to a peer is torn down, active reconnection to that peer's address
+// is paused for this many ms so the CQ poller isn't blocked re-handshaking a
+// gone peer. 0 disables (and is the default); the range is capped at 600000ms.
+// As with the other knobs, a typo / out-of-range value must preserve the
+// default rather than silently change behavior.
+class ConnPauseTtlEnvTest : public ::testing::Test {
+   protected:
+    void TearDown() override { ::unsetenv("MC_CONN_PAUSE_TTL_MS"); }
+};
+
+TEST_F(ConnPauseTtlEnvTest, DefaultIsZeroWhenUnset) {
+    ::unsetenv("MC_CONN_PAUSE_TTL_MS");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.conn_pause_ttl_ms, 0);
+}
+
+TEST_F(ConnPauseTtlEnvTest, ValidOverrideIsApplied) {
+    ASSERT_EQ(::setenv("MC_CONN_PAUSE_TTL_MS", "5000", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.conn_pause_ttl_ms, 5000);
+}
+
+TEST_F(ConnPauseTtlEnvTest, ZeroIsAcceptedAndDisables) {
+    ASSERT_EQ(::setenv("MC_CONN_PAUSE_TTL_MS", "0", 1), 0);
+    GlobalConfig config;
+    config.conn_pause_ttl_ms = 99;  // sentinel must be overwritten by 0
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.conn_pause_ttl_ms, 0);
+}
+
+TEST_F(ConnPauseTtlEnvTest, MaxBoundaryIsApplied) {
+    ASSERT_EQ(::setenv("MC_CONN_PAUSE_TTL_MS", "600000", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.conn_pause_ttl_ms, 600000);
+}
+
+TEST_F(ConnPauseTtlEnvTest, OutOfRangeIsIgnored) {
+    ASSERT_EQ(::setenv("MC_CONN_PAUSE_TTL_MS", "600001", 1), 0);
+    GlobalConfig config;
+    config.conn_pause_ttl_ms = 7;  // sentinel preserved when rejected
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.conn_pause_ttl_ms, 7);
+}
+
+TEST_F(ConnPauseTtlEnvTest, NegativeIsIgnored) {
+    ASSERT_EQ(::setenv("MC_CONN_PAUSE_TTL_MS", "-1", 1), 0);
+    GlobalConfig config;
+    config.conn_pause_ttl_ms = 11;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.conn_pause_ttl_ms, 11);
+}
+
+TEST_F(ConnPauseTtlEnvTest, NonNumericKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_CONN_PAUSE_TTL_MS", "abc", 1), 0);
+    GlobalConfig config;
+    config.conn_pause_ttl_ms = 13;  // a typo must NOT silently change behavior
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.conn_pause_ttl_ms, 13);
+}
+
+TEST_F(ConnPauseTtlEnvTest, NumericSuffixKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_CONN_PAUSE_TTL_MS", "5000s", 1), 0);
+    GlobalConfig config;
+    config.conn_pause_ttl_ms = 15;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.conn_pause_ttl_ms, 15);
+}
+
+TEST_F(ConnPauseTtlEnvTest, EmptyStringKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_CONN_PAUSE_TTL_MS", "", 1), 0);
+    GlobalConfig config;
+    config.conn_pause_ttl_ms = 17;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.conn_pause_ttl_ms, 17);
+}
+
+// MC_MAX_CONCURRENT_REG_MR caps how many buffers registerLocalMemoryBatch()
+// registers at once; 0 (the default) means unbounded. 0 is therefore also what
+// a silent atol() fallback would produce on a typo, which would read as "the
+// knob was honored and asked for no cap" -- the opposite of what the operator
+// wanted. So a typo must be rejected loudly and leave the field untouched.
+class MaxConcurrentRegMrEnvTest : public ::testing::Test {
+   protected:
+    void TearDown() override { ::unsetenv("MC_MAX_CONCURRENT_REG_MR"); }
+};
+
+TEST_F(MaxConcurrentRegMrEnvTest, UnboundedWhenUnset) {
+    ::unsetenv("MC_MAX_CONCURRENT_REG_MR");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.max_concurrent_reg_mr, 0u);
+}
+
+TEST_F(MaxConcurrentRegMrEnvTest, ValidOverrideIsApplied) {
+    ASSERT_EQ(::setenv("MC_MAX_CONCURRENT_REG_MR", "8", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.max_concurrent_reg_mr, 8u);
+}
+
+TEST_F(MaxConcurrentRegMrEnvTest, ExplicitZeroSelectsUnbounded) {
+    ASSERT_EQ(::setenv("MC_MAX_CONCURRENT_REG_MR", "0", 1), 0);
+    GlobalConfig config;
+    config.max_concurrent_reg_mr = 99;  // sentinel must be overwritten by 0
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.max_concurrent_reg_mr, 0u);
+}
+
+TEST_F(MaxConcurrentRegMrEnvTest, OneIsAcceptedAndSerializes) {
+    ASSERT_EQ(::setenv("MC_MAX_CONCURRENT_REG_MR", "1", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.max_concurrent_reg_mr, 1u);
+}
+
+TEST_F(MaxConcurrentRegMrEnvTest, NegativeIsIgnored) {
+    ASSERT_EQ(::setenv("MC_MAX_CONCURRENT_REG_MR", "-1", 1), 0);
+    GlobalConfig config;
+    config.max_concurrent_reg_mr = 11;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.max_concurrent_reg_mr, 11u);
+}
+
+TEST_F(MaxConcurrentRegMrEnvTest, NonNumericKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_MAX_CONCURRENT_REG_MR", "abc", 1), 0);
+    GlobalConfig config;
+    config.max_concurrent_reg_mr = 13;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.max_concurrent_reg_mr, 13u);
+}
+
+TEST_F(MaxConcurrentRegMrEnvTest, NumericSuffixKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_MAX_CONCURRENT_REG_MR", "8x", 1), 0);
+    GlobalConfig config;
+    config.max_concurrent_reg_mr = 15;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.max_concurrent_reg_mr, 15u);
+}
+
+TEST_F(MaxConcurrentRegMrEnvTest, EmptyStringKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_MAX_CONCURRENT_REG_MR", "", 1), 0);
+    GlobalConfig config;
+    config.max_concurrent_reg_mr = 17;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.max_concurrent_reg_mr, 17u);
+}
+
+class EfaNicSelectionEnvTest : public ::testing::Test {
+   protected:
+    void TearDown() override { ::unsetenv("MC_EFA_NIC_SELECTION"); }
+};
+
+TEST_F(EfaNicSelectionEnvTest, DefaultsToAll) {
+    ::unsetenv("MC_EFA_NIC_SELECTION");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.efa_nic_selection, EfaNicSelection::ALL);
+}
+
+TEST_F(EfaNicSelectionEnvTest, LocalIsApplied) {
+    ASSERT_EQ(::setenv("MC_EFA_NIC_SELECTION", "local", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.efa_nic_selection, EfaNicSelection::LOCAL);
+}
+
+TEST_F(EfaNicSelectionEnvTest, AllIsAcceptedExplicitly) {
+    ASSERT_EQ(::setenv("MC_EFA_NIC_SELECTION", "all", 1), 0);
+    GlobalConfig config;
+    config.efa_nic_selection = EfaNicSelection::LOCAL;  // must be overwritten
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.efa_nic_selection, EfaNicSelection::ALL);
+}
+
+TEST_F(EfaNicSelectionEnvTest, CaseIsIgnored) {
+    ASSERT_EQ(::setenv("MC_EFA_NIC_SELECTION", "LOCAL", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.efa_nic_selection, EfaNicSelection::LOCAL);
+}
+
+TEST_F(EfaNicSelectionEnvTest, UnknownValueKeepsDefault) {
+    // A typo must not silently pick a policy: registering buffers on the wrong
+    // NIC set is a correctness-adjacent surprise, not a perf knob.
+    ASSERT_EQ(::setenv("MC_EFA_NIC_SELECTION", "topology", 1), 0);
+    GlobalConfig config;
+    config.efa_nic_selection = EfaNicSelection::LOCAL;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.efa_nic_selection, EfaNicSelection::LOCAL);
+}
+
+TEST_F(EfaNicSelectionEnvTest, EmptyStringKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_EFA_NIC_SELECTION", "", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.efa_nic_selection, EfaNicSelection::ALL);
 }
 
 }  // namespace

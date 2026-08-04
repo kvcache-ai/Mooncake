@@ -5,6 +5,7 @@
 #include <csignal>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -225,7 +226,9 @@ class PyClient {
         const std::shared_ptr<TransferEngine> &transfer_engine,
         const std::string &ipc_socket_path, bool enable_ssd_offload = false,
         const std::string &ssd_offload_path = "",
-        const std::string &tenant_id = "default") = 0;
+        const std::string &tenant_id = "default",
+        bool enable_client_http_server = false,
+        int client_http_port = DEFAULT_CLIENT_HTTP_PORT) = 0;
 
     virtual int setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                             const std::string &server_address,
@@ -368,6 +371,13 @@ class PyClient {
     virtual tl::expected<QueryTaskResponse, ErrorCode> query_task(
         const UUID &task_id) = 0;
 
+    virtual std::optional<BufferHandle> allocate_client_buffer(size_t size) {
+        if (!client_buffer_allocator_) {
+            return std::nullopt;
+        }
+        return client_buffer_allocator_->allocate(size);
+    }
+
     std::shared_ptr<mooncake::Client> client_ = nullptr;
     std::shared_ptr<mooncake::ClientRequester> client_requester_ = nullptr;
     std::shared_ptr<mooncake::FileStorage> file_storage_ = nullptr;
@@ -398,7 +408,8 @@ inline CachedQueryResultResponse to_cached_query_result_response(
     return CachedQueryResultResponse(GetReplicaListResponse(
         std::vector<Replica::Descriptor>(query_result->replicas.begin(),
                                          query_result->replicas.end()),
-        remaining_lease_ttl_ms(*query_result, now)));
+        remaining_lease_ttl_ms(*query_result, now),
+        query_result->object_checksum));
 }
 
 inline tl::expected<QueryResult, ErrorCode> from_cached_query_result_response(
@@ -410,7 +421,8 @@ inline tl::expected<QueryResult, ErrorCode> from_cached_query_result_response(
     return QueryResult(
         std::vector<Replica::Descriptor>(cached_result.value.replicas.begin(),
                                          cached_result.value.replicas.end()),
-        now + std::chrono::milliseconds(cached_result.value.lease_ttl_ms));
+        now + std::chrono::milliseconds(cached_result.value.lease_ttl_ms),
+        cached_result.value.object_checksum);
 }
 
 inline PyClient::QueryResultCache build_query_result_cache_from_cached_results(

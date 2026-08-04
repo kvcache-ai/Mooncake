@@ -5,6 +5,12 @@ import os
 import time
 import threading
 import random
+
+try:
+    import torch as _torch
+except Exception:
+    _torch = None
+
 from mooncake.store import MooncakeDistributedStore
 
 # The lease time of the kv object, should be set equal to
@@ -12,6 +18,9 @@ from mooncake.store import MooncakeDistributedStore
 DEFAULT_DEFAULT_KV_LEASE_TTL = 5000 # 5000 milliseconds
 # Use environment variable if set, otherwise use default
 default_kv_lease_ttl = int(os.getenv("DEFAULT_KV_LEASE_TTL", DEFAULT_DEFAULT_KV_LEASE_TTL))
+
+def cuda_available():
+    return _torch is not None and _torch.cuda.is_available()
 
 # Define a test class for serialization
 class TestClass:
@@ -118,6 +127,32 @@ class TestDistributedObjectStore(unittest.TestCase):
         self.store.remove(key_int)
         self.store.remove(key_bool)
         self.store.remove(key_rand)
+
+    @unittest.skipUnless(cuda_available(), "CUDA is not available")
+    def test_cuda_local_copy_paths(self):
+        """Test CUDA source writes and CUDA destination reads."""
+        import torch
+
+        prefix = f"test_cuda_local_copy_{os.getpid()}"
+        put_key = f"{prefix}_put"
+        upsert_key = f"{prefix}_upsert"
+        raw_key = f"{prefix}_raw"
+
+        tensor = torch.arange(16, dtype=torch.float32, device="cuda")
+        self.assertEqual(self.store.put_tensor(put_key, tensor), 0)
+        self.assertEqual(self.store.upsert_tensor(upsert_key, tensor), 0)
+
+        raw = bytes(range(32))
+        self.assertEqual(self.store.put(raw_key, raw), 0)
+
+        dst = torch.empty(len(raw), dtype=torch.uint8, device="cuda")
+        self.assertEqual(self.store.get_into(raw_key, dst.data_ptr(), len(raw)), len(raw))
+        expected = torch.tensor(list(raw), dtype=torch.uint8, device="cuda")
+        self.assertTrue(torch.equal(dst, expected))
+
+        self.store.remove(put_key)
+        self.store.remove(upsert_key)
+        self.store.remove(raw_key)
 
     def test_put_get_tensor_with_metadata(self):
         """Test storing and retrieving PyTorch tensors with metadata using put_tensor_with_metadata/get_tensor_with_metadata."""
@@ -251,15 +286,17 @@ class TestCodecInference(unittest.TestCase):
         self.assertTrue(d.accepted)
         self.assertEqual(d.codec, "ragged_tensor")
 
-    def test_tensor_mixed_dtype_rejected(self):
+    def test_tensor_mixed_dtype(self):
         import torch
         d = _choose_leaf_codec([torch.tensor([1], dtype=torch.float32), torch.tensor([1], dtype=torch.int64)])
         self.assertFalse(d.accepted)
+        self.assertEqual(d.codec, "ragged_tensor")
 
-    def test_tensor_mixed_ndim_rejected(self):
+    def test_tensor_mixed_ndim(self):
         import torch
         d = _choose_leaf_codec([torch.tensor([1]), torch.tensor([[1, 2]])])
-        self.assertFalse(d.accepted)
+        self.assertTrue(d.accepted)
+        self.assertEqual(d.codec, "ragged_tensor")
 
     def test_numeric_sequence(self):
         d = _choose_leaf_codec([[1, 2, 3], [4, 5]])
@@ -294,7 +331,7 @@ class TestCodecInference(unittest.TestCase):
     def test_fallback(self):
         d = _choose_leaf_codec([object(), object()])
         self.assertFalse(d.accepted)
-        self.assertEqual(d.codec, "pickle_ragged_fallback")
+        self.assertEqual(d.codec, "msgpack_ragged")
 
     def test_with_nulls(self):
         d = _choose_leaf_codec(["hello", None, "world"])

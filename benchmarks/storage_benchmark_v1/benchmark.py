@@ -11,6 +11,8 @@ import sys
 import time
 import statistics
 import signal
+from contextlib import ExitStack
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, List, Dict, Any
@@ -103,7 +105,8 @@ class StorageBenchmark:
             'read_pages': 0,
             'write_pages': 0,
             'page_hits': 0,
-            'request_latencies_ms': [],
+            'request_io_latencies_ms': [],
+            'request_wall_latencies_ms': [],
         }
 
     def process_request(self, req: KVCacheRequest) -> float:
@@ -118,13 +121,14 @@ class StorageBenchmark:
         self.stats['total_requests'] += 1
         self.stats['total_tokens'] += req.input_length + req.output_length
 
-        total_latency = 0.0
+        request_start = time.perf_counter()
+        io_latency_ms = 0.0
 
         # Process each access requirement from layout
         for access in self.layout.get_operations(req):
             if self.storage.exists(access.page_id):
                 # Page exists, perform READ
-                total_latency += self.storage.read(
+                io_latency_ms += self.storage.read(
                     access.page_id,
                     offset_in_page=access.offset_in_page,
                     length=access.length
@@ -133,39 +137,23 @@ class StorageBenchmark:
                 self.stats['page_hits'] += 1
             else:
                 # Page doesn't exist, perform WRITE
-                total_latency += self.storage.write(
+                io_latency_ms += self.storage.write(
                     access.page_id,
                     offset_in_page=access.offset_in_page,
                     length=access.length
                 )
                 self.stats['write_pages'] += 1
 
-        latency_ms = total_latency if total_latency > 0 else 0.0
-        if latency_ms > 0:
-            self.stats['request_latencies_ms'].append(latency_ms)
-        return latency_ms
+        wall_latency_ms = (time.perf_counter() - request_start) * 1000.0
+        self.stats['request_io_latencies_ms'].append(io_latency_ms)
+        self.stats['request_wall_latencies_ms'].append(wall_latency_ms)
+        return io_latency_ms
 
     def get_stats(self) -> Dict:
         """Get statistics"""
         storage_stats = self.storage.get_stats()
-        request_latencies = self.stats['request_latencies_ms']
-
-        if request_latencies:
-            sorted_latencies = sorted(request_latencies)
-            n = len(sorted_latencies)
-
-            def get_percentile(p: float) -> float:
-                idx = int(n * p)
-                return sorted_latencies[idx] if idx < n else sorted_latencies[-1]
-
-            latency_stats = {
-                'avg_ms': statistics.mean(request_latencies),
-                'p50_ms': sorted_latencies[n // 2],
-                'p95_ms': get_percentile(0.95),
-                'p99_ms': get_percentile(0.99),
-            }
-        else:
-            latency_stats = {'avg_ms': 0, 'p50_ms': 0, 'p95_ms': 0, 'p99_ms': 0}
+        request_io_latencies = self.stats['request_io_latencies_ms']
+        request_wall_latencies = self.stats['request_wall_latencies_ms']
 
         total_pages = self.stats['read_pages'] + self.stats['write_pages']
 
@@ -178,7 +166,8 @@ class StorageBenchmark:
             'page_hits': self.stats['page_hits'],
             'page_hit_rate': self.stats['read_pages'] / total_pages if total_pages > 0 else 0,
             'write_ratio': self.stats['write_pages'] / total_pages if total_pages > 0 else 0,
-            'latency': latency_stats,
+            'request_io_latency': latency_stats(request_io_latencies),
+            'request_wall_latency': latency_stats(request_wall_latencies),
             'storage': storage_stats,
         }
 
@@ -205,10 +194,228 @@ def get_max_page_id(requests: List[KVCacheRequest]) -> int:
     return max_id
 
 
+def parse_csv_floats(value: str) -> List[float]:
+    return [float(item.strip()) for item in value.split(',') if item.strip()]
+
+
+def wait_for_replay_time(req: KVCacheRequest, base_timestamp: float,
+                         start_time: float, replay_scale: float):
+    if replay_scale <= 0 or req.timestamp == 0:
+        return
+    target_time = (start_time +
+                   max(0.0, req.timestamp - base_timestamp) /
+                   (1000.0 * replay_scale))
+    delay = target_time - time.perf_counter()
+    if delay > 0:
+        time.sleep(delay)
+
+
+def latency_stats(values: List[float]) -> Dict[str, float]:
+    if not values:
+        return {'avg_ms': 0, 'p50_ms': 0, 'p95_ms': 0, 'p99_ms': 0}
+
+    sorted_values = sorted(values)
+
+    def get_percentile(p: float) -> float:
+        if len(sorted_values) == 1:
+            return sorted_values[0]
+        rank = (len(sorted_values) - 1) * p
+        lower = int(rank)
+        upper = min(lower + 1, len(sorted_values) - 1)
+        weight = rank - lower
+        return (sorted_values[lower] * (1.0 - weight) +
+                sorted_values[upper] * weight)
+
+    return {
+        'avg_ms': statistics.mean(values),
+        'p50_ms': get_percentile(0.50),
+        'p95_ms': get_percentile(0.95),
+        'p99_ms': get_percentile(0.99),
+    }
+
+
+def snapshot_thread_stats(benchmark: StorageBenchmark) -> Dict[str, Any]:
+    storage = benchmark.storage
+    total_pages = benchmark.stats['read_pages'] + benchmark.stats['write_pages']
+    return {
+        'total_requests': benchmark.stats['total_requests'],
+        'total_tokens': benchmark.stats['total_tokens'],
+        'read_pages': benchmark.stats['read_pages'],
+        'write_pages': benchmark.stats['write_pages'],
+        'page_hits': benchmark.stats['page_hits'],
+        'request_io_latencies_ms': list(
+            benchmark.stats['request_io_latencies_ms']
+        ),
+        'request_wall_latencies_ms': list(
+            benchmark.stats['request_wall_latencies_ms']
+        ),
+        'read_bytes': storage.stats['read_bytes'],
+        'write_bytes': storage.stats['write_bytes'],
+        'read_time_s': storage.stats['read_time_s'],
+        'write_time_s': storage.stats['write_time_s'],
+        'read_latencies_ms': list(storage.stats['read_latencies_ms']),
+        'write_latencies_ms': list(storage.stats['write_latencies_ms']),
+        'sync_count': storage.stats['sync_count'],
+        'max_pages': storage.max_pages,
+        'written_pages': len(storage._written_pages),
+        'total_pages': total_pages,
+    }
+
+
+def aggregate_thread_stats(thread_stats: List[Dict[str, Any]]) -> Dict:
+    total_requests = sum(s['total_requests'] for s in thread_stats)
+    total_tokens = sum(s['total_tokens'] for s in thread_stats)
+    read_pages = sum(s['read_pages'] for s in thread_stats)
+    write_pages = sum(s['write_pages'] for s in thread_stats)
+    page_hits = sum(s['page_hits'] for s in thread_stats)
+    total_pages = read_pages + write_pages
+
+    request_io_latencies = []
+    request_wall_latencies = []
+    read_latencies = []
+    write_latencies = []
+    for stats in thread_stats:
+        request_io_latencies.extend(stats['request_io_latencies_ms'])
+        request_wall_latencies.extend(stats['request_wall_latencies_ms'])
+        read_latencies.extend(stats['read_latencies_ms'])
+        write_latencies.extend(stats['write_latencies_ms'])
+
+    read_bytes = sum(s['read_bytes'] for s in thread_stats)
+    write_bytes = sum(s['write_bytes'] for s in thread_stats)
+    read_time = sum(s['read_time_s'] for s in thread_stats)
+    write_time = sum(s['write_time_s'] for s in thread_stats)
+
+    return {
+        'total_requests': total_requests,
+        'total_tokens': total_tokens,
+        'total_pages': total_pages,
+        'read_pages': read_pages,
+        'write_pages': write_pages,
+        'page_hits': page_hits,
+        'page_hit_rate': read_pages / total_pages if total_pages > 0 else 0,
+        'write_ratio': write_pages / total_pages if total_pages > 0 else 0,
+        'request_io_latency': latency_stats(request_io_latencies),
+        'request_wall_latency': latency_stats(request_wall_latencies),
+        'storage': {
+            'read': {
+                'count': read_pages,
+                'mb': read_bytes / 1024 / 1024,
+                'time_s': read_time,
+                **latency_stats(read_latencies),
+            },
+            'write': {
+                'count': write_pages,
+                'mb': write_bytes / 1024 / 1024,
+                'time_s': write_time,
+                **latency_stats(write_latencies),
+            },
+            'sync_count': sum(s['sync_count'] for s in thread_stats),
+            'max_pages': sum(s['max_pages'] for s in thread_stats),
+            'written_pages': sum(s['written_pages'] for s in thread_stats),
+            'page_hits': page_hits,
+            'page_misses': write_pages,
+        },
+    }
+
+
+def print_progress(done: int, total: int, start_time: float,
+                   stats: Dict, req: KVCacheRequest = None,
+                   suffix: str = ""):
+    elapsed = time.perf_counter() - start_time
+    qps = done / elapsed if elapsed > 0 else 0
+    storage = stats.get('storage', {})
+    read_stats = storage.get('read', {})
+    write_stats = storage.get('write', {})
+    read_time = read_stats.get('time_s', 0)
+    write_time = write_stats.get('time_s', 0)
+    read_mbps = read_stats.get('mb', 0) / read_time if read_time > 0 else 0
+    write_mbps = write_stats.get('mb', 0) / write_time if write_time > 0 else 0
+
+    if req is None:
+        req_info = ""
+    else:
+        req_info = (f" ids={len(req.hash_ids):3d} "
+                    f"tokens={req.input_length + req.output_length:6d} |")
+
+    print(f"  [{done:5d}/{total}]{req_info} QPS={qps:7.2f} | "
+          f"R={stats['read_pages']:6d} "
+          f"({read_stats.get('avg_ms', 0):6.2f}ms, {read_mbps:6.1f}MB/s) | "
+          f"W={stats['write_pages']:6d} "
+          f"({write_stats.get('avg_ms', 0):6.2f}ms, {write_mbps:6.1f}MB/s)"
+          f"{suffix}")
+
+
+def should_print_progress(done: int, total: int, progress_interval: int) -> bool:
+    if done >= total:
+        return True
+    return progress_interval > 0 and done % progress_interval == 0
+
+
+def run_single_thread(benchmark: StorageBenchmark,
+                      requests: List[KVCacheRequest],
+                      replay_scale: float,
+                      progress_interval: int) -> Dict[str, Any]:
+    start_time = time.perf_counter()
+    base_timestamp = requests[0].timestamp if requests else 0
+    completed = 0
+
+    for req in requests:
+        wait_for_replay_time(req, base_timestamp, start_time, replay_scale)
+        benchmark.process_request(req)
+        completed += 1
+        if should_print_progress(completed, len(requests), progress_interval):
+            print_progress(completed, len(requests), start_time,
+                           benchmark.get_stats(), req)
+
+    return {
+        'completed': completed,
+        'elapsed': time.perf_counter() - start_time,
+        'stats': benchmark.get_stats(),
+    }
+
+
+def run_multi_thread(benchmarks: List[StorageBenchmark],
+                     requests: List[KVCacheRequest],
+                     replay_scale: float) -> Dict[str, Any]:
+    start_time = time.perf_counter()
+    base_timestamp = requests[0].timestamp if requests else 0
+    total_requests = len(requests) * len(benchmarks)
+    completed = 0
+
+    def run_worker(thread_id: int):
+        benchmark = benchmarks[thread_id]
+        for req in requests:
+            wait_for_replay_time(req, base_timestamp, start_time, replay_scale)
+            benchmark.process_request(req)
+        return snapshot_thread_stats(benchmark)
+
+    thread_stats = []
+    with ThreadPoolExecutor(max_workers=len(benchmarks)) as executor:
+        futures = [
+            executor.submit(run_worker, thread_id)
+            for thread_id in range(len(benchmarks))
+        ]
+        for future in as_completed(futures):
+            worker_stats = future.result()
+            thread_stats.append(worker_stats)
+            completed += worker_stats['total_requests']
+            print_progress(completed, total_requests, start_time,
+                           aggregate_thread_stats(thread_stats),
+                           suffix=" | completed worker")
+
+    return {
+        'completed': completed,
+        'elapsed': time.perf_counter() - start_time,
+        'stats': aggregate_thread_stats(thread_stats),
+    }
+
+
 def run_benchmark(trace_path: str, storage_dir: str, model_config: dict,
                   max_requests: int = None, max_pages: int = None,
                   page_size_tokens: int = 512,
-                  fsync_mode: str = 'none', fsync_batch_size: int = 100) -> Dict:
+                  fsync_mode: str = 'none', fsync_batch_size: int = 100,
+                  threads: int = 1, replay_scale: float = 0.0,
+                  progress_interval: int = 100) -> Dict:
     """Run benchmark
 
     Args:
@@ -220,6 +427,9 @@ def run_benchmark(trace_path: str, storage_dir: str, model_config: dict,
         page_size_tokens: Tokens per page
         fsync_mode: When to fsync
         fsync_batch_size: Number of writes between fsync
+        threads: Benchmark client worker threads
+        replay_scale: Timestamp replay multiplier; 0 runs unpaced
+        progress_interval: Print progress every N requests; 0 disables progress
 
     Returns:
         Benchmark results dictionary
@@ -229,6 +439,8 @@ def run_benchmark(trace_path: str, storage_dir: str, model_config: dict,
     print(f"Model: {model_config['name']}")
     print(f"Layers: {model_config['num_layers']}")
     print(f"Page size: {page_size_tokens} tokens")
+    print(f"Threads: {threads}")
+    print(f"Fast-forward: {replay_scale:g}x" if replay_scale > 0 else "Fast-forward: unpaced")
     print(f"{'='*80}")
 
     # Load trace
@@ -266,7 +478,11 @@ def run_benchmark(trace_path: str, storage_dir: str, model_config: dict,
     print(f"  Pages needed (trace):             {max_pages_needed:,}")
     print(f"  Trace storage size:               {trace_size_gb:.2f} GB")
     print(f"  Max pages configured:             {max_pages:,}")
+    if threads > 1:
+        print(f"  Max pages across threads:         {max_pages * threads:,}")
     print(f"  Max storage available:            {max_size_gb:.2f} GB")
+    if threads > 1:
+        print(f"  Max storage across threads:       {max_size_gb * threads:.2f} GB")
 
     if max_pages_needed > max_pages:
         shortfall = max_pages_needed - max_pages
@@ -279,65 +495,69 @@ def run_benchmark(trace_path: str, storage_dir: str, model_config: dict,
         surplus_pct = (surplus / max_pages) * 100 if max_pages > 0 else 0
         print(f"  ✓ Direct mapping: all {max_pages_needed:,} logical pages uniquely mapped")
 
-    # Run benchmark
-    with StorageBenchmark(
-        storage_dir=storage_dir,
-        model_config=model_config,
-        page_size_tokens=page_size_tokens,
-        max_pages=max_pages,
-        fsync_mode=fsync_mode,
-        fsync_batch_size=fsync_batch_size
-    ) as benchmark:
-        start_time = time.perf_counter()
-        try:
-            for i, req in enumerate(requests):
-                benchmark.process_request(req)
-                # Print progress for each request
-                elapsed = time.perf_counter() - start_time
-                qps = (i + 1) / elapsed if elapsed > 0 else 0
-                stats = benchmark.get_stats()
-                storage = stats.get('storage', {})
-                read_latency = storage.get('read', {}).get('avg_ms', 0)
-                write_latency = storage.get('write', {}).get('avg_ms', 0)
-                read_mb = storage.get('read', {}).get('mb', 0)
-                write_mb = storage.get('write', {}).get('mb', 0)
-                read_time = storage.get('read', {}).get('time_s', 0)
-                write_time = storage.get('write', {}).get('time_s', 0)
-                read_mbps = read_mb / read_time if read_time > 0 else 0
-                write_mbps = write_mb / write_time if write_time > 0 else 0
-                print(f"  [{i+1:5d}/{len(requests)}] ids={len(req.hash_ids):3d} "
-                      f"tokens={req.input_length+req.output_length:6d} | "
-                      f"QPS={qps:7.2f} | "
-                      f"R={stats['read_pages']:6d} ({read_latency:6.2f}ms, {read_mbps:6.1f}MB/s) | "
-                      f"W={stats['write_pages']:6d} ({write_latency:6.2f}ms, {write_mbps:6.1f}MB/s)")
-        except KeyboardInterrupt:
-            print(f"\n\n{'='*80}")
-            print(f"Interrupted! Showing partial results:")
-            print(f"{'='*80}")
-            elapsed = time.perf_counter() - start_time
-            stats = benchmark.get_stats()
-            print_results([{
-                'trace_file': Path(trace_path).name,
-                'total_requests': i + 1,
-                'io_time_s': elapsed,
-                'requests_per_second': (i + 1) / elapsed if elapsed > 0 else 0,
-                'model': model_config['name'],
-                'fsync_mode': fsync_mode,
-                **stats,
-            }])
-            sys.exit(0)
-
-        elapsed = time.perf_counter() - start_time
-        stats = benchmark.get_stats()
+    try:
+        if threads <= 1:
+            with StorageBenchmark(
+                storage_dir=storage_dir,
+                model_config=model_config,
+                page_size_tokens=page_size_tokens,
+                max_pages=max_pages,
+                fsync_mode=fsync_mode,
+                fsync_batch_size=fsync_batch_size
+            ) as benchmark:
+                result = run_single_thread(benchmark, requests, replay_scale,
+                                           progress_interval)
+        else:
+            with ExitStack() as stack:
+                benchmarks = [
+                    stack.enter_context(StorageBenchmark(
+                        storage_dir=str(Path(storage_dir) / f"thread_{thread_id}"),
+                        model_config=model_config,
+                        page_size_tokens=page_size_tokens,
+                        max_pages=max_pages,
+                        fsync_mode=fsync_mode,
+                        fsync_batch_size=fsync_batch_size
+                    ))
+                    for thread_id in range(threads)
+                ]
+                result = run_multi_thread(benchmarks, requests, replay_scale)
+    except KeyboardInterrupt:
+        print(f"\n\n{'='*80}")
+        print(f"Interrupted! Showing partial results:")
+        print(f"{'='*80}")
+        result = result if 'result' in locals() else {
+            'completed': 0,
+            'elapsed': 0,
+            'stats': {},
+        }
+        print_results([{
+            'trace_file': Path(trace_path).name,
+            'total_requests': result['completed'],
+            'io_time_s': result['elapsed'],
+            'requests_per_second': (
+                result['completed'] / result['elapsed']
+                if result['elapsed'] > 0 else 0
+            ),
+            'model': model_config['name'],
+            'fsync_mode': fsync_mode,
+            'threads': threads,
+            'replay_scale': replay_scale,
+            **result['stats'],
+        }])
+        sys.exit(0)
 
     return {
         'trace_file': Path(trace_path).name,
-        'total_requests': len(requests),
-        'io_time_s': elapsed,
-        'requests_per_second': len(requests) / elapsed if elapsed > 0 else 0,
+        'total_requests': result['completed'],
+        'io_time_s': result['elapsed'],
+        'requests_per_second': (
+            result['completed'] / result['elapsed'] if result['elapsed'] > 0 else 0
+        ),
         'model': model_config['name'],
         'fsync_mode': fsync_mode,
-        **stats,
+        'threads': threads,
+        'replay_scale': replay_scale,
+        **result['stats'],
     }
 
 
@@ -350,6 +570,8 @@ def format_storage_stats(stats: Dict, title: str = "Storage"):
     storage = stats.get('storage', {})
     read_stats = storage.get('read', {})
     write_stats = storage.get('write', {})
+    request_wall = stats.get('request_wall_latency', {})
+    request_io = stats.get('request_io_latency', {})
 
     output = []
     output.append(f"\n[{title}]")
@@ -357,11 +579,27 @@ def format_storage_stats(stats: Dict, title: str = "Storage"):
     # General info
     output.append(f"\n[General]")
     output.append(f"  Model:            {stats.get('model', 'N/A')}")
+    output.append(f"  Threads:          {stats.get('threads', 1)}")
+    replay_scale = stats.get('replay_scale', 0)
+    output.append(f"  Fast-forward:     {f'{replay_scale:g}x' if replay_scale else 'unpaced'}")
     output.append(f"  Requests:         {stats.get('total_requests', 0):,}")
     output.append(f"  Tokens:           {stats.get('total_tokens', 0):,}")
     output.append(f"  Total I/O Time:    {stats.get('io_time_s', 0):.3f} s")
     output.append(f"  QPS:              {stats.get('requests_per_second', 0):.2f}")
     output.append(f"  Hit Rate:         {stats.get('page_hit_rate', 0):.2%}")
+
+    # Request Stats
+    output.append(f"\n[Request Wall Latency]")
+    output.append(f"  Avg:              {request_wall.get('avg_ms', 0):.3f} ms")
+    output.append(f"  P50:              {request_wall.get('p50_ms', 0):.3f} ms")
+    output.append(f"  P95:              {request_wall.get('p95_ms', 0):.3f} ms")
+    output.append(f"  P99:              {request_wall.get('p99_ms', 0):.3f} ms")
+
+    output.append(f"\n[Request Storage I/O Latency]")
+    output.append(f"  Avg:              {request_io.get('avg_ms', 0):.3f} ms")
+    output.append(f"  P50:              {request_io.get('p50_ms', 0):.3f} ms")
+    output.append(f"  P95:              {request_io.get('p95_ms', 0):.3f} ms")
+    output.append(f"  P99:              {request_io.get('p99_ms', 0):.3f} ms")
 
     # Read Stats
     output.append(f"\n[Read Operations]")
@@ -438,8 +676,18 @@ def main():
                        default='none', help='When to fsync')
     parser.add_argument('--fsync-batch-size', type=int, default=100,
                        help='Number of writes between fsync')
+    parser.add_argument('--threads', type=int, default=1,
+                       help='Number of benchmark client worker threads')
+    parser.add_argument('--replay-scales', type=str, default='0',
+                       help='Comma-separated trace fast-forward speeds; 0 means unpaced')
+    parser.add_argument('--progress-interval', type=int, default=100,
+                       help='Print progress every N requests; 0 disables per-request progress')
 
     args = parser.parse_args()
+    if args.threads < 1:
+        parser.error('--threads must be at least 1')
+    if args.progress_interval < 0:
+        parser.error('--progress-interval must be non-negative')
 
     print(f"\n{'='*80}")
     print(f"{'Mooncake KVCache Storage Benchmark':^80}")
@@ -447,6 +695,11 @@ def main():
 
     model_config = get_model_config(args.model)
     print(f"Model: {args.model} ({model_config['num_layers']} layers)")
+    replay_scales = parse_csv_floats(args.replay_scales)
+    if not replay_scales:
+        parser.error('--replay-scales must include at least one value')
+    if any(scale < 0 for scale in replay_scales):
+        parser.error('--replay-scales values must be non-negative')
 
     # Determine scenarios
     scenarios = ['conversation', 'synthetic', 'toolagent'] if args.scenario == 'all' else [args.scenario]
@@ -458,20 +711,28 @@ def main():
 
     # Run benchmarks
     results = []
+    use_scale_subdirs = len(replay_scales) > 1 or replay_scales[0] != 0
     for scenario in scenarios:
         trace_path = Path(args.trace_dir) / trace_files[scenario]
         if trace_path.exists():
-            result = run_benchmark(
-                str(trace_path),
-                str(Path(args.storage_dir) / scenario),
-                model_config,
-                args.max_requests,
-                args.max_pages,
-                args.page_size_tokens,
-                args.fsync_mode,
-                args.fsync_batch_size
-            )
-            results.append(result)
+            for replay_scale in replay_scales:
+                run_dir = Path(args.storage_dir) / scenario
+                if use_scale_subdirs:
+                    run_dir = run_dir / f"replay_{replay_scale:g}x"
+                result = run_benchmark(
+                    str(trace_path),
+                    str(run_dir),
+                    model_config,
+                    args.max_requests,
+                    args.max_pages,
+                    args.page_size_tokens,
+                    args.fsync_mode,
+                    args.fsync_batch_size,
+                    args.threads,
+                    replay_scale,
+                    args.progress_interval
+                )
+                results.append(result)
         else:
             print(f"Warning: Trace file not found: {trace_path}")
 

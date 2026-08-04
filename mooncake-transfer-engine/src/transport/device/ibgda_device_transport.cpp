@@ -25,11 +25,13 @@
 #include <infiniband/mlx5dv.h>
 #include <infiniband/verbs.h>
 
+#include <cstdlib>
 #include <cstring>
 #include <stdexcept>
 
 #include "cuda_alike.h"
 #include "transport/device/ibgda/memheap.h"
+#include "transport/device/ibgda/mlx5_ifc.h"
 #include "transport/device/ibgda/mlx5gda.h"
 #include "topology.h"
 
@@ -199,28 +201,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     }
 
     int allocateControlBuffer() override {
-        cudaError_t err = cudaMalloc(&ctrl_buf_, kCtrlBufSize);
-        if (err != cudaSuccess) {
-            LOG(ERROR) << "[EP IBGDA] cudaMalloc ctrl_buf failed: "
-                       << cudaGetErrorString(err);
-            return -1;
-        }
-
-        ctrl_buf_umem_ = mlx5dv_devx_umem_reg(ctx_, ctrl_buf_, kCtrlBufSize,
-                                              IBV_ACCESS_LOCAL_WRITE);
-        if (!ctrl_buf_umem_) {
-            LOG(ERROR) << "[EP IBGDA] mlx5dv_devx_umem_reg failed (errno="
-                       << errno << ")";
-            return -1;
-        }
-        LOG(INFO) << "[EP IBGDA] ctrl_buf UMEM registered via VA path";
-
-        ctrl_buf_heap_ = memheap_create(kCtrlBufSize);
-        if (!ctrl_buf_heap_) {
-            LOG(ERROR) << "[EP IBGDA] memheap_create failed";
-            return -1;
-        }
-        return 0;
+        return allocateControlBuffer(false);
     }
 
     int createQueuePairs(void* stream_ptr) override {
@@ -231,6 +212,8 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
                                      ctrl_buf_heap_, pd_, 16384, 1, stream);
             if (!qp) {
                 LOG(ERROR) << "[EP IBGDA] mlx5gda_create_rc_qp failed at " << i;
+                if (retryWithHostControlBuffer())
+                    return createQueuePairs(stream_ptr);
                 return -1;
             }
             if (mlx5gda_modify_rc_qp_rst2init(qp, 0)) {
@@ -243,11 +226,11 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
                 .qpn = qp->qpn,
                 .wqeid_mask = qp->num_wqebb - 1,
                 .wq = reinterpret_cast<mlx5gda_wqebb*>(
-                    static_cast<char*>(ctrl_buf_) + qp->wq_offset),
+                    static_cast<char*>(ctrl_buf_dev_) + qp->wq_offset),
                 .cq = reinterpret_cast<mlx5_cqe64*>(
-                    static_cast<char*>(ctrl_buf_) + qp->send_cq->cq_offset),
+                    static_cast<char*>(ctrl_buf_dev_) + qp->send_cq->cq_offset),
                 .dbr = reinterpret_cast<mlx5gda_wq_dbr*>(
-                    static_cast<char*>(ctrl_buf_) + qp->dbr_offset),
+                    static_cast<char*>(ctrl_buf_dev_) + qp->dbr_offset),
                 .bf = static_cast<char*>(qp->uar->reg_addr),
             };
             cudaMemcpy(
@@ -259,11 +242,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     }
 
     int recreateQueuePairs(void* stream_ptr) override {
-        auto stream = static_cast<cudaStream_t>(stream_ptr);
-        for (auto* qp : qps_) {
-            if (qp) mlx5gda_destroy_qp(ctrl_buf_heap_, qp);
-        }
-        qps_.clear();
+        destroyQueuePairs();
         return createQueuePairs(stream_ptr);
     }
 
@@ -349,11 +328,98 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     int gidIndex() const override { return gid_index_; }
 
    private:
-    void teardown() {
+    static bool isCreateQpBadParam(const mlx5gda_create_qp_failure& failure) {
+        return failure.valid && failure.status == MLX5_CMD_STAT_BAD_PARAM_ERR;
+    }
+
+    int allocateControlBuffer(bool host_backed) {
+        ctrl_buf_host_ = host_backed;
+        if (ctrl_buf_host_) {
+            void* ptr = nullptr;
+            int ret = posix_memalign(&ptr, 4096, kCtrlBufSize);
+            if (ret != 0) {
+                LOG(ERROR) << "[EP IBGDA] posix_memalign ctrl_buf failed: "
+                           << ret;
+                return -1;
+            }
+            ctrl_buf_ = ptr;
+            std::memset(ctrl_buf_, 0, kCtrlBufSize);
+
+            cudaError_t err = cudaHostRegister(
+                ctrl_buf_, kCtrlBufSize,
+                cudaHostRegisterPortable | cudaHostRegisterMapped);
+            if (err != cudaSuccess) {
+                LOG(ERROR) << "[EP IBGDA] cudaHostRegister ctrl_buf failed: "
+                           << cudaGetErrorString(err);
+                free(ctrl_buf_);
+                ctrl_buf_ = nullptr;
+                return -1;
+            }
+
+            err = cudaHostGetDevicePointer(&ctrl_buf_dev_, ctrl_buf_, 0);
+            if (err != cudaSuccess) {
+                LOG(ERROR)
+                    << "[EP IBGDA] cudaHostGetDevicePointer ctrl_buf failed: "
+                    << cudaGetErrorString(err);
+                cudaHostUnregister(ctrl_buf_);
+                free(ctrl_buf_);
+                ctrl_buf_ = nullptr;
+                ctrl_buf_host_ = false;
+                return -1;
+            }
+            LOG(INFO) << "[EP IBGDA] Using host-backed mapped control buffer";
+        } else {
+            cudaError_t err = cudaMalloc(&ctrl_buf_, kCtrlBufSize);
+            if (err != cudaSuccess) {
+                LOG(ERROR) << "[EP IBGDA] cudaMalloc ctrl_buf failed: "
+                           << cudaGetErrorString(err);
+                return -1;
+            }
+            ctrl_buf_dev_ = ctrl_buf_;
+        }
+
+        ctrl_buf_umem_ = mlx5dv_devx_umem_reg(ctx_, ctrl_buf_, kCtrlBufSize,
+                                              IBV_ACCESS_LOCAL_WRITE);
+        if (!ctrl_buf_umem_) {
+            LOG(ERROR) << "[EP IBGDA] mlx5dv_devx_umem_reg failed (errno="
+                       << errno << ")";
+            freeControlBuffer();
+            return -1;
+        }
+        LOG(INFO) << "[EP IBGDA] ctrl_buf UMEM registered via VA path";
+
+        ctrl_buf_heap_ = memheap_create(kCtrlBufSize);
+        if (!ctrl_buf_heap_) {
+            LOG(ERROR) << "[EP IBGDA] memheap_create failed";
+            freeControlBuffer();
+            return -1;
+        }
+        return 0;
+    }
+
+    bool retryWithHostControlBuffer() {
+        auto failure = mlx5gda_last_create_qp_failure();
+        if (ctrl_buf_host_ || !isCreateQpBadParam(failure)) return false;
+
+        LOG(WARNING) << "[EP IBGDA] GPU-backed control buffer was rejected by "
+                        "DevX CREATE_QP"
+                     << " (status=0x" << std::hex << failure.status
+                     << " syndrome=0x" << failure.syndrome << std::dec
+                     << "); retrying with host-backed mapped control buffer";
+
+        destroyQueuePairs();
+        freeControlBuffer();
+        return allocateControlBuffer(true) == 0;
+    }
+
+    void destroyQueuePairs() {
         for (auto* qp : qps_) {
             if (qp) mlx5gda_destroy_qp(ctrl_buf_heap_, qp);
         }
         qps_.clear();
+    }
+
+    void freeControlBuffer() {
         if (ctrl_buf_heap_) {
             memheap_destroy(ctrl_buf_heap_);
             ctrl_buf_heap_ = nullptr;
@@ -363,9 +429,21 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
             ctrl_buf_umem_ = nullptr;
         }
         if (ctrl_buf_) {
-            cudaFree(ctrl_buf_);
+            if (ctrl_buf_host_) {
+                cudaHostUnregister(ctrl_buf_);
+                free(ctrl_buf_);
+            } else {
+                cudaFree(ctrl_buf_);
+            }
             ctrl_buf_ = nullptr;
+            ctrl_buf_dev_ = nullptr;
+            ctrl_buf_host_ = false;
         }
+    }
+
+    void teardown() {
+        destroyQueuePairs();
+        freeControlBuffer();
         if (mr_) {
             ibv_dereg_mr(mr_);
             mr_ = nullptr;
@@ -407,6 +485,8 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
 
     // Control buffer
     void* ctrl_buf_ = nullptr;  // GPU VA
+    void* ctrl_buf_dev_ = nullptr;
+    bool ctrl_buf_host_ = false;
     mlx5dv_devx_umem* ctrl_buf_umem_ = nullptr;
     memheap* ctrl_buf_heap_ = nullptr;
 

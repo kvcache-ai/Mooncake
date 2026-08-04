@@ -1,10 +1,16 @@
 #include "file_storage.h"
 
+#include <cmath>
+#include <locale>
 #include <memory>
+#include <optional>
+#include <sstream>
 #include <utility>
 #include <vector>
 
 #include "aligned_client_buffer.h"
+#include "bool_parser.h"
+#include "environ.h"
 #include "storage_backend.h"
 #include "client_metric.h"
 #include "utils.h"
@@ -17,16 +23,57 @@ namespace mooncake {
 
 namespace {
 
+double ParseEnvRatioOr(const std::string& raw_value, double default_value) {
+    if (raw_value.empty()) {
+        return default_value;
+    }
+
+    std::istringstream stream(raw_value);
+    stream.imbue(std::locale::classic());
+
+    double value = 0.0;
+    stream >> value;
+    if (stream.fail()) {
+        return default_value;
+    }
+    if (!stream.eof() || !std::isfinite(value) || value <= 0.0 || value > 1.0) {
+        return default_value;
+    }
+    return value;
+}
+
+double GetEnvRatioOr(const char* name, double default_value) {
+    const auto raw_value = Environ::GetString(name, "");
+    return ParseEnvRatioOr(raw_value, default_value);
+}
+
+double GetEnvRatioOr(const char* preferred_name, const char* fallback_name,
+                     double default_value) {
+    const auto preferred_value = Environ::GetString(preferred_name, "");
+    if (!preferred_value.empty()) {
+        return ParseEnvRatioOr(preferred_value, default_value);
+    }
+    return GetEnvRatioOr(fallback_name, default_value);
+}
+
+bool GetEnvBoolStringOr(const char* name, bool default_value) {
+    const auto raw_value =
+        Environ::GetString(name, default_value ? "true" : "false");
+    return TryParseBool(raw_value, {.token_set = BoolTokenSet::kTrueFalse,
+                                    .trim_ascii_whitespace = false})
+        .value_or(default_value);
+}
+
 std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
     const std::vector<std::string>& storage_keys,
     const std::vector<StorageObjectMetadata>& metadatas) {
     std::vector<OffloadTaskItem> tasks;
     tasks.reserve(storage_keys.size());
     for (size_t i = 0; i < storage_keys.size(); ++i) {
-        auto [tenant_id, key] = ParseTenantScopedStorageKey(storage_keys[i]);
+        auto [tenant_id, key] = TenantId::ParseScopedKey(storage_keys[i]);
         const int64_t size =
             i < metadatas.size() ? metadatas[i].data_size : int64_t{0};
-        tasks.push_back(OffloadTaskItem{.tenant_id = std::move(tenant_id),
+        tasks.push_back(OffloadTaskItem{.tenant_id = tenant_id.value(),
                                         .key = std::move(key),
                                         .size = size});
     }
@@ -39,8 +86,8 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
     FileStorageConfig config;
 
     auto storage_backend_descriptor =
-        GetEnvStringOr("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
-                       "bucket_storage_backend");
+        Environ::GetString("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                           "bucket_storage_backend");
 
     if (storage_backend_descriptor == "bucket_storage_backend") {
         config.storage_backend_type = StorageBackendType::kBucket;
@@ -55,38 +102,53 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
         LOG(ERROR) << "Unknown storage backend.";
     }
 
-    config.storage_filepath = GetEnvStringOr(
+    config.storage_filepath = Environ::GetString(
         "MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", config.storage_filepath);
 
-    config.local_buffer_size = GetEnvOr<int64_t>(
+    config.local_buffer_size = Environ::GetInt64(
         "MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", config.local_buffer_size);
 
-    config.scanmeta_iterator_keys_limit = GetEnvOr<int64_t>(
+    config.scanmeta_iterator_keys_limit = Environ::GetInt64(
         "MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT",
-        GetEnvOr<int64_t>("MOONCAKE_SCANMETA_ITERATOR_KEYS_LIMIT",
+        Environ::GetInt64("MOONCAKE_SCANMETA_ITERATOR_KEYS_LIMIT",
                           config.scanmeta_iterator_keys_limit));
 
-    config.total_keys_limit = GetEnvOr<int64_t>(
+    config.total_keys_limit = Environ::GetInt64(
         "MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT", config.total_keys_limit);
 
-    config.total_size_limit = GetEnvOr<int64_t>(
+    config.total_size_limit = Environ::GetInt64(
         "MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES", config.total_size_limit);
 
     config.heartbeat_interval_seconds =
-        GetEnvOr<uint32_t>("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS",
+        Environ::GetUInt32("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS",
                            config.heartbeat_interval_seconds);
     config.client_buffer_gc_interval_seconds =
-        GetEnvOr<uint32_t>("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS",
+        Environ::GetUInt32("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS",
                            config.client_buffer_gc_interval_seconds);
 
     config.client_buffer_gc_ttl_ms =
-        GetEnvOr<uint64_t>("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS",
+        Environ::GetUInt64("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS",
                            config.client_buffer_gc_ttl_ms);
 
-    auto use_uring_str =
-        GetEnvStringOr("MOONCAKE_OFFLOAD_USE_URING",
-                       GetEnvStringOr("MOONCAKE_USE_URING", "false"));
-    config.use_uring = (use_uring_str == "true" || use_uring_str == "1");
+    config.enable_disk_watermark_eviction =
+        GetEnvBoolStringOr("MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION",
+                           config.enable_disk_watermark_eviction);
+    config.disk_eviction_high_watermark_ratio =
+        GetEnvRatioOr("MOONCAKE_OFFLOAD_DISK_EVICTION_HIGH_WATERMARK_RATIO",
+                      "MOONCAKE_DISK_EVICTION_HIGH_WATERMARK_RATIO",
+                      config.disk_eviction_high_watermark_ratio);
+    config.disk_eviction_low_watermark_ratio =
+        GetEnvRatioOr("MOONCAKE_OFFLOAD_DISK_EVICTION_LOW_WATERMARK_RATIO",
+                      "MOONCAKE_DISK_EVICTION_LOW_WATERMARK_RATIO",
+                      config.disk_eviction_low_watermark_ratio);
+
+    const auto use_uring_str =
+        Environ::GetString("MOONCAKE_OFFLOAD_USE_URING",
+                           Environ::GetString("MOONCAKE_USE_URING", "false"));
+    config.use_uring =
+        TryParseBool(use_uring_str, {.token_set = BoolTokenSet::kTrueFalse,
+                                     .trim_ascii_whitespace = false})
+            .value_or(false);
 
     return config;
 }
@@ -166,6 +228,25 @@ bool FileStorageConfig::Validate() const {
     }
     if (heartbeat_interval_seconds <= 0) {
         LOG(ERROR) << "FileStorageConfig: heartbeat_interval_seconds must > 0";
+        return false;
+    }
+    if (disk_eviction_low_watermark_ratio <= 0.0 ||
+        disk_eviction_low_watermark_ratio > 1.0) {
+        LOG(ERROR) << "FileStorageConfig: "
+                   << "disk_eviction_low_watermark_ratio must be in (0, 1]";
+        return false;
+    }
+    if (disk_eviction_high_watermark_ratio <= 0.0 ||
+        disk_eviction_high_watermark_ratio > 1.0) {
+        LOG(ERROR) << "FileStorageConfig: "
+                   << "disk_eviction_high_watermark_ratio must be in (0, 1]";
+        return false;
+    }
+    if (disk_eviction_low_watermark_ratio >=
+        disk_eviction_high_watermark_ratio) {
+        LOG(ERROR) << "FileStorageConfig: "
+                   << "disk_eviction_low_watermark_ratio must be lower than "
+                   << "disk_eviction_high_watermark_ratio";
         return false;
     }
     return true;
@@ -358,6 +439,11 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
     return batch_result;
 }
 
+bool FileStorage::IsPerBucketSoftOffloadError(ErrorCode error) {
+    return error == ErrorCode::INVALID_READ ||
+           error == ErrorCode::OBJECT_ALREADY_EXISTS;
+}
+
 tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     const std::vector<OffloadTaskItem>& offloading_objects) {
     if (offloading_objects.empty()) {
@@ -369,7 +455,7 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     task_by_storage_key.reserve(offloading_objects.size());
     for (const auto& task : offloading_objects) {
         const auto storage_key =
-            MakeTenantScopedStorageKey(task.tenant_id, task.key);
+            TenantId(task.tenant_id).MakeScopedKey(task.key);
         storage_object_sizes.emplace(storage_key, task.size);
         task_by_storage_key.emplace(storage_key, task);
     }
@@ -425,6 +511,10 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     // orphaned offloading_tasks and release source replica refcounts.
     std::vector<OffloadTaskItem> failed_tasks;
     std::unordered_set<std::string> all_bucket_keys;
+    // Set when a whole-cycle error aborts the bucket loop early. We still fall
+    // through to the NACK flush below before returning it, so no drained key is
+    // left waiting on the TTL reaper.
+    std::optional<ErrorCode> abort_error;
 
     for (const auto& keys : buckets_keys) {
         for (const auto& k : keys) all_bucket_keys.insert(k);
@@ -446,8 +536,8 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             }
             std::unordered_map<std::string, std::vector<Slice>>
                 user_batch_object;
-            auto query_result = BatchQuerySegmentSlices(user_keys, tenant_id,
-                                                        user_batch_object);
+            [[maybe_unused]] auto query_result = BatchQuerySegmentSlices(
+                user_keys, tenant_id, user_batch_object);
             // BatchQuerySegmentSlices is now best-effort: it always returns
             // OK. Keys present in user_batch_object go to batch_object; the
             // rest are reported as failed.
@@ -464,31 +554,6 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         if (batch_object.empty()) {
             continue;
         }
-
-        auto eviction_handler = [this](const std::vector<std::string>&
-                                           evicted_keys) {
-            if (evicted_keys.empty()) return;
-            std::unordered_map<std::string, std::vector<std::string>>
-                keys_by_tenant;
-            for (const auto& storage_key : evicted_keys) {
-                auto [tenant_id, key] =
-                    ParseTenantScopedStorageKey(storage_key);
-                keys_by_tenant[tenant_id].push_back(key);
-            }
-            for (const auto& [tenant_id, keys] : keys_by_tenant) {
-                auto results = client_->BatchEvictDiskReplica(
-                    keys, tenant_id, ReplicaType::LOCAL_DISK);
-                for (size_t i = 0; i < results.size(); ++i) {
-                    if (!results[i]) {
-                        LOG(WARNING)
-                            << "Failed to notify master about evicted local "
-                               "disk key: "
-                            << keys[i] << ", tenant_id=" << tenant_id
-                            << ", error: " << results[i].error();
-                    }
-                }
-            }
-        };
 
         // D2H staging: replace device slices with host memory slices
         // so that storage_backend (ConcatSlicesToString / BuildBucket /
@@ -527,6 +592,21 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             }
         }
 
+        // If every object in this bucket failed D2H staging, host_batch_object
+        // is empty (those keys are already in failed_tasks). Skip BatchOffload,
+        // which rejects an empty map as INVALID_KEY and would otherwise trip
+        // the whole-cycle abort below for a bucket that has nothing left to
+        // persist. staging_bufs can still be non-empty here (an object whose
+        // first slices copied fine but a later one failed), so hand those
+        // buffers back before continuing: the release loop after BatchOffload
+        // is unreachable on this path.
+        if (host_batch_object.empty()) {
+            for (auto& buf : staging_bufs) {
+                pinned_buffer_pool_->Release(std::move(buf));
+            }
+            continue;
+        }
+
         auto offload_start = std::chrono::steady_clock::now();
         auto bucket_complete_handler =
             [this, offload_start, complete_handler](
@@ -554,7 +634,10 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             return res;
         };
         auto offload_res = storage_backend_->BatchOffload(
-            host_batch_object, bucket_complete_handler, eviction_handler);
+            host_batch_object, bucket_complete_handler,
+            [this](const std::vector<std::string>& evicted_keys) {
+                return NotifyEvictedDiskReplicas(evicted_keys);
+            });
 
         // Release staging buffers back to pool.
         for (auto& buf : staging_bufs) {
@@ -563,18 +646,29 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         if (!offload_res) {
             LOG(ERROR) << "Failed to store objects with error: "
                        << offload_res.error();
+            // This bucket did not persist, so report its keys back to the
+            // master as failed regardless of whether we continue or abort.
+            // Doing it here (rather than only on the soft path) keeps their
+            // offloading tasks and source-replica refcounts from leaking until
+            // the put_start_release_timeout_sec_ TTL reaper fires.
+            for (const auto& [key, _] : host_batch_object) {
+                failed_tasks.push_back(task_by_storage_key.at(key));
+            }
             if (offload_res.error() == ErrorCode::KEYS_ULTRA_LIMIT) {
+                // Disk is over the key-count limit: stop offloading entirely.
                 MutexLocker locker(&offloading_mutex_);
                 enable_offloading_ = false;
-                return tl::make_unexpected(offload_res.error());
             }
-            if (offload_res.error() == ErrorCode::INVALID_READ) {
-                for (const auto& [key, _] : host_batch_object) {
-                    failed_tasks.push_back(task_by_storage_key.at(key));
-                }
-            } else {
-                return tl::make_unexpected(offload_res.error());
+            if (!IsPerBucketSoftOffloadError(offload_res.error())) {
+                // Whole-cycle error (KEYS_ULTRA_LIMIT or any hard failure):
+                // stop processing further buckets, but fall through to the NACK
+                // flush below so every drained key is released. Unvisited
+                // buckets are not yet in all_bucket_keys, so the sweep NACKs
+                // them too; this bucket's keys were just pushed above.
+                abort_error = offload_res.error();
+                break;
             }
+            // Soft per-bucket error: keep processing the remaining buckets.
         }
     }
 
@@ -601,6 +695,79 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         }
     }
 
+    if (abort_error) {
+        return tl::make_unexpected(*abort_error);
+    }
+    return {};
+}
+
+tl::expected<void, ErrorCode> FileStorage::NotifyEvictedDiskReplicas(
+    const std::vector<std::string>& evicted_keys) {
+    if (evicted_keys.empty()) return {};
+
+    std::optional<ErrorCode> first_error;
+    std::unordered_map<TenantId, std::vector<std::string>, TenantIdHash>
+        keys_by_tenant;
+    for (const auto& storage_key : evicted_keys) {
+        auto [tenant_id, key] = TenantId::ParseScopedKey(storage_key);
+        keys_by_tenant[tenant_id].push_back(key);
+    }
+
+    for (const auto& [tenant_id, keys] : keys_by_tenant) {
+        auto results = client_->BatchEvictDiskReplica(keys, tenant_id.value(),
+                                                      ReplicaType::LOCAL_DISK);
+        if (results.size() != keys.size()) {
+            LOG(ERROR) << "BatchEvictDiskReplica returned " << results.size()
+                       << " result(s) for " << keys.size()
+                       << " key(s), tenant_id=" << tenant_id;
+            if (!first_error.has_value()) {
+                first_error = ErrorCode::INTERNAL_ERROR;
+            }
+            continue;
+        }
+
+        for (size_t i = 0; i < results.size(); ++i) {
+            if (!results[i]) {
+                if (results[i].error() == ErrorCode::OBJECT_NOT_FOUND) {
+                    VLOG(1)
+                        << "Master no longer tracks evicted local disk key: "
+                        << keys[i] << ", tenant_id=" << tenant_id;
+                    continue;
+                }
+                if (!first_error.has_value()) {
+                    first_error = results[i].error();
+                }
+                LOG(WARNING)
+                    << "Failed to notify master about evicted local disk key: "
+                    << keys[i] << ", tenant_id=" << tenant_id
+                    << ", error: " << results[i].error();
+            }
+        }
+    }
+    if (first_error.has_value()) {
+        return tl::make_unexpected(first_error.value());
+    }
+    return {};
+}
+
+tl::expected<void, ErrorCode> FileStorage::RunDiskWatermarkEviction() {
+    if (!config_.enable_disk_watermark_eviction) {
+        return {};
+    }
+
+    auto eviction_result = storage_backend_->EvictAboveDiskWatermark(
+        config_.disk_eviction_high_watermark_ratio,
+        config_.disk_eviction_low_watermark_ratio,
+        [this](const std::vector<std::string>& evicted_keys) {
+            return NotifyEvictedDiskReplicas(evicted_keys);
+        });
+    if (!eviction_result) {
+        return tl::make_unexpected(eviction_result.error());
+    }
+    if (!eviction_result.value().empty()) {
+        LOG(INFO) << "Disk watermark eviction removed "
+                  << eviction_result.value().size() << " LOCAL_DISK key(s)";
+    }
     return {};
 }
 
@@ -664,6 +831,19 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                 auto remount_result =
                     client_->MountLocalDiskSegment(enable_offloading_);
                 if (remount_result) {
+                    // Report configured SSD capacity so the Master can
+                    // restore file_total_capacity_ (the denominator in
+                    // "SSD Storage: X / Y").  This was lost on restart;
+                    // re-reporting it here avoids the 0 B display.
+                    if (config_.total_size_limit > 0) {
+                        auto cap_result = client_->ReportSsdCapacity(
+                            config_.total_size_limit);
+                        if (!cap_result) {
+                            LOG(WARNING)
+                                << "ReportSsdCapacity failed during "
+                                << "heartbeat recovery: " << cap_result.error();
+                        }
+                    }
                     heartbeat_result = client_->OffloadObjectHeartbeat(
                         enable_offloading_, offloading_objects);
                     if (!heartbeat_result) {
@@ -701,15 +881,20 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         }
     }
 
-    if (offloading_objects.empty()) {
-        return {};
+    // === STEP 2: Poll whether master requested a full SSD clear ===
+    auto remove_all_result = client_->PollRemoveAll();
+    if (remove_all_result && remove_all_result.value()) {
+        RemoveAll();
     }
-    // === STEP 2: Persist offloaded objects (trigger actual data migration) ===
-    auto offload_result = OffloadObjects(offloading_objects);
-    if (!offload_result) {
-        LOG(ERROR) << "Failed to persist objects with error: "
-                   << offload_result.error();
-        return offload_result;
+
+    // === STEP 3: Persist offloaded objects (trigger actual data migration) ===
+    if (!offloading_objects.empty()) {
+        auto offload_result = OffloadObjects(offloading_objects);
+        if (!offload_result) {
+            LOG(ERROR) << "Failed to persist objects with error: "
+                       << offload_result.error();
+            return offload_result;
+        }
     }
 
     VLOG(1) << "Completed heartbeat with offloaded objects count: "
@@ -720,9 +905,30 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
     // promotion is best-effort and must never break offload.
     (void)ProcessPromotionTasks();
 
-    // TODO(eviction): Implement an LRU eviction mechanism to manage local
-    // storage capacity.
+    // Proactive disk watermarks keep LOCAL_DISK usage below the configured
+    // low watermark even when no new write arrives to trigger reactive
+    // eviction.
+    auto disk_eviction_result = RunDiskWatermarkEviction();
+    if (!disk_eviction_result) {
+        LOG(WARNING) << "Disk watermark eviction failed: "
+                     << disk_eviction_result.error();
+    }
     return {};
+}
+
+void FileStorage::RemoveAll() {
+    // TODO(tenant-isolation): This performs a tenant-UNAWARE global wipe of the
+    // storage directory. Storage backends store physical files without a
+    // tenant dimension, so a tenant-scoped master RemoveAll("tenant_A") that
+    // signals this client will also delete tenant_B's SSD files here, while
+    // master still holds valid metadata for tenant_B (subsequent reads get
+    // OBJECT_NOT_FOUND on this node). Safe for the global RemoveAll(force) and
+    // for single-tenant / shared-nothing deployments. Proper per-tenant
+    // physical isolation needs backend-level tenant-scoped layout (follow-up).
+    if (storage_backend_) {
+        storage_backend_->RemoveAll();
+    }
+    LOG(INFO) << "FileStorage::RemoveAll: cleared storage backend";
 }
 
 tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
@@ -765,7 +971,7 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
         const auto& key = task.key;
         const auto& tenant_id = task.tenant_id;
         const int64_t size = task.size;
-        const auto storage_key = MakeTenantScopedStorageKey(tenant_id, key);
+        const auto storage_key = TenantId(tenant_id).MakeScopedKey(key);
         if (size <= 0) {
             LOG(WARNING) << "Skipping promotion for key=" << key
                          << " with non-positive size=" << size;
@@ -932,9 +1138,15 @@ tl::expected<void, ErrorCode> FileStorage::BatchQuerySegmentSlices(
 }
 
 tl::expected<void, ErrorCode> FileStorage::RegisterLocalMemory() {
+    // The buffer pool backs SSD-offload read results that are fetched by
+    // remote peers via RDMA READ.  It must therefore be registered with
+    // remote_accessible=true so its BufferDesc publishes an rkey; otherwise
+    // every remote read of an offloaded object fails with "No rkey for MR
+    // access" (the pool is only reachable through the address-range lookup,
+    // and with remote_accessible=false the rkey array is left empty).
     auto error_code = client_->RegisterLocalMemory(
         client_buffer_allocator_->getBase(), config_.local_buffer_size,
-        kWildcardLocation, false, true);
+        kWildcardLocation, true, true);
     if (!error_code) {
         LOG(ERROR) << "Failed to register local memory: " << error_code.error();
         return error_code;

@@ -243,5 +243,5 @@ Adapt launch commands to the target environment and number of GPUs.
 ## Related documentation
 
 - [Mooncake Backend (PG) design](mooncake-backend-pg.md)
-- [Python API reference](../python-api-reference/ep-backend.md)
+- [Python API reference](../api-reference/python/ep-backend.md)
 - [PG/EP troubleshooting](../troubleshooting/pg-ep-troubleshooting.md)

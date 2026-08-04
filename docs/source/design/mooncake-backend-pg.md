@@ -220,5 +220,5 @@ subgroups, `extend_group_size_to()`, `get_peer_state()`, `recover_ranks()`, or
 ## Related documentation
 
 - [Mooncake EP design](mooncake-ep.md)
-- [Python API reference](../python-api-reference/ep-backend.md)
+- [Python API reference](../api-reference/python/ep-backend.md)
 - [PG/EP troubleshooting](../troubleshooting/pg-ep-troubleshooting.md)

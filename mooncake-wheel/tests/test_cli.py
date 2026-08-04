@@ -55,9 +55,21 @@ def test_entry_point_installed():
 def test_run_master_and_client():
     """Test running the master service through the entry point."""
     try:
-        # Run mooncake_master with a non-default port to avoid conflicts
+        # Use non-default ports to avoid collisions with processes started
+        # earlier in the CI test-wheel-ubuntu job:
+        #  * --port: gRPC port. The test client connects via
+        #    --master_server_address (direct gRPC), so it does not need the
+        #    embedded HTTP metadata server on the default 8080 — the job runs a
+        #    shared Python mooncake_http_metadata_server on 8080 for the whole
+        #    run_tests.sh suite, so enabling it here would collide and
+        #    LOG(FATAL) (master.cpp:1449).
+        #  * --metrics_port: the master admin server always binds this port
+        #    (master.cpp:1485, created unconditionally and cannot be disabled),
+        #    and the default 9003 is still held by a lingering master from the
+        #    prior CXL test step when this smoke test runs.
         process = subprocess.Popen(
-            ["mooncake_master", "--port=61351", "--max_threads=2", "--enable_http_metadata_server=true"],
+            ["mooncake_master", "--port=61351", "--max_threads=2",
+             "--metrics_port=19003"],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE
         )

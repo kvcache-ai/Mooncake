@@ -1,0 +1,49 @@
+name: _publish-wheel
+
+# Shared publish tail: collect this run's wheels, attach to the GitHub Release,
+# and upload to PyPI. Used by the Release workflows.
+
+on:
+  workflow_call:
+    inputs:
+      artifact-pattern:
+        type: string
+        required: true
+    secrets:
+      pypi-token:
+        required: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: mooncake-wheel/dist-all
+          pattern: ${{ inputs.artifact-pattern }}
+
+      - name: Prepare wheels for release
+        run: |
+          mkdir -p mooncake-wheel/dist-release
+          find mooncake-wheel/dist-all -name "*.whl" -exec cp {} mooncake-wheel/dist-release/ \;
+          echo "Collected wheels for release:"
+          ls -la mooncake-wheel/dist-release/
+
+      - name: Upload wheels to GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: mooncake-wheel/dist-release/*.whl
+
+      - name: Publish package to PyPI
+        if: ${{ github.repository == 'kvcache-ai/Mooncake' }}
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: mooncake-wheel/dist-release/
+          password: ${{ secrets.pypi-token }}

@@ -2,20 +2,20 @@
 
 This page documents the Rust bindings living under `mooncake-transfer-engine/rust`.
 
-At the time of writing, the crate (`transfer_engine_rust`) is primarily used as a **Rust-side binding + example binary**. The public Rust types are implemented in `src/transfer_engine.rs` and wrap the Transfer Engine C API (`transfer_engine_c.h`).
+At the time of writing, the Rust package (`transfer_engine_rust`) is primarily used as a **Rust-side binding + example binary**. The public Rust types are implemented in `src/transfer_engine.rs` and wrap the Transfer Engine C API (`transfer_engine_c.h`).
 
 For Transfer Engine design docs and non-Rust APIs, see:
 
 - Transfer Engine design docs: `design/transfer-engine/index`
-- Transfer Engine C++ API: `design/transfer-engine/cpp-api`
+- Transfer Engine C++ API: `api-reference/cpp/transfer-engine`
 
 ## Build & runtime prerequisites
 
-The Rust crate uses bindgen + CMake to link against the Transfer Engine C/C++ build outputs.
+The Rust package uses bindgen + CMake to link against the Transfer Engine C/C++ build outputs.
 
 - **Build**:
   - Requires Rust toolchain and libclang (bindgen).
-  - The crate has `build.rs` that expects to find / build the native library via CMake.
+  - The package has `build.rs` that expects to find / build the native library via CMake.
 - **Runtime**:
   - Dynamic linker must find Transfer Engine shared libraries.
   - You need a metadata server backend (commonly etcd) and a reachable peer segment registry.
@@ -204,4 +204,3 @@ fn main() -> anyhow::Result<()> {
 - The wrapper marks `TransferEngine` as `Send + Sync`, but it owns an FFI handle (`transfer_engine_t`).
 - All pointer-based arguments must satisfy Rust’s aliasing and lifetime rules.
 - You must ensure registered memory remains valid until it is unregistered.
-

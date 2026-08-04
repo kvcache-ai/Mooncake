@@ -189,7 +189,7 @@ YLT_REFL(HttpTenantQuotaSnapshot, tenant_id, requested_quota_bytes,
 HttpTenantQuotaSnapshot ToHttpTenantQuotaSnapshot(
     const TenantQuotaSnapshot& snapshot) {
     return HttpTenantQuotaSnapshot{
-        .tenant_id = snapshot.tenant_id,
+        .tenant_id = snapshot.tenant_id.value(),
         .requested_quota_bytes = snapshot.requested_quota_bytes,
         .effective_quota_bytes = snapshot.effective_quota_bytes,
         .used_bytes = snapshot.used_bytes,
@@ -230,11 +230,11 @@ tl::expected<std::string, ErrorCode> ParseAdminTenantId(
     if (tenant_id_view.empty()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    std::string tenant_id = NormalizeTenantId(std::string(tenant_id_view));
-    if (!IsValidTenantId(tenant_id)) {
+    TenantId tenant_id{std::string(tenant_id_view)};
+    if (!tenant_id.IsValid()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    return tenant_id;
+    return tenant_id.value();
 }
 
 tl::expected<HttpTenantQuotaPolicyRequest, std::string> ParseQuotaPolicyBody(
@@ -411,7 +411,7 @@ std::string MasterAdminServer::BuildTenantQuotaMetricsText() const {
     for (const auto& snapshot : snapshots) {
         requested_sum += snapshot.requested_quota_bytes;
         effective_sum += snapshot.effective_quota_bytes;
-        const auto tenant = EscapePrometheusLabel(snapshot.tenant_id);
+        const auto tenant = EscapePrometheusLabel(snapshot.tenant_id.value());
         tenant_metrics << "mooncake_tenant_quota_requested_bytes{tenant_id=\""
                        << tenant << "\"} " << snapshot.requested_quota_bytes
                        << "\n";
@@ -560,6 +560,31 @@ void MasterAdminServer::HandleHaStatus(coro_http::coro_http_request&,
     resp.add_header("Content-Type", "text/plain; charset=utf-8");
     resp.set_status_and_content(coro_http::status_type::ok,
                                 ha::MasterRuntimeStateToString(snapshot.state));
+}
+
+struct HttpKvEventsStatusResponse {
+    bool enabled{false};
+    uint64_t published_batches{0};
+    uint64_t published_events{0};
+    uint64_t dropped_events{0};
+    uint64_t skipped_unparsed_keys{0};
+};
+YLT_REFL(HttpKvEventsStatusResponse, enabled, published_batches,
+         published_events, dropped_events, skipped_unparsed_keys);
+
+void MasterAdminServer::HandleKvEventsStatus(
+    coro_http::coro_http_request&, coro_http::coro_http_response& resp) {
+    WithActiveService(
+        resp, [&](const std::shared_ptr<WrappedMasterService>& service) {
+            const auto stats = service->GetKvEventStats();
+            HttpKvEventsStatusResponse payload;
+            payload.enabled = service->KvEventsEnabled();
+            payload.published_batches = stats.published_batches;
+            payload.published_events = stats.published_events;
+            payload.dropped_events = stats.dropped_events;
+            payload.skipped_unparsed_keys = stats.skipped_unparsed_keys;
+            WriteJsonResponse(resp, coro_http::status_type::ok, payload);
+        });
 }
 
 void MasterAdminServer::HandleQueryKey(coro_http::coro_http_request& req,
@@ -1132,6 +1157,33 @@ void MasterAdminServer::HandleDeleteTenantQuota(
     });
 }
 
+struct HttpRemoveAllResponse {
+    bool success{true};
+    long removed_count{0};
+};
+YLT_REFL(HttpRemoveAllResponse, success, removed_count);
+
+void MasterAdminServer::HandleRemoveAll(coro_http::coro_http_request& req,
+                                        coro_http::coro_http_response& resp) {
+    bool force = false;
+    if (auto it = req.get_query_value("force"); !it.empty()) {
+        force = (it == "true" || it == "1");
+    }
+    std::string tenant_id;
+    if (auto it = req.get_query_value("tenant_id"); !it.empty()) {
+        tenant_id = std::string(it);
+    }
+
+    WithActiveService(resp, [&](auto service) {
+        // Empty tenant_id => clear all tenants; pass "" so WrappedMasterService
+        // dispatches to the global (broadcast) RemoveAll, not the "default"
+        // tenant-scoped one.
+        long count = service->RemoveAll(force, tenant_id);
+        WriteJsonResponse(resp, coro_http::status_type::ok,
+                          HttpRemoveAllResponse{.removed_count = count});
+    });
+}
+
 void MasterAdminServer::RegisterHandler() {
     using namespace coro_http;
 
@@ -1155,6 +1207,11 @@ void MasterAdminServer::RegisterHandler() {
     http_server_.set_http_handler<GET>(
         "/ha_status", [this](coro_http_request& req, coro_http_response& resp) {
             HandleHaStatus(req, resp);
+        });
+    http_server_.set_http_handler<GET>(
+        "/kv_events/status",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleKvEventsStatus(req, resp);
         });
     http_server_.set_http_handler<GET>(
         "/leader", [this](coro_http_request& req, coro_http_response& resp) {
@@ -1224,6 +1281,11 @@ void MasterAdminServer::RegisterHandler() {
         "/batch_query_keys",
         [this](coro_http_request& req, coro_http_response& resp) {
             HandleBatchQueryKeys(req, resp);
+        });
+    http_server_.set_http_handler<POST>(
+        "/api/v1/remove_all",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            HandleRemoveAll(req, resp);
         });
 }
 }  // namespace mooncake
