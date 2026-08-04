@@ -345,9 +345,14 @@ OffsetAllocator::OffsetAllocator(T& serializer) {
                 "Deserializing OffsetAllocator failed: corrupt header");
         }
         m_allocator = std::make_unique<__Allocator>(serializer);
-        m_largest_free_region.store(
-            m_allocator->storageReport().largestFreeRegion << m_multiplier_bits,
-            std::memory_order_relaxed);
+        const uint64_t largest_free_region =
+            m_allocator->storageReport().largestFreeRegion << m_multiplier_bits;
+        m_largest_free_region.store(largest_free_region,
+                                    std::memory_order_relaxed);
+        const uint64_t allocator_capacity =
+            static_cast<uint64_t>(m_allocator->m_size) << m_multiplier_bits;
+        m_largest_free_region_tightened =
+            largest_free_region < allocator_capacity;
     } catch (const std::exception& e) {
         LOG(ERROR) << "Deserializing OffsetAllocator failed, error="
                    << e.what();

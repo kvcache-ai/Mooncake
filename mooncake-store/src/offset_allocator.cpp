@@ -569,9 +569,12 @@ OffsetAllocator::OffsetAllocator(uint64_t base, size_t size,
       m_base(base),
       m_multiplier_bits(multiplier_bits),
       m_capacity(size) {
-    m_largest_free_region.store(
-        m_allocator->storageReport().largestFreeRegion << m_multiplier_bits,
-        std::memory_order_relaxed);
+    const uint64_t largest_free_region =
+        m_allocator->storageReport().largestFreeRegion << m_multiplier_bits;
+    m_largest_free_region.store(largest_free_region, std::memory_order_relaxed);
+    const uint64_t allocator_capacity =
+        static_cast<uint64_t>(m_allocator->m_size) << m_multiplier_bits;
+    m_largest_free_region_tightened = largest_free_region < allocator_capacity;
 }
 
 std::optional<OffsetAllocationHandle> OffsetAllocator::allocate(size_t size) {

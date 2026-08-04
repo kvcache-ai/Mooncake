@@ -1653,6 +1653,29 @@ TEST_F(OffsetAllocatorTest, SerializationOneElementAllocator) {
     testSerializeAllocator(alloc_a, handles);
 }
 
+TEST_F(OffsetAllocatorTest, DeserializedHintRaisesWhenAllocationsAreFreed) {
+    constexpr size_t ALLOCATOR_SIZE = 1024;
+    constexpr size_t BLOCK_SIZE = ALLOCATOR_SIZE / 2;
+    constexpr uint32 MAX_ALLOCS = 1000;
+    auto original =
+        OffsetAllocator::create(0, ALLOCATOR_SIZE, MAX_ALLOCS, MAX_ALLOCS);
+
+    auto handle = original->allocate(BLOCK_SIZE);
+    ASSERT_TRUE(handle.has_value());
+
+    std::vector<SerializedByte> buffer;
+    ASSERT_EQ(serialize_to(original, buffer), ErrorCode::OK);
+    auto restored = deserialize_from<OffsetAllocator>(buffer);
+    ASSERT_NE(restored, nullptr);
+
+    std::optional<OffsetAllocationHandle> restored_handle(
+        copyHandleWithNewAllocator(*handle, restored));
+    restored_handle.reset();
+
+    EXPECT_EQ(restored->getLargestFreeRegion(), ALLOCATOR_SIZE);
+    EXPECT_TRUE(restored->allocate(ALLOCATOR_SIZE).has_value());
+}
+
 TEST_F(OffsetAllocatorTest, SerializationRandomAllocatedAllocator) {
     // The size multiplier is larger than 1 when the allocator size is larger
     // than MAX_BIN_SIZE.
