@@ -122,6 +122,8 @@ bool startSignalWatcherLocked(pid_t current_pid) {
     try {
         std::thread(signalWatcher).detach();
         watcher_started = true;
+    } catch (const std::exception& e) {
+        LOG(WARNING) << "action=start_signal_watcher_failed, error=" << e.what();
     } catch (...) {
     }
 
