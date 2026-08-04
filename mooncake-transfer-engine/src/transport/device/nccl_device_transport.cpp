@@ -15,12 +15,14 @@
 #include "transport/device/nccl_device_transport.h"
 
 #include <cuda_runtime.h>
+#include <dlfcn.h>
 #include <glog/logging.h>
 #include <nccl.h>
 #include <nccl_device.h>
 
 #include <cstring>
 #include <limits>
+#include <sstream>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -32,10 +34,117 @@ namespace mooncake {
 namespace device {
 namespace {
 
+class NcclDeviceRuntime {
+   public:
+    struct Symbols {
+        decltype(&ncclGetErrorString) get_error_string = nullptr;
+        decltype(&ncclGetUniqueId) get_unique_id = nullptr;
+        decltype(&ncclGetVersion) get_version = nullptr;
+        decltype(&ncclCommInitRank) comm_init_rank = nullptr;
+        decltype(&ncclCommQueryProperties) comm_query_properties = nullptr;
+        decltype(&ncclGroupStart) group_start = nullptr;
+        decltype(&ncclDevCommCreate) dev_comm_create = nullptr;
+        decltype(&ncclGroupEnd) group_end = nullptr;
+        decltype(&ncclMemAlloc) mem_alloc = nullptr;
+        decltype(&ncclMemFree) mem_free = nullptr;
+        decltype(&ncclCommWindowRegister) comm_window_register = nullptr;
+        decltype(&ncclCommWindowDeregister) comm_window_deregister = nullptr;
+        decltype(&ncclDevCommDestroy) dev_comm_destroy = nullptr;
+        decltype(&ncclCommDestroy) comm_destroy = nullptr;
+        decltype(&ncclAllReduce) all_reduce = nullptr;
+        decltype(&ncclCommAbort) comm_abort = nullptr;
+    };
+
+    static NcclDeviceRuntime& instance() {
+        static NcclDeviceRuntime runtime;
+        return runtime;
+    }
+
+    bool available() const { return available_; }
+    const std::string& error() const { return error_; }
+    const Symbols& symbols() const { return symbols_; }
+
+   private:
+    NcclDeviceRuntime() {
+        handle_ = dlopen("libnccl.so.2", RTLD_NOW | RTLD_LOCAL);
+        if (!handle_) {
+            const char* error = dlerror();
+            error_ = "Unable to load libnccl.so.2: " +
+                     std::string(error ? error : "unknown error");
+            return;
+        }
+
+        bool loaded = true;
+        loaded &= loadSymbol("ncclGetErrorString", &symbols_.get_error_string);
+        loaded &= loadSymbol("ncclGetUniqueId", &symbols_.get_unique_id);
+        loaded &= loadSymbol("ncclGetVersion", &symbols_.get_version);
+        loaded &= loadSymbol("ncclCommInitRank", &symbols_.comm_init_rank);
+        loaded &= loadSymbol("ncclCommQueryProperties",
+                             &symbols_.comm_query_properties);
+        loaded &= loadSymbol("ncclGroupStart", &symbols_.group_start);
+        loaded &= loadSymbol("ncclDevCommCreate", &symbols_.dev_comm_create);
+        loaded &= loadSymbol("ncclGroupEnd", &symbols_.group_end);
+        loaded &= loadSymbol("ncclMemAlloc", &symbols_.mem_alloc);
+        loaded &= loadSymbol("ncclMemFree", &symbols_.mem_free);
+        loaded &= loadSymbol("ncclCommWindowRegister",
+                             &symbols_.comm_window_register);
+        loaded &= loadSymbol("ncclCommWindowDeregister",
+                             &symbols_.comm_window_deregister);
+        loaded &= loadSymbol("ncclDevCommDestroy", &symbols_.dev_comm_destroy);
+        loaded &= loadSymbol("ncclCommDestroy", &symbols_.comm_destroy);
+        loaded &= loadSymbol("ncclAllReduce", &symbols_.all_reduce);
+        loaded &= loadSymbol("ncclCommAbort", &symbols_.comm_abort);
+        if (!loaded) return;
+
+        int version = 0;
+        const ncclResult_t result = symbols_.get_version(&version);
+        if (result != ncclSuccess) {
+            error_ = "ncclGetVersion failed: " +
+                     std::string(symbols_.get_error_string(result));
+            return;
+        }
+        if (version != NCCL_VERSION_CODE) {
+            std::ostringstream out;
+            out << "NCCL Device API requires the exact build-time NCCL "
+                << NCCL_VERSION_CODE << ", but the process loaded " << version
+                << ". Start Python with LD_PRELOAD pointing to the matching "
+                   "libnccl.so.2, then rebuild Mooncake and Device API kernels "
+                   "when changing NCCL versions.";
+            error_ = out.str();
+            return;
+        }
+
+        available_ = true;
+        LOG(INFO) << "[Device NCCL] runtime loaded, version=" << version;
+    }
+
+    template <typename Fn>
+    bool loadSymbol(const char* name, Fn* target) {
+        dlerror();
+        void* symbol = dlsym(handle_, name);
+        const char* error = dlerror();
+        if (error) {
+            error_ = "libnccl.so.2 is missing required symbol '" +
+                     std::string(name) + "': " + error;
+            return false;
+        }
+        *target = reinterpret_cast<Fn>(symbol);
+        return true;
+    }
+
+    // Keep the runtime loaded for the lifetime of every NCCL communicator.
+    void* handle_ = nullptr;
+    Symbols symbols_;
+    bool available_ = false;
+    std::string error_;
+};
+
+NcclDeviceRuntime& ncclRuntime() { return NcclDeviceRuntime::instance(); }
+
 int reportNcclError(ncclResult_t result, const char* operation) {
     if (result == ncclSuccess) return 0;
-    LOG(ERROR) << "[Device NCCL] " << operation
-               << " failed: " << ncclGetErrorString(result);
+    LOG(ERROR) << "[Device NCCL] " << operation << " failed: "
+               << ncclRuntime().symbols().get_error_string(result);
     return -1;
 }
 
@@ -92,7 +201,8 @@ class NcclDeviceTransportImpl final : public NcclTransport {
 
     std::vector<int32_t> createUniqueId() override {
         ncclUniqueId id{};
-        if (reportNcclError(ncclGetUniqueId(&id), "ncclGetUniqueId") != 0) {
+        if (reportNcclError(ncclRuntime().symbols().get_unique_id(&id),
+                            "ncclGetUniqueId") != 0) {
             return {};
         }
 
@@ -125,8 +235,9 @@ class NcclDeviceTransportImpl final : public NcclTransport {
         }
 
         int runtime_version = 0;
-        if (reportNcclError(ncclGetVersion(&runtime_version),
-                            "ncclGetVersion") != 0) {
+        if (reportNcclError(
+                ncclRuntime().symbols().get_version(&runtime_version),
+                "ncclGetVersion") != 0) {
             return -1;
         }
         if (runtime_version != NCCL_VERSION_CODE) {
@@ -146,15 +257,16 @@ class NcclDeviceTransportImpl final : public NcclTransport {
             return -1;
         }
 
-        if (reportNcclError(
-                ncclCommInitRank(&comm_, config.num_ranks, id, config.rank),
-                "ncclCommInitRank") != 0) {
+        if (reportNcclError(ncclRuntime().symbols().comm_init_rank(
+                                &comm_, config.num_ranks, id, config.rank),
+                            "ncclCommInitRank") != 0) {
             comm_ = nullptr;
             return -1;
         }
 
         ncclCommProperties_t comm_properties = NCCL_COMM_PROPERTIES_INITIALIZER;
-        if (reportNcclError(ncclCommQueryProperties(comm_, &comm_properties),
+        if (reportNcclError(ncclRuntime().symbols().comm_query_properties(
+                                comm_, &comm_properties),
                             "ncclCommQueryProperties") != 0) {
             abortPartialInitialization();
             return -1;
@@ -191,12 +303,13 @@ class NcclDeviceTransportImpl final : public NcclTransport {
         requirements.ginExclusiveContexts =
             config.enable_gin && config.gin_exclusive_contexts;
 
-        ncclResult_t start_result = ncclGroupStart();
+        ncclResult_t start_result = ncclRuntime().symbols().group_start();
         ncclResult_t create_result = ncclSuccess;
         ncclResult_t end_result = ncclSuccess;
         if (start_result == ncclSuccess) {
-            create_result = ncclDevCommCreate(comm_, &requirements, &dev_comm_);
-            end_result = ncclGroupEnd();
+            create_result = ncclRuntime().symbols().dev_comm_create(
+                comm_, &requirements, &dev_comm_);
+            end_result = ncclRuntime().symbols().group_end();
         }
         if (reportNcclError(start_result, "ncclGroupStart") != 0 ||
             reportNcclError(create_result, "ncclDevCommCreate") != 0 ||
@@ -267,7 +380,8 @@ class NcclDeviceTransportImpl final : public NcclTransport {
         }
 
         void* ptr = nullptr;
-        if (reportNcclError(ncclMemAlloc(&ptr, bytes), "ncclMemAlloc") != 0) {
+        if (reportNcclError(ncclRuntime().symbols().mem_alloc(&ptr, bytes),
+                            "ncclMemAlloc") != 0) {
             return nullptr;
         }
 
@@ -292,7 +406,8 @@ class NcclDeviceTransportImpl final : public NcclTransport {
                           "transport";
             return -1;
         }
-        if (reportNcclError(ncclMemFree(ptr), "ncclMemFree") != 0) {
+        if (reportNcclError(ncclRuntime().symbols().mem_free(ptr),
+                            "ncclMemFree") != 0) {
             return -1;
         }
         allocations_.erase(it);
@@ -312,15 +427,16 @@ class NcclDeviceTransportImpl final : public NcclTransport {
         }
 
         ncclWindow_t window = nullptr;
-        if (reportNcclError(ncclCommWindowRegister(comm_, ptr, bytes, &window,
-                                                   NCCL_WIN_COLL_SYMMETRIC),
-                            "ncclCommWindowRegister") != 0) {
+        if (reportNcclError(
+                ncclRuntime().symbols().comm_window_register(
+                    comm_, ptr, bytes, &window, NCCL_WIN_COLL_SYMMETRIC),
+                "ncclCommWindowRegister") != 0) {
             return -1;
         }
 
         if (next_registration_id_ == 0) {
             LOG(ERROR) << "[Device NCCL] registration ID space exhausted";
-            ncclCommWindowDeregister(comm_, window);
+            ncclRuntime().symbols().comm_window_deregister(comm_, window);
             return -1;
         }
         const uint64_t id = next_registration_id_++;
@@ -337,7 +453,8 @@ class NcclDeviceTransportImpl final : public NcclTransport {
             LOG(ERROR) << "[Device NCCL] unknown buffer registration";
             return -1;
         }
-        if (reportNcclError(ncclCommWindowDeregister(comm_, it->second.window),
+        if (reportNcclError(ncclRuntime().symbols().comm_window_deregister(
+                                comm_, it->second.window),
                             "ncclCommWindowDeregister") != 0) {
             return -1;
         }
@@ -411,7 +528,8 @@ class NcclDeviceTransportImpl final : public NcclTransport {
         if (comm_) {
             for (const auto& entry : registrations_) {
                 if (reportNcclError(
-                        ncclCommWindowDeregister(comm_, entry.second.window),
+                        ncclRuntime().symbols().comm_window_deregister(
+                            comm_, entry.second.window),
                         "ncclCommWindowDeregister") != 0) {
                     status = -1;
                 }
@@ -420,7 +538,8 @@ class NcclDeviceTransportImpl final : public NcclTransport {
         registrations_.clear();
 
         for (void* ptr : allocations_) {
-            if (reportNcclError(ncclMemFree(ptr), "ncclMemFree") != 0) {
+            if (reportNcclError(ncclRuntime().symbols().mem_free(ptr),
+                                "ncclMemFree") != 0) {
                 status = -1;
             }
         }
@@ -449,16 +568,17 @@ class NcclDeviceTransportImpl final : public NcclTransport {
         }
 
         if (dev_comm_created_) {
-            if (reportNcclError(ncclDevCommDestroy(comm_, &dev_comm_),
-                                "ncclDevCommDestroy") != 0) {
+            if (reportNcclError(
+                    ncclRuntime().symbols().dev_comm_destroy(comm_, &dev_comm_),
+                    "ncclDevCommDestroy") != 0) {
                 status = -1;
             }
             dev_comm_created_ = false;
             dev_comm_ = {};
         }
         if (comm_) {
-            if (reportNcclError(ncclCommDestroy(comm_), "ncclCommDestroy") !=
-                0) {
+            if (reportNcclError(ncclRuntime().symbols().comm_destroy(comm_),
+                                "ncclCommDestroy") != 0) {
                 status = -1;
             }
             comm_ = nullptr;
@@ -483,10 +603,10 @@ class NcclDeviceTransportImpl final : public NcclTransport {
                 cudaMemcpyAsync(collective_status_, &value, sizeof(value),
                                 cudaMemcpyHostToDevice, control_stream_),
                 "cudaMemcpyAsync(collective status H2D)") != 0 ||
-            reportNcclError(
-                ncclAllReduce(collective_status_, collective_status_, 1,
-                              ncclInt, ncclMin, comm_, control_stream_),
-                "ncclAllReduce(collective status)") != 0 ||
+            reportNcclError(ncclRuntime().symbols().all_reduce(
+                                collective_status_, collective_status_, 1,
+                                ncclInt, ncclMin, comm_, control_stream_),
+                            "ncclAllReduce(collective status)") != 0 ||
             reportCudaError(
                 cudaMemcpyAsync(&value, collective_status_, sizeof(value),
                                 cudaMemcpyDeviceToHost, control_stream_),
@@ -512,12 +632,12 @@ class NcclDeviceTransportImpl final : public NcclTransport {
             device_comm_ = nullptr;
         }
         if (dev_comm_created_) {
-            ncclDevCommDestroy(comm_, &dev_comm_);
+            ncclRuntime().symbols().dev_comm_destroy(comm_, &dev_comm_);
             dev_comm_created_ = false;
             dev_comm_ = {};
         }
         if (comm_) {
-            ncclCommAbort(comm_);
+            ncclRuntime().symbols().comm_abort(comm_);
             comm_ = nullptr;
         }
     }
@@ -538,6 +658,11 @@ class NcclDeviceTransportImpl final : public NcclTransport {
 };
 
 std::unique_ptr<NcclTransport> createNcclDeviceTransport() {
+    if (!ncclRuntime().available()) {
+        LOG(ERROR) << "NCCL DeviceTransport is unavailable: "
+                   << ncclRuntime().error();
+        return nullptr;
+    }
     return std::make_unique<NcclDeviceTransportImpl>();
 }
 

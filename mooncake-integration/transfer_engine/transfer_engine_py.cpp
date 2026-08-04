@@ -21,6 +21,10 @@
 #include <pybind11/stl.h>
 #include "transport/rpc_communicator/rpc_interface.h"
 
+#ifdef USE_NCCL_HOST
+#include "transport/nccl_transport/nccl_transport.h"
+#endif
+
 #ifdef USE_TENT
 #include "tent/common/types.h"
 #endif
@@ -192,6 +196,13 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
 
     auto device_name_safe = device_name ? std::string(device_name) : "";
     auto device_filter = buildDeviceFilter(device_name_safe);
+    bool use_nccl = (proto == "nccl");
+#ifndef USE_NCCL_HOST
+    if (use_nccl) {
+        LOG(ERROR) << "Protocol 'nccl' requires -DUSE_NCCL_HOST=ON";
+        return -1;
+    }
+#endif
 
 #ifdef USE_EFA
     // When using EFA protocol, we still need topology discovery but won't
@@ -218,7 +229,9 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
                   << " devices.";
     }
 #else
-    engine_ = std::make_unique<TransferEngine>(true, device_filter);
+    // NCCL host transport must be installed before buffer registration and
+    // cannot coexist with auto-discovered transports.
+    engine_ = std::make_unique<TransferEngine>(!use_nccl, device_filter);
 #endif
 
     if (getenv("MC_LEGACY_RPC_PORT_BINDING")) {
@@ -235,7 +248,15 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
 
 #ifdef USE_EFA
     // Install EFA transport when protocol is "efa"
-    if (use_efa) {
+    if (use_nccl) {
+#ifdef USE_NCCL_HOST
+        auto transport = engine_->installTransport("nccl", nullptr);
+        if (!transport) {
+            LOG(ERROR) << "Failed to install NCCL host transport";
+            return -1;
+        }
+#endif
+    } else if (use_efa) {
         LOG(INFO)
             << "Installing EFA transport as requested by protocol parameter";
         auto transport = engine_->installTransport("efa", nullptr);
@@ -258,7 +279,15 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
         LOG(INFO) << "TCP transport installed successfully";
     }
 #elif defined(USE_CXI)
-    if (use_cxi) {
+    if (use_nccl) {
+#ifdef USE_NCCL_HOST
+        auto transport = engine_->installTransport("nccl", nullptr);
+        if (!transport) {
+            LOG(ERROR) << "Failed to install NCCL host transport";
+            return -1;
+        }
+#endif
+    } else if (use_cxi) {
         LOG(INFO)
             << "Installing CXI transport as requested by protocol parameter";
         auto transport = engine_->installTransport("cxi", nullptr);
@@ -280,6 +309,16 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
         }
         LOG(INFO) << "TCP transport installed successfully";
     }
+#else
+#ifdef USE_NCCL_HOST
+    if (use_nccl) {
+        auto transport = engine_->installTransport("nccl", nullptr);
+        if (!transport) {
+            LOG(ERROR) << "Failed to install NCCL host transport";
+            return -1;
+        }
+    }
+#endif
 #endif
 
     free_list_.resize(kSlabSizeKBTabLen);
@@ -287,6 +326,10 @@ int TransferEnginePy::initializeExt(const char* local_hostname,
 }
 
 int TransferEnginePy::getRpcPort() { return engine_->getRpcPort(); }
+
+std::string TransferEnginePy::getLocalIpAndPort() const {
+    return engine_ ? engine_->getLocalIpAndPort() : "";
+}
 
 char* TransferEnginePy::allocateRawBuffer(size_t capacity) {
     auto buffer = allocateMemory(capacity);
@@ -1146,6 +1189,23 @@ PYBIND11_MODULE(engine, m) {
     m.attr("SUPPORT_CUDA") = false;
 #endif
 
+#ifdef USE_NCCL_HOST
+    m.attr("SUPPORT_NCCL_HOST") = true;
+    m.def("is_nccl_host_runtime_available",
+          []() { return isNcclHostRuntimeAvailable(); });
+    m.def("get_nccl_host_runtime_error", []() {
+        std::string error;
+        isNcclHostRuntimeAvailable(&error);
+        return error;
+    });
+#else
+    m.attr("SUPPORT_NCCL_HOST") = false;
+    m.def("is_nccl_host_runtime_available", []() { return false; });
+    m.def("get_nccl_host_runtime_error", []() {
+        return std::string("Mooncake was built without NCCL host transport");
+    });
+#endif
+
     py::enum_<TransferEnginePy::TransferOpcode> transfer_opcode(
         m, "TransferOpcode", py::arithmetic());
     transfer_opcode.value("Read", TransferEnginePy::TransferOpcode::READ)
@@ -1165,6 +1225,7 @@ PYBIND11_MODULE(engine, m) {
             .def("initialize", &TransferEnginePy::initialize)
             .def("initialize_ext", &TransferEnginePy::initializeExt)
             .def("get_rpc_port", &TransferEnginePy::getRpcPort)
+            .def("get_local_ip_and_port", &TransferEnginePy::getLocalIpAndPort)
             .def("allocate_managed_buffer",
                  &TransferEnginePy::allocateManagedBuffer)
             .def("free_managed_buffer", &TransferEnginePy::freeManagedBuffer)
