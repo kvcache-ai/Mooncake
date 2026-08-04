@@ -32,6 +32,9 @@ cp mooncake-integration/fabric_allocator_utils.py mooncake-wheel/mooncake/fabric
 # Copy engine.so to mooncake directory (will be imported by transfer module)
 cp ${BUILD_DIR}/mooncake-integration/engine.*.so mooncake-wheel/mooncake/engine.so
 
+# Copy the shared segment wrapper, which builds on engine.so
+cp mooncake-integration/shared_segment.py mooncake-wheel/mooncake/shared_segment.py
+
 # Copy libasio.so to mooncake directory (runtime dependency of engine.so)
 cp ${BUILD_DIR}/mooncake-common/libasio.so mooncake-wheel/mooncake/libasio.so
 

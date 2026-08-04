@@ -1,4 +1,4 @@
-file(GLOB ENGINE_SOURCES "*.cpp")
+file(GLOB ENGINE_SOURCES "*.cpp" "shared_segment/*.cpp")
 add_subdirectory(common)
 add_subdirectory(transport)
 
@@ -11,6 +11,9 @@ if(USE_HIP)
 endif()
 
 add_library(transfer_engine ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>)
+# Platform backends under shared_segment/ include their own headers by bare name.
+target_include_directories(transfer_engine
+                           PRIVATE ${CMAKE_CURRENT_LIST_DIR}/shared_segment)
 if(BUILD_SHARED_LIBS)
   install(TARGETS transfer_engine DESTINATION lib)
 endif()
