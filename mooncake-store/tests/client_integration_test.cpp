@@ -2,11 +2,15 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <array>
+#include <cstdlib>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 #include <regex>
 #include <unordered_set>
@@ -20,6 +24,8 @@
 #include "utils.h"
 #include "test_server_helpers.h"
 #include "default_config.h"
+#include "crc_checksum.h"
+#include "environ.h"
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
 DEFINE_string(device_name, "", "Device name to use, valid if protocol=rdma");
@@ -50,6 +56,54 @@ UUID ParseClientId(const std::string& client_id_str) {
         LOG(ERROR) << "Invalid client_id format. Expected format: first-second";
     }
     return client_id;
+}
+
+class ObjectChecksumClient : public Client {
+   public:
+    ObjectChecksumClient() : Client("localhost", "", "tcp") {}
+};
+
+TEST(ObjectChecksumTest, ClientVerifiesOnlyLogicalObjectBytes) {
+    if (!Environ::Get().GetStoreChecksumEnabled()) {
+        GTEST_SKIP() << "MOONCAKE_STORE_CHECKSUM is not enabled";
+    }
+
+    ObjectChecksumClient client;
+    std::array<uint8_t, 20> value = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06,
+                                     0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D,
+                                     0x0E, 0x0F, 0xAA, 0xBB, 0xCC, 0xDD};
+    constexpr size_t object_size = 16;
+    std::vector<Slice> slices{{value.data(), value.size()}};
+    const uint64_t checksum = ComputeCrcChecksum(value.data(), object_size);
+
+    EXPECT_TRUE(
+        client.VerifyObjectChecksum("key", slices, object_size, checksum)
+            .has_value());
+    value[16] ^= 0xFF;
+    EXPECT_TRUE(
+        client.VerifyObjectChecksum("key", slices, object_size, checksum)
+            .has_value());
+    value[0] ^= 0xFF;
+    auto mismatch =
+        client.VerifyObjectChecksum("key", slices, object_size, checksum);
+    ASSERT_FALSE(mismatch.has_value());
+    EXPECT_EQ(mismatch.error(), ErrorCode::CHECKSUM_MISMATCH);
+}
+
+TEST(ObjectChecksumTest, BatchPutStopsAfterChecksumPrecomputeFailure) {
+    if (!Environ::Get().GetStoreChecksumEnabled()) {
+        GTEST_SKIP() << "MOONCAKE_STORE_CHECKSUM is not enabled";
+    }
+
+    ObjectChecksumClient client;
+    const std::vector<ObjectKey> keys{"invalid-slice"};
+    std::vector<std::vector<Slice>> slices{{Slice{nullptr, 1}}};
+
+    auto results = client.BatchPut(keys, slices, ReplicateConfig{});
+
+    ASSERT_EQ(results.size(), 1);
+    ASSERT_FALSE(results[0].has_value());
+    EXPECT_EQ(results[0].error(), ErrorCode::INVALID_PARAMS);
 }
 
 class ClientIdCaptureSink : public google::LogSink {
@@ -340,6 +394,82 @@ TEST_F(ClientIntegrationTest, BasicPutGetOperations) {
     ASSERT_TRUE(remove_result.has_value())
         << "Remove operation failed: " << toString(remove_result.error());
     client_buffer_allocator_->deallocate(buffer, test_data.size());
+}
+
+TEST_F(ClientIntegrationTest, ObjectChecksumRejectsCorruptedObject) {
+    if (!Environ::Get().GetStoreChecksumEnabled()) {
+        GTEST_SKIP() << "MOONCAKE_STORE_CHECKSUM is not enabled";
+    }
+
+    const std::string key = "checksum_corruption_key";
+    const std::string test_data = "0123456789abcdef";
+    void* source = client_buffer_allocator_->allocate(test_data.size());
+    memcpy(source, test_data.data(), test_data.size());
+    std::vector<Slice> slices{{source, test_data.size()}};
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto put_result = test_client_->Put(key, slices, config);
+    ASSERT_TRUE(put_result.has_value()) << toString(put_result.error());
+    client_buffer_allocator_->deallocate(source, test_data.size());
+
+    auto query_result = test_client_->Query(key);
+    ASSERT_TRUE(query_result.has_value()) << toString(query_result.error());
+    ASSERT_TRUE(query_result->object_checksum.has_value());
+    ASSERT_EQ(query_result->replicas.size(), 1);
+    ASSERT_TRUE(query_result->replicas[0].is_memory_replica());
+
+    auto& descriptor =
+        query_result->replicas[0].get_memory_descriptor().buffer_descriptor;
+    auto* stored_data = reinterpret_cast<char*>(descriptor.buffer_address_);
+    stored_data[0] ^= 0x01;
+
+    void* target = client_buffer_allocator_->allocate(test_data.size());
+    slices = {{target, test_data.size()}};
+    auto get_result = test_client_->Get(key, query_result.value(), slices);
+    ASSERT_FALSE(get_result.has_value());
+    EXPECT_EQ(get_result.error(), ErrorCode::CHECKSUM_MISMATCH);
+
+    stored_data[0] ^= 0x01;
+    client_buffer_allocator_->deallocate(target, test_data.size());
+}
+
+TEST_F(ClientIntegrationTest, BatchPutPreservesObjectChecksumPairing) {
+    if (!Environ::Get().GetStoreChecksumEnabled()) {
+        GTEST_SKIP() << "MOONCAKE_STORE_CHECKSUM is not enabled";
+    }
+
+    const std::vector<ObjectKey> keys = {"checksum_batch_a",
+                                         "checksum_batch_b"};
+    const std::vector<std::string> values = {"first-object",
+                                             "different-second-object"};
+    std::vector<std::vector<Slice>> batched_slices;
+    std::vector<void*> buffers;
+    batched_slices.reserve(values.size());
+    buffers.reserve(values.size());
+    for (const auto& value : values) {
+        void* buffer = client_buffer_allocator_->allocate(value.size());
+        memcpy(buffer, value.data(), value.size());
+        buffers.emplace_back(buffer);
+        batched_slices.push_back({Slice{buffer, value.size()}});
+    }
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto results = test_client_->BatchPut(keys, batched_slices, config);
+    ASSERT_EQ(results.size(), keys.size());
+    for (const auto& result : results) {
+        ASSERT_TRUE(result.has_value()) << toString(result.error());
+    }
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto query_result = test_client_->Query(keys[i]);
+        ASSERT_TRUE(query_result.has_value()) << toString(query_result.error());
+        ASSERT_TRUE(query_result->object_checksum.has_value());
+        EXPECT_EQ(*query_result->object_checksum,
+                  ComputeCrcChecksum(values[i].data(), values[i].size()));
+        client_buffer_allocator_->deallocate(buffers[i], values[i].size());
+    }
 }
 
 // Test Remove operation

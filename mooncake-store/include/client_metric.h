@@ -14,8 +14,9 @@
 #include <ylt/metric/counter.hpp>
 #include <ylt/metric/histogram.hpp>
 #include <ylt/metric/summary.hpp>
-#include "utils.h"
+#include "environ.h"
 #include "hybrid_metric.h"
+#include "utils.h"
 
 namespace mooncake {
 
@@ -30,16 +31,10 @@ const std::vector<double> kLatencyBucket = {
     50000, 100000, 200000, 500000, 1000000, 2000000, 5000000, 10000000,
     20000000};
 
-static inline std::string get_env_or_default(
-    const char* env_var, const std::string& default_val = "") {
-    const char* val = getenv(env_var);
-    return val ? val : default_val;
-}
-
 // In production mode, more labels are needed for monitoring and troubleshooting
 // Static labels include but are not limited to machine address, cluster name,
 // etc. These labels remain constant during the lifetime of the application
-const std::string kClusterID = get_env_or_default("MC_STORE_CLUSTER_ID");
+const std::string kClusterID = Environ::GetString("MC_STORE_CLUSTER_ID", "");
 
 // Merge static labels with dynamic labels
 const inline std::map<std::string, std::string> merge_labels(

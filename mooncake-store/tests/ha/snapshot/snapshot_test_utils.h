@@ -53,9 +53,14 @@ struct CatalogBackendParam {
 //   kDataTypeAndHardPinned:
 //                    9 + replica_count, data_type plus trailing hard_pinned
 //   kWithGroupId:    10 + replica_count, data_type + hard_pinned + group_id
-//                    (the writer format before optional agent_hints)
+//                    (the writer format before optional tail fields)
 //   kWithAgentHints: 11 + replica_count, data_type + hard_pinned + group_id +
 //                    agent_hints
+//   kWithObjectChecksum:
+//                    11 + replica_count, data_type + hard_pinned + group_id +
+//                    object_checksum
+//   kWithAgentHintsAndObjectChecksum:
+//                    12 + replica_count, current writer fields + checksum
 enum class SnapshotMetadataFormat {
     kLegacy,
     kDataTypeOnly,
@@ -63,6 +68,8 @@ enum class SnapshotMetadataFormat {
     kDataTypeAndHardPinned,
     kWithGroupId,
     kWithAgentHints,
+    kWithObjectChecksum,
+    kWithAgentHintsAndObjectChecksum,
 };
 
 class ScopedEnvVar {
@@ -235,24 +242,34 @@ inline std::vector<uint8_t> BuildMetadataPayloadWithClientIdString(
         format == SnapshotMetadataFormat::kDataTypeOnly ||
         format == SnapshotMetadataFormat::kDataTypeAndHardPinned ||
         format == SnapshotMetadataFormat::kWithGroupId ||
-        format == SnapshotMetadataFormat::kWithAgentHints;
+        format == SnapshotMetadataFormat::kWithAgentHints ||
+        format == SnapshotMetadataFormat::kWithObjectChecksum ||
+        format == SnapshotMetadataFormat::kWithAgentHintsAndObjectChecksum;
     const bool include_hard_pinned =
         format == SnapshotMetadataFormat::kHardPinnedOnly ||
         format == SnapshotMetadataFormat::kDataTypeAndHardPinned ||
         format == SnapshotMetadataFormat::kWithGroupId ||
-        format == SnapshotMetadataFormat::kWithAgentHints;
+        format == SnapshotMetadataFormat::kWithAgentHints ||
+        format == SnapshotMetadataFormat::kWithObjectChecksum ||
+        format == SnapshotMetadataFormat::kWithAgentHintsAndObjectChecksum;
     const bool include_group_id =
         format == SnapshotMetadataFormat::kWithGroupId ||
-        format == SnapshotMetadataFormat::kWithAgentHints;
+        format == SnapshotMetadataFormat::kWithAgentHints ||
+        format == SnapshotMetadataFormat::kWithObjectChecksum ||
+        format == SnapshotMetadataFormat::kWithAgentHintsAndObjectChecksum;
     const bool include_agent_hints =
-        format == SnapshotMetadataFormat::kWithAgentHints;
+        format == SnapshotMetadataFormat::kWithAgentHints ||
+        format == SnapshotMetadataFormat::kWithAgentHintsAndObjectChecksum;
+    const bool include_object_checksum =
+        format == SnapshotMetadataFormat::kWithObjectChecksum ||
+        format == SnapshotMetadataFormat::kWithAgentHintsAndObjectChecksum;
     constexpr uint32_t kReplicaCount = 1;
     // 7 leading fields + replicas + optional data_type/hard_pinned/group_id/
-    // agent_hints.
-    const size_t array_size = 7 + kReplicaCount + (include_data_type ? 1 : 0) +
-                              (include_hard_pinned ? 1 : 0) +
-                              (include_group_id ? 1 : 0) +
-                              (include_agent_hints ? 1 : 0);
+    // agent_hints/object_checksum.
+    const size_t array_size =
+        7 + kReplicaCount + (include_data_type ? 1 : 0) +
+        (include_hard_pinned ? 1 : 0) + (include_group_id ? 1 : 0) +
+        (include_agent_hints ? 1 : 0) + (include_object_checksum ? 1 : 0);
 
     msgpack::sbuffer shard_buffer;
     MsgpackPacker shard_packer(&shard_buffer);
@@ -282,6 +299,9 @@ inline std::vector<uint8_t> BuildMetadataPayloadWithClientIdString(
     }
     if (include_agent_hints) {
         PackAgentHintsV1(shard_packer);
+    }
+    if (include_object_checksum) {
+        shard_packer.pack(uint64_t{0x123456789ABCDEF0ULL});
     }
 
     return WrapShardIntoMetadataRoot(shard_buffer);

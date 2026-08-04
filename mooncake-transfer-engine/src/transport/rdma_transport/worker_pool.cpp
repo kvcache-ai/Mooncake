@@ -79,6 +79,19 @@ static int selectPeerDevice(RdmaTransport::SegmentDesc *peer_segment_desc,
                    << " addr=" << (void *)offset << " len=" << length;
         return ERR_ADDRESS_NOT_REGISTERED;
     }
+
+    // device_id comes from the peer-supplied topology, whose HCA list is
+    // independent of the peer 'devices' array, so bound it against that array
+    // too before the devices[device_id] accesses below. decodeSegmentDesc()
+    // now rejects a descriptor whose key count and device count disagree, which
+    // makes this check redundant for descriptors that arrived through the
+    // metadata path; it is kept as a local bound on the value actually used.
+    if (static_cast<size_t>(device_id) >= peer_segment_desc->devices.size()) {
+        LOG(ERROR) << "[RDMA] Peer device index out of range: seg="
+                   << peer_segment_desc->name << " device_id=" << device_id
+                   << " devices=" << peer_segment_desc->devices.size();
+        return ERR_ADDRESS_NOT_REGISTERED;
+    }
     return 0;
 }
 
@@ -551,7 +564,26 @@ void WorkerPool::performPollCq(int thread_id) {
         }
     }
 
+    // Slices this loop drove to a terminal state, successes and
+    // retry-exhausted failures alike; folded into processed_slice_count_,
+    // which gates worker parking. Every terminal outcome below goes through
+    // finalize_slice() so it is counted exactly once. Slices handed to
+    // redispatch() are not terminal here and are accounted for there.
     int processed_slice_count = 0;
+    // Successful completions only, kept apart because it clears the context
+    // health counter. A completion error is no evidence that this RNIC can
+    // still move data -- including IBV_WC_WR_FLUSH_ERR, which only reports
+    // WRs the hardware discarded after the QP had already entered ERR.
+    int succeeded_slice_count = 0;
+    auto finalize_slice = [&](Transport::Slice *slice, bool success) {
+        if (success) {
+            slice->markSuccess();
+            succeeded_slice_count++;
+        } else {
+            slice->markFailed();
+        }
+        processed_slice_count++;
+    };
     const static size_t kPollCount = 64;
     std::unordered_map<std::atomic<int> *, int> qp_depth_set;
     std::unordered_set<RdmaEndPoint *> local_failed_endpoints;
@@ -597,10 +629,8 @@ void WorkerPool::performPollCq(int thread_id) {
                                 << "), handing off if retry allows";
                         if (shouldRetrySlice(slice))
                             local_failed_slice_list.push_back(slice);
-                        else {
-                            slice->markFailed();
-                            processed_slice_count++;
-                        }
+                        else
+                            finalize_slice(slice, false);
                     } else {
                         if (globalConfig().trace)
                             LOG(INFO) << "Worker: WR flush error (peer_nic: "
@@ -608,10 +638,8 @@ void WorkerPool::performPollCq(int thread_id) {
                                       << "), redispatching if retry allows";
                         if (shouldRetrySlice(slice))
                             failed_slice_list.push_back(slice);
-                        else {
-                            slice->markFailed();
-                            processed_slice_count++;
-                        }
+                        else
+                            finalize_slice(slice, false);
                     }
                     continue;
                 }
@@ -658,12 +686,10 @@ void WorkerPool::performPollCq(int thread_id) {
                 if (shouldRetrySlice(slice)) {
                     retry_list->push_back(slice);
                 } else {
-                    slice->markFailed();
-                    processed_slice_count_++;
+                    finalize_slice(slice, false);
                 }
             } else {
-                slice->markSuccess();
-                processed_slice_count++;
+                finalize_slice(slice, true);
             }
         }
         if (nr_poll)
@@ -674,10 +700,12 @@ void WorkerPool::performPollCq(int thread_id) {
     for (auto &entry : qp_depth_set)
         entry.first->fetch_sub(entry.second, std::memory_order_acq_rel);
 
-    if (processed_slice_count) {
+    if (processed_slice_count)
         processed_slice_count_.fetch_add(processed_slice_count);
-        markContextSuccess();
-    }
+    // Clear the consecutive-failure counter only on proven data movement, so
+    // that repeated local completion failures can still reach the threshold
+    // and retire this RNIC (see handleLocalFailure()).
+    if (succeeded_slice_count) markContextSuccess();
 
     if (!local_failed_slice_list.empty()) {
         redispatch(local_failed_slice_list, thread_id, true);
@@ -948,47 +976,57 @@ void WorkerPool::transferWorker(int thread_id) {
 }
 
 int WorkerPool::doProcessContextEvents() {
-    ibv_async_event event;
-    bool event_acked = false;
-    if (ibv_get_async_event(context_.context(), &event) < 0) return ERR_CONTEXT;
-    LOG(WARNING) << "Worker: Received context async event "
-                 << ibv_event_type_str(event.event_type) << " for context "
-                 << context_.deviceName();
-    if (event.event_type == IBV_EVENT_QP_FATAL) {
-        auto endpoint_ptr = (RdmaEndPoint *)event.element.qp->qp_context;
+    // The async fd is edge-triggered (joinNonblockingPollList) and
+    // ibv_get_async_event() returns one record per read, so anything left
+    // queued here waits for an unrelated later event to release it. Bursts
+    // are routine -- IBV_EVENT_COMM_EST fires once per connection -- and a
+    // backlog delays every event behind it, port and device errors included.
+    while (true) {
+        ibv_async_event event;
+        bool event_acked = false;
+        errno = 0;
+        if (ibv_get_async_event(context_.context(), &event) < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;  // drained
+            if (errno == EINTR) continue;
+            return ERR_CONTEXT;
+        }
+        LOG(WARNING) << "Worker: Received context async event "
+                     << ibv_event_type_str(event.event_type) << " for context "
+                     << context_.deviceName();
+        if (event.event_type == IBV_EVENT_QP_FATAL) {
+            auto endpoint_ptr = (RdmaEndPoint *)event.element.qp->qp_context;
 
-        /**
-         * There might be a deadlock if we call endpoint->set_active(false)
-         * before ack the event:
-         *
-         * Thread A:
-         *     Holding endpoint->lock_ and calling ibv_destroy_qp (if using
-         * eRDMA), ibv_destroy_qp will block until the event is acked.
-         *
-         * Thread B (this thread):
-         *     Calling endpoint->set_active(false), which blocks as
-         * endpoint->lock_ is held by Thread A.
-         */
-        ibv_ack_async_event(&event);
-        event_acked = true;
+            /**
+             * There might be a deadlock if we call endpoint->set_active(false)
+             * before ack the event:
+             *
+             * Thread A:
+             *     Holding endpoint->lock_ and calling ibv_destroy_qp (if using
+             * eRDMA), ibv_destroy_qp will block until the event is acked.
+             *
+             * Thread B (this thread):
+             *     Calling endpoint->set_active(false), which blocks as
+             * endpoint->lock_ is held by Thread A.
+             */
+            ibv_ack_async_event(&event);
+            event_acked = true;
 
-        /**
-         * After ack the event, the endpoint might be destroyed if it happened
-         * to be destroying event.element.qp. Therefore, we cannot just
-         * dereference endpoint_ptr. Instead, we need to get the shared_ptr of
-         * the endpoint from context_ and use that shared_ptr to access the
-         * endpoint.
-         */
-        context_.deleteEndpointByPtr(endpoint_ptr);
-    } else if (handleContextEvent(event.event_type, false, &event)) {
-        event_acked = true;
+            /**
+             * After ack the event, the endpoint might be destroyed if it
+             * happened to be destroying event.element.qp. Therefore, we cannot
+             * just dereference endpoint_ptr. Instead, we need to get the
+             * shared_ptr of the endpoint from context_ and use that shared_ptr
+             * to access the endpoint.
+             */
+            context_.deleteEndpointByPtr(endpoint_ptr);
+        } else if (handleContextEvent(event.event_type, false, &event)) {
+            event_acked = true;
+        }
+
+        if (!event_acked) {
+            ibv_ack_async_event(&event);
+        }
     }
-
-    if (!event_acked) {
-        ibv_ack_async_event(&event);
-    }
-
-    return 0;
 }
 
 void WorkerPool::processContextEventForTest(ibv_event_type event_type) {

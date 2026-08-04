@@ -43,6 +43,17 @@ class RdmaTransportTestPeer {
                            std::shared_ptr<RdmaContext> context) {
         transport.context_list_.push_back(std::move(context));
     }
+
+    static void bindTopology(RdmaTransport &transport,
+                             std::shared_ptr<Topology> topology) {
+        transport.local_topology_ = std::move(topology);
+    }
+
+    // Drives the device-initialization loop directly so tests can assert on
+    // the resulting context_list_ layout without a full install().
+    static int initializeResources(RdmaTransport &transport) {
+        return transport.initializeRdmaResources();
+    }
 };
 
 class RdmaContextTestPeer {
