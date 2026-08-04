@@ -723,7 +723,7 @@ int RdmaTransport::refreshLocalDeviceDesc(const std::string &device_name,
 int RdmaTransport::registerLocalMemoryBatch(
     const std::vector<RdmaTransport::BufferEntry> &buffer_list,
     const std::string &location) {
-#if defined(USE_CUDA)
+#if defined(USE_CUDA) || defined(USE_SUPA)
     if (!Environ::Get().GetWithNvidiaPeermem()) {
         for (auto &buffer : buffer_list) {
             int ret = registerLocalMemory(buffer.addr, buffer.length, location,
@@ -760,7 +760,7 @@ int RdmaTransport::registerLocalMemoryBatch(
             }
         }
         if (first_error) return first_error;
-#if defined(USE_CUDA)
+#if defined(USE_CUDA) || defined(USE_SUPA)
     }  // Environ::Get().GetWithNvidiaPeermem()
 #endif
 

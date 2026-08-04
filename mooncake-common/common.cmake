@@ -82,6 +82,7 @@ option(USE_MACA "option for enabling gpu features for MUXI GPU with MACA" OFF)
 option(USE_HIP "option for enabling gpu features for AMD GPU" OFF)
 option(USE_HYGON "option for enabling gpu features for Hygon DCU with DTK" OFF)
 option(USE_COREX "option for enabling gpu features for Iluvatar CoreX" OFF)
+option(USE_SUPA "option for enabling gpu features for Biren GPU with SUPA" OFF)
 option(USE_NVMEOF "option for using NVMe over Fabric" OFF)
 option(USE_TCP "option for using TCP transport" ON)
 option(USE_BAREX "option for using accl-barex transport" OFF)
@@ -198,7 +199,8 @@ endif()
 if(USE_MNNVL)
   if(NOT USE_HIP
      AND NOT USE_MUSA
-     AND NOT USE_MACA)
+     AND NOT USE_MACA
+     AND NOT USE_SUPA)
     set(USE_CUDA ON)
   endif()
   add_compile_definitions(USE_MNNVL)
@@ -238,6 +240,25 @@ if(USE_NCCL_HOST)
   add_compile_definitions(USE_NCCL_HOST)
   message(STATUS
     "NCCL host RMA transport is enabled (NCCL ${NCCLDevice_VERSION})")
+endif()
+
+if(USE_SUPA)
+  add_compile_definitions(USE_SUPA)
+  message(STATUS "SUPA support is enabled")
+  if(NOT DEFINED BIREN_HOME OR BIREN_HOME STREQUAL "")
+    if(DEFINED ENV{BIREN_HOME} AND NOT "$ENV{BIREN_HOME}" STREQUAL "")
+      set(BIREN_HOME
+          "$ENV{BIREN_HOME}"
+          CACHE PATH "Biren SUPA SDK root")
+    else()
+      set(BIREN_HOME
+          "/usr/local/birensupa/all/latest"
+          CACHE PATH "Biren SUPA SDK root")
+    endif()
+  endif()
+  message(STATUS "  BIREN_HOME: ${BIREN_HOME}")
+  include_directories(${BIREN_HOME}/supa/include)
+  link_directories(${BIREN_HOME}/supa/lib ${BIREN_HOME}/brumd/lib)
 endif()
 
 if(USE_TPU)
