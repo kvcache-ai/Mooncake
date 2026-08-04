@@ -277,5 +277,76 @@ TEST_F(ConnPauseTtlEnvTest, EmptyStringKeepsDefault) {
     EXPECT_EQ(config.conn_pause_ttl_ms, 17);
 }
 
+// MC_MAX_CONCURRENT_REG_MR caps how many buffers registerLocalMemoryBatch()
+// registers at once; 0 (the default) means unbounded. 0 is therefore also what
+// a silent atol() fallback would produce on a typo, which would read as "the
+// knob was honored and asked for no cap" -- the opposite of what the operator
+// wanted. So a typo must be rejected loudly and leave the field untouched.
+class MaxConcurrentRegMrEnvTest : public ::testing::Test {
+   protected:
+    void TearDown() override { ::unsetenv("MC_MAX_CONCURRENT_REG_MR"); }
+};
+
+TEST_F(MaxConcurrentRegMrEnvTest, UnboundedWhenUnset) {
+    ::unsetenv("MC_MAX_CONCURRENT_REG_MR");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.max_concurrent_reg_mr, 0u);
+}
+
+TEST_F(MaxConcurrentRegMrEnvTest, ValidOverrideIsApplied) {
+    ASSERT_EQ(::setenv("MC_MAX_CONCURRENT_REG_MR", "8", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.max_concurrent_reg_mr, 8u);
+}
+
+TEST_F(MaxConcurrentRegMrEnvTest, ExplicitZeroSelectsUnbounded) {
+    ASSERT_EQ(::setenv("MC_MAX_CONCURRENT_REG_MR", "0", 1), 0);
+    GlobalConfig config;
+    config.max_concurrent_reg_mr = 99;  // sentinel must be overwritten by 0
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.max_concurrent_reg_mr, 0u);
+}
+
+TEST_F(MaxConcurrentRegMrEnvTest, OneIsAcceptedAndSerializes) {
+    ASSERT_EQ(::setenv("MC_MAX_CONCURRENT_REG_MR", "1", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.max_concurrent_reg_mr, 1u);
+}
+
+TEST_F(MaxConcurrentRegMrEnvTest, NegativeIsIgnored) {
+    ASSERT_EQ(::setenv("MC_MAX_CONCURRENT_REG_MR", "-1", 1), 0);
+    GlobalConfig config;
+    config.max_concurrent_reg_mr = 11;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.max_concurrent_reg_mr, 11u);
+}
+
+TEST_F(MaxConcurrentRegMrEnvTest, NonNumericKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_MAX_CONCURRENT_REG_MR", "abc", 1), 0);
+    GlobalConfig config;
+    config.max_concurrent_reg_mr = 13;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.max_concurrent_reg_mr, 13u);
+}
+
+TEST_F(MaxConcurrentRegMrEnvTest, NumericSuffixKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_MAX_CONCURRENT_REG_MR", "8x", 1), 0);
+    GlobalConfig config;
+    config.max_concurrent_reg_mr = 15;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.max_concurrent_reg_mr, 15u);
+}
+
+TEST_F(MaxConcurrentRegMrEnvTest, EmptyStringKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_MAX_CONCURRENT_REG_MR", "", 1), 0);
+    GlobalConfig config;
+    config.max_concurrent_reg_mr = 17;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.max_concurrent_reg_mr, 17u);
+}
+
 }  // namespace
 }  // namespace mooncake

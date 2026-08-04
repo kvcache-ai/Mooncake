@@ -71,22 +71,14 @@ jobs:
         method: 'network'
         sub-packages: '["nvcc"]'
 
-    - name: Install coverage tools and build utilities
+    - name: Install build utilities
       run: |
         sudo apt-get update
-        sudo apt-get install -y lcov gcovr ninja-build
+        sudo apt-get install -y ninja-build
 
     - name: Test HugeTLB sizing helper
       run: |
         python3 scripts/test_hicache_hugepage_requirements.py
-      shell: bash
-
-    - name: Set up coverage compilation flags
-      run: |
-        echo "Setting up coverage compilation flags..."
-        echo "CXXFLAGS=--coverage" >> $GITHUB_ENV
-        echo "CFLAGS=--coverage" >> $GITHUB_ENV
-        echo "LDFLAGS=--coverage" >> $GITHUB_ENV
       shell: bash
 
     - name: Run sccache-cache
@@ -99,7 +91,7 @@ jobs:
           core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
           core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
 
-    - name: Configure project with coverage support
+    - name: Configure project
       run: |
         sudo apt update -y
         sudo bash -x dependencies.sh -y
@@ -150,7 +142,7 @@ jobs:
       run: ./scripts/ci/run_store_go_integration.sh
       shell: bash
 
-    - name: Test (in build env) with coverage
+    - name: Test (in build env)
       run: |
         cd build
         export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
@@ -168,110 +160,6 @@ jobs:
         # a Python host process is not stable.
         DEFAULT_KV_LEASE_TTL=500 ./mooncake-store/tests/task_integration_test --gtest_filter='TaskExecutorIntegrationTest.DrainJobCompleteFlow'
       shell: bash
-
-    - name: Generate coverage report
-      id: coverage
-      run: |
-        cd build
-        echo "=== Starting coverage report generation ==="
-        echo "Current directory: $(pwd)"
-
-        echo "=== Looking for .gcda files ==="
-        find . -name "*.gcda" 2>/dev/null | head -10 || echo "No .gcda files found"
-
-        echo "=== Running lcov ==="
-        lcov --capture --directory . --output-file coverage.info 2>&1 || {
-          echo "WARNING: lcov failed to capture coverage data"
-          echo "Creating minimal lcov-compliant coverage file to allow CI to continue"
-          echo "TN:dummy" > coverage.filtered.info
-          echo "SF:/dev/null" >> coverage.filtered.info
-          echo "DA:0,0" >> coverage.filtered.info
-          echo "end_of_record" >> coverage.filtered.info
-          echo "coverage_failed=true" >> $GITHUB_OUTPUT
-          exit 0  # Exit successfully, do not block CI
-        }
-
-        echo "=== Processing coverage data ==="
-        lcov --remove coverage.info '/usr/*' '*/test/*' '*/third_party/*' '*/benchmarks/*' --output-file coverage.filtered.info 2>&1 || true
-
-        echo "=== Generating HTML report ==="
-        genhtml coverage.filtered.info --output-directory coverage_report 2>&1 || echo "genhtml failed, continuing..."
-
-        echo "=== Coverage summary ==="
-        lcov --list coverage.filtered.info 2>&1 || echo "lcov list failed"
-
-        echo "=== Coverage report generation completed ==="
-      shell: bash
-
-    - name: Upload coverage to Codecov
-      uses: codecov/codecov-action@v4
-      with:
-        files: build/coverage.filtered.info
-        flags: unittests
-        name: code-coverage-report
-        token: ${{ secrets.CODECOV_TOKEN }}
-        fail_ci_if_error: false
-      continue-on-error: true
-
-    - name: Check coverage status
-      if: always()
-      run: |
-        if [ "${{ steps.coverage.outputs.coverage_failed }}" = "true" ]; then
-          echo "⚠️ Coverage collection failed but CI continued"
-          echo "::warning::Code coverage collection failed. Please check the build logs."
-        else
-          echo "✅ Coverage collected successfully"
-        fi
-
-  build-musa:
-    needs: [spell-check, clang-format, check-paths]
-    if: *run-ci-for-source-changes
-    runs-on: ubuntu-22.04
-    container: registry.mthreads.com/mcconline/inference/pytorch:2.9.1.post1-py3.10-musa5.2.0-mp31-devel-ubuntu22.04-amd64
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        persist-credentials: false
-
-    - name: Mark repository as safe
-      run: git config --global --add safe.directory $GITHUB_WORKSPACE
-      shell: bash
-
-    - name: Configure project
-      run: |
-        apt update -y
-        apt install -y ninja-build
-        bash -x dependencies.sh -y
-        mkdir build
-        cd build
-        cmake -G Ninja .. -DUSE_MUSA=ON -DUSE_MNNVL=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DUSE_CXL=ON -DUSE_TCP=ON -DWITH_EP=ON -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DENABLE_DEBUG_SYMBOLS=OFF
-      shell: bash
-
-    - name: Build project
-      run: |
-        cd build
-        source ~/.bashrc
-        cmake --build . --parallel 1
-        cmake --install .
-      shell: bash
-
-  build-arm64:
-    needs: [spell-check, clang-format, check-paths]
-    if: *run-ci-for-source-changes
-    uses: ./.github/workflows/_build-wheel.yaml
-    with:
-      runner: ubuntu-22.04-arm
-      container: pytorch/manylinuxaarch64-builder:cuda13.0
-      python-versions: '["3.10", "3.12"]'
-      cuda: container
-      cmake-generator: Ninja
-      variant-flag: CU13_BUILD
-      torch-cuda-arch-list: '9.0'
-      cmake-args: >-
-        -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=OFF
-        -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
-      artifact-prefix: wheel-arm64-cuda13
-      version-override: 0.0.0.dev0
 
   # Build the artifact tested below through the exact release wheel path. The
   # Ubuntu jobs remain consumer tests, not an alternate wheel build environment.
@@ -682,29 +570,6 @@ jobs:
       shell: bash
       run: ${SCCACHE_PATH} --show-stats
 
-  build-docker:
-    name: Build Docker Image
-    needs: [spell-check, clang-format, check-paths]
-    if: *run-ci-for-source-changes
-    runs-on: ubuntu-22.04
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        persist-credentials: false
-
-    - name: Free up disk space
-      uses: ./.github/actions/free-disk-space
-
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@v2
-
-    - name: Build Docker image
-      run: |
-        docker build -f docker/mooncake.Dockerfile \
-          --build-arg PYTHON_VERSION=3.10 \
-          --build-arg EP_TORCH_VERSIONS="2.13.0" \
-          --build-arg CLEAN_BUILD_ARTIFACTS=1 \
-          -t mooncake:from-source .
 
   spell-check:
     name: Spell Check with Typos
@@ -857,10 +722,16 @@ jobs:
     uses: ./.github/workflows/ci_efa.yml
     secrets: inherit
 
-  ascend-test:
-    needs: [build, check-paths]
-    if: needs.check-paths.outputs.should-run-downstream == 'true'
-    uses: ./.github/workflows/ci_ascend.yml
+  build-wheel-rocm:
+    needs: [spell-check, clang-format, check-paths]
+    if: >-
+      (needs.check-paths.outputs.should-run-downstream == 'true' ||
+       github.event_name == 'workflow_dispatch') &&
+      (github.event_name == 'push' ||
+       github.event_name == 'workflow_dispatch' ||
+       github.event.action == 'opened' ||
+       contains(github.event.pull_request.labels.*.name, 'run-ci'))
+    uses: ./.github/workflows/ci_rocm.yml
     secrets: inherit
 
   integration-test:
@@ -979,16 +850,13 @@ jobs:
       - clang-format
       - docs-check
       - build
-      - build-musa
-      - build-arm64
       - build-wheel
       - build-flags
-      - build-docker
       - test-wheel-ubuntu
       - build-wheel-cu13
       - build-wheel-efa
+      - build-wheel-rocm
       - tent-ci
-      - ascend-test
       - integration-test
     runs-on: ubuntu-latest
     steps:

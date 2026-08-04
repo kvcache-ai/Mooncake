@@ -8,7 +8,6 @@
 #ifdef STORE_USE_ETCD
 #include "etcd_helper.h"
 #include "ha/kv/etcd_ha_kv_backend.h"
-#include "ha/oplog/oplog_batch_codec.h"
 #include "ha/oplog/oplog_batch_storage.h"
 #endif
 
@@ -823,7 +822,7 @@ TEST_F(SnapshotChildProcessTest,
     const std::string cluster_id =
         "snapshot-batch-boundary-" + UuidToString(generate_uuid());
     constexpr ViewVersionId kViewVersion = 19;
-    constexpr uint64_t kBatchLatest = 77;
+    constexpr uint64_t kBatchLatest = 1;
 
     auto backend = std::make_shared<EtcdHaKvBackend>();
     OpLogBatchStorage storage(cluster_id, *backend);
@@ -833,10 +832,14 @@ TEST_F(SnapshotChildProcessTest,
         GTEST_SKIP() << "failed to initialize batch durable prefix: "
                      << toString(init_err);
     }
-    ASSERT_EQ(ErrorCode::OK,
-              backend->Put(BuildDurablePrefixKey(cluster_id),
-                           EncodeDurablePrefix(
-                               {.batch_id = 3, .last_seq = kBatchLatest})));
+    OpLogBatchRecord batch{.batch_id = 1,
+                           .first_seq = kBatchLatest,
+                           .last_seq = kBatchLatest,
+                           .entries = {{.sequence_id = kBatchLatest,
+                                        .op_type = OpType::PUT_END,
+                                        .object_key = "snapshot-boundary",
+                                        .payload = {}}}};
+    ASSERT_EQ(ErrorCode::OK, storage.WriteBatchAndAdvancePrefix(batch, prefix));
 
     const std::string snapshot_id = "20240601_120000_789";
     CreateBatchEtcdHASnapshotService(cluster_id, etcd_endpoints, kViewVersion);

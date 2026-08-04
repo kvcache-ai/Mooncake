@@ -394,6 +394,11 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
     for (size_t ci = 0; ci < chunks.size(); ++ci) {
         void *chunk_addr = chunks[ci].first;
         size_t chunk_len = chunks[ci].second;
+        const uint64_t chunk_offset = reinterpret_cast<uintptr_t>(chunk_addr) -
+                                      reinterpret_cast<uintptr_t>(addr);
+        DmabufExport chunk_dmabuf_exp = dmabuf_exp;
+        if (chunk_dmabuf_exp.method == DmabufExport::Method::kDmabufReg)
+            chunk_dmabuf_exp.offset += chunk_offset;
 
         if (do_pre_touch) {
             // Parallel pre-touch the memory to speed up registration.
@@ -429,10 +434,10 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
             const int ar = access_rights;  // Local copy for lambda capture
 
             for (size_t i = 0; i < context_list_.size(); ++i) {
-                reg_threads.emplace_back([this, &ret_codes, &dmabuf_exp, i,
+                reg_threads.emplace_back([this, &ret_codes, chunk_dmabuf_exp, i,
                                           chunk_addr, chunk_len, ar]() {
                     ret_codes[i] = context_list_[i]->registerMemoryRegion(
-                        chunk_addr, chunk_len, ar, dmabuf_exp);
+                        chunk_addr, chunk_len, ar, chunk_dmabuf_exp);
                 });
             }
 
@@ -453,7 +458,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         } else {
             for (size_t i = 0; i < context_list_.size(); ++i) {
                 int ret = context_list_[i]->registerMemoryRegion(
-                    chunk_addr, chunk_len, access_rights, dmabuf_exp);
+                    chunk_addr, chunk_len, access_rights, chunk_dmabuf_exp);
                 if (ret) {
                     LOG(ERROR) << "Failed to register memory region (chunk "
                                << ci << ") with context " << i;
@@ -718,7 +723,7 @@ int RdmaTransport::refreshLocalDeviceDesc(const std::string &device_name,
 int RdmaTransport::registerLocalMemoryBatch(
     const std::vector<RdmaTransport::BufferEntry> &buffer_list,
     const std::string &location) {
-#if defined(USE_CUDA)
+#if defined(USE_CUDA) || defined(USE_SUPA)
     if (!Environ::Get().GetWithNvidiaPeermem()) {
         for (auto &buffer : buffer_list) {
             int ret = registerLocalMemory(buffer.addr, buffer.length, location,
@@ -755,7 +760,7 @@ int RdmaTransport::registerLocalMemoryBatch(
             }
         }
         if (first_error) return first_error;
-#if defined(USE_CUDA)
+#if defined(USE_CUDA) || defined(USE_SUPA)
     }  // Environ::Get().GetWithNvidiaPeermem()
 #endif
 
