@@ -40,7 +40,9 @@ class DfsGlobalAllocator {
 
     bool Init(const std::string& mount_path, int shard_count,
               uint64_t shard_capacity, uint64_t alignment);
-    bool IsInitialized() const { return initialized_; }
+    bool IsInitialized() const {
+        return initialized_.load(std::memory_order_acquire);
+    }
 
     tl::expected<DistributedFSDescriptor, ErrorCode> Allocate(
         const std::string& key, uint64_t size);
