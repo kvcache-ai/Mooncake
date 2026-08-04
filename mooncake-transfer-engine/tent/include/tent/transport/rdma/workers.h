@@ -102,6 +102,12 @@ class Workers {
 
     int getDeviceByFlatIndex(const RouteHint& hint, size_t flat_idx);
 
+    // True if the (sdev -> tdev) NIC pair is known-unable to GPUDirect-DMA to
+    // the source/target GPU (learned from prior completion errors). Used to
+    // steer selection away from dead rails before posting.
+    bool gdrPairExcluded(const RouteHint& source, const RouteHint& target,
+                         int sdev, int tdev, int src_gpu, int dst_gpu);
+
     int getDeviceRank(const RouteHint& hint, int device_id);
 
     void showLatencyInfo();

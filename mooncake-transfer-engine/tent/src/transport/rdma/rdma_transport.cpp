@@ -502,6 +502,7 @@ Status RdmaTransport::submitTransferTasks(
             slice->length = length;
             slice->task = task;
             slice->retry_count = 0;
+            slice->last_fallback_idx = -1;
             slice->quota_charged = false;
             slice->ep_weak_ptr.reset();
             slice->word = PENDING;
