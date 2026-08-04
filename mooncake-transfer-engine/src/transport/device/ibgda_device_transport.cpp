@@ -286,12 +286,25 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
                 return -1;
             }
             cudaStreamSynchronize(stream);
+            const bool split_regions =
+                ctrl_buf_mode_ == ControlMemoryMode::kGpuDmabuf;
             mlx5gda_qp_devctx devctx{
                 .qpn = qp->qpn,
                 .wqeid_mask = qp->num_wqebb - 1,
-                .wq = reinterpret_cast<mlx5gda_wqebb*>(qp->wq),
-                .cq = reinterpret_cast<mlx5_cqe64*>(qp->send_cq->cq_buf),
-                .dbr = reinterpret_cast<mlx5gda_wq_dbr*>(qp->dbr),
+                .wq = split_regions ? reinterpret_cast<mlx5gda_wqebb*>(qp->wq)
+                                    : reinterpret_cast<mlx5gda_wqebb*>(
+                                          static_cast<char*>(ctrl_buf_dev_) +
+                                          qp->wq_offset),
+                .cq = split_regions
+                          ? reinterpret_cast<mlx5_cqe64*>(qp->send_cq->cq_buf)
+                          : reinterpret_cast<mlx5_cqe64*>(
+                                static_cast<char*>(ctrl_buf_dev_) +
+                                qp->send_cq->cq_offset),
+                .dbr = split_regions
+                           ? reinterpret_cast<mlx5gda_wq_dbr*>(qp->dbr)
+                           : reinterpret_cast<mlx5gda_wq_dbr*>(
+                                 static_cast<char*>(ctrl_buf_dev_) +
+                                 qp->dbr_offset),
                 .bf = static_cast<char*>(qp->uar->reg_addr),
             };
             cudaMemcpy(
