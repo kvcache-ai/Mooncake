@@ -33,7 +33,9 @@ Integration:
 
 Common:
   - changed-files:
-    - any-glob-to-any-file: 'mooncake-common/**/*'
+    - any-glob-to-any-file:
+      - 'mooncake-common/**/*'
+      - 'mooncake-reshard/**/*'
 
 CI/Build:
   - changed-files:
@@ -54,6 +56,7 @@ Tests:
     - any-glob-to-any-file:
       - 'scripts/test_*'
       - 'mooncake-wheel/tests/**/*'
+      - 'mooncake-reshard/tests/**/*'
       - 'scripts/tone_tests/**/*'
 
 Ascend/NPU:
