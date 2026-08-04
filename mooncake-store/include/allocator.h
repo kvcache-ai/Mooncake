@@ -303,12 +303,6 @@ class OffsetBufferAllocator
 
     friend class Serializer<OffsetBufferAllocator>;
     friend struct RestoredOffsetBufferAllocator;
-    friend std::optional<struct RestoredOffsetBufferAllocator>
-    RestoreOffsetBufferAllocator(
-        std::string segment_name, size_t base, size_t size,
-        std::string transport_endpoint,
-        const std::vector<AllocatedBuffer::Descriptor>& descriptors,
-        ReplicaType replica_type);
 };
 
 struct RestoredOffsetBufferAllocator {

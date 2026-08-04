@@ -2618,12 +2618,22 @@ void MasterService::RestoreFromStandbySnapshot(
             }
 
             auto& tenant_state = shard->tenants[tenant_id];
-            tenant_state.metadata.emplace(
+            auto [metadata_it, inserted] = tenant_state.metadata.emplace(
                 std::piecewise_construct, std::forward_as_tuple(user_key),
                 std::forward_as_tuple(
                     standby_meta.client_id, now, standby_meta.size,
                     std::move(replicas), false, false, standby_meta.data_type,
                     standby_meta.group_id, tenant_id, user_key));
+            if (inserted &&
+                metadata_it->second.HasReplica([this](const Replica& replica) {
+                    return replica.is_memory_replica() &&
+                           !IsReplicaReadable(replica);
+                })) {
+                // Give recovering memory replicas one hard-lease interval to
+                // remount before they become evictable.
+                metadata_it->second.GrantLease(default_kv_lease_ttl_,
+                                               default_kv_soft_pin_ttl_);
+            }
             if (!standby_meta.group_id.empty()) {
                 RegisterGroupMember(tenant_state, tenant_id, user_key,
                                     standby_meta.group_id);

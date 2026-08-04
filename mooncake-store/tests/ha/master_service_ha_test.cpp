@@ -699,6 +699,32 @@ TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesMemoryBufferDescriptor) {
     EXPECT_EQ(restored.transport_endpoint_, endpoint);
 }
 
+TEST_F(MasterServiceHATest,
+       RestoredMemoryReplicaBecomesEvictableAfterRecoveryLeaseExpires) {
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(false)
+                              .set_default_kv_lease_ttl(500)
+                              .build());
+
+    const std::string endpoint = "standby_recovery_lease_segment";
+    const std::string key = "standby_recovery_lease_key";
+    auto object = MakeStandbyObject(key, endpoint);
+    service.RestoreFromStandbySnapshot({object}, 7,
+                                       {MakeStandbyMemorySegment(endpoint)});
+    const auto lease_timeout =
+        LeaseTimeoutForTesting(service, kDefaultTenant, key);
+
+    service.RunBatchEvictForTesting(/*evict_ratio_target=*/1.0,
+                                    /*evict_ratio_lowerbound=*/1.0);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, key), 1);
+
+    std::this_thread::sleep_until(lease_timeout +
+                                  std::chrono::milliseconds(10));
+    service.RunBatchEvictForTesting(/*evict_ratio_target=*/1.0,
+                                    /*evict_ratio_lowerbound=*/1.0);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, key), 0);
+}
+
 TEST_F(MasterServiceHATest, RemountMakesRestoredMemoryReplicaReady) {
     MasterService service(MasterServiceConfig::builder()
                               .set_enable_ha(false)
@@ -736,6 +762,11 @@ TEST_F(MasterServiceHATest, RemountMakesRestoredMemoryReplicaReady) {
         ASSERT_FALSE(result.has_value());
         EXPECT_EQ(result.error(), ErrorCode::REPLICA_IS_NOT_READY);
     }
+
+    service.RunBatchEvictForTesting(/*evict_ratio_target=*/1.0,
+                                    /*evict_ratio_lowerbound=*/1.0);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, first_key), 1);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, second_key), 1);
 
     Segment segment = MakeSegment(endpoint);
     ASSERT_TRUE(service.ReMountSegment({segment}, generate_uuid()).has_value());
