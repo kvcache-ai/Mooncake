@@ -22,9 +22,10 @@
 #include <iomanip>
 #include <memory>
 
+#include "common.h"
+#include "cuda_alike.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
-#include "common.h"
 
 using namespace mooncake;
 
@@ -82,8 +83,8 @@ std::string loadNicPriorityMatrix() {
            " \"cpu:1\": [[" +
            device_names +
            "], []], "
-           " \"cuda:0\": [[" +
-           device_names +
+           " \"" +
+           GPU_PREFIX + "0\": [[" + device_names +
            "], []], "
            " \"musa:0\": [[" +
            device_names +

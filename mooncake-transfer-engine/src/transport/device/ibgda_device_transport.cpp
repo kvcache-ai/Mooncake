@@ -76,7 +76,7 @@ static std::string autoDetectNic(const std::vector<std::string>& filter) {
     // topologically closest NIC.  Fall back to wildcard if cudaGetDevice fails.
     int device_id = 0;
     cudaGetDevice(&device_id);
-    std::string location = "cuda:" + std::to_string(device_id);
+    std::string location = GPU_PREFIX + std::to_string(device_id);
 
     int idx = topo.selectDevice(location);
     if (idx < 0) idx = topo.selectDevice("*");  // wildcard fallback
