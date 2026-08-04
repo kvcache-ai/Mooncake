@@ -73,6 +73,13 @@ struct TransferArgs {
 enum FeatureType : int32_t {
     AUTO_CONNECT = 0,
     CLIENT_SERVER_COMM = 1,
+    MALLOC_MEM_EXPORTED_HANDLE = 2,
+};
+
+// Fabric share handle of memory allocated by MallocMem. Layout is identical to
+// aclrtMemFabricHandle.
+struct MemFabricHandle {
+    uint8_t data[128] = {};
 };
 
 class ASCEND_FUNC_VISIBILITY AdxlEngine {
@@ -183,6 +190,16 @@ class ASCEND_FUNC_VISIBILITY AdxlEngine {
      */
     __attribute__((weak)) static Status MallocMem(MemType type, size_t size,
                                                   void** ptr);
+
+    /**
+     * @brief 获取MallocMem申请内存导出的fabric share handle
+     * @param [in] addr MallocMem返回的虚拟内存ptr
+     * @param [out] handle 导出的fabric share handle
+     * @return 成功:SUCCESS, 地址非MallocMem申请或已释放:PARAM_INVALID,
+     * 失败:其它.
+     */
+    __attribute__((weak)) static Status GetExportedHandle(
+        void* addr, MemFabricHandle& handle);
 
     /**
      * @brief 释放MallocMem申请的内存内存

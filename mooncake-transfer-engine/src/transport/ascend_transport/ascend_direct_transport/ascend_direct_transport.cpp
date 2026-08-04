@@ -311,6 +311,69 @@ Status AscendDirectTransport::getTransferStatus(BatchID batch_id,
     return Status::OK();
 }
 
+namespace {
+// HostRegister(MAPPED) pages are registered with TE via the caller's host VA
+// (e.g. SharedSegment.tensors().data_ptr()) and location=npu. ADXL ROCE D2rH
+// needs the mapped device VA; resolve it when present, otherwise keep addr.
+void *ResolveAscendRegisterAddr(void *addr, const std::string &location,
+                                adxl::MemType &mem_type) {
+    if (location.starts_with("cpu")) {
+        mem_type = adxl::MEM_HOST;
+        return addr;
+    }
+    if (location.starts_with("npu")) {
+        mem_type = adxl::MEM_DEVICE;
+        void *device_ptr = nullptr;
+        if (aclrtHostGetDevicePointer(addr, &device_ptr, 0) == ACL_ERROR_NONE &&
+            device_ptr != nullptr) {
+            LOG(INFO) << "HostRegister-mapped host " << addr
+                      << " resolved to device " << device_ptr
+                      << " for location=" << location;
+            return device_ptr;
+        }
+        return addr;
+    }
+    if (location == kWildcardLocation) {
+        aclrtPtrAttributes attributes;
+        if (aclrtPointerGetAttributes(addr, &attributes) != ACL_ERROR_NONE) {
+            LOG(ERROR) << "aclrtPointerGetAttributes failed for addr " << addr
+                       << ", errmsg: " << aclGetRecentErrMsg();
+            return nullptr;
+        }
+        if (attributes.location.type == ACL_MEM_LOCATION_TYPE_HOST) {
+            mem_type = adxl::MEM_HOST;
+            void *device_ptr = nullptr;
+            if (aclrtHostGetDevicePointer(addr, &device_ptr, 0) ==
+                    ACL_ERROR_NONE &&
+                device_ptr != nullptr) {
+                // Prefer device mapping when the host pages were HostRegister'd.
+                mem_type = adxl::MEM_DEVICE;
+                return device_ptr;
+            }
+            return addr;
+        }
+        if (attributes.location.type == ACL_MEM_LOCATION_TYPE_DEVICE) {
+            mem_type = adxl::MEM_DEVICE;
+            return addr;
+        }
+        LOG(INFO) << "mem addr:" << addr
+                  << " can not be recognized, try set to host mem.";
+        mem_type = adxl::MEM_HOST;
+        return addr;
+    }
+    return nullptr;
+}
+
+void *ResolveAscendUnregisterAddr(void *addr) {
+    void *device_ptr = nullptr;
+    if (aclrtHostGetDevicePointer(addr, &device_ptr, 0) == ACL_ERROR_NONE &&
+        device_ptr != nullptr) {
+        return device_ptr;
+    }
+    return addr;
+}
+}  // namespace
+
 int AscendDirectTransport::registerLocalMemory(void *addr, size_t length,
                                                const std::string &location,
                                                bool remote_accessible,
@@ -325,32 +388,17 @@ int AscendDirectTransport::registerLocalMemory(void *addr, size_t length,
     MAKE_GUARD(ctx_restore,
                [saved_ctx]() { (void)aclrtSetCurrentContext(saved_ctx); });
 
-    BufferDesc buffer_desc;
-    buffer_desc.name = location;
-    buffer_desc.addr = (uint64_t)addr;
-    buffer_desc.length = (uint64_t)length;
-
     adxl::MemType mem_type;
-    if (location.starts_with("cpu")) {
-        mem_type = adxl::MEM_HOST;
-    } else if (location.starts_with("npu")) {
-        mem_type = adxl::MEM_DEVICE;
-    } else if (location == kWildcardLocation) {
-        aclrtPtrAttributes attributes;
-        CHECK_ACL(aclrtPointerGetAttributes(addr, &attributes));
-        if (attributes.location.type == ACL_MEM_LOCATION_TYPE_HOST) {
-            mem_type = adxl::MEM_HOST;
-        } else if (attributes.location.type == ACL_MEM_LOCATION_TYPE_DEVICE) {
-            mem_type = adxl::MEM_DEVICE;
-        } else {
-            LOG(INFO) << "mem addr:" << addr
-                      << " can not be recognized, try set to host mem.";
-            mem_type = adxl::MEM_HOST;
-        }
-    } else {
+    void *reg_addr = ResolveAscendRegisterAddr(addr, location, mem_type);
+    if (reg_addr == nullptr) {
         LOG(ERROR) << "location:" << location << " is not supported.";
         return ERR_INVALID_ARGUMENT;
     }
+
+    BufferDesc buffer_desc;
+    buffer_desc.name = location;
+    buffer_desc.addr = (uint64_t)reg_addr;
+    buffer_desc.length = (uint64_t)length;
 
     int ret = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
     if (ret) {
@@ -359,14 +407,14 @@ int AscendDirectTransport::registerLocalMemory(void *addr, size_t length,
     }
 
     const int register_ret = transfer_executor_->registerMem(
-        addr, length, mem_type, transfer_executor_->getUseBufferPool(),
+        reg_addr, length, mem_type, transfer_executor_->getUseBufferPool(),
         roce_mode_, agent_mode_);
     if (register_ret == 0) {
         return 0;
     }
 
     const int rollback_ret =
-        metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+        metadata_->removeLocalMemoryBuffer(reg_addr, update_metadata);
     if (rollback_ret != 0) {
         LOG(ERROR) << "removeLocalMemoryBuffer rollback failed, ret: "
                    << rollback_ret;
@@ -385,11 +433,12 @@ int AscendDirectTransport::unregisterLocalMemory(void *addr,
     MAKE_GUARD(ctx_restore,
                [saved_ctx]() { (void)aclrtSetCurrentContext(saved_ctx); });
 
-    int ret = transfer_executor_->deregisterMem(addr);
+    void *reg_addr = ResolveAscendUnregisterAddr(addr);
+    int ret = transfer_executor_->deregisterMem(reg_addr);
     if (ret != 0) {
         return ret;
     }
-    (void)metadata_->removeLocalMemoryBuffer(addr, update_metadata);
+    (void)metadata_->removeLocalMemoryBuffer(reg_addr, update_metadata);
     return 0;
 }
 
