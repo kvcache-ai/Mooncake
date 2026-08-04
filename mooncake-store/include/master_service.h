@@ -77,6 +77,10 @@ class SnapshotChildProcessTest;
 // exposing test-only accessors on MasterService itself.
 class PromotionOnHitTest;
 class MasterServiceTenantQuotaTest;
+// Friended so the BatchEvict correctness tests can invoke the private
+// BatchEvict entry point and seed lease timestamps directly, instead of
+// relying on segment pressure plus the background eviction thread.
+class BatchEvictTest;
 class MasterServiceHATest;
 }  // namespace test
 namespace benchmarks {
@@ -107,6 +111,7 @@ class MasterService {
     friend class test::PromotionOnHitTest;
     friend class benchmarks::BatchEvictBench;
     friend class test::MasterServiceTenantQuotaTest;
+    friend class test::BatchEvictTest;
     friend class MasterSnapshotManager;    // Allow access to internal state for
                                            // snapshot
     friend class ha::MasterSnapshotCodec;  // Allow codec to access private
@@ -421,6 +426,10 @@ class MasterService {
      * @return ErrorCode::OK on success, ErrorCode::OBJECT_NOT_FOUND if not
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
+    auto PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
+                const TenantId& tenant_id, ReplicaType replica_type)
+        -> tl::expected<void, ErrorCode>;
+
     auto PutEnd(const UUID& client_id, const std::string& key,
                 const TenantId& tenant_id, ReplicaType replica_type)
         -> tl::expected<void, ErrorCode>;
@@ -448,7 +457,7 @@ class MasterService {
      * found, ErrorCode::INVALID_WRITE if replica status is invalid
      */
     std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
-        const UUID& client_id, const std::vector<std::string>& keys,
+        const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
         const TenantId& tenant_id, ReplicaType replica_type = ReplicaType::ALL);
 
     /**
@@ -477,6 +486,10 @@ class MasterService {
     /**
      * @brief Complete an upsert operation. Delegates to PutEnd.
      */
+    auto UpsertEnd(const UUID& client_id, const ObjectMeta& object_meta,
+                   const TenantId& tenant_id, ReplicaType replica_type)
+        -> tl::expected<void, ErrorCode>;
+
     auto UpsertEnd(const UUID& client_id, const std::string& key,
                    const TenantId& tenant_id, ReplicaType replica_type)
         -> tl::expected<void, ErrorCode>;
@@ -502,7 +515,7 @@ class MasterService {
      * @brief Complete a batch of upsert operations. Delegates to BatchPutEnd.
      */
     std::vector<tl::expected<void, ErrorCode>> BatchUpsertEnd(
-        const UUID& client_id, const std::vector<std::string>& keys,
+        const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
         const TenantId& tenant_id);
 
     /**
@@ -961,6 +974,7 @@ class MasterService {
         // Updated by UpsertStart (Case B) to reset the discard timeout.
         std::chrono::system_clock::time_point put_start_time;
         const size_t size;
+        std::optional<uint64_t> object_checksum;
         const ObjectDataType data_type{ObjectDataType::UNKNOWN};
         const std::string group_id;
         const TenantId tenant_id;

@@ -111,7 +111,10 @@ class ShmTransport : public Transport {
     std::unordered_map<void *, std::string> shm_path_map_;
 
     std::string cxl_mount_path_;
+
+    static constexpr int kShmCreateMaxRetries = 8;
 };
+
 }  // namespace tent
 }  // namespace mooncake
 

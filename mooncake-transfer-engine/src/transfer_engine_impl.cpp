@@ -435,6 +435,13 @@ Transport* TransferEngineImpl::installTransport(const std::string& proto,
         LOG(WARNING) << "Transport " << proto << " already installed";
         return transport;
     }
+#ifdef USE_NCCL_HOST
+    if (proto == "nccl" && !local_memory_regions_.empty()) {
+        LOG(ERROR) << "Install NCCL before registering local memory so peer "
+                      "buffer order remains deterministic";
+        return nullptr;
+    }
+#endif
 
     if (args != nullptr && args[0] != nullptr) {
         const std::string nic_priority_matrix = static_cast<char*>(args[0]);
@@ -481,6 +488,15 @@ device::RdmaTransport* TransferEngineImpl::getOrCreateRdmaTransport(
         rdma_transport_ = device::createIbgdaDeviceTransport(device_filter);
     }
     return rdma_transport_.get();
+}
+#endif
+
+#ifdef USE_NCCL_DEVICE
+device::NcclTransport* TransferEngineImpl::getOrCreateNcclTransport() {
+    if (!nccl_transport_) {
+        nccl_transport_ = device::createNcclDeviceTransport();
+    }
+    return nccl_transport_.get();
 }
 #endif
 

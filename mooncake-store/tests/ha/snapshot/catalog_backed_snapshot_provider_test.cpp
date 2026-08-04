@@ -197,6 +197,12 @@ TEST_P(CatalogBackedSnapshotProviderTest, LoadLatestSnapshotWithGroupId) {
     ExpectLoadsDefaultObject();
 }
 
+TEST_P(CatalogBackedSnapshotProviderTest,
+       LoadLatestSnapshotIgnoresObjectChecksum) {
+    PublishSnapshotPayload(SnapshotMetadataFormat::kWithObjectChecksum);
+    ExpectLoadsDefaultObject();
+}
+
 TEST_P(CatalogBackedSnapshotProviderTest, RejectsOverflowingReplicaCount) {
     // A near-UINT32_MAX replica_count must not wrap the format-detection
     // arithmetic into a valid-looking total and slip an out-of-bounds index

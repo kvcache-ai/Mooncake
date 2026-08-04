@@ -16,8 +16,9 @@
 
 #include <glog/logging.h>
 #include <tent/thirdparty/nlohmann/json.h>
-#include <sstream>
 #include <iomanip>
+#include <sstream>
+#include <unordered_set>
 
 namespace mooncake::tent {
 
@@ -29,6 +30,12 @@ TentMetrics& TentMetrics::instance() {
 TentMetrics::~TentMetrics() { shutdown(); }
 
 #if TENT_METRICS_ENABLED
+
+namespace {
+const char* operationName(Request::OpCode operation) {
+    return operation == Request::READ ? "read" : "write";
+}
+}  // namespace
 
 Status TentMetrics::initialize(const MetricsConfig& config) {
     // Validate configuration before touching initialized_. An invalid config
@@ -200,27 +207,38 @@ void TentMetrics::shutdown() {
 
 void TentMetrics::registerMetrics() {
     // Register all counters as base metric_t* pointers so that counters with
-    // different label arities (N=1 per-transport, N=2 failover from→to) share
-    // one vector for Prometheus serialize().
+    // different label arities (N=1 per-transport, N=2 failover from→to and
+    // transport-attempt operation labels) share one vector for Prometheus
+    // serialize().
     counters_ = {
-        &read_bytes_total_,    &write_bytes_total_,
-        &read_requests_total_, &write_requests_total_,
-        &read_failures_total_, &write_failures_total_,
-        &failover_total_,      &deadline_infeasible_total_,
+        &read_bytes_total_,
+        &write_bytes_total_,
+        &read_requests_total_,
+        &write_requests_total_,
+        &read_failures_total_,
+        &write_failures_total_,
+        &failover_total_,
+        &transport_attempts_total_,
+        &transport_attempt_failures_total_,
+        &deadline_infeasible_total_,
     };
 
-    // Register all histograms - add new histograms here. Each entry pairs the
-    // histogram with its compile-time bucket boundaries; the struct keeps the
-    // two in sync so getJsonMetrics() cannot mislabel buckets.
+    // Register the N=1 per-transport histograms with their bucket boundaries
+    // and parallel sum counters. Each entry keeps the histogram, its
+    // compile-time boundaries, and its sum counter in sync so both the
+    // Prometheus and JSON serializers cannot mislabel buckets or drop _sum.
+    // The N=2 transport_attempt_latency_ histogram is serialized separately
+    // (it can't share this N=1-typed vector); see getPrometheusMetrics /
+    // getJsonMetrics.
     histograms_ = {
-        {&read_latency_, &kLatencyBuckets},
-        {&write_latency_, &kLatencyBuckets},
-        {&read_size_, &kSizeBuckets},
-        {&write_size_, &kSizeBuckets},
-        {&deadline_mlu_, &kMluPerMilleBuckets},
-        {&stage_queue_wait_, &kStageBuckets},
-        {&stage_dispatch_, &kStageBuckets},
-        {&stage_transport_, &kStageBuckets},
+        {&read_latency_, &kLatencyBuckets, &read_latency_sum_},
+        {&write_latency_, &kLatencyBuckets, &write_latency_sum_},
+        {&read_size_, &kSizeBuckets, &read_size_sum_},
+        {&write_size_, &kSizeBuckets, &write_size_sum_},
+        {&deadline_mlu_, &kMluPerMilleBuckets, &deadline_mlu_sum_},
+        {&stage_queue_wait_, &kStageBuckets, &stage_queue_wait_sum_},
+        {&stage_dispatch_, &kStageBuckets, &stage_dispatch_sum_},
+        {&stage_transport_, &kStageBuckets, &stage_transport_sum_},
     };
 }
 
@@ -232,10 +250,13 @@ void TentMetrics::recordReadCompleted(TransportType tp, size_t bytes,
     auto label = std::array<std::string, 1>{transportTypeName(tp)};
     read_bytes_total_.inc(label, static_cast<int64_t>(bytes));
     read_requests_total_.inc(label);
-    read_size_.observe(label, static_cast<int64_t>(bytes));
+    auto bytes_val = static_cast<int64_t>(bytes);
+    read_size_.observe(label, bytes_val);
+    read_size_sum_.inc(label, bytes_val);
     if (latency_seconds > 0.0) {
         int64_t latency_us = static_cast<int64_t>(latency_seconds * 1000000.0);
         read_latency_.observe(label, latency_us);
+        read_latency_sum_.inc(label, latency_us);
     }
 }
 
@@ -247,10 +268,13 @@ void TentMetrics::recordWriteCompleted(TransportType tp, size_t bytes,
     auto label = std::array<std::string, 1>{transportTypeName(tp)};
     write_bytes_total_.inc(label, static_cast<int64_t>(bytes));
     write_requests_total_.inc(label);
-    write_size_.observe(label, static_cast<int64_t>(bytes));
+    auto bytes_val = static_cast<int64_t>(bytes);
+    write_size_.observe(label, bytes_val);
+    write_size_sum_.inc(label, bytes_val);
     if (latency_seconds > 0.0) {
         int64_t latency_us = static_cast<int64_t>(latency_seconds * 1000000.0);
         write_latency_.observe(label, latency_us);
+        write_latency_sum_.inc(label, latency_us);
     }
 }
 
@@ -259,7 +283,9 @@ void TentMetrics::recordDeadlineMLU(TransportType tp, double mlu) {
         return;
     if (mlu < 0.0) return;
     auto label = std::array<std::string, 1>{transportTypeName(tp)};
-    deadline_mlu_.observe(label, static_cast<int64_t>(mlu * 1000.0));
+    auto mlu_permille = static_cast<int64_t>(mlu * 1000.0);
+    deadline_mlu_.observe(label, mlu_permille);
+    deadline_mlu_sum_.inc(label, mlu_permille);
 }
 
 void TentMetrics::recordDeadlineInfeasible(TransportType tp) {
@@ -279,12 +305,15 @@ void TentMetrics::recordStageLatency(Stage stage, TransportType tp,
     switch (stage) {
         case Stage::QueueWait:
             stage_queue_wait_.observe(label, val);
+            stage_queue_wait_sum_.inc(label, val);
             break;
         case Stage::Dispatch:
             stage_dispatch_.observe(label, val);
+            stage_dispatch_sum_.inc(label, val);
             break;
         case Stage::Transport:
             stage_transport_.observe(label, val);
+            stage_transport_sum_.inc(label, val);
             break;
     }
 }
@@ -313,6 +342,32 @@ void TentMetrics::recordTransportFailover(TransportType from,
                                                    transportTypeName(to)});
 }
 
+void TentMetrics::recordTransportAttemptStarted(TransportType tp,
+                                                Request::OpCode operation) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    transport_attempts_total_.inc(std::array<std::string, 2>{
+        transportTypeName(tp), operationName(operation)});
+}
+
+void TentMetrics::recordTransportAttemptFinished(TransportType tp,
+                                                 Request::OpCode operation,
+                                                 TransferStatusEnum status,
+                                                 double latency_us) {
+    if (!initialized_ || !runtime_enabled_.load(std::memory_order_relaxed))
+        return;
+    auto label = std::array<std::string, 2>{transportTypeName(tp),
+                                            operationName(operation)};
+    if (status == FAILED) {
+        transport_attempt_failures_total_.inc(label);
+    }
+    if (latency_us >= 0.0) {
+        auto latency_val = static_cast<int64_t>(latency_us);
+        transport_attempt_latency_.observe(label, latency_val);
+        transport_attempt_latency_sum_.inc(label, latency_val);
+    }
+}
+
 std::string TentMetrics::getPrometheusMetrics() {
     if (!initialized_) return "";
 
@@ -320,22 +375,33 @@ std::string TentMetrics::getPrometheusMetrics() {
         std::string result;
         result.reserve(kPrometheusBufferSize);
 
-        // Serialize each metric into a temporary buffer first, then append.
-        // ylt's basic_dynamic_histogram::serialize() calls str.clear() when
-        // all label combos have sum=0, which would wipe previous output if
-        // we serialized directly into `result`. Using a per-metric temporary
-        // isolates each serialize() call.
+        // Counters: ylt's counter_t::serialize() is reliable — no evidence of
+        // silent drops in practice. Kept as-is.
         for (auto* counter : counters_) {
             std::string tmp;
             counter->serialize(tmp);
             result += tmp;
         }
 
+        // Histograms: do NOT use ylt's basic_dynamic_histogram::serialize().
+        // It silently drops the entire metric (including the # HELP / # TYPE
+        // header it already wrote) whenever every label combo has sum_==0 —
+        // via `if (value == 0) continue; ... if (value_str.empty())
+        // str.clear();`. That condition is reachable in production: e.g.
+        // stage_queue_wait_us with sub-microsecond latencies that truncate to
+        // 0 under int64_t observation. The JSON endpoint's custom serializer
+        // walks get_bucket_counts() directly and is unaffected, which is why
+        // /metrics/json reported count=4846 while /metrics omitted the metric
+        // entirely. Using the same bucket-walk here closes that drift.
         for (const auto& entry : histograms_) {
-            std::string tmp;
-            entry.h->serialize(tmp);
-            result += tmp;
+            serializeHistogramPrometheus(entry.h, *entry.boundaries, *entry.sum,
+                                         result);
         }
+        // N=2 transport-attempt latency histogram (labels: transport,
+        // operation) goes through the same helper, instantiated for N=2.
+        serializeHistogramPrometheus(&transport_attempt_latency_,
+                                     kLatencyBuckets,
+                                     transport_attempt_latency_sum_, result);
 
         return result;
     } catch (const std::exception& e) {
@@ -355,7 +421,163 @@ int64_t sumCounterValues(CounterPtr counter) {
     }
     return total;
 }
+
+template <uint8_t N>
+void serializeHistogramToJson(
+    nlohmann::json& root,
+    ylt::metric::basic_dynamic_histogram<int64_t, N>* hist,
+    const std::vector<double>& boundaries,
+    ylt::metric::basic_dynamic_counter<int64_t, N>* sum) {
+    auto bucket_counts = hist->get_bucket_counts();
+    int64_t total_count = 0;
+    int64_t total_sum = 0;
+    nlohmann::json buckets_obj;
+    for (size_t i = 0; i < bucket_counts.size(); ++i) {
+        int64_t bucket_total = sumCounterValues(bucket_counts[i]);
+        total_count += bucket_total;
+        if (i < boundaries.size()) {
+            buckets_obj[std::to_string(static_cast<int64_t>(boundaries[i]))] =
+                bucket_total;
+        }
+    }
+    // ylt keeps the histogram's sum_ private, so read the parallel sum counter
+    // maintained alongside each observe() call (matches the Prometheus path).
+    for (auto& e : sum->copy()) {
+        total_sum += e->value.load();
+    }
+    nlohmann::json hist_obj;
+    hist_obj["count"] = total_count;
+    hist_obj["sum"] = total_sum;
+    hist_obj["buckets"] = buckets_obj;
+    root[hist->str_name()] = hist_obj;
+}
 }  // namespace
+
+template <uint8_t N>
+void TentMetrics::serializeHistogramPrometheus(
+    ylt::metric::basic_dynamic_histogram<int64_t, N>* hist,
+    const std::vector<double>& boundaries,
+    ylt::metric::basic_dynamic_counter<int64_t, N>& sum,
+    std::string& out) const {
+    // Walk the same data the JSON path uses (get_bucket_counts() + copy()),
+    // so the two endpoints cannot drift. Unlike ylt's serialize() this never
+    // silently drops a histogram that has observed >=1 sample: ylt clears its
+    // output string (taking the # HELP / # TYPE header with it) whenever
+    // every label combo has sum_==0, which is reachable in production when
+    // sub-microsecond latencies truncate to 0 under int64_t observation.
+    //
+    // Templated over label arity N: the per-transport histograms are N=1 and
+    // the transport-attempt latency histogram is N=2. For N=1 the emitted
+    // text is byte-identical to the original single-label implementation.
+    auto bucket_counts = hist->get_bucket_counts();
+    if (bucket_counts.empty()) return;
+
+    const auto& label_names = hist->labels_name();
+
+    // A unique key per label tuple, used to dedup combos and look up the sum.
+    auto combo_key = [](const std::array<std::string, N>& lv) {
+        std::string k;
+        for (uint8_t i = 0; i < N; ++i) {
+            k.append(lv[i]);
+            k.push_back('\x1f');  // separator that cannot appear in a label
+        }
+        return k;
+    };
+    // Render `name0="v0",name1="v1"` for a label tuple (no surrounding braces).
+    auto append_labels = [&](std::string& dst,
+                             const std::array<std::string, N>& lv) {
+        for (uint8_t i = 0; i < N; ++i) {
+            if (i) dst.append(",");
+            dst.append(label_names[i]).append("=\"").append(lv[i]).append("\"");
+        }
+    };
+
+    // Build the union of label combos across ALL buckets. ylt's observe()
+    // increments exactly one bucket per observation (the bucket containing
+    // the value), so no single bucket sees every combo: e.g. queue_wait
+    // (sub-us -> bucket[0]) and transport_us (>=100us -> higher buckets) live
+    // in disjoint buckets. ylt itself uses sum_->copy() for this, but sum_ is
+    // private. Unioning across buckets gives the same set without needing sum_.
+    std::vector<const std::array<std::string, N>*> label_combos;
+    std::unordered_set<std::string> seen;
+    for (auto& bc : bucket_counts) {
+        for (auto& e : bc->copy()) {
+            if (seen.insert(combo_key(e->label)).second) {
+                label_combos.push_back(&e->label);
+            }
+        }
+    }
+    if (label_combos.empty()) return;
+
+    // Pre-compute per-combo total counts so we can (a) skip totally-empty
+    // combos and (b) decide whether to emit the # HELP / # TYPE header at
+    // all. This mirrors ylt's "emit head only if value_map non-empty" but
+    // uses bucket counts instead of sum, so a combo with sum==0 but real
+    // observations is still emitted.
+    std::vector<std::pair<const std::array<std::string, N>*, int64_t>>
+        active_combos;
+    for (auto* labels_value : label_combos) {
+        int64_t total_count = 0;
+        for (auto& bc : bucket_counts) {
+            total_count += bc->value(*labels_value);
+        }
+        if (total_count > 0) {
+            active_combos.emplace_back(labels_value, total_count);
+        }
+    }
+    if (active_combos.empty()) return;
+
+    // Read back the per-combo sum from the parallel counter. ylt's histogram
+    // keeps sum_ private with no accessor, so we maintain a separate counter
+    // incremented alongside each observe() call. copy() returns a vector of
+    // {label, value} pairs; build a lookup map for O(1) access per combo.
+    std::unordered_map<std::string, int64_t> sum_by_combo;
+    for (auto& e : sum.copy()) {
+        sum_by_combo[combo_key(e->label)] = e->value.load();
+    }
+
+    const std::string& name = hist->str_name();
+    const std::string help_str{hist->help()};
+
+    // Emit the header once per metric (matches ylt's serialize_head()).
+    out.append("# HELP ").append(name).append(" ").append(help_str).append(
+        "\n");
+    out.append("# TYPE ").append(name).append(" histogram\n");
+
+    for (auto& [labels_value, total_count] : active_combos) {
+        int64_t cumulative = 0;
+        for (size_t i = 0; i < bucket_counts.size(); ++i) {
+            cumulative += bucket_counts[i]->value(*labels_value);
+            out.append(name).append("_bucket{");
+            append_labels(out, *labels_value);
+            out.append(",");
+            if (i < boundaries.size()) {
+                out.append("le=\"")
+                    .append(std::to_string(boundaries[i]))
+                    .append("\"} ");
+            } else {
+                out.append("le=\"+Inf\"} ");
+            }
+            out.append(std::to_string(cumulative)).append("\n");
+        }
+
+        // _sum: read from the parallel counter maintained alongside each
+        // observe() call. Falls back to 0 if the combo is not yet in the
+        // counter (should not happen for active combos, but defensive).
+        int64_t total_sum = 0;
+        auto it = sum_by_combo.find(combo_key(*labels_value));
+        if (it != sum_by_combo.end()) {
+            total_sum = it->second;
+        }
+        out.append(name).append("_sum{");
+        append_labels(out, *labels_value);
+        out.append("} ").append(std::to_string(total_sum)).append("\n");
+
+        out.append(name).append("_count{");
+        append_labels(out, *labels_value);
+        out.append("} ").append(std::to_string(total_count)).append("\n");
+    }
+}
 
 std::string TentMetrics::getJsonMetrics() {
     if (!initialized_) return "{}";
@@ -379,38 +601,36 @@ std::string TentMetrics::getJsonMetrics() {
         root[write_failures_total_.str_name()] =
             sumCounterValues(&write_failures_total_);
         root[failover_total_.str_name()] = sumCounterValues(&failover_total_);
+        root[transport_attempts_total_.str_name()] =
+            sumCounterValues(&transport_attempts_total_);
+        root[transport_attempt_failures_total_.str_name()] =
+            sumCounterValues(&transport_attempt_failures_total_);
         root[deadline_infeasible_total_.str_name()] =
             sumCounterValues(&deadline_infeasible_total_);
 
-        // Histograms: sum bucket counts across all transport labels.
-        auto serializeHistogram =
-            [&](ylt::metric::basic_dynamic_histogram<int64_t, 1>* hist,
-                const std::vector<double>& boundaries) {
-                auto bucket_counts = hist->get_bucket_counts();
-                int64_t total_count = 0;
-                nlohmann::json buckets_obj;
-                for (size_t i = 0; i < bucket_counts.size(); ++i) {
-                    int64_t bucket_total = sumCounterValues(bucket_counts[i]);
-                    total_count += bucket_total;
-                    if (i < boundaries.size()) {
-                        buckets_obj[std::to_string(static_cast<int64_t>(
-                            boundaries[i]))] = bucket_total;
-                    }
-                }
-                nlohmann::json hist_obj;
-                hist_obj["count"] = total_count;
-                hist_obj["buckets"] = buckets_obj;
-                root[hist->str_name()] = hist_obj;
-            };
-
-        serializeHistogram(&read_latency_, kLatencyBuckets);
-        serializeHistogram(&write_latency_, kLatencyBuckets);
-        serializeHistogram(&read_size_, kSizeBuckets);
-        serializeHistogram(&write_size_, kSizeBuckets);
-        serializeHistogram(&deadline_mlu_, kMluPerMilleBuckets);
-        serializeHistogram(&stage_queue_wait_, kStageBuckets);
-        serializeHistogram(&stage_dispatch_, kStageBuckets);
-        serializeHistogram(&stage_transport_, kStageBuckets);
+        // Histograms: sum bucket counts across all transport labels. The
+        // templated helper also reads back the parallel sum counter so the
+        // JSON endpoint emits "sum" alongside "count" (and stays in sync with
+        // the Prometheus endpoint).
+        serializeHistogramToJson(root, &read_latency_, kLatencyBuckets,
+                                 &read_latency_sum_);
+        serializeHistogramToJson(root, &write_latency_, kLatencyBuckets,
+                                 &write_latency_sum_);
+        serializeHistogramToJson(root, &read_size_, kSizeBuckets,
+                                 &read_size_sum_);
+        serializeHistogramToJson(root, &write_size_, kSizeBuckets,
+                                 &write_size_sum_);
+        serializeHistogramToJson(root, &deadline_mlu_, kMluPerMilleBuckets,
+                                 &deadline_mlu_sum_);
+        serializeHistogramToJson(root, &stage_queue_wait_, kStageBuckets,
+                                 &stage_queue_wait_sum_);
+        serializeHistogramToJson(root, &stage_dispatch_, kStageBuckets,
+                                 &stage_dispatch_sum_);
+        serializeHistogramToJson(root, &stage_transport_, kStageBuckets,
+                                 &stage_transport_sum_);
+        serializeHistogramToJson(root, &transport_attempt_latency_,
+                                 kLatencyBuckets,
+                                 &transport_attempt_latency_sum_);
 
         return root.dump(2);  // Pretty print with 2-space indent
     } catch (const std::exception& e) {
@@ -482,6 +702,10 @@ void TentMetrics::recordWriteCompleted(TransportType, size_t, double) {}
 void TentMetrics::recordReadFailed(TransportType) {}
 void TentMetrics::recordWriteFailed(TransportType) {}
 void TentMetrics::recordTransportFailover(TransportType, TransportType) {}
+void TentMetrics::recordTransportAttemptStarted(TransportType,
+                                                Request::OpCode) {}
+void TentMetrics::recordTransportAttemptFinished(TransportType, Request::OpCode,
+                                                 TransferStatusEnum, double) {}
 void TentMetrics::recordDeadlineMLU(TransportType, double) {}
 void TentMetrics::recordDeadlineInfeasible(TransportType) {}
 void TentMetrics::recordStageLatency(Stage, TransportType, double) {}

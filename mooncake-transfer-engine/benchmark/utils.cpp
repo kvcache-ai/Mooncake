@@ -20,6 +20,15 @@
 DEFINE_string(seg_name, "", "Memory segment name for the local side");
 DEFINE_string(seg_type, "DRAM",
               "Memory segment type for the target side: DRAM|VRAM");
+DEFINE_string(
+    seg_type_mix, "",
+    "Comma-separated segment types for mixed DRAM+VRAM runs, e.g. "
+    "\"dram,vram\". When set, target registers buffers of each listed type "
+    "in one segment, and initiator threads round-robin across them so a "
+    "single tebench process drives traffic over multiple memory types (and "
+    "thus multiple transports — SHM for DRAM, NVLink for VRAM) "
+    "concurrently. Empty falls back to --seg_type (single type, existing "
+    "behavior). Requires transports to be enabled via MC_TENT_CONF.");
 DEFINE_string(target_seg_name, "", "Memory segment name for the target side");
 DEFINE_string(op_type, "read", "Operation type to benchmark: read|write|mix");
 DEFINE_bool(check_consistency, false,
@@ -88,6 +97,7 @@ namespace mooncake {
 namespace tent {
 std::string XferBenchConfig::seg_name;
 std::string XferBenchConfig::seg_type;
+std::string XferBenchConfig::seg_type_mix;
 std::string XferBenchConfig::target_seg_name;
 std::string XferBenchConfig::op_type;
 bool XferBenchConfig::check_consistency = false;
@@ -123,6 +133,7 @@ int XferBenchConfig::target_gpu_id = 0;
 
 void XferBenchConfig::loadFromFlags() {
     seg_type = FLAGS_seg_type;
+    seg_type_mix = FLAGS_seg_type_mix;
     seg_name = FLAGS_seg_name;
     target_seg_name = FLAGS_target_seg_name;
     op_type = FLAGS_op_type;

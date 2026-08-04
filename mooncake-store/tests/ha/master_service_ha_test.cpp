@@ -3390,8 +3390,8 @@ TEST_F(MasterServiceHATest, BatchEvictStopsAfterFirstOpLogReservationFailure) {
         ASSERT_TRUE(held.has_value());
         SetNeedMemoryEvictionForTesting(service, true);
         testing::internal::CaptureStderr();
-        service.RunBatchEvictForTesting(/*evict_ratio_target=*/1.0,
-                                        /*evict_ratio_lowerbound=*/1.0);
+        service.RunBatchEvictForTesting(/*evict_ratio_target=*/0.05,
+                                        /*evict_ratio_lowerbound=*/0.05);
         const std::string logs = testing::internal::GetCapturedStderr();
 
         const std::string warning = "BatchEvict: OpLog reservation failed";

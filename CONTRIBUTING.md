@@ -47,10 +47,9 @@ Mooncake uses [pre-commit](https://pre-commit.com/) to enforce consistent format
 | Type | Tool | Purpose |
 |------|------|---------|
 | Generic | trailing-whitespace / end-of-file-fixer | Basic hygiene |
-| Project | `./scripts/code_format.sh` | Enforce Mooncake C/C++ formatting script before commit |
+| Project | `./scripts/code_format.sh --staged` | Format staged C/C++ changes before commit |
 | Python | ruff / ruff-format | Lint + format (includes import sorting) |
 | Spelling | codespell | Catch common typos (ignores domain-specific words) |
-| C/C++ | clang-format | Apply style from the repository's `.clang-format` |
 | CMake | cmake-format | Keep build scripts readable |
 | Meta | check-yaml / check-merge-conflict / check-added-large-files | Prevent bad commits |
 
@@ -60,10 +59,15 @@ pip install -r requirements.txt
 pre-commit install
 ```
 
-After installation, every commit will run `./scripts/code_format.sh` automatically. If it rewrites files, re-stage the changes and commit again.
+After installation, every commit formats only the added or modified lines in
+staged C/C++ files. If the hook rewrites a file, review and re-stage it before
+committing again. Use `./scripts/code_format.sh --all` only when intentionally
+formatting the whole project.
 
 #### Usage
-Run on all files (first run will install hook environments):
+Run hooks on all files (the first run installs hook environments). The C/C++
+hook remains limited to staged line ranges; use `./scripts/code_format.sh --all`
+for an intentional whole-project C/C++ format:
 ```bash
 pre-commit run --all-files
 ```
@@ -74,7 +78,8 @@ git add .pre-commit-config.yaml
 git commit -m "chore: pre-commit autoupdate"
 ```
 
-If clang-format is missing, install it (Ubuntu example):
+If clang-format or its `git-clang-format` helper is missing, install the LLVM
+20 package (Ubuntu example):
 ```bash
 sudo apt-get update && sudo apt-get install -y clang-format-20
 ```
@@ -86,7 +91,15 @@ git commit -m "wip: skipping hooks" --no-verify
 But please avoid using `--no-verify` for routine commits to keep code quality high.
 
 #### CI Integration
-The configuration supports automatic fixing PRs via `pre-commit.ci` if enabled. To activate, add the repository in the pre-commit.ci dashboard; no further changes are needed.
+GitHub pull-request and push checks validate only added or modified C/C++ line
+ranges relative to the selected base revision. This avoids failing a focused
+change solely because an otherwise untouched part of the same file has older
+formatting. Changed-line selection is delegated to LLVM's `git-clang-format`
+helper so the local hook and CI use the same Git-aware behavior.
+
+The configuration also supports automatic fixing PRs via `pre-commit.ci` if
+enabled. To activate, add the repository in the pre-commit.ci dashboard; no
+further changes are needed.
 
 
 ## Code Quality
