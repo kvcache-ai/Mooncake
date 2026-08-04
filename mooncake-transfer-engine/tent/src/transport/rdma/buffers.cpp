@@ -141,12 +141,26 @@ Status LocalBufferManager::addBufferInternal(BufferDesc& desc,
                 context->registerMemReg((void*)desc.addr, desc.length, access);
         }
     }
+
     for (size_t id = 0; id < context_list_.size(); ++id) {
         if (!context_list_[id]) continue;
         if (!mem_reg_list[id]) {
+            for (size_t cleanup_id = 0; cleanup_id < context_list_.size();
+                 ++cleanup_id) {
+                if (!context_list_[cleanup_id] || !mem_reg_list[cleanup_id])
+                    continue;
+                context_list_[cleanup_id]->unregisterMemReg(
+                    mem_reg_list[cleanup_id]);
+            }
+            desc.lkey.clear();
+            desc.rkey.clear();
             return Status::RdmaError(
                 "Unable to register buffer of local memory segment" LOC_MARK);
         }
+    }
+
+    for (size_t id = 0; id < context_list_.size(); ++id) {
+        if (!context_list_[id]) continue;
         staging.mem_reg_map[context_list_[id]] = mem_reg_list[id];
         auto keys = context_list_[id]->queryMemRegKey(mem_reg_list[id]);
         desc.lkey.push_back(keys.first);
@@ -174,22 +188,39 @@ Status LocalBufferManager::addBuffer(std::vector<BufferDesc>& desc_list,
                 return addBufferInternal(*desc_ptr, options, true);
             }));
     }
+    Status first_error = Status::OK();
     for (auto& task : tasks) {
         auto status = task.get();
-        if (!status.ok()) return status;
+        if (!status.ok() && first_error.ok()) first_error = status;
     }
-    return Status::OK();
+    if (first_error.ok()) return Status::OK();
+
+    for (auto& desc : desc_list) {
+        auto rollback_status = removeBuffer(desc);
+        if (!rollback_status.ok()) {
+            LOG(WARNING) << "Failed to roll back RDMA buffer registration: "
+                         << rollback_status.ToString();
+        }
+    }
+    return first_error;
 }
 
 Status LocalBufferManager::removeBuffer(BufferDesc& desc) {
     RWSpinlock::WriteGuard guard(lock_);
     AddressRange range((void*)desc.addr, desc.length);
-    auto& item = buffer_list_[range];
+    auto it = buffer_list_.find(range);
+    if (it == buffer_list_.end()) {
+        desc.lkey.clear();
+        desc.rkey.clear();
+        return Status::OK();
+    }
+    auto& item = it->second;
     for (auto& elem : item.mem_reg_map) {
         elem.first->unregisterMemReg(elem.second);
     }
+    desc.lkey.clear();
     desc.rkey.clear();
-    buffer_list_.erase(range);
+    buffer_list_.erase(it);
     return Status::OK();
 }
 

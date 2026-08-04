@@ -149,7 +149,7 @@ inline int selectQpInPool(const std::vector<QpPoolSegment>& segments,
 
 struct WorkerParams {
     int num_workers = 6;  // Derived from RdmaParams::num_lanes.
-    int max_retry_count = 8;
+    int max_retry_count = 9;
     int block_size = 65536;
     uint64_t grace_period_ns = 5000000;  // 5ms
     std::string rail_topo_path;

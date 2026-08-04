@@ -313,13 +313,14 @@ void checkData(int thread_id, void *addr, uint8_t seed) {
 Status initiatorWorker(TransferEngine *engine, SegmentID segment_id,
                        int thread_id, void *addr) {
     bindToSocket(thread_id % NR_SOCKETS);
-    auto segment_desc = engine->getMetadata()->getSegmentDescByID(segment_id);
-    if (!segment_desc) {
-        LOG(ERROR) << "Unable to get target segment ID, please recheck";
+    uint64_t remote_base = 0;
+    auto base_status = engine->getSegmentBufferBase(
+        segment_id, thread_id % buffer_num, remote_base);
+    if (!base_status.ok()) {
+        LOG(ERROR) << "Unable to get target segment buffer, please recheck: "
+                   << base_status.ToString();
         exit(EXIT_FAILURE);
     }
-    uint64_t remote_base =
-        (uint64_t)segment_desc->buffers[thread_id % buffer_num].addr;
 
     size_t batch_count = 0;
     while (running) {
@@ -420,7 +421,7 @@ int initiator() {
         } else {
             LOG(ERROR) << "Unsupported protocol";
         }
-        LOG_ASSERT(xport);
+        if (!engine->isUsingTent()) LOG_ASSERT(xport);
     }
 
     std::vector<void *> addr;
