@@ -1,6 +1,6 @@
 name: 'Build Wheel (ROCm)'
 
-# ROCm/HIP CI parity with the CUDA CI (ci_cu13.yml): build the AMD ROCm wheel
+# ROCm/HIP CI parity with the standard CUDA wheel CI: build the AMD ROCm wheel
 # on PRs so packaging regressions are caught. Runs inside the ROCm dev image so
 # hipcc / HIP headers / hsa-runtime are available; no GPU is needed to compile.
 # On-device transfer tests (test_transfer_on_hip.py) require AMD hardware and
