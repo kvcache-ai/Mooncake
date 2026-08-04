@@ -17,6 +17,13 @@ namespace {
 class FakeHaKvBackend : public HaKvBackend {
    public:
     ErrorCode Get(std::string_view key, std::string& value) override {
+        if (next_get_key_error_ != ErrorCode::OK &&
+            key == next_get_error_key_) {
+            ErrorCode err = next_get_key_error_;
+            next_get_key_error_ = ErrorCode::OK;
+            next_get_error_key_.clear();
+            return err;
+        }
         if (next_get_error_ != ErrorCode::OK) {
             ErrorCode err = next_get_error_;
             next_get_error_ = ErrorCode::OK;
@@ -93,6 +100,10 @@ class FakeHaKvBackend : public HaKvBackend {
         race_value_ = std::move(value);
     }
     void FailNextGet(ErrorCode err) { next_get_error_ = err; }
+    void FailNextGetForKey(std::string key, ErrorCode err) {
+        next_get_error_key_ = std::move(key);
+        next_get_key_error_ = err;
+    }
     void FailNextRange(ErrorCode err) { next_range_error_ = err; }
     void FailNextTxn(ErrorCode err) { next_txn_error_ = err; }
     const std::vector<size_t>& range_limits() const { return range_limits_; }
@@ -104,6 +115,8 @@ class FakeHaKvBackend : public HaKvBackend {
     std::string race_key_;
     std::string race_value_;
     ErrorCode next_get_error_{ErrorCode::OK};
+    std::string next_get_error_key_;
+    ErrorCode next_get_key_error_{ErrorCode::OK};
     ErrorCode next_range_error_{ErrorCode::OK};
     ErrorCode next_txn_error_{ErrorCode::OK};
     std::vector<size_t> range_limits_;
@@ -208,18 +221,21 @@ TEST(OpLogBatchStorageTest, RereadsDurablePrefixWhenCreateIfAbsentLosesRace) {
     FakeHaKvBackend backend;
     backend.CreateBeforeNextTxn(
         "/oplog/clusterA/durable_prefix",
-        EncodeDurablePrefix({.batch_id = 7, .last_seq = 99}));
+        EncodeDurablePrefix({.batch_id = 0, .last_seq = 0}));
     OpLogBatchStorage storage("clusterA", backend);
 
     DurablePrefix prefix;
     EXPECT_EQ(ErrorCode::OK, storage.InitDurablePrefix(prefix));
 
-    EXPECT_EQ(7u, prefix.batch_id);
-    EXPECT_EQ(99u, prefix.last_seq);
+    EXPECT_EQ(0u, prefix.batch_id);
+    EXPECT_EQ(0u, prefix.last_seq);
 }
 
-TEST(OpLogBatchStorageTest, UsesExistingDurablePrefixWithoutReadingLatest) {
+TEST(OpLogBatchStorageTest, ValidatesExistingDurablePrefix) {
     FakeHaKvBackend backend;
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put("/oplog/clusterA/batches/00000000000000000003",
+                          EncodeOpLogBatchRecord(MakeBatch(3, 7, 3))));
     ASSERT_EQ(ErrorCode::OK,
               backend.Put("/oplog/clusterA/durable_prefix",
                           EncodeDurablePrefix({.batch_id = 3, .last_seq = 9})));
@@ -230,6 +246,111 @@ TEST(OpLogBatchStorageTest, UsesExistingDurablePrefixWithoutReadingLatest) {
 
     EXPECT_EQ(3u, prefix.batch_id);
     EXPECT_EQ(9u, prefix.last_seq);
+}
+
+TEST(OpLogBatchStorageTest, RejectsZeroPrefixWithExistingBatch) {
+    FakeHaKvBackend backend;
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put("/oplog/clusterA/durable_prefix",
+                          EncodeDurablePrefix({.batch_id = 0, .last_seq = 0})));
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put("/oplog/clusterA/batches/00000000000000000001",
+                          EncodeOpLogBatchRecord(MakeBatch(1, 1, 1))));
+    OpLogBatchStorage storage("clusterA", backend);
+
+    DurablePrefix prefix;
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, storage.InitDurablePrefix(prefix));
+}
+
+TEST(OpLogBatchStorageTest, RejectsInconsistentDurablePrefixZeroFields) {
+    for (const DurablePrefix stored :
+         {DurablePrefix{.batch_id = 0, .last_seq = 9},
+          DurablePrefix{.batch_id = 3, .last_seq = 0}}) {
+        SCOPED_TRACE("batch_id=" + std::to_string(stored.batch_id) +
+                     " last_seq=" + std::to_string(stored.last_seq));
+        FakeHaKvBackend backend;
+        ASSERT_EQ(ErrorCode::OK, backend.Put("/oplog/clusterA/durable_prefix",
+                                             EncodeDurablePrefix(stored)));
+        OpLogBatchStorage storage("clusterA", backend);
+
+        DurablePrefix prefix;
+        EXPECT_EQ(ErrorCode::INTERNAL_ERROR, storage.InitDurablePrefix(prefix));
+    }
+}
+
+TEST(OpLogBatchStorageTest, RejectsPrefixWithoutTerminalBatch) {
+    FakeHaKvBackend backend;
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put("/oplog/clusterA/durable_prefix",
+                          EncodeDurablePrefix({.batch_id = 3, .last_seq = 9})));
+    OpLogBatchStorage storage("clusterA", backend);
+
+    DurablePrefix prefix;
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, storage.InitDurablePrefix(prefix));
+}
+
+TEST(OpLogBatchStorageTest, RejectsTerminalBatchIdMismatch) {
+    FakeHaKvBackend backend;
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put("/oplog/clusterA/batches/00000000000000000003",
+                          EncodeOpLogBatchRecord(MakeBatch(2, 7, 3))));
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put("/oplog/clusterA/durable_prefix",
+                          EncodeDurablePrefix({.batch_id = 3, .last_seq = 9})));
+    OpLogBatchStorage storage("clusterA", backend);
+
+    DurablePrefix prefix;
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, storage.InitDurablePrefix(prefix));
+}
+
+TEST(OpLogBatchStorageTest, RejectsTerminalBatchLastSequenceMismatch) {
+    FakeHaKvBackend backend;
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put("/oplog/clusterA/batches/00000000000000000003",
+                          EncodeOpLogBatchRecord(MakeBatch(3, 7, 3))));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend.Put("/oplog/clusterA/durable_prefix",
+                    EncodeDurablePrefix({.batch_id = 3, .last_seq = 10})));
+    OpLogBatchStorage storage("clusterA", backend);
+
+    DurablePrefix prefix;
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, storage.InitDurablePrefix(prefix));
+}
+
+TEST(OpLogBatchStorageTest, RejectsCorruptedTerminalBatch) {
+    FakeHaKvBackend backend;
+    std::string encoded = EncodeOpLogBatchRecord(MakeBatch(1, 1, 1));
+    const auto pos =
+        encoded.find_first_of("0123456789", encoded.rfind(',') + 1);
+    ASSERT_NE(std::string::npos, pos);
+    encoded[pos] = encoded[pos] == '0' ? '1' : '0';
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend.Put("/oplog/clusterA/batches/00000000000000000001", encoded));
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put("/oplog/clusterA/durable_prefix",
+                          EncodeDurablePrefix({.batch_id = 1, .last_seq = 1})));
+    OpLogBatchStorage storage("clusterA", backend);
+
+    DurablePrefix prefix;
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, storage.InitDurablePrefix(prefix));
+}
+
+TEST(OpLogBatchStorageTest, RejectsInvalidTerminalBatchSequenceRange) {
+    FakeHaKvBackend backend;
+    auto batch = MakeBatch(1, 1, 1);
+    batch.last_seq = 2;
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put("/oplog/clusterA/batches/00000000000000000001",
+                          EncodeOpLogBatchRecord(batch)));
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put("/oplog/clusterA/durable_prefix",
+                          EncodeDurablePrefix({.batch_id = 1, .last_seq = 2})));
+    OpLogBatchStorage storage("clusterA", backend);
+
+    DurablePrefix prefix;
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, storage.InitDurablePrefix(prefix));
 }
 
 TEST(OpLogBatchStorageTest, WriteBatchAndAdvancePrefixCommitsAtomically) {
@@ -377,6 +498,17 @@ TEST(OpLogBatchStorageTest, ReadBatchRejectsCorruptedRecord) {
     EXPECT_EQ(ErrorCode::INTERNAL_ERROR, storage.ReadBatch(1, out));
 }
 
+TEST(OpLogBatchStorageTest, ReadBatchRejectsMismatchedPayloadBatchId) {
+    FakeHaKvBackend backend;
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put("/oplog/clusterA/batches/00000000000000000001",
+                          EncodeOpLogBatchRecord(MakeBatch(2, 1, 1))));
+    OpLogBatchStorage storage("clusterA", backend);
+
+    OpLogBatchRecord out;
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, storage.ReadBatch(1, out));
+}
+
 TEST(OpLogBatchStorageTest, ReadBatchesAfterReturnsOrderedBatches) {
     FakeHaKvBackend backend;
     ASSERT_EQ(ErrorCode::OK,
@@ -459,6 +591,39 @@ TEST(OpLogBatchStorageTest, ReadBatchesAfterHonorsLimit) {
 TEST(OpLogBatchStorageBackendErrorTest, PropagatesReadDurablePrefixError) {
     FakeHaKvBackend backend;
     backend.FailNextGet(ErrorCode::ETCD_OPERATION_ERROR);
+    OpLogBatchStorage storage("clusterA", backend);
+
+    DurablePrefix prefix;
+    EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR,
+              storage.InitDurablePrefix(prefix));
+}
+
+TEST(OpLogBatchStorageBackendErrorTest,
+     PropagatesZeroPrefixValidationRangeError) {
+    FakeHaKvBackend backend;
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put("/oplog/clusterA/durable_prefix",
+                          EncodeDurablePrefix({.batch_id = 0, .last_seq = 0})));
+    backend.FailNextRange(ErrorCode::ETCD_OPERATION_ERROR);
+    OpLogBatchStorage storage("clusterA", backend);
+
+    DurablePrefix prefix;
+    EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR,
+              storage.InitDurablePrefix(prefix));
+}
+
+TEST(OpLogBatchStorageBackendErrorTest,
+     PropagatesTerminalBatchReadErrorAtStartup) {
+    FakeHaKvBackend backend;
+    const std::string batch_key =
+        "/oplog/clusterA/batches/00000000000000000001";
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend.Put(batch_key, EncodeOpLogBatchRecord(MakeBatch(1, 1, 1))));
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put("/oplog/clusterA/durable_prefix",
+                          EncodeDurablePrefix({.batch_id = 1, .last_seq = 1})));
+    backend.FailNextGetForKey(batch_key, ErrorCode::ETCD_OPERATION_ERROR);
     OpLogBatchStorage storage("clusterA", backend);
 
     DurablePrefix prefix;
