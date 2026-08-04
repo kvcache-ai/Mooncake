@@ -126,8 +126,7 @@ std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(
     void* buffer = nullptr;
     try {
         // Allocate memory using CacheLib.
-        size_t padding_size =
-            std::max(size, static_cast<size_t>(kMinSliceSize));
+        size_t padding_size = std::max<size_t>(size, kMinSliceSize);
         buffer = memory_allocator_->allocate(pool_id_, padding_size);
         if (!buffer) {
             VLOG(1) << "allocation_failed size=" << size
@@ -398,8 +397,7 @@ void* SimpleAllocator::allocate(size_t size) {
     }
 
     try {
-        size_t padding_size =
-            std::max(size, static_cast<size_t>(kMinSliceSize));
+        size_t padding_size = std::max<size_t>(size, kMinSliceSize);
         void* ptr = memory_allocator_->allocate(pool_id_, padding_size);
         if (!ptr) {
             // This allocator is used in client side. Though the failure will
