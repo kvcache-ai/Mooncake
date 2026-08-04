@@ -286,6 +286,10 @@ void OrderedOpLogWriter::Start() {
                 batch.entries.push_back(std::move(entry.entry));
             }
 
+            constexpr auto kInitialRetryDelay = std::chrono::milliseconds(1);
+            constexpr auto kMaxRetryDelay = std::chrono::milliseconds(1000);
+            auto retry_delay = kInitialRetryDelay;
+
             while (true) {
                 TestFailPoint::Wait("batch_before_txn");
 #ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
@@ -348,17 +352,20 @@ void OrderedOpLogWriter::Start() {
                 }
 
                 {
-                    std::lock_guard<std::mutex> lock(impl_->mutex);
+                    std::unique_lock<std::mutex> lock(impl_->mutex);
 #ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
                     HAMetricManager::instance().inc_batch_record_retries();
 #endif
                     impl_->last_error = err;
                     impl_->accepting = false;
-                    if (impl_->stop_requested) {
+                    if (impl_->stop_requested ||
+                        impl_->cv.wait_for(lock, retry_delay, [this] {
+                            return impl_->stop_requested;
+                        })) {
                         return;
                     }
                 }
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                retry_delay = std::min(retry_delay * 2, kMaxRetryDelay);
             }
         }
     });
