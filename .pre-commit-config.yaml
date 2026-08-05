@@ -1,6 +1,7 @@
 # Pre-commit hooks configuration for Mooncake
 # Install: pip install -r requirements-dev.txt && pre-commit install
-# Run manually: pre-commit run --all-files
+# Run manually on all files: pre-commit run --all-files
+# Format all C/C++ files explicitly: ./scripts/code_format.sh --all
 # Note: clang-format should already be available (installed via system packages or dependencies.sh)
 # Exclusions: build artifacts, vendored extern code, generated wheels.
 
@@ -9,6 +10,9 @@ minimum_pre_commit_version: '3.6.0'
 ci:
   autofix_prs: true
   autoupdate_commit_msg: 'chore: pre-commit autoupdate'
+  # Needs Cargo + libclang, which the hosted pre-commit.ci image lacks;
+  # GitHub Actions is the authoritative check for this hook.
+  skip: [store-rust-dlopen-bindings]
 
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
@@ -26,12 +30,21 @@ repos:
   - repo: local
     hooks:
       - id: mooncake-code-format
-        name: Run Mooncake code format script
-        entry: ./scripts/code_format.sh
+        name: Format staged C/C++ changes
+        entry: ./scripts/code_format.sh --staged
+        language: system
+        files: '\.(c|cc|cpp|cxx|cu|cuh|h|hpp)$'
+        exclude: '^(extern/|build/|.*/build/|FAST25-release/|.*cachelib_memory_allocator/|.*/thirdparty/.*)'
+        require_serial: true
+      # Regenerate the committed dlopen bindings when store_c.h or the generator
+      # inputs change; a resulting diff fails the commit so they can't go stale.
+      - id: store-rust-dlopen-bindings
+        name: Regenerate Mooncake Store Rust dlopen bindings
+        entry: cargo run --locked --manifest-path mooncake-store/rust/Cargo.toml --example generate_dlopen_bindings
         language: system
         pass_filenames: false
-        always_run: true
         require_serial: true
+        files: '^(mooncake-store/include/store_c\.h|mooncake-store/rust/(Cargo\.(toml|lock)|examples/generate_dlopen_bindings\.rs|src/generated/ffi_dlopen_bindings\.rs))$'
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.6.9
@@ -48,13 +61,6 @@ repos:
       - id: codespell
         exclude: '^(extern/|FAST25-release/)'
         args: ['--ignore-words-list=te,mooncake,KVCache,cann,hsa']
-
-  - repo: https://github.com/pre-commit/mirrors-clang-format
-    rev: v20.1.8
-    hooks:
-      - id: clang-format
-        files: '\.(c|cc|cpp|cxx|h|hpp)$'
-        exclude: '^(extern/|build/|.*/build/|FAST25-release/|.*/thirdparty/.*)'
 
   - repo: https://github.com/cheshirekow/cmake-format-precommit
     rev: v0.6.13

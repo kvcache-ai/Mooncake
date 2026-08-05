@@ -3,7 +3,11 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <cstdlib>
+#include <string>
+#include <unordered_map>
 
+#include "config.h"
+#include "cuda_alike.h"
 #include "transfer_metadata.h"
 #include "memory_location.h"
 
@@ -153,6 +157,38 @@ TEST(ToplogyTest, TestDisableDeviceRemovesLocalHcaAffinityCandidate) {
     ASSERT_EQ(topology.disableDevice("mlx5_2"), 0);
     ASSERT_NE(topology.selectDeviceByLocalHca("cpu:0", "mlx5_2", 0),
               disabled_index);
+}
+
+// HCA peer affinity must key off GPU_PREFIX (cuda:/hip:/...), not a
+// hardcoded "cuda:" string — otherwise USE_HIP builds never resolve affinity
+// for discovered hip:N topology entries.
+TEST(ToplogyTest, HcaPeerAffinityAppliesToGpuPrefixEntries) {
+    auto &cfg = mooncake::globalConfig();
+    const bool old_enable = cfg.enable_hca_peer_affinity;
+    const auto old_map = cfg.nic_peer_affinity;
+    cfg.enable_hca_peer_affinity = true;
+    cfg.nic_peer_affinity = {{"L", {"P0"}}};
+
+    const std::string gpu_loc = GPU_PREFIX + "0";
+    const std::string json_str = "{\"" + gpu_loc + "\" : [[\"P0\",\"P1\"],[]]}";
+
+    mooncake::Topology topology;
+    ASSERT_EQ(topology.parse(json_str), 0);
+    ASSERT_EQ(topology.getHcaList().size(), static_cast<size_t>(2));
+    ASSERT_EQ(topology.getHcaList()[0], "P0");
+
+    std::unordered_map<int, int> hist;
+    for (int i = 0; i < 64; ++i) {
+        int id = topology.selectDeviceByLocalHca(gpu_loc, "L", 0);
+        hist[id]++;
+    }
+
+    cfg.enable_hca_peer_affinity = old_enable;
+    cfg.nic_peer_affinity = old_map;
+
+    ASSERT_EQ(hist.size(), static_cast<size_t>(1));
+    EXPECT_EQ(hist[0], 64) << "peer affinity should pin " << gpu_loc
+                           << " to P0 for local HCA L";
 }
 
 int main(int argc, char **argv) {

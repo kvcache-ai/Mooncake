@@ -168,7 +168,14 @@ bool ConfigHelper::parseBool(const std::string& str, bool default_value) {
 
 int ConfigHelper::parseInt(const std::string& str, int default_value) {
     try {
-        return std::stoi(str);
+        size_t parsed = 0;
+        int value = std::stoi(str, &parsed);
+        if (parsed != str.size()) {
+            LOG(WARNING) << "Invalid integer value '" << str
+                         << "', using default: " << default_value;
+            return default_value;
+        }
+        return value;
     } catch (const std::exception& e) {
         LOG(WARNING) << "Failed to parse integer '" << str << "': " << e.what()
                      << ", using default: " << default_value;
@@ -179,7 +186,13 @@ int ConfigHelper::parseInt(const std::string& str, int default_value) {
 uint16_t ConfigHelper::parsePort(const std::string& str,
                                  uint16_t default_value) {
     try {
-        int port = std::stoi(str);
+        size_t parsed = 0;
+        int port = std::stoi(str, &parsed);
+        if (parsed != str.size()) {
+            LOG(WARNING) << "Invalid port value '" << str
+                         << "', using default: " << default_value;
+            return default_value;
+        }
         if (port > 0 && port <= 65535) {
             return static_cast<uint16_t>(port);
         } else {

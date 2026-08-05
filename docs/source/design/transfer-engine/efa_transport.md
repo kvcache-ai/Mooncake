@@ -37,15 +37,20 @@ This installs all system packages, git submodules (including pybind11 and yalant
 
 ## Installing from PyPI (recommended)
 
-Pre-built EFA wheels are published to PyPI by the official release pipeline, so most users do not need to build from source. The EFA transport's memory path is CUDA-aware, so two variants are published:
+Pre-built EFA wheels are published to PyPI by the official release pipeline, so most users do not need to build from source. The EFA transport's memory path is CUDA-aware, so separate CUDA 12, CUDA 13, and non-CUDA variants are published:
 
 ```bash
-# GPU memory transfers (e.g., KV cache in vLLM) — built with USE_CUDA=ON
+# GPU memory transfers with CUDA 12 — built with USE_CUDA=ON
 pip install mooncake-transfer-engine-efa
+
+# GPU memory transfers with CUDA 13 — built with USE_CUDA=ON
+pip install mooncake-transfer-engine-efa-cuda13
 
 # CPU/DRAM-only transfers — built with USE_CUDA=OFF
 pip install mooncake-transfer-engine-efa-non-cuda
 ```
+
+The CUDA 13 wheel requires an NVIDIA 580-series or newer driver, following the [CUDA compatibility requirements](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html).
 
 > **Note:** These wheels deliberately do **not** bundle `libfabric`/`libefa` (see the runtime note in [Building a Distributable Wheel](#efa-distributable-wheel)). They resolve to the system AWS EFA installation at runtime, so the EFA driver and libfabric from the [Prerequisites](#efa-prerequisites-driver) must still be present on the instance. Make sure `/opt/amazon/efa/lib` is on `LD_LIBRARY_PATH`.
 
@@ -108,17 +113,20 @@ PYTHON_VERSION=3.13 BUILD_DIR=build bash scripts/build_wheel.sh 3.13 dist
 pip install dist/mooncake_transfer_engine-*.whl
 ```
 
-To produce a wheel whose package name matches the published variants (`mooncake-transfer-engine-efa` / `-efa-non-cuda`), set the corresponding build-variant environment variable — this is exactly what the release pipeline does:
+To produce a wheel whose package name matches one of the published variants, set the corresponding build-variant environment variable — this is exactly what the release pipeline does:
 
 ```bash
 # GPU build (cmake was configured with USE_CUDA=ON):
 EFA_BUILD=1 PYTHON_VERSION=3.13 BUILD_DIR=build bash scripts/build_wheel.sh 3.13 dist
 
+# CUDA 13 GPU build (cmake was configured with CUDA 13 and USE_CUDA=ON):
+EFA_CU13_BUILD=1 PYTHON_VERSION=3.13 BUILD_DIR=build bash scripts/build_wheel.sh 3.13 dist
+
 # CPU build (cmake was configured with USE_CUDA=OFF):
 EFA_NON_CUDA_BUILD=1 PYTHON_VERSION=3.13 BUILD_DIR=build bash scripts/build_wheel.sh 3.13 dist
 ```
 
-> **CI/CD:** EFA wheels are built and published automatically — see `.github/workflows/ci_efa.yml` (per-PR build validation) and `.github/workflows/release-efa.yaml` (tagged release to GitHub Release + PyPI). No EFA hardware is required to *build* the wheel: only the libfabric headers/library are needed to compile and link, which the CI runner obtains from the distro `libfabric-dev` package.
+> **CI/CD:** EFA wheels are built and published automatically — see `.github/workflows/ci_efa.yml` (per-PR build validation), `.github/workflows/release-efa.yaml` (CUDA 12 release), `.github/workflows/release-efa-cuda13.yaml` (CUDA 13 release), and `.github/workflows/release-efa-non-cuda.yaml` (non-CUDA release). No EFA hardware is required to *build* the wheel: only the libfabric headers/library are needed to compile and link, which the CI runner obtains from the distro `libfabric-dev` package.
 
 > **Important (EFA builds):** `auditwheel repair` excludes `libfabric` and `libefa` from the wheel so they resolve to the system EFA installation (`/opt/amazon/efa/lib`) at runtime. This is required because the in-process `aws-ofi-nccl` plugin (loaded by NCCL) links the **same** system `libfabric`. If the wheel bundled its own copy, the process would load two independent libfabric instances — Mooncake's bundled one and NCCL's system one — and whichever initializes first claims the EFA device, leaving the other with an empty provider list (`fi_getinfo: provider efa output empty list`). NCCL then silently falls back to the TCP provider and cross-node collectives such as `all_gather_object` hang. Excluding libfabric/libefa (see `scripts/build_wheel.sh`) keeps a single shared libfabric in the process. If you are on an older Mooncake build whose wheel still bundles libfabric, force the system copy with `export LD_PRELOAD=/opt/amazon/efa/lib/libfabric.so.1` as a workaround.
 
@@ -136,6 +144,13 @@ print(f'Initialize result: {result}')  # Should be 0
 # You should see logs like:
 # EFA device (libfabric): rdmap79s0, domain: rdmap79s0-rdm, fabric: efa, provider: efa
 ```
+
+Mooncake Store also auto-discovers topology when `protocol="efa"` and no
+device names are supplied. The Store passes the requested protocol to the
+Transfer Engine, which uses its normal topology discovery and installs the EFA
+transport instead of RDMA. Use `MC_MS_FILTERS` to restrict discovery to a
+comma-separated device whitelist. To disable discovery, set
+`MC_MS_AUTO_DISC=0` and provide device names explicitly.
 
 ## Unit Tests
 

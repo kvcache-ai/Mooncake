@@ -1,7 +1,7 @@
 name: _build-wheel
 
-# Shared build for one wheel variant (matrixed over Python version), used by the
-# Release and Pre-Release workflows so both build identically.
+# Shared build for one wheel variant (matrixed over Python version), used by CI,
+# Release, and Pre-Release so validation and publication build identically.
 
 on:
   workflow_call:
@@ -31,9 +31,6 @@ on:
       ep-torch-versions:
         type: string
         default: ''
-      build-with-ep:
-        type: string
-        default: '0'
       variant-flag:
         # build_wheel.sh variant set to 1, e.g. CU13_BUILD, NON_CUDA_BUILD
         type: string
@@ -47,6 +44,11 @@ on:
       artifact-prefix:
         type: string
         required: true
+      version-override:
+        # Optional: override the wheel version instead of deriving from git tag.
+        # Used by nightly builds to stamp date-based dev versions.
+        type: string
+        default: ''
 
 env:
   SCCACHE_GHA_ENABLED: "true"
@@ -61,7 +63,6 @@ jobs:
       matrix:
         python-version: ${{ fromJSON(inputs.python-versions) }}
     env:
-      BUILD_WITH_EP: ${{ inputs.build-with-ep }}
       TORCH_CUDA_ARCH_LIST: ${{ inputs.torch-cuda-arch-list }}
       CMAKE_ARGS: ${{ inputs.cmake-args }}
       CMAKE_GEN: ${{ inputs.cmake-generator }}
@@ -75,8 +76,19 @@ jobs:
         if: ${{ inputs.container != '' }}
         run: git config --global --add safe.directory '*'
 
-      - name: Set version from tag
-        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+      - name: Set version
+        run: |
+          if [ -n "${{ inputs.version-override }}" ]; then
+            echo "VERSION=${{ inputs.version-override }}" >> "$GITHUB_ENV"
+          else
+            echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Patch wheel version in pyproject.toml
+        if: ${{ inputs.version-override != '' }}
+        run: |
+          sed -i "s/^version = .*/version = \"$VERSION\"/" mooncake-wheel/pyproject.toml
+          echo "Patched mooncake-wheel/pyproject.toml version to: $VERSION"
 
       - name: Select Python ${{ matrix.python-version }} from manylinux image
         if: ${{ inputs.container != '' }}
@@ -177,6 +189,53 @@ jobs:
             ./scripts/build_wheel.sh
         env:
           VERSION: ${{ env.VERSION }}
+
+      - name: Smoke test repaired wheel
+        run: |
+          smoke_venv=$(mktemp -d)
+          python -m venv "$smoke_venv"
+          "$smoke_venv/bin/python" -m pip install --no-deps \
+            mooncake-wheel/dist-py${{ steps.pytag.outputs.tag }}/*.whl
+
+          if [ "${VARIANT_FLAG:-}" = "NON_CUDA_BUILD" ]; then
+            site_packages=$("$smoke_venv/bin/python" -c \
+              'import sysconfig; print(sysconfig.get_paths()["purelib"])')
+            master="$site_packages/mooncake/mooncake_master"
+            if readelf -d "$master" | grep -Eq \
+              'Shared library: \[(libcuda|libcudart)\.so'; then
+              echo "Non-CUDA mooncake_master depends on CUDA"
+              readelf -d "$master" | grep 'Shared library:'
+              exit 1
+            fi
+          fi
+
+          export LD_LIBRARY_PATH="/usr/local/lib:${LD_LIBRARY_PATH:-}"
+          for dir in /usr/local/cuda/lib64 \
+                     /usr/local/cuda/lib64/stubs \
+                     /usr/local/cuda/targets/*/lib \
+                     /usr/local/cuda/targets/*/lib/stubs; do
+            [ -d "$dir" ] && export LD_LIBRARY_PATH="$dir:$LD_LIBRARY_PATH"
+          done
+
+          # CUDA builder images contain the link-time driver stub but not the
+          # real libcuda.so.1 supplied by an NVIDIA driver. Non-CUDA wheels must
+          # not receive this alias, so an accidental CUDA dependency still fails.
+          if [ "${VARIANT_FLAG:-}" != "NON_CUDA_BUILD" ]; then
+            cuda_stub=
+            for candidate in /usr/local/cuda/lib64/stubs/libcuda.so \
+                             /usr/local/cuda/targets/*/lib/stubs/libcuda.so; do
+              if [ -f "$candidate" ]; then
+                cuda_stub="$candidate"
+                break
+              fi
+            done
+            if [ -n "$cuda_stub" ]; then
+              ln -s "$cuda_stub" "$smoke_venv/libcuda.so.1"
+              export LD_LIBRARY_PATH="$smoke_venv:$LD_LIBRARY_PATH"
+            fi
+          fi
+
+          "$smoke_venv/bin/mooncake_master" --version
 
       - name: Upload Python wheel artifact
         uses: actions/upload-artifact@v4

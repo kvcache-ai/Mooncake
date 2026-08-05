@@ -32,6 +32,12 @@ cp mooncake-integration/fabric_allocator_utils.py mooncake-wheel/mooncake/fabric
 # Copy engine.so to mooncake directory (will be imported by transfer module)
 cp ${BUILD_DIR}/mooncake-integration/engine.*.so mooncake-wheel/mooncake/engine.so
 
+# Copy the host-only PG core to mooncake directory
+if [ -f "${BUILD_DIR}/mooncake-pg/src/libmooncake_pg.so" ]; then
+    echo "Copying libmooncake_pg.so..."
+    cp "${BUILD_DIR}/mooncake-pg/src/libmooncake_pg.so" mooncake-wheel/mooncake/libmooncake_pg.so
+fi
+
 # Copy libasio.so to mooncake directory (runtime dependency of engine.so)
 cp ${BUILD_DIR}/mooncake-common/libasio.so mooncake-wheel/mooncake/libasio.so
 
@@ -177,7 +183,7 @@ cleanup_wheel_metadata_state() {
 }
 trap cleanup_wheel_metadata_state EXIT
 
-BUILD_VARIANTS="NON_CUDA_BUILD CU13_BUILD NPU_BUILD EFA_BUILD EFA_NON_CUDA_BUILD MUSA_BUILD"
+BUILD_VARIANTS="NON_CUDA_BUILD CU13_BUILD NPU_BUILD EFA_BUILD EFA_CU13_BUILD EFA_NON_CUDA_BUILD MUSA_BUILD HIP_BUILD"
 BUILD_VARIANT_COUNT=0
 for build_variant in $BUILD_VARIANTS; do
     if [ "${!build_variant}" = "1" ]; then
@@ -239,6 +245,15 @@ elif [ "$EFA_BUILD" = "1" ]; then
     sed -i 's/^description = "\(.*\)"$/description = "\1 (AWS EFA, CUDA version)"/' pyproject.toml
     sed -i 's/^keywords = \[\(.*\)\]$/keywords = [\1, "aws", "efa", "libfabric", "cuda"]/' pyproject.toml
     echo "Package name modified to: mooncake-transfer-engine-efa"
+elif [ "$EFA_CU13_BUILD" = "1" ]; then
+    echo "Modifying package name for AWS EFA build (CUDA 13)"
+    # Backup original pyproject.toml
+    cp pyproject.toml pyproject.toml.backup
+    # Replace package name and description
+    sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-efa-cuda13"/' pyproject.toml
+    sed -i 's/^description = "\(.*\)"$/description = "\1 (AWS EFA, CUDA 13 version)"/' pyproject.toml
+    sed -i 's/^keywords = \[\(.*\)\]$/keywords = [\1, "aws", "efa", "libfabric", "cuda13"]/' pyproject.toml
+    echo "Package name modified to: mooncake-transfer-engine-efa-cuda13"
 elif [ "$EFA_NON_CUDA_BUILD" = "1" ]; then
     echo "Modifying package name for AWS EFA build (non-CUDA)"
     # Backup original pyproject.toml
@@ -261,6 +276,16 @@ elif [ "$MUSA_BUILD" = "1" ]; then
     sed -i 's|"Environment :: GPU :: NVIDIA CUDA"|"Environment :: GPU"|' pyproject.toml
     sed -i 's|"Programming Language :: Python :: 3.10"|"Programming Language :: Python :: 3.9", "Programming Language :: Python :: 3.10"|' pyproject.toml
     echo "Package name modified to: mooncake-transfer-engine-musa"
+elif [ "$HIP_BUILD" = "1" ]; then
+    echo "Modifying package name for AMD ROCm/HIP build"
+    # Backup original pyproject.toml
+    cp pyproject.toml pyproject.toml.backup
+    # Replace package name and description
+    sed -i 's/name = "mooncake-transfer-engine"/name = "mooncake-transfer-engine-rocm"/' pyproject.toml
+    sed -i 's/^description = "\(.*\)"$/description = "\1 (AMD ROCm version)"/' pyproject.toml
+    sed -i 's/^keywords = \[\(.*\)\]$/keywords = [\1, "rocm", "amd", "hip"]/' pyproject.toml
+    sed -i 's|"Environment :: GPU :: NVIDIA CUDA"|"Environment :: GPU"|' pyproject.toml
+    echo "Package name modified to: mooncake-transfer-engine-rocm"
 else
     echo "Using standard package name: mooncake-transfer-engine"
 fi
@@ -411,6 +436,7 @@ ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude libffi.so* \
     --exclude libcuda.so* \
     --exclude libcudart.so* \
+    --exclude libmooncake_pg_device.so* \
     --exclude libmusa.so* \
     --exclude libmusart.so* \
     --exclude libamdhip64.so* \

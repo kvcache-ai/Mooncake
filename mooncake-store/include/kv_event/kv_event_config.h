@@ -19,7 +19,8 @@ struct KvEventConfig {
     bool emit_legacy_compat_fields{true};
     // Emit Mooncake object_key for consumers that match on store key format.
     bool emit_object_key{true};
-    // Max pending events in the async publisher queue; oldest dropped when full.
+    // Max pending events in the async publisher queue; oldest dropped when
+    // full.
     uint32_t queue_capacity{65536};
 
     // Deprecated: not stamped on events. Indexer registration supplies model,

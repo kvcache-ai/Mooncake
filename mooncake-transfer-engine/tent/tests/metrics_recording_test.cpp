@@ -34,6 +34,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <vector>
@@ -102,11 +103,30 @@ class MetricsSnapshot {
    public:
     explicit MetricsSnapshot(TentMetrics& m) {
         std::string body = m.getJsonMetrics();
+        prometheus_ = m.getPrometheusMetrics();
         try {
             json_ = nlohmann::json::parse(body);
         } catch (...) {
             json_ = nlohmann::json::object();
         }
+    }
+
+    // Exact Prometheus series value (0 if absent). `series` includes its full
+    // label set, for example:
+    // tent_transport_attempts_total{transport="rdma",operation="write"}
+    double series(const std::string& series) const {
+        std::istringstream input(prometheus_);
+        std::string line;
+        const std::string prefix = series + " ";
+        while (std::getline(input, line)) {
+            if (line.rfind(prefix, 0) != 0) continue;
+            try {
+                return std::stod(line.substr(prefix.size()));
+            } catch (...) {
+                return 0.0;
+            }
+        }
+        return 0.0;
     }
 
     // Counter value (0 if absent).
@@ -150,6 +170,7 @@ class MetricsSnapshot {
 
    private:
     nlohmann::json json_;
+    std::string prometheus_;
 };
 
 // ---------------------------------------------------------------------------
@@ -167,8 +188,11 @@ class FakeSubBatch : public Transport::SubBatch {
 
 class FakeTransport : public Transport {
    public:
-    explicit FakeTransport(TransportType self_type, bool force_fail = false)
-        : self_type_(self_type), force_fail_(force_fail) {
+    explicit FakeTransport(TransportType self_type, bool force_fail = false,
+                           bool force_submit_fail = false)
+        : self_type_(self_type),
+          force_fail_(force_fail),
+          force_submit_fail_(force_submit_fail) {
         caps.dram_to_dram = true;
     }
     std::atomic<int> submit_calls{0};
@@ -193,6 +217,12 @@ class FakeTransport : public Transport {
     Status submitTransferTasks(SubBatchRef batch,
                                const std::vector<Request>& requests) override {
         ++submit_calls;
+        // Synchronous submit failure: report the error without enqueuing any
+        // physical task, exercising the engine's !status.ok() attempt-failure
+        // branches (commitPreparedSubmit / resubmitTransferTask / ...).
+        if (force_submit_fail_) {
+            return Status::InternalError("forced submit failure" LOC_MARK);
+        }
         auto* fake = static_cast<FakeSubBatch*>(batch);
         for (const auto& request : requests) {
             fake->requests.push_back(request);
@@ -251,6 +281,7 @@ class FakeTransport : public Transport {
    private:
     TransportType self_type_;
     bool force_fail_;
+    bool force_submit_fail_;
 };
 
 std::shared_ptr<Config> makeMetricsTestConfig() {
@@ -278,6 +309,13 @@ void installFakeRdma(TransferEngineImpl& engine,
     std::string seg_name = engine.getSegmentName();
     ASSERT_TRUE(fake->install(seg_name, nullptr, nullptr, nullptr).ok());
     engine.swapTransportForTest(RDMA, fake);
+}
+
+void installFakeTcp(TransferEngineImpl& engine,
+                    const std::shared_ptr<FakeTransport>& fake) {
+    std::string seg_name = engine.getSegmentName();
+    ASSERT_TRUE(fake->install(seg_name, nullptr, nullptr, nullptr).ok());
+    engine.swapTransportForTest(TCP, fake);
 }
 
 Request makeLocalWrite(uint8_t* ptr, size_t length, uint64_t deadline_ns = 0) {
@@ -367,6 +405,218 @@ TEST_F(MetricsRecordingTest, CompletedTransferRecordsBytesAndLatency) {
     EXPECT_EQ(after.histogramCount("tent_write_size_bytes") -
                   before.histogramCount("tent_write_size_bytes"),
               1);
+    EXPECT_EQ(after.counter("tent_transport_attempts_total") -
+                  before.counter("tent_transport_attempts_total"),
+              1);
+    EXPECT_EQ(after.counter("tent_transport_attempt_failures_total") -
+                  before.counter("tent_transport_attempt_failures_total"),
+              0);
+    EXPECT_EQ(after.histogramCount("tent_transport_attempt_latency_us") -
+                  before.histogramCount("tent_transport_attempt_latency_us"),
+              1);
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
+}
+
+// ---------------------------------------------------------------------------
+// A recovered RDMA->TCP failover closes the failed RDMA physical attempt and
+// opens a distinct TCP attempt. Logical request metrics remain final-transport
+// compatible, while attempt metrics expose RDMA reliability and per-attempt
+// latency without charging the RDMA/failover interval to TCP stage latency.
+// ---------------------------------------------------------------------------
+TEST_F(MetricsRecordingTest, RecoveredFailoverRecordsDistinctAttempts) {
+    auto cfg = makeMetricsTestConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma = std::make_shared<FakeTransport>(RDMA, /*force_fail=*/true);
+    auto fake_tcp = std::make_shared<FakeTransport>(TCP);
+    installFakeRdma(engine, fake_rdma);
+    installFakeTcp(engine, fake_tcp);
+
+    constexpr size_t kLen = 4096;
+    std::vector<uint8_t> buf(kLen, 0xBC);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), buf.size()).ok());
+
+    BatchID batch = engine.allocateBatch(4);
+    ASSERT_NE(batch, (BatchID)0);
+
+    auto before = MetricsSnapshot(TentMetrics::instance());
+    ASSERT_TRUE(
+        engine.submitTransfer(batch, {makeLocalWrite(buf.data(), kLen)}).ok());
+    ASSERT_EQ(pollUntilTerminal(engine, batch, 0),
+              TransferStatusEnum::COMPLETED);
+    auto after = MetricsSnapshot(TentMetrics::instance());
+
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
+    EXPECT_EQ(fake_tcp->submit_calls.load(), 1);
+
+    EXPECT_EQ(after.counter("tent_transport_attempts_total") -
+                  before.counter("tent_transport_attempts_total"),
+              2);
+    EXPECT_EQ(after.counter("tent_transport_attempt_failures_total") -
+                  before.counter("tent_transport_attempt_failures_total"),
+              1);
+    EXPECT_EQ(after.histogramCount("tent_transport_attempt_latency_us") -
+                  before.histogramCount("tent_transport_attempt_latency_us"),
+              2);
+
+    const std::string rdma_attempts =
+        "tent_transport_attempts_total{transport=\"rdma\",operation=\"write\"}";
+    const std::string tcp_attempts =
+        "tent_transport_attempts_total{transport=\"tcp\",operation=\"write\"}";
+    const std::string rdma_failures =
+        "tent_transport_attempt_failures_total{transport=\"rdma\",operation="
+        "\"write\"}";
+    EXPECT_EQ(after.series(rdma_attempts) - before.series(rdma_attempts), 1);
+    EXPECT_EQ(after.series(tcp_attempts) - before.series(tcp_attempts), 1);
+    EXPECT_EQ(after.series(rdma_failures) - before.series(rdma_failures), 1);
+
+    // Logical compatibility: the recovered request completes once and does not
+    // become a terminal request failure.
+    EXPECT_EQ(after.counter("tent_write_requests_total") -
+                  before.counter("tent_write_requests_total"),
+              1);
+    EXPECT_EQ(after.counter("tent_write_failures_total") -
+                  before.counter("tent_write_failures_total"),
+              0);
+
+    // Backward-compatible stage decomposition: the causal-chain stage metrics
+    // remain attributed to the final transport (tcp) and measure the full
+    // request span, exactly as before this change. The per-attempt truth
+    // (which transport actually failed, and each attempt's latency) lives in
+    // the additive tent_transport_attempt_* metrics asserted above.
+    const std::string tcp_dispatch_count =
+        "tent_stage_dispatch_us_count{transport=\"tcp\"}";
+    const std::string tcp_transport_count =
+        "tent_stage_transport_us_count{transport=\"tcp\"}";
+    // Direct submissions have exactly zero queue wait. YLT omits dynamic
+    // histogram label series whose sample sum is zero from Prometheus output,
+    // but the JSON aggregate still preserves the observation count.
+    EXPECT_EQ(after.histogramCount("tent_stage_queue_wait_us") -
+                  before.histogramCount("tent_stage_queue_wait_us"),
+              1);
+    EXPECT_EQ(
+        after.series(tcp_dispatch_count) - before.series(tcp_dispatch_count),
+        1);
+    EXPECT_EQ(
+        after.series(tcp_transport_count) - before.series(tcp_transport_count),
+        1);
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
+}
+
+// ---------------------------------------------------------------------------
+// A synchronous submit failure on the direct path (submitTransferTasks returns
+// non-ok) is closed as a failed physical attempt. The attempt-started counter
+// still increments (the engine committed to the attempt before submitting),
+// the attempt-failure counter increments, and the logical request terminates
+// as a failure. This exercises the commitPreparedSubmit !status.ok() branch,
+// which FakeTransport could not reach before force_submit_fail existed.
+// ---------------------------------------------------------------------------
+TEST_F(MetricsRecordingTest, SynchronousSubmitFailureRecordsFailedAttempt) {
+    auto cfg = makeMetricsTestConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma = std::make_shared<FakeTransport>(
+        RDMA, /*force_fail=*/false, /*force_submit_fail=*/true);
+    installFakeRdma(engine, fake_rdma);
+
+    constexpr size_t kLen = 4096;
+    std::vector<uint8_t> buf(kLen, 0xCD);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), buf.size()).ok());
+
+    BatchID batch = engine.allocateBatch(4);
+    ASSERT_NE(batch, (BatchID)0);
+
+    auto before = MetricsSnapshot(TentMetrics::instance());
+    ASSERT_TRUE(
+        engine.submitTransfer(batch, {makeLocalWrite(buf.data(), kLen)}).ok());
+    ASSERT_EQ(pollUntilTerminal(engine, batch, 0), TransferStatusEnum::FAILED);
+    auto after = MetricsSnapshot(TentMetrics::instance());
+
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
+
+    // One RDMA attempt was started and failed synchronously; no bytes moved.
+    EXPECT_EQ(after.counter("tent_transport_attempts_total") -
+                  before.counter("tent_transport_attempts_total"),
+              1);
+    EXPECT_EQ(after.counter("tent_transport_attempt_failures_total") -
+                  before.counter("tent_transport_attempt_failures_total"),
+              1);
+    EXPECT_EQ(after.histogramCount("tent_transport_attempt_latency_us") -
+                  before.histogramCount("tent_transport_attempt_latency_us"),
+              1);
+    const std::string rdma_attempt_failures =
+        "tent_transport_attempt_failures_total{transport=\"rdma\",operation="
+        "\"write\"}";
+    EXPECT_EQ(after.series(rdma_attempt_failures) -
+                  before.series(rdma_attempt_failures),
+              1);
+
+    // Logical request records exactly one terminal failure, no double counting
+    // from recordTaskCompletionMetrics closing an already-finished attempt.
+    EXPECT_EQ(after.counter("tent_write_requests_total") -
+                  before.counter("tent_write_requests_total"),
+              1);
+
+    EXPECT_TRUE(engine.freeBatch(batch).ok());
+    EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
+}
+
+// ---------------------------------------------------------------------------
+// When the failover target also fails synchronously, both the original async
+// failure and the resubmit's synchronous failure are recorded as distinct
+// failed attempts. This exercises the resubmitTransferTask !status.ok() branch.
+// ---------------------------------------------------------------------------
+TEST_F(MetricsRecordingTest, FailoverResubmitSyncFailureRecordsBothAttempts) {
+    auto cfg = makeMetricsTestConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    // RDMA fails asynchronously (poll returns FAILED), triggering failover to
+    // TCP, whose submitTransferTasks then fails synchronously.
+    auto fake_rdma = std::make_shared<FakeTransport>(RDMA, /*force_fail=*/true);
+    auto fake_tcp = std::make_shared<FakeTransport>(TCP, /*force_fail=*/false,
+                                                    /*force_submit_fail=*/true);
+    installFakeRdma(engine, fake_rdma);
+    installFakeTcp(engine, fake_tcp);
+
+    constexpr size_t kLen = 4096;
+    std::vector<uint8_t> buf(kLen, 0xEF);
+    ASSERT_TRUE(engine.registerLocalMemory(buf.data(), buf.size()).ok());
+
+    BatchID batch = engine.allocateBatch(4);
+    ASSERT_NE(batch, (BatchID)0);
+
+    auto before = MetricsSnapshot(TentMetrics::instance());
+    ASSERT_TRUE(
+        engine.submitTransfer(batch, {makeLocalWrite(buf.data(), kLen)}).ok());
+    ASSERT_EQ(pollUntilTerminal(engine, batch, 0), TransferStatusEnum::FAILED);
+    auto after = MetricsSnapshot(TentMetrics::instance());
+
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
+    EXPECT_EQ(fake_tcp->submit_calls.load(), 1);
+
+    // Two attempts started (RDMA then TCP), both failed.
+    EXPECT_EQ(after.counter("tent_transport_attempts_total") -
+                  before.counter("tent_transport_attempts_total"),
+              2);
+    EXPECT_EQ(after.counter("tent_transport_attempt_failures_total") -
+                  before.counter("tent_transport_attempt_failures_total"),
+              2);
+
+    const std::string rdma_failures =
+        "tent_transport_attempt_failures_total{transport=\"rdma\",operation="
+        "\"write\"}";
+    const std::string tcp_failures =
+        "tent_transport_attempt_failures_total{transport=\"tcp\",operation="
+        "\"write\"}";
+    EXPECT_EQ(after.series(rdma_failures) - before.series(rdma_failures), 1);
+    EXPECT_EQ(after.series(tcp_failures) - before.series(tcp_failures), 1);
 
     EXPECT_TRUE(engine.freeBatch(batch).ok());
     EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), buf.size()).ok());
@@ -556,8 +806,8 @@ TEST_F(MetricsRecordingTest, InfeasibleDeadlineRecordedOnFailedTransfer) {
 
 // ---------------------------------------------------------------------------
 // Regression guard: every histogram's JSON bucket keys must match its
-// compile-time boundary vector. Locks the invariant that the HistogramEntry
-// struct pairing must preserve.
+// compile-time boundary vector. Locks the invariant that getJsonMetrics()
+// pairs each histogram with the correct bucket boundaries.
 // ---------------------------------------------------------------------------
 TEST_F(MetricsRecordingTest, HistogramJsonBucketsMatchBoundaries) {
     struct HistSpec {
@@ -583,6 +833,8 @@ TEST_F(MetricsRecordingTest, HistogramJsonBucketsMatchBoundaries) {
          {10, 50, 100, 500, 1000, 5000, 10000, 50000, 100000, 500000}},
         {"tent_stage_transport_us",
          {10, 50, 100, 500, 1000, 5000, 10000, 50000, 100000, 500000}},
+        {"tent_transport_attempt_latency_us",
+         {100, 500, 1000, 5000, 10000, 50000, 100000, 500000, 1000000}},
     };
 
     auto snap = MetricsSnapshot(TentMetrics::instance());
@@ -708,6 +960,141 @@ TEST_F(MetricsHttpTest, JsonEndpointValid) {
     EXPECT_TRUE(json.contains("tent_read_bytes_total"));
     EXPECT_TRUE(json.contains("tent_deadline_infeasible_total"));
     EXPECT_TRUE(json.contains("tent_read_latency_us"));
+}
+
+// Regression guard for the silent-drop bug: ylt's
+// basic_dynamic_histogram::serialize() clears its output string (taking the
+// # HELP / # TYPE header with it) when every observed value truncates to 0
+// under int64_t. Sub-microsecond queue_wait latencies trigger this in
+// production — JSON reports a non-zero count but /metrics omits the metric
+// entirely. The custom serializer in getPrometheusMetrics() walks bucket
+// counts directly so the metric always appears when count > 0.
+TEST_F(MetricsHttpTest, PrometheusExposesHistogramWhenAllSamplesAreZero) {
+    // Reproduce the bug condition: observe 3 sub-microsecond latencies.
+    // recordStageLatency casts to int64_t (val=0), so sum_ stays 0 — exactly
+    // the case ylt's serialize() drops.
+    auto& m = TentMetrics::instance();
+    m.recordStageLatency(TentMetrics::Stage::QueueWait, UNSPEC, 0.3);
+    m.recordStageLatency(TentMetrics::Stage::QueueWait, UNSPEC, 0.5);
+    m.recordStageLatency(TentMetrics::Stage::QueueWait, UNSPEC, 0.9);
+
+    auto resp = retryGet("/metrics");
+    EXPECT_EQ(resp.http_status, 200);
+    // The bug: this substring was MISSING from Prometheus output even though
+    // JSON reported count=3. Must appear now.
+    EXPECT_NE(resp.body.find("tent_stage_queue_wait_us_bucket"),
+              std::string::npos)
+        << "stage_queue_wait_us silently dropped by ylt serialize() when all "
+           "samples truncate to 0 under int64_t";
+    // The +Inf bucket must carry the cumulative count of 3.
+    EXPECT_NE(
+        resp.body.find("tent_stage_queue_wait_us_bucket{transport=\"unspec\","
+                       "le=\"+Inf\"} 3"),
+        std::string::npos)
+        << "+Inf bucket must be cumulative (== total count)";
+    // _count line must be present with value 3.
+    EXPECT_NE(resp.body.find("tent_stage_queue_wait_us_count{transport=\""
+                             "unspec\"} 3"),
+              std::string::npos)
+        << "_count must match total observations";
+}
+
+// Same bug condition as above but with transport=TCP — this is what tebench
+// produces and what surfaced the original silent-drop bug in production.
+// Guard against a regression that only affects a subset of transports.
+TEST_F(MetricsHttpTest, PrometheusExposesZeroValuedHistogramForTcpTransport) {
+    auto& m = TentMetrics::instance();
+
+    // TentMetrics is a process-wide singleton whose histogram values are not
+    // reset across tests, and other tests in this binary can complete real
+    // TCP transfers (e.g. failover recovery) that record tcp stage latency.
+    // So snapshot the tcp +Inf cumulative first and assert on the delta, the
+    // same convention JsonAndPrometheusAgreeOnHistogramCount uses.
+    auto tcp_inf_count = [&]() -> int64_t {
+        std::string needle =
+            "tent_stage_queue_wait_us_bucket{transport=\"tcp\",le=\"+Inf\"} ";
+        auto body = retryGet("/metrics").body;
+        auto pos = body.find(needle);
+        if (pos == std::string::npos) return 0;
+        return std::strtoll(body.c_str() + pos + needle.size(), nullptr, 10);
+    };
+    int64_t inf_before = tcp_inf_count();
+
+    m.recordStageLatency(TentMetrics::Stage::QueueWait, TCP, 0.3);
+    m.recordStageLatency(TentMetrics::Stage::QueueWait, TCP, 0.5);
+    m.recordStageLatency(TentMetrics::Stage::QueueWait, TCP, 0.9);
+
+    auto resp = retryGet("/metrics");
+    EXPECT_EQ(resp.http_status, 200);
+    EXPECT_NE(resp.body.find("tent_stage_queue_wait_us_bucket"),
+              std::string::npos)
+        << "stage_queue_wait_us (transport=tcp) silently dropped when all "
+           "samples truncate to 0 under int64_t";
+    // All three samples truncate to 0 (sub-microsecond), so the +Inf bucket
+    // (cumulative == total count) must still advance by exactly 3 even though
+    // sum_ stays 0 — the silent-drop regression this test guards against.
+    EXPECT_EQ(tcp_inf_count() - inf_before, 3)
+        << "+Inf bucket for transport=tcp must be cumulative (== total count)";
+}
+
+// Regression guard for Prometheus/JSON drift: both endpoints must agree on
+// the histogram count for a given metric. Previously they used two completely
+// different serialization paths (ylt serialize() vs. custom bucket walk),
+// so any ylt behavior change would silently desync them. Both now share the
+// bucket-walk code path.
+TEST_F(MetricsHttpTest, JsonAndPrometheusAgreeOnHistogramCount) {
+    // Snapshot before so the assertion is delta-based. TentMetrics is a
+    // process-wide singleton whose counter/histogram values are not reset
+    // across tests, so absolute values would be order-dependent.
+    auto json_before_resp = retryGet("/metrics/json");
+    ASSERT_EQ(json_before_resp.http_status, 200);
+    auto json_before_obj = nlohmann::json::parse(json_before_resp.body, nullptr,
+                                                 /*allow_exceptions=*/false);
+    ASSERT_FALSE(json_before_obj.is_discarded());
+    int64_t json_count_before =
+        json_before_obj["tent_stage_transport_us"]["count"];
+
+    // Parse the unspec _count line from Prometheus before-state too.
+    auto prom_before = retryGet("/metrics");
+    ASSERT_EQ(prom_before.http_status, 200);
+    auto count_before = [&]() -> int64_t {
+        std::string needle =
+            "tent_stage_transport_us_count{transport=\"unspec\"} ";
+        auto pos = prom_before.body.find(needle);
+        if (pos == std::string::npos) return 0;
+        return std::strtoll(prom_before.body.c_str() + pos + needle.size(),
+                            nullptr, 10);
+    }();
+
+    // Record 3 observations landing in distinct buckets.
+    auto& m = TentMetrics::instance();
+    m.recordStageLatency(TentMetrics::Stage::Transport, UNSPEC, 750.0);
+    m.recordStageLatency(TentMetrics::Stage::Transport, UNSPEC, 1200.0);
+    m.recordStageLatency(TentMetrics::Stage::Transport, UNSPEC, 50.0);
+    const int64_t kDelta = 3;
+
+    auto prom = retryGet("/metrics");
+    auto json_resp = retryGet("/metrics/json");
+    ASSERT_EQ(prom.http_status, 200);
+    ASSERT_EQ(json_resp.http_status, 200);
+
+    // JSON aggregates across all transport labels; its count must advance by
+    // exactly kDelta.
+    auto json = nlohmann::json::parse(json_resp.body, nullptr,
+                                      /*allow_exceptions=*/false);
+    ASSERT_FALSE(json.is_discarded()) << "invalid JSON: " << json_resp.body;
+    int64_t json_count_after = json["tent_stage_transport_us"]["count"];
+    EXPECT_EQ(json_count_after - json_count_before, kDelta)
+        << "JSON count delta must equal observations (" << kDelta
+        << "); before=" << json_count_before << " after=" << json_count_after;
+
+    // Prometheus: the unspec label's _count must have advanced by kDelta too.
+    std::string expected =
+        "tent_stage_transport_us_count{transport=\"unspec\"} " +
+        std::to_string(count_before + kDelta);
+    EXPECT_NE(prom.body.find(expected), std::string::npos)
+        << "Prometheus unspec _count (" << (count_before + kDelta)
+        << ") must match JSON delta. Body length=" << prom.body.size();
 }
 
 TEST_F(MetricsHttpTest, HealthEndpointOk) {

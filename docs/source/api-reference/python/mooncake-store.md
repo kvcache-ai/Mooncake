@@ -1134,6 +1134,22 @@ def setup_dummy(self, mem_pool_size: int, local_buffer_size: int, server_address
 store.setup_dummy(1024*1024*256, 1024*1024*64, "localhost:8080")
 ```
 
+Dummy clients do not own Store segments. They use a local shared-memory buffer
+that is mapped by a real client process at `server_address`. Tensor APIs that
+stage through this SHM buffer are supported, including tensor put/get,
+`*_tensor_from`, `*_tensor_into`, tensor upsert/pub, TP wrappers, and unified
+parallelism write wrappers.
+
+The real client owns the SHM buffer allocator. This keeps tensor writes and
+regular object writes from allocating overlapping offsets when they run
+concurrently through the same dummy client. Writes staged through the dummy
+client's local SHM buffer keep their allocation alive until completion through
+the real-side active buffer handle and dummy-side RAII release path.
+
+Full materialized reconstruction reads for writer-sharded or reconstructed
+parallel tensors are still conservative for dummy clients. Use the corresponding
+`*_into` APIs, or read stored shards directly, when using dummy clients.
+
 ---
 
 #### put()
@@ -1611,7 +1627,8 @@ def batch_get_buffer(self, keys: List[str]) -> List[BufferHandle]
 **Returns:**
 - `List[BufferHandle]`: List of buffer objects, with None for keys not found
 
-**Note:** This function is not supported for dummy client.
+**Note:** This function is supported for dummy clients through the real
+client-owned shared-memory staging buffer.
 
 **Example:**
 ```python
@@ -2045,7 +2062,8 @@ def put_from_with_metadata(self, key: str, buffer_ptr: int, metadata_buffer_ptr:
 **Returns:**
 - `int`: Status code (0 = success, non-zero = error code)
 
-**Note:** This function is not supported for dummy client.
+**Note:** This function is supported for dummy clients through the real
+client-owned shared-memory staging buffer.
 
 **Example:**
 ```python
@@ -2445,7 +2463,8 @@ def upsert_tensor_from(self, key: str, buffer_ptr: int, size: int) -> int
 **Returns:**
 - `int`: Status code (0 = success, non-zero = error code)
 
-**Note:** This function is not supported for dummy client.
+**Note:** This function is supported for dummy clients through the real
+client-owned shared-memory staging buffer.
 
 #### batch_upsert_tensor_from()
 
@@ -2479,7 +2498,9 @@ def batch_upsert_tensor(self, keys: List[str], tensors_list: List[torch.Tensor])
 **Returns:**
 - `List[int]`: List of status codes for each tensor operation.
 
-**Note:** This function requires `torch` to be installed and available in the environment. Not supported for dummy client.
+**Note:** This function requires `torch` to be installed and available in the
+environment. It is supported for dummy clients through the real client-owned
+shared-memory staging buffer.
 
 #### upsert_pub_tensor()
 
@@ -2497,7 +2518,9 @@ def upsert_pub_tensor(self, key: str, tensor: torch.Tensor, config: ReplicateCon
 **Returns:**
 - `int`: Status code (0 = success, non-zero = error code)
 
-**Note:** This function requires `torch` to be installed and available in the environment. Not supported for dummy client.
+**Note:** This function requires `torch` to be installed and available in the
+environment. It is supported for dummy clients through the real client-owned
+shared-memory staging buffer.
 
 **Example:**
 ```python
@@ -2531,7 +2554,9 @@ def batch_upsert_pub_tensor(self, keys: List[str], tensors_list: List[torch.Tens
 **Returns:**
 - `List[int]`: List of status codes for each tensor operation.
 
-**Note:** This function requires `torch` to be installed and available in the environment. Not supported for dummy client.
+**Note:** This function requires `torch` to be installed and available in the
+environment. It is supported for dummy clients through the real client-owned
+shared-memory staging buffer.
 
 
 ---

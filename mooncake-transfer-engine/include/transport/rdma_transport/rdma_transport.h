@@ -148,6 +148,13 @@ class RdmaTransport : public Transport {
     // local_server_name_ keeps the TCP-reachable address for P2P routing.
     std::string rdma_server_name_;
     std::mutex local_desc_lock_;
+    // Mooncake#2017: buffers larger than the device max_mr_size are split into
+    // multiple sub-max_mr_size MRs (one BufferDesc per chunk) so that
+    // ibv_reg_mr is never silently truncated. unregisterLocalMemory() only
+    // receives the base addr, so remember each base buffer's chunk
+    // start-addresses for cleanup.
+    std::mutex chunk_map_mutex_;
+    std::unordered_map<uint64_t, std::vector<uint64_t>> chunk_map_;
 };
 
 using TransferRequest = Transport::TransferRequest;

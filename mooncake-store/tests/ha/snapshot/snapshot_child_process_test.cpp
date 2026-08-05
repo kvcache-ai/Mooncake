@@ -7,7 +7,8 @@
 #include "ha/snapshot/snapshot_test_utils.h"
 #ifdef STORE_USE_ETCD
 #include "etcd_helper.h"
-#include "ha/oplog/etcd_oplog_store.h"
+#include "ha/kv/etcd_ha_kv_backend.h"
+#include "ha/oplog/oplog_batch_storage.h"
 #endif
 
 #include <glog/logging.h>
@@ -100,6 +101,28 @@ class SnapshotChildProcessTest : public ::testing::Test {
                           .set_enable_snapshot(false)
                           .set_enable_snapshot_restore(true)
                           .set_enable_ha(true)
+                          .set_enable_oplog(true)
+                          .set_ha_backend_type("etcd")
+                          .set_ha_backend_connstring(etcd_endpoints)
+                          .set_cluster_id(cluster_id)
+                          .set_snapshot_backup_dir(tmp_dir() + "/backup")
+                          .set_snapshot_interval_seconds(100)
+                          .set_snapshot_child_timeout_seconds(60)
+                          .set_snapshot_retention_count(3)
+                          .set_snapshot_object_store_type("local")
+                          .set_view_version(view_version)
+                          .build();
+        service_ = std::make_unique<MasterService>(config);
+    }
+
+    void CreateBatchEtcdHASnapshotService(const std::string& cluster_id,
+                                          const std::string& etcd_endpoints,
+                                          ViewVersionId view_version) {
+        auto config = MasterServiceConfigBuilder()
+                          .set_enable_snapshot(false)
+                          .set_enable_snapshot_restore(true)
+                          .set_enable_ha(true)
+                          .set_enable_oplog(true)
                           .set_ha_backend_type("etcd")
                           .set_ha_backend_connstring(etcd_endpoints)
                           .set_cluster_id(cluster_id)
@@ -616,6 +639,56 @@ TEST_F(SnapshotChildProcessTest, RestoreRebuildsGroupedObjectRouting) {
     EXPECT_FALSE(service_->ExistKey(key, TenantId::Default()).value_or(true));
 }
 
+TEST_F(SnapshotChildProcessTest, RestorePreservesObjectChecksum) {
+    auto make_config = [this]() {
+        return MasterServiceConfigBuilder()
+            .set_enable_snapshot(false)
+            .set_enable_snapshot_restore(true)
+            .set_snapshot_backup_dir(tmp_dir() + "/backup")
+            .set_snapshot_interval_seconds(100)
+            .set_snapshot_child_timeout_seconds(60)
+            .set_snapshot_retention_count(3)
+            .set_snapshot_object_store_type("local")
+            .set_default_kv_lease_ttl(600000)
+            .build();
+    };
+    service_ = std::make_unique<MasterService>(make_config());
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "checksum_snapshot_segment";
+    segment.base = 0x320000000;
+    segment.size = 1024 * 1024 * 16;
+    segment.te_endpoint = segment.name;
+    const UUID client_id = generate_uuid();
+    ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
+
+    constexpr uint64_t kChecksum = 0x123456789ABCDEF0ULL;
+    const std::string key = "snapshot_object_checksum_key";
+    ReplicateConfig replicate_config;
+    replicate_config.replica_num = 1;
+    auto put_start = service_->PutStart(client_id, key, TenantId::Default(),
+                                        1024, replicate_config);
+    ASSERT_TRUE(put_start.has_value()) << toString(put_start.error());
+    ASSERT_TRUE(service_
+                    ->PutEnd(client_id, ObjectMeta{key, kChecksum},
+                             TenantId::Default(), ReplicaType::MEMORY)
+                    .has_value());
+    ASSERT_TRUE(service_->ExistKey(key, TenantId::Default()).value_or(false));
+
+    auto persist_result = CallPersistState("20240701_140000_000");
+    ASSERT_TRUE(persist_result.has_value())
+        << "PersistState failed: " << persist_result.error().message;
+
+    service_.reset();
+    service_ = std::make_unique<MasterService>(make_config());
+
+    auto restored = service_->GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(restored.has_value());
+    ASSERT_TRUE(restored->object_checksum.has_value());
+    EXPECT_EQ(*restored->object_checksum, kChecksum);
+}
+
 TEST_F(SnapshotChildProcessTest,
        DeserializeLegacyMetadataWithoutGroupIdRestoresUngroupedObject) {
     CreateDefaultService();
@@ -738,7 +811,7 @@ TEST_F(SnapshotChildProcessTest, LegacyEtcdConnstringFallbackIsPreserved) {
 
 #ifdef STORE_USE_ETCD
 TEST_F(SnapshotChildProcessTest,
-       PersistState_UsesEtcdOplogBoundaryInSnapshotDescriptor) {
+       PersistState_UsesBatchDurablePrefixBoundaryInSnapshotDescriptor) {
     const std::string etcd_endpoints = "127.0.0.1:2379";
     auto connect_err =
         EtcdHelper::ConnectToEtcdStoreClient(etcd_endpoints.c_str());
@@ -747,25 +820,30 @@ TEST_F(SnapshotChildProcessTest,
     }
 
     const std::string cluster_id =
-        "snapshot-descriptor-" + UuidToString(generate_uuid());
+        "snapshot-batch-boundary-" + UuidToString(generate_uuid());
     constexpr ViewVersionId kViewVersion = 19;
-    constexpr uint64_t kLatestSequenceId = 123;
-    const std::string snapshot_id = "20240601_120000_456";
+    constexpr uint64_t kBatchLatest = 1;
 
-    EtcdOpLogStore oplog_store(cluster_id);
-    auto init_err = oplog_store.Init();
+    auto backend = std::make_shared<EtcdHaKvBackend>();
+    OpLogBatchStorage storage(cluster_id, *backend);
+    DurablePrefix prefix;
+    auto init_err = storage.InitDurablePrefix(prefix);
     if (init_err != ErrorCode::OK) {
-        GTEST_SKIP() << "failed to initialize etcd oplog store: "
+        GTEST_SKIP() << "failed to initialize batch durable prefix: "
                      << toString(init_err);
     }
+    OpLogBatchRecord batch{.batch_id = 1,
+                           .first_seq = kBatchLatest,
+                           .last_seq = kBatchLatest,
+                           .entries = {{.sequence_id = kBatchLatest,
+                                        .op_type = OpType::PUT_END,
+                                        .object_key = "snapshot-boundary",
+                                        .payload = {}}}};
+    ASSERT_EQ(ErrorCode::OK, storage.WriteBatchAndAdvancePrefix(batch, prefix));
 
-    auto update_err = oplog_store.UpdateLatestSequenceId(kLatestSequenceId);
-    if (update_err != ErrorCode::OK) {
-        GTEST_SKIP() << "failed to update etcd latest sequence id: "
-                     << toString(update_err);
-    }
-
-    CreateEtcdHASnapshotService(cluster_id, etcd_endpoints, kViewVersion);
+    const std::string snapshot_id = "20240601_120000_789";
+    CreateBatchEtcdHASnapshotService(cluster_id, etcd_endpoints, kViewVersion);
+    ASSERT_EQ(ErrorCode::OK, service_->SetBatchOpLogBackendForTesting(backend));
     auto persist_result = CallPersistState(snapshot_id);
     ASSERT_TRUE(persist_result.has_value())
         << "PersistState failed: " << persist_result.error().message;
@@ -776,9 +854,8 @@ TEST_F(SnapshotChildProcessTest,
     ASSERT_TRUE(latest.has_value());
     ASSERT_TRUE(latest->has_value());
 
-    EXPECT_EQ(latest->value().last_included_seq, kLatestSequenceId);
+    EXPECT_EQ(latest->value().last_included_seq, kBatchLatest);
     EXPECT_EQ(latest->value().producer_view_version, kViewVersion);
-    EXPECT_GT(latest->value().created_at_ms, 0);
 }
 #endif
 

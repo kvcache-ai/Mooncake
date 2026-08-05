@@ -576,15 +576,19 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
             local_desc.notify_qp_num = notifyQpNum();
             return mooncake::tent::Status::OK();
         }
-        // Endpoint already connected to a different peer - reject the request
-        // instead of resetting. Endpoints have unidirectional lifecycle and
-        // are never reset or reused. The caller should create a new endpoint.
-        LOG(ERROR)
-            << "Endpoint already established with " << peer_nic_name_ << " of "
-            << peer_server_name_
-            << ", cannot accept new connection (unidirectional lifecycle)";
+        // The bootstrap does not match the established connection: the peer
+        // discarded its endpoint (eviction or failure) and came back with new
+        // QPs, so the local QPs now point at QPs that no longer exist.
+        // Endpoints have unidirectional lifecycle and are never reset, so
+        // retire this one. The caller drops retiring endpoints from the store,
+        // and the peer's next bootstrap gets a newly created endpoint.
+        LOG(WARNING) << "Endpoint already established with " << peer_nic_name_
+                     << " of " << peer_server_name_
+                     << ", retiring it for the new connection (unidirectional "
+                        "lifecycle)";
+        beginDestroyNoLock();
         return mooncake::tent::Status::InternalError(
-            "Endpoint already connected to different peer" LOC_MARK);
+            "Endpoint retired for reconnection from peer" LOC_MARK);
     }
     if (status_.load(std::memory_order_relaxed) != EP_HANDSHAKING) {
         LOG(ERROR) << "Endpoint not in handshaking state: "

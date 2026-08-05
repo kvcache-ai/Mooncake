@@ -7,6 +7,7 @@
 #include <xxhash.h>
 #include <filesystem>
 
+#include "environ.h"
 #include "utils.h"
 
 namespace mooncake {
@@ -43,16 +44,16 @@ bool DistributedStorageConfig::Validate() const {
 DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
     DistributedStorageConfig config;
     config.fsdir =
-        GetEnvStringOr("MOONCAKE_DISTRIBUTED_ROOT_DIR", config.fsdir);
+        Environ::GetString("MOONCAKE_DISTRIBUTED_ROOT_DIR", config.fsdir);
     if (!std::filesystem::path(config.fsdir).is_absolute()) {
         config.fsdir = std::filesystem::absolute(config.fsdir).string();
     }
-    config.fs_adapter_type =
-        GetEnvStringOr("MOONCAKE_DISTRIBUTED_FS_TYPE", config.fs_adapter_type);
+    config.fs_adapter_type = Environ::GetString("MOONCAKE_DISTRIBUTED_FS_TYPE",
+                                                config.fs_adapter_type);
     config.enable_health_check =
-        GetEnvOr<bool>("MOONCAKE_DISTRIBUTED_HEALTH_CHECK", false);
+        Environ::GetBool("MOONCAKE_DISTRIBUTED_HEALTH_CHECK", false);
     config.hash_bucket_count =
-        GetEnvOr<int>("MOONCAKE_DISTRIBUTED_HASH_BUCKET_COUNT", 256);
+        Environ::GetInt("MOONCAKE_DISTRIBUTED_HASH_BUCKET_COUNT", 256);
     return config;
 }
 

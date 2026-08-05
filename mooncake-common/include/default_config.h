@@ -12,6 +12,8 @@
 #include <unordered_map>
 #include <ylt/easylog.hpp>
 
+#include "ascii_string.h"
+
 namespace mooncake {
 class DefaultConfig {
    public:
@@ -156,9 +158,7 @@ inline void init_ylt_log_level() {
         easylog::set_min_severity(easylog::Severity::WARN);
         return;
     }
-    std::string level_str(env_level);
-    std::transform(level_str.begin(), level_str.end(), level_str.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
+    const std::string level_str = AsciiToLower(env_level);
     easylog::Severity severity;
     if (level_str == "trace") {
         severity = easylog::Severity::TRACE;

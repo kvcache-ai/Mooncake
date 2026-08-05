@@ -30,7 +30,6 @@ jobs:
         python-version: ['3.10']
 
     env:
-      BUILD_WITH_EP: "0"
       MUSA_BUILD: "1"
 
     steps:

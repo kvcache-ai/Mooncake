@@ -30,6 +30,15 @@
 
 namespace mooncake::test {
 
+std::vector<ObjectMeta> MakeObjectMetas(const std::vector<std::string>& keys) {
+    std::vector<ObjectMeta> object_metas;
+    object_metas.reserve(keys.size());
+    for (const auto& key : keys) {
+        object_metas.emplace_back(ObjectMeta{key, std::nullopt});
+    }
+    return object_metas;
+}
+
 class ScopedEnvVar {
    public:
     explicit ScopedEnvVar(const char* name) : name_(name) {
@@ -324,6 +333,42 @@ class MasterServiceTest : public ::testing::Test {
         google::ShutdownGoogleLogging();
     }
 };
+
+TEST_F(MasterServiceTest, ObjectChecksumIsStoredAndClearedByUpsert) {
+    MasterService service;
+    const auto segment = PrepareSimpleSegment(service, "checksum_segment");
+    const std::string key = "checksum_key";
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "checksum_segment";
+
+    ASSERT_TRUE(
+        service
+            .PutStart(segment.client_id, key, TenantId::Default(), 1024, config)
+            .has_value());
+    constexpr uint64_t kChecksum = 0;
+    ASSERT_TRUE(service
+                    .PutEnd(segment.client_id, ObjectMeta{key, kChecksum},
+                            TenantId::Default(), ReplicaType::MEMORY)
+                    .has_value());
+
+    auto query = service.GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(query.has_value());
+    ASSERT_TRUE(query->object_checksum.has_value());
+    EXPECT_EQ(*query->object_checksum, kChecksum);
+
+    ASSERT_TRUE(service
+                    .UpsertStart(segment.client_id, key, TenantId::Default(),
+                                 1024, config)
+                    .has_value());
+    ASSERT_TRUE(service
+                    .UpsertEnd(segment.client_id, ObjectMeta{key, std::nullopt},
+                               TenantId::Default(), ReplicaType::MEMORY)
+                    .has_value());
+    query = service.GetReplicaList(key, TenantId::Default());
+    ASSERT_TRUE(query.has_value());
+    EXPECT_FALSE(query->object_checksum.has_value());
+}
 
 TEST(TenantScopedStorageKeyTest, RoundTripsAndParsesLegacyKeys) {
     const auto scoped =
@@ -818,6 +863,28 @@ TEST_F(MasterServiceTest, GroupRoutingIsTenantScopedForSameUserKey) {
     ASSERT_TRUE(service_->Remove(key, tenant_a, /*force=*/true).has_value());
     EXPECT_FALSE(service_->GetReplicaList(key, tenant_a).has_value());
     EXPECT_TRUE(service_->GetReplicaList(key, tenant_b).has_value());
+}
+
+TEST_F(MasterServiceTest, StandbySnapshotRestorePreservesTenantScopedKeys) {
+    const TenantId tenant_a("tenant_restore_a");
+    const TenantId tenant_b("tenant_restore_b");
+    MasterService service(
+        MakeStrictTenantConfig({tenant_a.value(), tenant_b.value()}));
+    const std::string key = "shared_restore_key";
+
+    Replica replica(generate_uuid(), 128, "local://standby",
+                    ReplicaStatus::COMPLETE);
+    StandbyObjectMetadata metadata;
+    metadata.client_id = generate_uuid();
+    metadata.size = 128;
+    metadata.replicas.push_back(replica.get_descriptor());
+
+    service.RestoreFromStandbySnapshot({{tenant_a.value(), key, metadata}},
+                                       /*initial_oplog_sequence_id=*/0, {});
+
+    EXPECT_TRUE(service.ExistKey(key, tenant_a).value_or(false));
+    EXPECT_FALSE(service.ExistKey(key, tenant_b).value_or(true));
+    EXPECT_FALSE(service.ExistKey(key, TenantId::Default()).value_or(true));
 }
 
 TEST_F(MasterServiceTest, BatchGetReplicaListPreservesOrderWithGroupedKeys) {
@@ -1536,8 +1603,8 @@ TEST_F(MasterServiceTest, BatchUpsertStartMixedGroupIdsPreservesOrder) {
         ASSERT_TRUE(result.has_value());
     }
 
-    auto end_results =
-        service_->BatchUpsertEnd(client_id, keys, TenantId::Default());
+    auto end_results = service_->BatchUpsertEnd(
+        client_id, MakeObjectMetas(keys), TenantId::Default());
     ASSERT_EQ(end_results.size(), keys.size());
     for (const auto& result : end_results) {
         ASSERT_TRUE(result.has_value());
@@ -1588,7 +1655,7 @@ TEST_F(MasterServiceTest, WrappedBatchPutStartMixedGroupIdsPreservesOrder) {
         ASSERT_TRUE(result.has_value()) << toString(result.error());
     }
 
-    auto end_results = service_.BatchPutEnd(client_id, keys);
+    auto end_results = service_.BatchPutEnd(client_id, MakeObjectMetas(keys));
     ASSERT_EQ(end_results.size(), keys.size());
     for (const auto& result : end_results) {
         ASSERT_TRUE(result.has_value());
@@ -1782,7 +1849,8 @@ TEST_F(MasterServiceTest, TenantBatchUpsertAndRevokeAreScoped) {
     for (const auto& result : tenant_a_results) {
         ASSERT_TRUE(result.has_value());
     }
-    auto tenant_a_end = svc->BatchUpsertEnd(client_id, keys, tenant_a);
+    auto tenant_a_end =
+        svc->BatchUpsertEnd(client_id, MakeObjectMetas(keys), tenant_a);
     ASSERT_EQ(tenant_a_end.size(), keys.size());
     for (const auto& result : tenant_a_end) {
         ASSERT_TRUE(result.has_value());
@@ -1794,7 +1862,8 @@ TEST_F(MasterServiceTest, TenantBatchUpsertAndRevokeAreScoped) {
     for (const auto& result : tenant_b_results) {
         ASSERT_TRUE(result.has_value());
     }
-    auto tenant_b_end = svc->BatchUpsertEnd(client_id, keys, tenant_b);
+    auto tenant_b_end =
+        svc->BatchUpsertEnd(client_id, MakeObjectMetas(keys), tenant_b);
     ASSERT_EQ(tenant_b_end.size(), keys.size());
     for (const auto& result : tenant_b_end) {
         ASSERT_TRUE(result.has_value());
@@ -4070,6 +4139,43 @@ TEST_F(MasterServiceTest, ReadableAfterPartialUnmountWithReplication) {
         << "Object should remain accessible with surviving replica";
 }
 
+TEST_F(MasterServiceTest, PutStartPartialAllocationIsObservable) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+
+    // Mount two segments only
+    constexpr size_t buffer1 = 0x300000000;
+    constexpr size_t buffer2 = 0x400000000;
+    constexpr size_t segment_size = 1024 * 1024 * 64;  // 64MB
+
+    auto segment1 = MakeSegment("segment1", buffer1, segment_size);
+    auto segment2 = MakeSegment("segment2", buffer2, segment_size);
+    UUID client_id = generate_uuid();
+    ASSERT_TRUE(service_->MountSegment(segment1, client_id).has_value());
+    ASSERT_TRUE(service_->MountSegment(segment2, client_id).has_value());
+
+    auto& metrics = MasterMetricManager::instance();
+    const int64_t partial_before = metrics.get_put_start_partial_allocations();
+
+    // Request more replicas than available segments: best-effort keeps the
+    // put successful but the degradation must be recorded.
+    ReplicateConfig config;
+    config.replica_num = 3;
+    auto put_start_result = service_->PutStart(
+        client_id, "partial_alloc_key", TenantId::Default(), 1024, config);
+    ASSERT_TRUE(put_start_result.has_value());
+    ASSERT_EQ(2u, put_start_result->size());
+    ASSERT_EQ(metrics.get_put_start_partial_allocations(), partial_before + 1);
+
+    // A fully satisfied allocation must not be counted as partial.
+    ReplicateConfig full_config;
+    full_config.replica_num = 2;
+    auto full_result = service_->PutStart(
+        client_id, "full_alloc_key", TenantId::Default(), 1024, full_config);
+    ASSERT_TRUE(full_result.has_value());
+    ASSERT_EQ(2u, full_result->size());
+    ASSERT_EQ(metrics.get_put_start_partial_allocations(), partial_before + 1);
+}
+
 TEST_F(MasterServiceTest, UnmountSegmentPerformance) {
     std::unique_ptr<MasterService> service_(new MasterService());
     constexpr size_t kBufferAddress = 0x300000000;
@@ -4913,8 +5019,9 @@ TEST_F(MasterServiceTest, WrappedBatchExistKeyUsesTenantAwareBatchPath) {
     for (const auto& result : tenant_put_start) {
         ASSERT_TRUE(result.has_value()) << toString(result.error());
     }
-    auto tenant_put_end = service_.BatchPutEnd(
-        client_id, tenant_keys, ReplicaType::MEMORY, tenant_id.value());
+    auto tenant_put_end =
+        service_.BatchPutEnd(client_id, MakeObjectMetas(tenant_keys),
+                             ReplicaType::MEMORY, tenant_id.value());
     ASSERT_EQ(tenant_put_end.size(), tenant_keys.size());
     for (const auto& result : tenant_put_end) {
         ASSERT_TRUE(result.has_value()) << toString(result.error());
@@ -4923,9 +5030,11 @@ TEST_F(MasterServiceTest, WrappedBatchExistKeyUsesTenantAwareBatchPath) {
     auto default_put_start =
         service_.PutStart(client_id, default_only_key, 1024, config);
     ASSERT_TRUE(default_put_start.has_value());
-    ASSERT_TRUE(
-        service_.PutEnd(client_id, default_only_key, ReplicaType::MEMORY)
-            .has_value());
+    ASSERT_TRUE(service_
+                    .PutEnd(client_id,
+                            ObjectMeta{default_only_key, std::nullopt},
+                            ReplicaType::MEMORY)
+                    .has_value());
 
     auto& metrics = MasterMetricManager::instance();
     const auto base_requests = metrics.get_batch_exist_key_requests();
@@ -5397,20 +5506,33 @@ TEST_F(MasterServiceTest, PutStartExpiringTest) {
     }
 
     // Put key_2 again, should fail because eviction has not been triggered. And
-    // this PutStart should trigger the eviction.
+    // this PutStart should trigger the eviction. Only BatchEvict moves the
+    // eviction attempt counter, so take the baseline before the trigger: the
+    // eviction thread polls every 10 ms, and sampling after the failing
+    // PutStart could race a completed BatchEvict and wait for a second one
+    // that never comes.
+    const int64_t eviction_attempts_before =
+        MasterMetricManager::instance().get_mem_eviction_attempts();
     put_start_result = service_->PutStart(client_id, key_2, TenantId::Default(),
                                           slice_length, config);
     EXPECT_FALSE(put_start_result.has_value());
     EXPECT_EQ(put_start_result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 
-    // Wait a moment for the eviction to complete.
-    std::this_thread::sleep_for(std::chrono::milliseconds(50));
-
-    // Put key_2 again, should success because the previous one has been
-    // discarded and released.
+    // The failed PutStart above sets need_mem_eviction_, and the eviction
+    // thread answers with an asynchronous BatchEvict. Polling PutStart for up
+    // to put_start_release_timeout_sec cannot tell that path apart from the
+    // periodic DiscardExpiredProcessingReplicas fallback, which releases the
+    // same replicas on the same 5 s scale and would pass the test without
+    // exercising the immediate eviction, and the periodic path never touches
+    // the attempt counter.
+    WaitUntil([&] {
+        return MasterMetricManager::instance().get_mem_eviction_attempts() >
+               eviction_attempts_before;
+    });
     put_start_result = service_->PutStart(client_id, key_2, TenantId::Default(),
                                           slice_length, config);
-    EXPECT_TRUE(put_start_result.has_value());
+    ASSERT_TRUE(put_start_result.has_value())
+        << toString(put_start_result.error());
     replica_list = put_start_result.value();
     EXPECT_EQ(replica_list.size(), kReplicaCnt);
     for (size_t i = 0; i < kReplicaCnt; i++) {
@@ -7082,8 +7204,8 @@ TEST_F(MasterServiceTest, BatchUpsertStart) {
     EXPECT_TRUE(results[1].has_value());  // key_2: Case A (new)
 
     // Complete both
-    auto end_results =
-        service_->BatchUpsertEnd(client_id, keys, TenantId::Default());
+    auto end_results = service_->BatchUpsertEnd(
+        client_id, MakeObjectMetas(keys), TenantId::Default());
     ASSERT_EQ(2, end_results.size());
     EXPECT_TRUE(end_results[0].has_value());
     EXPECT_TRUE(end_results[1].has_value());
