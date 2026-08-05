@@ -19,16 +19,38 @@ std::optional<std::vector<int>> try_dummy_cuda_ipc_batch_put_tensor_impl(
     const std::vector<PyTensorInfo> &infos, const ReplicateConfig &config) {
     if (!use_dummy_client_ || keys.size() != infos.size()) return std::nullopt;
 
+    struct CudaStreamContext {
+        int32_t device_id;
+        uintptr_t stream_handle;
+    };
+    std::vector<std::optional<CudaStreamContext>> cuda_stream_contexts(
+        infos.size());
+    for (size_t i = 0; i < infos.size(); ++i) {
+        const py::object &owner = infos[i].owner;
+        if (!infos[i].valid() || !owner || owner.is_none()) continue;
+
+        try {
+            if (!owner.attr("is_cuda").cast<bool>()) continue;
+            cuda_stream_contexts[i] = CudaStreamContext{
+                .device_id = owner.attr("get_device")().cast<int32_t>(),
+                .stream_handle =
+                    torch_module()
+                        .attr("cuda")
+                        .attr("current_stream")(owner.attr("device"))
+                        .attr("cuda_stream")
+                        .cast<uintptr_t>(),
+            };
+        } catch (const py::error_already_set &) {
+            PyErr_Clear();
+        } catch (const py::cast_error &) {
+            PyErr_Clear();
+        }
+    }
+
     std::vector<int> results(keys.size(), 0);
     py::gil_scoped_release release_gil;
 
-    std::vector<CudaIpcWriteRequest> write_requests;
-    std::vector<size_t> original_indices;
-    std::vector<std::unique_ptr<BufferHandle>> metadata_allocations;
-    write_requests.reserve(infos.size());
-    original_indices.reserve(infos.size());
-    metadata_allocations.reserve(infos.size());
-
+    std::vector<std::optional<CudaIpcBufferHandle>> ipc_payloads(infos.size());
     for (size_t i = 0; i < infos.size(); ++i) {
         if (!infos[i].valid()) {
             results[i] = to_py_ret(ErrorCode::INVALID_PARAMS);
@@ -40,6 +62,39 @@ std::optional<std::vector<int>> try_dummy_cuda_ipc_batch_put_tensor_impl(
             reinterpret_cast<const void *>(infos[i].data_ptr),
             infos[i].tensor_size);
         if (!payload) return std::nullopt;
+        ipc_payloads[i] = std::move(*payload);
+    }
+
+    bool stream_context_invalid = false;
+    for (size_t i = 0; i < infos.size(); ++i) {
+        if (!ipc_payloads[i].has_value()) continue;
+        if (!cuda_stream_contexts[i].has_value() ||
+            cuda_stream_contexts[i]->device_id != ipc_payloads[i]->device_id) {
+            results[i] = to_py_ret(ErrorCode::INTERNAL_ERROR);
+            stream_context_invalid = true;
+        }
+    }
+    if (stream_context_invalid) {
+        LOG(ERROR) << "CUDA IPC tensor stream context validation failed";
+        for (size_t i = 0; i < infos.size(); ++i) {
+            if (ipc_payloads[i].has_value()) {
+                results[i] = to_py_ret(ErrorCode::INTERNAL_ERROR);
+            }
+        }
+        return results;
+    }
+
+    std::vector<CudaIpcWriteRequest> write_requests;
+    std::vector<size_t> original_indices;
+    std::vector<std::unique_ptr<BufferHandle>> metadata_allocations;
+    std::vector<std::pair<int32_t, uintptr_t>> unique_streams;
+    write_requests.reserve(infos.size());
+    original_indices.reserve(infos.size());
+    metadata_allocations.reserve(infos.size());
+    unique_streams.reserve(infos.size());
+
+    for (size_t i = 0; i < infos.size(); ++i) {
+        if (!ipc_payloads[i].has_value()) continue;
 
         size_t metadata_size = infos[i].metadata.header.data_offset;
         auto metadata = store_->allocate_client_buffer(metadata_size);
@@ -56,17 +111,41 @@ std::optional<std::vector<int>> try_dummy_cuda_ipc_batch_put_tensor_impl(
                     .ptr = reinterpret_cast<uint64_t>(metadata->ptr()),
                     .size = static_cast<uint64_t>(metadata_size),
                 },
-            .payload = *payload,
+            .payload = *ipc_payloads[i],
         });
         original_indices.push_back(i);
         metadata_allocations.push_back(
             std::make_unique<BufferHandle>(std::move(*metadata)));
+
+        const CudaStreamContext &stream_context = *cuda_stream_contexts[i];
+        bool stream_is_unique = true;
+        for (const auto &[device_id, stream_handle] : unique_streams) {
+            if (device_id == stream_context.device_id &&
+                stream_handle == stream_context.stream_handle) {
+                stream_is_unique = false;
+                break;
+            }
+        }
+        if (stream_is_unique) {
+            unique_streams.emplace_back(stream_context.device_id,
+                                        stream_context.stream_handle);
+        }
     }
 
     if (!write_requests.empty()) {
         ReplicateConfig write_config =
             MakeIndexedConfig(config, original_indices);
         auto dummy_client = std::static_pointer_cast<DummyClient>(store_);
+        for (const auto &[device_id, stream_handle] : unique_streams) {
+            if (!mooncake::device::SynchronizeCudaStream(device_id,
+                                                         stream_handle)) {
+                LOG(ERROR) << "CUDA IPC tensor stream synchronization failed";
+                for (size_t index : original_indices) {
+                    results[index] = to_py_ret(ErrorCode::INTERNAL_ERROR);
+                }
+                return results;
+            }
+        }
         std::vector<int> op_results =
             dummy_client->batch_put_from_cuda_ipc(write_requests, write_config);
         if (!apply_indexed_results("put", op_results, original_indices,
