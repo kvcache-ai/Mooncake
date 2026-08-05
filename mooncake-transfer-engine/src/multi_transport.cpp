@@ -123,16 +123,30 @@ Status MultiTransport::submitTransfer(
             "Exceed the limitation of batch capacity");
     }
 
-    size_t task_id = batch_desc.task_list.size();
-    batch_desc.task_list.resize(task_id + entries.size());
-
-    std::unordered_map<Transport*, std::vector<Transport::TransferTask*> >
-        submit_tasks;
-    for (auto& request : entries) {
+    std::vector<Transport*> transports;
+    transports.reserve(entries.size());
+    for (const auto& request : entries) {
         Transport* transport = nullptr;
         auto status = selectTransport(request, transport);
         if (!status.ok()) return status;
         assert(transport);
+        transports.push_back(transport);
+    }
+
+    size_t task_id = batch_desc.task_list.size();
+    batch_desc.task_list.resize(task_id + entries.size());
+
+    struct TaskGroup {
+        uint64_t id;
+        Transport* transport;
+        std::vector<Transport::TransferTask*> tasks;
+    };
+    std::unordered_map<Transport*, std::vector<Transport::TransferTask*> >
+        submit_tasks;
+    std::vector<TaskGroup> task_groups;
+    for (size_t i = 0; i < entries.size(); ++i) {
+        const auto& request = entries[i];
+        auto* transport = transports[i];
         auto& task = batch_desc.task_list[task_id];
         task.batch_id = batch_id;
         task.transport_ = transport;
@@ -142,7 +156,15 @@ Status MultiTransport::submitTransfer(
         task.request = &request;
 #endif
         ++task_id;
-        submit_tasks[transport].push_back(&task);
+        if (request.task_group_id == TransferRequest::kNoTaskGroup) {
+            submit_tasks[transport].push_back(&task);
+        } else if (!task_groups.empty() &&
+                   task_groups.back().id == request.task_group_id &&
+                   task_groups.back().transport == transport) {
+            task_groups.back().tasks.push_back(&task);
+        } else {
+            task_groups.push_back({request.task_group_id, transport, {&task}});
+        }
     }
     Status overall_status = Status::OK();
     for (auto& entry : submit_tasks) {
@@ -152,6 +174,10 @@ Status MultiTransport::submitTransfer(
             //            << entry.first->getName();
             overall_status = status;
         }
+    }
+    for (auto& group : task_groups) {
+        auto status = group.transport->submitTransferTaskGroup(group.tasks);
+        if (!status.ok()) overall_status = status;
     }
     return overall_status;
 }
@@ -238,7 +264,7 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
             task.transport_->getTransferStatus(batch_id, task_id, status);
         if (!ret.ok()) return ret;
 
-        // Apply timeout check on top of the transport's result.
+        // Apply timeout check on top of the transport result.
         if (status.s == Transport::TransferStatusEnum::WAITING &&
             checkSliceTimeout(task)) {
             status.s = Transport::TransferStatusEnum::TIMEOUT;
@@ -295,7 +321,8 @@ Status MultiTransport::getBatchTransferStatus(BatchID batch_id,
         if (task_status.s == Transport::TransferStatusEnum::COMPLETED) {
             status.transferred_bytes += task_status.transferred_bytes;
             success_count++;
-        } else if (task_status.s == Transport::TransferStatusEnum::FAILED) {
+        } else if (task_status.s == Transport::TransferStatusEnum::FAILED ||
+                   task_status.s == Transport::TransferStatusEnum::TIMEOUT) {
             status.s = Transport::TransferStatusEnum::FAILED;
             return Status::OK();
         }

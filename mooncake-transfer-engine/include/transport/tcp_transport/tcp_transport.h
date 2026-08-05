@@ -21,6 +21,7 @@
 #include <chrono>
 #include <cstddef>
 #include <deque>
+#include <functional>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -75,6 +76,9 @@ class TcpTransport : public Transport {
     Status submitTransferTask(
         const std::vector<TransferTask *> &task_list) override;
 
+    Status submitTransferTaskGroup(
+        const std::vector<TransferTask *> &task_list) override;
+
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus &status) override;
 
@@ -102,7 +106,13 @@ class TcpTransport : public Transport {
 
     void worker();
 
-    void startTransfer(Slice *slice);
+    Slice *prepareTransfer(TransferTask *task, const TransferRequest &request);
+
+    void startTransfer(Slice *slice,
+                       std::function<void()> continuation = nullptr,
+                       bool reuse_connection = false);
+
+    void startTransferSequence(std::vector<Slice *> slices);
 
     bool validateAddress(uint64_t addr, uint64_t size) const;
 
@@ -139,7 +149,7 @@ class TcpTransport : public Transport {
     std::mutex pool_mutex_;
 
     std::shared_ptr<asio::ip::tcp::socket> getConnection(
-        const std::string &host, uint16_t port);
+        const std::string &host, uint16_t port, bool use_pool);
     void returnConnection(const std::string &host, uint16_t port,
                           std::shared_ptr<asio::ip::tcp::socket> socket);
     // Close `socket` and drop it from the pool: used for requests that did

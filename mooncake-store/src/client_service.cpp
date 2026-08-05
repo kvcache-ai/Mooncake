@@ -1344,6 +1344,15 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
     return {};
 }
 
+std::optional<TransferEngine::ScatterTransferOperation> Client::SubmitScatter(
+    const std::vector<TransferEngine::ScatterTransferRange>& transfers) {
+    if (!transfer_submitter_) {
+        LOG(ERROR) << "TransferSubmitter not initialized";
+        return std::nullopt;
+    }
+    return transfer_submitter_->submitScatter(transfers);
+}
+
 struct BatchGetOperation {
     std::vector<Replica::Descriptor> replicas;
     std::vector<std::vector<Slice>> batched_slices;
