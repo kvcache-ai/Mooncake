@@ -3595,6 +3595,8 @@ RealClient::get_into_ranges_internal(
             .first->second;
     };
 
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
     struct ScatterLease {
         std::chrono::steady_clock::time_point expires_at;
         std::optional<ErrorCode> error;
@@ -3633,6 +3635,20 @@ RealClient::get_into_ranges_internal(
 
             const auto &metadata = metadata_result.value();
             if (metadata.replica.is_memory_replica()) {
+                if (client_->CanUseLocalMemcpy(metadata.replica) &&
+                    runtime_accelerator.FindDeviceForPointer(buffers[i])) {
+                    for (size_t k = 0; k < range_results.size(); ++k) {
+                        const size_t dst_offset = dst_offsets[k];
+                        if (dst_offset > capacities[i] ||
+                            sizes[k] > capacities[i] - dst_offset) {
+                            continue;
+                        }
+                        range_results[k] = execute_ranged_read(
+                            keys[j], buffers[i], dst_offset, src_offsets[k],
+                            sizes[k], metadata, false, false);
+                    }
+                    continue;
+                }
                 const auto &handle =
                     metadata.replica.get_memory_descriptor().buffer_descriptor;
                 auto [lease_it, inserted] = scatter_leases.try_emplace(keys[j]);
