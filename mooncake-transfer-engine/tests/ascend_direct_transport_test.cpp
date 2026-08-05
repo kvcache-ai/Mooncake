@@ -355,6 +355,8 @@ static int g_transfer_async_count = 0;
 static int g_register_mem_count = 0;
 static int g_deregister_mem_count = 0;
 static std::string g_last_connect_target;
+static adxl::Status g_get_capability_result = adxl::SUCCESS;
+static int32_t g_get_capability_value = 0;
 
 namespace adxl_mock {
 void reset() {
@@ -380,6 +382,14 @@ void reset() {
     g_register_mem_count = 0;
     g_deregister_mem_count = 0;
     g_last_connect_target.clear();
+    g_get_capability_result = adxl::SUCCESS;
+    g_get_capability_value = 0;
+}
+
+void set_capability_result(adxl::Status status, int32_t value) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_get_capability_result = status;
+    g_get_capability_value = value;
 }
 
 void set_connect_result(adxl::Status status) {
@@ -609,6 +619,13 @@ Status AdxlEngine::DeregisterMem(MemHandle mem_handle) {
     g_deregistered_mem_handles.push_back(
         reinterpret_cast<uintptr_t>(mem_handle));
     return SUCCESS;
+}
+
+Status AdxlEngine::GetCapability(FeatureType feature_type, int32_t& value) {
+    (void)feature_type;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    value = g_get_capability_value;
+    return g_get_capability_result;
 }
 
 }  // namespace adxl
@@ -2233,6 +2250,82 @@ TEST(StoreResourceConfigSplitTest, IsRoceModeEnabled_StoreRoceP2pHccs) {
         EXPECT_FALSE(IsRoceModeEnabled()) << "P2P TE should resolve to HCCS";
     }
     unsetenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
+}
+
+// -----------------------------------------------------------------------------
+// ResolveAscendCapabilityFlag: env var precedence + GetCapability probe.
+//   1. env var set (1/0) -> env wins
+//   2. env unset + GetCapability returns supported -> enabled
+//   3. env unset + GetCapability returns not supported / fails -> disabled
+// -----------------------------------------------------------------------------
+
+class ResolveCapabilityFlagTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        unsetenv("ASCEND_AUTO_CONNECT");
+        unsetenv("ASCEND_CLIENT_SERVER_MODE");
+        adxl_mock::reset();
+    }
+    void TearDown() override {
+        unsetenv("ASCEND_AUTO_CONNECT");
+        unsetenv("ASCEND_CLIENT_SERVER_MODE");
+    }
+};
+
+TEST_F(ResolveCapabilityFlagTest, EnvVarEnableOverridesProbe) {
+    adxl_mock::set_capability_result(adxl::SUCCESS, 0);
+    setenv("ASCEND_AUTO_CONNECT", "1", 1);
+    EXPECT_TRUE(ResolveAscendCapabilityFlag("ASCEND_AUTO_CONNECT",
+                                            adxl::AUTO_CONNECT));
+}
+
+TEST_F(ResolveCapabilityFlagTest, EnvVarDisableOverridesProbe) {
+    adxl_mock::set_capability_result(adxl::SUCCESS, 1);
+    setenv("ASCEND_AUTO_CONNECT", "0", 1);
+    EXPECT_FALSE(ResolveAscendCapabilityFlag("ASCEND_AUTO_CONNECT",
+                                             adxl::AUTO_CONNECT));
+}
+
+TEST_F(ResolveCapabilityFlagTest, EnvVarInvalidDefaultsDisabled) {
+    setenv("ASCEND_AUTO_CONNECT", "abc", 1);
+    EXPECT_FALSE(ResolveAscendCapabilityFlag("ASCEND_AUTO_CONNECT",
+                                             adxl::AUTO_CONNECT));
+}
+
+TEST_F(ResolveCapabilityFlagTest, ProbeSupportedWhenEnvUnset) {
+    adxl_mock::set_capability_result(adxl::SUCCESS, 1);
+    EXPECT_TRUE(ResolveAscendCapabilityFlag("ASCEND_AUTO_CONNECT",
+                                            adxl::AUTO_CONNECT));
+}
+
+TEST_F(ResolveCapabilityFlagTest, ProbeNotSupportedWhenEnvUnset) {
+    adxl_mock::set_capability_result(adxl::SUCCESS, 0);
+    EXPECT_FALSE(ResolveAscendCapabilityFlag("ASCEND_AUTO_CONNECT",
+                                             adxl::AUTO_CONNECT));
+}
+
+TEST_F(ResolveCapabilityFlagTest, ProbeFailureDisabled) {
+    adxl_mock::set_capability_result(adxl::FAILED, 1);
+    EXPECT_FALSE(ResolveAscendCapabilityFlag("ASCEND_AUTO_CONNECT",
+                                             adxl::AUTO_CONNECT));
+}
+
+TEST_F(ResolveCapabilityFlagTest, ClientServerCommEnvEnable) {
+    setenv("ASCEND_CLIENT_SERVER_MODE", "1", 1);
+    EXPECT_TRUE(ResolveAscendCapabilityFlag("ASCEND_CLIENT_SERVER_MODE",
+                                            adxl::CLIENT_SERVER_COMM));
+}
+
+TEST_F(ResolveCapabilityFlagTest, ClientServerCommProbeSupported) {
+    adxl_mock::set_capability_result(adxl::SUCCESS, 1);
+    EXPECT_TRUE(ResolveAscendCapabilityFlag("ASCEND_CLIENT_SERVER_MODE",
+                                            adxl::CLIENT_SERVER_COMM));
+}
+
+TEST_F(ResolveCapabilityFlagTest, ClientServerCommProbeNotSupported) {
+    adxl_mock::set_capability_result(adxl::SUCCESS, 0);
+    EXPECT_FALSE(ResolveAscendCapabilityFlag("ASCEND_CLIENT_SERVER_MODE",
+                                             adxl::CLIENT_SERVER_COMM));
 }
 
 int main(int argc, char** argv) {
