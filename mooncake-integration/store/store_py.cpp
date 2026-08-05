@@ -912,6 +912,7 @@ class MooncakeStorePyWrapper {
                         const ReplicateConfig &config) {
         // Validation & Metadata extraction (GIL Held)
         auto info = extract_tensor_info(tensor, key);
+        if (!info.valid()) return to_py_ret(ErrorCode::INVALID_PARAMS);
         return put_tensor_info_impl(key, info, config);
     }
 
@@ -1062,7 +1063,7 @@ class MooncakeStorePyWrapper {
                    const std::vector<std::vector<void *>> &buffers,
                    const std::vector<std::vector<size_t>> &sizes,
                    const ReplicateConfig &write_config) {
-                return store_->batch_upsert_from_multi_buffers(
+                return real_client_->batch_upsert_from_multi_buffers(
                     write_keys, buffers, sizes, write_config);
             });
     }
@@ -1071,6 +1072,11 @@ class MooncakeStorePyWrapper {
         const std::vector<std::string> &keys,
         const pybind11::list &tensors_list,
         const ReplicateConfig &config = ReplicateConfig{}) {
+        if (pybind11::len(tensors_list) != keys.size()) {
+            LOG(ERROR) << "batch_put_tensor keys and tensors size mismatch";
+            return std::vector<int>(keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
         std::vector<PyTensorInfo> infos(keys.size());
         for (size_t i = 0; i < keys.size(); ++i) {
             infos[i] = extract_tensor_info(tensors_list[i], keys[i]);
@@ -1487,6 +1493,7 @@ class MooncakeStorePyWrapper {
     int upsert_tensor_impl(const std::string &key, pybind11::object tensor,
                            const ReplicateConfig &config) {
         auto info = extract_tensor_info(tensor, key);
+        if (!info.valid()) return to_py_ret(ErrorCode::INVALID_PARAMS);
         return upsert_tensor_info_impl(key, info, config);
     }
 
@@ -1581,6 +1588,11 @@ class MooncakeStorePyWrapper {
         const std::vector<std::string> &keys,
         const pybind11::list &tensors_list,
         const ReplicateConfig &config = ReplicateConfig{}) {
+        if (pybind11::len(tensors_list) != keys.size()) {
+            LOG(ERROR) << "batch_upsert_tensor keys and tensors size mismatch";
+            return std::vector<int>(keys.size(),
+                                    to_py_ret(ErrorCode::INVALID_PARAMS));
+        }
         std::vector<PyTensorInfo> infos(keys.size());
         for (size_t i = 0; i < keys.size(); ++i) {
             infos[i] = extract_tensor_info(tensors_list[i], keys[i]);
