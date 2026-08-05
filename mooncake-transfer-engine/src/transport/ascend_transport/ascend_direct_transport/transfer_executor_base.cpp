@@ -95,22 +95,10 @@ void TransferExecutorBase::ParseExecutorEnvIntoInitParams(InitParams& params) {
     if (use_async) {
         params.use_async_transfer = true;
     }
-    char* auto_connect = std::getenv("ASCEND_AUTO_CONNECT");
-    if (auto_connect) {
-        auto auto_connect_opt = parseFromString<int32_t>(auto_connect);
-        if (!auto_connect_opt.has_value()) {
-            LOG(WARNING) << "ASCEND_AUTO_CONNECT is not valid, value:"
-                         << auto_connect << ", defaulting to disabled";
-            params.auto_connect = false;
-        } else {
-            params.auto_connect = (*auto_connect_opt == 1);
-            LOG(INFO) << "Set auto_connect from ASCEND_AUTO_CONNECT to: "
-                      << *auto_connect_opt;
-        }
-    } else if (adxl::IsAdxlFeatureSupported(adxl::AUTO_CONNECT)) {
-        params.auto_connect = true;
-        LOG(INFO) << "AutoConnect enabled by capability probe";
-    }
+    params.auto_connect = ResolveAscendCapabilityFlag("ASCEND_AUTO_CONNECT",
+                                                      adxl::AUTO_CONNECT);
+    params.client_server_mode = ResolveAscendCapabilityFlag(
+        "ASCEND_CLIENT_SERVER_MODE", adxl::CLIENT_SERVER_COMM);
     char* buffer_pool = std::getenv("ASCEND_BUFFER_POOL");
     if (buffer_pool && std::strcmp(buffer_pool, "0:0") != 0) {
         params.use_buffer_pool = true;

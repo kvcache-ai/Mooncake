@@ -108,6 +108,7 @@ int AscendDirectTransport::install(std::string &local_server_name,
     exec_params.agent_mode = agent_mode_;
     exec_params.roce_mode = roce_mode_;
     exec_params.use_fabric_mem = use_fabric_mem_;
+    exec_params.client_server_mode = client_server_mode_;
 
     transfer_executor_ = TransferExecutorBase::Create(exec_params);
     ret = transfer_executor_->initialize();
@@ -140,6 +141,11 @@ int AscendDirectTransport::addEngineToSegmentDesc(int32_t device_id,
     local_engine_contexts_.push_back(context);
     desc->rank_info.endpoints.push_back(
         GenAdxlEngineName(host_ip, listen_port));
+    if (client_server_mode_) {
+        LOG(INFO) << "[AscendTE] client_server_mode enabled, engine for device "
+                  << device_id << " running as server (listening on "
+                  << listen_port << ")";
+    }
     return 0;
 }
 
@@ -156,10 +162,14 @@ int AscendDirectTransport::allocateLocalSegmentID() {
     // process-global config.
     use_fabric_mem_ = globalConfig().ascend_use_fabric_mem &&
                       globalConfig().ascend_store_te_init;
+    client_server_mode_ = ResolveAscendCapabilityFlag(
+        "ASCEND_CLIENT_SERVER_MODE", adxl::CLIENT_SERVER_COMM);
     LOG(INFO) << "[AscendTE] init local segment, te is created for store="
               << (globalConfig().ascend_store_te_init ? "true" : "false")
               << ", roce_mode=" << (roce_mode_ ? "true" : "false")
               << ", use_fabric_mem=" << (use_fabric_mem_ ? "true" : "false")
+              << ", client_server_mode="
+              << (client_server_mode_ ? "true" : "false")
               << (agent_mode_
                       ? ", launched as standalone real client (manages all "
                         "local NPU devices)"
