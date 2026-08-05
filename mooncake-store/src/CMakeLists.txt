@@ -1,3 +1,10 @@
+# Copyright (c) 2026 绿算技术
+# All rights reserved.
+#
+# @File: mooncake-store/src/CMakeLists.txt
+#
+# 修改履历：
+# 2026-07-30 | 绿算技术 | ISAL库链接修复
 # Find Python package
 add_subdirectory(cachelib_memory_allocator)
 
@@ -220,6 +227,9 @@ if(USE_NOF)
       ${SPDK_LIB_DIR}/libspdk_nvme.a
       ${SPDK_LIB_DIR}/libspdk_sock_posix.a
       -Wl,--no-whole-archive
+      # 在 SPDK_STATIC_LIBS 中添加:
+      ${SPDK_LIB_DIR}/libisal.a
+      ${SPDK_LIB_DIR}/libisal_crypto.a
       ${SPDK_LIB_DIR}/libspdk_vfio_user.a
       ${SPDK_LIB_DIR}/libspdk_dma.a
       ${SPDK_LIB_DIR}/libspdk_init.a

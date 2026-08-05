@@ -1,3 +1,12 @@
+/*
+ * Copyright (c) 2026 绿算技术
+ * All rights reserved.
+ *
+ * @File: mooncake-store/src/ssd_register_client.cpp
+ *
+ * 修改履历：
+ * 2026-07-30 | 绿算技术 | NVMe-oF 传输类型支持
+ */
 #include "ssd_register_client.h"
 #include <algorithm>
 #include <cctype>
@@ -27,6 +36,10 @@ int NoFRegisterClient::set_register(const std::string &nqn, size_t nsid,
 
     const char *trtype_env = std::getenv("MC_NOF_TRTYPE");
     std::string trtype = trtype_env ? trtype_env : "RDMA";
+     //Mooncake NoF 代码支持 MC_NOF_TRTYPE 环境变量来选择传输协议 
+    if (trtype != "RDMA" && trtype != "TCP") {
+        trtype = "RDMA";
+    } 
     std::transform(
         trtype.begin(), trtype.end(), trtype.begin(),
         [](unsigned char c) { return static_cast<char>(std::toupper(c)); });

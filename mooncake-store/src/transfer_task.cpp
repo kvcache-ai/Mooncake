@@ -1,3 +1,15 @@
+/*
+ * Copyright (c) 2026 绿算技术
+ * All rights reserved.
+ *
+ * @File:mooncake-store/src/transfer_task.cpp
+ *
+ * 修改履历 | 2026-07-31 | submitSpdkNofOperation 新增 per-client handle 缓存 + TransferSubmitter
+ *                       析构释放缓存 handle；SpdkNofWorkerPool 构造/析构调用
+ *                       SpdkNoF_Register/UnregisterWorkerPool 配合 Cleanup 诊断静态析构顺序
+ * 修改履历 | 2026-08-03 | 新增任务队列流控 (max_queue_depth) + 背压等待；
+ *                       workerThread 新增周期性 TryGrow 再均衡 + 排队积压诊断（本 PR）
+ */
 #include "transfer_task.h"
 
 #include <glog/logging.h>
@@ -89,6 +101,15 @@ static int GetSpdkNofInflightBytesLimit() {
 static int GetSpdkNofWorkerCount() {
     static const int value = GetPositiveEnvOrDefault(
         "MC_NOF_WORKERS", mooncake::kDefaultSpdkNofWorkers);
+    return value;
+}
+
+// 修改履历 | 2026-08-03 | 新增（本 PR）
+// 读取 MC_NOF_MAX_QUEUE_DEPTH 环境变量作为任务队列深度上限。
+// 默认 256。设为 0 表示不限制队列深度（无背压）。
+static int GetSpdkNofMaxQueueDepth() {
+    static const int value =
+        GetPositiveEnvOrDefault("MC_NOF_MAX_QUEUE_DEPTH", 256);
     return value;
 }
 
@@ -290,9 +311,17 @@ SpdkNofWorkerPool::SpdkNofWorkerPool(int numa_socket_id)
       task_queue_(std::make_unique<std::queue<SpdkNofTask>[]>(worker_count_)),
       queue_mutex_(std::make_unique<std::mutex[]>(worker_count_)),
       queue_cv_(std::make_unique<std::condition_variable[]>(worker_count_)),
+      // 修改履历 | 2026-08-03 | 流控：背压条件变量（本 PR）
+      queue_not_full_cv_(
+          std::make_unique<std::condition_variable[]>(worker_count_)),
+      max_queue_depth_(GetSpdkNofMaxQueueDepth()),
       shutdown_(false) {
     VLOG(1) << "Creating SpdkNofWorkerPool with " << worker_count_
-            << " workers";
+            << " workers, max_queue_depth=" << max_queue_depth_;
+
+    // Diagnostic: register with SpdkWrapper so Cleanup() can detect premature
+    // destruction (static destruction order fiasco).
+    SpdkNoF_RegisterWorkerPool();
 
     // Start worker threads
     workers_.reserve(worker_count_);
@@ -315,6 +344,9 @@ SpdkNofWorkerPool::~SpdkNofWorkerPool() {
             worker.join();
         }
     }
+
+    // Diagnostic: all workers joined — safe for SpdkWrapper::Cleanup() to free qpairs.
+    SpdkNoF_UnregisterWorkerPool();
 
     VLOG(1) << "SpdkNofWorkerPool destroyed";
 }
@@ -356,7 +388,36 @@ void SpdkNofWorkerPool::submitTask(SpdkNofTask task) {
     }
 
     {
-        std::lock_guard<std::mutex> lock(queue_mutex_[worker_idx]);
+        // 修改履历 | 2026-08-03 | 流控：队列深度保护（本 PR）。
+        // 当 worker 的任务队列已满时阻塞调用方形成背压，
+        // 防止降级场景下请求在 task_queue_ + seg_to_qos 中无界积压导致内存溢出。
+        // max_queue_depth_ = 0 时跳过检查（不限制）。
+        std::unique_lock<std::mutex> lock(queue_mutex_[worker_idx]);
+        if (max_queue_depth_ > 0 &&
+            static_cast<int>(task_queue_[worker_idx].size()) >=
+                max_queue_depth_) {
+            auto wait_start = std::chrono::steady_clock::now();
+            queue_not_full_cv_[worker_idx].wait(lock, [&] {
+                return shutdown_.load() ||
+                       static_cast<int>(task_queue_[worker_idx].size()) <
+                           max_queue_depth_;
+            });
+            if (shutdown_.load()) {
+                task.state->set_completed(ErrorCode::TRANSFER_FAIL);
+                return;
+            }
+            auto waited =
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - wait_start)
+                    .count();
+            if (waited > 1000) {
+                LOG(WARNING)
+                    << "[SpdkNofWorkerPool] submitTask blocked for " << waited
+                    << "ms (queue full, depth=" << max_queue_depth_
+                    << ", worker=" << worker_idx
+                    << ") — target may be overloaded or qpair pool degraded";
+            }
+        }
         task_queue_[worker_idx].push(std::move(task));
     }
     queue_cv_[worker_idx].notify_one();
@@ -410,6 +471,10 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
     auto& queue_mutex = queue_mutex_[work_idx];
     auto last_debug_snapshot = std::chrono::steady_clock::now();
 
+    // 修改履历 | 2026-08-03 | 再均衡 + 排队积压诊断计时器（本 PR）
+    auto last_rebalance = std::chrono::steady_clock::now();
+    auto last_queue_depth_log = std::chrono::steady_clock::now();
+
     if (!CheckSubTaskPool(sub_task_pool, sub_task_chunks, work_idx)) {
         return;
     }
@@ -435,6 +500,11 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                 if (task == nullptr) {
                     LOG(ERROR)
                         << "alloc SpdkNofTask failed, worker " << work_idx;
+                    // 弹出失败的任务以释放队列空间。
+                    task_queue.pop();
+                    if (max_queue_depth_ > 0) {
+                        queue_not_full_cv_[work_idx].notify_one();
+                    }
                     continue;
                 }
 
@@ -448,10 +518,32 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                         LOG(ERROR)
                             << "alloc SpdkNofQos failed, worker " << work_idx;
                         delete task;
+                        task_queue.pop();
+                        if (max_queue_depth_ > 0) {
+                            queue_not_full_cv_[work_idx].notify_one();
+                        }
                         continue;
                     }
                     nof_qos = qos.get();
                     seg_to_qos[task->seg_handle] = std::move(qos);
+
+                    // 修改履历 | 2026-08-03 | 自适应 inflight（本 PR）。
+                    // 仅在池已降级时（Size < target）缩小 inflight 封顶，
+                    // 防止在单条 qpair 上积累过多在途 I/O。
+                    // 满血池保持原始 32MB 限制以确保最大吞吐量。
+                    auto* seg_conn =
+                        task->seg_handle->segment->GetConnection();
+                    const auto& seg_cfg = seg_conn->GetConfig();
+                    if (seg_cfg.adaptive_inflight) {
+                        auto& pool = seg_conn->GetQpairPool();
+                        if (pool.Size() < pool.GetTargetCount()) {
+                            nof_qos->UpdateInflightLimit(
+                                static_cast<int>(pool.Size()),
+                                static_cast<int>(
+                                    seg_cfg.max_inflight_per_qpair));
+                        }
+                    }
+
                     if (IsSpdkNofDebugEnabled()) {
                         LOG(INFO)
                             << "nof_qos_create worker_idx=" << work_idx
@@ -470,6 +562,11 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                 task->on_chain = true;
                 nof_qos->PushTask(task);
                 task_queue.pop();
+
+                // 通知生产者队列有空位。
+                if (max_queue_depth_ > 0) {
+                    queue_not_full_cv_[work_idx].notify_one();
+                }
             }
         }
 
@@ -561,6 +658,67 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                         << " total_outstanding_io=" << total_outstanding_io;
                 }
                 last_debug_snapshot = now;
+            }
+        }
+
+        // 修改履历 | 2026-08-03 | 周期性再均衡（本 PR）。
+        // 检查所有 seg 的 qpair 池，对降级池尝试 TryGrow 补齐。
+        // 同时联动更新 inflight_blocks_limit 反映恢复后的 qpair 容量。
+        {
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed =
+                std::chrono::duration_cast<std::chrono::seconds>(
+                    now - last_rebalance);
+            if (elapsed.count() >= kRebalanceIntervalSeconds) {
+                last_rebalance = now;
+                for (auto& [seg_handle, nof_qos] : seg_to_qos) {
+                    auto* conn = seg_handle->segment->GetConnection();
+                    auto& pool = conn->GetQpairPool();
+                    uint32_t target = pool.GetTargetCount();
+                    if (pool.Size() < target) {
+                        uint32_t added = pool.TryGrow(target);
+                        if (added > 0) {
+                            // 更新 inflight 上限以反映扩展后的池容量。
+                            const auto& seg_cfg = conn->GetConfig();
+                            if (seg_cfg.adaptive_inflight) {
+                                nof_qos->UpdateInflightLimit(
+                                    static_cast<int>(pool.Size()),
+                                    static_cast<int>(
+                                        seg_cfg.max_inflight_per_qpair));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 修改履历 | 2026-08-03 | 排队积压诊断（本 PR）。
+        // 每 10 秒检查一次 seg_to_qos 中的排队任务数，
+        // 若显著积压则输出警告（降级场景的早期预警）。
+        {
+            auto now = std::chrono::steady_clock::now();
+            auto elapsed =
+                std::chrono::duration_cast<std::chrono::seconds>(
+                    now - last_queue_depth_log);
+            if (elapsed.count() >= 10) {
+                last_queue_depth_log = now;
+                int total_queued = 0;
+                for (const auto& [seg_handle, nof_qos] : seg_to_qos) {
+                    for (int i = 0; i < kSpdkNofOpNum; ++i) {
+                        total_queued +=
+                            CountSpdkNofQueuedTasks(nof_qos->head[i]);
+                    }
+                }
+                if (total_queued > 16) {
+                    // 仅在显著积压时打日志，减少噪音。
+                    LOG(WARNING)
+                        << "[SpdkNofWorkerPool] task backlog: queued="
+                        << total_queued
+                        << " queue_depth=" << task_queue.size()
+                        << " worker=" << work_idx
+                        << " — target throughput may be degraded"
+                        << " (check qpair allocation count)";
+                }
             }
         }
     }
@@ -978,6 +1136,20 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
             << memcpy_enabled_;
 }
 
+// Added 2026-07-31: release cached NoF handles so that QIDs are recycled
+// when a client is closed, rather than lingering until process exit.
+TransferSubmitter::~TransferSubmitter() {
+#ifdef USE_NOF
+    for (auto& [endpoint, handle] : nof_handle_cache_) {
+        if (handle) {
+            VLOG(1) << "TransferSubmitter releasing NoF handle for " << endpoint;
+            SpdkWrapper::GetInstance().CloseNofSegment(handle);
+        }
+    }
+    nof_handle_cache_.clear();
+#endif
+}
+
 std::optional<TransferFuture> TransferSubmitter::submit(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,
     TransferRequest::OpCode op_code, void* ptr, size_t size) {
@@ -1300,12 +1472,21 @@ std::optional<TransferFuture> TransferSubmitter::submitSpdkNofOperation(
         return std::nullopt;
     }
 
-    nof_seg_handle* seg_handle =
-        SpdkWrapper::GetInstance().OpenNofSegment(handle.transport_endpoint_);
-    if (!seg_handle) {
-        LOG(ERROR) << "Failed to open NoF segment endpoint="
-                   << handle.transport_endpoint_;
-        return std::nullopt;
+    // Per-TransferSubmitter handle 缓存 — 同一 client 复用连接，
+    // 避免每次 put() 都创建新连接耗尽 QID + SPDK 内部状态。
+    nof_seg_handle* seg_handle = nullptr;
+    auto cache_it = nof_handle_cache_.find(handle.transport_endpoint_);
+    if (cache_it != nof_handle_cache_.end()) {
+        seg_handle = cache_it->second;
+    } else {
+        seg_handle =
+            SpdkWrapper::GetInstance().OpenNofSegment(handle.transport_endpoint_);
+        if (!seg_handle) {
+            LOG(ERROR) << "Failed to open NoF segment endpoint="
+                       << handle.transport_endpoint_;
+            return std::nullopt;
+        }
+        nof_handle_cache_[handle.transport_endpoint_] = seg_handle;
     }
 
     uint32_t block_size = SpdkWrapper::GetInstance().GetBlockSize(seg_handle);
