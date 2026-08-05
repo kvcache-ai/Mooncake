@@ -263,8 +263,8 @@ Status CudaPlatform::probe(std::vector<Topology::NicEntry>& nic_list,
 }
 
 namespace {
-bool cudaProbeUsable() {
-    static const bool usable = [] {
+bool cudaDevicePresent() {
+    static const bool present = [] {
         int device_count = 0;
         if (cudaGetDeviceCount(&device_count) != cudaSuccess ||
             device_count == 0) {
@@ -272,6 +272,13 @@ bool cudaProbeUsable() {
                             "host memory";
             return false;
         }
+        return true;
+    }();
+    return present;
+}
+
+bool cudaAbiMatches() {
+    static const bool matches = [] {
         int runtime_version = 0;
         // Major version only: struct layout changes across CUDA majors.
         if (cudaRuntimeGetVersion(&runtime_version) == cudaSuccess &&
@@ -285,12 +292,13 @@ bool cudaProbeUsable() {
         }
         return true;
     }();
-    return usable;
+    return matches;
 }
 }  // namespace
 
 MemoryType CudaPlatform::getMemoryType(void* addr) {
-    if (!cudaProbeUsable()) return MTYPE_UNKNOWN;
+    if (!cudaDevicePresent()) return MTYPE_CPU;
+    if (!cudaAbiMatches()) return MTYPE_UNKNOWN;
     cudaPointerAttributes attributes{};
     cudaError_t result = cudaPointerGetAttributes(&attributes, addr);
     if (result != cudaSuccess) {
@@ -323,23 +331,24 @@ const std::vector<RangeLocation> CudaPlatform::getLocation(void* start,
     const static size_t kPageSize = 4096;
     std::vector<RangeLocation> entries;
 
-    if (!cudaProbeUsable()) {
+    if (cudaDevicePresent() && !cudaAbiMatches()) {
         entries.push_back({(uint64_t)start, len, kWildcardLocation});
         return entries;
     }
-    cudaPointerAttributes attributes{};
-    cudaError_t result = cudaPointerGetAttributes(&attributes, start);
-    if (result != cudaSuccess) {
-        LOG(WARNING) << "cudaPointerGetAttributes: "
-                     << cudaGetErrorString(result);
-        entries.push_back({(uint64_t)start, len, kWildcardLocation});
-        return entries;
-    }
-
-    if (attributes.type == cudaMemoryTypeDevice) {
-        entries.push_back(
-            {(uint64_t)start, len, genCudaNodeName(attributes.device)});
-        return entries;
+    if (cudaDevicePresent()) {
+        cudaPointerAttributes attributes{};
+        cudaError_t result = cudaPointerGetAttributes(&attributes, start);
+        if (result != cudaSuccess) {
+            LOG(WARNING) << "cudaPointerGetAttributes: "
+                         << cudaGetErrorString(result);
+            entries.push_back({(uint64_t)start, len, kWildcardLocation});
+            return entries;
+        }
+        if (attributes.type == cudaMemoryTypeDevice) {
+            entries.push_back(
+                {(uint64_t)start, len, genCudaNodeName(attributes.device)});
+            return entries;
+        }
     }
 
     // start and end address may not be page aligned.
