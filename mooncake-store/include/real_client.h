@@ -459,6 +459,11 @@ class RealClient : public PyClient {
         const std::vector<CudaIpcWriteRequest> &requests,
         const ReplicateConfig &config, const UUID &client_id);
 
+    std::vector<tl::expected<void, ErrorCode>>
+    batch_upsert_from_cuda_ipc_dummy_helper(
+        const std::vector<CudaIpcWriteRequest> &requests,
+        const ReplicateConfig &config, const UUID &client_id);
+
     std::vector<tl::expected<int64_t, ErrorCode>>
     batch_get_into_cuda_ipc_dummy_helper(
         const std::vector<CudaIpcReadRequest> &requests, const UUID &client_id);
@@ -792,6 +797,11 @@ class RealClient : public PyClient {
     };
 
     void FreeAllocatedStoreSegment(AllocatedSegmentRecord &record);
+
+    std::vector<tl::expected<void, ErrorCode>>
+    batch_write_from_cuda_ipc_dummy_helper(
+        const std::vector<CudaIpcWriteRequest> &requests,
+        const ReplicateConfig &config, const UUID &client_id, bool is_upsert);
 
     std::unique_ptr<AutoPortBinder> port_binder_ = nullptr;
 

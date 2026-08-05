@@ -14,9 +14,11 @@ int write_manifest_impl(const std::string &key,
     return ret;
 }
 
-std::optional<std::vector<int>> try_dummy_cuda_ipc_batch_put_tensor_impl(
+template <typename CudaIpcBatchWriteFn>
+std::optional<std::vector<int>> try_dummy_cuda_ipc_batch_write_tensor_impl(
     const std::vector<std::string> &keys,
-    const std::vector<PyTensorInfo> &infos, const ReplicateConfig &config) {
+    const std::vector<PyTensorInfo> &infos, const ReplicateConfig &config,
+    const char *operation_name, CudaIpcBatchWriteFn &&write_cuda_ipc) {
     if (!use_dummy_client_ || keys.size() != infos.size()) return std::nullopt;
 
     std::vector<int> results(keys.size(), 0);
@@ -68,13 +70,35 @@ std::optional<std::vector<int>> try_dummy_cuda_ipc_batch_put_tensor_impl(
             MakeIndexedConfig(config, original_indices);
         auto dummy_client = std::static_pointer_cast<DummyClient>(store_);
         std::vector<int> op_results =
-            dummy_client->batch_put_from_cuda_ipc(write_requests, write_config);
-        if (!apply_indexed_results("put", op_results, original_indices,
+            write_cuda_ipc(dummy_client, write_requests, write_config);
+        if (!apply_indexed_results(operation_name, op_results, original_indices,
                                    results)) {
             return results;
         }
     }
     return results;
+}
+
+std::optional<std::vector<int>> try_dummy_cuda_ipc_batch_put_tensor_impl(
+    const std::vector<std::string> &keys,
+    const std::vector<PyTensorInfo> &infos, const ReplicateConfig &config) {
+    return try_dummy_cuda_ipc_batch_write_tensor_impl(
+        keys, infos, config, "put",
+        [](auto dummy_client, const auto &requests, const auto &write_config) {
+            return dummy_client->batch_put_from_cuda_ipc(requests,
+                                                         write_config);
+        });
+}
+
+std::optional<std::vector<int>> try_dummy_cuda_ipc_batch_upsert_tensor_impl(
+    const std::vector<std::string> &keys,
+    const std::vector<PyTensorInfo> &infos, const ReplicateConfig &config) {
+    return try_dummy_cuda_ipc_batch_write_tensor_impl(
+        keys, infos, config, "upsert",
+        [](auto dummy_client, const auto &requests, const auto &write_config) {
+            return dummy_client->batch_upsert_from_cuda_ipc(requests,
+                                                            write_config);
+        });
 }
 
 inline void append_tensor_write_buffers(const PyTensorInfo &info,

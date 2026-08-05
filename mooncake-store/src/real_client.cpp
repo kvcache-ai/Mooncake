@@ -4577,6 +4577,22 @@ std::vector<tl::expected<void, ErrorCode>>
 RealClient::batch_put_from_cuda_ipc_dummy_helper(
     const std::vector<CudaIpcWriteRequest> &requests,
     const ReplicateConfig &config, const UUID &client_id) {
+    return batch_write_from_cuda_ipc_dummy_helper(requests, config, client_id,
+                                                  false);
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+RealClient::batch_upsert_from_cuda_ipc_dummy_helper(
+    const std::vector<CudaIpcWriteRequest> &requests,
+    const ReplicateConfig &config, const UUID &client_id) {
+    return batch_write_from_cuda_ipc_dummy_helper(requests, config, client_id,
+                                                  true);
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+RealClient::batch_write_from_cuda_ipc_dummy_helper(
+    const std::vector<CudaIpcWriteRequest> &requests,
+    const ReplicateConfig &config, const UUID &client_id, bool is_upsert) {
     std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
@@ -4638,6 +4654,10 @@ RealClient::batch_put_from_cuda_ipc_dummy_helper(
         }
     }
 
+    if (is_upsert) {
+        return batch_upsert_from_multi_buffers_internal(keys, all_buffers,
+                                                        all_sizes, config);
+    }
     return batch_put_from_multi_buffers_internal(keys, all_buffers, all_sizes,
                                                  config);
 }

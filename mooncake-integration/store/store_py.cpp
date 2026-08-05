@@ -1045,6 +1045,10 @@ class MooncakeStorePyWrapper {
         const std::vector<std::string> &keys,
         const std::vector<PyTensorInfo> &infos,
         const ReplicateConfig &config = ReplicateConfig{}) {
+        if (auto cuda_ipc_results = try_dummy_cuda_ipc_batch_upsert_tensor_impl(
+                keys, infos, config)) {
+            return *cuda_ipc_results;
+        }
         return batch_write_tensor_impl(
             keys, infos, config, "upsert",
             [this](const std::vector<std::string> &write_keys,

@@ -165,6 +165,7 @@ class TestDistributedObjectStore(unittest.TestCase):
         raw_key = f"{prefix}_raw"
 
         tensor = torch.arange(16, dtype=torch.float32, device="cuda")
+        torch.cuda.synchronize()
         self.assertEqual(self.store.put_tensor(put_key, tensor), 0)
         self.assertEqual(self.store.upsert_tensor(upsert_key, tensor), 0)
         self.assertTrue(torch.equal(self.store.get_tensor(put_key), tensor.cpu()))
@@ -176,6 +177,7 @@ class TestDistributedObjectStore(unittest.TestCase):
             torch.arange(16, dtype=torch.float32, device="cuda").reshape(4, 4),
             torch.arange(24, dtype=torch.int64, device="cuda").reshape(2, 3, 4),
         ]
+        torch.cuda.synchronize()
         self.assertEqual(
             self.store.batch_put_tensor(batch_put_keys, batch_tensors), [0, 0]
         )
