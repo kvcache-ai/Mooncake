@@ -106,13 +106,30 @@ if (WITH_EP)
   # The dedicated directory is injected after auditwheel.
   set(EP_PG_STAGING_DIR "${CMAKE_BINARY_DIR}/ep_pg_staging")
 
+  message(STATUS "WITH_EP enabled: building Mooncake EP natively and PG via setup.py")
+  if(USE_CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    message(STATUS "Detected CUDA version: ${CUDAToolkit_VERSION}")
+  endif()
+
+  # Use the existing EP/PG architecture list for the native EP target too.
+  if(NOT TORCH_CUDA_ARCH_LIST)
+    set(TORCH_CUDA_ARCH_LIST "$ENV{TORCH_CUDA_ARCH_LIST}")
+  endif()
+  if(NOT TORCH_CUDA_ARCH_LIST)
+    set(TORCH_CUDA_ARCH_LIST "8.0;9.0")
+  endif()
+  set(TORCH_CUDA_ARCH_LIST "${TORCH_CUDA_ARCH_LIST}" CACHE STRING
+          "CUDA arch list for EP/PG extension builds (e.g. \"8.0;9.0\")")
+
+  add_subdirectory(mooncake-ep)
+  include_directories(mooncake-ep/include)
+
   add_subdirectory(mooncake-pg)
   include_directories(mooncake-pg/include)
 
   if (EP_USE_IDE)
     message(WARNING "EP_USE_IDE enabled. DO NOT USE IN PRODUCTION!")
-    add_subdirectory(mooncake-ep)
-    include_directories(mooncake-ep/include)
     add_library(
       mooncake_pg_torch_ide OBJECT
       mooncake-pg/torch/src/mooncake_backend.cpp
@@ -123,27 +140,8 @@ if (WITH_EP)
       mooncake_pg_torch_ide
       PRIVATE mooncake-pg/torch/include
               mooncake-pg/include
-              $<TARGET_PROPERTY:mooncake_ep,INCLUDE_DIRECTORIES>)
+              $<TARGET_PROPERTY:_ep,INCLUDE_DIRECTORIES>)
   else ()
-    message(STATUS "WITH_EP enabled: building Mooncake EP natively and PG via setup.py")
-    if(USE_CUDA)
-      find_package(CUDAToolkit REQUIRED)
-      message(STATUS "Detected CUDA version: ${CUDAToolkit_VERSION}")
-    endif()
-
-    # Use the existing EP/PG architecture list for the native EP target too.
-    if(NOT TORCH_CUDA_ARCH_LIST)
-      set(TORCH_CUDA_ARCH_LIST "$ENV{TORCH_CUDA_ARCH_LIST}")
-    endif()
-    if(NOT TORCH_CUDA_ARCH_LIST)
-      set(TORCH_CUDA_ARCH_LIST "8.0;9.0")
-    endif()
-    set(TORCH_CUDA_ARCH_LIST "${TORCH_CUDA_ARCH_LIST}" CACHE STRING
-        "CUDA arch list for EP/PG extension builds (e.g. \"8.0;9.0\")")
-
-    add_subdirectory(mooncake-ep)
-    include_directories(mooncake-ep/include)
-
     # EP_TORCH_VERSIONS: semicolon-separated list of PyTorch versions to build for.
     # Can be set via -DEP_TORCH_VERSIONS="2.9.1;2.8.0" or the EP_TORCH_VERSIONS env var.
     # Empty means build with the currently-installed torch.
