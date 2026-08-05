@@ -7,6 +7,7 @@
 #include <set>
 #include <unordered_map>
 #include <iterator>
+#include <vector>
 #include <time.h>
 #include <ylt/util/tl/expected.hpp>
 
@@ -461,13 +462,24 @@ class FreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
                     idx, getSegmentFreeRatio(allocator_manager, names[idx])};
             }
 
-            std::sort(candidates.begin(), candidates.begin() + sample_count,
-                      [](const Candidate& a, const Candidate& b) {
-                          return a.free_ratio > b.free_ratio;
-                      });
+            // Select only as much of the order as allocation needs. The sample
+            // is capped at six, so this avoids std::sort's generic machinery
+            // and can return before ordering the remaining candidates.
+            for (size_t attempt = 0; attempt < sample_count; ++attempt) {
+                size_t best_pos = attempt;
+                for (size_t i = attempt + 1; i < sample_count; ++i) {
+                    if (candidates[i].free_ratio >
+                        candidates[best_pos].free_ratio) {
+                        best_pos = i;
+                    }
+                }
+                if (best_pos != attempt) {
+                    const Candidate displaced = candidates[attempt];
+                    candidates[attempt] = candidates[best_pos];
+                    candidates[best_pos] = displaced;
+                }
 
-            for (size_t i = 0; i < sample_count; ++i) {
-                const auto& name = names[candidates[i].name_idx];
+                const auto& name = names[candidates[attempt].name_idx];
                 if (auto buffer =
                         allocateSingle(allocator_manager, name, slice_length)) {
                     std::vector<Replica> replicas;
