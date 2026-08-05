@@ -11,7 +11,9 @@ use_maca = (
 )
 if use_musa:
     try:
-        import torchada  # noqa: F401
+        import importlib
+
+        importlib.import_module("torchada")
     except ImportError as e:
         raise ImportError(
             "torchada is required to build the MUSA EP extension. "
