@@ -70,6 +70,17 @@ class EfaTransport : public Transport {
     int unregisterLocalMemoryBatch(
         const std::vector<void*>& addr_list) override;
 
+    // For each memory location the topology knows about (e.g. "cuda:3"), the
+    // indices into `device_names` of the NICs it reports as closest. Locations
+    // whose preferred set is empty, or whose preferred NICs are all absent from
+    // `device_names`, are omitted rather than mapped to an empty vector.
+    //
+    // Exposed for testing; used to build the lookup MC_EFA_NIC_SELECTION=local
+    // consults. See registerLocalMemoryInternal() for the trade-off.
+    static std::unordered_map<std::string, std::vector<size_t>>
+    buildLocalNicMap(const TopologyMatrix& matrix,
+                     const std::vector<std::string>& device_names);
+
     // Eagerly populate the address vector with every (local_ctx, peer_nic)
     // handshake for `segment_name`.
     //
@@ -149,6 +160,12 @@ class EfaTransport : public Transport {
    private:
     std::vector<std::shared_ptr<EfaContext>> context_list_;
     std::shared_ptr<Topology> local_topology_;
+
+    // Memory location -> context_list_ indices of the topology-local NICs,
+    // built once in initializeEfaResources(). Only read when
+    // MC_EFA_NIC_SELECTION=local; empty otherwise. Const after install(), so no
+    // lock is needed on the registration path.
+    std::unordered_map<std::string, std::vector<size_t>> local_nic_map_;
 
     // Track chunked MR registrations for per-NIC partitioned buffers.
     // When a buffer exceeds max_mr_size, it is split into chunks, each

@@ -15,6 +15,7 @@
 #include "pyclient.h"
 #include "client_service.h"
 #include "client_buffer.h"
+#include "device/cuda_ipc_buffer_handle.h"
 #include "mutex.h"
 #include "utils.h"
 #include "rpc_types.h"
@@ -448,6 +449,15 @@ class RealClient : public PyClient {
         const ReplicateConfig &config, int32_t device_id,
         const UUID &client_id);
 
+    std::vector<tl::expected<void, ErrorCode>>
+    batch_put_from_cuda_ipc_dummy_helper(
+        const std::vector<CudaIpcWriteRequest> &requests,
+        const ReplicateConfig &config, const UUID &client_id);
+
+    std::vector<tl::expected<int64_t, ErrorCode>>
+    batch_get_into_cuda_ipc_dummy_helper(
+        const std::vector<CudaIpcReadRequest> &requests, const UUID &client_id);
+
     std::vector<tl::expected<int64_t, ErrorCode>>
     batch_get_into_multi_buffers_dummy_helper(
         const std::vector<std::string> &keys,
@@ -802,6 +812,16 @@ class RealClient : public PyClient {
         }
     };
 
+#ifdef USE_VRAM_SEGMENT
+    struct VRAMSegmentDeleter {
+        void operator()(void *ptr) {
+            if (ptr) {
+                free_memory("vram", ptr);
+            }
+        }
+    };
+#endif
+
 #if defined(USE_SUNRISE)
     struct SunriseSegmentDeleter {
         void operator()(void *ptr) {
@@ -818,6 +838,9 @@ class RealClient : public PyClient {
     std::vector<std::unique_ptr<void, AscendSegmentDeleter>>
         ascend_segment_ptrs_;
     std::vector<std::unique_ptr<void, UbSegmentDeleter>> ub_segment_ptrs_;
+#ifdef USE_VRAM_SEGMENT
+    std::vector<std::unique_ptr<void, VRAMSegmentDeleter>> vram_segment_ptrs_;
+#endif
 #if defined(USE_SUNRISE)
     std::vector<std::unique_ptr<void, SunriseSegmentDeleter>>
         sunrise_segment_ptrs_;

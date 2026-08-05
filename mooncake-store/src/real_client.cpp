@@ -11,8 +11,6 @@
 #include <dlfcn.h>  // for dlsym (Python detection)
 #include <cstdlib>  // for atexit
 #include <algorithm>
-#include <cctype>
-#include <charconv>
 #include <functional>
 #include <limits>
 #include <optional>
@@ -25,6 +23,9 @@
 #include "common.h"
 #include "config.h"
 #include "store_rpc_client_io_context.h"
+#include "bool_parser.h"
+#include "environ.h"
+#include "integer_parser.h"
 #include "mutex.h"
 #include "types.h"
 #include "utils.h"
@@ -33,6 +34,7 @@
 #include "device/accelerator_registry.h"
 #include "default_config.h"
 #include "uds_transport.h"
+#include "device/cuda_ipc_buffer.h"
 #include "shm_helper.h"
 #include "memory_location.h"
 #ifdef USE_NOF
@@ -41,6 +43,12 @@
 #ifdef USE_ASCEND_DIRECT
 #include "acl/acl_rt.h"
 #include "transport/ascend_transport/ascend_direct_transport/context_manager.h"
+#endif
+#ifdef USE_CUDA
+#include <cuda_runtime.h>
+#endif
+#ifdef USE_INTRA_NVLINK
+#include "gpu_vendor/intra_nvlink.h"
 #endif
 
 DEFINE_bool(enable_http_server, false,
@@ -624,9 +632,11 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     } else {
         // Auto port binding with retry on metadata registration failure
         const int kMaxRetries =
-            GetEnvOr<int>("MC_STORE_CLIENT_SETUP_RETRIES", 20);
-        const int rawMinPort = GetEnvOr<int>("MC_STORE_CLIENT_MIN_PORT", 12300);
-        const int rawMaxPort = GetEnvOr<int>("MC_STORE_CLIENT_MAX_PORT", 14300);
+            Environ::GetInt("MC_STORE_CLIENT_SETUP_RETRIES", 20);
+        const int rawMinPort =
+            Environ::GetInt("MC_STORE_CLIENT_MIN_PORT", 12300);
+        const int rawMaxPort =
+            Environ::GetInt("MC_STORE_CLIENT_MAX_PORT", 14300);
         constexpr int kDefaultMinPort = 12300;
         constexpr int kDefaultMaxPort = 14300;
         auto [minPort, maxPort] = ValidatePortRange(
@@ -717,10 +727,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         size_t cxl_dev_size = 0;
         const char *env = std::getenv("MC_CXL_DEV_SIZE");
         if (env) {
-            char *end = nullptr;
-            unsigned long long val = strtoull(env, &end, 10);
-            if (end != env && *end == '\0')
-                cxl_dev_size = static_cast<size_t>(val);
+            cxl_dev_size =
+                TryParseInteger<size_t>(env, {.trim_ascii_whitespace = true,
+                                              .allow_leading_plus = true})
+                    .value_or(0);
         } else {
             LOG(FATAL) << "MC_CXL_DEV_SIZE not set";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -819,7 +829,11 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 hugepage_segment_ptrs_.emplace_back(
                     ptr, HugepageSegmentDeleter{mapped_size});
             } else {
+#ifdef USE_VRAM_SEGMENT
+                vram_segment_ptrs_.emplace_back(ptr);
+#else
                 segment_ptrs_.emplace_back(ptr);
+#endif
             }
 
             // Populate HugeTLB pages in parallel immediately before transfer-
@@ -966,15 +980,6 @@ inline std::optional<size_t> get_config_size(const ConfigDict &config,
     return static_cast<size_t>(parsed_size_opt.value());
 }
 
-inline std::string trim(const std::string &value) {
-    auto start = value.find_first_not_of(" \t\r\n");
-    if (start == std::string::npos) {
-        return "";
-    }
-    auto end = value.find_last_not_of(" \t\r\n");
-    return value.substr(start, end - start + 1);
-}
-
 inline bool get_config_bool(const ConfigDict &config, const std::string &key,
                             bool default_value) {
     auto it = config.find(key);
@@ -982,16 +987,9 @@ inline bool get_config_bool(const ConfigDict &config, const std::string &key,
         return default_value;
     }
 
-    std::string value = trim(it->second);
-    std::transform(value.begin(), value.end(), value.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
-    if (value == "true" || value == "1" || value == "yes" || value == "on" ||
-        value == "enable") {
-        return true;
-    }
-    if (value == "false" || value == "0" || value == "no" || value == "off" ||
-        value == "disable") {
-        return false;
+    const auto parsed = TryParseBool(it->second);
+    if (parsed.has_value()) {
+        return *parsed;
     }
 
     LOG(WARNING) << "Invalid boolean value for config key '" << key
@@ -1007,17 +1005,14 @@ inline std::optional<int> get_config_int(const ConfigDict &config,
         return default_value;
     }
 
-    std::string value = trim(it->second);
-    int parsed_value = 0;
-    const char *begin = value.data();
-    const char *end = begin + value.size();
-    auto [ptr, ec] = std::from_chars(begin, end, parsed_value);
-    if (ec != std::errc{} || ptr != end) {
+    const auto parsed_value =
+        TryParseInteger<int>(it->second, {.trim_ascii_whitespace = true});
+    if (!parsed_value.has_value()) {
         LOG(ERROR) << "Invalid integer value for config key '" << key
                    << "': " << it->second;
         return std::nullopt;
     }
-    return parsed_value;
+    return *parsed_value;
 }
 }  // namespace
 
@@ -1172,6 +1167,9 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     hugepage_segment_ptrs_.clear();
     segment_ptrs_.clear();
     ub_segment_ptrs_.clear();
+#ifdef USE_VRAM_SEGMENT
+    vram_segment_ptrs_.clear();
+#endif
 #if defined(USE_SUNRISE)
     sunrise_segment_ptrs_.clear();
 #endif
@@ -4485,6 +4483,145 @@ RealClient::batch_put_from_multi_buffers_dummy_helper(
 
     return batch_put_from_multi_buffers_internal(
         keys, real_buffers_result.value(), all_sizes, config);
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+RealClient::batch_put_from_cuda_ipc_dummy_helper(
+    const std::vector<CudaIpcWriteRequest> &requests,
+    const ReplicateConfig &config, const UUID &client_id) {
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+        return std::vector<tl::expected<void, ErrorCode>>(
+            requests.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+
+    const ShmContext &context = it->second;
+    const bool has_metadata =
+        !requests.empty() && requests[0].metadata.size != 0;
+    for (const auto &request : requests) {
+        if ((request.metadata.size != 0) != has_metadata) {
+            LOG(ERROR) << "Mixed cuda ipc metadata batches are not supported";
+            return std::vector<tl::expected<void, ErrorCode>>(
+                requests.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+        }
+    }
+
+    std::vector<device::CudaIpcBufferMapping> payload_mappings;
+    std::vector<std::string> keys;
+    std::vector<std::vector<void *>> all_buffers;
+    std::vector<std::vector<size_t>> all_sizes;
+    payload_mappings.reserve(requests.size());
+    keys.reserve(requests.size());
+    all_buffers.reserve(requests.size());
+    all_sizes.reserve(requests.size());
+
+    const MappedShm *last_hit_shm = nullptr;
+    for (const auto &request : requests) {
+        auto mapping = device::CudaIpcBufferMapping::Open(request.payload);
+        if (!mapping) {
+            return std::vector<tl::expected<void, ErrorCode>>(
+                requests.size(), tl::unexpected(mapping.error()));
+        }
+        payload_mappings.push_back(std::move(*mapping));
+        void *payload_ptr = payload_mappings.back().ptr();
+        keys.push_back(request.key);
+        if (has_metadata) {
+            void *metadata_ptr = nullptr;
+            if (!map_dummy_buffer_to_real(
+                    context, request.metadata.ptr,
+                    static_cast<size_t>(request.metadata.size), last_hit_shm,
+                    metadata_ptr)) {
+                LOG(ERROR) << "Dummy metadata buffer at "
+                           << request.metadata.ptr << " (size "
+                           << request.metadata.size
+                           << ") not found in any mapped shared memory, "
+                           << "client_id=" << client_id;
+                return std::vector<tl::expected<void, ErrorCode>>(
+                    requests.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+            }
+            all_buffers.push_back({metadata_ptr, payload_ptr});
+            all_sizes.push_back({static_cast<size_t>(request.metadata.size),
+                                 static_cast<size_t>(request.payload.size)});
+        } else {
+            all_buffers.push_back({payload_ptr});
+            all_sizes.push_back({static_cast<size_t>(request.payload.size)});
+        }
+    }
+
+    return batch_put_from_multi_buffers_internal(keys, all_buffers, all_sizes,
+                                                 config);
+}
+
+std::vector<tl::expected<int64_t, ErrorCode>>
+RealClient::batch_get_into_cuda_ipc_dummy_helper(
+    const std::vector<CudaIpcReadRequest> &requests, const UUID &client_id) {
+    {
+        std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+        if (shm_contexts_.find(client_id) == shm_contexts_.end()) {
+            LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+            return std::vector<tl::expected<int64_t, ErrorCode>>(
+                requests.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+        }
+    }
+
+    std::vector<tl::expected<int64_t, ErrorCode>> results(
+        requests.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    std::vector<device::CudaIpcBufferMapping> mappings;
+    std::vector<void *> buffers;
+    std::vector<std::vector<std::string>> all_keys;
+    std::vector<std::vector<std::vector<size_t>>> all_dst_offsets;
+    std::vector<std::vector<std::vector<size_t>>> all_src_offsets;
+    std::vector<std::vector<std::vector<size_t>>> all_sizes;
+    std::vector<size_t> buffer_capacities;
+    std::vector<size_t> original_indices;
+    mappings.reserve(requests.size());
+    buffers.reserve(requests.size());
+    all_keys.reserve(requests.size());
+    all_dst_offsets.reserve(requests.size());
+    all_src_offsets.reserve(requests.size());
+    all_sizes.reserve(requests.size());
+    buffer_capacities.reserve(requests.size());
+    original_indices.reserve(requests.size());
+
+    for (size_t i = 0; i < requests.size(); ++i) {
+        const auto &request = requests[i];
+        auto mapping = device::CudaIpcBufferMapping::Open(request.destination);
+        if (!mapping) {
+            results[i] = tl::unexpected(mapping.error());
+            continue;
+        }
+        mappings.push_back(std::move(*mapping));
+        buffers.push_back(mappings.back().ptr());
+        all_keys.push_back({request.key});
+        all_dst_offsets.push_back({{0}});
+        all_src_offsets.push_back(
+            {{static_cast<size_t>(request.source_offset)}});
+        all_sizes.push_back({{static_cast<size_t>(request.size)}});
+        buffer_capacities.push_back(static_cast<size_t>(request.size));
+        original_indices.push_back(i);
+    }
+
+    if (buffers.empty()) {
+        return results;
+    }
+
+    auto range_results = get_into_ranges_internal(
+        buffers, all_keys, all_dst_offsets, all_src_offsets, all_sizes,
+        &buffer_capacities, nullptr, nullptr, nullptr);
+    for (size_t i = 0; i < original_indices.size(); ++i) {
+        if (i < range_results.size() && range_results[i].size() == 1 &&
+            range_results[i][0].size() == 1) {
+            results[original_indices[i]] = range_results[i][0][0];
+        } else {
+            LOG(ERROR) << "Invalid cuda ipc tensor read result shape for key "
+                       << requests[original_indices[i]].key;
+            results[original_indices[i]] =
+                tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+    }
+    return results;
 }
 
 std::vector<tl::expected<int64_t, ErrorCode>>

@@ -24,6 +24,7 @@ class OpLogBatchStorage {
    private:
     bool IsValidClusterId() const;
     ErrorCode RejectLegacyLayout() const;
+    ErrorCode ValidateDurablePrefixAtStartup(const DurablePrefix& prefix);
 
     std::string cluster_id_;
     HaKvBackend& backend_;

@@ -144,6 +144,21 @@ if (WITH_EP)
     string(REPLACE ";" "|" _ep_torch_versions_pipe "${EP_TORCH_VERSIONS}")
     string(REPLACE ";" "|" _torch_cuda_arch_list_pipe "${TORCH_CUDA_ARCH_LIST}")
 
+    # PG is compiled by setup.py rather than as a native CMake target. Pass it
+    # the exact YLT include directories selected by find_package() so its
+    # header-only RPC types have the same ABI as engine.so.
+    get_target_property(
+      _pg_ylt_include_dirs
+      yalantinglibs::yalantinglibs
+      INTERFACE_INCLUDE_DIRECTORIES
+    )
+    if(NOT _pg_ylt_include_dirs)
+      message(FATAL_ERROR
+        "yalantinglibs::yalantinglibs has no INTERFACE_INCLUDE_DIRECTORIES")
+    endif()
+    string(REPLACE ";" "|" _pg_ylt_include_dirs_pipe
+           "${_pg_ylt_include_dirs}")
+
     add_custom_target(mooncake_ep_ext ALL
       COMMAND ${CMAKE_COMMAND} -E make_directory "${EP_PG_STAGING_DIR}"
       COMMAND ${CMAKE_COMMAND}
@@ -173,12 +188,14 @@ if (WITH_EP)
         "-DTORCH_CUDA_ARCH_LIST=${_torch_cuda_arch_list_pipe}"
         "-DSTAGING_DIR=${EP_PG_STAGING_DIR}"
         "-DENGINE_SO_PATH=$<TARGET_FILE:engine>"
+        "-DASIO_SO_PATH=$<TARGET_FILE:asio_shared>"
+        "-DYLT_INCLUDE_DIRS=${_pg_ylt_include_dirs_pipe}"
         "-DPython3_EXECUTABLE=${Python3_EXECUTABLE}"
         "-DEP_USE_MUSA=$<IF:$<BOOL:${USE_MUSA}>,1,0>"
         "-DEP_USE_MACA=$<IF:$<BOOL:${USE_MACA}>,1,0>"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/BuildPgExt.cmake"
       COMMENT "Building Mooncake PG Python extension(s)"
-      DEPENDS engine mooncake_ep_ext
+      DEPENDS engine asio_shared mooncake_ep_ext
       VERBATIM
     )
   endif ()

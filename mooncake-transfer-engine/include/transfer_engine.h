@@ -62,6 +62,11 @@ enum class PeerLiveness : uint8_t {
     Unreachable = 1,
 };
 
+struct AutoDiscoverConfig {
+    bool enabled = false;
+    std::string protocol;
+};
+
 class TransferEngine {
    public:
 #ifdef ENABLE_MULTI_PROTOCOL
@@ -254,6 +259,7 @@ class TransferEngine {
     bool checkOverlap(void* addr, uint64_t length);
 
     void setAutoDiscover(bool auto_discover);
+    void setAutoDiscover(const AutoDiscoverConfig& config);
 
     void* getBaseAddr();
 

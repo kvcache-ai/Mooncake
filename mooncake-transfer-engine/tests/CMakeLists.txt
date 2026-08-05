@@ -70,6 +70,22 @@ add_test(NAME rdma_endpoint_reestablish_test
          COMMAND rdma_endpoint_reestablish_test)
 set_tests_properties(rdma_endpoint_reestablish_test PROPERTIES LABELS "rdma")
 
+# Regression test for the edge-triggered async event fd: one epoll wakeup must
+# drain the whole queue. Wraps ibv_get_async_event to script the event source,
+# so it needs no RDMA device. -Wl,--wrap is a GNU ld / lld feature that Apple's
+# linker lacks, and the test is meaningless without it, so skip the target there
+# rather than build one that calls the real symbols.
+if(UNIX AND NOT APPLE)
+  add_executable(rdma_async_event_drain_test
+                 ${WORKSPACE}/rdma_async_event_drain_test.cpp)
+  target_link_libraries(rdma_async_event_drain_test PUBLIC transfer_engine
+                                                           gtest gtest_main)
+  target_link_options(
+    rdma_async_event_drain_test PRIVATE "-Wl,--wrap=ibv_get_async_event"
+    "-Wl,--wrap=ibv_ack_async_event")
+  add_test(NAME rdma_async_event_drain_test COMMAND rdma_async_event_drain_test)
+endif()
+
 if(USE_CXL)
   add_executable(cxl_transport_test ${WORKSPACE}/cxl_transport_test.cpp)
   target_link_libraries(cxl_transport_test PUBLIC transfer_engine gtest

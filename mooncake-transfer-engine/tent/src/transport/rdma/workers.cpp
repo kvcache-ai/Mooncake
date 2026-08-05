@@ -992,8 +992,8 @@ Status Workers::selectFallbackDevice(RouteHint& source, RouteHint& target,
         if (reachable) {
             slice->source_dev_id = sdev;
             slice->target_dev_id = tdev;
-            slice->source_lkey = source.buffer->lkey[slice->source_dev_id];
-            slice->target_rkey = target.buffer->rkey[slice->target_dev_id];
+            // Keys are assigned by generatePostPath() once the device pair is
+            // settled.
             return Status::OK();
         }
 
@@ -1016,8 +1016,19 @@ Status Workers::generatePostPath(RdmaSlice* slice) {
         CHECK_STATUS(selectOptimalDevice(source, target, slice));
     else
         CHECK_STATUS(selectFallbackDevice(source, target, slice));
-    slice->source_lkey = source.buffer->lkey[slice->source_dev_id];
-    slice->target_rkey = target.buffer->rkey[slice->target_dev_id];
+    // Keys are NicID-indexed. A peer running an older build publishes a
+    // compacted rkey vector, so a NicID from its device_list can point past the
+    // end; fail the slice instead of reading out of bounds.
+    const auto& lkeys = source.buffer->lkey;
+    const auto& rkeys = target.buffer->rkey;
+    if (slice->source_dev_id < 0 ||
+        (size_t)slice->source_dev_id >= lkeys.size() ||
+        slice->target_dev_id < 0 ||
+        (size_t)slice->target_dev_id >= rkeys.size())
+        return Status::DeviceNotFound(
+            "Selected device has no registered memory key" LOC_MARK);
+    slice->source_lkey = lkeys[slice->source_dev_id];
+    slice->target_rkey = rkeys[slice->target_dev_id];
     // Cache the RailMonitor pointer so asyncPollCq / disableEndpoint can
     // update rail state without a segment lookup or string-keyed map
     // lookup on the hot path.
