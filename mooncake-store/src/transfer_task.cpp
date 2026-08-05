@@ -1708,8 +1708,7 @@ TransferSubmitter::submitSpdkNofRangeReadOperation(
     }
     std::shared_ptr<void> discard_owner;
     if (discard_size != 0) {
-        discard_owner = AllocateDmaOwner(
-            static_cast<size_t>(discard_size), block_size, &discard_buffer);
+        discard_owner = AllocateDmaOwner(static_cast<size_t>(discard_size), block_size, &discard_buffer);
         if (!discard_owner) {
             LOG(ERROR) << "Failed to allocate NoF discard DMA buffer";
             return std::nullopt;
@@ -1733,8 +1732,7 @@ TransferSubmitter::submitSpdkNofRangeReadOperation(
         }
         const uintptr_t tail_address =
             discard_address + static_cast<uintptr_t>(head_discard);
-        if (!AppendDmaSges(reinterpret_cast<void*>(tail_address),
-                           tail_discard, &sgl)) {
+        if (!AppendDmaSges(reinterpret_cast<void*>(tail_address), tail_discard, &sgl)) {
             return std::nullopt;
         }
     }
@@ -1744,19 +1742,14 @@ TransferSubmitter::submitSpdkNofRangeReadOperation(
 
     if (!ValidateSgl(sgl, physical_size, capabilities)) {
         LOG(ERROR) << "NoF range-read SGL violates Controller requirements"
-                   << ", dword_required="
-                   << capabilities.requires_dword_alignment
-                   << ", src_offset=" << src_offset
-                   << ", destination=" << ptr
-                   << ", size=" << size
-                   << ", head_discard=" << head_discard
+                   << ", dword_required=" << capabilities.requires_dword_alignment
+                   << ", src_offset=" << src_offset << ", destination=" << ptr
+                   << ", size=" << size << ", head_discard=" << head_discard
                    << ", tail_discard=" << tail_discard;
         return std::nullopt;
     }
 
-    const uint64_t start_lba =
-        handle.buffer_address_ / block_size +
-        physical_relative_start / block_size;
+    const uint64_t start_lba = handle.buffer_address_ / block_size + physical_relative_start / block_size;
     auto state = std::make_shared<SpdkNofOperationState>();
     SpdkNofTask task(seg_handle, std::move(sgl), start_lba, lba_count,
                      TransferRequest::READ, state, std::move(owners));
