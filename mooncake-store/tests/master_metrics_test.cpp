@@ -337,12 +337,20 @@ TEST_F(MasterMetricsTest, SnapshotReaderTeardownKeepsCapacityIntact) {
         ASSERT_TRUE(
             reader_serializer.Deserialize(snapshot.value()).has_value());
         const auto restored_usage = reader.GetMemoryUsageSnapshot();
+        const auto restored_aggregate = reader.GetMemoryUsage();
         EXPECT_EQ(restored_usage.used_bytes, kAllocationSize);
         EXPECT_EQ(restored_usage.capacity_bytes, segment.size);
         EXPECT_DOUBLE_EQ(restored_usage.used_ratio(), 0.25);
+        EXPECT_EQ(restored_aggregate.used_bytes, kAllocationSize);
+        EXPECT_EQ(restored_aggregate.capacity_bytes, segment.size);
+        EXPECT_DOUBLE_EQ(restored_aggregate.used_ratio(), 0.25);
         ASSERT_EQ(restored_usage.segments.size(), 1u);
         EXPECT_EQ(restored_usage.segments.at(segment.name).used_bytes,
                   kAllocationSize);
+
+        reader_serializer.Reset();
+        EXPECT_EQ(reader.GetMemoryUsage().used_bytes, 0u);
+        EXPECT_EQ(reader.GetMemoryUsage().capacity_bytes, 0u);
     }
     ASSERT_EQ(metrics.get_total_mem_capacity(), capacity_after_mount);
     ASSERT_EQ(metrics.get_segment_total_mem_capacity(segment.name),

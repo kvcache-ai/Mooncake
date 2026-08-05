@@ -9,6 +9,7 @@
 
 #include "cachelib_memory_allocator/MemoryAllocator.h"
 #include "offset_allocator/offset_allocator.h"
+#include "storage_usage.h"
 #include "types.h"
 
 using facebook::cachelib::MemoryAllocator;
@@ -109,7 +110,7 @@ class AllocatedBuffer {
  */
 class BufferAllocatorBase {
    public:
-    virtual ~BufferAllocatorBase() = default;
+    virtual ~BufferAllocatorBase();
 
     virtual std::unique_ptr<AllocatedBuffer> allocate(size_t size) = 0;
     virtual void deallocate(AllocatedBuffer* handle) = 0;
@@ -128,6 +129,25 @@ class BufferAllocatorBase {
      * allocation may still fail due to race conditions or fragmentation.
      */
     virtual size_t getLargestFreeRegion() const = 0;
+
+    void AttachUsageTracker(
+        const std::shared_ptr<StorageUsageTracker>& usage_tracker);
+    void DetachUsageTracker();
+
+   protected:
+    [[nodiscard]] size_t GetUsageBytes() const noexcept {
+        return cur_size_.load(std::memory_order_relaxed);
+    }
+    void RecordAllocation(size_t bytes) noexcept;
+    void RecordDeallocation(size_t bytes) noexcept;
+    void SetUsageBytesForRestore(size_t bytes) noexcept {
+        cur_size_.store(bytes, std::memory_order_relaxed);
+    }
+
+   private:
+    std::atomic_size_t cur_size_{0};
+    std::shared_ptr<StorageUsageTracker> usage_tracker_;
+    size_t tracked_capacity_{0};
 };
 
 /**
@@ -198,7 +218,7 @@ class CachelibBufferAllocator
     void deallocate(AllocatedBuffer* handle) override;
 
     size_t capacity() const override { return total_size_; }
-    size_t size() const override { return cur_size_.load(); }
+    size_t size() const override { return GetUsageBytes(); }
     std::string getSegmentName() const override { return segment_name_; }
     std::string getTransportEndpoint() const override {
         return transport_endpoint_;
@@ -220,7 +240,6 @@ class CachelibBufferAllocator
     const std::string segment_name_;
     const size_t base_;
     const size_t total_size_;
-    std::atomic_size_t cur_size_;
     const std::string transport_endpoint_;
     const ReplicaType replica_type_;
 
@@ -272,7 +291,7 @@ class OffsetBufferAllocator
     void deallocate(AllocatedBuffer* handle) override;
 
     size_t capacity() const override { return total_size_; }
-    size_t size() const override { return cur_size_.load(); }
+    size_t size() const override { return GetUsageBytes(); }
     std::string getSegmentName() const override { return segment_name_; }
     std::string getTransportEndpoint() const override {
         return transport_endpoint_;
@@ -290,11 +309,14 @@ class OffsetBufferAllocator
     }
 
    private:
+    void RestoreUsageBytes(size_t bytes) noexcept {
+        SetUsageBytesForRestore(bytes);
+    }
+
     // metadata
     const std::string segment_name_;
     const size_t base_;
     const size_t total_size_;
-    std::atomic_size_t cur_size_;
     const std::string transport_endpoint_;
     const ReplicaType replica_type_;
 

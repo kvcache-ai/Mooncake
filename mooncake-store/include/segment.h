@@ -14,6 +14,7 @@
 #include "allocation_strategy.h"
 #include "allocator.h"
 #include "rpc_types.h"
+#include "storage_usage.h"
 #include "types.h"
 
 namespace mooncake {
@@ -441,19 +442,6 @@ class SegmentSerializer {
     SegmentManager* segment_manager_;
 };
 
-struct StorageUsage {
-    size_t used_bytes{0};
-    size_t capacity_bytes{0};
-
-    [[nodiscard]] double used_ratio() const noexcept {
-        if (capacity_bytes == 0) {
-            return 0.0;
-        }
-        return static_cast<double>(used_bytes) /
-               static_cast<double>(capacity_bytes);
-    }
-};
-
 struct StorageUsageSnapshot : StorageUsage {
     std::map<std::string, StorageUsage> segments;
 };
@@ -518,6 +506,16 @@ class SegmentManager {
      */
     [[nodiscard]] StorageUsageSnapshot GetMemoryUsageSnapshot() const;
 
+    /**
+     * @brief Return aggregate DRAM usage in O(1) without segment_mutex_.
+     *
+     * Best-effort: used/capacity may tear briefly across mount/unmount, matching
+     * the previous metric-gauge watermark reads.
+     */
+    [[nodiscard]] StorageUsage GetMemoryUsage() const noexcept {
+        return usage_tracker_->GetUsage();
+    }
+
     void initializeCxlAllocator(const std::string& cxl_path,
                                 const size_t cxl_size);
 
@@ -527,6 +525,11 @@ class SegmentManager {
                              std::string& te_endpoint) const;
 
    private:
+    void AttachMountedUsageTrackers();
+    void DetachMountedUsageTrackers();
+
+    std::shared_ptr<StorageUsageTracker> usage_tracker_ =
+        std::make_shared<StorageUsageTracker>();
     mutable std::shared_mutex segment_mutex_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
     const BufferAllocatorType
@@ -600,6 +603,16 @@ class NoFSegmentManager {
      */
     [[nodiscard]] StorageUsageSnapshot GetUsageSnapshot() const;
 
+    /**
+     * @brief Return aggregate NoF usage in O(1) without segment_mutex_.
+     *
+     * Best-effort: used/capacity may tear briefly across mount/unmount, matching
+     * the previous metric-gauge watermark reads.
+     */
+    [[nodiscard]] StorageUsage GetUsage() const noexcept {
+        return usage_tracker_->GetUsage();
+    }
+
     tl::expected<std::vector<NoFSegmentOwnerInfo>, ErrorCode> GetSegmentsByName(
         const std::string& segment_name) const {
         std::shared_lock<std::shared_mutex> lock(segment_mutex_);
@@ -616,6 +629,8 @@ class NoFSegmentManager {
     }
 
    private:
+    std::shared_ptr<StorageUsageTracker> usage_tracker_ =
+        std::make_shared<StorageUsageTracker>();
     mutable std::shared_mutex segment_mutex_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
     const BufferAllocatorType

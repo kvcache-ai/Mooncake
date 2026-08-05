@@ -148,6 +148,35 @@ StorageUsageSnapshot SegmentManager::GetMemoryUsageSnapshot() const {
     return snapshot;
 }
 
+void SegmentManager::AttachMountedUsageTrackers() {
+    std::unordered_set<const BufferAllocatorBase*> attached_allocators;
+    if (cxl_global_allocator_) {
+        cxl_global_allocator_->AttachUsageTracker(usage_tracker_);
+        attached_allocators.insert(cxl_global_allocator_.get());
+    }
+    for (auto& [segment_id, mounted_segment] : mounted_segments_) {
+        (void)segment_id;
+        auto& allocator = mounted_segment.buf_allocator;
+        if (allocator && attached_allocators.insert(allocator.get()).second) {
+            allocator->AttachUsageTracker(usage_tracker_);
+        }
+    }
+}
+
+void SegmentManager::DetachMountedUsageTrackers() {
+    std::unordered_set<const BufferAllocatorBase*> detached_allocators;
+    if (cxl_global_allocator_) {
+        detached_allocators.insert(cxl_global_allocator_.get());
+    }
+    for (auto& [segment_id, mounted_segment] : mounted_segments_) {
+        (void)segment_id;
+        auto& allocator = mounted_segment.buf_allocator;
+        if (allocator && detached_allocators.insert(allocator.get()).second) {
+            allocator->DetachUsageTracker();
+        }
+    }
+}
+
 ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
                                             const UUID& client_id) {
     const uintptr_t buffer = segment.base;
@@ -246,6 +275,7 @@ ErrorCode ScopedSegmentAccess::MountSegment(const Segment& segment,
         return ErrorCode::INVALID_PARAMS;
     }
 
+    allocator->AttachUsageTracker(segment_manager_->usage_tracker_);
     segment_manager_->allocator_manager_.addAllocator(segment.name, allocator);
     segment_manager_->client_segments_[client_id].push_back(segment.id);
     segment_manager_->mounted_segments_[segment.id] = {
@@ -360,6 +390,11 @@ bool ScopedSegmentAccess::ReplaceAllocators(
         return false;
     }
     for (const auto& replacement : replacements) {
+        if (replacement.expected != replacement.replacement) {
+            replacement.expected->DetachUsageTracker();
+            replacement.replacement->AttachUsageTracker(
+                segment_manager_->usage_tracker_);
+        }
         segment_manager_->mounted_segments_.at(replacement.segment_id)
             .buf_allocator = replacement.replacement;
     }
@@ -405,6 +440,9 @@ ErrorCode ScopedSegmentAccess::PrepareUnmountSegment(
     RemoveHostSegment(segment_manager_->segments_by_host_, segment);
 
     // 2. Remove from mounted_segment
+    if (allocator && allocator != segment_manager_->cxl_global_allocator_) {
+        allocator->DetachUsageTracker();
+    }
     mounted_segment.buf_allocator.reset();
 
     // Set the segment status to UNMOUNTING
@@ -483,6 +521,11 @@ ErrorCode ScopedSegmentAccess::CommitUnmountSegment(
     auto&& segment = segment_manager_->mounted_segments_.find(segment_id);
     if (segment != segment_manager_->mounted_segments_.end()) {
         segment_name = segment->second.segment.name;
+        if (segment->second.buf_allocator &&
+            segment->second.buf_allocator !=
+                segment_manager_->cxl_global_allocator_) {
+            segment->second.buf_allocator->DetachUsageTracker();
+        }
         RemoveHostSegment(segment_manager_->segments_by_host_,
                           segment->second.segment);
         auto segment_id_by_name_it =
@@ -867,6 +910,7 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
     }
 
     // Clear existing data
+    segment_manager_->DetachMountedUsageTrackers();
     segment_manager_->mounted_segments_.clear();
     segment_manager_->client_segments_.clear();
     segment_manager_->segments_by_host_.clear();
@@ -1222,10 +1266,12 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
         }
     }
 
+    segment_manager_->AttachMountedUsageTrackers();
     return {};
 }
 
 void SegmentSerializer::Reset() {
+    segment_manager_->DetachMountedUsageTrackers();
     segment_manager_->mounted_segments_.clear();
     segment_manager_->client_segments_.clear();
     segment_manager_->client_by_name_.clear();
@@ -1418,6 +1464,7 @@ ErrorCode ScopedNoFSegmentAccess::MountSegment(const NoFSegment& segment,
         return ErrorCode::INVALID_PARAMS;
     }
 
+    allocator->AttachUsageTracker(nof_segment_manager_->usage_tracker_);
     nof_segment_manager_->allocator_manager_.addAllocator(segment.name,
                                                           allocator);
     nof_segment_manager_->client_segments_[client_id].push_back(segment.id);
@@ -1480,6 +1527,9 @@ ErrorCode ScopedNoFSegmentAccess::PrepareUnmountSegment(
                                                                  allocator);
     }
 
+    if (allocator) {
+        allocator->DetachUsageTracker();
+    }
     mounted_segment.buf_allocator.reset();
     mounted_segment.status = SegmentStatus::UNMOUNTING;
     return ErrorCode::OK;
@@ -1511,6 +1561,9 @@ ErrorCode ScopedNoFSegmentAccess::CommitUnmountSegment(
     auto segment_it = nof_segment_manager_->mounted_segments_.find(segment_id);
     if (segment_it != nof_segment_manager_->mounted_segments_.end()) {
         segment_name = segment_it->second.segment.name;
+        if (segment_it->second.buf_allocator) {
+            segment_it->second.buf_allocator->DetachUsageTracker();
+        }
         nof_segment_manager_->client_by_name_.erase(segment_name);
     }
 
@@ -1641,8 +1694,12 @@ void SegmentManager::initializeCxlAllocator(const std::string& cxl_path,
               << std::fixed << std::setprecision(2)
               << cxl_size / (1024.0 * 1024 * 1024) << " GB)";
 
+    if (cxl_global_allocator_) {
+        cxl_global_allocator_->DetachUsageTracker();
+    }
     cxl_global_allocator_ = std::make_shared<CachelibBufferAllocator>(
         cxl_path, DEFAULT_CXL_BASE, cxl_size, cxl_path);
+    cxl_global_allocator_->AttachUsageTracker(usage_tracker_);
     MasterMetricManager::instance().inc_total_mem_capacity(cxl_path, cxl_size);
 }
 

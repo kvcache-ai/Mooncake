@@ -8,7 +8,10 @@
 #include <boost/functional/hash.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <functional>
+#include <future>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -148,11 +151,23 @@ class SegmentTest : public ::testing::Test {
         SegmentManager& segment_manager,
         const std::shared_ptr<BufferAllocatorBase>& allocator,
         const std::vector<Segment>& segments) {
-        segment_manager.cxl_global_allocator_ = allocator;
+        if (segment_manager.cxl_global_allocator_ != allocator) {
+            if (segment_manager.cxl_global_allocator_) {
+                segment_manager.cxl_global_allocator_->DetachUsageTracker();
+            }
+            segment_manager.cxl_global_allocator_ = allocator;
+            allocator->AttachUsageTracker(segment_manager.usage_tracker_);
+        }
         for (const auto& segment : segments) {
             segment_manager.mounted_segments_[segment.id] = {
                 segment, SegmentStatus::OK, allocator};
         }
+    }
+
+    std::unique_lock<std::shared_mutex> HoldSegmentMutexForTesting(
+        SegmentManager& segment_manager) {
+        return std::unique_lock<std::shared_mutex>(
+            segment_manager.segment_mutex_);
     }
 
     std::shared_ptr<BufferAllocatorBase> GetNoFAllocatorForTesting(
@@ -209,9 +224,13 @@ TEST_F(SegmentTest, MemoryUsageSnapshotTracksMountedAllocatorState) {
     ASSERT_NE(buffer, nullptr);
 
     auto snapshot = segment_manager.GetMemoryUsageSnapshot();
+    auto usage = segment_manager.GetMemoryUsage();
     EXPECT_EQ(snapshot.used_bytes, kAllocationSize);
     EXPECT_EQ(snapshot.capacity_bytes, kSegmentSize);
     EXPECT_DOUBLE_EQ(snapshot.used_ratio(), 0.25);
+    EXPECT_EQ(usage.used_bytes, kAllocationSize);
+    EXPECT_EQ(usage.capacity_bytes, kSegmentSize);
+    EXPECT_DOUBLE_EQ(usage.used_ratio(), 0.25);
     ASSERT_EQ(snapshot.segments.size(), 1u);
     EXPECT_EQ(snapshot.segments.at(segment.name).used_bytes, kAllocationSize);
     EXPECT_EQ(snapshot.segments.at(segment.name).capacity_bytes, kSegmentSize);
@@ -239,9 +258,82 @@ TEST_F(SegmentTest, MemoryUsageSnapshotTracksMountedAllocatorState) {
     }
 
     snapshot = segment_manager.GetMemoryUsageSnapshot();
+    usage = segment_manager.GetMemoryUsage();
     EXPECT_EQ(snapshot.used_bytes, 0u);
     EXPECT_EQ(snapshot.capacity_bytes, 0u);
     EXPECT_DOUBLE_EQ(snapshot.used_ratio(), 0.0);
+    EXPECT_EQ(usage.used_bytes, 0u);
+    EXPECT_EQ(usage.capacity_bytes, 0u);
+}
+
+TEST_F(SegmentTest, AggregateMemoryUsageDoesNotTakeSegmentMutex) {
+    SegmentManager segment_manager(BufferAllocatorType::OFFSET);
+    auto segment_lock = HoldSegmentMutexForTesting(segment_manager);
+    auto usage = std::async(std::launch::async, [&segment_manager] {
+        return segment_manager.GetMemoryUsage();
+    });
+
+    const auto status = usage.wait_for(std::chrono::seconds(1));
+    segment_lock.unlock();
+
+    ASSERT_EQ(status, std::future_status::ready);
+    EXPECT_EQ(usage.get().capacity_bytes, 0u);
+}
+
+TEST_F(SegmentTest, AggregateMemoryUsageFollowsAllocatorReplacement) {
+    SegmentManager segment_manager(BufferAllocatorType::OFFSET);
+    constexpr size_t kSegmentSize = 16 * 1024 * 1024;
+    constexpr size_t kOldAllocationSize = 4 * 1024 * 1024;
+    constexpr size_t kRestoredAllocationSize = 8 * 1024 * 1024;
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "usage_replacement_segment";
+    segment.size = kSegmentSize;
+    segment.base = 0x180000000;
+    UUID client_id = generate_uuid();
+
+    std::shared_ptr<BufferAllocatorBase> old_allocator;
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        ASSERT_EQ(segment_access.MountSegment(segment, client_id),
+                  ErrorCode::OK);
+        old_allocator = segment_access.GetAllocator(segment.id);
+    }
+    ASSERT_NE(old_allocator, nullptr);
+    auto old_buffer = old_allocator->allocate(kOldAllocationSize);
+    ASSERT_NE(old_buffer, nullptr);
+
+    auto replacement = std::make_shared<OffsetBufferAllocator>(
+        segment.name, segment.base, segment.size, segment.te_endpoint);
+    auto restored_buffer = replacement->allocate(kRestoredAllocationSize);
+    ASSERT_NE(restored_buffer, nullptr);
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        ASSERT_TRUE(segment_access.ReplaceAllocators(
+            {{segment.id, old_allocator, replacement}}));
+    }
+
+    auto usage = segment_manager.GetMemoryUsage();
+    EXPECT_EQ(usage.used_bytes, kRestoredAllocationSize);
+    EXPECT_EQ(usage.capacity_bytes, kSegmentSize);
+
+    old_buffer.reset();
+    usage = segment_manager.GetMemoryUsage();
+    EXPECT_EQ(usage.used_bytes, kRestoredAllocationSize);
+
+    restored_buffer.reset();
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        size_t metrics_dec_capacity = 0;
+        ASSERT_EQ(segment_access.PrepareUnmountSegment(segment.id,
+                                                       metrics_dec_capacity),
+                  ErrorCode::OK);
+        ASSERT_EQ(segment_access.CommitUnmountSegment(segment.id, client_id,
+                                                      metrics_dec_capacity),
+                  ErrorCode::OK);
+    }
+    EXPECT_EQ(segment_manager.GetMemoryUsage().capacity_bytes, 0u);
 }
 
 TEST_F(SegmentTest, MemoryUsageSnapshotCountsSharedCxlAllocatorOnce) {
@@ -257,8 +349,11 @@ TEST_F(SegmentTest, MemoryUsageSnapshotCountsSharedCxlAllocatorOnce) {
     ASSERT_NE(buffer, nullptr);
 
     auto snapshot = segment_manager.GetMemoryUsageSnapshot();
+    auto usage = segment_manager.GetMemoryUsage();
     EXPECT_EQ(snapshot.used_bytes, kAllocationSize);
     EXPECT_EQ(snapshot.capacity_bytes, kSegmentSize);
+    EXPECT_EQ(usage.used_bytes, kAllocationSize);
+    EXPECT_EQ(usage.capacity_bytes, kSegmentSize);
 
     Segment first;
     first.id = generate_uuid();
@@ -272,8 +367,11 @@ TEST_F(SegmentTest, MemoryUsageSnapshotCountsSharedCxlAllocatorOnce) {
                                         {first, second});
 
     snapshot = segment_manager.GetMemoryUsageSnapshot();
+    usage = segment_manager.GetMemoryUsage();
     EXPECT_EQ(snapshot.used_bytes, kAllocationSize);
     EXPECT_EQ(snapshot.capacity_bytes, kSegmentSize);
+    EXPECT_EQ(usage.used_bytes, kAllocationSize);
+    EXPECT_EQ(usage.capacity_bytes, kSegmentSize);
     ASSERT_EQ(snapshot.segments.size(), 1u);
     EXPECT_EQ(snapshot.segments.at("cxl_pool").used_bytes, kAllocationSize);
     EXPECT_EQ(snapshot.segments.at("cxl_pool").capacity_bytes, kSegmentSize);
@@ -303,9 +401,13 @@ TEST_F(SegmentTest, NoFUsageSnapshotSurvivesMetricsReset) {
     ASSERT_NE(buffer, nullptr);
 
     auto snapshot = segment_manager.GetUsageSnapshot();
+    auto usage = segment_manager.GetUsage();
     EXPECT_EQ(snapshot.used_bytes, kAllocationSize);
     EXPECT_EQ(snapshot.capacity_bytes, kSegmentSize);
     EXPECT_DOUBLE_EQ(snapshot.used_ratio(), 0.25);
+    EXPECT_EQ(usage.used_bytes, kAllocationSize);
+    EXPECT_EQ(usage.capacity_bytes, kSegmentSize);
+    EXPECT_DOUBLE_EQ(usage.used_ratio(), 0.25);
 
     auto& metrics = MasterMetricManager::instance();
     metrics.reset_allocated_nof_size();
@@ -314,9 +416,13 @@ TEST_F(SegmentTest, NoFUsageSnapshotSurvivesMetricsReset) {
     EXPECT_EQ(metrics.get_total_nof_capacity(), 0);
 
     snapshot = segment_manager.GetUsageSnapshot();
+    usage = segment_manager.GetUsage();
     EXPECT_EQ(snapshot.used_bytes, kAllocationSize);
     EXPECT_EQ(snapshot.capacity_bytes, kSegmentSize);
     EXPECT_DOUBLE_EQ(snapshot.used_ratio(), 0.25);
+    EXPECT_EQ(usage.used_bytes, kAllocationSize);
+    EXPECT_EQ(usage.capacity_bytes, kSegmentSize);
+    EXPECT_DOUBLE_EQ(usage.used_ratio(), 0.25);
 
     // Restore global gauges before teardown because allocator and segment
     // cleanup still emit their matching decrements.
@@ -333,6 +439,8 @@ TEST_F(SegmentTest, NoFUsageSnapshotSurvivesMetricsReset) {
                                                       metrics_dec_capacity),
                   ErrorCode::OK);
     }
+    EXPECT_EQ(segment_manager.GetUsage().used_bytes, 0u);
+    EXPECT_EQ(segment_manager.GetUsage().capacity_bytes, 0u);
 }
 
 // MountSegmentDuplicate Tests:
