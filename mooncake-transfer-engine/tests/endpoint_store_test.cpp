@@ -116,6 +116,24 @@ TEST_F(EndpointStoreTest, ReclaimLeavesActiveEntries) {
            "active ones";
 }
 
+TEST_F(EndpointStoreTest, ReclaimLeavesCompletionPinnedEntries) {
+    SIEVEEndpointStore store(4);
+
+    auto endpoint = makeQuiescentEndpoint(*ctx_);
+    endpoint->beginCompletionBatch();
+    store.testOnlyInsertWaiting(endpoint);
+    EXPECT_EQ(store.waitingListSize(), 1u);
+
+    store.reclaimEndpoint();
+    EXPECT_EQ(store.waitingListSize(), 1u)
+        << "reclaim must not free an endpoint while a CQ completion batch "
+           "still holds raw slice endpoint pointers";
+
+    endpoint->endCompletionBatch();
+    store.reclaimEndpoint();
+    EXPECT_EQ(store.waitingListSize(), 0u);
+}
+
 TEST_F(EndpointStoreTest, ReclaimIsIdempotentWhenEmpty) {
     SIEVEEndpointStore store(4);
 
