@@ -440,8 +440,6 @@ class FreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
         }
 
-        static thread_local std::mt19937 generator(std::random_device{}());
-
         // Fast path for the common single-replica case. Avoid building a
         // temporary candidate vector on every allocation; keep the sampled
         // candidates on the stack and try by descending free ratio.
@@ -455,9 +453,7 @@ class FreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
             std::array<Candidate, kCandidateMultiplier> candidates{};
             const size_t sample_count =
                 std::min(kCandidateMultiplier, names.size());
-            std::uniform_int_distribution<size_t> start_dist(0,
-                                                             names.size() - 1);
-            size_t start_idx = start_dist(generator);
+            const size_t start_idx = randomIndex(names.size());
 
             for (size_t i = 0; i < sample_count; ++i) {
                 const size_t idx = (start_idx + i) % names.size();
@@ -472,8 +468,8 @@ class FreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
 
             for (size_t i = 0; i < sample_count; ++i) {
                 const auto& name = names[candidates[i].name_idx];
-                if (auto buffer = allocateSingle(allocator_manager, name,
-                                                 slice_length, generator)) {
+                if (auto buffer =
+                        allocateSingle(allocator_manager, name, slice_length)) {
                     std::vector<Replica> replicas;
                     replicas.emplace_back(std::move(buffer),
                                           ReplicaStatus::PROCESSING,
