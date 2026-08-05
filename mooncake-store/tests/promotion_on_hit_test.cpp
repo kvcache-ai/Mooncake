@@ -1796,7 +1796,7 @@ TEST_F(PromotionOnHitTest, QueueLimitZeroClampsToOne) {
     ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "k1", 1024,
                                        seg.segment_name));
     {
-        auto r = service->GetReplicaList("k1", "default");
+        auto r = service->GetReplicaList("k1", TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
 
@@ -2353,7 +2353,7 @@ TEST_F(PromotionOnHitTest, BudgetModeOrdersByClosestDeadlineAndRespectsCap) {
     auto enqueue = [&](const std::string& key) {
         ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, key, 1024,
                                            seg.segment_name));
-        auto r = service->GetReplicaList(key, "default");
+        auto r = service->GetReplicaList(key, TenantId::Default());
         ASSERT_TRUE(r.has_value());
     };
 
@@ -2401,7 +2401,7 @@ TEST_F(PromotionOnHitTest, BudgetModeUsesDeterministicTieBreaker) {
     for (const auto& key : {"tie_b", "tie_c", "tie_a"}) {
         ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, key, 1024,
                                            seg.segment_name));
-        auto r = service->GetReplicaList(key, "default");
+        auto r = service->GetReplicaList(key, TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
 
@@ -2441,7 +2441,7 @@ TEST_F(PromotionOnHitTest, BudgetModeSelectsBestWindowFromBacklog) {
     auto enqueue = [&](const std::string& key) {
         ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, key, 1024,
                                            seg.segment_name));
-        auto r = service->GetReplicaList(key, "default");
+        auto r = service->GetReplicaList(key, TenantId::Default());
         ASSERT_TRUE(r.has_value());
     };
 
@@ -2508,7 +2508,7 @@ TEST_F(PromotionOnHitTest, BudgetModeExpiresLateTaskAndReleasesSlot) {
     ASSERT_TRUE(InjectLocalDiskReplica(*service, seg.client_id, "budget_late",
                                        1024, seg.segment_name));
     {
-        auto r = service->GetReplicaList("budget_late", "default");
+        auto r = service->GetReplicaList("budget_late", TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
     EXPECT_EQ(mm.get_promotion_in_flight(), in_flight_pre + 1);
@@ -2523,7 +2523,7 @@ TEST_F(PromotionOnHitTest, BudgetModeExpiresLateTaskAndReleasesSlot) {
     EXPECT_EQ(mm.get_promotion_in_flight(), in_flight_pre);
 
     {
-        auto r = service->GetReplicaList("budget_late", "default");
+        auto r = service->GetReplicaList("budget_late", TenantId::Default());
         ASSERT_TRUE(r.has_value());
     }
     EXPECT_EQ(mm.get_promotion_in_flight(), in_flight_pre + 1)
