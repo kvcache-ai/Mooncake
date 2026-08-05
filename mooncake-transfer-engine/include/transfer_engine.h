@@ -15,8 +15,14 @@
 #ifndef MULTI_TRANSFER_ENGINE_H_
 #define MULTI_TRANSFER_ENGINE_H_
 
+#include <chrono>
+#include <cstddef>
+#include <cstdint>
+#include <functional>
 #include <memory>
+#include <span>
 #include <string>
+#include <vector>
 
 #include "memory_location.h"
 #include "multi_transport.h"
@@ -127,6 +133,49 @@ class TransferEngine {
 
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest>& entries);
+
+    struct ScatterTransferRange {
+        TransferRequest::OpCode opcode;
+        std::string remote_segment;
+        uint64_t remote_base_offset;
+        size_t remote_size;
+        void* local_buffer;
+        size_t local_capacity;
+        std::span<const size_t> local_offsets;
+        std::span<const size_t> remote_offsets;
+        std::span<const size_t> lengths;
+        std::function<void(size_t, const Status&)> on_fragment_complete;
+    };
+
+    class ScatterTransferOperation {
+       public:
+        ScatterTransferOperation(ScatterTransferOperation&&) noexcept;
+        ScatterTransferOperation& operator=(
+            ScatterTransferOperation&&) noexcept;
+
+        // Destruction waits for physical completion before releasing state.
+        ~ScatterTransferOperation();
+
+        ScatterTransferOperation(const ScatterTransferOperation&) = delete;
+        ScatterTransferOperation& operator=(const ScatterTransferOperation&) =
+            delete;
+
+        Status wait();
+
+        // A wait timeout does not cancel the transfer. Keep this operation and
+        // its CPU/GPU buffers alive until a later wait reaches completion.
+        Status waitFor(std::chrono::nanoseconds timeout);
+
+       private:
+        class Impl;
+        explicit ScatterTransferOperation(std::unique_ptr<Impl> impl);
+        std::unique_ptr<Impl> impl_;
+        friend class TransferEngine;
+    };
+
+    ScatterTransferOperation submitScatter(
+        const std::vector<ScatterTransferRange>& ranges);
+    Status transferScatter(const std::vector<ScatterTransferRange>& ranges);
 
     Status submitTransferWithNotify(BatchID batch_id,
                                     const std::vector<TransferRequest>& entries,

@@ -32,6 +32,12 @@ cp mooncake-integration/fabric_allocator_utils.py mooncake-wheel/mooncake/fabric
 # Copy engine.so to mooncake directory (will be imported by transfer module)
 cp ${BUILD_DIR}/mooncake-integration/engine.*.so mooncake-wheel/mooncake/engine.so
 
+# Copy the host-only PG core to mooncake directory
+if [ -f "${BUILD_DIR}/mooncake-pg/src/libmooncake_pg.so" ]; then
+    echo "Copying libmooncake_pg.so..."
+    cp "${BUILD_DIR}/mooncake-pg/src/libmooncake_pg.so" mooncake-wheel/mooncake/libmooncake_pg.so
+fi
+
 # Copy libasio.so to mooncake directory (runtime dependency of engine.so)
 cp ${BUILD_DIR}/mooncake-common/libasio.so mooncake-wheel/mooncake/libasio.so
 
@@ -426,6 +432,7 @@ ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude libffi.so* \
     --exclude libcuda.so* \
     --exclude libcudart.so* \
+    --exclude libmooncake_pg_device.so* \
     --exclude libmusa.so* \
     --exclude libmusart.so* \
     --exclude libamdhip64.so* \
