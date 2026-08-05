@@ -18,7 +18,6 @@
 #include <thread>
 #include <vector>
 
-#include "client_wrapper.h"
 #include "e2e_utils.h"
 #include "ha/oplog/p2p_oplog_types.h"
 #include "ha/oplog/p2p_standby_snapshot_service.h"
@@ -454,59 +453,6 @@ class RedisChaosTest : public ::testing::Test {
             std::chrono::seconds(FLAGS_redis_master_view_ttl_sec + 1));
     }
 
-    std::shared_ptr<ClientTestWrapper> CreateRedisClient(
-        int index, std::chrono::seconds timeout) {
-        auto deadline = std::chrono::steady_clock::now() + timeout;
-        while (std::chrono::steady_clock::now() < deadline) {
-            auto client = ClientTestWrapper::CreateClientWrapper(
-                "127.0.0.1:" + std::to_string(kClientPortBase + index),
-                "P2PHANDSHAKE", "tcp", "", "redis://" + FLAGS_redis_endpoint,
-                /*local_buffer_size=*/1024 * 1024 * 128, FLAGS_redis_cluster_id,
-                /*enable_http_server=*/false, /*deployment_mode=*/"P2P",
-                /*p2p_local_transfer_mode=*/"memcpy",
-                static_cast<uint16_t>(kClientPortBase + index),
-                FLAGS_redis_username, FLAGS_redis_password);
-            if (client.has_value()) {
-                return client.value();
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        }
-        return nullptr;
-    }
-
-    bool WaitForClientPutGet(ClientTestWrapper& client,
-                             const std::string& key_prefix,
-                             const std::string& value,
-                             std::chrono::seconds timeout) {
-        auto deadline = std::chrono::steady_clock::now() + timeout;
-        int attempt = 0;
-        while (std::chrono::steady_clock::now() < deadline) {
-            std::string key = key_prefix + "_" + std::to_string(attempt++);
-            if (client.Put(key, value) == ErrorCode::OK) {
-                std::string got;
-                if (client.Get(key, got) == ErrorCode::OK && got == value) {
-                    return true;
-                }
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        }
-        return false;
-    }
-
-    bool WaitForClientGet(ClientTestWrapper& client, const std::string& key,
-                          const std::string& value,
-                          std::chrono::seconds timeout) {
-        auto deadline = std::chrono::steady_clock::now() + timeout;
-        while (std::chrono::steady_clock::now() < deadline) {
-            std::string got;
-            if (client.Get(key, got) == ErrorCode::OK && got == value) {
-                return true;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        }
-        return false;
-    }
-
     bool WaitForReplicaOpLog(const std::string& key,
                              std::chrono::seconds timeout) {
         RedisOpLogStore store(FLAGS_redis_cluster_id, FLAGS_redis_endpoint,
@@ -555,11 +501,32 @@ class RedisChaosTest : public ::testing::Test {
 
     bool WaitForMasterLog(int index, const std::string& needle,
                           std::chrono::seconds timeout) {
+        return WaitForMasterLogSince(index, needle, std::streampos(0), timeout);
+    }
+
+    std::streampos MasterLogEndOffset(int index) {
+        const std::string path =
+            FLAGS_out_dir + "/master_" + std::to_string(index) + ".err";
+        std::ifstream input(path, std::ios::binary | std::ios::ate);
+        if (!input) {
+            return std::streampos(0);
+        }
+        return input.tellg();
+    }
+
+    bool WaitForMasterLogSince(int index, const std::string& needle,
+                               std::streampos offset,
+                               std::chrono::seconds timeout) {
         const std::string path =
             FLAGS_out_dir + "/master_" + std::to_string(index) + ".err";
         auto deadline = std::chrono::steady_clock::now() + timeout;
         while (std::chrono::steady_clock::now() < deadline) {
-            std::ifstream input(path);
+            std::ifstream input(path, std::ios::binary);
+            if (!input) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                continue;
+            }
+            input.seekg(offset);
             std::string content((std::istreambuf_iterator<char>(input)),
                                 std::istreambuf_iterator<char>());
             if (content.find(needle) != std::string::npos) {
@@ -625,11 +592,16 @@ TEST_F(RedisChaosTest, TrimmedStandbyAutoDiscoversPeerAndBootstraps) {
                                  std::chrono::seconds(10)));
     ASSERT_TRUE(masters_[lagging_index]->kill());
 
-    auto client = CreateRedisClient(/*index=*/20, std::chrono::seconds(15));
-    ASSERT_NE(client, nullptr);
+    ClientCtlProcess client(/*index=*/20, FLAGS_out_dir);
+    ASSERT_TRUE(client.Start());
+    ASSERT_TRUE(client.SendAndWait(
+        "create c_trim " + std::to_string(kClientPortBase + 20),
+        "Successfully created client: c_trim", std::chrono::seconds(30)));
     const std::string key = "trim_rebootstrap_key";
     const std::string value = "trim_rebootstrap_value";
-    ASSERT_EQ(client->Put(key, value), ErrorCode::OK);
+    ASSERT_TRUE(client.SendAndWait("put c_trim " + key + " " + value,
+                                   "Successfully put value for key: " + key,
+                                   std::chrono::seconds(10)));
     ASSERT_TRUE(WaitForReplicaOpLog(key, std::chrono::seconds(10)));
 
     RedisOpLogStore store(FLAGS_redis_cluster_id, FLAGS_redis_endpoint,
@@ -643,10 +615,11 @@ TEST_F(RedisChaosTest, TrimmedStandbyAutoDiscoversPeerAndBootstraps) {
                                         std::chrono::seconds(10)));
     ASSERT_EQ(store.CleanupOpLogBefore(latest_sequence_id + 1), ErrorCode::OK);
 
+    auto lagging_log_offset = MasterLogEndOffset(lagging_index);
     ASSERT_TRUE(masters_[lagging_index]->start());
-    ASSERT_TRUE(WaitForMasterLog(lagging_index,
-                                 "Standby snapshot: bootstrap completed",
-                                 std::chrono::seconds(20)));
+    ASSERT_TRUE(WaitForMasterLogSince(
+        lagging_index, "Standby snapshot: bootstrap completed",
+        lagging_log_offset, std::chrono::seconds(20)));
 
     ASSERT_TRUE(masters_[source_index]->kill());
     ASSERT_TRUE(masters_[leader_index]->kill());
@@ -655,8 +628,10 @@ TEST_F(RedisChaosTest, TrimmedStandbyAutoDiscoversPeerAndBootstraps) {
     ASSERT_TRUE(
         WaitForNewLeader(leader_index, version, new_leader_index, new_version));
     ASSERT_EQ(new_leader_index, lagging_index);
-    ASSERT_TRUE(
-        WaitForClientGet(*client, key, value, std::chrono::seconds(20)));
+    ASSERT_TRUE(WaitForClientCtlCommand(
+        client, "expect_get c_trim " + key + " " + value,
+        "Successfully expected value for key: " + key,
+        std::chrono::seconds(60)));
 }
 
 TEST_F(RedisChaosTest, LeaderKeyDeletedTriggersReElection) {
