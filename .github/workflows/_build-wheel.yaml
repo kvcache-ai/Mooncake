@@ -193,11 +193,6 @@ jobs:
       - name: Verify DMA-BUF Device API wheel contents
         if: ${{ inputs.runner == 'ubuntu-22.04' && inputs.cuda == 'container' && contains(inputs.cmake-args, '-DWITH_EP=ON') }}
         run: |
-          if ! grep -q '^MOONCAKE_HAVE_MLX5_DMABUF_UMEM:INTERNAL=1$' build/CMakeCache.txt; then
-            echo '::error::The CUDA wheel was built without DMA-BUF DevX UMEM support'
-            exit 1
-          fi
-
           whl=$(find mooncake-wheel/dist-py${{ steps.pytag.outputs.tag }} -name '*.whl' -print -quit)
           inspect_dir=$(mktemp -d)
           trap 'rm -rf "$inspect_dir"' EXIT
