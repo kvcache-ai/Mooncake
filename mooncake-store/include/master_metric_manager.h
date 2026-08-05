@@ -140,6 +140,7 @@ class MasterMetricManager {
     void inc_put_start_requests(int64_t val = 1);
     void inc_put_start_failures(int64_t val = 1);
     void inc_put_start_alloc_failures(int64_t val = 1);
+    void inc_put_start_partial_allocations(int64_t val = 1);
     void inc_put_end_requests(int64_t val = 1);
     void inc_put_end_failures(int64_t val = 1);
     void inc_put_revoke_requests(int64_t val = 1);
@@ -203,6 +204,7 @@ class MasterMetricManager {
     int64_t get_put_start_requests();
     int64_t get_put_start_failures();
     int64_t get_put_start_alloc_failures();
+    int64_t get_put_start_partial_allocations();
     int64_t get_put_end_requests();
     int64_t get_put_end_failures();
     int64_t get_put_revoke_requests();
@@ -323,6 +325,14 @@ class MasterMetricManager {
                                  const std::string& reason, int64_t val = 1);
     void inc_tenant_evict_bytes(const std::string& tenant_id, int64_t bytes);
 
+    // Promotion retry candidate metrics
+    void inc_promotion_candidate_recorded(int64_t val = 1);
+    void inc_promotion_candidate_admitted(int64_t val = 1);
+    void inc_promotion_candidate_admission_rejected(int64_t val = 1);
+    void inc_promotion_candidate_expired_evaluated(int64_t val = 1);
+    void inc_promotion_candidate_expired_unevaluated(int64_t val = 1);
+    void inc_promotion_candidate_dropped_limit(int64_t val = 1);
+
     // Promotion-on-hit Metrics Getters
     int64_t get_promotion_in_flight();
     int64_t get_promotion_admitted();
@@ -336,6 +346,12 @@ class MasterMetricManager {
     int64_t get_promotion_rejected_cap();
     int64_t get_promotion_within_budget();
     int64_t get_promotion_late();
+    int64_t get_promotion_candidate_recorded();
+    int64_t get_promotion_candidate_admitted();
+    int64_t get_promotion_candidate_admission_rejected();
+    int64_t get_promotion_candidate_expired_evaluated();
+    int64_t get_promotion_candidate_expired_unevaluated();
+    int64_t get_promotion_candidate_dropped_limit();
 
     // CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke Metrics
     void inc_copy_start_requests(int64_t val = 1);
@@ -423,6 +439,7 @@ class MasterMetricManager {
         int64_t put_starts = 0;
         int64_t put_start_fails = 0;
         int64_t put_start_alloc_fails = 0;
+        int64_t put_start_partial_allocs = 0;
         int64_t put_ends = 0;
         int64_t put_end_fails = 0;
         int64_t put_revoke_requests = 0;
@@ -559,6 +576,7 @@ class MasterMetricManager {
     ylt::metric::counter_t put_start_requests_;
     ylt::metric::counter_t put_start_failures_;
     ylt::metric::counter_t put_start_alloc_failures_;
+    ylt::metric::counter_t put_start_partial_allocations_;
     ylt::metric::counter_t put_end_requests_;
     ylt::metric::counter_t put_end_failures_;
     ylt::metric::counter_t put_revoke_requests_;
@@ -689,6 +707,13 @@ class MasterMetricManager {
     ylt::metric::counter_t promotion_rejected_cap_;
     ylt::metric::counter_t promotion_within_budget_;
     ylt::metric::counter_t promotion_late_;
+    // Promotion retry candidate metrics
+    ylt::metric::counter_t promotion_candidate_recorded_;
+    ylt::metric::counter_t promotion_candidate_admitted_;
+    ylt::metric::counter_t promotion_candidate_admission_rejected_;
+    ylt::metric::counter_t promotion_candidate_expired_evaluated_;
+    ylt::metric::counter_t promotion_candidate_expired_unevaluated_;
+    ylt::metric::counter_t promotion_candidate_dropped_limit_;
 
     ylt::metric::dynamic_counter_2t tenant_quota_reject_total_;
     ylt::metric::dynamic_counter_1t tenant_evict_bytes_total_;

@@ -5,6 +5,7 @@
 #include <infiniband/verbs.h>
 #include <infiniband/mlx5dv.h>
 
+#include <cstring>
 #include <transport/device/ibgda/memheap.h>
 #include <transport/device/ibgda/mlx5gda.h>
 #include <transport/device/ibgda/mlx5_ifc.h>
@@ -36,6 +37,47 @@ static void print_cuda_error(const char* msg) {
     const char* err_str = cudaGetErrorString(cudaGetLastError());
 #endif
     fprintf(stderr, "%s: %s\n", msg, err_str);
+}
+
+static thread_local mlx5gda_create_qp_failure g_last_create_qp_failure{};
+
+void mlx5gda_reset_create_qp_failure() { g_last_create_qp_failure = {}; }
+
+mlx5gda_create_qp_failure mlx5gda_last_create_qp_failure() {
+    return g_last_create_qp_failure;
+}
+
+static bool is_host_control_buffer(void* ptr) {
+    cudaPointerAttributes attr{};
+    cudaError_t err = cudaPointerGetAttributes(&attr, ptr);
+    if (err != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    return attr.type == cudaMemoryTypeHost;
+}
+
+static void print_devx_create_qp_failure(const uint8_t* cmd_out,
+                                         uint32_t num_wqebb, uint8_t port_num,
+                                         uint32_t pdn, uint32_t uar_page,
+                                         uint32_t cqn, uint32_t umem_id,
+                                         size_t wq_offset, size_t dbr_offset,
+                                         int sys_errno) {
+    uint32_t status = DEVX_GET(create_qp_out, cmd_out, status);
+    uint32_t syndrome = DEVX_GET(create_qp_out, cmd_out, syndrome);
+    g_last_create_qp_failure = mlx5gda_create_qp_failure{
+        .valid = true,
+        .status = status,
+        .syndrome = syndrome,
+        .sys_errno = sys_errno,
+    };
+    fprintf(stderr,
+            "mlx5dv_devx_obj_create(create_qp) failed: errno=%d (%s) "
+            "status=0x%x syndrome=0x%x port=%u pdn=0x%x uar_page=0x%x "
+            "cqn=0x%x umem_id=0x%x num_wqebb=%u wq_offset=0x%zx "
+            "dbr_offset=0x%zx\n",
+            sys_errno, strerror(sys_errno), status, syndrome, port_num, pdn,
+            uar_page, cqn, umem_id, num_wqebb, wq_offset, dbr_offset);
 }
 
 // Create UAR for BF (Blue Flame) doorbell ringing.
@@ -99,6 +141,7 @@ struct mlx5gda_cq* mlx5gda_create_cq(void* ctrl_buf,
 
     struct ibv_context* ctx = pd->context;
     void* cq_context = NULL;
+    bool ctrl_host = is_host_control_buffer(ctrl_buf);
 
     if (cqe <= 0) {
         errno = EINVAL;
@@ -120,11 +163,16 @@ struct mlx5gda_cq* mlx5gda_create_cq(void* ctrl_buf,
     // initialized to 0xFF (-1) to mark them as invalid. The hardware checks the
     // owner bit in CQE to determine if it's valid. This is mandatory for proper
     // CQ operation. Use async version to avoid blocking.
-    if (cudaMemsetAsync(ctrl_buf + cq_offset, -1,
-                        num_cqe * sizeof(struct mlx5_cqe64),
-                        stream) != cudaSuccess) {
-        print_cuda_error("Failed to memset CQ memory");
-        goto fail;
+    if (ctrl_host) {
+        memset(static_cast<char*>(ctrl_buf) + cq_offset, -1,
+               num_cqe * sizeof(struct mlx5_cqe64));
+    } else {
+        if (cudaMemsetAsync(static_cast<char*>(ctrl_buf) + cq_offset, -1,
+                            num_cqe * sizeof(struct mlx5_cqe64),
+                            stream) != cudaSuccess) {
+            print_cuda_error("Failed to memset CQ memory");
+            goto fail;
+        }
     }
     dbr_offset = memheap_alloc(ctrl_buf_heap, sizeof(struct mlx5gda_cq_dbr));
     if (dbr_offset == -1) {
@@ -162,9 +210,11 @@ struct mlx5gda_cq* mlx5gda_create_cq(void* ctrl_buf,
 
     // Synchronize stream before creating CQ object, as hardware will read the
     // CQE memory
-    if (cudaStreamSynchronize(stream) != cudaSuccess) {
-        print_cuda_error("Failed to synchronize stream before CQ creation");
-        goto fail;
+    if (!ctrl_host) {
+        if (cudaStreamSynchronize(stream) != cudaSuccess) {
+            print_cuda_error("Failed to synchronize stream before CQ creation");
+            goto fail;
+        }
     }
 
     mlx5_cq = mlx5dv_devx_obj_create(ctx, cmd_in, sizeof(cmd_in), cmd_out,
@@ -208,6 +258,8 @@ struct mlx5gda_qp* mlx5gda_create_rc_qp(struct mlx5dv_pd mpd, void* ctrl_buf,
                                         struct memheap* ctrl_buf_heap,
                                         struct ibv_pd* pd, int wqe,
                                         uint8_t port_num, cudaStream_t stream) {
+    mlx5gda_reset_create_qp_failure();
+
     struct mlx5gda_qp* qp = NULL;
     struct mlx5gda_cq* send_cq = NULL;
     struct mlx5dv_devx_uar* uar = NULL;
@@ -219,6 +271,7 @@ struct mlx5gda_qp* mlx5gda_create_rc_qp(struct mlx5dv_pd mpd, void* ctrl_buf,
     void* qp_context = NULL;
     void* cap = NULL;
     uint32_t cqe_version = 0;
+    bool ctrl_host = is_host_control_buffer(ctrl_buf);
 
     if (wqe <= 0) {
         errno = EINVAL;
@@ -291,10 +344,16 @@ struct mlx5gda_qp* mlx5gda_create_rc_qp(struct mlx5dv_pd mpd, void* ctrl_buf,
         goto fail;
     }
     // DBR must be zero-initialized. Use async version to avoid blocking.
-    if (cudaMemsetAsync(ctrl_buf + dbr_offset, 0, sizeof(struct mlx5gda_wq_dbr),
-                        stream) != cudaSuccess) {
-        print_cuda_error("Failed to zero DBR memory");
-        goto fail;
+    if (ctrl_host) {
+        memset(static_cast<char*>(ctrl_buf) + dbr_offset, 0,
+               sizeof(struct mlx5gda_wq_dbr));
+    } else {
+        if (cudaMemsetAsync(static_cast<char*>(ctrl_buf) + dbr_offset, 0,
+                            sizeof(struct mlx5gda_wq_dbr),
+                            stream) != cudaSuccess) {
+            print_cuda_error("Failed to zero DBR memory");
+            goto fail;
+        }
     }
 
     DEVX_SET(create_qp_in, cmd_in, opcode, MLX5_CMD_OP_CREATE_QP);
@@ -326,14 +385,19 @@ struct mlx5gda_qp* mlx5gda_create_rc_qp(struct mlx5dv_pd mpd, void* ctrl_buf,
 
     // Synchronize stream before creating QP object, as hardware will read the
     // DBR memory
-    if (cudaStreamSynchronize(stream) != cudaSuccess) {
-        print_cuda_error("Failed to synchronize stream before QP creation");
-        goto fail;
+    if (!ctrl_host) {
+        if (cudaStreamSynchronize(stream) != cudaSuccess) {
+            print_cuda_error("Failed to synchronize stream before QP creation");
+            goto fail;
+        }
     }
 
     mlx5_qp = mlx5dv_devx_obj_create(ctx, cmd_in, sizeof(cmd_in), cmd_out,
                                      sizeof(cmd_out));
     if (mlx5_qp == NULL) {
+        print_devx_create_qp_failure(
+            cmd_out, num_wqebb, port_num, mpd.pdn, uar->page_id, send_cq->cqn,
+            ctrl_buf_umem->umem_id, wq_offset, dbr_offset, errno);
         goto fail;
     }
 

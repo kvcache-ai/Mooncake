@@ -6,6 +6,8 @@
 
 #include <glog/logging.h>
 
+#include "ascii_string.h"
+
 namespace mooncake {
 namespace ha {
 namespace backends {
@@ -94,8 +96,7 @@ EmbeddedSnapshotCatalogStore::GetLatest() {
         return tl::make_unexpected(ErrorCode::PERSISTENT_FAIL);
     }
 
-    latest_snapshot_id = snapshot_catalog_store_detail::TrimAsciiWhitespace(
-        std::move(latest_snapshot_id));
+    latest_snapshot_id = std::string(TrimAsciiWhitespace(latest_snapshot_id));
     if (latest_snapshot_id.empty()) {
         return std::optional<SnapshotDescriptor>();
     }

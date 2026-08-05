@@ -17,10 +17,18 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
+#include <arpa/inet.h>
+#include <sys/socket.h>
 #include <sys/time.h>
+#include <unistd.h>
 
+#include <chrono>
 #include <cstdlib>
+#include <thread>
 
+#include "common.h"
+#include "config.h"
+#include "transfer_metadata_plugin.h"
 #include "transport/transport.h"
 
 using namespace mooncake;
@@ -107,6 +115,75 @@ TEST_F(TransferMetadataTest, LocalMemoryBufferTest) {
     ASSERT_EQ(re, 0);
 }
 
+TEST_F(TransferMetadataTest, NcclMetadataAndHandshakePayloadRoundTrip) {
+    TransferMetadata server(P2PHANDSHAKE);
+    int sockfd = -1;
+    const uint16_t port = findAvailableTcpPort(sockfd);
+    ASSERT_NE(port, 0);
+    const std::string host = globalConfig().use_ipv6 ? "::1" : "127.0.0.1";
+
+    auto server_segment = std::make_shared<TransferMetadata::SegmentDesc>();
+    server_segment->name = maybeWrapIpV6(host) + ":" + std::to_string(port);
+    server_segment->protocol = "nccl";
+    TransferMetadata::BufferDesc server_buffer;
+    server_buffer.name = "cuda:2";
+    server_buffer.addr = 0x10000;
+    server_buffer.length = 4096;
+    server_buffer.device_id = 2;
+    server_segment->buffers.push_back(server_buffer);
+    const std::string server_name = server_segment->name;
+    TransferMetadata::BufferDesc server_buffer_2;
+    server_buffer_2.name = "cuda:2-aux";
+    server_buffer_2.addr = 0x08000;
+    server_buffer_2.length = 8192;
+    server_buffer_2.device_id = 2;
+    server_segment->buffers.push_back(server_buffer_2);
+    ASSERT_EQ(server.addLocalSegment(LOCAL_SEGMENT_ID, server_name,
+                                     std::move(server_segment)),
+              0);
+
+    TransferMetadata::RpcMetaDesc rpc{};
+    rpc.ip_or_host_name = host;
+    rpc.rpc_port = port;
+    rpc.sockfd = sockfd;
+    ASSERT_EQ(server.addRpcMetaEntry("nccl-metadata-test", rpc), 0);
+    ASSERT_EQ(server.startHandshakeDaemon(
+                  [](const TransferMetadata::HandShakeDesc& peer,
+                     TransferMetadata::HandShakeDesc& local) {
+                      local.payload = "reply:" + peer.payload;
+                      return 0;
+                  },
+                  port, sockfd),
+              0);
+
+    TransferMetadata client(P2PHANDSHAKE);
+    auto client_segment = std::make_shared<TransferMetadata::SegmentDesc>();
+    client_segment->name = "client";
+    client_segment->protocol = "nccl";
+    ASSERT_EQ(client.addLocalSegment(LOCAL_SEGMENT_ID, "client",
+                                     std::move(client_segment)),
+              0);
+
+    auto peer_segment = client.getSegmentDesc(server_name);
+    ASSERT_NE(peer_segment, nullptr);
+    ASSERT_EQ(peer_segment->protocol, "nccl");
+    ASSERT_EQ(peer_segment->buffers.size(), 2U);
+    EXPECT_EQ(peer_segment->buffers[0].name, "cuda:2");
+    EXPECT_EQ(peer_segment->buffers[0].addr, 0x10000U);
+    EXPECT_EQ(peer_segment->buffers[0].length, 4096U);
+    EXPECT_EQ(peer_segment->buffers[0].device_id, 2);
+    EXPECT_EQ(peer_segment->buffers[1].name, "cuda:2-aux");
+    EXPECT_EQ(peer_segment->buffers[1].addr, 0x08000U);
+    EXPECT_EQ(peer_segment->buffers[1].length, 8192U);
+    EXPECT_EQ(peer_segment->buffers[1].device_id, 2);
+
+    TransferMetadata::HandShakeDesc request;
+    request.payload = "bootstrap";
+    TransferMetadata::HandShakeDesc response;
+    ASSERT_EQ(client.sendHandshake(server_name, request, response), 0);
+    EXPECT_EQ(response.payload, "reply:bootstrap");
+}
+
 // add, get and remove RPCMetaEntryMeta
 TEST_F(TransferMetadataTest, RpcMetaEntryTest) {
     auto hostname_port = parseHostNameWithPort(local_server_name);
@@ -121,6 +198,361 @@ TEST_F(TransferMetadataTest, RpcMetaEntryTest) {
     ASSERT_EQ(desc.rpc_port, desc1.rpc_port);
     re = metadata_client->removeRpcMetaEntry("test_server");
     ASSERT_EQ(re, 0);
+}
+
+namespace {
+
+struct ScopedMetadataRefreshConfig {
+    uint64_t old_interval_seconds;
+    bool old_metacache;
+
+    ScopedMetadataRefreshConfig(uint64_t interval_seconds, bool metacache)
+        : old_interval_seconds(
+              globalConfig().te_metadata_refresh_interval_seconds),
+          old_metacache(globalConfig().metacache) {
+        globalConfig().te_metadata_refresh_interval_seconds = interval_seconds;
+        globalConfig().metacache = metacache;
+    }
+
+    ~ScopedMetadataRefreshConfig() {
+        globalConfig().te_metadata_refresh_interval_seconds =
+            old_interval_seconds;
+        globalConfig().metacache = old_metacache;
+    }
+};
+
+TransferMetadata::BufferDesc makeRdmaBufferDesc(uint64_t addr) {
+    TransferMetadata::BufferDesc buffer_desc;
+    buffer_desc.name = "buffer";
+    buffer_desc.addr = addr;
+    buffer_desc.length = 1024;
+    buffer_desc.lkey.push_back(1);
+    buffer_desc.rkey.push_back(2);
+    return buffer_desc;
+}
+
+std::shared_ptr<TransferMetadata::SegmentDesc> makeRdmaSegmentDesc(
+    const std::string& name, uint64_t addr) {
+    auto segment_desc = std::make_shared<TransferMetadata::SegmentDesc>();
+    segment_desc->name = name;
+    segment_desc->protocol = "rdma";
+    segment_desc->tcp_data_port = 0;
+
+    TransferMetadata::DeviceDesc device_desc;
+    device_desc.name = "mlx5_0";
+    device_desc.lid = 1;
+    device_desc.gid = "00000000000000000000ffff7f000001";
+    segment_desc->devices.push_back(device_desc);
+
+    segment_desc->buffers.push_back(makeRdmaBufferDesc(addr));
+    return segment_desc;
+}
+
+}  // namespace
+
+TEST(TransferMetadataPollingTest, PollingRefreshesCachedRemoteSegmentDesc) {
+    constexpr uint64_t kInitialAddr = 0x1000;
+    constexpr uint64_t kUpdatedAddr = 0x2000;
+
+    ScopedMetadataRefreshConfig restore(1, true);
+    TransferMetadata server(P2PHANDSHAKE);
+    TransferMetadata client(P2PHANDSHAKE);
+
+    int sockfd = -1;
+    const uint16_t port = findAvailableTcpPort(sockfd);
+    ASSERT_GT(port, 0);
+    const std::string remote_segment_name = "127.0.0.1:" + std::to_string(port);
+
+    ASSERT_EQ(server.addLocalSegment(
+                  LOCAL_SEGMENT_ID, remote_segment_name,
+                  makeRdmaSegmentDesc(remote_segment_name, kInitialAddr)),
+              0);
+    TransferMetadata::RpcMetaDesc rpc_desc;
+    rpc_desc.ip_or_host_name = "127.0.0.1";
+    rpc_desc.rpc_port = port;
+    rpc_desc.sockfd = sockfd;
+    ASSERT_EQ(server.addRpcMetaEntry(remote_segment_name, rpc_desc), 0);
+
+    ASSERT_EQ(
+        client.addLocalSegment(LOCAL_SEGMENT_ID, "127.0.0.1:0",
+                               makeRdmaSegmentDesc("127.0.0.1:0", 0x3000)),
+        0);
+
+    const auto segment_id = client.getSegmentID(remote_segment_name);
+    ASSERT_NE(segment_id, static_cast<TransferMetadata::SegmentID>(-1));
+    auto cached_desc = client.getSegmentDescByID(segment_id);
+    ASSERT_TRUE(cached_desc);
+    ASSERT_EQ(cached_desc->buffers[0].addr, kInitialAddr);
+
+    ASSERT_EQ(server.removeLocalMemoryBuffer(
+                  reinterpret_cast<void*>(kInitialAddr), false),
+              0);
+    ASSERT_EQ(
+        server.addLocalMemoryBuffer(makeRdmaBufferDesc(kUpdatedAddr), false),
+        0);
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (std::chrono::steady_clock::now() < deadline) {
+        cached_desc = client.getSegmentDescByID(segment_id);
+        ASSERT_TRUE(cached_desc);
+        if (!cached_desc->buffers.empty() &&
+            cached_desc->buffers[0].addr == kUpdatedAddr) {
+            return;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+
+    FAIL() << "TE metadata refresh polling did not refresh cached descriptor";
+}
+
+TEST(TransferMetadataPublicationTest, PreservesLocalOnlyBufferWithoutRkey) {
+    constexpr uint64_t kRemoteAddr = 0x1000;
+    constexpr uint64_t kLocalOnlyAddr = 0x2000;
+
+    TransferMetadata server(P2PHANDSHAKE);
+    TransferMetadata client(P2PHANDSHAKE);
+
+    int sockfd = -1;
+    const uint16_t port = findAvailableTcpPort(sockfd);
+    ASSERT_GT(port, 0);
+    const std::string remote_segment_name = "127.0.0.1:" + std::to_string(port);
+
+    auto server_desc = makeRdmaSegmentDesc(remote_segment_name, kRemoteAddr);
+    auto local_only_buffer = makeRdmaBufferDesc(kLocalOnlyAddr);
+    local_only_buffer.rkey.clear();
+    server_desc->buffers.push_back(local_only_buffer);
+    ASSERT_EQ(server.addLocalSegment(LOCAL_SEGMENT_ID, remote_segment_name,
+                                     std::move(server_desc)),
+              0);
+
+    TransferMetadata::RpcMetaDesc rpc_desc;
+    rpc_desc.ip_or_host_name = "127.0.0.1";
+    rpc_desc.rpc_port = port;
+    rpc_desc.sockfd = sockfd;
+    ASSERT_EQ(server.addRpcMetaEntry(remote_segment_name, rpc_desc), 0);
+
+    ASSERT_EQ(
+        client.addLocalSegment(LOCAL_SEGMENT_ID, "127.0.0.1:0",
+                               makeRdmaSegmentDesc("127.0.0.1:0", 0x3000)),
+        0);
+
+    const auto segment_id = client.getSegmentID(remote_segment_name);
+    ASSERT_NE(segment_id, static_cast<TransferMetadata::SegmentID>(-1));
+    auto remote_desc = client.getSegmentDescByID(segment_id, true);
+    ASSERT_NE(remote_desc, nullptr);
+    ASSERT_EQ(remote_desc->buffers.size(), 2);
+    EXPECT_EQ(remote_desc->buffers[0].addr, kRemoteAddr);
+    EXPECT_EQ(remote_desc->buffers[1].addr, kLocalOnlyAddr);
+    EXPECT_TRUE(remote_desc->buffers[1].rkey.empty());
+}
+
+// A peer descriptor whose key vector is longer than its device list lets the
+// topology-selected device_id pass the rkey bound in selectPeerDevice() and
+// still index devices[] out of bounds. Such a descriptor must be rejected at
+// decode time.
+TEST(TransferMetadataValidationTest, RejectsMoreKeysThanDevices) {
+    constexpr uint64_t kRemoteAddr = 0x1000;
+    constexpr size_t kKeyCount = 64;
+
+    TransferMetadata server(P2PHANDSHAKE);
+    TransferMetadata client(P2PHANDSHAKE);
+
+    int sockfd = -1;
+    const uint16_t port = findAvailableTcpPort(sockfd);
+    ASSERT_GT(port, 0);
+    const std::string remote_segment_name = "127.0.0.1:" + std::to_string(port);
+
+    auto server_desc = makeRdmaSegmentDesc(remote_segment_name, kRemoteAddr);
+    ASSERT_EQ(server_desc->devices.size(), 1u);
+    auto& buffer = server_desc->buffers[0];
+    while (buffer.rkey.size() < kKeyCount) {
+        buffer.lkey.push_back(1);
+        buffer.rkey.push_back(2);
+    }
+    ASSERT_EQ(server.addLocalSegment(LOCAL_SEGMENT_ID, remote_segment_name,
+                                     std::move(server_desc)),
+              0);
+
+    TransferMetadata::RpcMetaDesc rpc_desc;
+    rpc_desc.ip_or_host_name = "127.0.0.1";
+    rpc_desc.rpc_port = port;
+    rpc_desc.sockfd = sockfd;
+    ASSERT_EQ(server.addRpcMetaEntry(remote_segment_name, rpc_desc), 0);
+
+    ASSERT_EQ(
+        client.addLocalSegment(LOCAL_SEGMENT_ID, "127.0.0.1:0",
+                               makeRdmaSegmentDesc("127.0.0.1:0", 0x3000)),
+        0);
+
+    EXPECT_EQ(client.getSegmentID(remote_segment_name),
+              static_cast<TransferMetadata::SegmentID>(-1));
+}
+
+// The multi-NIC case a real publisher produces: one key per device. It must
+// still decode.
+TEST(TransferMetadataValidationTest, AcceptsOneKeyPerDevice) {
+    constexpr uint64_t kRemoteAddr = 0x1000;
+    constexpr size_t kDeviceCount = 4;
+
+    TransferMetadata server(P2PHANDSHAKE);
+    TransferMetadata client(P2PHANDSHAKE);
+
+    int sockfd = -1;
+    const uint16_t port = findAvailableTcpPort(sockfd);
+    ASSERT_GT(port, 0);
+    const std::string remote_segment_name = "127.0.0.1:" + std::to_string(port);
+
+    auto server_desc = makeRdmaSegmentDesc(remote_segment_name, kRemoteAddr);
+    auto& buffer = server_desc->buffers[0];
+    while (server_desc->devices.size() < kDeviceCount) {
+        TransferMetadata::DeviceDesc device_desc;
+        device_desc.name =
+            "mlx5_" + std::to_string(server_desc->devices.size());
+        device_desc.lid = 1;
+        device_desc.gid = "00000000000000000000ffff7f000001";
+        server_desc->devices.push_back(device_desc);
+        buffer.lkey.push_back(1);
+        buffer.rkey.push_back(2);
+    }
+    ASSERT_EQ(buffer.rkey.size(), kDeviceCount);
+    ASSERT_EQ(server.addLocalSegment(LOCAL_SEGMENT_ID, remote_segment_name,
+                                     std::move(server_desc)),
+              0);
+
+    TransferMetadata::RpcMetaDesc rpc_desc;
+    rpc_desc.ip_or_host_name = "127.0.0.1";
+    rpc_desc.rpc_port = port;
+    rpc_desc.sockfd = sockfd;
+    ASSERT_EQ(server.addRpcMetaEntry(remote_segment_name, rpc_desc), 0);
+
+    ASSERT_EQ(
+        client.addLocalSegment(LOCAL_SEGMENT_ID, "127.0.0.1:0",
+                               makeRdmaSegmentDesc("127.0.0.1:0", 0x3000)),
+        0);
+
+    const auto segment_id = client.getSegmentID(remote_segment_name);
+    ASSERT_NE(segment_id, static_cast<TransferMetadata::SegmentID>(-1));
+    auto remote_desc = client.getSegmentDescByID(segment_id, true);
+    ASSERT_NE(remote_desc, nullptr);
+    EXPECT_EQ(remote_desc->devices.size(), kDeviceCount);
+    EXPECT_EQ(remote_desc->buffers[0].rkey.size(), kDeviceCount);
+}
+
+TEST(HandshakeFrameTest, ValidFrameRoundTrips) {
+    int fds[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+
+    ASSERT_EQ(writeString(fds[0], HandShakeRequestType::Metadata,
+                          "{\"name\":\"segment\"}"),
+              0);
+    auto [type, payload] = readString(fds[1]);
+    EXPECT_EQ(type, HandShakeRequestType::Metadata);
+    EXPECT_EQ(payload, "{\"name\":\"segment\"}");
+
+    close(fds[0]);
+    close(fds[1]);
+}
+
+TEST(HandshakeFrameTest, ValidTypedFrameWithTlsLikeNativeEndianLength) {
+    int fds[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+
+    // 790 is encoded as 0x16 0x03 0x00 ... on little-endian machines, which
+    // collides with the first two bytes of a TLS ClientHello record. It is
+    // still a valid native-endian handshake frame length.
+    const std::string payload(789, 'x');
+    ASSERT_EQ(writeString(fds[0], HandShakeRequestType::Metadata, payload), 0);
+
+    auto [type, read_payload] = readString(fds[1]);
+    EXPECT_EQ(type, HandShakeRequestType::Metadata);
+    EXPECT_EQ(read_payload, payload);
+
+    close(fds[0]);
+    close(fds[1]);
+}
+
+TEST(HandshakeFrameTest, OldProtocolFrameStillWorks) {
+    int fds[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+
+    const std::string old_payload = "{\"name\":\"segment\"}";
+    uint64_t old_length = old_payload.size();
+    ASSERT_EQ(writeFully(fds[0], &old_length, sizeof(old_length)),
+              static_cast<ssize_t>(sizeof(old_length)));
+    ASSERT_EQ(writeFully(fds[0], old_payload.data(), old_payload.size()),
+              static_cast<ssize_t>(old_payload.size()));
+
+    auto [type, payload] = readString(fds[1]);
+    EXPECT_EQ(type, HandShakeRequestType::OldProtocol);
+    EXPECT_EQ(payload, old_payload);
+
+    close(fds[0]);
+    close(fds[1]);
+}
+
+TEST(HandshakeFrameTest, RejectsHttpProbe) {
+    int fds[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+
+    const std::string request = "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    ASSERT_EQ(writeFully(fds[0], request.data(), request.size()),
+              static_cast<ssize_t>(request.size()));
+
+    auto [type, payload] = readString(fds[1]);
+    EXPECT_EQ(type, HandShakeRequestType::Invalid);
+    EXPECT_TRUE(payload.empty());
+
+    close(fds[0]);
+    close(fds[1]);
+}
+
+TEST(HandshakeFrameTest, RejectsTlsProbe) {
+    int fds[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+
+    const uint8_t client_hello_prefix[] = {0x16, 0x03, 0x01, 0x05,
+                                           0xc2, 0x01, 0x00, 0x05};
+
+    ASSERT_EQ(
+        writeFully(fds[0], client_hello_prefix, sizeof(client_hello_prefix)),
+        static_cast<ssize_t>(sizeof(client_hello_prefix)));
+
+    auto [read_type, payload] = readString(fds[1]);
+    EXPECT_EQ(read_type, HandShakeRequestType::Invalid);
+    EXPECT_TRUE(payload.empty());
+
+    close(fds[0]);
+    close(fds[1]);
+}
+
+TEST(HandshakeFrameTest, RejectsInvalidLength) {
+    int fds[2];
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+
+    const uint64_t oversized_length = kMaxHandshakeMaxLength + 1;
+    ASSERT_EQ(writeFully(fds[0], &oversized_length, sizeof(oversized_length)),
+              static_cast<ssize_t>(sizeof(oversized_length)));
+
+    auto [oversized_type, oversized_payload] = readString(fds[1]);
+    EXPECT_EQ(oversized_type, HandShakeRequestType::Invalid);
+    EXPECT_TRUE(oversized_payload.empty());
+
+    close(fds[0]);
+    close(fds[1]);
+
+    ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+
+    const uint64_t zero_length = 0;
+    ASSERT_EQ(writeFully(fds[0], &zero_length, sizeof(zero_length)),
+              static_cast<ssize_t>(sizeof(zero_length)));
+
+    auto [zero_type, zero_payload] = readString(fds[1]);
+    EXPECT_EQ(zero_type, HandShakeRequestType::Invalid);
+    EXPECT_TRUE(zero_payload.empty());
+
+    close(fds[0]);
+    close(fds[1]);
 }
 
 }  // namespace mooncake

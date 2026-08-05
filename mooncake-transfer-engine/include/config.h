@@ -33,6 +33,12 @@ enum class EndpointStoreType {
     SIEVE = 1,
 };
 
+// Which NICs the EFA transport registers a buffer on.
+enum class EfaNicSelection {
+    ALL = 0,    // every NIC, the historical behavior
+    LOCAL = 1,  // device memory only on that GPU's topology-local NICs
+};
+
 struct GlobalConfig {
     size_t num_cq_per_ctx = 1;
     size_t num_comp_channels_per_ctx = 1;
@@ -59,10 +65,26 @@ struct GlobalConfig {
     // torn-down pod IP) it stalls for the kernel's full SYN-retry cycle,
     // which is minutes. Override via MC_HANDSHAKE_CONNECT_TIMEOUT.
     int handshake_connect_timeout = 5;
+    // Cooldown before retrying a failed RDMA peer rail. Override via
+    // MC_RDMA_RAIL_PAUSE_SECONDS.
+    uint64_t rdma_rail_pause_seconds = 30;
     bool metacache = true;
+    // Periodically refresh Transfer Engine metadata-derived local caches. 0
+    // disables the background poller and preserves the manual
+    // syncSegmentCache() behavior. Currently refreshes cached remote segment
+    // descriptors. Override via MC_TE_METADATA_REFRESH_INTERVAL_SECONDS.
+    uint64_t te_metadata_refresh_interval_seconds = 0;
     int log_level = google::INFO;
     bool trace = false;
     int64_t slice_timeout = -1;
+    // Active-connect circuit-breaker. After an endpoint to a peer is torn down
+    // (path failure / QP fatal), pause active reconnection to that peer's
+    // address for this many milliseconds, so the posting worker is not
+    // blocked re-handshaking a likely-gone peer (a k8s rolling restart brings
+    // the pod back at a different podIP:port, so the old address is dead). The
+    // not-yet-posted slices fail/redispatch instead of hanging. 0 disables.
+    // Override via MC_CONN_PAUSE_TTL_MS.
+    int conn_pause_ttl_ms = 0;
     uint16_t rpc_min_port = 15000;
     uint16_t rpc_max_port = 17000;
     bool use_ipv6 = false;
@@ -71,7 +93,18 @@ struct GlobalConfig {
     bool enable_hca_peer_affinity = false;
     std::unordered_map<std::string, std::vector<std::string>> nic_peer_affinity;
     bool log_rdma_slice_affinity = false;
+    bool track_rdma_posted_slices = false;
     int parallel_reg_mr = -1;
+    // Cap on concurrent buffer registrations in registerLocalMemoryBatch().
+    // 0 (default) = unbounded, one thread per buffer. Set via
+    // MC_MAX_CONCURRENT_REG_MR; the best value is platform-specific, see the
+    // measured tables in efa_transport.cpp before choosing one.
+    size_t max_concurrent_reg_mr = 0;
+    // Which NICs a buffer is registered on in the EFA transport. ALL (default)
+    // registers every buffer on every NIC; LOCAL restricts device memory to the
+    // NICs the topology reports as closest to that GPU. Set via
+    // MC_EFA_NIC_SELECTION=all|local; see efa_transport.cpp for the trade-off.
+    EfaNicSelection efa_nic_selection = EfaNicSelection::ALL;
     size_t eic_max_block_size = 64UL * 1024 * 1024;
     EndpointStoreType endpoint_store_type = EndpointStoreType::SIEVE;
     int ib_traffic_class = -1;
@@ -90,7 +123,7 @@ struct GlobalConfig {
     // mode the setting is a no-op. Requires USE_MLX5DV.
     bool mlx5_qp_lag_port_balance = false;
     // ib_pci_relaxed_ordering_mode: 0: off, 1: on if supported, 2: auto
-    int ib_pci_relaxed_ordering_mode = 0;
+    int ib_pci_relaxed_ordering_mode = 1;
     bool ascend_use_fabric_mem = false;
     bool ascend_agent_mode = false;
     bool sunrise_use_device_mem = false;
@@ -114,7 +147,10 @@ struct RpcCommunicatorConfig {
     std::string listen_address;
     size_t thread_count = 0;
     size_t timeout_seconds = 30;
-    size_t pool_size = 10;
+    // Maximum number of cached RPC client connections per target endpoint.
+    // RPC client I/O threads are configured by
+    // MC_TE_RPC_CLIENT_IO_THREADS/MC_RPC_CLIENT_IO_THREADS.
+    size_t pool_size = 100;
 };
 
 void loadGlobalConfig(GlobalConfig& config);

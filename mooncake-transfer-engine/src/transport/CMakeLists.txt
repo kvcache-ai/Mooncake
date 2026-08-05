@@ -28,6 +28,11 @@ if(USE_NVMEOF)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:nvmeof_transport>)
 endif()
 
+if(USE_NCCL_HOST)
+  add_subdirectory(nccl_transport)
+  target_sources(transport PUBLIC $<TARGET_OBJECTS:nccl_host_transport>)
+endif()
+
 if(USE_CXL)
   add_subdirectory(cxl_transport)
   target_sources(transport PUBLIC $<TARGET_OBJECTS:cxl_transport>)

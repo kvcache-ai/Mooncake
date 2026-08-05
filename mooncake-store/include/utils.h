@@ -258,45 +258,6 @@ std::string expected_to_str(const tl::expected<T, ErrorCode>& expected) {
     return parsed.value_or(0);
 }
 
-/**
- * @brief Convert a boolean-like string to a bool
- * @param str String representation ("1"/"true"/"yes"/"on" or
- * "0"/"false"/"no"/"off")
- * @return std::optional<bool> Parsed value, or std::nullopt if parsing fails
- */
-[[nodiscard]] inline std::optional<bool> string_to_bool(std::string str) {
-    if (str.empty()) {
-        return std::nullopt;
-    }
-
-    str.erase(0, str.find_first_not_of(" \t\r\n"));
-    str.erase(str.find_last_not_of(" \t\r\n") + 1);
-    std::transform(str.begin(), str.end(), str.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
-
-    if (str == "1" || str == "true" || str == "yes" || str == "on") {
-        return true;
-    }
-    if (str == "0" || str == "false" || str == "no" || str == "off") {
-        return false;
-    }
-
-    return std::nullopt;
-}
-
-/**
- * @brief Split a string by delimiter into a vector of strings
- * @param str The string to split
- * @param delimiter The delimiter to split by (default is comma)
- * @param trim_spaces Whether to trim leading/trailing spaces from each token
- * @param keep_empty Whether to keep empty tokens in the result
- * @return Vector of split strings
- */
-std::vector<std::string> splitString(const std::string& str,
-                                     char delimiter = ',',
-                                     bool trim_spaces = true,
-                                     bool keep_empty = false);
-
 // Buffer allocator functions
 
 constexpr size_t SZ_2MB = 2 * 1024 * 1024;
@@ -378,6 +339,24 @@ inline size_t align_up(size_t size, size_t alignment) {
 }
 
 /**
+ * @brief Fault in a fresh HugeTLB mapping with parallel CPU writes.
+ *
+ * Touches one byte per configured hugepage. Call this only for a newly
+ * allocated mapping whose contents may be zeroed.
+ */
+void populate_hugetlb_mapping(void* ptr, size_t total_size);
+
+/**
+ * @brief Fault in an mbind-partitioned HugeTLB mapping with NUMA-local workers.
+ *
+ * The mapping is divided into equal regions in the same order as numa_nodes.
+ * Workers are scheduled on the corresponding node before touching that
+ * region.
+ */
+void populate_hugetlb_numa_mapping(void* ptr, size_t total_size,
+                                   const std::vector<int>& numa_nodes);
+
+/**
  * Allocate mmap-backed buffer memory for host KV / transfer buffers.
  *
  * When the global mmap arena is enabled, this function serves allocations
@@ -393,6 +372,24 @@ inline size_t align_up(size_t size, size_t alignment) {
  * @return Pointer to the allocation, or nullptr on failure.
  */
 void* allocate_buffer_mmap_memory(size_t total_size, size_t alignment);
+
+/**
+ * Allocate mmap-backed memory, optionally deferring direct HugeTLB population.
+ *
+ * When defer_hugetlb_population is true, a direct HugeTLB mmap omits
+ * MAP_POPULATE so the caller can populate the mapping later. Arena allocations
+ * retain their existing eager-population behavior.
+ */
+void* allocate_buffer_mmap_memory(size_t total_size, size_t alignment,
+                                  bool defer_hugetlb_population);
+
+/**
+ * @brief Return whether ptr is backed by the global mmap arena.
+ *
+ * Intended for callers that need to distinguish an eagerly populated arena
+ * allocation from a direct mmap fallback.
+ */
+[[nodiscard]] bool is_mmap_arena_allocation(const void* ptr);
 
 /**
  * Release memory previously returned by allocate_buffer_mmap_memory().
@@ -411,8 +408,9 @@ void free_buffer_mmap_memory(void* ptr, size_t total_size);
  *
  * Reserves a single VMA via mmap, divides it into N equal regions,
  * binds each region to the corresponding NUMA node via mbind(MPOL_BIND).
- * No explicit prefault — ibv_reg_mr() will fault and pin pages respecting
- * the mbind policy, allocating directly on the target NUMA node.
+ * The mapping remains lazy after allocation. The caller may populate it with
+ * NUMA-local workers or let ibv_reg_mr() fault and pin pages while respecting
+ * the mbind policy.
  *
  * @param total_size  Total buffer size in bytes
  * @param numa_nodes  NUMA node IDs to bind regions to (e.g., {1,3,5,7})
@@ -424,7 +422,8 @@ void* allocate_buffer_numa_segments(size_t total_size,
                                     const std::vector<int>& numa_nodes,
                                     size_t page_size = 0);
 
-void free_memory(const std::string& protocol, void* ptr);
+void free_memory(const std::string& protocol, void* ptr,
+                 bool use_spdk_dma = false);
 
 // Network utility functions
 
@@ -475,27 +474,6 @@ int getFreeTcpPort();
 std::vector<int> getFreeTcpPorts(int count);
 
 int64_t time_gen();
-
-// Helper: Get integer from environment variable, fallback to default
-template <typename T>
-T GetEnvOr(const char* name, T default_value) {
-    const char* env_val = std::getenv(name);
-    if (!env_val || std::string(env_val).empty()) {
-        return default_value;
-    }
-    try {
-        long long value = std::stoll(env_val);
-        // Check range for unsigned types
-        if constexpr (std::is_same_v<T, uint32_t>) {
-            if (value < 0 || value > UINT32_MAX) throw std::out_of_range("");
-        }
-        return static_cast<T>(value);
-    } catch (...) {
-        return default_value;
-    }
-}
-
-std::string GetEnvStringOr(const char* name, const std::string& default_value);
 
 std::string ResolveMooncakeHostId(const std::string& local_hostname);
 

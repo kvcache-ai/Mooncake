@@ -141,11 +141,13 @@ Runs a cluster of master instances coordinated through etcd. If the leader fails
 # Start each master instance with:
 mooncake_master \
   --enable_ha=true \
-  --etcd_endpoints="10.0.0.1:2379;10.0.0.2:2379;10.0.0.3:2379" \
+  --ha_backend_type=etcd \
+  --ha_backend_connstring="10.0.0.1:2379;10.0.0.2:2379;10.0.0.3:2379" \
+  --enable_oplog=true \
   --rpc_address=10.0.0.1
 ```
 
-Each instance must specify its own reachable `--rpc_address`. The etcd cluster used for HA can be shared with or separate from the Transfer Engine's metadata etcd.
+Each instance must specify its own reachable `--rpc_address`. `--etcd_endpoints` is still accepted as a backward-compatible alias for the etcd HA backend connection string when `--ha_backend_connstring` is empty. The etcd cluster used for HA can be shared with or separate from the Transfer Engine's metadata etcd.
 
 **Client addressing:** to reach an HA cluster, clients must use the `etcd://` master-address form (so they can discover the current leader) instead of a single `IP:Port` — set `master_server_addr` (Method A) / `MOONCAKE_MASTER` (Method B) / `--master_server_address` (Method C) to `etcd://10.0.0.1:2379;10.0.0.2:2379;...`.
 
@@ -163,7 +165,7 @@ mooncake_master \
   --rpc_address=10.0.0.1
 ```
 
-**Client addressing:** clients reach a Redis-backed HA cluster with the `redis://connstring` master-address form (e.g. `redis://127.0.0.1:6379`) for `master_server_addr` / `MOONCAKE_MASTER` / `--master_server_address`, instead of a single `IP:Port`.
+**Client addressing:** clients reach a Redis-backed HA cluster with the `redis://connstring` master-address form (e.g. `redis://127.0.0.1:6379`) for `master_server_addr` / `MOONCAKE_MASTER` / `--master_server_address`, instead of a single `IP:Port`. Redis is used only for leader election here. OpLog replication currently requires `ha_backend_type=etcd`.
 
 
 ---
@@ -200,10 +202,11 @@ mooncake_master \
   --promotion_on_hit=true \
   --promotion_admission_threshold=2 \
   --promotion_max_budget_ms=0 \
-  --root_fs_dir=/mnt/ssd_cache \
   --enable_http_metadata_server=true \
   --http_metadata_server_port=8080
 ```
+
+Do not set `--root_fs_dir` with `--enable_offload=true`. `--root_fs_dir` is a legacy parameter from an older persistence path and may cause issues on the SSD offload path. Configure each real client's offload directory with `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` instead.
 
 ---
 
@@ -235,8 +238,138 @@ mooncake_master \
 
 The master resolves the current IPv4 address of `eth0` at startup and uses it as the advertised RPC address.
 
-
 ---
+
+## High Availability (HA)
+
+Mooncake Store supports a Primary-Standby HA model with batch-record OpLog replication. The active Primary serves traffic and writes ordered batches to etcd. Standby nodes poll the durable batch prefix and apply each entry in strict sequence order.
+
+### HA Architecture
+
+```
++------------------+     etcd batch records     +---------------+
+| Primary          | --------------------------> | Standby       |
+| OrderedOpLogWriter|     durable_prefix         | OpLogApplier  |
+| MasterService    |                              | MetadataStore |
++------------------+                              +---------------+
+       ^                                                 |
+       |         Leadership Election                      |
+       +---------------- etcd/redis/k8s ------------------+
+```
+
+### HA Configuration
+
+HA leadership and metadata replication are configured separately:
+
+- The HA coordinator elects the active master. Configure it with `--enable_ha`, `--ha_backend_type`, `--ha_backend_connstring`, and `--cluster_id`. For `ha_backend_type=etcd`, legacy `--etcd_endpoints` is used only when `--ha_backend_connstring` is empty.
+- The optional batch-record OpLog persists metadata mutations so standby masters can catch up and later be promoted. Enable it explicitly with `--enable_oplog=true`; it is disabled by default and requires `ha_backend_type=etcd` and a build with `STORE_USE_ETCD`.
+
+
+- `--enable_oplog`: Enable the primary OpLog writer and standby reader. Defaults to `false`.
+- `--oplog_poll_interval_ms`: Base polling and retry delay for the batch standby, in milliseconds.
+- `--oplog_batch_max_entries`: Maximum number of entries admitted to an ordered batch. Defaults to `1024`.
+- `--batch_oplog_retry_timeout_sec`: Maximum consecutive retryable batch-standby failure window in seconds (default `180`).
+
+For snapshot-based standby bootstrap, also configure:
+
+- `--enable_snapshot_restore` (bool, default `false`): Enable standby to bootstrap from the latest snapshot at startup.
+- `--snapshot_object_store_type` (str): Snapshot object store type: `local` or `s3`.
+- `--snapshot_catalog_store_type` (str): Snapshot catalog store type: `embedded` (default) or `redis`.
+
+### Standby Bootstrap
+
+When a Standby starts, it follows this sequence:
+
+1. **Snapshot Bootstrap** (if `enable_snapshot_restore=true`):
+   - Load the latest snapshot from the configured catalog and object store.
+   - Rebuild object metadata and segment state from the snapshot baseline.
+2. **OpLog Catch-up**:
+   - Start from the snapshot's `last_included_seq` (or from 1 if no snapshot).
+   - Poll `durable_prefix`, read batch records up to that boundary, and apply entries in strict sequence order.
+
+Supported OpLog entry types:
+- `PUT_END`: Object write completion
+- `REMOVE`: Object removal
+- `PUT_REVOKE`: Object revocation
+- `SEGMENT_MOUNT`: Segment mount event
+- `SEGMENT_UNMOUNT`: Segment unmount event
+- `SEGMENT_UPDATE`: Segment update event
+
+### Promotion and Failover
+
+When the Primary fails, the Standby is promoted through the following steps:
+
+1. **Leadership Lease**: The supervisor must acquire and retain the leadership lease before promotion begins.
+2. **Final Prefix Read and Catch-up**: The Standby stops its polling loop, reads `durable_prefix` again, and applies all durable batches. A missing prefix is accepted only when the local applied sequence is zero; otherwise promotion fails closed.
+3. **Export Context**: The Standby exports its current state as a `PromotionContext`, including:
+   - `applied_seq_id`: The latest applied OpLog sequence ID.
+   - `objects`: All object metadata from the in-memory store.
+   - `segments`: All segment registry entries.
+4. **State Restoration**: The new Primary restores its state from the `PromotionContext`, populating metadata shards and the segment manager.
+5. **Invalid Endpoint Filtering**: During restoration, any replica endpoints that correspond to segments no longer in the registry are automatically filtered out from `GetReplicaList` results.
+
+### Example: HA Deployment with etcd
+
+Primary configuration (`primary.yaml`):
+
+```yaml
+enable_ha: true
+ha_backend_type: "etcd"
+ha_backend_connstring: "etcd-1:2379;etcd-2:2379;etcd-3:2379"
+cluster_id: "mooncake_cluster"
+enable_oplog: true
+oplog_poll_interval_ms: 1000
+oplog_batch_max_entries: 1024
+enable_snapshot: true
+snapshot_object_store_type: "local"
+snapshot_catalog_store_type: "embedded"
+rpc_port: 50051
+```
+
+Standby configuration (`standby.yaml`):
+
+```yaml
+enable_ha: true
+ha_backend_type: "etcd"
+ha_backend_connstring: "etcd-1:2379;etcd-2:2379;etcd-3:2379"
+cluster_id: "mooncake_cluster"
+enable_oplog: true
+oplog_poll_interval_ms: 1000
+oplog_batch_max_entries: 1024
+enable_snapshot_restore: true
+snapshot_object_store_type: "local"
+snapshot_catalog_store_type: "embedded"
+rpc_port: 50052
+```
+
+Environment variable for local snapshot storage:
+
+```bash
+export MOONCAKE_SNAPSHOT_LOCAL_PATH=/data/mooncake_snapshots
+```
+
+Start the cluster:
+
+```bash
+# Start Primary
+mooncake_master --config_path=primary.yaml
+
+# Start Standby
+mooncake_master --config_path=standby.yaml
+```
+
+### Resetting a Legacy OpLog Namespace
+
+The batch-only implementation does not migrate or read older per-entry OpLog data. Reusing a namespace that contains legacy `latest`, numeric entry, or snapshot sidecar keys is rejected.
+
+Reset is destructive:
+
+1. Stop every Primary and Standby process that uses the cluster ID.
+2. Confirm that loss of the old metadata and snapshots is acceptable.
+3. Delete the complete `/oplog/{cluster_id}` namespace directly with the operator's etcd tooling.
+4. Start the cluster with empty state and batch-record OpLog enabled.
+
+Do not delete individual compatibility keys while any process is running, and do not retain an old snapshot baseline with a nonzero sequence after deleting `durable_prefix`.
 
 ## Metrics Endpoints
 
@@ -350,8 +483,8 @@ In HA mode, quota admin requests are served only by the active master service. S
 - Scale `--rpc_thread_num` with available CPU cores and workload.
 - Start with default eviction settings; adjust `--eviction_high_watermark_ratio` and `--eviction_ratio` based on memory pressure and object churn.
 - Use `/metrics/summary` during bring-up; integrate `/metrics` with Prometheus/Grafana for production.
-- For detailed SSD offload configuration (storage backends, eviction policies, io_uring), see the [SSD Offload guide](ssd-offload).
-- For NVMe-oF SSD pool configuration see the [NVMe-oF SSD Pool Deployment Guide](nvmf-ssd-deployment-guide)
+- For detailed SSD offload configuration (storage backends, eviction policies, io_uring), see the [SSD Offload guide](ssd/ssd-offload).
+- For NVMe-oF SSD pool configuration see the [NVMe-oF SSD Pool Deployment Guide](ssd/nvmf-ssd-deployment-guide)
 - For experimental 3FS (USRBIO) integration as a persistent storage backend, see the [3FS USRBIO Plugin guide](../getting_started/plugin-usage/3FS-USRBIO-Plugin).
 - For detailed monitoring and observation see [Observability](../getting_started/observability)
 
@@ -359,8 +492,8 @@ In HA mode, quota admin requests are served only by the active master service. S
 :maxdepth: 1
 :hidden:
 
-ssd-offload
-NvMe-Of SSD Pool<nvmf-ssd-deployment-guide>
+KV Cache Sharing and Isolation<kv-cache-sharing-and-isolation>
+SSD Storage<ssd/index>
 HF3FS Plugin (Experimental)<../getting_started/plugin-usage/3FS-USRBIO-Plugin>
 ../getting_started/observability
 :::
@@ -392,6 +525,45 @@ glog's standard flags (`--log_dir`, `--max_log_size`, `--logtostderr`, ...) cont
 |------|---------|-------------|
 | `--enable_metric_reporting` | `true` | Periodically log master metrics |
 | `--metrics_port` | `9003` | HTTP port for `/metrics` endpoints |
+
+### KV Cache Event Publisher
+
+The master can publish KV cache lifecycle events over a ZMQ PUB socket for
+cache-aware indexers such as Mooncake Conductor. This feature is compiled out
+by default. Install `libzmq3-dev` and configure Mooncake Store with
+`-DENABLE_KV_EVENTS=ON` before enabling it at runtime.
+
+Both `--kv_events_bind_endpoint` and `--kv_events_backend_id` are required when
+the publisher is enabled. If either value is empty, or the ZMQ socket cannot
+bind, the master logs an error and continues with event publishing disabled.
+
+```bash
+mooncake_master \
+  --enable_kv_events=true \
+  --kv_events_bind_endpoint=tcp://0.0.0.0:5557 \
+  --kv_events_backend_id=store-node-1
+```
+
+Register an address reachable by the indexer, rather than the wildcard bind
+address, through the indexer's `POST /register` endpoint. For the event format,
+registration fields, and object-key behavior, see the {ref}`Mooncake Store
+master publisher <mooncake-store-master-publisher>` reference.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--enable_kv_events` | `false` | Enable the ZMQ KV cache event publisher; requires a build with `ENABLE_KV_EVENTS=ON` |
+| `--kv_events_bind_endpoint` | empty | ZMQ PUB bind endpoint, for example `tcp://0.0.0.0:5557`; required when enabled |
+| `--kv_events_backend_id` | empty | Cache-owner identity emitted as `backend_id`; required when enabled |
+| `--kv_events_emit_legacy_compat` | `true` | Include vLLM/SGLang-compatible aliases such as `type` and `block_hashes` |
+| `--kv_events_emit_object_key` | `true` | Include the Mooncake `object_key`; unparsable sequence hashes are still published when this is enabled |
+| `--kv_events_queue_capacity` | `65536` | Maximum pending events; the publisher drops the oldest event when the queue is full. Set to `0` for an unbounded queue |
+
+The legacy flags `--kv_events_model_name`, `--kv_events_tenant_id`,
+`--kv_events_additional_salt`, `--kv_events_lora_name`,
+`--kv_events_block_size`, and `--kv_events_dp_rank` are retained for config
+compatibility but are not emitted in event payloads. Supply model, block-size,
+hash-namespace, LoRA, and data-parallel metadata when registering the publisher
+with the indexer; each event carries its object's tenant ID.
 
 ### HTTP Metadata Server (Embedded)
 
@@ -474,11 +646,11 @@ mooncake_master \
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--default_kv_lease_ttl` | `5000` ms | Lease TTL for KV objects. Supports `5000ms`, `5s`, `30m`, `1h` |
+| `--default_kv_lease_ttl` | `10000` ms | Lease TTL for KV objects. Supports `5000ms`, `5s`, `30m`, `1h` |
 | `--default_kv_soft_pin_ttl` | `1800000` ms | Soft pin TTL (30 min) |
 | `--allow_evict_soft_pinned_objects` | `true` | Allow evicting soft-pinned objects |
 | `--eviction_ratio` | `0.05` | Fraction evicted at high watermark |
-| `--eviction_high_watermark_ratio` | `0.95` | Usage ratio triggering eviction |
+| `--eviction_high_watermark_ratio` | `0.90` | Usage ratio triggering eviction |
 | `--client_ttl` | `10` s | Seconds before a silent client is considered disconnected |
 
 ### Tenant Quota
@@ -497,8 +669,12 @@ mooncake_master \
 | `--enable_ha` | `false` | Enable HA mode |
 | `--ha_backend_type` | `etcd` | HA backend: `etcd`, `redis`, or `k8s` |
 | `--ha_backend_connstring` | empty | HA backend connection string |
-| `--etcd_endpoints` | empty | etcd endpoints, semicolon separated (when `--ha_backend_type=etcd`) |
+| `--etcd_endpoints` | empty | Backward-compatible etcd HA endpoints, used only for `ha_backend_type=etcd` when `--ha_backend_connstring` is empty |
 | `--cluster_id` | `mooncake_cluster` | Cluster ID for HA persistence |
+| `--enable_oplog` | `false` | Enable the primary OpLog writer and standby reader; currently requires `enable_ha=true` and `ha_backend_type=etcd` |
+| `--oplog_poll_interval_ms` | `1000` | Base polling and retry delay for the batch standby, in milliseconds |
+| `--oplog_batch_max_entries` | `1024` | Maximum number of entries admitted to an ordered batch |
+| `--batch_oplog_retry_timeout_sec` | `180` | Maximum consecutive retryable batch-standby failure window in seconds |
 
 ```{caution}
 Metadata Snapshot And Restore is experimental feature.
@@ -556,6 +732,8 @@ Flags for controlling data movement between DRAM and SSD.
 
 Start with `--enable_offload=true` for eager asynchronous SSD persistence after `Put` completion. Add `--offload_on_evict=true` when you want SSD writes to happen only when memory pressure selects an object for eviction. Add `--promotion_on_hit=true` to allow hot SSD-only data to be promoted back to DRAM, and tune `--promotion_admission_threshold` to control how many observed reads are required before promotion is queued. Keep `--promotion_max_budget_ms=0` for the original FIFO queue behavior; set it to a positive SLO budget when late SSD-to-DRAM promotions should be expired instead of consuming client work after their useful window has passed.
 
+For SSD offload, configure the disk path on each real client with `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`; the master tracks these objects as `LOCAL_DISK` replicas. Do not use the legacy `--root_fs_dir` parameter with `--enable_offload=true`.
+
 When `--offload_on_evict=true` is active, each `BatchEvict` cycle can queue at most `offloading_queue_limit * offload_cap_ratio` objects for SSD offload (default: `50000 * 0.5 = 25000`); objects exceeding this cap fall back to force-evict (discard) if `--offload_force_evict=true`, otherwise they remain in memory. For SSD-heavy workloads where NVMe bandwidth is underutilized while the KV-cache hit rate suffers, raise both `--offloading_queue_limit` and `--offload_cap_ratio` so more objects per cycle are actually persisted to SSD instead of discarded. Example: `--offloading_queue_limit=500000 --offload_cap_ratio=0.8` yields a per-cycle cap of `400000` (vs the default `25000`).
 
 ### CXL Memory
@@ -572,8 +750,10 @@ When `--allocation_strategy=cxl` is set alongside `--enable_cxl=true`, the maste
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--root_fs_dir` | empty | DFS mount directory for multi-layer storage backend |
+| `--root_fs_dir` | empty | Legacy DFS persistence directory; do not use with SSD offload |
 | `--global_file_segment_size` | `INT64_MAX` (unlimited) | Max available space for DFS segments; default does not cap DFS usage |
+
+`--root_fs_dir` is a legacy persistence parameter and is expected to be replaced as the distributed filesystem path is refactored. For SSD offload, configure `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` on each real client instead.
 
 ### NoF (NVMe-oF SSD Pool)
 
@@ -581,12 +761,12 @@ When `--allocation_strategy=cxl` is set alongside `--enable_cxl=true`, the maste
 NVMe-oF SSD Pool (NoF) is an experimental feature.
 ```
 
-Master-side flags for the NVMe-oF SSD pool. They control eviction within the NoF SSD tier and the heartbeat used to detect and unmount unresponsive NoF segments. For the client-side NoF I/O tuning (`MC_NOF_*`), see the [NVMe-oF SSD Pool Deployment Guide](nvmf-ssd-deployment-guide.md).
+Master-side flags for the NVMe-oF SSD pool. They control eviction within the NoF SSD tier and the heartbeat used to detect and unmount unresponsive NoF segments. For the client-side NoF I/O tuning (`MC_NOF_*`), see the [NVMe-oF SSD Pool Deployment Guide](ssd/nvmf-ssd-deployment-guide.md).
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--nof_eviction_ratio` | `0.05` | Fraction of objects evicted when NoF SSD space is full |
-| `--nof_eviction_high_watermark_ratio` | `0.95` | Usage ratio that triggers eviction in the NoF SSD tier |
+| `--nof_eviction_high_watermark_ratio` | `0.90` | Usage ratio that triggers eviction in the NoF SSD tier |
 | `--nof_heartbeat_interval_sec` | `10` | How often the master probes each mounted NoF segment |
 | `--nof_heartbeat_probe_timeout_ms` | `1000` | Timeout for a single NoF heartbeat probe |
 | `--nof_heartbeat_failures_threshold` | `3` | Consecutive NoF heartbeat failures before a segment is unmounted |
@@ -649,9 +829,11 @@ Arguments of `MooncakeDistributedStore.setup(...)`:
 | `enable_ssd_offload` | bool | `false` | *(advanced)* Enable client-side SSD offload |
 | `ssd_offload_path` | str | empty | *(advanced)* SSD offload directory |
 | `tenant_id` | str | `default` | *(advanced)* Tenant identifier |
+| `enable_client_http_server` | bool | `false` | Enable the client-side HTTP `/health`, `/metrics`, and `/metrics/summary` endpoints |
+| `client_http_port` | int | `9300` | Client-side HTTP endpoint port, used only when `enable_client_http_server=true` |
 
 ```{note}
-The first seven arguments have **no Python default** — the C++ defaults are not exposed by the pybind binding, so they must all be supplied (a bare `setup(local_hostname, metadata_server)` raises `TypeError`). Only `engine` / `enable_ssd_offload` / `ssd_offload_path` / `tenant_id` are optional. Also, in Method A the `MOONCAKE_*` variables used by `MooncakeConfig` are ignored; low-level runtime variables such as the `MC_*` engine variables below are still read by the C++ client.
+The first seven arguments have **no Python default** — the C++ defaults are not exposed by the pybind binding, so they must all be supplied (a bare `setup(local_hostname, metadata_server)` raises `TypeError`). The later arguments (`engine`, SSD offload fields, `tenant_id`, and client HTTP endpoint fields) are optional. Also, in Method A the `MOONCAKE_*` variables used by `MooncakeConfig` are ignored; low-level runtime variables such as the `MC_*` engine variables below are still read by the C++ client.
 ```
 
 ### Method B — Service / Integration (`MOONCAKE_*` + CLI)
@@ -678,6 +860,8 @@ The store service CLI only accepts `--config`, `-D/--define`, `--port`, and `--m
 | `MOONCAKE_OFFLOAD_ENABLED` | `enable_ssd_offload` | `false` | Client-side SSD offload |
 | `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | `ssd_offload_path` | empty | Offload directory |
 | `MOONCAKE_TENANT_ID` | `tenant_id` | `default` | Tenant identifier |
+| `MOONCAKE_ENABLE_CLIENT_HTTP_SERVER` | `enable_client_http_server` | `false` | Enable client-side `/health`, `/metrics`, and `/metrics/summary` endpoints |
+| `MOONCAKE_CLIENT_HTTP_PORT` | `client_http_port` | `9300` | Client-side HTTP endpoint port |
 | `MOONCAKE_CONFIG_PATH` | — | unset | Path to a JSON config file (takes precedence over the variables above) |
 
 ```{note}
@@ -709,7 +893,9 @@ Or via a JSON config file. The service also exposes a lightweight HTTP API (on `
   "protocol": "tcp",
   "device_name": "",
   "master_server_address": "127.0.0.1:50051",
-  "tenant_id": "default"
+  "tenant_id": "default",
+  "enable_client_http_server": false,
+  "client_http_port": 9300
 }
 ```
 
@@ -732,8 +918,8 @@ mooncake_client \
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `--host` | `0.0.0.0` | Client service bind host |
-| `--port` | `50052` | Client service listen port |
+| `--host` | `0.0.0.0` | Client service bind host. Accepts `ip:port` to specify the data plane port for TransferEngine |
+| `--port` | `50052` | Client RPC listen port (dummy↔real client control plane) |
 | `--global_segment_size` | `4 GB` | Global segment size contributed by the client |
 | `--master_server_address` | `127.0.0.1:50051` | Master service address |
 | `--metadata_server` | `http://127.0.0.1:8080/metadata` | Transfer Engine metadata service |
@@ -743,6 +929,38 @@ mooncake_client \
 | `--tenant_id` | `default` | Tenant identifier |
 | `--enable_offload` | `false` | Enable client-side SSD offload |
 | `--start_offload_rpc_server` | `true` | Start the offload RPC server for dummy clients |
+| `--enable_http_server` | `false` | Enable client-side `/health`, `/metrics`, and `/metrics/summary` endpoints |
+| `--http_port` | `9300` | Client-side HTTP endpoint port |
+
+### Client HTTP Health and Metrics Endpoint
+
+Each real client can expose its own lightweight HTTP endpoint independently of the master admin HTTP server and the Python store REST API. This endpoint is disabled by default for programmatic clients and `mooncake_store_service`; enable it explicitly when you want to scrape client-local metrics:
+
+```python
+store.setup(
+    local_hostname,
+    metadata_server,
+    global_segment_size,
+    local_buffer_size,
+    protocol,
+    rdma_devices,
+    master_server_addr,
+    enable_client_http_server=True,
+    client_http_port=9300,
+)
+```
+
+For `mooncake_store_service`, use `MOONCAKE_ENABLE_CLIENT_HTTP_SERVER=true` and optionally `MOONCAKE_CLIENT_HTTP_PORT=<port>`, or set the same fields in the JSON config. For `mooncake_client`, use `--enable_http_server=true --http_port=<port>`.
+
+| Endpoint | Description |
+|----------|-------------|
+| `GET /health` | Client health check |
+| `GET /metrics` | Prometheus-format client metrics |
+| `GET /metrics/summary` | Human-readable client metrics summary |
+
+```{note}
+`MC_STORE_CLIENT_METRIC` controls whether client metrics are collected. If the client HTTP server is enabled but `MC_STORE_CLIENT_METRIC=0`, `/metrics` and `/metrics/summary` return HTTP 503 with `metrics not available`.
+```
 
 ### Engine Runtime Tuning (`MC_*`)
 
@@ -755,8 +973,16 @@ The following `MC_*` variables are read directly by the engine/client at runtime
 | `MC_RPC_PROTOCOL` | `tcp` | RPC transport protocol between master and clients: `tcp` or `rdma` |
 | `MC_RPC_TIMEOUT_MS` | `30000` | Per-request deadline (ms) for all client→master RPCs. Applies uniformly to every RPC method. A negative value disables the timeout. On expiry the call returns `RPC_TIMEOUT` |
 | `MC_RPC_CONNECT_TIMEOUT_MS` | `30000` | Connection-establishment timeout (ms) for the master RPC client |
+| `MC_RPC_CLIENT_IO_THREADS` | `min(16, online CPU count)`, minimum `1` | Fallback number of threads and `io_context` instances for each component's RPC client I/O pool. A positive integer overrides the default; invalid values and `0` use the default |
+| `MC_STORE_RPC_CLIENT_IO_THREADS` | `MC_RPC_CLIENT_IO_THREADS` | Store/Master client RPC I/O pool size. This pool is isolated from Transfer Engine traffic. Invalid values and `0` use the fallback |
+| `MC_TE_RPC_CLIENT_IO_THREADS` | `MC_RPC_CLIENT_IO_THREADS` | Transfer Engine and TENT client RPC I/O pool size. This pool is isolated from Store/Master traffic. Invalid values and `0` use the fallback |
 | `MC_USE_TENT` / `MC_USE_TEV1` | unset | Set to any value to enable the TENT (next-gen) transfer engine |
 | `MC_STORE_CLUSTER_ID` | unset | Cluster ID label attached to client metrics |
+
+RPC client I/O pool settings are read and resolved once when the process-wide
+`Environ` singleton is initialized. Changes therefore require a process
+restart. When Store and Transfer Engine run in the same process, each component
+owns the configured number of threads and `io_context` instances.
 
 #### Topology Discovery
 
@@ -794,6 +1020,14 @@ Local hot cache provides a DRAM read cache on top of SSD-resident objects for fa
 | `MC_STORE_LOCAL_HOT_CACHE_USE_SHM` | unset | Set `1` to use memfd-backed shared memory |
 | `MC_STORE_LOCAL_HOT_ADMISSION_THRESHOLD` | unset | Minimum CountMinSketch count before a key is admitted to hot cache |
 
+#### Object-Level Checksum Diagnostics
+
+Set `MOONCAKE_STORE_CHECKSUM=1` on a Mooncake Store client process before the client is created to enable object-level CRC-64 checks. The client computes the checksum before `put`/`upsert`, stores it in master metadata, and verifies the logical `object_size` bytes returned by a full-object `get`. For complete diagnostic coverage, enable the switch on every writer and reader client. A client with the switch disabled does not generate or verify checksums; an enabled reader skips verification for objects whose metadata has no checksum.
+
+This switch is intended for corruption diagnosis, not normal production use. It adds a full data scan to writes and reads, performs device-to-host staging for GPU buffers, and disables the local hot cache. Range reads, including `get_into_ranges`, are intentionally not verified.
+
+Do not run binaries from before and after checksum support was introduced in the same deployment; Mooncake Store clients, the primary master, and the standby master must all use a checksum-capable version. Checksum-capable masters persist checksum metadata in new snapshots and can load snapshots created by older versions; objects restored from an older snapshot have no checksum and are read without verification. Snapshots containing checksum metadata cannot be restored by binaries that predate checksum support, so rolling back requires an older compatible snapshot or a fresh deployment.
+
 #### Local Memory Optimization
 
 | Variable | Default | Description |
@@ -810,6 +1044,21 @@ Local hot cache provides a DRAM read cache on top of SSD-resident objects for fa
 | `MC_STORE_HUGEPAGE_SIZE` | `2MB` | Supported: `2MB`, `1GB` |
 | `MC_MMAP_ARENA_POOL_SIZE` | unset | Pre-allocated arena pool size (e.g., `8gb`). Explicitly set to enable the arena |
 | `MC_DISABLE_MMAP_ARENA` | unset | Disable arena, fall back to per-call `mmap()`. Accepts `1`/`true`/`yes`/`on` (or `0`/`false`/`no`/`off`) |
+
+RDMA Store segments backed by HugeTLB are populated in parallel immediately
+before transfer-engine registration. No additional population-mode setting is
+required:
+
+```bash
+export MC_STORE_USE_HUGEPAGE=1
+export MC_STORE_HUGEPAGE_SIZE=2MB
+```
+
+For direct mappings, workers divide the mapping into page ranges. For
+NUMA-segmented mappings, each worker is scheduled on the NUMA node associated
+with its `mbind()` region before touching pages. The mmap arena retains its
+eager `MAP_POPULATE` behavior for DMA safety; set `MC_DISABLE_MMAP_ARENA=1` if
+the deferred direct-mmap path is desired while the arena is otherwise enabled.
 
 #### yalantinglibs Log Level
 

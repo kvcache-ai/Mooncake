@@ -55,6 +55,12 @@ struct MasterConfig {
     std::string ha_backend_connstring;
     std::string etcd_endpoints;
 
+    // OpLog store configuration
+    bool enable_oplog = false;
+    int oplog_poll_interval_ms = 1000;
+    uint32_t oplog_batch_max_entries = 1024;
+    uint32_t batch_oplog_retry_timeout_sec = 180;
+
     std::string cluster_id;
     std::string root_fs_dir;
     int64_t global_file_segment_size;
@@ -136,6 +142,21 @@ struct MasterConfig {
     // When set, tasks are sorted by deadline (queued_time + budget) and only
     // tasks within budget are returned.
     uint32_t promotion_max_budget_ms = 0;
+
+    // KV Events publisher (RFC #1527) for cache-aware indexers.
+    bool enable_kv_events = false;
+    std::string kv_events_bind_endpoint;
+    std::string kv_events_model_name;
+    std::string kv_events_backend_id;
+    std::string kv_events_tenant_id = "default";
+    std::string kv_events_additional_salt;
+    std::string kv_events_lora_name;
+    uint32_t kv_events_block_size = 0;
+    uint32_t kv_events_dp_rank = 0;
+    bool kv_events_emit_legacy_compat = true;
+    bool kv_events_emit_object_key = true;
+    uint32_t kv_events_queue_capacity = 65536;
+>>>>>>> upstream/main
 };
 
 class MasterServiceSupervisorConfig {
@@ -172,11 +193,18 @@ class MasterServiceSupervisorConfig {
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     std::string etcd_endpoints = "0.0.0.0:2379";
+    // OpLog store configuration
+    bool enable_oplog = false;
+    int oplog_poll_interval_ms = 1000;
+    uint32_t oplog_batch_max_entries = 1024;
+    uint32_t batch_oplog_retry_timeout_sec = 180;
     std::string local_hostname = "0.0.0.0:50051";
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
     BufferAllocatorType memory_allocator = BufferAllocatorType::OFFSET;
+    AllocationStrategyType allocation_strategy_type =
+        AllocationStrategyType::RANDOM;
     uint64_t put_start_discard_timeout_sec = DEFAULT_PUT_START_DISCARD_TIMEOUT;
     uint64_t put_start_release_timeout_sec = DEFAULT_PUT_START_RELEASE_TIMEOUT;
     bool enable_disk_eviction = true;
@@ -216,6 +244,19 @@ class MasterServiceSupervisorConfig {
     uint32_t promotion_queue_limit = 50000;
     uint32_t promotion_max_per_heartbeat = 1;
     uint32_t promotion_max_budget_ms = 0;  // SLO-aware budget, 0=disabled
+    bool enable_kv_events = false;
+    std::string kv_events_bind_endpoint;
+    std::string kv_events_model_name;
+    std::string kv_events_backend_id;
+    std::string kv_events_tenant_id = "default";
+    std::string kv_events_additional_salt;
+    std::string kv_events_lora_name;
+    uint32_t kv_events_block_size = 0;
+    uint32_t kv_events_dp_rank = 0;
+    bool kv_events_emit_legacy_compat = true;
+    bool kv_events_emit_object_key = true;
+    uint32_t kv_events_queue_capacity = 65536;
+>>>>>>> upstream/main
 
     // Pod identity for K8s label-based routing
     std::string pod_name;
@@ -259,6 +300,18 @@ class MasterServiceSupervisorConfig {
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
         promotion_max_budget_ms = config.promotion_max_budget_ms;
+        enable_kv_events = config.enable_kv_events;
+        kv_events_bind_endpoint = config.kv_events_bind_endpoint;
+        kv_events_model_name = config.kv_events_model_name;
+        kv_events_backend_id = config.kv_events_backend_id;
+        kv_events_tenant_id = config.kv_events_tenant_id;
+        kv_events_additional_salt = config.kv_events_additional_salt;
+        kv_events_lora_name = config.kv_events_lora_name;
+        kv_events_block_size = config.kv_events_block_size;
+        kv_events_dp_rank = config.kv_events_dp_rank;
+        kv_events_emit_legacy_compat = config.kv_events_emit_legacy_compat;
+        kv_events_emit_object_key = config.kv_events_emit_object_key;
+        kv_events_queue_capacity = config.kv_events_queue_capacity;
         rpc_port = static_cast<int>(config.rpc_port);
         rpc_thread_num = static_cast<size_t>(config.rpc_thread_num);
 
@@ -271,6 +324,10 @@ class MasterServiceSupervisorConfig {
         etcd_endpoints = config.etcd_endpoints;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring, etcd_endpoints);
+        enable_oplog = config.enable_oplog;
+        oplog_poll_interval_ms = config.oplog_poll_interval_ms;
+        oplog_batch_max_entries = config.oplog_batch_max_entries;
+        batch_oplog_retry_timeout_sec = config.batch_oplog_retry_timeout_sec;
         local_hostname = rpc_address + ":" + std::to_string(rpc_port);
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
@@ -281,6 +338,28 @@ class MasterServiceSupervisorConfig {
             memory_allocator = BufferAllocatorType::CACHELIB;
         } else {
             memory_allocator = BufferAllocatorType::OFFSET;
+        }
+
+        // Convert string allocation_strategy to AllocationStrategyType enum
+        if (config.allocation_strategy == "free_ratio_first") {
+            allocation_strategy_type = AllocationStrategyType::FREE_RATIO_FIRST;
+        } else if (config.allocation_strategy == "cxl") {
+            allocation_strategy_type = AllocationStrategyType::CXL;
+        } else if (config.allocation_strategy == "random") {
+            allocation_strategy_type = AllocationStrategyType::RANDOM;
+        } else if (config.allocation_strategy == "ssd_free_ratio_first") {
+            allocation_strategy_type =
+                AllocationStrategyType::SSD_FREE_RATIO_FIRST;
+        } else if (config.allocation_strategy == "local_first") {
+            allocation_strategy_type = AllocationStrategyType::LOCAL_FIRST;
+        } else {
+            LOG(WARNING) << "Unrecognized allocation_strategy value: '"
+                         << config.allocation_strategy
+                         << "'. Defaulting to 'random'. "
+                         << "Valid options are: random, free_ratio_first, cxl, "
+                            "ssd_free_ratio_first, local_first "
+                            "(case-sensitive)";
+            allocation_strategy_type = AllocationStrategyType::RANDOM;
         }
 
         put_start_discard_timeout_sec = config.put_start_discard_timeout_sec;
@@ -410,8 +489,25 @@ class WrappedMasterServiceConfig {
     uint32_t promotion_queue_limit = 50000;
     uint32_t promotion_max_per_heartbeat = 1;
     uint32_t promotion_max_budget_ms = 0;  // SLO-aware budget, 0=disabled
+    bool enable_kv_events = false;
+    std::string kv_events_bind_endpoint;
+    std::string kv_events_model_name;
+    std::string kv_events_backend_id;
+    std::string kv_events_tenant_id = "default";
+    std::string kv_events_additional_salt;
+    std::string kv_events_lora_name;
+    uint32_t kv_events_block_size = 0;
+    uint32_t kv_events_dp_rank = 0;
+    bool kv_events_emit_legacy_compat = true;
+    bool kv_events_emit_object_key = true;
+    uint32_t kv_events_queue_capacity = 65536;
+>>>>>>> upstream/main
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
+    // OpLog store configuration
+    bool enable_oplog = false;
+    int oplog_poll_interval_ms = 1000;
+    uint32_t oplog_batch_max_entries = 1024;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
@@ -484,10 +580,25 @@ class WrappedMasterServiceConfig {
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
         promotion_max_budget_ms = config.promotion_max_budget_ms;
+        enable_kv_events = config.enable_kv_events;
+        kv_events_bind_endpoint = config.kv_events_bind_endpoint;
+        kv_events_model_name = config.kv_events_model_name;
+        kv_events_backend_id = config.kv_events_backend_id;
+        kv_events_tenant_id = config.kv_events_tenant_id;
+        kv_events_additional_salt = config.kv_events_additional_salt;
+        kv_events_lora_name = config.kv_events_lora_name;
+        kv_events_block_size = config.kv_events_block_size;
+        kv_events_dp_rank = config.kv_events_dp_rank;
+        kv_events_emit_legacy_compat = config.kv_events_emit_legacy_compat;
+        kv_events_emit_object_key = config.kv_events_emit_object_key;
+        kv_events_queue_capacity = config.kv_events_queue_capacity;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring,
             config.etcd_endpoints);
+        enable_oplog = config.enable_oplog;
+        oplog_poll_interval_ms = config.oplog_poll_interval_ms;
+        oplog_batch_max_entries = config.oplog_batch_max_entries;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
@@ -570,6 +681,10 @@ class WrappedMasterServiceConfig {
             config.nof_eviction_high_watermark_ratio;
         view_version = view_version_param;
         client_live_ttl_sec = config.client_live_ttl_sec;
+        nof_heartbeat_interval_sec = config.nof_heartbeat_interval_sec;
+        nof_heartbeat_probe_timeout_ms = config.nof_heartbeat_probe_timeout_ms;
+        nof_heartbeat_failures_threshold =
+            config.nof_heartbeat_failures_threshold;
         enable_ha =
             true;  // This is used in HA mode, so enable_ha should be true
         enable_offload = config.enable_offload;
@@ -582,14 +697,30 @@ class WrappedMasterServiceConfig {
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
         promotion_max_budget_ms = config.promotion_max_budget_ms;
+        enable_kv_events = config.enable_kv_events;
+        kv_events_bind_endpoint = config.kv_events_bind_endpoint;
+        kv_events_model_name = config.kv_events_model_name;
+        kv_events_backend_id = config.kv_events_backend_id;
+        kv_events_tenant_id = config.kv_events_tenant_id;
+        kv_events_additional_salt = config.kv_events_additional_salt;
+        kv_events_lora_name = config.kv_events_lora_name;
+        kv_events_block_size = config.kv_events_block_size;
+        kv_events_dp_rank = config.kv_events_dp_rank;
+        kv_events_emit_legacy_compat = config.kv_events_emit_legacy_compat;
+        kv_events_emit_object_key = config.kv_events_emit_object_key;
+        kv_events_queue_capacity = config.kv_events_queue_capacity;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = ResolveConfiguredHABackendConnstring(
             ha_backend_type, config.ha_backend_connstring,
             config.etcd_endpoints);
+        enable_oplog = config.enable_oplog;
+        oplog_poll_interval_ms = config.oplog_poll_interval_ms;
+        oplog_batch_max_entries = config.oplog_batch_max_entries;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
         memory_allocator = config.memory_allocator;
+        allocation_strategy_type = config.allocation_strategy_type;
         enable_disk_eviction = config.enable_disk_eviction;
         quota_bytes = config.quota_bytes;
         enable_multi_tenants = config.enable_multi_tenants;
@@ -648,6 +779,10 @@ class MasterServiceConfigBuilder {
     bool enable_offload_ = false;
     std::string ha_backend_type_ = "etcd";
     std::string ha_backend_connstring_;
+    // OpLog store configuration
+    bool enable_oplog_ = false;
+    int oplog_poll_interval_ms_ = 1000;
+    uint32_t oplog_batch_max_entries_ = 1024;
     std::string cluster_id_ = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir_ = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size_ = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
@@ -769,6 +904,21 @@ class MasterServiceConfigBuilder {
     MasterServiceConfigBuilder& set_ha_backend_connstring(
         const std::string& connstring) {
         ha_backend_connstring_ = connstring;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_enable_oplog(bool enable) {
+        enable_oplog_ = enable;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_oplog_poll_interval_ms(int interval_ms) {
+        oplog_poll_interval_ms_ = interval_ms;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_oplog_batch_max_entries(uint32_t entries) {
+        oplog_batch_max_entries_ = entries;
         return *this;
     }
 
@@ -993,8 +1143,25 @@ class MasterServiceConfig {
     uint32_t promotion_queue_limit = 50000;
     uint32_t promotion_max_per_heartbeat = 1;
     uint32_t promotion_max_budget_ms = 0;  // SLO-aware budget, 0=disabled
+    bool enable_kv_events = false;
+    std::string kv_events_bind_endpoint;
+    std::string kv_events_model_name;
+    std::string kv_events_backend_id;
+    std::string kv_events_tenant_id = "default";
+    std::string kv_events_additional_salt;
+    std::string kv_events_lora_name;
+    uint32_t kv_events_block_size = 0;
+    uint32_t kv_events_dp_rank = 0;
+    bool kv_events_emit_legacy_compat = true;
+    bool kv_events_emit_object_key = true;
+    uint32_t kv_events_queue_capacity = 65536;
+>>>>>>> upstream/main
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
+    // OpLog store configuration
+    bool enable_oplog = false;
+    int oplog_poll_interval_ms = 1000;
+    uint32_t oplog_batch_max_entries = 1024;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
@@ -1063,8 +1230,23 @@ class MasterServiceConfig {
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
         promotion_max_budget_ms = config.promotion_max_budget_ms;
+        enable_kv_events = config.enable_kv_events;
+        kv_events_bind_endpoint = config.kv_events_bind_endpoint;
+        kv_events_model_name = config.kv_events_model_name;
+        kv_events_backend_id = config.kv_events_backend_id;
+        kv_events_tenant_id = config.kv_events_tenant_id;
+        kv_events_additional_salt = config.kv_events_additional_salt;
+        kv_events_lora_name = config.kv_events_lora_name;
+        kv_events_block_size = config.kv_events_block_size;
+        kv_events_dp_rank = config.kv_events_dp_rank;
+        kv_events_emit_legacy_compat = config.kv_events_emit_legacy_compat;
+        kv_events_emit_object_key = config.kv_events_emit_object_key;
+        kv_events_queue_capacity = config.kv_events_queue_capacity;
         ha_backend_type = config.ha_backend_type;
         ha_backend_connstring = config.ha_backend_connstring;
+        enable_oplog = config.enable_oplog;
+        oplog_poll_interval_ms = config.oplog_poll_interval_ms;
+        oplog_batch_max_entries = config.oplog_batch_max_entries;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
@@ -1130,6 +1312,9 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.enable_offload = enable_offload_;
     config.ha_backend_type = ha_backend_type_;
     config.ha_backend_connstring = ha_backend_connstring_;
+    config.enable_oplog = enable_oplog_;
+    config.oplog_poll_interval_ms = oplog_poll_interval_ms_;
+    config.oplog_batch_max_entries = oplog_batch_max_entries_;
     config.cluster_id = cluster_id_;
     config.root_fs_dir = root_fs_dir_;
     config.global_file_segment_size = global_file_segment_size_;

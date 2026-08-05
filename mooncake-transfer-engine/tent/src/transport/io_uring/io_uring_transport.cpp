@@ -247,27 +247,28 @@ Status IOUringTransport::getTransferStatus(SubBatchRef batch, int task_id,
             return Status::InternalError(
                 std::string("io_uring_peek_cqe failed: ") + strerror(-err));
         }
-        auto task = (IOUringTask*)cqe->user_data;
-        if (task) {
+        auto cqe_task = (IOUringTask*)cqe->user_data;
+        if (cqe_task) {
             if (cqe->res < 0) {
                 LOG(INFO) << "Received an event with error code " << cqe->res;
-                task->status_word = TransferStatusEnum::FAILED;
+                cqe_task->status_word = TransferStatusEnum::FAILED;
             } else {
-                if (task->buffer) {
-                    if (task->request.opcode == Request::READ)
-                        Platform::getLoader().copy(task->request.source,
-                                                   task->buffer,
-                                                   task->request.length);
+                if (cqe_task->buffer) {
+                    if (cqe_task->request.opcode == Request::READ)
+                        Platform::getLoader().copy(cqe_task->request.source,
+                                                   cqe_task->buffer,
+                                                   cqe_task->request.length);
 
-                    free(task->buffer);
-                    task->buffer = nullptr;
+                    free(cqe_task->buffer);
+                    cqe_task->buffer = nullptr;
                 }
-                task->status_word = TransferStatusEnum::COMPLETED;
-                task->transferred_bytes = task->request.length;
+                cqe_task->status_word = TransferStatusEnum::COMPLETED;
+                cqe_task->transferred_bytes = cqe_task->request.length;
             }
         }
         io_uring_cqe_seen(&io_uring_batch->ring, cqe);
         batch->notifyProgress();
+        status = TransferStatus{task.status_word, task.transferred_bytes};
     }
     return Status::OK();
 }

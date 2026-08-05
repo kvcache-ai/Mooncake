@@ -3,6 +3,12 @@ add_executable(allocator_bench allocator_bench.cpp)
 target_link_libraries(allocator_bench PRIVATE cachelib_memory_allocator
                                               mooncake_store)
 
+# Add focused OffsetAllocator concurrency benchmark
+add_executable(offset_allocator_concurrency_bench
+               offset_allocator_concurrency_bench.cpp)
+target_link_libraries(offset_allocator_concurrency_bench
+                      PRIVATE mooncake_store gflags::gflags pthread)
+
 # Add master benchmark executable
 add_executable(master_bench master_bench.cpp)
 target_link_libraries(master_bench PRIVATE cachelib_memory_allocator
@@ -38,4 +44,17 @@ if(USE_NOF)
   add_executable(nof_worker_pool_bench nof_worker_pool_bench.cpp)
   target_link_libraries(nof_worker_pool_bench PRIVATE mooncake_store glog::glog
                                                        gflags::gflags)
+endif()
+
+# Add BatchEvict benchmark executable
+add_executable(batch_evict_bench batch_evict_bench.cpp)
+target_link_libraries(
+  batch_evict_bench PRIVATE mooncake_store cachelib_memory_allocator
+                            gflags::gflags glog::glog pthread)
+
+if(STORE_USE_ETCD)
+  add_executable(oplog_batch_bench oplog_batch_bench.cpp)
+  target_link_libraries(
+    oplog_batch_bench PRIVATE mooncake_store glog::glog gflags::gflags
+                              JsonCpp::JsonCpp)
 endif()

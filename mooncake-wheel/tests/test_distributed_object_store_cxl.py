@@ -2,7 +2,6 @@ import unittest
 import os
 import time
 import threading
-import random
 import tempfile
 from mooncake.store import MooncakeDistributedStore
 

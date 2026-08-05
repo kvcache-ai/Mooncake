@@ -140,6 +140,10 @@ Status TransferEngine::submitTransfer(BatchID batch_id,
     return impl_->submitTransfer(batch_id, request_list, notifi);
 }
 
+Status TransferEngine::cancelTransfer(BatchID batch_id, size_t task_id) {
+    return impl_->cancelTransfer(batch_id, task_id);
+}
+
 Status TransferEngine::sendNotification(SegmentID target_id,
                                         const Notification& notifi) {
     return impl_->sendNotification(target_id, notifi);
@@ -172,6 +176,10 @@ Status TransferEngine::getTransferStatus(BatchID batch_id,
 Status TransferEngine::progressBatch(BatchID batch_id,
                                      TransferStatus& overall_status) {
     return impl_->progressBatch(batch_id, overall_status);
+}
+
+Status TransferEngine::getNicLoadStats(std::vector<NicLoadStats>& stats) const {
+    return impl_->getNicLoadStats(stats);
 }
 
 }  // namespace tent
