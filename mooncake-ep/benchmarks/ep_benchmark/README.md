@@ -8,7 +8,7 @@ under uniform, k-hot incast, and Zipfian routing patterns.
 Single-node (uses `mp.spawn` internally):
 
 ```bash
-python benchmarks/ep_benchmark/run_ep_benchmark.py \
+python mooncake-ep/benchmarks/ep_benchmark/run_ep_benchmark.py \
     --num-ranks 8 --num-experts 256 --hidden-size 7168 \
     --top-k 8 --num-tokens 1024 --dtype bf16 \
     --routing-mode k_hot --hot-experts 32 --hot-fraction 0.9 \
@@ -23,7 +23,7 @@ Multi-node via `torchrun` (`--num-ranks` is ignored, `WORLD_SIZE` from torchrun 
 ```bash
 torchrun --nnodes=2 --nproc_per_node=4 --rdzv_backend=c10d \
     --rdzv_endpoint=$HEAD_NODE \
-    benchmarks/ep_benchmark/run_ep_benchmark.py \
+    mooncake-ep/benchmarks/ep_benchmark/run_ep_benchmark.py \
     --num-experts 256 --hidden-size 7168 \
     --top-k 8 --num-tokens 1024 --dtype bf16 \
     --routing-mode k_hot --hot-experts 32 --hot-fraction 0.9 \
@@ -35,8 +35,8 @@ torchrun --nnodes=2 --nproc_per_node=4 --rdzv_backend=c10d \
 Using a config file (CLI flags override config values):
 
 ```bash
-python benchmarks/ep_benchmark/run_ep_benchmark.py \
-    --config benchmarks/ep_benchmark/configs/cuda_zipfian.json \
+python mooncake-ep/benchmarks/ep_benchmark/run_ep_benchmark.py \
+    --config mooncake-ep/benchmarks/ep_benchmark/configs/cuda_zipfian.json \
     --num-ranks 8
 ```
 
