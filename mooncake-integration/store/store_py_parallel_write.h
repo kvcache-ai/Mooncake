@@ -153,7 +153,7 @@ std::vector<int> batch_write_tensor_impl(
         valid_keys.reserve(infos.size());
         original_indices.reserve(infos.size());
 
-        if (use_dummy_client_) {
+        auto run_staged_write = [&]() -> std::vector<int> {
             auto runtime_accelerator =
                 mooncake::device::GetAcceleratorRegistry()
                     .RuntimeAccelerators();
@@ -212,7 +212,10 @@ std::vector<int> batch_write_tensor_impl(
                                            op_results, operation_name);
             }
             return results;
-        }
+        };
+
+        if (use_dummy_client_ || !config.prefer_alloc_in_same_node)
+            return run_staged_write();
 
         if (!real_client_) {
             LOG(ERROR) << operation_name << ": real client is not available";
