@@ -193,9 +193,9 @@ metadata = result.metadata
 
 ### Structured object transfer policy
 
-By default, structured object writes use `BundleTransferPolicy(copy_mode="auto")`. This keeps the existing behavior: Mooncake uses the zero-copy `batch_put_from` fast path when buffer registration is available, and falls back to ordinary `store.put` when the fast path is unavailable.
+By default, structured object writes use `BundleTransferPolicy(copy_mode="auto")`. Non-tensor payloads are staged through a Mooncake BufferPool and written with `batch_put_from` when that path is available; otherwise Mooncake falls back to ordinary `store.put`. Typed-ragged ndarray rows use the native fast-copy extension to copy directly into the staging buffer without an intermediate concatenation.
 
-For very large tensors, buffer registration capacity can be exhausted. If the upper layer does not handle this failure mode yet, force the non-zero-copy path with `copy_mode="copy"`:
+Use `copy_mode="copy"` to force the regular `store.put` path:
 
 ```python
 from mooncake.structured_object_store import BundleTransferPolicy
@@ -208,11 +208,9 @@ ref = transfer.put_structured_object(
 
 Available modes:
 
-- `auto`: prefer zero-copy and fall back to regular `store.put` when zero-copy support is unavailable;
-- `copy`: force the non-zero-copy `store.put` path;
-- `zero_copy`: require the zero-copy `batch_put_from` path and raise an error if it is unavailable.
-
-If a caller has already registered a structured member buffer, pass `pre_registered_buffers={"member_name": True}` to avoid duplicate registration. The buffer must be the same writable, contiguous buffer used for transfer; read-only, non-contiguous, or internally copied buffers are rejected.
+- `auto`: prefer BufferPool staging plus `batch_put_from` for non-tensor payloads and fall back to regular `store.put` when that path is unavailable;
+- `copy`: force the regular `store.put` path;
+- `zero_copy`: require payloads to be explicit `tensor_object_buffer` instances; non-tensor structured payloads are rejected.
 
 ### Partial reads
 

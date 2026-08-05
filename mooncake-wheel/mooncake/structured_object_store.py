@@ -18,8 +18,14 @@ except Exception:  # pragma: no cover - depends on built extension
 
 import msgpack as _msgpack
 
-DEFAULT_BUNDLE_CHUNK_BYTES = 512 * 1024**2
-AUTO_PARALLEL_MIN_BYTES = 4 * 1024**3
+# -- C fast-path: concat_arrays_into(list[ndarray], dest_ptr) ----------------
+try:
+    from mooncake._fast_copy import concat_arrays_into as _concat_arrays_into
+except Exception:  # pragma: no cover
+    _concat_arrays_into = None
+
+DEFAULT_BUNDLE_CHUNK_BYTES = 64 * 1024**2
+AUTO_PARALLEL_MIN_BYTES = DEFAULT_BUNDLE_CHUNK_BYTES
 AUTO_PARALLEL_MIN_CHUNKS = 8
 MISSING_OBJECT_ERROR = (
     -704
@@ -154,6 +160,29 @@ class _MultiBufferPayload:
 
 
 @dataclass(frozen=True)
+class _DirectCopyPayload:
+    """Deferred-copy ndarray list copied directly into pool memory at PUT time."""
+    arrays: list[np.ndarray]
+    total_bytes: int
+    dtype: str | None = None
+    shape: tuple[int, ...] | None = None
+
+    @property
+    def nbytes(self) -> int:
+        return self.total_bytes
+
+    @staticmethod
+    def from_flat_arrays(
+        flat_arrays: list[np.ndarray], dtype: np.dtype, total_elems: int,
+    ) -> "_DirectCopyPayload":
+        return _DirectCopyPayload(
+            arrays=flat_arrays,
+            total_bytes=sum(a.nbytes for a in flat_arrays),
+            dtype=np.dtype(dtype).str,
+            shape=(total_elems,),
+        )
+
+
 class _RawDestinationBuffer:
     ptr: int
     size: int
@@ -456,7 +485,6 @@ class MooncakeBundleTransfer:
         chunk_bytes: Optional[int] = None,
         policy: Optional[BundleTransferPolicy] = None,
         max_inflight_put: Optional[int] = None,
-        pre_registered_buffers: Optional[Mapping[str, bool]] = None,
         config: Any = None,
     ) -> RemoteBundleRef:
         """Store raw metadata bytes plus named buffers as a low-level bundle."""
@@ -467,7 +495,6 @@ class MooncakeBundleTransfer:
             chunk_bytes=chunk_bytes,
             policy=policy,
             max_inflight_put=max_inflight_put,
-            pre_registered_buffers=pre_registered_buffers,
             config=config,
         )
 
@@ -482,7 +509,6 @@ class MooncakeBundleTransfer:
         chunk_bytes: Optional[int] = None,
         policy: Optional[BundleTransferPolicy] = None,
         max_inflight_put: Optional[int] = None,
-        pre_registered_buffers: Optional[Mapping[str, bool]] = None,
         config: Any = None,
     ) -> RemoteBundleRef:
         """Store a structured object described by JSON metadata plus named members."""
@@ -492,7 +518,6 @@ class MooncakeBundleTransfer:
             chunk_bytes=chunk_bytes,
             policy=policy,
             max_inflight_put=max_inflight_put,
-            pre_registered_buffers=pre_registered_buffers,
             config=config,
         )
 
@@ -2643,7 +2668,6 @@ def _decode_ragged_tensor_values(
         values.append(data[begin:end].reshape(shape))
     return values
 
-
 def _normalize_ragged_tensor_dict_keys(keys: Any) -> list[str]:
     if isinstance(keys, Mapping):
         iterable = keys.keys()
@@ -2816,13 +2840,18 @@ def _encode_typed_ragged_values(
         if array.ndim > 0:
             shapes[row, : array.ndim] = array.shape
     if flat_arrays:
-        buffers = tuple(memoryview(flat.data).cast("B") for flat in flat_arrays)
-        data = _MultiBufferPayload(
-            buffers=buffers,
-            owners=tuple(flat_arrays),
-            dtype=np.dtype(dtype).str,
-            shape=(int(offset),),
-        )
+        if _concat_arrays_into is not None:
+            data = _DirectCopyPayload.from_flat_arrays(
+                flat_arrays, dtype, int(offset)
+            )
+        else:
+            buffers = tuple(memoryview(flat.data).cast("B") for flat in flat_arrays)
+            data = _MultiBufferPayload(
+                buffers=buffers,
+                owners=tuple(flat_arrays),
+                dtype=np.dtype(dtype).str,
+                shape=(int(offset),),
+            )
     else:
         empty = np.empty(0, dtype=dtype)
         data = _MultiBufferPayload(
@@ -2909,7 +2938,6 @@ def _value_to_media_bytes(value: Any) -> tuple[bytes, str | None, dict[str, Any]
             },
         )
     return bytes(value), None, {"kind": "bytes"}
-
 
 def _encode_bytes_like_values(
     values: list[Any],
@@ -3055,17 +3083,12 @@ class _StructuredObjectLayer:
         chunk_bytes: Optional[int],
         policy: Optional[BundleTransferPolicy],
         max_inflight_put: Optional[int],
-        pre_registered_buffers: Optional[Mapping[str, bool]],
         config: Any = None,
     ) -> RemoteBundleRef:
         metadata, buffers = _encode_structured_fields(payload.metadata, payload.buffers)
         transfer_policy = self._bundle_store._policy(
             policy, max_inflight_put=max_inflight_put
         )
-        if transfer_policy.copy_mode != "copy":
-            _validate_pre_registered_structured_buffers(
-                payload.buffers, buffers, pre_registered_buffers
-            )
         return self._bundle_store.put_bundle(
             meta=_encode_structured_metadata(metadata),
             buffers=buffers,
@@ -3073,7 +3096,6 @@ class _StructuredObjectLayer:
             chunk_bytes=chunk_bytes,
             policy=transfer_policy,
             max_inflight_put=None,
-            pre_registered_buffers=pre_registered_buffers,
             config=config,
         )
 
@@ -3338,7 +3360,6 @@ class _BundleManifestStore:
         chunk_bytes: Optional[int],
         policy: Optional[BundleTransferPolicy],
         max_inflight_put: Optional[int],
-        pre_registered_buffers: Optional[Mapping[str, bool]] = None,
         config: Any = None,
     ) -> RemoteBundleRef:
         _validate_key_segment(partition, "partition")
@@ -3352,14 +3373,12 @@ class _BundleManifestStore:
         manifest_key = f"{base_key}/manifest"
         written_keys: list[str] = []
         buffer_specs: dict[str, Any] = {}
-        pre_registered_map = dict(pre_registered_buffers or {})
         try:
             meta_spec, meta_keys = self._put_payload(
                 f"{base_key}/meta",
                 meta_view,
                 target_chunk_bytes,
                 _copy_transfer_policy(transfer_policy),
-                pre_registered=False,
                 config=config,
             )
             written_keys.extend(meta_keys)
@@ -3379,6 +3398,15 @@ class _BundleManifestStore:
                         value,
                         target_chunk_bytes,
                         transfer_policy,
+                        config=config,
+                    )
+                elif isinstance(value, _DirectCopyPayload):
+                    payload_spec, payload_keys = self._put_direct_copy_payload(
+                        payload_key,
+                        value,
+                        target_chunk_bytes,
+                        transfer_policy,
+                        config=config,
                     )
                 else:
                     payload_spec, payload_keys = self._put_payload(
@@ -3386,7 +3414,6 @@ class _BundleManifestStore:
                         _bytes_view(value, name),
                         target_chunk_bytes,
                         transfer_policy,
-                        pre_registered=bool(pre_registered_map.get(name, False)),
                         config=config,
                     )
                 buffer_specs[name] = payload_spec
@@ -3437,7 +3464,6 @@ class _BundleManifestStore:
                 meta_view,
                 target_chunk_bytes,
                 _copy_transfer_policy(transfer_policy),
-                pre_registered=False,
                 config=config,
             )
             written_keys.extend(meta_keys)
@@ -3637,7 +3663,6 @@ class _BundleManifestStore:
                 memoryview(payload),
                 len(payload) or 1,
                 transfer_policy,
-                pre_registered=False,
                 config=config,
             )
             payload_spec["format"] = "torch_save"
@@ -3660,7 +3685,6 @@ class _BundleManifestStore:
         value: memoryview,
         chunk_bytes: int,
         transfer_policy: BundleTransferPolicy,
-        pre_registered: bool,
         config: Any = None,
     ) -> tuple[dict[str, Any], list[str]]:
         if len(value) == 0:
@@ -3670,12 +3694,11 @@ class _BundleManifestStore:
             key if len(chunks) == 1 else f"{key}/chunk/{index}"
             for index in range(len(chunks))
         ]
-        written_keys = self._transport.put_payload_chunks(
+        self._transport.put_multi_buffer_payload_chunks(
             chunk_keys,
-            chunks,
+            [[chunk] for chunk in chunks],
             transfer_policy,
-            pre_registered=pre_registered,
-            config=config,
+            config,
         )
         payload_spec = {
             "key": key,
@@ -3685,7 +3708,7 @@ class _BundleManifestStore:
                 for chunk_key, chunk in zip(chunk_keys, chunks)
             ],
         }
-        return payload_spec, written_keys
+        return payload_spec, list(chunk_keys)
 
     def _put_multi_buffer_payload(
         self,
@@ -3693,27 +3716,25 @@ class _BundleManifestStore:
         value: _MultiBufferPayload,
         chunk_bytes: int,
         transfer_policy: BundleTransferPolicy,
+        config: Any = None,
     ) -> tuple[dict[str, Any], list[str]]:
         total_bytes = value.nbytes
         if total_bytes == 0:
             return {"key": key, "bytes": 0, "chunks": []}, []
         if len(value.buffers) == 1:
             return self._put_payload(
-                key,
-                value.buffers[0],
-                chunk_bytes,
-                transfer_policy,
-                pre_registered=False,
+                key, value.buffers[0], chunk_bytes, transfer_policy, config=config
             )
         chunk_groups = _split_multi_buffer_payload(value.buffers, chunk_bytes)
         chunk_keys = [
             key if len(chunk_groups) == 1 else f"{key}/chunk/{index}"
             for index in range(len(chunk_groups))
         ]
-        written_keys = self._transport.put_multi_buffer_payload_chunks(
+        self._transport.put_multi_buffer_payload_chunks(
             chunk_keys,
             chunk_groups,
             transfer_policy,
+            config,
         )
         payload_spec = {
             "key": key,
@@ -3723,7 +3744,136 @@ class _BundleManifestStore:
                 for chunk_key, group in zip(chunk_keys, chunk_groups)
             ],
         }
-        return payload_spec, written_keys
+        return payload_spec, list(chunk_keys)
+
+
+    def _put_direct_copy_payload(
+        self,
+        key: str,
+        value: _DirectCopyPayload,
+        chunk_bytes: int,
+        transfer_policy: BundleTransferPolicy,
+        config: Any = None,
+    ) -> tuple[dict[str, Any], list[str]]:
+        if transfer_policy.copy_mode == "zero_copy":
+            raise RuntimeError("zero-copy put requires tensor-object buffers")
+        total_bytes = value.total_bytes
+        if total_bytes == 0:
+            return {"key": key, "bytes": 0, "chunks": []}, []
+        if len(value.arrays) == 1:
+            buf = memoryview(value.arrays[0].data).cast("B")
+            return self._put_payload(
+                key,
+                buf,
+                chunk_bytes,
+                transfer_policy,
+                config=config,
+            )
+        arrays = value.arrays
+        transport = self._transport
+        pool = transport._ensure_buffer_pool()
+        batch_put_from = transport._batch_put_from
+        if pool is None or not callable(batch_put_from):
+            buf = memoryview(np.concatenate(
+                [a.ravel().view(np.uint8) for a in arrays]
+            ).data).cast("B")
+            return self._put_payload(
+                key,
+                buf,
+                chunk_bytes,
+                transfer_policy,
+                config=config,
+            )
+        # Group arrays into chunk-sized batches
+        n = len(arrays)
+        chunk_batches: list[tuple[int, int, int]] = []  # (start, count, bytes)
+        batch_start = 0
+        batch_bytes = 0
+        fallback = False
+        for i in range(n):
+            ab = arrays[i].nbytes
+            if ab > chunk_bytes:
+                fallback = True
+                break
+            if batch_bytes + ab > chunk_bytes and batch_bytes > 0:
+                chunk_batches.append((batch_start, i - batch_start, batch_bytes))
+                batch_start = i
+                batch_bytes = 0
+            batch_bytes += ab
+        if fallback:
+            buf = memoryview(np.concatenate(
+                [a.ravel().view(np.uint8) for a in arrays]
+            ).data).cast("B")
+            return self._put_payload(
+                key,
+                buf,
+                chunk_bytes,
+                transfer_policy,
+                config=config,
+            )
+        if batch_bytes > 0:
+            chunk_batches.append((batch_start, n - batch_start, batch_bytes))
+        num_chunks = len(chunk_batches)
+        chunk_keys = [
+            key if num_chunks == 1 else f"{key}/chunk/{idx}"
+            for idx in range(num_chunks)
+        ]
+
+        def _put_chunk_batch(keys, batches):
+            for ck, (start, count, size) in zip(keys, batches):
+                lease = pool.acquire(size)
+                try:
+                    copied = _concat_arrays_into(arrays, lease.ptr, size, start, count)
+                    if copied != size:
+                        raise RuntimeError(
+                            f"native fast-copy wrote {copied} bytes, expected {size}"
+                        )
+                    results = _batch_put_from_with_optional_config(
+                        batch_put_from, [ck], [lease.ptr], [size], config
+                    )
+                    transport._check_batch_put_results(results, [ck], "batch_put_from")
+                finally:
+                    lease.release()
+
+        max_inflight = transfer_policy.max_inflight_put
+        use_parallel = (
+            transfer_policy.put_mode != "batch"
+            and max_inflight > 1
+            and num_chunks >= AUTO_PARALLEL_MIN_CHUNKS
+            and total_bytes >= AUTO_PARALLEL_MIN_BYTES
+        )
+        futures: list = []
+        try:
+            if not use_parallel:
+                _put_chunk_batch(chunk_keys, chunk_batches)
+            else:
+                group_count = max(1, min(max_inflight, num_chunks))
+                group_size = (num_chunks + group_count - 1) // group_count
+                groups = [
+                    (chunk_keys[s:s + group_size], chunk_batches[s:s + group_size])
+                    for s in range(0, num_chunks, group_size)
+                ]
+                with ThreadPoolExecutor(max_workers=len(groups)) as executor:
+                    futures = [
+                        executor.submit(_put_chunk_batch, gk, gb)
+                        for gk, gb in groups
+                    ]
+                    for f in as_completed(futures):
+                        f.result()
+        except Exception:
+            for f in futures:
+                f.cancel()
+            _cleanup_keys(self._store, chunk_keys, strict=False)
+            raise
+        payload_spec = {
+            "key": key,
+            "bytes": total_bytes,
+            "chunks": [
+                {"key": ck, "bytes": cb[2]}
+                for ck, cb in zip(chunk_keys, chunk_batches)
+            ],
+        }
+        return payload_spec, list(chunk_keys)
 
     def _policy(
         self,
@@ -3882,71 +4032,39 @@ class _MooncakePayloadTransport:
                 return None
         return self._buffer_pool
 
-    def put_payload_chunks(
-        self,
-        chunk_keys: Sequence[str],
-        chunks: Sequence[memoryview],
-        transfer_policy: BundleTransferPolicy,
-        pre_registered: bool,
-        config: Any = None,
-    ) -> list[str]:
-        if transfer_policy.copy_mode == "copy":
-            return self._put_chunks_direct(chunk_keys, chunks, config=config)
-        if not self._has_batch_put_support():
-            if transfer_policy.copy_mode == "zero_copy":
-                raise RuntimeError(
-                    "zero-copy put requested but batch_put_from is unavailable"
-                )
-            return self._put_chunks_direct(chunk_keys, chunks, config=config)
-        put_mode = self._resolve_put_mode(chunks, transfer_policy)
-        if put_mode == "batch":
-            self.batch_put_chunks_from(
-                chunk_keys, chunks, pre_registered=pre_registered, config=config
-            )
-            return list(chunk_keys)
-        return self._put_chunks_parallel(
-            list(chunk_keys),
-            list(chunks),
-            transfer_policy.max_inflight_put,
-            pre_registered=pre_registered,
-            config=config,
-        )
-
     def put_multi_buffer_payload_chunks(
         self,
         chunk_keys: Sequence[str],
         chunk_groups: Sequence[Sequence[memoryview]],
         transfer_policy: BundleTransferPolicy,
+        config: Any = None,
     ) -> list[str]:
         def fallback_to_direct_put() -> list[str]:
             chunks = [memoryview(b"".join(group)) for group in chunk_groups]
-            return self._put_chunks_direct(chunk_keys, chunks)
+            return self._put_chunks_direct(chunk_keys, chunks, config)
 
         if transfer_policy.copy_mode == "zero_copy":
-            # Joining one chunk group costs the same single copy the contiguous
-            # encoder path paid before multi-buffer puts; delegating keeps the
-            # register-source-buffer zero-copy semantics of single-buffer puts.
-            chunks = [memoryview(b"".join(group)) for group in chunk_groups]
-            return self.put_payload_chunks(
-                chunk_keys, chunks, transfer_policy, pre_registered=False
+            raise RuntimeError(
+                "zero-copy put requires tensor-object buffers"
             )
         if transfer_policy.copy_mode == "copy" or self._ensure_buffer_pool() is None:
             return fallback_to_direct_put()
         if all(len(group) == 1 for group in chunk_groups):
             self.batch_put_buffer_groups_from(
-                chunk_keys, [[group[0]] for group in chunk_groups]
+                chunk_keys, [[group[0]] for group in chunk_groups], config
             )
             return list(chunk_keys)
         if not callable(self._batch_put_from):
             return fallback_to_direct_put()
         put_mode = self._resolve_buffer_group_put_mode(chunk_groups, transfer_policy)
         if put_mode == "batch":
-            self.batch_put_buffer_groups_from(chunk_keys, chunk_groups)
+            self.batch_put_buffer_groups_from(chunk_keys, chunk_groups, config)
             return list(chunk_keys)
         return self._put_buffer_groups_parallel(
             list(chunk_keys),
             [list(group) for group in chunk_groups],
             transfer_policy.max_inflight_put,
+            config,
         )
 
     def read_payload(self, payload_spec: Mapping[str, Any]) -> bytes:
@@ -4189,6 +4307,7 @@ class _MooncakePayloadTransport:
         self,
         chunk_keys: Sequence[str],
         chunk_groups: Sequence[Sequence[memoryview]],
+        config: Any = None,
     ) -> None:
         batch_put_from = self._batch_put_from
         if not callable(batch_put_from):
@@ -4203,7 +4322,9 @@ class _MooncakePayloadTransport:
             lease = pool.acquire(size)
             try:
                 _copy_memoryviews_to_lease(group, lease)
-                results = batch_put_from([chunk_key], [lease.ptr], [size])
+                results = _batch_put_from_with_optional_config(
+                    batch_put_from, [chunk_key], [lease.ptr], [size], config
+                )
                 self._check_batch_put_results(results, [chunk_key], "batch_put_from")
             except Exception:
                 _cleanup_keys(self._store, chunk_keys, strict=False)
@@ -4221,40 +4342,6 @@ class _MooncakePayloadTransport:
             )
         for chunk_key, status in zip(chunk_keys, results):
             _check_status(status, operation, chunk_key)
-
-    def batch_put_chunks_from(
-        self,
-        chunk_keys: Sequence[str],
-        chunks: Sequence[memoryview],
-        pre_registered: bool,
-        config: Any = None,
-    ) -> None:
-        batch_put_from = self._batch_put_from
-        if not callable(batch_put_from):
-            raise RuntimeError("batch_put_from is unavailable")
-        if not chunk_keys:
-            return
-        prepared_chunks = [_prepare_chunk_source_buffer(chunk) for chunk in chunks]
-        buffer_ptrs = [ptr for _owner, ptr, _size in prepared_chunks]
-        sizes = [size for _owner, _ptr, size in prepared_chunks]
-        registered_ptrs = self._register_buffers(
-            buffer_ptrs, sizes, pre_registered, "bundle source payload"
-        )
-        try:
-            results = _batch_put_from_with_optional_config(
-                batch_put_from, list(chunk_keys), buffer_ptrs, sizes, config
-            )
-            if len(results) != len(chunk_keys):
-                raise RuntimeError(
-                    f"batch_put_from returned {len(results)} results for {len(chunk_keys)} chunks"
-                )
-            for chunk_key, status in zip(chunk_keys, results):
-                _check_status(status, "batch_put_from", chunk_key)
-        except Exception:
-            _cleanup_keys(self._store, chunk_keys, strict=False)
-            raise
-        finally:
-            self._unregister_buffers(registered_ptrs, "bundle source payload")
 
     def _put_chunks_direct(
         self,
@@ -4276,68 +4363,12 @@ class _MooncakePayloadTransport:
             raise
         return list(chunk_keys)
 
-    def _put_chunks_parallel(
-        self,
-        chunk_keys: list[str],
-        chunks: list[memoryview],
-        max_inflight_put: int,
-        pre_registered: bool,
-        config: Any = None,
-    ) -> list[str]:
-        groups = self._group_chunk_ranges(chunk_keys, chunks, max_inflight_put)
-        futures: list[Future[None]] = []
-        try:
-            with ThreadPoolExecutor(
-                max_workers=min(max_inflight_put, len(groups))
-            ) as executor:
-                futures = [
-                    executor.submit(
-                        self.batch_put_chunks_from,
-                        group_keys,
-                        group_chunks,
-                        pre_registered,
-                        config,
-                    )
-                    for group_keys, group_chunks in groups
-                ]
-                for future in as_completed(futures):
-                    future.result()
-        except Exception:
-            for future in futures:
-                future.cancel()
-            for future in futures:
-                if future.done() and not future.cancelled():
-                    try:
-                        future.result()
-                    except Exception:
-                        pass
-            _cleanup_keys(self._store, chunk_keys, strict=False)
-            raise
-        return chunk_keys
-
-    def _group_chunk_ranges(
-        self,
-        chunk_keys: Sequence[str],
-        chunks: Sequence[memoryview],
-        max_inflight_put: int,
-    ) -> list[tuple[list[str], list[memoryview]]]:
-        if not chunk_keys:
-            return []
-        group_count = max(1, min(max_inflight_put, len(chunks)))
-        group_size = (len(chunks) + group_count - 1) // group_count
-        return [
-            (
-                list(chunk_keys[start : start + group_size]),
-                list(chunks[start : start + group_size]),
-            )
-            for start in range(0, len(chunks), group_size)
-        ]
-
     def _put_buffer_groups_parallel(
         self,
         chunk_keys: list[str],
         chunk_groups: list[Sequence[memoryview]],
         max_inflight_put: int,
+        config: Any = None,
     ) -> list[str]:
         groups = self._group_buffer_group_ranges(
             chunk_keys, chunk_groups, max_inflight_put
@@ -4352,6 +4383,7 @@ class _MooncakePayloadTransport:
                         self.batch_put_buffer_groups_from,
                         group_keys,
                         group_chunks,
+                        config,
                     )
                     for group_keys, group_chunks in groups
                 ]
@@ -4741,25 +4773,6 @@ class _MooncakePayloadTransport:
                 if succeeded:
                     raise
 
-    def _resolve_put_mode(
-        self,
-        chunks: Sequence[memoryview],
-        transfer_policy: BundleTransferPolicy,
-    ) -> Literal["batch", "parallel"]:
-        if transfer_policy.put_mode == "parallel":
-            return "parallel"
-        if transfer_policy.put_mode == "batch":
-            return "batch"
-        if transfer_policy.max_inflight_put <= 1:
-            return "batch"
-        if len(chunks) < AUTO_PARALLEL_MIN_CHUNKS:
-            return "batch"
-        if sum(len(chunk) for chunk in chunks) < AUTO_PARALLEL_MIN_BYTES:
-            return "batch"
-        if min(transfer_policy.max_inflight_put, len(chunks)) < 2:
-            return "batch"
-        return "parallel"
-
     def _resolve_buffer_group_put_mode(
         self,
         chunk_groups: Sequence[Sequence[memoryview]],
@@ -4779,11 +4792,6 @@ class _MooncakePayloadTransport:
         if min(transfer_policy.max_inflight_put, len(chunk_groups)) < 2:
             return "batch"
         return "parallel"
-
-    def _has_batch_put_support(self) -> bool:
-        return (
-            callable(self._batch_put_from) and self._has_buffer_registration_support()
-        )
 
     def _has_buffer_registration_support(self) -> bool:
         return callable(self._register_buffer) and callable(self._unregister_buffer)
@@ -5097,7 +5105,9 @@ def raw_destination(
 def _encode_structured_field(value: Any) -> tuple[dict[str, Any], Any]:
     if isinstance(value, _TensorObjectBufferPayload):
         return {"encoding": "torch_tensor"}, value
-    if isinstance(value, _MultiBufferPayload):
+    if isinstance(value, _TensorPayload):
+        return _encode_torch_tensor_field(value.tensor)
+    if isinstance(value, (_DirectCopyPayload, _MultiBufferPayload)):
         if value.dtype is not None and value.shape is not None:
             return {
                 "encoding": "ndarray",
@@ -5281,6 +5291,10 @@ def _normalize_structured_scalar(value: Any) -> Any:
 
 
 
+
+
+
+
 def _encode_msgpack_ragged_values(
     path: str, values: list[Any]
 ) -> tuple[dict[str, Any], dict[str, Any]]:
@@ -5436,48 +5450,6 @@ def _tensor_codec_helper(name: str) -> Any:
     return helper
 
 
-def _validate_pre_registered_structured_buffers(
-    original_buffers: Mapping[str, Any],
-    encoded_buffers: Mapping[str, Any],
-    pre_registered_buffers: Optional[Mapping[str, bool]],
-) -> None:
-    if not pre_registered_buffers:
-        return
-    for name, pre_registered in pre_registered_buffers.items():
-        if not pre_registered:
-            continue
-        if name not in original_buffers or name not in encoded_buffers:
-            raise ValueError(f"unknown pre-registered structured buffer: {name}")
-        if not _is_same_writable_buffer(original_buffers[name], encoded_buffers[name]):
-            raise ValueError(
-                f"pre-registered structured buffer {name} must be the same writable contiguous buffer used for transfer"
-            )
-
-
-def _is_same_writable_buffer(original: Any, encoded: Any) -> bool:
-    try:
-        original_view = memoryview(original)
-        encoded_view = memoryview(encoded)
-    except TypeError:
-        return False
-    if not original_view.c_contiguous or not encoded_view.c_contiguous:
-        return False
-    if original_view.readonly or encoded_view.readonly:
-        return False
-    if original_view.nbytes != encoded_view.nbytes:
-        return False
-    if original_view.nbytes == 0:
-        return True
-    try:
-        original_bytes = original_view.cast("B")
-        encoded_bytes = encoded_view.cast("B")
-        original_ptr = ctypes.addressof(ctypes.c_char.from_buffer(original_bytes))
-        encoded_ptr = ctypes.addressof(ctypes.c_char.from_buffer(encoded_bytes))
-    except (BufferError, TypeError, ValueError):
-        return False
-    return original_ptr == encoded_ptr
-
-
 def _structured_field_specs(metadata: Mapping[str, Any]) -> dict[str, Any]:
     field_specs = metadata.get(STRUCTURED_FIELD_SPECS_KEY, {})
     if not isinstance(field_specs, dict):
@@ -5630,6 +5602,8 @@ try:
     import torch as _torch
 except Exception:  # pragma: no cover
     _torch = None  # type: ignore[assignment]
+
+
 
 
 @dataclass
