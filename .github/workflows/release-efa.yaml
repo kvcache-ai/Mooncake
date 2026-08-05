@@ -5,7 +5,7 @@ on:
     tags:
       - 'v*'
 
-# Publishes mooncake-transfer-engine-efa, the CUDA-aware AWS EFA wheel.
+# Publishes mooncake-transfer-engine-efa, the CUDA 12-aware AWS EFA wheel.
 jobs:
   build:
     permissions:
@@ -14,6 +14,7 @@ jobs:
     with:
       variant: cuda
       use-cuda: true
+      cuda-version: '12.8.1'
       python-versions: '["3.10", "3.11", "3.12", "3.13"]'
       build-profile: release
       cmake-args: >-

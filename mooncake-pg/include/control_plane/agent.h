@@ -7,6 +7,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "error_types.h"
 #include "rpc.h"
 
 namespace mooncake {
@@ -21,9 +22,8 @@ class AgentStateMachine {
 
     AgentApplyResult handlePeerJoined(const PeerJoinedPush& push);
     AgentApplyResult handleRankStateUpdate(const RankStatePush& push);
-    std::pair<AgentApplyResult, bool> applyGroupView(const GroupView& view);
-    std::pair<AgentApplyResult, bool> handleViewUpdate(
-        const ViewUpdatePush& push);
+    PGResult<AgentApplyResult> applyGroupView(const GroupView& view);
+    PGResult<AgentApplyResult> handleViewUpdate(const ViewUpdatePush& push);
 
     HeartbeatRequest buildHeartbeat() const;
 

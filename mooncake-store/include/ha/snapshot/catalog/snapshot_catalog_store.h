@@ -1,17 +1,16 @@
 #pragma once
 
-#include <charconv>
-#include <cctype>
 #include <cstddef>
 #include <optional>
 #include <string>
 #include <string_view>
-#include <system_error>
 #include <vector>
 
 #include <ylt/util/tl/expected.hpp>
 
 #include "ha/ha_types.h"
+#include "ascii_string.h"
+#include "integer_parser.h"
 
 namespace mooncake {
 namespace ha {
@@ -36,9 +35,7 @@ inline std::string BuildSnapshotRoot(const std::string& cluster_id) {
     return root;
 }
 
-inline bool IsAsciiDigit(char ch) {
-    return std::isdigit(static_cast<unsigned char>(ch)) != 0;
-}
+inline bool IsAsciiDigit(char ch) { return ch >= '0' && ch <= '9'; }
 
 inline bool IsValidSnapshotId(std::string_view snapshot_id) {
     if (snapshot_id.size() != 19) {
@@ -59,17 +56,6 @@ inline bool IsValidSnapshotId(std::string_view snapshot_id) {
     }
 
     return true;
-}
-
-inline std::string TrimAsciiWhitespace(std::string value) {
-    constexpr std::string_view kAsciiWhitespace = " \t\n\r\f\v";
-    const auto first = value.find_first_not_of(kAsciiWhitespace);
-    if (first == std::string::npos) {
-        return "";
-    }
-
-    const auto last = value.find_last_not_of(kAsciiWhitespace);
-    return value.substr(first, last - first + 1);
 }
 
 inline std::string BuildSnapshotPrefix(const std::string& snapshot_root,
@@ -104,10 +90,12 @@ inline SnapshotDescriptor MakeSnapshotDescriptor(
 
 template <typename Integer>
 inline bool ParseDecimal(std::string_view text, Integer& value) {
-    const char* begin = text.data();
-    const char* end = begin + text.size();
-    const auto result = std::from_chars(begin, end, value);
-    return result.ec == std::errc() && result.ptr == end;
+    const auto parsed = TryParseInteger<Integer>(text);
+    if (!parsed.has_value()) {
+        return false;
+    }
+    value = *parsed;
+    return true;
 }
 
 inline std::string SerializeSnapshotDescriptor(

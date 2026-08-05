@@ -316,7 +316,9 @@ static void precomputeResolvedHcaPeerAffinity(
     }
 
     for (const auto &entry : matrix) {
-        if (entry.first.rfind("cuda:", 0) != 0) continue;
+        // Match the vendor-specific GPU location prefix (cuda:/hip:/...).
+        // Hardcoding "cuda:" silently disables HCA peer affinity under USE_HIP.
+        if (entry.first.rfind(GPU_PREFIX, 0) != 0) continue;
 
         std::unordered_set<std::string> preferred_set(
             entry.second.preferred_hca.begin(),

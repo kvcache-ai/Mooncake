@@ -67,7 +67,7 @@ class TransferEngineImpl {
     TransferEngineImpl(bool auto_discover = false)
         : metadata_(nullptr),
           local_topology_(std::make_shared<Topology>()),
-          auto_discover_(auto_discover) {
+          auto_discover_config_{.enabled = auto_discover, .protocol = ""} {
 #ifdef WITH_METRICS
         InitializeMetricsConfig();
         StartMetricsReportingThread();
@@ -78,7 +78,7 @@ class TransferEngineImpl {
                        const std::vector<std::string>& filter)
         : metadata_(nullptr),
           local_topology_(std::make_shared<Topology>()),
-          auto_discover_(auto_discover),
+          auto_discover_config_{.enabled = auto_discover, .protocol = ""},
           filter_(filter) {
 #ifdef WITH_METRICS
         InitializeMetricsConfig();
@@ -385,7 +385,13 @@ class TransferEngineImpl {
     void rollbackAllRegistrations(const std::vector<RegisteredRecord>& records);
 #endif
 
-    void setAutoDiscover(bool auto_discover) { auto_discover_ = auto_discover; }
+    void setAutoDiscover(bool auto_discover) {
+        auto_discover_config_ = {.enabled = auto_discover, .protocol = ""};
+    }
+
+    void setAutoDiscover(const AutoDiscoverConfig& config) {
+        auto_discover_config_ = config;
+    }
 
     void* getBaseAddr() { return multi_transports_->getBaseAddr(); }
 
@@ -439,9 +445,18 @@ class TransferEngineImpl {
                        std::pair<SegmentID, TransferMetadata::NotifyDesc>>
         notifies_to_send_;
 
-    // Discover topology and install transports automatically when it's true.
-    // Set it to false only for testing.
-    bool auto_discover_;
+    std::string autoDiscoverTransport() const {
+        if (use_barex_) {
+            return "barex";
+        }
+        if (auto_discover_config_.protocol == "efa") {
+            return "efa";
+        }
+        return "rdma";
+    }
+
+    // Discover topology and install transports automatically when enabled.
+    AutoDiscoverConfig auto_discover_config_;
     std::vector<std::string> filter_;
     bool use_barex_ = false;
 
