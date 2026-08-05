@@ -1004,6 +1004,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.enable_oplog = FLAGS_enable_oplog;
     }
+    if ((google::GetCommandLineFlagInfo("oplog_poll_interval_ms", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.oplog_poll_interval_ms = FLAGS_oplog_poll_interval_ms;
+    }
     if ((google::GetCommandLineFlagInfo("oplog_batch_max_entries", &info) &&
          !info.is_default) ||
         !conf_set) {
