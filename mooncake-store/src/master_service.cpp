@@ -9836,13 +9836,17 @@ MasterService::MetadataSerializer::SerializeMetadata(
     // Pack ObjectMetadata using array structure for efficiency
     // Format: [client_id, put_start_time, size, lease_timeout,
     // has_soft_pin_timeout, soft_pin_timeout, replicas_count, data_type,
-    // replicas..., hard_pinned, group_id, agent_hints, object_checksum?]
+    // replicas..., hard_pinned, group_id, agent_hints?, object_checksum?]
 
-    size_t array_size = 11;  // client_id, put_start_time, size, lease_timeout,
+    size_t array_size = 10;  // client_id, put_start_time, size, lease_timeout,
                              // has_soft_pin_timeout, soft_pin_timeout,
                              // replicas_count, data_type, hard_pinned,
-                             // group_id, agent_hints
+                             // group_id
     array_size += metadata.CountReplicas();  // One element per replica
+    const auto agent_hints = metadata.GetAgentHints();
+    if (agent_hints.has_value()) {
+        ++array_size;
+    }
     if (metadata.object_checksum.has_value()) {
         ++array_size;
     }
@@ -9898,7 +9902,9 @@ MasterService::MetadataSerializer::SerializeMetadata(
 
     packer.pack(metadata.IsHardPinned());
     packer.pack(metadata.group_id);
-    PackAgentHints(metadata.GetAgentHints(), packer);
+    if (agent_hints.has_value()) {
+        PackAgentHints(agent_hints, packer);
+    }
     if (metadata.object_checksum.has_value()) {
         packer.pack(*metadata.object_checksum);
     }
