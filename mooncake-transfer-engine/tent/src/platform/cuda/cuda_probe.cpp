@@ -262,10 +262,26 @@ Status CudaPlatform::probe(std::vector<Topology::NicEntry>& nic_list,
     return Status::OK();
 }
 
+namespace {
+struct PaddedPointerAttributes {
+    cudaPointerAttributes attr;
+    unsigned char pad[256];
+};
+
+inline cudaError_t safePointerGetAttributes(cudaPointerAttributes* out,
+                                            const void* ptr) {
+    PaddedPointerAttributes buf;
+    memset(&buf, 0, sizeof(buf));
+    cudaError_t rc = cudaPointerGetAttributes(&buf.attr, ptr);
+    memcpy(out, &buf.attr, sizeof(cudaPointerAttributes));
+    return rc;
+}
+}
+
 MemoryType CudaPlatform::getMemoryType(void* addr) {
     cudaPointerAttributes attributes;
-    cudaError_t result;
-    result = cudaPointerGetAttributes(&attributes, addr);
+    memset(&attributes, 0, sizeof(attributes));
+    cudaError_t result = safePointerGetAttributes(&attributes, addr);
     if (result != cudaSuccess) {
         LOG(WARNING) << "cudaPointerGetAttributes: "
                      << cudaGetErrorString(result);
@@ -297,9 +313,8 @@ const std::vector<RangeLocation> CudaPlatform::getLocation(void* start,
     std::vector<RangeLocation> entries;
 
     cudaPointerAttributes attributes;
-    cudaError_t result;
-
-    result = cudaPointerGetAttributes(&attributes, start);
+    memset(&attributes, 0, sizeof(attributes));
+    cudaError_t result = safePointerGetAttributes(&attributes, start);
     if (result != cudaSuccess) {
         LOG(WARNING) << "cudaPointerGetAttributes: "
                      << cudaGetErrorString(result);

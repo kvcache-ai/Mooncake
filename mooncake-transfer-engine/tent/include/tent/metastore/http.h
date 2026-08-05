@@ -46,16 +46,15 @@ class HttpMetaStore : public MetaStore {
     }
 
     std::string encodeUrl(const std::string &key) {
-        char *newkey = curl_easy_escape(client_, key.c_str(), key.size());
-        std::string encodedKey(newkey);
+        char *newkey = curl_easy_escape(nullptr, key.c_str(), key.size());
+        std::string encodedKey(newkey ? newkey : "");
         std::string url = endpoint_ + "?key=" + encodedKey;
-        curl_free(newkey);
+        if (newkey) curl_free(newkey);
         return url;
     }
 
    private:
     std::atomic<bool> connected_;
-    CURL *client_;
     std::string endpoint_;
 };
 }  // namespace tent
