@@ -17,24 +17,22 @@ __global__
     volatile bool active = false;
     int opType =
         0;  // c10d::OpType as int, for ABI compatibility with kernel code
-    size_t tensorSize;  // In bytes
+    size_t dataSize;  // In bytes
     int64_t broadcastRoot;
     int bufferOffset;
     uint64_t submitSequence = 0;
-    uint64_t hintRouteId = 0;
+    int32_t* failedRanksHint = nullptr;
     bool resetFailedRanksHint = false;
     BatchID batchID;
     void* transferGroupMeta;
 };
 
 // Kernel function declarations — guarded so g++ doesn't see __global__
-// which it can't parse. Parameters use plain C++ types (int instead of
-// c10d::OpType / c10d::ReduceOp::RedOpType) so that mcc can compile them
-// without torch headers.
 #if defined(__CUDACC__) || defined(__MUSA__)
-__global__ void enqueueTaskKernel(int opType, size_t tensorSize,
+__global__ void enqueueTaskKernel(int opType, size_t dataSize,
                                   int64_t broadcastRoot, int bufferOffset,
-                                  uint64_t submitSequence, uint64_t hintRouteId,
+                                  uint64_t submitSequence,
+                                  int32_t* failedRanksHint,
                                   bool resetFailedRanksHint, void* meta,
                                   Task* tasks, size_t taskId);
 
@@ -50,9 +48,9 @@ __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
 // Both CUDA and MUSA use cudaStream_t in the declaration: on MUSA,
 // cuda_alike.h typedefs cudaStream_t to musaStream_t.
 
-void launchEnqueueTaskKernel(int opType, size_t tensorSize,
-                             int64_t broadcastRoot, int bufferOffset,
-                             uint64_t submitSequence, uint64_t hintRouteId,
+void launchEnqueueTaskKernel(int opType, size_t dataSize, int64_t broadcastRoot,
+                             int bufferOffset, uint64_t submitSequence,
+                             int32_t* failedRanksHint,
                              bool resetFailedRanksHint, void* meta, Task* tasks,
                              size_t taskId, cudaStream_t stream);
 
