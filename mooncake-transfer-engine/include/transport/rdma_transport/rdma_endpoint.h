@@ -132,6 +132,9 @@ class RdmaEndPoint {
     void beginDestroy();
     bool finishDestroy();
 
+    void beginCompletionBatch();
+    void endCompletionBatch();
+
    private:
     int disconnectUnlocked();
 
@@ -229,6 +232,7 @@ class RdmaEndPoint {
     ibv_cq *cq_;
     std::atomic<int> *cq_outstanding_;
     std::atomic<uint64_t> inactive_time_;
+    std::atomic<int> completion_batch_refs_{0};
     bool finish_destroy_timeout_logged_ = false;
     int finish_destroy_retries_ = 0;
 };

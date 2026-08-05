@@ -18,6 +18,7 @@
 
 #include <cassert>
 #include <functional>
+#include <unordered_set>
 
 #include "config.h"
 #include "memory_location.h"
@@ -539,6 +540,7 @@ void WorkerPool::performPollCq(int thread_id) {
 
     const static size_t kPollCount = 64;
     std::unordered_map<std::atomic<int> *, int> qp_depth_set;
+    std::unordered_set<RdmaEndPoint *> pinned_endpoints;
     std::vector<ibv_wc> wc_list;
     const int cq_index = cqIndexForPostingThread(thread_id);
     ibv_wc wc[kPollCount];
@@ -564,6 +566,10 @@ void WorkerPool::performPollCq(int thread_id) {
             qp_depth_set[slice->rdma.qp_depth]++;
         else
             qp_depth_set[slice->rdma.qp_depth] = 1;
+        if (slice->rdma.endpoint &&
+            pinned_endpoints.insert(slice->rdma.endpoint).second) {
+            slice->rdma.endpoint->beginCompletionBatch();
+        }
         wc_list.push_back(wc[i]);
     }
     if (nr_poll)
@@ -574,6 +580,10 @@ void WorkerPool::performPollCq(int thread_id) {
         entry.first->fetch_sub(entry.second, std::memory_order_acq_rel);
 
     if (!wc_list.empty()) processCompletions(thread_id, wc_list);
+
+    for (auto *endpoint : pinned_endpoints) {
+        endpoint->endCompletionBatch();
+    }
 }
 
 void WorkerPool::processCompletions(int thread_id,
@@ -657,17 +667,18 @@ void WorkerPool::processCompletions(int thread_id,
             const bool local_wc_failure = isLocalWcFailure(wc);
             if (!context_.active() || local_wc_failure) {
                 // A local completion fault retires the endpoint, and the slice
-                // is handed to another local RNIC that rebuilds its own endpoint
-                // to the same peer NIC. If the fault keeps recurring nothing
-                // throttles that cycle: the rail is deliberately not paused on
-                // the local path, and the context failure counter is cleared by
-                // any concurrent success, so both RNICs re-handshake the same
-                // peer as fast as the workers spin. Charge the path an error
-                // instead -- without an immediate pause, so a one-off fault
-                // still costs nothing -- and let kRailErrorThreshold stop the
-                // rebuild loop from this context. See issue #3299.
+                // is handed to another local RNIC that rebuilds its own
+                // endpoint to the same peer NIC. If the fault keeps recurring
+                // nothing throttles that cycle: the rail is deliberately not
+                // paused on the local path, and the context failure counter is
+                // cleared by any concurrent success, so both RNICs re-handshake
+                // the same peer as fast as the workers spin. Charge the path an
+                // error instead -- without an immediate pause, so a one-off
+                // fault still costs nothing -- and let kRailErrorThreshold stop
+                // the rebuild loop from this context. See issue #3299.
                 if (local_wc_failure &&
-                    local_failed_peer_paths.insert(slice->peer_nic_path).second) {
+                    local_failed_peer_paths.insert(slice->peer_nic_path)
+                        .second) {
                     markRailFailed(slice->peer_nic_path);
                 }
                 if (!recorded_local_context_failure) {

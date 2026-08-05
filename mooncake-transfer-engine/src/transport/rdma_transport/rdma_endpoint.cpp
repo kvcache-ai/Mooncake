@@ -287,6 +287,9 @@ bool RdmaEndPoint::finishDestroy() {
     // inactive endpoints are eligible for reclaim; active ones must stay.
     if (current_status != DESTROYING) {
         if (active_.load(std::memory_order_acquire)) return false;
+        if (completion_batch_refs_.load(std::memory_order_acquire) != 0) {
+            return false;
+        }
         // Endpoints that never reached construct() own no RDMA resources
         // and have wr_depth_list_ uninitialized; deconstructLocked() would
         // delete[] a wild pointer. Drop them directly.
@@ -310,7 +313,8 @@ bool RdmaEndPoint::finishDestroy() {
                 break;
             }
         }
-        if (has_outstanding) {
+        if (has_outstanding ||
+            completion_batch_refs_.load(std::memory_order_acquire) != 0) {
             double elapsed = (getCurrentTimeInNano() -
                               inactive_time_.load(std::memory_order_relaxed)) /
                              1e9;
@@ -340,6 +344,14 @@ bool RdmaEndPoint::finishDestroy() {
     }
     status_.store(DESTROYED, std::memory_order_relaxed);
     return true;
+}
+
+void RdmaEndPoint::beginCompletionBatch() {
+    completion_batch_refs_.fetch_add(1, std::memory_order_acq_rel);
+}
+
+void RdmaEndPoint::endCompletionBatch() {
+    completion_batch_refs_.fetch_sub(1, std::memory_order_acq_rel);
 }
 
 void RdmaEndPoint::setPeerNicPath(const std::string &peer_nic_path) {
