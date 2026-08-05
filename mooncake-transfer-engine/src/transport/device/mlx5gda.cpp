@@ -199,13 +199,13 @@ struct mlx5gda_cq* mlx5gda_create_cq(
         cq_offset = memheap_aligned_alloc(ctrl_buf_heap,
                                           num_cqe * sizeof(struct mlx5_cqe64),
                                           (size_t)1 << MLX5_ADAPTER_PAGE_SHIFT);
-        if (cq_offset == -1) {
+        if (cq_offset == (size_t)-1) {
             perror("Failed to allocate CQ memory");
             goto fail;
         }
         dbr_offset =
             memheap_alloc(ctrl_buf_heap, sizeof(struct mlx5gda_cq_dbr));
-        if (dbr_offset == -1) {
+        if (dbr_offset == (size_t)-1) {
             perror("Failed to allocate CQ DBR memory");
             goto fail;
         }
@@ -287,8 +287,8 @@ fail:
         free(cq);
     }
     if (!split_regions) {
-        if (cq_offset != -1) memheap_free(ctrl_buf_heap, cq_offset);
-        if (dbr_offset != -1) memheap_free(ctrl_buf_heap, dbr_offset);
+        if (cq_offset != (size_t)-1) memheap_free(ctrl_buf_heap, cq_offset);
+        if (dbr_offset != (size_t)-1) memheap_free(ctrl_buf_heap, dbr_offset);
     }
     errno = saved_errno;
     return NULL;
@@ -418,14 +418,14 @@ struct mlx5gda_qp* mlx5gda_create_rc_qp(
         wq_offset = memheap_aligned_alloc(
             ctrl_buf_heap, num_wqebb * sizeof(struct mlx5gda_wqebb),
             (size_t)1 << MLX5_ADAPTER_PAGE_SHIFT);
-        if (wq_offset == -1) {
+        if (wq_offset == (size_t)-1) {
             perror("Failed to allocate WQ memory");
             goto fail;
         }
 
         dbr_offset =
             memheap_alloc(ctrl_buf_heap, sizeof(struct mlx5gda_wq_dbr));
-        if (dbr_offset == -1) {
+        if (dbr_offset == (size_t)-1) {
             perror("Failed to allocate DBR memory");
             goto fail;
         }
@@ -518,10 +518,10 @@ fail:
     if (qp) {
         free(qp);
     }
-    if (!split_regions && wq_offset != -1) {
+    if (!split_regions && wq_offset != (size_t)-1) {
         memheap_free(ctrl_buf_heap, wq_offset);
     }
-    if (!split_regions && dbr_offset != -1) {
+    if (!split_regions && dbr_offset != (size_t)-1) {
         memheap_free(ctrl_buf_heap, dbr_offset);
     }
     errno = saved_errno;
@@ -542,10 +542,10 @@ void mlx5gda_destroy_qp(struct memheap* ctrl_buf_heap, struct mlx5gda_qp* qp) {
         release_control_region(&qp->region_allocator, &qp->dbr_region);
         release_control_region(&qp->region_allocator, &qp->wq_region);
     } else {
-        if (qp->wq_offset != -1) {
+        if (qp->wq_offset != (size_t)-1) {
             memheap_free(ctrl_buf_heap, qp->wq_offset);
         }
-        if (qp->dbr_offset != -1) {
+        if (qp->dbr_offset != (size_t)-1) {
             memheap_free(ctrl_buf_heap, qp->dbr_offset);
         }
     }
