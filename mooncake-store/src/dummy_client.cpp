@@ -19,6 +19,7 @@
 #include "types.h"
 #include "default_config.h"
 #include "config.h"
+#include "device/cuda_ipc_buffer.h"
 #ifdef USE_ASCEND_DIRECT
 #include "acl/acl_rt.h"
 #include "ascend_allocator.h"
@@ -64,6 +65,34 @@ size_t sum_successful_nested_sizes(
     return total;
 }
 
+size_t sum_successful_cuda_ipc_sizes(
+    const std::vector<int>& results,
+    const std::vector<mooncake::CudaIpcWriteRequest>& requests) {
+    size_t total = 0;
+    for (size_t i = 0; i < results.size() && i < requests.size(); ++i) {
+        if (results[i] == 0) {
+            total += requests[i].metadata.size + requests[i].payload.size;
+        }
+    }
+    return total;
+}
+
+std::optional<std::vector<mooncake::CudaIpcBufferHandle>>
+try_export_cuda_ipc_buffers(const std::vector<void*>& buffers,
+                            const std::vector<size_t>& sizes) {
+    if (buffers.size() != sizes.size() || buffers.empty()) return std::nullopt;
+
+    std::vector<mooncake::CudaIpcBufferHandle> payloads;
+    payloads.reserve(buffers.size());
+    for (size_t i = 0; i < buffers.size(); ++i) {
+        auto payload =
+            mooncake::device::ExportCudaIpcBuffer(buffers[i], sizes[i]);
+        if (!payload) return std::nullopt;
+        payloads.push_back(*payload);
+    }
+    return payloads;
+}
+
 size_t sum_positive_results(const std::vector<int64_t>& results) {
     size_t total = 0;
     for (int64_t result : results) {
@@ -93,6 +122,17 @@ size_t sum_positive_ranges(
         }
     }
     return total;
+}
+
+template <typename Result = int64_t, typename T>
+std::vector<Result> expected_results_to_py(
+    const std::vector<tl::expected<T, mooncake::ErrorCode>>& internal_results) {
+    std::vector<Result> results;
+    results.reserve(internal_results.size());
+    for (const auto& result : internal_results) {
+        results.push_back(static_cast<Result>(mooncake::to_py_ret(result)));
+    }
+    return results;
 }
 
 std::vector<uint64_t> void_ptrs_to_u64(const std::vector<void*>& ptrs) {
@@ -1016,6 +1056,19 @@ std::vector<std::shared_ptr<BufferHandle>> DummyClient::batch_get_buffer(
 
 int64_t DummyClient::get_into(const std::string& key, void* buffer,
                               size_t size) {
+    if (auto dst_buffer = try_export_cuda_ipc_buffers({buffer}, {size})) {
+        std::vector<CudaIpcReadRequest> requests{
+            CudaIpcReadRequest{
+                .key = key,
+                .destination = (*dst_buffer)[0],
+                .source_offset = 0,
+                .size = static_cast<uint64_t>(size),
+            },
+        };
+        auto results = batch_get_into_cuda_ipc(requests);
+        return results.empty() ? toInt(ErrorCode::INVALID_PARAMS) : results[0];
+    }
+
     uint64_t buf_addr = reinterpret_cast<uint64_t>(buffer);
     const auto start_time = std::chrono::steady_clock::now();
     auto result = invoke_rpc<&RealClient::get_into_range_shm_helper,
@@ -1100,6 +1153,20 @@ std::string DummyClient::get_hostname() const {
 std::vector<int> DummyClient::batch_put_from(
     const std::vector<std::string>& keys, const std::vector<void*>& buffer_ptrs,
     const std::vector<size_t>& sizes, const ReplicateConfig& config) {
+    if (auto payloads = try_export_cuda_ipc_buffers(buffer_ptrs, sizes);
+        payloads && keys.size() == payloads->size()) {
+        std::vector<CudaIpcWriteRequest> requests;
+        requests.reserve(keys.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            requests.push_back(CudaIpcWriteRequest{
+                .key = keys[i],
+                .metadata = CudaIpcShmBufferRef{},
+                .payload = (*payloads)[i],
+            });
+        }
+        return batch_put_from_cuda_ipc(requests, config);
+    }
+
     std::vector<uint64_t> buffers = void_ptrs_to_u64(buffer_ptrs);
     const auto start_time = std::chrono::steady_clock::now();
     auto internal_results =
@@ -1131,22 +1198,50 @@ int DummyClient::put_from(const std::string& key, void* buffer, size_t size,
 std::vector<int64_t> DummyClient::batch_get_into(
     const std::vector<std::string>& keys, const std::vector<void*>& buffer_ptrs,
     const std::vector<size_t>& sizes) {
+    if (auto dst_buffers = try_export_cuda_ipc_buffers(buffer_ptrs, sizes);
+        dst_buffers && keys.size() == dst_buffers->size()) {
+        std::vector<CudaIpcReadRequest> requests;
+        requests.reserve(keys.size());
+        for (size_t i = 0; i < keys.size(); ++i) {
+            requests.push_back(CudaIpcReadRequest{
+                .key = keys[i],
+                .destination = (*dst_buffers)[i],
+                .source_offset = 0,
+                .size = static_cast<uint64_t>(sizes[i]),
+            });
+        }
+        return batch_get_into_cuda_ipc(requests);
+    }
+
     std::vector<uint64_t> buffers = void_ptrs_to_u64(buffer_ptrs);
     const auto start_time = std::chrono::steady_clock::now();
     auto internal_results =
         invoke_batch_rpc<&RealClient::batch_get_into_dummy_helper, int64_t>(
             keys.size(), keys, buffers, sizes, device_id_, client_id_);
-    std::vector<int64_t> results;
-    results.reserve(internal_results.size());
-
-    for (const auto& result : internal_results) {
-        results.push_back(to_py_ret(result));
-    }
+    auto results = expected_results_to_py(internal_results);
 
     const size_t total_bytes = sum_positive_results(results);
     if (total_bytes > 0) {
         ObserveTransferMetric(TransferOperationKind::kRead, "batch_get_into",
                               total_bytes, elapsed_us_since(start_time), true);
+    }
+
+    return results;
+}
+
+std::vector<int64_t> DummyClient::batch_get_into_cuda_ipc(
+    const std::vector<mooncake::CudaIpcReadRequest>& requests) {
+    const auto start_time = std::chrono::steady_clock::now();
+    auto internal_results =
+        invoke_batch_rpc<&RealClient::batch_get_into_cuda_ipc_dummy_helper,
+                         int64_t>(requests.size(), requests, client_id_);
+    auto results = expected_results_to_py(internal_results);
+
+    const size_t total_bytes = sum_positive_results(results);
+    if (total_bytes > 0) {
+        ObserveTransferMetric(TransferOperationKind::kRead,
+                              "batch_get_into_cuda_ipc", total_bytes,
+                              elapsed_us_since(start_time), true);
     }
 
     return results;
@@ -1173,16 +1268,30 @@ std::vector<int> DummyClient::batch_put_from_multi_buffers(
         invoke_batch_rpc<&RealClient::batch_put_from_multi_buffers_dummy_helper,
                          void>(keys.size(), keys, dummy_nested, all_sizes,
                                config, device_id_, client_id_);
-    std::vector<int> results;
-    results.reserve(internal_results.size());
-    for (const auto& result : internal_results) {
-        results.push_back(to_py_ret(result));
-    }
+    auto results = expected_results_to_py<int>(internal_results);
     const size_t successful_bytes =
         sum_successful_nested_sizes(results, all_sizes);
     if (successful_bytes > 0) {
         ObserveTransferMetric(TransferOperationKind::kWrite,
                               "batch_put_from_multi_buffers", successful_bytes,
+                              elapsed_us_since(start_time), true);
+    }
+    return results;
+}
+
+std::vector<int> DummyClient::batch_put_from_cuda_ipc(
+    const std::vector<mooncake::CudaIpcWriteRequest>& requests,
+    const ReplicateConfig& config) {
+    const auto start_time = std::chrono::steady_clock::now();
+    auto internal_results =
+        invoke_batch_rpc<&RealClient::batch_put_from_cuda_ipc_dummy_helper,
+                         void>(requests.size(), requests, config, client_id_);
+    auto results = expected_results_to_py<int>(internal_results);
+    const size_t successful_bytes =
+        sum_successful_cuda_ipc_sizes(results, requests);
+    if (successful_bytes > 0) {
+        ObserveTransferMetric(TransferOperationKind::kWrite,
+                              "batch_put_from_cuda_ipc", successful_bytes,
                               elapsed_us_since(start_time), true);
     }
     return results;

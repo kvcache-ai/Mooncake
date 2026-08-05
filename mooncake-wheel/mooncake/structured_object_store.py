@@ -4,7 +4,6 @@ import ctypes
 import io
 import json
 import uuid
-from collections.abc import Iterable
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -2046,11 +2045,6 @@ def _select_mapping(
 
 
 _DATAPROTO_SCHEMA_SECTIONS = frozenset({"batch", "non_tensor_batch", "meta_info"})
-_FIELD_SCHEMA_CODECS = frozenset({
-    "auto", "ragged_tensor_dict", "ragged_tensor", "typed_ragged", "ndarray",
-    "bytes_ragged", "media_bytes", "media_list_ragged", "utf8_ragged",
-    "msgpack_ragged", "json_ragged",
-})
 _RAGGED_TENSOR_PAYLOAD_NAMES = frozenset({"data", "offsets", "shapes", "ndims", "nulls"})
 
 
@@ -5892,19 +5886,6 @@ def _can_json(values: list[Any]) -> _CodecDecision:
     return _CodecDecision(
         True, "json_ragged", "all rows pass JSON serialization", "json"
     )
-
-
-_CODEC_PREDICATES: tuple[Any, ...] = (
-    _can_tensor,
-    _can_media_list,
-    _can_numeric_sequence,
-    _can_numeric_scalar,
-    lambda v: _check_all(v, _is_bytes_like, "bytes_ragged", "bytes-like"),
-    lambda v: _check_all(v, _is_pil_image, "media_bytes", "media"),
-    lambda v: _check_all(v, lambda x: isinstance(x, str), "utf8_ragged", "str"),
-    _can_msgpack,
-    _can_json,
-)
 
 
 def _choose_leaf_codec(values: list[Any]) -> _CodecDecision:

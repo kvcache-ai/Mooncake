@@ -4,7 +4,6 @@
 import argparse
 import json
 import logging
-import time
 import re
 import shlex
 from typing import List, Dict, Any
@@ -12,7 +11,6 @@ from typing import List, Dict, Any
 import paramiko
 
 from mooncake.store import MooncakeDistributedNoFRegister
-from mooncake.mooncake_config import MooncakeConfig
 
 
 class MooncakeNoFRegister:

@@ -42,6 +42,9 @@
 #include "rpc_types.h"
 #include "local_hot_cache.h"
 #include "device/accelerator_registry.h"
+#ifdef USE_INTRA_NVLINK
+#include "gpu_vendor/intra_nvlink.h"
+#endif
 #include "crc_checksum.h"
 #include "environ.h"
 
@@ -688,17 +691,16 @@ ErrorCode Client::InitTransferEngine(
             // Use user-specified auto-discover setting
             auto_discover = env_auto_discover.value();
         } else {
-            // Enable auto-discover for RDMA if no devices are specified
+            // Enable auto-discover for RDMA/EFA if no devices are specified
             if ((protocol == "rdma" || protocol == "efa") &&
                 !device_names.has_value()) {
-                LOG(INFO)
-                    << "Set auto discovery ON by default for RDMA protocol, "
-                       "since no "
-                       "device names provided";
+                LOG(INFO) << "Set auto discovery ON by default for " << protocol
+                          << " protocol, since no device names provided";
                 auto_discover = true;
             }
         }
-        transfer_engine_->setAutoDiscover(auto_discover);
+        transfer_engine_->setAutoDiscover(
+            {.enabled = auto_discover, .protocol = protocol});
 
         // Honor filters when auto-discovery is enabled; otherwise warn once
         if (auto_discover) {
@@ -868,6 +870,21 @@ ErrorCode Client::InitTransferEngine(
                               "devices";
                 return ErrorCode::INTERNAL_ERROR;
             }
+        } else if (protocol == "nvlink_intra") {
+#ifdef USE_INTRA_NVLINK
+            LOG(INFO) << "Using intra-NVLink protocol.";
+            transport =
+                transfer_engine_->installTransport("nvlink_intra", nullptr);
+            if (!transport) {
+                LOG(ERROR) << "Failed to install nvlink_intra transport.";
+                return ErrorCode::INTERNAL_ERROR;
+            }
+#else
+            LOG(ERROR)
+                << "--protocol=nvlink_intra requires USE_INTRA_NVLINK=ON, "
+                   "please rebuild mooncake from source.";
+            return ErrorCode::INVALID_PARAMS;
+#endif
         } else {
             LOG(ERROR) << "unsupported_protocol protocol=" << protocol;
             return ErrorCode::INVALID_PARAMS;
@@ -1325,6 +1342,15 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
         return tl::unexpected(ErrorCode::LEASE_EXPIRED);
     }
     return {};
+}
+
+std::optional<TransferEngine::ScatterTransferOperation> Client::SubmitScatter(
+    const std::vector<TransferEngine::ScatterTransferRange>& transfers) {
+    if (!transfer_submitter_) {
+        LOG(ERROR) << "TransferSubmitter not initialized";
+        return std::nullopt;
+    }
+    return transfer_submitter_->submitScatter(transfers);
 }
 
 struct BatchGetOperation {

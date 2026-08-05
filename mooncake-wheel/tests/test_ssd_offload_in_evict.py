@@ -2,10 +2,7 @@ import unittest
 import os
 import time
 import threading
-import random
 from mooncake.store import MooncakeDistributedStore
-import statistics
-import math
 from collections import defaultdict
 
 # The lease time of the kv object, should be set equal to
@@ -255,7 +252,6 @@ class TestDistributedObjectStore(unittest.TestCase):
         # --------------------------
         get_stats.start_timer()
         index = 0
-        count = 0
         while index < MAX_REQUESTS:
             key = "k_" + str(index)
             
@@ -524,8 +520,6 @@ class TestDistributedObjectStore(unittest.TestCase):
             self.assertEqual(len(results), len(batch_keys), "Should return result for each key")
             
             success_counter = 0
-            failed_counter = 0
-            count=0
             for i, result in enumerate(results):
                 current_key = batch_keys[i]
                 expected = reference.get(current_key)

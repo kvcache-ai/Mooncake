@@ -30,8 +30,10 @@ concurrency:
 env:
   SCCACHE_GHA_ENABLED: "true"
 
+# Gate the dependency root so all downstream jobs are skipped in forks.
 jobs:
   version-stamp:
+    if: github.repository == 'kvcache-ai/Mooncake'
     runs-on: ubuntu-22.04
     outputs:
       nightly_version: ${{ steps.version.outputs.nightly_version }}
@@ -234,6 +236,7 @@ jobs:
           twine upload --repository testpypi --skip-existing dist-publish/*.whl
 
   nightly-test:
+    needs: version-stamp
     runs-on: ubuntu-22.04
     env:
       CI: "true"
@@ -497,7 +500,8 @@ jobs:
           fi
 
   nightly-gate:
-    if: always()
+    # always() bypasses skipped dependencies, so this job needs its own guard.
+    if: ${{ always() && github.repository == 'kvcache-ai/Mooncake' }}
     needs:
       - version-stamp
       - build-cuda128-x86

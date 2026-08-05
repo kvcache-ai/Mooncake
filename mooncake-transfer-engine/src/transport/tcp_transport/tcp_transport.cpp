@@ -1026,19 +1026,7 @@ Status TcpTransport::submitTransfer(
     for (auto& request : entries) {
         TransferTask& task = batch_desc.task_list[task_id];
         ++task_id;
-        task.total_bytes = request.length;
-        Slice* slice = getSliceCache().allocate();
-        slice->source_addr = (char*)request.source;
-        slice->length = request.length;
-        slice->opcode = request.opcode;
-        slice->tcp.dest_addr = request.target_offset;
-        slice->task = &task;
-        slice->target_id = request.target_id;
-        slice->status = Slice::PENDING;
-        slice->ts = 0;
-        task.slice_list.push_back(slice);
-        __sync_fetch_and_add(&task.slice_count, 1);
-        startTransfer(slice);
+        startTransfer(prepareTransfer(&task, request));
     }
 
     return Status::OK();
@@ -1046,26 +1034,61 @@ Status TcpTransport::submitTransfer(
 
 Status TcpTransport::submitTransferTask(
     const std::vector<TransferTask*>& task_list) {
-    for (size_t index = 0; index < task_list.size(); ++index) {
-        assert(task_list[index]);
-        auto& task = *task_list[index];
-        assert(task.request);
-        auto& request = *task.request;
-        task.total_bytes = request.length;
-        Slice* slice = getSliceCache().allocate();
-        slice->source_addr = (char*)request.source;
-        slice->length = request.length;
-        slice->opcode = request.opcode;
-        slice->tcp.dest_addr = request.target_offset;
-        slice->task = &task;
-        slice->target_id = request.target_id;
-        slice->status = Slice::PENDING;
-        slice->ts = 0;
-        task.slice_list.push_back(slice);
-        __sync_fetch_and_add(&task.slice_count, 1);
-        startTransfer(slice);
+    for (auto* task : task_list) {
+        assert(task && task->request);
+        startTransfer(prepareTransfer(task, *task->request));
     }
     return Status::OK();
+}
+
+Status TcpTransport::submitTransferTaskGroup(
+    const std::vector<TransferTask*>& task_list) {
+    std::vector<Slice*> slices;
+    slices.reserve(task_list.size());
+    for (auto* task : task_list) {
+        assert(task && task->request);
+        slices.push_back(prepareTransfer(task, *task->request));
+    }
+    startTransferSequence(std::move(slices));
+    return Status::OK();
+}
+
+Transport::Slice* TcpTransport::prepareTransfer(
+    TransferTask* task, const TransferRequest& request) {
+    task->total_bytes = request.length;
+    Slice* slice = getSliceCache().allocate();
+    slice->source_addr = static_cast<char*>(request.source);
+    slice->length = request.length;
+    slice->opcode = request.opcode;
+    slice->tcp.dest_addr = request.target_offset;
+    slice->task = task;
+    slice->target_id = request.target_id;
+    slice->status = Slice::PENDING;
+    slice->ts = 0;
+    task->slice_list.push_back(slice);
+    __sync_fetch_and_add(&task->slice_count, 1);
+    return slice;
+}
+
+void TcpTransport::startTransferSequence(std::vector<Slice*> slices) {
+    struct Sequence {
+        std::vector<Slice*> slices;
+        size_t next = 0;
+    };
+    auto sequence = std::make_shared<Sequence>();
+    sequence->slices = std::move(slices);
+    auto advance = std::make_shared<std::function<void()>>();
+    std::weak_ptr<std::function<void()>> weak_advance = advance;
+    *advance = [this, sequence, weak_advance]() {
+        auto advance = weak_advance.lock();
+        if (!advance || sequence->next == sequence->slices.size()) return;
+        auto* slice = sequence->slices[sequence->next++];
+        std::function<void()> continuation;
+        if (sequence->next < sequence->slices.size())
+            continuation = [advance]() { (*advance)(); };
+        startTransfer(slice, std::move(continuation), true);
+    };
+    (*advance)();
 }
 
 void TcpTransport::worker() {
@@ -1083,9 +1106,9 @@ void TcpTransport::worker() {
 }
 
 std::shared_ptr<asio::ip::tcp::socket> TcpTransport::getConnection(
-    const std::string& host, uint16_t port) {
-    // If connection pool is disabled, always create a new connection
-    if (!enable_connection_pool_) {
+    const std::string& host, uint16_t port, bool use_pool) {
+    // Ungrouped transfers keep the configured connection-pool behavior.
+    if (!use_pool) {
         try {
             asio::ip::tcp::resolver resolver(context_->io_context);
             auto endpoint_iterator =
@@ -1285,13 +1308,24 @@ void TcpTransport::discardConnection(
     }
 }
 
-void TcpTransport::startTransfer(Slice* slice) {
+void TcpTransport::startTransfer(Slice* slice,
+                                 std::function<void()> continuation,
+                                 bool reuse_connection) {
+    auto finish = [this, slice, continuation = std::move(continuation)](
+                      TransferStatusEnum status) mutable {
+        if (status == TransferStatusEnum::COMPLETED)
+            slice->markSuccess();
+        else
+            slice->markFailed();
+        if (continuation)
+            asio::post(context_->io_context, std::move(continuation));
+    };
     auto desc = metadata_->getSegmentDescByID(slice->target_id);
     if (!desc) {
         LOG(ERROR) << "TcpTransport::startTransfer failed to get segment "
                       "description for target_id: "
                    << slice->target_id;
-        slice->markFailed();
+        finish(TransferStatusEnum::FAILED);
         return;
     }
 
@@ -1300,7 +1334,7 @@ void TcpTransport::startTransfer(Slice* slice) {
         LOG(ERROR) << "TcpTransport::startTransfer failed to get RPC meta "
                       "entry for segment name: "
                    << desc->name;
-        slice->markFailed();
+        finish(TransferStatusEnum::FAILED);
         return;
     }
 
@@ -1309,17 +1343,17 @@ void TcpTransport::startTransfer(Slice* slice) {
     // validation; short-circuiting keeps that outcome (rather than turning
     // no-ops into v2 rejection failures) without the pointless round trip.
     if (slice->length == 0) {
-        slice->markSuccess();
+        finish(TransferStatusEnum::COMPLETED);
         return;
     }
 
-    // Get connection from pool
-    auto socket =
-        getConnection(meta_entry.ip_or_host_name, desc->tcp_data_port);
+    const bool use_pool = enable_connection_pool_ || reuse_connection;
+    auto socket = getConnection(meta_entry.ip_or_host_name, desc->tcp_data_port,
+                                use_pool);
     if (!socket) {
         LOG(ERROR) << "TcpTransport::startTransfer failed to get connection to "
                    << meta_entry.ip_or_host_name << ":" << desc->tcp_data_port;
-        slice->markFailed();
+        finish(TransferStatusEnum::FAILED);
         return;
     }
 
@@ -1328,18 +1362,13 @@ void TcpTransport::startTransfer(Slice* slice) {
             desc->tcp_proto_version >= 2 && !forceLegacyTcpProto();
         auto session = std::make_shared<ClientSession>(socket, use_v2);
 
-        session->on_finalize_ = [slice](TransferStatusEnum status) {
-            if (status == TransferStatusEnum::COMPLETED)
-                slice->markSuccess();
-            else
-                slice->markFailed();
-        };
+        session->on_finalize_ = finish;
 
         // Return connection to pool when the request terminated cleanly;
         // otherwise the server-side session state is unknown (it may be
         // mid-frame), so reusing the socket would desynchronize the next
         // request. Discard it instead.
-        if (enable_connection_pool_) {
+        if (use_pool) {
             session->on_complete_ = [this, host = meta_entry.ip_or_host_name,
                                      port = desc->tcp_data_port,
                                      socket](bool clean) {
@@ -1372,7 +1401,7 @@ void TcpTransport::startTransfer(Slice* slice) {
         // inconsistent state.
         discardConnection(meta_entry.ip_or_host_name,
                           static_cast<uint16_t>(desc->tcp_data_port), socket);
-        slice->markFailed();
+        finish(TransferStatusEnum::FAILED);
     }
 }
 

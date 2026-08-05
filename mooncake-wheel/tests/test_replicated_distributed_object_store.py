@@ -94,13 +94,13 @@ class TestDistributedObjectStoreReplication(unittest.TestCase):
         self.assertEqual(self.store.remove(key2), 0)
         
         with self.assertRaises(TypeError):
-            result = self.store.put(key_arg_name_error=key, value=test_data, config=config)
+            self.store.put(key_arg_name_error=key, value=test_data, config=config)
         
         with self.assertRaises(TypeError):
-            result = self.store.put(key=key, value_arg_name_error=test_data, config=config)
+            self.store.put(key=key, value_arg_name_error=test_data, config=config)
             
         with self.assertRaises(TypeError):
-            result = self.store.put(key=key, value=test_data, config_arg_name_error=config)
+            self.store.put(key=key, value=test_data, config_arg_name_error=config)
 
     def test_put_batch_with_config_parameter(self):
         """Test put_batch method with config parameter."""

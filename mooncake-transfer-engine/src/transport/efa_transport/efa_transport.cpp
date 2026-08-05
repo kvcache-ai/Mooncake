@@ -314,8 +314,37 @@ int EfaTransport::registerLocalMemoryInternal(void* addr, size_t length,
     size_t total_pages_per_nic = length / page_size;
     bool use_full_coverage = (total_pages_per_nic <= getMaxPteEntries());
 
+    // Optionally narrow a single-chunk DEVICE buffer to the NICs the topology
+    // reports as closest to its GPU. See buildLocalNicMap() for where the set
+    // comes from, and the MC_EFA_NIC_SELECTION docs for the trade-off: fewer
+    // NICs can serve a transfer touching this buffer, so this is registration
+    // time bought with potential per-buffer bandwidth, not a free win.
+    //
+    // Registering one buffer on N NICs costs ~N times one registration, and for
+    // device memory the per-domain accumulation described above is paid once
+    // per domain, so the two multiply. Measured on p5.48xlarge, 48 x 391 MB GPU
+    // buffers registered serially: 123.7 s on 32 NICs, 17.6 s on 4, 4.4 s on 1.
+    //
+    // Host memory is deliberately excluded. It has no accumulation to amplify,
+    // it is ~4x cheaper to register in the first place, and a host buffer has
+    // no single owning device -- the topology's "cpu:N" preferred set is a NUMA
+    // node's NICs, which is half the machine rather than a rail group.
+    const std::vector<size_t>* local_nics = nullptr;
+    if (!local_nic_map_.empty() && resolved_name.rfind("cpu", 0) != 0) {
+        auto it = local_nic_map_.find(resolved_name);
+        if (it != local_nic_map_.end()) local_nics = &it->second;
+    }
+
     std::vector<std::vector<size_t>> nic_assignments(num_chunks);
-    if (chunks.size() <= 1) {
+    if (chunks.size() <= 1 && local_nics) {
+        // Single chunk, topology-local NIC selection requested for this device.
+        nic_assignments[0] = *local_nics;
+        if (globalConfig().trace) {
+            LOG(INFO) << "EFA local NIC selection: " << addr << " ("
+                      << resolved_name << ") on " << local_nics->size() << "/"
+                      << num_nics << " NICs";
+        }
+    } else if (chunks.size() <= 1) {
         // Single chunk: all NICs
         for (size_t n = 0; n < num_nics; ++n) {
             nic_assignments[0].push_back(n);
@@ -701,6 +730,41 @@ static int runBoundedParallel(size_t count,
     for (auto& t : threads) t.join();
 
     return first_error.load();
+}
+
+// Invert the topology's per-location preferred_hca lists into indices into the
+// NIC set the transport actually opened. `Topology::discover()` already
+// computes what matters here: for a "cuda:N" entry, preferred_hca holds the
+// HCAs at the minimum PCI distance from that GPU, restricted to its NUMA node.
+// On p5.48xlarge each GPU and 4 of the 32 EFA devices sit under the same PCIe
+// root complex, so preferred_hca is exactly those 4 -- the same set NIXL's
+// libfabric plugin derives from hwloc in getEfaDevicesForPci(). No new PCI walk
+// needed.
+//
+// Preferred rather than avail: avail_hca is "every other NIC", which is the
+// all-NICs behavior this exists to avoid.
+std::unordered_map<std::string, std::vector<size_t>>
+EfaTransport::buildLocalNicMap(const TopologyMatrix& matrix,
+                               const std::vector<std::string>& device_names) {
+    std::unordered_map<std::string, size_t> name_to_index;
+    for (size_t i = 0; i < device_names.size(); ++i)
+        name_to_index[device_names[i]] = i;
+
+    std::unordered_map<std::string, std::vector<size_t>> local_nic_map;
+    for (const auto& entry : matrix) {
+        std::vector<size_t> indices;
+        for (const auto& hca : entry.second.preferred_hca) {
+            auto it = name_to_index.find(hca);
+            // A preferred HCA can be missing here: non-EFA devices are filtered
+            // out of context_list_, and an EFA device whose construct() failed
+            // was dropped. Skipping it leaves the rest of the set usable.
+            if (it != name_to_index.end()) indices.push_back(it->second);
+        }
+        // No entry at all rather than an empty one, so the caller's lookup miss
+        // falls back to all NICs instead of registering the buffer nowhere.
+        if (!indices.empty()) local_nic_map[entry.first] = std::move(indices);
+    }
+    return local_nic_map;
 }
 
 int EfaTransport::registerLocalMemoryBatch(
@@ -1124,6 +1188,29 @@ int EfaTransport::initializeEfaResources() {
     if (context_list_.empty()) {
         LOG(ERROR) << "EfaTransport: No available EFA devices";
         return ERR_DEVICE_NOT_FOUND;
+    }
+
+    if (globalConfig().efa_nic_selection == EfaNicSelection::LOCAL) {
+        std::vector<std::string> context_names;
+        context_names.reserve(context_list_.size());
+        for (auto& context : context_list_)
+            context_names.push_back(context->deviceName());
+        local_nic_map_ =
+            buildLocalNicMap(local_topology_->getMatrix(), context_names);
+        for (auto& entry : local_nic_map_) {
+            std::string nic_list;
+            for (size_t i = 0; i < entry.second.size(); ++i) {
+                if (i > 0) nic_list += ",";
+                nic_list += context_names[entry.second[i]];
+            }
+            LOG(INFO) << "EfaTransport: local NICs for " << entry.first << ": ["
+                      << nic_list << "]";
+        }
+        if (local_nic_map_.empty()) {
+            LOG(WARNING) << "EfaTransport: MC_EFA_NIC_SELECTION=local but the "
+                            "topology reports no per-location preferred NICs; "
+                            "every buffer will use all NICs as before";
+        }
     }
 
     // Query EFA device max_mr_size via ibverbs and clamp globalConfig.

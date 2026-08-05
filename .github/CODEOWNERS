@@ -10,7 +10,7 @@
 /docs @ShangmingCai @stmatengss @ykwd @UNIDY2002 @alogfans @staryxchen
 /mooncake-ep @UNIDY2002 @ympcMark @yuechen-sys
 /mooncake-integration/transfer_engine @ShangmingCai @alogfans
-/mooncake-integration/store @ykwd @stmatengss
+/mooncake-integration/store @ykwd @stmatengss @zxpdemonio
 /mooncake-pg @UNIDY2002 @ympcMark @yuechen-sys
 /mooncake-store @ykwd @stmatengss @XucSh @YiXR
 /mooncake-store/*/ha/ @Libotry @YiXR @00fish0 @Icedcoco
@@ -19,6 +19,6 @@
 /mooncake-transfer-engine/*/transport/hip_transport/ @alogfans @amd-arozanov
 /mooncake-transfer-engine/*/transport/ascend_transport/ @alogfans @ascend-direct-dev
 /mooncake-transfer-engine/*/transport/efa_transport/ @alogfans @whn09
-/mooncake-wheel @ShangmingCai @stmatengss
+/mooncake-wheel @ShangmingCai @stmatengss @zxpdemonio
 /scripts/tone_tests @luketong777
 /scripts/ascend/ @ascend-direct-dev @VNightMare @MingYang119
