@@ -25,8 +25,7 @@ static void ensureCurlGlobalInit() {
     std::call_once(g_curl_global_init_flag, []() {
         CURLcode rc = curl_global_init(CURL_GLOBAL_ALL);
         if (rc != CURLE_OK) {
-            LOG(ERROR) << "curl_global_init failed: "
-                       << curl_easy_strerror(rc);
+            LOG(ERROR) << "curl_global_init failed: " << curl_easy_strerror(rc);
         }
     });
 }
@@ -55,7 +54,9 @@ namespace {
 struct ScopedCurl {
     CURL *h{nullptr};
     ScopedCurl() : h(curl_easy_init()) {}
-    ~ScopedCurl() { if (h) curl_easy_cleanup(h); }
+    ~ScopedCurl() {
+        if (h) curl_easy_cleanup(h);
+    }
     ScopedCurl(const ScopedCurl &) = delete;
     ScopedCurl &operator=(const ScopedCurl &) = delete;
     operator CURL *() const { return h; }
