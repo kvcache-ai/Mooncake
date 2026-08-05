@@ -290,7 +290,7 @@ bool cudaProbeUsable() {
 }  // namespace
 
 MemoryType CudaPlatform::getMemoryType(void* addr) {
-    if (!cudaProbeUsable()) return MTYPE_CPU;
+    if (!cudaProbeUsable()) return MTYPE_UNKNOWN;
     cudaPointerAttributes attributes{};
     cudaError_t result = cudaPointerGetAttributes(&attributes, addr);
     if (result != cudaSuccess) {
