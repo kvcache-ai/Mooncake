@@ -702,7 +702,8 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     // left waiting on the TTL reaper.
     std::optional<ErrorCode> abort_error;
 
-    // Pre-populate all_bucket_keys (needed by both sequential and parallel paths).
+    // Pre-populate all_bucket_keys (needed by both sequential and parallel
+    // paths).
     for (const auto& keys : buckets_keys) {
         for (const auto& k : keys) all_bucket_keys.insert(k);
     }
@@ -715,20 +716,36 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         std::vector<std::future<void>> futures;
         futures.reserve(buckets_keys.size());
 
-        for (const auto& keys : buckets_keys) {
-            auto task = std::make_shared<std::packaged_task<void()>>(
-                [this, keys, &task_by_storage_key, &failed_tasks, &failed_mutex,
-                 &fatal_error, &fatal_mutex, complete_handler]() {
-                    auto result = ProcessOneBucket(
-                        keys, task_by_storage_key, failed_tasks, &failed_mutex,
-                        complete_handler);
-                    if (!result) {
-                        MutexLocker lk(&fatal_mutex);
-                        if (!fatal_error) fatal_error = result.error();
-                    }
-                });
-            futures.push_back(task->get_future());
-            offload_write_pool_->enqueue([task]() { (*task)(); });
+        try {
+            for (const auto& keys : buckets_keys) {
+                auto task = std::make_shared<std::packaged_task<void()>>(
+                    [this, keys, &task_by_storage_key, &failed_tasks,
+                     &failed_mutex, &fatal_error, &fatal_mutex,
+                     complete_handler]() {
+                        auto result = ProcessOneBucket(
+                            keys, task_by_storage_key, failed_tasks,
+                            &failed_mutex, complete_handler);
+                        if (!result) {
+                            MutexLocker lk(&fatal_mutex);
+                            if (!fatal_error) fatal_error = result.error();
+                        }
+                    });
+                futures.push_back(task->get_future());
+                offload_write_pool_->enqueue([task]() { (*task)(); });
+            }
+        } catch (...) {
+            // Dispatch failed (e.g. bad_alloc in make_shared / push_back /
+            // enqueue).  Drain the futures already dispatched so queued
+            // workers never outlive the stack locals they captured, then
+            // rethrow.
+            std::exception_ptr pending = std::current_exception();
+            for (auto& f : futures) {
+                try {
+                    f.get();
+                } catch (...) {
+                }
+            }
+            std::rethrow_exception(pending);
         }
 
         // Drain ALL futures before unwinding, even if one throws (e.g.
@@ -741,7 +758,8 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             try {
                 f.get();
             } catch (...) {
-                if (!first_exception) first_exception = std::current_exception();
+                if (!first_exception)
+                    first_exception = std::current_exception();
             }
         }
         if (first_exception) std::rethrow_exception(first_exception);
