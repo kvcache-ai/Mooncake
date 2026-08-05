@@ -21,6 +21,7 @@
 
 #include "tent/common/config.h"
 #include "tent/common/types.h"
+#include "tent/transfer_engine.h"
 #include "tent/runtime/transport_selector.h"
 #include "tent/runtime/transport.h"
 
@@ -186,6 +187,7 @@ TEST(TransportSelectorTest, TransportTypeNameMapping) {
     EXPECT_STREQ(transportTypeName(AscendDirect), "ascend");
     EXPECT_STREQ(transportTypeName(SUNRISE_LINK), "sunrise_link");
     EXPECT_STREQ(transportTypeName(UB), "ub");
+    EXPECT_STREQ(transportTypeName(MPCOMM), "mpcomm");
 }
 
 TEST(TransportSelectorTest, ParseTransportType) {
@@ -200,6 +202,7 @@ TEST(TransportSelectorTest, ParseTransportType) {
     EXPECT_EQ(parseTransportType("ascend"), AscendDirect);
     EXPECT_EQ(parseTransportType("sunrise_link"), SUNRISE_LINK);
     EXPECT_EQ(parseTransportType("ub"), UB);
+    EXPECT_EQ(parseTransportType("mpcomm"), MPCOMM);
     EXPECT_EQ(parseTransportType("unknown"), UNSPEC);
 }
 
@@ -222,7 +225,24 @@ TEST(TransportTypeTest, WireValuesRemainStableWithUbAppended) {
     EXPECT_EQ(static_cast<int>(SUNRISE_LINK), 9);
     EXPECT_EQ(static_cast<int>(TPU), 10);
     EXPECT_EQ(static_cast<int>(UB), 11);
-    EXPECT_EQ(static_cast<int>(kNumTransportTypes), 12);
+    EXPECT_EQ(static_cast<int>(MPCOMM), 12);
+    EXPECT_EQ(static_cast<int>(kNumTransportTypes), 13);
+}
+
+// MPComm is appended after UB, so it takes wire value 12. The same integer is
+// exposed through the C API macros and the Python binding, which makes it a
+// compatibility contract rather than an implementation detail. pybind.cpp
+// carries a matching static_assert so a divergence fails the build.
+TEST(TransportTypeTest, MpcommWireValueMatchesCApiAndRoundTrips) {
+    EXPECT_EQ(static_cast<int>(MPCOMM), 12);
+    EXPECT_EQ(TRANSPORT_MPCOMM, static_cast<int>(MPCOMM));
+    EXPECT_EQ(TRANSPORT_UB, static_cast<int>(UB));
+    // The conversion the C API actually performs on an incoming hint.
+    EXPECT_EQ(c_to_transport_hint(TRANSPORT_MPCOMM), MPCOMM);
+    // Name mapping is what policy parsing relies on; a gap here would make
+    // "transports": ["mpcomm"] resolve to UNSPEC silently.
+    EXPECT_STREQ(transportTypeName(MPCOMM), "mpcomm");
+    EXPECT_EQ(parseTransportType("mpcomm"), MPCOMM);
 }
 
 // Topology::NicType is serialized as an integer. These values are therefore a

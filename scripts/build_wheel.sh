@@ -388,6 +388,15 @@ else
     AUDITWHEEL_CMD="auditwheel"
 fi
 
+# `--exclude libmpcomm.so*` below is deliberate, not an oversight. MPComm ships
+# its own wheel / CMake install and is upgraded independently of Mooncake, so
+# engine.so keeps its DT_NEEDED on libmpcomm.so.<N> and the dynamic linker
+# resolves it at run time (e.g. LD_LIBRARY_PATH=$MPCOMM_ROOT/lib). Vendoring it
+# would: (a) freeze one MPComm build inside the wheel, where the RPATH injected
+# by auditwheel outranks LD_LIBRARY_PATH and would silently shadow any newer
+# libmpcomm.so; and (b) let patchelf rewrite a library carrying CUDA fatbins
+# (MPComm builds TMA kernels with USE_CUDA_KERNELS=ON by default), the same
+# corruption risk the EP/PG extensions are kept away from below.
 ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude libcurl.so* \
     --exclude libfabric.so* \
@@ -479,6 +488,7 @@ ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude ascend_transport*.so \
     --exclude libaccl_barex.so* \
     --exclude liburma.so* \
+    --exclude libmpcomm.so* \
     -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
 
 # Inject CUDA extensions into the repaired wheel.  patchelf (used by auditwheel)
