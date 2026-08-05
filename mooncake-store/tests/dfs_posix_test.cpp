@@ -607,6 +607,8 @@ class ControlledPosixFsAdapter : public PosixFsAdapter {
    public:
     void FailWriteCall(int call) { fail_write_call_ = call; }
     void ShortWriteCall(int call) { short_write_call_ = call; }
+    void FailReadCall(int call) { fail_read_call_ = call; }
+    void ShortReadCall(int call) { short_read_call_ = call; }
     int WriteCallCount() const { return write_calls_.load(); }
     int ReadCallCount() const { return read_calls_.load(); }
 
@@ -629,7 +631,17 @@ class ControlledPosixFsAdapter : public PosixFsAdapter {
 
     tl::expected<size_t, ErrorCode> ReadAt(int fd, iovec* iov, int iovcnt,
                                            int64_t offset) override {
-        ++read_calls_;
+        const int call = ++read_calls_;
+        if (call == fail_read_call_) {
+            return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+        }
+        if (call == short_read_call_) {
+            size_t total_size = 0;
+            for (int i = 0; i < iovcnt; ++i) {
+                total_size += iov[i].iov_len;
+            }
+            return total_size == 0 ? 0 : total_size - 1;
+        }
         return PosixFsAdapter::ReadAt(fd, iov, iovcnt, offset);
     }
 
@@ -638,6 +650,8 @@ class ControlledPosixFsAdapter : public PosixFsAdapter {
     std::atomic<int> read_calls_{0};
     int fail_write_call_ = -1;
     int short_write_call_ = -1;
+    int fail_read_call_ = -1;
+    int short_read_call_ = -1;
 };
 
 TEST_F(DfsBackendTest, BatchWriteUsesExplicitDescriptors) {
@@ -715,6 +729,113 @@ TEST_F(DfsBackendTest, BatchWritePreservesPerKeyWriteErrors) {
     EXPECT_EQ(results[2].error(), ErrorCode::FILE_WRITE_FAIL);
 }
 
+TEST_F(DfsBackendTest, BatchReadUsesExplicitDescriptorsAndMultipleSlices) {
+    AlignedBuffer first_value(4096), second_value(4096);
+    ASSERT_NE(first_value.data(), nullptr);
+    ASSERT_NE(second_value.data(), nullptr);
+    first_value.Fill('R');
+    second_value.Fill('S');
+
+    const DistributedFSDescriptor first_desc{ShardPath(0), 0, 4096, 4096, 0};
+    const DistributedFSDescriptor second_desc{ShardPath(0), 4096, 4096, 4096,
+                                              0};
+    auto write_results = backend_->BatchWrite(
+        {{"same_key", first_desc, {{first_value.data(), first_value.size()}}},
+         {"other_key",
+          second_desc,
+          {{second_value.data(), second_value.size()}}}});
+    ASSERT_EQ(write_results.size(), 2);
+    ASSERT_TRUE(write_results[0].has_value());
+    ASSERT_TRUE(write_results[1].has_value());
+
+    // A stale compatibility-cache entry must not affect explicit reads.
+    desc_cache_->Put("same_key", second_desc);
+
+    AlignedBuffer output_0(1024), output_1(3072), unused(64);
+    ASSERT_NE(output_0.data(), nullptr);
+    ASSERT_NE(output_1.data(), nullptr);
+    ASSERT_NE(unused.data(), nullptr);
+    unused.Fill('U');
+    std::vector<DfsReadRequest> requests{
+        {"same_key",
+         first_desc,
+         {{output_0.data(), output_0.size()},
+          {output_1.data(), output_1.size()},
+          {unused.data(), unused.size()}}},
+        {"too_small", first_desc, {{output_0.data(), output_0.size()}}},
+        {"null_slice", first_desc, {{nullptr, first_desc.object_size}}},
+    };
+    auto read_results = backend_->BatchRead(requests);
+    ASSERT_EQ(read_results.size(), requests.size());
+    ASSERT_TRUE(read_results[0].has_value());
+    ASSERT_FALSE(read_results[1].has_value());
+    EXPECT_EQ(read_results[1].error(), ErrorCode::INVALID_PARAMS);
+    ASSERT_FALSE(read_results[2].has_value());
+    EXPECT_EQ(read_results[2].error(), ErrorCode::INVALID_PARAMS);
+
+    EXPECT_EQ(std::memcmp(first_value.data(), output_0.data(), output_0.size()),
+              0);
+    EXPECT_EQ(std::memcmp(first_value.data() + output_0.size(), output_1.data(),
+                          output_1.size()),
+              0);
+    for (size_t i = 0; i < unused.size(); ++i) {
+        EXPECT_EQ(unused.data()[i], 'U');
+    }
+}
+
+TEST_F(DfsBackendTest, BatchReadPreservesPerKeyErrors) {
+    FileStorageConfig file_config;
+    file_config.storage_backend_type = StorageBackendType::kDistributed;
+    file_config.storage_filepath = tmp_->path();
+
+    DistributedStorageConfig distributed_config;
+    distributed_config.fsdir = tmp_->path();
+    distributed_config.fs_adapter_type = "posix";
+    distributed_config.shard_count = 4;
+    distributed_config.shard_capacity = 64 * 1024 * 1024;
+    distributed_config.alignment = 4096;
+
+    auto adapter = std::make_unique<ControlledPosixFsAdapter>();
+    auto* controlled_adapter = adapter.get();
+    auto backend = std::make_unique<DistributedStorageBackend>(
+        file_config, distributed_config, std::move(adapter));
+    ASSERT_TRUE(backend->Init().has_value());
+
+    AlignedBuffer write_buf(4096);
+    ASSERT_NE(write_buf.data(), nullptr);
+    write_buf.Fill('T');
+    std::vector<DfsWriteRequest> writes;
+    for (size_t i = 0; i < 4; ++i) {
+        writes.push_back({"key_" + std::to_string(i),
+                          {ShardPath(0), i * 4096, 4096, 4096, 0},
+                          {{write_buf.data(), write_buf.size()}}});
+    }
+    auto write_results = backend->BatchWrite(writes);
+    ASSERT_EQ(write_results.size(), writes.size());
+    for (const auto& result : write_results) {
+        ASSERT_TRUE(result.has_value());
+    }
+
+    controlled_adapter->FailReadCall(2);
+    controlled_adapter->ShortReadCall(3);
+    AlignedBuffer out0(4096), out1(4096), out2(4096), out3(4096);
+    std::vector<DfsReadRequest> reads{
+        {"ok_0", writes[0].descriptor, {{out0.data(), out0.size()}}},
+        {"failed", writes[1].descriptor, {{out1.data(), out1.size()}}},
+        {"short", writes[2].descriptor, {{out2.data(), out2.size()}}},
+        {"ok_3", writes[3].descriptor, {{out3.data(), out3.size()}}},
+    };
+    auto read_results = backend->BatchRead(reads);
+    ASSERT_EQ(read_results.size(), reads.size());
+    EXPECT_TRUE(read_results[0].has_value());
+    ASSERT_FALSE(read_results[1].has_value());
+    EXPECT_EQ(read_results[1].error(), ErrorCode::FILE_OPEN_FAIL);
+    ASSERT_FALSE(read_results[2].has_value());
+    EXPECT_EQ(read_results[2].error(), ErrorCode::FILE_READ_FAIL);
+    EXPECT_TRUE(read_results[3].has_value());
+    EXPECT_EQ(std::memcmp(write_buf.data(), out3.data(), write_buf.size()), 0);
+}
+
 TEST_F(DfsBackendTest, RejectsInvalidDescriptorRangesBeforeIo) {
     constexpr uint64_t kShardCapacity = 64 * 1024 * 1024;
 
@@ -768,11 +889,15 @@ TEST_F(DfsBackendTest, RejectsInvalidDescriptorRangesBeforeIo) {
 
     AlignedBuffer read_buf(8192);
     ASSERT_NE(read_buf.data(), nullptr);
+    std::vector<DfsReadRequest> read_requests;
     for (const auto& request : requests) {
-        desc_cache->Put(request.key, request.descriptor);
-        std::unordered_map<std::string, Slice> load_batch;
-        load_batch[request.key] = {read_buf.data(), read_buf.size()};
-        auto result = backend->BatchLoad(load_batch);
+        read_requests.push_back({request.key,
+                                 request.descriptor,
+                                 {{read_buf.data(), read_buf.size()}}});
+    }
+    auto read_results = backend->BatchRead(read_requests);
+    ASSERT_EQ(read_results.size(), read_requests.size());
+    for (const auto& result : read_results) {
         ASSERT_FALSE(result.has_value());
         EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
     }

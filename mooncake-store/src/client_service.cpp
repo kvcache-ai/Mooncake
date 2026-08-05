@@ -1524,6 +1524,8 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
     std::vector<std::tuple<size_t, std::string, TransferFuture,
                            Replica::Descriptor, bool>>
         pending_transfers;
+    std::vector<DfsReadRequest> dfs_read_requests;
+    std::vector<size_t> dfs_read_indices;
     std::vector<tl::expected<void, ErrorCode>> results(object_keys.size());
     // Record batch get transfer latency (Submit + Wait)
     auto t0_batch_get = std::chrono::steady_clock::now();
@@ -1566,12 +1568,15 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         // Submit transfer operation asynchronously
         std::optional<TransferFuture> future;
         if (replica.is_dfs_replica()) {
-            auto dfs_result = ReadDfsReplica(key, replica, slices_it->second);
-            if (dfs_result != ErrorCode::OK) {
-                results[i] = tl::unexpected(dfs_result);
+            if (!dfs_storage_backend_) {
+                LOG(ERROR) << "DFS backend is not initialized";
+                results[i] = tl::unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
                 continue;
             }
-            results[i] = {};
+            const auto& desc = replica.get_dfs_descriptor();
+            dfs_read_requests.push_back(
+                DfsReadRequest{key, desc, slices_it->second});
+            dfs_read_indices.push_back(i);
             continue;
         } else if (replica.is_nof_replica()) {
             auto contiguous_range = GetContiguousSliceRange(slices_it->second);
@@ -1603,6 +1608,35 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
 
         pending_transfers.emplace_back(i, key, std::move(*future), replica,
                                        cache_used);
+    }
+
+    if (!dfs_read_requests.empty()) {
+        auto dfs_results = dfs_storage_backend_->BatchRead(dfs_read_requests);
+        if (dfs_results.size() != dfs_read_requests.size()) {
+            LOG(ERROR) << "DFS BatchRead response size mismatch: expected "
+                       << dfs_read_requests.size() << ", got "
+                       << dfs_results.size();
+            for (size_t index : dfs_read_indices) {
+                results[index] = tl::unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+        } else {
+            for (size_t i = 0; i < dfs_results.size(); ++i) {
+                const size_t index = dfs_read_indices[i];
+                const auto& request = dfs_read_requests[i];
+                if (!dfs_results[i]) {
+                    results[index] = tl::unexpected(dfs_results[i].error());
+                    continue;
+                }
+                auto checksum_result = VerifyObjectChecksum(
+                    request.key, request.slices, request.descriptor.object_size,
+                    query_results[index].object_checksum);
+                if (!checksum_result) {
+                    results[index] = tl::unexpected(checksum_result.error());
+                    continue;
+                }
+                results[index] = {};
+            }
+        }
     }
 
     // Wait for all transfers to complete
@@ -4090,30 +4124,22 @@ ErrorCode Client::ReadDfsReplica(const std::string& key,
     if (!replica_descriptor.is_dfs_replica()) {
         return ErrorCode::INVALID_REPLICA;
     }
-    if (!dfs_storage_backend_ || !dfs_desc_cache_) {
-        LOG(ERROR) << "DFS backend/cache is not initialized";
-        return ErrorCode::INVALID_PARAMS;
+    if (!dfs_storage_backend_) {
+        LOG(ERROR) << "DFS backend is not initialized";
+        return ErrorCode::DFS_SERVICE_UNAVAILABLE;
     }
 
     const auto& desc = replica_descriptor.get_dfs_descriptor();
-    dfs_desc_cache_->Put(key, desc);
-
-    auto contiguous_range = GetContiguousSliceRange(slices);
-    if (!contiguous_range.has_value()) {
-        LOG(ERROR) << "DFS read requires contiguous destination slices";
-        return ErrorCode::INVALID_PARAMS;
+    std::vector<DfsReadRequest> requests{DfsReadRequest{key, desc, slices}};
+    auto results = dfs_storage_backend_->BatchRead(requests);
+    if (results.size() != 1) {
+        LOG(ERROR) << "DFS BatchRead response size mismatch for key " << key;
+        return ErrorCode::INTERNAL_ERROR;
     }
-    if (contiguous_range->size < desc.object_size) {
-        return ErrorCode::INVALID_PARAMS;
-    }
-
-    std::unordered_map<std::string, Slice> batch;
-    batch.emplace(key, Slice{contiguous_range->ptr, contiguous_range->size});
-    auto result = dfs_storage_backend_->BatchLoad(batch);
-    if (!result) {
+    if (!results[0]) {
         LOG(ERROR) << "DFS read failed for key " << key << ": "
-                   << result.error();
-        return result.error();
+                   << results[0].error();
+        return results[0].error();
     }
     return ErrorCode::OK;
 }

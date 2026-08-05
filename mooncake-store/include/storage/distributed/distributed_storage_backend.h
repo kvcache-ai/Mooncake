@@ -30,6 +30,12 @@ struct DfsWriteRequest {
     std::vector<Slice> slices;
 };
 
+struct DfsReadRequest {
+    std::string key;
+    DistributedFSDescriptor descriptor;
+    std::vector<Slice> slices;
+};
+
 /**
  * @brief Distributed filesystem storage backend.
  *
@@ -56,6 +62,11 @@ class DistributedStorageBackend : public StorageBackendInterface {
     std::vector<tl::expected<void, ErrorCode>> BatchWrite(
         const std::vector<DfsWriteRequest>& requests);
 
+    std::vector<tl::expected<void, ErrorCode>> BatchRead(
+        const std::vector<DfsReadRequest>& requests);
+
+    // Compatibility path for StorageBackendInterface callers. Shard-based DFS
+    // reads should prefer BatchRead so the descriptor remains request-scoped.
     tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batched_slices) override;
 

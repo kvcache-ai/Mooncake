@@ -15,7 +15,6 @@
 #include <vector>
 
 #include "hf3fs/hf3fs.h"
-#include "storage/distributed/dfs_descriptor_cache.h"
 #include "storage/distributed/dfs_global_allocator.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/hf3fs_adapter.h"
@@ -135,7 +134,7 @@ TEST_F(Hf3fsAdapterTest, WriteAtReadAtThroughUsrbio) {
     EXPECT_TRUE(adapter.Shutdown().has_value());
 }
 
-TEST_F(Hf3fsAdapterTest, DistributedBackendBatchOffloadAndLoad) {
+TEST_F(Hf3fsAdapterTest, DistributedBackendBatchWriteAndRead) {
     FileStorageConfig file_config;
     file_config.storage_backend_type = StorageBackendType::kDistributed;
     file_config.storage_filepath = test_dir_->path();
@@ -148,10 +147,8 @@ TEST_F(Hf3fsAdapterTest, DistributedBackendBatchOffloadAndLoad) {
     distributed_config.alignment = 4096;
     distributed_config.single_tenant = true;
 
-    auto desc_cache = std::make_shared<DfsDescriptorCache>();
     DistributedStorageBackend backend(file_config, distributed_config,
                                       std::make_unique<Hf3fsAdapter>());
-    backend.SetDescriptorCache(desc_cache);
     ASSERT_TRUE(backend.Init().has_value());
 
     alignas(4096) std::array<char, 4096> write_buf;
@@ -163,22 +160,17 @@ TEST_F(Hf3fsAdapterTest, DistributedBackendBatchOffloadAndLoad) {
         "dfs_shard_" +
         DfsGlobalAllocator::FormatShardIdx(0, distributed_config.shard_count) +
         ".data");
-    desc_cache->Put(key,
-                    {shard_path, 0, write_buf.size(), write_buf.size(), 0});
+    DistributedFSDescriptor descriptor{shard_path, 0, write_buf.size(),
+                                       write_buf.size(), 0};
+    auto write = backend.BatchWrite(
+        {{key, descriptor, {{write_buf.data(), write_buf.size()}}}});
+    ASSERT_EQ(write.size(), 1);
+    ASSERT_TRUE(write[0].has_value());
 
-    std::unordered_map<std::string, std::vector<Slice>> offload_batch;
-    offload_batch[key] = {{write_buf.data(), write_buf.size()}};
-    auto offload = backend.BatchOffload(
-        offload_batch,
-        [](const std::vector<std::string>&,
-           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
-    ASSERT_TRUE(offload.has_value());
-    EXPECT_EQ(*offload, 1);
-
-    std::unordered_map<std::string, Slice> load_batch;
-    load_batch[key] = {read_buf.data(), read_buf.size()};
-    auto load = backend.BatchLoad(load_batch);
-    ASSERT_TRUE(load.has_value());
+    auto read = backend.BatchRead(
+        {{key, descriptor, {{read_buf.data(), read_buf.size()}}}});
+    ASSERT_EQ(read.size(), 1);
+    ASSERT_TRUE(read[0].has_value());
     EXPECT_EQ(std::memcmp(write_buf.data(), read_buf.data(), write_buf.size()),
               0);
 }

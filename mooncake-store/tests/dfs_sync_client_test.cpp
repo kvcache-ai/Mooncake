@@ -123,11 +123,33 @@ class DfsSyncClientTest : public ::testing::Test {
         return config;
     }
 
+    tl::expected<QueryResult, ErrorCode> QueryDfsOnly(const std::string& key) {
+        auto query = writer_->Query(key);
+        if (!query) {
+            return tl::make_unexpected(query.error());
+        }
+        std::vector<Replica::Descriptor> replicas;
+        for (const auto& replica : query->replicas) {
+            if (replica.is_dfs_replica()) {
+                replicas.push_back(replica);
+            }
+        }
+        if (replicas.empty()) {
+            return tl::make_unexpected(ErrorCode::INVALID_REPLICA);
+        }
+        return QueryResult(std::move(replicas), query->lease_timeout,
+                           query->object_checksum);
+    }
+
     void ExpectDfsValue(const std::string& key, const std::string& expected) {
+        auto query = QueryDfsOnly(key);
+        ASSERT_TRUE(query.has_value());
         std::vector<char> output(expected.size());
-        std::unordered_map<std::string, Slice> slices;
-        slices.emplace(key, Slice{output.data(), output.size()});
-        ASSERT_TRUE(backend_->BatchLoad(slices).has_value());
+        const auto& descriptor = query->replicas[0].get_dfs_descriptor();
+        auto results = backend_->BatchRead(
+            {{key, descriptor, {{output.data(), output.size()}}}});
+        ASSERT_EQ(results.size(), 1);
+        ASSERT_TRUE(results[0].has_value());
         EXPECT_EQ(std::memcmp(output.data(), expected.data(), expected.size()),
                   0);
     }
@@ -258,6 +280,90 @@ TEST_F(DfsSyncClientTest, MissingDfsBackendRevokesObject) {
     auto query = client_without_backend->Query("sync_no_backend");
     ASSERT_FALSE(query.has_value());
     EXPECT_EQ(query.error(), ErrorCode::OBJECT_NOT_FOUND);
+}
+
+TEST_F(DfsSyncClientTest, GetReadsDfsIntoMultipleSlices) {
+    const std::string key = "dfs_multi_slice_get";
+    std::string value(4096, 'M');
+    std::vector<Slice> write_slices{{value.data(), value.size()}};
+    ASSERT_TRUE(writer_->Put(key, write_slices, DfsConfig()).has_value());
+
+    auto query = QueryDfsOnly(key);
+    ASSERT_TRUE(query.has_value());
+    std::vector<char> first(1024), second(3072);
+    std::vector<Slice> read_slices{{first.data(), first.size()},
+                                   {second.data(), second.size()}};
+    ASSERT_TRUE(writer_->Get(key, *query, read_slices).has_value());
+    EXPECT_EQ(std::memcmp(value.data(), first.data(), first.size()), 0);
+    EXPECT_EQ(
+        std::memcmp(value.data() + first.size(), second.data(), second.size()),
+        0);
+}
+
+TEST_F(DfsSyncClientTest, BatchGetUsesExplicitDfsDescriptors) {
+    std::vector<std::string> keys{"dfs_batch_read_0", "dfs_batch_read_1"};
+    std::vector<std::string> values{std::string(4096, 'N'),
+                                    std::string(4096, 'O')};
+    auto write_slices = MakeSlices(values);
+    auto put_results = writer_->BatchPut(keys, write_slices, DfsConfig());
+    ASSERT_EQ(put_results.size(), keys.size());
+    ASSERT_TRUE(put_results[0].has_value());
+    ASSERT_TRUE(put_results[1].has_value());
+
+    std::vector<QueryResult> queries;
+    queries.reserve(keys.size());
+    for (const auto& key : keys) {
+        auto query = QueryDfsOnly(key);
+        ASSERT_TRUE(query.has_value());
+        queries.push_back(*query);
+    }
+
+    // Point the compatibility cache at the other key. BatchGet must still use
+    // the descriptor carried by each QueryResult.
+    backend_->GetDescriptorCache()->Put(
+        keys[0], queries[1].replicas[0].get_dfs_descriptor());
+
+    std::vector<std::string> output{std::string(4096, '\0'),
+                                    std::string(4096, '\0')};
+    std::unordered_map<std::string, std::vector<Slice>> read_slices;
+    for (size_t i = 0; i < keys.size(); ++i) {
+        read_slices[keys[i]] = {{output[i].data(), output[i].size()}};
+    }
+    auto get_results = writer_->BatchGet(keys, queries, read_slices);
+    ASSERT_EQ(get_results.size(), keys.size());
+    ASSERT_TRUE(get_results[0].has_value());
+    ASSERT_TRUE(get_results[1].has_value());
+    EXPECT_EQ(output[0], values[0]);
+    EXPECT_EQ(output[1], values[1]);
+}
+
+TEST_F(DfsSyncClientTest, BatchGetVerifiesDfsChecksum) {
+    const char* checksum_enabled = std::getenv("MOONCAKE_STORE_CHECKSUM");
+    if (checksum_enabled == nullptr || std::string(checksum_enabled) != "1") {
+        GTEST_SKIP() << "MOONCAKE_STORE_CHECKSUM is not enabled";
+    }
+
+    const std::string key = "dfs_batch_checksum";
+    std::string value(4096, 'P');
+    std::vector<Slice> write_slices{{value.data(), value.size()}};
+    ASSERT_TRUE(writer_->Put(key, write_slices, DfsConfig()).has_value());
+
+    auto query = QueryDfsOnly(key);
+    ASSERT_TRUE(query.has_value());
+    ASSERT_TRUE(query->object_checksum.has_value());
+    std::vector<Replica::Descriptor> replicas = query->replicas;
+    std::vector<QueryResult> queries;
+    queries.emplace_back(
+        std::move(replicas), query->lease_timeout,
+        std::optional<uint64_t>(*query->object_checksum ^ uint64_t{1}));
+
+    std::string output(value.size(), '\0');
+    std::unordered_map<std::string, std::vector<Slice>> read_slices;
+    read_slices[key] = {{output.data(), output.size()}};
+    auto results = writer_->BatchGet({key}, queries, read_slices);
+    ASSERT_EQ(results.size(), 1);
+    ASSERT_FALSE(results[0].has_value());
+    EXPECT_EQ(results[0].error(), ErrorCode::CHECKSUM_MISMATCH);
 }
 
 }  // namespace mooncake::test

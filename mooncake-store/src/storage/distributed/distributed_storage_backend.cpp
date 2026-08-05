@@ -1,5 +1,6 @@
 #include "storage/distributed/distributed_storage_backend.h"
 
+#include <algorithm>
 #include <filesystem>
 #include <limits>
 
@@ -297,6 +298,104 @@ DistributedStorageBackend::BatchWrite(
                          << ", actual=" << *write_result;
             results.emplace_back(
                 tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL));
+            continue;
+        }
+        results.emplace_back();
+    }
+    return results;
+}
+
+std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
+    const std::vector<DfsReadRequest>& requests) {
+    std::vector<tl::expected<void, ErrorCode>> results;
+    results.reserve(requests.size());
+
+    if (!initialized_) {
+        LOG(ERROR) << "DistributedStorageBackend is not initialized";
+        results.assign(requests.size(),
+                       tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE));
+        return results;
+    }
+
+    for (const auto& request : requests) {
+        const auto& desc = request.descriptor;
+        if (desc.shard_idx < 0 ||
+            desc.shard_idx >= static_cast<int>(shard_files_.size())) {
+            LOG(ERROR) << "Invalid DFS shard_idx " << desc.shard_idx
+                       << " for key " << request.key;
+            results.emplace_back(
+                tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+            continue;
+        }
+
+        auto& shard = *shard_files_[desc.shard_idx];
+        if (desc.file_path != shard.path) {
+            LOG(ERROR) << "DFS path mismatch for key " << request.key
+                       << ", descriptor=" << desc.file_path
+                       << ", configured=" << shard.path;
+            results.emplace_back(
+                tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+            continue;
+        }
+        if (!IsDfsDescriptorRangeValid(desc, distributed_config_)) {
+            LOG(ERROR) << "Invalid DFS descriptor range for key " << request.key
+                       << ", offset=" << desc.offset
+                       << ", object_size=" << desc.object_size
+                       << ", aligned_size=" << desc.aligned_size
+                       << ", shard_capacity="
+                       << distributed_config_.shard_capacity;
+            results.emplace_back(
+                tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+            continue;
+        }
+        if (desc.object_size > std::numeric_limits<size_t>::max() ||
+            request.slices.size() >
+                static_cast<size_t>(std::numeric_limits<int>::max())) {
+            results.emplace_back(
+                tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+            continue;
+        }
+
+        std::vector<iovec> iovs;
+        iovs.reserve(request.slices.size());
+        size_t remaining = static_cast<size_t>(desc.object_size);
+        bool invalid = false;
+        for (const auto& slice : request.slices) {
+            if (!slice.ptr && slice.size > 0) {
+                invalid = true;
+                break;
+            }
+            if (remaining == 0 || slice.size == 0) {
+                continue;
+            }
+            const size_t read_size = std::min(slice.size, remaining);
+            iovs.push_back({slice.ptr, read_size});
+            remaining -= read_size;
+        }
+        if (invalid || remaining != 0) {
+            LOG(WARNING) << "Invalid DFS read request for key " << request.key
+                         << ", expected capacity at least=" << desc.object_size;
+            results.emplace_back(
+                tl::make_unexpected(ErrorCode::INVALID_PARAMS));
+            continue;
+        }
+
+        std::lock_guard lock(shard.mutex);
+        auto read_result = fs_adapter_->ReadAt(
+            shard.fd, iovs.data(), static_cast<int>(iovs.size()),
+            static_cast<int64_t>(desc.offset));
+        if (!read_result) {
+            LOG(WARNING) << "DFS read failed for key " << request.key
+                         << ", error=" << read_result.error();
+            results.emplace_back(tl::make_unexpected(read_result.error()));
+            continue;
+        }
+        if (*read_result != desc.object_size) {
+            LOG(WARNING) << "DFS short read for key " << request.key
+                         << ", expected=" << desc.object_size
+                         << ", actual=" << *read_result;
+            results.emplace_back(
+                tl::make_unexpected(ErrorCode::FILE_READ_FAIL));
             continue;
         }
         results.emplace_back();
