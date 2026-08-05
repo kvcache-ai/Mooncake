@@ -156,7 +156,6 @@ struct MasterConfig {
     bool kv_events_emit_legacy_compat = true;
     bool kv_events_emit_object_key = true;
     uint32_t kv_events_queue_capacity = 65536;
->>>>>>> upstream/main
 };
 
 class MasterServiceSupervisorConfig {
@@ -256,7 +255,6 @@ class MasterServiceSupervisorConfig {
     bool kv_events_emit_legacy_compat = true;
     bool kv_events_emit_object_key = true;
     uint32_t kv_events_queue_capacity = 65536;
->>>>>>> upstream/main
 
     // Pod identity for K8s label-based routing
     std::string pod_name;
@@ -501,7 +499,6 @@ class WrappedMasterServiceConfig {
     bool kv_events_emit_legacy_compat = true;
     bool kv_events_emit_object_key = true;
     uint32_t kv_events_queue_capacity = 65536;
->>>>>>> upstream/main
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     // OpLog store configuration
@@ -1155,7 +1152,6 @@ class MasterServiceConfig {
     bool kv_events_emit_legacy_compat = true;
     bool kv_events_emit_object_key = true;
     uint32_t kv_events_queue_capacity = 65536;
->>>>>>> upstream/main
     std::string ha_backend_type = "etcd";
     std::string ha_backend_connstring;
     // OpLog store configuration
