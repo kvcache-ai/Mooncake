@@ -45,7 +45,8 @@ class WorkerPool;
 class ConnectionLimiter {
    public:
     explicit ConnectionLimiter(int max_concurrent)
-        : max_concurrent_(max_concurrent), current_(0) {}
+        : max_concurrent_(max_concurrent > 0 ? max_concurrent : 1),
+          current_(0) {}
 
     void acquire() {
         std::unique_lock<std::mutex> lock(mu_);
@@ -55,6 +56,7 @@ class ConnectionLimiter {
 
     void release() {
         std::unique_lock<std::mutex> lock(mu_);
+        if (current_ <= 0) return;
         --current_;
         cv_.notify_one();
     }
@@ -181,6 +183,21 @@ class RdmaTransport : public Transport {
     std::string rdma_server_name_;
     std::mutex local_desc_lock_;
     std::unique_ptr<ConnectionLimiter> connection_limiter_;
+};
+
+// RAII guard that holds a handshake slot for its lifetime, guaranteeing the
+// slot is released even if the handshake path throws or returns early.
+class HandshakeSlotGuard {
+   public:
+    explicit HandshakeSlotGuard(RdmaTransport &engine) : engine_(engine) {
+        engine_.acquireHandshakeSlot();
+    }
+    ~HandshakeSlotGuard() { engine_.releaseHandshakeSlot(); }
+    HandshakeSlotGuard(const HandshakeSlotGuard &) = delete;
+    HandshakeSlotGuard &operator=(const HandshakeSlotGuard &) = delete;
+
+   private:
+    RdmaTransport &engine_;
 };
 
 using TransferRequest = Transport::TransferRequest;

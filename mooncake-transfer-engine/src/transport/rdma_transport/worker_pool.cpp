@@ -16,7 +16,10 @@
 
 #include <sys/epoll.h>
 
+#include <algorithm>
 #include <cassert>
+#include <chrono>
+#include <thread>
 
 #include "config.h"
 #include "memory_location.h"
@@ -336,6 +339,7 @@ void WorkerPool::performPostSend(int thread_id) {
 #endif
 
     SliceList failed_slice_list;
+    SliceList backoff_slice_list;
     for (auto &entry : local_slice_queue) {
         if (entry.second.empty()) continue;
 
@@ -359,8 +363,10 @@ void WorkerPool::performPostSend(int thread_id) {
         if (!endpoint->connected()) {
             // Check handshake backoff before attempting connection
             if (isInHandshakeBackoff(entry.first)) {
+                // The rail is temporarily backing off; requeue these slices
+                // without consuming their retry budget.
                 for (auto &slice : entry.second)
-                    failed_slice_list.push_back(slice);
+                    backoff_slice_list.push_back(slice);
                 entry.second.clear();
                 continue;
             }
@@ -400,6 +406,13 @@ void WorkerPool::performPostSend(int thread_id) {
         if (!retry_list.empty()) {
             redispatch(retry_list, thread_id);
         }
+    }
+
+    if (!backoff_slice_list.empty()) {
+        // Sleep briefly to avoid busy-spinning while the rail backs off,
+        // then redispatch without touching the slices' retry budget.
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        redispatch(backoff_slice_list, thread_id);
     }
 }
 

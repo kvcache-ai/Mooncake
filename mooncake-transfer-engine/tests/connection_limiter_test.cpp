@@ -91,5 +91,43 @@ TEST(ConnectionLimiterTest, SequentialAcquireReleaseDoesNotDeadlock) {
     SUCCEED();
 }
 
+// A non-positive limit is clamped to 1, so acquire() must not block forever.
+TEST(ConnectionLimiterTest, NonPositiveLimitClampedToOne) {
+    ConnectionLimiter zero_limiter(0);
+    zero_limiter.acquire();
+    zero_limiter.release();
+
+    ConnectionLimiter negative_limiter(-5);
+    negative_limiter.acquire();
+    negative_limiter.release();
+    SUCCEED();
+}
+
+// Extra release() calls must not underflow the counter and thereby allow
+// more concurrent holders than the configured limit.
+TEST(ConnectionLimiterTest, ExtraReleaseDoesNotBreakLimit) {
+    ConnectionLimiter limiter(1);
+    limiter.release();  // Spurious release on an empty limiter.
+    limiter.release();
+
+    limiter.acquire();  // Take the only slot.
+
+    std::atomic<bool> second_acquired{false};
+    auto fut = std::async(std::launch::async, [&]() {
+        limiter.acquire();
+        second_acquired.store(true);
+        limiter.release();
+    });
+
+    // If release() underflowed, the second acquire would succeed immediately.
+    EXPECT_EQ(fut.wait_for(std::chrono::milliseconds(100)),
+              std::future_status::timeout);
+    EXPECT_FALSE(second_acquired.load());
+
+    limiter.release();
+    ASSERT_EQ(fut.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    EXPECT_TRUE(second_acquired.load());
+}
+
 }  // namespace
 }  // namespace mooncake

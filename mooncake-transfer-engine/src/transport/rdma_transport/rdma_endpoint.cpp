@@ -396,11 +396,14 @@ int RdmaEndPoint::setupConnectionsByActive() {
 
         // Perform the RPC without holding the lock to avoid deadlock and allow
         // "simultaneous open" handshake handling.
-        // Acquire a handshake slot to limit concurrent connection storms.
-        context_.engine().acquireHandshakeSlot();
-        int rc = context_.engine().sendHandshake(peer_server_name, local_desc,
+        int rc;
+        {
+            // Hold a handshake slot for the RPC duration to limit concurrent
+            // connection storms; RAII guarantees release on any exit path.
+            HandshakeSlotGuard slot_guard(context_.engine());
+            rc = context_.engine().sendHandshake(peer_server_name, local_desc,
                                                  peer_desc);
-        context_.engine().releaseHandshakeSlot();
+        }
 
         // We should check the RPC return code before comparing
         // `peer_qp_num_list_` with `peer_desc.qp_num`, since a failed RPC may

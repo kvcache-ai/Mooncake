@@ -189,7 +189,7 @@ TEST_F(PkeyIndexEnvTest, MaxConcurrentHandshakesNegativeIsIgnored) {
     EXPECT_EQ(config.max_concurrent_handshakes, 8);
 }
 
-TEST_F(PkeyIndexEnvTest, MaxConcurrentHandshakesNonNumericKeepsDefault) {
+TEST_F(PkeyIndexEnvTest, MaxConcurrentHandshakesNonNumericKeepsExistingValue) {
     ASSERT_EQ(::setenv("MC_MAX_CONCURRENT_HANDSHAKES", "abc", 1), 0);
     GlobalConfig config;
     config.max_concurrent_handshakes = 8;
