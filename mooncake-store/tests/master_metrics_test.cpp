@@ -831,9 +831,9 @@ TEST_F(MasterMetricsTest, PromotionBudgetDiagnosticsAreExported) {
               std::string::npos);
 
     const std::string summary = metrics.get_summary_string();
-    EXPECT_NE(summary.find("within_budget=" +
-                           std::to_string(within_before + 2)),
-              std::string::npos);
+    EXPECT_NE(
+        summary.find("within_budget=" + std::to_string(within_before + 2)),
+        std::string::npos);
     EXPECT_NE(summary.find("late=" + std::to_string(late_before + 3)),
               std::string::npos);
 }
