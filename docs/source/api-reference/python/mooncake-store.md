@@ -1919,6 +1919,12 @@ def create_copy_task(self, key: str, targets: List[str]) -> Tuple[UUID, int]
   - If successful: (task UUID, 0)
   - If failed: (UUID{0, 0}, error code)
 
+**Task lifecycle and failure behavior:**
+- New tasks start in `TaskStatus.PENDING`, move to `TaskStatus.PROCESSING` after a client picks them up, and finish as `TaskStatus.SUCCESS` or `TaskStatus.FAILED`.
+- The task payload is executed by a storage client in the background; the client reports the final status back to the master automatically.
+- Only allocation-pressure failures (`NO_AVAILABLE_HANDLE`) are retried automatically by the client, up to the master-side `max_retry_attempts` setting.
+- Submission can fail immediately with errors such as `TASK_PENDING_LIMIT_EXCEEDED` when the master-side pending queue is full.
+
 **Example:**
 ```python
 # Create an asynchronous copy task
@@ -1953,6 +1959,11 @@ def create_move_task(self, key: str, source: str, target: str) -> Tuple[UUID, in
   - If successful: (task UUID, 0)
   - If failed: (UUID{0, 0}, error code)
 
+**Task lifecycle and failure behavior:**
+- Move tasks use the same state machine as copy tasks: `PENDING -> PROCESSING -> SUCCESS/FAILED`.
+- Only `NO_AVAILABLE_HANDLE` failures are retried automatically; failures such as missing objects or replicas are reported directly as `FAILED`.
+- Timeout and retry behavior is controlled on the master side rather than by the Python client API.
+
 **Example:**
 ```python
 # Create an asynchronous move task
@@ -1984,6 +1995,26 @@ def query_task(self, task_id: UUID) -> Tuple[QueryTaskResponse | None, int]
 - `Tuple[QueryTaskResponse | None, int]`: (QueryTaskResponse if success, error code)
   - If successful: (QueryTaskResponse, 0)
   - If failed: (None, error code)
+
+`QueryTaskResponse` includes:
+- `id`: task UUID
+- `type`: `TaskType.REPLICA_COPY` or `TaskType.REPLICA_MOVE`
+- `status`: `TaskStatus.PENDING`, `TaskStatus.PROCESSING`, `TaskStatus.SUCCESS`, or `TaskStatus.FAILED`
+- `created_at_ms_epoch`: creation timestamp in milliseconds
+- `last_updated_at_ms_epoch`: last state-change timestamp in milliseconds
+- `assigned_client`: UUID of the client currently assigned to the task
+- `message`: completion or failure message
+
+Typical query-time failures include:
+- `TASK_NOT_FOUND`: the task ID does not exist or the finished task has already been pruned from the master's in-memory history
+
+**Master-side task manager settings affecting task APIs:**
+- `--max_total_finished_tasks`: number of completed tasks retained for later `query_task` calls
+- `--max_total_pending_tasks`: maximum queued tasks before submissions fail with `TASK_PENDING_LIMIT_EXCEEDED`
+- `--max_total_processing_tasks`: cap on concurrently processing tasks
+- `--pending_task_timeout_sec`: how long a task may stay in `PENDING` before being failed by the master (`0` disables this timeout)
+- `--processing_task_timeout_sec`: how long a task may stay in `PROCESSING` before being failed by the master (`0` disables this timeout)
+- `--max_retry_attempts`: retry budget used only for `NO_AVAILABLE_HANDLE` execution failures
 
 **Example:**
 ```python
