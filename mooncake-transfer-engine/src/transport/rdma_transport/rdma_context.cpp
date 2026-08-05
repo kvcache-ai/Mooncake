@@ -27,6 +27,7 @@
 #include <cassert>
 #include <exception>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <thread>
 
@@ -724,6 +725,31 @@ RdmaContext::findMemoryRegionContaining(uintptr_t addr) const {
 
 std::shared_ptr<RdmaEndPoint> RdmaContext::endpoint(
     const std::string &peer_nic_path) {
+    if (cq_list_.empty()) {
+        LOG(ERROR) << "No CQ available for endpoint on " << deviceName();
+        return nullptr;
+    }
+
+    const auto &config = globalConfig();
+    if (config.workers_per_ctx <= 0) {
+        LOG(ERROR) << "Invalid workers_per_ctx=" << config.workers_per_ctx
+                   << " for endpoint on " << deviceName();
+        return nullptr;
+    }
+    int owner_thread =
+        static_cast<int>(std::hash<std::string>{}(peer_nic_path) %
+                         static_cast<size_t>(config.workers_per_ctx));
+    int cq_index = owner_thread % static_cast<int>(cq_list_.size());
+    return endpoint(peer_nic_path, cq_index);
+}
+
+std::shared_ptr<RdmaEndPoint> RdmaContext::endpoint(
+    const std::string &peer_nic_path, int cq_index) {
+    if (cq_list_.empty()) {
+        LOG(ERROR) << "No CQ available for endpoint on " << deviceName();
+        return nullptr;
+    }
+
     if (!active_.load(std::memory_order_acquire)) {
         LOG(ERROR) << "Context is not active: " << deviceName();
         return nullptr;
@@ -739,7 +765,8 @@ std::shared_ptr<RdmaEndPoint> RdmaContext::endpoint(
         return endpoint;
     }
 
-    endpoint = endpoint_store_->insertEndpoint(peer_nic_path, this);
+    endpoint =
+        endpoint_store_->insertEndpoint(peer_nic_path, this, cq(cq_index));
     endpoint_store_->reclaimEndpoint();
     return endpoint;
 }
@@ -825,6 +852,12 @@ int RdmaContext::gidIndex() const {
 ibv_cq *RdmaContext::cq() {
     int index = (next_cq_list_index_++) % cq_list_.size();
     return cq_list_[index].native;
+}
+
+ibv_cq *RdmaContext::cq(int cq_index) {
+    if (cq_list_.empty()) return nullptr;
+    if (cq_index < 0) return cq();
+    return cq_list_[static_cast<size_t>(cq_index) % cq_list_.size()].native;
 }
 
 ibv_comp_channel *RdmaContext::compChannel() {

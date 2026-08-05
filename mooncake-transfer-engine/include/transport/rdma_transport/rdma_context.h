@@ -173,6 +173,8 @@ class RdmaContext {
    public:
     // EndPoint Management
     std::shared_ptr<RdmaEndPoint> endpoint(const std::string &peer_nic_path);
+    std::shared_ptr<RdmaEndPoint> endpoint(const std::string &peer_nic_path,
+                                           int cq_index);
 
     std::shared_ptr<RdmaEndPoint> getEndpointByPtr(
         const RdmaEndPoint *endpoint_ptr);
@@ -261,6 +263,7 @@ class RdmaContext {
     int eventFd() const { return event_fd_; }
 
     ibv_cq *cq();
+    ibv_cq *cq(int cq_index);
 
     std::atomic<int> *cqOutstandingCount(int cq_index) {
         return &cq_list_[cq_index].outstanding;
