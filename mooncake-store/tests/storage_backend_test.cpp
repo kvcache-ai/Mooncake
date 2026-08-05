@@ -2356,8 +2356,7 @@ TEST_F(StorageBackendTest, BucketStorageBackend_DuplicateBatchPartialSkip) {
 
 //-----------------------------------------------------------------------------
 
-TEST_F(StorageBackendTest,
-       BucketEvictionDoesNotReportSkippedDuplicateKeys) {
+TEST_F(StorageBackendTest, BucketEvictionDoesNotReportSkippedDuplicateKeys) {
     FileStorageConfig config;
     config.storage_filepath = data_path;
     BucketBackendConfig bucket_config;
@@ -2375,8 +2374,9 @@ TEST_F(StorageBackendTest,
     std::unordered_map<std::string, std::vector<Slice>> batch1;
     batch1.emplace(keyA, std::vector<Slice>{Slice{bufA.get(), 6 * 1024}});
     auto result1 = storage_backend.BatchOffload(
-        batch1, [](const std::vector<std::string>&,
-                   std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+        batch1,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
     ASSERT_TRUE(result1.has_value());
 
     // Re-offload keyA (skipped as a duplicate) together with keyB. The new
@@ -2389,8 +2389,9 @@ TEST_F(StorageBackendTest,
     batch2.emplace(keyA, std::vector<Slice>{Slice{bufA.get(), 6 * 1024}});
     batch2.emplace(keyB, std::vector<Slice>{Slice{bufB.get(), 6 * 1024}});
     auto result2 = storage_backend.BatchOffload(
-        batch2, [](const std::vector<std::string>&,
-                   std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+        batch2,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
     ASSERT_TRUE(result2.has_value());
 
     // Read keyA so the older bucket is LRU-hotter than the new one.
@@ -2398,7 +2399,6 @@ TEST_F(StorageBackendTest,
     std::unordered_map<std::string, Slice> load;
     load.emplace(keyA, Slice{read_buf.get(), 6 * 1024});
     ASSERT_TRUE(storage_backend.BatchLoad(load).has_value());
-
 
     // The new (now colder) bucket is evicted. keyA must NOT be reported to
     // the master: its index entry points at the still-alive older bucket,
