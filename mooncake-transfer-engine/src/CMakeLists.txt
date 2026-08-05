@@ -1,7 +1,6 @@
 file(GLOB ENGINE_SOURCES "*.cpp" "shared_segment/*.cpp")
 set(TRANSFER_METADATA_PLUGIN_SOURCES config.cpp transfer_metadata_plugin.cpp)
-list(REMOVE_ITEM ENGINE_SOURCES
-     "${CMAKE_CURRENT_SOURCE_DIR}/config.cpp"
+list(REMOVE_ITEM ENGINE_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/config.cpp"
      "${CMAKE_CURRENT_SOURCE_DIR}/transfer_metadata_plugin.cpp")
 add_subdirectory(common)
 add_subdirectory(transport)
@@ -14,7 +13,7 @@ if(USE_HIP)
   hipify_files(ENGINE_SOURCES)
 endif()
 
-add_library(transfer_metadata_plugin STATIC ${TRANSFER_METADATA_PLUGIN_SOURCES})
+add_library(transfer_metadata_plugin OBJECT ${TRANSFER_METADATA_PLUGIN_SOURCES})
 set_target_properties(transfer_metadata_plugin
                       PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(
@@ -23,9 +22,10 @@ target_include_directories(
          $<INSTALL_INTERFACE:include>)
 target_compile_definitions(transfer_metadata_plugin PRIVATE MOONCAKE_USE_ETCD
                                                             CMAKE_INCLUDE)
-target_link_libraries(transfer_metadata_plugin PUBLIC glog::glog
-                                                      JsonCpp::JsonCpp
-                                               PRIVATE pthread)
+target_link_libraries(
+  transfer_metadata_plugin
+  PUBLIC glog::glog JsonCpp::JsonCpp
+  PRIVATE pthread)
 if(USE_ETCD)
   if(USE_ETCD_LEGACY)
     if(USE_STATIC_ETCD_CPP_API)
@@ -86,11 +86,14 @@ if(USE_BAREX)
 endif()
 
 if(USE_CUDA)
-  target_include_directories(transfer_engine PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+  target_include_directories(transfer_engine
+                             PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
   if(USE_CXI)
-    target_link_libraries(transfer_engine PUBLIC CUDA::cuda_driver CUDA::cudart rt)
+    target_link_libraries(transfer_engine PUBLIC CUDA::cuda_driver CUDA::cudart
+                                                 rt)
   else()
-    target_link_libraries(transfer_engine PUBLIC CUDA::cuda_driver CUDA::cudart rt mlx5)
+    target_link_libraries(transfer_engine PUBLIC CUDA::cuda_driver CUDA::cudart
+                                                 rt mlx5)
   endif()
   if(USE_NVMEOF)
     target_link_libraries(transfer_engine PUBLIC nvmeof_transport cufile)
@@ -142,9 +145,9 @@ if(USE_HIP)
       # compiled in the rdma_transport OBJECT library and pulled into
       # transfer_engine via $<TARGET_OBJECTS:transport>. A PRIVATE define on
       # transfer_engine never reaches that object compilation, so the dmabuf
-      # path is silently compiled out and GPU MRs fall back to plain
-      # ibv_reg_mr (EINVAL on device memory). Put the define (and the hsa
-      # include/link usage requirements) on the target that actually compiles
+      # path is silently compiled out and GPU MRs fall back to plain ibv_reg_mr
+      # (EINVAL on device memory). Put the define (and the hsa include/link
+      # usage requirements) on the target that actually compiles
       # rdma_context.cpp.
       target_compile_definitions(rdma_transport PRIVATE USE_HIP_DMABUF)
       target_link_libraries(rdma_transport PUBLIC hsa-runtime64::hsa-runtime64)
@@ -210,5 +213,8 @@ endif()
 
 if(USE_UB)
   message(STATUS "Enabled USE_UB protocol support")
-  target_link_libraries(transfer_engine PUBLIC ub_transport)
+  target_link_libraries(
+    transfer_engine
+    PUBLIC ub_transport
+    PRIVATE ub_allocator)
 endif()

@@ -111,8 +111,7 @@ endif()
 
 set(KV_EVENTS_ZMQ_FOUND FALSE)
 if(ENABLE_KV_EVENTS)
-  list(APPEND MOONCAKE_STORE_MASTER_SOURCES
-       kv_event/kv_event_publisher.cpp)
+  list(APPEND MOONCAKE_STORE_MASTER_SOURCES kv_event/kv_event_publisher.cpp)
   set(KV_EVENTS_ZMQ_FOUND TRUE)
 endif()
 
@@ -227,8 +226,7 @@ endif()
 # Resolve target-independent configuration before defining the Store targets.
 set(MOONCAKE_STORE_INCLUDE_DIRS
     ${MOONCAKE_STORE_INCLUDE_ROOT}/mooncake-store/proto
-    ${MOONCAKE_STORE_INCLUDE_ROOT}
-    ${CMAKE_CURRENT_BINARY_DIR}/../include
+    ${MOONCAKE_STORE_INCLUDE_ROOT} ${CMAKE_CURRENT_BINARY_DIR}/../include
     ${ETCD_WRAPPER_INCLUDE})
 
 set(MASTER_EXTRA_INCS)
@@ -272,6 +270,9 @@ target_link_libraries(
           yalantinglibs::yalantinglibs)
 if(STORE_USE_ETCD)
   add_dependencies(mooncake_store_shared_objects build_etcd_wrapper)
+endif()
+if(USE_UB)
+  target_link_libraries(mooncake_store_shared_objects PRIVATE ub_allocator)
 endif()
 
 # Sources used by mooncake_master and the complete mooncake_store library.
@@ -340,7 +341,8 @@ if(USE_NOF)
 endif()
 if(TARGET liburing::liburing)
   target_compile_definitions(mooncake_store_client_objects PRIVATE USE_URING)
-  target_link_libraries(mooncake_store_client_objects PRIVATE liburing::liburing)
+  target_link_libraries(mooncake_store_client_objects
+                        PRIVATE liburing::liburing)
 endif()
 if(STORE_USE_ETCD)
   add_dependencies(mooncake_store_client_objects build_etcd_wrapper)
@@ -389,12 +391,16 @@ endif()
 if(STORE_USE_REDIS)
   target_link_libraries(mooncake_store_master PRIVATE hiredis::hiredis)
 endif()
+if(USE_UB)
+  target_link_libraries(mooncake_store_master PRIVATE ub_allocator)
+endif()
 
 # Complete public Store library.
 add_library(
-  mooncake_store $<TARGET_OBJECTS:mooncake_store_shared_objects>
-                 $<TARGET_OBJECTS:mooncake_store_master_objects>
-                 $<TARGET_OBJECTS:mooncake_store_client_objects>)
+  mooncake_store
+  $<TARGET_OBJECTS:mooncake_store_shared_objects>
+  $<TARGET_OBJECTS:mooncake_store_master_objects>
+  $<TARGET_OBJECTS:mooncake_store_client_objects>)
 target_include_directories(mooncake_store PUBLIC ${MOONCAKE_STORE_INCLUDE_DIRS})
 target_link_libraries(
   mooncake_store
@@ -502,8 +508,8 @@ endif()
 install(TARGETS mooncake_client DESTINATION bin)
 
 # ---------------------------------------------------------------------------
-# Optional: a self-contained libmooncake_store.so exporting only the store_c.h
-# C ABI, for consumers that dlopen the store (e.g. the Rust crate's `dlopen`
+# Optional: a self-contained libmooncake_store.so exporting only the store_c.h C
+# ABI, for consumers that dlopen the store (e.g. the Rust crate's `dlopen`
 # feature). Whole-archives the static mooncake_store + asio_static (objects are
 # -fPIC, see mooncake-common/common.cmake) and localizes everything else via the
 # version script; only system/toolkit libs (and the Go etcd/k8s backends when
@@ -513,15 +519,13 @@ if(WITH_STORE_C_SHARED)
   # ELF/GNU-ld features (--whole-archive, --as-needed, version script, $ORIGIN);
   # supported by GNU ld, gold, and lld. Linux only.
   if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    message(
-      FATAL_ERROR
-        "WITH_STORE_C_SHARED currently supports Linux/ELF only "
-        "(got CMAKE_SYSTEM_NAME=${CMAKE_SYSTEM_NAME}).")
+    message(FATAL_ERROR "WITH_STORE_C_SHARED currently supports Linux/ELF only "
+                        "(got CMAKE_SYSTEM_NAME=${CMAKE_SYSTEM_NAME}).")
   endif()
 
-  # We whole-archive mooncake_store and reuse its name, so require it to be static
-  # (add_library(mooncake_store) follows BUILD_SHARED_LIBS, which some backends
-  # force ON).
+  # We whole-archive mooncake_store and reuse its name, so require it to be
+  # static (add_library(mooncake_store) follows BUILD_SHARED_LIBS, which some
+  # backends force ON).
   get_target_property(_mooncake_store_type mooncake_store TYPE)
   if(NOT _mooncake_store_type STREQUAL "STATIC_LIBRARY")
     message(
