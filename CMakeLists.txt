@@ -102,6 +102,10 @@ endif()
 
 option(EP_USE_IDE "Enable intelligent indexing for IDEs" OFF)
 if (WITH_EP)
+  # Stage the native EP and PyTorch-versioned PG extensions for build_wheel.sh.
+  # The dedicated directory is injected after auditwheel.
+  set(EP_PG_STAGING_DIR "${CMAKE_BINARY_DIR}/ep_pg_staging")
+
   add_subdirectory(mooncake-pg)
   include_directories(mooncake-pg/include)
 
@@ -121,11 +125,24 @@ if (WITH_EP)
               mooncake-pg/include
               $<TARGET_PROPERTY:mooncake_ep,INCLUDE_DIRECTORIES>)
   else ()
-    message(STATUS "WITH_EP enabled: building Mooncake EP and PG Python extensions")
+    message(STATUS "WITH_EP enabled: building Mooncake EP natively and PG via setup.py")
     if(USE_CUDA)
       find_package(CUDAToolkit REQUIRED)
       message(STATUS "Detected CUDA version: ${CUDAToolkit_VERSION}")
     endif()
+
+    # Use the existing EP/PG architecture list for the native EP target too.
+    if(NOT TORCH_CUDA_ARCH_LIST)
+      set(TORCH_CUDA_ARCH_LIST "$ENV{TORCH_CUDA_ARCH_LIST}")
+    endif()
+    if(NOT TORCH_CUDA_ARCH_LIST)
+      set(TORCH_CUDA_ARCH_LIST "8.0;9.0")
+    endif()
+    set(TORCH_CUDA_ARCH_LIST "${TORCH_CUDA_ARCH_LIST}" CACHE STRING
+        "CUDA arch list for EP/PG extension builds (e.g. \"8.0;9.0\")")
+
+    add_subdirectory(mooncake-ep)
+    include_directories(mooncake-ep/include)
 
     # EP_TORCH_VERSIONS: semicolon-separated list of PyTorch versions to build for.
     # Can be set via -DEP_TORCH_VERSIONS="2.9.1;2.8.0" or the EP_TORCH_VERSIONS env var.
@@ -136,44 +153,10 @@ if (WITH_EP)
     set(EP_TORCH_VERSIONS "${EP_TORCH_VERSIONS}" CACHE STRING
         "PyTorch versions for EP/PG extensions, semicolon-separated (empty = use currently-installed torch)")
 
-    # TORCH_CUDA_ARCH_LIST forwarded to the torch CUDA extension build.
-    if(NOT TORCH_CUDA_ARCH_LIST)
-      set(TORCH_CUDA_ARCH_LIST "$ENV{TORCH_CUDA_ARCH_LIST}")
-    endif()
-    if(NOT TORCH_CUDA_ARCH_LIST)
-      set(TORCH_CUDA_ARCH_LIST "8.0;9.0")
-    endif()
-    set(TORCH_CUDA_ARCH_LIST "${TORCH_CUDA_ARCH_LIST}" CACHE STRING
-        "CUDA arch list for EP/PG extension builds (e.g. \"8.0;9.0\")")
-
-    # Staging directory: EP/PG .so files are placed here during make and later
-    # injected into the wheel AFTER auditwheel, so patchelf never touches the
-    # CUDA fatbins (which would cause cudaErrorInvalidKernelImage at runtime).
-    set(EP_PG_STAGING_DIR "${CMAKE_BINARY_DIR}/ep_pg_staging")
-
     # Convert semicolon-separated lists to pipe-separated strings so they survive
     # CMake's COMMAND list-splitting (semicolons are CMake list separators).
     string(REPLACE ";" "|" _ep_torch_versions_pipe "${EP_TORCH_VERSIONS}")
     string(REPLACE ";" "|" _torch_cuda_arch_list_pipe "${TORCH_CUDA_ARCH_LIST}")
-
-    add_custom_target(mooncake_ep_ext ALL
-      COMMAND ${CMAKE_COMMAND} -E make_directory "${EP_PG_STAGING_DIR}"
-      COMMAND ${CMAKE_COMMAND}
-        "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/mooncake-ep"
-        "-DEP_CUDA_MAJOR=${CUDAToolkit_VERSION_MAJOR}"
-        "-DEP_CUDA_MINOR=${CUDAToolkit_VERSION_MINOR}"
-        "-DEP_TORCH_VERSIONS=${_ep_torch_versions_pipe}"
-        "-DTORCH_CUDA_ARCH_LIST=${_torch_cuda_arch_list_pipe}"
-        "-DSTAGING_DIR=${EP_PG_STAGING_DIR}"
-        "-DENGINE_SO_PATH=$<TARGET_FILE:engine>"
-        "-DPython3_EXECUTABLE=${Python3_EXECUTABLE}"
-        "-DEP_USE_MUSA=$<IF:$<BOOL:${USE_MUSA}>,1,0>"
-        "-DEP_USE_MACA=$<IF:$<BOOL:${USE_MACA}>,1,0>"
-        -P "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-ep/BuildEpExt.cmake"
-      COMMENT "Building Mooncake EP Python extension(s)"
-      DEPENDS engine
-      VERBATIM
-    )
 
     add_custom_target(mooncake_pg_ext ALL
       COMMAND ${CMAKE_COMMAND} -E make_directory "${EP_PG_STAGING_DIR}"
@@ -190,7 +173,7 @@ if (WITH_EP)
         "-DEP_USE_MACA=$<IF:$<BOOL:${USE_MACA}>,1,0>"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/torch/BuildPgExt.cmake"
       COMMENT "Building Mooncake PG Python extension(s)"
-      DEPENDS mooncake_pg mooncake_pg_device mooncake_ep_ext
+      DEPENDS mooncake_pg mooncake_pg_device
       VERBATIM
     )
   endif ()

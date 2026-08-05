@@ -2,8 +2,7 @@
 
 #include <cstdint>
 
-#include <cuda_bf16.h>
-#include <cuda_runtime.h>
+#include <cuda_alike.h>
 
 namespace mooncake {
 

@@ -173,6 +173,10 @@ cd mooncake-wheel
 cp ../README.md README.md
 
 WHEEL_DIR="$(pwd)"
+# auditwheel resolves engine.so's package-local libasio.so through the dynamic
+# loader. Keep the wheel staging directory searchable after FREE_BUILD_DIR has
+# removed the original CMake build directory.
+export LD_LIBRARY_PATH="${LD_LIBRARY_PATH}:${WHEEL_DIR}/mooncake"
 cleanup_wheel_metadata_state() {
     [[ -f "${WHEEL_DIR}/pyproject.toml.backup" ]] && mv "${WHEEL_DIR}/pyproject.toml.backup" "${WHEEL_DIR}/pyproject.toml"
     rm -f "${WHEEL_DIR}/README.md"
