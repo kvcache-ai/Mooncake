@@ -4623,7 +4623,7 @@ RealClient::batch_get_into_cuda_ipc_dummy_helper(
 
     auto range_results = get_into_ranges_internal(
         buffers, all_keys, all_dst_offsets, all_src_offsets, all_sizes,
-        &buffer_capacities, nullptr, nullptr, nullptr);
+        &buffer_capacities, nullptr);
     for (size_t i = 0; i < original_indices.size(); ++i) {
         if (i < range_results.size() && range_results[i].size() == 1 &&
             range_results[i][0].size() == 1) {
