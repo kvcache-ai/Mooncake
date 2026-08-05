@@ -1566,19 +1566,24 @@ TEST_F(MasterServiceTest, SameSizeUpsertAgentHintsReconcileRetention) {
                           "agent_same_size_upsert_trigger", value_size * 3);
 
     WaitUntil([&] {
-        return !service_->GetReplicaList(neutral_key, TenantId::Default())
+        return !service_
+                    ->GetReplicaListForAdmin(neutral_key, TenantId::Default())
                     .has_value() &&
-               !service_->GetReplicaList(cleared_key, TenantId::Default())
+               !service_
+                    ->GetReplicaListForAdmin(cleared_key, TenantId::Default())
                     .has_value();
     });
+    EXPECT_TRUE(service_->GetReplicaListForAdmin(keep_key, TenantId::Default())
+                    .has_value());
     EXPECT_TRUE(
-        service_->GetReplicaList(keep_key, TenantId::Default()).has_value());
-    EXPECT_TRUE(
-        service_->GetReplicaList(pinned_key, TenantId::Default()).has_value());
+        service_->GetReplicaListForAdmin(pinned_key, TenantId::Default())
+            .has_value());
     EXPECT_FALSE(
-        service_->GetReplicaList(neutral_key, TenantId::Default()).has_value());
+        service_->GetReplicaListForAdmin(neutral_key, TenantId::Default())
+            .has_value());
     EXPECT_FALSE(
-        service_->GetReplicaList(cleared_key, TenantId::Default()).has_value());
+        service_->GetReplicaListForAdmin(cleared_key, TenantId::Default())
+            .has_value());
 }
 
 TEST_F(MasterServiceTest, IncompleteGroupedUpsertCanBecomeUngrouped) {
@@ -4808,13 +4813,15 @@ TEST_F(MasterServiceTest, AgentKeepHintSurvivesNeutralUnderEviction) {
                           value_size * 2);
 
     WaitUntil([&] {
-        return !service_->GetReplicaList(neutral_key, TenantId::Default())
+        return !service_
+                    ->GetReplicaListForAdmin(neutral_key, TenantId::Default())
                     .has_value();
     });
-    EXPECT_TRUE(
-        service_->GetReplicaList(keep_key, TenantId::Default()).has_value());
+    EXPECT_TRUE(service_->GetReplicaListForAdmin(keep_key, TenantId::Default())
+                    .has_value());
     EXPECT_FALSE(
-        service_->GetReplicaList(neutral_key, TenantId::Default()).has_value());
+        service_->GetReplicaListForAdmin(neutral_key, TenantId::Default())
+            .has_value());
 }
 
 TEST_F(MasterServiceTest, AgentCacheTtlExtendsSoftPinRetention) {
@@ -4859,13 +4866,17 @@ TEST_F(MasterServiceTest, AgentCacheTtlExtendsSoftPinRetention) {
                           value_size * 2);
 
     WaitUntil([&] {
-        return !service_->GetReplicaList(default_ttl_key, TenantId::Default())
+        return !service_
+                    ->GetReplicaListForAdmin(default_ttl_key,
+                                             TenantId::Default())
                     .has_value();
     });
-    EXPECT_TRUE(service_->GetReplicaList(extended_key, TenantId::Default())
-                    .has_value());
-    EXPECT_FALSE(service_->GetReplicaList(default_ttl_key, TenantId::Default())
-                     .has_value());
+    EXPECT_TRUE(
+        service_->GetReplicaListForAdmin(extended_key, TenantId::Default())
+            .has_value());
+    EXPECT_FALSE(
+        service_->GetReplicaListForAdmin(default_ttl_key, TenantId::Default())
+            .has_value());
 }
 
 TEST_F(MasterServiceTest, AgentDiscardHintDoesNotAddRetention) {
@@ -4906,13 +4917,16 @@ TEST_F(MasterServiceTest, AgentDiscardHintDoesNotAddRetention) {
                           "agent_discard_no_retention_trigger", value_size * 2);
 
     WaitUntil([&] {
-        return !service_->GetReplicaList(discard_key, TenantId::Default())
+        return !service_
+                    ->GetReplicaListForAdmin(discard_key, TenantId::Default())
                     .has_value();
     });
     EXPECT_FALSE(
-        service_->GetReplicaList(discard_key, TenantId::Default()).has_value());
+        service_->GetReplicaListForAdmin(discard_key, TenantId::Default())
+            .has_value());
     EXPECT_TRUE(
-        service_->GetReplicaList(pinned_key, TenantId::Default()).has_value());
+        service_->GetReplicaListForAdmin(pinned_key, TenantId::Default())
+            .has_value());
 }
 
 TEST_F(MasterServiceTest, SoftPinObjectsCanBeEvicted) {
