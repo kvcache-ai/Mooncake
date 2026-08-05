@@ -72,7 +72,7 @@ class PromotionOnHitTest : public ::testing::Test {
         }
         MutexLocker locker(&holder_it->second->offloading_mutex_);
         auto task_it = holder_it->second->promotion_objects.find(
-            MakeTenantScopedStorageKey(tenant_id, key));
+            TenantId(tenant_id).MakeScopedKey(key));
         if (task_it == holder_it->second->promotion_objects.end()) {
             return false;
         }

@@ -239,7 +239,7 @@ class PromotionBudgetBench {
         if (holder_it == client_local_disk_segment.end()) return false;
         MutexLocker locker(&holder_it->second->offloading_mutex_);
         auto task_it = holder_it->second->promotion_objects.find(
-            MakeTenantScopedStorageKey("default", key));
+            TenantId::Default().MakeScopedKey(key));
         if (task_it == holder_it->second->promotion_objects.end()) return false;
         task_it->second.queued_time = queued_time;
         return true;
@@ -270,7 +270,7 @@ RunResult RunOne(const std::string& scheduler, const BenchCase& bench_case,
                                 std::to_string(run) + "_" + std::to_string(i);
         CHECK(InjectLocalDiskReplica(*service, segment.client_id, key, 1024,
                                      segment.segment_name));
-        auto replica_list = service->GetReplicaList(key, "default");
+        auto replica_list = service->GetReplicaList(key, TenantId::Default());
         CHECK(replica_list.has_value()) << "GetReplicaList failed for " << key;
         const double rank =
             bench_case.task_count <= 1
@@ -321,11 +321,12 @@ RunResult RunOne(const std::string& scheduler, const BenchCase& bench_case,
             }
 
             auto alloc = service->PromotionAllocStart(
-                segment.client_id, task.key, task.tenant_id, task.size, {});
+                segment.client_id, task.key, TenantId(task.tenant_id),
+                task.size, {});
             CHECK(alloc.has_value()) << "PromotionAllocStart failed for "
                                      << task.key << " err=" << alloc.error();
             auto success = service->NotifyPromotionSuccess(
-                segment.client_id, task.key, task.tenant_id);
+                segment.client_id, task.key, TenantId(task.tenant_id));
             CHECK(success.has_value())
                 << "NotifyPromotionSuccess failed for " << task.key
                 << " err=" << success.error();

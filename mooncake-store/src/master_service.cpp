@@ -6893,8 +6893,9 @@ auto MasterService::PromotionObjectHeartbeat(const UUID& client_id)
                 const int64_t remaining_ms =
                     static_cast<int64_t>(promotion_max_budget_ms_) - elapsed_ms;
                 if (remaining_ms < 0) {
-                    expired_tasks.push_back(
-                        ObjectIdentity{task_item.tenant_id, task_item.key});
+                    expired_tasks.push_back(ObjectIdentity{
+                        .tenant_id = TenantId(task_item.tenant_id),
+                        .user_key = task_item.key});
                     it = src.erase(it);
                     continue;
                 }
