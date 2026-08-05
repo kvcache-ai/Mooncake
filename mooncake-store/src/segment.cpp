@@ -463,6 +463,10 @@ ErrorCode ScopedSegmentAccess::CommitUnmountSegment(
     if (!is_cxl) {
         MasterMetricManager::instance().dec_total_mem_capacity(
             segment_name, metrics_dec_capacity);
+        // Remove per-segment metric labels entirely to avoid stale 0-value
+        // entries persisting in Prometheus output (e.g. after snapshot
+        // restore followed by client expiry / reaper cleanup).
+        MasterMetricManager::instance().remove_segment_metrics(segment_name);
     }
 
     return ErrorCode::OK;
@@ -1474,6 +1478,7 @@ ErrorCode ScopedNoFSegmentAccess::CommitUnmountSegment(
     nof_segment_manager_->mounted_segments_.erase(segment_id);
     MasterMetricManager::instance().dec_total_nof_capacity(
         segment_name, metrics_dec_capacity);
+    MasterMetricManager::instance().remove_nof_segment_metrics(segment_name);
 
     return ErrorCode::OK;
 }
@@ -1572,6 +1577,7 @@ void SegmentManager::releaseCapacityMetrics() {
         }
         MasterMetricManager::instance().dec_total_mem_capacity(segment.name,
                                                                segment.size);
+        MasterMetricManager::instance().remove_segment_metrics(segment.name);
     }
 }
 

@@ -603,6 +603,7 @@ MasterService::~MasterService() {
     for (const auto& [segment, bytes] : standby_accounted_memory_bytes_) {
         MasterMetricManager::instance().dec_allocated_mem_size(
             segment, static_cast<int64_t>(bytes));
+        MasterMetricManager::instance().remove_segment_metrics(segment);
     }
 
     // Segments still mounted here never went through CommitUnmountSegment;
