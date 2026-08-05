@@ -807,11 +807,11 @@ class RealClient : public PyClient {
 
 #ifdef USE_VRAM_SEGMENT
     struct VRAMSegmentDeleter {
-        std::string protocol;
+        bool use_intra_nvlink = false;
 
-        void operator()(void *ptr) {
+        void operator()(void *ptr) const {
             if (ptr) {
-                free_memory(protocol, ptr);
+                free_memory(use_intra_nvlink ? "nvlink_intra" : "vram", ptr);
             }
         }
     };

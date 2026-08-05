@@ -910,7 +910,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             } else {
 #ifdef USE_VRAM_SEGMENT
                 vram_segment_ptrs_.emplace_back(
-                    ptr, VRAMSegmentDeleter{this->protocol});
+                    ptr, VRAMSegmentDeleter{this->protocol == "nvlink_intra"});
 #else
                 segment_ptrs_.emplace_back(ptr);
 #endif
