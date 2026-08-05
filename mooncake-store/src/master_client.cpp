@@ -1047,9 +1047,8 @@ MasterClient::ValidateOffloadGenerations(
     const std::vector<OffloadTaskItem>& tasks) {
     ScopedVLogTimer timer(1, "MasterClient::ValidateOffloadGenerations");
     timer.LogRequest("tasks_count=", tasks.size());
-    auto result =
-        invoke_rpc<&WrappedMasterService::ValidateOffloadGenerations,
-                   std::vector<uint8_t>>(tasks);
+    auto result = invoke_rpc<&WrappedMasterService::ValidateOffloadGenerations,
+                             std::vector<uint8_t>>(tasks);
     timer.LogResponseExpected(result);
     return result;
 }

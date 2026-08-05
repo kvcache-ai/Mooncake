@@ -735,8 +735,7 @@ class MasterService {
      * wire payloads (HA restore / older workers) keep the orphan-fallback
      * path. uint8_t is used instead of bool for struct-pack compatibility.
      */
-    auto ValidateOffloadGenerations(
-        const std::vector<OffloadTaskItem>& tasks)
+    auto ValidateOffloadGenerations(const std::vector<OffloadTaskItem>& tasks)
         -> tl::expected<std::vector<uint8_t>, ErrorCode>;
 
     /**

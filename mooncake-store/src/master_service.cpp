@@ -3832,17 +3832,15 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
             },
             [this, &object_id, &tenant_state, &task_created](Replica& replica) {
                 if (task_created) return;
-                const uint64_t gen =
-                    next_offload_generation_.fetch_add(
-                        1, std::memory_order_relaxed);
+                const uint64_t gen = next_offload_generation_.fetch_add(
+                    1, std::memory_order_relaxed);
                 auto result = PushOffloadingQueue(object_id, replica, gen);
                 if (result) {
                     replica.inc_refcnt();
                     tenant_state.offloading_tasks.emplace(
                         object_id.user_key,
                         OffloadingTask{replica.id(),
-                                       std::chrono::system_clock::now(),
-                                       gen});
+                                       std::chrono::system_clock::now(), gen});
                     task_created = true;
                 }
             });
@@ -4282,10 +4280,10 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 // upsert allocates fresh buffers.
                 auto offload_it = tenant_state.offloading_tasks.find(key);
                 if (offload_it != tenant_state.offloading_tasks.end()) {
-                    LOG(INFO) << "key=" << key
-                              << ", action=upsert_preempts_offload"
-                              << ", cancelled_generation="
-                              << offload_it->second.generation;
+                    LOG(INFO)
+                        << "key=" << key << ", action=upsert_preempts_offload"
+                        << ", cancelled_generation="
+                        << offload_it->second.generation;
                     auto source =
                         metadata.GetReplicaByID(offload_it->second.source_id);
                     if (source != nullptr) {
@@ -6341,11 +6339,10 @@ auto MasterService::ValidateOffloadGenerations(
         auto& tenant_state = accessor.GetTenantState();
         auto task_it =
             tenant_state.offloading_tasks.find(request_object_id.user_key);
-        results.push_back(
-            task_it != tenant_state.offloading_tasks.end() &&
-                    task_it->second.generation == task.generation
-                ? 1
-                : 0);
+        results.push_back(task_it != tenant_state.offloading_tasks.end() &&
+                                  task_it->second.generation == task.generation
+                              ? 1
+                              : 0);
     }
     return results;
 }

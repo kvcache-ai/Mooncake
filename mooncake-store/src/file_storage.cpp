@@ -573,19 +573,18 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                 client_->ValidateOffloadGenerations(validate_tasks);
             if (!validation) {
                 // Master-side gate still applies in NotifyOffloadSuccess.
-                LOG(WARNING)
-                    << "[OFFLOAD] ValidateOffloadGenerations failed, "
-                       "skipping pre-SSD-IO check: "
-                    << validation.error();
+                LOG(WARNING) << "[OFFLOAD] ValidateOffloadGenerations failed, "
+                                "skipping pre-SSD-IO check: "
+                             << validation.error();
             } else {
                 const auto& results = validation.value();
                 for (size_t i = 0; i < validate_keys.size(); ++i) {
                     if (i >= results.size() || !results[i]) {
                         const auto& obj_key = validate_keys[i];
                         const auto& task = task_by_storage_key.at(obj_key);
-                        LOG(INFO) << "[OFFLOAD] drop stale key, key="
-                                  << task.key
-                                  << ", generation=" << task.generation;
+                        LOG(INFO)
+                            << "[OFFLOAD] drop stale key, key=" << task.key
+                            << ", generation=" << task.generation;
                         failed_tasks.push_back(task);
                         batch_object.erase(obj_key);
                     }

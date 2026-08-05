@@ -99,9 +99,9 @@ class OffloadOnEvictTest : public ::testing::Test {
 
     // Snapshot the mirror entry for @p key on the LocalDisk segment owned
     // by @p client_id, or std::nullopt if absent.
-    std::optional<OffloadTaskItem> ReadMirror(
-        MasterService& service, const UUID& client_id,
-        const std::string& key) const {
+    std::optional<OffloadTaskItem> ReadMirror(MasterService& service,
+                                              const UUID& client_id,
+                                              const std::string& key) const {
         auto ssd_access = service.segment_manager_.getLocalDiskSegmentAccess();
         auto& segments = ssd_access.getClientLocalDiskSegment();
         auto it = segments.find(client_id);
@@ -524,10 +524,10 @@ TEST_F(OffloadOnEvictTest, UpsertPreemptsInProgressOffload) {
                                        kSize, put_cfg);
     ASSERT_TRUE(put_start.has_value());
     ASSERT_EQ(put_start->size(), 1u);
-    const uintptr_t original_buffer_address = put_start->at(0)
-                                                  .get_memory_descriptor()
-                                                  .buffer_descriptor
-                                                  .buffer_address_;
+    const uintptr_t original_buffer_address =
+        put_start->at(0)
+            .get_memory_descriptor()
+            .buffer_descriptor.buffer_address_;
     ASSERT_TRUE(service
                     ->PutEnd(ctx.client_id, key, TenantId::Default(),
                              ReplicaType::MEMORY)
@@ -655,8 +655,8 @@ TEST_F(OffloadOnEvictTest, UpsertPreemptsInFlightOffloadAndDropsStaleNotify) {
     StorageObjectMetadata sm{};
     sm.data_size = 1024;
     sm.transport_endpoint = "test_endpoint";
-    auto notify = service->NotifyOffloadSuccess(ctx.client_id, {stale_task},
-                                                {sm});
+    auto notify =
+        service->NotifyOffloadSuccess(ctx.client_id, {stale_task}, {sm});
     ASSERT_TRUE(notify.has_value());
 
     // Only the newly-upserted MEMORY replica should exist; no LOCAL_DISK
@@ -689,7 +689,8 @@ TEST_F(OffloadOnEvictTest, UpsertPreemptsOffloadAcrossMultipleSegments) {
     // binary invocation.
     constexpr size_t seg_size = 1024 * 1024 * 16;
     constexpr size_t kMultiSegBase = kDefaultSegmentBase + 1024ULL * seg_size;
-    auto ctx_a = PrepareSegment(*service, "multi_seg_a", kMultiSegBase, seg_size);
+    auto ctx_a =
+        PrepareSegment(*service, "multi_seg_a", kMultiSegBase, seg_size);
     auto ctx_b = PrepareSegment(*service, "multi_seg_b",
                                 kMultiSegBase + seg_size, seg_size);
     auto mount_a = service->MountLocalDiskSegment(ctx_a.client_id, true);
@@ -744,8 +745,9 @@ TEST_F(OffloadOnEvictTest, UpsertPreemptsOffloadAcrossMultipleSegments) {
     EXPECT_TRUE(hb_secondary->empty())
         << "UpsertStart failed to clear the cross-segment mirror";
 
-    ASSERT_TRUE(service->PutEnd(ctx_a.client_id, key, TenantId::Default(),
-                                ReplicaType::MEMORY)
+    ASSERT_TRUE(service
+                    ->PutEnd(ctx_a.client_id, key, TenantId::Default(),
+                             ReplicaType::MEMORY)
                     .has_value());
 
     // The primary's late completion carries the pre-preempt generation and
@@ -792,8 +794,7 @@ TEST_F(OffloadOnEvictTest, HANotifyWithGenerationZeroStillAdmitted) {
     StorageObjectMetadata sm{};
     sm.data_size = 1024;
     sm.transport_endpoint = "test_endpoint";
-    auto notify =
-        service->NotifyOffloadSuccess(ctx.client_id, {ha_task}, {sm});
+    auto notify = service->NotifyOffloadSuccess(ctx.client_id, {ha_task}, {sm});
     ASSERT_TRUE(notify.has_value());
 }
 
@@ -834,8 +835,9 @@ TEST_F(OffloadOnEvictTest, UpsertPreemptsOffloadWithOffloadOnEvict) {
     ASSERT_TRUE(upsert.has_value())
         << "UpsertStart must preempt an offload_on_evict task, got error "
         << static_cast<int>(upsert.error());
-    ASSERT_TRUE(service->PutEnd(ctx.client_id, key, TenantId::Default(),
-                                ReplicaType::MEMORY)
+    ASSERT_TRUE(service
+                    ->PutEnd(ctx.client_id, key, TenantId::Default(),
+                             ReplicaType::MEMORY)
                     .has_value());
 
     // Preempt must clear both the marker and its mirror.
