@@ -26,6 +26,12 @@
     mooncake::UBShmemTransport::allocatePinnedLocalMemory(size)
 #define freeFabricMemory(addr) \
     mooncake::UBShmemTransport::freePinnedLocalMemory(addr)
+#elif defined(USE_MUSA)
+#include <transport/musa_transport/musa_transport.h>
+#define allocateFabricMemory(size) \
+    mooncake::MusaTransport::allocatePinnedLocalMemory(size)
+#define freeFabricMemory(addr) \
+    mooncake::MusaTransport::freePinnedLocalMemory(addr)
 #else
 #include <transport/nvlink_transport/nvlink_transport.h>
 #define allocateFabricMemory(size) \
