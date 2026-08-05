@@ -89,6 +89,20 @@ python mooncake-ep/benchmarks/ep_benchmark/run_ep_benchmark.py \
       "min_tokens_per_expert": 0,
       "mean_tokens_per_expert": 0,
       "imbalance_ratio": 0
+    },
+    "per_rank_stats": {
+      "dispatch_latency_ms": {
+        "rank0": {"p50": 0, "p90": 0, "p99": 0, "p999": 0, "mean": 0},
+        "rank1": {"p50": 0, "p90": 0, "p99": 0, "p999": 0, "mean": 0}
+      },
+      "combine_latency_ms": {
+        "rank0": {"p50": 0, "p90": 0, "p99": 0, "p999": 0, "mean": 0},
+        "rank1": {"p50": 0, "p90": 0, "p99": 0, "p999": 0, "mean": 0}
+      },
+      "e2e_latency_ms": {
+        "rank0": {"p50": 0, "p90": 0, "p99": 0, "p999": 0, "mean": 0},
+        "rank1": {"p50": 0, "p90": 0, "p99": 0, "p999": 0, "mean": 0}
+      }
     }
   }
 }

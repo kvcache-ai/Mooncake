@@ -17,6 +17,7 @@ import torch.multiprocessing as mp
 from metrics import (
     assemble_json_output,
     compute_global_expert_load,
+    compute_percentiles,
     write_json_output,
 )
 from routing import ROUTING_MODES
@@ -370,9 +371,21 @@ class EPBenchmarkWorker:
         )
 
         if self.rank == 0:
-            all_dispatch_flat = torch.cat(all_dispatch).cpu().tolist()
-            all_combine_flat = torch.cat(all_combine).cpu().tolist()
-            all_e2e_flat = torch.cat(all_e2e).cpu().tolist()
+            # A step completes only when the slowest rank finishes (critical path).
+            dispatch_critical = torch.stack(all_dispatch).max(dim=0).values.cpu().tolist()
+            combine_critical = torch.stack(all_combine).max(dim=0).values.cpu().tolist()
+            e2e_critical = torch.stack(all_e2e).max(dim=0).values.cpu().tolist()
+
+            per_rank_stats = {}
+            for metric, tensors in (
+                ("dispatch", all_dispatch),
+                ("combine", all_combine),
+                ("e2e", all_e2e),
+            ):
+                per_rank_stats[f"{metric}_latency_ms"] = {
+                    f"rank{r}": compute_percentiles(latencies.cpu())
+                    for r, latencies in enumerate(tensors)
+                }
 
             result = assemble_json_output(
                 backend=self.args.backend,
@@ -399,11 +412,12 @@ class EPBenchmarkWorker:
                 zipf_alpha=(
                     self.args.zipf_alpha if self.args.routing_mode == "zipf" else None
                 ),
-                dispatch_latencies_ms=all_dispatch_flat,
-                combine_latencies_ms=all_combine_flat,
-                e2e_latencies_ms=all_e2e_flat,
+                dispatch_latencies_ms=dispatch_critical,
+                combine_latencies_ms=combine_critical,
+                e2e_latencies_ms=e2e_critical,
                 expert_load=expert_load,
                 pg_backend=self.args.pg_backend,
+                per_rank_stats=per_rank_stats,
             )
 
             if self.args.json_output:

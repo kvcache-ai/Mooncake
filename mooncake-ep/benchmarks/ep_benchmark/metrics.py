@@ -81,6 +81,8 @@ def assemble_json_output(
     e2e_latencies_ms: list[float] | None = None,
     expert_load: dict[str, float] | None = None,
     pg_backend: str = "nccl",
+    *,
+    per_rank_stats: dict[str, Any],
 ) -> dict[str, Any]:
     """Assemble the final JSON-serializable output dict matching the RFC schema."""
     result = {
@@ -129,6 +131,7 @@ def assemble_json_output(
             "mean_tokens_per_expert": 0,
             "imbalance_ratio": 0,
         },
+        "per_rank_stats": per_rank_stats,
     }
 
     return result
