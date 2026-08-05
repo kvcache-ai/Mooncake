@@ -561,10 +561,12 @@ class NoFSegmentManager {
         std::shared_lock<std::shared_mutex> lock(segment_mutex_);
         return mounted_segments_.size();
     }
+
     uint32_t getBlockSize() const {
         std::shared_lock<std::shared_mutex> lock(segment_mutex_);
         return block_size_;
     }
+    
     void GetMountedSegmentsSnapshot(
         std::vector<MountedNoFSegmentSnapshot>& segments) const;
 
