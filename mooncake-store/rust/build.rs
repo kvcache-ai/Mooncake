@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Everything below is used only by the `link` build path (see the two cfg'd
+// main()s). Scope the allowances to non-`link` builds, where the helpers/imports
+// are unused, so the `link` build keeps normal warning hygiene.
+#![cfg_attr(not(feature = "link"), allow(dead_code, unused_imports))]
+
 use std::env;
 use std::fs;
 use std::path::PathBuf;
@@ -163,6 +168,13 @@ fn add_compiler_runtime_search_dir(search_dirs: &mut Vec<PathBuf>, file_name: &s
     false
 }
 
+// A pure `dlopen` build uses committed, pre-generated bindings
+// (src/generated/ffi_dlopen_bindings.rs), so build.rs has nothing to do. Also
+// covers the no-feature case (lib.rs emits a compile_error! there).
+#[cfg(not(feature = "link"))]
+fn main() {}
+
+#[cfg(feature = "link")]
 fn main() {
     // -----------------------------------------------------------------------
     // Library search path

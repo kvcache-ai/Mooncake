@@ -2,7 +2,6 @@ import unittest
 import os
 import time
 import threading
-import random
 from mooncake.store import MooncakeDistributedStore
 
 # The lease time of the kv object, should be set equal to
@@ -303,7 +302,7 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         self.assertEqual(bytes(buffer1[16:20]), data1[10:14])
 
         mismatch_results = self.store.get_into_ranges(
-            [buffer_ptr0], [[key1, key2]], [[[0], []]], [[[0, 1], []]], [[[4, 4], []]]
+            [buffer_ptr0], [[key1, key2]], [[[0], []]], [[[0, 1], []]], [[[], []]]
         )
         self.assertEqual(len(mismatch_results), 1)
         self.assertEqual(len(mismatch_results[0]), 2)

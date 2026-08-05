@@ -245,10 +245,16 @@ static bool isGpuDirectRdmaSupported(std::shared_ptr<Config> conf) {
     if (disable_gpu_direct) {
         return false;
     }
+    // Detect vendor GPUDirect/peer-memory drivers from /proc/modules.
+    // NVIDIA: nvidia_peermem. AMD: peermem is built into amdgpu (linked with
+    // ib_core), so the amdgpu module itself is the presence signal.
     std::ifstream modules("/proc/modules");
     std::string line;
     while (std::getline(modules, line)) {
-        if (line.find("nvidia_peermem") != std::string::npos) {
+        const auto name_end = line.find(' ');
+        const auto name =
+            name_end == std::string::npos ? line : line.substr(0, name_end);
+        if (name == "nvidia_peermem" || name == "amdgpu") {
             return true;
         }
     }
@@ -554,6 +560,10 @@ Status RdmaTransport::cancelTransferTask(SubBatchRef batch, int task_id) {
     auto* task = rdma_batch->task_list[task_id];
     if (task->status_word != PENDING) return Status::OK();
     return workers_->cancel(task);
+}
+
+Status RdmaTransport::getNicLoadStats(std::vector<NicLoadStats>& stats) const {
+    return workers_->getDeviceSelector()->getNicLoadStats(stats);
 }
 
 bool RdmaTransport::warmupMemory(void* addr, size_t length) {

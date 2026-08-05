@@ -258,45 +258,6 @@ std::string expected_to_str(const tl::expected<T, ErrorCode>& expected) {
     return parsed.value_or(0);
 }
 
-/**
- * @brief Convert a boolean-like string to a bool
- * @param str String representation ("1"/"true"/"yes"/"on" or
- * "0"/"false"/"no"/"off")
- * @return std::optional<bool> Parsed value, or std::nullopt if parsing fails
- */
-[[nodiscard]] inline std::optional<bool> string_to_bool(std::string str) {
-    if (str.empty()) {
-        return std::nullopt;
-    }
-
-    str.erase(0, str.find_first_not_of(" \t\r\n"));
-    str.erase(str.find_last_not_of(" \t\r\n") + 1);
-    std::transform(str.begin(), str.end(), str.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
-
-    if (str == "1" || str == "true" || str == "yes" || str == "on") {
-        return true;
-    }
-    if (str == "0" || str == "false" || str == "no" || str == "off") {
-        return false;
-    }
-
-    return std::nullopt;
-}
-
-/**
- * @brief Split a string by delimiter into a vector of strings
- * @param str The string to split
- * @param delimiter The delimiter to split by (default is comma)
- * @param trim_spaces Whether to trim leading/trailing spaces from each token
- * @param keep_empty Whether to keep empty tokens in the result
- * @return Vector of split strings
- */
-std::vector<std::string> splitString(const std::string& str,
-                                     char delimiter = ',',
-                                     bool trim_spaces = true,
-                                     bool keep_empty = false);
-
 // Buffer allocator functions
 
 constexpr size_t SZ_2MB = 2 * 1024 * 1024;
@@ -513,27 +474,6 @@ int getFreeTcpPort();
 std::vector<int> getFreeTcpPorts(int count);
 
 int64_t time_gen();
-
-// Helper: Get integer from environment variable, fallback to default
-template <typename T>
-T GetEnvOr(const char* name, T default_value) {
-    const char* env_val = std::getenv(name);
-    if (!env_val || std::string(env_val).empty()) {
-        return default_value;
-    }
-    try {
-        long long value = std::stoll(env_val);
-        // Check range for unsigned types
-        if constexpr (std::is_same_v<T, uint32_t>) {
-            if (value < 0 || value > UINT32_MAX) throw std::out_of_range("");
-        }
-        return static_cast<T>(value);
-    } catch (...) {
-        return default_value;
-    }
-}
-
-std::string GetEnvStringOr(const char* name, const std::string& default_value);
 
 std::string ResolveMooncakeHostId(const std::string& local_hostname);
 

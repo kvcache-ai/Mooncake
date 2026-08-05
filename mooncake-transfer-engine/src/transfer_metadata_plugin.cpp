@@ -746,7 +746,7 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                 }
 
                 struct timeval timeout;
-                timeout.tv_sec = 60;
+                timeout.tv_sec = 5;
                 timeout.tv_usec = 0;
                 if (setsockopt(conn_fd, SOL_SOCKET, SO_RCVTIMEO, &timeout,
                                sizeof(timeout))) {
@@ -762,6 +762,11 @@ struct SocketHandShakePlugin : public HandShakePlugin {
                 Json::Value local, peer;
 
                 auto [type, json_str] = readString(conn_fd);
+                if (type == HandShakeRequestType::Invalid) {
+                    close(conn_fd);
+                    continue;
+                }
+
                 std::string errs;
                 if (!parseJsonString(json_str, peer, &errs)) {
                     LOG(ERROR)

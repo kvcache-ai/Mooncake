@@ -1,5 +1,6 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
+#include <boost/algorithm/string.hpp>
 
 #include <algorithm>
 #include <array>
@@ -23,7 +24,6 @@
 
 #include "spdk/spdk_wrapper.h"
 #include "transfer_task.h"
-#include "utils.h"
 
 namespace {
 
@@ -714,7 +714,12 @@ int main(int argc, char **argv) {
         SetEnvU64IfRequested("MC_NOF_INFLIGHT_BYTES_LIMIT",
                              FLAGS_nof_inflight_bytes_limit);
 
-        auto endpoint_strings = mooncake::splitString(FLAGS_endpoints);
+        std::vector<std::string> endpoint_strings;
+        boost::split(endpoint_strings, FLAGS_endpoints, boost::is_any_of(","),
+                     boost::token_compress_on);
+        for (auto &endpoint : endpoint_strings) {
+            boost::trim(endpoint);
+        }
         if (endpoint_strings.empty()) {
             LOG(ERROR) << "No valid endpoints parsed from --endpoints";
             return 1;

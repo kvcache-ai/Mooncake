@@ -38,6 +38,8 @@ echo "Running import structure test..."
 cp -r mooncake-wheel/tests test_env/
 cd test_env
 pip install torch==2.11.0 numpy
+python -c "import mooncake._fast_copy"
+python tests/test_fast_copy.py
 python tests/test_import_structure.py
 
 echo "Running mooncake config test..."
@@ -46,6 +48,7 @@ python tests/test_mooncake_config.py
 echo "Verifying mooncake_master entry point..."
 # Check if the mooncake_master entry point is installed and executable
 which mooncake_master || { echo "ERROR: mooncake_master entry point not found!"; exit 1; }
+mooncake_master --version
 echo "Success: mooncake_master entry point found"
 
 # Check if the mooncake_client entry point is installed and executable

@@ -963,7 +963,7 @@ Status TransferEngineImpl::validateTransportHint(const Request& req,
     if (!transport_list_[req.transport_hint]) {
         return Status::InvalidArgument(
             "transport_hint=" +
-            TransportSelector::transportTypeName(req.transport_hint) +
+            std::string(transportTypeName(req.transport_hint)) +
             " is not enabled in config (request[" +
             std::to_string(request_index) + "])" LOC_MARK);
     }
@@ -1067,34 +1067,6 @@ SelectionResult TransferEngineImpl::getTransportType(const Request& request,
 
     return transport_selector_->select(ctx, transport_list_, transport_index,
                                        hint);
-}
-
-static const char* transportTypeName(TransportType type) {
-    switch (type) {
-        case UNSPEC:
-            return "UNSPEC";
-        case RDMA:
-            return "RDMA";
-        case MNNVL:
-            return "MNNVL";
-        case SHM:
-            return "SHM";
-        case NVLINK:
-            return "NVLINK";
-        case GDS:
-            return "GDS";
-        case IOURING:
-            return "IOURING";
-        case TCP:
-            return "TCP";
-        case AscendDirect:
-            return "AscendDirect";
-        case SUNRISE_LINK:
-            return "SUNRISE_LINK";
-        case TPU:
-            return "TPU";
-    }
-    return "UNKNOWN";
 }
 
 std::string printRequest(const Request& request) {
@@ -1527,8 +1499,19 @@ Status TransferEngineImpl::commitPreparedSubmit(
 
         if (owner.staging) {
             task.staging = true;
-            staging_proxy_->submit(&task, (BatchID)batch, owner.staging_params);
-            task.post_time = std::chrono::steady_clock::now();
+            // Staging is an orchestration step, not a concrete transport
+            // attempt. ProxyManager chunks the transfer and issues the real
+            // Transport::submitTransferTasks() calls, which are counted where
+            // they recurse through the non-staging path below. Only stamp the
+            // logical request's first post time for stage decomposition here.
+            auto status = staging_proxy_->submit(&task, (BatchID)batch,
+                                                 owner.staging_params);
+            if (!status.ok()) {
+                task.staging = false;
+                task.type = UNSPEC;
+            } else {
+                task.post_time = std::chrono::steady_clock::now();
+            }
             continue;
         }
 
@@ -1572,15 +1555,21 @@ Status TransferEngineImpl::commitPreparedSubmit(
                 batch->task_list[task_id_list[type][0]].qp_pool;
         }
 
+        auto attempt_start = std::chrono::steady_clock::now();
+        for (auto& task_id : task_id_list[type]) {
+            startTransportAttempt(batch->task_list[task_id],
+                                  static_cast<TransportType>(type),
+                                  attempt_start);
+        }
         auto status = transport->submitTransferTasks(
             sub_batch, classified_request_list[type]);
         if (!status.ok()) {
-            for (auto& task_id : task_id_list[type])
+            auto attempt_end = std::chrono::steady_clock::now();
+            for (auto& task_id : task_id_list[type]) {
+                finishTransportAttempt(batch->task_list[task_id], FAILED,
+                                       attempt_end);
                 batch->task_list[task_id].type = UNSPEC;
-        } else {
-            auto now = std::chrono::steady_clock::now();
-            for (auto& task_id : task_id_list[type])
-                batch->task_list[task_id].post_time = now;
+            }
         }
     }
 
@@ -1745,6 +1734,9 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
         findStagingPolicy(task.request, staging_params);
         if (!staging_params.empty() && staging_proxy_) {
             task.staging = true;
+            // Orchestration only; the real transport submissions issued by
+            // ProxyManager are counted where they recurse through the
+            // non-staging path below.
             auto status =
                 staging_proxy_->submit(&task, (BatchID)batch, staging_params);
             if (!status.ok()) return finishQueuedOwner(owner_id, FAILED);
@@ -1770,12 +1762,13 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
         sub_batch->qp_pool = task.qp_pool;
     }
     task.sub_task_id = sub_batch->size();
+    startTransportAttempt(task, task.type, std::chrono::steady_clock::now());
     auto status = transport->submitTransferTasks(sub_batch, {task.request});
     if (!status.ok()) {
+        finishTransportAttempt(task, FAILED, std::chrono::steady_clock::now());
         task.type = UNSPEC;
         return finishQueuedOwner(owner_id, FAILED);
     }
-    task.post_time = std::chrono::steady_clock::now();
     return markQueuedOwnerSubmitted(owner_id);
 }
 
@@ -2049,7 +2042,7 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
     LOG(INFO) << "Transport failover: " << transportTypeName(prev_type)
               << " -> " << transportTypeName(type) << " (attempt "
               << task.failover_count << "/" << max_failover_attempts_ << ")";
-    TENT_RECORD_TRANSPORT_FAILOVER();
+    TENT_RECORD_TRANSPORT_FAILOVER(prev_type, type);
 
     auto& transport = transport_list_[type];
     if (!batch->sub_batch[type]) {
@@ -2060,7 +2053,12 @@ Status TransferEngineImpl::resubmitTransferTask(Batch* batch, size_t task_id) {
     auto& sub_batch = batch->sub_batch[type];
     task.sub_task_id = sub_batch->size();
     task.type = type;
-    return transport->submitTransferTasks(sub_batch, {task.request});
+    startTransportAttempt(task, type, std::chrono::steady_clock::now());
+    auto status = transport->submitTransferTasks(sub_batch, {task.request});
+    if (!status.ok()) {
+        finishTransportAttempt(task, FAILED, std::chrono::steady_clock::now());
+    }
+    return status;
 }
 
 Status TransferEngineImpl::pollTaskStatus(Batch* batch, size_t task_id,
@@ -2094,6 +2092,10 @@ void TransferEngineImpl::updateTaskStatusAfterPoll(Batch* batch, size_t task_id,
         task.type == UNSPEC)
         return;
 
+    // The current physical transport attempt has failed even if the logical
+    // request will recover through failover. Close it before task.type is
+    // overwritten by resubmitTransferTask().
+    finishTransportAttempt(task, FAILED, std::chrono::steady_clock::now());
     if (resubmitTransferTask(batch, task_id).ok()) {
         task_status.s = PENDING;
         task.status = PENDING;
@@ -2333,6 +2335,17 @@ Status TransferEngineImpl::progressBatch(BatchID batch_id,
     return getBatchStatus(batch_id, overall_status, true);
 }
 
+Status TransferEngineImpl::getNicLoadStats(
+    std::vector<NicLoadStats>& stats) const {
+    stats.clear();
+    for (const auto& transport : transport_list_) {
+        if (transport) {
+            CHECK_STATUS(transport->getNicLoadStats(stats));
+        }
+    }
+    return Status::OK();
+}
+
 void TransferEngineImpl::notifyBatchMaybeReady(BatchID batch_id) {
     if (progress_worker_) progress_worker_->notifyBatchMaybeReady(batch_id);
 }
@@ -2388,29 +2401,34 @@ Status TransferEngineImpl::unlockStageBuffer(uint64_t addr) {
 void TransferEngineImpl::recordTaskCompletionMetrics(
     TaskInfo& task, TransferStatusEnum prev_status,
     TransferStatusEnum new_status) {
+#if TENT_METRICS_ENABLED
     if (prev_status == PENDING && new_status != PENDING && !task.derived) {
+        auto end_time = std::chrono::steady_clock::now();
+        finishTransportAttempt(task, new_status, end_time);
         auto start_time = task.start_time;
         if (start_time.time_since_epoch().count() > 0) {
-            auto end_time = std::chrono::steady_clock::now();
             double latency_seconds =
                 std::chrono::duration<double>(end_time - start_time).count();
             if (new_status == COMPLETED) {
                 if (task.request.opcode == Request::READ) {
                     TentMetrics::instance().recordReadCompleted(
-                        task.request.length, latency_seconds);
+                        task.type, task.request.length, latency_seconds);
                 } else {
                     TentMetrics::instance().recordWriteCompleted(
-                        task.request.length, latency_seconds);
+                        task.type, task.request.length, latency_seconds);
                 }
-#if TENT_METRICS_ENABLED
-                // Causal chain stage decomposition
+                // Causal chain stage decomposition. These stage metrics stay
+                // attributed to the final (task.type) transport and measure the
+                // full request span for backward compatibility; per-attempt and
+                // initial-transport breakdowns live in the additive
+                // tent_transport_attempt_* metrics instead.
                 if (task.dispatch_time.time_since_epoch().count() > 0) {
                     double queue_wait_us =
                         std::chrono::duration<double, std::micro>(
                             task.dispatch_time - start_time)
                             .count();
                     TENT_RECORD_STAGE_LATENCY(TentMetrics::Stage::QueueWait,
-                                              queue_wait_us);
+                                              task.type, queue_wait_us);
                     if (task.post_time.time_since_epoch().count() > 0) {
                         double dispatch_us =
                             std::chrono::duration<double, std::micro>(
@@ -2421,45 +2439,86 @@ void TransferEngineImpl::recordTaskCompletionMetrics(
                                 end_time - task.post_time)
                                 .count();
                         TENT_RECORD_STAGE_LATENCY(TentMetrics::Stage::Dispatch,
-                                                  dispatch_us);
+                                                  task.type, dispatch_us);
                         TENT_RECORD_STAGE_LATENCY(TentMetrics::Stage::Transport,
-                                                  transport_us);
-                    }
-                }
-#endif
-                // Observability only (RFC #2519): if this transfer carried a
-                // deadline, emit the post-hoc feasibility ratio MLU =
-                // actual_transfer_time / available_window, where the window is
-                // (deadline - submit_time). MLU < 1 met the deadline; >= 1
-                // missed it. This does not drive any admission/scheduling yet.
-                if (task.request.deadline_ns != 0) {
-                    uint64_t start_ns = static_cast<uint64_t>(
-                        std::chrono::duration_cast<std::chrono::nanoseconds>(
-                            start_time.time_since_epoch())
-                            .count());
-                    if (task.request.deadline_ns > start_ns) {
-                        double window_seconds =
-                            (task.request.deadline_ns - start_ns) / 1e9;
-                        TentMetrics::instance().recordDeadlineMLU(
-                            latency_seconds / window_seconds);
-                    } else {
-                        // Deadline already in the past at submit: infeasible.
-                        TentMetrics::instance().recordDeadlineMLU(5.0);
+                                                  task.type, transport_us);
                     }
                 }
             } else if (new_status == FAILED) {
                 if (task.request.opcode == Request::READ) {
-                    TentMetrics::instance().recordReadFailed(
-                        task.request.length);
+                    TentMetrics::instance().recordReadFailed(task.type);
                 } else {
-                    TentMetrics::instance().recordWriteFailed(
-                        task.request.length);
+                    TentMetrics::instance().recordWriteFailed(task.type);
+                }
+            }
+            // Observability only (RFC #2519): deadline feasibility. The
+            // infeasible-at-submit case (deadline already in the past when
+            // the transfer was submitted) is independent of whether the
+            // transfer ultimately completed or failed, so it is recorded for
+            // both outcomes. The feasible MLU ratio requires the actual
+            // transfer latency, so it is only recorded on COMPLETED.
+            if (task.request.deadline_ns != 0) {
+                uint64_t start_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        start_time.time_since_epoch())
+                        .count());
+                if (task.request.deadline_ns > start_ns) {
+                    if (new_status == COMPLETED) {
+                        double window_seconds =
+                            (task.request.deadline_ns - start_ns) / 1e9;
+                        TentMetrics::instance().recordDeadlineMLU(
+                            task.type, latency_seconds / window_seconds);
+                    }
+                } else {
+                    // Deadline already in the past at submit: infeasible.
+                    // Recorded into a dedicated counter so it does not
+                    // pollute the MLU histogram with a sentinel value.
+                    TentMetrics::instance().recordDeadlineInfeasible(task.type);
                 }
             }
             // Reset start_time to prevent duplicate recording
             task.start_time = std::chrono::steady_clock::time_point{};
         }
     }
+#endif  // TENT_METRICS_ENABLED
+}
+
+void TransferEngineImpl::startTransportAttempt(
+    TaskInfo& task, TransportType type,
+    std::chrono::steady_clock::time_point post_time) {
+    if (task.derived) return;
+    if (task.post_time.time_since_epoch().count() == 0) {
+        task.post_time = post_time;
+    }
+    task.attempt_post_time = post_time;
+    // Capture the transport now so the attempt is attributed correctly even if
+    // task.type is overwritten by failover before finishTransportAttempt().
+    task.attempt_type = type;
+    task.attempt_active = true;
+#if TENT_METRICS_ENABLED
+    TentMetrics::instance().recordTransportAttemptStarted(type,
+                                                          task.request.opcode);
+#else
+    (void)type;
+#endif
+}
+
+void TransferEngineImpl::finishTransportAttempt(
+    TaskInfo& task, TransferStatusEnum status,
+    std::chrono::steady_clock::time_point end_time) {
+    if (!task.attempt_active) return;
+    task.attempt_active = false;
+#if TENT_METRICS_ENABLED
+    auto post_time = task.attempt_post_time;
+    if (post_time.time_since_epoch().count() == 0) return;
+    double latency_us =
+        std::chrono::duration<double, std::micro>(end_time - post_time).count();
+    TentMetrics::instance().recordTransportAttemptFinished(
+        task.attempt_type, task.request.opcode, status, latency_us);
+#else
+    (void)status;
+    (void)end_time;
+#endif
 }
 
 }  // namespace tent

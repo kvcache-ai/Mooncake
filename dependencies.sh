@@ -158,7 +158,6 @@ if [ "$OS" = "ubuntu" ] || [ "$OS" = "debian" ]; then
                      unzip \
                      libibverbs-dev \
                      libgoogle-glog-dev \
-                     libgtest-dev \
                      libjsoncpp-dev \
                      libunwind-dev \
                      libnuma-dev \
@@ -196,7 +195,6 @@ elif [ "$OS" = "centos" ] || [ "$OS" = "rhel" ] || [ "$OS" = "rocky" ] || [ "$OS
                      rdma-core-devel \
                      glog-devel \
                      gflags-devel \
-                     gtest-devel \
                      jsoncpp-devel \
                      libunwind-devel \
                      numactl-devel \

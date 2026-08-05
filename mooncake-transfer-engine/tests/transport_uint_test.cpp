@@ -54,7 +54,51 @@ class TransferEngineImplTestPeer {
             engine.multi_transports_->transport_map_.emplace(name, transport);
         }
     }
+
+    static AutoDiscoverConfig autoDiscoverConfig(
+        const TransferEngineImpl& engine) {
+        return engine.auto_discover_config_;
+    }
+
+    static std::string autoDiscoverTransport(const TransferEngineImpl& engine) {
+        return engine.autoDiscoverTransport();
+    }
+
+    static void setUseBarex(TransferEngineImpl& engine, bool use_barex) {
+        engine.use_barex_ = use_barex;
+    }
 };
+
+TEST(TransferEngineAutoDiscoverTest, SelectsEfaForEfaProtocol) {
+    TransferEngineImpl engine(false);
+    engine.setAutoDiscover({.enabled = true, .protocol = "efa"});
+
+    const auto config = TransferEngineImplTestPeer::autoDiscoverConfig(engine);
+    EXPECT_TRUE(config.enabled);
+    EXPECT_EQ(config.protocol, "efa");
+    EXPECT_EQ(TransferEngineImplTestPeer::autoDiscoverTransport(engine), "efa");
+}
+
+TEST(TransferEngineAutoDiscoverTest, BarexOverrideTakesPrecedence) {
+    TransferEngineImpl engine(false);
+    engine.setAutoDiscover({.enabled = true, .protocol = "efa"});
+    TransferEngineImplTestPeer::setUseBarex(engine, true);
+
+    EXPECT_EQ(TransferEngineImplTestPeer::autoDiscoverTransport(engine),
+              "barex");
+}
+
+TEST(TransferEngineAutoDiscoverTest, BoolSetterPreservesDefaultSelection) {
+    TransferEngineImpl engine(false);
+    engine.setAutoDiscover({.enabled = true, .protocol = "efa"});
+    engine.setAutoDiscover(true);
+
+    const auto config = TransferEngineImplTestPeer::autoDiscoverConfig(engine);
+    EXPECT_TRUE(config.enabled);
+    EXPECT_TRUE(config.protocol.empty());
+    EXPECT_EQ(TransferEngineImplTestPeer::autoDiscoverTransport(engine),
+              "rdma");
+}
 
 class BatchResultTransport : public Transport {
    public:
@@ -232,6 +276,46 @@ TEST_F(TransportTest, parseHostNameWithPortTest) {
     res = parseHostNameWithPort(local_server_name);
     ASSERT_EQ(res.first, "1.2.3.4");
     ASSERT_EQ(res.second, 12001);
+}
+
+TEST_F(TransportTest, TransferTaskDestructorRunsSliceCleanup) {
+    int cleanup_count = 0;
+    {
+        Transport::TransferTask task;
+        auto* slice = new Transport::Slice();
+        slice->source_addr = &cleanup_count;
+        slice->cleanup_callback = [](Transport::Slice* released) {
+            auto* count = static_cast<int*>(released->source_addr);
+            ++*count;
+        };
+        task.slice_list.push_back(slice);
+    }
+
+    EXPECT_EQ(cleanup_count, 1);
+}
+
+TEST_F(TransportTest, SliceCleanupRunsOnceBeforeCacheReuse) {
+    Transport::ThreadLocalSliceCache cache;
+    int cleanup_count = 0;
+
+    Transport::Slice* slice = cache.allocate();
+    slice->source_addr = &cleanup_count;
+    slice->cleanup_callback = [](Transport::Slice* released) {
+        auto* count = static_cast<int*>(released->source_addr);
+        ++*count;
+    };
+
+    cache.deallocate(slice);
+    EXPECT_EQ(cleanup_count, 1);
+
+    Transport::Slice* reused = cache.allocate();
+    EXPECT_EQ(reused, slice);
+    EXPECT_EQ(reused->cleanup_callback, nullptr);
+
+    // A backend that does not install a callback must not inherit the callback
+    // from the previous owner of this cached slice.
+    cache.deallocate(reused);
+    EXPECT_EQ(cleanup_count, 1);
 }
 
 TEST_F(TransportTest, WriteSuccess) {
