@@ -82,6 +82,10 @@ class MasterServiceTenantQuotaTest;
 // relying on segment pressure plus the background eviction thread.
 class BatchEvictTest;
 class MasterServiceHATest;
+// Friended so the processing_keys double-erase reproduction test can
+// invalidate a segment allocator via PrepareUnmountSegment WITHOUT the
+// ClearInvalidHandles sweep that MasterService::UnmountSegment performs.
+class MasterServiceProcessingKeyDoubleEraseTest;
 }  // namespace test
 namespace benchmarks {
 class BatchEvictBench;
@@ -112,6 +116,8 @@ class MasterService {
     friend class benchmarks::BatchEvictBench;
     friend class test::MasterServiceTenantQuotaTest;
     friend class test::BatchEvictTest;
+    // double-erase processing_keys UAF repro (2026-08-03 prod segfault)
+    friend class test::MasterServiceProcessingKeyDoubleEraseTest;
     friend class MasterSnapshotManager;    // Allow access to internal state for
                                            // snapshot
     friend class ha::MasterSnapshotCodec;  // Allow codec to access private
@@ -1739,12 +1745,12 @@ class MasterService {
                 }
                 // If no valid replicas remain, delete the whole object.
                 if (!it_->second.IsValid()) {
-                    const bool had_processing =
-                        processing_it_ != tenant_state_->processing_keys.end();
+                    // NOTE: Erase() -> EraseMetadata() already removes the key
+                    // from processing_keys (by key), so calling
+                    // EraseFromProcessing() here would re-erase the same node
+                    // via the now-dangling processing_it_ iterator
+                    // (use-after-free, prod segfault 2026-08-03).
                     this->Erase();
-                    if (tenant_state_ != nullptr && had_processing) {
-                        this->EraseFromProcessing();
-                    }
                     if (tenant_state_ != nullptr) {
                         service_->ErasePromotionTaskIfPresent(
                             *tenant_state_, object_id_.user_key,

@@ -132,7 +132,6 @@ Arguments:
 | `pg.set_host_ip(host_ip)` | Override the host IP used by the backend. | Call before `init_process_group()`. |
 | `pg.set_device_filter(filters)` | Restrict NIC/HCA selection. | Call before `init_process_group()`. |
 | `pg.set_transfer_engine(engine)` | Reuse an external `TransferEngine`. | The engine must outlive all process groups. |
-| `pg.get_preferred_hca(backend, location)` | Query topology-preferred HCA for a location. | Useful for topology-aware placement/debugging. |
 | `pg.get_active_ranks(backend)` | Return the backend active-rank tensor. | Used by EP fallback and recovery paths. |
 | `pg.get_num_synced_ranks(backend)` | Return the number of ranks synchronized by the backend. | Diagnostic helper. |
 | `pg.extend_group_size_to(backend, size)` | Reserve additional inactive ranks. | Newly extended ranks do not participate until recovered. |

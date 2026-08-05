@@ -2,7 +2,7 @@
 
 #include <cstring>
 
-#ifndef MOONCAKE_EP_USE_MUSA
+#ifndef USE_MUSA
 #include <cuda.h>
 #include <cuda_runtime.h>
 #endif
@@ -15,7 +15,7 @@
 
 namespace mooncake {
 
-#ifndef MOONCAKE_EP_USE_MUSA
+#ifndef USE_MUSA
 static bool checkSupportFabricMem() {
     const char* nvlink_ipc = getenv("MC_USE_NVLINK_IPC");
     bool fabric_enabled = nvlink_ipc && strcmp(nvlink_ipc, "0") == 0;
@@ -42,50 +42,43 @@ bool LinkManager::supportFabricMem() {
     return cached;
 }
 
-void LinkManager::init(GlobalRank rank, int max_world_size,
-                       TransferEngine* engine) {
-    if (initialized_.exchange(true, std::memory_order_acq_rel)) {
-        return;
-    }
-    if (shutdown_.load(std::memory_order_acquire)) {
-        initialized_.store(false, std::memory_order_release);
-        LOG(ERROR) << "LinkManager: init() called after shutdown(); ignoring.";
-        return;
-    }
+PGResult<void> LinkManager::init(GlobalRank rank, int max_world_size,
+                                 TransferEngine* engine) {
+    PG_VALIDATE_STATE(!shutdown_.load(std::memory_order_acquire),
+                      "LinkManager cannot be initialized after shutdown");
+    if (initialized_.load(std::memory_order_acquire)) return {};
+    PG_VALIDATE_ARG(max_world_size > 0 && max_world_size <= kMaxNumRanks,
+                    "LinkManager world size is outside the supported range");
 
     rank_ = rank;
     max_world_size_ = max_world_size;
-    CHECK_GT(max_world_size_, 0);
-    CHECK_LE(max_world_size_, kMaxNumRanks)
-        << "max_world_size " << max_world_size_ << " exceeds kMaxNumRanks ("
-        << kMaxNumRanks << ")";
     engine_ = engine;
     local_server_name_ = engine_->getLocalIpAndPort();
     skip_warmup_ = supportFabricMem();
-
     peers_.resize(max_world_size_);
     read_state_ = std::vector<PeerReadState>(max_world_size_);
 
     if (!skip_warmup_) {
-        warmup_send_region_ = std::make_unique<int32_t>(1);
-        int rc = engine_->registerLocalMemory(
-            warmup_send_region_.get(), sizeof(int32_t), kWildcardLocation);
-        if (rc != 0) {
-            LOG(FATAL) << "LinkManager: failed to register warmup send region";
-        }
-
-        warmup_recv_region_ = std::make_unique<int32_t[]>(max_world_size_);
-        std::memset(warmup_recv_region_.get(), 0,
+        auto warmup_send_region = std::make_unique<int32_t>(1);
+        auto warmup_recv_region = std::make_unique<int32_t[]>(max_world_size_);
+        std::memset(warmup_recv_region.get(), 0,
                     max_world_size_ * sizeof(int32_t));
-        rc = engine_->registerLocalMemory(warmup_recv_region_.get(),
-                                          max_world_size_ * sizeof(int32_t),
-                                          kWildcardLocation);
-        if (rc != 0) {
-            LOG(FATAL)
-                << "LinkManager: failed to register warmup recv region, rc="
-                << rc;
-        }
+
+        PG_TRY_TE(engine_->registerLocalMemory(
+            warmup_send_region.get(), sizeof(int32_t), kWildcardLocation));
+
+        const int rc = engine_->registerLocalMemory(
+            warmup_recv_region.get(), max_world_size_ * sizeof(int32_t),
+            kWildcardLocation);
+        if (rc != 0) engine_->unregisterLocalMemory(warmup_send_region.get());
+        PG_TRY_TE(rc);
+
+        warmup_send_region_ = std::move(warmup_send_region);
+        warmup_recv_region_ = std::move(warmup_recv_region);
     }
+
+    initialized_.store(true, std::memory_order_release);
+    return {};
 }
 
 void LinkManager::start(uint64_t self_rank_epoch) {

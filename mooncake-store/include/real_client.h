@@ -15,6 +15,7 @@
 #include "pyclient.h"
 #include "client_service.h"
 #include "client_buffer.h"
+#include "device/cuda_ipc_buffer_handle.h"
 #include "mutex.h"
 #include "utils.h"
 #include "rpc_types.h"
@@ -448,6 +449,15 @@ class RealClient : public PyClient {
         const ReplicateConfig &config, int32_t device_id,
         const UUID &client_id);
 
+    std::vector<tl::expected<void, ErrorCode>>
+    batch_put_from_cuda_ipc_dummy_helper(
+        const std::vector<CudaIpcWriteRequest> &requests,
+        const ReplicateConfig &config, const UUID &client_id);
+
+    std::vector<tl::expected<int64_t, ErrorCode>>
+    batch_get_into_cuda_ipc_dummy_helper(
+        const std::vector<CudaIpcReadRequest> &requests, const UUID &client_id);
+
     std::vector<tl::expected<int64_t, ErrorCode>>
     batch_get_into_multi_buffers_dummy_helper(
         const std::vector<std::string> &keys,
@@ -552,7 +562,8 @@ class RealClient : public PyClient {
         tl::expected<QueryResult, ErrorCode> query_result);
 
     tl::expected<RangedReadMetadata, ErrorCode> resolve_ranged_read_metadata(
-        const std::string &key);
+        const std::string &key,
+        const QueryResultCache *query_result_cache = nullptr);
 
     tl::expected<int64_t, ErrorCode> execute_ranged_read(
         const std::string &key, void *buffer, size_t dst_offset,
@@ -572,10 +583,6 @@ class RealClient : public PyClient {
         const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
         const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
         const std::vector<size_t> *buffer_capacities = nullptr,
-        std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
-            *prepared_results = nullptr,
-        const std::vector<std::vector<std::vector<bool>>> *valid_fragments =
-            nullptr,
         const QueryResultCache *query_result_cache = nullptr);
 
     std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
@@ -888,7 +895,8 @@ class RealClient : public PyClient {
     bool map_dummy_buffer_to_real(const ShmContext &shm_ctx,
                                   uint64_t dummy_addr, size_t buf_size,
                                   const MappedShm *&last_hit_shm,
-                                  void *&out_real) const;
+                                  void *&out_real,
+                                  size_t *out_capacity = nullptr) const;
 
     bool map_dummy_buffer_range_to_real(const ShmContext &shm_ctx,
                                         uint64_t dummy_addr, size_t dst_offset,
@@ -896,7 +904,8 @@ class RealClient : public PyClient {
 
     tl::expected<std::vector<void *>, ErrorCode> map_dummy_addrs_to_real_ptrs(
         const ShmContext &context, const std::vector<uint64_t> &dummy_addrs,
-        const std::vector<size_t> &sizes, const UUID &client_id) const;
+        const std::vector<size_t> &sizes, const UUID &client_id,
+        std::vector<size_t> *capacities = nullptr) const;
 
     tl::expected<std::vector<std::vector<void *>>, ErrorCode>
     map_dummy_nested_addrs_to_real_ptrs(

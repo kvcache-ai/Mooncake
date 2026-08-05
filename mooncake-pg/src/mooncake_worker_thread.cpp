@@ -1,8 +1,8 @@
 #include <cuda_alike.h>
-#include <exception>
+#include <algorithm>
 #include <thread>
 #include <mooncake_worker.cuh>
-#include <mooncake_backend.h>
+#include <mooncake_communicator.h>
 #include <glog/logging.h>
 #include <transfer_engine.h>
 #include "control_plane/rpc.h"
@@ -39,11 +39,10 @@ bool MooncakeWorker::drainTasks(const TransferGroupMeta* meta) const {
         });
 }
 
-bool MooncakeWorker::waitUntilTasksSubmitted(
-    const std::vector<CudaTaskSubmissionToken>& tasks,
-    std::chrono::milliseconds timeout) const {
+void MooncakeWorker::waitUntilTasksSubmitted(
+    const std::vector<CudaTaskSubmissionToken>& tasks) const {
     if (tasks.empty()) {
-        return true;
+        return;
     }
 
     auto submitted = [this, &tasks] {
@@ -62,11 +61,7 @@ bool MooncakeWorker::waitUntilTasksSubmitted(
 
     BackoffWaiter waiter(
         BackoffWaiterConfig::constantSleep(std::chrono::microseconds(10)));
-    if (timeout == kNoTimeout) {
-        waiter.wait(submitted);
-        return true;
-    }
-    return waiter.wait_for(timeout, submitted);
+    waiter.wait(submitted);
 }
 
 void MooncakeWorker::startWorker() {
@@ -83,9 +78,7 @@ void MooncakeWorker::startWorker() {
         size_t rankToTaskId[kNumTasks_][kMaxNumRanks];
         int32_t failedRanks[kNumTasks_][kMaxNumRanks]{};
         int32_t attemptedRanks[kNumTasks_][kMaxNumRanks]{};
-        // Pins an optional hint tensor selected at admission until this slot's
-        // task completes, even if its graph route is concurrently removed.
-        at::Tensor active_hint_tensors[kNumTasks_];
+        int32_t* active_failed_ranks_hint[kNumTasks_]{};
         bool task_detected_failure[kNumTasks_]{};
 
         auto hasFailed = [&failedRanks](size_t task_id, int rank) {
@@ -111,17 +104,15 @@ void MooncakeWorker::startWorker() {
                 }
 
                 auto group = (TransferGroupMeta*)task.transferGroupMeta;
-                bool skipTransfer =
-                    ((c10d::OpType)task.opType == c10d::OpType::BROADCAST &&
-                     group->rank != task.broadcastRoot) ||
-                    ((c10d::OpType)task.opType == c10d::OpType::SCATTER &&
-                     group->rank != task.broadcastRoot) ||
-                    (c10d::OpType)task.opType == c10d::OpType::BARRIER;
+                const auto op_type = static_cast<OpType>(task.opType);
+                bool skipTransfer = (op_type == OpType::Broadcast &&
+                                     group->rank != task.broadcastRoot) ||
+                                    (op_type == OpType::Scatter &&
+                                     group->rank != task.broadcastRoot) ||
+                                    op_type == OpType::Barrier;
 
                 if (task_status[i].load(std::memory_order_acquire) == IDLE) {
                     const auto submit_sequence = task.submitSequence;
-                    const auto hint_route_id = task.hintRouteId;
-
                     // A slot is reused by unrelated tasks. Start with fresh
                     // task-local observations so stale failures/attempts from
                     // the previous occupant cannot affect this task.
@@ -130,23 +121,14 @@ void MooncakeWorker::startWorker() {
                         attemptedRanks[i][j] = 0;
                     }
                     task_detected_failure[i] = false;
-                    active_hint_tensors[i] = at::Tensor();
+                    active_failed_ranks_hint[i] = task.failedRanksHint;
 
-                    {
-                        std::lock_guard<std::mutex> lock(hint_routes_mutex_);
-                        auto it = hint_routes_by_id_.find(hint_route_id);
-                        if (it != hint_routes_by_id_.end()) {
-                            active_hint_tensors[i] = it->second.tensor;
-                        }
-                    }
                     if (task.resetFailedRanksHint &&
-                        active_hint_tensors[i].defined()) {
+                        active_failed_ranks_hint[i]) {
                         // A graph replay carries the captured first-chunk flag,
                         // so it starts a fresh hint in the same tensor storage.
-                        auto* failed = active_hint_tensors[i].data_ptr<int>();
-                        for (int j = 0; j < group->maxGroupSize; ++j) {
-                            failed[j] = 0;
-                        }
+                        std::fill_n(active_failed_ranks_hint[i],
+                                    group->maxGroupSize, int32_t{0});
                     }
                     if (skipTransfer) {
                         submitted_task_sequence_[i].store(
@@ -164,10 +146,8 @@ void MooncakeWorker::startWorker() {
                         if (!group->activeRanks[j] || hasFailed(i, j)) {
                             continue;
                         }
-                        if (((c10d::OpType)task.opType ==
-                                 c10d::OpType::GATHER ||
-                             (c10d::OpType)task.opType ==
-                                 c10d::OpType::REDUCE) &&
+                        if ((op_type == OpType::Gather ||
+                             op_type == OpType::Reduce) &&
                             j != task.broadcastRoot) {
                             continue;
                         }
@@ -175,19 +155,17 @@ void MooncakeWorker::startWorker() {
                         uint64_t source = group->segmentInfos[group->rank]
                                               .send_buffer[task.bufferOffset];
 
-                        switch ((c10d::OpType)task.opType) {
-                            case c10d::OpType::BROADCAST:
-                            case c10d::OpType::ALLREDUCE:
-                            case c10d::OpType::ALLGATHER:
-                            case c10d::OpType::_ALLGATHER_BASE:
-                            case c10d::OpType::REDUCE:
-                            case c10d::OpType::GATHER:
+                        switch (op_type) {
+                            case OpType::Broadcast:
+                            case OpType::AllReduce:
+                            case OpType::AllGather:
+                            case OpType::Reduce:
+                            case OpType::Gather:
                                 break;
-                            case c10d::OpType::ALLTOALL_BASE:
-                            case c10d::OpType::ALLTOALL:
-                            case c10d::OpType::_REDUCE_SCATTER_BASE:
-                            case c10d::OpType::SCATTER:
-                                source += j * task.tensorSize;
+                            case OpType::AllToAll:
+                            case OpType::ReduceScatter:
+                            case OpType::Scatter:
+                                source += j * task.dataSize;
                                 break;
                             default:
                                 break;
@@ -196,19 +174,17 @@ void MooncakeWorker::startWorker() {
                             group->segmentInfos[j]
                                 .recv_buffer[task.bufferOffset];
 
-                        switch ((c10d::OpType)task.opType) {
-                            case c10d::OpType::BROADCAST:
-                            case c10d::OpType::SCATTER:
+                        switch (op_type) {
+                            case OpType::Broadcast:
+                            case OpType::Scatter:
                                 break;
-                            case c10d::OpType::ALLREDUCE:
-                            case c10d::OpType::ALLGATHER:
-                            case c10d::OpType::_ALLGATHER_BASE:
-                            case c10d::OpType::ALLTOALL_BASE:
-                            case c10d::OpType::ALLTOALL:
-                            case c10d::OpType::_REDUCE_SCATTER_BASE:
-                            case c10d::OpType::REDUCE:
-                            case c10d::OpType::GATHER:
-                                target_offset += group->rank * task.tensorSize;
+                            case OpType::AllReduce:
+                            case OpType::AllGather:
+                            case OpType::AllToAll:
+                            case OpType::ReduceScatter:
+                            case OpType::Reduce:
+                            case OpType::Gather:
+                                target_offset += group->rank * task.dataSize;
                                 break;
 
                             default:
@@ -220,7 +196,7 @@ void MooncakeWorker::startWorker() {
                             .source = (void*)source,
                             .target_id = group->segmentIDs[j],
                             .target_offset = target_offset,
-                            .length = task.tensorSize,
+                            .length = task.dataSize,
                         });
 
                         // Attempted to transfer to this peer
@@ -386,17 +362,17 @@ void MooncakeWorker::startWorker() {
                             signal_ptr[j] = 0;
                         }
 
-                        if (active_hint_tensors[i].defined()) {
-                            auto* failed =
-                                active_hint_tensors[i].data_ptr<int>();
-                            for (int j = 0; j < group->maxGroupSize; ++j) {
-                                failed[j] |= failedRanks[i][j];
+                        if (active_failed_ranks_hint[i]) {
+                            for (int rank = 0; rank < group->maxGroupSize;
+                                 ++rank) {
+                                active_failed_ranks_hint[i][rank] |=
+                                    failedRanks[i][rank];
                             }
-                            active_hint_tensors[i] = at::Tensor();
+                            active_failed_ranks_hint[i] = nullptr;
                         }
 
-                        // Push link event via backend's Agent.
-                        if (group->backend) {
+                        // Push link event via communicator's Agent.
+                        if (group->communicator) {
                             bool has_any_attempted = false;
                             for (int j = 0; j < group->maxGroupSize; ++j) {
                                 if (hasAttempted(i, j)) {
@@ -421,7 +397,8 @@ void MooncakeWorker::startWorker() {
                                     event.target_rank_epochs[peer_global] =
                                         group->rankEpochs[peer_global];
                                 }
-                                group->backend->getAgent().pushLinkEvent(event);
+                                group->communicator->getAgent().pushLinkEvent(
+                                    event);
                             }
                         }
 
@@ -435,26 +412,13 @@ void MooncakeWorker::startWorker() {
 
                         if (task_detected_failure[i] &&
                             group->autoSyncOnFailure) {
-                            SyncAfterFailureResponse response;
-                            try {
-                                response = group->backend->syncAfterFailure();
-                            } catch (const std::exception& e) {
-                                LOG(FATAL)
-                                    << "syncAfterFailure RPC failed for rank "
-                                    << group->globalRank << ": " << e.what();
-                            } catch (...) {
-                                LOG(FATAL)
-                                    << "syncAfterFailure RPC failed for rank "
-                                    << group->globalRank
-                                    << " with an unknown exception";
-                            }
-                            if (response.status ==
-                                SyncAfterFailureStatus::Rejected) {
-                                LOG(FATAL)
-                                    << "syncAfterFailure rejected for rank "
-                                    << group->globalRank << ": "
-                                    << response.reject_reason;
-                            }
+                            auto result =
+                                group->communicator->syncAfterFailure();
+                            PG_ASSERT(result.has_value() &&
+                                          result.value().status !=
+                                              SyncAfterFailureStatus::Rejected,
+                                      "syncAfterFailure failed for rank ",
+                                      group->globalRank);
                         }
 
                         task_status[i].store(DONE, std::memory_order_release);
