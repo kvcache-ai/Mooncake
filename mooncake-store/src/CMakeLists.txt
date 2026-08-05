@@ -327,6 +327,7 @@ target_link_libraries(
           gflags::gflags
           JsonCpp::JsonCpp
           yaml-cpp
+          xxHash::xxhash
           mooncake_common
           numa
           asio_shared
