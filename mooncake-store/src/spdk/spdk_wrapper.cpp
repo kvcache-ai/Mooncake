@@ -428,13 +428,7 @@ int SpdkWrapper::SubmitSglRequest(
         return -EINVAL;
     }
 
-    SpdkSglCapabilities capabilities;
-    if (!GetSglCapabilities(seg_handle, &capabilities)) {
-        return -EINVAL;
-    }
-    if (!capabilities.supported) {
-        return -ENOTSUP;
-    }
+    
 
     if (op == kSpdkNofOpRead) {
         return spdk_nvme_ns_cmd_readv(
