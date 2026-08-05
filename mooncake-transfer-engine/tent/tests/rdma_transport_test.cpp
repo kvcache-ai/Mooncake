@@ -17,6 +17,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -81,6 +82,8 @@ std::shared_ptr<Config> makeRdmaConfig() {
     config->set("metadata_type", "p2p");
     config->set("metadata_servers", "P2PHANDSHAKE");
     config->set("transports/rdma/enable", true);
+    config->set("transports/rdma/num_lanes", 1);
+    config->set("transports/rdma/endpoint/max_qp_wr", 1);
     config->set("transports/tcp/enable", false);
     config->set("transports/shm/enable", false);
     return config;
@@ -122,6 +125,9 @@ TEST(RdmaTransportIntegrationTest, WriteThenReadAcrossProcesses) {
     if (!hasRdmaDevice()) GTEST_SKIP() << "no RDMA device detected";
 
     constexpr size_t kDataLength = 4 * 1024 * 1024;
+    constexpr size_t kCancelTaskCount = 16;
+    constexpr size_t kCancelStride = 8 * 1024 * 1024;
+    constexpr size_t kBufferLength = kCancelTaskCount * kCancelStride;
     int ready_pipe[2];
     int stop_pipe[2];
     ASSERT_EQ(pipe(ready_pipe), 0);
@@ -135,7 +141,7 @@ TEST(RdmaTransportIntegrationTest, WriteThenReadAcrossProcesses) {
 
         TransferEngine server(makeRdmaConfig());
         if (!server.available()) _exit(2);
-        std::vector<uint8_t> buffer(kDataLength);
+        std::vector<uint8_t> buffer(kBufferLength);
         if (!server.registerLocalMemory(buffer.data(), buffer.size()).ok())
             _exit(3);
 
@@ -172,7 +178,7 @@ TEST(RdmaTransportIntegrationTest, WriteThenReadAcrossProcesses) {
 
     TransferEngine client(makeRdmaConfig());
     ASSERT_TRUE(client.available());
-    std::vector<uint8_t> buffer(kDataLength * 2);
+    std::vector<uint8_t> buffer(kBufferLength);
     for (size_t i = 0; i < kDataLength; ++i) {
         buffer[i] = static_cast<uint8_t>((i * 31) & 0xff);
     }
@@ -213,6 +219,45 @@ TEST(RdmaTransportIntegrationTest, WriteThenReadAcrossProcesses) {
     EXPECT_EQ(
         std::memcmp(buffer.data(), buffer.data() + kDataLength, kDataLength),
         0);
+
+    // Keep one QP/worker and one outstanding WR so the tail task remains in
+    // the worker's unposted set long enough to exercise real cancellation.
+    std::vector<Request> cancel_requests;
+    cancel_requests.reserve(kCancelTaskCount);
+    for (size_t i = 0; i < kCancelTaskCount; ++i) {
+        Request cancel_request{};
+        cancel_request.opcode = Request::WRITE;
+        cancel_request.source = buffer.data() + i * kCancelStride;
+        cancel_request.target_id = segment;
+        cancel_request.target_offset = info.buffers[0].base + i * kCancelStride;
+        cancel_request.length = kDataLength;
+        cancel_request.transport_hint = RDMA;
+        cancel_requests.push_back(cancel_request);
+    }
+
+    batch = client.allocateBatch(kCancelTaskCount);
+    ASSERT_TRUE(client.submitTransfer(batch, cancel_requests).ok());
+    const size_t cancel_task_id = kCancelTaskCount - 1;
+    ASSERT_TRUE(client.cancelTransfer(batch, cancel_task_id).ok());
+    ASSERT_TRUE(client.cancelTransfer(batch, cancel_task_id).ok());
+
+    std::vector<TransferStatus> statuses;
+    for (int poll = 0; poll < 10000; ++poll) {
+        ASSERT_TRUE(client.getTransferStatus(batch, statuses).ok());
+        if (std::all_of(statuses.begin(), statuses.end(),
+                        [](const TransferStatus& task_status) {
+                            return task_status.s != TransferStatusEnum::PENDING;
+                        }))
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_EQ(statuses.size(), kCancelTaskCount);
+    for (size_t i = 0; i < cancel_task_id; ++i) {
+        EXPECT_EQ(statuses[i].s, TransferStatusEnum::COMPLETED);
+    }
+    EXPECT_EQ(statuses[cancel_task_id].s, TransferStatusEnum::CANCELED);
+    EXPECT_LE(statuses[cancel_task_id].transferred_bytes, kDataLength);
+    ASSERT_TRUE(client.freeBatch(batch).ok());
 
     EXPECT_TRUE(client.closeSegment(segment).ok());
     EXPECT_TRUE(

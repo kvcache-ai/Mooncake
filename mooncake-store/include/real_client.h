@@ -15,6 +15,7 @@
 #include "pyclient.h"
 #include "client_service.h"
 #include "client_buffer.h"
+#include "device/cuda_ipc_buffer_handle.h"
 #include "mutex.h"
 #include "utils.h"
 #include "rpc_types.h"
@@ -29,6 +30,7 @@
 namespace mooncake {
 
 class RealClient;
+class RegisteredPinnedRegion;
 class UdsAcceptor;
 class UdsConnection;
 
@@ -89,7 +91,9 @@ class RealClient : public PyClient {
         const std::string &ipc_socket_path = "",
         bool enable_ssd_offload = false,
         const std::string &ssd_offload_path = "",
-        const std::string &tenant_id = "default");
+        const std::string &tenant_id = "default",
+        bool enable_client_http_server = false,
+        int client_http_port = DEFAULT_CLIENT_HTTP_PORT);
 
     int setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
                     const std::string &server_address,
@@ -386,6 +390,9 @@ class RealClient : public PyClient {
     batch_acquire_buffer_dummy(const std::vector<std::string> &keys,
                                const UUID &client_id);
 
+    tl::expected<std::tuple<uint64_t, size_t>, ErrorCode> allocate_buffer_dummy(
+        size_t size, const UUID &client_id);
+
     tl::expected<void, ErrorCode> put_dummy_helper(
         const std::string &key, std::span<const char> value,
         const ReplicateConfig &config, const UUID &client_id);
@@ -442,6 +449,15 @@ class RealClient : public PyClient {
         const ReplicateConfig &config, int32_t device_id,
         const UUID &client_id);
 
+    std::vector<tl::expected<void, ErrorCode>>
+    batch_put_from_cuda_ipc_dummy_helper(
+        const std::vector<CudaIpcWriteRequest> &requests,
+        const ReplicateConfig &config, const UUID &client_id);
+
+    std::vector<tl::expected<int64_t, ErrorCode>>
+    batch_get_into_cuda_ipc_dummy_helper(
+        const std::vector<CudaIpcReadRequest> &requests, const UUID &client_id);
+
     std::vector<tl::expected<int64_t, ErrorCode>>
     batch_get_into_multi_buffers_dummy_helper(
         const std::vector<std::string> &keys,
@@ -452,7 +468,8 @@ class RealClient : public PyClient {
 
     tl::expected<int64_t, ErrorCode> get_into_range_shm_helper(
         const std::string &key, uint64_t buffer, size_t dst_offset,
-        size_t src_offset, size_t size, const UUID &client_id);
+        size_t src_offset, size_t size, bool size_is_buffer_capacity,
+        bool verify_checksum, const UUID &client_id);
 
     std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
     get_into_ranges_shm_helper(
@@ -511,7 +528,9 @@ class RealClient : public PyClient {
         const std::string &ipc_socket_path = "", int local_rpc_port = 50052,
         bool enable_ssd_offload = false, bool start_offload_rpc_server = false,
         const std::string &ssd_offload_path = "",
-        const std::string &tenant_id = "default");
+        const std::string &tenant_id = "default",
+        bool enable_client_http_server = false,
+        int client_http_port = DEFAULT_CLIENT_HTTP_PORT);
 
     // Overload that accepts a configuration dictionary
     tl::expected<void, ErrorCode> setup_internal(const ConfigDict &config);
@@ -543,16 +562,18 @@ class RealClient : public PyClient {
         tl::expected<QueryResult, ErrorCode> query_result);
 
     tl::expected<RangedReadMetadata, ErrorCode> resolve_ranged_read_metadata(
-        const std::string &key);
+        const std::string &key,
+        const QueryResultCache *query_result_cache = nullptr);
 
     tl::expected<int64_t, ErrorCode> execute_ranged_read(
         const std::string &key, void *buffer, size_t dst_offset,
         size_t src_offset, size_t size, const RangedReadMetadata &metadata,
-        bool size_is_buffer_capacity = false);
+        bool size_is_buffer_capacity, bool verify_checksum);
 
     tl::expected<int64_t, ErrorCode> get_into_range_internal(
         const std::string &key, void *buffer, size_t dst_offset,
-        size_t src_offset, size_t size, bool size_is_buffer_capacity = false);
+        size_t src_offset, size_t size, bool size_is_buffer_capacity,
+        bool verify_checksum);
 
     std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
     get_into_ranges_internal(
@@ -562,10 +583,6 @@ class RealClient : public PyClient {
         const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
         const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
         const std::vector<size_t> *buffer_capacities = nullptr,
-        std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
-            *prepared_results = nullptr,
-        const std::vector<std::vector<std::vector<bool>>> *valid_fragments =
-            nullptr,
         const QueryResultCache *query_result_cache = nullptr);
 
     std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
@@ -752,7 +769,10 @@ class RealClient : public PyClient {
         void *base = nullptr;
         size_t size = 0;
         std::string protocol;
+        std::shared_ptr<RegisteredPinnedRegion> pinned_region;
     };
+
+    void FreeAllocatedStoreSegment(AllocatedSegmentRecord &record);
 
     std::unique_ptr<AutoPortBinder> port_binder_ = nullptr;
 
@@ -792,6 +812,16 @@ class RealClient : public PyClient {
         }
     };
 
+#ifdef USE_VRAM_SEGMENT
+    struct VRAMSegmentDeleter {
+        void operator()(void *ptr) {
+            if (ptr) {
+                free_memory("vram", ptr);
+            }
+        }
+    };
+#endif
+
 #if defined(USE_SUNRISE)
     struct SunriseSegmentDeleter {
         void operator()(void *ptr) {
@@ -808,10 +838,16 @@ class RealClient : public PyClient {
     std::vector<std::unique_ptr<void, AscendSegmentDeleter>>
         ascend_segment_ptrs_;
     std::vector<std::unique_ptr<void, UbSegmentDeleter>> ub_segment_ptrs_;
+#ifdef USE_VRAM_SEGMENT
+    std::vector<std::unique_ptr<void, VRAMSegmentDeleter>> vram_segment_ptrs_;
+#endif
 #if defined(USE_SUNRISE)
     std::vector<std::unique_ptr<void, SunriseSegmentDeleter>>
         sunrise_segment_ptrs_;
 #endif
+    std::vector<std::shared_ptr<RegisteredPinnedRegion>>
+        setup_segment_pinned_regions_;
+    bool setup_segment_memory_must_leak_ = false;
     std::string protocol;
     std::string device_name;
     std::string local_hostname;
@@ -859,7 +895,8 @@ class RealClient : public PyClient {
     bool map_dummy_buffer_to_real(const ShmContext &shm_ctx,
                                   uint64_t dummy_addr, size_t buf_size,
                                   const MappedShm *&last_hit_shm,
-                                  void *&out_real) const;
+                                  void *&out_real,
+                                  size_t *out_capacity = nullptr) const;
 
     bool map_dummy_buffer_range_to_real(const ShmContext &shm_ctx,
                                         uint64_t dummy_addr, size_t dst_offset,
@@ -867,7 +904,8 @@ class RealClient : public PyClient {
 
     tl::expected<std::vector<void *>, ErrorCode> map_dummy_addrs_to_real_ptrs(
         const ShmContext &context, const std::vector<uint64_t> &dummy_addrs,
-        const std::vector<size_t> &sizes, const UUID &client_id) const;
+        const std::vector<size_t> &sizes, const UUID &client_id,
+        std::vector<size_t> *capacities = nullptr) const;
 
     tl::expected<std::vector<std::vector<void *>>, ErrorCode>
     map_dummy_nested_addrs_to_real_ptrs(
@@ -909,7 +947,7 @@ class RealClient : public PyClient {
     int stop_ipc_server();
     // Embedded HTTP server for health-check / metrics
     std::unique_ptr<coro_http::coro_http_server> http_server_;
-    int start_http_server();
+    int start_http_server(int port);
     void stop_http_server();
 
     void handle_ipc_shm_register(UdsConnection &connection);

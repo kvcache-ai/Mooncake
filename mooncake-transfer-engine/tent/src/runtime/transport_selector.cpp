@@ -18,44 +18,12 @@
 #include "tent/thirdparty/nlohmann/json.h"
 
 #include <algorithm>
-#include <glog/logging.h>
-
-#include <algorithm>
 #include <cctype>
+#include <cstdint>
+#include <glog/logging.h>
 
 namespace mooncake {
 namespace tent {
-
-// Transport type name mapping
-static const std::unordered_map<std::string, TransportType> kTransportNameMap =
-    {
-        {"unspec", UNSPEC},
-        {"rdma", RDMA},
-        {"mnnvl", MNNVL},
-        {"shm", SHM},
-        {"nvlink", NVLINK},
-        {"gds", GDS},
-        {"io_uring", IOURING},
-        {"tcp", TCP},
-        {"ascend", AscendDirect},
-        {"sunrise_link", SUNRISE_LINK},
-        {"tpu", TPU},
-};
-
-static const std::unordered_map<TransportType, std::string>
-    kTransportTypeNames = {
-        {UNSPEC, "unspec"},
-        {RDMA, "rdma"},
-        {MNNVL, "mnnvl"},
-        {SHM, "shm"},
-        {NVLINK, "nvlink"},
-        {GDS, "gds"},
-        {IOURING, "io_uring"},
-        {TCP, "tcp"},
-        {AscendDirect, "ascend"},
-        {SUNRISE_LINK, "sunrise_link"},
-        {TPU, "tpu"},
-};
 
 // Memory type name mapping for pattern matching
 static const std::string kMemoryTypeCpu = "cpu";
@@ -63,21 +31,44 @@ static const std::string kMemoryTypeCuda = "cuda";
 static const std::string kMemoryTypeNpu = "npu";
 static const std::string kMemoryTypeWildcard = "*";
 
-std::string TransportSelector::transportTypeName(TransportType type) {
-    auto it = kTransportTypeNames.find(type);
-    if (it != kTransportTypeNames.end()) {
-        return it->second;
-    }
-    return "unknown";
-}
+static const std::unordered_map<std::string, IntentType> kIntentTypeNameMap = {
+    {"intent_unspec", IntentType::INTENT_UNSPEC},
+    {"unspec", IntentType::INTENT_UNSPEC},
+    {"foreground_get", IntentType::FOREGROUND_GET},
+    {"background_prefetch", IntentType::BACKGROUND_PREFETCH},
+    {"migration", IntentType::MIGRATION},
+    {"checkpoint", IntentType::CHECKPOINT},
+    {"weight_loading", IntentType::WEIGHT_LOADING},
+    {"staging_internal", IntentType::STAGING_INTERNAL},
+};
 
-TransportType TransportSelector::parseTransportType(const std::string& str) {
-    auto it = kTransportNameMap.find(str);
-    if (it != kTransportNameMap.end()) {
-        return it->second;
+static std::optional<IntentType> parseIntentType(const json& value) {
+    if (value.is_string()) {
+        auto name = value.get<std::string>();
+        std::transform(name.begin(), name.end(), name.begin(),
+                       [](unsigned char c) { return std::tolower(c); });
+        auto it = kIntentTypeNameMap.find(name);
+        if (it != kIntentTypeNameMap.end()) return it->second;
+        return std::nullopt;
     }
-    LOG(WARNING) << "Unknown transport type: " << str;
-    return UNSPEC;
+
+    if (value.is_number_unsigned()) {
+        const auto raw = value.get<uint64_t>();
+        if (raw <= static_cast<uint64_t>(IntentType::STAGING_INTERNAL)) {
+            return static_cast<IntentType>(raw);
+        }
+        return std::nullopt;
+    }
+
+    if (value.is_number_integer()) {
+        const auto raw = value.get<int64_t>();
+        if (raw >= static_cast<int64_t>(IntentType::INTENT_UNSPEC) &&
+            raw <= static_cast<int64_t>(IntentType::STAGING_INTERNAL)) {
+            return static_cast<IntentType>(raw);
+        }
+    }
+
+    return std::nullopt;
 }
 
 std::vector<SelectionPolicy> TransportSelector::getDefaultPolicies() {
@@ -86,14 +77,18 @@ std::vector<SelectionPolicy> TransportSelector::getDefaultPolicies() {
         {
             "file_storage",
             SegmentType::File,
-            std::nullopt,   // same_machine doesn't matter for file
-            std::nullopt,   // local_memory_pattern
-            std::nullopt,   // remote_memory_pattern
-            std::nullopt,   // min_size
-            std::nullopt,   // max_size
-            std::nullopt,   // priority
-            {},             // devices (empty = all devices)
-            {GDS, IOURING}  // File segment priority (original: GDS -> IOURING)
+            std::nullopt,    // same_machine doesn't matter for file
+            std::nullopt,    // local_memory_pattern
+            std::nullopt,    // remote_memory_pattern
+            std::nullopt,    // min_size
+            std::nullopt,    // max_size
+            std::nullopt,    // priority
+            {},              // devices (empty = all devices)
+            {GDS, IOURING},  // File priority (original: GDS -> IOURING)
+            std::nullopt,    // service_level
+            std::nullopt,    // traffic_class
+            std::nullopt,    // qp_pool
+            std::nullopt     // intent_type
         },
         {
             "memory_default",
@@ -101,11 +96,15 @@ std::vector<SelectionPolicy> TransportSelector::getDefaultPolicies() {
             std::nullopt,  // any machine
             std::nullopt,  // any local memory
             std::nullopt,  // any remote memory
-            std::nullopt,  // any size
-            std::nullopt,  // min_priority
+            std::nullopt,  // min_size
+            std::nullopt,  // max_size
+            std::nullopt,  // priority
             {},            // devices (empty = all devices)
-            {}  // Empty priority = use buffer_transports order (original
-                // behavior)
+            {},            // Empty = use buffer_transports order
+            std::nullopt,  // service_level
+            std::nullopt,  // traffic_class
+            std::nullopt,  // qp_pool
+            std::nullopt   // intent_type
         },
     };
 }
@@ -196,6 +195,19 @@ void TransportSelector::loadPolicies() {
             policy.priority = std::nullopt;
         }
 
+        // Parse the optional business-intent filter. An invalid value skips the
+        // entire policy instead of turning it into a catch-all rule, which
+        // would silently broaden its authorization scope.
+        if (policy_json.contains("intent_type")) {
+            auto intent = parseIntentType(policy_json["intent_type"]);
+            if (!intent.has_value()) {
+                LOG(WARNING)
+                    << "Skip policy " << policy.name << ": invalid intent_type";
+                continue;
+            }
+            policy.intent_type = *intent;
+        }
+
         // Parse devices (optional)
         if (policy_json.contains("devices")) {
             for (const auto& device_name : policy_json["devices"]) {
@@ -210,8 +222,11 @@ void TransportSelector::loadPolicies() {
         if (policy_json.contains("transports")) {
             for (const auto& transport_str : policy_json["transports"]) {
                 if (!transport_str.is_string()) continue;
-                TransportType type =
-                    parseTransportType(transport_str.get<std::string>());
+                const auto name = transport_str.get<std::string>();
+                TransportType type = parseTransportType(name);
+                if (type == UNSPEC && name != "unspec") {
+                    LOG(WARNING) << "Unknown transport type: " << name;
+                }
                 if (type != UNSPEC) {
                     policy.transports.push_back(type);
                 }
@@ -349,6 +364,13 @@ bool TransportSelector::matchesPolicy(const SelectionPolicy& policy,
         if (context.priority_level != policy.priority.value()) {
             return false;
         }
+    }
+
+    // Policies without an intent filter retain the historical catch-all
+    // behavior. Intent-specific policies require an exact match.
+    if (policy.intent_type.has_value() &&
+        context.intent_type != policy.intent_type.value()) {
+        return false;
     }
 
     return true;

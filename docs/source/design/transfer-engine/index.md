@@ -161,7 +161,7 @@ The following video shows a normal run as described above, with the Target on th
 ## Transfer Engine C/C++ API
 Transfer Engine provides interfaces through the `TransferEngine` class (located in `mooncake-transfer-engine/include/transfer_engine.h`), where the specific data transfer functions for different backends are implemented by the `Transport` class, currently supporting `TcpTransport`, `RdmaTransport`, `EfaTransport` (for AWS EFA), `NVMeoFTransport`, `NvlinkTransport` (for NVIDIA GPUs), `IntraNodeNvlinkTransport` (for NVIDIA GPUs), and `HipTransport` (for AMD GPUs).
 
-For a complete C++ API reference, see [Transfer Engine C++ API Reference](cpp-api.md).
+For a complete C++ API reference, see [Transfer Engine C++ API Reference](../../api-reference/cpp/transfer-engine.md).
 
 ### Data Transfer
 Transfer Engine provides batch-based read/write transfers between segments (DRAM/VRAM/NVMeof). A typical flow is: register local memory, open a target segment, submit a batch, and poll status. Detailed function signatures and usage are documented in the C++ API reference.
@@ -435,7 +435,7 @@ if __name__ == "__main__":
 
 ::::
 
-For more Python APIs, see [Transfer Engine Python API](../../python-api-reference/transfer-engine.md).
+For more Python APIs, see [Transfer Engine Python API](../../api-reference/python/transfer-engine.md).
 
 ### Using C/C++ Interface
 After compiling Mooncake Store, you can move the compiled static library file `libtransfer_engine.a` and the C header file `transfer_engine_c.h` into your own project. There is no need to reference other files under `src/transfer_engine`.
@@ -456,7 +456,7 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_IB_PORT` The IB port number used per device instance, default value 1
 - `MC_IB_TC` Adjust RDMA NIC Traffic Class when switch/NIC defaults differ or for traffic planning. Default value -1
 - `MC_IB_SL` Set the InfiniBand Service Level (0-15) of RDMA QPs. The switch maps SL to a Virtual Lane for QoS isolation, e.g. to steer KV-cache traffic into a different VL than Expert-Parallel all-to-all traffic that shares the same NIC. -1 keeps the default (0). Default value -1
-- `MC_IB_PCI_RELAXED_ORDERING` Setting the PCIe ordering to relaxed for the network adapter sometimes results in better performance. Can set 1 to enable RO function. Default value 0
+- `MC_IB_PCI_RELAXED_ORDERING` Controls PCIe Relaxed Ordering (RO) for RDMA memory regions. `0`: disabled, `1`: enabled if supported by hardware (default), `2`: auto. Requires `ibv_reg_mr_iova2` (libibverbs ≥ 1.8); falls back to strict ordering if unavailable.
 - `MC_MLX5_QP_UDP_SPORTS` Comma-separated list of UDP source ports (0-65535) used to override the RoCEv2 UDP source port of each QP, for spreading traffic across different ECMP/LAG paths. QP at index *i* uses `list[i % size]`. Default empty (driver chooses). **Requires** an mlx5 NIC + RoCEv2, and the binary built with `-DUSE_MLX5DV=ON`. Recommend ports in the dynamic range 49152-65535. Example: `MC_MLX5_QP_UDP_SPORTS="49152,49153,49154,49155"`
 - `MC_MLX5_QP_LAG_PORT_BALANCE` Set to `1` or `true` to enable automatic LAG port balancing across bonded physical ports. QP at index *i* is pinned to port `(i % num_lag_ports) + 1`; the number of LAG ports is queried from hardware via `mlx5dv_query_device` at startup and printed in the device log. If the device is not in LAG mode the setting is a no-op. Default: disabled. **Requires** the binary built with `-DUSE_MLX5DV=ON`. Example: `MC_MLX5_QP_LAG_PORT_BALANCE=1`
 - `MC_GID_INDEX` The GID index used per device instance, default value 3 (or the maximum value supported by the platform)
@@ -471,9 +471,12 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_WORKERS_PER_CTX` The number of asynchronous worker threads corresponding to each device instance
 - `MC_SLICE_SIZE` The segmentation granularity of user requests in Transfer Engine
 - `MC_RETRY_CNT` The maximum number of retries in Transfer Engine
+- `MC_TE_FILTERS` Restrict which RDMA NICs the engine discovers and uses, as a comma-separated allow-list of device names (e.g. `mlx5_bond_0,mlx5_bond_1`). Only the listed NICs are kept; all others are ignored. Unset (default) discovers all NICs. This is the **same env var and semantics as the legacy Transfer Engine's device whitelist** (see below), so a single variable scopes NICs across both engines. Useful on multi-NIC / multi-NUMA hosts to keep the engine (and its rail selection) off NICs that are not routable to the peer.
+- `MC_TE_FILTERS_EXCLUDE` The deny-list counterpart of `MC_TE_FILTERS`: a comma-separated list of device names to exclude from discovery. Ignored if `MC_TE_FILTERS` is set (allow-list takes precedence). Unset (default) excludes nothing. (New; the legacy engine has an allow-list only.)
 - `MC_AUTO_GID_MAX_RETRIES` The maximum number of automatic local GID reprobe retries during classic RDMA handshake recovery. Default value 2. Set to 0 to disable automatic GID retry.
 - `MC_LOG_LEVEL` This option can be set as `TRACE`/`INFO`/`WARNING`/`ERROR` (see [glog doc](https://github.com/google/glog/blob/master/docs/logging.md)), and more detailed logs will be output during runtime
 - `MC_DISABLE_METACACHE` Disable local meta cache to prevent transfer failure due to dynamic memory registrations, which may downgrades the performance
+- `MC_TE_METADATA_REFRESH_INTERVAL_SECONDS` Periodically refresh Transfer Engine metadata-derived local caches. Currently refreshes cached remote segment descriptors from the metadata service. Default value 0 disables background polling; callers may still manually invoke `syncSegmentCache()`. Set a positive interval in seconds when peers may re-register the same segment name after restart and cached descriptors must converge automatically
 - `MC_HANDSHAKE_LISTEN_BACKLOG` The backlog size of socket listening for handshaking, default value is 128
 - `MC_HANDSHAKE_CONNECT_TIMEOUT` Connect timeout in seconds for outbound handshake-port requests (QP handshake, probe, notify, metadata exchange), default value is 5. Bounds the stall when the peer address is unreachable; without it, a connect to an unroutable address (e.g. a removed node) blocks for the kernel's full TCP SYN retry cycle, which can take minutes
 - `MC_HANDSHAKE_MAX_LENGTH` The maximum handshake message length in bytes for P2P mode. Valid range: 1MB to 128MB. Default value is 1MB (1048576 bytes). Increase this value when using a single RDMA instance with many registered memory buffers (>10,000) to avoid handshake failures. Example: set to 10485760 for 10MB
@@ -482,7 +485,10 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_REDIS_DB_INDEX` The database index for Redis storage plugin, must be an integer between 0 and 255. Only takes effect when Redis is specified as the metadata server. If not set or invalid, the default value is 0.
 - `MC_FRAGMENT_RATIO ` In RdmaTransport::submitTransferTask, if the last data piece after division is ≤ 1/MC_FRAGMENT_RATIO of the block size, it merges with the previous block to reduce overhead. The default value is 4
 - `MC_ENABLE_DEST_DEVICE_AFFINITY` Enable device affinity for RDMA performance optimization. When enabled, Transfer Engine will prioritize communication with remote NICs that have the same name as local NICs to reduce QP count and improve network performance in rail-optimized topologies. The default value is false
+- `MC_TRACK_RDMA_POSTED_SLICES` Enable RDMA posted-slice tracking for timeout diagnostics. When enabled, CQ timeout logs include stuck transfer groups by peer NIC path, slice count, bytes, oldest post age, and sample addresses. This adds synchronization on the RDMA post and poll hot paths, so it is disabled by default and should be enabled only while diagnosing stuck completions.
 - `MC_ENABLE_PARALLEL_REG_MR` Control parallel memory region registration across multiple RDMA NICs. Valid values: -1 (auto, default), 0 (disabled), 1 (enabled). When set to -1, parallel registration is automatically enabled when multiple RNICs exist and memory has been pre-touched. Note: If memory hasn't been touched before registration, parallel registration can be slower than sequential registration
+- `MC_MAX_CONCURRENT_REG_MR` Cap on how many buffers `registerLocalMemoryBatch` registers concurrently (EFA transport). The default 0 means unbounded — one thread per buffer, the historical behavior. Note the cap is **per process**, so a framework running one `TransferEngine` per TP rank multiplies it by the rank count. Capping can cut registration time substantially when a batch holds many large GPU buffers. Registration is CPU-bound, so a reasonable value is `cores / processes-per-node` — on a 192-core node running 8 ranks, around 16. Oversubscribing costs more than undersubscribing, and the result also depends on the order the caller passes buffers in, so a poorly chosen cap can be slower than unbounded — hence opt-in.
+- `MC_EFA_NIC_SELECTION` Which NICs the EFA transport registers a buffer on. `all` (the default) registers every buffer on every NIC. `local` restricts **device** memory to the NICs the topology reports as closest to that GPU, which on p5.48xlarge is the 4 EFA devices sharing the GPU's PCIe root complex. Because EFA charges device-memory registration in proportion to the device bytes already registered on the same libfabric domain, narrowing the NIC set cuts registration time by close to the fan-out ratio. Set it when registering many GPU buffers is a startup bottleneck; it is opt-in because fewer NICs can serve a transfer touching that buffer, so a job whose working set sits behind a single GPU is capped at that rail group's bandwidth rather than the node's. Host memory is unaffected. Combine with `MC_MAX_CONCURRENT_REG_MR`, which bounds a different variable: this reduces the cost per registration, that one reduces how many run at once.
 - `MC_FORCE_HCA` Force to use RDMA as the active transport, return error if no HCA has been found.
 - `MC_FORCE_MNNVL` Force to use Multi-Node NVLink as the active transport regardless whether RDMA devices are installed.
 - `MC_INTRA_NVLINK` Enable intra-node NVLINK transport, and cannot be used together with MC_FORCE_MNNVL.
@@ -495,6 +501,7 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_ENDPOINT_STORE_TYPE` Choose FIFO Endpoint Store (`FIFO`) or Sieve Endpoint Store (`SIEVE`), default is `SIEVE`.
 - `MC_TCP_ENABLE_CONNECTION_POOL` Enable TCP Connection Pool to avoid excessive sockets.
 - `MC_TCP_SLICE_SIZE` The segmentation granularity (in bytes) of TCP transport for splitting large transfers into socket read/write operations. Corresponds to `MC_SLICE_SIZE` for RDMA. Default value 65536 (64KB).
+- `MC_TCP_PROTO` When set to `1`, TCP initiators use the legacy unacknowledged framing even against servers that support acknowledged framing (protocol v2). Under v2 (the default against v2-capable servers), a WRITE completes only after the receiver confirms the payload has been applied to destination memory, and server-side rejections surface as failed transfers instead of silent data loss. Use this variable only as a rollback escape hatch during mixed-version upgrades.
 
 ## C++ API Reference
 

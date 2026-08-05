@@ -1,0 +1,272 @@
+name: Release ROCm
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        # Only tags whose tree already contains ROCm support (the HIP_BUILD
+        # variant in scripts/build_wheel.sh, i.e. this PR onward) can be built.
+        # Tags predating ROCm support are rejected by the guard below, since
+        # they would produce a mislabeled default-named wheel.
+        description: 'Release tag to (re)build the ROCm wheel for (must contain HIP_BUILD support)'
+        required: true
+        type: string
+
+concurrency:
+  group: release-rocm-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.ref_name, '-') }}
+    runs-on: ubuntu-22.04
+    # ROCm 7.2 dev image: matches the upstream vllm/vllm-openai-rocm and sglang
+    # ROCm images. hipcc/HIP/hsa-runtime are present; no GPU needed to compile.
+    container: rocm/dev-ubuntu-22.04:7.2.3-complete
+
+    permissions:
+      contents: write
+
+    strategy:
+      max-parallel: 2
+      matrix:
+        python-version: ['3.10', '3.11', '3.12', '3.13']
+
+    env:
+      HIP_BUILD: "1"
+
+    steps:
+      # git must exist BEFORE checkout so actions/checkout does a real clone
+      # (with .git + submodules); the rocm/dev image ships without git.
+      - name: Install git (pre-checkout)
+        shell: bash
+        run: |
+          set -eo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -y
+          apt-get install -y --no-install-recommends git ca-certificates
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || github.ref }}
+          fetch-depth: 0
+          submodules: recursive
+
+      - name: Mark repository as safe
+        shell: bash
+        run: git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
+
+      - name: Validate backfill target
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ "${RELEASE_TAG}" != v* || "${RELEASE_TAG}" == *-* ]]; then
+            echo "::error::Backfill tag must be a stable release tag starting with v"
+            exit 1
+          fi
+          git check-ref-format "refs/tags/${RELEASE_TAG}"
+          TAG_SHA="$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")"
+          BUILD_SHA="$(git rev-parse HEAD)"
+          if [[ "${BUILD_SHA}" != "${TAG_SHA}" ]]; then
+            echo "::error::Build source ${BUILD_SHA} does not match ${RELEASE_TAG} at ${TAG_SHA}"
+            exit 1
+          fi
+
+      - name: Ensure checked-out tree supports the ROCm wheel variant
+        shell: bash
+        run: |
+          set -eo pipefail
+          # Guard against backfilling a tag that predates ROCm support: its
+          # scripts/build_wheel.sh would ignore HIP_BUILD and emit the default
+          # "mooncake-transfer-engine" package, which the publish steps would
+          # then upload over the CUDA package on PyPI. Refuse such tags.
+          if ! grep -q 'HIP_BUILD' scripts/build_wheel.sh; then
+            echo "::error::Checked-out tree has no HIP_BUILD support in scripts/build_wheel.sh;"
+            echo "::error::refusing to build a mislabeled ROCm wheel. Use a tag at or after ROCm support landed."
+            exit 1
+          fi
+
+      - name: Install toolchain and Python ${{ matrix.python-version }}
+        shell: bash
+        run: |
+          set -eo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -y
+          apt-get install -y --no-install-recommends \
+            git curl ca-certificates build-essential sudo pkg-config \
+            ninja-build software-properties-common
+          PYV="${{ matrix.python-version }}"
+          if ! command -v "python${PYV}" >/dev/null 2>&1; then
+            add-apt-repository -y ppa:deadsnakes/ppa
+            apt-get update -y
+          fi
+          # Always install -dev + -venv: the image's system python3.10 exists but
+          # ships without the venv module / dev headers.
+          apt-get install -y --no-install-recommends \
+            "python${PYV}" "python${PYV}-dev" "python${PYV}-venv"
+          curl -sS https://bootstrap.pypa.io/get-pip.py | "python${PYV}"
+          PYTHON_BIN="$(command -v python${PYV})"
+          echo "PYTHON_BIN=${PYTHON_BIN}" >> "$GITHUB_ENV"
+          echo "/opt/rocm/bin" >> "$GITHUB_PATH"
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          set -eo pipefail
+          bash -x dependencies.sh -y
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+
+      - name: Configure project
+        shell: bash
+        run: |
+          set -eo pipefail
+          export PATH="/opt/rocm/bin:$PATH"   # hipify-perl for USE_HIP
+          rm -rf build && mkdir build && cd build
+          cmake -G Ninja .. \
+            -DUSE_HIP=ON -DUSE_CUDA=OFF -DWITH_EP=OFF \
+            -DUSE_HTTP=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON \
+            -DBUILD_UNIT_TESTS=OFF -DENABLE_DEBUG_SYMBOLS=OFF \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DPython3_EXECUTABLE="${PYTHON_BIN}"
+
+      - name: Build project
+        shell: bash
+        run: |
+          set -eo pipefail
+          export PATH="/opt/rocm/bin:$PATH"
+          cd build
+          # Retry to ride out transient Go module (proxy.golang.org) fetch errors
+          # during the etcd-wrapper build; Go caches modules, so retries resume.
+          n=0
+          until cmake --build . -j"$(nproc)"; do
+            n=$((n+1))
+            if [ "$n" -ge 3 ]; then echo "Build failed after $n attempts"; exit 1; fi
+            echo "Build attempt $n failed; retrying in 15s..."; sleep 15
+          done
+          cmake --install .
+
+      - name: Generate Python version tag
+        id: generate_tag_release
+        shell: bash
+        run: echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> "$GITHUB_OUTPUT"
+
+      - name: Build Python wheel
+        shell: bash
+        run: |
+          set -eo pipefail
+          export PATH="/opt/rocm/bin:$PATH"
+          export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:/usr/local/lib"
+          HIP_BUILD=1 PYTHON_VERSION=${{ matrix.python-version }} \
+            OUTPUT_DIR=dist-rocm-py${{ steps.generate_tag_release.outputs.python_version_tag }} \
+            ./scripts/build_wheel.sh
+
+      - name: Assert ROCm package name
+        shell: bash
+        run: |
+          set -eo pipefail
+          # Defense in depth: never let a wheel that was not renamed to the ROCm
+          # package (e.g. HIP_BUILD silently ignored) reach the publish steps.
+          dir="mooncake-wheel/dist-rocm-py${{ steps.generate_tag_release.outputs.python_version_tag }}"
+          if ! ls "${dir}"/mooncake_transfer_engine_rocm-*.whl >/dev/null 2>&1; then
+            echo "::error::Built wheel is not named mooncake-transfer-engine-rocm:"
+            ls -la "${dir}" || true
+            exit 1
+          fi
+
+      - name: Smoke test the exact release wheel
+        shell: bash
+        run: |
+          set -eo pipefail
+          # Install the actual per-matrix release artifact (cp310-cp313) into a
+          # fresh venv and exercise the packaged binary, so packaging/ELF-layout
+          # failures in any version are caught before this wheel reaches PyPI.
+          # No GPU is needed for `mooncake_master --version`.
+          smoke_venv=$(mktemp -d)
+          "${PYTHON_BIN}" -m venv "$smoke_venv"
+          "$smoke_venv/bin/python" -m pip install --no-deps \
+            mooncake-wheel/dist-rocm-py${{ steps.generate_tag_release.outputs.python_version_tag }}/*.whl
+          export LD_LIBRARY_PATH="/opt/rocm/lib:/usr/local/lib:${LD_LIBRARY_PATH:-}"
+          site="$("$smoke_venv/bin/python" -c 'import mooncake,os;print(os.path.dirname(mooncake.__file__))')"
+          "$site/mooncake_master" --version
+
+      - name: Upload Python wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: mooncake-wheel-rocm-x86_64-py${{ steps.generate_tag_release.outputs.python_version_tag }}
+          path: mooncake-wheel/dist-rocm-py${{ steps.generate_tag_release.outputs.python_version_tag }}/*.whl
+
+  # Publish to PyPI and attach to the GitHub Release in SEPARATE jobs, with the
+  # GitHub Release job depending on PyPI. PyPI uploads are immutable, so if a
+  # single combined job published to PyPI and then failed on the GitHub Release
+  # upload, "re-run failed jobs" would restart at the (now-rejected) PyPI step
+  # and could never reach the release upload. Split jobs let a transient GitHub
+  # Release failure be retried on its own without republishing PyPI files.
+  publish-pypi:
+    if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.ref_name, '-') }}
+    needs: build
+    runs-on: ubuntu-22.04
+    environment: pypi
+
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: mooncake-wheel/dist-all
+          pattern: mooncake-wheel-rocm-*
+
+      - name: Prepare wheels for release
+        run: |
+          mkdir -p mooncake-wheel/dist-release
+          find mooncake-wheel/dist-all -name "*.whl" -exec cp {} mooncake-wheel/dist-release/ \;
+          echo "Collected wheels for release:"
+          ls -la mooncake-wheel/dist-release/
+
+      # PREREQUISITE (one-time, maintainer/PyPI-owner action): this uses OIDC
+      # (no API token), so PyPI must have a Trusted Publisher configured for
+      # the NEW project `mooncake-transfer-engine-rocm` with identity
+      # owner/repo `kvcache-ai/Mooncake`, workflow `release-rocm.yaml`, and
+      # environment `pypi`. Without it the publish step fails.
+      - name: Publish package to PyPI
+        if: github.repository == 'kvcache-ai/Mooncake'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: mooncake-wheel/dist-release/
+
+  publish-github-release:
+    # Runs only after PyPI succeeds; can be re-run on its own if the GitHub
+    # Release upload fails transiently, without touching the immutable PyPI files.
+    if: ${{ github.event_name == 'workflow_dispatch' || !contains(github.ref_name, '-') }}
+    needs: publish-pypi
+    runs-on: ubuntu-22.04
+
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: mooncake-wheel/dist-all
+          pattern: mooncake-wheel-rocm-*
+
+      - name: Prepare wheels for release
+        run: |
+          mkdir -p mooncake-wheel/dist-release
+          find mooncake-wheel/dist-all -name "*.whl" -exec cp {} mooncake-wheel/dist-release/ \;
+          ls -la mooncake-wheel/dist-release/
+
+      - name: Upload wheels to GitHub Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+          files: mooncake-wheel/dist-release/*.whl

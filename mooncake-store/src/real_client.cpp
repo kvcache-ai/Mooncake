@@ -11,16 +11,21 @@
 #include <dlfcn.h>  // for dlsym (Python detection)
 #include <cstdlib>  // for atexit
 #include <algorithm>
-#include <cctype>
 #include <functional>
 #include <limits>
 #include <optional>
 #include <vector>
 
 #include "real_client.h"
+#include "registered_pinned_memory.h"
 #include "client_buffer.h"
+#include "replica_selection.h"
 #include "common.h"
 #include "config.h"
+#include "store_rpc_client_io_context.h"
+#include "bool_parser.h"
+#include "environ.h"
+#include "integer_parser.h"
 #include "mutex.h"
 #include "types.h"
 #include "utils.h"
@@ -29,6 +34,7 @@
 #include "device/accelerator_registry.h"
 #include "default_config.h"
 #include "uds_transport.h"
+#include "device/cuda_ipc_buffer.h"
 #include "shm_helper.h"
 #include "memory_location.h"
 #ifdef USE_NOF
@@ -37,6 +43,15 @@
 #ifdef USE_ASCEND_DIRECT
 #include "acl/acl_rt.h"
 #include "transport/ascend_transport/ascend_direct_transport/context_manager.h"
+#endif
+#ifdef USE_CUDA
+#include <cuda_runtime.h>
+#endif
+#ifdef USE_INTRA_NVLINK
+#include "gpu_vendor/intra_nvlink.h"
+#endif
+#if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
+#include "ascend_allocator.h"
 #endif
 
 DEFINE_bool(enable_http_server, false,
@@ -48,6 +63,46 @@ DEFINE_int32(http_port, 9300,
 namespace mooncake {
 namespace {
 constexpr std::chrono::seconds kIpcRequestRecvTimeout{5};
+
+bool IsHostStoreSegmentProtocol(const std::string &protocol) {
+    return protocol.empty() || protocol == "tcp" || protocol == "rdma" ||
+           protocol == "efa" || protocol == "cxi" || protocol == "rpc_only";
+}
+
+std::shared_ptr<RegisteredPinnedRegion> TryPinStoreSegment(
+    void *ptr, size_t size, const std::string &protocol,
+    const char *segment_owner) {
+    if (!IsHostStoreSegmentProtocol(protocol)) return nullptr;
+    return RegisteredPinnedMemoryManager::instance().try_pin(
+        ptr, size,
+        std::string("Store segment ") + segment_owner +
+            " protocol=" + protocol);
+}
+
+bool ReleasePinnedRegionForFree(
+    std::shared_ptr<RegisteredPinnedRegion> &pinned_region,
+    const char *segment_owner) {
+    if (!pinned_region) return true;
+    const bool safe_to_free = pinned_region->release();
+    pinned_region.reset();
+    if (!safe_to_free) {
+        LOG(ERROR) << "Leaking " << segment_owner
+                   << " backing memory because cudaHostUnregister failed";
+    }
+    return safe_to_free;
+}
+
+bool ReleasePinnedRegionsForFree(
+    std::vector<std::shared_ptr<RegisteredPinnedRegion>> &pinned_regions,
+    const char *segment_owner) {
+    bool safe_to_free = true;
+    for (auto &pinned_region : pinned_regions) {
+        safe_to_free &=
+            ReleasePinnedRegionForFree(pinned_region, segment_owner);
+    }
+    pinned_regions.clear();
+    return safe_to_free;
+}
 
 #ifdef USE_ASCEND_DIRECT
 bool checkAcl(aclError result, const char *message) {
@@ -79,15 +134,6 @@ tl::expected<void, ErrorCode> set_context_if_needed(const std::string &protocol,
     return {};
 }
 #endif
-
-struct PreparedRangedReadRequest {
-    std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
-        results;
-    std::vector<std::vector<std::vector<bool>>> valid_fragments;
-    std::vector<size_t> required_buffer_sizes;
-    bool top_level_valid = true;
-    bool has_any_valid_fragment = false;
-};
 
 size_t sum_value_sizes(const std::vector<std::span<const char>> &values) {
     size_t total = 0;
@@ -170,97 +216,9 @@ size_t sum_buffer_handle_sizes(
     return total;
 }
 
-PreparedRangedReadRequest prepare_ranged_read_request(
-    size_t buffer_count, const std::vector<std::vector<std::string>> &all_keys,
-    const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
-    const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
-    const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
-    const char *log_prefix) {
-    PreparedRangedReadRequest prepared;
-    prepared.results.resize(buffer_count);
-    prepared.valid_fragments.resize(buffer_count);
-    prepared.required_buffer_sizes.resize(buffer_count, 0);
-
-    if (buffer_count != all_keys.size() ||
-        buffer_count != all_dst_offsets.size() ||
-        buffer_count != all_src_offsets.size() ||
-        buffer_count != all_sizes.size()) {
-        LOG(ERROR) << log_prefix << ": top-level size mismatch";
-        prepared.results = build_ranged_read_internal_error_results(
-            buffer_count, all_keys, all_dst_offsets, ErrorCode::INVALID_PARAMS);
-        prepared.top_level_valid = false;
-        return prepared;
-    }
-
-    for (size_t i = 0; i < buffer_count; ++i) {
-        const size_t key_count = all_keys[i].size();
-        prepared.results[i].resize(key_count);
-        prepared.valid_fragments[i].resize(key_count);
-
-        if (key_count != all_dst_offsets[i].size() ||
-            key_count != all_src_offsets[i].size() ||
-            key_count != all_sizes[i].size()) {
-            LOG(ERROR) << log_prefix
-                       << ": key-group size mismatch for buffer index " << i;
-            for (size_t j = 0; j < key_count; ++j) {
-                prepared.results[i][j] =
-                    std::vector<tl::expected<int64_t, ErrorCode>>(
-                        1, tl::unexpected(ErrorCode::INVALID_PARAMS));
-                prepared.valid_fragments[i][j] = std::vector<bool>(1, false);
-            }
-            continue;
-        }
-
-        size_t max_required = 0;
-        for (size_t j = 0; j < key_count; ++j) {
-            const size_t fragment_count = all_dst_offsets[i][j].size();
-            prepared.results[i][j] =
-                std::vector<tl::expected<int64_t, ErrorCode>>(
-                    fragment_count, tl::unexpected(ErrorCode::INVALID_PARAMS));
-            prepared.valid_fragments[i][j] =
-                std::vector<bool>(fragment_count, false);
-
-            if (fragment_count != all_src_offsets[i][j].size() ||
-                fragment_count != all_sizes[i][j].size()) {
-                LOG(ERROR) << log_prefix << ": fragment size mismatch, "
-                           << "buffer_index=" << i << " key_index=" << j;
-                continue;
-            }
-
-            for (size_t k = 0; k < fragment_count; ++k) {
-                const size_t dst_offset = all_dst_offsets[i][j][k];
-                const size_t fragment_size = all_sizes[i][j][k];
-                if (dst_offset >
-                    std::numeric_limits<size_t>::max() - fragment_size) {
-                    LOG(ERROR)
-                        << log_prefix
-                        << ": destination range overflow, buffer_index=" << i
-                        << " key_index=" << j << " fragment_index=" << k;
-                    continue;
-                }
-                prepared.valid_fragments[i][j][k] = true;
-                prepared.has_any_valid_fragment = true;
-                max_required =
-                    std::max(max_required, dst_offset + fragment_size);
-            }
-        }
-        prepared.required_buffer_sizes[i] = max_required;
-    }
-
-    return prepared;
-}
-
-void fill_ranged_read_results_with_error(
-    std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
-        &results,
-    ErrorCode error) {
-    for (auto &key_rows : results) {
-        for (auto &row : key_rows) {
-            for (auto &fragment : row) {
-                fragment = tl::unexpected(error);
-            }
-        }
-    }
+ErrorCode scatter_transfer_error(const Status &status) {
+    return status.IsInvalidArgument() ? ErrorCode::INVALID_PARAMS
+                                      : ErrorCode::TRANSFER_FAIL;
 }
 
 // Scatter host (CPU) memory to a destination that may be GPU or host.
@@ -277,53 +235,31 @@ inline tl::expected<void, ErrorCode> scatter_host_to_maybe_device(
     return {};
 }
 
-// Select the best replica from a list: prefer local MEMORY, then any
-// MEMORY, then LOCAL_DISK, then DISK.  Master may return replicas in any
-// order, so we always scan.
-inline const Replica::Descriptor *SelectBestReplica(
-    const std::vector<Replica::Descriptor> &replicas,
-    const std::unordered_set<std::string> &local_endpoints) {
-    const Replica::Descriptor *first_memory = nullptr;
-    const Replica::Descriptor *first_nof = nullptr;
-    for (const auto &r : replicas) {
-        if (r.status != ReplicaStatus::COMPLETE) continue;
-        if (r.is_memory_replica()) {
-            if (local_endpoints.count(
-                    r.get_memory_descriptor()
-                        .buffer_descriptor.transport_endpoint_)) {
-                return &r;  // local MEMORY — best case
-            }
-            if (!first_memory) first_memory = &r;
-        } else if (r.is_nof_replica()) {
-            if (local_endpoints.count(
-                    r.get_nof_descriptor()
-                        .buffer_descriptor.transport_endpoint_)) {
-                return &r;  // local NOF_SSD — also good
-            }
-            if (!first_nof) first_nof = &r;
-        }
+// Gather memory that may be GPU or host into a host destination.
+inline tl::expected<void, ErrorCode> gather_maybe_device_to_host(
+    void *dst, const void *src, size_t size, const std::string &context) {
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
+    if (!runtime_accelerator.CopyToHost(dst, src, size)) {
+        LOG(ERROR) << "D2H copy failed: " << context;
+        return tl::unexpected(ErrorCode::TRANSFER_FAIL);
     }
-    if (first_memory) return first_memory;
-    if (first_nof) return first_nof;
-
-    const Replica::Descriptor *best = nullptr;
-    for (const auto &r : replicas) {
-        if (r.status != ReplicaStatus::COMPLETE) continue;
-        if (r.is_local_disk_replica()) {
-            best = &r;  // LOCAL_DISK always overrides DISK
-        } else if (r.is_disk_replica() && !best) {
-            best = &r;
-        }
-    }
-    return best;
+    return {};
 }
+
+// SelectBestReplica and the replica-scoring helpers live in
+// replica_selection.h (included above) so they can be unit-tested directly.
+using mooncake::SelectBestReplica;
 
 // Build a QueryResult containing only the chosen replica so that
 // Client::Get / Client::BatchGet (which internally call
 // FindFirstCompleteReplica) cannot pick a different replica type.
 inline QueryResult FilterQueryResult(const QueryResult &qr,
-                                     const Replica::Descriptor &replica) {
-    return QueryResult({replica}, qr.lease_timeout);
+                                     const Replica::Descriptor &replica,
+                                     bool include_object_checksum = true) {
+    return QueryResult(
+        {replica}, qr.lease_timeout,
+        include_object_checksum ? qr.object_checksum : std::nullopt);
 }
 }  // namespace
 
@@ -352,14 +288,23 @@ bool RealClient::map_dummy_range_in_shm(const MappedShm &shm,
 bool RealClient::map_dummy_buffer_to_real(const ShmContext &shm_ctx,
                                           uint64_t dummy_addr, size_t buf_size,
                                           const MappedShm *&last_hit_shm,
-                                          void *&out_real) const {
+                                          void *&out_real,
+                                          size_t *out_capacity) const {
     if (last_hit_shm && map_dummy_range_in_shm(*last_hit_shm, dummy_addr, 0,
                                                buf_size, out_real)) {
+        if (out_capacity) {
+            *out_capacity = last_hit_shm->shm_size -
+                            (dummy_addr - last_hit_shm->dummy_base_addr);
+        }
         return true;
     }
     for (const auto &shm : shm_ctx.mapped_shms) {
         if (map_dummy_range_in_shm(shm, dummy_addr, 0, buf_size, out_real)) {
             last_hit_shm = &shm;
+            if (out_capacity) {
+                *out_capacity =
+                    shm.shm_size - (dummy_addr - shm.dummy_base_addr);
+            }
             return true;
         }
     }
@@ -382,7 +327,8 @@ bool RealClient::map_dummy_buffer_range_to_real(const ShmContext &shm_ctx,
 tl::expected<std::vector<void *>, ErrorCode>
 RealClient::map_dummy_addrs_to_real_ptrs(
     const ShmContext &context, const std::vector<uint64_t> &dummy_addrs,
-    const std::vector<size_t> &sizes, const UUID &client_id) const {
+    const std::vector<size_t> &sizes, const UUID &client_id,
+    std::vector<size_t> *capacities) const {
     if (dummy_addrs.size() != sizes.size()) {
         LOG(ERROR) << "Mismatched dummy_addrs and sizes, client_id="
                    << client_id;
@@ -390,11 +336,17 @@ RealClient::map_dummy_addrs_to_real_ptrs(
     }
     std::vector<void *> buffers;
     buffers.reserve(dummy_addrs.size());
+    if (capacities) {
+        capacities->clear();
+        capacities->reserve(dummy_addrs.size());
+    }
     const MappedShm *last_hit_shm = nullptr;
     for (size_t i = 0; i < dummy_addrs.size(); ++i) {
         void *real_ptr = nullptr;
+        size_t capacity = 0;
         if (!map_dummy_buffer_to_real(context, dummy_addrs[i], sizes[i],
-                                      last_hit_shm, real_ptr)) {
+                                      last_hit_shm, real_ptr,
+                                      capacities ? &capacity : nullptr)) {
             LOG(ERROR) << "Dummy buffer at " << dummy_addrs[i] << " (size "
                        << sizes[i]
                        << ") not found in any mapped shared memory, client_id="
@@ -402,6 +354,7 @@ RealClient::map_dummy_addrs_to_real_ptrs(
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
         buffers.push_back(real_ptr);
+        if (capacities) capacities->push_back(capacity);
     }
     return buffers;
 }
@@ -626,7 +579,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::shared_ptr<TransferEngine> &transfer_engine,
     const std::string &ipc_socket_path, int local_rpc_port,
     bool enable_ssd_offload, bool start_offload_rpc_server,
-    const std::string &ssd_offload_path, const std::string &tenant_id) {
+    const std::string &ssd_offload_path, const std::string &tenant_id,
+    bool enable_client_http_server, int client_http_port) {
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
     const bool should_use_hugepage =
@@ -681,9 +635,11 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     } else {
         // Auto port binding with retry on metadata registration failure
         const int kMaxRetries =
-            GetEnvOr<int>("MC_STORE_CLIENT_SETUP_RETRIES", 20);
-        const int rawMinPort = GetEnvOr<int>("MC_STORE_CLIENT_MIN_PORT", 12300);
-        const int rawMaxPort = GetEnvOr<int>("MC_STORE_CLIENT_MAX_PORT", 14300);
+            Environ::GetInt("MC_STORE_CLIENT_SETUP_RETRIES", 20);
+        const int rawMinPort =
+            Environ::GetInt("MC_STORE_CLIENT_MIN_PORT", 12300);
+        const int rawMaxPort =
+            Environ::GetInt("MC_STORE_CLIENT_MAX_PORT", 14300);
         constexpr int kDefaultMinPort = 12300;
         constexpr int kDefaultMaxPort = 14300;
         auto [minPort, maxPort] = ValidatePortRange(
@@ -774,10 +730,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         size_t cxl_dev_size = 0;
         const char *env = std::getenv("MC_CXL_DEV_SIZE");
         if (env) {
-            char *end = nullptr;
-            unsigned long long val = strtoull(env, &end, 10);
-            if (end != env && *end == '\0')
-                cxl_dev_size = static_cast<size_t>(val);
+            cxl_dev_size =
+                TryParseInteger<size_t>(env, {.trim_ascii_whitespace = true,
+                                              .allow_leading_plus = true})
+                    .value_or(0);
         } else {
             LOG(FATAL) << "MC_CXL_DEV_SIZE not set";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -816,12 +772,12 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             }
         }
 
+        const bool parallel_hugetlb_population =
+            protocol == "rdma" && should_use_hugepage;
+
         while (global_segment_size > 0) {
             size_t segment_size = std::min(global_segment_size, max_mr_size);
             global_segment_size -= segment_size;
-            current_glbseg_size += segment_size;
-            LOG(INFO) << "Mounting segment: " << segment_size << " bytes, "
-                      << current_glbseg_size << " of " << total_glbseg_size;
 
             size_t mapped_size = segment_size;
             void *ptr = nullptr;
@@ -841,7 +797,18 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 mapped_size =
                     align_up(segment_size, get_hugepage_size_from_env());
                 ptr = allocate_buffer_mmap_memory(mapped_size,
-                                                  get_hugepage_size_from_env());
+                                                  get_hugepage_size_from_env(),
+                                                  parallel_hugetlb_population);
+#if defined(USE_ASCEND_DIRECT) || defined(USE_UBSHMEM)
+            } else if ((protocol == "ascend" || protocol == "ubshmem") &&
+                       globalConfig().ascend_use_fabric_mem) {
+                size_t actual_size = 0;
+                ptr = ascend_allocate_memory_best_effort(
+                    segment_size, this->protocol, &actual_size);
+                if (ptr) {
+                    mapped_size = actual_size;
+                }
+#endif
             } else {
                 ptr = allocate_buffer_allocator_memory(segment_size,
                                                        this->protocol);
@@ -851,6 +818,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 LOG(ERROR) << "Failed to allocate segment memory";
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
             }
+            current_glbseg_size += mapped_size;
+            LOG(INFO) << "Mounting segment: " << mapped_size << " bytes, "
+                      << current_glbseg_size << " of " << total_glbseg_size;
+
             if (this->protocol == "ascend" || this->protocol == "ubshmem") {
                 ascend_segment_ptrs_.emplace_back(
                     ptr, AscendSegmentDeleter{this->protocol});
@@ -872,14 +843,41 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 hugepage_segment_ptrs_.emplace_back(
                     ptr, HugepageSegmentDeleter{mapped_size});
             } else {
+#ifdef USE_VRAM_SEGMENT
+                vram_segment_ptrs_.emplace_back(ptr);
+#else
                 segment_ptrs_.emplace_back(ptr);
+#endif
             }
+
+            // Populate HugeTLB pages in parallel immediately before transfer-
+            // engine registration. NUMA mappings use node-local workers for
+            // each mbind region; direct mappings use the generic worker pool.
+            if (parallel_hugetlb_population) {
+                if (!seg_numa_nodes.empty()) {
+                    populate_hugetlb_numa_mapping(ptr, mapped_size,
+                                                  seg_numa_nodes);
+                } else if (!is_mmap_arena_allocation(ptr)) {
+                    populate_hugetlb_mapping(ptr, mapped_size);
+                }
+            }
+
+            auto pinned_region =
+                TryPinStoreSegment(ptr, mapped_size, this->protocol, "setup");
             auto mount_result =
                 client_->MountSegment(ptr, mapped_size, protocol, seg_location);
             if (!mount_result.has_value()) {
+                if (!ReleasePinnedRegionForFree(pinned_region,
+                                                "Store setup segment")) {
+                    setup_segment_memory_must_leak_ = true;
+                }
                 LOG(ERROR) << "Failed to mount segment: "
                            << toString(mount_result.error());
                 return tl::unexpected(mount_result.error());
+            }
+            if (pinned_region) {
+                setup_segment_pinned_regions_.push_back(
+                    std::move(pinned_region));
             }
         }
         if (total_glbseg_size == 0) {
@@ -935,10 +933,20 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
     }
     client_requester_ = std::make_shared<ClientRequester>();
-    if (FLAGS_enable_http_server) {
-        if (start_http_server() != 0) {
-            LOG(ERROR) << "Failed to start HTTP server on port "
-                       << FLAGS_http_port;
+    const bool should_start_http_server =
+        enable_client_http_server || FLAGS_enable_http_server;
+    const int selected_http_port =
+        enable_client_http_server ? client_http_port : FLAGS_http_port;
+    if (should_start_http_server) {
+        if (selected_http_port <= 0 || selected_http_port > 65535) {
+            LOG(ERROR) << "Invalid client HTTP server port: "
+                       << selected_http_port;
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if (start_http_server(selected_http_port) != 0) {
+            LOG(WARNING) << "Failed to start client HTTP server on port "
+                         << selected_http_port
+                         << "; continuing without HTTP endpoints";
         }
     }
 
@@ -952,12 +960,13 @@ int RealClient::setup_real(
     const std::string &master_server_addr,
     const std::shared_ptr<TransferEngine> &transfer_engine,
     const std::string &ipc_socket_path, bool enable_ssd_offload,
-    const std::string &ssd_offload_path, const std::string &tenant_id) {
+    const std::string &ssd_offload_path, const std::string &tenant_id,
+    bool enable_client_http_server, int client_http_port) {
     return to_py_ret(setup_internal(
         local_hostname, metadata_server, global_segment_size, local_buffer_size,
         protocol, rdma_devices, master_server_addr, transfer_engine,
         ipc_socket_path, 50052, enable_ssd_offload, true, ssd_offload_path,
-        tenant_id));
+        tenant_id, enable_client_http_server, client_http_port));
 }
 
 namespace {
@@ -983,6 +992,41 @@ inline std::optional<size_t> get_config_size(const ConfigDict &config,
         return std::nullopt;
     }
     return static_cast<size_t>(parsed_size_opt.value());
+}
+
+inline bool get_config_bool(const ConfigDict &config, const std::string &key,
+                            bool default_value) {
+    auto it = config.find(key);
+    if (it == config.end()) {
+        return default_value;
+    }
+
+    const auto parsed = TryParseBool(it->second);
+    if (parsed.has_value()) {
+        return *parsed;
+    }
+
+    LOG(WARNING) << "Invalid boolean value for config key '" << key
+                 << "': " << it->second << ", using default: " << default_value;
+    return default_value;
+}
+
+inline std::optional<int> get_config_int(const ConfigDict &config,
+                                         const std::string &key,
+                                         int default_value) {
+    auto it = config.find(key);
+    if (it == config.end()) {
+        return default_value;
+    }
+
+    const auto parsed_value =
+        TryParseInteger<int>(it->second, {.trim_ascii_whitespace = true});
+    if (!parsed_value.has_value()) {
+        LOG(ERROR) << "Invalid integer value for config key '" << key
+                   << "': " << it->second;
+        return std::nullopt;
+    }
+    return *parsed_value;
 }
 }  // namespace
 
@@ -1054,19 +1098,22 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
 
     std::string ssd_offload_path = get_config(config, "ssd_offload_path");
     std::string tenant_id = get_config(config, CONFIG_KEY_TENANT_ID, "default");
-
-    std::string enable_ssd_offload_str =
-        get_config(config, "enable_ssd_offload", "false");
-    std::transform(enable_ssd_offload_str.begin(), enable_ssd_offload_str.end(),
-                   enable_ssd_offload_str.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
     bool enable_ssd_offload =
-        (enable_ssd_offload_str == "true" || enable_ssd_offload_str == "1");
+        get_config_bool(config, "enable_ssd_offload", false);
+    bool enable_client_http_server =
+        get_config_bool(config, CONFIG_KEY_ENABLE_CLIENT_HTTP_SERVER, false);
+    auto client_http_port_opt = get_config_int(
+        config, CONFIG_KEY_CLIENT_HTTP_PORT, DEFAULT_CLIENT_HTTP_PORT);
+    if (!client_http_port_opt.has_value()) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    int client_http_port = client_http_port_opt.value();
 
-    return setup_internal(
-        local_hostname, metadata_server, global_segment_size, local_buffer_size,
-        protocol, rdma_devices, master_server_addr, nullptr, ipc_socket_path,
-        50052, enable_ssd_offload, true, ssd_offload_path, tenant_id);
+    return setup_internal(local_hostname, metadata_server, global_segment_size,
+                          local_buffer_size, protocol, rdma_devices,
+                          master_server_addr, nullptr, ipc_socket_path, 50052,
+                          enable_ssd_offload, true, ssd_offload_path, tenant_id,
+                          enable_client_http_server, client_http_port);
 }
 
 tl::expected<void, ErrorCode> RealClient::initAll_internal(
@@ -1124,12 +1171,22 @@ tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
     ReleaseAllAllocatedSegmentRecords();
     client_buffer_allocator_.reset();
     port_binder_.reset();
+    const bool setup_segments_safe_to_free = ReleasePinnedRegionsForFree(
+        setup_segment_pinned_regions_, "Store setup segment");
+    if (!setup_segments_safe_to_free || setup_segment_memory_must_leak_) {
+        for (auto &ptr : hugepage_segment_ptrs_) ptr.release();
+        for (auto &ptr : segment_ptrs_) ptr.release();
+        setup_segment_memory_must_leak_ = false;
+    }
     hugepage_segment_ptrs_.clear();
+    segment_ptrs_.clear();
     ub_segment_ptrs_.clear();
+#ifdef USE_VRAM_SEGMENT
+    vram_segment_ptrs_.clear();
+#endif
 #if defined(USE_SUNRISE)
     sunrise_segment_ptrs_.clear();
 #endif
-    segment_ptrs_.clear();
     local_hostname = "";
     device_name = "";
     protocol = "";
@@ -1304,6 +1361,13 @@ void RealClient::ReleaseAllMountedSegmentRecords() {
     }
 }
 
+void RealClient::FreeAllocatedStoreSegment(AllocatedSegmentRecord &record) {
+    if (record.base && ReleasePinnedRegionForFree(record.pinned_region,
+                                                  "allocated Store segment")) {
+        free_memory(record.protocol, record.base);
+    }
+}
+
 void RealClient::ReleaseAllocatedSegmentRecord(const std::string &segment_id) {
     AllocatedSegmentRecord record;
     bool found = false;
@@ -1317,7 +1381,7 @@ void RealClient::ReleaseAllocatedSegmentRecord(const std::string &segment_id) {
         }
     }
     if (found && record.base) {
-        free_memory(record.protocol, record.base);
+        FreeAllocatedStoreSegment(record);
     }
 }
 
@@ -1328,9 +1392,7 @@ void RealClient::ReleaseAllAllocatedSegmentRecords() {
         records.swap(allocated_segment_records_);
     }
     for (auto &entry : records) {
-        if (entry.second.base) {
-            free_memory(entry.second.protocol, entry.second.base);
-        }
+        FreeAllocatedStoreSegment(entry.second);
     }
 }
 
@@ -1470,17 +1532,23 @@ int RealClient::allocateAndMountSegment(
             break;
         }
 
+        auto pinned_region =
+            TryPinStoreSegment(ptr, chunk_size, protocol, "allocated");
         auto result =
             client_->MountSegmentAndGetId(ptr, chunk_size, protocol, location);
         if (!result.has_value()) {
             LOG(ERROR) << "MountSegmentAndGetId failed";
-            free_memory(protocol, ptr);
+            if (ReleasePinnedRegionForFree(pinned_region,
+                                           "allocated Store segment")) {
+                free_memory(protocol, ptr);
+            }
             break;
         }
 
         std::string segment_id = UuidToString(result.value());
         mounted_ids.push_back(segment_id);
-        allocated_records.push_back({ptr, chunk_size, protocol});
+        allocated_records.push_back(
+            {ptr, chunk_size, protocol, std::move(pinned_region)});
 
         remaining -= chunk_size;
     }
@@ -1492,8 +1560,7 @@ int RealClient::allocateAndMountSegment(
                 client_->UnmountSegmentById(id);
             }
             if (allocated_records[i].base) {
-                free_memory(allocated_records[i].protocol,
-                            allocated_records[i].base);
+                FreeAllocatedStoreSegment(allocated_records[i]);
             }
         }
         out_segment_ids.clear();
@@ -1579,9 +1646,7 @@ int RealClient::unmountAndFreeSegment(
     }
 
     for (auto &p : to_cleanup) {
-        if (p.second.base) {
-            free_memory(p.second.protocol, p.second.base);
-        }
+        FreeAllocatedStoreSegment(p.second);
     }
 
     return first_error;
@@ -1594,11 +1659,15 @@ int RealClient::health_check() {
     return HC_HEALTHY;
 }
 
-int RealClient::start_http_server() {
+int RealClient::start_http_server(int port) {
     using namespace coro_http;
 
-    http_server_ =
-        std::make_unique<coro_http_server>(/*thread_num=*/1, FLAGS_http_port);
+    if (http_server_) {
+        LOG(WARNING) << "Client HTTP server is already running";
+        return 0;
+    }
+
+    http_server_ = std::make_unique<coro_http_server>(/*thread_num=*/1, port);
 
     http_server_->set_http_handler<GET>(
         "/health", [this](coro_http_request &req, coro_http_response &resp) {
@@ -1664,11 +1733,11 @@ int RealClient::start_http_server() {
 
     auto ec = http_server_->async_start();
     if (ec.hasResult()) {
-        LOG(ERROR) << "Failed to start HTTP server on port " << FLAGS_http_port;
+        LOG(WARNING) << "Failed to start HTTP server on port " << port;
         http_server_.reset();
         return -1;
     }
-    LOG(INFO) << "Client HTTP server started on port " << FLAGS_http_port;
+    LOG(INFO) << "Client HTTP server started on port " << port;
     return 0;
 }
 
@@ -1703,7 +1772,7 @@ tl::expected<void, ErrorCode> RealClient::put_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto &buffer_handle = *alloc_result;
-    auto scatter_result = scatter_host_to_maybe_device(
+    auto scatter_result = gather_maybe_device_to_host(
         buffer_handle.ptr(), value.data(), value.size_bytes(), "put:" + key);
     if (!scatter_result) {
         return tl::unexpected(scatter_result.error());
@@ -1785,9 +1854,9 @@ tl::expected<void, ErrorCode> RealClient::put_batch_internal(
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
         auto &buffer_handle = *alloc_result;
-        auto scatter_result = scatter_host_to_maybe_device(
-            buffer_handle.ptr(), value.data(), value.size_bytes(),
-            "put_batch:" + key);
+        auto scatter_result =
+            gather_maybe_device_to_host(buffer_handle.ptr(), value.data(),
+                                        value.size_bytes(), "put_batch:" + key);
         if (!scatter_result) {
             return tl::unexpected(scatter_result.error());
         }
@@ -1894,7 +1963,7 @@ tl::expected<void, ErrorCode> RealClient::put_parts_internal(
     // Copy all parts into the contiguous buffer
     size_t offset = 0;
     for (const auto &value : values) {
-        auto scatter_result = scatter_host_to_maybe_device(
+        auto scatter_result = gather_maybe_device_to_host(
             static_cast<char *>(buffer_handle.ptr()) + offset, value.data(),
             value.size_bytes(), "put_multi_value");
         if (!scatter_result) {
@@ -2621,6 +2690,14 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
                        << "': " << toString(read_result.error());
             return nullptr;
         }
+        auto checksum_result =
+            client_->VerifyObjectChecksum(key, objects.at(key), total_length,
+                                          query_result.value().object_checksum);
+        if (!checksum_result) {
+            LOG(ERROR) << "SSD checksum verification failed for key '" << key
+                       << "': " << toString(checksum_result.error());
+            return nullptr;
+        }
         return buffer_handle;
     }
 
@@ -2735,6 +2812,40 @@ tl::expected<void, ErrorCode> RealClient::release_buffer_dummy(
 
     it->second.active_handles.erase(dummy_addr);
     return {};
+}
+
+tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>
+RealClient::allocate_buffer_dummy(size_t size, const UUID &client_id) {
+    std::unique_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto &context = it->second;
+    if (!context.client_buffer_allocator) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto alloc_result = context.client_buffer_allocator->allocate(size);
+    if (!alloc_result) {
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+
+    auto handle = std::make_shared<BufferHandle>(std::move(*alloc_result));
+    const uint64_t real_addr = reinterpret_cast<uint64_t>(handle->ptr());
+    const size_t allocated_size = handle->size();
+    for (const auto &shm : context.mapped_shms) {
+        const uint64_t shm_start = reinterpret_cast<uint64_t>(shm.shm_buffer);
+        const uint64_t shm_end = shm_start + shm.shm_size;
+        if (real_addr >= shm_start && allocated_size <= shm_end - real_addr) {
+            const uint64_t dummy_addr = real_addr - shm.shm_addr_offset;
+            context.active_handles[dummy_addr] = std::move(handle);
+            return std::make_tuple(dummy_addr, allocated_size);
+        }
+    }
+
+    return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
 }
 
 std::vector<tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>>
@@ -3028,6 +3139,16 @@ RealClient::batch_get_buffer_internal(
                 if (idx_it == disk_key_to_idx.end()) continue;
                 auto &op = disk_ops[idx_it->second];
                 if (read_result) {
+                    auto checksum_result = client_->VerifyObjectChecksum(
+                        key, slices, op.total_size,
+                        op.query_result.object_checksum);
+                    if (!checksum_result) {
+                        LOG(ERROR)
+                            << "SSD checksum verification failed for key '"
+                            << key
+                            << "': " << toString(checksum_result.error());
+                        continue;
+                    }
                     final_results[op.original_index] =
                         std::make_shared<BufferHandle>(
                             std::move(*op.buffer_handle));
@@ -3135,12 +3256,21 @@ RealClient::resolve_writable_buffer_region(void *buffer) const {
 }
 
 tl::expected<RealClient::RangedReadMetadata, ErrorCode>
-RealClient::resolve_ranged_read_metadata(const std::string &key) {
+RealClient::resolve_ranged_read_metadata(
+    const std::string &key, const QueryResultCache *query_result_cache) {
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    if (query_result_cache) {
+        auto cached = query_result_cache->find(key);
+        if (cached != query_result_cache->end() &&
+            (!cached->second || !cached->second->IsLeaseExpired())) {
+            return build_ranged_read_metadata_from_query_result(key,
+                                                                cached->second);
+        }
+    }
     return build_ranged_read_metadata_from_query_result(key,
                                                         client_->Query(key));
 }
@@ -3148,7 +3278,7 @@ RealClient::resolve_ranged_read_metadata(const std::string &key) {
 tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
     const std::string &key, void *buffer, size_t dst_offset, size_t src_offset,
     size_t size, const RangedReadMetadata &metadata,
-    bool size_is_buffer_capacity) {
+    bool size_is_buffer_capacity, bool verify_checksum) {
     const auto &query_result = metadata.query_result;
     const auto &replica = metadata.replica;
     const uint64_t total_size = metadata.total_size;
@@ -3180,6 +3310,14 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             auto result =
                 batch_get_into_offload_object_internal(endpoint, objects);
             if (!result) return tl::unexpected(result.error());
+            if (verify_checksum) {
+                auto checksum_result = client_->VerifyObjectChecksum(
+                    key, objects.at(key), total_size,
+                    query_result.object_checksum);
+                if (!checksum_result) {
+                    return tl::unexpected(checksum_result.error());
+                }
+            }
             return static_cast<int64_t>(total_size);
         }
 
@@ -3195,7 +3333,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             BufferHandle tmp_handle(std::move(*alloc_result));
             std::vector<mooncake::Slice> tmp_slices;
             allocateSlices(tmp_slices, replica, tmp_handle.ptr());
-            auto filtered_qr = FilterQueryResult(query_result, replica);
+            auto filtered_qr =
+                FilterQueryResult(query_result, replica, verify_checksum);
             auto get_result = client_->Get(key, filtered_qr, tmp_slices);
             if (!get_result) {
                 LOG(ERROR) << "DISK Get failed for key: " << key
@@ -3212,11 +3351,46 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             return static_cast<int64_t>(total_size);
         }
 
-        std::vector<mooncake::Slice> slices;
-        allocateSlices(slices, replica,
-                       static_cast<char *>(buffer) + dst_offset);
+        auto runtime_accelerator =
+            device::GetAcceleratorRegistry().RuntimeAccelerators();
+        void *dst = static_cast<char *>(buffer) + dst_offset;
+        if (runtime_accelerator.FindDeviceForPointer(dst)) {
+            if (!client_buffer_allocator_) {
+                LOG(ERROR) << "Client buffer allocator is not provided";
+                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            auto alloc_result = client_buffer_allocator_->allocate(total_size);
+            if (!alloc_result) {
+                LOG(ERROR) << "Failed to allocate temp buffer for GPU memory "
+                           << "read, key: " << key << ", size: " << total_size;
+                return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+            }
+            BufferHandle tmp_handle(std::move(*alloc_result));
+            std::vector<mooncake::Slice> tmp_slices;
+            allocateSlices(tmp_slices, replica, tmp_handle.ptr());
 
-        auto filtered_qr = FilterQueryResult(query_result, replica);
+            auto filtered_qr =
+                FilterQueryResult(query_result, replica, verify_checksum);
+            auto get_result = client_->Get(key, filtered_qr, tmp_slices);
+            if (!get_result) {
+                LOG(ERROR) << "Get failed for key: " << key
+                           << " with error: " << toString(get_result.error());
+                return tl::unexpected(get_result.error());
+            }
+            if (auto r = scatter_host_to_maybe_device(
+                    dst, tmp_handle.ptr(), total_size,
+                    "MEMORY full read, key: " + key);
+                !r) {
+                return tl::unexpected(r.error());
+            }
+            return static_cast<int64_t>(total_size);
+        }
+
+        std::vector<mooncake::Slice> slices;
+        allocateSlices(slices, replica, dst);
+
+        auto filtered_qr =
+            FilterQueryResult(query_result, replica, verify_checksum);
         auto get_result = client_->Get(key, filtered_qr, slices);
         if (!get_result) {
             LOG(ERROR) << "Get failed for key: " << key
@@ -3280,7 +3454,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             [&](void *tmp_buf) -> tl::expected<void, ErrorCode> {
                 std::vector<mooncake::Slice> tmp_slices;
                 allocateSlices(tmp_slices, replica, tmp_buf);
-                auto filtered_qr = FilterQueryResult(query_result, replica);
+                auto filtered_qr =
+                    FilterQueryResult(query_result, replica, false);
                 auto get_result = client_->Get(key, filtered_qr, tmp_slices);
                 if (!get_result) {
                     LOG(ERROR)
@@ -3298,8 +3473,39 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         return tl::unexpected(ErrorCode::INVALID_REPLICA);
     }
 
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
+    void *dst = static_cast<char *>(buffer) + dst_offset;
+    if (runtime_accelerator.FindDeviceForPointer(dst)) {
+        if (!client_buffer_allocator_) {
+            LOG(ERROR) << "Client buffer allocator is not provided";
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        auto alloc_result = client_buffer_allocator_->allocate(size);
+        if (!alloc_result) {
+            LOG(ERROR) << "Failed to allocate temp buffer for GPU ranged "
+                       << "read, key: " << key << ", size: " << size;
+            return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+        BufferHandle tmp_handle(std::move(*alloc_result));
+        std::vector<Slice> tmp_slices;
+        tmp_slices.emplace_back(Slice{tmp_handle.ptr(), size});
+
+        auto get_result =
+            client_->Get(key, query_result, tmp_slices, src_offset);
+        if (!get_result) {
+            return tl::unexpected(get_result.error());
+        }
+        if (auto r = scatter_host_to_maybe_device(
+                dst, tmp_handle.ptr(), size, "MEMORY ranged read, key: " + key);
+            !r) {
+            return tl::unexpected(r.error());
+        }
+        return static_cast<int64_t>(size);
+    }
+
     std::vector<Slice> slices;
-    slices.emplace_back(Slice{static_cast<char *>(buffer) + dst_offset, size});
+    slices.emplace_back(Slice{dst, size});
 
     auto get_result = client_->Get(key, query_result, slices, src_offset);
     if (!get_result) {
@@ -3310,7 +3516,7 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
 
 tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
     const std::string &key, void *buffer, size_t dst_offset, size_t src_offset,
-    size_t size, bool size_is_buffer_capacity) {
+    size_t size, bool size_is_buffer_capacity, bool verify_checksum) {
     auto metadata_result = resolve_ranged_read_metadata(key);
     if (!metadata_result) {
         if ((metadata_result.error() == ErrorCode::OBJECT_NOT_FOUND ||
@@ -3322,15 +3528,15 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_internal(
     }
 
     return execute_ranged_read(key, buffer, dst_offset, src_offset, size,
-                               metadata_result.value(),
-                               size_is_buffer_capacity);
+                               metadata_result.value(), size_is_buffer_capacity,
+                               verify_checksum);
 }
 
 int64_t RealClient::get_into(const std::string &key, void *buffer,
                              size_t size) {
     auto result = execute_timed_operation<tl::expected<int64_t, ErrorCode>>(
         [&]() {
-            return get_into_range_internal(key, buffer, 0, 0, size, true);
+            return get_into_range_internal(key, buffer, 0, 0, size, true, true);
         },
         [](const auto &ret) { return ret.has_value(); },
         [&](uint64_t latency_us, const auto &ret) {
@@ -3349,143 +3555,184 @@ RealClient::get_into_ranges_internal(
     const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
     const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
     const std::vector<size_t> *buffer_capacities,
-    std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
-        *prepared_results,
-    const std::vector<std::vector<std::vector<bool>>> *valid_fragments,
     const QueryResultCache *query_result_cache) {
+    auto results = build_ranged_read_internal_error_results(
+        buffers.size(), all_keys, all_dst_offsets, ErrorCode::INVALID_PARAMS);
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
-        return build_ranged_read_internal_error_results(
-            buffers.size(), all_keys, all_dst_offsets,
-            ErrorCode::INVALID_PARAMS);
+        return results;
     }
 
     const size_t buffer_count = buffers.size();
-    PreparedRangedReadRequest prepared;
-    if (prepared_results != nullptr && valid_fragments != nullptr) {
-        prepared.results = std::move(*prepared_results);
-        prepared.valid_fragments = *valid_fragments;
-        prepared.required_buffer_sizes.resize(buffer_count, 0);
-        prepared.top_level_valid = true;
-    } else {
-        prepared = prepare_ranged_read_request(buffer_count, all_keys,
-                                               all_dst_offsets, all_src_offsets,
-                                               all_sizes, "get_into_ranges");
-    }
-    if (!prepared.top_level_valid) {
-        return std::move(prepared.results);
+    if (buffer_count != all_keys.size() ||
+        buffer_count != all_dst_offsets.size() ||
+        buffer_count != all_src_offsets.size() ||
+        buffer_count != all_sizes.size() ||
+        (buffer_capacities && buffer_capacities->size() != buffer_count)) {
+        LOG(ERROR) << "get_into_ranges: top-level size mismatch";
+        return results;
     }
 
-    std::vector<size_t> resolved_buffer_capacities;
-    if (buffer_capacities != nullptr) {
-        if (buffer_capacities->size() != buffer_count) {
-            LOG(ERROR) << "get_into_ranges: buffer capacities size mismatch";
-            return build_ranged_read_internal_error_results(
-                buffer_count, all_keys, all_dst_offsets,
-                ErrorCode::INVALID_PARAMS);
-        }
-        resolved_buffer_capacities = *buffer_capacities;
-    } else {
-        resolved_buffer_capacities.resize(buffer_count, 0);
+    std::vector<size_t> capacities = buffer_capacities
+                                         ? *buffer_capacities
+                                         : std::vector<size_t>(buffer_count);
+    if (!buffer_capacities) {
         for (size_t i = 0; i < buffer_count; ++i) {
             auto region = resolve_writable_buffer_region(buffers[i]);
-            if (!region.has_value()) {
-                LOG(ERROR)
-                    << "get_into_ranges: buffer is not Store-managed writable "
-                       "memory at index "
-                    << i;
-                continue;
-            }
-            resolved_buffer_capacities[i] = region->size - region->offset;
+            if (region) capacities[i] = region->size - region->offset;
         }
     }
 
     std::unordered_map<std::string, tl::expected<RangedReadMetadata, ErrorCode>>
         metadata_cache;
-    size_t key_count_hint = 0;
-    for (const auto &keys : all_keys) {
-        key_count_hint += keys.size();
-    }
-    metadata_cache.reserve(key_count_hint);
-    auto now = std::chrono::steady_clock::now();
-    if (query_result_cache != nullptr) {
-        for (const auto &[key, query_result] : *query_result_cache) {
-            if (!query_result) {
-                metadata_cache.emplace(key,
-                                       tl::unexpected(query_result.error()));
-                continue;
-            }
-            if (query_result->IsLeaseExpired(now)) {
-                continue;
-            }
-            metadata_cache.emplace(key,
-                                   build_ranged_read_metadata_from_query_result(
-                                       key, query_result));
-        }
-    }
+    auto metadata_for = [&](const std::string &key) -> auto & {
+        auto found = metadata_cache.find(key);
+        if (found != metadata_cache.end()) return found->second;
+        return metadata_cache
+            .emplace(key, resolve_ranged_read_metadata(key, query_result_cache))
+            .first->second;
+    };
 
+    struct ScatterLease {
+        std::chrono::steady_clock::time_point expires_at;
+        std::optional<ErrorCode> error;
+    };
+    std::unordered_map<std::string, ScatterLease> scatter_leases;
+    std::vector<TransferEngine::ScatterTransferRange> memory_transfers;
     for (size_t i = 0; i < buffer_count; ++i) {
-        const size_t key_count = prepared.results[i].size();
-        const size_t buffer_size = resolved_buffer_capacities[i];
-        if (buffer_size == 0 && key_count > 0 && buffer_capacities == nullptr) {
+        if (!buffers[i] || (!buffer_capacities && capacities[i] == 0)) {
+            continue;
+        }
+        const auto &keys = all_keys[i];
+        const auto &dst_groups = all_dst_offsets[i];
+        const auto &src_groups = all_src_offsets[i];
+        const auto &size_groups = all_sizes[i];
+        if (keys.size() != dst_groups.size() ||
+            keys.size() != src_groups.size() ||
+            keys.size() != size_groups.size()) {
             continue;
         }
 
-        for (size_t j = 0; j < key_count; ++j) {
-            auto metadata_it = metadata_cache.find(all_keys[i][j]);
-            if (metadata_it == metadata_cache.end()) {
-                metadata_it =
-                    metadata_cache
-                        .emplace(
-                            all_keys[i][j],
-                            build_ranged_read_metadata_from_query_result(
-                                all_keys[i][j], client_->Query(all_keys[i][j])))
-                        .first;
+        for (size_t j = 0; j < keys.size(); ++j) {
+            const auto &dst_offsets = dst_groups[j];
+            const auto &src_offsets = src_groups[j];
+            const auto &sizes = size_groups[j];
+            auto &range_results = results[i][j];
+            if (dst_offsets.size() != src_offsets.size() ||
+                dst_offsets.size() != sizes.size()) {
+                continue;
             }
-            auto &metadata_result = metadata_it->second;
+            auto &metadata_result = metadata_for(keys[j]);
+            if (!metadata_result) {
+                std::fill(range_results.begin(), range_results.end(),
+                          tl::unexpected(metadata_result.error()));
+                continue;
+            }
 
-            for (size_t k = 0; k < prepared.results[i][j].size(); ++k) {
-                if (!prepared.valid_fragments[i][j][k]) {
+            const auto &metadata = metadata_result.value();
+            if (metadata.replica.is_memory_replica()) {
+                const auto &handle =
+                    metadata.replica.get_memory_descriptor().buffer_descriptor;
+                auto [lease_it, inserted] = scatter_leases.try_emplace(keys[j]);
+                if (inserted)
+                    lease_it->second.expires_at =
+                        metadata.query_result.lease_timeout;
+                memory_transfers.push_back(TransferEngine::ScatterTransferRange{
+                    .opcode = TransferRequest::READ,
+                    .remote_segment = handle.transport_endpoint_,
+                    .remote_base_offset = handle.buffer_address_,
+                    .remote_size = handle.size_,
+                    .local_buffer = buffers[i],
+                    .local_capacity = capacities[i],
+                    .local_offsets = dst_offsets,
+                    .remote_offsets = src_offsets,
+                    .lengths = sizes,
+                    .on_fragment_complete =
+                        [results = &range_results, sizes = &sizes,
+                         lease = &lease_it->second](size_t k,
+                                                    const Status &status) {
+                            if (status.ok() && !lease->error.has_value() &&
+                                std::chrono::steady_clock::now() <
+                                    lease->expires_at) {
+                                (*results)[k] =
+                                    static_cast<int64_t>((*sizes)[k]);
+                                return;
+                            }
+                            const auto error = lease->error.value_or(
+                                status.ok() ? ErrorCode::LEASE_EXPIRED
+                                            : scatter_transfer_error(status));
+                            (*results)[k] = tl::unexpected(error);
+                        },
+                });
+                continue;
+            }
+
+            for (size_t k = 0; k < range_results.size(); ++k) {
+                const size_t dst_offset = dst_offsets[k];
+                if (dst_offset > capacities[i] ||
+                    sizes[k] > capacities[i] - dst_offset) {
                     continue;
                 }
 
-                if (all_sizes[i][j][k] > 0 &&
-                    (all_dst_offsets[i][j][k] > buffer_size ||
-                     all_sizes[i][j][k] >
-                         buffer_size - all_dst_offsets[i][j][k])) {
-                    LOG(ERROR)
-                        << "get_into_ranges: destination overflow, "
-                           "buffer_index="
-                        << i << " key_index=" << j << " fragment_index=" << k
-                        << " dst_offset=" << all_dst_offsets[i][j][k]
-                        << " size=" << all_sizes[i][j][k]
-                        << " buffer_size=" << buffer_size;
-                    continue;
-                }
-
-                if (!metadata_result) {
-                    if ((metadata_result.error() ==
-                             ErrorCode::OBJECT_NOT_FOUND ||
-                         metadata_result.error() ==
-                             ErrorCode::REPLICA_IS_NOT_READY) &&
-                        all_src_offsets[i][j][k] == 0) {
-                        VLOG(1)
-                            << "Object not found for key: " << all_keys[i][j];
-                    }
-                    prepared.results[i][j][k] =
-                        tl::unexpected(metadata_result.error());
-                    continue;
-                }
-
-                prepared.results[i][j][k] = execute_ranged_read(
-                    all_keys[i][j], buffers[i], all_dst_offsets[i][j][k],
-                    all_src_offsets[i][j][k], all_sizes[i][j][k],
-                    metadata_result.value());
+                range_results[k] = execute_ranged_read(
+                    keys[j], buffers[i], dst_offset, src_offsets[k], sizes[k],
+                    metadata, false, false);
             }
         }
     }
 
-    return prepared.results;
+    auto next_refresh_delay = [&]() {
+        const auto now = std::chrono::steady_clock::now();
+        auto delay = std::chrono::nanoseconds::max();
+        for (const auto &[key, lease] : scatter_leases) {
+            (void)key;
+            if (lease.error.has_value()) continue;
+            const auto remaining =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    lease.expires_at - now);
+            delay = std::min(delay, std::max(remaining / 2,
+                                             std::chrono::nanoseconds::zero()));
+        }
+        return delay;
+    };
+    auto refresh_leases = [&]() {
+        std::vector<std::string> keys;
+        keys.reserve(scatter_leases.size());
+        for (const auto &[key, lease] : scatter_leases)
+            if (!lease.error.has_value()) keys.push_back(key);
+        auto refreshed = client_->BatchQuery(keys);
+        for (size_t i = 0; i < refreshed.size(); ++i) {
+            auto &lease = scatter_leases.at(keys[i]);
+            if (!refreshed[i]) {
+                lease.error = refreshed[i].error();
+                continue;
+            }
+            lease.expires_at = refreshed[i]->lease_timeout;
+        }
+    };
+
+    // Planning may consume most of a short lease; renew before submission.
+    if (!scatter_leases.empty()) refresh_leases();
+    auto operation = client_->SubmitScatter(memory_transfers);
+    if (!operation.has_value()) {
+        const auto failure =
+            Status::InvalidArgument("TransferSubmitter not initialized");
+        for (const auto &transfer : memory_transfers) {
+            for (size_t i = 0; i < transfer.lengths.size(); ++i)
+                transfer.on_fragment_complete(i, failure);
+        }
+        return results;
+    }
+
+    while (true) {
+        const auto delay = next_refresh_delay();
+        const auto status = delay == std::chrono::nanoseconds::max()
+                                ? operation->wait()
+                                : operation->waitFor(delay);
+        if (!status.IsClock()) break;
+        refresh_leases();
+    }
+    return results;
 }
 
 std::vector<std::vector<std::vector<int64_t>>> RealClient::get_into_ranges(
@@ -3500,7 +3747,7 @@ std::vector<std::vector<std::vector<int64_t>>> RealClient::get_into_ranges(
             [&]() {
                 return convert_ranged_read_results(get_into_ranges_internal(
                     buffers, all_keys, all_dst_offsets, all_src_offsets,
-                    all_sizes, nullptr, nullptr, nullptr, query_result_cache));
+                    all_sizes, nullptr, query_result_cache));
             },
             [](const auto &) { return true; },
             [&](uint64_t latency_us, const auto &ret) {
@@ -3734,7 +3981,7 @@ tl::expected<void, ErrorCode> RealClient::upsert_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     auto &buffer_handle = *alloc_result;
-    auto scatter_result = scatter_host_to_maybe_device(
+    auto scatter_result = gather_maybe_device_to_host(
         buffer_handle.ptr(), value.data(), value.size_bytes(), "upsert:" + key);
     if (!scatter_result) {
         return tl::unexpected(scatter_result.error());
@@ -3970,7 +4217,7 @@ tl::expected<void, ErrorCode> RealClient::upsert_parts_internal(
     auto &buffer_handle = *alloc_result;
     size_t offset = 0;
     for (const auto &value : values) {
-        auto scatter_result = scatter_host_to_maybe_device(
+        auto scatter_result = gather_maybe_device_to_host(
             static_cast<char *>(buffer_handle.ptr()) + offset, value.data(),
             value.size_bytes(), "upsert_parts:" + key);
         if (!scatter_result) {
@@ -4058,7 +4305,7 @@ tl::expected<void, ErrorCode> RealClient::upsert_batch_internal(
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
         auto &buffer_handle = *alloc_result;
-        auto scatter_result = scatter_host_to_maybe_device(
+        auto scatter_result = gather_maybe_device_to_host(
             buffer_handle.ptr(), value.data(), value.size_bytes(),
             "upsert_batch:" + key);
         if (!scatter_result) {
@@ -4252,6 +4499,145 @@ RealClient::batch_put_from_multi_buffers_dummy_helper(
         keys, real_buffers_result.value(), all_sizes, config);
 }
 
+std::vector<tl::expected<void, ErrorCode>>
+RealClient::batch_put_from_cuda_ipc_dummy_helper(
+    const std::vector<CudaIpcWriteRequest> &requests,
+    const ReplicateConfig &config, const UUID &client_id) {
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+        return std::vector<tl::expected<void, ErrorCode>>(
+            requests.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+
+    const ShmContext &context = it->second;
+    const bool has_metadata =
+        !requests.empty() && requests[0].metadata.size != 0;
+    for (const auto &request : requests) {
+        if ((request.metadata.size != 0) != has_metadata) {
+            LOG(ERROR) << "Mixed cuda ipc metadata batches are not supported";
+            return std::vector<tl::expected<void, ErrorCode>>(
+                requests.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+        }
+    }
+
+    std::vector<device::CudaIpcBufferMapping> payload_mappings;
+    std::vector<std::string> keys;
+    std::vector<std::vector<void *>> all_buffers;
+    std::vector<std::vector<size_t>> all_sizes;
+    payload_mappings.reserve(requests.size());
+    keys.reserve(requests.size());
+    all_buffers.reserve(requests.size());
+    all_sizes.reserve(requests.size());
+
+    const MappedShm *last_hit_shm = nullptr;
+    for (const auto &request : requests) {
+        auto mapping = device::CudaIpcBufferMapping::Open(request.payload);
+        if (!mapping) {
+            return std::vector<tl::expected<void, ErrorCode>>(
+                requests.size(), tl::unexpected(mapping.error()));
+        }
+        payload_mappings.push_back(std::move(*mapping));
+        void *payload_ptr = payload_mappings.back().ptr();
+        keys.push_back(request.key);
+        if (has_metadata) {
+            void *metadata_ptr = nullptr;
+            if (!map_dummy_buffer_to_real(
+                    context, request.metadata.ptr,
+                    static_cast<size_t>(request.metadata.size), last_hit_shm,
+                    metadata_ptr)) {
+                LOG(ERROR) << "Dummy metadata buffer at "
+                           << request.metadata.ptr << " (size "
+                           << request.metadata.size
+                           << ") not found in any mapped shared memory, "
+                           << "client_id=" << client_id;
+                return std::vector<tl::expected<void, ErrorCode>>(
+                    requests.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+            }
+            all_buffers.push_back({metadata_ptr, payload_ptr});
+            all_sizes.push_back({static_cast<size_t>(request.metadata.size),
+                                 static_cast<size_t>(request.payload.size)});
+        } else {
+            all_buffers.push_back({payload_ptr});
+            all_sizes.push_back({static_cast<size_t>(request.payload.size)});
+        }
+    }
+
+    return batch_put_from_multi_buffers_internal(keys, all_buffers, all_sizes,
+                                                 config);
+}
+
+std::vector<tl::expected<int64_t, ErrorCode>>
+RealClient::batch_get_into_cuda_ipc_dummy_helper(
+    const std::vector<CudaIpcReadRequest> &requests, const UUID &client_id) {
+    {
+        std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+        if (shm_contexts_.find(client_id) == shm_contexts_.end()) {
+            LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+            return std::vector<tl::expected<int64_t, ErrorCode>>(
+                requests.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+        }
+    }
+
+    std::vector<tl::expected<int64_t, ErrorCode>> results(
+        requests.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    std::vector<device::CudaIpcBufferMapping> mappings;
+    std::vector<void *> buffers;
+    std::vector<std::vector<std::string>> all_keys;
+    std::vector<std::vector<std::vector<size_t>>> all_dst_offsets;
+    std::vector<std::vector<std::vector<size_t>>> all_src_offsets;
+    std::vector<std::vector<std::vector<size_t>>> all_sizes;
+    std::vector<size_t> buffer_capacities;
+    std::vector<size_t> original_indices;
+    mappings.reserve(requests.size());
+    buffers.reserve(requests.size());
+    all_keys.reserve(requests.size());
+    all_dst_offsets.reserve(requests.size());
+    all_src_offsets.reserve(requests.size());
+    all_sizes.reserve(requests.size());
+    buffer_capacities.reserve(requests.size());
+    original_indices.reserve(requests.size());
+
+    for (size_t i = 0; i < requests.size(); ++i) {
+        const auto &request = requests[i];
+        auto mapping = device::CudaIpcBufferMapping::Open(request.destination);
+        if (!mapping) {
+            results[i] = tl::unexpected(mapping.error());
+            continue;
+        }
+        mappings.push_back(std::move(*mapping));
+        buffers.push_back(mappings.back().ptr());
+        all_keys.push_back({request.key});
+        all_dst_offsets.push_back({{0}});
+        all_src_offsets.push_back(
+            {{static_cast<size_t>(request.source_offset)}});
+        all_sizes.push_back({{static_cast<size_t>(request.size)}});
+        buffer_capacities.push_back(static_cast<size_t>(request.size));
+        original_indices.push_back(i);
+    }
+
+    if (buffers.empty()) {
+        return results;
+    }
+
+    auto range_results = get_into_ranges_internal(
+        buffers, all_keys, all_dst_offsets, all_src_offsets, all_sizes,
+        &buffer_capacities, nullptr);
+    for (size_t i = 0; i < original_indices.size(); ++i) {
+        if (i < range_results.size() && range_results[i].size() == 1 &&
+            range_results[i][0].size() == 1) {
+            results[original_indices[i]] = range_results[i][0][0];
+        } else {
+            LOG(ERROR) << "Invalid cuda ipc tensor read result shape for key "
+                       << requests[original_indices[i]].key;
+            results[original_indices[i]] =
+                tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+    }
+    return results;
+}
+
 std::vector<tl::expected<int64_t, ErrorCode>>
 RealClient::batch_get_into_multi_buffers_dummy_helper(
     const std::vector<std::string> &keys,
@@ -4290,7 +4676,8 @@ RealClient::batch_get_into_multi_buffers_dummy_helper(
 
 tl::expected<int64_t, ErrorCode> RealClient::get_into_range_shm_helper(
     const std::string &key, uint64_t dummy_buffer, size_t dst_offset,
-    size_t src_offset, size_t size, const UUID &client_id) {
+    size_t src_offset, size_t size, bool size_is_buffer_capacity,
+    bool verify_checksum, const UUID &client_id) {
     std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
@@ -4309,7 +4696,8 @@ tl::expected<int64_t, ErrorCode> RealClient::get_into_range_shm_helper(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    return get_into_range_internal(key, real_buffer, 0, src_offset, size);
+    return get_into_range_internal(key, real_buffer, 0, src_offset, size,
+                                   size_is_buffer_capacity, verify_checksum);
 }
 
 std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
@@ -4335,41 +4723,30 @@ RealClient::get_into_ranges_shm_helper(
     }
 #endif
 
-    const size_t buffer_count = dummy_buffers.size();
-    auto prepared = prepare_ranged_read_request(
-        buffer_count, all_keys, all_dst_offsets, all_src_offsets, all_sizes,
-        "get_into_ranges_shm_helper");
-    if (!prepared.top_level_valid) {
-        return std::move(prepared.results);
-    }
-
     std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
         LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
-        fill_ranged_read_results_with_error(prepared.results,
-                                            ErrorCode::INVALID_PARAMS);
-        return prepared.results;
+        return build_ranged_read_internal_error_results(
+            dummy_buffers.size(), all_keys, all_dst_offsets,
+            ErrorCode::INVALID_PARAMS);
     }
 
-    if (!prepared.has_any_valid_fragment) {
-        return prepared.results;
-    }
-
+    std::vector<size_t> capacities;
     auto real_buffers_result = map_dummy_addrs_to_real_ptrs(
-        it->second, dummy_buffers, prepared.required_buffer_sizes, client_id);
+        it->second, dummy_buffers, std::vector<size_t>(dummy_buffers.size()),
+        client_id, &capacities);
     if (!real_buffers_result) {
-        fill_ranged_read_results_with_error(prepared.results,
-                                            real_buffers_result.error());
-        return prepared.results;
+        return build_ranged_read_internal_error_results(
+            dummy_buffers.size(), all_keys, all_dst_offsets,
+            real_buffers_result.error());
     }
 
     auto query_result_cache =
         build_query_result_cache_from_cached_results(cached_query_results);
     return get_into_ranges_internal(
         real_buffers_result.value(), all_keys, all_dst_offsets, all_src_offsets,
-        all_sizes, &prepared.required_buffer_sizes, &prepared.results,
-        &prepared.valid_fragments,
+        all_sizes, &capacities,
         query_result_cache.empty() ? nullptr : &query_result_cache);
 }
 
@@ -4377,7 +4754,7 @@ std::vector<tl::expected<int64_t, ErrorCode>>
 RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                                     const std::vector<void *> &buffers,
                                     const std::vector<size_t> &sizes) {
-    auto start_time = std::chrono::steady_clock::now();
+    [[maybe_unused]] auto start_time = std::chrono::steady_clock::now();
     // Validate preconditions
     if (!client_) {
         LOG(ERROR) << "Client is not initialized";
@@ -4646,8 +5023,9 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
         store_segment_it->second.emplace(op_it.first, op_it.second.slices);
     }
 
-    size_t offload_object_count = 0;
-    auto start_read_store_time = std::chrono::steady_clock::now();
+    [[maybe_unused]] size_t offload_object_count = 0;
+    [[maybe_unused]] auto start_read_store_time =
+        std::chrono::steady_clock::now();
     for (auto &offload_objects_it : offload_objects) {
         offload_object_count += offload_objects_it.second.size();
         auto batch_get_offload_result = batch_get_into_offload_object_internal(
@@ -4660,14 +5038,27 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
                             .original_index] =
                     tl::make_unexpected(batch_get_offload_result.error());
             }
+            continue;
+        }
+        for (const auto &offload_object_it : offload_objects_it.second) {
+            const auto &op =
+                valid_local_disk_operations.at(offload_object_it.first);
+            auto checksum_result = client_->VerifyObjectChecksum(
+                offload_object_it.first, offload_object_it.second,
+                op.total_size, op.query_result.object_checksum);
+            if (!checksum_result) {
+                results[op.original_index] =
+                    tl::make_unexpected(checksum_result.error());
+            }
         }
     }
 
     auto end_time = std::chrono::steady_clock::now();
-    auto elapsed_time = std::chrono::duration_cast<std::chrono::microseconds>(
-                            end_time - start_time)
-                            .count();
-    auto read_store_time =
+    [[maybe_unused]] auto elapsed_time =
+        std::chrono::duration_cast<std::chrono::microseconds>(end_time -
+                                                              start_time)
+            .count();
+    [[maybe_unused]] auto read_store_time =
         std::chrono::duration_cast<std::chrono::microseconds>(
             end_time - start_read_store_time)
             .count();
@@ -5073,6 +5464,19 @@ RealClient::batch_get_into_multi_buffers_internal(
                                    << "': " << toString(read_result.error());
                         results[disk_it->second.original_index] =
                             tl::make_unexpected(read_result.error());
+                    }
+                    continue;
+                }
+                for (auto &[key, slices] : objects) {
+                    auto disk_it = valid_local_disk_ops.find(key);
+                    if (disk_it == valid_local_disk_ops.end()) continue;
+                    auto &op = disk_it->second;
+                    auto checksum_result = client_->VerifyObjectChecksum(
+                        key, slices, op.total_size,
+                        op.query_result.object_checksum);
+                    if (!checksum_result) {
+                        results[op.original_index] =
+                            tl::make_unexpected(checksum_result.error());
                     }
                 }
             }
@@ -5525,10 +5929,10 @@ RealClient::batch_get_into_offload_object_internal(
     std::vector<std::string> keys;
     std::vector<std::string> storage_keys;
     std::vector<int64_t> sizes;
+    const TenantId tenant_id(client_->tenant_id());
     for (const auto &object_it : objects) {
         keys.emplace_back(object_it.first);
-        storage_keys.emplace_back(
-            MakeTenantScopedStorageKey(client_->tenant_id(), object_it.first));
+        storage_keys.emplace_back(tenant_id.MakeScopedKey(object_it.first));
         int64_t total = 0;
         for (const auto &s : object_it.second) total += s.size;
         sizes.emplace_back(total);
@@ -5597,7 +6001,7 @@ ClientRequester::ClientRequester() {
 
     client_pools_ =
         std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(
-            pool_conf);
+            pool_conf, GetStoreRpcClientIoContextPool());
 }
 
 tl::expected<BatchGetOffloadObjectResponse, ErrorCode>

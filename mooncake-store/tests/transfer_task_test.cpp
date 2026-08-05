@@ -7,10 +7,14 @@
 #include <chrono>
 #include <cstring>
 #include <memory>
+#include <numeric>
 #include <thread>
 #include <vector>
 
 #include "types.h"
+#ifdef USE_CUDA
+#include <cuda_runtime_api.h>
+#endif
 
 namespace mooncake {
 
@@ -143,6 +147,139 @@ TEST_F(TransferTaskTest, MemcpyWorkerPoolMultipleOperations) {
         }
     }
 }
+
+TEST_F(TransferTaskTest, TransferScatterHandlesFragmentedCpuBuffers) {
+    constexpr size_t kBufferSize = 512;
+    constexpr size_t kFragmentCount = 128;
+    std::vector<char> source(kBufferSize), destination(kBufferSize, 0);
+    std::iota(source.begin(), source.end(), 0);
+    std::vector<size_t> destination_offsets, source_offsets,
+        lengths(kFragmentCount, 1);
+    for (size_t i = 0; i < kFragmentCount; ++i) {
+        destination_offsets.push_back(i * 2);
+        source_offsets.push_back(i * 3);
+    }
+
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init("P2PHANDSHAKE", "localhost:17931"), 0);
+    if (!engine.isUsingTent()) {
+        ASSERT_NE(engine.installTransport("tcp", nullptr), nullptr);
+    }
+    ASSERT_EQ(engine.registerLocalMemory(source.data(), source.size(), "cpu:0"),
+              0);
+    ASSERT_EQ(engine.registerLocalMemory(destination.data(), destination.size(),
+                                         "cpu:0"),
+              0);
+
+    ASSERT_TRUE(engine
+                    .transferScatter({{
+                        .opcode = TransferRequest::READ,
+                        .remote_segment = engine.getLocalIpAndPort(),
+                        .remote_base_offset =
+                            reinterpret_cast<uintptr_t>(source.data()),
+                        .remote_size = source.size(),
+                        .local_buffer = destination.data(),
+                        .local_capacity = destination.size(),
+                        .local_offsets = destination_offsets,
+                        .remote_offsets = source_offsets,
+                        .lengths = lengths,
+                        .on_fragment_complete = {},
+                    }})
+                    .ok());
+    for (size_t i = 0; i < kFragmentCount; ++i) {
+        EXPECT_EQ(destination[destination_offsets[i]],
+                  source[source_offsets[i]]);
+    }
+}
+
+#ifdef USE_CUDA
+TEST_F(TransferTaskTest, TransferScatterHandlesFragmentedGpuBuffers) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+        GTEST_SKIP() << "CUDA device is unavailable";
+    }
+
+    constexpr size_t kBufferSize = 512;
+    constexpr size_t kFragmentCount = 128;
+    std::vector<char> source(kBufferSize), cpu_destination(kBufferSize, 0);
+    std::iota(source.begin(), source.end(), 0);
+    void *gpu_source = nullptr, *gpu_destination = nullptr;
+    ASSERT_EQ(cudaMalloc(&gpu_source, kBufferSize), cudaSuccess);
+    ASSERT_EQ(cudaMalloc(&gpu_destination, kBufferSize), cudaSuccess);
+    ASSERT_EQ(cudaMemcpy(gpu_source, source.data(), kBufferSize,
+                         cudaMemcpyHostToDevice),
+              cudaSuccess);
+
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init("P2PHANDSHAKE", "localhost:17932"), 0);
+    if (!engine.isUsingTent()) {
+        ASSERT_NE(engine.installTransport("tcp", nullptr), nullptr);
+    }
+    ASSERT_EQ(engine.registerLocalMemory(source.data(), source.size(), "cpu:0"),
+              0);
+    ASSERT_EQ(engine.registerLocalMemory(cpu_destination.data(),
+                                         cpu_destination.size(), "cpu:0"),
+              0);
+    ASSERT_EQ(engine.registerLocalMemory(gpu_source, kBufferSize, "cuda:0"), 0);
+    ASSERT_EQ(
+        engine.registerLocalMemory(gpu_destination, kBufferSize, "cuda:0"), 0);
+
+    std::vector<size_t> destination_offsets, source_offsets,
+        lengths(kFragmentCount, 1);
+    std::vector<char> expected(kBufferSize, 0), actual(kBufferSize);
+    for (size_t i = 0; i < kFragmentCount; ++i) {
+        destination_offsets.push_back(i * 2);
+        source_offsets.push_back(i * 3);
+        expected[i * 2] = source[i * 3];
+    }
+    auto make_transfer = [&](void* remote_source, void* local_destination) {
+        return TransferEngine::ScatterTransferRange{
+            .opcode = TransferRequest::READ,
+            .remote_segment = engine.getLocalIpAndPort(),
+            .remote_base_offset = reinterpret_cast<uintptr_t>(remote_source),
+            .remote_size = kBufferSize,
+            .local_buffer = local_destination,
+            .local_capacity = kBufferSize,
+            .local_offsets = destination_offsets,
+            .remote_offsets = source_offsets,
+            .lengths = lengths,
+            .on_fragment_complete = {},
+        };
+    };
+
+    auto invalid_transfer = make_transfer(source.data(), gpu_destination);
+    invalid_transfer.remote_offsets = {};
+    EXPECT_TRUE(engine.transferScatter({invalid_transfer}).IsInvalidArgument());
+
+    ASSERT_EQ(cudaMemset(gpu_destination, 0, kBufferSize), cudaSuccess);
+    ASSERT_TRUE(
+        engine.transferScatter({make_transfer(source.data(), gpu_destination)})
+            .ok());
+    ASSERT_EQ(cudaMemcpy(actual.data(), gpu_destination, kBufferSize,
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_EQ(actual, expected);
+
+    ASSERT_TRUE(engine
+                    .transferScatter(
+                        {make_transfer(gpu_source, cpu_destination.data())})
+                    .ok());
+    EXPECT_EQ(cpu_destination, expected);
+
+    ASSERT_EQ(cudaMemset(gpu_destination, 0, kBufferSize), cudaSuccess);
+    auto operation =
+        engine.submitScatter({make_transfer(gpu_source, gpu_destination)});
+    ASSERT_EQ(engine.freeEngine(), 0);
+    ASSERT_TRUE(operation.wait().ok());
+    ASSERT_EQ(cudaMemcpy(actual.data(), gpu_destination, kBufferSize,
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_EQ(actual, expected);
+
+    EXPECT_EQ(cudaFree(gpu_source), cudaSuccess);
+    EXPECT_EQ(cudaFree(gpu_destination), cudaSuccess);
+}
+#endif
 
 // Test the locality decision used by TransferSubmitter::isLocalTransfer.
 // Same-host different-process pairs share an IP but have distinct ports;

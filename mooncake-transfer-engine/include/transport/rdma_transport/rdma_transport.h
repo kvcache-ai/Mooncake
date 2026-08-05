@@ -173,6 +173,10 @@ class RdmaTransport : public Transport {
         if (connection_limiter_) connection_limiter_->release();
     }
 
+    const std::vector<std::shared_ptr<RdmaContext>> &getContextList() const {
+        return context_list_;
+    }
+
    private:
     std::vector<std::shared_ptr<RdmaContext>> context_list_;
     std::shared_ptr<Topology> local_topology_;
@@ -183,6 +187,13 @@ class RdmaTransport : public Transport {
     std::string rdma_server_name_;
     std::mutex local_desc_lock_;
     std::unique_ptr<ConnectionLimiter> connection_limiter_;
+    // Mooncake#2017: buffers larger than the device max_mr_size are split into
+    // multiple sub-max_mr_size MRs (one BufferDesc per chunk) so that
+    // ibv_reg_mr is never silently truncated. unregisterLocalMemory() only
+    // receives the base addr, so remember each base buffer's chunk
+    // start-addresses for cleanup.
+    std::mutex chunk_map_mutex_;
+    std::unordered_map<uint64_t, std::vector<uint64_t>> chunk_map_;
 };
 
 // RAII guard that holds a handshake slot for its lifetime, guaranteeing the

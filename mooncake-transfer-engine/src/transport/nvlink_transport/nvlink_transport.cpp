@@ -855,15 +855,23 @@ int NvlinkTransport::relocateSharedMemoryAddress(uint64_t &dest_addr,
 int NvlinkTransport::registerLocalMemoryBatch(
     const std::vector<Transport::BufferEntry> &buffer_list,
     const std::string &location) {
-    for (auto &buffer : buffer_list)
-        registerLocalMemory(buffer.addr, buffer.length, location, true, false);
+    for (auto &buffer : buffer_list) {
+        int ret = registerLocalMemory(buffer.addr, buffer.length, location,
+                                      true, false);
+        if (ret) return ret;
+    }
     return metadata_->updateLocalSegmentDesc();
 }
 
 int NvlinkTransport::unregisterLocalMemoryBatch(
     const std::vector<void *> &addr_list) {
-    for (auto &addr : addr_list) unregisterLocalMemory(addr, false);
-    return metadata_->updateLocalSegmentDesc();
+    int first_error = 0;
+    for (auto &addr : addr_list) {
+        int ret = unregisterLocalMemory(addr, false);
+        if (ret && !first_error) first_error = ret;
+    }
+    int metadata_ret = metadata_->updateLocalSegmentDesc();
+    return first_error ? first_error : metadata_ret;
 }
 
 void *NvlinkTransport::allocatePinnedLocalMemory(size_t size) {

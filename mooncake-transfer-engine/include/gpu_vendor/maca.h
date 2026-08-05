@@ -120,6 +120,7 @@ static inline CUresult cuGetErrorString(CUresult error, const char **err_str) {
 #define cudaMemcpyDeviceToHost mcMemcpyDeviceToHost
 #define cudaMemcpyHostToDevice mcMemcpyHostToDevice
 #define cudaMemcpyKind mcMemcpyKind
+#define cudaMemcpyPeerAsync mcMemcpyPeerAsync
 #define cudaMemset mcMemset
 #define cudaMemsetAsync mcMemsetAsync
 #define cudaMemoryTypeDevice mcMemoryTypeDevice

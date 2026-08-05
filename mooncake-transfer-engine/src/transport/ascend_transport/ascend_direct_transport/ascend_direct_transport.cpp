@@ -420,16 +420,18 @@ int AscendDirectTransport::unregisterLocalMemoryBatch(
                  "with addr count: "
               << addr_list.size();
 
+    int first_error = 0;
     for (void *addr : addr_list) {
         int ret = unregisterLocalMemory(addr, false);
         if (ret != 0) {
             LOG(ERROR) << "Failed to unregister memory in batch, addr: "
                        << addr;
-            return ret;
+            if (!first_error) first_error = ret;
         }
     }
 
     // Update metadata once for the entire batch
-    return metadata_->updateLocalSegmentDesc();
+    int metadata_ret = metadata_->updateLocalSegmentDesc();
+    return first_error ? first_error : metadata_ret;
 }
 }  // namespace mooncake
