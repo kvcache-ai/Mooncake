@@ -702,14 +702,14 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     // left waiting on the TTL reaper.
     std::optional<ErrorCode> abort_error;
 
-    // Pre-populate all_bucket_keys (needed by both sequential and parallel
-    // paths).
-    for (const auto& keys : buckets_keys) {
-        for (const auto& k : keys) all_bucket_keys.insert(k);
-    }
-
     if (offload_write_pool_ && buckets_keys.size() > 1) {
         // --- Parallel path: dispatch each bucket to the offload write pool ---
+        // Every bucket is dispatched up front, so pre-populate all_bucket_keys
+        // with all of them: the sweep at the tail must only NACK keys skipped
+        // by GroupOffloadingKeysByBucket, not the dispatched ones.
+        for (const auto& keys : buckets_keys) {
+            for (const auto& k : keys) all_bucket_keys.insert(k);
+        }
         Mutex failed_mutex;
         Mutex fatal_mutex;
         std::optional<ErrorCode> fatal_error;
@@ -799,7 +799,13 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     }
 
     // --- Sequential path (original behavior, unchanged) ---
+    // Insert each bucket's keys into all_bucket_keys incrementally, right
+    // before processing it (same as main).  On a whole-cycle abort, buckets
+    // not yet reached are absent from all_bucket_keys, so the tail sweep NACKs
+    // them and their offloading tasks / source-replica refcounts are released
+    // immediately rather than waiting on the TTL reaper.
     for (const auto& keys : buckets_keys) {
+        for (const auto& k : keys) all_bucket_keys.insert(k);
         auto result = ProcessOneBucket(keys, task_by_storage_key, failed_tasks,
                                        /*failed_mutex=*/nullptr,
                                        complete_handler);
