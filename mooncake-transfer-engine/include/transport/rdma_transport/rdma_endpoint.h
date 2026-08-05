@@ -197,9 +197,10 @@ class RdmaEndPoint {
     static constexpr uint32_t kWaitExistingHandshakeInitialSleepUs = 50;
     static constexpr uint32_t kWaitExistingHandshakeMaxSleepUs = 2000;
 
-    // Maximum time (in seconds) to wait for outstanding WRs to drain in
-    // finishDestroy before forcing QP destruction. This guards against
-    // ibv_modify_qp-to-ERR failures that prevent WR flushing.
+    // Maximum time (in seconds) to wait for outstanding WRs to drain before
+    // treating the endpoint as leaked. Timed-out endpoints stay in the
+    // EndpointStore waiting list so stale in-flight references cannot turn
+    // into UAF.
     static constexpr double kFinishDestroyTimeoutSec = 30.0;
 
     // Maximum number of deconstructLocked retries in finishDestroy before
@@ -224,8 +225,10 @@ class RdmaEndPoint {
     size_t max_inline_bytes_;
 
     std::atomic<bool> active_;
+    ibv_cq *cq_;
     std::atomic<int> *cq_outstanding_;
     std::atomic<uint64_t> inactive_time_;
+    bool finish_destroy_timeout_logged_ = false;
     int finish_destroy_retries_ = 0;
 };
 
