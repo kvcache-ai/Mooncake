@@ -172,7 +172,7 @@ jobs:
           [ -d /usr/local/cuda ] && export CUDA_HOME=/usr/local/cuda
           SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -E"
           cd build
-          cmake --build . --parallel 128
+          cmake --build . -j"$(nproc)"
           $SUDO cmake --install .
 
       - name: Build nvlink_allocator.so
