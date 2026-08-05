@@ -4584,58 +4584,22 @@ RealClient::batch_get_into_cuda_ipc_dummy_helper(
 
     std::vector<tl::expected<int64_t, ErrorCode>> results(
         requests.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
-    std::vector<device::CudaIpcBufferMapping> mappings;
-    std::vector<void *> buffers;
-    std::vector<std::vector<std::string>> all_keys;
-    std::vector<std::vector<std::vector<size_t>>> all_dst_offsets;
-    std::vector<std::vector<std::vector<size_t>>> all_src_offsets;
-    std::vector<std::vector<std::vector<size_t>>> all_sizes;
-    std::vector<size_t> buffer_capacities;
-    std::vector<size_t> original_indices;
-    mappings.reserve(requests.size());
-    buffers.reserve(requests.size());
-    all_keys.reserve(requests.size());
-    all_dst_offsets.reserve(requests.size());
-    all_src_offsets.reserve(requests.size());
-    all_sizes.reserve(requests.size());
-    buffer_capacities.reserve(requests.size());
-    original_indices.reserve(requests.size());
 
     for (size_t i = 0; i < requests.size(); ++i) {
         const auto &request = requests[i];
+        if (request.size == 0) {
+            results[i] = 0;
+            continue;
+        }
         auto mapping = device::CudaIpcBufferMapping::Open(request.destination);
         if (!mapping) {
             results[i] = tl::unexpected(mapping.error());
             continue;
         }
-        mappings.push_back(std::move(*mapping));
-        buffers.push_back(mappings.back().ptr());
-        all_keys.push_back({request.key});
-        all_dst_offsets.push_back({{0}});
-        all_src_offsets.push_back(
-            {{static_cast<size_t>(request.source_offset)}});
-        all_sizes.push_back({{static_cast<size_t>(request.size)}});
-        buffer_capacities.push_back(static_cast<size_t>(request.size));
-        original_indices.push_back(i);
-    }
-
-    if (buffers.empty()) {
-        return results;
-    }
-
-    auto range_results = get_into_ranges_internal(
-        buffers, all_keys, all_dst_offsets, all_src_offsets, all_sizes,
-        &buffer_capacities, nullptr);
-    for (size_t i = 0; i < original_indices.size(); ++i) {
-        if (i < range_results.size() && range_results[i].size() == 1 &&
-            range_results[i][0].size() == 1) {
-            results[original_indices[i]] = range_results[i][0][0];
-        } else {
-            LOG(ERROR) << "Invalid cuda ipc tensor read result shape for key "
-                       << requests[original_indices[i]].key;
-            results[original_indices[i]] =
-                tl::unexpected(ErrorCode::INTERNAL_ERROR);
-        }
+        results[i] = get_into_range_internal(
+            request.key, mapping->ptr(), 0,
+            static_cast<size_t>(request.source_offset),
+            static_cast<size_t>(request.size), false, false);
     }
     return results;
 }
