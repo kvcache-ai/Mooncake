@@ -522,8 +522,11 @@ Status GdsTransport::getTransferStatus(SubBatchRef batch, int task_id,
     bool all_terminal = false;
     auto task_status = aggregateTransferStatus(
         gds_batch->cached_events, range.base, range.count, all_terminal);
+    if (range.known_failure == PENDING && isTerminalFailure(task_status.s)) {
+        range.known_failure = task_status.s;
+    }
 
-    if (isTerminalFailure(task_status.s) && !all_terminal) {
+    if (range.known_failure != PENDING && !all_terminal) {
         if (!gds_batch->cancel_requested) {
             gds_batch->cancel_requested = true;
             auto cancel_status = cancelBatch(gds_batch);
@@ -532,9 +535,8 @@ Status GdsTransport::getTransferStatus(SubBatchRef batch, int task_id,
             }
         }
 
-        // Cancellation is best effort. Poll once more, then report the known
-        // failure without waiting indefinitely for sibling slices. If any IO
-        // is still active, the handle and parameter storage must not be reused.
+        // Cancellation is best effort. Poll once more, but do not publish a
+        // terminal status while cuFile may still access the user buffer.
         auto repoll_status = updateBatchStatus(gds_batch);
         if (!repoll_status.ok()) {
             LOG(WARNING) << repoll_status.ToString();
@@ -550,8 +552,10 @@ Status GdsTransport::getTransferStatus(SubBatchRef batch, int task_id,
     // reported byte count monotonic across repeated polls.
     range.transferred_bytes =
         std::max(range.transferred_bytes, task_status.transferred_bytes);
-    if (task_status.s != PENDING) {
-        range.status = task_status.s;
+    if (all_terminal) {
+        range.status = range.known_failure != PENDING ? range.known_failure
+                                                      : task_status.s;
+        gds_batch->reusable = allBatchIOsTerminal(gds_batch);
     }
     status = TransferStatus{range.status, range.transferred_bytes};
     return Status::OK();

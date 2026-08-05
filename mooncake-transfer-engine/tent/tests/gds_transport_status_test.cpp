@@ -23,6 +23,7 @@
 namespace {
 
 std::vector<CUfileIOEvents_t> reported_events;
+size_t cancel_call_count = 0;
 
 }  // namespace
 
@@ -41,6 +42,13 @@ extern "C" CUfileError_t __wrap_cuFileBatchIOGetStatus(CUfileBatchHandle_t,
     std::copy_n(reported_events.begin(), count, events);
     *num_events = static_cast<unsigned>(count);
 
+    CUfileError_t result{};
+    result.err = CU_FILE_SUCCESS;
+    return result;
+}
+
+extern "C" CUfileError_t __wrap_cuFileBatchIOCancel(CUfileBatchHandle_t) {
+    ++cancel_call_count;
     CUfileError_t result{};
     result.err = CU_FILE_SUCCESS;
     return result;
@@ -69,7 +77,7 @@ CUfileIOEvents_t makeEvent(CUfileStatus_t status, int64_t bytes = 0,
     return event;
 }
 
-TEST(GdsTransportStatusTest, ReportsFailureWhileSiblingIsActive) {
+TEST(GdsTransportStatusTest, DetectsFailureWhileSiblingIsActive) {
     bool all_terminal = true;
     auto status = GdsTransportTestPeer::aggregate(
         {makeEvent(CUFILE_FAILED), makeEvent(CUFILE_WAITING)}, all_terminal);
@@ -98,7 +106,7 @@ TEST(GdsTransportStatusTest, PublicStatusReportsCompletedBytesWhilePending) {
     batch.io_events.resize(2);
     batch.cached_events = {makeEvent(CUFILE_PENDING, 0, 0),
                            makeEvent(CUFILE_PENDING, 0, 1)};
-    batch.io_param_ranges.push_back(IOParamRange{0, 2, 0, PENDING});
+    batch.io_param_ranges.push_back(IOParamRange{0, 2, 0, PENDING, PENDING});
     reported_events = {makeEvent(CUFILE_COMPLETE, 1024, 0),
                        makeEvent(CUFILE_PENDING, 0, 1)};
 
@@ -107,6 +115,93 @@ TEST(GdsTransportStatusTest, PublicStatusReportsCompletedBytesWhilePending) {
     EXPECT_EQ(status.s, PENDING);
     EXPECT_EQ(status.transferred_bytes, 1024);
     EXPECT_EQ(batch.io_param_ranges[0].transferred_bytes, 1024);
+}
+
+TEST(GdsTransportStatusTest, KeepsFailurePendingUntilEverySliceIsTerminal) {
+    GdsTransport transport;
+    GdsSubBatch batch;
+    BatchHandle batch_handle{};
+    batch.batch_handle = &batch_handle;
+    batch.io_params.resize(2);
+    batch.io_events.resize(2);
+    batch.cached_events = {makeEvent(CUFILE_PENDING, 0, 0),
+                           makeEvent(CUFILE_PENDING, 0, 1)};
+    batch.io_param_ranges.push_back(IOParamRange{0, 2, 0, PENDING, PENDING});
+    reported_events = {makeEvent(CUFILE_FAILED, 0, 0),
+                       makeEvent(CUFILE_PENDING, 0, 1)};
+    cancel_call_count = 0;
+
+    TransferStatus status{INITIAL, 0};
+    ASSERT_TRUE(transport.getTransferStatus(&batch, 0, status).ok());
+    EXPECT_EQ(status.s, PENDING);
+    EXPECT_EQ(batch.io_param_ranges[0].known_failure, FAILED);
+    EXPECT_FALSE(batch.reusable);
+    EXPECT_EQ(cancel_call_count, 1);
+
+    ASSERT_TRUE(transport.getTransferStatus(&batch, 0, status).ok());
+    EXPECT_EQ(status.s, PENDING);
+    EXPECT_EQ(cancel_call_count, 1);
+
+    reported_events = {makeEvent(CUFILE_FAILED, 0, 0),
+                       makeEvent(CUFILE_CANCELED, 0, 1)};
+    ASSERT_TRUE(transport.getTransferStatus(&batch, 0, status).ok());
+    EXPECT_EQ(status.s, FAILED);
+    EXPECT_TRUE(batch.reusable);
+    EXPECT_EQ(cancel_call_count, 1);
+}
+
+TEST(GdsTransportStatusTest, CancellationDoesNotMaskOriginalFailure) {
+    GdsTransport transport;
+    GdsSubBatch batch;
+    BatchHandle batch_handle{};
+    batch.batch_handle = &batch_handle;
+    batch.io_params.resize(2);
+    batch.io_events.resize(2);
+    batch.cached_events = {makeEvent(CUFILE_PENDING, 0, 0),
+                           makeEvent(CUFILE_PENDING, 0, 1)};
+    batch.io_param_ranges.push_back(IOParamRange{0, 2, 0, PENDING, PENDING});
+    reported_events = {makeEvent(CUFILE_INVALID, 0, 0),
+                       makeEvent(CUFILE_PENDING, 0, 1)};
+    cancel_call_count = 0;
+
+    TransferStatus status{INITIAL, 0};
+    ASSERT_TRUE(transport.getTransferStatus(&batch, 0, status).ok());
+    EXPECT_EQ(status.s, PENDING);
+    EXPECT_EQ(batch.io_param_ranges[0].known_failure, INVALID);
+
+    reported_events = {makeEvent(CUFILE_INVALID, 0, 0),
+                       makeEvent(CUFILE_CANCELED, 0, 1)};
+    ASSERT_TRUE(transport.getTransferStatus(&batch, 0, status).ok());
+    EXPECT_EQ(status.s, INVALID);
+    EXPECT_EQ(cancel_call_count, 1);
+}
+
+TEST(GdsTransportStatusTest, ReusesHandleOnlyAfterWholeBatchIsTerminal) {
+    GdsTransport transport;
+    GdsSubBatch batch;
+    BatchHandle batch_handle{};
+    batch.batch_handle = &batch_handle;
+    batch.io_params.resize(2);
+    batch.io_events.resize(2);
+    batch.cached_events = {makeEvent(CUFILE_PENDING, 0, 0),
+                           makeEvent(CUFILE_PENDING, 0, 1)};
+    batch.io_param_ranges = {IOParamRange{0, 1, 0, PENDING, PENDING},
+                             IOParamRange{1, 1, 0, PENDING, PENDING}};
+    reported_events = {makeEvent(CUFILE_FAILED, 0, 0),
+                       makeEvent(CUFILE_PENDING, 0, 1)};
+    cancel_call_count = 0;
+
+    TransferStatus status{INITIAL, 0};
+    ASSERT_TRUE(transport.getTransferStatus(&batch, 0, status).ok());
+    EXPECT_EQ(status.s, FAILED);
+    EXPECT_FALSE(batch.reusable);
+    EXPECT_EQ(cancel_call_count, 0);
+
+    reported_events = {makeEvent(CUFILE_FAILED, 0, 0),
+                       makeEvent(CUFILE_COMPLETE, 1024, 1)};
+    ASSERT_TRUE(transport.getTransferStatus(&batch, 1, status).ok());
+    EXPECT_EQ(status.s, COMPLETED);
+    EXPECT_TRUE(batch.reusable);
 }
 
 TEST(GdsTransportStatusTest, AggregatesCompletedBytes) {

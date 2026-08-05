@@ -41,6 +41,10 @@ struct IOParamRange {
     size_t count = 0;
     size_t transferred_bytes = 0;
     TransferStatusEnum status = TransferStatusEnum::PENDING;
+    // Public status stays PENDING until every slice in this range is
+    // physically terminal. Preserve the first observed failure while sibling
+    // slices drain so cancellation cannot mask the original result.
+    TransferStatusEnum known_failure = TransferStatusEnum::PENDING;
 };
 
 // Wrapper for reusable CUfileBatchHandle_t
