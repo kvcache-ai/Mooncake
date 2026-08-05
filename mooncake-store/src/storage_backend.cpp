@@ -2788,6 +2788,77 @@ void BucketStorageBackend::RollbackCommittedBucket(
               << " with " << keys.size() << " keys";
 }
 
+void BucketStorageBackend::PartialRollbackKeys(
+    const std::vector<std::string>& keys_to_evict) {
+    if (keys_to_evict.empty()) {
+        return;
+    }
+    int64_t bucket_id = -1;
+    bool bucket_now_empty = false;
+    {
+        SharedMutexLocker lock(&mutex_);
+
+        // Resolve bucket_id from the first still-committed key. The caller
+        // contract (complete_handler) guarantees all keys share one bucket.
+        for (const auto& key : keys_to_evict) {
+            auto obj_it = object_bucket_map_.find(key);
+            if (obj_it != object_bucket_map_.end()) {
+                bucket_id = obj_it->second.bucket_id;
+                break;
+            }
+        }
+        if (bucket_id < 0) {
+            LOG(WARNING) << "PartialRollbackKeys: no key still committed — "
+                            "already rolled back or evicted";
+            return;
+        }
+        auto bucket_it = buckets_.find(bucket_id);
+        if (bucket_it == buckets_.end()) {
+            LOG(WARNING) << "PartialRollbackKeys: bucket " << bucket_id
+                         << " not found — already rolled back or evicted";
+            return;
+        }
+        const auto& bucket_meta = bucket_it->second;
+
+        for (const auto& key : keys_to_evict) {
+            auto obj_it = object_bucket_map_.find(key);
+            if (obj_it == object_bucket_map_.end() ||
+                obj_it->second.bucket_id != bucket_id) {
+                // Key was never committed here (or already reaped). Skip
+                // rather than fail: this path is best-effort cleanup.
+                continue;
+            }
+            total_size_ -= obj_it->second.data_size + obj_it->second.key_size;
+            object_bucket_map_.erase(obj_it);
+        }
+
+        // Recompute residency by scanning the bucket's key list against the
+        // (post-erase) object_bucket_map_. Cheap because a bucket has at
+        // most a handful of keys.
+        bucket_now_empty = true;
+        for (const auto& key : bucket_meta->keys) {
+            auto obj_it = object_bucket_map_.find(key);
+            if (obj_it != object_bucket_map_.end() &&
+                obj_it->second.bucket_id == bucket_id) {
+                bucket_now_empty = false;
+                break;
+            }
+        }
+    }
+
+    if (bucket_now_empty) {
+        // No accepted sibling left. Reuse the bucket-scope rollback so the
+        // on-disk file is reclaimed instead of turning into an orphan.
+        LOG(INFO) << "PartialRollbackKeys: bucket " << bucket_id
+                  << " drained by partial rollback; running full rollback";
+        RollbackCommittedBucket(bucket_id, /*keys=*/{});
+        return;
+    }
+    LOG(INFO) << "PartialRollbackKeys: evicted " << keys_to_evict.size()
+              << " keys from bucket " << bucket_id
+              << " (accepted siblings retained)";
+}
+
 std::map<int64_t, std::shared_ptr<BucketMetadata>>::iterator
 BucketStorageBackend::SelectEvictionCandidate() {
     // Must be called with mutex_ held (exclusive).

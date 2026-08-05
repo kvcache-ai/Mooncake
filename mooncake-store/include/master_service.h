@@ -720,11 +720,19 @@ class MasterService {
      * successfully offloaded.
      * @param metadatas    The corresponding metadata for each offloaded object,
      * including size, storage location, etc.
+     *
+     * Returns a vector aligned with @p tasks; result[i] is 1 iff master
+     * accepted the completion for task i, 0 iff master dropped it as stale
+     * (post-SSD-IO generation mismatch on the NACK path, the success path,
+     * or the orphan-fallback path). The worker must locally roll back any
+     * on-disk state committed for rejected tasks, without disturbing the
+     * accepted siblings in the same batch. uint8_t is used instead of bool
+     * for struct-pack compatibility with ValidateOffloadGenerations.
      */
     auto NotifyOffloadSuccess(
         const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas)
-        -> tl::expected<void, ErrorCode>;
+        -> tl::expected<std::vector<uint8_t>, ErrorCode>;
 
     /**
      * @brief Check that each pending offload task is still current. Called

@@ -518,10 +518,10 @@ class Client {
      * @param metadatas    The corresponding metadata for each offloaded object,
      * including size, storage location, etc.
      */
-    tl::expected<void, ErrorCode> NotifyOffloadSuccess(
+    tl::expected<std::vector<uint8_t>, ErrorCode> NotifyOffloadSuccess(
         const std::vector<std::string>& keys,
         const std::vector<StorageObjectMetadata>& metadatas);
-    tl::expected<void, ErrorCode> NotifyOffloadSuccess(
+    tl::expected<std::vector<uint8_t>, ErrorCode> NotifyOffloadSuccess(
         const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas);
 

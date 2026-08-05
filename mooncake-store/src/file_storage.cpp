@@ -503,6 +503,39 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                        << result.error() << " keys count: " << keys.size();
             return result.error();
         }
+        // Master returns a per-task acceptance vector: 1 = accepted, 0 =
+        // rejected as stale (post-SSD-IO generation mismatch on the NACK,
+        // success, or orphan-fallback path). Locally roll back on-disk
+        // state only for the rejected keys, leaving accepted siblings in
+        // the same bucket intact — otherwise a partial rejection would
+        // leave orphan bucket entries whose replicas Master no longer
+        // references, which ScanMeta could later re-register after restart.
+        const auto& accepted = result.value();
+        if (accepted.size() == keys.size()) {
+            std::vector<std::string> rejected_keys;
+            rejected_keys.reserve(keys.size());
+            for (size_t i = 0; i < keys.size(); ++i) {
+                if (!accepted[i]) {
+                    rejected_keys.push_back(keys[i]);
+                }
+            }
+            if (!rejected_keys.empty()) {
+                LOG(INFO) << "[OFFLOAD] master rejected "
+                          << rejected_keys.size() << " of " << keys.size()
+                          << " keys as stale; running partial rollback";
+                if (auto bucket_backend =
+                        std::dynamic_pointer_cast<BucketStorageBackend>(
+                            storage_backend_)) {
+                    bucket_backend->PartialRollbackKeys(rejected_keys);
+                }
+            }
+        } else {
+            // Shape mismatch is a protocol violation; log loudly but treat
+            // the batch as accepted so we don't clobber committed state.
+            LOG(ERROR) << "[OFFLOAD] NotifyOffloadSuccess returned "
+                       << accepted.size() << " flags for " << keys.size()
+                       << " keys; skipping partial-rollback bookkeeping";
+        }
         return ErrorCode::OK;
     };
 
@@ -557,9 +590,11 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
 
         // Pre-SSD-IO generation check. UpsertStart may have preempted an
         // offload after its mirror was drained: the master marker is gone
-        // and OffloadTaskItem.generation no longer matches. Route stale
-        // keys through failed_tasks so the NACK flush releases the source
-        // refcount and no SSD bucket is written.
+        // and OffloadTaskItem.generation no longer matches. Drop stale
+        // keys locally: master already released source refcount and erased
+        // the marker in UpsertStart, so a NACK from us would race the new
+        // generation's marker (see the NACK generation-guard in
+        // MasterService::NotifyOffloadSuccess for defence-in-depth).
         {
             std::vector<OffloadTaskItem> validate_tasks;
             std::vector<std::string> validate_keys;
@@ -583,9 +618,8 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                         const auto& obj_key = validate_keys[i];
                         const auto& task = task_by_storage_key.at(obj_key);
                         LOG(INFO)
-                            << "[OFFLOAD] drop stale key, key=" << task.key
-                            << ", generation=" << task.generation;
-                        failed_tasks.push_back(task);
+                            << "[OFFLOAD] drop stale key locally, key="
+                            << task.key << ", generation=" << task.generation;
                         batch_object.erase(obj_key);
                     }
                 }

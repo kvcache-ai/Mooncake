@@ -6145,10 +6145,15 @@ auto MasterService::ReportSsdCapacity(const UUID& client_id,
 auto MasterService::NotifyOffloadSuccess(
     const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
     const std::vector<StorageObjectMetadata>& metadatas)
-    -> tl::expected<void, ErrorCode> {
+    -> tl::expected<std::vector<uint8_t>, ErrorCode> {
     if (tasks.size() != metadatas.size()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
+    // accepted[i] = 1 means master committed the completion for task i;
+    // 0 means master rejected it as stale (post-SSD-IO generation mismatch)
+    // and the caller must locally roll back any on-disk state written for
+    // task i without touching siblings in the same batch.
+    std::vector<uint8_t> accepted(tasks.size(), 1);
     std::shared_ptr<LocalDiskSegment> local_disk_segment;
     {
         ScopedLocalDiskSegmentAccess ssd_access =
@@ -6179,6 +6184,22 @@ auto MasterService::NotifyOffloadSuccess(
                 auto task_it = tenant_state.offloading_tasks.find(
                     request_object_id.user_key);
                 if (task_it != tenant_state.offloading_tasks.end()) {
+                    // Reject stale NACKs that arrive after UpsertStart has
+                    // reset the marker for a newer generation. Without this
+                    // guard, an old worker's NACK would decrement the newer
+                    // task's source refcount and erase its marker, leaking
+                    // the newer offload. Sentinel 0 keeps the pre-generation
+                    // NACK path for HA restore / older workers.
+                    if (task.generation != 0 &&
+                        task.generation != task_it->second.generation) {
+                        LOG(INFO)
+                            << "key=" << request_object_id.user_key
+                            << ", action=drop_stale_offload_nack"
+                            << ", task_gen=" << task.generation
+                            << ", current_gen=" << task_it->second.generation;
+                        accepted[i] = 0;
+                        continue;
+                    }
                     auto source = accessor.Get().GetReplicaByID(
                         task_it->second.source_id);
                     if (source != nullptr) {
@@ -6223,6 +6244,7 @@ auto MasterService::NotifyOffloadSuccess(
                             << ", action=drop_stale_offload_notify"
                             << ", task_gen=" << task.generation
                             << ", current_gen=" << task_it->second.generation;
+                        accepted[i] = 0;
                         continue;
                     }
                     auto source =
@@ -6278,6 +6300,7 @@ auto MasterService::NotifyOffloadSuccess(
                 LOG(INFO) << "key=" << request_object_id.user_key
                           << ", action=drop_stale_offload_notify_orphan"
                           << ", task_gen=" << task.generation;
+                accepted[i] = 0;
                 continue;
             }
             auto normalized_tenant_result =
@@ -6310,7 +6333,7 @@ auto MasterService::NotifyOffloadSuccess(
         }
     }
 
-    return {};
+    return accepted;
 }
 
 auto MasterService::ValidateOffloadGenerations(

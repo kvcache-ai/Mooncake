@@ -218,7 +218,7 @@ class WrappedMasterService {
     tl::expected<void, ErrorCode> ReportSsdCapacity(
         const UUID& client_id, int64_t ssd_total_capacity_bytes);
 
-    tl::expected<void, ErrorCode> NotifyOffloadSuccess(
+    tl::expected<std::vector<uint8_t>, ErrorCode> NotifyOffloadSuccess(
         const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas);
 

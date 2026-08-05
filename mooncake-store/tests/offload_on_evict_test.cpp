@@ -132,6 +132,47 @@ class OffloadOnEvictTest : public ::testing::Test {
             TenantId::Default().MakeScopedKey(key), task);
     }
 
+    // Read the generation of the current offloading_tasks[key] marker, or
+    // std::nullopt if no marker is installed. Requires a completed metadata
+    // shard entry for @p key in the default tenant.
+    std::optional<uint64_t> ReadTaskGeneration(MasterService& service,
+                                               const std::string& key) const {
+        const size_t shard_index =
+            service.getShardIndex(TenantId::Default(), key);
+        MasterService::MetadataShardAccessorRW shard(&service, shard_index);
+        auto& tenant_state = shard->tenants[TenantId::Default()];
+        auto task_it = tenant_state.offloading_tasks.find(key);
+        if (task_it == tenant_state.offloading_tasks.end()) {
+            return std::nullopt;
+        }
+        return task_it->second.generation;
+    }
+
+    // Read the refcnt of the first completed MEMORY replica of @p key in
+    // the default tenant, or std::nullopt if absent.
+    std::optional<uint32_t> ReadMemoryReplicaRefcnt(
+        MasterService& service, const std::string& key) const {
+        const size_t shard_index =
+            service.getShardIndex(TenantId::Default(), key);
+        MasterService::MetadataShardAccessorRW shard(&service, shard_index);
+        auto& tenant_state = shard->tenants[TenantId::Default()];
+        auto md_it = tenant_state.metadata.find(key);
+        if (md_it == tenant_state.metadata.end()) {
+            return std::nullopt;
+        }
+        std::optional<uint32_t> out;
+        md_it->second.VisitReplicas(
+            [](const Replica& r) {
+                return r.is_completed() && r.is_memory_replica();
+            },
+            [&out](Replica& r) {
+                if (!out.has_value()) {
+                    out = r.get_refcnt();
+                }
+            });
+        return out;
+    }
+
     // Simulate the offload_on_evict push path: create the offloading_tasks
     // marker + LocalDisk mirror + refcnt pin for @p key, exactly like the
     // eviction path would. Requires @p key to have a completed MEMORY
@@ -658,14 +699,192 @@ TEST_F(OffloadOnEvictTest, UpsertPreemptsInFlightOffloadAndDropsStaleNotify) {
     auto notify =
         service->NotifyOffloadSuccess(ctx.client_id, {stale_task}, {sm});
     ASSERT_TRUE(notify.has_value());
-
-    // Only the newly-upserted MEMORY replica should exist; no LOCAL_DISK
-    // replica must have been attached from the stale completion.
+    // Per-task rejection contract: the returned acceptance vector must
+    // observably flag the stale task as rejected so the worker can roll
+    // back the local commit without disturbing accepted siblings.
+    ASSERT_EQ(notify->size(), 1u);
+    EXPECT_FALSE(notify->front())
+        << "stale post-SSD-IO completion must be reported as rejected";
     auto listing = service->GetReplicaListForAdmin(key, TenantId::Default());
     ASSERT_TRUE(listing.has_value());
     for (const auto& rep : listing->replicas) {
         EXPECT_FALSE(rep.is_local_disk_replica())
             << "stale offload completion leaked a LOCAL_DISK replica";
+    }
+}
+
+// =============================================================================
+// Regression (fcczzz review, file_storage.cpp:588 window): after UpsertStart
+// preempts an offload the worker may still emit a NACK carrying the old wire
+// generation. Prior to the fix the NACK sentinel branch in
+// NotifyOffloadSuccess only keyed on offloading_tasks[key] and would
+// decrement the *new* generation's source refcount and erase its marker,
+// leaking the newer offload. The regression asserts the NACK is rejected
+// per-task (accepted[0] == 0) and the fresh marker + refcnt are untouched.
+// =============================================================================
+
+TEST_F(OffloadOnEvictTest, StaleNackDoesNotClobberNewerOffloadTask) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx =
+        PrepareSegment(*service, "test_segment", kDefaultSegmentBase, seg_size);
+    auto mount_ld = service->MountLocalDiskSegment(ctx.client_id, true);
+    ASSERT_TRUE(mount_ld.has_value());
+
+    const std::string key = "nack_over_newer_task";
+    PutObject(*service, ctx.client_id, key);
+
+    // Drain the queue to capture a stale (pre-preempt) task. Master's
+    // offloading_tasks[key] survives until NotifyOffloadSuccess.
+    auto hb = service->OffloadObjectHeartbeat(ctx.client_id, true);
+    ASSERT_TRUE(hb.has_value());
+    ASSERT_EQ(hb->size(), 1u);
+    const OffloadTaskItem stale_task = hb->front();
+    ASSERT_NE(stale_task.generation, 0u);
+
+    // Upsert preempts the in-flight task and installs a new PROCESSING
+    // replica; PutEnd completes it as a fresh MEMORY replica which
+    // re-queues a fresh offloading_tasks[key] marker with a new generation.
+    ReplicateConfig cfg;
+    cfg.replica_num = 1;
+    auto upsert_result = service->UpsertStart(
+        ctx.client_id, key, TenantId::Default(), /*slice_length=*/1024, cfg);
+    ASSERT_TRUE(upsert_result.has_value());
+    auto put_end = service->PutEnd(ctx.client_id, key, TenantId::Default(),
+                                   ReplicaType::MEMORY);
+    ASSERT_TRUE(put_end.has_value());
+
+    auto fresh_gen = ReadTaskGeneration(*service, key);
+    ASSERT_TRUE(fresh_gen.has_value())
+        << "PutEnd must re-queue offloading_tasks[key] under a new gen";
+    EXPECT_GT(*fresh_gen, stale_task.generation);
+    auto fresh_refcnt = ReadMemoryReplicaRefcnt(*service, key);
+    ASSERT_TRUE(fresh_refcnt.has_value());
+    EXPECT_GT(*fresh_refcnt, 0u);
+
+    // Late NACK from the stale worker: data_size=-1 sentinel with the old
+    // generation. Master must reject per-task and leave the fresh marker
+    // + refcnt alone.
+    StorageObjectMetadata nack_meta{};
+    nack_meta.data_size = -1;
+    auto notify =
+        service->NotifyOffloadSuccess(ctx.client_id, {stale_task}, {nack_meta});
+    ASSERT_TRUE(notify.has_value());
+    ASSERT_EQ(notify->size(), 1u);
+    EXPECT_FALSE(notify->front())
+        << "stale NACK must be reported as rejected so the worker can "
+           "locally roll back its committed bucket without touching accepted "
+           "siblings";
+
+    auto post_gen = ReadTaskGeneration(*service, key);
+    ASSERT_TRUE(post_gen.has_value())
+        << "stale NACK must not erase the fresh offloading_tasks[key] marker";
+    EXPECT_EQ(*post_gen, *fresh_gen);
+    auto post_refcnt = ReadMemoryReplicaRefcnt(*service, key);
+    ASSERT_TRUE(post_refcnt.has_value());
+    EXPECT_EQ(*post_refcnt, *fresh_refcnt)
+        << "stale NACK must not decrement the fresh source refcnt";
+}
+
+// =============================================================================
+// Regression (fcczzz review, master_service.cpp:6226 window): a batch that
+// mixes an accepted task and a stale one must report per-task acceptance so
+// the worker can partial-rollback only the rejected key, leaving the
+// accepted sibling's local commit intact. Prior to the fix the RPC returned
+// tl::expected<void, ErrorCode> and per-task rejection was silently
+// swallowed, allowing an orphan LOCAL_DISK bucket entry to leak on-disk.
+// =============================================================================
+
+TEST_F(OffloadOnEvictTest,
+       NotifyOffloadSuccessMixedBatchReportsPerTaskAcceptance) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.default_kv_lease_ttl = 2000;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto ctx = PrepareSegment(*service, "test_segment_mixed",
+                              kDefaultSegmentBase, seg_size);
+    auto mount_ld = service->MountLocalDiskSegment(ctx.client_id, true);
+    ASSERT_TRUE(mount_ld.has_value());
+
+    const std::string stale_key = "mixed_stale";
+    const std::string fresh_key = "mixed_fresh";
+    PutObject(*service, ctx.client_id, stale_key);
+    PutObject(*service, ctx.client_id, fresh_key);
+
+    auto hb = service->OffloadObjectHeartbeat(ctx.client_id, true);
+    ASSERT_TRUE(hb.has_value());
+    ASSERT_EQ(hb->size(), 2u);
+    OffloadTaskItem stale_task{};
+    OffloadTaskItem fresh_task{};
+    for (const auto& t : hb.value()) {
+        if (t.key == stale_key) {
+            stale_task = t;
+        } else if (t.key == fresh_key) {
+            fresh_task = t;
+        }
+    }
+    ASSERT_EQ(stale_task.key, stale_key);
+    ASSERT_EQ(fresh_task.key, fresh_key);
+
+    // Preempt only stale_key; fresh_key keeps its original generation.
+    ReplicateConfig cfg;
+    cfg.replica_num = 1;
+    ASSERT_TRUE(service
+                    ->UpsertStart(ctx.client_id, stale_key, TenantId::Default(),
+                                  /*slice_length=*/1024, cfg)
+                    .has_value());
+    ASSERT_TRUE(service
+                    ->PutEnd(ctx.client_id, stale_key, TenantId::Default(),
+                             ReplicaType::MEMORY)
+                    .has_value());
+
+    // Build a mixed batch. Storage payload is fabricated: fresh_task must
+    // still be admitted as a LOCAL_DISK replica so the assertion targets
+    // the per-task acceptance flag, not the underlying storage state.
+    StorageObjectMetadata stale_sm{};
+    stale_sm.data_size = 1024;
+    stale_sm.transport_endpoint = "test_endpoint_stale";
+    StorageObjectMetadata fresh_sm{};
+    fresh_sm.data_size = 1024;
+    fresh_sm.transport_endpoint = "test_endpoint_fresh";
+
+    auto notify = service->NotifyOffloadSuccess(
+        ctx.client_id, {stale_task, fresh_task}, {stale_sm, fresh_sm});
+    ASSERT_TRUE(notify.has_value());
+    ASSERT_EQ(notify->size(), 2u);
+    EXPECT_FALSE(notify.value()[0])
+        << "stale task must be reported as rejected without affecting the "
+           "accepted sibling";
+    EXPECT_TRUE(notify.value()[1]) << "fresh task must be reported as accepted";
+
+    // Fresh sibling's LOCAL_DISK replica must be attached.
+    auto listing =
+        service->GetReplicaListForAdmin(fresh_key, TenantId::Default());
+    ASSERT_TRUE(listing.has_value());
+    bool has_local_disk = false;
+    for (const auto& rep : listing->replicas) {
+        if (rep.is_local_disk_replica()) {
+            has_local_disk = true;
+            break;
+        }
+    }
+    EXPECT_TRUE(has_local_disk)
+        << "accepted sibling must be admitted as a LOCAL_DISK replica";
+
+    // Stale sibling must not have gained a LOCAL_DISK replica.
+    auto stale_listing =
+        service->GetReplicaListForAdmin(stale_key, TenantId::Default());
+    ASSERT_TRUE(stale_listing.has_value());
+    for (const auto& rep : stale_listing->replicas) {
+        EXPECT_FALSE(rep.is_local_disk_replica())
+            << "stale completion leaked a LOCAL_DISK replica onto the "
+               "preempted key";
     }
 }
 

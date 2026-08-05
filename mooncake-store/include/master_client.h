@@ -437,13 +437,20 @@ class MasterClient {
      * offloaded.
      * @param metadatas    The corresponding metadata for each offloaded object,
      * including size, storage location, etc.
+     *
+     * Returns a per-task acceptance vector aligned with @p tasks: 1 = master
+     * accepted, 0 = master rejected as stale. Callers must locally roll back
+     * on-disk state for rejected tasks without touching accepted siblings.
+     * See MasterService::NotifyOffloadSuccess for details.
      */
-    [[nodiscard]] tl::expected<void, ErrorCode> NotifyOffloadSuccess(
-        const UUID& client_id, const std::vector<std::string>& keys,
-        const std::vector<StorageObjectMetadata>& metadatas);
-    [[nodiscard]] tl::expected<void, ErrorCode> NotifyOffloadSuccess(
-        const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
-        const std::vector<StorageObjectMetadata>& metadatas);
+    [[nodiscard]] tl::expected<std::vector<uint8_t>, ErrorCode>
+    NotifyOffloadSuccess(const UUID& client_id,
+                         const std::vector<std::string>& keys,
+                         const std::vector<StorageObjectMetadata>& metadatas);
+    [[nodiscard]] tl::expected<std::vector<uint8_t>, ErrorCode>
+    NotifyOffloadSuccess(const UUID& client_id,
+                         const std::vector<OffloadTaskItem>& tasks,
+                         const std::vector<StorageObjectMetadata>& metadatas);
 
     /**
      * @brief Pre-SSD-IO check that a batch of pending offload tasks is still

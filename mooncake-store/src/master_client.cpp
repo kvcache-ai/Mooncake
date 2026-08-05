@@ -1017,7 +1017,8 @@ tl::expected<void, ErrorCode> MasterClient::ReportSsdCapacity(
         client_id, ssd_total_capacity_bytes);
 }
 
-tl::expected<void, ErrorCode> MasterClient::NotifyOffloadSuccess(
+tl::expected<std::vector<uint8_t>, ErrorCode>
+MasterClient::NotifyOffloadSuccess(
     const UUID& client_id, const std::vector<std::string>& keys,
     const std::vector<StorageObjectMetadata>& metadatas) {
     std::vector<OffloadTaskItem> tasks;
@@ -1029,15 +1030,16 @@ tl::expected<void, ErrorCode> MasterClient::NotifyOffloadSuccess(
     return NotifyOffloadSuccess(client_id, tasks, metadatas);
 }
 
-tl::expected<void, ErrorCode> MasterClient::NotifyOffloadSuccess(
+tl::expected<std::vector<uint8_t>, ErrorCode>
+MasterClient::NotifyOffloadSuccess(
     const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
     const std::vector<StorageObjectMetadata>& metadatas) {
     ScopedVLogTimer timer(1, "MasterClient::NotifyOffloadSuccess");
     timer.LogRequest("client_id=", client_id, ", tasks_count=", tasks.size(),
                      ", metadatas_count=", metadatas.size());
 
-    auto result = invoke_rpc<&WrappedMasterService::NotifyOffloadSuccess, void>(
-        client_id, tasks, metadatas);
+    auto result = invoke_rpc<&WrappedMasterService::NotifyOffloadSuccess,
+                             std::vector<uint8_t>>(client_id, tasks, metadatas);
     timer.LogResponseExpected(result);
     return result;
 }

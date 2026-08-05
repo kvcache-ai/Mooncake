@@ -1513,7 +1513,8 @@ tl::expected<void, ErrorCode> WrappedMasterService::ReportSsdCapacity(
                                              ssd_total_capacity_bytes);
 }
 
-tl::expected<void, ErrorCode> WrappedMasterService::NotifyOffloadSuccess(
+tl::expected<std::vector<uint8_t>, ErrorCode>
+WrappedMasterService::NotifyOffloadSuccess(
     const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
     const std::vector<StorageObjectMetadata>& metadatas) {
     ScopedVLogTimer timer(1, "NotifyOffloadSuccess");
@@ -1525,7 +1526,7 @@ tl::expected<void, ErrorCode> WrappedMasterService::NotifyOffloadSuccess(
                                        ? std::string_view(task.tenant_id)
                                        : TenantId::kDefaultValue);
         if (!tenant_id) {
-            auto result = tl::expected<void, ErrorCode>(
+            auto result = tl::expected<std::vector<uint8_t>, ErrorCode>(
                 tl::make_unexpected(tenant_id.error()));
             timer.LogResponseExpected(result);
             return result;
