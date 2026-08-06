@@ -473,7 +473,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
             return -1;
         }
 
-        const long page_size = sysconf(_SC_PAGESIZE);
+        static const long page_size = sysconf(_SC_PAGESIZE);
         if (page_size <= 0) {
             LOG(ERROR) << "[EP IBGDA] Failed to query host page size";
             errno = EIO;
@@ -650,14 +650,15 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
 
     bool retryControlBuffer(int failure_errno) {
         auto failure = mlx5gda_last_create_qp_failure();
-        const bool dmabuf_control_region_failure =
+        const bool using_dmabuf_control_regions =
             ctrl_buf_mode_ == ControlMemoryMode::kGpuDmabuf;
         if (ctrl_buf_mode_ == ControlMemoryMode::kHostMapped ||
-            (!isCreateQpBadParam(failure) && !dmabuf_control_region_failure))
+            (!isCreateQpBadParam(failure) && !using_dmabuf_control_regions))
             return false;
 
-        if (dmabuf_control_region_failure) {
-            LOG(WARNING) << "[EP IBGDA] DMA-BUF control-region creation failed "
+        if (using_dmabuf_control_regions) {
+            LOG(WARNING) << "[EP IBGDA] QP setup failed while using DMA-BUF "
+                            "control regions "
                             "(errno="
                          << failure_errno
                          << "); retrying with GPU-VA control buffer";

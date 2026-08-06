@@ -125,7 +125,8 @@ static bool uses_control_regions(
 static void release_control_region(
     const struct mlx5gda_control_region_allocator* allocator,
     struct mlx5gda_control_region* region) {
-    if (uses_control_regions(allocator) && region->addr) {
+    if (uses_control_regions(allocator) &&
+        (region->addr || region->umem || region->size != 0)) {
         allocator->release(allocator->context, region);
     }
 }
