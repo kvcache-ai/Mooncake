@@ -266,7 +266,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
         return allocateGpuVaOrHostControlBuffer();
 #endif
 #if defined(USE_MUSA)
-        return allocateSplitControlBuffers();
+        return allocatePerQpGpuVaControlBuffers();
 #else
         return allocateControlBuffer(ControlMemoryMode::kGpuVa);
 #endif

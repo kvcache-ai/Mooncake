@@ -48,8 +48,12 @@
 #include <infiniband/mlx5dv.h>
 #endif
 
-#if defined(MOONCAKE_EP_USE_MACA)
+#if defined(MOONCAKE_EP_USE_MUSA) || defined(MOONCAKE_EP_USE_MACA)
 #define MOONCAKE_EP_SPLIT_SEND_RECV 1
+#endif
+
+#if defined(MOONCAKE_EP_USE_MACA)
+#define MOONCAKE_EP_PHASE_ACK 1
 #endif
 
 // torchada maps nv_bfloat16 → __mt_bfloat16 which is an incomplete type on

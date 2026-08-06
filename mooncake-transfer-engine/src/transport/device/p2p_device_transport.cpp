@@ -36,6 +36,14 @@ namespace device {
 
 namespace {
 
+bool p2pDisabledByEnv() {
+    const char* value = std::getenv("MOONCAKE_EP_DISABLE_P2P");
+    return value != nullptr &&
+           (std::strcmp(value, "1") == 0 || std::strcmp(value, "on") == 0 ||
+            std::strcmp(value, "ON") == 0 || std::strcmp(value, "true") == 0 ||
+            std::strcmp(value, "TRUE") == 0);
+}
+
 #if defined(USE_CUDA)
 bool supportFabricMem() {
     const char* nvlink_ipc = std::getenv("MC_USE_NVLINK_IPC");
@@ -502,6 +510,16 @@ class P2pDeviceTransportImpl : public P2pTransport {
         std::vector<int32_t> available(num_ranks_, 0);
         available[rank] = 1;
         peer_ptrs_host_[rank] = local_ptr;
+
+        if (p2pDisabledByEnv()) {
+            all_peers_accessible_ = num_ranks_ == 1;
+            cudaMemcpy(available_table_, available.data(),
+                       num_ranks_ * sizeof(int32_t), cudaMemcpyHostToDevice);
+            cudaMemcpy(peer_ptrs_dev_, peer_ptrs_host_,
+                       num_ranks_ * sizeof(void*), cudaMemcpyHostToDevice);
+            LOG(INFO) << "[EP P2P] P2P disabled by MOONCAKE_EP_DISABLE_P2P";
+            return;
+        }
 
 #if defined(USE_CUDA)
         if (use_fabric_mem_) {

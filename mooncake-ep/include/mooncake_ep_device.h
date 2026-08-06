@@ -44,15 +44,11 @@ __forceinline__ __device__ int get_lane_id() { return threadIdx.x % 32; }
     dim3 _block(num_threads);                             \
     cudaStream_t _stream = stream
 
-#define LAUNCH_KERNEL(config, kernel, ...)                     \
-    kernel<<<_grid, _block, 0, _stream>>>(__VA_ARGS__);        \
-    {                                                          \
-        auto _err = cudaGetLastError();                        \
-        if (_err != cudaSuccess) {                             \
-            fprintf(stderr, "[EP] kernel launch failed: %s\n", \
-                    cudaGetErrorString(_err));                 \
-        }                                                      \
-    }
+#define LAUNCH_KERNEL(config, kernel, ...)                 \
+    do {                                                    \
+        kernel<<<_grid, _block, 0, _stream>>>(__VA_ARGS__); \
+        CUDA_CHECK(cudaGetLastError());                     \
+    } while (false)
 
 #elif defined(MOONCAKE_EP_USE_MACA)
 
@@ -86,15 +82,11 @@ __forceinline__ __device__ int get_lane_id() { return threadIdx.x % 32; }
     dim3 _block(num_threads);                             \
     cudaStream_t _stream = stream
 
-#define LAUNCH_KERNEL(config, kernel, ...)                     \
-    kernel<<<_grid, _block, 0, _stream>>>(__VA_ARGS__);        \
-    {                                                          \
-        auto _err = cudaGetLastError();                        \
-        if (_err != cudaSuccess) {                             \
-            fprintf(stderr, "[EP] kernel launch failed: %s\n", \
-                    cudaGetErrorString(_err));                 \
-        }                                                      \
-    }
+#define LAUNCH_KERNEL(config, kernel, ...)                 \
+    do {                                                    \
+        kernel<<<_grid, _block, 0, _stream>>>(__VA_ARGS__); \
+        CUDA_CHECK(cudaGetLastError());                     \
+    } while (false)
 
 #else  // !MOONCAKE_EP_USE_MUSA && !MOONCAKE_EP_USE_MACA
 

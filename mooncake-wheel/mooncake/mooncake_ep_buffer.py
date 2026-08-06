@@ -15,7 +15,8 @@ _USE_MACA = (
     _env_enabled("MOONCAKE_EP_USE_MACA")
     or bool(getattr(torch.version, "maca", None))
 )
-_USE_SPLIT_SEND_RECV = _USE_MACA
+_USE_MUSA = _env_enabled("MOONCAKE_EP_USE_MUSA")
+_USE_SPLIT_SEND_RECV = _USE_MUSA or _USE_MACA
 
 
 def _native_current_stream_ptr() -> int:
@@ -295,6 +296,11 @@ class Buffer:
             # export also avoids unnecessary driver IPC calls on MACA.
             self._use_fallback = False
             return
+        if _env_enabled("MOONCAKE_EP_DISABLE_P2P"):
+            # The RDMA-only transport policy must not create GPU IPC mappings.
+            # In particular, this keeps forced-RDMA tests from touching a
+            # platform's peer-VA import path.
+            return
         else:
             try:
                 local_handle_ints = self.runtime.get_ipc_handle()
@@ -432,8 +438,8 @@ class Buffer:
         elif _USE_MACA and use_fp8:
             raise NotImplementedError("FP8 dispatch is not supported on MACA")
 
-        # MACA uses split SEND/RECV kernels with a host phase fence instead of
-        # the single-kernel cooperative path.
+        # MUSA and MACA use split SEND/RECV launches because they do not expose
+        # CUDA cooperative-grid synchronization. Only MACA adds a phase fence.
         if _USE_SPLIT_SEND_RECV and async_finish:
             import warnings
 
@@ -445,7 +451,7 @@ class Buffer:
             )
 
         runtime_return_recv_hook = return_recv_hook or (
-            _USE_MACA and not self._use_fallback
+            _USE_SPLIT_SEND_RECV and not self._use_fallback
         )
 
         if self._use_fallback:
@@ -484,7 +490,9 @@ class Buffer:
                 dtype=torch.float8_e4m3fn if use_fp8 else torch.bfloat16,
                 device=x.device,
             )
-            packed_recv_count = torch.zeros(
+            # The dispatch SEND phase resets every local-expert counter before
+            # the RECV phase reads it, so this output need not be pre-cleared.
+            packed_recv_count = torch.empty(
                 (num_local_experts,), dtype=torch.int32, device=x.device
             )
             packed_recv_src_info = torch.empty(
@@ -534,7 +542,7 @@ class Buffer:
                 runtime_return_recv_hook,
                 _native_current_stream_ptr(),
             )
-            if _USE_MACA:
+            if _USE_SPLIT_SEND_RECV:
                 hook = self._wrap_maca_recv_hook(hook, event)
                 if not return_recv_hook:
                     hook()
@@ -614,7 +622,7 @@ class Buffer:
             num_experts,
         ) = handle
         runtime_return_recv_hook = return_recv_hook or (
-            _USE_MACA and not self._use_fallback
+            _USE_SPLIT_SEND_RECV and not self._use_fallback
         )
 
         if self._use_fallback:
@@ -684,7 +692,7 @@ class Buffer:
                 runtime_return_recv_hook,
                 _native_current_stream_ptr(),
             )
-            if _USE_MACA:
+            if _USE_SPLIT_SEND_RECV:
                 hook = self._wrap_maca_recv_hook(hook, event)
                 if not return_recv_hook:
                     hook()

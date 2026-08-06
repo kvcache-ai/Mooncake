@@ -91,33 +91,20 @@ static struct mlx5dv_devx_uar* create_uar(struct ibv_context* ctx) {
 
 static int map_uar_for_device(struct mlx5dv_devx_uar* uar,
                               struct mlx5gda_qp* qp) {
-    const long page_size = sysconf(_SC_PAGESIZE);
-    if (page_size <= 0) {
-        errno = EIO;
-        return -1;
-    }
-    const uintptr_t reg_addr = reinterpret_cast<uintptr_t>(uar->reg_addr);
-    const uintptr_t host_base =
-        reg_addr & ~(static_cast<uintptr_t>(page_size) - 1);
-    const size_t offset = reg_addr - host_base;
-    const size_t length =
-        ((offset + MLX5GDA_BF_SIZE * 2 + page_size - 1) / page_size) *
-        page_size;
     const cudaError_t register_result =
-        cudaHostRegister(reinterpret_cast<void*>(host_base), length,
+        cudaHostRegister(uar->reg_addr, MLX5GDA_BF_SIZE * 2,
                          cudaHostRegisterMapped | cudaHostRegisterIoMemory);
     void* device_base = nullptr;
-    if (cudaHostGetDevicePointer(&device_base,
-                                 reinterpret_cast<void*>(host_base),
-                                 0) != cudaSuccess) {
+    if (cudaHostGetDevicePointer(&device_base, uar->reg_addr, 0) !=
+        cudaSuccess) {
         if (register_result == cudaSuccess)
-            cudaHostUnregister(reinterpret_cast<void*>(host_base));
+            cudaHostUnregister(uar->reg_addr);
         print_cuda_error("Failed to map BF MMIO page");
         errno = EIO;
         return -1;
     }
-    qp->bf_host_base = reinterpret_cast<void*>(host_base);
-    qp->bf_device_addr = static_cast<char*>(device_base) + offset;
+    qp->bf_host_base = uar->reg_addr;
+    qp->bf_device_addr = static_cast<char*>(device_base);
     qp->bf_host_registration_owner = register_result == cudaSuccess;
     return 0;
 }

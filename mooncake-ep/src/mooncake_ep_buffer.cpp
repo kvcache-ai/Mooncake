@@ -249,7 +249,7 @@ MooncakeEpBuffer::dispatch(
         active_qps_cap_);
 
     auto mark_send_done = [=]() {
-#ifdef MOONCAKE_EP_SPLIT_SEND_RECV
+#ifdef MOONCAKE_EP_PHASE_ACK
         mooncake::mark_phase_ack(gdr_buffer, nvlink_avail, ipc_ptrs,
                                  buffer.rdma_send_signal_buffer, rank,
                                  num_ranks, phase_epoch, launch_stream);
@@ -257,7 +257,7 @@ MooncakeEpBuffer::dispatch(
     };
 
     auto wait_peer_send_done = [=]() {
-#ifdef MOONCAKE_EP_SPLIT_SEND_RECV
+#ifdef MOONCAKE_EP_PHASE_ACK
         mooncake::wait_phase_ack(buffer.rdma_send_signal_buffer, rank,
                                  num_ranks, phase_epoch, launch_stream,
                                  timeout_ticks);
@@ -265,7 +265,7 @@ MooncakeEpBuffer::dispatch(
     };
 
     auto mark_and_wait_peer_send_done = [=]() {
-#ifdef MOONCAKE_EP_SPLIT_SEND_RECV
+#ifdef MOONCAKE_EP_PHASE_ACK
         mooncake::mark_and_wait_phase_ack(
             gdr_buffer, nvlink_avail, ipc_ptrs, buffer.rdma_send_signal_buffer,
             rank, num_ranks, phase_epoch, launch_stream, timeout_ticks);
@@ -384,7 +384,7 @@ MooncakeEpBuffer::combine(uint64_t x_ptr, uint64_t topk_idx_ptr,
         active_qps_cap_);
 
     auto mark_send_done = [=]() {
-#ifdef MOONCAKE_EP_SPLIT_SEND_RECV
+#ifdef MOONCAKE_EP_PHASE_ACK
         mooncake::mark_phase_ack(gdr_buffer, nvlink_avail, ipc_ptrs,
                                  buffer.rdma_send_signal_buffer, rank,
                                  num_ranks, phase_epoch, launch_stream);
@@ -392,7 +392,7 @@ MooncakeEpBuffer::combine(uint64_t x_ptr, uint64_t topk_idx_ptr,
     };
 
     auto wait_peer_send_done = [=]() {
-#ifdef MOONCAKE_EP_SPLIT_SEND_RECV
+#ifdef MOONCAKE_EP_PHASE_ACK
         mooncake::wait_phase_ack(buffer.rdma_send_signal_buffer, rank,
                                  num_ranks, phase_epoch, launch_stream,
                                  timeout_ticks);
@@ -400,7 +400,7 @@ MooncakeEpBuffer::combine(uint64_t x_ptr, uint64_t topk_idx_ptr,
     };
 
     auto mark_and_wait_peer_send_done = [=]() {
-#ifdef MOONCAKE_EP_SPLIT_SEND_RECV
+#ifdef MOONCAKE_EP_PHASE_ACK
         mooncake::mark_and_wait_phase_ack(
             gdr_buffer, nvlink_avail, ipc_ptrs, buffer.rdma_send_signal_buffer,
             rank, num_ranks, phase_epoch, launch_stream, timeout_ticks);
