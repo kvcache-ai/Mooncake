@@ -1,46 +1,23 @@
 name: _build-wheel
 
-# Shared build for one wheel variant (matrixed over Python version), used by CI,
-# Release, and Pre-Release so validation and publication build identically.
+# Shared build for one supported wheel variant (matrixed over Python version).
+# Callers choose the package variant and architecture; toolchain and CMake
+# details live here so CI, nightly, pre-release, and release cannot drift.
 
 on:
   workflow_call:
     inputs:
-      runner:
+      variant:
+        # cuda | cuda13 | non-cuda
         type: string
-        required: true
-      container:
-        # x86 builds run in manylinux2_28 so the wheel's libstdc++/glibc floor
-        # stays low enough to import on RHEL/Rocky/Alma 8+. '' = bare runner.
+        default: cuda
+      architecture:
+        # x86_64 | arm64
         type: string
-        default: ''
+        default: x86_64
       python-versions:
         type: string
         default: '["3.10", "3.11", "3.12", "3.13"]'
-      cuda:
-        # none | container | sbsa-12.8 | sbsa-13.0
-        type: string
-        default: none
-      cmake-args:
-        # Space-separated -D flags. No semicolons; use ep-torch-versions for those.
-        type: string
-        required: true
-      cmake-generator:
-        type: string
-        default: ''
-      ep-torch-versions:
-        type: string
-        default: ''
-      variant-flag:
-        # build_wheel.sh variant set to 1, e.g. CU13_BUILD, NON_CUDA_BUILD
-        type: string
-        default: ''
-      torch-cuda-arch-list:
-        type: string
-        default: ''
-      build-nvlink-allocator:
-        type: boolean
-        default: false
       artifact-prefix:
         type: string
         required: true
@@ -55,26 +32,89 @@ env:
 
 jobs:
   build:
-    runs-on: ${{ inputs.runner }}
-    container: ${{ inputs.container }}
+    runs-on: ${{ inputs.architecture == 'arm64' && 'ubuntu-22.04-arm' || 'ubuntu-22.04' }}
+    # manylinux2_28 keeps the x86 wheel's libstdc++/glibc floor compatible with
+    # RHEL/Rocky/Alma 8+. The CUDA image is also the toolchain for non-CUDA builds.
+    container: >-
+      ${{ inputs.architecture == 'arm64' &&
+          (inputs.variant == 'cuda13' && 'pytorch/manylinuxaarch64-builder:cuda13.0' || 'pytorch/manylinuxaarch64-builder:cuda12.8') ||
+          (inputs.variant == 'cuda13' && 'pytorch/manylinux2_28-builder:cuda13.0' || 'pytorch/manylinux2_28-builder:cuda12.8') }}
     permissions:
       contents: read
     strategy:
       matrix:
         python-version: ${{ fromJSON(inputs.python-versions) }}
     env:
-      TORCH_CUDA_ARCH_LIST: ${{ inputs.torch-cuda-arch-list }}
-      CMAKE_ARGS: ${{ inputs.cmake-args }}
-      CMAKE_GEN: ${{ inputs.cmake-generator }}
-      EP_TORCH_VERSIONS_INPUT: ${{ inputs.ep-torch-versions }}
-      VARIANT_FLAG: ${{ inputs.variant-flag }}
+      BUILD_ARCHITECTURE: ${{ inputs.architecture }}
+      BUILD_VARIANT: ${{ inputs.variant }}
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
 
-      - name: Mark workspace safe for git (container runs as root)
-        if: ${{ inputs.container != '' }}
+      - name: Mark workspace safe for git
         run: git config --global --add safe.directory '*'
+
+      - name: Configure build profile
+        shell: bash
+        run: |
+          case "$BUILD_VARIANT:$BUILD_ARCHITECTURE" in
+            cuda:x86_64)
+              variant_flag=''
+              generator=''
+              arch_list='8.0;9.0'
+              ep_versions='2.11.0;2.12.0;2.12.1;2.13.0'
+              build_nvlink=true
+              cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release'
+              ;;
+            cuda13:x86_64)
+              variant_flag=CU13_BUILD
+              generator=''
+              arch_list='8.0;9.0'
+              ep_versions='2.11.0;2.12.0;2.12.1;2.13.0'
+              build_nvlink=true
+              cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release'
+              ;;
+            non-cuda:x86_64)
+              variant_flag=NON_CUDA_BUILD
+              generator=''
+              arch_list=''
+              ep_versions=''
+              build_nvlink=false
+              cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=OFF -DWITH_EP=OFF -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release'
+              ;;
+            cuda:arm64|cuda13:arm64)
+              variant_flag=''
+              if [ "$BUILD_VARIANT" = cuda13 ]; then
+                variant_flag=CU13_BUILD
+              fi
+              generator=Ninja
+              arch_list='9.0'
+              ep_versions=''
+              build_nvlink=false
+              cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=OFF -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release'
+              ;;
+            non-cuda:arm64)
+              variant_flag=NON_CUDA_BUILD
+              generator=Ninja
+              arch_list=''
+              ep_versions=''
+              build_nvlink=false
+              cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=OFF -DWITH_EP=OFF -DSTORE_USE_ETCD=ON -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release'
+              ;;
+            *)
+              echo "::error::Unsupported wheel profile: $BUILD_VARIANT/$BUILD_ARCHITECTURE"
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "VARIANT_FLAG=$variant_flag"
+            echo "CMAKE_GEN=$generator"
+            echo "TORCH_CUDA_ARCH_LIST=$arch_list"
+            echo "EP_TORCH_VERSIONS_INPUT=$ep_versions"
+            echo "BUILD_NVLINK_ALLOCATOR=$build_nvlink"
+            echo "CMAKE_ARGS=$cmake_args"
+          } >> "$GITHUB_ENV"
 
       - name: Set version
         run: |
@@ -91,33 +131,11 @@ jobs:
           echo "Patched mooncake-wheel/pyproject.toml version to: $VERSION"
 
       - name: Select Python ${{ matrix.python-version }} from manylinux image
-        if: ${{ inputs.container != '' }}
         run: |
           PYV_NODOT=$(echo "${{ matrix.python-version }}" | tr -d '.')
           PYBIN="/opt/python/cp${PYV_NODOT}-cp${PYV_NODOT}/bin"
           echo "$PYBIN" >> "$GITHUB_PATH"
           "$PYBIN/pip" install --quiet "cmake<4" setuptools wheel
-
-      - name: Set up Python ${{ matrix.python-version }}
-        if: ${{ inputs.container == '' }}
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Free up disk space
-        if: ${{ inputs.container == '' }}
-        uses: ./.github/actions/free-disk-space
-
-      - name: Install CUDA Toolkit (arm64 SBSA)
-        if: ${{ startsWith(inputs.cuda, 'sbsa-') }}
-        run: |
-          ver="${{ inputs.cuda }}"; ver="${ver#sbsa-}"
-          wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/sbsa/cuda-keyring_1.1-1_all.deb
-          sudo dpkg -i cuda-keyring_1.1-1_all.deb
-          sudo apt-get update
-          sudo apt-get install -y "cuda-toolkit-${ver/./-}"
-          echo "/usr/local/cuda/bin" >> "$GITHUB_PATH"
-          /usr/local/cuda/bin/nvcc --version
 
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
@@ -158,7 +176,7 @@ jobs:
           $SUDO cmake --install .
 
       - name: Build nvlink_allocator.so
-        if: ${{ inputs.build-nvlink-allocator }}
+        if: ${{ env.BUILD_NVLINK_ALLOCATOR == 'true' }}
         run: |
           export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
           if [ -d /usr/local/cuda/lib64/stubs ]; then
