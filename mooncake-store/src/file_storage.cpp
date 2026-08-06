@@ -382,11 +382,10 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
         return scan_meta_result;
     }
 
-    const int offload_threads =
-        GetEnvOr<int>("MC_OFFLOAD_WRITE_THREADS", 0);
+    const int offload_threads = GetEnvOr<int>("MC_OFFLOAD_WRITE_THREADS", 0);
     if (offload_threads > 1) {
-        offload_write_pool_ = std::make_unique<ThreadPool>(
-            static_cast<size_t>(offload_threads));
+        offload_write_pool_ =
+            std::make_unique<ThreadPool>(static_cast<size_t>(offload_threads));
         LOG(INFO) << "FileStorage: offload write pool created, "
                   << offload_threads << " threads";
     }
@@ -499,8 +498,8 @@ tl::expected<void, ErrorCode> FileStorage::ProcessOneBucket(
             user_keys.push_back(task_by_storage_key.at(storage_key).key);
         }
         std::unordered_map<std::string, std::vector<Slice>> user_batch_object;
-        [[maybe_unused]] auto query_result = BatchQuerySegmentSlices(
-            user_keys, tenant_id, user_batch_object);
+        [[maybe_unused]] auto query_result =
+            BatchQuerySegmentSlices(user_keys, tenant_id, user_batch_object);
         // BatchQuerySegmentSlices is now best-effort: it always returns OK.
         // Keys present in user_batch_object go to batch_object; the rest are
         // reported as failed.
@@ -575,11 +574,10 @@ tl::expected<void, ErrorCode> FileStorage::ProcessOneBucket(
             std::vector<StorageObjectMetadata>& metadatas) -> ErrorCode {
         auto res = complete_handler(bk_keys, metadatas);
         if (res == ErrorCode::OK && ssd_metric_) {
-            auto elapsed_us = std::chrono::duration_cast<
-                                  std::chrono::microseconds>(
-                                  std::chrono::steady_clock::now() -
-                                  offload_start)
-                                  .count();
+            auto elapsed_us =
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now() - offload_start)
+                    .count();
             int64_t total_bytes = 0;
             for (const auto& metadata : metadatas) {
                 total_bytes += metadata.data_size;
@@ -806,9 +804,9 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
     // immediately rather than waiting on the TTL reaper.
     for (const auto& keys : buckets_keys) {
         for (const auto& k : keys) all_bucket_keys.insert(k);
-        auto result = ProcessOneBucket(keys, task_by_storage_key, failed_tasks,
-                                       /*failed_mutex=*/nullptr,
-                                       complete_handler);
+        auto result =
+            ProcessOneBucket(keys, task_by_storage_key, failed_tasks,
+                             /*failed_mutex=*/nullptr, complete_handler);
         if (!result) {
             abort_error = result.error();
             break;

@@ -1705,8 +1705,7 @@ BucketStorageBackend::BucketStorageBackend(
     const BucketBackendConfig& bucket_backend_config_)
     : StorageBackendInterface(file_storage_config_),
       storage_path_(file_storage_config_.storage_filepath),
-      bucket_backend_config_(bucket_backend_config_) {
-}
+      bucket_backend_config_(bucket_backend_config_) {}
 
 BucketStorageBackend::~BucketStorageBackend() {
     // Clear file cache to release UringFile instances before destruction
