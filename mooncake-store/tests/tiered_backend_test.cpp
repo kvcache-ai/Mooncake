@@ -1668,10 +1668,11 @@ TEST_F(TieredBackendTest, TierMetricCountsStorageSelfEviction) {
 
     auto tier_metric = std::make_shared<TierMetric>();
     TieredBackend backend;
-    ASSERT_TRUE(backend.Init(config, /*engine=*/nullptr,
-                             /*add_replica_callback=*/nullptr,
-                             /*remove_replica_callback=*/nullptr,
-                             /*segment_sync_callback=*/nullptr, tier_metric)
+    ASSERT_TRUE(backend
+                    .Init(config, /*engine=*/nullptr,
+                          /*add_replica_callback=*/nullptr,
+                          /*remove_replica_callback=*/nullptr,
+                          /*segment_sync_callback=*/nullptr, tier_metric)
                     .has_value());
 
     auto views = backend.GetTierViews();
@@ -1681,8 +1682,7 @@ TEST_F(TieredBackendTest, TierMetricCountsStorageSelfEviction) {
     // Fill the 20KB tier with twenty committed 1KB keys.
     for (int i = 0; i < 20; ++i) {
         auto test_buffer = CreateTestBuffer(1024);
-        auto handle_result =
-            AllocateAndWrite(backend, 1024, test_buffer.get());
+        auto handle_result = AllocateAndWrite(backend, 1024, test_buffer.get());
         ASSERT_TRUE(handle_result.has_value());
         const std::string key = "key_" + std::to_string(i);
         ASSERT_TRUE(backend.Commit(key, handle_result.value()).has_value());

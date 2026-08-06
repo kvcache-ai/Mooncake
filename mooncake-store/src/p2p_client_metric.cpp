@@ -456,8 +456,8 @@ std::string TierMetric::summary_metrics() {
         }
         ss << ", evicted_keys=" << evicted_keys.value(entry->label_array)
            << ", offloaded_keys=" << offloaded_keys.value(entry->label_array)
-           << ", onboarded_keys="
-           << onboarded_keys.value(entry->label_array) << "\n";
+           << ", onboarded_keys=" << onboarded_keys.value(entry->label_array)
+           << "\n";
     }
     return ss.str();
 }

@@ -366,8 +366,9 @@ TEST_F(EventDrivenSchedulerTest, TierMetricsCountOffloadKeys) {
     // scheduler threads regardless of local destruction order.
     auto tier_metric = std::make_shared<TierMetric>();
     TieredBackend backend;
-    ASSERT_TRUE(backend.Init(MakeConfig(16 * kMB, 64 * kMB), nullptr, nullptr,
-                             nullptr, nullptr, tier_metric)
+    ASSERT_TRUE(backend
+                    .Init(MakeConfig(16 * kMB, 64 * kMB), nullptr, nullptr,
+                          nullptr, nullptr, tier_metric)
                     .has_value());
     const UUID fast = FastTier(backend);
     const UUID slow = SlowTier(backend);
@@ -397,8 +398,9 @@ TEST_F(EventDrivenSchedulerTest, TierMetricsCountOnboardKeys) {
     // scheduler threads regardless of local destruction order.
     auto tier_metric = std::make_shared<TierMetric>();
     TieredBackend backend;
-    ASSERT_TRUE(backend.Init(MakeConfig(16 * kMB, 64 * kMB), nullptr, nullptr,
-                             nullptr, nullptr, tier_metric)
+    ASSERT_TRUE(backend
+                    .Init(MakeConfig(16 * kMB, 64 * kMB), nullptr, nullptr,
+                          nullptr, nullptr, tier_metric)
                     .has_value());
     const UUID fast = FastTier(backend);
     const UUID slow = SlowTier(backend);
@@ -428,10 +430,11 @@ TEST_F(EventDrivenSchedulerTest, TierMetricsCountEvictedKeys) {
     // scheduler threads regardless of local destruction order.
     auto tier_metric = std::make_shared<TierMetric>();
     TieredBackend backend;
-    ASSERT_TRUE(backend.Init(MakeConfig(4 * kMB, 64 * kMB,
-                                        /*evict_wm_high=*/0.50,
-                                        /*evict_wm_low=*/0.40),
-                             nullptr, nullptr, nullptr, nullptr, tier_metric)
+    ASSERT_TRUE(backend
+                    .Init(MakeConfig(4 * kMB, 64 * kMB,
+                                     /*evict_wm_high=*/0.50,
+                                     /*evict_wm_low=*/0.40),
+                          nullptr, nullptr, nullptr, nullptr, tier_metric)
                     .has_value());
     const UUID fast = FastTier(backend);
 
