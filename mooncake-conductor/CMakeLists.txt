@@ -6,6 +6,10 @@ if(NOT GLOBAL_CONFIG)
   set(CMAKE_CXX_STANDARD_REQUIRED ON)
   include(../mooncake-common/FindJsonCpp.cmake)
   include(../mooncake-common/FindGLOG.cmake)
+  # Match the top-level common.cmake policy: keep debuginfo by default.
+  if(NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE "RelWithDebInfo")
+  endif()
 endif()
 
 find_package(cppzmq REQUIRED)
