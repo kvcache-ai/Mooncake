@@ -211,6 +211,14 @@ class EPBenchmarkWorker:
 
         torch.cuda.set_device(local_rank)
 
+        if args.pg_backend == "mooncake":
+            try:
+                import mooncake.pg  # noqa: F401
+            except Exception as exc:
+                raise RuntimeError(
+                    "Failed to import mooncake.pg; required for --pg-backend=mooncake"
+                ) from exc
+
         dist.init_process_group(
             backend=args.pg_backend, rank=rank, world_size=args.num_ranks
         )
