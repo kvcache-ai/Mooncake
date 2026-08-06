@@ -790,6 +790,16 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    // A drain deregistered the disk tier on purpose. Skipping the whole tick
+    // matters for the SEGMENT_NOT_FOUND branch below, which would re-mount the
+    // segment and re-register every object; there is also no point taking new
+    // offload work for a store that is leaving. The client TTL is renewed by
+    // Ping on the storage heartbeat thread, not here, so the client stays
+    // alive for its memory segments.
+    if (draining_.load()) {
+        return {};
+    }
+
     // Join previous rescan if completed
     if (rescan_future_.valid() && rescan_future_.wait_for(std::chrono::seconds(
                                       0)) == std::future_status::ready) {
@@ -929,6 +939,33 @@ void FileStorage::RemoveAll() {
         storage_backend_->RemoveAll();
     }
     LOG(INFO) << "FileStorage::RemoveAll: cleared storage backend";
+}
+
+tl::expected<void, ErrorCode> FileStorage::DrainLocalDiskSegment(
+    uint64_t grace_period_ms) {
+    if (client_ == nullptr) {
+        LOG(ERROR) << "client is nullptr";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    // Latch before the RPC, so a heartbeat tick that overlaps the
+    // deregistration cannot re-mount the segment behind it.
+    draining_.store(true);
+
+    auto result = client_->UnmountLocalDiskSegment();
+    if (!result) {
+        LOG(ERROR) << "action=drain_local_disk_segment, error="
+                   << result.error();
+        draining_.store(false);
+        return result;
+    }
+
+    LOG(INFO) << "action=drain_local_disk_segment, grace_period_ms="
+              << grace_period_ms;
+    if (grace_period_ms > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(grace_period_ms));
+    }
+    return {};
 }
 
 tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {

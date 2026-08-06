@@ -21,6 +21,25 @@ class FileStorage {
     void RemoveAll();
 
     /**
+     * @brief Deregisters this store's disk tier from the master, then waits out
+     * a grace period so offload reads already in flight can finish.
+     *
+     * Meant for a shutdown hook that runs before the process is signalled. Once
+     * this returns, the master no longer names this store as the owner of any
+     * offloaded key, so a reader gets a clean miss instead of a peer that is
+     * about to disappear. Unlike a memory replica, which the NIC serves without
+     * the process, a disk replica is read and pushed by this process -- hence
+     * the grace period rather than an immediate exit.
+     *
+     * Latches offloading off first: the heartbeat re-mounts the segment
+     * whenever the master answers SEGMENT_NOT_FOUND, which would otherwise
+     * undo this within one heartbeat interval. The latch is not reversible on
+     * success; the process is expected to exit.
+     */
+    tl::expected<void, ErrorCode> DrainLocalDiskSegment(
+        uint64_t grace_period_ms);
+
+    /**
      * @brief Result of BatchGet operation containing batch_id and buffer
      * pointers.
      */
@@ -174,6 +193,9 @@ class FileStorage {
     std::thread client_buffer_gc_thread_;
     std::future<void> rescan_future_;
     std::atomic<bool> metadata_resync_pending_{false};
+    // Set by DrainLocalDiskSegment. Stops the heartbeat, which would otherwise
+    // re-mount the segment the drain just deregistered.
+    std::atomic<bool> draining_{false};
 };
 
 }  // namespace mooncake

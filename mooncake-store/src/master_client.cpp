@@ -218,6 +218,11 @@ struct RpcNameTraits<&WrappedMasterService::MountLocalDiskSegment> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::UnmountLocalDiskSegment> {
+    static constexpr const char* value = "UnmountLocalDiskSegment";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::OffloadObjectHeartbeat> {
     static constexpr const char* value = "OffloadObjectHeartbeat";
 };
@@ -938,6 +943,18 @@ tl::expected<void, ErrorCode> MasterClient::MountLocalDiskSegment(
     auto result =
         invoke_rpc<&WrappedMasterService::MountLocalDiskSegment, void>(
             client_id, enable_offloading);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::UnmountLocalDiskSegment(
+    const UUID& client_id) {
+    ScopedVLogTimer timer(1, "MasterClient::UnmountLocalDiskSegment");
+    timer.LogRequest("client_id=", client_id);
+
+    auto result =
+        invoke_rpc<&WrappedMasterService::UnmountLocalDiskSegment, void>(
+            client_id);
     timer.LogResponseExpected(result);
     return result;
 }
