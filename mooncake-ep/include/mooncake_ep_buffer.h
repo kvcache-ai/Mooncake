@@ -71,7 +71,7 @@ struct MooncakeEpBuffer {
     int rank, num_ranks;
     int clock_rate_khz;
 
-    // GDR buffer — owned by p2p_transport_
+    // GDR buffer — allocated by p2p_transport_; peer mappings are optional.
     int buffer_idx{};
     int phase_epochs[2]{};
     int64_t num_ep_buffer_bytes;
@@ -89,6 +89,7 @@ struct MooncakeEpBuffer {
     std::unique_ptr<device::RdmaTransport> owned_rdma_transport_;
 
     bool ibgda_disabled_ = false;
+    bool p2p_enabled_ = true;
 
     int USE_QP_COUNT = MAX_QP_COUNT;
     // Cap on active RoCE QPs per peer: spreading small EP messages across too
@@ -108,6 +109,7 @@ struct MooncakeEpBuffer {
     // (engine owns the transports).  Otherwise EP creates its own via the
     // factory functions (EP owns them via owned_p2p_transport_ etc.).
     MooncakeEpBuffer(int rank, int num_ranks, int64_t num_ep_buffer_bytes,
+                     bool disable_p2p = false,
                      TransferEngine* engine = nullptr);
 
     ~MooncakeEpBuffer() noexcept(false);
@@ -132,6 +134,7 @@ struct MooncakeEpBuffer {
             bool return_recv_hook, uint64_t compute_stream_ptr);
 
     bool ibgda_disabled() const { return ibgda_disabled_; }
+    bool p2p_enabled() const { return p2p_enabled_; }
 
     bool is_roce() const {
         return rdma_transport_ && rdma_transport_->isRoce();

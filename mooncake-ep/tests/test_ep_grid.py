@@ -63,6 +63,7 @@ def run_test_iteration(
     return_recv_hook: bool,
     use_fallback: bool,
     fail_rank: int,
+    disable_p2p: bool = False,
     buf: Buffer = None,
 ):
     assert not (async_finish and return_recv_hook), (
@@ -112,7 +113,7 @@ def run_test_iteration(
         max_tokens, hidden, num_ranks, num_experts
     )
     if buf is None:
-        buf = Buffer(group, num_ep_buffer_bytes)
+        buf = Buffer(group, num_ep_buffer_bytes, disable_p2p)
 
     if use_fallback:
         buf._use_fallback = True

@@ -43,14 +43,13 @@ namespace mooncake {
 namespace device {
 
 static constexpr size_t kCtrlBufSize = 1024ULL * 1024 * 1024;  // 1 GiB
-static constexpr size_t kSplitCqBufSize = 256ULL * 1024 * 1024;
+static constexpr size_t kHostMappedCqMinSize = 256ULL * 1024 * 1024;
 static constexpr size_t kIbgdaQpWqebbCount = 16384;
 
 enum class ControlMemoryMode {
     kGpuDmabuf,
     kGpuVa,
     kHostMapped,
-    kSplitGpuVaHostMappedCq,
     kPerQpGpuVaHostMappedCq,
 };
 
@@ -62,8 +61,6 @@ static const char* controlMemoryModeName(ControlMemoryMode mode) {
             return "gpu-va";
         case ControlMemoryMode::kHostMapped:
             return "host-mapped";
-        case ControlMemoryMode::kSplitGpuVaHostMappedCq:
-            return "split-gpu-va-host-mapped-cq";
         case ControlMemoryMode::kPerQpGpuVaHostMappedCq:
             return "per-qp-gpu-va-host-mapped-cq";
     }
@@ -309,10 +306,9 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
                       }
                     : ctrl;
         for (int i = 0; i < num_qps_; ++i) {
-            mlx5gda_qp* qp =
-                mlx5gda_create_rc_qp(mpd_, &ctrl, &cq, pd_,
-                                     kIbgdaQpWqebbCount, 1, stream,
-                                     cq_region_allocator, qp_region_allocator);
+            mlx5gda_qp* qp = mlx5gda_create_rc_qp(
+                mpd_, &ctrl, &cq, pd_, kIbgdaQpWqebbCount, 1, stream,
+                cq_region_allocator, qp_region_allocator);
             if (!qp) {
                 const int qp_errno = errno;
                 LOG(ERROR) << "[EP IBGDA] mlx5gda_create_rc_qp failed at " << i;
@@ -727,19 +723,6 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
         return 0;
     }
 
-    int allocateSplitControlBuffers() {
-        if (allocateControlBuffer(ControlMemoryMode::kGpuVa) != 0) return -1;
-        ctrl_buf_mode_ = ControlMemoryMode::kSplitGpuVaHostMappedCq;
-        if (allocateHostMappedCqBuffer() != 0) {
-            freeControlBuffer();
-            return -1;
-        }
-        LOG(INFO)
-            << "[EP IBGDA] Using shared GPU WQ/DBR and host-backed mapped CQ "
-               "buffer";
-        return 0;
-    }
-
     int allocatePerQpGpuVaControlBuffers() {
         ctrl_buf_mode_ = ControlMemoryMode::kPerQpGpuVaHostMappedCq;
         if (allocateHostMappedCqBuffer() != 0) {
@@ -758,8 +741,9 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
         constexpr size_t kAdapterPageSize = 4096;
         constexpr size_t kCqBytesPerQp =
             kIbgdaQpWqebbCount * sizeof(mlx5_cqe64) + kAdapterPageSize;
-        const size_t cq_buf_size = std::max(
-            kSplitCqBufSize, static_cast<size_t>(num_qps_) * kCqBytesPerQp);
+        const size_t cq_buf_size =
+            std::max(kHostMappedCqMinSize,
+                     static_cast<size_t>(num_qps_) * kCqBytesPerQp);
         void* ptr = nullptr;
         const int ret = posix_memalign(&ptr, 4096, cq_buf_size);
         if (ret != 0) {
@@ -824,18 +808,6 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
         auto failure = mlx5gda_last_create_qp_failure();
         const bool using_dmabuf_control_regions =
             ctrl_buf_mode_ == ControlMemoryMode::kGpuDmabuf;
-        const bool using_shared_gpu_va_with_host_cq =
-            ctrl_buf_mode_ == ControlMemoryMode::kSplitGpuVaHostMappedCq;
-        if (using_shared_gpu_va_with_host_cq && failure.valid) {
-            LOG(WARNING) << "[EP IBGDA] Shared GPU-VA WQ/DBR UMEM was "
-                            "rejected by DevX CREATE_QP (status=0x"
-                         << std::hex << failure.status << " syndrome=0x"
-                         << failure.syndrome << std::dec
-                         << "); retrying with per-QP GPU-VA regions";
-            destroyQueuePairs();
-            freeControlBuffer();
-            return allocatePerQpGpuVaControlBuffers() == 0;
-        }
         if (ctrl_buf_mode_ == ControlMemoryMode::kHostMapped ||
             ctrl_buf_mode_ == ControlMemoryMode::kPerQpGpuVaHostMappedCq ||
             (!isCreateQpBadParam(failure) && !using_dmabuf_control_regions))

@@ -22,9 +22,6 @@ def main() -> None:
     args = parse_args()
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", "29664")
-    if args.disable_p2p:
-        os.environ["MOONCAKE_EP_DISABLE_P2P"] = "1"
-
     config = {
         "max_tokens": args.max_tokens,
         "hidden": args.hidden,
@@ -36,6 +33,7 @@ def main() -> None:
         "return_recv_hook": True,
         "use_fallback": False,
         "fail_rank": -1,
+        "disable_p2p": args.disable_p2p,
     }
     mp.spawn(worker, args=(2, config), nprocs=2, join=True, daemon=False)
     print("MOONCAKE_EP_GRID_2_RANK_OK", flush=True)

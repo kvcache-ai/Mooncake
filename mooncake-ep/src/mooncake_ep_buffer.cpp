@@ -61,10 +61,11 @@ static bool macaHostPhaseFenceCoversPeers() {
 
 MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
                                    int64_t num_ep_buffer_bytes,
-                                   TransferEngine* engine)
+                                   bool disable_p2p, TransferEngine* engine)
     : rank(rank),
       num_ranks(num_ranks),
       num_ep_buffer_bytes(num_ep_buffer_bytes),
+      p2p_enabled_(!disable_p2p),
       comm_stream(create_comm_stream()) {
     USE_QP_COUNT = MAX_QP_COUNT / num_ranks * num_ranks;
 
@@ -89,7 +90,8 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
     CUDA_CHECK(cudaDeviceGetAttribute(&clock_rate_khz, cudaDevAttrClockRate,
                                       device_id));
 
-    // P2P transport — owns GDR buffer allocation and IPC handle exchange.
+    // P2P transport owns GDR buffer allocation. Peer mappings remain disabled
+    // when the EP caller selects RDMA-only operation.
     if (engine) {
         p2p_transport_ = engine->getOrCreateP2pTransport(num_ranks);
     } else {
@@ -501,12 +503,14 @@ void MooncakeEpBuffer::sync_ibgda_peers(
 }
 
 std::vector<int32_t> MooncakeEpBuffer::get_ipc_handle() {
+    if (!p2p_enabled_) return {};
     return p2p_transport_->exportIpcHandle(gdr_buffer);
 }
 
 void MooncakeEpBuffer::sync_nvlink_ipc_handles(
     const std::vector<std::vector<int32_t>>& remote_handles,
     const std::vector<int>& active_ranks_mask) {
+    if (!p2p_enabled_) return;
     p2p_transport_->importPeerHandles(gdr_buffer, rank, num_ranks,
                                       remote_handles, active_ranks_mask);
 }
