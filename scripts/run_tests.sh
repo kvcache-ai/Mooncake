@@ -8,6 +8,7 @@ set -e  # Exit immediately if a command exits with a non-zero status
 export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
 
 METADATA_SERVER_PID=""
+RUN_TESTS_METADATA_SERVER_MODE="${RUN_TESTS_METADATA_SERVER_MODE:-managed}"
 
 metadata_port_is_listening() {
     ss -H -ltn 'sport = :8080' | grep -q .
@@ -37,6 +38,22 @@ start_metadata_server() {
 
     echo "ERROR: metadata server did not listen on port 8080 within 5 seconds"
     ss -ltnp | grep ':8080' || true
+    return 1
+}
+
+use_external_metadata_server() {
+    local attempt
+
+    echo "Using caller-managed HTTP metadata server on port 8080..."
+    for attempt in {1..50}; do
+        if metadata_port_is_listening; then
+            echo "Caller-managed HTTP metadata server is ready"
+            return 0
+        fi
+        sleep 0.1
+    done
+
+    echo "ERROR: caller-managed metadata server is not listening on port 8080"
     return 1
 }
 
@@ -86,8 +103,19 @@ cleanup_metadata_server() {
     stop_metadata_server || true
 }
 
-trap cleanup_metadata_server EXIT
-start_metadata_server
+case "$RUN_TESTS_METADATA_SERVER_MODE" in
+    managed)
+        trap cleanup_metadata_server EXIT
+        start_metadata_server
+        ;;
+    external)
+        use_external_metadata_server
+        ;;
+    *)
+        echo "ERROR: RUN_TESTS_METADATA_SERVER_MODE must be 'managed' or 'external'"
+        exit 1
+        ;;
+esac
 
 echo "Running transfer_engine tests..."
 cd mooncake-wheel/tests
@@ -206,10 +234,18 @@ echo "CXL protocol test completed successfully!"
 echo "Running CLI entry point tests..."
 python test_cli.py
 
-stop_metadata_server
+ENABLE_EMBEDDED_METADATA_SERVER=true
+if [ "$RUN_TESTS_METADATA_SERVER_MODE" = "managed" ]; then
+    stop_metadata_server
+else
+    ENABLE_EMBEDDED_METADATA_SERVER=false
+    echo "Leaving caller-managed HTTP metadata server running"
+fi
 killall mooncake_master || true
 killall mooncake_client || true
-mooncake_master --default_kv_lease_ttl=500 --enable_http_metadata_server=true &
+mooncake_master \
+    --default_kv_lease_ttl=500 \
+    --enable_http_metadata_server="$ENABLE_EMBEDDED_METADATA_SERVER" &
 MASTER_PID=$!
 sleep 1
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_distributed_object_store.py
