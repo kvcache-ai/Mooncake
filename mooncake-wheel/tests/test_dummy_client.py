@@ -7,7 +7,9 @@ import unittest
 
 try:
     import torch
-except ImportError:
+except ModuleNotFoundError as error:
+    if error.name != "torch":
+        raise
     torch = None
 
 from mooncake.store import MooncakeDistributedStore
@@ -230,7 +232,7 @@ def _run_dummy_cuda_ipc_stream_readiness_case(
                                 (time.perf_counter() - put_started) * 1000.0, 3
                             )
                         diagnostics["ready_at_return"] = bool(ready.query())
-                        if not put_ok:
+                        if not put_ok or not diagnostics["ready_at_return"]:
                             primary_failed = True
                 finally:
                     producer.synchronize()
