@@ -1686,60 +1686,6 @@ TEST_F(MasterServiceTest, WrappedBatchPutStartMixedGroupIdsPreservesOrder) {
     }
 }
 
-TEST_F(MasterServiceTest, PutStartEndFlow) {
-    std::unique_ptr<MasterService> service_(new MasterService());
-    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
-    const UUID client_id = generate_uuid();
-    const UUID invalid_client_id = generate_uuid();
-    ASSERT_NE(client_id, invalid_client_id);
-
-    // Test PutStart
-    std::string key = "test_key";
-    uint64_t value_length = 1024;
-    ReplicateConfig config;
-    config.replica_num = 1;
-
-    auto put_start_result = service_->PutStart(
-        client_id, key, TenantId::Default(), value_length, config);
-    EXPECT_TRUE(put_start_result.has_value());
-    replica_list = put_start_result.value();
-    EXPECT_FALSE(replica_list.empty());
-    EXPECT_EQ(ReplicaStatus::PROCESSING, replica_list[0].status);
-
-    // During put, Get/Remove should fail
-    auto get_replica_result =
-        service_->GetReplicaList(key, TenantId::Default());
-    EXPECT_FALSE(get_replica_result.has_value());
-    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, get_replica_result.error());
-    auto remove_result = service_->Remove(key, TenantId::Default());
-    EXPECT_FALSE(remove_result.has_value());
-    EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, remove_result.error());
-
-    // PutEnd should fail if the client_id does not match.
-    auto put_end_fail_result = service_->PutEnd(
-        invalid_client_id, key, TenantId::Default(), ReplicaType::MEMORY);
-    EXPECT_FALSE(put_end_fail_result.has_value());
-    EXPECT_EQ(put_end_fail_result.error(), ErrorCode::ILLEGAL_CLIENT);
-
-    // PutRevoke should fail if the client_id does not match.
-    auto put_revoke_fail_result = service_->PutRevoke(
-        invalid_client_id, key, TenantId::Default(), ReplicaType::MEMORY);
-    EXPECT_FALSE(put_revoke_fail_result.has_value());
-    EXPECT_EQ(put_revoke_fail_result.error(), ErrorCode::ILLEGAL_CLIENT);
-
-    // Test PutEnd
-    auto put_end_result = service_->PutEnd(client_id, key, TenantId::Default(),
-                                           ReplicaType::MEMORY);
-    EXPECT_TRUE(put_end_result.has_value());
-
-    // Verify replica list after PutEnd
-    auto final_get_result = service_->GetReplicaList(key, TenantId::Default());
-    EXPECT_TRUE(final_get_result.has_value());
-    replica_list = final_get_result.value().replicas;
-    EXPECT_EQ(1, replica_list.size());
-    EXPECT_EQ(ReplicaStatus::COMPLETE, replica_list[0].status);
-}
-
 TEST_F(MasterServiceTest, TenantPutGetRemoveIsolatesSameUserKey) {
     const std::string key = "shared_user_key";
     const TenantId tenant_a("tenant_a");

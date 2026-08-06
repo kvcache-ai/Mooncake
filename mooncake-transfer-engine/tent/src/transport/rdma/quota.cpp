@@ -14,6 +14,7 @@
 
 #include "tent/transport/rdma/quota.h"
 #include "tent/transport/rdma/shared_quota.h"
+#include "tent/transport/rdma/gdr_reachability.h"
 #include "tent/common/utils/random.h"
 #include "tent/common/utils/os.h"
 
@@ -58,6 +59,23 @@ Status DeviceSelector::allocate(uint64_t total_length, uint32_t num_slices,
     slice_dev_ids.reserve(num_slices);
     auto entry = local_topology_->getMemEntry(location);
     if (!entry) return Status::InvalidArgument("Unknown location" LOC_MARK);
+
+    // Exclude NICs that have proven unable to GPUDirect-DMA to this GPU. Only
+    // engaged once something has actually been learned (permissive fabrics pay
+    // nothing) and only for GPU/cuda locations.
+    if (GdrReachability::hasAnyExclusion()) {
+        LocationParser lp(location);
+        if (lp.type() == "cuda" && lp.index() >= 0) {
+            auto& gdr = GdrReachability::instance();
+            for (const auto& kv : devices_) {
+                int dev_id = kv.first;
+                if (dev_id < 0 || dev_id >= 64) continue;
+                const auto* nic = local_topology_->getNicEntry(dev_id);
+                if (nic && !gdr.localReachable(nic->name, lp.index()))
+                    device_mask &= ~(1ULL << dev_id);
+            }
+        }
+    }
 
     if (!smart_selection_enabled_) {
         // Baseline mode: consistent with original TE behavior

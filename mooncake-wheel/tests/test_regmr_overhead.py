@@ -23,7 +23,6 @@ import torch.distributed as dist
 import time
 import numpy as np
 import unittest
-import ctypes
 
 # Add project root to path for importing mooncake module
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../..'))

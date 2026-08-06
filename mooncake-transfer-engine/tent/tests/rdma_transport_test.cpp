@@ -29,11 +29,43 @@
 #include "tent/common/config.h"
 #include "tent/common/types.h"
 #include "tent/transfer_engine.h"
+#include "tent/runtime/topology.h"
+#include "tent/transport/rdma/context.h"
+#include "tent/transport/rdma/ibv_loader.h"
 #include "tent/transport/rdma/params.h"
 #include "tent/transport/rdma/rdma_transport.h"
+#include "tent/transport/rdma/workers.h"
 
 namespace mooncake {
 namespace tent {
+
+// Friend accessor for driving initializeContexts() without a full install().
+class RdmaTransportTestPeer {
+   public:
+    static void bindTopology(RdmaTransport& transport,
+                             std::shared_ptr<Topology> topology) {
+        transport.local_topology_ = topology;
+        transport.local_buffer_manager_.setTopology(topology);
+        transport.params_ = std::make_shared<RdmaParams>();
+        transport.conf_ = std::make_shared<Config>();
+    }
+
+    // Runs the monitorThread() 1 Hz reclaim tick without starting any worker
+    // threads.
+    static void reclaimEndpoints(RdmaTransport& transport) {
+        Workers workers(&transport);
+        workers.reclaimEndpoints();
+    }
+
+    static size_t initializeContexts(RdmaTransport& transport) {
+        return transport.initializeContexts();
+    }
+
+    static const RdmaContextSet& contextSet(const RdmaTransport& transport) {
+        return transport.context_set_;
+    }
+};
+
 namespace {
 
 bool hasRdmaDevice() {
@@ -119,6 +151,92 @@ TEST(RdmaSubBatchTest, ReportsTaskCount) {
     batch.task_list.push_back(nullptr);
     batch.task_list.push_back(nullptr);
     EXPECT_EQ(batch.size(), 2);
+}
+
+// context_set_ is subscripted by NicID, so it must keep one slot per NIC even
+// when a device is skipped. It used to push_back only on the success path,
+// compacting the array so a later dev_id named the wrong RNIC or ran off it.
+void expectInertContextPerNic(const RdmaContextSet& contexts, size_t expected) {
+    ASSERT_EQ(contexts.size(), expected);
+    for (size_t i = 0; i < contexts.size(); ++i) {
+        ASSERT_NE(contexts[i], nullptr) << "slot " << i << " must be occupied";
+        EXPECT_NE(contexts[i]->status(), RdmaContext::DEVICE_ENABLED)
+            << "slot " << i << " must not report itself usable";
+        // Inert contexts must stay safe for the whole-list consumers.
+        EXPECT_EQ(contexts[i]->cq(0), nullptr);
+        EXPECT_EQ(contexts[i]->notifyCq(), nullptr);
+    }
+}
+
+// Non-RDMA entries are skipped before construct() is ever called, so this runs
+// without libibverbs devices.
+TEST(RdmaNicIndexAlignmentTest, ContextSetKeepsOneSlotPerNonRdmaNic) {
+    auto topology = std::make_shared<Topology>();
+    ASSERT_TRUE(topology
+                    ->parse(R"({"nics":[
+                        {"name":"mc-tcp-0","type":1,"numa_node":0},
+                        {"name":"mc-unknown-1","type":2,"numa_node":0},
+                        {"name":"mc-tcp-2","type":1,"numa_node":0}]})")
+                    .ok());
+    ASSERT_EQ(topology->getNicCount(), static_cast<size_t>(3));
+
+    RdmaTransport transport;
+    RdmaTransportTestPeer::bindTopology(transport, topology);
+
+    EXPECT_EQ(RdmaTransportTestPeer::initializeContexts(transport),
+              static_cast<size_t>(0));
+    expectInertContextPerNic(RdmaTransportTestPeer::contextSet(transport),
+                             topology->getNicCount());
+}
+
+// monitorThread()'s 1 Hz tick walks every slot. An inert context never built
+// an endpoint store, so an unguarded endpointStore()->reclaim() would crash --
+// and only on the first heartbeat, well after startup.
+TEST(RdmaNicIndexAlignmentTest, ReclaimTickSkipsInertContexts) {
+    auto topology = std::make_shared<Topology>();
+    ASSERT_TRUE(topology
+                    ->parse(R"({"nics":[
+                        {"name":"mc-tcp-0","type":1,"numa_node":0},
+                        {"name":"mc-unknown-1","type":2,"numa_node":0}]})")
+                    .ok());
+
+    RdmaTransport transport;
+    RdmaTransportTestPeer::bindTopology(transport, topology);
+    ASSERT_EQ(RdmaTransportTestPeer::initializeContexts(transport),
+              static_cast<size_t>(0));
+
+    // Precondition that makes the unguarded call fatal.
+    for (const auto& context : RdmaTransportTestPeer::contextSet(transport)) {
+        ASSERT_EQ(context->endpointStore(), nullptr);
+    }
+
+    RdmaTransportTestPeer::reclaimEndpoints(transport);
+}
+
+// The construct()-failure branch. IbvLoader dlcloses libibverbs when no device
+// is present, so construct() cannot be driven safely in that state.
+TEST(RdmaNicIndexAlignmentTest, ContextSetKeepsOneSlotWhenConstructFails) {
+    if (!IbvLoader::Instance().available())
+        GTEST_SKIP() << "no usable libibverbs; construct() cannot be driven";
+
+    // Device names that resolve to no real RNIC, so construct() fails on any
+    // host, with a non-RDMA entry in the middle to offset the indexes.
+    auto topology = std::make_shared<Topology>();
+    ASSERT_TRUE(topology
+                    ->parse(R"({"nics":[
+                        {"name":"mc-absent-rnic-0","type":0,"numa_node":0},
+                        {"name":"mc-tcp-1","type":1,"numa_node":0},
+                        {"name":"mc-absent-rnic-2","type":0,"numa_node":0}]})")
+                    .ok());
+    ASSERT_EQ(topology->getNicCount(), static_cast<size_t>(3));
+
+    RdmaTransport transport;
+    RdmaTransportTestPeer::bindTopology(transport, topology);
+
+    EXPECT_EQ(RdmaTransportTestPeer::initializeContexts(transport),
+              static_cast<size_t>(0));
+    expectInertContextPerNic(RdmaTransportTestPeer::contextSet(transport),
+                             topology->getNicCount());
 }
 
 TEST(RdmaTransportIntegrationTest, WriteThenReadAcrossProcesses) {

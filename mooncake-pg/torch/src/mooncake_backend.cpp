@@ -2,7 +2,11 @@
 #include <torch_utils.h>
 
 #include <ATen/cuda/CUDAContext.h>
+#ifdef MOONCAKE_EP_USE_MUSA
+#include <ATen/musa/MUSAGraphsUtils.muh>
+#else
 #include <ATen/cuda/CUDAGraphsUtils.cuh>
+#endif
 #include <c10/cuda/CUDAStream.h>
 #include <c10/util/env.h>
 #include <torch/csrc/distributed/c10d/Backend.hpp>

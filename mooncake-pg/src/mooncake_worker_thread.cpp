@@ -75,6 +75,7 @@ void MooncakeWorker::startWorker() {
 
         // Per-slot state owned exclusively by this worker thread.
         clock::time_point activeTime[kNumTasks_];
+        BatchID batchIDs[kNumTasks_]{};
         size_t rankToTaskId[kNumTasks_][kMaxNumRanks];
         int32_t failedRanks[kNumTasks_][kMaxNumRanks]{};
         int32_t attemptedRanks[kNumTasks_][kMaxNumRanks]{};
@@ -202,9 +203,9 @@ void MooncakeWorker::startWorker() {
                         // Attempted to transfer to this peer
                         markAttempted(i, j);
                     }
-                    task.batchID =
+                    batchIDs[i] =
                         group->engine->allocateBatchID(entries.size());
-                    group->engine->submitTransfer(task.batchID, entries);
+                    group->engine->submitTransfer(batchIDs[i], entries);
                     submitted_task_sequence_[i].store(
                         submit_sequence, std::memory_order_release);
                     activeTime[i] = clock::now();
@@ -227,7 +228,7 @@ void MooncakeWorker::startWorker() {
                                 continue;
                             }
                             group->engine->getTransferStatus(
-                                task.batchID, rankToTaskId[i][j], status);
+                                batchIDs[i], rankToTaskId[i][j], status);
                             if (status.s != TransferStatusEnum::COMPLETED) {
                                 bool peer_dead = false;
                                 if (status.s == TransferStatusEnum::FAILED) {
@@ -264,7 +265,7 @@ void MooncakeWorker::startWorker() {
                     }
 
                     if (!skipTransfer) {
-                        auto s = group->engine->freeBatchID(task.batchID);
+                        auto s = group->engine->freeBatchID(batchIDs[i]);
                         if (!s.ok()) {
                             LOG(WARNING)
                                 << "BatchID leaked due to freeBatchID "
@@ -298,9 +299,9 @@ void MooncakeWorker::startWorker() {
                         });
                         markAttempted(i, j);
                     }
-                    task.batchID =
+                    batchIDs[i] =
                         group->engine->allocateBatchID(entries.size());
-                    group->engine->submitTransfer(task.batchID, entries);
+                    group->engine->submitTransfer(batchIDs[i], entries);
                     activeTime[i] = clock::now();
                     task_status[i].store(SIGNALED_1, std::memory_order_release);
                 } else if (task_status[i].load(std::memory_order_acquire) ==
@@ -323,7 +324,7 @@ void MooncakeWorker::startWorker() {
                             continue;
                         }
                         group->engine->getTransferStatus(
-                            task.batchID, rankToTaskId[i][j], status);
+                            batchIDs[i], rankToTaskId[i][j], status);
                         if (signal_ptr[j] != 1 ||
                             status.s != TransferStatusEnum::COMPLETED) {
                             bool peer_dead = false;
@@ -402,7 +403,7 @@ void MooncakeWorker::startWorker() {
                             }
                         }
 
-                        auto s = group->engine->freeBatchID(task.batchID);
+                        auto s = group->engine->freeBatchID(batchIDs[i]);
                         if (!s.ok()) {
                             LOG(WARNING)
                                 << "BatchID leaked due to freeBatchID "
