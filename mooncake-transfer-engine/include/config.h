@@ -79,6 +79,14 @@ struct GlobalConfig {
     // not-yet-posted slices fail/redispatch instead of hanging. 0 disables.
     // Override via MC_CONN_PAUSE_TTL_MS.
     int conn_pause_ttl_ms = 0;
+    // Tell the EFA provider that every peer runs our platform, build, and
+    // capabilities, which lets it skip the per-peer RDM handshake. That
+    // handshake is what limits the first transfers to a new peer to 16 queued
+    // ops before returning FI_EAGAIN, endpoint-wide rather than per-peer.
+    // Defaults on: a Mooncake cluster is homogeneous by construction. Set
+    // MC_EFA_HOMOGENEOUS_PEERS=0 for a fleet mixing EFA generations or
+    // Mooncake builds. See buildSharedEndpoint() for the full rationale.
+    bool efa_homogeneous_peers = true;
     uint16_t rpc_min_port = 15000;
     uint16_t rpc_max_port = 17000;
     bool use_ipv6 = false;

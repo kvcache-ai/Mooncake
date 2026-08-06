@@ -321,6 +321,62 @@ int EfaContext::buildSharedEndpoint(size_t max_wr, size_t max_inline) {
         return ERR_ENDPOINT;
     }
 
+    // Skip the EFA RDM handshake, which otherwise gates the very first RMA to
+    // each new peer.  Before the handshake completes, fi_write()/fi_read()
+    // queue into a fixed 16-slot allowance
+    // (EFA_RDM_MAX_QUEUED_OPE_BEFORE_HANDSHAKE) and the 17th onward return
+    // -FI_EAGAIN.  The counter lives on the *endpoint*, not the peer, so with
+    // one shared_ep_ per NIC a single peer's first batch stalls submission for
+    // every other peer on that NIC.  Measured on p5: ops 17..N all EAGAIN,
+    // clearing only after ~14-29 ms of retries -- exactly the "pod became
+    // ready, then a burst of first transfers" failure seen in production.
+    //
+    // The option tells the provider that all peers share our platform,
+    // software version, and capabilities, so no negotiation is needed.  That
+    // holds for a Mooncake cluster by construction: peers run the same build
+    // against the same EFA fabric.  What the provider then assumes on our word
+    // is p2p / RDMA-read / RDMA-write support (efa_rdm_ep.h), i.e. it uses OUR
+    // capabilities for the peer -- safe between identical instance types, so
+    // MC_EFA_HOMOGENEOUS_PEERS=0 exists for a genuinely mixed fleet.
+    //
+    // Must precede fi_enable(): the flag changes protocol selection at enable
+    // time.  It is a local endpoint property, so it needs no coordination with
+    // the peer and can be rolled out one side at a time.
+    //
+    // One documented constraint (fi_efa.7): the target of an RMA must have
+    // inserted the initiator's address into its AV before the op starts, else
+    // completions fail with prov_errno=14.  EfaEndPoint satisfies this --
+    // setupConnectionsByPassive() calls insertPeerAddr() before it replies, and
+    // the active side only marks CONNECTED after that reply arrives.  Should it
+    // ever be violated, 14 is already in isStalePeerCqError() and drops the
+    // peer handle for a fresh handshake.
+    //
+    // The value is an enum, not a macro, so #ifdef cannot probe it; guard on
+    // the libfabric API version that introduced it (2.2; absent in 2.1).
+#if FI_VERSION(FI_MAJOR_VERSION, FI_MINOR_VERSION) >= FI_VERSION(2, 2)
+    if (globalConfig().efa_homogeneous_peers) {
+        bool homogeneous = true;
+        ret = fi_setopt(&shared_ep_->fid, FI_OPT_ENDPOINT,
+                        FI_OPT_EFA_HOMOGENEOUS_PEERS, &homogeneous,
+                        sizeof(homogeneous));
+        if (ret == -FI_EOPNOTSUPP || ret == -FI_ENOPROTOOPT) {
+            // Provider built without the option: keep the handshake path.
+            LOG(INFO) << "EFA: FI_OPT_EFA_HOMOGENEOUS_PEERS unsupported on "
+                      << device_name_ << " (" << fi_strerror(-ret)
+                      << "), using the default handshake path";
+        } else if (ret) {
+            LOG(ERROR) << "fi_setopt(FI_OPT_EFA_HOMOGENEOUS_PEERS) failed on "
+                       << device_name_ << ": " << fi_strerror(-ret);
+            fi_close(&shared_ep_->fid);
+            shared_ep_ = nullptr;
+            return ERR_ENDPOINT;
+        } else {
+            VLOG(1) << "EFA: homogeneous peers enabled on " << device_name_
+                    << ", skipping the per-peer handshake";
+        }
+    }
+#endif
+
     ret = fi_ep_bind(shared_ep_, &av_->fid, 0);
     if (ret) {
         LOG(ERROR) << "fi_ep_bind(av) failed: " << fi_strerror(-ret);

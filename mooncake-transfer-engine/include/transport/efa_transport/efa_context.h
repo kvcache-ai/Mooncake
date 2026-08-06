@@ -23,6 +23,8 @@
 #include <rdma/fi_cm.h>
 #include <rdma/fi_rma.h>
 #include <rdma/fi_errno.h>
+// FI_OPT_EFA_* provider-specific setopt values (FI_OPT_EFA_HOMOGENEOUS_PEERS).
+#include <rdma/fi_ext.h>
 
 #include <atomic>
 #include <condition_variable>
