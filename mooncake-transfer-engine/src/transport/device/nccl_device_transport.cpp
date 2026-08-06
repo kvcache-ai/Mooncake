@@ -76,6 +76,37 @@ const char* ginBackendName(NcclGinBackend backend) {
     }
 }
 
+bool validGinConnectionType(NcclGinConnectionType type) {
+    return type == NcclGinConnectionType::kNone ||
+           type == NcclGinConnectionType::kFull ||
+           type == NcclGinConnectionType::kRail;
+}
+
+ncclGinConnectionType_t toNativeGinConnectionType(
+    NcclGinConnectionType type) {
+    switch (type) {
+        case NcclGinConnectionType::kFull:
+            return NCCL_GIN_CONNECTION_FULL;
+        case NcclGinConnectionType::kRail:
+            return NCCL_GIN_CONNECTION_RAIL;
+        case NcclGinConnectionType::kNone:
+        default:
+            return NCCL_GIN_CONNECTION_NONE;
+    }
+}
+
+const char* ginConnectionTypeName(NcclGinConnectionType type) {
+    switch (type) {
+        case NcclGinConnectionType::kFull:
+            return "full";
+        case NcclGinConnectionType::kRail:
+            return "rail";
+        case NcclGinConnectionType::kNone:
+        default:
+            return "none";
+    }
+}
+
 bool decodeUniqueId(const std::vector<int32_t>& encoded, ncclUniqueId* id) {
     const size_t words =
         (sizeof(ncclUniqueId) + sizeof(int32_t) - 1) / sizeof(int32_t);
@@ -112,8 +143,12 @@ class NcclDeviceTransportImpl final : public NcclTransport {
         if (config.num_ranks <= 0 || config.rank < 0 ||
             config.rank >= config.num_ranks || config.gin_context_count < 0 ||
             (config.enable_gin && config.gin_context_count == 0) ||
+            (config.enable_gin &&
+             config.gin_connection_type == NcclGinConnectionType::kNone) ||
+            !validGinConnectionType(config.gin_connection_type) ||
             config.gin_context_count > std::numeric_limits<int>::max() / 2 ||
-            config.lsa_barrier_count < 0) {
+            config.gin_queue_depth < 0 || config.gin_signal_count < 0 ||
+            config.gin_traffic_class < -1 || config.lsa_barrier_count < 0) {
             LOG(ERROR) << "[Device NCCL] invalid communicator configuration";
             return -1;
         }
@@ -182,10 +217,15 @@ class NcclDeviceTransportImpl final : public NcclTransport {
                           "not supported";
             local_capabilities_valid = false;
         }
+        const ncclGinType_t selected_gin_type =
+            config.gin_connection_type == NcclGinConnectionType::kRail
+                ? comm_properties.railedGinType
+                : comm_properties.ginType;
         if (local_capabilities_valid && config.enable_gin &&
-            comm_properties.ginType == NCCL_GIN_TYPE_NONE) {
-            LOG(ERROR) << "[Device NCCL] full GIN connectivity was requested "
-                          "but GIN is unavailable";
+            selected_gin_type == NCCL_GIN_TYPE_NONE) {
+            LOG(ERROR) << "[Device NCCL] "
+                       << ginConnectionTypeName(config.gin_connection_type)
+                       << " GIN connectivity was requested but is unavailable";
             local_capabilities_valid = false;
         }
         if (!collectiveAllSucceeded(local_capabilities_valid)) {
@@ -201,26 +241,24 @@ class NcclDeviceTransportImpl final : public NcclTransport {
         requirements.lsaBarrierCount = config.lsa_barrier_count;
         requirements.ginContextCount =
             config.enable_gin ? config.gin_context_count : 0;
-        requirements.ginConnectionType = config.enable_gin
-                                             ? NCCL_GIN_CONNECTION_FULL
-                                             : NCCL_GIN_CONNECTION_NONE;
+        requirements.ginConnectionType =
+            config.enable_gin
+                ? toNativeGinConnectionType(config.gin_connection_type)
+                : NCCL_GIN_CONNECTION_NONE;
         requirements.ginExclusiveContexts =
             config.enable_gin && config.gin_exclusive_contexts;
-
-        ncclResult_t start_result = ncclGroupStart();
-        ncclResult_t create_result = ncclSuccess;
-        ncclResult_t end_result = ncclSuccess;
-        if (start_result == ncclSuccess) {
-            create_result = ncclDevCommCreate(comm_, &requirements, &dev_comm_);
-            end_result = ncclGroupEnd();
+        requirements.ginQueueDepth =
+            config.enable_gin ? config.gin_queue_depth : 0;
+        requirements.ginSignalCount =
+            config.enable_gin ? config.gin_signal_count : 0;
+        if (config.enable_gin && config.gin_traffic_class >= 0) {
+            requirements.ginTrafficClass = config.gin_traffic_class;
         }
-        const bool start_valid =
-            reportNcclError(start_result, "ncclGroupStart") == 0;
-        const bool create_valid =
-            reportNcclError(create_result, "ncclDevCommCreate") == 0;
-        const bool end_valid = reportNcclError(end_result, "ncclGroupEnd") == 0;
+
         const bool local_dev_comm_valid =
-            start_valid && create_valid && end_valid;
+            reportNcclError(
+                ncclDevCommCreate(comm_, &requirements, &dev_comm_),
+                "ncclDevCommCreate") == 0;
         if (!collectiveAllSucceeded(local_dev_comm_valid)) {
             LOG(ERROR) << "[Device NCCL] device communicator creation failed "
                           "on one or more ranks";
@@ -236,7 +274,9 @@ class NcclDeviceTransportImpl final : public NcclTransport {
             (dev_comm_.ginConnectionCount > 0 && dev_comm_.ginContextCount > 0);
         if (!local_gin_resources_valid) {
             LOG(ERROR) << "[Device NCCL] communicator did not provide the "
-                          "requested full GIN resources";
+                       << "requested "
+                       << ginConnectionTypeName(config.gin_connection_type)
+                       << " GIN resources";
         }
         if (!collectiveAllSucceeded(local_gin_resources_valid)) {
             LOG(ERROR) << "[Device NCCL] requested GIN resources are missing "
@@ -277,7 +317,12 @@ class NcclDeviceTransportImpl final : public NcclTransport {
         lsa_topology_.first_rank = dev_comm_.rank - dev_comm_.lsaRank;
         properties_.lsa_barrier_count = config.lsa_barrier_count;
         properties_.gin_enabled = config.enable_gin;
-        properties_.gin_backend = toGinBackend(comm_properties.ginType);
+        properties_.gin_connection_type =
+            config.enable_gin ? config.gin_connection_type
+                              : NcclGinConnectionType::kNone;
+        properties_.gin_backend =
+            toGinBackend(config.enable_gin ? selected_gin_type
+                                           : NCCL_GIN_TYPE_NONE);
         properties_.gin_connection_count = dev_comm_.ginConnectionCount;
         properties_.gin_context_count =
             static_cast<int>(dev_comm_.ginContextCount);
@@ -293,6 +338,8 @@ class NcclDeviceTransportImpl final : public NcclTransport {
                   << " multimem=" << properties_.lsa_multimem_enabled
                   << " lsa_barriers=" << properties_.lsa_barrier_count
                   << " gin_backend=" << ginBackendName(properties_.gin_backend)
+                  << " gin_connection_type="
+                  << ginConnectionTypeName(properties_.gin_connection_type)
                   << " gin_connections=" << properties_.gin_connection_count
                   << " gin_contexts=" << properties_.gin_context_count;
         return 0;
@@ -453,11 +500,20 @@ class NcclDeviceTransportImpl final : public NcclTransport {
         }
 
         context.native_comm_ = device_comm_;
+        static_assert(sizeof(dev_comm_) == NcclDeviceContext::kNativeCommBytes,
+                      "Update embedded NCCL device communicator storage");
+        static_assert(alignof(ncclDevComm_t) <=
+                          NcclDeviceContext::kNativeCommAlignment,
+                      "Update embedded NCCL device communicator alignment");
+        std::memcpy(context.native_comm_storage_, &dev_comm_,
+                    sizeof(dev_comm_));
         context.native_window_ = it->second.window;
         context.local_base_ = it->second.ptr;
         context.rank_ = properties_.rank;
         context.gin_context_count_ = properties_.gin_context_count;
         context.gin_enabled_ = properties_.gin_enabled;
+        context.gin_connections_railed_ =
+            properties_.gin_connection_type == NcclGinConnectionType::kRail;
         context.lsa_multimem_enabled_ = properties_.lsa_multimem_enabled;
         return context;
     }
@@ -526,7 +582,6 @@ class NcclDeviceTransportImpl final : public NcclTransport {
             }
             comm_ = nullptr;
         }
-
         initialized_ = false;
         next_registration_id_ = 1;
         properties_ = {};

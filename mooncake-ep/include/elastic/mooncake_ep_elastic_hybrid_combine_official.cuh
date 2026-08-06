@@ -104,15 +104,6 @@ __global__ void __launch_bounds__(kNumThreads, 1)
         Ops(comm_ctx, qp_idx, sharing_mode, kNumQPs, scaleout_rank_idx,
             scaleup_rank_idx, kNumScaleupRanks, kNumRanks);
 
-    // Forward warps own the scale-out channels and their GIN contexts. Reset
-    // every remote completion slot before the opening barrier releases senders.
-    if (warp_idx >= kNumScaleupWarps && lane_idx < kNumScaleoutRanks) {
-        const int channel_idx =
-            sm_idx * kNumChannelsPerSM + warp_idx - kNumScaleupWarps;
-        gin.template reset_completion_tail<transport::ScaleoutTeam>(channel_idx,
-                                                                    lane_idx);
-    }
-
     // Global parallel barriers for scale-out subteam and scale-up subteam
     // NOTES: this barrier needs a grid sync, as there are channel scale-up tail
     // cleaning before
@@ -124,10 +115,17 @@ __global__ void __launch_bounds__(kNumThreads, 1)
 
     // Adjust register count at certain cases
     // TODO: support more cases, or try to make channel count more aligned
-    // DeepEP's register redistribution uses setmaxnreg, which is not accepted
-    // by ptxas for the SM90 target used by current Mooncake NV validation.
-    // Keep the official role split but disable this SM100-only optimization.
+    // setmaxnreg is rejected by the SM90 build used in Mooncake validation,
+    // but it materially improves the producer/forwarder split on Blackwell.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000 && \
+    (defined(__CUDA_ARCH_SPECIFIC__) || \
+     defined(__CUDA_ARCH_FAMILY_SPECIFIC__))
+    constexpr bool kAdjustRegisters =
+        (kNumChannelsPerSM == 4 || kNumChannelsPerSM == 8) &&
+        !kUseExpandedLayout;
+#else
     constexpr bool kAdjustRegisters = false;
+#endif
     constexpr int kNumRegistersForScaleupWarps = 40;
     constexpr int kNumRegistersForForwardWarps =
         256 - kNumRegistersForScaleupWarps;
@@ -479,7 +477,9 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                         last_recv_token_buffer_ptr, last_send_token_buffer_ptr,
                         token_layout.get_num_bytes<false>(),
                         last_src_scaleout_rank_idx,
-                        last_is_token_last_in_chunk ? 0 : 0);
+                        last_is_token_last_in_chunk
+                            ? 0
+                            : Ops::kAggregateRequests);
                 }
             }
             __syncwarp();
@@ -632,7 +632,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                                 src_scaleout_rank_idx,
                                 topk_valid_mask == 0 and is_token_last_in_chunk
                                     ? 0
-                                    : 0);
+                                    : Ops::kAggregateRequests);
                         }
                     }
                 }
@@ -754,29 +754,55 @@ __global__ void __launch_bounds__(kNumThreads, 1)
         }
         __syncwarp();
 
+        // Settle this channel's source buffers before publishing completion.
+        // The matching remote tail signals below acknowledge every preceding
+        // put on this context, so no additional grid-wide flush is needed.
+        if constexpr (Ops::kIsNccl) gin.flush_channel();
+
         // Update, wait and clean
         EP_STATIC_ASSERT(kNumScaleoutRanks <= 32, "Invalid ranks");
+        const auto expected_signal = math::pack2<int, int64_t>(1, 0);
         if (lane_idx < kNumScaleoutRanks) {
             // Update remote tails
-            const auto expected_signal = math::pack2<int, int64_t>(1, 0);
-            gin.template publish_tail<transport::ScaleoutTeam>(
+            auto* remote_tail =
                 workspace_layout.get_scaleout_channel_signaled_tail_ptr(
-                    channel_idx, scaleout_rank_idx),
-                channel_idx, expected_signal, expected_signal, lane_idx);
+                    channel_idx, scaleout_rank_idx);
+            if constexpr (Ops::kIsNccl) {
+                gin.template red_add_rel<transport::ScaleoutTeam>(
+                    remote_tail, expected_signal, lane_idx);
+            } else {
+                gin.template publish_tail<transport::ScaleoutTeam>(
+                    remote_tail, channel_idx, expected_signal, expected_signal,
+                    lane_idx);
+            }
+        }
+        __syncwarp();
 
-            // Wait tail arrival
+        // Wait tail arrival. Keep the NCCL poll independent of `gin` so the
+        // timeout lambda does not capture and spill the full GIN handle.
+        if (lane_idx < kNumScaleoutRanks) {
             const auto wait_ptr =
                 workspace_layout.get_scaleout_channel_signaled_tail_ptr(
                     channel_idx, lane_idx);
             comm::timeout_while<kNumTimeoutCycles>([=](const bool&
                                                            is_last_check) {
-                const auto signal =
-                    gin.template read_completion_tail<transport::ScaleoutTeam>(
-                        wait_ptr, channel_idx, lane_idx);
+                int64_t signal;
+                if constexpr (Ops::kIsNccl) {
+                    signal = ptx::ld_acquire_sys<int64_t>(wait_ptr);
+                } else {
+                    signal = gin.template read_completion_tail<
+                        transport::ScaleoutTeam>(wait_ptr, channel_idx,
+                                                 lane_idx);
+                }
                 if (signal == expected_signal) {
                     // Clean for next usages
-                    gin.template clear_completion_tail<transport::ScaleoutTeam>(
-                        wait_ptr, channel_idx, lane_idx);
+                    if constexpr (Ops::kIsNccl) {
+                        *wait_ptr = 0;
+                    } else {
+                        gin.template clear_completion_tail<
+                            transport::ScaleoutTeam>(wait_ptr, channel_idx,
+                                                     lane_idx);
+                    }
                     return true;
                 }
 
@@ -795,18 +821,6 @@ __global__ void __launch_bounds__(kNumThreads, 1)
         __syncwarp();
     }
 
-    // NCCL GIN puts retain registered source storage until their contexts are
-    // flushed. Quiesce the cooperative grid before returning so the next EP
-    // kernel can safely reuse the send buffers. IBGDA keeps its existing path.
-#ifdef USE_NCCL_DEVICE
-    if constexpr (Ops::kIsNccl) {
-        comm::gpu_barrier<Ops, true, kNumScaleoutRanks, kNumScaleupRanks,
-                          kNumSMs, kNumThreads, kNumQPs, kNumTimeoutCycles,
-                          comm::kHybridCombineTag1, true, true, false>(
-            gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx,
-            thread_idx, false, false);
-    }
-#endif
 }
 
 }  // namespace mooncake::elastic

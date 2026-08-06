@@ -112,8 +112,15 @@ __forceinline__ __device__ void mooncake_barrier_wo_local_sync(
     const int sign = status >> 1;
     const int* base_signal = workspace.get_nvl_barrier_signal_ptr(kTag, phase);
 
+    // NCCL LSA atomics can safely converge on one symmetric counter, which
+    // matches DeepEP and lets the waiter issue one acquire load. IBGDA retains
+    // one slot per source rank because its portable remote-atomic protocol must
+    // not rely on a shared remote word.
+    constexpr bool kUseAggregateSignal =
+        Ops::kIsNccl && std::is_same_v<team_t, transport::ScaleupTeam>;
     if (thread_idx < kNumRanks) {
-        auto* dst_ptr = const_cast<int*>(base_signal) + rank_idx;
+        auto* dst_ptr = const_cast<int*>(base_signal) +
+                        (kUseAggregateSignal ? 0 : rank_idx);
         gin.template red_add_rel<team_t>(dst_ptr, sign ? -1 : 1, thread_idx);
     }
     __syncthreads();
@@ -123,24 +130,24 @@ __forceinline__ __device__ void mooncake_barrier_wo_local_sync(
 
     timeout_while<kNumTimeoutCycles>(
         thread_idx == 0, [=](const bool& is_last_check) {
-            int sum = 0;
+            int observed = 0;
+            if constexpr (kUseAggregateSignal) {
+                observed = ptx::ld_acquire_sys<int>(
+                    const_cast<int*>(base_signal));
+            } else {
 #pragma unroll
-            for (int i = 0; i < kNumRanks; ++i) {
-                sum +=
-                    ptx::ld_acquire_sys<int>(const_cast<int*>(base_signal) + i);
+                for (int i = 0; i < kNumRanks; ++i) {
+                    observed += ptx::ld_acquire_sys<int>(
+                        const_cast<int*>(base_signal) + i);
+                }
             }
-            // Mooncake's portable barrier uses one additive slot per source
-            // rank. Each positive phase adds +1 into a zeroed phase slot; the
-            // matching negative phase later adds -1 into the same phase slot.
-            // This matches RDMA atomic-add semantics and avoids relying on a
-            // remote store primitive for non-P2P peers.
             const auto target = sign ? 0 : kNumRanks;
-            if (sum == target) return true;
+            if (observed == target) return true;
             if (is_last_check) {
                 printf(
                     "Mooncake elastic barrier timeout, tag: %d, rank: %d, "
-                    "signal-sum: %d, target: %d\n",
-                    kTag, rank_idx, sum, target);
+                    "signal: %d, target: %d\n",
+                    kTag, rank_idx, observed, target);
             }
             return false;
         });
@@ -148,76 +155,43 @@ __forceinline__ __device__ void mooncake_barrier_wo_local_sync(
 
 #ifdef USE_NCCL_DEVICE
 
-// GIN signal words are NCCL-owned monotonic tails. Every sender advances its
-// own slot once on every active GIN context, and every receiver waits for the
-// matching local epoch. No kernel load/store resets these signal words.
-template <typename team_t, int kNumTeamRanks, int kNumWorldRanks,
-          int kNumThreads, int64_t kNumTimeoutCycles,
-          int kTag = kDeviceBarrierTag>
+// Use one communicator-owned signal per source rank on GIN context 0. Payload
+// contexts are flushed before this function; a single control context is enough
+// to publish barrier arrival and avoids O(team_size * context_count) signals.
+template <typename team_t, int kNumTeamRanks, int kNumThreads,
+          int64_t kNumTimeoutCycles, int kTag = kDeviceBarrierTag>
 __forceinline__ __device__ void nccl_gin_barrier_wo_local_sync(
     const transport::NcclOps& gin, const layout::WorkspaceLayout& workspace,
     const int& team_rank_idx, const int& barrier_sm_idx,
     const int& thread_idx) {
     if (barrier_sm_idx != 0) return;
-    (void)team_rank_idx;
+    (void)workspace;
 
-    const int num_contexts = gin.ctx.gin_context_count;
-    const int sender_world_rank = gin.ctx.world_rank;
-
-    // Publish arrival to each non-LSA peer on every context. The full-world
-    // NCCL GIN team is used even when team_t describes one scale-out rail.
-    const int num_signal_items = kNumTeamRanks * num_contexts;
-    for (int item = thread_idx; item < num_signal_items; item += kNumThreads) {
-        const int dst_team_rank = item / num_contexts;
-        const int context_idx = item % num_contexts;
-        const int dst_world_rank = gin.world_rank<team_t>(dst_team_rank);
-        if (dst_world_rank != sender_world_rank &&
-            !gin.is_lsa_world_rank(dst_world_rank)) {
-            auto* signal_ptr = gin.gin_signal_ptr(
-                kNumWorldRanks, kTag, sender_world_rank, context_idx);
-            gin.gin_signal_add(dst_world_rank, context_idx, signal_ptr, 1);
-        }
+    for (int dst_team_rank = thread_idx; dst_team_rank < kNumTeamRanks;
+         dst_team_rank += kNumThreads) {
+        gin.template gin_barrier_signal_inc<team_t>(dst_team_rank,
+                                                    team_rank_idx);
     }
-    __syncthreads();
 
-    auto* barrier_epoch = workspace.get_gin_barrier_epoch_ptr(kTag);
-    if (thread_idx == 0) {
-        atomicAdd(reinterpret_cast<unsigned long long*>(barrier_epoch), 1ULL);
-    }
-    __syncthreads();
-    uint64_t target_epoch = 0;
-    if ((thread_idx & (warpSize - 1)) == 0) {
-        target_epoch = ptx::ld_acquire_sys<uint64_t>(barrier_epoch);
-    }
-    target_epoch = __shfl_sync(0xffffffffU, target_epoch, 0);
-
-    const int num_wait_items = kNumTeamRanks * num_contexts;
-    for (int item = thread_idx; item < num_wait_items; item += kNumThreads) {
-        const int src_team_rank = item / num_contexts;
-        const int context_idx = item % num_contexts;
-        const int src_world_rank = gin.world_rank<team_t>(src_team_rank);
-        if (src_world_rank == sender_world_rank ||
-            gin.is_lsa_world_rank(src_world_rank))
-            continue;
-
-        const auto* signal_ptr = gin.gin_signal_ptr(
-            kNumWorldRanks, kTag, src_world_rank, context_idx);
+    for (int src_team_rank = thread_idx; src_team_rank < kNumTeamRanks;
+         src_team_rank += kNumThreads) {
+        const uint64_t target =
+            gin.gin_barrier_advance_shadow(src_team_rank);
         timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
             const uint64_t observed =
-                gin.gin_read_signal(context_idx, signal_ptr);
-            if (observed >= target_epoch) return true;
+                gin.gin_barrier_read_signal(src_team_rank);
+            if (observed >= target) return true;
             if (is_last_check) {
                 printf(
                     "Mooncake NCCL GIN barrier timeout, tag: %d, rank: %d, "
-                    "source: %d, context: %d, signal: %llu, target: %llu\n",
-                    kTag, sender_world_rank, src_world_rank, context_idx,
+                    "source: %d, signal: %llu, target: %llu\n",
+                    kTag, team_rank_idx, src_team_rank,
                     static_cast<unsigned long long>(observed),
-                    static_cast<unsigned long long>(target_epoch));
+                    static_cast<unsigned long long>(target));
             }
             return false;
         });
     }
-    __syncthreads();
 }
 
 #endif  // USE_NCCL_DEVICE
@@ -261,9 +235,14 @@ __forceinline__ __device__ void gpu_barrier(
                           "GIN flush requires a leading grid synchronization");
         }
         if constexpr (kFlushStores && kNumScaleoutRanks > 1) {
-            gin.flush();
-            local_grid_sync<kNumSMs, kNumThreads, kNumTimeoutCycles>(
-                workspace, thread_idx);
+            // Only a participating scale-out barrier needs to flush GIN. A
+            // scale-up-only epilogue has already consumed/acknowledged every
+            // rail put through its strong completion tails.
+            if (do_scaleout) {
+                gin.flush();
+                local_grid_sync<kNumSMs, kNumThreads, kNumTimeoutCycles>(
+                    workspace, thread_idx);
+            }
         }
     }
 
@@ -278,8 +257,7 @@ __forceinline__ __device__ void gpu_barrier(
                 gin, workspace, scaleup_rank_idx, sm_idx, thread_idx);
         } else if (do_scaleout && !do_scaleup) {
             nccl_gin_barrier_wo_local_sync<
-                transport::ScaleoutTeam, kNumScaleoutRanks,
-                kNumScaleoutRanks * kNumScaleupRanks, kNumThreads,
+                transport::ScaleoutTeam, kNumScaleoutRanks, kNumThreads,
                 kNumTimeoutCycles, kTag>(gin, workspace, scaleout_rank_idx,
                                          sm_idx, thread_idx);
         } else if (do_scaleup && do_scaleout) {
@@ -291,8 +269,7 @@ __forceinline__ __device__ void gpu_barrier(
                     kNumThreads, kNumTimeoutCycles, kTag>(
                     gin, workspace, scaleup_rank_idx, sm_idx, thread_idx);
                 nccl_gin_barrier_wo_local_sync<
-                    transport::ScaleoutTeam, kNumScaleoutRanks,
-                    kNumScaleoutRanks * kNumScaleupRanks, kNumThreads,
+                    transport::ScaleoutTeam, kNumScaleoutRanks, kNumThreads,
                     kNumTimeoutCycles, kTag>(gin, workspace, scaleout_rank_idx,
                                              sm_idx - 1, thread_idx);
             } else {
@@ -303,8 +280,7 @@ __forceinline__ __device__ void gpu_barrier(
                                                kNumTimeoutCycles, kTag>(
                     gin, workspace, scaleup_rank_idx, 0, thread_idx);
                 nccl_gin_barrier_wo_local_sync<
-                    transport::ScaleoutTeam, kNumScaleoutRanks,
-                    kNumScaleoutRanks * kNumScaleupRanks, kNumThreads,
+                    transport::ScaleoutTeam, kNumScaleoutRanks, kNumThreads,
                     kNumTimeoutCycles, kTag>(gin, workspace, scaleout_rank_idx,
                                              0, thread_idx);
             }

@@ -32,7 +32,9 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_copy_epilogue_impl(
     const auto sm_idx = static_cast<int>(blockIdx.x),
                thread_idx = static_cast<int>(threadIdx.x);
     const auto warp_idx = ptx::get_warp_idx(), lane_idx = ptx::get_lane_idx();
-    const auto global_warp_idx = warp_idx * kNumSMs + sm_idx;
+    const auto num_sms =
+        kNumSMs == 0 ? static_cast<int>(gridDim.x) : kNumSMs;
+    const auto global_warp_idx = warp_idx * num_sms + sm_idx;
 
     // For top-k index transformations
     constexpr int kNumExpertsPerRank = kNumExperts / kNumRanks;
@@ -77,7 +79,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_copy_epilogue_impl(
     int current_rank_start = 0, current_rank_end = 0;
 #pragma unroll
     for (int i = global_warp_idx; i < num_recv_tokens;
-         i += kNumWarps * kNumSMs) {
+         i += kNumWarps * num_sms) {
         // Calculate token index in the buffer
         while (i >= current_rank_end) {
             current_rank_idx += 1;
@@ -256,7 +258,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_copy_epilogue_impl(
         const auto workspace_layout = layout::WorkspaceLayout(
             workspace, kNumScaleoutRanks, kNumScaleupRanks, kNumExperts);
         for (int i = global_warp_idx; i < kNumChannels;
-             i += kNumSMs * kNumWarps) {
+             i += num_sms * kNumWarps) {
 #pragma unroll
             for (int j = 0; j < kNumScaleupRanksPerLane; ++j) {
                 if (const auto k = j * 32 + lane_idx;

@@ -26,7 +26,7 @@ template <
     int kNumChannels = kNumScaleoutWarps * kNumSMs,
     int kNumMaxTokensPerChannel = math::constexpr_ceil_div(kNumMaxTokensPerRank,
                                                            kNumChannels),
-    int kScaleoutUpdateInterval = 3,
+    int kScaleoutUpdateInterval = 6,
     int kNumSlotsPerForwardChunk = kScaleoutUpdateInterval,
     int kNumRanks = kNumScaleoutRanks * kNumScaleupRanks,
     int kNumNotifyThreads = kNumNotifyWarps * 32,
@@ -96,22 +96,10 @@ __global__ void __launch_bounds__(kNumThreads, 1)
         Ops(comm_ctx, qp_idx, sharing_mode, kNumQPs, scaleout_rank_idx,
             scaleup_rank_idx, kNumScaleupRanks, kNumRanks);
 
-    // NCCL completion tails are GIN-only VA signals. Reset each channel/source
-    // slot on its matching context before the opening cross-rank barrier; no
-    // producer can publish the next epoch until every receiver has reset.
-    if (warp_idx >= kNumNotifyWarps &&
-        warp_idx < kNumNotifyWarps + kNumScaleoutWarps &&
-        lane_idx < kNumScaleoutRanks) {
-        const int channel_idx =
-            sm_idx * kNumChannelsPerSM + warp_idx - kNumNotifyWarps;
-        gin.template reset_completion_tail<transport::ScaleoutTeam>(channel_idx,
-                                                                    lane_idx);
-    }
-
     // Global parallel barriers for scale-out subteam and scale-up subteam
     comm::gpu_barrier<Ops, true, kNumScaleoutRanks, kNumScaleupRanks, kNumSMs,
                       kNumThreads, kNumQPs, kNumTimeoutCycles,
-                      comm::kHybridDispatchTag0, false, Ops::kIsNccl, true>(
+                      comm::kHybridDispatchTag0, false, false, true>(
         gin, workspace_layout, scaleout_rank_idx, scaleup_rank_idx, sm_idx,
         thread_idx);
 
@@ -243,7 +231,8 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                         scaleout_rank_idx),
                     workspace_layout.get_scaleout_rank_count_ptr<true>(
                         dst_scaleout_rank_idx),
-                    kNumScaleupRanks * sizeof(int), dst_scaleout_rank_idx, 0);
+                    kNumScaleupRanks * sizeof(int), dst_scaleout_rank_idx,
+                    Ops::kAggregateRequests);
                 gin.template put<transport::ScaleoutTeam>(
                     workspace_layout.get_scaleout_expert_count_ptr<false>(
                         scaleout_rank_idx),
@@ -604,7 +593,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                     scaleout_send_buffer.get_token_buffer(token_idx)
                         .get_base_ptr(),
                     tma_buffer.get_num_bytes<false>(),
-                    stored_dst_scaleout_rank_idx, 0);
+                    stored_dst_scaleout_rank_idx, Ops::kAggregateRequests);
             }
             __syncwarp();
 

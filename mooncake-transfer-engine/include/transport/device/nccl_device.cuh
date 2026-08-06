@@ -39,12 +39,33 @@
 
 namespace mooncake {
 namespace device {
+
+enum class NcclGinTeam : uint8_t {
+    kWorld = 0,
+    kRail,
+};
+
+// Values intentionally match Mooncake EP's backend-neutral sharing-mode
+// contract, not NCCL's enum values.
+enum class NcclGinResourceSharing : uint8_t {
+    kCta = 0,
+    kGpu = 1,
+    kThread = 2,
+};
+
 namespace detail {
 
 struct NcclDeviceContextAccess {
     __device__ __forceinline__ static const ncclDevComm_t& comm(
         const NcclDeviceContext& ctx) {
-        return *static_cast<const ncclDevComm_t*>(ctx.native_comm_);
+        static_assert(sizeof(ncclDevComm_t) ==
+                          NcclDeviceContext::kNativeCommBytes,
+                      "Update NcclDeviceContext storage for this NCCL version");
+        static_assert(alignof(ncclDevComm_t) <=
+                          NcclDeviceContext::kNativeCommAlignment,
+                      "Increase NcclDeviceContext communicator alignment");
+        return *reinterpret_cast<const ncclDevComm_t*>(
+            ctx.native_comm_storage_);
     }
 
     __device__ __forceinline__ static ncclWindow_t window(
@@ -72,6 +93,11 @@ struct NcclDeviceContextAccess {
         return ctx.gin_enabled_;
     }
 
+    __device__ __forceinline__ static bool ginConnectionsRailed(
+        const NcclDeviceContext& ctx) {
+        return ctx.gin_connections_railed_;
+    }
+
     __device__ __forceinline__ static bool lsaMultimemEnabled(
         const NcclDeviceContext& ctx) {
         return ctx.lsa_multimem_enabled_;
@@ -90,6 +116,29 @@ __device__ __forceinline__ int mc_nccl_gin_context(const NcclDeviceContext& ctx,
     return static_cast<int>(channel % static_cast<unsigned int>(count));
 }
 
+template <NcclGinTeam Team>
+__device__ __forceinline__ ncclTeam mc_nccl_gin_team(
+    const ncclDevComm_t& comm) {
+    if constexpr (Team == NcclGinTeam::kRail) {
+        return ncclTeamRail(comm);
+    } else {
+        return ncclTeamWorld(comm);
+    }
+}
+
+__device__ __forceinline__ ncclGinResourceSharingMode
+mc_nccl_gin_sharing_mode(NcclGinResourceSharing mode) {
+    switch (mode) {
+        case NcclGinResourceSharing::kCta:
+            return NCCL_GIN_RESOURCE_SHARING_CTA;
+        case NcclGinResourceSharing::kThread:
+            return NCCL_GIN_RESOURCE_SHARING_THREAD;
+        case NcclGinResourceSharing::kGpu:
+        default:
+            return NCCL_GIN_RESOURCE_SHARING_GPU;
+    }
+}
+
 #if NCCL_VERSION_CODE >= NCCL_VERSION(2, 30, 5)
 using NcclStrongVaSignalAdd = ncclGin_StrongVASignalAdd;
 #else
@@ -105,6 +154,159 @@ using NcclStrongVaSignalAdd = ncclGin_VASignalAdd;
 // ranges wholly contained in the registration bound to ctx. Violating a
 // precondition is undefined behavior. Hoist capability and route queries out of
 // hot loops when the route is already known.
+
+// Pre-bound GIN state for hot device loops. Construct this once per issuing
+// thread/warp and reuse it for every operation on the same logical channel.
+// Unlike the lane-selected compatibility helpers below, these methods do not
+// check a lane id: the caller must elect exactly the threads required by the
+// selected NCCL cooperative operation.
+class NcclGinHandle {
+   public:
+    __device__ __forceinline__ NcclGinHandle(
+        const NcclDeviceContext& ctx, unsigned int channel,
+        NcclGinResourceSharing sharing = NcclGinResourceSharing::kGpu)
+        : comm_(detail::NcclDeviceContextAccess::comm(ctx)),
+          gin_(comm_, detail::mc_nccl_gin_context(ctx, channel),
+               detail::mc_nccl_gin_sharing_mode(sharing)),
+          window_(detail::NcclDeviceContextAccess::window(ctx)),
+          local_base_(detail::NcclDeviceContextAccess::localBase(ctx)),
+          team_world_(ncclTeamWorld(comm_)),
+          team_lsa_(ncclTeamLsa(comm_)),
+          team_rail_(ncclTeamRail(comm_)) {}
+
+    __device__ __forceinline__ int worldRank() const {
+        return team_world_.rank;
+    }
+
+    __device__ __forceinline__ int lsaRank() const { return team_lsa_.rank; }
+
+    __device__ __forceinline__ int railRank() const {
+        return team_rail_.rank;
+    }
+
+    __device__ __forceinline__ bool worldRankInLsa(int peer) const {
+        const int first = team_rail_.rank * team_lsa_.nRanks;
+        return first <= peer && peer < first + team_lsa_.nRanks;
+    }
+
+    __device__ __forceinline__ int contextCount() const {
+        return comm_.ginContextCount;
+    }
+
+    __device__ __forceinline__ size_t pointerOffset(const void* ptr) const {
+        return static_cast<size_t>(static_cast<const char*>(ptr) -
+                                   local_base_);
+    }
+
+    __device__ __forceinline__ void* worldPeerPointer(
+        int peer, const void* ptr) const {
+        if (peer == team_world_.rank) return const_cast<void*>(ptr);
+        return ncclGetPeerPointer(window_, pointerOffset(ptr), peer);
+    }
+
+    __device__ __forceinline__ void* lsaPeerPointer(
+        int peer, const void* ptr) const {
+        if (peer == team_lsa_.rank) return const_cast<void*>(ptr);
+        return ncclGetLsaPointer(window_, pointerOffset(ptr), peer);
+    }
+
+    template <NcclGinTeam Team>
+    __device__ __forceinline__ void put(
+        int dst_rank, const void* send_ptr, void* recv_ptr, uint32_t nbytes,
+        uint32_t opt_flags = ncclGinOptFlagsDefault) const {
+        gin_.put(team<Team>(), dst_rank, window_, pointerOffset(recv_ptr),
+                 window_, pointerOffset(send_ptr), nbytes, ncclGin_None{},
+                 ncclGin_None{}, ncclCoopThread{}, ncclGin_None{},
+                 cuda::thread_scope_thread, cuda::thread_scope_device,
+                 opt_flags);
+    }
+
+    template <NcclGinTeam Team, typename T>
+    __device__ __forceinline__ void putValue(
+        int dst_rank, T* recv_ptr, T value,
+        uint32_t opt_flags = ncclGinOptFlagsDefault) const {
+        static_assert(std::is_scalar<T>::value &&
+                          std::is_trivially_copyable<T>::value,
+                      "NcclGinHandle::putValue requires a scalar");
+        static_assert(sizeof(T) == 1 || sizeof(T) == 2 || sizeof(T) == 4 ||
+                          sizeof(T) == 8,
+                      "NcclGinHandle::putValue supports 1, 2, 4, or 8 bytes");
+        gin_.putValue(team<Team>(), dst_rank, window_,
+                      pointerOffset(recv_ptr), value, ncclGin_None{},
+                      ncclCoopThread{}, ncclGin_None{},
+                      cuda::thread_scope_thread, cuda::thread_scope_device,
+                      opt_flags);
+    }
+
+    template <NcclGinTeam Team>
+    __device__ __forceinline__ void signalAdd(int dst_rank,
+                                              uint64_t* signal_ptr,
+                                              uint64_t value) const {
+        gin_.signal(team<Team>(), dst_rank,
+                    detail::NcclStrongVaSignalAdd{
+                        window_, pointerOffset(signal_ptr), value},
+                    ncclCoopThread{});
+    }
+
+    __device__ __forceinline__ void resetSignal(uint64_t* signal_ptr) const {
+        gin_.resetSignal(window_, pointerOffset(signal_ptr));
+    }
+
+    __device__ __forceinline__ uint64_t readSignal(
+        const uint64_t* signal_ptr) const {
+        return gin_.readSignal(window_, pointerOffset(signal_ptr));
+    }
+
+    __device__ __forceinline__ void flushWarp() const {
+        gin_.flush(ncclCoopWarp{});
+    }
+
+    __device__ __forceinline__ void flushContextWarp(int context) const {
+        ncclGin(comm_, context, NCCL_GIN_RESOURCE_SHARING_CTA)
+            .flush(ncclCoopWarp{});
+    }
+
+    template <NcclGinTeam Team>
+    __device__ __forceinline__ void signalIncContext0(int dst_rank,
+                                                       int signal_id) const {
+        ncclGin(comm_, 0, NCCL_GIN_RESOURCE_SHARING_CTA)
+            .signal(team<Team>(), dst_rank,
+                    ncclGin_SignalInc{
+                        static_cast<ncclGinSignal_t>(signal_id)},
+                    ncclCoopThread{});
+    }
+
+    __device__ __forceinline__ uint64_t advanceSignalShadowContext0(
+        int signal_id) const {
+        ncclGin barrier(comm_, 0, NCCL_GIN_RESOURCE_SHARING_CTA);
+        return ++(*barrier.getSignalShadowPtr(
+            static_cast<ncclGinSignal_t>(signal_id)));
+    }
+
+    __device__ __forceinline__ uint64_t readSignalContext0(
+        int signal_id) const {
+        return ncclGin(comm_, 0, NCCL_GIN_RESOURCE_SHARING_CTA)
+            .readSignal(static_cast<ncclGinSignal_t>(signal_id));
+    }
+
+   private:
+    template <NcclGinTeam Team>
+    __device__ __forceinline__ ncclTeam team() const {
+        if constexpr (Team == NcclGinTeam::kRail) {
+            return team_rail_;
+        } else {
+            return team_world_;
+        }
+    }
+
+    const ncclDevComm_t& comm_;
+    ncclGin gin_;
+    ncclWindow_t window_;
+    const char* local_base_;
+    ncclTeam team_world_;
+    ncclTeam team_lsa_;
+    ncclTeam team_rail_;
+};
 
 // Pointer and route queries are per-thread operations. peer must be a valid
 // world rank.
@@ -184,6 +386,29 @@ __device__ __forceinline__ void mc_nccl_lsa_barrier(
 // nonnegative channel. Signal pointers must be naturally aligned uint64_t
 // objects inside the registration.
 
+template <NcclGinTeam Team>
+__device__ __forceinline__ void mc_nccl_put_team(
+    const NcclDeviceContext& ctx, int channel, int dst_rank, int qps_per_rank,
+    const void* send_ptr, void* recv_ptr, uint32_t nbytes, int lane_id,
+    uint32_t opt_flags = ncclGinOptFlagsDefault,
+    NcclGinResourceSharing sharing = NcclGinResourceSharing::kGpu) {
+    (void)qps_per_rank;
+    if (lane_id != 0) return;
+
+    const size_t src_offset = detail::mc_nccl_pointer_offset(ctx, send_ptr);
+    const size_t dst_offset = detail::mc_nccl_pointer_offset(ctx, recv_ptr);
+    const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
+    const auto window = detail::NcclDeviceContextAccess::window(ctx);
+    ncclGin gin{comm,
+                detail::mc_nccl_gin_context(
+                    ctx, static_cast<unsigned int>(channel)),
+                detail::mc_nccl_gin_sharing_mode(sharing)};
+    gin.put(detail::mc_nccl_gin_team<Team>(comm), dst_rank, window, dst_offset,
+            window, src_offset, nbytes, ncclGin_None{}, ncclGin_None{},
+            ncclCoopThread{}, ncclGin_None{}, cuda::thread_scope_thread,
+            cuda::thread_scope_device, opt_flags);
+}
+
 __device__ __forceinline__ void mc_nccl_put(
     const NcclDeviceContext& ctx, int channel, int dst_rank, int qps_per_rank,
     const void* send_ptr, void* recv_ptr, uint32_t nbytes, int lane_id) {
@@ -232,6 +457,35 @@ __device__ __forceinline__ void mc_nccl_put_with_signal(
 // The destination must be naturally aligned for T and wholly contained in the
 // symmetric registration bound to ctx. This operation does not signal remote
 // completion; pair ordered traffic with a strong GIN signal and receiver wait.
+template <NcclGinTeam Team, typename T>
+__device__ __forceinline__ void mc_nccl_put_value_team(
+    const NcclDeviceContext& ctx, int channel, int dst_rank, int qps_per_rank,
+    T* recv_ptr, T value, int lane_id,
+    uint32_t opt_flags = ncclGinOptFlagsDefault,
+    NcclGinResourceSharing sharing = NcclGinResourceSharing::kGpu) {
+    static_assert(std::is_scalar<T>::value,
+                  "mc_nccl_put_value_team requires a scalar type");
+    static_assert(std::is_trivially_copyable<T>::value,
+                  "mc_nccl_put_value_team requires a trivially copyable type");
+    static_assert(
+        sizeof(T) == 1 || sizeof(T) == 2 || sizeof(T) == 4 || sizeof(T) == 8,
+        "mc_nccl_put_value_team supports only 1, 2, 4, or 8 bytes");
+    (void)qps_per_rank;
+    if (lane_id != 0) return;
+
+    const size_t dst_offset = detail::mc_nccl_pointer_offset(ctx, recv_ptr);
+    const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
+    const auto window = detail::NcclDeviceContextAccess::window(ctx);
+    ncclGin gin{comm,
+                detail::mc_nccl_gin_context(
+                    ctx, static_cast<unsigned int>(channel)),
+                detail::mc_nccl_gin_sharing_mode(sharing)};
+    gin.putValue(detail::mc_nccl_gin_team<Team>(comm), dst_rank, window,
+                 dst_offset, value, ncclGin_None{}, ncclCoopThread{},
+                 ncclGin_None{}, cuda::thread_scope_thread,
+                 cuda::thread_scope_device, opt_flags);
+}
+
 template <typename T>
 __device__ __forceinline__ void mc_nccl_put_value(const NcclDeviceContext& ctx,
                                                   int channel, int dst_rank,
@@ -261,6 +515,73 @@ __device__ __forceinline__ void mc_nccl_put_value(const NcclDeviceContext& ctx,
 // Signal visibility has strong semantics: it implies settlement of preceding
 // puts issued to the same peer on this context. signal_ptr must identify a
 // naturally aligned uint64_t wholly contained in the registration bound to ctx.
+template <NcclGinTeam Team>
+__device__ __forceinline__ void mc_nccl_gin_signal_add_team(
+    const NcclDeviceContext& ctx, int dst_rank, int channel, int qps_per_rank,
+    uint64_t* signal_ptr, uint64_t value, int lane_id,
+    NcclGinResourceSharing sharing = NcclGinResourceSharing::kGpu) {
+    (void)qps_per_rank;
+    if (lane_id != 0) return;
+
+    const size_t signal_offset =
+        detail::mc_nccl_pointer_offset(ctx, signal_ptr);
+    const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
+    const auto window = detail::NcclDeviceContextAccess::window(ctx);
+    ncclGin gin{comm,
+                detail::mc_nccl_gin_context(
+                    ctx, static_cast<unsigned int>(channel)),
+                detail::mc_nccl_gin_sharing_mode(sharing)};
+    gin.signal(detail::mc_nccl_gin_team<Team>(comm), dst_rank,
+               detail::NcclStrongVaSignalAdd{window, signal_offset, value},
+               ncclCoopThread{});
+}
+
+// Increment one of the communicator-owned GIN signals. These signals avoid a
+// symmetric-memory address calculation and are intended for compact control
+// protocols such as a device barrier. signal_id must be smaller than the
+// gin_signal_count requested when the device communicator was created.
+template <NcclGinTeam Team>
+__device__ __forceinline__ void mc_nccl_gin_signal_inc_team(
+    const NcclDeviceContext& ctx, int dst_rank, int channel, int signal_id,
+    int lane_id,
+    NcclGinResourceSharing sharing = NcclGinResourceSharing::kGpu) {
+    if (lane_id != 0) return;
+
+    const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
+    ncclGin gin{comm,
+                detail::mc_nccl_gin_context(
+                    ctx, static_cast<unsigned int>(channel)),
+                detail::mc_nccl_gin_sharing_mode(sharing)};
+    gin.signal(detail::mc_nccl_gin_team<Team>(comm), dst_rank,
+               ncclGin_SignalInc{static_cast<ncclGinSignal_t>(signal_id)},
+               ncclCoopThread{});
+}
+
+// Advance the caller-managed shadow for a communicator-owned GIN signal and
+// return the value that a matching receive must reach.
+__device__ __forceinline__ uint64_t mc_nccl_gin_advance_signal_shadow(
+    const NcclDeviceContext& ctx, int channel, int signal_id,
+    NcclGinResourceSharing sharing = NcclGinResourceSharing::kGpu) {
+    const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
+    ncclGin gin{comm,
+                detail::mc_nccl_gin_context(
+                    ctx, static_cast<unsigned int>(channel)),
+                detail::mc_nccl_gin_sharing_mode(sharing)};
+    return ++(*gin.getSignalShadowPtr(
+        static_cast<ncclGinSignal_t>(signal_id)));
+}
+
+__device__ __forceinline__ uint64_t mc_nccl_gin_read_signal_id(
+    const NcclDeviceContext& ctx, int channel, int signal_id,
+    NcclGinResourceSharing sharing = NcclGinResourceSharing::kGpu) {
+    const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
+    ncclGin gin{comm,
+                detail::mc_nccl_gin_context(
+                    ctx, static_cast<unsigned int>(channel)),
+                detail::mc_nccl_gin_sharing_mode(sharing)};
+    return gin.readSignal(static_cast<ncclGinSignal_t>(signal_id));
+}
+
 __device__ __forceinline__ void mc_nccl_gin_signal_add(
     const NcclDeviceContext& ctx, int dst_rank, int channel, int qps_per_rank,
     uint64_t* signal_ptr, uint64_t value, int lane_id) {
@@ -282,15 +603,18 @@ __device__ __forceinline__ void mc_nccl_gin_signal_add(
 // ensure that no remote signal operation can race this reset. Only lane 0 acts.
 __device__ __forceinline__ void mc_nccl_gin_reset_signal(
     const NcclDeviceContext& ctx, int channel, uint64_t* signal_ptr,
-    int lane_id) {
+    int lane_id,
+    NcclGinResourceSharing sharing = NcclGinResourceSharing::kGpu) {
     if (lane_id != 0) return;
 
     const size_t signal_offset =
         detail::mc_nccl_pointer_offset(ctx, signal_ptr);
     const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
     const auto window = detail::NcclDeviceContextAccess::window(ctx);
-    ncclGin gin{comm, detail::mc_nccl_gin_context(
-                          ctx, static_cast<unsigned int>(channel))};
+    ncclGin gin{comm,
+                detail::mc_nccl_gin_context(
+                    ctx, static_cast<unsigned int>(channel)),
+                detail::mc_nccl_gin_sharing_mode(sharing)};
     gin.resetSignal(window, signal_offset);
 }
 
@@ -326,13 +650,27 @@ __device__ __forceinline__ void mc_nccl_signal_add(
                            value, 0);
 }
 
-__device__ __forceinline__ void mc_nccl_flush(const NcclDeviceContext& ctx,
-                                              int channel, int lane_id) {
+__device__ __forceinline__ void mc_nccl_flush(
+    const NcclDeviceContext& ctx, int channel, int lane_id,
+    NcclGinResourceSharing sharing = NcclGinResourceSharing::kGpu) {
     if (lane_id != 0) return;
     const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
-    ncclGin gin{comm, detail::mc_nccl_gin_context(
-                          ctx, static_cast<unsigned int>(channel))};
+    ncclGin gin{comm,
+                detail::mc_nccl_gin_context(
+                    ctx, static_cast<unsigned int>(channel)),
+                detail::mc_nccl_gin_sharing_mode(sharing)};
     gin.flush(ncclCoopThread{});
+}
+
+__device__ __forceinline__ void mc_nccl_flush_warp(
+    const NcclDeviceContext& ctx, int channel,
+    NcclGinResourceSharing sharing = NcclGinResourceSharing::kCta) {
+    const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
+    ncclGin gin{comm,
+                detail::mc_nccl_gin_context(
+                    ctx, static_cast<unsigned int>(channel)),
+                detail::mc_nccl_gin_sharing_mode(sharing)};
+    gin.flush(ncclCoopWarp{});
 }
 
 // Read a GIN VA signal from the local matching window. This helper never falls
@@ -340,12 +678,15 @@ __device__ __forceinline__ void mc_nccl_flush(const NcclDeviceContext& ctx,
 // inside the registration bound to ctx, and channel must select the same GIN
 // context used by the remote producer.
 __device__ __forceinline__ uint64_t mc_nccl_gin_read_signal(
-    const NcclDeviceContext& ctx, int channel, const uint64_t* signal_ptr) {
+    const NcclDeviceContext& ctx, int channel, const uint64_t* signal_ptr,
+    NcclGinResourceSharing sharing = NcclGinResourceSharing::kGpu) {
     const size_t signal_offset =
         detail::mc_nccl_pointer_offset(ctx, signal_ptr);
     const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
-    ncclGin gin{comm, detail::mc_nccl_gin_context(
-                          ctx, static_cast<unsigned int>(channel))};
+    ncclGin gin{comm,
+                detail::mc_nccl_gin_context(
+                    ctx, static_cast<unsigned int>(channel)),
+                detail::mc_nccl_gin_sharing_mode(sharing)};
     return gin.readSignal(detail::NcclDeviceContextAccess::window(ctx),
                           signal_offset);
 }
@@ -367,13 +708,16 @@ __device__ __forceinline__ uint64_t mc_nccl_read_signal(
 // and channel have the same preconditions as mc_nccl_gin_read_signal().
 __device__ __forceinline__ void mc_nccl_gin_wait_signal(
     const NcclDeviceContext& ctx, int channel, const uint64_t* signal_ptr,
-    uint64_t least, int lane_id) {
+    uint64_t least, int lane_id,
+    NcclGinResourceSharing sharing = NcclGinResourceSharing::kGpu) {
     if (lane_id != 0) return;
     const size_t signal_offset =
         detail::mc_nccl_pointer_offset(ctx, signal_ptr);
     const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
-    ncclGin gin{comm, detail::mc_nccl_gin_context(
-                          ctx, static_cast<unsigned int>(channel))};
+    ncclGin gin{comm,
+                detail::mc_nccl_gin_context(
+                    ctx, static_cast<unsigned int>(channel)),
+                detail::mc_nccl_gin_sharing_mode(sharing)};
     gin.waitSignal(ncclCoopThread{},
                    detail::NcclDeviceContextAccess::window(ctx), signal_offset,
                    least);

@@ -93,7 +93,8 @@ class MooncakeElasticBuffer {
         uint64_t active_ranks_ptr, int num_experts, int num_max_tokens_per_rank,
         int expert_alignment, int num_sms, bool do_expand,
         bool async_with_compute_stream, uint64_t compute_stream_ptr,
-        bool cached_mode, uint64_t psum_num_recv_tokens_per_scaleup_rank_ptr,
+        bool cached_mode, int num_recv_tokens,
+        uint64_t psum_num_recv_tokens_per_scaleup_rank_ptr,
         uint64_t psum_num_recv_tokens_per_expert_ptr,
         uint64_t dst_buffer_slot_idx_ptr,
         uint64_t token_metadata_at_forward_ptr,
@@ -144,6 +145,9 @@ class MooncakeElasticBuffer {
     void* mapped_host_workspace_ = nullptr;
     std::shared_ptr<void> deterministic_rank_count_buffer_;
     int64_t deterministic_rank_count_buffer_bytes_ = 0;
+    int device_id_ = -1;
+    int physical_num_sms_ = 0;
+    int device_smem_bytes_ = 0;
     bool destroyed_ = false;
 
     ElasticLaunchContext make_launch_context(int64_t timeout_cycles) const;

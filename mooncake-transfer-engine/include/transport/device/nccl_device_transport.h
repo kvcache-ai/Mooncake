@@ -36,16 +36,28 @@ enum class NcclDeviceRoute : uint8_t {
     kGin,
 };
 
+enum class NcclGinConnectionType : uint8_t {
+    kNone = 0,
+    kFull,
+    kRail,
+};
+
 struct NcclTransportConfig {
     int rank = -1;
     int num_ranks = 0;
 
-    // Mooncake currently supports either full world-team GIN connectivity or
-    // no GIN. Rail connectivity is deferred until Mooncake has a rail-team
-    // rank contract.
+    // enable_gin=false overrides gin_connection_type. Rail connectivity uses
+    // NCCL's rail team: peers are addressed by their rail-team rank rather
+    // than by world rank.
     bool enable_gin = true;
+    NcclGinConnectionType gin_connection_type =
+        NcclGinConnectionType::kFull;
     int gin_context_count = 4;
     bool gin_exclusive_contexts = false;
+    int gin_queue_depth = 0;
+    int gin_signal_count = 0;
+    // A negative value leaves NCCL's default traffic class unchanged.
+    int gin_traffic_class = -1;
 
     // LSA barriers synchronize only the local LSA team. Cross-LSA/world
     // synchronization remains the caller's responsibility.
@@ -64,6 +76,8 @@ struct NcclTransportProperties {
     int lsa_team_count = 0;
     int lsa_barrier_count = 0;
     bool gin_enabled = false;
+    NcclGinConnectionType gin_connection_type =
+        NcclGinConnectionType::kNone;
     NcclGinBackend gin_backend = NcclGinBackend::kNone;
     int gin_connection_count = 0;
     int gin_context_count = 0;
@@ -100,15 +114,25 @@ class NcclBufferRegistration {
 // communicators and windows remain behind opaque pointers.
 class NcclDeviceContext {
    public:
+    // ncclDevComm is embedded so kernels read its hot fields from parameter
+    // memory instead of chasing a global-memory pointer. The exact-size check
+    // in nccl_device.cuh intentionally forces an update/rebuild if NCCL changes
+    // this version-specific layout.
+    static constexpr size_t kNativeCommBytes = 240;
+    static constexpr size_t kNativeCommAlignment = 8;
+
     bool valid() const { return native_comm_ != nullptr; }
 
    private:
     const void* native_comm_ = nullptr;
+    alignas(kNativeCommAlignment)
+        unsigned char native_comm_storage_[kNativeCommBytes]{};
     const void* native_window_ = nullptr;
     const void* local_base_ = nullptr;
     int rank_ = -1;
     int gin_context_count_ = 0;
     bool gin_enabled_ = false;
+    bool gin_connections_railed_ = false;
     bool lsa_multimem_enabled_ = false;
 
     friend class NcclDeviceTransportImpl;
