@@ -715,9 +715,20 @@ class RealClient : public PyClient {
      "ip:port").
 
      */
+    struct OffloadReadRange {
+        uint64_t source_offset;
+        int64_t restore_size;
+    };
+
     tl::expected<void, ErrorCode> batch_get_into_offload_object_internal(
         const std::string &target_rpc_service_addr,
-        std::unordered_map<std::string, std::vector<Slice>> &objects);
+        std::unordered_map<std::string, std::vector<Slice>> &objects,
+        const OffloadReadRange *read_range = nullptr);
+
+    bool can_use_pinned_restore(
+        const std::string &target_rpc_service_addr,
+        const std::unordered_map<std::string, std::vector<Slice>> &objects)
+        const;
 
     int64_t get_offload_rpc_read_count() const {
         return offload_rpc_read_count_.load(std::memory_order_relaxed);

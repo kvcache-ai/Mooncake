@@ -3314,8 +3314,19 @@ tl::expected<void, ErrorCode> Client::BatchGetOffloadObject(
     const std::vector<std::string>& keys,
     const std::vector<uintptr_t>& pointers,
     const std::unordered_map<std::string, std::vector<Slice>>& batch_slices) {
+    return BatchGetOffloadObject(transfer_engine_addr, keys, pointers,
+                                 batch_slices,
+                                 OffloadBufferAccess::kTransferEngine);
+}
+
+tl::expected<void, ErrorCode> Client::BatchGetOffloadObject(
+    const std::string& transfer_engine_addr,
+    const std::vector<std::string>& keys,
+    const std::vector<uintptr_t>& pointers,
+    const std::unordered_map<std::string, std::vector<Slice>>& batch_slices,
+    OffloadBufferAccess buffer_access) {
     auto future = transfer_submitter_->submit_batch_get_offload_object(
-        transfer_engine_addr, keys, pointers, batch_slices);
+        transfer_engine_addr, keys, pointers, batch_slices, buffer_access);
     if (!future) {
         LOG(ERROR) << "Failed to submit transfer operation";
         return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
