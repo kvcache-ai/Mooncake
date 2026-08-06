@@ -1552,8 +1552,7 @@ int main(int argc, char* argv[]) {
                 metadata_server_ptr, http_metadata_remote_url);
         mooncake::MasterAdminServer admin_server(
             static_cast<uint16_t>(master_config.metrics_port),
-            master_config.enable_metric_reporting,
-            master_config.metrics_host);
+            master_config.enable_metric_reporting, master_config.metrics_host);
         if (!admin_server.Start()) {
             LOG(ERROR) << "Failed to start master admin server";
             return 1;
