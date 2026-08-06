@@ -504,10 +504,30 @@ fn ignore_source_path(path: &Path, build_dir: &Path) -> bool {
     if path.starts_with(build_dir) {
         return true;
     }
+    // Inside the monorepo the upstream tree *is* the enclosing repository, so
+    // this walk would otherwise descend into store-rs itself -- including
+    // `target/`, which cargo is writing to while this build script runs. The
+    // freshness comparison would then always see a source newer than the
+    // upstream artifacts and reconfigure upstream on every build, fighting
+    // whatever configured it first.
+    if let Some(store_rs_root) = store_rs_root() {
+        if path.starts_with(&store_rs_root) {
+            return true;
+        }
+    }
     matches!(
         path.file_name().and_then(|name| name.to_str()),
-        Some(".git" | "build-rust" | "build-wheel-compat")
+        Some(".git" | "target" | "build-rust" | "build-wheel-compat")
     )
+}
+
+/// Root of this cargo workspace (`crates/<crate>` -> two levels up).
+fn store_rs_root() -> Option<PathBuf> {
+    let manifest_dir = env::var_os("CARGO_MANIFEST_DIR")?;
+    PathBuf::from(manifest_dir)
+        .join("../..")
+        .canonicalize()
+        .ok()
 }
 
 fn file_mtime(path: &Path) -> Option<SystemTime> {
