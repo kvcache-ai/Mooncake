@@ -12,6 +12,7 @@
 #include <utility>
 #include <vector>
 
+#include "p2p_client_metric.h"
 #include "tiered_cache/event_driven_scheduler/json_config_util.h"
 #include "tiered_cache/tiered_backend.h"
 #include "tiered_cache/tiers/cache_tier.h"
@@ -258,6 +259,26 @@ void EventDrivenClientScheduler::EvictLoop() {
 }
 
 bool EventDrivenClientScheduler::Execute(const MovementRequest& mv) {
+    const bool ok = ExecuteMovement(mv);
+    if (ok) {
+        RecordMovement(mv);
+    }
+    return ok;
+}
+
+void EventDrivenClientScheduler::RecordMovement(const MovementRequest& mv) {
+    std::shared_ptr<TierMetric> metric = backend_->GetTierMetric();
+    if (!metric) {
+        return;
+    }
+    if (mv.kind == MovementRequest::Kind::kEvict) {
+        metric->OnEvicted(mv.source_tier);
+    } else {
+        metric->OnMoved(mv.source_tier, mv.dest_tier);
+    }
+}
+
+bool EventDrivenClientScheduler::ExecuteMovement(const MovementRequest& mv) {
     switch (mv.kind) {
         case MovementRequest::Kind::kReplicate: {
             // Copy source -> dest, retaining the source (e.g. pre-demote). The

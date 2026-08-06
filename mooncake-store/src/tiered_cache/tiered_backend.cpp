@@ -147,7 +147,8 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
     Json::Value root, TransferEngine* engine,
     AddReplicaCallback add_replica_callback,
     RemoveReplicaCallback remove_replica_callback,
-    SegmentSyncCallback segment_sync_callback, TierMetric* tier_metric) {
+    SegmentSyncCallback segment_sync_callback,
+    std::shared_ptr<TierMetric> tier_metric) {
     // Initialize DataCopier
     try {
         DataCopierBuilder builder;
@@ -163,7 +164,7 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
     // Register callback for segment lifecycle synchronization with Master
     segment_sync_callback_ = segment_sync_callback;
     // Optional per-tier metrics sink
-    tier_metric_ = tier_metric;
+    tier_metric_ = std::move(tier_metric);
 
     // Initialize Tiers
     if (!root.isMember("tiers")) {
@@ -889,6 +890,7 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(std::string_view key,
     return tl::expected<void, ErrorCode>{};
 }
 
+// TODO: move the logic into the storage_tier
 size_t TieredBackend::NotifyBucketEviction(const std::vector<std::string>& keys,
                                            const UUID& tier_id) {
     // Capture handle references locally so the actual resource release (and the
@@ -956,6 +958,7 @@ size_t TieredBackend::NotifyBucketEviction(const std::vector<std::string>& keys,
             ++removed;
             if (tier_metric_) {
                 tier_metric_->OnReplicaRemoved(tier_id);
+                tier_metric_->OnEvicted(tier_id);
             }
             // Notify Master that the replica on this tier is gone. Best-effort:
             // the eviction is irreversible, so log failures and continue.

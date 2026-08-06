@@ -2,7 +2,6 @@
 
 #include <array>
 #include <memory>
-#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 
@@ -155,11 +154,31 @@ struct TierMetric {
         "Currently used bytes of each tier",
         {"tier"}};
 
+    // Scheduler-driven key-movement counters
+    ylt::metric::dynamic_counter_1t evicted_keys{
+        "mooncake_p2p_tier_evicted_keys_total",
+        "Keys whose replica on each tier was evicted by the scheduler",
+        {"tier"}};
+    ylt::metric::dynamic_counter_1t offloaded_keys{
+        "mooncake_p2p_tier_offloaded_keys_total",
+        "Keys moved from each tier down to a lower-priority tier",
+        {"tier"}};
+    ylt::metric::dynamic_counter_1t onboarded_keys{
+        "mooncake_p2p_tier_onboarded_keys_total",
+        "Keys moved from each tier up to a higher-priority tier",
+        {"tier"}};
+
+    // NOT thread-safe
     void RegisterTier(const UUID& tier_id, const std::string& label,
                       const std::shared_ptr<CacheTier>& tier, int priority);
 
     void OnReplicaAdded(const UUID& tier_id);
     void OnReplicaRemoved(const UUID& tier_id);
+
+    void OnEvicted(const UUID& tier_id);
+    // OnMoved classifies by priority: down = offload, up = onboard, both
+    // counted on the source tier.
+    void OnMoved(const UUID& source_tier, const UUID& dest_tier);
 
     void serialize(std::string& str);
     std::string summary_metrics();
@@ -177,7 +196,6 @@ struct TierMetric {
     // called from serialize()/summary_metrics(), never from the data path.
     void RefreshUsage();
 
-    std::shared_mutex mutex_;  // guards tiers_; hot path takes shared lock
     std::unordered_map<UUID, TierEntry> tiers_;
 };
 
@@ -193,8 +211,8 @@ struct P2PClientMetric : public ClientMetric {
     RemoteRequestMetric remote_request;
     RollbackMetric rollback;
     PeerRequestMetrics peer_request_metrics;
-    // Per-tier storage metrics; initially empty
-    TierMetric tier_metric;
+    // Per-tier storage metrics; initially empty. Shared with TieredBackend.
+    std::shared_ptr<TierMetric> tier_metric;
 
     static std::unique_ptr<P2PClientMetric> Create(
         const std::map<std::string, std::string>& labels = {}) {

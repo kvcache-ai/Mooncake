@@ -330,26 +330,25 @@ void TierMetric::RegisterTier(const UUID& tier_id, const std::string& label,
     entry.capacity = tier->GetCapacity();
     entry.tier = tier;
 
-    {
-        std::unique_lock<std::shared_mutex> lock(mutex_);
-        if (!tiers_.try_emplace(tier_id, std::move(entry)).second) {
-            LOG(ERROR) << "TierMetric::RegisterTier: tier already registered"
-                       << ", tier_id=" << TierIdToString(tier_id)
-                       << ", label=" << label;
-            return;
-        }
+    if (!tiers_.try_emplace(tier_id, std::move(entry)).second) {
+        LOG(ERROR) << "TierMetric::RegisterTier: tier already registered"
+                   << ", tier_id=" << TierIdToString(tier_id)
+                   << ", label=" << label;
+        return;
     }
 
-    // Initialize all gauges so an idle tier still shows up in /metrics.
+    // Initialize all series so an idle tier still shows up in /metrics.
     const std::array<std::string, 1> label_array = {label};
     key_count.inc(label_array, 0);
     capacity_bytes.update(label_array,
                           static_cast<int64_t>(tier->GetCapacity()));
     used_bytes.update(label_array, static_cast<int64_t>(tier->GetUsage()));
+    evicted_keys.inc(label_array, 0);
+    offloaded_keys.inc(label_array, 0);
+    onboarded_keys.inc(label_array, 0);
 }
 
 void TierMetric::OnReplicaAdded(const UUID& tier_id) {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
     auto it = tiers_.find(tier_id);
     if (it == tiers_.end()) {
         LOG(ERROR) << "TierMetric::OnReplicaAdded: unregistered tier, tier_id="
@@ -360,7 +359,6 @@ void TierMetric::OnReplicaAdded(const UUID& tier_id) {
 }
 
 void TierMetric::OnReplicaRemoved(const UUID& tier_id) {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
     auto it = tiers_.find(tier_id);
     if (it == tiers_.end()) {
         LOG(ERROR)
@@ -371,8 +369,34 @@ void TierMetric::OnReplicaRemoved(const UUID& tier_id) {
     key_count.dec(it->second.label_array, 1);
 }
 
+void TierMetric::OnEvicted(const UUID& tier_id) {
+    auto it = tiers_.find(tier_id);
+    if (it == tiers_.end()) {
+        LOG(ERROR) << "TierMetric::OnEvicted: unregistered tier, tier_id="
+                   << TierIdToString(tier_id);
+        return;
+    }
+    evicted_keys.inc(it->second.label_array, 1);
+}
+
+void TierMetric::OnMoved(const UUID& source_tier, const UUID& dest_tier) {
+    auto src = tiers_.find(source_tier);
+    auto dst = tiers_.find(dest_tier);
+    if (src == tiers_.end() || dst == tiers_.end()) {
+        LOG(ERROR) << "TierMetric::OnMoved: unregistered tier, source="
+                   << TierIdToString(source_tier)
+                   << ", dest=" << TierIdToString(dest_tier);
+        return;
+    }
+    if (src->second.priority > dst->second.priority) {
+        offloaded_keys.inc(src->second.label_array, 1);
+    } else if (src->second.priority < dst->second.priority) {
+        onboarded_keys.inc(src->second.label_array, 1);
+    }
+    // Same-priority movement is neither offload nor onboard; not counted.
+}
+
 void TierMetric::RefreshUsage() {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
     for (const auto& [tier_id, entry] : tiers_) {
         auto tier = entry.tier.lock();
         if (!tier) {
@@ -389,13 +413,15 @@ void TierMetric::serialize(std::string& str) {
     key_count.serialize(str);
     capacity_bytes.serialize(str);
     used_bytes.serialize(str);
+    evicted_keys.serialize(str);
+    offloaded_keys.serialize(str);
+    onboarded_keys.serialize(str);
 }
 
 std::string TierMetric::summary_metrics() {
     RefreshUsage();
 
     std::stringstream ss;
-    std::shared_lock<std::shared_mutex> lock(mutex_);
     if (tiers_.empty()) {
         ss << "No tiers registered\n";
         return ss.str();
@@ -428,7 +454,10 @@ std::string TierMetric::summary_metrics() {
         if (capacity > 0) {
             ss << " (" << (used * 100 / capacity) << "%)";
         }
-        ss << "\n";
+        ss << ", evicted_keys=" << evicted_keys.value(entry->label_array)
+           << ", offloaded_keys=" << offloaded_keys.value(entry->label_array)
+           << ", onboarded_keys="
+           << onboarded_keys.value(entry->label_array) << "\n";
     }
     return ss.str();
 }
@@ -444,7 +473,8 @@ P2PClientMetric::P2PClientMetric(
       local_request("mooncake_p2p_local", labels),
       remote_request("mooncake_p2p_remote", labels),
       rollback("mooncake_p2p_rollback", labels),
-      peer_request_metrics("mooncake_p2p_peer", labels) {}
+      peer_request_metrics("mooncake_p2p_peer", labels),
+      tier_metric(std::make_shared<TierMetric>()) {}
 
 void P2PClientMetric::serialize(std::string& str) {
     ClientMetric::serialize(str);
@@ -453,7 +483,7 @@ void P2PClientMetric::serialize(std::string& str) {
     remote_request.serialize(str);
     rollback.serialize(str);
     peer_request_metrics.serialize(str);
-    tier_metric.serialize(str);
+    tier_metric->serialize(str);
 }
 
 std::string P2PClientMetric::summary_metrics() {
@@ -478,7 +508,7 @@ std::string P2PClientMetric::summary_metrics() {
     ss << peer_request_metrics.summary_metrics();
 
     ss << "=== P2P Tier Metrics ===\n";
-    ss << tier_metric.summary_metrics();
+    ss << tier_metric->summary_metrics();
 
     return ss.str();
 }

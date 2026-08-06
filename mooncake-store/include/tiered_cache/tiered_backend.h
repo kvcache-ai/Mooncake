@@ -148,7 +148,7 @@ class TieredBackend {
         AddReplicaCallback add_replica_callback,
         RemoveReplicaCallback remove_replica_callback,
         SegmentSyncCallback segment_sync_callback,
-        TierMetric* tier_metric = nullptr);
+        std::shared_ptr<TierMetric> tier_metric = nullptr);
 
     // --- Client-Centric Operations ---
     // All the following operations are designed for Client-Centric, Client
@@ -284,6 +284,8 @@ class TieredBackend {
     std::vector<TierView> GetTierViews() const;
     std::vector<UUID> GetReplicaTierIds(std::string_view key) const;
     const CacheTier* GetTier(UUID tier_id) const;
+    // Optional per-tier metrics sink; null when metric collection is off.
+    std::shared_ptr<TierMetric> GetTierMetric() const { return tier_metric_; }
 
     /**
      * @brief Id of the DRAM (fast) tier, for DRAM-only local writes.
@@ -384,9 +386,8 @@ class TieredBackend {
     RemoveReplicaCallback remove_replica_callback_;
     // Callback for segment lifecycle synchronization with Master
     SegmentSyncCallback segment_sync_callback_;
-    // Optional per-tier metrics sink (not owned); null when metric
-    // collection is disabled.
-    TierMetric* tier_metric_ = nullptr;
+    // Optional per-tier metrics; null when metric collection is disabled
+    std::shared_ptr<TierMetric> tier_metric_;
 
     // Scheduler
     std::unique_ptr<IClientScheduler> scheduler_;

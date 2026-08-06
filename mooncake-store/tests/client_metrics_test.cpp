@@ -788,4 +788,65 @@ TEST_F(ClientMetricsTest, P2PClientMetricTierSectionTest) {
     metrics.serialize(serialized);  // must not crash with empty tier metric
 }
 
+TEST_F(ClientMetricsTest, TierMetricMovementCountersTest) {
+    TierMetric metric;
+    const UUID high{1, 1};
+    const UUID low{2, 2};
+    auto high_tier = std::make_shared<StubStatsTier>(
+        high, /*capacity=*/1024, /*usage=*/0, MemoryType::DRAM);
+    auto low_tier = std::make_shared<StubStatsTier>(
+        low, /*capacity=*/2048, /*usage=*/0, MemoryType::NVME);
+
+    metric.RegisterTier(high, "tier_1_1", high_tier, /*priority=*/20);
+    metric.RegisterTier(low, "tier_2_2", low_tier, /*priority=*/10);
+
+    std::array<std::string, 1> high_label = {"tier_1_1"};
+    std::array<std::string, 1> low_label = {"tier_2_2"};
+
+    // Counters start at zero at registration.
+    EXPECT_EQ(metric.evicted_keys.value(high_label), 0);
+    EXPECT_EQ(metric.offloaded_keys.value(high_label), 0);
+    EXPECT_EQ(metric.onboarded_keys.value(high_label), 0);
+
+    // Evictions are counted on the tier losing the replica.
+    metric.OnEvicted(high);
+    metric.OnEvicted(high);
+    EXPECT_EQ(metric.evicted_keys.value(high_label), 2);
+    EXPECT_EQ(metric.evicted_keys.value(low_label), 0);
+
+    // A downward movement counts as an offload on the source tier.
+    metric.OnMoved(high, low);
+    EXPECT_EQ(metric.offloaded_keys.value(high_label), 1);
+    EXPECT_EQ(metric.onboarded_keys.value(low_label), 0);
+
+    // An upward movement counts as an onboard on the source tier.
+    metric.OnMoved(low, high);
+    metric.OnMoved(low, high);
+    EXPECT_EQ(metric.onboarded_keys.value(low_label), 2);
+    EXPECT_EQ(metric.offloaded_keys.value(high_label), 1);
+
+    // Same-priority movements are neither offload nor onboard.
+    const UUID peer{3, 3};
+    auto peer_tier = std::make_shared<StubStatsTier>(
+        peer, /*capacity=*/512, /*usage=*/0, MemoryType::DRAM);
+    metric.RegisterTier(peer, "tier_3_3", peer_tier, /*priority=*/20);
+    metric.OnMoved(high, peer);
+    std::array<std::string, 1> peer_label = {"tier_3_3"};
+    EXPECT_EQ(metric.offloaded_keys.value(high_label), 1);
+    EXPECT_EQ(metric.onboarded_keys.value(high_label), 0);
+    EXPECT_EQ(metric.offloaded_keys.value(peer_label), 0);
+
+    // Summary exposes the new counters.
+    std::string summary = metric.summary_metrics();
+    EXPECT_TRUE(summary.find("evicted_keys=2") != std::string::npos);
+    EXPECT_TRUE(summary.find("offloaded_keys=1") != std::string::npos);
+    EXPECT_TRUE(summary.find("onboarded_keys=2") != std::string::npos);
+
+    // Serialized output contains the counter series.
+    std::string serialized;
+    metric.serialize(serialized);
+    EXPECT_TRUE(serialized.find("mooncake_p2p_tier_evicted_keys_total") !=
+                std::string::npos);
+}
+
 }  // namespace mooncake::test

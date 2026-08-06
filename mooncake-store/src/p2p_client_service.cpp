@@ -317,7 +317,7 @@ ErrorCode P2PClientService::InitStorage(const P2PClientConfig& config) {
     auto init_result = tiered_backend->Init(
         config.tiered_backend_config, transfer_engine_.get(),
         add_replica_callback, remove_replica_callback, segment_sync_callback,
-        metrics_ ? &metrics_->tier_metric : nullptr);
+        metrics_ ? metrics_->tier_metric : nullptr);
     if (!init_result) {
         LOG(ERROR) << "Failed to init TieredBackend: " << init_result.error();
         return init_result.error();

@@ -1547,13 +1547,13 @@ TEST_F(TieredBackendTest, TierMetricRegistrationAndKeyCount) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    TierMetric tier_metric;
+    auto tier_metric = std::make_shared<TierMetric>();
     ASSERT_TRUE(backend
                     .Init(config, /*engine=*/nullptr,
                           /*add_replica_callback=*/nullptr,
                           /*remove_replica_callback=*/nullptr,
                           /*segment_sync_callback=*/nullptr,
-                          /*tier_metric=*/&tier_metric)
+                          /*tier_metric=*/tier_metric)
                     .has_value());
 
     // The tier is registered under its segment-name label.
@@ -1562,9 +1562,9 @@ TEST_F(TieredBackendTest, TierMetricRegistrationAndKeyCount) {
     const std::string label = "tier_" + std::to_string(views[0].id.first) +
                               "_" + std::to_string(views[0].id.second);
     std::array<std::string, 1> label_array = {label};
-    EXPECT_EQ(tier_metric.capacity_bytes.value(label_array),
+    EXPECT_EQ(tier_metric->capacity_bytes.value(label_array),
               static_cast<int64_t>(views[0].capacity));
-    EXPECT_EQ(tier_metric.key_count.value(label_array), 0);
+    EXPECT_EQ(tier_metric->key_count.value(label_array), 0);
 
     // Commit adds the key to the tier's count.
     auto test_buffer = CreateTestBuffer(SMALL_DATA_SIZE);
@@ -1572,12 +1572,12 @@ TEST_F(TieredBackendTest, TierMetricRegistrationAndKeyCount) {
         AllocateAndWrite(backend, SMALL_DATA_SIZE, test_buffer.get());
     ASSERT_TRUE(handle_result.has_value());
     ASSERT_TRUE(backend.Commit("key1", handle_result.value()).has_value());
-    EXPECT_EQ(tier_metric.key_count.value(label_array), 1);
+    EXPECT_EQ(tier_metric->key_count.value(label_array), 1);
 
     // A metrics read refreshes usage from the tier.
     std::string serialized;
-    tier_metric.serialize(serialized);
-    EXPECT_GE(tier_metric.used_bytes.value(label_array),
+    tier_metric->serialize(serialized);
+    EXPECT_GE(tier_metric->used_bytes.value(label_array),
               static_cast<int64_t>(SMALL_DATA_SIZE));
 
     // Re-committing the same key on the same tier replaces the replica and
@@ -1586,11 +1586,11 @@ TEST_F(TieredBackendTest, TierMetricRegistrationAndKeyCount) {
         AllocateAndWrite(backend, SMALL_DATA_SIZE, test_buffer.get());
     ASSERT_TRUE(handle2_result.has_value());
     ASSERT_TRUE(backend.Commit("key1", handle2_result.value()).has_value());
-    EXPECT_EQ(tier_metric.key_count.value(label_array), 1);
+    EXPECT_EQ(tier_metric->key_count.value(label_array), 1);
 
     // Deleting the key removes it from the tier's count.
     ASSERT_TRUE(backend.Delete("key1").has_value());
-    EXPECT_EQ(tier_metric.key_count.value(label_array), 0);
+    EXPECT_EQ(tier_metric->key_count.value(label_array), 0);
 }
 
 // RemoveAll drains every replica and resets all per-tier key counts.
@@ -1609,13 +1609,13 @@ TEST_F(TieredBackendTest, TierMetricRemoveAllResetsKeyCount) {
     ASSERT_TRUE(parseJsonString(json_config_str, config));
 
     TieredBackend backend;
-    TierMetric tier_metric;
+    auto tier_metric = std::make_shared<TierMetric>();
     ASSERT_TRUE(backend
                     .Init(config, /*engine=*/nullptr,
                           /*add_replica_callback=*/nullptr,
                           /*remove_replica_callback=*/nullptr,
                           /*segment_sync_callback=*/nullptr,
-                          /*tier_metric=*/&tier_metric)
+                          /*tier_metric=*/tier_metric)
                     .has_value());
 
     auto views = backend.GetTierViews();
@@ -1634,12 +1634,78 @@ TEST_F(TieredBackendTest, TierMetricRemoveAllResetsKeyCount) {
     ASSERT_TRUE(handle2.has_value());
     ASSERT_TRUE(backend.Commit("key2", handle2.value()).has_value());
 
-    EXPECT_EQ(tier_metric.key_count.value(label_array), 2);
+    EXPECT_EQ(tier_metric->key_count.value(label_array), 2);
 
     auto removed = backend.RemoveAll();
     ASSERT_TRUE(removed.has_value());
     EXPECT_EQ(removed.value(), 2);
-    EXPECT_EQ(tier_metric.key_count.value(label_array), 0);
+    EXPECT_EQ(tier_metric->key_count.value(label_array), 0);
+}
+
+// Storage-tier capacity self-eviction (bucket eviction triggered inside
+// StorageTier::Allocate) also counts toward evicted_keys.
+TEST_F(TieredBackendTest, TierMetricCountsStorageSelfEviction) {
+    namespace fs = std::filesystem;
+    const std::string storage_path = "/tmp/mooncake_test_metric_eviction";
+    fs::remove_all(storage_path);
+    fs::create_directories(storage_path);
+    setenv("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+           "bucket_storage_backend", 1);
+    setenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", storage_path.c_str(), 1);
+
+    std::string json_config_str = R"({
+        "tiers": [
+            {
+                "type": "STORAGE",
+                "capacity": 20480,
+                "priority": 5,
+                "tags": ["ssd"]
+            }
+        ]
+    })";
+    Json::Value config;
+    ASSERT_TRUE(parseJsonString(json_config_str, config));
+
+    auto tier_metric = std::make_shared<TierMetric>();
+    TieredBackend backend;
+    ASSERT_TRUE(backend.Init(config, /*engine=*/nullptr,
+                             /*add_replica_callback=*/nullptr,
+                             /*remove_replica_callback=*/nullptr,
+                             /*segment_sync_callback=*/nullptr, tier_metric)
+                    .has_value());
+
+    auto views = backend.GetTierViews();
+    ASSERT_EQ(views.size(), 1u);
+    std::array<std::string, 1> label_array = {views[0].GetName()};
+
+    // Fill the 20KB tier with twenty committed 1KB keys.
+    for (int i = 0; i < 20; ++i) {
+        auto test_buffer = CreateTestBuffer(1024);
+        auto handle_result =
+            AllocateAndWrite(backend, 1024, test_buffer.get());
+        ASSERT_TRUE(handle_result.has_value());
+        const std::string key = "key_" + std::to_string(i);
+        ASSERT_TRUE(backend.Commit(key, handle_result.value()).has_value());
+    }
+    ASSERT_EQ(tier_metric->key_count.value(label_array), 20);
+
+    // Persist committed data into buckets so self-eviction has victims.
+    auto tier = backend.GetTier(views[0].id);
+    ASSERT_NE(tier, nullptr);
+    ASSERT_TRUE(const_cast<CacheTier*>(tier)->Flush().has_value());
+
+    // Exceeds capacity -> StorageTier::Allocate triggers bucket eviction.
+    auto alloc_result = backend.Allocate(5 * 1024);
+    ASSERT_TRUE(alloc_result.has_value())
+        << "Should succeed after automatic eviction";
+
+    EXPECT_GE(tier_metric->evicted_keys.value(label_array), 1);
+    // Every evicted key leaves the tier key count exactly once.
+    EXPECT_EQ(tier_metric->key_count.value(label_array) +
+                  tier_metric->evicted_keys.value(label_array),
+              20);
+
+    fs::remove_all(storage_path);
 }
 
 }  // namespace mooncake
