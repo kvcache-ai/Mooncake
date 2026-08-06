@@ -232,6 +232,10 @@ setup_runtime_loader_env() {
   export MOONCAKE_UPSTREAM_BUILD_DIR="${build_dir}"
   if [[ -z "${MOONCAKE_UPSTREAM_DIR:-}" && -d "${REPO_ROOT}/third_party/Mooncake" ]]; then
     export MOONCAKE_UPSTREAM_DIR="${REPO_ROOT}/third_party/Mooncake"
+  elif [[ -z "${MOONCAKE_UPSTREAM_DIR:-}" && -d "${REPO_ROOT}/../../mooncake-transfer-engine" ]]; then
+    # monorepo layout: upstream is the enclosing repository
+    MOONCAKE_UPSTREAM_DIR=$(cd "${REPO_ROOT}/../.." && pwd)
+    export MOONCAKE_UPSTREAM_DIR
   fi
 
   mc_scripts_prepend_env_path \
@@ -347,6 +351,10 @@ else
   echo "==> building standalone mooncake-store-client/admin binaries"
   if [[ -z "${MOONCAKE_UPSTREAM_DIR:-}" && -d "${REPO_ROOT}/third_party/Mooncake" ]]; then
     export MOONCAKE_UPSTREAM_DIR="${REPO_ROOT}/third_party/Mooncake"
+  elif [[ -z "${MOONCAKE_UPSTREAM_DIR:-}" && -d "${REPO_ROOT}/../../mooncake-transfer-engine" ]]; then
+    # monorepo layout: upstream is the enclosing repository
+    MOONCAKE_UPSTREAM_DIR=$(cd "${REPO_ROOT}/../.." && pwd)
+    export MOONCAKE_UPSTREAM_DIR
   fi
   cargo build -p mooncake-store-py
 fi

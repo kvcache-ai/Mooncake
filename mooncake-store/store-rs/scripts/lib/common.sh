@@ -45,6 +45,13 @@ mc_scripts_list_upstream_dirs() {
   fi
   printf '%s\n' "${repo_root}/third_party/Mooncake"
 
+  # Inside the Mooncake monorepo the upstream tree is the enclosing repository
+  # rather than a submodule; identify it by its transfer-engine module so this
+  # does not latch onto an unrelated parent directory.
+  if [[ -d "${repo_root}/../../mooncake-transfer-engine" ]]; then
+    (cd "${repo_root}/../.." && pwd)
+  fi
+
   if primary_worktree=$(git -C "${repo_root}" worktree list --porcelain 2>/dev/null | awk '/^worktree / { print substr($0, 10); exit }'); then
     if [[ -n "${primary_worktree}" && "${primary_worktree}" != "${repo_root}" ]]; then
       printf '%s\n' "${primary_worktree}/third_party/Mooncake"

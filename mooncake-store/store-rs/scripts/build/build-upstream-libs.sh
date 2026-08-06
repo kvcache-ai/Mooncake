@@ -21,6 +21,14 @@ REPO_ROOT=$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)
 
 PYTHON_BIN=${PYTHON:-python3}
 UPSTREAM_DIR=${MOONCAKE_UPSTREAM_DIR:-"${REPO_ROOT}/third_party/Mooncake"}
+# Inside the Mooncake monorepo the upstream tree is the enclosing repository
+# rather than a submodule. Both arms are guarded on a transfer-engine
+# directory, so an uninitialised submodule keeps the submodule path and
+# fails with that name rather than silently pointing somewhere unrelated.
+if [ ! -d "${UPSTREAM_DIR}/mooncake-transfer-engine" ] \
+  && [ -d "${REPO_ROOT}/../../mooncake-transfer-engine" ]; then
+  UPSTREAM_DIR=$(cd "${REPO_ROOT}/../.." && pwd)
+fi
 UPSTREAM_BUILD_DIR=${MOONCAKE_UPSTREAM_BUILD_DIR:-"${UPSTREAM_DIR}/build-wheel-compat"}
 YALANTINGLIBS_PREFIX=${YALANTINGLIBS_PREFIX:-"${UPSTREAM_BUILD_DIR}/yalantinglibs-install"}
 BUILD_JOBS=${BUILD_JOBS:-$(command -v nproc >/dev/null 2>&1 && nproc || getconf _NPROCESSORS_ONLN || echo 8)}
