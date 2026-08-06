@@ -76,9 +76,6 @@ class TcpTransport : public Transport {
     Status submitTransferTask(
         const std::vector<TransferTask *> &task_list) override;
 
-    Status submitTransferTaskGroup(
-        const std::vector<TransferTask *> &task_list) override;
-
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus &status) override;
 
