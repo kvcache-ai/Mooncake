@@ -512,7 +512,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
             LOG(ERROR) << "[EP IBGDA] cudaMalloc failed for DMA-BUF control "
                           "region size="
                        << size << ": " << cudaGetErrorString(cuda_error);
-            errno = cuda_error == cudaErrorMemoryAllocation ? ENOMEM : EIO;
+            errno = EIO;
             return -1;
         }
 
