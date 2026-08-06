@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 try:
-    from mooncake.store import BufferPool
+    from .store import BufferPool
 except (ImportError, AttributeError):
     BufferPool = None  # type: ignore[assignment]
 

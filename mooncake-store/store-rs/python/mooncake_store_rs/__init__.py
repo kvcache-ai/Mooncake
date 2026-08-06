@@ -1,9 +1,5 @@
 from __future__ import annotations
 
-import importlib.util
-import pathlib
-import sys
-
 _STORE_EXPORTS = {
     "MooncakeDistributedStore",
     "MooncakeHostMemAllocator",
@@ -22,8 +18,8 @@ _BUILD_EXPORTS = {
     "__build_time__",
 }
 
-__edition__ = "pro"
-__version__ = "1.0.0+pro.1"
+__edition__ = "rs"
+__version__ = "0.1.0"
 
 __all__ = sorted(
     _STORE_EXPORTS
@@ -33,26 +29,6 @@ __all__ = sorted(
         "__version__",
     }
 )
-
-
-def _load_store_rs_module_alias():
-    name = f"{__name__}.store"
-    existing = sys.modules.get(name)
-    if (
-        existing is not None
-        and pathlib.Path(getattr(existing, "__file__", "")).suffix == ".py"
-    ):
-        return existing
-
-    store_py = pathlib.Path(__file__).with_name("store.py")
-    spec = importlib.util.spec_from_file_location(name, store_py)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"cannot load {name} from {store_py}")
-
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    spec.loader.exec_module(module)
-    return module
 
 
 def _load_build_exports() -> None:
@@ -67,8 +43,9 @@ def _load_build_exports() -> None:
 
 def __getattr__(name: str):
     if name in _STORE_EXPORTS:
-        store_module = _load_store_rs_module_alias()
-        return getattr(store_module, name)
+        from . import store
+
+        return getattr(store, name)
     if name in _BUILD_EXPORTS:
         _load_build_exports()
         return globals()[name]

@@ -3,9 +3,9 @@ requires = ["maturin>=1.7,<2"]
 build-backend = "maturin"
 
 [project]
-name = "mooncake"
-version = "1.0.0+pro.1"
-description = "Mooncake Pro distribution with Rust store and upstream transfer engine compatibility"
+name = "mooncake-store-rs"
+version = "0.1.0"
+description = "Masterless Rust implementation of the Mooncake Store, with an opt-in drop-in for the mooncake.store API"
 readme = "README.md"
 requires-python = ">=3.8"
 license = { text = "Apache-2.0" }
@@ -38,16 +38,17 @@ dev = [
 ]
 
 [project.scripts]
-transfer_engine_bench = "mooncake.cli:main"
-mooncake-store-client = "mooncake.cli:main"
-mooncake-store-admin = "mooncake.cli:main"
-mooncake-store-bench = "mooncake.cli:main"
-mooncake_http_metadata_server = "mooncake.http_metadata_server:main"
-mc_store_rest_server = "mooncake.mooncake_store_service:main"
-transfer_engine_topology_dump = "mooncake.transfer_engine_topology_dump:main"
+# Only store-rs-specific entry points live here. The upstream
+# `mooncake-transfer-engine` wheel owns `transfer_engine_bench`,
+# `mooncake_http_metadata_server`, `mc_store_rest_server`,
+# `transfer_engine_topology_dump`, `mooncake_master` and `mooncake_client`;
+# redeclaring any of those would have the last-installed wheel silently win.
+mooncake-store-client = "mooncake_store_rs.cli:main"
+mooncake-store-admin = "mooncake_store_rs.cli:main"
+mooncake-store-bench = "mooncake_store_rs.cli:main"
 
 [tool.maturin]
 manifest-path = "crates/mooncake-store-py/Cargo.toml"
 python-source = "python"
-module-name = "mooncake._store_rs"
+module-name = "mooncake_store_rs._store_rs"
 bindings = "pyo3"

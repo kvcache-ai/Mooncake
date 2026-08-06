@@ -272,9 +272,6 @@ PIP_INDEX=${PIP_INDEX_URL:-"https://mirrors.aliyun.com/pypi/simple/"}
 if ! "${VENV_PYTHON}" -m pip show maturin >/dev/null 2>&1; then
   "${VENV_PYTHON}" -m pip install -i "${PIP_INDEX}" "maturin>=1.7,<2"
 fi
-if ! "${VENV_PYTHON}" -m pip show build >/dev/null 2>&1; then
-  "${VENV_PYTHON}" -m pip install -i "${PIP_INDEX}" "build>=1.2,<2"
-fi
 if ! "${VENV_PYTHON}" -m pip show auditwheel >/dev/null 2>&1; then
   "${VENV_PYTHON}" -m pip install -i "${PIP_INDEX}" "auditwheel>=6,<7"
 fi
@@ -746,40 +743,10 @@ _CLI_LIBPYTHON_START=$(_timer_start)
 restore_cli_libpython_dependency "${LATEST_WHEEL}"
 _timer_elapsed $_CLI_LIBPYTHON_START "restore CLI libpython dependency"
 
-readarray -t VERSION_INFO < <("${VENV_PYTHON}" - <<'PY' "${REPO_ROOT}/pyproject.toml"
-import pathlib
-import sys
-try:
-    import tomllib
-except ModuleNotFoundError:
-    import tomli as tomllib
-
-pyproject = pathlib.Path(sys.argv[1])
-data = tomllib.loads(pyproject.read_text())
-core_version = data["project"]["version"]
-meta_version = core_version.split("+", 1)[0]
-print(core_version)
-print(meta_version)
-PY
-)
-MOONCAKE_CORE_VERSION=${VERSION_INFO[0]}
-MOONCAKE_META_VERSION=${VERSION_INFO[1]}
-
-env \
-  MOONCAKE_CORE_VERSION="${MOONCAKE_CORE_VERSION}" \
-  MOONCAKE_META_VERSION="${MOONCAKE_META_VERSION}" \
-  "${VENV_PYTHON}" -m build \
-  --wheel \
-  --outdir "${WHEEL_DIR}" \
-  "${REPO_ROOT}/packages/mooncake-pro"
-
-LATEST_META_WHEEL=$(ls -1t "${WHEEL_DIR}"/mooncake-*.whl 2>/dev/null | head -n 1 || true)
-
 _timer_elapsed $_WHEEL_GLOBAL_START "TOTAL build-wheel.sh"
 
 cat <<EOF
 wheel:  ${LATEST_WHEEL}
-meta:   ${LATEST_META_WHEEL}
 client: ${BIN_DIR}/mooncake-store-client
 admin:  ${BIN_DIR}/mooncake-store-admin
 bench:  ${BIN_DIR}/mooncake-store-bench

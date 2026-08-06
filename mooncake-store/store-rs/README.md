@@ -587,11 +587,11 @@ To package the Python module and the standalone client command together:
 ./scripts/build/build-wheel.sh
 python3 -m venv .venv-wheel-test
 . .venv-wheel-test/bin/activate
-pip install --find-links dist/wheels dist/wheels/mooncake_pro-*.whl
+pip install --find-links dist/wheels dist/wheels/mooncake_store_rs-*.whl
 mooncake-store-client --help
 mooncake-store-client -v
-python -c "import mooncake; print(mooncake.__version__, mooncake.__edition__)"
-python -c "import mooncake; print(mooncake.__build_info__)"
+python -c "import mooncake_store_rs as m; print(m.__version__, m.__edition__)"
+python -c "import mooncake_store_rs as m; print(m.__build_info__)"
 ```
 
 If the host OS is missing build dependencies, use the Ubuntu Docker wrapper:
@@ -604,12 +604,20 @@ The Docker wrapper produces the same `dist/wheels/` and `dist/bin/` outputs and
 defaults to CN mirrors for rustup, cargo, and pip. Set `CN_MIRROR=0` to force
 the upstream endpoints.
 
-This packaging flow now produces two wheels:
+This packaging flow produces a single wheel, `mooncake_store_rs-*.whl`, imported
+as `mooncake_store_rs`.
 
-- `mooncake-*.whl` is the real compatibility runtime package imported as `mooncake`
-- `mooncake_pro-*.whl` is the user-facing Pro metapackage and the recommended install target
+It owns its own top-level name, so it installs alongside the upstream
+`mooncake-transfer-engine` wheel without either overwriting the other's files.
+Code that expects the upstream import path keeps working by opting in:
 
-Installing `mooncake-pro` upgrades an existing `mooncake` installation to the matching Pro runtime without requiring `--force-reinstall`.
+```bash
+export MOONCAKE_STORE_BACKEND=rs   # `from mooncake.store import ...` now resolves here
+python -m mooncake_store_rs.doctor # report which backend is active
+```
+
+See `docs/python.md` for how the redirect works and why the variable has to be
+exported before the interpreter starts.
 
 ### Run the HiCache compatibility checks
 
@@ -880,8 +888,7 @@ PYTHON_VERSION=3.12 ./scripts/build/build-wheel-ubuntu-docker.sh
 
 The default output layout is:
 
-- `dist/wheels/mooncake-*.whl` for the real runtime package
-- `dist/wheels/mooncake_pro-*.whl` for the user-facing Pro metapackage
+- `dist/wheels/mooncake_store_rs-*.whl` for the runtime package
 - `dist/bin/mooncake-store-client` for the standalone client runtime
 - `dist/bin/mooncake-store-bench` for the standalone benchmark / verify / soak runtime
 
@@ -890,22 +897,25 @@ Recommended installation flow:
 ```bash
 python3 -m venv .venv-wheel-test
 . .venv-wheel-test/bin/activate
-pip install --find-links dist/wheels dist/wheels/mooncake_pro-*.whl
-python -c "import mooncake; print(mooncake.__version__, mooncake.__edition__)"
-python -c "import mooncake; print(mooncake.__build_info__)"
+pip install --find-links dist/wheels dist/wheels/mooncake_store_rs-*.whl
+python -c "import mooncake_store_rs as m; print(m.__version__, m.__edition__)"
+python -c "import mooncake_store_rs as m; print(m.__build_info__)"
 mooncake-store-client --version
 mooncake-store-client -v
 mooncake-store-bench --help
 ```
 
-For local wheelhouse installs, `scripts/build/install-pro-wheel.sh` wraps the same flow.
+For local wheelhouse installs, `scripts/build/install-wheel.sh` wraps the same flow.
 
 Packaging model:
 
-- users install `mooncake-pro`
-- Python code and integrations still import `mooncake`
-- the `mooncake-pro` wheel pins a matching `mooncake==...+pro...` runtime version
-- this keeps the import path compatible while making the installed product identity obvious in `pip list`
+- users install `mooncake-store-rs`, which imports as `mooncake_store_rs`
+- the upstream `mooncake-transfer-engine` wheel can be installed at the same
+  time; the two share no files, so neither needs uninstalling first
+- integrations written against `from mooncake.store import ...` work unchanged
+  once `MOONCAKE_STORE_BACKEND=rs` is exported, which redirects that import here
+- without that variable the upstream implementation stays in charge, so
+  installing this wheel does not change existing behaviour
 
 ```python
 from mooncake.store import MooncakeDistributedStore, ReplicateConfig

@@ -7,7 +7,17 @@ import subprocess
 import sys
 import tempfile
 
-_WHEEL_LIB_DIRS = ("mooncake.libs", "mooncake_store_rs.libs")
+# Directories that follow auditwheel's vendoring layout, where libraries carry
+# a `libfoo-<hash>.so` suffix. The upstream `mooncake-transfer-engine` wheel is
+# listed too: when it is co-installed its vendored transfer-engine libraries are
+# usable, so they are worth probing.
+_VENDORED_LIB_DIRS = ("mooncake_store_rs.libs", "mooncake.libs")
+
+# Only *this* package's vendored directory means "auditwheel already wired up
+# our libraries via RPATH, so preloading is unnecessary". Checking the upstream
+# directory here would suppress our own preload the moment the upstream wheel is
+# installed alongside us -- the co-installation this package is built for.
+_OWN_VENDORED_LIB_DIRS = ("mooncake_store_rs.libs",)
 _NATIVE_LIBRARIES = (
     "libasio.so",
     "libtransfer_engine.so",
@@ -21,6 +31,19 @@ _NATIVE_LIBRARY_ENV_VARS = {
     "libmooncake_classic_shim.so": "MOONCAKE_CLASSIC_SHIM_LIB_PATH",
     "libmooncake_tent_shim.so": "MOONCAKE_TENT_SHIM_LIB_PATH",
 }
+
+# Build directories an upstream Mooncake checkout may have been configured into,
+# and the artefact locations within each.
+_UPSTREAM_BUILD_DIRS = ("build", "build-rust", "build-wheel-compat")
+_UPSTREAM_LIB_SUBDIRS = (
+    ("mooncake-asio",),
+    ("mooncake-transfer-engine", "src"),
+    ("mooncake-transfer-engine", "tent", "src"),
+)
+_UPSTREAM_BIN_SUBDIRS = (
+    ("mooncake-store", "src"),
+    ("mooncake-transfer-engine", "example"),
+)
 
 
 def package_dir() -> pathlib.Path:
@@ -46,84 +69,75 @@ def safe_resolve(path: pathlib.Path) -> pathlib.Path | None:
         return None
 
 
+def source_tree_root(package_root: pathlib.Path | None = None) -> pathlib.Path | None:
+    """The checkout this package was imported from, or None when installed.
+
+    `repo_root` answers unconditionally, which for a wheel install points at
+    whatever happens to sit two levels above ``site-packages``. Build-tree
+    lookups must not follow it there, so they ask this instead.
+    """
+    candidate = repo_root(package_root)
+    if (candidate / "Cargo.toml").is_file() and (candidate / "crates").is_dir():
+        return candidate
+    return None
+
+
+def upstream_roots(package_root: pathlib.Path | None = None) -> list[pathlib.Path]:
+    """Checkouts of upstream Mooncake that may hold built artefacts.
+
+    Both supported layouts are probed without configuration: a standalone
+    checkout vendors upstream at ``third_party/Mooncake``, while inside the
+    Mooncake monorepo the upstream tree *is* an ancestor directory. A candidate
+    only counts if it actually looks like Mooncake, which keeps walking upwards
+    from finding false positives.
+    """
+    candidates: list[pathlib.Path] = []
+
+    configured = os.environ.get("MOONCAKE_UPSTREAM_DIR")
+    if configured:
+        candidates.append(pathlib.Path(configured).expanduser())
+
+    source_root = source_tree_root(package_root)
+    if source_root is not None:
+        candidates.append(source_root / "third_party" / "Mooncake")
+        candidates.extend(source_root.parents[:3])
+
+    return [
+        candidate
+        for candidate in candidates
+        if (candidate / "mooncake-transfer-engine").is_dir()
+    ]
+
+
 def library_dirs(package_root: pathlib.Path | None = None) -> list[pathlib.Path]:
     root = package_root if package_root is not None else package_dir()
-    repository = repo_root(root)
-    env_candidates: list[pathlib.Path] = []
-    upstream_build = os.environ.get("MOONCAKE_UPSTREAM_BUILD_DIR")
-    if upstream_build:
-        build_root = pathlib.Path(upstream_build).expanduser()
-        if build_root.exists():
-            env_candidates.extend(
-                [
-                    build_root / "mooncake-asio",
-                    build_root / "mooncake-transfer-engine" / "src",
-                    build_root / "mooncake-transfer-engine" / "tent" / "src",
-                ]
+    candidates: list[pathlib.Path] = []
+
+    configured_build = os.environ.get("MOONCAKE_UPSTREAM_BUILD_DIR")
+    if configured_build:
+        build_root = pathlib.Path(configured_build).expanduser()
+        candidates.extend(
+            build_root.joinpath(*parts) for parts in _UPSTREAM_LIB_SUBDIRS
+        )
+
+    candidates.extend(
+        [
+            root,
+            root / "lib",
+            # Our own vendored copy first: a co-installed upstream wheel pins
+            # its own transfer-engine build, which need not match ours.
+            root.parent / "mooncake_store_rs.libs",
+            root.parent / "mooncake.libs",
+        ]
+    )
+
+    for upstream in upstream_roots(root):
+        for build_dir in _UPSTREAM_BUILD_DIRS:
+            candidates.extend(
+                (upstream / build_dir).joinpath(*parts)
+                for parts in _UPSTREAM_LIB_SUBDIRS
             )
-    upstream_root = os.environ.get("MOONCAKE_UPSTREAM_DIR")
-    if upstream_root:
-        root_path = pathlib.Path(upstream_root).expanduser()
-        if root_path.exists():
-            env_candidates.extend(
-                [
-                    root_path / "build-wheel-compat" / "mooncake-asio",
-                    root_path
-                    / "build-wheel-compat"
-                    / "mooncake-transfer-engine"
-                    / "src",
-                    root_path
-                    / "build-wheel-compat"
-                    / "mooncake-transfer-engine"
-                    / "tent"
-                    / "src",
-                    root_path / "build-rust" / "mooncake-asio",
-                    root_path / "build-rust" / "mooncake-transfer-engine" / "src",
-                    root_path
-                    / "build-rust"
-                    / "mooncake-transfer-engine"
-                    / "tent"
-                    / "src",
-                ]
-            )
-    candidates = env_candidates + [
-        root,
-        root / "lib",
-        root.parent / "mooncake.libs",
-        root.parent / "mooncake_store_rs.libs",
-        repository / "third_party" / "Mooncake" / "build-rust" / "mooncake-asio",
-        repository
-        / "third_party"
-        / "Mooncake"
-        / "build-rust"
-        / "mooncake-transfer-engine"
-        / "src",
-        repository
-        / "third_party"
-        / "Mooncake"
-        / "build-rust"
-        / "mooncake-transfer-engine"
-        / "tent"
-        / "src",
-        repository
-        / "third_party"
-        / "Mooncake"
-        / "build-wheel-compat"
-        / "mooncake-asio",
-        repository
-        / "third_party"
-        / "Mooncake"
-        / "build-wheel-compat"
-        / "mooncake-transfer-engine"
-        / "src",
-        repository
-        / "third_party"
-        / "Mooncake"
-        / "build-wheel-compat"
-        / "mooncake-transfer-engine"
-        / "tent"
-        / "src",
-    ]
+
     resolved: list[pathlib.Path] = []
     seen: set[pathlib.Path] = set()
     for candidate in candidates:
@@ -160,7 +174,7 @@ def native_library_candidates(
                     continue
         candidate_path: pathlib.Path | None = None
         for library_dir in library_dirs(package_root):
-            if library_dir.name in _WHEEL_LIB_DIRS:
+            if library_dir.name in _VENDORED_LIB_DIRS:
                 candidate = hashed_library(library_dir, library_name[:-3])
             else:
                 candidate = library_dir / library_name
@@ -178,7 +192,7 @@ def native_library_candidates(
 
 def preload_native_libraries(package_root: pathlib.Path | None = None) -> None:
     root = package_root if package_root is not None else package_dir()
-    if any((root.parent / name).is_dir() for name in _WHEEL_LIB_DIRS):
+    if any((root.parent / name).is_dir() for name in _OWN_VENDORED_LIB_DIRS):
         return
     for library in native_library_candidates(package_root):
         try:
@@ -194,40 +208,20 @@ def binary_path(
     binary_name: str, package_root: pathlib.Path | None = None
 ) -> pathlib.Path:
     root = package_root if package_root is not None else package_dir()
-    repository = repo_root(root)
-    candidates = [
-        root / binary_name,
-        repository / "dist" / "bin" / binary_name,
-        repository / "target" / "release" / binary_name,
-        repository
-        / "third_party"
-        / "Mooncake"
-        / "build-wheel-compat"
-        / "mooncake-store"
-        / "src"
-        / binary_name,
-        repository
-        / "third_party"
-        / "Mooncake"
-        / "build-wheel-compat"
-        / "mooncake-transfer-engine"
-        / "example"
-        / binary_name,
-        repository
-        / "third_party"
-        / "Mooncake"
-        / "build"
-        / "mooncake-store"
-        / "src"
-        / binary_name,
-        repository
-        / "third_party"
-        / "Mooncake"
-        / "build"
-        / "mooncake-transfer-engine"
-        / "example"
-        / binary_name,
-    ]
+    candidates = [root / binary_name]
+
+    source_root = source_tree_root(root)
+    if source_root is not None:
+        candidates.append(source_root / "dist" / "bin" / binary_name)
+        candidates.append(source_root / "target" / "release" / binary_name)
+
+    for upstream in upstream_roots(root):
+        for build_dir in _UPSTREAM_BUILD_DIRS:
+            candidates.extend(
+                (upstream / build_dir).joinpath(*parts) / binary_name
+                for parts in _UPSTREAM_BIN_SUBDIRS
+            )
+
     resolved = resolve_first(candidates)
     if resolved is None:
         raise FileNotFoundError(f"cannot find packaged {binary_name} binary")
@@ -244,7 +238,7 @@ def prepare_library_env(
 
     for library_dir in library_dirs(root):
         search_paths.append(str(library_dir))
-        if library_dir.name not in _WHEEL_LIB_DIRS:
+        if library_dir.name not in _VENDORED_LIB_DIRS:
             continue
         if temp_dir is None:
             temp_dir = tempfile.TemporaryDirectory(prefix="mooncake-cli-")
@@ -278,8 +272,9 @@ def execute_packaged_binary(binary_name: str, argv: list[str]) -> int:
 
 def invoked_binary_name() -> str:
     program_name = pathlib.Path(sys.argv[0]).name
+    # Must stay in sync with [project.scripts]. `transfer_engine_bench` is
+    # deliberately absent: it belongs to the upstream wheel.
     if program_name in {
-        "transfer_engine_bench",
         "mooncake-store-client",
         "mooncake-store-admin",
         "mooncake-store-bench",

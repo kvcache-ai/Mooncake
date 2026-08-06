@@ -19,7 +19,7 @@ import warnings
 
 from ._runtime import package_dir, preload_native_libraries
 
-_logger = logging.getLogger("mooncake.store")
+_logger = logging.getLogger("mooncake_store_rs.store")
 
 
 def _load_native():
@@ -68,12 +68,12 @@ def _load_native():
 
         for candidate in candidates:
             spec = importlib.util.spec_from_file_location(
-                "mooncake._store_rs", candidate
+                "mooncake_store_rs._store_rs", candidate
             )
             if spec is None or spec.loader is None:
                 continue
             module = importlib.util.module_from_spec(spec)
-            sys.modules["mooncake._store_rs"] = module
+            sys.modules["mooncake_store_rs._store_rs"] = module
             spec.loader.exec_module(module)
             return module
 

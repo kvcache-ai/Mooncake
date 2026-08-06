@@ -401,8 +401,7 @@ the upstream endpoints instead.
 
 Default outputs:
 
-- `dist/wheels/mooncake-*.whl`
-- `dist/wheels/mooncake_pro-*.whl`
+- `dist/wheels/mooncake_store_rs-*.whl`
 - `dist/bin/mooncake-store-client`
 - `dist/bin/mooncake-store-bench`
 
@@ -411,20 +410,23 @@ Recommended installation flow:
 ```bash
 python3 -m venv .venv-wheel-test
 . .venv-wheel-test/bin/activate
-pip install --find-links dist/wheels dist/wheels/mooncake_pro-*.whl
+pip install --find-links dist/wheels dist/wheels/mooncake_store_rs-*.whl
 ```
 
 Or use the repository helper:
 
 ```bash
-./scripts/build/install-pro-wheel.sh
+./scripts/build/install-wheel.sh
 ```
 
 Operational meaning:
 
-- `mooncake-pro` is the product-facing package users install
-- `mooncake` remains the runtime compatibility package imported by Python and expected by integrations such as SGLang
-- installing `mooncake-pro` upgrades an existing `mooncake` install to the matching Pro runtime without `--force-reinstall`
+- `mooncake-store-rs` is the package users install; it imports as `mooncake_store_rs`
+- it co-installs with the upstream `mooncake-transfer-engine` wheel, so switching
+  a host between the two implementations does not require uninstalling either
+- integrations that import `mooncake.store`, such as SGLang, are redirected here
+  by exporting `MOONCAKE_STORE_BACKEND=rs` before the process starts; see
+  `docs/python.md`
 
 ## Deployment Roles
 

@@ -25,11 +25,11 @@ WHEEL_DIR=${WHEEL_DIR:-"${REPO_ROOT}/dist/wheels"}
 WHEEL_PATH=${1:-}
 
 if [[ -z "${WHEEL_PATH}" ]]; then
-  WHEEL_PATH=$(ls -1t "${WHEEL_DIR}"/mooncake-*.whl 2>/dev/null | head -n 1 || true)
+  WHEEL_PATH=$(ls -1t "${WHEEL_DIR}"/mooncake_store_rs-*.whl 2>/dev/null | head -n 1 || true)
 fi
 
 if [[ -z "${WHEEL_PATH}" || ! -f "${WHEEL_PATH}" ]]; then
-  echo "cannot find mooncake-pro wheel; run scripts/build/build-wheel.sh first" >&2
+  echo "cannot find mooncake-store-rs wheel; run scripts/build/build-wheel.sh first" >&2
   exit 1
 fi
 
@@ -42,9 +42,9 @@ PIP_INDEX=${PIP_INDEX_URL:-"https://mirrors.aliyun.com/pypi/simple/"}
 # Install in two steps to avoid --force-reinstall uninstalling and
 # re-downloading all transitive dependencies (aiohttp, requests, etc.):
 #
-# Step 1: Force-reinstall only the mooncake wheel itself (--no-deps),
+# Step 1: Force-reinstall only the mooncake-store-rs wheel itself (--no-deps),
 #         ensuring the latest CI-built wheel replaces any cached version
-#         with the same version number (e.g. 1.0.0+pro.1).
+#         carrying the same version number.
 #
 # Step 2: Install the wheel again without --force-reinstall to let pip
 #         resolve and install any missing dependencies.  Already-installed

@@ -1,79 +1,32 @@
 from __future__ import annotations
 
-import importlib.util
-import pathlib
+import importlib
 import sys
 import types
 import unittest
 
-
-def _load_store_module():
-    repo_root = pathlib.Path(__file__).resolve().parents[2]
-    package_dir = repo_root / "python" / "mooncake"
-
-    fake_package = types.ModuleType("mooncake")
-    fake_package.__path__ = [str(package_dir)]
-    sys.modules["mooncake"] = fake_package
-
-    fake_runtime = types.ModuleType("mooncake._runtime")
-    fake_runtime.package_dir = lambda: package_dir
-    fake_runtime.preload_native_libraries = lambda root: None
-    sys.modules["mooncake._runtime"] = fake_runtime
-
-    fake_native = types.ModuleType("mooncake._store_rs")
-    sys.modules["mooncake._store_rs"] = fake_native
-
-    spec = importlib.util.spec_from_file_location(
-        "mooncake.store",
-        package_dir / "store.py",
-    )
-    if spec is None or spec.loader is None:
-        raise RuntimeError("failed to create mooncake.store module spec")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["mooncake.store"] = module
-    spec.loader.exec_module(module)
-    return module
+_NATIVE = "mooncake_store_rs._store_rs"
 
 
-def _load_package_with_stale_native_store():
-    repo_root = pathlib.Path(__file__).resolve().parents[2]
-    package_dir = repo_root / "python" / "mooncake"
-
+def _purge() -> None:
     for name in list(sys.modules):
-        if name == "mooncake" or name.startswith("mooncake."):
+        if name == "mooncake_store_rs" or name.startswith("mooncake_store_rs."):
             del sys.modules[name]
 
-    fake_build_info = types.ModuleType("mooncake._build_info")
-    fake_build_info.BUILD_INFO = {
-        "branch": "test",
-        "commit": "test",
-        "build_time": "test",
-    }
-    sys.modules["mooncake._build_info"] = fake_build_info
 
-    fake_runtime = types.ModuleType("mooncake._runtime")
-    fake_runtime.package_dir = lambda: package_dir
-    fake_runtime.preload_native_libraries = lambda root: None
-    sys.modules["mooncake._runtime"] = fake_runtime
+def _load_store_module():
+    """Import `mooncake_store_rs.store` without a built native extension.
 
-    fake_native = types.ModuleType("mooncake._store_rs")
-    sys.modules["mooncake._store_rs"] = fake_native
+    Seeding `sys.modules` is enough: `_load_native` reaches the extension via
+    `from . import _store_rs`, which resolves out of `sys.modules` first.
+    """
+    _purge()
 
-    stale_store = types.ModuleType("mooncake.store")
-    stale_store.__file__ = "/tmp/store.cpython-312-x86_64-linux-gnu.so"
-    sys.modules["mooncake.store"] = stale_store
+    runtime = importlib.import_module("mooncake_store_rs._runtime")
+    runtime.preload_native_libraries = lambda package_root=None: None
 
-    spec = importlib.util.spec_from_file_location(
-        "mooncake",
-        package_dir / "__init__.py",
-        submodule_search_locations=[str(package_dir)],
-    )
-    if spec is None or spec.loader is None:
-        raise RuntimeError("failed to create mooncake package spec")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules["mooncake"] = module
-    spec.loader.exec_module(module)
-    return module, sys.modules["mooncake.store"]
+    sys.modules[_NATIVE] = types.ModuleType(_NATIVE)
+    return importlib.import_module("mooncake_store_rs.store")
 
 
 STORE_MODULE = _load_store_module()
@@ -84,47 +37,14 @@ class StoreAliasTests(unittest.TestCase):
     def test_store_import_tolerates_native_without_buffer_pool(self) -> None:
         self.assertIsNone(STORE_MODULE.BufferPool)
 
-    def test_package_import_does_not_eagerly_load_store_rs_native(
-        self,
-    ) -> None:
-        for name in list(sys.modules):
-            if name == "mooncake" or name.startswith("mooncake."):
-                del sys.modules[name]
+    def test_package_import_does_not_eagerly_load_store_rs_native(self) -> None:
+        _purge()
 
-        repo_root = pathlib.Path(__file__).resolve().parents[2]
-        package_dir = repo_root / "python" / "mooncake"
-        fake_build_info = types.ModuleType("mooncake._build_info")
-        fake_build_info.BUILD_INFO = {
-            "branch": "test",
-            "commit": "test",
-            "build_time": "test",
-        }
-        sys.modules["mooncake._build_info"] = fake_build_info
+        importlib.import_module("mooncake_store_rs")
 
-        spec = importlib.util.spec_from_file_location(
-            "mooncake",
-            package_dir / "__init__.py",
-            submodule_search_locations=[str(package_dir)],
-        )
-        if spec is None or spec.loader is None:
-            raise RuntimeError("failed to create mooncake package spec")
-        module = importlib.util.module_from_spec(spec)
-        sys.modules["mooncake"] = module
-        spec.loader.exec_module(module)
-
-        self.assertNotIn("mooncake.store", sys.modules)
-        self.assertNotIn("mooncake._runtime", sys.modules)
-        self.assertNotIn("mooncake._store_rs", sys.modules)
-
-    def test_store_export_prefers_store_rs_python_module_over_stale_native_store(
-        self,
-    ) -> None:
-        package_module, _ = _load_package_with_stale_native_store()
-        store_type = package_module.MooncakeDistributedStore
-        store_module = sys.modules["mooncake.store"]
-
-        self.assertEqual(pathlib.Path(store_module.__file__).name, "store.py")
-        self.assertIs(store_type, store_module.MooncakeDistributedStore)
+        self.assertNotIn("mooncake_store_rs.store", sys.modules)
+        self.assertNotIn("mooncake_store_rs._runtime", sys.modules)
+        self.assertNotIn(_NATIVE, sys.modules)
 
     def test_put_batch_delegates_to_batch_put(self) -> None:
         store = object.__new__(MooncakeDistributedStore)
