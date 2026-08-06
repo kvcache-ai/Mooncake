@@ -3,6 +3,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT_DIR="$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)"
+# store-rs is a subdirectory when it lives inside the Mooncake monorepo,
+# where the git toplevel is the enclosing repository rather than this tree.
+[ -f "${ROOT_DIR}/Cargo.toml" ] || ROOT_DIR="${ROOT_DIR}/mooncake-store/store-rs"
 # shellcheck disable=SC1091
 source "${ROOT_DIR}/scripts/lib/common.sh"
 REDIS_PORT="${MC_STORE_RS_REDIS_PORT:-6380}"

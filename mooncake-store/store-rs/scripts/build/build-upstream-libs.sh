@@ -15,6 +15,9 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)
+# store-rs is a subdirectory when it lives inside the Mooncake monorepo,
+# where the git toplevel is the enclosing repository rather than this tree.
+[ -f "${REPO_ROOT}/Cargo.toml" ] || REPO_ROOT="${REPO_ROOT}/mooncake-store/store-rs"
 
 PYTHON_BIN=${PYTHON:-python3}
 UPSTREAM_DIR=${MOONCAKE_UPSTREAM_DIR:-"${REPO_ROOT}/third_party/Mooncake"}

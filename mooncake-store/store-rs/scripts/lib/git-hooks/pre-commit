@@ -10,6 +10,9 @@ set -euo pipefail
 
 HOOK_DIR=$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(git -C "${HOOK_DIR}" rev-parse --show-toplevel)
+# store-rs is a subdirectory when it lives inside the Mooncake monorepo,
+# where the git toplevel is the enclosing repository rather than this tree.
+[ -f "${REPO_ROOT}/Cargo.toml" ] || REPO_ROOT="${REPO_ROOT}/mooncake-store/store-rs"
 FORMATTER="${REPO_ROOT}/scripts/format.sh"
 
 if [[ ! -x "${FORMATTER}" ]]; then

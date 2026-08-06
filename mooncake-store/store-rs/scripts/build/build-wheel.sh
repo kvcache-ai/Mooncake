@@ -3,6 +3,9 @@ set -euo pipefail
 
 SCRIPT_DIR=$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(git -C "${SCRIPT_DIR}" rev-parse --show-toplevel)
+# store-rs is a subdirectory when it lives inside the Mooncake monorepo,
+# where the git toplevel is the enclosing repository rather than this tree.
+[ -f "${REPO_ROOT}/Cargo.toml" ] || REPO_ROOT="${REPO_ROOT}/mooncake-store/store-rs"
 
 # ── Timing helpers (only print when CI=true or TIMING=1) ──
 _WHEEL_TIMING=${TIMING:-${CI:-0}}
