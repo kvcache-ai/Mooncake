@@ -245,10 +245,16 @@ static bool isGpuDirectRdmaSupported(std::shared_ptr<Config> conf) {
     if (disable_gpu_direct) {
         return false;
     }
+    // Detect vendor GPUDirect/peer-memory drivers from /proc/modules.
+    // NVIDIA: nvidia_peermem. AMD: peermem is built into amdgpu (linked with
+    // ib_core), so the amdgpu module itself is the presence signal.
     std::ifstream modules("/proc/modules");
     std::string line;
     while (std::getline(modules, line)) {
-        if (line.find("nvidia_peermem") != std::string::npos) {
+        const auto name_end = line.find(' ');
+        const auto name =
+            name_end == std::string::npos ? line : line.substr(0, name_end);
+        if (name == "nvidia_peermem" || name == "amdgpu") {
             return true;
         }
     }
@@ -261,6 +267,32 @@ RdmaTransport::RdmaTransport()
       notify_poll_interval_us_(10) {}  // Start at 10us
 
 RdmaTransport::~RdmaTransport() { uninstall(); }
+
+size_t RdmaTransport::initializeContexts() {
+    context_set_.clear();
+    context_name_lookup_.clear();
+    // One slot per NicID: dev_id arrives as a NicID and subscripts both this
+    // and BufferDesc::lkey, so a compacted layout would name the wrong RNIC.
+    // Skipped NICs keep an inert context, which consumers reject via status().
+    context_set_.reserve(local_topology_->getNicCount());
+    size_t context_count = 0;
+    for (size_t i = 0; i < local_topology_->getNicCount(); ++i) {
+        auto entry = local_topology_->getNicEntry(i);
+        auto context = std::make_shared<RdmaContext>(*this);
+        context_set_.push_back(context);
+        if (entry->type != Topology::NIC_RDMA) continue;
+        int ret = context->construct(entry->name, params_);
+        if (ret) {
+            LOG(WARNING) << "Disable RDMA device " << entry->name << " because "
+                         << "of initialization failure";
+            continue;
+        }
+        context_name_lookup_[entry->name] = i;
+        ++context_count;
+        local_buffer_manager_.addDevice(context.get());
+    }
+    return context_count;
+}
 
 Status RdmaTransport::install(std::string& local_segment_name,
                               std::shared_ptr<ControlService> metadata,
@@ -307,22 +339,7 @@ Status RdmaTransport::install(std::string& local_segment_name,
     }
 
     local_buffer_manager_.setTopology(local_topology);
-    context_set_.clear();
-    for (size_t i = 0; i < local_topology_->getNicCount(); ++i) {
-        auto entry = local_topology_->getNicEntry(i);
-        if (entry->type != Topology::NIC_RDMA) continue;
-        auto context = std::make_shared<RdmaContext>(*this);
-        int ret = context->construct(entry->name, params_);
-        if (ret) {
-            LOG(WARNING) << "Disable RDMA device " << entry->name << " because "
-                         << "of initialization failure";
-            continue;
-        }
-        context_name_lookup_[entry->name] = context_set_.size();
-        context_set_.push_back(context);
-        local_buffer_manager_.addDevice(context.get());
-    }
-    const bool context_empty = context_set_.empty();
+    const bool context_empty = initializeContexts() == 0;
     const bool topology_empty = local_topology_->empty();
     if (context_empty || topology_empty) {
         const char* error_message = "No RDMA device initialized successfully";
@@ -496,6 +513,7 @@ Status RdmaTransport::submitTransferTasks(
             slice->length = length;
             slice->task = task;
             slice->retry_count = 0;
+            slice->last_fallback_idx = -1;
             slice->quota_charged = false;
             slice->ep_weak_ptr.reset();
             slice->word = PENDING;
@@ -698,8 +716,16 @@ std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
         return nullptr;
     }
 
-    auto context = context_set_[0].get();
-    if (context->status() != RdmaContext::DEVICE_ENABLED) {
+    // context_set_ is NicID-indexed, so slot 0 may be inert; take the first
+    // enabled context instead.
+    RdmaContext* context = nullptr;
+    for (auto& ctx : context_set_) {
+        if (ctx->status() == RdmaContext::DEVICE_ENABLED) {
+            context = ctx.get();
+            break;
+        }
+    }
+    if (!context) {
         return nullptr;
     }
     std::shared_ptr<RdmaEndPoint> endpoint;

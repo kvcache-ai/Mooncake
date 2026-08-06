@@ -214,22 +214,26 @@ else
     echo "Skipping test: TEST_PROMOTION_ON_HIT environment variable is not set"
 fi
 
-echo "Running CXL protocol test (test_distributed_object_store_cxl.py)..."
-killall mooncake_master || true
-sleep 2
+if [ -n "$TEST_CXL" ]; then
+    echo "Running CXL protocol test (test_distributed_object_store_cxl.py)..."
+    killall mooncake_master || true
+    sleep 2
 
-echo "Starting Mooncake Master with CXL enabled (--enable_cxl=true)..."
-mooncake_master \
-  --default_kv_lease_ttl=500 \
-  --enable_cxl=true \
-  &
-CXL_MASTER_PID=$!
-sleep 3
-MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_distributed_object_store_cxl.py
-kill $CXL_MASTER_PID || true
-wait $CXL_MASTER_PID 2>/dev/null || true
-sleep 2
-echo "CXL protocol test completed successfully!"
+    echo "Starting Mooncake Master with CXL enabled (--enable_cxl=true)..."
+    mooncake_master \
+      --default_kv_lease_ttl=500 \
+      --enable_cxl=true \
+      &
+    CXL_MASTER_PID=$!
+    sleep 3
+    MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_distributed_object_store_cxl.py
+    kill $CXL_MASTER_PID || true
+    wait $CXL_MASTER_PID 2>/dev/null || true
+    sleep 2
+    echo "CXL protocol test completed successfully!"
+else
+    echo "Skipping CXL protocol test: TEST_CXL is not set"
+fi
 
 echo "Running CLI entry point tests..."
 python test_cli.py

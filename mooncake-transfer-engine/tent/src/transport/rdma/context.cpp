@@ -637,7 +637,9 @@ std::string RdmaContext::gid() const {
 }
 
 RdmaCQ* RdmaContext::cq(int index) {
-    if (index < 0 || index >= params_->device.num_cq_list) return nullptr;
+    // params_ is null until construct(): an inert context has no CQs.
+    if (!params_ || index < 0 || index >= params_->device.num_cq_list)
+        return nullptr;
     return cq_list_.empty() ? nullptr : cq_list_[index];
 }
 

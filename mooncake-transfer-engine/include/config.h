@@ -33,6 +33,12 @@ enum class EndpointStoreType {
     SIEVE = 1,
 };
 
+// Which NICs the EFA transport registers a buffer on.
+enum class EfaNicSelection {
+    ALL = 0,    // every NIC, the historical behavior
+    LOCAL = 1,  // device memory only on that GPU's topology-local NICs
+};
+
 struct GlobalConfig {
     size_t num_cq_per_ctx = 1;
     size_t num_comp_channels_per_ctx = 1;
@@ -45,6 +51,12 @@ struct GlobalConfig {
     size_t num_qp_per_ep = 2;
     size_t max_sge = 4;
     size_t max_wr = 256;
+    // Set when MC_MAX_WR was given explicitly.  EFA's transmit depth is a
+    // per-device attribute (2048 on p6-b300, 4096 on p5), so with no override
+    // the EFA transport adopts the provider's depth rather than max_wr; with
+    // one it honors the operator's value, clamped to the hardware.  The RDMA
+    // transport passes max_wr to ibv_create_qp() and is unaffected.
+    bool max_wr_from_env = false;
     size_t max_inline = 64;
     ibv_mtu mtu_length = IBV_MTU_4096;
     uint16_t handshake_port = 12001;
@@ -89,6 +101,16 @@ struct GlobalConfig {
     bool log_rdma_slice_affinity = false;
     bool track_rdma_posted_slices = false;
     int parallel_reg_mr = -1;
+    // Cap on concurrent buffer registrations in registerLocalMemoryBatch().
+    // 0 (default) = unbounded, one thread per buffer. Set via
+    // MC_MAX_CONCURRENT_REG_MR; the best value is platform-specific, see the
+    // measured tables in efa_transport.cpp before choosing one.
+    size_t max_concurrent_reg_mr = 0;
+    // Which NICs a buffer is registered on in the EFA transport. ALL (default)
+    // registers every buffer on every NIC; LOCAL restricts device memory to the
+    // NICs the topology reports as closest to that GPU. Set via
+    // MC_EFA_NIC_SELECTION=all|local; see efa_transport.cpp for the trade-off.
+    EfaNicSelection efa_nic_selection = EfaNicSelection::ALL;
     size_t eic_max_block_size = 64UL * 1024 * 1024;
     EndpointStoreType endpoint_store_type = EndpointStoreType::SIEVE;
     int ib_traffic_class = -1;
@@ -107,7 +129,7 @@ struct GlobalConfig {
     // mode the setting is a no-op. Requires USE_MLX5DV.
     bool mlx5_qp_lag_port_balance = false;
     // ib_pci_relaxed_ordering_mode: 0: off, 1: on if supported, 2: auto
-    int ib_pci_relaxed_ordering_mode = 0;
+    int ib_pci_relaxed_ordering_mode = 1;
     bool ascend_use_fabric_mem = false;
     bool ascend_agent_mode = false;
     bool sunrise_use_device_mem = false;

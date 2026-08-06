@@ -94,16 +94,6 @@ def test_main(num_tokens: int, hidden: int, num_experts: int, num_topk: int,
                     assert diff < 1e-5, f'Error: {diff=}, {zero_copy=}'
                     hash_value ^= hash_tensor(combined_x)
 
-    def create_test_cast_with_outliers(num_outliers):
-        tmp = torch.randn((num_tokens, hidden), dtype=torch.bfloat16, device='cuda')
-        tmp /= tmp.abs().amax(dim=1).view(-1, 1)
-        assert tmp.abs().amax().item() <= 1
-
-        # Create some amax outliers
-        for i in range(num_outliers):
-            tmp[random.randint(0, num_tokens - 1)] *= 1e3
-        return tmp
-
     # noinspection PyShadowingNames
     def large_gemm_with_hook(hook):
         mat_0 = torch.randn((8192, 8192), dtype=torch.float)

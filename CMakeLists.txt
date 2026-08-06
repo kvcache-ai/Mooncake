@@ -102,12 +102,24 @@ endif()
 
 option(EP_USE_IDE "Enable intelligent indexing for IDEs" OFF)
 if (WITH_EP)
+  add_subdirectory(mooncake-pg)
+  include_directories(mooncake-pg/include)
+
   if (EP_USE_IDE)
     message(WARNING "EP_USE_IDE enabled. DO NOT USE IN PRODUCTION!")
     add_subdirectory(mooncake-ep)
     include_directories(mooncake-ep/include)
-    add_subdirectory(mooncake-pg)
-    include_directories(mooncake-pg/include)
+    add_library(
+      mooncake_pg_torch_ide OBJECT
+      mooncake-pg/torch/src/mooncake_backend.cpp
+      mooncake-pg/torch/src/pg_py.cpp
+      mooncake-pg/torch/src/work_handles.cpp)
+    # Reuse Mooncake EP's dependency include paths for clangd indexing.
+    target_include_directories(
+      mooncake_pg_torch_ide
+      PRIVATE mooncake-pg/torch/include
+              mooncake-pg/include
+              $<TARGET_PROPERTY:mooncake_ep,INCLUDE_DIRECTORIES>)
   else ()
     message(STATUS "WITH_EP enabled: building Mooncake EP and PG Python extensions")
     if(USE_CUDA)
@@ -166,19 +178,19 @@ if (WITH_EP)
     add_custom_target(mooncake_pg_ext ALL
       COMMAND ${CMAKE_COMMAND} -E make_directory "${EP_PG_STAGING_DIR}"
       COMMAND ${CMAKE_COMMAND}
-        "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg"
+        "-DSOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/torch"
         "-DEP_CUDA_MAJOR=${CUDAToolkit_VERSION_MAJOR}"
         "-DEP_CUDA_MINOR=${CUDAToolkit_VERSION_MINOR}"
         "-DEP_TORCH_VERSIONS=${_ep_torch_versions_pipe}"
-        "-DTORCH_CUDA_ARCH_LIST=${_torch_cuda_arch_list_pipe}"
         "-DSTAGING_DIR=${EP_PG_STAGING_DIR}"
-        "-DENGINE_SO_PATH=$<TARGET_FILE:engine>"
+        "-DPG_CORE_SO_PATH=$<TARGET_FILE:mooncake_pg>"
+        "-DPG_DEVICE_SO_PATH=$<TARGET_FILE:mooncake_pg_device>"
         "-DPython3_EXECUTABLE=${Python3_EXECUTABLE}"
         "-DEP_USE_MUSA=$<IF:$<BOOL:${USE_MUSA}>,1,0>"
         "-DEP_USE_MACA=$<IF:$<BOOL:${USE_MACA}>,1,0>"
-        -P "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/BuildPgExt.cmake"
+        -P "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/torch/BuildPgExt.cmake"
       COMMENT "Building Mooncake PG Python extension(s)"
-      DEPENDS engine mooncake_ep_ext
+      DEPENDS mooncake_pg mooncake_pg_device mooncake_ep_ext
       VERBATIM
     )
   endif ()

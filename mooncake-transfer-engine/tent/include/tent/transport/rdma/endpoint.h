@@ -192,6 +192,8 @@ class RdmaEndPoint : public std::enable_shared_from_this<RdmaEndPoint> {
     void repostAllNotifyRecvs();
 
    private:
+    friend class EndpointTestAccess;
+
     std::atomic<EndPointStatus> status_;
     RdmaContext* context_;
     EndPointParams* params_;

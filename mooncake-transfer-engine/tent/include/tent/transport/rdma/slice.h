@@ -90,11 +90,24 @@ struct RdmaSlice {
     uint32_t target_rkey = 0;
     int source_dev_id = -1;
     int target_dev_id = -1;
+    // GPUDirect reachability learning (see GdrReachability). Resolved once per
+    // (re)submit in Workers::generatePostPath. GPU ordinals are -1 for host
+    // memory; the name pointers alias stable Topology::NicEntry / segment
+    // storage and stay valid for the slice's lifetime.
+    int source_gpu_ordinal = -1;
+    int target_gpu_ordinal = -1;
+    const char* source_nic_name = nullptr;
+    const char* target_nic_name = nullptr;
+    const std::string* target_machine_id = nullptr;
 
     std::weak_ptr<RdmaEndPoint> ep_weak_ptr;
     TransferStatusEnum word = TransferStatusEnum::INITIAL;
     int qp_index = 0;
     int retry_count = 0;
+    // Flat (source,target) combination index last tried by
+    // selectFallbackDevice; the next fallback resumes just past it so retries
+    // rotate through all combinations with wraparound instead of hammering one.
+    int last_fallback_idx = -1;
     bool failed = false;
     // True while DeviceSelector accounts this slice against source_dev_id.
     // The worker clears it exactly once on completion, failure, or cancel.

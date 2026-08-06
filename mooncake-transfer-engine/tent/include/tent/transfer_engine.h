@@ -109,6 +109,8 @@ typedef struct tent_notifi_info tent_notifi_info;
 #define TRANSPORT_TCP (7)
 #define TRANSPORT_ASCEND_DIRECT (8)
 #define TRANSPORT_SUNRISE_LINK (9)
+#define TRANSPORT_TPU (10)
+#define TRANSPORT_UB (11)
 
 struct tent_memory_options {
     char location[64];

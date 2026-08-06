@@ -69,6 +69,8 @@ const static std::string GPU_PREFIX = "musa:";
 #define cudaGetDeviceCount musaGetDeviceCount
 #define cudaGetErrorString musaGetErrorString
 #define cudaGetLastError musaGetLastError
+#define cudaHostAlloc musaHostAlloc
+#define cudaHostAllocMapped musaHostAllocMapped
 #define cudaHostRegister musaHostRegister
 #define cudaHostRegisterPortable musaHostRegisterPortable
 #define cudaHostUnregister musaHostUnregister
@@ -99,6 +101,9 @@ const static std::string GPU_PREFIX = "musa:";
 #define cudaStreamDestroy musaStreamDestroy
 #define cudaStreamPerThread musaStreamPerThread
 #define cudaStreamQuery musaStreamQuery
+#define cudaStreamCaptureStatus musaStreamCaptureStatus
+#define cudaStreamCaptureStatusNone musaStreamCaptureStatusNone
+#define cudaStreamIsCapturing musaStreamIsCapturing
 #define cudaStreamWaitEvent musaStreamWaitEvent
 #define cudaDeviceSynchronize musaDeviceSynchronize
 #define cudaStreamSynchronize musaStreamSynchronize
@@ -108,8 +113,9 @@ const static std::string GPU_PREFIX = "musa:";
 #define cudaDeviceGetAttribute musaDeviceGetAttribute
 #define cudaEvent_t musaEvent_t
 #define cudaEventCreateWithFlags musaEventCreateWithFlags
-#define cudaEventDisableTiming musaEventDisableTiming
+#define cudaEventDisableTiming MU_EVENT_DISABLE_TIMING
 #define cudaEventDestroy musaEventDestroy
+#define cudaEventQuery musaEventQuery
 #define cudaEventRecord musaEventRecord
 #define cudaEventSynchronize musaEventSynchronize
 #define cudaDeviceProp musaDeviceProp

@@ -117,6 +117,13 @@ class _InitFunctionalMixin:
         for row in rows:
             self.assertEqual(row["sum"], expected_sum)
 
+    def test_world_size_one(self) -> None:
+        """Test a process group with world size 1 initializes and works."""
+        rows = self.spawn_backend_and_collect(_basic_init_worker, world_size=1)
+        self.assert_all_ok(rows)
+        for row in rows:
+            self.assertEqual(row["sum"], 1)
+
     def test_subgroup_create_destroy(self) -> None:
         """Test subgroup creation and destruction."""
         if self.world_size < 4:
