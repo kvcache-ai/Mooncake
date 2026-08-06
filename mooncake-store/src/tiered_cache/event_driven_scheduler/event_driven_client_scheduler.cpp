@@ -4,7 +4,9 @@
 
 #include <algorithm>
 #include <chrono>
+#include <iomanip>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -15,6 +17,41 @@
 #include "tiered_cache/tiers/cache_tier.h"
 
 namespace mooncake {
+
+namespace {
+
+// Render one "[Eviction] ..." line for the event-driven paths: the current
+// tier watermark (usage/capacity, read from the tier view) and how much data
+// this eviction reclaimed.
+std::string MakeEvictionLog(TieredBackend* backend, std::string_view path,
+                            UUID tier_id, size_t evicted_keys,
+                            size_t evicted_bytes) {
+    size_t usage = 0;
+    size_t capacity = 0;
+    for (const auto& view : backend->GetTierViews()) {
+        if (view.id == tier_id) {
+            usage = view.usage;
+            capacity = view.capacity;
+            break;
+        }
+    }
+    std::ostringstream ss;
+    ss << "[Eviction] path=" << path << " tier=" << tier_id
+       << " usage=" << usage << "/" << capacity << " (";
+    if (capacity == 0) {
+        ss << "n/a)";
+    } else {
+        ss << std::fixed << std::setprecision(1)
+           << (100.0 * static_cast<double>(usage) /
+               static_cast<double>(capacity))
+           << "%)";
+    }
+    ss << " evicted_keys=" << evicted_keys
+       << " evicted_bytes=" << evicted_bytes;
+    return ss.str();
+}
+
+}  // namespace
 
 EventDrivenClientScheduler::EventDrivenClientScheduler(
     TieredBackend* backend, const Json::Value& config,
@@ -154,13 +191,24 @@ bool EventDrivenClientScheduler::OnAllocationFailure(
 
     const auto movements = policy_->DecideEvict(ctx.required_bytes);
     size_t reclaimed = 0;
+    size_t evicted_keys = 0;
+    size_t evicted_bytes = 0;
     for (const auto& mv : movements) {
         if (reclaimed >= ctx.required_bytes || !running_.load()) {
             break;
         }
         if (Execute(mv)) {
             reclaimed += mv.size_bytes;
+            // kReplicate only adds a copy; it reclaims no space.
+            if (mv.kind != MovementRequest::Kind::kReplicate) {
+                ++evicted_keys;
+                evicted_bytes += mv.size_bytes;
+            }
         }
+    }
+    if (!movements.empty()) {
+        LOG(INFO) << MakeEvictionLog(backend_, "sync_alloc_failure",
+                                     ctx.tier_id, evicted_keys, evicted_bytes);
     }
     return HasAvailableBytes(ctx.tier_id, ctx.required_bytes);
 }
@@ -190,12 +238,22 @@ void EventDrivenClientScheduler::EvictLoop() {
             continue;
         }
         const auto movements = policy_->DecideEvict(/*min_reclaim_bytes=*/0);
+        if (movements.empty()) {
+            continue;
+        }
+        size_t evicted_keys = 0;
+        size_t evicted_bytes = 0;
         for (const auto& mv : movements) {
             if (!running_.load()) {
                 return;
             }
-            Execute(mv);
+            if (Execute(mv) && mv.kind != MovementRequest::Kind::kReplicate) {
+                ++evicted_keys;
+                evicted_bytes += mv.size_bytes;
+            }
         }
+        LOG(INFO) << MakeEvictionLog(backend_, "async_periodic", fast_tier_id_,
+                                     evicted_keys, evicted_bytes);
     }
 }
 
