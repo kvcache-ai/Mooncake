@@ -640,6 +640,7 @@ void Workers::asyncPollCq() {
     for (int index = 0; index < num_contexts; index++) {
         auto& context = transport_->context_set_[index];
         auto cq = context->cq(tl_wid % num_cq_list);
+        if (!cq) continue;  // inert context for a non-RDMA or failed NIC
         ibv_wc wc[kPollCount];
         int nr_poll = cq->poll(kPollCount, wc);
         if (nr_poll < 0) continue;
@@ -821,6 +822,14 @@ int Workers::handleContextEvents(std::shared_ptr<RdmaContext>& context) {
     return 0;
 }
 
+void Workers::reclaimEndpoints() {
+    for (auto& context : transport_->context_set_) {
+        // Inert contexts never built an endpoint store.
+        auto store = context->endpointStore();
+        if (store) store->reclaim();
+    }
+}
+
 void Workers::monitorThread() {
     // Track time for periodic endpoint reclaim (1 Hz heartbeat)
     auto last_reclaim_time = std::chrono::steady_clock::now();
@@ -835,9 +844,7 @@ void Workers::monitorThread() {
                 .count();
 
         if (time_since_last_reclaim >= 1000) {  // 1 second = 1000 ms
-            for (auto& context : transport_->context_set_) {
-                context->endpointStore()->reclaim();
-            }
+            reclaimEndpoints();
             last_reclaim_time = current_time;
         }
 

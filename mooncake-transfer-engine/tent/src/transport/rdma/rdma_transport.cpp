@@ -268,6 +268,32 @@ RdmaTransport::RdmaTransport()
 
 RdmaTransport::~RdmaTransport() { uninstall(); }
 
+size_t RdmaTransport::initializeContexts() {
+    context_set_.clear();
+    context_name_lookup_.clear();
+    // One slot per NicID: dev_id arrives as a NicID and subscripts both this
+    // and BufferDesc::lkey, so a compacted layout would name the wrong RNIC.
+    // Skipped NICs keep an inert context, which consumers reject via status().
+    context_set_.reserve(local_topology_->getNicCount());
+    size_t context_count = 0;
+    for (size_t i = 0; i < local_topology_->getNicCount(); ++i) {
+        auto entry = local_topology_->getNicEntry(i);
+        auto context = std::make_shared<RdmaContext>(*this);
+        context_set_.push_back(context);
+        if (entry->type != Topology::NIC_RDMA) continue;
+        int ret = context->construct(entry->name, params_);
+        if (ret) {
+            LOG(WARNING) << "Disable RDMA device " << entry->name << " because "
+                         << "of initialization failure";
+            continue;
+        }
+        context_name_lookup_[entry->name] = i;
+        ++context_count;
+        local_buffer_manager_.addDevice(context.get());
+    }
+    return context_count;
+}
+
 Status RdmaTransport::install(std::string& local_segment_name,
                               std::shared_ptr<ControlService> metadata,
                               std::shared_ptr<Topology> local_topology,
@@ -313,22 +339,7 @@ Status RdmaTransport::install(std::string& local_segment_name,
     }
 
     local_buffer_manager_.setTopology(local_topology);
-    context_set_.clear();
-    for (size_t i = 0; i < local_topology_->getNicCount(); ++i) {
-        auto entry = local_topology_->getNicEntry(i);
-        if (entry->type != Topology::NIC_RDMA) continue;
-        auto context = std::make_shared<RdmaContext>(*this);
-        int ret = context->construct(entry->name, params_);
-        if (ret) {
-            LOG(WARNING) << "Disable RDMA device " << entry->name << " because "
-                         << "of initialization failure";
-            continue;
-        }
-        context_name_lookup_[entry->name] = context_set_.size();
-        context_set_.push_back(context);
-        local_buffer_manager_.addDevice(context.get());
-    }
-    const bool context_empty = context_set_.empty();
+    const bool context_empty = initializeContexts() == 0;
     const bool topology_empty = local_topology_->empty();
     if (context_empty || topology_empty) {
         const char* error_message = "No RDMA device initialized successfully";
@@ -705,8 +716,16 @@ std::shared_ptr<RdmaEndPoint> RdmaTransport::getEndpoint(SegmentID target_id,
         return nullptr;
     }
 
-    auto context = context_set_[0].get();
-    if (context->status() != RdmaContext::DEVICE_ENABLED) {
+    // context_set_ is NicID-indexed, so slot 0 may be inert; take the first
+    // enabled context instead.
+    RdmaContext* context = nullptr;
+    for (auto& ctx : context_set_) {
+        if (ctx->status() == RdmaContext::DEVICE_ENABLED) {
+            context = ctx.get();
+            break;
+        }
+    }
+    if (!context) {
         return nullptr;
     }
     std::shared_ptr<RdmaEndPoint> endpoint;
