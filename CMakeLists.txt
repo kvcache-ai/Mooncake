@@ -174,7 +174,7 @@ if (WITH_EP)
         "-DEP_USE_MACA=$<IF:$<BOOL:${USE_MACA}>,1,0>"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/mooncake-pg/torch/BuildPgExt.cmake"
       COMMENT "Building Mooncake PG Python extension(s)"
-      DEPENDS mooncake_pg mooncake_pg_device mooncake_ep_ext
+      DEPENDS mooncake_pg mooncake_pg_device _ep
       VERBATIM
     )
   endif ()

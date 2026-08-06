@@ -69,6 +69,7 @@ const static std::string GPU_PREFIX = "musa:";
 #define cudaFreeHost musaFreeHost
 #define cudaGetDevice musaGetDevice
 #define cudaGetDeviceCount musaGetDeviceCount
+#define cudaGetErrorName musaGetErrorName
 #define cudaGetErrorString musaGetErrorString
 #define cudaGetLastError musaGetLastError
 #define cudaHostAlloc musaHostAlloc

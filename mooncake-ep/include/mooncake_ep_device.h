@@ -13,14 +13,14 @@
 #include <musa_fp8.h>
 using ep_fp8_storage_t = __mt_fp8_storage_t;
 using ep_fp8x2_storage_t = __mt_fp8x2_storage_t;
-#if defined(__CUDACC__) || defined(__MCC__)
+#if defined(__CUDACC__) || defined(__MCC__) || defined(__MUSACC__)
 __device__ __forceinline__ ep_fp8x2_storage_t ep_cvt_float2_to_fp8x2(float2 x) {
     return __musa_cvt_float2_to_fp8x2(x, __MT_SATFINITE, __MT_E4M3);
 }
 #endif
 
 // -- Device intrinsics (MUSA doesn't have __ldg / __activemask) --------------
-#if (defined(__CUDACC__) || defined(__MCC__)) && \
+#if (defined(__CUDACC__) || defined(__MCC__) || defined(__MUSACC__)) && \
     !defined(MOONCAKE_EP_MUSA_LDG_DEFINED)
 #define MOONCAKE_EP_MUSA_LDG_DEFINED
 template <typename dtype_t>
@@ -32,7 +32,7 @@ __device__ __forceinline__ dtype_t __ldg(const dtype_t* ptr) {
 #define __activemask() (0xffffffff)
 #endif
 
-#if defined(__CUDACC__) || defined(__MCC__)
+#if defined(__CUDACC__) || defined(__MCC__) || defined(__MUSACC__)
 __forceinline__ __device__ int get_lane_id() { return threadIdx.x % 32; }
 #endif
 
@@ -63,7 +63,7 @@ __forceinline__ __device__ int get_lane_id() { return threadIdx.x % 32; }
 #include <cstdint>
 using ep_fp8_storage_t = uint8_t;
 using ep_fp8x2_storage_t = uint16_t;
-#if defined(__CUDACC__) || defined(__MCC__)
+#if defined(__CUDACC__) || defined(__MCC__) || defined(__MUSACC__)
 __device__ __forceinline__ ep_fp8x2_storage_t ep_cvt_float2_to_fp8x2(float2) {
     return 0;
 }
@@ -74,7 +74,7 @@ __device__ __forceinline__ ep_fp8x2_storage_t ep_cvt_float2_to_fp8x2(float2) {
 #define __activemask() (0xffffffff)
 #endif
 
-#if defined(__CUDACC__) || defined(__MCC__)
+#if defined(__CUDACC__) || defined(__MCC__) || defined(__MUSACC__)
 __forceinline__ __device__ int get_lane_id() { return threadIdx.x % 32; }
 #endif
 

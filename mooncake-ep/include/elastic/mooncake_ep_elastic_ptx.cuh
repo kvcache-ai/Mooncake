@@ -22,7 +22,7 @@ using arrival_phase = uint32_t;
 // More than TMA, `longlong4` requires 32 bytes aligned
 static constexpr int kNumTMAAlignBytes = 32;
 
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__MUSACC__)
 
 /// Exceptions
 __forceinline__ __device__ void trap() {
