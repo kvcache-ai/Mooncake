@@ -23,7 +23,8 @@ class WrappedMasterService;
 
 class MasterAdminServer {
    public:
-    MasterAdminServer(uint16_t http_port, bool enable_metric_reporting);
+    MasterAdminServer(uint16_t http_port, bool enable_metric_reporting,
+                      std::string http_host = "0.0.0.0");
 
     ~MasterAdminServer();
 
@@ -107,6 +108,7 @@ class MasterAdminServer {
     void RegisterHandler();
 
     uint16_t http_port_;
+    std::string http_host_;
     bool enable_metric_reporting_ = false;
     coro_http::coro_http_server http_server_;
     std::thread metric_report_thread_;
