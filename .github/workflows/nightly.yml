@@ -251,6 +251,7 @@ jobs:
       - name: Build project
         run: |
           cd build
+          export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LIBRARY_PATH:-}
           cmake --build . -j$(nproc)
           sudo cmake --install .
 
