@@ -93,7 +93,7 @@ ensure_runtime_ready() {
   if [[ "${REFRESH_WHEEL}" == "1" ]]; then
     echo "==> rebuilding and reinstalling latest wheel into .venv-wheel"
     bash "${REPO_ROOT}/scripts/build/build-wheel.sh"
-    bash "${REPO_ROOT}/scripts/build/install-pro-wheel.sh"
+    bash "${REPO_ROOT}/scripts/build/install-wheel.sh"
     PYTHON_BIN="${REPO_ROOT}/.venv-wheel/bin/python"
     return 0
   fi
@@ -101,7 +101,7 @@ ensure_runtime_ready() {
   if [[ ! -x "${python_bin}" ]]; then
     echo "python runtime not found at ${python_bin}; rebuilding wheel runtime" >&2
     bash "${REPO_ROOT}/scripts/build/build-wheel.sh"
-    bash "${REPO_ROOT}/scripts/build/install-pro-wheel.sh"
+    bash "${REPO_ROOT}/scripts/build/install-wheel.sh"
     PYTHON_BIN="${REPO_ROOT}/.venv-wheel/bin/python"
     return 0
   fi
@@ -112,7 +112,7 @@ PY
   then
     echo "==> installed wheel missing or stale; rebuilding .venv-wheel runtime"
     bash "${REPO_ROOT}/scripts/build/build-wheel.sh"
-    bash "${REPO_ROOT}/scripts/build/install-pro-wheel.sh"
+    bash "${REPO_ROOT}/scripts/build/install-wheel.sh"
     PYTHON_BIN="${REPO_ROOT}/.venv-wheel/bin/python"
     return 0
   fi

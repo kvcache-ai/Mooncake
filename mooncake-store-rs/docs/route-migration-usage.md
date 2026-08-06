@@ -3,7 +3,7 @@
 Last updated: 2026-04-23
 
 This guide is for operators and control-plane callers that need to submit
-explicit key-level route migration tasks in `mooncake-pro`.
+explicit key-level route migration tasks in `mooncake-store-rs`.
 
 ## 1. Capability Summary
 

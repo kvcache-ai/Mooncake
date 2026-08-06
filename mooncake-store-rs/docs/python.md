@@ -6,35 +6,86 @@ The Python package does not wrap a second store implementation. It reuses the sa
 
 ## Package Model
 
-The repository now builds two Python wheels with different responsibilities:
-
-- `mooncake-*.whl` is the real runtime package
-- `mooncake_pro-*.whl` is the user-facing Pro metapackage
+The repository builds one Python wheel, `mooncake_store_rs-*.whl`, which imports
+as `mooncake_store_rs`.
 
 Recommended installation flow:
 
 ```bash
-./scripts/build/install-pro-wheel.sh
+./scripts/build/install-wheel.sh
 ```
 
 Equivalent raw pip flow:
 
 ```bash
-pip install --find-links dist/wheels dist/wheels/mooncake_pro-*.whl
+pip install --find-links dist/wheels dist/wheels/mooncake_store_rs-*.whl
 ```
 
 The install helper also supports bundle-local wheelhouses on another machine:
 
 ```bash
-./scripts/build/install-pro-wheel.sh --wheel-dir /tmp/sglang-true-e2e-bundle/dist/wheels
+./scripts/build/install-wheel.sh --wheel-dir /tmp/sglang-true-e2e-bundle/dist/wheels
 ```
 
 After installation:
 
-- Python code still imports `mooncake`
-- `pip list` clearly shows `mooncake-pro`
-- the installed runtime version is pinned through `mooncake-pro -> mooncake==...+pro...`
-- upgrading from an older `mooncake` install does not require `--force-reinstall`
+- Python code imports `mooncake_store_rs`
+- `pip list` shows `mooncake-store-rs`
+- the upstream `mooncake-transfer-engine` wheel may be installed alongside it;
+  the two packages share no files, so neither has to be uninstalled first
+
+### Using the upstream import path
+
+Integrations are usually written against the upstream API:
+
+```python
+from mooncake.store import MooncakeDistributedStore, ReplicateConfig
+```
+
+Those keep working against this backend once the operator opts in:
+
+```bash
+export MOONCAKE_STORE_BACKEND=rs
+```
+
+`rust`, `store-rs` and `masterless` are accepted as synonyms. Anything else, or
+leaving the variable unset, leaves the upstream implementation in charge —
+installing this wheel on its own changes nothing.
+
+Two properties are worth knowing before relying on it:
+
+- **The variable must be exported before the interpreter starts.** The redirect
+  is registered from a `.pth` file at startup, so setting `os.environ[...]` from
+  inside Python is too late and will silently keep the upstream backend.
+- **Tracebacks name the real file.** A frame from the redirected module shows
+  `mooncake_store_rs/store.py` even though the import said `mooncake.store`.
+
+To check what is actually in effect:
+
+```bash
+python -m mooncake_store_rs.doctor
+```
+
+It prints the requested backend, whether the redirect is installed, and the file
+`mooncake.store` currently resolves to. It exits non-zero when this backend was
+requested but the redirect is not active, which is the signature of setting the
+variable too late.
+
+Only the modules that both packages implement are redirected: `store`,
+`buffer_pool`, `cli`, `cli_client` and `structured_object_store`. Everything else
+under `mooncake.*` continues to come from the upstream wheel.
+
+The API examples throughout the rest of this document use the upstream
+`mooncake.*` paths, since that is what integrations such as SGLang are written
+against — they assume the variable is exported. Code that only ever targets this
+backend can skip the redirect entirely and import directly:
+
+```python
+from mooncake_store_rs.store import MooncakeDistributedStore, ReplicateConfig
+```
+
+That form needs no environment variable and is what this repository's own
+`mooncake_rl` adapters use.
 
 ## What the Python Layer Provides
 
@@ -225,10 +276,9 @@ By default the script:
 
 - creates or reuses `.venv-wheel`
 - installs `maturin`
-- installs `build` for the Pro metapackage
 - embeds the standalone `mooncake-store-client` and `mooncake-store-admin` binaries into the runtime wheel package
 - embeds the build Python `libpython*.so` needed by those standalone binaries and restores that dependency after `auditwheel repair`, because the binaries run as subprocesses from a wheel install rather than as Python extension modules
-- builds both wheels into `dist/wheels/`
+- builds the wheel into `dist/wheels/`
 - copies the standalone `mooncake-store-client` and `mooncake-store-admin` artifacts into `dist/bin/`
 
 Repository packaging rule:
@@ -275,24 +325,24 @@ Docker wheel notes:
 Install the wheel into any compatible virtualenv:
 
 ```bash
-./scripts/build/install-pro-wheel.sh
+./scripts/build/install-wheel.sh
 ```
 
 Or with raw pip:
 
 ```bash
-pip install --find-links dist/wheels dist/wheels/mooncake_pro-*.whl
+pip install --find-links dist/wheels dist/wheels/mooncake_store_rs-*.whl
 ```
 
 After installation, both interfaces are available:
 
-- `python -c "import mooncake"` loads package metadata only; the Store-RS native extension is loaded lazily when callers access `mooncake.store` or the top-level Store-RS compatibility exports
-- `python -c "import mooncake; print(mooncake.__version__, mooncake.__edition__)"` shows the active Pro runtime
-- `python -c "import mooncake; print(mooncake.__build_info__)"` shows the packaged build branch, commit, and build time without loading the native extension
+- `python -c "import mooncake_store_rs"` loads package metadata only; the native extension is loaded lazily when callers access `mooncake_store_rs.store` or the top-level compatibility exports
+- `python -c "import mooncake_store_rs as m; print(m.__version__, m.__edition__)"` shows the active runtime
+- `python -c "import mooncake_store_rs as m; print(m.__build_info__)"` shows the packaged build branch, commit, and build time without loading the native extension
 - `mooncake-store-client --help` runs the packaged standalone client command
-- `mooncake-store-client -v` prints the packaged Pro version plus wheel build branch, commit, and build time
+- `mooncake-store-client -v` prints the packaged version plus wheel build branch, commit, and build time
 - `mooncake-store-admin --help` runs the packaged metadata maintenance and route-policy management command
-- if your environment still exposes the upstream compatibility alias, `mooncake_master --version` prints the same packaged Pro version banner
+- `mooncake-store-bench --help` runs the packaged benchmark / verify / soak runtime
 
 ## Standalone Client Binary
 
@@ -1205,7 +1255,7 @@ The true e2e runner prints, for each phase:
 
 Portable bundle notes:
 
-- machine B installs `mooncake_pro` from `dist/wheels/` inside the bundle
+- machine B installs `mooncake_store_rs` from `dist/wheels/` inside the bundle
 - machine B only needs `python3`, working `python3 -m venv`, `redis-server`, `redis-cli`, and a compatible GPU/SGLang stack
 - machine B does not need a source checkout, `git`, `cargo`, `cmake`, or `third_party/Mooncake`
 - logs default to `target/sglang-true-e2e/`, overridable with `--workdir` or `MC_STORE_RS_SGLANG_TRUE_E2E_WORKDIR`

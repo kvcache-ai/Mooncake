@@ -13,7 +13,7 @@ def main() -> int:
     if argv in (["--version"], ["-V"]):
         print(
             format_version_output(
-                "mooncake",
+                "mooncake-store-rs",
                 __version__,
                 __edition__,
                 verbose=False,
@@ -23,7 +23,7 @@ def main() -> int:
     if argv == ["-v"]:
         print(
             format_version_output(
-                "mooncake",
+                "mooncake-store-rs",
                 __version__,
                 __edition__,
                 verbose=True,
