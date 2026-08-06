@@ -181,19 +181,14 @@ MasterService::MasterService(const MasterServiceConfig& config)
           config.nof_heartbeat_failures_threshold),
       enable_ha_(config.enable_ha),
       enable_offload_(config.enable_offload),
-      ha_backend_type_(config.ha_backend_type),
-      ha_backend_connstring_(config.ha_backend_connstring),
       enable_oplog_(config.enable_ha && config.enable_oplog &&
                     config.ha_backend_type == "etcd"),
       oplog_batch_max_entries_(config.oplog_batch_max_entries),
       cluster_id_(config.cluster_id),
       root_fs_dir_(config.root_fs_dir),
-      global_file_segment_size_(config.global_file_segment_size),
       enable_disk_eviction_(config.enable_disk_eviction),
       quota_bytes_(config.quota_bytes),
       enable_multi_tenants_(config.enable_multi_tenants),
-      tenant_quota_connector_type_(config.tenant_quota_connector_type),
-      tenant_quota_connector_uri_(config.tenant_quota_connector_uri),
       segment_manager_(config.memory_allocator, config.enable_cxl),
       nof_segment_manager_(config.memory_allocator),
       memory_allocator_type_(config.memory_allocator),
@@ -201,20 +196,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
                                     ? AllocationStrategyType::CXL
                                     : config.allocation_strategy_type),
       allocation_strategy_(CreateAllocationStrategy(allocation_strategy_type_)),
-      enable_snapshot_restore_(config.enable_snapshot_restore),
-      enable_snapshot_(config.enable_snapshot),
-      snapshot_backup_dir_(config.snapshot_backup_dir),
-      snapshot_interval_seconds_(config.snapshot_interval_seconds),
-      snapshot_child_timeout_seconds_(config.snapshot_child_timeout_seconds),
-      snapshot_retention_count_(config.snapshot_retention_count),
-      snapshot_catalog_store_type_(config.snapshot_catalog_store_type),
-      snapshot_catalog_store_connstring_(
-          config.snapshot_catalog_store_connstring),
       put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
       put_start_release_timeout_sec_(config.put_start_release_timeout_sec),
-      cxl_path_(config.cxl_path),
-      cxl_size_(config.cxl_size),
-      enable_cxl_(config.enable_cxl),
       offloading_queue_limit_(config.offloading_queue_limit),
       offload_cap_ratio_(config.offload_cap_ratio),
       task_manager_(config.task_manager_config) {
@@ -232,47 +215,44 @@ MasterService::MasterService(const MasterServiceConfig& config)
         LOG(INFO) << "Local-first allocation strategy enabled";
     }
 
-    if (enable_snapshot_ || enable_snapshot_restore_) {
+    const bool use_snapshot_backup_dir = !config.snapshot_backup_dir.empty();
+    if (config.enable_snapshot || config.enable_snapshot_restore) {
         try {
             auto object_store_type =
                 ParseSnapshotObjectStoreType(config.snapshot_object_store_type);
             snapshot_object_store_ =
                 SnapshotObjectStore::Create(object_store_type);
-            snapshot_catalog_store_ = CreateSnapshotCatalogStore();
+            snapshot_catalog_store_ = CreateSnapshotCatalogStore(config);
         } catch (const std::exception& e) {
             LOG(ERROR) << "Failed to create snapshot stores: " << e.what();
             throw std::runtime_error(
                 fmt::format("Failed to create snapshot stores: {}", e.what()));
         }
-        if (!snapshot_backup_dir_.empty()) {
-            use_snapshot_backup_dir_ = true;
-        }
-
         // Initialize repository and codec for both save and restore
         snapshot_repository_ = std::make_unique<MasterSnapshotRepository>(
             snapshot_object_store_.get(), snapshot_catalog_store_.get(),
-            snapshot_backup_dir_, use_snapshot_backup_dir_);
+            config.snapshot_backup_dir, use_snapshot_backup_dir);
         snapshot_codec_ = std::make_unique<ha::MasterSnapshotCodec>();
     }
 
     if (enable_multi_tenants_) {
-        auto store = CreateTenantQuotaPolicyStore(tenant_quota_connector_type_,
-                                                  tenant_quota_connector_uri_,
-                                                  cluster_id_);
+        auto store = CreateTenantQuotaPolicyStore(
+            config.tenant_quota_connector_type,
+            config.tenant_quota_connector_uri, cluster_id_);
         if (!store) {
             throw std::invalid_argument(store.error());
         }
         tenant_quota_policy_store_ = std::move(store.value());
     }
 
-    if (enable_snapshot_restore_) {
+    if (config.enable_snapshot_restore) {
         RestoreState();
     }
     if (enable_multi_tenants_) {
         LoadTenantQuotaPoliciesFromStoreOrThrow();
         RebuildTenantQuotaUsageFromMetadata();
     }
-    if (enable_snapshot_ && snapshot_retention_count_ == 0) {
+    if (config.enable_snapshot && config.snapshot_retention_count == 0) {
         LOG(ERROR) << "snapshot_retention_count must be greater than 0";
         throw std::invalid_argument("snapshot_retention_count must be > 0");
     }
@@ -398,12 +378,12 @@ MasterService::MasterService(const MasterServiceConfig& config)
 
     if (enable_oplog_ && !cluster_id_.empty()) {
 #ifdef STORE_USE_ETCD
-        if (ha_backend_connstring_.empty()) {
+        if (config.ha_backend_connstring.empty()) {
             LOG(INFO) << "Skipping automatic batch-record OpLog writer "
                          "initialization; no HA backend connstring configured";
         } else {
             ErrorCode connect_err = EtcdHelper::ConnectToEtcdStoreClient(
-                ha_backend_connstring_.c_str());
+                config.ha_backend_connstring.c_str());
             if (connect_err != ErrorCode::OK) {
                 throw std::runtime_error(fmt::format(
                     "failed to connect HA batch-record OpLog writer to etcd: "
@@ -419,7 +399,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
             }
         }
 #else
-        if (ha_backend_connstring_.empty()) {
+        if (config.ha_backend_connstring.empty()) {
             LOG(INFO) << "Skipping automatic batch-record OpLog writer "
                          "initialization; no HA backend connstring configured";
         } else {
@@ -465,56 +445,50 @@ MasterService::MasterService(const MasterServiceConfig& config)
 
     if (!root_fs_dir_.empty()) {
         use_disk_replica_ = true;
-        if (global_file_segment_size_ == std::numeric_limits<int64_t>::max()) {
+        if (config.global_file_segment_size ==
+            std::numeric_limits<int64_t>::max()) {
             MasterMetricManager::instance().set_dfs_capacity_unlimited(true);
         } else {
             MasterMetricManager::instance().inc_total_file_capacity(
-                global_file_segment_size_);
+                config.global_file_segment_size);
         }
     }
 
-    if (enable_snapshot_ && !enable_oplog_) {
+    if (config.enable_snapshot && !enable_oplog_) {
         if (memory_allocator_type_ == BufferAllocatorType::OFFSET) {
             // Initialize and start snapshot manager
             MasterSnapshotManagerOptions snapshot_options;
-            snapshot_options.enable_snapshot = enable_snapshot_;
             snapshot_options.snapshot_interval_seconds =
-                snapshot_interval_seconds_;
+                config.snapshot_interval_seconds;
             snapshot_options.snapshot_child_timeout_seconds =
-                snapshot_child_timeout_seconds_;
+                config.snapshot_child_timeout_seconds;
             snapshot_options.snapshot_retention_count =
-                snapshot_retention_count_;
-            snapshot_options.snapshot_backup_dir = snapshot_backup_dir_;
-            snapshot_options.use_snapshot_backup_dir = use_snapshot_backup_dir_;
-            snapshot_options.snapshot_catalog_store_type =
-                snapshot_catalog_store_type_;
-            snapshot_options.snapshot_catalog_store_connstring =
-                snapshot_catalog_store_connstring_;
-            snapshot_options.ha_backend_type = ha_backend_type_;
-            snapshot_options.ha_backend_connstring = ha_backend_connstring_;
-            snapshot_options.cluster_id = cluster_id_;
-            snapshot_options.enable_ha = enable_ha_;
+                config.snapshot_retention_count;
+            snapshot_options.snapshot_backup_dir = config.snapshot_backup_dir;
+            snapshot_options.use_snapshot_backup_dir = use_snapshot_backup_dir;
 
             snapshot_manager_ = std::make_unique<MasterSnapshotManager>(
                 this, snapshot_options, snapshot_mutex_,
                 snapshot_object_store_.get(), snapshot_catalog_store_.get());
             snapshot_manager_->Start();
         }
-    } else if (enable_snapshot_ && enable_oplog_) {
+    } else if (config.enable_snapshot && enable_oplog_) {
         LOG(INFO) << "Skipping primary snapshot generation in batch-record "
                      "OpLog mode; snapshots are owned by standby";
     }
 
-    if (enable_cxl_) {
+    if (config.enable_cxl) {
         allocation_strategy_ = std::make_shared<CxlAllocationStrategy>();
-        segment_manager_.initializeCxlAllocator(cxl_path_, cxl_size_);
+        segment_manager_.initializeCxlAllocator(config.cxl_path,
+                                                config.cxl_size);
         VLOG(1) << "action=start_cxl_global_allocator";
     }
 }
 
 std::unique_ptr<ha::SnapshotCatalogStore>
-MasterService::CreateSnapshotCatalogStore() {
-    auto catalog_kind = ParseSnapshotCatalogKind(snapshot_catalog_store_type_);
+MasterService::CreateSnapshotCatalogStore(const MasterServiceConfig& config) {
+    auto catalog_kind =
+        ParseSnapshotCatalogKind(config.snapshot_catalog_store_type);
     if (!catalog_kind) {
         throw std::invalid_argument(catalog_kind.error());
     }
@@ -530,9 +504,10 @@ MasterService::CreateSnapshotCatalogStore() {
                 "redis snapshot catalog store is unavailable in the current "
                 "build");
 #else
-            const auto connstring = !snapshot_catalog_store_connstring_.empty()
-                                        ? snapshot_catalog_store_connstring_
-                                        : ha_backend_connstring_;
+            const auto connstring =
+                !config.snapshot_catalog_store_connstring.empty()
+                    ? config.snapshot_catalog_store_connstring
+                    : config.ha_backend_connstring;
             if (connstring.empty()) {
                 throw std::invalid_argument(
                     "redis snapshot catalog store requires a connection "
