@@ -3355,7 +3355,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             device::GetAcceleratorRegistry().RuntimeAccelerators();
         void *dst = static_cast<char *>(buffer) + dst_offset;
         if (runtime_accelerator.FindDeviceForPointer(dst) &&
-            !client_->CanUseLocalMemcpy(replica)) {
+            (!client_->CanUseLocalMemcpy(replica) ||
+             client_->IsHotCacheEnabled())) {
             if (!client_buffer_allocator_) {
                 LOG(ERROR) << "Client buffer allocator is not provided";
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -3492,6 +3493,7 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
     auto runtime_accelerator =
         device::GetAcceleratorRegistry().RuntimeAccelerators();
     void *dst = static_cast<char *>(buffer) + dst_offset;
+    auto filtered_qr = FilterQueryResult(query_result, replica, false);
     if (runtime_accelerator.FindDeviceForPointer(dst) &&
         !client_->CanUseLocalMemcpy(replica)) {
         if (!client_buffer_allocator_) {
@@ -3509,7 +3511,7 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         tmp_slices.emplace_back(Slice{tmp_handle.ptr(), size});
 
         auto get_result =
-            client_->Get(key, query_result, tmp_slices, src_offset);
+            client_->Get(key, filtered_qr, tmp_slices, src_offset);
         if (!get_result) {
             return tl::unexpected(get_result.error());
         }
@@ -3524,7 +3526,7 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
     std::vector<Slice> slices;
     slices.emplace_back(Slice{dst, size});
 
-    auto get_result = client_->Get(key, query_result, slices, src_offset);
+    auto get_result = client_->Get(key, filtered_qr, slices, src_offset);
     if (!get_result) {
         return tl::unexpected(get_result.error());
     }
