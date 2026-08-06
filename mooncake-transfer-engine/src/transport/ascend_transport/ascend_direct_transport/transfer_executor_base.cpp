@@ -161,6 +161,9 @@ int TransferExecutorBase::initEngines() {
     if (local_comm_res) {
         options["adxl.LocalCommRes"] = local_comm_res;
         LOG(INFO) << "Set LocalCommRes to:" << local_comm_res;
+    } else if (params_.client_server_mode) {
+        options["adxl.LocalCommRes"] = R"({"version":"1.3"})";
+        LOG(INFO) << "Client-Server mode enabled, set LocalCommRes to {\"version\":\"1.3\"}";
     }
 
     options[kAutoConnect] = params_.auto_connect ? kEnabled : kDisabled;
