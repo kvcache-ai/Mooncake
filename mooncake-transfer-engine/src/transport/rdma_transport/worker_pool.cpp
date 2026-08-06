@@ -16,8 +16,11 @@
 
 #include <sys/epoll.h>
 
+#include <algorithm>
 #include <cassert>
+#include <chrono>
 #include <functional>
+#include <thread>
 
 #include "config.h"
 #include "memory_location.h"
@@ -426,6 +429,7 @@ void WorkerPool::performPostSend(int thread_id) {
 #endif
 
     SliceList failed_slice_list;
+    SliceList backoff_slice_list;
     for (auto &entry : local_slice_queue) {
         if (entry.second.empty()) continue;
 
@@ -459,8 +463,20 @@ void WorkerPool::performPostSend(int thread_id) {
             continue;
         }
         if (!endpoint->connected()) {
+            // Check handshake backoff before attempting connection
+            if (isInHandshakeBackoff(entry.first)) {
+                // The rail is temporarily backing off; requeue these slices
+                // without consuming their retry budget.
+                for (auto &slice : entry.second)
+                    backoff_slice_list.push_back(slice);
+                entry.second.clear();
+                continue;
+            }
             int setup_ret = endpoint->setupConnectionsByActive();
             if (setup_ret) {
+                // Mark exponential backoff for this rail to avoid handshake
+                // storms against an unhealthy peer.
+                markHandshakeBackoff(entry.first);
                 // Active handshake setup failures are ambiguous: the failed
                 // side may be the peer rail, or this local RNIC may have just
                 // gone inactive. Prefer switching peer rails when one is
@@ -504,6 +520,8 @@ void WorkerPool::performPostSend(int thread_id) {
                 entry.second.clear();
                 continue;
             }
+            // Connection succeeded, clear any backoff state
+            clearHandshakeBackoff(entry.first);
         }
         if (!endpoint->readyToSend()) {
             if (endpoint->readyAckTimedOut()) {
@@ -546,6 +564,13 @@ void WorkerPool::performPostSend(int thread_id) {
         }
         if (!local_retry_list.empty())
             redispatch(local_retry_list, thread_id, true);
+    }
+
+    if (!backoff_slice_list.empty()) {
+        // Sleep briefly to avoid busy-spinning while the rail backs off,
+        // then redispatch without touching the slices' retry budget.
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        redispatch(backoff_slice_list, thread_id);
     }
 }
 
@@ -1419,6 +1444,44 @@ bool WorkerPool::isLocalWcFailure(const ibv_wc &wc) {
         default:
             return false;
     }
+}
+
+void WorkerPool::markHandshakeBackoff(const std::string &peer_nic_path) {
+    std::lock_guard<std::mutex> lock(rail_state_lock_);
+    auto &state = rail_states_[peer_nic_path];
+    state.handshake_failures =
+        std::min(state.handshake_failures + 1, kHandshakeBackoffMaxFailures);
+    // Exponential backoff: base * 2^(failures-1), capped at max
+    uint64_t delay = kHandshakeBackoffBaseNs << (state.handshake_failures - 1);
+    if (delay > kHandshakeBackoffMaxNs) delay = kHandshakeBackoffMaxNs;
+    state.handshake_backoff_until_ns = getCurrentTimeInNano() + delay;
+    LOG(WARNING) << "Handshake backoff: peer=" << peer_nic_path
+                 << " failures=" << state.handshake_failures
+                 << " backoff_ms=" << (delay / 1000000);
+}
+
+bool WorkerPool::isInHandshakeBackoff(const std::string &peer_nic_path) {
+    std::lock_guard<std::mutex> lock(rail_state_lock_);
+    auto it = rail_states_.find(peer_nic_path);
+    if (it == rail_states_.end()) return false;
+    auto &state = it->second;
+    if (state.handshake_backoff_until_ns == 0) return false;
+    uint64_t now = getCurrentTimeInNano();
+    if (now >= state.handshake_backoff_until_ns) {
+        // Backoff expired, allow retry (but don't clear failures yet;
+        // clearHandshakeBackoff does that on success)
+        state.handshake_backoff_until_ns = 0;
+        return false;
+    }
+    return true;
+}
+
+void WorkerPool::clearHandshakeBackoff(const std::string &peer_nic_path) {
+    std::lock_guard<std::mutex> lock(rail_state_lock_);
+    auto it = rail_states_.find(peer_nic_path);
+    if (it == rail_states_.end()) return;
+    it->second.handshake_failures = 0;
+    it->second.handshake_backoff_until_ns = 0;
 }
 
 void WorkerPool::handleLocalFailure(const std::string &peer_nic_path,

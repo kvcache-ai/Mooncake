@@ -18,6 +18,7 @@
 #include <infiniband/verbs.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <cstddef>
 #include <map>
 #include <memory>
@@ -38,6 +39,34 @@ class RdmaEndPoint;
 class TransferMetadata;
 class RdmaTransportTestPeer;
 class WorkerPool;
+
+// Counting semaphore that limits concurrent RDMA handshakes to prevent
+// thundering-herd QP failures during large-scale simultaneous startup.
+class ConnectionLimiter {
+   public:
+    explicit ConnectionLimiter(int max_concurrent)
+        : max_concurrent_(max_concurrent > 0 ? max_concurrent : 1),
+          current_(0) {}
+
+    void acquire() {
+        std::unique_lock<std::mutex> lock(mu_);
+        cv_.wait(lock, [this] { return current_ < max_concurrent_; });
+        ++current_;
+    }
+
+    void release() {
+        std::unique_lock<std::mutex> lock(mu_);
+        if (current_ <= 0) return;
+        --current_;
+        cv_.notify_one();
+    }
+
+   private:
+    const int max_concurrent_;
+    int current_;
+    std::mutex mu_;
+    std::condition_variable cv_;
+};
 
 class RdmaTransport : public Transport {
     friend class RdmaContext;
@@ -135,6 +164,15 @@ class RdmaTransport : public Transport {
                                       int &buffer_id, int &device_id,
                                       int retry_cnt = 0);
 
+   public:
+    // Acquire/release a handshake slot to limit concurrent connection setup.
+    void acquireHandshakeSlot() {
+        if (connection_limiter_) connection_limiter_->acquire();
+    }
+    void releaseHandshakeSlot() {
+        if (connection_limiter_) connection_limiter_->release();
+    }
+
     const std::vector<std::shared_ptr<RdmaContext>> &getContextList() const {
         return context_list_;
     }
@@ -148,6 +186,7 @@ class RdmaTransport : public Transport {
     // local_server_name_ keeps the TCP-reachable address for P2P routing.
     std::string rdma_server_name_;
     std::mutex local_desc_lock_;
+    std::unique_ptr<ConnectionLimiter> connection_limiter_;
     // Mooncake#2017: buffers larger than the device max_mr_size are split into
     // multiple sub-max_mr_size MRs (one BufferDesc per chunk) so that
     // ibv_reg_mr is never silently truncated. unregisterLocalMemory() only
@@ -155,6 +194,21 @@ class RdmaTransport : public Transport {
     // start-addresses for cleanup.
     std::mutex chunk_map_mutex_;
     std::unordered_map<uint64_t, std::vector<uint64_t>> chunk_map_;
+};
+
+// RAII guard that holds a handshake slot for its lifetime, guaranteeing the
+// slot is released even if the handshake path throws or returns early.
+class HandshakeSlotGuard {
+   public:
+    explicit HandshakeSlotGuard(RdmaTransport &engine) : engine_(engine) {
+        engine_.acquireHandshakeSlot();
+    }
+    ~HandshakeSlotGuard() { engine_.releaseHandshakeSlot(); }
+    HandshakeSlotGuard(const HandshakeSlotGuard &) = delete;
+    HandshakeSlotGuard &operator=(const HandshakeSlotGuard &) = delete;
+
+   private:
+    RdmaTransport &engine_;
 };
 
 using TransferRequest = Transport::TransferRequest;

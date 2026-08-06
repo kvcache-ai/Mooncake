@@ -72,11 +72,19 @@ class WorkerPool {
     struct RailState {
         int error_count = 0;
         uint64_t pause_until_ns = 0;  // Timestamp (ns) when pause expires
+        // Handshake backoff state for thundering-herd mitigation
+        uint32_t handshake_failures = 0;
+        uint64_t handshake_backoff_until_ns = 0;
     };
 
     void markRailFailed(const std::string &peer_nic_path,
                         bool immediate_pause = false);
     bool isRailAvailable(const std::string &peer_nic_path);
+
+    // Handshake backoff: exponential delay after connection setup failures
+    void markHandshakeBackoff(const std::string &peer_nic_path);
+    bool isInHandshakeBackoff(const std::string &peer_nic_path);
+    void clearHandshakeBackoff(const std::string &peer_nic_path);
 
     // Retry helper: increment retry count and return whether retry is allowed
     static bool shouldRetrySlice(Transport::Slice *slice);
@@ -168,6 +176,11 @@ class WorkerPool {
     const static int kRailErrorThreshold = 5;  // Errors before pause
     const static uint64_t kContextRecoveryDelayNs =
         30000000000ull;  // 30 seconds before a recovered local RNIC is reused
+
+    // Handshake backoff configuration (exponential: 100ms, 200ms, 400ms, ...)
+    static constexpr uint64_t kHandshakeBackoffBaseNs = 100000000ull;  // 100ms
+    static constexpr uint64_t kHandshakeBackoffMaxNs = 5000000000ull;  // 5s
+    static constexpr uint32_t kHandshakeBackoffMaxFailures = 10;
 
     // Context-level health tracking
     std::atomic<int> context_failure_count_{0};
