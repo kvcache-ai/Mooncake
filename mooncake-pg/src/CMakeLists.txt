@@ -16,7 +16,6 @@ elseif(USE_MUSA OR USE_MACA)
   set(_pg_device_flags
       -std=c++20
       -O3
-      --compiler-options=-fPIC
       -MMD
       -MT "${_pg_device_object}"
       -MF "${_pg_device_depfile}"
@@ -45,13 +44,15 @@ elseif(USE_MUSA OR USE_MACA)
       set(_pg_device_compiler_hint /usr/local/musa/bin)
     endif()
     set(_pg_platform_device_flags
+        -x musa
+        -fPIC
         --cuda-gpu-arch=mp_21
         --cuda-gpu-arch=mp_31)
   elseif(USE_MACA)
     set(_pg_platform_name MACA)
     set(_pg_device_compiler_name mxcc)
     set(_pg_device_compiler_hint "${MACA_ROOT}/bin")
-    set(_pg_platform_device_flags)
+    set(_pg_platform_device_flags --compiler-options=-fPIC)
   endif()
 
   find_program(_pg_device_compiler NAMES "${_pg_device_compiler_name}"
