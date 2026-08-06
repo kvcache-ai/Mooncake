@@ -248,7 +248,8 @@ DEFINE_bool(kv_events_emit_legacy_compat, true,
 DEFINE_bool(kv_events_emit_object_key, true,
             "Include Mooncake object_key in published KV events");
 DEFINE_uint32(kv_events_queue_capacity, 65536,
-              "Deprecated; ignored (event queue is unbounded)");
+              "Maximum pending KV events; oldest events are dropped when "
+              "the queue is full (0 = unbounded)");
 DEFINE_string(ha_backend_type, "etcd",
               "HA backend type, e.g. etcd | redis | k8s");
 DEFINE_string(ha_backend_connstring, "",
@@ -1002,6 +1003,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.enable_oplog = FLAGS_enable_oplog;
+    }
+    if ((google::GetCommandLineFlagInfo("oplog_poll_interval_ms", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.oplog_poll_interval_ms = FLAGS_oplog_poll_interval_ms;
     }
     if ((google::GetCommandLineFlagInfo("oplog_batch_max_entries", &info) &&
          !info.is_default) ||

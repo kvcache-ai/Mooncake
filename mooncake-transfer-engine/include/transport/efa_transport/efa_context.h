@@ -261,7 +261,13 @@ class EfaContext {
     // model; plain `volatile int` + __sync_* was UB under the current
     // standard.
     std::atomic<int> wr_depth_;
+    // Ceilings for the two pacing counters (wr_depth_ above, EfaCq::outstanding
+    // on shared_cq_).  Both are the depths the provider gave us for this
+    // device, not GlobalConfig values: a counter that disagrees with the queue
+    // it paces either stalls submission early or hands out credit fi_write has
+    // to refuse.  Set in buildSharedEndpoint() and construct() respectively.
     int max_wr_depth_;
+    size_t max_cqe_ = 0;
     // CQ that shared_ep_ is bound to (FI_TRANSMIT|FI_RECV).  Points into
     // cq_list_[0]; kept here to avoid re-indexing on the hot path.
     std::shared_ptr<EfaCq> shared_cq_;

@@ -118,9 +118,11 @@ Tensor fields are stored through the best available Mooncake path:
 3. If a tensor-native path is unavailable, Mooncake falls back to a serialized tensor payload.
 4. Scalar tensors use a correctness fallback until the native tensor codec preserves zero-dimensional shape.
 
-Numeric numpy arrays are stored as structured ndarray members. Contiguous arrays can be passed through without copying; non-contiguous arrays are made contiguous before storage. Row slices are materialized through structured range reads when the backend supports them.
+Numeric numpy arrays are stored as structured ndarray members. Non-tensor ndarray PUTs are staged and copied before being written to Mooncake; non-contiguous arrays are made contiguous as part of that staging path. Row slices are materialized through structured range reads when the backend supports them, and `destinations` can still be used on GET to materialize selected fields into caller-provided buffers.
 
 `non_tensor_batch` object arrays are structured-encoded according to their contents. Numeric scalar object arrays, ragged tensors, bytes, strings, JSON-like values, and selected media payloads have explicit codecs. These fields are serialized by design and should not be treated as zero-copy tensor data.
+
+For typed-ragged ndarray rows, Mooncake copies the rows directly into BufferPool staging memory with the native fast-copy extension and writes each chunk through `batch_put_from`. If the extension or BufferPool path is unavailable, the implementation transparently falls back to the regular copy path. This optimization does not change the stored format or require caller configuration.
 
 ## Materializing into caller buffers
 
@@ -162,6 +164,8 @@ transfer.put_structured_object(payload, policy=policy)
 ```
 
 `copy_mode="zero_copy"` requires tensor payloads to be provided as `tensor_object_buffer`; plain torch tensors are rejected because they do not expose a registered tensor-object buffer.
+
+Typed-ragged and other non-tensor structured payloads do not support `copy_mode="zero_copy"`. Use `auto` to enable BufferPool staging and the native fast-copy path when available, or `copy` to force the regular `store.put` path.
 
 ## Cleanup
 

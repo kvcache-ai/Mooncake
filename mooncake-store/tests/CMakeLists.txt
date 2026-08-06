@@ -66,7 +66,14 @@ if(ENABLE_KV_EVENTS)
   endif()
 endif()
 add_store_test(master_service_test master_service_test.cpp)
+add_store_test(batch_evict_test batch_evict_test.cpp)
+add_store_test(master_scenario_test master_scenario.cpp
+               master_scenario_test.cpp)
+add_store_test(master_service_scenario_test master_scenario.cpp
+               master_service_scenario_test.cpp)
 add_store_test(master_service_config_test master_service_config_test.cpp)
+add_store_test(master_service_processing_key_double_erase_test
+               master_service_processing_key_double_erase_test.cpp)
 add_store_test(master_service_tenant_quota_test
                master_service_tenant_quota_test.cpp)
 add_store_test(batch_remove_test batch_remove_test.cpp)
@@ -82,6 +89,14 @@ if(USE_NOF)
   add_store_test(nof_heartbeat_test nof_heartbeat_test.cpp)
 endif()
 add_store_test(client_integration_test client_integration_test.cpp)
+add_test(
+  NAME object_checksum_client_test
+  COMMAND
+    client_integration_test
+    "--gtest_filter=ObjectChecksumTest.*:ClientIntegrationTest.ObjectChecksumRejectsCorruptedObject:ClientIntegrationTest.BatchPutPreservesObjectChecksumPairing"
+)
+set_tests_properties(object_checksum_client_test
+                     PROPERTIES ENVIRONMENT "MOONCAKE_STORE_CHECKSUM=1")
 add_store_test(rpc_timeout_test rpc_timeout_test.cpp)
 if(USE_CXL)
   add_store_test(cxl_client_integration_test cxl_client_integration_test.cpp)
@@ -91,6 +106,19 @@ add_store_test(master_admin_server_test master_admin_server_test.cpp)
 add_store_test(posix_file_test posix_file_test.cpp)
 add_store_test(thread_pool_test thread_pool_test.cpp)
 add_store_test(transfer_task_test transfer_task_test.cpp)
+if(USE_CUDA)
+  find_package(CUDAToolkit REQUIRED)
+  target_compile_definitions(transfer_task_test PRIVATE USE_CUDA)
+  target_link_libraries(transfer_task_test PRIVATE CUDA::cudart)
+  if(USE_TENT)
+    add_test(
+      NAME transfer_scatter_tent_test
+      COMMAND transfer_task_test
+              --gtest_filter=TransferTaskTest.TransferScatterWritesGpuDestinationDirectly)
+    set_tests_properties(transfer_scatter_tent_test
+                         PROPERTIES ENVIRONMENT "MC_USE_TENT=1")
+  endif()
+endif()
 add_store_test(tenant_quota_test tenant_quota_test.cpp)
 add_store_test(tenant_id_test tenant_id_test.cpp)
 add_store_test(segment_test segment_test.cpp)
@@ -129,6 +157,14 @@ add_store_test(task_manager_test task_manager_test.cpp)
 add_store_test(task_executor_test task_executor_test.cpp)
 add_store_test(task_integration_test task_integration_test.cpp)
 add_store_test(dummy_client_get_buffer_test dummy_client_get_buffer_test.cpp)
+add_test(
+  NAME dummy_client_object_checksum_test
+  COMMAND
+    dummy_client_get_buffer_test
+    "--gtest_filter=DummyClientGetBufferTest.GetIntoRejectsCorruptedObjectWithChecksum:DummyClientGetBufferTest.BatchQueryPreservesObjectChecksum"
+)
+set_tests_properties(dummy_client_object_checksum_test
+                     PROPERTIES ENVIRONMENT "MOONCAKE_STORE_CHECKSUM=1")
 add_store_test(uds_transport_test uds_transport_test.cpp)
 add_store_test(health_check_test health_check_test.cpp)
 add_store_test(http_metadata_server_test http_metadata_server_test.cpp)

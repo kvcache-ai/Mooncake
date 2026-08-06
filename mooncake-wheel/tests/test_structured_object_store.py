@@ -589,91 +589,14 @@ def test_bundle_copy_mode_forces_store_put() -> None:
     assert result.objects["payload"] == payload
 
 
-def test_structured_object_copy_mode_skips_pre_registered_validation() -> None:
-    store, transfer = make_transfer()
-    payload = np.arange(64, dtype=np.uint8).reshape(8, 8).T
-
-    ref = transfer.put_structured_object(
-        structured_payload(payload=payload),
-        policy=BundleTransferPolicy(copy_mode="copy"),
-        pre_registered_buffers={"payload": True},
-    )
-
-    assert store.batch_put_from_calls == 0
-    assert store.register_buffer_calls == 0
-    assert store.unregister_buffer_calls == 0
-
-    result = transfer.materialize(transfer.read_spec(ref))
-    assert np.array_equal(result.objects["payload"], payload)
-
-
 def test_bundle_zero_copy_mode_requires_batch_put_support() -> None:
     _store, transfer = make_transfer(MinimalStore())
 
-    with pytest.raises(RuntimeError, match="zero-copy put requested"):
+    with pytest.raises(RuntimeError, match="zero-copy put"):
         transfer.put_structured_object(
             structured_payload(payload=b"data"),
             policy=BundleTransferPolicy(copy_mode="zero_copy"),
         )
-
-
-def test_structured_object_pre_registered_buffers_passthrough() -> None:
-    store, transfer = make_transfer()
-    payload = np.arange(64, dtype=np.uint8).reshape(8, 8)
-    payload_ptr = ctypes.addressof(ctypes.c_char.from_buffer(payload))
-    assert store.register_buffer(payload_ptr, int(payload.nbytes)) == 0
-    store.register_buffer_calls = 0
-    store.unregister_buffer_calls = 0
-
-    ref = transfer.put_structured_object(
-        structured_payload(payload=payload),
-        pre_registered_buffers={"payload": True},
-    )
-
-    assert store.batch_put_from_calls > 0
-    assert store.register_buffer_calls == 0
-    assert store.unregister_buffer_calls == 0
-    assert payload_ptr in store.registered
-
-    result = transfer.materialize(transfer.read_spec(ref))
-    assert np.array_equal(result.objects["payload"], payload)
-    store.unregister_buffer(payload_ptr)
-
-
-def test_structured_object_pre_registered_rejects_copied_buffers() -> None:
-    _store, transfer = make_transfer()
-    non_contiguous = np.arange(64, dtype=np.uint8).reshape(8, 8).T
-
-    with pytest.raises(ValueError, match="pre-registered structured buffer"):
-        transfer.put_structured_object(
-            structured_payload(payload=non_contiguous),
-            pre_registered_buffers={"payload": True},
-        )
-
-    with pytest.raises(ValueError, match="pre-registered structured buffer"):
-        transfer.put_structured_object(
-            structured_payload(payload=b"readonly"),
-            pre_registered_buffers={"payload": True},
-        )
-
-    with pytest.raises(ValueError, match="unknown pre-registered"):
-        transfer.put_structured_object(
-            structured_payload(payload=bytearray(b"data")),
-            pre_registered_buffers={"missing": True},
-        )
-
-
-def test_structured_object_pre_registered_empty_buffer() -> None:
-    _store, transfer = make_transfer()
-    payload = bytearray()
-
-    ref = transfer.put_structured_object(
-        structured_payload(payload=payload),
-        pre_registered_buffers={"payload": True},
-    )
-
-    result = transfer.materialize(transfer.read_spec(ref))
-    assert result.objects["payload"] == b""
 
 
 def test_structured_object_roundtrip() -> None:
@@ -745,6 +668,8 @@ def test_structured_object_ndarray_read_can_use_buffer_pool() -> None:
     payload = structured_payload(weights=array)
 
     ref = transfer.put_structured_object(payload, chunk_bytes=32)
+    pool.acquire_sizes.clear()
+    before_release_count = pool.release_count
     before_range_reads = store.get_into_ranges_calls
     result = transfer.materialize(transfer.read_spec(ref))
 
@@ -754,9 +679,9 @@ def test_structured_object_ndarray_read_can_use_buffer_pool() -> None:
     assert pool.acquire_sizes == [array.nbytes]
 
     MooncakeBundleTransfer.release_result(result.objects)
-    assert pool.release_count == 1
+    assert pool.release_count == before_release_count + 1
     MooncakeBundleTransfer.release_result(result.objects)
-    assert pool.release_count == 1
+    assert pool.release_count == before_release_count + 1
 
 
 def test_structured_object_multi_buffer_payload_uses_pool_batch_put() -> None:
@@ -809,30 +734,6 @@ def test_structured_object_multi_buffer_put_cleans_all_chunk_keys_on_failure() -
     assert pool.release_count == 2
 
 
-def test_structured_object_multi_buffer_zero_copy_put_uses_batch_put() -> None:
-    store, transfer = make_transfer()
-    parts = [bytearray(b"ab"), bytearray(b"cd"), bytearray(b"ef")]
-    payload = StructuredObjectPayload(
-        metadata={},
-        buffers={
-            "raw": sos._MultiBufferPayload(
-                buffers=tuple(memoryview(part) for part in parts),
-                owners=tuple(parts),
-            )
-        },
-    )
-
-    ref = transfer.put_structured_object(
-        payload, chunk_bytes=4, policy=BundleTransferPolicy(copy_mode="zero_copy")
-    )
-    result = transfer.materialize(transfer.read_spec(ref))
-
-    raw = result.objects["raw"]
-    raw_bytes = raw if isinstance(raw, bytes) else raw.tobytes()
-    assert raw_bytes == b"abcdef"
-    assert store.batch_put_from_calls > 0
-
-
 def test_structured_object_multi_buffer_zero_copy_requires_batch_put_support() -> None:
     _store, transfer = make_transfer(MinimalStore())
     parts = [bytearray(b"ab"), bytearray(b"cd")]
@@ -846,7 +747,7 @@ def test_structured_object_multi_buffer_zero_copy_requires_batch_put_support() -
         },
     )
 
-    with pytest.raises(RuntimeError, match="zero-copy put requested"):
+    with pytest.raises(RuntimeError, match="zero-copy put"):
         transfer.put_structured_object(
             payload, policy=BundleTransferPolicy(copy_mode="zero_copy")
         )
@@ -1031,48 +932,6 @@ def test_bundle_remove_recovers_after_transient_batch_failure() -> None:
 
     assert store.objects == {}
     assert store.batch_remove_calls == 1
-
-
-def test_bundle_concurrent_put_and_read_spec_full_read() -> None:
-    store, transfer = make_transfer(GetOnlyStore())
-    payload = bytes(range(128))
-
-    ref = transfer.put_structured_object(
-        structured_payload(payload=payload),
-        chunk_bytes=8,
-        policy=BundleTransferPolicy(max_inflight_put=4, put_mode="parallel"),
-    )
-    result = transfer.materialize(transfer.read_spec(ref))
-
-    assert result.objects["payload"] == payload
-    assert store.max_active_puts > 1
-    assert store.max_active_gets >= 1
-
-
-def test_bundle_duplicate_source_registration_is_tolerated() -> None:
-    store, transfer = make_transfer(StrictRegisterStore())
-    payload = np.arange(64, dtype=np.uint8).reshape(8, 8)
-    payload_ptr = ctypes.addressof(ctypes.c_char.from_buffer(payload))
-    assert store.register_buffer(payload_ptr, int(payload.nbytes)) == 0
-
-    ref = transfer.put_structured_object(structured_payload(payload=payload))
-
-    assert ref.manifest["buffers"]["payload"]["bytes"] == int(payload.nbytes)
-    assert payload_ptr in store.registered
-    store.unregister_buffer(payload_ptr)
-
-
-def test_bundle_partial_register_failure_unwinds_registered_buffers() -> None:
-    store, transfer = make_transfer(FailingRegisterStore(fail_on_register=2))
-    payload = bytes(range(64))
-
-    with pytest.raises(RuntimeError, match="register_buffer"):
-        transfer.put_structured_object(
-            structured_payload(payload=payload), chunk_bytes=32
-        )
-
-    assert store.registered == set()
-    assert store.objects == {}
 
 
 def test_bundle_batch_get_failure_unregisters_buffer() -> None:
@@ -1963,14 +1822,14 @@ def test_unified_put_rejects_unknown_type() -> None:
 
 
 @pytest.mark.parametrize(
-    ("policy", "config_attr"),
+    ("policy", "config_attr", "use_pool"),
     [
-        (BundleTransferPolicy(copy_mode="copy"), "put_configs"),
-        (None, "batch_put_from_configs"),
+        (BundleTransferPolicy(copy_mode="copy"), "put_configs", False),
+        (None, "batch_put_from_configs", True),
     ],
 )
-def test_unified_dict_put_passes_store_config_to_writes(policy, config_attr) -> None:
-    store, transfer = make_transfer()
+def test_unified_dict_put_passes_store_config_to_writes(policy, config_attr, use_pool) -> None:
+    store, transfer = make_transfer(buffer_pool=FakeBufferPool() if use_pool else None)
     config = object()
     data = {"input_ids": np.arange(12, dtype=np.int64).reshape(4, 3)}
     kwargs = {"config": config}
@@ -2026,6 +1885,41 @@ def test_unified_dict_put_accepts_field_schemas() -> None:
     assert result["global_batch_sizes"] == [2]
     assert result["num_microbatches"] == 1
     assert result["step"] == 7
+
+
+def test_release_result_recurses_into_ragged_row_views() -> None:
+    class FakeOwner:
+        def __init__(self) -> None:
+            self.release_count = 0
+
+        def release(self) -> None:
+            self.release_count += 1
+
+    class OwnedArray(np.ndarray):
+        def __new__(cls, data, owner):
+            array = np.asarray(data).view(cls)
+            array._mooncake_pool_owner = owner
+            return array
+
+        def __array_finalize__(self, obj) -> None:
+            if obj is not None:
+                self._mooncake_pool_owner = getattr(
+                    obj, "_mooncake_pool_owner", None
+                )
+
+    owner = FakeOwner()
+    other_owner = FakeOwner()
+    base = OwnedArray(np.arange(6, dtype=np.int64), owner)
+    other = OwnedArray(np.arange(2, dtype=np.int64), other_owner)
+    object_items = np.empty(1, dtype=object)
+    object_items[0] = base[4:5]
+
+    MooncakeBundleTransfer.release_result(
+        {"values": [None, 0, base[:2], {"nested": (base[2:4], object_items)}, other[:1]]}
+    )
+
+    assert owner.release_count == 1
+    assert other_owner.release_count == 1
 
 
 def test_ref_aliases_match_dataproto_ref_helpers() -> None:
@@ -3004,12 +2898,29 @@ def test_dataproto_helper_typed_ragged_uses_multi_buffer_put() -> None:
     result = transfer.get_dataproto(ref)
 
     assert ref.encoded_non_tensor["tokens"]["codec"] == "typed_ragged"
-    assert result["non_tensor_batch"]["tokens"].tolist() == [[1, 2], None, [3, 4, 5]]
+    tokens = result["non_tensor_batch"]["tokens"].tolist()
+    assert tokens == [[1, 2], None, [3, 4, 5]]
     assert rows[0].nbytes + rows[2].nbytes in pool.acquire_sizes
 
 
-def test_dataproto_helper_typed_ragged_zero_copy_put() -> None:
-    store, transfer = make_transfer()
+def test_typed_ragged_uses_direct_copy_payload_when_fast_copy_available() -> None:
+    if sos._concat_arrays_into is None:
+        pytest.skip("native fast-copy extension is unavailable")
+    rows = [
+        np.arange(2, dtype=np.int32),
+        np.arange(3, dtype=np.int32),
+    ]
+
+    payload, metadata = sos._encode_typed_ragged_values(rows, dtype_hint=np.int32)
+
+    assert metadata["shape_policy"] == "ragged"
+    assert isinstance(payload["data"], sos._DirectCopyPayload)
+    assert payload["data"].shape == (5,)
+
+
+def test_dataproto_helper_typed_ragged_fast_copy_put() -> None:
+    pool = FakeBufferPool()
+    store, transfer = make_transfer(buffer_pool=pool)
     rows = np.empty(3, dtype=object)
     rows[:] = [
         np.asarray([1, 2], dtype=np.int32),
@@ -3018,11 +2929,67 @@ def test_dataproto_helper_typed_ragged_zero_copy_put() -> None:
     ]
     data = SimpleDataProto(non_tensor_batch={"tokens": rows})
 
-    ref = transfer.put_dataproto(data, policy=BundleTransferPolicy(copy_mode="zero_copy"))
+    ref = transfer.put_dataproto(data)
     result = transfer.get_dataproto(ref)
 
-    assert result["non_tensor_batch"]["tokens"].tolist() == [[1, 2], None, [3, 4, 5]]
+    tokens = result["non_tensor_batch"]["tokens"].tolist()
+    assert tokens == [[1, 2], None, [3, 4, 5]]
     assert store.batch_put_from_calls > 0
+    assert rows[0].nbytes + rows[2].nbytes in pool.acquire_sizes
+
+
+def test_direct_copy_put_rolls_back_all_chunks_on_late_failure() -> None:
+    if sos._concat_arrays_into is None:
+        pytest.skip("native fast-copy extension is unavailable")
+    store = FailingBatchPutStore(fail_on_call=2)
+    pool = FakeBufferPool()
+    _, transfer = make_transfer(store=store, buffer_pool=pool)
+    arrays = [
+        np.asarray([1, 2], dtype=np.int32),
+        np.asarray([3, 4], dtype=np.int32),
+        np.asarray([5, 6], dtype=np.int32),
+    ]
+    payload = sos._DirectCopyPayload.from_flat_arrays(
+        arrays, np.dtype(np.int32), total_elems=6
+    )
+
+    with pytest.raises(RuntimeError, match="batch_put_from"):
+        transfer._bundle_store._put_direct_copy_payload(
+            "payload",
+            payload,
+            chunk_bytes=8,
+            transfer_policy=BundleTransferPolicy(),
+        )
+
+    assert store.objects == {}
+    assert pool.acquire_count == pool.release_count == 2
+
+
+def test_dataproto_helper_typed_ragged_rejects_short_fast_copy(monkeypatch) -> None:
+    pool = FakeBufferPool()
+    _store, transfer = make_transfer(buffer_pool=pool)
+    rows = np.empty(2, dtype=object)
+    rows[:] = [np.asarray([1, 2], dtype=np.int32), np.asarray([3], dtype=np.int32)]
+
+    monkeypatch.setattr(sos, "_concat_arrays_into", lambda *args: args[2] - 1)
+
+    with pytest.raises(RuntimeError, match="native fast-copy wrote"):
+        transfer.put_dataproto(SimpleDataProto(non_tensor_batch={"tokens": rows}))
+
+
+def test_dataproto_helper_typed_ragged_zero_copy_rejects_source_buffers() -> None:
+    _store, transfer = make_transfer(buffer_pool=FakeBufferPool())
+    rows = np.empty(2, dtype=object)
+    rows[:] = [
+        np.asarray([1, 2], dtype=np.int32),
+        np.asarray([3], dtype=np.int32),
+    ]
+
+    with pytest.raises(RuntimeError, match="zero-copy put"):
+        transfer.put_dataproto(
+            SimpleDataProto(non_tensor_batch={"tokens": rows}),
+            policy=BundleTransferPolicy(copy_mode="zero_copy"),
+        )
 
 
 def test_dataproto_helper_rejects_unsupported_object_non_tensor() -> None:

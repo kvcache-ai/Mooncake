@@ -1,5 +1,5 @@
-#ifndef MOONCAKE_PG_CONTROL_PLANE_TYPES_H
-#define MOONCAKE_PG_CONTROL_PLANE_TYPES_H
+#ifndef MOONCAKE_PG_CONTROL_PLANE_CONTROL_TYPES_H
+#define MOONCAKE_PG_CONTROL_PLANE_CONTROL_TYPES_H
 
 #include <cstdint>
 #include <optional>
@@ -27,7 +27,7 @@ constexpr GlobalRank kInvalidGlobalRank = -1;
 constexpr int kMaxNumRanks = 64;
 
 // Resolves a registration only against runtime groups stored under the same
-// GroupBootstrapId, i.e. the same backend type and PyTorch group_id.
+// GroupBootstrapId, i.e. the same device kind and PyTorch group id.
 // An exact match requires both rank_order and max_group_size to be equal.
 //
 // CreateOrAttach:
@@ -167,4 +167,4 @@ struct LinkEvent {
 
 }  // namespace mooncake
 
-#endif  // MOONCAKE_PG_CONTROL_PLANE_TYPES_H
+#endif  // MOONCAKE_PG_CONTROL_PLANE_CONTROL_TYPES_H

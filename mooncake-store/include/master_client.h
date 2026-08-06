@@ -210,12 +210,12 @@ class MasterClient {
 
     /**
      * @brief Ends a put operation
-     * @param key Object key
+     * @param object_meta Object key and optional checksum
      * @param replica_type Type of replica (memory or disk)
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
     [[nodiscard]] tl::expected<void, ErrorCode> PutEnd(
-        const std::string& key, ReplicaType replica_type);
+        const ObjectMeta& object_meta, ReplicaType replica_type);
 
     /**
      * @brief Ends a put operation for a batch of objects
@@ -223,7 +223,7 @@ class MasterClient {
      * @return ErrorCode indicating success/failure
      */
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
-        const std::vector<std::string>& keys,
+        const std::vector<ObjectMeta>& object_metas,
         ReplicaType replica_type = ReplicaType::ALL);
 
     /**
@@ -263,10 +263,10 @@ class MasterClient {
                      const ReplicateConfig& config);
 
     [[nodiscard]] tl::expected<void, ErrorCode> UpsertEnd(
-        const std::string& key, ReplicaType replica_type);
+        const ObjectMeta& object_meta, ReplicaType replica_type);
 
     [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchUpsertEnd(
-        const std::vector<std::string>& keys);
+        const std::vector<ObjectMeta>& object_metas);
 
     [[nodiscard]] tl::expected<void, ErrorCode> UpsertRevoke(
         const std::string& key, ReplicaType replica_type);

@@ -604,6 +604,12 @@ MasterService::~MasterService() {
         MasterMetricManager::instance().dec_allocated_mem_size(
             segment, static_cast<int64_t>(bytes));
     }
+
+    // Segments still mounted here never went through CommitUnmountSegment;
+    // release their capacity contribution so the process-lifetime
+    // MasterMetricManager stays consistent when the next leadership term
+    // constructs a fresh MasterService and the clients remount.
+    segment_manager_.releaseCapacityMetrics();
 }
 
 ErrorCode MasterService::SetBatchOpLogBackendForTesting(
@@ -1906,6 +1912,17 @@ MasterService::EraseMetadata(
             source->dec_refcnt();
         }
         tenant_state.offloading_tasks.erase(offload_it);
+
+        // Mirror entry in local_disk_segment.offloading_objects must be
+        // dropped too, otherwise the next OffloadObjectHeartbeat drains a
+        // task-less key back to the client and produces an orphan bucket.
+        const std::string scoped_key = tenant_id.MakeScopedKey(key);
+        ScopedLocalDiskSegmentAccess ssd_access =
+            segment_manager_.getLocalDiskSegmentAccess();
+        for (auto& [_, segment] : ssd_access.getClientLocalDiskSegment()) {
+            MutexLocker locker(&segment->offloading_mutex_);
+            segment->offloading_objects.erase(scoped_key);
+        }
     }
     tenant_state.processing_keys.erase(key);
     tenant_state.replication_tasks.erase(key);
@@ -3051,7 +3068,8 @@ auto MasterService::GetReplicaList(const std::string& key,
         }
 
         resp = GetReplicaListResponse(std::move(replica_list),
-                                      default_kv_lease_ttl_);
+                                      default_kv_lease_ttl_,
+                                      metadata.object_checksum);
     }
     // RO accessor released. Safe to take a fresh RW accessor now.
     if (promotion_eligible) {
@@ -3087,7 +3105,8 @@ auto MasterService::GetReplicaListForAdmin(const std::string& key,
     }
 
     return GetReplicaListResponse(std::move(replica_list),
-                                  default_kv_lease_ttl_);
+                                  default_kv_lease_ttl_,
+                                  metadata.object_checksum);
 }
 
 std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
@@ -3210,7 +3229,8 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                 }
 
                 results[original_idx] = GetReplicaListResponse(
-                    std::move(replica_list), default_kv_lease_ttl_);
+                    std::move(replica_list), default_kv_lease_ttl_,
+                    metadata.object_checksum);
             }
         }
 
@@ -3303,7 +3323,8 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
                 }
 
                 results[original_idx] = GetReplicaListResponse(
-                    std::move(replica_list), default_kv_lease_ttl_);
+                    std::move(replica_list), default_kv_lease_ttl_,
+                    metadata.object_checksum);
             }
         }
     }
@@ -3732,9 +3753,10 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
     return tl::make_unexpected(ErrorCode::TENANT_QUOTA_EXCEEDED);
 }
 
-auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
+auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
                            const TenantId& tenant_id, ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
+    const auto& key = object_meta.key;
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const auto object_id = MakeObjectIdentityForRequest(key, tenant_id);
     MetadataAccessorRW accessor(this, object_id);
@@ -3769,6 +3791,13 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
             return replica.type() == replica_type;
         },
         [](Replica& replica) { replica.mark_complete(); });
+
+    if (object_meta.object_checksum.has_value() ||
+        replica_type == ReplicaType::ALL ||
+        replica_type == ReplicaType::MEMORY ||
+        replica_type == ReplicaType::NOF_SSD) {
+        metadata.object_checksum = object_meta.object_checksum;
+    }
 
     const bool has_memory_replica = metadata.HasMemReplica();
     const bool should_settle_quota =
@@ -4052,14 +4081,22 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     return {};
 }
 
+auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
+                           const TenantId& tenant_id, ReplicaType replica_type)
+    -> tl::expected<void, ErrorCode> {
+    return PutEnd(client_id, ObjectMeta{key, std::nullopt}, tenant_id,
+                  replica_type);
+}
+
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutEnd(
-    const UUID& client_id, const std::vector<std::string>& keys,
+    const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
     const TenantId& tenant_id, ReplicaType replica_type) {
     assert(tenant_id.IsValid());
     std::vector<tl::expected<void, ErrorCode>> results;
-    results.reserve(keys.size());
-    for (const auto& key : keys) {
-        results.emplace_back(PutEnd(client_id, key, tenant_id, replica_type));
+    results.reserve(object_metas.size());
+    for (const auto& object_meta : object_metas) {
+        results.emplace_back(
+            PutEnd(client_id, object_meta, tenant_id, replica_type));
     }
     return results;
 }
@@ -4432,11 +4469,20 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     return tl::make_unexpected(ErrorCode::TENANT_QUOTA_EXCEEDED);
 }
 
+auto MasterService::UpsertEnd(const UUID& client_id,
+                              const ObjectMeta& object_meta,
+                              const TenantId& tenant_id,
+                              ReplicaType replica_type)
+    -> tl::expected<void, ErrorCode> {
+    return PutEnd(client_id, object_meta, tenant_id, replica_type);
+}
+
 auto MasterService::UpsertEnd(const UUID& client_id, const std::string& key,
                               const TenantId& tenant_id,
                               ReplicaType replica_type)
     -> tl::expected<void, ErrorCode> {
-    return PutEnd(client_id, key, tenant_id, replica_type);
+    return UpsertEnd(client_id, ObjectMeta{key, std::nullopt}, tenant_id,
+                     replica_type);
 }
 
 auto MasterService::UpsertRevoke(const UUID& client_id, const std::string& key,
@@ -4481,9 +4527,9 @@ MasterService::BatchUpsertStart(const UUID& client_id,
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchUpsertEnd(
-    const UUID& client_id, const std::vector<std::string>& keys,
+    const UUID& client_id, const std::vector<ObjectMeta>& object_metas,
     const TenantId& tenant_id) {
-    return BatchPutEnd(client_id, keys, tenant_id);
+    return BatchPutEnd(client_id, object_metas, tenant_id, ReplicaType::ALL);
 }
 
 std::vector<tl::expected<void, ErrorCode>> MasterService::BatchUpsertRevoke(
@@ -8225,13 +8271,31 @@ void MasterService::BatchEvict(double evict_ratio_target,
     size_t start_idx = randomIndex(kNumShards);
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
 
-    // ===== Phase 1: Parallel candidate collection =====
-    // N threads each scan a batch of shards, collecting Candidates with
-    // shard_idx + tenant_id + key for safe re-lookup in Phase 2.
+    // ===== Phase 1: Parallel candidate census =====
+    // N threads each scan a batch of shards. For selective ratios only the
+    // lease timestamps are collected here; full tenant/key identities are
+    // materialized afterwards for a bounded frontier around the eviction
+    // cutoff. High ratios collect full Candidates directly, because a census
+    // followed by a second scan would cost more than the identities it saves.
     int num_threads = std::min((int)kNumShards, 16);
     size_t shards_per_thread = (kNumShards + num_threads - 1) / num_threads;
 
+    constexpr size_t kMinReserveSlack = 1024;
+    constexpr size_t kMinFrontierLimit = 64 * 1024;
+    constexpr size_t kReserveSlackDivisor = 10;
+    constexpr size_t kFrontierDivisor = 4;
+    // Above this target ratio the reserve frontier would already cover a
+    // large share of the population, so selective materialization stops
+    // paying for the extra scan it costs.
+    constexpr double kCompactPrebypassTargetRatio =
+        static_cast<double>(kReserveSlackDivisor) /
+        static_cast<double>(kFrontierDivisor * (kReserveSlackDivisor + 1));
+    const bool compact_frontier_prebypass =
+        evict_ratio_target >= kCompactPrebypassTargetRatio;
+
     std::vector<std::vector<Candidate>> local_candidates(num_threads);
+    std::vector<std::vector<std::chrono::system_clock::time_point>>
+        local_no_pin(num_threads);
     std::vector<long> local_eviction_base(num_threads, 0);
     std::vector<long> local_object_count(num_threads, 0);
     std::vector<std::vector<std::chrono::system_clock::time_point>>
@@ -8258,9 +8322,14 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         if (!it->second.IsLeaseExpired(now) || !has_evictable)
                             continue;
                         if (!it->second.IsSoftPinned(now)) {
-                            local_candidates[t].push_back(
-                                {s, tenant_id, it->first,
-                                 it->second.lease_timeout});
+                            if (compact_frontier_prebypass) {
+                                local_candidates[t].push_back(
+                                    {s, tenant_id, it->first,
+                                     it->second.lease_timeout});
+                            } else {
+                                local_no_pin[t].push_back(
+                                    it->second.lease_timeout);
+                            }
                         } else if (allow_evict_soft_pinned_objects_) {
                             local_soft_pin[t].push_back(
                                 it->second.lease_timeout);
@@ -8282,14 +8351,27 @@ void MasterService::BatchEvict(double evict_ratio_target,
     for (auto v : local_object_count) object_count += v;
 
     std::vector<Candidate> candidates;
-    {
+    if (compact_frontier_prebypass) {
         size_t total = 0;
         for (auto& v : local_candidates) total += v.size();
         candidates.reserve(total);
+        for (auto& v : local_candidates) {
+            candidates.insert(candidates.end(),
+                              std::make_move_iterator(v.begin()),
+                              std::make_move_iterator(v.end()));
+        }
     }
-    for (auto& v : local_candidates) {
-        candidates.insert(candidates.end(), std::make_move_iterator(v.begin()),
-                          std::make_move_iterator(v.end()));
+
+    std::vector<std::chrono::system_clock::time_point> no_pin_timeouts;
+    {
+        size_t total = 0;
+        for (auto& v : local_no_pin) total += v.size();
+        no_pin_timeouts.reserve(total);
+    }
+    for (auto& v : local_no_pin) {
+        no_pin_timeouts.insert(no_pin_timeouts.end(),
+                               std::make_move_iterator(v.begin()),
+                               std::make_move_iterator(v.end()));
     }
 
     std::vector<std::chrono::system_clock::time_point> soft_pin_objects;
@@ -8311,6 +8393,108 @@ void MasterService::BatchEvict(double evict_ratio_target,
         return;
     }
 
+    const long ideal_evict_num =
+        std::ceil(total_eviction_base * evict_ratio_target);
+    const size_t no_pin_count =
+        compact_frontier_prebypass ? candidates.size() : no_pin_timeouts.size();
+    const long primary_no_pin_num =
+        std::min(ideal_evict_num, static_cast<long>(no_pin_count));
+
+    // Re-scan metadata and copy full identities only for objects inside the
+    // requested timestamp range. The eligibility conditions are identical to
+    // the census above, so the selected set matches what the census counted.
+    auto collect_candidates = [&](bool use_cutoff,
+                                  std::chrono::system_clock::time_point cutoff,
+                                  bool collect_older_or_equal) {
+        std::vector<std::vector<Candidate>> local_frontier(num_threads);
+        std::vector<std::thread> collectors;
+        collectors.reserve(num_threads);
+
+        for (int t = 0; t < num_threads; t++) {
+            collectors.emplace_back([&, t] {
+                size_t s_start = t * shards_per_thread;
+                size_t s_end =
+                    std::min(s_start + shards_per_thread, kNumShards);
+                for (size_t s = s_start; s < s_end; s++) {
+                    MetadataShardAccessorRW shard(this, s);
+                    for (const auto& [tenant_id, tenant_state] :
+                         shard->tenants) {
+                        for (const auto& [key, metadata] :
+                             tenant_state.metadata) {
+                            if (metadata.IsHardPinned() ||
+                                !metadata.IsLeaseExpired(now) ||
+                                metadata.IsSoftPinned(now) ||
+                                !can_evict_replicas(metadata)) {
+                                continue;
+                            }
+                            if (use_cutoff) {
+                                const bool in_range =
+                                    collect_older_or_equal
+                                        ? metadata.lease_timeout <= cutoff
+                                        : metadata.lease_timeout > cutoff;
+                                if (!in_range) continue;
+                            }
+                            local_frontier[t].push_back(
+                                {s, tenant_id, key, metadata.lease_timeout});
+                        }
+                    }
+                }
+            });
+        }
+        for (auto& collector : collectors) collector.join();
+
+        size_t total = 0;
+        for (const auto& v : local_frontier) total += v.size();
+        std::vector<Candidate> merged;
+        merged.reserve(total);
+        for (auto& v : local_frontier) {
+            merged.insert(merged.end(), std::make_move_iterator(v.begin()),
+                          std::make_move_iterator(v.end()));
+        }
+        return merged;
+    };
+
+    bool compact_frontier_used = false;
+    std::chrono::system_clock::time_point reserve_cutoff{};
+
+    if (primary_no_pin_num > 0 && !compact_frontier_prebypass) {
+        const size_t primary_count = static_cast<size_t>(primary_no_pin_num);
+        // The reserve absorbs objects that stop being evictable between the
+        // census and the eviction pass, so ordinary churn does not require a
+        // second materialization pass.
+        const size_t reserve_slack = std::max(
+            kMinReserveSlack,
+            (primary_count + kReserveSlackDivisor - 1) / kReserveSlackDivisor);
+        const size_t reserve_count =
+            std::min(no_pin_count, primary_count + reserve_slack);
+        const size_t frontier_limit =
+            std::max(kMinFrontierLimit,
+                     (no_pin_count + kFrontierDivisor - 1) / kFrontierDivisor);
+
+        if (reserve_count <= frontier_limit) {
+            std::nth_element(no_pin_timeouts.begin(),
+                             no_pin_timeouts.begin() + (reserve_count - 1),
+                             no_pin_timeouts.end());
+            reserve_cutoff = no_pin_timeouts[reserve_count - 1];
+            candidates = collect_candidates(/*use_cutoff=*/true, reserve_cutoff,
+                                            /*collect_older_or_equal=*/true);
+
+            // Shortfall guard: if churn left the frontier holding fewer
+            // objects than the target needs, fall back to the full candidate
+            // set so evict_num below still derives from the requested target
+            // rather than from a shrunken frontier.
+            if (candidates.size() >= primary_count) {
+                compact_frontier_used = true;
+            } else {
+                candidates =
+                    collect_candidates(/*use_cutoff=*/false, {},
+                                       /*collect_older_or_equal=*/true);
+            }
+        } else {
+            candidates = collect_candidates(/*use_cutoff=*/false, {},
+                                            /*collect_older_or_equal=*/true);
+        }
+    }
     // ===== Phase 2: Serial eviction via key lookup =====
     long evicted_count = 0;
     uint64_t total_freed_size = 0;
@@ -8319,8 +8503,6 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
     // First pass: evict candidates with no soft pin
     if (!candidates.empty()) {
-        long ideal_evict_num =
-            std::ceil(total_eviction_base * evict_ratio_target);
         long evict_num = std::min(ideal_evict_num, (long)candidates.size());
 
         std::nth_element(candidates.begin(),
@@ -8334,46 +8516,70 @@ void MasterService::BatchEvict(double evict_ratio_target,
         // continue trying the next one so actual evicted count reaches
         // evict_num. This matches the old per-shard over-eviction behavior.
         long evicted_this_pass = 0;
-        for (auto& c : candidates) {
-            if (evicted_this_pass >= evict_num &&
-                c.lease_timeout > target_timeout) {
-                no_pin_objects.push_back(c.lease_timeout);
-                continue;
-            }
-            {
-                MetadataShardAccessorRW shard(this, c.shard_idx);
-                auto tenant_it = shard->tenants.find(c.tenant_id);
-                if (tenant_it == shard->tenants.end()) continue;
-                auto& tenant_state = tenant_it->second;
-                auto it = tenant_state.metadata.find(c.key);
-                if (it == tenant_state.metadata.end()) continue;
-                // Re-validate: state may have changed since Phase 1
-                if (!it->second.IsLeaseExpired(now) ||
-                    it->second.IsSoftPinned(now) ||
-                    !can_evict_replicas(it->second)) {
+        auto evict_candidate_batch = [&](std::vector<Candidate>& batch) {
+            for (auto& c : batch) {
+                if (evicted_this_pass >= evict_num &&
+                    c.lease_timeout > target_timeout) {
                     no_pin_objects.push_back(c.lease_timeout);
                     continue;
                 }
-                auto evict_result = try_evict_group_or_object(
-                    c.tenant_id, c.key, it->second, shard, tenant_state,
-                    deferred_replicas,
-                    /*allow_soft_pinned=*/false);
-                total_freed_size += evict_result.freed_bytes;
-                if (!enable_oplog_ && !it->second.IsGrouped()) {
-                    PublishKvRemovedAfterEvict(c.key, evict_result.freed_bytes,
-                                               "cpu", it->second, c.tenant_id);
+                {
+                    MetadataShardAccessorRW shard(this, c.shard_idx);
+                    auto tenant_it = shard->tenants.find(c.tenant_id);
+                    if (tenant_it == shard->tenants.end()) continue;
+                    auto& tenant_state = tenant_it->second;
+                    auto it = tenant_state.metadata.find(c.key);
+                    if (it == tenant_state.metadata.end()) continue;
+
+                    // Re-validate: state may have changed since Phase 1
+                    if (!it->second.IsLeaseExpired(now) ||
+                        it->second.IsSoftPinned(now) ||
+                        !can_evict_replicas(it->second)) {
+                        no_pin_objects.push_back(c.lease_timeout);
+                        continue;
+                    }
+
+                    auto evict_result = try_evict_group_or_object(
+                        c.tenant_id, c.key, it->second, shard, tenant_state,
+                        deferred_replicas,
+                        /*allow_soft_pinned=*/false);
+
+                    total_freed_size += evict_result.freed_bytes;
+
+                    if (!enable_oplog_ && !it->second.IsGrouped()) {
+                        PublishKvRemovedAfterEvict(
+                            c.key, evict_result.freed_bytes, "cpu", it->second,
+                            c.tenant_id);
+                    }
+
+                    if (!enable_oplog_ && !it->second.IsValid()) {
+                        EraseMetadata(tenant_state, it, c.tenant_id,
+                                      QuotaEraseMode::kFull, &shard);
+                    }
+
+                    if (tenant_state.Empty()) {
+                        shard->tenants.erase(tenant_it);
+                    }
+
+                    evicted_count += evict_result.evicted_objects;
+                    evicted_this_pass += evict_result.evicted_objects;
                 }
-                if (!enable_oplog_ && !it->second.IsValid()) {
-                    EraseMetadata(tenant_state, it, c.tenant_id,
-                                  QuotaEraseMode::kFull, &shard);
-                }
-                if (tenant_state.Empty()) {
-                    shard->tenants.erase(tenant_it);
-                }
-                evicted_count += evict_result.evicted_objects;
-                evicted_this_pass += evict_result.evicted_objects;
+                deferred_replicas.clear();
             }
-            deferred_replicas.clear();
+        };
+
+        evict_candidate_batch(candidates);
+
+        // Metadata may change after the frontier is materialized. If the
+        // reserve is exhausted before the target is met, refill from the
+        // remainder of the current no-soft-pin population. This recovery
+        // scan is paid only on churn and preserves the behavior of
+        // continuing past the cutoff until evict_num is reached.
+        if (compact_frontier_used && evicted_this_pass < evict_num) {
+            auto refill_candidates = collect_candidates(
+                /*use_cutoff=*/true, reserve_cutoff,
+                /*collect_older_or_equal=*/false);
+            evict_candidate_batch(refill_candidates);
         }
     }
 
@@ -9515,6 +9721,7 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
 
         it->second.lease_timeout = metadata_ptr->lease_timeout;
         it->second.soft_pin_timeout = metadata_ptr->soft_pin_timeout;
+        it->second.object_checksum = metadata_ptr->object_checksum;
 
         // Recompute disk_object_count for restored metadata
         if (it->second.HasReplica([](const Replica& r) {
@@ -9534,12 +9741,15 @@ MasterService::MetadataSerializer::SerializeMetadata(
     // Pack ObjectMetadata using array structure for efficiency
     // Format: [client_id, put_start_time, size, lease_timeout,
     // has_soft_pin_timeout, soft_pin_timeout, replicas_count, data_type,
-    // replicas..., hard_pinned, group_id]
+    // replicas..., hard_pinned, group_id, object_checksum?]
 
     size_t array_size = 10;  // client_id, put_start_time, size, lease_timeout,
                              // has_soft_pin_timeout, soft_pin_timeout,
                              // replicas_count, data_type, hard_pinned, group_id
     array_size += metadata.CountReplicas();  // One element per replica
+    if (metadata.object_checksum.has_value()) {
+        ++array_size;
+    }
     packer.pack_array(array_size);
 
     // Serialize client_id
@@ -9592,6 +9802,9 @@ MasterService::MetadataSerializer::SerializeMetadata(
 
     packer.pack(metadata.IsHardPinned());
     packer.pack(metadata.group_id);
+    if (metadata.object_checksum.has_value()) {
+        packer.pack(*metadata.object_checksum);
+    }
 
     return {};
 }
@@ -9650,11 +9863,12 @@ MasterService::MetadataSerializer::DeserializeMetadata(
     //   v2: 8 + replicas_count, either data_type or hard_pinned
     //   v3: 9 + replicas_count, data_type + hard_pinned or hard_pinned +
     //   group_id v4: 10 + replicas_count, data_type + hard_pinned + group_id
+    //   v5: 11 + replicas_count, v4 + object_checksum
     // 64-bit arithmetic keeps an attacker-controlled near-UINT32_MAX
     // replicas_count from wrapping the bounds and slipping an out-of-bounds
     // index past the size check.
     constexpr uint64_t kBaseFieldCount = 7;
-    constexpr uint64_t kMaxOptionalFieldCount = 3;
+    constexpr uint64_t kMaxOptionalFieldCount = 4;
     const uint64_t total_elements = obj.via.array.size;
     const uint64_t min_elements = kBaseFieldCount + replicas_count;
     if (total_elements < min_elements ||
@@ -9704,6 +9918,17 @@ MasterService::MetadataSerializer::DeserializeMetadata(
         group_id = array[index++].as<std::string>();
     }
 
+    std::optional<uint64_t> object_checksum;
+    if (index < total_elements &&
+        array[index].type == msgpack::type::POSITIVE_INTEGER) {
+        object_checksum = array[index++].as<uint64_t>();
+    }
+    if (index != total_elements) {
+        return tl::unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL,
+            "deserialize ObjectMetadata optional field type mismatch"));
+    }
+
     // Create ObjectMetadata instance
     bool enable_soft_pin = has_soft_pin_timeout;
     auto metadata = std::make_unique<ObjectMetadata>(
@@ -9712,6 +9937,7 @@ MasterService::MetadataSerializer::DeserializeMetadata(
             std::chrono::milliseconds(put_start_time_timestamp)),
         size, std::move(replicas), enable_soft_pin, is_hard_pinned, data_type,
         group_id);
+    metadata->object_checksum = object_checksum;
     metadata->lease_timeout = std::chrono::system_clock::time_point(
         std::chrono::milliseconds(lease_timestamp));
 

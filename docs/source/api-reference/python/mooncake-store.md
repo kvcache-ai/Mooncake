@@ -193,9 +193,9 @@ metadata = result.metadata
 
 ### Structured object transfer policy
 
-By default, structured object writes use `BundleTransferPolicy(copy_mode="auto")`. This keeps the existing behavior: Mooncake uses the zero-copy `batch_put_from` fast path when buffer registration is available, and falls back to ordinary `store.put` when the fast path is unavailable.
+By default, structured object writes use `BundleTransferPolicy(copy_mode="auto")`. Non-tensor payloads are staged through a Mooncake BufferPool and written with `batch_put_from` when that path is available; otherwise Mooncake falls back to ordinary `store.put`. Typed-ragged ndarray rows use the native fast-copy extension to copy directly into the staging buffer without an intermediate concatenation.
 
-For very large tensors, buffer registration capacity can be exhausted. If the upper layer does not handle this failure mode yet, force the non-zero-copy path with `copy_mode="copy"`:
+Use `copy_mode="copy"` to force the regular `store.put` path:
 
 ```python
 from mooncake.structured_object_store import BundleTransferPolicy
@@ -208,11 +208,9 @@ ref = transfer.put_structured_object(
 
 Available modes:
 
-- `auto`: prefer zero-copy and fall back to regular `store.put` when zero-copy support is unavailable;
-- `copy`: force the non-zero-copy `store.put` path;
-- `zero_copy`: require the zero-copy `batch_put_from` path and raise an error if it is unavailable.
-
-If a caller has already registered a structured member buffer, pass `pre_registered_buffers={"member_name": True}` to avoid duplicate registration. The buffer must be the same writable, contiguous buffer used for transfer; read-only, non-contiguous, or internally copied buffers are rejected.
+- `auto`: prefer BufferPool staging plus `batch_put_from` for non-tensor payloads and fall back to regular `store.put` when that path is unavailable;
+- `copy`: force the regular `store.put` path;
+- `zero_copy`: require payloads to be explicit `tensor_object_buffer` instances; non-tensor structured payloads are rejected.
 
 ### Partial reads
 
@@ -1134,6 +1132,22 @@ def setup_dummy(self, mem_pool_size: int, local_buffer_size: int, server_address
 store.setup_dummy(1024*1024*256, 1024*1024*64, "localhost:8080")
 ```
 
+Dummy clients do not own Store segments. They use a local shared-memory buffer
+that is mapped by a real client process at `server_address`. Tensor APIs that
+stage through this SHM buffer are supported, including tensor put/get,
+`*_tensor_from`, `*_tensor_into`, tensor upsert/pub, TP wrappers, and unified
+parallelism write wrappers.
+
+The real client owns the SHM buffer allocator. This keeps tensor writes and
+regular object writes from allocating overlapping offsets when they run
+concurrently through the same dummy client. Writes staged through the dummy
+client's local SHM buffer keep their allocation alive until completion through
+the real-side active buffer handle and dummy-side RAII release path.
+
+Full materialized reconstruction reads for writer-sharded or reconstructed
+parallel tensors are still conservative for dummy clients. Use the corresponding
+`*_into` APIs, or read stored shards directly, when using dummy clients.
+
 ---
 
 #### put()
@@ -1611,7 +1625,8 @@ def batch_get_buffer(self, keys: List[str]) -> List[BufferHandle]
 **Returns:**
 - `List[BufferHandle]`: List of buffer objects, with None for keys not found
 
-**Note:** This function is not supported for dummy client.
+**Note:** This function is supported for dummy clients through the real
+client-owned shared-memory staging buffer.
 
 **Example:**
 ```python
@@ -2045,7 +2060,8 @@ def put_from_with_metadata(self, key: str, buffer_ptr: int, metadata_buffer_ptr:
 **Returns:**
 - `int`: Status code (0 = success, non-zero = error code)
 
-**Note:** This function is not supported for dummy client.
+**Note:** This function is supported for dummy clients through the real
+client-owned shared-memory staging buffer.
 
 **Example:**
 ```python
@@ -2445,7 +2461,8 @@ def upsert_tensor_from(self, key: str, buffer_ptr: int, size: int) -> int
 **Returns:**
 - `int`: Status code (0 = success, non-zero = error code)
 
-**Note:** This function is not supported for dummy client.
+**Note:** This function is supported for dummy clients through the real
+client-owned shared-memory staging buffer.
 
 #### batch_upsert_tensor_from()
 
@@ -2479,7 +2496,9 @@ def batch_upsert_tensor(self, keys: List[str], tensors_list: List[torch.Tensor])
 **Returns:**
 - `List[int]`: List of status codes for each tensor operation.
 
-**Note:** This function requires `torch` to be installed and available in the environment. Not supported for dummy client.
+**Note:** This function requires `torch` to be installed and available in the
+environment. It is supported for dummy clients through the real client-owned
+shared-memory staging buffer.
 
 #### upsert_pub_tensor()
 
@@ -2497,7 +2516,9 @@ def upsert_pub_tensor(self, key: str, tensor: torch.Tensor, config: ReplicateCon
 **Returns:**
 - `int`: Status code (0 = success, non-zero = error code)
 
-**Note:** This function requires `torch` to be installed and available in the environment. Not supported for dummy client.
+**Note:** This function requires `torch` to be installed and available in the
+environment. It is supported for dummy clients through the real client-owned
+shared-memory staging buffer.
 
 **Example:**
 ```python
@@ -2531,7 +2552,9 @@ def batch_upsert_pub_tensor(self, keys: List[str], tensors_list: List[torch.Tens
 **Returns:**
 - `List[int]`: List of status codes for each tensor operation.
 
-**Note:** This function requires `torch` to be installed and available in the environment. Not supported for dummy client.
+**Note:** This function requires `torch` to be installed and available in the
+environment. It is supported for dummy clients through the real client-owned
+shared-memory staging buffer.
 
 
 ---

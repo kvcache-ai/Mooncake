@@ -525,6 +525,45 @@ glog's standard flags (`--log_dir`, `--max_log_size`, `--logtostderr`, ...) cont
 | `--enable_metric_reporting` | `true` | Periodically log master metrics |
 | `--metrics_port` | `9003` | HTTP port for `/metrics` endpoints |
 
+### KV Cache Event Publisher
+
+The master can publish KV cache lifecycle events over a ZMQ PUB socket for
+cache-aware indexers such as Mooncake Conductor. This feature is compiled out
+by default. Install `libzmq3-dev` and configure Mooncake Store with
+`-DENABLE_KV_EVENTS=ON` before enabling it at runtime.
+
+Both `--kv_events_bind_endpoint` and `--kv_events_backend_id` are required when
+the publisher is enabled. If either value is empty, or the ZMQ socket cannot
+bind, the master logs an error and continues with event publishing disabled.
+
+```bash
+mooncake_master \
+  --enable_kv_events=true \
+  --kv_events_bind_endpoint=tcp://0.0.0.0:5557 \
+  --kv_events_backend_id=store-node-1
+```
+
+Register an address reachable by the indexer, rather than the wildcard bind
+address, through the indexer's `POST /register` endpoint. For the event format,
+registration fields, and object-key behavior, see the {ref}`Mooncake Store
+master publisher <mooncake-store-master-publisher>` reference.
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--enable_kv_events` | `false` | Enable the ZMQ KV cache event publisher; requires a build with `ENABLE_KV_EVENTS=ON` |
+| `--kv_events_bind_endpoint` | empty | ZMQ PUB bind endpoint, for example `tcp://0.0.0.0:5557`; required when enabled |
+| `--kv_events_backend_id` | empty | Cache-owner identity emitted as `backend_id`; required when enabled |
+| `--kv_events_emit_legacy_compat` | `true` | Include vLLM/SGLang-compatible aliases such as `type` and `block_hashes` |
+| `--kv_events_emit_object_key` | `true` | Include the Mooncake `object_key`; unparsable sequence hashes are still published when this is enabled |
+| `--kv_events_queue_capacity` | `65536` | Maximum pending events; the publisher drops the oldest event when the queue is full. Set to `0` for an unbounded queue |
+
+The legacy flags `--kv_events_model_name`, `--kv_events_tenant_id`,
+`--kv_events_additional_salt`, `--kv_events_lora_name`,
+`--kv_events_block_size`, and `--kv_events_dp_rank` are retained for config
+compatibility but are not emitted in event payloads. Supply model, block-size,
+hash-namespace, LoRA, and data-parallel metadata when registering the publisher
+with the indexer; each event carries its object's tenant ID.
+
 ### HTTP Metadata Server (Embedded)
 
 | Flag | Default | Description |
@@ -978,6 +1017,14 @@ Local hot cache provides a DRAM read cache on top of SSD-resident objects for fa
 | `MC_STORE_LOCAL_HOT_BLOCK_SIZE` | `16777216` (16 MB) | Block size for hot cache **in raw bytes** (decimal integer, e.g., `2097152` for 2 MB). Suffixed forms like `"2mb"` are **not** parsed. Only read when the hot cache is enabled |
 | `MC_STORE_LOCAL_HOT_CACHE_USE_SHM` | unset | Set `1` to use memfd-backed shared memory |
 | `MC_STORE_LOCAL_HOT_ADMISSION_THRESHOLD` | unset | Minimum CountMinSketch count before a key is admitted to hot cache |
+
+#### Object-Level Checksum Diagnostics
+
+Set `MOONCAKE_STORE_CHECKSUM=1` on a Mooncake Store client process before the client is created to enable object-level CRC-64 checks. The client computes the checksum before `put`/`upsert`, stores it in master metadata, and verifies the logical `object_size` bytes returned by a full-object `get`. For complete diagnostic coverage, enable the switch on every writer and reader client. A client with the switch disabled does not generate or verify checksums; an enabled reader skips verification for objects whose metadata has no checksum.
+
+This switch is intended for corruption diagnosis, not normal production use. It adds a full data scan to writes and reads, performs device-to-host staging for GPU buffers, and disables the local hot cache. Range reads, including `get_into_ranges`, are intentionally not verified.
+
+Do not run binaries from before and after checksum support was introduced in the same deployment; Mooncake Store clients, the primary master, and the standby master must all use a checksum-capable version. Checksum-capable masters persist checksum metadata in new snapshots and can load snapshots created by older versions; objects restored from an older snapshot have no checksum and are read without verification. Snapshots containing checksum metadata cannot be restored by binaries that predate checksum support, so rolling back requires an older compatible snapshot or a fresh deployment.
 
 #### Local Memory Optimization
 

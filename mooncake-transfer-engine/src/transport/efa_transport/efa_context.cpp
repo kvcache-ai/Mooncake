@@ -268,7 +268,19 @@ int EfaContext::construct(size_t num_cq_list, size_t max_cqe,
         return ERR_CONTEXT;
     }
 
-    // Create completion queues
+    // Create completion queues.
+    //
+    // Same design as max_wr_depth_ in buildSharedEndpoint(): the submit path
+    // also paces against a CQ-occupancy counter (EfaCq::outstanding vs
+    // max_cqe_), so that ceiling must be the CQ the provider created, not the
+    // one we asked for.  EFA raises any request below
+    // MAX(rx_attr->size + tx_attr->size, FI_EFA_CQ_SIZE) to that value
+    // (efa_domain.c), e.g. 12288 on p5 -- 3x the 4096 default, so the counter
+    // would stop submission long before the CQ is full.
+    //
+    // fi_cq_open() writes the size it chose back into cq_attr.size; read that
+    // instead of recomputing the formula, which folds in the operator-settable
+    // FI_EFA_CQ_SIZE and may change in a future provider.
     cq_list_.resize(num_cq_list);
     for (size_t i = 0; i < num_cq_list; ++i) {
         auto cq = std::make_shared<EfaCq>();
@@ -283,7 +295,16 @@ int EfaContext::construct(size_t num_cq_list, size_t max_cqe,
             LOG(ERROR) << "fi_cq_open failed: " << fi_strerror(-ret);
             return ERR_CONTEXT;
         }
+        // Every CQ on this domain gets the same treatment, so one value covers
+        // the list; guard anyway so a future provider that sizes them
+        // independently cannot leave the counter above a smaller CQ.
+        if (i == 0 || cq_attr.size < max_cqe_) max_cqe_ = cq_attr.size;
         cq_list_[i] = cq;
+    }
+    if (max_cqe_ > max_cqe) {
+        VLOG(1) << "EFA " << device_name_ << ": provider opened a CQ of "
+                << max_cqe_ << " entries for the requested " << max_cqe
+                << "; pacing against the larger real depth.";
     }
 
     // Build the shared endpoint that services every peer through AV lookup.
@@ -298,7 +319,9 @@ int EfaContext::construct(size_t num_cq_list, size_t max_cqe,
               << ", domain: " << fi_info_->domain_attr->name
               << ", fabric: " << fi_info_->fabric_attr->name
               << ", provider: " << fi_info_->fabric_attr->prov_name
-              << " (shared endpoint, max_wr=" << max_wr_depth_ << ")";
+              << " (shared endpoint, max_wr=" << max_wr_depth_
+              << ", provider tx queue=" << fi_info_->tx_attr->size
+              << ", max_cqe=" << max_cqe_ << ")";
 
     return 0;
 }
@@ -311,6 +334,46 @@ int EfaContext::buildSharedEndpoint(size_t max_wr, size_t max_inline) {
     if (!shared_cq_) {
         LOG(ERROR) << "EfaContext::buildSharedEndpoint: no CQ available";
         return ERR_CONTEXT;
+    }
+
+    // Design: adopt the provider's transmit depth instead of pacing against an
+    // independent number.  We never tell libfabric how deep we want the queue
+    // (fi_endpoint() below takes its depth from fi_info_), and the depth is a
+    // per-device attribute -- 4096 on p5, 2048 on p6-b300 -- so no compiled-in
+    // default can match it.  Either direction of disagreement hurts: too
+    // shallow and submitters exhaust credit while the queue is mostly empty;
+    // too deep and we hand out credit fi_write must refuse with FI_EAGAIN.
+    // Both were observed in production.
+    //
+    // Read-back rather than a hint: asking for more than the device supports
+    // makes the EFA provider fail fi_getinfo() with -FI_ENODATA, turning a
+    // misconfigured MC_MAX_WR into a failure to initialize.  MC_MAX_WR still
+    // throttles a NIC when it asks for less; it can no longer ask for more.
+    const size_t provider_tx_depth =
+        fi_info_ && fi_info_->tx_attr ? fi_info_->tx_attr->size : 0;
+    if (provider_tx_depth == 0) {
+        LOG(ERROR) << "EfaContext::buildSharedEndpoint: provider reported no "
+                      "transmit queue depth for "
+                   << device_name_;
+        return ERR_CONTEXT;
+    }
+    if (!globalConfig().max_wr_from_env) {
+        // No override: take the provider's depth verbatim, so the default is
+        // correct on an instance type nobody has measured yet.
+        max_wr = provider_tx_depth;
+    } else if (max_wr > provider_tx_depth) {
+        // FIRST_N(1): MC_MAX_WR is process-wide, so an over-large value is one
+        // mistake, not one per NIC -- a p5 has 32.  The value that took effect
+        // is in the per-device "EFA device" INFO line below.
+        LOG_FIRST_N(WARNING, 1)
+            << "EFA " << device_name_ << ": MC_MAX_WR=" << max_wr
+            << " exceeds the provider's transmit queue depth ("
+            << provider_tx_depth
+            << "); clamping.  A larger value cannot increase the number of "
+            << "operations the NIC accepts -- it only hands out credit that "
+            << "fi_write must refuse with FI_EAGAIN.  Unset MC_MAX_WR to track "
+            << "the provider's depth automatically.";
+        max_wr = provider_tx_depth;
     }
     max_wr_depth_ = static_cast<int>(max_wr);
 
@@ -548,6 +611,67 @@ int EfaContext::deconstruct() {
     return 0;
 }
 
+#if defined(USE_CUDA)
+// A silent failure here resurfaces as the provider's opaque "Operation not
+// supported" from fi_mr_regattr(), which is the attribution problem this whole
+// helper exists to remove -- so name the driver call that actually failed.
+static void logCudaFailure(const char* call, CUresult ret, int device_ordinal) {
+    const char* err = nullptr;
+    cuGetErrorString(ret, &err);
+    LOG(WARNING) << "EFA: " << call << " failed for CUDA device "
+                 << device_ordinal << ": " << (err ? err : "unknown") << " ("
+                 << ret
+                 << "); GPU memory registration may fail with a bare"
+                    " \"Operation not supported\"";
+}
+
+// Make `device_ordinal`'s primary context current on the calling thread, unless
+// a context for that same device already is.
+//
+// Why a context is needed at all: fi_mr_regattr() on FI_HMEM_CUDA memory
+// reaches libfabric's cuda_get_dmabuf_fd(), which calls the driver API
+// cuMemGetHandleForAddressRange() and does no context management of its own.
+// The export also runs against the CURRENT context, so a context belonging to
+// another device is no better than none -- both end up as a bare "Operation not
+// supported" from the provider.
+//
+// Who arrives here without the right context: registerLocalMemoryBatch() runs
+// one std::async(std::launch::async) per buffer and registerLocalMemory() can
+// fan out one std::thread per NIC, so a registering thread may have touched no
+// CUDA API at all; and since std::async may reuse threads, one thread can
+// register buffers on several devices in turn.
+//
+// cuDevicePrimaryCtxRetain() returns the same primary context the CUDA runtime
+// uses, so this attaches to the process's existing context rather than creating
+// another.  The retain is intentionally not released: the primary context
+// outlives every registration, and dropping the last reference here would tear
+// down the context the rest of the process is using.
+static void bindCudaContextIfNeeded(int device_ordinal) {
+    CUdevice want;
+    CUresult ret = cuDeviceGet(&want, device_ordinal);
+    if (ret != CUDA_SUCCESS) {
+        logCudaFailure("cuDeviceGet", ret, device_ordinal);
+        return;
+    }
+
+    CUcontext cur = nullptr;
+    CUdevice cur_dev;
+    if (cuCtxGetCurrent(&cur) == CUDA_SUCCESS && cur != nullptr &&
+        cuCtxGetDevice(&cur_dev) == CUDA_SUCCESS && cur_dev == want)
+        return;
+
+    CUcontext primary = nullptr;
+    ret = cuDevicePrimaryCtxRetain(&primary, want);
+    if (ret != CUDA_SUCCESS) {
+        logCudaFailure("cuDevicePrimaryCtxRetain", ret, device_ordinal);
+        return;
+    }
+    ret = cuCtxSetCurrent(primary);
+    if (ret != CUDA_SUCCESS)
+        logCudaFailure("cuCtxSetCurrent", ret, device_ordinal);
+}
+#endif
+
 int EfaContext::registerMemoryRegionInternal(void* addr, size_t length,
                                              int access,
                                              EfaMemoryRegionMeta& mrMeta) {
@@ -592,6 +716,9 @@ int EfaContext::registerMemoryRegionInternal(void* addr, size_t length,
 
     int ret;
     if (iface != FI_HMEM_SYSTEM) {
+#if defined(USE_CUDA)
+        bindCudaContextIfNeeded(device_ordinal);
+#endif
         // GPU memory: use fi_mr_regattr with explicit iface and device
         struct iovec iov = {.iov_base = addr, .iov_len = length};
         struct fi_mr_attr attr = {};
@@ -1249,6 +1376,20 @@ int EfaContext::submitPostSend(
             continue;
         }
 
+        // device_id comes from the peer-supplied topology, whose HCA list is
+        // independent of the peer 'devices' array, and selectDevice() bounds it
+        // against rkey only. decodeSegmentDesc() now rejects a descriptor whose
+        // key count and device count disagree; bound the value used to index
+        // devices[] locally as well.
+        if (static_cast<size_t>(device_id) >=
+            peer_segment_desc->devices.size()) {
+            LOG(ERROR) << "Peer device index out of range for target "
+                       << slice->target_id << ": device_id=" << device_id
+                       << " devices=" << peer_segment_desc->devices.size();
+            slice->markFailed();
+            continue;
+        }
+
         slice->rdma.dest_rkey =
             peer_segment_desc->buffers[buffer_id].rkey[device_id];
 
@@ -1302,7 +1443,9 @@ int EfaContext::submitSlicesOnPeer(
     // 2. Prepare MR descriptors and op contexts outside the lock
     // 3. Hold post_lock_ once for the entire batch of fi_write calls
     const int kMaxBackoffYields = 100000;
-    const int cq_limit = static_cast<int>(globalConfig().max_cqe);
+    // Not globalConfig().max_cqe: that is the requested value, while max_cqe_
+    // is what this device's CQ was actually opened with (see construct()).
+    const int cq_limit = static_cast<int>(max_cqe_);
     std::atomic<int>* cq_outstanding =
         shared_cq_ ? &shared_cq_->outstanding : nullptr;
 

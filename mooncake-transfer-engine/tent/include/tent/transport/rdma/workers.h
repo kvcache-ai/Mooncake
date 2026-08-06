@@ -38,6 +38,8 @@ class RdmaTransport;
 class DeviceSelector;
 
 class Workers {
+    friend class RdmaTransportTestPeer;
+
    public:
     static constexpr size_t kCapacity = 1024 * 8;
     using BoundedSliceQueue = BoundedMPSCQueue<RdmaSliceList, kCapacity>;
@@ -75,6 +77,11 @@ class Workers {
 
     void monitorThread();
 
+    // 1 Hz heartbeat from monitorThread(): drains every context's retiring
+    // endpoints so reclaim is not gated on new insertions, which stall under
+    // failure load.
+    void reclaimEndpoints();
+
     int handleContextEvents(std::shared_ptr<RdmaContext>& context);
 
     Status generatePostPath(RdmaSlice* slice);
@@ -101,6 +108,12 @@ class Workers {
                                 RdmaSlice* slice);
 
     int getDeviceByFlatIndex(const RouteHint& hint, size_t flat_idx);
+
+    // True if the (sdev -> tdev) NIC pair is known-unable to GPUDirect-DMA to
+    // the source/target GPU (learned from prior completion errors). Used to
+    // steer selection away from dead rails before posting.
+    bool gdrPairExcluded(const RouteHint& source, const RouteHint& target,
+                         int sdev, int tdev, int src_gpu, int dst_gpu);
 
     int getDeviceRank(const RouteHint& hint, int device_id);
 

@@ -8,6 +8,7 @@
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 
 #include "client_metric.h"
+#include "device/cuda_ipc_buffer_handle.h"
 #include "pyclient.h"
 #include "store_rpc_client_io_context.h"
 #include "shm_helper.h"
@@ -74,6 +75,9 @@ class DummyClient : public PyClient {
                                         const std::vector<void *> &buffers,
                                         const std::vector<size_t> &sizes);
 
+    std::vector<int64_t> batch_get_into_cuda_ipc(
+        const std::vector<CudaIpcReadRequest> &requests);
+
     std::vector<int> batch_get_into_multi_buffers(
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
@@ -97,6 +101,10 @@ class DummyClient : public PyClient {
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
+        const ReplicateConfig &config = ReplicateConfig{});
+
+    std::vector<int> batch_put_from_cuda_ipc(
+        const std::vector<CudaIpcWriteRequest> &requests,
         const ReplicateConfig &config = ReplicateConfig{});
 
     std::shared_ptr<BufferHandle> get_buffer(const std::string &key);
@@ -179,6 +187,8 @@ class DummyClient : public PyClient {
 
     tl::expected<QueryTaskResponse, ErrorCode> query_task(const UUID &task_id);
 
+    std::optional<BufferHandle> allocate_client_buffer(size_t size) override;
+
    private:
     ErrorCode connect(const std::string &server_address);
 
@@ -251,6 +261,7 @@ class DummyClient : public PyClient {
     // For shared memory management
     ShmHelper *shm_helper_ = nullptr;
     std::string ipc_socket_path_;
+    void *local_buffer_base_ = nullptr;
 
     // Hot cache shm mapping (obtained from real client via IPC)
     void *hot_cache_base_ = nullptr;

@@ -1,0 +1,157 @@
+name: 'Build Wheel (ROCm)'
+
+# ROCm/HIP CI parity with the standard CUDA wheel CI: build the AMD ROCm wheel
+# on PRs so packaging regressions are caught. Runs inside the ROCm dev image so
+# hipcc / HIP headers / hsa-runtime are available; no GPU is needed to compile.
+# On-device transfer tests (test_transfer_on_hip.py) require AMD hardware and
+# run outside GitHub-hosted runners.
+
+on:
+  workflow_call: {}
+
+jobs:
+  build-wheel-rocm:
+    runs-on: ubuntu-22.04
+    # Pinned to match the upstream vllm/vllm-openai-rocm and sglang ROCm images
+    # (ROCm 7.2). The wheel excludes the ROCm runtime and binds it at load time,
+    # so it also loads on the ROCm 7.0 image variants.
+    container: rocm/dev-ubuntu-22.04:7.2.3-complete
+    strategy:
+      matrix:
+        # 3.10 covers the SGLang ROCm image; 3.12 covers vLLM ROCm.
+        python-version: ['3.10', '3.12']
+    env:
+      HIP_BUILD: "1"
+      SCCACHE_GHA_ENABLED: "true"
+
+    steps:
+    # git must exist BEFORE checkout so actions/checkout does a real clone
+    # (with .git + submodules). The rocm/dev image ships without git, which
+    # otherwise makes checkout fall back to a source tarball and breaks
+    # dependencies.sh's `git submodule` step.
+    - name: Install git (pre-checkout)
+      shell: bash
+      run: |
+        set -eo pipefail
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -y
+        apt-get install -y --no-install-recommends git ca-certificates
+
+    - uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+        submodules: recursive
+
+    - name: Mark repository as safe
+      run: git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
+      shell: bash
+
+    - name: Install toolchain and Python ${{ matrix.python-version }}
+      shell: bash
+      run: |
+        set -eo pipefail
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -y
+        apt-get install -y --no-install-recommends \
+          curl build-essential sudo pkg-config \
+          ninja-build software-properties-common
+        PYV="${{ matrix.python-version }}"
+        if ! command -v "python${PYV}" >/dev/null 2>&1; then
+          add-apt-repository -y ppa:deadsnakes/ppa
+          apt-get update -y
+        fi
+        # Always install -dev + -venv: the image's system python3.10 exists but
+        # ships without the venv module / dev headers.
+        apt-get install -y --no-install-recommends \
+          "python${PYV}" "python${PYV}-dev" "python${PYV}-venv"
+        curl -sS https://bootstrap.pypa.io/get-pip.py | "python${PYV}"
+        PYTHON_BIN="$(command -v python${PYV})"
+        echo "PYTHON_BIN=${PYTHON_BIN}" >> "$GITHUB_ENV"
+        # hipify-perl lives in /opt/rocm/bin; CMake's USE_HIP path requires it.
+        # Use GITHUB_PATH (setting PATH via GITHUB_ENV is not honored reliably).
+        echo "/opt/rocm/bin" >> "$GITHUB_PATH"
+
+    - name: Run sccache-cache
+      uses: mozilla-actions/sccache-action@v0.0.9
+
+    - name: Configure sccache
+      uses: actions/github-script@v7
+      with:
+        script: |
+          core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+          core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+    - name: Install dependencies
+      shell: bash
+      run: |
+        set -eo pipefail
+        bash -x dependencies.sh -y
+        echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+
+    - name: Configure project
+      shell: bash
+      run: |
+        set -eo pipefail
+        export PATH="/opt/rocm/bin:$PATH"   # hipify-perl for USE_HIP
+        rm -rf build && mkdir build && cd build
+        cmake -G Ninja .. \
+          -DUSE_HIP=ON -DUSE_CUDA=OFF -DWITH_EP=OFF \
+          -DUSE_HTTP=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON \
+          -DBUILD_UNIT_TESTS=OFF -DENABLE_SCCACHE=ON \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DPython3_EXECUTABLE="${PYTHON_BIN}"
+
+    - name: Build project
+      shell: bash
+      run: |
+        set -eo pipefail
+        export PATH="/opt/rocm/bin:$PATH"
+        cd build
+        # Retry to ride out transient Go module (proxy.golang.org) fetch errors
+        # during the etcd-wrapper build; Go caches modules, so retries resume.
+        n=0
+        until cmake --build . -j"$(nproc)"; do
+          n=$((n+1))
+          if [ "$n" -ge 3 ]; then echo "Build failed after $n attempts"; exit 1; fi
+          echo "Build attempt $n failed; retrying in 15s..."; sleep 15
+        done
+        cmake --install .
+
+    - name: Run sccache stat for check
+      if: ${{ env.SCCACHE_PATH != '' }}
+      shell: bash
+      run: ${SCCACHE_PATH} --show-stats
+
+    - name: Generate Python version tag
+      id: generate_tag
+      shell: bash
+      run: echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> "$GITHUB_OUTPUT"
+
+    - name: Build Python wheel
+      shell: bash
+      run: |
+        set -eo pipefail
+        export PATH="/opt/rocm/bin:$PATH"
+        export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:/usr/local/lib"
+        HIP_BUILD=1 PYTHON_VERSION=${{ matrix.python-version }} \
+          OUTPUT_DIR=dist-rocm-py${{ steps.generate_tag.outputs.python_version_tag }} \
+          ./scripts/build_wheel.sh
+
+    - name: Smoke test wheel
+      shell: bash
+      run: |
+        set -eo pipefail
+        smoke_venv=$(mktemp -d)
+        "${PYTHON_BIN}" -m venv "$smoke_venv"
+        "$smoke_venv/bin/python" -m pip install --no-deps \
+          mooncake-wheel/dist-rocm-py${{ steps.generate_tag.outputs.python_version_tag }}/*.whl
+        # ROCm runtime is excluded from the wheel and bound at load time.
+        export LD_LIBRARY_PATH="/opt/rocm/lib:/usr/local/lib:${LD_LIBRARY_PATH:-}"
+        site="$("$smoke_venv/bin/python" -c 'import mooncake,os;print(os.path.dirname(mooncake.__file__))')"
+        "$site/mooncake_master" --version
+
+    - name: Upload Python wheel artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: mooncake-wheel-rocm-ubuntu-py${{ steps.generate_tag.outputs.python_version_tag }}
+        path: mooncake-wheel/dist-rocm-py${{ steps.generate_tag.outputs.python_version_tag }}/*.whl
