@@ -36,17 +36,29 @@ namespace tent {
 class Platform;
 class Topology {
    public:
-    const static size_t DevicePriorityRanks = 3;
+    inline static constexpr size_t DevicePriorityRanks = 3;
 
-    enum NicType { NIC_RDMA, NIC_TCP, NIC_UNKNOWN };
+    // Keep the existing RDMA/TCP numeric values stable for serialized
+    // topologies. UB is a distinct link type and must never be selected as an
+    // RDMA verbs device.
+    enum NicType {
+        NIC_RDMA = 0,
+        NIC_TCP = 1,
+        NIC_UNKNOWN = 2,
+        NIC_UB = 3,
+    };
     enum MemType { MEM_HOST, MEM_CUDA, MEM_ROCM, MEM_ASCEND, MEM_UNKNOWN };
 
     using NicID = int;
     struct NicEntry {
         std::string name;
         std::string pci_bus_id;
-        NicType type;
-        int numa_node;
+        NicType type{NIC_UNKNOWN};
+        int numa_node{-1};
+
+        // Hardware-specific discovery metadata is opaque to the common
+        // topology layer. Transports own namespaced keys and interpretation.
+        std::unordered_map<std::string, std::string> device_attrs{};
     };
 
     using MemID = int;
@@ -67,7 +79,11 @@ class Topology {
 
     void clear();
 
+    // Preserve the original one-argument symbol for source and binary
+    // compatibility with callers that do not opt into UB discovery.
     Status discover(const std::vector<Platform*>& platforms);
+
+    Status discover(const std::vector<Platform*>& platforms, bool discover_ub);
 
     Status parse(const std::string& json_content);
 

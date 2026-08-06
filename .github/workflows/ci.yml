@@ -761,6 +761,12 @@ jobs:
             cmake_flags: '-DUSE_CUDA=OFF'
             need_cuda: false
             metrics_flags: '-DTENT_METRICS_ENABLED=ON'
+          # Exercise the native UB target with its injected mock adapter. A
+          # Debug build also catches ODR/link errors hidden by optimization.
+          - name: ub-mock
+            cmake_flags: '-DUSE_CUDA=OFF -DUSE_UB=ON -DCMAKE_BUILD_TYPE=Debug'
+            need_cuda: false
+            metrics_flags: ''
     name: tent-ci (${{ matrix.name }})
     env:
       CI: "true"
