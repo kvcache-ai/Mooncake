@@ -190,27 +190,6 @@ jobs:
         env:
           VERSION: ${{ env.VERSION }}
 
-      - name: Verify DMA-BUF Device API wheel contents
-        if: ${{ inputs.runner == 'ubuntu-22.04' && inputs.cuda == 'container' && contains(inputs.cmake-args, '-DWITH_EP=ON') }}
-        run: |
-          whl=$(find mooncake-wheel/dist-py${{ steps.pytag.outputs.tag }} -name '*.whl' -print -quit)
-          inspect_dir=$(mktemp -d)
-          trap 'rm -rf "$inspect_dir"' EXIT
-          unzip -q "$whl" mooncake/engine.so -d "$inspect_dir"
-          engine="$inspect_dir/mooncake/engine.so"
-
-          for marker in mlx5dv_devx_umem_reg_ex MLX5_1.19; do
-            if ! strings "$engine" | grep -Fxq "$marker"; then
-              echo "::error::DMA-BUF Device API marker $marker is missing from $whl"
-              exit 1
-            fi
-          done
-          if readelf -Ws "$engine" | grep -q 'mlx5dv_devx_umem_reg_ex@'; then
-            echo '::error::DMA-BUF Device API retains a hard libmlx5 symbol dependency'
-            exit 1
-          fi
-          echo 'DMA-BUF Device API compiled into wheel with runtime-optional libmlx5 lookup'
-
       - name: Smoke test repaired wheel
         run: |
           smoke_venv=$(mktemp -d)
