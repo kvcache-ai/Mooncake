@@ -216,6 +216,31 @@ if(USE_SUNRISE)
   add_test(NAME tent_sunrise_link_transport_test
            COMMAND tent_sunrise_link_transport_test)
 endif()
+
+if(USE_MPCOMM)
+  add_executable(tent_mpcomm_transport_test mpcomm_transport_test.cpp)
+  target_link_libraries(tent_mpcomm_transport_test PRIVATE gtest gtest_main
+                                                           tent_link_group)
+  target_include_directories(
+    tent_mpcomm_transport_test
+    PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+  add_test(NAME tent_mpcomm_transport_test COMMAND tent_mpcomm_transport_test)
+endif()
+
+# Boundary tests of the TENT side of the mpcomm transport, driven through an
+# injected MpcommAdapter. Built unconditionally: nothing here includes mpcomm.h
+# and nothing needs an RDMA device, so these run wherever the rest of the suite
+# runs. The hardware data path stays in tent_mpcomm_transport_test above, which
+# skips itself when no device is present.
+add_executable(tent_mpcomm_boundary_test mpcomm_boundary_test.cpp)
+target_link_libraries(tent_mpcomm_boundary_test PRIVATE gtest gtest_main
+                                                        tent_link_group)
+target_include_directories(
+  tent_mpcomm_boundary_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include
+                                    ${CMAKE_CURRENT_SOURCE_DIR}/../../include)
+add_test(NAME tent_mpcomm_boundary_test COMMAND tent_mpcomm_boundary_test)
+
 add_executable(tent_fault_proxy_test fault_proxy_test.cpp)
 target_link_libraries(tent_fault_proxy_test PRIVATE gtest gtest_main
                                                     tent_link_group)
