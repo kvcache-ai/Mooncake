@@ -668,7 +668,7 @@ class MooncakeBundleTransfer:
         """Materialize a DataProto-like object or flat dict."""
         if type not in {"dataproto", "dict"}:
             raise ValueError(f"unsupported Mooncake payload type: {type!r}")
-        result = self.get_dataproto(
+        result = self._get_dataproto(
             ref,
             fields=fields,
             batch_fields=batch_fields,
@@ -677,6 +677,7 @@ class MooncakeBundleTransfer:
             data_cls=dict if type == "dict" else data_cls,
             destinations=destinations,
             rows=rows,
+            _flat_dict_output=(type == "dict"),
         )
         return _envelope_to_flat_dict(result) if type == "dict" else result
 
@@ -750,6 +751,31 @@ class MooncakeBundleTransfer:
         rows: slice | StructuredMemberSlice | Sequence[int] | None = None,
     ) -> Any:
         """Materialize selected DataProto fields from structured object refs."""
+        return self._get_dataproto(
+            ref,
+            fields=fields,
+            batch_fields=batch_fields,
+            non_tensor_fields=non_tensor_fields,
+            meta_info_keys=meta_info_keys,
+            data_cls=data_cls,
+            destinations=destinations,
+            rows=rows,
+        )
+
+    def _get_dataproto(
+        self,
+        ref: DataProtoRefLike,
+        *,
+        fields: Optional[Sequence[str]] = None,
+        batch_fields: Optional[Sequence[str]] = None,
+        non_tensor_fields: Optional[Sequence[str]] = None,
+        meta_info_keys: Optional[Sequence[str]] = None,
+        data_cls: Optional[Any] = None,
+        destinations: Optional[Mapping[str, Any]] = None,
+        rows: slice | StructuredMemberSlice | Sequence[int] | None = None,
+        _flat_dict_output: bool = False,
+    ) -> Any:
+        """Materialize selected DataProto fields from structured object refs."""
         ref = _resolve_dataproto_ref(ref)
         row_selection = _coerce_dataproto_row_selection(rows, ref.batch_size)
         row_slice = None if row_selection is None else row_selection.member_slice
@@ -814,41 +840,61 @@ class MooncakeBundleTransfer:
                     batch[name] = value
                 else:
                     non_tensor_batch[name] = value
-        for name, location in encoded_requests:
-            stage_ref = ref.stage_refs[location.stage]
-            encoded = ref.encoded_non_tensor[name]
-            if row_selection is None:
-                members = list(encoded["payload_members"].values())
+        if row_selection is None and encoded_requests:
+            by_stage_encoded: dict[str, list[tuple[str, StructuredFieldLocation]]] = {}
+            for name, location in encoded_requests:
+                by_stage_encoded.setdefault(location.stage, []).append((name, location))
+            for stage, entries in by_stage_encoded.items():
+                stage_ref = ref.stage_refs[stage]
+                members: list[str] = []
+                for name, _location in entries:
+                    encoded = ref.encoded_non_tensor[name]
+                    members.extend(encoded["payload_members"].values())
                 result = self.materialize(
                     self.read_spec(stage_ref).select_members(members)
                 )
-                payload = {
-                    payload_name: result.objects[member]
-                    for payload_name, member in encoded["payload_members"].items()
-                }
-                values = _decode_structured_non_tensor_encoded(
-                    encoded, payload, ref.batch_size, encoded.get("metadata")
+                for name, _location in entries:
+                    encoded = ref.encoded_non_tensor[name]
+                    payload = {
+                        payload_name: result.objects[member]
+                        for payload_name, member in encoded["payload_members"].items()
+                    }
+                    values = _decode_structured_non_tensor_encoded(
+                        encoded, payload, ref.batch_size, encoded.get("metadata")
+                    )
+                    non_tensor_batch[name] = (
+                        values
+                        if _flat_dict_output
+                        else _object_array_from_decoded_values(values)
+                    )
+        else:
+            for name, location in encoded_requests:
+                stage_ref = ref.stage_refs[location.stage]
+                encoded = ref.encoded_non_tensor[name]
+                if row_indices is not None:
+                    payload, metadata = self._read_structured_non_tensor_payload_indices(
+                        stage_ref,
+                        encoded,
+                        row_indices,
+                    )
+                    values = _decode_structured_non_tensor_encoded(
+                        encoded, payload, output_rows, metadata
+                    )
+                else:
+                    payload, metadata = self._read_structured_non_tensor_payload_slice(
+                        stage_ref,
+                        encoded,
+                        row_slice,
+                        ref.batch_size,
+                    )
+                    values = _decode_structured_non_tensor_encoded(
+                        encoded, payload, output_rows, metadata
+                    )
+                non_tensor_batch[name] = (
+                    values
+                    if _flat_dict_output
+                    else _object_array_from_decoded_values(values)
                 )
-            elif row_indices is not None:
-                payload, metadata = self._read_structured_non_tensor_payload_indices(
-                    stage_ref,
-                    encoded,
-                    row_indices,
-                )
-                values = _decode_structured_non_tensor_encoded(
-                    encoded, payload, output_rows, metadata
-                )
-            else:
-                payload, metadata = self._read_structured_non_tensor_payload_slice(
-                    stage_ref,
-                    encoded,
-                    row_slice,
-                    ref.batch_size,
-                )
-                values = _decode_structured_non_tensor_encoded(
-                    encoded, payload, output_rows, metadata
-                )
-            non_tensor_batch[name] = _object_array_from_decoded_values(values)
         meta_info = _select_mapping(ref.meta_info, meta_info_keys)
         return _build_dataproto_like_result(
             batch, non_tensor_batch, meta_info, data_cls
@@ -1883,7 +1929,7 @@ def _envelope_to_flat_dict(data: Mapping[str, Any]) -> dict[str, Any]:
     result.update(batch)
     for name, value in non_tensor_batch.items():
         result[name] = (
-            list(value)
+            value.tolist()
             if isinstance(value, np.ndarray) and value.dtype == object
             else value
         )
@@ -5711,14 +5757,24 @@ def _decode_msgpack_ragged_values(payload: dict[str, Any], rows: int) -> list[An
             f"msgpack_ragged nulls length {len(nulls)} does not match rows {rows}"
         )
     raw_data = bytes(data) if not isinstance(data, bytes) else data
+    if rows == 0 or not bool(nulls.any()):
+        unpacker = _msgpack.Unpacker(raw=False)
+        unpacker.feed(raw_data)
+        values = list(unpacker)
+        if len(values) != rows:
+            raise ValueError(
+                f"msgpack_ragged decoded {len(values)} rows, expected {rows}"
+            )
+        return values
+    unpacker = _msgpack.Unpacker(raw=False)
+    unpacker.feed(raw_data)
+    non_null_iter = iter(unpacker)
     values = []
-    for row, is_null in enumerate(nulls):
+    for is_null in nulls:
         if bool(is_null):
             values.append(None)
         else:
-            begin = int(offsets[row])
-            end = int(offsets[row + 1])
-            values.append(_msgpack.unpackb(raw_data[begin:end], raw=False))
+            values.append(next(non_null_iter))
     return values
 
 

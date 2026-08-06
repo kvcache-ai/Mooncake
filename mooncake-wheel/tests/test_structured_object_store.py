@@ -1814,6 +1814,59 @@ def test_unified_put_get_roundtrips_flat_dict() -> None:
     assert result["step"] == 7
 
 
+def test_unified_dict_get_returns_flat_lists_without_changing_dataproto_shape() -> None:
+    _store, transfer = make_transfer()
+    data = {
+        "tokens": [
+            np.asarray([1, 2], dtype=np.int32),
+            np.asarray([3], dtype=np.int32),
+            np.asarray([4, 5, 6], dtype=np.int32),
+        ],
+        "json": [{"rank": 0}, {"rank": 1}, {"rank": 2}],
+    }
+    schemas = {
+        "tokens": FieldSchema(
+            codec="typed_ragged",
+            metadata={"section": "non_tensor_batch", "dtype": "int32"},
+        ),
+        "json": FieldSchema(
+            codec="msgpack_ragged",
+            metadata={"section": "non_tensor_batch"},
+        ),
+    }
+
+    ref = transfer.put(data, type="dict", field_schemas=schemas)
+
+    flat = transfer.get(ref, type="dict")
+    assert isinstance(flat["tokens"], list)
+    assert isinstance(flat["json"], list)
+    assert [row.tolist() for row in flat["tokens"]] == [[1, 2], [3], [4, 5, 6]]
+    assert flat["json"] == [{"rank": 0}, {"rank": 1}, {"rank": 2}]
+
+    sliced = transfer.get(ref, type="dict", rows=slice(1, 3))
+    assert isinstance(sliced["tokens"], list)
+    assert isinstance(sliced["json"], list)
+    assert [row.tolist() for row in sliced["tokens"]] == [[3], [4, 5, 6]]
+    assert sliced["json"] == [{"rank": 1}, {"rank": 2}]
+
+    envelope = transfer.get_dataproto(ref, data_cls=dict)
+    non_tensor_batch = envelope["non_tensor_batch"]
+    assert isinstance(non_tensor_batch["tokens"], np.ndarray)
+    assert non_tensor_batch["tokens"].dtype == object
+    assert isinstance(non_tensor_batch["json"], np.ndarray)
+    assert non_tensor_batch["json"].dtype == object
+    assert [row.tolist() for row in non_tensor_batch["tokens"]] == [
+        [1, 2],
+        [3],
+        [4, 5, 6],
+    ]
+    assert non_tensor_batch["json"].tolist() == [
+        {"rank": 0},
+        {"rank": 1},
+        {"rank": 2},
+    ]
+
+
 def test_unified_put_rejects_unknown_type() -> None:
     _store, transfer = make_transfer()
 
@@ -3056,13 +3109,24 @@ def test_typed_ragged_packs_ndarray_rows_contiguously() -> None:
     assert gathered["non_tensor_batch"]["values"][2].shape == ()
 
 
+def _typed_ragged_payload_array(
+    payload: dict[str, object], dtype: np.dtype
+) -> np.ndarray:
+    data = payload["data"]
+    arrays = getattr(data, "arrays", None)
+    if arrays is not None:
+        flat_arrays = [
+            np.asarray(array, dtype=dtype).reshape(-1) for array in arrays
+        ]
+        if not flat_arrays:
+            return np.asarray([], dtype=dtype)
+        return np.concatenate(flat_arrays)
+    return np.concatenate([np.frombuffer(buf, dtype=dtype) for buf in data.buffers])
+
 def test_typed_ragged_fast_decodes_equal_shape_ndarray_views() -> None:
     rows = [np.arange(6, dtype=np.int32).reshape(2, 3) + i * 10 for i in range(3)]
     payload, metadata = sos._encode_typed_ragged_values(rows, np.dtype(np.int32))
-    multi_buffer = payload["data"]
-    data = np.concatenate(
-        [np.frombuffer(buf, dtype=np.int32) for buf in multi_buffer.buffers]
-    )
+    data = _typed_ragged_payload_array(payload, np.dtype(np.int32))
 
     decoded = sos._decode_typed_ragged_values({**payload, "data": data}, 3, metadata)
 
@@ -3079,8 +3143,7 @@ def test_typed_ragged_single_ndarray_row_uses_general_layout() -> None:
         rows, np.dtype(np.int32)
     ) is None
     payload, metadata = sos._encode_typed_ragged_values(rows, np.dtype(np.int32))
-    multi_buffer = payload["data"]
-    data = np.frombuffer(multi_buffer.buffers[0], dtype=np.int32)
+    data = _typed_ragged_payload_array(payload, np.dtype(np.int32))
 
     decoded = sos._decode_typed_ragged_values({**payload, "data": data}, 1, metadata)
 
@@ -3101,10 +3164,7 @@ def test_typed_ragged_equal_shape_rows_with_nulls_use_general_layout() -> None:
         rows, np.dtype(np.int32)
     ) is None
     payload, metadata = sos._encode_typed_ragged_values(rows, np.dtype(np.int32))
-    multi_buffer = payload["data"]
-    data = np.concatenate(
-        [np.frombuffer(buf, dtype=np.int32) for buf in multi_buffer.buffers]
-    )
+    data = _typed_ragged_payload_array(payload, np.dtype(np.int32))
 
     decoded = sos._decode_typed_ragged_values({**payload, "data": data}, 3, metadata)
 
