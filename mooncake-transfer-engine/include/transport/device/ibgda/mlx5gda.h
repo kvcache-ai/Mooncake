@@ -58,6 +58,8 @@ struct mlx5gda_cq {
     struct mlx5dv_devx_uar *uar;  // uar is allocated but not used
     uint32_t cqn;
     uint32_t cqe;
+    void *dev_base;
+    struct memheap *heap;
     size_t cq_offset;
     size_t dbr_offset;
     void *cq_buf;
@@ -70,7 +72,8 @@ struct mlx5gda_cq {
 struct mlx5gda_cq *mlx5gda_create_cq(
     void *ctrl_buf, struct mlx5dv_devx_umem *ctrl_buf_umem,
     struct memheap *ctrl_buf_heap, struct ibv_pd *pd, int num_cqe,
-    cudaStream_t stream,
+    cudaStream_t stream, void *cq_buf, void *cq_buf_dev,
+    struct mlx5dv_devx_umem *cq_buf_umem, struct memheap *cq_buf_heap,
     const struct mlx5gda_control_region_allocator *region_allocator);
 void mlx5gda_destroy_cq(struct memheap *ctrl_buf_heap, struct mlx5gda_cq *cq);
 
@@ -80,6 +83,12 @@ struct mlx5gda_qp {
     struct mlx5dv_devx_obj *mqp;
     struct mlx5gda_cq *send_cq;
     struct mlx5dv_devx_uar *uar;
+#ifdef USE_MUSA
+    void *bf_host_base;
+    size_t bf_host_length;
+    char *bf_device_addr;
+    bool bf_host_registration_owner;
+#endif
 
     uint8_t port_num;
     struct ibv_port_attr port_attr;
@@ -124,6 +133,8 @@ struct mlx5gda_qp *mlx5gda_create_rc_qp(
     struct mlx5dv_pd mpd, void *ctrl_buf,
     struct mlx5dv_devx_umem *ctrl_buf_umem, struct memheap *ctrl_buf_heap,
     struct ibv_pd *pd, int wqe, uint8_t port_num, cudaStream_t stream,
+    void *cq_buf, void *cq_buf_dev, struct mlx5dv_devx_umem *cq_buf_umem,
+    struct memheap *cq_buf_heap,
     const struct mlx5gda_control_region_allocator *region_allocator);
 void mlx5gda_destroy_qp(struct memheap *ctrl_buf_heap, struct mlx5gda_qp *qp);
 
