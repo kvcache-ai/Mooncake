@@ -143,11 +143,35 @@ fn python_config_for_candidate(candidate: &Path) -> Option<PythonConfig> {
 
     let (include_dir, library_path, library_name) = query_python_dev(candidate)?;
     Some(PythonConfig {
-        executable: candidate.to_path_buf(),
+        executable: resolve_python_executable(candidate)
+            .unwrap_or_else(|| candidate.to_path_buf()),
         include_dir,
         library_path,
         library_name,
     })
+}
+
+/// Resolve an interpreter to its own absolute path.
+///
+/// Candidates are probed as bare command names (`python3.10`), and CMake's
+/// `FindPython3` cannot derive the `Development.Module` component from one --
+/// it needs a path it can resolve sysconfig against. Upstream's
+/// `rpc_communicator` requires that component, so passing the bare name makes
+/// the upstream configure step fail with "Could NOT find Python3".
+fn resolve_python_executable(candidate: &Path) -> Option<PathBuf> {
+    let output = Command::new(candidate)
+        .args(["-c", "import sys; print(sys.executable)"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let path = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    if path.is_absolute() && path.exists() {
+        Some(path)
+    } else {
+        None
+    }
 }
 
 fn query_python_dev(candidate: &Path) -> Option<(PathBuf, PathBuf, String)> {
