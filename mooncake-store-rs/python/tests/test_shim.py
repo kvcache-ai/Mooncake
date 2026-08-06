@@ -9,6 +9,8 @@ from __future__ import annotations
 
 import importlib
 import os
+import pathlib
+import re
 import sys
 import types
 import unittest
@@ -126,22 +128,75 @@ class RedirectTests(ShimTestCase):
         self.assertIs(canonical.__spec__, spec_before)
 
     def test_every_divergent_module_is_redirected(self) -> None:
-        # Upstream ships its own version of each of these; serving one half
-        # from upstream and the other from here would not work.
-        self.assertEqual(
-            set(_shim._REDIRECTS),
-            {
-                "mooncake.store",
-                "mooncake.buffer_pool",
-                "mooncake.cli",
-                "mooncake.cli_client",
-                "mooncake.structured_object_store",
-            },
+        # Where the two implementations genuinely differ, serving one half from
+        # upstream and the other from here would not work.
+        for name in (
+            "mooncake.store",
+            "mooncake.buffer_pool",
+            "mooncake.cli",
+            "mooncake.cli_client",
+            "mooncake.structured_object_store",
+        ):
+            with self.subTest(module=name):
+                self.assertIn(name, _shim._REDIRECTS)
+
+    def test_engine_is_redirected(self) -> None:
+        # SGLang imports `mooncake.engine`. Without this the wheel cannot stand
+        # alone -- it would need the upstream wheel installed alongside it.
+        self.assertIn("mooncake.engine", _shim._REDIRECTS)
+
+    def test_redirect_targets_all_live_in_this_package(self) -> None:
+        for source, target in _shim._REDIRECTS.items():
+            with self.subTest(module=source):
+                self.assertTrue(
+                    target.startswith("mooncake_store_rs."),
+                    f"{source} -> {target} escapes this package",
+                )
+
+    def test_vendored_assets_are_all_redirected(self) -> None:
+        """Every upstream module the wheel vendors must also be redirected.
+
+        The two lists live apart -- `build-wheel.sh` stages the files, this shim
+        exposes them under the upstream import path -- so they drift silently:
+        a module added to the wheel but not here is simply unreachable through
+        `mooncake.*`, and a stale entry here redirects to nothing.
+        """
+        build_wheel = (
+            pathlib.Path(__file__).resolve().parents[2]
+            / "scripts"
+            / "build"
+            / "build-wheel.sh"
+        )
+        if not build_wheel.is_file():
+            self.skipTest(f"{build_wheel} not present")
+
+        text = build_wheel.read_text()
+        block = re.search(r"python_assets = \[(.*?)\]", text, re.S)
+        self.assertIsNotNone(block, "could not locate python_assets in build-wheel.sh")
+        assert block is not None
+        staged = {
+            f"mooncake.{name[: -len('.py')]}"
+            for name in re.findall(r'"([^"]+\.py)"', block.group(1))
+        }
+        self.assertTrue(staged, "python_assets parsed as empty")
+
+        missing = staged - set(_shim._REDIRECTS)
+        self.assertFalse(
+            missing, f"vendored but not redirected, unreachable as mooncake.*: {missing}"
         )
 
     def test_unlisted_submodules_are_left_to_upstream(self) -> None:
         finder = _shim.StoreRsFinder()
-        self.assertIsNone(finder.find_spec("mooncake.http_metadata_server"))
+        # Real upstream modules this wheel neither implements nor vendors; they
+        # have to keep resolving to the upstream wheel.
+        for name in (
+            "mooncake.cli_bench",
+            "mooncake.mooncake_elastic_buffer",
+            "mooncake.mooncake_ssd_register",
+            "mooncake.spdk_tgt_create",
+        ):
+            with self.subTest(module=name):
+                self.assertIsNone(finder.find_spec(name))
         self.assertIsNone(finder.find_spec("mooncake_store_rs.store"))
         self.assertIsNone(finder.find_spec("json"))
 
