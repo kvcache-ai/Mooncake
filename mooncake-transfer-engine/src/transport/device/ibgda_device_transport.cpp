@@ -26,6 +26,7 @@
 #include <infiniband/mlx5dv.h>
 #include <infiniband/verbs.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
@@ -43,6 +44,7 @@ namespace device {
 
 static constexpr size_t kCtrlBufSize = 1024ULL * 1024 * 1024;  // 1 GiB
 static constexpr size_t kSplitCqBufSize = 256ULL * 1024 * 1024;
+static constexpr size_t kIbgdaQpWqebbCount = 16384;
 
 enum class ControlMemoryMode {
     kGpuDmabuf,
@@ -308,7 +310,8 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
                     : ctrl;
         for (int i = 0; i < num_qps_; ++i) {
             mlx5gda_qp* qp =
-                mlx5gda_create_rc_qp(mpd_, &ctrl, &cq, pd_, 16384, 1, stream,
+                mlx5gda_create_rc_qp(mpd_, &ctrl, &cq, pd_,
+                                     kIbgdaQpWqebbCount, 1, stream,
                                      cq_region_allocator, qp_region_allocator);
             if (!qp) {
                 const int qp_errno = errno;
@@ -749,16 +752,24 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     }
 
     int allocateHostMappedCqBuffer() {
+        // Each QP owns a 16K-entry CQ.  A CQ consumes exactly 1 MiB, but its
+        // trailing DBR makes the next CQ start on a fresh adapter page.  The
+        // fixed 256 MiB baseline therefore cannot hold 256 QPs.
+        constexpr size_t kAdapterPageSize = 4096;
+        constexpr size_t kCqBytesPerQp =
+            kIbgdaQpWqebbCount * sizeof(mlx5_cqe64) + kAdapterPageSize;
+        const size_t cq_buf_size = std::max(
+            kSplitCqBufSize, static_cast<size_t>(num_qps_) * kCqBytesPerQp);
         void* ptr = nullptr;
-        const int ret = posix_memalign(&ptr, 4096, kSplitCqBufSize);
+        const int ret = posix_memalign(&ptr, 4096, cq_buf_size);
         if (ret != 0) {
             LOG(ERROR) << "[EP IBGDA] posix_memalign cq_buf failed: " << ret;
             return -1;
         }
         cq_buf_ = ptr;
-        std::memset(cq_buf_, 0, kSplitCqBufSize);
+        std::memset(cq_buf_, 0, cq_buf_size);
         cudaError_t err =
-            cudaHostRegister(cq_buf_, kSplitCqBufSize,
+            cudaHostRegister(cq_buf_, cq_buf_size,
                              cudaHostRegisterPortable | cudaHostRegisterMapped);
         if (err != cudaSuccess) {
             LOG(ERROR) << "[EP IBGDA] cudaHostRegister cq_buf failed: "
@@ -776,7 +787,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
             cq_buf_ = nullptr;
             return -1;
         }
-        cq_buf_umem_ = mlx5dv_devx_umem_reg(ctx_, cq_buf_, kSplitCqBufSize,
+        cq_buf_umem_ = mlx5dv_devx_umem_reg(ctx_, cq_buf_, cq_buf_size,
                                             IBV_ACCESS_LOCAL_WRITE);
         if (!cq_buf_umem_) {
             LOG(ERROR) << "[EP IBGDA] CQ UMEM registration failed (errno="
@@ -787,7 +798,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
             cq_buf_dev_ = nullptr;
             return -1;
         }
-        cq_buf_heap_ = memheap_create(kSplitCqBufSize);
+        cq_buf_heap_ = memheap_create(cq_buf_size);
         if (!cq_buf_heap_) {
             LOG(ERROR) << "[EP IBGDA] memheap_create cq_buf failed";
             mlx5dv_devx_umem_dereg(cq_buf_umem_);
