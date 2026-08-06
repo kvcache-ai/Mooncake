@@ -33,11 +33,7 @@ constexpr T round_up_pow2(T n) {
 #define IBGDA_ROUND_UP_POW2_OR_0(_n) (((_n) == 0) ? 0 : round_up_pow2(_n))
 
 static void print_cuda_error(const char* msg) {
-#ifdef USE_MUSA
-    const char* err_str = musaGetErrorString(musaGetLastError());
-#else
     const char* err_str = cudaGetErrorString(cudaGetLastError());
-#endif
     fprintf(stderr, "%s: %s\n", msg, err_str);
 }
 
@@ -83,11 +79,6 @@ static void print_devx_create_qp_failure(const uint8_t* cmd_out,
             dbr_offset);
 }
 
-// Create UAR for BF (Blue Flame) doorbell ringing.
-// On CUDA: registers the BF MMIO region into GPU address space so the
-//          GPU kernel can directly write the doorbell (lowest latency).
-// MUSA registration is completed in mlx5gda_create_rc_qp so the QP can retain
-// both the host page used for teardown and the distinct MUSA device pointer.
 static struct mlx5dv_devx_uar* create_uar(struct ibv_context* ctx) {
     struct mlx5dv_devx_uar* uar =
         mlx5dv_devx_alloc_uar(ctx, MLX5DV_UAR_ALLOC_TYPE_BF);
@@ -95,17 +86,49 @@ static struct mlx5dv_devx_uar* create_uar(struct ibv_context* ctx) {
         errno = EIO;
         return NULL;
     }
-#ifndef USE_MUSA
-    if (cudaHostRegister(uar->reg_addr, MLX5GDA_BF_SIZE * 2,
-                         cudaHostRegisterPortable | cudaHostRegisterMapped |
-                             cudaHostRegisterIoMemory) != cudaSuccess) {
-        print_cuda_error("Failed to register MMIO memory");
-        errno = EIO;
-        mlx5dv_devx_free_uar(uar);
-        return NULL;
-    }
-#endif
     return uar;
+}
+
+static int map_uar_for_device(struct mlx5dv_devx_uar* uar,
+                              struct mlx5gda_qp* qp) {
+    const long page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) {
+        errno = EIO;
+        return -1;
+    }
+    const uintptr_t reg_addr = reinterpret_cast<uintptr_t>(uar->reg_addr);
+    const uintptr_t host_base =
+        reg_addr & ~(static_cast<uintptr_t>(page_size) - 1);
+    const size_t offset = reg_addr - host_base;
+    const size_t length =
+        ((offset + MLX5GDA_BF_SIZE * 2 + page_size - 1) / page_size) *
+        page_size;
+    const cudaError_t register_result =
+        cudaHostRegister(reinterpret_cast<void*>(host_base), length,
+                         cudaHostRegisterMapped | cudaHostRegisterIoMemory);
+    void* device_base = nullptr;
+    if (cudaHostGetDevicePointer(&device_base,
+                                 reinterpret_cast<void*>(host_base),
+                                 0) != cudaSuccess) {
+        if (register_result == cudaSuccess)
+            cudaHostUnregister(reinterpret_cast<void*>(host_base));
+        print_cuda_error("Failed to map BF MMIO page");
+        errno = EIO;
+        return -1;
+    }
+    qp->bf_host_base = reinterpret_cast<void*>(host_base);
+    qp->bf_device_addr = static_cast<char*>(device_base) + offset;
+    qp->bf_host_registration_owner = register_result == cudaSuccess;
+    return 0;
+}
+
+static void unmap_uar_for_device(struct mlx5gda_qp* qp) {
+    if (qp->bf_host_registration_owner) {
+        cudaHostUnregister(qp->bf_host_base);
+        qp->bf_host_registration_owner = false;
+    }
+    qp->bf_host_base = nullptr;
+    qp->bf_device_addr = nullptr;
 }
 
 static bool uses_control_regions(
@@ -124,13 +147,6 @@ static void release_control_region(
 
 static void destroy_uar(struct mlx5dv_devx_uar* uar) {
     if (!uar) return;
-#ifndef USE_MUSA
-    if (uar->reg_addr) {
-        if (cudaHostUnregister(uar->reg_addr) != cudaSuccess) {
-            print_cuda_error("Failed to unregister MMIO memory");
-        }
-    }
-#endif
     mlx5dv_devx_free_uar(uar);
 }
 
@@ -269,6 +285,9 @@ struct mlx5gda_cq* mlx5gda_create_cq(
     cq->dev_base = cq_buf_dev ? cq_buf_dev : ctrl_buf;
     cq->heap = cq_heap;
     cq->cq_buf = static_cast<char*>(cq_buf) + cq_offset;
+    cq->dev_cq_buf = split_regions
+                         ? cq->cq_buf
+                         : static_cast<char*>(cq->dev_base) + cq_offset;
     cq->dbr = static_cast<char*>(dbr) + dbr_offset;
     cq->cqe = num_cqe;
     cq->cqn = cqn;
@@ -291,7 +310,7 @@ fail:
     return NULL;
 }
 
-void mlx5gda_destroy_cq(struct memheap* ctrl_buf_heap, struct mlx5gda_cq* cq) {
+void mlx5gda_destroy_cq(struct mlx5gda_cq* cq) {
     if (!cq) return;
     if (cq->mcq) {
         mlx5dv_devx_obj_destroy(cq->mcq);
@@ -310,11 +329,9 @@ void mlx5gda_destroy_cq(struct memheap* ctrl_buf_heap, struct mlx5gda_cq* cq) {
 }
 
 struct mlx5gda_qp* mlx5gda_create_rc_qp(
-    struct mlx5dv_pd mpd, void* ctrl_buf,
-    struct mlx5dv_devx_umem* ctrl_buf_umem, struct memheap* ctrl_buf_heap,
-    struct ibv_pd* pd, int wqe, uint8_t port_num, cudaStream_t stream,
-    void* cq_buf, void* cq_buf_dev, struct mlx5dv_devx_umem* cq_buf_umem,
-    struct memheap* cq_buf_heap,
+    struct mlx5dv_pd mpd, const struct mlx5gda_control_buffer* ctrl,
+    const struct mlx5gda_control_buffer* cq, struct ibv_pd* pd, int wqe,
+    uint8_t port_num, cudaStream_t stream,
     const struct mlx5gda_control_region_allocator* region_allocator) {
     mlx5gda_reset_create_qp_failure();
 
@@ -324,17 +341,17 @@ struct mlx5gda_qp* mlx5gda_create_rc_qp(
     struct mlx5dv_devx_obj* mlx5_qp = NULL;
     size_t wq_offset = -1;
     size_t dbr_offset = -1;
-    void* wq = ctrl_buf;
-    void* dbr = ctrl_buf;
-    struct mlx5dv_devx_umem* wq_umem = ctrl_buf_umem;
-    struct mlx5dv_devx_umem* dbr_umem = ctrl_buf_umem;
+    void* wq = ctrl->addr;
+    void* dbr = ctrl->addr;
+    struct mlx5dv_devx_umem* wq_umem = ctrl->umem;
+    struct mlx5dv_devx_umem* dbr_umem = ctrl->umem;
     const bool split_regions = uses_control_regions(region_allocator);
 
     struct ibv_context* ctx = pd->context;
     void* qp_context = NULL;
     void* cap = NULL;
     uint32_t cqe_version = 0;
-    bool ctrl_host = !split_regions && is_host_control_buffer(ctrl_buf);
+    bool ctrl_host = !split_regions && is_host_control_buffer(ctrl->addr);
 
     if (wqe <= 0) {
         errno = EINVAL;
@@ -381,9 +398,9 @@ struct mlx5gda_qp* mlx5gda_create_rc_qp(
     }
 
     // Create send_cq on GPU memory.
-    send_cq = mlx5gda_create_cq(ctrl_buf, ctrl_buf_umem, ctrl_buf_heap, pd, wqe,
-                                stream, cq_buf, cq_buf_dev, cq_buf_umem,
-                                cq_buf_heap, region_allocator);
+    send_cq = mlx5gda_create_cq(ctrl->addr, ctrl->umem, ctrl->heap, pd, wqe,
+                                stream, cq->addr, cq->dev_addr, cq->umem,
+                                cq->heap, region_allocator);
     if (send_cq == NULL) {
         perror("mlx5gda_create_cq failed");
         goto fail;
@@ -394,34 +411,7 @@ struct mlx5gda_qp* mlx5gda_create_rc_qp(
         perror("Failed to create UAR");
         goto fail;
     }
-#ifdef USE_MUSA
-    {
-        const size_t page_size = static_cast<size_t>(sysconf(_SC_PAGESIZE));
-        const uintptr_t reg_addr = reinterpret_cast<uintptr_t>(uar->reg_addr);
-        const uintptr_t host_base =
-            reg_addr & ~(static_cast<uintptr_t>(page_size) - 1);
-        const size_t offset = reg_addr - host_base;
-        const size_t length =
-            ((offset + MLX5GDA_BF_SIZE * 2 + page_size - 1) / page_size) *
-            page_size;
-        const musaError_t register_result =
-            musaHostRegister(reinterpret_cast<void*>(host_base), length,
-                             musaHostRegisterMapped | musaHostRegisterIoMemory);
-        void* device_base = nullptr;
-        if (musaHostGetDevicePointer(&device_base,
-                                     reinterpret_cast<void*>(host_base),
-                                     0) != musaSuccess) {
-            if (register_result == musaSuccess)
-                musaHostUnregister(reinterpret_cast<void*>(host_base));
-            print_cuda_error("Failed to map MUSA BF MMIO page");
-            goto fail;
-        }
-        qp->bf_host_base = reinterpret_cast<void*>(host_base);
-        qp->bf_host_length = length;
-        qp->bf_device_addr = static_cast<char*>(device_base) + offset;
-        qp->bf_host_registration_owner = register_result == musaSuccess;
-    }
-#endif
+    if (map_uar_for_device(uar, qp) != 0) goto fail;
 
     if (split_regions) {
         if (region_allocator->allocate(region_allocator->context,
@@ -444,15 +434,14 @@ struct mlx5gda_qp* mlx5gda_create_rc_qp(
         dbr_offset = 0;
     } else {
         wq_offset = memheap_aligned_alloc(
-            ctrl_buf_heap, num_wqebb * sizeof(struct mlx5gda_wqebb),
+            ctrl->heap, num_wqebb * sizeof(struct mlx5gda_wqebb),
             (size_t)1 << MLX5_ADAPTER_PAGE_SHIFT);
         if (wq_offset == -1) {
             perror("Failed to allocate WQ memory");
             goto fail;
         }
 
-        dbr_offset =
-            memheap_alloc(ctrl_buf_heap, sizeof(struct mlx5gda_wq_dbr));
+        dbr_offset = memheap_alloc(ctrl->heap, sizeof(struct mlx5gda_wq_dbr));
         if (dbr_offset == -1) {
             perror("Failed to allocate DBR memory");
             goto fail;
@@ -524,6 +513,7 @@ struct mlx5gda_qp* mlx5gda_create_rc_qp(
     qp->num_wqebb = num_wqebb;
     qp->wq_offset = wq_offset;
     qp->dbr_offset = dbr_offset;
+    qp->wq_heap = ctrl->heap;
     qp->wq = static_cast<char*>(wq) + wq_offset;
     qp->dbr = static_cast<char*>(dbr) + dbr_offset;
     return qp;
@@ -534,14 +524,11 @@ fail:
         mlx5dv_devx_obj_destroy(mlx5_qp);
     }
     if (uar) {
-#ifdef USE_MUSA
-        if (qp && qp->bf_host_registration_owner)
-            musaHostUnregister(qp->bf_host_base);
-#endif
+        if (qp) unmap_uar_for_device(qp);
         destroy_uar(uar);
     }
     if (send_cq) {
-        mlx5gda_destroy_cq(ctrl_buf_heap, send_cq);
+        mlx5gda_destroy_cq(send_cq);
     }
     if (qp) {
         release_control_region(&qp->region_allocator, &qp->dbr_region);
@@ -551,38 +538,35 @@ fail:
         free(qp);
     }
     if (!split_regions && wq_offset != -1) {
-        memheap_free(ctrl_buf_heap, wq_offset);
+        memheap_free(ctrl->heap, wq_offset);
     }
     if (!split_regions && dbr_offset != -1) {
-        memheap_free(ctrl_buf_heap, dbr_offset);
+        memheap_free(ctrl->heap, dbr_offset);
     }
     errno = saved_errno;
     return NULL;
 }
 
-void mlx5gda_destroy_qp(struct memheap* ctrl_buf_heap, struct mlx5gda_qp* qp) {
+void mlx5gda_destroy_qp(struct mlx5gda_qp* qp) {
     if (qp->mqp) {
         mlx5dv_devx_obj_destroy(qp->mqp);
     }
     if (qp->uar) {
-#ifdef USE_MUSA
-        if (qp->bf_host_registration_owner)
-            musaHostUnregister(qp->bf_host_base);
-#endif
+        unmap_uar_for_device(qp);
         destroy_uar(qp->uar);
     }
     if (qp->send_cq) {
-        mlx5gda_destroy_cq(ctrl_buf_heap, qp->send_cq);
+        mlx5gda_destroy_cq(qp->send_cq);
     }
     if (uses_control_regions(&qp->region_allocator)) {
         release_control_region(&qp->region_allocator, &qp->dbr_region);
         release_control_region(&qp->region_allocator, &qp->wq_region);
     } else {
         if (qp->wq_offset != -1) {
-            memheap_free(ctrl_buf_heap, qp->wq_offset);
+            memheap_free(qp->wq_heap, qp->wq_offset);
         }
         if (qp->dbr_offset != -1) {
-            memheap_free(ctrl_buf_heap, qp->dbr_offset);
+            memheap_free(qp->wq_heap, qp->dbr_offset);
         }
     }
     if (qp) {

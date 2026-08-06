@@ -3,12 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#ifdef USE_MUSA
-#include <musa_runtime.h>
-#define cudaStream_t musaStream_t
-#else
-#include <cuda_runtime.h>
-#endif
+#include "cuda_alike.h"
 #include <infiniband/verbs.h>
 #include <infiniband/mlx5dv.h>
 
@@ -40,6 +35,13 @@ struct mlx5gda_control_region_allocator {
     void (*release)(void *context, struct mlx5gda_control_region *region);
 };
 
+struct mlx5gda_control_buffer {
+    void *addr;
+    void *dev_addr;
+    struct mlx5dv_devx_umem *umem;
+    struct memheap *heap;
+};
+
 struct mlx5gda_rdma_write_wqe {
     struct mlx5_wqe_ctrl_seg ctrl;
     struct mlx5_wqe_raddr_seg raddr;
@@ -59,6 +61,7 @@ struct mlx5gda_cq {
     uint32_t cqn;
     uint32_t cqe;
     void *dev_base;
+    void *dev_cq_buf;
     struct memheap *heap;
     size_t cq_offset;
     size_t dbr_offset;
@@ -75,7 +78,7 @@ struct mlx5gda_cq *mlx5gda_create_cq(
     cudaStream_t stream, void *cq_buf, void *cq_buf_dev,
     struct mlx5dv_devx_umem *cq_buf_umem, struct memheap *cq_buf_heap,
     const struct mlx5gda_control_region_allocator *region_allocator);
-void mlx5gda_destroy_cq(struct memheap *ctrl_buf_heap, struct mlx5gda_cq *cq);
+void mlx5gda_destroy_cq(struct mlx5gda_cq *cq);
 
 static const size_t MLX5GDA_BF_SIZE = 256;
 
@@ -83,12 +86,9 @@ struct mlx5gda_qp {
     struct mlx5dv_devx_obj *mqp;
     struct mlx5gda_cq *send_cq;
     struct mlx5dv_devx_uar *uar;
-#ifdef USE_MUSA
     void *bf_host_base;
-    size_t bf_host_length;
     char *bf_device_addr;
     bool bf_host_registration_owner;
-#endif
 
     uint8_t port_num;
     struct ibv_port_attr port_attr;
@@ -99,6 +99,7 @@ struct mlx5gda_qp {
     uint32_t num_wqebb;
     size_t wq_offset;
     size_t dbr_offset;
+    struct memheap *wq_heap;
     void *wq;
     void *dbr;
     struct mlx5gda_control_region wq_region;
@@ -130,13 +131,11 @@ void mlx5gda_reset_create_qp_failure();
 mlx5gda_create_qp_failure mlx5gda_last_create_qp_failure();
 
 struct mlx5gda_qp *mlx5gda_create_rc_qp(
-    struct mlx5dv_pd mpd, void *ctrl_buf,
-    struct mlx5dv_devx_umem *ctrl_buf_umem, struct memheap *ctrl_buf_heap,
-    struct ibv_pd *pd, int wqe, uint8_t port_num, cudaStream_t stream,
-    void *cq_buf, void *cq_buf_dev, struct mlx5dv_devx_umem *cq_buf_umem,
-    struct memheap *cq_buf_heap,
+    struct mlx5dv_pd mpd, const struct mlx5gda_control_buffer *ctrl,
+    const struct mlx5gda_control_buffer *cq, struct ibv_pd *pd, int wqe,
+    uint8_t port_num, cudaStream_t stream,
     const struct mlx5gda_control_region_allocator *region_allocator);
-void mlx5gda_destroy_qp(struct memheap *ctrl_buf_heap, struct mlx5gda_qp *qp);
+void mlx5gda_destroy_qp(struct mlx5gda_qp *qp);
 
 int mlx5gda_modify_rc_qp_rst2init(struct mlx5gda_qp *qp, uint16_t pkey_index);
 int mlx5gda_modify_rc_qp_init2rtr(struct mlx5gda_qp *qp,
