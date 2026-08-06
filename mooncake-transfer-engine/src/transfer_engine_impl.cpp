@@ -610,6 +610,10 @@ int TransferEngineImpl::registerLocalMemory(void* addr, size_t length,
 
     std::vector<MemoryRegion> regions = {
         {addr, length, location, remote_accessible}};
+    if (tryBumpLocalMemoryRegionRefs(regions)) {
+        return 0;
+    }
+
     if (!tryReserveMemoryRegions(regions)) {
         LOG(ERROR)
             << "Transfer Engine does not support overlapped memory region";
@@ -647,6 +651,11 @@ int TransferEngineImpl::registerLocalMemory(void* addr, size_t length,
 
 int TransferEngineImpl::unregisterLocalMemory(void* addr,
                                               bool update_metadata) {
+    auto addr_list = releaseLocalMemoryRegionRefs({addr});
+    if (addr_list.empty()) {
+        return 0;
+    }
+
     for (auto& transport : multi_transports_->listTransports()) {
         int ret = transport->unregisterLocalMemory(addr, update_metadata);
         if (ret) return ret;
@@ -814,6 +823,10 @@ int TransferEngineImpl::registerLocalMemoryBatch(
         regions.push_back({buffer.addr, buffer.length, location, true});
         addr_list.push_back(buffer.addr);
     }
+    if (tryBumpLocalMemoryRegionRefs(regions)) {
+        return 0;
+    }
+
     if (!tryReserveMemoryRegions(regions)) {
         LOG(ERROR)
             << "Transfer Engine does not support overlapped memory region";
@@ -846,15 +859,20 @@ int TransferEngineImpl::registerLocalMemoryBatch(
 
 int TransferEngineImpl::unregisterLocalMemoryBatch(
     const std::vector<void*>& addr_list) {
+    auto pending_addr_list = releaseLocalMemoryRegionRefs(addr_list);
+    if (pending_addr_list.empty()) {
+        return 0;
+    }
+
     int first_error = 0;
     for (auto transport : multi_transports_->listTransports()) {
-        int ret = transport->unregisterLocalMemoryBatch(addr_list);
+        int ret = transport->unregisterLocalMemoryBatch(pending_addr_list);
         if (ret && !first_error) first_error = ret;
     }
     if (first_error) return first_error;
 
     std::unique_lock<std::shared_mutex> lock(mutex_);
-    for (auto& addr : addr_list) {
+    for (auto& addr : pending_addr_list) {
         eraseMemoryRegionLocked(addr);
     }
     return 0;
@@ -889,6 +907,42 @@ bool TransferEngineImpl::hasOverlapInMapLocked(const MemoryRegionMap& regions,
     }
 
     return false;
+}
+
+bool TransferEngineImpl::tryBumpLocalMemoryRegionRefs(
+    const std::vector<MemoryRegion>& regions) {
+    if (regions.empty()) {
+        return false;
+    }
+
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+
+    for (const auto& region : regions) {
+        auto addr = reinterpret_cast<uintptr_t>(region.addr);
+        if (hasOverlapInMapLocked(registering_memory_regions_, addr,
+                                  region.length)) {
+            return false;
+        }
+
+        auto it = local_memory_regions_.find(addr);
+        if (it == local_memory_regions_.end()) {
+            return false;
+        }
+
+        auto& existing = it->second;
+        if (existing.length != region.length ||
+            existing.location != region.location ||
+            existing.remote_accessible != region.remote_accessible) {
+            return false;
+        }
+    }
+
+    for (const auto& region : regions) {
+        ++local_memory_regions_[reinterpret_cast<uintptr_t>(region.addr)]
+              .ref_count;
+    }
+
+    return true;
 }
 
 bool TransferEngineImpl::tryReserveMemoryRegions(
@@ -928,6 +982,24 @@ void TransferEngineImpl::releaseMemoryRegions(
         registering_memory_regions_.erase(
             reinterpret_cast<uintptr_t>(region.addr));
     }
+}
+
+std::vector<void*> TransferEngineImpl::releaseLocalMemoryRegionRefs(
+    const std::vector<void*>& addr_list) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    std::vector<void*> pending_addr_list;
+    pending_addr_list.reserve(addr_list.size());
+
+    for (auto addr : addr_list) {
+        auto it = local_memory_regions_.find(reinterpret_cast<uintptr_t>(addr));
+        if (it != local_memory_regions_.end() && it->second.ref_count > 1) {
+            --it->second.ref_count;
+        } else {
+            pending_addr_list.push_back(addr);
+        }
+    }
+
+    return pending_addr_list;
 }
 
 void TransferEngineImpl::insertMemoryRegionLocked(const MemoryRegion& region) {
