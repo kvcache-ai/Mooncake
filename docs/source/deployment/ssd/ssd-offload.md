@@ -131,6 +131,7 @@ Start with `--enable_offload=true` for eager SSD persistence. Add `--offload_on_
 | Environment Variable | Default | Description |
 |---|---|---|
 | `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | `/data/file_storage` | Absolute path to the SSD storage directory |
+| `MOONCAKE_OFFLOAD_FILE_STORAGE_PATHS` | empty | Comma-separated absolute paths for multi-SSD sharding. When set, it takes precedence over the single-path setting. |
 | `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR` | `bucket_storage_backend` | Storage backend type (see below) |
 | `MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES` | `1342177280` (1.25 GB) | Client-side staging buffer size |
 | `MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT` | `20000` | Max keys processed per iteration when scanning existing SSD metadata on startup |
@@ -145,6 +146,32 @@ Start with `--enable_offload=true` for eager SSD persistence. Add `--offload_on_
 | `MOONCAKE_OFFLOAD_DISK_EVICTION_LOW_WATERMARK_RATIO` | `0.80` | Target backend usage ratio for proactive disk eviction |
 
 The `MOONCAKE_OFFLOAD_*` watermark names are preferred. Short aliases `MOONCAKE_DISK_EVICTION_HIGH_WATERMARK_RATIO` and `MOONCAKE_DISK_EVICTION_LOW_WATERMARK_RATIO` are also accepted. The high watermark must be greater than the low watermark.
+
+### Multi-SSD sharding
+
+To use independent local NVMe drives without creating a RAID volume, list one
+existing directory per drive:
+
+```bash
+export MOONCAKE_OFFLOAD_FILE_STORAGE_PATHS=/mnt/nvme0/mooncake,/mnt/nvme1/mooncake,/mnt/nvme2/mooncake,/mnt/nvme3/mooncake
+```
+
+Mooncake assigns each object to one path with stable rendezvous hashing. A
+batch is grouped by path, and the path-local reads or writes run concurrently.
+Each path owns an independent storage backend, metadata scan, capacity state,
+and eviction state. `MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES` and
+`MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT` are aggregate limits and are divided as
+evenly as possible among the paths. The bucket backend's
+`MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` remains a per-path eviction threshold.
+
+On restart, metadata is scanned from every configured path and the in-memory
+key-to-path routes are rebuilt. Reordering the same path list does not make
+existing objects inaccessible. Adding a path also preserves access to existing
+objects; Mooncake does not rebalance old objects automatically, while new
+objects use the updated path set. All configured paths must be unique,
+absolute, existing, writable directories. Multi-path mode is supported by
+local storage backends; it is not supported by
+`distributed_storage_backend`.
 
 ### Bucket backend settings
 
@@ -282,7 +309,7 @@ mooncake_client \
 
 ## Notes
 
-- `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` must be an absolute path to an existing, writable directory. Symbolic links and paths containing `..` are rejected.
+- `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` and every entry in `MOONCAKE_OFFLOAD_FILE_STORAGE_PATHS` must be an absolute path to an existing, writable directory. Symbolic links and paths containing `..` are rejected.
 - On real client restart, `bucket_storage_backend` and `file_per_key_storage_backend` scan existing SSD metadata and report it to the master, so previously offloaded objects remain accessible. `offset_allocator_storage_backend` does not support restart recovery.
 - Eviction only notifies the master and deletes local files; objects replicated on other nodes are unaffected.
 - Each machine requires its own real client process. In multi-node deployments, ensure `--host` and `--port` are correctly set so nodes can reach each other.

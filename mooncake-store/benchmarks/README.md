@@ -2,6 +2,21 @@
 
 This directory contains benchmark tools for Mooncake Store internals.
 
+## Storage Backend Benchmark
+
+`storage_backend_bench` accepts either `--storage_path` for a single backend or
+`--storage_paths` with a comma-separated list for multi-path SSD sharding:
+
+```bash
+./build/mooncake-store/benchmarks/storage_backend_bench \
+  --backend=bucket --test=load --value_size=1048576 --batch_size=32 \
+  --storage_paths=/mnt/nvme0/mooncake,/mnt/nvme1/mooncake
+```
+
+Use directories on distinct physical devices when measuring scaling. Buffered
+I/O may measure page-cache performance; size the working set and container
+memory accordingly, or use the benchmark's documented cache controls.
+
 ## Allocation Strategy Benchmark
 
 `allocation_strategy_bench` evaluates Store allocation behavior across segment
