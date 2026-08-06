@@ -70,7 +70,7 @@ class Transport {
         int advise_retry_cnt = 0;
         // Per-request transport pin, TENT only.
         int transport_hint = 0;
-        // Adjacent requests in the same group are one transport submission.
+        // Adjacent requests in a group may be scheduled as one unit.
         uint64_t task_group_id = kNoTaskGroup;
     };
 
@@ -203,14 +203,14 @@ class Transport {
             status = Slice::SUCCESS;
             __atomic_fetch_add(&task->transferred_bytes, length,
                                __ATOMIC_RELAXED);
-            __atomic_fetch_add(&task->success_slice_count, 1, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&task->success_slice_count, 1, __ATOMIC_ACQ_REL);
 
             check_batch_completion(false);
         }
 
         void markFailed() {
             status = Slice::FAILED;
-            __atomic_fetch_add(&task->failed_slice_count, 1, __ATOMIC_RELAXED);
+            __atomic_fetch_add(&task->failed_slice_count, 1, __ATOMIC_ACQ_REL);
 
             check_batch_completion(true);
         }
@@ -351,6 +351,7 @@ class Transport {
 #else
         const TransferRequest *request = nullptr;
 #endif
+        size_t request_count = 1;
         // record the slice list for freeing objects
         std::vector<Slice *> slice_list;
         ~TransferTask() {
@@ -403,10 +404,9 @@ class Transport {
             "Transport::submitTransferTask is not implemented");
     }
 
-    virtual Status submitTransferTaskGroup(
-        const std::vector<TransferTask *> &task_list) {
-        return submitTransferTask(task_list);
-    }
+    // Grouped transports must append slices in request order so scatter can
+    // recover per-request status after a grouped task fails.
+    virtual bool supportsGroupedScatter() const { return false; }
 
     /// @brief Get the status of a submitted transfer. This function shall not
     /// be called again after completion.

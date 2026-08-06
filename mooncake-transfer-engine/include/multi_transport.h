@@ -29,6 +29,7 @@ class MultiTransport {
     using BatchID = Transport::BatchID;
     using TransferRequest = Transport::TransferRequest;
     using TransferStatus = Transport::TransferStatus;
+    using TransferStatusEnum = Transport::TransferStatusEnum;
     using BatchDesc = Transport::BatchDesc;
 
     MultiTransport(std::shared_ptr<TransferMetadata> metadata,
@@ -36,12 +37,20 @@ class MultiTransport {
 
     ~MultiTransport();
 
+    struct ScatterSubmission {
+        BatchID batch_id = static_cast<BatchID>(-1);
+        std::vector<size_t> task_sizes;
+    };
+
     BatchID allocateBatchID(size_t batch_size);
 
     Status freeBatchID(BatchID batch_id);
 
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest> &entries);
+
+    Status submitScatter(const std::vector<TransferRequest> &entries,
+                         ScatterSubmission &submission);
 
 #ifdef ENABLE_MULTI_PROTOCOL
     Status mp_submitTransfer(BatchID batch_id,
@@ -51,6 +60,10 @@ class MultiTransport {
 
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus &status);
+
+    Status getScatterRequestStatuses(
+        BatchID batch_id, size_t task_id,
+        std::vector<TransferStatusEnum> &request_statuses);
 
     Status getBatchTransferStatus(BatchID batch_id, TransferStatus &status);
 
@@ -72,6 +85,10 @@ class MultiTransport {
     void *getBaseAddr();
 
    private:
+    Status submitTransfer(BatchID batch_id,
+                          const std::vector<TransferRequest> &entries,
+                          std::vector<size_t> *task_sizes);
+
     Status selectTransport(const TransferRequest &entry, Transport *&transport);
 
 #ifdef ENABLE_MULTI_PROTOCOL

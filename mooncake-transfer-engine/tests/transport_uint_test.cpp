@@ -55,6 +55,10 @@ class TransferEngineImplTestPeer {
         }
     }
 
+    static TransferEngineImpl& implementation(TransferEngine& engine) {
+        return *engine.impl_;
+    }
+
     static AutoDiscoverConfig autoDiscoverConfig(
         const TransferEngineImpl& engine) {
         return engine.auto_discover_config_;
@@ -229,6 +233,44 @@ class BlockingRegistrationTransport : public Transport {
     int registration_calls_ = 0;
     bool first_registration_started_ = false;
     bool release_first_registration_ = false;
+};
+
+class PartialFailureSubmissionTransport : public BatchResultTransport {
+   public:
+    Status submitTransferTask(
+        const std::vector<TransferTask*>& tasks) override {
+        submission_sizes.push_back(tasks.size());
+        for (auto* task : tasks) {
+            request_counts.push_back(task->request_count);
+            task->slice_count = task->request_count;
+            task->success_slice_count = 1;
+            task->failed_slice_count = task->request_count - 1;
+            for (size_t i = 0; i < task->request_count; ++i) {
+                auto* slice = new Slice{};
+                slice->length = task->request[i].length;
+                slice->status = i == 0 ? Slice::SUCCESS : Slice::FAILED;
+                task->slice_list.push_back(slice);
+            }
+            if (extra_slice_) task->slice_list.push_back(new Slice{});
+            task->is_finished = true;
+        }
+        return Status::InvalidArgument("synthetic submit failure");
+    }
+
+    Status getTransferStatus(BatchID, size_t, TransferStatus& status) override {
+        status.s = TransferStatusEnum::FAILED;
+        return Status::OK();
+    }
+
+    bool supportsGroupedScatter() const override { return true; }
+
+    void addExtraSlice() { extra_slice_ = true; }
+
+    std::vector<size_t> submission_sizes;
+    std::vector<size_t> request_counts;
+
+   private:
+    bool extra_slice_ = false;
 };
 
 class TransportTest : public ::testing::Test {
@@ -607,6 +649,53 @@ TEST_F(TransportTest, RegisterLocalMemoryBatchRollsBackAttemptedTransports) {
         engine.unregisterLocalMemoryBatch({buffer.data(), buffer.data() + 1}),
         0);
 }
+
+TEST_F(TransportTest, ScatterSubmitFailurePreservesCompletedFragments) {
+    TransferEngine engine(false);
+    ASSERT_EQ(engine.init(P2PHANDSHAKE, "127.0.0.1:12345"), 0);
+    auto transport = std::make_shared<PartialFailureSubmissionTransport>();
+    auto& impl = TransferEngineImplTestPeer::implementation(engine);
+    TransferEngineImplTestPeer::replaceTransports(
+        impl, {{"partial-failure", transport}});
+
+    constexpr SegmentID kSegmentId = 12;
+    auto descriptor = std::make_shared<TransferMetadata::SegmentDesc>();
+    descriptor->name = "remote";
+    descriptor->protocol = "partial-failure";
+    impl.getMetadata()->addLocalSegment(kSegmentId, "remote",
+                                        std::move(descriptor));
+    std::array<char, 2> buffer{};
+    std::array<size_t, 2> offsets{0, 1};
+    std::array<size_t, 2> lengths{1, 1};
+
+    auto run = [&] {
+        std::vector<bool> fragment_ok;
+        auto operation = engine.submitScatter({{
+            .opcode = TransferRequest::READ,
+            .remote_segment = "remote",
+            .remote_base_offset = 0,
+            .remote_size = buffer.size(),
+            .local_buffer = buffer.data(),
+            .local_capacity = buffer.size(),
+            .local_offsets = offsets,
+            .remote_offsets = offsets,
+            .lengths = lengths,
+            .on_fragment_complete =
+                [&](size_t, const Status& status) {
+                    fragment_ok.push_back(status.ok());
+                },
+        }});
+        EXPECT_FALSE(operation.wait().ok());
+        return fragment_ok;
+    };
+
+    EXPECT_EQ(run(), (std::vector<bool>{true, false}));
+    EXPECT_EQ(transport->submission_sizes, (std::vector<size_t>{1}));
+    EXPECT_EQ(transport->request_counts, (std::vector<size_t>{2}));
+    transport->addExtraSlice();
+    EXPECT_EQ(run(), (std::vector<bool>{false, false}));
+}
+
 }  // namespace mooncake
 
 int main(int argc, char** argv) {
