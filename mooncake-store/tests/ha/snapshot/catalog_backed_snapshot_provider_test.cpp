@@ -151,7 +151,6 @@ TEST_P(CatalogBackedSnapshotProviderTest, LoadLatestSnapshotRoundTrip) {
     EXPECT_EQ(entry.key, kDefaultTestObjectKey);
     EXPECT_EQ(entry.metadata.client_id, (UUID{1, 2}));
     EXPECT_EQ(entry.metadata.size, kDefaultTestObjectSize);
-    EXPECT_EQ(entry.metadata.last_sequence_id, descriptor_.last_included_seq);
     ASSERT_EQ(entry.metadata.replicas.size(), 1u);
 
     const auto& replica = entry.metadata.replicas.front();

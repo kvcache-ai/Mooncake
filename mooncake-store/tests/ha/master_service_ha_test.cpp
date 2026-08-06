@@ -400,7 +400,6 @@ class MasterServiceHATest : public ::testing::Test {
         StandbyObjectMetadata metadata;
         metadata.client_id = generate_uuid();
         metadata.size = size;
-        metadata.last_sequence_id = 1;
         metadata.replicas.push_back(MakeStandbyMemoryReplica(endpoint, size));
         return StandbyObjectEntry{"default", key, std::move(metadata)};
     }
@@ -1045,7 +1044,6 @@ TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesNoFBufferDescriptor) {
     StandbyObjectMetadata metadata;
     metadata.client_id = generate_uuid();
     metadata.size = size;
-    metadata.last_sequence_id = 1;
     metadata.replicas.push_back(std::move(replica));
     StandbyObjectEntry object{kDefaultTenant.value(), "standby_restore_nof_key",
                               std::move(metadata)};

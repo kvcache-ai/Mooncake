@@ -50,6 +50,7 @@ set(MOONCAKE_STORE_SOURCES
     ha/leadership/master_service_supervisor.cpp
     ha/kv/etcd_ha_kv_backend.cpp
     ha/standby_controller.cpp
+    ha/standby_metadata_store.cpp
     ha/snapshot/catalog_backed_snapshot_provider.cpp
     ha/snapshot/batch_oplog_snapshot_types.cpp
     ha/snapshot/master_snapshot_codec.cpp

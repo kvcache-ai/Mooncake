@@ -7,16 +7,16 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
-#include "metadata_store.h"
 #include "ha/oplog/oplog_applier.h"
 #include "ha/oplog/oplog_types.h"
 #include "ha/snapshot/snapshot_provider.h"
+#include "ha/standby_metadata_store.h"
 #include "standby_state_machine.h"
 #include "types.h"
 
@@ -27,6 +27,40 @@ class MasterService;
 class HaKvBackend;
 class OpLogBatchStandbyReader;
 enum class OpLogBatchStandbyPollDisposition;
+struct OpLogBatchStandbyPollResult;
+
+class StandbySnapshotCapture {
+   public:
+    StandbySnapshotCapture(StandbySnapshotCapture&&) = default;
+    StandbySnapshotCapture& operator=(StandbySnapshotCapture&&) = default;
+    StandbySnapshotCapture(const StandbySnapshotCapture&) = delete;
+    StandbySnapshotCapture& operator=(const StandbySnapshotCapture&) = delete;
+
+    bool done() const { return cursor_.done(); }
+
+    uint64_t last_included_seq;
+    uint64_t last_included_batch_id;
+    ViewVersionId producer_view_version;
+    std::vector<StandbySegmentInfo> segments;
+
+   private:
+    friend class HotStandbyService;
+
+    StandbySnapshotCapture(uint64_t last_seq, uint64_t last_batch_id,
+                           ViewVersionId producer_view,
+                           std::vector<StandbySegmentInfo> captured_segments,
+                           StandbyMetadataStore::SnapshotCursor cursor,
+                           uint64_t generation)
+        : last_included_seq(last_seq),
+          last_included_batch_id(last_batch_id),
+          producer_view_version(producer_view),
+          segments(std::move(captured_segments)),
+          cursor_(std::move(cursor)),
+          generation_(generation) {}
+
+    StandbyMetadataStore::SnapshotCursor cursor_;
+    uint64_t generation_;
+};
 
 /**
  * @brief Configuration for HotStandbyService
@@ -169,6 +203,11 @@ class HotStandbyService {
      */
     bool ExportStandbySnapshot(StandbySnapshot& out) const;
 
+    std::optional<StandbySnapshotCapture> BeginSnapshotCapture();
+    bool CopyNextSnapshotChunk(size_t count, StandbySnapshotCapture& capture,
+                               std::vector<StandbyObjectEntry>& out);
+    void EndSnapshotCapture(StandbySnapshotCapture& capture);
+
     // Inject a snapshot provider (from external snapshot implementation).
     void SetSnapshotProvider(std::unique_ptr<SnapshotProvider> provider);
 
@@ -204,6 +243,9 @@ class HotStandbyService {
     ErrorCode FinalCatchUpForPromotionLocked(uint64_t current_applied_seq_id);
     ErrorCode FinalCatchUpBatchRecordsLocked(HaKvBackend& backend);
     void StopReplicationLoop();
+    void HandleSnapshotCaptureRequest(
+        const OpLogBatchStandbyPollResult& result);
+    void CancelSnapshotCapture();
 
     // Shared body for Promote() and PromoteAndExportSnapshot(): runs the
     // promotion sequence machine transitions + gap resolution + final
@@ -225,34 +267,6 @@ class HotStandbyService {
 
     HotStandbyConfig config_;
 
-    // Simple in-memory metadata store implementation
-    class StandbyMetadataStore : public MetadataStore {
-       public:
-        bool PutMetadata(const std::string& tenant_id, const std::string& key,
-                         const StandbyObjectMetadata& metadata) override;
-        bool Put(const std::string& key,
-                 const std::string& payload = std::string()) override;
-        std::optional<StandbyObjectMetadata> GetMetadata(
-            const std::string& tenant_id,
-            const std::string& key) const override;
-        bool Remove(const std::string& tenant_id,
-                    const std::string& key) override;
-        bool Exists(const std::string& tenant_id,
-                    const std::string& key) const override;
-        size_t GetKeyCountForTenant(
-            const std::string& tenant_id) const override;
-        size_t GetKeyCount() const override;
-        void Clear();
-
-        // Snapshot for promotion/restore.
-        void Snapshot(std::vector<StandbyObjectEntry>& out) const;
-
-       private:
-        mutable std::mutex mutex_;
-        std::unordered_map<
-            std::string, std::unordered_map<std::string, StandbyObjectMetadata>>
-            store_;
-    };
     std::unique_ptr<StandbyMetadataStore> metadata_store_;
     std::unique_ptr<SnapshotProvider> snapshot_provider_{
         std::make_unique<NoopSnapshotProvider>()};
@@ -286,6 +300,13 @@ class HotStandbyService {
     std::atomic<bool> replication_loop_running_{false};
     std::mutex replication_loop_mutex_;
     std::condition_variable replication_loop_cv_;
+
+    std::condition_variable snapshot_capture_cv_;
+    std::mutex snapshot_capture_mutex_;
+    bool snapshot_capture_requested_{false};
+    bool snapshot_capture_active_{false};
+    uint64_t snapshot_capture_generation_{0};
+    std::optional<StandbySnapshotCapture> ready_snapshot_capture_;
 
     // Synchronization
     mutable std::mutex mutex_;
