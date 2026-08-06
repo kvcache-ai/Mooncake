@@ -257,7 +257,7 @@ int EfaContext::buildSharedEndpoint(size_t max_wr, size_t max_inline) {
     //
     // Read-back rather than a hint: asking for more than the device supports
     // makes the EFA provider fail fi_getinfo() with -FI_ENODATA, turning a
-    // mis-set MC_MAX_WR into a failure to initialize.  MC_MAX_WR still
+    // misconfigured MC_MAX_WR into a failure to initialize.  MC_MAX_WR still
     // throttles a NIC when it asks for less; it can no longer ask for more.
     const size_t provider_tx_depth =
         fi_info_ && fi_info_->tx_attr ? fi_info_->tx_attr->size : 0;
