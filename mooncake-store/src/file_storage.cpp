@@ -504,12 +504,8 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             return result.error();
         }
         // Master returns a per-task acceptance vector: 1 = accepted, 0 =
-        // rejected as stale (post-SSD-IO generation mismatch on the NACK,
-        // success, or orphan-fallback path). Locally roll back on-disk
-        // state only for the rejected keys, leaving accepted siblings in
-        // the same bucket intact — otherwise a partial rejection would
-        // leave orphan bucket entries whose replicas Master no longer
-        // references, which ScanMeta could later re-register after restart.
+        // rejected as stale. Roll back rejected keys only, so accepted
+        // siblings in the same bucket are not clobbered.
         const auto& accepted = result.value();
         if (accepted.size() == keys.size()) {
             std::vector<std::string> rejected_keys;
@@ -588,13 +584,9 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             continue;
         }
 
-        // Pre-SSD-IO generation check. UpsertStart may have preempted an
-        // offload after its mirror was drained: the master marker is gone
-        // and OffloadTaskItem.generation no longer matches. Drop stale
-        // keys locally: master already released source refcount and erased
-        // the marker in UpsertStart, so a NACK from us would race the new
-        // generation's marker (see the NACK generation-guard in
-        // MasterService::NotifyOffloadSuccess for defence-in-depth).
+        // Pre-SSD-IO generation check: skip keys UpsertStart has already
+        // preempted so we don't emit a NACK that would race the new
+        // generation's marker. NotifyOffloadSuccess re-checks defensively.
         {
             std::vector<OffloadTaskItem> validate_tasks;
             std::vector<std::string> validate_keys;

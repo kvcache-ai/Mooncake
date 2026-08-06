@@ -981,28 +981,10 @@ class BucketStorageBackend : public StorageBackendInterface {
         double high_watermark_ratio, double low_watermark_ratio,
         EvictionHandler eviction_handler = nullptr) override;
 
-    /**
-     * @brief Partial rollback: evict the specified keys from
-     * object_bucket_map_ (and adjust total_size_) without dropping the
-     * bucket that still hosts accepted siblings. When @p keys_to_evict
-     * happens to cover all remaining keys of the bucket, delegates to
-     * RollbackCommittedBucket so the on-disk file is reclaimed.
-     *
-     * Used when master rejected only a subset of a batch in
-     * NotifyOffloadSuccess (post-SSD-IO generation mismatch on the NACK,
-     * success, or orphan-fallback path). Rolling back the whole bucket
-     * here would clobber accepted siblings and violate the RPC contract
-     * that per-task rejection must not disturb accepted keys.
-     *
-     * The bucket is resolved from object_bucket_map_[keys[0]] under the
-     * lock; @p keys_to_evict is required to reference keys that share a
-     * single bucket (this is the shape of a complete_handler callback).
-     * Keys already reaped (evicted / rolled back concurrently) are
-     * skipped.
-     *
-     * @param keys_to_evict   Keys whose committed local state must be
-     *                        removed from the index.
-     */
+    // Evict @p keys_to_evict from a single bucket (all keys must share one
+    // bucket, per the complete_handler contract) without disturbing accepted
+    // siblings. Falls back to RollbackCommittedBucket when the bucket is
+    // fully drained. Used by NotifyOffloadSuccess partial-rejection paths.
     void PartialRollbackKeys(const std::vector<std::string>& keys_to_evict);
 
    private:

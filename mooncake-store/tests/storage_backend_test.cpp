@@ -716,10 +716,8 @@ TEST_F(StorageBackendTest, BatchOffloadRollbackOnCompleteHandlerFailure) {
         << "No bucket data or metadata files should remain after rollback";
 }
 
-// PartialRollbackKeys must trim the on-disk .meta so a subsequent Init() /
-// ScanMeta() reflects the accepted-only view. Without this, ReRegisterOffloaded
-// Objects would resurrect the rejected key at master after a restart and
-// silently bypass the NotifyOffloadSuccess generation guard.
+// PartialRollbackKeys must trim the on-disk .meta so a subsequent Init()
+// cannot resurrect the rejected key via ReRegisterOffloadedObjects.
 TEST_F(StorageBackendTest, PartialRollbackKeysPersistsAcrossInit) {
     std::string test_dir = data_path + "/partial_rollback_persist_test";
     fs::create_directories(test_dir);
@@ -789,9 +787,8 @@ TEST_F(StorageBackendTest, PartialRollbackKeysPersistsAcrossInit) {
         total_size_after_partial_rollback = partial_meta->total_size;
     }
 
-    // The bucket .meta / .bucket files must still exist (partial rollback
-    // keeps the accepted sibling on disk); only the rejected key's name
-    // must be gone from the .meta.
+    // The bucket files must remain (partial rollback keeps accepted
+    // siblings); only the rejected key's name is gone from .meta.
     const auto metadata_path =
         fs::path(test_dir) / (std::to_string(bucket_id) + ".meta");
     const auto data_file_path =
@@ -849,10 +846,8 @@ TEST_F(StorageBackendTest, PartialRollbackKeysPersistsAcrossInit) {
     EXPECT_EQ(std::string(read_buf.begin(), read_buf.end()), kKeptValue);
 }
 
-// When PartialRollbackKeys evicts every key in a bucket, the bucket must be
-// fully reclaimed (both .bucket and .meta deleted) via the RollbackCommitted
-// Bucket fallback. Otherwise a fresh Init() would rehydrate an empty bucket
-// and leak disk bytes.
+// PartialRollbackKeys draining every key in a bucket must delete both
+// on-disk files via the RollbackCommittedBucket fallback.
 TEST_F(StorageBackendTest,
        PartialRollbackKeysAllRejectedFallsBackToFullRollback) {
     std::string test_dir = data_path + "/partial_rollback_all_rejected_test";

@@ -2719,10 +2719,9 @@ void BucketStorageBackend::RollbackCommittedBucket(
         bucket_meta = bucket_it->second;
 
         // Remove all keys from object_bucket_map_. total_size_ tracks the
-        // physical bucket files currently owned by buckets_, so subtract the
-        // whole bucket once below instead of summing only still-visible keys
-        // (partial rollback may already have trimmed bucket_meta->keys while
-        // the .bucket file still contains the rejected records).
+        // physical bucket files, so subtract the whole bucket once below
+        // instead of summing per-key sizes (partial rollback may already
+        // have trimmed bucket_meta->keys).
         for (const auto& key : keys) {
             auto obj_it = object_bucket_map_.find(key);
             if (obj_it != object_bucket_map_.end() &&
@@ -2796,19 +2795,17 @@ void BucketStorageBackend::PartialRollbackKeys(
     }
     int64_t bucket_id = -1;
     bool bucket_now_empty = false;
-    // Snapshot of the in-memory bucket_meta after in-memory eviction, taken
-    // under the write lock. Used outside the lock to rewrite the on-disk
-    // .meta so a subsequent Init()/ScanMeta() cannot resurrect the evicted
-    // keys via ReRegisterOffloadedObjects.
+    // Snapshot of bucket_meta after in-memory eviction. Used outside the
+    // lock to rewrite .meta so Init()/ScanMeta() cannot resurrect the
+    // evicted keys via ReRegisterOffloadedObjects.
     std::shared_ptr<BucketMetadata> meta_to_persist;
-    // Pre-rewrite meta_size so total_size_ can be re-accounted after the
-    // on-disk .meta is rewritten to a (typically smaller) size.
+    // Meta size before rewrite; needed to update total_size_ after persist.
     int64_t old_meta_size = 0;
     {
         SharedMutexLocker lock(&mutex_);
 
-        // Resolve bucket_id from the first still-committed key. The caller
-        // contract (complete_handler) guarantees all keys share one bucket.
+        // Resolve bucket_id from the first still-committed key; the
+        // complete_handler contract guarantees all keys share one bucket.
         for (const auto& key : keys_to_evict) {
             auto obj_it = object_bucket_map_.find(key);
             if (obj_it != object_bucket_map_.end()) {
@@ -2830,8 +2827,7 @@ void BucketStorageBackend::PartialRollbackKeys(
         auto& bucket_meta = bucket_it->second;
 
         // Set of storage keys to strip from the in-memory index and from
-        // the persisted bucket metadata. A key stays in the set only if it
-        // is currently mapped to this bucket in object_bucket_map_.
+        // the persisted bucket metadata (only keys currently mapped here).
         std::unordered_set<std::string> evict_set;
         evict_set.reserve(keys_to_evict.size());
         for (const auto& key : keys_to_evict) {
@@ -2842,21 +2838,15 @@ void BucketStorageBackend::PartialRollbackKeys(
                 // rather than fail: this path is best-effort cleanup.
                 continue;
             }
-            // Do not decrement total_size_ for this object's payload bytes:
-            // the .bucket file is unchanged and still occupies the same disk
-            // space until the whole bucket is deleted. Only the .meta delta is
-            // re-accounted after StoreBucketMetadata succeeds below.
+            // Do not touch total_size_ here: the .bucket file is unchanged.
+            // Only the .meta delta is re-accounted after StoreBucketMetadata.
             object_bucket_map_.erase(obj_it);
             evict_set.insert(key);
         }
 
-        // Filter bucket_meta->keys / metadatas in place so they match the
-        // post-eviction view. keys[] and metadatas[] are parallel arrays;
-        // preserve the pairing during compaction. data_size is intentionally
-        // NOT decremented: the record bytes remain on disk (the .bucket file
-        // is unchanged) — only the .meta index that names them is being
-        // rewritten. Those bytes are reclaimed together with the bucket the
-        // next time it is fully evicted or rolled back.
+        // Filter bucket_meta->{keys, metadatas} in place (parallel arrays).
+        // data_size stays unchanged: the .bucket file is not rewritten; those
+        // bytes are reclaimed on the next full eviction/rollback.
         std::vector<std::string> kept_keys;
         std::vector<BucketObjectMetadata> kept_metadatas;
         kept_keys.reserve(bucket_meta->keys.size());
@@ -2877,10 +2867,8 @@ void BucketStorageBackend::PartialRollbackKeys(
 
         bucket_now_empty = bucket_meta->keys.empty();
         if (!bucket_now_empty) {
-            // Copy under the lock; publish rewrite outside the lock so we
-            // do not hold the metadata mutex across a synchronous disk
-            // write. Runtime atomics (inflight_reads_, last_access_ns_) are
-            // reset in the copy ctor and do not affect the on-disk layout.
+            // Copy under the lock, publish rewrite outside (do not hold
+            // the metadata mutex across a synchronous disk write).
             meta_to_persist = std::make_shared<BucketMetadata>(*bucket_meta);
         }
     }
@@ -2894,18 +2882,13 @@ void BucketStorageBackend::PartialRollbackKeys(
         return;
     }
 
-    // Persist the trimmed key list to .meta. Without this, Init() reloads
-    // the pre-rollback keys from disk and ReRegisterOffloadedObjects will
-    // resurrect them at master, defeating the generation guard. Rewrite is
-    // O_TRUNC-based (see StoreBucketMetadata → OpenFile FileMode::Write),
-    // so it atomically replaces the file with the accepted-only view.
+    // Persist trimmed .meta so Init() / ScanMeta() cannot resurrect the
+    // evicted keys via ReRegisterOffloadedObjects on restart.
+    // StoreBucketMetadata uses O_TRUNC so the replace is atomic.
     auto persist_result = StoreBucketMetadata(bucket_id, meta_to_persist);
     if (!persist_result) {
-        // Rewrite failed after the in-memory view was already trimmed. The
-        // safest recovery is to escalate to a full bucket rollback: drop
-        // every remaining committed key here and delete both on-disk files.
-        // Leaving the .meta with a superset of live keys would let a
-        // future Init() resurrect the evicted keys.
+        // Meta rewrite failed after the in-memory view was trimmed.
+        // Escalate to a full rollback so the .meta cannot resurrect keys.
         LOG(ERROR) << "PartialRollbackKeys: failed to persist trimmed .meta "
                    << "for bucket " << bucket_id
                    << ", error=" << persist_result.error()
@@ -2923,10 +2906,8 @@ void BucketStorageBackend::PartialRollbackKeys(
         return;
     }
 
-    // Re-account total_size_ for the meta size change. StoreBucketMetadata
-    // updates meta_to_persist->meta_size in place with the on-disk byte
-    // count; publish it back to the tracked bucket and adjust the global
-    // tally by the delta.
+    // Re-account total_size_ for the meta size delta. StoreBucketMetadata
+    // updated meta_to_persist->meta_size in place.
     const int64_t new_meta_size = meta_to_persist->meta_size;
     {
         SharedMutexLocker lock(&mutex_);
@@ -3088,10 +3069,9 @@ BucketStorageBackend::PrepareEviction(
         const int64_t evicted_size =
             evict_meta->data_size + evict_meta->meta_size;
         // Remove all keys belonging to this bucket from the object map.
-        // total_size_ tracks the bucket files, not just visible keys, so
-        // subtract the whole .bucket + .meta once. This matters after partial
-        // rollback: bucket_meta->keys may contain only accepted siblings while
-        // bucket_meta->data_size still covers the unchanged .bucket file.
+        // total_size_ tracks bucket files (not just visible keys), so
+        // subtract the whole .bucket + .meta once. After partial rollback
+        // bucket_meta->keys may be a strict subset of the .bucket file.
         for (const auto& key : evict_meta->keys) {
             auto obj_it = object_bucket_map_.find(key);
             if (obj_it != object_bucket_map_.end() &&
@@ -3371,10 +3351,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
              bucket_id});
         buckets_.erase(bucket_it);
 
-        // Collect keys to remove (they reference this bucket). total_size_
-        // tracks the physical bucket files, so subtract the full bucket once
-        // rather than summing visible keys. After PartialRollbackKeys, visible
-        // keys can be a strict subset of the unchanged .bucket file.
+        // Collect keys to remove. total_size_ tracks bucket files, so
+        // subtract the full bucket once rather than summing visible keys.
         keys_to_remove = bucket_metadata->keys;
         for (const auto& key : keys_to_remove) {
             auto obj_it = object_bucket_map_.find(key);

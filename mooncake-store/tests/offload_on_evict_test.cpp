@@ -93,12 +93,11 @@ class OffloadOnEvictTest : public ::testing::Test {
         EXPECT_TRUE(predicate());
     }
 
-    // Test-only accessors that reach into MasterService::segment_manager_.
-    // Live on the friend-declared fixture; gtest's generated Fixture_Test
-    // subclass does not inherit friendship.
+    // Test-only accessors that reach into MasterService internals
+    // through the OffloadOnEvictTest friendship (gtest's generated
+    // Fixture_Test subclass does not inherit that friendship).
 
-    // Snapshot the mirror entry for @p key on the LocalDisk segment owned
-    // by @p client_id, or std::nullopt if absent.
+    // Snapshot the mirror entry for @p key on @p client_id's LocalDisk.
     std::optional<OffloadTaskItem> ReadMirror(MasterService& service,
                                               const UUID& client_id,
                                               const std::string& key) const {
@@ -117,9 +116,8 @@ class OffloadOnEvictTest : public ::testing::Test {
         return obj_it->second;
     }
 
-    // Inject @p task into the LocalDisk mirror owned by @p client_id.
-    // Simulates a replica that spans multiple LocalDisk segments so that a
-    // single offloading_tasks[key] entry corresponds to more than one mirror.
+    // Inject @p task into @p client_id's LocalDisk mirror to simulate a
+    // replica that spans multiple LocalDisk segments.
     void InjectMirror(MasterService& service, const UUID& client_id,
                       const std::string& key,
                       const OffloadTaskItem& task) const {
@@ -132,9 +130,7 @@ class OffloadOnEvictTest : public ::testing::Test {
             TenantId::Default().MakeScopedKey(key), task);
     }
 
-    // Read the generation of the current offloading_tasks[key] marker, or
-    // std::nullopt if no marker is installed. Requires a completed metadata
-    // shard entry for @p key in the default tenant.
+    // Read the generation of offloading_tasks[key], or nullopt if absent.
     std::optional<uint64_t> ReadTaskGeneration(MasterService& service,
                                                const std::string& key) const {
         const size_t shard_index =
@@ -148,8 +144,7 @@ class OffloadOnEvictTest : public ::testing::Test {
         return task_it->second.generation;
     }
 
-    // Read the refcnt of the first completed MEMORY replica of @p key in
-    // the default tenant, or std::nullopt if absent.
+    // Read the refcnt of the first completed MEMORY replica of @p key.
     std::optional<uint32_t> ReadMemoryReplicaRefcnt(
         MasterService& service, const std::string& key) const {
         const size_t shard_index =
@@ -173,10 +168,8 @@ class OffloadOnEvictTest : public ::testing::Test {
         return out;
     }
 
-    // Simulate the offload_on_evict push path: create the offloading_tasks
-    // marker + LocalDisk mirror + refcnt pin for @p key, exactly like the
-    // eviction path would. Requires @p key to have a completed MEMORY
-    // replica in the default tenant.
+    // Simulate the offload_on_evict push: create the offloading_tasks
+    // marker + LocalDisk mirror + refcnt pin, like the eviction path.
     void InjectOffloadTask(MasterService& service, const UUID& client_id,
                            const std::string& key) const {
         const size_t shard_index =
@@ -502,11 +495,8 @@ TEST_F(OffloadOnEvictTest, ComboD_EvictionWorks) {
     service->RemoveAll();
 }
 
-// Regression: EraseMetadata must drop the mirror entry in
-// LocalDiskSegment::offloading_objects. Otherwise BatchRemove leaves a
-// task-less key in the offload queue which the next
-// OffloadObjectHeartbeat drains back to the client, producing an
-// orphan bucket on SSD.
+// Regression: EraseMetadata must drop the LocalDiskSegment mirror entry;
+// otherwise BatchRemove leaves a task-less key in the offload queue.
 TEST_F(OffloadOnEvictTest, BatchRemoveDropsOffloadingObjectsMirror) {
     MasterServiceConfig config;
     config.enable_offload = true;
@@ -538,9 +528,8 @@ TEST_F(OffloadOnEvictTest, BatchRemoveDropsOffloadingObjectsMirror) {
 }
 
 // =============================================================================
-// UpsertStart on a key with a queued offload task must preempt the task and
-// reallocate a fresh buffer so the offload worker's read never races with
-// the client's RDMA write.
+// UpsertStart on a key with a queued offload must preempt the task and
+// reallocate a fresh buffer so the offload read never races the RDMA write.
 // =============================================================================
 
 TEST_F(OffloadOnEvictTest, UpsertPreemptsInProgressOffload) {
@@ -574,10 +563,8 @@ TEST_F(OffloadOnEvictTest, UpsertPreemptsInProgressOffload) {
                              ReplicaType::MEMORY)
                     .has_value());
 
-    // Upsert with the same size without draining the offload queue: even
-    // though Case B could reuse the existing buffer, preemption must fall
-    // through to Case A so the offload worker's in-flight read never races
-    // with the client's RDMA write.
+    // Upsert with the same size without draining: preemption must fall
+    // through to Case A so the worker's read never races the RDMA write.
     auto upsert_result = service->UpsertStart(
         ctx.client_id, key, TenantId::Default(), kSize, put_cfg);
     ASSERT_TRUE(upsert_result.has_value())
@@ -643,10 +630,8 @@ TEST_F(OffloadOnEvictTest, BatchUpsertPreemptsInProgressOffload) {
 }
 
 // =============================================================================
-// Regression: after UpsertStart preempts a task that OffloadObjectHeartbeat
-// has already drained (IN-FLIGHT), a late NotifyOffloadSuccess carrying the
-// old wire generation must be dropped so the stale LOCAL_DISK replica cannot
-// be attached to the new object generation.
+// Regression: after UpsertStart preempts a drained (IN-FLIGHT) task, a late
+// NotifyOffloadSuccess with the old wire generation must be dropped.
 // =============================================================================
 
 TEST_F(OffloadOnEvictTest, UpsertPreemptsInFlightOffloadAndDropsStaleNotify) {
@@ -664,9 +649,8 @@ TEST_F(OffloadOnEvictTest, UpsertPreemptsInFlightOffloadAndDropsStaleNotify) {
     const std::string key = "upsert_over_inflight";
     PutObject(*service, ctx.client_id, key);
 
-    // Drain the queue: mirror is gone but the master task marker survives
-    // until NotifyOffloadSuccess. Capture the wire generation the store
-    // worker would carry.
+    // Drain the queue: mirror gone, but master's task marker survives
+    // until NotifyOffloadSuccess. Capture the wire generation.
     auto hb = service->OffloadObjectHeartbeat(ctx.client_id, true);
     ASSERT_TRUE(hb.has_value());
     ASSERT_EQ(hb->size(), 1u);
@@ -684,9 +668,8 @@ TEST_F(OffloadOnEvictTest, UpsertPreemptsInFlightOffloadAndDropsStaleNotify) {
                                    ReplicaType::MEMORY);
     ASSERT_TRUE(put_end.has_value());
 
-    // Late NotifyOffloadSuccess arrives carrying the old generation. Master
-    // must drop it: neither ValidateOffloadGenerations nor NotifyOffloadSuccess
-    // may admit a LOCAL_DISK replica onto the new object generation.
+    // Late Notify with the old generation: both Validate and Notify must
+    // reject; no LOCAL_DISK replica may attach to the new generation.
     auto validate = service->ValidateOffloadGenerations({stale_task});
     ASSERT_TRUE(validate.has_value());
     ASSERT_EQ(validate->size(), 1u);
@@ -699,9 +682,8 @@ TEST_F(OffloadOnEvictTest, UpsertPreemptsInFlightOffloadAndDropsStaleNotify) {
     auto notify =
         service->NotifyOffloadSuccess(ctx.client_id, {stale_task}, {sm});
     ASSERT_TRUE(notify.has_value());
-    // Per-task rejection contract: the returned acceptance vector must
-    // observably flag the stale task as rejected so the worker can roll
-    // back the local commit without disturbing accepted siblings.
+    // Per-task rejection: the acceptance vector must flag the stale task
+    // so the worker rolls back locally without touching accepted siblings.
     ASSERT_EQ(notify->size(), 1u);
     EXPECT_FALSE(notify->front())
         << "stale post-SSD-IO completion must be reported as rejected";
@@ -714,13 +696,8 @@ TEST_F(OffloadOnEvictTest, UpsertPreemptsInFlightOffloadAndDropsStaleNotify) {
 }
 
 // =============================================================================
-// Regression (fcczzz review, file_storage.cpp:588 window): after UpsertStart
-// preempts an offload the worker may still emit a NACK carrying the old wire
-// generation. Prior to the fix the NACK sentinel branch in
-// NotifyOffloadSuccess only keyed on offloading_tasks[key] and would
-// decrement the *new* generation's source refcount and erase its marker,
-// leaking the newer offload. The regression asserts the NACK is rejected
-// per-task (accepted[0] == 0) and the fresh marker + refcnt are untouched.
+// Regression: a stale NACK arriving after UpsertStart re-queued the task
+// must not clobber the newer generation's marker / source refcount.
 // =============================================================================
 
 TEST_F(OffloadOnEvictTest, StaleNackDoesNotClobberNewerOffloadTask) {
@@ -746,9 +723,8 @@ TEST_F(OffloadOnEvictTest, StaleNackDoesNotClobberNewerOffloadTask) {
     const OffloadTaskItem stale_task = hb->front();
     ASSERT_NE(stale_task.generation, 0u);
 
-    // Upsert preempts the in-flight task and installs a new PROCESSING
-    // replica; PutEnd completes it as a fresh MEMORY replica which
-    // re-queues a fresh offloading_tasks[key] marker with a new generation.
+    // Upsert preempts the in-flight task; PutEnd installs a fresh MEMORY
+    // replica which re-queues offloading_tasks[key] at a new generation.
     ReplicateConfig cfg;
     cfg.replica_num = 1;
     auto upsert_result = service->UpsertStart(
@@ -766,9 +742,8 @@ TEST_F(OffloadOnEvictTest, StaleNackDoesNotClobberNewerOffloadTask) {
     ASSERT_TRUE(fresh_refcnt.has_value());
     EXPECT_GT(*fresh_refcnt, 0u);
 
-    // Late NACK from the stale worker: data_size=-1 sentinel with the old
-    // generation. Master must reject per-task and leave the fresh marker
-    // + refcnt alone.
+    // Late NACK from the stale worker (data_size=-1 sentinel, old gen).
+    // Must be rejected per-task; fresh marker + refcnt untouched.
     StorageObjectMetadata nack_meta{};
     nack_meta.data_size = -1;
     auto notify =
@@ -791,12 +766,8 @@ TEST_F(OffloadOnEvictTest, StaleNackDoesNotClobberNewerOffloadTask) {
 }
 
 // =============================================================================
-// Regression (fcczzz review, master_service.cpp:6226 window): a batch that
-// mixes an accepted task and a stale one must report per-task acceptance so
-// the worker can partial-rollback only the rejected key, leaving the
-// accepted sibling's local commit intact. Prior to the fix the RPC returned
-// tl::expected<void, ErrorCode> and per-task rejection was silently
-// swallowed, allowing an orphan LOCAL_DISK bucket entry to leak on-disk.
+// Regression: a mixed batch (accepted + stale) must return per-task
+// acceptance so the worker rolls back only the rejected key.
 // =============================================================================
 
 TEST_F(OffloadOnEvictTest,
@@ -844,9 +815,8 @@ TEST_F(OffloadOnEvictTest,
                              ReplicaType::MEMORY)
                     .has_value());
 
-    // Build a mixed batch. Storage payload is fabricated: fresh_task must
-    // still be admitted as a LOCAL_DISK replica so the assertion targets
-    // the per-task acceptance flag, not the underlying storage state.
+    // Mixed batch: fabricated storage payload; assertions target the
+    // per-task acceptance flag, not the underlying storage state.
     StorageObjectMetadata stale_sm{};
     stale_sm.data_size = 1024;
     stale_sm.transport_endpoint = "test_endpoint_stale";
@@ -889,12 +859,10 @@ TEST_F(OffloadOnEvictTest,
 }
 
 // =============================================================================
-// Regression: a MEMORY replica may span multiple LocalDisk segments, so a
-// single offloading_tasks[key] entry can correspond to multiple mirrors.
-// UpsertStart must clear every mirror atomically; a late completion from any
-// drained mirror must be rejected via the generation guard. The second
-// mirror is injected via the OffloadOnEvictTest friendship because forcing
-// allocator-driven cross-segment placement is not deterministic in unit tests.
+// Regression: a replica may span multiple LocalDisk segments. UpsertStart
+// must clear every mirror; late completions from any drained mirror must
+// be rejected. The second mirror is injected via friendship because
+// allocator-driven cross-segment placement is not deterministic.
 // =============================================================================
 
 TEST_F(OffloadOnEvictTest, UpsertPreemptsOffloadAcrossMultipleSegments) {
@@ -903,9 +871,8 @@ TEST_F(OffloadOnEvictTest, UpsertPreemptsOffloadAcrossMultipleSegments) {
     config.default_kv_lease_ttl = 2000;
     auto service = std::make_unique<MasterService>(config);
 
-    // Use a base far away from kDefaultSegmentBase to avoid clashing with the
-    // address space of any segment mounted by a prior test in the same
-    // binary invocation.
+    // Base far from kDefaultSegmentBase to avoid clashing with any prior
+    // test's segment address space in the same binary.
     constexpr size_t seg_size = 1024 * 1024 * 16;
     constexpr size_t kMultiSegBase = kDefaultSegmentBase + 1024ULL * seg_size;
     auto ctx_a =
@@ -920,10 +887,8 @@ TEST_F(OffloadOnEvictTest, UpsertPreemptsOffloadAcrossMultipleSegments) {
     const std::string key = "upsert_multi_segment";
     PutObject(*service, ctx_a.client_id, key);
 
-    // Snapshot the natural mirror + its generation via the friend-owned
-    // helper. The replica lands on whichever memory segment the allocator
-    // chose; mirror the wire generation from whichever LocalDisk segment
-    // received the push.
+    // Snapshot the mirror + its generation. The replica lands on whichever
+    // segment the allocator chose; mirror from that segment.
     auto seg_a_task_opt = ReadMirror(*service, ctx_a.client_id, key);
     UUID primary_disk = ctx_a.client_id;
     UUID secondary_disk = ctx_b.client_id;
@@ -941,9 +906,8 @@ TEST_F(OffloadOnEvictTest, UpsertPreemptsOffloadAcrossMultipleSegments) {
     // replica that spans both LocalDisk segments.
     InjectMirror(*service, secondary_disk, key, seg_a_task);
 
-    // Drain the primary segment's heartbeat only: it is now IN-FLIGHT while
-    // the secondary is still QUEUED. UpsertStart must handle this mixed
-    // state by clearing every mirror and bumping the generation.
+    // Drain the primary heartbeat only: primary is IN-FLIGHT, secondary
+    // still QUEUED. UpsertStart must clear both and bump the generation.
     auto hb_primary = service->OffloadObjectHeartbeat(primary_disk, true);
     ASSERT_TRUE(hb_primary.has_value());
     ASSERT_EQ(hb_primary->size(), 1u);
@@ -955,10 +919,8 @@ TEST_F(OffloadOnEvictTest, UpsertPreemptsOffloadAcrossMultipleSegments) {
                                        TenantId::Default(), 1024, cfg);
     ASSERT_TRUE(upsert.has_value());
 
-    // Preempt clears every LocalDisk mirror synchronously inside
-    // UpsertStart. Assert this *before* PutEnd completes the new replica,
-    // since PutEnd's own offload push may legitimately re-populate either
-    // segment (allocator choice), which is orthogonal to preempt cleanup.
+    // Preempt clears every mirror synchronously in UpsertStart. Check
+    // this before PutEnd, whose own push may re-populate either segment.
     auto hb_secondary = service->OffloadObjectHeartbeat(secondary_disk, true);
     ASSERT_TRUE(hb_secondary.has_value());
     EXPECT_TRUE(hb_secondary->empty())
@@ -969,7 +931,7 @@ TEST_F(OffloadOnEvictTest, UpsertPreemptsOffloadAcrossMultipleSegments) {
                              ReplicaType::MEMORY)
                     .has_value());
 
-    // The primary's late completion carries the pre-preempt generation and
+    // Primary's late completion carries the pre-preempt generation and
     // must be dropped by ValidateOffloadGenerations.
     auto validate = service->ValidateOffloadGenerations({seg_a_task});
     ASSERT_TRUE(validate.has_value());
@@ -978,7 +940,7 @@ TEST_F(OffloadOnEvictTest, UpsertPreemptsOffloadAcrossMultipleSegments) {
 
 // =============================================================================
 // HA compatibility: NotifyOffloadSuccess payloads that predate the generation
-// field (wire generation == 0) must keep the historical orphan-fallback path.
+// field (wire generation == 0) must take the orphan-fallback path.
 // =============================================================================
 
 TEST_F(OffloadOnEvictTest, HANotifyWithGenerationZeroStillAdmitted) {
@@ -1000,10 +962,8 @@ TEST_F(OffloadOnEvictTest, HANotifyWithGenerationZeroStillAdmitted) {
     ASSERT_TRUE(hb.has_value());
     ASSERT_EQ(hb->size(), 1u);
 
-    // Simulate a master restart followed by a pre-generation completion:
-    // wire generation is 0 and the master's own marker is stale. The
-    // orphan-fallback path in NotifyOffloadSuccess must still admit the
-    // LOCAL_DISK replica.
+    // Simulate master-restart + pre-generation completion (wire gen == 0,
+    // master marker stale). The orphan-fallback path must still admit it.
     OffloadTaskItem ha_task{
         .tenant_id = TenantId::Default().value(),
         .key = key,
@@ -1039,7 +999,7 @@ TEST_F(OffloadOnEvictTest, UpsertPreemptsOffloadWithOffloadOnEvict) {
     PutObject(*service, ctx.client_id, key);
 
     // offload_on_evict mode: PutEnd does not push. Simulate the eviction
-    // path directly so the test does not depend on filling the segment.
+    // path directly instead of filling the segment.
     auto queued_before = DrainOffloadQueue(*service, ctx.client_id);
     ASSERT_TRUE(queued_before.empty())
         << "offload_on_evict must not push at PutEnd";

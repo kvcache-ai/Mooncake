@@ -86,9 +86,7 @@ class MasterServiceHATest;
 // invalidate a segment allocator via PrepareUnmountSegment WITHOUT the
 // ClearInvalidHandles sweep that MasterService::UnmountSegment performs.
 class MasterServiceProcessingKeyDoubleEraseTest;
-// Friended so multi-segment tests inject a second mirror into
-// LocalDiskSegment::offloading_objects without relying on allocator-
-// driven cross-segment placement.
+// Friend for tests that inject cross-segment mirrors directly.
 class OffloadOnEvictTest;
 }  // namespace test
 namespace benchmarks {
@@ -721,28 +719,19 @@ class MasterService {
      * @param metadatas    The corresponding metadata for each offloaded object,
      * including size, storage location, etc.
      *
-     * Returns a vector aligned with @p tasks; result[i] is 1 iff master
-     * accepted the completion for task i, 0 iff master dropped it as stale
-     * (post-SSD-IO generation mismatch on the NACK path, the success path,
-     * or the orphan-fallback path). The worker must locally roll back any
-     * on-disk state committed for rejected tasks, without disturbing the
-     * accepted siblings in the same batch. uint8_t is used instead of bool
-     * for struct-pack compatibility with ValidateOffloadGenerations.
+     * Returns a per-task acceptance vector (1 = accepted, 0 = rejected as
+     * stale via generation mismatch). Callers roll back rejected keys only,
+     * without disturbing accepted siblings. uint8_t for struct-pack parity
+     * with ValidateOffloadGenerations.
      */
     auto NotifyOffloadSuccess(
         const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas)
         -> tl::expected<std::vector<uint8_t>, ErrorCode>;
 
-    /**
-     * @brief Check that each pending offload task is still current. Called
-     * by the worker right before writing a bucket to SSD; stale entries
-     * (result[i] == 0) must be dropped.
-     *
-     * Sentinel: task.generation == 0 always reports valid so pre-generation
-     * wire payloads (HA restore / older workers) keep the orphan-fallback
-     * path. uint8_t is used instead of bool for struct-pack compatibility.
-     */
+    // Pre-SSD-IO check; stale entries (result[i] == 0) must be dropped by
+    // the worker. task.generation == 0 is a wire sentinel for pre-generation
+    // payloads (HA restore / older workers) and always reports valid.
     auto ValidateOffloadGenerations(const std::vector<OffloadTaskItem>& tasks)
         -> tl::expected<std::vector<uint8_t>, ErrorCode>;
 
@@ -1278,9 +1267,8 @@ class MasterService {
     struct OffloadingTask {
         ReplicaID source_id;
         std::chrono::system_clock::time_point start_time;
-        // Monotonic id stamped at task creation. UpsertStart preemption
-        // erases this entry; late completions carrying an older value are
-        // rejected by ValidateOffloadGenerations / NotifyOffloadSuccess.
+        // Bumped by UpsertStart preemption; late completions with a stale
+        // value are rejected on both the validate and notify paths.
         uint64_t generation{0};
     };
 
@@ -2086,10 +2074,8 @@ class MasterService {
     // promotion task reaper after the task entry is erased. Relaxed memory
     // order is safe — the value is an advisory soft cap, not a barrier.
     std::atomic<uint64_t> promotion_in_flight_{0};
-    // Generation stamped on every offload task. UpsertStart bumps the value
-    // for a key by cancelling the current marker; late completions with the
-    // old generation are dropped. Starts at 1 so 0 stays reserved as the
-    // wire sentinel for pre-generation payloads.
+    // Monotonic id source for OffloadingTask::generation. Starts at 1 so 0
+    // stays reserved as the wire sentinel for pre-generation payloads.
     std::atomic<uint64_t> next_offload_generation_{1};
     // Promotion retry candidate state.
     std::atomic<uint64_t> promotion_candidate_count_{0};

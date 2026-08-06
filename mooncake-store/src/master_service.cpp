@@ -4266,18 +4266,11 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                         ErrorCode::OBJECT_HAS_REPLICATION_TASK);
                 }
 
-                // Preempt any in-progress offload for this key. QUEUED and
-                // IN-FLIGHT tasks are cancelled the same way: erase the task
-                // marker, drop the source refcnt, and clear every segment
-                // mirror. For IN-FLIGHT tasks the worker keeps reading the
-                // old buffer, but its late completion carries the pre-
-                // preempt generation and is dropped by
-                // ValidateOffloadGenerations (pre-SSD-IO) and
-                // NotifyOffloadSuccess (defence in depth). To ensure the
-                // worker's in-flight read never races with the upsert's
-                // RDMA write, move the existing memory replicas into
-                // discarded_replicas_ and fall through to Case A so the
-                // upsert allocates fresh buffers.
+                // Preempt any in-progress offload: erase the marker, drop
+                // source refcnt, clear all segment mirrors, and fall through
+                // to Case A so the upsert allocates fresh buffers. Late
+                // completions with the pre-preempt generation are dropped by
+                // Validate / NotifyOffloadSuccess.
                 auto offload_it = tenant_state.offloading_tasks.find(key);
                 if (offload_it != tenant_state.offloading_tasks.end()) {
                     LOG(INFO)
@@ -6149,10 +6142,8 @@ auto MasterService::NotifyOffloadSuccess(
     if (tasks.size() != metadatas.size()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    // accepted[i] = 1 means master committed the completion for task i;
-    // 0 means master rejected it as stale (post-SSD-IO generation mismatch)
-    // and the caller must locally roll back any on-disk state written for
-    // task i without touching siblings in the same batch.
+    // accepted[i] = 1 = committed, 0 = rejected as stale (generation
+    // mismatch). Caller must roll back rejected keys only.
     std::vector<uint8_t> accepted(tasks.size(), 1);
     std::shared_ptr<LocalDiskSegment> local_disk_segment;
     {
@@ -6184,12 +6175,9 @@ auto MasterService::NotifyOffloadSuccess(
                 auto task_it = tenant_state.offloading_tasks.find(
                     request_object_id.user_key);
                 if (task_it != tenant_state.offloading_tasks.end()) {
-                    // Reject stale NACKs that arrive after UpsertStart has
-                    // reset the marker for a newer generation. Without this
-                    // guard, an old worker's NACK would decrement the newer
-                    // task's source refcount and erase its marker, leaking
-                    // the newer offload. Sentinel 0 keeps the pre-generation
-                    // NACK path for HA restore / older workers.
+                    // Reject stale NACK: UpsertStart already reset the
+                    // marker for a newer generation. Sentinel 0 preserves
+                    // the pre-generation NACK path (HA / older workers).
                     if (task.generation != 0 &&
                         task.generation != task_it->second.generation) {
                         LOG(INFO)
@@ -6234,7 +6222,7 @@ auto MasterService::NotifyOffloadSuccess(
                 // for a master-admitted offload completion. Without this task
                 // marker, fall through to the regular registration check.
                 if (task_it != tenant_state.offloading_tasks.end()) {
-                    // Defence in depth: reject late completions whose wire
+                    // Defence in depth: reject completions whose wire
                     // generation no longer matches. Sentinel 0 keeps the
                     // orphan-fallback path for pre-generation payloads.
                     if (task.generation != 0 &&
@@ -6292,10 +6280,10 @@ auto MasterService::NotifyOffloadSuccess(
         }
 
         if (!handled_existing_object) {
-            // Orphan-fallback: no task marker. A non-zero wire generation
-            // means UpsertStart cancelled the task after it was dispatched,
-            // so the completion is stale. Sentinel 0 keeps the historical
-            // AddReplica path for pre-generation payloads.
+            // Orphan fallback: no task marker. A non-zero wire generation
+            // means UpsertStart cancelled the task after dispatch, so drop
+            // the completion. Sentinel 0 takes the AddReplica path used by
+            // pre-generation payloads (HA restore, older workers).
             if (task.generation != 0) {
                 LOG(INFO) << "key=" << request_object_id.user_key
                           << ", action=drop_stale_offload_notify_orphan"
@@ -6344,7 +6332,7 @@ auto MasterService::ValidateOffloadGenerations(
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     for (const auto& task : tasks) {
         // Sentinel 0: pre-generation payload (HA restore, older workers).
-        // Report valid to preserve the historical orphan-fallback path.
+        // Report valid so the caller takes the orphan-fallback path.
         if (task.generation == 0) {
             results.push_back(1);
             continue;

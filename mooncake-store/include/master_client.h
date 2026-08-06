@@ -438,10 +438,8 @@ class MasterClient {
      * @param metadatas    The corresponding metadata for each offloaded object,
      * including size, storage location, etc.
      *
-     * Returns a per-task acceptance vector aligned with @p tasks: 1 = master
-     * accepted, 0 = master rejected as stale. Callers must locally roll back
-     * on-disk state for rejected tasks without touching accepted siblings.
-     * See MasterService::NotifyOffloadSuccess for details.
+     * Returns a per-task acceptance vector (1 = accepted, 0 = rejected as
+     * stale). See MasterService::NotifyOffloadSuccess for the contract.
      */
     [[nodiscard]] tl::expected<std::vector<uint8_t>, ErrorCode>
     NotifyOffloadSuccess(const UUID& client_id,
@@ -453,11 +451,8 @@ class MasterClient {
                          const std::vector<StorageObjectMetadata>& metadatas);
 
     /**
-     * @brief Pre-SSD-IO check that a batch of pending offload tasks is still
-     * current. Callers must drop stale entries (result[i] == false) from
-     * the batch before writing bucket data to SSD; otherwise a late
-     * completion can attach a stale LOCAL_DISK replica if UpsertStart
-     * cancelled the task after the mirror was drained.
+     * @brief Pre-SSD-IO check: drop tasks whose master-side generation no
+     * longer matches (UpsertStart preempted them after mirror drain).
      */
     [[nodiscard]] tl::expected<std::vector<uint8_t>, ErrorCode>
     ValidateOffloadGenerations(const std::vector<OffloadTaskItem>& tasks);

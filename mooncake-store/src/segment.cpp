@@ -761,10 +761,8 @@ SegmentSerializer::Serialize() {
         for (const auto& key : sorted_keys) {
             packer.pack(key);
             const auto& task = segment->offloading_objects.at(key);
-            // OffloadTaskItem grew a `generation` field for UpsertStart
-            // preemption. Persist it so snapshot round-trip is lossless;
-            // Deserialize accepts the legacy 3-field layout for backward
-            // compat with pre-#3006 snapshots.
+            // Pack generation as a 4th field; Deserialize still accepts
+            // the legacy 3-field layout for backward compat.
             packer.pack_array(4);
             packer.pack(task.tenant_id);
             packer.pack(task.key);
