@@ -3725,7 +3725,8 @@ auto MasterService::AllocateAndInsertMetadata(
     size_t allocated_nof_replicas = 0;
     if (config.replica_num > 0) {
         const bool use_local_first =
-            allocation_strategy_type_ == AllocationStrategyType::LOCAL_FIRST &&
+            (allocation_strategy_type_ == AllocationStrategyType::LOCAL_FIRST ||
+             config.prefer_alloc_in_same_node) &&
             config.replica_num == 1;
         std::string writer_host_id;
         if (use_local_first) {
