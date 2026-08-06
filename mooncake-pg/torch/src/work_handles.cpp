@@ -3,7 +3,11 @@
 #include <pg_utils.h>
 
 #include <ATen/cuda/CUDAContext.h>
+#ifdef MOONCAKE_EP_USE_MUSA
+#include <ATen/musa/MUSAGraphsUtils.muh>
+#else
 #include <ATen/cuda/CUDAGraphsUtils.cuh>
+#endif
 
 #include <algorithm>
 #include <chrono>
