@@ -2718,19 +2718,20 @@ void BucketStorageBackend::RollbackCommittedBucket(
         // Save a reference for inflight-read waiting
         bucket_meta = bucket_it->second;
 
-        // Remove all keys from object_bucket_map_
+        // Remove all keys from object_bucket_map_. total_size_ tracks the
+        // physical bucket files currently owned by buckets_, so subtract the
+        // whole bucket once below instead of summing only still-visible keys
+        // (partial rollback may already have trimmed bucket_meta->keys while
+        // the .bucket file still contains the rejected records).
         for (const auto& key : keys) {
             auto obj_it = object_bucket_map_.find(key);
             if (obj_it != object_bucket_map_.end() &&
                 obj_it->second.bucket_id == bucket_id) {
-                total_size_ -=
-                    obj_it->second.data_size + obj_it->second.key_size;
                 object_bucket_map_.erase(obj_it);
             }
         }
 
-        // Remove bucket metadata
-        total_size_ -= bucket_meta->meta_size;
+        total_size_ -= bucket_meta->data_size + bucket_meta->meta_size;
         lru_index_.erase({0LL, bucket_id});
         buckets_.erase(bucket_it);
     }
@@ -2841,7 +2842,10 @@ void BucketStorageBackend::PartialRollbackKeys(
                 // rather than fail: this path is best-effort cleanup.
                 continue;
             }
-            total_size_ -= obj_it->second.data_size + obj_it->second.key_size;
+            // Do not decrement total_size_ for this object's payload bytes:
+            // the .bucket file is unchanged and still occupies the same disk
+            // space until the whole bucket is deleted. Only the .meta delta is
+            // re-accounted after StoreBucketMetadata succeeds below.
             object_bucket_map_.erase(obj_it);
             evict_set.insert(key);
         }
@@ -3081,20 +3085,21 @@ BucketStorageBackend::PrepareEviction(
             std::move(evict_it->second);
         buckets_.erase(evict_it);
 
-        int64_t evicted_size = evict_meta->meta_size;
+        const int64_t evicted_size =
+            evict_meta->data_size + evict_meta->meta_size;
         // Remove all keys belonging to this bucket from the object map.
+        // total_size_ tracks the bucket files, not just visible keys, so
+        // subtract the whole .bucket + .meta once. This matters after partial
+        // rollback: bucket_meta->keys may contain only accepted siblings while
+        // bucket_meta->data_size still covers the unchanged .bucket file.
         for (const auto& key : evict_meta->keys) {
             auto obj_it = object_bucket_map_.find(key);
             if (obj_it != object_bucket_map_.end() &&
                 obj_it->second.bucket_id == evict_id) {
-                const int64_t object_size =
-                    obj_it->second.data_size + obj_it->second.key_size;
-                total_size_ -= object_size;
-                evicted_size += object_size;
                 object_bucket_map_.erase(obj_it);
             }
         }
-        total_size_ -= evict_meta->meta_size;
+        total_size_ -= evicted_size;
         result.evicted_size += evicted_size;
 
         // Collect for notification and file deletion.
@@ -3153,9 +3158,8 @@ void BucketStorageBackend::RestorePreparedEvictionLocked(
             object_bucket_map_[key] = StorageObjectMetadata{
                 bucket_id, object_meta.offset, object_meta.key_size,
                 object_meta.data_size, ""};
-            total_size_ += object_meta.data_size + object_meta.key_size;
         }
-        total_size_ += bucket_meta->meta_size;
+        total_size_ += bucket_meta->data_size + bucket_meta->meta_size;
         if (bucket_backend_config_.eviction_policy ==
             BucketEvictionPolicy::LRU) {
             lru_index_.emplace(
@@ -3367,20 +3371,20 @@ tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
              bucket_id});
         buckets_.erase(bucket_it);
 
-        // Collect keys to remove (they reference this bucket)
+        // Collect keys to remove (they reference this bucket). total_size_
+        // tracks the physical bucket files, so subtract the full bucket once
+        // rather than summing visible keys. After PartialRollbackKeys, visible
+        // keys can be a strict subset of the unchanged .bucket file.
         keys_to_remove = bucket_metadata->keys;
         for (const auto& key : keys_to_remove) {
             auto obj_it = object_bucket_map_.find(key);
             if (obj_it != object_bucket_map_.end() &&
                 obj_it->second.bucket_id == bucket_id) {
-                total_size_ -=
-                    obj_it->second.data_size + obj_it->second.key_size;
                 object_bucket_map_.erase(obj_it);
             }
         }
 
-        // Subtract metadata size
-        total_size_ -= bucket_metadata->meta_size;
+        total_size_ -= bucket_metadata->data_size + bucket_metadata->meta_size;
     }
     // Lock released - new readers can't find this bucket anymore
 

@@ -737,6 +737,7 @@ TEST_F(StorageBackendTest, PartialRollbackKeysPersistsAcrossInit) {
     const std::string kKeptValue = "value_of_kept_key";
 
     int64_t bucket_id = -1;
+    int64_t total_size_after_partial_rollback = 0;
     {
         BucketStorageBackend storage_backend(config, bucket_config);
         ASSERT_TRUE(storage_backend.Init());
@@ -782,6 +783,10 @@ TEST_F(StorageBackendTest, PartialRollbackKeysPersistsAcrossInit) {
         ASSERT_TRUE(kept_exists_after.has_value());
         EXPECT_TRUE(kept_exists_after.value())
             << "Accepted sibling must survive partial rollback";
+
+        auto partial_meta = storage_backend.GetStoreMetadata();
+        ASSERT_TRUE(partial_meta.has_value());
+        total_size_after_partial_rollback = partial_meta->total_size;
     }
 
     // The bucket .meta / .bucket files must still exist (partial rollback
@@ -809,6 +814,12 @@ TEST_F(StorageBackendTest, PartialRollbackKeysPersistsAcrossInit) {
     ASSERT_TRUE(kept_after_restart.has_value());
     EXPECT_TRUE(kept_after_restart.value())
         << "Accepted sibling must survive Init() re-scan";
+
+    auto restarted_meta = restarted_backend.GetStoreMetadata();
+    ASSERT_TRUE(restarted_meta.has_value());
+    EXPECT_EQ(restarted_meta->total_size, total_size_after_partial_rollback)
+        << "Partial rollback must not discount payload bytes that still occupy "
+           "the unchanged .bucket file";
 
     // ScanMeta enumerates the persisted keys that ReRegisterOffloadedObjects
     // would replay to master. Only the accepted sibling should appear.
