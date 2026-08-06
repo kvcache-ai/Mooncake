@@ -2795,6 +2795,14 @@ void BucketStorageBackend::PartialRollbackKeys(
     }
     int64_t bucket_id = -1;
     bool bucket_now_empty = false;
+    // Snapshot of the in-memory bucket_meta after in-memory eviction, taken
+    // under the write lock. Used outside the lock to rewrite the on-disk
+    // .meta so a subsequent Init()/ScanMeta() cannot resurrect the evicted
+    // keys via ReRegisterOffloadedObjects.
+    std::shared_ptr<BucketMetadata> meta_to_persist;
+    // Pre-rewrite meta_size so total_size_ can be re-accounted after the
+    // on-disk .meta is rewritten to a (typically smaller) size.
+    int64_t old_meta_size = 0;
     {
         SharedMutexLocker lock(&mutex_);
 
@@ -2818,8 +2826,13 @@ void BucketStorageBackend::PartialRollbackKeys(
                          << " not found — already rolled back or evicted";
             return;
         }
-        const auto& bucket_meta = bucket_it->second;
+        auto& bucket_meta = bucket_it->second;
 
+        // Set of storage keys to strip from the in-memory index and from
+        // the persisted bucket metadata. A key stays in the set only if it
+        // is currently mapped to this bucket in object_bucket_map_.
+        std::unordered_set<std::string> evict_set;
+        evict_set.reserve(keys_to_evict.size());
         for (const auto& key : keys_to_evict) {
             auto obj_it = object_bucket_map_.find(key);
             if (obj_it == object_bucket_map_.end() ||
@@ -2830,19 +2843,41 @@ void BucketStorageBackend::PartialRollbackKeys(
             }
             total_size_ -= obj_it->second.data_size + obj_it->second.key_size;
             object_bucket_map_.erase(obj_it);
+            evict_set.insert(key);
         }
 
-        // Recompute residency by scanning the bucket's key list against the
-        // (post-erase) object_bucket_map_. Cheap because a bucket has at
-        // most a handful of keys.
-        bucket_now_empty = true;
-        for (const auto& key : bucket_meta->keys) {
-            auto obj_it = object_bucket_map_.find(key);
-            if (obj_it != object_bucket_map_.end() &&
-                obj_it->second.bucket_id == bucket_id) {
-                bucket_now_empty = false;
-                break;
+        // Filter bucket_meta->keys / metadatas in place so they match the
+        // post-eviction view. keys[] and metadatas[] are parallel arrays;
+        // preserve the pairing during compaction. data_size is intentionally
+        // NOT decremented: the record bytes remain on disk (the .bucket file
+        // is unchanged) — only the .meta index that names them is being
+        // rewritten. Those bytes are reclaimed together with the bucket the
+        // next time it is fully evicted or rolled back.
+        std::vector<std::string> kept_keys;
+        std::vector<BucketObjectMetadata> kept_metadatas;
+        kept_keys.reserve(bucket_meta->keys.size());
+        kept_metadatas.reserve(bucket_meta->metadatas.size());
+        for (size_t i = 0; i < bucket_meta->keys.size(); ++i) {
+            const auto& k = bucket_meta->keys[i];
+            if (evict_set.find(k) != evict_set.end()) {
+                continue;
             }
+            kept_keys.push_back(k);
+            if (i < bucket_meta->metadatas.size()) {
+                kept_metadatas.push_back(bucket_meta->metadatas[i]);
+            }
+        }
+        bucket_meta->keys = std::move(kept_keys);
+        bucket_meta->metadatas = std::move(kept_metadatas);
+        old_meta_size = bucket_meta->meta_size;
+
+        bucket_now_empty = bucket_meta->keys.empty();
+        if (!bucket_now_empty) {
+            // Copy under the lock; publish rewrite outside the lock so we
+            // do not hold the metadata mutex across a synchronous disk
+            // write. Runtime atomics (inflight_reads_, last_access_ns_) are
+            // reset in the copy ctor and do not affect the on-disk layout.
+            meta_to_persist = std::make_shared<BucketMetadata>(*bucket_meta);
         }
     }
 
@@ -2854,9 +2889,54 @@ void BucketStorageBackend::PartialRollbackKeys(
         RollbackCommittedBucket(bucket_id, /*keys=*/{});
         return;
     }
+
+    // Persist the trimmed key list to .meta. Without this, Init() reloads
+    // the pre-rollback keys from disk and ReRegisterOffloadedObjects will
+    // resurrect them at master, defeating the generation guard. Rewrite is
+    // O_TRUNC-based (see StoreBucketMetadata → OpenFile FileMode::Write),
+    // so it atomically replaces the file with the accepted-only view.
+    auto persist_result = StoreBucketMetadata(bucket_id, meta_to_persist);
+    if (!persist_result) {
+        // Rewrite failed after the in-memory view was already trimmed. The
+        // safest recovery is to escalate to a full bucket rollback: drop
+        // every remaining committed key here and delete both on-disk files.
+        // Leaving the .meta with a superset of live keys would let a
+        // future Init() resurrect the evicted keys.
+        LOG(ERROR) << "PartialRollbackKeys: failed to persist trimmed .meta "
+                   << "for bucket " << bucket_id
+                   << ", error=" << persist_result.error()
+                   << ". Escalating to full RollbackCommittedBucket to avoid "
+                   << "leaving stale keys recoverable on disk.";
+        std::vector<std::string> remaining_keys;
+        {
+            SharedMutexLocker lock(&mutex_);
+            auto bucket_it = buckets_.find(bucket_id);
+            if (bucket_it != buckets_.end()) {
+                remaining_keys = bucket_it->second->keys;
+            }
+        }
+        RollbackCommittedBucket(bucket_id, remaining_keys);
+        return;
+    }
+
+    // Re-account total_size_ for the meta size change. StoreBucketMetadata
+    // updates meta_to_persist->meta_size in place with the on-disk byte
+    // count; publish it back to the tracked bucket and adjust the global
+    // tally by the delta.
+    const int64_t new_meta_size = meta_to_persist->meta_size;
+    {
+        SharedMutexLocker lock(&mutex_);
+        auto bucket_it = buckets_.find(bucket_id);
+        if (bucket_it != buckets_.end()) {
+            bucket_it->second->meta_size = new_meta_size;
+        }
+        total_size_ += new_meta_size - old_meta_size;
+    }
+
     LOG(INFO) << "PartialRollbackKeys: evicted " << keys_to_evict.size()
               << " keys from bucket " << bucket_id
-              << " (accepted siblings retained)";
+              << " (accepted siblings retained, .meta rewritten "
+              << old_meta_size << " → " << new_meta_size << " bytes)";
 }
 
 std::map<int64_t, std::shared_ptr<BucketMetadata>>::iterator
