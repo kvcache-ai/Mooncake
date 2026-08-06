@@ -652,7 +652,7 @@ config.preferred_segment = self.get_hostname()
 #### prefer_alloc_in_same_node
 **Type:** `bool`
 **Default:** `False`
-**Description:** Enables the preference for allocating data on the same node. This can be used with direct multi-buffer writes and tensor write APIs to avoid staging when the selected segment is local and local memcpy is enabled. It does not support disk segments, and the `replica_num` can only be set to 1. Tensor APIs keep their default staging behavior unless this flag is explicitly enabled.
+**Description:** Enables host-aware local-first allocation for this request, using the writer host identity and the normal ordered remote fallback. This can be used with direct multi-buffer writes and tensor write APIs to avoid staging when the selected segment is local and local memcpy is enabled. It does not support disk segments, and the `replica_num` can only be set to 1. Tensor APIs keep their default staging behavior unless this flag is explicitly enabled.
 
 ```python
 config = ReplicateConfig()

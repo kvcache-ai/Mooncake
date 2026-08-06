@@ -144,16 +144,6 @@ using BatchWriteMethod = std::vector<tl::expected<void, ErrorCode>> (Client::*)(
     const std::vector<ObjectKey> &, std::vector<std::vector<Slice>> &,
     const ReplicateConfig &);
 
-ReplicateConfig PreferLocalWriteSegment(const std::shared_ptr<Client> &client,
-                                        const ReplicateConfig &config) {
-    ReplicateConfig write_config = config;
-    if (client && write_config.preferred_segment.empty() &&
-        write_config.preferred_segments.empty()) {
-        write_config.preferred_segment = client->GetSegmentEndpoint();
-    }
-    return write_config;
-}
-
 std::vector<tl::expected<void, ErrorCode>> BatchWriteFromMultiBuffers(
     const std::shared_ptr<Client> &client, const std::vector<std::string> &keys,
     const std::vector<std::vector<void *>> &all_buffers,
@@ -170,8 +160,7 @@ std::vector<tl::expected<void, ErrorCode>> BatchWriteFromMultiBuffers(
         return std::vector<tl::expected<void, ErrorCode>>(
             keys.size(), tl::unexpected(batched_slices.error()));
     }
-    auto write_config = PreferLocalWriteSegment(client, config);
-    return ((*client).*write)(keys, batched_slices.value(), write_config);
+    return ((*client).*write)(keys, batched_slices.value(), config);
 }
 
 #ifdef USE_ASCEND_DIRECT
@@ -3981,8 +3970,7 @@ std::vector<tl::expected<void, ErrorCode>> RealClient::batch_put_from_internal(
     }
 
     // Call client BatchPut and return the vector<expected> directly
-    auto write_config = PreferLocalWriteSegment(client_, config);
-    return client_->BatchPut(keys, ordered_batched_slices, write_config);
+    return client_->BatchPut(keys, ordered_batched_slices, config);
 }
 
 tl::expected<void, ErrorCode> RealClient::put_from_internal(
@@ -4007,8 +3995,7 @@ tl::expected<void, ErrorCode> RealClient::put_from_internal(
     // Create slices directly from the user buffer
     std::vector<mooncake::Slice> slices = split_into_slices(buffer, size);
 
-    auto write_config = PreferLocalWriteSegment(client_, config);
-    auto put_result = client_->Put(key, slices, write_config);
+    auto put_result = client_->Put(key, slices, config);
     if (!put_result) {
         return tl::unexpected(put_result.error());
     }
@@ -4115,8 +4102,7 @@ tl::expected<void, ErrorCode> RealClient::upsert_from_internal(
 
     std::vector<mooncake::Slice> slices = split_into_slices(buffer, size);
 
-    auto write_config = PreferLocalWriteSegment(client_, config);
-    auto result = client_->Upsert(key, slices, write_config);
+    auto result = client_->Upsert(key, slices, config);
     if (!result) {
         return tl::unexpected(result.error());
     }
@@ -4164,8 +4150,7 @@ RealClient::batch_upsert_from_internal(const std::vector<std::string> &keys,
             split_into_slices(buffers[i], sizes[i]));
     }
 
-    auto write_config = PreferLocalWriteSegment(client_, config);
-    return client_->BatchUpsert(keys, ordered_batched_slices, write_config);
+    return client_->BatchUpsert(keys, ordered_batched_slices, config);
 }
 
 std::vector<int> RealClient::batch_upsert_from(
@@ -5242,8 +5227,7 @@ int RealClient::put_from_with_metadata(const std::string &key, void *buffer,
         split_into_slices(metadata_buffer, metadata_size);
     auto data_slices = split_into_slices(buffer, size);
     slices.insert(slices.end(), data_slices.begin(), data_slices.end());
-    auto write_config = PreferLocalWriteSegment(client_, config);
-    auto put_result = client_->Put(key, slices, write_config);
+    auto put_result = client_->Put(key, slices, config);
     if (!put_result) {
         LOG(ERROR) << "Put operation failed with error: "
                    << toString(put_result.error());
