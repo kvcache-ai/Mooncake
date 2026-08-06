@@ -32,16 +32,35 @@ from importlib.machinery import ModuleSpec, PathFinder
 BACKEND_ENV = "MOONCAKE_STORE_BACKEND"
 _ENABLED_VALUES = frozenset({"rs", "rust", "store-rs", "store_rs", "masterless"})
 
-# Upstream ships its own implementation of each of these names, and this
-# backend carries a divergent version of every one of them (notably
-# ``structured_object_store``, which is a reduced variant rather than a
-# superset).  They are redirected as a set because mixing halves does not work.
+# Names this package implements or vendors, mapped onto their location here.
+#
+# The first group is where the two implementations genuinely diverge -- notably
+# ``structured_object_store``, which is a reduced variant rather than a superset
+# -- so they are redirected as a set: serving one half from upstream and the
+# other from here does not work.
+#
+# The second group is upstream code that the wheel vendors verbatim (built from
+# the same commit). Redirecting it is what lets this wheel stand alone: without
+# it, ``from mooncake.engine import TransferEngine`` -- which SGLang does --
+# would require the upstream wheel to be installed as well.
 _REDIRECTS = {
     "mooncake.store": "mooncake_store_rs.store",
     "mooncake.buffer_pool": "mooncake_store_rs.buffer_pool",
     "mooncake.cli": "mooncake_store_rs.cli",
     "mooncake.cli_client": "mooncake_store_rs.cli_client",
     "mooncake.structured_object_store": "mooncake_store_rs.structured_object_store",
+    "mooncake.engine": "mooncake_store_rs.engine",
+    "mooncake.ep": "mooncake_store_rs.ep",
+    "mooncake.pg": "mooncake_store_rs.pg",
+    "mooncake.mooncake_config": "mooncake_store_rs.mooncake_config",
+    "mooncake.mooncake_connector_v1": "mooncake_store_rs.mooncake_connector_v1",
+    "mooncake.mooncake_ep_buffer": "mooncake_store_rs.mooncake_ep_buffer",
+    "mooncake.mooncake_store_service": "mooncake_store_rs.mooncake_store_service",
+    "mooncake.http_metadata_server": "mooncake_store_rs.http_metadata_server",
+    "mooncake.transfer_engine_topology_dump": (
+        "mooncake_store_rs.transfer_engine_topology_dump"
+    ),
+    "mooncake.vllm_v1_proxy_server": "mooncake_store_rs.vllm_v1_proxy_server",
 }
 
 

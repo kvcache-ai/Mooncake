@@ -371,7 +371,7 @@ with tempfile.TemporaryDirectory(prefix="mooncake-wheel-libpython-") as temp_dir
     with zipfile.ZipFile(wheel_path) as source_wheel:
         source_wheel.extractall(root)
 
-    package_root = root / "mooncake"
+    package_root = root / "mooncake_store_rs"
     libpython_candidates = sorted(package_root.glob("libpython*.so*"))
     if not libpython_candidates:
         raise FileNotFoundError("runtime wheel does not contain libpython*.so")
@@ -551,7 +551,8 @@ _PY_POST_START=$(_timer_start)
   "${REPO_ROOT}/target/release/mooncake_store_bench" \
   "${BUILD_GIT_BRANCH}" \
   "${BUILD_GIT_COMMIT}" \
-  "${BUILD_TIME}"
+  "${BUILD_TIME}" \
+  "${UPSTREAM_DIR}"
 import base64
 import csv
 import hashlib
@@ -576,7 +577,10 @@ store_bench_path = pathlib.Path(sys.argv[7])
 build_git_branch = sys.argv[8]
 build_git_commit = sys.argv[9]
 build_time = sys.argv[10]
-upstream_py_dir = repo_root / "third_party" / "Mooncake" / "mooncake-wheel" / "mooncake"
+# Passed in rather than derived: upstream is a submodule in a standalone
+# checkout but the enclosing repository inside the Mooncake monorepo.
+upstream_dir = pathlib.Path(sys.argv[11])
+upstream_py_dir = upstream_dir / "mooncake-wheel" / "mooncake"
 rl_py_dir = repo_root / "python" / "mooncake_rl"
 transport_shim_out_dirs = sorted(transport_build_dir.glob("mooncake-transport-sys-*/out"))
 
@@ -668,7 +672,7 @@ with tempfile.TemporaryDirectory(prefix="mooncake-wheel-") as temp_dir:
     with zipfile.ZipFile(wheel_path) as source_wheel:
         source_wheel.extractall(root)
 
-    package_root = root / "mooncake"
+    package_root = root / "mooncake_store_rs"
     package_root.mkdir(parents=True, exist_ok=True)
 
     for name, source in binary_assets.items():
@@ -686,6 +690,15 @@ with tempfile.TemporaryDirectory(prefix="mooncake-wheel-") as temp_dir:
 
     for name in python_assets:
         shutil.copy2(upstream_py_dir / name, package_root / name)
+
+    # Belongs at the site-packages root, not inside the package: that is what
+    # makes the import redirect active before any user code runs. maturin does
+    # not package non-package files from python-source, so it is staged here.
+    # RECORD is rewritten below, so the new entry is picked up automatically.
+    shutil.copy2(
+        repo_root / "python" / "mooncake_store_rs.pth",
+        root / "mooncake_store_rs.pth",
+    )
 
     rl_package_root = root / "mooncake_rl"
     if rl_package_root.exists():
