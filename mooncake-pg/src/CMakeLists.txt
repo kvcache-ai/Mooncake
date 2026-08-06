@@ -91,9 +91,11 @@ target_include_directories(
           ${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/include)
 
 if(USE_CUDA)
+  # The standalone device worker only needs CUDA C++17. Host-side PG remains
+  # C++20 and must not leak its headers into the device translation unit.
   set_target_properties(
     mooncake_pg_device
-    PROPERTIES CUDA_STANDARD 20
+    PROPERTIES CUDA_STANDARD 17
                CUDA_STANDARD_REQUIRED ON
                CUDA_EXTENSIONS OFF
                CUDA_RUNTIME_LIBRARY Shared)
