@@ -310,9 +310,9 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
             mlx5gda_qp_devctx devctx{
                 .qpn = qp->qpn,
                 .wqeid_mask = qp->num_wqebb - 1,
-                .wq = reinterpret_cast<mlx5gda_wqebb*>(qp->wq),
+                .wq = reinterpret_cast<mlx5gda_wqebb*>(qp->dev_wq),
                 .cq = reinterpret_cast<mlx5_cqe64*>(qp->send_cq->dev_cq_buf),
-                .dbr = reinterpret_cast<mlx5gda_wq_dbr*>(qp->dbr),
+                .dbr = reinterpret_cast<mlx5gda_wq_dbr*>(qp->dev_dbr),
                 .bf = qp->bf_device_addr,
             };
             cudaMemcpy(

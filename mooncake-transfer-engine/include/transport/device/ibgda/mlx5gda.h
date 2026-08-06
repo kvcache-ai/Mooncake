@@ -102,6 +102,8 @@ struct mlx5gda_qp {
     struct memheap *wq_heap;
     void *wq;
     void *dbr;
+    void *dev_wq;
+    void *dev_dbr;
     struct mlx5gda_control_region wq_region;
     struct mlx5gda_control_region dbr_region;
     struct mlx5gda_control_region_allocator region_allocator;

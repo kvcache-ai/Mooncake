@@ -516,6 +516,11 @@ struct mlx5gda_qp* mlx5gda_create_rc_qp(
     qp->wq_heap = ctrl->heap;
     qp->wq = static_cast<char*>(wq) + wq_offset;
     qp->dbr = static_cast<char*>(dbr) + dbr_offset;
+    qp->dev_wq =
+        split_regions ? qp->wq : static_cast<char*>(ctrl->dev_addr) + wq_offset;
+    qp->dev_dbr = split_regions
+                      ? qp->dbr
+                      : static_cast<char*>(ctrl->dev_addr) + dbr_offset;
     return qp;
 
 fail:
