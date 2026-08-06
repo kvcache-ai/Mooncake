@@ -21,11 +21,23 @@ elseif(USE_MUSA)
   if(NOT _ep_musa_compiler)
     message(FATAL_ERROR "USE_MUSA=ON requires the MUSA compiler (mcc)")
   endif()
+  set(_ep_musa_depfile_supported FALSE)
+  if(CMAKE_GENERATOR MATCHES "^Ninja" OR
+     (CMAKE_GENERATOR MATCHES "Makefiles" AND
+      CMAKE_VERSION VERSION_GREATER_EQUAL 3.20))
+    set(_ep_musa_depfile_supported TRUE)
+  endif()
 
   foreach(_ep_device_source IN LISTS MOONCAKE_EP_DEVICE_SOURCES)
     get_filename_component(_ep_device_name "${_ep_device_source}" NAME_WE)
     set(_ep_device_object
         "${CMAKE_CURRENT_BINARY_DIR}/${_ep_device_name}_musa.o")
+    set(_ep_device_depfile
+        "${CMAKE_CURRENT_BINARY_DIR}/${_ep_device_name}_musa.d")
+    set(_ep_musa_depfile_argument)
+    if(_ep_musa_depfile_supported)
+      set(_ep_musa_depfile_argument DEPFILE "${_ep_device_depfile}")
+    endif()
     add_custom_command(
       OUTPUT "${_ep_device_object}"
       COMMAND "${_ep_musa_compiler}"
@@ -35,12 +47,16 @@ elseif(USE_MUSA)
               -fPIC
               -DUSE_MUSA
               -DMOONCAKE_EP_USE_MUSA=1
+              -MMD
+              -MT "${_ep_device_object}"
+              -MF "${_ep_device_depfile}"
               --cuda-gpu-arch=mp_21
               --cuda-gpu-arch=mp_31
               "-I${CMAKE_CURRENT_SOURCE_DIR}/../include"
               "-I${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/include"
               -c "${_ep_device_source}" -o "${_ep_device_object}"
       DEPENDS "${_ep_device_source}"
+      ${_ep_musa_depfile_argument}
       COMMENT "Compiling Mooncake EP MUSA device source ${_ep_device_name}"
       VERBATIM)
     set_source_files_properties("${_ep_device_object}"

@@ -15,10 +15,7 @@ _USE_MACA = (
     _env_enabled("MOONCAKE_EP_USE_MACA")
     or bool(getattr(torch.version, "maca", None))
 )
-_USE_SPLIT_SEND_RECV = (
-    _env_enabled("MOONCAKE_EP_USE_MUSA")
-    or _USE_MACA
-)
+_USE_SPLIT_SEND_RECV = _USE_MACA
 
 
 def _native_current_stream_ptr() -> int:
@@ -395,10 +392,8 @@ class Buffer:
         elif _USE_MACA and use_fp8:
             raise NotImplementedError("FP8 dispatch is not supported on MACA")
 
-        # MUSA/MACA do not support cooperative grid sync, so the C++ runtime
-        # splits no-hook calls into SEND -> phase-ack -> RECV instead of using
-        # a single cooperative kernel.  async_finish still returns a stream
-        # event, but it is not the CUDA single-kernel cooperative path.
+        # MACA uses split SEND/RECV kernels with a host phase fence instead of
+        # the single-kernel cooperative path.
         if _USE_SPLIT_SEND_RECV and async_finish:
             import warnings
 
