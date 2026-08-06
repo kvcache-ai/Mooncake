@@ -427,7 +427,9 @@ detect_classic_te_lib() {
 
 require_reusable_native_artifacts() {
   require_file "${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/tent/src/libtent_shared.so"
-  require_file "${UPSTREAM_BUILD_DIR}/mooncake-asio/libasio.so"
+  # Upstream moved libasio.so from mooncake-asio/ to mooncake-common/; accept
+  # either so an older pinned upstream still validates.
+  require_glob "${UPSTREAM_BUILD_DIR}/mooncake-*/libasio.so"
   require_file "${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/example/transfer_engine_bench"
   require_glob "${UPSTREAM_BUILD_DIR}/mooncake-integration/engine*.so"
 
@@ -609,7 +611,12 @@ binary_assets = {
 
 library_assets = {
     "engine.so": sorted((upstream_build_dir / "mooncake-integration").glob("engine*.so")),
-    "libasio.so": [upstream_build_dir / "mooncake-asio" / "libasio.so"],
+    # mooncake-common/ is where upstream moved it; mooncake-asio/ is where an
+    # older pinned upstream still puts it. first_existing picks whichever.
+    "libasio.so": [
+        upstream_build_dir / "mooncake-common" / "libasio.so",
+        upstream_build_dir / "mooncake-asio" / "libasio.so",
+    ],
     "libtransfer_engine.so": [
         upstream_build_dir / "mooncake-transfer-engine" / "src" / "libtransfer_engine.so",
     ],

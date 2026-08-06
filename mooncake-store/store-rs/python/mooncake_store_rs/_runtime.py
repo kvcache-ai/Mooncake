@@ -36,6 +36,8 @@ _NATIVE_LIBRARY_ENV_VARS = {
 # and the artefact locations within each.
 _UPSTREAM_BUILD_DIRS = ("build", "build-rust", "build-wheel-compat")
 _UPSTREAM_LIB_SUBDIRS = (
+    # upstream relocated libasio.so from mooncake-asio/ to mooncake-common/
+    ("mooncake-common",),
     ("mooncake-asio",),
     ("mooncake-transfer-engine", "src"),
     ("mooncake-transfer-engine", "tent", "src"),
