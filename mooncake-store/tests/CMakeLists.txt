@@ -67,6 +67,10 @@ if(ENABLE_KV_EVENTS)
 endif()
 add_store_test(master_service_test master_service_test.cpp)
 add_store_test(batch_evict_test batch_evict_test.cpp)
+add_store_test(master_scenario_test master_scenario.cpp
+               master_scenario_test.cpp)
+add_store_test(master_service_scenario_test master_scenario.cpp
+               master_service_scenario_test.cpp)
 add_store_test(master_service_config_test master_service_config_test.cpp)
 add_store_test(master_service_processing_key_double_erase_test
                master_service_processing_key_double_erase_test.cpp)
