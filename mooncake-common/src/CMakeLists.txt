@@ -1,4 +1,5 @@
 find_package(yaml-cpp REQUIRED)
+find_path(ASIO_INCLUDE_DIR asio.hpp REQUIRED)
 
 set(MOONCAKE_COMMON_SOURCES crc_checksum.cpp default_config.cpp environ.cpp
                             rpc_client_io_context.cpp)
@@ -7,6 +8,7 @@ add_library(asio_shared SHARED asio_impl.cpp)
 
 target_compile_definitions(asio_shared PUBLIC ASIO_SEPARATE_COMPILATION
                                               ASIO_DYN_LINK)
+target_include_directories(asio_shared PUBLIC ${ASIO_INCLUDE_DIR})
 
 set_target_properties(
   asio_shared
@@ -17,6 +19,7 @@ set_target_properties(
              LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/mooncake-common")
 
 target_link_libraries(asio_shared PUBLIC pthread yalantinglibs::yalantinglibs)
+install(TARGETS asio_shared DESTINATION lib)
 
 # Static, PIC twin of asio_shared for consumers that absorb asio into their own
 # shared object instead of taking a DT_NEEDED on libasio.so (see
@@ -39,11 +42,10 @@ target_include_directories(
   PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
          $<INSTALL_INTERFACE:include>)
 
-target_link_libraries(mooncake_common PUBLIC asio_shared yaml-cpp jsoncpp
-                                             yalantinglibs::yalantinglibs)
+target_link_libraries(
+  mooncake_common PUBLIC asio_shared yaml-cpp JsonCpp::JsonCpp
+                         yalantinglibs::yalantinglibs)
 
 if(BUILD_SHARED_LIBS)
   install(TARGETS mooncake_common DESTINATION lib)
 endif()
-
-install(TARGETS asio_shared DESTINATION lib)

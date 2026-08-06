@@ -15,7 +15,6 @@
 #ifndef CXI_CONTEXT_H
 #define CXI_CONTEXT_H
 
-#include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <rdma/fabric.h>
 #include <rdma/fi_domain.h>
