@@ -404,14 +404,17 @@ MooncakeElasticBuffer::MooncakeElasticBuffer(
                 "of the initial backend");
         }
         const bool local_topology_supported =
-            topology_.num_rdma_ranks == 1 ? (lsa.size == 2 || lsa.size == 8)
-                                          : (topology_.num_rdma_ranks == 2 &&
-                                             (lsa.size == 4 || lsa.size == 8));
+            topology_.num_rdma_ranks == 1
+                ? (lsa.size == 2 || lsa.size == 8)
+                : ((topology_.num_rdma_ranks == 2 &&
+                    (lsa.size == 4 || lsa.size == 8)) ||
+                   (topology_.num_rdma_ranks == 4 && lsa.size == 4));
         if (!nccl_state_->transport->allRanksSucceeded(
                 local_topology_supported)) {
             throw std::runtime_error(
                 "NCCL ElasticBuffer currently supports one LSA team of 2 or 8 "
-                "GPUs, or exactly two LSA teams of 4 or 8 GPUs");
+                "GPUs, two LSA teams of 4 or 8 GPUs, or four LSA teams of 4 "
+                "GPUs");
         }
         if (allow_hybrid_mode && topology_.num_rdma_ranks > 1) {
             topology_.num_scaleout_ranks = topology_.num_rdma_ranks;

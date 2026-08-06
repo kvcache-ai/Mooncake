@@ -633,7 +633,8 @@ void launch_mooncake_elastic_dispatch_backend(
 
 #define TRY_HYBRID_DISPATCH_SHAPE(H, E, K, M, S)                               \
         TRY_HYBRID_DISPATCH(H, E, K, M, S, 2, 4);                              \
-        TRY_HYBRID_DISPATCH(H, E, K, M, S, 2, 8)
+        TRY_HYBRID_DISPATCH(H, E, K, M, S, 2, 8);                              \
+        TRY_HYBRID_DISPATCH(H, E, K, M, S, 4, 4)
 
         TRY_HYBRID_DISPATCH_SHAPE(4096, 256, 8, 128, 24);
 
@@ -834,7 +835,8 @@ void launch_mooncake_elastic_dispatch_copy_epilogue_backend(
 
 #define TRY_HYBRID_DISPATCH_EPILOGUE_SHAPE(H, E, K, M, S, CPS)                 \
         TRY_HYBRID_DISPATCH_EPILOGUE(H, E, K, M, S, 2, 4, CPS);                \
-        TRY_HYBRID_DISPATCH_EPILOGUE(H, E, K, M, S, 2, 8, CPS)
+        TRY_HYBRID_DISPATCH_EPILOGUE(H, E, K, M, S, 2, 8, CPS);                \
+        TRY_HYBRID_DISPATCH_EPILOGUE(H, E, K, M, S, 4, 4, CPS)
 
 #ifdef USE_NCCL_DEVICE
         TRY_HYBRID_DISPATCH_EPILOGUE_SHAPE(4096, 256, 8, 128, 24, 8);
@@ -993,7 +995,8 @@ void* launch_mooncake_elastic_combine_backend(
 
 #define TRY_HYBRID_COMBINE_SHAPE(H, E, K, M, S)                                \
         TRY_HYBRID_COMBINE(H, E, K, M, S, 2, 4);                               \
-        TRY_HYBRID_COMBINE(H, E, K, M, S, 2, 8)
+        TRY_HYBRID_COMBINE(H, E, K, M, S, 2, 8);                               \
+        TRY_HYBRID_COMBINE(H, E, K, M, S, 4, 4)
 
         TRY_HYBRID_COMBINE_SHAPE(4096, 256, 8, 128, 24);
 
@@ -1117,7 +1120,8 @@ void launch_mooncake_elastic_combine_reduce_epilogue_backend(
 
 #define TRY_HYBRID_COMBINE_EPILOGUE_SHAPE(H, E, K, M, S)                       \
     TRY_COMBINE_EPILOGUE(H, E, K, M, S, 2, 4);                                 \
-    TRY_COMBINE_EPILOGUE(H, E, K, M, S, 2, 8)
+    TRY_COMBINE_EPILOGUE(H, E, K, M, S, 2, 8);                                 \
+    TRY_COMBINE_EPILOGUE(H, E, K, M, S, 4, 4)
 
     TRY_HYBRID_COMBINE_EPILOGUE_SHAPE(4096, 256, 8, 128, 24);
 #endif
