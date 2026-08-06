@@ -151,6 +151,6 @@ echo "  libtransfer_engine.so: ${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/sr
 echo "  libtent_shared.so:     ${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/tent/src/libtent_shared.so"
 if is_truthy "${BUILD_WHEEL_NATIVE_ASSETS}"; then
   echo "  engine*.so:            ${UPSTREAM_BUILD_DIR}/mooncake-integration/"
-  echo "  libasio.so:            ${UPSTREAM_BUILD_DIR}/mooncake-asio/libasio.so"
+  echo "  libasio.so:            ${UPSTREAM_BUILD_DIR}/mooncake-{common,asio}/libasio.so"
   echo "  transfer_engine_bench: ${UPSTREAM_BUILD_DIR}/mooncake-transfer-engine/example/transfer_engine_bench"
 fi

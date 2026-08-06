@@ -151,6 +151,8 @@ fn add_base_search_dirs(base_dir: &Path, dirs: &mut Vec<PathBuf>) {
 }
 
 fn add_upstream_search_dirs(build_dir: &Path, dirs: &mut Vec<PathBuf>) {
+    // upstream relocated libasio.so from mooncake-asio/ to mooncake-common/
+    push_unique_dir(dirs, &build_dir.join("mooncake-common"));
     push_unique_dir(dirs, &build_dir.join("mooncake-asio"));
     push_unique_dir(
         dirs,
