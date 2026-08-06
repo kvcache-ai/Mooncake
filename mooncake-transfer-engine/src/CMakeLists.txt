@@ -1,4 +1,4 @@
-file(GLOB ENGINE_SOURCES "*.cpp")
+file(GLOB ENGINE_SOURCES "*.cpp" "shared_segment/*.cpp")
 add_subdirectory(common)
 add_subdirectory(transport)
 
@@ -11,6 +11,11 @@ if(USE_HIP)
 endif()
 
 add_library(transfer_engine ${ENGINE_SOURCES} $<TARGET_OBJECTS:transport>)
+# Private headers live next to the .cpp sources. CUDA builds compile from the
+# source tree so quoted includes work; USE_HIP hipifies into the build tree and
+# needs this path explicitly.
+target_include_directories(transfer_engine
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shared_segment)
 if(BUILD_SHARED_LIBS)
   install(TARGETS transfer_engine DESTINATION lib)
 endif()

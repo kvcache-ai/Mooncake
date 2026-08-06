@@ -18,6 +18,8 @@
 
 #include <graph/ascend_string.h>
 
+#include <acl/acl.h>
+
 #include <cstddef>
 #include <cstdint>
 #include <map>
@@ -73,7 +75,10 @@ struct TransferArgs {
 enum FeatureType : int32_t {
     AUTO_CONNECT = 0,
     CLIENT_SERVER_COMM = 1,
+    EXPORT_SHAREABLE_HANDLE = 2,
 };
+
+using ShareableHandle = aclrtMemFabricHandle;
 
 class ASCEND_FUNC_VISIBILITY AdxlEngine {
    public:
@@ -183,6 +188,17 @@ class ASCEND_FUNC_VISIBILITY AdxlEngine {
      */
     __attribute__((weak)) static Status MallocMem(MemType type, size_t size,
                                                   void** ptr);
+
+    /**
+     * @brief 将MallocMem申请的内存导出为fabric share handle.
+     * ACL export 每个分配最多一次：首次导出并缓存，之后返回缓存 handle.
+     * @param [in] addr MallocMem返回的虚拟内存ptr
+     * @param [out] handle 导出的fabric share handle
+     * @return 成功:SUCCESS, 地址非MallocMem申请或已释放:PARAM_INVALID,
+     * 失败:其它.
+     */
+    __attribute__((weak)) static Status ExportToShareableHandle(
+        void* addr, ShareableHandle& handle);
 
     /**
      * @brief 释放MallocMem申请的内存内存

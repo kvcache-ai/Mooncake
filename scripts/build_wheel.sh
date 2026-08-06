@@ -38,6 +38,9 @@ if [ -f "${BUILD_DIR}/mooncake-pg/src/libmooncake_pg.so" ]; then
     cp "${BUILD_DIR}/mooncake-pg/src/libmooncake_pg.so" mooncake-wheel/mooncake/libmooncake_pg.so
 fi
 
+# Copy the shared segment wrapper, which builds on engine.so
+cp mooncake-integration/shared_segment.py mooncake-wheel/mooncake/shared_segment.py
+
 # Copy libasio.so to mooncake directory (runtime dependency of engine.so)
 cp ${BUILD_DIR}/mooncake-common/libasio.so mooncake-wheel/mooncake/libasio.so
 
