@@ -155,7 +155,7 @@ struct mlx5gda_cq* mlx5gda_create_cq(
     struct memheap* ctrl_buf_heap, struct ibv_pd* pd, int cqe,
     cudaStream_t stream, void* cq_buf_arg, void* cq_buf_dev,
     struct mlx5dv_devx_umem* cq_buf_umem, struct memheap* cq_buf_heap,
-    const struct mlx5gda_control_region_allocator* region_allocator) {
+    const struct mlx5gda_control_region_allocator* cq_region_allocator) {
     struct mlx5gda_cq* cq = NULL;
     struct mlx5dv_devx_uar* uar = NULL;
     uint32_t eqn = 0;
@@ -169,7 +169,7 @@ struct mlx5gda_cq* mlx5gda_create_cq(
         cq_buf_umem ? cq_buf_umem : ctrl_buf_umem;
     struct mlx5dv_devx_umem* dbr_umem = cq_umem;
     struct memheap* cq_heap = cq_buf_heap ? cq_buf_heap : ctrl_buf_heap;
-    const bool split_regions = uses_control_regions(region_allocator);
+    const bool split_regions = uses_control_regions(cq_region_allocator);
 
     struct ibv_context* ctx = pd->context;
     void* cq_context = NULL;
@@ -188,16 +188,16 @@ struct mlx5gda_cq* mlx5gda_create_cq(
     if (!cq) goto fail;
 
     if (split_regions) {
-        cq->region_allocator = *region_allocator;
-        if (region_allocator->allocate(region_allocator->context,
-                                       num_cqe * sizeof(struct mlx5_cqe64),
-                                       &cq->cq_region) != 0) {
+        cq->region_allocator = *cq_region_allocator;
+        if (cq_region_allocator->allocate(cq_region_allocator->context,
+                                          num_cqe * sizeof(struct mlx5_cqe64),
+                                          &cq->cq_region) != 0) {
             perror("Failed to allocate CQ control region");
             goto fail;
         }
-        if (region_allocator->allocate(region_allocator->context,
-                                       sizeof(struct mlx5gda_cq_dbr),
-                                       &cq->dbr_region) != 0) {
+        if (cq_region_allocator->allocate(cq_region_allocator->context,
+                                          sizeof(struct mlx5gda_cq_dbr),
+                                          &cq->dbr_region) != 0) {
             perror("Failed to allocate CQ DBR control region");
             goto fail;
         }
@@ -332,7 +332,8 @@ struct mlx5gda_qp* mlx5gda_create_rc_qp(
     struct mlx5dv_pd mpd, const struct mlx5gda_control_buffer* ctrl,
     const struct mlx5gda_control_buffer* cq, struct ibv_pd* pd, int wqe,
     uint8_t port_num, cudaStream_t stream,
-    const struct mlx5gda_control_region_allocator* region_allocator) {
+    const struct mlx5gda_control_region_allocator* cq_region_allocator,
+    const struct mlx5gda_control_region_allocator* qp_region_allocator) {
     mlx5gda_reset_create_qp_failure();
 
     struct mlx5gda_qp* qp = NULL;
@@ -345,7 +346,7 @@ struct mlx5gda_qp* mlx5gda_create_rc_qp(
     void* dbr = ctrl->addr;
     struct mlx5dv_devx_umem* wq_umem = ctrl->umem;
     struct mlx5dv_devx_umem* dbr_umem = ctrl->umem;
-    const bool split_regions = uses_control_regions(region_allocator);
+    const bool split_regions = uses_control_regions(qp_region_allocator);
 
     struct ibv_context* ctx = pd->context;
     void* qp_context = NULL;
@@ -370,7 +371,7 @@ struct mlx5gda_qp* mlx5gda_create_rc_qp(
         perror("Failed to allocate QP memory");
         goto fail;
     }
-    if (split_regions) qp->region_allocator = *region_allocator;
+    if (split_regions) qp->region_allocator = *qp_region_allocator;
 
     qp->port_num = port_num;
     if (ibv_query_port(ctx, port_num, &qp->port_attr) != 0) {
@@ -400,7 +401,7 @@ struct mlx5gda_qp* mlx5gda_create_rc_qp(
     // Create send_cq on GPU memory.
     send_cq = mlx5gda_create_cq(ctrl->addr, ctrl->umem, ctrl->heap, pd, wqe,
                                 stream, cq->addr, cq->dev_addr, cq->umem,
-                                cq->heap, region_allocator);
+                                cq->heap, cq_region_allocator);
     if (send_cq == NULL) {
         perror("mlx5gda_create_cq failed");
         goto fail;
@@ -414,15 +415,16 @@ struct mlx5gda_qp* mlx5gda_create_rc_qp(
     if (map_uar_for_device(uar, qp) != 0) goto fail;
 
     if (split_regions) {
-        if (region_allocator->allocate(region_allocator->context,
-                                       num_wqebb * sizeof(struct mlx5gda_wqebb),
-                                       &qp->wq_region) != 0) {
+        if (qp_region_allocator->allocate(
+                qp_region_allocator->context,
+                num_wqebb * sizeof(struct mlx5gda_wqebb),
+                &qp->wq_region) != 0) {
             perror("Failed to allocate WQ control region");
             goto fail;
         }
-        if (region_allocator->allocate(region_allocator->context,
-                                       sizeof(struct mlx5gda_wq_dbr),
-                                       &qp->dbr_region) != 0) {
+        if (qp_region_allocator->allocate(qp_region_allocator->context,
+                                          sizeof(struct mlx5gda_wq_dbr),
+                                          &qp->dbr_region) != 0) {
             perror("Failed to allocate QP DBR control region");
             goto fail;
         }

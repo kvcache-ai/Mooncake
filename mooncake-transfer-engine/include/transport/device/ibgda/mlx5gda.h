@@ -77,7 +77,7 @@ struct mlx5gda_cq *mlx5gda_create_cq(
     struct memheap *ctrl_buf_heap, struct ibv_pd *pd, int num_cqe,
     cudaStream_t stream, void *cq_buf, void *cq_buf_dev,
     struct mlx5dv_devx_umem *cq_buf_umem, struct memheap *cq_buf_heap,
-    const struct mlx5gda_control_region_allocator *region_allocator);
+    const struct mlx5gda_control_region_allocator *cq_region_allocator);
 void mlx5gda_destroy_cq(struct mlx5gda_cq *cq);
 
 static const size_t MLX5GDA_BF_SIZE = 256;
@@ -136,7 +136,8 @@ struct mlx5gda_qp *mlx5gda_create_rc_qp(
     struct mlx5dv_pd mpd, const struct mlx5gda_control_buffer *ctrl,
     const struct mlx5gda_control_buffer *cq, struct ibv_pd *pd, int wqe,
     uint8_t port_num, cudaStream_t stream,
-    const struct mlx5gda_control_region_allocator *region_allocator);
+    const struct mlx5gda_control_region_allocator *cq_region_allocator,
+    const struct mlx5gda_control_region_allocator *qp_region_allocator);
 void mlx5gda_destroy_qp(struct mlx5gda_qp *qp);
 
 int mlx5gda_modify_rc_qp_rst2init(struct mlx5gda_qp *qp, uint16_t pkey_index);

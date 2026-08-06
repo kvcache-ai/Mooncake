@@ -49,6 +49,7 @@ enum class ControlMemoryMode {
     kGpuVa,
     kHostMapped,
     kSplitGpuVaHostMappedCq,
+    kPerQpGpuVaHostMappedCq,
 };
 
 static const char* controlMemoryModeName(ControlMemoryMode mode) {
@@ -61,6 +62,8 @@ static const char* controlMemoryModeName(ControlMemoryMode mode) {
             return "host-mapped";
         case ControlMemoryMode::kSplitGpuVaHostMappedCq:
             return "split-gpu-va-host-mapped-cq";
+        case ControlMemoryMode::kPerQpGpuVaHostMappedCq:
+            return "per-qp-gpu-va-host-mapped-cq";
     }
     return "unknown";
 }
@@ -269,14 +272,26 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
 
     int createQueuePairs(void* stream_ptr) override {
         auto stream = static_cast<cudaStream_t>(stream_ptr);
-        mlx5gda_control_region_allocator region_allocator{
+        mlx5gda_control_region_allocator dmabuf_region_allocator{
             .context = this,
             .allocate = allocateDmabufControlRegionThunk,
             .release = releaseDmabufControlRegionThunk,
         };
-        const mlx5gda_control_region_allocator* allocator =
-            ctrl_buf_mode_ == ControlMemoryMode::kGpuDmabuf ? &region_allocator
-                                                            : nullptr;
+        mlx5gda_control_region_allocator gpu_va_region_allocator{
+            .context = this,
+            .allocate = allocateGpuVaControlRegionThunk,
+            .release = releaseGpuVaControlRegionThunk,
+        };
+        const mlx5gda_control_region_allocator* cq_region_allocator =
+            ctrl_buf_mode_ == ControlMemoryMode::kGpuDmabuf
+                ? &dmabuf_region_allocator
+                : nullptr;
+        const mlx5gda_control_region_allocator* qp_region_allocator =
+            ctrl_buf_mode_ == ControlMemoryMode::kGpuDmabuf
+                ? &dmabuf_region_allocator
+            : ctrl_buf_mode_ == ControlMemoryMode::kPerQpGpuVaHostMappedCq
+                ? &gpu_va_region_allocator
+                : nullptr;
         const mlx5gda_control_buffer ctrl{
             .addr = ctrl_buf_,
             .dev_addr = ctrl_buf_dev_,
@@ -292,8 +307,9 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
                       }
                     : ctrl;
         for (int i = 0; i < num_qps_; ++i) {
-            mlx5gda_qp* qp = mlx5gda_create_rc_qp(mpd_, &ctrl, &cq, pd_, 16384,
-                                                  1, stream, allocator);
+            mlx5gda_qp* qp =
+                mlx5gda_create_rc_qp(mpd_, &ctrl, &cq, pd_, 16384, 1, stream,
+                                     cq_region_allocator, qp_region_allocator);
             if (!qp) {
                 const int qp_errno = errno;
                 LOG(ERROR) << "[EP IBGDA] mlx5gda_create_rc_qp failed at " << i;
@@ -569,6 +585,54 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
         *region = {};
     }
 
+    int allocateGpuVaControlRegion(size_t requested_size,
+                                   mlx5gda_control_region* region) {
+        if (!region || requested_size == 0) {
+            errno = EINVAL;
+            return -1;
+        }
+
+        const long page_size = sysconf(_SC_PAGESIZE);
+        if (page_size <= 0) {
+            errno = EIO;
+            return -1;
+        }
+        const size_t page_mask = static_cast<size_t>(page_size) - 1;
+        const size_t size = (requested_size + page_mask) & ~page_mask;
+
+        void* addr = nullptr;
+        const cudaError_t cuda_error = cudaMalloc(&addr, size);
+        if (cuda_error != cudaSuccess) {
+            LOG(ERROR) << "[EP IBGDA] cudaMalloc failed for per-QP GPU-VA "
+                          "control region size="
+                       << size << ": " << cudaGetErrorString(cuda_error);
+            errno = cuda_error == cudaErrorMemoryAllocation ? ENOMEM : EIO;
+            return -1;
+        }
+
+        mlx5dv_devx_umem* umem =
+            mlx5dv_devx_umem_reg(ctx_, addr, size, IBV_ACCESS_LOCAL_WRITE);
+        if (!umem) {
+            PLOG(ERROR) << "[EP IBGDA] Control UMEM registration failed for "
+                           "per-QP GPU-VA region";
+            cudaFree(addr);
+            return -1;
+        }
+        *region = mlx5gda_control_region{
+            .addr = addr,
+            .size = size,
+            .umem = umem,
+        };
+        return 0;
+    }
+
+    void releaseGpuVaControlRegion(mlx5gda_control_region* region) {
+        if (!region) return;
+        if (region->umem) mlx5dv_devx_umem_dereg(region->umem);
+        if (region->addr) cudaFree(region->addr);
+        *region = {};
+    }
+
     static int allocateDmabufControlRegionThunk(
         void* context, size_t size, mlx5gda_control_region* region) {
         return static_cast<IbgdaDeviceTransportImpl*>(context)
@@ -579,6 +643,18 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
         void* context, mlx5gda_control_region* region) {
         static_cast<IbgdaDeviceTransportImpl*>(context)
             ->releaseDmabufControlRegion(region);
+    }
+
+    static int allocateGpuVaControlRegionThunk(void* context, size_t size,
+                                               mlx5gda_control_region* region) {
+        return static_cast<IbgdaDeviceTransportImpl*>(context)
+            ->allocateGpuVaControlRegion(size, region);
+    }
+
+    static void releaseGpuVaControlRegionThunk(void* context,
+                                               mlx5gda_control_region* region) {
+        static_cast<IbgdaDeviceTransportImpl*>(context)
+            ->releaseGpuVaControlRegion(region);
     }
 
     int allocateControlBuffer(ControlMemoryMode mode) {
@@ -651,11 +727,32 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
     int allocateSplitControlBuffers() {
         if (allocateControlBuffer(ControlMemoryMode::kGpuVa) != 0) return -1;
         ctrl_buf_mode_ = ControlMemoryMode::kSplitGpuVaHostMappedCq;
+        if (allocateHostMappedCqBuffer() != 0) {
+            freeControlBuffer();
+            return -1;
+        }
+        LOG(INFO)
+            << "[EP IBGDA] Using shared GPU WQ/DBR and host-backed mapped CQ "
+               "buffer";
+        return 0;
+    }
+
+    int allocatePerQpGpuVaControlBuffers() {
+        ctrl_buf_mode_ = ControlMemoryMode::kPerQpGpuVaHostMappedCq;
+        if (allocateHostMappedCqBuffer() != 0) {
+            freeControlBuffer();
+            return -1;
+        }
+        LOG(INFO) << "[EP IBGDA] Using per-QP GPU WQ/DBR regions and "
+                     "host-backed mapped CQ buffer";
+        return 0;
+    }
+
+    int allocateHostMappedCqBuffer() {
         void* ptr = nullptr;
         const int ret = posix_memalign(&ptr, 4096, kSplitCqBufSize);
         if (ret != 0) {
             LOG(ERROR) << "[EP IBGDA] posix_memalign cq_buf failed: " << ret;
-            freeControlBuffer();
             return -1;
         }
         cq_buf_ = ptr;
@@ -668,7 +765,6 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
                        << cudaGetErrorString(err);
             free(cq_buf_);
             cq_buf_ = nullptr;
-            freeControlBuffer();
             return -1;
         }
         err = cudaHostGetDevicePointer(&cq_buf_dev_, cq_buf_, 0);
@@ -678,7 +774,6 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
             cudaHostUnregister(cq_buf_);
             free(cq_buf_);
             cq_buf_ = nullptr;
-            freeControlBuffer();
             return -1;
         }
         cq_buf_umem_ = mlx5dv_devx_umem_reg(ctx_, cq_buf_, kSplitCqBufSize,
@@ -690,7 +785,6 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
             free(cq_buf_);
             cq_buf_ = nullptr;
             cq_buf_dev_ = nullptr;
-            freeControlBuffer();
             return -1;
         }
         cq_buf_heap_ = memheap_create(kSplitCqBufSize);
@@ -702,11 +796,8 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
             free(cq_buf_);
             cq_buf_ = nullptr;
             cq_buf_dev_ = nullptr;
-            freeControlBuffer();
             return -1;
         }
-        LOG(INFO)
-            << "[EP IBGDA] Using GPU WQ/DBR and host-backed mapped CQ buffer";
         return 0;
     }
 
@@ -722,8 +813,20 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
         auto failure = mlx5gda_last_create_qp_failure();
         const bool using_dmabuf_control_regions =
             ctrl_buf_mode_ == ControlMemoryMode::kGpuDmabuf;
+        const bool using_shared_gpu_va_with_host_cq =
+            ctrl_buf_mode_ == ControlMemoryMode::kSplitGpuVaHostMappedCq;
+        if (using_shared_gpu_va_with_host_cq && failure.valid) {
+            LOG(WARNING) << "[EP IBGDA] Shared GPU-VA WQ/DBR UMEM was "
+                            "rejected by DevX CREATE_QP (status=0x"
+                         << std::hex << failure.status << " syndrome=0x"
+                         << failure.syndrome << std::dec
+                         << "); retrying with per-QP GPU-VA regions";
+            destroyQueuePairs();
+            freeControlBuffer();
+            return allocatePerQpGpuVaControlBuffers() == 0;
+        }
         if (ctrl_buf_mode_ == ControlMemoryMode::kHostMapped ||
-            ctrl_buf_mode_ == ControlMemoryMode::kSplitGpuVaHostMappedCq ||
+            ctrl_buf_mode_ == ControlMemoryMode::kPerQpGpuVaHostMappedCq ||
             (!isCreateQpBadParam(failure) && !using_dmabuf_control_regions))
             return false;
 
