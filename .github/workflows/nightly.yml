@@ -253,7 +253,7 @@ jobs:
           cd build
           export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LIBRARY_PATH:-}
           cmake --build . -j$(nproc)
-          sudo cmake --install .
+          sudo -E cmake --install .
 
       - name: Build nvlink_allocator.so
         run: |
