@@ -1,6 +1,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <json/json.h>
+#include <array>
 #include <fstream>
 #include <filesystem>
 #include <cstdlib>
@@ -11,6 +12,7 @@
 #include "acl/acl.h"
 #endif
 
+#include "p2p_client_metric.h"
 #include "tiered_cache/tiered_backend.h"
 #include "tiered_cache/tiers/cache_tier.h"
 #include "utils/common.h"
@@ -1522,6 +1524,122 @@ TEST_F(TieredBackendTest, CapacityAsPlainInteger) {
     auto tier_views = backend.GetTierViews();
     ASSERT_EQ(tier_views.size(), 1u);
     EXPECT_EQ(tier_views[0].capacity, 512ULL * 1024 * 1024);
+}
+
+// ============================================================================
+// TierMetric Integration Tests
+// ============================================================================
+
+// Init registers every created tier into the TierMetric, and Commit/Delete
+// maintain the per-tier key count; usage is refreshed on metrics reads.
+TEST_F(TieredBackendTest, TierMetricRegistrationAndKeyCount) {
+    std::string json_config_str = R"({
+        "tiers": [
+            {
+                "type": "DRAM",
+                "capacity": 1073741824,
+                "priority": 10,
+                "allocator_type": "OFFSET"
+            }
+        ]
+    })";
+    Json::Value config;
+    ASSERT_TRUE(parseJsonString(json_config_str, config));
+
+    TieredBackend backend;
+    TierMetric tier_metric;
+    ASSERT_TRUE(backend
+                    .Init(config, /*engine=*/nullptr,
+                          /*add_replica_callback=*/nullptr,
+                          /*remove_replica_callback=*/nullptr,
+                          /*segment_sync_callback=*/nullptr,
+                          /*tier_metric=*/&tier_metric)
+                    .has_value());
+
+    // The tier is registered under its segment-name label.
+    auto views = backend.GetTierViews();
+    ASSERT_EQ(views.size(), 1u);
+    const std::string label = "tier_" + std::to_string(views[0].id.first) +
+                              "_" + std::to_string(views[0].id.second);
+    std::array<std::string, 1> label_array = {label};
+    EXPECT_EQ(tier_metric.capacity_bytes.value(label_array),
+              static_cast<int64_t>(views[0].capacity));
+    EXPECT_EQ(tier_metric.key_count.value(label_array), 0);
+
+    // Commit adds the key to the tier's count.
+    auto test_buffer = CreateTestBuffer(SMALL_DATA_SIZE);
+    auto handle_result =
+        AllocateAndWrite(backend, SMALL_DATA_SIZE, test_buffer.get());
+    ASSERT_TRUE(handle_result.has_value());
+    ASSERT_TRUE(backend.Commit("key1", handle_result.value()).has_value());
+    EXPECT_EQ(tier_metric.key_count.value(label_array), 1);
+
+    // A metrics read refreshes usage from the tier.
+    std::string serialized;
+    tier_metric.serialize(serialized);
+    EXPECT_GE(tier_metric.used_bytes.value(label_array),
+              static_cast<int64_t>(SMALL_DATA_SIZE));
+
+    // Re-committing the same key on the same tier replaces the replica and
+    // keeps the count unchanged.
+    auto handle2_result =
+        AllocateAndWrite(backend, SMALL_DATA_SIZE, test_buffer.get());
+    ASSERT_TRUE(handle2_result.has_value());
+    ASSERT_TRUE(backend.Commit("key1", handle2_result.value()).has_value());
+    EXPECT_EQ(tier_metric.key_count.value(label_array), 1);
+
+    // Deleting the key removes it from the tier's count.
+    ASSERT_TRUE(backend.Delete("key1").has_value());
+    EXPECT_EQ(tier_metric.key_count.value(label_array), 0);
+}
+
+// RemoveAll drains every replica and resets all per-tier key counts.
+TEST_F(TieredBackendTest, TierMetricRemoveAllResetsKeyCount) {
+    std::string json_config_str = R"({
+        "tiers": [
+            {
+                "type": "DRAM",
+                "capacity": 1073741824,
+                "priority": 10,
+                "allocator_type": "OFFSET"
+            }
+        ]
+    })";
+    Json::Value config;
+    ASSERT_TRUE(parseJsonString(json_config_str, config));
+
+    TieredBackend backend;
+    TierMetric tier_metric;
+    ASSERT_TRUE(backend
+                    .Init(config, /*engine=*/nullptr,
+                          /*add_replica_callback=*/nullptr,
+                          /*remove_replica_callback=*/nullptr,
+                          /*segment_sync_callback=*/nullptr,
+                          /*tier_metric=*/&tier_metric)
+                    .has_value());
+
+    auto views = backend.GetTierViews();
+    ASSERT_EQ(views.size(), 1u);
+    std::array<std::string, 1> label_array = {
+        "tier_" + std::to_string(views[0].id.first) + "_" +
+        std::to_string(views[0].id.second)};
+
+    auto buffer1 = CreateTestBuffer(SMALL_DATA_SIZE);
+    auto handle1 = AllocateAndWrite(backend, SMALL_DATA_SIZE, buffer1.get());
+    ASSERT_TRUE(handle1.has_value());
+    ASSERT_TRUE(backend.Commit("key1", handle1.value()).has_value());
+
+    auto buffer2 = CreateTestBuffer(MEDIUM_DATA_SIZE);
+    auto handle2 = AllocateAndWrite(backend, MEDIUM_DATA_SIZE, buffer2.get());
+    ASSERT_TRUE(handle2.has_value());
+    ASSERT_TRUE(backend.Commit("key2", handle2.value()).has_value());
+
+    EXPECT_EQ(tier_metric.key_count.value(label_array), 2);
+
+    auto removed = backend.RemoveAll();
+    ASSERT_TRUE(removed.has_value());
+    EXPECT_EQ(removed.value(), 2);
+    EXPECT_EQ(tier_metric.key_count.value(label_array), 0);
 }
 
 }  // namespace mooncake

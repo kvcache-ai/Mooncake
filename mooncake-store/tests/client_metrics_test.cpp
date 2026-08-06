@@ -1,12 +1,16 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <array>
 #include <cstdlib>
 #include <map>
+#include <memory>
 #include <string>
+#include <vector>
 
 #include "client_metric.h"
 #include "p2p_client_metric.h"
+#include "tiered_cache/tiers/cache_tier.h"
 
 namespace mooncake::test {
 
@@ -640,6 +644,148 @@ TEST_F(ClientMetricsTest, P2PClientMetricRetryCountersTest) {
 
     std::string summary = metrics.summary_metrics();
     EXPECT_TRUE(summary.find("Retries: write=3, read=2") != std::string::npos);
+}
+
+namespace {
+// Minimal CacheTier stub with fixed capacity/usage for TierMetric tests.
+class StubStatsTier : public CacheTier {
+   public:
+    StubStatsTier(UUID id, size_t capacity, size_t usage, MemoryType type)
+        : id_(id), capacity_(capacity), usage_(usage), type_(type) {}
+
+    tl::expected<void, ErrorCode> Init(TieredBackend*,
+                                       TransferEngine*) override {
+        return {};
+    }
+    tl::expected<void, ErrorCode> Allocate(size_t, DataSource&) override {
+        return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+    tl::expected<void, ErrorCode> Free(DataSource) override { return {}; }
+    UUID GetTierId() const override { return id_; }
+    size_t GetCapacity() const override { return capacity_; }
+    size_t GetUsage() const override { return usage_; }
+    MemoryType GetMemoryType() const override { return type_; }
+    const std::vector<std::string>& GetTags() const override { return tags_; }
+
+    void SetUsage(size_t usage) { usage_ = usage; }
+
+   private:
+    UUID id_;
+    size_t capacity_;
+    size_t usage_;
+    MemoryType type_;
+    std::vector<std::string> tags_;
+};
+}  // namespace
+
+TEST_F(ClientMetricsTest, TierMetricEmptyTest) {
+    TierMetric metric;
+
+    std::string summary = metric.summary_metrics();
+    EXPECT_TRUE(summary.find("No tiers registered") != std::string::npos);
+
+    // No tier registered -> no tier series serialized.
+    std::string serialized;
+    metric.serialize(serialized);
+    EXPECT_TRUE(serialized.find("mooncake_p2p_tier") == std::string::npos);
+}
+
+TEST_F(ClientMetricsTest, TierMetricRegisterAndCountTest) {
+    TierMetric metric;
+    const UUID tier_id{1, 2};
+    const std::string label = "tier_1_2";
+    auto tier =
+        std::make_shared<StubStatsTier>(tier_id, /*capacity=*/1024,
+                                        /*usage=*/256, MemoryType::DRAM);
+
+    metric.RegisterTier(tier_id, label, tier, /*priority=*/10);
+
+    std::array<std::string, 1> label_array = {label};
+    EXPECT_EQ(metric.capacity_bytes.value(label_array), 1024);
+    // Usage is captured at registration and only refreshed on read.
+    EXPECT_EQ(metric.used_bytes.value(label_array), 256);
+    EXPECT_EQ(metric.key_count.value(label_array), 0);
+
+    // Key count follows replica add/remove.
+    metric.OnReplicaAdded(tier_id);
+    metric.OnReplicaAdded(tier_id);
+    metric.OnReplicaAdded(tier_id);
+    metric.OnReplicaRemoved(tier_id);
+    EXPECT_EQ(metric.key_count.value(label_array), 2);
+
+    // Usage is refreshed from the tier only on serialize/summary reads.
+    tier->SetUsage(512);
+    EXPECT_EQ(metric.used_bytes.value(label_array), 256);  // stale before read
+    std::string serialized;
+    metric.serialize(serialized);
+    EXPECT_EQ(metric.used_bytes.value(label_array), 512);
+    EXPECT_TRUE(serialized.find("mooncake_p2p_tier_key_count") !=
+                std::string::npos);
+
+    // Summary contains label, memory type, priority and counters.
+    std::string summary = metric.summary_metrics();
+    EXPECT_TRUE(summary.find(label) != std::string::npos);
+    EXPECT_TRUE(summary.find("DRAM") != std::string::npos);
+    EXPECT_TRUE(summary.find("priority=10") != std::string::npos);
+    EXPECT_TRUE(summary.find("keys=2") != std::string::npos);
+}
+
+TEST_F(ClientMetricsTest, TierMetricUnregisteredTierTest) {
+    TierMetric metric;
+
+    // Hooks on unknown tiers must not crash nor create series.
+    metric.OnReplicaAdded(UUID{9, 9});
+    metric.OnReplicaRemoved(UUID{9, 9});
+
+    std::string serialized;
+    metric.serialize(serialized);
+    EXPECT_TRUE(serialized.find("mooncake_p2p_tier") == std::string::npos);
+}
+
+TEST_F(ClientMetricsTest, TierMetricExpiredTierKeepsLastUsageTest) {
+    TierMetric metric;
+    const UUID tier_id{3, 4};
+    const std::string label = "tier_3_4";
+    auto tier =
+        std::make_shared<StubStatsTier>(tier_id, /*capacity=*/2048,
+                                        /*usage=*/100, MemoryType::NVME);
+    metric.RegisterTier(tier_id, label, tier, /*priority=*/5);
+
+    tier->SetUsage(999);
+    std::string serialized;
+    metric.serialize(serialized);  // refresh while the tier is alive
+
+    tier.reset();                  // destroy the tier
+    metric.serialize(serialized);  // must not crash on the expired weak_ptr
+
+    std::array<std::string, 1> label_array = {label};
+    EXPECT_EQ(metric.used_bytes.value(label_array), 999);  // last known value
+}
+
+TEST_F(ClientMetricsTest, TierMetricDuplicateRegistrationTest) {
+    TierMetric metric;
+    const UUID tier_id{5, 6};
+    auto tier = std::make_shared<StubStatsTier>(tier_id, /*capacity=*/1024,
+                                                /*usage=*/0, MemoryType::DRAM);
+
+    metric.RegisterTier(tier_id, "tier_5_6", tier, /*priority=*/1);
+    metric.RegisterTier(tier_id, "tier_5_6_dup", tier, /*priority=*/1);
+
+    // The duplicate registration is rejected; only the first label exists.
+    std::string summary = metric.summary_metrics();
+    EXPECT_TRUE(summary.find("tier_5_6") != std::string::npos);
+    EXPECT_TRUE(summary.find("tier_5_6_dup") == std::string::npos);
+}
+
+TEST_F(ClientMetricsTest, P2PClientMetricTierSectionTest) {
+    P2PClientMetric metrics;
+
+    std::string summary = metrics.summary_metrics();
+    EXPECT_TRUE(summary.find("=== P2P Tier Metrics ===") != std::string::npos);
+    EXPECT_TRUE(summary.find("No tiers registered") != std::string::npos);
+
+    std::string serialized;
+    metrics.serialize(serialized);  // must not crash with empty tier metric
 }
 
 }  // namespace mooncake::test

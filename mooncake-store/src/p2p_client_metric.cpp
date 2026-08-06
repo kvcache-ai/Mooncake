@@ -1,5 +1,13 @@
 #include "p2p_client_metric.h"
 
+#include <glog/logging.h>
+
+#include <algorithm>
+#include <sstream>
+#include <vector>
+
+#include "tiered_cache/tiers/cache_tier.h"
+
 namespace mooncake {
 
 // ============================================================================
@@ -297,6 +305,135 @@ std::string PeerRequestMetrics::summary_metrics() {
 }
 
 // ============================================================================
+// TierMetric
+// ============================================================================
+
+namespace {
+std::string TierIdToString(const UUID& tier_id) {
+    return std::to_string(tier_id.first) + "_" + std::to_string(tier_id.second);
+}
+}  // namespace
+
+void TierMetric::RegisterTier(const UUID& tier_id, const std::string& label,
+                              const std::shared_ptr<CacheTier>& tier,
+                              int priority) {
+    if (!tier) {
+        LOG(ERROR) << "TierMetric::RegisterTier: null tier, tier_id="
+                   << TierIdToString(tier_id);
+        return;
+    }
+
+    TierEntry entry;
+    entry.label_array = {label};
+    entry.memory_type = tier->GetMemoryType();
+    entry.priority = priority;
+    entry.capacity = tier->GetCapacity();
+    entry.tier = tier;
+
+    {
+        std::unique_lock<std::shared_mutex> lock(mutex_);
+        if (!tiers_.try_emplace(tier_id, std::move(entry)).second) {
+            LOG(ERROR) << "TierMetric::RegisterTier: tier already registered"
+                       << ", tier_id=" << TierIdToString(tier_id)
+                       << ", label=" << label;
+            return;
+        }
+    }
+
+    // Initialize all gauges so an idle tier still shows up in /metrics.
+    const std::array<std::string, 1> label_array = {label};
+    key_count.inc(label_array, 0);
+    capacity_bytes.update(label_array,
+                          static_cast<int64_t>(tier->GetCapacity()));
+    used_bytes.update(label_array, static_cast<int64_t>(tier->GetUsage()));
+}
+
+void TierMetric::OnReplicaAdded(const UUID& tier_id) {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    auto it = tiers_.find(tier_id);
+    if (it == tiers_.end()) {
+        LOG(ERROR) << "TierMetric::OnReplicaAdded: unregistered tier, tier_id="
+                   << TierIdToString(tier_id);
+        return;
+    }
+    key_count.inc(it->second.label_array, 1);
+}
+
+void TierMetric::OnReplicaRemoved(const UUID& tier_id) {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    auto it = tiers_.find(tier_id);
+    if (it == tiers_.end()) {
+        LOG(ERROR)
+            << "TierMetric::OnReplicaRemoved: unregistered tier, tier_id="
+            << TierIdToString(tier_id);
+        return;
+    }
+    key_count.dec(it->second.label_array, 1);
+}
+
+void TierMetric::RefreshUsage() {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    for (const auto& [tier_id, entry] : tiers_) {
+        auto tier = entry.tier.lock();
+        if (!tier) {
+            // Tier already destroyed; keep the last known value.
+            continue;
+        }
+        used_bytes.update(entry.label_array,
+                          static_cast<int64_t>(tier->GetUsage()));
+    }
+}
+
+void TierMetric::serialize(std::string& str) {
+    RefreshUsage();
+    key_count.serialize(str);
+    capacity_bytes.serialize(str);
+    used_bytes.serialize(str);
+}
+
+std::string TierMetric::summary_metrics() {
+    RefreshUsage();
+
+    std::stringstream ss;
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    if (tiers_.empty()) {
+        ss << "No tiers registered\n";
+        return ss.str();
+    }
+
+    // Display tiers by priority (descending), then by label, for stable and
+    // readable output.
+    std::vector<const TierEntry*> sorted;
+    sorted.reserve(tiers_.size());
+    for (const auto& [tier_id, entry] : tiers_) {
+        sorted.push_back(&entry);
+    }
+    std::sort(sorted.begin(), sorted.end(),
+              [](const TierEntry* a, const TierEntry* b) {
+                  if (a->priority != b->priority) {
+                      return a->priority > b->priority;
+                  }
+                  return a->label_array[0] < b->label_array[0];
+              });
+
+    for (const auto* entry : sorted) {
+        const int64_t keys = key_count.value(entry->label_array);
+        const int64_t used = used_bytes.value(entry->label_array);
+        const int64_t capacity = static_cast<int64_t>(entry->capacity);
+        ss << "Tier " << entry->label_array[0] << " ("
+           << MemoryTypeToString(entry->memory_type)
+           << ", priority=" << entry->priority << "): keys=" << keys
+           << ", used=" << byte_size_to_string(used) << "/"
+           << byte_size_to_string(capacity);
+        if (capacity > 0) {
+            ss << " (" << (used * 100 / capacity) << "%)";
+        }
+        ss << "\n";
+    }
+    return ss.str();
+}
+
+// ============================================================================
 // P2PClientMetric
 // ============================================================================
 
@@ -316,6 +453,7 @@ void P2PClientMetric::serialize(std::string& str) {
     remote_request.serialize(str);
     rollback.serialize(str);
     peer_request_metrics.serialize(str);
+    tier_metric.serialize(str);
 }
 
 std::string P2PClientMetric::summary_metrics() {
@@ -338,6 +476,9 @@ std::string P2PClientMetric::summary_metrics() {
 
     ss << "=== P2P Peer Request Metrics ===\n";
     ss << peer_request_metrics.summary_metrics();
+
+    ss << "=== P2P Tier Metrics ===\n";
+    ss << tier_metric.summary_metrics();
 
     return ss.str();
 }

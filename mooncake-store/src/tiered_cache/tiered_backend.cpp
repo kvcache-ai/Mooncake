@@ -3,6 +3,7 @@
 #include <vector>
 #include <limits>
 
+#include "p2p_client_metric.h"
 #include "tiered_cache/tiered_backend.h"
 #include "tiered_cache/tiers/cache_tier.h"
 #include "tiered_cache/tiers/dram_tier.h"
@@ -22,6 +23,12 @@ static size_t ParseByteSize(const Json::Value& v) {
     }
     return static_cast<size_t>(v.asUInt64());
 }
+
+static std::string MakeTierSegmentName(const UUID& id) {
+    return "tier_" + std::to_string(id.first) + "_" + std::to_string(id.second);
+}
+
+std::string TierView::GetName() const { return MakeTierSegmentName(id); }
 
 AllocationEntry::~AllocationEntry() {
     if (loc.tier) {
@@ -115,8 +122,7 @@ void TieredBackend::Destroy() {
         Segment segment;
         segment.extra = P2PSegmentExtraData{};
         segment.id = id;
-        segment.name = "tier_" + std::to_string(id.first) + "_" +
-                       std::to_string(id.second);
+        segment.name = MakeTierSegmentName(id);
         segment.size = tier->GetCapacity();
         auto& p2p_extra = segment.GetP2PExtra();
         p2p_extra.priority = info.priority;
@@ -141,7 +147,7 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
     Json::Value root, TransferEngine* engine,
     AddReplicaCallback add_replica_callback,
     RemoveReplicaCallback remove_replica_callback,
-    SegmentSyncCallback segment_sync_callback) {
+    SegmentSyncCallback segment_sync_callback, TierMetric* tier_metric) {
     // Initialize DataCopier
     try {
         DataCopierBuilder builder;
@@ -156,6 +162,8 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
     remove_replica_callback_ = remove_replica_callback;
     // Register callback for segment lifecycle synchronization with Master
     segment_sync_callback_ = segment_sync_callback;
+    // Optional per-tier metrics sink
+    tier_metric_ = tier_metric;
 
     // Initialize Tiers
     if (!root.isMember("tiers")) {
@@ -303,6 +311,13 @@ tl::expected<void, ErrorCode> TieredBackend::Init(
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
         }
 
+        // Expose per-tier metrics before mounting so an early metrics read
+        // already sees this tier.
+        if (tier_metric_) {
+            tier_metric_->RegisterTier(id, MakeTierSegmentName(id), tiers_[id],
+                                       priority);
+        }
+
         auto mount_result =
             MountSegment(id, capacity, priority, tags, memory_type);
         if (!mount_result) {
@@ -341,8 +356,7 @@ tl::expected<void, ErrorCode> TieredBackend::MountSegment(
     Segment segment;
     segment.extra = P2PSegmentExtraData{};
     segment.id = id;
-    segment.name =
-        "tier_" + std::to_string(id.first) + "_" + std::to_string(id.second);
+    segment.name = MakeTierSegmentName(id);
     segment.size = capacity;
     auto& p2p_extra = segment.GetP2PExtra();
     p2p_extra.priority = priority;
@@ -571,6 +585,7 @@ tl::expected<void, ErrorCode> TieredBackend::Commit(
     size_t handle_size =
         handle->loc.data.buffer ? handle->loc.data.buffer->size() : 0;
     uint64_t committed_version = 0;
+    bool replica_added = false;
 
     // Update Entry (Entry Write Lock)
     {
@@ -601,11 +616,16 @@ tl::expected<void, ErrorCode> TieredBackend::Commit(
                           return tier_info_.at(a.first).priority >
                                  tier_info_.at(b.first).priority;
                       });
+            replica_added = true;
         }
 
         // Increment Version on modification
         entry->version++;
         committed_version = entry->version;
+    }
+
+    if (replica_added && tier_metric_) {
+        tier_metric_->OnReplicaAdded(current_tier_id);
     }
 
     if (scheduler_) {
@@ -729,6 +749,7 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(std::string_view key,
     // locks This is crucial for non-blocking deletions.
     AllocationHandle handle_ref = nullptr;
     std::vector<AllocationHandle> handles_to_free;
+    std::vector<UUID> removed_tier_ids;
 
     if (tier_id.has_value()) {
         // Delete Specific Replica
@@ -804,6 +825,9 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(std::string_view key,
         }
 
         if (found_tier) {
+            if (tier_metric_) {
+                tier_metric_->OnReplicaRemoved(*tier_id);
+            }
             if (scheduler_) {
                 scheduler_->OnDelete(DeleteContext{key, *tier_id});
             }
@@ -841,11 +865,19 @@ tl::expected<void, ErrorCode> TieredBackend::Delete(std::string_view key,
                     }
                 }
                 handles_to_free.push_back(replica.second);
+                removed_tier_ids.push_back(replica.first);
             }
             entry->replicas.clear();
         }
 
         shard.index.erase(it);
+    }
+
+    // Per-tier key-count accounting for the removed replicas.
+    if (tier_metric_) {
+        for (const auto& removed_tier_id : removed_tier_ids) {
+            tier_metric_->OnReplicaRemoved(removed_tier_id);
+        }
     }
 
     // Handles go out of scope here.
@@ -922,6 +954,9 @@ size_t TieredBackend::NotifyBucketEviction(const std::vector<std::string>& keys,
 
         if (found_tier) {
             ++removed;
+            if (tier_metric_) {
+                tier_metric_->OnReplicaRemoved(tier_id);
+            }
             // Notify Master that the replica on this tier is gone. Best-effort:
             // the eviction is irreversible, so log failures and continue.
             if (remove_replica_callback_) {
@@ -992,6 +1027,12 @@ tl::expected<long, ErrorCode> TieredBackend::RemoveAll() {
                             << ", key=" << key << ", segment_id=" << segment_id
                             << ", error_code=" << result.error();
                     }
+                }
+            }
+
+            if (tier_metric_) {
+                for (const auto& [tier_id, handle] : replicas) {
+                    tier_metric_->OnReplicaRemoved(tier_id);
                 }
             }
 

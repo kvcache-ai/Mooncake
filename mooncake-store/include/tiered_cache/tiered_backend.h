@@ -21,6 +21,7 @@ namespace mooncake {
 
 class TieredBackend;     // Forward declaration
 class IClientScheduler;  // Forward declaration
+struct TierMetric;       // Optional per-tier metrics sink (p2p_client_metric.h)
 
 /**
  * @struct TieredLocation
@@ -45,6 +46,10 @@ struct TierView {
     size_t free_space;
     int priority;
     std::vector<std::string> tags;
+
+    // Segment name reported to Master ("tier_<uuid>"), also used as the
+    // per-tier metric label.
+    std::string GetName() const;
 };
 
 /**
@@ -142,7 +147,8 @@ class TieredBackend {
         Json::Value root, TransferEngine* engine,
         AddReplicaCallback add_replica_callback,
         RemoveReplicaCallback remove_replica_callback,
-        SegmentSyncCallback segment_sync_callback);
+        SegmentSyncCallback segment_sync_callback,
+        TierMetric* tier_metric = nullptr);
 
     // --- Client-Centric Operations ---
     // All the following operations are designed for Client-Centric, Client
@@ -378,6 +384,9 @@ class TieredBackend {
     RemoveReplicaCallback remove_replica_callback_;
     // Callback for segment lifecycle synchronization with Master
     SegmentSyncCallback segment_sync_callback_;
+    // Optional per-tier metrics sink (not owned); null when metric
+    // collection is disabled.
+    TierMetric* tier_metric_ = nullptr;
 
     // Scheduler
     std::unique_ptr<IClientScheduler> scheduler_;

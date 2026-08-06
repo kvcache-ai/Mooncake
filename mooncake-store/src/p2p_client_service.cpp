@@ -316,7 +316,8 @@ ErrorCode P2PClientService::InitStorage(const P2PClientConfig& config) {
 
     auto init_result = tiered_backend->Init(
         config.tiered_backend_config, transfer_engine_.get(),
-        add_replica_callback, remove_replica_callback, segment_sync_callback);
+        add_replica_callback, remove_replica_callback, segment_sync_callback,
+        metrics_ ? &metrics_->tier_metric : nullptr);
     if (!init_result) {
         LOG(ERROR) << "Failed to init TieredBackend: " << init_result.error();
         return init_result.error();
@@ -547,8 +548,7 @@ std::vector<Segment> P2PClientService::CollectTierSegments() const {
     for (const auto& view : tier_views) {
         Segment seg;
         seg.id = view.id;
-        seg.name = "tier_" + std::to_string(view.id.first) + "_" +
-                   std::to_string(view.id.second);
+        seg.name = view.GetName();
         seg.size = view.capacity;
         auto& p2p_extra = seg.GetP2PExtra();
         p2p_extra.priority = view.priority;
