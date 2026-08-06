@@ -1,8 +1,10 @@
 // clang-format off
 
 #include <algorithm>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include <mooncake_ep_configs.cuh>
 #include <elastic/mooncake_ep_elastic_api.cuh>
@@ -24,13 +26,13 @@ constexpr int kElasticNumEpilogueWarps = 8;
 constexpr int kElasticNumHybridScaleoutWarps = 4;
 constexpr int kElasticNumHybridForwardWarps = 4;
 constexpr int kElasticNumHybridScaleupWarps = 4;
-constexpr int kElasticNumQPs = MAX_QP_COUNT;
 constexpr int64_t kElasticTimeoutCycles = NUM_TIMEOUT_CYCLES;
 
 inline int ceil_div(int x, int y) { return (x + y - 1) / y; }
 
+template <typename Ops>
 inline int hybrid_num_channels(int num_sms) {
-    return num_sms * kElasticNumHybridForwardWarps;
+    return num_sms * Ops::kNumHybridForwardWarps;
 }
 
 inline void* hybrid_combine_reduce_buffer_ptr(void* buffer, int hidden,
@@ -362,12 +364,46 @@ void launch_musa_elastic_prepare_dispatch(
 
 #endif
 
-template <typename Kernel, typename... Args>
-void launch_cooperative(Kernel kernel, int num_sms, int num_threads,
-                        int smem_bytes, cudaStream_t stream, Args... args) {
 #ifndef MOONCAKE_EP_USE_MUSA
+struct ConfiguredKernelAttribute {
+    const void* kernel = nullptr;
+    int device_id = -1;
+    int max_dynamic_smem_bytes = 0;
+};
+
+std::mutex configured_kernel_attributes_mutex;
+std::vector<ConfiguredKernelAttribute> configured_kernel_attributes;
+
+template <typename Kernel>
+void configure_kernel_dynamic_smem_once(Kernel kernel, int device_id,
+                                        int smem_bytes) {
+    const auto* kernel_ptr = reinterpret_cast<const void*>(kernel);
+    std::lock_guard<std::mutex> lock(configured_kernel_attributes_mutex);
+    for (auto& entry : configured_kernel_attributes) {
+        if (entry.kernel == kernel_ptr && entry.device_id == device_id) {
+            if (entry.max_dynamic_smem_bytes >= smem_bytes) return;
+            CUDA_CHECK(cudaFuncSetAttribute(
+                kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                smem_bytes));
+            entry.max_dynamic_smem_bytes = smem_bytes;
+            return;
+        }
+    }
     CUDA_CHECK(cudaFuncSetAttribute(
         kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_bytes));
+    configured_kernel_attributes.push_back(
+        {kernel_ptr, device_id, smem_bytes});
+}
+#endif
+
+template <typename Kernel, typename... Args>
+void launch_cooperative(Kernel kernel, int device_id, int num_sms,
+                        int num_threads, int smem_bytes, cudaStream_t stream,
+                        Args... args) {
+#ifndef MOONCAKE_EP_USE_MUSA
+    configure_kernel_dynamic_smem_once(kernel, device_id, smem_bytes);
+#else
+    (void)device_id;
 #endif
 #ifdef MOONCAKE_EP_USE_MUSA
     kernel<<<num_sms, num_threads, smem_bytes, stream>>>(args...);
@@ -411,12 +447,18 @@ void launch_elastic_dispatch_deterministic_prologue(
     constexpr int kNumThreads = kNumWarps * 32;
     const int smem_bytes = (1 + 2 * kNumWarps) * num_scaleup_ranks * sizeof(int);
     (void)num_smem_bytes;
+#ifdef MOONCAKE_EP_USE_MUSA
+    constexpr int device_id = 0;
+#else
+    int device_id = -1;
+    CUDA_CHECK(cudaGetDevice(&device_id));
+#endif
 
 #define LAUNCH_PROLOGUE(HIDDEN, EXPERTS, TOPK, MAXTOK, SMS, RANKS)             \
     do {                                                                       \
         auto kernel = elastic::dispatch_deterministic_prologue_impl<           \
             SMS, kNumWarps, RANKS, MAXTOK, EXPERTS, TOPK>;                    \
-        launch_cooperative(kernel, SMS, kNumThreads, smem_bytes, stream,       \
+        launch_cooperative(kernel, device_id, SMS, kNumThreads, smem_bytes, stream,       \
                            const_cast<int64_t*>(topk_idx), rank_count_buffer,  \
                            dst_buffer_slot_idx, num_tokens,                    \
                            scaleup_rank_idx);                                  \
@@ -471,7 +513,7 @@ void launch_mooncake_elastic_dispatch_backend(
 #endif
     const bool effective_cached_mode = cached_mode || musa_use_prepared_slots;
     const int num_notify_warps = effective_cached_mode ? 0 : kElasticNumNotifyWarps;
-    const int num_dispatch_warps = kElasticNumDispatchWarps;
+    const int num_dispatch_warps = Ops::kNumDispatchWarps;
     const int num_threads = (num_notify_warps + num_dispatch_warps) * 32;
     const int smem_bytes = std::max(
         num_smem_bytes,
@@ -495,7 +537,7 @@ void launch_mooncake_elastic_dispatch_backend(
     if (ctx.num_scaleout_ranks != 1) {
         const bool hybrid_reuse_slot_indices = cached_mode;
         const int hybrid_dispatch_warps =
-            kElasticNumHybridScaleoutWarps + kElasticNumHybridForwardWarps;
+            Ops::kNumHybridScaleoutWarps + Ops::kNumHybridForwardWarps;
         const int hybrid_threads =
             (num_notify_warps + hybrid_dispatch_warps) * 32;
         const int hybrid_smem_bytes = std::max(
@@ -511,11 +553,11 @@ void launch_mooncake_elastic_dispatch_backend(
             constexpr int kNumSFPacks = (SFP);                                 \
             if (cached_mode) {                                                 \
                 auto kernel = elastic::hybrid_dispatch_impl<Ops,               \
-                    false, true, S, 0, kElasticNumHybridScaleoutWarps,         \
-                    kElasticNumHybridForwardWarps, SO, SU, kHiddenBytes,       \
-                    kNumSFPacks, M, E, K, 1, kElasticNumQPs,                   \
+                    false, true, S, 0, Ops::kNumHybridScaleoutWarps,               \
+                    Ops::kNumHybridForwardWarps, SO, SU, kHiddenBytes,       \
+                    kNumSFPacks, M, E, K, 1, Ops::kNumQPs,                   \
                     kElasticTimeoutCycles>;                                    \
-                launch_cooperative(kernel, S, hybrid_threads,                  \
+                launch_cooperative(kernel, ctx.device_id, S, hybrid_threads,                  \
                                    hybrid_smem_bytes, stream, x,               \
                                    static_cast<sf_pack_t*>(sf), topk_idx,      \
                                    topk_weights, copied_topk_idx,              \
@@ -532,11 +574,11 @@ void launch_mooncake_elastic_dispatch_backend(
             } else if (hybrid_reuse_slot_indices) {                            \
                 auto kernel = elastic::hybrid_dispatch_impl<Ops,               \
                     false, true, S, kElasticNumNotifyWarps,                    \
-                    kElasticNumHybridScaleoutWarps,                            \
-                    kElasticNumHybridForwardWarps, SO, SU, kHiddenBytes,       \
-                    kNumSFPacks, M, E, K, 1, kElasticNumQPs,                   \
+                    Ops::kNumHybridScaleoutWarps,                              \
+                    Ops::kNumHybridForwardWarps, SO, SU, kHiddenBytes,       \
+                    kNumSFPacks, M, E, K, 1, Ops::kNumQPs,                   \
                     kElasticTimeoutCycles>;                                    \
-                launch_cooperative(kernel, S, hybrid_threads,                  \
+                launch_cooperative(kernel, ctx.device_id, S, hybrid_threads,                  \
                                    hybrid_smem_bytes, stream, x,               \
                                    static_cast<sf_pack_t*>(sf), topk_idx,      \
                                    topk_weights, copied_topk_idx,              \
@@ -553,11 +595,11 @@ void launch_mooncake_elastic_dispatch_backend(
             } else {                                                           \
                 auto kernel = elastic::hybrid_dispatch_impl<Ops,               \
                     false, false, S, kElasticNumNotifyWarps,                   \
-                    kElasticNumHybridScaleoutWarps,                            \
-                    kElasticNumHybridForwardWarps, SO, SU, kHiddenBytes,       \
-                    kNumSFPacks, M, E, K, 1, kElasticNumQPs,                   \
+                    Ops::kNumHybridScaleoutWarps,                              \
+                    Ops::kNumHybridForwardWarps, SO, SU, kHiddenBytes,       \
+                    kNumSFPacks, M, E, K, 1, Ops::kNumQPs,                   \
                     kElasticTimeoutCycles>;                                    \
-                launch_cooperative(kernel, S, hybrid_threads,                  \
+                launch_cooperative(kernel, ctx.device_id, S, hybrid_threads,                  \
                                    hybrid_smem_bytes, stream, x,               \
                                    static_cast<sf_pack_t*>(sf), topk_idx,      \
                                    topk_weights, copied_topk_idx,              \
@@ -608,10 +650,10 @@ void launch_mooncake_elastic_dispatch_backend(
         constexpr int kNumSFPacks = (SFP);                                     \
         if (effective_cached_mode) {                                           \
             auto kernel = elastic::dispatch_impl<Ops,                          \
-                true, false, true, S, 0, kElasticNumDispatchWarps, R,          \
-                kHiddenBytes, kNumSFPacks, M, E, K, 1, kElasticNumQPs,         \
+                true, false, true, S, 0, Ops::kNumDispatchWarps, R,          \
+                kHiddenBytes, kNumSFPacks, M, E, K, 1, Ops::kNumQPs,         \
                 kElasticTimeoutCycles>;                                        \
-            launch_cooperative(kernel, S, num_threads, smem_bytes, stream, x,  \
+            launch_cooperative(kernel, ctx.device_id, S, num_threads, smem_bytes, stream, x,  \
                                static_cast<sf_pack_t*>(sf), topk_idx,          \
                                topk_weights, copied_topk_idx,                  \
                                cumulative_local_expert_recv_stats,             \
@@ -624,9 +666,9 @@ void launch_mooncake_elastic_dispatch_backend(
         } else if (reuse_slot_indices) {                                       \
             auto kernel = elastic::dispatch_impl<Ops,                          \
                 true, false, true, S, kElasticNumNotifyWarps,                  \
-                kElasticNumDispatchWarps, R, kHiddenBytes, kNumSFPacks, M, E, K, 1, \
-                kElasticNumQPs, kElasticTimeoutCycles>;                       \
-            launch_cooperative(kernel, S, num_threads, smem_bytes, stream, x,  \
+                Ops::kNumDispatchWarps, R, kHiddenBytes, kNumSFPacks, M, E, K, 1, \
+                Ops::kNumQPs, kElasticTimeoutCycles>;                       \
+            launch_cooperative(kernel, ctx.device_id, S, num_threads, smem_bytes, stream, x,  \
                                static_cast<sf_pack_t*>(sf), topk_idx,          \
                                topk_weights, copied_topk_idx,                  \
                                cumulative_local_expert_recv_stats,             \
@@ -639,9 +681,9 @@ void launch_mooncake_elastic_dispatch_backend(
         } else {                                                               \
             auto kernel = elastic::dispatch_impl<Ops,                          \
                 true, false, false, S, kElasticNumNotifyWarps,                 \
-                kElasticNumDispatchWarps, R, kHiddenBytes, kNumSFPacks, M, E, K, 1, \
-                kElasticNumQPs, kElasticTimeoutCycles>;                       \
-            launch_cooperative(kernel, S, num_threads, smem_bytes, stream, x,  \
+                Ops::kNumDispatchWarps, R, kHiddenBytes, kNumSFPacks, M, E, K, 1, \
+                Ops::kNumQPs, kElasticTimeoutCycles>;                       \
+            launch_cooperative(kernel, ctx.device_id, S, num_threads, smem_bytes, stream, x,  \
                                static_cast<sf_pack_t*>(sf), topk_idx,          \
                                topk_weights, copied_topk_idx,                  \
                                cumulative_local_expert_recv_stats,             \
@@ -727,20 +769,22 @@ void launch_mooncake_elastic_dispatch(
         stream);
 }
 
-void launch_mooncake_elastic_dispatch_copy_epilogue(
+template <int kNumEpilogueWarps>
+void launch_mooncake_elastic_dispatch_copy_epilogue_backend(
     void* recv_x, void* recv_sf, int64_t* recv_topk_idx,
     float* recv_topk_weights, int* recv_src_metadata,
     int* channel_linked_list, int num_recv_tokens, int num_max_tokens_per_rank,
     int hidden, int elem_size, int num_sf_packs, int recv_sf_token_stride,
     int recv_sf_hidden_stride, int num_experts, int num_topk, int num_sms,
-    int num_smem_bytes, int num_channels, bool do_expand, bool cached_mode,
+    int num_epilogue_sms, int num_smem_bytes, int num_channels, bool do_expand,
+    bool cached_mode,
     const ElasticLaunchContext& ctx, int* psum_num_recv_tokens_per_scaleup_rank,
     int* psum_num_recv_tokens_per_expert, cudaStream_t stream) {
-    const int num_threads = kElasticNumEpilogueWarps * 32;
+    const int num_threads = kNumEpilogueWarps * 32;
     const int smem_bytes = std::max(
         num_smem_bytes,
         dispatch_epilogue_smem_bytes(hidden, elem_size, num_sf_packs, num_topk,
-                                     kElasticNumEpilogueWarps));
+                                     kNumEpilogueWarps));
 
 #ifndef MOONCAKE_EP_USE_MUSA
     if (ctx.num_scaleout_ranks != 1) {
@@ -750,16 +794,17 @@ void launch_mooncake_elastic_dispatch_copy_epilogue(
             constexpr int kNumSFPacks = (SFP);                                 \
             auto kernel = do_expand ?                                          \
                 elastic::dispatch_copy_epilogue_impl<                          \
-                    true, false, S, C, kElasticNumEpilogueWarps, SO, SU,       \
+                    true, false, 0, C, kNumEpilogueWarps, SO, SU,       \
                     kHiddenBytes, kNumSFPacks, M, E, K> :                      \
                 (cached_mode ?                                                 \
                     elastic::dispatch_copy_epilogue_impl<                      \
-                        false, true, S, C, kElasticNumEpilogueWarps, SO, SU,   \
+                        false, true, 0, C, kNumEpilogueWarps, SO, SU,   \
                         kHiddenBytes, kNumSFPacks, M, E, K> :                  \
                     elastic::dispatch_copy_epilogue_impl<                      \
-                        false, false, S, C, kElasticNumEpilogueWarps, SO, SU,  \
+                        false, false, 0, C, kNumEpilogueWarps, SO, SU,  \
                         kHiddenBytes, kNumSFPacks, M, E, K>);                  \
-            launch_cooperative(kernel, S, num_threads, smem_bytes, stream,     \
+            launch_cooperative(kernel, ctx.device_id, num_epilogue_sms, num_threads,          \
+                               smem_bytes, stream,                               \
                                ctx.buffer, ctx.workspace,                      \
                                psum_num_recv_tokens_per_scaleup_rank,          \
                                psum_num_recv_tokens_per_expert, recv_x,        \
@@ -771,27 +816,30 @@ void launch_mooncake_elastic_dispatch_copy_epilogue(
                                ctx.scaleup_rank_idx);                          \
         } while (false)
 
-#define TRY_HYBRID_DISPATCH_EPILOGUE_TYPED(H, E, K, M, S, SO, SU, EL, SFP)     \
+#define TRY_HYBRID_DISPATCH_EPILOGUE_TYPED(H, E, K, M, S, SO, SU, EL, SFP, CPS) \
         if (hidden == H && num_experts == E && num_topk == K &&                \
             num_max_tokens_per_rank == M && num_sms == S &&                   \
             ctx.num_scaleout_ranks == SO && ctx.num_scaleup_ranks == SU &&     \
             elem_size == EL && num_sf_packs == SFP &&                          \
-            num_channels == hybrid_num_channels(S)) {                          \
+            num_channels == (S) * (CPS)) {                                     \
             LAUNCH_HYBRID_DISPATCH_EPILOGUE((H) * (EL), SFP, E, K, M, S, SO, SU, \
-                                            (S) * kElasticNumHybridForwardWarps); \
+                                            (S) * (CPS));                       \
             return;                                                            \
         }
 
-#define TRY_HYBRID_DISPATCH_EPILOGUE(H, E, K, M, S, SO, SU)                    \
+#define TRY_HYBRID_DISPATCH_EPILOGUE(H, E, K, M, S, SO, SU, CPS)               \
         TRY_HYBRID_DISPATCH_EPILOGUE_TYPED(H, E, K, M, S, SO, SU,              \
-                                           static_cast<int>(sizeof(nv_bfloat16)), 0); \
-        TRY_HYBRID_DISPATCH_EPILOGUE_TYPED(H, E, K, M, S, SO, SU, 1, (H) / 128)
+                                           static_cast<int>(sizeof(nv_bfloat16)), 0, CPS); \
+        TRY_HYBRID_DISPATCH_EPILOGUE_TYPED(H, E, K, M, S, SO, SU, 1, (H) / 128, CPS)
 
-#define TRY_HYBRID_DISPATCH_EPILOGUE_SHAPE(H, E, K, M, S)                      \
-        TRY_HYBRID_DISPATCH_EPILOGUE(H, E, K, M, S, 2, 4);                     \
-        TRY_HYBRID_DISPATCH_EPILOGUE(H, E, K, M, S, 2, 8)
+#define TRY_HYBRID_DISPATCH_EPILOGUE_SHAPE(H, E, K, M, S, CPS)                 \
+        TRY_HYBRID_DISPATCH_EPILOGUE(H, E, K, M, S, 2, 4, CPS);                \
+        TRY_HYBRID_DISPATCH_EPILOGUE(H, E, K, M, S, 2, 8, CPS)
 
-        TRY_HYBRID_DISPATCH_EPILOGUE_SHAPE(4096, 256, 8, 128, 24);
+#ifdef USE_NCCL_DEVICE
+        TRY_HYBRID_DISPATCH_EPILOGUE_SHAPE(4096, 256, 8, 128, 24, 8);
+#endif
+        TRY_HYBRID_DISPATCH_EPILOGUE_SHAPE(4096, 256, 8, 128, 24, 4);
 
 #undef TRY_HYBRID_DISPATCH_EPILOGUE_SHAPE
 #undef TRY_HYBRID_DISPATCH_EPILOGUE
@@ -806,16 +854,17 @@ void launch_mooncake_elastic_dispatch_copy_epilogue(
         constexpr int kNumSFPacks = (SFP);                                     \
         auto kernel = do_expand ?                                              \
             elastic::dispatch_copy_epilogue_impl<                              \
-                true, false, S, 1, kElasticNumEpilogueWarps, 1, R,             \
+                true, false, 0, 1, kNumEpilogueWarps, 1, R,             \
                 kHiddenBytes, kNumSFPacks, M, E, K> :                          \
             (cached_mode ?                                                     \
                 elastic::dispatch_copy_epilogue_impl<                          \
-                    false, true, S, 1, kElasticNumEpilogueWarps, 1, R,         \
+                    false, true, 0, 1, kNumEpilogueWarps, 1, R,         \
                     kHiddenBytes, kNumSFPacks, M, E, K> :                      \
                 elastic::dispatch_copy_epilogue_impl<                          \
-                    false, false, S, 1, kElasticNumEpilogueWarps, 1, R,        \
+                    false, false, 0, 1, kNumEpilogueWarps, 1, R,        \
                     kHiddenBytes, kNumSFPacks, M, E, K>);                      \
-        launch_cooperative(kernel, S, num_threads, smem_bytes, stream,         \
+        launch_cooperative(kernel, ctx.device_id, num_epilogue_sms, num_threads,              \
+                           smem_bytes, stream,                                   \
                            ctx.buffer, ctx.workspace,                          \
                            psum_num_recv_tokens_per_scaleup_rank,              \
                            psum_num_recv_tokens_per_expert, recv_x,            \
@@ -857,6 +906,38 @@ void launch_mooncake_elastic_dispatch_copy_epilogue(
                                ctx.num_scaleup_ranks);
 }
 
+
+void launch_mooncake_elastic_dispatch_copy_epilogue(
+    void* recv_x, void* recv_sf, int64_t* recv_topk_idx,
+    float* recv_topk_weights, int* recv_src_metadata,
+    int* channel_linked_list, int num_recv_tokens, int num_max_tokens_per_rank,
+    int hidden, int elem_size, int num_sf_packs, int recv_sf_token_stride,
+    int recv_sf_hidden_stride, int num_experts, int num_topk, int num_sms,
+    int num_epilogue_sms, int num_smem_bytes, int num_channels, bool do_expand,
+    bool cached_mode,
+    const ElasticLaunchContext& ctx, int* psum_num_recv_tokens_per_scaleup_rank,
+    int* psum_num_recv_tokens_per_expert, cudaStream_t stream) {
+#define CALL_DISPATCH_EPILOGUE(WARPS)                                          \
+    launch_mooncake_elastic_dispatch_copy_epilogue_backend<WARPS>(             \
+        recv_x, recv_sf, recv_topk_idx, recv_topk_weights, recv_src_metadata,  \
+        channel_linked_list, num_recv_tokens, num_max_tokens_per_rank, hidden, \
+        elem_size, num_sf_packs, recv_sf_token_stride, recv_sf_hidden_stride,  \
+        num_experts, num_topk, num_sms, num_epilogue_sms, num_smem_bytes,      \
+        num_channels,                                                          \
+        do_expand, cached_mode, ctx, psum_num_recv_tokens_per_scaleup_rank,    \
+        psum_num_recv_tokens_per_expert, stream)
+#ifdef USE_NCCL_DEVICE
+    if (ctx.backend == ElasticTransportBackend::kNccl) {
+        CALL_DISPATCH_EPILOGUE(
+            elastic::transport::NcclOps::kNumDispatchEpilogueWarps);
+        return;
+    }
+#endif
+    CALL_DISPATCH_EPILOGUE(
+        elastic::transport::IbgdaOps::kNumDispatchEpilogueWarps);
+#undef CALL_DISPATCH_EPILOGUE
+}
+
 template <typename Ops>
 void* launch_mooncake_elastic_combine_backend(
     void* x, float* topk_weights, int* src_metadata,
@@ -867,16 +948,16 @@ void* launch_mooncake_elastic_combine_backend(
     int num_channels, bool use_expanded_layout, bool allow_multiple_reduction,
     const ElasticLaunchContext& ctx, const typename Ops::Context& comm_ctx,
     cudaStream_t stream) {
-    const int num_threads = kElasticNumEpilogueWarps * 32;
+    const int num_threads = Ops::kNumCombineWarps * 32;
     const int smem_bytes = std::max(
-        num_smem_bytes, combine_smem_bytes(hidden, num_topk, kElasticNumEpilogueWarps));
+        num_smem_bytes, combine_smem_bytes(hidden, num_topk, Ops::kNumCombineWarps));
     (void)token_metadata_at_forward;
     (void)channel_linked_list;
 
 #ifndef MOONCAKE_EP_USE_MUSA
     if (ctx.num_scaleout_ranks != 1) {
         const int hybrid_combine_warps =
-            kElasticNumHybridScaleupWarps + kElasticNumHybridForwardWarps;
+            Ops::kNumHybridScaleupWarps + Ops::kNumHybridForwardWarps;
         const int hybrid_threads = hybrid_combine_warps * 32;
         const int hybrid_smem_bytes = std::max(
             num_smem_bytes,
@@ -885,10 +966,10 @@ void* launch_mooncake_elastic_combine_backend(
 #define LAUNCH_HYBRID_COMBINE(H, E, K, M, S, SO, SU)                           \
         do {                                                                   \
             auto kernel = elastic::hybrid_combine_impl<Ops,                    \
-                false, true, S, kElasticNumHybridScaleupWarps,                 \
-                kElasticNumHybridForwardWarps, SO, SU, H, M, E, K,             \
-                kElasticNumQPs, kElasticTimeoutCycles>;                        \
-            launch_cooperative(kernel, S, hybrid_threads, hybrid_smem_bytes,   \
+                false, true, S, Ops::kNumHybridScaleupWarps,                       \
+                Ops::kNumHybridForwardWarps, SO, SU, H, M, E, K,             \
+                Ops::kNumQPs, kElasticTimeoutCycles>;                        \
+            launch_cooperative(kernel, ctx.device_id, S, hybrid_threads, hybrid_smem_bytes,   \
                                stream, static_cast<nv_bfloat16*>(x),           \
                                topk_weights, src_metadata,                     \
                                psum_num_recv_tokens_per_scaleup_rank,          \
@@ -903,7 +984,7 @@ void* launch_mooncake_elastic_combine_backend(
             num_max_tokens_per_rank == M && num_sms == S &&                   \
             ctx.num_scaleout_ranks == SO && ctx.num_scaleup_ranks == SU &&     \
             allow_multiple_reduction && !use_expanded_layout &&                \
-            num_channels == hybrid_num_channels(S) &&                          \
+            num_channels == hybrid_num_channels<Ops>(S) &&                     \
             token_metadata_at_forward != nullptr && channel_linked_list != nullptr) { \
             LAUNCH_HYBRID_COMBINE(H, E, K, M, S, SO, SU);                      \
             return hybrid_combine_reduce_buffer_ptr(                            \
@@ -927,9 +1008,9 @@ void* launch_mooncake_elastic_combine_backend(
 #define LAUNCH_COMBINE(H, E, K, M, S, R)                                       \
     do {                                                                       \
         auto kernel = elastic::combine_impl<Ops, true, false, true, S,         \
-            kElasticNumEpilogueWarps, R, H, M, E, K, kElasticNumQPs,           \
+            Ops::kNumCombineWarps, R, H, M, E, K, Ops::kNumQPs,           \
             kElasticTimeoutCycles>;                                           \
-        launch_cooperative(kernel, S, num_threads, smem_bytes, stream,         \
+        launch_cooperative(kernel, ctx.device_id, S, num_threads, smem_bytes, stream,         \
                            static_cast<nv_bfloat16*>(x), topk_weights,         \
                            src_metadata, psum_num_recv_tokens_per_scaleup_rank,\
                            comm_ctx, ctx.buffer, ctx.workspace,                \
@@ -993,22 +1074,25 @@ void* launch_mooncake_elastic_combine(
         use_expanded_layout, allow_multiple_reduction, ctx, comm_ctx, stream);
 }
 
-void launch_mooncake_elastic_combine_reduce_epilogue(
+template <int kNumEpilogueWarps>
+void launch_mooncake_elastic_combine_reduce_epilogue_backend(
     void* combined_x, float* combined_topk_weights, int64_t* combined_topk_idx,
     int num_combined_tokens, int num_max_tokens_per_rank, int hidden,
     int num_experts, int num_topk, void* reduce_buffer, void* bias_0,
-    void* bias_1, int num_sms, int num_smem_bytes, bool use_expanded_layout,
+    void* bias_1, int num_sms, int num_epilogue_sms, int num_smem_bytes,
+    bool use_expanded_layout,
     bool allow_multiple_reduction, const ElasticLaunchContext& ctx,
     cudaStream_t stream) {
-    const int num_threads = kElasticNumEpilogueWarps * 32;
+    const int num_threads = kNumEpilogueWarps * 32;
     const int smem_bytes = std::max(
-        num_smem_bytes, combine_epilogue_smem_bytes(hidden, kElasticNumEpilogueWarps));
+        num_smem_bytes, combine_epilogue_smem_bytes(hidden, kNumEpilogueWarps));
 
 #define LAUNCH_COMBINE_EPILOGUE(H, E, K, M, S, SO, SU)                         \
     do {                                                                       \
         auto kernel = elastic::combine_reduce_epilogue_impl<                   \
-            false, true, S, kElasticNumEpilogueWarps, SO, SU, H, M, E, K>;     \
-        launch_cooperative(kernel, S, num_threads, smem_bytes, stream,         \
+            false, true, 0, kNumEpilogueWarps, SO, SU, H, M, E, K>;     \
+        launch_cooperative(kernel, ctx.device_id, num_epilogue_sms, num_threads,              \
+                           smem_bytes, stream,                                   \
                            static_cast<nv_bfloat16*>(combined_x),              \
                            combined_topk_weights, combined_topk_idx,           \
                            reduce_buffer, bias_0, bias_1, num_combined_tokens, \
@@ -1045,6 +1129,34 @@ void launch_mooncake_elastic_combine_reduce_epilogue(
     unsupported_elastic_config("combine_reduce_epilogue", hidden, num_experts,
                                num_topk, num_max_tokens_per_rank, num_sms,
                                ctx.num_scaleup_ranks);
+}
+
+
+void launch_mooncake_elastic_combine_reduce_epilogue(
+    void* combined_x, float* combined_topk_weights, int64_t* combined_topk_idx,
+    int num_combined_tokens, int num_max_tokens_per_rank, int hidden,
+    int num_experts, int num_topk, void* reduce_buffer, void* bias_0,
+    void* bias_1, int num_sms, int num_epilogue_sms, int num_smem_bytes,
+    bool use_expanded_layout,
+    bool allow_multiple_reduction, const ElasticLaunchContext& ctx,
+    cudaStream_t stream) {
+#define CALL_COMBINE_EPILOGUE(WARPS)                                           \
+    launch_mooncake_elastic_combine_reduce_epilogue_backend<WARPS>(            \
+        combined_x, combined_topk_weights, combined_topk_idx,                  \
+        num_combined_tokens, num_max_tokens_per_rank, hidden, num_experts,     \
+        num_topk, reduce_buffer, bias_0, bias_1, num_sms, num_epilogue_sms,    \
+        num_smem_bytes,                                                        \
+        use_expanded_layout, allow_multiple_reduction, ctx, stream)
+#ifdef USE_NCCL_DEVICE
+    if (ctx.backend == ElasticTransportBackend::kNccl) {
+        CALL_COMBINE_EPILOGUE(
+            elastic::transport::NcclOps::kNumCombineEpilogueWarps);
+        return;
+    }
+#endif
+    CALL_COMBINE_EPILOGUE(
+        elastic::transport::IbgdaOps::kNumCombineEpilogueWarps);
+#undef CALL_COMBINE_EPILOGUE
 }
 
 }  // namespace mooncake

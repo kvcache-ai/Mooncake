@@ -220,6 +220,12 @@ class ElasticBuffer:
         self.scaleout_rank_idx = self.rank_idx // self.num_scaleup_ranks
         self.scaleup_rank_idx = self.rank_idx % self.num_scaleup_ranks
         self._connect_native()
+        # The native elastic kernels currently use fixed communicator
+        # membership. Reuse this compatibility argument instead of allocating
+        # and filling a CUDA tensor for every dispatch and combine call.
+        self._active_ranks = torch.ones(
+            self.num_ranks, dtype=torch.int32, device="cuda"
+        )
 
         torch.cuda.synchronize()
         _dist_barrier(group)
@@ -525,16 +531,15 @@ class ElasticBuffer:
     def get_logical_domain_size(self) -> Tuple[int, int]:
         return self.num_scaleout_ranks, self.num_scaleup_ranks
 
-    @staticmethod
-    def _hybrid_num_channels(num_sms: int) -> int:
-        return max(1, num_sms) * 4
+    def _hybrid_num_channels(self, num_sms: int) -> int:
+        channels_per_sm = 8 if self.transport == "nccl" else 4
+        return max(1, num_sms) * channels_per_sm
 
-    @staticmethod
     def _hybrid_num_max_tokens_per_channel(
-        num_max_tokens_per_rank: int, num_sms: int
+        self, num_max_tokens_per_rank: int, num_sms: int
     ) -> int:
         return _ceil_div(
-            num_max_tokens_per_rank, ElasticBuffer._hybrid_num_channels(num_sms)
+            num_max_tokens_per_rank, self._hybrid_num_channels(num_sms)
         )
 
     def barrier(self, use_comm_stream: bool = True, with_cpu_sync: bool = False) -> None:
@@ -614,8 +619,15 @@ class ElasticBuffer:
         hidden = int(x_data.shape[1])
         num_topk = int(topk_idx.shape[1])
         num_local_experts = num_experts // self.num_ranks
-        num_recv_tokens = num_max_tokens_per_rank * self.num_ranks
-        num_recv_output_capacity = num_recv_tokens * num_topk if do_expand else num_recv_tokens
+        max_num_recv_tokens = num_max_tokens_per_rank * self.num_ranks
+        num_recv_tokens = (
+            int(handle.recv_src_metadata.shape[0])
+            if handle is not None
+            else max_num_recv_tokens
+        )
+        num_recv_output_capacity = (
+            num_recv_tokens * num_topk if do_expand else num_recv_tokens
+        )
         use_hybrid = self.num_scaleout_ranks != 1
         hybrid_channels = self._hybrid_num_channels(num_sms) if use_hybrid else 0
         hybrid_max_tokens_per_channel = (
@@ -627,7 +639,7 @@ class ElasticBuffer:
         sf_token_stride = int(sf.stride(0)) if sf is not None else 0
         sf_hidden_stride = int(sf.stride(1)) if sf is not None else 0
 
-        active_ranks = torch.ones(self.num_ranks, dtype=torch.int32, device=x_data.device)
+        active_ranks = self._active_ranks
         full_psum_num_recv_tokens_per_expert = (
             handle.psum_num_recv_tokens_per_expert
             if handle is not None and do_expand
@@ -719,8 +731,14 @@ class ElasticBuffer:
             if topk_weights is not None
             else None
         )
-        recv_src_metadata = torch.empty(
-            (num_recv_tokens, num_topk + 2), dtype=torch.int32, device=x_data.device
+        recv_src_metadata = (
+            handle.recv_src_metadata
+            if handle is not None
+            else torch.empty(
+                (num_recv_tokens, num_topk + 2),
+                dtype=torch.int32,
+                device=x_data.device,
+            )
         )
         event = self.runtime.dispatch(
             x_data.data_ptr(),
@@ -743,6 +761,7 @@ class ElasticBuffer:
             async_with_compute_stream,
             _native_current_stream_ptr(),
             handle is not None,
+            num_recv_tokens,
             psum_num_recv_tokens_per_scaleup_rank.data_ptr(),
             full_psum_num_recv_tokens_per_expert.data_ptr(),
             dst_buffer_slot_idx.data_ptr(),
@@ -793,25 +812,29 @@ class ElasticBuffer:
                 recv_topk_weights = recv_topk_weights[:actual_num_output_tokens]
             recv_src_metadata = recv_src_metadata[:actual_num_recv_tokens]
 
-        elastic_handle = EPHandle(
-            do_expand=do_expand,
-            num_experts=num_experts,
-            expert_alignment=expert_alignment,
-            num_max_tokens_per_rank=num_max_tokens_per_rank,
-            num_sms=num_sms,
-            topk_idx=handle.topk_idx if handle is not None else topk_idx.clone(),
-            num_recv_tokens_per_expert_list=num_recv_tokens_per_expert_list,
-            psum_num_recv_tokens_per_scaleup_rank=psum_num_recv_tokens_per_scaleup_rank,
-            psum_num_recv_tokens_per_expert=handle_psum_num_recv_tokens_per_expert,
-            recv_src_metadata=recv_src_metadata,
-            dst_buffer_slot_idx=dst_buffer_slot_idx,
-            token_metadata_at_forward=token_metadata_at_forward,
-            channel_linked_list=channel_linked_list,
-            native_handle=True,
-        )
+        elastic_handle = handle
+        if elastic_handle is None:
+            elastic_handle = EPHandle(
+                do_expand=do_expand,
+                num_experts=num_experts,
+                expert_alignment=expert_alignment,
+                num_max_tokens_per_rank=num_max_tokens_per_rank,
+                num_sms=num_sms,
+                topk_idx=topk_idx.clone(),
+                num_recv_tokens_per_expert_list=num_recv_tokens_per_expert_list,
+                psum_num_recv_tokens_per_scaleup_rank=psum_num_recv_tokens_per_scaleup_rank,
+                psum_num_recv_tokens_per_expert=handle_psum_num_recv_tokens_per_expert,
+                recv_src_metadata=recv_src_metadata,
+                dst_buffer_slot_idx=dst_buffer_slot_idx,
+                token_metadata_at_forward=token_metadata_at_forward,
+                channel_linked_list=channel_linked_list,
+                native_handle=True,
+            )
         recv_x_out = (recv_x, recv_x_scales) if recv_x_scales is not None else recv_x
-        tensors_to_record = (
-            x_data,
+        tensors_to_record = None
+        if async_with_compute_stream:
+            tensors_to_record = (
+                x_data,
             topk_idx,
             active_ranks,
             recv_x,
@@ -833,7 +856,7 @@ class ElasticBuffer:
             recv_topk_idx,
             recv_topk_weights,
             elastic_handle,
-            EventOverlap(event, tensors_to_record if async_with_compute_stream else None),
+            EventOverlap(event, tensors_to_record),
         )
 
     def combine(
@@ -850,7 +873,7 @@ class ElasticBuffer:
             raise RuntimeError("Mooncake EPHandle does not contain a native handle")
         assert x.dim() == 2 and x.is_contiguous()
         assert x.dtype == torch.bfloat16
-        active_ranks = torch.ones(self.num_ranks, dtype=torch.int32, device=x.device)
+        active_ranks = self._active_ranks
         if topk_weights is None:
             topk_weights = torch.ones_like(handle.topk_idx, dtype=torch.float32, device=x.device)
         combined_x = torch.empty(
@@ -877,8 +900,10 @@ class ElasticBuffer:
             _native_current_stream_ptr(),
             combined_x.data_ptr(),
         )
-        tensors_to_record = (
-            x,
+        tensors_to_record = None
+        if async_with_compute_stream:
+            tensors_to_record = (
+                x,
             topk_weights,
             active_ranks,
             combined_x,
@@ -893,7 +918,7 @@ class ElasticBuffer:
         return (
             combined_x,
             None,
-            EventOverlap(event, tensors_to_record if async_with_compute_stream else None),
+            EventOverlap(event, tensors_to_record),
         )
 
 

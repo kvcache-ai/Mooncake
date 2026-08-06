@@ -19,7 +19,8 @@ namespace {
 
 int64_t ceil_div_i64(int64_t x, int64_t y) { return (x + y - 1) / y; }
 
-constexpr int kElasticHybridChannelsPerSm = 4;
+constexpr int kIbgdaElasticHybridChannelsPerSm = 4;
+constexpr int kNcclElasticHybridChannelsPerSm = 8;
 
 int64_t align_i64(int64_t x, int64_t alignment) {
     return ceil_div_i64(x, alignment) * alignment;
@@ -31,21 +32,19 @@ int getenv_int(const char* name, int default_value) {
     return std::max(1, std::atoi(value));
 }
 
-int hybrid_num_channels(int num_sms) {
-    return std::max(1, num_sms) * kElasticHybridChannelsPerSm;
+int hybrid_num_channels(int num_sms, int channels_per_sm) {
+    return std::max(1, num_sms) * channels_per_sm;
 }
 
-int hybrid_num_max_tokens_per_channel(int num_max_tokens_per_rank,
-                                      int num_sms) {
-    return static_cast<int>(
-        ceil_div_i64(num_max_tokens_per_rank, hybrid_num_channels(num_sms)));
+int hybrid_num_max_tokens_per_channel(int num_max_tokens_per_rank, int num_sms,
+                                      int channels_per_sm) {
+    return static_cast<int>(ceil_div_i64(
+        num_max_tokens_per_rank,
+        hybrid_num_channels(num_sms, channels_per_sm)));
 }
 
 int64_t elastic_workspace_num_bytes() {
-    // Preserve the established host reservation and payload offset. The
-    // device layout currently uses 1024 channels, so its NCCL epoch suffix
-    // fits inside the existing 1280-channel reservation without growing or
-    // shifting the IBGDA allocation.
+    // Preserve the established host reservation and payload offset.
     constexpr int64_t kNumMaxRanks = 1024;
     constexpr int64_t kNumMaxExperts = 2048;
     constexpr int64_t kNumMaxChannels = 8 * 160;
@@ -70,19 +69,6 @@ int64_t elastic_workspace_num_bytes() {
 
 int64_t elastic_atomic_scratch_num_bytes() {
     return elastic_workspace_num_bytes();
-}
-
-int device_smem_bytes() {
-#ifdef MOONCAKE_EP_USE_MUSA
-    return 0;
-#else
-    int device = 0;
-    cudaGetDevice(&device);
-    int value = 0;
-    cudaDeviceGetAttribute(&value, cudaDevAttrMaxSharedMemoryPerBlockOptin,
-                           device);
-    return value > 0 ? value : 98304;
-#endif
 }
 
 #ifdef USE_NCCL_DEVICE
@@ -119,16 +105,18 @@ class NcclCommStream {
     cudaStream_t stream_ = nullptr;
 };
 
-int nccl_gin_context_count(int requested_count) {
-    constexpr int kDefaultGinContexts = 16;
-    constexpr int kMaxGinContexts = 64;
+int nccl_gin_context_count(int requested_count, bool allow_hybrid_mode) {
+    // Match upstream DeepEP v2: hybrid mode reserves one notify context plus
+    // 64 data contexts; direct mode reserves one notify plus 16 data contexts.
+    const int default_count = allow_hybrid_mode ? 65 : 17;
+    constexpr int kMaxGinContexts = MAX_QP_COUNT;
     const int count =
         requested_count > 0
             ? requested_count
-            : getenv_int("MOONCAKE_EP_NCCL_GIN_CONTEXTS", kDefaultGinContexts);
+            : getenv_int("MOONCAKE_EP_NCCL_GIN_CONTEXTS", default_count);
     if (count > kMaxGinContexts) {
         throw std::invalid_argument(
-            "NCCL ElasticBuffer supports at most 64 GIN contexts");
+            "NCCL ElasticBuffer GIN context count exceeds MAX_QP_COUNT");
     }
     return count;
 }
@@ -149,7 +137,8 @@ struct NcclElasticState {
     NcclCommStream comm_stream;
 
     NcclElasticState(int rank, int num_ranks, size_t bytes,
-                     int gin_context_count,
+                     int gin_context_count, bool use_rail_gin,
+                     int gin_traffic_class,
                      const std::vector<int32_t>& nccl_unique_id)
         : transport(device::createNcclDeviceTransport()),
           allocation_bytes(bytes) {
@@ -166,8 +155,14 @@ struct NcclElasticState {
         config.rank = rank;
         config.num_ranks = num_ranks;
         config.enable_gin = num_ranks > 1;
+        config.gin_connection_type =
+            use_rail_gin ? device::NcclGinConnectionType::kRail
+                         : device::NcclGinConnectionType::kFull;
         config.gin_context_count = config.enable_gin ? gin_context_count : 0;
         config.gin_exclusive_contexts = config.enable_gin;
+        config.gin_queue_depth = config.enable_gin ? 1024 : 0;
+        config.gin_signal_count = config.enable_gin ? num_ranks + 4 : 0;
+        config.gin_traffic_class = gin_traffic_class;
         config.lsa_barrier_count = 0;
         config.require_lsa_multimem = false;
         if (transport->initialize(config, nccl_unique_id) != 0) {
@@ -233,6 +228,7 @@ struct NcclElasticState {
 ElasticLaunchContext MooncakeElasticBuffer::make_launch_context(
     int64_t timeout_cycles) const {
     ElasticLaunchContext ctx;
+    ctx.device_id = device_id_;
     const auto workspace_bytes = elastic_workspace_num_bytes();
     const auto scratch_bytes = elastic_atomic_scratch_num_bytes();
 
@@ -242,12 +238,8 @@ ElasticLaunchContext MooncakeElasticBuffer::make_launch_context(
         local_base = static_cast<char*>(nccl_state_->allocation);
         ctx.backend = ElasticTransportBackend::kNccl;
         ctx.nccl.device = nccl_state_->device_context;
-        ctx.nccl.gin_signal_base = local_base + workspace_bytes;
-        ctx.nccl.world_rank = topology_.rank_idx;
-        ctx.nccl.lsa_first_rank = nccl_state_->lsa_topology.first_rank;
-        ctx.nccl.lsa_size = nccl_state_->lsa_topology.size;
-        ctx.nccl.gin_context_count = nccl_state_->properties.gin_context_count;
-        ctx.num_qps = std::max(1, ctx.nccl.gin_context_count);
+        ctx.num_qps =
+            std::max(1, nccl_state_->properties.gin_context_count);
 #else
         throw std::logic_error(
             "NCCL ElasticBuffer state exists in a non-NCCL build");
@@ -271,10 +263,9 @@ ElasticLaunchContext MooncakeElasticBuffer::make_launch_context(
         ctx.num_qps = buffer.USE_QP_COUNT;
     }
 
-    // Both backends expose one registered allocation. The first prefix is
-    // ordinary workspace. The second is IBGDA atomic-response scratch or,
-    // for NCCL, GIN-only monotonic signal storage. Payload buffers follow both
-    // prefixes so no NCCL VA signal is ever directly loaded or stored.
+    // Both backends expose one registered allocation. Keep the established
+    // workspace and IBGDA atomic-response prefix sizes for a common payload
+    // offset; NCCL does not access the second prefix.
     ctx.gdr_buffer = local_base;
     ctx.workspace = local_base;
     ctx.buffer = local_base + workspace_bytes + scratch_bytes;
@@ -342,6 +333,18 @@ MooncakeElasticBuffer::MooncakeElasticBuffer(
             "ElasticBuffer transport must be either 'ibgda' or 'nccl'");
     }
 
+    CUDA_CHECK(cudaGetDevice(&device_id_));
+    CUDA_CHECK(cudaDeviceGetAttribute(
+        &physical_num_sms_, cudaDevAttrMultiProcessorCount, device_id_));
+#ifdef MOONCAKE_EP_USE_MUSA
+    device_smem_bytes_ = 0;
+#else
+    CUDA_CHECK(cudaDeviceGetAttribute(&device_smem_bytes_,
+                                      cudaDevAttrMaxSharedMemoryPerBlockOptin,
+                                      device_id_));
+    if (device_smem_bytes_ <= 0) device_smem_bytes_ = 98304;
+#endif
+
     config_.num_max_tokens_per_rank = num_max_tokens_per_rank;
     config_.hidden = hidden;
     config_.num_topk = num_topk;
@@ -366,10 +369,11 @@ MooncakeElasticBuffer::MooncakeElasticBuffer(
 
     if (transport_ == "nccl") {
 #ifdef USE_NCCL_DEVICE
-        const int context_count = nccl_gin_context_count(num_allocated_qps);
+        const int context_count =
+            nccl_gin_context_count(num_allocated_qps, allow_hybrid_mode);
         nccl_state_ = std::make_unique<NcclElasticState>(
             rank, num_ranks, static_cast<size_t>(num_buffer_bytes),
-            context_count, nccl_unique_id);
+            context_count, allow_hybrid_mode, sl_idx, nccl_unique_id);
         const auto& properties = nccl_state_->properties;
         const auto& lsa = nccl_state_->lsa_topology;
         const bool local_lsa_topology_valid =
@@ -385,23 +389,6 @@ MooncakeElasticBuffer::MooncakeElasticBuffer(
                 "NCCL LSA membership on one or more ranks is not a "
                 "contiguous, equal-sized EP local team; reorder "
                 "process-group ranks by node/device");
-        }
-
-        bool local_gin_signal_capacity_valid =
-            properties.gin_context_count >= 0;
-        if (properties.gin_context_count > 0) {
-            local_gin_signal_capacity_valid =
-                num_ranks <= elastic::layout::WorkspaceLayout::kNumMaxRanks &&
-                properties.gin_context_count <= MAX_QP_COUNT &&
-                elastic::layout::GinSignalLayout::get_num_bytes(
-                    num_ranks, properties.gin_context_count) <=
-                    elastic_atomic_scratch_num_bytes();
-        }
-        if (!nccl_state_->transport->allRanksSucceeded(
-                local_gin_signal_capacity_valid)) {
-            throw std::runtime_error(
-                "NCCL GIN signal storage on one or more ranks exceeds the "
-                "reserved EP prefix");
         }
 
         topology_.rank_idx = rank;
@@ -719,7 +706,8 @@ std::optional<EventHandle> MooncakeElasticBuffer::dispatch(
     uint64_t active_ranks_ptr, int num_experts, int num_max_tokens_per_rank,
     int expert_alignment, int num_sms, bool do_expand,
     bool async_with_compute_stream, uint64_t compute_stream_ptr,
-    bool cached_mode, uint64_t psum_num_recv_tokens_per_scaleup_rank_ptr,
+    bool cached_mode, int num_recv_tokens,
+    uint64_t psum_num_recv_tokens_per_scaleup_rank_ptr,
     uint64_t psum_num_recv_tokens_per_expert_ptr,
     uint64_t dst_buffer_slot_idx_ptr, uint64_t token_metadata_at_forward_ptr,
     uint64_t channel_linked_list_ptr, uint64_t recv_x_ptr,
@@ -735,15 +723,24 @@ std::optional<EventHandle> MooncakeElasticBuffer::dispatch(
     // tokens forwarded from every scale-out rank, so the conservative output
     // capacity and sentinel must cover the full logical world, not just the
     // intra-node scale-up domain.
-    const int num_recv_tokens = num_max_tokens_per_rank * topology_.num_ranks;
-    const int num_smem_bytes = device_smem_bytes();
+    const int max_num_recv_tokens =
+        num_max_tokens_per_rank * topology_.num_ranks;
+    EP_HOST_ASSERT(num_recv_tokens >= 0 &&
+                   num_recv_tokens <= max_num_recv_tokens);
+    EP_HOST_ASSERT(cached_mode || num_recv_tokens == max_num_recv_tokens);
+    const int num_smem_bytes = device_smem_bytes_;
     const int num_channels_per_sm = 1;
     const int num_channels = num_sms * num_channels_per_sm;
     const bool use_hybrid = topology_.num_scaleout_ranks != 1;
-    const int hybrid_channels = use_hybrid ? hybrid_num_channels(num_sms) : 0;
+    const int hybrid_channels_per_sm =
+        using_nccl() ? kNcclElasticHybridChannelsPerSm
+                     : kIbgdaElasticHybridChannelsPerSm;
+    const int hybrid_channels =
+        use_hybrid ? hybrid_num_channels(num_sms, hybrid_channels_per_sm) : 0;
     const int hybrid_max_tokens_per_channel =
-        use_hybrid ? hybrid_num_max_tokens_per_channel(num_max_tokens_per_rank,
-                                                       num_sms)
+        use_hybrid ? hybrid_num_max_tokens_per_channel(
+                         num_max_tokens_per_rank, num_sms,
+                         hybrid_channels_per_sm)
                    : 0;
 
     EP_HOST_ASSERT(x_ptr != 0 && topk_idx_ptr != 0 && active_ranks_ptr != 0);
@@ -816,7 +813,7 @@ std::optional<EventHandle> MooncakeElasticBuffer::dispatch(
         num_max_tokens_per_rank, hidden, x_element_size, num_sf_packs,
         sf_token_stride, sf_hidden_stride, num_experts, num_topk,
         expert_alignment, num_sms,
-        use_hybrid ? kElasticHybridChannelsPerSm : num_channels_per_sm,
+        use_hybrid ? hybrid_channels_per_sm : num_channels_per_sm,
         num_smem_bytes, cached_mode, config_.deterministic, false, launch_ctx,
         launch_stream);
 
@@ -831,7 +828,8 @@ std::optional<EventHandle> MooncakeElasticBuffer::dispatch(
         recv_src_metadata, channel_linked_list, num_recv_tokens,
         num_max_tokens_per_rank, hidden, x_element_size, num_sf_packs,
         recv_sf_token_stride, recv_sf_hidden_stride, num_experts, num_topk,
-        num_sms, num_smem_bytes, use_hybrid ? hybrid_channels : num_channels,
+        num_sms, physical_num_sms_, num_smem_bytes,
+        use_hybrid ? hybrid_channels : num_channels,
         do_expand, cached_mode, launch_ctx,
         psum_num_recv_tokens_per_scaleup_rank,
         epilogue_psum_num_recv_tokens_per_expert, launch_stream);
@@ -872,10 +870,14 @@ std::optional<EventHandle> MooncakeElasticBuffer::combine(
     auto* active_ranks = reinterpret_cast<int*>(active_ranks_ptr);
     void* combined_x = reinterpret_cast<void*>(combined_x_ptr);
 
-    const int num_smem_bytes = device_smem_bytes();
+    const int num_smem_bytes = device_smem_bytes_;
     const int num_channels = std::max(1, num_sms);
     const bool use_hybrid = topology_.num_scaleout_ranks != 1;
-    const int hybrid_channels = use_hybrid ? hybrid_num_channels(num_sms) : 0;
+    const int hybrid_channels_per_sm =
+        using_nccl() ? kNcclElasticHybridChannelsPerSm
+                     : kIbgdaElasticHybridChannelsPerSm;
+    const int hybrid_channels =
+        use_hybrid ? hybrid_num_channels(num_sms, hybrid_channels_per_sm) : 0;
     auto compute_stream_raw =
         reinterpret_cast<cudaStream_t>(compute_stream_ptr);
     auto launch_stream = communication_stream();
@@ -897,7 +899,8 @@ std::optional<EventHandle> MooncakeElasticBuffer::combine(
     launch_mooncake_elastic_combine_reduce_epilogue(
         combined_x, topk_weights, topk_idx, num_combined_tokens,
         num_max_tokens_per_rank, hidden, num_experts, num_topk, reduce_buffer,
-        nullptr, nullptr, num_sms, num_smem_bytes, do_expand,
+        nullptr, nullptr, num_sms, physical_num_sms_, num_smem_bytes,
+        do_expand,
         config_.allow_multiple_reduction, launch_ctx, launch_stream);
 
     (void)active_ranks;
