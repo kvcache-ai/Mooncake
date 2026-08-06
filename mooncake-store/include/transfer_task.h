@@ -4,10 +4,11 @@
  *
  * @File:mooncake-store/include/transfer_task.h
  *
- * 修改履历 | 2026-07-31 | TransferSubmitter 新增 ~TransferSubmitter + nof_handle_cache_
- *                       per-client 连接缓存，析构时释放 handle 回收 QID
- * 修改履历 | 2026-08-03 | SpdkNofWorkerPool 新增任务队列流控 (max_queue_depth)；
- *                       SpdkNofQos 新增 UpdateInflightLimit 自适应 inflight（本 PR）
+ * 修改履历 | 2026-07-31 | TransferSubmitter 新增 ~TransferSubmitter +
+ * nof_handle_cache_ per-client 连接缓存，析构时释放 handle 回收 QID 修改履历 |
+ * 2026-08-03 | SpdkNofWorkerPool 新增任务队列流控 (max_queue_depth)；
+ *                       SpdkNofQos 新增 UpdateInflightLimit 自适应 inflight（本
+ * PR）
  */
 #pragma once
 
@@ -638,8 +639,9 @@ class TransferSubmitter {
 #ifdef USE_NOF
     std::unique_ptr<SpdkNofWorkerPool> spdk_nvmf_pool_;
     // [Added 2026-07-31] Per-TransferSubmitter handle 缓存。
-    // 每个 client 独立缓存其 nof_seg_handle，同一 client 内多次 put() 复用同一连接。
-    // 不跨 TransferSubmitter 共享，避免多 WorkerPool 并发访问同一 SPDK qpair 池。
+    // 每个 client 独立缓存其 nof_seg_handle，同一 client 内多次 put()
+    // 复用同一连接。 不跨 TransferSubmitter 共享，避免多 WorkerPool
+    // 并发访问同一 SPDK qpair 池。
     std::map<std::string, nof_seg_handle*> nof_handle_cache_;
 #endif
     std::unique_ptr<FilereadWorkerPool> fileread_pool_;

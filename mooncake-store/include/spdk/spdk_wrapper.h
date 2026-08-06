@@ -5,13 +5,14 @@
  * @File:mooncake-store/include/spdk/spdk_wrapper.h
  *
  * 修改履历 | 2026-07-31 | spdk_wrapper.h — 重写
- * 修改履历 | 2026-07-31 | 新增 CloseNofSegment；ProbeNofSegment 改用独立临时连接，心跳线程
- *                       不与 Worker 共享 qpair，防止 QID 泄漏 + SPDK 单线程约束违反
- * 修改履历 | 2026-07-31 | OpenNofSegment 新增 connect_mutex_ 序列化 spdk_nvme_probe()，
- *                       防止多线程并发 probe 导致 namespace_inactive
- * 修改履历 | 2026-07-31 | 新增 g_active_worker_count 全局计数器 + SpdkNoF_Register/Unregister
- *                       自由函数；Cleanup 中 LOG(FATAL) 检测静态析构顺序错误
- * 修改履历 | 2026-08-03 | 新增 QidPressureGauge 全局压力感知器 + config_probe_ 探测独立配置（本 PR）
+ * 修改履历 | 2026-07-31 | 新增 CloseNofSegment；ProbeNofSegment
+ * 改用独立临时连接，心跳线程 不与 Worker 共享 qpair，防止 QID 泄漏 + SPDK
+ * 单线程约束违反 修改履历 | 2026-07-31 | OpenNofSegment 新增 connect_mutex_
+ * 序列化 spdk_nvme_probe()， 防止多线程并发 probe 导致 namespace_inactive
+ * 修改履历 | 2026-07-31 | 新增 g_active_worker_count 全局计数器 +
+ * SpdkNoF_Register/Unregister 自由函数；Cleanup 中 LOG(FATAL)
+ * 检测静态析构顺序错误 修改履历 | 2026-08-03 | 新增 QidPressureGauge
+ * 全局压力感知器 + config_probe_ 探测独立配置（本 PR）
  */
 #pragma once
 #include <atomic>
@@ -31,7 +32,6 @@
 #include "nof_connection.h"
 #include "nof_segment.h"
 
-
 namespace mooncake {
 
 #define INVALID_BLOCK_SIZE 0xFFFFFFFF
@@ -40,7 +40,8 @@ constexpr int kSpdkNofOpRead = 0;
 constexpr int kSpdkNofOpWrite = 1;
 constexpr int kSpdkNofOpNum = 2;
 
-// [Migrated] tr_info / ctrlr_info 前向声明已移除，传输解析由 NofConnection::Connect() 内部处理。
+// [Migrated] tr_info / ctrlr_info 前向声明已移除，传输解析由
+// NofConnection::Connect() 内部处理。
 struct nof_seg_handle;
 
 /**
@@ -68,7 +69,8 @@ class QidPressureGauge {
     /// @param allocated  实际分配到的 qpair 数。
     void Record(uint32_t requested, uint32_t allocated) {
         if (requested == 0) return;
-        size_t idx = write_idx_.fetch_add(1, std::memory_order_relaxed) % kWindowSize;
+        size_t idx =
+            write_idx_.fetch_add(1, std::memory_order_relaxed) % kWindowSize;
         window_[idx].requested = requested;
         window_[idx].allocated = allocated;
     }
@@ -77,9 +79,9 @@ class QidPressureGauge {
     /// @return 0=绿灯(>75% 获取率), 1=黄灯(50-75%), 2=红灯(<50%)。
     int GetPressureLevel() const {
         double ratio = GetAverageRatio();
-        if (ratio > 0.75) return 0;   // Green: healthy
-        if (ratio > 0.50) return 1;   // Yellow: moderate pressure
-        return 2;                      // Red: severe pressure
+        if (ratio > 0.75) return 0;  // Green: healthy
+        if (ratio > 0.50) return 1;  // Yellow: moderate pressure
+        return 2;                    // Red: severe pressure
     }
 
     /// 根据压力等级，返回建议的新连接 qpair 请求数。
@@ -178,11 +180,11 @@ class SpdkWrapper {
     QidPressureGauge qid_pressure_gauge_;
 
     // 新增 API
-    void SetConfig(const NofConfig&);
+    void SetConfig(const NofConfig &);
     const NofConfig &GetConfig() const { return config_; }
-    ssize_t PipelineRead(nof_seg_handle*, void*, uint64_t, uint32_t);
-    ssize_t PipelineWrite(nof_seg_handle*, const void*, uint64_t, uint32_t);
-    
+    ssize_t PipelineRead(nof_seg_handle *, void *, uint64_t, uint32_t);
+    ssize_t PipelineWrite(nof_seg_handle *, const void *, uint64_t, uint32_t);
+
     uint32_t GetBlockSize(const nof_seg_handle *seg_handle);
 
     int SubmitRequest(const nof_seg_handle *seg_handle, void *ptr, uint64_t lba,
@@ -223,7 +225,8 @@ class SpdkWrapper {
     explicit SpdkWrapper();
     ~SpdkWrapper();
 
-    // [Removed] ParseTransPortStr / ConnectController — 新设计由 NofConnection::Connect() 统一处理。
+    // [Removed] ParseTransPortStr / ConnectController — 新设计由
+    // NofConnection::Connect() 统一处理。
     ProbeBuffer *GetOrCreateProbeBuffer(const std::string &tr_str,
                                         uint32_t block_size,
                                         std::string *error_reason);
@@ -234,7 +237,8 @@ class SpdkWrapper {
 
     std::atomic<bool> initialized{false};
     std::mutex init_mutex;
-    // [Removed] connected_ctrlrs / ctrlrs_mutex — 新设计使用 open_segments_ 管理连接。
+    // [Removed] connected_ctrlrs / ctrlrs_mutex — 新设计使用 open_segments_
+    // 管理连接。
     std::map<std::string, std::unique_ptr<ProbeBuffer>> probe_buffers_;
     std::mutex probe_buffers_mutex_;
     std::vector<std::unique_ptr<ProbeRequestContext>> probe_request_contexts_;

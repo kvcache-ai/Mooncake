@@ -91,9 +91,10 @@ class NofSegment {
 
    private:
     /// Common pipeline loop (read or write).
-    ssize_t PipelineIO(void *buf, uint64_t lba, uint32_t total_blocks, bool is_write);
+    ssize_t PipelineIO(void *buf, uint64_t lba, uint32_t total_blocks,
+                       bool is_write);
 
-    NofConnection *conn_;    // non-owning
+    NofConnection *conn_;  // non-owning
     uint64_t start_lba_;
     uint64_t num_blocks_;
     NofConfig config_;

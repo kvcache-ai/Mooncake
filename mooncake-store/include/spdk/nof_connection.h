@@ -6,7 +6,8 @@
  * @Description: NofQpairPool + NofConnection 类声明
  *
  * 修改履历 | 2026-07-31 | 初始多 qpair 实现
- * 修改履历 | 2026-08-03 | NofQpairPool 新增 TryGrow/GetTargetCount 支持再均衡（本 PR）
+ * 修改履历 | 2026-08-03 | NofQpairPool 新增 TryGrow/GetTargetCount
+ * 支持再均衡（本 PR）
  */
 #pragma once
 
@@ -58,12 +59,20 @@ class NofQpairPool {
     int32_t PollAll(uint32_t max_completions = 0);
 
     /// Inflight tracking for pipeline flow control.
-    void IncrementInflight() { inflight_count_.fetch_add(1, std::memory_order_relaxed); }
-    void DecrementInflight() { inflight_count_.fetch_sub(1, std::memory_order_relaxed); }
-    int32_t InflightCount() const { return inflight_count_.load(std::memory_order_relaxed); }
+    void IncrementInflight() {
+        inflight_count_.fetch_add(1, std::memory_order_relaxed);
+    }
+    void DecrementInflight() {
+        inflight_count_.fetch_sub(1, std::memory_order_relaxed);
+    }
+    int32_t InflightCount() const {
+        return inflight_count_.load(std::memory_order_relaxed);
+    }
 
     size_t Size() const { return qpairs_.size(); }
-    uint32_t MaxInflight() const { return static_cast<uint32_t>(qpairs_.size()) * max_inflight_per_qpair_; }
+    uint32_t MaxInflight() const {
+        return static_cast<uint32_t>(qpairs_.size()) * max_inflight_per_qpair_;
+    }
 
     /**
      * @brief 尝试向池中追加 qpair 直到达到 target_total。
@@ -108,18 +117,14 @@ class NofConnection {
     /// Connect to an NVMe-oF target.
     /// @return nullptr on failure (error_msg receives a description).
     static std::unique_ptr<NofConnection> Connect(
-        const std::string &traddr,
-        const std::string &trsvcid,
-        const std::string &subnqn,
-        uint32_t ns_id,
-        const NofConfig &config,
+        const std::string &traddr, const std::string &trsvcid,
+        const std::string &subnqn, uint32_t ns_id, const NofConfig &config,
         std::string *error_msg = nullptr);
 
     /// Connect from a transport string.
     /// Format: "traddr:X trsvcid:Y subnqn:Z trtype:RDMA adrfam:IPv4 ns:N"
     static std::unique_ptr<NofConnection> Connect(
-        const std::string &transport_str,
-        const NofConfig &config,
+        const std::string &transport_str, const NofConfig &config,
         std::string *error_msg = nullptr);
 
     ~NofConnection();
@@ -139,9 +144,8 @@ class NofConnection {
 
    private:
     NofConnection(spdk_nvme_ctrlr *ctrlr, spdk_nvme_ns *ns,
-                  std::unique_ptr<NofQpairPool> pool,
-                  uint32_t block_size, uint64_t num_blocks,
-                  std::string subnqn, NofConfig config);
+                  std::unique_ptr<NofQpairPool> pool, uint32_t block_size,
+                  uint64_t num_blocks, std::string subnqn, NofConfig config);
 
     spdk_nvme_ctrlr *ctrlr_;
     spdk_nvme_ns *ns_;

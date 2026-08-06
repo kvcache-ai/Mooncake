@@ -5,12 +5,13 @@
  * @File:mooncake-store/src/spdk/spdk_wrapper.cpp
  *
  * 修改履历 | 2026-07-31 | spdk_wrapper.h — 重写
- * 修改履历 | 2026-07-31 | 新增 CloseNofSegment；ProbeNofSegment 改用独立临时连接防止 QID 泄漏
- * 修改履历 | 2026-07-31 | OpenNofSegment 新增 connect_mutex_ 序列化 spdk_nvme_probe
- * 修改履历 | 2026-07-31 | 新增 g_active_worker_count 全局计数器 + SpdkNoF_Register/Unregister；
- *                       Cleanup 中 LOG(FATAL) 检测 WorkerPool 未 join 时的错误析构顺序
- * 修改履历 | 2026-08-03 | OpenNofSegment 接入 QidPressureGauge 自适应 qpair 数；
- *                       ProbeNofSegment 改用 config_probe_ (num_io_queues=1)（本 PR）
+ * 修改履历 | 2026-07-31 | 新增 CloseNofSegment；ProbeNofSegment
+ * 改用独立临时连接防止 QID 泄漏 修改履历 | 2026-07-31 | OpenNofSegment 新增
+ * connect_mutex_ 序列化 spdk_nvme_probe 修改履历 | 2026-07-31 | 新增
+ * g_active_worker_count 全局计数器 + SpdkNoF_Register/Unregister； Cleanup 中
+ * LOG(FATAL) 检测 WorkerPool 未 join 时的错误析构顺序 修改履历 | 2026-08-03 |
+ * OpenNofSegment 接入 QidPressureGauge 自适应 qpair 数； ProbeNofSegment 改用
+ * config_probe_ (num_io_queues=1)（本 PR）
  */
 #include <glog/logging.h>
 
@@ -167,16 +168,18 @@ bool SpdkWrapper::InitializeEnv() {
 void SpdkWrapper::Cleanup() {
     if (initialized.load(std::memory_order_acquire)) {
         // [Diagnostic] 2026-07-31：检测错误的销毁顺序。
-        // g_active_worker_count 为文件级全局变量，不依赖 SpdkWrapper 单例生命周期。
-        // 若 >0，说明 WorkerPool 尚未析构（workers 未 join），
+        // g_active_worker_count 为文件级全局变量，不依赖 SpdkWrapper
+        // 单例生命周期。 若 >0，说明 WorkerPool 尚未析构（workers 未 join），
         // 此时释放 qpair 会导致 worker 线程 poll 已释放内存 → segfault。
         int alive = g_active_worker_count.load(std::memory_order_relaxed);
         if (alive > 0) {
-            LOG(FATAL) << "SpdkWrapper::Cleanup() called while "
-                       << alive << " SpdkNofWorkerPool instance(s) still active. "
-                       << "WorkerPool must be fully stopped and joined BEFORE Cleanup. "
-                       << "Check static destruction order — SpdkWrapper must outlive "
-                       << "all SpdkNofWorkerPool instances.";
+            LOG(FATAL)
+                << "SpdkWrapper::Cleanup() called while " << alive
+                << " SpdkNofWorkerPool instance(s) still active. "
+                << "WorkerPool must be fully stopped and joined BEFORE "
+                   "Cleanup. "
+                << "Check static destruction order — SpdkWrapper must outlive "
+                << "all SpdkNofWorkerPool instances.";
         }
 
         // [Migrated] 清理新设计的 open_segments_：
@@ -186,13 +189,16 @@ void SpdkWrapper::Cleanup() {
             std::lock_guard<std::mutex> lock(segments_mutex_);
             for (auto &[handle, conn] : open_segments_) {
                 if (handle) {
-                    delete handle->segment;  // NofSegment* 由 OpenNofSegment new 分配
-                    delete handle;           // nof_seg_handle* 由 OpenNofSegment new 分配
+                    delete handle
+                        ->segment;  // NofSegment* 由 OpenNofSegment new 分配
+                    delete handle;  // nof_seg_handle* 由 OpenNofSegment new
+                                    // 分配
                 }
-                // conn (unique_ptr<NofConnection>) 自动析构，释放 qpair 池并 detach ctrlr
+                // conn (unique_ptr<NofConnection>) 自动析构，释放 qpair 池并
+                // detach ctrlr
             }
             open_segments_.clear();
-            endpoint_to_handle_.clear();     // 清理反向去重索引
+            endpoint_to_handle_.clear();  // 清理反向去重索引
         }
 
         {
@@ -284,15 +290,15 @@ int64_t SpdkWrapper::NvmePollProcessCompletion(nof_seg_handle *seg,
 
 // OpenNofSegment: 使用新层连接。
 // 修改履历 2026-07-31：新增 endpoint→handle 去重 (已移除 I/O 路径复用，见下)。
-// 修改履历 2026-07-31：spdk_nvme_probe 非线程安全 — 新增 connect_mutex_ 序列化。
-// 修改履历 2026-07-31：移除 I/O 路径连接复用。
+// 修改履历 2026-07-31：spdk_nvme_probe 非线程安全 — 新增 connect_mutex_
+// 序列化。 修改履历 2026-07-31：移除 I/O 路径连接复用。
 //   原因：多个 ClientService 各自持有独立的 SpdkNofWorkerPool。
 //   若复用同一 handle，多个 WorkerPool 的 worker 线程会并发访问同一 qpair 池，
 //   互相收割对方的 completion 导致 inflight 计数器下溢。
 //   SPDK qpair 单线程约束要求每 handle 仅被一个 WorkerPool 使用。
 //   每个 client 持有独立连接，4 clients × 4 qpairs = 20 QID (远低于 64 上限)。
 nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str) {
-   if (!InitializeEnv()) return nullptr;
+    if (!InitializeEnv()) return nullptr;
 
     // 修改履历 | 2026-08-03 | 自适应 + 重试移出 connect_mutex_（本 PR）
     // - 每次重试前重新 GetRecommended()，感知并发 Client 的失败事件
@@ -333,16 +339,16 @@ nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str) {
 
         auto wait_ms = config_.retry_backoff_ms * (1 << attempt);
         LOG(WARNING) << "SpdkWrapper::OpenNofSegment: QID exhausted"
-                     << " (target=" << current_target
-                     << "), waiting " << wait_ms << "ms"
+                     << " (target=" << current_target << "), waiting "
+                     << wait_ms << "ms"
                      << " (attempt " << (attempt + 1) << "/" << max_retries
                      << ") for " << tr_str;
         std::this_thread::sleep_for(std::chrono::milliseconds(wait_ms));
     }
 
     if (!conn) {
-        LOG(ERROR) << "SpdkWrapper::OpenNofSegment failed for "
-                   << tr_str << ": " << error;
+        LOG(ERROR) << "SpdkWrapper::OpenNofSegment failed for " << tr_str
+                   << ": " << error;
         return nullptr;
     }
 
@@ -381,16 +387,18 @@ void SpdkWrapper::CloseNofSegment(nof_seg_handle *handle) {
     }
 
     // 清理反向索引：遍历 endpoint_to_handle_ 找到指向此 handle 的条目并移除。
-    for (auto ei = endpoint_to_handle_.begin(); ei != endpoint_to_handle_.end(); ++ei) {
+    for (auto ei = endpoint_to_handle_.begin(); ei != endpoint_to_handle_.end();
+         ++ei) {
         if (ei->second == handle) {
             endpoint_to_handle_.erase(ei);
             break;
         }
     }
 
-    delete handle->segment;          // NofSegment* 由 OpenNofSegment new 分配
-    delete handle;                   // nof_seg_handle* 由 OpenNofSegment new 分配
-    open_segments_.erase(it);        // unique_ptr<NofConnection> 析构 → qpair pool → ctrlr detach
+    delete handle->segment;  // NofSegment* 由 OpenNofSegment new 分配
+    delete handle;           // nof_seg_handle* 由 OpenNofSegment new 分配
+    open_segments_.erase(
+        it);  // unique_ptr<NofConnection> 析构 → qpair pool → ctrlr detach
 }
 
 // [Migrated] 通过 NofSegment 获取 block size，替代旧版直接访问 seg_handle->ns。
@@ -404,7 +412,7 @@ uint32_t SpdkWrapper::GetBlockSize(const nof_seg_handle *seg_handle) {
 int SpdkWrapper::SubmitRequest(const nof_seg_handle *seg_handle, void *ptr,
                                uint64_t lba, uint32_t lba_count, int op,
                                spdk_nvme_cmd_cb cb_fn, void *cb_ctx) {
-     if (!seg_handle || !seg_handle->segment) return -1;
+    if (!seg_handle || !seg_handle->segment) return -1;
 
     auto *seg = seg_handle->segment;
     if (op == kSpdkNofOpRead)
@@ -444,10 +452,11 @@ SpdkWrapper::ProbeBuffer *SpdkWrapper::GetOrCreateProbeBuffer(
     return probe_buffer.get();
 }
 
-// 修改履历 2026-07-31：重写为直接使用 NofConnection::Connect() 创建独立临时连接。
-// 不经过 OpenNofSegment（I/O 路径共享连接），不加入 open_segments_，
-// 不与 Worker 线程共享 qpair — 避免违反 SPDK qpair 单线程约束。
-// 函数返回时 NofConnection 自动析构 → qpair pool free → ctrlr detach → QID 回收。
+// 修改履历 2026-07-31：重写为直接使用 NofConnection::Connect()
+// 创建独立临时连接。 不经过 OpenNofSegment（I/O 路径共享连接），不加入
+// open_segments_， 不与 Worker 线程共享 qpair — 避免违反 SPDK qpair
+// 单线程约束。 函数返回时 NofConnection 自动析构 → qpair pool free → ctrlr
+// detach → QID 回收。
 bool SpdkWrapper::ProbeNofSegment(const std::string &tr_str,
                                   uint32_t timeout_ms,
                                   std::string *error_reason) {
@@ -489,8 +498,8 @@ bool SpdkWrapper::ProbeNofSegment(const std::string &tr_str,
     }
 
     ProbeRequestContext *probe_ctx = AcquireProbeRequestContext();
-    int ret = SubmitRequest(&seg_handle, probe_buffer->ptr, 0, 1, kSpdkNofOpRead,
-                            ProbeReadComplete, probe_ctx);
+    int ret = SubmitRequest(&seg_handle, probe_buffer->ptr, 0, 1,
+                            kSpdkNofOpRead, ProbeReadComplete, probe_ctx);
     if (ret != 0) {
         RecycleProbeRequestContext(probe_ctx);
         if (error_reason) {
@@ -521,15 +530,13 @@ bool SpdkWrapper::ProbeNofSegment(const std::string &tr_str,
     }
 
     // conn 出作用域自动析构：
-    //   ~NofConnection() → ~NofQpairPool() → free io qpairs → spdk_nvme_detach()
-    //   16+1 QID 全部回收，无泄漏。
+    //   ~NofConnection() → ~NofQpairPool() → free io qpairs →
+    //   spdk_nvme_detach() 16+1 QID 全部回收，无泄漏。
     return ok;
 }
 
 // [Migrated] 新增方法：SetConfig / PipelineRead / PipelineWrite 桩实现。
-void SpdkWrapper::SetConfig(const NofConfig &config) {
-    config_ = config;
-}
+void SpdkWrapper::SetConfig(const NofConfig &config) { config_ = config; }
 
 ssize_t SpdkWrapper::PipelineRead(nof_seg_handle *handle, void *buf,
                                   uint64_t lba, uint32_t total_blocks) {

@@ -30,8 +30,7 @@ namespace mooncake {
 
 NofQpairPool::NofQpairPool(std::vector<spdk_nvme_qpair *> qpairs,
                            uint32_t max_inflight_per_qpair,
-                           uint32_t target_count,
-                           spdk_nvme_ctrlr *ctrlr)
+                           uint32_t target_count, spdk_nvme_ctrlr *ctrlr)
     : qpairs_(std::move(qpairs)),
       max_inflight_per_qpair_(max_inflight_per_qpair),
       target_count_(target_count > 0 ? target_count
@@ -54,10 +53,13 @@ spdk_nvme_qpair *NofQpairPool::GetNextQpair() {
 int32_t NofQpairPool::PollAll(uint32_t max_completions) {
     int32_t total = 0;
     for (auto *qp : qpairs_) {
-        int32_t n = spdk_nvme_qpair_process_completions(qp, max_completions == 0 ? 0 : (max_completions - total));
+        int32_t n = spdk_nvme_qpair_process_completions(
+            qp, max_completions == 0 ? 0 : (max_completions - total));
         if (n < 0) return n;
         total += n;
-        if (max_completions > 0 && static_cast<uint32_t>(total) >= max_completions) break;
+        if (max_completions > 0 &&
+            static_cast<uint32_t>(total) >= max_completions)
+            break;
     }
     return total;
 }
@@ -91,8 +93,8 @@ uint32_t NofQpairPool::TryGrow(uint32_t target_total) {
     if (added > 0) {
         LOG(INFO) << "[NofQpairPool] Rebalanced: grew from "
                   << (qpairs_.size() - added) << " to " << qpairs_.size()
-                  << " qpairs (target=" << target_total
-                  << ", recovered " << added << " qpairs after peer disconnect)";
+                  << " qpairs (target=" << target_total << ", recovered "
+                  << added << " qpairs after peer disconnect)";
     }
 
     return added;
@@ -121,10 +123,9 @@ static std::atomic<uint32_t> g_hostnqn_counter{0};
 
 /// Parse a transport string into (traddr, trsvcid, subnqn, trtype, ns).
 /// Returns 0 on success, -1 on parse error.
-int ParseTransportStr(const std::string &tr_str,
-                       std::string &traddr, std::string &trsvcid,
-                       std::string &subnqn, std::string &trtype,
-                       uint32_t &ns) {
+int ParseTransportStr(const std::string &tr_str, std::string &traddr,
+                      std::string &trsvcid, std::string &subnqn,
+                      std::string &trtype, uint32_t &ns) {
     struct spdk_nvme_transport_id trid;
     std::memset(&trid, 0, sizeof(trid));
     if (spdk_nvme_transport_id_parse(&trid, tr_str.c_str()) != 0) return -1;
@@ -138,7 +139,8 @@ int ParseTransportStr(const std::string &tr_str,
     ns = 1;
     auto ns_pos = tr_str.find("ns:");
     if (ns_pos != std::string::npos) {
-        ns = static_cast<uint32_t>(std::strtoul(tr_str.c_str() + ns_pos + 3, nullptr, 10));
+        ns = static_cast<uint32_t>(
+            std::strtoul(tr_str.c_str() + ns_pos + 3, nullptr, 10));
     }
     return 0;
 }
@@ -150,12 +152,16 @@ int ParseTransportStr(const std::string &tr_str,
 // ===================================================================
 
 NofConnection::NofConnection(spdk_nvme_ctrlr *ctrlr, spdk_nvme_ns *ns,
-                               std::unique_ptr<NofQpairPool> pool,
-                               uint32_t block_size, uint64_t num_blocks,
-                               std::string subnqn, NofConfig config)
-    : ctrlr_(ctrlr), ns_(ns), qpair_pool_(std::move(pool)),
-      block_size_(block_size), num_blocks_(num_blocks),
-      subnqn_(std::move(subnqn)), config_(std::move(config)) {}
+                             std::unique_ptr<NofQpairPool> pool,
+                             uint32_t block_size, uint64_t num_blocks,
+                             std::string subnqn, NofConfig config)
+    : ctrlr_(ctrlr),
+      ns_(ns),
+      qpair_pool_(std::move(pool)),
+      block_size_(block_size),
+      num_blocks_(num_blocks),
+      subnqn_(std::move(subnqn)),
+      config_(std::move(config)) {}
 
 NofConnection::~NofConnection() {
     // QpairPool destructor frees all qpairs.
@@ -168,13 +174,9 @@ NofConnection::~NofConnection() {
 
 // static
 std::unique_ptr<NofConnection> NofConnection::Connect(
-    const std::string &traddr,
-    const std::string &trsvcid,
-    const std::string &subnqn,
-    uint32_t ns_id,
-    const NofConfig &config,
+    const std::string &traddr, const std::string &trsvcid,
+    const std::string &subnqn, uint32_t ns_id, const NofConfig &config,
     std::string *error_msg) {
-
     // Build transport ID
     struct spdk_nvme_transport_id trid;
     std::memset(&trid, 0, sizeof(trid));
@@ -211,7 +213,8 @@ std::unique_ptr<NofConnection> NofConnection::Connect(
                  "nqn.2024-08.mooncake:c%u", pctx->hostnqn_id);
 
         if (cfg.transport_ack_timeout > 0)
-            opts->transport_ack_timeout = static_cast<uint8_t>(cfg.transport_ack_timeout);
+            opts->transport_ack_timeout =
+                static_cast<uint8_t>(cfg.transport_ack_timeout);
         if (cfg.admin_queue_size > 0)
             opts->admin_queue_size = cfg.admin_queue_size;
         if (cfg.fabrics_connect_timeout_us > 0)
@@ -219,9 +222,8 @@ std::unique_ptr<NofConnection> NofConnection::Connect(
         opts->header_digest = cfg.header_digest;
         opts->data_digest = cfg.data_digest;
 
-        LOG(INFO) << "[NofConnection] Attaching to " << trid->traddr
-                  << " " << trid->subnqn
-                  << " num_io_queues=" << opts->num_io_queues;
+        LOG(INFO) << "[NofConnection] Attaching to " << trid->traddr << " "
+                  << trid->subnqn << " num_io_queues=" << opts->num_io_queues;
         return true;
     };
 
@@ -283,16 +285,14 @@ std::unique_ptr<NofConnection> NofConnection::Connect(
             if (requested == min_required) {
                 *error_msg = "qpair_alloc_fail: all allocations failed";
             } else {
-                *error_msg =
-                    "qpair_alloc_fail: got " +
-                    std::to_string(qpairs.size()) + " (min=" +
-                    std::to_string(min_required) +
-                    ", target=" + std::to_string(requested) + ")";
+                *error_msg = "qpair_alloc_fail: got " +
+                             std::to_string(qpairs.size()) +
+                             " (min=" + std::to_string(min_required) +
+                             ", target=" + std::to_string(requested) + ")";
             }
         }
-        LOG(ERROR) << "[NofConnection] QID exhaustion: 0 qpairs for "
-                   << subnqn << " (target=" << requested
-                   << ", min=" << min_required
+        LOG(ERROR) << "[NofConnection] QID exhaustion: 0 qpairs for " << subnqn
+                   << " (target=" << requested << ", min=" << min_required
                    << ") — target QID pool likely exhausted";
         spdk_nvme_detach(ctx.ctrlr);
         return nullptr;
@@ -304,38 +304,36 @@ std::unique_ptr<NofConnection> NofConnection::Connect(
                      << subnqn << " — performance may be reduced";
     }
 
-    // target_count = 请求数，TryGrow 恢复目标；ctrlr 用于 TryGrow 分配新 qpair。
+    // target_count = 请求数，TryGrow 恢复目标；ctrlr 用于 TryGrow 分配新
+    // qpair。
     auto pool = std::make_unique<NofQpairPool>(
-        std::move(qpairs), config.max_inflight_per_qpair, requested,
-        ctx.ctrlr);
+        std::move(qpairs), config.max_inflight_per_qpair, requested, ctx.ctrlr);
 
-    LOG(INFO) << "[NofConnection] Connected to " << subnqn
-              << " ns=" << ns_id
-              << " block_size=" << block_size
-              << " num_blocks=" << num_blocks
+    LOG(INFO) << "[NofConnection] Connected to " << subnqn << " ns=" << ns_id
+              << " block_size=" << block_size << " num_blocks=" << num_blocks
               << " qpairs=" << pool->Size();
 
     return std::unique_ptr<NofConnection>(
-        new NofConnection(ctx.ctrlr, ns, std::move(pool),
-                          block_size, num_blocks, subnqn, config));
+        new NofConnection(ctx.ctrlr, ns, std::move(pool), block_size,
+                          num_blocks, subnqn, config));
 }
 
 // static
 std::unique_ptr<NofConnection> NofConnection::Connect(
-    const std::string &transport_str,
-    const NofConfig &config,
+    const std::string &transport_str, const NofConfig &config,
     std::string *error_msg) {
-
     std::string traddr, trsvcid, subnqn, trtype;
     uint32_t ns = 1;
-    if (ParseTransportStr(transport_str, traddr, trsvcid, subnqn, trtype, ns) != 0) {
+    if (ParseTransportStr(transport_str, traddr, trsvcid, subnqn, trtype, ns) !=
+        0) {
         if (error_msg) *error_msg = "parse_transport_str_fail";
         return nullptr;
     }
 
     // RDMA is our only transport currently; warn if TCP requested.
     if (trtype == "TCP") {
-        LOG(WARNING) << "[NofConnection] TCP transport requested — RDMA is preferred";
+        LOG(WARNING)
+            << "[NofConnection] TCP transport requested — RDMA is preferred";
     }
 
     return Connect(traddr, trsvcid, subnqn, ns, config, error_msg);

@@ -36,10 +36,10 @@ int NoFRegisterClient::set_register(const std::string &nqn, size_t nsid,
 
     const char *trtype_env = std::getenv("MC_NOF_TRTYPE");
     std::string trtype = trtype_env ? trtype_env : "RDMA";
-     //Mooncake NoF 代码支持 MC_NOF_TRTYPE 环境变量来选择传输协议 
+    // Mooncake NoF 代码支持 MC_NOF_TRTYPE 环境变量来选择传输协议
     if (trtype != "RDMA" && trtype != "TCP") {
         trtype = "RDMA";
-    } 
+    }
     std::transform(
         trtype.begin(), trtype.end(), trtype.begin(),
         [](unsigned char c) { return static_cast<char>(std::toupper(c)); });

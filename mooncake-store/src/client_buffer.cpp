@@ -3,9 +3,9 @@
  * All rights reserved.
  *
  * @File: mooncake-store/src/client_buffer.cpp
- * 
+ *
  * 修改履历：
- * 2026-07-30 | 绿算技术 | free(): invalid pointer 崩溃修复 
+ * 2026-07-30 | 绿算技术 | free(): invalid pointer 崩溃修复
  */
 #include "client_buffer.h"
 
@@ -94,13 +94,13 @@ ClientBufferAllocator::~ClientBufferAllocator() {
         if (use_hugepage_) {
             free_buffer_mmap_memory(buffer_, buffer_size_);
         } else {
-// 2. 析构函数中使用 SpdkWrapper::Free() 替代 free():  
+// 2. 析构函数中使用 SpdkWrapper::Free() 替代 free():
 #ifdef USE_NOF
             if (use_spdk_dma_) {
                 ::mooncake::SpdkWrapper::GetInstance().Free(buffer_);
             } else
 #endif
-            free_memory(protocol, buffer_, use_spdk_dma_);
+                free_memory(protocol, buffer_, use_spdk_dma_);
         }
     }
 }

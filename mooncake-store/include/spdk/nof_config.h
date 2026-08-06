@@ -31,7 +31,7 @@ struct NofConfig {
     // detect dead connections.  10 s is a safe default.
     uint32_t keep_alive_timeout_ms = 10000;
 
-    uint32_t transport_ack_timeout = 0;   // 0 = SPDK default
+    uint32_t transport_ack_timeout = 0;  // 0 = SPDK default
     uint16_t admin_queue_size = 64;
     uint64_t fabrics_connect_timeout_us = 0;
     bool header_digest = false;
@@ -61,8 +61,8 @@ struct NofConfig {
     // 环境变量: MC_NVME_MIN_IO_QUEUES，有效范围 [1, num_io_queues]。
     uint32_t min_io_queues = 1;
 
-    // 分配失败时的最大重试次数。重试间隔指数增长 (retry_backoff_ms * 2^attempt)。
-    // 默认 5 次 = 最多约 3100ms 总退避（100+200+400+800+1600ms）。
+    // 分配失败时的最大重试次数。重试间隔指数增长 (retry_backoff_ms *
+    // 2^attempt)。 默认 5 次 = 最多约 3100ms 总退避（100+200+400+800+1600ms）。
     // 覆盖 keep-alive 典型回收窗口 (MC_NVME_KEEP_ALIVE_TIMEOUT_MS=2000)。
     // 环境变量: MC_NVME_RETRY_MAX_ATTEMPTS，有效范围 [0, 10]。
     uint32_t retry_max_attempts = 5;
@@ -155,10 +155,8 @@ inline NofConfig NofConfig::FromEnv() {
         cfg.admin_queue_size = static_cast<uint16_t>(v);
     if (ParseEnvU64_("MC_NVME_FABRICS_CONNECT_TIMEOUT_US", &v))
         cfg.fabrics_connect_timeout_us = v;
-    if (ParseEnvBool_("MC_NVME_HEADER_DIGEST", &bv))
-        cfg.header_digest = bv;
-    if (ParseEnvBool_("MC_NVME_DATA_DIGEST", &bv))
-        cfg.data_digest = bv;
+    if (ParseEnvBool_("MC_NVME_HEADER_DIGEST", &bv)) cfg.header_digest = bv;
+    if (ParseEnvBool_("MC_NVME_DATA_DIGEST", &bv)) cfg.data_digest = bv;
 
     // Pipeline tuning
     if (ParseEnvU64_("MC_NVME_MAX_INFLIGHT_PER_QPAIR", &v))
@@ -227,7 +225,7 @@ inline NofConfig NofConfig::ForProbe() {
     NofConfig cfg = FromEnv();
     cfg.num_io_queues = 1;
     cfg.min_io_queues = 1;
-    cfg.retry_max_attempts = 2;   // 探测连接重试 2 次即可
+    cfg.retry_max_attempts = 2;  // 探测连接重试 2 次即可
     cfg.retry_backoff_ms = 50;
     cfg.enable_degradation = false;  // 探测不降级，1 条 qpair 足够
     return cfg;
