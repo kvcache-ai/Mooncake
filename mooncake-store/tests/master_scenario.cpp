@@ -379,9 +379,9 @@ MasterScenario& MasterScenario::ThenObjects(ObjectsSpecData objects,
         return *this;
     }
     for (auto& key : objects.keys) {
-        ThenObject(
-            ObjectSpecData{.key = std::move(key), .tenant = objects.tenant},
-            expectation);
+        ObjectSpecData object(std::move(key));
+        object.tenant = objects.tenant;
+        ThenObject(std::move(object), expectation);
     }
     return *this;
 }
@@ -402,12 +402,32 @@ MasterScenario& MasterScenario::Then(TenantQuotaSpec tenant_quota) {
     if (!EnsureService()) {
         return *this;
     }
-    const auto snapshot =
+
+    auto snapshot =
         service_->GetTenantQuotaSnapshot(TenantId(tenant_quota.tenant));
     if (!snapshot.has_value()) {
         Fail("TenantQuota(" + tenant_quota.tenant + ") is not registered");
         return *this;
     }
+
+    const auto matches = [&tenant_quota](const TenantQuotaSnapshot& value) {
+        return (!tenant_quota.used_bytes.has_value() ||
+                value.used_bytes == *tenant_quota.used_bytes) &&
+               (!tenant_quota.reserved_bytes.has_value() ||
+                value.reserved_bytes == *tenant_quota.reserved_bytes);
+    };
+    const auto deadline =
+        std::chrono::steady_clock::now() + tenant_quota.eventual_timeout;
+    while (!matches(*snapshot) && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        snapshot =
+            service_->GetTenantQuotaSnapshot(TenantId(tenant_quota.tenant));
+        if (!snapshot.has_value()) {
+            Fail("TenantQuota(" + tenant_quota.tenant + ") is not registered");
+            return *this;
+        }
+    }
+
     if (tenant_quota.used_bytes.has_value() &&
         snapshot->used_bytes != *tenant_quota.used_bytes) {
         Fail("TenantQuota(" + tenant_quota.tenant + ") uses " +
