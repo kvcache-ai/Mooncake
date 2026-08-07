@@ -1,6 +1,17 @@
 #include "conductor/prefixindex/hash_strategy.h"
 
+// Two SHA-256 backends, selected by CONDUCTOR_HAS_LOWLEVEL_SHA256 (probed by
+// CMake): the low-level SHA256_* API with a stack context is ~3x cheaper per
+// call than EVP per-call setup on ~100-byte block encodings, but its
+// declarations are hidden in OpenSSL no-deprecated builds and it bypasses
+// the provider framework required by FIPS.  Both backends dispatch to the
+// same OpenSSL implementation and produce byte-identical digests.
+#if CONDUCTOR_HAS_LOWLEVEL_SHA256
+#define OPENSSL_SUPPRESS_DEPRECATED
+#include <openssl/sha.h>
+#else
 #include <openssl/evp.h>
+#endif
 
 #include <cstddef>
 #include <limits>
@@ -491,6 +502,21 @@ bool IsValidUtf8(std::string_view value) {
     return true;
 }
 
+#if CONDUCTOR_HAS_LOWLEVEL_SHA256
+
+std::string Sha256(std::span<const uint8_t> input,
+                   std::array<uint8_t, kSha256DigestSize>* digest) {
+    SHA256_CTX context;
+    if (SHA256_Init(&context) != 1 ||
+        SHA256_Update(&context, input.data(), input.size()) != 1 ||
+        SHA256_Final(digest->data(), &context) != 1) {
+        return "OpenSSL SHA-256 computation failed";
+    }
+    return "";
+}
+
+#else  // EVP backend: no-deprecated builds and FIPS-forced configurations.
+
 std::string Sha256(std::span<const uint8_t> input,
                    std::array<uint8_t, kSha256DigestSize>* digest) {
     using EvpContext = std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>;
@@ -526,6 +552,8 @@ std::string Sha256Reuse(EVP_MD_CTX* context, std::span<const uint8_t> input,
     }
     return "";
 }
+
+#endif
 
 int LowerHexValue(char value) {
     if (value >= '0' && value <= '9') {
@@ -685,12 +713,14 @@ class VllmV1HashChain final : public HashChain {
             }
             return nullptr;
         }
+#if !CONDUCTOR_HAS_LOWLEVEL_SHA256
         if (!EnsureEvp()) {
             if (error != nullptr) {
                 *error = sticky_error_;
             }
             return nullptr;
         }
+#endif
         while (computed_.size() <= index) {
             const size_t block_index = computed_.size();
             const bool has_lora = !lora_name_.empty();
@@ -707,9 +737,13 @@ class VllmV1HashChain final : public HashChain {
             codec_->EncodeBlock(values, &encoded_);
 
             HashBlock block;
-            if (std::string hash_error =
-                    Sha256Reuse(evp_.get(), encoded_, &block.digest);
-                !hash_error.empty()) {
+#if CONDUCTOR_HAS_LOWLEVEL_SHA256
+            std::string hash_error = Sha256(encoded_, &block.digest);
+#else
+            std::string hash_error =
+                Sha256Reuse(evp_.get(), encoded_, &block.digest);
+#endif
+            if (!hash_error.empty()) {
                 sticky_error_ = std::move(hash_error);
                 if (error != nullptr) {
                     *error = sticky_error_;
@@ -724,6 +758,7 @@ class VllmV1HashChain final : public HashChain {
     }
 
    private:
+#if !CONDUCTOR_HAS_LOWLEVEL_SHA256
     bool EnsureEvp() {
         if (evp_) {
             return true;
@@ -737,6 +772,7 @@ class VllmV1HashChain final : public HashChain {
     }
 
     using EvpContext = std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)>;
+#endif
 
     const VllmValueCodec* codec_;
     std::array<uint8_t, kSha256DigestSize> parent_;
@@ -747,7 +783,9 @@ class VllmV1HashChain final : public HashChain {
     size_t block_count_;
     std::vector<HashBlock> computed_;
     std::vector<uint8_t> encoded_;
+#if !CONDUCTOR_HAS_LOWLEVEL_SHA256
     EvpContext evp_{nullptr, EVP_MD_CTX_free};
+#endif
     std::string sticky_error_;
 };
 
