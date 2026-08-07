@@ -17,7 +17,7 @@ struct DurablePrefix {
     uint64_t last_seq{0};
     // Leadership view that produced this durable boundary. Zero means that
     // the prefix has no producer-view metadata (legacy or not yet assigned).
-    uint64_t producer_view_version{0};
+    ViewVersionId producer_view_version{0};
 
     friend bool operator==(const DurablePrefix&,
                            const DurablePrefix&) = default;

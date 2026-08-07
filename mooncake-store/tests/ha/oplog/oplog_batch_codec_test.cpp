@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 #include <xxhash.h>
 
+#include <limits>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -190,9 +191,11 @@ TEST(OpLogDurablePrefixCodecTest, PreservesLegacyEncodingWithoutProducerView) {
     EXPECT_TRUE(reason.empty());
 }
 
-TEST(OpLogDurablePrefixCodecTest, RoundTripsNonZeroProducerView) {
+TEST(OpLogDurablePrefixCodecTest, RoundTripsMaxProducerView) {
     DurablePrefix in{
-        .batch_id = 9, .last_seq = 1024, .producer_view_version = UINT64_MAX};
+        .batch_id = 9,
+        .last_seq = 1024,
+        .producer_view_version = std::numeric_limits<ViewVersionId>::max()};
 
     DurablePrefix out;
     std::string reason;
@@ -228,8 +231,8 @@ TEST(OpLogDurablePrefixCodecTest, IgnoresUnknownFields) {
 }
 
 TEST(OpLogDurablePrefixCodecTest, RejectsInvalidProducerViews) {
-    const std::vector<std::string> invalid_values = {R"("1")", "-1", "1.5",
-                                                     "18446744073709551616"};
+    const std::vector<std::string> invalid_values = {
+        R"("1")", "-1", "1.5", "9223372036854775808", "18446744073709551616"};
 
     for (const auto& invalid_value : invalid_values) {
         DurablePrefix prefix;
