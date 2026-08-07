@@ -871,6 +871,12 @@ class MooncakeBundleTransfer:
                 member, payload_spec, field_spec, indices, destination
             )
         if encoding == "torch_tensor":
+            if field_spec.get("nested"):
+                result = self.materialize_into(
+                    self.read_spec(stage_ref).select_members([member]),
+                    None if destination is None else {member: destination},
+                )
+                return _select_nested_tensor_rows(result.objects[member], indices)
             return self._read_torch_tensor_member_indices(
                 member, payload_spec, field_spec, indices, destination
             )
@@ -3178,6 +3184,22 @@ class _StructuredObjectLayer:
         member_slice: StructuredMemberSlice | None,
         destination: Any,
     ) -> Any:
+        if field_spec.get("nested"):
+            if destination is not None:
+                raise ValueError(
+                    f"structured nested tensor member {name} does not support destinations"
+                )
+            value = _deserialize_nested_tensor_payload(
+                self._bundle_store.read_payload(payload_spec), field_spec
+            )
+            if member_slice is None:
+                return value
+            if member_slice.axis != 0:
+                raise ValueError(
+                    "structured nested tensor slicing currently supports axis=0 only"
+                )
+            start, end, step = _normalized_member_slice(member_slice, len(value))
+            return _select_nested_tensor_rows(value, range(start, end, step))
         if member_slice is not None:
             return self._read_sliced_torch_tensor_member(
                 name, payload_spec, field_spec, member_slice, destination
@@ -4896,6 +4918,25 @@ def _normalized_member_slice(
     )
 
 
+def _select_nested_tensor_rows(value: Any, indices: Sequence[int]) -> Any:
+    rows = value.unbind()
+    selected = [rows[int(index)] for index in indices]
+    if selected:
+        result = _torch.nested.as_nested_tensor(selected, layout=value.layout)
+    else:
+        offsets = _torch.zeros(
+            1,
+            dtype=value.offsets().dtype,
+            device=value.offsets().device,
+        )
+        result = _torch.nested.nested_tensor_from_jagged(
+            value.values()[:0], offsets=offsets
+        )
+    if hasattr(value, "_ragged_idx"):
+        result._ragged_idx = value._ragged_idx
+    return result
+
+
 def _bytes_view(value: Any, name: str) -> memoryview:
     try:
         view = memoryview(value)
@@ -5128,6 +5169,10 @@ def _encode_structured_field(value: Any) -> tuple[dict[str, Any], Any]:
 
 
 def _encode_torch_tensor_field(value: Any) -> tuple[dict[str, Any], Any]:
+    if value.is_nested:
+        if value.layout != _torch.jagged:
+            raise ValueError("structured nested tensor fields require torch.jagged layout")
+        return _encode_nested_tensor_field(value)
     return {
         "encoding": "torch_tensor",
         "dtype": str(value.dtype),
@@ -5411,6 +5456,79 @@ def _torch_save_payload_bytes(value: Any) -> bytes:
 
 def _deserialize_torch_save_payload(payload: bytes) -> Any:
     return _torch.load(io.BytesIO(payload), weights_only=True)
+
+
+def _encode_nested_tensor_field(value: Any) -> tuple[dict[str, Any], Any]:
+    field_spec = {
+        "encoding": "torch_tensor",
+        "dtype": str(value.dtype),
+        "nested": True,
+        "format": "torch_save",
+    }
+    values = value.values()
+    offsets = value.offsets()
+    lengths = value.lengths()
+    tensors = [values, offsets]
+    if lengths is not None:
+        tensors.append(lengths)
+
+    if _has_tensor_codec_helpers() and all(
+        tensor.device.type == "cpu" for tensor in tensors
+    ):
+        parts = [
+            _tensor_payload_bytes(_TensorPayload(tensor=tensor))[0]
+            for tensor in tensors
+        ]
+        field_spec.update(
+            {
+                "format": "tensor_parts",
+                "part_bytes": [len(part) for part in parts],
+                "has_lengths": lengths is not None,
+                "ragged_idx": int(getattr(value, "_ragged_idx", 1)),
+            }
+        )
+        return field_spec, _MultiBufferPayload(
+            buffers=tuple(memoryview(part) for part in parts)
+        )
+
+    return field_spec, memoryview(_torch_save_payload_bytes(value))
+
+
+def _deserialize_nested_tensor_payload(
+    payload: bytes, field_spec: Mapping[str, Any]
+) -> Any:
+    payload_format = field_spec.get("format", "torch_save")
+    if payload_format == "torch_save":
+        return _deserialize_torch_save_payload(payload)
+    if payload_format != "tensor_parts":
+        raise ValueError(f"unsupported nested tensor payload format: {payload_format}")
+
+    part_bytes = field_spec.get("part_bytes")
+    expected_parts = 3 if field_spec.get("has_lengths") else 2
+    if not isinstance(part_bytes, list) or len(part_bytes) != expected_parts:
+        raise ValueError("nested tensor payload has invalid part metadata")
+
+    tensors = []
+    offset = 0
+    for part_size in part_bytes:
+        if (
+            not isinstance(part_size, int) or isinstance(part_size, bool) or part_size <= 0
+        ):
+            raise ValueError("nested tensor payload has invalid part size")
+        end = offset + int(part_size)
+        if end > len(payload):
+            raise ValueError("nested tensor payload is truncated")
+        tensors.append(_deserialize_tensor_payload(payload[offset:end]))
+        offset = end
+    if offset != len(payload):
+        raise ValueError("nested tensor payload has trailing bytes")
+
+    return _torch.nested.nested_tensor_from_jagged(
+        tensors[0],
+        offsets=tensors[1],
+        lengths=tensors[2] if expected_parts == 3 else None,
+        jagged_dim=int(field_spec.get("ragged_idx", 1)),
+    )
 
 
 def _slice_tensor_metadata(
