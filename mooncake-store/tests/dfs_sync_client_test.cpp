@@ -89,7 +89,6 @@ class DfsSyncClientTest : public ::testing::Test {
         backend_ = std::make_shared<DistributedStorageBackend>(
             file_config, distributed_config, std::move(adapter));
         ASSERT_TRUE(backend_->Init().has_value());
-        writer_->SetDfsDescriptorCache(backend_->GetDescriptorCache());
         writer_->SetDfsStorageBackend(backend_);
     }
 
@@ -317,11 +316,6 @@ TEST_F(DfsSyncClientTest, BatchGetUsesExplicitDfsDescriptors) {
         ASSERT_TRUE(query.has_value());
         queries.push_back(*query);
     }
-
-    // Point the compatibility cache at the other key. BatchGet must still use
-    // the descriptor carried by each QueryResult.
-    backend_->GetDescriptorCache()->Put(
-        keys[0], queries[1].replicas[0].get_dfs_descriptor());
 
     std::vector<std::string> output{std::string(4096, '\0'),
                                     std::string(4096, '\0')};

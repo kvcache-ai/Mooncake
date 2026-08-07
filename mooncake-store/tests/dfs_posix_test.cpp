@@ -17,7 +17,6 @@
 #include <vector>
 
 #include "replica.h"
-#include "storage/distributed/dfs_descriptor_cache.h"
 #include "storage/distributed/dfs_global_allocator.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/posix_fs_adapter.h"
@@ -512,57 +511,6 @@ TEST(ReplicaDfsTest, HelpersAndDescriptor) {
               ReplicaWriteMode::RELIABLE_MULTI_REPLICA);
 }
 
-TEST(DfsDescCacheTest, BasicAndConcurrentOperations) {
-    DfsDescriptorCache cache;
-    DistributedFSDescriptor desc{"/mnt/3fs/shard0.data", 4096, 100, 4096, 0};
-    cache.Put("key1", desc);
-    auto got = cache.Get("key1");
-    ASSERT_TRUE(got.has_value());
-    EXPECT_EQ(got->offset, 4096);
-
-    DistributedFSDescriptor overwritten{"/mnt/3fs/shard1.data", 8192, 200, 4096,
-                                        1};
-    cache.Put("key1", overwritten);
-    got = cache.Get("key1");
-    ASSERT_TRUE(got.has_value());
-    EXPECT_EQ(got->offset, 8192);
-    EXPECT_EQ(got->shard_idx, 1);
-
-    cache.Remove("key1");
-    EXPECT_FALSE(cache.Get("key1").has_value());
-    cache.Remove("missing");
-
-    for (int i = 0; i < 50; ++i) {
-        cache.Put("key_" + std::to_string(i),
-                  {"/mnt/3fs/shard0.data", static_cast<uint64_t>(i * 4096), 100,
-                   4096, 0});
-    }
-
-    std::vector<std::thread> threads;
-    for (int t = 0; t < 4; ++t) {
-        threads.emplace_back([&cache]() {
-            for (int i = 0; i < 50; ++i) {
-                cache.Get("key_" + std::to_string(i));
-            }
-        });
-    }
-    for (int t = 0; t < 2; ++t) {
-        threads.emplace_back([&cache, t]() {
-            for (int i = 50; i < 100; ++i) {
-                cache.Put("key_" + std::to_string(i + t * 50),
-                          {"/mnt/3fs/shard0.data",
-                           static_cast<uint64_t>(i * 4096), 100, 4096, 0});
-            }
-        });
-    }
-    threads.emplace_back([&cache]() {
-        for (int i = 0; i < 25; ++i) {
-            cache.Remove("key_" + std::to_string(i));
-        }
-    });
-    for (auto& thread : threads) thread.join();
-}
-
 class DfsBackendTest : public ::testing::Test {
    protected:
     void SetUp() override {
@@ -578,17 +526,14 @@ class DfsBackendTest : public ::testing::Test {
         distributed_config.shard_capacity = 64 * 1024 * 1024;
         distributed_config.alignment = 4096;
 
-        desc_cache_ = std::make_shared<DfsDescriptorCache>();
         backend_ = std::make_unique<DistributedStorageBackend>(
             file_config, distributed_config,
             std::make_unique<PosixFsAdapter>());
-        backend_->SetDescriptorCache(desc_cache_);
         ASSERT_TRUE(backend_->Init().has_value());
     }
 
     void TearDown() override {
         backend_.reset();
-        desc_cache_.reset();
         tmp_.reset();
     }
 
@@ -600,7 +545,6 @@ class DfsBackendTest : public ::testing::Test {
 
     std::unique_ptr<TempDir> tmp_;
     std::unique_ptr<DistributedStorageBackend> backend_;
-    std::shared_ptr<DfsDescriptorCache> desc_cache_;
 };
 
 class ControlledPosixFsAdapter : public PosixFsAdapter {
@@ -678,11 +622,13 @@ TEST_F(DfsBackendTest, BatchWriteUsesExplicitDescriptors) {
     ASSERT_FALSE(results[2].has_value());
     EXPECT_EQ(results[2].error(), ErrorCode::INVALID_PARAMS);
 
-    desc_cache_->Put("explicit", requests[0].descriptor);
     AlignedBuffer read_buf(4096);
-    std::unordered_map<std::string, Slice> load_batch;
-    load_batch["explicit"] = {read_buf.data(), read_buf.size()};
-    ASSERT_TRUE(backend_->BatchLoad(load_batch).has_value());
+    auto read_results =
+        backend_->BatchRead({{"explicit",
+                              requests[0].descriptor,
+                              {{read_buf.data(), read_buf.size()}}}});
+    ASSERT_EQ(read_results.size(), 1);
+    ASSERT_TRUE(read_results[0].has_value());
     EXPECT_EQ(std::memcmp(write_buf.data(), read_buf.data(), write_buf.size()),
               0);
 }
@@ -747,9 +693,6 @@ TEST_F(DfsBackendTest, BatchReadUsesExplicitDescriptorsAndMultipleSlices) {
     ASSERT_EQ(write_results.size(), 2);
     ASSERT_TRUE(write_results[0].has_value());
     ASSERT_TRUE(write_results[1].has_value());
-
-    // A stale compatibility-cache entry must not affect explicit reads.
-    desc_cache_->Put("same_key", second_desc);
 
     AlignedBuffer output_0(1024), output_1(3072), unused(64);
     ASSERT_NE(output_0.data(), nullptr);
@@ -854,8 +797,6 @@ TEST_F(DfsBackendTest, RejectsInvalidDescriptorRangesBeforeIo) {
     auto* controlled_adapter = adapter.get();
     auto backend = std::make_unique<DistributedStorageBackend>(
         file_config, distributed_config, std::move(adapter));
-    auto desc_cache = std::make_shared<DfsDescriptorCache>();
-    backend->SetDescriptorCache(desc_cache);
     ASSERT_TRUE(backend->Init().has_value());
 
     AlignedBuffer small_buf(4096);
@@ -904,38 +845,29 @@ TEST_F(DfsBackendTest, RejectsInvalidDescriptorRangesBeforeIo) {
     EXPECT_EQ(controlled_adapter->ReadCallCount(), 0);
 }
 
-TEST_F(DfsBackendTest, BatchOffloadAndBatchLoad) {
-    AlignedBuffer write_buf(4096);
-    ASSERT_NE(write_buf.data(), nullptr);
-    write_buf.Fill('X');
-    std::unordered_map<std::string, std::vector<Slice>> batch;
-    batch["key1"] = {{write_buf.data(), write_buf.size()}};
+TEST_F(DfsBackendTest, KeyOnlyStorageBackendOperationsAreNotSupported) {
+    std::unordered_map<std::string, std::vector<Slice>> offload_batch;
+    auto offload_result = backend_->BatchOffload(
+        offload_batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_FALSE(offload_result.has_value());
+    EXPECT_EQ(offload_result.error(), ErrorCode::NOT_SUPPORTED);
 
-    desc_cache_->Put("key1", {ShardPath(0), 0, 4096, 4096, 0});
-
-    std::vector<std::string> completed_keys;
-    auto offload_res =
-        backend_->BatchOffload(batch, [&](const std::vector<std::string>& keys,
-                                          std::vector<StorageObjectMetadata>&) {
-            completed_keys = keys;
-            return ErrorCode::OK;
-        });
-    ASSERT_TRUE(offload_res.has_value());
-    EXPECT_EQ(*offload_res, 1);
-    ASSERT_EQ(completed_keys.size(), 1);
-    EXPECT_EQ(completed_keys[0], "key1");
-
-    AlignedBuffer read_buf(4096);
-    ASSERT_NE(read_buf.data(), nullptr);
     std::unordered_map<std::string, Slice> load_batch;
-    load_batch["key1"] = {read_buf.data(), read_buf.size()};
-    auto load_res = backend_->BatchLoad(load_batch);
-    ASSERT_TRUE(load_res.has_value());
-    EXPECT_EQ(std::memcmp(write_buf.data(), read_buf.data(), write_buf.size()),
-              0);
+    auto load_result = backend_->BatchLoad(load_batch);
+    ASSERT_FALSE(load_result.has_value());
+    EXPECT_EQ(load_result.error(), ErrorCode::NOT_SUPPORTED);
+
+    auto exists_result = backend_->IsExist("key");
+    ASSERT_FALSE(exists_result.has_value());
+    EXPECT_EQ(exists_result.error(), ErrorCode::NOT_SUPPORTED);
+    auto enabled_result = backend_->IsEnableOffloading();
+    ASSERT_TRUE(enabled_result.has_value());
+    EXPECT_FALSE(*enabled_result);
 }
 
-TEST_F(DfsBackendTest, BatchOffloadAndBatchLoadAcceptUnalignedBuffers) {
+TEST_F(DfsBackendTest, BatchReadAndWriteAcceptUnalignedBuffers) {
     constexpr size_t kObjectSize = 1234;
     AlignedBuffer write_storage(kObjectSize + 1);
     AlignedBuffer read_storage(kObjectSize + 3);
@@ -950,26 +882,17 @@ TEST_F(DfsBackendTest, BatchOffloadAndBatchLoadAcceptUnalignedBuffers) {
         write_ptr[i] = static_cast<char>('a' + (i % 26));
     }
 
-    std::unordered_map<std::string, std::vector<Slice>> batch;
-    batch["unaligned"] = {{write_ptr, kObjectSize}};
-    desc_cache_->Put("unaligned", {ShardPath(0), 0, kObjectSize, 4096, 0});
+    const DistributedFSDescriptor descriptor{ShardPath(0), 0, kObjectSize, 4096,
+                                             0};
+    auto write_results = backend_->BatchWrite(
+        {{"unaligned", descriptor, {{write_ptr, kObjectSize}}}});
+    ASSERT_EQ(write_results.size(), 1);
+    ASSERT_TRUE(write_results[0].has_value());
 
-    std::vector<std::string> completed_keys;
-    auto offload_res =
-        backend_->BatchOffload(batch, [&](const std::vector<std::string>& keys,
-                                          std::vector<StorageObjectMetadata>&) {
-            completed_keys = keys;
-            return ErrorCode::OK;
-        });
-    ASSERT_TRUE(offload_res.has_value());
-    EXPECT_EQ(*offload_res, 1);
-    ASSERT_EQ(completed_keys.size(), 1);
-    EXPECT_EQ(completed_keys[0], "unaligned");
-
-    std::unordered_map<std::string, Slice> load_batch;
-    load_batch["unaligned"] = {read_ptr, kObjectSize};
-    auto load_res = backend_->BatchLoad(load_batch);
-    ASSERT_TRUE(load_res.has_value());
+    auto read_results = backend_->BatchRead(
+        {{"unaligned", descriptor, {{read_ptr, kObjectSize}}}});
+    ASSERT_EQ(read_results.size(), 1);
+    ASSERT_TRUE(read_results[0].has_value());
     EXPECT_EQ(std::memcmp(write_ptr, read_ptr, kObjectSize), 0);
 }
 
@@ -982,32 +905,32 @@ TEST_F(DfsBackendTest, MultipleKeysAcrossShards) {
     key1.Fill('B');
     key2.Fill('C');
 
-    std::unordered_map<std::string, std::vector<Slice>> batch;
-    batch["key0"] = {{key0.data(), key0.size()}};
-    batch["key1"] = {{key1.data(), key1.size()}};
-    batch["key2"] = {{key2.data(), key2.size()}};
-
-    desc_cache_->Put("key0", {ShardPath(0), 0, key0.size(), key0.size(), 0});
-    desc_cache_->Put("key1", {ShardPath(0), 4096, key1.size(), key1.size(), 0});
-    desc_cache_->Put("key2", {ShardPath(1), 0, key2.size(), key2.size(), 1});
-
-    auto offload_res = backend_->BatchOffload(
-        batch,
-        [](const std::vector<std::string>&,
-           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
-    ASSERT_TRUE(offload_res.has_value());
-    EXPECT_EQ(*offload_res, 3);
+    const std::vector<DistributedFSDescriptor> descriptors{
+        {ShardPath(0), 0, key0.size(), key0.size(), 0},
+        {ShardPath(0), 4096, key1.size(), key1.size(), 0},
+        {ShardPath(1), 0, key2.size(), key2.size(), 1},
+    };
+    auto write_results = backend_->BatchWrite(
+        {{"key0", descriptors[0], {{key0.data(), key0.size()}}},
+         {"key1", descriptors[1], {{key1.data(), key1.size()}}},
+         {"key2", descriptors[2], {{key2.data(), key2.size()}}}});
+    ASSERT_EQ(write_results.size(), 3);
+    EXPECT_TRUE(write_results[0].has_value());
+    EXPECT_TRUE(write_results[1].has_value());
+    EXPECT_TRUE(write_results[2].has_value());
 
     AlignedBuffer out0(4096), out1(4096), out2(8192);
     ASSERT_NE(out0.data(), nullptr);
     ASSERT_NE(out1.data(), nullptr);
     ASSERT_NE(out2.data(), nullptr);
-    std::unordered_map<std::string, Slice> load_batch;
-    load_batch["key0"] = {out0.data(), out0.size()};
-    load_batch["key1"] = {out1.data(), out1.size()};
-    load_batch["key2"] = {out2.data(), out2.size()};
-    auto load_res = backend_->BatchLoad(load_batch);
-    ASSERT_TRUE(load_res.has_value());
+    auto read_results = backend_->BatchRead(
+        {{"key0", descriptors[0], {{out0.data(), out0.size()}}},
+         {"key1", descriptors[1], {{out1.data(), out1.size()}}},
+         {"key2", descriptors[2], {{out2.data(), out2.size()}}}});
+    ASSERT_EQ(read_results.size(), 3);
+    EXPECT_TRUE(read_results[0].has_value());
+    EXPECT_TRUE(read_results[1].has_value());
+    EXPECT_TRUE(read_results[2].has_value());
     EXPECT_EQ(std::memcmp(key0.data(), out0.data(), key0.size()), 0);
     EXPECT_EQ(std::memcmp(key1.data(), out1.data(), key1.size()), 0);
     EXPECT_EQ(std::memcmp(key2.data(), out2.data(), key2.size()), 0);
@@ -1018,36 +941,23 @@ TEST_F(DfsBackendTest, LargeObject) {
     AlignedBuffer write_buf(kLargeSize);
     ASSERT_NE(write_buf.data(), nullptr);
     write_buf.Fill('L');
-    std::unordered_map<std::string, std::vector<Slice>> batch;
-    batch["large"] = {{write_buf.data(), write_buf.size()}};
-    desc_cache_->Put("large",
-                     {ShardPath(2), 0, write_buf.size(), write_buf.size(), 2});
-
-    auto offload_res = backend_->BatchOffload(
-        batch,
-        [](const std::vector<std::string>&,
-           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
-    ASSERT_TRUE(offload_res.has_value());
-    EXPECT_EQ(*offload_res, 1);
+    const DistributedFSDescriptor descriptor{ShardPath(2), 0, write_buf.size(),
+                                             write_buf.size(), 2};
+    auto write_results = backend_->BatchWrite(
+        {{"large", descriptor, {{write_buf.data(), write_buf.size()}}}});
+    ASSERT_EQ(write_results.size(), 1);
+    ASSERT_TRUE(write_results[0].has_value());
 
     AlignedBuffer read_buf(kLargeSize);
     ASSERT_NE(read_buf.data(), nullptr);
-    std::unordered_map<std::string, Slice> load_batch;
-    load_batch["large"] = {read_buf.data(), read_buf.size()};
-    auto load_res = backend_->BatchLoad(load_batch);
-    ASSERT_TRUE(load_res.has_value());
+    auto read_results = backend_->BatchRead(
+        {{"large", descriptor, {{read_buf.data(), read_buf.size()}}}});
+    ASSERT_EQ(read_results.size(), 1);
+    ASSERT_TRUE(read_results[0].has_value());
     EXPECT_EQ(std::memcmp(write_buf.data(), read_buf.data(), kLargeSize), 0);
 }
 
 TEST_F(DfsBackendTest, FailurePaths) {
-    AlignedBuffer read_buf(4096);
-    ASSERT_NE(read_buf.data(), nullptr);
-    std::unordered_map<std::string, Slice> load_batch;
-    load_batch["missing_key"] = {read_buf.data(), read_buf.size()};
-    auto load_res = backend_->BatchLoad(load_batch);
-    ASSERT_FALSE(load_res.has_value());
-    EXPECT_EQ(load_res.error(), ErrorCode::OBJECT_NOT_FOUND);
-
     PosixFsAdapter adapter;
     ASSERT_TRUE(adapter.Init(tmp_->path()).has_value());
     char buf[64] = {};

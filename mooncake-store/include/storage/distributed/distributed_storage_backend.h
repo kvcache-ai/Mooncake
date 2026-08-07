@@ -2,11 +2,10 @@
 
 #include <memory>
 #include <mutex>
-#include <optional>
 #include <vector>
 
-#include "dfs_descriptor_cache.h"
 #include "fs_adapter.h"
+#include "replica.h"
 #include "storage_backend.h"
 
 namespace mooncake {
@@ -65,8 +64,8 @@ class DistributedStorageBackend : public StorageBackendInterface {
     std::vector<tl::expected<void, ErrorCode>> BatchRead(
         const std::vector<DfsReadRequest>& requests);
 
-    // Compatibility path for StorageBackendInterface callers. Shard-based DFS
-    // reads should prefer BatchRead so the descriptor remains request-scoped.
+    // Key-only storage backend operations cannot safely address DFS objects;
+    // callers must use BatchRead/BatchWrite with request-scoped descriptors.
     tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batched_slices) override;
 
@@ -79,14 +78,6 @@ class DistributedStorageBackend : public StorageBackendInterface {
             const std::vector<std::string>& keys,
             std::vector<StorageObjectMetadata>& metadatas)>& handler) override;
 
-    void SetDescriptorCache(std::shared_ptr<DfsDescriptorCache> cache) {
-        desc_cache_ = std::move(cache);
-    }
-
-    std::shared_ptr<DfsDescriptorCache> GetDescriptorCache() const {
-        return desc_cache_;
-    }
-
    private:
     struct ShardFile {
         std::string path;
@@ -94,11 +85,7 @@ class DistributedStorageBackend : public StorageBackendInterface {
         std::mutex mutex;
     };
 
-    std::optional<DistributedFSDescriptor> LookupDescriptor(
-        const std::string& storage_key) const;
-
     std::unique_ptr<FileSystemAdapter> fs_adapter_;
-    std::shared_ptr<DfsDescriptorCache> desc_cache_;
     DistributedStorageConfig distributed_config_;
     std::string root_dir_;
     std::vector<std::unique_ptr<ShardFile>> shard_files_;

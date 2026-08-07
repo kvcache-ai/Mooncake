@@ -283,8 +283,6 @@ FileStorage::FileStorage(const FileStorageConfig& config,
             std::dynamic_pointer_cast<DistributedStorageBackend>(
                 storage_backend_)) {
         if (client_) {
-            client_->SetDfsDescriptorCache(
-                distributed_backend->GetDescriptorCache());
             client_->SetDfsStorageBackend(distributed_backend);
         }
     }

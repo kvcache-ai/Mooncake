@@ -1108,7 +1108,6 @@ tl::expected<QueryResult, ErrorCode> Client::Query(
     if (!result) {
         return tl::unexpected(result.error());
     }
-    CacheDfsDescriptors(object_key, result.value().replicas);
     return QueryResult(
         std::move(result.value().replicas),
         start_time + std::chrono::milliseconds(result.value().lease_ttl_ms),
@@ -1142,7 +1141,6 @@ std::vector<tl::expected<QueryResult, ErrorCode>> Client::BatchQuery(
     results.reserve(response.size());
     for (size_t i = 0; i < response.size(); ++i) {
         if (response[i]) {
-            CacheDfsDescriptors(object_keys[i], response[i].value().replicas);
             results.emplace_back(QueryResult(
                 std::move(response[i].value().replicas),
                 start_time +
@@ -1782,7 +1780,6 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     }
 
     ReplicaTransferSummary transfer_summary;
-    CacheDfsDescriptors(key, start_result.value());
     for (const auto& replica : start_result.value()) {
         transfer_summary.RecordAllocatedReplica(replica);
     }
@@ -1866,9 +1863,6 @@ tl::expected<void, ErrorCode> Client::Put(const ObjectKey& key,
     if (finalize_decision.revoke_type.has_value()) {
         auto revoke_result =
             master_client_.PutRevoke(key, *finalize_decision.revoke_type);
-        if (dfs_desc_cache_) {
-            dfs_desc_cache_->Remove(key);
-        }
         if (!revoke_result) {
             LOG(ERROR) << "Failed to revoke put operation";
             return tl::unexpected(revoke_result.error());
@@ -1925,7 +1919,6 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
         return tl::unexpected(err);
     }
 
-    CacheDfsDescriptors(key, start_result.value());
     ReplicaTransferSummary transfer_summary;
     for (const auto& replica : start_result.value()) {
         transfer_summary.RecordAllocatedReplica(replica);
@@ -2006,9 +1999,6 @@ tl::expected<void, ErrorCode> Client::Upsert(const ObjectKey& key,
     if (finalize_decision.revoke_type.has_value()) {
         auto revoke_result =
             master_client_.UpsertRevoke(key, *finalize_decision.revoke_type);
-        if (dfs_desc_cache_) {
-            dfs_desc_cache_->Remove(key);
-        }
         if (!revoke_result) {
             LOG(ERROR) << "Failed to revoke upsert operation";
             return tl::unexpected(revoke_result.error());
@@ -2270,7 +2260,6 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
                                 "Master failed to start put operation");
         } else {
             op.replicas = start_responses[i].value();
-            CacheDfsDescriptors(op.key, op.replicas);
             op.RecordAllocatedReplicas();
             if (!HasExpectedReplicaAllocation(config, op.transfer_summary)) {
                 op.SetTerminalError(ErrorCode::NO_AVAILABLE_HANDLE,
@@ -2350,7 +2339,6 @@ void Client::StartBatchUpsert(std::vector<PutOperation>& ops,
                                 "Master failed to start upsert operation");
         } else {
             op.replicas = start_responses[i].value();
-            CacheDfsDescriptors(op.key, op.replicas);
             op.RecordAllocatedReplicas();
             if (!HasExpectedReplicaAllocation(config, op.transfer_summary)) {
                 op.SetTerminalError(ErrorCode::NO_AVAILABLE_HANDLE,
@@ -2821,15 +2809,6 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
                             op.failure_context.value_or(
                                 "Replica transfer failed before finalize"));
     }
-
-    if (dfs_desc_cache_) {
-        for (const auto& op : ops) {
-            if (!op.IsSuccessful() &&
-                op.transfer_summary.allocated_dfs_replicas > 0) {
-                dfs_desc_cache_->Remove(op.key);
-            }
-        }
-    }
 }
 
 void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
@@ -2938,11 +2917,6 @@ void Client::FinalizeBatchUpsert(std::vector<PutOperation>& ops) {
                     LOG(INFO) << "Successfully revoked failed upsert for key "
                               << failed_keys[i];
                 }
-            }
-        }
-        if (dfs_desc_cache_) {
-            for (const auto& key : failed_keys) {
-                dfs_desc_cache_->Remove(key);
             }
         }
     }
@@ -3159,7 +3133,6 @@ tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
         hot_cache_->RemoveHotKey(key);
     }
 
-    if (dfs_desc_cache_) dfs_desc_cache_->Remove(key);
     return {};
 }
 
@@ -3221,11 +3194,6 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchRemove(
         }
     }
 
-    if (dfs_desc_cache_) {
-        for (size_t i = 0; i < keys.size() && i < results.size(); ++i) {
-            if (results[i]) dfs_desc_cache_->Remove(keys[i]);
-        }
-    }
     return results;
 }
 
@@ -3635,10 +3603,6 @@ tl::expected<void, ErrorCode> Client::NotifyOffloadSuccess(
     const std::vector<OffloadTaskItem>& tasks,
     const std::vector<StorageObjectMetadata>& metadatas) {
     return master_client_.NotifyOffloadSuccess(client_id_, tasks, metadatas);
-}
-
-void Client::SetDfsDescriptorCache(std::shared_ptr<DfsDescriptorCache> cache) {
-    dfs_desc_cache_ = std::move(cache);
 }
 
 void Client::SetDfsStorageBackend(
@@ -4142,17 +4106,6 @@ ErrorCode Client::ReadDfsReplica(const std::string& key,
         return results[0].error();
     }
     return ErrorCode::OK;
-}
-
-void Client::CacheDfsDescriptors(
-    const std::string& key,
-    const std::vector<Replica::Descriptor>& replica_descriptors) {
-    if (!dfs_desc_cache_) return;
-    for (const auto& replica : replica_descriptors) {
-        if (replica.is_dfs_replica()) {
-            dfs_desc_cache_->Put(key, replica.get_dfs_descriptor());
-        }
-    }
 }
 
 ErrorCode Client::TransferReadRange(

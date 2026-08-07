@@ -18,7 +18,6 @@
 #include "ha/leadership/leader_coordinator.h"
 #include "master_client.h"
 #include "storage_backend.h"
-#include "storage/distributed/dfs_descriptor_cache.h"
 #include "thread_pool.h"
 #include "transfer_engine.h"
 #include "transfer_task.h"
@@ -523,7 +522,6 @@ class Client {
     tl::expected<void, ErrorCode> NotifyOffloadSuccess(
         const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas);
-    void SetDfsDescriptorCache(std::shared_ptr<DfsDescriptorCache> cache);
     void SetDfsStorageBackend(
         std::shared_ptr<DistributedStorageBackend> backend);
 
@@ -711,10 +709,6 @@ class Client {
     ErrorCode ReadDfsReplica(const std::string& key,
                              const Replica::Descriptor& replica_descriptor,
                              std::vector<Slice>& slices);
-    void CacheDfsDescriptors(
-        const std::string& key,
-        const std::vector<Replica::Descriptor>& replica_descriptors);
-
     tl::expected<uint64_t, ErrorCode> ComputeObjectChecksumForSlices(
         const std::string& object_key, const std::vector<Slice>& slices,
         size_t object_size);
@@ -865,7 +859,6 @@ class Client {
     ThreadPool write_thread_pool_;
     std::shared_ptr<StorageBackend> storage_backend_;
     std::shared_ptr<DistributedStorageBackend> dfs_storage_backend_;
-    std::shared_ptr<DfsDescriptorCache> dfs_desc_cache_;
 
     // For high availability
     std::unique_ptr<ha::LeaderCoordinator> leader_coordinator_;
