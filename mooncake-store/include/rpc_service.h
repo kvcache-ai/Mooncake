@@ -218,9 +218,15 @@ class WrappedMasterService {
     tl::expected<void, ErrorCode> ReportSsdCapacity(
         const UUID& client_id, int64_t ssd_total_capacity_bytes);
 
-    tl::expected<void, ErrorCode> NotifyOffloadSuccess(
+    tl::expected<std::vector<uint8_t>, ErrorCode> NotifyOffloadSuccess(
         const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas);
+
+    // Pre-SSD-IO check: returns a vector aligned with @p tasks; result[i] is
+    // true iff task i is still current on master. Callers must drop stale
+    // tasks before writing bucket data to SSD.
+    tl::expected<std::vector<uint8_t>, ErrorCode> ValidateOffloadGenerations(
+        const std::vector<OffloadTaskItem>& tasks);
 
     // Promotion-on-hit RPCs.
     tl::expected<std::vector<PromotionTaskItem>, ErrorCode>

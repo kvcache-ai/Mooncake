@@ -981,6 +981,12 @@ class BucketStorageBackend : public StorageBackendInterface {
         double high_watermark_ratio, double low_watermark_ratio,
         EvictionHandler eviction_handler = nullptr) override;
 
+    // Evict @p keys_to_evict from a single bucket (all keys must share one
+    // bucket, per the complete_handler contract) without disturbing accepted
+    // siblings. Falls back to RollbackCommittedBucket when the bucket is
+    // fully drained. Used by NotifyOffloadSuccess partial-rejection paths.
+    void PartialRollbackKeys(const std::vector<std::string>& keys_to_evict);
+
    private:
     tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode> BuildBucket(
         int64_t bucket_id,

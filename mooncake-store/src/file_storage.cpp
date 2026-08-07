@@ -503,6 +503,35 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
                        << result.error() << " keys count: " << keys.size();
             return result.error();
         }
+        // Master returns a per-task acceptance vector: 1 = accepted, 0 =
+        // rejected as stale. Roll back rejected keys only, so accepted
+        // siblings in the same bucket are not clobbered.
+        const auto& accepted = result.value();
+        if (accepted.size() == keys.size()) {
+            std::vector<std::string> rejected_keys;
+            rejected_keys.reserve(keys.size());
+            for (size_t i = 0; i < keys.size(); ++i) {
+                if (!accepted[i]) {
+                    rejected_keys.push_back(keys[i]);
+                }
+            }
+            if (!rejected_keys.empty()) {
+                LOG(INFO) << "[OFFLOAD] master rejected "
+                          << rejected_keys.size() << " of " << keys.size()
+                          << " keys as stale; running partial rollback";
+                if (auto bucket_backend =
+                        std::dynamic_pointer_cast<BucketStorageBackend>(
+                            storage_backend_)) {
+                    bucket_backend->PartialRollbackKeys(rejected_keys);
+                }
+            }
+        } else {
+            // Shape mismatch is a protocol violation; log loudly but treat
+            // the batch as accepted so we don't clobber committed state.
+            LOG(ERROR) << "[OFFLOAD] NotifyOffloadSuccess returned "
+                       << accepted.size() << " flags for " << keys.size()
+                       << " keys; skipping partial-rollback bookkeeping";
+        }
         return ErrorCode::OK;
     };
 
@@ -553,6 +582,43 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         }
         if (batch_object.empty()) {
             continue;
+        }
+
+        // Pre-SSD-IO generation check: skip keys UpsertStart has already
+        // preempted so we don't emit a NACK that would race the new
+        // generation's marker. NotifyOffloadSuccess re-checks defensively.
+        {
+            std::vector<OffloadTaskItem> validate_tasks;
+            std::vector<std::string> validate_keys;
+            validate_tasks.reserve(batch_object.size());
+            validate_keys.reserve(batch_object.size());
+            for (const auto& [obj_key, _] : batch_object) {
+                validate_tasks.push_back(task_by_storage_key.at(obj_key));
+                validate_keys.push_back(obj_key);
+            }
+            auto validation =
+                client_->ValidateOffloadGenerations(validate_tasks);
+            if (!validation) {
+                // Master-side gate still applies in NotifyOffloadSuccess.
+                LOG(WARNING) << "[OFFLOAD] ValidateOffloadGenerations failed, "
+                                "skipping pre-SSD-IO check: "
+                             << validation.error();
+            } else {
+                const auto& results = validation.value();
+                for (size_t i = 0; i < validate_keys.size(); ++i) {
+                    if (i >= results.size() || !results[i]) {
+                        const auto& obj_key = validate_keys[i];
+                        const auto& task = task_by_storage_key.at(obj_key);
+                        LOG(INFO)
+                            << "[OFFLOAD] drop stale key locally, key="
+                            << task.key << ", generation=" << task.generation;
+                        batch_object.erase(obj_key);
+                    }
+                }
+            }
+            if (batch_object.empty()) {
+                continue;
+            }
         }
 
         // D2H staging: replace device slices with host memory slices

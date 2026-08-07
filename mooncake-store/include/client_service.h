@@ -518,12 +518,20 @@ class Client {
      * @param metadatas    The corresponding metadata for each offloaded object,
      * including size, storage location, etc.
      */
-    tl::expected<void, ErrorCode> NotifyOffloadSuccess(
+    tl::expected<std::vector<uint8_t>, ErrorCode> NotifyOffloadSuccess(
         const std::vector<std::string>& keys,
         const std::vector<StorageObjectMetadata>& metadatas);
-    tl::expected<void, ErrorCode> NotifyOffloadSuccess(
+    tl::expected<std::vector<uint8_t>, ErrorCode> NotifyOffloadSuccess(
         const std::vector<OffloadTaskItem>& tasks,
         const std::vector<StorageObjectMetadata>& metadatas);
+
+    /**
+     * @brief Pre-SSD-IO check that pending offload tasks are still current
+     * on master. Callers must drop stale entries from the batch before
+     * writing bucket data to SSD.
+     */
+    tl::expected<std::vector<uint8_t>, ErrorCode> ValidateOffloadGenerations(
+        const std::vector<OffloadTaskItem>& tasks);
 
     /**
      * @brief Fetch tasks assigned to a client

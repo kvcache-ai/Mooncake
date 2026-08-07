@@ -437,13 +437,25 @@ class MasterClient {
      * offloaded.
      * @param metadatas    The corresponding metadata for each offloaded object,
      * including size, storage location, etc.
+     *
+     * Returns a per-task acceptance vector (1 = accepted, 0 = rejected as
+     * stale). See MasterService::NotifyOffloadSuccess for the contract.
      */
-    [[nodiscard]] tl::expected<void, ErrorCode> NotifyOffloadSuccess(
-        const UUID& client_id, const std::vector<std::string>& keys,
-        const std::vector<StorageObjectMetadata>& metadatas);
-    [[nodiscard]] tl::expected<void, ErrorCode> NotifyOffloadSuccess(
-        const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
-        const std::vector<StorageObjectMetadata>& metadatas);
+    [[nodiscard]] tl::expected<std::vector<uint8_t>, ErrorCode>
+    NotifyOffloadSuccess(const UUID& client_id,
+                         const std::vector<std::string>& keys,
+                         const std::vector<StorageObjectMetadata>& metadatas);
+    [[nodiscard]] tl::expected<std::vector<uint8_t>, ErrorCode>
+    NotifyOffloadSuccess(const UUID& client_id,
+                         const std::vector<OffloadTaskItem>& tasks,
+                         const std::vector<StorageObjectMetadata>& metadatas);
+
+    /**
+     * @brief Pre-SSD-IO check: drop tasks whose master-side generation no
+     * longer matches (UpsertStart preempted them after mirror drain).
+     */
+    [[nodiscard]] tl::expected<std::vector<uint8_t>, ErrorCode>
+    ValidateOffloadGenerations(const std::vector<OffloadTaskItem>& tasks);
 
     /**
      * @brief Heartbeat-driven pull of pending L2->L1 promotion work for a

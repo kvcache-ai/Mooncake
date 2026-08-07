@@ -761,10 +761,13 @@ SegmentSerializer::Serialize() {
         for (const auto& key : sorted_keys) {
             packer.pack(key);
             const auto& task = segment->offloading_objects.at(key);
-            packer.pack_array(3);
+            // Pack generation as a 4th field; Deserialize still accepts
+            // the legacy 3-field layout for backward compat.
+            packer.pack_array(4);
             packer.pack(task.tenant_id);
             packer.pack(task.key);
             packer.pack(task.size);
+            packer.pack(task.generation);
         }
         packer.pack(segment->ssd_total_capacity_bytes);
     }
@@ -1126,7 +1129,8 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
                     client_value.via.array.ptr[key_idx].via.str.size);
                 const auto& task_obj = client_value.via.array.ptr[task_idx];
                 if (task_obj.type == msgpack::type::ARRAY &&
-                    task_obj.via.array.size == 3) {
+                    (task_obj.via.array.size == 3 ||
+                     task_obj.via.array.size == 4)) {
                     if (task_obj.via.array.ptr[0].type != msgpack::type::STR ||
                         task_obj.via.array.ptr[1].type != msgpack::type::STR) {
                         return tl::unexpected(SerializationError(
@@ -1140,11 +1144,24 @@ tl::expected<void, SerializationError> SegmentSerializer::Deserialize(
                             "deserialize local_disk_segments offloading task "
                             "size is not integer"));
                     }
+                    // Layout: size==3 is the pre-generation snapshot; size==4
+                    // additionally carries OffloadTaskItem.generation.
+                    if (task_obj.via.array.size == 4 &&
+                        !IsMsgpackInteger(task_obj.via.array.ptr[3])) {
+                        return tl::unexpected(SerializationError(
+                            ErrorCode::DESERIALIZE_FAIL,
+                            "deserialize local_disk_segments offloading task "
+                            "generation is not integer"));
+                    }
                     OffloadTaskItem task;
                     task.tenant_id =
                         task_obj.via.array.ptr[0].as<std::string>();
                     task.key = task_obj.via.array.ptr[1].as<std::string>();
                     task.size = task_obj.via.array.ptr[2].as<int64_t>();
+                    if (task_obj.via.array.size == 4) {
+                        task.generation =
+                            task_obj.via.array.ptr[3].as<uint64_t>();
+                    }
                     segment->offloading_objects[key] = std::move(task);
                 } else {
                     // Backward compatibility for snapshots whose

@@ -3329,7 +3329,7 @@ tl::expected<void, ErrorCode> Client::BatchGetOffloadObject(
     return {};
 }
 
-tl::expected<void, ErrorCode> Client::NotifyOffloadSuccess(
+tl::expected<std::vector<uint8_t>, ErrorCode> Client::NotifyOffloadSuccess(
     const std::vector<std::string>& keys,
     const std::vector<StorageObjectMetadata>& metadatas) {
     auto response =
@@ -3337,10 +3337,15 @@ tl::expected<void, ErrorCode> Client::NotifyOffloadSuccess(
     return response;
 }
 
-tl::expected<void, ErrorCode> Client::NotifyOffloadSuccess(
+tl::expected<std::vector<uint8_t>, ErrorCode> Client::NotifyOffloadSuccess(
     const std::vector<OffloadTaskItem>& tasks,
     const std::vector<StorageObjectMetadata>& metadatas) {
     return master_client_.NotifyOffloadSuccess(client_id_, tasks, metadatas);
+}
+
+tl::expected<std::vector<uint8_t>, ErrorCode>
+Client::ValidateOffloadGenerations(const std::vector<OffloadTaskItem>& tasks) {
+    return master_client_.ValidateOffloadGenerations(tasks);
 }
 
 tl::expected<void, ErrorCode> Client::PromotionObjectHeartbeat(

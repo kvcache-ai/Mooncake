@@ -233,13 +233,17 @@ struct OffloadTaskItem {
     std::string tenant_id;
     std::string key;
     int64_t size;
+    // Bumped by UpsertStart preemption; late completions with a stale value
+    // are rejected. 0 is a wire sentinel for pre-generation payloads (HA
+    // restore / older workers) and always treated as valid.
+    uint64_t generation{0};
 
     bool operator==(const OffloadTaskItem& other) const {
         return tenant_id == other.tenant_id && key == other.key &&
-               size == other.size;
+               size == other.size && generation == other.generation;
     }
 };
-YLT_REFL(OffloadTaskItem, tenant_id, key, size);
+YLT_REFL(OffloadTaskItem, tenant_id, key, size, generation);
 
 struct PromotionTaskItem {
     std::string tenant_id;

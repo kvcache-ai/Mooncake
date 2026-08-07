@@ -716,6 +716,211 @@ TEST_F(StorageBackendTest, BatchOffloadRollbackOnCompleteHandlerFailure) {
         << "No bucket data or metadata files should remain after rollback";
 }
 
+// PartialRollbackKeys must trim the on-disk .meta so a subsequent Init()
+// cannot resurrect the rejected key via ReRegisterOffloadedObjects.
+TEST_F(StorageBackendTest, PartialRollbackKeysPersistsAcrossInit) {
+    std::string test_dir = data_path + "/partial_rollback_persist_test";
+    fs::create_directories(test_dir);
+
+    FileStorageConfig config;
+    config.storage_filepath = test_dir;
+    BucketBackendConfig bucket_config;
+
+    std::shared_ptr<SimpleAllocator> client_buffer_allocator =
+        std::make_shared<SimpleAllocator>(128 * 1024 * 1024);
+
+    const std::string kRejectedKey = "partial_rollback_rejected_key";
+    const std::string kKeptKey = "partial_rollback_kept_key";
+    const std::string kRejectedValue = "value_of_rejected_key";
+    const std::string kKeptValue = "value_of_kept_key";
+
+    int64_t bucket_id = -1;
+    int64_t total_size_after_partial_rollback = 0;
+    {
+        BucketStorageBackend storage_backend(config, bucket_config);
+        ASSERT_TRUE(storage_backend.Init());
+
+        std::unordered_map<std::string, std::vector<Slice>> batched_slices;
+        void* rej_buf =
+            client_buffer_allocator->allocate(kRejectedValue.size());
+        memcpy(rej_buf, kRejectedValue.data(), kRejectedValue.size());
+        batched_slices.emplace(
+            kRejectedKey,
+            std::vector<Slice>{Slice{rej_buf, kRejectedValue.size()}});
+        void* kept_buf = client_buffer_allocator->allocate(kKeptValue.size());
+        memcpy(kept_buf, kKeptValue.data(), kKeptValue.size());
+        batched_slices.emplace(
+            kKeptKey, std::vector<Slice>{Slice{kept_buf, kKeptValue.size()}});
+
+        auto offload_res = storage_backend.BatchOffload(
+            batched_slices,
+            [](const std::vector<std::string>&,
+               std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+        ASSERT_TRUE(offload_res.has_value());
+        bucket_id = offload_res.value();
+
+        // Sanity: both keys are committed on disk and in the in-memory index.
+        auto rej_exists_before = storage_backend.IsExist(kRejectedKey);
+        ASSERT_TRUE(rej_exists_before.has_value());
+        EXPECT_TRUE(rej_exists_before.value());
+        auto kept_exists_before = storage_backend.IsExist(kKeptKey);
+        ASSERT_TRUE(kept_exists_before.has_value());
+        EXPECT_TRUE(kept_exists_before.value());
+
+        // Simulate the NotifyOffloadSuccess rejection path: master accepted
+        // kKeptKey and stale-rejected kRejectedKey. The worker calls
+        // PartialRollbackKeys with only the rejected key.
+        storage_backend.PartialRollbackKeys({kRejectedKey});
+
+        // In-memory: rejected gone, kept still there.
+        auto rej_exists_after = storage_backend.IsExist(kRejectedKey);
+        ASSERT_TRUE(rej_exists_after.has_value());
+        EXPECT_FALSE(rej_exists_after.value())
+            << "Rejected key must be evicted from object_bucket_map_";
+        auto kept_exists_after = storage_backend.IsExist(kKeptKey);
+        ASSERT_TRUE(kept_exists_after.has_value());
+        EXPECT_TRUE(kept_exists_after.value())
+            << "Accepted sibling must survive partial rollback";
+
+        auto partial_meta = storage_backend.GetStoreMetadata();
+        ASSERT_TRUE(partial_meta.has_value());
+        total_size_after_partial_rollback = partial_meta->total_size;
+    }
+
+    // The bucket files must remain (partial rollback keeps accepted
+    // siblings); only the rejected key's name is gone from .meta.
+    const auto metadata_path =
+        fs::path(test_dir) / (std::to_string(bucket_id) + ".meta");
+    const auto data_file_path =
+        fs::path(test_dir) / (std::to_string(bucket_id) + ".bucket");
+    ASSERT_TRUE(fs::exists(metadata_path))
+        << ".meta must remain for the accepted sibling";
+    ASSERT_TRUE(fs::exists(data_file_path))
+        << ".bucket must remain for the accepted sibling";
+
+    // Fresh backend loads only what is on disk. If PartialRollbackKeys did
+    // not rewrite .meta, kRejectedKey would come back here.
+    BucketStorageBackend restarted_backend(config, bucket_config);
+    ASSERT_TRUE(restarted_backend.Init());
+
+    auto rej_after_restart = restarted_backend.IsExist(kRejectedKey);
+    ASSERT_TRUE(rej_after_restart.has_value());
+    EXPECT_FALSE(rej_after_restart.value())
+        << "Rejected key must NOT be resurrected by Init() from .meta";
+    auto kept_after_restart = restarted_backend.IsExist(kKeptKey);
+    ASSERT_TRUE(kept_after_restart.has_value());
+    EXPECT_TRUE(kept_after_restart.value())
+        << "Accepted sibling must survive Init() re-scan";
+
+    auto restarted_meta = restarted_backend.GetStoreMetadata();
+    ASSERT_TRUE(restarted_meta.has_value());
+    EXPECT_EQ(restarted_meta->total_size, total_size_after_partial_rollback)
+        << "Partial rollback must not discount payload bytes that still occupy "
+           "the unchanged .bucket file";
+
+    // ScanMeta enumerates the persisted keys that ReRegisterOffloadedObjects
+    // would replay to master. Only the accepted sibling should appear.
+    std::vector<std::string> recovered_keys;
+    auto scan_result =
+        restarted_backend.ScanMeta([&](const std::vector<std::string>& keys,
+                                       std::vector<StorageObjectMetadata>&) {
+            recovered_keys.insert(recovered_keys.end(), keys.begin(),
+                                  keys.end());
+            return ErrorCode::OK;
+        });
+    ASSERT_TRUE(scan_result.has_value());
+    EXPECT_EQ(recovered_keys.size(), 1u);
+    EXPECT_NE(std::find(recovered_keys.begin(), recovered_keys.end(), kKeptKey),
+              recovered_keys.end());
+    EXPECT_EQ(
+        std::find(recovered_keys.begin(), recovered_keys.end(), kRejectedKey),
+        recovered_keys.end());
+
+    // The accepted sibling must still be readable end-to-end.
+    std::vector<char> read_buf(kKeptValue.size(), 0);
+    std::unordered_map<std::string, Slice> load_batch;
+    load_batch.emplace(kKeptKey, Slice{read_buf.data(), read_buf.size()});
+    auto load_result = restarted_backend.BatchLoad(load_batch);
+    ASSERT_TRUE(load_result.has_value())
+        << "BatchLoad should succeed for the accepted sibling after restart";
+    EXPECT_EQ(std::string(read_buf.begin(), read_buf.end()), kKeptValue);
+}
+
+// PartialRollbackKeys draining every key in a bucket must delete both
+// on-disk files via the RollbackCommittedBucket fallback.
+TEST_F(StorageBackendTest,
+       PartialRollbackKeysAllRejectedFallsBackToFullRollback) {
+    std::string test_dir = data_path + "/partial_rollback_all_rejected_test";
+    fs::create_directories(test_dir);
+
+    FileStorageConfig config;
+    config.storage_filepath = test_dir;
+    BucketBackendConfig bucket_config;
+
+    std::shared_ptr<SimpleAllocator> client_buffer_allocator =
+        std::make_shared<SimpleAllocator>(128 * 1024 * 1024);
+
+    const std::string k1 = "all_rej_k1";
+    const std::string k2 = "all_rej_k2";
+    const std::string v1 = "value1";
+    const std::string v2 = "value2";
+
+    int64_t bucket_id = -1;
+    {
+        BucketStorageBackend storage_backend(config, bucket_config);
+        ASSERT_TRUE(storage_backend.Init());
+
+        std::unordered_map<std::string, std::vector<Slice>> batched_slices;
+        void* b1 = client_buffer_allocator->allocate(v1.size());
+        memcpy(b1, v1.data(), v1.size());
+        batched_slices.emplace(k1, std::vector<Slice>{Slice{b1, v1.size()}});
+        void* b2 = client_buffer_allocator->allocate(v2.size());
+        memcpy(b2, v2.data(), v2.size());
+        batched_slices.emplace(k2, std::vector<Slice>{Slice{b2, v2.size()}});
+
+        auto offload_res = storage_backend.BatchOffload(
+            batched_slices,
+            [](const std::vector<std::string>&,
+               std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+        ASSERT_TRUE(offload_res.has_value());
+        bucket_id = offload_res.value();
+
+        // Reject BOTH keys — bucket drains and full rollback should fire.
+        storage_backend.PartialRollbackKeys({k1, k2});
+
+        auto e1 = storage_backend.IsExist(k1);
+        ASSERT_TRUE(e1.has_value());
+        EXPECT_FALSE(e1.value());
+        auto e2 = storage_backend.IsExist(k2);
+        ASSERT_TRUE(e2.has_value());
+        EXPECT_FALSE(e2.value());
+    }
+
+    // Both on-disk files must be gone. Full rollback deletes .bucket + .meta.
+    const auto metadata_path =
+        fs::path(test_dir) / (std::to_string(bucket_id) + ".meta");
+    const auto data_file_path =
+        fs::path(test_dir) / (std::to_string(bucket_id) + ".bucket");
+    EXPECT_FALSE(fs::exists(metadata_path))
+        << ".meta must be deleted when bucket drains";
+    EXPECT_FALSE(fs::exists(data_file_path))
+        << ".bucket must be deleted when bucket drains";
+
+    // Fresh Init sees an empty backend.
+    BucketStorageBackend restarted_backend(config, bucket_config);
+    ASSERT_TRUE(restarted_backend.Init());
+    std::vector<std::string> recovered_keys;
+    auto scan_result =
+        restarted_backend.ScanMeta([&](const std::vector<std::string>& keys,
+                                       std::vector<StorageObjectMetadata>&) {
+            recovered_keys.insert(recovered_keys.end(), keys.begin(),
+                                  keys.end());
+            return ErrorCode::OK;
+        });
+    ASSERT_TRUE(scan_result.has_value());
+    EXPECT_TRUE(recovered_keys.empty());
+}
+
 TEST_F(StorageBackendTest, AdaptorBatchOffloadAndBatchLoad) {
     FileStorageConfig cfg;
 
