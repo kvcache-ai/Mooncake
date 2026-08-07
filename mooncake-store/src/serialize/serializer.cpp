@@ -9,6 +9,19 @@
 
 namespace mooncake {
 
+namespace {
+
+bool IsKnownMountedSegmentProtocol(const std::string &value) {
+    return value == "tcp" || value == "rdma" || value == "efa" ||
+           value == "cxl" || value == "cxi" || value == "ub" ||
+           value == "ascend" || value == "ubshmem" || value == "sunrise_link" ||
+           value == "rpc_only" || value == "nvmeof" || value == "hip" ||
+           value == "nvlink" || value == "nvlink_intra" || value == "maca" ||
+           value == "barex";
+}
+
+}  // namespace
+
 // Node serialization size constants for offset_allocator::__Allocator
 constexpr size_t OFFSET_ALLOCATOR_NODE_BOOL_SIZE = 1;
 constexpr size_t OFFSET_ALLOCATOR_NODE_UINT32_COUNT = 6;
@@ -831,9 +844,13 @@ tl::expected<void, SerializationError> Serializer<MountedSegment>::serialize(
     // Use array structure for packing, more efficient
     // Format: [segment_id, segment_name, segment_base, segment_size,
     // te_endpoint, status, has_buffer_allocator, buffer_allocator_data,
-    // host_id]
+    // host_id, protocol]
+    //
+    // protocol and host_id were independently added as a 9th field on two
+    // branches. New snapshots use size==10 to keep both fields unambiguous,
+    // with host_id first because it entered main before protocol.
 
-    packer.pack_array(9);
+    packer.pack_array(10);
 
     // Serialize Segment info
     packer.pack(UuidToString(mounted_segment.segment.id));
@@ -857,6 +874,7 @@ tl::expected<void, SerializationError> Serializer<MountedSegment>::serialize(
                 return tl::unexpected(result.error());
             }
             packer.pack(mounted_segment.segment.host_id);
+            packer.pack(mounted_segment.segment.protocol);
             return {};
         }
     }
@@ -864,6 +882,7 @@ tl::expected<void, SerializationError> Serializer<MountedSegment>::serialize(
     packer.pack(false);  // Mark no valid buffer allocator exists
     packer.pack_nil();
     packer.pack(mounted_segment.segment.host_id);
+    packer.pack(mounted_segment.segment.protocol);
     return {};
 }
 
@@ -876,10 +895,18 @@ Serializer<MountedSegment>::deserialize(const msgpack::object &obj) {
                                "state: not a msgpack array"));
     }
 
-    if (obj.via.array.size < 8) {
+    // Snapshot format is versioned by array size:
+    //   size == 8: legacy snapshot, no protocol or host_id field
+    //   size == 9: compatibility snapshot, either protocol or host_id
+    //   size == 10: current snapshot, with host_id and protocol
+    // Anything else is invalid.
+    if (obj.via.array.size != 8 && obj.via.array.size != 9 &&
+        obj.via.array.size != 10) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
-            "deserialize MountedSegment invalid array size"));
+            fmt::format("deserialize MountedSegment invalid array size: "
+                        "expected 8, 9, or 10, got {}",
+                        obj.via.array.size)));
     }
 
     MountedSegment mounted_segment;
@@ -920,8 +947,16 @@ Serializer<MountedSegment>::deserialize(const msgpack::object &obj) {
                 return tl::unexpected(allocatorResult.error());
             }
         }
-        if (obj.via.array.size >= 9) {
+        if (obj.via.array.size == 9) {
+            std::string value = array[8].as<std::string>();
+            if (IsKnownMountedSegmentProtocol(value)) {
+                mounted_segment.segment.protocol = std::move(value);
+            } else {
+                mounted_segment.segment.host_id = std::move(value);
+            }
+        } else if (obj.via.array.size == 10) {
             mounted_segment.segment.host_id = array[8].as<std::string>();
+            mounted_segment.segment.protocol = array[9].as<std::string>();
         }
     } catch (const std::exception &e) {
         return tl::unexpected(SerializationError(
@@ -937,9 +972,12 @@ Serializer<OffsetBufferAllocator>::serialize(
     const OffsetBufferAllocator &allocator, MsgpackPacker &packer) {
     // Use array structure to pack OffsetBufferAllocator
     // Format: [segment_name, base, total_size, current_size,
-    // transport_endpoint, offset_allocator]
+    // transport_endpoint, offset_allocator, replica_type]
+    //
+    // replica_type is appended at the end so that older snapshots (size==6)
+    // remain deserializable. New snapshots use size==7. See issue #2636.
 
-    packer.pack_array(6);
+    packer.pack_array(7);
 
     // Serialize basic properties
     packer.pack(allocator.segment_name_);
@@ -956,6 +994,9 @@ Serializer<OffsetBufferAllocator>::serialize(
         return tl::unexpected(result.error());
     }
 
+    // Append replica_type as int8 at the end (see format comment).
+    packer.pack(static_cast<int8_t>(allocator.replica_type_));
+
     return {};
 }
 
@@ -969,10 +1010,18 @@ auto Serializer<OffsetBufferAllocator>::deserialize(const msgpack::object &obj)
                                "serialized state: not a msgpack array"));
     }
 
-    if (obj.via.array.size != 6) {
+    // Snapshot format is versioned by array size:
+    //   size == 6: legacy snapshot, no replica_type (defaults to MEMORY,
+    //              which is the same wrong behavior as before the fix)
+    //   size == 7: current snapshot, with replica_type as the last field
+    // Anything else is invalid.
+    if (obj.via.array.size != 6 && obj.via.array.size != 7) {
         return tl::unexpected(SerializationError(
             ErrorCode::DESERIALIZE_FAIL,
-            "deserialize OffsetBufferAllocator invalid array size"));
+            fmt::format("deserialize OffsetBufferAllocator invalid array "
+                        "size: expected 6 (legacy) or 7 (with replica_type), "
+                        "got {}",
+                        obj.via.array.size)));
     }
 
     try {
@@ -992,9 +1041,32 @@ auto Serializer<OffsetBufferAllocator>::deserialize(const msgpack::object &obj)
             return tl::unexpected(offset_allocator_result.error());
         }
 
+        // replica_type is the trailing field added for issue #2636. Legacy
+        // snapshots (size==6) fall back to ReplicaType::MEMORY, which matches
+        // the previous (buggy) behavior - i.e. a NoF SSD segment would have
+        // its metrics counted under the memory bucket.
+        ReplicaType replica_type = ReplicaType::MEMORY;
+        if (obj.via.array.size == 7) {
+            auto raw_replica_type = array[6].as<int8_t>();
+            switch (raw_replica_type) {
+                case static_cast<int8_t>(ReplicaType::MEMORY):
+                    replica_type = ReplicaType::MEMORY;
+                    break;
+                case static_cast<int8_t>(ReplicaType::NOF_SSD):
+                    replica_type = ReplicaType::NOF_SSD;
+                    break;
+                default:
+                    return tl::unexpected(SerializationError(
+                        ErrorCode::DESERIALIZE_FAIL,
+                        fmt::format("deserialize OffsetBufferAllocator "
+                                    "invalid replica_type: {}",
+                                    raw_replica_type)));
+            }
+        }
+
         // Create OffsetBufferAllocator instance
         auto allocator = std::make_shared<OffsetBufferAllocator>(
-            segment_name, base, total_size, transport_endpoint);
+            segment_name, base, total_size, transport_endpoint, replica_type);
 
         // Set internal member variable values
         allocator->offset_allocator_ = offset_allocator_result.value();
