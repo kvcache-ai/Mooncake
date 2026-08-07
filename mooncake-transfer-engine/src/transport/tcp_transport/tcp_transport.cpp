@@ -1059,6 +1059,18 @@ Status TcpTransport::submitTransferTask(
     return Status::OK();
 }
 
+Status TcpTransport::submitTransferTaskGroup(
+    const std::vector<TransferTask*>& task_list) {
+    std::vector<Slice*> slices;
+    slices.reserve(task_list.size());
+    for (auto* task : task_list) {
+        assert(task && task->request);
+        slices.push_back(prepareTransfer(task, *task->request));
+    }
+    startTransferSequence(std::move(slices));
+    return Status::OK();
+}
+
 Transport::Slice* TcpTransport::prepareTransfer(
     TransferTask* task, const TransferRequest& request) {
     task->total_bytes = request.length;
