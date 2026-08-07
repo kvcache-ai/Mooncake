@@ -21,6 +21,12 @@
 namespace mooncake {
 namespace {
 
+#ifdef MOONCAKE_EP_USE_MUSA
+constexpr c10::DeviceType kGpuDeviceType = c10::DeviceType::PrivateUse1;
+#else
+constexpr c10::DeviceType kGpuDeviceType = c10::DeviceType::CUDA;
+#endif
+
 constexpr const char* kSingleTensorError =
     "Expecting one tensor only but got multiple.";
 constexpr const char* kSparseError = "Sparse op not supported.";
@@ -380,8 +386,7 @@ MooncakeBackend::MooncakeBackend(
     // Register a lightweight Backend shim so PyTorch dispatch can find a
     // registered Backend for this ProcessGroup. The shim delegates supported
     // P2P and collective operations back to this backend.
-    const auto device_type =
-        isCpu_ ? c10::DeviceType::CPU : c10::DeviceType::CUDA;
+    const auto device_type = isCpu_ ? c10::DeviceType::CPU : kGpuDeviceType;
     auto shim = c10::make_intrusive<MooncakeBackendShim>(this, max_group_size_);
     setBackend(device_type, BackendType::CUSTOM, shim);
 #ifndef MOONCAKE_EP_USE_MUSA
@@ -431,7 +436,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::launchCollective(
                       failed_ranks_hint.data(), failed_ranks_hint_count),
                 operation);
     if (postCompletion) postCompletion();
-    auto event = std::make_shared<c10::Event>(c10::DeviceType::CUDA);
+    auto event = std::make_shared<c10::Event>(kGpuDeviceType);
     event->record(stream);
     if (at::cuda::currentStreamCaptureStatus() ==
         c10::cuda::CaptureStatus::None) {
@@ -551,7 +556,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_allgather_base(
     const c10d::AllgatherOptions&) {
     validateSingleBufferTensors(
         outputBuffer, inputBuffer,
-        isCpu_ ? c10::DeviceType::CPU : c10::DeviceType::CUDA);
+        isCpu_ ? c10::DeviceType::CPU : kGpuDeviceType);
 
     return launchCollective<mooncakePgAllGatherCpu, mooncakePgAllGatherGpu>(
         c10d::OpType::_ALLGATHER_BASE, "mooncakePgAllGather", inputBuffer,
@@ -565,7 +570,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::_reduce_scatter_base(
     const c10d::ReduceScatterOptions& opts) {
     validateSingleBufferTensors(
         outputBuffer, inputBuffer,
-        isCpu_ ? c10::DeviceType::CPU : c10::DeviceType::CUDA);
+        isCpu_ ? c10::DeviceType::CPU : kGpuDeviceType);
 
     return launchCollective<mooncakePgReduceScatterCpu,
                             mooncakePgReduceScatterGpu>(
@@ -622,7 +627,7 @@ c10::intrusive_ptr<c10d::Work> MooncakeBackend::barrier(
         mooncakePgBarrierGpu(comm_, convertStream(stream),
                              failed_ranks_hint.data(), failed_ranks_hint_count),
         "mooncakePgBarrierGpu");
-    auto event = std::make_shared<c10::Event>(c10::DeviceType::CUDA);
+    auto event = std::make_shared<c10::Event>(kGpuDeviceType);
     event->record(stream);
     if (at::cuda::currentStreamCaptureStatus() ==
         c10::cuda::CaptureStatus::None) {
