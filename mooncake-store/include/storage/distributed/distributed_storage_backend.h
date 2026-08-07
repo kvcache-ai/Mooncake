@@ -1,20 +1,39 @@
 #pragma once
 
 #include <memory>
+#include <mutex>
+#include <optional>
+#include <vector>
 
+#include "dfs_descriptor_cache.h"
 #include "fs_adapter.h"
 #include "storage_backend.h"
 
 namespace mooncake {
 
 struct DistributedStorageConfig {
-    std::string fsdir = "distributed_dir";
+    std::string fsdir = "/mnt/3fs/mooncake";
     std::string fs_adapter_type = "hf3fs";
     bool enable_health_check = false;
-    int hash_bucket_count = 256;
+    int shard_count = 64;
+    uint64_t shard_capacity = 4ULL * 1024 * 1024 * 1024;
+    uint64_t alignment = 4096;
+    bool single_tenant = true;
 
     bool Validate() const;
     static DistributedStorageConfig FromEnvironment();
+};
+
+struct DfsWriteRequest {
+    std::string key;
+    DistributedFSDescriptor descriptor;
+    std::vector<Slice> slices;
+};
+
+struct DfsReadRequest {
+    std::string key;
+    DistributedFSDescriptor descriptor;
+    std::vector<Slice> slices;
 };
 
 /**
@@ -29,6 +48,7 @@ class DistributedStorageBackend : public StorageBackendInterface {
         const FileStorageConfig& file_storage_config,
         const DistributedStorageConfig& distributed_config,
         std::unique_ptr<FileSystemAdapter> fs_adapter);
+    ~DistributedStorageBackend() override;
 
     tl::expected<void, ErrorCode> Init() override;
 
@@ -39,6 +59,14 @@ class DistributedStorageBackend : public StorageBackendInterface {
             complete_handler,
         EvictionHandler eviction_handler = nullptr) override;
 
+    std::vector<tl::expected<void, ErrorCode>> BatchWrite(
+        const std::vector<DfsWriteRequest>& requests);
+
+    std::vector<tl::expected<void, ErrorCode>> BatchRead(
+        const std::vector<DfsReadRequest>& requests);
+
+    // Compatibility path for StorageBackendInterface callers. Shard-based DFS
+    // reads should prefer BatchRead so the descriptor remains request-scoped.
     tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batched_slices) override;
 
@@ -51,15 +79,29 @@ class DistributedStorageBackend : public StorageBackendInterface {
             const std::vector<std::string>& keys,
             std::vector<StorageObjectMetadata>& metadatas)>& handler) override;
 
+    void SetDescriptorCache(std::shared_ptr<DfsDescriptorCache> cache) {
+        desc_cache_ = std::move(cache);
+    }
+
+    std::shared_ptr<DfsDescriptorCache> GetDescriptorCache() const {
+        return desc_cache_;
+    }
+
    private:
-    std::string GetObjectPath(const std::string& key) const;
-    static std::string EscapeFilename(const std::string& key);
-    static std::string UnescapeFilename(const std::string& name);
+    struct ShardFile {
+        std::string path;
+        int fd = -1;
+        std::mutex mutex;
+    };
+
+    std::optional<DistributedFSDescriptor> LookupDescriptor(
+        const std::string& storage_key) const;
 
     std::unique_ptr<FileSystemAdapter> fs_adapter_;
+    std::shared_ptr<DfsDescriptorCache> desc_cache_;
     DistributedStorageConfig distributed_config_;
     std::string root_dir_;
-    int hash_bucket_count_;
+    std::vector<std::unique_ptr<ShardFile>> shard_files_;
     bool initialized_ = false;
 };
 

@@ -1,21 +1,11 @@
 #pragma once
 
-#include <memory>
-
 #include "storage/distributed/fs_adapter.h"
 
 namespace mooncake {
 
-// Forward declaration: avoid including hf3fs/hf3fs.h in the header.
-// Full type is only used in hf3fs_adapter.cpp.
-class USRBIOResourceManager;
-
-class Hf3fsAdapter : public FileSystemAdapter {
+class PosixFsAdapter : public FileSystemAdapter {
    public:
-    Hf3fsAdapter();
-    ~Hf3fsAdapter() override;  // defined in .cpp (needs complete type for
-                               // unique_ptr deleter)
-
     tl::expected<size_t, ErrorCode> WriteFile(
         const std::string& path, std::span<const char> data) override;
 
@@ -56,10 +46,10 @@ class Hf3fsAdapter : public FileSystemAdapter {
 
     tl::expected<void, ErrorCode> Shutdown() override;
 
-    const char* GetName() const override { return "hf3fs"; }
+    const char* GetName() const override { return "posix"; }
 
    private:
-    std::unique_ptr<USRBIOResourceManager> resource_manager_;
+    std::string mount_path_;
 };
 
 }  // namespace mooncake

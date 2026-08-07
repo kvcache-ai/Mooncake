@@ -115,10 +115,11 @@ inline const Replica::Descriptor *PickBestRemoteMemory(
     return best;
 }
 
-// Select the best replica from a list: prefer local MEMORY, then any MEMORY,
-// then LOCAL_DISK, then DISK. Master may return replicas in any order, so we
-// always scan. When scoring is enabled and there are multiple remote MEMORY
-// replicas, the best-scoring one is chosen instead of the first encountered.
+// Select the best replica from a list: prefer local MEMORY, local NOF_SSD,
+// remote MEMORY, remote NOF_SSD, LOCAL_DISK, DFS, then DISK. Master may return
+// replicas in any order, so we always scan. When scoring is enabled and there
+// are multiple remote MEMORY replicas, the best-scoring one is chosen instead
+// of the first encountered.
 inline const Replica::Descriptor *SelectBestReplica(
     const std::vector<Replica::Descriptor> &replicas,
     const std::unordered_set<std::string> &local_endpoints) {
@@ -157,7 +158,9 @@ inline const Replica::Descriptor *SelectBestReplica(
     for (const auto &r : replicas) {
         if (r.status != ReplicaStatus::COMPLETE) continue;
         if (r.is_local_disk_replica()) {
-            best = &r;  // LOCAL_DISK always overrides DISK
+            best = &r;  // LOCAL_DISK always overrides DFS and DISK
+        } else if (r.is_dfs_replica()) {
+            if (!best || !best->is_local_disk_replica()) best = &r;
         } else if (r.is_disk_replica() && !best) {
             best = &r;
         }

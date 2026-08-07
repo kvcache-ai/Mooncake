@@ -133,6 +133,16 @@ add_store_test(host_port_fix_test host_port_fix_test.cpp)
 add_store_test(client_metrics_test client_metrics_test.cpp)
 add_store_test(ssd_metrics_test ssd_metrics_test.cpp)
 add_store_test(serializer_test serializer_test.cpp)
+add_store_test(dfs_posix_test dfs_posix_test.cpp)
+add_store_test(dfs_sync_client_test dfs_sync_client_test.cpp)
+add_test(NAME dfs_batch_read_checksum_test
+         COMMAND dfs_sync_client_test
+                 --gtest_filter=DfsSyncClientTest.BatchGetVerifiesDfsChecksum)
+set_tests_properties(dfs_batch_read_checksum_test
+                     PROPERTIES ENVIRONMENT "MOONCAKE_STORE_CHECKSUM=1")
+if(USE_3FS)
+  add_store_test(dfs_hf3fs_test dfs_hf3fs_test.cpp)
+endif()
 add_store_test(
   embedded_snapshot_catalog_store_test
   ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store_test.cpp

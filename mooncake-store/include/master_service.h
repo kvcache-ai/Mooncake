@@ -57,6 +57,9 @@ struct MasterSnapshotPayloads;
 class MasterSnapshotCodecTest;  // test fixture, needs private state access
 }  // namespace ha
 
+class EtcdOpLogStore;
+class DfsGlobalAllocator;
+
 // Forward declarations
 class AllocationStrategy;
 class EvictionStrategy;
@@ -1120,7 +1123,7 @@ class MasterService {
             return EraseReplicas([replica_type](const Replica& replica) {
                 if (replica_type == ReplicaType::ALL) {
                     return replica.is_memory_replica() ||
-                           replica.is_nof_replica();
+                           replica.is_nof_replica() || replica.is_dfs_replica();
                 }
                 return replica.type() == replica_type;
             });
@@ -1580,7 +1583,11 @@ class MasterService {
     void DiscardExpiredProcessingReplicas(
         MetadataShardAccessorRW& shard,
         const std::chrono::system_clock::time_point& now);
-
+    void FreeDfsReplicas(const std::string& key,
+                         const std::vector<Replica>& replicas);
+    void RemoveDfsReplicaByOffset(const std::string& key, int shard_idx,
+                                  uint64_t offset);
+    void InitDfsAllocatorFromEnvironment();
     /**
      * @brief Helper to release space of expired discarded replicas.
      * @return Number of released objects that have memory replicas
@@ -2125,6 +2132,8 @@ class MasterService {
     void cleanupHttpMetadata(const std::string& segment_name);
 
     bool use_disk_replica_{false};
+    bool enable_dfs_{false};
+    std::unique_ptr<DfsGlobalAllocator> dfs_allocator_;
 
     // Segment management
     SegmentManager segment_manager_;
