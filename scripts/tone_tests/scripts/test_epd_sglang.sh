@@ -31,7 +31,7 @@ start_epd_component()
             port=30000
             log_path="/test_run/run/logs/$test_case_name/$model_name_clean/encoder.log"
             pid_suffix="encoder"
-            extra_args="--encoder-only --encoder-transfer-backend mooncake --tp-size 2"
+            extra_args="--encoder-only --encoder-transfer-backend mooncake --tp-size 2 --base-gpu-id=${MOONCAKE_EPD_ENCODER_GPU_ID:-0}"
             ready_pattern="Application startup complete."
             echo "Starting Encoder..."
             ;;
@@ -40,7 +40,7 @@ start_epd_component()
             port=30002
             log_path="/test_run/run/logs/$test_case_name/$model_name_clean/sglang_server_prefill.log"
             pid_suffix="prefill"
-            extra_args="--disaggregation-mode prefill --language-only --encoder-urls http://${LOCAL_IP}:30000 --tp-size 2 --encoder-transfer-backend mooncake --base-gpu-id=4"
+            extra_args="--disaggregation-mode prefill --language-only --encoder-urls http://${LOCAL_IP}:30000 --tp-size 2 --encoder-transfer-backend mooncake --base-gpu-id=${MOONCAKE_EPD_PREFILL_GPU_ID:-4}"
             ready_pattern="The server is fired up and ready to roll!"
             echo "Starting Prefill Server..."
             ;;
@@ -49,7 +49,7 @@ start_epd_component()
             port=30003
             log_path="/test_run/run/logs/$test_case_name/$model_name_clean/sglang_server_decode.log"
             pid_suffix="decode"
-            extra_args="--disaggregation-mode decode --tp-size 2 --base-gpu-id=6"
+            extra_args="--disaggregation-mode decode --tp-size 2 --base-gpu-id=${MOONCAKE_EPD_DECODE_GPU_ID:-6}"
             ready_pattern="The server is fired up and ready to roll!"
             echo "Starting Decode Server..."
             ;;
@@ -178,7 +178,7 @@ start_remote_decode()
     local model_name=$1
     local model_name_clean=$2
     
-    if ! ${SSH_CMD} $REMOTE_IP "source $REMOTE_TEST_DIR/run/.shrc; cd \$BASE_DIR/scripts && ./$test_case_name.sh start_component decode $model_name $model_name_clean"; then
+    if ! ${SSH_CMD} "${REMOTE_SSH_TARGET:-$REMOTE_IP}" "source $REMOTE_TEST_DIR/run/.shrc; cd \$BASE_DIR/scripts && ./$test_case_name.sh start_component decode $model_name $model_name_clean"; then
         echo "ERROR: Failed to start remote decode component"
         return 1
     fi

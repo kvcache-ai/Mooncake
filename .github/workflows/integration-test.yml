@@ -149,3 +149,107 @@ jobs:
             sleep 30
           done
         shell: bash
+
+  test-rocm-integration:
+    name: ROCm MI350X external PD (4+4 core tier)
+    if: >-
+      github.event_name == 'push' ||
+      github.event_name == 'workflow_dispatch' ||
+      github.event.action == 'opened' ||
+      contains(github.event.pull_request.labels.*.name, 'run-ci')
+    runs-on: ubuntu-latest
+    timeout-minutes: 390
+    env:
+      TONE_USER_NAME: ${{ secrets.TONE_ROCM_USER_NAME }}
+      TONE_USER_TOKEN: ${{ secrets.TONE_ROCM_USER_TOKEN }}
+      TONE_TEMPLATE: ${{ secrets.TONE_ROCM_TEMPLATE }}
+      GH_API_TOKEN: ${{ github.token }}
+    steps:
+      - name: Report unconfigured ROCm external CI
+        if: ${{ env.TONE_USER_NAME == '' || env.TONE_USER_TOKEN == '' || env.TONE_TEMPLATE == '' }}
+        run: echo "ROCm external CI is staged but its T-One credentials/template are not configured."
+
+      - name: Resolve ROCm wheel artifacts and trigger T-One
+        if: ${{ env.TONE_USER_NAME != '' && env.TONE_USER_TOKEN != '' && env.TONE_TEMPLATE != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA="${{ inputs.pr_sha || github.event.pull_request.head.sha || github.sha }}"
+          PR_ID="${{ inputs.pr_number || github.event.pull_request.number }}"
+          if [ "${{ github.event_name }}" = push ]; then
+            SHA="${{ github.sha }}"
+            PR_ID=""
+          fi
+
+          for attempt in $(seq 1 120); do
+            run_id=""
+            if curl -LfsS \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -H "Authorization: Bearer ${GH_API_TOKEN}" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/runs?head_sha=${SHA}&per_page=100" \
+              -o runs.json; then
+              run_id=$(jq -r '.workflow_runs[] | select(.path == ".github/workflows/ci.yml") | .id' runs.json | head -n1 || true)
+            fi
+            if [ -n "$run_id" ]; then
+              if curl -LfsS \
+                -H "Accept: application/vnd.github+json" \
+                -H "X-GitHub-Api-Version: 2022-11-28" \
+                -H "Authorization: Bearer ${GH_API_TOKEN}" \
+                "https://api.github.com/repos/${{ github.repository }}/actions/runs/${run_id}/artifacts?per_page=100" \
+                -o artifacts.json; then
+                artifact_py310=$(jq -r '.artifacts[] | select(.name == "mooncake-wheel-rocm-ubuntu-py310" and (.expired | not)) | .id' artifacts.json | head -n1 || true)
+                artifact_py312=$(jq -r '.artifacts[] | select(.name == "mooncake-wheel-rocm-ubuntu-py312" and (.expired | not)) | .id' artifacts.json | head -n1 || true)
+                if [ -n "$artifact_py310" ] && [ -n "$artifact_py312" ]; then
+                  break
+                fi
+              fi
+            fi
+            [ "$attempt" -lt 120 ] || { echo "ROCm wheel artifacts did not appear" >&2; exit 1; }
+            sleep 30
+          done
+
+          ENV_INFO="ARTIFACT_ID_SGLANG=${artifact_py310} ARTIFACT_ID_VLLM=${artifact_py312} GIT_REPO=${{ github.repository }} CI_ACCELERATOR=rocm MOONCAKE_CI_TIER=core-4gpu"
+          [ -z "$PR_ID" ] || ENV_INFO="${ENV_INFO} PR_ID=${PR_ID}"
+          signature="${TONE_USER_NAME}|${TONE_USER_TOKEN}|$(python3 -c 'import time; print(time.time())')"
+          signature=$(printf '%s' "$signature" | base64 -w0)
+          jq -n \
+            --arg workspace mooncake_test \
+            --arg project mooncake-ci \
+            --arg template "$TONE_TEMPLATE" \
+            --arg name "mooncake-rocm-ci-${SHA}" \
+            --arg username "$TONE_USER_NAME" \
+            --arg env_info "$ENV_INFO" \
+            --arg signature "$signature" \
+            '{workspace:$workspace,project:$project,template:$template,name:$name,username:$username,env_ifs:" ",env_info:$env_info,signature:$signature}' \
+            > request.json
+          curl -fsS -H 'Content-Type: application/json' -X POST \
+            --data @request.json https://tone.openanolis.cn/api/job/create/ -o job.json
+          [ "$(jq -r .code job.json)" = 200 ] || { jq . job.json; exit 1; }
+          job_id=$(jq -r .data.id job.json)
+          [ -n "$job_id" ] && [ "$job_id" != null ] || { echo "T-One returned no job ID" >&2; exit 1; }
+          echo "job_id=$job_id" >> "$GITHUB_ENV"
+          echo "T-One ROCm job: $job_id"
+
+      - name: Query ROCm T-One result
+        if: ${{ env.TONE_USER_NAME != '' && env.TONE_USER_TOKEN != '' && env.TONE_TEMPLATE != '' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          for attempt in $(seq 1 720); do
+            signature="${TONE_USER_NAME}|${TONE_USER_TOKEN}|$(python3 -c 'import time; print(time.time())')"
+            signature=$(printf '%s' "$signature" | base64 -w0)
+            jq -n --arg username "$TONE_USER_NAME" --arg signature "$signature" \
+              --arg job_id "$job_id" '{username:$username,signature:$signature,job_id:$job_id}' > query.json
+            curl -fsS -H 'Content-Type: application/json' -X POST \
+              --data @query.json https://tone.openanolis.cn/api/job/query/ -o status.json
+            [ "$(jq -r .code status.json)" = 200 ] || { jq . status.json; exit 1; }
+            state=$(jq -r .data.job_second_state status.json)
+            case "$state" in
+              *pass*) exit 0 ;;
+              *fail*|*stop*) jq .data status.json; exit 1 ;;
+            esac
+            sleep 30
+          done
+          echo "ROCm T-One job exceeded its six-hour controller timeout" >&2
+          exit 1
