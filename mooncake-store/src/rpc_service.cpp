@@ -89,6 +89,14 @@ void WrappedMasterService::init_http_server() {
         });
 
     http_server_.set_http_handler<GET>(
+        "/get_key_count", [&](coro_http_request& req, coro_http_response& resp) {
+            resp.add_header("Content-Type", "text/plain; version=0.0.4");
+            resp.set_status_and_content(
+                status_type::ok,
+                std::to_string(GetMasterService().GetKeyCount()));
+        });
+
+    http_server_.set_http_handler<GET>(
         "/health", [](coro_http_request& req, coro_http_response& resp) {
             resp.add_header("Content-Type", "text/plain; version=0.0.4");
             resp.set_status_and_content(status_type::ok, "OK");

@@ -1036,6 +1036,30 @@ TEST_F(P2PMasterServiceTest, RemoveAll) {
     EXPECT_EQ(0, service->GetKeyCount());
 }
 
+TEST_F(P2PMasterServiceTest, GetKeyCountEmpty) {
+    auto service = CreateService();
+    EXPECT_EQ(0u, service->GetKeyCount());
+}
+
+TEST_F(P2PMasterServiceTest, GetKeyCountsDistinctKeys) {
+    auto service = CreateService();
+    auto seg1 = MakeP2PSegment("seg1");
+    auto seg2 = MakeP2PSegment("seg2");
+    auto client_id = generate_uuid();
+    RegisterP2PClient(*service, client_id, {seg1, seg2}, "127.0.0.1", 50051);
+
+    // Two replicas of the same key on different segments count only once.
+    AddReplicaHelper(*service, "key1", 1024, client_id, seg1.id);
+    AddReplicaHelper(*service, "key1", 1024, client_id, seg2.id);
+    AddReplicaHelper(*service, "key2", 1024, client_id, seg1.id);
+
+    EXPECT_EQ(2u, service->GetKeyCount());
+
+    auto all_keys = service->GetAllKeys();
+    ASSERT_TRUE(all_keys.has_value());
+    EXPECT_EQ(2u, all_keys.value().size());
+}
+
 // ============================================================
 // MountSegment / UnmountSegment Tests
 // ============================================================
