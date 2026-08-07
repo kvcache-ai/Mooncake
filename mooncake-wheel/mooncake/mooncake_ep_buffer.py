@@ -16,10 +16,6 @@ _USE_MACA = (
     or bool(getattr(torch.version, "maca", None))
 )
 _USE_SPLIT_SEND_RECV = _USE_MACA
-_USE_MUSA = _env_enabled("MOONCAKE_EP_USE_MUSA") or bool(
-    getattr(torch.version, "musa", None)
-)
-_GPU_DEVICE = "musa" if _USE_MUSA else "cuda"
 
 
 def _native_current_stream_ptr() -> int:
@@ -190,7 +186,8 @@ class Buffer:
 
         if not self._use_fallback:
             (raddr, rkey) = self.runtime.get_mr_info()
-            gpu_device = _GPU_DEVICE
+            # torchada maps the CUDA device namespace to MUSA when enabled.
+            gpu_device = "cuda"
 
             raddr = torch.tensor(
                 [raddr], dtype=torch.int64, device=gpu_device
