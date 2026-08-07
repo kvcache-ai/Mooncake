@@ -11,6 +11,8 @@
 #include <thread>
 #include <atomic>
 #include <algorithm>
+#include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <fcntl.h>
@@ -4723,6 +4725,83 @@ TEST_F(StorageBackendTest,
         << "record with unknown flags must be dropped on recovery";
     EXPECT_EQ(LoadOne(recovered, "key_b", value_b.size()),
               std::make_optional(value_b));
+}
+
+// Helper: run a BatchLoad test with specific concurrency settings.
+static void RunConcurrentBatchLoadTest(const std::string& data_path,
+                                       const std::string& batch_threads,
+                                       const std::string& bucket_threads) {
+    setenv("MC_BATCH_LOAD_THREADS", batch_threads.c_str(), 1);
+    setenv("MC_BUCKET_READ_THREADS", bucket_threads.c_str(), 1);
+
+    FileStorageConfig config;
+    BucketBackendConfig bucket_config;
+    config.storage_filepath = data_path;
+
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    std::vector<std::string> keys;
+    std::vector<int64_t> sizes;
+    std::unordered_map<std::string, std::string> test_data;
+    std::vector<int64_t> buckets;
+    ASSERT_TRUE(
+        BatchOffloadUtil(storage_backend, keys, sizes, test_data, buckets));
+
+    auto allocator = std::make_shared<SimpleAllocator>(128 * 1024 * 1024);
+    std::unordered_map<std::string, Slice> batch_object;
+    for (const auto& [key, data] : test_data) {
+        void* buf = allocator->allocate(data.size());
+        batch_object.emplace(key, Slice{buf, data.size()});
+    }
+
+    auto t0 = std::chrono::steady_clock::now();
+    auto result = storage_backend.BatchLoad(batch_object);
+    auto t1 = std::chrono::steady_clock::now();
+    ASSERT_TRUE(result.has_value());
+
+    LOG(INFO) << "BatchLoad batch=" << batch_threads
+              << " bucket=" << bucket_threads << " " << test_data.size()
+              << " keys in "
+              << std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0)
+                     .count()
+              << " ms";
+
+    ASSERT_EQ(batch_object.size(), test_data.size());
+    for (const auto& [key, data] : test_data) {
+        auto it = batch_object.find(key);
+        ASSERT_NE(it, batch_object.end());
+        std::string loaded(static_cast<char*>(it->second.ptr), it->second.size);
+        ASSERT_EQ(loaded, data) << "Data mismatch for key: " << key;
+    }
+
+    unsetenv("MC_BATCH_LOAD_THREADS");
+    unsetenv("MC_BUCKET_READ_THREADS");
+}
+
+// Default: both env vars unset (0) — original sequential path.
+TEST_F(StorageBackendTest, BatchLoadConcurrentDefault) {
+    RunConcurrentBatchLoadTest(data_path, "0", "0");
+}
+
+// Only bucket-level parallelism (MC_BATCH_LOAD_THREADS=4).
+TEST_F(StorageBackendTest, BatchLoadConcurrentBucketOnly) {
+    RunConcurrentBatchLoadTest(data_path, "4", "0");
+}
+
+// Only intra-bucket parallelism (MC_BUCKET_READ_THREADS=4).
+TEST_F(StorageBackendTest, BatchLoadConcurrentIntraBucketOnly) {
+    RunConcurrentBatchLoadTest(data_path, "0", "4");
+}
+
+// Both pools active — true 2-level concurrency.
+TEST_F(StorageBackendTest, BatchLoadConcurrentTwoLevel) {
+    RunConcurrentBatchLoadTest(data_path, "4", "4");
+}
+
+// Uneven thread counts: bucket=2, intra-bucket=8.
+TEST_F(StorageBackendTest, BatchLoadConcurrentUneven) {
+    RunConcurrentBatchLoadTest(data_path, "2", "8");
 }
 
 }  // namespace mooncake::test
