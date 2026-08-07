@@ -300,6 +300,7 @@ jobs:
       - name: Run Python integration tests (full suite)
         env:
           MC_METADATA_SERVER: http://127.0.0.1:8080/metadata
+          RUN_TESTS_METADATA_SERVER_MODE: external
           DEFAULT_KV_LEASE_TTL: "500"
           TEST_SSD_OFFLOAD_IN_EVICT: "1"
           TEST_PROMOTION_ON_HIT: "1"
