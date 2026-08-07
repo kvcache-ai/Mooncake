@@ -109,16 +109,18 @@ Status TransferEngine::registerLocalMemory(std::vector<void*> addr_list,
     return impl_->registerLocalMemory(addr_list, size_list, options);
 }
 
-Status TransferEngine::unregisterLocalMemory(void* addr, size_t size) {
+Status TransferEngine::unregisterLocalMemory(void* addr, size_t size,
+                                             bool update_metadata) {
     if (size == 0)
-        return impl_->unregisterLocalMemory({addr});
+        return impl_->unregisterLocalMemory({addr}, {}, update_metadata);
     else
-        return impl_->unregisterLocalMemory({addr}, {size});
+        return impl_->unregisterLocalMemory({addr}, {size}, update_metadata);
 }
 
 Status TransferEngine::unregisterLocalMemory(std::vector<void*> addr_list,
-                                             std::vector<size_t> size_list) {
-    return impl_->unregisterLocalMemory(addr_list, size_list);
+                                             std::vector<size_t> size_list,
+                                             bool update_metadata) {
+    return impl_->unregisterLocalMemory(addr_list, size_list, update_metadata);
 }
 
 BatchID TransferEngine::allocateBatch(size_t batch_size) {

@@ -749,7 +749,8 @@ Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
 
 // WARNING: before exiting TE, make sure that all local memory are
 // unregistered, otherwise the CUDA may halt!
-Status TransferEngineImpl::unregisterLocalMemory(void* addr, size_t size) {
+Status TransferEngineImpl::unregisterLocalMemory(void* addr, size_t size,
+                                                 bool update_metadata) {
     bool removed = false;
     auto status = local_segment_tracker_->remove(
         (uint64_t)addr, size, [&](BufferDesc& desc) -> Status {
@@ -762,11 +763,13 @@ Status TransferEngineImpl::unregisterLocalMemory(void* addr, size_t size) {
         });
     if (!status.ok()) return status;
     if (!removed) return Status::OK();
-    return metadata_->segmentManager().synchronizeLocal();
+    if (update_metadata) return metadata_->segmentManager().synchronizeLocal();
+    return Status::OK();
 }
 
-Status TransferEngineImpl::unregisterLocalMemory(
-    std::vector<void*> addr_list, std::vector<size_t> size_list) {
+Status TransferEngineImpl::unregisterLocalMemory(std::vector<void*> addr_list,
+                                                 std::vector<size_t> size_list,
+                                                 bool update_metadata) {
     if (!size_list.empty() && addr_list.size() != size_list.size()) {
         return Status::InvalidArgument(
             "Mismatched addresses and sizes in unregisterLocalMemory" LOC_MARK);
@@ -788,7 +791,8 @@ Status TransferEngineImpl::unregisterLocalMemory(
         if (removed) removed_any = true;
     }
     if (!removed_any) return Status::OK();
-    return metadata_->segmentManager().synchronizeLocal();
+    if (update_metadata) return metadata_->segmentManager().synchronizeLocal();
+    return Status::OK();
 }
 
 BatchID TransferEngineImpl::allocateBatch(size_t batch_size) {
