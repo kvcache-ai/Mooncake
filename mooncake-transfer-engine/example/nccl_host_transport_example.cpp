@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "common.h"
+#include "cuda_alike.h"
 #include "transfer_engine.h"
 
 namespace {
@@ -179,8 +180,8 @@ int main(int argc, char** argv) {
                 0 ||
             !engines[rank]->installTransport("nccl", nullptr) ||
             engines[rank]->registerLocalMemory(
-                buffers[rank], kBufferBytes, "cuda:" + std::to_string(rank)) !=
-                0) {
+                buffers[rank], kBufferBytes,
+                GPU_PREFIX + std::to_string(rank)) != 0) {
             LOG(ERROR) << "Failed to initialize NCCL TE rank " << rank;
             return 1;
         }

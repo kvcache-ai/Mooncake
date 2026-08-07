@@ -28,6 +28,7 @@
 
 #include "common.h"
 #include "config.h"
+#include "cuda_alike.h"
 #include "transfer_metadata_plugin.h"
 #include "transport/transport.h"
 
@@ -126,14 +127,14 @@ TEST_F(TransferMetadataTest, NcclMetadataAndHandshakePayloadRoundTrip) {
     server_segment->name = maybeWrapIpV6(host) + ":" + std::to_string(port);
     server_segment->protocol = "nccl";
     TransferMetadata::BufferDesc server_buffer;
-    server_buffer.name = "cuda:2";
+    server_buffer.name = GPU_PREFIX + "2";
     server_buffer.addr = 0x10000;
     server_buffer.length = 4096;
     server_buffer.device_id = 2;
     server_segment->buffers.push_back(server_buffer);
     const std::string server_name = server_segment->name;
     TransferMetadata::BufferDesc server_buffer_2;
-    server_buffer_2.name = "cuda:2-aux";
+    server_buffer_2.name = GPU_PREFIX + "2-aux";
     server_buffer_2.addr = 0x08000;
     server_buffer_2.length = 8192;
     server_buffer_2.device_id = 2;
@@ -168,11 +169,11 @@ TEST_F(TransferMetadataTest, NcclMetadataAndHandshakePayloadRoundTrip) {
     ASSERT_NE(peer_segment, nullptr);
     ASSERT_EQ(peer_segment->protocol, "nccl");
     ASSERT_EQ(peer_segment->buffers.size(), 2U);
-    EXPECT_EQ(peer_segment->buffers[0].name, "cuda:2");
+    EXPECT_EQ(peer_segment->buffers[0].name, GPU_PREFIX + "2");
     EXPECT_EQ(peer_segment->buffers[0].addr, 0x10000U);
     EXPECT_EQ(peer_segment->buffers[0].length, 4096U);
     EXPECT_EQ(peer_segment->buffers[0].device_id, 2);
-    EXPECT_EQ(peer_segment->buffers[1].name, "cuda:2-aux");
+    EXPECT_EQ(peer_segment->buffers[1].name, GPU_PREFIX + "2-aux");
     EXPECT_EQ(peer_segment->buffers[1].addr, 0x08000U);
     EXPECT_EQ(peer_segment->buffers[1].length, 8192U);
     EXPECT_EQ(peer_segment->buffers[1].device_id, 2);
