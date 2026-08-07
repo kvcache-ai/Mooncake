@@ -2,6 +2,8 @@
 
 #include <glog/logging.h>
 
+#include <algorithm>
+
 #include "ha_metric_manager.h"
 #include "metadata_store.h"
 #include "ha/oplog/oplog_types.h"
@@ -68,7 +70,14 @@ bool OpLogApplier::ApplyOpLogEntry(const OpLogEntry& entry) {
             ApplyPutRevoke(entry);
             break;
         case OpType::REMOVE:
-            ApplyRemove(entry);
+            if (!ApplyRemove(entry)) {
+                return false;
+            }
+            break;
+        case OpType::LOCAL_DELETE_ACK:
+            if (!ApplyLocalDeleteAck(entry)) {
+                return false;
+            }
             break;
         case OpType::SEGMENT_MOUNT:
             ApplySegmentMount(entry);
@@ -189,7 +198,40 @@ void OpLogApplier::ApplyPutRevoke(const OpLogEntry& entry) {
     }
 }
 
-void OpLogApplier::ApplyRemove(const OpLogEntry& entry) {
+bool OpLogApplier::ApplyRemove(const OpLogEntry& entry) {
+    if (!entry.payload.empty()) {
+        LocalDeleteRemovePayloadV1 payload;
+        if (struct_pack::deserialize_to(payload, entry.payload) !=
+            struct_pack::errc::ok) {
+            LOG(ERROR) << "OpLogApplier: invalid LOCAL_DISK delete intents, "
+                       << "sequence_id=" << entry.sequence_id;
+            return false;
+        }
+        if (payload.schema_version != 1) {
+            LOG(ERROR) << "OpLogApplier: unsupported LOCAL_DISK delete "
+                          "schema, sequence_id="
+                       << entry.sequence_id;
+            return false;
+        }
+        if (payload.delete_intents.size() > kMaxLocalDeleteTasksPerBatch ||
+            std::any_of(
+                payload.delete_intents.begin(), payload.delete_intents.end(),
+                [&](const LocalDeleteTask& task) {
+                    return task.local_disk_segment_id.empty() ||
+                           (task.task_id.high == 0 && task.task_id.low == 0) ||
+                           task.tenant_id != entry.tenant_id ||
+                           task.key != entry.object_key ||
+                           task.object_incarnation !=
+                               payload.object_incarnation;
+                }) ||
+            !metadata_store_->ApplyRemoveWithLocalDeleteTasks(
+                entry.tenant_id, entry.object_key, payload.delete_intents)) {
+            LOG(ERROR) << "OpLogApplier: invalid LOCAL_DISK delete intents, "
+                       << "sequence_id=" << entry.sequence_id;
+            return false;
+        }
+        return true;
+    }
     if (!metadata_store_->Remove(entry.tenant_id, entry.object_key)) {
         LOG(WARNING) << "OpLogApplier: failed to Remove key="
                      << entry.object_key
@@ -199,6 +241,35 @@ void OpLogApplier::ApplyRemove(const OpLogEntry& entry) {
         VLOG(1) << "OpLogApplier: applied REMOVE, key=" << entry.object_key
                 << ", sequence_id=" << entry.sequence_id;
     }
+    return true;
+}
+
+bool OpLogApplier::ApplyLocalDeleteAck(const OpLogEntry& entry) {
+    LocalDeleteAckPayloadV1 payload;
+    if (struct_pack::deserialize_to(payload, entry.payload) !=
+        struct_pack::errc::ok) {
+        LOG(ERROR) << "OpLogApplier: invalid LOCAL_DELETE_ACK payload, "
+                   << "sequence_id=" << entry.sequence_id;
+        return false;
+    }
+    if (payload.schema_version != 1) {
+        LOG(ERROR) << "OpLogApplier: unsupported LOCAL_DELETE_ACK schema, "
+                   << "sequence_id=" << entry.sequence_id;
+        return false;
+    }
+    if (payload.local_disk_segment_id.empty() ||
+        payload.task_ids.size() > kMaxLocalDeleteTasksPerBatch ||
+        std::any_of(payload.task_ids.begin(), payload.task_ids.end(),
+                    [](const LocalDeleteTaskId& task_id) {
+                        return task_id.high == 0 && task_id.low == 0;
+                    })) {
+        LOG(ERROR) << "OpLogApplier: invalid LOCAL_DELETE_ACK payload, "
+                   << "sequence_id=" << entry.sequence_id;
+        return false;
+    }
+    metadata_store_->AckLocalDeleteTasks(payload.local_disk_segment_id,
+                                         payload.task_ids);
+    return true;
 }
 
 const StandbySegmentRegistry& OpLogApplier::GetSegmentRegistry() const {

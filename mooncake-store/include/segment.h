@@ -90,6 +90,9 @@ inline std::ostream& operator<<(
 struct LocalDiskSegment {
     mutable Mutex offloading_mutex_;
     bool enable_offloading;
+    std::string local_disk_segment_id;
+    uint64_t mount_epoch{0};
+    uint32_t capabilities{0};
     int64_t ssd_total_capacity_bytes = 0;  // last reported by client heartbeat
     std::atomic<int64_t> ssd_used_bytes{0};
     std::unordered_map<std::string, OffloadTaskItem> GUARDED_BY(
@@ -105,8 +108,14 @@ struct LocalDiskSegment {
     // delete all SSD files. Same locking as offloading_objects
     // (offloading_mutex_).
     bool GUARDED_BY(offloading_mutex_) pending_remove_all = false;
-    explicit LocalDiskSegment(bool enable_offloading)
-        : enable_offloading(enable_offloading) {}
+    explicit LocalDiskSegment(bool enable_offloading,
+                              std::string local_disk_segment_id = {},
+                              uint64_t mount_epoch = 0,
+                              uint32_t capabilities = 0)
+        : enable_offloading(enable_offloading),
+          local_disk_segment_id(std::move(local_disk_segment_id)),
+          mount_epoch(mount_epoch),
+          capabilities(capabilities) {}
 
     LocalDiskSegment(const LocalDiskSegment&) = delete;
     LocalDiskSegment& operator=(const LocalDiskSegment&) = delete;
@@ -136,8 +145,10 @@ class ScopedSegmentAccess {
      */
     ErrorCode MountSegment(const Segment& segment, const UUID& client_id);
 
-    ErrorCode MountLocalDiskSegment(const UUID& client_id,
-                                    bool enable_offloading);
+    ErrorCode MountLocalDiskSegment(
+        const UUID& client_id, bool enable_offloading,
+        const std::string& local_disk_segment_id = {}, uint64_t mount_epoch = 0,
+        uint32_t capabilities = 0);
 
     /**
      * @brief Re-mount a segment. To avoid infinite remount trying, only the

@@ -151,6 +151,9 @@ add_store_test(master_service_test_for_snapshot
 add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)
 add_store_test(storage_backend_test storage_backend_test.cpp)
 add_store_test(client_storage_backend_test client_storage_backend_test.cpp)
+add_store_test(storage_backend_bucket_delete_test
+               storage_backend_bucket_delete_test.cpp)
+add_store_test(local_delete_test local_delete_test.cpp)
 add_store_test(mutex_test mutex_test.cpp)
 add_store_test(file_storage_test file_storage_test.cpp)
 add_store_test(task_manager_test task_manager_test.cpp)
@@ -280,6 +283,10 @@ target_link_libraries(oplog_test_failpoint_test PRIVATE glog gtest gtest_main
                                                         pthread)
 add_test(NAME oplog_test_failpoint_test COMMAND oplog_test_failpoint_test)
 add_ha_test(master_service_ha_test ha/master_service_ha_test.cpp)
+if(MOONCAKE_ENABLE_TEST_FAILPOINTS)
+  add_ha_test(local_delete_process_kill_test
+              ha/oplog/local_delete_process_kill_test.cpp)
+endif()
 add_ha_test(catalog_backed_snapshot_provider_test
             ha/snapshot/catalog_backed_snapshot_provider_test.cpp)
 if(STORE_USE_REDIS)

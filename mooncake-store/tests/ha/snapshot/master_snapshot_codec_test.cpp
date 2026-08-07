@@ -46,7 +46,7 @@ TEST_F(MasterSnapshotCodecTest, EncodeManifestPreservesSnapshotId) {
         MasterSnapshotCodec::kSerializerType,
         MasterSnapshotCodec::kSerializerVersion, "snapshot-000042");
     std::string manifest(bytes.begin(), bytes.end());
-    EXPECT_EQ(manifest, "messagepack|1.0.0|snapshot-000042");
+    EXPECT_EQ(manifest, "messagepack|1.1.0|snapshot-000042");
 }
 
 TEST_F(MasterSnapshotCodecTest, EncodeDecodeRoundTrip) {

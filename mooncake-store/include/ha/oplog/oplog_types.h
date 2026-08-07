@@ -17,6 +17,7 @@ enum class OpType : uint8_t {
     SEGMENT_MOUNT = 5,
     SEGMENT_UNMOUNT = 6,
     SEGMENT_UPDATE = 7,
+    LOCAL_DELETE_ACK = 8,
     OP_TYPE_MAX,
 };
 

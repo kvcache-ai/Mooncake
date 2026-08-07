@@ -705,11 +705,18 @@ tl::expected<void, SerializationError> Serializer<Replica>::serialize(
                     ErrorCode::DESERIALIZE_FAIL,
                     "serialize_msgpack Replica missing LocalDiskReplicaData"));
             }
-            // Format: [client_id_str, object_size, transport_endpoint]
-            packer.pack_array(3);
+            // The first three fields are the legacy layout.
+            packer.pack_array(8);
             packer.pack(UuidToString(local_data->client_id));
             packer.pack(static_cast<uint64_t>(local_data->object_size));
             packer.pack(local_data->transport_endpoint);
+            packer.pack(local_data->local_disk_segment_id);
+            packer.pack(local_data->mount_epoch);
+            packer.pack(local_data->capabilities);
+            packer.pack(local_data->bucket_id);
+            packer.pack_array(2);
+            packer.pack(local_data->object_incarnation.high);
+            packer.pack(local_data->object_incarnation.low);
             break;
         }
         default:
@@ -788,16 +795,38 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
         case static_cast<int8_t>(ReplicaType::LOCAL_DISK): {
             const auto &payload = array_items[3];
             if (payload.type != msgpack::type::ARRAY ||
-                payload.via.array.size != 3) {
+                (payload.via.array.size != 3 && payload.via.array.size != 8)) {
                 return tl::unexpected(
                     SerializationError(ErrorCode::DESERIALIZE_FAIL,
                                        "deserialize_msgpack Replica LOCAL_DISK "
-                                       "payload is not valid array[3]"));
+                                       "payload is not valid array[3 or 8]"));
             }
             auto *payload_items = payload.via.array.ptr;
             std::string client_id_str = payload_items[0].as<std::string>();
             uint64_t object_size = payload_items[1].as<uint64_t>();
             std::string transport_endpoint = payload_items[2].as<std::string>();
+            std::string local_disk_segment_id;
+            uint64_t mount_epoch = 0;
+            uint32_t capabilities = 0;
+            int64_t bucket_id = -1;
+            ObjectIncarnation object_incarnation;
+            if (payload.via.array.size == 8) {
+                local_disk_segment_id = payload_items[3].as<std::string>();
+                mount_epoch = payload_items[4].as<uint64_t>();
+                capabilities = payload_items[5].as<uint32_t>();
+                bucket_id = payload_items[6].as<int64_t>();
+                const auto &incarnation = payload_items[7];
+                if (incarnation.type != msgpack::type::ARRAY ||
+                    incarnation.via.array.size != 2) {
+                    return tl::unexpected(SerializationError(
+                        ErrorCode::DESERIALIZE_FAIL,
+                        "LOCAL_DISK incarnation is not array[2]"));
+                }
+                object_incarnation.high =
+                    incarnation.via.array.ptr[0].as<uint64_t>();
+                object_incarnation.low =
+                    incarnation.via.array.ptr[1].as<uint64_t>();
+            }
 
             UUID client_id;
             if (!StringToUuid(client_id_str, client_id)) {
@@ -809,7 +838,9 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
             }
 
             replica = std::make_shared<Replica>(
-                client_id, object_size, std::move(transport_endpoint), status);
+                client_id, object_size, std::move(transport_endpoint), status,
+                std::move(local_disk_segment_id), mount_epoch, capabilities,
+                bucket_id, object_incarnation);
             break;
         }
         default:

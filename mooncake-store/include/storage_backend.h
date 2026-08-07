@@ -4,6 +4,7 @@
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstring>
 #include <filesystem>
 #include <functional>
@@ -12,6 +13,7 @@
 #include <mutex>
 #include <set>
 #include <string>
+#include <thread>
 #include <unordered_set>
 #include <vector>
 
@@ -31,12 +33,15 @@ struct BucketObjectMetadata {
     int64_t offset;
     int64_t key_size;
     int64_t data_size;
+    ObjectIncarnation object_incarnation;
+    bool tombstoned{false};
 };
-YLT_REFL(BucketObjectMetadata, offset, key_size, data_size);
+YLT_REFL(BucketObjectMetadata, offset, key_size, data_size, object_incarnation,
+         tombstoned);
 
 struct BucketMetadata {
-    int64_t meta_size;
-    int64_t data_size;
+    int64_t meta_size{0};
+    int64_t data_size{0};
     std::vector<std::string> keys;
     std::vector<BucketObjectMetadata> metadatas;
 
@@ -46,6 +51,8 @@ struct BucketMetadata {
     // Last access timestamp in nanoseconds; used by LRU eviction policy.
     // Updated on every read with relaxed ordering (approximate is sufficient).
     mutable std::atomic<int64_t> last_access_ns_{0};
+    mutable std::mutex operation_mutex_;
+    mutable std::atomic<bool> mutation_in_progress_{false};
 
     // Default constructor
     BucketMetadata() = default;
@@ -57,7 +64,8 @@ struct BucketMetadata {
           keys(other.keys),
           metadatas(other.metadatas),
           inflight_reads_(0),
-          last_access_ns_(0) {}
+          last_access_ns_(0),
+          mutation_in_progress_(false) {}
 
     // Move constructor
     BucketMetadata(BucketMetadata&& other) noexcept
@@ -66,7 +74,8 @@ struct BucketMetadata {
           keys(std::move(other.keys)),
           metadatas(std::move(other.metadatas)),
           inflight_reads_(0),
-          last_access_ns_(0) {}
+          last_access_ns_(0),
+          mutation_in_progress_(false) {}
 
     // Copy assignment
     BucketMetadata& operator=(const BucketMetadata& other) {
@@ -93,6 +102,32 @@ struct BucketMetadata {
     }
 };
 YLT_REFL(BucketMetadata, data_size, keys, metadatas);
+
+struct BucketGcIntent {
+    uint32_t version{1};
+    bool committed{false};
+    int64_t target_bucket_id{-1};
+    std::vector<int64_t> source_bucket_ids;
+};
+YLT_REFL(BucketGcIntent, version, committed, target_bucket_id,
+         source_bucket_ids);
+
+enum class LocalDeleteResult {
+    kRemoved,
+    kAlreadyRemoved,
+    kStaleVersion,
+    kRetryableFailure,
+};
+
+struct LocalDeleteTaskResult {
+    LocalDeleteTaskId task_id;
+    LocalDeleteResult result{LocalDeleteResult::kRetryableFailure};
+    ErrorCode error{ErrorCode::OK};
+
+    [[nodiscard]] bool IsTerminal() const {
+        return result != LocalDeleteResult::kRetryableFailure;
+    }
+};
 
 /**
  * @brief RAII guard for tracking in-flight bucket reads.
@@ -198,6 +233,10 @@ struct BucketBackendConfig {
 
     int64_t max_total_size = 0;  // 0 = unlimited; evict when total_size_
                                  // exceeds this threshold (bytes)
+
+    bool gc_enable = true;
+    int64_t gc_interval_seconds = 10;
+    double gc_deleted_ratio = 0.25;
 
     bool Validate() const;
 
@@ -393,6 +432,23 @@ class StorageBackendInterface {
                             double /* low_watermark_ratio */,
                             EvictionHandler /* eviction_handler */ = nullptr) {
         return std::vector<std::string>{};
+    }
+
+    virtual std::vector<LocalDeleteTaskResult> BatchMarkDeleted(
+        const std::vector<LocalDeleteTask>& tasks) {
+        std::vector<LocalDeleteTaskResult> results;
+        results.reserve(tasks.size());
+        for (const auto& task : tasks) {
+            results.push_back({task.task_id,
+                               LocalDeleteResult::kRetryableFailure,
+                               ErrorCode::UNAVAILABLE_IN_CURRENT_MODE});
+        }
+        return results;
+    }
+    virtual int64_t GetReclaimableBytes() const { return 0; }
+    virtual bool RequestGarbageCollection(
+        bool /* require_disk_pressure */ = false) {
+        return false;
     }
 
     FileStorageConfig file_storage_config_;
@@ -927,7 +983,9 @@ class BucketStorageBackend : public StorageBackendInterface {
      */
     tl::expected<void, ErrorCode> AllocateOffloadingBuckets(
         const std::unordered_map<std::string, int64_t>& offloading_objects,
-        std::vector<std::vector<std::string>>& buckets_keys);
+        std::vector<std::vector<std::string>>& buckets_keys,
+        const std::unordered_map<std::string, ObjectIncarnation>*
+            object_incarnations = nullptr);
 
     void ClearUngroupedOffloadingObjects();
 
@@ -981,6 +1039,11 @@ class BucketStorageBackend : public StorageBackendInterface {
         double high_watermark_ratio, double low_watermark_ratio,
         EvictionHandler eviction_handler = nullptr) override;
 
+    std::vector<LocalDeleteTaskResult> BatchMarkDeleted(
+        const std::vector<LocalDeleteTask>& tasks) override;
+    int64_t GetReclaimableBytes() const override;
+    bool RequestGarbageCollection(bool require_disk_pressure = false) override;
+
    private:
     tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode> BuildBucket(
         int64_t bucket_id,
@@ -995,8 +1058,31 @@ class BucketStorageBackend : public StorageBackendInterface {
     tl::expected<void, ErrorCode> StoreBucketMetadata(
         int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata);
 
+    tl::expected<void, ErrorCode> StoreBucketMetadataAtomically(
+        int64_t bucket_id, BucketMetadata& bucket_metadata);
+
     tl::expected<void, ErrorCode> LoadBucketMetadata(
         int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata);
+
+    struct GcCandidate {
+        int64_t bucket_id;
+        std::shared_ptr<BucketMetadata> bucket;
+        int64_t live_bytes;
+        int64_t reclaimable_bytes;
+        size_t live_keys;
+    };
+
+    std::vector<GcCandidate> SelectGcCandidates(bool under_pressure);
+    tl::expected<bool, ErrorCode> RunGarbageCollectionOnce(bool under_pressure);
+    tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode> WriteGcReplacement(
+        int64_t target_bucket_id, const std::vector<GcCandidate>& sources);
+    tl::expected<void, ErrorCode> RecoverGarbageCollection();
+    tl::expected<void, ErrorCode> StoreGcIntent(const BucketGcIntent& intent);
+    tl::expected<void, ErrorCode> RemoveGcIntent();
+    tl::expected<void, ErrorCode> SyncStorageDirectory() const;
+    bool FinalizeGcSource(const GcCandidate& source);
+    void GarbageCollectionThreadFunc();
+    static int64_t BucketReclaimableBytes(const BucketMetadata& bucket);
 
     tl::expected<int64_t, ErrorCode> CreateBucketId();
 
@@ -1024,7 +1110,7 @@ class BucketStorageBackend : public StorageBackendInterface {
      * Used by write rollback and startup recovery of incomplete buckets.
      * @param bucket_id The bucket ID whose files should be deleted.
      */
-    void CleanupOrphanedBucket(int64_t bucket_id);
+    bool CleanupOrphanedBucket(int64_t bucket_id);
 
     /**
      * @brief Rollback a committed bucket from the local index when
@@ -1140,6 +1226,7 @@ class BucketStorageBackend : public StorageBackendInterface {
     mutable Mutex iterator_mutex_;
     std::string storage_path_;
     int64_t total_size_ GUARDED_BY(mutex_) = 0;
+    std::atomic<int64_t> reclaimable_bytes_{0};
     std::unordered_map<std::string, StorageObjectMetadata> GUARDED_BY(mutex_)
         object_bucket_map_;
     std::unordered_set<std::string> GUARDED_BY(mutex_) pending_eviction_keys_;
@@ -1155,9 +1242,17 @@ class BucketStorageBackend : public StorageBackendInterface {
     int64_t GUARDED_BY(mutex_) next_bucket_ = -1;
     BucketBackendConfig bucket_backend_config_;
 
+    std::mutex gc_mutex_;
+    std::condition_variable gc_cv_;
+    std::thread gc_thread_;
+    std::atomic<bool> gc_stop_{false};
+    bool gc_requested_{false};
+
     mutable Mutex offloading_mutex_;
     std::unordered_map<std::string, int64_t> GUARDED_BY(offloading_mutex_)
         ungrouped_offloading_objects_;
+    std::unordered_map<std::string, ObjectIncarnation> GUARDED_BY(
+        offloading_mutex_) offloading_object_incarnations_;
 
     // File handle cache for UringFile to avoid repeated open/close overhead
     mutable Mutex file_cache_mutex_;

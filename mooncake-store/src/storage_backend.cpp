@@ -16,6 +16,7 @@
 #include <regex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 #include <algorithm>
 #include <chrono>
@@ -48,11 +49,27 @@ struct FdGuard {
         return r;
     }
 };
+
+template <typename Callback>
+class ScopeExit {
+   public:
+    explicit ScopeExit(Callback callback) : callback_(std::move(callback)) {}
+    ScopeExit(const ScopeExit&) = delete;
+    ScopeExit& operator=(const ScopeExit&) = delete;
+    ~ScopeExit() { callback_(); }
+
+   private:
+    Callback callback_;
+};
+
+constexpr size_t kMaxGcSources = 8;
 }  // namespace
 
 #include "storage/distributed/distributed_storage_backend.h"
 
 namespace mooncake {
+
+static std::optional<double> GetEnvDouble(const char* name);
 
 bool FilePerKeyConfig::Validate() const {
     if (fsdir.empty()) {
@@ -69,6 +86,15 @@ bool BucketBackendConfig::Validate() const {
     }
     if (bucket_size_limit <= 0) {
         LOG(ERROR) << "BucketBackendConfig: bucket_size_limit must > 0";
+        return false;
+    }
+    if (gc_enable && gc_interval_seconds <= 0) {
+        LOG(ERROR)
+            << "BucketBackendConfig: gc_interval_seconds must be positive";
+        return false;
+    }
+    if (gc_enable && (gc_deleted_ratio <= 0.0 || gc_deleted_ratio > 1.0)) {
+        LOG(ERROR) << "BucketBackendConfig: gc_deleted_ratio must be in (0, 1]";
         return false;
     }
     return true;
@@ -99,6 +125,17 @@ BucketBackendConfig BucketBackendConfig::FromEnvironment() {
         Environ::GetInt64("MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE",
                           Environ::GetInt64("MOONCAKE_BUCKET_MAX_TOTAL_SIZE",
                                             config.max_total_size));
+
+    config.gc_enable =
+        Environ::GetBool("MOONCAKE_OFFLOAD_BUCKET_GC_ENABLE", config.gc_enable);
+    config.gc_interval_seconds =
+        Environ::GetInt64("MOONCAKE_OFFLOAD_BUCKET_GC_INTERVAL_SECONDS",
+                          config.gc_interval_seconds);
+    const auto gc_deleted_ratio =
+        GetEnvDouble("MOONCAKE_OFFLOAD_BUCKET_GC_DELETED_RATIO");
+    if (gc_deleted_ratio.has_value()) {
+        config.gc_deleted_ratio = *gc_deleted_ratio;
+    }
 
     const auto policy_str = Environ::GetString(
         "MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY",
@@ -1464,8 +1501,12 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
         }
 
         metadatas.emplace_back(
-            StorageObjectMetadata{-1, 0, static_cast<int64_t>(kv.key.size()),
-                                  static_cast<int64_t>(kv.value.size()), ""});
+            StorageObjectMetadata{-1,
+                                  0,
+                                  static_cast<int64_t>(kv.key.size()),
+                                  static_cast<int64_t>(kv.value.size()),
+                                  "",
+                                  {}});
         keys.emplace_back(kv.key);
     }
 
@@ -1621,9 +1662,13 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
                 total_size += buf.size();
 
                 keys.emplace_back(std::move(kv.key));
-                metas.emplace_back(StorageObjectMetadata{
-                    -1, 0, (int64_t)keys.back().size(),
-                    static_cast<int64_t>(kv.value.size()), ""});
+                metas.emplace_back(
+                    StorageObjectMetadata{-1,
+                                          0,
+                                          (int64_t)keys.back().size(),
+                                          static_cast<int64_t>(kv.value.size()),
+                                          "",
+                                          {}});
 
                 if ((int64_t)keys.size() >=
                     file_storage_config_.scanmeta_iterator_keys_limit) {
@@ -1696,6 +1741,14 @@ BucketStorageBackend::BucketStorageBackend(
 }
 
 BucketStorageBackend::~BucketStorageBackend() {
+    {
+        std::lock_guard<std::mutex> lock(gc_mutex_);
+        gc_stop_.store(true, std::memory_order_release);
+    }
+    gc_cv_.notify_all();
+    if (gc_thread_.joinable()) {
+        gc_thread_.join();
+    }
     // Clear file cache to release UringFile instances before destruction
     // This ensures orderly cleanup of io_uring resources
     ClearFileCache();
@@ -2054,11 +2107,16 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
             LOG(ERROR) << "Storage backend already initialized";
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
+        auto recovery = RecoverGarbageCollection();
+        if (!recovery) {
+            return tl::make_unexpected(recovery.error());
+        }
         SharedMutexLocker lock(&mutex_);
         object_bucket_map_.clear();
         buckets_.clear();
         lru_index_.clear();
         total_size_ = 0;
+        reclaimable_bytes_.store(0, std::memory_order_relaxed);
         int64_t max_bucket_id = BucketIdGenerator::INIT_NEW_START_ID;
 
         for (const auto& entry :
@@ -2087,25 +2145,13 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                 auto load_bucket_metadata_result =
                     LoadBucketMetadata(bucket_id, metadata_it->second);
                 if (!load_bucket_metadata_result) {
-                    LOG(ERROR)
-                        << "Failed to load metadata for bucket: "
-                        << bucket_id_str
-                        << ", will delete the bucket's data and metadata";
-
-                    auto bucket_data_path_res = GetBucketDataPath(bucket_id);
-                    if (bucket_data_path_res) {
-                        fs::remove(bucket_data_path_res.value());
-                    }
-
-                    auto bucket_meta_path_res =
-                        GetBucketMetadataPath(bucket_id);
-                    if (bucket_meta_path_res) {
-                        fs::remove(bucket_meta_path_res.value());
-                    }
-
+                    LOG(ERROR) << "Failed to load metadata for bucket: "
+                               << bucket_id_str
+                               << "; preserving files for operator recovery";
                     lru_index_.erase({0LL, bucket_id});
                     buckets_.erase(bucket_id);
-                    continue;
+                    return tl::make_unexpected(
+                        load_bucket_metadata_result.error());
                 }
                 auto bucket_data_path_res = GetBucketDataPath(bucket_id);
                 if (!bucket_data_path_res) {
@@ -2126,9 +2172,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                 }
                 if (bucket_data_ec == std::errc::no_such_file_or_directory ||
                     !fs::is_regular_file(bucket_data_status)) {
-                    LOG(ERROR) << "Bucket metadata has no valid data file: "
-                               << entry.path().string()
-                               << ", will delete the bucket's remaining files";
+                    LOG(ERROR)
+                        << "Bucket metadata has no valid data file: "
+                        << entry.path().string() << "; removing stale metadata";
                     CleanupOrphanedBucket(bucket_id);
                     lru_index_.erase({0LL, bucket_id});
                     buckets_.erase(bucket_id);
@@ -2139,8 +2185,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                     meta.metadatas.empty() || meta.keys.empty()) {
                     LOG(ERROR) << "Metadata validation failed for bucket: "
                                << bucket_id_str
-                               << ", will delete the bucket's data and "
-                                  "metadata. Detailed values:";
+                               << "; preserving files for operator recovery. "
+                                  "Detailed values:";
                     LOG(ERROR) << "  data_size: " << meta.data_size
                                << " (should not be 0)";
                     LOG(ERROR) << "  meta_size: " << meta.meta_size
@@ -2154,34 +2200,63 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                         << "  keys.size(): " << meta.keys.size()
                         << " (empty: " << (meta.keys.empty() ? "true" : "false")
                         << ")";
-                    auto bucket_data_path_res = GetBucketDataPath(bucket_id);
-                    if (bucket_data_path_res) {
-                        fs::remove(bucket_data_path_res.value());
-                    }
-
-                    auto bucket_meta_path_res =
-                        GetBucketMetadataPath(bucket_id);
-                    if (bucket_meta_path_res) {
-                        fs::remove(bucket_meta_path_res.value());
-                    }
-
                     lru_index_.erase({0LL, bucket_id});
                     buckets_.erase(bucket_id);
-                    continue;
+                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                }
+                if (meta.keys.size() != meta.metadatas.size()) {
+                    LOG(ERROR) << "Bucket metadata key/object count mismatch: "
+                               << bucket_id_str;
+                    lru_index_.erase({0LL, bucket_id});
+                    buckets_.erase(bucket_id);
+                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                }
+                const uintmax_t physical_data_size =
+                    fs::file_size(bucket_data_path_res.value(), bucket_data_ec);
+                if (bucket_data_ec ||
+                    physical_data_size <
+                        static_cast<uintmax_t>(meta.data_size)) {
+                    LOG(ERROR) << "Bucket data file is shorter than metadata: "
+                               << bucket_id_str;
+                    lru_index_.erase({0LL, bucket_id});
+                    buckets_.erase(bucket_id);
+                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                }
+                std::unordered_set<std::string> unique_keys;
+                for (size_t i = 0; i < meta.keys.size(); ++i) {
+                    const auto& object = meta.metadatas[i];
+                    if (object.offset < 0 || object.key_size < 0 ||
+                        object.data_size < 0 ||
+                        object.offset > meta.data_size - object.key_size ||
+                        object.offset + object.key_size >
+                            meta.data_size - object.data_size ||
+                        !unique_keys.insert(meta.keys[i]).second) {
+                        LOG(ERROR) << "Bucket object metadata is invalid: "
+                                   << bucket_id_str << ", object_index=" << i;
+                        lru_index_.erase({0LL, bucket_id});
+                        buckets_.erase(bucket_id);
+                        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                    }
                 }
                 if (bucket_id > max_bucket_id) {
                     max_bucket_id = bucket_id;
                 }
                 total_size_ += metadata_it->second->data_size +
                                metadata_it->second->meta_size;
+                reclaimable_bytes_.fetch_add(
+                    BucketReclaimableBytes(*metadata_it->second),
+                    std::memory_order_relaxed);
                 for (size_t i = 0; i < metadata_it->second->keys.size(); i++) {
+                    const auto& object_meta = metadata_it->second->metadatas[i];
+                    if (object_meta.tombstoned) {
+                        continue;
+                    }
                     object_bucket_map_.emplace(
                         metadata_it->second->keys[i],
                         StorageObjectMetadata{
-                            metadata_it->first,
-                            metadata_it->second->metadatas[i].offset,
-                            metadata_it->second->metadatas[i].key_size,
-                            metadata_it->second->metadatas[i].data_size, ""});
+                            metadata_it->first, object_meta.offset,
+                            object_meta.key_size, object_meta.data_size, "",
+                            object_meta.object_incarnation});
                 }
             }
         }
@@ -2282,6 +2357,10 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
+    if (bucket_backend_config_.gc_enable) {
+        gc_thread_ = std::thread(
+            &BucketStorageBackend::GarbageCollectionThreadFunc, this);
+    }
     return {};
 }
 
@@ -2345,24 +2424,32 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BucketScan(
     SharedMutexLocker lock(&mutex_, shared_lock);
     auto bucket_it = buckets_.lower_bound(bucket_id);
     for (; bucket_it != buckets_.end(); ++bucket_it) {
-        if (static_cast<int64_t>(bucket_it->second->keys.size()) > limit) {
+        const auto live_count = static_cast<int64_t>(
+            std::count_if(bucket_it->second->metadatas.begin(),
+                          bucket_it->second->metadatas.end(),
+                          [](const BucketObjectMetadata& metadata) {
+                              return !metadata.tombstoned;
+                          }));
+        if (live_count > limit) {
             LOG(ERROR) << "Bucket key count exceeds limit: "
                        << "bucket_id=" << bucket_it->first
-                       << ", current_size=" << bucket_it->second->keys.size()
+                       << ", current_size=" << live_count
                        << ", limit=" << limit;
             return tl::make_unexpected(ErrorCode::KEYS_EXCEED_BUCKET_LIMIT);
         }
-        if (static_cast<int64_t>(bucket_it->second->keys.size() + keys.size()) >
-            limit) {
+        if (live_count + static_cast<int64_t>(keys.size()) > limit) {
             return bucket_it->first;
         }
         buckets.emplace_back(bucket_it->first);
         for (size_t i = 0; i < bucket_it->second->keys.size(); i++) {
+            const auto& object_meta = bucket_it->second->metadatas[i];
+            if (object_meta.tombstoned) {
+                continue;
+            }
             keys.emplace_back(bucket_it->second->keys[i]);
             metadatas.emplace_back(StorageObjectMetadata{
-                bucket_it->first, bucket_it->second->metadatas[i].offset,
-                bucket_it->second->metadatas[i].key_size,
-                bucket_it->second->metadatas[i].data_size, ""});
+                bucket_it->first, object_meta.offset, object_meta.key_size,
+                object_meta.data_size, "", object_meta.object_incarnation});
         }
     }
     return 0;
@@ -2377,13 +2464,33 @@ BucketStorageBackend::GetStoreMetadata() {
 
 tl::expected<void, ErrorCode> BucketStorageBackend::AllocateOffloadingBuckets(
     const std::unordered_map<std::string, int64_t>& offloading_objects,
-    std::vector<std::vector<std::string>>& buckets_keys) {
-    return GroupOffloadingKeysByBucket(offloading_objects, buckets_keys);
+    std::vector<std::vector<std::string>>& buckets_keys,
+    const std::unordered_map<std::string, ObjectIncarnation>*
+        object_incarnations) {
+    auto grouped =
+        GroupOffloadingKeysByBucket(offloading_objects, buckets_keys);
+    if (!grouped || object_incarnations == nullptr) {
+        return grouped;
+    }
+
+    std::unordered_set<std::string> grouped_keys;
+    for (const auto& bucket_keys : buckets_keys) {
+        grouped_keys.insert(bucket_keys.begin(), bucket_keys.end());
+    }
+    MutexLocker locker(&offloading_mutex_);
+    for (const auto& [key, incarnation] : *object_incarnations) {
+        if (grouped_keys.contains(key) ||
+            ungrouped_offloading_objects_.contains(key)) {
+            offloading_object_incarnations_[key] = incarnation;
+        }
+    }
+    return {};
 }
 
 void BucketStorageBackend::ClearUngroupedOffloadingObjects() {
     MutexLocker locker(&offloading_mutex_);
     ungrouped_offloading_objects_.clear();
+    offloading_object_incarnations_.clear();
 }
 
 size_t BucketStorageBackend::UngroupedOffloadingObjectsSize() const {
@@ -2493,6 +2600,7 @@ BucketStorageBackend::BuildBucket(
     std::vector<iovec>& iovs, std::vector<StorageObjectMetadata>& metadatas) {
     auto bucket = std::make_shared<BucketMetadata>();
     int64_t storage_offset = 0;
+    MutexLocker offloading_locker(&offloading_mutex_);
     for (const auto& object : batch_object) {
         if (object.second.empty()) {
             LOG(ERROR) << "Failed to create bucket, object is empty";
@@ -2506,12 +2614,20 @@ BucketStorageBackend::BuildBucket(
             iovs.emplace_back(iovec{slice.ptr, slice.size});
         }
         bucket->data_size += object_total_size + object.first.size();
+        ObjectIncarnation object_incarnation;
+        auto incarnation_it =
+            offloading_object_incarnations_.find(object.first);
+        if (incarnation_it != offloading_object_incarnations_.end()) {
+            object_incarnation = incarnation_it->second;
+            offloading_object_incarnations_.erase(incarnation_it);
+        }
         bucket->metadatas.emplace_back(BucketObjectMetadata{
             storage_offset, static_cast<int64_t>(object.first.size()),
-            object_total_size});
-        metadatas.emplace_back(StorageObjectMetadata{
-            bucket_id, storage_offset,
-            static_cast<int64_t>(object.first.size()), object_total_size, ""});
+            object_total_size, object_incarnation, false});
+        metadatas.emplace_back(
+            StorageObjectMetadata{bucket_id, storage_offset,
+                                  static_cast<int64_t>(object.first.size()),
+                                  object_total_size, "", object_incarnation});
         bucket->keys.push_back(object.first);
         storage_offset += object_total_size + object.first.size();
     }
@@ -2659,9 +2775,10 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
     return {};
 }
 
-void BucketStorageBackend::CleanupOrphanedBucket(int64_t bucket_id) {
+bool BucketStorageBackend::CleanupOrphanedBucket(int64_t bucket_id) {
     namespace fs = std::filesystem;
     std::error_code ec;
+    bool cleaned = true;
 
     auto data_path_res = GetBucketDataPath(bucket_id);
     if (data_path_res) {
@@ -2680,7 +2797,10 @@ void BucketStorageBackend::CleanupOrphanedBucket(int64_t bucket_id) {
             LOG(WARNING) << "Failed to cleanup bucket data file: "
                          << data_path_res.value()
                          << ", error: " << ec.message();
+            cleaned = false;
         }
+    } else {
+        cleaned = false;
     }
 
     auto meta_path_res = GetBucketMetadataPath(bucket_id);
@@ -2693,8 +2813,12 @@ void BucketStorageBackend::CleanupOrphanedBucket(int64_t bucket_id) {
             LOG(WARNING) << "Failed to cleanup bucket metadata file: "
                          << meta_path_res.value()
                          << ", error: " << ec.message();
+            cleaned = false;
         }
+    } else {
+        cleaned = false;
     }
+    return cleaned;
 }
 
 void BucketStorageBackend::RollbackCommittedBucket(
@@ -2723,14 +2847,11 @@ void BucketStorageBackend::RollbackCommittedBucket(
             auto obj_it = object_bucket_map_.find(key);
             if (obj_it != object_bucket_map_.end() &&
                 obj_it->second.bucket_id == bucket_id) {
-                total_size_ -=
-                    obj_it->second.data_size + obj_it->second.key_size;
                 object_bucket_map_.erase(obj_it);
             }
         }
 
-        // Remove bucket metadata
-        total_size_ -= bucket_meta->meta_size;
+        total_size_ -= bucket_meta->data_size + bucket_meta->meta_size;
         lru_index_.erase({0LL, bucket_id});
         buckets_.erase(bucket_it);
     }
@@ -2795,40 +2916,43 @@ BucketStorageBackend::SelectEvictionCandidate() {
         case BucketEvictionPolicy::FIFO:
             // buckets_ is ordered by bucket_id (monotonically increasing),
             // so begin() is always the oldest bucket.
-            return buckets_.begin();
+            return std::find_if(
+                buckets_.begin(), buckets_.end(), [](const auto& entry) {
+                    return !entry.second->mutation_in_progress_.load(
+                        std::memory_order_acquire);
+                });
 
-        case BucketEvictionPolicy::LRU:
-            // Use lru_index_ (a std::set ordered by {last_access_ns_,
-            // bucket_id}) for O(log N) candidate selection.
-            //
-            // The index may be stale: BatchLoad updates last_access_ns_
-            // atomically under a shared lock without touching lru_index_.
-            // We repair lazily here (called under exclusive lock):
-            //   - If the top entry's timestamp matches the actual
-            //     last_access_ns_, it is the true LRU candidate.
-            //   - If stale, re-insert with the correct timestamp and retry.
-            //   - If the bucket no longer exists, discard the entry.
+        case BucketEvictionPolicy::LRU: {
+            std::vector<std::pair<int64_t, int64_t>> skipped;
             while (!lru_index_.empty()) {
-                auto top_it = lru_index_.begin();
-                auto [ts, id] = *top_it;
-                auto bucket_it = buckets_.find(id);
-                if (bucket_it == buckets_.end()) {
-                    lru_index_.erase(top_it);
+                auto top = lru_index_.begin();
+                auto [timestamp, bucket_id] = *top;
+                auto bucket = buckets_.find(bucket_id);
+                if (bucket == buckets_.end()) {
+                    lru_index_.erase(top);
                     continue;
                 }
-                int64_t actual_ts = bucket_it->second->last_access_ns_.load(
-                    std::memory_order_relaxed);
-                if (actual_ts == ts) {
-                    // Correct entry: remove from index (bucket is about to be
-                    // evicted) and return.
-                    lru_index_.erase(top_it);
-                    return bucket_it;
+                const int64_t actual_timestamp =
+                    bucket->second->last_access_ns_.load(
+                        std::memory_order_relaxed);
+                if (bucket->second->mutation_in_progress_.load(
+                        std::memory_order_acquire)) {
+                    skipped.emplace_back(actual_timestamp, bucket_id);
+                    lru_index_.erase(top);
+                    continue;
                 }
-                // Stale: repair and retry to find the true minimum.
-                lru_index_.erase(top_it);
-                lru_index_.emplace(actual_ts, id);
+                if (actual_timestamp != timestamp) {
+                    lru_index_.erase(top);
+                    lru_index_.emplace(actual_timestamp, bucket_id);
+                    continue;
+                }
+                lru_index_.erase(top);
+                lru_index_.insert(skipped.begin(), skipped.end());
+                return bucket;
             }
+            lru_index_.insert(skipped.begin(), skipped.end());
             return buckets_.end();
+        }
 
         default:
             return buckets_.end();
@@ -2930,20 +3054,19 @@ BucketStorageBackend::PrepareEviction(
             std::move(evict_it->second);
         buckets_.erase(evict_it);
 
-        int64_t evicted_size = evict_meta->meta_size;
+        const int64_t evicted_size =
+            evict_meta->data_size + evict_meta->meta_size;
         // Remove all keys belonging to this bucket from the object map.
         for (const auto& key : evict_meta->keys) {
             auto obj_it = object_bucket_map_.find(key);
             if (obj_it != object_bucket_map_.end() &&
                 obj_it->second.bucket_id == evict_id) {
-                const int64_t object_size =
-                    obj_it->second.data_size + obj_it->second.key_size;
-                total_size_ -= object_size;
-                evicted_size += object_size;
                 object_bucket_map_.erase(obj_it);
             }
         }
-        total_size_ -= evict_meta->meta_size;
+        total_size_ -= evicted_size;
+        reclaimable_bytes_.fetch_sub(BucketReclaimableBytes(*evict_meta),
+                                     std::memory_order_relaxed);
         result.evicted_size += evicted_size;
 
         // Collect for notification and file deletion.
@@ -2999,12 +3122,20 @@ void BucketStorageBackend::RestorePreparedEvictionLocked(
         for (size_t i = 0; i < bucket_meta->keys.size(); ++i) {
             const auto& key = bucket_meta->keys[i];
             const auto& object_meta = bucket_meta->metadatas[i];
-            object_bucket_map_[key] = StorageObjectMetadata{
-                bucket_id, object_meta.offset, object_meta.key_size,
-                object_meta.data_size, ""};
-            total_size_ += object_meta.data_size + object_meta.key_size;
+            if (object_meta.tombstoned) {
+                continue;
+            }
+            object_bucket_map_[key] =
+                StorageObjectMetadata{bucket_id,
+                                      object_meta.offset,
+                                      object_meta.key_size,
+                                      object_meta.data_size,
+                                      "",
+                                      object_meta.object_incarnation};
         }
-        total_size_ += bucket_meta->meta_size;
+        total_size_ += bucket_meta->data_size + bucket_meta->meta_size;
+        reclaimable_bytes_.fetch_add(BucketReclaimableBytes(*bucket_meta),
+                                     std::memory_order_relaxed);
         if (bucket_backend_config_.eviction_policy ==
             BucketEvictionPolicy::LRU) {
             lru_index_.emplace(
@@ -3057,6 +3188,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::FinalizeEviction(
     size_t cleanup_failed_count = 0;
 
     for (const auto& [bucket_id, bucket_meta] : pending.buckets) {
+        std::unique_lock<std::mutex> operation_lock(
+            bucket_meta->operation_mutex_);
         bool bucket_cleanup_failed = false;
 
         // The master has already committed the replica removal. Attempt to
@@ -3208,6 +3341,11 @@ tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
                          << bucket_id;
             return tl::make_unexpected(ErrorCode::BUCKET_NOT_FOUND);
         }
+        if (bucket_it->second->mutation_in_progress_.load(
+                std::memory_order_acquire)) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
 
         // Move the shared_ptr out - we now own it
         bucket_metadata = std::move(bucket_it->second);
@@ -3222,16 +3360,18 @@ tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
             auto obj_it = object_bucket_map_.find(key);
             if (obj_it != object_bucket_map_.end() &&
                 obj_it->second.bucket_id == bucket_id) {
-                total_size_ -=
-                    obj_it->second.data_size + obj_it->second.key_size;
                 object_bucket_map_.erase(obj_it);
             }
         }
 
-        // Subtract metadata size
-        total_size_ -= bucket_metadata->meta_size;
+        total_size_ -= bucket_metadata->data_size + bucket_metadata->meta_size;
+        reclaimable_bytes_.fetch_sub(BucketReclaimableBytes(*bucket_metadata),
+                                     std::memory_order_relaxed);
     }
     // Lock released - new readers can't find this bucket anymore
+
+    std::unique_lock<std::mutex> operation_lock(
+        bucket_metadata->operation_mutex_);
 
     // Step 2: Wait for in-flight reads to complete
     // Readers that started before we removed from buckets_ still hold guards
@@ -3345,6 +3485,929 @@ tl::expected<void, ErrorCode> BucketStorageBackend::StoreBucketMetadata(
     }
     metadata->meta_size = str.size();
     return {};
+}
+
+tl::expected<void, ErrorCode>
+BucketStorageBackend::StoreBucketMetadataAtomically(int64_t id,
+                                                    BucketMetadata& metadata) {
+    namespace fs = std::filesystem;
+    auto meta_path_res = GetBucketMetadataPath(id);
+    if (!meta_path_res) {
+        return tl::unexpected(meta_path_res.error());
+    }
+    const fs::path meta_path(meta_path_res.value());
+    const fs::path temp_path =
+        meta_path.string() + ".delete." + UuidToString(generate_uuid());
+
+    std::string bytes;
+    struct_pb::to_pb(metadata, bytes);
+    const int fd = ::open(temp_path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (fd < 0) {
+        return tl::unexpected(ErrorCode::FILE_OPEN_FAIL);
+    }
+    FdGuard file(fd);
+    size_t written = 0;
+    while (written < bytes.size()) {
+        const ssize_t n =
+            ::write(file.get(), bytes.data() + written, bytes.size() - written);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            fs::remove(temp_path);
+            return tl::unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        written += static_cast<size_t>(n);
+    }
+    if (::fsync(file.get()) != 0 || ::close(file.release()) != 0) {
+        fs::remove(temp_path);
+        return tl::unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    if (::rename(temp_path.c_str(), meta_path.c_str()) != 0) {
+        fs::remove(temp_path);
+        return tl::unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    const int directory_fd =
+        ::open(meta_path.parent_path().c_str(), O_RDONLY | O_DIRECTORY);
+    if (directory_fd < 0) {
+        return tl::unexpected(ErrorCode::FILE_OPEN_FAIL);
+    }
+    FdGuard directory(directory_fd);
+    if (::fsync(directory.get()) != 0) {
+        return tl::unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    metadata.meta_size = static_cast<int64_t>(bytes.size());
+    return {};
+}
+
+std::vector<LocalDeleteTaskResult> BucketStorageBackend::BatchMarkDeleted(
+    const std::vector<LocalDeleteTask>& tasks) {
+    std::vector<LocalDeleteTaskResult> results;
+    results.reserve(tasks.size());
+    for (const auto& task : tasks) {
+        results.push_back({task.task_id, LocalDeleteResult::kRetryableFailure,
+                           ErrorCode::INTERNAL_ERROR});
+    }
+
+    std::unordered_map<int64_t, std::vector<size_t>> by_bucket;
+    {
+        SharedMutexLocker lock(&mutex_, shared_lock);
+        for (size_t i = 0; i < tasks.size(); ++i) {
+            const auto& task = tasks[i];
+            auto live_it = object_bucket_map_.find(task.key);
+            if (live_it != object_bucket_map_.end()) {
+                if (live_it->second.object_incarnation !=
+                    task.object_incarnation) {
+                    results[i] = {task.task_id,
+                                  LocalDeleteResult::kStaleVersion,
+                                  ErrorCode::OK};
+                    continue;
+                }
+                by_bucket[live_it->second.bucket_id].push_back(i);
+                continue;
+            }
+            if (task.expected_bucket_id < 0) {
+                results[i] = {task.task_id, LocalDeleteResult::kStaleVersion,
+                              ErrorCode::OK};
+                continue;
+            }
+            by_bucket[task.expected_bucket_id].push_back(i);
+        }
+    }
+
+    for (const auto& [bucket_id, indexes] : by_bucket) {
+        std::shared_ptr<BucketMetadata> bucket;
+        {
+            SharedMutexLocker lock(&mutex_, shared_lock);
+            auto bucket_it = buckets_.find(bucket_id);
+            if (bucket_it != buckets_.end()) {
+                bucket = bucket_it->second;
+            }
+        }
+        if (!bucket) {
+            for (size_t index : indexes) {
+                results[index] = {tasks[index].task_id,
+                                  LocalDeleteResult::kStaleVersion,
+                                  ErrorCode::OK};
+            }
+            continue;
+        }
+
+        std::lock_guard<std::mutex> operation_lock(bucket->operation_mutex_);
+        BucketMetadata updated;
+        std::vector<size_t> changed_indexes;
+        int64_t newly_reclaimable = 0;
+        {
+            // Claim the bucket while holding the metadata lock. Eviction and
+            // GC skip claimed buckets, so the durable rewrite cannot race
+            // with file retirement.
+            SharedMutexLocker active_lock(&mutex_, shared_lock);
+            auto active_it = buckets_.find(bucket_id);
+            if (active_it == buckets_.end() || active_it->second != bucket) {
+                for (size_t index : indexes) {
+                    results[index] = {tasks[index].task_id,
+                                      LocalDeleteResult::kStaleVersion,
+                                      ErrorCode::OK};
+                }
+                continue;
+            }
+            bool expected = false;
+            if (!bucket->mutation_in_progress_.compare_exchange_strong(
+                    expected, true, std::memory_order_acq_rel)) {
+                continue;
+            }
+
+            updated = *bucket;
+            for (size_t index : indexes) {
+                const auto& task = tasks[index];
+                auto key_it = std::find(updated.keys.begin(),
+                                        updated.keys.end(), task.key);
+                if (key_it == updated.keys.end()) {
+                    results[index] = {task.task_id,
+                                      LocalDeleteResult::kStaleVersion,
+                                      ErrorCode::OK};
+                    continue;
+                }
+                const size_t object_index = static_cast<size_t>(
+                    std::distance(updated.keys.begin(), key_it));
+                auto& object_meta = updated.metadatas[object_index];
+                if (object_meta.object_incarnation != task.object_incarnation) {
+                    results[index] = {task.task_id,
+                                      LocalDeleteResult::kStaleVersion,
+                                      ErrorCode::OK};
+                    continue;
+                }
+                if (object_meta.tombstoned) {
+                    results[index] = {task.task_id,
+                                      LocalDeleteResult::kAlreadyRemoved,
+                                      ErrorCode::OK};
+                    continue;
+                }
+                object_meta.tombstoned = true;
+                newly_reclaimable +=
+                    object_meta.key_size + object_meta.data_size;
+                changed_indexes.push_back(index);
+                results[index] = {task.task_id, LocalDeleteResult::kRemoved,
+                                  ErrorCode::OK};
+            }
+            if (changed_indexes.empty()) {
+                bucket->mutation_in_progress_.store(false,
+                                                    std::memory_order_release);
+                continue;
+            }
+        }
+
+        auto persist = StoreBucketMetadataAtomically(bucket_id, updated);
+        if (!persist) {
+            bucket->mutation_in_progress_.store(false,
+                                                std::memory_order_release);
+            for (size_t index : changed_indexes) {
+                results[index] = {tasks[index].task_id,
+                                  LocalDeleteResult::kRetryableFailure,
+                                  persist.error()};
+            }
+            continue;
+        }
+
+        {
+            SharedMutexLocker lock(&mutex_);
+            auto active_it = buckets_.find(bucket_id);
+            if (active_it == buckets_.end() || active_it->second != bucket) {
+                bucket->mutation_in_progress_.store(false,
+                                                    std::memory_order_release);
+                continue;
+            }
+            total_size_ += updated.meta_size - bucket->meta_size;
+            reclaimable_bytes_.fetch_add(newly_reclaimable,
+                                         std::memory_order_relaxed);
+            *bucket = std::move(updated);
+            for (size_t index : changed_indexes) {
+                const auto& task = tasks[index];
+                auto live_it = object_bucket_map_.find(task.key);
+                if (live_it != object_bucket_map_.end() &&
+                    live_it->second.bucket_id == bucket_id &&
+                    live_it->second.object_incarnation ==
+                        task.object_incarnation) {
+                    object_bucket_map_.erase(live_it);
+                }
+            }
+            bucket->mutation_in_progress_.store(false,
+                                                std::memory_order_release);
+        }
+    }
+
+    return results;
+}
+
+int64_t BucketStorageBackend::GetReclaimableBytes() const {
+    return reclaimable_bytes_.load(std::memory_order_relaxed);
+}
+
+int64_t BucketStorageBackend::BucketReclaimableBytes(
+    const BucketMetadata& bucket) {
+    int64_t bytes = 0;
+    for (const auto& metadata : bucket.metadatas) {
+        if (metadata.tombstoned) {
+            bytes += metadata.key_size + metadata.data_size;
+        }
+    }
+    return bytes;
+}
+
+bool BucketStorageBackend::RequestGarbageCollection(
+    bool require_disk_pressure) {
+    if (!bucket_backend_config_.gc_enable) {
+        return false;
+    }
+    if (require_disk_pressure) {
+        SharedMutexLocker lock(&mutex_, shared_lock);
+        const int64_t capacity = bucket_backend_config_.max_total_size;
+        const int64_t high_watermark = static_cast<int64_t>(
+            capacity * file_storage_config_.disk_eviction_high_watermark_ratio);
+        if (capacity <= 0 || total_size_ < high_watermark) {
+            return false;
+        }
+    }
+    {
+        std::lock_guard<std::mutex> lock(gc_mutex_);
+        gc_requested_ = true;
+    }
+    gc_cv_.notify_one();
+    return true;
+}
+
+tl::expected<void, ErrorCode> BucketStorageBackend::SyncStorageDirectory()
+    const {
+    const int fd = ::open(storage_path_.c_str(), O_RDONLY | O_DIRECTORY);
+    if (fd < 0) {
+        return tl::unexpected(ErrorCode::FILE_OPEN_FAIL);
+    }
+    FdGuard directory(fd);
+    if (::fsync(directory.get()) != 0) {
+        return tl::unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    return {};
+}
+
+tl::expected<void, ErrorCode> BucketStorageBackend::StoreGcIntent(
+    const BucketGcIntent& intent) {
+    namespace fs = std::filesystem;
+    const fs::path path = fs::path(storage_path_) / ".bucket_gc_intent";
+    const fs::path temp =
+        path.string() + ".tmp." + UuidToString(generate_uuid());
+    std::string bytes;
+    struct_pb::to_pb(intent, bytes);
+
+    const int fd = ::open(temp.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (fd < 0) {
+        return tl::unexpected(ErrorCode::FILE_OPEN_FAIL);
+    }
+    FdGuard file(fd);
+    size_t written = 0;
+    while (written < bytes.size()) {
+        const ssize_t n =
+            ::write(file.get(), bytes.data() + written, bytes.size() - written);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            fs::remove(temp);
+            return tl::unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        written += static_cast<size_t>(n);
+    }
+    if (::fsync(file.get()) != 0 || ::close(file.release()) != 0) {
+        fs::remove(temp);
+        return tl::unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    if (::rename(temp.c_str(), path.c_str()) != 0) {
+        fs::remove(temp);
+        return tl::unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    return SyncStorageDirectory();
+}
+
+tl::expected<void, ErrorCode> BucketStorageBackend::RemoveGcIntent() {
+    namespace fs = std::filesystem;
+    const fs::path path = fs::path(storage_path_) / ".bucket_gc_intent";
+    std::error_code ec;
+    fs::remove(path, ec);
+    if (ec && ec != std::errc::no_such_file_or_directory) {
+        return tl::unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    return SyncStorageDirectory();
+}
+
+tl::expected<void, ErrorCode> BucketStorageBackend::RecoverGarbageCollection() {
+    namespace fs = std::filesystem;
+    const fs::path path = fs::path(storage_path_) / ".bucket_gc_intent";
+    std::error_code ec;
+    if (!fs::exists(path, ec)) {
+        if (ec) {
+            return tl::unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+        return {};
+    }
+
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) {
+        return tl::unexpected(ErrorCode::FILE_OPEN_FAIL);
+    }
+    FdGuard file(fd);
+    struct stat stat_buf{};
+    if (::fstat(file.get(), &stat_buf) != 0 || stat_buf.st_size <= 0) {
+        return tl::unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+    std::string bytes(static_cast<size_t>(stat_buf.st_size), '\0');
+    size_t read_bytes = 0;
+    while (read_bytes < bytes.size()) {
+        const ssize_t n = ::read(file.get(), bytes.data() + read_bytes,
+                                 bytes.size() - read_bytes);
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+        if (n <= 0) {
+            return tl::unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+        read_bytes += static_cast<size_t>(n);
+    }
+
+    BucketGcIntent intent;
+    try {
+        struct_pb::from_pb(intent, bytes);
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Failed to decode bucket GC intent: " << e.what();
+        return tl::unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+    if (intent.version != 1 || intent.target_bucket_id < -1 ||
+        intent.source_bucket_ids.empty() ||
+        intent.source_bucket_ids.size() > kMaxGcSources) {
+        return tl::unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+    std::unordered_set<int64_t> source_ids;
+    for (int64_t source_id : intent.source_bucket_ids) {
+        if (source_id < 0 || source_id == intent.target_bucket_id ||
+            !source_ids.insert(source_id).second) {
+            return tl::unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+    }
+
+    if (!intent.committed) {
+        if (intent.target_bucket_id >= 0) {
+            if (!CleanupOrphanedBucket(intent.target_bucket_id)) {
+                return tl::unexpected(ErrorCode::FILE_WRITE_FAIL);
+            }
+        }
+    } else {
+        if (intent.target_bucket_id >= 0) {
+            auto target_meta = GetBucketMetadataPath(intent.target_bucket_id);
+            auto target_data = GetBucketDataPath(intent.target_bucket_id);
+            if (!target_meta || !target_data ||
+                !fs::is_regular_file(target_meta.value(), ec) || ec ||
+                !fs::is_regular_file(target_data.value(), ec) || ec) {
+                LOG(ERROR) << "Committed GC replacement is incomplete: "
+                           << intent.target_bucket_id;
+                return tl::unexpected(ErrorCode::FILE_READ_FAIL);
+            }
+            auto replacement = std::make_shared<BucketMetadata>();
+            auto loaded =
+                LoadBucketMetadata(intent.target_bucket_id, replacement);
+            const auto data_size = fs::file_size(target_data.value(), ec);
+            if (!loaded || ec || replacement->keys.empty() ||
+                replacement->keys.size() != replacement->metadatas.size() ||
+                data_size < static_cast<uintmax_t>(replacement->data_size)) {
+                LOG(ERROR) << "Committed GC replacement is invalid: "
+                           << intent.target_bucket_id;
+                return tl::unexpected(ErrorCode::FILE_READ_FAIL);
+            }
+            std::unordered_set<std::string> unique_keys;
+            for (size_t i = 0; i < replacement->keys.size(); ++i) {
+                const auto& object = replacement->metadatas[i];
+                if (object.tombstoned || object.offset < 0 ||
+                    object.key_size < 0 || object.data_size < 0 ||
+                    object.offset > replacement->data_size - object.key_size ||
+                    object.offset + object.key_size >
+                        replacement->data_size - object.data_size ||
+                    !unique_keys.insert(replacement->keys[i]).second) {
+                    return tl::unexpected(ErrorCode::FILE_READ_FAIL);
+                }
+            }
+        }
+        for (int64_t source_id : intent.source_bucket_ids) {
+            if (!CleanupOrphanedBucket(source_id)) {
+                return tl::unexpected(ErrorCode::FILE_WRITE_FAIL);
+            }
+        }
+    }
+    return RemoveGcIntent();
+}
+
+std::vector<BucketStorageBackend::GcCandidate>
+BucketStorageBackend::SelectGcCandidates(bool under_pressure) {
+    std::vector<GcCandidate> candidates;
+    SharedMutexLocker lock(&mutex_, shared_lock);
+    for (const auto& [bucket_id, bucket] : buckets_) {
+        if (bucket->mutation_in_progress_.load(std::memory_order_acquire)) {
+            continue;
+        }
+        int64_t live_bytes = 0;
+        int64_t reclaimable_bytes = 0;
+        size_t live_keys = 0;
+        for (const auto& metadata : bucket->metadatas) {
+            const int64_t bytes = metadata.key_size + metadata.data_size;
+            if (metadata.tombstoned) {
+                reclaimable_bytes += bytes;
+            } else {
+                live_bytes += bytes;
+                ++live_keys;
+            }
+        }
+        if (reclaimable_bytes == 0) {
+            continue;
+        }
+        const double deleted_ratio =
+            static_cast<double>(reclaimable_bytes) /
+            static_cast<double>(live_bytes + reclaimable_bytes);
+        if (!under_pressure &&
+            deleted_ratio < bucket_backend_config_.gc_deleted_ratio) {
+            continue;
+        }
+        candidates.push_back(
+            {bucket_id, bucket, live_bytes, reclaimable_bytes, live_keys});
+    }
+    std::sort(
+        candidates.begin(), candidates.end(),
+        [](const GcCandidate& lhs, const GcCandidate& rhs) {
+            if ((lhs.live_keys == 0) != (rhs.live_keys == 0)) {
+                return lhs.live_keys == 0;
+            }
+            const int64_t lhs_total = lhs.live_bytes + lhs.reclaimable_bytes;
+            const int64_t rhs_total = rhs.live_bytes + rhs.reclaimable_bytes;
+            const double lhs_ratio =
+                static_cast<double>(lhs.reclaimable_bytes) / lhs_total;
+            const double rhs_ratio =
+                static_cast<double>(rhs.reclaimable_bytes) / rhs_total;
+            if (lhs_ratio != rhs_ratio) {
+                return lhs_ratio > rhs_ratio;
+            }
+            if (lhs.reclaimable_bytes != rhs.reclaimable_bytes) {
+                return lhs.reclaimable_bytes > rhs.reclaimable_bytes;
+            }
+            return lhs.bucket_id < rhs.bucket_id;
+        });
+    return candidates;
+}
+
+tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode>
+BucketStorageBackend::WriteGcReplacement(
+    int64_t target_bucket_id, const std::vector<GcCandidate>& sources) {
+    namespace fs = std::filesystem;
+    auto target_path_result = GetBucketDataPath(target_bucket_id);
+    if (!target_path_result) {
+        return tl::unexpected(target_path_result.error());
+    }
+    const std::string& target_path = target_path_result.value();
+    const int target_fd =
+        ::open(target_path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (target_fd < 0) {
+        return tl::unexpected(ErrorCode::FILE_OPEN_FAIL);
+    }
+    FdGuard target_file(target_fd);
+    auto replacement = std::make_shared<BucketMetadata>();
+    std::vector<char> buffer(1024 * 1024);
+    int64_t output_offset = 0;
+
+    for (const auto& source : sources) {
+        auto source_path_result = GetBucketDataPath(source.bucket_id);
+        if (!source_path_result) {
+            CleanupOrphanedBucket(target_bucket_id);
+            return tl::unexpected(source_path_result.error());
+        }
+        const int source_fd =
+            ::open(source_path_result.value().c_str(), O_RDONLY);
+        if (source_fd < 0) {
+            CleanupOrphanedBucket(target_bucket_id);
+            return tl::unexpected(ErrorCode::FILE_OPEN_FAIL);
+        }
+        FdGuard source_file(source_fd);
+        for (size_t i = 0; i < source.bucket->metadatas.size(); ++i) {
+            const auto& metadata = source.bucket->metadatas[i];
+            if (metadata.tombstoned) {
+                continue;
+            }
+            const int64_t record_size = metadata.key_size + metadata.data_size;
+            int64_t copied = 0;
+            while (copied < record_size) {
+                if (gc_stop_.load(std::memory_order_acquire)) {
+                    CleanupOrphanedBucket(target_bucket_id);
+                    return tl::unexpected(
+                        ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+                }
+                const size_t chunk = static_cast<size_t>(
+                    std::min<int64_t>(record_size - copied, buffer.size()));
+                ssize_t n = 0;
+                do {
+                    n = ::pread(source_file.get(), buffer.data(), chunk,
+                                metadata.offset + copied);
+                } while (n < 0 && errno == EINTR);
+                if (n <= 0) {
+                    CleanupOrphanedBucket(target_bucket_id);
+                    return tl::unexpected(ErrorCode::FILE_READ_FAIL);
+                }
+                size_t written = 0;
+                while (written < static_cast<size_t>(n)) {
+                    ssize_t out = ::pwrite(
+                        target_file.get(), buffer.data() + written,
+                        static_cast<size_t>(n) - written,
+                        output_offset + copied + static_cast<int64_t>(written));
+                    if (out < 0 && errno == EINTR) {
+                        continue;
+                    }
+                    if (out <= 0) {
+                        CleanupOrphanedBucket(target_bucket_id);
+                        return tl::unexpected(ErrorCode::FILE_WRITE_FAIL);
+                    }
+                    written += static_cast<size_t>(out);
+                }
+                copied += n;
+            }
+            replacement->keys.push_back(source.bucket->keys[i]);
+            replacement->metadatas.push_back(
+                {output_offset, metadata.key_size, metadata.data_size,
+                 metadata.object_incarnation, false});
+            output_offset += record_size;
+        }
+    }
+    replacement->data_size = output_offset;
+    if (::fsync(target_file.get()) != 0 ||
+        ::close(target_file.release()) != 0) {
+        CleanupOrphanedBucket(target_bucket_id);
+        return tl::unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    auto stored = StoreBucketMetadataAtomically(target_bucket_id, *replacement);
+    if (!stored) {
+        CleanupOrphanedBucket(target_bucket_id);
+        return tl::unexpected(stored.error());
+    }
+    return replacement;
+}
+
+bool BucketStorageBackend::FinalizeGcSource(const GcCandidate& source) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+    auto meta_path = GetBucketMetadataPath(source.bucket_id);
+    if (!meta_path) {
+        return false;
+    }
+    fs::remove(meta_path.value(), ec);
+    if (ec && ec != std::errc::no_such_file_or_directory) {
+        return false;
+    }
+    if (!SyncStorageDirectory()) {
+        return false;
+    }
+
+    constexpr auto kReaderTimeout = std::chrono::seconds(10);
+    const auto deadline = std::chrono::steady_clock::now() + kReaderTimeout;
+    while (source.bucket->inflight_reads_.load(std::memory_order_acquire) > 0) {
+        if (gc_stop_.load(std::memory_order_acquire)) {
+            return false;
+        }
+        if (std::chrono::steady_clock::now() >= deadline) {
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::microseconds(100));
+    }
+
+    auto data_path = GetBucketDataPath(source.bucket_id);
+    if (!data_path) {
+        return false;
+    }
+    {
+        MutexLocker cache_locker(&file_cache_mutex_);
+        file_cache_.erase(data_path.value());
+    }
+    ec.clear();
+    fs::remove(data_path.value(), ec);
+    if (ec && ec != std::errc::no_such_file_or_directory) {
+        return false;
+    }
+    if (!SyncStorageDirectory()) {
+        return false;
+    }
+    {
+        SharedMutexLocker lock(&mutex_);
+        total_size_ =
+            std::max<int64_t>(0, total_size_ - source.bucket->data_size -
+                                     source.bucket->meta_size);
+    }
+    return true;
+}
+
+tl::expected<bool, ErrorCode> BucketStorageBackend::RunGarbageCollectionOnce(
+    bool under_pressure) {
+    namespace fs = std::filesystem;
+    const fs::path intent_path = fs::path(storage_path_) / ".bucket_gc_intent";
+    std::error_code ec;
+    if (fs::exists(intent_path, ec) || ec) {
+        if (ec) {
+            return tl::unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+        return false;
+    }
+
+    auto candidates = SelectGcCandidates(under_pressure);
+    if (candidates.empty()) {
+        return false;
+    }
+
+    std::vector<GcCandidate> sources;
+    int64_t live_bytes = 0;
+    size_t live_keys = 0;
+    for (const auto& candidate : candidates) {
+        if (candidate.live_keys == 0) {
+            if (!sources.empty() && sources.front().live_keys != 0) {
+                break;
+            }
+            sources.push_back(candidate);
+            if (sources.size() == kMaxGcSources) {
+                break;
+            }
+            continue;
+        }
+        if (!sources.empty() && sources.front().live_keys == 0) {
+            break;
+        }
+        if (sources.size() == kMaxGcSources ||
+            live_bytes + candidate.live_bytes >
+                bucket_backend_config_.bucket_size_limit ||
+            live_keys + candidate.live_keys >
+                static_cast<size_t>(bucket_backend_config_.bucket_keys_limit)) {
+            continue;
+        }
+        sources.push_back(candidate);
+        live_bytes += candidate.live_bytes;
+        live_keys += candidate.live_keys;
+    }
+    if (sources.empty()) {
+        return false;
+    }
+    std::sort(sources.begin(), sources.end(),
+              [](const GcCandidate& lhs, const GcCandidate& rhs) {
+                  return lhs.bucket_id < rhs.bucket_id;
+              });
+
+    std::vector<std::unique_lock<std::mutex>> operation_locks;
+    operation_locks.reserve(sources.size());
+    for (const auto& source : sources) {
+        operation_locks.emplace_back(source.bucket->operation_mutex_);
+    }
+
+    {
+        SharedMutexLocker lock(&mutex_);
+        for (const auto& source : sources) {
+            auto active = buckets_.find(source.bucket_id);
+            if (active == buckets_.end() || active->second != source.bucket ||
+                source.bucket->mutation_in_progress_.load(
+                    std::memory_order_relaxed)) {
+                return false;
+            }
+        }
+        for (auto& source : sources) {
+            source.live_bytes = 0;
+            source.reclaimable_bytes = 0;
+            source.live_keys = 0;
+            for (const auto& metadata : source.bucket->metadatas) {
+                const int64_t bytes = metadata.key_size + metadata.data_size;
+                if (metadata.tombstoned) {
+                    source.reclaimable_bytes += bytes;
+                } else {
+                    source.live_bytes += bytes;
+                    ++source.live_keys;
+                }
+            }
+            source.bucket->mutation_in_progress_.store(
+                true, std::memory_order_release);
+        }
+    }
+    auto clear_mutation = [&] {
+        SharedMutexLocker lock(&mutex_);
+        for (const auto& source : sources) {
+            auto active = buckets_.find(source.bucket_id);
+            if (active != buckets_.end() && active->second == source.bucket) {
+                source.bucket->mutation_in_progress_.store(
+                    false, std::memory_order_release);
+            }
+        }
+    };
+    ScopeExit mutation_guard(clear_mutation);
+
+    const bool fully_dead = std::all_of(
+        sources.begin(), sources.end(),
+        [](const GcCandidate& source) { return source.live_keys == 0; });
+    const int64_t target_bucket_id =
+        fully_dead ? -1 : bucket_id_generator_->NextId();
+    BucketGcIntent intent{
+        .version = 1, .committed = false, .target_bucket_id = target_bucket_id};
+    for (const auto& source : sources) {
+        intent.source_bucket_ids.push_back(source.bucket_id);
+    }
+    auto prepared = StoreGcIntent(intent);
+    if (!prepared) {
+        return tl::unexpected(prepared.error());
+    }
+
+    std::shared_ptr<BucketMetadata> replacement;
+    int64_t replacement_size = 0;
+    auto rollback_prepared = [&]() -> tl::expected<void, ErrorCode> {
+        if (target_bucket_id >= 0 && !CleanupOrphanedBucket(target_bucket_id)) {
+            return tl::unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        if (replacement_size > 0) {
+            SharedMutexLocker lock(&mutex_);
+            total_size_ = std::max<int64_t>(0, total_size_ - replacement_size);
+        }
+        return RemoveGcIntent();
+    };
+    if (!fully_dead) {
+        auto written = WriteGcReplacement(target_bucket_id, sources);
+        if (!written) {
+            rollback_prepared();
+            return tl::unexpected(written.error());
+        }
+        replacement = std::move(written.value());
+        replacement_size = replacement->data_size + replacement->meta_size;
+        {
+            SharedMutexLocker lock(&mutex_);
+            total_size_ += replacement_size;
+        }
+    }
+
+    std::unordered_map<std::string, StorageObjectMetadata>
+        staged_object_mappings;
+    std::map<int64_t, std::shared_ptr<BucketMetadata>> staged_bucket;
+    std::set<std::pair<int64_t, int64_t>> staged_lru;
+    if (replacement) {
+        try {
+            staged_object_mappings.reserve(replacement->keys.size());
+            for (size_t i = 0; i < replacement->keys.size(); ++i) {
+                const auto& metadata = replacement->metadatas[i];
+                auto [_, inserted] = staged_object_mappings.emplace(
+                    replacement->keys[i],
+                    StorageObjectMetadata{target_bucket_id, metadata.offset,
+                                          metadata.key_size, metadata.data_size,
+                                          "", metadata.object_incarnation});
+                if (!inserted) {
+                    rollback_prepared();
+                    return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+                }
+            }
+            staged_bucket.emplace(target_bucket_id, replacement);
+            staged_lru.emplace(0, target_bucket_id);
+        } catch (const std::exception&) {
+            rollback_prepared();
+            return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+    }
+    {
+        SharedMutexLocker lock(&mutex_, shared_lock);
+        for (const auto& source : sources) {
+            for (size_t i = 0; i < source.bucket->keys.size(); ++i) {
+                const auto& metadata = source.bucket->metadatas[i];
+                if (metadata.tombstoned) {
+                    continue;
+                }
+                auto object = object_bucket_map_.find(source.bucket->keys[i]);
+                if (object == object_bucket_map_.end() ||
+                    object->second.bucket_id != source.bucket_id ||
+                    object->second.object_incarnation !=
+                        metadata.object_incarnation) {
+                    lock.unlock();
+                    rollback_prepared();
+                    return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+                }
+            }
+        }
+    }
+
+    intent.committed = true;
+    auto committed = StoreGcIntent(intent);
+    if (!committed) {
+        rollback_prepared();
+        return tl::unexpected(committed.error());
+    }
+
+    {
+        SharedMutexLocker lock(&mutex_);
+        for (const auto& source : sources) {
+            reclaimable_bytes_.fetch_sub(source.reclaimable_bytes,
+                                         std::memory_order_relaxed);
+            for (size_t i = 0; i < source.bucket->keys.size(); ++i) {
+                const auto& key = source.bucket->keys[i];
+                auto object = object_bucket_map_.find(key);
+                if (object != object_bucket_map_.end() &&
+                    object->second.bucket_id == source.bucket_id) {
+                    object_bucket_map_.erase(object);
+                }
+            }
+            for (auto it = lru_index_.begin(); it != lru_index_.end();) {
+                if (it->second == source.bucket_id) {
+                    it = lru_index_.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            buckets_.erase(source.bucket_id);
+        }
+        if (replacement) {
+            object_bucket_map_.merge(staged_object_mappings);
+            buckets_.merge(staged_bucket);
+            lru_index_.merge(staged_lru);
+        }
+    }
+
+    bool all_removed = true;
+    int64_t reclaimed = 0;
+    for (const auto& source : sources) {
+        if (FinalizeGcSource(source)) {
+            reclaimed += source.bucket->data_size + source.bucket->meta_size;
+        } else {
+            all_removed = false;
+        }
+    }
+    if (all_removed) {
+        auto removed = RemoveGcIntent();
+        if (!removed) {
+            return tl::unexpected(removed.error());
+        }
+    }
+    LOG(INFO) << "Bucket GC compacted " << sources.size()
+              << " source bucket(s), replacement=" << target_bucket_id
+              << ", reclaimed_bytes=" << reclaimed;
+    return true;
+}
+
+void BucketStorageBackend::GarbageCollectionThreadFunc() {
+    const auto interval =
+        std::chrono::seconds(bucket_backend_config_.gc_interval_seconds);
+    while (true) {
+        {
+            std::unique_lock<std::mutex> lock(gc_mutex_);
+            gc_cv_.wait_for(lock, interval, [this] {
+                return gc_stop_.load(std::memory_order_acquire) ||
+                       gc_requested_;
+            });
+            if (gc_stop_.load(std::memory_order_acquire)) {
+                return;
+            }
+            gc_requested_ = false;
+        }
+
+        bool under_pressure = false;
+        int64_t low_watermark = 0;
+        {
+            SharedMutexLocker lock(&mutex_, shared_lock);
+            const int64_t capacity = bucket_backend_config_.max_total_size;
+            under_pressure =
+                capacity > 0 &&
+                total_size_ >=
+                    static_cast<int64_t>(
+                        capacity * file_storage_config_
+                                       .disk_eviction_high_watermark_ratio);
+            low_watermark = static_cast<int64_t>(
+                capacity *
+                file_storage_config_.disk_eviction_low_watermark_ratio);
+        }
+
+        while (true) {
+            tl::expected<bool, ErrorCode> result =
+                tl::unexpected(ErrorCode::INTERNAL_ERROR);
+            try {
+                result = RunGarbageCollectionOnce(under_pressure);
+            } catch (const std::exception& e) {
+                LOG(ERROR) << "Bucket GC aborted by exception: " << e.what();
+                break;
+            } catch (...) {
+                LOG(ERROR) << "Bucket GC aborted by unknown exception";
+                break;
+            }
+            if (!result) {
+                LOG(WARNING)
+                    << "Bucket GC failed: " << toString(result.error());
+                break;
+            }
+            if (gc_stop_.load(std::memory_order_acquire)) {
+                return;
+            }
+            if (!result.value() || !under_pressure) {
+                break;
+            }
+            SharedMutexLocker lock(&mutex_, shared_lock);
+            if (total_size_ <= low_watermark) {
+                break;
+            }
+        }
+    }
 }
 
 tl::expected<void, ErrorCode> BucketStorageBackend::LoadBucketMetadata(
@@ -5065,9 +6128,12 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
 
         keys.push_back(key);
         metadatas.push_back(
-            StorageObjectMetadata{0, static_cast<int64_t>(offset),
+            StorageObjectMetadata{0,
+                                  static_cast<int64_t>(offset),
                                   static_cast<int64_t>(header.key_len),
-                                  static_cast<int64_t>(value_size), ""});
+                                  static_cast<int64_t>(value_size),
+                                  "",
+                                  {}});
     }
 
     // ---- Post-loop flush: notify master of any evicted keys that
@@ -5426,7 +6492,9 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::ScanMeta(
                     // contains header and alignment padding, so it cannot
                     // be derived arithmetically.
                     static_cast<int64_t>(key.size()),
-                    static_cast<int64_t>(entry.value_size), ""});
+                    static_cast<int64_t>(entry.value_size),
+                    "",
+                    {}});
 
                 // Call handler when batch limit is reached
                 if (static_cast<int64_t>(keys.size()) >=
