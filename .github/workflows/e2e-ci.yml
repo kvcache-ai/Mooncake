@@ -37,10 +37,20 @@ jobs:
       checkout_ref: ${{ inputs.pr_sha || github.event.pull_request.head.sha }}
     secrets: inherit
 
+  build-wheel-rocm:
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      github.event.label.name == 'run-e2e-ci'
+    uses: ./.github/workflows/ci_rocm.yml
+    with:
+      checkout_ref: ${{ inputs.pr_sha || github.event.pull_request.head.sha }}
+
   integration-test:
     if: >
       github.event_name == 'workflow_dispatch' ||
       github.event.label.name == 'run-e2e-ci'
+    needs:
+      - build-wheel-rocm
     uses: ./.github/workflows/integration-test.yml
     with:
       pr_sha: ${{ inputs.pr_sha || github.event.pull_request.head.sha }}
@@ -55,6 +65,7 @@ jobs:
        github.event.label.name == 'run-e2e-ci')
     needs:
       - ascend-test
+      - build-wheel-rocm
       - integration-test
     runs-on: ubuntu-latest
     steps:
