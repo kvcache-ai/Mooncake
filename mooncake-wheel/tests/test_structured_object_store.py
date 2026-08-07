@@ -3041,6 +3041,40 @@ def test_dataproto_helper_ragged_tensor_non_tensor_roundtrip() -> None:
         transfer.put_dataproto(SimpleDataProto(non_tensor_batch={"ragged": mixed}))
 
 
+def test_dataproto_helper_jagged_nested_batch_tensor_roundtrip() -> None:
+    torch = pytest.importorskip("torch")
+    _store, transfer = make_transfer()
+    rows = [
+        torch.arange(2, dtype=torch.int64),
+        torch.arange(10, 14, dtype=torch.int64),
+        torch.arange(20, 21, dtype=torch.int64),
+    ]
+    nested = torch.nested.as_nested_tensor(rows, layout=torch.jagged)
+
+    ref = transfer.put_dataproto(SimpleDataProto(batch={"tokens": nested}))
+    view = transfer.dataproto_manifest_view(ref)
+
+    field_spec = view["batch_fields"]["tokens"]["spec"]
+    assert field_spec == {
+        "encoding": "torch_tensor",
+        "dtype": "torch.int64",
+        "nested": True,
+    }
+
+    for selection, expected_rows in (
+        (None, rows),
+        (slice(1, 3), rows[1:3]),
+        ([2, 0], [rows[2], rows[0]]),
+        ([], []),
+    ):
+        result = transfer.get_dataproto(ref, rows=selection)["batch"]["tokens"]
+        assert result.is_nested
+        assert result.layout == torch.jagged
+        assert len(result) == len(expected_rows)
+        for actual, expected in zip(result.unbind(), expected_rows):
+            assert torch.equal(actual, expected)
+
+
 def _assert_tensor_object_equal(actual, expected) -> None:
     torch = pytest.importorskip("torch")
     if expected is None:

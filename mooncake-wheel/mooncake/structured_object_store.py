@@ -871,6 +871,12 @@ class MooncakeBundleTransfer:
                 member, payload_spec, field_spec, indices, destination
             )
         if encoding == "torch_tensor":
+            if field_spec.get("nested"):
+                result = self.materialize_into(
+                    self.read_spec(stage_ref).select_members([member]),
+                    None if destination is None else {member: destination},
+                )
+                return _select_nested_tensor_rows(result.objects[member], indices)
             return self._read_torch_tensor_member_indices(
                 member, payload_spec, field_spec, indices, destination
             )
@@ -3178,6 +3184,22 @@ class _StructuredObjectLayer:
         member_slice: StructuredMemberSlice | None,
         destination: Any,
     ) -> Any:
+        if field_spec.get("nested"):
+            if destination is not None:
+                raise ValueError(
+                    f"structured nested tensor member {name} does not support destinations"
+                )
+            value = _deserialize_torch_save_payload(
+                self._bundle_store.read_payload(payload_spec)
+            )
+            if member_slice is None:
+                return value
+            if member_slice.axis != 0:
+                raise ValueError(
+                    "structured nested tensor slicing currently supports axis=0 only"
+                )
+            start, end, step = _normalized_member_slice(member_slice, len(value))
+            return _select_nested_tensor_rows(value, range(start, end, step))
         if member_slice is not None:
             return self._read_sliced_torch_tensor_member(
                 name, payload_spec, field_spec, member_slice, destination
@@ -4896,6 +4918,25 @@ def _normalized_member_slice(
     )
 
 
+def _select_nested_tensor_rows(value: Any, indices: Sequence[int]) -> Any:
+    rows = value.unbind()
+    selected = [rows[int(index)] for index in indices]
+    if selected:
+        result = _torch.nested.as_nested_tensor(selected, layout=value.layout)
+    else:
+        offsets = _torch.zeros(
+            1,
+            dtype=value.offsets().dtype,
+            device=value.offsets().device,
+        )
+        result = _torch.nested.nested_tensor_from_jagged(
+            value.values()[:0], offsets=offsets
+        )
+    if hasattr(value, "_ragged_idx"):
+        result._ragged_idx = value._ragged_idx
+    return result
+
+
 def _bytes_view(value: Any, name: str) -> memoryview:
     try:
         view = memoryview(value)
@@ -5128,6 +5169,14 @@ def _encode_structured_field(value: Any) -> tuple[dict[str, Any], Any]:
 
 
 def _encode_torch_tensor_field(value: Any) -> tuple[dict[str, Any], Any]:
+    if value.is_nested:
+        if value.layout != _torch.jagged:
+            raise ValueError("structured nested tensor fields require torch.jagged layout")
+        return {
+            "encoding": "torch_tensor",
+            "dtype": str(value.dtype),
+            "nested": True,
+        }, memoryview(_torch_save_payload_bytes(value))
     return {
         "encoding": "torch_tensor",
         "dtype": str(value.dtype),
