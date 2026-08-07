@@ -33,6 +33,7 @@ set(MOONCAKE_STORE_SOURCES
     shm_helper.cpp
     http_metadata_server.cpp
     file_storage.cpp
+    egm_store_pool.cpp
     serialize/serializer.cpp
     storage/distributed/distributed_storage_backend.cpp
     device/accelerator_device.cpp
