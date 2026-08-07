@@ -84,6 +84,35 @@ class EvictFakeBatchHaKvBackend : public HaKvBackend {
     std::map<std::string, std::string> kvs_;
 };
 
+class EvictBlockingBatchHaKvBackend : public EvictFakeBatchHaKvBackend {
+   public:
+    void BlockTxn() {
+        std::lock_guard lock(block_mutex_);
+        blocked_ = true;
+    }
+
+    void AllowTxn() {
+        {
+            std::lock_guard lock(block_mutex_);
+            blocked_ = false;
+        }
+        block_cv_.notify_all();
+    }
+
+    ErrorCode Txn(const KvTxn& txn) override {
+        {
+            std::unique_lock lock(block_mutex_);
+            block_cv_.wait(lock, [this] { return !blocked_; });
+        }
+        return EvictFakeBatchHaKvBackend::Txn(txn);
+    }
+
+   private:
+    std::mutex block_mutex_;
+    std::condition_variable block_cv_;
+    bool blocked_{false};
+};
+
 class EvictFailingBatchHaKvBackend : public EvictFakeBatchHaKvBackend {
    public:
     void FailTransactionsWith(ErrorCode error) {
@@ -438,6 +467,42 @@ TEST_F(MasterServiceEvictScenarioTest, OpLogRecordsEvictedTenantAndKey) {
     EXPECT_EQ(batch.entries[0].op_type, OpType::REMOVE);
     EXPECT_EQ(batch.entries[0].tenant_id, "tenant-a");
     EXPECT_EQ(batch.entries[0].object_key, "cold");
+}
+
+TEST_F(MasterServiceEvictScenarioTest,
+       OpLogDurabilityGatesTenantQuotaReclamation) {
+    const std::string cluster_id = "evict_scenario_durability";
+    const std::string tenant = TenantId::Default().value();
+    auto backend = std::make_shared<EvictBlockingBatchHaKvBackend>();
+    MasterScenario scenario("durability gates eviction quota reclamation",
+                            HaConfig(cluster_id, {{tenant, kObjectSize}}),
+                            backend);
+    scenario.Given(MemoryNode("memory").Capacity(kObjectSize))
+        .Given(Objects({"cold"})
+                   .Size(kObjectSize)
+                   .ForTenant(tenant)
+                   .CompleteOn("memory")
+                   .ExpiresAt(ExpiredBase()));
+
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 2, batch);
+
+    backend->BlockTxn();
+    scenario.When(EvictMemory(1.0))
+        .Then(Object("cold").DoesNotExist())
+        .Then(TenantQuota(tenant).Uses(kObjectSize).Reserves(0))
+        .When(PutStart("before-durable", kObjectSize)
+                  .ForTenant(tenant)
+                  .ExpectError(ErrorCode::TENANT_QUOTA_EXCEEDED));
+
+    backend->AllowTxn();
+    ReadBatchEventually(storage, 3, batch);
+    scenario.Then(TenantQuota(tenant).Uses(0).Reserves(0).Eventually())
+        .When(PutStart("after-durable", kObjectSize)
+                  .ForTenant(tenant)
+                  .ExpectReplicas(1))
+        .Then(TenantQuota(tenant).Uses(0).Reserves(kObjectSize));
 }
 
 TEST_F(MasterServiceEvictScenarioTest,

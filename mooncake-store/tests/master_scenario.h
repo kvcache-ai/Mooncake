@@ -461,6 +461,7 @@ struct TenantQuotaSpec {
     std::string tenant;
     std::optional<uint64_t> used_bytes{};
     std::optional<uint64_t> reserved_bytes{};
+    std::chrono::milliseconds eventual_timeout{};
 
     TenantQuotaSpec& Uses(uint64_t value) {
         used_bytes = value;
@@ -469,6 +470,12 @@ struct TenantQuotaSpec {
 
     TenantQuotaSpec& Reserves(uint64_t value) {
         reserved_bytes = value;
+        return *this;
+    }
+
+    TenantQuotaSpec& Eventually(
+        std::chrono::milliseconds timeout = std::chrono::seconds(1)) {
+        eventual_timeout = timeout;
         return *this;
     }
 };
