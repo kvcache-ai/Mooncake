@@ -1983,6 +1983,12 @@ void MasterService::ReleaseLocalDiskUsage(
             bytes_by_client[descriptor.client_id] += descriptor.object_size;
         }
     }
+    ReleaseLocalDiskUsage(bytes_by_client);
+}
+
+void MasterService::ReleaseLocalDiskUsage(
+    const std::unordered_map<UUID, int64_t, boost::hash<UUID>>&
+        bytes_by_client) {
     if (bytes_by_client.empty()) {
         return;
     }
@@ -3934,49 +3940,103 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const ObjectIdentity object_id{std::move(normalized_tenant), key};
     MetadataAccessorRW accessor(this, object_id);
-    if (!accessor.Exists()) {
-        accessor.Create(
-            client_id,
-            replica.get_descriptor().get_local_disk_descriptor().object_size,
-            std::vector<Replica>{}, false);
-    }
-    auto& metadata = accessor.Get();
     if (replica.type() != ReplicaType::LOCAL_DISK) {
         LOG(ERROR) << "Invalid replica type: " << replica.type()
                    << ". Expected ReplicaType::LOCAL_DISK.";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    const bool replacing_existing =
-        metadata.HasReplica(&Replica::fn_is_local_disk_replica);
+    const auto reported_descriptor = replica.get_descriptor();
+    const auto reported_local_disk =
+        reported_descriptor.get_local_disk_descriptor();
+
+    if (!accessor.Exists()) {
+        if (enable_oplog_ && ordered_oplog_writer_) {
+            auto persist_result = AppendOpLogVisibleBeforeDurable(
+                OpType::PUT_END, object_id.tenant_id.value(), key,
+                SerializeMetadataForOpLogFromReplicaDescriptors(
+                    client_id, reported_local_disk.object_size,
+                    {reported_descriptor}));
+            if (!persist_result) {
+                return tl::make_unexpected(persist_result.error());
+            }
+        }
+
+        accessor.Create(client_id, reported_local_disk.object_size,
+                        std::vector<Replica>{}, false);
+        auto& metadata = accessor.Get();
+        std::vector<Replica> replicas;
+        replicas.emplace_back(std::move(replica));
+        metadata.AddReplicas(std::move(replicas));
+        auto& shard = accessor.GetShard();
+        shard.OnDiskReplicaAdded(metadata);
+        SyncCacheTotalAccounting(metadata);
+        return true;
+    }
+
+    auto& metadata = accessor.Get();
+    const auto is_active_local_disk = [](const Replica& existing) {
+        return existing.is_local_disk_replica() && existing.is_completed();
+    };
+    const auto matches_reported_local_disk =
+        [client_id, &reported_local_disk](const Replica& existing) {
+            if (!existing.is_local_disk_replica() || !existing.is_completed()) {
+                return false;
+            }
+            const auto existing_local_disk =
+                existing.get_descriptor().get_local_disk_descriptor();
+            return existing_local_disk.client_id == client_id ||
+                   (!reported_local_disk.transport_endpoint.empty() &&
+                    existing_local_disk.transport_endpoint ==
+                        reported_local_disk.transport_endpoint);
+        };
+    const bool has_active_local_disk =
+        metadata.HasReplica(is_active_local_disk);
+    const bool has_matching_local_disk =
+        metadata.HasReplica(matches_reported_local_disk);
+
+    if (has_matching_local_disk) {
+        bool has_size_mismatch = false;
+        metadata.VisitReplicas(
+            matches_reported_local_disk,
+            [&reported_local_disk,
+             &has_size_mismatch](const Replica& existing) {
+                const auto existing_local_disk =
+                    existing.get_descriptor().get_local_disk_descriptor();
+                has_size_mismatch =
+                    has_size_mismatch || existing_local_disk.object_size !=
+                                             reported_local_disk.object_size;
+            });
+        if (has_size_mismatch) {
+            LOG(ERROR) << "LOCAL_DISK replica size mismatch for key=" << key;
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    } else if (has_active_local_disk) {
+        // A non-empty transport endpoint is a stable, unique local-disk
+        // identity across client UUID rotations. Different (or empty)
+        // endpoints must not take over an existing replica.
+        return false;
+    }
 
     if (enable_oplog_ && ordered_oplog_writer_) {
         std::vector<Replica::Descriptor> post;
         for (const auto& existing : metadata.GetAllReplicas()) {
             if (existing.status() != ReplicaStatus::COMPLETE) continue;
-            if (replacing_existing &&
-                existing.type() == ReplicaType::LOCAL_DISK &&
-                existing.get_descriptor()
-                        .get_local_disk_descriptor()
-                        .client_id == client_id) {
+            if (has_matching_local_disk &&
+                matches_reported_local_disk(existing)) {
                 // Substitute with the updated descriptor.
                 Replica::Descriptor updated = existing.get_descriptor();
+                updated.get_local_disk_descriptor().client_id = client_id;
                 updated.get_local_disk_descriptor().transport_endpoint =
-                    replica.get_descriptor()
-                        .get_local_disk_descriptor()
-                        .transport_endpoint;
-                updated.get_local_disk_descriptor().object_size =
-                    replica.get_descriptor()
-                        .get_local_disk_descriptor()
-                        .object_size;
+                    reported_local_disk.transport_endpoint;
                 post.push_back(std::move(updated));
             } else {
                 post.push_back(existing.get_descriptor());
             }
         }
-        if (!replacing_existing) {
+        if (!has_active_local_disk) {
             // The new LOCAL_DISK replica is COMPLETE upon AddReplica.
-            post.push_back(replica.get_descriptor());
+            post.push_back(reported_descriptor);
         }
 
         auto persist_result = AppendOpLogVisibleBeforeDurable(
@@ -3989,7 +4049,7 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
         }
     }
 
-    if (!replacing_existing) {
+    if (!has_active_local_disk) {
         std::vector<Replica> replicas;
         replicas.emplace_back(std::move(replica));
         metadata.AddReplicas(std::move(replicas));
@@ -3999,24 +4059,26 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
         return true;
     }
 
+    bool transferred_ownership = false;
+    std::unordered_map<UUID, int64_t, boost::hash<UUID>> replaced_usage;
     metadata.VisitReplicas(
-        [client_id](const Replica& rep) {
-            return rep.type() == ReplicaType::LOCAL_DISK &&
-                   rep.get_descriptor().get_local_disk_descriptor().client_id ==
-                       client_id;
-        },
-        [&replica](Replica& rep) {
-            rep.get_descriptor()
-                .get_local_disk_descriptor()
-                .transport_endpoint = replica.get_descriptor()
-                                          .get_local_disk_descriptor()
-                                          .transport_endpoint;
-            rep.get_descriptor().get_local_disk_descriptor().object_size =
-                replica.get_descriptor()
-                    .get_local_disk_descriptor()
-                    .object_size;
+        matches_reported_local_disk,
+        [client_id, &reported_local_disk, &transferred_ownership,
+         &replaced_usage](Replica& existing) {
+            const auto existing_local_disk =
+                existing.get_descriptor().get_local_disk_descriptor();
+            if (existing_local_disk.client_id != client_id) {
+                transferred_ownership = true;
+                if (existing_local_disk.object_size > 0) {
+                    replaced_usage[existing_local_disk.client_id] +=
+                        existing_local_disk.object_size;
+                }
+            }
+            CHECK(existing.update_local_disk_owner(
+                client_id, reported_local_disk.transport_endpoint));
         });
-    return false;
+    ReleaseLocalDiskUsage(replaced_usage);
+    return transferred_ownership;
 }
 
 auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,

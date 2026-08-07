@@ -12,12 +12,14 @@
 #include <shared_mutex>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <vector>
 
 #include <gtest/gtest.h>
 #include <unistd.h>
 
 #include "allocation_strategy.h"
+#include "master_metric_manager.h"
 #include "tenant_quota_policy_store.h"
 #include "types.h"
 
@@ -224,6 +226,12 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
             return -1;
         }
         return it->second->ssd_used_bytes.load(std::memory_order_relaxed);
+    }
+
+    void ClearInvalidHandlesForTesting(
+        MasterService& service,
+        const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients) {
+        service.ClearInvalidHandles(alive_clients);
     }
 
 #ifdef USE_NOF
@@ -511,7 +519,7 @@ TEST_F(MasterServiceTenantQuotaTest,
     ASSERT_TRUE(service.MountLocalDiskSegment(client_a, true).has_value());
     ASSERT_TRUE(service.MountLocalDiskSegment(client_b, true).has_value());
 
-    StorageObjectMetadata first_metadata;
+    StorageObjectMetadata first_metadata{};
     first_metadata.data_size = 128;
     first_metadata.transport_endpoint = "disk-endpoint-a";
     std::vector<OffloadTaskItem> tasks{
@@ -521,7 +529,7 @@ TEST_F(MasterServiceTenantQuotaTest,
     EXPECT_EQ(LocalDiskUsedBytes(service, client_a), 128);
     EXPECT_EQ(LocalDiskUsedBytes(service, client_b), 0);
 
-    StorageObjectMetadata second_metadata;
+    StorageObjectMetadata second_metadata{};
     second_metadata.data_size = 128;
     second_metadata.transport_endpoint = "disk-endpoint-b";
     auto result =
@@ -530,6 +538,92 @@ TEST_F(MasterServiceTenantQuotaTest,
     ASSERT_TRUE(result.has_value()) << toString(result.error());
     EXPECT_EQ(LocalDiskUsedBytes(service, client_a), 128);
     EXPECT_EQ(LocalDiskUsedBytes(service, client_b), 0);
+
+    auto replicas = service.GetReplicaList("cold", TenantId("tenant-a"));
+    ASSERT_TRUE(replicas.has_value()) << toString(replicas.error());
+    ASSERT_EQ(replicas->replicas.size(), 1u);
+    EXPECT_EQ(replicas->replicas.front().get_local_disk_descriptor().client_id,
+              client_a);
+
+    StorageObjectMetadata empty_endpoint_metadata{};
+    empty_endpoint_metadata.data_size = 128;
+    auto empty_endpoint_result = service.NotifyOffloadSuccess(
+        client_b, tasks, {empty_endpoint_metadata});
+    ASSERT_TRUE(empty_endpoint_result.has_value())
+        << toString(empty_endpoint_result.error());
+    EXPECT_EQ(LocalDiskUsedBytes(service, client_a), 128);
+    EXPECT_EQ(LocalDiskUsedBytes(service, client_b), 0);
+}
+
+TEST_F(MasterServiceTenantQuotaTest,
+       NotifyOffloadSuccessTransfersDiskReplicaAfterClientRestart) {
+    const std::string policy = WritePolicyFile({{TenantId("tenant-a"), 1000}});
+    auto config = MasterServiceConfig::builder()
+                      .set_enable_multi_tenants(true)
+                      .set_enable_offload(true)
+                      .set_tenant_quota_connector_type("file")
+                      .set_tenant_quota_connector_uri(policy)
+                      .build();
+    MasterService service(config);
+    UUID old_client = MountSegment(service, 4096, "restart_segment_old");
+    UUID restarted_client =
+        MountSegment(service, 4096, "restart_segment_restarted");
+    ASSERT_TRUE(service.MountLocalDiskSegment(old_client, true).has_value());
+    ASSERT_TRUE(
+        service.MountLocalDiskSegment(restarted_client, true).has_value());
+
+    const int64_t initial_allocated_file_size =
+        MasterMetricManager::instance().get_allocated_file_size();
+
+    std::vector<OffloadTaskItem> tasks{
+        OffloadTaskItem{.tenant_id = "tenant-a", .key = "cold", .size = 128}};
+    StorageObjectMetadata metadata{};
+    metadata.data_size = 128;
+    metadata.transport_endpoint = "stable-disk-endpoint";
+    ASSERT_TRUE(service.NotifyOffloadSuccess(old_client, tasks, {metadata})
+                    .has_value());
+    EXPECT_EQ(LocalDiskUsedBytes(service, old_client), 128);
+    EXPECT_EQ(MasterMetricManager::instance().get_allocated_file_size(),
+              initial_allocated_file_size + 128);
+
+    StorageObjectMetadata inconsistent_metadata{};
+    inconsistent_metadata.data_size = 256;
+    inconsistent_metadata.transport_endpoint = "stable-disk-endpoint";
+    auto inconsistent_result = service.NotifyOffloadSuccess(
+        restarted_client, tasks, {inconsistent_metadata});
+    ASSERT_FALSE(inconsistent_result.has_value());
+    EXPECT_EQ(inconsistent_result.error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(LocalDiskUsedBytes(service, old_client), 128);
+    EXPECT_EQ(LocalDiskUsedBytes(service, restarted_client), 0);
+    EXPECT_EQ(MasterMetricManager::instance().get_allocated_file_size(),
+              initial_allocated_file_size + 128);
+
+    ASSERT_TRUE(
+        service.NotifyOffloadSuccess(restarted_client, tasks, {metadata})
+            .has_value());
+    EXPECT_EQ(LocalDiskUsedBytes(service, old_client), 0);
+    EXPECT_EQ(LocalDiskUsedBytes(service, restarted_client), 128);
+    EXPECT_EQ(MasterMetricManager::instance().get_allocated_file_size(),
+              initial_allocated_file_size + 128);
+
+    auto replicas = service.GetReplicaList("cold", TenantId("tenant-a"));
+    ASSERT_TRUE(replicas.has_value()) << toString(replicas.error());
+    ASSERT_EQ(replicas->replicas.size(), 1u);
+    const auto& local_disk =
+        replicas->replicas.front().get_local_disk_descriptor();
+    EXPECT_EQ(local_disk.client_id, restarted_client);
+    EXPECT_EQ(local_disk.transport_endpoint, "stable-disk-endpoint");
+
+    ClearInvalidHandlesForTesting(service, {restarted_client});
+    auto after_old_client_expiry =
+        service.GetReplicaList("cold", TenantId("tenant-a"));
+    ASSERT_TRUE(after_old_client_expiry.has_value())
+        << toString(after_old_client_expiry.error());
+    ASSERT_EQ(after_old_client_expiry->replicas.size(), 1u);
+    EXPECT_EQ(after_old_client_expiry->replicas.front()
+                  .get_local_disk_descriptor()
+                  .client_id,
+              restarted_client);
 }
 
 TEST_F(MasterServiceTenantQuotaTest,
