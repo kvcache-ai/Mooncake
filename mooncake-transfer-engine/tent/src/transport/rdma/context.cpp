@@ -385,13 +385,13 @@ int RdmaContext::enable() {
     }
 
     for (int i = 0; i < params_->device.num_cq_list; ++i) {
-        auto cq = new RdmaCQ();
+        auto cq = std::make_unique<RdmaCQ>();
         int ret = cq->construct(this, params_->device.max_cqe, i);
         if (ret) {
             rollbackEnable();
             return ret;
         }
-        cq_list_.push_back(cq);
+        cq_list_.push_back(cq.release());
     }
 
     // Create dedicated notification CQ
