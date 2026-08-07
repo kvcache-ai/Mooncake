@@ -3639,15 +3639,48 @@ RealClient::get_into_ranges_internal(
             if (metadata.replica.is_memory_replica()) {
                 if (client_->CanUseLocalMemcpy(metadata.replica) &&
                     runtime_accelerator.FindDeviceForPointer(buffers[i])) {
+                    // Planning cache entries may be close to expiry. Renew and
+                    // reselect the replica before copying into device memory.
+                    auto refresh_result = resolve_ranged_read_metadata(keys[j]);
+                    if (!refresh_result) {
+                        std::fill(range_results.begin(), range_results.end(),
+                                  tl::unexpected(refresh_result.error()));
+                        continue;
+                    }
+                    std::optional<RangedReadMetadata> refreshed_metadata;
+                    refreshed_metadata.emplace(std::move(*refresh_result));
+                    auto lease_refresh_at =
+                        [](const RangedReadMetadata &value) {
+                            const auto now = std::chrono::steady_clock::now();
+                            return now +
+                                   (value.query_result.lease_timeout - now) / 2;
+                        };
+                    auto refresh_at = lease_refresh_at(*refreshed_metadata);
                     for (size_t k = 0; k < range_results.size(); ++k) {
+                        // Renew halfway through the remaining lease in long
+                        // batches.
                         const size_t dst_offset = dst_offsets[k];
                         if (dst_offset > capacities[i] ||
                             sizes[k] > capacities[i] - dst_offset) {
                             continue;
                         }
+                        if (std::chrono::steady_clock::now() >= refresh_at) {
+                            auto next_refresh_result =
+                                resolve_ranged_read_metadata(keys[j]);
+                            if (!next_refresh_result) {
+                                std::fill(range_results.begin() + k,
+                                          range_results.end(),
+                                          tl::unexpected(
+                                              next_refresh_result.error()));
+                                break;
+                            }
+                            refreshed_metadata.emplace(
+                                std::move(*next_refresh_result));
+                            refresh_at = lease_refresh_at(*refreshed_metadata);
+                        }
                         range_results[k] = execute_ranged_read(
                             keys[j], buffers[i], dst_offset, src_offsets[k],
-                            sizes[k], metadata, false, false);
+                            sizes[k], *refreshed_metadata, false, false);
                     }
                     continue;
                 }
