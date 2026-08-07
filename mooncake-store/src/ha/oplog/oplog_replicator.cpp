@@ -45,7 +45,9 @@ bool OpLogReplicator::StartFromSequenceId(uint64_t start_seq_id) {
     auto on_error = [this](ErrorCode err) {
         LOG(ERROR) << "OpLogReplicator: notifier error="
                    << static_cast<int>(err);
-        NotifyStateEvent(StandbyEvent::WATCH_BROKEN);
+        NotifyStateEvent(err == ErrorCode::OPLOG_TRIMMED
+                             ? StandbyEvent::RESYNC_REQUIRED
+                             : StandbyEvent::WATCH_BROKEN);
     };
 
     auto on_maintenance =

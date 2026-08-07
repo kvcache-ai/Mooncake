@@ -371,6 +371,64 @@ TEST_F(P2PHotStandbyServiceTest, SnapshotServerRejectsOccupiedPort) {
     first.Stop();
 }
 
+TEST_F(P2PHotStandbyServiceTest, TrimSignalSwitchesToSnapshotResync) {
+    P2PMasterService master(MakeMasterConfig());
+    const UUID client_id{31, 31};
+    const UUID segment_id{32, 32};
+    RegisterClient(master, client_id, MakeSegment(segment_id));
+    AddReplica(master, "trim-resync-key", client_id, segment_id, 4096);
+
+    auto source_config = MakeStandbyConfig();
+    source_config.snapshot_service_port =
+        static_cast<uint16_t>(50000 + (::getpid() % 1000));
+    P2PHotStandbyService source(source_config);
+    ASSERT_EQ(source.Start(), ErrorCode::OK);
+    ASSERT_TRUE(
+        source.WaitForAppliedSequence(2, std::chrono::milliseconds(2000)));
+
+    std::mutex states_mutex;
+    std::vector<std::shared_ptr<ControlledNotifierState>> states;
+    auto factory = [&]() -> std::unique_ptr<OpLogStore> {
+        auto state = std::make_shared<ControlledNotifierState>();
+        {
+            std::lock_guard<std::mutex> lock(states_mutex);
+            states.push_back(state);
+        }
+        return std::make_unique<ControlledReaderStore>(state);
+    };
+
+    auto target_config = MakeStandbyConfig();
+    target_config.snapshot_source_endpoints = {
+        "127.0.0.1:" + std::to_string(source_config.snapshot_service_port)};
+    P2PHotStandbyService target(target_config, factory);
+    ASSERT_EQ(target.Start(), ErrorCode::OK);
+
+    std::shared_ptr<ControlledNotifierState> initial_state;
+    {
+        std::lock_guard<std::mutex> lock(states_mutex);
+        ASSERT_FALSE(states.empty());
+        initial_state = states.front();
+    }
+    InjectNotifierErrors(initial_state, ErrorCode::OPLOG_TRIMMED);
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (std::chrono::steady_clock::now() < deadline) {
+        size_t state_count = 0;
+        {
+            std::lock_guard<std::mutex> lock(states_mutex);
+            state_count = states.size();
+        }
+        if (state_count >= 3 && target.GetState() == StandbyState::WATCHING) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(target.GetState(), StandbyState::WATCHING);
+    auto exported = target.ExportMetadata();
+    EXPECT_NE(exported.objects.find("trim-resync-key"), exported.objects.end());
+}
+
 TEST_F(P2PHotStandbyServiceTest, ReconnectsFromLastAppliedSequence) {
     std::mutex states_mutex;
     std::vector<std::shared_ptr<ControlledNotifierState>> states;

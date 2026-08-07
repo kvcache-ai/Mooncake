@@ -76,6 +76,10 @@ StateTransitionResult StandbyStateMachine::ValidateTransition(
                     result.allowed = true;
                     result.new_state = StandbyState::RECONNECTING;
                     break;
+                case StandbyEvent::RESYNC_REQUIRED:
+                    result.allowed = true;
+                    result.new_state = StandbyState::SYNCING;
+                    break;
                 case StandbyEvent::MAX_ERRORS_REACHED:
                     result.allowed = true;
                     result.new_state = StandbyState::RECOVERING;
@@ -128,6 +132,10 @@ StateTransitionResult StandbyStateMachine::ValidateTransition(
 
         case StandbyState::RECONNECTING:
             switch (event) {
+                case StandbyEvent::RESYNC_REQUIRED:
+                    result.allowed = true;
+                    result.new_state = StandbyState::SYNCING;
+                    break;
                 case StandbyEvent::CONNECTED:
                     result.allowed = true;
                     result.new_state = StandbyState::SYNCING;

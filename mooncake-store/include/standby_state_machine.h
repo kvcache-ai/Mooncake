@@ -123,8 +123,9 @@ enum class StandbyEvent : uint8_t {
     SYNC_FAILED,    // Sync failed
 
     // Watch events
-    WATCH_HEALTHY,  // Watch is healthy and receiving events
-    WATCH_BROKEN,   // Watch connection broken
+    WATCH_HEALTHY,    // Watch is healthy and receiving events
+    WATCH_BROKEN,     // Watch connection broken
+    RESYNC_REQUIRED,  // OpLog history was trimmed; full bootstrap is required
 
     // Recovery events
     RECOVERY_SUCCESS,  // Successfully recovered from error
@@ -163,6 +164,8 @@ inline const char* StandbyEventToString(StandbyEvent event) {
             return "WATCH_HEALTHY";
         case StandbyEvent::WATCH_BROKEN:
             return "WATCH_BROKEN";
+        case StandbyEvent::RESYNC_REQUIRED:
+            return "RESYNC_REQUIRED";
         case StandbyEvent::RECOVERY_SUCCESS:
             return "RECOVERY_SUCCESS";
         case StandbyEvent::RECOVERY_FAILED:
