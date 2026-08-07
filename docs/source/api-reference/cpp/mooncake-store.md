@@ -125,7 +125,8 @@ tl::expected<UUID, ErrorCode> CreateMoveTask(
 
 **Failure and retry behavior:**
 - Move tasks follow the same state machine as copy tasks: `PENDING -> PROCESSING -> SUCCESS/FAILED`.
-- Failures such as missing objects or missing source replicas are reported directly; only `ErrorCode::NO_AVAILABLE_HANDLE` is retried automatically.
+- **Submission-time failures**: If the object or source replica is already missing when `CreateMoveTask` is called, the call returns `ErrorCode::OBJECT_NOT_FOUND` or `ErrorCode::INVALID_PARAMS` directly and no task is created.
+- **Execution-time failures**: If the object or source replica disappears after the task is successfully submitted, the task transitions to `FAILED` state. Only `ErrorCode::NO_AVAILABLE_HANDLE` execution failures are retried automatically.
 - Timeout and retry policy is configured on the master, not per request.
 
 ### QueryTask

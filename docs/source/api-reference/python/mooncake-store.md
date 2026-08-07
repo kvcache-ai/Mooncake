@@ -1961,7 +1961,8 @@ def create_move_task(self, key: str, source: str, target: str) -> Tuple[UUID, in
 
 **Task lifecycle and failure behavior:**
 - Move tasks use the same state machine as copy tasks: `PENDING -> PROCESSING -> SUCCESS/FAILED`.
-- Only `NO_AVAILABLE_HANDLE` failures are retried automatically; failures such as missing objects or replicas are reported directly as `FAILED`.
+- **Submission-time failures**: If the object or source replica is already missing when `create_move_task` is called, the call returns an error code directly (e.g., `OBJECT_NOT_FOUND` or `INVALID_PARAMS`) and no task is created.
+- **Execution-time failures**: If the object or source replica disappears after the task is successfully submitted, the task transitions to `FAILED` state. Only `NO_AVAILABLE_HANDLE` execution failures are retried automatically.
 - Timeout and retry behavior is controlled on the master side rather than by the Python client API.
 
 **Example:**
