@@ -3,11 +3,16 @@ name: 'Build Wheel (ROCm)'
 # ROCm/HIP CI parity with the standard CUDA wheel CI: build the AMD ROCm wheel
 # on PRs so packaging regressions are caught. Runs inside the ROCm dev image so
 # hipcc / HIP headers / hsa-runtime are available; no GPU is needed to compile.
-# On-device transfer tests (test_transfer_on_hip.py) require AMD hardware and
-# run outside GitHub-hosted runners.
+# On-device external-PD tests consume these artifacts later on the trusted
+# self-hosted ROCm runner in integration-test.yml.
 
 on:
-  workflow_call: {}
+  workflow_call:
+    inputs:
+      checkout_ref:
+        description: 'Git revision to build (used by trusted E2E dispatches)'
+        required: false
+        type: string
 
 jobs:
   build-wheel-rocm:
@@ -39,6 +44,7 @@ jobs:
 
     - uses: actions/checkout@v4
       with:
+        ref: ${{ inputs.checkout_ref || github.sha }}
         persist-credentials: false
         submodules: recursive
 
