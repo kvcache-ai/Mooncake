@@ -108,6 +108,7 @@ int AscendDirectTransport::install(std::string &local_server_name,
     exec_params.agent_mode = agent_mode_;
     exec_params.roce_mode = roce_mode_;
     exec_params.use_fabric_mem = use_fabric_mem_;
+    exec_params.client_server_mode = client_server_mode_;
 
     transfer_executor_ = TransferExecutorBase::Create(exec_params);
     ret = transfer_executor_->initialize();
@@ -156,6 +157,8 @@ int AscendDirectTransport::allocateLocalSegmentID() {
     // process-global config.
     use_fabric_mem_ = globalConfig().ascend_use_fabric_mem &&
                       globalConfig().ascend_store_te_init;
+    client_server_mode_ = ResolveAscendCapabilityFlag(
+        "ASCEND_CLIENT_SERVER_MODE", adxl::CLIENT_SERVER_COMM);
     LOG(INFO) << "[AscendTE] init local segment, te is created for store="
               << (globalConfig().ascend_store_te_init ? "true" : "false")
               << ", roce_mode=" << (roce_mode_ ? "true" : "false")

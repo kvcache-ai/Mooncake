@@ -15,6 +15,7 @@
 
 #include "transport/ascend_transport/ascend_direct_transport/utils.h"
 
+#include <cstdlib>
 #include <cstring>
 #include <memory>
 #include <pthread.h>
@@ -28,6 +29,7 @@
 #include <json/json.h>  // CentOS
 #endif
 
+#include "adxl_compat.h"
 #include "common.h"
 #include "config.h"
 
@@ -129,6 +131,25 @@ std::string ResolveAscendGlobalResourceConfig(const char* config_str) {
     Json::Value normal = root;
     normal.removeMember(kStoreConfigKey);
     return SerializeCompactJson(normal);
+}
+
+bool ResolveAscendCapabilityFlag(const char *env_name,
+                                 adxl::FeatureType feature) {
+    if (const char *env = std::getenv(env_name)) {
+        const auto opt = parseFromString<int32_t>(env);
+        if (!opt.has_value()) {
+            LOG(WARNING) << env_name << " is not valid, value: " << env
+                         << ", defaulting to disabled";
+            return false;
+        }
+        const bool enabled = (*opt == 1);
+        LOG(INFO) << "Set " << env_name << " from env to: " << *opt;
+        return enabled;
+    }
+    const bool supported = adxl::IsAdxlFeatureSupported(feature);
+    LOG(INFO) << env_name << " unset, capability probe -> "
+              << (supported ? "enabled" : "disabled");
+    return supported;
 }
 
 bool IsRoceModeEnabled() {

@@ -27,6 +27,8 @@
 
 #include <acl/acl.h>
 
+#include "adxl_compat.h"
+
 namespace mooncake {
 
 #define CHECK_ACL(call)                                       \
@@ -95,6 +97,11 @@ bool HasRoceProtocolDescInGlobalResourceConfig(const char *config_str);
 //   - has "store" and normal TE      -> root with "store" removed, serialized
 // A Store TE with no "store" key falls back to the default config.
 std::string ResolveAscendGlobalResourceConfig(const char *config_str);
+
+// Resolve a capability flag: env var `env_name` (1/0) wins if set; otherwise
+// probe GetCapability(feature). Returns false on older libs lacking the symbol.
+bool ResolveAscendCapabilityFlag(const char *env_name,
+                                 adxl::FeatureType feature);
 
 int SetDeviceAndGetContext(int32_t device_id, aclrtContext *out_context);
 
