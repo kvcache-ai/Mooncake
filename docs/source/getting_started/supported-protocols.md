@@ -200,13 +200,55 @@ The following protocols are available at the C++ Transfer Engine level for speci
 - NVIDIA MNNVL hardware
 - Compiled with `USE_MNNVL=ON`
 
+Mooncake Store providers can use this transport for a default-off,
+EGM-backed DRAM tier. Configure the Python `setup(config)` overload with
+`enable_egm_store_pool=true`, `protocol="nvlink"`,
+`global_segment_size>0`, and `local_buffer_size=0`. `egm_numa_nodes` accepts
+`auto` (the default, using each visible GPU's CUDA
+`CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID`) or a comma-separated node list. Consumers
+do not enable the pool; they use the ordinary `nvlink` protocol to access the
+provider's mounted segments. Use `MC_MS_AUTO_DISC=0` for the manual selection
+shown below, for both Providers and Consumers. `MC_FORCE_MNNVL` is not needed
+in this mode. EGM requires a non-TENT Transfer Engine with the `nvlink`
+transport installed.
+
+The requested EGM capacity is rounded down to a multiple of the common
+alignment: the maximum of the Store slab alignment and the selected nodes'
+CUDA allocation granularities. It is distributed across nodes, then split
+into balanced, aligned chunks no larger than `max_mr_size`. This planning
+applies only to EGM pools.
+
 **Configuration:**
 ```bash
-# Set MC_FORCE_MNNVL=true to use MNNVL even when RDMA NICs are present
-export MC_FORCE_MNNVL=true
+# Provider and Consumer: install the requested nvlink transport explicitly.
+export MC_MS_AUTO_DISC=0
 ```
 
-**Note:** When `protocol="rdma"` is set and RDMA NICs exist, you must explicitly set `MC_FORCE_MNNVL=true` to use MNNVL instead of RDMA. If no RDMA HCA is detected, MNNVL will be used automatically.
+```python
+consumer.setup({
+    "local_hostname": "10.192.8.58:12400",
+    "metadata_server": "http://10.192.8.81:8079/metadata",
+    "master_server_addr": "10.192.8.81:50051",
+    "protocol": "nvlink",
+    "global_segment_size": "0",
+    "local_buffer_size": "0",
+    "rdma_devices": "",
+    "enable_egm_store_pool": "false",
+})
+```
+
+**Note:** Manual `protocol="nvlink"` selection is supported for both Providers
+and Consumers. If you use `MC_MS_AUTO_DISC=1` instead, set `MC_FORCE_MNNVL=1`
+on hosts with RDMA HCAs so discovery selects MNNVL. EGM setup checks the
+actual engine and fails before allocation unless it is non-TENT and has
+`nvlink` installed.
+
+Drain all application and offload calls before closing a Store. Close is
+terminal, even on error. EGM cleanup is attempted, and resources whose cleanup
+cannot be confirmed are retained until process exit rather than retried by a
+later close. See
+`close()` in the [Python Store API](../api-reference/python/mooncake-store.md)
+for cleanup and failure handling.
 
 **Host memory over NVLink (TENT, EGM):** on Grace-Blackwell systems the GPUs of
 an NVLink domain can also address each other's host DRAM (Extended GPU Memory).

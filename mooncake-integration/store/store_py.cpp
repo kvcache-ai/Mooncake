@@ -2466,6 +2466,11 @@ PYBIND11_MODULE(store, m) {
             "  local_buffer_size: Local buffer size (default 16MB).\n"
             "  protocol: Transfer protocol (default 'tcp').\n"
             "  rdma_devices: RDMA device list.\n"
+            "  enable_egm_store_pool: Use EGM DRAM for the global Store pool "
+            "(default false; requires protocol 'nvlink', "
+            "global_segment_size>0, and local_buffer_size=0).\n"
+            "  egm_numa_nodes: Provider NUMA nodes ('auto' or comma-separated "
+            "IDs; default 'auto').\n"
             "  master_server_addr: Master server address.\n"
             "  ipc_socket_path: IPC socket path.\n"
             "  enable_ssd_offload: Enable SSD offload (default false).\n"
@@ -2621,13 +2626,17 @@ PYBIND11_MODULE(store, m) {
             "no read leases. Returns list of results: 1 if existed at the "
             "time of the call, 0 if not exists, -1 if error. Objects may "
             "still be evicted before a subsequent get.")
-        .def("close",
-             [](MooncakeStorePyWrapper &self) {
-                 if (!self.store_) return 0;
-                 int rc = self.store_->tearDownAll();
-                 self.store_.reset();
-                 return rc;
-             })
+        .def(
+            "close",
+            [](MooncakeStorePyWrapper &self) {
+                int rc = self.store_ ? self.store_->tearDownAll() : 0;
+                self.store_.reset();
+                self.real_client_.reset();
+                self.use_dummy_client_ = false;
+                return rc;
+            },
+            "Close the store and clear the native client, including on "
+            "cleanup failure. A nonzero result is terminal, not retryable.")
         .def("health_check", &MooncakeStorePyWrapper::health_check,
              "Health check for store connectivity. "
              "Returns 0 if healthy, 1 if not initialized/closed, "
