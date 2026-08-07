@@ -3437,12 +3437,11 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         std::unordered_map<std::string, std::vector<Slice>> objects{
             {key, {{dst, size}}}};
         if (can_use_pinned_restore(endpoint, objects)) {
-            const uint64_t restore_size = src_offset + size;
-            if (restore_size > uint64_t(std::numeric_limits<int64_t>::max())) {
+            if (total_size > uint64_t(std::numeric_limits<int64_t>::max())) {
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
             }
-            const OffloadReadRange read_range{
-                src_offset, static_cast<int64_t>(restore_size)};
+            const OffloadReadRange read_range{src_offset,
+                                              static_cast<int64_t>(total_size)};
             auto result = batch_get_into_offload_object_internal(
                 endpoint, objects, &read_range);
             if (!result) return tl::unexpected(result.error());
