@@ -700,25 +700,34 @@ TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesMemoryBufferDescriptor) {
 }
 
 TEST_F(MasterServiceHATest,
-       RestoredMemoryReplicaBecomesEvictableAfterRecoveryLeaseExpires) {
+       RestoredMemoryReplicaBecomesEvictableOnlyAfterRemountLeaseExpires) {
     MasterService service(MasterServiceConfig::builder()
                               .set_enable_ha(false)
-                              .set_default_kv_lease_ttl(500)
+                              .set_default_kv_lease_ttl(100)
                               .build());
 
     const std::string endpoint = "standby_recovery_lease_segment";
     const std::string key = "standby_recovery_lease_key";
     auto object = MakeStandbyObject(key, endpoint);
+    object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
     service.RestoreFromStandbySnapshot({object}, 7,
                                        {MakeStandbyMemorySegment(endpoint)});
-    const auto lease_timeout =
+    const auto restored_lease_timeout =
         LeaseTimeoutForTesting(service, kDefaultTenant, key);
+    EXPECT_LE(restored_lease_timeout, std::chrono::system_clock::now());
 
     service.RunBatchEvictForTesting(/*evict_ratio_target=*/1.0,
                                     /*evict_ratio_lowerbound=*/1.0);
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, key), 1);
+    ASSERT_TRUE(service.ReMountSegment({MakeSegment(endpoint)}, generate_uuid())
+                    .has_value());
+    const auto remount_lease_timeout =
+        LeaseTimeoutForTesting(service, kDefaultTenant, key);
+    EXPECT_GT(remount_lease_timeout, std::chrono::system_clock::now());
 
-    std::this_thread::sleep_until(lease_timeout +
+    std::this_thread::sleep_until(remount_lease_timeout +
                                   std::chrono::milliseconds(10));
     service.RunBatchEvictForTesting(/*evict_ratio_target=*/1.0,
                                     /*evict_ratio_lowerbound=*/1.0);

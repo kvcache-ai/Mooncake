@@ -2647,22 +2647,12 @@ void MasterService::RestoreFromStandbySnapshot(
             }
 
             auto& tenant_state = shard->tenants[tenant_id];
-            auto [metadata_it, inserted] = tenant_state.metadata.emplace(
+            tenant_state.metadata.emplace(
                 std::piecewise_construct, std::forward_as_tuple(user_key),
                 std::forward_as_tuple(
                     standby_meta.client_id, now, standby_meta.size,
                     std::move(replicas), false, false, standby_meta.data_type,
                     standby_meta.group_id, tenant_id, user_key));
-            if (inserted &&
-                metadata_it->second.HasReplica([this](const Replica& replica) {
-                    return replica.is_memory_replica() &&
-                           !IsReplicaReadable(replica);
-                })) {
-                // Give recovering memory replicas one hard-lease interval to
-                // remount before they become evictable.
-                metadata_it->second.GrantLease(default_kv_lease_ttl_,
-                                               default_kv_soft_pin_ttl_);
-            }
             if (!standby_meta.group_id.empty()) {
                 RegisterGroupMember(tenant_state, tenant_id, user_key,
                                     standby_meta.group_id);
@@ -2977,6 +2967,11 @@ bool MasterService::IsReplicaReadable(const Replica& replica) const {
         endpoint = descriptor.get_local_disk_descriptor().transport_endpoint;
     }
     return !endpoint || !invalid_replica_endpoints_.contains(*endpoint);
+}
+
+bool MasterService::IsMemoryReplicaEvictable(const Replica& replica) const {
+    return replica.is_memory_replica() && replica.is_completed() &&
+           replica.get_refcnt() == 0 && IsReplicaReadable(replica);
 }
 
 auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
@@ -7794,9 +7789,8 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
     auto now = std::chrono::system_clock::now();
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
 
-    auto is_evictable_memory_replica = [](const Replica& replica) {
-        return replica.is_memory_replica() && replica.is_completed() &&
-               replica.get_refcnt() == 0;
+    auto is_evictable_memory_replica = [this](const Replica& replica) {
+        return IsMemoryReplicaEvictable(replica);
     };
     auto can_evict_replicas = [&](const ObjectMetadata& metadata) {
         return metadata.HasReplica(is_evictable_memory_replica);
@@ -8025,9 +8019,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
     auto now = std::chrono::system_clock::now();
 
-    auto is_evictable_memory_replica = [](const Replica& replica) {
-        return replica.is_memory_replica() && replica.is_completed() &&
-               replica.get_refcnt() == 0;
+    auto is_evictable_memory_replica = [this](const Replica& replica) {
+        return IsMemoryReplicaEvictable(replica);
     };
 
     auto can_evict_replicas = [&](const ObjectMetadata& metadata) {
@@ -8104,12 +8097,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
         // Queue one MEMORY replica for offload; others will be evicted below.
         bool queued = false;
         metadata.VisitReplicas(
-            [](const Replica& r) {
-                return r.is_memory_replica() && r.is_completed() &&
-                       r.get_refcnt() == 0;
-            },
-            [this, &tenant_id, &key, &tenant_state, &queued,
-             &now](Replica& replica) {
+            is_evictable_memory_replica, [this, &tenant_id, &key, &tenant_state,
+                                          &queued, &now](Replica& replica) {
                 if (queued) return;  // only need to pin one replica for offload
                 auto result = PushOffloadingQueue(
                     MakeObjectIdentity(key, tenant_id), replica);
@@ -8158,14 +8147,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
             return EvictOpLogSubmissionResult::kNotRequired;
         }
 
-        // Predict the descriptor list after evict_replicas() runs:
-        // drop COMPLETE memory replicas with refcnt==0; keep everything else
-        // that is COMPLETE.
-        auto remaining =
-            BuildRemainingReplicaDescriptors(metadata, [](const Replica& r) {
-                return r.is_memory_replica() && r.is_completed() &&
-                       r.get_refcnt() == 0;
-            });
+        // Predict the descriptor list after evict_replicas() runs.
+        auto remaining = BuildRemainingReplicaDescriptors(
+            metadata, is_evictable_memory_replica);
 
         if (enable_oplog_) {
             auto reservation = ReserveBatchOpLogSlot();
