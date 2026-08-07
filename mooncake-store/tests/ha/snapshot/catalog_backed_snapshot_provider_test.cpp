@@ -190,16 +190,32 @@ TEST_P(CatalogBackedSnapshotProviderTest,
 }
 
 TEST_P(CatalogBackedSnapshotProviderTest, LoadLatestSnapshotWithGroupId) {
-    // 10 + replica_count: current writer format (data_type + hard_pinned +
-    // trailing group_id). Regression test for the live snapshot restore
-    // failure against the latest metadata layout.
+    // 10 + replica_count: data_type + hard_pinned + trailing group_id. This
+    // pins the writer format before agent_hints and object_checksum.
     PublishSnapshotPayload(SnapshotMetadataFormat::kWithGroupId);
+    ExpectLoadsDefaultObject();
+}
+
+TEST_P(CatalogBackedSnapshotProviderTest, LoadLatestSnapshotWithAgentHints) {
+    // 11 + replica_count: v4 + optional agent_hints. The standby reader does
+    // not need the annotation, but it must tolerate the trailing field.
+    PublishSnapshotPayload(SnapshotMetadataFormat::kWithAgentHints);
     ExpectLoadsDefaultObject();
 }
 
 TEST_P(CatalogBackedSnapshotProviderTest,
        LoadLatestSnapshotIgnoresObjectChecksum) {
+    // 11 + replica_count: v4 + optional object_checksum from the checksum
+    // branch. The standby reader ignores the checksum.
     PublishSnapshotPayload(SnapshotMetadataFormat::kWithObjectChecksum);
+    ExpectLoadsDefaultObject();
+}
+
+TEST_P(CatalogBackedSnapshotProviderTest,
+       LoadLatestSnapshotWithAgentHintsAndObjectChecksum) {
+    // 12 + replica_count: current writer shape when checksum is present.
+    PublishSnapshotPayload(
+        SnapshotMetadataFormat::kWithAgentHintsAndObjectChecksum);
     ExpectLoadsDefaultObject();
 }
 

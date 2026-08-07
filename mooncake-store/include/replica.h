@@ -5,6 +5,7 @@
 #include <boost/functional/hash.hpp>
 
 #include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <memory>
 #include <string>
@@ -76,6 +77,74 @@ inline std::ostream& operator<<(std::ostream& os,
 }
 
 /**
+ * @brief Optional agent-workflow metadata carried by ReplicateConfig.
+ *
+ * Store v1 consumes reuse_hint/cache_ttl_ms for soft-pin retention and
+ * persists the remaining fields as annotations.
+ */
+struct AgentHints {
+    static constexpr size_t kMaxStringBytes = 1024;
+    static constexpr size_t kMaxChildrenStepIds = 64;
+    static constexpr size_t kMaxTotalStringBytes = 4096;
+
+    std::string workflow_id{};
+    std::string agent_id{};
+    std::string step_id{};
+    int64_t step_index{0};
+    int64_t total_steps{0};
+    std::string parent_step_id{};
+    std::vector<std::string> children_step_ids{};
+    std::string tool_name{};
+    int64_t expected_tool_duration_ms{0};
+    int64_t cache_ttl_ms{0};
+    std::string shared_prefix_hash{};
+    std::string reuse_hint{"neutral"};
+
+    bool RequestsRetention() const noexcept { return reuse_hint == "keep"; }
+
+    bool FitsSizeLimits() const noexcept {
+        size_t total_string_bytes = 0;
+        auto add_string_size = [&](const std::string& value) noexcept {
+            if (total_string_bytes > kMaxTotalStringBytes ||
+                value.size() > kMaxStringBytes ||
+                value.size() > kMaxTotalStringBytes - total_string_bytes) {
+                return false;
+            }
+            total_string_bytes += value.size();
+            return true;
+        };
+
+        if (!add_string_size(workflow_id) || !add_string_size(agent_id) ||
+            !add_string_size(step_id) || !add_string_size(parent_step_id) ||
+            !add_string_size(tool_name) ||
+            !add_string_size(shared_prefix_hash) ||
+            !add_string_size(reuse_hint)) {
+            return false;
+        }
+        if (children_step_ids.size() > kMaxChildrenStepIds) {
+            return false;
+        }
+        for (const auto& child_step_id : children_step_ids) {
+            if (!add_string_size(child_step_id)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    bool IsValid() const noexcept {
+        return (reuse_hint == "keep" || reuse_hint == "discard" ||
+                reuse_hint == "neutral") &&
+               cache_ttl_ms >= 0 && FitsSizeLimits();
+    }
+};
+
+YLT_REFL(AgentHints, workflow_id, agent_id, step_id, step_index, total_steps,
+         parent_step_id, children_step_ids, tool_name,
+         expected_tool_duration_ms, cache_ttl_ms, shared_prefix_hash,
+         reuse_hint);
+
+/**
  * @brief Configuration for replica management
  */
 struct ReplicateConfig {
@@ -96,6 +165,7 @@ struct ReplicateConfig {
     // ungrouped. Grouped keys share metadata routing, coalesced lease refresh,
     // and memory eviction behavior.
     std::optional<std::vector<std::string>> group_ids{};
+    std::optional<AgentHints> agent_hints{};
 
     ReplicateConfig ForSingleKey(size_t key_index) const {
         ReplicateConfig key_config = *this;
@@ -141,6 +211,13 @@ struct ReplicateConfig {
                 if (i + 1 < config.group_ids->size()) os << ", ";
             }
             os << "]";
+        }
+        if (config.agent_hints.has_value()) {
+            os << ", agent_hints: { workflow_id_set: "
+               << (!config.agent_hints->workflow_id.empty())
+               << ", reuse_hint: " << config.agent_hints->reuse_hint
+               << ", cache_ttl_ms: " << config.agent_hints->cache_ttl_ms
+               << " }";
         }
         os << " }";
         return os;
