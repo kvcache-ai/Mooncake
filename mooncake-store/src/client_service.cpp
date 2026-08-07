@@ -1,4 +1,5 @@
 #include "client_service.h"
+#include "client_internal.h"
 
 #include <boost/algorithm/string.hpp>
 #include <glog/logging.h>
@@ -3616,8 +3617,11 @@ tl::expected<void, ErrorCode> Client::MountSegment(
 }
 
 tl::expected<void, ErrorCode> Client::UnmountSegmentImpl(
-    std::unordered_map<UUID, Segment, boost::hash<UUID>>::iterator it) {
-    auto unmount_result = master_client_.UnmountSegment(it->second.id);
+    std::unordered_map<UUID, Segment, boost::hash<UUID>>::iterator it,
+    const internal::SegmentMountOperations* operations) {
+    auto unmount_result = operations
+                              ? operations->unmount_master(it->second.id)
+                              : master_client_.UnmountSegment(it->second.id);
     if (!unmount_result) {
         ErrorCode err = unmount_result.error();
         LOG(ERROR) << "Failed to unmount segment from master: "
@@ -3625,8 +3629,9 @@ tl::expected<void, ErrorCode> Client::UnmountSegmentImpl(
         return tl::unexpected(err);
     }
 
-    int rc = transfer_engine_->unregisterLocalMemory(
-        reinterpret_cast<void*>(it->second.base));
+    void* base = reinterpret_cast<void*>(it->second.base);
+    int rc = operations ? operations->unregister_memory(base)
+                        : transfer_engine_->unregisterLocalMemory(base);
     if (rc != 0) {
         LOG(ERROR) << "Failed to unregister transfer buffer with transfer "
                       "engine ret is "
@@ -3666,14 +3671,28 @@ tl::expected<void, ErrorCode> Client::UnmountSegment(const void* buffer,
 tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
     const void* buffer, size_t size, const std::string& protocol,
     const std::string& location) {
+    UUID segment_id = generate_uuid();
+    auto result =
+        MountSegmentWithId(segment_id, buffer, size, protocol, location);
+    if (!result) return tl::unexpected(result.error());
+    return segment_id;
+}
+
+tl::expected<void, ErrorCode> Client::MountSegmentWithId(
+    const UUID& segment_id, const void* buffer, size_t size,
+    const std::string& protocol, const std::string& location,
+    const internal::SegmentMountOperations* operations) {
     auto check_result = CheckRegisterMemoryParams(buffer, size, protocol);
     if (!check_result) {
         return tl::unexpected(check_result.error());
     }
 
-    UUID segment_id;
     {
         std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+
+        if (mounted_segments_.count(segment_id) != 0) {
+            return tl::unexpected(ErrorCode::SEGMENT_ALREADY_EXISTS);
+        }
 
         // Check if the segment overlaps with any existing segment
         for (auto& it : mounted_segments_) {
@@ -3690,16 +3709,8 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
             }
         }
 
-        int rc = transfer_engine_->registerLocalMemory((void*)buffer, size,
-                                                       location, true, true);
-        if (rc != 0) {
-            LOG(ERROR) << "register_local_memory_failed base=" << buffer
-                       << " size=" << size << ", error=" << rc;
-            return tl::unexpected(ErrorCode::INVALID_PARAMS);
-        }
-
         Segment segment;
-        segment.id = generate_uuid();
+        segment.id = segment_id;
         segment.name = local_hostname_;
         segment.base = reinterpret_cast<uintptr_t>(buffer);
         segment.size = size;
@@ -3711,20 +3722,59 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
             segment.te_endpoint = local_hostname_;
         }
 
-        auto mount_result = master_client_.MountSegment(segment);
+        auto [record, inserted] =
+            mounted_segments_.emplace(segment_id, segment);
+        if (!inserted) {
+            return tl::unexpected(ErrorCode::SEGMENT_ALREADY_EXISTS);
+        }
+
+        int rc =
+            operations
+                ? operations->register_memory(const_cast<void*>(buffer), size,
+                                              location, true, true)
+                : transfer_engine_->registerLocalMemory(
+                      const_cast<void*>(buffer), size, location, true, true);
+        if (rc != 0) {
+            LOG(ERROR) << "register_local_memory_failed base=" << buffer
+                       << " size=" << size << ", error=" << rc;
+            auto cleanup = UnmountSegmentImpl(record, operations);
+            if (!cleanup) {
+                LOG(ERROR) << "mount_segment_register_rollback_failed base="
+                           << buffer << " size=" << size
+                           << " cleanup_error=" << cleanup.error();
+            }
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+
+        auto mount_result = operations ? operations->mount_master(segment)
+                                       : master_client_.MountSegment(segment);
         if (!mount_result) {
             ErrorCode err = mount_result.error();
             LOG(ERROR) << "mount_segment_to_master_failed base=" << buffer
                        << " size=" << size << ", error=" << err;
+            auto cleanup = UnmountSegmentImpl(record, operations);
+            if (!cleanup) {
+                LOG(ERROR) << "mount_segment_publication_rollback_failed base="
+                           << buffer << " size=" << size
+                           << " cleanup_error=" << cleanup.error();
+            }
             return tl::unexpected(err);
         }
-
-        segment_id = segment.id;
-        mounted_segments_[segment_id] = segment;
     }
 
-    EnsureStorageControlPlaneStarted();
-    return segment_id;
+    if (operations == nullptr) {
+        EnsureStorageControlPlaneStarted();
+    }
+    return {};
+}
+
+tl::expected<void, ErrorCode> Client::CleanupSegmentByIdIfPresent(
+    const UUID& segment_id,
+    const internal::SegmentMountOperations* operations) {
+    std::lock_guard<std::mutex> lock(mounted_segments_mutex_);
+    auto segment = mounted_segments_.find(segment_id);
+    if (segment == mounted_segments_.end()) return {};
+    return UnmountSegmentImpl(segment, operations);
 }
 
 tl::expected<void, ErrorCode> Client::UnmountSegmentById(
