@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cctype>
 #include <cstdint>
 #include <exception>
 #include <map>
@@ -247,6 +248,27 @@ tl::expected<HttpTenantQuotaPolicyRequest, std::string> ParseQuotaPolicyBody(
                                    e.what());
     }
     return request;
+}
+
+tl::expected<bool, ErrorCode> ParseOptionalBoolQuery(
+    coro_http::coro_http_request& req, std::string_view name,
+    bool default_value) {
+    auto value_view = req.get_query_value(std::string(name));
+    if (value_view.empty()) {
+        return default_value;
+    }
+
+    std::string value(value_view);
+    std::transform(
+        value.begin(), value.end(), value.begin(),
+        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    if (value == "true" || value == "1") {
+        return true;
+    }
+    if (value == "false" || value == "0") {
+        return false;
+    }
+    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
 }
 
 }  // namespace
@@ -625,11 +647,19 @@ void MasterAdminServer::HandleQueryKey(coro_http::coro_http_request& req,
     });
 }
 
-void MasterAdminServer::HandleGetAllKeys(coro_http::coro_http_request&,
+void MasterAdminServer::HandleGetAllKeys(coro_http::coro_http_request& req,
                                          coro_http::coro_http_response& resp) {
     WithActiveService(resp, [&](auto service) {
         resp.add_header("Content-Type", "text/plain; version=0.0.4");
-        auto result = service->GetAllKeysForAdmin();
+        auto filter_invalid =
+            ParseOptionalBoolQuery(req, "filter_invalid", true);
+        if (!filter_invalid) {
+            resp.set_status_and_content(coro_http::status_type::bad_request,
+                                        "Invalid filter_invalid parameter");
+            return;
+        }
+
+        auto result = service->GetAllKeysForAdmin(*filter_invalid);
         if (!result) {
             resp.set_status_and_content(
                 coro_http::status_type::internal_server_error,

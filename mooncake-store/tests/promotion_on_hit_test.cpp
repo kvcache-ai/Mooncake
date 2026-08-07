@@ -86,6 +86,13 @@ class PromotionOnHitTest : public ::testing::Test {
         return service->promotion_in_flight_.load(std::memory_order_relaxed);
     }
 
+    static void PrepareUnmountLocalDiskSegmentForTesting(
+        MasterService& service, const UUID& client_id) {
+        auto segment_access = service.segment_manager_.getSegmentAccess();
+        ASSERT_NE(nullptr,
+                  segment_access.PrepareUnmountLocalDiskSegment(client_id));
+    }
+
     static constexpr size_t kDefaultSegmentBase = 0x300000000;
 
     std::string WriteTenantQuotaPolicyFile(
@@ -1609,7 +1616,8 @@ TEST_F(PromotionOnHitTest, AllocStartRejectsSizeMismatch) {
 //
 // Test mechanism: short client_live_ttl_sec, admit a promotion, stop
 // pinging, wait for ClientMonitorFunc to expire the client and call
-// ClearInvalidHandles. Then assert promotion_in_flight_ is back to 0
+// SweepUnavailableReplicas. Then assert promotion_in_flight_ is
+// back to 0
 // by attempting a second admission with queue_limit=1 on a fresh
 // client.
 TEST_F(PromotionOnHitTest, ClientExpiryClearsPromotionTask) {
@@ -1620,7 +1628,7 @@ TEST_F(PromotionOnHitTest, ClientExpiryClearsPromotionTask) {
     config.promotion_queue_limit = 1;  // cap=1 makes the slot observable
     config.default_kv_lease_ttl = 5000;
     // Long task TTL so that any clearing we see must come from
-    // ClearInvalidHandles, not from the promotion-task reaper.
+    // client-liveness cleanup, not from the promotion-task reaper.
     config.put_start_release_timeout_sec = 300;
     // Short client TTL so expiration is fast.
     config.client_live_ttl_sec = 1;
@@ -1646,13 +1654,13 @@ TEST_F(PromotionOnHitTest, ClientExpiryClearsPromotionTask) {
     auto second_holder = PrepareSegment(
         *service, "seg_b", kDefaultSegmentBase + seg_size, seg_size);
     // Promote second_holder into ok_client_ via ReMountSegment so its
-    // LOCAL_DISK replicas survive any ClearInvalidHandles run triggered
+    // LOCAL_DISK replicas survive any client-liveness cleanup triggered
     // by the first holder's expiry. MountSegment alone does not register
     // the client as alive (only ReMountSegment does), and
-    // CleanupStaleHandles uses ok_client_ to decide which LOCAL_DISK
+    // Client-liveness cleanup uses ok_client_ to decide which LOCAL_DISK
     // replicas to erase — without this, second_holder's k_other replica
     // would be wiped alongside the first holder's k_cold replica when
-    // ClearInvalidHandles runs.
+    // client-liveness cleanup runs.
     {
         Segment seg_b =
             MakeSegment("seg_b", kDefaultSegmentBase + seg_size, seg_size);
@@ -1692,7 +1700,7 @@ TEST_F(PromotionOnHitTest, ClientExpiryClearsPromotionTask) {
         }
     }
 
-    // ClearInvalidHandles should have erased the holder's LOCAL_DISK
+    // Client-liveness cleanup should have erased the holder's LOCAL_DISK
     // source replica AND (with the fix) the promotion_tasks entry,
     // decrementing the global in-flight counter. Re-admit a promotion
     // on the second holder; with queue_limit=1 this can only succeed if
@@ -1706,7 +1714,7 @@ TEST_F(PromotionOnHitTest, ClientExpiryClearsPromotionTask) {
         service->PromotionObjectHeartbeat(second_holder.client_id);
     ASSERT_TRUE(pending_post.has_value());
     EXPECT_EQ(CountPromotionTask(*pending_post, "k_other"), 1u)
-        << "After the holder expired, ClearInvalidHandles must have "
+        << "After the holder expired, client-liveness cleanup must have "
         << "erased its promotion_tasks entry and decremented "
         << "promotion_in_flight_. Otherwise the global cap remains "
         << "saturated by the dead holder's task for "
@@ -1922,7 +1930,7 @@ TEST_F(PromotionOnHitTest, RemoveAllErasesPromotionTask) {
 
 // BatchRemove normal-completion path on a key with an in-flight
 // PromotionTask must drop the task entry. ReMountSegment registers the
-// holder in ok_client_ so CleanupStaleHandles returns false and
+// holder in ok_client_ so client-liveness cleanup returns false and
 // BatchRemove takes the non-stale branch.
 TEST_F(PromotionOnHitTest, BatchRemoveErasesPromotionTask) {
     MasterServiceConfig config;
@@ -1985,11 +1993,9 @@ TEST_F(PromotionOnHitTest, BatchRemoveErasesPromotionTask) {
     service->RemoveAll(/*force=*/true);
 }
 
-// BatchRemove stale-handle path on a key with an in-flight
-// PromotionTask must drop the task entry. The holder is mounted via
-// PrepareSegment only (no ReMount), so its client is absent from
-// ok_client_; BatchRemove's CleanupStaleHandles then erases the
-// LOCAL_DISK replica and the stale-handle branch fires.
+// BatchRemove stale-handle path on a key with an in-flight PromotionTask must
+// drop the task entry. LOCAL_DISK staleness is represented by segment lifetime,
+// so explicitly invalidate the holder's LocalDiskSegment before BatchRemove.
 TEST_F(PromotionOnHitTest, BatchRemoveStaleHandleErasesPromotionTask) {
     MasterServiceConfig config;
     config.enable_offload = true;
@@ -2018,6 +2024,7 @@ TEST_F(PromotionOnHitTest, BatchRemoveStaleHandleErasesPromotionTask) {
         ASSERT_TRUE(pending.has_value());
         EXPECT_EQ(CountPromotionTask(*pending, "k_first"), 1u);
     }
+    PrepareUnmountLocalDiskSegmentForTesting(*service, holder.client_id);
 
     auto results =
         service->BatchRemove({"k_first"}, TenantId::Default(), /*force=*/true);

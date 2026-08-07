@@ -379,12 +379,12 @@ static double computeAverageUtilAll(const AllocatorManager& manager) {
     double sum = 0.0;
     int count = 0;
     for (const auto& name : names) {
-        const auto* allocators = manager.getAllocators(name);
-        if (!allocators || allocators->empty()) continue;
-        for (const auto& alloc : *allocators) {
-            double cap = static_cast<double>(alloc->capacity());
+        const auto* registrations = manager.getRegistrations(name);
+        if (!registrations || registrations->empty()) continue;
+        for (const auto& registration : *registrations) {
+            double cap = static_cast<double>(registration->capacity());
             if (cap == 0) continue;
-            sum += static_cast<double>(alloc->size()) / cap;
+            sum += static_cast<double>(registration->size()) / cap;
             ++count;
         }
     }
@@ -394,10 +394,10 @@ static double computeAverageUtilAll(const AllocatorManager& manager) {
 static size_t computeTotalCapacity(const AllocatorManager& manager) {
     size_t total = 0;
     for (const auto& name : manager.getNames()) {
-        const auto* allocs = manager.getAllocators(name);
-        if (!allocs) continue;
-        for (const auto& alloc : *allocs) {
-            total += alloc->capacity();
+        const auto* registrations = manager.getRegistrations(name);
+        if (!registrations) continue;
+        for (const auto& registration : *registrations) {
+            total += registration->capacity();
         }
     }
     return total;
@@ -414,12 +414,12 @@ static double computeUtilizationStdDev(const AllocatorManager& manager) {
     ratios.reserve(names.size());
 
     for (const auto& name : names) {
-        const auto* allocators = manager.getAllocators(name);
-        if (!allocators || allocators->empty()) continue;
-        for (const auto& alloc : *allocators) {
-            double cap = static_cast<double>(alloc->capacity());
+        const auto* registrations = manager.getRegistrations(name);
+        if (!registrations || registrations->empty()) continue;
+        for (const auto& registration : *registrations) {
+            double cap = static_cast<double>(registration->capacity());
             if (cap == 0) continue;
-            double used = static_cast<double>(alloc->size());
+            double used = static_cast<double>(registration->size());
             ratios.push_back(used / cap);
         }
     }
@@ -504,29 +504,30 @@ static FragmentationSnapshot computeFragmentationSnapshot(
     double weighted_fragmentation = 0.0;
 
     for (const auto& name : manager.getNames()) {
-        const auto* allocs = manager.getAllocators(name);
-        if (!allocs) continue;
+        const auto* registrations = manager.getRegistrations(name);
+        if (!registrations) continue;
 
-        for (const auto& alloc : *allocs) {
-            auto offset_alloc =
-                std::dynamic_pointer_cast<OffsetBufferAllocator>(alloc);
-            if (!offset_alloc) continue;
+        for (const auto& registration : *registrations) {
+            const size_t total_free_space = registration->getTotalFreeSpace();
+            const size_t largest_free_region =
+                registration->getLargestFreeRegion();
+            if (total_free_space == kAllocatorUnknownFreeSpace ||
+                largest_free_region == kAllocatorUnknownFreeSpace) {
+                continue;
+            }
 
-            auto allocator = offset_alloc->getOffsetAllocator();
-            if (!allocator) continue;
-
-            auto metrics = allocator->get_metrics();
-            snapshot.total_free_space += metrics.total_free_space_;
-            snapshot.capacity += metrics.capacity;
-            snapshot.largest_free_region = std::max(
-                snapshot.largest_free_region, metrics.largest_free_region_);
-            if (metrics.total_free_space_ > 0) {
+            const size_t capacity = registration->capacity();
+            snapshot.total_free_space += total_free_space;
+            snapshot.capacity += capacity;
+            snapshot.largest_free_region =
+                std::max(snapshot.largest_free_region, largest_free_region);
+            if (total_free_space > 0) {
                 double local_fragmentation =
-                    1.0 - (static_cast<double>(metrics.largest_free_region_) /
-                           static_cast<double>(metrics.total_free_space_));
+                    1.0 - (static_cast<double>(largest_free_region) /
+                           static_cast<double>(total_free_space));
                 local_fragmentation = std::clamp(local_fragmentation, 0.0, 1.0);
                 weighted_fragmentation +=
-                    local_fragmentation * metrics.total_free_space_;
+                    local_fragmentation * total_free_space;
             }
             snapshot.valid = true;
         }
