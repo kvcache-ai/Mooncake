@@ -434,6 +434,25 @@ def write_manifest(
     )
 
 
+def test_default_bundle_chunk_tuning_matches_rollout_transfer_target() -> None:
+    assert sos.DEFAULT_BUNDLE_CHUNK_BYTES == 64 * 1024**2
+    assert sos.AUTO_PARALLEL_MIN_BYTES == sos.DEFAULT_BUNDLE_CHUNK_BYTES
+
+
+def test_small_dict_sized_groups_enable_auto_parallel_put() -> None:
+    class SizedBuffer:
+        def __init__(self, size: int) -> None:
+            self._size = size
+
+        def __len__(self) -> int:
+            return self._size
+
+    _store, transfer = make_transfer()
+    groups = [[SizedBuffer(1024**2)] for _ in range(128)]
+    policy = BundleTransferPolicy(max_inflight_put=8)
+    assert transfer._transport._resolve_buffer_group_put_mode(groups, policy) == "parallel"
+
+
 def test_put_object_roundtrips_numpy_and_torch_tensor_fields() -> None:
     torch = pytest.importorskip("torch")
     store, transfer = make_transfer()
