@@ -234,8 +234,8 @@ CtrlChannel handshake per-peer 一次；msg QP 仍随 data endpoint handshake �
 
 **通道重建**
 
-1. 重建 QP + `SESSION_OPEN { epoch+1 }`，重同步 grant/progress。  
-2. Notify 可 OOB fallback。  
+1. 重建 QP + `SESSION_OPEN { epoch+1 }`，重同步 grant/progress。
+2. Notify 可 OOB fallback。
 3. **单边** credit 可 fail-open；**双边**保持排队 + 扩池，不放行无 grant SEND。
 
 **FENCE**：停旧 epoch 提交 → 排空 inflight → `deactivate`/`activate`。Data endpoint 驱逐不触发 FENCE。
@@ -293,7 +293,7 @@ C/Python 绑定同步托管缓冲 API 与 `WAITING` 语义说明。
 
 **分流**
 
-- 默认 / managed `two_sided` → msg 路径。  
+- 默认 / managed `two_sided` → msg 路径。
 - 显式已注册、非 two_sided segment → 单边 WRITE/READ。
 
 **消息格式（msg QP；含 READ）**
@@ -303,8 +303,8 @@ C/Python 绑定同步托管缓冲 API 与 `WAITING` 语义说明。
 msg_type = DATA_WRITE | READ_REQ | READ_RESP | …
 ```
 
-- `DATA_WRITE` / `READ_RESP`：带 payload。  
-- `READ_REQ`：**无大 payload**，只带头；走 **msg QP**（可多轨喷洒），响应用 `READ_RESP`。  
+- `DATA_WRITE` / `READ_RESP`：带 payload。
+- `READ_REQ`：**无大 payload**，只带头；走 **msg QP**（可多轨喷洒），响应用 `READ_RESP`。
 - 乱序/重复按 `(task_id, slice_seq)` 幂等。
 
 **传输资源**
@@ -345,7 +345,7 @@ msg_type = DATA_WRITE | READ_REQ | READ_RESP | …
 
 **安全（选定）**
 
-- 校验 `segment_id` 属于本机 TE managed/`two_sided` segment，且 `offset+len` 在范围内。  
+- 校验 `segment_id` 属于本机 TE managed/`two_sided` segment，且 `offset+len` 在范围内。
 - 失败：丢弃该消息 + metric；同一 peer 连续违规超过阈值 → 断开该 peer 的 msg/ctrl 并报错。
 
 **Bounce 池弹性**
@@ -429,11 +429,11 @@ submitTransfer
 
 ### 10. Observability
 
-- notify / ctrl RTO / 通道重建  
-- credit insufficient、WAITING 时长、扩池次数  
-- 多 peer grant 分配、池水位  
-- bounce 拷贝延迟、DATA_ACK 滞后、非法包计数  
-- 默认双边 vs 显式单边流量占比  
+- notify / ctrl RTO / 通道重建
+- credit insufficient、WAITING 时长、扩池次数
+- 多 peer grant 分配、池水位
+- bounce 拷贝延迟、DATA_ACK 滞后、非法包计数
+- 默认双边 vs 显式单边流量占比
 
 ### 11. Tests
 
@@ -454,9 +454,9 @@ submitTransfer
 
 ### 12. Documentation and bindings
 
-- 本文  
-- C++/Python/C：托管缓冲 API、默认双边、`WAITING`、单边如何显式开启  
-- 选型：默认双边（生命周期简单）；极致带宽 → 显式注册单边  
+- 本文
+- C++/Python/C：托管缓冲 API、默认双边、`WAITING`、单边如何显式开启
+- 选型：默认双边（生命周期简单）；极致带宽 → 显式注册单边
 
 ## Call Stack Comparison
 
@@ -497,8 +497,8 @@ Ctrl:
 
 ## Performance Note
 
-- **默认双边**：优化生命周期与正确性（TE 全托管、有槽才发），不是峰值带宽。  
-- **显式单边**：KVCache 等可常驻注册的大流量零拷贝。  
+- **默认双边**：优化生命周期与正确性（TE 全托管、有槽才发），不是峰值带宽。
+- **显式单边**：KVCache 等可常驻注册的大流量零拷贝。
 - 控制面相对 OOB：降低 notify 延迟；与 data/msg CQ 分离改善控制尾延迟。
 
 ## Related Documents

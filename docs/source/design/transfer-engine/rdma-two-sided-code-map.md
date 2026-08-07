@@ -1,6 +1,6 @@
 # Classic TE RDMA 双边实现：代码功能划分
 
-本文对照当前实现，按**功能模块**梳理新增/改动代码，并说明主要类型与函数职责。  
+本文对照当前实现，按**功能模块**梳理新增/改动代码，并说明主要类型与函数职责。
 设计语义见 [rdma-two-sided-control-plane.md](rdma-two-sided-control-plane.md)。
 
 源码根目录：`mooncake-transfer-engine/`。
@@ -49,7 +49,7 @@
 
 ## 2. 控制面：CtrlChannel
 
-**路径**：`include/transport/rdma_transport/ctrl_channel.h`  
+**路径**：`include/transport/rdma_transport/ctrl_channel.h`
 `src/transport/rdma_transport/ctrl_channel.cpp`
 
 Per-peer 独立 RC QP + CQ，承载类型化控制帧（credit、DATA_ACK、SESSION、兼容 notify）。不进入 EndpointStore。
@@ -88,7 +88,7 @@ Per-peer 独立 RC QP + CQ，承载类型化控制帧（credit、DATA_ACK、SESS
 
 ## 3. 控制帧：CtrlFrame
 
-**路径**：`include/transport/rdma_transport/ctrl_frame.h`  
+**路径**：`include/transport/rdma_transport/ctrl_frame.h`
 `src/transport/rdma_transport/ctrl_frame.cpp`
 
 线格式（host 侧结构 + 编解码）：
@@ -121,7 +121,7 @@ Per-peer 独立 RC QP + CQ，承载类型化控制帧（credit、DATA_ACK、SESS
 
 ## 4. Credit：SenderCreditLedger
 
-**路径**：`include/transport/rdma_transport/sender_credit.h`  
+**路径**：`include/transport/rdma_transport/sender_credit.h`
 `src/transport/rdma_transport/sender_credit.cpp`
 
 发送方本地账本：key = `(peer, session)`，累计 `grant_total`，`consumed` 随 `tryReserve` 增加。
@@ -155,7 +155,7 @@ Per-peer 独立 RC QP + CQ，承载类型化控制帧（credit、DATA_ACK、SESS
 
 ### 5.2 BouncePool
 
-**路径**：`include/transport/rdma_transport/bounce_pool.h`  
+**路径**：`include/transport/rdma_transport/bounce_pool.h`
 `src/transport/rdma_transport/bounce_pool.cpp`
 
 | 函数 | 功能 |
@@ -180,7 +180,7 @@ Per-peer 独立 RC QP + CQ，承载类型化控制帧（credit、DATA_ACK、SESS
 
 ### 5.3 MsgChannel
 
-**路径**：`include/transport/rdma_transport/msg_channel.h`  
+**路径**：`include/transport/rdma_transport/msg_channel.h`
 `src/transport/rdma_transport/msg_channel.cpp`
 
 Per-peer 数据 RC QP；payload 经 bounce：`managed/src → send bounce → 网络 → recv bounce → managed/dst`。
