@@ -2,6 +2,7 @@
 #include <gtest/gtest.h>
 #include <json/json.h>
 
+#include <array>
 #include <chrono>
 #include <cstring>
 #include <limits>
@@ -9,6 +10,7 @@
 #include <thread>
 #include <vector>
 
+#include "p2p_client_metric.h"
 #include "tiered_cache/tiered_backend.h"
 #include "tiered_cache/tiers/cache_tier.h"  // TempDRAMBuffer
 #include "utils/common.h"                   // InitTieredBackendForTest
@@ -88,6 +90,15 @@ class EventDrivenSchedulerTest : public ::testing::Test {
             }
         }
         return 0;
+    }
+
+    static std::string TierLabel(const TieredBackend& b, UUID tier) {
+        for (const auto& v : b.GetTierViews()) {
+            if (v.id == tier) {
+                return v.GetName();
+            }
+        }
+        return {};
     }
 
     static bool Put(TieredBackend& b, const std::string& key, UUID tier,
@@ -344,6 +355,107 @@ TEST_F(EventDrivenSchedulerTest, StopUnderLoadIsClean) {
     // backend goes out of scope here -> TieredBackend::Stop()/dtor ->
     // scheduler Stop() drains the pool and joins the evict thread cleanly.
     SUCCEED();
+}
+
+// ============================================================================
+// Tier movement metric tests (event_driven path only)
+// ============================================================================
+
+TEST_F(EventDrivenSchedulerTest, TierMetricsCountOffloadKeys) {
+    // Shared ownership: TieredBackend keeps the metric alive for its
+    // scheduler threads regardless of local destruction order.
+    auto tier_metric = std::make_shared<TierMetric>();
+    TieredBackend backend;
+    ASSERT_TRUE(backend
+                    .Init(MakeConfig(16 * kMB, 64 * kMB), nullptr, nullptr,
+                          nullptr, nullptr, tier_metric)
+                    .has_value());
+    const UUID fast = FastTier(backend);
+    const UUID slow = SlowTier(backend);
+
+    ASSERT_TRUE(Put(backend, "k", fast, 64 * 1024));
+    // Exactly 3 accesses: freq crosses the offload threshold (>2) on the 3rd,
+    // so exactly one offload movement is ever enqueued for this key.
+    for (int i = 0; i < 3; ++i) {
+        Access(backend, "k", fast);
+    }
+
+    std::array<std::string, 1> fast_label = {TierLabel(backend, fast)};
+    std::array<std::string, 1> slow_label = {TierLabel(backend, slow)};
+    // Wait on the counter itself: it is incremented right after the movement
+    // succeeds, so no state check can race ahead of the accounting.
+    EXPECT_TRUE(WaitUntil(
+        [&] { return tier_metric->offloaded_keys.value(fast_label) == 1; },
+        5000));
+    EXPECT_TRUE(backend.Exist("k", slow));
+    EXPECT_EQ(tier_metric->onboarded_keys.value(fast_label), 0);
+    EXPECT_EQ(tier_metric->offloaded_keys.value(slow_label), 0);
+    EXPECT_EQ(tier_metric->evicted_keys.value(fast_label), 0);
+}
+
+TEST_F(EventDrivenSchedulerTest, TierMetricsCountOnboardKeys) {
+    // Shared ownership: TieredBackend keeps the metric alive for its
+    // scheduler threads regardless of local destruction order.
+    auto tier_metric = std::make_shared<TierMetric>();
+    TieredBackend backend;
+    ASSERT_TRUE(backend
+                    .Init(MakeConfig(16 * kMB, 64 * kMB), nullptr, nullptr,
+                          nullptr, nullptr, tier_metric)
+                    .has_value());
+    const UUID fast = FastTier(backend);
+    const UUID slow = SlowTier(backend);
+
+    ASSERT_TRUE(Put(backend, "k", slow, 64 * 1024));
+    // Exactly 3 accesses: freq crosses the onboard threshold (>2) on the 3rd,
+    // so exactly one onboard movement is ever enqueued for this key.
+    for (int i = 0; i < 3; ++i) {
+        Access(backend, "k", slow);
+    }
+
+    std::array<std::string, 1> fast_label = {TierLabel(backend, fast)};
+    std::array<std::string, 1> slow_label = {TierLabel(backend, slow)};
+    // Wait on the counter itself (incremented right after the movement
+    // succeeds), then verify the migration's state effects.
+    EXPECT_TRUE(WaitUntil(
+        [&] { return tier_metric->onboarded_keys.value(slow_label) == 1; },
+        5000));
+    EXPECT_TRUE(backend.Exist("k", fast));
+    EXPECT_FALSE(backend.Exist("k", slow));
+    EXPECT_EQ(tier_metric->offloaded_keys.value(slow_label), 0);
+    EXPECT_EQ(tier_metric->onboarded_keys.value(fast_label), 0);
+}
+
+TEST_F(EventDrivenSchedulerTest, TierMetricsCountEvictedKeys) {
+    // Shared ownership: TieredBackend keeps the metric alive for its
+    // scheduler threads regardless of local destruction order.
+    auto tier_metric = std::make_shared<TierMetric>();
+    TieredBackend backend;
+    ASSERT_TRUE(backend
+                    .Init(MakeConfig(4 * kMB, 64 * kMB,
+                                     /*evict_wm_high=*/0.50,
+                                     /*evict_wm_low=*/0.40),
+                          nullptr, nullptr, nullptr, nullptr, tier_metric)
+                    .has_value());
+    const UUID fast = FastTier(backend);
+
+    std::vector<std::string> keys;
+    for (int i = 0; i < 14; ++i) {
+        const std::string k = "e" + std::to_string(i);
+        if (Put(backend, k, fast, 256 * 1024)) {
+            keys.push_back(k);
+        }
+    }
+    ASSERT_FALSE(keys.empty());
+
+    std::array<std::string, 1> fast_label = {TierLabel(backend, fast)};
+    // Wait on the counter itself: it is incremented right after each
+    // successful eviction, ahead of any Exist-based state observation.
+    EXPECT_TRUE(WaitUntil(
+        [&] { return tier_metric->evicted_keys.value(fast_label) >= 1; },
+        5000));
+    // Eviction never moves data between tiers.
+    EXPECT_EQ(tier_metric->offloaded_keys.value(fast_label), 0);
+    EXPECT_EQ(tier_metric->onboarded_keys.value(fast_label), 0);
 }
 
 }  // namespace

@@ -21,6 +21,7 @@ namespace mooncake {
 
 class TieredBackend;     // Forward declaration
 class IClientScheduler;  // Forward declaration
+struct TierMetric;       // Optional per-tier metrics sink (p2p_client_metric.h)
 
 /**
  * @struct TieredLocation
@@ -45,6 +46,10 @@ struct TierView {
     size_t free_space;
     int priority;
     std::vector<std::string> tags;
+
+    // Segment name reported to Master ("tier_<uuid>"), also used as the
+    // per-tier metric label.
+    std::string GetName() const;
 };
 
 /**
@@ -142,7 +147,8 @@ class TieredBackend {
         Json::Value root, TransferEngine* engine,
         AddReplicaCallback add_replica_callback,
         RemoveReplicaCallback remove_replica_callback,
-        SegmentSyncCallback segment_sync_callback);
+        SegmentSyncCallback segment_sync_callback,
+        std::shared_ptr<TierMetric> tier_metric = nullptr);
 
     // --- Client-Centric Operations ---
     // All the following operations are designed for Client-Centric, Client
@@ -278,6 +284,8 @@ class TieredBackend {
     std::vector<TierView> GetTierViews() const;
     std::vector<UUID> GetReplicaTierIds(std::string_view key) const;
     const CacheTier* GetTier(UUID tier_id) const;
+    // Optional per-tier metrics sink; null when metric collection is off.
+    std::shared_ptr<TierMetric> GetTierMetric() const { return tier_metric_; }
 
     /**
      * @brief Id of the DRAM (fast) tier, for DRAM-only local writes.
@@ -378,6 +386,8 @@ class TieredBackend {
     RemoveReplicaCallback remove_replica_callback_;
     // Callback for segment lifecycle synchronization with Master
     SegmentSyncCallback segment_sync_callback_;
+    // Optional per-tier metrics; null when metric collection is disabled
+    std::shared_ptr<TierMetric> tier_metric_;
 
     // Scheduler
     std::unique_ptr<IClientScheduler> scheduler_;

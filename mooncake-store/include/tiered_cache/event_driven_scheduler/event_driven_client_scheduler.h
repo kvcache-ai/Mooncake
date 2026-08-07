@@ -62,9 +62,12 @@ class EventDrivenClientScheduler : public IClientScheduler {
     void
     ResolveRoles();  // resolve fast/slow from tier topology, Init the policy
 
-    // Execute a single policy-decided movement against the data plane. Returns
-    // true if the movement's source-side effect succeeded.
+    // Execute a single policy-decided movement against the data plane, then
+    // record per-tier movement metrics on success. Returns true if the
+    // movement's source-side effect succeeded.
     bool Execute(const MovementRequest& mv);
+    bool ExecuteMovement(const MovementRequest& mv);  // data-plane work
+    void RecordMovement(const MovementRequest& mv);   // TierMetric bookkeeping
 
     bool HasAvailableBytes(UUID tier_id, size_t required_bytes) const;
     void DispatchToPool(std::function<void()> fn);
