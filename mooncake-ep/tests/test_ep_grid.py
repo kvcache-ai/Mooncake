@@ -113,7 +113,7 @@ def run_test_iteration(
         max_tokens, hidden, num_ranks, num_experts
     )
     if buf is None:
-        buf = Buffer(group, num_ep_buffer_bytes, disable_p2p)
+        buf = Buffer(group, num_ep_buffer_bytes, disable_p2p=disable_p2p)
 
     if use_fallback:
         buf._use_fallback = True
