@@ -315,6 +315,9 @@ Status GdsTransport::submitTransferTasks(
 Status GdsTransport::getTransferStatus(SubBatchRef batch, int task_id,
                                        TransferStatus& status) {
     auto gds_batch = dynamic_cast<GdsSubBatch*>(batch);
+    if (!gds_batch) {
+        return Status::InvalidArgument("Invalid GDS sub-batch" LOC_MARK);
+    }
     unsigned num_tasks = gds_batch->io_param_ranges.size();
     if (task_id < 0 || task_id >= (int)num_tasks)
         return Status::InvalidArgument("Invalid task ID");
