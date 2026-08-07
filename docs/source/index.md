@@ -124,6 +124,7 @@ performance/vllm/index
 :maxdepth: 1
 
 design/architecture
+design/ecosystem-support
 design/mooncake-store
 design/p2p-store
 design/mooncake-backend-pg
