@@ -104,8 +104,7 @@ ErrorCode OpLogBatchStorage::InitDurablePrefix(DurablePrefix& prefix) {
         return ErrorCode::OK;
     }
     if (err == ErrorCode::ETCD_TRANSACTION_FAIL) {
-        err = ReadDurablePrefix(prefix);
-        if (err != ErrorCode::OK) {
+        if ((err = ReadDurablePrefix(prefix)) != ErrorCode::OK) {
             return err;
         }
         return ValidateDurablePrefixAtStartup(prefix);
@@ -232,10 +231,7 @@ ErrorCode OpLogBatchStorage::WriteBatchAndAdvancePrefix(
         if (backend_.Get(durable_key, raw_prefix) == ErrorCode::OK &&
             raw_prefix != txn.compares[0].expected_value &&
             DecodeDurablePrefix(raw_prefix, &decoded_prefix) &&
-            decoded_prefix.batch_id == expected_prefix.batch_id &&
-            decoded_prefix.last_seq == expected_prefix.last_seq &&
-            decoded_prefix.producer_view_version ==
-                expected_prefix.producer_view_version) {
+            decoded_prefix == expected_prefix) {
             txn.compares[0].expected_value = raw_prefix;
             err = backend_.Txn(txn);
         }
@@ -246,10 +242,11 @@ ErrorCode OpLogBatchStorage::WriteBatchAndAdvancePrefix(
 
     DurablePrefix current_prefix;
     if (ReadDurablePrefix(current_prefix) != ErrorCode::OK ||
-        current_prefix.batch_id != batch.batch_id ||
-        current_prefix.last_seq != batch.last_seq ||
-        current_prefix.producer_view_version !=
-            expected_prefix.producer_view_version) {
+        current_prefix !=
+            DurablePrefix{.batch_id = batch.batch_id,
+                          .last_seq = batch.last_seq,
+                          .producer_view_version =
+                              expected_prefix.producer_view_version}) {
         return err;
     }
     OpLogBatchRecord current_batch;
