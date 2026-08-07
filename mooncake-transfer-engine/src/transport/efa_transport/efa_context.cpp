@@ -414,16 +414,19 @@ int EfaContext::buildSharedEndpoint(size_t max_wr, size_t max_inline) {
     // ever be violated, 14 is already in isStalePeerCqError() and drops the
     // peer handle for a fresh handshake.
     //
-    // The value is an enum, not a macro, so #ifdef cannot probe it; guard on
-    // the libfabric API version that introduced it (2.2; absent in 2.1).
-#if FI_VERSION(FI_MAJOR_VERSION, FI_MINOR_VERSION) >= FI_VERSION(2, 2)
+    // Support is decided at RUNTIME, not compile time: the option's value is
+    // resolved from headers if we have them and vendored if we do not (see
+    // kEfaOptHomogeneousPeers), but whether it takes effect depends on the
+    // libfabric actually loaded.  A provider too old to know the option answers
+    // -FI_ENOPROTOOPT / -FI_EOPNOTSUPP, which we treat as "keep the handshake".
     if (globalConfig().efa_homogeneous_peers) {
         bool homogeneous = true;
         ret = fi_setopt(&shared_ep_->fid, FI_OPT_ENDPOINT,
-                        FI_OPT_EFA_HOMOGENEOUS_PEERS, &homogeneous,
+                        kEfaOptHomogeneousPeers, &homogeneous,
                         sizeof(homogeneous));
         if (ret == -FI_EOPNOTSUPP || ret == -FI_ENOPROTOOPT) {
-            // Provider built without the option: keep the handshake path.
+            // libfabric predates the option (added in 2.2), or it was built
+            // without it: keep the handshake path.
             LOG(INFO) << "EFA: FI_OPT_EFA_HOMOGENEOUS_PEERS unsupported on "
                       << device_name_ << " (" << fi_strerror(-ret)
                       << "), using the default handshake path";
@@ -438,7 +441,6 @@ int EfaContext::buildSharedEndpoint(size_t max_wr, size_t max_inline) {
                     << ", skipping the per-peer handshake";
         }
     }
-#endif
 
     ret = fi_ep_bind(shared_ep_, &av_->fid, 0);
     if (ret) {

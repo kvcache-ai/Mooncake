@@ -24,7 +24,16 @@
 #include <rdma/fi_rma.h>
 #include <rdma/fi_errno.h>
 // FI_OPT_EFA_* provider-specific setopt values (FI_OPT_EFA_HOMOGENEOUS_PEERS).
+// Not a mandatory libfabric header: the AWS EFA installer ships it, but the
+// distro libfabric-dev package -- what the wheel CI builds against -- does not.
+// Probe for it instead of hard-failing the compile; see
+// kEfaOptHomogeneousPeers for what we do when it is absent.
+#if defined(__has_include)
+#if __has_include(<rdma/fi_ext.h>)
 #include <rdma/fi_ext.h>
+#define MC_HAVE_FI_EXT_H 1
+#endif
+#endif
 
 #include <atomic>
 #include <condition_variable>
@@ -42,6 +51,29 @@
 #include "transport/transport.h"
 
 namespace mooncake {
+
+// fi_setopt() value that tells the EFA provider every peer is homogeneous with
+// us, letting it skip the per-peer RDM handshake (see buildSharedEndpoint()).
+//
+// libfabric declares this as an *enum*, not a macro, so #ifdef cannot probe it,
+// and it lives in rdma/fi_ext.h -- a header the AWS EFA installer ships but the
+// distro libfabric-dev package does not.  Whether the option works is a
+// property of the libfabric we LOAD, not the headers we COMPILE against, and
+// those differ in the build that matters: the EFA wheel compiles against distro
+// headers and then runs against the EFA installer's libfabric.  So resolve the
+// value at compile time but always issue the fi_setopt, and let the provider
+// reject it (-FI_ENOPROTOOPT / -FI_EOPNOTSUPP) when it is too old to know it.
+//
+// The vendored fallback is safe because the enum's layout is append-only: the
+// first seven values are byte-identical in every libfabric release from 1.22
+// through 2.3, with HOMOGENEOUS_PEERS added eighth in 2.2.  A libfabric
+// predating it hits efa_rdm_ep_setopt()'s default case and returns
+// -FI_ENOPROTOOPT, which is exactly the "keep the handshake" path.
+#ifdef MC_HAVE_FI_EXT_H
+constexpr int kEfaOptHomogeneousPeers = FI_OPT_EFA_HOMOGENEOUS_PEERS;
+#else
+constexpr int kEfaOptHomogeneousPeers = -(0xefa << 16) + 7;
+#endif
 
 class EfaEndPoint;
 class EfaTransport;
