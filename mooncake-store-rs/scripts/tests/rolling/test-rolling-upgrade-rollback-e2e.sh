@@ -200,7 +200,7 @@ echo "  [OK] Both V1 clients started"
 
 REDIS_URL="${REDIS_URL}" KEYSPACE="${KEYSPACE}" python3 - <<'PY'
 import os
-from mooncake.store import MooncakeDistributedStore, ReplicateConfig
+from mooncake_store_rs.store import MooncakeDistributedStore, ReplicateConfig
 
 store = MooncakeDistributedStore()
 assert store.setup(
@@ -257,7 +257,7 @@ echo "  [OK] client-a V1 exited, V2 promoted"
 
 REDIS_URL="${REDIS_URL}" KEYSPACE="${KEYSPACE}" python3 - <<'PY'
 import os, time
-from mooncake.store import MooncakeDistributedStore, ReplicateConfig
+from mooncake_store_rs.store import MooncakeDistributedStore, ReplicateConfig
 
 store = MooncakeDistributedStore()
 assert store.setup(
@@ -331,7 +331,7 @@ echo "=== PHASE 4: Verify all data intact after rollback ==="
 
 REDIS_URL="${REDIS_URL}" KEYSPACE="${KEYSPACE}" python3 - <<'PY'
 import os, time
-from mooncake.store import MooncakeDistributedStore, ReplicateConfig
+from mooncake_store_rs.store import MooncakeDistributedStore, ReplicateConfig
 
 store = MooncakeDistributedStore()
 assert store.setup(

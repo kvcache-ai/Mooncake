@@ -110,7 +110,7 @@ ensure_runtime_ready() {
   fi
 
   if ! "${python_bin}" - <<'PY' >/dev/null 2>&1
-from mooncake.store import MooncakeDistributedStore  # noqa: F401
+from mooncake_store_rs.store import MooncakeDistributedStore  # noqa: F401
 PY
   then
     echo "==> installed wheel missing or stale; rebuilding .venv-wheel runtime"
@@ -294,7 +294,7 @@ if [[ "${MODE}" == "all" || "${MODE}" == "real" ]]; then
 import os
 import time
 
-from mooncake.store import MooncakeDistributedStore, ReplicateConfig
+from mooncake_store_rs.store import MooncakeDistributedStore, ReplicateConfig
 
 from scripts.clients.real_client_rw import apply_replication_config, setup_store
 
@@ -423,7 +423,7 @@ if [[ "${MODE}" == "all" || "${MODE}" == "dummy" ]]; then
 import os
 import time
 
-from mooncake.store import MooncakeDistributedStore, ReplicateConfig
+from mooncake_store_rs.store import MooncakeDistributedStore, ReplicateConfig
 
 from scripts.clients.dummy_client_rw import wait_for_dummy_ready
 from scripts.clients.real_client_rw import apply_replication_config, setup_store

@@ -107,7 +107,7 @@ resolve_python_bin() {
 python_can_import_store() {
   local python_bin=$1
   "${python_bin}" - <<'PY' >/dev/null 2>&1
-from mooncake.store import MooncakeDistributedStore  # noqa: F401
+from mooncake_store_rs.store import MooncakeDistributedStore  # noqa: F401
 PY
 }
 

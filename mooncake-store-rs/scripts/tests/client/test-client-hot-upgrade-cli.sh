@@ -185,7 +185,7 @@ TEST_VALUE="${TEST_VALUE}" \
 python3 - <<'PY'
 import os
 
-from mooncake.store import MooncakeDistributedStore, ReplicateConfig
+from mooncake_store_rs.store import MooncakeDistributedStore, ReplicateConfig
 
 store = MooncakeDistributedStore()
 assert store.setup(
@@ -237,7 +237,7 @@ python3 - <<'PY'
 import os
 import time
 
-from mooncake.store import MooncakeDistributedStore
+from mooncake_store_rs.store import MooncakeDistributedStore
 
 store = MooncakeDistributedStore()
 assert store.setup(

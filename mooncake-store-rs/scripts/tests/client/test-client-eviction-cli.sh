@@ -404,7 +404,7 @@ import os
 import time
 import traceback
 
-from mooncake.store import MooncakeDistributedStore, ReplicateConfig
+from mooncake_store_rs.store import MooncakeDistributedStore, ReplicateConfig
 
 writer = MooncakeDistributedStore()
 reader = MooncakeDistributedStore()

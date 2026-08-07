@@ -49,7 +49,7 @@ import time
 from typing import Iterable
 from urllib.parse import urlsplit
 
-from mooncake.store import MooncakeDistributedStore, ReplicateConfig
+from mooncake_store_rs.store import MooncakeDistributedStore, ReplicateConfig
 
 
 # ---------------------------------------------------------------------------

@@ -47,18 +47,18 @@ import threading
 import types
 
 repo_root = pathlib.Path(os.environ["REPO_ROOT"])
-package_dir = repo_root / "python" / "mooncake"
+package_dir = repo_root / "python" / "mooncake_store_rs"
 
-pkg = types.ModuleType("mooncake")
+pkg = types.ModuleType("mooncake_store_rs")
 pkg.__path__ = [str(package_dir)]
-sys.modules["mooncake"] = pkg
+sys.modules["mooncake_store_rs"] = pkg
 
-runtime = types.ModuleType("mooncake._runtime")
+runtime = types.ModuleType("mooncake_store_rs._runtime")
 runtime.package_dir = lambda: package_dir
 runtime.preload_native_libraries = lambda root: None
-sys.modules["mooncake._runtime"] = runtime
+sys.modules["mooncake_store_rs._runtime"] = runtime
 
-native = types.ModuleType("mooncake._store_rs")
+native = types.ModuleType("mooncake_store_rs._store_rs")
 native.MooncakeDistributedStore = lambda: object()
 native.MooncakeHostMemAllocator = lambda *args, **kwargs: None
 trace_state = {"filters": []}
@@ -75,11 +75,11 @@ def start_metrics_server(bind_addr="127.0.0.1:0"):
 native.start_metrics_server = start_metrics_server
 native.stop_metrics_server = lambda: None
 native.metrics_server_address = lambda: metrics_state["address"]
-sys.modules["mooncake._store_rs"] = native
+sys.modules["mooncake_store_rs._store_rs"] = native
 
-spec = importlib.util.spec_from_file_location("mooncake.store", package_dir / "store.py")
+spec = importlib.util.spec_from_file_location("mooncake_store_rs.store", package_dir / "store.py")
 module = importlib.util.module_from_spec(spec)
-sys.modules["mooncake.store"] = module
+sys.modules["mooncake_store_rs.store"] = module
 assert spec.loader is not None
 spec.loader.exec_module(module)
 

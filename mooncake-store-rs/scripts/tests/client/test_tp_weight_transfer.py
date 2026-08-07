@@ -21,7 +21,7 @@ import argparse
 import ctypes
 import sys
 
-from mooncake.store import MooncakeDistributedStore, MooncakeHostMemAllocator
+from mooncake_store_rs.store import MooncakeDistributedStore, MooncakeHostMemAllocator
 
 
 def parse_args() -> argparse.Namespace:

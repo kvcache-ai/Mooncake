@@ -28,7 +28,7 @@ import subprocess
 import time
 import urllib.request
 
-from mooncake.store import (
+from mooncake_store_rs.store import (
     MooncakeDistributedStore,
     ReplicateConfig,
     metrics_server_address,

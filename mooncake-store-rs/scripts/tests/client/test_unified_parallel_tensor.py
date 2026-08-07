@@ -21,7 +21,7 @@ import struct
 
 import torch
 
-from mooncake.store import (
+from mooncake_store_rs.store import (
     MooncakeDistributedStore,
     MooncakeHostMemAllocator,
     ParallelAxis,
