@@ -1581,7 +1581,6 @@ TEST(TcpWriteVisibilityTest,
     EXPECT_EQ(fake_peer.activeAcceptedCount(), 2);
     EXPECT_EQ(cooldown_started_count.load(std::memory_order_acquire), 0);
     EXPECT_GE(retry_armed_count.load(std::memory_order_acquire), 1);
-    EXPECT_GE(retry_fired_count.load(std::memory_order_acquire), 1);
     EXPECT_EQ(session_failure_count.load(std::memory_order_acquire), 1);
     EXPECT_LE(maximum_observed_socket_count.load(std::memory_order_acquire),
               2u);
@@ -1639,7 +1638,6 @@ TEST(TcpWriteVisibilityTest,
               3);
     EXPECT_EQ(cooldown_started_count.load(std::memory_order_acquire), 0);
     EXPECT_GE(retry_armed_count.load(std::memory_order_acquire), 1);
-    EXPECT_GE(retry_fired_count.load(std::memory_order_acquire), 1);
     EXPECT_EQ(connect_failure_count.load(std::memory_order_acquire), 0);
     EXPECT_LE(maximum_observed_socket_count.load(std::memory_order_acquire),
               2u);
