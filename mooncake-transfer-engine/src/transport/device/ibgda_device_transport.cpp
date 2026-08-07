@@ -291,6 +291,7 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
             mlx5gda_qp_devctx devctx{
                 .qpn = qp->qpn,
                 .wqeid_mask = qp->num_wqebb - 1,
+                .mutex = 0,
                 .wq = split_regions ? reinterpret_cast<mlx5gda_wqebb*>(qp->wq)
                                     : reinterpret_cast<mlx5gda_wqebb*>(
                                           static_cast<char*>(ctrl_buf_dev_) +
@@ -306,6 +307,9 @@ class IbgdaDeviceTransportImpl : public RdmaTransport {
                                  static_cast<char*>(ctrl_buf_dev_) +
                                  qp->dbr_offset),
                 .bf = static_cast<char*>(qp->uar->reg_addr),
+                .bf_offset = 0,
+                .wq_head = 0,
+                .wq_tail = 0,
             };
             cudaMemcpy(
                 static_cast<char*>(qp_devctxs_) + i * sizeof(mlx5gda_qp_devctx),
