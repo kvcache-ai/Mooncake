@@ -1363,7 +1363,8 @@ class MasterService {
         ObjectMetadata& metadata);
     size_t EraseReplicasWithCacheTotalAccounting(
         ObjectMetadata& metadata,
-        const std::function<bool(const Replica&)>& pred_fn);
+        const std::function<bool(const Replica&)>& pred_fn,
+        std::vector<ReplicaID>* erased_replica_ids = nullptr);
 
     std::unordered_map<std::string, std::string> object_group_ids_
         GUARDED_BY(group_routing_mutex_);
@@ -1560,7 +1561,7 @@ class MasterService {
     // Helper to clean up stale handles pointing to unmounted segments
     // or local_disk replicas whose owner client is no longer alive.
     bool CleanupStaleHandles(
-        ObjectMetadata& metadata,
+        TenantState& tenant_state, ObjectMetadata& metadata,
         const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients,
         MetadataShardAccessorRW* shard = nullptr);
 
@@ -1661,6 +1662,10 @@ class MasterService {
             MasterMetricManager::instance().inc_promotion_cancelled();
         }
     }
+    void CancelPromotionTaskForRemovedReplicas(
+        TenantState& tenant_state, ObjectMetadata& metadata,
+        const std::vector<ReplicaID>& removed_replica_ids)
+        NO_THREAD_SAFETY_ANALYSIS;
 
     // Lease related members
     const uint64_t default_kv_lease_ttl_;     // in milliseconds
@@ -1733,10 +1738,15 @@ class MasterService {
                 // replicas.
                 const uint64_t before_charge =
                     service_->CompletedMemoryQuotaCharge(it_->second);
+                std::vector<ReplicaID> removed_replica_ids;
                 service_->EraseReplicasWithCacheTotalAccounting(
-                    it_->second, [](const Replica& replica) {
+                    it_->second,
+                    [](const Replica& replica) {
                         return replica.has_invalid_mem_handle();
-                    });
+                    },
+                    &removed_replica_ids);
+                service_->CancelPromotionTaskForRemovedReplicas(
+                    *tenant_state_, it_->second, removed_replica_ids);
                 const uint64_t after_charge =
                     service_->CompletedMemoryQuotaCharge(it_->second);
                 if (before_charge > after_charge) {

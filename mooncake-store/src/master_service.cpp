@@ -1649,9 +1649,17 @@ std::vector<Replica> MasterService::PopReplicasWithCacheTotalAccounting(
 
 size_t MasterService::EraseReplicasWithCacheTotalAccounting(
     ObjectMetadata& metadata,
-    const std::function<bool(const Replica&)>& pred_fn) {
+    const std::function<bool(const Replica&)>& pred_fn,
+    std::vector<ReplicaID>* erased_replica_ids) {
     auto erased_replicas =
         PopReplicasWithCacheTotalAccounting(metadata, pred_fn);
+    if (erased_replica_ids != nullptr) {
+        erased_replica_ids->reserve(erased_replica_ids->size() +
+                                    erased_replicas.size());
+        for (const auto& replica : erased_replicas) {
+            erased_replica_ids->push_back(replica.id());
+        }
+    }
     // Release SSD/local-disk usage for any local-disk replicas being removed.
     // No-op for memory/noF replicas, so it is safe to call unconditionally.
     ReleaseLocalDiskUsage(erased_replicas);
@@ -1690,6 +1698,11 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
     if (erased_replicas.empty()) {
         return;
     }
+    std::vector<ReplicaID> erased_replica_ids;
+    erased_replica_ids.reserve(erased_replicas.size());
+    for (const auto& replica : erased_replicas) {
+        erased_replica_ids.push_back(replica.id());
+    }
     const uint64_t erased_memory_replicas = static_cast<uint64_t>(std::count_if(
         erased_replicas.begin(), erased_replicas.end(),
         [](const Replica& replica) { return replica.is_memory_replica(); }));
@@ -1705,6 +1718,8 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
     if (erased_local_disk) {
         shard.OnDiskReplicaRemoved(erased_local_disk, metadata);
     }
+    CancelPromotionTaskForRemovedReplicas(tenant_state, metadata,
+                                          erased_replica_ids);
     if (!metadata.IsValid()) {
         EraseMetadata(tenant_state, metadata_it, tenant_id, quota_mode, &shard);
         if (tenant_state.Empty()) {
@@ -2082,8 +2097,8 @@ void MasterService::ClearInvalidHandles(
                             continue;
                         }
                     }
-                    if (CleanupStaleHandles(it->second, alive_clients,
-                                            &shard)) {
+                    if (CleanupStaleHandles(tenant_state, it->second,
+                                            alive_clients, &shard)) {
                         it = EraseMetadata(tenant_state, it, tenant_it->first,
                                            QuotaEraseMode::kFull, &shard);
                     } else {
@@ -3660,8 +3675,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                     if (enable_oplog_) {
                         return tl::make_unexpected(
                             ErrorCode::OBJECT_ALREADY_EXISTS);
-                    } else if (CleanupStaleHandles(it->second, alive_clients,
-                                                   &shard)) {
+                    } else if (CleanupStaleHandles(tenant_state, it->second,
+                                                   alive_clients, &shard)) {
                         EraseMetadata(tenant_state, it, object_id.tenant_id,
                                       QuotaEraseMode::kFull, &shard);
                         it = tenant_state.metadata.end();
@@ -3772,23 +3787,51 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
 
+    auto is_target_replica = [replica_type](const Replica& replica) {
+        if (replica_type == ReplicaType::ALL) {
+            return (replica.is_memory_replica() &&
+                    !replica.has_invalid_mem_handle()) ||
+                   (replica.is_nof_replica() &&
+                    !replica.has_invalid_nof_handle());
+        }
+        if (replica_type == ReplicaType::MEMORY) {
+            return replica.is_memory_replica() &&
+                   !replica.has_invalid_mem_handle();
+        }
+        if (replica_type == ReplicaType::NOF_SSD) {
+            return replica.is_nof_replica() &&
+                   !replica.has_invalid_nof_handle();
+        }
+        return replica.type() == replica_type;
+    };
+
+    // A successful End removes the processing marker. Treat a retry as a
+    // no-op only when every replica targeted by that End is already COMPLETE.
+    // In particular, a promotion-owned PROCESSING replica keeps this check
+    // from accepting a MEMORY/ALL End and is never modified here.
+    if (!accessor.InProcessing()) {
+        bool has_target_replica = false;
+        bool all_target_replicas_complete = true;
+        for (const auto& replica : metadata.GetAllReplicas()) {
+            if (!is_target_replica(replica)) {
+                continue;
+            }
+            has_target_replica = true;
+            if (!replica.is_completed()) {
+                all_target_replicas_complete = false;
+                break;
+            }
+        }
+        if (has_target_replica && all_target_replicas_complete) {
+            return {};
+        }
+        LOG(ERROR) << "key=" << key << ", error=no_primary_write_in_progress";
+        return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+    }
+
     metadata.VisitReplicas(
-        [replica_type](const Replica& replica) {
-            if (replica_type == ReplicaType::ALL) {
-                return (replica.is_memory_replica() &&
-                        !replica.has_invalid_mem_handle()) ||
-                       (replica.is_nof_replica() &&
-                        !replica.has_invalid_nof_handle());
-            }
-            if (replica_type == ReplicaType::MEMORY) {
-                return replica.is_memory_replica() &&
-                       !replica.has_invalid_mem_handle();
-            }
-            if (replica_type == ReplicaType::NOF_SSD) {
-                return replica.is_nof_replica() &&
-                       !replica.has_invalid_nof_handle();
-            }
-            return replica.type() == replica_type;
+        [&is_target_replica](const Replica& replica) {
+            return replica.is_processing() && is_target_replica(replica);
         },
         [](Replica& replica) { replica.mark_complete(); });
 
@@ -3994,6 +4037,11 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
 
+    if (!accessor.InProcessing()) {
+        LOG(ERROR) << "key=" << key << ", error=no_primary_write_in_progress";
+        return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+    }
+
     auto processing_rep = metadata.GetFirstReplica([replica_type](
                                                        const Replica& replica) {
         if (replica_type == ReplicaType::ALL) {
@@ -4009,6 +4057,9 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     }
 
     auto target_pred = [replica_type](const Replica& r) {
+        if (!r.is_processing()) {
+            return false;
+        }
         if (replica_type == ReplicaType::ALL) {
             return r.is_memory_replica() || r.is_nof_replica();
         }
@@ -4231,8 +4282,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     if (enable_oplog_) {
                         return tl::make_unexpected(
                             ErrorCode::OBJECT_ALREADY_EXISTS);
-                    } else if (CleanupStaleHandles(it->second, alive_clients,
-                                                   &shard)) {
+                    } else if (CleanupStaleHandles(tenant_state, it->second,
+                                                   alive_clients, &shard)) {
                         // EraseMetadata handles processing_keys,
                         // replication_tasks, offloading_tasks (with
                         // dec_refcnt), and promotion task cleanup.
@@ -4261,6 +4312,13 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 if (tenant_state.replication_tasks.count(key) > 0) {
                     LOG(INFO) << "key=" << key
                               << ", error=object_has_replication_task";
+                    return tl::make_unexpected(
+                        ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+                }
+
+                if (tenant_state.promotion_tasks.count(key) > 0) {
+                    LOG(INFO)
+                        << "key=" << key << ", error=object_has_promotion_task";
                     return tl::make_unexpected(
                         ErrorCode::OBJECT_HAS_REPLICATION_TASK);
                 }
@@ -5773,8 +5831,8 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                             ? ErrorCode::OBJECT_NOT_FOUND
                             : ErrorCode::OBJECT_ALREADY_EXISTS);
                     continue;
-                } else if (CleanupStaleHandles(it->second, alive_clients,
-                                               &shard)) {
+                } else if (CleanupStaleHandles(tenant_state, it->second,
+                                               alive_clients, &shard)) {
                     EraseMetadata(tenant_state, it, normalized_tenant,
                                   QuotaEraseMode::kFull, &shard);
                     if (tenant_state.Empty()) {
@@ -5862,8 +5920,44 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
     return results;
 }
 
+void MasterService::CancelPromotionTaskForRemovedReplicas(
+    TenantState& tenant_state, ObjectMetadata& metadata,
+    const std::vector<ReplicaID>& removed_replica_ids) {
+    if (removed_replica_ids.empty()) {
+        return;
+    }
+
+    auto task_it = tenant_state.promotion_tasks.find(metadata.user_key);
+    if (task_it == tenant_state.promotion_tasks.end() ||
+        task_it->second.alloc_id == 0 ||
+        std::find(removed_replica_ids.begin(), removed_replica_ids.end(),
+                  task_it->second.alloc_id) == removed_replica_ids.end()) {
+        return;
+    }
+
+    if (auto* source = metadata.GetReplicaByID(task_it->second.source_id);
+        source != nullptr) {
+        source->dec_refcnt();
+    }
+    const UUID holder_id = task_it->second.holder_id;
+    ErasePromotionTaskIfPresent(tenant_state, metadata.user_key,
+                                metadata.tenant_id);
+
+    // Best-effort cleanup of a task that may still be queued on the holder.
+    ScopedLocalDiskSegmentAccess local_disk_segment_access =
+        segment_manager_.getLocalDiskSegmentAccess();
+    auto& client_local_disk_segment =
+        local_disk_segment_access.getClientLocalDiskSegment();
+    auto segment_it = client_local_disk_segment.find(holder_id);
+    if (segment_it != client_local_disk_segment.end()) {
+        MutexLocker locker(&segment_it->second->offloading_mutex_);
+        segment_it->second->promotion_objects.erase(
+            metadata.tenant_id.MakeScopedKey(metadata.user_key));
+    }
+}
+
 bool MasterService::CleanupStaleHandles(
-    ObjectMetadata& metadata,
+    TenantState& tenant_state, ObjectMetadata& metadata,
     const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients,
     MetadataShardAccessorRW* shard) {
     bool had_completed_disk = metadata.HasReplica([](const Replica& r) {
@@ -5872,13 +5966,18 @@ bool MasterService::CleanupStaleHandles(
     // Remove those with invalid allocators (memory replicas on unmounted
     // segments) and local_disk replicas whose owner client is no longer alive.
     const uint64_t before_charge = CompletedMemoryQuotaCharge(metadata);
+    std::vector<ReplicaID> removed_replica_ids;
     EraseReplicasWithCacheTotalAccounting(
-        metadata, [&alive_clients](const Replica& replica) {
+        metadata,
+        [&alive_clients](const Replica& replica) {
             return (replica.has_invalid_mem_handle() ||
                     replica.has_invalid_nof_handle() ||
                     replica.has_stale_local_disk_client(alive_clients)) &&
                    replica.is_completed();
-        });
+        },
+        &removed_replica_ids);
+    CancelPromotionTaskForRemovedReplicas(tenant_state, metadata,
+                                          removed_replica_ids);
     const uint64_t after_charge = CompletedMemoryQuotaCharge(metadata);
     if (before_charge > after_charge) {
         ReleaseCommittedQuotaCharge(metadata, before_charge - after_charge);
@@ -6592,6 +6691,7 @@ size_t MasterService::RunPromotionCandidateRetry(size_t max_shards_to_scan) {
                     auto meta_it = tenant_state.metadata.find(key);
                     if (meta_it == tenant_state.metadata.end() ||
                         !meta_it->second.IsValid() ||
+                        tenant_state.processing_keys.count(key) > 0 ||
                         tenant_state.promotion_tasks.count(key) > 0 ||
                         meta_it->second.HasReplica(
                             &Replica::fn_is_memory_replica) ||
@@ -6685,6 +6785,13 @@ MasterService::PromotionQueueResult MasterService::TryPushPromotionQueue(
     }
     auto& metadata = accessor.Get();
     auto& tenant_state = accessor.GetTenantState();
+
+    // A primary Put/Upsert owns all PROCESSING replicas while the key is in
+    // processing_keys. Promotion must not establish a second owner.
+    if (accessor.InProcessing()) {
+        EraseCandidate(tenant_state, key);
+        return PromotionQueueResult::kAlreadyInFlight;
+    }
 
     // Dedup: don't queue twice if a promotion is already in flight or if a
     // MEMORY replica has appeared since GetReplicaList observed only-disk.
@@ -6819,6 +6926,10 @@ auto MasterService::PromotionAllocStart(
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
     auto& metadata = accessor.Get();
+
+    if (accessor.InProcessing()) {
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    }
 
     // Verify the in-flight task still exists before allocating. The
     // reaper can sweep it between the holder's heartbeat and this
