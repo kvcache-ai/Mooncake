@@ -39,7 +39,7 @@ import hashlib
 import sys
 import time
 
-from mooncake.store import (
+from mooncake_store_rs.store import (
     MooncakeDistributedStore,
     MooncakeHostMemAllocator,
     ReplicateConfig,

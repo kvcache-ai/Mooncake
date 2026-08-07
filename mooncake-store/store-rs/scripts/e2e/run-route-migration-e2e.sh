@@ -520,7 +520,7 @@ import sys
 import time
 import urllib.request
 
-from mooncake.store import MooncakeDistributedStore, ReplicateConfig
+from mooncake_store_rs.store import MooncakeDistributedStore, ReplicateConfig
 
 admin_url = sys.argv[1]
 redis_url = sys.argv[2]
