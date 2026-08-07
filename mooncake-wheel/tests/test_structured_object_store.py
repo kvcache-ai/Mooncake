@@ -3055,11 +3055,12 @@ def test_dataproto_helper_jagged_nested_batch_tensor_roundtrip() -> None:
     view = transfer.dataproto_manifest_view(ref)
 
     field_spec = view["batch_fields"]["tokens"]["spec"]
-    assert field_spec == {
-        "encoding": "torch_tensor",
-        "dtype": "torch.int64",
-        "nested": True,
-    }
+    assert field_spec["encoding"] == "torch_tensor"
+    assert field_spec["dtype"] == "torch.int64"
+    assert field_spec["nested"] is True
+    assert field_spec["format"] in {"tensor_parts", "torch_save"}
+    if field_spec["format"] == "tensor_parts":
+        assert len(field_spec["part_bytes"]) == 2
 
     for selection, expected_rows in (
         (None, rows),
@@ -3073,6 +3074,20 @@ def test_dataproto_helper_jagged_nested_batch_tensor_roundtrip() -> None:
         assert len(result) == len(expected_rows)
         for actual, expected in zip(result.unbind(), expected_rows):
             assert torch.equal(actual, expected)
+
+    matrix_rows = [
+        torch.arange(6, dtype=torch.int64).reshape(2, 3),
+        torch.arange(10, dtype=torch.int64).reshape(2, 5),
+    ]
+    matrix = torch.nested.as_nested_tensor(matrix_rows, layout=torch.jagged)
+    matrix_ref = transfer.put_dataproto(SimpleDataProto(batch={"position_ids": matrix}))
+    matrix_result = transfer.get_dataproto(matrix_ref)["batch"]["position_ids"]
+
+    assert matrix_result.is_nested
+    assert matrix_result.layout == torch.jagged
+    assert matrix_result._ragged_idx == 2
+    for actual, expected in zip(matrix_result.unbind(), matrix_rows):
+        assert torch.equal(actual, expected)
 
 
 def _assert_tensor_object_equal(actual, expected) -> None:
