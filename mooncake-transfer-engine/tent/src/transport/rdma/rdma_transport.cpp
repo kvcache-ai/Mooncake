@@ -654,8 +654,9 @@ int RdmaTransport::onSetupRdmaConnections(const BootstrapDesc& peer_desc,
     }
     auto index = context_name_lookup_[local_nic_name];
     auto context = context_set_[index];
-    if (context->status() != RdmaContext::DEVICE_ENABLED &&
-        context->status() != RdmaContext::DEVICE_PAUSED) {
+    auto ctx_status = context->status();
+    if (ctx_status != RdmaContext::DEVICE_ENABLED &&
+        ctx_status != RdmaContext::DEVICE_PAUSED) {
         std::stringstream ss;
         ss << "Device is down: " << peer_desc.local_nic_path;
         LOG(ERROR) << ss.str();
