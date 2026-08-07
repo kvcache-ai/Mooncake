@@ -19,6 +19,7 @@
 #include "real_client.h"
 #include "registered_pinned_memory.h"
 #include "client_buffer.h"
+#include "egm_store_pool.h"
 #include "replica_selection.h"
 #include "common.h"
 #include "config.h"
@@ -728,7 +729,12 @@ RealClient::~RealClient() {
     }
     // Ensure resources are cleaned even if not explicitly closed
     stop_http_server();
-    tearDownAll_internal();
+    auto teardown = tearDownAll_internal();
+    if (!teardown && egm_store_pool_) {
+        LOG(ERROR) << "EGM Store Pool cleanup is incomplete; retaining its "
+                      "owners for process lifetime";
+        (void)egm_store_pool_.release();
+    }
 }
 
 std::shared_ptr<RealClient> RealClient::create() {
@@ -761,6 +767,25 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     bool enable_ssd_offload, bool start_offload_rpc_server,
     const std::string &ssd_offload_path, const std::string &tenant_id,
     bool enable_client_http_server, int client_http_port) {
+    return setup_internal_impl(
+        local_hostname, metadata_server, global_segment_size, local_buffer_size,
+        protocol, rdma_devices, master_server_addr, transfer_engine,
+        ipc_socket_path, local_rpc_port, enable_ssd_offload,
+        start_offload_rpc_server, ssd_offload_path, tenant_id,
+        enable_client_http_server, client_http_port, false);
+}
+
+tl::expected<void, ErrorCode> RealClient::setup_internal_impl(
+    const std::string &local_hostname, const std::string &metadata_server,
+    size_t global_segment_size, size_t local_buffer_size,
+    const std::string &protocol, const std::string &rdma_devices,
+    const std::string &master_server_addr,
+    const std::shared_ptr<TransferEngine> &transfer_engine,
+    const std::string &ipc_socket_path, int local_rpc_port,
+    bool enable_ssd_offload, bool start_offload_rpc_server,
+    const std::string &ssd_offload_path, const std::string &tenant_id,
+    bool enable_client_http_server, int client_http_port,
+    bool force_manual_nvlink) {
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
     const bool should_use_hugepage =
@@ -803,10 +828,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         this->local_hostname = local_hostname;
         this->local_rpc_addr = buildHostNameWithPort(
             getHostNameWithoutPort(hostname), local_rpc_port);
-        auto client_opt = mooncake::Client::Create(
+        auto client_opt = mooncake::Client::CreateInternal(
             this->local_hostname, metadata_server, protocol, device_name,
             master_server_addr, transfer_engine, {{"client_mode", "real"}},
-            tenant_id);
+            tenant_id, force_manual_nvlink);
         if (!client_opt) {
             LOG(ERROR) << "Failed to create client";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -841,10 +866,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             this->local_hostname = buildHostNameWithPort(hostname, port);
             this->local_rpc_addr =
                 buildHostNameWithPort(hostname, local_rpc_port);
-            auto client_opt = mooncake::Client::Create(
+            auto client_opt = mooncake::Client::CreateInternal(
                 this->local_hostname, metadata_server, protocol, device_name,
                 master_server_addr, transfer_engine, {{"client_mode", "real"}},
-                tenant_id);
+                tenant_id, force_manual_nvlink);
             if (client_opt) {
                 client_ = *client_opt;
                 success = true;
@@ -1240,8 +1265,67 @@ inline std::optional<int> get_config_int(const ConfigDict &config,
 }
 }  // namespace
 
+tl::expected<void, ErrorCode> RealClient::setup_egm_store_pool(
+    const EgmStorePoolOptions &options, size_t global_segment_size) {
+    if (!client_ || egm_store_pool_) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    EgmStorePoolHooks hooks;
+    hooks.mount = [client = client_](
+                      const UUID &segment_id, void *base,
+                      size_t length) -> EgmStorePoolResult<void> {
+        auto result =
+            client->MountEgmStorePoolSegment(segment_id, base, length);
+        if (!result) {
+            return tl::make_unexpected(toString(result.error()));
+        }
+        return {};
+    };
+    hooks.unmount =
+        [client = client_](const UUID &segment_id) -> EgmStorePoolResult<void> {
+        auto result = client->UnmountSegmentById(segment_id);
+        if (!result) {
+            return tl::make_unexpected(toString(result.error()));
+        }
+        return {};
+    };
+
+    auto pool = std::make_unique<EgmStorePool>(
+        MakeNvlinkHostNumaHooks(std::move(hooks)));
+    auto setup = pool->Setup(options, protocol, global_segment_size, 0,
+                             static_cast<size_t>(globalConfig().max_mr_size));
+    if (!setup) {
+        // The underlying Client is already initialized even if the pool
+        // rolled back completely. Retain the pool marker so another setup is
+        // rejected until close() tears down that Client.
+        egm_store_pool_ = std::move(pool);
+        LOG(ERROR) << "EGM Store Pool setup failed: " << setup.error();
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    egm_store_pool_ = std::move(pool);
+    return {};
+}
+
+tl::expected<void, ErrorCode> RealClient::teardown_egm_store_pool() {
+    if (!egm_store_pool_) return {};
+    auto teardown = egm_store_pool_->Teardown();
+    if (!teardown) {
+        LOG(ERROR) << "EGM Store Pool teardown failed: " << teardown.error();
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    egm_store_pool_.reset();
+    return {};
+}
+
 tl::expected<void, ErrorCode> RealClient::setup_internal(
     const ConfigDict &config) {
+    if (egm_store_pool_) {
+        LOG(ERROR) << "Refusing setup while EGM Store Pool ownership is active "
+                      "or cleanup-pending; close the client first";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
     // Extract required parameters (no defaults)
     std::string local_hostname = get_config(config, CONFIG_KEY_LOCAL_HOSTNAME);
     std::string metadata_server =
@@ -1319,11 +1403,28 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
     int client_http_port = client_http_port_opt.value();
 
-    return setup_internal(local_hostname, metadata_server, global_segment_size,
-                          local_buffer_size, protocol, rdma_devices,
-                          master_server_addr, nullptr, ipc_socket_path, 50052,
-                          enable_ssd_offload, true, ssd_offload_path, tenant_id,
-                          enable_client_http_server, client_http_port);
+    auto egm_options = ParseEgmStorePoolOptions(config);
+    if (!egm_options) {
+        LOG(ERROR) << "Invalid EGM Store Pool configuration: "
+                   << egm_options.error();
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto egm_validation = ValidateEgmStorePoolOptions(
+        *egm_options, protocol, global_segment_size, local_buffer_size);
+    if (!egm_validation) {
+        LOG(ERROR) << "Invalid EGM Store Pool configuration: "
+                   << egm_validation.error();
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto setup = setup_internal_impl(
+        local_hostname, metadata_server,
+        egm_options->enabled ? 0 : global_segment_size, local_buffer_size,
+        protocol, rdma_devices, master_server_addr, nullptr, ipc_socket_path,
+        50052, enable_ssd_offload, true, ssd_offload_path, tenant_id,
+        enable_client_http_server, client_http_port, egm_options->enabled);
+    if (!setup || !egm_options->enabled) return setup;
+    return setup_egm_store_pool(*egm_options, global_segment_size);
 }
 
 tl::expected<void, ErrorCode> RealClient::initAll_internal(
@@ -1347,6 +1448,9 @@ int RealClient::initAll(const std::string &protocol_,
 }
 
 tl::expected<void, ErrorCode> RealClient::tearDownAll_internal() {
+    auto egm_teardown = teardown_egm_store_pool();
+    if (!egm_teardown) return egm_teardown;
+
     // Ensure cleanup executes once across destructor/close/signal paths
     bool expected = false;
     if (!closed_.compare_exchange_strong(expected, true,

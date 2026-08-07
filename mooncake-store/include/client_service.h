@@ -762,14 +762,31 @@ class Client {
                                     uint64_t quota_bytes = 0);
 
    private:
+    friend class RealClient;
+
+    // EGM setup supplies the UUID before publication so rollback can unmount
+    // an ambiguous Master RPC and then retry Transfer Engine cleanup safely.
+    tl::expected<void, ErrorCode> MountEgmStorePoolSegment(
+        const UUID& segment_id, const void* buffer, size_t size);
+
+    static std::optional<std::shared_ptr<Client>> CreateInternal(
+        const std::string& local_hostname,
+        const std::string& metadata_connstring, const std::string& protocol,
+        const std::optional<std::string>& device_names,
+        const std::string& master_server_entry,
+        const std::shared_ptr<TransferEngine>& transfer_engine,
+        std::map<std::string, std::string> labels, const std::string& tenant_id,
+        bool force_manual_nvlink);
+
     /**
      * @brief Internal helper functions for initialization and data transfer
      */
     ErrorCode ConnectToMaster(const std::string& master_server_entry);
-    ErrorCode InitTransferEngine(
-        const std::string& local_hostname,
-        const std::string& metadata_connstring, const std::string& protocol,
-        const std::optional<std::string>& device_names);
+    ErrorCode InitTransferEngine(const std::string& local_hostname,
+                                 const std::string& metadata_connstring,
+                                 const std::string& protocol,
+                                 const std::optional<std::string>& device_names,
+                                 bool force_manual_nvlink);
     void InitTransferSubmitter();
     ErrorCode TransferData(const Replica::Descriptor& replica_descriptor,
                            std::vector<Slice>& slices,

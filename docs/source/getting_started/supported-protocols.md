@@ -198,13 +198,43 @@ The following protocols are available at the C++ Transfer Engine level for speci
 - NVIDIA MNNVL hardware
 - Compiled with `USE_MNNVL=ON`
 
+Mooncake Store providers can use this transport for a default-off,
+EGM-backed DRAM tier. Configure the Python `setup(config)` overload with
+`enable_egm_store_pool=true`, `protocol="nvlink"`,
+`global_segment_size>0`, and `local_buffer_size=0`. `egm_numa_nodes` accepts
+`auto` (the default, using each visible GPU's CUDA
+`CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID`) or a comma-separated node list. Consumers
+do not enable the pool; they use the ordinary `nvlink` protocol to access the
+provider's mounted segments. An ordinary Consumer must set
+`MC_MS_AUTO_DISC=1`; when RDMA HCAs are present it must also set
+`MC_FORCE_MNNVL=1` so discovery selects MNNVL. The requested capacity is
+rounded down to the common Store/CUDA allocation alignment before it is
+distributed across nodes and split by `max_mr_size`.
+
 **Configuration:**
 ```bash
-# Set MC_FORCE_MNNVL=true to use MNNVL even when RDMA NICs are present
-export MC_FORCE_MNNVL=true
+# Consumer: enter auto-discovery and select MNNVL even when RDMA NICs exist.
+export MC_MS_AUTO_DISC=1
+export MC_FORCE_MNNVL=1
 ```
 
-**Note:** When `protocol="rdma"` is set and RDMA NICs exist, you must explicitly set `MC_FORCE_MNNVL=true` to use MNNVL instead of RDMA. If no RDMA HCA is detected, MNNVL will be used automatically.
+```python
+consumer.setup({
+    "local_hostname": "10.192.8.58:12400",
+    "metadata_server": "http://10.192.8.81:8079/metadata",
+    "master_server_addr": "10.192.8.81:50051",
+    "protocol": "nvlink",
+    "global_segment_size": "0",
+    "local_buffer_size": "0",
+    "rdma_devices": "",
+    "enable_egm_store_pool": "false",
+})
+```
+
+**Note:** With `MC_MS_AUTO_DISC=0`, or with it unset, an ordinary
+`protocol="nvlink"` Consumer can return `unsupported_protocol`; only an EGM
+Provider forces manual NVLink installation. `MC_FORCE_MNNVL=1` is separately
+required to prevent auto-discovery from selecting RDMA when HCAs are present.
 
 ### MUSA Transport (musa)
 

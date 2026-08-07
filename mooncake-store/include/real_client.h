@@ -32,6 +32,9 @@
 namespace mooncake {
 
 class RealClient;
+class EgmStorePool;
+class EgmStorePoolTestPeer;
+struct EgmStorePoolOptions;
 class RegisteredPinnedRegion;
 class UdsAcceptor;
 class UdsConnection;
@@ -1056,6 +1059,23 @@ class RealClient : public PyClient {
         size_t local_buffer_size);
 
    private:
+    friend class EgmStorePoolTestPeer;
+
+    tl::expected<void, ErrorCode> setup_internal_impl(
+        const std::string &local_hostname, const std::string &metadata_server,
+        size_t global_segment_size, size_t local_buffer_size,
+        const std::string &protocol, const std::string &rdma_devices,
+        const std::string &master_server_addr,
+        const std::shared_ptr<TransferEngine> &transfer_engine,
+        const std::string &ipc_socket_path, int local_rpc_port,
+        bool enable_ssd_offload, bool start_offload_rpc_server,
+        const std::string &ssd_offload_path, const std::string &tenant_id,
+        bool enable_client_http_server, int client_http_port,
+        bool force_manual_nvlink);
+    tl::expected<void, ErrorCode> setup_egm_store_pool(
+        const EgmStorePoolOptions &options, size_t global_segment_size);
+    tl::expected<void, ErrorCode> teardown_egm_store_pool();
+
     std::unordered_map<std::string, MountedSegmentRecord>
         mounted_segment_records_;
     std::mutex mounted_segment_records_mutex_;
@@ -1063,6 +1083,8 @@ class RealClient : public PyClient {
     std::unordered_map<std::string, AllocatedSegmentRecord>
         allocated_segment_records_;
     std::mutex allocated_segment_records_mutex_;
+
+    std::unique_ptr<EgmStorePool> egm_store_pool_;
 
     void ReleaseMountedSegmentRecord(const std::string &segment_id);
     void ReleaseAllMountedSegmentRecords();

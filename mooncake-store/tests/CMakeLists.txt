@@ -36,6 +36,10 @@ endfunction()
 add_store_test(buffer_allocator_test buffer_allocator_test.cpp)
 add_store_test(runtime_accelerator_test runtime_accelerator_test.cpp)
 add_store_test(registered_pinned_memory_test registered_pinned_memory_test.cpp)
+add_store_test(egm_store_pool_test egm_store_pool_test.cpp)
+target_include_directories(egm_store_pool_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src)
+set_tests_properties(egm_store_pool_test PROPERTIES LABELS egm_store_pool_unit)
 add_store_test(allocation_strategy_test allocation_strategy_test.cpp)
 add_store_test(replica_selection_test replica_selection_test.cpp)
 add_test(

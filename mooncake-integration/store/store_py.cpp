@@ -405,6 +405,13 @@ class MooncakeStorePyWrapper {
 
     MooncakeStorePyWrapper() = default;
 
+    int ensure_can_setup() const {
+        if (!store_) return 0;
+        LOG(ERROR) << "setup rejected while a native client is active or "
+                      "cleanup-pending; call close() first";
+        return to_py_ret(ErrorCode::INVALID_PARAMS);
+    }
+
     // Helper to initialize real client and register it
     std::shared_ptr<RealClient> init_real_client() {
         auto &resource_tracker = ResourceTracker::getInstance();
@@ -2202,6 +2209,8 @@ PYBIND11_MODULE(store, m) {
                const std::string &tenant_id = "default",
                bool enable_client_http_server = false,
                int client_http_port = DEFAULT_CLIENT_HTTP_PORT) {
+                const int guard_rc = self.ensure_can_setup();
+                if (guard_rc != 0) return guard_rc;
                 auto real_client = self.init_real_client();
                 std::shared_ptr<mooncake::TransferEngine> transfer_engine =
                     nullptr;
@@ -2227,6 +2236,8 @@ PYBIND11_MODULE(store, m) {
         .def(
             "setup",
             [](MooncakeStorePyWrapper &self, const py::dict &config_dict) {
+                const int guard_rc = self.ensure_can_setup();
+                if (guard_rc != 0) return guard_rc;
                 auto real_client = self.init_real_client();
 
                 // Convert py::dict to ConfigDict (all values as strings)
@@ -2250,6 +2261,11 @@ PYBIND11_MODULE(store, m) {
             "  local_buffer_size: Local buffer size (default 16MB).\n"
             "  protocol: Transfer protocol (default 'tcp').\n"
             "  rdma_devices: RDMA device list.\n"
+            "  enable_egm_store_pool: Use EGM DRAM for the global Store pool "
+            "(default false; requires protocol 'nvlink', "
+            "global_segment_size>0, and local_buffer_size=0).\n"
+            "  egm_numa_nodes: Provider NUMA nodes ('auto' or comma-separated "
+            "IDs; default 'auto').\n"
             "  master_server_addr: Master server address.\n"
             "  ipc_socket_path: IPC socket path.\n"
             "  enable_ssd_offload: Enable SSD offload (default false).\n"
@@ -2263,6 +2279,8 @@ PYBIND11_MODULE(store, m) {
             "setup_dummy",
             [](MooncakeStorePyWrapper &self, size_t mem_pool_size,
                size_t local_buffer_size, const std::string &server_address) {
+                const int guard_rc = self.ensure_can_setup();
+                if (guard_rc != 0) return guard_rc;
                 auto &resource_tracker = ResourceTracker::getInstance();
                 self.use_dummy_client_ = true;
                 self.store_ = std::make_shared<DummyClient>();
@@ -2379,13 +2397,20 @@ PYBIND11_MODULE(store, m) {
             py::arg("keys"),
             "Check if multiple objects exist. Returns list of results: 1 if "
             "exists, 0 if not exists, -1 if error")
-        .def("close",
-             [](MooncakeStorePyWrapper &self) {
-                 if (!self.store_) return 0;
-                 int rc = self.store_->tearDownAll();
-                 self.store_.reset();
-                 return rc;
-             })
+        .def(
+            "close",
+            [](MooncakeStorePyWrapper &self) {
+                if (!self.store_) return 0;
+                int rc = self.store_->tearDownAll();
+                if (rc == 0) {
+                    self.store_.reset();
+                    self.real_client_.reset();
+                    self.use_dummy_client_ = false;
+                }
+                return rc;
+            },
+            "Close the store. On cleanup failure the object is retained so "
+            "close() can be retried.")
         .def("health_check", &MooncakeStorePyWrapper::health_check,
              "Health check for store connectivity. "
              "Returns 0 if healthy, 1 if not initialized/closed, "

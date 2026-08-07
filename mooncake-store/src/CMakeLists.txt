@@ -82,6 +82,7 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     dummy_client.cpp
     shm_helper.cpp
     file_storage.cpp
+    egm_store_pool.cpp
     device/accelerator_device.cpp
     device/accelerator_registry.cpp
     device/runtime_accelerator.cpp
