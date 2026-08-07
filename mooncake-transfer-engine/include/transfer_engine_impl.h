@@ -124,6 +124,9 @@ class TransferEngineImpl {
 
     int unregisterLocalMemory(void* addr, bool update_metadata = true);
 
+    void* allocateManagedBuffer(size_t length);
+    int releaseManagedBuffer(void* addr);
+
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest>& entries) {
         Status s = multi_transports_->submitTransfer(batch_id, entries);

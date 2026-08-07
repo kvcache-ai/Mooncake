@@ -128,6 +128,36 @@ struct GlobalConfig {
     // + 1. num_lag_ports is queried from hardware; if the device is not in LAG
     // mode the setting is a no-op. Requires USE_MLX5DV.
     bool mlx5_qp_lag_port_balance = false;
+    // Per-peer RDMA CtrlChannel (two-sided notify). MC_RDMA_NOTIFY_ENABLED.
+    bool rdma_notify_enabled = true;
+    // Ctrl recv/send slot count and slot size. MC_RDMA_NOTIFY_RECV_COUNT /
+    // MC_RDMA_NOTIFY_BUFFER_SIZE.
+    size_t rdma_notify_recv_count = 64;
+    size_t rdma_notify_buffer_size = 4096;
+    // Local pending SEND cap; actual cap is min(this, peer notify_rq_depth).
+    // MC_RDMA_NOTIFY_MAX_PENDING_SENDS.
+    size_t rdma_notify_max_pending_sends = 64;
+    // Fall back to OOB RPC notify when CtrlChannel is unavailable.
+    // MC_RDMA_NOTIFY_OOB_FALLBACK.
+    bool rdma_notify_oob_fallback = true;
+    // Credit admission + SESSION/GRANT on CtrlChannel. MC_RDMA_CREDIT_ENABLED.
+    bool rdma_credit_enabled = true;
+    // One-sided sliding window (bytes / request slots). 0 disables that resource.
+    uint64_t rdma_credit_window_bytes = 256ull << 20;  // 256 MiB
+    uint64_t rdma_credit_window_requests = 4096;
+    // Pending WAITING timeout; 0 = never. MC_RDMA_CREDIT_QUEUE_TIMEOUT_MS.
+    uint64_t rdma_credit_queue_timeout_ms = 0;
+    // One-sided-only fail-open when ctrl unavailable. MC_RDMA_CTRL_FAIL_OPEN.
+    bool rdma_ctrl_fail_open = true;
+    // Two-sided msg QP / bounce capability. MC_RDMA_MSG_ENABLED.
+    bool rdma_msg_enabled = true;
+    // Prefer managed two-sided when peer supports it. MC_RDMA_MSG_DEFAULT.
+    bool rdma_msg_default = true;
+    // Bounce slot size including msg header. MC_RDMA_MSG_SLOT_SIZE.
+    size_t rdma_msg_slot_size = (64 * 1024) + 64;
+    // Base / max posted bounce slots. MC_RDMA_MSG_POOL_BASE / _MAX.
+    size_t rdma_msg_pool_base = 64;
+    size_t rdma_msg_pool_max = 256;
     // ib_pci_relaxed_ordering_mode: 0: off, 1: on if supported, 2: auto
     int ib_pci_relaxed_ordering_mode = 1;
     bool ascend_use_fabric_mem = false;

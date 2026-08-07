@@ -27,7 +27,9 @@
 #include <sstream>
 #endif
 
+#include "config.h"
 #include "transfer_metadata_plugin.h"
+#include "transport/rdma_transport/rdma_transport.h"
 #include "transport/transport.h"
 #ifdef USE_BAREX
 #include "transport/barex_transport/barex_transport.h"
@@ -508,6 +510,23 @@ std::string TransferEngineImpl::getLocalIpAndPort() {
            std::to_string(metadata_->localRpcMeta().rpc_port);
 }
 
+void* TransferEngineImpl::allocateManagedBuffer(size_t length) {
+    auto* transport = getTransport("rdma");
+    auto* rdma = dynamic_cast<RdmaTransport*>(transport);
+    if (!rdma) {
+        LOG(ERROR) << "allocateManagedBuffer requires RDMA transport";
+        return nullptr;
+    }
+    return rdma->allocateManagedBuffer(length);
+}
+
+int TransferEngineImpl::releaseManagedBuffer(void* addr) {
+    auto* transport = getTransport("rdma");
+    auto* rdma = dynamic_cast<RdmaTransport*>(transport);
+    if (!rdma) return ERR_DEVICE_NOT_FOUND;
+    return rdma->releaseManagedBuffer(addr);
+}
+
 int TransferEngineImpl::getNotifies(
     std::vector<TransferMetadata::NotifyDesc>& notifies) {
     return metadata_->getNotifies(notifies);
@@ -520,16 +539,29 @@ int TransferEngineImpl::sendNotifyByID(
         LOG(ERROR) << "sendNotifyByID: invalid segment ID " << target_id;
         return ERR_METADATA;
     }
-    Transport::NotifyDesc peer_desc;
-    int ret = metadata_->sendNotify(desc->name, notify_msg, peer_desc);
-    return ret;
+    return sendNotifyByName(desc->name, std::move(notify_msg));
 }
 
 int TransferEngineImpl::sendNotifyByName(
     std::string remote_agent, TransferMetadata::NotifyDesc notify_msg) {
+    if (globalConfig().rdma_notify_enabled) {
+        auto *transport = getTransport("rdma");
+        auto *rdma = dynamic_cast<RdmaTransport *>(transport);
+        if (rdma) {
+            int ret = rdma->sendRdmaNotify(remote_agent, notify_msg);
+            if (ret == 0) return 0;
+            if (!globalConfig().rdma_notify_oob_fallback) {
+                LOG(ERROR) << "sendNotifyByName: RDMA notify failed for "
+                           << remote_agent << " ret=" << ret
+                           << " (OOB fallback disabled)";
+                return ret;
+            }
+            VLOG(1) << "sendNotifyByName: RDMA notify unavailable for "
+                    << remote_agent << ", falling back to OOB";
+        }
+    }
     Transport::NotifyDesc peer_desc;
-    int ret = metadata_->sendNotify(remote_agent, notify_msg, peer_desc);
-    return ret;
+    return metadata_->sendNotify(remote_agent, notify_msg, peer_desc);
 }
 
 int TransferEngineImpl::probePeerAliveByID(SegmentID target_id) {

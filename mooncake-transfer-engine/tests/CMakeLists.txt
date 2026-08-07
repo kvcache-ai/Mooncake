@@ -56,6 +56,28 @@ add_executable(rdma_large_mr_test ${WORKSPACE}/rdma_large_mr_test.cpp)
 target_link_libraries(rdma_large_mr_test PUBLIC transfer_engine gtest gtest_main )
 # add_test(NAME rdma_large_mr_test COMMAND rdma_large_mr_test)  # needs an RDMA dev + metadata server
 
+# CtrlChannel RDMA notify correctness + smoke perf. Self-skips without RDMA.
+add_executable(rdma_notify_test ${WORKSPACE}/rdma_notify_test.cpp)
+target_link_libraries(rdma_notify_test PUBLIC transfer_engine gflags::gflags
+                                              glog::glog gtest)
+add_test(NAME rdma_notify_test COMMAND rdma_notify_test)
+set_tests_properties(rdma_notify_test PROPERTIES LABELS "rdma")
+
+add_executable(ctrl_frame_test ${WORKSPACE}/ctrl_frame_test.cpp)
+target_link_libraries(ctrl_frame_test PUBLIC transfer_engine gtest gtest_main)
+add_test(NAME ctrl_frame_test COMMAND ctrl_frame_test)
+
+add_executable(sender_credit_test ${WORKSPACE}/sender_credit_test.cpp)
+target_link_libraries(sender_credit_test PUBLIC transfer_engine gtest
+                                                gtest_main)
+add_test(NAME sender_credit_test COMMAND sender_credit_test)
+
+add_executable(rdma_twosided_test ${WORKSPACE}/rdma_twosided_test.cpp)
+target_link_libraries(rdma_twosided_test PUBLIC transfer_engine gflags::gflags
+                                                glog::glog gtest)
+add_test(NAME rdma_twosided_test COMMAND rdma_twosided_test)
+set_tests_properties(rdma_twosided_test PROPERTIES LABELS "rdma")
+
 # This test verifies endpoint re-establishment in RDMATransport.
 add_executable(rdma_endpoint_reestablish_test
                ${WORKSPACE}/rdma_endpoint_reestablish_test.cpp)

@@ -528,6 +528,115 @@ void loadGlobalConfig(GlobalConfig& config) {
                            config.track_rdma_posted_slices);
     }
 
+    const char* rdma_notify_enabled_env = std::getenv("MC_RDMA_NOTIFY_ENABLED");
+    if (rdma_notify_enabled_env) {
+        parseBoolConfigEnv(rdma_notify_enabled_env, "MC_RDMA_NOTIFY_ENABLED",
+                           config.rdma_notify_enabled);
+    }
+    const char* rdma_notify_recv_count_env =
+        std::getenv("MC_RDMA_NOTIFY_RECV_COUNT");
+    if (rdma_notify_recv_count_env) {
+        int val = atoi(rdma_notify_recv_count_env);
+        if (val > 0 && val <= 4096)
+            config.rdma_notify_recv_count = static_cast<size_t>(val);
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_RDMA_NOTIFY_RECV_COUNT";
+    }
+    const char* rdma_notify_buffer_size_env =
+        std::getenv("MC_RDMA_NOTIFY_BUFFER_SIZE");
+    if (rdma_notify_buffer_size_env) {
+        int val = atoi(rdma_notify_buffer_size_env);
+        if (val >= 256 && val <= 65536)
+            config.rdma_notify_buffer_size = static_cast<size_t>(val);
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_RDMA_NOTIFY_BUFFER_SIZE";
+    }
+    const char* rdma_notify_max_pending_sends_env =
+        std::getenv("MC_RDMA_NOTIFY_MAX_PENDING_SENDS");
+    if (rdma_notify_max_pending_sends_env) {
+        int val = atoi(rdma_notify_max_pending_sends_env);
+        if (val > 0 && val <= 4096)
+            config.rdma_notify_max_pending_sends = static_cast<size_t>(val);
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_RDMA_NOTIFY_MAX_PENDING_SENDS";
+    }
+    const char* rdma_notify_oob_fallback_env =
+        std::getenv("MC_RDMA_NOTIFY_OOB_FALLBACK");
+    if (rdma_notify_oob_fallback_env) {
+        parseBoolConfigEnv(rdma_notify_oob_fallback_env,
+                           "MC_RDMA_NOTIFY_OOB_FALLBACK",
+                           config.rdma_notify_oob_fallback);
+    }
+
+    const char* rdma_credit_enabled_env = std::getenv("MC_RDMA_CREDIT_ENABLED");
+    if (rdma_credit_enabled_env) {
+        parseBoolConfigEnv(rdma_credit_enabled_env, "MC_RDMA_CREDIT_ENABLED",
+                           config.rdma_credit_enabled);
+    }
+    const char* rdma_credit_window_bytes_env =
+        std::getenv("MC_RDMA_CREDIT_WINDOW_BYTES");
+    if (rdma_credit_window_bytes_env) {
+        config.rdma_credit_window_bytes =
+            std::strtoull(rdma_credit_window_bytes_env, nullptr, 10);
+    }
+    const char* rdma_credit_window_requests_env =
+        std::getenv("MC_RDMA_CREDIT_WINDOW_REQUESTS");
+    if (rdma_credit_window_requests_env) {
+        config.rdma_credit_window_requests =
+            std::strtoull(rdma_credit_window_requests_env, nullptr, 10);
+    }
+    const char* rdma_credit_queue_timeout_ms_env =
+        std::getenv("MC_RDMA_CREDIT_QUEUE_TIMEOUT_MS");
+    if (rdma_credit_queue_timeout_ms_env) {
+        config.rdma_credit_queue_timeout_ms =
+            std::strtoull(rdma_credit_queue_timeout_ms_env, nullptr, 10);
+    }
+    const char* rdma_ctrl_fail_open_env = std::getenv("MC_RDMA_CTRL_FAIL_OPEN");
+    if (rdma_ctrl_fail_open_env) {
+        parseBoolConfigEnv(rdma_ctrl_fail_open_env, "MC_RDMA_CTRL_FAIL_OPEN",
+                           config.rdma_ctrl_fail_open);
+    }
+    const char* rdma_msg_enabled_env = std::getenv("MC_RDMA_MSG_ENABLED");
+    if (rdma_msg_enabled_env) {
+        parseBoolConfigEnv(rdma_msg_enabled_env, "MC_RDMA_MSG_ENABLED",
+                           config.rdma_msg_enabled);
+    }
+    const char* rdma_msg_default_env = std::getenv("MC_RDMA_MSG_DEFAULT");
+    if (rdma_msg_default_env) {
+        parseBoolConfigEnv(rdma_msg_default_env, "MC_RDMA_MSG_DEFAULT",
+                           config.rdma_msg_default);
+    }
+    const char* rdma_msg_slot_size_env = std::getenv("MC_RDMA_MSG_SLOT_SIZE");
+    if (rdma_msg_slot_size_env) {
+        int val = atoi(rdma_msg_slot_size_env);
+        if (val >= 1024 && val <= (1 << 20))
+            config.rdma_msg_slot_size = static_cast<size_t>(val);
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_RDMA_MSG_SLOT_SIZE";
+    }
+    const char* rdma_msg_pool_base_env = std::getenv("MC_RDMA_MSG_POOL_BASE");
+    if (rdma_msg_pool_base_env) {
+        int val = atoi(rdma_msg_pool_base_env);
+        if (val > 0 && val <= 65536)
+            config.rdma_msg_pool_base = static_cast<size_t>(val);
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_RDMA_MSG_POOL_BASE";
+    }
+    const char* rdma_msg_pool_max_env = std::getenv("MC_RDMA_MSG_POOL_MAX");
+    if (rdma_msg_pool_max_env) {
+        int val = atoi(rdma_msg_pool_max_env);
+        if (val > 0 && val <= 65536)
+            config.rdma_msg_pool_max = static_cast<size_t>(val);
+        else
+            LOG(WARNING) << "Ignore value from environment variable "
+                            "MC_RDMA_MSG_POOL_MAX";
+    }
+
     const char* enable_parallel_reg_mr =
         std::getenv("MC_ENABLE_PARALLEL_REG_MR");
     if (enable_parallel_reg_mr) {
@@ -760,6 +869,27 @@ void dumpGlobalConfig() {
               << (config.log_rdma_slice_affinity ? "true" : "false");
     LOG(INFO) << "track_rdma_posted_slices = "
               << (config.track_rdma_posted_slices ? "true" : "false");
+    LOG(INFO) << "rdma_notify_enabled = "
+              << (config.rdma_notify_enabled ? "true" : "false");
+    LOG(INFO) << "rdma_notify_recv_count = " << config.rdma_notify_recv_count;
+    LOG(INFO) << "rdma_notify_buffer_size = " << config.rdma_notify_buffer_size;
+    LOG(INFO) << "rdma_notify_max_pending_sends = "
+              << config.rdma_notify_max_pending_sends;
+    LOG(INFO) << "rdma_notify_oob_fallback = "
+              << (config.rdma_notify_oob_fallback ? "true" : "false");
+    LOG(INFO) << "rdma_credit_enabled = "
+              << (config.rdma_credit_enabled ? "true" : "false");
+    LOG(INFO) << "rdma_credit_window_bytes = "
+              << config.rdma_credit_window_bytes;
+    LOG(INFO) << "rdma_credit_window_requests = "
+              << config.rdma_credit_window_requests;
+    LOG(INFO) << "rdma_msg_enabled = "
+              << (config.rdma_msg_enabled ? "true" : "false");
+    LOG(INFO) << "rdma_msg_default = "
+              << (config.rdma_msg_default ? "true" : "false");
+    LOG(INFO) << "rdma_msg_slot_size = " << config.rdma_msg_slot_size;
+    LOG(INFO) << "rdma_msg_pool_base = " << config.rdma_msg_pool_base;
+    LOG(INFO) << "rdma_msg_pool_max = " << config.rdma_msg_pool_max;
 }
 
 GlobalConfig& globalConfig() {
