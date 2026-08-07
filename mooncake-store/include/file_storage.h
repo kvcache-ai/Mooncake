@@ -1,9 +1,12 @@
 #pragma once
 
+#include <functional>
+
 #include "client_service.h"
 #include "client_buffer.h"
 #include "storage_backend.h"
 #include "pinned_buffer_pool.h"
+#include "thread_pool.h"
 
 namespace mooncake {
 
@@ -78,6 +81,24 @@ class FileStorage {
      */
     tl::expected<void, ErrorCode> OffloadObjects(
         const std::vector<OffloadTaskItem>& offloading_objects);
+
+    // Process one bucket's offload work: build the batch object, D2H-stage
+    // device slices, call BatchOffload, and report per-key failures.  Shared
+    // by the sequential and parallel (thread-pool) offload paths so the
+    // offload logic is defined exactly once.
+    //
+    // Returns tl::unexpected on a fatal error (KEYS_ULTRA_LIMIT or any error
+    // other than INVALID_READ); INVALID_READ and success return OK, with the
+    // affected keys appended to failed_tasks.  When failed_mutex is non-null
+    // (parallel path), failed_tasks is modified under that lock.
+    tl::expected<void, ErrorCode> ProcessOneBucket(
+        const std::vector<std::string>& keys,
+        const std::unordered_map<std::string, OffloadTaskItem>&
+            task_by_storage_key,
+        std::vector<OffloadTaskItem>& failed_tasks, Mutex* failed_mutex,
+        const std::function<ErrorCode(const std::vector<std::string>&,
+                                      std::vector<StorageObjectMetadata>&)>&
+            complete_handler);
 
     /**
      * @brief Classifies a BatchOffload error as affecting only the current
@@ -174,6 +195,11 @@ class FileStorage {
     std::thread client_buffer_gc_thread_;
     std::future<void> rescan_future_;
     std::atomic<bool> metadata_resync_pending_{false};
+
+    // Optional thread pool for parallel bucket writes during offload.
+    // Created when MC_OFFLOAD_WRITE_THREADS > 1; when nullptr (default),
+    // buckets are written sequentially (original behavior).
+    std::unique_ptr<ThreadPool> offload_write_pool_;
 };
 
 }  // namespace mooncake
