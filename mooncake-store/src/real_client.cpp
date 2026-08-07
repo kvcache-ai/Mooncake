@@ -5638,11 +5638,29 @@ void RealClient::dummy_client_monitor_func() {
         // Update the client status to NEED_REMOUNT
         if (!expired_clients.empty()) {
             for (auto &client_id : expired_clients) {
+                {
+                    std::shared_lock<std::shared_mutex> lock(
+                        dummy_client_mutex_);
+                    if (shm_contexts_.find(client_id) == shm_contexts_.end()) {
+                        LOG(INFO)
+                            << "client_id=" << client_id
+                            << ", action=shm_already_unmapped_by_other_path";
+                        continue;
+                    }
+                }
+
                 // Unmap mapped_shms associated with this client
+                tl::expected<void, ErrorCode> result;
                 if (globalConfig().ascend_agent_mode) {
-                    ascend_unmap_shm_internal(client_id);
+                    result = ascend_unmap_shm_internal(client_id);
                 } else {
-                    unmap_shm_internal(client_id);
+                    result = unmap_shm_internal(client_id);
+                }
+                if (!result) {
+                    // Client already unmapped (e.g., by other thread or earlier
+                    // cleanup)
+                    LOG(INFO) << "client_id=" << client_id
+                              << ", action=client_already_unmapped";
                 }
             }
         }
