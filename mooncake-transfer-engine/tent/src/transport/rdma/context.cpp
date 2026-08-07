@@ -283,6 +283,8 @@ static inline const std::string statusToString(
             return "DEVICE_ENABLED";
         case RdmaContext::DEVICE_DISABLED:
             return "DEVICE_DISABLED";
+        case RdmaContext::DEVICE_INITIALIZING:
+            return "DEVICE_INITIALIZING";
         case RdmaContext::DEVICE_PAUSED:
             return "DEVICE_PAUSED";
     }
@@ -302,7 +304,15 @@ RdmaContext::RdmaContext(RdmaTransport& transport)
 }
 
 RdmaContext::~RdmaContext() {
-    if (status_ != DEVICE_UNINIT) disable();
+    if (status_ == DEVICE_INITIALIZING) {
+        rollbackEnable();
+        return;
+    }
+    if (status_ != DEVICE_UNINIT || native_context_ || native_pd_ ||
+        event_fd_ >= 0 || !comp_channel_.empty() || !cq_list_.empty() ||
+        notify_cq_) {
+        disable();
+    }
 }
 
 int RdmaContext::construct(const std::string& device_name,
@@ -320,34 +330,40 @@ int RdmaContext::construct(const std::string& device_name,
 }
 
 int RdmaContext::enable() {
-    if (status_ != DEVICE_DISABLED) {
-        LOG(WARNING) << "RDMA context " << name() << " has been enabled";
-        return 0;
+    DeviceStatus expected = DEVICE_DISABLED;
+    if (!status_.compare_exchange_strong(expected, DEVICE_INITIALIZING)) {
+        if (expected == DEVICE_ENABLED || expected == DEVICE_PAUSED) {
+            LOG(WARNING) << "RDMA context " << name() << " has been enabled";
+            return 0;
+        }
+        LOG(ERROR) << "RDMA context " << name() << " cannot be enabled from "
+                   << statusToString(expected);
+        return -1;
     }
     if (openDevice(device_name_, params_->device.port)) {
         LOG(ERROR) << "Failed to open device [" << device_name_ << "] on port ["
                    << params_->device.port << "] with GID index ["
                    << params_->device.gid_index << "]";
-        disable();
+        rollbackEnable();
         return -1;
     }
 
     native_pd_ = verbs_.ibv_alloc_pd(native_context_);
     if (!native_pd_) {
         PLOG(ERROR) << "ibv_alloc_pd";
-        disable();
+        rollbackEnable();
         return -1;
     }
 
     event_fd_ = epoll_create1(0);
     if (event_fd_ < 0) {
         PLOG(ERROR) << "epoll_create1";
-        disable();
+        rollbackEnable();
         return -1;
     }
 
     if (joinNonblockingPollList(event_fd_, native_context_->async_fd)) {
-        disable();
+        rollbackEnable();
         return -1;
     }
 
@@ -358,12 +374,12 @@ int RdmaContext::enable() {
         comp_channel_[i] = verbs_.ibv_create_comp_channel(native_context_);
         if (!comp_channel_[i]) {
             PLOG(ERROR) << "ibv_create_comp_channel";
-            disable();
+            rollbackEnable();
             return -1;
         }
 
         if (joinNonblockingPollList(event_fd_, comp_channel_[i]->fd)) {
-            disable();
+            rollbackEnable();
             return -1;
         }
     }
@@ -372,7 +388,7 @@ int RdmaContext::enable() {
         auto cq = new RdmaCQ();
         int ret = cq->construct(this, params_->device.max_cqe, i);
         if (ret) {
-            disable();
+            rollbackEnable();
             return ret;
         }
         cq_list_.push_back(cq);
@@ -384,7 +400,7 @@ int RdmaContext::enable() {
                                            params_->device.num_cq_list);
     if (notify_ret) {
         LOG(ERROR) << "Failed to create notification CQ for " << device_name_;
-        disable();
+        rollbackEnable();
         return notify_ret;
     }
 
@@ -419,9 +435,7 @@ int RdmaContext::enable() {
     if (ret) {
         PLOG(ERROR) << "Failed to query port " << params_->device.port << " on "
                     << device_name_;
-        if (verbs_.ibv_close_device(native_context_)) {
-            PLOG(ERROR) << "ibv_close_device";
-        }
+        rollbackEnable();
         return -1;
     }
 
@@ -439,16 +453,34 @@ int RdmaContext::enable() {
 }
 
 int RdmaContext::disable() {
-    if (status_ == DEVICE_UNINIT || status_ == DEVICE_DISABLED) {
+    if (status_ == DEVICE_INITIALIZING) {
+        LOG(ERROR) << "RDMA context " << name()
+                   << " cannot be disabled while it is initializing";
+        return -1;
+    }
+    if (status_ == DEVICE_UNINIT && !native_context_ && !native_pd_ &&
+        event_fd_ < 0 && comp_channel_.empty() && cq_list_.empty() &&
+        !notify_cq_) {
         LOG(WARNING) << "RDMA context " << name() << " has been deconstructed";
         return 0;
     }
-    if (endpoint_store_->clear()) {
+    if (endpoint_store_ && endpoint_store_->clear()) {
         LOG(ERROR) << "Failed to destroy all endpoints for context " << name()
                    << "; preserving CQ, PD and device resources for retry";
         return -1;
     }
 
+    cleanupResources();
+    status_ = DEVICE_DISABLED;
+    return 0;
+}
+
+void RdmaContext::rollbackEnable() {
+    cleanupResources();
+    status_ = DEVICE_DISABLED;
+}
+
+void RdmaContext::cleanupResources() {
     for (auto& entry : mr_set_) {
         int ret = verbs_.ibv_dereg_mr(entry);
         if (ret) PLOG(ERROR) << "ibv_dereg_mr";
@@ -486,9 +518,6 @@ int RdmaContext::disable() {
             PLOG(ERROR) << "ibv_close_device";
         native_context_ = nullptr;
     }
-
-    status_ = DEVICE_DISABLED;
-    return 0;
 }
 
 int RdmaContext::pause() {
@@ -505,7 +534,8 @@ int RdmaContext::resume() {
 
 RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
                                                 int access) {
-    if (status_ == DEVICE_DISABLED || status_ == DEVICE_UNINIT) {
+    if (status_ == DEVICE_DISABLED || status_ == DEVICE_INITIALIZING ||
+        status_ == DEVICE_UNINIT) {
         LOG(FATAL) << "RDMA context " << name() << " not constructed";
         return nullptr;
     }
@@ -583,7 +613,8 @@ RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
 }
 
 int RdmaContext::warmupMrRegistration(void* addr, size_t length) {
-    if (status_ == DEVICE_DISABLED || status_ == DEVICE_UNINIT) {
+    if (status_ == DEVICE_DISABLED || status_ == DEVICE_INITIALIZING ||
+        status_ == DEVICE_UNINIT) {
         LOG(FATAL) << "RDMA context " << name() << " not constructed";
         return -1;
     }
@@ -607,7 +638,8 @@ int RdmaContext::warmupMrRegistration(void* addr, size_t length) {
 }
 
 int RdmaContext::unregisterMemReg(MemReg id) {
-    if (status_ == DEVICE_DISABLED || status_ == DEVICE_UNINIT) {
+    if (status_ == DEVICE_DISABLED || status_ == DEVICE_INITIALIZING ||
+        status_ == DEVICE_UNINIT) {
         LOG(FATAL) << "RDMA context " << name() << " not constructed";
         return -1;
     }

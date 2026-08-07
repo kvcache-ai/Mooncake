@@ -66,6 +66,7 @@ class RdmaContext {
     enum DeviceStatus {
         DEVICE_UNINIT,
         DEVICE_DISABLED,
+        DEVICE_INITIALIZING,
         DEVICE_ENABLED,
         DEVICE_PAUSED
     };
@@ -122,6 +123,13 @@ class RdmaContext {
 
    private:
     int openDevice(const std::string &device_name, uint8_t port);
+
+    // Release every resource currently owned by this context in reverse
+    // construction order. This is intentionally state-independent so it can
+    // roll back a partially completed enable() and can safely be retried.
+    void cleanupResources();
+
+    void rollbackEnable();
 
    private:
     // initialized during ctor, will never be changed during the context's
