@@ -11,6 +11,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <csignal>
 #include <cstdint>
@@ -96,6 +97,21 @@ class P2PClientHttpEndpointsTest : public ::testing::Test {
         coro_http::coro_http_client client;
         return client.post(url, std::move(body),
                            coro_http::req_content_type::octet_stream);
+    }
+
+    static std::vector<std::string> SplitLines(const std::string& body) {
+        std::vector<std::string> lines;
+        size_t start = 0;
+        while (start < body.size()) {
+            size_t pos = body.find('\n', start);
+            if (pos == std::string::npos) {
+                lines.push_back(body.substr(start));
+                break;
+            }
+            lines.push_back(body.substr(start, pos - start));
+            start = pos + 1;
+        }
+        return lines;
     }
 
     static InProcP2PMaster master_;
@@ -197,6 +213,89 @@ TEST_F(P2PClientHttpEndpointsTest, HttpRemoveAllLocal) {
             << "Get unexpectedly returned " << get_resp.status
             << " for key=" << key;
     }
+}
+
+// ============================================================================
+// /get_key_count + /get_all_keys
+// ============================================================================
+
+TEST_F(P2PClientHttpEndpointsTest, HttpGetKeyCountAndGetAllKeys) {
+    // Baseline so the count assertion below is exact.
+    ASSERT_EQ(HttpPost(Url("/remove_all_local")).status, 200);
+
+    auto count_resp = HttpGet(Url("/get_key_count"));
+    ASSERT_EQ(count_resp.status, 200)
+        << "status=" << count_resp.status << " body=" << count_resp.resp_body;
+    EXPECT_EQ(count_resp.resp_body, "0");
+
+    auto empty_resp = HttpGet(Url("/get_all_keys"));
+    ASSERT_EQ(empty_resp.status, 200);
+    EXPECT_TRUE(empty_resp.resp_body.empty());
+
+    const std::vector<std::string> keys = {"http_keys_b", "http_keys_a",
+                                           "http_keys_c"};
+    for (const auto& key : keys) {
+        ASSERT_EQ(HttpPost(Url("/put", "key=" + key), "v_" + key).status, 200)
+            << "PUT failed for " << key;
+    }
+
+    count_resp = HttpGet(Url("/get_key_count"));
+    ASSERT_EQ(count_resp.status, 200);
+    EXPECT_EQ(count_resp.resp_body, std::to_string(keys.size()));
+
+    // Single-tier deployment: one entry per key; order is unspecified.
+    auto list_resp = HttpGet(Url("/get_all_keys"));
+    ASSERT_EQ(list_resp.status, 200);
+    auto lines = SplitLines(list_resp.resp_body);
+    ASSERT_EQ(lines.size(), keys.size());
+    for (const auto& key : keys) {
+        EXPECT_TRUE(std::find(lines.begin(), lines.end(), key) != lines.end())
+            << "missing key " << key << " in /get_all_keys response";
+    }
+
+    // Count and listing drop back to zero after removing everything.
+    ASSERT_EQ(HttpPost(Url("/remove_all_local")).status, 200);
+    count_resp = HttpGet(Url("/get_key_count"));
+    ASSERT_EQ(count_resp.status, 200);
+    EXPECT_EQ(count_resp.resp_body, "0");
+    list_resp = HttpGet(Url("/get_all_keys"));
+    ASSERT_EQ(list_resp.status, 200);
+    EXPECT_TRUE(list_resp.resp_body.empty());
+}
+
+TEST_F(P2PClientHttpEndpointsTest, HttpGetAllKeysWithLimit) {
+    ASSERT_EQ(HttpPost(Url("/remove_all_local")).status, 200);
+    const std::vector<std::string> keys = {"http_limit_x", "http_limit_y",
+                                           "http_limit_z"};
+    for (const auto& key : keys) {
+        ASSERT_EQ(HttpPost(Url("/put", "key=" + key), "v").status, 200);
+    }
+
+    auto resp = HttpGet(Url("/get_all_keys", "limit=2"));
+    ASSERT_EQ(resp.status, 200);
+    auto lines = SplitLines(resp.resp_body);
+    ASSERT_EQ(lines.size(), 2u);
+    for (const auto& line : lines) {
+        EXPECT_TRUE(std::find(keys.begin(), keys.end(), line) != keys.end())
+            << "unexpected key " << line << " in limited listing";
+    }
+    EXPECT_NE(lines[0], lines[1]);
+
+    // limit larger than the number of keys returns everything.
+    resp = HttpGet(Url("/get_all_keys", "limit=100"));
+    ASSERT_EQ(resp.status, 200);
+    lines = SplitLines(resp.resp_body);
+    ASSERT_EQ(lines.size(), keys.size());
+    for (const auto& key : keys) {
+        EXPECT_TRUE(std::find(lines.begin(), lines.end(), key) != lines.end())
+            << "missing key " << key << " in /get_all_keys response";
+    }
+}
+
+TEST_F(P2PClientHttpEndpointsTest, HttpGetAllKeysInvalidLimit) {
+    EXPECT_EQ(HttpGet(Url("/get_all_keys", "limit=0")).status, 400);
+    EXPECT_EQ(HttpGet(Url("/get_all_keys", "limit=abc")).status, 400);
+    EXPECT_EQ(HttpGet(Url("/get_all_keys", "limit=-1")).status, 400);
 }
 
 // ============================================================================

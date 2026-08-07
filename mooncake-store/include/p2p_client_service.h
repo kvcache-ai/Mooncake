@@ -530,6 +530,11 @@ class P2PClientService final : public ClientService {
     void RecordLocalInflight(bool entering) override;
 
    private:
+    tl::expected<size_t, ErrorCode> GetLocalKeyCount();
+    tl::expected<std::vector<std::string>, ErrorCode> GetLocalKeys(
+        size_t limit = 0);
+
+   private:
     std::shared_ptr<P2PClientMetric> metrics_;
     P2PMasterClient master_client_;
     uint16_t client_rpc_port_ = 12345;
