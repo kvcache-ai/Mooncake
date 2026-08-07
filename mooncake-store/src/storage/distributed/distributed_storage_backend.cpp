@@ -4,8 +4,9 @@
 
 #include <algorithm>
 #include <cstdlib>
-#include <xxhash.h>
 #include <filesystem>
+#include <limits>
+#include <xxhash.h>
 
 #include "environ.h"
 #include "utils.h"
@@ -63,15 +64,39 @@ DistributedStorageBackend::DistributedStorageBackend(
     const FileStorageConfig& file_storage_config,
     const DistributedStorageConfig& distributed_config,
     std::unique_ptr<FileSystemAdapter> fs_adapter)
+    : DistributedStorageBackend(file_storage_config, distributed_config,
+                                std::move(fs_adapter), nullptr) {}
+
+DistributedStorageBackend::DistributedStorageBackend(
+    const FileStorageConfig& file_storage_config,
+    const DistributedStorageConfig& distributed_config,
+    std::unique_ptr<FileSystemAdapter> fs_adapter,
+    std::unique_ptr<ObjectStorageAdapter> object_storage_adapter)
     : StorageBackendInterface(file_storage_config),
       fs_adapter_(std::move(fs_adapter)),
+      object_storage_adapter_(std::move(object_storage_adapter)),
       distributed_config_(distributed_config),
       root_dir_(distributed_config.fsdir),
-      hash_bucket_count_(distributed_config.hash_bucket_count) {}
+      hash_bucket_count_(distributed_config.hash_bucket_count) {
+    CHECK((fs_adapter_ != nullptr) != (object_storage_adapter_ != nullptr))
+        << "DistributedStorageBackend: exactly one I/O adapter is required";
+    if (object_storage_adapter_) {
+        storage_mode_ = DistributedStorageMode::kObjectStorage;
+    }
+}
 
 tl::expected<void, ErrorCode> DistributedStorageBackend::Init() {
     if (initialized_) {
         LOG(WARNING) << "DistributedStorageBackend is already initialized";
+        return {};
+    }
+
+    if (UsesObjectStorage()) {
+        auto init_result = object_storage_adapter_->Init();
+        if (!init_result) return init_result;
+        initialized_ = true;
+        LOG(INFO) << "DistributedStorageBackend initialized, object adapter="
+                  << object_storage_adapter_->GetName();
         return {};
     }
 
@@ -156,24 +181,56 @@ tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
     std::vector<StorageObjectMetadata> success_metas;
 
     for (const auto& [key, slices] : batch_object) {
-        auto path = GetObjectPath(key);
+        if (slices.size() >
+            static_cast<size_t>(std::numeric_limits<int>::max())) {
+            LOG(WARNING) << "Failed to offload key " << key
+                         << ": slice count exceeds INT_MAX";
+            continue;
+        }
+        const int iovcnt = static_cast<int>(slices.size());
 
         std::vector<iovec> iovs;
+        iovs.reserve(slices.size());
+        size_t total_size = 0;
+        bool total_size_overflow = false;
         for (const auto& slice : slices) {
+            if (slice.size > std::numeric_limits<size_t>::max() - total_size) {
+                total_size_overflow = true;
+                break;
+            }
             iovs.push_back({slice.ptr, slice.size});
+            total_size += slice.size;
+        }
+        if (total_size_overflow) {
+            LOG(WARNING) << "Failed to offload key " << key
+                         << ": total slice size overflows size_t";
+            continue;
         }
 
-        auto result =
-            fs_adapter_->VectorWriteFile(path, iovs.data(), iovs.size(), 0);
-        if (!result) {
-            LOG(WARNING) << "Failed to offload key " << key << ": "
-                         << static_cast<int>(result.error());
-            continue;
+        size_t written = 0;
+        if (UsesObjectStorage()) {
+            auto result =
+                object_storage_adapter_->PutV(key, iovs.data(), iovcnt);
+            if (!result) {
+                LOG(WARNING) << "Failed to offload key " << key << ": "
+                             << static_cast<int>(result.error());
+                continue;
+            }
+            written = total_size;
+        } else {
+            auto result = fs_adapter_->VectorWriteFile(GetObjectPath(key),
+                                                       iovs.data(), iovcnt, 0);
+            if (!result) {
+                LOG(WARNING) << "Failed to offload key " << key << ": "
+                             << static_cast<int>(result.error());
+                continue;
+            }
+            written = *result;
         }
 
         success_keys.push_back(key);
         StorageObjectMetadata meta{-1, 0, static_cast<int64_t>(key.size()),
-                                   static_cast<int64_t>(*result), ""};
+                                   static_cast<int64_t>(written), ""};
         success_metas.push_back(meta);
     }
 
@@ -195,9 +252,11 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::BatchLoad(
     }
 
     for (auto& [key, slice] : batched_slices) {
-        auto path = GetObjectPath(key);
-
-        auto result = fs_adapter_->ReadFile(path, slice.ptr, slice.size);
+        auto result =
+            UsesObjectStorage()
+                ? object_storage_adapter_->Get(key, slice.ptr, slice.size)
+                : fs_adapter_->ReadFile(GetObjectPath(key), slice.ptr,
+                                        slice.size);
         if (!result) {
             return tl::make_unexpected(result.error());
         }
@@ -215,8 +274,10 @@ tl::expected<bool, ErrorCode> DistributedStorageBackend::IsExist(
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
-    auto path = GetObjectPath(key);
-    return fs_adapter_->FileExists(path);
+    if (UsesObjectStorage()) {
+        return object_storage_adapter_->Exists(key);
+    }
+    return fs_adapter_->FileExists(GetObjectPath(key));
 }
 
 tl::expected<bool, ErrorCode> DistributedStorageBackend::IsEnableOffloading() {
@@ -236,6 +297,35 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::ScanMeta(
     std::vector<StorageObjectMetadata> batch_metas;
     const size_t batch_limit = static_cast<size_t>(std::max<int64_t>(
         1, file_storage_config_.scanmeta_iterator_keys_limit));
+
+    if (UsesObjectStorage()) {
+        auto key_infos = object_storage_adapter_->ListKeys();
+        if (!key_infos) {
+            LOG(ERROR) << "Failed to list keys from object storage adapter: "
+                       << static_cast<int>(key_infos.error());
+            return tl::make_unexpected(key_infos.error());
+        }
+
+        for (const auto& info : *key_infos) {
+            batch_keys.push_back(info.logical_key);
+            StorageObjectMetadata meta{
+                -1, 0, static_cast<int64_t>(info.logical_key.size()),
+                static_cast<int64_t>(info.size), ""};
+            batch_metas.push_back(meta);
+
+            if (batch_keys.size() >= batch_limit) {
+                auto err = handler(batch_keys, batch_metas);
+                if (err != ErrorCode::OK) return tl::make_unexpected(err);
+                batch_keys.clear();
+                batch_metas.clear();
+            }
+        }
+        if (!batch_keys.empty()) {
+            auto err = handler(batch_keys, batch_metas);
+            if (err != ErrorCode::OK) return tl::make_unexpected(err);
+        }
+        return {};
+    }
 
     for (int i = 0; i < hash_bucket_count_; ++i) {
         std::string bucket_dir = fmt::format("{}/{:02x}", root_dir_, i);

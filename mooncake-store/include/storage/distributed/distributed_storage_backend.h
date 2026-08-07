@@ -3,9 +3,18 @@
 #include <memory>
 
 #include "fs_adapter.h"
+#include "storage/distributed/object_storage_adapter.h"
 #include "storage_backend.h"
 
 namespace mooncake {
+
+// The filesystem mode covers both the current per-object layout and the
+// shard-offset DFS layout introduced by follow-up work. Object storage remains
+// a separate, key-oriented I/O mode.
+enum class DistributedStorageMode {
+    kFileSystem,
+    kObjectStorage,
+};
 
 struct DistributedStorageConfig {
     std::string fsdir = "distributed_dir";
@@ -18,10 +27,11 @@ struct DistributedStorageConfig {
 };
 
 /**
- * @brief Distributed filesystem storage backend.
+ * @brief Distributed filesystem and object storage backend.
  *
- * Implements StorageBackendInterface, delegating I/O to a FileSystemAdapter.
- * Does not handle eviction (DFS manages its own space).
+ * Implements StorageBackendInterface using either a FileSystemAdapter for
+ * per-object files or an ObjectStorageAdapter for object storage services.
+ * Does not handle eviction.
  */
 class DistributedStorageBackend : public StorageBackendInterface {
    public:
@@ -29,6 +39,19 @@ class DistributedStorageBackend : public StorageBackendInterface {
         const FileStorageConfig& file_storage_config,
         const DistributedStorageConfig& distributed_config,
         std::unique_ptr<FileSystemAdapter> fs_adapter);
+
+    // Exactly one adapter must be non-null.
+    DistributedStorageBackend(
+        const FileStorageConfig& file_storage_config,
+        const DistributedStorageConfig& distributed_config,
+        std::unique_ptr<FileSystemAdapter> fs_adapter,
+        std::unique_ptr<ObjectStorageAdapter> object_storage_adapter);
+
+    DistributedStorageMode GetStorageMode() const { return storage_mode_; }
+
+    bool UsesObjectStorage() const {
+        return storage_mode_ == DistributedStorageMode::kObjectStorage;
+    }
 
     tl::expected<void, ErrorCode> Init() override;
 
@@ -57,9 +80,11 @@ class DistributedStorageBackend : public StorageBackendInterface {
     static std::string UnescapeFilename(const std::string& name);
 
     std::unique_ptr<FileSystemAdapter> fs_adapter_;
+    std::unique_ptr<ObjectStorageAdapter> object_storage_adapter_;
     DistributedStorageConfig distributed_config_;
     std::string root_dir_;
     int hash_bucket_count_;
+    DistributedStorageMode storage_mode_ = DistributedStorageMode::kFileSystem;
     bool initialized_ = false;
 };
 
