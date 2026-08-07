@@ -25,6 +25,7 @@ In addition to tcp and rdma, the C++ Transfer Engine also supports:
 - nvlink: NVIDIA NVLink for inter-GPU communication across nodes
 - nvlink_intra: NVIDIA NVLink for intra-node GPU communication
 - hip: ROCm/HIP for AMD GPU communication using IPC/Shareable handles
+- nccl: NCCL host RMA transport for CUDA VMM buffers
 - barex: Bare-metal RDMA extension protocol
 - cxl: Compute Express Link for memory pooling and sharing
 - ascend: Huawei Ascend NPU communication (HCCL and direct transport)
@@ -102,6 +103,7 @@ _KNOWN_PROTOCOLS = frozenset(
         "nvlink",
         "nvlink_intra",
         "hip",
+        "nccl",
         "barex",
         "cxl",
         "ascend",

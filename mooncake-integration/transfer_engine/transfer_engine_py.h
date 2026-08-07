@@ -65,6 +65,8 @@ class TransferEnginePy {
 
     int getRpcPort();
 
+    std::string getLocalIpAndPort() const;
+
     uintptr_t allocateManagedBuffer(size_t length);
 
     int freeManagedBuffer(uintptr_t user_tensor, size_t length);

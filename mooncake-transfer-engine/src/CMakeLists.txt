@@ -75,7 +75,7 @@ if(USE_CUDA)
 endif()
 
 if(USE_NCCL_DEVICE OR USE_NCCL_HOST)
-  target_link_libraries(transfer_engine PUBLIC NCCL::nccl)
+  target_link_libraries(transfer_engine PRIVATE ${CMAKE_DL_LIBS})
 endif()
 
 if(USE_SUPA)
