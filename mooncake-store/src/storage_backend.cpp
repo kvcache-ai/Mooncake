@@ -2521,7 +2521,6 @@ BucketStorageBackend::BuildBucket(
 tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
     int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata,
     std::vector<iovec>& iovs) {
-    namespace fs = std::filesystem;
     auto bucket_data_path_res = GetBucketDataPath(bucket_id);
     if (!bucket_data_path_res) {
         LOG(ERROR) << "Failed to get bucket data path, bucket_id=" << bucket_id;
@@ -2598,15 +2597,6 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
 
-        // Flush bucket data to stable storage before writing metadata.
-        // This prevents a crash from leaving valid metadata pointing at
-        // incomplete data (write-ordering durability guarantee).
-        auto sync_result = uring_file->datasync();
-        if (!sync_result) {
-            LOG(ERROR) << "datasync failed for bucket: " << bucket_id;
-            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-        }
-
         // Invalidate cache for this file since content changed
         {
             MutexLocker cache_locker(&file_cache_mutex_);
@@ -2636,24 +2626,33 @@ tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
             file_cache_.erase(bucket_data_path);
         }
     }
+    // Flush bucket data to stable storage before writing metadata, so a crash
+    // cannot leave committed metadata pointing at unpersisted data
+    // (write-ordering durability guarantee). This runs for both the O_DIRECT
+    // UringFile path and the buffered PosixFile path: OpenFile() only returns a
+    // UringFile for FileMode::Read, so bucket writes always take the PosixFile
+    // branch, where fdatasync() is what actually enforces the ordering.
+    auto sync_result = file->datasync();
+    if (test_datasync_failure_.exchange(false, std::memory_order_relaxed)) {
+        // Test-only fault injection (see SetDatasyncFailureForTest()).
+        sync_result = tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    if (!sync_result) {
+        LOG(ERROR) << "datasync failed for bucket: " << bucket_id;
+        // The data file was written but not durably persisted; drop it so no
+        // orphan remains (mirrors the metadata-write-failure cleanup below).
+        CleanupOrphanedBucket(bucket_id);
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+
     auto store_bucket_metadata_result =
         StoreBucketMetadata(bucket_id, bucket_metadata);
     if (!store_bucket_metadata_result) {
         LOG(ERROR) << "Failed to store bucket metadata, error: "
                    << store_bucket_metadata_result.error();
-
-        // Clean up the bucket file to prevent orphans
-        std::error_code ec;
-        if (fs::remove(bucket_data_path, ec)) {
-            LOG(WARNING) << "Cleaned up orphaned bucket file after metadata "
-                            "write failure: "
-                         << bucket_data_path;
-        } else if (ec) {
-            LOG(ERROR) << "Failed to clean up bucket file after metadata write "
-                          "failure: "
-                       << bucket_data_path << ", error: " << ec.message();
-        }
-
+        // Drop the just-written data file (and any partial metadata file) so no
+        // orphan remains; same cleanup as the datasync-failure path above.
+        CleanupOrphanedBucket(bucket_id);
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
     return {};

@@ -716,6 +716,66 @@ TEST_F(StorageBackendTest, BatchOffloadRollbackOnCompleteHandlerFailure) {
         << "No bucket data or metadata files should remain after rollback";
 }
 
+// Regression test for the bucket write-ordering durability guarantee:
+// WriteBucket must datasync() the bucket data before committing its metadata,
+// and a failed datasync must abort the offload so metadata never points at
+// unpersisted data. This only holds if datasync() is actually called on the
+// (PosixFile) write path; if the sync is skipped, the injected failure is never
+// observed and the offload wrongly succeeds. See issue #3089.
+TEST_F(StorageBackendTest, BucketOffloadFailsWhenDataDatasyncFails) {
+    std::string test_dir = data_path + "/datasync_fail_test";
+    fs::create_directories(test_dir);
+
+    FileStorageConfig config;
+    config.storage_filepath = test_dir;
+    BucketBackendConfig bucket_config;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    std::string value = "durability_probe_value";
+    std::unordered_map<std::string, std::vector<Slice>> batched_slices;
+    batched_slices.emplace(
+        "datasync_fail_key",
+        std::vector<Slice>{Slice{value.data(), value.size()}});
+
+    // Force the bucket-data datasync to fail on the next WriteBucket.
+    storage_backend.SetDatasyncFailureForTest();
+
+    auto offload_res = storage_backend.BatchOffload(
+        batched_slices,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+
+    // The failed durability flush must surface as an offload failure...
+    EXPECT_FALSE(offload_res.has_value())
+        << "offload must fail when the bucket-data datasync fails";
+
+    // ...and the key must not be committed (no metadata pointing at data that
+    // was never durably persisted).
+    auto exist_res = storage_backend.IsExist("datasync_fail_key");
+    ASSERT_TRUE(exist_res.has_value());
+    EXPECT_FALSE(exist_res.value())
+        << "key must not be committed when its data datasync failed";
+
+    // No orphaned bucket data/metadata files should remain.
+    int bucket_file_count = 0;
+    for (const auto& entry : fs::directory_iterator(test_dir)) {
+        if (!entry.is_regular_file()) continue;
+        std::string ext = entry.path().extension().string();
+        if (ext == ".bucket" || ext == ".meta") bucket_file_count++;
+    }
+    EXPECT_EQ(bucket_file_count, 0)
+        << "no bucket files should remain after a datasync-failed offload";
+
+    // Sanity: a subsequent offload without injected failure succeeds and syncs.
+    auto ok_res = storage_backend.BatchOffload(
+        batched_slices,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    EXPECT_TRUE(ok_res.has_value())
+        << "offload should succeed once datasync is no longer forced to fail";
+}
+
 TEST_F(StorageBackendTest, AdaptorBatchOffloadAndBatchLoad) {
     FileStorageConfig cfg;
 
