@@ -32,7 +32,10 @@ namespace mooncake {
 
 class PutOperation;
 class DistributedStorageBackend;
-class RealClient;
+namespace internal {
+class ClientAccess;
+struct SegmentMountOperations;
+}  // namespace internal
 
 std::optional<size_t> GetTransportRegistrationLimit(
     const std::string& protocol);
@@ -781,6 +784,8 @@ class Client {
                                     uint64_t quota_bytes = 0);
 
    private:
+    friend class internal::ClientAccess;
+
     /**
      * @brief Internal helper functions for initialization and data transfer
      */
@@ -946,7 +951,15 @@ class Client {
      *        Caller must hold mounted_segments_mutex_.
      */
     tl::expected<void, ErrorCode> UnmountSegmentImpl(
-        std::unordered_map<UUID, Segment, boost::hash<UUID>>::iterator it);
+        std::unordered_map<UUID, Segment, boost::hash<UUID>>::iterator it,
+        const internal::SegmentMountOperations* operations = nullptr);
+    tl::expected<void, ErrorCode> MountSegmentWithId(
+        const UUID& segment_id, const void* buffer, size_t size,
+        const std::string& protocol, const std::string& location,
+        const internal::SegmentMountOperations* operations = nullptr);
+    tl::expected<void, ErrorCode> CleanupSegmentByIdIfPresent(
+        const UUID& segment_id,
+        const internal::SegmentMountOperations* operations = nullptr);
 
     void StartGracefulUnmountTimer(const UUID& segment_id,
                                    uint64_t grace_period_ms);
