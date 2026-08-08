@@ -81,6 +81,16 @@ struct TransferHandshakeUtil {
         root["qp_num"] = qpNums;
         if (desc.ready_ack_supported || desc.ready_ack)
             root["ready_ack"] = desc.ready_ack;
+        if (desc.notify_qp_num != 0 || desc.ctrl_channel) {
+            root["notify_qp_num"] = Json::UInt(desc.notify_qp_num);
+            root["notify_rq_depth"] = Json::UInt(desc.notify_rq_depth);
+            root["ctrl_channel"] = desc.ctrl_channel;
+        }
+        if (desc.msg_qp_num != 0 || desc.msg_channel) {
+            root["msg_qp_num"] = Json::UInt(desc.msg_qp_num);
+            root["msg_rq_depth"] = Json::UInt(desc.msg_rq_depth);
+            root["msg_channel"] = desc.msg_channel;
+        }
         root["reply_msg"] = desc.reply_msg;
 #ifdef USE_EFA
         root["efa_addr"] = desc.efa_addr;  // EFA endpoint address
@@ -124,6 +134,33 @@ struct TransferHandshakeUtil {
             desc.ready_ack = root["ready_ack"].asBool();
         } else {
             desc.ready_ack = false;
+        }
+        desc.notify_qp_num = 0;
+        desc.notify_rq_depth = 0;
+        desc.ctrl_channel = false;
+        desc.msg_qp_num = 0;
+        desc.msg_rq_depth = 0;
+        desc.msg_channel = false;
+        if (root.isMember("notify_qp_num") && root["notify_qp_num"].isUInt()) {
+            desc.notify_qp_num = root["notify_qp_num"].asUInt();
+        }
+        if (root.isMember("notify_rq_depth") &&
+            root["notify_rq_depth"].isUInt()) {
+            desc.notify_rq_depth =
+                static_cast<uint16_t>(root["notify_rq_depth"].asUInt());
+        }
+        if (root.isMember("ctrl_channel") && root["ctrl_channel"].isBool()) {
+            desc.ctrl_channel = root["ctrl_channel"].asBool();
+        }
+        if (root.isMember("msg_qp_num") && root["msg_qp_num"].isUInt()) {
+            desc.msg_qp_num = root["msg_qp_num"].asUInt();
+        }
+        if (root.isMember("msg_rq_depth") && root["msg_rq_depth"].isUInt()) {
+            desc.msg_rq_depth =
+                static_cast<uint16_t>(root["msg_rq_depth"].asUInt());
+        }
+        if (root.isMember("msg_channel") && root["msg_channel"].isBool()) {
+            desc.msg_channel = root["msg_channel"].asBool();
         }
         desc.reply_msg = root["reply_msg"].asString();
 #ifdef USE_EFA
@@ -292,6 +329,11 @@ int TransferMetadata::getNotifies(std::vector<NotifyDesc> &notifies) {
     return 0;
 }
 
+void TransferMetadata::pushNotify(const NotifyDesc &notify) {
+    RWSpinlock::WriteGuard guard(notify_lock_);
+    notifys.push_back(notify);
+}
+
 #ifdef ENABLE_MULTI_PROTOCOL
 static int encodeMultiProtocolSegmentDesc(
     const std::vector<std::string> &protocols,
@@ -424,6 +466,7 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
             Json::Value lkeyJSON(Json::arrayValue);
             for (auto &entry : buffer.lkey) lkeyJSON.append(entry);
             bufferJSON["lkey"] = lkeyJSON;
+            if (buffer.two_sided) bufferJSON["two_sided"] = true;
             buffersJSON.append(bufferJSON);
         }
         segmentJSON["buffers"] = buffersJSON;
@@ -814,6 +857,10 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
                 buffer.lkey.push_back(
                     static_cast<decltype(buffer.lkey)::value_type>(
                         lkeyJSON.asUInt64()));
+            if (bufferJSON.isMember("two_sided") &&
+                bufferJSON["two_sided"].isBool()) {
+                buffer.two_sided = bufferJSON["two_sided"].asBool();
+            }
             if (buffer.name.empty() || !buffer.addr || !buffer.length ||
                 (!buffer.rkey.empty() &&
                  (buffer.rkey.size() != buffer.lkey.size() ||

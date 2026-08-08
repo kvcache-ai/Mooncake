@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdlib>
+#include <functional>
 #include <future>
 #include <set>
 #include <thread>
@@ -35,6 +36,8 @@
 #include "environ.h"
 #include "memory_location.h"
 #include "topology.h"
+#include "transport/rdma_transport/ctrl_channel.h"
+#include "transport/rdma_transport/msg_channel.h"
 #include "transport/rdma_transport/rdma_context.h"
 #include "transport/rdma_transport/rdma_endpoint.h"
 
@@ -171,6 +174,26 @@ RdmaTransport::~RdmaTransport() {
     for (auto &entry : batch_desc_set_) delete entry.second;
     batch_desc_set_.clear();
 #endif
+    stopCtrlWorker();
+    {
+        std::lock_guard<std::mutex> lock(ctrl_mutex_);
+        for (auto &entry : ctrl_channels_) {
+            if (entry.second) entry.second->disconnect();
+        }
+        ctrl_channels_.clear();
+        for (auto &entry : msg_channels_) {
+            if (entry.second) entry.second->disconnect();
+        }
+        msg_channels_.clear();
+        peer_ctrl_state_.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(managed_mutex_);
+        for (auto &entry : managed_buffers_) {
+            if (entry.second.owned) free(entry.second.addr);
+        }
+        managed_buffers_.clear();
+    }
     metadata_->removeSegmentDesc(local_server_name_);
     batch_desc_set_.clear();
     context_list_.clear();
@@ -228,6 +251,18 @@ int RdmaTransport::install(std::string &local_server_name,
         return ret;
     }
 
+    // Stable per-process session id for CtrlChannel SESSION_OPEN.
+    local_ctrl_session_id_ =
+        (static_cast<uint64_t>(std::hash<std::string>{}(local_server_name_))
+         << 1) ^
+        (static_cast<uint64_t>(
+             std::chrono::steady_clock::now().time_since_epoch().count()) |
+         1ULL);
+
+    if (globalConfig().rdma_notify_enabled) {
+        startCtrlWorker();
+    }
+
     return 0;
 }
 
@@ -278,14 +313,15 @@ int RdmaTransport::registerLocalMemory(void *addr, size_t length,
                                        bool remote_accessible,
                                        bool update_metadata) {
     return registerLocalMemoryInternal(addr, length, name, remote_accessible,
-                                       update_metadata, false);
+                                       update_metadata, false, false);
 }
 
 int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
                                                const std::string &name,
                                                bool remote_accessible,
                                                bool update_metadata,
-                                               bool force_sequential) {
+                                               bool force_sequential,
+                                               bool two_sided) {
     int access_rights = IBV_ACCESS_LOCAL_WRITE;
     if (remote_accessible)
         access_rights |= IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
@@ -496,6 +532,7 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
         buffer_desc.name = resolved_name;
         buffer_desc.addr = (uint64_t)chunk_addr;
         buffer_desc.length = chunk_len;
+        buffer_desc.two_sided = two_sided;
 #ifdef ENABLE_MULTI_PROTOCOL
         buffer_desc.protocol = "rdma";
 #endif
@@ -821,6 +858,24 @@ Status RdmaTransport::submitTransfer(
 
 Status RdmaTransport::submitTransferTask(
     const std::vector<TransferTask *> &task_list) {
+    std::vector<TransferTask *> one_sided, two_sided;
+    one_sided.reserve(task_list.size());
+    for (auto *task : task_list) {
+        if (task && task->request && shouldUseTwoSided(*task->request))
+            two_sided.push_back(task);
+        else
+            one_sided.push_back(task);
+    }
+    if (!two_sided.empty()) {
+        Status s = submitTwoSidedTasks(two_sided);
+        if (!s.ok()) return s;
+    }
+    if (!one_sided.empty()) return submitOneSidedTasks(one_sided);
+    return Status::OK();
+}
+
+Status RdmaTransport::submitOneSidedTasks(
+    const std::vector<TransferTask *> &task_list) {
     std::unordered_map<std::shared_ptr<RdmaContext>, std::vector<Slice *>>
         slices_to_post;
     std::unordered_map<SegmentID, std::shared_ptr<SegmentDesc>>
@@ -1044,6 +1099,16 @@ RdmaTransport::SegmentID RdmaTransport::getSegmentID(
 
 int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
                                           HandShakeDesc &local_desc) {
+    if (peer_desc.ctrl_channel ||
+        (peer_desc.notify_qp_num != 0 && peer_desc.qp_num.empty() &&
+         !peer_desc.msg_channel)) {
+        return onSetupCtrlChannel(peer_desc, local_desc);
+    }
+    if (peer_desc.msg_channel ||
+        (peer_desc.msg_qp_num != 0 && peer_desc.qp_num.empty())) {
+        return onSetupMsgChannel(peer_desc, local_desc);
+    }
+
     auto local_nic_name = getNicNameFromNicPath(peer_desc.peer_nic_path);
     if (local_nic_name.empty()) {
         local_desc.reply_msg =
@@ -1137,6 +1202,337 @@ int RdmaTransport::startHandshakeDaemon(std::string &local_server_name) {
         std::bind(&RdmaTransport::onSetupRdmaConnections, this,
                   std::placeholders::_1, std::placeholders::_2),
         metadata_->localRpcMeta().rpc_port, metadata_->localRpcMeta().sockfd);
+}
+
+int RdmaTransport::onSetupCtrlChannel(const HandShakeDesc &peer_desc,
+                                      HandShakeDesc &local_desc) {
+    if (!globalConfig().rdma_notify_enabled) {
+        local_desc.reply_msg = "RDMA notify disabled";
+        return ERR_INVALID_ARGUMENT;
+    }
+    if (context_list_.empty()) {
+        local_desc.reply_msg = "No local RDMA context for CtrlChannel";
+        return ERR_DEVICE_NOT_FOUND;
+    }
+
+    std::string peer_server_name =
+        getServerNameFromNicPath(peer_desc.local_nic_path);
+    if (peer_server_name.empty()) {
+        local_desc.reply_msg = "Cannot derive peer server name from handshake";
+        return ERR_INVALID_ARGUMENT;
+    }
+
+    std::shared_ptr<CtrlChannel> channel;
+    {
+        std::lock_guard<std::mutex> lock(ctrl_mutex_);
+        auto it = ctrl_channels_.find(peer_server_name);
+        if (it != ctrl_channels_.end() && it->second) {
+            it->second->disconnect();
+        }
+        channel = std::make_shared<CtrlChannel>(*this, *context_list_[0],
+                                                peer_server_name);
+        ctrl_channels_[peer_server_name] = channel;
+    }
+    return channel->acceptPassive(peer_desc, local_desc);
+}
+
+std::shared_ptr<CtrlChannel> RdmaTransport::ensureCtrlChannel(
+    const std::string &peer_server_name) {
+    if (!globalConfig().rdma_notify_enabled || context_list_.empty()) {
+        return nullptr;
+    }
+
+    std::unique_lock<std::mutex> lock(ctrl_mutex_);
+    auto it = ctrl_channels_.find(peer_server_name);
+    if (it != ctrl_channels_.end() && it->second && it->second->connected()) {
+        return it->second;
+    }
+
+    // Serialize active connect per peer to avoid duplicate handshakes.
+    auto channel = std::make_shared<CtrlChannel>(*this, *context_list_[0],
+                                                 peer_server_name);
+    // Release lock during handshake I/O; re-check afterwards.
+    lock.unlock();
+    if (channel->connectActive()) {
+        return nullptr;
+    }
+    lock.lock();
+    auto again = ctrl_channels_.find(peer_server_name);
+    if (again != ctrl_channels_.end() && again->second &&
+        again->second->connected()) {
+        // Another thread won the race; keep the already-connected channel.
+        channel->disconnect();
+        return again->second;
+    }
+    ctrl_channels_[peer_server_name] = channel;
+    return channel;
+}
+
+int RdmaTransport::sendRdmaNotify(const std::string &peer_server_name,
+                                  const NotifyDesc &notify) {
+    auto channel = ensureCtrlChannel(peer_server_name);
+    if (!channel) return ERR_ENDPOINT;
+    return channel->sendNotify(notify);
+}
+
+void RdmaTransport::onCtrlNotifyReceived(const NotifyDesc &notify) {
+    if (metadata_) metadata_->pushNotify(notify);
+}
+
+void RdmaTransport::onCtrlFrameReceived(const std::string &peer_server_name,
+                                        const CtrlFrame &frame) {
+    switch (frame.type) {
+        case CtrlFrameType::NOTIFY_COMPAT: {
+            NotifyDesc notify;
+            if (decodeNotifyCompatPayload(frame.payload.data(),
+                                          frame.payload.size(), notify) == 0) {
+                onCtrlNotifyReceived(notify);
+            } else {
+                LOG(ERROR) << "CtrlChannel: bad NOTIFY_COMPAT from "
+                           << peer_server_name;
+            }
+            break;
+        }
+        case CtrlFrameType::SESSION_OPEN:
+            handleSessionOpen(peer_server_name, frame);
+            break;
+        case CtrlFrameType::CREDIT_GRANT:
+            handleCreditGrant(peer_server_name, frame);
+            break;
+        case CtrlFrameType::DATA_ACK:
+            handleDataAck(peer_server_name, frame);
+            break;
+        case CtrlFrameType::SESSION_CLOSE:
+        case CtrlFrameType::CREDIT_PROGRESS:
+        case CtrlFrameType::CREDIT_REQUEST:
+        case CtrlFrameType::FENCE:
+        case CtrlFrameType::DRAIN_ACK:
+        case CtrlFrameType::CTRL_ACK:
+            VLOG(1) << "CtrlChannel: ignoring frame type "
+                    << static_cast<int>(frame.type) << " from "
+                    << peer_server_name;
+            break;
+        default:
+            LOG(WARNING) << "CtrlChannel: unknown frame type "
+                         << static_cast<int>(frame.type) << " from "
+                         << peer_server_name;
+            break;
+    }
+}
+
+void RdmaTransport::handleSessionOpen(const std::string &peer_server_name,
+                                      const CtrlFrame &frame) {
+    uint32_t bounce_slots = 0, bounce_slot_size = 0;
+    if (decodeSessionOpenPayload(frame.payload.data(), frame.payload.size(),
+                                 bounce_slots, bounce_slot_size)) {
+        LOG(ERROR) << "CtrlChannel: bad SESSION_OPEN from " << peer_server_name;
+        return;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(ctrl_mutex_);
+        auto &state = peer_ctrl_state_[peer_server_name];
+        state.peer_session = frame.session;
+        state.epoch = frame.epoch ? frame.epoch : 1;
+        state.peer_bounce_slots = bounce_slots;
+        state.peer_bounce_slot_size = bounce_slot_size;
+        state.session_open_received = true;
+
+        if (sender_credit_.activate(peer_server_name, frame.session,
+                                    state.epoch)) {
+            LOG(ERROR) << "CtrlChannel: credit activate failed for "
+                       << peer_server_name;
+            return;
+        }
+        // Defer GRANT to ctrl worker so we never sendCtrlFrame inside the
+        // recv dispatch stack.
+        if (!state.initial_grant_sent && globalConfig().rdma_credit_enabled) {
+            state.grant_pending = true;
+        }
+    }
+
+    LOG(INFO) << "CtrlChannel: SESSION_OPEN from " << peer_server_name
+              << " peer_session=" << frame.session
+              << " bounce_slots=" << bounce_slots
+              << " slot_size=" << bounce_slot_size;
+}
+
+int RdmaTransport::sendInitialCreditGrant(
+    const std::string &peer_server_name) {
+    if (!globalConfig().rdma_credit_enabled) return 0;
+    uint64_t epoch = 1;
+    {
+        std::lock_guard<std::mutex> lock(ctrl_mutex_);
+        auto &state = peer_ctrl_state_[peer_server_name];
+        if (state.initial_grant_sent) return 0;
+        state.initial_grant_sent = true;
+        state.grant_pending = false;
+        epoch = state.epoch ? state.epoch : 1;
+    }
+    int ret = sendCreditGrant(peer_server_name, epoch);
+    if (ret) {
+        std::lock_guard<std::mutex> lock(ctrl_mutex_);
+        peer_ctrl_state_[peer_server_name].initial_grant_sent = false;
+        peer_ctrl_state_[peer_server_name].grant_pending = true;
+    }
+    return ret;
+}
+
+int RdmaTransport::sendCreditGrant(const std::string &peer_server_name,
+                                   uint64_t epoch) {
+    std::shared_ptr<CtrlChannel> channel;
+    uint64_t seq = 0;
+    {
+        std::lock_guard<std::mutex> lock(ctrl_mutex_);
+        auto it = ctrl_channels_.find(peer_server_name);
+        if (it == ctrl_channels_.end() || !it->second) return ERR_ENDPOINT;
+        channel = it->second;
+        auto &state = peer_ctrl_state_[peer_server_name];
+        if (epoch == 0) epoch = state.epoch;
+        seq = state.next_grant_seq;
+    }
+    if (!channel || !channel->connected()) return ERR_ENDPOINT;
+
+    // Grant our local bounce capacity to the peer (they send into our pool).
+    uint64_t slots = globalConfig().rdma_msg_pool_base;
+    uint64_t bytes =
+        slots * static_cast<uint64_t>(globalConfig().rdma_msg_slot_size);
+    std::vector<CreditAmount> grants = {
+        {CreditResource::BounceSlots, slots},
+        {CreditResource::BounceBytes, bytes},
+    };
+    if (globalConfig().rdma_credit_window_bytes > 0) {
+        grants.push_back({CreditResource::DataBytes,
+                          globalConfig().rdma_credit_window_bytes});
+    }
+    if (globalConfig().rdma_credit_window_requests > 0) {
+        grants.push_back({CreditResource::RequestSlots,
+                          globalConfig().rdma_credit_window_requests});
+    }
+
+    CtrlFrame frame;
+    frame.type = CtrlFrameType::CREDIT_GRANT;
+    frame.session = local_ctrl_session_id_;
+    frame.epoch = epoch;
+    frame.seq = seq;
+    if (encodeCreditGrantPayload(grants, frame.payload))
+        return ERR_INVALID_ARGUMENT;
+
+    int ret = channel->sendCtrlFrame(frame);
+    if (ret == 0) {
+        std::lock_guard<std::mutex> lock(ctrl_mutex_);
+        auto &state = peer_ctrl_state_[peer_server_name];
+        if (state.next_grant_seq == seq) state.next_grant_seq++;
+    }
+    return ret;
+}
+
+void RdmaTransport::handleCreditGrant(const std::string &peer_server_name,
+                                      const CtrlFrame &frame) {
+    std::vector<CreditAmount> grants;
+    if (decodeCreditGrantPayload(frame.payload.data(), frame.payload.size(),
+                                 grants)) {
+        LOG(ERROR) << "CtrlChannel: bad CREDIT_GRANT from " << peer_server_name;
+        return;
+    }
+    int disposition = 0;
+    // Ensure ledger entry exists before apply (GRANT may race SESSION_OPEN).
+    if (sender_credit_.activate(peer_server_name, frame.session, frame.epoch)) {
+        LOG(ERROR) << "CtrlChannel: credit activate failed for grant from "
+                   << peer_server_name;
+        return;
+    }
+    int ret = sender_credit_.applyGrant(peer_server_name, frame.session,
+                                        frame.epoch, frame.seq, grants,
+                                        disposition);
+    if (ret) {
+        LOG(ERROR) << "CtrlChannel: apply CREDIT_GRANT failed from "
+                   << peer_server_name << " ret=" << ret
+                   << " session=" << frame.session << " epoch=" << frame.epoch
+                   << " seq=" << frame.seq << " grants=" << grants.size();
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(ctrl_mutex_);
+        auto &state = peer_ctrl_state_[peer_server_name];
+        state.peer_session = frame.session;
+        state.epoch = frame.epoch ? frame.epoch : state.epoch;
+    }
+    LOG(INFO) << "CtrlChannel: CREDIT_GRANT from " << peer_server_name
+              << " seq=" << frame.seq << " disposition=" << disposition
+              << " grants=" << grants.size();
+    redispatchWaitingTasks();
+}
+
+void RdmaTransport::handleDataAck(const std::string &peer_server_name,
+                                  const CtrlFrame &frame) {
+    std::vector<DataAckEntry> acks;
+    if (decodeDataAckPayload(frame.payload.data(), frame.payload.size(),
+                             acks)) {
+        LOG(ERROR) << "CtrlChannel: bad DATA_ACK from " << peer_server_name;
+        return;
+    }
+    for (const auto &ack : acks) {
+        completeTwoSidedAck(ack.task_id, ack.acked_bytes);
+    }
+    VLOG(1) << "CtrlChannel: DATA_ACK from " << peer_server_name
+            << " entries=" << acks.size();
+}
+
+uint64_t RdmaTransport::peerGrantedBounceSlots(
+    const std::string &peer_server_name) {
+    return sender_credit_.availableForPeer(peer_server_name,
+                                           CreditResource::BounceSlots);
+}
+
+void RdmaTransport::startCtrlWorker() {
+    if (ctrl_worker_running_.exchange(true)) return;
+    ctrl_worker_ = std::thread([this] { ctrlWorkerLoop(); });
+}
+
+void RdmaTransport::stopCtrlWorker() {
+    if (!ctrl_worker_running_.exchange(false)) return;
+    if (ctrl_worker_.joinable()) ctrl_worker_.join();
+}
+
+void RdmaTransport::ctrlWorkerLoop() {
+    while (ctrl_worker_running_.load(std::memory_order_acquire)) {
+        std::vector<std::shared_ptr<CtrlChannel>> channels;
+        std::vector<std::string> pending_grants;
+        {
+            std::lock_guard<std::mutex> lock(ctrl_mutex_);
+            channels.reserve(ctrl_channels_.size());
+            for (auto &entry : ctrl_channels_) {
+                if (entry.second) channels.push_back(entry.second);
+            }
+            for (auto &entry : peer_ctrl_state_) {
+                if (entry.second.grant_pending) {
+                    pending_grants.push_back(entry.first);
+                }
+            }
+        }
+        std::vector<std::shared_ptr<MsgChannel>> msg_channels;
+        {
+            std::lock_guard<std::mutex> lock(ctrl_mutex_);
+            msg_channels.reserve(msg_channels_.size());
+            for (auto &entry : msg_channels_) {
+                if (entry.second) msg_channels.push_back(entry.second);
+            }
+        }
+        int processed = 0;
+        for (auto &channel : channels) {
+            processed += channel->pollCompletions(16);
+        }
+        for (auto &channel : msg_channels) {
+            processed += channel->pollCompletions(16);
+        }
+        for (const auto &peer : pending_grants) {
+            if (sendInitialCreditGrant(peer) == 0) processed++;
+        }
+        if (processed == 0) {
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+    }
 }
 
 // According to the request desc, offset and length information, find proper

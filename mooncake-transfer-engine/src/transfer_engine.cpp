@@ -164,6 +164,14 @@ int TransferEngine::unregisterLocalMemory(void* addr, bool update_metadata) {
     return impl_->unregisterLocalMemory(addr, update_metadata);
 }
 
+void* TransferEngine::allocateManagedBuffer(size_t length) {
+    return impl_->allocateManagedBuffer(length);
+}
+
+int TransferEngine::releaseManagedBuffer(void* addr) {
+    return impl_->releaseManagedBuffer(addr);
+}
+
 Status TransferEngine::submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest>& entries) {
     return impl_->submitTransfer(batch_id, entries);
@@ -335,6 +343,7 @@ std::string TransferEngine::showLinks(bool json) const {
 
 #include <mutex>
 #include <utility>
+#include "error.h"
 #include "graceful_shutdown.h"
 #include "show_links.h"
 
@@ -577,6 +586,16 @@ int TransferEngine::unregisterLocalMemory(void* addr, bool update_metadata) {
         return (int)status.code();
     } else
         return impl_->unregisterLocalMemory(addr, update_metadata);
+}
+
+void* TransferEngine::allocateManagedBuffer(size_t length) {
+    if (use_tent_) return nullptr;
+    return impl_->allocateManagedBuffer(length);
+}
+
+int TransferEngine::releaseManagedBuffer(void* addr) {
+    if (use_tent_) return ERR_NOT_IMPLEMENTED;
+    return impl_->releaseManagedBuffer(addr);
 }
 
 int TransferEngine::registerLocalMemoryBatch(

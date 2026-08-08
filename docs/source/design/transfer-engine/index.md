@@ -543,6 +543,15 @@ kunpeng_ub_transport
 sunrise_link_transport
 :::
 
+## RDMA Two-Sided Control Plane
+
+:::{toctree}
+:maxdepth: 1
+
+rdma-two-sided-control-plane
+rdma-two-sided-code-map
+:::
+
 ## Benchmark and Tuning Guide
 
 :::{toctree}

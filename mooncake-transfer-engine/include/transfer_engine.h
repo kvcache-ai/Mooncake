@@ -131,6 +131,11 @@ class TransferEngine {
 
     int unregisterLocalMemory(void* addr, bool update_metadata = true);
 
+    // TE-managed buffer for the default RDMA two-sided path. Returns nullptr
+    // on failure. Pair with releaseManagedBuffer after transfers complete.
+    void* allocateManagedBuffer(size_t length);
+    int releaseManagedBuffer(void* addr);
+
     Status submitTransfer(BatchID batch_id,
                           const std::vector<TransferRequest>& entries);
 
