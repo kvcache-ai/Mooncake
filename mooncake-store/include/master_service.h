@@ -949,15 +949,13 @@ class MasterService {
             size_t value_length, std::vector<Replica>&& reps,
             bool enable_soft_pin, bool enable_hard_pin = false,
             ObjectDataType data_type_ = ObjectDataType::UNKNOWN,
-            std::string group_id_ = "", TenantId tenant_id_ = TenantId(),
-            std::string user_key_ = {})
+            std::string group_id_ = "", TenantId tenant_id_ = TenantId())
             : client_id(client_id_),
               put_start_time(put_start_time_),
               size(value_length),
               data_type(data_type_),
               group_id(std::move(group_id_)),
               tenant_id(std::move(tenant_id_)),
-              user_key(std::move(user_key_)),
               lease_timeout(),
               soft_pin_timeout(std::nullopt),
               hard_pinned(enable_hard_pin),
@@ -984,7 +982,6 @@ class MasterService {
         const ObjectDataType data_type{ObjectDataType::UNKNOWN};
         const std::string group_id;
         const TenantId tenant_id;
-        const std::string user_key;
 
         mutable SpinLock lock;
         // Default constructor, creates a time_point representing
@@ -1561,7 +1558,8 @@ class MasterService {
     // Helper to clean up stale handles pointing to unmounted segments
     // or local_disk replicas whose owner client is no longer alive.
     bool CleanupStaleHandles(
-        TenantState& tenant_state, ObjectMetadata& metadata,
+        TenantState& tenant_state, const std::string& user_key,
+        ObjectMetadata& metadata,
         const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients,
         MetadataShardAccessorRW* shard = nullptr);
 
@@ -1663,7 +1661,8 @@ class MasterService {
         }
     }
     void CancelPromotionTaskForRemovedReplicas(
-        TenantState& tenant_state, ObjectMetadata& metadata,
+        TenantState& tenant_state, const std::string& user_key,
+        ObjectMetadata& metadata,
         const std::vector<ReplicaID>& removed_replica_ids)
         NO_THREAD_SAFETY_ANALYSIS;
 
@@ -1746,7 +1745,8 @@ class MasterService {
                     },
                     &removed_replica_ids);
                 service_->CancelPromotionTaskForRemovedReplicas(
-                    *tenant_state_, it_->second, removed_replica_ids);
+                    *tenant_state_, it_->first, it_->second,
+                    removed_replica_ids);
                 const uint64_t after_charge =
                     service_->CompletedMemoryQuotaCharge(it_->second);
                 if (before_charge > after_charge) {
@@ -1838,10 +1838,10 @@ class MasterService {
             auto result = tenant_state_->metadata.emplace(
                 std::piecewise_construct,
                 std::forward_as_tuple(object_id_.user_key),
-                std::forward_as_tuple(
-                    client_id, now, total_length, std::move(replicas),
-                    enable_soft_pin, enable_hard_pin, data_type, group_id,
-                    object_id_.tenant_id, object_id_.user_key));
+                std::forward_as_tuple(client_id, now, total_length,
+                                      std::move(replicas), enable_soft_pin,
+                                      enable_hard_pin, data_type, group_id,
+                                      object_id_.tenant_id));
             it_ = result.first;
             if (result.second) {
                 service_->IncrementTenantMetadataObjectCount(

@@ -18,9 +18,9 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <unordered_set>
 #include <utility>
 #include <vector>
-#include <unordered_set>
 
 #include <unistd.h>
 
@@ -1040,6 +1040,48 @@ TEST_F(MasterServiceTest, GetAllKeysListsOnlyRequestedTenant) {
     EXPECT_EQ(
         std::find(tenant_keys->begin(), tenant_keys->end(), default_only_key),
         tenant_keys->end());
+}
+
+TEST_F(MasterServiceTest, MetadataMapKeyRemainsCanonicalAfterRehash) {
+    std::unique_ptr<MasterService> service_(new MasterService());
+    [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);
+    const UUID client_id = generate_uuid();
+
+    static constexpr size_t kMetadataShardCount = 1024;
+    static constexpr size_t kKeyCount = 256;
+    const size_t target_shard =
+        std::hash<std::string>{}("canonical_metadata_key") %
+        kMetadataShardCount;
+
+    std::vector<std::string> keys;
+    keys.reserve(kKeyCount);
+    for (uint64_t candidate = 0; keys.size() < kKeyCount; ++candidate) {
+        std::string key = "canonical_metadata_key_" + std::to_string(candidate);
+        if (std::hash<std::string>{}(key) % kMetadataShardCount ==
+            target_shard) {
+            keys.push_back(std::move(key));
+        }
+    }
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    for (const auto& key : keys) {
+        PutCompletedObject(*service_, client_id, key, config);
+    }
+
+    auto listed_keys = service_->GetAllKeys(TenantId::Default());
+    ASSERT_TRUE(listed_keys.has_value());
+    const std::unordered_set<std::string> listed_set(listed_keys->begin(),
+                                                     listed_keys->end());
+    ASSERT_EQ(listed_set.size(), keys.size());
+    for (const auto& key : keys) {
+        EXPECT_EQ(listed_set.count(key), 1u);
+        ASSERT_TRUE(service_->Remove(key, TenantId::Default()).has_value());
+    }
+
+    auto remaining_keys = service_->GetAllKeys(TenantId::Default());
+    ASSERT_TRUE(remaining_keys.has_value());
+    EXPECT_TRUE(remaining_keys->empty());
 }
 
 TEST_F(MasterServiceTest,
