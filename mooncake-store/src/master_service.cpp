@@ -6085,6 +6085,60 @@ auto MasterService::MountLocalDiskSegment(const UUID& client_id,
     return {};
 }
 
+auto MasterService::UnmountLocalDiskSegment(const UUID& client_id)
+    -> tl::expected<void, ErrorCode> {
+    if (!enable_offload_) {
+        LOG(ERROR) << "The offload functionality is not enabled";
+        return tl::make_unexpected(ErrorCode::UNABLE_OFFLOAD);
+    }
+
+    {
+        ScopedLocalDiskSegmentAccess ssd_access =
+            segment_manager_.getLocalDiskSegmentAccess();
+        const auto& client_segments = ssd_access.getClientLocalDiskSegment();
+        if (client_segments.find(client_id) == client_segments.end()) {
+            // Idempotent, the same way MountLocalDiskSegment treats an
+            // already-mounted segment as success.
+            return {};
+        }
+    }
+
+    // Remove the segment entry first: from here on OffloadObjectHeartbeat
+    // answers SEGMENT_NOT_FOUND, so the master hands this client no further
+    // offload work. Then sweep the replicas it still owns, so no reader can be
+    // given a replica whose owner is about to stop serving. The sweep walks
+    // every metadata shard, so it must run without the segment lock held --
+    // the same order and the same reason as the expiry branch of
+    // ClientMonitorFunc.
+    {
+        std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+        ScopedSegmentAccess segment_access =
+            segment_manager_.getSegmentAccess();
+        segment_access.UnmountLocalDiskSegment(client_id);
+    }
+
+    // The sweep classifies a LOCAL_DISK replica as stale when its owner is
+    // absent from the set it is given, so the set has to name every owner that
+    // is staying -- not just the ones the client monitor currently counts as
+    // alive. A client only enters ok_client_ by remounting, so passing the
+    // alive snapshot alone would drop the disk replicas of any peer that had
+    // not remounted yet, turning one store's deregistration into everyone's.
+    auto staying_clients = getAliveClientsSnapshot();
+    {
+        ScopedLocalDiskSegmentAccess ssd_access =
+            segment_manager_.getLocalDiskSegmentAccess();
+        for (const auto& owner : ssd_access.getClientLocalDiskSegment()) {
+            staying_clients.insert(owner.first);
+        }
+    }
+    staying_clients.erase(client_id);
+    ClearInvalidHandles(staying_clients);
+
+    LOG(INFO) << "client_id=" << client_id
+              << ", action=unmount_local_disk_segment_by_request";
+    return {};
+}
+
 auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
                                            bool enable_offloading)
     -> tl::expected<std::vector<OffloadTaskItem>, ErrorCode> {

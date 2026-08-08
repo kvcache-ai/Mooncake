@@ -3280,6 +3280,15 @@ tl::expected<void, ErrorCode> Client::MountLocalDiskSegment(
     return response;
 }
 
+tl::expected<void, ErrorCode> Client::UnmountLocalDiskSegment() {
+    auto response = master_client_.UnmountLocalDiskSegment(client_id_);
+    if (!response) {
+        LOG(ERROR) << "UnmountLocalDiskSegment failed, error code is "
+                   << response.error();
+    }
+    return response;
+}
+
 tl::expected<void, ErrorCode> Client::OffloadObjectHeartbeat(
     bool enable_offloading, std::vector<OffloadTaskItem>& offloading_objects) {
     auto response =

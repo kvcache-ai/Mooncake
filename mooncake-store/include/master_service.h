@@ -688,6 +688,22 @@ class MasterService {
         -> tl::expected<void, ErrorCode>;
 
     /**
+     * @brief Deregisters a client's file storage segment from the master. This
+     * function is idempotent.
+     *
+     * Drops the client's LOCAL_DISK replicas and its segment entry, which is
+     * what the client-expiry branch of ClientMonitorFunc does after one
+     * client_ttl. Exposing it as an operation lets a store that is shutting
+     * down deregister while it can still serve, instead of leaving the master
+     * advertising it as an owner until the TTL elapses. Object metadata whose
+     * last replica was on that disk is erased, exactly as on expiry; a store
+     * that comes back re-adopts its files through the
+     * MountLocalDiskSegment/NotifyOffloadSuccess path, which recreates them.
+     */
+    auto UnmountLocalDiskSegment(const UUID& client_id)
+        -> tl::expected<void, ErrorCode>;
+
+    /**
      * @brief Heartbeat call to collect object-level statistics and retrieve the
      * set of non-offloaded objects.
      * @param enable_offloading Indicates whether offloading is enabled for this

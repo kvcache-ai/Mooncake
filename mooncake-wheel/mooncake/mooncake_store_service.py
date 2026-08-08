@@ -251,6 +251,12 @@ class MooncakeStoreService:
                 web.post(
                     "/api/unmount", _timed_handler("UNMOUNT", self.handle_unmount)
                 ),
+                web.post(
+                    "/api/unmount_local_disk",
+                    _timed_handler(
+                        "UNMOUNT_LOCAL_DISK", self.handle_unmount_local_disk
+                    ),
+                ),
                 web.put("/api/put", _timed_handler("PUT", self.handle_put)),
                 web.get("/api/get/{key}", _timed_handler("GET", self.handle_get)),
                 web.get("/api/exist/{key}", _timed_handler("EXIST", self.handle_exist)),
@@ -608,6 +614,47 @@ class MooncakeStoreService:
             )
         except Exception as e:
             logging.error("UNMOUNT error: %s", e)
+            return web.Response(
+                status=500,
+                text=json.dumps({"error": str(e)}),
+                content_type="application/json",
+            )
+
+    async def handle_unmount_local_disk(self, request):
+        """Deregister this store's SSD offload tier before the process goes away.
+
+        Meant for a preStop hook. The master stops naming this store as the
+        owner of its offloaded keys, so a reader gets a clean miss instead of a
+        peer that is about to disappear; the call then holds for
+        grace_period_seconds so offload reads already in flight finish here.
+        Runs off the event loop because that wait is seconds long.
+        """
+        try:
+            try:
+                data = await request.json()
+            except Exception:
+                data = {}
+            grace_period_seconds = data.get("grace_period_seconds", 0)
+
+            ret = await asyncio.to_thread(
+                self.store.unmount_local_disk_segment, grace_period_seconds
+            )
+            if ret != 0:
+                return web.Response(
+                    status=500,
+                    text=json.dumps(
+                        {"error": f"Unmount local disk failed, ret={ret}"}
+                    ),
+                    content_type="application/json",
+                )
+
+            return web.Response(
+                status=200,
+                text=json.dumps({"status": "success"}),
+                content_type="application/json",
+            )
+        except Exception as e:
+            logging.error("UNMOUNT_LOCAL_DISK error: %s", e)
             return web.Response(
                 status=500,
                 text=json.dumps({"error": str(e)}),
