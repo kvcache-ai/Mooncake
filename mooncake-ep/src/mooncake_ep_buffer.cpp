@@ -9,9 +9,21 @@ namespace mooncake {
 
 namespace {
 
-int active_qps_per_rank_for_ep(int qps_per_rank, bool is_roce, int cap) {
+int active_qps_per_rank_for_ep(int qps_per_rank, bool is_roce, int cap,
+                               int num_local_experts) {
     if (!is_roce) return qps_per_rank;
-    return std::min(qps_per_rank, cap);
+    // CUDA RoCE shares HCAs across local GPUs; spreading small EP messages
+    // over all expert QPs adds doorbell/progress overhead. MUSA keeps the
+    // existing expert-scaled policy until its high-QP path is fully tuned.
+    int target = cap;
+    if (target <= 0) {
+#ifdef MOONCAKE_EP_USE_MUSA
+        target = std::max(8, num_local_experts);
+#else
+        target = 8;
+#endif
+    }
+    return std::min(qps_per_rank, target);
 }
 
 cudaStream_t create_comm_stream() {
@@ -69,9 +81,9 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
       comm_stream(create_comm_stream()) {
     USE_QP_COUNT = MAX_QP_COUNT / num_ranks * num_ranks;
 
-    // Optional runtime override for the RoCE active-QP cap (default 8).
-    // Set MOONCAKE_EP_ACTIVE_QPS_PER_RANK to a value >= the per-rank QP count
-    // (e.g. 256) to effectively disable the cap.
+    // Optional runtime override for the RoCE active-QP count. Without an
+    // override, CUDA uses eight QPs and MUSA scales up to local experts.
+    active_qps_cap_ = 0;
     if (const char* env = std::getenv("MOONCAKE_EP_ACTIVE_QPS_PER_RANK")) {
         char* end = nullptr;
         long v = std::strtol(env, &end, 10);
@@ -83,7 +95,9 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
                          << env << "'";
         }
     }
-    LOG(INFO) << "[EP] RoCE active QPs/rank cap = " << active_qps_cap_;
+    LOG(INFO) << "[EP] RoCE active QPs/rank override = "
+              << (active_qps_cap_ > 0 ? std::to_string(active_qps_cap_)
+                                      : "auto");
 
     // Get ranks
     CUDA_CHECK(cudaGetDevice(&device_id));
@@ -248,8 +262,7 @@ MooncakeEpBuffer::dispatch(
     void** ipc_ptrs = p2p_transport_->peerPtrsTablePtr();
     int active_qps_per_rank = active_qps_per_rank_for_ep(
         USE_QP_COUNT / num_ranks, rdma_transport_ && rdma_transport_->isRoce(),
-        active_qps_cap_);
-
+        active_qps_cap_, num_experts / num_ranks);
     auto mark_send_done = [=]() {
 #ifdef MOONCAKE_EP_PHASE_ACK
         mooncake::mark_phase_ack(gdr_buffer, nvlink_avail, ipc_ptrs,
@@ -284,8 +297,8 @@ MooncakeEpBuffer::dispatch(
             rkeys_ptr, qp_devctxs_ptr, nvlink_avail, ipc_ptrs, x, topk_idx,
             next_buffer.rdma_recv_signal_buffer, num_tokens, hidden,
             num_max_dispatch_tokens_per_rank, num_topk, num_experts, rank,
-            num_ranks, use_fp8, workspace, launch_stream, timeout_ticks, phases,
-            active_qps_per_rank);
+            num_ranks, use_fp8, workspace, launch_stream,
+            timeout_ticks, phases, active_qps_per_rank);
     };
     if (return_recv_hook) {
         launcher(LOW_LATENCY_SEND_PHASE);
@@ -383,7 +396,7 @@ MooncakeEpBuffer::combine(uint64_t x_ptr, uint64_t topk_idx_ptr,
     void** ipc_ptrs = p2p_transport_->peerPtrsTablePtr();
     int active_qps_per_rank = active_qps_per_rank_for_ep(
         USE_QP_COUNT / num_ranks, rdma_transport_ && rdma_transport_->isRoce(),
-        active_qps_cap_);
+        active_qps_cap_, num_experts / num_ranks);
 
     auto mark_send_done = [=]() {
 #ifdef MOONCAKE_EP_PHASE_ACK
