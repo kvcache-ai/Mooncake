@@ -169,6 +169,20 @@ TEST(OpLogBatchStorageTest, InitializesEmptyNamespaceAtZero) {
     EXPECT_EQ(prefix.last_seq, stored.last_seq);
 }
 
+TEST(OpLogBatchStorageTest, AcceptsNonzeroViewAtEmptyBoundary) {
+    FakeHaKvBackend backend;
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put("/oplog/clusterA/durable_prefix",
+                          EncodeDurablePrefix({.batch_id = 0,
+                                               .last_seq = 0,
+                                               .producer_view_version = 7})));
+    OpLogBatchStorage storage("clusterA", backend);
+
+    DurablePrefix prefix;
+    EXPECT_EQ(ErrorCode::OK, storage.InitDurablePrefix(prefix));
+    EXPECT_EQ(7u, prefix.producer_view_version);
+}
+
 TEST(OpLogBatchStorageTest, RejectsLegacyLatest) {
     FakeHaKvBackend backend;
     ASSERT_EQ(ErrorCode::OK, backend.Put("/oplog/clusterA/latest", "42"));
@@ -379,6 +393,58 @@ TEST(OpLogBatchStorageTest, WriteBatchAndAdvancePrefixCommitsAtomically) {
     EXPECT_EQ(5u, prefix.last_seq);
 }
 
+TEST(OpLogBatchStorageTest, PreservesProducerViewWhenAdvancingPrefix) {
+    FakeHaKvBackend backend;
+    const DurablePrefix expected_prefix{
+        .batch_id = 1, .last_seq = 3, .producer_view_version = 7};
+    ASSERT_EQ(ErrorCode::OK, backend.Put("/oplog/clusterA/durable_prefix",
+                                         EncodeDurablePrefix(expected_prefix)));
+    OpLogBatchStorage storage("clusterA", backend);
+
+    auto batch = MakeBatch(/*batch_id=*/2, /*first_seq=*/4, /*count=*/2);
+    ASSERT_EQ(ErrorCode::OK,
+              storage.WriteBatchAndAdvancePrefix(batch, expected_prefix));
+
+    std::string encoded_prefix;
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Get("/oplog/clusterA/durable_prefix", encoded_prefix));
+    DurablePrefix prefix;
+    ASSERT_TRUE(DecodeDurablePrefix(encoded_prefix, &prefix));
+    EXPECT_EQ(2u, prefix.batch_id);
+    EXPECT_EQ(5u, prefix.last_seq);
+    EXPECT_EQ(7u, prefix.producer_view_version);
+}
+
+TEST(OpLogBatchStorageTest, ExplicitZeroProducerViewCanAdvancePrefix) {
+    FakeHaKvBackend backend;
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put("/oplog/clusterA/batches/00000000000000000001",
+                          EncodeOpLogBatchRecord(MakeBatch(
+                              /*batch_id=*/1, /*first_seq=*/1, /*count=*/3))));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend.Put(
+            "/oplog/clusterA/durable_prefix",
+            R"({"schema_version":1,"batch_id":1,"last_seq":3,"producer_view_version":0})"));
+    OpLogBatchStorage storage("clusterA", backend);
+
+    DurablePrefix prefix;
+    ASSERT_EQ(ErrorCode::OK, storage.InitDurablePrefix(prefix));
+    ASSERT_EQ(0u, prefix.producer_view_version);
+    ASSERT_EQ(
+        ErrorCode::OK,
+        storage.WriteBatchAndAdvancePrefix(
+            MakeBatch(/*batch_id=*/2, /*first_seq=*/4, /*count=*/2), prefix));
+
+    std::string encoded_prefix;
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Get("/oplog/clusterA/durable_prefix", encoded_prefix));
+    ASSERT_TRUE(DecodeDurablePrefix(encoded_prefix, &prefix));
+    EXPECT_EQ(2u, prefix.batch_id);
+    EXPECT_EQ(5u, prefix.last_seq);
+    EXPECT_EQ(0u, prefix.producer_view_version);
+}
+
 TEST(OpLogBatchStorageTest, CompareFailureDoesNotWriteBatchOrAdvancePrefix) {
     FakeHaKvBackend backend;
     ASSERT_EQ(ErrorCode::OK,
@@ -416,6 +482,27 @@ TEST(OpLogBatchStorageTest, CompareFailureIsOkWhenTargetBatchAlreadyDurable) {
 
     EXPECT_EQ(ErrorCode::OK, storage.WriteBatchAndAdvancePrefix(
                                  batch, {.batch_id = 1, .last_seq = 3}));
+}
+
+TEST(OpLogBatchStorageTest,
+     CompareFailureWithDifferentProducerViewIsNotIdempotentSuccess) {
+    FakeHaKvBackend backend;
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put("/oplog/clusterA/durable_prefix",
+                          EncodeDurablePrefix({.batch_id = 2,
+                                               .last_seq = 5,
+                                               .producer_view_version = 8})));
+    auto batch = MakeBatch(/*batch_id=*/2, /*first_seq=*/4, /*count=*/2);
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put("/oplog/clusterA/batches/00000000000000000002",
+                          EncodeOpLogBatchRecord(batch)));
+    backend.FailNextTxn(ErrorCode::ETCD_TRANSACTION_FAIL);
+    OpLogBatchStorage storage("clusterA", backend);
+
+    EXPECT_EQ(
+        ErrorCode::ETCD_TRANSACTION_FAIL,
+        storage.WriteBatchAndAdvancePrefix(
+            batch, {.batch_id = 1, .last_seq = 3, .producer_view_version = 7}));
 }
 
 TEST(OpLogBatchStorageTest, RejectsSkippedBatchId) {
