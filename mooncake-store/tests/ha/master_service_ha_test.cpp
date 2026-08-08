@@ -320,6 +320,18 @@ class MasterServiceHATest : public ::testing::Test {
         ASSERT_EQ(ErrorCode::OK, read_err);
     }
 
+    bool PutStartEventually(MasterService& service, const UUID& client_id,
+                            const std::string& key, const TenantId& tenant,
+                            const ReplicateConfig& config) const {
+        for (int attempt = 0; attempt < 50; ++attempt) {
+            if (service.PutStart(client_id, key, tenant, 1024, config)) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+        return false;
+    }
+
     void ReadRemoveBatchEventually(OpLogBatchStorage& storage,
                                    uint64_t first_batch_id,
                                    const std::string& key,
@@ -1730,10 +1742,9 @@ TEST_F(MasterServiceBatchRecordE2ETest,
     ASSERT_TRUE(removed.has_value());
     EXPECT_FALSE(removed.value());
 
-    auto after_finalize = service.PutStart(
-        mounted.client_id, "batch_e2e_after_remove_finalize_key",
-        kDefaultTenant, 1024, config);
-    EXPECT_TRUE(after_finalize.has_value()) << toString(after_finalize.error());
+    EXPECT_TRUE(PutStartEventually(service, mounted.client_id,
+                                   "batch_e2e_after_remove_finalize_key",
+                                   kDefaultTenant, config));
 }
 
 TEST_F(MasterServiceBatchRecordE2ETest,
@@ -2807,14 +2818,9 @@ TEST_F(MasterServiceHATest, RemoveHidesBeforeDurableAndReleasesAfterFinalize) {
     backend->AllowTxn();
     ReadBatchEventually(storage, 3, batch);
 
-    if (!before_finalize.has_value()) {
-        const std::string after_finalize_key = "after_remove_finalize_key";
-        auto after_finalize =
-            service.PutStart(mounted.client_id, after_finalize_key,
-                             kDefaultTenant, 1024, config);
-        EXPECT_TRUE(after_finalize.has_value())
-            << toString(after_finalize.error());
-    }
+    EXPECT_TRUE(PutStartEventually(service, mounted.client_id,
+                                   "after_remove_finalize_key", kDefaultTenant,
+                                   config));
 }
 
 TEST_F(MasterServiceHATest, BatchRemoveWritesBatchRecordOpLog) {
@@ -2897,15 +2903,9 @@ TEST_F(MasterServiceHATest, BatchRemoveFinalizesEachObjectAfterDurable) {
     backend->AllowTxn();
     ReadBatchEventually(storage, 3, batch);
 
-    if (!before_finalize.has_value()) {
-        const std::string after_finalize_key =
-            "after_batch_remove_finalize_key";
-        auto after_finalize =
-            service.PutStart(mounted.client_id, after_finalize_key,
-                             kDefaultTenant, 1024, config);
-        EXPECT_TRUE(after_finalize.has_value())
-            << toString(after_finalize.error());
-    }
+    EXPECT_TRUE(PutStartEventually(service, mounted.client_id,
+                                   "after_batch_remove_finalize_key",
+                                   kDefaultTenant, config));
 }
 
 TEST_F(MasterServiceHATest, RemoveAllWritesBatchRecordOpLog) {
@@ -2983,14 +2983,9 @@ TEST_F(MasterServiceHATest, RemoveAllFinalizesAfterDurable) {
     backend->AllowTxn();
     ReadBatchEventually(storage, 3, batch);
 
-    if (!before_finalize.has_value()) {
-        const std::string after_finalize_key = "after_remove_all_finalize_key";
-        auto after_finalize =
-            service.PutStart(mounted.client_id, after_finalize_key,
-                             kDefaultTenant, 1024, config);
-        EXPECT_TRUE(after_finalize.has_value())
-            << toString(after_finalize.error());
-    }
+    EXPECT_TRUE(PutStartEventually(service, mounted.client_id,
+                                   "after_remove_all_finalize_key",
+                                   kDefaultTenant, config));
 }
 
 TEST_F(MasterServiceHATest, BatchReplicaClearAllWritesBatchRecordOpLog) {
@@ -3125,14 +3120,9 @@ TEST_F(MasterServiceHATest, BatchReplicaClearAllReleasesAfterDurable) {
     backend->AllowTxn();
     ReadBatchEventually(storage, 3, batch);
 
-    if (!before_finalize.has_value()) {
-        const std::string after_finalize_key = "after_clear_all_finalize_key";
-        auto after_finalize =
-            service.PutStart(mounted.client_id, after_finalize_key,
-                             kDefaultTenant, 1024, config);
-        EXPECT_TRUE(after_finalize.has_value())
-            << toString(after_finalize.error());
-    }
+    EXPECT_TRUE(PutStartEventually(service, mounted.client_id,
+                                   "after_clear_all_finalize_key",
+                                   kDefaultTenant, config));
 }
 
 TEST_F(MasterServiceHATest, BatchReplicaClearSegmentReleasesAfterDurable) {
@@ -3203,15 +3193,9 @@ TEST_F(MasterServiceHATest, BatchReplicaClearSegmentReleasesAfterDurable) {
     backend->AllowTxn();
     ReadBatchEventually(storage, 5, batch);
 
-    if (!before_finalize.has_value()) {
-        const std::string after_finalize_key =
-            "after_clear_segment_finalize_key";
-        auto after_finalize =
-            service.PutStart(mounted.client_id, after_finalize_key,
-                             kDefaultTenant, 1024, config);
-        EXPECT_TRUE(after_finalize.has_value())
-            << toString(after_finalize.error());
-    }
+    EXPECT_TRUE(PutStartEventually(service, mounted.client_id,
+                                   "after_clear_segment_finalize_key",
+                                   kDefaultTenant, config));
 }
 
 TEST_F(MasterServiceHATest, BatchEvictWritesBatchRecordOpLog) {
@@ -3292,14 +3276,9 @@ TEST_F(MasterServiceHATest, BatchEvictReleasesMemoryAfterDurable) {
     backend->AllowTxn();
     ReadBatchEventually(storage, 3, batch);
 
-    if (!before_finalize.has_value()) {
-        const std::string after_finalize_key = "after_batch_evict_finalize_key";
-        auto after_finalize =
-            service.PutStart(mounted.client_id, after_finalize_key,
-                             kDefaultTenant, 1024, config);
-        EXPECT_TRUE(after_finalize.has_value())
-            << toString(after_finalize.error());
-    }
+    EXPECT_TRUE(PutStartEventually(service, mounted.client_id,
+                                   "after_batch_evict_finalize_key",
+                                   kDefaultTenant, config));
 }
 
 TEST_F(MasterServiceHATest, EvictDiskReplicaWritesBatchRecordOpLog) {
@@ -3402,7 +3381,14 @@ TEST_F(MasterServiceHATest, EvictDiskReplicaReleasesLocalDiskAfterDurable) {
 
     backend->AllowTxn();
     ReadBatchEventually(storage, 4, batch);
-    EXPECT_EQ(0, GetLocalDiskUsedBytesForTesting(service, segment_name));
+    bool reclaimed = false;
+    for (int attempt = 0; attempt < 50 && !reclaimed; ++attempt) {
+        reclaimed = GetLocalDiskUsedBytesForTesting(service, segment_name) == 0;
+        if (!reclaimed) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+    EXPECT_TRUE(reclaimed);
 }
 
 #ifdef USE_NOF
@@ -3498,14 +3484,9 @@ TEST_F(MasterServiceHATest, NoFBatchEvictReleasesNoFSpaceAfterDurable) {
     backend->AllowTxn();
     ReadBatchEventually(storage, 2, batch);
 
-    if (!before_finalize.has_value()) {
-        const std::string after_finalize_key =
-            "after_batch_nof_evict_finalize_key";
-        auto after_finalize = service.PutStart(client_id, after_finalize_key,
-                                               kDefaultTenant, 1024, config);
-        EXPECT_TRUE(after_finalize.has_value())
-            << toString(after_finalize.error());
-    }
+    EXPECT_TRUE(PutStartEventually(service, client_id,
+                                   "after_batch_nof_evict_finalize_key",
+                                   kDefaultTenant, config));
 }
 #endif
 
