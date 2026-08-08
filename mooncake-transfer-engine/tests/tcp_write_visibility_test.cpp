@@ -2097,6 +2097,75 @@ TEST(TcpWriteVisibilityTest,
     reclaimBatchDescAfterEngineShutdownForTest(pending_batch);
 }
 
+TEST(TcpWriteVisibilityTest,
+     TaskGroupShutdownCompletesNotYetStartedSlicesExactlyOnce) {
+    constexpr int kRequestCount = 3;
+    constexpr size_t kLength = 64 * 1024;
+
+    ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "1");
+    ScopedEnvVar queue_capacity("MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER", "8");
+    ScopedLaneHooks hooks;
+
+    const char* env = std::getenv("MC_METADATA_SERVER");
+    const std::string metadata_server = env ? env : "P2PHANDSHAKE";
+
+    HoldingWriteServer fake_peer;
+    ASSERT_TRUE(fake_peer.ok());
+
+    EngineHandle h;
+    h.init(metadata_server, "127.0.0.2:17936", kLength);
+    ASSERT_TRUE(h.ok);
+    pointTcpSegmentAt(h, fake_peer.port());
+
+    memset(h.pool, 0x6D, kLength);
+    TransferRequest request = makeWriteRequest(h, kLength);
+    request.task_group_id = 1;
+
+    std::vector<TransferRequest> requests(kRequestCount, request);
+    const auto batch_id = h.engine->allocateBatchID(kRequestCount);
+    ASSERT_TRUE(h.engine->submitTransfer(batch_id, requests).ok());
+
+    // Task-group sequencing starts only the first Slice. Hold it BUSY so the
+    // remaining Slices have been created but have not entered the lane queue.
+    ASSERT_TRUE(fake_peer.waitForAccepted(1, std::chrono::seconds(5)));
+    ASSERT_TRUE(waitForPredicate(
+        [] { return lane_busy_count.load(std::memory_order_acquire) >= 1; },
+        std::chrono::seconds(5)));
+
+    h.engine.reset();
+
+    // Shutdown must not strand the sequence tail merely because the TCP
+    // io_context has already been stopped. Every pre-created Slice must become
+    // terminal exactly once.
+    expectEverySliceCompletedExactlyOnceAfterShutdown(batch_id);
+
+    const auto& batch = Transport::toBatchDesc(batch_id);
+    ASSERT_EQ(batch.task_list.size(), kRequestCount);
+    for (size_t task_id = 0; task_id < batch.task_list.size(); ++task_id) {
+        const auto& task = batch.task_list[task_id];
+        const uint64_t success =
+            __atomic_load_n(&task.success_slice_count, __ATOMIC_RELAXED);
+        const uint64_t failed =
+            __atomic_load_n(&task.failed_slice_count, __ATOMIC_RELAXED);
+        const uint64_t slices =
+            __atomic_load_n(&task.slice_count, __ATOMIC_RELAXED);
+
+        EXPECT_EQ(slices, 1u) << "task " << task_id;
+        EXPECT_EQ(success, 0u) << "task " << task_id;
+        EXPECT_EQ(failed, 1u) << "task " << task_id;
+        ASSERT_EQ(task.slice_list.size(), 1u);
+        EXPECT_EQ(task.slice_list.front()->status, Transport::Slice::FAILED)
+            << "task " << task_id;
+    }
+
+    EXPECT_EQ(shutdown_failure_count.load(std::memory_order_acquire),
+              kRequestCount);
+    EXPECT_EQ(lane_shutdown_clean_count.load(std::memory_order_acquire), 1);
+
+    hooks.reset();
+    reclaimBatchDescAfterEngineShutdownForTest(batch_id);
+}
+
 TEST(TcpWriteVisibilityTest, LaneTerminalTypesAreMoveOnly) {
     EXPECT_TRUE(tcpTransportLaneTypesAreMoveOnlyForTest());
 }

@@ -503,26 +503,69 @@ Transport::Slice* TcpTransport::prepareTransfer(
 
 void TcpTransport::startTransferSequence(std::vector<Slice*> slices) {
     struct Sequence {
+        std::mutex mutex;
         std::vector<Slice*> slices;
         size_t next = 0;
+        bool advancing = false;
+        bool resume_requested = false;
     };
+
     auto sequence = std::make_shared<Sequence>();
     sequence->slices = std::move(slices);
+
     auto advance = std::make_shared<std::function<void()>>();
     std::weak_ptr<std::function<void()>> weak_advance = advance;
+
     *advance = [this, sequence, weak_advance]() {
         auto advance = weak_advance.lock();
-        if (!advance || sequence->next == sequence->slices.size()) return;
-        auto* slice = sequence->slices[sequence->next++];
-        std::function<void()> continuation;
-        if (sequence->next < sequence->slices.size()) {
-            auto executor = context_->io_context.get_executor();
-            continuation = [executor, advance]() mutable {
-                asio::post(executor, [advance]() { (*advance)(); });
-            };
+        if (!advance) return;
+
+        {
+            std::lock_guard<std::mutex> lock(sequence->mutex);
+            if (sequence->next == sequence->slices.size()) return;
+            if (sequence->advancing) {
+                sequence->resume_requested = true;
+                return;
+            }
+            sequence->advancing = true;
         }
-        startTransfer(slice, std::move(continuation), true);
+
+        while (true) {
+            Slice* slice = nullptr;
+            bool has_more = false;
+            {
+                std::lock_guard<std::mutex> lock(sequence->mutex);
+                if (sequence->next == sequence->slices.size()) {
+                    sequence->advancing = false;
+                    return;
+                }
+                slice = sequence->slices[sequence->next++];
+                has_more = sequence->next < sequence->slices.size();
+                sequence->resume_requested = false;
+            }
+
+            std::function<void()> continuation;
+            if (has_more) {
+                continuation = [advance]() { (*advance)(); };
+            }
+
+            // startTransfer may fail synchronously (including during shutdown).
+            // The trampoline above turns a synchronous continuation into
+            // another loop iteration rather than recursive calls. For an
+            // asynchronous completion, this invocation returns and the
+            // continuation becomes the next runner.
+            startTransfer(slice, std::move(continuation), true);
+
+            {
+                std::lock_guard<std::mutex> lock(sequence->mutex);
+                if (!sequence->resume_requested) {
+                    sequence->advancing = false;
+                    return;
+                }
+            }
+        }
     };
+
     (*advance)();
 }
 
