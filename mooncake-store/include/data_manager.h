@@ -15,6 +15,7 @@
 #include <vector>
 #include <functional>
 #include <async_simple/Future.h>
+#include <async_simple/coro/Lazy.h>
 #include <ylt/util/tl/expected.hpp>
 #include "async_memcpy_executor.h"
 #include "client_buffer.hpp"
@@ -234,6 +235,11 @@ class DataManager {
         std::string_view key,
         const std::vector<RemoteBufferDesc>& dest_buffers);
 
+    /** Reverse read with TE wait offloaded when te_poll is enabled. */
+    async_simple::coro::Lazy<tl::expected<void, ErrorCode>> ReadRemoteDataAsync(
+        std::string_view key,
+        const std::vector<RemoteBufferDesc>& dest_buffers);
+
     /**
      * @brief Write data from remote source buffers
      * @param key Object key to write
@@ -244,6 +250,12 @@ class DataManager {
     tl::expected<UUID, ErrorCode> WriteRemoteData(
         std::string_view key, const std::vector<RemoteBufferDesc>& src_buffers,
         std::optional<UUID> tier_id = std::nullopt);
+
+    /** Reverse write with TE wait offloaded when te_poll is enabled. */
+    async_simple::coro::Lazy<tl::expected<UUID, ErrorCode>>
+    WriteRemoteDataAsync(std::string_view key,
+                         const std::vector<RemoteBufferDesc>& src_buffers,
+                         std::optional<UUID> tier_id = std::nullopt);
 
     tl::expected<PreWriteResponse, ErrorCode> PreWrite(
         std::string_view key, size_t size_bytes,

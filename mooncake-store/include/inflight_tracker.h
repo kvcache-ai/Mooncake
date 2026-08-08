@@ -3,15 +3,17 @@
 #include <glog/logging.h>
 
 #include <atomic>
+#include <condition_variable>
 #include <functional>
 #include <mutex>
-#include <shared_mutex>
 #include <string>
 #include <utility>
 
 namespace mooncake {
 
-// Tracks in-flight operations and supports graceful draining via a rw lock.
+// Tracks in-flight work for graceful drain. Guard is thread-agnostic (safe to
+// destroy after co_await on another executor).
+// Drain protocol: Close() then Wait(). Wait() alone does not reject new Enter().
 class InflightTracker {
    public:
     explicit InflightTracker(std::string name,
@@ -21,25 +23,21 @@ class InflightTracker {
           on_entering_(std::move(on_entering)),
           on_leaving_(std::move(on_leaving)) {}
 
-    // RAII guard for one in-flight operation; holds the read lock while alive.
+    // RAII guard for one in-flight operation.
     class Guard {
        public:
-        explicit Guard(InflightTracker* tracker) : lock_(tracker->rwlock_) {
+        explicit Guard(InflightTracker* tracker) {
             if (tracker->Admit()) {
                 tracker_ = tracker;
-            } else {
-                lock_.unlock();
             }
         }
 
-        Guard(Guard&& other) noexcept
-            : lock_(std::move(other.lock_)), tracker_(other.tracker_) {
+        Guard(Guard&& other) noexcept : tracker_(other.tracker_) {
             other.tracker_ = nullptr;
         }
         Guard& operator=(Guard&& other) noexcept {
             if (this != &other) {
                 if (tracker_) tracker_->Retire();
-                lock_ = std::move(other.lock_);
                 tracker_ = other.tracker_;
                 other.tracker_ = nullptr;
             }
@@ -57,23 +55,24 @@ class InflightTracker {
         bool is_valid() const { return tracker_ != nullptr; }
 
        private:
-        std::shared_lock<std::shared_mutex> lock_;
         InflightTracker* tracker_ = nullptr;  // non-null iff admitted
     };
 
    public:
     Guard Enter() { return Guard(this); }
 
-    // Stop admitting new operations
+    // Reject further Enter(); returns whether this call flipped running→false.
     bool Close() { return running_.exchange(false, std::memory_order_acq_rel); }
 
-    // Block until all in-flight operations have finished. Pure wait — does not
-    // change the running state. Call Close() first so new operations stop
-    // arriving, otherwise this may not converge.
+    // Block until inflight_ == 0. Does not stop new Enter() — call Close()
+    // first, or Wait() may never return while callers keep entering.
     void Wait() {
         LOG(INFO) << name_ << ": draining, in-flight="
                   << inflight_.load(std::memory_order_acquire);
-        std::lock_guard<std::shared_mutex> wait_for_inflight(rwlock_);
+        std::unique_lock<std::mutex> lock(mu_);
+        cv_.wait(lock, [this] {
+            return inflight_.load(std::memory_order_acquire) == 0;
+        });
         LOG(INFO) << name_ << ": drained";
     }
 
@@ -81,16 +80,28 @@ class InflightTracker {
     int inflight() const { return inflight_.load(std::memory_order_acquire); }
 
    private:
-    // Admit() and Retire() run while the Guard holds the read lock.
     bool Admit() {
         if (!running_.load(std::memory_order_acquire)) return false;
         inflight_.fetch_add(1, std::memory_order_acq_rel);
+        // Close() may have raced after the first check; undo and reject.
+        if (!running_.load(std::memory_order_acquire)) {
+            NotifyIfDrained(
+                inflight_.fetch_sub(1, std::memory_order_acq_rel) == 1);
+            return false;
+        }
         if (on_entering_) on_entering_();
         return true;
     }
+
     void Retire() {
         if (on_leaving_) on_leaving_();
-        inflight_.fetch_sub(1, std::memory_order_acq_rel);
+        NotifyIfDrained(inflight_.fetch_sub(1, std::memory_order_acq_rel) == 1);
+    }
+
+    void NotifyIfDrained(bool became_zero) {
+        if (!became_zero) return;
+        std::lock_guard<std::mutex> lock(mu_);
+        cv_.notify_all();
     }
 
     std::string name_;
@@ -102,7 +113,8 @@ class InflightTracker {
     std::function<void()> on_leaving_;
     std::atomic<bool> running_{true};
     std::atomic<int> inflight_{0};
-    std::shared_mutex rwlock_;
+    std::mutex mu_;
+    std::condition_variable cv_;
 };
 
 }  // namespace mooncake

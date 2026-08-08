@@ -5,13 +5,11 @@
 #include <glog/logging.h>
 #include <async_simple/Future.h>
 #include <async_simple/Promise.h>
-#include <async_simple/Executor.h>
-#include <async_simple/coro/CurrentExecutor.h>
-#include <async_simple/coro/FutureAwaiter.h>
 #include <async_simple/coro/Lazy.h>
 #include <async_simple/coro/SyncAwait.h>
 #include <ylt/util/tl/expected.hpp>
 
+#include "te_wait_future.h"
 #include "types.h"
 
 namespace mooncake {
@@ -103,23 +101,9 @@ class FutureHandle : public TaskHandle<V> {
         }
     }
 
-    // When the Lazy has an executor (via CurrentExecutor), bind the Future so
-    // TE-poll setValue resumes the coroutine on that executor, not on the poll
-    // worker.
+    // Resume off te_poll: via CurrentExecutor, or coro_io global if unbound.
     async_simple::coro::Lazy<tl::expected<V, ErrorCode>> WaitAsync() override {
-        async_simple::Executor* ex = co_await async_simple::coro::CurrentExecutor{};
-        try {
-            if (ex != nullptr) {
-                co_return co_await std::move(future_).via(ex);
-            }
-            co_return co_await std::move(future_);
-        } catch (const std::exception& e) {
-            LOG(ERROR) << "FutureHandle::WaitAsync exception: " << e.what();
-            co_return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-        } catch (...) {
-            LOG(ERROR) << "FutureHandle::WaitAsync unknown exception";
-            co_return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-        }
+        co_return co_await AwaitTeExpectedFuture(std::move(future_));
     }
 
     template <typename T>

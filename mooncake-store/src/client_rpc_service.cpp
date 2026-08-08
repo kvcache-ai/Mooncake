@@ -1,8 +1,10 @@
 #include "client_rpc_service.h"
 
 #include <utility>
+#include <exception>
 
 #include <glog/logging.h>
+#include <async_simple/coro/Lazy.h>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 #include "utils.h"
 #include "utils/scoped_vlog_timer.h"
@@ -73,8 +75,8 @@ void ClientRpcService::RecordPeerInflight(bool entering) {
     }
 }
 
-tl::expected<void, ErrorCode> ClientRpcService::ReadRemoteData(
-    const RemoteReadRequest& request) {
+async_simple::coro::Lazy<tl::expected<void, ErrorCode>>
+ClientRpcService::ReadRemoteData(const RemoteReadRequest& request) {
     ScopedVLogTimer timer(1, "ClientRpcService::ReadRemoteData");
     timer.LogRequest("key=", request.key,
                      "buffer_count=", request.dest_buffers.size());
@@ -83,7 +85,7 @@ tl::expected<void, ErrorCode> ClientRpcService::ReadRemoteData(
     if (!inflight_handle.is_valid()) {
         LOG(WARNING) << "Rejecting peer RPC for key=" << request.key
                      << ": client is draining/shutting down";
-        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        co_return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
 
     if (metrics_) {
@@ -98,45 +100,66 @@ tl::expected<void, ErrorCode> ClientRpcService::ReadRemoteData(
             metrics_->peer_request_metrics.read_remote_data.latency_failure
                 .observe(sw.elapsed_us());
         }
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        co_return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Delegate to DataManager
-    auto result =
-        data_manager_.ReadRemoteData(request.key, request.dest_buffers);
+    try {
+        auto result = co_await data_manager_.ReadRemoteDataAsync(
+            request.key, request.dest_buffers);
 
-    if (!result.has_value()) {
-        LOG(ERROR) << "ReadRemoteData failed for key: " << request.key
-                   << ", error: " << toString(result.error());
-        timer.LogResponse("error_code=", result.error());
-        if (result.error() == ErrorCode::OBJECT_NOT_FOUND) {
-            data_manager_.RectifyReadRoute(request.key);
-        }
-        if (metrics_) {
+        if (!result.has_value()) {
+            LOG(ERROR) << "ReadRemoteData failed for key: " << request.key
+                       << ", error: " << toString(result.error());
+            timer.LogResponse("error_code=", result.error());
             if (result.error() == ErrorCode::OBJECT_NOT_FOUND) {
-                metrics_->peer_request_metrics.read_remote_data.misses.inc();
-            } else {
-                metrics_->peer_request_metrics.read_remote_data.failures.inc();
+                data_manager_.RectifyReadRoute(request.key);
             }
+            if (metrics_) {
+                if (result.error() == ErrorCode::OBJECT_NOT_FOUND) {
+                    metrics_->peer_request_metrics.read_remote_data.misses.inc();
+                } else {
+                    metrics_->peer_request_metrics.read_remote_data.failures
+                        .inc();
+                }
+                metrics_->peer_request_metrics.read_remote_data.latency_failure
+                    .observe(sw.elapsed_us());
+            }
+            co_return result;
+        }
+
+        if (metrics_) {
+            metrics_->peer_request_metrics.read_remote_data.hits.inc();
+            metrics_->peer_request_metrics.read_remote_data.latency_success
+                .observe(sw.elapsed_us());
+        }
+
+        timer.LogResponse("error_code=", ErrorCode::OK);
+        co_return result;
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "ReadRemoteData exception for key=" << request.key
+                   << ", what=" << e.what();
+        timer.LogResponse("error_code=", ErrorCode::INTERNAL_ERROR);
+        if (metrics_) {
+            metrics_->peer_request_metrics.read_remote_data.failures.inc();
             metrics_->peer_request_metrics.read_remote_data.latency_failure
                 .observe(sw.elapsed_us());
         }
-        return result;
+        co_return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    } catch (...) {
+        LOG(ERROR) << "ReadRemoteData unknown exception for key="
+                   << request.key;
+        timer.LogResponse("error_code=", ErrorCode::INTERNAL_ERROR);
+        if (metrics_) {
+            metrics_->peer_request_metrics.read_remote_data.failures.inc();
+            metrics_->peer_request_metrics.read_remote_data.latency_failure
+                .observe(sw.elapsed_us());
+        }
+        co_return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-
-    // Record successful get: latency
-    if (metrics_) {
-        metrics_->peer_request_metrics.read_remote_data.hits.inc();
-        metrics_->peer_request_metrics.read_remote_data.latency_success.observe(
-            sw.elapsed_us());
-    }
-
-    timer.LogResponse("error_code=", ErrorCode::OK);
-    return {};
 }
 
-tl::expected<UUID, ErrorCode> ClientRpcService::WriteRemoteData(
-    const RemoteWriteRequest& request) {
+async_simple::coro::Lazy<tl::expected<UUID, ErrorCode>>
+ClientRpcService::WriteRemoteData(const RemoteWriteRequest& request) {
     ScopedVLogTimer timer(1, "ClientRpcService::WriteRemoteData");
     timer.LogRequest("key=", request.key,
                      "buffer_count=", request.src_buffers.size());
@@ -145,7 +168,7 @@ tl::expected<UUID, ErrorCode> ClientRpcService::WriteRemoteData(
     if (!inflight_handle.is_valid()) {
         LOG(WARNING) << "Rejecting peer RPC for key=" << request.key
                      << ": client is draining/shutting down";
-        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        co_return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
 
     if (metrics_) {
@@ -160,32 +183,53 @@ tl::expected<UUID, ErrorCode> ClientRpcService::WriteRemoteData(
             metrics_->peer_request_metrics.write_remote_data.latency_failure
                 .observe(sw.elapsed_us());
         }
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        co_return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    // Delegate to DataManager
-    auto result = data_manager_.WriteRemoteData(
-        request.key, request.src_buffers, request.target_tier_id);
+    try {
+        auto result = co_await data_manager_.WriteRemoteDataAsync(
+            request.key, request.src_buffers, request.target_tier_id);
 
-    if (!result.has_value()) {
-        LOG(ERROR) << "WriteRemoteData failed for key: " << request.key
-                   << ", error: " << toString(result.error());
-        timer.LogResponse("error_code=", result.error());
+        if (!result.has_value()) {
+            LOG(ERROR) << "WriteRemoteData failed for key: " << request.key
+                       << ", error: " << toString(result.error());
+            timer.LogResponse("error_code=", result.error());
+            if (metrics_) {
+                metrics_->peer_request_metrics.write_remote_data.failures.inc();
+                metrics_->peer_request_metrics.write_remote_data.latency_failure
+                    .observe(sw.elapsed_us());
+            }
+            co_return result;
+        }
+
+        if (metrics_) {
+            metrics_->peer_request_metrics.write_remote_data.latency_success
+                .observe(sw.elapsed_us());
+        }
+
+        timer.LogResponse("error_code=", ErrorCode::OK);
+        co_return result;
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "WriteRemoteData exception for key=" << request.key
+                   << ", what=" << e.what();
+        timer.LogResponse("error_code=", ErrorCode::INTERNAL_ERROR);
         if (metrics_) {
             metrics_->peer_request_metrics.write_remote_data.failures.inc();
             metrics_->peer_request_metrics.write_remote_data.latency_failure
                 .observe(sw.elapsed_us());
         }
-        return result;
+        co_return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    } catch (...) {
+        LOG(ERROR) << "WriteRemoteData unknown exception for key="
+                   << request.key;
+        timer.LogResponse("error_code=", ErrorCode::INTERNAL_ERROR);
+        if (metrics_) {
+            metrics_->peer_request_metrics.write_remote_data.failures.inc();
+            metrics_->peer_request_metrics.write_remote_data.latency_failure
+                .observe(sw.elapsed_us());
+        }
+        co_return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-
-    if (metrics_) {
-        metrics_->peer_request_metrics.write_remote_data.latency_success
-            .observe(sw.elapsed_us());
-    }
-
-    timer.LogResponse("error_code=", ErrorCode::OK);
-    return result;
 }
 
 tl::expected<PreWriteResponse, ErrorCode> ClientRpcService::PreWrite(

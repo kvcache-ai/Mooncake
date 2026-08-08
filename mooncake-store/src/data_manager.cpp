@@ -19,10 +19,10 @@
 #include "utils.h"
 
 #include <async_simple/Promise.h>
-#include <async_simple/Executor.h>
-#include <async_simple/coro/CurrentExecutor.h>
-#include <async_simple/coro/FutureAwaiter.h>
 #include <async_simple/coro/Lazy.h>
+#include <async_simple/coro/SyncAwait.h>
+
+#include "te_wait_future.h"
 
 namespace mooncake {
 
@@ -513,23 +513,6 @@ tl::expected<void, ErrorCode> GetExpectedFuture(
     }
 }
 
-async_simple::coro::Lazy<tl::expected<void, ErrorCode>> AwaitExpectedFuture(
-    async_simple::Future<tl::expected<void, ErrorCode>> fut) {
-    async_simple::Executor* ex = co_await async_simple::coro::CurrentExecutor{};
-    try {
-        if (ex != nullptr) {
-            co_return co_await std::move(fut).via(ex);
-        }
-        co_return co_await std::move(fut);
-    } catch (const std::exception& e) {
-        LOG(ERROR) << "TE wait future exception: " << e.what();
-        co_return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-    } catch (...) {
-        LOG(ERROR) << "TE wait future unknown exception";
-        co_return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-}
-
 }  // namespace
 
 // Keeps TeSubmitResult alive across async TE wait, then runs copy/commit.
@@ -555,7 +538,7 @@ class PutViaTeTaskHandle final : public TaskHandle<void> {
         override {
         co_return dm_->FinishPutViaTeAfterWait(
             kctx_, write_operation_id_, ctx_,
-            co_await AwaitExpectedFuture(std::move(wait_future_)));
+            co_await AwaitTeExpectedFuture(std::move(wait_future_)));
     }
 
    private:
@@ -909,6 +892,13 @@ tl::expected<ReadTaskHandle, ErrorCode> DataManager::BuildDataCopierViaMemcpy(
 
 tl::expected<void, ErrorCode> DataManager::ReadRemoteData(
     std::string_view key, const std::vector<RemoteBufferDesc>& dest_buffers) {
+    return async_simple::coro::syncAwait(
+        ReadRemoteDataAsync(key, dest_buffers));
+}
+
+async_simple::coro::Lazy<tl::expected<void, ErrorCode>>
+DataManager::ReadRemoteDataAsync(
+    std::string_view key, const std::vector<RemoteBufferDesc>& dest_buffers) {
     ScopedVLogTimer timer(1, "DataManager::ReadRemoteData");
     timer.LogRequest("key=", key, "buffer_count=", dest_buffers.size());
 
@@ -917,7 +907,7 @@ tl::expected<void, ErrorCode> DataManager::ReadRemoteData(
         LOG(ERROR) << "ReadRemoteData: Buffer validation failed for key: "
                    << key << ", error: " << toString(validate_result.error());
         timer.LogResponse("error_code=", validate_result.error());
-        return tl::make_unexpected(validate_result.error());
+        co_return tl::make_unexpected(validate_result.error());
     }
 
     // Reverse transfer read stays on the direct object-handle path. Only
@@ -933,20 +923,32 @@ tl::expected<void, ErrorCode> DataManager::ReadRemoteData(
             VLOG(1) << "ReadRemoteData: key not found locally, key=" << key;
         }
         timer.LogResponse("error_code=", handle_result.error());
-        return tl::make_unexpected(handle_result.error());
+        co_return tl::make_unexpected(handle_result.error());
     }
 
-    auto transfer_result =
-        TransferDataToRemote(handle_result.value(), dest_buffers);
-    if (!transfer_result) {
-        LOG(ERROR) << "ReadRemoteData: TransferDataToRemote failed"
+    auto submit_result = SubmitTeTransferInternal(
+        handle_result.value(), dest_buffers, Transport::TransferRequest::WRITE);
+    if (!submit_result) {
+        LOG(ERROR) << "ReadRemoteData: SubmitTeTransferInternal failed"
                    << ", key=" << key
-                   << ", error=" << toString(transfer_result.error());
-        timer.LogResponse("error_code=", transfer_result.error());
-        return tl::make_unexpected(transfer_result.error());
+                   << ", error=" << toString(submit_result.error());
+        timer.LogResponse("error_code=", submit_result.error());
+        co_return tl::make_unexpected(submit_result.error());
+    }
+    // Keep TeSubmitResult (AllocationHandle / temp_buffer) alive across await.
+    TeSubmitResult ctx = std::move(*submit_result);
+
+    auto wait_result = co_await AwaitTeExpectedFuture(
+        WaitAllTransferBatchesAsync(std::move(ctx.transfer_batches)));
+    if (!wait_result) {
+        LOG(ERROR) << "ReadRemoteData: WaitAllTransferBatches failed"
+                   << ", key=" << key
+                   << ", error=" << toString(wait_result.error());
+        timer.LogResponse("error_code=", wait_result.error());
+        co_return wait_result;
     }
     timer.LogResponse("error_code=", ErrorCode::OK);
-    return {};
+    co_return tl::expected<void, ErrorCode>{};
 }
 
 tl::expected<void, ErrorCode> DataManager::TransferDataToRemote(
@@ -968,6 +970,14 @@ tl::expected<void, ErrorCode> DataManager::TransferDataToRemote(
 tl::expected<UUID, ErrorCode> DataManager::WriteRemoteData(
     std::string_view key, const std::vector<RemoteBufferDesc>& src_buffers,
     std::optional<UUID> tier_id) {
+    return async_simple::coro::syncAwait(
+        WriteRemoteDataAsync(key, src_buffers, tier_id));
+}
+
+async_simple::coro::Lazy<tl::expected<UUID, ErrorCode>>
+DataManager::WriteRemoteDataAsync(
+    std::string_view key, const std::vector<RemoteBufferDesc>& src_buffers,
+    std::optional<UUID> tier_id) {
     ScopedVLogTimer timer(1, "DataManager::WriteRemoteData");
     timer.LogRequest("key=", key, "buffer_count=", src_buffers.size());
     const KeyCtx kctx = BuildKeyCtx(key);
@@ -977,7 +987,7 @@ tl::expected<UUID, ErrorCode> DataManager::WriteRemoteData(
         LOG(ERROR) << "WriteRemoteData: Buffer validation failed for key: "
                    << key << ", error: " << toString(validate_result.error());
         timer.LogResponse("error_code=", validate_result.error());
-        return tl::make_unexpected(validate_result.error());
+        co_return tl::make_unexpected(validate_result.error());
     }
 
     size_t total_size = 0;
@@ -990,28 +1000,54 @@ tl::expected<UUID, ErrorCode> DataManager::WriteRemoteData(
         PreWriteInternal(kctx, total_size, tier_id, /*dram_only=*/false);
     if (!prewrite_result) {
         timer.LogResponse("error_code=", prewrite_result.error());
-        return tl::make_unexpected(prewrite_result.error());
+        co_return tl::make_unexpected(prewrite_result.error());
     }
     const UUID write_operation_id = prewrite_result->write_operation_id;
     AllocationHandle handle = prewrite_result->handle;
     UUID result_tier_id = handle->loc.tier->GetTierId();
 
-    auto transfer_result = TransferDataFromRemote(handle, src_buffers);
-    if (!transfer_result) {
+    auto submit_result = SubmitTeTransferInternal(
+        handle, src_buffers, Transport::TransferRequest::READ);
+    if (!submit_result) {
         (void)WriteRevokeInternal(kctx, write_operation_id);
-        timer.LogResponse("error_code=", transfer_result.error());
-        return tl::make_unexpected(transfer_result.error());
+        timer.LogResponse("error_code=", submit_result.error());
+        co_return tl::make_unexpected(submit_result.error());
+    }
+    TeSubmitResult ctx = std::move(*submit_result);
+
+    auto wait_result = co_await AwaitTeExpectedFuture(
+        WaitAllTransferBatchesAsync(std::move(ctx.transfer_batches)));
+    if (!wait_result) {
+        (void)WriteRevokeInternal(kctx, write_operation_id);
+        timer.LogResponse("error_code=", wait_result.error());
+        co_return tl::make_unexpected(wait_result.error());
+    }
+
+    if (ctx.handle->loc.data.type != MemoryType::DRAM && ctx.temp_buffer) {
+        auto& loc_data = ctx.handle->loc.data;
+        auto copy_result = CopyFromDRAMBuffer(
+            ctx.temp_buffer.get(),
+            reinterpret_cast<void*>(loc_data.buffer->data()), loc_data.type,
+            loc_data.buffer->size(), ctx.handle->backend);
+        if (!copy_result) {
+            LOG(ERROR)
+                << "WriteRemoteData: Failed to copy from temp DRAM buffer to "
+                   "destination tier";
+            (void)WriteRevokeInternal(kctx, write_operation_id);
+            timer.LogResponse("error_code=", copy_result.error());
+            co_return tl::make_unexpected(copy_result.error());
+        }
     }
 
     auto commit_result = WriteCommitInternal(kctx, write_operation_id);
     if (!commit_result) {
         timer.LogResponse("error_code=", commit_result.error());
-        return tl::make_unexpected(commit_result.error());
+        co_return tl::make_unexpected(commit_result.error());
     }
 
     timer.LogResponse("error_code=", ErrorCode::OK,
                       "transferred_bytes=", total_size);
-    return result_tier_id;
+    co_return result_tier_id;
 }
 
 tl::expected<PreWriteResponse, ErrorCode> DataManager::PreWrite(

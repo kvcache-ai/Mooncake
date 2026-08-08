@@ -14,13 +14,11 @@
 #include <thread>
 
 #include <async_simple/Try.h>
-#include <async_simple/Executor.h>
-#include <async_simple/coro/CurrentExecutor.h>
-#include <async_simple/coro/FutureAwaiter.h>
 #include <async_simple/coro/Lazy.h>
 #include <async_simple/coro/SyncAwait.h>
 #include <ylt/coro_io/coro_io.hpp>
 
+#include "te_wait_future.h"
 #include "utils/scoped_vlog_timer.h"
 
 namespace mooncake {
@@ -31,25 +29,6 @@ namespace {
 // (e.g. after TE write failure, or read cleanup). LEASE_EXPIRED is treated as
 // success; a missing owner record is already OK (idempotent).
 constexpr int kRevokeRetryMaxCnt = 3;
-
-// Resume TE-poll Futures on the Lazy's executor (coro_io global by default)
-// so WriteCommit/WriteRevoke/UnPin do not continue on te_poll workers.
-async_simple::coro::Lazy<tl::expected<void, ErrorCode>> AwaitTeWaitFuture(
-    async_simple::Future<tl::expected<void, ErrorCode>> fut) {
-    async_simple::Executor* ex = co_await async_simple::coro::CurrentExecutor{};
-    try {
-        if (ex != nullptr) {
-            co_return co_await std::move(fut).via(ex);
-        }
-        co_return co_await std::move(fut);
-    } catch (const std::exception& e) {
-        LOG(ERROR) << "TE wait future exception: " << e.what();
-        co_return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-    } catch (...) {
-        LOG(ERROR) << "TE wait future unknown exception";
-        co_return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-}
 
 }  // namespace
 
@@ -1832,7 +1811,7 @@ async_simple::coro::Lazy<ErrorCode> P2PClientService::RunForwardReadOnRoute(
     }
     void* base = reinterpret_cast<void*>(req->dest_buffers[0].addr);
     const size_t total = req->dest_buffers[0].size;
-    auto tr = co_await AwaitTeWaitFuture(data_manager_->TransferDataAsync(
+    auto tr = co_await AwaitTeExpectedFuture(data_manager_->TransferDataAsync(
         base, total, {pin.value().remote_buffer},
         Transport::TransferRequest::READ));
     if (!tr) {
@@ -2519,7 +2498,7 @@ P2PClientService::RemoteForwardWriteOp::RunForwardRemotePut(
 
         std::vector<RemoteBufferDesc> dest{pre.value().remote_buffer};
         void* base = slices->front().ptr;
-        auto te = co_await AwaitTeWaitFuture(
+        auto te = co_await AwaitTeExpectedFuture(
             te_transfer(base, slices->front().size, dest));
         if (!te) {
             LOG(ERROR) << "Forward TE write failed, key=" << write_req->key
