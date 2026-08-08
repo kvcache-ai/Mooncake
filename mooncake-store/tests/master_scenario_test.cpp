@@ -24,6 +24,9 @@ template <typename T>
 concept SupportsIsNotReady = requires(T value) { value.IsNotReady(); };
 
 template <typename T>
+concept SupportsDoesNotExist = requires(T value) { value.DoesNotExist(); };
+
+template <typename T>
 concept SupportsHasReplicas = requires(T value) { value.HasReplicas(1); };
 
 template <typename T>
@@ -37,7 +40,11 @@ using SuccessExpectedPutStart =
     decltype(PutStart("compile-time", 1_KB).ExpectReplicas(1));
 using UnspecifiedObject = decltype(Object("compile-time"));
 using NotReadyObject = decltype(Object("compile-time").IsNotReady());
+using MissingObject = decltype(Object("compile-time").DoesNotExist());
 using ReadableObject = decltype(Object("compile-time").HasReplicas(1));
+using UnspecifiedObjects = decltype(Objects(0, 1));
+using MissingObjects = decltype(Objects(0, 1).DoNotExist());
+using ReadableObjects = decltype(Objects(0, 1).AreReadable());
 
 static_assert(!SupportsExpectReplicas<ErrorExpectedPutStart>);
 static_assert(!SupportsExpectStatus<ErrorExpectedPutStart>);
@@ -45,9 +52,16 @@ static_assert(!SupportsExpectError<SuccessExpectedPutStart>);
 static_assert(!SupportsIsReadable<NotReadyObject>);
 static_assert(!SupportsHasReplicas<NotReadyObject>);
 static_assert(!SupportsIsNotReady<ReadableObject>);
+static_assert(!SupportsIsReadable<MissingObject>);
+static_assert(!SupportsHasReplicas<MissingObject>);
+static_assert(!SupportsDoesNotExist<ReadableObject>);
 static_assert(!SupportsThen<UnspecifiedObject>);
 static_assert(SupportsThen<NotReadyObject>);
+static_assert(SupportsThen<MissingObject>);
 static_assert(SupportsThen<ReadableObject>);
+static_assert(!SupportsThen<UnspecifiedObjects>);
+static_assert(SupportsThen<MissingObjects>);
+static_assert(SupportsThen<ReadableObjects>);
 
 }  // namespace
 
@@ -99,6 +113,23 @@ TEST(MasterScenarioContractTest, ReportsUnreadableObject) {
         "Object(missing) is not readable: OBJECT_NOT_FOUND");
 }
 
+TEST(MasterScenarioContractTest, ReportsObjectExpectedMissing) {
+    EXPECT_NONFATAL_FAILURE(MasterScenario("object expected missing")
+                                .Given(MemoryNode("memory"))
+                                .When(PutStart("key", 1_KB))
+                                .When(PutEnd("key"))
+                                .Then(Object("key").DoesNotExist()),
+                            "Object(key) was expected to be missing");
+}
+
+TEST(MasterScenarioContractTest, ReportsKeyCountMismatch) {
+    EXPECT_NONFATAL_FAILURE(MasterScenario("key count mismatch")
+                                .Given(MemoryNode("memory"))
+                                .When(PutStart("key", 1_KB))
+                                .Then(KeyCount(0)),
+                            "KeyCount is 1; expected 0");
+}
+
 TEST(MasterScenarioContractTest, ReportsObjectReplicaCountMismatch) {
     EXPECT_NONFATAL_FAILURE(MasterScenario("object replica count mismatch")
                                 .Given(MemoryNode("memory"))
@@ -115,6 +146,32 @@ TEST(MasterScenarioContractTest, ReportsCompleteReplicaCountMismatch) {
                                 .When(PutEnd("key"))
                                 .Then(Object("key").HasCompleteReplicas(0)),
                             "Object(key) has 1 complete replicas; expected 0");
+}
+
+TEST(MasterScenarioContractTest, CreatesAndChecksObjectCollections) {
+    MasterScenario("object collections")
+        .Given(MemoryNode("memory"))
+        .Given(Objects(2, 5)
+                   .NamedBy([](size_t index) {
+                       return "collection-" + std::to_string(index);
+                   })
+                   .Size(1_KB)
+                   .CompleteOn("memory"))
+        .Then(Objects(2, 5)
+                  .NamedBy([](size_t index) {
+                      return "collection-" + std::to_string(index);
+                  })
+                  .AreReadable())
+        .Then(KeyCount(3));
+}
+
+TEST(MasterScenarioContractTest, CollectionFailureIdentifiesObjectKey) {
+    EXPECT_NONFATAL_FAILURE(
+        MasterScenario("collection failure")
+            .Given(MemoryNode("memory"))
+            .Given(Objects({"present"}).Size(1_KB).CompleteOn("memory"))
+            .Then(Objects({"present", "missing"}).AreReadable()),
+        "Object(missing) is not readable: OBJECT_NOT_FOUND");
 }
 
 }  // namespace mooncake::test
