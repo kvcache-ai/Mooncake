@@ -28,7 +28,7 @@ start_server()
         mode_name=decode
     fi
 
-    local extra_args="--disaggregation-mode $mode_name --tp-size 2 --base-gpu-id=6"
+    local extra_args="--disaggregation-mode $mode_name --tp-size 2 --base-gpu-id=${MOONCAKE_SGLANG_BASE_GPU_ID:-6}"
     if ! launch_sglang_server "$model_name" "$host" "30001" "$sglang_server_log_path" "$mode_name" "$extra_args"; then
         return 1
     fi
@@ -93,7 +93,7 @@ run_single_model()
         status=1
     else
         # Remote start server
-        if ! ${SSH_CMD} $REMOTE_IP "source $REMOTE_TEST_DIR/run/.shrc; cd \$BASE_DIR/scripts && ./$test_case_name.sh start_server $model_name $model_name_clean"; then
+        if ! ${SSH_CMD} "${REMOTE_SSH_TARGET:-$REMOTE_IP}" "source $REMOTE_TEST_DIR/run/.shrc; cd \$BASE_DIR/scripts && ./$test_case_name.sh start_server $model_name $model_name_clean"; then
             echo "ERROR: Failed to start remote server for model $model_name"
             status=1
         else
@@ -126,6 +126,10 @@ run_test()
         return 1
     fi
     echo "===== Running test case: $test_case_name for all supported models ====="
+
+    if [ "$#" -gt 0 ]; then
+        SUPPORT_MODELS=("$@")
+    fi
 
     local test_failed=false
     for model in "${SUPPORT_MODELS[@]}"; do
