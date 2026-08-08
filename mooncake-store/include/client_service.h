@@ -495,13 +495,6 @@ class Client {
     /**
      * @brief Performs a batched read of multiple objects using a
      * high-throughput Transfer Engine.
-     * @param transfer_engine_addr Address of the Transfer Engine service (e.g.,
-     * "ip:port").
-     * @param keys List of keys identifying the data objects to be transferred
-     * @param pointers Array of destination memory addresses on the remote node
-     *                         where data will be written (one per key)
-     * @param batch_slices Map from object key to its data slice
-     * (`mooncake::Slice`), containing raw bytes to be written.
      */
     tl::expected<void, ErrorCode> BatchGetOffloadObject(
         const std::string& transfer_engine_addr,
@@ -509,6 +502,13 @@ class Client {
         const std::vector<uintptr_t>& pointers,
         const std::unordered_map<std::string, std::vector<Slice>>&
             batch_slices);
+
+    tl::expected<void, ErrorCode> BatchGetOffloadObject(
+        const std::string& transfer_engine_addr,
+        const std::vector<std::string>& keys,
+        const std::vector<uintptr_t>& pointers,
+        const std::unordered_map<std::string, std::vector<Slice>>& batch_slices,
+        OffloadBufferAccess buffer_access);
 
     /**
      * @brief Notifies the master that offloading of specified objects has
@@ -583,6 +583,11 @@ class Client {
     }
 
     [[nodiscard]] const std::string& GetProtocol() const { return protocol_; }
+
+    [[nodiscard]] bool CanUseLocalMemcpy(const std::string& endpoint) const {
+        return transfer_submitter_ != nullptr &&
+               transfer_submitter_->canUseLocalMemcpy(endpoint);
+    }
 
     /**
      * @brief Get the endpoint address for segment operations.

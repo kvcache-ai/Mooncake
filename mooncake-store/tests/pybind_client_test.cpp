@@ -6,13 +6,19 @@
 #include <chrono>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fcntl.h>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <random>
 #include <string>
 #include <thread>
 #include <unistd.h>
+
+#ifdef MOONCAKE_TEST_CUDA_H2D
+#include <cuda_runtime_api.h>
+#endif
 
 #include "real_client.h"
 #include "test_server_helpers.h"
@@ -34,6 +40,26 @@ class GLogMuter {
 
    private:
     int original_log_level_;
+};
+
+class ScopedEnvVar {
+   public:
+    ScopedEnvVar(const char* name, const char* value) : name_(name) {
+        if (const char* previous = getenv(name)) previous_ = previous;
+        setenv(name, value, 1);
+    }
+
+    ~ScopedEnvVar() {
+        if (previous_) {
+            setenv(name_.c_str(), previous_->c_str(), 1);
+        } else {
+            unsetenv(name_.c_str());
+        }
+    }
+
+   private:
+    std::string name_;
+    std::optional<std::string> previous_;
 };
 
 class RealClientTest : public ::testing::Test {
@@ -60,9 +86,11 @@ class RealClientTest : public ::testing::Test {
     void TearDown() override {
         if (py_client_) {
             py_client_->tearDownAll();
+            if (!ssd_path_.empty()) py_client_.reset();
         }
 
         master_.Stop();
+        if (!ssd_path_.empty()) std::filesystem::remove_all(ssd_path_);
     }
 
     std::shared_ptr<RealClient> py_client_;
@@ -70,6 +98,7 @@ class RealClientTest : public ::testing::Test {
     // In-proc master for tests
     mooncake::testing::InProcMaster master_;
     std::string master_address_;
+    std::string ssd_path_;
 
     void StartMasterAndSetupClient() {
         ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()))
@@ -116,6 +145,113 @@ class RealClientTest : public ::testing::Test {
         return path;
     }
 };
+
+#ifdef MOONCAKE_TEST_CUDA_H2D
+TEST_F(RealClientTest, PinnedSsdRestoreReadsNonTailRangeIntoGpu) {
+    int device_count = 0;
+    if (cudaGetDeviceCount(&device_count) != cudaSuccess || device_count == 0) {
+        GTEST_SKIP() << "CUDA device is unavailable";
+    }
+
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar pinned_restore(
+        "MOONCAKE_OFFLOAD_PINNED_RESTORE_BUFFER_SIZE_BYTES", "1048576");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+
+    char path[] = "/tmp/mooncake_ssd_pinned_restore_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(10)
+                                  .build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17813", "P2PHANDSHAKE",
+                               16 * 1024 * 1024, 16 * 1024 * 1024, "tcp", "",
+                               master_address_, nullptr, "", true, ssd_path_),
+        0);
+
+    constexpr size_t kObjectSize = 64 * 1024;
+    constexpr size_t kSourceOffset = 8 * 1024;
+    constexpr size_t kRangeSize = 16 * 1024;
+    static_assert(kSourceOffset + kRangeSize < kObjectSize);
+    std::vector<char> source(kObjectSize);
+    for (size_t i = 0; i < source.size(); ++i) {
+        source[i] = static_cast<char>(i % 251);
+    }
+    const std::string key = "pinned_ssd_non_tail_range";
+    ASSERT_EQ(py_client_->put(key, source), 0);
+
+    bool disk_ready = false;
+    const auto offload_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::chrono::steady_clock::now() < offload_deadline && !disk_ready) {
+        for (const auto& replica : py_client_->get_replica_desc(key)) {
+            if (replica.is_local_disk_replica()) {
+                disk_ready = true;
+            }
+        }
+        if (!disk_ready)
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    ASSERT_TRUE(disk_ready);
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    const auto clear_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    bool memory_cleared = false;
+    while (std::chrono::steady_clock::now() < clear_deadline) {
+        if (py_client_->batch_replica_clear({key}, "localhost:17813").size() ==
+            1) {
+            memory_cleared = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    ASSERT_TRUE(memory_cleared);
+
+    auto replicas = py_client_->get_replica_desc(key);
+    ASSERT_EQ(replicas.size(), 1);
+    ASSERT_TRUE(replicas.front().is_local_disk_replica());
+
+    void* gpu_destination = nullptr;
+    ASSERT_EQ(cudaMalloc(&gpu_destination, kRangeSize), cudaSuccess);
+    bool registered = false;
+    auto cleanup = [this, &registered](void* ptr) {
+        if (registered) {
+            EXPECT_EQ(py_client_->unregister_buffer(ptr), 0);
+        }
+        EXPECT_EQ(cudaFree(ptr), cudaSuccess);
+    };
+    std::unique_ptr<void, decltype(cleanup)> gpu_owner(gpu_destination,
+                                                       cleanup);
+    ASSERT_EQ(py_client_->register_buffer(gpu_destination, kRangeSize), 0);
+    registered = true;
+
+    const auto reads_before = py_client_->get_offload_rpc_read_count();
+    auto results =
+        py_client_->get_into_ranges({gpu_destination}, {{key}}, {{{0}}},
+                                    {{{kSourceOffset}}}, {{{kRangeSize}}});
+    ASSERT_EQ(results.size(), 1);
+    ASSERT_EQ(results[0].size(), 1);
+    ASSERT_EQ(results[0][0].size(), 1);
+    EXPECT_EQ(results[0][0][0], static_cast<int64_t>(kRangeSize));
+    EXPECT_EQ(py_client_->get_offload_rpc_read_count(), reads_before + 1);
+
+    std::vector<char> actual(kRangeSize);
+    ASSERT_EQ(cudaMemcpy(actual.data(), gpu_destination, kRangeSize,
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_TRUE(std::equal(actual.begin(), actual.end(),
+                           source.begin() + kSourceOffset));
+}
+#endif
 
 TEST_F(RealClientTest, AllocateAndMountSegmentAlignsAndUnmounts) {
     StartMasterAndSetupClient();
