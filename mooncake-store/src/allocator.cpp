@@ -475,7 +475,7 @@ std::optional<RestoredOffsetBufferAllocator> RestoreOffsetBufferAllocator(
         buffers[index] = std::move(buffer);
     }
 
-    allocator->restored_gap_buffers_ = std::move(gaps);
+    gaps.clear();
     return RestoredOffsetBufferAllocator{std::move(allocator),
                                          std::move(buffers)};
 }

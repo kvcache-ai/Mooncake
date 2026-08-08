@@ -444,6 +444,15 @@ class MasterServiceHATest : public ::testing::Test {
         return service.snapshot_manager_ != nullptr;
     }
 
+    static bool NeedMemoryEvictionForTesting(const MasterService& service) {
+        return service.need_mem_eviction_.load(std::memory_order_relaxed);
+    }
+
+    static void SetNeedMemoryEvictionForTesting(MasterService& service,
+                                                bool value) {
+        service.need_mem_eviction_.store(value, std::memory_order_relaxed);
+    }
+
     static tl::expected<uint64_t, ErrorCode> AppendVisibleForTesting(
         MasterService& service, OpType type, const std::string& tenant_id,
         const std::string& key, const std::string& payload) {
@@ -527,6 +536,16 @@ class MasterServiceHATest : public ::testing::Test {
         return false;
     }
 
+    static std::chrono::system_clock::time_point LeaseTimeoutForTesting(
+        MasterService& service, const TenantId& tenant_id,
+        const std::string& key) {
+        MasterService::MetadataAccessorRO accessor(
+            &service, MasterService::ObjectIdentity{tenant_id, key});
+        EXPECT_TRUE(accessor.Exists());
+        return accessor.Exists() ? accessor.Get().lease_timeout
+                                 : std::chrono::system_clock::time_point{};
+    }
+
     static size_t SegmentAllocatedSizeForTesting(MasterService& service,
                                                  const std::string& name) {
         auto access = service.segment_manager_.getAllocatorAccess();
@@ -600,6 +619,57 @@ class MasterServiceHATest : public ::testing::Test {
 
 class MasterServiceBatchRecordE2ETest : public MasterServiceHATest {};
 
+TEST_F(MasterServiceHATest,
+       PutStartWithoutWritableSegmentsDoesNotArmMemoryEviction) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    auto result = service.PutStart(generate_uuid(), "no_segment",
+                                   kDefaultTenant, 1024, config);
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_FALSE(NeedMemoryEvictionForTesting(service));
+}
+
+TEST_F(MasterServiceHATest,
+       PutStartWithTooFewSegmentsDoesNotArmMemoryEviction) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    auto mounted =
+        PrepareSimpleSegment(service, "one_segment", kDefaultSegmentBase, 4096);
+    PutObjectOnSegment(service, mounted.client_id, "existing", "one_segment");
+    ReplicateConfig config;
+    config.replica_num = 2;
+
+    auto result = service.PutStart(mounted.client_id, "needs_two",
+                                   kDefaultTenant, 4096, config);
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_FALSE(NeedMemoryEvictionForTesting(service));
+}
+
+TEST_F(MasterServiceHATest, PutStartWithReclaimableUsageArmsMemoryEviction) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    auto mounted = PrepareSimpleSegment(service, "full_segment",
+                                        kDefaultSegmentBase, 2048);
+    PutObjectOnSegment(service, mounted.client_id, "existing", "full_segment",
+                       1024);
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    auto result = service.PutStart(mounted.client_id, "too_large",
+                                   kDefaultTenant, 2048, config);
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_TRUE(NeedMemoryEvictionForTesting(service));
+}
+
 TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesMemoryBufferDescriptor) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
@@ -629,9 +699,46 @@ TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesMemoryBufferDescriptor) {
     EXPECT_EQ(restored.transport_endpoint_, endpoint);
 }
 
+TEST_F(MasterServiceHATest,
+       RestoredMemoryReplicaBecomesEvictableOnlyAfterRemountLeaseExpires) {
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(false)
+                              .set_default_kv_lease_ttl(100)
+                              .build());
+
+    const std::string endpoint = "standby_recovery_lease_segment";
+    const std::string key = "standby_recovery_lease_key";
+    auto object = MakeStandbyObject(key, endpoint);
+    object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    service.RestoreFromStandbySnapshot({object}, 7,
+                                       {MakeStandbyMemorySegment(endpoint)});
+    const auto restored_lease_timeout =
+        LeaseTimeoutForTesting(service, kDefaultTenant, key);
+    EXPECT_LE(restored_lease_timeout, std::chrono::system_clock::now());
+
+    service.RunBatchEvictForTesting(/*evict_ratio_target=*/1.0,
+                                    /*evict_ratio_lowerbound=*/1.0);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, key), 1);
+    ASSERT_TRUE(service.ReMountSegment({MakeSegment(endpoint)}, generate_uuid())
+                    .has_value());
+    const auto remount_lease_timeout =
+        LeaseTimeoutForTesting(service, kDefaultTenant, key);
+    EXPECT_GT(remount_lease_timeout, std::chrono::system_clock::now());
+
+    std::this_thread::sleep_until(remount_lease_timeout +
+                                  std::chrono::milliseconds(10));
+    service.RunBatchEvictForTesting(/*evict_ratio_target=*/1.0,
+                                    /*evict_ratio_lowerbound=*/1.0);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, key), 0);
+}
+
 TEST_F(MasterServiceHATest, RemountMakesRestoredMemoryReplicaReady) {
-    MasterService service(
-        MasterServiceConfig::builder().set_enable_ha(false).build());
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(false)
+                              .set_default_kv_lease_ttl(5000)
+                              .build());
 
     const std::string endpoint = "standby_remount_segment";
     const auto metric_before =
@@ -648,6 +755,8 @@ TEST_F(MasterServiceHATest, RemountMakesRestoredMemoryReplicaReady) {
         .buffer_descriptor.buffer_address_ = kDefaultSegmentBase + 4096;
     service.RestoreFromStandbySnapshot({first_object, second_object}, 7,
                                        {MakeStandbyMemorySegment(endpoint)});
+    const auto lease_before =
+        LeaseTimeoutForTesting(service, kDefaultTenant, first_key);
     EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size() -
                   metric_before,
               2048);
@@ -663,8 +772,17 @@ TEST_F(MasterServiceHATest, RemountMakesRestoredMemoryReplicaReady) {
         EXPECT_EQ(result.error(), ErrorCode::REPLICA_IS_NOT_READY);
     }
 
+    service.RunBatchEvictForTesting(/*evict_ratio_target=*/1.0,
+                                    /*evict_ratio_lowerbound=*/1.0);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, first_key), 1);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, second_key), 1);
+
     Segment segment = MakeSegment(endpoint);
     ASSERT_TRUE(service.ReMountSegment({segment}, generate_uuid()).has_value());
+    const auto lease_after =
+        LeaseTimeoutForTesting(service, kDefaultTenant, first_key);
+    EXPECT_GT(lease_after, lease_before);
+    EXPECT_GT(lease_after, std::chrono::system_clock::now());
 
     auto after = service.GetReplicaList(first_key, kDefaultTenant);
     ASSERT_TRUE(after.has_value()) << toString(after.error());
@@ -689,10 +807,10 @@ TEST_F(MasterServiceHATest, RemountMakesRestoredMemoryReplicaReady) {
                   .get_memory_descriptor()
                   .buffer_descriptor.buffer_address_,
               kDefaultSegmentBase + 4096);
-    EXPECT_EQ(SegmentAllocatedSizeForTesting(service, endpoint), 5120);
+    EXPECT_EQ(SegmentAllocatedSizeForTesting(service, endpoint), 2048);
     EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size() -
                   metric_before,
-              5120);
+              2048);
 
     const std::string new_key = "post_remount_allocation";
     PutObjectOnSegment(service, generate_uuid(), new_key, endpoint);
@@ -705,12 +823,12 @@ TEST_F(MasterServiceHATest, RemountMakesRestoredMemoryReplicaReady) {
               kDefaultSegmentBase + 1024);
     EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size() -
                   metric_before,
-              6144);
+              3072);
 
     EraseObjectForTesting(service, kDefaultTenant, first_key);
     EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size() -
                   metric_before,
-              5120);
+              2048);
     const std::string replacement_key = "post_remount_replacement";
     PutObjectOnSegment(service, generate_uuid(), replacement_key, endpoint);
     auto replacement =
@@ -722,7 +840,7 @@ TEST_F(MasterServiceHATest, RemountMakesRestoredMemoryReplicaReady) {
               kDefaultSegmentBase);
     EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size() -
                   metric_before,
-              6144);
+              3072);
 }
 
 TEST_F(MasterServiceHATest, RemountRestoresCachelibMemoryReplica) {
@@ -795,11 +913,16 @@ TEST_F(MasterServiceHATest, FailedRemountKeepsReplicaInvalidAndCanBeRetried) {
         .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
     service.RestoreFromStandbySnapshot({first, conflicting}, 7,
                                        {MakeStandbyMemorySegment(endpoint)});
+    const auto lease_before =
+        LeaseTimeoutForTesting(service, kDefaultTenant, "standby_retry_first");
 
     Segment segment = MakeSegment(endpoint);
     auto failed = service.ReMountSegment({segment}, generate_uuid());
     ASSERT_FALSE(failed.has_value());
     EXPECT_EQ(failed.error(), ErrorCode::INVALID_PARAMS);
+    EXPECT_EQ(
+        LeaseTimeoutForTesting(service, kDefaultTenant, "standby_retry_first"),
+        lease_before);
     auto get_after_failure =
         service.GetReplicaList("standby_retry_first", kDefaultTenant);
     ASSERT_FALSE(get_after_failure.has_value());
@@ -3246,6 +3369,71 @@ TEST_F(MasterServiceHATest, BatchEvictWritesBatchRecordOpLog) {
     EXPECT_EQ(kDefaultTenant.value(), batch.entries[0].tenant_id);
     EXPECT_EQ(key, batch.entries[0].object_key);
     EXPECT_EQ(3u, batch.entries[0].sequence_id);
+}
+
+TEST_F(MasterServiceHATest, BatchEvictStopsAfterFirstOpLogReservationFailure) {
+    const std::string cluster_id = "test_batch_evict_reservation_stop";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    MasterService service(MasterServiceConfig::builder()
+                              .set_default_kv_lease_ttl(50)
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(1)
+                              .build());
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    auto mounted = PrepareSimpleSegment(service, "reservation_stop_segment");
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+    PutObjectOnSegment(service, mounted.client_id, "reservation_stop_first",
+                       "reservation_stop_segment");
+    ReadBatchEventually(storage, 2, batch);
+    PutObjectOnSegment(service, mounted.client_id, "reservation_stop_second",
+                       "reservation_stop_segment");
+    ReadBatchEventually(storage, 3, batch);
+    std::this_thread::sleep_for(std::chrono::milliseconds(60));
+
+    {
+        auto held = ReserveBatchSlotForTesting(service);
+        ASSERT_TRUE(held.has_value());
+        SetNeedMemoryEvictionForTesting(service, true);
+        testing::internal::CaptureStderr();
+        service.RunBatchEvictForTesting(/*evict_ratio_target=*/0.05,
+                                        /*evict_ratio_lowerbound=*/0.05);
+        const std::string logs = testing::internal::GetCapturedStderr();
+
+        const std::string warning = "BatchEvict: OpLog reservation failed";
+        const auto first = logs.find(warning);
+        ASSERT_NE(first, std::string::npos);
+        EXPECT_EQ(logs.find(warning, first + warning.size()),
+                  std::string::npos);
+        EXPECT_TRUE(NeedMemoryEvictionForTesting(service));
+        EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                         "reservation_stop_first"),
+                  1);
+        EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                         "reservation_stop_second"),
+                  1);
+    }
+
+    service.RunBatchEvictForTesting(/*evict_ratio_target=*/1.0,
+                                    /*evict_ratio_lowerbound=*/1.0);
+    for (int i = 0; i < 50; ++i) {
+        if (ReplicaCountForTesting(service, kDefaultTenant,
+                                   "reservation_stop_first") == 0 &&
+            ReplicaCountForTesting(service, kDefaultTenant,
+                                   "reservation_stop_second") == 0) {
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "reservation_stop_first"),
+              0);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "reservation_stop_second"),
+              0);
 }
 
 TEST_F(MasterServiceHATest, BatchEvictReleasesMemoryAfterDurable) {
