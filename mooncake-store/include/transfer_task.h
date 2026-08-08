@@ -1,3 +1,15 @@
+/*
+ * Copyright (c) 2026 绿算技术
+ * All rights reserved.
+ *
+ * @File:mooncake-store/include/transfer_task.h
+ *
+ * 修改履历 | 2026-07-31 | TransferSubmitter 新增 ~TransferSubmitter +
+ * nof_handle_cache_ per-client 连接缓存，析构时释放 handle 回收 QID 修改履历 |
+ * 2026-08-03 | SpdkNofWorkerPool 新增任务队列流控 (max_queue_depth)；
+ *                       SpdkNofQos 新增 UpdateInflightLimit 自适应 inflight（本
+ * PR）
+ */
 #pragma once
 
 #include <atomic>
@@ -409,6 +421,23 @@ struct SpdkNofQos {
                 head[kSpdkNofOpWrite] == nullptr);
     }
 
+    /**
+     * @brief 根据 qpair 池容量更新 inflight 上限。
+     *
+     * 当 qpair 数变化时（降级或 TryGrow 恢复），同步调整 inflight 封顶。
+     * inflight_blocks_limit = min(绝对限制, qpair池 I/O 容量)。
+     * blocks_per_chunk 作为下界保证至少能提交 1 个 chunk。
+     *
+     * @param num_qpairs              当前 qpair 数量。
+     * @param max_inflight_per_qpair  每 qpair 最大在途 I/O 数。
+     *
+     * 修改履历 | 2026-08-03 | 新增（本 PR）
+     */
+    void UpdateInflightLimit(int num_qpairs, int max_inflight_per_qpair) {
+        int pool_limit = num_qpairs * max_inflight_per_qpair;
+        inflight_blocks_limit = std::max(blocks_per_chunk, pool_limit);
+    }
+
     void PushTask(SpdkNofTask* task) {
         int op = task->op;
         if (head[op] == nullptr) {
@@ -460,11 +489,23 @@ class SpdkNofWorkerPool {
     std::unique_ptr<std::queue<SpdkNofTask>[]> task_queue_;
     std::unique_ptr<std::mutex[]> queue_mutex_;
     std::unique_ptr<std::condition_variable[]> queue_cv_;
+
+    // 修改履历 | 2026-08-03 | 流控：任务队列背压（本 PR）
+    // 当 task_queue_ 深度达到 max_queue_depth_ 时，submitTask 阻塞等待。
+    // 防止降级场景下请求无界积压导致内存溢出。
+    std::unique_ptr<std::condition_variable[]> queue_not_full_cv_;
+    int max_queue_depth_;
+
     std::atomic<bool> shutdown_;
     std::mutex seg_mutex_;
     int seg_num = 0;
     std::map<nof_seg_handle*, int> seg_to_worker_;
 };
+
+/// 再均衡检查间隔（秒）。Worker 线程每隔此间隔检查是否有降级的
+/// qpair 池可以通过 TryGrow 恢复。
+/// 修改履历 | 2026-08-03 | 新增（本 PR）
+constexpr int kRebalanceIntervalSeconds = 30;
 #endif
 
 /**
@@ -534,6 +575,10 @@ class TransferSubmitter {
                                TransferMetric* transfer_metric = nullptr,
                                int numa_socket_id = 0);
 
+    // Added 2026-07-31: release cached NoF handles via CloseNofSegment
+    // so QIDs are recycled when client is closed.
+    ~TransferSubmitter();
+
     /**
      * @brief Submit an asynchronous transfer operation
      *
@@ -596,6 +641,11 @@ class TransferSubmitter {
     std::unique_ptr<MemcpyWorkerPool> memcpy_pool_;
 #ifdef USE_NOF
     std::unique_ptr<SpdkNofWorkerPool> spdk_nvmf_pool_;
+    // [Added 2026-07-31] Per-TransferSubmitter handle 缓存。
+    // 每个 client 独立缓存其 nof_seg_handle，同一 client 内多次 put()
+    // 复用同一连接。 不跨 TransferSubmitter 共享，避免多 WorkerPool
+    // 并发访问同一 SPDK qpair 池。
+    std::map<std::string, nof_seg_handle*> nof_handle_cache_;
 #endif
     std::unique_ptr<FilereadWorkerPool> fileread_pool_;
     bool memcpy_enabled_;
