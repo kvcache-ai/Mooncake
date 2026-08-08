@@ -29,6 +29,7 @@
 #include "master_metric_manager.h"
 #include "mutex.h"
 #include "segment.h"
+#include "tenant_quota_ledger.h"
 #include "tenant_quota_sharded.h"
 #include "tenant_quota_policy_store.h"
 #include "types.h"
@@ -997,9 +998,7 @@ class MasterService {
         const bool hard_pinned{false};          // immutable, set at creation
         bool memory_cache_total_accounted{false};
         bool disk_cache_total_accounted{false};
-        uint64_t reserved_quota_charge_bytes{0};
-        uint64_t committed_quota_charge_bytes{0};
-        uint64_t pending_replaced_quota_charge_bytes{0};
+        TenantQuotaLedger quota_ledger;
 
         void AddReplicas(std::vector<Replica>&& replicas) {
             replicas_.insert(replicas_.end(),
@@ -1247,7 +1246,7 @@ class MasterService {
         } type;
         ReplicaID source_id;
         std::vector<ReplicaID> replica_ids;
-        uint64_t reserved_quota_charge_bytes{0};
+        uint64_t pending_quota_charge_bytes{0};
     };
 
     struct OffloadingTask {
@@ -1311,7 +1310,7 @@ class MasterService {
         ReplicaID source_id;    // the LOCAL_DISK replica being promoted
         ReplicaID alloc_id{0};  // the new MEMORY replica staged by AllocStart
         uint64_t object_size;
-        uint64_t reserved_quota_charge_bytes{0};
+        uint64_t pending_quota_charge_bytes{0};
         std::chrono::system_clock::time_point start_time;
         UUID holder_id;  // owner of source LOCAL_DISK; only Notifier allowed
     };
@@ -1319,6 +1318,7 @@ class MasterService {
     static constexpr size_t kNumShards = 1024;  // Number of metadata shards
 
     struct TenantState {
+        TenantQuotaHandle quota_account{nullptr};
         std::unordered_map<std::string, ObjectMetadata> metadata;
         std::unordered_set<std::string> processing_keys;
         std::unordered_map<std::string, const ReplicationTask>
@@ -1504,21 +1504,19 @@ class MasterService {
         TenantState& tenant_state,
         std::unordered_map<std::string, ObjectMetadata>::iterator it,
         const TenantId& tenant_id, QuotaEraseMode quota_mode);
+    tl::expected<void, ErrorCode> SettlePrimaryWriteQuotaIfReady(
+        TenantState& tenant_state, ObjectMetadata& metadata);
     uint64_t CompletedMemoryQuotaCharge(const ObjectMetadata& metadata) const;
     uint64_t RequestedMemoryQuotaCharge(uint64_t value_length,
                                         const ReplicateConfig& config) const;
-    bool ShouldProtectZeroChargeMetadataCreate(
-        uint64_t requested_quota_charge) const;
-    tl::expected<void, ErrorCode> ReserveTenantQuota(const TenantId& tenant_id,
-                                                     uint64_t bytes);
-    void CommitTenantQuota(const TenantId& tenant_id, uint64_t bytes);
-    void AbortTenantQuota(const TenantId& tenant_id, uint64_t bytes);
-    void ReleaseTenantQuota(const TenantId& tenant_id, uint64_t bytes);
-    void ReleaseTenantQuotaPartial(const TenantId& tenant_id, uint64_t bytes);
-    void CommitAdditionalTenantQuota(const TenantId& tenant_id, uint64_t bytes);
-    void IncrementTenantMetadataObjectCount(const TenantId& tenant_id);
-    void DecrementTenantMetadataObjectCount(const TenantId& tenant_id);
-    void ReleaseCommittedQuotaCharge(ObjectMetadata& metadata, uint64_t bytes);
+    TenantState& GetOrCreateTenantState(MetadataShard& shard,
+                                        const TenantId& tenant_id);
+    TenantQuotaHandle GetBoundTenantQuotaHandle(
+        const TenantState& tenant_state) const;
+    tl::expected<void, ErrorCode> ChargeTenantQuota(
+        TenantQuotaHandle account, uint64_t bytes,
+        uint64_t* deficit_bytes = nullptr);
+    void ReleaseTenantQuota(TenantQuotaHandle account, uint64_t bytes);
     void RecomputeTenantEffectiveQuotas();
     void RebuildTenantQuotaUsageFromMetadata();
     void LoadTenantQuotaPoliciesFromStoreOrThrow();
@@ -1572,7 +1570,8 @@ class MasterService {
         const std::string& key, uint64_t value_length,
         const ReplicateConfig& config, const std::string& group_id,
         const TenantId& tenant_id,
-        const std::chrono::system_clock::time_point& now)
+        const std::chrono::system_clock::time_point& now,
+        uint64_t& quota_deficit_bytes)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
 
     /**
@@ -1646,16 +1645,17 @@ class MasterService {
     size_t CountCandidatesForTesting(const TenantId& tenant_id);
     void ResetCandidateBackoffsForTesting();
 
-    // Erase any in-flight PromotionTask for `key`, abort any staged promotion
-    // quota reservation, and decrement the cluster-wide in-flight counter. Safe
-    // no-op if no task exists.
-    void ErasePromotionTaskIfPresent(
-        TenantState& tenant_state, const std::string& key,
-        const TenantId& tenant_id) NO_THREAD_SAFETY_ANALYSIS {
+    // Erase any in-flight PromotionTask for `key`, refund its pending charge,
+    // and decrement the cluster-wide in-flight counter. Safe no-op if no task
+    // exists.
+    void ErasePromotionTaskIfPresent(TenantState& tenant_state,
+                                     const std::string& key)
+        NO_THREAD_SAFETY_ANALYSIS {
         auto task_it = tenant_state.promotion_tasks.find(key);
         if (task_it != tenant_state.promotion_tasks.end()) {
-            AbortTenantQuota(tenant_id,
-                             task_it->second.reserved_quota_charge_bytes);
+            ReleaseTenantQuota(
+                GetBoundTenantQuotaHandle(tenant_state),
+                std::exchange(task_it->second.pending_quota_charge_bytes, 0));
             tenant_state.promotion_tasks.erase(task_it);
             promotion_in_flight_.fetch_sub(1, std::memory_order_relaxed);
             MasterMetricManager::instance().dec_promotion_in_flight();
@@ -1725,6 +1725,9 @@ class MasterService {
                                        ? ReplicationTaskIterator{}
                                        : tenant_state_->replication_tasks.find(
                                              object_id_.user_key)) {
+            if (tenant_state_ != nullptr) {
+                service_->GetBoundTenantQuotaHandle(*tenant_state_);
+            }
             // Automatically clean up invalid handles (memory replicas only).
             // Note: We only check memory replicas here to avoid lock order
             // violation (client_mutex_ must be acquired before metadata shard).
@@ -1749,9 +1752,19 @@ class MasterService {
                     *tenant_state_, it_->second, removed_replica_ids);
                 const uint64_t after_charge =
                     service_->CompletedMemoryQuotaCharge(it_->second);
-                if (before_charge > after_charge) {
-                    service_->ReleaseCommittedQuotaCharge(
-                        it_->second, before_charge - after_charge);
+                if (service_->enable_multi_tenants_ &&
+                    before_charge > after_charge) {
+                    auto release_result =
+                        it_->second.quota_ledger.ReleaseCommitted(
+                            service_->GetBoundTenantQuotaHandle(*tenant_state_),
+                            before_charge - after_charge);
+                    if (!release_result) {
+                        LOG(ERROR)
+                            << "tenant quota committed release mismatch tenant="
+                            << object_id_.tenant_id.value()
+                            << ", key=" << object_id_.user_key
+                            << ", bytes=" << before_charge - after_charge;
+                    }
                 }
                 // If no valid replicas remain, delete the whole object.
                 if (!it_->second.IsValid()) {
@@ -1763,8 +1776,7 @@ class MasterService {
                     this->Erase();
                     if (tenant_state_ != nullptr) {
                         service_->ErasePromotionTaskIfPresent(
-                            *tenant_state_, object_id_.user_key,
-                            object_id_.tenant_id);
+                            *tenant_state_, object_id_.user_key);
                         MaybeEraseEmptyTenant();
                     }
                 }
@@ -1843,10 +1855,6 @@ class MasterService {
                     enable_soft_pin, enable_hard_pin, data_type, group_id,
                     object_id_.tenant_id, object_id_.user_key));
             it_ = result.first;
-            if (result.second) {
-                service_->IncrementTenantMetadataObjectCount(
-                    object_id_.tenant_id);
-            }
         }
 
        private:
@@ -1860,10 +1868,9 @@ class MasterService {
             if (tenant_state_ != nullptr) {
                 return;
             }
-            auto result =
-                shard_guard_->tenants.try_emplace(object_id_.tenant_id);
-            tenant_it_ = result.first;
-            tenant_state_ = &tenant_it_->second;
+            tenant_state_ = &service_->GetOrCreateTenantState(
+                shard_guard_.get(), object_id_.tenant_id);
+            tenant_it_ = shard_guard_->tenants.find(object_id_.tenant_id);
             it_ = tenant_state_->metadata.end();
             processing_it_ = tenant_state_->processing_keys.end();
             replication_task_it_ = tenant_state_->replication_tasks.end();
