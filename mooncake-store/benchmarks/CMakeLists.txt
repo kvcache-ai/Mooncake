@@ -14,6 +14,11 @@ add_executable(master_bench master_bench.cpp)
 target_link_libraries(master_bench PRIVATE cachelib_memory_allocator
                                            mooncake_store)
 
+# Add synthetic master workload benchmark executable
+add_executable(master_synthetic_bench master_synthetic_bench.cpp)
+target_link_libraries(master_synthetic_bench
+                      PRIVATE cachelib_memory_allocator mooncake_store)
+
 # Add BatchGetReplicaList latency benchmark executable
 add_executable(batch_get_replica_bench batch_get_replica_bench.cpp)
 target_link_libraries(batch_get_replica_bench PRIVATE cachelib_memory_allocator
