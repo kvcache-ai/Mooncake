@@ -457,11 +457,14 @@ int RdmaContext::disable() {
 }
 
 void RdmaContext::cleanupResources() {
-    for (auto& entry : mr_set_) {
-        int ret = verbs_.ibv_dereg_mr(entry);
-        if (ret) PLOG(ERROR) << "ibv_dereg_mr";
+    {
+        std::lock_guard<std::mutex> lock(mr_set_mutex_);
+        for (auto& entry : mr_set_) {
+            int ret = verbs_.ibv_dereg_mr(entry);
+            if (ret) PLOG(ERROR) << "ibv_dereg_mr";
+        }
+        mr_set_.clear();
     }
-    mr_set_.clear();
     for (auto& entry : cq_list_) {
         delete entry;
     }

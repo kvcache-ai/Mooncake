@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <list>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -123,9 +124,9 @@ class RdmaContext {
    private:
     int openDevice(const std::string &device_name, uint8_t port);
 
-    // Release every resource currently owned by this context in reverse
-    // construction order. This is intentionally state-independent so it can
-    // clean up a partially completed enable() and can safely be retried.
+    // Release every resource currently owned by this context. This is
+    // intentionally state-independent so it can clean up a partially completed
+    // enable() and can safely be retried.
     void cleanupResources();
 
    private:
