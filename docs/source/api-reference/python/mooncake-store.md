@@ -1110,6 +1110,25 @@ store.setup("localhost", "http://localhost:8080/metadata", 512*1024*1024, 128*10
 
 </details>
 
+The class also accepts a configuration dictionary:
+
+```python
+store.setup({
+    "local_hostname": "provider:12345",
+    "metadata_server": "http://metadata:8080/metadata",
+    "master_server_addr": "master:50051",
+    "protocol": "nvlink",
+    "global_segment_size": str(64 * 1024**3),
+    "local_buffer_size": "0",
+    "enable_egm_store_pool": "true",
+    "egm_numa_nodes": "auto",  # or, for example, "0,1"
+})
+```
+
+`enable_egm_store_pool` defaults to `false`; `egm_numa_nodes` defaults to
+`auto`. These controls apply only to this dictionary overload. The EGM pool
+requires the exact `nvlink`/nonzero-global/zero-local combination shown above.
+
 ---
 #### setup_dummy()
 Initialize the store with a dummy client for testing purposes.
@@ -2059,18 +2078,22 @@ store.close()
 ---
 
 #### close()
-Clean up all resources and terminate connections.
+Clean up all resources and terminate connections. If cleanup fails, the object
+is retained so the same `close()` call can retry EGM unmount, unregister, and
+release work without repeating completed stages.
 
 ```python
 def close(self) -> int
 ```
 
 **Returns:**
-- `int`: Status code (0 = success, non-zero = error code)
+- `int`: Status code (0 = success, non-zero = cleanup is still pending)
 
 **Example:**
 ```python
-store.close()
+if store.close() != 0:
+    # Keep `store` alive and retry after the blocking condition clears.
+    store.close()
 ```
 
 ---
