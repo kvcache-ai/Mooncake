@@ -6,6 +6,7 @@
 #include <chrono>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -558,6 +559,7 @@ std::string MakeValidPayload(uint64_t client_id_first = 1,
 class FakeHaKvBackend : public HaKvBackend {
    public:
     ErrorCode Get(std::string_view key, std::string& value) override {
+        std::lock_guard<std::mutex> lock(mutex_);
         if (next_get_error_ != ErrorCode::OK) {
             auto error = next_get_error_;
             next_get_error_ = ErrorCode::OK;
@@ -574,11 +576,13 @@ class FakeHaKvBackend : public HaKvBackend {
         return ErrorCode::OK;
     }
     ErrorCode Put(std::string_view key, std::string_view value) override {
+        std::lock_guard<std::mutex> lock(mutex_);
         values_[std::string(key)] = std::string(value);
         return ErrorCode::OK;
     }
     ErrorCode Range(std::string_view begin_key, std::string_view end_key,
                     size_t limit, std::vector<KvPair>& kvs) override {
+        std::lock_guard<std::mutex> lock(mutex_);
         if (range_error_ != ErrorCode::OK) {
             return range_error_;
         }
@@ -592,12 +596,39 @@ class FakeHaKvBackend : public HaKvBackend {
         return ErrorCode::OK;
     }
     bool SupportsTxn() const override { return true; }
-    ErrorCode Txn(const KvTxn&) override { return ErrorCode::OK; }
-    void SetGetError(ErrorCode err) { get_error_ = err; }
-    void SetRangeError(ErrorCode err) { range_error_ = err; }
-    void FailNextGet(ErrorCode err) { next_get_error_ = err; }
+    ErrorCode Txn(const KvTxn& txn) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& compare : txn.compares) {
+            auto it = values_.find(compare.key);
+            if (compare.kind == KvCompareKind::kKeyNotExists) {
+                if (it != values_.end()) {
+                    return ErrorCode::ETCD_TRANSACTION_FAIL;
+                }
+            } else if (it == values_.end() ||
+                       it->second != compare.expected_value) {
+                return ErrorCode::ETCD_TRANSACTION_FAIL;
+            }
+        }
+        for (const auto& put : txn.puts) {
+            values_[put.key] = put.value;
+        }
+        return ErrorCode::OK;
+    }
+    void SetGetError(ErrorCode err) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        get_error_ = err;
+    }
+    void SetRangeError(ErrorCode err) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        range_error_ = err;
+    }
+    void FailNextGet(ErrorCode err) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        next_get_error_ = err;
+    }
 
    private:
+    mutable std::mutex mutex_;
     std::map<std::string, std::string> values_;
     ErrorCode get_error_{ErrorCode::OK};
     ErrorCode range_error_{ErrorCode::OK};
@@ -870,16 +901,17 @@ TEST_F(PromotionCatchUpTest, MissingDurablePrefixRejectsNonzeroSequence) {
 }
 
 TEST_F(PromotionCatchUpTest, CatchesUpPrefixThatAppearsBeforePromotion) {
+    const DurablePrefix initial_prefix{.batch_id = 0, .last_seq = 0};
+    ASSERT_EQ(ErrorCode::OK,
+              batch_backend_->Put(BuildDurablePrefixKey(cluster_id_),
+                                  EncodeDurablePrefix(initial_prefix)));
     ASSERT_EQ(ErrorCode::OK,
               service_->Start("", oplog_endpoints_, cluster_id_));
     ASSERT_EQ(StandbyState::WATCHING, service_->GetState());
-    ASSERT_EQ(ErrorCode::OK,
-              batch_backend_->Put(
-                  BuildDurablePrefixKey(cluster_id_),
-                  EncodeDurablePrefix({.batch_id = 1, .last_seq = 1})));
-    ASSERT_EQ(ErrorCode::OK,
-              batch_backend_->Put(BuildBatchRecordKey(cluster_id_, 1),
-                                  EncodeOpLogBatchRecord(MakeBatch(1, 1, 1))));
+
+    OpLogBatchStorage storage(cluster_id_, *batch_backend_);
+    ASSERT_EQ(ErrorCode::OK, storage.WriteBatchAndAdvancePrefix(
+                                 MakeBatch(1, 1, 1), initial_prefix));
 
     StandbySnapshot out;
     ASSERT_EQ(ErrorCode::OK, service_->PromoteAndExportSnapshot(out));
