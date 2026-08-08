@@ -100,7 +100,6 @@ ErrorCode ValidateManifest(std::string_view snapshot_id,
 tl::expected<std::optional<StandbyObjectMetadata>, ErrorCode>
 DeserializeStandbyObjectMetadata(
     const msgpack::object& object, const SegmentView& segment_view,
-    uint64_t snapshot_sequence_id,
     const std::chrono::system_clock::time_point& now) {
     if (object.type != msgpack::type::ARRAY) {
         LOG(ERROR) << "Snapshot metadata entry is not an array";
@@ -228,7 +227,6 @@ DeserializeStandbyObjectMetadata(
         metadata.client_id = client_id;
         metadata.size = size;
         metadata.replicas = std::move(replicas);
-        metadata.last_sequence_id = snapshot_sequence_id;
         metadata.data_type = data_type;
         metadata.group_id = std::move(group_id);
         return std::optional<StandbyObjectMetadata>(std::move(metadata));
@@ -240,8 +238,7 @@ DeserializeStandbyObjectMetadata(
 
 tl::expected<std::vector<StandbyObjectEntry>, ErrorCode>
 DeserializeStandbySnapshotMetadata(const std::vector<uint8_t>& data,
-                                   const SegmentView& segment_view,
-                                   uint64_t snapshot_sequence_id) {
+                                   const SegmentView& segment_view) {
     msgpack::object_handle root_handle;
     try {
         root_handle = msgpack::unpack(
@@ -329,8 +326,7 @@ DeserializeStandbySnapshotMetadata(const std::vector<uint8_t>& data,
                 const auto normalized_tenant = NormalizeTenantId(tenant_id);
 
                 auto metadata_result = DeserializeStandbyObjectMetadata(
-                    item.via.array.ptr[metadata_index], segment_view,
-                    snapshot_sequence_id, now);
+                    item.via.array.ptr[metadata_index], segment_view, now);
                 if (!metadata_result) {
                     return tl::make_unexpected(metadata_result.error());
                 }
@@ -482,8 +478,7 @@ class CatalogBackedSnapshotProvider final : public SnapshotProvider {
         }
 
         auto deserialize_metadata = DeserializeStandbySnapshotMetadata(
-            metadata_content, segment_manager.getView(),
-            descriptor.last_included_seq);
+            metadata_content, segment_manager.getView());
         if (!deserialize_metadata) {
             LOG(ERROR) << "Failed to deserialize snapshot metadata payload, "
                        << "snapshot_id=" << descriptor.snapshot_id

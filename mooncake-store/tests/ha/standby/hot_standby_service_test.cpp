@@ -41,6 +41,70 @@ class FakeSnapshotProvider final : public SnapshotProvider {
     tl::expected<std::optional<LoadedSnapshot>, ErrorCode> result_;
 };
 
+class FakeCaptureHaKvBackend final : public HaKvBackend {
+   public:
+    ErrorCode Get(std::string_view key, std::string& value) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        auto it = values_.find(std::string(key));
+        if (it == values_.end()) {
+            return ErrorCode::ETCD_KEY_NOT_EXIST;
+        }
+        value = it->second;
+        return ErrorCode::OK;
+    }
+
+    ErrorCode Put(std::string_view key, std::string_view value) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        values_[std::string(key)] = std::string(value);
+        return ErrorCode::OK;
+    }
+
+    ErrorCode Range(std::string_view begin_key, std::string_view end_key,
+                    size_t limit, std::vector<KvPair>& kvs) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        kvs.clear();
+        for (const auto& [key, value] : values_) {
+            if (key >= begin_key && key < end_key) {
+                kvs.push_back({.key = key, .value = value});
+                if (limit != 0 && kvs.size() >= limit) {
+                    break;
+                }
+            }
+        }
+        return ErrorCode::OK;
+    }
+
+    bool SupportsTxn() const override { return true; }
+    ErrorCode Txn(const KvTxn&) override { return ErrorCode::OK; }
+
+   private:
+    std::mutex mutex_;
+    std::map<std::string, std::string> values_;
+};
+
+OpLogBatchRecord MakeCaptureBatch(uint64_t batch_id, uint64_t sequence_id,
+                                  OpType op_type = OpType::REMOVE,
+                                  std::string object_key = "key",
+                                  std::string payload = {}) {
+    OpLogEntry entry;
+    entry.sequence_id = sequence_id;
+    entry.op_type = op_type;
+    entry.tenant_id = "tenant";
+    entry.object_key = std::move(object_key);
+    entry.payload = std::move(payload);
+    entry.checksum = static_cast<uint32_t>(
+        XXH32(entry.payload.data(), entry.payload.size(), 0));
+    entry.prefix_hash = static_cast<uint32_t>(
+        XXH32(entry.object_key.data(), entry.object_key.size(), 0));
+
+    OpLogBatchRecord batch;
+    batch.batch_id = batch_id;
+    batch.first_seq = sequence_id;
+    batch.last_seq = sequence_id;
+    batch.entries.push_back(std::move(entry));
+    return batch;
+}
+
 LoadedSnapshot MakeSnapshot(std::string snapshot_id, uint64_t seq_id,
                             std::string key, uint64_t size) {
     LoadedSnapshot snapshot;
@@ -50,7 +114,6 @@ LoadedSnapshot MakeSnapshot(std::string snapshot_id, uint64_t seq_id,
     StandbyObjectMetadata metadata;
     metadata.client_id = UUID{1, 2};
     metadata.size = size;
-    metadata.last_sequence_id = seq_id;
     snapshot.metadata.emplace_back("default", std::move(key), metadata);
     return snapshot;
 }
@@ -99,7 +162,6 @@ std::unique_ptr<HotStandbyService> CreateSnapshotOnlyReadyStandby(
     StandbyObjectMetadata metadata;
     metadata.client_id = UUID{1, 2};
     metadata.size = 4096;
-    metadata.last_sequence_id = 42;
     snapshot.metadata.emplace_back("default", "key-1", metadata);
 
     service->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
@@ -274,7 +336,6 @@ TEST_F(HotStandbyServiceTest, TestPromoteAndExportSnapshot_FinalCatchUp) {
     StandbyObjectMetadata metadata;
     metadata.client_id = UUID{1, 2};
     metadata.size = 4096;
-    metadata.last_sequence_id = 10;
     snapshot.metadata.emplace_back("default", "key-1", metadata);
 
     service_->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
@@ -395,7 +456,6 @@ TEST_F(HotStandbyServiceTest,
     ASSERT_EQ(1u, exported.size());
     EXPECT_EQ("key-new", exported[0].key);
     EXPECT_EQ(8192u, exported[0].metadata.size);
-    EXPECT_EQ(84u, exported[0].metadata.last_sequence_id);
 }
 
 TEST_F(HotStandbyServiceTest, TestStart_SnapshotOnlyWhenProviderFails) {
@@ -408,6 +468,22 @@ TEST_F(HotStandbyServiceTest, TestStart_SnapshotOnlyWhenProviderFails) {
 
     auto err = service_->Start("", "", cluster_id_);
     EXPECT_EQ(ErrorCode::PERSISTENT_FAIL, err);
+    EXPECT_EQ(StandbyState::FAILED, service_->GetState());
+}
+
+TEST_F(HotStandbyServiceTest, SnapshotRestoreRejectsDuplicateObject) {
+    config_.enable_snapshot_bootstrap = true;
+    config_.enable_oplog_following = false;
+    service_ = std::make_unique<HotStandbyService>(config_);
+
+    auto snapshot = MakeSnapshot("snapshot", 42, "key", 1);
+    snapshot.metadata.push_back(snapshot.metadata.front());
+    snapshot.metadata.back().metadata.size = 2;
+    service_->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
+        std::optional<LoadedSnapshot>(std::move(snapshot))));
+
+    EXPECT_EQ(ErrorCode::DESERIALIZE_FAIL,
+              service_->Start("", "", cluster_id_));
     EXPECT_EQ(StandbyState::FAILED, service_->GetState());
 }
 
@@ -465,6 +541,107 @@ TEST_F(HotStandbyServiceTest, TestExportStandbySnapshot_Empty) {
     EXPECT_EQ(0u, snapshot.oplog_sequence_id);
     EXPECT_TRUE(snapshot.objects.empty());
     EXPECT_TRUE(snapshot.segments.empty());
+}
+
+TEST_F(HotStandbyServiceTest, SnapshotCaptureFreezesApplyUntilEnded) {
+    auto backend = std::make_shared<FakeCaptureHaKvBackend>();
+    SegmentMountOp mount;
+    mount.segment_name = "segment-1";
+    mount.transport_endpoint = "127.0.0.1:12345";
+    mount.capacity = 4096;
+    mount.is_memory_segment = true;
+    auto mount_payload = struct_pack::serialize(mount);
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend->Put(
+            BuildBatchRecordKey(cluster_id_, 1),
+            EncodeOpLogBatchRecord(MakeCaptureBatch(
+                1, 1, OpType::SEGMENT_MOUNT, mount.segment_name,
+                std::string(mount_payload.begin(), mount_payload.end())))));
+    ASSERT_EQ(ErrorCode::OK,
+              backend->Put(BuildDurablePrefixKey(cluster_id_),
+                           EncodeDurablePrefix({.batch_id = 1,
+                                                .last_seq = 1,
+                                                .producer_view_version = 7})));
+    config_.enable_oplog_following = true;
+    config_.oplog_poll_interval_ms = 1;
+    service_ = std::make_unique<HotStandbyService>(config_);
+    service_->SetCatchUpBatchKvBackendForTesting(backend);
+    ASSERT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
+
+    auto capture = service_->BeginSnapshotCapture();
+    ASSERT_TRUE(capture.has_value());
+    EXPECT_EQ(1u, capture->last_included_seq);
+    EXPECT_EQ(1u, capture->last_included_batch_id);
+    EXPECT_EQ(7, capture->producer_view_version);
+    ASSERT_EQ(1u, capture->segments.size());
+    EXPECT_EQ(mount.segment_name, capture->segments[0].segment_name);
+    EXPECT_EQ(mount.transport_endpoint,
+              capture->segments[0].transport_endpoint);
+
+    std::vector<StandbyObjectEntry> chunk;
+    ASSERT_TRUE(service_->CopyNextSnapshotChunk(2, *capture, chunk));
+    EXPECT_TRUE(chunk.empty());
+    EXPECT_TRUE(capture->done());
+
+    ASSERT_EQ(ErrorCode::OK,
+              backend->Put(BuildBatchRecordKey(cluster_id_, 2),
+                           EncodeOpLogBatchRecord(MakeCaptureBatch(2, 2))));
+    ASSERT_EQ(ErrorCode::OK,
+              backend->Put(BuildDurablePrefixKey(cluster_id_),
+                           EncodeDurablePrefix({.batch_id = 2,
+                                                .last_seq = 2,
+                                                .producer_view_version = 7})));
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    EXPECT_EQ(1u, service_->GetLatestAppliedSequenceId());
+
+    service_->EndSnapshotCapture(*capture);
+    for (int i = 0; i < 100 && service_->GetLatestAppliedSequenceId() != 2;
+         ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_EQ(2u, service_->GetLatestAppliedSequenceId());
+}
+
+TEST_F(HotStandbyServiceTest, PromotionCancelsActiveSnapshotCapture) {
+    auto backend = std::make_shared<FakeCaptureHaKvBackend>();
+    ASSERT_EQ(ErrorCode::OK,
+              backend->Put(BuildDurablePrefixKey(cluster_id_),
+                           EncodeDurablePrefix({.batch_id = 0,
+                                                .last_seq = 0,
+                                                .producer_view_version = 7})));
+    config_.enable_oplog_following = true;
+    config_.oplog_poll_interval_ms = 1;
+    service_ = std::make_unique<HotStandbyService>(config_);
+    service_->SetCatchUpBatchKvBackendForTesting(backend);
+    ASSERT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
+
+    auto capture = service_->BeginSnapshotCapture();
+    ASSERT_TRUE(capture.has_value());
+    ASSERT_EQ(ErrorCode::OK, service_->Promote());
+
+    std::vector<StandbyObjectEntry> chunk;
+    EXPECT_FALSE(service_->CopyNextSnapshotChunk(1, *capture, chunk));
+}
+
+TEST_F(HotStandbyServiceTest, SnapshotCaptureRejectsInconsistentSequence) {
+    auto backend = std::make_shared<FakeCaptureHaKvBackend>();
+    ASSERT_EQ(ErrorCode::OK,
+              backend->Put(BuildDurablePrefixKey(cluster_id_),
+                           EncodeDurablePrefix({.batch_id = 0,
+                                                .last_seq = 0,
+                                                .producer_view_version = 7})));
+    config_.enable_snapshot_bootstrap = true;
+    config_.enable_oplog_following = true;
+    config_.oplog_poll_interval_ms = 1;
+    service_ = std::make_unique<HotStandbyService>(config_);
+    service_->SetSnapshotProvider(
+        std::make_unique<FakeSnapshotProvider>(std::optional<LoadedSnapshot>(
+            MakeSnapshot("snapshot", 42, "key", 4096))));
+    service_->SetCatchUpBatchKvBackendForTesting(backend);
+    ASSERT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
+
+    EXPECT_FALSE(service_->BeginSnapshotCapture().has_value());
 }
 
 // ========== 6.1.7 Replication loop tests ==========

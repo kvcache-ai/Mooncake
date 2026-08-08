@@ -146,6 +146,8 @@ add_store_test(snapshot_child_process_test
                ha/snapshot/snapshot_child_process_test.cpp)
 add_store_test(master_snapshot_codec_test
                ha/snapshot/master_snapshot_codec_test.cpp)
+add_ha_test(batch_oplog_snapshot_types_test
+            ha/snapshot/batch_oplog_snapshot_types_test.cpp)
 add_store_test(master_service_test_for_snapshot
                ha/snapshot/master_service_test_for_snapshot.cpp)
 add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)
@@ -257,6 +259,8 @@ add_ha_test(standby_state_machine_test
             ha/standby/standby_state_machine_test.cpp)
 add_ha_test(ha_metric_manager_test ha/standby/ha_metric_manager_test.cpp)
 add_ha_test(hot_standby_service_test ha/standby/hot_standby_service_test.cpp)
+add_ha_test(standby_metadata_store_test
+            ha/standby/standby_metadata_store_test.cpp)
 add_ha_test(hot_standby_snapshot_bootstrap_test
             ha/standby/hot_standby_snapshot_bootstrap_test.cpp)
 add_ha_test(oplog_applier_test ha/oplog/oplog_applier_test.cpp)

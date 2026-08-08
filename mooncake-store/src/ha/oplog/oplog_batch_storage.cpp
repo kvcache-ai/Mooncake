@@ -219,11 +219,27 @@ ErrorCode OpLogBatchStorage::WriteBatchAndAdvancePrefix(
          .expected_value = EncodeDurablePrefix(expected_prefix)});
     txn.puts.push_back({.key = BuildBatchRecordKey(cluster_id_, batch.batch_id),
                         .value = encoded_batch});
-    txn.puts.push_back(
-        {.key = durable_key,
-         .value = EncodeDurablePrefix(
-             {.batch_id = batch.batch_id, .last_seq = batch.last_seq})});
+    txn.puts.push_back({.key = durable_key,
+                        .value = EncodeDurablePrefix(
+                            {.batch_id = batch.batch_id,
+                             .last_seq = batch.last_seq,
+                             .producer_view_version =
+                                 expected_prefix.producer_view_version})});
     ErrorCode err = backend_.Txn(txn);
+    if (err == ErrorCode::ETCD_TRANSACTION_FAIL) {
+        std::string raw_prefix;
+        DurablePrefix decoded_prefix;
+        if (backend_.Get(durable_key, raw_prefix) == ErrorCode::OK &&
+            raw_prefix != txn.compares[0].expected_value &&
+            DecodeDurablePrefix(raw_prefix, &decoded_prefix) &&
+            decoded_prefix.batch_id == expected_prefix.batch_id &&
+            decoded_prefix.last_seq == expected_prefix.last_seq &&
+            decoded_prefix.producer_view_version ==
+                expected_prefix.producer_view_version) {
+            txn.compares[0].expected_value = raw_prefix;
+            err = backend_.Txn(txn);
+        }
+    }
     if (err != ErrorCode::ETCD_TRANSACTION_FAIL) {
         return err;
     }
@@ -231,7 +247,9 @@ ErrorCode OpLogBatchStorage::WriteBatchAndAdvancePrefix(
     DurablePrefix current_prefix;
     if (ReadDurablePrefix(current_prefix) != ErrorCode::OK ||
         current_prefix.batch_id != batch.batch_id ||
-        current_prefix.last_seq != batch.last_seq) {
+        current_prefix.last_seq != batch.last_seq ||
+        current_prefix.producer_view_version !=
+            expected_prefix.producer_view_version) {
         return err;
     }
     OpLogBatchRecord current_batch;
