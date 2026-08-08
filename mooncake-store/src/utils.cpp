@@ -599,10 +599,12 @@ void free_memory(const std::string &protocol, void *ptr, bool use_spdk_dma) {
 #endif
 #ifdef USE_VRAM_SEGMENT
 #ifdef USE_INTRA_NVLINK
-    freeFabricMemory_intra(ptr);
-#else
-    cudaFree(ptr);
+    if (protocol == "nvlink_intra") {
+        freeFabricMemory_intra(ptr);
+        return;
+    }
 #endif
+    cudaFree(ptr);
     return;
 #endif
     free(ptr);

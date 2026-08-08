@@ -814,9 +814,11 @@ class RealClient : public PyClient {
 
 #ifdef USE_VRAM_SEGMENT
     struct VRAMSegmentDeleter {
-        void operator()(void *ptr) {
+        bool use_intra_nvlink = false;
+
+        void operator()(void *ptr) const {
             if (ptr) {
-                free_memory("vram", ptr);
+                free_memory(use_intra_nvlink ? "nvlink_intra" : "vram", ptr);
             }
         }
     };
