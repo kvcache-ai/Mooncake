@@ -20,6 +20,8 @@
 #include <gtest/gtest.h>
 
 #include <memory>
+#include <string>
+#include <vector>
 
 #include "transport/rdma_transport/endpoint_store.h"
 #include "transport/rdma_transport/rdma_context.h"
@@ -114,6 +116,24 @@ TEST_F(EndpointStoreTest, ReclaimLeavesActiveEntries) {
            "active ones";
 }
 
+TEST_F(EndpointStoreTest, ReclaimLeavesCompletionPinnedEntries) {
+    SIEVEEndpointStore store(4);
+
+    auto endpoint = makeQuiescentEndpoint(*ctx_);
+    endpoint->beginCompletionBatch();
+    store.testOnlyInsertWaiting(endpoint);
+    EXPECT_EQ(store.waitingListSize(), 1u);
+
+    store.reclaimEndpoint();
+    EXPECT_EQ(store.waitingListSize(), 1u)
+        << "reclaim must not free an endpoint while a CQ completion batch "
+           "still holds raw slice endpoint pointers";
+
+    endpoint->endCompletionBatch();
+    store.reclaimEndpoint();
+    EXPECT_EQ(store.waitingListSize(), 0u);
+}
+
 TEST_F(EndpointStoreTest, ReclaimIsIdempotentWhenEmpty) {
     SIEVEEndpointStore store(4);
 
@@ -173,6 +193,40 @@ TEST_F(EndpointStoreTest, ReclaimDoesNotRequireActiveMap) {
 
     store.reclaimEndpoint();
     EXPECT_EQ(store.waitingListSize(), 0u);
+}
+
+TEST_F(EndpointStoreTest,
+       StaleRawPointerLookupAndDeleteStressDoesNotDereference) {
+    SIEVEEndpointStore store(4);
+    std::vector<RdmaEndPoint*> stale_ptrs;
+    stale_ptrs.reserve(1000);
+
+    for (size_t i = 0; i < 1000; ++i) {
+        auto endpoint = makeQuiescentEndpoint(*ctx_);
+        const std::string peer_nic_path = "peer@" + std::to_string(i);
+        store.testOnlyInsertEndpoint(peer_nic_path, endpoint);
+        stale_ptrs.push_back(endpoint.get());
+        EXPECT_EQ(endpoint, store.getEndpointByPtr(endpoint.get()));
+        EXPECT_EQ(0, store.deleteEndpointByPtr(endpoint.get()));
+    }
+
+    EXPECT_EQ(store.getSize(), 0u);
+    EXPECT_EQ(store.waitingListSize(), 1000u);
+    auto sentinel = makeQuiescentEndpoint(*ctx_);
+    store.testOnlyInsertEndpoint("sentinel@peer", sentinel);
+    store.reclaimEndpoint();
+    EXPECT_EQ(store.waitingListSize(), 0u);
+    EXPECT_EQ(store.getSize(), 1u);
+
+    // The endpoints were live in the store, deleted by raw pointer, then
+    // reclaimed. The raw pointers are now stale while the sentinel keeps the
+    // active map non-empty. Store APIs must compare pointer identity only;
+    // dereferencing would be caught by ASan builds.
+    for (auto* stale_ptr : stale_ptrs) {
+        EXPECT_EQ(nullptr, store.getEndpointByPtr(stale_ptr));
+        EXPECT_EQ(-1, store.deleteEndpointByPtr(stale_ptr));
+    }
+    EXPECT_EQ(sentinel, store.getEndpointByPtr(sentinel.get()));
 }
 
 }  // namespace
