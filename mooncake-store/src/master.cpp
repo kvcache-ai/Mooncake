@@ -118,6 +118,9 @@ DEFINE_int32(
     "Maximum number of threads to use (deprecated, use rpc_thread_num)");
 DEFINE_bool(enable_metric_reporting, true, "Enable periodic metric reporting");
 DEFINE_int32(metrics_port, 9003, "Port for HTTP metrics server to listen on");
+DEFINE_string(metrics_host, "0.0.0.0",
+              "Address for the HTTP metrics/admin server to listen on. "
+              "Use \"::\" to listen on IPv6 (and IPv4 on dual-stack hosts)");
 DEFINE_string(default_kv_lease_ttl, kDefaultKvLeaseTtlFlagValue,
               "Default lease time for kv objects. Supports raw milliseconds "
               "or duration strings with ms, s, m, or h suffixes");
@@ -440,6 +443,8 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
                            FLAGS_enable_metric_reporting);
     default_config.GetUInt32("metrics_port", &master_config.metrics_port,
                              FLAGS_metrics_port);
+    default_config.GetString("metrics_host", &master_config.metrics_host,
+                             FLAGS_metrics_host);
     default_config.GetUInt32("rpc_port", &master_config.rpc_port,
                              FLAGS_rpc_port);
     default_config.GetUInt32("rpc_thread_num", &master_config.rpc_thread_num,
@@ -779,6 +784,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
          !info.is_default) ||
         !conf_set) {
         master_config.metrics_port = FLAGS_metrics_port;
+    }
+    if ((google::GetCommandLineFlagInfo("metrics_host", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.metrics_host = FLAGS_metrics_host;
     }
     if ((google::GetCommandLineFlagInfo("default_kv_lease_ttl", &info) &&
          !info.is_default) ||
@@ -1421,6 +1431,7 @@ int main(int argc, char* argv[]) {
         << ", max_threads=" << master_config.rpc_thread_num
         << ", enable_metric_reporting=" << master_config.enable_metric_reporting
         << ", metrics_port=" << master_config.metrics_port
+        << ", metrics_host=" << master_config.metrics_host
         << ", default_kv_lease_ttl=" << master_config.default_kv_lease_ttl
         << ", default_kv_soft_pin_ttl=" << master_config.default_kv_soft_pin_ttl
         << ", allow_evict_soft_pinned_objects="
@@ -1541,7 +1552,7 @@ int main(int argc, char* argv[]) {
                 metadata_server_ptr, http_metadata_remote_url);
         mooncake::MasterAdminServer admin_server(
             static_cast<uint16_t>(master_config.metrics_port),
-            master_config.enable_metric_reporting);
+            master_config.enable_metric_reporting, master_config.metrics_host);
         if (!admin_server.Start()) {
             LOG(ERROR) << "Failed to start master admin server";
             return 1;
