@@ -12,6 +12,15 @@
 
 namespace mooncake::test {
 
+class MasterServiceTestPeer {
+   public:
+    static tl::expected<void, ErrorCode> PushOffloadingQueue(
+        MasterService& service, const std::string& key, Replica& replica) {
+        return service.PushOffloadingQueue(
+            MasterService::ObjectIdentity{TenantId::Default(), key}, replica);
+    }
+};
+
 std::unique_ptr<MasterService> CreateMasterServiceWithSSDFeat(
     const std::string& root_fs_dir) {
     return std::make_unique<MasterService>(
@@ -91,6 +100,147 @@ void ExpectNextAllocationOnSegment(MasterService& service,
                   .get_memory_descriptor()
                   .buffer_descriptor.transport_endpoint_,
               expected_segment);
+}
+
+TEST_F(MasterServiceSSDTest, PutEndSurvivesOffloadEnqueueFailure) {
+    // Reproduction for issue #2997: with eager offload enabled but no local
+    // disk segment mounted, the enqueue in PutEnd fails (UNABLE_OFFLOADING).
+    // PutEnd must still report success (enqueue is best-effort), but the
+    // failure used to vanish without a trace.
+    auto service_ = CreateSsdAwareOffloadService();
+
+    UUID client_id = generate_uuid();
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "mem_only_segment";
+    segment.base = 0x100000000;
+    segment.size = 64 * 1024 * 1024;
+    segment.te_endpoint = segment.name;
+    ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
+    // no MountLocalDiskSegment call -> PushOffloadingQueue will fail
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    ASSERT_TRUE(service_
+                    ->PutStart(client_id, "silent_key", TenantId::Default(),
+                               1024, config)
+                    .has_value());
+    EXPECT_TRUE(service_
+                    ->PutEnd(client_id, "silent_key", TenantId::Default(),
+                             ReplicaType::MEMORY)
+                    .has_value());
+}
+
+TEST_F(MasterServiceSSDTest, PutEndOffloadEnqueueFailureIsCounted) {
+    auto service_ = CreateSsdAwareOffloadService();
+    auto& metrics = MasterMetricManager::instance();
+    const int64_t base = metrics.get_offload_enqueue_failed();
+
+    UUID client_id = generate_uuid();
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "mem_only_segment_counted";
+    segment.base = 0x140000000;
+    segment.size = 64 * 1024 * 1024;
+    segment.te_endpoint = segment.name;
+    ASSERT_TRUE(service_->MountSegment(segment, client_id).has_value());
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    ASSERT_TRUE(service_
+                    ->PutStart(client_id, "counted_key", TenantId::Default(),
+                               1024, config)
+                    .has_value());
+    EXPECT_TRUE(service_
+                    ->PutEnd(client_id, "counted_key", TenantId::Default(),
+                             ReplicaType::MEMORY)
+                    .has_value());
+    EXPECT_EQ(base + 1, metrics.get_offload_enqueue_failed());
+    EXPECT_NE(std::string::npos,
+              metrics.serialize_metrics().find(
+                  "# TYPE master_offload_enqueue_failed_total counter"));
+}
+
+TEST_F(MasterServiceSSDTest, PushOffloadingQueueWithoutUsableSegmentIsNoop) {
+    // A replica without any usable segment names is a no-op success, not a
+    // failure (mirrors the original silent behavior).
+    auto service_ = CreateSsdAwareOffloadService();
+    auto& metrics = MasterMetricManager::instance();
+    const int64_t base = metrics.get_offload_enqueue_failed();
+
+    auto buffer = std::make_unique<AllocatedBuffer>(
+        std::shared_ptr<BufferAllocatorBase>{}, nullptr, 1024);
+    Replica replica(std::move(buffer), ReplicaStatus::COMPLETE);
+
+    auto result = MasterServiceTestPeer::PushOffloadingQueue(
+        *service_, "no_usable_segment_key", replica);
+    EXPECT_TRUE(result.has_value());
+    EXPECT_EQ(base, metrics.get_offload_enqueue_failed());
+}
+
+TEST_F(MasterServiceSSDTest, PutEndOffloadQueueFullIsCounted) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.offloading_queue_limit =
+        1;  // the second enqueue hits KEYS_ULTRA_LIMIT
+    auto service_ = std::make_unique<MasterService>(config);
+    auto& metrics = MasterMetricManager::instance();
+    const int64_t base = metrics.get_offload_enqueue_failed();
+
+    UUID client_id = generate_uuid();
+    MountMemoryAndLocalDisk(*service_, client_id, "full_segment", 0x180000000);
+
+    ASSERT_TRUE(service_
+                    ->PutStart(client_id, "full_key_1", TenantId::Default(),
+                               1024, {.replica_num = 1})
+                    .has_value());
+    EXPECT_TRUE(service_
+                    ->PutEnd(client_id, "full_key_1", TenantId::Default(),
+                             ReplicaType::MEMORY)
+                    .has_value());
+
+    ASSERT_TRUE(service_
+                    ->PutStart(client_id, "full_key_2", TenantId::Default(),
+                               1024, {.replica_num = 1})
+                    .has_value());
+    EXPECT_TRUE(service_
+                    ->PutEnd(client_id, "full_key_2", TenantId::Default(),
+                             ReplicaType::MEMORY)
+                    .has_value());
+    EXPECT_EQ(base + 1, metrics.get_offload_enqueue_failed());
+}
+
+TEST_F(MasterServiceSSDTest, PutEndDuplicateEnqueueIsBenignWhenQueueIsFull) {
+    // Keep the queue full after the first enqueue. A second enqueue for the
+    // same key must still be classified as OBJECT_ALREADY_EXISTS rather than
+    // KEYS_ULTRA_LIMIT, and therefore must not increment the failure counter.
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.offloading_queue_limit = 1;
+    auto service_ = std::make_unique<MasterService>(config);
+    auto& metrics = MasterMetricManager::instance();
+    const int64_t base = metrics.get_offload_enqueue_failed();
+
+    UUID client_id = generate_uuid();
+    MountMemoryAndLocalDisk(*service_, client_id, "dup_segment", 0x1c0000000);
+
+    ASSERT_TRUE(service_
+                    ->PutStart(client_id, "dup_key", TenantId::Default(), 1024,
+                               {.replica_num = 1})
+                    .has_value());
+    EXPECT_TRUE(service_
+                    ->PutEnd(client_id, "dup_key", TenantId::Default(),
+                             ReplicaType::MEMORY)
+                    .has_value());
+    EXPECT_EQ(base, metrics.get_offload_enqueue_failed());
+
+    // PutEnd keeps best-effort success semantics; internally the duplicate
+    // enqueue is benign and must not increment the failure counter.
+    EXPECT_TRUE(service_
+                    ->PutEnd(client_id, "dup_key", TenantId::Default(),
+                             ReplicaType::MEMORY)
+                    .has_value());
+    EXPECT_EQ(base, metrics.get_offload_enqueue_failed());
 }
 
 TEST_F(MasterServiceSSDTest, PutEndBothReplica) {

@@ -291,6 +291,9 @@ MasterMetricManager::MasterMetricManager()
                       "Current number of cached values in the memory pool"),
       file_cache_nums_("file_cache_nums_",
                        "Current number of cached values in SSD cache"),
+      offload_enqueue_failed_(
+          "master_offload_enqueue_failed_total",
+          "Total number of failed PushOffloadingQueue attempts"),
       valid_get_nums_("valid_get_nums_",
                       "Total number of GetReplicaList operations that returned "
                       "at least one completed replica"),
@@ -499,6 +502,7 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     promotion_in_flight_metric_.update(0);
 
     // Update Counters (use inc(0) to mark as changed)
+    offload_enqueue_failed_.inc(0);
     promotion_admitted_.inc(0);
     promotion_completed_.inc(0);
     promotion_completed_bytes_.inc(0);
@@ -906,6 +910,12 @@ int64_t MasterMetricManager::get_mem_cache_nums() {
 }
 int64_t MasterMetricManager::get_file_cache_nums() {
     return file_cache_nums_.value();
+}
+void MasterMetricManager::inc_offload_enqueue_failed(int64_t val) {
+    offload_enqueue_failed_.inc(val);
+}
+int64_t MasterMetricManager::get_offload_enqueue_failed() {
+    return offload_enqueue_failed_.value();
 }
 void MasterMetricManager::dec_mem_cache_nums(int64_t val) {
     mem_cache_nums_.dec(val);
@@ -1873,6 +1883,7 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(move_revoke_failures_);
     serialize_metric(evict_disk_replica_requests_);
     serialize_metric(evict_disk_replica_failures_);
+    serialize_metric(offload_enqueue_failed_);
 
     // Serialize CreateCopyTask, CreateMoveTask, MarkTaskToComplete, QueryTask,
     // FetchTasks Request Counters
