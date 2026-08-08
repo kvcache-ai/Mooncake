@@ -434,6 +434,25 @@ def write_manifest(
     )
 
 
+def test_default_bundle_chunk_tuning_matches_rollout_transfer_target() -> None:
+    assert sos.DEFAULT_BUNDLE_CHUNK_BYTES == 64 * 1024**2
+    assert sos.AUTO_PARALLEL_MIN_BYTES == sos.DEFAULT_BUNDLE_CHUNK_BYTES
+
+
+def test_small_dict_sized_groups_enable_auto_parallel_put() -> None:
+    class SizedBuffer:
+        def __init__(self, size: int) -> None:
+            self._size = size
+
+        def __len__(self) -> int:
+            return self._size
+
+    _store, transfer = make_transfer()
+    groups = [[SizedBuffer(1024**2)] for _ in range(128)]
+    policy = BundleTransferPolicy(max_inflight_put=8)
+    assert transfer._transport._resolve_buffer_group_put_mode(groups, policy) == "parallel"
+
+
 def test_put_object_roundtrips_numpy_and_torch_tensor_fields() -> None:
     torch = pytest.importorskip("torch")
     store, transfer = make_transfer()
@@ -1603,9 +1622,9 @@ def test_dataproto_field_schema_encodes_typed_ragged_non_tensor_field() -> None:
     )
     result = transfer.get_dataproto(ref)["non_tensor_batch"]["tokens"]
 
-    assert result[0] == [1, 2]
+    assert result[0].tolist() == [1, 2]
     assert result[1] is None
-    assert result[2] == [3]
+    assert result[2].tolist() == [3]
 
     bad_text = np.asarray([object()], dtype=object)
     with pytest.raises(AttributeError, match="failed to encode.*'text'.*utf8_ragged"):
@@ -1814,6 +1833,59 @@ def test_unified_put_get_roundtrips_flat_dict() -> None:
     assert result["step"] == 7
 
 
+def test_unified_dict_get_returns_flat_lists_without_changing_dataproto_shape() -> None:
+    _store, transfer = make_transfer()
+    data = {
+        "tokens": [
+            np.asarray([1, 2], dtype=np.int32),
+            np.asarray([3], dtype=np.int32),
+            np.asarray([4, 5, 6], dtype=np.int32),
+        ],
+        "json": [{"rank": 0}, {"rank": 1}, {"rank": 2}],
+    }
+    schemas = {
+        "tokens": FieldSchema(
+            codec="typed_ragged",
+            metadata={"section": "non_tensor_batch", "dtype": "int32"},
+        ),
+        "json": FieldSchema(
+            codec="msgpack_ragged",
+            metadata={"section": "non_tensor_batch"},
+        ),
+    }
+
+    ref = transfer.put(data, type="dict", field_schemas=schemas)
+
+    flat = transfer.get(ref, type="dict")
+    assert isinstance(flat["tokens"], list)
+    assert isinstance(flat["json"], list)
+    assert [row.tolist() for row in flat["tokens"]] == [[1, 2], [3], [4, 5, 6]]
+    assert flat["json"] == [{"rank": 0}, {"rank": 1}, {"rank": 2}]
+
+    sliced = transfer.get(ref, type="dict", rows=slice(1, 3))
+    assert isinstance(sliced["tokens"], list)
+    assert isinstance(sliced["json"], list)
+    assert [row.tolist() for row in sliced["tokens"]] == [[3], [4, 5, 6]]
+    assert sliced["json"] == [{"rank": 1}, {"rank": 2}]
+
+    envelope = transfer.get_dataproto(ref, data_cls=dict)
+    non_tensor_batch = envelope["non_tensor_batch"]
+    assert isinstance(non_tensor_batch["tokens"], np.ndarray)
+    assert non_tensor_batch["tokens"].dtype == object
+    assert isinstance(non_tensor_batch["json"], np.ndarray)
+    assert non_tensor_batch["json"].dtype == object
+    assert [row.tolist() for row in non_tensor_batch["tokens"]] == [
+        [1, 2],
+        [3],
+        [4, 5, 6],
+    ]
+    assert non_tensor_batch["json"].tolist() == [
+        {"rank": 0},
+        {"rank": 1},
+        {"rank": 2},
+    ]
+
+
 def test_unified_put_rejects_unknown_type() -> None:
     _store, transfer = make_transfer()
 
@@ -1879,7 +1951,8 @@ def test_unified_dict_put_accepts_field_schemas() -> None:
     result = transfer.get(ref, type="dict")
 
     assert np.array_equal(result["input_ids"], np.arange(2))
-    assert result["tokens"] == [[1, 2], None]
+    assert result["tokens"][0].tolist() == [1, 2]
+    assert result["tokens"][1] is None
     assert result["partition"] == [0, 1]
     assert result["response_lengths"] == [2, 0]
     assert result["global_batch_sizes"] == [2]
@@ -2899,7 +2972,11 @@ def test_dataproto_helper_typed_ragged_uses_multi_buffer_put() -> None:
 
     assert ref.encoded_non_tensor["tokens"]["codec"] == "typed_ragged"
     tokens = result["non_tensor_batch"]["tokens"].tolist()
-    assert tokens == [[1, 2], None, [3, 4, 5]]
+    assert [None if row is None else row.tolist() for row in tokens] == [
+        [1, 2],
+        None,
+        [3, 4, 5],
+    ]
     assert rows[0].nbytes + rows[2].nbytes in pool.acquire_sizes
 
 
@@ -2933,7 +3010,11 @@ def test_dataproto_helper_typed_ragged_fast_copy_put() -> None:
     result = transfer.get_dataproto(ref)
 
     tokens = result["non_tensor_batch"]["tokens"].tolist()
-    assert tokens == [[1, 2], None, [3, 4, 5]]
+    assert [None if row is None else row.tolist() for row in tokens] == [
+        [1, 2],
+        None,
+        [3, 4, 5],
+    ]
     assert store.batch_put_from_calls > 0
     assert rows[0].nbytes + rows[2].nbytes in pool.acquire_sizes
 
@@ -2992,6 +3073,135 @@ def test_dataproto_helper_typed_ragged_zero_copy_rejects_source_buffers() -> Non
         )
 
 
+def test_typed_ragged_packs_ndarray_rows_contiguously() -> None:
+    _store, transfer = make_transfer()
+    rows = [
+        np.asarray(7, dtype=np.int32),
+        np.arange(3, dtype=np.int32),
+        None,
+        np.arange(4, dtype=np.int32).reshape(2, 2),
+        np.arange(6, dtype=np.int32).reshape(2, 3),
+    ]
+
+    ref = transfer.put(
+        {"values": rows},
+        field_schemas={
+            "values": FieldSchema(
+                codec="typed_ragged",
+                metadata={"section": "non_tensor_batch"},
+            )
+        },
+        type="dict",
+    )
+    result = transfer.get(ref, type="dict")
+    view = transfer.dataproto_manifest_view(ref)
+
+    encoded = ref.encoded_non_tensor["values"]
+    assert encoded["codec"] == "typed_ragged"
+    assert encoded["metadata"]["physical_layout"] == "contiguous_flat"
+    assert view["non_tensor_fields"]["values"]["spec"]["payload_specs"]["data"][
+        "shape"
+    ] == [14]
+    assert [
+        None if row is None else row.tolist() for row in result["values"]
+    ] == [
+        None if row is None else row.tolist() for row in rows
+    ]
+    assert all(
+        row is None or isinstance(row, np.ndarray) for row in result["values"]
+    )
+    assert result["values"][0].shape == ()
+    assert [row.dtype for row in result["values"] if row is not None] == [
+        np.dtype(np.int32)
+    ] * 4
+    gathered = transfer.get_dataproto(
+        ref, non_tensor_fields=["values"], rows=[4, 2, 0]
+    )
+    assert [
+        None if row is None else row.tolist()
+        for row in gathered["non_tensor_batch"]["values"]
+    ] == [
+        rows[4].tolist(),
+        None,
+        rows[0].tolist(),
+    ]
+    assert gathered["non_tensor_batch"]["values"][2].shape == ()
+
+
+def _typed_ragged_payload_array(
+    payload: dict[str, object], dtype: np.dtype
+) -> np.ndarray:
+    data = payload["data"]
+    arrays = getattr(data, "arrays", None)
+    if arrays is not None:
+        flat_arrays = [
+            np.asarray(array, dtype=dtype).reshape(-1) for array in arrays
+        ]
+        if not flat_arrays:
+            return np.asarray([], dtype=dtype)
+        return np.concatenate(flat_arrays)
+    return np.concatenate([np.frombuffer(buf, dtype=dtype) for buf in data.buffers])
+
+def test_typed_ragged_fast_decodes_equal_shape_ndarray_views() -> None:
+    rows = [np.arange(6, dtype=np.int32).reshape(2, 3) + i * 10 for i in range(3)]
+    payload, metadata = sos._encode_typed_ragged_values(rows, np.dtype(np.int32))
+    data = _typed_ragged_payload_array(payload, np.dtype(np.int32))
+
+    decoded = sos._decode_typed_ragged_values({**payload, "data": data}, 3, metadata)
+
+    assert metadata["physical_layout"] == "contiguous_flat"
+    assert all(isinstance(row, np.ndarray) for row in decoded)
+    assert all(np.shares_memory(row, data) for row in decoded)
+    assert [row.tolist() for row in decoded] == [row.tolist() for row in rows]
+
+
+def test_typed_ragged_single_ndarray_row_uses_general_layout() -> None:
+    rows = [np.arange(6, dtype=np.int32).reshape(2, 3)]
+
+    assert sos._encode_typed_ragged_regular_ndarray_rows(
+        rows, np.dtype(np.int32)
+    ) is None
+    payload, metadata = sos._encode_typed_ragged_values(rows, np.dtype(np.int32))
+    data = _typed_ragged_payload_array(payload, np.dtype(np.int32))
+
+    decoded = sos._decode_typed_ragged_values({**payload, "data": data}, 1, metadata)
+
+    assert metadata["physical_layout"] == "contiguous_flat"
+    assert isinstance(decoded[0], np.ndarray)
+    assert np.shares_memory(decoded[0], data)
+    assert decoded[0].tolist() == rows[0].tolist()
+
+
+def test_typed_ragged_equal_shape_rows_with_nulls_use_general_layout() -> None:
+    rows = [
+        np.arange(6, dtype=np.int32).reshape(2, 3),
+        None,
+        np.arange(6, 12, dtype=np.int32).reshape(2, 3),
+    ]
+
+    assert sos._encode_typed_ragged_regular_ndarray_rows(
+        rows, np.dtype(np.int32)
+    ) is None
+    payload, metadata = sos._encode_typed_ragged_values(rows, np.dtype(np.int32))
+    data = _typed_ragged_payload_array(payload, np.dtype(np.int32))
+
+    decoded = sos._decode_typed_ragged_values({**payload, "data": data}, 3, metadata)
+
+    assert metadata["physical_layout"] == "contiguous_flat"
+    assert decoded[1] is None
+    assert all(
+        row is None or isinstance(row, np.ndarray) for row in decoded
+    )
+    assert all(
+        row is None or np.shares_memory(row, data) for row in decoded
+    )
+    assert [None if row is None else row.tolist() for row in decoded] == [
+        rows[0].tolist(),
+        None,
+        rows[2].tolist(),
+    ]
+
+
 def test_dataproto_helper_rejects_unsupported_object_non_tensor() -> None:
     _store, transfer = make_transfer()
     data = SimpleDataProto(
@@ -3026,6 +3236,7 @@ def test_dataproto_helper_ragged_tensor_non_tensor_roundtrip() -> None:
     result = transfer.get_dataproto(ref)
 
     assert ref.encoded_non_tensor["ragged"]["codec"] == "ragged_tensor"
+    assert ref.encoded_non_tensor["ragged"]["metadata"]["dtype"] == "torch.float32"
     actual = result["non_tensor_batch"]["ragged"]
     assert torch.equal(actual[0], ragged[0])
     assert actual[1] is None
@@ -3039,6 +3250,11 @@ def test_dataproto_helper_ragged_tensor_non_tensor_roundtrip() -> None:
     ]
     with pytest.raises(ValueError, match="mixed tensor dtype"):
         transfer.put_dataproto(SimpleDataProto(non_tensor_batch={"ragged": mixed}))
+
+    bfloat = np.empty(1, dtype=object)
+    bfloat[0] = torch.zeros(1, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="bfloat16"):
+        transfer.put_dataproto(SimpleDataProto(non_tensor_batch={"ragged": bfloat}))
 
 
 def test_dataproto_helper_jagged_nested_batch_tensor_roundtrip() -> None:
@@ -3219,11 +3435,13 @@ def test_dataproto_helper_dict_of_native_object_leaves_uses_recursive_codec() ->
     assert ref.encoded_non_tensor["samples"]["codec"] == "structured_recursive"
     assert actual[0]["media"] == [b"a", b"bc"]
     assert actual[0]["blob"] == b"payload-0"
-    assert actual[0]["scores"] == [1, 2]
+    assert isinstance(actual[0]["scores"], np.ndarray)
+    assert actual[0]["scores"].tolist() == [1, 2]
     assert actual[0]["label"] == "x"
     assert actual[1]["media"] == []
     assert actual[1]["blob"] == b"payload-1"
-    assert actual[1]["scores"] == [3]
+    assert isinstance(actual[1]["scores"], np.ndarray)
+    assert actual[1]["scores"].tolist() == [3]
     assert actual[1]["label"] == "y"
     assert actual[2] == {"label": "missing-native"}
     assert actual[3] is None
