@@ -211,7 +211,7 @@ TEST(OrderedOpLogWriterAdmissionTest, CommitAssignsContiguousSequences) {
 #ifdef MOONCAKE_ENABLE_OPLOG_PERF_METRICS
 TEST(OrderedOpLogWriterMetricTest, RecordsDurabilityQueuesAndRetry) {
     FakeBatchWriter storage;
-    storage.FailNextWrites(1, ErrorCode::ETCD_TRANSACTION_FAIL);
+    storage.FailNextWrites(1, ErrorCode::PERSISTENT_FAIL);
     auto& metrics = HAMetricManager::instance();
     const auto batches_before =
         metrics.get_batch_record_durable_batches_total();
@@ -713,6 +713,107 @@ TEST(OrderedOpLogWriterFailureTest, FirstStorageFailureStopsNewReservations) {
     writer.Stop();
 }
 
+TEST(OrderedOpLogWriterFailureTest, NonRetryableFailureLatchesTerminalState) {
+    FakeBatchWriter storage;
+    std::mutex mutex;
+    std::condition_variable cv;
+    int terminal_callbacks = 0;
+    std::optional<OrderedOpLogWriterTerminalState> callback_state;
+    OrderedOpLogWriter writer(
+        OrderedOpLogWriterConfig{.max_entries_per_batch = 2},
+        [&](const OpLogBatchRecord& batch,
+            const DurablePrefix& expected_prefix) {
+            return storage.Write(batch, expected_prefix);
+        },
+        [&](const OrderedOpLogWriterTerminalState& state) {
+            std::lock_guard<std::mutex> lock(mutex);
+            ++terminal_callbacks;
+            callback_state = state;
+            cv.notify_all();
+        });
+    writer.Start();
+
+    auto held = writer.Reserve();
+    auto failing = writer.Reserve();
+    ASSERT_TRUE(held.has_value());
+    ASSERT_TRUE(failing.has_value());
+    storage.FailNextWrite(ErrorCode::INVALID_PARAMS);
+    ASSERT_TRUE(
+        writer
+            .Commit(std::move(*failing), MakeEntry("fail"), [](const auto&) {})
+            .has_value());
+
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        ASSERT_TRUE(cv.wait_for(lock, std::chrono::seconds(1),
+                                [&] { return terminal_callbacks == 1; }));
+    }
+    const auto state = writer.GetTerminalState();
+    ASSERT_TRUE(state.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, state->error);
+    EXPECT_EQ(OrderedOpLogWriterTerminalReason::kNonRetryableWriteError,
+              state->reason);
+    EXPECT_EQ(0u, state->durable_prefix.batch_id);
+    EXPECT_EQ(0u, state->durable_prefix.last_seq);
+    EXPECT_NE(0u, state->occurred_at_ms);
+    ASSERT_TRUE(callback_state.has_value());
+    EXPECT_EQ(state->error, callback_state->error);
+    EXPECT_FALSE(writer.IsAccepting());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, writer.LastError());
+    auto reserve_after_terminal = writer.Reserve();
+    ASSERT_FALSE(reserve_after_terminal.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, reserve_after_terminal.error());
+
+    auto committed =
+        writer.Commit(std::move(*held), MakeEntry(), [](const auto&) {});
+    ASSERT_FALSE(committed.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, committed.error());
+    auto reused =
+        writer.Commit(std::move(*held), MakeEntry(), [](const auto&) {});
+    ASSERT_FALSE(reused.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, reused.error());
+    writer.Stop();
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, writer.LastError());
+    const auto state_after_stop = writer.GetTerminalState();
+    ASSERT_TRUE(state_after_stop.has_value());
+    EXPECT_EQ(state->error, state_after_stop->error);
+    EXPECT_EQ(state->reason, state_after_stop->reason);
+    EXPECT_EQ(state->durable_prefix.batch_id,
+              state_after_stop->durable_prefix.batch_id);
+    EXPECT_EQ(state->durable_prefix.last_seq,
+              state_after_stop->durable_prefix.last_seq);
+    EXPECT_EQ(state->occurred_at_ms, state_after_stop->occurred_at_ms);
+    EXPECT_EQ(1, terminal_callbacks);
+}
+
+TEST(OrderedOpLogWriterFailureTest, TransactionConflictBecomesFencedTerminal) {
+    FakeBatchWriter storage;
+    OrderedOpLogWriter writer(
+        OrderedOpLogWriterConfig{.max_entries_per_batch = 1},
+        [&](const OpLogBatchRecord& batch,
+            const DurablePrefix& expected_prefix) {
+            return storage.Write(batch, expected_prefix);
+        });
+    writer.Start();
+
+    storage.FailNextWrite(ErrorCode::ETCD_TRANSACTION_FAIL);
+    auto reservation = writer.Reserve();
+    ASSERT_TRUE(reservation.has_value());
+    ASSERT_TRUE(
+        writer.Commit(std::move(*reservation), MakeEntry(), [](const auto&) {})
+            .has_value());
+    ASSERT_TRUE(storage.WaitForAttempts(1));
+    for (int i = 0; i < 100 && !writer.GetTerminalState().has_value(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    const auto state = writer.GetTerminalState();
+    ASSERT_TRUE(state.has_value());
+    EXPECT_EQ(ErrorCode::ETCD_TRANSACTION_FAIL, state->error);
+    EXPECT_EQ(OrderedOpLogWriterTerminalReason::kFenced, state->reason);
+    EXPECT_EQ(1u, storage.AttemptTimes().size());
+    writer.Stop();
+}
+
 TEST(OrderedOpLogWriterFailureTest,
      DoesNotInvokeCallbacksWhileBatchIsUndurable) {
     FakeBatchWriter storage;
@@ -735,6 +836,84 @@ TEST(OrderedOpLogWriterFailureTest,
     std::this_thread::sleep_for(std::chrono::milliseconds(50));
 
     EXPECT_EQ(0, callbacks.load());
+    writer.Stop();
+}
+
+TEST(OrderedOpLogWriterFailureTest, RetryTimeoutStopsFurtherAttempts) {
+    using namespace std::chrono_literals;
+
+    FakeBatchWriter storage;
+    std::atomic<int> terminal_callbacks{0};
+    OrderedOpLogWriter writer(
+        OrderedOpLogWriterConfig{.max_entries_per_batch = 1,
+                                 .retry_timeout = 50ms},
+        [&](const OpLogBatchRecord& batch,
+            const DurablePrefix& expected_prefix) {
+            return storage.Write(batch, expected_prefix);
+        },
+        [&](const OrderedOpLogWriterTerminalState&) { ++terminal_callbacks; });
+    writer.Start();
+
+    storage.FailNextWrites(100000, ErrorCode::PERSISTENT_FAIL);
+    auto reservation = writer.Reserve();
+    ASSERT_TRUE(reservation.has_value());
+    ASSERT_TRUE(writer
+                    .Commit(std::move(*reservation), MakeEntry("k1"),
+                            [](const auto&) {})
+                    .has_value());
+
+    for (int i = 0; i < 200 && !writer.GetTerminalState().has_value(); ++i) {
+        std::this_thread::sleep_for(10ms);
+    }
+    const auto state = writer.GetTerminalState();
+    ASSERT_TRUE(state.has_value());
+    EXPECT_EQ(ErrorCode::PERSISTENT_FAIL, state->error);
+    EXPECT_EQ(OrderedOpLogWriterTerminalReason::kRetryTimeout, state->reason);
+    EXPECT_NE(0u, state->occurred_at_ms);
+    EXPECT_EQ(ErrorCode::PERSISTENT_FAIL, writer.LastError());
+    for (int i = 0; i < 100 && terminal_callbacks.load() != 1; ++i) {
+        std::this_thread::sleep_for(10ms);
+    }
+    EXPECT_EQ(1, terminal_callbacks.load());
+
+    const size_t attempts_after_terminal = storage.AttemptTimes().size();
+    std::this_thread::sleep_for(100ms);
+    EXPECT_EQ(attempts_after_terminal, storage.AttemptTimes().size());
+    writer.Stop();
+}
+
+TEST(OrderedOpLogWriterFailureTest,
+     SuccessBeforeRetryTimeoutDoesNotBecomeTerminal) {
+    using namespace std::chrono_literals;
+
+    FakeBatchWriter storage;
+    std::atomic<int> terminal_callbacks{0};
+    OrderedOpLogWriter writer(
+        OrderedOpLogWriterConfig{.max_entries_per_batch = 1,
+                                 .retry_timeout = 2s},
+        [&](const OpLogBatchRecord& batch,
+            const DurablePrefix& expected_prefix) {
+            return storage.Write(batch, expected_prefix);
+        },
+        [&](const OrderedOpLogWriterTerminalState&) { ++terminal_callbacks; });
+    writer.Start();
+
+    storage.FailNextWrites(1, ErrorCode::PERSISTENT_FAIL);
+    auto reservation = writer.Reserve();
+    ASSERT_TRUE(reservation.has_value());
+    ASSERT_TRUE(writer
+                    .Commit(std::move(*reservation), MakeEntry("k1"),
+                            [](const auto&) {})
+                    .has_value());
+
+    ASSERT_TRUE(storage.WaitForWrites(1));
+    for (int i = 0; i < 100 && !writer.IsAccepting(); ++i) {
+        std::this_thread::sleep_for(10ms);
+    }
+    EXPECT_FALSE(writer.GetTerminalState().has_value());
+    EXPECT_EQ(0, terminal_callbacks.load());
+    EXPECT_TRUE(writer.IsAccepting());
+    EXPECT_EQ(ErrorCode::OK, writer.LastError());
     writer.Stop();
 }
 
@@ -859,6 +1038,7 @@ TEST(OrderedOpLogWriterFailureTest, StopInterruptsRetryBackoff) {
     const auto started_at = FakeBatchWriter::Clock::now();
     writer.Stop();
     EXPECT_LT(FakeBatchWriter::Clock::now() - started_at, 250ms);
+    EXPECT_FALSE(writer.GetTerminalState().has_value());
 }
 
 TEST(OrderedOpLogWriterFailureTest, SuccessAfterRetryRestoresAccepting) {
