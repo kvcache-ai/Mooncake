@@ -3765,7 +3765,6 @@ class _BundleManifestStore:
             memoryview(payload),
             len(payload) or 1,
             transfer_policy,
-            pre_registered=False,
             config=config,
         )
         payload_spec["metadata_bytes"] = metadata_bytes
