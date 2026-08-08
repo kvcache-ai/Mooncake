@@ -323,6 +323,9 @@ class MasterMetricManager {
     void inc_promotion_rejected_frequency(int64_t val = 1);
     void inc_promotion_rejected_watermark(int64_t val = 1);
     void inc_promotion_rejected_cap(int64_t val = 1);
+    // SLO-aware promotion diagnostics.
+    void inc_promotion_within_budget(int64_t val = 1);
+    void inc_promotion_late(int64_t val = 1);
 
     // Tenant quota metrics
     void inc_tenant_quota_reject(const std::string& tenant_id,
@@ -348,6 +351,8 @@ class MasterMetricManager {
     int64_t get_promotion_rejected_frequency();
     int64_t get_promotion_rejected_watermark();
     int64_t get_promotion_rejected_cap();
+    int64_t get_promotion_within_budget();
+    int64_t get_promotion_late();
     int64_t get_promotion_candidate_recorded();
     int64_t get_promotion_candidate_admitted();
     int64_t get_promotion_candidate_admission_rejected();
@@ -707,6 +712,8 @@ class MasterMetricManager {
     ylt::metric::counter_t promotion_rejected_frequency_;
     ylt::metric::counter_t promotion_rejected_watermark_;
     ylt::metric::counter_t promotion_rejected_cap_;
+    ylt::metric::counter_t promotion_within_budget_;
+    ylt::metric::counter_t promotion_late_;
     // Promotion retry candidate metrics
     ylt::metric::counter_t promotion_candidate_recorded_;
     ylt::metric::counter_t promotion_candidate_admitted_;

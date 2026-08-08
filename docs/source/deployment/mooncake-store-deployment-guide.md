@@ -193,7 +193,7 @@ mooncake_master \
 
 ### Tiered Storage with SSD Offload — Cost-Effective Capacity
 
-Extends the cache pool from DRAM to SSD while keeping normal reads and writes on the distributed memory path. With `--enable_offload=true`, completed memory writes are queued for asynchronous SSD persistence through the master control plane. Set `--offload_on_evict=true` to defer that SSD write until the memory eviction path selects an object for reclamation. When `--promotion_on_hit=true`, SSD-only objects can be promoted back to DRAM after repeated reads; admission is gated by `--promotion_admission_threshold`.
+Extends the cache pool from DRAM to SSD while keeping normal reads and writes on the distributed memory path. With `--enable_offload=true`, completed memory writes are queued for asynchronous SSD persistence through the master control plane. Set `--offload_on_evict=true` to defer that SSD write until the memory eviction path selects an object for reclamation. When `--promotion_on_hit=true`, SSD-only objects can be promoted back to DRAM after repeated reads; admission is gated by `--promotion_admission_threshold`. To keep promotion work aligned with an application-level SLO window, set `--promotion_max_budget_ms` to a positive value so the master prioritizes in-budget queued tasks and expires late queued tasks before they are handed to clients.
 
 ```bash
 mooncake_master \
@@ -201,6 +201,7 @@ mooncake_master \
   --offload_on_evict=true \
   --promotion_on_hit=true \
   --promotion_admission_threshold=2 \
+  --promotion_max_budget_ms=0 \
   --enable_http_metadata_server=true \
   --http_metadata_server_port=8080
 ```
@@ -724,11 +725,12 @@ Flags for controlling data movement between DRAM and SSD.
 | `--promotion_on_hit` | `false` | Promote SSD-resident keys to DRAM on read hit |
 | `--promotion_admission_threshold` | `2` | Min CountMinSketch count to allow promotion (`1` = disable gating) |
 | `--promotion_max_per_heartbeat` | `1` | Max promotion tasks handed to a single client per heartbeat. Each task is a synchronous SSD-read + RDMA-write on the client; serializing them avoids blocking past the client-liveness window |
+| `--promotion_max_budget_ms` | `0` | SLO-aware promotion queue budget in milliseconds. `0` keeps FIFO behavior; a positive value sorts queued tasks by deadline and expires tasks that have already missed the budget before they are handed to clients |
 | `--promotion_queue_limit` | `50000` | Max in-flight promotion tasks |
 | `--quota_bytes` | `0` (90% of capacity) | Storage quota in bytes |
 | `--enable_disk_eviction` | `true` | Enable disk eviction |
 
-Start with `--enable_offload=true` for eager asynchronous SSD persistence after `Put` completion. Add `--offload_on_evict=true` when you want SSD writes to happen only when memory pressure selects an object for eviction. Add `--promotion_on_hit=true` to allow hot SSD-only data to be promoted back to DRAM, and tune `--promotion_admission_threshold` to control how many observed reads are required before promotion is queued.
+Start with `--enable_offload=true` for eager asynchronous SSD persistence after `Put` completion. Add `--offload_on_evict=true` when you want SSD writes to happen only when memory pressure selects an object for eviction. Add `--promotion_on_hit=true` to allow hot SSD-only data to be promoted back to DRAM, and tune `--promotion_admission_threshold` to control how many observed reads are required before promotion is queued. Keep `--promotion_max_budget_ms=0` for the original FIFO queue behavior; set it to a positive SLO budget when late SSD-to-DRAM promotions should be expired instead of consuming client work after their useful window has passed.
 
 For SSD offload, configure the disk path on each real client with `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`; the master tracks these objects as `LOCAL_DISK` replicas. Do not use the legacy `--root_fs_dir` parameter with `--enable_offload=true`.
 
