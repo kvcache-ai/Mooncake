@@ -609,15 +609,23 @@ config = ReplicateConfig()
 config.replica_num = 3  # Store 3 copies of the data
 ```
 
-#### with_soft_pin
-**Type:** `bool`
-**Default:** `False`
-**Description:** Enables soft pinning for the stored object. Soft pinned objects are prioritized to remain in memory during eviction - they are only evicted when memory is insufficient and no other objects are eligible for eviction. This is useful for frequently accessed or important objects like system prompts.
+#### soft_pin_action
+**Type:** `SoftPinAction`
+**Default:** `SoftPinAction.PRESERVE`
+**Description:** Controls the soft-pin transition committed when the first replica becomes readable. `PRESERVE` keeps an existing deadline during Upsert, `ENABLE` starts a fixed soft-pin lifetime, and `DISABLE` removes it. Reads do not extend the lifetime.
 
 ```python
+from mooncake.store import ReplicateConfig, SoftPinAction
+
 config = ReplicateConfig()
-config.with_soft_pin = True  # Keep this object in memory longer
+config.soft_pin_action = SoftPinAction.ENABLE
+config.soft_pin_ttl_ms = 60_000  # Optional; omitted uses the Master default
 ```
+
+`soft_pin_ttl_ms` is valid only with `ENABLE`. The Master rejects TTLs above
+`max_kv_soft_pin_ttl`; a value of zero commits the object as ordinary cache.
+Soft-pin state is not persisted in snapshots or the HA OpLog. Restored objects
+therefore become ordinary cache after recovery or Standby promotion.
 
 #### with_hard_pin
 **Type:** `bool`
@@ -2141,7 +2149,7 @@ def pub_tensor(self, key: str, tensor: torch.Tensor, config: ReplicateConfig = N
 **Example:**
 ```python
 import torch
-from mooncake.store import ReplicateConfig
+from mooncake.store import ReplicateConfig, SoftPinAction
 
 # Create a tensor
 tensor = torch.randn(100, 100)
@@ -2149,7 +2157,7 @@ tensor = torch.randn(100, 100)
 # Create replication config
 config = ReplicateConfig()
 config.replica_num = 3
-config.with_soft_pin = True
+config.soft_pin_action = SoftPinAction.ENABLE
 
 # Publish tensor with replication settings
 result = store.pub_tensor("my_tensor", tensor, config)
@@ -2555,13 +2563,13 @@ shared-memory staging buffer.
 **Example:**
 ```python
 import torch
-from mooncake.store import ReplicateConfig
+from mooncake.store import ReplicateConfig, SoftPinAction
 
 tensor = torch.randn(100, 100)
 
 config = ReplicateConfig()
 config.replica_num = 2
-config.with_soft_pin = True
+config.soft_pin_action = SoftPinAction.ENABLE
 
 result = store.upsert_pub_tensor("my_tensor", tensor, config)
 if result == 0:
