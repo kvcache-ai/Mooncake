@@ -24,6 +24,7 @@ distributed execution components.
 | [Engram](engram) | Distributed serving and cache architecture. |
 | [Unified Parallel Tensor I/O](unified-parallel-tensor-io) | Parallel tensor storage and transfer model. |
 | [SSD Offload](ssd-offload) | SSD-backed cache hierarchy design. |
+| [NVMe KV Backend](nvme-kv-backend) | Local NVMe KV object layout, executor, and I/O design. |
 | [SSD Free-Ratio-First Allocation](ssd-free-ratio-first-allocation) | Capacity-aware replica placement strategy. |
 
 ## Distributed Execution and Routing
