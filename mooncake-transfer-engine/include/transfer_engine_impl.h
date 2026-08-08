@@ -141,6 +141,23 @@ class TransferEngineImpl {
         return s;
     }
 
+    Status submitScatter(const std::vector<TransferRequest>& entries,
+                         MultiTransport::ScatterSubmission& submission) {
+        Status s = multi_transports_->submitScatter(entries, submission);
+#ifdef WITH_METRICS
+        if (metrics_enabled_ && s.ok()) {
+            auto& batch = Transport::toBatchDesc(submission.batch_id);
+            auto now = std::chrono::steady_clock::now();
+            for (auto& task : batch.task_list) {
+                if (task.start_time.time_since_epoch().count() == 0) {
+                    task.start_time = now;
+                }
+            }
+        }
+#endif
+        return s;
+    }
+
     Status submitTransferWithNotify(BatchID batch_id,
                                     const std::vector<TransferRequest>& entries,
                                     TransferMetadata::NotifyDesc notify_msg) {
@@ -319,6 +336,13 @@ class TransferEngineImpl {
             }
         }
         return result;
+    }
+
+    Status getScatterRequestStatuses(
+        BatchID batch_id, size_t task_id,
+        std::vector<TransferStatusEnum>& request_statuses) {
+        return multi_transports_->getScatterRequestStatuses(batch_id, task_id,
+                                                            request_statuses);
     }
 
     Status getBatchTransferStatus(BatchID batch_id, TransferStatus& status,

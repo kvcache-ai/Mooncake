@@ -1034,9 +1034,27 @@ Status TcpTransport::submitTransfer(
 
 Status TcpTransport::submitTransferTask(
     const std::vector<TransferTask*>& task_list) {
-    for (auto* task : task_list) {
+    for (size_t i = 0; i < task_list.size();) {
+        auto* task = task_list[i];
         assert(task && task->request);
-        startTransfer(prepareTransfer(task, *task->request));
+        const auto group_id = task->request->task_group_id;
+        if (group_id == TransferRequest::kNoTaskGroup) {
+            startTransfer(prepareTransfer(task, *task->request));
+            ++i;
+            continue;
+        }
+
+        std::vector<Slice*> slices;
+        do {
+            task = task_list[i];
+            assert(task && task->request);
+            slices.push_back(prepareTransfer(task, *task->request));
+            ++i;
+        } while (i < task_list.size() && task_list[i]->request &&
+                 task_list[i]->request->task_group_id == group_id &&
+                 task_list[i - 1]->request + task_list[i - 1]->request_count ==
+                     task_list[i]->request);
+        startTransferSequence(std::move(slices));
     }
     return Status::OK();
 }
