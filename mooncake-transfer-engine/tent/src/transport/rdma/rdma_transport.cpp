@@ -278,18 +278,22 @@ size_t RdmaTransport::initializeContexts() {
     size_t context_count = 0;
     for (size_t i = 0; i < local_topology_->getNicCount(); ++i) {
         auto entry = local_topology_->getNicEntry(i);
-        auto context = std::make_shared<RdmaContext>(*this);
-        context_set_.push_back(context);
-        if (entry->type != Topology::NIC_RDMA) continue;
-        int ret = context->construct(entry->name, params_);
-        if (ret) {
+        if (entry->type == Topology::NIC_RDMA) {
+            auto context = std::make_shared<RdmaContext>(*this);
+            if (context->construct(entry->name, params_) == 0) {
+                context_name_lookup_[entry->name] = i;
+                ++context_count;
+                local_buffer_manager_.addDevice(context.get());
+                context_set_.push_back(std::move(context));
+                continue;
+            }
             LOG(WARNING) << "Disable RDMA device " << entry->name << " because "
                          << "of initialization failure";
-            continue;
         }
-        context_name_lookup_[entry->name] = i;
-        ++context_count;
-        local_buffer_manager_.addDevice(context.get());
+        // A never-constructed context, not the one whose construct() failed:
+        // the slot only has to stand in for the NicID, so it should not carry
+        // a device name or an endpoint store it will never use.
+        context_set_.push_back(std::make_shared<RdmaContext>(*this));
     }
     return context_count;
 }

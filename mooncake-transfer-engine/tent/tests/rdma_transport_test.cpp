@@ -31,7 +31,6 @@
 #include "tent/transfer_engine.h"
 #include "tent/runtime/topology.h"
 #include "tent/transport/rdma/context.h"
-#include "tent/transport/rdma/ibv_loader.h"
 #include "tent/transport/rdma/params.h"
 #include "tent/transport/rdma/rdma_transport.h"
 #include "tent/transport/rdma/workers.h"
@@ -165,6 +164,13 @@ void expectInertContextPerNic(const RdmaContextSet& contexts, size_t expected) {
         // Inert contexts must stay safe for the whole-list consumers.
         EXPECT_EQ(contexts[i]->cq(0), nullptr);
         EXPECT_EQ(contexts[i]->notifyCq(), nullptr);
+        EXPECT_LT(contexts[i]->eventFd(), 0);
+        EXPECT_EQ(contexts[i]->nativeContext(), nullptr);
+        // construct() sets device_name_ before it can fail, so an empty name
+        // is what tells a fresh placeholder from a kept half-built context.
+        EXPECT_TRUE(contexts[i]->name().empty())
+            << "slot " << i << " kept a half-built context for "
+            << contexts[i]->name();
     }
 }
 
@@ -213,12 +219,9 @@ TEST(RdmaNicIndexAlignmentTest, ReclaimTickSkipsInertContexts) {
     RdmaTransportTestPeer::reclaimEndpoints(transport);
 }
 
-// The construct()-failure branch. IbvLoader dlcloses libibverbs when no device
-// is present, so construct() cannot be driven safely in that state.
+// The construct()-failure branch. Runs on any host: this binary links
+// libibverbs directly, so IbvLoader's dlclose does not unmap it.
 TEST(RdmaNicIndexAlignmentTest, ContextSetKeepsOneSlotWhenConstructFails) {
-    if (!IbvLoader::Instance().available())
-        GTEST_SKIP() << "no usable libibverbs; construct() cannot be driven";
-
     // Device names that resolve to no real RNIC, so construct() fails on any
     // host, with a non-RDMA entry in the middle to offset the indexes.
     auto topology = std::make_shared<Topology>();
