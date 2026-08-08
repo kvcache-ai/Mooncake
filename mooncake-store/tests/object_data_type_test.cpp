@@ -47,6 +47,7 @@ TEST_F(ObjectDataTypeTest, EnumValues) {
     EXPECT_EQ(static_cast<uint8_t>(ObjectDataType::OPTIMIZER_STATE), 7);
     EXPECT_EQ(static_cast<uint8_t>(ObjectDataType::METADATA), 8);
     EXPECT_EQ(static_cast<uint8_t>(ObjectDataType::GENERAL), 9);
+    EXPECT_EQ(static_cast<uint8_t>(ObjectDataType::HIDDEN_STATE), 10);
 }
 
 // Verify stream operator produces readable output
@@ -66,6 +67,10 @@ TEST_F(ObjectDataTypeTest, StreamOperator) {
     oss.str("");
     oss << ObjectDataType::GENERAL;
     EXPECT_EQ(oss.str(), "GENERAL");
+
+    oss.str("");
+    oss << ObjectDataType::HIDDEN_STATE;
+    EXPECT_EQ(oss.str(), "HIDDEN_STATE");
 
     // Out-of-range value should print "UNKNOWN"
     oss.str("");
@@ -142,11 +147,12 @@ TEST_F(ObjectDataTypeTest, PutStartDefaultDataType) {
 // Verify all enum values can roundtrip through uint8_t cast
 TEST_F(ObjectDataTypeTest, EnumRoundtrip) {
     std::vector<ObjectDataType> all_types = {
-        ObjectDataType::UNKNOWN,  ObjectDataType::KVCACHE,
-        ObjectDataType::TENSOR,   ObjectDataType::WEIGHT,
-        ObjectDataType::SAMPLE,   ObjectDataType::ACTIVATION,
-        ObjectDataType::GRADIENT, ObjectDataType::OPTIMIZER_STATE,
-        ObjectDataType::METADATA, ObjectDataType::GENERAL,
+        ObjectDataType::UNKNOWN,      ObjectDataType::KVCACHE,
+        ObjectDataType::TENSOR,       ObjectDataType::WEIGHT,
+        ObjectDataType::SAMPLE,       ObjectDataType::ACTIVATION,
+        ObjectDataType::GRADIENT,     ObjectDataType::OPTIMIZER_STATE,
+        ObjectDataType::METADATA,     ObjectDataType::GENERAL,
+        ObjectDataType::HIDDEN_STATE,
     };
 
     for (auto type : all_types) {

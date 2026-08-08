@@ -1912,6 +1912,7 @@ PYBIND11_MODULE(store, m) {
         .value("OPTIMIZER_STATE", ObjectDataType::OPTIMIZER_STATE)
         .value("METADATA", ObjectDataType::METADATA)
         .value("GENERAL", ObjectDataType::GENERAL)
+        .value("HIDDEN_STATE", ObjectDataType::HIDDEN_STATE)
         .export_values();
 
     // Define the ReplicateConfig class
