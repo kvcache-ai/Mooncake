@@ -408,6 +408,14 @@ class Transport {
         return submitTransferTask(task_list);
     }
 
+    /// @brief Whether requests sharing a task_group_id must reach the transport
+    /// as their own submitTransferTaskGroup call. TCP needs this to sequence
+    /// one object's fragments over a single reused connection instead of
+    /// opening a connection per fragment. Transports that already coalesce a
+    /// whole submission internally can return false, so all groups are handed
+    /// over in one submitTransferTask call and the batching is not split apart.
+    virtual bool requiresTaskGroupSubmission() const { return true; }
+
     /// @brief Get the status of a submitted transfer. This function shall not
     /// be called again after completion.
     /// @return Return 1 on completed (either success or failure); 0 if still in

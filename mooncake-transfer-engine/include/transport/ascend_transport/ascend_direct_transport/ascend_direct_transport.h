@@ -47,6 +47,12 @@ class AscendDirectTransport : public Transport {
     Status submitTransferTask(
         const std::vector<TransferTask *> &task_list) override;
 
+    // The dispatcher already groups a whole submission per target segment and
+    // hands each group to ADXL as one TransferSync. Keeping per-task-group
+    // submissions would instead produce one TransferSync per group, collapsing
+    // layer-wise ranged transfers to a single op_desc per call.
+    bool requiresTaskGroupSubmission() const override { return false; }
+
     Status getTransferStatus(BatchID batch_id, size_t task_id,
                              TransferStatus &status) override;
 

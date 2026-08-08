@@ -156,7 +156,8 @@ Status MultiTransport::submitTransfer(
         task.request = &request;
 #endif
         ++task_id;
-        if (request.task_group_id == TransferRequest::kNoTaskGroup) {
+        if (request.task_group_id == TransferRequest::kNoTaskGroup ||
+            !transport->requiresTaskGroupSubmission()) {
             submit_tasks[transport].push_back(&task);
         } else if (!task_groups.empty() &&
                    task_groups.back().id == request.task_group_id &&
