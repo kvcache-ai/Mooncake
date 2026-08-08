@@ -5,8 +5,6 @@ from __future__ import annotations
 
 import argparse
 import ctypes
-import importlib
-import json
 import logging
 import math
 import os
@@ -17,23 +15,7 @@ import time
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Callable, Iterable, List, Optional
-
-_store_module = importlib.import_module(
-    os.environ.get("MOONCAKE_STORE_MODULE", "mooncake.store")
-)
-MooncakeDistributedStore = _store_module.MooncakeDistributedStore
-ReplicateConfig = _store_module.ReplicateConfig
-
-try:
-    get_alloc_func_addr = _store_module.get_alloc_func_addr
-    get_free_func_addr = _store_module.get_free_func_addr
-except AttributeError:
-
-    def get_alloc_func_addr():
-        return None
-
-    def get_free_func_addr():
-        return None
+from mooncake.store import MooncakeDistributedStore, ReplicateConfig, get_alloc_func_addr, get_free_func_addr
 
 
 LOG = logging.getLogger("store_kv_bench")
@@ -49,14 +31,11 @@ def build_parser() -> argparse.ArgumentParser:
         required=True,
         choices=[
             "verify_write",
+            "verify_nof_unaligned",
             "fill",
             "write_perf",
             "read_perf",
             "mixed_rw",
-            "metadata_smoke",
-            "mixed_metadata",
-            "remove_perf",
-            "replay",
         ],
         help="Benchmark scenario to execute.",
     )
@@ -72,15 +51,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--io-api",
         choices=["plain", "zcopy"],
         default="plain",
-        help="plain uses put/get/put_batch/get_batch, zcopy uses put_from/get_into/batch_put_from/batch_get_into",
+        help=(
+            "plain uses put/get/put_batch/get_batch, zcopy uses "
+            "put_from/get_into/batch_put_from/batch_get_into. The NoF "
+            "range-get verification always uses get_into_ranges with an "
+            "internally registered buffer because no plain ranged API exists."
+        ),
     )
 
     parser.add_argument("--numjobs", type=int, default=1)
     parser.add_argument("--iodepth", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=1)
-    parser.add_argument(
-        "--runtime", type=int, default=0, help="Seconds. 0 means object-count based."
-    )
+    parser.add_argument("--runtime", type=int, default=0, help="Seconds. 0 means object-count based.")
     parser.add_argument("--nr-objects", type=int, default=128)
     parser.add_argument("--write-objects", type=int, default=0)
     parser.add_argument(
@@ -93,28 +75,61 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--key-prefix", default="kvbench")
     parser.add_argument("--key-size", type=int, default=20)
     parser.add_argument("--value-size", type=int, default=4096)
-    parser.add_argument("--rand-seed", type=int, default=1)
-    parser.add_argument("--put-pct", type=int, default=40)
-    parser.add_argument("--get-pct", type=int, default=40)
-    parser.add_argument("--exist-pct", type=int, default=10)
-    parser.add_argument("--remove-pct", type=int, default=10)
-    parser.add_argument("--latency-sample-rate", type=int, default=100)
-    parser.add_argument("--output-dir", default="")
     parser.add_argument(
-        "--journal", choices=["none", "failures", "all"], default="failures"
+        "--unaligned-nof-put",
+        action="store_true",
+        help=(
+            "Enable the NoF unaligned Put test mode. "
+            "Only fill/write_perf with io-api=plain are supported."
+        ),
     )
-    parser.add_argument("--summary-json", default="")
-    parser.add_argument("--replay-file", default="")
-    parser.add_argument("--tenant-id", default="default")
+    parser.add_argument(
+        "--nof-block-size",
+        type=int,
+        default=0,
+        help=(
+            "NoF logical block size used to validate and report padding. "
+            "Required when --unaligned-nof-put is enabled and must match "
+            "the block size used when registering the SSD."
+        ),
+    )
+    parser.add_argument(
+        "--range-src-offset",
+        type=int,
+        default=4,
+        help="Source offset used by the NoF unaligned range-get test.",
+    )
+    parser.add_argument(
+        "--range-size",
+        type=int,
+        default=0,
+        help=(
+            "Range-get length. 0 derives a length containing an unaligned "
+            "head, an aligned middle block, and an unaligned tail."
+        ),
+    )
+    parser.add_argument(
+        "--range-dst-offset",
+        type=int,
+        default=4,
+        help="Destination offset used by the NoF unaligned range-get test.",
+    )
+    parser.add_argument(
+        "--allow-non-dword-sgl",
+        action="store_true",
+        help=(
+            "Allow byte-granular NoF range parameters. Use only when the "
+            "controller reports SGL support without DWORD alignment."
+        ),
+    )
+    parser.add_argument("--rand-seed", type=int, default=1)
 
     parser.add_argument("--memory-replica-num", type=int, default=1)
     parser.add_argument("--nof-replica-num", type=int, default=0)
 
     parser.add_argument("--verify", action="store_true")
     parser.add_argument("--pattern", default="")
-    parser.add_argument(
-        "--prepare-mode", choices=["auto", "none", "write"], default="auto"
-    )
+    parser.add_argument("--prepare-mode", choices=["auto", "none", "write"], default="auto")
     parser.add_argument("--rwmixread", type=int, default=70)
 
     parser.add_argument(
@@ -154,7 +169,6 @@ class PhaseStats:
     start_time: float = 0.0
     end_time: float = 0.0
     dataset_exhausted: bool = False
-    latency_seen: int = 0
 
 
 @dataclass
@@ -167,115 +181,6 @@ class RequestResult:
     misses: int = 0
     verify_failures: int = 0
     error_counts: Counter = field(default_factory=Counter)
-
-
-METADATA_OPERATIONS = ("put", "get", "exist", "remove")
-
-
-def validate_operation_percentages(weights: dict) -> None:
-    if set(weights) != set(METADATA_OPERATIONS):
-        raise ValueError(f"operation percentages require {METADATA_OPERATIONS}")
-    if any(not isinstance(value, int) or value < 0 for value in weights.values()):
-        raise ValueError("operation percentages must be non-negative integers")
-    if sum(weights.values()) != 100:
-        raise ValueError("operation percentages must sum to 100")
-
-
-def choose_metadata_operations(
-    seed: int, lane: int, count: int, weights: dict
-) -> List[str]:
-    validate_operation_percentages(weights)
-    rng = random.Random(seed + lane)
-    boundaries = []
-    total = 0
-    for operation in METADATA_OPERATIONS:
-        total += weights[operation]
-        boundaries.append((total, operation))
-    result = []
-    for _ in range(count):
-        choice = rng.randrange(100)
-        result.append(
-            next(operation for limit, operation in boundaries if choice < limit)
-        )
-    return result
-
-
-class MetadataLaneModel:
-    def __init__(self):
-        self._present = set()
-
-    def is_present(self, object_id: int) -> bool:
-        return object_id in self._present
-
-    def record(self, object_id: int, operation: str, success: bool) -> None:
-        if not success:
-            return
-        if operation == "put":
-            self._present.add(object_id)
-        elif operation == "remove":
-            self._present.discard(object_id)
-
-
-class LatencySampler:
-    def __init__(self, rate: int):
-        if rate <= 0:
-            raise ValueError("latency sample rate must be > 0")
-        self.rate = rate
-        self.seen = 0
-        self.samples = []
-
-    def add(self, value: float) -> None:
-        if self.seen % self.rate == 0:
-            self.samples.append(value)
-        self.seen += 1
-
-
-def write_jsonl(path, records: Iterable[dict]) -> None:
-    os.makedirs(os.path.dirname(os.fspath(path)) or ".", exist_ok=True)
-    with open(path, "w", encoding="utf-8") as output:
-        for record in records:
-            output.write(json.dumps(record, sort_keys=True) + "\n")
-
-
-def read_replay(path) -> List[dict]:
-    required = {
-        "schema_version",
-        "op_id",
-        "lane",
-        "op",
-        "object_id",
-        "key",
-        "invoke_ns",
-        "return_ns",
-        "result",
-    }
-    records = []
-    with open(path, encoding="utf-8") as input_file:
-        for line_number, line in enumerate(input_file, 1):
-            if not line.strip():
-                continue
-            record = json.loads(line)
-            missing = required - set(record)
-            if (
-                missing
-                or record.get("schema_version") != 1
-                or record.get("op") not in METADATA_OPERATIONS
-            ):
-                raise ValueError(
-                    f"invalid replay record at line {line_number}: missing={sorted(missing)}"
-                )
-            records.append(record)
-    return records
-
-
-def write_json_atomic(path, value: dict) -> None:
-    path = os.fspath(path)
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    temporary = path + ".tmp"
-    with open(temporary, "w", encoding="utf-8") as output:
-        json.dump(value, output, sort_keys=True)
-        output.write("\n")
-    os.replace(temporary, path)
 
 
 class PayloadFactory:
@@ -345,6 +250,10 @@ class DatasetState:
         with self.ids_lock:
             return list(self.written_ids)
 
+    def reset_read_cursor(self) -> None:
+        with self.cursor_lock:
+            self.read_cursor = 0
+
     def next_read_ids(
         self,
         count: int,
@@ -355,9 +264,7 @@ class DatasetState:
         source: str = "written",
     ) -> List[int]:
         with self.ids_lock:
-            readable_ids = (
-                self.prepared_ids if source == "prepared" else self.written_ids
-            )
+            readable_ids = self.prepared_ids if source == "prepared" else self.written_ids
         if not readable_ids:
             return []
         if sequential:
@@ -388,12 +295,16 @@ def parse_pattern(pattern_text: str) -> bytes:
 def make_key(prefix: str, key_size: int, object_id: int) -> str:
     suffix = f"{object_id:016d}"
     if key_size < len(suffix):
-        raise ValueError(
-            f"key_size={key_size} is smaller than suffix length {len(suffix)}"
-        )
+        raise ValueError(f"key_size={key_size} is smaller than suffix length {len(suffix)}")
     prefix_space = key_size - len(suffix)
     prefix_part = prefix[:prefix_space].ljust(prefix_space, "_")
     return f"{prefix_part}{suffix}"
+
+
+def align_up(value: int, alignment: int) -> int:
+    if alignment <= 0:
+        return value
+    return ((value + alignment - 1) // alignment) * alignment
 
 
 class StoreSession:
@@ -418,17 +329,12 @@ class StoreSession:
         self._zcopy = None
 
     def put_ids(self, object_ids: List[int]) -> RequestResult:
-        keys = [
-            make_key(self.args.key_prefix, self.args.key_size, object_id)
-            for object_id in object_ids
-        ]
+        keys = [make_key(self.args.key_prefix, self.args.key_size, object_id) for object_id in object_ids]
         ret_codes = self._put_keys(keys, object_ids)
 
         errors: Counter = Counter()
         success_ids: List[int] = []
-        if self.args.io_api == "plain" and not (
-            len(object_ids) == 1 and self.args.batch_size == 1
-        ):
+        if self.args.io_api == "plain" and not (len(object_ids) == 1 and self.args.batch_size == 1):
             ret = ret_codes[0]
             if ret == 0:
                 success_ids.extend(object_ids)
@@ -451,10 +357,7 @@ class StoreSession:
         )
 
     def get_ids(self, object_ids: List[int], verify: bool) -> RequestResult:
-        keys = [
-            make_key(self.args.key_prefix, self.args.key_size, object_id)
-            for object_id in object_ids
-        ]
+        keys = [make_key(self.args.key_prefix, self.args.key_size, object_id) for object_id in object_ids]
         errors: Counter = Counter()
         kv_successes = 0
         misses = 0
@@ -466,9 +369,7 @@ class StoreSession:
                     misses += 1
                     errors["MISS"] += 1
                     continue
-                if verify and not self.payload_factory.verify_payload(
-                    object_id, payload
-                ):
+                if verify and not self.payload_factory.verify_payload(object_id, payload):
                     verify_failures += 1
                     errors["VERIFY_FAIL"] += 1
                     continue
@@ -507,60 +408,66 @@ class StoreSession:
             error_counts=errors,
         )
 
-    def metadata_operation(
-        self, operation: str, object_id: int, expected_present: bool
-    ):
-        key = make_key(self.args.key_prefix, self.args.key_size, object_id)
-        result_code = 0
-        actual_present = expected_present
-        bytes_processed = 0
-        success = False
+    def get_range_ids(self, object_ids: List[int]) -> RequestResult:
+        assert self._zcopy is not None
+
+        keys = [
+            make_key(self.args.key_prefix, self.args.key_size, object_id)
+            for object_id in object_ids
+        ]
+        slot_count = len(object_ids)
+        ptrs = self._zcopy.prepare_read_buffers(slot_count)
+        src_offset = self.args.range_src_offset
+        dst_offset = self.args.range_dst_offset
+        range_size = self.args.range_size
+
+        results = self.store.get_into_ranges(
+            ptrs,
+            [[key] for key in keys],
+            [[[dst_offset]] for _ in keys],
+            [[[src_offset]] for _ in keys],
+            [[[range_size]] for _ in keys],
+        )
+
+        errors: Counter = Counter()
+        kv_successes = 0
         verify_failures = 0
 
-        if operation == "put":
-            payload = self.payload_factory.build(object_id)
-            result_code = self.store.put(key, payload, self.config)
-            actual_present = result_code == 0 or self.store.isExist(key) == 1
-            success = result_code == 0 or (expected_present and actual_present)
-            bytes_processed = len(payload) if success else 0
-        elif operation == "get":
-            payload = self.store.get(key)
-            actual_present = payload not in (None, b"")
-            success = actual_present == expected_present
-            if actual_present and not self.payload_factory.verify_payload(
-                object_id, payload
-            ):
-                success = False
-                verify_failures = 1
-                result_code = "VERIFY_FAIL"
-            elif not success:
-                result_code = "PRESENCE_MISMATCH"
-            bytes_processed = len(payload) if actual_present else 0
-        elif operation == "exist":
-            result_code = self.store.isExist(key)
-            actual_present = result_code == 1
-            success = result_code >= 0 and actual_present == expected_present
-        elif operation == "remove":
-            result_code = self.store.remove(key)
-            actual_present = self.store.isExist(key) == 1
-            success = not actual_present and (result_code == 0 or not expected_present)
-        else:
-            raise ValueError(f"unsupported metadata operation: {operation}")
+        for slot, object_id in enumerate(object_ids):
+            try:
+                result = results[slot][0][0]
+            except (IndexError, TypeError):
+                errors["INVALID_RESULT_SHAPE"] += 1
+                verify_failures += 1
+                continue
 
-        errors = Counter()
-        if not success:
-            errors[result_code] += 1
-        return (
-            RequestResult(
-                request_ok=success,
-                kv_successes=int(success),
-                kv_failures=int(not success),
-                bytes_processed=bytes_processed,
-                verify_failures=verify_failures,
-                error_counts=errors,
-            ),
-            actual_present,
-            result_code,
+            if result < 0:
+                errors[result] += 1
+                continue
+
+            if result != range_size:
+                errors["VERIFY_SIZE_MISMATCH"] += 1
+                verify_failures += 1
+                continue
+
+            actual = self._zcopy.read_bytes_at(slot, dst_offset, range_size)
+            full_payload = self.payload_factory.build(object_id)
+            expected = full_payload[src_offset : src_offset + range_size]
+            if actual != expected:
+                errors["VERIFY_RANGE_MISMATCH"] += 1
+                verify_failures += 1
+                continue
+
+            kv_successes += 1
+
+        kv_failures = len(object_ids) - kv_successes
+        return RequestResult(
+            request_ok=(kv_failures == 0),
+            kv_successes=kv_successes,
+            kv_failures=kv_failures,
+            bytes_processed=kv_successes * range_size,
+            verify_failures=verify_failures,
+            error_counts=errors,
         )
 
     def _put_keys(self, keys: List[str], object_ids: List[int]) -> List[int]:
@@ -592,11 +499,19 @@ class StoreSession:
 
 
 class ZcopyBufferPool:
-    def __init__(self, store_obj, value_size: int, slots: int):
+    def __init__(
+        self,
+        store_obj,
+        value_size: int,
+        slots: int,
+        alignment: int = 1,
+    ):
         self.store = store_obj
         self.value_size = value_size
         self.slots = slots
-        self.total_size = self.value_size * self.slots
+        self.alignment = max(1, alignment)
+        self.slot_stride = align_up(self.value_size, self.alignment)
+        self.total_size = self.slot_stride * self.slots
         self._alloc_fn = None
         self._free_fn = None
         self._registered = False
@@ -605,20 +520,28 @@ class ZcopyBufferPool:
         alloc_addr = get_alloc_func_addr()
         free_addr = get_free_func_addr()
         if alloc_addr is None or free_addr is None:
-            raise RuntimeError(
-                "store module does not expose hugepage alloc/free helpers"
-            )
+            raise RuntimeError("store module does not expose hugepage alloc/free helpers")
 
         self._alloc_fn = ctypes.CFUNCTYPE(ctypes.c_void_p, ctypes.c_size_t)(
             get_alloc_func_addr()
         )
-        self._free_fn = ctypes.CFUNCTYPE(None, ctypes.c_void_p)(get_free_func_addr())
+        self._free_fn = ctypes.CFUNCTYPE(None, ctypes.c_void_p)(
+            get_free_func_addr()
+        )
 
         raw_ptr = self._alloc_fn(self.total_size)
         self.base_ptr = ctypes.cast(raw_ptr, ctypes.c_void_p).value or 0
         if self.base_ptr == 0:
             raise RuntimeError(
                 f"direct hugepage alloc failed for zcopy pool: size={self.total_size}"
+            )
+        if self.base_ptr % self.alignment != 0:
+            failed_ptr = self.base_ptr
+            self._free_fn(ctypes.c_void_p(self.base_ptr))
+            self.base_ptr = 0
+            raise RuntimeError(
+                f"zcopy base pointer {failed_ptr:#x} is not "
+                f"{self.alignment}-byte aligned"
             )
         ret = self.store.register_buffer(self.base_ptr, self.total_size)
         if ret != 0:
@@ -638,11 +561,7 @@ class ZcopyBufferPool:
                 try:
                     self.store.unregister_buffer(self.base_ptr)
                 except Exception:
-                    LOG.debug(
-                        "unregister_buffer failed for direct zcopy pool ptr=%s",
-                        self.base_ptr,
-                        exc_info=True,
-                    )
+                    LOG.debug("unregister_buffer failed for direct zcopy pool ptr=%s", self.base_ptr, exc_info=True)
                 self._registered = False
             if self._free_fn is not None:
                 self._free_fn(ctypes.c_void_p(self.base_ptr))
@@ -651,20 +570,82 @@ class ZcopyBufferPool:
     def slot_ptr(self, slot: int) -> int:
         if slot < 0 or slot >= self.slots:
             raise IndexError(f"zcopy slot {slot} is out of range [0, {self.slots})")
-        return self.base_ptr + slot * self.value_size
+        ptr = self.base_ptr + slot * self.slot_stride
+        if ptr % self.alignment != 0:
+            raise RuntimeError(
+                f"zcopy slot pointer {ptr:#x} is not "
+                f"{self.alignment}-byte aligned"
+            )
+        return ptr
+
+
+class RegisteredHostBufferPool:
+    """Registered host buffers used only by plain ranged-read verification."""
+
+    def __init__(
+        self,
+        store_obj,
+        value_size: int,
+        slots: int,
+        alignment: int = 1,
+    ):
+        self.store = store_obj
+        self.value_size = value_size
+        self.slots = slots
+        self.alignment = max(1, alignment)
+        self.slot_stride = align_up(self.value_size, self.alignment)
+        self.total_size = self.slot_stride * self.slots
+        self.allocated_size = self.total_size + self.alignment - 1
+        self._registered = False
+
+        self._buffer = (ctypes.c_ubyte * self.allocated_size)()
+        self.raw_ptr = ctypes.addressof(self._buffer)
+        self.base_ptr = align_up(self.raw_ptr, self.alignment)
+
+        ret = self.store.register_buffer(self.raw_ptr, self.allocated_size)
+        if ret != 0:
+            failed_ptr = self.raw_ptr
+            self._buffer = None
+            self.raw_ptr = 0
+            self.base_ptr = 0
+            raise RuntimeError(
+                "register_buffer failed for host range pool "
+                f"ptr={failed_ptr}: {ret}"
+            )
+        self._registered = True
+
+    def close(self) -> None:
+        if self.raw_ptr and self._registered:
+            try:
+                self.store.unregister_buffer(self.raw_ptr)
+            except Exception:
+                LOG.debug(
+                    "unregister_buffer failed for host range pool ptr=%s",
+                    self.raw_ptr,
+                    exc_info=True,
+                )
+            self._registered = False
+        self._buffer = None
+        self.raw_ptr = 0
+        self.base_ptr = 0
+
+    def slot_ptr(self, slot: int) -> int:
+        if slot < 0 or slot >= self.slots:
+            raise IndexError(
+                f"host range slot {slot} is out of range [0, {self.slots})"
+            )
+        return self.base_ptr + slot * self.slot_stride
 
 
 class ZcopyBufferView:
-    def __init__(self, pool: ZcopyBufferPool, slot_offset: int, slots: int):
+    def __init__(self, pool, slot_offset: int, slots: int):
         self.pool = pool
         self.slot_offset = slot_offset
         self.slots = slots
 
     def _slot_ptr(self, slot: int) -> int:
         if slot < 0 or slot >= self.slots:
-            raise IndexError(
-                f"zcopy view slot {slot} is out of range [0, {self.slots})"
-            )
+            raise IndexError(f"zcopy view slot {slot} is out of range [0, {self.slots})")
         return self.pool.slot_ptr(self.slot_offset + slot)
 
     def fill_write_buffers(self, payloads: List[bytes]) -> List[int]:
@@ -694,9 +675,20 @@ class ZcopyBufferView:
             )
         return ctypes.string_at(self._slot_ptr(slot), size)
 
+    def read_bytes_at(self, slot: int, offset: int, size: int) -> bytes:
+        if offset < 0 or size < 0:
+            raise ValueError("offset and size must be >= 0")
+        if offset + size > self.pool.value_size:
+            raise ValueError(
+                f"Read range [{offset}, {offset + size}) exceeds slot size "
+                f"{self.pool.value_size}"
+            )
+        return ctypes.string_at(self._slot_ptr(slot) + offset, size)
+
 
 class StoreRuntime:
     def __init__(self, args: argparse.Namespace, lane_count: int):
+
         self.lane_count = lane_count
         self.store = MooncakeDistributedStore()
         setup_ret = self.store.setup(
@@ -711,10 +703,28 @@ class StoreRuntime:
         if setup_ret != 0:
             raise RuntimeError(f"setup failed: {setup_ret}")
 
-        self.zcopy_pool: Optional[ZcopyBufferPool] = None
+        self.zcopy_pool = None
+        needs_registered_range_buffers = (
+            args.scenario == "verify_nof_unaligned"
+        )
         if args.io_api == "zcopy":
             slots = max(1, args.batch_size) * lane_count
-            self.zcopy_pool = ZcopyBufferPool(self.store, args.value_size, slots)
+            alignment = args.nof_block_size if args.nof_replica_num > 0 else 1
+            self.zcopy_pool = ZcopyBufferPool(
+                self.store,
+                args.value_size,
+                slots,
+                alignment,
+            )
+        elif needs_registered_range_buffers:
+            slots = max(1, args.batch_size) * lane_count
+            alignment = args.nof_block_size if args.nof_replica_num > 0 else 1
+            self.zcopy_pool = RegisteredHostBufferPool(
+                self.store,
+                args.value_size,
+                slots,
+                alignment,
+            )
 
     def make_session(
         self,
@@ -756,13 +766,10 @@ def merge_stats(name: str, stats_list: List[PhaseStats]) -> PhaseStats:
     merged = PhaseStats(name=name)
     if not stats_list:
         return merged
-    merged.start_time = min(
-        (s.start_time for s in stats_list if s.start_time), default=0.0
-    )
+    merged.start_time = min((s.start_time for s in stats_list if s.start_time), default=0.0)
     merged.end_time = max((s.end_time for s in stats_list if s.end_time), default=0.0)
     for stats in stats_list:
         merged.request_latencies.extend(stats.request_latencies)
-        merged.latency_seen += stats.latency_seen
         merged.requests += stats.requests
         merged.successful_requests += stats.successful_requests
         merged.failed_requests += stats.failed_requests
@@ -806,16 +813,11 @@ def summarize_stats(stats: PhaseStats) -> dict:
         "duration_sec": duration,
         "req_per_sec": (stats.requests / duration) if duration > 0 else 0.0,
         "kv_per_sec": (stats.kvs / duration) if duration > 0 else 0.0,
-        "MiB_per_sec": (stats.bytes_processed / duration / (1024 * 1024))
-        if duration > 0
-        else 0.0,
-        "lat_mean_ms": statistics.mean(stats.request_latencies) * 1000
-        if stats.request_latencies
-        else 0.0,
+        "MiB_per_sec": (stats.bytes_processed / duration / (1024 * 1024)) if duration > 0 else 0.0,
+        "lat_mean_ms": statistics.mean(stats.request_latencies) * 1000 if stats.request_latencies else 0.0,
         "lat_p50_ms": percentile(stats.request_latencies, 0.50) * 1000,
         "lat_p95_ms": percentile(stats.request_latencies, 0.95) * 1000,
         "lat_p99_ms": percentile(stats.request_latencies, 0.99) * 1000,
-        "latency_samples": len(stats.request_latencies),
         "dataset_exhausted": stats.dataset_exhausted,
         "error_counts": dict(stats.error_counts),
     }
@@ -864,7 +866,6 @@ class BenchmarkRunner:
         self.lane_count = args.numjobs * args.iodepth
         self._sessions: Optional[List[StoreSession]] = None
         self._runtime: Optional[StoreRuntime] = None
-        self._journal_records: List[List[dict]] = [[] for _ in range(self.lane_count)]
         self._validate_args()
 
     def _validate_args(self) -> None:
@@ -884,20 +885,6 @@ class BenchmarkRunner:
             raise ValueError("prepare-objects must be >= 0")
         if self.args.rwmixread < 0 or self.args.rwmixread > 100:
             raise ValueError("rwmixread must be within [0, 100]")
-        validate_operation_percentages(
-            {
-                "put": self.args.put_pct,
-                "get": self.args.get_pct,
-                "exist": self.args.exist_pct,
-                "remove": self.args.remove_pct,
-            }
-        )
-        if self.args.latency_sample_rate <= 0:
-            raise ValueError("latency-sample-rate must be > 0")
-        if self.args.tenant_id != "default":
-            raise ValueError("only --tenant-id=default is currently supported")
-        if self.args.scenario == "replay" and not self.args.replay_file:
-            raise ValueError("replay requires --replay-file")
         if self.args.verify and not self.pattern:
             raise ValueError("verify mode currently requires --pattern")
         if self.args.memory_replica_num == 0 and self.args.nof_replica_num == 0:
@@ -908,37 +895,88 @@ class BenchmarkRunner:
             raise ValueError("phase-gap-file must be set when phase-gap-mode=file")
         if self.args.scenario == "mixed_rw" and self.args.runtime <= 0:
             raise ValueError("mixed_rw requires --runtime > 0")
-        if self._scenario_has_write() and self.args.value_size % 512 != 0:
-            raise ValueError(
-                "write-involved scenarios require value-size to be 512B aligned"
-            )
+        if self.args.scenario == "verify_nof_unaligned":
+            if self.args.nof_replica_num <= 0:
+                raise ValueError(
+                    "verify_nof_unaligned requires --nof-replica-num > 0"
+                )
+            if self.args.memory_replica_num != 0:
+                raise ValueError(
+                    "set --memory-replica-num 0 so verification must use NoF"
+                )
+            if self.args.nof_block_size <= 0:
+                raise ValueError("--nof-block-size must be > 0")
+
+            block_size = self.args.nof_block_size
+            if block_size % 4 != 0:
+                raise ValueError("nof-block-size must be DWORD aligned")
+            if self.args.value_size % block_size == 0:
+                raise ValueError(
+                    "value-size must not be aligned to nof-block-size"
+                )
+            if self.args.range_src_offset <= 0:
+                raise ValueError("range-src-offset must be > 0")
+            if self.args.range_src_offset % block_size == 0:
+                raise ValueError("range-src-offset must be block-unaligned")
+            if self.args.range_dst_offset < 0:
+                raise ValueError("range-dst-offset must be >= 0")
+
+            if self.args.range_size == 0:
+                self.args.range_size = 2 * block_size + 36
+            if self.args.range_size <= 0:
+                raise ValueError("range-size must be > 0")
+
+            src_offset = self.args.range_src_offset
+            range_size = self.args.range_size
+            dst_offset = self.args.range_dst_offset
+            if not self.args.allow_non_dword_sgl:
+                dword_fields = {
+                    "value-size": self.args.value_size,
+                    "range-src-offset": src_offset,
+                    "range-dst-offset": dst_offset,
+                    "range-size": range_size,
+                }
+                for name, value in dword_fields.items():
+                    if value % 4 != 0:
+                        raise ValueError(
+                            f"{name} must be DWORD aligned unless "
+                            "--allow-non-dword-sgl is specified"
+                        )
+            if (src_offset + range_size) % block_size == 0:
+                raise ValueError("range end must be block-unaligned")
+
+            head_size = block_size - src_offset % block_size
+            if range_size <= head_size + block_size:
+                raise ValueError(
+                    "range-size must cover an unaligned head, at least one "
+                    "aligned middle block, and an unaligned tail"
+                )
+            if src_offset + range_size > self.args.value_size:
+                raise ValueError("source range exceeds value-size")
+            if dst_offset + range_size > self.args.value_size:
+                raise ValueError("destination range exceeds zcopy slot")
+            if not self.pattern or len(set(self.pattern)) < 2:
+                raise ValueError(
+                    "verify_nof_unaligned requires a non-constant --pattern"
+                )
+        # if self._scenario_has_write() and self.args.value_size % 512 != 0:
+        #     raise ValueError("write-involved scenarios require value-size to be 512B aligned")
         make_key(self.args.key_prefix, self.args.key_size, self.args.object_id_start)
 
     def _scenario_has_write(self) -> bool:
         return self.args.scenario in {
             "verify_write",
+            "verify_nof_unaligned",
             "fill",
             "write_perf",
             "mixed_rw",
-            "metadata_smoke",
-            "mixed_metadata",
-            "remove_perf",
-            "replay",
         }
 
     def _write_budget(self) -> int:
-        return (
-            self.args.write_objects
-            if self.args.write_objects > 0
-            else self.args.nr_objects
-        )
+        return self.args.write_objects if self.args.write_objects > 0 else self.args.nr_objects
 
     def _prepare_budget(self) -> int:
-        return (
-            self.args.prepare_objects
-            if self.args.prepare_objects > 0
-            else self.args.nr_objects
-        )
+        return self.args.prepare_objects if self.args.prepare_objects > 0 else self.args.nr_objects
 
     def _make_sessions(self) -> List[StoreSession]:
         if self._sessions is None:
@@ -968,65 +1006,55 @@ class BenchmarkRunner:
             time.sleep(self.args.phase_gap_sec)
             return
         if mode == "manual":
-            input(
-                f"phase '{label}' is waiting, finish external operations then press Enter to continue..."
-            )
+            input(f"phase '{label}' is waiting, finish external operations then press Enter to continue...")
             return
         deadline = time.time() + self.args.phase_gap_timeout_sec
         while time.time() < deadline:
             if os.path.exists(self.args.phase_gap_file):
-                LOG.info(
-                    "detected phase gap file %s, continuing to %s",
-                    self.args.phase_gap_file,
-                    label,
-                )
+                LOG.info("detected phase gap file %s, continuing to %s", self.args.phase_gap_file, label)
                 return
             time.sleep(1.0)
-        raise TimeoutError(
-            f"timed out waiting for phase gap file {self.args.phase_gap_file}"
-        )
+        raise TimeoutError(f"timed out waiting for phase gap file {self.args.phase_gap_file}")
 
-    def _run_threads(
-        self,
-        phase_name: str,
-        worker_builder: Callable[[StoreSession, int], Callable[[PhaseStats], None]],
-    ) -> PhaseStats:
+    def _run_threads(self, phase_name: str, worker_builder: Callable[[StoreSession, int], Callable[[PhaseStats], None]]) -> PhaseStats:
         sessions = self._make_sessions()
         per_lane_stats: List[Optional[PhaseStats]] = [None] * self.lane_count
+        worker_errors: List[tuple[int, Exception]] = []
+        worker_errors_lock = threading.Lock()
         threads: List[threading.Thread] = []
 
         def runner(index: int, session: StoreSession) -> None:
             stats = PhaseStats(name=f"{phase_name}/lane{index}")
             stats.start_time = time.perf_counter()
-            worker_builder(session, index)(stats)
-            stats.end_time = time.perf_counter()
-            per_lane_stats[index] = stats
+            try:
+                worker_builder(session, index)(stats)
+                per_lane_stats[index] = stats
+            except Exception as exc:
+                with worker_errors_lock:
+                    worker_errors.append((index, exc))
+            finally:
+                stats.end_time = time.perf_counter()
 
         for lane_id, session in enumerate(sessions):
-            thread = threading.Thread(
-                target=runner,
-                args=(lane_id, session),
-                name=f"{phase_name}-lane{lane_id}",
-            )
+            thread = threading.Thread(target=runner, args=(lane_id, session), name=f"{phase_name}-lane{lane_id}")
             threads.append(thread)
             thread.start()
 
         for thread in threads:
             thread.join()
 
+        if worker_errors:
+            lane_id, exc = worker_errors[0]
+            raise RuntimeError(
+                f"{phase_name} worker lane {lane_id} failed: {exc}"
+            ) from exc
+
         merged = merge_stats(phase_name, [s for s in per_lane_stats if s is not None])
         log_phase_stats(merged)
         return merged
 
-    def _record(
-        self, stats: PhaseStats, latency: float, request: RequestResult, kv_count: int
-    ) -> None:
-        if (
-            self.args.runtime <= 0
-            or stats.latency_seen % self.args.latency_sample_rate == 0
-        ):
-            stats.request_latencies.append(latency)
-        stats.latency_seen += 1
+    def _record(self, stats: PhaseStats, latency: float, request: RequestResult, kv_count: int) -> None:
+        stats.request_latencies.append(latency)
         stats.requests += 1
         stats.kvs += kv_count
         if request.request_ok:
@@ -1040,154 +1068,6 @@ class BenchmarkRunner:
         stats.bytes_processed += request.bytes_processed
         stats.error_counts.update(request.error_counts)
 
-    def _run_metadata_operations(
-        self, phase_name: str, operations_by_lane
-    ) -> PhaseStats:
-        def worker(session: StoreSession, lane_id: int) -> Callable[[PhaseStats], None]:
-            def run(stats: PhaseStats) -> None:
-                model = MetadataLaneModel()
-                for op_id, (operation, object_id) in enumerate(
-                    operations_by_lane(lane_id)
-                ):
-                    expected_present = model.is_present(object_id)
-                    invoke_ns = time.time_ns()
-                    start = time.perf_counter()
-                    result, actual_present, result_code = session.metadata_operation(
-                        operation, object_id, expected_present
-                    )
-                    return_ns = time.time_ns()
-                    self._record(
-                        stats,
-                        time.perf_counter() - start,
-                        result,
-                        1,
-                    )
-                    model.record(object_id, operation, result.request_ok)
-                    if self.args.journal == "all" or (
-                        self.args.journal == "failures" and not result.request_ok
-                    ):
-                        self._journal_records[lane_id].append(
-                            {
-                                "schema_version": 1,
-                                "op_id": op_id,
-                                "lane": lane_id,
-                                "op": operation,
-                                "object_id": object_id,
-                                "key": make_key(
-                                    self.args.key_prefix,
-                                    self.args.key_size,
-                                    object_id,
-                                ),
-                                "invoke_ns": invoke_ns,
-                                "return_ns": return_ns,
-                                "result": result_code,
-                                "ok": result.request_ok,
-                                "expected_present": expected_present,
-                                "actual_present": actual_present,
-                            }
-                        )
-
-            return run
-
-        return self._run_threads(phase_name, worker)
-
-    def _metadata_smoke(self) -> PhaseStats:
-        sequence = ("put", "exist", "get", "remove", "exist")
-
-        def operations(lane_id: int):
-            object_id = self.args.object_id_start + lane_id
-            if object_id >= self.args.object_id_start + self.args.nr_objects:
-                return []
-            return [(operation, object_id) for operation in sequence]
-
-        stats = self._run_metadata_operations("metadata_smoke", operations)
-        if stats.failed_kvs:
-            raise RuntimeError(f"metadata_smoke failed operations={stats.failed_kvs}")
-        return stats
-
-    def _mixed_metadata(self) -> PhaseStats:
-        weights = {
-            "put": self.args.put_pct,
-            "get": self.args.get_pct,
-            "exist": self.args.exist_pct,
-            "remove": self.args.remove_pct,
-        }
-
-        def operations(lane_id: int):
-            object_ids = list(
-                range(
-                    self.args.object_id_start + lane_id,
-                    self.args.object_id_start + self.args.nr_objects,
-                    self.lane_count,
-                )
-            )
-            if not object_ids:
-                return []
-            count = len(object_ids)
-            choices = choose_metadata_operations(
-                self.args.rand_seed, lane_id, count, weights
-            )
-            return [
-                (operation, object_ids[index % len(object_ids)])
-                for index, operation in enumerate(choices)
-            ]
-
-        return self._run_metadata_operations("mixed_metadata", operations)
-
-    def _remove_prepared(self) -> PhaseStats:
-        object_ids = self.dataset.snapshot_written_ids()
-
-        def operations(lane_id: int):
-            return [
-                ("remove", object_id)
-                for index, object_id in enumerate(object_ids)
-                if index % self.lane_count == lane_id
-            ]
-
-        return self._run_metadata_operations("remove_perf", operations)
-
-    def _replay(self) -> PhaseStats:
-        records = read_replay(self.args.replay_file)
-
-        def operations(lane_id: int):
-            return [
-                (record["op"], int(record["object_id"]))
-                for record in records
-                if int(record["lane"]) == lane_id
-            ]
-
-        return self._run_metadata_operations("replay", operations)
-
-    def write_outputs(self, phases: List[PhaseStats]) -> None:
-        records = sorted(
-            (record for lane in self._journal_records for record in lane),
-            key=lambda record: (
-                record["invoke_ns"],
-                record["lane"],
-                record["op_id"],
-            ),
-        )
-        if self.args.output_dir:
-            os.makedirs(self.args.output_dir, exist_ok=True)
-        if self.args.journal != "none" and self.args.output_dir:
-            write_jsonl(os.path.join(self.args.output_dir, "journal.jsonl"), records)
-        summary_path = self.args.summary_json
-        if not summary_path and self.args.output_dir:
-            summary_path = os.path.join(self.args.output_dir, "summary.json")
-        if summary_path:
-            overall = merge_stats("overall", phases)
-            write_json_atomic(
-                summary_path,
-                {
-                    "schema_version": 1,
-                    "scenario": self.args.scenario,
-                    "ok": overall.failed_kvs == 0 and overall.verify_failures == 0,
-                    "phases": {phase.name: summarize_stats(phase) for phase in phases},
-                    "overall": summarize_stats(overall),
-                    "journal_records": len(records),
-                },
-            )
-
     def _run_fixed_write(
         self,
         phase_name: str,
@@ -1198,14 +1078,10 @@ class BenchmarkRunner:
     ) -> PhaseStats:
         write_upper = self.dataset.next_write_id + total_objects
 
-        def worker(
-            session: StoreSession, _lane_id: int
-        ) -> Callable[[PhaseStats], None]:
+        def worker(session: StoreSession, _lane_id: int) -> Callable[[PhaseStats], None]:
             def run(stats: PhaseStats) -> None:
                 while True:
-                    object_ids = self.dataset.reserve_write_ids(
-                        self.args.batch_size, write_upper
-                    )
+                    object_ids = self.dataset.reserve_write_ids(self.args.batch_size, write_upper)
                     if not object_ids:
                         break
                     start = time.perf_counter()
@@ -1216,10 +1092,7 @@ class BenchmarkRunner:
                         if write_scope == "prepared":
                             self.dataset.mark_prepared(result.successful_object_ids)
                         else:
-                            self.dataset.mark_runtime_written(
-                                result.successful_object_ids
-                            )
-
+                            self.dataset.mark_runtime_written(result.successful_object_ids)
             return run
 
         stats = self._run_threads(phase_name, worker)
@@ -1238,14 +1111,10 @@ class BenchmarkRunner:
         write_upper = self.dataset.next_write_id + total_objects
         stop_event = threading.Event()
 
-        def worker(
-            session: StoreSession, _lane_id: int
-        ) -> Callable[[PhaseStats], None]:
+        def worker(session: StoreSession, _lane_id: int) -> Callable[[PhaseStats], None]:
             def run(stats: PhaseStats) -> None:
                 while time.time() < deadline and not stop_event.is_set():
-                    object_ids = self.dataset.reserve_write_ids(
-                        self.args.batch_size, write_upper
-                    )
+                    object_ids = self.dataset.reserve_write_ids(self.args.batch_size, write_upper)
                     if not object_ids:
                         stats.dataset_exhausted = True
                         stop_event.set()
@@ -1256,7 +1125,6 @@ class BenchmarkRunner:
                     self._record(stats, latency, result, len(object_ids))
                     if result.successful_object_ids:
                         self.dataset.mark_runtime_written(result.successful_object_ids)
-
             return run
 
         return self._run_threads(phase_name, worker)
@@ -1274,9 +1142,7 @@ class BenchmarkRunner:
         if runtime_sec > 0:
             deadline = time.time() + runtime_sec
 
-            def worker(
-                session: StoreSession, lane_id: int
-            ) -> Callable[[PhaseStats], None]:
+            def worker(session: StoreSession, lane_id: int) -> Callable[[PhaseStats], None]:
                 rng = random.Random(seed_base + lane_id)
 
                 def run(stats: PhaseStats) -> None:
@@ -1323,6 +1189,51 @@ class BenchmarkRunner:
 
         return self._run_threads(phase_name, worker)
 
+    def _run_nof_range_verify(self, phase_name: str) -> PhaseStats:
+        self.dataset.reset_read_cursor()
+        seed_base = self.args.rand_seed
+
+        def worker(
+            session: StoreSession,
+            lane_id: int,
+        ) -> Callable[[PhaseStats], None]:
+            rng = random.Random(seed_base + lane_id)
+
+            def run(stats: PhaseStats) -> None:
+                while True:
+                    object_ids = self.dataset.next_read_ids(
+                        self.args.batch_size,
+                        loop=False,
+                        sequential=True,
+                        rng=rng,
+                        source="prepared",
+                    )
+                    if not object_ids:
+                        break
+
+                    start = time.perf_counter()
+                    result = session.get_range_ids(object_ids)
+                    latency = time.perf_counter() - start
+                    self._record(stats, latency, result, len(object_ids))
+
+            return run
+
+        stats = self._run_threads(phase_name, worker)
+        expected = self._write_budget()
+        if (
+            stats.failed_kvs > 0
+            or stats.verify_failures > 0
+            or stats.successful_kvs != expected
+        ):
+            raise RuntimeError(
+                f"{phase_name} failed: expected={expected}, "
+                f"success={stats.successful_kvs}, "
+                f"failed={stats.failed_kvs}, "
+                f"verify_failures={stats.verify_failures}, "
+                f"errors={dict(stats.error_counts)}"
+            )
+        return stats
+
     def _run_mixed_phase(self, phase_name: str, extra_write_budget: int) -> PhaseStats:
         deadline = time.time() + self.args.runtime
         write_upper = self.dataset.next_write_id + extra_write_budget
@@ -1351,9 +1262,7 @@ class BenchmarkRunner:
                         self._record(stats, latency, result, len(object_ids))
                         continue
 
-                    object_ids = self.dataset.reserve_write_ids(
-                        self.args.batch_size, write_upper
-                    )
+                    object_ids = self.dataset.reserve_write_ids(self.args.batch_size, write_upper)
                     if not object_ids:
                         stats.dataset_exhausted = True
                         stop_event.set()
@@ -1372,10 +1281,7 @@ class BenchmarkRunner:
     def _maybe_prepare_dataset(self) -> Optional[PhaseStats]:
         if self.args.prepare_mode == "none":
             return None
-        if self.args.prepare_mode == "write" or self.args.scenario in {
-            "read_perf",
-            "mixed_rw",
-        }:
+        if self.args.prepare_mode == "write" or self.args.scenario in {"read_perf", "mixed_rw"}:
             stats = self._run_fixed_write(
                 "prepare_write",
                 self._prepare_budget(),
@@ -1405,6 +1311,41 @@ class BenchmarkRunner:
         )
 
         phases: List[PhaseStats] = []
+        if self.args.scenario == "verify_nof_unaligned":
+            phases.append(
+                self._run_fixed_write(
+                    "nof_unaligned_put",
+                    self._write_budget(),
+                    strict=True,
+                    write_scope="prepared",
+                )
+            )
+            self.dataset.reset_read_cursor()
+            full_get_stats = self._run_read_phase(
+                "nof_unaligned_full_get",
+                verify=True,
+                sequential=True,
+                loop=False,
+            )
+            if (
+                full_get_stats.failed_kvs > 0
+                or full_get_stats.verify_failures > 0
+                or full_get_stats.successful_kvs != self._write_budget()
+            ):
+                raise RuntimeError(
+                    "nof_unaligned_full_get failed: "
+                    f"expected={self._write_budget()}, "
+                    f"success={full_get_stats.successful_kvs}, "
+                    f"failed={full_get_stats.failed_kvs}, "
+                    f"verify_failures={full_get_stats.verify_failures}, "
+                    f"errors={dict(full_get_stats.error_counts)}"
+                )
+            phases.append(full_get_stats)
+            phases.append(
+                self._run_nof_range_verify("nof_unaligned_range_get")
+            )
+            return phases
+
         if self.args.scenario == "verify_write":
             phases.append(
                 self._run_fixed_write(
@@ -1415,17 +1356,11 @@ class BenchmarkRunner:
                 )
             )
             self._phase_gap("verify_read")
-            phases.append(
-                self._run_read_phase(
-                    "verify_read", verify=True, sequential=True, loop=False
-                )
-            )
+            phases.append(self._run_read_phase("verify_read", verify=True, sequential=True, loop=False))
             return phases
 
         if self.args.scenario == "fill":
-            phases.append(
-                self._run_fixed_write("fill_write", self._write_budget(), strict=False)
-            )
+            phases.append(self._run_fixed_write("fill_write", self._write_budget(), strict=False))
             return phases
 
         if self.args.scenario == "write_perf":
@@ -1433,33 +1368,7 @@ class BenchmarkRunner:
             if self.args.runtime > 0:
                 phases.append(self._run_time_based_write("write_perf", total_objects))
             else:
-                phases.append(
-                    self._run_fixed_write("write_perf", total_objects, strict=False)
-                )
-            return phases
-
-        if self.args.scenario == "metadata_smoke":
-            phases.append(self._metadata_smoke())
-            return phases
-
-        if self.args.scenario == "mixed_metadata":
-            phases.append(self._mixed_metadata())
-            return phases
-
-        if self.args.scenario == "remove_perf":
-            phases.append(
-                self._run_fixed_write(
-                    "prepare_write",
-                    self._prepare_budget(),
-                    strict=True,
-                    write_scope="prepared",
-                )
-            )
-            phases.append(self._remove_prepared())
-            return phases
-
-        if self.args.scenario == "replay":
-            phases.append(self._replay())
+                phases.append(self._run_fixed_write("write_perf", total_objects, strict=False))
             return phases
 
         if self.args.scenario == "read_perf":
@@ -1499,20 +1408,10 @@ def main() -> int:
         runner = BenchmarkRunner(args)
         phases = runner.run()
         log_overall_summary(phases)
-        runner.write_outputs(phases)
         if any(phase.verify_failures > 0 for phase in phases):
             return 20
-        if args.verify and any(
-            phase.misses > 0 for phase in phases if "read" in phase.name
-        ):
+        if args.verify and any(phase.misses > 0 for phase in phases if "read" in phase.name):
             return 21
-        if args.scenario in {
-            "metadata_smoke",
-            "mixed_metadata",
-            "remove_perf",
-            "replay",
-        } and any(phase.failed_kvs > 0 for phase in phases):
-            return 22
         return 0
     except KeyboardInterrupt:
         LOG.warning("benchmark interrupted")

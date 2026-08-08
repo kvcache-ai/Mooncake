@@ -2620,10 +2620,13 @@ void MasterService::RestoreFromStandbySnapshot(
                         alloc = std::make_shared<DummyBufferAllocator>(
                             endpoint, endpoint);
                     }
-                    replicas.emplace_back(
-                        std::make_unique<AllocatedBuffer>(
-                            alloc, nof_desc.buffer_descriptor),
-                        desc.status, ReplicaType::NOF_SSD);
+                    const uint64_t object_size = nof_desc.object_size;
+                    const uint32_t block_size = nof_desc.block_size;
+                    Replica replica(
+                        std::make_unique<AllocatedBuffer>(alloc, nof_desc.buffer_descriptor),
+                        desc.status,ReplicaType::NOF_SSD);
+                    replica.set_nof_metadata(object_size, block_size)
+                    replicas.emplace_back(std::move(replica));
                 } else if (desc.is_disk_replica()) {
                     const auto& disk_desc = desc.get_disk_descriptor();
                     replicas.emplace_back(disk_desc.file_path,
@@ -3461,11 +3464,19 @@ auto MasterService::AllocateAndInsertMetadata(
             nof_segment_manager_.getAllocatorAccess();
         const auto& allocator_manager = allocator_access.getAllocatorManager();
 
+        const uint32_t nof_block_size = allocator_access.getBlockSize(); 
+        if (value_length > std::numeric_limits<uint64_t>::max() -(nof_block_size - 1)) {
+            abort_reserved_quota();
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        const uint64_t nof_allocation_length = ((value_length + nof_block_size - 1) / nof_block_size) * nof_block_size;
+        
+
         std::vector<std::string> preferred_segments =
             config.preferred_nof_segments;
 
         auto allocation_result = allocation_strategy_->Allocate(
-            allocator_manager, value_length, config.nof_replica_num,
+            allocator_manager, nof_allocation_length, config.nof_replica_num,
             preferred_segments, std::set<std::string>(), ReplicaType::NOF_SSD);
 
         if (!allocation_result.has_value()) {
@@ -3484,6 +3495,7 @@ auto MasterService::AllocateAndInsertMetadata(
         } else {
             allocated_nof_replicas = allocation_result->size();
             for (auto& replica : allocation_result.value()) {
+                replica.set_nof_metadata(value_length, nof_block_size);
                 replicas.push_back(std::move(replica));
             }
         }

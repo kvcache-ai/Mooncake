@@ -157,6 +157,7 @@ class MasterServiceTest : public ::testing::Test {
         segment.name = std::move(name);
         segment.base = base;
         segment.size = size;
+        segment.block_size = 512;
         segment.te_endpoint = std::move(endpoint);
         return segment;
     }

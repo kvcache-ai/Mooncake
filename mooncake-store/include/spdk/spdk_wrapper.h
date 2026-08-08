@@ -19,6 +19,11 @@ constexpr int kSpdkNofOpRead = 0;
 constexpr int kSpdkNofOpWrite = 1;
 constexpr int kSpdkNofOpNum = 2;
 
+struct SpdkSglCapabilities {
+    bool supported{false};
+    bool requires_dword_alignment{false};
+};
+
 struct nof_seg_handle;
 struct tr_info;
 struct ctrlr_info;
@@ -46,9 +51,18 @@ class SpdkWrapper {
 
     uint32_t GetBlockSize(const nof_seg_handle *seg_handle);
 
+    bool GetSglCapabilities(const nof_seg_handle *seg_handle,
+                            SpdkSglCapabilities *capabilities);
+
     int SubmitRequest(const nof_seg_handle *seg_handle, void *ptr, uint64_t lba,
                       uint32_t lba_count, int op, spdk_nvme_cmd_cb cb_fn,
                       void *cb_ctx);
+                      
+    int SubmitSglRequest(
+        const nof_seg_handle *seg_handle, uint64_t lba, uint32_t lba_count,
+        int op, spdk_nvme_cmd_cb cb_fn, void *cb_ctx,
+        spdk_nvme_req_reset_sgl_cb reset_sgl_fn,
+        spdk_nvme_req_next_sge_cb next_sge_fn);
 
     bool ProbeNofSegment(const std::string &tr_str, uint32_t timeout_ms,
                          std::string *error_reason = nullptr);

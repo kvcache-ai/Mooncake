@@ -153,6 +153,7 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         segment.id = generate_uuid();
         segment.name = std::move(name);
         segment.base = kSegmentBase + next_segment_offset_;
+        segment.block_size = 512;
         segment.size = size;
         segment.te_endpoint = segment.name;
         next_segment_offset_ += size + 4096;

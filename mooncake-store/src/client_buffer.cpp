@@ -150,7 +150,7 @@ uint64_t calculate_total_size(const Replica::Descriptor& replica) {
     } else if (replica.is_local_disk_replica()) {
         total_length = replica.get_local_disk_descriptor().object_size;
     } else if (replica.is_nof_replica()) {
-        total_length = replica.get_nof_descriptor().buffer_descriptor.size_;
+        total_length = replica.get_nof_descriptor().object_size;
     } else {
         total_length = replica.get_memory_descriptor().buffer_descriptor.size_;
     }
@@ -173,9 +173,8 @@ int allocateSlices(std::vector<Slice>& slices,
         slices.emplace_back(
             Slice{buffer_ptr, replica.get_local_disk_descriptor().object_size});
     } else if (replica.is_nof_replica()) {
-        auto& handle = replica.get_nof_descriptor().buffer_descriptor;
-        void* chunk_ptr = buffer_ptr;
-        slices.emplace_back(Slice{chunk_ptr, handle.size_});
+        const auto& nof_desc = replica.get_nof_descriptor();
+        slices.emplace_back(Slice{buffer_ptr, nof_desc.object_size});
     } else {
         // For memory-based replica, split into slices based on buffer
         // descriptors
