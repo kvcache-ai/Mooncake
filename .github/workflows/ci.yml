@@ -399,6 +399,33 @@ jobs:
         df -h
       shell: bash
 
+    - name: Build and test NVLink HOST_NUMA units
+      if: matrix.python-version == '3.10'
+      run: |
+        cuda_stub=/usr/local/cuda/lib64/stubs
+        export LIBRARY_PATH="$cuda_stub:${LIBRARY_PATH:-}"
+        cmake -G Ninja -S . -B build-nvlink-vmm-tests \
+          -DUSE_HTTP=ON \
+          -DUSE_CUDA=ON \
+          -DUSE_MNNVL=ON \
+          -DWITH_EP=OFF \
+          -DWITH_STORE_RUST=OFF \
+          -DBUILD_UNIT_TESTS=ON \
+          -DBUILD_EXAMPLES=OFF \
+          -DENABLE_SCCACHE=ON \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_EXE_LINKER_FLAGS="-L$cuda_stub"
+        cmake --build build-nvlink-vmm-tests --target \
+          nvlink_host_numa_allocation_test nvlink_transport_test
+        mkdir -p "$RUNNER_TEMP/cuda-driver-stubs"
+        cp -L "$cuda_stub/libcuda.so" \
+          "$RUNNER_TEMP/cuda-driver-stubs/libcuda.so.1"
+        export LD_LIBRARY_PATH="$RUNNER_TEMP/cuda-driver-stubs:$cuda_stub:${LD_LIBRARY_PATH:-}"
+        ctest --test-dir \
+          build-nvlink-vmm-tests/mooncake-transfer-engine/tests \
+          -L nvlink_vmm_unit --output-on-failure
+      shell: bash
+
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@stable
 
