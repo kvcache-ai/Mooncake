@@ -1,0 +1,77 @@
+name: AI Issue Triage
+
+on:
+  issues:
+    types: [opened]
+
+permissions:
+  issues: write
+
+jobs:
+  triage:
+    if: github.repository == 'kvcache-ai/Mooncake'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Auto-label by keywords
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const issue = context.payload.issue;
+            const title = issue.title.toLowerCase();
+            const body = (issue.body || '').toLowerCase();
+            const text = title + ' ' + body;
+
+            const labelMap = {
+              'transfer engine': 'Transfer Engine',
+              'transferengine': 'Transfer Engine',
+              'rdma': 'Transfer Engine',
+              'transport': 'Transfer Engine',
+              'store': 'store',
+              'kvcache': 'store',
+              'hicache': 'store',
+              'expert parallel': 'Mooncake EP',
+              'mooncake-ep': 'Mooncake EP',
+              'moe': 'Mooncake EP',
+              'pytorch backend': 'PyTorch Backend',
+              'mooncake-pg': 'PyTorch Backend',
+              'process group': 'PyTorch Backend',
+              'nccl': 'PyTorch Backend',
+              'pip install': 'Installation',
+              'wheel': 'Installation',
+              'build error': 'Installation',
+              'cmake': 'Installation',
+              'vllm': 'Integration',
+              'sglang': 'Integration',
+              'lmdeploy': 'Integration',
+              'ascend': 'Ascend/NPU',
+              'npu': 'Ascend/NPU',
+              'cann': 'Ascend/NPU',
+            };
+
+            const labelsToAdd = [];
+            for (const [keyword, label] of Object.entries(labelMap)) {
+              if (text.includes(keyword) && !labelsToAdd.includes(label)) {
+                labelsToAdd.push(label);
+              }
+            }
+
+            if (labelsToAdd.length > 0) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                labels: labelsToAdd,
+              });
+            }
+
+            // Add 'ai-ready' label for well-structured feature requests
+            const isFeatureRequest = issue.labels?.some(l => l.name === 'feature request');
+            const hasDescription = body.length > 200;
+            if (isFeatureRequest && hasDescription) {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                labels: ['ai-ready'],
+              });
+            }
