@@ -338,6 +338,7 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         key_from = f"{key}_from"
         batch_keys = [f"{key}_batch_{i}" for i in range(2)]
         upsert_key = f"{key}_upsert"
+        cuda_upsert_key = f"{key}_cuda_upsert"
         pub_key = f"{key}_pub"
         tp_key = f"{key}_tp"
         batch_tp_key = f"{key}_batch_tp"
@@ -346,7 +347,9 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         parallel_from_key = f"{key}_parallel_from"
         parallel_upsert_key = f"{key}_parallel_upsert"
         parallel_upsert_from_key = f"{key}_parallel_upsert_from"
-        cleanup_keys = [key, key_from, *batch_keys, upsert_key, pub_key]
+        cleanup_keys = [
+            key, key_from, *batch_keys, upsert_key, cuda_upsert_key, pub_key
+        ]
         cleanup_keys.extend(
             [
                 parallel_key,
@@ -403,6 +406,16 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
             updated = tensor + 2
             self.assertEqual(self.store.upsert_tensor(upsert_key, updated), 0)
             self.assertTrue(torch.equal(self.store.get_tensor(upsert_key), updated))
+
+            if torch.cuda.is_available():
+                cuda_updated = updated.to("cuda")
+                torch.cuda.synchronize()
+                self.assertEqual(
+                    self.store.upsert_tensor(cuda_upsert_key, cuda_updated), 0
+                )
+                self.assertTrue(
+                    torch.equal(self.store.get_tensor(cuda_upsert_key), updated)
+                )
 
             self.assertEqual(self.store.pub_tensor(pub_key, tensor + 3), 0)
             self.assertTrue(torch.equal(self.store.get_tensor(pub_key), tensor + 3))

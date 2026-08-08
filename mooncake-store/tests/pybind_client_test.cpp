@@ -2,6 +2,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <barrier>
 #include <chrono>
 #include <cstdio>
@@ -747,6 +748,7 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffers) {
         0);
 
     std::string test_data(1000, '1');
+    std::string upsert_data(1000, '2');
     std::string dst_data(1000, '0');
 
     // Register buffers for zero-copy operations
@@ -758,26 +760,36 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffers) {
         py_client_->register_buffer(dst_data.data(), dst_data.size());
     ASSERT_EQ(reg_result_dst, 0)
         << "Dst data buffer registration should succeed";
+    int reg_result_upsert =
+        py_client_->register_buffer(upsert_data.data(), upsert_data.size());
+    ASSERT_EQ(reg_result_upsert, 0)
+        << "Upsert data buffer registration should succeed";
 
     std::vector<std::string> keys;
     std::vector<std::vector<void*>> all_ptrs;
+    std::vector<std::vector<void*>> all_upsert_ptrs;
     std::vector<std::vector<void*>> all_dst_ptrs;
     std::vector<std::vector<size_t>> all_sizes;
     auto ptr = test_data.data();
+    auto upsert_ptr = upsert_data.data();
     auto dst_ptr = dst_data.data();
     for (size_t i = 0; i < 10; i++) {
         keys.emplace_back("test_key_" + std::to_string(i));
         std::vector<void*> ptrs;
+        std::vector<void*> upsert_ptrs;
         std::vector<void*> dst_ptrs;
         std::vector<size_t> sizes;
         for (size_t j = 0; j < 10; j++) {
             ptrs.emplace_back(ptr);
+            upsert_ptrs.emplace_back(upsert_ptr);
             dst_ptrs.emplace_back(dst_ptr);
             sizes.emplace_back(10);
             ptr += 10;
+            upsert_ptr += 10;
             dst_ptr += 10;
         }
         all_ptrs.emplace_back(ptrs);
+        all_upsert_ptrs.emplace_back(upsert_ptrs);
         all_dst_ptrs.emplace_back(dst_ptrs);
         all_sizes.emplace_back(sizes);
     }
@@ -796,6 +808,21 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffers) {
     }
     EXPECT_EQ(dst_data, test_data) << "Retrieved data should match original";
 
+    std::vector<int> upsert_results =
+        py_client_->batch_upsert_from_multi_buffers(keys, all_upsert_ptrs,
+                                                    all_sizes, config);
+    for (auto result : upsert_results) {
+        EXPECT_EQ(result, 0) << "Upsert operation should succeed";
+    }
+    std::fill(dst_data.begin(), dst_data.end(), '0');
+    get_results = py_client_->batch_get_into_multi_buffers(keys, all_dst_ptrs,
+                                                           all_sizes, true);
+    for (auto result : get_results) {
+        EXPECT_EQ(result, 100) << "Get after upsert should succeed";
+    }
+    EXPECT_EQ(dst_data, upsert_data)
+        << "Retrieved data should match upserted data";
+
     // Unregister buffers
     int unreg_result_test = py_client_->unregister_buffer(test_data.data());
     ASSERT_EQ(unreg_result_test, 0)
@@ -803,6 +830,9 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffers) {
     int unreg_result_dst = py_client_->unregister_buffer(dst_data.data());
     ASSERT_EQ(unreg_result_dst, 0)
         << "Dst data buffer unregistration should succeed";
+    int unreg_result_upsert = py_client_->unregister_buffer(upsert_data.data());
+    ASSERT_EQ(unreg_result_upsert, 0)
+        << "Upsert data buffer unregistration should succeed";
 }
 
 TEST_F(RealClientTest, TestBatchAndNormalGetReplicaDesc) {

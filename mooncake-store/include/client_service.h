@@ -790,8 +790,8 @@ class Client {
     std::vector<tl::expected<void, ErrorCode>> CollectResults(
         const std::vector<PutOperation>& ops);
 
-    std::vector<tl::expected<void, ErrorCode>> BatchPutWhenPreferSameNode(
-        std::vector<PutOperation>& ops);
+    std::vector<tl::expected<void, ErrorCode>> BatchWriteWhenPreferSameNode(
+        std::vector<PutOperation>& ops, bool is_upsert);
     std::vector<tl::expected<void, ErrorCode>> BatchGetWhenPreferSameNode(
         const std::vector<std::string>& object_keys,
         const std::vector<QueryResult>& query_results,

@@ -104,6 +104,65 @@ bool ReleasePinnedRegionsForFree(
     return safe_to_free;
 }
 
+template <typename T>
+std::vector<int> ToPyResults(
+    const std::vector<tl::expected<T, ErrorCode>> &results) {
+    std::vector<int> converted;
+    converted.reserve(results.size());
+    for (const auto &result : results) converted.push_back(to_py_ret(result));
+    return converted;
+}
+
+tl::expected<std::vector<std::vector<Slice>>, ErrorCode>
+BuildNestedSlicesFromBuffers(
+    const std::vector<std::string> &keys,
+    const std::vector<std::vector<void *>> &all_buffers,
+    const std::vector<std::vector<size_t>> &all_sizes) {
+    if (keys.size() != all_buffers.size() ||
+        all_buffers.size() != all_sizes.size()) {
+        LOG(ERROR) << "Mismatched sizes for keys, buffers, and sizes";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    std::vector<std::vector<Slice>> batched_slices(keys.size());
+    for (size_t i = 0; i < all_buffers.size(); ++i) {
+        const auto &buffers = all_buffers[i];
+        const auto &sizes = all_sizes[i];
+        if (buffers.size() != sizes.size()) {
+            LOG(ERROR) << "Mismatched buffers and sizes of key:" << keys[i];
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        batched_slices[i].reserve(buffers.size());
+        for (size_t j = 0; j < buffers.size(); ++j) {
+            batched_slices[i].emplace_back(Slice{buffers[j], sizes[j]});
+        }
+    }
+    return batched_slices;
+}
+
+using BatchWriteMethod = std::vector<tl::expected<void, ErrorCode>> (Client::*)(
+    const std::vector<ObjectKey> &, std::vector<std::vector<Slice>> &,
+    const ReplicateConfig &);
+
+std::vector<tl::expected<void, ErrorCode>> BatchWriteFromMultiBuffers(
+    const std::shared_ptr<Client> &client, const std::vector<std::string> &keys,
+    const std::vector<std::vector<void *>> &all_buffers,
+    const std::vector<std::vector<size_t>> &all_sizes,
+    const ReplicateConfig &config, BatchWriteMethod write) {
+    if (!client) {
+        LOG(ERROR) << "Client is not initialized";
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    auto batched_slices =
+        BuildNestedSlicesFromBuffers(keys, all_buffers, all_sizes);
+    if (!batched_slices) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(batched_slices.error()));
+    }
+    return ((*client).*write)(keys, batched_slices.value(), config);
+}
+
 #ifdef USE_ASCEND_DIRECT
 bool checkAcl(aclError result, const char *message) {
     if (result != ACL_ERROR_NONE) {
@@ -4503,6 +4562,22 @@ std::vector<tl::expected<void, ErrorCode>>
 RealClient::batch_put_from_cuda_ipc_dummy_helper(
     const std::vector<CudaIpcWriteRequest> &requests,
     const ReplicateConfig &config, const UUID &client_id) {
+    return batch_write_from_cuda_ipc_dummy_helper(requests, config, client_id,
+                                                  false);
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+RealClient::batch_upsert_from_cuda_ipc_dummy_helper(
+    const std::vector<CudaIpcWriteRequest> &requests,
+    const ReplicateConfig &config, const UUID &client_id) {
+    return batch_write_from_cuda_ipc_dummy_helper(requests, config, client_id,
+                                                  true);
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+RealClient::batch_write_from_cuda_ipc_dummy_helper(
+    const std::vector<CudaIpcWriteRequest> &requests,
+    const ReplicateConfig &config, const UUID &client_id, bool is_upsert) {
     std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
     auto it = shm_contexts_.find(client_id);
     if (it == shm_contexts_.end()) {
@@ -4564,6 +4639,10 @@ RealClient::batch_put_from_cuda_ipc_dummy_helper(
         }
     }
 
+    if (is_upsert) {
+        return batch_upsert_from_multi_buffers_internal(keys, all_buffers,
+                                                        all_sizes, config);
+    }
     return batch_put_from_multi_buffers_internal(keys, all_buffers, all_sizes,
                                                  config);
 }
@@ -4636,6 +4715,41 @@ RealClient::batch_get_into_cuda_ipc_dummy_helper(
         }
     }
     return results;
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+RealClient::batch_upsert_from_multi_buffers_dummy_helper(
+    const std::vector<std::string> &keys,
+    const std::vector<std::vector<uint64_t>> &dummy_all_buffers,
+    const std::vector<std::vector<size_t>> &all_sizes,
+    const ReplicateConfig &config, int32_t device_id, const UUID &client_id) {
+#ifdef USE_ASCEND_DIRECT
+    if (!ContextManager::getInstance().setCurrentContextByPhysicalId(
+            device_id)) {
+        LOG(ERROR) << "Failed to set context for physical device " << device_id;
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+#endif
+
+    std::shared_lock<std::shared_mutex> lock(dummy_client_mutex_);
+    auto it = shm_contexts_.find(client_id);
+    if (it == shm_contexts_.end()) {
+        LOG(ERROR) << "client_id=" << client_id << ", error=shm_not_mapped";
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    auto &context = it->second;
+
+    auto real_buffers_result = map_dummy_nested_addrs_to_real_ptrs(
+        context, dummy_all_buffers, all_sizes, keys, client_id);
+    if (!real_buffers_result) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(real_buffers_result.error()));
+    }
+
+    return batch_upsert_from_multi_buffers_internal(
+        keys, real_buffers_result.value(), all_sizes, config);
 }
 
 std::vector<tl::expected<int64_t, ErrorCode>>
@@ -5149,14 +5263,39 @@ std::vector<int> RealClient::batch_put_from_multi_buffers(
                     "batch_put_from_multi_buffers",
                     sum_successful_nested_sizes(py_results, sizes), latency_us);
             });
-    std::vector<int> results;
-    results.reserve(internal_results.size());
+    return ToPyResults(internal_results);
+}
 
-    for (const auto &result : internal_results) {
-        results.push_back(to_py_ret(result));
-    }
+std::vector<int> RealClient::batch_upsert_from_multi_buffers(
+    const std::vector<std::string> &keys,
+    const std::vector<std::vector<void *>> &all_buffers,
+    const std::vector<std::vector<size_t>> &sizes,
+    const ReplicateConfig &config) {
+    auto internal_results =
+        execute_timed_operation<std::vector<tl::expected<void, ErrorCode>>>(
+            [&]() {
+                return batch_upsert_from_multi_buffers_internal(
+                    keys, all_buffers, sizes, config);
+            },
+            [](const auto &) { return true; },
+            [&](uint64_t latency_us, const auto &ret) {
+                auto py_results = ToPyResults(ret);
+                client_->ObserveTransferOperation(
+                    TransferOperationKind::kWrite,
+                    "batch_upsert_from_multi_buffers",
+                    sum_successful_nested_sizes(py_results, sizes), latency_us);
+            });
+    return ToPyResults(internal_results);
+}
 
-    return results;
+std::vector<tl::expected<void, ErrorCode>>
+RealClient::batch_upsert_from_multi_buffers_internal(
+    const std::vector<std::string> &keys,
+    const std::vector<std::vector<void *>> &all_buffers,
+    const std::vector<std::vector<size_t>> &all_sizes,
+    const ReplicateConfig &config) {
+    return BatchWriteFromMultiBuffers(client_, keys, all_buffers, all_sizes,
+                                      config, &Client::BatchUpsert);
 }
 
 std::vector<tl::expected<void, ErrorCode>>
@@ -5165,35 +5304,8 @@ RealClient::batch_put_from_multi_buffers_internal(
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &all_sizes,
     const ReplicateConfig &config) {
-    if (!client_) {
-        LOG(ERROR) << "Client is not initialized";
-        return std::vector<tl::expected<void, ErrorCode>>(
-            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
-    }
-
-    if ((keys.size() != all_buffers.size()) ||
-        (all_buffers.size() != all_sizes.size())) {
-        LOG(ERROR) << "Mismatched sizes for keys, buffers, and sizes";
-        return std::vector<tl::expected<void, ErrorCode>>(
-            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
-    }
-
-    std::vector<std::vector<mooncake::Slice>> batched_slices(keys.size());
-    for (size_t i = 0; i < all_buffers.size(); ++i) {
-        const auto &buffers = all_buffers[i];
-        const auto &sizes = all_sizes[i];
-        if (buffers.size() != sizes.size()) {
-            LOG(ERROR) << "Mismatched buffers and sizes of key:" << keys[i];
-            return std::vector<tl::expected<void, ErrorCode>>(
-                keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
-        }
-        batched_slices[i].reserve(buffers.size());
-        for (size_t j = 0; j < buffers.size(); ++j) {
-            batched_slices[i].emplace_back(Slice{buffers[j], sizes[j]});
-        }
-    }
-    // Call client BatchPut and return the vector<expected> directly
-    return client_->BatchPut(keys, batched_slices, config);
+    return BatchWriteFromMultiBuffers(client_, keys, all_buffers, all_sizes,
+                                      config, &Client::BatchPut);
 }
 
 std::vector<int> RealClient::batch_get_into_multi_buffers(
