@@ -132,8 +132,7 @@ class P2PMasterHttpEndpointsTest : public ::testing::Test {
     static UUID segment_id_;
 };
 
-std::unique_ptr<WrappedP2PMasterService>
-    P2PMasterHttpEndpointsTest::wrapped_;
+std::unique_ptr<WrappedP2PMasterService> P2PMasterHttpEndpointsTest::wrapped_;
 std::string P2PMasterHttpEndpointsTest::http_base_url_;
 UUID P2PMasterHttpEndpointsTest::client_id_;
 UUID P2PMasterHttpEndpointsTest::segment_id_;
