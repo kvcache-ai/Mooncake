@@ -115,10 +115,10 @@ class P2PClientHttpEndpointsTest : public ::testing::Test {
         while (start < body.size()) {
             size_t pos = body.find('\n', start);
             if (pos == std::string_view::npos) {
-                lines.push_back(body.substr(start));
+                lines.emplace_back(body.substr(start));
                 break;
             }
-            lines.push_back(body.substr(start, pos - start));
+            lines.emplace_back(body.substr(start, pos - start));
             start = pos + 1;
         }
         return lines;
