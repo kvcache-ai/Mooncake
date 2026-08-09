@@ -2366,12 +2366,12 @@ P2PClientService::GetLocalKeys(size_t limit) {
         LOG(ERROR) << "data_manager_ is not initialized";
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    // limit <= 0 means no limit
-    bool need_limit = limit > 0;
 
     std::vector<std::string> keys;
     data_manager_->ForEachKeyBatch(
-        [&keys](std::vector<ReplicaLocation>&& batch) {
+        [&keys, limit](std::vector<ReplicaLocation>&& batch) {
+            // limit <= 0 means no limit
+            const bool need_limit = limit > 0;
             keys.reserve(keys.size() + batch.size());
             for (auto& loc : batch) {
                 keys.push_back(std::move(loc.key));
