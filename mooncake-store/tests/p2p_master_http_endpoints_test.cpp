@@ -91,8 +91,11 @@ class P2PMasterHttpEndpointsTest : public ::testing::Test {
 
         // Add replicas for three distinct keys.
         for (int i = 0; i < kNumKeys; ++i) {
+            // Keep the key string alive: AddReplicaRequest::key is a
+            // string_view and AddReplica copies from it synchronously.
+            const std::string key = "master_http_key_" + std::to_string(i);
             AddReplicaRequest req;
-            req.key = "master_http_key_" + std::to_string(i);
+            req.key = key;
             req.size = 1024;
             req.client_id = client_id_;
             req.segment_id = segment_id_;
