@@ -17,6 +17,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -87,9 +88,18 @@ class P2PClientHttpEndpointsTest : public ::testing::Test {
                              : http_base_url_ + path + "?" + query;
     }
 
-    static coro_http::resp_data HttpGet(const std::string& url) {
+    // Owns the response body: resp_data::resp_body is a string_view into
+    // the client's internal buffer and would dangle once the client used
+    // below is destroyed.
+    struct HttpResponse {
+        int status;
+        std::string resp_body;
+    };
+
+    static HttpResponse HttpGet(const std::string& url) {
         coro_http::coro_http_client client;
-        return client.get(url);
+        auto resp = client.get(url);
+        return {resp.status, std::string(resp.resp_body)};
     }
 
     static coro_http::resp_data HttpPost(const std::string& url,
@@ -99,12 +109,12 @@ class P2PClientHttpEndpointsTest : public ::testing::Test {
                            coro_http::req_content_type::octet_stream);
     }
 
-    static std::vector<std::string> SplitLines(const std::string& body) {
+    static std::vector<std::string> SplitLines(std::string_view body) {
         std::vector<std::string> lines;
         size_t start = 0;
         while (start < body.size()) {
             size_t pos = body.find('\n', start);
-            if (pos == std::string::npos) {
+            if (pos == std::string_view::npos) {
                 lines.push_back(body.substr(start));
                 break;
             }
