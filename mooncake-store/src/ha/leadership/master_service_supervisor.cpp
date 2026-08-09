@@ -394,9 +394,13 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         if (promotion_ctx->applied_seq_id > 0 ||
             !promotion_ctx->objects.empty() ||
             !promotion_ctx->segments.empty()) {
-            wrapped_master_service->RestoreFromStandby(
+            auto restore_result = wrapped_master_service->RestoreFromStandby(
                 promotion_ctx->objects, promotion_ctx->applied_seq_id,
                 promotion_ctx->segments);
+            if (!restore_result) {
+                LOG(ERROR) << "Standby restore failed: "
+                           << toString(restore_result.error());
+            }
         }
 
         mooncake::RegisterRpcService(server, *wrapped_master_service);

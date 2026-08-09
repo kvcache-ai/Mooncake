@@ -829,7 +829,7 @@ class MasterService {
      * @brief Restore primary state from standby promotion context.
      * Called once at promotion time before serving requests.
      */
-    void RestoreFromStandbySnapshot(
+    tl::expected<void, ErrorCode> RestoreFromStandbySnapshot(
         const std::vector<StandbyObjectEntry>& objects,
         uint64_t initial_oplog_sequence_id,
         const std::vector<StandbySegmentInfo>& segments);
