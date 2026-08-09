@@ -30,7 +30,7 @@ class FileStorageTest : public ::testing::Test {
         FLAGS_logtostderr = true;
         UnsetEnv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH");
         UnsetEnv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES");
-        UnsetEnv("MOONCAKE_OFFLOAD_PINNED_RESTORE_BUFFER_SIZE_BYTES");
+        UnsetEnv("MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES");
         UnsetEnv("MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT");
         UnsetEnv("MOONCAKE_SCANMETA_ITERATOR_KEYS_LIMIT");
         UnsetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT");
@@ -74,7 +74,7 @@ class FileStorageTest : public ::testing::Test {
 
     void SetPinnedRestoreArena(FileStorage& fileStorage, void* address,
                                size_t size) {
-        fileStorage.pinned_restore_allocator_ =
+        fileStorage.pinned_restore_arena_allocator_ =
             ClientBufferAllocator::create(address, size);
     }
 
@@ -383,7 +383,7 @@ TEST_F(FileStorageTest, DefaultValuesWhenNoEnvSet) {
     EXPECT_EQ(config.total_size_limit, 2ULL * 1024 * 1024 * 1024 * 1024);
     EXPECT_EQ(config.heartbeat_interval_seconds, 10u);
     EXPECT_TRUE(config.enable_disk_watermark_eviction);
-    EXPECT_EQ(config.pinned_restore_buffer_size, 0);
+    EXPECT_EQ(config.pinned_restore_arena_size, 0);
     EXPECT_DOUBLE_EQ(config.disk_eviction_high_watermark_ratio, 0.90);
     EXPECT_DOUBLE_EQ(config.disk_eviction_low_watermark_ratio, 0.80);
 }
@@ -397,7 +397,7 @@ TEST_F(FileStorageTest, ReadStringFromEnv) {
 
 TEST_F(FileStorageTest, ReadInt64FromEnv) {
     SetEnv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", "2147483648");  // 2GB
-    SetEnv("MOONCAKE_OFFLOAD_PINNED_RESTORE_BUFFER_SIZE_BYTES", "67108864");
+    SetEnv("MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES", "67108864");
     SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1000");
     SetEnv("MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT", "5000000");
 
@@ -405,7 +405,7 @@ TEST_F(FileStorageTest, ReadInt64FromEnv) {
     auto bucket_backend_config = BucketBackendConfig::FromEnvironment();
 
     EXPECT_EQ(config.local_buffer_size, 2147483648);
-    EXPECT_EQ(config.pinned_restore_buffer_size, 64 * 1024 * 1024);
+    EXPECT_EQ(config.pinned_restore_arena_size, 64 * 1024 * 1024);
     EXPECT_EQ(bucket_backend_config.bucket_keys_limit, 1000);
     EXPECT_EQ(config.total_keys_limit, 5000000);
 }
@@ -652,10 +652,10 @@ TEST_F(FileStorageTest, ValidateFailsOnInvalidLimits) {
     EXPECT_FALSE(config.Validate());
 
     config.total_size_limit = 1;
-    config.pinned_restore_buffer_size = -1;
+    config.pinned_restore_arena_size = -1;
     EXPECT_FALSE(config.Validate());
 
-    config.pinned_restore_buffer_size = 0;
+    config.pinned_restore_arena_size = 0;
     config.heartbeat_interval_seconds = 0;
     EXPECT_FALSE(config.Validate());
 

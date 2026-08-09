@@ -155,8 +155,8 @@ TEST_F(RealClientTest, PinnedSsdRestoreReadsNonTailRangeIntoGpu) {
 
     ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
     ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
-    ScopedEnvVar pinned_restore(
-        "MOONCAKE_OFFLOAD_PINNED_RESTORE_BUFFER_SIZE_BYTES", "1048576");
+    ScopedEnvVar pinned_restore_arena(
+        "MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES", "1048576");
     ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
                                  "bucket_storage_backend");
     ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");

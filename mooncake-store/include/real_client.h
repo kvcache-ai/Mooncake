@@ -725,7 +725,7 @@ class RealClient : public PyClient {
         std::unordered_map<std::string, std::vector<Slice>> &objects,
         const OffloadReadRange *read_range = nullptr);
 
-    bool can_use_pinned_restore(
+    bool can_use_pinned_restore_arena(
         const std::string &target_rpc_service_addr,
         const std::unordered_map<std::string, std::vector<Slice>> &objects)
         const;

@@ -3436,7 +3436,7 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         void *dst = static_cast<char *>(buffer) + dst_offset;
         std::unordered_map<std::string, std::vector<Slice>> objects{
             {key, {{dst, size}}}};
-        if (can_use_pinned_restore(endpoint, objects)) {
+        if (can_use_pinned_restore_arena(endpoint, objects)) {
             if (total_size > uint64_t(std::numeric_limits<int64_t>::max())) {
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
             }
@@ -5935,11 +5935,11 @@ bool RealClient::release_offload_buffer(uint64_t batch_id) {
     return file_storage_->ReleaseBuffer(batch_id);
 }
 
-bool RealClient::can_use_pinned_restore(
+bool RealClient::can_use_pinned_restore_arena(
     const std::string &target_rpc_service_addr,
     const std::unordered_map<std::string, std::vector<Slice>> &objects) const {
     if (!file_storage_ || target_rpc_service_addr != local_rpc_addr ||
-        !file_storage_->HasPinnedRestore()) {
+        !file_storage_->HasPinnedRestoreArena()) {
         return false;
     }
     auto accelerators = device::GetAcceleratorRegistry().RuntimeAccelerators();
@@ -5995,7 +5995,7 @@ RealClient::batch_get_into_offload_object_internal(
     }
 
     const bool local_batch =
-        can_use_pinned_restore(target_rpc_service_addr, objects);
+        can_use_pinned_restore_arena(target_rpc_service_addr, objects);
     std::optional<FileStorage::LocalBatchResult> local_owner;
     auto response =
         [&]() -> tl::expected<BatchGetOffloadObjectResponse, ErrorCode> {

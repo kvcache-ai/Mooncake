@@ -108,9 +108,9 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
     config.local_buffer_size = Environ::GetInt64(
         "MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", config.local_buffer_size);
 
-    config.pinned_restore_buffer_size =
-        Environ::GetInt64("MOONCAKE_OFFLOAD_PINNED_RESTORE_BUFFER_SIZE_BYTES",
-                          config.pinned_restore_buffer_size);
+    config.pinned_restore_arena_size =
+        Environ::GetInt64("MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES",
+                          config.pinned_restore_arena_size);
 
     config.scanmeta_iterator_keys_limit = Environ::GetInt64(
         "MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT",
@@ -230,8 +230,8 @@ bool FileStorageConfig::Validate() const {
         LOG(ERROR) << "FileStorageConfig: total_size_limit should not be zero";
         return false;
     }
-    if (pinned_restore_buffer_size < 0) {
-        LOG(ERROR) << "FileStorageConfig: pinned_restore_buffer_size must be "
+    if (pinned_restore_arena_size < 0) {
+        LOG(ERROR) << "FileStorageConfig: pinned_restore_arena_size must be "
                       "non-negative";
         return false;
     }
@@ -276,7 +276,7 @@ FileStorage::FileStorage(const FileStorageConfig& config,
         throw std::invalid_argument("Invalid FileStorage configuration");
     }
 
-    if (config.pinned_restore_buffer_size > 0) {
+    if (config.pinned_restore_arena_size > 0) {
         if (config.use_uring) {
             LOG(WARNING) << "Pinned SSD restore is disabled with io_uring";
         } else if (!client ||
@@ -285,14 +285,14 @@ FileStorage::FileStorage(const FileStorageConfig& config,
                 << "Pinned SSD restore is disabled: local memcpy unavailable";
         } else {
             auto buffer = PinnedBufferPool::AllocatePinned(
-                static_cast<size_t>(config.pinned_restore_buffer_size));
+                static_cast<size_t>(config.pinned_restore_arena_size));
             if (buffer.pinned_host.addr) {
-                pinned_restore_buffer_ = std::move(buffer);
-                pinned_restore_allocator_ = ClientBufferAllocator::create(
-                    pinned_restore_buffer_.data,
-                    pinned_restore_buffer_.capacity, client->GetProtocol());
+                pinned_restore_arena_ = std::move(buffer);
+                pinned_restore_arena_allocator_ = ClientBufferAllocator::create(
+                    pinned_restore_arena_.data, pinned_restore_arena_.capacity,
+                    client->GetProtocol());
                 LOG(INFO) << "Initialized pinned SSD restore arena, size="
-                          << pinned_restore_buffer_.capacity;
+                          << pinned_restore_arena_.capacity;
             } else {
                 LOG(WARNING) << "Failed to allocate pinned SSD restore arena";
             }
@@ -433,9 +433,9 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
 tl::expected<std::shared_ptr<FileStorage::AllocatedBatch>, ErrorCode>
 FileStorage::LoadBatch(const std::vector<std::string>& keys,
                        const std::vector<int64_t>& sizes, bool prefer_pinned) {
-    const bool use_pinned = prefer_pinned && pinned_restore_allocator_;
-    auto& allocator =
-        use_pinned ? *pinned_restore_allocator_ : *client_buffer_allocator_;
+    const bool use_pinned = prefer_pinned && pinned_restore_arena_allocator_;
+    auto& allocator = use_pinned ? *pinned_restore_arena_allocator_
+                                 : *client_buffer_allocator_;
     auto allocate_res = AllocateBatch(keys, sizes, allocator);
     if (!allocate_res && use_pinned &&
         allocate_res.error() == ErrorCode::BUFFER_OVERFLOW) {

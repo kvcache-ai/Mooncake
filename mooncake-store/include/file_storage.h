@@ -53,8 +53,8 @@ class FileStorage {
         const std::vector<std::string>& keys,
         const std::vector<int64_t>& sizes);
 
-    [[nodiscard]] bool HasPinnedRestore() const {
-        return pinned_restore_allocator_ != nullptr;
+    [[nodiscard]] bool HasPinnedRestoreArena() const {
+        return pinned_restore_arena_allocator_ != nullptr;
     }
 
     FileStorageConfig config_;
@@ -179,8 +179,8 @@ class FileStorage {
     std::string local_rpc_addr_;
     // Pinned memory for GPU staging and SSD-to-GPU restores.
     std::unique_ptr<PinnedBufferPool> pinned_buffer_pool_;
-    PinnedBufferPool::Buffer pinned_restore_buffer_;
-    std::shared_ptr<ClientBufferAllocator> pinned_restore_allocator_;
+    PinnedBufferPool::Buffer pinned_restore_arena_;
+    std::shared_ptr<ClientBufferAllocator> pinned_restore_arena_allocator_;
     std::shared_ptr<StorageBackendInterface> storage_backend_;
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_;
     mutable Mutex client_buffer_mutex_;
