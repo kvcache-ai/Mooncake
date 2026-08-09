@@ -23,6 +23,7 @@ struct PromotionContext {
     uint64_t applied_seq_id{0};
     std::vector<StandbyObjectEntry> objects;
     std::vector<StandbySegmentInfo> segments;
+    std::vector<LocalDeleteTask> pending_local_deletes;
 };
 
 class StandbyController {

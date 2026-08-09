@@ -21,6 +21,7 @@
 #include <memory>
 #include <sstream>
 #include <thread>
+#include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -121,6 +122,7 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
             client_by_name;  // segment name -> client_id (sorted)
         std::map<UUID, LocalDiskSegmentState>
             local_disk_segments;  // client_id -> segment state (sorted)
+        std::vector<LocalDeleteTask> pending_local_deletes;
 
         // === TaskManager State ===
         std::map<UUID, TaskState> tasks;  // task_id -> task state (sorted)
@@ -303,6 +305,14 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
                 state.local_disk_segments[client_id] = std::move(seg_state);
             }
         }
+        state.pending_local_deletes =
+            service->local_delete_registry_.Snapshot();
+        std::sort(state.pending_local_deletes.begin(),
+                  state.pending_local_deletes.end(),
+                  [](const LocalDeleteTask& lhs, const LocalDeleteTask& rhs) {
+                      return std::tie(lhs.local_disk_segment_id, lhs.task_id) <
+                             std::tie(rhs.local_disk_segment_id, rhs.task_id);
+                  });
 
         // === TaskManager State (via friend access) ===
         {
@@ -443,6 +453,12 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
                     all_passed = false;
                 }
             }
+        }
+        if (before.pending_local_deletes != after.pending_local_deletes) {
+            LOG(ERROR) << "pending_local_deletes mismatch. before="
+                       << before.pending_local_deletes.size()
+                       << ", after=" << after.pending_local_deletes.size();
+            all_passed = false;
         }
 
         // ========== Level 1: Basic state comparison ==========

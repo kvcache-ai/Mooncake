@@ -210,8 +210,24 @@ class WrappedMasterService {
     tl::expected<void, ErrorCode> MountLocalDiskSegment(const UUID& client_id,
                                                         bool enable_offloading);
 
+    tl::expected<LocalDiskMountInfo, ErrorCode> MountLocalDiskSegmentV2(
+        const UUID& client_id, bool enable_offloading,
+        const std::string& local_disk_segment_id, uint32_t capabilities);
+
     tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
     OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading);
+
+    tl::expected<std::vector<LocalDeleteTask>, ErrorCode> FetchLocalDeleteTasks(
+        const UUID& client_id, const std::string& local_disk_segment_id,
+        uint64_t mount_epoch, uint32_t limit);
+
+    tl::expected<void, ErrorCode> AckLocalDeleteTasks(
+        const UUID& client_id, const std::string& local_disk_segment_id,
+        uint64_t mount_epoch, const std::vector<LocalDeleteTaskId>& task_ids);
+
+    tl::expected<std::vector<uint8_t>, ErrorCode> ReconcileLocalDiskObjects(
+        const UUID& client_id, const std::string& local_disk_segment_id,
+        uint64_t mount_epoch, const std::vector<OffloadTaskItem>& objects);
 
     tl::expected<bool, ErrorCode> PollRemoveAll(const UUID& client_id);
 
@@ -253,9 +269,11 @@ class WrappedMasterService {
 
     // Internal method called by supervisor during promotion; NOT an RPC
     // endpoint.
-    void RestoreFromStandby(const std::vector<StandbyObjectEntry>& objects,
-                            uint64_t initial_oplog_sequence_id,
-                            const std::vector<StandbySegmentInfo>& segments);
+    tl::expected<void, ErrorCode> RestoreFromStandby(
+        const std::vector<StandbyObjectEntry>& objects,
+        uint64_t initial_oplog_sequence_id,
+        const std::vector<StandbySegmentInfo>& segments,
+        const std::vector<LocalDeleteTask>& pending_local_deletes = {});
 
     tl::expected<UUID, ErrorCode> CreateCopyTask(
         const std::string& key, const std::string& tenant_id,

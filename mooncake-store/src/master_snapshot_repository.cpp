@@ -260,11 +260,13 @@ MasterSnapshotRepository::DownloadSnapshotPayloads(
                                            protocol_type + "', expected '" +
                                            ha::kSnapshotSerializerType + "'"));
     }
-    if (version != ha::kSnapshotSerializerVersion) {
+    if (version != ha::kSnapshotSerializerVersion &&
+        version != ha::kLegacySnapshotSerializerVersion) {
         return tl::make_unexpected(SerializationError(
             ErrorCode::INVALID_PARAMS,
             "incompatible snapshot version '" + version + "', expected '" +
-                ha::kSnapshotSerializerVersion + "'"));
+                ha::kSnapshotSerializerVersion + "' or '" +
+                ha::kLegacySnapshotSerializerVersion + "'"));
     }
 
     ha::MasterSnapshotPayloads payloads;

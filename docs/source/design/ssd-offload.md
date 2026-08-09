@@ -271,3 +271,7 @@ To prevent `io_uring`'s `FOLL_LONGTERM` page pinning from failing on systems wit
 On startup, `FileStorage::Init` calls `StorageBackend::ScanMeta`, which reads on-disk metadata and invokes a callback for each discovered object. The callback calls `MasterClient::NotifyOffloadSuccess` to re-register the objects with the master. This restores the full disk-replica view without any application-level intervention for the backends that preserve restart metadata, namely `BucketStorageBackend` and the file-per-key backend.
 
 `OffsetAllocatorStorageBackend` is the exception. It truncates its pre-allocated data file during initialization and clears its in-memory metadata, so previously offloaded objects are not recoverable after a real client restart.
+
+For durable `Remove` and `BatchRemove` handling in the bucket backend, including
+tombstones, watermark-triggered reclamation, and multi-bucket compaction, see
+[Reliable SSD Object Deletion and Bucket Garbage Collection](ssd-object-deletion-and-gc.md).

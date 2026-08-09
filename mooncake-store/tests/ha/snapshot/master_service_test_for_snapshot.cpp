@@ -273,6 +273,53 @@ TEST_F(MasterServiceSnapshotTest, PutStartEndFlow) {
     EXPECT_EQ(ReplicaStatus::COMPLETE, replica_list[0].status);
 }
 
+TEST_F(MasterServiceSnapshotTest, PendingLocalDeleteIntentRoundTrip) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    service_ = std::make_unique<MasterService>(config);
+    const auto context = PrepareSimpleSegment(*service_);
+
+    const std::string storage_id = "snapshot-local-disk";
+    auto mount =
+        service_->MountLocalDiskSegment(context.client_id, true, storage_id,
+                                        kLocalDiskCapabilityObjectTombstoneV1);
+    ASSERT_TRUE(mount);
+
+    ReplicateConfig replicate_config;
+    replicate_config.replica_num = 1;
+    ASSERT_TRUE(service_->PutStart(context.client_id, "delete-me",
+                                   TenantId::Default(), 1024,
+                                   replicate_config));
+    ASSERT_TRUE(service_->PutEnd(context.client_id, "delete-me",
+                                 TenantId::Default(), ReplicaType::MEMORY));
+
+    auto offload = service_->OffloadObjectHeartbeat(context.client_id, true);
+    ASSERT_TRUE(offload);
+    ASSERT_EQ(offload->size(), 1);
+    EXPECT_FALSE(offload->front().GetObjectIncarnation().IsZero());
+
+    StorageObjectMetadata storage_metadata;
+    storage_metadata.bucket_id = 7;
+    storage_metadata.data_size = 1024;
+    storage_metadata.transport_endpoint = "local-disk-endpoint";
+    storage_metadata.object_incarnation =
+        offload->front().GetObjectIncarnation();
+    ASSERT_TRUE(service_->NotifyOffloadSuccess(context.client_id, *offload,
+                                               {storage_metadata}));
+    ASSERT_TRUE(service_->Remove("delete-me", TenantId::Default(), true));
+
+    auto first_fetch = service_->FetchLocalDeleteTasks(
+        context.client_id, storage_id, mount->mount_epoch, 8);
+    ASSERT_TRUE(first_fetch);
+    ASSERT_EQ(first_fetch->size(), 1);
+    EXPECT_EQ(first_fetch->front().object_incarnation,
+              offload->front().GetObjectIncarnation());
+    auto redelivery = service_->FetchLocalDeleteTasks(
+        context.client_id, storage_id, mount->mount_epoch, 8);
+    ASSERT_TRUE(redelivery);
+    EXPECT_EQ(*redelivery, *first_fetch);
+}
+
 TEST_F(MasterServiceSnapshotTest, RandomPutStartEndFlow) {
     service_.reset(new MasterService());
     const UUID client_id = generate_uuid();

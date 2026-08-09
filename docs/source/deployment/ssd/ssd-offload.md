@@ -85,6 +85,19 @@ store.setup_dummy(
 
 > **Note:** When using `bucket_storage_backend` or `file_per_key_storage_backend`, the real client scans existing SSD metadata on startup and reports it to the master automatically. `offset_allocator_storage_backend` is the exception: it truncates its data file during initialization and does not recover previously offloaded objects after a restart.
 
+### Upgrading an existing bucket storage directory
+
+`bucket_storage_backend` stores its stable identity in
+`.mooncake_local_disk_segment_id` and takes an advisory lock on the storage
+directory. Preserve the identity marker when moving or copying the bucket
+files, and do not mount the same directory from two real-client processes.
+
+A populated directory created by an older release has no identity marker and
+is rejected by default. After verifying that the directory belongs to this
+client, adopt it once with
+`MC_STORE_ADOPT_UNMARKED_LOCAL_DISK=1`. Unset the variable after the first
+successful start; subsequent starts reuse the synchronized marker.
+
 ---
 
 ## Real Client Parameters
@@ -156,6 +169,9 @@ Applies when `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
 | `MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT` | `500` | Max keys per bucket |
 | `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` | `0` | Eviction threshold in bytes. When set to `0`, the backend uses **90% of the physical disk capacity** as the quota — it does not mean unlimited. Set an explicit value to control disk usage precisely. |
 | `MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY` | `fifo` | Eviction policy: `none` / `fifo` / `lru` |
+| `MOONCAKE_OFFLOAD_BUCKET_GC_ENABLE` | `true` | Enable the single background worker that reclaims tombstoned records |
+| `MOONCAKE_OFFLOAD_BUCKET_GC_INTERVAL_SECONDS` | `10` | Normal GC scan interval |
+| `MOONCAKE_OFFLOAD_BUCKET_GC_DELETED_RATIO` | `0.25` | Minimum deleted-byte ratio for normal GC; disk pressure bypasses this threshold |
 
 ### File-per-key backend settings
 
@@ -224,7 +240,7 @@ Eviction is two-phase: the bucket is removed from metadata and master is notifie
 
 ### Proactive watermark eviction
 
-When `MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION=true`, the FileStorage heartbeat asks the backend to check local-disk usage every `MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS` seconds. If usage exceeds `MOONCAKE_OFFLOAD_DISK_EVICTION_HIGH_WATERMARK_RATIO`, the backend evicts toward `MOONCAKE_OFFLOAD_DISK_EVICTION_LOW_WATERMARK_RATIO`.
+When `MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION=true`, the FileStorage heartbeat asks the backend to check local-disk usage every `MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS` seconds. If usage exceeds `MOONCAKE_OFFLOAD_DISK_EVICTION_HIGH_WATERMARK_RATIO`, the bucket backend first asks GC to reclaim tombstoned records toward the low watermark. Live-bucket eviction remains the fallback when GC is disabled or no reclaimable bytes remain.
 
 | Backend | Behavior |
 |---------|----------|
@@ -235,6 +251,28 @@ When `MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION=true`, the FileStorage hea
 The watermark ratios apply to each backend's quota. For `bucket_storage_backend`, the quota is `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE`; when that value is `0`, the backend defaults it to 90% of the physical disk capacity. For `file_per_key_storage_backend`, the underlying file backend uses its storage quota, which defaults to 90% of the physical disk capacity in SSD offload mode.
 
 For watermark eviction, the real client notifies the master before deleting local files. If the notification fails, the selected files remain tracked locally and are retried by a later heartbeat.
+
+### Object deletion and bucket GC
+
+For `bucket_storage_backend`, `Remove` and `BatchRemove` also schedule deletion
+for completed `LOCAL_DISK` replicas. The master stops exposing the logical
+object first. During a subsequent real-client heartbeat, the SSD holder
+persists a tombstone for the matching object incarnation and acknowledges the
+task. A delayed task for an older incarnation cannot delete a newly created
+object with the same key.
+
+Tombstoning makes the deleted object unavailable but does not immediately
+shrink its immutable bucket file. The single background GC worker reclaims that
+space by unlinking fully dead buckets or merging live records from up to eight
+partially dead buckets. Normal GC uses
+`MOONCAKE_OFFLOAD_BUCKET_GC_DELETED_RATIO`; after disk usage reaches the high
+watermark, GC bypasses that ratio and works toward the low watermark.
+
+Deletion tasks survive HA failover through the master OpLog. Interrupted local
+bucket replacement is recovered independently from `.bucket_gc_intent`. Keep
+that file with the bucket data when inspecting or recovering an SSD directory.
+See [Reliable SSD Object Deletion and Bucket Garbage Collection](../../design/ssd-object-deletion-and-gc.md)
+for protocol, crash-recovery, and validation details.
 
 ---
 

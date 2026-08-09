@@ -124,6 +124,10 @@ class FileStorage {
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<void, ErrorCode> ProcessPromotionTasks();
+    tl::expected<void, ErrorCode> ProcessLocalDeleteTasks();
+    ErrorCode ReconcileScannedObjects(
+        const std::vector<std::string>& keys,
+        std::vector<StorageObjectMetadata>& metadatas);
 
     tl::expected<bool, ErrorCode> IsEnableOffloading();
 
@@ -157,6 +161,10 @@ class FileStorage {
     std::shared_ptr<Client> client_;
     SsdMetric* ssd_metric_{nullptr};
     std::string local_rpc_addr_;
+    std::string local_disk_segment_id_;
+    uint64_t local_disk_mount_epoch_{0};
+    uint32_t local_disk_capabilities_{0};
+    int local_disk_lock_fd_{-1};
     // Pinned host memory pool for GPU D2H staging in OffloadObjects
     std::unique_ptr<PinnedBufferPool> pinned_buffer_pool_;
     std::shared_ptr<StorageBackendInterface> storage_backend_;

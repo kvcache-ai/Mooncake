@@ -136,6 +136,7 @@ design/tent/overview
 design/tent/tebench
 design/conductor/conductor-architecture-design
 design/ssd-offload
+design/ssd-object-deletion-and-gc
 design/ssd-free-ratio-first-allocation
 :::
 

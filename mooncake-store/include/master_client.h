@@ -410,8 +410,11 @@ class MasterClient {
      * @brief Mounts a local disk segment into the master.
      * @param enable_offloading If true, enables offloading (write-to-file).
      */
-    [[nodiscard]] tl::expected<void, ErrorCode> MountLocalDiskSegment(
-        const UUID& client_id, bool enable_offloading);
+    [[nodiscard]] tl::expected<LocalDiskMountInfo, ErrorCode>
+    MountLocalDiskSegment(
+        const UUID& client_id, bool enable_offloading,
+        const std::string& local_disk_segment_id = std::string(),
+        uint32_t capabilities = 0);
 
     /**
      * @brief Heartbeat call to collect object-level statistics and retrieve the
@@ -421,6 +424,21 @@ class MasterClient {
      */
     [[nodiscard]] tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
     OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading);
+
+    [[nodiscard]] tl::expected<std::vector<LocalDeleteTask>, ErrorCode>
+    FetchLocalDeleteTasks(const UUID& client_id,
+                          const std::string& local_disk_segment_id,
+                          uint64_t mount_epoch, uint32_t limit);
+
+    [[nodiscard]] tl::expected<void, ErrorCode> AckLocalDeleteTasks(
+        const UUID& client_id, const std::string& local_disk_segment_id,
+        uint64_t mount_epoch, const std::vector<LocalDeleteTaskId>& task_ids);
+
+    [[nodiscard]] tl::expected<std::vector<uint8_t>, ErrorCode>
+    ReconcileLocalDiskObjects(const UUID& client_id,
+                              const std::string& local_disk_segment_id,
+                              uint64_t mount_epoch,
+                              const std::vector<OffloadTaskItem>& objects);
 
     /**
      * @brief Poll whether master has requested a full SSD clear.

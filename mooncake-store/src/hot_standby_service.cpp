@@ -121,9 +121,47 @@ size_t HotStandbyService::StandbyMetadataStore::GetKeyCountForTenant(
     return it == store_.end() ? 0 : it->second.size();
 }
 
+bool HotStandbyService::StandbyMetadataStore::ApplyLocalDeleteTasks(
+    const std::vector<LocalDeleteTask>& tasks) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return local_delete_registry_.ApplyDurableTasks(tasks);
+}
+
+bool HotStandbyService::StandbyMetadataStore::ApplyRemoveWithLocalDeleteTasks(
+    const std::string& tenant_id, const std::string& key,
+    const std::vector<LocalDeleteTask>& tasks) {
+    const auto normalized = NormalizeTenantId(tenant_id);
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!local_delete_registry_.ApplyDurableTasks(tasks)) {
+        return false;
+    }
+    auto tenant_it = store_.find(normalized);
+    if (tenant_it != store_.end()) {
+        tenant_it->second.erase(key);
+        if (tenant_it->second.empty()) {
+            store_.erase(tenant_it);
+        }
+    }
+    return true;
+}
+
+void HotStandbyService::StandbyMetadataStore::AckLocalDeleteTasks(
+    const std::string& local_disk_segment_id,
+    const std::vector<LocalDeleteTaskId>& task_ids) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    local_delete_registry_.Erase(local_disk_segment_id, task_ids);
+}
+
+std::vector<LocalDeleteTask>
+HotStandbyService::StandbyMetadataStore::SnapshotLocalDeleteTasks() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return local_delete_registry_.Snapshot();
+}
+
 void HotStandbyService::StandbyMetadataStore::Clear() {
     std::lock_guard<std::mutex> lock(mutex_);
     store_.clear();
+    local_delete_registry_.Reset();
 }
 
 void HotStandbyService::StandbyMetadataStore::Snapshot(
@@ -136,6 +174,20 @@ void HotStandbyService::StandbyMetadataStore::Snapshot(
                                              metadata});
         }
     }
+}
+
+void HotStandbyService::StandbyMetadataStore::Snapshot(
+    std::vector<StandbyObjectEntry>& objects,
+    std::vector<LocalDeleteTask>& local_deletes) const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    objects.clear();
+    for (const auto& [tenant_id, tenant_store] : store_) {
+        for (const auto& [key, metadata] : tenant_store) {
+            objects.push_back(StandbyObjectEntry{NormalizeTenantId(tenant_id),
+                                                 key, metadata});
+        }
+    }
+    local_deletes = local_delete_registry_.Snapshot();
 }
 
 HotStandbyService::~HotStandbyService() {
@@ -326,6 +378,11 @@ ErrorCode HotStandbyService::LoadSnapshotBaselineLocked(
     for (const auto& entry : snapshot.metadata) {
         metadata_store_->PutMetadata(entry.tenant_id, entry.key,
                                      entry.metadata);
+    }
+    if (!metadata_store_->ApplyLocalDeleteTasks(
+            snapshot.pending_local_deletes)) {
+        LOG(ERROR) << "Snapshot contains too many pending LOCAL_DISK deletes";
+        return ErrorCode::DESERIALIZE_FAIL;
     }
     // Load segment registry from snapshot
     if (oplog_applier_) {
@@ -657,9 +714,12 @@ ErrorCode HotStandbyService::PromoteAndExportSnapshot(StandbySnapshot& out) {
     uint64_t latest_applied_seq_id = GetLocalLastAppliedSequenceIdLocked();
     out.oplog_sequence_id = latest_applied_seq_id;
     if (metadata_store_) {
-        metadata_store_->Snapshot(out.objects);
+        std::vector<LocalDeleteTask> local_deletes;
+        metadata_store_->Snapshot(out.objects, local_deletes);
+        out.pending_local_deletes = std::move(local_deletes);
     } else {
         out.objects.clear();
+        out.pending_local_deletes = std::vector<LocalDeleteTask>{};
     }
     if (oplog_applier_) {
         out.segments = oplog_applier_->GetSegmentRegistry().GetAllSegments();
@@ -722,9 +782,12 @@ bool HotStandbyService::ExportStandbySnapshot(StandbySnapshot& out) const {
 
     // Export object metadata
     if (metadata_store_) {
-        metadata_store_->Snapshot(out.objects);
+        std::vector<LocalDeleteTask> local_deletes;
+        metadata_store_->Snapshot(out.objects, local_deletes);
+        out.pending_local_deletes = std::move(local_deletes);
     } else {
         out.objects.clear();
+        out.pending_local_deletes = std::vector<LocalDeleteTask>{};
     }
 
     // Export segments from OpLogApplier's registry (Patch B)

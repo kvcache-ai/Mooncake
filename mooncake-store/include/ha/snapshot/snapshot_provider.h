@@ -16,6 +16,7 @@ struct LoadedSnapshot {
     uint64_t snapshot_sequence_id{0};
     std::vector<StandbyObjectEntry> metadata;
     std::vector<StandbySegmentInfo> segments;
+    std::vector<LocalDeleteTask> pending_local_deletes;
 };
 
 /**

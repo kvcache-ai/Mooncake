@@ -15,6 +15,7 @@
 
 #include "metadata_store.h"
 #include "ha/oplog/oplog_applier.h"
+#include "local_delete.h"
 #include "ha/oplog/oplog_types.h"
 #include "ha/snapshot/snapshot_provider.h"
 #include "standby_state_machine.h"
@@ -242,16 +243,28 @@ class HotStandbyService {
         size_t GetKeyCountForTenant(
             const std::string& tenant_id) const override;
         size_t GetKeyCount() const override;
+        bool ApplyLocalDeleteTasks(
+            const std::vector<LocalDeleteTask>& tasks) override;
+        bool ApplyRemoveWithLocalDeleteTasks(
+            const std::string& tenant_id, const std::string& key,
+            const std::vector<LocalDeleteTask>& tasks) override;
+        void AckLocalDeleteTasks(
+            const std::string& local_disk_segment_id,
+            const std::vector<LocalDeleteTaskId>& task_ids) override;
+        std::vector<LocalDeleteTask> SnapshotLocalDeleteTasks() const override;
         void Clear();
 
         // Snapshot for promotion/restore.
         void Snapshot(std::vector<StandbyObjectEntry>& out) const;
+        void Snapshot(std::vector<StandbyObjectEntry>& objects,
+                      std::vector<LocalDeleteTask>& local_deletes) const;
 
        private:
         mutable std::mutex mutex_;
         std::unordered_map<
             std::string, std::unordered_map<std::string, StandbyObjectMetadata>>
             store_;
+        LocalDeleteRegistry local_delete_registry_;
     };
     std::unique_ptr<StandbyMetadataStore> metadata_store_;
     std::unique_ptr<SnapshotProvider> snapshot_provider_{

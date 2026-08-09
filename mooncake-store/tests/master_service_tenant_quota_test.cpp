@@ -533,6 +533,28 @@ TEST_F(MasterServiceTenantQuotaTest,
 }
 
 TEST_F(MasterServiceTenantQuotaTest,
+       AddReplicaTreatsStableStorageIdentityAsExisting) {
+    MasterService service(MakeConfig({{TenantId("tenant-a"), 1000}}));
+    const UUID client_a = generate_uuid();
+    const UUID client_b = generate_uuid();
+
+    Replica first(client_a, 128, "disk-endpoint-a", ReplicaStatus::COMPLETE,
+                  "disk-a", 1);
+    auto first_result =
+        service.AddReplica(client_a, "cold", TenantId("tenant-a"), first);
+    ASSERT_TRUE(first_result.has_value()) << toString(first_result.error());
+    EXPECT_TRUE(first_result.value());
+
+    Replica replacement(client_b, 128, "disk-endpoint-b",
+                        ReplicaStatus::COMPLETE, "disk-a", 2);
+    auto replacement_result =
+        service.AddReplica(client_b, "cold", TenantId("tenant-a"), replacement);
+    ASSERT_TRUE(replacement_result.has_value())
+        << toString(replacement_result.error());
+    EXPECT_FALSE(replacement_result.value());
+}
+
+TEST_F(MasterServiceTenantQuotaTest,
        RegisteredTenantQuotaAdmissionDoesNotCreateImplicitTenants) {
     MasterService service(MakeConfig({{TenantId("tenant-a"), 100}}));
     UUID client_id = MountSegment(service);
