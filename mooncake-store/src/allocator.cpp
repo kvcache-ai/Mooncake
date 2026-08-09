@@ -392,6 +392,13 @@ size_t OffsetBufferAllocator::getLargestFreeRegion() const {
     }
 }
 
+size_t OffsetBufferAllocator::getLargestFreeRegionHint() const {
+    if (!offset_allocator_) {
+        return 0;
+    }
+    return offset_allocator_->getLargestFreeRegion();
+}
+
 std::optional<RestoredOffsetBufferAllocator> RestoreOffsetBufferAllocator(
     std::string segment_name, size_t base, size_t size,
     std::string transport_endpoint,

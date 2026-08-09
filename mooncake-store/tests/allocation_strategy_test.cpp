@@ -40,6 +40,56 @@ class AllocationStrategyTest : public ::testing::Test {
     std::unique_ptr<RandomAllocationStrategy> strategy_;
 };
 
+class ScopedRandomSeed {
+   public:
+    explicit ScopedRandomSeed(uint64_t seed)
+        : saved_engine_(threadLocalRandomEngine()) {
+        threadLocalRandomEngine().seed(seed);
+    }
+
+    ~ScopedRandomSeed() { threadLocalRandomEngine() = saved_engine_; }
+
+   private:
+    RandomEngine saved_engine_;
+};
+
+class HintTestAllocator final
+    : public BufferAllocatorBase,
+      public std::enable_shared_from_this<HintTestAllocator> {
+   public:
+    HintTestAllocator(std::string name, size_t hint, bool succeeds)
+        : name_(std::move(name)), hint_(hint), succeeds_(succeeds) {}
+
+    std::unique_ptr<AllocatedBuffer> allocate(size_t size) override {
+        ++allocation_calls_;
+        if (!succeeds_) {
+            return nullptr;
+        }
+        return std::make_unique<AllocatedBuffer>(
+            shared_from_this(), reinterpret_cast<void*>(0x1000), size);
+    }
+
+    void deallocate(AllocatedBuffer*) override {}
+    size_t capacity() const override { return MiB; }
+    size_t size() const override { return 0; }
+    std::string getSegmentName() const override { return name_; }
+    std::string getTransportEndpoint() const override { return name_; }
+    size_t getLargestFreeRegion() const override { return hint_; }
+    size_t getLargestFreeRegionHint() const override {
+        ++hint_queries_;
+        return hint_;
+    }
+    size_t allocationCalls() const { return allocation_calls_; }
+    size_t hintQueries() const { return hint_queries_; }
+
+   private:
+    std::string name_;
+    size_t hint_;
+    bool succeeds_;
+    size_t allocation_calls_{0};
+    mutable size_t hint_queries_{0};
+};
+
 // Parameterized test class for strategy and allocator type variations
 class AllocationStrategyParameterizedTest
     : public ::testing::TestWithParam<
@@ -711,6 +761,247 @@ TEST_F(AllocationStrategyTest, PerformanceComparison) {
               << (static_cast<double>(random_elapsed_us.count()) /
                   frf_elapsed_us.count())
               << "x\n\n";
+}
+
+TEST_F(AllocationStrategyTest,
+       FreeRatioFirstPreservesFallbackBudgetForKnownNoFitSegments) {
+    constexpr size_t kSegmentCount = 256;
+    constexpr size_t kRequestSize = 4096;
+    constexpr uint64_t kSeed = 0xCCF2026;
+
+    RandomEngine predictor(kSeed);
+    const size_t sample_start = randomIndex(kSegmentCount, predictor);
+    const size_t fallback_start = randomIndex(kSegmentCount, predictor);
+    const auto is_sampled = [&](size_t index) {
+        const size_t offset = index >= sample_start
+                                  ? index - sample_start
+                                  : kSegmentCount - sample_start + index;
+        return offset < 6;
+    };
+
+    size_t fit_offset = 150;
+    while (fit_offset < 200 &&
+           is_sampled((fallback_start + fit_offset) % kSegmentCount)) {
+        ++fit_offset;
+    }
+    ASSERT_LT(fit_offset, 200);
+    const size_t fit_index = (fallback_start + fit_offset) % kSegmentCount;
+
+    AllocatorManager allocator_manager;
+    std::vector<std::shared_ptr<HintTestAllocator>> allocators;
+    allocators.reserve(kSegmentCount);
+    for (size_t i = 0; i < kSegmentCount; ++i) {
+        const std::string name = "fit-budget-segment-" + std::to_string(i);
+        const bool can_fit = i == fit_index;
+        auto allocator = std::make_shared<HintTestAllocator>(
+            name, can_fit ? kRequestSize : 0, can_fit);
+        allocator_manager.addAllocator(name, allocator);
+        allocators.push_back(std::move(allocator));
+    }
+
+    ScopedRandomSeed seed(kSeed);
+    FreeRatioFirstAllocationStrategy strategy;
+    auto result = strategy.Allocate(allocator_manager, kRequestSize);
+
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->size(), 1);
+    EXPECT_EQ(allocators[fit_index]->allocationCalls(), 1);
+    const size_t total_calls =
+        std::accumulate(allocators.begin(), allocators.end(), size_t{0},
+                        [](size_t total, const auto& allocator) {
+                            return total + allocator->allocationCalls();
+                        });
+    EXPECT_EQ(total_calls, 7);
+}
+
+TEST_F(AllocationStrategyTest,
+       FreeRatioFirstUnknownHintsFailOpenWithinOriginalAttemptLimit) {
+    constexpr size_t kSegmentCount = 256;
+    constexpr size_t kRequestSize = 4096;
+    constexpr uint64_t kSeed = 0xFA11BAC;
+
+    RandomEngine predictor(kSeed);
+    const size_t sample_start = randomIndex(kSegmentCount, predictor);
+    const size_t fallback_start = randomIndex(kSegmentCount, predictor);
+    const auto is_sampled = [&](size_t index) {
+        const size_t offset = index >= sample_start
+                                  ? index - sample_start
+                                  : kSegmentCount - sample_start + index;
+        return offset < 6;
+    };
+
+    size_t fit_offset = 150;
+    while (fit_offset < 200 &&
+           is_sampled((fallback_start + fit_offset) % kSegmentCount)) {
+        ++fit_offset;
+    }
+    ASSERT_LT(fit_offset, 200);
+    const size_t fit_index = (fallback_start + fit_offset) % kSegmentCount;
+
+    AllocatorManager allocator_manager;
+    std::vector<std::shared_ptr<HintTestAllocator>> allocators;
+    allocators.reserve(kSegmentCount);
+    for (size_t i = 0; i < kSegmentCount; ++i) {
+        const std::string name = "unknown-hint-segment-" + std::to_string(i);
+        const bool can_fit = i == fit_index;
+        auto allocator = std::make_shared<HintTestAllocator>(
+            name, can_fit ? kRequestSize : kAllocatorUnknownFreeSpace, can_fit);
+        allocator_manager.addAllocator(name, allocator);
+        allocators.push_back(std::move(allocator));
+    }
+
+    ScopedRandomSeed seed(kSeed);
+    FreeRatioFirstAllocationStrategy strategy;
+    auto result = strategy.Allocate(allocator_manager, kRequestSize);
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_EQ(allocators[fit_index]->allocationCalls(), 0);
+    const size_t total_calls =
+        std::accumulate(allocators.begin(), allocators.end(), size_t{0},
+                        [](size_t total, const auto& allocator) {
+                            return total + allocator->allocationCalls();
+                        });
+    EXPECT_EQ(total_calls, 106);
+}
+
+TEST_F(AllocationStrategyTest,
+       FreeRatioFirstAvoidsHintOverheadWhenRetryBudgetCoversAllSegments) {
+    constexpr size_t kSegmentCount = 64;
+    constexpr size_t kRequestSize = 4096;
+
+    AllocatorManager allocator_manager;
+    std::vector<std::shared_ptr<HintTestAllocator>> allocators;
+    allocators.reserve(kSegmentCount);
+    for (size_t i = 0; i < kSegmentCount; ++i) {
+        const std::string name = "small-cluster-segment-" + std::to_string(i);
+        auto allocator = std::make_shared<HintTestAllocator>(name, 0, false);
+        allocator_manager.addAllocator(name, allocator);
+        allocators.push_back(std::move(allocator));
+    }
+
+    ScopedRandomSeed seed(0x5A11C1A5);
+    FreeRatioFirstAllocationStrategy strategy;
+    auto result = strategy.Allocate(allocator_manager, kRequestSize);
+
+    ASSERT_FALSE(result.has_value());
+    const size_t total_hint_queries =
+        std::accumulate(allocators.begin(), allocators.end(), size_t{0},
+                        [](size_t total, const auto& allocator) {
+                            return total + allocator->hintQueries();
+                        });
+    EXPECT_EQ(total_hint_queries, 0);
+}
+
+TEST_F(AllocationStrategyTest,
+       FreeRatioFirstDoesNotRefundBudgetForExcludedSegments) {
+    constexpr size_t kSegmentCount = 256;
+    constexpr size_t kRequestSize = 4096;
+    constexpr uint64_t kSeed = 0xE7C1DDED;
+
+    RandomEngine predictor(kSeed);
+    const size_t sample_start = randomIndex(kSegmentCount, predictor);
+    const size_t fallback_start = randomIndex(kSegmentCount, predictor);
+    const auto is_sampled = [&](size_t index) {
+        const size_t offset = index >= sample_start
+                                  ? index - sample_start
+                                  : kSegmentCount - sample_start + index;
+        return offset < 6;
+    };
+
+    size_t fit_offset = 150;
+    while (fit_offset < 200 &&
+           is_sampled((fallback_start + fit_offset) % kSegmentCount)) {
+        ++fit_offset;
+    }
+    ASSERT_LT(fit_offset, 200);
+    const size_t fit_index = (fallback_start + fit_offset) % kSegmentCount;
+
+    AllocatorManager allocator_manager;
+    std::vector<std::shared_ptr<HintTestAllocator>> allocators;
+    allocators.reserve(kSegmentCount);
+    std::set<std::string> excluded_segments;
+    for (size_t i = 0; i < kSegmentCount; ++i) {
+        const std::string name = "excluded-budget-segment-" + std::to_string(i);
+        const bool can_fit = i == fit_index;
+        auto allocator = std::make_shared<HintTestAllocator>(
+            name, can_fit ? kRequestSize : 0, can_fit);
+        allocator_manager.addAllocator(name, allocator);
+        allocators.push_back(std::move(allocator));
+    }
+    for (size_t offset = 0; offset < 100; ++offset) {
+        excluded_segments.insert(
+            "excluded-budget-segment-" +
+            std::to_string((fallback_start + offset) % kSegmentCount));
+    }
+
+    ScopedRandomSeed seed(kSeed);
+    FreeRatioFirstAllocationStrategy strategy;
+    auto result = strategy.Allocate(allocator_manager, kRequestSize, 1, {},
+                                    excluded_segments);
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_EQ(allocators[fit_index]->allocationCalls(), 0);
+}
+
+TEST_F(AllocationStrategyTest,
+       FreeRatioFirstUsesRealOffsetHintsBeyondLegacyFallbackBudget) {
+    constexpr size_t kSegmentCount = 256;
+    constexpr size_t kRequestSize = 128 * 1024;
+    constexpr uint64_t kSeed = 0x0FF5E7;
+
+    RandomEngine predictor(kSeed);
+    const size_t sample_start = randomIndex(kSegmentCount, predictor);
+    const size_t fallback_start = randomIndex(kSegmentCount, predictor);
+    const auto is_sampled = [&](size_t index) {
+        const size_t offset = index >= sample_start
+                                  ? index - sample_start
+                                  : kSegmentCount - sample_start + index;
+        return offset < 6;
+    };
+
+    size_t fit_offset = 150;
+    while (fit_offset < 200 &&
+           is_sampled((fallback_start + fit_offset) % kSegmentCount)) {
+        ++fit_offset;
+    }
+    ASSERT_LT(fit_offset, 200);
+    const size_t fit_index = (fallback_start + fit_offset) % kSegmentCount;
+
+    AllocatorManager allocator_manager;
+    std::vector<std::shared_ptr<OffsetBufferAllocator>> allocators;
+    std::vector<std::unique_ptr<AllocatedBuffer>> held_buffers;
+    allocators.reserve(kSegmentCount);
+    held_buffers.reserve(kSegmentCount - 1);
+    for (size_t i = 0; i < kSegmentCount; ++i) {
+        const std::string name = "real-hint-segment-" + std::to_string(i);
+        const uintptr_t base =
+            0x300000000ULL + static_cast<uintptr_t>(i) * kRequestSize;
+        auto allocator = std::make_shared<OffsetBufferAllocator>(
+            name, base, kRequestSize, name);
+        if (i != fit_index) {
+            auto held = allocator->allocate(kRequestSize);
+            ASSERT_NE(held, nullptr);
+            ASSERT_EQ(allocator->allocate(kRequestSize), nullptr);
+            ASSERT_LT(allocator->getLargestFreeRegionHint(), kRequestSize);
+            held_buffers.push_back(std::move(held));
+        }
+        allocator_manager.addAllocator(name, allocator);
+        allocators.push_back(std::move(allocator));
+    }
+
+    ScopedRandomSeed seed(kSeed);
+    FreeRatioFirstAllocationStrategy strategy;
+    auto result = strategy.Allocate(allocator_manager, kRequestSize);
+
+    ASSERT_TRUE(result.has_value());
+    ASSERT_EQ(result->size(), 1);
+    const auto segment_names = result->front().get_segment_names();
+    ASSERT_EQ(segment_names.size(), 1);
+    ASSERT_TRUE(segment_names.front().has_value());
+    EXPECT_EQ(segment_names.front().value(),
+              "real-hint-segment-" + std::to_string(fit_index));
 }
 
 TEST_F(AllocationStrategyTest, PerformanceTest) {

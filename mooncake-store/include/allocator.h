@@ -128,6 +128,16 @@ class BufferAllocatorBase {
      * allocation may still fail due to race conditions or fragmentation.
      */
     virtual size_t getLargestFreeRegion() const = 0;
+
+    /**
+     * Returns a conservative upper-bound hint for the largest allocatable
+     * region without requiring an exact allocator scan. A value smaller than
+     * the request proves that allocation cannot succeed; larger values are
+     * inconclusive. Allocators without a safe hint return unknown.
+     */
+    virtual size_t getLargestFreeRegionHint() const {
+        return kAllocatorUnknownFreeSpace;
+    }
 };
 
 /**
@@ -282,6 +292,11 @@ class OffsetBufferAllocator
      * Returns the actual largest free region from the offset allocator.
      */
     size_t getLargestFreeRegion() const override;
+
+    /**
+     * Returns OffsetAllocator's mutex-free conservative upper-bound hint.
+     */
+    size_t getLargestFreeRegionHint() const override;
 
     // Public method to get offset_allocator
     std::shared_ptr<offset_allocator::OffsetAllocator> getOffsetAllocator()

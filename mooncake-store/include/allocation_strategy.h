@@ -442,6 +442,7 @@ class FreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
         std::vector<Replica> replicas;
         replicas.reserve(replica_num);
         std::set<std::string> used_segments;
+        bool allocation_failed = false;
 
         // --- Handle preferred segments first (same as Random) ---
         for (const auto& preferred_segment : preferred_segments) {
@@ -459,6 +460,8 @@ class FreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
                 if (replicas.size() == replica_num) {
                     return replicas;
                 }
+            } else {
+                allocation_failed = true;
             }
         }
 
@@ -510,6 +513,8 @@ class FreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
                 replicas.emplace_back(std::move(buffer),
                                       ReplicaStatus::PROCESSING, replica_type);
                 used_segments.insert(name);
+            } else {
+                allocation_failed = true;
             }
         }
 
@@ -520,25 +525,44 @@ class FreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
         // --- Fallback: Random allocation for any remaining replicas ---
         size_t fallback_idx = randomIndex(names.size());
         const size_t max_retry = std::min(kMaxRetryLimit, names.size());
-        size_t try_count = 0;
+        const size_t max_scan = std::min(kMaxFallbackScanLimit, names.size());
+        const bool retry_budget_truncates_search = max_retry < names.size();
+        size_t scan_count = 0;
+        size_t retry_budget_used = 0;
 
-        while (replicas.size() < replica_num && try_count < max_retry) {
+        while (replicas.size() < replica_num && scan_count < max_scan &&
+               retry_budget_used < max_retry) {
             auto index = fallback_idx % names.size();
             fallback_idx++;
-            try_count++;
+            scan_count++;
 
-            // Skip excluded and used segments
+            // Preserve the legacy position budget for excluded and used
+            // segments. Only a proven no-fit hint earns an extra scan.
             if (excluded_segments.contains(names[index]) ||
                 used_segments.contains(names[index])) {
+                retry_budget_used++;
                 continue;
             }
 
+            // Once this request has observed a real allocation failure, do
+            // not spend the bounded fallback retry budget on a segment
+            // whose conservative hints prove that no allocator can fit it.
+            // Unknown or stale-high hints fail open to the allocator.
+            if (retry_budget_truncates_search && allocation_failed &&
+                segmentDefinitelyCannotFit(allocator_manager, names[index],
+                                           slice_length)) {
+                continue;
+            }
+
+            retry_budget_used++;
             auto buffer =
                 allocateSingle(allocator_manager, names[index], slice_length);
             if (buffer) {
                 replicas.emplace_back(std::move(buffer),
                                       ReplicaStatus::PROCESSING, replica_type);
                 used_segments.insert(names[index]);
+            } else {
+                allocation_failed = true;
             }
         }
 
@@ -550,7 +574,30 @@ class FreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
 
    private:
     static constexpr size_t kMaxRetryLimit = 100;
+    static constexpr size_t kMaxFallbackScanLimit = 2 * kMaxRetryLimit;
     static constexpr size_t kCandidateMultiplier = 6;
+
+    bool segmentDefinitelyCannotFit(const AllocatorManager& allocator_manager,
+                                    const std::string& name,
+                                    size_t slice_length) const {
+        const auto* allocators = allocator_manager.getAllocators(name);
+        if (allocators == nullptr || allocators->empty()) {
+            return false;
+        }
+
+        bool saw_allocator = false;
+        for (const auto& allocator : *allocators) {
+            if (!allocator) {
+                continue;
+            }
+            saw_allocator = true;
+            const size_t hint = allocator->getLargestFreeRegionHint();
+            if (hint == kAllocatorUnknownFreeSpace || hint >= slice_length) {
+                return false;
+            }
+        }
+        return saw_allocator;
+    }
 
     double getSegmentFreeRatio(const AllocatorManager& allocator_manager,
                                const std::string& name) {
