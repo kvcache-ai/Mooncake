@@ -26,6 +26,8 @@ class WrappedMasterService {
 
     void init_http_server();
 
+    uint16_t GetHttpPort() const { return http_server_.port(); }
+
     tl::expected<bool, ErrorCode> ExistKey(std::string_view key);
 
     tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>

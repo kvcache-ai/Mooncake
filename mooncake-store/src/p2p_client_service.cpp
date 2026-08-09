@@ -4,6 +4,7 @@
 
 #include <csignal>
 #include <algorithm>
+#include <charconv>
 #include <limits>
 #include <coroutine>
 #include <cstring>
@@ -2334,6 +2335,55 @@ tl::expected<void, ErrorCode> P2PClientService::RemoveLocal(
     return {};
 }
 
+tl::expected<size_t, ErrorCode> P2PClientService::GetLocalKeyCount() {
+    auto guard = AcquireInflightGuard();
+    if (!guard.is_valid()) {
+        LOG(ERROR) << "client is shutting down";
+        return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
+    }
+    if (!data_manager_.has_value()) {
+        LOG(ERROR) << "data_manager_ is not initialized";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    size_t count = 0;
+    data_manager_->ForEachKeyBatch(
+        [&count](std::vector<ReplicaLocation>&& batch) {
+            count += batch.size();
+            return true;
+        });
+    return count;
+}
+
+tl::expected<std::vector<std::string>, ErrorCode>
+P2PClientService::GetLocalKeys(size_t limit) {
+    auto guard = AcquireInflightGuard();
+    if (!guard.is_valid()) {
+        LOG(ERROR) << "client is shutting down";
+        return tl::make_unexpected(ErrorCode::SHUTTING_DOWN);
+    }
+    if (!data_manager_.has_value()) {
+        LOG(ERROR) << "data_manager_ is not initialized";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    std::vector<std::string> keys;
+    data_manager_->ForEachKeyBatch(
+        [&keys, limit](std::vector<ReplicaLocation>&& batch) {
+            // limit <= 0 means no limit
+            const bool need_limit = limit > 0;
+            keys.reserve(keys.size() + batch.size());
+            for (auto& loc : batch) {
+                keys.push_back(std::move(loc.key));
+                if (need_limit && keys.size() >= limit) {
+                    return false;  // no need to continue
+                }
+            }
+            return true;
+        });
+    return keys;
+}
+
 // ============================================================================
 // MountSegment / UnmountSegment (Not Supported)
 // ============================================================================
@@ -2624,6 +2674,64 @@ void P2PClientService::RegisterHttpMethods() {
             }
             resp.set_status_and_content(status_type::ok,
                                         std::to_string(result.value()));
+        });
+
+    // Number of keys stored in the local data plane.
+    // curl "localhost:9003/get_key_count"
+    http_server_->set_http_handler<GET>(
+        "/get_key_count",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            auto result = GetLocalKeyCount();
+            if (!result) {
+                resp.set_status_and_content(
+                    ErrorToHttpStatus(result.error()),
+                    std::string(toString(result.error())));
+                return;
+            }
+            resp.add_header("Content-Type", "text/plain; version=0.0.4");
+            resp.set_status_and_content(status_type::ok,
+                                        std::to_string(result.value()));
+        });
+
+    // Local keys, newline-separated in metadata iteration order. A key with
+    // replicas on multiple tiers appears once per replica.
+    // Optional ?limit=N truncates the response to the first N entries.
+    // curl "localhost:9003/get_all_keys"
+    // curl "localhost:9003/get_all_keys?limit=100"
+    http_server_->set_http_handler<GET>(
+        "/get_all_keys",
+        [this](coro_http_request& req, coro_http_response& resp) {
+            size_t limit = 0;  // 0 means no limit
+            auto limit_view = req.get_query_value("limit");
+            if (!limit_view.empty()) {
+                auto [ptr, ec] = std::from_chars(
+                    limit_view.data(), limit_view.data() + limit_view.size(),
+                    limit);
+                if (ec != std::errc() ||
+                    ptr != limit_view.data() + limit_view.size() ||
+                    limit <= 0) {
+                    resp.set_status_and_content(
+                        status_type::bad_request,
+                        "limit must be a positive integer");
+                    return;
+                }
+            }
+
+            auto result = GetLocalKeys(limit);
+            if (!result) {
+                resp.set_status_and_content(
+                    ErrorToHttpStatus(result.error()),
+                    std::string(toString(result.error())));
+                return;
+            }
+            auto keys = std::move(result.value());
+            std::string body;
+            for (const auto& key : keys) {
+                body += key;
+                body += "\n";
+            }
+            resp.add_header("Content-Type", "text/plain; version=0.0.4");
+            resp.set_status_and_content(status_type::ok, std::move(body));
         });
 
     // Re-register with the master (e.g. after a prior /unregister), restoring
