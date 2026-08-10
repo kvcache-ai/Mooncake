@@ -86,6 +86,7 @@ class MasterServiceHATest;
 // invalidate a segment allocator via PrepareUnmountSegment WITHOUT the
 // ClearInvalidHandles sweep that MasterService::UnmountSegment performs.
 class MasterServiceProcessingKeyDoubleEraseTest;
+class MasterServiceTestPeer;
 }  // namespace test
 namespace benchmarks {
 class BatchEvictBench;
@@ -118,6 +119,7 @@ class MasterService {
     friend class test::BatchEvictTest;
     // double-erase processing_keys UAF repro (2026-08-03 prod segfault)
     friend class test::MasterServiceProcessingKeyDoubleEraseTest;
+    friend class test::MasterServiceTestPeer;
     friend class MasterSnapshotManager;    // Allow access to internal state for
                                            // snapshot
     friend class ha::MasterSnapshotCodec;  // Allow codec to access private
