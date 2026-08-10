@@ -43,10 +43,11 @@ fn recover_extent_store_segments(
     let max_recovered_segment_id = segment_ids.iter().copied().max().unwrap_or(0);
     for segment_id in segment_ids.iter().copied() {
         let mut segment = open_segment(root, segment_id, segment_size)?;
+        let scan_len = segment.allocated_len;
         let live_bytes = recover_extent_store_segment_live_bytes(
             &segment.file,
             segment_id,
-            segment_size,
+            scan_len,
             &mut segment.packed_blocks,
         )?;
         if live_bytes == 0 {
@@ -61,7 +62,9 @@ fn recover_extent_store_segments(
     recover_extent_store_delete_journal(root, &mut inner)?;
     remove_fully_dead_sealed_segments(&mut inner, max_recovered_segment_id)?;
     if inner.active_offset >= inner.segment_size {
-        inner.active_segment_id = inner.active_segment_id.saturating_add(1).max(1);
+        inner.active_segment_id = inner.active_segment_id.checked_add(1).ok_or_else(|| {
+            StoreError::InvalidState("extent store segment id overflow during recovery".to_string())
+        })?;
         inner.active_offset = 0;
     }
     if !inner.segments.contains_key(&inner.active_segment_id) {
@@ -981,7 +984,7 @@ fn extent_store_pinned_error_allows_owned_fallback(error: &StoreError) -> bool {
 fn open_segment(
     root: &ExtentStorePath,
     segment_id: u64,
-    segment_size: u64,
+    _segment_size: u64,
 ) -> Result<ExtentStoreSegment> {
     let path = root.join("segments").join(format!("{segment_id:016x}.seg"));
     let file = OpenOptions::new()
@@ -997,12 +1000,21 @@ fn open_segment(
                 path.display()
             ))
         })?;
-    preallocate_segment(&file, &path, segment_size)?;
+    let allocated_len = file
+        .metadata()
+        .map_err(|error| {
+            StoreError::Transport(format!(
+                "failed to stat extent store segment {}: {error}",
+                path.display()
+            ))
+        })?
+        .len();
     let direct_file = open_direct_segment(&path)?;
     Ok(ExtentStoreSegment {
         file: Arc::new(file),
         direct_file: direct_file.map(Arc::new),
         path,
+        allocated_len,
         live_bytes: 0,
         dead_bytes: 0,
         deleted_extents: BTreeSet::new(),
@@ -1010,21 +1022,69 @@ fn open_segment(
     })
 }
 
-fn preallocate_segment(
-    file: &ExtentStoreFile,
-    path: &ExtentStorePath,
+fn ensure_segment_allocated(
+    segment: &mut ExtentStoreSegment,
+    required_len: u64,
     segment_size: u64,
+    preallocate: bool,
 ) -> Result<()> {
-    if !segment_preallocate_enabled() {
+    if required_len <= segment.allocated_len {
         return Ok(());
     }
-    let result = unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, segment_size as libc::off_t) };
+    let target_len = round_up_extent_store_allocation(required_len, segment_size)?;
+    extent_store_off_t(target_len, &segment.path)?;
+    if !preallocate {
+        segment.allocated_len = target_len;
+        return Ok(());
+    }
+    preallocate_segment_range(
+        &segment.file,
+        &segment.path,
+        segment.allocated_len,
+        target_len,
+    )?;
+    segment.allocated_len = target_len;
+    Ok(())
+}
+
+fn extent_store_expansion_chunk(segment_size: u64) -> u64 {
+    segment_size
+        .max(EXTENT_STORE_ALIGNMENT)
+        .min(DEFAULT_EXTENT_STORE_EXPANSION_CHUNK_BYTES)
+}
+
+fn round_up_extent_store_allocation(required_len: u64, segment_size: u64) -> Result<u64> {
+    if required_len == 0 {
+        return Ok(0);
+    }
+    let chunk = extent_store_expansion_chunk(segment_size);
+    let chunks = required_len
+        .checked_add(chunk.saturating_sub(1))
+        .ok_or_else(|| StoreError::InvalidState("extent store allocation overflow".to_string()))?
+        / chunk;
+    chunks
+        .checked_mul(chunk)
+        .ok_or_else(|| StoreError::InvalidState("extent store allocation overflow".to_string()))
+}
+
+fn preallocate_segment_range(
+    file: &ExtentStoreFile,
+    path: &ExtentStorePath,
+    current_len: u64,
+    target_len: u64,
+) -> Result<()> {
+    if target_len <= current_len {
+        return Ok(());
+    }
+    let offset = extent_store_off_t(current_len, path)?;
+    let len = extent_store_off_t(target_len - current_len, path)?;
+    let result = unsafe { libc::fallocate(file.as_raw_fd(), 0, offset, len) };
     if result == 0 {
         return Ok(());
     }
     let error = io::Error::last_os_error();
     if preallocation_unavailable(&error) {
-        file.set_len(segment_size).map_err(|error| {
+        file.set_len(target_len).map_err(|error| {
             StoreError::Transport(format!(
                 "failed to size extent store segment {}: {error}",
                 path.display()
@@ -1036,6 +1096,16 @@ fn preallocate_segment(
         "failed to preallocate extent store segment {}: {error}",
         path.display()
     )))
+}
+
+fn extent_store_off_t(value: u64, path: &ExtentStorePath) -> Result<libc::off_t> {
+    if value > i64::MAX as u64 {
+        return Err(StoreError::InvalidState(format!(
+            "extent store segment {} offset {value} exceeds off_t",
+            path.display()
+        )));
+    }
+    Ok(value as libc::off_t)
 }
 
 fn preallocation_unavailable(error: &io::Error) -> bool {

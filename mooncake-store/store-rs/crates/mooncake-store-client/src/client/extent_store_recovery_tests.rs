@@ -20,6 +20,73 @@
     }
 
     #[test]
+    fn extent_store_recovers_record_larger_than_segment_size() {
+        let root = test_extent_store_root("expanded-segment-restart");
+        let segment_size = EXTENT_STORE_ALIGNMENT * 2;
+        let payload = vec![9u8; segment_size as usize];
+        let locator = {
+            let engine = ExtentStoreEngine::new_with_segment_size(root.path(), segment_size)
+                .expect("extent store should start");
+            engine
+                .put("logical/expanded-segment", &payload)
+                .expect("large extent store write should succeed")
+        };
+        let decoded = ExtentStoreLocator::decode(&locator).expect("locator should decode");
+        assert!(decoded.record_len > segment_size);
+        let segment_path = root
+            .path()
+            .join("segments")
+            .join(format!("{:016x}.seg", decoded.segment_id));
+        assert!(
+            std::fs::metadata(&segment_path)
+                .expect("expanded segment file should exist")
+                .len()
+                > segment_size
+        );
+
+        let engine = ExtentStoreEngine::new_with_segment_size(root.path(), segment_size)
+            .expect("extent store should recover expanded segment");
+        let recovered = engine
+            .get(&locator, payload.len() as u64)
+            .expect("expanded extent store read should succeed")
+            .expect("expanded extent store object should exist");
+        assert_eq!(recovered, payload);
+    }
+
+    #[test]
+    fn extent_store_recovers_legacy_preallocated_segment_tail() {
+        let root = test_extent_store_root("legacy-preallocated-restart");
+        let segment_size = EXTENT_STORE_ALIGNMENT * 16;
+        let payload = b"legacy-preallocated".to_vec();
+        let locator = {
+            let engine = ExtentStoreEngine::new_with_segment_size(root.path(), segment_size)
+                .expect("extent store should start");
+            engine
+                .put("logical/legacy-preallocated", &payload)
+                .expect("extent store write should succeed")
+        };
+        let decoded = ExtentStoreLocator::decode(&locator).expect("locator should decode");
+        let segment_path = root
+            .path()
+            .join("segments")
+            .join(format!("{:016x}.seg", decoded.segment_id));
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&segment_path)
+            .expect("segment should open for legacy sizing")
+            .set_len(segment_size)
+            .expect("segment should mimic legacy full preallocation");
+
+        let engine = ExtentStoreEngine::new_with_segment_size(root.path(), segment_size)
+            .expect("extent store should recover legacy preallocated segment");
+        let recovered = engine
+            .get(&locator, payload.len() as u64)
+            .expect("legacy preallocated extent store read should succeed")
+            .expect("legacy preallocated extent store object should exist");
+        assert_eq!(recovered, payload);
+    }
+
+    #[test]
     fn extent_store_persists_delete_across_restart() {
         let root = test_extent_store_root("delete-restart");
         let payload = b"delete-me".to_vec();
