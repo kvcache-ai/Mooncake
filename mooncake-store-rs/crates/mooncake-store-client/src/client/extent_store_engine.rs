@@ -1351,6 +1351,7 @@ impl ExtentStoreEngine {
 
         let reserve_started = std::time::Instant::now();
         let mut reserved = Vec::with_capacity(writes.len());
+        let mut dead_non_active_segments = Vec::new();
         {
             let mut inner = self.inner.lock();
             for packed in packed_records {
@@ -1370,6 +1371,7 @@ impl ExtentStoreEngine {
                     counters: &self.io_counters,
                     results: &mut results,
                     reserved: &mut reserved,
+                    dead_non_active_segments: &mut dead_non_active_segments,
                     record_stage,
                 };
                 reserve_encoded_extent_store_record(
@@ -1395,6 +1397,7 @@ impl ExtentStoreEngine {
                     counters: &self.io_counters,
                     results: &mut results,
                     reserved: &mut reserved,
+                    dead_non_active_segments: &mut dead_non_active_segments,
                     record_stage,
                 };
                 reserve_encoded_extent_store_record(
@@ -1408,6 +1411,10 @@ impl ExtentStoreEngine {
             }
         }
         record_stage("engine_reserve_writes", reserve_started.elapsed());
+
+        for segment_id in dead_non_active_segments {
+            self.remove_dead_non_active_segment(segment_id);
+        }
 
         let write_started = std::time::Instant::now();
         let mut reserved_writes = reserved.into_iter().collect::<Vec<_>>();
@@ -1978,6 +1985,32 @@ impl ExtentStoreEngine {
         }
         if let Some(segment) = removed_segment {
             let _ = self.remove_segment_file(locator.segment_id, segment);
+        }
+    }
+
+    fn remove_dead_non_active_segment(&self, segment_id: u64) {
+        let _permit = self.io_priority.enter_write();
+        let removed_segment = {
+            let mut inner = self.inner.lock();
+            if segment_id == inner.active_segment_id {
+                return;
+            }
+            let Some(segment) = inner.segments.get(&segment_id) else {
+                return;
+            };
+            if segment.live_bytes != 0 {
+                return;
+            }
+            inner.segments.remove(&segment_id)
+        };
+        if let Some(segment) = removed_segment {
+            if let Err(error) = self.remove_segment_file(segment_id, segment) {
+                warn!(
+                    segment_id,
+                    error = %error,
+                    "failed to remove dead extent store segment after rollover"
+                );
+            }
         }
     }
 
@@ -2775,6 +2808,7 @@ struct ExtentStoreRecordReservationContext<'a, 'b> {
     counters: &'a ExtentStoreIoCounters,
     results: &'a mut [Result<String>],
     reserved: &'a mut Vec<(usize, ReservedExtentStoreWrite<'b>)>,
+    dead_non_active_segments: &'a mut Vec<u64>,
     record_stage: &'a mut dyn FnMut(&'static str, std::time::Duration),
 }
 
@@ -2802,6 +2836,7 @@ fn reserve_extent_store_record_space(
     inner: &mut ExtentStoreEngineInner,
     root: &ExtentStorePath,
     counters: &ExtentStoreIoCounters,
+    dead_non_active_segments: &mut Vec<u64>,
     record_stage: &mut dyn FnMut(&'static str, std::time::Duration),
     record_len: u64,
 ) -> Result<ExtentStoreRecordAllocation> {
@@ -2846,6 +2881,7 @@ fn reserve_extent_store_record_space(
             StoreError::InvalidState("extent store segment id overflow".to_string())
         })?;
         let rollover_started = std::time::Instant::now();
+        let old_segment_id = inner.active_segment_id;
         let mut segment = open_segment(root, next_segment_id, inner.segment_size)?;
         ensure_segment_allocated(
             &mut segment,
@@ -2856,6 +2892,13 @@ fn reserve_extent_store_record_space(
         let rollover_elapsed = rollover_started.elapsed();
         counters.record_segment_rollover(rollover_elapsed);
         record_stage("engine_reserve_rollover_open", rollover_elapsed);
+        if inner
+            .segments
+            .get(&old_segment_id)
+            .is_some_and(|segment| segment.live_bytes == 0)
+        {
+            dead_non_active_segments.push(old_segment_id);
+        }
         inner.active_segment_id = next_segment_id;
         inner.active_offset = 0;
         inner.segments.insert(next_segment_id, segment);
@@ -2909,6 +2952,7 @@ fn reserve_encoded_extent_store_record<'record>(
         inner,
         context.root,
         context.counters,
+        context.dead_non_active_segments,
         context.record_stage,
         encoded.record_len,
     ) {
@@ -5114,6 +5158,42 @@ mod extent_store_engine_tests {
             decoded2.segment_id > decoded1.segment_id,
             "second write should be in new segment"
         );
+    }
+
+    #[test]
+    fn engine_rollover_removes_dead_active_segment() {
+        let root = test_extent_store_root("rollover-dead-active");
+        let segment_size = EXTENT_STORE_ALIGNMENT * 2;
+        let engine = ExtentStoreEngine::new_with_segment_size(root.path(), segment_size)
+            .expect("engine should start");
+
+        let first = engine
+            .put("rollover-dead-active/a", b"payload")
+            .expect("first put should succeed");
+        let first_segment_id = ExtentStoreLocator::decode(&first)
+            .expect("first locator should decode")
+            .segment_id;
+        let first_segment_path = root
+            .path()
+            .join("segments")
+            .join(format!("{first_segment_id:016x}.seg"));
+        assert!(first_segment_path.exists());
+
+        assert!(engine.delete(&first).expect("delete should succeed"));
+        assert!(
+            first_segment_path.exists(),
+            "active segment is cleaned when a later rollover seals it"
+        );
+
+        let rollover_payload = vec![2u8; EXTENT_STORE_ALIGNMENT as usize];
+        let second = engine
+            .put("rollover-dead-active/b", &rollover_payload)
+            .expect("second put should trigger rollover");
+        let second_segment_id = ExtentStoreLocator::decode(&second)
+            .expect("second locator should decode")
+            .segment_id;
+        assert!(second_segment_id > first_segment_id);
+        assert!(!first_segment_path.exists());
     }
 
     // --- parse_locator_hex edge case ---
