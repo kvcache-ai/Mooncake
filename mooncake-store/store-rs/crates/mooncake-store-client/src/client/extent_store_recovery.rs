@@ -36,6 +36,7 @@ fn recover_extent_store_segments(
         active_offset: 0,
         generation: 1,
         segments: BTreeMap::new(),
+        free_extents: ExtentStoreFreeExtents::default(),
         delete_journal: open_delete_journal(root)?,
     };
     let mut empty_segment_ids = Vec::new();
@@ -116,6 +117,10 @@ fn recover_extent_store_delete_journal(
             read += bytes;
         }
         let locator = decode_delete_journal_record(&record, offset)?;
+        inner.generation =
+            inner
+                .generation
+                .max(next_extent_store_generation_after(locator.generation)?);
         apply_recovered_delete_locator(inner, &locator)?;
         offset = offset.saturating_add(record.len() as u64);
     }
@@ -141,7 +146,12 @@ fn apply_recovered_delete_locator(
             locator.segment_id, locator.offset, locator.record_len
         )));
     }
-    apply_delete_to_segment(segment, locator);
+    let Some(delete_result) = apply_delete_to_segment(segment, locator) else {
+        return Ok(());
+    };
+    if let Some((offset, len)) = delete_result.free_extent {
+        inner.free_extents.insert_exact(locator.segment_id, offset, len);
+    }
     Ok(())
 }
 
@@ -850,6 +860,7 @@ fn remove_fully_dead_sealed_segments(
         .collect::<Vec<_>>();
     for (segment_id, path) in remove {
         inner.segments.remove(&segment_id);
+        inner.free_extents.remove_segment(segment_id);
         remove_extent_store_segment_file(&path)?;
     }
     Ok(())

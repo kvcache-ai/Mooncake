@@ -876,6 +876,7 @@ struct ExtentStoreEngineInner {
     active_offset: u64,
     generation: u64,
     segments: BTreeMap<u64, ExtentStoreSegment>,
+    free_extents: ExtentStoreFreeExtents,
     delete_journal: ExtentStoreDeleteJournal,
 }
 
@@ -885,8 +886,52 @@ struct ExtentStoreSegment {
     path: ExtentStorePathBuf,
     live_bytes: u64,
     dead_bytes: u64,
-    deleted_extents: BTreeSet<(u64, u64)>,
+    deleted_extents: BTreeSet<ExtentStoreDeletedExtent>,
     packed_blocks: BTreeMap<(u64, u64), PackedBlockLiveState>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct ExtentStoreDeletedExtent {
+    offset: u64,
+    len: u64,
+    generation: u64,
+}
+
+// Keep reuse exact-size for now: recovery still scans segment records linearly,
+// so splitting a freed record would create an unparseable hole without a new
+// padding/free-record format.
+#[derive(Default)]
+struct ExtentStoreFreeExtents {
+    exact_offsets_by_len: BTreeMap<u64, BTreeSet<(u64, u64)>>,
+}
+
+impl ExtentStoreFreeExtents {
+    fn insert_exact(&mut self, segment_id: u64, offset: u64, len: u64) {
+        if len == 0 {
+            return;
+        }
+        self.exact_offsets_by_len
+            .entry(len)
+            .or_default()
+            .insert((segment_id, offset));
+    }
+
+    fn take_exact(&mut self, len: u64) -> Option<(u64, u64)> {
+        let offsets = self.exact_offsets_by_len.get_mut(&len)?;
+        let key = offsets.iter().next().copied()?;
+        offsets.remove(&key);
+        if offsets.is_empty() {
+            self.exact_offsets_by_len.remove(&len);
+        }
+        Some(key)
+    }
+
+    fn remove_segment(&mut self, segment_id: u64) {
+        self.exact_offsets_by_len.retain(|_, offsets| {
+            offsets.retain(|(free_segment_id, _)| *free_segment_id != segment_id);
+            !offsets.is_empty()
+        });
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1907,14 +1952,24 @@ impl ExtentStoreEngine {
         {
             let mut inner = self.inner.lock();
             let active_segment_id = inner.active_segment_id;
-            let Some(segment) = inner.segments.get_mut(&locator.segment_id) else {
-                return;
+            let delete_result = {
+                let Some(segment) = inner.segments.get_mut(&locator.segment_id) else {
+                    return;
+                };
+                let Some(delete_result) = apply_delete_to_segment(segment, locator) else {
+                    return;
+                };
+                if segment.live_bytes == 0 && locator.segment_id != active_segment_id {
+                    removed_segment = inner.segments.remove(&locator.segment_id);
+                }
+                delete_result
             };
-            if !apply_delete_to_segment(segment, locator) {
-                return;
-            }
-            if segment.live_bytes == 0 && locator.segment_id != active_segment_id {
-                removed_segment = inner.segments.remove(&locator.segment_id);
+            if removed_segment.is_some() {
+                inner.free_extents.remove_segment(locator.segment_id);
+            } else if let Some((offset, len)) = delete_result.free_extent {
+                inner
+                    .free_extents
+                    .insert_exact(locator.segment_id, offset, len);
             }
         }
         if let Some(segment) = removed_segment {
@@ -1937,15 +1992,27 @@ impl ExtentStoreEngine {
             if !extent_store_locator_within_segment(segment, locator)? {
                 return Ok(false);
             }
+            let next_generation = next_extent_store_generation_after(locator.generation)?;
             append_delete_journal_record(&mut inner.delete_journal, locator)?;
-            let Some(segment) = inner.segments.get_mut(&locator.segment_id) else {
-                return Ok(false);
+            inner.generation = inner.generation.max(next_generation);
+            let delete_result = {
+                let Some(segment) = inner.segments.get_mut(&locator.segment_id) else {
+                    return Ok(false);
+                };
+                let Some(delete_result) = apply_delete_to_segment(segment, locator) else {
+                    return Ok(false);
+                };
+                if segment.live_bytes == 0 && locator.segment_id != active_segment_id {
+                    removed_segment = inner.segments.remove(&locator.segment_id);
+                }
+                delete_result
             };
-            if !apply_delete_to_segment(segment, locator) {
-                return Ok(false);
-            }
-            if segment.live_bytes == 0 && locator.segment_id != active_segment_id {
-                removed_segment = inner.segments.remove(&locator.segment_id);
+            if removed_segment.is_some() {
+                inner.free_extents.remove_segment(locator.segment_id);
+            } else if let Some((offset, len)) = delete_result.free_extent {
+                inner
+                    .free_extents
+                    .insert_exact(locator.segment_id, offset, len);
             }
         }
         if let Some(segment) = removed_segment {
@@ -2604,23 +2671,54 @@ fn extent_store_locator_deleted(
 ) -> bool {
     if segment
         .deleted_extents
-        .contains(&(locator.value_offset, locator.value_len))
+        .contains(&deleted_record_extent(locator))
     {
         return true;
     }
+    if !segment
+        .packed_blocks
+        .contains_key(&(locator.offset, locator.record_len))
+    {
+        return false;
+    }
     segment
         .deleted_extents
-        .contains(&(locator.offset, locator.record_len))
+        .contains(&deleted_value_extent(locator))
 }
 
-fn apply_delete_to_segment(segment: &mut ExtentStoreSegment, locator: &ExtentStoreLocator) -> bool {
+fn deleted_record_extent(locator: &ExtentStoreLocator) -> ExtentStoreDeletedExtent {
+    ExtentStoreDeletedExtent {
+        offset: locator.offset,
+        len: locator.record_len,
+        generation: locator.generation,
+    }
+}
+
+fn deleted_value_extent(locator: &ExtentStoreLocator) -> ExtentStoreDeletedExtent {
+    ExtentStoreDeletedExtent {
+        offset: locator.value_offset,
+        len: locator.value_len,
+        generation: locator.generation,
+    }
+}
+
+struct ExtentStoreDeleteResult {
+    free_extent: Option<(u64, u64)>,
+}
+
+fn apply_delete_to_segment(
+    segment: &mut ExtentStoreSegment,
+    locator: &ExtentStoreLocator,
+) -> Option<ExtentStoreDeleteResult> {
     if segment
         .packed_blocks
         .contains_key(&(locator.offset, locator.record_len))
     {
-        let entry_key = (locator.value_offset, locator.value_len);
-        if !segment.deleted_extents.insert(entry_key) {
-            return false;
+        if !segment
+            .deleted_extents
+            .insert(deleted_value_extent(locator))
+        {
+            return None;
         }
         let state = segment
             .packed_blocks
@@ -2629,21 +2727,26 @@ fn apply_delete_to_segment(segment: &mut ExtentStoreSegment, locator: &ExtentSto
         state.live_count = state.live_count.saturating_sub(1);
         state.live_value_bytes = state.live_value_bytes.saturating_sub(locator.value_len);
         state.dead_value_bytes = state.dead_value_bytes.saturating_add(locator.value_len);
-        if state.live_count == 0 {
+        let free_extent = if state.live_count == 0 {
             segment.live_bytes = segment.live_bytes.saturating_sub(locator.record_len);
             segment.dead_bytes = segment.dead_bytes.saturating_add(locator.record_len);
-        }
-        return true;
+            Some((locator.offset, locator.record_len))
+        } else {
+            None
+        };
+        return Some(ExtentStoreDeleteResult { free_extent });
     }
     if !segment
         .deleted_extents
-        .insert((locator.offset, locator.record_len))
+        .insert(deleted_record_extent(locator))
     {
-        return false;
+        return None;
     }
     segment.live_bytes = segment.live_bytes.saturating_sub(locator.record_len);
     segment.dead_bytes = segment.dead_bytes.saturating_add(locator.record_len);
-    true
+    Some(ExtentStoreDeleteResult {
+        free_extent: Some((locator.offset, locator.record_len)),
+    })
 }
 
 struct EncodedExtentStoreRecordReservation<'a> {
@@ -2671,6 +2774,101 @@ struct ExtentStoreRecordReservationContext<'a, 'b> {
     record_stage: &'a mut dyn FnMut(&'static str, std::time::Duration),
 }
 
+struct ExtentStoreRecordAllocation {
+    segment_id: u64,
+    offset: u64,
+    generation: u64,
+    file: Arc<ExtentStoreFile>,
+    direct_file: Option<Arc<ExtentStoreFile>>,
+}
+
+fn next_extent_store_generation_after(generation: u64) -> Result<u64> {
+    generation
+        .checked_add(1)
+        .ok_or_else(|| StoreError::InvalidState("extent store generation overflow".to_string()))
+}
+
+fn reserve_extent_store_generation(inner: &mut ExtentStoreEngineInner) -> Result<u64> {
+    let generation = inner.generation.max(1);
+    inner.generation = next_extent_store_generation_after(generation)?;
+    Ok(generation)
+}
+
+fn reserve_extent_store_record_space(
+    inner: &mut ExtentStoreEngineInner,
+    root: &ExtentStorePath,
+    counters: &ExtentStoreIoCounters,
+    record_stage: &mut dyn FnMut(&'static str, std::time::Duration),
+    record_len: u64,
+) -> Result<ExtentStoreRecordAllocation> {
+    if let Some((segment_id, offset)) = inner.free_extents.take_exact(record_len) {
+        if !inner.segments.contains_key(&segment_id) {
+            inner
+                .free_extents
+                .insert_exact(segment_id, offset, record_len);
+            return Err(StoreError::InvalidState(format!(
+                "reused extent store segment {segment_id} is not open"
+            )));
+        }
+        let generation = match reserve_extent_store_generation(inner) {
+            Ok(generation) => generation,
+            Err(error) => {
+                inner
+                    .free_extents
+                    .insert_exact(segment_id, offset, record_len);
+                return Err(error);
+            }
+        };
+        let segment = inner
+            .segments
+            .get_mut(&segment_id)
+            .expect("reused extent store segment was checked");
+        segment.live_bytes = segment.live_bytes.saturating_add(record_len);
+        segment.dead_bytes = segment.dead_bytes.saturating_sub(record_len);
+        return Ok(ExtentStoreRecordAllocation {
+            segment_id,
+            offset,
+            generation,
+            file: segment.file.clone(),
+            direct_file: segment.direct_file.clone(),
+        });
+    }
+
+    if inner.active_offset + record_len > inner.segment_size {
+        let next_segment_id = inner.active_segment_id.saturating_add(1);
+        inner.active_segment_id = next_segment_id;
+        inner.active_offset = 0;
+        let rollover_started = std::time::Instant::now();
+        let segment = open_segment(root, next_segment_id, inner.segment_size)?;
+        let rollover_elapsed = rollover_started.elapsed();
+        counters.record_segment_rollover(rollover_elapsed);
+        record_stage("engine_reserve_rollover_open", rollover_elapsed);
+        inner.segments.insert(next_segment_id, segment);
+    }
+
+    let segment_id = inner.active_segment_id;
+    let offset = inner.active_offset;
+    if !inner.segments.contains_key(&segment_id) {
+        return Err(StoreError::InvalidState(format!(
+            "active extent store segment {segment_id} is not open"
+        )));
+    }
+    let generation = reserve_extent_store_generation(inner)?;
+    inner.active_offset = inner.active_offset.saturating_add(record_len);
+    let segment = inner
+        .segments
+        .get_mut(&segment_id)
+        .expect("active extent store segment was checked");
+    segment.live_bytes = segment.live_bytes.saturating_add(record_len);
+    Ok(ExtentStoreRecordAllocation {
+        segment_id,
+        offset,
+        generation,
+        file: segment.file.clone(),
+        direct_file: segment.direct_file.clone(),
+    })
+}
+
 fn reserve_encoded_extent_store_record<'record>(
     context: &mut ExtentStoreRecordReservationContext<'_, 'record>,
     index: usize,
@@ -2681,34 +2879,29 @@ fn reserve_encoded_extent_store_record<'record>(
         result_locators,
     } = reservation;
     let inner = &mut *context.inner;
-    if inner.active_offset + encoded.record_len > inner.segment_size {
-        let next_segment_id = inner.active_segment_id.saturating_add(1);
-        inner.active_segment_id = next_segment_id;
-        inner.active_offset = 0;
-        let rollover_started = std::time::Instant::now();
-        let segment = match open_segment(context.root, next_segment_id, inner.segment_size) {
-            Ok(segment) => segment,
-            Err(error) => {
-                context.results[index] = Err(error);
-                return;
-            }
-        };
-        let rollover_elapsed = rollover_started.elapsed();
-        context.counters.record_segment_rollover(rollover_elapsed);
-        (context.record_stage)("engine_reserve_rollover_open", rollover_elapsed);
-        inner.segments.insert(next_segment_id, segment);
-    }
-    let segment_id = inner.active_segment_id;
-    let offset = inner.active_offset;
-    inner.active_offset = inner.active_offset.saturating_add(encoded.record_len);
-    let generation = inner.generation;
+    let allocation = match reserve_extent_store_record_space(
+        inner,
+        context.root,
+        context.counters,
+        context.record_stage,
+        encoded.record_len,
+    ) {
+        Ok(allocation) => allocation,
+        Err(error) => {
+            context.results[index] = Err(error);
+            return;
+        }
+    };
+    let segment_id = allocation.segment_id;
+    let offset = allocation.offset;
+    let generation = allocation.generation;
     let Some(segment) = inner.segments.get_mut(&segment_id) else {
         context.results[index] = Err(StoreError::InvalidState(format!(
-            "active extent store segment {segment_id} is not open"
+            "reserved extent store segment {segment_id} is not open"
         )));
         return;
     };
-    segment.live_bytes = segment.live_bytes.saturating_add(encoded.record_len);
+    segment.packed_blocks.remove(&(offset, encoded.record_len));
     if encoded.entry_count > 1 {
         segment.packed_blocks.insert(
             (offset, encoded.record_len),
@@ -2720,8 +2913,8 @@ fn reserve_encoded_extent_store_record<'record>(
             },
         );
     }
-    let file = segment.file.clone();
-    let direct_file = segment.direct_file.clone();
+    let file = allocation.file;
+    let direct_file = allocation.direct_file;
     let block_locator = ExtentStoreLocator {
         segment_id,
         offset,
@@ -4641,6 +4834,195 @@ mod extent_store_engine_tests {
         let stats_after_del = engine.maintenance_stats();
         assert!(stats_after_del.dead_bytes > 0);
         assert!(stats_after_del.live_bytes < stats_after_put.live_bytes);
+    }
+
+    #[test]
+    fn engine_reuses_exact_size_deleted_extent() {
+        let root = test_extent_store_root("reuse-exact");
+        let engine =
+            ExtentStoreEngine::new_with_segment_size(root.path(), EXTENT_STORE_ALIGNMENT * 8)
+                .expect("engine should start");
+        let first_payload = b"reuse-first-payload";
+        let second_payload = b"reuse-secondpayload";
+        assert_eq!(first_payload.len(), second_payload.len());
+
+        let first_locator = engine
+            .put("reuse/a", first_payload)
+            .expect("first put should succeed");
+        let first_decoded = ExtentStoreLocator::decode(&first_locator).expect("decode first");
+        assert!(engine.delete(&first_locator).expect("delete first"));
+
+        let second_locator = engine
+            .put("reuse/b", second_payload)
+            .expect("second put should succeed");
+        let second_decoded = ExtentStoreLocator::decode(&second_locator).expect("decode second");
+
+        assert_eq!(second_decoded.segment_id, first_decoded.segment_id);
+        assert_eq!(second_decoded.offset, first_decoded.offset);
+        assert_eq!(second_decoded.record_len, first_decoded.record_len);
+        assert_ne!(second_decoded.generation, first_decoded.generation);
+        assert!(engine
+            .get(&first_locator, first_payload.len() as u64)
+            .is_err());
+        let second = engine
+            .get(&second_locator, second_payload.len() as u64)
+            .expect("second get should succeed")
+            .expect("second payload should exist");
+        assert_eq!(second, second_payload);
+        let stats = engine.maintenance_stats();
+        assert_eq!(stats.dead_bytes, 0);
+    }
+
+    #[test]
+    fn engine_reused_packed_extent_can_store_single_record() {
+        let root = test_extent_store_root("reuse-packed-as-single");
+        let engine =
+            ExtentStoreEngine::new_with_segment_size(root.path(), EXTENT_STORE_ALIGNMENT * 8)
+                .expect("engine should start");
+        let first = b"packed-a";
+        let second = b"packed-b";
+        let packed = [
+            ExtentStoreWrite {
+                logical_locator: "packed/a",
+                payload: first,
+                checksum: None,
+            },
+            ExtentStoreWrite {
+                logical_locator: "packed/b",
+                payload: second,
+                checksum: None,
+            },
+        ];
+        let packed_locators = engine.put_batch(&packed);
+        let first_locator = packed_locators[0]
+            .as_ref()
+            .expect("first packed put should succeed");
+        let first_decoded = ExtentStoreLocator::decode(first_locator).expect("decode first");
+        let second_locator = packed_locators[1]
+            .as_ref()
+            .expect("second packed put should succeed");
+        assert!(engine
+            .delete(first_locator)
+            .expect("delete first packed entry"));
+        assert!(engine
+            .delete(second_locator)
+            .expect("delete second packed entry"));
+
+        let single_payload = vec![9u8; first_decoded.value_len as usize * 2];
+        let single_locator = engine
+            .put("single/reuse-packed-space", &single_payload)
+            .expect("single put should reuse packed block space");
+        let single_decoded = ExtentStoreLocator::decode(&single_locator).expect("decode single");
+
+        assert_eq!(single_decoded.segment_id, first_decoded.segment_id);
+        assert_eq!(single_decoded.offset, first_decoded.offset);
+        assert_eq!(single_decoded.record_len, first_decoded.record_len);
+        let data = engine
+            .get(&single_locator, single_payload.len() as u64)
+            .expect("single get should not use stale packed state")
+            .expect("single payload should exist");
+        assert_eq!(data, single_payload);
+    }
+
+    #[test]
+    fn engine_delete_after_restart_advances_reuse_generation() {
+        let root = test_extent_store_root("reuse-generation-after-restart");
+        let payload_a = b"generation-a";
+        let payload_b = b"generation-b";
+        let payload_c = b"generation-c";
+        assert_eq!(payload_a.len(), payload_b.len());
+        assert_eq!(payload_b.len(), payload_c.len());
+        let second_locator;
+        let second_decoded;
+        {
+            let engine =
+                ExtentStoreEngine::new_with_segment_size(root.path(), EXTENT_STORE_ALIGNMENT * 8)
+                    .expect("engine should start");
+            let first_locator = engine.put("gen/a", payload_a).expect("first put");
+            assert!(engine.delete(&first_locator).expect("delete first"));
+            second_locator = engine.put("gen/b", payload_b).expect("second put");
+            second_decoded = ExtentStoreLocator::decode(&second_locator).expect("decode second");
+        }
+
+        let engine =
+            ExtentStoreEngine::new_with_segment_size(root.path(), EXTENT_STORE_ALIGNMENT * 8)
+                .expect("engine should recover");
+        assert!(engine
+            .delete(&second_locator)
+            .expect("delete recovered second"));
+        let third_locator = engine.put("gen/c", payload_c).expect("third put");
+        let third_decoded = ExtentStoreLocator::decode(&third_locator).expect("decode third");
+
+        assert_eq!(third_decoded.segment_id, second_decoded.segment_id);
+        assert_eq!(third_decoded.offset, second_decoded.offset);
+        assert!(third_decoded.generation > second_decoded.generation);
+    }
+
+    #[test]
+    fn engine_put_rejects_generation_overflow() {
+        let root = test_extent_store_root("generation-overflow-put");
+        let engine =
+            ExtentStoreEngine::new_with_segment_size(root.path(), EXTENT_STORE_ALIGNMENT * 8)
+                .expect("engine should start");
+        engine.inner.lock().generation = u64::MAX;
+
+        assert!(engine.put("overflow/put", b"payload").is_err());
+    }
+
+    #[test]
+    fn engine_delete_rejects_locator_generation_overflow() {
+        let root = test_extent_store_root("generation-overflow-delete");
+        let engine =
+            ExtentStoreEngine::new_with_segment_size(root.path(), EXTENT_STORE_ALIGNMENT * 8)
+                .expect("engine should start");
+        let locator = engine
+            .put("overflow/delete", b"payload")
+            .expect("put should succeed");
+        let mut decoded = ExtentStoreLocator::decode(&locator).expect("decode locator");
+        decoded.generation = u64::MAX;
+
+        assert!(engine.delete(&decoded.encode()).is_err());
+    }
+
+    #[test]
+    fn engine_recovers_reusable_exact_extent_after_restart() {
+        let root = test_extent_store_root("reuse-exact-restart");
+        let first_payload = b"restart-first";
+        let second_payload = b"restart-secon";
+        assert_eq!(first_payload.len(), second_payload.len());
+        let first_locator;
+        let first_decoded;
+        {
+            let engine =
+                ExtentStoreEngine::new_with_segment_size(root.path(), EXTENT_STORE_ALIGNMENT * 8)
+                    .expect("engine should start");
+            first_locator = engine
+                .put("restart/a", first_payload)
+                .expect("first put should succeed");
+            first_decoded = ExtentStoreLocator::decode(&first_locator).expect("decode first");
+            assert!(engine.delete(&first_locator).expect("delete first"));
+        }
+
+        let engine =
+            ExtentStoreEngine::new_with_segment_size(root.path(), EXTENT_STORE_ALIGNMENT * 8)
+                .expect("engine should recover");
+        let second_locator = engine
+            .put("restart/b", second_payload)
+            .expect("second put should succeed");
+        let second_decoded = ExtentStoreLocator::decode(&second_locator).expect("decode second");
+
+        assert_eq!(second_decoded.segment_id, first_decoded.segment_id);
+        assert_eq!(second_decoded.offset, first_decoded.offset);
+        assert_eq!(second_decoded.record_len, first_decoded.record_len);
+        assert!(second_decoded.generation > first_decoded.generation);
+        assert!(engine
+            .get(&first_locator, first_payload.len() as u64)
+            .is_err());
+        let second = engine
+            .get(&second_locator, second_payload.len() as u64)
+            .expect("second get should succeed")
+            .expect("second payload should exist");
+        assert_eq!(second, second_payload);
     }
 
     #[test]
