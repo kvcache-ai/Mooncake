@@ -248,10 +248,26 @@ jobs:
             -DSTORE_USE_ETCD=ON -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_UNIT_TESTS=ON -DENABLE_SCCACHE=ON
 
+      - name: Configure CUDA driver runtime
+        run: |
+          cuda_driver_library=$(sed -n \
+            's/^CUDA_cuda_driver_LIBRARY:FILEPATH=//p' build/CMakeCache.txt)
+          if [ -z "$cuda_driver_library" ] || [ ! -f "$cuda_driver_library" ]; then
+            echo "::error::CMake did not resolve the CUDA driver library"
+            exit 1
+          fi
+
+          cuda_driver_dir=$(dirname "$cuda_driver_library")
+          if [ ! -e "$cuda_driver_dir/libcuda.so.1" ]; then
+            sudo ln -s "$(basename "$cuda_driver_library")" \
+              "$cuda_driver_dir/libcuda.so.1"
+          fi
+          echo "LIBRARY_PATH=$cuda_driver_dir:${LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$cuda_driver_dir:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+
       - name: Build project
         run: |
           cd build
-          export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LIBRARY_PATH:-}
           cmake --build . -j$(nproc)
           sudo -E cmake --install .
 
@@ -259,7 +275,6 @@ jobs:
         run: |
           mkdir -p build/mooncake-transfer-engine/nvlink-allocator
           cd mooncake-transfer-engine/nvlink-allocator
-          export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
           bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
 
       - name: Start Metadata Server
@@ -271,14 +286,8 @@ jobs:
 
       - name: Run CTest unit tests
         run: |
-          # libcuda.so.1 (SONAME of the CUDA stub) must be findable at runtime.
-          # The toolkit stubs dir only ships libcuda.so; create the versioned symlink.
-          if [ -f /usr/local/cuda/lib64/stubs/libcuda.so ] && \
-             [ ! -e /usr/local/cuda/lib64/stubs/libcuda.so.1 ]; then
-            sudo ln -s libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
-          fi
           cd build
-          export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH:-}:/usr/local/lib
+          export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
           MC_METADATA_SERVER=http://127.0.0.1:8080/metadata \
           DEFAULT_KV_LEASE_TTL=500 \
             ctest --parallel $(nproc) --output-on-failure
@@ -292,7 +301,6 @@ jobs:
       - name: Run Go store binding integration tests
         env:
           MOONCAKE_STORE_CLUSTER_ID: nightly_go_cluster
-          MOONCAKE_STORE_GO_LINK_COMMON: "0"
           MOONCAKE_STORE_GO_SANITIZED: "0"
         run: ./scripts/ci/run_store_go_integration.sh
 
