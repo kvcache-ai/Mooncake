@@ -255,6 +255,13 @@ navigation_with_keys = False
 # Preserve published URLs when documentation is reorganized. Redirect targets
 # are relative to the generated location of each legacy page.
 redirects = {
+    "design/mooncake-store": "store/mooncake-store.html",
+    "design/ssd-offload": "store/ssd-offload.html",
+    "design/ssd-free-ratio-first-allocation":
+    "store/ssd-free-ratio-first-allocation.html",
+    "design/engram": "store/engram.html",
+    "design/unified-parallel-tensor-io":
+    "store/unified-parallel-tensor-io.html",
     "deployment/ssd-offload": "ssd/ssd-offload.html",
     "deployment/nvmf-ssd-deployment-guide":
     "ssd/nvmf-ssd-deployment-guide.html",

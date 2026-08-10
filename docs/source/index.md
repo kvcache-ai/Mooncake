@@ -124,19 +124,15 @@ performance/vllm/index
 :maxdepth: 1
 
 design/architecture
-design/mooncake-store
-design/p2p-store
+design/transfer-engine/index
+design/store/mooncake-store
 design/mooncake-backend-pg
 design/mooncake-ep
-design/transfer-engine/index
 design/hicache-design
-design/engram
-design/unified-parallel-tensor-io
+design/p2p-store
 design/tent/overview
 design/tent/tebench
 design/conductor/conductor-architecture-design
-design/ssd-offload
-design/ssd-free-ratio-first-allocation
 :::
 
 % API Documentation

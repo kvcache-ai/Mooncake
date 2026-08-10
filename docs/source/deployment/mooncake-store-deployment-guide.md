@@ -13,7 +13,7 @@ This guide covers minimal deployment, and operational tuning of Mooncake Store.
 
 **Metadata Service**: A separate service (etcd, Redis, or HTTP) used by the Transfer Engine for peer discovery and configuration. The master's embedded HTTP metadata server can replace an external etcd/Redis for simple deployments. We also provide a P2P handshake mechanism (`P2PHANDSHAKE`) that enables decentralized metadata management by storing metadata locally on each node, eliminating the need for a centralized service — this is the simplest metadata handshake method and the recommended starting point (see [Quick Start](#quick-start)).
 
-For a detailed design discussion, see the [Mooncake Store Design](../design/mooncake-store.md).
+For a detailed design discussion, see the [Mooncake Store Design](../design/store/mooncake-store.md).
 
 ---
 

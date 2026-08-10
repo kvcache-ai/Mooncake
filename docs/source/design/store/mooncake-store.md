@@ -21,7 +21,7 @@ Key features of Mooncake Store include:
 
 ## Architecture
 
-![architecture](../image/mooncake-store-preview.png)
+![architecture](../../image/mooncake-store-preview.png)
 
 As shown in the figure above, there are two key components in Mooncake Store: **Master Service** and **Client**.
 
@@ -67,7 +67,7 @@ The `Client` class provides the primary interface for Mooncake Store operations:
 | `BatchReplicaClear` | Batch clear replicas on specific segments |
 | `QueryByRegex` / `RemoveByRegex` | Query or delete objects matching a regex |
 
-For full API signatures, parameter details, and usage examples, see the [Mooncake Store C++ API Reference](../api-reference/cpp/mooncake-store.md).
+For full API signatures, parameter details, and usage examples, see the [Mooncake Store C++ API Reference](../../api-reference/cpp/mooncake-store.md).
 
 ## Master Service
 
@@ -494,7 +494,7 @@ Mooncake Store provides two concrete implementations of `BufferAllocatorBase`:
 
 **OffsetBufferAllocator (default and recommended)**: This allocator is derived from [OffsetAllocator](https://github.com/sebbbi/OffsetAllocator), which uses a custom bin-based allocation strategy that supports fast hard realtime `O(1)` offset allocation with minimal fragmentation. Mooncake Store optimizes this allocator based on the specific memory usage characteristics of LLM inference workloads, thereby enhancing memory utilization in LLM scenarios.
 
-For measured utilization and allocation latency across LLM-style workloads, see [Allocator Performance](../performance/mooncake/allocator-benchmark-result.md).
+For measured utilization and allocation latency across LLM-style workloads, see [Allocator Performance](../../performance/mooncake/allocator-benchmark-result.md).
 
 **CachelibBufferAllocator (deprecated)**: This allocator leverages Facebook's [CacheLib](https://github.com/facebook/CacheLib) to manage memory using a slab-based allocation strategy. It provides efficient memory allocation with good fragmentation resistance and is well-suited for high-performance scenarios. However, in our modified version, it does not handle workloads with highly variable object sizes effectively, so it is currently marked as deprecated.
 
@@ -588,7 +588,7 @@ Valid values are: `random` (default), `free_ratio_first`, `ssd_free_ratio_first`
 
 **Use `local_first`** when inference workers and Mooncake Store memory segments are colocated and you want writes to prefer the writer's host before falling back to other hosts. For this strategy to work correctly, all writer and store processes on the same physical or logical host must use the same stable, globally unique host part in `local_hostname`.
 
-For benchmark data comparing `random` and `free_ratio_first` across segment counts, replica counts, and skewed capacities, see [AllocationStrategy Performance](../performance/mooncake/allocation-strategy-benchmark-result.md).
+For benchmark data comparing `random` and `free_ratio_first` across segment counts, replica counts, and skewed capacities, see [AllocationStrategy Performance](../../performance/mooncake/allocation-strategy-benchmark-result.md).
 
 #### Strategy Details
 
@@ -754,7 +754,7 @@ After enabling the persistence feature:
 This integration is **experimental** and incomplete; see the plugin page for details before relying on it.
 ```
 
-If you need to use 3FS's native API (USRBIO) to achieve high-performance persistent file reads and writes, you can refer to the configuration instructions in this document [3FS USRBIO Plugin](../getting_started/plugin-usage/3FS-USRBIO-Plugin.md).
+If you need to use 3FS's native API (USRBIO) to achieve high-performance persistent file reads and writes, you can refer to the configuration instructions in this document [3FS USRBIO Plugin](../../getting_started/plugin-usage/3FS-USRBIO-Plugin.md).
 
 ## Builtin Metadata Server
 Mooncake Store provides a built-in HTTP metadata server as an alternative to etcd for storing cluster metadata. This feature is particularly useful for development environments or scenarios where etcd is not available.
@@ -785,7 +785,7 @@ To start the master service with the HTTP metadata server enabled:
 When enabled, the HTTP metadata server will start automatically and provide metadata services for the Mooncake Store cluster. This eliminates the need for an external etcd deployment, simplifying the setup process for development and testing environments.
 Note that the HTTP metadata server is designed for single-node deployments and does not provide the high availability features that etcd offers. For production environments requiring high availability, etcd is still the recommended choice.
 
-For detailed guidance on monitoring master metrics, Prometheus endpoints, and health checks, see the [Observability guide](../getting_started/observability.md).
+For detailed guidance on monitoring master metrics, Prometheus endpoints, and health checks, see the [Observability guide](../../getting_started/observability.md).
 
 ## Mooncake Store Python API
 
@@ -809,4 +809,8 @@ When to bump the version:
 :maxdepth: 1
 
 ssd-offload
+unified-parallel-tensor-io
+ssd-free-ratio-first-allocation
+engram
+
 :::
