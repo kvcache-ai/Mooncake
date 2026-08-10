@@ -142,7 +142,7 @@ bool MasterProcessHandler::start() {
                     config_.standby_snapshot_service_port_base + index_;
                 args.emplace_back("--standby-snapshot-service-port=" +
                                   std::to_string(snapshot_port));
-                args.emplace_back("--standby-snapshot-advertise-endpoint=" +
+                args.emplace_back("--standby-snapshot-service-endpoint=" +
                                   config_.rpc_address + ":" +
                                   std::to_string(snapshot_port));
             }

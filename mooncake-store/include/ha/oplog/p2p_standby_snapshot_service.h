@@ -175,6 +175,7 @@ class RedisMasterRegistryHeartbeat {
     std::thread thread_;
     std::function<uint64_t()> applied_sequence_provider_;
     std::function<bool()> snapshot_ready_provider_;
+    size_t provider_in_flight_{0};
     bool refresh_requested_{false};
     bool stopping_{false};
 };

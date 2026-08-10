@@ -722,6 +722,9 @@ ErrorCode RedisOpLogStore::GetTrimmedSequenceId(uint64_t& sequence_id) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto err = EnsureConnectedUnlocked();
     if (err != ErrorCode::OK) {
+        LOG(ERROR) << "RedisOpLogStore::GetTrimmedSequenceId: failed to "
+                      "ensure Redis connection"
+                   << ", error=" << toString(err);
         return err;
     }
     RedisReplyPtr reply((redisReply*)redisCommand(

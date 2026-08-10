@@ -39,6 +39,7 @@ ErrorCode P2PHotStandbyService::Start(uint64_t baseline_sequence_id) {
     }
 
     state_machine_.ProcessEvent(StandbyEvent::CONNECTED);
+    snapshot_resync_required_.store(false);
     metadata_store_->RemoveAllMetadata();
     oplog_applier_ = std::make_unique<P2POpLogApplier>(metadata_store_.get(),
                                                        config_.cluster_id);
@@ -52,11 +53,13 @@ ErrorCode P2PHotStandbyService::Start(uint64_t baseline_sequence_id) {
         state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
         return ErrorCode::INTERNAL_ERROR;
     }
-    const bool has_discovered_source =
-        config_.snapshot_source_endpoints.empty() &&
-        !DiscoverSnapshotSources().empty();
+    std::vector<std::string> discovered_snapshot_sources;
+    if (config_.snapshot_source_endpoints.empty()) {
+        discovered_snapshot_sources = DiscoverSnapshotSources();
+    }
     const bool bootstrap_requested =
-        !config_.snapshot_source_endpoints.empty() || has_discovered_source ||
+        !config_.snapshot_source_endpoints.empty() ||
+        !discovered_snapshot_sources.empty() ||
         baseline_sequence_id < trimmed_sequence_id;
     if (bootstrap_requested) {
         ErrorCode bootstrap_err = ErrorCode::INTERNAL_ERROR;
@@ -65,8 +68,15 @@ ErrorCode P2PHotStandbyService::Start(uint64_t baseline_sequence_id) {
             baseline_sequence_id < trimmed_sequence_id;
         const auto deadline =
             std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        const std::vector<std::string> empty_discovered_sources;
+        bool use_cached_discovered_sources =
+            !discovered_snapshot_sources.empty();
         do {
-            bootstrap_err = BootstrapFromSnapshotSources(baseline_sequence_id);
+            bootstrap_err = BootstrapFromSnapshotSources(
+                baseline_sequence_id, use_cached_discovered_sources
+                                          ? discovered_snapshot_sources
+                                          : empty_discovered_sources);
+            use_cached_discovered_sources = false;
             uint64_t current_trimmed_sequence_id = 0;
             if (bootstrap_err == ErrorCode::OK &&
                 (probe_store->GetTrimmedSequenceId(
@@ -119,24 +129,44 @@ ErrorCode P2PHotStandbyService::Start(uint64_t baseline_sequence_id) {
         return err;
     }
 
-    if (!WaitForAppliedSequenceLocked(initial_sync_target)) {
-        if (oplog_applier_ && !oplog_applier_->IsHealthy() &&
-            state_machine_.GetState() == StandbyState::FAILED) {
-            // TODO(P2P HA): Decide whether supervisor startup should fail here
-            // instead of joining election with a FAILED standby.
-            LOG(ERROR) << "P2PHotStandbyService: initial apply failed; "
-                          "retaining FAILED state for operator action"
-                       << ", failed_sequence_id="
-                       << oplog_applier_->GetFailedSequenceId();
-            return ErrorCode::OK;
+    if (!WaitForAppliedSequenceLocked(initial_sync_target,
+                                      std::chrono::seconds(30),
+                                      /*stop_on_snapshot_resync=*/true)) {
+        if (snapshot_resync_required_.load()) {
+            LOG(WARNING) << "P2PHotStandbyService: initial OpLog catch-up "
+                            "was trimmed; switching to snapshot bootstrap"
+                         << ", target_sequence_id=" << initial_sync_target
+                         << ", applied_sequence_id="
+                         << GetLocalLastAppliedSequenceIdLocked();
+            auto resync_err = ResyncFromSnapshotLocked();
+            if (resync_err != ErrorCode::OK) {
+                LOG(ERROR) << "P2PHotStandbyService: initial snapshot resync "
+                              "failed"
+                           << ", error=" << toString(resync_err);
+                state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
+                ResetOplogFollowingLocked();
+                return resync_err;
+            }
+            snapshot_resync_required_.store(false);
+        } else {
+            if (oplog_applier_ && !oplog_applier_->IsHealthy() &&
+                state_machine_.GetState() == StandbyState::FAILED) {
+                // TODO(P2P HA): Decide whether supervisor startup should fail
+                // here instead of joining election with a FAILED standby.
+                LOG(ERROR) << "P2PHotStandbyService: initial apply failed; "
+                              "retaining FAILED state for operator action"
+                           << ", failed_sequence_id="
+                           << oplog_applier_->GetFailedSequenceId();
+                return ErrorCode::OK;
+            }
+            LOG(ERROR) << "P2PHotStandbyService: initial sync timed out"
+                       << ", target_sequence_id=" << initial_sync_target
+                       << ", applied_sequence_id="
+                       << GetLocalLastAppliedSequenceIdLocked();
+            state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
+            ResetOplogFollowingLocked();
+            return ErrorCode::INTERNAL_ERROR;
         }
-        LOG(ERROR) << "P2PHotStandbyService: initial sync timed out"
-                   << ", target_sequence_id=" << initial_sync_target
-                   << ", applied_sequence_id="
-                   << GetLocalLastAppliedSequenceIdLocked();
-        state_machine_.ProcessEvent(StandbyEvent::FATAL_ERROR);
-        ResetOplogFollowingLocked();
-        return ErrorCode::INTERNAL_ERROR;
     }
     if (bootstrap_requested) {
         LOG(INFO) << "P2PHotStandbyService: initial OpLog catch-up completed"
@@ -352,7 +382,7 @@ ErrorCode P2PHotStandbyService::FinalCatchUpForPromotionLocked(
     static constexpr size_t kMaxCatchUpBatches = 100;
     // TODO: Add promotion readiness gating and a clear fail/continue policy for
     // incomplete catch-up: require initial sync completion, enforce max standby
-    // lag, handle final catch-up read failures, and monitor apply rate.
+    // lag, classify non-trimmed read failures, and monitor apply rate.
     uint64_t read_from_seq = current_applied_seq_id;
     size_t total_applied = 0;
     size_t batch_count = 0;
@@ -364,6 +394,13 @@ ErrorCode P2PHotStandbyService::FinalCatchUpForPromotionLocked(
             read_from_seq, kBatchSize, batch, progress);
         if (read_err != ErrorCode::OK) {
             HAMetricManager::instance().inc_promotion_catchup_incomplete();
+            if (read_err == ErrorCode::OPLOG_TRIMMED) {
+                LOG(ERROR)
+                    << "P2PHotStandbyService: final catch-up history was "
+                       "trimmed; aborting promotion"
+                    << ", from_seq=" << read_from_seq;
+                return read_err;
+            }
             LOG(WARNING) << "P2PHotStandbyService: final catch-up read failed"
                          << ", from_seq=" << read_from_seq
                          << ", error=" << toString(read_err)
@@ -441,15 +478,21 @@ bool P2PHotStandbyService::IsReadyForPromotion() const {
 }
 
 bool P2PHotStandbyService::IsReadyForSnapshot() const {
-    if (!IsReadyForPromotion() || !oplog_applier_ ||
-        !oplog_applier_->IsHealthy()) {
-        return false;
+    std::shared_ptr<OpLogStore> store;
+    uint64_t applied_sequence_id = 0;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!state_machine_.IsReadyForPromotion() || !oplog_applier_ ||
+            !oplog_applier_->IsHealthy() || !watcher_oplog_store_) {
+            return false;
+        }
+        store = watcher_oplog_store_;
+        applied_sequence_id = GetLocalLastAppliedSequenceIdLocked();
     }
-    auto store = CreateReaderStore();
+
     uint64_t trimmed_sequence_id = 0;
-    return store &&
-           store->GetTrimmedSequenceId(trimmed_sequence_id) == ErrorCode::OK &&
-           GetLatestAppliedSequenceId() >= trimmed_sequence_id;
+    return store->GetTrimmedSequenceId(trimmed_sequence_id) == ErrorCode::OK &&
+           applied_sequence_id >= trimmed_sequence_id;
 }
 
 uint64_t P2PHotStandbyService::GetLatestAppliedSequenceId() const {
@@ -484,11 +527,13 @@ bool P2PHotStandbyService::WaitForAppliedSequence(
 }
 
 ErrorCode P2PHotStandbyService::BootstrapFromSnapshotSources(
-    uint64_t& baseline_sequence_id) {
+    uint64_t& baseline_sequence_id,
+    const std::vector<std::string>& discovered_endpoints) {
     P2PStandbySnapshotClient client;
     auto endpoints = config_.snapshot_source_endpoints;
     if (endpoints.empty()) {
-        endpoints = DiscoverSnapshotSources();
+        endpoints = discovered_endpoints.empty() ? DiscoverSnapshotSources()
+                                                 : discovered_endpoints;
     }
     if (endpoints.size() > 1) {
         static thread_local std::mt19937 generator(std::random_device{}());
@@ -524,15 +569,36 @@ ErrorCode P2PHotStandbyService::ResyncFromSnapshotLocked() {
     uint64_t baseline_sequence_id = 0;
     auto err = BootstrapFromSnapshotSources(baseline_sequence_id);
     if (err != ErrorCode::OK) {
+        LOG(ERROR) << "P2PHotStandbyService: snapshot resync bootstrap failed"
+                   << ", cluster_id=" << config_.cluster_id
+                   << ", error=" << toString(err);
         return err;
     }
 
     auto trim_store = CreateReaderStore();
+    if (!trim_store) {
+        LOG(ERROR) << "P2PHotStandbyService: failed to create reader store "
+                      "while validating snapshot resync trim horizon"
+                   << ", cluster_id=" << config_.cluster_id
+                   << ", baseline_sequence_id=" << baseline_sequence_id;
+        return ErrorCode::OPLOG_TRIMMED;
+    }
     uint64_t trimmed_sequence_id = 0;
-    if (!trim_store ||
-        trim_store->GetTrimmedSequenceId(trimmed_sequence_id) !=
-            ErrorCode::OK ||
-        baseline_sequence_id < trimmed_sequence_id) {
+    err = trim_store->GetTrimmedSequenceId(trimmed_sequence_id);
+    if (err != ErrorCode::OK) {
+        LOG(ERROR) << "P2PHotStandbyService: failed to read trim horizon "
+                      "after snapshot resync"
+                   << ", cluster_id=" << config_.cluster_id
+                   << ", baseline_sequence_id=" << baseline_sequence_id
+                   << ", error=" << toString(err);
+        return ErrorCode::OPLOG_TRIMMED;
+    }
+    if (baseline_sequence_id < trimmed_sequence_id) {
+        LOG(ERROR) << "P2PHotStandbyService: snapshot resync baseline is "
+                      "behind trim horizon"
+                   << ", cluster_id=" << config_.cluster_id
+                   << ", baseline_sequence_id=" << baseline_sequence_id
+                   << ", trimmed_sequence_id=" << trimmed_sequence_id;
         return ErrorCode::OPLOG_TRIMMED;
     }
 
@@ -543,13 +609,29 @@ ErrorCode P2PHotStandbyService::ResyncFromSnapshotLocked() {
     uint64_t catch_up_target = baseline_sequence_id;
     err = GetLatestOpLogSequenceId(catch_up_target);
     if (err != ErrorCode::OK) {
+        LOG(ERROR) << "P2PHotStandbyService: failed to get snapshot resync "
+                      "catch-up target"
+                   << ", cluster_id=" << config_.cluster_id
+                   << ", baseline_sequence_id=" << baseline_sequence_id
+                   << ", error=" << toString(err);
         return err;
     }
     err = StartOplogFollowingLocked(baseline_sequence_id);
     if (err != ErrorCode::OK) {
+        LOG(ERROR) << "P2PHotStandbyService: failed to restart OpLog "
+                      "following after snapshot resync"
+                   << ", cluster_id=" << config_.cluster_id
+                   << ", baseline_sequence_id=" << baseline_sequence_id
+                   << ", catch_up_target=" << catch_up_target
+                   << ", error=" << toString(err);
         return err;
     }
     if (!WaitForAppliedSequenceLocked(catch_up_target)) {
+        LOG(ERROR) << "P2PHotStandbyService: snapshot resync catch-up timed out"
+                   << ", cluster_id=" << config_.cluster_id
+                   << ", catch_up_target=" << catch_up_target
+                   << ", applied_sequence_id="
+                   << GetLocalLastAppliedSequenceIdLocked();
         ResetOplogFollowingLocked();
         return ErrorCode::INTERNAL_ERROR;
     }
@@ -573,11 +655,15 @@ ErrorCode P2PHotStandbyService::GetLatestOpLogSequenceId(
 }
 
 bool P2PHotStandbyService::WaitForAppliedSequenceLocked(
-    uint64_t sequence_id, std::chrono::milliseconds timeout) const {
+    uint64_t sequence_id, std::chrono::milliseconds timeout,
+    bool stop_on_snapshot_resync) const {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (std::chrono::steady_clock::now() < deadline) {
         if (GetLocalLastAppliedSequenceIdLocked() >= sequence_id) {
             return true;
+        }
+        if (stop_on_snapshot_resync && snapshot_resync_required_.load()) {
+            return false;
         }
         if (state_machine_.GetState() == StandbyState::FAILED) {
             return false;

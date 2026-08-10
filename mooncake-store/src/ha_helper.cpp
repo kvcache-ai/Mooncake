@@ -220,7 +220,7 @@ int MasterServiceSupervisor::Start() {
             entry.master_endpoint = config_.local_hostname;
             entry.snapshot_endpoint = BuildSnapshotEndpoint(
                 config_.local_hostname, config_.standby_snapshot_service_port,
-                config_.standby_snapshot_advertise_endpoint);
+                config_.standby_snapshot_service_endpoint);
             entry.role = "starting";
             entry.snapshot_ready = false;
             master_registry_heartbeat =

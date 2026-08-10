@@ -111,12 +111,15 @@ class P2PHotStandbyService {
     void RestoreRecoveryWorker();
     void RequestRecovery();
     void RecoveryLoop();
-    ErrorCode BootstrapFromSnapshotSources(uint64_t& baseline_sequence_id);
+    ErrorCode BootstrapFromSnapshotSources(
+        uint64_t& baseline_sequence_id,
+        const std::vector<std::string>& discovered_endpoints = {});
     ErrorCode ResyncFromSnapshotLocked();
     ErrorCode GetLatestOpLogSequenceId(uint64_t& sequence_id) const;
     bool WaitForAppliedSequenceLocked(
         uint64_t sequence_id,
-        std::chrono::milliseconds timeout = std::chrono::seconds(30)) const;
+        std::chrono::milliseconds timeout = std::chrono::seconds(30),
+        bool stop_on_snapshot_resync = false) const;
     ErrorCode StartSnapshotServer();
     void StopSnapshotServer();
     std::vector<std::string> DiscoverSnapshotSources() const;

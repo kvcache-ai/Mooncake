@@ -36,7 +36,7 @@ struct MasterConfig {
     std::string oplog_async_queue_overflow_mode = "reject";
     uint64_t oplog_best_effort_max_retries = 3;
     uint32_t standby_snapshot_service_port = 0;
-    std::string standby_snapshot_advertise_endpoint;
+    std::string standby_snapshot_service_endpoint;
     std::string standby_snapshot_sources;
     uint32_t standby_snapshot_chunk_size = 256;
     bool enable_offload;
@@ -138,7 +138,7 @@ class MasterServiceSupervisorConfig {
     std::string oplog_async_queue_overflow_mode = "reject";
     uint64_t oplog_best_effort_max_retries = 3;
     uint32_t standby_snapshot_service_port = 0;
-    std::string standby_snapshot_advertise_endpoint;
+    std::string standby_snapshot_service_endpoint;
     std::string standby_snapshot_sources;
     uint32_t standby_snapshot_chunk_size = 256;
     uint32_t max_total_finished_tasks = DEFAULT_MAX_TOTAL_FINISHED_TASKS;
@@ -213,8 +213,8 @@ class MasterServiceSupervisorConfig {
             config.oplog_async_queue_overflow_mode;
         oplog_best_effort_max_retries = config.oplog_best_effort_max_retries;
         standby_snapshot_service_port = config.standby_snapshot_service_port;
-        standby_snapshot_advertise_endpoint =
-            config.standby_snapshot_advertise_endpoint;
+        standby_snapshot_service_endpoint =
+            config.standby_snapshot_service_endpoint;
         standby_snapshot_sources = config.standby_snapshot_sources;
         standby_snapshot_chunk_size = config.standby_snapshot_chunk_size;
 
