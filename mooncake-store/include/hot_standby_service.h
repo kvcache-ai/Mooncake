@@ -10,11 +10,11 @@
 #include <optional>
 #include <string>
 #include <thread>
-#include <utility>
 #include <vector>
 
 #include "ha/oplog/oplog_applier.h"
 #include "ha/oplog/oplog_types.h"
+#include "ha/snapshot/batch_oplog/capture.h"
 #include "ha/snapshot/snapshot_provider.h"
 #include "ha/standby_metadata_store.h"
 #include "standby_state_machine.h"
@@ -28,39 +28,6 @@ class HaKvBackend;
 class OpLogBatchStandbyReader;
 enum class OpLogBatchStandbyPollDisposition;
 struct OpLogBatchStandbyPollResult;
-
-class StandbySnapshotCapture {
-   public:
-    StandbySnapshotCapture(StandbySnapshotCapture&&) = default;
-    StandbySnapshotCapture& operator=(StandbySnapshotCapture&&) = default;
-    StandbySnapshotCapture(const StandbySnapshotCapture&) = delete;
-    StandbySnapshotCapture& operator=(const StandbySnapshotCapture&) = delete;
-
-    bool done() const { return cursor_.done(); }
-
-    uint64_t last_included_seq;
-    uint64_t last_included_batch_id;
-    ViewVersionId producer_view_version;
-    std::vector<StandbySegmentInfo> segments;
-
-   private:
-    friend class HotStandbyService;
-
-    StandbySnapshotCapture(uint64_t last_seq, uint64_t last_batch_id,
-                           ViewVersionId producer_view,
-                           std::vector<StandbySegmentInfo> captured_segments,
-                           StandbyMetadataStore::SnapshotCursor cursor,
-                           uint64_t generation)
-        : last_included_seq(last_seq),
-          last_included_batch_id(last_batch_id),
-          producer_view_version(producer_view),
-          segments(std::move(captured_segments)),
-          cursor_(std::move(cursor)),
-          generation_(generation) {}
-
-    StandbyMetadataStore::SnapshotCursor cursor_;
-    uint64_t generation_;
-};
 
 /**
  * @brief Configuration for HotStandbyService
@@ -203,10 +170,11 @@ class HotStandbyService {
      */
     bool ExportStandbySnapshot(StandbySnapshot& out) const;
 
-    std::optional<StandbySnapshotCapture> BeginSnapshotCapture();
-    bool CopyNextSnapshotChunk(size_t count, StandbySnapshotCapture& capture,
-                               std::vector<StandbyObjectEntry>& out);
-    void EndSnapshotCapture(StandbySnapshotCapture& capture);
+    std::optional<BatchOpLogSnapshotCapture> BeginBatchOpLogSnapshotCapture();
+    bool CopyNextBatchOpLogSnapshotChunk(size_t count,
+                                         BatchOpLogSnapshotCapture& capture,
+                                         std::vector<StandbyObjectEntry>& out);
+    void EndBatchOpLogSnapshotCapture(BatchOpLogSnapshotCapture& capture);
 
     // Inject a snapshot provider (from external snapshot implementation).
     void SetSnapshotProvider(std::unique_ptr<SnapshotProvider> provider);
@@ -306,7 +274,7 @@ class HotStandbyService {
     bool snapshot_capture_requested_{false};
     bool snapshot_capture_active_{false};
     uint64_t snapshot_capture_generation_{0};
-    std::optional<StandbySnapshotCapture> ready_snapshot_capture_;
+    std::optional<BatchOpLogSnapshotCapture> ready_snapshot_capture_;
 
     // Synchronization
     mutable std::mutex mutex_;

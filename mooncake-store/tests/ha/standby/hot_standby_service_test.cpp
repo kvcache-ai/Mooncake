@@ -570,7 +570,7 @@ TEST_F(HotStandbyServiceTest, SnapshotCaptureFreezesApplyUntilEnded) {
     service_->SetCatchUpBatchKvBackendForTesting(backend);
     ASSERT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
 
-    auto capture = service_->BeginSnapshotCapture();
+    auto capture = service_->BeginBatchOpLogSnapshotCapture();
     ASSERT_TRUE(capture.has_value());
     EXPECT_EQ(1u, capture->last_included_seq);
     EXPECT_EQ(1u, capture->last_included_batch_id);
@@ -581,7 +581,7 @@ TEST_F(HotStandbyServiceTest, SnapshotCaptureFreezesApplyUntilEnded) {
               capture->segments[0].transport_endpoint);
 
     std::vector<StandbyObjectEntry> chunk;
-    ASSERT_TRUE(service_->CopyNextSnapshotChunk(2, *capture, chunk));
+    ASSERT_TRUE(service_->CopyNextBatchOpLogSnapshotChunk(2, *capture, chunk));
     EXPECT_TRUE(chunk.empty());
     EXPECT_TRUE(capture->done());
 
@@ -596,7 +596,7 @@ TEST_F(HotStandbyServiceTest, SnapshotCaptureFreezesApplyUntilEnded) {
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     EXPECT_EQ(1u, service_->GetLatestAppliedSequenceId());
 
-    service_->EndSnapshotCapture(*capture);
+    service_->EndBatchOpLogSnapshotCapture(*capture);
     for (int i = 0; i < 100 && service_->GetLatestAppliedSequenceId() != 2;
          ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
@@ -617,12 +617,12 @@ TEST_F(HotStandbyServiceTest, PromotionCancelsActiveSnapshotCapture) {
     service_->SetCatchUpBatchKvBackendForTesting(backend);
     ASSERT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
 
-    auto capture = service_->BeginSnapshotCapture();
+    auto capture = service_->BeginBatchOpLogSnapshotCapture();
     ASSERT_TRUE(capture.has_value());
     ASSERT_EQ(ErrorCode::OK, service_->Promote());
 
     std::vector<StandbyObjectEntry> chunk;
-    EXPECT_FALSE(service_->CopyNextSnapshotChunk(1, *capture, chunk));
+    EXPECT_FALSE(service_->CopyNextBatchOpLogSnapshotChunk(1, *capture, chunk));
 }
 
 TEST_F(HotStandbyServiceTest, SnapshotCaptureRejectsInconsistentSequence) {
@@ -642,7 +642,7 @@ TEST_F(HotStandbyServiceTest, SnapshotCaptureRejectsInconsistentSequence) {
     service_->SetCatchUpBatchKvBackendForTesting(backend);
     ASSERT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
 
-    EXPECT_FALSE(service_->BeginSnapshotCapture().has_value());
+    EXPECT_FALSE(service_->BeginBatchOpLogSnapshotCapture().has_value());
 }
 
 // ========== 6.1.7 Replication loop tests ==========

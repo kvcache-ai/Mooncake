@@ -4,7 +4,6 @@
 
 #include <algorithm>
 #include <chrono>
-#include <limits>
 #include <thread>
 
 #include "etcd_helper.h"
@@ -652,8 +651,8 @@ bool HotStandbyService::ExportStandbySnapshot(StandbySnapshot& out) const {
     return true;
 }
 
-std::optional<StandbySnapshotCapture>
-HotStandbyService::BeginSnapshotCapture() {
+std::optional<BatchOpLogSnapshotCapture>
+HotStandbyService::BeginBatchOpLogSnapshotCapture() {
     std::unique_lock<std::mutex> service_lock(mutex_);
     std::unique_lock<std::mutex> capture_lock(snapshot_capture_mutex_);
     if (!IsRunning() || !batch_standby_reader_ || snapshot_capture_requested_ ||
@@ -676,8 +675,8 @@ HotStandbyService::BeginSnapshotCapture() {
     return capture;
 }
 
-bool HotStandbyService::CopyNextSnapshotChunk(
-    size_t count, StandbySnapshotCapture& capture,
+bool HotStandbyService::CopyNextBatchOpLogSnapshotChunk(
+    size_t count, BatchOpLogSnapshotCapture& capture,
     std::vector<StandbyObjectEntry>& out) {
     std::lock_guard<std::mutex> lock(snapshot_capture_mutex_);
     if (!snapshot_capture_active_ ||
@@ -689,7 +688,8 @@ bool HotStandbyService::CopyNextSnapshotChunk(
     return metadata_store_->CopyNextSnapshotChunk(count, capture.cursor_, out);
 }
 
-void HotStandbyService::EndSnapshotCapture(StandbySnapshotCapture& capture) {
+void HotStandbyService::EndBatchOpLogSnapshotCapture(
+    BatchOpLogSnapshotCapture& capture) {
     std::lock_guard<std::mutex> lock(snapshot_capture_mutex_);
     if (snapshot_capture_active_ &&
         capture.generation_ == snapshot_capture_generation_) {
@@ -710,18 +710,12 @@ void HotStandbyService::HandleSnapshotCaptureRequest(
     const uint64_t expected = oplog_applier_->GetExpectedSequenceId();
     const bool consistent =
         result.error == ErrorCode::OK && result.durable_prefix_present &&
-        applied_prefix &&
-        applied_prefix->batch_id == result.durable_prefix.batch_id &&
-        applied_prefix->last_seq == result.durable_prefix.last_seq &&
-        applied_prefix->producer_view_version ==
-            result.durable_prefix.producer_view_version &&
-        expected > 0 && expected - 1 == applied_prefix->last_seq &&
-        applied_prefix->producer_view_version <=
-            static_cast<uint64_t>(std::numeric_limits<ViewVersionId>::max());
+        applied_prefix && *applied_prefix == result.durable_prefix &&
+        expected > 0 && expected - 1 == applied_prefix->last_seq;
     if (consistent && IsRunning() && metadata_store_) {
-        StandbySnapshotCapture capture(
+        BatchOpLogSnapshotCapture capture(
             applied_prefix->last_seq, applied_prefix->batch_id,
-            static_cast<ViewVersionId>(applied_prefix->producer_view_version),
+            applied_prefix->producer_view_version,
             oplog_applier_->GetSegmentRegistry().GetAllSegments(),
             metadata_store_->BeginSnapshotTraversal(),
             snapshot_capture_generation_);
