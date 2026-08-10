@@ -23,7 +23,6 @@ _store_module = importlib.import_module(
 )
 MooncakeDistributedStore = _store_module.MooncakeDistributedStore
 ReplicateConfig = _store_module.ReplicateConfig
-BufferPool = _store_module.BufferPool
 
 
 LOG = logging.getLogger("store_kv_bench")
@@ -598,7 +597,9 @@ class ZcopyBufferPool:
                 f"{local_buffer_size}; increase --local-buffer-size"
             )
 
-        self._pool = BufferPool(self.store, max_bytes=local_buffer_size, max_regions=1)
+        self._pool = _store_module.BufferPool(
+            self.store, max_bytes=local_buffer_size, max_regions=1
+        )
         try:
             self._lease = self._pool.acquire(self.total_size, block=False)
         except Exception:

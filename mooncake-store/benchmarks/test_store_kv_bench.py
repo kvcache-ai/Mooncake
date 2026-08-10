@@ -55,6 +55,20 @@ sys.modules[SPEC.name] = bench
 SPEC.loader.exec_module(bench)
 
 
+class StoreModuleCompatibilityTest(unittest.TestCase):
+    def test_import_does_not_require_buffer_pool(self):
+        del store_module.BufferPool
+        module_name = "store_kv_bench_without_buffer_pool"
+        spec = importlib.util.spec_from_file_location(module_name, MODULE_PATH)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        try:
+            spec.loader.exec_module(module)
+        finally:
+            store_module.BufferPool = FakeBufferPool
+            sys.modules.pop(module_name, None)
+
+
 class MetadataWorkloadModelTest(unittest.TestCase):
     def test_percentages_and_lane_choices_are_deterministic(self):
         weights = {"put": 40, "get": 30, "exist": 20, "remove": 10}
