@@ -124,12 +124,6 @@ MasterMetricManager::MasterMetricManager()
       unmount_segment_failures_(
           "master_unmount_segment_failures_total",
           "Total number of failed UnmountSegment requests"),
-      remount_segment_requests_(
-          "master_remount_segment_requests_total",
-          "Total number of RemountSegment requests received"),
-      remount_segment_failures_(
-          "master_remount_segment_failures_total",
-          "Total number of failed RemountSegment requests"),
       heartbeat_requests_("master_heartbeat_requests_total",
                           "Total number of heartbeat requests received"),
       heartbeat_failures_("master_heartbeat_failures_total",
@@ -230,8 +224,6 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     mount_segment_failures_.inc(0);
     unmount_segment_requests_.inc(0);
     unmount_segment_failures_.inc(0);
-    remount_segment_requests_.inc(0);
-    remount_segment_failures_.inc(0);
     heartbeat_requests_.inc(0);
     heartbeat_failures_.inc(0);
 
@@ -471,30 +463,39 @@ void MasterMetricManager::inc_total_get_nums(int64_t val) {
 void MasterMetricManager::inc_exist_key_requests(int64_t val) {
     exist_key_requests_.inc(val);
 }
+
 void MasterMetricManager::inc_exist_key_failures(int64_t val) {
     exist_key_failures_.inc(val);
 }
+
 void MasterMetricManager::inc_get_replica_list_requests(int64_t val) {
     get_replica_list_requests_.inc(val);
 }
+
 void MasterMetricManager::inc_get_replica_list_failures(int64_t val) {
     get_replica_list_failures_.inc(val);
 }
+
 void MasterMetricManager::inc_get_replica_list_by_regex_requests(int64_t val) {
     get_replica_list_by_regex_requests_.inc(val);
 }
+
 void MasterMetricManager::inc_get_replica_list_by_regex_failures(int64_t val) {
     get_replica_list_by_regex_failures_.inc(val);
 }
+
 void MasterMetricManager::inc_remove_requests(int64_t val) {
     remove_requests_.inc(val);
 }
+
 void MasterMetricManager::inc_remove_failures(int64_t val) {
     remove_failures_.inc(val);
 }
+
 void MasterMetricManager::inc_remove_by_regex_requests(int64_t val) {
     remove_by_regex_requests_.inc(val);
 }
+
 void MasterMetricManager::inc_remove_by_regex_failures(int64_t val) {
     remove_by_regex_failures_.inc(val);
 }
@@ -504,27 +505,27 @@ void MasterMetricManager::inc_remove_all_requests(int64_t val) {
 void MasterMetricManager::inc_remove_all_failures(int64_t val) {
     remove_all_failures_.inc(val);
 }
+
 void MasterMetricManager::inc_mount_segment_requests(int64_t val) {
     mount_segment_requests_.inc(val);
 }
+
 void MasterMetricManager::inc_mount_segment_failures(int64_t val) {
     mount_segment_failures_.inc(val);
 }
+
 void MasterMetricManager::inc_unmount_segment_requests(int64_t val) {
     unmount_segment_requests_.inc(val);
 }
+
 void MasterMetricManager::inc_unmount_segment_failures(int64_t val) {
     unmount_segment_failures_.inc(val);
 }
-void MasterMetricManager::inc_remount_segment_requests(int64_t val) {
-    remount_segment_requests_.inc(val);
-}
-void MasterMetricManager::inc_remount_segment_failures(int64_t val) {
-    remount_segment_failures_.inc(val);
-}
+
 void MasterMetricManager::inc_heartbeat_requests(int64_t val) {
     heartbeat_requests_.inc(val);
 }
+
 void MasterMetricManager::inc_heartbeat_failures(int64_t val) {
     heartbeat_failures_.inc(val);
 }
@@ -634,14 +635,6 @@ int64_t MasterMetricManager::get_unmount_segment_requests() {
 
 int64_t MasterMetricManager::get_unmount_segment_failures() {
     return unmount_segment_failures_.value();
-}
-
-int64_t MasterMetricManager::get_remount_segment_requests() {
-    return remount_segment_requests_.value();
-}
-
-int64_t MasterMetricManager::get_remount_segment_failures() {
-    return remount_segment_failures_.value();
 }
 
 int64_t MasterMetricManager::get_heartbeat_requests() {
@@ -763,8 +756,6 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(mount_segment_failures_);
     serialize_metric(unmount_segment_requests_);
     serialize_metric(unmount_segment_failures_);
-    serialize_metric(remount_segment_requests_);
-    serialize_metric(remount_segment_failures_);
     serialize_metric(heartbeat_requests_);
     serialize_metric(heartbeat_failures_);
 
