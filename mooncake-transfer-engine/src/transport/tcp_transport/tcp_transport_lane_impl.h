@@ -1099,8 +1099,7 @@ void TcpTransport::handleLaneTerminal(
             const bool sibling_usable = hasUsableLaneLocked(*group);
             if (sibling_usable) {
                 enterReconnectCooldownLocked(*group);
-            } else if (!group->queue.empty() &&
-                       group->probes_in_flight == 0 &&
+            } else if (!group->queue.empty() && group->probes_in_flight == 0 &&
                        group->connect_round_had_success) {
                 beginConnectRoundLocked(*group);
             }
