@@ -271,8 +271,14 @@ jobs:
 
       - name: Run CTest unit tests
         run: |
+          # libcuda.so.1 (SONAME of the CUDA stub) must be findable at runtime.
+          # The toolkit stubs dir only ships libcuda.so; create the versioned symlink.
+          if [ -f /usr/local/cuda/lib64/stubs/libcuda.so ] && \
+             [ ! -e /usr/local/cuda/lib64/stubs/libcuda.so.1 ]; then
+            sudo ln -s libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
+          fi
           cd build
-          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+          export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH:-}:/usr/local/lib
           MC_METADATA_SERVER=http://127.0.0.1:8080/metadata \
           DEFAULT_KV_LEASE_TTL=500 \
             ctest --parallel $(nproc) --output-on-failure
