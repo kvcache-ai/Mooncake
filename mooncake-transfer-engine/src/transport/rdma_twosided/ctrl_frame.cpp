@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "transport/rdma_transport/ctrl_frame.h"
+#include "transport/rdma_twosided/ctrl_frame.h"
 
 #include <cstring>
 

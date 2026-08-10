@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#include "transport/rdma_transport/sender_credit.h"
+#include "transport/rdma_twosided/sender_credit.h"
 
 #include "error.h"
 

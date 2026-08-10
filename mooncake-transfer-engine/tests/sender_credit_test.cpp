@@ -15,7 +15,7 @@
 #include <gtest/gtest.h>
 
 #include "error.h"
-#include "transport/rdma_transport/sender_credit.h"
+#include "transport/rdma_twosided/sender_credit.h"
 
 using namespace mooncake;
 

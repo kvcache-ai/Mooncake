@@ -23,7 +23,7 @@
 #include <utility>
 #include <vector>
 
-#include "transport/rdma_transport/ctrl_frame.h"
+#include "transport/rdma_twosided/ctrl_frame.h"
 
 namespace mooncake {
 

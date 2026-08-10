@@ -14,7 +14,7 @@
 
 #include <gtest/gtest.h>
 
-#include "transport/rdma_transport/ctrl_frame.h"
+#include "transport/rdma_twosided/ctrl_frame.h"
 
 using namespace mooncake;
 
