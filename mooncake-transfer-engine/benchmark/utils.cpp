@@ -214,9 +214,14 @@ void printStats(size_t block_size, size_t batch_size, XferBenchStats& stats,
     auto num_ops = stats.transfer_duration.count();
     double total_duration = stats.total_duration.avg();
     total_data_transferred = ((block_size * batch_size) * num_ops);
-    avg_latency = (total_duration * num_threads / num_ops);
     throughput_gb = (((double)total_data_transferred / (1000 * 1000 * 1000)) /
                      (total_duration / 1e6));  // In GB/Sec
+    const double avg_instant_gbps = stats.instant_bandwidth.avg();
+    if (avg_instant_gbps > 0.0) {
+        avg_latency =
+            static_cast<double>(block_size * batch_size) /
+            (avg_instant_gbps * 1000.0);
+    }
 
     // Tabulate print with fixed width for each string
     // clang-format off
@@ -224,7 +229,7 @@ void printStats(size_t block_size, size_t batch_size, XferBenchStats& stats,
               << std::setw(14) << block_size
               << std::setw(8)  << batch_size
               << std::setw(14) << throughput_gb
-              << std::setw(18) << stats.instant_bandwidth.avg()
+              << std::setw(18) << avg_instant_gbps
               << std::setprecision(1)
               << std::setw(14) << avg_latency
               << std::setw(14) << stats.transfer_duration.avg()
