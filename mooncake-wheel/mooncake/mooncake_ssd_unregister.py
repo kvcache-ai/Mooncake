@@ -4,14 +4,12 @@
 import argparse
 import logging
 import json
-import re
 import shlex
 from typing import List, Dict, Any
 
 import paramiko
 
 from mooncake.store import MooncakeDistributedNoFRegister
-from mooncake.mooncake_config import MooncakeConfig
 
 
 class MooncakeNoFUnregister:
@@ -150,7 +148,6 @@ class MooncakeNoFUnregister:
 
             # Default transport parameters
             trsvcid = int(target.get('port', '4420'))
-            trtype = target.get('trtype', 'RDMA')
 
             # Create SSD config for each namespace (or specified ns only)
             if specified_ns is not None:

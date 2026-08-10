@@ -1,34 +1,33 @@
 // mooncake_worker.cu — GPU kernel functions and launch wrappers.
-// Compiled by nvcc (CUDA) and mcc (MUSA, via mooncake_worker.mu symlink).
-// The __MUSA__ branch avoids torch headers to stay compatible with mcc.
 
 #include <mooncake_worker_kernels.cuh>
+
+#include <algorithm>
+#include <type_traits>
 
 #ifdef __MUSA__
 #include <musa_bf16.h>
 #else
-#include <ATen/ATen.h>
+#include <cuda_bf16.h>
 #endif
+
+#include "error_types.h"
 
 namespace mooncake {
 
-// ── Kernel functions ──────────────────────────────────────────────
-// Both CUDA and MUSA share the same kernel bodies. Parameters use plain
-// C++ types (int instead of c10d::OpType / c10d::ReduceOp::RedOpType)
-// so that mcc can compile them without torch headers.
-
-__global__ void enqueueTaskKernel(int opType, size_t tensorSize,
+__global__ void enqueueTaskKernel(int opType, size_t dataSize,
                                   int64_t broadcastRoot, int bufferOffset,
-                                  uint64_t submitSequence, uint64_t hintRouteId,
+                                  uint64_t submitSequence,
+                                  int32_t* failedRanksHint,
                                   bool resetFailedRanksHint, void* meta,
                                   Task* tasks, size_t taskId) {
     // Copy task into slot
     tasks[taskId].opType = opType;
-    tasks[taskId].tensorSize = tensorSize;
+    tasks[taskId].dataSize = dataSize;
     tasks[taskId].broadcastRoot = broadcastRoot;
     tasks[taskId].bufferOffset = bufferOffset;
     tasks[taskId].submitSequence = submitSequence;
-    tasks[taskId].hintRouteId = hintRouteId;
+    tasks[taskId].failedRanksHint = failedRanksHint;
     tasks[taskId].resetFailedRanksHint = resetFailedRanksHint;
     tasks[taskId].transferGroupMeta = meta;
 
@@ -93,20 +92,19 @@ __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
                                 break;
                         }
                     } else {
+                        const scalar_t val = src[rank * numElements + elem_idx];
                         switch (op) {
                             case 0:  // SUM
-                                acc += src[rank * numElements + elem_idx];
+                                acc += val;
                                 break;
                             case 2:  // PRODUCT
-                                acc *= src[rank * numElements + elem_idx];
+                                acc *= val;
                                 break;
                             case 3:  // MIN
-                                acc = std::min(
-                                    src[rank * numElements + elem_idx], acc);
+                                acc = acc < val ? acc : val;
                                 break;
                             case 4:  // MAX
-                                acc = std::max(
-                                    src[rank * numElements + elem_idx], acc);
+                                acc = val < acc ? acc : val;
                                 break;
                             default:
                                 break;
@@ -136,14 +134,14 @@ __global__ void reduceKernel(scalar_t* dst, const scalar_t* src,
 
 namespace mooncake {
 
-void launchEnqueueTaskKernel(int opType, size_t tensorSize,
-                             int64_t broadcastRoot, int bufferOffset,
-                             uint64_t submitSequence, uint64_t hintRouteId,
+void launchEnqueueTaskKernel(int opType, size_t dataSize, int64_t broadcastRoot,
+                             int bufferOffset, uint64_t submitSequence,
+                             int32_t* failedRanksHint,
                              bool resetFailedRanksHint, void* meta, Task* tasks,
                              size_t taskId, cudaStream_t stream) {
     enqueueTaskKernel<<<1, 1, 0, stream>>>(
-        opType, tensorSize, broadcastRoot, bufferOffset, submitSequence,
-        hintRouteId, resetFailedRanksHint, meta, tasks, taskId);
+        opType, dataSize, broadcastRoot, bufferOffset, submitSequence,
+        failedRanksHint, resetFailedRanksHint, meta, tasks, taskId);
 }
 
 #define DEF_LAUNCH_REDUCE(scalar_t, suffix)                                   \
@@ -173,8 +171,8 @@ void launchReduceKernel_bf16(void* dst, const void* src, size_t numElements,
                                          (const mt_bfloat16*)src, numElements,
                                          numRanks, op, activeRanks);
 #else
-    reduceKernel<<<64, 256, 0, stream>>>((at::BFloat16*)dst,
-                                         (const at::BFloat16*)src, numElements,
+    reduceKernel<<<64, 256, 0, stream>>>((__nv_bfloat16*)dst,
+                                         (const __nv_bfloat16*)src, numElements,
                                          numRanks, op, activeRanks);
 #endif
 }
@@ -188,8 +186,8 @@ void preloadReduceKernels() {
     auto preload = [](const char* name, auto kernel_ptr) {
         cudaFuncAttributes attr{};
         auto err = cudaFuncGetAttributes(&attr, kernel_ptr);
-        TORCH_CHECK(err == cudaSuccess, "Failed to preload kernel ", name, ": ",
-                    cudaGetErrorString(err));
+        PG_ASSERT(err == cudaSuccess, "Failed to preload kernel ", name, ": ",
+                  cudaGetErrorString(err));
     };
     preload("reduceKernel<uint8_t>",
             reinterpret_cast<const void*>(reduceKernel<uint8_t>));
@@ -208,7 +206,7 @@ void preloadReduceKernels() {
     preload("reduceKernel<bool>",
             reinterpret_cast<const void*>(reduceKernel<bool>));
     preload("reduceKernel<BFloat16>",
-            reinterpret_cast<const void*>(reduceKernel<at::BFloat16>));
+            reinterpret_cast<const void*>(reduceKernel<__nv_bfloat16>));
 #endif
 }
 

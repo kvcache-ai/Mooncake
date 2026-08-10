@@ -46,6 +46,7 @@ set(MOONCAKE_STORE_SOURCES
     device/accelerator_registry.cpp
     device/runtime_accelerator.cpp
     device/cuda_like_accelerator_device.cpp
+    device/cuda_ipc_buffer.cpp
     device/hip_accelerator_device.cpp
     device/ascend_accelerator_device.cpp
     device/sunrise_accelerator_device.cpp

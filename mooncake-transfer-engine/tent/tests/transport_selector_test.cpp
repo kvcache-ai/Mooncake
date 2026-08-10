@@ -185,6 +185,7 @@ TEST(TransportSelectorTest, TransportTypeNameMapping) {
     EXPECT_STREQ(transportTypeName(TCP), "tcp");
     EXPECT_STREQ(transportTypeName(AscendDirect), "ascend");
     EXPECT_STREQ(transportTypeName(SUNRISE_LINK), "sunrise_link");
+    EXPECT_STREQ(transportTypeName(UB), "ub");
 }
 
 TEST(TransportSelectorTest, ParseTransportType) {
@@ -198,7 +199,92 @@ TEST(TransportSelectorTest, ParseTransportType) {
     EXPECT_EQ(parseTransportType("tcp"), TCP);
     EXPECT_EQ(parseTransportType("ascend"), AscendDirect);
     EXPECT_EQ(parseTransportType("sunrise_link"), SUNRISE_LINK);
+    EXPECT_EQ(parseTransportType("ub"), UB);
     EXPECT_EQ(parseTransportType("unknown"), UNSPEC);
+}
+
+TEST(TransportSelectorTest, UbTransportNameRoundTrips) {
+    const auto name = transportTypeName(UB);
+    EXPECT_EQ(name, "ub");
+    EXPECT_EQ(parseTransportType(name), UB);
+}
+
+TEST(TransportTypeTest, WireValuesRemainStableWithUbAppended) {
+    EXPECT_EQ(static_cast<int>(UNSPEC), 0);
+    EXPECT_EQ(static_cast<int>(RDMA), 1);
+    EXPECT_EQ(static_cast<int>(MNNVL), 2);
+    EXPECT_EQ(static_cast<int>(SHM), 3);
+    EXPECT_EQ(static_cast<int>(NVLINK), 4);
+    EXPECT_EQ(static_cast<int>(GDS), 5);
+    EXPECT_EQ(static_cast<int>(IOURING), 6);
+    EXPECT_EQ(static_cast<int>(TCP), 7);
+    EXPECT_EQ(static_cast<int>(AscendDirect), 8);
+    EXPECT_EQ(static_cast<int>(SUNRISE_LINK), 9);
+    EXPECT_EQ(static_cast<int>(TPU), 10);
+    EXPECT_EQ(static_cast<int>(UB), 11);
+    EXPECT_EQ(static_cast<int>(kNumTransportTypes), 12);
+}
+
+// Topology::NicType is serialized as an integer. These values are therefore a
+// wire-compatibility contract, not merely an implementation detail.
+TEST(TopologyTest, NicTypeWireValuesRemainStableWithUbAppended) {
+    EXPECT_EQ(static_cast<int>(Topology::NIC_RDMA), 0);
+    EXPECT_EQ(static_cast<int>(Topology::NIC_TCP), 1);
+    EXPECT_EQ(static_cast<int>(Topology::NIC_UNKNOWN), 2);
+    EXPECT_EQ(static_cast<int>(Topology::NIC_UB), 3);
+}
+
+TEST(TopologyTest, LegacyJsonDefaultsDeviceAttributes) {
+    constexpr const char* kLegacyTopology = R"json(
+        {
+          "nics": [
+            {
+              "name": "legacy-nic",
+              "pci_bus_id": "0000:01:00.0",
+              "type": 2,
+              "numa_node": -1
+            }
+          ],
+          "mems": []
+        }
+    )json";
+
+    Topology topology;
+    ASSERT_TRUE(topology.parse(kLegacyTopology).ok());
+    ASSERT_EQ(topology.getNicCount(), 1u);
+    const auto* nic = topology.getNicEntry(0);
+    ASSERT_NE(nic, nullptr);
+    EXPECT_EQ(nic->type, Topology::NIC_UNKNOWN);
+    EXPECT_TRUE(nic->device_attrs.empty());
+    EXPECT_EQ(topology.toString().find("device_attrs"), std::string::npos);
+}
+
+TEST(TopologyTest, UbDeviceAttributesRoundTripThroughJson) {
+    Topology source;
+    Topology::NicEntry ub;
+    ub.name = "ub-device-0/eid-2";
+    ub.pci_bus_id = "0000:02:00.0";
+    ub.type = Topology::NIC_UB;
+    ub.numa_node = 1;
+    ub.device_attrs = {{"ub.native_name", "ub-device-0"},
+                       {"ub.device_index", "7"},
+                       {"ub.eid_index", "2"},
+                       {"ub.eid", "e1:02:03:04:05:06:07:08"},
+                       {"ub.discovery_active", "false"},
+                       {"vendor.future_attribute", "preserved"}};
+    source.nic_list_.push_back(ub);
+
+    Topology parsed;
+    ASSERT_TRUE(parsed.parse(source.toString()).ok());
+    ASSERT_EQ(parsed.getNicCount(), 1u);
+    ASSERT_EQ(parsed.getNicCount(Topology::NIC_UB), 1u);
+    const auto* round_tripped = parsed.getNicEntry(0);
+    ASSERT_NE(round_tripped, nullptr);
+    EXPECT_EQ(round_tripped->name, ub.name);
+    EXPECT_EQ(round_tripped->pci_bus_id, ub.pci_bus_id);
+    EXPECT_EQ(round_tripped->type, Topology::NIC_UB);
+    EXPECT_EQ(round_tripped->numa_node, ub.numa_node);
+    EXPECT_EQ(round_tripped->device_attrs, ub.device_attrs);
 }
 
 // ---------------------------------------------------------------------------

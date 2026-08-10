@@ -38,6 +38,8 @@ echo "Running import structure test..."
 cp -r mooncake-wheel/tests test_env/
 cd test_env
 pip install torch==2.11.0 numpy
+python -c "import mooncake._fast_copy"
+python tests/test_fast_copy.py
 python tests/test_import_structure.py
 
 echo "Running mooncake config test..."

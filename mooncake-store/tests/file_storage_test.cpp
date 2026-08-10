@@ -30,6 +30,7 @@ class FileStorageTest : public ::testing::Test {
         FLAGS_logtostderr = true;
         UnsetEnv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH");
         UnsetEnv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES");
+        UnsetEnv("MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES");
         UnsetEnv("MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT");
         UnsetEnv("MOONCAKE_SCANMETA_ITERATOR_KEYS_LIMIT");
         UnsetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT");
@@ -67,7 +68,14 @@ class FileStorageTest : public ::testing::Test {
     FileStorageAllocateBatch(FileStorage& fileStorage,
                              const std::vector<std::string>& keys,
                              const std::vector<int64_t>& sizes) {
-        return fileStorage.AllocateBatch(keys, sizes);
+        return fileStorage.AllocateBatch(keys, sizes,
+                                         *fileStorage.client_buffer_allocator_);
+    }
+
+    void SetPinnedRestoreArena(FileStorage& fileStorage, void* address,
+                               size_t size) {
+        fileStorage.pinned_restore_arena_allocator_ =
+            ClientBufferAllocator::create(address, size);
     }
 
     tl::expected<void, ErrorCode> FileStorageBatchLoad(
@@ -216,27 +224,45 @@ TEST_F(FileStorageTest, IsEnableOffloading) {
                 !enable_offloading_result3.value());
 }
 
-TEST_F(FileStorageTest, BatchLoad) {
+TEST_F(FileStorageTest, BatchGetUsesPinnedArenaAndFallsBackWhenFull) {
     std::vector<std::string> keys;
     std::vector<int64_t> sizes;
     std::unordered_map<std::string, std::string> batch_data;
+
     auto file_storage_config = FileStorageConfig::FromEnvironment();
     file_storage_config.storage_filepath = data_path;
+    file_storage_config.local_buffer_size = 128 * 1024 * 1024;
+    constexpr size_t kArenaSize = 2 * 1024 * 1024;
+    std::vector<char> restore_arena(kArenaSize + 4096);
     FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+    const auto arena_begin =
+        (reinterpret_cast<uintptr_t>(restore_arena.data()) + 4095) & ~4095ULL;
+    SetPinnedRestoreArena(fileStorage, reinterpret_cast<void*>(arena_begin),
+                          kArenaSize);
     ASSERT_TRUE(FileStorageBatchOffload(fileStorage, keys, sizes, batch_data));
-    std::unordered_map<std::string, Slice> batch_slice;
-    std::vector<BufferHandle> buff;
 
-    auto allocate_res = FileStorageAllocateBatch(fileStorage, keys, sizes);
-    ASSERT_TRUE(allocate_res);
+    auto pinned_result = fileStorage.BatchGetLocal(keys, sizes);
+    ASSERT_TRUE(pinned_result);
+    ASSERT_EQ(pinned_result->pointers.size(), keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        EXPECT_GE(pinned_result->pointers[i], arena_begin);
+        EXPECT_LT(pinned_result->pointers[i], arena_begin + kArenaSize);
+        EXPECT_EQ(
+            std::string(reinterpret_cast<char*>(pinned_result->pointers[i]),
+                        sizes[i]),
+            batch_data.at(keys[i]));
+    }
 
-    ASSERT_TRUE(
-        FileStorageBatchLoad(fileStorage, allocate_res.value()->slices));
-    for (auto& slice_it : batch_slice) {
-        std::string data(static_cast<char*>(slice_it.second.ptr),
-                         slice_it.second.size);
-        LOG(INFO) << "key: " << slice_it.first;
-        ASSERT_EQ(data, batch_data.at(slice_it.first));
+    auto fallback_result = fileStorage.BatchGetLocal(keys, sizes);
+    ASSERT_TRUE(fallback_result);
+    ASSERT_EQ(fallback_result->pointers.size(), keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        EXPECT_TRUE(fallback_result->pointers[i] < arena_begin ||
+                    fallback_result->pointers[i] >= arena_begin + kArenaSize);
+        EXPECT_EQ(
+            std::string(reinterpret_cast<char*>(fallback_result->pointers[i]),
+                        sizes[i]),
+            batch_data.at(keys[i]));
     }
 }
 
@@ -357,6 +383,7 @@ TEST_F(FileStorageTest, DefaultValuesWhenNoEnvSet) {
     EXPECT_EQ(config.total_size_limit, 2ULL * 1024 * 1024 * 1024 * 1024);
     EXPECT_EQ(config.heartbeat_interval_seconds, 10u);
     EXPECT_TRUE(config.enable_disk_watermark_eviction);
+    EXPECT_EQ(config.pinned_restore_arena_size, 0);
     EXPECT_DOUBLE_EQ(config.disk_eviction_high_watermark_ratio, 0.90);
     EXPECT_DOUBLE_EQ(config.disk_eviction_low_watermark_ratio, 0.80);
 }
@@ -370,6 +397,7 @@ TEST_F(FileStorageTest, ReadStringFromEnv) {
 
 TEST_F(FileStorageTest, ReadInt64FromEnv) {
     SetEnv("MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", "2147483648");  // 2GB
+    SetEnv("MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES", "67108864");
     SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1000");
     SetEnv("MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT", "5000000");
 
@@ -377,6 +405,7 @@ TEST_F(FileStorageTest, ReadInt64FromEnv) {
     auto bucket_backend_config = BucketBackendConfig::FromEnvironment();
 
     EXPECT_EQ(config.local_buffer_size, 2147483648);
+    EXPECT_EQ(config.pinned_restore_arena_size, 64 * 1024 * 1024);
     EXPECT_EQ(bucket_backend_config.bucket_keys_limit, 1000);
     EXPECT_EQ(config.total_keys_limit, 5000000);
 }
@@ -623,6 +652,10 @@ TEST_F(FileStorageTest, ValidateFailsOnInvalidLimits) {
     EXPECT_FALSE(config.Validate());
 
     config.total_size_limit = 1;
+    config.pinned_restore_arena_size = -1;
+    EXPECT_FALSE(config.Validate());
+
+    config.pinned_restore_arena_size = 0;
     config.heartbeat_interval_seconds = 0;
     EXPECT_FALSE(config.Validate());
 

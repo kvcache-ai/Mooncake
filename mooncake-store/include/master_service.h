@@ -82,6 +82,10 @@ class MasterServiceTenantQuotaTest;
 // relying on segment pressure plus the background eviction thread.
 class BatchEvictTest;
 class MasterServiceHATest;
+// Friended so the processing_keys double-erase reproduction test can
+// invalidate a segment allocator via PrepareUnmountSegment WITHOUT the
+// ClearInvalidHandles sweep that MasterService::UnmountSegment performs.
+class MasterServiceProcessingKeyDoubleEraseTest;
 }  // namespace test
 namespace benchmarks {
 class BatchEvictBench;
@@ -112,6 +116,8 @@ class MasterService {
     friend class benchmarks::BatchEvictBench;
     friend class test::MasterServiceTenantQuotaTest;
     friend class test::BatchEvictTest;
+    // double-erase processing_keys UAF repro (2026-08-03 prod segfault)
+    friend class test::MasterServiceProcessingKeyDoubleEraseTest;
     friend class MasterSnapshotManager;    // Allow access to internal state for
                                            // snapshot
     friend class ha::MasterSnapshotCodec;  // Allow codec to access private
@@ -1357,7 +1363,8 @@ class MasterService {
         ObjectMetadata& metadata);
     size_t EraseReplicasWithCacheTotalAccounting(
         ObjectMetadata& metadata,
-        const std::function<bool(const Replica&)>& pred_fn);
+        const std::function<bool(const Replica&)>& pred_fn,
+        std::vector<ReplicaID>* erased_replica_ids = nullptr);
 
     std::unordered_map<std::string, std::string> object_group_ids_
         GUARDED_BY(group_routing_mutex_);
@@ -1554,7 +1561,7 @@ class MasterService {
     // Helper to clean up stale handles pointing to unmounted segments
     // or local_disk replicas whose owner client is no longer alive.
     bool CleanupStaleHandles(
-        ObjectMetadata& metadata,
+        TenantState& tenant_state, ObjectMetadata& metadata,
         const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients,
         MetadataShardAccessorRW* shard = nullptr);
 
@@ -1655,6 +1662,10 @@ class MasterService {
             MasterMetricManager::instance().inc_promotion_cancelled();
         }
     }
+    void CancelPromotionTaskForRemovedReplicas(
+        TenantState& tenant_state, ObjectMetadata& metadata,
+        const std::vector<ReplicaID>& removed_replica_ids)
+        NO_THREAD_SAFETY_ANALYSIS;
 
     // Lease related members
     const uint64_t default_kv_lease_ttl_;     // in milliseconds
@@ -1727,10 +1738,15 @@ class MasterService {
                 // replicas.
                 const uint64_t before_charge =
                     service_->CompletedMemoryQuotaCharge(it_->second);
+                std::vector<ReplicaID> removed_replica_ids;
                 service_->EraseReplicasWithCacheTotalAccounting(
-                    it_->second, [](const Replica& replica) {
+                    it_->second,
+                    [](const Replica& replica) {
                         return replica.has_invalid_mem_handle();
-                    });
+                    },
+                    &removed_replica_ids);
+                service_->CancelPromotionTaskForRemovedReplicas(
+                    *tenant_state_, it_->second, removed_replica_ids);
                 const uint64_t after_charge =
                     service_->CompletedMemoryQuotaCharge(it_->second);
                 if (before_charge > after_charge) {
@@ -1739,12 +1755,12 @@ class MasterService {
                 }
                 // If no valid replicas remain, delete the whole object.
                 if (!it_->second.IsValid()) {
-                    const bool had_processing =
-                        processing_it_ != tenant_state_->processing_keys.end();
+                    // NOTE: Erase() -> EraseMetadata() already removes the key
+                    // from processing_keys (by key), so calling
+                    // EraseFromProcessing() here would re-erase the same node
+                    // via the now-dangling processing_it_ iterator
+                    // (use-after-free, prod segfault 2026-08-03).
                     this->Erase();
-                    if (tenant_state_ != nullptr && had_processing) {
-                        this->EraseFromProcessing();
-                    }
                     if (tenant_state_ != nullptr) {
                         service_->ErasePromotionTaskIfPresent(
                             *tenant_state_, object_id_.user_key,

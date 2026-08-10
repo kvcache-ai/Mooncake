@@ -301,9 +301,7 @@ RdmaContext::RdmaContext(RdmaTransport& transport)
     std::call_once(g_once_flag, fork_init);
 }
 
-RdmaContext::~RdmaContext() {
-    if (status_ != DEVICE_UNINIT) disable();
-}
+RdmaContext::~RdmaContext() { disable(); }
 
 int RdmaContext::construct(const std::string& device_name,
                            std::shared_ptr<RdmaParams> params) {
@@ -320,9 +318,14 @@ int RdmaContext::construct(const std::string& device_name,
 }
 
 int RdmaContext::enable() {
-    if (status_ != DEVICE_DISABLED) {
+    if (status_ == DEVICE_ENABLED || status_ == DEVICE_PAUSED) {
         LOG(WARNING) << "RDMA context " << name() << " has been enabled";
         return 0;
+    }
+    if (status_ != DEVICE_DISABLED) {
+        LOG(ERROR) << "RDMA context " << name() << " cannot be enabled from "
+                   << statusToString(status_);
+        return -1;
     }
     if (openDevice(device_name_, params_->device.port)) {
         LOG(ERROR) << "Failed to open device [" << device_name_ << "] on port ["
@@ -369,13 +372,13 @@ int RdmaContext::enable() {
     }
 
     for (int i = 0; i < params_->device.num_cq_list; ++i) {
-        auto cq = new RdmaCQ();
+        auto cq = std::make_unique<RdmaCQ>();
         int ret = cq->construct(this, params_->device.max_cqe, i);
         if (ret) {
             disable();
             return ret;
         }
-        cq_list_.push_back(cq);
+        cq_list_.push_back(cq.release());
     }
 
     // Create dedicated notification CQ
@@ -419,9 +422,7 @@ int RdmaContext::enable() {
     if (ret) {
         PLOG(ERROR) << "Failed to query port " << params_->device.port << " on "
                     << device_name_;
-        if (verbs_.ibv_close_device(native_context_)) {
-            PLOG(ERROR) << "ibv_close_device";
-        }
+        disable();
         return -1;
     }
 
@@ -439,21 +440,31 @@ int RdmaContext::enable() {
 }
 
 int RdmaContext::disable() {
-    if (status_ == DEVICE_UNINIT || status_ == DEVICE_DISABLED) {
+    if (!native_context_ && !native_pd_ && event_fd_ < 0 &&
+        comp_channel_.empty() && cq_list_.empty() && !notify_cq_) {
         LOG(WARNING) << "RDMA context " << name() << " has been deconstructed";
         return 0;
     }
-    if (endpoint_store_->clear()) {
+    if (endpoint_store_ && endpoint_store_->clear()) {
         LOG(ERROR) << "Failed to destroy all endpoints for context " << name()
                    << "; preserving CQ, PD and device resources for retry";
         return -1;
     }
 
-    for (auto& entry : mr_set_) {
-        int ret = verbs_.ibv_dereg_mr(entry);
-        if (ret) PLOG(ERROR) << "ibv_dereg_mr";
+    cleanupResources();
+    status_ = DEVICE_DISABLED;
+    return 0;
+}
+
+void RdmaContext::cleanupResources() {
+    {
+        std::lock_guard<std::mutex> lock(mr_set_mutex_);
+        for (auto& entry : mr_set_) {
+            int ret = verbs_.ibv_dereg_mr(entry);
+            if (ret) PLOG(ERROR) << "ibv_dereg_mr";
+        }
+        mr_set_.clear();
     }
-    mr_set_.clear();
     for (auto& entry : cq_list_) {
         delete entry;
     }
@@ -486,9 +497,6 @@ int RdmaContext::disable() {
             PLOG(ERROR) << "ibv_close_device";
         native_context_ = nullptr;
     }
-
-    status_ = DEVICE_DISABLED;
-    return 0;
 }
 
 int RdmaContext::pause() {
@@ -637,7 +645,9 @@ std::string RdmaContext::gid() const {
 }
 
 RdmaCQ* RdmaContext::cq(int index) {
-    if (index < 0 || index >= params_->device.num_cq_list) return nullptr;
+    // params_ is null until construct(): an inert context has no CQs.
+    if (!params_ || index < 0 || index >= params_->device.num_cq_list)
+        return nullptr;
     return cq_list_.empty() ? nullptr : cq_list_[index];
 }
 

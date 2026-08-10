@@ -54,9 +54,6 @@ using namespace mooncake;
 
 namespace mooncake {
 
-DEFINE_string(metadata_server, "127.0.0.1:2379",
-              "central metadata server for transfer engine");
-
 // Small max_mr_size so the >max_mr_size path is exercised without needing a
 // multi-GB allocation. Must be set before TransferEngine init (config reads
 // env).

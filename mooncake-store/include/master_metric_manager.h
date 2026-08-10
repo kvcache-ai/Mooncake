@@ -81,10 +81,6 @@ class MasterMetricManager {
     CacheHitStatDict calculate_cache_stats();
 
     // Memory Storage Metrics
-    void inc_allocated_mem_size(int64_t val = 1);
-    void dec_allocated_mem_size(int64_t val = 1);
-    void inc_total_mem_capacity(int64_t val = 1);
-    void dec_total_mem_capacity(int64_t val = 1);
     int64_t get_allocated_mem_size();
     int64_t get_total_mem_capacity();
     double get_segment_mem_used_ratio(const std::string& segment);
@@ -92,17 +88,20 @@ class MasterMetricManager {
     void reset_segment_total_mem_capacity(const std::string& segment);
     int64_t get_segment_allocated_mem_size(const std::string& segment);
     int64_t get_segment_total_mem_capacity(const std::string& segment);
+    // Remove all per-segment metric labels for the given segment.
+    // Called when a segment is unmounted to prevent stale 0-value entries
+    // from persisting in Prometheus output (e.g. after snapshot restore
+    // followed by client expiry / reaper cleanup).
+    void remove_segment_metrics(const std::string& segment);
 
     // NoF segment Metrics
-    void inc_allocated_nof_size(int64_t val = 1);
-    void dec_allocated_nof_size(int64_t val = 1);
-    void inc_total_nof_capacity(int64_t val = 1);
-    void dec_total_nof_capacity(int64_t val = 1);
     int64_t get_allocated_nof_size();
     int64_t get_total_nof_capacity();
     double get_segment_nof_used_ratio(const std::string& segment);
     int64_t get_segment_allocated_nof_size(const std::string& segment);
     int64_t get_segment_total_nof_capacity(const std::string& segment);
+    // Remove all per-segment NoF metric labels for the given segment.
+    void remove_nof_segment_metrics(const std::string& segment);
 
     // File Storage Metrics
     void inc_allocated_file_size(int64_t val = 1);

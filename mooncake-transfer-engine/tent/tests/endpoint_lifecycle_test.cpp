@@ -16,11 +16,29 @@
 
 #include <memory>
 
+#include "tent/common/utils/string_builder.h"
 #include "tent/transport/rdma/endpoint.h"
 #include "tent/transport/rdma/slice.h"
 
 namespace mooncake {
 namespace tent {
+
+class EndpointTestAccess {
+   public:
+    // Puts a context-less endpoint into the state a completed bootstrap
+    // leaves behind, so accept() can be driven without an RDMA device.
+    static void markConnected(RdmaEndPoint& endpoint,
+                              const std::string& peer_server_name,
+                              const std::string& peer_nic_name,
+                              const std::vector<uint32_t>& peer_qp_num_list) {
+        endpoint.peer_server_name_ = peer_server_name;
+        endpoint.peer_nic_name_ = peer_nic_name;
+        endpoint.peer_qp_num_list_ = peer_qp_num_list;
+        endpoint.status_.store(RdmaEndPoint::EP_READY,
+                               std::memory_order_relaxed);
+    }
+};
+
 namespace {
 
 TEST(EndpointLifecycleTest, DefaultConstructedEndpointOwnsNoResources) {
@@ -150,6 +168,23 @@ TEST(EndpointLifecycleTest, SliceWeakPtrResetClearsReference) {
     EXPECT_TRUE(slice.ep_weak_ptr.expired());
     EXPECT_EQ(slice.ep_weak_ptr.lock(), nullptr);
     EXPECT_NE(endpoint, nullptr);
+}
+
+TEST(EndpointLifecycleTest, BootstrapWithNewPeerQpsRetiresEstablishedEndpoint) {
+    // The peer dropped its endpoint (store eviction or a transfer failure)
+    // and bootstraps again with a fresh QP set. The established endpoint now
+    // points at QPs that no longer exist, so it must retire instead of
+    // staying EP_READY and rejecting every later bootstrap from that peer.
+    RdmaEndPoint endpoint;
+    EndpointTestAccess::markConnected(endpoint, "10.0.0.1:12345", "mlx5_0",
+                                      {100, 101});
+
+    BootstrapDesc peer_desc, local_desc;
+    peer_desc.local_nic_path = MakeNicPath("10.0.0.1:12345", "mlx5_0");
+    peer_desc.qp_num = {200, 201};
+
+    EXPECT_FALSE(endpoint.accept(peer_desc, local_desc).ok());
+    EXPECT_EQ(endpoint.status(), RdmaEndPoint::EP_DESTROYING);
 }
 
 TEST(EndpointLifecycleTest, ExternalOwnerCanReleaseAfterExplicitDeconstruct) {

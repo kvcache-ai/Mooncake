@@ -300,6 +300,8 @@ struct FileStorageConfig {
     // Size of the local client-side buffer (used for caching or batching)
     int64_t local_buffer_size = 1280 * kMB;  // ~1.2 GB
 
+    int64_t pinned_restore_arena_size = 0;
+
     // Limits for scanning and iteration operations
     int64_t scanmeta_iterator_keys_limit =
         20000;  // Max number of keys returned per Scan call, required by bucket

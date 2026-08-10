@@ -51,6 +51,12 @@ struct GlobalConfig {
     size_t num_qp_per_ep = 2;
     size_t max_sge = 4;
     size_t max_wr = 256;
+    // Set when MC_MAX_WR was given explicitly.  EFA's transmit depth is a
+    // per-device attribute (2048 on p6-b300, 4096 on p5), so with no override
+    // the EFA transport adopts the provider's depth rather than max_wr; with
+    // one it honors the operator's value, clamped to the hardware.  The RDMA
+    // transport passes max_wr to ibv_create_qp() and is unaffected.
+    bool max_wr_from_env = false;
     size_t max_inline = 64;
     ibv_mtu mtu_length = IBV_MTU_4096;
     uint16_t handshake_port = 12001;

@@ -434,6 +434,25 @@ def write_manifest(
     )
 
 
+def test_default_bundle_chunk_tuning_matches_rollout_transfer_target() -> None:
+    assert sos.DEFAULT_BUNDLE_CHUNK_BYTES == 64 * 1024**2
+    assert sos.AUTO_PARALLEL_MIN_BYTES == sos.DEFAULT_BUNDLE_CHUNK_BYTES
+
+
+def test_small_dict_sized_groups_enable_auto_parallel_put() -> None:
+    class SizedBuffer:
+        def __init__(self, size: int) -> None:
+            self._size = size
+
+        def __len__(self) -> int:
+            return self._size
+
+    _store, transfer = make_transfer()
+    groups = [[SizedBuffer(1024**2)] for _ in range(128)]
+    policy = BundleTransferPolicy(max_inflight_put=8)
+    assert transfer._transport._resolve_buffer_group_put_mode(groups, policy) == "parallel"
+
+
 def test_put_object_roundtrips_numpy_and_torch_tensor_fields() -> None:
     torch = pytest.importorskip("torch")
     store, transfer = make_transfer()
@@ -589,91 +608,14 @@ def test_bundle_copy_mode_forces_store_put() -> None:
     assert result.objects["payload"] == payload
 
 
-def test_structured_object_copy_mode_skips_pre_registered_validation() -> None:
-    store, transfer = make_transfer()
-    payload = np.arange(64, dtype=np.uint8).reshape(8, 8).T
-
-    ref = transfer.put_structured_object(
-        structured_payload(payload=payload),
-        policy=BundleTransferPolicy(copy_mode="copy"),
-        pre_registered_buffers={"payload": True},
-    )
-
-    assert store.batch_put_from_calls == 0
-    assert store.register_buffer_calls == 0
-    assert store.unregister_buffer_calls == 0
-
-    result = transfer.materialize(transfer.read_spec(ref))
-    assert np.array_equal(result.objects["payload"], payload)
-
-
 def test_bundle_zero_copy_mode_requires_batch_put_support() -> None:
     _store, transfer = make_transfer(MinimalStore())
 
-    with pytest.raises(RuntimeError, match="zero-copy put requested"):
+    with pytest.raises(RuntimeError, match="zero-copy put"):
         transfer.put_structured_object(
             structured_payload(payload=b"data"),
             policy=BundleTransferPolicy(copy_mode="zero_copy"),
         )
-
-
-def test_structured_object_pre_registered_buffers_passthrough() -> None:
-    store, transfer = make_transfer()
-    payload = np.arange(64, dtype=np.uint8).reshape(8, 8)
-    payload_ptr = ctypes.addressof(ctypes.c_char.from_buffer(payload))
-    assert store.register_buffer(payload_ptr, int(payload.nbytes)) == 0
-    store.register_buffer_calls = 0
-    store.unregister_buffer_calls = 0
-
-    ref = transfer.put_structured_object(
-        structured_payload(payload=payload),
-        pre_registered_buffers={"payload": True},
-    )
-
-    assert store.batch_put_from_calls > 0
-    assert store.register_buffer_calls == 0
-    assert store.unregister_buffer_calls == 0
-    assert payload_ptr in store.registered
-
-    result = transfer.materialize(transfer.read_spec(ref))
-    assert np.array_equal(result.objects["payload"], payload)
-    store.unregister_buffer(payload_ptr)
-
-
-def test_structured_object_pre_registered_rejects_copied_buffers() -> None:
-    _store, transfer = make_transfer()
-    non_contiguous = np.arange(64, dtype=np.uint8).reshape(8, 8).T
-
-    with pytest.raises(ValueError, match="pre-registered structured buffer"):
-        transfer.put_structured_object(
-            structured_payload(payload=non_contiguous),
-            pre_registered_buffers={"payload": True},
-        )
-
-    with pytest.raises(ValueError, match="pre-registered structured buffer"):
-        transfer.put_structured_object(
-            structured_payload(payload=b"readonly"),
-            pre_registered_buffers={"payload": True},
-        )
-
-    with pytest.raises(ValueError, match="unknown pre-registered"):
-        transfer.put_structured_object(
-            structured_payload(payload=bytearray(b"data")),
-            pre_registered_buffers={"missing": True},
-        )
-
-
-def test_structured_object_pre_registered_empty_buffer() -> None:
-    _store, transfer = make_transfer()
-    payload = bytearray()
-
-    ref = transfer.put_structured_object(
-        structured_payload(payload=payload),
-        pre_registered_buffers={"payload": True},
-    )
-
-    result = transfer.materialize(transfer.read_spec(ref))
-    assert result.objects["payload"] == b""
 
 
 def test_structured_object_roundtrip() -> None:
@@ -745,6 +687,8 @@ def test_structured_object_ndarray_read_can_use_buffer_pool() -> None:
     payload = structured_payload(weights=array)
 
     ref = transfer.put_structured_object(payload, chunk_bytes=32)
+    pool.acquire_sizes.clear()
+    before_release_count = pool.release_count
     before_range_reads = store.get_into_ranges_calls
     result = transfer.materialize(transfer.read_spec(ref))
 
@@ -754,9 +698,9 @@ def test_structured_object_ndarray_read_can_use_buffer_pool() -> None:
     assert pool.acquire_sizes == [array.nbytes]
 
     MooncakeBundleTransfer.release_result(result.objects)
-    assert pool.release_count == 1
+    assert pool.release_count == before_release_count + 1
     MooncakeBundleTransfer.release_result(result.objects)
-    assert pool.release_count == 1
+    assert pool.release_count == before_release_count + 1
 
 
 def test_structured_object_multi_buffer_payload_uses_pool_batch_put() -> None:
@@ -809,30 +753,6 @@ def test_structured_object_multi_buffer_put_cleans_all_chunk_keys_on_failure() -
     assert pool.release_count == 2
 
 
-def test_structured_object_multi_buffer_zero_copy_put_uses_batch_put() -> None:
-    store, transfer = make_transfer()
-    parts = [bytearray(b"ab"), bytearray(b"cd"), bytearray(b"ef")]
-    payload = StructuredObjectPayload(
-        metadata={},
-        buffers={
-            "raw": sos._MultiBufferPayload(
-                buffers=tuple(memoryview(part) for part in parts),
-                owners=tuple(parts),
-            )
-        },
-    )
-
-    ref = transfer.put_structured_object(
-        payload, chunk_bytes=4, policy=BundleTransferPolicy(copy_mode="zero_copy")
-    )
-    result = transfer.materialize(transfer.read_spec(ref))
-
-    raw = result.objects["raw"]
-    raw_bytes = raw if isinstance(raw, bytes) else raw.tobytes()
-    assert raw_bytes == b"abcdef"
-    assert store.batch_put_from_calls > 0
-
-
 def test_structured_object_multi_buffer_zero_copy_requires_batch_put_support() -> None:
     _store, transfer = make_transfer(MinimalStore())
     parts = [bytearray(b"ab"), bytearray(b"cd")]
@@ -846,7 +766,7 @@ def test_structured_object_multi_buffer_zero_copy_requires_batch_put_support() -
         },
     )
 
-    with pytest.raises(RuntimeError, match="zero-copy put requested"):
+    with pytest.raises(RuntimeError, match="zero-copy put"):
         transfer.put_structured_object(
             payload, policy=BundleTransferPolicy(copy_mode="zero_copy")
         )
@@ -1031,48 +951,6 @@ def test_bundle_remove_recovers_after_transient_batch_failure() -> None:
 
     assert store.objects == {}
     assert store.batch_remove_calls == 1
-
-
-def test_bundle_concurrent_put_and_read_spec_full_read() -> None:
-    store, transfer = make_transfer(GetOnlyStore())
-    payload = bytes(range(128))
-
-    ref = transfer.put_structured_object(
-        structured_payload(payload=payload),
-        chunk_bytes=8,
-        policy=BundleTransferPolicy(max_inflight_put=4, put_mode="parallel"),
-    )
-    result = transfer.materialize(transfer.read_spec(ref))
-
-    assert result.objects["payload"] == payload
-    assert store.max_active_puts > 1
-    assert store.max_active_gets >= 1
-
-
-def test_bundle_duplicate_source_registration_is_tolerated() -> None:
-    store, transfer = make_transfer(StrictRegisterStore())
-    payload = np.arange(64, dtype=np.uint8).reshape(8, 8)
-    payload_ptr = ctypes.addressof(ctypes.c_char.from_buffer(payload))
-    assert store.register_buffer(payload_ptr, int(payload.nbytes)) == 0
-
-    ref = transfer.put_structured_object(structured_payload(payload=payload))
-
-    assert ref.manifest["buffers"]["payload"]["bytes"] == int(payload.nbytes)
-    assert payload_ptr in store.registered
-    store.unregister_buffer(payload_ptr)
-
-
-def test_bundle_partial_register_failure_unwinds_registered_buffers() -> None:
-    store, transfer = make_transfer(FailingRegisterStore(fail_on_register=2))
-    payload = bytes(range(64))
-
-    with pytest.raises(RuntimeError, match="register_buffer"):
-        transfer.put_structured_object(
-            structured_payload(payload=payload), chunk_bytes=32
-        )
-
-    assert store.registered == set()
-    assert store.objects == {}
 
 
 def test_bundle_batch_get_failure_unregisters_buffer() -> None:
@@ -1744,9 +1622,9 @@ def test_dataproto_field_schema_encodes_typed_ragged_non_tensor_field() -> None:
     )
     result = transfer.get_dataproto(ref)["non_tensor_batch"]["tokens"]
 
-    assert result[0] == [1, 2]
+    assert result[0].tolist() == [1, 2]
     assert result[1] is None
-    assert result[2] == [3]
+    assert result[2].tolist() == [3]
 
     bad_text = np.asarray([object()], dtype=object)
     with pytest.raises(AttributeError, match="failed to encode.*'text'.*utf8_ragged"):
@@ -1955,6 +1833,59 @@ def test_unified_put_get_roundtrips_flat_dict() -> None:
     assert result["step"] == 7
 
 
+def test_unified_dict_get_returns_flat_lists_without_changing_dataproto_shape() -> None:
+    _store, transfer = make_transfer()
+    data = {
+        "tokens": [
+            np.asarray([1, 2], dtype=np.int32),
+            np.asarray([3], dtype=np.int32),
+            np.asarray([4, 5, 6], dtype=np.int32),
+        ],
+        "json": [{"rank": 0}, {"rank": 1}, {"rank": 2}],
+    }
+    schemas = {
+        "tokens": FieldSchema(
+            codec="typed_ragged",
+            metadata={"section": "non_tensor_batch", "dtype": "int32"},
+        ),
+        "json": FieldSchema(
+            codec="msgpack_ragged",
+            metadata={"section": "non_tensor_batch"},
+        ),
+    }
+
+    ref = transfer.put(data, type="dict", field_schemas=schemas)
+
+    flat = transfer.get(ref, type="dict")
+    assert isinstance(flat["tokens"], list)
+    assert isinstance(flat["json"], list)
+    assert [row.tolist() for row in flat["tokens"]] == [[1, 2], [3], [4, 5, 6]]
+    assert flat["json"] == [{"rank": 0}, {"rank": 1}, {"rank": 2}]
+
+    sliced = transfer.get(ref, type="dict", rows=slice(1, 3))
+    assert isinstance(sliced["tokens"], list)
+    assert isinstance(sliced["json"], list)
+    assert [row.tolist() for row in sliced["tokens"]] == [[3], [4, 5, 6]]
+    assert sliced["json"] == [{"rank": 1}, {"rank": 2}]
+
+    envelope = transfer.get_dataproto(ref, data_cls=dict)
+    non_tensor_batch = envelope["non_tensor_batch"]
+    assert isinstance(non_tensor_batch["tokens"], np.ndarray)
+    assert non_tensor_batch["tokens"].dtype == object
+    assert isinstance(non_tensor_batch["json"], np.ndarray)
+    assert non_tensor_batch["json"].dtype == object
+    assert [row.tolist() for row in non_tensor_batch["tokens"]] == [
+        [1, 2],
+        [3],
+        [4, 5, 6],
+    ]
+    assert non_tensor_batch["json"].tolist() == [
+        {"rank": 0},
+        {"rank": 1},
+        {"rank": 2},
+    ]
+
+
 def test_unified_put_rejects_unknown_type() -> None:
     _store, transfer = make_transfer()
 
@@ -1963,14 +1894,14 @@ def test_unified_put_rejects_unknown_type() -> None:
 
 
 @pytest.mark.parametrize(
-    ("policy", "config_attr"),
+    ("policy", "config_attr", "use_pool"),
     [
-        (BundleTransferPolicy(copy_mode="copy"), "put_configs"),
-        (None, "batch_put_from_configs"),
+        (BundleTransferPolicy(copy_mode="copy"), "put_configs", False),
+        (None, "batch_put_from_configs", True),
     ],
 )
-def test_unified_dict_put_passes_store_config_to_writes(policy, config_attr) -> None:
-    store, transfer = make_transfer()
+def test_unified_dict_put_passes_store_config_to_writes(policy, config_attr, use_pool) -> None:
+    store, transfer = make_transfer(buffer_pool=FakeBufferPool() if use_pool else None)
     config = object()
     data = {"input_ids": np.arange(12, dtype=np.int64).reshape(4, 3)}
     kwargs = {"config": config}
@@ -2020,12 +1951,48 @@ def test_unified_dict_put_accepts_field_schemas() -> None:
     result = transfer.get(ref, type="dict")
 
     assert np.array_equal(result["input_ids"], np.arange(2))
-    assert result["tokens"] == [[1, 2], None]
+    assert result["tokens"][0].tolist() == [1, 2]
+    assert result["tokens"][1] is None
     assert result["partition"] == [0, 1]
     assert result["response_lengths"] == [2, 0]
     assert result["global_batch_sizes"] == [2]
     assert result["num_microbatches"] == 1
     assert result["step"] == 7
+
+
+def test_release_result_recurses_into_ragged_row_views() -> None:
+    class FakeOwner:
+        def __init__(self) -> None:
+            self.release_count = 0
+
+        def release(self) -> None:
+            self.release_count += 1
+
+    class OwnedArray(np.ndarray):
+        def __new__(cls, data, owner):
+            array = np.asarray(data).view(cls)
+            array._mooncake_pool_owner = owner
+            return array
+
+        def __array_finalize__(self, obj) -> None:
+            if obj is not None:
+                self._mooncake_pool_owner = getattr(
+                    obj, "_mooncake_pool_owner", None
+                )
+
+    owner = FakeOwner()
+    other_owner = FakeOwner()
+    base = OwnedArray(np.arange(6, dtype=np.int64), owner)
+    other = OwnedArray(np.arange(2, dtype=np.int64), other_owner)
+    object_items = np.empty(1, dtype=object)
+    object_items[0] = base[4:5]
+
+    MooncakeBundleTransfer.release_result(
+        {"values": [None, 0, base[:2], {"nested": (base[2:4], object_items)}, other[:1]]}
+    )
+
+    assert owner.release_count == 1
+    assert other_owner.release_count == 1
 
 
 def test_ref_aliases_match_dataproto_ref_helpers() -> None:
@@ -3004,12 +2971,33 @@ def test_dataproto_helper_typed_ragged_uses_multi_buffer_put() -> None:
     result = transfer.get_dataproto(ref)
 
     assert ref.encoded_non_tensor["tokens"]["codec"] == "typed_ragged"
-    assert result["non_tensor_batch"]["tokens"].tolist() == [[1, 2], None, [3, 4, 5]]
+    tokens = result["non_tensor_batch"]["tokens"].tolist()
+    assert [None if row is None else row.tolist() for row in tokens] == [
+        [1, 2],
+        None,
+        [3, 4, 5],
+    ]
     assert rows[0].nbytes + rows[2].nbytes in pool.acquire_sizes
 
 
-def test_dataproto_helper_typed_ragged_zero_copy_put() -> None:
-    store, transfer = make_transfer()
+def test_typed_ragged_uses_direct_copy_payload_when_fast_copy_available() -> None:
+    if sos._concat_arrays_into is None:
+        pytest.skip("native fast-copy extension is unavailable")
+    rows = [
+        np.arange(2, dtype=np.int32),
+        np.arange(3, dtype=np.int32),
+    ]
+
+    payload, metadata = sos._encode_typed_ragged_values(rows, dtype_hint=np.int32)
+
+    assert metadata["shape_policy"] == "ragged"
+    assert isinstance(payload["data"], sos._DirectCopyPayload)
+    assert payload["data"].shape == (5,)
+
+
+def test_dataproto_helper_typed_ragged_fast_copy_put() -> None:
+    pool = FakeBufferPool()
+    store, transfer = make_transfer(buffer_pool=pool)
     rows = np.empty(3, dtype=object)
     rows[:] = [
         np.asarray([1, 2], dtype=np.int32),
@@ -3018,11 +3006,200 @@ def test_dataproto_helper_typed_ragged_zero_copy_put() -> None:
     ]
     data = SimpleDataProto(non_tensor_batch={"tokens": rows})
 
-    ref = transfer.put_dataproto(data, policy=BundleTransferPolicy(copy_mode="zero_copy"))
+    ref = transfer.put_dataproto(data)
     result = transfer.get_dataproto(ref)
 
-    assert result["non_tensor_batch"]["tokens"].tolist() == [[1, 2], None, [3, 4, 5]]
+    tokens = result["non_tensor_batch"]["tokens"].tolist()
+    assert [None if row is None else row.tolist() for row in tokens] == [
+        [1, 2],
+        None,
+        [3, 4, 5],
+    ]
     assert store.batch_put_from_calls > 0
+    assert rows[0].nbytes + rows[2].nbytes in pool.acquire_sizes
+
+
+def test_direct_copy_put_rolls_back_all_chunks_on_late_failure() -> None:
+    if sos._concat_arrays_into is None:
+        pytest.skip("native fast-copy extension is unavailable")
+    store = FailingBatchPutStore(fail_on_call=2)
+    pool = FakeBufferPool()
+    _, transfer = make_transfer(store=store, buffer_pool=pool)
+    arrays = [
+        np.asarray([1, 2], dtype=np.int32),
+        np.asarray([3, 4], dtype=np.int32),
+        np.asarray([5, 6], dtype=np.int32),
+    ]
+    payload = sos._DirectCopyPayload.from_flat_arrays(
+        arrays, np.dtype(np.int32), total_elems=6
+    )
+
+    with pytest.raises(RuntimeError, match="batch_put_from"):
+        transfer._bundle_store._put_direct_copy_payload(
+            "payload",
+            payload,
+            chunk_bytes=8,
+            transfer_policy=BundleTransferPolicy(),
+        )
+
+    assert store.objects == {}
+    assert pool.acquire_count == pool.release_count == 2
+
+
+def test_dataproto_helper_typed_ragged_rejects_short_fast_copy(monkeypatch) -> None:
+    pool = FakeBufferPool()
+    _store, transfer = make_transfer(buffer_pool=pool)
+    rows = np.empty(2, dtype=object)
+    rows[:] = [np.asarray([1, 2], dtype=np.int32), np.asarray([3], dtype=np.int32)]
+
+    monkeypatch.setattr(sos, "_concat_arrays_into", lambda *args: args[2] - 1)
+
+    with pytest.raises(RuntimeError, match="native fast-copy wrote"):
+        transfer.put_dataproto(SimpleDataProto(non_tensor_batch={"tokens": rows}))
+
+
+def test_dataproto_helper_typed_ragged_zero_copy_rejects_source_buffers() -> None:
+    _store, transfer = make_transfer(buffer_pool=FakeBufferPool())
+    rows = np.empty(2, dtype=object)
+    rows[:] = [
+        np.asarray([1, 2], dtype=np.int32),
+        np.asarray([3], dtype=np.int32),
+    ]
+
+    with pytest.raises(RuntimeError, match="zero-copy put"):
+        transfer.put_dataproto(
+            SimpleDataProto(non_tensor_batch={"tokens": rows}),
+            policy=BundleTransferPolicy(copy_mode="zero_copy"),
+        )
+
+
+def test_typed_ragged_packs_ndarray_rows_contiguously() -> None:
+    _store, transfer = make_transfer()
+    rows = [
+        np.asarray(7, dtype=np.int32),
+        np.arange(3, dtype=np.int32),
+        None,
+        np.arange(4, dtype=np.int32).reshape(2, 2),
+        np.arange(6, dtype=np.int32).reshape(2, 3),
+    ]
+
+    ref = transfer.put(
+        {"values": rows},
+        field_schemas={
+            "values": FieldSchema(
+                codec="typed_ragged",
+                metadata={"section": "non_tensor_batch"},
+            )
+        },
+        type="dict",
+    )
+    result = transfer.get(ref, type="dict")
+    view = transfer.dataproto_manifest_view(ref)
+
+    encoded = ref.encoded_non_tensor["values"]
+    assert encoded["codec"] == "typed_ragged"
+    assert encoded["metadata"]["physical_layout"] == "contiguous_flat"
+    assert view["non_tensor_fields"]["values"]["spec"]["payload_specs"]["data"][
+        "shape"
+    ] == [14]
+    assert [
+        None if row is None else row.tolist() for row in result["values"]
+    ] == [
+        None if row is None else row.tolist() for row in rows
+    ]
+    assert all(
+        row is None or isinstance(row, np.ndarray) for row in result["values"]
+    )
+    assert result["values"][0].shape == ()
+    assert [row.dtype for row in result["values"] if row is not None] == [
+        np.dtype(np.int32)
+    ] * 4
+    gathered = transfer.get_dataproto(
+        ref, non_tensor_fields=["values"], rows=[4, 2, 0]
+    )
+    assert [
+        None if row is None else row.tolist()
+        for row in gathered["non_tensor_batch"]["values"]
+    ] == [
+        rows[4].tolist(),
+        None,
+        rows[0].tolist(),
+    ]
+    assert gathered["non_tensor_batch"]["values"][2].shape == ()
+
+
+def _typed_ragged_payload_array(
+    payload: dict[str, object], dtype: np.dtype
+) -> np.ndarray:
+    data = payload["data"]
+    arrays = getattr(data, "arrays", None)
+    if arrays is not None:
+        flat_arrays = [
+            np.asarray(array, dtype=dtype).reshape(-1) for array in arrays
+        ]
+        if not flat_arrays:
+            return np.asarray([], dtype=dtype)
+        return np.concatenate(flat_arrays)
+    return np.concatenate([np.frombuffer(buf, dtype=dtype) for buf in data.buffers])
+
+def test_typed_ragged_fast_decodes_equal_shape_ndarray_views() -> None:
+    rows = [np.arange(6, dtype=np.int32).reshape(2, 3) + i * 10 for i in range(3)]
+    payload, metadata = sos._encode_typed_ragged_values(rows, np.dtype(np.int32))
+    data = _typed_ragged_payload_array(payload, np.dtype(np.int32))
+
+    decoded = sos._decode_typed_ragged_values({**payload, "data": data}, 3, metadata)
+
+    assert metadata["physical_layout"] == "contiguous_flat"
+    assert all(isinstance(row, np.ndarray) for row in decoded)
+    assert all(np.shares_memory(row, data) for row in decoded)
+    assert [row.tolist() for row in decoded] == [row.tolist() for row in rows]
+
+
+def test_typed_ragged_single_ndarray_row_uses_general_layout() -> None:
+    rows = [np.arange(6, dtype=np.int32).reshape(2, 3)]
+
+    assert sos._encode_typed_ragged_regular_ndarray_rows(
+        rows, np.dtype(np.int32)
+    ) is None
+    payload, metadata = sos._encode_typed_ragged_values(rows, np.dtype(np.int32))
+    data = _typed_ragged_payload_array(payload, np.dtype(np.int32))
+
+    decoded = sos._decode_typed_ragged_values({**payload, "data": data}, 1, metadata)
+
+    assert metadata["physical_layout"] == "contiguous_flat"
+    assert isinstance(decoded[0], np.ndarray)
+    assert np.shares_memory(decoded[0], data)
+    assert decoded[0].tolist() == rows[0].tolist()
+
+
+def test_typed_ragged_equal_shape_rows_with_nulls_use_general_layout() -> None:
+    rows = [
+        np.arange(6, dtype=np.int32).reshape(2, 3),
+        None,
+        np.arange(6, 12, dtype=np.int32).reshape(2, 3),
+    ]
+
+    assert sos._encode_typed_ragged_regular_ndarray_rows(
+        rows, np.dtype(np.int32)
+    ) is None
+    payload, metadata = sos._encode_typed_ragged_values(rows, np.dtype(np.int32))
+    data = _typed_ragged_payload_array(payload, np.dtype(np.int32))
+
+    decoded = sos._decode_typed_ragged_values({**payload, "data": data}, 3, metadata)
+
+    assert metadata["physical_layout"] == "contiguous_flat"
+    assert decoded[1] is None
+    assert all(
+        row is None or isinstance(row, np.ndarray) for row in decoded
+    )
+    assert all(
+        row is None or np.shares_memory(row, data) for row in decoded
+    )
+    assert [None if row is None else row.tolist() for row in decoded] == [
+        rows[0].tolist(),
+        None,
+        rows[2].tolist(),
+    ]
 
 
 def test_dataproto_helper_rejects_unsupported_object_non_tensor() -> None:
@@ -3059,6 +3236,7 @@ def test_dataproto_helper_ragged_tensor_non_tensor_roundtrip() -> None:
     result = transfer.get_dataproto(ref)
 
     assert ref.encoded_non_tensor["ragged"]["codec"] == "ragged_tensor"
+    assert ref.encoded_non_tensor["ragged"]["metadata"]["dtype"] == "torch.float32"
     actual = result["non_tensor_batch"]["ragged"]
     assert torch.equal(actual[0], ragged[0])
     assert actual[1] is None
@@ -3072,6 +3250,60 @@ def test_dataproto_helper_ragged_tensor_non_tensor_roundtrip() -> None:
     ]
     with pytest.raises(ValueError, match="mixed tensor dtype"):
         transfer.put_dataproto(SimpleDataProto(non_tensor_batch={"ragged": mixed}))
+
+    bfloat = np.empty(1, dtype=object)
+    bfloat[0] = torch.zeros(1, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="bfloat16"):
+        transfer.put_dataproto(SimpleDataProto(non_tensor_batch={"ragged": bfloat}))
+
+
+def test_dataproto_helper_jagged_nested_batch_tensor_roundtrip() -> None:
+    torch = pytest.importorskip("torch")
+    _store, transfer = make_transfer()
+    rows = [
+        torch.arange(2, dtype=torch.int64),
+        torch.arange(10, 14, dtype=torch.int64),
+        torch.arange(20, 21, dtype=torch.int64),
+    ]
+    nested = torch.nested.as_nested_tensor(rows, layout=torch.jagged)
+
+    ref = transfer.put_dataproto(SimpleDataProto(batch={"tokens": nested}))
+    view = transfer.dataproto_manifest_view(ref)
+
+    field_spec = view["batch_fields"]["tokens"]["spec"]
+    assert field_spec["encoding"] == "torch_tensor"
+    assert field_spec["dtype"] == "torch.int64"
+    assert field_spec["nested"] is True
+    assert field_spec["format"] in {"tensor_parts", "torch_save"}
+    if field_spec["format"] == "tensor_parts":
+        assert len(field_spec["part_bytes"]) == 2
+
+    for selection, expected_rows in (
+        (None, rows),
+        (slice(1, 3), rows[1:3]),
+        ([2, 0], [rows[2], rows[0]]),
+        ([], []),
+    ):
+        result = transfer.get_dataproto(ref, rows=selection)["batch"]["tokens"]
+        assert result.is_nested
+        assert result.layout == torch.jagged
+        assert len(result) == len(expected_rows)
+        for actual, expected in zip(result.unbind(), expected_rows):
+            assert torch.equal(actual, expected)
+
+    matrix_rows = [
+        torch.arange(6, dtype=torch.int64).reshape(2, 3),
+        torch.arange(10, dtype=torch.int64).reshape(2, 5),
+    ]
+    matrix = torch.nested.as_nested_tensor(matrix_rows, layout=torch.jagged)
+    matrix_ref = transfer.put_dataproto(SimpleDataProto(batch={"position_ids": matrix}))
+    matrix_result = transfer.get_dataproto(matrix_ref)["batch"]["position_ids"]
+
+    assert matrix_result.is_nested
+    assert matrix_result.layout == torch.jagged
+    assert matrix_result._ragged_idx == 2
+    for actual, expected in zip(matrix_result.unbind(), matrix_rows):
+        assert torch.equal(actual, expected)
 
 
 def _assert_tensor_object_equal(actual, expected) -> None:
@@ -3203,11 +3435,13 @@ def test_dataproto_helper_dict_of_native_object_leaves_uses_recursive_codec() ->
     assert ref.encoded_non_tensor["samples"]["codec"] == "structured_recursive"
     assert actual[0]["media"] == [b"a", b"bc"]
     assert actual[0]["blob"] == b"payload-0"
-    assert actual[0]["scores"] == [1, 2]
+    assert isinstance(actual[0]["scores"], np.ndarray)
+    assert actual[0]["scores"].tolist() == [1, 2]
     assert actual[0]["label"] == "x"
     assert actual[1]["media"] == []
     assert actual[1]["blob"] == b"payload-1"
-    assert actual[1]["scores"] == [3]
+    assert isinstance(actual[1]["scores"], np.ndarray)
+    assert actual[1]["scores"].tolist() == [3]
     assert actual[1]["label"] == "y"
     assert actual[2] == {"label": "missing-native"}
     assert actual[3] is None

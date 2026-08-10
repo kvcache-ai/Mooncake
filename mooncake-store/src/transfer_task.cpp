@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <cstring>
 #include <cstdlib>
+#include <limits>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -1260,52 +1261,82 @@ std::optional<TransferFuture> TransferSubmitter::submit_batch(
     return future;
 }
 
+TransferEngine::ScatterTransferOperation TransferSubmitter::submitScatter(
+    const std::vector<TransferEngine::ScatterTransferRange>& transfers) {
+    return engine_.submitScatter(transfers);
+}
+
 std::optional<TransferFuture>
 TransferSubmitter::submit_batch_get_offload_object(
     const std::string& transfer_engine_addr,
     const std::vector<std::string>& keys, const std::vector<uint64_t>& pointers,
-    const std::unordered_map<std::string, std::vector<Slice>>& batched_slices) {
-    std::optional<TransferFuture> future;
-    std::vector<TransferRequest> requests;
-    // Open the segment once — all keys share the same transfer_engine_addr.
-    SegmentHandle seg = engine_.openSegment(transfer_engine_addr);
-    if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
-        LOG(ERROR) << "Failed to open segment " << transfer_engine_addr;
-        // nullopt = failure (caller checks !future).  The function returns
-        // std::optional so tl::unexpected is not available here.
+    const std::unordered_map<std::string, std::vector<Slice>>& batched_slices,
+    OffloadBufferAccess buffer_access) {
+    if (keys.size() != pointers.size()) {
+        LOG(ERROR) << "Mismatched offload transfer argument counts";
         return std::nullopt;
     }
+
+    const bool use_local_memcpy =
+        buffer_access == OffloadBufferAccess::kLocalAddress;
+    if (use_local_memcpy && !canUseLocalMemcpy(transfer_engine_addr)) {
+        LOG(ERROR) << "Offload source is not locally addressable: "
+                   << transfer_engine_addr;
+        return std::nullopt;
+    }
+
+    std::vector<TransferRequest> requests;
+    std::vector<MemcpyOperation> operations;
+    constexpr uint64_t kMaxAddress = std::numeric_limits<uint64_t>::max();
+    SegmentHandle seg = 0;
+    if (!use_local_memcpy) {
+        // Open once: all keys share the same transfer endpoint.
+        seg = engine_.openSegment(transfer_engine_addr);
+        if (seg == static_cast<uint64_t>(ERR_INVALID_ARGUMENT)) {
+            LOG(ERROR) << "Failed to open segment " << transfer_engine_addr;
+            return std::nullopt;
+        }
+    }
+
     for (size_t i = 0; i < keys.size(); ++i) {
         const auto& key = keys[i];
-        const uint64_t pointer = pointers[i];
         auto it = batched_slices.find(key);
         if (it == batched_slices.end()) {
             LOG(ERROR) << "Key not found in batched_slices: " << key;
-            return std::nullopt;  // fail closed
+            return std::nullopt;
         }
-        // Emit one TransferRequest per slice: the on-disk blob is read
-        // sequentially while slices may point to non-contiguous GPU memory.
         uint64_t offset = 0;
         for (const auto& slice : it->second) {
-            TransferRequest request;
-            request.opcode = TransferRequest::READ;
-            request.source = static_cast<char*>(slice.ptr);
-            request.target_id = seg;
-            request.target_offset = pointer + offset;
-            request.length = slice.size;
-            requests.emplace_back(request);
+            if (slice.size == 0) continue;
+            if (!slice.ptr || pointers[i] > kMaxAddress - offset ||
+                slice.size > kMaxAddress - pointers[i] - offset) {
+                LOG(ERROR) << "Invalid offload transfer range for key: " << key;
+                return std::nullopt;
+            }
+            if (use_local_memcpy) {
+                operations.emplace_back(
+                    slice.ptr,
+                    reinterpret_cast<const void*>(pointers[i] + offset),
+                    slice.size);
+            } else {
+                requests.emplace_back(TransferRequest{
+                    .opcode = TransferRequest::READ,
+                    .source = static_cast<char*>(slice.ptr),
+                    .target_id = seg,
+                    .target_offset = pointers[i] + offset,
+                    .length = slice.size,
+                });
+            }
             offset += slice.size;
         }
     }
-    return submitTransfer(requests);
+    return use_local_memcpy ? submitMemcpyOperations(std::move(operations))
+                            : submitTransfer(requests);
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
     const AllocatedBuffer::Descriptor& handle, const std::vector<Slice>& slices,
     const TransferRequest::OpCode op_code, uint64_t src_offset) {
-    auto state = std::make_shared<MemcpyOperationState>();
-
-    // Create memcpy operations
     std::vector<MemcpyOperation> operations;
     operations.reserve(slices.size());
     uint64_t base_address = static_cast<uint64_t>(handle.buffer_address_);
@@ -1333,12 +1364,18 @@ std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(
         operations.emplace_back(dest, src, slice.size);
     }
 
-    // Submit memcpy operations to worker pool for async execution
+    return submitMemcpyOperations(std::move(operations));
+}
+
+std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperations(
+    std::vector<MemcpyOperation> operations) {
+    auto state = std::make_shared<MemcpyOperationState>();
+    const size_t operation_count = operations.size();
     MemcpyTask task(std::move(operations), state);
     memcpy_pool_->submitTask(std::move(task));
 
-    VLOG(1) << "Memcpy transfer submitted to worker pool with " << slices.size()
-            << " operations";
+    VLOG(1) << "Memcpy transfer submitted to worker pool with "
+            << operation_count << " operations";
 
     return TransferFuture(state);
 }
@@ -1573,50 +1610,17 @@ std::optional<TransferFuture> TransferSubmitter::submitFileReadOperation(
 
 TransferStrategy TransferSubmitter::selectStrategy(
     const AllocatedBuffer::Descriptor& handle,
-    const std::vector<Slice>& slices) const {
-    // Check if memcpy operations are enabled via environment variable
-    if (!memcpy_enabled_) {
-        VLOG(2) << "Memcpy operations disabled via MC_STORE_MEMCPY environment "
-                   "variable";
-        return TransferStrategy::TRANSFER_ENGINE;
-    }
-
-    // Check conditions for local memcpy optimization
-    if (isLocalTransfer(handle)) {
-        return TransferStrategy::LOCAL_MEMCPY;
-    }
-
-    return TransferStrategy::TRANSFER_ENGINE;
+    const std::vector<Slice>& /* slices */) const {
+    return canUseLocalMemcpy(handle.transport_endpoint_)
+               ? TransferStrategy::LOCAL_MEMCPY
+               : TransferStrategy::TRANSFER_ENGINE;
 }
 
-namespace {
-// Helper function to extract IP address from endpoint string (ip:port format).
-// Supports both IPv4 (ip:port) and IPv6 ([ipv6]:port) formats.
-std::string extractIpAddress(const std::string& endpoint) {
-    if (endpoint.empty()) {
-        return "";
-    }
-
-    // Handle IPv6 format: [ipv6]:port
-    if (endpoint[0] == '[') {
-        size_t closing_bracket = endpoint.find(']');
-        if (closing_bracket == std::string::npos) {
-            LOG(WARNING) << "Invalid IPv6 endpoint format: " << endpoint;
-            return "";
-        }
-        return endpoint.substr(1, closing_bracket - 1);
-    }
-
-    // Handle IPv4 or hostname:port format.
-    size_t colon_pos = endpoint.rfind(':');
-    if (colon_pos != std::string::npos) {
-        return endpoint.substr(0, colon_pos);
-    }
-
-    // No colon found, return the whole string (might be just IP or hostname).
-    return endpoint;
+bool TransferSubmitter::canUseLocalMemcpy(const std::string& endpoint) const {
+    return memcpy_enabled_ &&
+           (isSameProcessEndpoint(endpoint, local_hostname_) ||
+            isSameProcessEndpoint(endpoint, local_endpoint_));
 }
-}  // namespace
 
 bool TransferSubmitter::isSameProcessEndpoint(
     const std::string& handle_endpoint, const std::string& local_endpoint) {
@@ -1626,28 +1630,7 @@ bool TransferSubmitter::isSameProcessEndpoint(
     // memcpy on a peer process's address would segfault. Require the full
     // transport endpoint to match, which uniquely identifies the owning
     // process.
-    if (handle_endpoint.empty() || local_endpoint.empty()) {
-        return false;
-    }
-    if (handle_endpoint == local_endpoint) {
-        return true;
-    }
-
-    const std::string handle_ip = extractIpAddress(handle_endpoint);
-    const std::string local_ip = extractIpAddress(local_endpoint);
-    if (!handle_ip.empty() && handle_ip == local_ip) {
-        VLOG(2) << "Disabling local memcpy for same-host endpoints with "
-                   "different process endpoints: handle="
-                << handle_endpoint << ", local=" << local_endpoint;
-    }
-
-    return false;
-}
-
-bool TransferSubmitter::isLocalTransfer(
-    const AllocatedBuffer::Descriptor& handle) const {
-    return isSameProcessEndpoint(handle.transport_endpoint_, local_hostname_) ||
-           isSameProcessEndpoint(handle.transport_endpoint_, local_endpoint_);
+    return !handle_endpoint.empty() && handle_endpoint == local_endpoint;
 }
 
 bool TransferSubmitter::validateTransferParams(

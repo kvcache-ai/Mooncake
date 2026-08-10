@@ -691,17 +691,16 @@ ErrorCode Client::InitTransferEngine(
             // Use user-specified auto-discover setting
             auto_discover = env_auto_discover.value();
         } else {
-            // Enable auto-discover for RDMA if no devices are specified
+            // Enable auto-discover for RDMA/EFA if no devices are specified
             if ((protocol == "rdma" || protocol == "efa") &&
                 !device_names.has_value()) {
-                LOG(INFO)
-                    << "Set auto discovery ON by default for RDMA protocol, "
-                       "since no "
-                       "device names provided";
+                LOG(INFO) << "Set auto discovery ON by default for " << protocol
+                          << " protocol, since no device names provided";
                 auto_discover = true;
             }
         }
-        transfer_engine_->setAutoDiscover(auto_discover);
+        transfer_engine_->setAutoDiscover(
+            {.enabled = auto_discover, .protocol = protocol});
 
         // Honor filters when auto-discovery is enabled; otherwise warn once
         if (auto_discover) {
@@ -1343,6 +1342,15 @@ tl::expected<void, ErrorCode> Client::Get(const std::string& object_key,
         return tl::unexpected(ErrorCode::LEASE_EXPIRED);
     }
     return {};
+}
+
+std::optional<TransferEngine::ScatterTransferOperation> Client::SubmitScatter(
+    const std::vector<TransferEngine::ScatterTransferRange>& transfers) {
+    if (!transfer_submitter_) {
+        LOG(ERROR) << "TransferSubmitter not initialized";
+        return std::nullopt;
+    }
+    return transfer_submitter_->submitScatter(transfers);
 }
 
 struct BatchGetOperation {
@@ -3306,8 +3314,19 @@ tl::expected<void, ErrorCode> Client::BatchGetOffloadObject(
     const std::vector<std::string>& keys,
     const std::vector<uintptr_t>& pointers,
     const std::unordered_map<std::string, std::vector<Slice>>& batch_slices) {
+    return BatchGetOffloadObject(transfer_engine_addr, keys, pointers,
+                                 batch_slices,
+                                 OffloadBufferAccess::kTransferEngine);
+}
+
+tl::expected<void, ErrorCode> Client::BatchGetOffloadObject(
+    const std::string& transfer_engine_addr,
+    const std::vector<std::string>& keys,
+    const std::vector<uintptr_t>& pointers,
+    const std::unordered_map<std::string, std::vector<Slice>>& batch_slices,
+    OffloadBufferAccess buffer_access) {
     auto future = transfer_submitter_->submit_batch_get_offload_object(
-        transfer_engine_addr, keys, pointers, batch_slices);
+        transfer_engine_addr, keys, pointers, batch_slices, buffer_access);
     if (!future) {
         LOG(ERROR) << "Failed to submit transfer operation";
         return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
