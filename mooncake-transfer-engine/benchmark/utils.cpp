@@ -60,6 +60,9 @@ DEFINE_double(qos_link_capacity_gbps, 0.0,
               "Link capacity in GB/s for total utilization (0 reports N/A).");
 DEFINE_string(qos_output_jsonl, "",
               "Append versioned QoS metric records to this JSONL file.");
+DEFINE_uint64(request_interval_us, 0,
+              "Minimum aggregate interval between issued transfer batches, in "
+              "microseconds. 0 disables pacing.");
 DEFINE_uint64(deadline_us, 0,
               "tent only: relative per-transfer deadline in microseconds for "
               "tight worker threads (0 disables deadline tagging); cannot be "
@@ -115,6 +118,7 @@ std::string XferBenchConfig::qos_classes_json;
 std::string XferBenchConfig::workload_classes_json;
 double XferBenchConfig::qos_link_capacity_gbps = 0.0;
 std::string XferBenchConfig::qos_output_jsonl;
+uint64_t XferBenchConfig::request_interval_us = 0;
 uint64_t XferBenchConfig::deadline_us = 0;
 int XferBenchConfig::deadline_tight_threads = 0;
 bool XferBenchConfig::deadline_bw_arbitration = false;
@@ -151,6 +155,7 @@ void XferBenchConfig::loadFromFlags() {
     workload_classes_json = FLAGS_workload_classes_json;
     qos_link_capacity_gbps = FLAGS_qos_link_capacity_gbps;
     qos_output_jsonl = FLAGS_qos_output_jsonl;
+    request_interval_us = FLAGS_request_interval_us;
     deadline_us = FLAGS_deadline_us;
     deadline_tight_threads = FLAGS_deadline_tight_threads;
     deadline_bw_arbitration = FLAGS_deadline_bw_arbitration;
@@ -191,7 +196,8 @@ void printStatsHeader() {
     std::cout << std::left
               << std::setw(14) << "BlkSize (B)"
               << std::setw(8) << "Batch"
-              << std::setw(14) << "BW (GB/S)"
+              << std::setw(14) << "BW (GB/s)"
+              << std::setw(18) << "Avg Inst GB/s"
               << std::setw(14) << "Avg Lat (us)"
               << std::setw(14) << "Avg Tx (us)"
               << std::setw(14) << "P99 Tx (us)"
@@ -218,6 +224,7 @@ void printStats(size_t block_size, size_t batch_size, XferBenchStats& stats,
               << std::setw(14) << block_size
               << std::setw(8)  << batch_size
               << std::setw(14) << throughput_gb
+              << std::setw(18) << stats.instant_bandwidth.avg()
               << std::setprecision(1)
               << std::setw(14) << avg_latency
               << std::setw(14) << stats.transfer_duration.avg()
