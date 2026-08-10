@@ -23,9 +23,17 @@
 namespace mooncake {
 
 WrappedMasterService::WrappedMasterService(
-    const WrappedMasterServiceConfig& config)
+    const WrappedMasterServiceConfig& config,
+    MasterMetricManager& metric_manager)
     : http_server_(4, config.http_port),
       metric_report_running_(config.enable_metric_reporting) {
+
+    if (&MasterMetricManager::instance() != &metric_manager) {
+        LOG(ERROR) << "WrappedMasterService constructed with a metric manager "
+                      "that is not the registered MasterMetricManager "
+                      "instance; metrics may be routed to the wrong "
+                      "architecture.";
+    }
     init_http_server();
 
     if (config.enable_metric_reporting) {

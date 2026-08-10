@@ -19,7 +19,7 @@
 #include <ylt/util/expected.hpp>
 #include <ylt/util/tl/expected.hpp>
 
-#include "master_metric_manager.h"
+#include "centralized_master_metric_manager.h"
 #include "master_service.h"
 #include "mutex.h"
 #include "centralized_client_manager.h"
@@ -540,13 +540,13 @@ class CentralizedMasterService final : public MasterService {
             for (auto& replica : replicas_) {
                 mem_size_ += replica.get_memory_buffer_size();
             }
-            MasterMetricManager::instance().inc_put_start_discard_cnt(
-                1, mem_size_);
+            CentralizedMasterMetricManager::instance()
+                .inc_put_start_discard_cnt(1, mem_size_);
         }
 
         ~DiscardedReplicas() {
-            MasterMetricManager::instance().inc_put_start_release_cnt(
-                1, mem_size_);
+            CentralizedMasterMetricManager::instance()
+                .inc_put_start_release_cnt(1, mem_size_);
         }
 
         uint64_t memSize() const { return mem_size_; }

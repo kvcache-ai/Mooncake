@@ -11,14 +11,28 @@
 
 namespace mooncake {
 
-// --- Singleton Instance ---
+MasterMetricManager* MasterMetricManager::instance_ = nullptr;
+
 MasterMetricManager& MasterMetricManager::instance() {
-    // Guaranteed to be lazy initialized and thread-safe in C++11+
-    static MasterMetricManager static_instance;
-    return static_instance;
+    if (instance_ == nullptr) {
+        LOG(ERROR) << "MasterMetricManager::instance() called before any "
+                      "architecture metric manager was registered";
+    }
+    CHECK(instance_ != nullptr);
+    return *instance_;
 }
 
-// --- Constructor ---
+void MasterMetricManager::RegisterInstance(MasterMetricManager* instance) {
+    if (instance_ == instance) return;  // idempotent (in-place reset)
+    if (instance_ != nullptr) {
+        LOG(ERROR) << "A MasterMetricManager instance is already registered; "
+                      "keeping the first one. A process must run a single "
+                      "master architecture.";
+        return;
+    }
+    instance_ = instance;
+}
+
 MasterMetricManager::MasterMetricManager()
     // Initialize Gauges
     : mem_allocated_size_(
@@ -39,9 +53,6 @@ MasterMetricManager::MasterMetricManager()
                            "Total capacity for file storage in 3fs/nfs"),
       key_count_("master_key_count",
                  "Total number of keys managed by the master"),
-      soft_pin_key_count_(
-          "master_soft_pin_key_count",
-          "Total number of soft-pinned keys managed by the master"),
       // Initialize Histogram (4KB, 64KB, 256KB, 1MB, 4MB, 16MB, 64MB)
       value_size_distribution_(
           "master_value_size_bytes", "Distribution of object value sizes",
@@ -72,19 +83,6 @@ MasterMetricManager::MasterMetricManager()
           "master_clients_crashed_total",
           "Total number of client crashes detected by heartbeat"),
 
-      // Initialize Request Counters
-      put_start_requests_("master_put_start_requests_total",
-                          "Total number of PutStart requests received"),
-      put_start_failures_("master_put_start_failures_total",
-                          "Total number of failed PutStart requests"),
-      put_end_requests_("master_put_end_requests_total",
-                        "Total number of PutEnd requests received"),
-      put_end_failures_("master_put_end_failures_total",
-                        "Total number of failed PutEnd requests"),
-      put_revoke_requests_("master_put_revoke_requests_total",
-                           "Total number of PutRevoke requests received"),
-      put_revoke_failures_("master_put_revoke_failures_total",
-                           "Total number of failed PutRevoke requests"),
       get_replica_list_requests_(
           "master_get_replica_list_requests_total",
           "Total number of GetReplicaList requests received"),
@@ -136,20 +134,6 @@ MasterMetricManager::MasterMetricManager()
                           "Total number of heartbeat requests received"),
       heartbeat_failures_("master_heartbeat_failures_total",
                           "Total number of failed heartbeat requests"),
-      get_write_route_requests_("master_get_write_route_requests_total",
-                                "Total number of get write route requests"),
-      get_write_route_failures_(
-          "master_get_write_route_failures_total",
-          "Total number of failed get write route requests"),
-      add_replica_requests_("master_add_replica_requests_total",
-                            "Total number of add replica requests"),
-      add_replica_failures_("master_add_replica_failures_total",
-                            "Total number of failed add replica requests"),
-      remove_replica_requests_("master_remove_replica_requests_total",
-                               "Total number of remove replica requests"),
-      remove_replica_failures_(
-          "master_remove_replica_failures_total",
-          "Total number of failed remove replica requests"),
 
       // Initialize Batch Request Counters
       batch_exist_key_requests_(
@@ -181,21 +165,6 @@ MasterMetricManager::MasterMetricManager()
       batch_query_ip_failed_items_(
           "master_batch_query_ip_failed_items_total",
           "Total number of failed items in BatchQueryIp requests"),
-      batch_replica_clear_requests_(
-          "master_batch_replica_clear_requests_total",
-          "Total number of BatchReplicaClear requests received"),
-      batch_replica_clear_failures_(
-          "master_batch_replica_clear_failures_total",
-          "Total number of failed BatchReplicaClear requests"),
-      batch_replica_clear_partial_successes_(
-          "master_batch_replica_clear_partial_successes_total",
-          "Total number of partially successful BatchReplicaClear requests"),
-      batch_replica_clear_items_(
-          "master_batch_replica_clear_items_total",
-          "Total number of items processed in BatchReplicaClear requests"),
-      batch_replica_clear_failed_items_(
-          "master_batch_replica_clear_failed_items_total",
-          "Total number of failed items in BatchReplicaClear requests"),
       batch_get_replica_list_requests_(
           "master_batch_get_replica_list_requests_total",
           "Total number of BatchGetReplicaList requests received"),
@@ -211,74 +180,6 @@ MasterMetricManager::MasterMetricManager()
       batch_get_replica_list_failed_items_(
           "master_batch_get_replica_list_failed_items_total",
           "Total number of failed items in BatchGetReplicaList requests"),
-      batch_put_start_requests_(
-          "master_batch_put_start_requests_total",
-          "Total number of BatchPutStart requests received"),
-      batch_put_start_failures_(
-          "master_batch_put_start_failures_total",
-          "Total number of failed BatchPutStart requests"),
-      batch_put_start_partial_successes_(
-          "master_batch_put_start_partial_successes_total",
-          "Total number of partially successful BatchPutStart requests"),
-      batch_put_start_items_(
-          "master_batch_put_start_items_total",
-          "Total number of items processed in BatchPutStart requests"),
-      batch_put_start_failed_items_(
-          "master_batch_put_start_failed_items_total",
-          "Total number of failed items in BatchPutStart requests"),
-      batch_put_end_requests_("master_batch_put_end_requests_total",
-                              "Total number of BatchPutEnd requests received"),
-      batch_put_end_failures_("master_batch_put_end_failures_total",
-                              "Total number of failed BatchPutEnd requests"),
-      batch_put_end_partial_successes_(
-          "master_batch_put_end_partial_successes_total",
-          "Total number of partially successful BatchPutEnd requests"),
-      batch_put_end_items_(
-          "master_batch_put_end_items_total",
-          "Total number of items processed in BatchPutEnd requests"),
-      batch_put_end_failed_items_(
-          "master_batch_put_end_failed_items_total",
-          "Total number of failed items in BatchPutEnd requests"),
-      batch_put_revoke_requests_(
-          "master_batch_put_revoke_requests_total",
-          "Total number of BatchPutRevoke requests received"),
-      batch_put_revoke_failures_(
-          "master_batch_put_revoke_failures_total",
-          "Total number of failed BatchPutRevoke requests"),
-      batch_put_revoke_partial_successes_(
-          "master_batch_put_revoke_partial_successes_total",
-          "Total number of partially successful BatchPutRevoke requests"),
-      batch_put_revoke_items_(
-          "master_batch_put_revoke_items_total",
-          "Total number of items processed in BatchPutRevoke requests"),
-      batch_put_revoke_failed_items_(
-          "master_batch_put_revoke_failed_items_total",
-          "Total number of failed items in BatchPutRevoke requests"),
-      batch_remove_replica_requests_(
-          "master_batch_remove_replica_requests_total",
-          "Total number of BatchRemoveReplica requests received"),
-      batch_remove_replica_failures_(
-          "master_batch_remove_replica_failures_total",
-          "Total number of failed BatchRemoveReplica requests"),
-      batch_remove_replica_partial_successes_(
-          "master_batch_remove_replica_partial_successes_total",
-          "Total number of partially successful BatchRemoveReplica requests"),
-      batch_remove_replica_items_(
-          "master_batch_remove_replica_items_total",
-          "Total number of items processed in BatchRemoveReplica requests"),
-      batch_remove_replica_failed_items_(
-          "master_batch_remove_replica_failed_items_total",
-          "Total number of failed items in BatchRemoveReplica requests"),
-      batch_get_write_route_requests_(
-          "master_batch_get_write_route_requests_total",
-          "Total number of BatchGetWriteRoute requests received"),
-      batch_get_write_route_failures_(
-          "master_batch_get_write_route_failures_total",
-          "Total number of failed BatchGetWriteRoute requests"),
-      batch_get_write_route_partial_successes_(
-          "master_batch_get_write_route_partial_successes_total",
-          "Total number of partially successful BatchGetWriteRoute requests"),
-
       // Initialize cache hit rate metrics
       mem_cache_hit_nums_("mem_cache_hit_nums_",
                           "Total number of cache hits in the memory pool"),
@@ -290,90 +191,9 @@ MasterMetricManager::MasterMetricManager()
                        "Total number of cached values in the ssd"),
       valid_get_nums_("valid_get_nums_",
                       "Total number of valid get operations"),
-      total_get_nums_("total_get_nums_", "Total number of get operations"),
-
-      // Initialize Eviction Counters
-      eviction_success_("master_successful_evictions_total",
-                        "Total number of successful eviction operations"),
-      eviction_attempts_("master_attempted_evictions_total",
-                         "Total number of attempted eviction operations"),
-      evicted_key_count_("master_evicted_key_count",
-                         "Total number of keys evicted"),
-      evicted_size_("master_evicted_size_bytes",
-                    "Total bytes of evicted objects"),
-
-      // Initialize Discarded Replicas Counters
-      put_start_discard_cnt_("master_put_start_discard_cnt",
-                             "Total number of discarded PutStart operations"),
-      put_start_release_cnt_("master_put_start_release_cnt",
-                             "Total number of released PutStart operations"),
-      put_start_discarded_staging_size_(
-          "master_put_start_discarded_staging_size",
-          "Total size of memory replicas in discarded but not yet released "
-          "PutStart operations"),
-
-      // Initialize CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd,
-      // MoveRevoke Counters
-      copy_start_requests_("master_copy_start_requests_total",
-                           "Total number of CopyStart requests received"),
-      copy_start_failures_("master_copy_start_failures_total",
-                           "Total number of failed CopyStart requests"),
-      copy_end_requests_("master_copy_end_requests_total",
-                         "Total number of CopyEnd requests received"),
-      copy_end_failures_("master_copy_end_failures_total",
-                         "Total number of failed CopyEnd requests"),
-      copy_revoke_requests_("master_copy_revoke_requests_total",
-                            "Total number of CopyRevoke requests received"),
-      copy_revoke_failures_("master_copy_revoke_failures_total",
-                            "Total number of failed CopyRevoke requests"),
-      move_start_requests_("master_move_start_requests_total",
-                           "Total number of MoveStart requests received"),
-      move_start_failures_("master_move_start_failures_total",
-                           "Total number of failed MoveStart requests"),
-      move_end_requests_("master_move_end_requests_total",
-                         "Total number of MoveEnd requests received"),
-      move_end_failures_("master_move_end_failures_total",
-                         "Total number of failed MoveEnd requests"),
-      move_revoke_requests_("master_move_revoke_requests_total",
-                            "Total number of MoveRevoke requests received"),
-      move_revoke_failures_("master_move_revoke_failures_total",
-                            "Total number of failed MoveRevoke requests"),
-
-      /*
-       * Initialize CreateMoveTask, CreateCopyTask, QueryTask, FetchTasks,
-       * MarkTaskToComplete Counters
-       */
-      create_copy_task_requests_("master_create_copy_task_requests_total",
-                                 "Total number of Copy requests received"),
-      create_copy_task_failures_("master_create_copy_task_failures_total",
-                                 "Total number of failed Copy requests"),
-      create_move_task_requests_("master_create_move_task_requests_total",
-                                 "Total number of Move requests received"),
-      create_move_task_failures_("master_create_move_task_failures_total",
-                                 "Total number of failed Move requests"),
-      query_task_requests_("master_query_task_requests_total",
-                           "Total number of QueryTask requests received"),
-      query_task_failures_("master_query_task_failures_total",
-                           "Total number of failed QueryTask requests"),
-      fetch_tasks_requests_("master_fetch_tasks_requests_total",
-                            "Total number of FetchTasks requests received"),
-      fetch_tasks_failures_("master_fetch_tasks_failures_total",
-                            "Total number of failed FetchTasks requests"),
-      mark_task_to_complete_requests_(
-          "master_update_task_requests_total",
-          "Total number of MarkTaskToComplete requests received"),
-      mark_task_to_complete_failures_(
-          "master_update_task_failures_total",
-          "Total number of failed MarkTaskToComplete requests") {
+      total_get_nums_("total_get_nums_", "Total number of get operations") {
     update_metrics_for_zero_output();
 }
-
-void MasterMetricManager::reset_all_metrics() {
-    this->~MasterMetricManager();
-    new (this) MasterMetricManager();
-}
-
-// --- Metric Interface Methods ---
 
 void MasterMetricManager::update_metrics_for_zero_output() {
     // Update Gauges (use update(0) to mark as changed)
@@ -382,11 +202,9 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     file_allocated_size_.update(0);
     file_total_capacity_.update(0);
     key_count_.update(0);
-    soft_pin_key_count_.update(0);
     active_clients_.update(0);
     mem_cache_nums_.update(0);
     file_cache_nums_.update(0);
-    put_start_discarded_staging_size_.update(0);
 
     // Update Counters (use inc(0) to mark as changed)
     register_client_requests_.inc(0);
@@ -396,12 +214,6 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     clients_disconnected_total_.inc(0);
     clients_recovered_total_.inc(0);
     clients_crashed_total_.inc(0);
-    put_start_requests_.inc(0);
-    put_start_failures_.inc(0);
-    put_end_requests_.inc(0);
-    put_end_failures_.inc(0);
-    put_revoke_requests_.inc(0);
-    put_revoke_failures_.inc(0);
     get_replica_list_requests_.inc(0);
     get_replica_list_failures_.inc(0);
     get_replica_list_by_regex_requests_.inc(0);
@@ -422,37 +234,6 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     remount_segment_failures_.inc(0);
     heartbeat_requests_.inc(0);
     heartbeat_failures_.inc(0);
-    get_write_route_requests_.inc(0);
-    get_write_route_failures_.inc(0);
-    add_replica_requests_.inc(0);
-    add_replica_failures_.inc(0);
-    remove_replica_requests_.inc(0);
-    remove_replica_failures_.inc(0);
-    create_copy_task_requests_.inc(0);
-    create_copy_task_failures_.inc(0);
-    create_move_task_requests_.inc(0);
-    create_move_task_failures_.inc(0);
-    query_task_requests_.inc(0);
-    query_task_failures_.inc(0);
-    fetch_tasks_requests_.inc(0);
-    fetch_tasks_failures_.inc(0);
-    mark_task_to_complete_requests_.inc(0);
-    mark_task_to_complete_failures_.inc(0);
-
-    // Update CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke
-    // counters
-    copy_start_requests_.inc(0);
-    copy_start_failures_.inc(0);
-    copy_end_requests_.inc(0);
-    copy_end_failures_.inc(0);
-    copy_revoke_requests_.inc(0);
-    copy_revoke_failures_.inc(0);
-    move_start_requests_.inc(0);
-    move_start_failures_.inc(0);
-    move_end_requests_.inc(0);
-    move_end_failures_.inc(0);
-    move_revoke_requests_.inc(0);
-    move_revoke_failures_.inc(0);
 
     // Update Batch Request Counters
     batch_exist_key_requests_.inc(0);
@@ -465,39 +246,11 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     batch_query_ip_partial_successes_.inc(0);
     batch_query_ip_items_.inc(0);
     batch_query_ip_failed_items_.inc(0);
-    batch_replica_clear_requests_.inc(0);
-    batch_replica_clear_failures_.inc(0);
-    batch_replica_clear_partial_successes_.inc(0);
-    batch_replica_clear_items_.inc(0);
-    batch_replica_clear_failed_items_.inc(0);
     batch_get_replica_list_requests_.inc(0);
     batch_get_replica_list_failures_.inc(0);
     batch_get_replica_list_partial_successes_.inc(0);
     batch_get_replica_list_items_.inc(0);
     batch_get_replica_list_failed_items_.inc(0);
-    batch_put_start_requests_.inc(0);
-    batch_put_start_failures_.inc(0);
-    batch_put_start_partial_successes_.inc(0);
-    batch_put_start_items_.inc(0);
-    batch_put_start_failed_items_.inc(0);
-    batch_put_end_requests_.inc(0);
-    batch_put_end_failures_.inc(0);
-    batch_put_end_partial_successes_.inc(0);
-    batch_put_end_items_.inc(0);
-    batch_put_end_failed_items_.inc(0);
-    batch_put_revoke_requests_.inc(0);
-    batch_put_revoke_failures_.inc(0);
-    batch_put_revoke_partial_successes_.inc(0);
-    batch_put_revoke_items_.inc(0);
-    batch_put_revoke_failed_items_.inc(0);
-    batch_remove_replica_requests_.inc(0);
-    batch_remove_replica_failures_.inc(0);
-    batch_remove_replica_partial_successes_.inc(0);
-    batch_remove_replica_items_.inc(0);
-    batch_remove_replica_failed_items_.inc(0);
-    batch_get_write_route_requests_.inc(0);
-    batch_get_write_route_failures_.inc(0);
-    batch_get_write_route_partial_successes_.inc(0);
 
     // Update cache hit rate metrics
     mem_cache_hit_nums_.inc(0);
@@ -505,23 +258,8 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     valid_get_nums_.inc(0);
     total_get_nums_.inc(0);
 
-    // Update Eviction Counters
-    eviction_success_.inc(0);
-    eviction_attempts_.inc(0);
-    evicted_key_count_.inc(0);
-    evicted_size_.inc(0);
-
-    // Update PutStart Discard Metrics
-    put_start_discard_cnt_.inc(0);
-    put_start_release_cnt_.inc(0);
-
     // Update Histogram (use observe(0) to mark as changed)
     value_size_distribution_.observe(0);
-
-    // Note: dynamic_gauge_1t (mem_allocated_size_per_segment_ and
-    // mem_total_capacity_per_segment_) are not initialized here because they
-    // require label values. They will be initialized when first used with
-    // actual segment names.
 }
 
 // Memory Storage Metrics
@@ -531,10 +269,18 @@ void MasterMetricManager::inc_allocated_mem_size(const std::string& segment,
     if (!segment.empty()) mem_allocated_size_per_segment_.inc({segment}, val);
 }
 
+void MasterMetricManager::inc_allocated_mem_size(int64_t val) {
+    mem_allocated_size_.inc(val);
+}
+
 void MasterMetricManager::dec_allocated_mem_size(const std::string& segment,
                                                  int64_t val) {
     mem_allocated_size_.dec(val);
     if (!segment.empty()) mem_allocated_size_per_segment_.dec({segment}, val);
+}
+
+void MasterMetricManager::dec_allocated_mem_size(int64_t val) {
+    mem_allocated_size_.dec(val);
 }
 
 void MasterMetricManager::reset_allocated_mem_size() {
@@ -630,22 +376,11 @@ double MasterMetricManager::get_global_file_used_ratio(void) {
 void MasterMetricManager::inc_key_count(int64_t val) { key_count_.inc(val); }
 void MasterMetricManager::dec_key_count(int64_t val) { key_count_.dec(val); }
 
-void MasterMetricManager::inc_soft_pin_key_count(int64_t val) {
-    soft_pin_key_count_.inc(val);
-}
-void MasterMetricManager::dec_soft_pin_key_count(int64_t val) {
-    soft_pin_key_count_.dec(val);
-}
-
 void MasterMetricManager::observe_value_size(int64_t size) {
     value_size_distribution_.observe(size);
 }
 
 int64_t MasterMetricManager::get_key_count() { return key_count_.value(); }
-
-int64_t MasterMetricManager::get_soft_pin_key_count() {
-    return soft_pin_key_count_.value();
-}
 
 // Cluster Metrics
 void MasterMetricManager::inc_active_clients(int64_t val) {
@@ -739,24 +474,6 @@ void MasterMetricManager::inc_exist_key_requests(int64_t val) {
 void MasterMetricManager::inc_exist_key_failures(int64_t val) {
     exist_key_failures_.inc(val);
 }
-void MasterMetricManager::inc_put_start_requests(int64_t val) {
-    put_start_requests_.inc(val);
-}
-void MasterMetricManager::inc_put_start_failures(int64_t val) {
-    put_start_failures_.inc(val);
-}
-void MasterMetricManager::inc_put_end_requests(int64_t val) {
-    put_end_requests_.inc(val);
-}
-void MasterMetricManager::inc_put_end_failures(int64_t val) {
-    put_end_failures_.inc(val);
-}
-void MasterMetricManager::inc_put_revoke_requests(int64_t val) {
-    put_revoke_requests_.inc(val);
-}
-void MasterMetricManager::inc_put_revoke_failures(int64_t val) {
-    put_revoke_failures_.inc(val);
-}
 void MasterMetricManager::inc_get_replica_list_requests(int64_t val) {
     get_replica_list_requests_.inc(val);
 }
@@ -811,24 +528,6 @@ void MasterMetricManager::inc_heartbeat_requests(int64_t val) {
 void MasterMetricManager::inc_heartbeat_failures(int64_t val) {
     heartbeat_failures_.inc(val);
 }
-void MasterMetricManager::inc_get_write_route_requests(int64_t val) {
-    get_write_route_requests_.inc(val);
-}
-void MasterMetricManager::inc_get_write_route_failures(int64_t val) {
-    get_write_route_failures_.inc(val);
-}
-void MasterMetricManager::inc_add_replica_requests(int64_t val) {
-    add_replica_requests_.inc(val);
-}
-void MasterMetricManager::inc_add_replica_failures(int64_t val) {
-    add_replica_failures_.inc(val);
-}
-void MasterMetricManager::inc_remove_replica_requests(int64_t val) {
-    remove_replica_requests_.inc(val);
-}
-void MasterMetricManager::inc_remove_replica_failures(int64_t val) {
-    remove_replica_failures_.inc(val);
-}
 
 // Batch Operation Statistics (Counters)
 void MasterMetricManager::inc_batch_exist_key_requests(int64_t items) {
@@ -857,20 +556,6 @@ void MasterMetricManager::inc_batch_query_ip_partial_success(
     batch_query_ip_partial_successes_.inc(1);
     batch_query_ip_failed_items_.inc(failed_items);
 }
-void MasterMetricManager::inc_batch_replica_clear_requests(int64_t items) {
-    batch_replica_clear_requests_.inc(1);
-    batch_replica_clear_items_.inc(items);
-}
-void MasterMetricManager::inc_batch_replica_clear_failures(
-    int64_t failed_items) {
-    batch_replica_clear_failures_.inc(1);
-    batch_replica_clear_failed_items_.inc(failed_items);
-}
-void MasterMetricManager::inc_batch_replica_clear_partial_success(
-    int64_t failed_items) {
-    batch_replica_clear_partial_successes_.inc(1);
-    batch_replica_clear_failed_items_.inc(failed_items);
-}
 void MasterMetricManager::inc_batch_get_replica_list_requests(int64_t items) {
     batch_get_replica_list_requests_.inc(1);
     batch_get_replica_list_items_.inc(items);
@@ -885,111 +570,8 @@ void MasterMetricManager::inc_batch_get_replica_list_partial_success(
     batch_get_replica_list_partial_successes_.inc(1);
     batch_get_replica_list_failed_items_.inc(failed_items);
 }
-void MasterMetricManager::inc_batch_put_start_requests(int64_t items) {
-    batch_put_start_requests_.inc(1);
-    batch_put_start_items_.inc(items);
-}
-void MasterMetricManager::inc_batch_put_start_failures(int64_t failed_items) {
-    batch_put_start_failures_.inc(1);
-    batch_put_start_failed_items_.inc(failed_items);
-}
-void MasterMetricManager::inc_batch_put_start_partial_success(
-    int64_t failed_items) {
-    batch_put_start_partial_successes_.inc(1);
-    batch_put_start_failed_items_.inc(failed_items);
-}
-void MasterMetricManager::inc_batch_put_end_requests(int64_t items) {
-    batch_put_end_requests_.inc(1);
-    batch_put_end_items_.inc(items);
-}
-void MasterMetricManager::inc_batch_put_end_failures(int64_t failed_items) {
-    batch_put_end_failures_.inc(1);
-    batch_put_end_failed_items_.inc(failed_items);
-}
-void MasterMetricManager::inc_batch_put_end_partial_success(
-    int64_t failed_items) {
-    batch_put_end_partial_successes_.inc(1);
-    batch_put_end_failed_items_.inc(failed_items);
-}
-void MasterMetricManager::inc_batch_put_revoke_requests(int64_t items) {
-    batch_put_revoke_requests_.inc(1);
-    batch_put_revoke_items_.inc(items);
-}
-void MasterMetricManager::inc_batch_put_revoke_failures(int64_t failed_items) {
-    batch_put_revoke_failures_.inc(1);
-    batch_put_revoke_failed_items_.inc(failed_items);
-}
-void MasterMetricManager::inc_batch_put_revoke_partial_success(
-    int64_t failed_items) {
-    batch_put_revoke_partial_successes_.inc(1);
-    batch_put_revoke_failed_items_.inc(failed_items);
-}
-void MasterMetricManager::inc_batch_remove_replica_requests(int64_t items) {
-    batch_remove_replica_requests_.inc(1);
-    batch_remove_replica_items_.inc(items);
-}
-void MasterMetricManager::inc_batch_remove_replica_failures(
-    int64_t failed_items) {
-    batch_remove_replica_failures_.inc(1);
-    batch_remove_replica_failed_items_.inc(failed_items);
-}
-void MasterMetricManager::inc_batch_remove_replica_partial_success(
-    int64_t failed_items) {
-    batch_remove_replica_partial_successes_.inc(1);
-    batch_remove_replica_failed_items_.inc(failed_items);
-}
-void MasterMetricManager::inc_batch_get_write_route_requests(int64_t items) {
-    batch_get_write_route_requests_.inc(1);
-    (void)items;
-}
-void MasterMetricManager::inc_batch_get_write_route_failures(
-    int64_t failed_items) {
-    batch_get_write_route_failures_.inc(1);
-    (void)failed_items;
-}
-void MasterMetricManager::inc_batch_get_write_route_partial_success(
-    int64_t failed_items) {
-    batch_get_write_route_partial_successes_.inc(1);
-    (void)failed_items;
-}
 
-// PutStart Discard Metrics
-void MasterMetricManager::inc_put_start_discard_cnt(int64_t count,
-                                                    int64_t size) {
-    put_start_discard_cnt_.inc(count);
-    put_start_discarded_staging_size_.inc(size);
-}
-
-void MasterMetricManager::inc_put_start_release_cnt(int64_t count,
-                                                    int64_t size) {
-    put_start_release_cnt_.inc(count);
-    put_start_discarded_staging_size_.dec(size);
-}
-
-int64_t MasterMetricManager::get_put_start_requests() {
-    return put_start_requests_.value();
-}
-
-int64_t MasterMetricManager::get_put_start_failures() {
-    return put_start_failures_.value();
-}
-
-int64_t MasterMetricManager::get_put_end_requests() {
-    return put_end_requests_.value();
-}
-
-int64_t MasterMetricManager::get_put_end_failures() {
-    return put_end_failures_.value();
-}
-
-int64_t MasterMetricManager::get_put_revoke_requests() {
-    return put_revoke_requests_.value();
-}
-
-int64_t MasterMetricManager::get_put_revoke_failures() {
-    return put_revoke_failures_.value();
-}
-
+// Operation Statistics Getters
 int64_t MasterMetricManager::get_get_replica_list_requests() {
     return get_replica_list_requests_.value();
 }
@@ -1054,25 +636,6 @@ int64_t MasterMetricManager::get_unmount_segment_failures() {
     return unmount_segment_failures_.value();
 }
 
-int64_t MasterMetricManager::get_get_write_route_requests() {
-    return get_write_route_requests_.value();
-}
-int64_t MasterMetricManager::get_get_write_route_failures() {
-    return get_write_route_failures_.value();
-}
-int64_t MasterMetricManager::get_add_replica_requests() {
-    return add_replica_requests_.value();
-}
-int64_t MasterMetricManager::get_add_replica_failures() {
-    return add_replica_failures_.value();
-}
-int64_t MasterMetricManager::get_remove_replica_requests() {
-    return remove_replica_requests_.value();
-}
-int64_t MasterMetricManager::get_remove_replica_failures() {
-    return remove_replica_failures_.value();
-}
-
 int64_t MasterMetricManager::get_remount_segment_requests() {
     return remount_segment_requests_.value();
 }
@@ -1129,26 +692,6 @@ int64_t MasterMetricManager::get_batch_query_ip_failed_items() {
     return batch_query_ip_failed_items_.value();
 }
 
-int64_t MasterMetricManager::get_batch_replica_clear_requests() {
-    return batch_replica_clear_requests_.value();
-}
-
-int64_t MasterMetricManager::get_batch_replica_clear_failures() {
-    return batch_replica_clear_failures_.value();
-}
-
-int64_t MasterMetricManager::get_batch_replica_clear_partial_successes() {
-    return batch_replica_clear_partial_successes_.value();
-}
-
-int64_t MasterMetricManager::get_batch_replica_clear_items() {
-    return batch_replica_clear_items_.value();
-}
-
-int64_t MasterMetricManager::get_batch_replica_clear_failed_items() {
-    return batch_replica_clear_failed_items_.value();
-}
-
 int64_t MasterMetricManager::get_batch_get_replica_list_requests() {
     return batch_get_replica_list_requests_.value();
 }
@@ -1167,279 +710,6 @@ int64_t MasterMetricManager::get_batch_get_replica_list_items() {
 
 int64_t MasterMetricManager::get_batch_get_replica_list_failed_items() {
     return batch_get_replica_list_failed_items_.value();
-}
-
-int64_t MasterMetricManager::get_batch_put_start_requests() {
-    return batch_put_start_requests_.value();
-}
-
-int64_t MasterMetricManager::get_batch_put_start_failures() {
-    return batch_put_start_failures_.value();
-}
-
-int64_t MasterMetricManager::get_batch_put_start_partial_successes() {
-    return batch_put_start_partial_successes_.value();
-}
-
-int64_t MasterMetricManager::get_batch_put_start_items() {
-    return batch_put_start_items_.value();
-}
-
-int64_t MasterMetricManager::get_batch_put_start_failed_items() {
-    return batch_put_start_failed_items_.value();
-}
-
-int64_t MasterMetricManager::get_batch_put_end_requests() {
-    return batch_put_end_requests_.value();
-}
-
-int64_t MasterMetricManager::get_batch_put_end_failures() {
-    return batch_put_end_failures_.value();
-}
-
-int64_t MasterMetricManager::get_batch_put_end_partial_successes() {
-    return batch_put_end_partial_successes_.value();
-}
-
-int64_t MasterMetricManager::get_batch_put_end_items() {
-    return batch_put_end_items_.value();
-}
-
-int64_t MasterMetricManager::get_batch_put_end_failed_items() {
-    return batch_put_end_failed_items_.value();
-}
-
-int64_t MasterMetricManager::get_batch_put_revoke_requests() {
-    return batch_put_revoke_requests_.value();
-}
-
-int64_t MasterMetricManager::get_batch_put_revoke_failures() {
-    return batch_put_revoke_failures_.value();
-}
-
-int64_t MasterMetricManager::get_batch_put_revoke_partial_successes() {
-    return batch_put_revoke_partial_successes_.value();
-}
-
-int64_t MasterMetricManager::get_batch_put_revoke_items() {
-    return batch_put_revoke_items_.value();
-}
-
-int64_t MasterMetricManager::get_batch_put_revoke_failed_items() {
-    return batch_put_revoke_failed_items_.value();
-}
-
-int64_t MasterMetricManager::get_batch_remove_replica_requests() {
-    return batch_remove_replica_requests_.value();
-}
-
-int64_t MasterMetricManager::get_batch_remove_replica_failures() {
-    return batch_remove_replica_failures_.value();
-}
-
-int64_t MasterMetricManager::get_batch_remove_replica_partial_successes() {
-    return batch_remove_replica_partial_successes_.value();
-}
-
-int64_t MasterMetricManager::get_batch_remove_replica_items() {
-    return batch_remove_replica_items_.value();
-}
-
-int64_t MasterMetricManager::get_batch_remove_replica_failed_items() {
-    return batch_remove_replica_failed_items_.value();
-}
-
-int64_t MasterMetricManager::get_batch_get_write_route_requests() {
-    return batch_get_write_route_requests_.value();
-}
-
-int64_t MasterMetricManager::get_batch_get_write_route_failures() {
-    return batch_get_write_route_failures_.value();
-}
-
-int64_t MasterMetricManager::get_batch_get_write_route_partial_successes() {
-    return batch_get_write_route_partial_successes_.value();
-}
-
-// Eviction Metrics
-void MasterMetricManager::inc_eviction_success(int64_t key_count,
-                                               int64_t size) {
-    evicted_key_count_.inc(key_count);
-    evicted_size_.inc(size);
-    eviction_success_.inc();
-    eviction_attempts_.inc();
-}
-
-void MasterMetricManager::inc_eviction_fail() { eviction_attempts_.inc(); }
-
-int64_t MasterMetricManager::get_eviction_success() {
-    return eviction_success_.value();
-}
-
-int64_t MasterMetricManager::get_eviction_attempts() {
-    return eviction_attempts_.value();
-}
-
-int64_t MasterMetricManager::get_evicted_key_count() {
-    return evicted_key_count_.value();
-}
-
-int64_t MasterMetricManager::get_evicted_size() {
-    return evicted_size_.value();
-}
-
-// PutStart Discard Metrics Getters
-int64_t MasterMetricManager::get_put_start_discard_cnt() {
-    return put_start_discard_cnt_.value();
-}
-
-int64_t MasterMetricManager::get_put_start_release_cnt() {
-    return put_start_release_cnt_.value();
-}
-
-int64_t MasterMetricManager::get_put_start_discarded_staging_size() {
-    return put_start_discarded_staging_size_.value();
-}
-
-// CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke Metrics
-void MasterMetricManager::inc_copy_start_requests(int64_t val) {
-    copy_start_requests_.inc(val);
-}
-void MasterMetricManager::inc_copy_start_failures(int64_t val) {
-    copy_start_failures_.inc(val);
-}
-void MasterMetricManager::inc_copy_end_requests(int64_t val) {
-    copy_end_requests_.inc(val);
-}
-void MasterMetricManager::inc_copy_end_failures(int64_t val) {
-    copy_end_failures_.inc(val);
-}
-void MasterMetricManager::inc_copy_revoke_requests(int64_t val) {
-    copy_revoke_requests_.inc(val);
-}
-void MasterMetricManager::inc_copy_revoke_failures(int64_t val) {
-    copy_revoke_failures_.inc(val);
-}
-void MasterMetricManager::inc_move_start_requests(int64_t val) {
-    move_start_requests_.inc(val);
-}
-void MasterMetricManager::inc_move_start_failures(int64_t val) {
-    move_start_failures_.inc(val);
-}
-void MasterMetricManager::inc_move_end_requests(int64_t val) {
-    move_end_requests_.inc(val);
-}
-void MasterMetricManager::inc_move_end_failures(int64_t val) {
-    move_end_failures_.inc(val);
-}
-void MasterMetricManager::inc_move_revoke_requests(int64_t val) {
-    move_revoke_requests_.inc(val);
-}
-void MasterMetricManager::inc_move_revoke_failures(int64_t val) {
-    move_revoke_failures_.inc(val);
-}
-
-// CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke Metrics
-// Getters
-int64_t MasterMetricManager::get_copy_start_requests() {
-    return copy_start_requests_.value();
-}
-int64_t MasterMetricManager::get_copy_start_failures() {
-    return copy_start_failures_.value();
-}
-int64_t MasterMetricManager::get_copy_end_requests() {
-    return copy_end_requests_.value();
-}
-int64_t MasterMetricManager::get_copy_end_failures() {
-    return copy_end_failures_.value();
-}
-int64_t MasterMetricManager::get_copy_revoke_requests() {
-    return copy_revoke_requests_.value();
-}
-int64_t MasterMetricManager::get_copy_revoke_failures() {
-    return copy_revoke_failures_.value();
-}
-int64_t MasterMetricManager::get_move_start_requests() {
-    return move_start_requests_.value();
-}
-int64_t MasterMetricManager::get_move_start_failures() {
-    return move_start_failures_.value();
-}
-int64_t MasterMetricManager::get_move_end_requests() {
-    return move_end_requests_.value();
-}
-int64_t MasterMetricManager::get_move_end_failures() {
-    return move_end_failures_.value();
-}
-int64_t MasterMetricManager::get_move_revoke_requests() {
-    return move_revoke_requests_.value();
-}
-int64_t MasterMetricManager::get_move_revoke_failures() {
-    return move_revoke_failures_.value();
-}
-
-// Task create, query, fetch Metrics
-void MasterMetricManager::inc_create_copy_task_requests(int64_t val) {
-    create_copy_task_requests_.inc(val);
-}
-void MasterMetricManager::inc_create_copy_task_failures(int64_t val) {
-    create_copy_task_failures_.inc(val);
-}
-void MasterMetricManager::inc_create_move_task_requests(int64_t val) {
-    create_move_task_requests_.inc(val);
-}
-void MasterMetricManager::inc_create_move_task_failures(int64_t val) {
-    create_move_task_failures_.inc(val);
-}
-void MasterMetricManager::inc_query_task_requests(int64_t val) {
-    query_task_requests_.inc(val);
-}
-void MasterMetricManager::inc_query_task_failures(int64_t val) {
-    query_task_failures_.inc(val);
-}
-void MasterMetricManager::inc_fetch_tasks_requests(int64_t val) {
-    fetch_tasks_requests_.inc(val);
-}
-void MasterMetricManager::inc_fetch_tasks_failures(int64_t val) {
-    fetch_tasks_failures_.inc(val);
-}
-void MasterMetricManager::inc_update_task_requests(int64_t val) {
-    mark_task_to_complete_requests_.inc(val);
-}
-void MasterMetricManager::inc_update_task_failures(int64_t val) {
-    mark_task_to_complete_failures_.inc(val);
-}
-
-// Task create, query, fetch Metrics Getters
-int64_t MasterMetricManager::get_create_copy_task_requests() {
-    return create_copy_task_requests_.value();
-}
-int64_t MasterMetricManager::get_create_copy_task_failures() {
-    return create_copy_task_failures_.value();
-}
-int64_t MasterMetricManager::get_create_move_task_requests() {
-    return create_move_task_requests_.value();
-}
-int64_t MasterMetricManager::get_create_move_task_failures() {
-    return create_move_task_failures_.value();
-}
-int64_t MasterMetricManager::get_query_task_requests() {
-    return query_task_requests_.value();
-}
-int64_t MasterMetricManager::get_query_task_failures() {
-    return query_task_failures_.value();
-}
-int64_t MasterMetricManager::get_fetch_tasks_requests() {
-    return fetch_tasks_requests_.value();
-}
-int64_t MasterMetricManager::get_fetch_tasks_failures() {
-    return fetch_tasks_failures_.value();
-}
-int64_t MasterMetricManager::get_update_task_requests() {
-    return mark_task_to_complete_requests_.value();
-}
-int64_t MasterMetricManager::get_update_task_failures() {
-    return mark_task_to_complete_failures_.value();
 }
 
 // --- Serialization ---
@@ -1464,7 +734,6 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(file_allocated_size_);
     serialize_metric(file_total_capacity_);
     serialize_metric(key_count_);
-    serialize_metric(soft_pin_key_count_);
     serialize_metric(active_clients_);
     serialize_metric(register_client_requests_);
     serialize_metric(register_client_failures_);
@@ -1480,12 +749,6 @@ std::string MasterMetricManager::serialize_metrics() {
     // Serialize Request Counters
     serialize_metric(exist_key_requests_);
     serialize_metric(exist_key_failures_);
-    serialize_metric(put_start_requests_);
-    serialize_metric(put_start_failures_);
-    serialize_metric(put_end_requests_);
-    serialize_metric(put_end_failures_);
-    serialize_metric(put_revoke_requests_);
-    serialize_metric(put_revoke_failures_);
     serialize_metric(get_replica_list_requests_);
     serialize_metric(get_replica_list_failures_);
     serialize_metric(get_replica_list_by_regex_requests_);
@@ -1504,78 +767,17 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(remount_segment_failures_);
     serialize_metric(heartbeat_requests_);
     serialize_metric(heartbeat_failures_);
-    serialize_metric(get_write_route_requests_);
-    serialize_metric(get_write_route_failures_);
-    serialize_metric(add_replica_requests_);
-    serialize_metric(add_replica_failures_);
-    serialize_metric(remove_replica_requests_);
-    serialize_metric(remove_replica_failures_);
-
-    // Serialize CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke
-    // Counters
-    serialize_metric(copy_start_requests_);
-    serialize_metric(copy_start_failures_);
-    serialize_metric(copy_end_requests_);
-    serialize_metric(copy_end_failures_);
-    serialize_metric(copy_revoke_requests_);
-    serialize_metric(copy_revoke_failures_);
-    serialize_metric(move_start_requests_);
-    serialize_metric(move_start_failures_);
-    serialize_metric(move_end_requests_);
-    serialize_metric(move_end_failures_);
-    serialize_metric(move_revoke_requests_);
-    serialize_metric(move_revoke_failures_);
-
-    // Serialize CreateCopyTask, CreateMoveTask, MarkTaskToComplete, QueryTask,
-    // FetchTasks Request Counters
-    serialize_metric(create_copy_task_requests_);
-    serialize_metric(create_copy_task_failures_);
-    serialize_metric(create_move_task_requests_);
-    serialize_metric(create_move_task_failures_);
-    serialize_metric(mark_task_to_complete_requests_);
-    serialize_metric(mark_task_to_complete_failures_);
-    serialize_metric(query_task_requests_);
-    serialize_metric(query_task_failures_);
-    serialize_metric(fetch_tasks_requests_);
-    serialize_metric(fetch_tasks_failures_);
 
     // Serialize Batch Request Counters
     serialize_metric(batch_exist_key_requests_);
     serialize_metric(batch_exist_key_failures_);
     serialize_metric(batch_query_ip_requests_);
     serialize_metric(batch_query_ip_failures_);
-    serialize_metric(batch_replica_clear_requests_);
-    serialize_metric(batch_replica_clear_failures_);
     serialize_metric(batch_get_replica_list_requests_);
     serialize_metric(batch_get_replica_list_failures_);
     serialize_metric(batch_get_replica_list_partial_successes_);
     serialize_metric(batch_get_replica_list_items_);
     serialize_metric(batch_get_replica_list_failed_items_);
-    serialize_metric(batch_put_start_requests_);
-    serialize_metric(batch_put_start_failures_);
-    serialize_metric(batch_put_end_requests_);
-    serialize_metric(batch_put_end_failures_);
-    serialize_metric(batch_put_revoke_requests_);
-    serialize_metric(batch_put_revoke_failures_);
-    serialize_metric(batch_remove_replica_requests_);
-    serialize_metric(batch_remove_replica_failures_);
-    serialize_metric(batch_remove_replica_partial_successes_);
-    serialize_metric(batch_remove_replica_items_);
-    serialize_metric(batch_remove_replica_failed_items_);
-    serialize_metric(batch_get_write_route_requests_);
-    serialize_metric(batch_get_write_route_failures_);
-    serialize_metric(batch_get_write_route_partial_successes_);
-
-    // Serialize Eviction Counters
-    serialize_metric(eviction_success_);
-    serialize_metric(eviction_attempts_);
-    serialize_metric(evicted_key_count_);
-    serialize_metric(evicted_size_);
-
-    // Serialize PutStart Discard Metrics
-    serialize_metric(put_start_discard_cnt_);
-    serialize_metric(put_start_release_cnt_);
-    serialize_metric(put_start_discarded_staging_size_);
 
     return ss.str();
 }
@@ -1653,68 +855,18 @@ std::string MasterMetricManager::get_summary_string() {
     int64_t file_allocated = file_allocated_size_.value();
     int64_t file_capacity = file_total_capacity_.value();
     int64_t keys = key_count_.value();
-    int64_t soft_pin_keys = soft_pin_key_count_.value();
     int64_t active_clients = active_clients_.value();
 
     // Request counters
     int64_t exist_keys = exist_key_requests_.value();
     int64_t exist_key_fails = exist_key_failures_.value();
-    int64_t put_starts = put_start_requests_.value();
-    int64_t put_start_fails = put_start_failures_.value();
-    int64_t put_ends = put_end_requests_.value();
-    int64_t put_end_fails = put_end_failures_.value();
-    int64_t put_revoke_requests = put_revoke_requests_.value();
-    int64_t put_revoke_fails = put_revoke_failures_.value();
     int64_t get_replicas = get_replica_list_requests_.value();
     int64_t get_replica_fails = get_replica_list_failures_.value();
     int64_t removes = remove_requests_.value();
     int64_t remove_fails = remove_failures_.value();
     int64_t remove_all = remove_all_requests_.value();
     int64_t remove_all_fails = remove_all_failures_.value();
-    int64_t create_move_tasks = create_move_task_requests_.value();
-    int64_t create_move_task_fails = create_move_task_failures_.value();
-    int64_t create_copy_tasks = create_copy_task_requests_.value();
-    int64_t create_copy_task_fails = create_copy_task_failures_.value();
-    int64_t query_tasks = query_task_requests_.value();
-    int64_t query_task_fails = query_task_failures_.value();
-    int64_t fetch_tasks = fetch_tasks_requests_.value();
-    int64_t fetch_task_fails = fetch_tasks_failures_.value();
 
-    // CopyStart, CopyEnd, CopyRevoke, MoveStart, MoveEnd, MoveRevoke counters
-    int64_t copy_starts = copy_start_requests_.value();
-    int64_t copy_start_fails = copy_start_failures_.value();
-    int64_t copy_ends = copy_end_requests_.value();
-    int64_t copy_end_fails = copy_end_failures_.value();
-    int64_t copy_revokes = copy_revoke_requests_.value();
-    int64_t copy_revoke_fails = copy_revoke_failures_.value();
-    int64_t move_starts = move_start_requests_.value();
-    int64_t move_start_fails = move_start_failures_.value();
-    int64_t move_ends = move_end_requests_.value();
-    int64_t move_end_fails = move_end_failures_.value();
-    int64_t move_revokes = move_revoke_requests_.value();
-    int64_t move_revoke_fails = move_revoke_failures_.value();
-
-    // Batch request counters
-    int64_t batch_put_start_requests = batch_put_start_requests_.value();
-    int64_t batch_put_start_fails = batch_put_start_failures_.value();
-    int64_t batch_put_start_partial_successes =
-        batch_put_start_partial_successes_.value();
-    int64_t batch_put_start_items = batch_put_start_items_.value();
-    int64_t batch_put_start_failed_items =
-        batch_put_start_failed_items_.value();
-    int64_t batch_put_end_requests = batch_put_end_requests_.value();
-    int64_t batch_put_end_fails = batch_put_end_failures_.value();
-    int64_t batch_put_end_partial_successes =
-        batch_put_end_partial_successes_.value();
-    int64_t batch_put_end_items = batch_put_end_items_.value();
-    int64_t batch_put_end_failed_items = batch_put_end_failed_items_.value();
-    int64_t batch_put_revoke_requests = batch_put_revoke_requests_.value();
-    int64_t batch_put_revoke_fails = batch_put_revoke_failures_.value();
-    int64_t batch_put_revoke_partial_successes =
-        batch_put_revoke_partial_successes_.value();
-    int64_t batch_put_revoke_items = batch_put_revoke_items_.value();
-    int64_t batch_put_revoke_failed_items =
-        batch_put_revoke_failed_items_.value();
     int64_t batch_get_replica_list_requests =
         batch_get_replica_list_requests_.value();
     int64_t batch_get_replica_list_fails =
@@ -1738,38 +890,10 @@ std::string MasterMetricManager::get_summary_string() {
         batch_query_ip_partial_successes_.value();
     int64_t batch_query_ip_items = batch_query_ip_items_.value();
     int64_t batch_query_ip_failed_items = batch_query_ip_failed_items_.value();
-    int64_t batch_replica_clear_requests =
-        batch_replica_clear_requests_.value();
-    int64_t batch_replica_clear_fails = batch_replica_clear_failures_.value();
-    int64_t batch_replica_clear_partial_successes =
-        batch_replica_clear_partial_successes_.value();
-    int64_t batch_replica_clear_items = batch_replica_clear_items_.value();
-    int64_t batch_replica_clear_failed_items =
-        batch_replica_clear_failed_items_.value();
-    int64_t batch_remove_replica_requests =
-        batch_remove_replica_requests_.value();
-    int64_t batch_remove_replica_fails = batch_remove_replica_failures_.value();
-    int64_t batch_remove_replica_partial_successes =
-        batch_remove_replica_partial_successes_.value();
-    int64_t batch_remove_replica_items = batch_remove_replica_items_.value();
-    int64_t batch_remove_replica_failed_items =
-        batch_remove_replica_failed_items_.value();
-
-    // Eviction counters
-    int64_t eviction_success = eviction_success_.value();
-    int64_t eviction_attempts = eviction_attempts_.value();
-    int64_t evicted_key_count = evicted_key_count_.value();
-    int64_t evicted_size = evicted_size_.value();
 
     // Heartbeat counters
     int64_t heartbeat = heartbeat_requests_.value();
     int64_t heartbeat_fails = heartbeat_failures_.value();
-
-    // Discard counters
-    int64_t put_start_discard_cnt = put_start_discard_cnt_.value();
-    int64_t put_start_release_cnt = put_start_release_cnt_.value();
-    int64_t put_start_discarded_staging_size =
-        put_start_discarded_staging_size_.value();
 
     // --- Format the summary string ---
     ss << "Mem Storage: " << byte_size_to_string(mem_allocated) << " / "
@@ -1780,59 +904,22 @@ std::string MasterMetricManager::get_summary_string() {
     }
     ss << " | SSD Storage: " << byte_size_to_string(file_allocated) << " / "
        << byte_size_to_string(file_capacity);
-    ss << " | Keys: " << keys << " (soft-pinned: " << soft_pin_keys << ")";
+    ss << " | Keys: " << keys;
     ss << " | Clients: " << active_clients;
 
     // Request summary - focus on the most important metrics
     ss << " | Requests (Success/Total): ";
-    ss << "PutStart=" << put_starts - put_start_fails << "/" << put_starts
-       << ", ";
-    ss << "PutEnd=" << put_ends - put_end_fails << "/" << put_ends << ", ";
-    ss << "PutRevoke=" << put_revoke_requests - put_revoke_fails << "/"
-       << put_revoke_requests << ", ";
     ss << "Get=" << get_replicas - get_replica_fails << "/" << get_replicas
        << ", ";
     ss << "Exist=" << exist_keys - exist_key_fails << "/" << exist_keys << ", ";
     ss << "Del=" << removes - remove_fails << "/" << removes << ", ";
     ss << "DelAll=" << remove_all - remove_all_fails << "/" << remove_all
        << ", ";
-    ss << "Heartbeat=" << heartbeat - heartbeat_fails << "/" << heartbeat
-       << ", ";
-    ss << "CopyStart=" << copy_starts - copy_start_fails << "/" << copy_starts
-       << ", ";
-    ss << "CopyEnd=" << copy_ends - copy_end_fails << "/" << copy_ends << ", ";
-    ss << "CopyRevoke=" << copy_revokes - copy_revoke_fails << "/"
-       << copy_revokes << ", ";
-    ss << "MoveStart=" << move_starts - move_start_fails << "/" << move_starts
-       << ", ";
-    ss << "MoveEnd=" << move_ends - move_end_fails << "/" << move_ends << ", ";
-    ss << "MoveRevoke=" << move_revokes - move_revoke_fails << "/"
-       << move_revokes;
+    ss << "Heartbeat=" << heartbeat - heartbeat_fails << "/" << heartbeat;
 
     // Batch request summary
     ss << " | Batch Requests "
           "(Req=Success/PartialSuccess/Total, Item=Success/Total): ";
-    ss << "PutStart:(Req="
-       << batch_put_start_requests - batch_put_start_fails -
-              batch_put_start_partial_successes
-       << "/" << batch_put_start_partial_successes << "/"
-       << batch_put_start_requests
-       << ", Item=" << batch_put_start_items - batch_put_start_failed_items
-       << "/" << batch_put_start_items << "), ";
-    ss << "PutEnd:(Req="
-       << batch_put_end_requests - batch_put_end_fails -
-              batch_put_end_partial_successes
-       << "/" << batch_put_end_partial_successes << "/"
-       << batch_put_end_requests
-       << ", Item=" << batch_put_end_items - batch_put_end_failed_items << "/"
-       << batch_put_end_items << "), ";
-    ss << "PutRevoke:(Req="
-       << batch_put_revoke_requests - batch_put_revoke_fails -
-              batch_put_revoke_partial_successes
-       << "/" << batch_put_revoke_partial_successes << "/"
-       << batch_put_revoke_requests
-       << ", Item=" << batch_put_revoke_items - batch_put_revoke_failed_items
-       << "/" << batch_put_revoke_items << "), ";
     ss << "Get:(Req="
        << batch_get_replica_list_requests - batch_get_replica_list_fails -
               batch_get_replica_list_partial_successes
@@ -1853,46 +940,7 @@ std::string MasterMetricManager::get_summary_string() {
        << "/" << batch_query_ip_partial_successes << "/"
        << batch_query_ip_requests
        << ", Item=" << batch_query_ip_items - batch_query_ip_failed_items << "/"
-       << batch_query_ip_items << "), ";
-    ss << "Clear:(Req="
-       << batch_replica_clear_requests - batch_replica_clear_fails -
-              batch_replica_clear_partial_successes
-       << "/" << batch_replica_clear_partial_successes << "/"
-       << batch_replica_clear_requests << ", Item="
-       << batch_replica_clear_items - batch_replica_clear_failed_items << "/"
-       << batch_replica_clear_items << "), ";
-    ss << "RemoveReplica:(Req="
-       << batch_remove_replica_requests - batch_remove_replica_fails -
-              batch_remove_replica_partial_successes
-       << "/" << batch_remove_replica_partial_successes << "/"
-       << batch_remove_replica_requests << ", Item="
-       << batch_remove_replica_items - batch_remove_replica_failed_items << "/"
-       << batch_remove_replica_items << "), ";
-
-    ss << "CreateMoveTask:(Req=" << create_move_tasks - create_move_task_fails
-       << "/" << create_move_tasks << "), ";
-    ss << "CreateCopyTask:(Req=" << create_copy_tasks - create_copy_task_fails
-       << "/" << create_copy_tasks << "), ";
-    ss << "QueryTask=(Req=" << query_tasks - query_task_fails << "/"
-       << query_tasks << "), ";
-    ss << "FetchTasks=(Req=" << fetch_tasks - fetch_task_fails << "/"
-       << fetch_tasks << "), ";
-    ss << "MarkTaskToComplete= (Req="
-       << mark_task_to_complete_requests_.value() -
-              mark_task_to_complete_failures_.value()
-       << "/" << mark_task_to_complete_requests_.value() << "), ";
-    // Eviction summary
-    ss << " | Eviction: "
-       << "Success/Attempts=" << eviction_success << "/" << eviction_attempts
-       << ", "
-       << "keys=" << evicted_key_count << ", "
-       << "size=" << byte_size_to_string(evicted_size);
-
-    // Discard summary
-    ss << " | Discard: "
-       << "Released/Total=" << put_start_release_cnt << "/"
-       << put_start_discard_cnt << ", StagingSize="
-       << byte_size_to_string(put_start_discarded_staging_size);
+       << batch_query_ip_items << ")";
 
     return ss.str();
 }

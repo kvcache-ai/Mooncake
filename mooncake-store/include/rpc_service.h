@@ -10,6 +10,7 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "master_service.h"
+#include "master_metric_manager.h"
 #include "types.h"
 #include "rpc_types.h"
 #include "master_config.h"
@@ -20,7 +21,10 @@ static const uint64_t kMetricReportIntervalSeconds = 10;
 
 class WrappedMasterService {
    public:
-    WrappedMasterService(const WrappedMasterServiceConfig& config);
+    // metric_manager registers itself before the HTTP server and the
+    // report thread start.
+    WrappedMasterService(const WrappedMasterServiceConfig& config,
+                         MasterMetricManager& metric_manager);
 
     virtual ~WrappedMasterService();
 

@@ -14,7 +14,7 @@
 
 #include "types.h"
 #include "allocator.h"
-#include "master_metric_manager.h"
+#include "centralized_master_metric_manager.h"
 
 namespace mooncake {
 
@@ -188,7 +188,8 @@ class Replica {
           status_(status),
           refcnt_(0) {
         // Automatic update allocated_file_size via RAII
-        MasterMetricManager::instance().inc_allocated_file_size(object_size);
+        CentralizedMasterMetricManager::instance().inc_allocated_file_size(
+            object_size);
     }
 
     Replica(UUID client_id, uint64_t object_size,
@@ -203,7 +204,7 @@ class Replica {
     ~Replica() {
         if (status_ != ReplicaStatus::UNDEFINED && is_disk_replica()) {
             const auto& disk_data = std::get<DiskReplicaData>(data_);
-            MasterMetricManager::instance().dec_allocated_file_size(
+            CentralizedMasterMetricManager::instance().dec_allocated_file_size(
                 disk_data.object_size);
         }
     }
@@ -232,7 +233,7 @@ class Replica {
         // Decrement metric for the current object before overwriting.
         if (status_ != ReplicaStatus::UNDEFINED && is_disk_replica()) {
             const auto& disk_data = std::get<DiskReplicaData>(data_);
-            MasterMetricManager::instance().dec_allocated_file_size(
+            CentralizedMasterMetricManager::instance().dec_allocated_file_size(
                 disk_data.object_size);
         }
 

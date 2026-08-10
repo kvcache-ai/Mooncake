@@ -1,4 +1,5 @@
 #include "p2p_master_service.h"
+#include "p2p_master_metric_manager.h"
 
 #include <unistd.h>
 
@@ -77,6 +78,8 @@ class FailingOpLogStore : public OpLogStore {
 class P2PRecordOplogTest : public ::testing::Test {
    protected:
     void SetUp() override {
+        // Register the metric singleton (no wrapped service here).
+        P2PMasterMetricManager::instance();
         test_dir_ =
             std::filesystem::temp_directory_path() /
             ("mooncake_p2p_record_oplog_test_" + std::to_string(::getpid()) +

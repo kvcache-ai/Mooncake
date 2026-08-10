@@ -2,6 +2,7 @@
 #define BUFFER_ALLOCATOR_H
 
 #include <atomic>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <string>
@@ -98,6 +99,13 @@ class BufferAllocatorBase {
    public:
     virtual ~BufferAllocatorBase() = default;
 
+    using UsageObserver = std::function<void(int64_t)>;
+    void set_usage_observers(UsageObserver on_allocated,
+                             UsageObserver on_deallocated) {
+        on_allocated_ = std::move(on_allocated);
+        on_deallocated_ = std::move(on_deallocated);
+    }
+
     virtual std::unique_ptr<AllocatedBuffer> allocate(size_t size) = 0;
     virtual void deallocate(AllocatedBuffer* handle) = 0;
     virtual size_t capacity() const = 0;
@@ -116,6 +124,10 @@ class BufferAllocatorBase {
      * allocation may still fail due to race conditions or fragmentation.
      */
     virtual size_t getLargestFreeRegion() const = 0;
+
+   protected:
+    UsageObserver on_allocated_;
+    UsageObserver on_deallocated_;
 };
 
 /**

@@ -18,6 +18,8 @@ set(MOONCAKE_STORE_SOURCES
     p2p_master_client.cpp
     utils.cpp
     master_metric_manager.cpp
+    centralized_master_metric_manager.cpp
+    p2p_master_metric_manager.cpp
     storage_backend.cpp
     thread_pool.cpp
     etcd_helper.cpp

@@ -23,6 +23,8 @@ class MasterServiceSSDTest : public ::testing::Test {
     void SetUp() override {
         google::InitGoogleLogging("MasterServiceTest");
         FLAGS_logtostderr = true;
+        // Register the metric singleton
+        CentralizedMasterMetricManager::instance();
     }
 
     void TearDown() override { google::ShutdownGoogleLogging(); }
@@ -313,8 +315,8 @@ TEST_F(MasterServiceSSDTest, EvictObject) {
 
 TEST_F(MasterServiceSSDTest, PutStartExpires) {
     // Reset storage space metrics.
-    MasterMetricManager::instance().reset_allocated_mem_size();
-    MasterMetricManager::instance().reset_total_mem_capacity();
+    CentralizedMasterMetricManager::instance().reset_allocated_mem_size();
+    CentralizedMasterMetricManager::instance().reset_total_mem_capacity();
 
     MasterServiceConfig master_config;
     master_config.root_fs_dir = "/mnt/ssd";

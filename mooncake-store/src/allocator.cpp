@@ -5,8 +5,6 @@
 
 #include <memory>
 
-#include "master_metric_manager.h"
-
 namespace mooncake {
 
 std::string AllocatedBuffer::getSegmentName() const noexcept {
@@ -112,8 +110,7 @@ CachelibBufferAllocator::CachelibBufferAllocator(std::string segment_name,
 }
 
 CachelibBufferAllocator::~CachelibBufferAllocator() {
-    MasterMetricManager::instance().dec_allocated_mem_size(segment_name_,
-                                                           cur_size_);
+    if (on_deallocated_) on_deallocated_(cur_size_);
 };
 
 std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(
@@ -139,7 +136,7 @@ std::unique_ptr<AllocatedBuffer> CachelibBufferAllocator::allocate(
     VLOG(1) << "allocation_succeeded size=" << size
             << " segment=" << segment_name_ << " address=" << buffer;
     cur_size_.fetch_add(size);
-    MasterMetricManager::instance().inc_allocated_mem_size(segment_name_, size);
+    if (on_allocated_) on_allocated_(size);
     return std::make_unique<AllocatedBuffer>(shared_from_this(), buffer, size,
                                              segment_id_);
 }
@@ -154,8 +151,7 @@ void CachelibBufferAllocator::deallocate(AllocatedBuffer* handle) {
         size_t freed_size =
             handle->size_;  // Store size before handle might become invalid
         cur_size_.fetch_sub(freed_size);
-        MasterMetricManager::instance().dec_allocated_mem_size(segment_name_,
-                                                               freed_size);
+        if (on_deallocated_) on_deallocated_(freed_size);
         VLOG(1) << "deallocation_succeeded address=" << handle->buffer_ptr_
                 << " size=" << freed_size << " segment=" << segment_name_;
     } catch (const std::exception& e) {
@@ -210,8 +206,7 @@ OffsetBufferAllocator::OffsetBufferAllocator(std::string segment_name,
 }
 
 OffsetBufferAllocator::~OffsetBufferAllocator() {
-    MasterMetricManager::instance().dec_allocated_mem_size(segment_name_,
-                                                           cur_size_);
+    if (on_deallocated_) on_deallocated_(cur_size_);
 };
 
 std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
@@ -250,7 +245,7 @@ std::unique_ptr<AllocatedBuffer> OffsetBufferAllocator::allocate(size_t size) {
     }
 
     cur_size_.fetch_add(size);
-    MasterMetricManager::instance().inc_allocated_mem_size(segment_name_, size);
+    if (on_allocated_) on_allocated_(size);
     return allocated_buffer;
 }
 
@@ -261,8 +256,7 @@ void OffsetBufferAllocator::deallocate(AllocatedBuffer* handle) {
         size_t freed_size = handle->size();
         handle->offset_handle_.reset();
         cur_size_.fetch_sub(freed_size);
-        MasterMetricManager::instance().dec_allocated_mem_size(segment_name_,
-                                                               freed_size);
+        if (on_deallocated_) on_deallocated_(freed_size);
         VLOG(1) << "deallocation_succeeded address=" << handle->data()
                 << " size=" << freed_size << " segment=" << segment_name_;
     } catch (const std::exception& e) {
