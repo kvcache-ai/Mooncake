@@ -61,7 +61,7 @@ DEFINE_double(qos_link_capacity_gbps, 0.0,
 DEFINE_string(qos_output_jsonl, "",
               "Append versioned QoS metric records to this JSONL file.");
 DEFINE_uint64(request_interval_us, 0,
-              "Minimum aggregate interval between issued transfer batches, in "
+              "Per-thread delay before each issued transfer batch, in "
               "microseconds. 0 disables pacing.");
 DEFINE_uint64(deadline_us, 0,
               "tent only: relative per-transfer deadline in microseconds for "
