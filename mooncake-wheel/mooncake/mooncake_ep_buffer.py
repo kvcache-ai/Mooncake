@@ -15,10 +15,15 @@ _USE_MACA = (
     _env_enabled("MOONCAKE_EP_USE_MACA")
     or bool(getattr(torch.version, "maca", None))
 )
-_USE_SPLIT_SEND_RECV = (
-    _env_enabled("MOONCAKE_EP_USE_MUSA")
-    or _USE_MACA
-)
+_USE_SPLIT_SEND_RECV = _USE_MACA
+
+
+def _native_current_stream_ptr() -> int:
+    return int(torch.cuda.current_stream().cuda_stream)
+
+
+def _wait_native_event_on_current_stream(event: "ep.EventHandle") -> None:
+    event.current_stream_wait(_native_current_stream_ptr())
 
 
 class EventOverlap:
@@ -53,7 +58,7 @@ class EventOverlap:
         The current stream `torch.cuda.current_stream()` waits for the event to be finished.
         """
         assert self.event is not None
-        self.event.current_stream_wait()
+        _wait_native_event_on_current_stream(self.event)
 
     def __enter__(self) -> Any:
         """
@@ -76,11 +81,16 @@ class EventOverlap:
         Please follow the example in the `__enter__` function.
         """
         if self.event is not None:
-            self.event.current_stream_wait()
+            _wait_native_event_on_current_stream(self.event)
 
 
 class Buffer:
-    def __init__(self, group: dist.ProcessGroup, num_ep_buffer_bytes: int = 0):
+    def __init__(
+        self,
+        group: dist.ProcessGroup,
+        num_ep_buffer_bytes: int = 0,
+        disable_p2p: bool = False,
+    ):
         from mooncake import ep
 
         # Initialize the CPP runtime
@@ -91,7 +101,7 @@ class Buffer:
         self.backend = self.group
         # NIC auto-detection happens inside ep.Buffer via Topology::discover().
         self.runtime = ep.Buffer(
-            self.rank, self.group_size, num_ep_buffer_bytes
+            self.rank, self.group_size, num_ep_buffer_bytes, disable_p2p
         )
         # Fallback flag and buffers.
         # Note: `sync_nvlink_ipc_handles()` can mutate C++ `ibgda_disabled_` (True->False when
@@ -172,18 +182,24 @@ class Buffer:
 
         if not self._use_fallback:
             (raddr, rkey) = self.runtime.get_mr_info()
+            # torchada maps the CUDA device namespace to MUSA when enabled.
+            gpu_device = "cuda"
 
-            raddr = torch.tensor([raddr], dtype=torch.int64, device="cuda")
+            raddr = torch.tensor(
+                [raddr], dtype=torch.int64, device=gpu_device
+            )
             raddrs = [
-                torch.empty(1, dtype=torch.int64, device="cuda")
+                torch.empty(1, dtype=torch.int64, device=gpu_device)
                 for _ in range(self.group_size)
             ]
             dist.all_gather(raddrs, raddr, self.group)
             raddrs = torch.cat(raddrs).tolist()
 
-            rkey = torch.tensor([rkey], dtype=torch.int32, device="cuda")
+            rkey = torch.tensor(
+                [rkey], dtype=torch.int32, device=gpu_device
+            )
             rkeys = [
-                torch.empty(1, dtype=torch.int32, device="cuda")
+                torch.empty(1, dtype=torch.int32, device=gpu_device)
                 for _ in range(self.group_size)
             ]
             dist.all_gather(rkeys, rkey, self.group)
@@ -197,13 +213,15 @@ class Buffer:
             local_qpns = self.runtime.get_local_qpns()
             local_qpns = list(
                 torch.unbind(
-                    torch.tensor(local_qpns, dtype=torch.int32, device="cuda").view(
-                        -1, all_to_all_size
-                    )
+                    torch.tensor(
+                        local_qpns, dtype=torch.int32, device=gpu_device
+                    ).view(-1, all_to_all_size)
                 )
             )
             remote_qpns = [
-                torch.empty(all_to_all_size, dtype=torch.int32, device="cuda")
+                torch.empty(
+                    all_to_all_size, dtype=torch.int32, device=gpu_device
+                )
                 for _ in range(self.group_size)
             ]
             dist.all_to_all(remote_qpns, local_qpns, self.group)
@@ -212,36 +230,48 @@ class Buffer:
             local_lids = self.runtime.get_local_lids()
             local_lids = list(
                 torch.unbind(
-                    torch.tensor(local_lids, dtype=torch.int32, device="cuda").view(
-                        -1, all_to_all_size
-                    )
+                    torch.tensor(
+                        local_lids, dtype=torch.int32, device=gpu_device
+                    ).view(-1, all_to_all_size)
                 )
             )
             remote_lids = [
-                torch.empty(all_to_all_size, dtype=torch.int32, device="cuda")
+                torch.empty(
+                    all_to_all_size, dtype=torch.int32, device=gpu_device
+                )
                 for _ in range(self.group_size)
             ]
             dist.all_to_all(remote_lids, local_lids, self.group)
             peer_lids = [remote_lids[r].tolist() for r in range(self.group_size)]
 
             (subnet_prefix, interface_id) = self.runtime.get_gid()
-            subnet_prefix_t = torch.tensor([subnet_prefix], dtype=torch.int64, device="cuda")
+            subnet_prefix_t = torch.tensor(
+                [subnet_prefix], dtype=torch.int64, device=gpu_device
+            )
             subnet_prefixes_list = [
-                torch.empty(1, dtype=torch.int64, device="cuda")
+                torch.empty(1, dtype=torch.int64, device=gpu_device)
                 for _ in range(self.group_size)
             ]
-            dist.all_gather(subnet_prefixes_list, subnet_prefix_t, self.group)
+            dist.all_gather(
+                subnet_prefixes_list, subnet_prefix_t, self.group
+            )
             subnet_prefixes = torch.cat(subnet_prefixes_list).tolist()
 
-            interface_id_t = torch.tensor([interface_id], dtype=torch.int64, device="cuda")
+            interface_id_t = torch.tensor(
+                [interface_id], dtype=torch.int64, device=gpu_device
+            )
             interface_ids_list = [
-                torch.empty(1, dtype=torch.int64, device="cuda")
+                torch.empty(1, dtype=torch.int64, device=gpu_device)
                 for _ in range(self.group_size)
             ]
-            dist.all_gather(interface_ids_list, interface_id_t, self.group)
+            dist.all_gather(
+                interface_ids_list, interface_id_t, self.group
+            )
             interface_ids = torch.cat(interface_ids_list).tolist()
 
-            active_ranks_mask = self._active_ranks_list(torch.device("cuda"))
+            active_ranks_mask = self._active_ranks_list(
+                torch.device(gpu_device)
+            )
             self.runtime.sync_ibgda_peers(
                 raddrs, rkeys, peer_qpns, peer_lids,
                 subnet_prefixes, interface_ids, active_ranks_mask
@@ -252,29 +282,36 @@ class Buffer:
             # export also avoids unnecessary driver IPC calls on MACA.
             self._use_fallback = False
             return
-        else:
-            try:
-                local_handle_ints = self.runtime.get_ipc_handle()
-                # pybind11 converts std::vector<int32_t> to a list of integers
-                local_handle_tensor = torch.tensor(
-                    local_handle_ints, dtype=torch.int32, device="cuda"
+        if not self.runtime.p2p_enabled():
+            return
+        try:
+            local_handle_ints = self.runtime.get_ipc_handle()
+            # pybind11 converts std::vector<int32_t> to a list of integers
+            local_handle_tensor = torch.tensor(
+                local_handle_ints, dtype=torch.int32, device=gpu_device
+            )
+            handles = [
+                torch.empty(
+                    len(local_handle_ints),
+                    dtype=torch.int32,
+                    device=gpu_device,
                 )
-                handles = [
-                    torch.empty(len(local_handle_ints), dtype=torch.int32, device="cuda")
-                    for _ in range(self.group_size)
-                ]
-                dist.all_gather(handles, local_handle_tensor, self.group)
-                remote_handles = [h.tolist() for h in handles]
-                active_ranks_mask = self._active_ranks_list(torch.device("cuda"))
-                self.runtime.sync_nvlink_ipc_handles(remote_handles, active_ranks_mask)
-            except Exception as e:
-                import warnings
+                for _ in range(self.group_size)
+            ]
+            dist.all_gather(handles, local_handle_tensor, self.group)
+            remote_handles = [h.tolist() for h in handles]
+            active_ranks_mask = self._active_ranks_list(
+                torch.device(gpu_device)
+            )
+            self.runtime.sync_nvlink_ipc_handles(remote_handles, active_ranks_mask)
+        except Exception as e:
+            import warnings
 
-                warnings.warn(
-                    f"[Rank {self.rank}] Failed to exchange IPC handles: {e}. Falling back.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
+            warnings.warn(
+                f"[Rank {self.rank}] Failed to exchange IPC handles: {e}. Falling back.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
         use_fast_path = False
         try:
@@ -316,7 +353,7 @@ class Buffer:
             return torch.ones((self.group_size,), dtype=dtype, device=device)
 
         try:
-            from mooncake.ep import get_active_ranks
+            from mooncake.pg import get_active_ranks
 
             return get_active_ranks(self.backend).to(device=device, dtype=dtype)
         except Exception:
@@ -357,15 +394,34 @@ class Buffer:
         EventOverlap,
         Callable,
     ]:
+        assert x.dim() == 2 and x.is_contiguous()
+        assert x.dtype == torch.bfloat16
+        assert topk_idx.dim() == 2 and topk_idx.is_contiguous()
+        assert topk_idx.dtype == torch.int64
+        assert x.size(0) == topk_idx.size(0)
+        assert x.size(0) <= num_max_dispatch_tokens_per_rank
+        assert x.size(1) % 16 == 0 and x.size(1) % 128 == 0
+        assert num_experts % self.group_size == 0
+        caller_active_ranks = active_ranks
+        if active_ranks is None:
+            active_ranks = self._active_ranks_tensor(
+                device=x.device, dtype=torch.int32
+            )
+        else:
+            assert active_ranks.dim() == 1 and active_ranks.is_contiguous()
+            assert active_ranks.dtype == torch.int32
+            if active_ranks.numel() != self.group_size:
+                active_ranks = torch.ones(
+                    (self.group_size,), dtype=torch.int32, device=x.device
+                )
+
         if use_fp8 is None:
             use_fp8 = not _USE_MACA
         elif _USE_MACA and use_fp8:
             raise NotImplementedError("FP8 dispatch is not supported on MACA")
 
-        # MUSA/MACA do not support cooperative grid sync, so the C++ runtime
-        # splits no-hook calls into SEND -> phase-ack -> RECV instead of using
-        # a single cooperative kernel.  async_finish still returns a stream
-        # event, but it is not the CUDA single-kernel cooperative path.
+        # MUSA and MACA use split SEND/RECV launches because they do not expose
+        # CUDA cooperative-grid synchronization. Only MACA adds a phase fence.
         if _USE_SPLIT_SEND_RECV and async_finish:
             import warnings
 
@@ -377,7 +433,7 @@ class Buffer:
             )
 
         runtime_return_recv_hook = return_recv_hook or (
-            _USE_MACA and not self._use_fallback
+            _USE_SPLIT_SEND_RECV and not self._use_fallback
         )
 
         if self._use_fallback:
@@ -400,29 +456,75 @@ class Buffer:
             backend_active_ranks = self._active_ranks_tensor(
                 device=active_ranks.device, dtype=active_ranks.dtype
             )
-            if active_ranks.numel() == backend_active_ranks.numel():
+            if (
+                caller_active_ranks is not None
+                and active_ranks.numel() == backend_active_ranks.numel()
+            ):
                 active_ranks.copy_(backend_active_ranks)
         else:
-            (
-                packed_recv_x,
-                packed_recv_x_scales,
-                packed_recv_count,
-                packed_recv_src_info,
-                packed_recv_layout_range,
-                event,
-                hook,
-            ) = self.runtime.dispatch(
-                x,
-                topk_idx,
-                active_ranks,
+            num_local_experts = num_experts // self.group_size
+            packed_recv_x = torch.empty(
+                (
+                    num_local_experts,
+                    self.group_size * num_max_dispatch_tokens_per_rank,
+                    x.size(1),
+                ),
+                dtype=torch.float8_e4m3fn if use_fp8 else torch.bfloat16,
+                device=x.device,
+            )
+            # The dispatch SEND phase resets every local-expert counter before
+            # the RECV phase reads it, so this output need not be pre-cleared.
+            packed_recv_count = torch.empty(
+                (num_local_experts,), dtype=torch.int32, device=x.device
+            )
+            packed_recv_src_info = torch.empty(
+                (
+                    num_local_experts,
+                    self.group_size * num_max_dispatch_tokens_per_rank,
+                ),
+                dtype=torch.int32,
+                device=x.device,
+            )
+            packed_recv_layout_range = torch.empty(
+                (num_local_experts, self.group_size),
+                dtype=torch.int64,
+                device=x.device,
+            )
+            packed_recv_x_scales = None
+            if use_fp8:
+                assert (
+                    self.group_size * num_max_dispatch_tokens_per_rank
+                ) % 4 == 0
+                packed_recv_x_scales = torch.empty(
+                    (
+                        num_local_experts,
+                        x.size(1) // 128,
+                        self.group_size * num_max_dispatch_tokens_per_rank,
+                    ),
+                    dtype=torch.float32,
+                    device=x.device,
+                ).transpose(1, 2)
+            event, hook = self.runtime.dispatch(
+                x.data_ptr(),
+                topk_idx.data_ptr(),
+                active_ranks.data_ptr(),
+                x.size(0),
+                x.size(1),
+                topk_idx.size(1),
                 num_max_dispatch_tokens_per_rank,
                 num_experts,
                 timeout_us,
                 use_fp8,
+                packed_recv_x.data_ptr(),
+                0 if packed_recv_x_scales is None else packed_recv_x_scales.data_ptr(),
+                packed_recv_count.data_ptr(),
+                packed_recv_src_info.data_ptr(),
+                packed_recv_layout_range.data_ptr(),
                 async_finish,
                 runtime_return_recv_hook,
+                _native_current_stream_ptr(),
             )
-            if _USE_MACA:
+            if _USE_SPLIT_SEND_RECV:
                 hook = self._wrap_maca_recv_hook(hook, event)
                 if not return_recv_hook:
                     hook()
@@ -465,6 +567,24 @@ class Buffer:
         return_recv_hook: bool = False,
         out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, EventOverlap, Callable]:
+        assert x.dim() == 3 and x.is_contiguous()
+        assert x.dtype == torch.bfloat16
+        assert topk_idx.dim() == 2 and topk_idx.is_contiguous()
+        assert topk_idx.dtype == torch.int64
+        assert topk_weights.dim() == 2 and topk_weights.is_contiguous()
+        assert topk_weights.dtype == torch.float32
+        caller_active_ranks = active_ranks
+        if active_ranks is None:
+            active_ranks = self._active_ranks_tensor(
+                device=x.device, dtype=torch.int32
+            )
+        else:
+            assert active_ranks.dim() == 1 and active_ranks.is_contiguous()
+            assert active_ranks.dtype == torch.int32
+            if active_ranks.numel() != self.group_size:
+                active_ranks = torch.ones(
+                    (self.group_size,), dtype=torch.int32, device=x.device
+                )
         # Same split-kernel behavior as dispatch().
         if _USE_SPLIT_SEND_RECV and async_finish:
             import warnings
@@ -484,7 +604,7 @@ class Buffer:
             num_experts,
         ) = handle
         runtime_return_recv_hook = return_recv_hook or (
-            _USE_MACA and not self._use_fallback
+            _USE_SPLIT_SEND_RECV and not self._use_fallback
         )
 
         if self._use_fallback:
@@ -503,25 +623,58 @@ class Buffer:
             backend_active_ranks = self._active_ranks_tensor(
                 device=active_ranks.device, dtype=active_ranks.dtype
             )
-            if active_ranks.numel() == backend_active_ranks.numel():
+            if (
+                caller_active_ranks is not None
+                and active_ranks.numel() == backend_active_ranks.numel()
+            ):
                 active_ranks.copy_(backend_active_ranks)
         else:
-            combined_x, event, hook = self.runtime.combine(
-                x,
-                topk_idx,
-                topk_weights,
-                src_info,
-                layout_range,
-                active_ranks,
+            assert x.size(0) == num_experts // self.group_size
+            assert x.size(1) == self.group_size * num_max_dispatch_tokens_per_rank
+            assert x.size(2) == hidden
+            assert x.size(2) % 16 == 0 and x.size(2) % 128 == 0
+            assert topk_idx.size() == topk_weights.size()
+            assert topk_weights.size(0) <= num_max_dispatch_tokens_per_rank
+            assert src_info.dim() == 2 and src_info.is_contiguous()
+            assert src_info.dtype == torch.int32
+            assert src_info.size(0) == x.size(0)
+            assert layout_range.dim() == 2 and layout_range.is_contiguous()
+            assert layout_range.dtype == torch.int64
+            assert layout_range.size(0) == num_experts // self.group_size
+            assert layout_range.size(1) == self.group_size
+            combined_x = (
+                out
+                if out is not None
+                else torch.empty(
+                    (topk_weights.size(0), hidden), dtype=x.dtype, device=x.device
+                )
+            )
+            if out is not None:
+                assert out.dim() == 2 and out.is_contiguous()
+                assert out.size(0) == topk_weights.size(0)
+                assert out.size(1) == hidden
+                assert out.dtype == x.dtype
+            event, hook = self.runtime.combine(
+                x.data_ptr(),
+                topk_idx.data_ptr(),
+                topk_weights.data_ptr(),
+                src_info.data_ptr(),
+                layout_range.data_ptr(),
+                active_ranks.data_ptr(),
+                x.size(0),
+                topk_weights.size(0),
+                hidden,
+                topk_weights.size(1),
                 num_max_dispatch_tokens_per_rank,
                 num_experts,
                 timeout_us,
                 zero_copy,
+                combined_x.data_ptr(),
                 async_finish,
                 runtime_return_recv_hook,
-                out,
+                _native_current_stream_ptr(),
             )
-            if _USE_MACA:
+            if _USE_SPLIT_SEND_RECV:
                 hook = self._wrap_maca_recv_hook(hook, event)
                 if not return_recv_hook:
                     hook()
@@ -548,35 +701,34 @@ class Buffer:
             hidden,
             num_experts,
         ) = handle
-        if self._use_fallback:
-            if (
-                self._fallback_next_combine_buffer is None
-                or self._fallback_next_combine_buffer.shape
-                != (
+        if (
+            self._fallback_next_combine_buffer is None
+            or self._fallback_next_combine_buffer.shape
+            != (
+                num_experts // self.group_size,
+                num_max_dispatch_tokens_per_rank * self.group_size,
+                hidden,
+            )
+        ):
+            self._fallback_next_combine_buffer = torch.empty(
+                (
                     num_experts // self.group_size,
                     num_max_dispatch_tokens_per_rank * self.group_size,
                     hidden,
-                )
-            ):
-                self._fallback_next_combine_buffer = torch.empty(
-                    (
-                        num_experts // self.group_size,
-                        num_max_dispatch_tokens_per_rank * self.group_size,
-                        hidden,
-                    ),
-                    dtype=torch.bfloat16,
-                    device="cuda",
-                )
-            return self._fallback_next_combine_buffer
-        return self.runtime.get_next_combine_buffer(
-            num_max_dispatch_tokens_per_rank, hidden, num_experts
-        )
+                ),
+                dtype=torch.bfloat16,
+                device="cuda",
+            )
+        return self._fallback_next_combine_buffer
 
     # -----------------
     # Fallback helpers
     # -----------------
     class _DummyEvent:
-        def current_stream_wait(self):
+        def current_stream_wait(self, stream_ptr: Optional[int] = None):
+            torch.cuda.synchronize()
+
+        def synchronize(self):
             torch.cuda.synchronize()
 
     @staticmethod
