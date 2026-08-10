@@ -1,13 +1,3 @@
-/*
- * Copyright (c) 2026 绿算技术
- * All rights reserved.
- *
- * @File: mooncake-store/src/spdk/nof_connection.cpp
- * @Description: NofConnection::Connect() 工厂, qpair 协商
- *
- * 修改履历 | 2026-07-31 | 初始多 qpair 实现
- * 修改履历 | 2026-08-03 | 新增连续分配 + 退避重试 + TryGrow 再均衡（本 PR）
- */
 #include "spdk/nof_connection.h"
 
 #include <glog/logging.h>
@@ -64,10 +54,10 @@ int32_t NofQpairPool::PollAll(uint32_t max_completions) {
     return total;
 }
 
-// 修改履历 | 2026-08-03 | 新增（本 PR）
-// 使用构造时存储的 ctrlr_ 分配新 qpair。
-// spdk_nvme_qpair 在公有头文件中仅前向声明，无法通过 qpairs_[0]->ctrlr
-// 获取 controller，因此必须在构造 NofQpairPool 时显式传入 ctrlr。
+// Use the ctrlr_ stored at construction time to allocate new qpairs.
+// spdk_nvme_qpair is only forward-declared in the public header, so we
+// cannot obtain the controller via qpairs_[0]->ctrlr — the controller
+// pointer must be passed explicitly to the NofQpairPool constructor.
 uint32_t NofQpairPool::TryGrow(uint32_t target_total) {
     if (qpairs_.empty() || qpairs_.size() >= target_total) {
         return 0;
@@ -83,7 +73,7 @@ uint32_t NofQpairPool::TryGrow(uint32_t target_total) {
     for (uint32_t i = qpairs_.size(); i < target_total; i++) {
         auto *qp = spdk_nvme_ctrlr_alloc_io_qpair(ctrlr_, nullptr, 0);
         if (!qp) {
-            // QID 池无可用 QID — 停止尝试，等待下一次 TryGrow 周期。
+            // No free QIDs — stop and wait for the next TryGrow cycle.
             break;
         }
         qpairs_.push_back(qp);
@@ -111,14 +101,15 @@ struct ConnectCtx {
     spdk_nvme_ctrlr *ctrlr = nullptr;
     const NofConfig *config = nullptr;
     bool attach_called = false;
-    // 修改履历 | 2026-08-03 | 唯一 host NQN 计数器（本 PR）
-    // 同一进程内多次 Connect 使用相同默认 hostnqn 会导致 target
-    // 将多连接合并到同一 controller，Set Features 被 NVMe 协议拒绝。
-    // 每连接分配唯一 hostnqn 确保 target 创建独立 controller。
+    // Unique per-connection host NQN counter.
+    // When multiple Connect() calls share the same default hostnqn within
+    // a single process, the target merges them onto one controller and
+    // NVMe Set Features is rejected.  Assigning a unique hostnqn per
+    // connection forces the target to create independent controllers.
     uint32_t hostnqn_id = 0;
 };
 
-// 修改履历 | 2026-08-03 | 全局计数器，每连接递增（本 PR）
+// Global counter incremented per connection to guarantee uniqueness.
 static std::atomic<uint32_t> g_hostnqn_counter{0};
 
 /// Parse a transport string into (traddr, trsvcid, subnqn, trtype, ns).
@@ -175,7 +166,8 @@ NofConnection::~NofConnection() {
 // static
 std::unique_ptr<NofConnection> NofConnection::Connect(
     const std::string &traddr, const std::string &trsvcid,
-    const std::string &subnqn, uint32_t ns_id, const NofConfig &config,
+    const std::string &subnqn, uint32_t ns_id,
+    spdk_nvme_transport_type trtype, const NofConfig &config,
     std::string *error_msg) {
     // Build transport ID
     struct spdk_nvme_transport_id trid;
@@ -183,15 +175,19 @@ std::unique_ptr<NofConnection> NofConnection::Connect(
     snprintf(trid.traddr, sizeof(trid.traddr), "%s", traddr.c_str());
     snprintf(trid.trsvcid, sizeof(trid.trsvcid), "%s", trsvcid.c_str());
     snprintf(trid.subnqn, sizeof(trid.subnqn), "%s", subnqn.c_str());
-    trid.trtype = SPDK_NVME_TRANSPORT_RDMA;
+    // Use the caller-supplied transport type instead of hard-coding RDMA.
+    // This allows TCP environments (MC_NOF_TRTYPE=TCP) to work correctly
+    // without master/client transport type disagreement.
+    trid.trtype = trtype;
     trid.adrfam = SPDK_NVMF_ADRFAM_IPV4;
 
     ConnectCtx ctx;
     ctx.config = &config;
-    // 修改履历 | 2026-08-03 | 每连接分配唯一 host NQN（本 PR）
-    // 同一进程内多次 spdk_nvme_probe 默认使用相同 hostnqn，
-    // target 会合并同 hostnqn 的连接导致 Set Features 被拒绝。
-    // 使用全局递增计数器确保每个连接获得独立的 hostnqn。
+    // Assign a unique per-connection host NQN.
+    // Multiple spdk_nvme_probe calls within the same process default to
+    // the same hostnqn; the target merges these connections onto one
+    // controller and NVMe Set Features is rejected.  A global incrementing
+    // counter ensures each connection gets an independent hostnqn.
     ctx.hostnqn_id = g_hostnqn_counter.fetch_add(1, std::memory_order_relaxed);
 
     // Probe callback: set controller options
@@ -205,10 +201,11 @@ std::unique_ptr<NofConnection> NofConnection::Connect(
         opts->io_queue_requests = cfg.io_queue_requests;
         opts->keep_alive_timeout_ms = cfg.keep_alive_timeout_ms;
 
-        // 修改履历 | 2026-08-03 | 设置唯一 host NQN（本 PR）
-        // 默认 hostnqn 为空时 SPDK 使用 nqn.2014-08.org.nvmexpress:uuid:XXX，
-        // 同进程内所有连接共享同一 UUID → target 合并连接 → IO qpair 分配失败。
-        // 格式: nqn.2024-08.mooncake:c<N> 确保每个连接独立 controller。
+        // When hostnqn is empty SPDK uses a UUID-based default
+        // (nqn.2014-08.org.nvmexpress:uuid:XXX); all connections in the
+        // same process share that UUID, so the target merges them and IO
+        // qpair allocation fails.  The nqn.2024-08.mooncake:c<N> format
+        // gives each connection an independent controller.
         snprintf(opts->hostnqn, sizeof(opts->hostnqn),
                  "nqn.2024-08.mooncake:c%u", pctx->hostnqn_id);
 
@@ -257,25 +254,29 @@ std::unique_ptr<NofConnection> NofConnection::Connect(
     uint32_t block_size = spdk_nvme_ns_get_sector_size(ns);
     uint64_t num_blocks = spdk_nvme_ns_get_num_sectors(ns);
 
-    // 修改履历 | 2026-08-03 | 连续分配，不重试（本 PR）。
-    // 重试退避逻辑已移至 OpenNofSegment() 的 connect_mutex_ 外部。
-    // 此处仅做一次连续分配：尝试拿满 requested 条，拿到多少算多少。
-    // 若 0 条则返回失败，由调用方在 mutex 外退避后重试。
+    // Sequential allocation — no retry inside Connect().
+    // Retry with backoff is handled by OpenNofSegment() outside the
+    // connect_mutex_ lock.  Here we make a single sequential pass:
+    // allocate as many I/O qpairs as possible up to `requested`.
+    // If we get zero qpairs, return failure; the caller retries outside
+    // the mutex after backoff.
     std::vector<spdk_nvme_qpair *> qpairs;
     uint32_t requested = config.num_io_queues;
     uint32_t min_required =
         config.enable_degradation ? config.min_io_queues : requested;
 
-    // 连续分配：能拿多少拿多少，不设离散分级。
-    // 理由：离散分级会在 QID 池有 13 空闲时只拿 8，浪费 5 QID。
+    // Allocate greedily in one pass without discrete tiers.
+    // Discrete tiers would waste QIDs (e.g. taking only 8 when 13 are
+    // available), whereas greedy allocation uses every available slot.
     for (uint32_t i = 0; i < requested; i++) {
         auto *qp = spdk_nvme_ctrlr_alloc_io_qpair(ctx.ctrlr, nullptr, 0);
-        if (!qp) break;  // QID 池耗尽，停止尝试
+        if (!qp) break;  // QID pool exhausted, stop allocating
         qpairs.push_back(qp);
     }
 
     if (qpairs.size() < min_required) {
-        // 清理可能残留的部分分配（< min 不可用）
+        // Release partial allocations (< min is unusable)
+        size_t partial_count = qpairs.size();
         for (auto *qp : qpairs) {
             spdk_nvme_ctrlr_free_io_qpair(qp);
         }
@@ -286,12 +287,13 @@ std::unique_ptr<NofConnection> NofConnection::Connect(
                 *error_msg = "qpair_alloc_fail: all allocations failed";
             } else {
                 *error_msg = "qpair_alloc_fail: got " +
-                             std::to_string(qpairs.size()) +
+                             std::to_string(partial_count) +
                              " (min=" + std::to_string(min_required) +
                              ", target=" + std::to_string(requested) + ")";
             }
         }
-        LOG(ERROR) << "[NofConnection] QID exhaustion: 0 qpairs for " << subnqn
+        LOG(ERROR) << "[NofConnection] QID exhaustion: " << partial_count
+                   << " qpairs for " << subnqn
                    << " (target=" << requested << ", min=" << min_required
                    << ") — target QID pool likely exhausted";
         spdk_nvme_detach(ctx.ctrlr);
@@ -304,8 +306,8 @@ std::unique_ptr<NofConnection> NofConnection::Connect(
                      << subnqn << " — performance may be reduced";
     }
 
-    // target_count = 请求数，TryGrow 恢复目标；ctrlr 用于 TryGrow 分配新
-    // qpair。
+    // target_count = initial requested count for TryGrow recovery;
+    // ctrlr is kept so TryGrow can allocate new qpairs later.
     auto pool = std::make_unique<NofQpairPool>(
         std::move(qpairs), config.max_inflight_per_qpair, requested, ctx.ctrlr);
 
@@ -330,13 +332,18 @@ std::unique_ptr<NofConnection> NofConnection::Connect(
         return nullptr;
     }
 
-    // RDMA is our only transport currently; warn if TCP requested.
+    // Translate parsed transport type to SPDK enum and pass it through
+    // to the 6-parameter Connect() so the SPDK transport ID is set
+    // correctly for both RDMA and TCP environments.
+    spdk_nvme_transport_type spdk_trtype;
     if (trtype == "TCP") {
-        LOG(WARNING)
-            << "[NofConnection] TCP transport requested — RDMA is preferred";
+        spdk_trtype = SPDK_NVME_TRANSPORT_TCP;
+    } else {
+        spdk_trtype = SPDK_NVME_TRANSPORT_RDMA;
     }
 
-    return Connect(traddr, trsvcid, subnqn, ns, config, error_msg);
+    return Connect(traddr, trsvcid, subnqn, ns, spdk_trtype, config,
+                   error_msg);
 }
 
 }  // namespace mooncake

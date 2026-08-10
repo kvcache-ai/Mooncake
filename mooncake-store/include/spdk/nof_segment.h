@@ -3,7 +3,7 @@
  * All rights reserved.
  *
  * @File: mooncake-store/include/spdk/nof_segment.h
- * @Description: NofSegment 类声明, PipelineCtx
+ * @Description: NofSegment class declaration, PipelineCtx
  */
 #pragma once
 

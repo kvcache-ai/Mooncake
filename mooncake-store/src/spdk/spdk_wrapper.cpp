@@ -1,18 +1,3 @@
-/*
- * Copyright (c) 2026 绿算技术
- * All rights reserved.
- *
- * @File:mooncake-store/src/spdk/spdk_wrapper.cpp
- *
- * 修改履历 | 2026-07-31 | spdk_wrapper.h — 重写
- * 修改履历 | 2026-07-31 | 新增 CloseNofSegment；ProbeNofSegment
- * 改用独立临时连接防止 QID 泄漏 修改履历 | 2026-07-31 | OpenNofSegment 新增
- * connect_mutex_ 序列化 spdk_nvme_probe 修改履历 | 2026-07-31 | 新增
- * g_active_worker_count 全局计数器 + SpdkNoF_Register/Unregister； Cleanup 中
- * LOG(FATAL) 检测 WorkerPool 未 join 时的错误析构顺序 修改履历 | 2026-08-03 |
- * OpenNofSegment 接入 QidPressureGauge 自适应 qpair 数； ProbeNofSegment 改用
- * config_probe_ (num_io_queues=1)（本 PR）
- */
 #include <glog/logging.h>
 
 #include <atomic>
@@ -25,11 +10,13 @@
 
 namespace mooncake {
 
-// Added 2026-07-31: 文件级全局计数器，跟踪活跃的 SpdkNofWorkerPool 实例数。
-// 必须在文件级（非 SpdkWrapper 成员），因为静态析构期间 SpdkWrapper 单例
-// 可能已销毁，WorkerPool 析构函数无法访问成员变量。
-// SpdkWrapper::Cleanup() 检查此计数器：>0 时表示 WorkerPool 尚未 join，
-// 此时释放 qpair 会导致 worker 线程 poll 已释放内存 → segfault。
+// File-scope counter tracking the number of active SpdkNofWorkerPool
+// instances.  Must be file-scope (not a SpdkWrapper member) because the
+// SpdkWrapper singleton may already be destroyed during static
+// destruction, so WorkerPool destructors cannot access member variables.
+// SpdkWrapper::Cleanup() checks this counter: > 0 means a WorkerPool has
+// not been joined yet.  Freeing qpairs at that point would cause worker
+// threads to poll freed memory → segfault.
 static std::atomic<int> g_active_worker_count{0};
 
 void SpdkNoF_RegisterWorkerPool() {
@@ -40,82 +27,9 @@ void SpdkNoF_UnregisterWorkerPool() {
     g_active_worker_count.fetch_sub(1, std::memory_order_relaxed);
 }
 
-namespace {
-
-bool ParseEnvU64(const char *name, uint64_t *out) {
-    const char *val = std::getenv(name);
-    if (!val || *val == '\0') {
-        return false;
-    }
-
-    errno = 0;
-    char *end = nullptr;
-    unsigned long long parsed = std::strtoull(val, &end, 10);
-    if (errno != 0 || end == val || (end && *end != '\0')) {
-        LOG(WARNING) << "Invalid value for " << name << ": " << val;
-        return false;
-    }
-
-    *out = static_cast<uint64_t>(parsed);
-    return true;
-}
-
-bool ParseEnvBool(const char *name, bool *out) {
-    uint64_t v = 0;
-    if (!ParseEnvU64(name, &v)) {
-        return false;
-    }
-    *out = (v != 0);
-    return true;
-}
-
-void ApplyCtrlrOptsFromEnv(struct spdk_nvme_ctrlr_opts *opts) {
-    uint64_t v = 0;
-    bool bv = false;
-    opts->keep_alive_timeout_ms = 0;
-
-    if (ParseEnvU64("MC_NVME_NUM_IO_QUEUES", &v)) {
-        opts->num_io_queues = static_cast<uint32_t>(v);
-    }
-    if (ParseEnvU64("MC_NVME_IO_QUEUE_SIZE", &v)) {
-        opts->io_queue_size = static_cast<uint32_t>(v);
-    }
-    if (ParseEnvU64("MC_NVME_IO_QUEUE_REQUESTS", &v)) {
-        opts->io_queue_requests = static_cast<uint32_t>(v);
-    }
-    if (ParseEnvU64("MC_NVME_TRANSPORT_ACK_TIMEOUT", &v)) {
-        opts->transport_ack_timeout = static_cast<uint8_t>(v);
-    }
-    if (ParseEnvU64("MC_NVME_ADMIN_QUEUE_SIZE", &v)) {
-        opts->admin_queue_size = static_cast<uint16_t>(v);
-    }
-    if (ParseEnvU64("MC_NVME_FABRICS_CONNECT_TIMEOUT_US", &v)) {
-        opts->fabrics_connect_timeout_us = v;
-    }
-    if (ParseEnvBool("MC_NVME_HEADER_DIGEST", &bv)) {
-        opts->header_digest = bv;
-    }
-    if (ParseEnvBool("MC_NVME_DATA_DIGEST", &bv)) {
-        opts->data_digest = bv;
-    }
-    LOG(INFO) << "NVMe ctrlr opts: num_io_queues=" << opts->num_io_queues
-              << ", io_queue_size=" << opts->io_queue_size
-              << ", io_queue_requests=" << opts->io_queue_requests
-              << ", keep_alive_timeout_ms=" << opts->keep_alive_timeout_ms
-              << ", transport_ack_timeout="
-              << static_cast<int>(opts->transport_ack_timeout)
-              << ", admin_queue_size=" << opts->admin_queue_size
-              << ", fabrics_connect_timeout_us="
-              << opts->fabrics_connect_timeout_us
-              << ", header_digest=" << opts->header_digest
-              << ", data_digest=" << opts->data_digest;
-}
-
-}  // namespace
-
-// [Migrated] 旧 struct nof_seg_handle_ / tr_info / ctrlr_info 已移除。
-// 新设计通过 NofConnection + NofSegment 抽象层管理 NVMe-oF 资源，
-// nof_seg_handle 统一在头文件 spdk_wrapper.h 中定义。
+// [Migrated] Old nof_seg_handle_ / tr_info / ctrlr_info structs removed.
+// The new design manages NVMe-oF resources through the NofConnection +
+// NofSegment abstraction layer; nof_seg_handle is defined in the header.
 
 SpdkWrapper::SpdkWrapper() = default;
 
@@ -154,8 +68,9 @@ bool SpdkWrapper::InitializeEnv() {
               << ", io_queue_size=" << config_.io_queue_size
               << ", chunk_blocks=" << config_.chunk_blocks;
 
-    // 修改履历 | 2026-08-03 | 心跳探测独立配置（本 PR）。
-    // 探测只需 1 qpair，不应与 I/O 路径竞争 QID 池。
+    // Use a dedicated config for heartbeat probes.
+    // Probes need only 1 qpair and must not compete with the I/O path
+    // for QID slots.
     config_probe_ = NofConfig::ForProbe();
     LOG(INFO) << "SpdkWrapper probe config: num_io_queues="
               << config_probe_.num_io_queues;
@@ -167,10 +82,11 @@ bool SpdkWrapper::InitializeEnv() {
 
 void SpdkWrapper::Cleanup() {
     if (initialized.load(std::memory_order_acquire)) {
-        // [Diagnostic] 2026-07-31：检测错误的销毁顺序。
-        // g_active_worker_count 为文件级全局变量，不依赖 SpdkWrapper
-        // 单例生命周期。 若 >0，说明 WorkerPool 尚未析构（workers 未 join），
-        // 此时释放 qpair 会导致 worker 线程 poll 已释放内存 → segfault。
+        // [Diagnostic] Detect incorrect destruction order.
+        // g_active_worker_count is a file-scope variable independent of
+        // the SpdkWrapper singleton lifetime.  If > 0, a WorkerPool still
+        // has active workers that have not been joined.  Releasing qpairs
+        // here would cause those workers to poll freed memory → segfault.
         int alive = g_active_worker_count.load(std::memory_order_relaxed);
         if (alive > 0) {
             LOG(FATAL)
@@ -182,23 +98,22 @@ void SpdkWrapper::Cleanup() {
                 << "all SpdkNofWorkerPool instances.";
         }
 
-        // [Migrated] 清理新设计的 open_segments_：
-        // NofConnection 由 unique_ptr 自动析构（含 qpair 池和 ctrlr detach），
-        // 只需手动释放 NofSegment 和 nof_seg_handle。
+        // [Migrated] Clean up the new open_segments_ design:
+        // NofConnection is auto-destroyed by unique_ptr (including qpair
+        // pool and ctrlr detach); only NofSegment and nof_seg_handle
+        // must be freed manually.
         {
             std::lock_guard<std::mutex> lock(segments_mutex_);
             for (auto &[handle, conn] : open_segments_) {
                 if (handle) {
                     delete handle
-                        ->segment;  // NofSegment* 由 OpenNofSegment new 分配
-                    delete handle;  // nof_seg_handle* 由 OpenNofSegment new
-                                    // 分配
+                        ->segment;  // Allocated by OpenNofSegment
+                    delete handle;  // Allocated by OpenNofSegment
                 }
-                // conn (unique_ptr<NofConnection>) 自动析构，释放 qpair 池并
-                // detach ctrlr
+                // conn (unique_ptr<NofConnection>) auto-destructs,
+                // freeing the qpair pool and detaching the ctrlr.
             }
             open_segments_.clear();
-            endpoint_to_handle_.clear();  // 清理反向去重索引
         }
 
         {
@@ -246,9 +161,11 @@ void SpdkWrapper::ProbeReadComplete(void *ctx,
         probe_ctx->success.store(true, std::memory_order_release);
     }
     probe_ctx->done.store(true, std::memory_order_release);
-    if (probe_ctx->owner != nullptr) {
-        probe_ctx->owner->RecycleProbeRequestContext(probe_ctx);
-    }
+    // Do NOT recycle probe_ctx here.  ProbeNofSegment() still reads
+    // success / error_reason after the poll loop, and a concurrent probe
+    // could acquire and reset the same context before those reads complete.
+    // The caller (ProbeNofSegment) is now responsible for recycling the
+    // context after it has copied the results.
 }
 
 void SpdkWrapper::ReplenishProbeRequestContextPoolLocked(size_t count) {
@@ -266,7 +183,7 @@ SpdkWrapper::ProbeRequestContext *SpdkWrapper::AcquireProbeRequestContext() {
     }
     auto *probe_ctx = probe_request_context_pool_.top();
     probe_request_context_pool_.pop();
-    probe_ctx->Reset(this);
+    probe_ctx->Reset();
     return probe_ctx;
 }
 
@@ -278,32 +195,40 @@ void SpdkWrapper::RecycleProbeRequestContext(ProbeRequestContext *ctx) {
     probe_request_context_pool_.push(ctx);
 }
 
-// [Migrated] 委托给 NofSegment::PollCompletion，替代旧版直接访问 seg->qpair。
+// [Migrated] Delegates to NofSegment::PollCompletion instead of the
+// old direct seg->qpair access.
 int64_t SpdkWrapper::NvmePollProcessCompletion(nof_seg_handle *seg,
                                                uint32_t complete_per_seg) {
     if (!seg || !seg->segment) return -1;
     return seg->segment->PollCompletion(complete_per_seg);
 }
 
-// [Removed] ParseTransPortStr / ConnectController 已移除。
-// 新设计中，传输地址解析和控制器连接由 NofConnection::Connect() 统一处理。
+// [Removed] ParseTransPortStr / ConnectController removed.
+// Transport parsing and controller connection are now handled centrally
+// by NofConnection::Connect().
 
-// OpenNofSegment: 使用新层连接。
-// 修改履历 2026-07-31：新增 endpoint→handle 去重 (已移除 I/O 路径复用，见下)。
-// 修改履历 2026-07-31：spdk_nvme_probe 非线程安全 — 新增 connect_mutex_
-// 序列化。 修改履历 2026-07-31：移除 I/O 路径连接复用。
-//   原因：多个 ClientService 各自持有独立的 SpdkNofWorkerPool。
-//   若复用同一 handle，多个 WorkerPool 的 worker 线程会并发访问同一 qpair 池，
-//   互相收割对方的 completion 导致 inflight 计数器下溢。
-//   SPDK qpair 单线程约束要求每 handle 仅被一个 WorkerPool 使用。
-//   每个 client 持有独立连接，4 clients × 4 qpairs = 20 QID (远低于 64 上限)。
+// OpenNofSegment: uses the new connection layer.
+// 2026-07-31: Endpoint→handle dedup added (I/O-path reuse later removed).
+// 2026-07-31: spdk_nvme_probe is not thread-safe — added connect_mutex_
+//             to serialise all Connect() calls.
+// 2026-07-31: Removed I/O-path connection reuse.
+//   Rationale: each ClientService owns an independent SpdkNofWorkerPool.
+//   Sharing a handle across WorkerPools would let multiple worker threads
+//   access the same qpair pool concurrently, stealing each other's
+//   completions and underflowing inflight counters.  SPDK requires each
+//   qpair to be owned by a single thread.  Each client now holds an
+//   independent connection: 4 clients × 4 qpairs = 20 QIDs (well under 64).
 nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str) {
     if (!InitializeEnv()) return nullptr;
 
-    // 修改履历 | 2026-08-03 | 自适应 + 重试移出 connect_mutex_（本 PR）
-    // - 每次重试前重新 GetRecommended()，感知并发 Client 的失败事件
-    // - 每次失败后立即 Record()，让其他 Client 实时感知压力
-    // - 渐进降级：target 逐次减半，而非全用同一个值重试 6 次
+    // Adaptive QID pressure handling with retry moved outside
+    // the connect_mutex_ lock.
+    // - Re-evaluate pressure via GetRecommended() before each retry so
+    //   concurrent client failures are visible.
+    // - Report failures immediately via Record() so other clients see
+    //   pressure in real time.
+    // - Gradual degradation: halve the target each cycle rather than
+    //   retrying with the same value N times.
     std::string error;
     std::unique_ptr<NofConnection> conn;
     uint32_t max_retries =
@@ -311,11 +236,13 @@ nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str) {
     uint32_t current_target = config_.num_io_queues;
 
     for (uint32_t attempt = 0; attempt <= max_retries; attempt++) {
-        // 每次重试前重新评估 QID 压力，感知并发 Client 的 Record 事件。
+        // Re-evaluate QID pressure before each retry to pick up
+        // Record() events from concurrent clients.
         if (config_.enable_degradation && attempt > 0) {
             uint32_t recommended =
                 qid_pressure_gauge_.GetRecommended(config_.num_io_queues);
-            // 渐进降级：取 gauge 建议值和上次 target 一半的最小值。
+            // Gradual degradation: take the minimum of the gauge
+            // recommendation and half the previous target.
             uint32_t degraded = std::max(current_target / 2, 1u);
             current_target = std::min(recommended, degraded);
         }
@@ -330,14 +257,19 @@ nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str) {
 
         if (conn) break;
 
-        // 立即上报失败，让并发的其他 Client 感知 QID 压力。
+        // Report failure immediately so concurrent clients can
+        // observe the pressure event.
         qid_pressure_gauge_.Record(current_target, 0);
 
         bool is_qid_exhaustion =
             (error.find("qpair_alloc_fail") != std::string::npos);
         if (!is_qid_exhaustion || attempt >= max_retries) break;
 
-        auto wait_ms = config_.retry_backoff_ms * (1 << attempt);
+        // Exponential backoff capped at 30 s to prevent unbounded
+        // blocking under extreme config values (retry_max_attempts=10,
+        // retry_backoff_ms=5000 → uncapped total ~85 min).
+        auto wait_ms = std::min(
+            config_.retry_backoff_ms * (1u << attempt), 30000u);
         LOG(WARNING) << "SpdkWrapper::OpenNofSegment: QID exhausted"
                      << " (target=" << current_target << "), waiting "
                      << wait_ms << "ms"
@@ -352,63 +284,61 @@ nof_seg_handle *SpdkWrapper::OpenNofSegment(const std::string &tr_str) {
         return nullptr;
     }
 
-    // 上报成功分配结果到压力感知器，恢复 Green 状态。
+    // Report successful allocation to the pressure gauge to
+    // restore Green status.
     uint32_t actual_qpairs = conn->GetQpairPool().Size();
     qid_pressure_gauge_.Record(current_target, actual_qpairs);
 
-    auto *segment = new NofSegment(conn.get(), 0, conn->GetNumBlocks());
-    auto *handle = new nof_seg_handle{segment};
+    // Wrap allocations in unique_ptr so that a subsequent exception
+    // (e.g. bad_alloc from the handle allocation, or map insertion
+    // failure) does not leak the segment.
+    auto segment = std::unique_ptr<NofSegment>(
+        new NofSegment(conn.get(), 0, conn->GetNumBlocks()));
+    auto handle = std::unique_ptr<nof_seg_handle>(
+        new nof_seg_handle{segment.get()});
 
     {
         std::lock_guard<std::mutex> lock(segments_mutex_);
-        open_segments_[handle] = std::move(conn);
+        open_segments_[handle.get()] = std::move(conn);
     }
 
     LOG(INFO) << "SpdkWrapper::OpenNofSegment OK: "
-              << "subnqn=" << open_segments_[handle]->GetSubnqn()
+              << "subnqn=" << segment->GetConnection()->GetSubnqn()
               << " qpairs=" << segment->GetConnection()->GetQpairPool().Size()
               << " (requested=" << current_target << ")";
 
-    return handle;
+    segment.release();
+    return handle.release();
 }
 
-// CloseNofSegment: 释放 OpenNofSegment 分配的全部资源。
-// 修改履历 2026-07-31：同步清理 endpoint_to_handle_ 反向索引，避免悬挂引用。
+// CloseNofSegment: release all resources allocated by OpenNofSegment.
 void SpdkWrapper::CloseNofSegment(nof_seg_handle *handle) {
     if (!handle) return;
 
     std::lock_guard<std::mutex> lock(segments_mutex_);
     auto it = open_segments_.find(handle);
     if (it == open_segments_.end()) {
-        // 不在 map 中 — handle 可能已被 Cleanup() 释放，仅清理裸指针。
-        delete handle->segment;
-        delete handle;
+        // Already closed (e.g. Cleanup() ran first during static
+        // destruction).  Do NOT double-free — the pointers were
+        // deleted when the entry was erased from open_segments_.
         return;
     }
 
-    // 清理反向索引：遍历 endpoint_to_handle_ 找到指向此 handle 的条目并移除。
-    for (auto ei = endpoint_to_handle_.begin(); ei != endpoint_to_handle_.end();
-         ++ei) {
-        if (ei->second == handle) {
-            endpoint_to_handle_.erase(ei);
-            break;
-        }
-    }
-
-    delete handle->segment;  // NofSegment* 由 OpenNofSegment new 分配
-    delete handle;           // nof_seg_handle* 由 OpenNofSegment new 分配
+    delete handle->segment;  // alloc'd by OpenNofSegment
+    delete handle;           // alloc'd by OpenNofSegment
     open_segments_.erase(
-        it);  // unique_ptr<NofConnection> 析构 → qpair pool → ctrlr detach
+        it);  // ~unique_ptr<NofConnection> → qpair pool → ctrlr detach
 }
 
-// [Migrated] 通过 NofSegment 获取 block size，替代旧版直接访问 seg_handle->ns。
+// [Migrated] Obtain block size via NofSegment instead of the old
+// direct seg_handle->ns access.
 uint32_t SpdkWrapper::GetBlockSize(const nof_seg_handle *seg_handle) {
     if (!seg_handle || !seg_handle->segment) {
         return INVALID_BLOCK_SIZE;
     }
     return seg_handle->segment->GetBlockSize();
 }
-// SubmitRequest: 委托给 NofSegment
+// SubmitRequest: delegates to NofSegment
 int SpdkWrapper::SubmitRequest(const nof_seg_handle *seg_handle, void *ptr,
                                uint64_t lba, uint32_t lba_count, int op,
                                spdk_nvme_cmd_cb cb_fn, void *cb_ctx) {
@@ -452,11 +382,13 @@ SpdkWrapper::ProbeBuffer *SpdkWrapper::GetOrCreateProbeBuffer(
     return probe_buffer.get();
 }
 
-// 修改履历 2026-07-31：重写为直接使用 NofConnection::Connect()
-// 创建独立临时连接。 不经过 OpenNofSegment（I/O 路径共享连接），不加入
-// open_segments_， 不与 Worker 线程共享 qpair — 避免违反 SPDK qpair
-// 单线程约束。 函数返回时 NofConnection 自动析构 → qpair pool free → ctrlr
-// detach → QID 回收。
+// 2026-07-31: Rewritten to use NofConnection::Connect() directly,
+// creating an independent temporary connection.  Does NOT go through
+// OpenNofSegment (I/O-path shared connection), does NOT insert into
+// open_segments_, and does NOT share qpairs with worker threads — this
+// avoids violating the SPDK qpair single-thread constraint.  The
+// NofConnection auto-destructs on return → qpair pool freed → ctrlr
+// detached → all QIDs reclaimed.
 bool SpdkWrapper::ProbeNofSegment(const std::string &tr_str,
                                   uint32_t timeout_ms,
                                   std::string *error_reason) {
@@ -467,11 +399,20 @@ bool SpdkWrapper::ProbeNofSegment(const std::string &tr_str,
         return false;
     }
 
-    // 创建独立探测连接 — 不共享给 Worker 线程，心跳线程独占访问。
-    // 修改履历 | 2026-08-03 | 使用 config_probe_ (num_io_queues=1)，
-    // 避免心跳探测与 I/O 路径竞争 target QID 池（本 PR）。
+    // Create an independent probe connection — exclusive to the
+    // heartbeat thread, never shared with worker threads.
+    // Uses config_probe_ (num_io_queues=1) to avoid competing with
+    // the I/O path for target QID slots.
+    //
+    // Serialise with OpenNofSegment: spdk_nvme_probe() is NOT
+    // thread-safe; concurrent Connect calls from the heartbeat
+    // thread and the I/O path cause a namespace activation race.
     std::string connect_error;
-    auto conn = NofConnection::Connect(tr_str, config_probe_, &connect_error);
+    std::unique_ptr<NofConnection> conn;
+    {
+        std::lock_guard<std::mutex> connect_lock(connect_mutex_);
+        conn = NofConnection::Connect(tr_str, config_probe_, &connect_error);
+    }
     if (!conn) {
         if (error_reason) {
             *error_reason = "open_fail: " + connect_error;
@@ -479,7 +420,8 @@ bool SpdkWrapper::ProbeNofSegment(const std::string &tr_str,
         return false;
     }
 
-    // 栈上临时 segment + handle（不注册到 open_segments_）
+    // Stack-allocated temporary segment + handle (not registered in
+    // open_segments_).
     NofSegment segment(conn.get(), 0, conn->GetNumBlocks());
     nof_seg_handle seg_handle{&segment};
 
@@ -488,13 +430,13 @@ bool SpdkWrapper::ProbeNofSegment(const std::string &tr_str,
         if (error_reason) {
             *error_reason = "invalid_block_size";
         }
-        return false;  // conn 自动析构 → QID 回收
+        return false;  // conn auto-destructs → QIDs reclaimed
     }
 
     ProbeBuffer *probe_buffer =
         GetOrCreateProbeBuffer(tr_str, block_size, error_reason);
     if (!probe_buffer || !probe_buffer->ptr) {
-        return false;  // conn 自动析构 → QID 回收
+        return false;  // conn auto-destructs → QIDs reclaimed
     }
 
     ProbeRequestContext *probe_ctx = AcquireProbeRequestContext();
@@ -505,7 +447,7 @@ bool SpdkWrapper::ProbeNofSegment(const std::string &tr_str,
         if (error_reason) {
             *error_reason = "submit_fail";
         }
-        return false;  // conn 自动析构 → QID 回收
+        return false;  // conn auto-destructs → QIDs reclaimed
     }
 
     auto deadline = std::chrono::steady_clock::now() +
@@ -529,13 +471,25 @@ bool SpdkWrapper::ProbeNofSegment(const std::string &tr_str,
         }
     }
 
-    // conn 出作用域自动析构：
-    //   ~NofConnection() → ~NofQpairPool() → free io qpairs →
-    //   spdk_nvme_detach() 16+1 QID 全部回收，无泄漏。
+    // Recycle the probe context only after we have copied all results.
+    // The callback (ProbeReadComplete) only publishes terminal state;
+    // deferring recycle here eliminates the race where a concurrent
+    // probe could acquire and Reset() the context while we still read
+    // success / error_reason from it.
+    RecycleProbeRequestContext(probe_ctx);
+
+    // conn goes out of scope → ~NofConnection() → ~NofQpairPool() →
+    // free io qpairs → spdk_nvme_detach().  All QIDs are reclaimed.
     return ok;
 }
 
-// [Migrated] 新增方法：SetConfig / PipelineRead / PipelineWrite 桩实现。
+// [Migrated] SetConfig / PipelineRead / PipelineWrite.
+//
+// NOTE: PipelineRead/Write are fully implemented at the segment layer
+// (NofSegment::PipelineIO) but are NOT currently wired into the Mooncake
+// NoF transfer hot path.  TransferSubmitter still submits individual
+// SpdkNofTasks through SubmitRequest/poll.  These pipeline APIs are
+// available for future integration into the worker pool.
 void SpdkWrapper::SetConfig(const NofConfig &config) { config_ = config; }
 
 ssize_t SpdkWrapper::PipelineRead(nof_seg_handle *handle, void *buf,

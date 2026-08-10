@@ -1,10 +1,3 @@
-/*
- * Copyright (c) 2026 绿算技术
- * All rights reserved.
- *
- * @File: mooncake-store/src/spdk/nof_segment.cpp
- * @Description: PipelineIO 核心循环实现
- */
 #include "spdk/nof_segment.h"
 
 #include <glog/logging.h>
@@ -42,16 +35,33 @@ NofSegment::NofSegment(NofConnection *conn, uint64_t start_lba,
 
 int NofSegment::SubmitRead(void *buf, uint64_t lba, uint32_t num_blocks,
                            NofIoCallback cb, void *cb_ctx) {
+    // Guard against out-of-range access: the caller-supplied `lba` is
+    // relative to the segment base, so we must translate to an absolute
+    // device LBA via start_lba_ and reject requests that exceed the
+    // segment extent.
+    if (lba + num_blocks > num_blocks_) {
+        LOG(ERROR) << "[NofSegment] LBA out of range: lba=" << lba
+                   << " count=" << num_blocks << " max=" << num_blocks_;
+        return -1;
+    }
+    uint64_t abs_lba = start_lba_ + lba;
     auto *qp = conn_->GetQpairPool().GetNextQpair();
-    return spdk_nvme_ns_cmd_read(conn_->GetNs(), qp, buf, lba, num_blocks, cb,
-                                 cb_ctx, 0);
+    return spdk_nvme_ns_cmd_read(conn_->GetNs(), qp, buf, abs_lba, num_blocks,
+                                 cb, cb_ctx, 0);
 }
 
 int NofSegment::SubmitWrite(void *buf, uint64_t lba, uint32_t num_blocks,
                             NofIoCallback cb, void *cb_ctx) {
+    // Same bounds check and start_lba_ translation as SubmitRead.
+    if (lba + num_blocks > num_blocks_) {
+        LOG(ERROR) << "[NofSegment] LBA out of range: lba=" << lba
+                   << " count=" << num_blocks << " max=" << num_blocks_;
+        return -1;
+    }
+    uint64_t abs_lba = start_lba_ + lba;
     auto *qp = conn_->GetQpairPool().GetNextQpair();
-    return spdk_nvme_ns_cmd_write(conn_->GetNs(), qp, buf, lba, num_blocks, cb,
-                                  cb_ctx, 0);
+    return spdk_nvme_ns_cmd_write(conn_->GetNs(), qp, buf, abs_lba, num_blocks,
+                                  cb, cb_ctx, 0);
 }
 
 int32_t NofSegment::PollCompletion(uint32_t max_completions) {
@@ -72,11 +82,27 @@ ssize_t NofSegment::PipelineWrite(const void *buf, uint64_t lba,
 
 ssize_t NofSegment::PipelineIO(void *buf, uint64_t lba, uint32_t total_blocks,
                                bool is_write) {
+    // Guard against out-of-range access, matching SubmitRead/SubmitWrite.
+    if (lba + total_blocks > num_blocks_) {
+        LOG(ERROR) << "[NofSegment::PipelineIO] LBA out of range: lba=" << lba
+                   << " count=" << total_blocks << " max=" << num_blocks_;
+        return -1;
+    }
+    // Guard against degenerate config that would cause an infinite loop.
+    uint32_t chunk_blocks = config_.chunk_blocks;
+    uint32_t max_inflight = conn_->GetQpairPool().MaxInflight();
+    if (chunk_blocks == 0 || max_inflight == 0) {
+        LOG(ERROR) << "[NofSegment::PipelineIO] invalid config: chunk_blocks="
+                   << chunk_blocks << " max_inflight=" << max_inflight;
+        return -1;
+    }
+
+    // Translate caller-relative LBA to absolute device LBA via the
+    // segment base, matching the single-request API behaviour.
+    uint64_t abs_lba = start_lba_ + lba;
     auto &pool = conn_->GetQpairPool();
     auto *ns = conn_->GetNs();
     uint32_t block_size = conn_->GetBlockSize();
-    uint32_t max_inflight = pool.MaxInflight();
-    uint32_t chunk_blocks = config_.chunk_blocks;
 
     PipelineCtx ctx;
     uint32_t next_block = 0;
@@ -96,11 +122,11 @@ ssize_t NofSegment::PipelineIO(void *buf, uint64_t lba, uint32_t total_blocks,
             auto *qp = pool.GetNextQpair();
             int rc;
             if (is_write) {
-                rc = spdk_nvme_ns_cmd_write(ns, qp, ptr, lba + next_block,
+                rc = spdk_nvme_ns_cmd_write(ns, qp, ptr, abs_lba + next_block,
                                             chunk, pipeline_io_cb, &ctx, 0);
             } else {
-                rc = spdk_nvme_ns_cmd_read(ns, qp, ptr, lba + next_block, chunk,
-                                           pipeline_io_cb, &ctx, 0);
+                rc = spdk_nvme_ns_cmd_read(ns, qp, ptr, abs_lba + next_block,
+                                           chunk, pipeline_io_cb, &ctx, 0);
             }
 
             if (rc != 0) {
@@ -113,7 +139,11 @@ ssize_t NofSegment::PipelineIO(void *buf, uint64_t lba, uint32_t total_blocks,
         }
 
         // Poll all qpairs
-        pool.PollAll(0);
+        int32_t poll_rc = pool.PollAll(0);
+        if (poll_rc < 0) {
+            LOG(ERROR) << "[NofSegment::PipelineIO] poll error rc=" << poll_rc;
+            return -1;
+        }
 
         // Check for errors
         if (ctx.error.load(std::memory_order_relaxed)) {

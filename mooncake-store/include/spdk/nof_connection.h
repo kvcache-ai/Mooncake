@@ -3,11 +3,12 @@
  * All rights reserved.
  *
  * @File: mooncake-store/include/spdk/nof_connection.h
- * @Description: NofQpairPool + NofConnection 类声明
+ * @Description: NofQpairPool + NofConnection class declarations
  *
- * 修改履历 | 2026-07-31 | 初始多 qpair 实现
- * 修改履历 | 2026-08-03 | NofQpairPool 新增 TryGrow/GetTargetCount
- * 支持再均衡（本 PR）
+ * Changelog:
+ *   2026-07-31  Initial multi-qpair implementation.
+ *   2026-08-03  NofQpairPool: added TryGrow / GetTargetCount for
+ *               runtime rebalancing.
  */
 #pragma once
 
@@ -35,8 +36,10 @@ namespace mooncake {
 class NofQpairPool {
    public:
     /// Takes ownership of an already-allocated qpair vector.
-    /// @param target_count  期望的 qpair 总数，用于后续 TryGrow 恢复判断。
-    /// @param ctrlr         NVMe controller，TryGrow 时用于分配新 qpair。
+    /// @param target_count  Desired total qpair count for subsequent
+    ///                      TryGrow recovery decisions.
+    /// @param ctrlr         NVMe controller used by TryGrow to
+    ///                      allocate new qpairs.
     explicit NofQpairPool(std::vector<spdk_nvme_qpair *> qpairs,
                           uint32_t max_inflight_per_qpair,
                           uint32_t target_count = 0,
@@ -75,19 +78,20 @@ class NofQpairPool {
     }
 
     /**
-     * @brief 尝试向池中追加 qpair 直到达到 target_total。
+     * @brief Grow the pool back toward target_total by allocating new qpairs.
      *
-     * 当其他连接断开释放 QID 后，本方法允许已降级的连接逐步恢复到
-     * 最初的 target_total。调用者负责确保与 I/O 操作在同一线程。
+     * When other connections disconnect and free QIDs, this method
+     * allows a degraded connection to gradually recover back to its
+     * original target_total.  Caller is responsible for ensuring this
+     * runs on the same thread as I/O operations.
      *
-     * @param target_total  期望达到的 qpair 总数。
-     * @return 实际新增的 qpair 数量，0 表示 target QID 池无可用 QID。
-     *
-     * 修改履历 | 2026-08-03 | 新增（本 PR）
+     * @param target_total  Desired total qpair count.
+     * @return Number of qpairs added; 0 means the target QID pool has
+     *         no free QIDs.
      */
     uint32_t TryGrow(uint32_t target_total);
 
-    /// 返回创建时请求的目标 qpair 数，用于判断降级程度。
+    /// Return the target qpair count requested at construction time.
     uint32_t GetTargetCount() const { return target_count_; }
 
    private:
@@ -96,13 +100,15 @@ class NofQpairPool {
     std::atomic<int32_t> inflight_count_{0};
     uint32_t max_inflight_per_qpair_;
 
-    // 创建时请求的目标 qpair 数。TryGrow 尝试向此数字补齐。
-    // 当 Size() < target_count_ 时表示当前处于降级状态。
+    // Target qpair count requested at construction time.
+    // TryGrow attempts to grow the pool back to this number.
+    // Size() < target_count_ indicates the pool is currently degraded.
     uint32_t target_count_;
 
-    // NVMe controller，用于 TryGrow 时分配新 qpair。
-    // spdk_nvme_qpair 在公有头文件中仅前向声明，无法通过 qpairs_[0]->ctrlr
-    // 获取 controller。因此需要在构造时显式传入存储。
+    // NVMe controller used by TryGrow to allocate new qpairs.
+    // spdk_nvme_qpair is only forward-declared in the public header,
+    // so we cannot obtain the controller via qpairs_[0]->ctrlr; the
+    // controller pointer must be stored explicitly at construction.
     spdk_nvme_ctrlr *ctrlr_;
 };
 
@@ -115,10 +121,14 @@ class NofQpairPool {
 class NofConnection {
    public:
     /// Connect to an NVMe-oF target.
+    /// @param trtype  SPDK transport type (SPDK_NVME_TRANSPORT_RDMA or
+    ///                SPDK_NVME_TRANSPORT_TCP).  Callers should derive this
+    ///                from the transport string or MC_NOF_TRTYPE env var.
     /// @return nullptr on failure (error_msg receives a description).
     static std::unique_ptr<NofConnection> Connect(
         const std::string &traddr, const std::string &trsvcid,
-        const std::string &subnqn, uint32_t ns_id, const NofConfig &config,
+        const std::string &subnqn, uint32_t ns_id,
+        spdk_nvme_transport_type trtype, const NofConfig &config,
         std::string *error_msg = nullptr);
 
     /// Connect from a transport string.
