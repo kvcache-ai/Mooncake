@@ -66,6 +66,7 @@ const EXTENT_STORE_DELETE_JOURNAL_VERSION: u16 = 1;
 const EXTENT_STORE_DELETE_JOURNAL_RECORD_LEN: usize = 64;
 const EXTENT_STORE_ALIGNMENT: u64 = 4096;
 const DEFAULT_EXTENT_STORE_SEGMENT_SIZE: u64 = 1024 * 1024 * 1024;
+const DEFAULT_EXTENT_STORE_EXPANSION_CHUNK_BYTES: u64 = 64 * 1024 * 1024;
 const DEFAULT_EXTENT_STORE_IO_WORKER_READ_PIPELINE_MAX_INFLIGHT_OPS: usize = 32;
 const EXTENT_STORE_IO_WORKER_READ_PIPELINE_MAX_INFLIGHT_BYTES: usize = 128 * 1024 * 1024;
 const EXTENT_STORE_IO_WORKER_READ_PIPELINE_WAIT_MIN: usize = 1;
@@ -884,6 +885,9 @@ struct ExtentStoreSegment {
     file: Arc<ExtentStoreFile>,
     direct_file: Option<Arc<ExtentStoreFile>>,
     path: ExtentStorePathBuf,
+    // Actual file length at open time. In non-preallocated mode this becomes
+    // the logical allocation watermark until writes extend the file.
+    allocated_len: u64,
     live_bytes: u64,
     dead_bytes: u64,
     deleted_extents: BTreeSet<ExtentStoreDeletedExtent>,
@@ -2834,27 +2838,49 @@ fn reserve_extent_store_record_space(
         });
     }
 
-    if inner.active_offset + record_len > inner.segment_size {
-        let next_segment_id = inner.active_segment_id.saturating_add(1);
-        inner.active_segment_id = next_segment_id;
-        inner.active_offset = 0;
+    let active_write_end = inner.active_offset.checked_add(record_len).ok_or_else(|| {
+        StoreError::InvalidState("extent store active write offset overflow".to_string())
+    })?;
+    if active_write_end > inner.segment_size {
+        let next_segment_id = inner.active_segment_id.checked_add(1).ok_or_else(|| {
+            StoreError::InvalidState("extent store segment id overflow".to_string())
+        })?;
         let rollover_started = std::time::Instant::now();
-        let segment = open_segment(root, next_segment_id, inner.segment_size)?;
+        let mut segment = open_segment(root, next_segment_id, inner.segment_size)?;
+        ensure_segment_allocated(
+            &mut segment,
+            record_len,
+            inner.segment_size,
+            segment_preallocate_enabled(),
+        )?;
         let rollover_elapsed = rollover_started.elapsed();
         counters.record_segment_rollover(rollover_elapsed);
         record_stage("engine_reserve_rollover_open", rollover_elapsed);
+        inner.active_segment_id = next_segment_id;
+        inner.active_offset = 0;
         inner.segments.insert(next_segment_id, segment);
     }
 
     let segment_id = inner.active_segment_id;
     let offset = inner.active_offset;
-    if !inner.segments.contains_key(&segment_id) {
-        return Err(StoreError::InvalidState(format!(
-            "active extent store segment {segment_id} is not open"
-        )));
+    let write_end = offset.checked_add(record_len).ok_or_else(|| {
+        StoreError::InvalidState("extent store write offset overflow".to_string())
+    })?;
+    {
+        let Some(segment) = inner.segments.get_mut(&segment_id) else {
+            return Err(StoreError::InvalidState(format!(
+                "active extent store segment {segment_id} is not open"
+            )));
+        };
+        ensure_segment_allocated(
+            segment,
+            write_end,
+            inner.segment_size,
+            segment_preallocate_enabled(),
+        )?;
     }
     let generation = reserve_extent_store_generation(inner)?;
-    inner.active_offset = inner.active_offset.saturating_add(record_len);
+    inner.active_offset = write_end;
     let segment = inner
         .segments
         .get_mut(&segment_id)
@@ -3901,6 +3927,52 @@ mod extent_store_engine_tests {
             std::os::unix::fs::MetadataExt::blocks(&metadata) * 512 < 1024 * 1024,
             "default extent store open unexpectedly allocated {} bytes",
             std::os::unix::fs::MetadataExt::blocks(&metadata) * 512
+        );
+    }
+
+    #[test]
+    fn extent_store_preallocation_expands_on_demand() {
+        let root = test_extent_store_root("preallocate-on-demand");
+        let segment_size = EXTENT_STORE_ALIGNMENT * 8;
+        std::fs::create_dir_all(root.path().join("segments"))
+            .expect("segments directory should be created");
+        let mut segment = open_segment(root.path(), 1, segment_size).expect("segment should open");
+        assert_eq!(
+            std::fs::metadata(&segment.path)
+                .expect("segment file should exist")
+                .len(),
+            0
+        );
+
+        ensure_segment_allocated(&mut segment, EXTENT_STORE_ALIGNMENT + 1, segment_size, true)
+            .expect("segment should expand");
+
+        assert_eq!(segment.allocated_len, segment_size);
+        assert_eq!(
+            std::fs::metadata(&segment.path)
+                .expect("expanded segment file should exist")
+                .len(),
+            segment_size
+        );
+    }
+
+    #[test]
+    fn extent_store_allocation_rounds_to_growth_chunk() {
+        assert_eq!(
+            round_up_extent_store_allocation(
+                EXTENT_STORE_ALIGNMENT,
+                DEFAULT_EXTENT_STORE_SEGMENT_SIZE
+            )
+            .expect("allocation should round"),
+            DEFAULT_EXTENT_STORE_EXPANSION_CHUNK_BYTES
+        );
+        assert_eq!(
+            round_up_extent_store_allocation(
+                DEFAULT_EXTENT_STORE_EXPANSION_CHUNK_BYTES + 1,
+                DEFAULT_EXTENT_STORE_SEGMENT_SIZE
+            )
+            .expect("allocation should round"),
+            DEFAULT_EXTENT_STORE_EXPANSION_CHUNK_BYTES * 2
         );
     }
 
