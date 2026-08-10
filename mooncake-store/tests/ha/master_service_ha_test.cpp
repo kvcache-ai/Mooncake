@@ -3381,7 +3381,7 @@ TEST_F(MasterServiceHATest, BatchEvictStopsAfterFirstOpLogReservationFailure) {
                               .set_cluster_id(cluster_id)
                               .set_oplog_batch_max_entries(1)
                               .build());
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    auto* writer = InstallGatedWriter(service, backend);
     auto mounted = PrepareSimpleSegment(service, "reservation_stop_segment");
     OpLogBatchStorage storage(cluster_id, *backend);
     OpLogBatchRecord batch;
@@ -3392,6 +3392,7 @@ TEST_F(MasterServiceHATest, BatchEvictStopsAfterFirstOpLogReservationFailure) {
     PutObjectOnSegment(service, mounted.client_id, "reservation_stop_second",
                        "reservation_stop_segment");
     ReadBatchEventually(storage, 3, batch);
+    ASSERT_TRUE(writer->PauseCallbacksAfter(batch.last_seq));
     std::this_thread::sleep_for(std::chrono::milliseconds(60));
 
     {
@@ -3419,15 +3420,16 @@ TEST_F(MasterServiceHATest, BatchEvictStopsAfterFirstOpLogReservationFailure) {
 
     service.RunBatchEvictForTesting(/*evict_ratio_target=*/1.0,
                                     /*evict_ratio_lowerbound=*/1.0);
-    for (int i = 0; i < 50; ++i) {
-        if (ReplicaCountForTesting(service, kDefaultTenant,
-                                   "reservation_stop_first") == 0 &&
-            ReplicaCountForTesting(service, kDefaultTenant,
-                                   "reservation_stop_second") == 0) {
-            break;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(20));
-    }
+    ReadBatchEventually(storage, 4, batch);
+    ReadBatchEventually(storage, 5, batch);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "reservation_stop_first"),
+              1);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
+                                     "reservation_stop_second"),
+              1);
+
+    ASSERT_TRUE(writer->RunCallbacksThrough(batch.last_seq));
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
                                      "reservation_stop_first"),
               0);
