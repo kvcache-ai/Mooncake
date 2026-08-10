@@ -659,6 +659,7 @@ MasterService::~MasterService() {
     for (const auto& [segment, bytes] : standby_accounted_memory_bytes_) {
         MasterMetricManager::instance().dec_allocated_mem_size(
             segment, static_cast<int64_t>(bytes));
+        MasterMetricManager::instance().remove_segment_metrics(segment);
     }
 
     // Segments still mounted here never went through CommitUnmountSegment;
@@ -1705,9 +1706,17 @@ std::vector<Replica> MasterService::PopReplicasWithCacheTotalAccounting(
 
 size_t MasterService::EraseReplicasWithCacheTotalAccounting(
     ObjectMetadata& metadata,
-    const std::function<bool(const Replica&)>& pred_fn) {
+    const std::function<bool(const Replica&)>& pred_fn,
+    std::vector<ReplicaID>* erased_replica_ids) {
     auto erased_replicas =
         PopReplicasWithCacheTotalAccounting(metadata, pred_fn);
+    if (erased_replica_ids != nullptr) {
+        erased_replica_ids->reserve(erased_replica_ids->size() +
+                                    erased_replicas.size());
+        for (const auto& replica : erased_replicas) {
+            erased_replica_ids->push_back(replica.id());
+        }
+    }
     // Release SSD/local-disk usage for any local-disk replicas being removed.
     // No-op for memory/noF replicas, so it is safe to call unconditionally.
     ReleaseLocalDiskUsage(erased_replicas);
@@ -1747,6 +1756,11 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
     if (erased_replicas.empty()) {
         return;
     }
+    std::vector<ReplicaID> erased_replica_ids;
+    erased_replica_ids.reserve(erased_replicas.size());
+    for (const auto& replica : erased_replicas) {
+        erased_replica_ids.push_back(replica.id());
+    }
     const uint64_t erased_memory_replicas = static_cast<uint64_t>(std::count_if(
         erased_replicas.begin(), erased_replicas.end(),
         [](const Replica& replica) { return replica.is_memory_replica(); }));
@@ -1763,6 +1777,8 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
     if (erased_local_disk) {
         shard.OnDiskReplicaRemoved(erased_local_disk, metadata);
     }
+    CancelPromotionTaskForRemovedReplicas(tenant_state, metadata,
+                                          erased_replica_ids);
     if (!metadata.IsValid()) {
         EraseMetadata(tenant_state, metadata_it, tenant_id, quota_mode, &shard);
         if (tenant_state.Empty()) {
@@ -2143,8 +2159,8 @@ void MasterService::ClearInvalidHandles(
                             continue;
                         }
                     }
-                    if (CleanupStaleHandles(it->second, alive_clients,
-                                            &shard)) {
+                    if (CleanupStaleHandles(tenant_state, it->second,
+                                            alive_clients, &shard)) {
                         it = EraseMetadata(tenant_state, it, tenant_it->first,
                                            QuotaEraseMode::kFull, &shard);
                     } else {
@@ -3772,8 +3788,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                     if (enable_oplog_) {
                         return tl::make_unexpected(
                             ErrorCode::OBJECT_ALREADY_EXISTS);
-                    } else if (CleanupStaleHandles(it->second, alive_clients,
-                                                   &shard)) {
+                    } else if (CleanupStaleHandles(tenant_state, it->second,
+                                                   alive_clients, &shard)) {
                         EraseMetadata(tenant_state, it, object_id.tenant_id,
                                       QuotaEraseMode::kFull, &shard);
                         it = tenant_state.metadata.end();
@@ -3885,24 +3901,52 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
 
+    auto is_target_replica = [replica_type](const Replica& replica) {
+        if (replica_type == ReplicaType::ALL) {
+            return (replica.is_memory_replica() &&
+                    !replica.has_invalid_mem_handle()) ||
+                   (replica.is_nof_replica() &&
+                    !replica.has_invalid_nof_handle()) ||
+                   replica.is_dfs_replica();
+        }
+        if (replica_type == ReplicaType::MEMORY) {
+            return replica.is_memory_replica() &&
+                   !replica.has_invalid_mem_handle();
+        }
+        if (replica_type == ReplicaType::NOF_SSD) {
+            return replica.is_nof_replica() &&
+                   !replica.has_invalid_nof_handle();
+        }
+        return replica.type() == replica_type;
+    };
+
+    // A successful End removes the processing marker. Treat a retry as a
+    // no-op only when every replica targeted by that End is already COMPLETE.
+    // In particular, a promotion-owned PROCESSING replica keeps this check
+    // from accepting a MEMORY/ALL End and is never modified here.
+    if (!accessor.InProcessing()) {
+        bool has_target_replica = false;
+        bool all_target_replicas_complete = true;
+        for (const auto& replica : metadata.GetAllReplicas()) {
+            if (!is_target_replica(replica)) {
+                continue;
+            }
+            has_target_replica = true;
+            if (!replica.is_completed()) {
+                all_target_replicas_complete = false;
+                break;
+            }
+        }
+        if (has_target_replica && all_target_replicas_complete) {
+            return {};
+        }
+        LOG(ERROR) << "key=" << key << ", error=no_primary_write_in_progress";
+        return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+    }
+
     metadata.VisitReplicas(
-        [replica_type](const Replica& replica) {
-            if (replica_type == ReplicaType::ALL) {
-                return (replica.is_memory_replica() &&
-                        !replica.has_invalid_mem_handle()) ||
-                       (replica.is_nof_replica() &&
-                        !replica.has_invalid_nof_handle()) ||
-                       replica.is_dfs_replica();
-            }
-            if (replica_type == ReplicaType::MEMORY) {
-                return replica.is_memory_replica() &&
-                       !replica.has_invalid_mem_handle();
-            }
-            if (replica_type == ReplicaType::NOF_SSD) {
-                return replica.is_nof_replica() &&
-                       !replica.has_invalid_nof_handle();
-            }
-            return replica.type() == replica_type;
+        [&is_target_replica](const Replica& replica) {
+            return replica.is_processing() && is_target_replica(replica);
         },
         [this, &key](Replica& replica) {
             replica.mark_complete();
@@ -4117,15 +4161,20 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
 
-    auto processing_rep =
-        metadata.GetFirstReplica([replica_type](const Replica& replica) {
-            if (replica_type == ReplicaType::ALL) {
-                return (replica.is_memory_replica() ||
-                        replica.is_nof_replica() || replica.is_dfs_replica()) &&
-                       !replica.is_processing();
-            }
-            return replica.type() == replica_type && !replica.is_processing();
-        });
+    if (!accessor.InProcessing()) {
+        LOG(ERROR) << "key=" << key << ", error=no_primary_write_in_progress";
+        return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+    }
+
+    auto processing_rep = metadata.GetFirstReplica([replica_type](
+                                                       const Replica& replica) {
+        if (replica_type == ReplicaType::ALL) {
+            return (replica.is_memory_replica() || replica.is_nof_replica() ||
+                    replica.is_dfs_replica()) &&
+                   !replica.is_processing();
+        }
+        return replica.type() == replica_type && !replica.is_processing();
+    });
     if (processing_rep != nullptr) {
         LOG(ERROR) << "key=" << key << ", status=" << processing_rep->status()
                    << ", error=invalid_replica_status";
@@ -4133,6 +4182,9 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     }
 
     auto target_pred = [replica_type](const Replica& r) {
+        if (!r.is_processing()) {
+            return false;
+        }
         if (replica_type == ReplicaType::ALL) {
             return r.is_memory_replica() || r.is_nof_replica() ||
                    r.is_dfs_replica();
@@ -4378,8 +4430,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     if (enable_oplog_) {
                         return tl::make_unexpected(
                             ErrorCode::OBJECT_ALREADY_EXISTS);
-                    } else if (CleanupStaleHandles(it->second, alive_clients,
-                                                   &shard)) {
+                    } else if (CleanupStaleHandles(tenant_state, it->second,
+                                                   alive_clients, &shard)) {
                         // EraseMetadata handles processing_keys,
                         // replication_tasks, offloading_tasks (with
                         // dec_refcnt), and promotion task cleanup.
@@ -4408,6 +4460,13 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 if (tenant_state.replication_tasks.count(key) > 0) {
                     LOG(INFO) << "key=" << key
                               << ", error=object_has_replication_task";
+                    return tl::make_unexpected(
+                        ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+                }
+
+                if (tenant_state.promotion_tasks.count(key) > 0) {
+                    LOG(INFO)
+                        << "key=" << key << ", error=object_has_promotion_task";
                     return tl::make_unexpected(
                         ErrorCode::OBJECT_HAS_REPLICATION_TASK);
                 }
@@ -5950,8 +6009,8 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
                             ? ErrorCode::OBJECT_NOT_FOUND
                             : ErrorCode::OBJECT_ALREADY_EXISTS);
                     continue;
-                } else if (CleanupStaleHandles(it->second, alive_clients,
-                                               &shard)) {
+                } else if (CleanupStaleHandles(tenant_state, it->second,
+                                               alive_clients, &shard)) {
                     EraseMetadata(tenant_state, it, normalized_tenant,
                                   QuotaEraseMode::kFull, &shard);
                     if (tenant_state.Empty()) {
@@ -6039,8 +6098,44 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
     return results;
 }
 
+void MasterService::CancelPromotionTaskForRemovedReplicas(
+    TenantState& tenant_state, ObjectMetadata& metadata,
+    const std::vector<ReplicaID>& removed_replica_ids) {
+    if (removed_replica_ids.empty()) {
+        return;
+    }
+
+    auto task_it = tenant_state.promotion_tasks.find(metadata.user_key);
+    if (task_it == tenant_state.promotion_tasks.end() ||
+        task_it->second.alloc_id == 0 ||
+        std::find(removed_replica_ids.begin(), removed_replica_ids.end(),
+                  task_it->second.alloc_id) == removed_replica_ids.end()) {
+        return;
+    }
+
+    if (auto* source = metadata.GetReplicaByID(task_it->second.source_id);
+        source != nullptr) {
+        source->dec_refcnt();
+    }
+    const UUID holder_id = task_it->second.holder_id;
+    ErasePromotionTaskIfPresent(tenant_state, metadata.user_key,
+                                metadata.tenant_id);
+
+    // Best-effort cleanup of a task that may still be queued on the holder.
+    ScopedLocalDiskSegmentAccess local_disk_segment_access =
+        segment_manager_.getLocalDiskSegmentAccess();
+    auto& client_local_disk_segment =
+        local_disk_segment_access.getClientLocalDiskSegment();
+    auto segment_it = client_local_disk_segment.find(holder_id);
+    if (segment_it != client_local_disk_segment.end()) {
+        MutexLocker locker(&segment_it->second->offloading_mutex_);
+        segment_it->second->promotion_objects.erase(
+            metadata.tenant_id.MakeScopedKey(metadata.user_key));
+    }
+}
+
 bool MasterService::CleanupStaleHandles(
-    ObjectMetadata& metadata,
+    TenantState& tenant_state, ObjectMetadata& metadata,
     const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients,
     MetadataShardAccessorRW* shard) {
     bool had_completed_disk = metadata.HasReplica([](const Replica& r) {
@@ -6049,13 +6144,18 @@ bool MasterService::CleanupStaleHandles(
     // Remove those with invalid allocators (memory replicas on unmounted
     // segments) and local_disk replicas whose owner client is no longer alive.
     const uint64_t before_charge = CompletedMemoryQuotaCharge(metadata);
+    std::vector<ReplicaID> removed_replica_ids;
     EraseReplicasWithCacheTotalAccounting(
-        metadata, [&alive_clients](const Replica& replica) {
+        metadata,
+        [&alive_clients](const Replica& replica) {
             return (replica.has_invalid_mem_handle() ||
                     replica.has_invalid_nof_handle() ||
                     replica.has_stale_local_disk_client(alive_clients)) &&
                    replica.is_completed();
-        });
+        },
+        &removed_replica_ids);
+    CancelPromotionTaskForRemovedReplicas(tenant_state, metadata,
+                                          removed_replica_ids);
     const uint64_t after_charge = CompletedMemoryQuotaCharge(metadata);
     if (before_charge > after_charge) {
         ReleaseCommittedQuotaCharge(metadata, before_charge - after_charge);
@@ -6798,6 +6898,7 @@ size_t MasterService::RunPromotionCandidateRetry(size_t max_shards_to_scan) {
                     auto meta_it = tenant_state.metadata.find(key);
                     if (meta_it == tenant_state.metadata.end() ||
                         !meta_it->second.IsValid() ||
+                        tenant_state.processing_keys.count(key) > 0 ||
                         tenant_state.promotion_tasks.count(key) > 0 ||
                         meta_it->second.HasReplica(
                             &Replica::fn_is_memory_replica) ||
@@ -6891,6 +6992,13 @@ MasterService::PromotionQueueResult MasterService::TryPushPromotionQueue(
     }
     auto& metadata = accessor.Get();
     auto& tenant_state = accessor.GetTenantState();
+
+    // A primary Put/Upsert owns all PROCESSING replicas while the key is in
+    // processing_keys. Promotion must not establish a second owner.
+    if (accessor.InProcessing()) {
+        EraseCandidate(tenant_state, key);
+        return PromotionQueueResult::kAlreadyInFlight;
+    }
 
     // Dedup: don't queue twice if a promotion is already in flight or if a
     // MEMORY replica has appeared since GetReplicaList observed only-disk.
@@ -7025,6 +7133,10 @@ auto MasterService::PromotionAllocStart(
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
     auto& metadata = accessor.Get();
+
+    if (accessor.InProcessing()) {
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    }
 
     // Verify the in-flight task still exists before allocating. The
     // reaper can sweep it between the holder's heartbeat and this
@@ -8479,13 +8591,31 @@ void MasterService::BatchEvict(double evict_ratio_target,
     size_t start_idx = randomIndex(kNumShards);
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
 
-    // ===== Phase 1: Parallel candidate collection =====
-    // N threads each scan a batch of shards, collecting Candidates with
-    // shard_idx + tenant_id + key for safe re-lookup in Phase 2.
+    // ===== Phase 1: Parallel candidate census =====
+    // N threads each scan a batch of shards. For selective ratios only the
+    // lease timestamps are collected here; full tenant/key identities are
+    // materialized afterwards for a bounded frontier around the eviction
+    // cutoff. High ratios collect full Candidates directly, because a census
+    // followed by a second scan would cost more than the identities it saves.
     int num_threads = std::min((int)kNumShards, 16);
     size_t shards_per_thread = (kNumShards + num_threads - 1) / num_threads;
 
+    constexpr size_t kMinReserveSlack = 1024;
+    constexpr size_t kMinFrontierLimit = 64 * 1024;
+    constexpr size_t kReserveSlackDivisor = 10;
+    constexpr size_t kFrontierDivisor = 4;
+    // Above this target ratio the reserve frontier would already cover a
+    // large share of the population, so selective materialization stops
+    // paying for the extra scan it costs.
+    constexpr double kCompactPrebypassTargetRatio =
+        static_cast<double>(kReserveSlackDivisor) /
+        static_cast<double>(kFrontierDivisor * (kReserveSlackDivisor + 1));
+    const bool compact_frontier_prebypass =
+        evict_ratio_target >= kCompactPrebypassTargetRatio;
+
     std::vector<std::vector<Candidate>> local_candidates(num_threads);
+    std::vector<std::vector<std::chrono::system_clock::time_point>>
+        local_no_pin(num_threads);
     std::vector<long> local_eviction_base(num_threads, 0);
     std::vector<long> local_object_count(num_threads, 0);
     std::vector<std::vector<std::chrono::system_clock::time_point>>
@@ -8512,9 +8642,14 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         if (!it->second.IsLeaseExpired(now) || !has_evictable)
                             continue;
                         if (!it->second.IsSoftPinned(now)) {
-                            local_candidates[t].push_back(
-                                {s, tenant_id, it->first,
-                                 it->second.lease_timeout});
+                            if (compact_frontier_prebypass) {
+                                local_candidates[t].push_back(
+                                    {s, tenant_id, it->first,
+                                     it->second.lease_timeout});
+                            } else {
+                                local_no_pin[t].push_back(
+                                    it->second.lease_timeout);
+                            }
                         } else if (allow_evict_soft_pinned_objects_) {
                             local_soft_pin[t].push_back(
                                 it->second.lease_timeout);
@@ -8536,14 +8671,27 @@ void MasterService::BatchEvict(double evict_ratio_target,
     for (auto v : local_object_count) object_count += v;
 
     std::vector<Candidate> candidates;
-    {
+    if (compact_frontier_prebypass) {
         size_t total = 0;
         for (auto& v : local_candidates) total += v.size();
         candidates.reserve(total);
+        for (auto& v : local_candidates) {
+            candidates.insert(candidates.end(),
+                              std::make_move_iterator(v.begin()),
+                              std::make_move_iterator(v.end()));
+        }
     }
-    for (auto& v : local_candidates) {
-        candidates.insert(candidates.end(), std::make_move_iterator(v.begin()),
-                          std::make_move_iterator(v.end()));
+
+    std::vector<std::chrono::system_clock::time_point> no_pin_timeouts;
+    {
+        size_t total = 0;
+        for (auto& v : local_no_pin) total += v.size();
+        no_pin_timeouts.reserve(total);
+    }
+    for (auto& v : local_no_pin) {
+        no_pin_timeouts.insert(no_pin_timeouts.end(),
+                               std::make_move_iterator(v.begin()),
+                               std::make_move_iterator(v.end()));
     }
 
     std::vector<std::chrono::system_clock::time_point> soft_pin_objects;
@@ -8565,6 +8713,108 @@ void MasterService::BatchEvict(double evict_ratio_target,
         return;
     }
 
+    const long ideal_evict_num =
+        std::ceil(total_eviction_base * evict_ratio_target);
+    const size_t no_pin_count =
+        compact_frontier_prebypass ? candidates.size() : no_pin_timeouts.size();
+    const long primary_no_pin_num =
+        std::min(ideal_evict_num, static_cast<long>(no_pin_count));
+
+    // Re-scan metadata and copy full identities only for objects inside the
+    // requested timestamp range. The eligibility conditions are identical to
+    // the census above, so the selected set matches what the census counted.
+    auto collect_candidates = [&](bool use_cutoff,
+                                  std::chrono::system_clock::time_point cutoff,
+                                  bool collect_older_or_equal) {
+        std::vector<std::vector<Candidate>> local_frontier(num_threads);
+        std::vector<std::thread> collectors;
+        collectors.reserve(num_threads);
+
+        for (int t = 0; t < num_threads; t++) {
+            collectors.emplace_back([&, t] {
+                size_t s_start = t * shards_per_thread;
+                size_t s_end =
+                    std::min(s_start + shards_per_thread, kNumShards);
+                for (size_t s = s_start; s < s_end; s++) {
+                    MetadataShardAccessorRW shard(this, s);
+                    for (const auto& [tenant_id, tenant_state] :
+                         shard->tenants) {
+                        for (const auto& [key, metadata] :
+                             tenant_state.metadata) {
+                            if (metadata.IsHardPinned() ||
+                                !metadata.IsLeaseExpired(now) ||
+                                metadata.IsSoftPinned(now) ||
+                                !can_evict_replicas(metadata)) {
+                                continue;
+                            }
+                            if (use_cutoff) {
+                                const bool in_range =
+                                    collect_older_or_equal
+                                        ? metadata.lease_timeout <= cutoff
+                                        : metadata.lease_timeout > cutoff;
+                                if (!in_range) continue;
+                            }
+                            local_frontier[t].push_back(
+                                {s, tenant_id, key, metadata.lease_timeout});
+                        }
+                    }
+                }
+            });
+        }
+        for (auto& collector : collectors) collector.join();
+
+        size_t total = 0;
+        for (const auto& v : local_frontier) total += v.size();
+        std::vector<Candidate> merged;
+        merged.reserve(total);
+        for (auto& v : local_frontier) {
+            merged.insert(merged.end(), std::make_move_iterator(v.begin()),
+                          std::make_move_iterator(v.end()));
+        }
+        return merged;
+    };
+
+    bool compact_frontier_used = false;
+    std::chrono::system_clock::time_point reserve_cutoff{};
+
+    if (primary_no_pin_num > 0 && !compact_frontier_prebypass) {
+        const size_t primary_count = static_cast<size_t>(primary_no_pin_num);
+        // The reserve absorbs objects that stop being evictable between the
+        // census and the eviction pass, so ordinary churn does not require a
+        // second materialization pass.
+        const size_t reserve_slack = std::max(
+            kMinReserveSlack,
+            (primary_count + kReserveSlackDivisor - 1) / kReserveSlackDivisor);
+        const size_t reserve_count =
+            std::min(no_pin_count, primary_count + reserve_slack);
+        const size_t frontier_limit =
+            std::max(kMinFrontierLimit,
+                     (no_pin_count + kFrontierDivisor - 1) / kFrontierDivisor);
+
+        if (reserve_count <= frontier_limit) {
+            std::nth_element(no_pin_timeouts.begin(),
+                             no_pin_timeouts.begin() + (reserve_count - 1),
+                             no_pin_timeouts.end());
+            reserve_cutoff = no_pin_timeouts[reserve_count - 1];
+            candidates = collect_candidates(/*use_cutoff=*/true, reserve_cutoff,
+                                            /*collect_older_or_equal=*/true);
+
+            // Shortfall guard: if churn left the frontier holding fewer
+            // objects than the target needs, fall back to the full candidate
+            // set so evict_num below still derives from the requested target
+            // rather than from a shrunken frontier.
+            if (candidates.size() >= primary_count) {
+                compact_frontier_used = true;
+            } else {
+                candidates =
+                    collect_candidates(/*use_cutoff=*/false, {},
+                                       /*collect_older_or_equal=*/true);
+            }
+        } else {
+            candidates = collect_candidates(/*use_cutoff=*/false, {},
+                                            /*collect_older_or_equal=*/true);
+        }
+    }
     // ===== Phase 2: Serial eviction via key lookup =====
     long evicted_count = 0;
     uint64_t total_freed_size = 0;
@@ -8573,8 +8823,6 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
     // First pass: evict candidates with no soft pin
     if (!candidates.empty()) {
-        long ideal_evict_num =
-            std::ceil(total_eviction_base * evict_ratio_target);
         long evict_num = std::min(ideal_evict_num, (long)candidates.size());
 
         std::nth_element(candidates.begin(),
@@ -8588,46 +8836,70 @@ void MasterService::BatchEvict(double evict_ratio_target,
         // continue trying the next one so actual evicted count reaches
         // evict_num. This matches the old per-shard over-eviction behavior.
         long evicted_this_pass = 0;
-        for (auto& c : candidates) {
-            if (evicted_this_pass >= evict_num &&
-                c.lease_timeout > target_timeout) {
-                no_pin_objects.push_back(c.lease_timeout);
-                continue;
-            }
-            {
-                MetadataShardAccessorRW shard(this, c.shard_idx);
-                auto tenant_it = shard->tenants.find(c.tenant_id);
-                if (tenant_it == shard->tenants.end()) continue;
-                auto& tenant_state = tenant_it->second;
-                auto it = tenant_state.metadata.find(c.key);
-                if (it == tenant_state.metadata.end()) continue;
-                // Re-validate: state may have changed since Phase 1
-                if (!it->second.IsLeaseExpired(now) ||
-                    it->second.IsSoftPinned(now) ||
-                    !can_evict_replicas(it->second)) {
+        auto evict_candidate_batch = [&](std::vector<Candidate>& batch) {
+            for (auto& c : batch) {
+                if (evicted_this_pass >= evict_num &&
+                    c.lease_timeout > target_timeout) {
                     no_pin_objects.push_back(c.lease_timeout);
                     continue;
                 }
-                auto evict_result = try_evict_group_or_object(
-                    c.tenant_id, c.key, it->second, shard, tenant_state,
-                    deferred_replicas,
-                    /*allow_soft_pinned=*/false);
-                total_freed_size += evict_result.freed_bytes;
-                if (!enable_oplog_ && !it->second.IsGrouped()) {
-                    PublishKvRemovedAfterEvict(c.key, evict_result.freed_bytes,
-                                               "cpu", it->second, c.tenant_id);
+                {
+                    MetadataShardAccessorRW shard(this, c.shard_idx);
+                    auto tenant_it = shard->tenants.find(c.tenant_id);
+                    if (tenant_it == shard->tenants.end()) continue;
+                    auto& tenant_state = tenant_it->second;
+                    auto it = tenant_state.metadata.find(c.key);
+                    if (it == tenant_state.metadata.end()) continue;
+
+                    // Re-validate: state may have changed since Phase 1
+                    if (!it->second.IsLeaseExpired(now) ||
+                        it->second.IsSoftPinned(now) ||
+                        !can_evict_replicas(it->second)) {
+                        no_pin_objects.push_back(c.lease_timeout);
+                        continue;
+                    }
+
+                    auto evict_result = try_evict_group_or_object(
+                        c.tenant_id, c.key, it->second, shard, tenant_state,
+                        deferred_replicas,
+                        /*allow_soft_pinned=*/false);
+
+                    total_freed_size += evict_result.freed_bytes;
+
+                    if (!enable_oplog_ && !it->second.IsGrouped()) {
+                        PublishKvRemovedAfterEvict(
+                            c.key, evict_result.freed_bytes, "cpu", it->second,
+                            c.tenant_id);
+                    }
+
+                    if (!enable_oplog_ && !it->second.IsValid()) {
+                        EraseMetadata(tenant_state, it, c.tenant_id,
+                                      QuotaEraseMode::kFull, &shard);
+                    }
+
+                    if (tenant_state.Empty()) {
+                        shard->tenants.erase(tenant_it);
+                    }
+
+                    evicted_count += evict_result.evicted_objects;
+                    evicted_this_pass += evict_result.evicted_objects;
                 }
-                if (!enable_oplog_ && !it->second.IsValid()) {
-                    EraseMetadata(tenant_state, it, c.tenant_id,
-                                  QuotaEraseMode::kFull, &shard);
-                }
-                if (tenant_state.Empty()) {
-                    shard->tenants.erase(tenant_it);
-                }
-                evicted_count += evict_result.evicted_objects;
-                evicted_this_pass += evict_result.evicted_objects;
+                deferred_replicas.clear();
             }
-            deferred_replicas.clear();
+        };
+
+        evict_candidate_batch(candidates);
+
+        // Metadata may change after the frontier is materialized. If the
+        // reserve is exhausted before the target is met, refill from the
+        // remainder of the current no-soft-pin population. This recovery
+        // scan is paid only on churn and preserves the behavior of
+        // continuing past the cutoff until evict_num is reached.
+        if (compact_frontier_used && evicted_this_pass < evict_num) {
+            auto refill_candidates = collect_candidates(
+                /*use_cutoff=*/true, reserve_cutoff,
+                /*collect_older_or_equal=*/false);
+            evict_candidate_batch(refill_candidates);
         }
     }
 

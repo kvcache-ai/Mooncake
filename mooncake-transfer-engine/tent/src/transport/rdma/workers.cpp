@@ -14,6 +14,8 @@
 
 #include "tent/transport/rdma/workers.h"
 
+#include "tent/transport/rdma/gdr_reachability.h"
+
 #include <sys/epoll.h>
 
 #include <algorithm>
@@ -62,6 +64,7 @@ Workers::Workers(RdmaTransport* transport)
     device_selector_ = std::make_unique<DeviceSelector>();
     device_selector_->loadTopology(transport_->local_topology_);
     auto& conf = transport_->conf_;
+    GdrReachability::instance().configure(conf.get());
 
     // RailMonitor consumes JSON text, while the public configuration is a file
     // path. Load it once here instead of reopening the file for every worker
@@ -637,6 +640,7 @@ void Workers::asyncPollCq() {
     for (int index = 0; index < num_contexts; index++) {
         auto& context = transport_->context_set_[index];
         auto cq = context->cq(tl_wid % num_cq_list);
+        if (!cq) continue;  // inert context for a non-RDMA or failed NIC
         ibv_wc wc[kPollCount];
         int nr_poll = cq->poll(kPollCount, wc);
         if (nr_poll < 0) continue;
@@ -667,6 +671,27 @@ void Workers::asyncPollCq() {
                               << ", local_nic: " << context->name()
                               << "): " << ibv_wc_status_str(wc[i].status);
                 }
+                // GPUDirect reachability learning: a protection/access error
+                // on a GPU buffer means the chosen NIC cannot P2P-DMA to that
+                // GPU (ibv_reg_mr succeeded but the PCIe path is unusable).
+                // Record it so selection avoids that NIC and converges onto a
+                // reachable rail instead of exhausting retries. The local side
+                // (source NIC -> source GPU) surfaces as LOC_PROT; the remote
+                // side (target NIC -> target GPU) as REM_ACCESS or, for a
+                // remote GDR-read failure, REM_OP (observed on strict fabrics).
+                bool local_gdr_err = (wc[i].status == IBV_WC_LOC_PROT_ERR);
+                bool remote_gdr_err = (wc[i].status == IBV_WC_REM_ACCESS_ERR ||
+                                       wc[i].status == IBV_WC_REM_OP_ERR);
+                if (local_gdr_err && slice->source_gpu_ordinal >= 0 &&
+                    slice->source_nic_name) {
+                    GdrReachability::instance().reportLocalFailure(
+                        slice->source_nic_name, slice->source_gpu_ordinal);
+                } else if (remote_gdr_err && slice->target_gpu_ordinal >= 0 &&
+                           slice->target_nic_name && slice->target_machine_id) {
+                    GdrReachability::instance().reportRemoteFailure(
+                        *slice->target_machine_id, slice->target_nic_name,
+                        slice->target_gpu_ordinal);
+                }
                 slice->retry_count++;
                 if (slice->retry_count >=
                     transport_->params_->workers.max_retry_count) {
@@ -686,6 +711,22 @@ void Workers::asyncPollCq() {
                 }
             } else {
                 num_slices += ep->acknowledge(slice, COMPLETED);
+                // A successful GPU transfer re-admits any learned GDR
+                // unreachability for the (GPU, NIC) pair(s) it used, so a
+                // transient exclusion (or a recovered path) heals. Skipped
+                // entirely until something has actually been excluded.
+                if (GdrReachability::hasAnyExclusion()) {
+                    auto& gdr = GdrReachability::instance();
+                    if (slice->source_gpu_ordinal >= 0 &&
+                        slice->source_nic_name)
+                        gdr.reportLocalSuccess(slice->source_nic_name,
+                                               slice->source_gpu_ordinal);
+                    if (slice->target_gpu_ordinal >= 0 &&
+                        slice->target_nic_name && slice->target_machine_id)
+                        gdr.reportRemoteSuccess(*slice->target_machine_id,
+                                                slice->target_nic_name,
+                                                slice->target_gpu_ordinal);
+                }
                 // A successful transfer proves this rail is healthy; clear
                 // any accumulated error count so a previously-cooled-down
                 // rail can be used again without waiting for the full
@@ -781,6 +822,14 @@ int Workers::handleContextEvents(std::shared_ptr<RdmaContext>& context) {
     return 0;
 }
 
+void Workers::reclaimEndpoints() {
+    for (auto& context : transport_->context_set_) {
+        // Inert contexts never built an endpoint store.
+        auto store = context->endpointStore();
+        if (store) store->reclaim();
+    }
+}
+
 void Workers::monitorThread() {
     // Track time for periodic endpoint reclaim (1 Hz heartbeat)
     auto last_reclaim_time = std::chrono::steady_clock::now();
@@ -795,9 +844,7 @@ void Workers::monitorThread() {
                 .count();
 
         if (time_since_last_reclaim >= 1000) {  // 1 second = 1000 ms
-            for (auto& context : transport_->context_set_) {
-                context->endpointStore()->reclaim();
-            }
+            reclaimEndpoints();
             last_reclaim_time = current_time;
         }
 
@@ -935,7 +982,22 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
         return Status::DeviceNotFound(
             "No device could access the slice memory region" LOC_MARK);
 
-    if (!rail.available(slice->source_dev_id, slice->target_dev_id)) {
+    // Proactively steer away from a NIC/GPU pair already known to be
+    // GPUDirect-unreachable (learned from earlier completion errors) so we
+    // never post to a dead rail; the fallback path re-selects a reachable one.
+    // Reactive learning in asyncPollCq still covers pairs not yet observed.
+    bool gdr_excluded = false;
+    if (GdrReachability::hasAnyExclusion()) {
+        int src_gpu = -1, dst_gpu = -1;
+        LocationParser s(source.location), d(target.location);
+        if (s.type() == "cuda") src_gpu = s.index();
+        if (d.type() == "cuda") dst_gpu = d.index();
+        gdr_excluded = gdrPairExcluded(source, target, slice->source_dev_id,
+                                       slice->target_dev_id, src_gpu, dst_gpu);
+    }
+
+    if (gdr_excluded ||
+        !rail.available(slice->source_dev_id, slice->target_dev_id)) {
         LOG(INFO) << "Optimal device pair not available: source_dev_id "
                   << slice->source_dev_id << ", target_dev_id "
                   << slice->target_dev_id;
@@ -954,11 +1016,40 @@ int Workers::getDeviceByFlatIndex(const RouteHint& hint, size_t flat_idx) {
     return -1;
 }
 
+bool Workers::gdrPairExcluded(const RouteHint& source, const RouteHint& target,
+                              int sdev, int tdev, int src_gpu, int dst_gpu) {
+    auto& gdr = GdrReachability::instance();
+    if (src_gpu >= 0) {
+        const auto* lnic = source.topo->getNicEntry(sdev);
+        if (lnic && !gdr.localReachable(lnic->name, src_gpu)) return true;
+    }
+    // Target-GPU reachability applies whether or not the peer is remote: on a
+    // same-host transfer the "remote" GPU is still a physical GPU some NICs
+    // cannot P2P to. The failure is reported under the (target machine_id, nic,
+    // gpu) key either way, so the check is keyed consistently.
+    if (dst_gpu >= 0) {
+        const auto* rnic = target.topo->getNicEntry(tdev);
+        if (rnic && !gdr.remoteReachable(target.segment->machine_id, rnic->name,
+                                         dst_gpu))
+            return true;
+    }
+    return false;
+}
+
 Status Workers::selectFallbackDevice(RouteHint& source, RouteHint& target,
                                      RdmaSlice* slice) {
     LOG_EVERY_N(INFO, 100) << "fallback device selection for slice " << slice;
     bool same_machine =
         (source.segment->machine_id == target.segment->machine_id);
+
+    // GPUDirect reachability filtering (only when something has been learned).
+    bool gdr_learned = GdrReachability::hasAnyExclusion();
+    int src_gpu = -1, dst_gpu = -1;
+    if (gdr_learned) {
+        LocationParser s(source.location), d(target.location);
+        if (s.type() == "cuda") src_gpu = s.index();
+        if (d.type() == "cuda") dst_gpu = d.index();
+    }
 
     size_t src_total = 0;
     for (size_t srank = 0; srank < Topology::DevicePriorityRanks; ++srank)
@@ -969,35 +1060,48 @@ Status Workers::selectFallbackDevice(RouteHint& source, RouteHint& target,
         dst_total += target.topo_entry->device_list[trank].size();
 
     size_t total_combos = src_total * dst_total;
-    if ((size_t)slice->retry_count >= total_combos)
+    if (total_combos == 0)
         return Status::DeviceNotFound("No available path" LOC_MARK);
 
-    size_t idx = slice->retry_count;
-    while (idx < total_combos) {
+    // Rotate through source/target combinations with wraparound, resuming just
+    // past the pair this slice tried last (last_fallback_idx, seeded to -1 so
+    // the first fallback starts at flat index 0). This keeps a retry from
+    // immediately re-picking the same path -- a non-GDR failure would otherwise
+    // burn the whole retry budget on one path before RailMonitor's error
+    // threshold excludes it -- while still preferring higher-priority pairs:
+    // getDeviceByFlatIndex walks the per-GPU priority-ranked NIC list, so flat
+    // index 0 is (source PIX NIC, target PIX NIC), the ideal GPUDirect-capable
+    // pair. Rail-down and GDR-excluded pairs are skipped, so the scan converges
+    // onto a reachable rail instead of exhausting retries.
+    auto& worker = worker_context_[tl_wid];
+    RailMonitor* rail_mon =
+        same_machine
+            ? nullptr
+            : &getOrCreateRail(worker.rails, target.segment->machine_id);
+    size_t start =
+        static_cast<size_t>(slice->last_fallback_idx + 1) % total_combos;
+    for (size_t k = 0; k < total_combos; ++k) {
+        size_t idx = (start + k) % total_combos;
         size_t src_idx = idx / dst_total;
         size_t dst_idx = idx % dst_total;
         int sdev = getDeviceByFlatIndex(source, src_idx);
         int tdev = getDeviceByFlatIndex(target, dst_idx);
-        bool reachable = true;
+        bool reachable = same_machine ? (sdev == tdev)  // loopback is safe
+                                      : rail_mon->available(sdev, tdev);
 
-        if (same_machine) {
-            reachable = (sdev == tdev);  // loopback is safe
-        } else {
-            auto& worker = worker_context_[tl_wid];
-            auto& rail =
-                getOrCreateRail(worker.rails, target.segment->machine_id);
-            reachable = rail.available(sdev, tdev);
-        }
+        // Skip NICs that cannot GPUDirect-DMA to the source/target GPU.
+        if (reachable && gdr_learned &&
+            gdrPairExcluded(source, target, sdev, tdev, src_gpu, dst_gpu))
+            reachable = false;
 
         if (reachable) {
             slice->source_dev_id = sdev;
             slice->target_dev_id = tdev;
-            slice->source_lkey = source.buffer->lkey[slice->source_dev_id];
-            slice->target_rkey = target.buffer->rkey[slice->target_dev_id];
+            // Keys are assigned by generatePostPath() once the device pair is
+            // settled.
+            slice->last_fallback_idx = static_cast<int>(idx);
             return Status::OK();
         }
-
-        ++idx;
     }
 
     return Status::DeviceNotFound("No available path" LOC_MARK);
@@ -1016,13 +1120,37 @@ Status Workers::generatePostPath(RdmaSlice* slice) {
         CHECK_STATUS(selectOptimalDevice(source, target, slice));
     else
         CHECK_STATUS(selectFallbackDevice(source, target, slice));
-    slice->source_lkey = source.buffer->lkey[slice->source_dev_id];
-    slice->target_rkey = target.buffer->rkey[slice->target_dev_id];
+    // Keys are NicID-indexed. A peer running an older build publishes a
+    // compacted rkey vector, so a NicID from its device_list can point past the
+    // end; fail the slice instead of reading out of bounds.
+    const auto& lkeys = source.buffer->lkey;
+    const auto& rkeys = target.buffer->rkey;
+    if (slice->source_dev_id < 0 ||
+        (size_t)slice->source_dev_id >= lkeys.size() ||
+        slice->target_dev_id < 0 ||
+        (size_t)slice->target_dev_id >= rkeys.size())
+        return Status::DeviceNotFound(
+            "Selected device has no registered memory key" LOC_MARK);
+    slice->source_lkey = lkeys[slice->source_dev_id];
+    slice->target_rkey = rkeys[slice->target_dev_id];
     // Cache the RailMonitor pointer so asyncPollCq / disableEndpoint can
     // update rail state without a segment lookup or string-keyed map
     // lookup on the hot path.
     slice->rail_monitor = &getOrCreateRail(worker_context_[tl_wid].rails,
                                            target.segment->machine_id);
+    // Stash identifiers for GPUDirect reachability learning in asyncPollCq.
+    // The name pointers alias stable Topology::NicEntry / segment storage and
+    // remain valid for the slice's lifetime.
+    {
+        LocationParser s(source.location), d(target.location);
+        slice->source_gpu_ordinal = (s.type() == "cuda") ? s.index() : -1;
+        slice->target_gpu_ordinal = (d.type() == "cuda") ? d.index() : -1;
+        const auto* lnic = source.topo->getNicEntry(slice->source_dev_id);
+        const auto* rnic = target.topo->getNicEntry(slice->target_dev_id);
+        slice->source_nic_name = lnic ? lnic->name.c_str() : nullptr;
+        slice->target_nic_name = rnic ? rnic->name.c_str() : nullptr;
+        slice->target_machine_id = &target.segment->machine_id;
+    }
     if (transport_->params_->log_slice_affinity) {
         const auto* local_nic = source.topo->getNicEntry(slice->source_dev_id);
         const auto* remote_nic = target.topo->getNicEntry(slice->target_dev_id);

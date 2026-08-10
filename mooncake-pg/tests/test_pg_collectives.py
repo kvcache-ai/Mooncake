@@ -8,7 +8,6 @@ from pg_test_utils import (
     MooncakePGCUDABackendTestCase,
     MooncakePGMUSABackendTestCase,
     MooncakePGWorkerContext,
-    wait_until,
 )
 
 

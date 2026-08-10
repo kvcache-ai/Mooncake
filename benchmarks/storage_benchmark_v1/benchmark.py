@@ -10,12 +10,11 @@ import json
 import sys
 import time
 import statistics
-import signal
 from contextlib import ExitStack
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterator, List, Dict, Any
+from typing import List, Dict, Any
 
 from storage import DiskHashTable
 from layout import get_model_config, create_layout

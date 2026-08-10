@@ -206,10 +206,12 @@ void loadGlobalConfig(GlobalConfig& config) {
     const char* max_wr_env = std::getenv("MC_MAX_WR");
     if (max_wr_env) {
         size_t val = atoi(max_wr_env);
-        if (val > 0 && val <= UINT16_MAX)
+        if (val > 0 && val <= UINT16_MAX) {
             config.max_wr = val;
-        else
+            config.max_wr_from_env = true;
+        } else {
             LOG(WARNING) << "Ignore value from environment variable MC_MAX_WR";
+        }
     }
 
     const char* max_inline_env = std::getenv("MC_MAX_INLINE");
@@ -557,6 +559,19 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
+    const char* efa_nic_selection = std::getenv("MC_EFA_NIC_SELECTION");
+    if (efa_nic_selection) {
+        if (strcasecmp(efa_nic_selection, "all") == 0) {
+            config.efa_nic_selection = EfaNicSelection::ALL;
+        } else if (strcasecmp(efa_nic_selection, "local") == 0) {
+            config.efa_nic_selection = EfaNicSelection::LOCAL;
+        } else {
+            LOG(WARNING) << "Invalid MC_EFA_NIC_SELECTION environment value: "
+                         << efa_nic_selection
+                         << ", expected all|local, keeping default";
+        }
+    }
+
     const char* endpoint_store_type_env = std::getenv("MC_ENDPOINT_STORE_TYPE");
     if (endpoint_store_type_env) {
         if (strcmp(endpoint_store_type_env, "FIFO") == 0) {
@@ -721,6 +736,9 @@ void dumpGlobalConfig() {
     LOG(INFO) << "max_inline = " << config.max_inline;
     LOG(INFO) << "mtu_length = " << mtuLengthToString(config.mtu_length);
     LOG(INFO) << "parallel_reg_mr = " << config.parallel_reg_mr;
+    LOG(INFO) << "efa_nic_selection = "
+              << (config.efa_nic_selection == EfaNicSelection::LOCAL ? "local"
+                                                                     : "all");
     LOG(INFO) << "ib_traffic_class = " << config.ib_traffic_class;
     LOG(INFO) << "ib_service_level = " << config.ib_service_level;
     LOG(INFO) << "te_metadata_refresh_interval_seconds = "

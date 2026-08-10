@@ -37,15 +37,20 @@ This installs all system packages, git submodules (including pybind11 and yalant
 
 ## Installing from PyPI (recommended)
 
-Pre-built EFA wheels are published to PyPI by the official release pipeline, so most users do not need to build from source. The EFA transport's memory path is CUDA-aware, so two variants are published:
+Pre-built EFA wheels are published to PyPI by the official release pipeline, so most users do not need to build from source. The EFA transport's memory path is CUDA-aware, so separate CUDA 12, CUDA 13, and non-CUDA variants are published:
 
 ```bash
-# GPU memory transfers (e.g., KV cache in vLLM) — built with USE_CUDA=ON
+# GPU memory transfers with CUDA 12 — built with USE_CUDA=ON
 pip install mooncake-transfer-engine-efa
+
+# GPU memory transfers with CUDA 13 — built with USE_CUDA=ON
+pip install mooncake-transfer-engine-efa-cuda13
 
 # CPU/DRAM-only transfers — built with USE_CUDA=OFF
 pip install mooncake-transfer-engine-efa-non-cuda
 ```
+
+The CUDA 13 wheel requires an NVIDIA 580-series or newer driver, following the [CUDA compatibility requirements](https://docs.nvidia.com/deploy/cuda-compatibility/minor-version-compatibility.html).
 
 > **Note:** These wheels deliberately do **not** bundle `libfabric`/`libefa` (see the runtime note in [Building a Distributable Wheel](#efa-distributable-wheel)). They resolve to the system AWS EFA installation at runtime, so the EFA driver and libfabric from the [Prerequisites](#efa-prerequisites-driver) must still be present on the instance. Make sure `/opt/amazon/efa/lib` is on `LD_LIBRARY_PATH`.
 
@@ -108,17 +113,20 @@ PYTHON_VERSION=3.13 BUILD_DIR=build bash scripts/build_wheel.sh 3.13 dist
 pip install dist/mooncake_transfer_engine-*.whl
 ```
 
-To produce a wheel whose package name matches the published variants (`mooncake-transfer-engine-efa` / `-efa-non-cuda`), set the corresponding build-variant environment variable — this is exactly what the release pipeline does:
+To produce a wheel whose package name matches one of the published variants, set the corresponding build-variant environment variable — this is exactly what the release pipeline does:
 
 ```bash
 # GPU build (cmake was configured with USE_CUDA=ON):
 EFA_BUILD=1 PYTHON_VERSION=3.13 BUILD_DIR=build bash scripts/build_wheel.sh 3.13 dist
 
+# CUDA 13 GPU build (cmake was configured with CUDA 13 and USE_CUDA=ON):
+EFA_CU13_BUILD=1 PYTHON_VERSION=3.13 BUILD_DIR=build bash scripts/build_wheel.sh 3.13 dist
+
 # CPU build (cmake was configured with USE_CUDA=OFF):
 EFA_NON_CUDA_BUILD=1 PYTHON_VERSION=3.13 BUILD_DIR=build bash scripts/build_wheel.sh 3.13 dist
 ```
 
-> **CI/CD:** EFA wheels are built and published automatically — see `.github/workflows/ci_efa.yml` (per-PR build validation) and `.github/workflows/release-efa.yaml` (tagged release to GitHub Release + PyPI). No EFA hardware is required to *build* the wheel: only the libfabric headers/library are needed to compile and link, which the CI runner obtains from the distro `libfabric-dev` package.
+> **CI/CD:** EFA wheels are built and published automatically — see `.github/workflows/ci_efa.yml` (per-PR build validation), `.github/workflows/release-efa.yaml` (CUDA 12 release), `.github/workflows/release-efa-cuda13.yaml` (CUDA 13 release), and `.github/workflows/release-efa-non-cuda.yaml` (non-CUDA release). No EFA hardware is required to *build* the wheel: only the libfabric headers/library are needed to compile and link, which the CI runner obtains from the distro `libfabric-dev` package.
 
 > **Important (EFA builds):** `auditwheel repair` excludes `libfabric` and `libefa` from the wheel so they resolve to the system EFA installation (`/opt/amazon/efa/lib`) at runtime. This is required because the in-process `aws-ofi-nccl` plugin (loaded by NCCL) links the **same** system `libfabric`. If the wheel bundled its own copy, the process would load two independent libfabric instances — Mooncake's bundled one and NCCL's system one — and whichever initializes first claims the EFA device, leaving the other with an empty provider list (`fi_getinfo: provider efa output empty list`). NCCL then silently falls back to the TCP provider and cross-node collectives such as `all_gather_object` hang. Excluding libfabric/libefa (see `scripts/build_wheel.sh`) keeps a single shared libfabric in the process. If you are on an older Mooncake build whose wheel still bundles libfabric, force the system copy with `export LD_PRELOAD=/opt/amazon/efa/lib/libfabric.so.1` as a workaround.
 
@@ -136,6 +144,13 @@ print(f'Initialize result: {result}')  # Should be 0
 # You should see logs like:
 # EFA device (libfabric): rdmap79s0, domain: rdmap79s0-rdm, fabric: efa, provider: efa
 ```
+
+Mooncake Store also auto-discovers topology when `protocol="efa"` and no
+device names are supplied. The Store passes the requested protocol to the
+Transfer Engine, which uses its normal topology discovery and installs the EFA
+transport instead of RDMA. Use `MC_MS_FILTERS` to restrict discovery to a
+comma-separated device whitelist. To disable discovery, set
+`MC_MS_AUTO_DISC=0` and provide device names explicitly.
 
 ## Unit Tests
 
@@ -212,7 +227,7 @@ Replace `<target_hostname>:<target_port>` with the target node's address shown i
 
 > **CPU-to-CPU** (no GPUs): build with `-DUSE_CUDA=OFF`, **or** pass `--use_vram=false` to a CUDA-enabled binary. Drop `--gpu_id=-1` in that case — the bench will spread buffers across NUMA nodes instead.
 
-> **Why `threads=16` and not 32:** the SRD shared endpoint caps outstanding WRs per NIC (default 256 — see `MC_MAX_WR`). With `threads × batch ≤ NICs × max_wr` the CQ never saturates; going higher triggers backoff and times out. 32 threads × 128 batch = 4096 slices chasing 16 × 256 = 4096 WRs has no headroom, so the steady-state config settles at 16 threads.
+> **Why `threads=16` and not 32:** measured, on 16-NIC hosts. It used to also be forced by the WR cap — when that cap was a fixed 256, 32 threads × 128 batch = 4096 slices chased 16 × 256 = 4096 WRs with no headroom and runs timed out. The cap is now the provider's real transmit depth (see the WR-cap tip under **Tuning Tips** below), which is far higher, so `threads=16` stands on the measurement alone.
 
 ### Key Parameters
 
@@ -411,7 +426,7 @@ For reference, a cross-host `put_from` of the same payload (device RDMA, 1 NIC) 
 ### Tuning Tips
 
 - **Use `--block_size=1048576` (1MB)** — the single most important knob. The 64 KB default reaches only ~26% of peak. 1 MB is within a few percent of the 2 MB plateau while leaving headroom for `batch_size` under the shared-endpoint WR cap.
-- **Keep `threads × batch_size ≤ num_nics × max_wr`** — under the SRD shared endpoint each NIC carries one `fid_ep` with a 256 WR cap (`MC_MAX_WR`), giving `16 NICs × 256 = 4096` in-flight slots on a 16-NIC host (b300, b200, p5en) and `32 NICs × 256 = 8192` on p5. Exceeding this trips "timed out waiting for CQ drain". `threads=16, batch=128` is a solid baseline on 16-NIC hosts; on 32-NIC p5, `threads=32, batch=128` works the same way.
+- **Keep `threads × batch_size ≤ num_nics × max_wr`** — under the SRD shared endpoint each NIC carries one `fid_ep` whose WR cap is the provider's transmit queue depth (`fi_tx_attr: size`: 4096 on p5, 2048 on p6-b300). Exceeding it trips "timed out waiting for CQ drain". In practice this is no longer the binding constraint — a 16-NIC b300 allows `16 × 2048 = 32768` in-flight slices, far more than any sane `threads × batch` — so pick `threads` and `batch_size` from the measurements above (`threads=16, batch=128` on 16-NIC hosts; `threads=32, batch=128` on 32-NIC p5) and treat this as a sanity check. Read your host's depth from the `provider tx queue=` field in Mooncake's per-device startup log, or with `fi_info -p efa -t FI_EP_RDM -v | grep -A9 fi_tx_attr`.
 - **Write vs read:** write benefits from larger batches (peak at `batch=128`); on 16-NIC p5en read prefers smaller queues (peak at `batch=32`), but on 32-NIC p5 reads scale up to `batch=128` because the wider fabric absorbs larger in-flight queues.
 - For **GPU-to-GPU**: pass `--gpu_id=-1` on **both** sides so buffers fan out across every GPU. Pinning a single GPU halves throughput because half the NICs end up cross-NUMA.
 - For **CPU-to-CPU**: DRAM bandwidth is the ceiling. NUMA-split (separate initiator/target instances per NUMA node) can help reduce contention when one instance can't saturate both nodes.
@@ -567,16 +582,27 @@ export FI_EFA_USE_DEVICE_RDMA=1
 export LD_LIBRARY_PATH=/opt/amazon/efa/lib:$LD_LIBRARY_PATH
 ```
 
-> **Note on additional `MC_*` knobs:** `MC_NUM_CQ_PER_CTX`, `MC_MAX_WR`, `MC_MAX_CQE_PER_CTX`, `MC_SLICE_SIZE`, and `MC_EFA_STRIPING_THRESHOLD` are **not** required at typical PD-disagg loads — the SRD shared-endpoint refactor (#1944) makes them redundant up to high concurrency on 1k/1k traffic. Treat them as emergency switches for CQ-overflow or long-running drift symptoms.
-
-> **`MC_EFA_CQ_THREADS`** — caps the number of CQ polling threads spawned by the EFA transport. Default is `1`, which reaches 99.93% of peak GPU-to-GPU throughput while saving CPU for other workloads. Set to `0` to disable the cap (one poller per EFA context — the legacy behavior). Higher values (e.g., `MC_EFA_CQ_THREADS=4`) are available as an escape hatch for throughput tuning but rarely help in practice.
+> **Do not set `MC_MAX_WR` on EFA — the default is already the correct value.** It caps a counter that paces submission against the endpoint's transmit queue, whose depth the *provider* chooses per device (`fi_tx_attr: size` — **4096** on p5.48xlarge, **2048** on p6-b300.48xlarge, derived from the device's `max_sq_wr`), so the transport reads that depth back instead of using a compiled-in number.
 >
-> ```bash
-> export MC_EFA_CQ_THREADS=1   # default: single CQ poller (recommended)
-> export MC_EFA_CQ_THREADS=0   # disable cap: one poller per EFA context (legacy)
+> Overriding it desynchronizes the counter from the queue it paces, and **both directions of error are real transfer failures, not just slowdowns** — EFA has no transport-level retransmit, so the affected slices are reported up as `FAILED`:
+>
+> - **Too small** (e.g. the old fixed default of 256): the counter saturates while the queue is mostly empty, so submitters spin in the credit-wait loop and give up — `timed out waiting for CQ drain (wr_depth=256, max=256)` — with thousands of slots the NIC would have accepted.
+> - **Too large** (e.g. `MC_MAX_WR=16384`): the counter hands out credit the queue cannot honor, so `fi_write` refuses with `-FI_EAGAIN` while `wr_depth` sits pinned at the provider's real depth and the rest of the credit is nominally free — `1024 consecutive FI_EAGAIN waves posted nothing`.
+>
+> A value **below** the provider's depth is still honored, as a deliberate per-NIC throttle; a value above it is clamped with a warning. Verify what took effect from the per-device startup line — no probe needed:
+>
+> ```
+> EFA device (libfabric): rdmap79s0, ... (shared endpoint, max_wr=4096, provider tx queue=4096, max_cqe=12288)
 > ```
 >
-> If the value exceeds the number of EFA contexts, it is safely ignored (no excess threads are created).
+> If you genuinely need a deeper queue, raise it at the provider with **`FI_EFA_TX_SIZE`** rather than with `MC_MAX_WR`, and Mooncake will track the new depth on its own — measured on p5, `FI_EFA_TX_SIZE=16384` moves `tx_attr->size` to 16384 and the CQ to 24576, and both counters follow. `MC_MAX_WR` cannot do this: it only moves Mooncake's counter, leaving the hardware queue where it was.
+
+> **`MC_EFA_CQ_THREADS`** — caps the number of CQ polling threads. The default of `1` reaches 99.93% of peak GPU-to-GPU throughput while leaving CPU for other work, so **leave it alone**. Pollers busy-wait (the CQs are opened `FI_WAIT_NONE`, so there is no descriptor to block on), which means each extra thread burns a full core whether or not completions are arriving — the opposite of what you want in PD-disagg, where the same cores serve the inference loop. Raising it also cannot fix `FI_EAGAIN` symptoms: those mean the provider is refusing new work, not that completions are going unreaped. Set `0` to lift the cap entirely (one poller per EFA device — the pre-#2113 behavior). Values above the device count are ignored; no excess threads are created.
+>
+> ```bash
+> export MC_EFA_CQ_THREADS=1   # default: single CQ poller
+> export MC_EFA_CQ_THREADS=0   # lift cap: one poller per EFA device (legacy)
+> ```
 
 ### 3. Prefill Instance
 
@@ -663,7 +689,7 @@ The EFA transport requests `FI_THREAD_SAFE` at the domain level and guards the s
 - Multiple submission threads may route slices through the same shared endpoint concurrently.
 - libfabric's EFA RDM endpoints are not thread-safe for concurrent `fi_write`/`fi_read` even under `FI_THREAD_SAFE` at the domain level — concurrent posts corrupt provider internals and completions silently vanish.
 
-CQ completion queues are polled by dedicated worker threads that run independently of submission threads. The poller count is `min(MC_EFA_CQ_THREADS, num_EFA_devices)`; `MC_EFA_CQ_THREADS` defaults to `1`, so a single poller round-robins every context's CQ (which already reaches ~99.9% of peak — see the SGLang env-var note above). Set `MC_EFA_CQ_THREADS=0` to lift the cap and spawn one poller per EFA device (the legacy behavior).
+CQs are polled by dedicated worker threads that run independently of submission threads. The poller count is `min(MC_EFA_CQ_THREADS, num_EFA_devices)`, and `MC_EFA_CQ_THREADS` defaults to `1`, so by default a single thread walks every device's CQ in a busy-wait loop (yielding only when a full pass reaped nothing). That already reaches ~99.9% of peak — see the env-var note under *Usage with SGLang* before changing it.
 
 ### EFA vs RoCE RDMA
 

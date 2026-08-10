@@ -80,7 +80,6 @@ class PinnedBufferPool {
             for (size_t i = 0; i < pool_.size(); ++i) {
                 if (pool_[i].capacity >= size) {
                     Buffer buf = std::move(pool_[i]);
-                    // O(1) erase: swap with back then pop
                     if (i != pool_.size() - 1) {
                         pool_[i] = std::move(pool_.back());
                     }
@@ -90,6 +89,17 @@ class PinnedBufferPool {
             }
         }
         return AllocNew(size);
+    }
+
+    // Never falls back to pageable memory.
+    static Buffer AllocatePinned(size_t size) {
+        auto accelerators =
+            device::GetAcceleratorRegistry().RuntimeAccelerators();
+        for (auto* accelerator : accelerators.Devices()) {
+            auto host = accelerator->AllocatePinnedHost(size);
+            if (host.addr) return Buffer(std::move(host));
+        }
+        return {};
     }
 
     void Release(Buffer buf) {
@@ -112,12 +122,8 @@ class PinnedBufferPool {
 
    private:
     static Buffer AllocNew(size_t size) {
-        const auto& registry = device::GetAcceleratorRegistry();
-        auto runtime_accelerator = registry.RuntimeAccelerators();
-        for (auto* accelerator : runtime_accelerator.Devices()) {
-            auto host = accelerator->AllocatePinnedHost(size);
-            if (host.addr) return Buffer(std::move(host));
-        }
+        auto pinned = AllocatePinned(size);
+        if (pinned.data) return pinned;
         return Buffer::Pageable(size);
     }
 

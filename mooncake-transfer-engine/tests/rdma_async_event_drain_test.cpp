@@ -37,9 +37,17 @@
 #else
 #define MC_HAS_FEATURE(x) 0
 #endif
-#if defined(__SANITIZE_ADDRESS__) || MC_HAS_FEATURE(address_sanitizer)
+#if defined(__SANITIZE_ADDRESS__) || MC_HAS_FEATURE(address_sanitizer) || \
+    MC_HAS_FEATURE(leak_sanitizer)
 #include <sanitizer/lsan_interface.h>
 #define MC_LSAN_IGNORE_OBJECT(p) __lsan_ignore_object(p)
+
+// Suppress false positives from libnuma.so's process-wide static cache
+// allocated in numa_node_to_cpus() which is intentionally retained until exit.
+extern "C" __attribute__((weak, visibility("default"))) const char *
+__lsan_default_suppressions() {
+    return "leak:libnuma.so\n";
+}
 #else
 #define MC_LSAN_IGNORE_OBJECT(p) ((void)(p))
 #endif

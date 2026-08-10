@@ -6,7 +6,8 @@
 #
 # NOTE: the `keywords` and `classifiers` arrays below MUST stay on a
 # single line. They are sed-substituted by scripts/build_wheel.sh for
-# each build variant (non-cuda, cuda13, npu, efa, efa-non-cuda, musa);
+# each build variant (non-cuda, cuda13, npu, efa, efa-cuda13, efa-non-cuda,
+# musa);
 # reordering or wrapping will silently break the variant build matrix.
 #
 # `readme = "README.md"` points at a per-build copy of the repo-root
@@ -17,7 +18,7 @@
 # source of truth for the long description.
 
 [build-system]
-requires = ["setuptools>=61.0.0", "wheel>=0.37.0"]
+requires = ["setuptools>=61.0.0", "wheel>=0.37.0", "numpy"]
 build-backend = "setuptools.build_meta"
 
 [project]

@@ -9,7 +9,6 @@ import numpy as np
 import asyncio
 
 from mooncake.mooncake_config import MooncakeConfig
-from dataclasses import dataclass
 
 
 try:

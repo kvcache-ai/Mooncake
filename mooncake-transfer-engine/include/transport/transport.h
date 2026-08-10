@@ -60,6 +60,8 @@ class Transport {
     struct TransferRequest {
         enum OpCode { READ, WRITE };
 
+        static constexpr uint64_t kNoTaskGroup = 0;
+
         OpCode opcode;
         void *source;
         SegmentID target_id;
@@ -68,6 +70,8 @@ class Transport {
         int advise_retry_cnt = 0;
         // Per-request transport pin, TENT only.
         int transport_hint = 0;
+        // Adjacent requests in the same group are one transport submission.
+        uint64_t task_group_id = kNoTaskGroup;
     };
 
     enum TransferStatusEnum {
@@ -397,6 +401,11 @@ class Transport {
         const std::vector<TransferTask *> &task_list) {
         return Status::NotImplemented(
             "Transport::submitTransferTask is not implemented");
+    }
+
+    virtual Status submitTransferTaskGroup(
+        const std::vector<TransferTask *> &task_list) {
+        return submitTransferTask(task_list);
     }
 
     /// @brief Get the status of a submitted transfer. This function shall not

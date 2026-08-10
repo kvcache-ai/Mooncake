@@ -56,6 +56,7 @@ struct RdmaSubBatch : public Transport::SubBatch {
 class RdmaTransport : public Transport {
     friend class Workers;
     friend class RdmaEndPoint;
+    friend class RdmaTransportTestPeer;
 
    public:
     RdmaTransport();
@@ -122,6 +123,11 @@ class RdmaTransport : public Transport {
     Status setupLocalSegment();
 
     std::shared_ptr<Config> config() const { return conf_; }
+
+   private:
+    // Builds context_set_ with one slot per NicID; returns how many RNICs
+    // came up. Remaining slots hold inert contexts.
+    size_t initializeContexts();
 
    private:
     bool installed_;

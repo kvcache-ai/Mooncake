@@ -1,7 +1,6 @@
 import ctypes
 import os
 import sys
-import json
 import time
 import argparse
 import unittest
@@ -1549,7 +1548,6 @@ class TestMooncakeFunctional(MooncakeTestBase):
             make_deterministic_tensor((12, 12)),
         ]
         keys = [f"func_unified_tp_full_batch_{i}" for i in range(len(tensors))]
-        parallelisms = [build_tp_parallelism(tp_size, split_dim, rank=0) for _ in tensors]
         results = batch_put_full_tensors_with_unified_tp(self.store, keys, tensors, tp_size, split_dim)
         self.assertTrue(all(r == 0 for r in results), f"batch put failed: {results}")
 
