@@ -93,7 +93,6 @@ class AscendDirectTransport : public Transport {
     // Store TE's fabric setting that leaked into the process-global flag. All
     // transfer-time decisions read this member, not the global.
     bool use_fabric_mem_{false};
-    bool client_server_mode_{false};
     std::vector<aclrtContext> local_engine_contexts_;
 
     std::unique_ptr<TransferExecutorBase> transfer_executor_;

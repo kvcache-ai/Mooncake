@@ -48,8 +48,7 @@ The following environment variables can be configured to control Ascend Direct T
 
 | Variable | Description | Default Value | Example |
 |----------|-------------|---------------|---------|
-| `ASCEND_AUTO_CONNECT` | Enable automatic connection management | Auto: enabled when the linked HIXL/ADXL library reports `AUTO_CONNECT` supported via `GetCapability`; disabled on older libs. Env var overrides. | `ASCEND_AUTO_CONNECT=0` |
-| `ASCEND_CLIENT_SERVER_MODE` | Enable HIXL Client/Server communication mode (server listens, client initiates links) | Auto: enabled when `GetCapability(CLIENT_SERVER_COMM)` reports supported; disabled on older libs. Env var overrides. | `ASCEND_CLIENT_SERVER_MODE=1` |
+| `ASCEND_AUTO_CONNECT` | Enable automatic connection management | 1 (enabled) | `ASCEND_AUTO_CONNECT=0` |
 | `ASCEND_ENABLE_USE_FABRIC_MEM` | Enable fabric memory transfer mode in Mooncake Store (A3 only) | 0 (disabled) | `ASCEND_ENABLE_USE_FABRIC_MEM=1` |
 | `ASCEND_USE_ASYNC_TRANSFER` | Enable asynchronous transfer mode | 0 (disabled) | `ASCEND_USE_ASYNC_TRANSFER=1` |
 | `ASCEND_GLOBAL_RESOURCE_CONFIG` | Global resource configuration | - | `ASCEND_GLOBAL_RESOURCE_CONFIG="{\"fabric_memory.max_capacity\":32}"` |
@@ -65,8 +64,7 @@ The following environment variables can be configured to control Ascend Direct T
 
 **Detailed Descriptions:**
 
-- **ASCEND_AUTO_CONNECT**: Requires CANN 9.0 or later. Default behavior is auto-detected via `GetCapability(AUTO_CONNECT)`: enabled on supporting libs, disabled on older libs that predate `GetCapability`. The env var `ASCEND_AUTO_CONNECT` (1/0) overrides the probe. When enabled, links are automatically disconnected when the remote end goes offline abnormally. Set `ASCEND_AUTO_CONNECT=0` to disable.
-- **ASCEND_CLIENT_SERVER_MODE**: Enables the HIXL Client/Server communication mode. Default is auto-detected via `GetCapability(CLIENT_SERVER_COMM)`: enabled on supporting libs, disabled on older libs. The env var `ASCEND_CLIENT_SERVER_MODE` (1/0) overrides. When enabled, Mooncake auto-injects `LocalCommRes={"version":"1.3"}` (unless `ASCEND_LOCAL_COMM_RES` is already set) so HIXL `EngineFactory` selects the HixlCS engine path.
+- **ASCEND_AUTO_CONNECT**: Requires CANN 9.0 or later. Default is 1: link can be automatically disconnected when the remote end goes offline abnormally. Set `ASCEND_AUTO_CONNECT=0` to disable.
 - **ASCEND_ENABLE_USE_FABRIC_MEM**: Requires CANN 9.0+ and HDK 26.0+. Recommended when using Mooncake Store on supported A3 platforms: it can significantly improve transmission performance.
 - **ASCEND_USE_ASYNC_TRANSFER**: Requires CANN 8.5+. Enables HIXL asynchronous transfer mode, defaults to synchronous mode.
 - **ASCEND_GLOBAL_RESOURCE_CONFIG**: Configures HIXL global resources. Refer to HIXL documentation for `OPTION_GLOBAL_RESOURCE_CONFIG` settings.
@@ -102,4 +100,4 @@ The following environment variables can be configured to control Ascend Direct T
 
 12. **Fabric Memory mode**: On the A3, with the latest drivers and CANN installed, when using Mooncake store, the ASCEND_ENABLE_USE_FABRIC_MEM environment variable can be set to enable fabric memory transfer mode (which allows direct access remote HOST memory).
 
-13. **Auto Connect**: Auto connect defaults to enabled when the linked HIXL/ADXL library supports it (probed via `GetCapability`); disabled on older libs. Override with `ASCEND_AUTO_CONNECT=1/0`.
+13. **Auto Connect**: The auto connect feature is enabled by default (`ASCEND_AUTO_CONNECT=1`). Set `ASCEND_AUTO_CONNECT=0` to disable.

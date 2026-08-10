@@ -2264,82 +2264,6 @@ TEST(StoreResourceConfigSplitTest, IsRoceModeEnabled_StoreRoceP2pHccs) {
 }
 
 // -----------------------------------------------------------------------------
-// ResolveAscendCapabilityFlag: env var precedence + GetCapability probe.
-//   1. env var set (1/0) -> env wins
-//   2. env unset + GetCapability returns supported -> enabled
-//   3. env unset + GetCapability returns not supported / fails -> disabled
-// -----------------------------------------------------------------------------
-
-class ResolveCapabilityFlagTest : public ::testing::Test {
-   protected:
-    void SetUp() override {
-        unsetenv("ASCEND_AUTO_CONNECT");
-        unsetenv("ASCEND_CLIENT_SERVER_MODE");
-        adxl_mock::reset();
-    }
-    void TearDown() override {
-        unsetenv("ASCEND_AUTO_CONNECT");
-        unsetenv("ASCEND_CLIENT_SERVER_MODE");
-    }
-};
-
-TEST_F(ResolveCapabilityFlagTest, EnvVarEnableOverridesProbe) {
-    adxl_mock::set_capability_result(adxl::SUCCESS, 0);
-    setenv("ASCEND_AUTO_CONNECT", "1", 1);
-    EXPECT_TRUE(ResolveAscendCapabilityFlag("ASCEND_AUTO_CONNECT",
-                                            adxl::AUTO_CONNECT));
-}
-
-TEST_F(ResolveCapabilityFlagTest, EnvVarDisableOverridesProbe) {
-    adxl_mock::set_capability_result(adxl::SUCCESS, 1);
-    setenv("ASCEND_AUTO_CONNECT", "0", 1);
-    EXPECT_FALSE(ResolveAscendCapabilityFlag("ASCEND_AUTO_CONNECT",
-                                             adxl::AUTO_CONNECT));
-}
-
-TEST_F(ResolveCapabilityFlagTest, EnvVarInvalidDefaultsDisabled) {
-    setenv("ASCEND_AUTO_CONNECT", "abc", 1);
-    EXPECT_FALSE(ResolveAscendCapabilityFlag("ASCEND_AUTO_CONNECT",
-                                             adxl::AUTO_CONNECT));
-}
-
-TEST_F(ResolveCapabilityFlagTest, ProbeSupportedWhenEnvUnset) {
-    adxl_mock::set_capability_result(adxl::SUCCESS, 1);
-    EXPECT_TRUE(ResolveAscendCapabilityFlag("ASCEND_AUTO_CONNECT",
-                                            adxl::AUTO_CONNECT));
-}
-
-TEST_F(ResolveCapabilityFlagTest, ProbeNotSupportedWhenEnvUnset) {
-    adxl_mock::set_capability_result(adxl::SUCCESS, 0);
-    EXPECT_FALSE(ResolveAscendCapabilityFlag("ASCEND_AUTO_CONNECT",
-                                             adxl::AUTO_CONNECT));
-}
-
-TEST_F(ResolveCapabilityFlagTest, ProbeFailureDisabled) {
-    adxl_mock::set_capability_result(adxl::FAILED, 1);
-    EXPECT_FALSE(ResolveAscendCapabilityFlag("ASCEND_AUTO_CONNECT",
-                                             adxl::AUTO_CONNECT));
-}
-
-TEST_F(ResolveCapabilityFlagTest, ClientServerCommEnvEnable) {
-    setenv("ASCEND_CLIENT_SERVER_MODE", "1", 1);
-    EXPECT_TRUE(ResolveAscendCapabilityFlag("ASCEND_CLIENT_SERVER_MODE",
-                                            adxl::CLIENT_SERVER_COMM));
-}
-
-TEST_F(ResolveCapabilityFlagTest, ClientServerCommProbeSupported) {
-    adxl_mock::set_capability_result(adxl::SUCCESS, 1);
-    EXPECT_TRUE(ResolveAscendCapabilityFlag("ASCEND_CLIENT_SERVER_MODE",
-                                            adxl::CLIENT_SERVER_COMM));
-}
-
-TEST_F(ResolveCapabilityFlagTest, ClientServerCommProbeNotSupported) {
-    adxl_mock::set_capability_result(adxl::SUCCESS, 0);
-    EXPECT_FALSE(ResolveAscendCapabilityFlag("ASCEND_CLIENT_SERVER_MODE",
-                                             adxl::CLIENT_SERVER_COMM));
-}
-
-// -----------------------------------------------------------------------------
 // Client-Server mode: when capability is supported and user did not set
 // ASCEND_LOCAL_COMM_RES, Mooncake auto-injects LocalCommRes={"version":"1.3"}
 // so EngineFactory selects HixlEngine (HixlCS path).
@@ -2350,11 +2274,9 @@ class ClientServerModeTest : public AscendDirectTransportTest {
     void SetUp() override {
         AscendDirectTransportTest::SetUp();
         unsetenv("ASCEND_LOCAL_COMM_RES");
-        unsetenv("ASCEND_CLIENT_SERVER_MODE");
     }
     void TearDown() override {
         unsetenv("ASCEND_LOCAL_COMM_RES");
-        unsetenv("ASCEND_CLIENT_SERVER_MODE");
         AscendDirectTransportTest::TearDown();
     }
 };
@@ -2386,15 +2308,6 @@ TEST_F(ClientServerModeTest, UserEnvOverridesAutoInject) {
     auto it = opts.find("adxl.LocalCommRes");
     ASSERT_NE(it, opts.end());
     EXPECT_EQ(it->second, R"({"version":"1.2"})");
-}
-
-TEST_F(ClientServerModeTest, EnvDisableOverridesProbe) {
-    adxl_mock::set_capability_result(adxl::SUCCESS, 1);
-    setenv("ASCEND_CLIENT_SERVER_MODE", "0", 1);
-    auto transport = createTransport();
-    ASSERT_NE(transport, nullptr);
-    const auto opts = adxl_mock::get_last_init_options();
-    EXPECT_EQ(opts.find("adxl.LocalCommRes"), opts.end());
 }
 
 int main(int argc, char** argv) {
