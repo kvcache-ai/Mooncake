@@ -875,7 +875,8 @@ class MasterService {
     void setHttpMetadataRemoteUrl(const std::string& metadata_connstring);
 
    private:
-    std::unique_ptr<ha::SnapshotCatalogStore> CreateSnapshotCatalogStore();
+    std::unique_ptr<ha::SnapshotCatalogStore> CreateSnapshotCatalogStore(
+        const MasterServiceConfig& config);
 
     // Restore master state
     void RestoreState();
@@ -2085,9 +2086,6 @@ class MasterService {
     // from any GetReplicaList caller without additional locking.
     std::unique_ptr<CountMinSketch> promotion_sketch_;
 
-    const std::string ha_backend_type_;
-
-    const std::string ha_backend_connstring_;
     const bool enable_oplog_;
     const uint32_t oplog_batch_max_entries_;
 
@@ -2095,14 +2093,10 @@ class MasterService {
     const std::string cluster_id_;
     // root filesystem directory for persistent storage
     const std::string root_fs_dir_;
-    // global 3fs/nfs segment size
-    int64_t global_file_segment_size_;
     // storage backend eviction configuration
     const bool enable_disk_eviction_;
     const uint64_t quota_bytes_;
     const bool enable_multi_tenants_;
-    const std::string tenant_quota_connector_type_;
-    const std::string tenant_quota_connector_uri_;
     std::unique_ptr<TenantQuotaPolicyStore> tenant_quota_policy_store_;
     mutable std::mutex tenant_quota_policy_mutex_;
     mutable std::mutex tenant_quota_recompute_mutex_;
@@ -2143,17 +2137,6 @@ class MasterService {
     const AllocationStrategyType allocation_strategy_type_;
     std::shared_ptr<AllocationStrategy> allocation_strategy_;
 
-    bool enable_snapshot_restore_ = false;
-
-    bool enable_snapshot_ = false;
-    std::string snapshot_backup_dir_;
-    bool use_snapshot_backup_dir_{false};
-    uint64_t snapshot_interval_seconds_ = DEFAULT_SNAPSHOT_INTERVAL_SEC;
-    uint64_t snapshot_child_timeout_seconds_ =
-        DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC;
-    uint32_t snapshot_retention_count_ = DEFAULT_SNAPSHOT_RETENTION_COUNT;
-    std::string snapshot_catalog_store_type_{};
-    std::string snapshot_catalog_store_connstring_;
     std::unique_ptr<SnapshotObjectStore> snapshot_object_store_;
     std::unique_ptr<ha::SnapshotCatalogStore> snapshot_catalog_store_;
     std::unique_ptr<MasterSnapshotRepository> snapshot_repository_;
@@ -2163,10 +2146,6 @@ class MasterService {
     // Discarded replicas management
     const std::chrono::seconds put_start_discard_timeout_sec_;
     const std::chrono::seconds put_start_release_timeout_sec_;
-    const std::string cxl_path_;
-    const size_t cxl_size_;
-    bool enable_cxl_;
-
     class DiscardedReplicas {
        public:
         DiscardedReplicas() = delete;

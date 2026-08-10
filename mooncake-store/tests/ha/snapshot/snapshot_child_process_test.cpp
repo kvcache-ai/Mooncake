@@ -45,9 +45,15 @@ class SnapshotChildProcessTest : public ::testing::Test {
     }
 
     std::unique_ptr<MasterService> service_;
+    MasterServiceConfig service_config_;
 
     static constexpr const char* kEnvSnapshotLocalPath =
         "MOONCAKE_SNAPSHOT_LOCAL_PATH";
+
+    void CreateService(MasterServiceConfig config) {
+        service_config_ = std::move(config);
+        service_ = std::make_unique<MasterService>(service_config_);
+    }
 
     void SetUp() override {
         google::InitGoogleLogging("SnapshotChildProcessTest");
@@ -90,7 +96,7 @@ class SnapshotChildProcessTest : public ::testing::Test {
                           .set_snapshot_object_store_type("local")
                           .set_view_version(view_version)
                           .build();
-        service_ = std::make_unique<MasterService>(config);
+        CreateService(std::move(config));
     }
 
 #ifdef STORE_USE_ETCD
@@ -112,7 +118,7 @@ class SnapshotChildProcessTest : public ::testing::Test {
                           .set_snapshot_object_store_type("local")
                           .set_view_version(view_version)
                           .build();
-        service_ = std::make_unique<MasterService>(config);
+        CreateService(std::move(config));
     }
 
     void CreateBatchEtcdHASnapshotService(const std::string& cluster_id,
@@ -133,7 +139,7 @@ class SnapshotChildProcessTest : public ::testing::Test {
                           .set_snapshot_object_store_type("local")
                           .set_view_version(view_version)
                           .build();
-        service_ = std::make_unique<MasterService>(config);
+        CreateService(std::move(config));
     }
 #endif
 
@@ -222,10 +228,6 @@ class SnapshotChildProcessTest : public ::testing::Test {
         }
     }
 
-    bool GetUseSnapshotBackupDir() {
-        return service_->use_snapshot_backup_dir_;
-    }
-
     // Check if a key exists in raw metadata (regardless of replica status)
     bool KeyExistsInMetadata(MasterService* svc, const std::string& key) {
         size_t shard_idx = svc->getShardIndex(key);
@@ -277,22 +279,15 @@ class SnapshotChildProcessTest : public ::testing::Test {
         EnsureSnapshotStores();
 
         MasterSnapshotManagerOptions options;
-        options.enable_snapshot = true;
         options.snapshot_interval_seconds =
-            service_->snapshot_interval_seconds_;
+            service_config_.snapshot_interval_seconds;
         options.snapshot_child_timeout_seconds =
-            service_->snapshot_child_timeout_seconds_;
-        options.snapshot_retention_count = service_->snapshot_retention_count_;
-        options.snapshot_backup_dir = service_->snapshot_backup_dir_;
-        options.use_snapshot_backup_dir = service_->use_snapshot_backup_dir_;
-        options.snapshot_catalog_store_type =
-            service_->snapshot_catalog_store_type_;
-        options.snapshot_catalog_store_connstring =
-            service_->snapshot_catalog_store_connstring_;
-        options.ha_backend_type = service_->ha_backend_type_;
-        options.ha_backend_connstring = service_->ha_backend_connstring_;
-        options.cluster_id = service_->cluster_id_;
-        options.enable_ha = service_->enable_ha_;
+            service_config_.snapshot_child_timeout_seconds;
+        options.snapshot_retention_count =
+            service_config_.snapshot_retention_count;
+        options.snapshot_backup_dir = service_config_.snapshot_backup_dir;
+        options.use_snapshot_backup_dir =
+            !service_config_.snapshot_backup_dir.empty();
 
         return std::make_unique<MasterSnapshotManager>(
             service_.get(), options, service_->snapshot_mutex_,
@@ -308,7 +303,7 @@ class SnapshotChildProcessTest : public ::testing::Test {
         if (!service_->snapshot_catalog_store_ &&
             service_->snapshot_object_store_) {
             service_->snapshot_catalog_store_ =
-                service_->CreateSnapshotCatalogStore();
+                service_->CreateSnapshotCatalogStore(service_config_);
         }
     }
 
@@ -598,7 +593,7 @@ TEST_F(SnapshotChildProcessTest, RestoreRebuildsGroupedObjectRouting) {
             .set_default_kv_lease_ttl(600000)
             .build();
     };
-    service_ = std::make_unique<MasterService>(make_config());
+    CreateService(make_config());
 
     Segment segment;
     segment.id = generate_uuid();
@@ -629,7 +624,7 @@ TEST_F(SnapshotChildProcessTest, RestoreRebuildsGroupedObjectRouting) {
         << "PersistState failed: " << persist_result.error().message;
 
     service_.reset();
-    service_ = std::make_unique<MasterService>(make_config());
+    CreateService(make_config());
 
     auto restored_replicas = service_->GetReplicaList(key, TenantId::Default());
     ASSERT_TRUE(restored_replicas.has_value())
@@ -652,7 +647,7 @@ TEST_F(SnapshotChildProcessTest, RestorePreservesObjectChecksum) {
             .set_default_kv_lease_ttl(600000)
             .build();
     };
-    service_ = std::make_unique<MasterService>(make_config());
+    CreateService(make_config());
 
     Segment segment;
     segment.id = generate_uuid();
@@ -681,7 +676,7 @@ TEST_F(SnapshotChildProcessTest, RestorePreservesObjectChecksum) {
         << "PersistState failed: " << persist_result.error().message;
 
     service_.reset();
-    service_ = std::make_unique<MasterService>(make_config());
+    CreateService(make_config());
 
     auto restored = service_->GetReplicaList(key, TenantId::Default());
     ASSERT_TRUE(restored.has_value());
@@ -922,7 +917,7 @@ TEST_F(SnapshotChildProcessTest, RestoreWithoutBackupDir_NoBackupFiles) {
     auto restore_service = std::make_unique<MasterService>(config);
 
     // Step 3: Verify NO backup directory was created
-    // With empty backup_dir, use_snapshot_backup_dir_ should be false
+    // With an empty backup_dir, no restore directory should be created.
     // and no restore directory should exist anywhere in tmp_dir()
     bool any_restore_dir_found = false;
     for (auto& entry : fs::recursive_directory_iterator(tmp_dir())) {
@@ -1070,7 +1065,7 @@ TEST_F(SnapshotChildProcessTest, RestoreCleansNonCompleteReplica) {
                       .set_snapshot_retention_count(3)
                       .set_snapshot_object_store_type("local")
                       .build();
-    service_ = std::make_unique<MasterService>(config);
+    CreateService(std::move(config));
 
     // Mount a segment
     Segment segment;
@@ -1145,7 +1140,7 @@ TEST_F(SnapshotChildProcessTest, RestoreCleansExpiredLease) {
                       .set_snapshot_object_store_type("local")
                       .set_default_kv_lease_ttl(600000)  // 10 min lease
                       .build();
-    service_ = std::make_unique<MasterService>(config);
+    CreateService(std::move(config));
 
     // Mount a segment
     Segment segment;
@@ -1228,7 +1223,7 @@ TEST_F(SnapshotChildProcessTest, PersistState_FailFast_StopsOnFirstError) {
             .set_snapshot_retention_count(3)
             .set_snapshot_object_store_type("local")
             .build();
-    service_ = std::make_unique<MasterService>(config);
+    CreateService(std::move(config));
 
     // Mount a segment to have some data to serialize
     Segment segment;
@@ -1296,7 +1291,7 @@ TEST_F(SnapshotChildProcessTest, UploadFail_WithBackupDir_SavesAllFiles) {
                       .set_snapshot_retention_count(3)
                       .set_snapshot_object_store_type("local")
                       .build();
-    service_ = std::make_unique<MasterService>(config);
+    CreateService(std::move(config));
 
     // Mount a segment to have some data to serialize
     Segment segment;
