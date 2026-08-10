@@ -1054,30 +1054,50 @@ def setup(
     self,
     local_hostname: str,
     metadata_server: str,
-    global_segment_size: int = 16777216,
-    local_buffer_size: int = 1073741824,
-    protocol: str = "tcp",
-    rdma_devices: str = "",
+    global_segment_size: int,
+    local_buffer_size: int,
+    protocol: str,
+    rdma_devices: str,
     master_server_addr: str,
     engine: Optional[TransferEngine] = None,
     enable_ssd_offload: bool = False,
     ssd_offload_path: str = "",
     tenant_id: str = "default",
+    enable_client_http_server: bool = False,
+    client_http_port: int = 9300,
 ) -> int
 ```
+
+The positional overload requires every argument through
+`master_server_addr`. To use defaults for those fields, pass a configuration
+dictionary instead:
+
+```python
+def setup(self, config: Dict[str, object]) -> int
+```
+
+The dictionary overload requires `local_hostname` and `metadata_server`. Its
+other keys are optional; the defaults are `16777216` (16 MiB) for both
+`global_segment_size` and `local_buffer_size`, `"tcp"` for `protocol`, an empty
+string for `rdma_devices`, and `"127.0.0.1:50051"` for
+`master_server_addr`. It also accepts `ipc_socket_path` and the optional
+configuration fields listed below. The `engine` argument is available only in
+the positional overload.
 
 **Parameters:**
 - `local_hostname` (str): **Required**. Local hostname and port (e.g., "localhost" or "localhost:12345")
 - `metadata_server` (str): **Required**. Metadata connection string, e.g. `"P2PHANDSHAKE"` or `"http://localhost:8080/metadata"`.
-- `global_segment_size` (int): Memory segment size in bytes for mounting.
-- `local_buffer_size` (int): Local buffer size in bytes.
-- `protocol` (str): Network protocol, usually `"tcp"`, `"rdma"`, `"efa"`, `"cxl"`, or `"ascend"` depending on the build.
-- `rdma_devices` (str): RDMA/EFA device name(s), e.g. `"mlx5_0"` or `"mlx5_0,mlx5_1"`. Leave empty to auto-discover NICs unless `MC_MS_AUTO_DISC=0`; always empty for TCP.
-- `master_server_addr` (str): **Required**. Master server address (e.g., "localhost:50051")
+- `global_segment_size` (int): **Required by the positional overload**. Memory segment size in bytes for mounting.
+- `local_buffer_size` (int): **Required by the positional overload**. Local buffer size in bytes.
+- `protocol` (str): **Required by the positional overload**. Network protocol, usually `"tcp"`, `"rdma"`, `"efa"`, `"cxl"`, or `"ascend"` depending on the build.
+- `rdma_devices` (str): **Required by the positional overload**. RDMA/EFA device name(s), e.g. `"mlx5_0"` or `"mlx5_0,mlx5_1"`. Leave empty to auto-discover NICs unless `MC_MS_AUTO_DISC=0`; always empty for TCP.
+- `master_server_addr` (str): **Required by the positional overload**. Master server address (e.g., "localhost:50051")
 - `engine` (Optional[TransferEngine]): Existing Transfer Engine instance to reuse. Defaults to `None`.
 - `enable_ssd_offload` (bool): Enable client-side SSD offload support. Defaults to `False`.
 - `ssd_offload_path` (str): SSD offload directory. When provided, overrides the storage path environment configuration.
 - `tenant_id` (str): Tenant namespace for object keys. Defaults to `"default"`.
+- `enable_client_http_server` (bool): Enable the client-local `/health`, `/metrics`, and `/metrics/summary` HTTP endpoints. Defaults to `False`.
+- `client_http_port` (int): Port for the client-local HTTP endpoints. Defaults to `9300`.
 
 **Store segment pinned memory:** CUDA-enabled builds can register Store-managed
 host segments as pinned memory when `MC_STORE_PIN_MEMORY_MAX_BYTES` is set to a
