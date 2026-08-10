@@ -1057,9 +1057,7 @@ fn ensure_segment_allocated(
 }
 
 fn extent_store_expansion_chunk(segment_size: u64) -> u64 {
-    segment_size
-        .max(EXTENT_STORE_ALIGNMENT)
-        .min(DEFAULT_EXTENT_STORE_EXPANSION_CHUNK_BYTES)
+    segment_size.clamp(EXTENT_STORE_ALIGNMENT, DEFAULT_EXTENT_STORE_EXPANSION_CHUNK_BYTES)
 }
 
 fn round_up_extent_store_allocation(required_len: u64, segment_size: u64) -> Result<u64> {
