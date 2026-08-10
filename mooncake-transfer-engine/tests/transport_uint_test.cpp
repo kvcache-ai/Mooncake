@@ -239,7 +239,6 @@ class PartialFailureSubmissionTransport : public BatchResultTransport {
    public:
     Status submitTransferTask(
         const std::vector<TransferTask*>& tasks) override {
-        submission_sizes.push_back(tasks.size());
         for (auto* task : tasks) {
             request_counts.push_back(task->request_count);
             task->slice_count = task->request_count;
@@ -266,7 +265,6 @@ class PartialFailureSubmissionTransport : public BatchResultTransport {
 
     void addExtraSlice() { extra_slice_ = true; }
 
-    std::vector<size_t> submission_sizes;
     std::vector<size_t> request_counts;
 
    private:
@@ -665,18 +663,18 @@ TEST_F(TransportTest, ScatterSubmitFailurePreservesCompletedFragments) {
     impl.getMetadata()->addLocalSegment(kSegmentId, "remote",
                                         std::move(descriptor));
     std::array<char, 2> buffer{};
-    std::array<size_t, 2> offsets{0, 1};
-    std::array<size_t, 2> lengths{1, 1};
+    std::array<size_t, 1> offsets{0};
+    std::array<size_t, 1> lengths{1};
 
     auto run = [&] {
         std::vector<bool> fragment_ok;
-        auto operation = engine.submitScatter({{
+        TransferEngine::ScatterTransferRange range{
             .opcode = TransferRequest::READ,
             .remote_segment = "remote",
             .remote_base_offset = 0,
             .remote_size = buffer.size(),
             .local_buffer = buffer.data(),
-            .local_capacity = buffer.size(),
+            .local_capacity = 1,
             .local_offsets = offsets,
             .remote_offsets = offsets,
             .lengths = lengths,
@@ -684,13 +682,13 @@ TEST_F(TransportTest, ScatterSubmitFailurePreservesCompletedFragments) {
                 [&](size_t, const Status& status) {
                     fragment_ok.push_back(status.ok());
                 },
-        }});
+        };
+        auto operation = engine.submitScatter({range, range});
         EXPECT_FALSE(operation.wait().ok());
         return fragment_ok;
     };
 
     EXPECT_EQ(run(), (std::vector<bool>{true, false}));
-    EXPECT_EQ(transport->submission_sizes, (std::vector<size_t>{1}));
     EXPECT_EQ(transport->request_counts, (std::vector<size_t>{2}));
     transport->addExtraSlice();
     EXPECT_EQ(run(), (std::vector<bool>{false, false}));

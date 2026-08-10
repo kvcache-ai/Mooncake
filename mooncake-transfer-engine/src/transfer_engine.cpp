@@ -1139,7 +1139,7 @@ class TransferEngine::ScatterTransferOperation::Impl {
                     .target_id = *segment_handle,
                     .target_offset = range.remote_base_offset + remote_offset,
                     .length = length,
-                    .task_group_id = range_index + 1,
+                    .task_group_id = 1,
                 });
                 request_fragments_.emplace_back(range_index, fragment_index);
             }
