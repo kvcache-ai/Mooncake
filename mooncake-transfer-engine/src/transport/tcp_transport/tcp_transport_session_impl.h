@@ -51,13 +51,6 @@ struct SessionHeader {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
-static bool isCudaMemory(void* addr) {
-    cudaPointerAttributes attributes;
-    auto status = cudaPointerGetAttributes(&attributes, addr);
-    if (status != cudaSuccess) return false;
-    return attributes.type == cudaMemoryTypeDevice;
-}
-
 // Returns the CUDA device ordinal if addr is device memory, or -1 otherwise.
 // Callers must call cudaSetDevice before any cudaMemcpy to avoid implicit
 // GPU 0 context creation.

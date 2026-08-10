@@ -153,8 +153,6 @@ class TcpTransport : public Transport {
         Slice *slice = nullptr;
         bool use_v2 = false;
         std::function<void()> continuation;
-        uint64_t admission_sequence = 0;
-        std::chrono::steady_clock::time_point enqueued_at;
         std::chrono::steady_clock::time_point admission_deadline;
 
         TcpWorkItem() = default;
@@ -167,8 +165,6 @@ class TcpTransport : public Transport {
             : slice(other.slice),
               use_v2(other.use_v2),
               continuation(std::move(other.continuation)),
-              admission_sequence(other.admission_sequence),
-              enqueued_at(other.enqueued_at),
               admission_deadline(other.admission_deadline) {
             other.slice = nullptr;
         }
@@ -243,13 +239,12 @@ class TcpTransport : public Transport {
     struct PeerConnectionGroup {
         PeerConnectionGroup(ConnectionKey key_arg,
                             const asio::io_context::executor_type &executor_arg,
-                            size_t lane_count_arg, size_t queue_capacity_arg,
+                            size_t queue_capacity_arg,
                             size_t pending_admission_capacity_arg,
                             std::chrono::milliseconds admission_timeout_arg,
                             std::shared_ptr<FailureCounters> counters_arg)
             : key(std::move(key_arg)),
               executor(executor_arg),
-              lane_count(lane_count_arg),
               queue_capacity(queue_capacity_arg),
               pending_admission_capacity(pending_admission_capacity_arg),
               admission_timeout(admission_timeout_arg),
@@ -259,23 +254,19 @@ class TcpTransport : public Transport {
         GroupState state = GroupState::OPEN;
         ConnectionKey key;
         asio::io_context::executor_type executor;
-        size_t lane_count;
         size_t queue_capacity;
         std::deque<TcpWorkItem> queue;
         std::deque<TcpWorkItem> pending_admissions;
         size_t pending_admission_capacity;
         std::chrono::milliseconds admission_timeout;
         std::shared_ptr<asio::steady_timer> admission_timer;
-        bool admission_timer_armed = false;
         uint64_t admission_epoch = 0;
         uint64_t queued_bytes = 0;
         bool queued_bytes_saturated = false;
-        uint64_t next_admission_sequence = 1;
         std::vector<std::shared_ptr<ConnectionLane>> lanes;
         bool pump_scheduled = false;
         uint64_t pump_epoch = 0;
         uint64_t connect_round = 1;
-        size_t connect_attempts_in_round = 0;
         size_t probes_in_flight = 0;
         bool connect_round_had_success = false;
         std::chrono::steady_clock::time_point next_probe_not_before{};
@@ -367,6 +358,9 @@ class TcpTransport : public Transport {
         WorkFailureReason reason,
         const std::shared_ptr<FailureCounters> &counters) noexcept;
     static bool hasUsableLaneLocked(const PeerConnectionGroup &group);
+    static bool hasDisconnectedLaneLocked(const PeerConnectionGroup &group);
+    static bool hasUntriedDisconnectedLaneLocked(
+        const PeerConnectionGroup &group);
 #ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
     static size_t activeSocketCountLocked(const PeerConnectionGroup &group);
 #endif

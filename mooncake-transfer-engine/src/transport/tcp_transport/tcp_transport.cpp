@@ -51,7 +51,7 @@ using tcpsocket = asio::ip::tcp::socket;
 #ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
 namespace {
 using LaneConnectHandlerHook = void (*)() noexcept;
-using LaneConnectFailureInjectionHook = bool (*)() noexcept;
+using LaneConnectFailureInjectionHook = bool (*)(size_t) noexcept;
 using LaneRetryHandlerHook = void (*)() noexcept;
 using LaneAdmissionHandlerHook = void (*)() noexcept;
 using LaneObserverHook = void (*)(int, size_t, uint64_t, size_t, bool) noexcept;
@@ -94,13 +94,13 @@ void invokeLaneConnectHandlerHook() noexcept {
     if (hook) hook();
 }
 
-bool invokeLaneConnectFailureInjectionHook() noexcept {
+bool invokeLaneConnectFailureInjectionHook(size_t lane_id) noexcept {
     LaneConnectFailureInjectionHook hook;
     {
         std::lock_guard<std::mutex> lock(lane_test_hook_mutex);
         hook = lane_connect_failure_injection_hook;
     }
-    return hook && hook();
+    return hook && hook(lane_id);
 }
 
 void invokeLaneRetryHandlerHook() noexcept {
@@ -251,43 +251,43 @@ TcpTransport::TcpTransport()
         }
     }
 
-    if (enable_connection_pool_) {
-        constexpr size_t kDefaultLanesPerPeer = 4;
-        constexpr size_t kDefaultQueuedTransfersPerPeer = 1024;
-        constexpr size_t kMaxQueuedTransfersPerPeer = 65535;
-        constexpr size_t kDefaultPendingAdmissionsPerPeer = 1024;
-        constexpr size_t kMaxPendingAdmissionsPerPeer = 65535;
-        constexpr size_t kDefaultAdmissionTimeoutMs = 1000;
-        constexpr size_t kMaxAdmissionTimeoutMs = 600000;
+    constexpr size_t kDefaultLanesPerPeer = 4;
+    constexpr size_t kDefaultQueuedTransfersPerPeer = 1024;
+    constexpr size_t kMaxQueuedTransfersPerPeer = 65535;
+    constexpr size_t kDefaultPendingAdmissionsPerPeer = 1024;
+    constexpr size_t kMaxPendingAdmissionsPerPeer = 65535;
+    constexpr size_t kDefaultAdmissionTimeoutMs = 1000;
+    constexpr size_t kMaxAdmissionTimeoutMs = 600000;
 
-        const char* lanes_env = getenv("MC_TCP_LANES_PER_PEER");
+    const char* lanes_env = getenv("MC_TCP_LANES_PER_PEER");
+    if (lanes_env) {
+        lane_state_->lanes_per_peer = parseBoundedTcpSetting(
+            "MC_TCP_LANES_PER_PEER", lanes_env, kDefaultLanesPerPeer, 1,
+            kMaxTcpLanesPerPeer);
+    } else {
         const char* deprecated_env = getenv("MC_TCP_MAX_CONNECTIONS_PER_PEER");
-        if (lanes_env) {
-            lane_state_->lanes_per_peer = parseBoundedTcpSetting(
-                "MC_TCP_LANES_PER_PEER", lanes_env, kDefaultLanesPerPeer, 1,
-                kMaxTcpLanesPerPeer);
-        } else if (deprecated_env) {
+        if (deprecated_env) {
             LOG(WARNING) << "MC_TCP_MAX_CONNECTIONS_PER_PEER is deprecated; "
                             "use MC_TCP_LANES_PER_PEER";
             lane_state_->lanes_per_peer = parseBoundedTcpSetting(
                 "MC_TCP_MAX_CONNECTIONS_PER_PEER", deprecated_env,
                 kDefaultLanesPerPeer, 1, kMaxTcpLanesPerPeer);
         }
-
-        lane_state_->max_queued_transfers_per_peer = parseBoundedTcpSetting(
-            "MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER",
-            getenv("MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER"),
-            kDefaultQueuedTransfersPerPeer, 1, kMaxQueuedTransfersPerPeer);
-        lane_state_->max_pending_admissions_per_peer = parseBoundedTcpSetting(
-            "MC_TCP_MAX_PENDING_ADMISSIONS_PER_PEER",
-            getenv("MC_TCP_MAX_PENDING_ADMISSIONS_PER_PEER"),
-            kDefaultPendingAdmissionsPerPeer, 1, kMaxPendingAdmissionsPerPeer);
-        lane_state_->admission_timeout =
-            std::chrono::milliseconds(parseBoundedTcpSetting(
-                "MC_TCP_ADMISSION_TIMEOUT_MS",
-                getenv("MC_TCP_ADMISSION_TIMEOUT_MS"),
-                kDefaultAdmissionTimeoutMs, 1, kMaxAdmissionTimeoutMs));
     }
+
+    lane_state_->max_queued_transfers_per_peer = parseBoundedTcpSetting(
+        "MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER",
+        getenv("MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER"),
+        kDefaultQueuedTransfersPerPeer, 1, kMaxQueuedTransfersPerPeer);
+    lane_state_->max_pending_admissions_per_peer = parseBoundedTcpSetting(
+        "MC_TCP_MAX_PENDING_ADMISSIONS_PER_PEER",
+        getenv("MC_TCP_MAX_PENDING_ADMISSIONS_PER_PEER"),
+        kDefaultPendingAdmissionsPerPeer, 1, kMaxPendingAdmissionsPerPeer);
+    lane_state_->admission_timeout =
+        std::chrono::milliseconds(parseBoundedTcpSetting(
+            "MC_TCP_ADMISSION_TIMEOUT_MS",
+            getenv("MC_TCP_ADMISSION_TIMEOUT_MS"), kDefaultAdmissionTimeoutMs,
+            1, kMaxAdmissionTimeoutMs));
 }
 
 TcpTransport::~TcpTransport() {

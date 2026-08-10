@@ -54,7 +54,7 @@ namespace mooncake {
 void tcpTransportSetLaneConnectHandlerHookForTest(
     void (*hook)() noexcept) noexcept;
 void tcpTransportSetLaneConnectFailureInjectionHookForTest(
-    bool (*hook)() noexcept) noexcept;
+    bool (*hook)(size_t) noexcept) noexcept;
 void tcpTransportSetLaneObserverHookForTest(
     void (*hook)(int, size_t, uint64_t, size_t, bool) noexcept) noexcept;
 void tcpTransportSetLaneRetryHandlerHookForTest(
@@ -211,9 +211,14 @@ void resetLaneTestState() noexcept {
     shutdown_failure_count.store(0, std::memory_order_release);
 }
 
-bool failSecondLaneConnectAttemptOnce() noexcept {
+bool failSecondLaneConnectAttemptOnce(size_t) noexcept {
     const int attempt = lane_connect_injection_call_count.fetch_add(1) + 1;
     return attempt == 2;
+}
+
+bool failLaneOneAndTwoConnectAttempt(size_t lane_id) noexcept {
+    lane_connect_injection_call_count.fetch_add(1, std::memory_order_relaxed);
+    return lane_id == 1 || lane_id == 2;
 }
 
 void releaseLaneConnectHandler() noexcept {
@@ -1641,6 +1646,115 @@ TEST(TcpWriteVisibilityTest,
     EXPECT_EQ(connect_failure_count.load(std::memory_order_acquire), 0);
     EXPECT_LE(maximum_observed_socket_count.load(std::memory_order_acquire),
               2u);
+
+    fake_peer.closePeer();
+    ASSERT_TRUE(waitForBatchTerminal(h.engine.get(), batch_id, kRequestCount,
+                                     std::chrono::seconds(10)));
+    expectEverySliceCompletedExactlyOnceAfterShutdown(batch_id);
+
+    hooks.reset();
+    (void)h.engine->freeBatchID(batch_id);
+}
+
+TEST(TcpWriteVisibilityTest, DirtyLastUsableLaneStartsFreshConnectRound) {
+    constexpr int kRequestCount = 2;
+    constexpr size_t kLength = 64 * 1024;
+    ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "1");
+    ScopedEnvVar queue_capacity("MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER", "8");
+    ScopedEnvVar status_timeout("MC_TCP_STATUS_TIMEOUT_SEC", "30");
+    ScopedLaneHooks hooks;
+    const char* env = std::getenv("MC_METADATA_SERVER");
+    const std::string metadata_server = env ? env : "P2PHANDSHAKE";
+
+    HoldingWriteServer fake_peer;
+    ASSERT_TRUE(fake_peer.ok());
+
+    EngineHandle h;
+    h.init(metadata_server, "127.0.0.2:17936", kLength);
+    ASSERT_TRUE(h.ok);
+    pointTcpSegmentAt(h, fake_peer.port());
+
+    memset(h.pool, 0x6E, kLength);
+    const TransferRequest request = makeWriteRequest(h, kLength);
+    const std::vector<TransferRequest> requests(kRequestCount, request);
+    const auto batch_id = h.engine->allocateBatchID(kRequestCount);
+    ASSERT_TRUE(h.engine->submitTransfer(batch_id, requests).ok());
+
+    ASSERT_TRUE(fake_peer.waitForAccepted(1, std::chrono::seconds(5)));
+    ASSERT_TRUE(waitForPredicate(
+        [] { return lane_busy_count.load(std::memory_order_acquire) >= 1; },
+        std::chrono::seconds(5)));
+    ASSERT_EQ(fake_peer.activeAcceptedCount(), 1);
+
+    // The only established lane fails while another request is still queued.
+    // Because this round had a successful connection, the queued request must
+    // get a fresh connect round instead of being failed as CONNECT_FAILED.
+    ASSERT_TRUE(fake_peer.closeOneAccepted());
+    ASSERT_TRUE(waitForPredicate(
+        [] { return lane_terminal_count.load(std::memory_order_acquire) >= 1; },
+        std::chrono::seconds(5)));
+    ASSERT_TRUE(fake_peer.waitForAccepted(2, std::chrono::seconds(5)));
+    ASSERT_TRUE(waitForPredicate(
+        [] { return lane_busy_count.load(std::memory_order_acquire) >= 2; },
+        std::chrono::seconds(5)));
+
+    EXPECT_EQ(fake_peer.activeAcceptedCount(), 1);
+    EXPECT_EQ(connect_failure_count.load(std::memory_order_acquire), 0);
+    EXPECT_GE(session_failure_count.load(std::memory_order_acquire), 1);
+    EXPECT_LE(maximum_observed_socket_count.load(std::memory_order_acquire),
+              1u);
+
+    fake_peer.closePeer();
+    ASSERT_TRUE(waitForBatchTerminal(h.engine.get(), batch_id, kRequestCount,
+                                     std::chrono::seconds(10)));
+    expectEverySliceCompletedExactlyOnceAfterShutdown(batch_id);
+
+    hooks.reset();
+    (void)h.engine->freeBatchID(batch_id);
+}
+
+TEST(TcpWriteVisibilityTest,
+     ReconnectProbePrefersNeverTriedLanesOverFailedLane) {
+    constexpr int kRequestCount = 5;
+    constexpr size_t kLength = 64 * 1024;
+    ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "4");
+    ScopedEnvVar queue_capacity("MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER", "8");
+    ScopedEnvVar status_timeout("MC_TCP_STATUS_TIMEOUT_SEC", "30");
+    ScopedLaneHooks hooks;
+    tcpTransportSetLaneConnectFailureInjectionHookForTest(
+        failLaneOneAndTwoConnectAttempt);
+    const char* env = std::getenv("MC_METADATA_SERVER");
+    const std::string metadata_server = env ? env : "P2PHANDSHAKE";
+
+    HoldingWriteServer fake_peer;
+    ASSERT_TRUE(fake_peer.ok());
+
+    EngineHandle h;
+    h.init(metadata_server, "127.0.0.2:17937", kLength);
+    ASSERT_TRUE(h.ok);
+    pointTcpSegmentAt(h, fake_peer.port());
+
+    memset(h.pool, 0x6D, kLength);
+    const TransferRequest request = makeWriteRequest(h, kLength);
+    const std::vector<TransferRequest> requests(kRequestCount, request);
+    const auto batch_id = h.engine->allocateBatchID(kRequestCount);
+    ASSERT_TRUE(h.engine->submitTransfer(batch_id, requests).ok());
+
+    // Lanes 1 and 2 fail on every probe. A starvation-prone selector retries
+    // lane 1 forever and never reaches the other retryable lane or lane 3.
+    // Each lane gets one probe per round, so lanes 0 and 3 are accepted.
+    ASSERT_TRUE(fake_peer.waitForAccepted(2, std::chrono::seconds(5)));
+    ASSERT_TRUE(waitForPredicate(
+        [] {
+            return lane_connect_injection_call_count.load(
+                       std::memory_order_acquire) >= 4;
+        },
+        std::chrono::seconds(5)));
+    EXPECT_EQ(fake_peer.activeAcceptedCount(), 2);
+    EXPECT_GE(lane_connect_injection_call_count.load(std::memory_order_acquire),
+              4);
+    EXPECT_LE(maximum_observed_socket_count.load(std::memory_order_acquire),
+              4u);
 
     fake_peer.closePeer();
     ASSERT_TRUE(waitForBatchTerminal(h.engine.get(), batch_id, kRequestCount,
