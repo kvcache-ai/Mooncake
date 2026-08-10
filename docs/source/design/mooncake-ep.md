@@ -16,7 +16,7 @@ Mooncake EP is designed to:
 - keep the Python programming model close to DeepEP low-latency mode;
 - use Mooncake device transports for fast intra-node and inter-node movement;
 - detect failed source ranks through timeout-aware kernels;
-- interoperate with Mooncake Backend (PG) for bootstrap metadata exchange and
+- interoperate with Mooncake PG for bootstrap metadata exchange and
   rank-health state.
 
 ## High-level data flow
@@ -242,6 +242,6 @@ Adapt launch commands to the target environment and number of GPUs.
 
 ## Related documentation
 
-- [Mooncake Backend (PG) design](mooncake-backend-pg.md)
+- [Mooncake PG design](mooncake-backend-pg.md)
 - [Python API reference](../api-reference/python/ep-backend.md)
 - [PG/EP troubleshooting](../troubleshooting/pg-ep-troubleshooting.md)
