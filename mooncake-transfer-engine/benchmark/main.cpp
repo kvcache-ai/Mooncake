@@ -66,26 +66,12 @@ int processBatchSizes(
     std::mutex mutex;
     std::atomic<int> measurement_ready{0};
     std::atomic<bool> measurement_started{false};
-    std::atomic<uint64_t> next_issue_ns{steadyClockNs()};
     auto paceRequest = [&]() {
         if (XferBenchConfig::request_interval_us == 0) return;
         const uint64_t interval_ns =
             XferBenchConfig::request_interval_us * 1000ull;
-        uint64_t now_ns = steadyClockNs();
-        uint64_t expected = next_issue_ns.load(std::memory_order_relaxed);
-        uint64_t issue_ns = 0;
-        while (true) {
-            if (expected < now_ns) expected = now_ns;
-            issue_ns = expected;
-            const uint64_t desired = issue_ns + interval_ns;
-            if (next_issue_ns.compare_exchange_weak(
-                    expected, desired, std::memory_order_acq_rel,
-                    std::memory_order_relaxed)) {
-                break;
-            }
-            now_ns = steadyClockNs();
-        }
-        while (steadyClockNs() < issue_ns) {
+        const uint64_t target_ns = steadyClockNs() + interval_ns;
+        while (steadyClockNs() < target_ns) {
             std::this_thread::yield();
         }
     };
@@ -139,7 +125,6 @@ int processBatchSizes(
         }
         if (measurement_ready.fetch_add(1, std::memory_order_acq_rel) + 1 ==
             num_threads) {
-            next_issue_ns.store(steadyClockNs(), std::memory_order_release);
             measurement_started.store(true, std::memory_order_release);
         } else {
             while (!measurement_started.load(std::memory_order_acquire)) {
