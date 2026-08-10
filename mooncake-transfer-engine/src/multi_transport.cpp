@@ -164,6 +164,9 @@ Status MultiTransport::submitTransfer(
         task.request = &entries[i];
 #endif
         task.request_count = count;
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+        if (count > 1) task.submission_sealed = false;
+#endif
         submit_tasks[transports[i]].push_back(&task);
         if (task_sizes) task_sizes->push_back(count);
         i += count;
@@ -172,6 +175,11 @@ Status MultiTransport::submitTransfer(
     Status overall_status = Status::OK();
     for (auto& entry : submit_tasks) {
         auto status = entry.first->submitTransferTask(entry.second);
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+        for (auto* task : entry.second)
+            if (task->request_count > 1)
+                Transport::Slice::sealTaskSubmission(task);
+#endif
         if (!status.ok()) {
             // LOG(ERROR) << "Failed to submit transfer task to "
             //            << entry.first->getName();

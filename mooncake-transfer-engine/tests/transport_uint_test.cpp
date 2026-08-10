@@ -694,6 +694,38 @@ TEST_F(TransportTest, ScatterSubmitFailurePreservesCompletedFragments) {
     EXPECT_EQ(run(), (std::vector<bool>{false, false}));
 }
 
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+TEST_F(TransportTest, GroupedTaskCompletionWaitsForSubmissionSeal) {
+    Transport::BatchDesc batch{};
+    batch.id = reinterpret_cast<Transport::BatchID>(&batch);
+    batch.batch_size = 1;
+    Transport::TransferTask task;
+    task.batch_id = batch.id;
+    task.request_count = 2;
+    task.submission_sealed = false;
+
+    auto complete_slice = [&] {
+        __atomic_add_fetch(&task.slice_count, 1, __ATOMIC_ACQ_REL);
+        Transport::Slice slice{};
+        slice.task = &task;
+        slice.length = 1;
+        slice.markSuccess();
+    };
+    complete_slice();
+    EXPECT_FALSE(task.is_finished);
+    complete_slice();
+    EXPECT_FALSE(task.is_finished);
+
+    Transport::Slice::sealTaskSubmission(&task);
+    EXPECT_TRUE(task.is_finished);
+    EXPECT_TRUE(batch.is_finished.load());
+    EXPECT_EQ(batch.finished_task_count.load(), 1);
+
+    Transport::Slice::sealTaskSubmission(&task);
+    EXPECT_EQ(batch.finished_task_count.load(), 1);
+}
+#endif
+
 }  // namespace mooncake
 
 int main(int argc, char** argv) {
