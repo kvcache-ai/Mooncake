@@ -699,14 +699,18 @@ Mooncake Store provides a **preferred segment allocation** feature that allows u
 
 ### How It Works
 
-The preferred segment allocation feature is implemented through the `AllocationStrategy` system and is controlled via the `preferred_segment` field in the `ReplicateConfig` structure:
+The preferred segment allocation feature is implemented through the
+`AllocationStrategy` system. The following excerpt shows the legacy
+single-segment field and the memory-replica count used by this path; other
+`ReplicateConfig` fields are omitted:
 
 ```cpp
 struct ReplicateConfig {
-    size_t replica_num{1};                    // Total number of replicas for the object
+    size_t replica_num{1};                    // Number of memory replicas
     bool with_soft_pin{false};               // Whether to enable soft pin mechanism for this object
     bool with_hard_pin{false};               // Whether to enable hard pin (never evicted)
     std::string preferred_segment{};         // Preferred segment for allocation
+    // Other fields, including nof_replica_num and dfs_replica_num, are omitted.
 };
 ```
 
@@ -723,38 +727,80 @@ When a `Put` operation is initiated with a non-empty `preferred_segment` value, 
 
 ## Multi-layer Storage Support
 
-This system provides support for a hierarchical cache architecture, enabling efficient data access through a combination of in-memory caching and persistent storage. Data is initially stored in memory cache and asynchronously backed up to a Distributed File System (DFS), forming a two-tier "memory-SSD persistent storage" cache structure.
+Mooncake Store supports three file-backed storage models in addition to memory
+and NoF replicas:
 
-### Enabling Persistence Functionality
+- `DISK` is the legacy shared-filesystem persistence path enabled by the
+  master's `--root_fs_dir` flag.
+- `LOCAL_DISK` replicas are owned by a real client and use the asynchronous SSD
+  offload and heartbeat protocol.
+- `DFS` replicas occupy globally allocated ranges in shard files on a shared
+  distributed filesystem. Any correctly configured client can access them.
 
-When the user specifies `--root_fs_dir=/path/to/dir` when starting the master, and this path is a valid DFS-mounted directory on all machines where the clients reside, Mooncake Store's tiered caching functionality will work properly. Additionally, during master initialization, a `cluster_id` is loaded. This ID can be specified during master initialization (`--cluster_id=xxxx`). If not specified, the default value `mooncake_cluster` will be used. Subsequently, the root directory for client persistence will be `<root_fs_dir>/<cluster_id>`.
+These models have independent placement, metadata, and lifecycle rules.
 
-​Note​​: When enabling this feature, the user must ensure that the DFS-mounted directory (`root_fs_dir=/path/to/dir`) is valid and consistent across all client hosts. If some clients have invalid or incorrect mount paths, it may cause abnormal behavior in Mooncake Store.
+### Legacy shared-filesystem `DISK` replicas
 
-This `root_fs_dir` path is a legacy persistence path. SSD offload uses `--enable_offload=true` on the master and real client, stores data under the real client's `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`, and records `LOCAL_DISK` replicas. Do not use `--root_fs_dir` with `--enable_offload=true`.
+When the master starts with `--root_fs_dir=/shared/path`, it adds a legacy
+`DISK` replica to each new object. Clients write that replica asynchronously to
+the per-cluster directory `<root_fs_dir>/<cluster_id>` and can read it when the
+normal replica-selection path chooses `DISK`. The path must identify the same
+shared filesystem location on every participating client.
 
-### Persistent Storage Space Configuration​
-Mooncake provides configurable DFS available space. Users can specify `--global_file_segment_size=1048576` when starting the master, indicating a maximum usable space of 1MB on DFS.
-The current default setting is the maximum value of int64 (as we generally do not restrict DFS storage usage), which is displayed as `infinite` in `mooncake_maseter`'s console logs.
-**Notice**  The DFS cache space configuration must be used together with the `--root_fs_dir` parameter. Otherwise, you will observe that the `SSD Storage` usage consistently shows: `0 B / 0 B`
-**Notice** The capability for file eviction on DFS has not been provided yet
+`--global_file_segment_size` declares the legacy file capacity used by master
+metrics; its default is unlimited. It does not configure or limit the
+descriptor-based DFS shard allocator. Do not combine the legacy path with the
+client-owned SSD-offload mode; see the deployment guide for the corresponding
+flags and restrictions.
 
-### Data Access Mechanism
+### Descriptor-based DFS replicas
 
-The persistence feature also follows Mooncake Store's design principle of separating control flow from data flow. The read/write operations of kvcache objects are completed on the client side, while the query and management functions of kvcache objects are handled on the master side. In the file system, the key -> kvcache object index information is maintained by a fixed indexing mechanism, with each file corresponding to one kvcache object (the filename serves as the associated key name).
+```{warning}
+**Work in progress.** Descriptor-based DFS is not production-ready and is not
+covered by the general fault-tolerance, HA continuity, durability, or
+multi-tenant guarantees described elsewhere in this design document.
+```
 
-After enabling the persistence feature:
+The master owns DFS placement metadata and an allocator for the shared shard
+files. During `PutStart` or `UpsertStart`, it allocates an aligned range and
+returns a descriptor containing the shard path, shard index, offset, object
+size, and aligned size. The replica remains `PROCESSING` until the request is
+finalized. Removal, revocation, replacement, and allocator eviction release
+the range, with a configurable deferred-free interval preventing immediate
+offset reuse.
 
-- For each `Put` or `BatchPut` operation, both a synchronous memory pool write operation and an asynchronous DFS persistence operation will be initiated.
-- For each `Get` or `BatchGet` operation, if the corresponding kvcache is not found in the memory pool, the system will attempt to read the file data from DFS and return it to the user.
+The client owns the DFS data plane. `DistributedStorageBackend` validates the
+descriptor and delegates positional I/O to either `PosixFsAdapter` or
+`Hf3fsAdapter`. The master and clients must use the same DFS root and shard
+layout so that a descriptor identifies the same physical file everywhere.
 
-### 3FS USRBIO Plugin (Experimental)
+For a write, the client first completes the requested memory and NoF transfers,
+then writes the DFS replica. `Put`, `BatchPut`, `Upsert`, and `BatchUpsert`
+acknowledge success only after the requested DFS `WriteAt` operations return
+successfully. This is request-synchronous acknowledgement, not an `fsync`
+durability guarantee. If either an existing object or an incoming same-size
+`Upsert` has a DFS replica, the requested memory, NoF, and DFS replica counts
+must match the existing topology.
+
+For a read, the master returns the readable replica list through the normal
+query path. The client selects the first complete replica; if that replica is a
+DFS replica, it uses the descriptor to read the requested range directly from
+the shared shard file.
+
+See the {ref}`Mooncake Store deployment guide <dfs-storage>` for
+configuration, usage, and current limitations.
+
+### HF3FS USRBIO Adapter (Experimental)
 
 ```{note}
 This integration is **experimental** and incomplete; see the plugin page for details before relying on it.
 ```
 
-If you need to use 3FS's native API (USRBIO) to achieve high-performance persistent file reads and writes, you can refer to the configuration instructions in this document [3FS USRBIO Plugin](../getting_started/plugin-usage/3FS-USRBIO-Plugin.md).
+The descriptor-based DFS data plane can use the native HF3FS USRBIO API instead
+of POSIX I/O. Select it with `MOONCAKE_DFS_FS_ADAPTER=hf3fs`; the legacy
+`--root_fs_dir` option does not enable this path, and there is no automatic
+fallback to POSIX. See the [HF3FS USRBIO adapter guide](../getting_started/plugin-usage/3FS-USRBIO-Plugin.md)
+for build prerequisites and configuration.
 
 ## Builtin Metadata Server
 Mooncake Store provides a built-in HTTP metadata server as an alternative to etcd for storing cluster metadata. This feature is particularly useful for development environments or scenarios where etcd is not available.
