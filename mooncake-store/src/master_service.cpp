@@ -217,7 +217,13 @@ MasterService::MasterService(const MasterServiceConfig& config)
       enable_cxl_(config.enable_cxl),
       offloading_queue_limit_(config.offloading_queue_limit),
       offload_cap_ratio_(config.offload_cap_ratio),
-      task_manager_(config.task_manager_config) {
+      task_manager_(config.task_manager_config),
+      batch_oplog_writer_factory_(
+          [](OrderedOpLogWriterConfig writer_config,
+             OrderedOpLogWriter::WriteBatchFn write_batch) {
+              return std::make_unique<OrderedOpLogWriter>(
+                  std::move(writer_config), std::move(write_batch));
+          }) {
     // Initialize HTTP metadata key prefix (read env var once at startup)
     const char* custom_prefix = std::getenv("MC_METADATA_CLUSTER_ID");
     if (custom_prefix && std::strlen(custom_prefix) > 0) {
@@ -620,6 +626,7 @@ ErrorCode MasterService::SetBatchOpLogBackendForTesting(
 
 void MasterService::SetBatchOpLogWriterFactoryForTesting(
     BatchOpLogWriterFactory factory) {
+    assert(factory);
     assert(!ordered_oplog_writer_);
     batch_oplog_writer_factory_ = std::move(factory);
 }
@@ -11134,10 +11141,7 @@ ErrorCode MasterService::InitializeBatchOpLogWriter(
                                                            expected_prefix);
         };
     auto writer =
-        batch_oplog_writer_factory_
-            ? batch_oplog_writer_factory_(writer_config, std::move(write_batch))
-            : std::make_unique<OrderedOpLogWriter>(writer_config,
-                                                   std::move(write_batch));
+        batch_oplog_writer_factory_(writer_config, std::move(write_batch));
     if (!writer) {
         return ErrorCode::INVALID_PARAMS;
     }
