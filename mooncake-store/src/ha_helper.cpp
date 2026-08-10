@@ -10,8 +10,54 @@
 
 #include <limits>
 #include <optional>
+#include <iomanip>
+#include <random>
+#include <sstream>
 
 namespace mooncake {
+
+namespace {
+
+#ifdef STORE_USE_REDIS
+std::string GenerateMasterInstanceId() {
+    std::random_device random;
+    std::mt19937_64 generator(random());
+    std::ostringstream stream;
+    stream << std::hex << std::setfill('0') << std::setw(16) << generator()
+           << std::setw(16) << generator();
+    return stream.str();
+}
+
+std::string BuildSnapshotEndpoint(const std::string& master_endpoint,
+                                  uint32_t snapshot_port,
+                                  const std::string& override_endpoint) {
+    if (!override_endpoint.empty()) {
+        return override_endpoint;
+    }
+    if (snapshot_port == 0 || master_endpoint.empty()) {
+        return "";
+    }
+    std::string host;
+    if (master_endpoint.front() == '[') {
+        const auto closing_bracket = master_endpoint.find(']');
+        if (closing_bracket == std::string::npos) {
+            return "";
+        }
+        host = master_endpoint.substr(0, closing_bracket + 1);
+    } else {
+        const auto separator = master_endpoint.rfind(':');
+        host = separator == std::string::npos
+                   ? master_endpoint
+                   : master_endpoint.substr(0, separator);
+    }
+    if (host.empty() || host == "0.0.0.0" || host == "[::]") {
+        return "";
+    }
+    return host + ":" + std::to_string(snapshot_port);
+}
+#endif
+
+}  // namespace
 
 MasterViewHelper::MasterViewHelper() {
     std::string cluster_id;
@@ -162,6 +208,36 @@ int MasterServiceSupervisor::Start() {
             return -1;
         }
 
+#ifdef STORE_USE_REDIS
+        std::unique_ptr<RedisMasterRegistryHeartbeat> master_registry_heartbeat;
+        std::string master_instance_id;
+        if (config_.deployment_mode == DeploymentMode::P2P &&
+            config_.enable_oplog &&
+            config_.election_backend == ElectionBackend::REDIS) {
+            master_instance_id = GenerateMasterInstanceId();
+            RedisMasterRegistryEntry entry;
+            entry.instance_id = master_instance_id;
+            entry.master_endpoint = config_.local_hostname;
+            entry.snapshot_endpoint = BuildSnapshotEndpoint(
+                config_.local_hostname, config_.standby_snapshot_service_port,
+                config_.standby_snapshot_service_endpoint);
+            entry.role = "starting";
+            entry.snapshot_ready = false;
+            master_registry_heartbeat =
+                std::make_unique<RedisMasterRegistryHeartbeat>(
+                    std::make_unique<RedisMasterRegistry>(
+                        config_.cluster_id, config_.redis_endpoint,
+                        config_.redis_username, config_.redis_password,
+                        config_.redis_db_index),
+                    std::move(entry));
+            if (master_registry_heartbeat->Start() != ErrorCode::OK) {
+                LOG(WARNING) << "Initial Redis Master registration failed; "
+                                "heartbeat will retry"
+                             << ", instance_id=" << master_instance_id;
+            }
+        }
+#endif
+
         std::unique_ptr<P2PHotStandbyService> p2p_standby;
         if (config_.deployment_mode == DeploymentMode::P2P &&
             config_.enable_oplog) {
@@ -187,6 +263,9 @@ int MasterServiceSupervisor::Start() {
             standby_config.redis_db_index = config_.redis_db_index;
             standby_config.snapshot_service_port =
                 static_cast<uint16_t>(config_.standby_snapshot_service_port);
+#ifdef STORE_USE_REDIS
+            standby_config.master_instance_id = master_instance_id;
+#endif
             standby_config.snapshot_chunk_size =
                 config_.standby_snapshot_chunk_size;
             if (!config_.standby_snapshot_sources.empty()) {
@@ -202,6 +281,20 @@ int MasterServiceSupervisor::Start() {
                            << ", error=" << toString(standby_start);
                 return -1;
             }
+#ifdef STORE_USE_REDIS
+            if (master_registry_heartbeat) {
+                master_registry_heartbeat->SetAppliedSequenceProvider(
+                    [standby = p2p_standby.get()] {
+                        return standby->GetLatestAppliedSequenceId();
+                    });
+                master_registry_heartbeat->SetSnapshotReadyProvider(
+                    [standby = p2p_standby.get()] {
+                        return standby->IsReadyForSnapshot();
+                    });
+                master_registry_heartbeat->UpdateRole(
+                    "standby", p2p_standby->IsReadyForSnapshot());
+            }
+#endif
         }
 
         LOG(INFO) << "Trying to elect self as leader...";
@@ -228,6 +321,11 @@ int MasterServiceSupervisor::Start() {
             p2p_promoted_metadata;
         uint64_t p2p_promoted_sequence_id = 0;
         if (p2p_standby) {
+#ifdef STORE_USE_REDIS
+            if (master_registry_heartbeat) {
+                master_registry_heartbeat->UpdateRole("promoting", false);
+            }
+#endif
             auto promote_err = p2p_standby->Promote();
             if (promote_err != ErrorCode::OK) {
                 LOG(ERROR) << "Failed to promote P2P hot standby service"
@@ -239,6 +337,12 @@ int MasterServiceSupervisor::Start() {
             p2p_promoted_sequence_id =
                 p2p_standby->GetLatestAppliedSequenceId();
             p2p_promoted_metadata = p2p_standby->ExportMetadata();
+#ifdef STORE_USE_REDIS
+            if (master_registry_heartbeat) {
+                master_registry_heartbeat->SetAppliedSequenceProvider({});
+                master_registry_heartbeat->SetSnapshotReadyProvider({});
+            }
+#endif
             p2p_standby.reset();
         }
 
@@ -273,6 +377,11 @@ int MasterServiceSupervisor::Start() {
             RegisterP2PRpcService(server, *p2p_wrapped_service);
             wrapped_master_service = std::move(p2p_wrapped_service);
         }
+#ifdef STORE_USE_REDIS
+        if (master_registry_heartbeat) {
+            master_registry_heartbeat->UpdateRole("primary", false);
+        }
+#endif
         // Metric reporting is now handled by WrappedMasterService.
 
         async_simple::Future<coro_rpc::err_code> ec =

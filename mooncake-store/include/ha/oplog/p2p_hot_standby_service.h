@@ -36,10 +36,10 @@ struct P2PHotStandbyConfig {
     int reconnect_initial_backoff_ms{100};
     int reconnect_max_backoff_ms{5000};
     uint16_t snapshot_service_port{0};
-    // TODO: Discover alive snapshot sources from the Redis Master registry by
-    // default, while keeping explicit endpoints as an override.
+    std::string master_instance_id;
     std::vector<std::string> snapshot_source_endpoints;
     uint32_t snapshot_chunk_size{256};
+    int master_registry_ttl_sec{10};
 };
 
 struct P2PStandbySyncStatus {
@@ -98,7 +98,9 @@ class P2PHotStandbyService {
     bool IsReadyForSnapshot() const;
 
    private:
-    ErrorCode StartOplogFollowingLocked(uint64_t baseline_sequence_id);
+    ErrorCode StartOplogFollowingLocked(
+        uint64_t baseline_sequence_id,
+        std::unique_ptr<OpLogStore> prepared_reader_store = nullptr);
     std::unique_ptr<OpLogStore> CreateReaderStore() const;
     void ResetOplogFollowingLocked();
     ErrorCode FinalCatchUpForPromotionLocked(uint64_t current_applied_seq_id);
@@ -109,13 +111,18 @@ class P2PHotStandbyService {
     void RestoreRecoveryWorker();
     void RequestRecovery();
     void RecoveryLoop();
-    ErrorCode BootstrapFromSnapshotSources(uint64_t& baseline_sequence_id);
+    ErrorCode BootstrapFromSnapshotSources(
+        uint64_t& baseline_sequence_id,
+        const std::vector<std::string>& discovered_endpoints = {});
+    ErrorCode ResyncFromSnapshotLocked();
     ErrorCode GetLatestOpLogSequenceId(uint64_t& sequence_id) const;
     bool WaitForAppliedSequenceLocked(
         uint64_t sequence_id,
-        std::chrono::milliseconds timeout = std::chrono::seconds(30)) const;
+        std::chrono::milliseconds timeout = std::chrono::seconds(30),
+        bool stop_on_snapshot_resync = false) const;
     ErrorCode StartSnapshotServer();
     void StopSnapshotServer();
+    std::vector<std::string> DiscoverSnapshotSources() const;
 
     P2PHotStandbyConfig config_;
     ReaderStoreFactory reader_store_factory_;
@@ -136,6 +143,7 @@ class P2PHotStandbyService {
     std::thread recovery_thread_;
     bool recovery_requested_{false};
     bool recovery_stopping_{false};
+    std::atomic<bool> snapshot_resync_required_{false};
 
     std::unique_ptr<P2PStandbySnapshotService> snapshot_service_;
     std::unique_ptr<coro_rpc::coro_rpc_server> snapshot_server_;

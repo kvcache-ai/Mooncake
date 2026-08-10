@@ -137,6 +137,15 @@ bool MasterProcessHandler::start() {
             if (!config_.oplog_data_dir.empty()) {
                 args.emplace_back("--oplog-data-dir=" + config_.oplog_data_dir);
             }
+            if (config_.standby_snapshot_service_port_base != 0) {
+                const int snapshot_port =
+                    config_.standby_snapshot_service_port_base + index_;
+                args.emplace_back("--standby-snapshot-service-port=" +
+                                  std::to_string(snapshot_port));
+                args.emplace_back("--standby-snapshot-service-endpoint=" +
+                                  config_.rpc_address + ":" +
+                                  std::to_string(snapshot_port));
+            }
         }
 
         if (config_.election_backend == "redis") {

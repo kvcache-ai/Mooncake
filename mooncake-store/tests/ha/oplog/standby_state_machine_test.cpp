@@ -115,6 +115,27 @@ TEST_F(StandbyStateMachineTest, TestWatchBrokenTransition) {
     EXPECT_FALSE(machine_->IsReadyForPromotion());
 }
 
+TEST_F(StandbyStateMachineTest, TestResyncRequiredTransition) {
+    ReachWatchingState();
+
+    auto result = machine_->ProcessEvent(StandbyEvent::RESYNC_REQUIRED);
+    EXPECT_TRUE(result.allowed);
+    EXPECT_EQ(StandbyState::WATCHING, result.old_state);
+    EXPECT_EQ(StandbyState::SYNCING, result.new_state);
+    EXPECT_EQ(StandbyState::SYNCING, machine_->GetState());
+    EXPECT_FALSE(machine_->IsReadyForPromotion());
+}
+
+TEST_F(StandbyStateMachineTest, TestResyncRequiredWhileSyncing) {
+    ReachSyncingState();
+
+    auto result = machine_->ProcessEvent(StandbyEvent::RESYNC_REQUIRED);
+    EXPECT_TRUE(result.allowed);
+    EXPECT_EQ(StandbyState::SYNCING, result.old_state);
+    EXPECT_EQ(StandbyState::SYNCING, result.new_state);
+    EXPECT_EQ(StandbyState::SYNCING, machine_->GetState());
+}
+
 TEST_F(StandbyStateMachineTest, TestDisconnectedFromWatching) {
     ReachWatchingState();
 

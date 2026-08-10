@@ -42,6 +42,7 @@ struct MasterRunnerConfig {
     std::string oplog_store_type = "localfs";
     std::string oplog_data_dir;
     int max_client_per_key = 0;
+    int standby_snapshot_service_port_base = 0;
 };
 
 class MasterProcessHandler {

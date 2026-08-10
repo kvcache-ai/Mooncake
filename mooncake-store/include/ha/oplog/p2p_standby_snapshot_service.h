@@ -4,6 +4,8 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -117,5 +119,66 @@ class P2PStandbySnapshotClient {
                         uint64_t& baseline_sequence_id,
                         uint32_t chunk_size = 256);
 };
+
+#ifdef STORE_USE_REDIS
+struct RedisMasterRegistryEntry {
+    std::string instance_id;
+    std::string master_endpoint;
+    std::string snapshot_endpoint;
+    std::string role;
+    bool snapshot_ready{false};
+    uint64_t applied_sequence_id{0};
+};
+
+class RedisMasterRegistry {
+   public:
+    RedisMasterRegistry(std::string cluster_id, std::string redis_endpoint,
+                        std::string username, std::string password,
+                        int db_index);
+
+    ErrorCode Refresh(const RedisMasterRegistryEntry& entry);
+    ErrorCode Remove(const std::string& instance_id);
+    ErrorCode DiscoverAlive(std::chrono::seconds ttl,
+                            std::vector<RedisMasterRegistryEntry>& entries);
+
+   private:
+    std::string heartbeat_key_;
+    std::string metadata_key_;
+    std::string redis_endpoint_;
+    std::string username_;
+    std::string password_;
+    int db_index_{0};
+};
+
+class RedisMasterRegistryHeartbeat {
+   public:
+    RedisMasterRegistryHeartbeat(
+        std::unique_ptr<RedisMasterRegistry> registry,
+        RedisMasterRegistryEntry entry,
+        std::chrono::seconds interval = std::chrono::seconds(2));
+    ~RedisMasterRegistryHeartbeat();
+
+    ErrorCode Start();
+    void UpdateRole(std::string role, bool snapshot_ready);
+    void SetAppliedSequenceProvider(std::function<uint64_t()> provider);
+    void SetSnapshotReadyProvider(std::function<bool()> provider);
+    void Stop();
+
+   private:
+    void Run();
+
+    std::unique_ptr<RedisMasterRegistry> registry_;
+    RedisMasterRegistryEntry entry_;
+    std::chrono::seconds interval_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    std::thread thread_;
+    std::function<uint64_t()> applied_sequence_provider_;
+    std::function<bool()> snapshot_ready_provider_;
+    size_t provider_in_flight_{0};
+    bool refresh_requested_{false};
+    bool stopping_{false};
+};
+#endif
 
 }  // namespace mooncake

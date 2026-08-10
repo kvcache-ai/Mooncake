@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cerrno>
 #include <cstring>
+#include <fstream>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -17,9 +18,9 @@
 #include <thread>
 #include <vector>
 
-#include "client_wrapper.h"
 #include "e2e_utils.h"
 #include "ha/oplog/p2p_oplog_types.h"
+#include "ha/oplog/p2p_standby_snapshot_service.h"
 #include "ha/oplog/redis_oplog_store.h"
 #include "process_handler.h"
 #include "redis_master_view_helper.h"
@@ -48,6 +49,7 @@ DEFINE_int32(redis_heartbeat_interval_sec, 2,
 constexpr int kMasterPortBase = 51051;
 constexpr int kMasterNum = 3;
 constexpr int kClientPortBase = 52051;
+constexpr int kSnapshotPortBase = 53051;
 
 namespace mooncake {
 namespace testing {
@@ -109,6 +111,10 @@ void CleanupRedisKeys() {
     }
 
     std::vector<std::string> keys = {MasterViewKey(), MasterEpochKey()};
+    keys.push_back("mooncake:{" + FLAGS_redis_cluster_id +
+                   "}:masters:heartbeat");
+    keys.push_back("mooncake:{" + FLAGS_redis_cluster_id +
+                   "}:masters:metadata");
     std::string oplog_pattern =
         "mooncake:{" + FLAGS_redis_cluster_id + "}:oplog*";
     redisReply* keys_reply = static_cast<redisReply*>(redisCommand(
@@ -375,6 +381,7 @@ class RedisChaosTest : public ::testing::Test {
         config.oplog_store_type = "redis";
         config.oplog_data_dir = FLAGS_redis_endpoint;
         config.max_client_per_key = 0;
+        config.standby_snapshot_service_port_base = kSnapshotPortBase;
 
         for (int i = 0; i < kMasterNum; ++i) {
             masters_.emplace_back(std::make_unique<MasterProcessHandler>(
@@ -446,59 +453,6 @@ class RedisChaosTest : public ::testing::Test {
             std::chrono::seconds(FLAGS_redis_master_view_ttl_sec + 1));
     }
 
-    std::shared_ptr<ClientTestWrapper> CreateRedisClient(
-        int index, std::chrono::seconds timeout) {
-        auto deadline = std::chrono::steady_clock::now() + timeout;
-        while (std::chrono::steady_clock::now() < deadline) {
-            auto client = ClientTestWrapper::CreateClientWrapper(
-                "127.0.0.1:" + std::to_string(kClientPortBase + index),
-                "P2PHANDSHAKE", "tcp", "", "redis://" + FLAGS_redis_endpoint,
-                /*local_buffer_size=*/1024 * 1024 * 128, FLAGS_redis_cluster_id,
-                /*enable_http_server=*/false, /*deployment_mode=*/"P2P",
-                /*p2p_local_transfer_mode=*/"memcpy",
-                static_cast<uint16_t>(kClientPortBase + index),
-                FLAGS_redis_username, FLAGS_redis_password);
-            if (client.has_value()) {
-                return client.value();
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        }
-        return nullptr;
-    }
-
-    bool WaitForClientPutGet(ClientTestWrapper& client,
-                             const std::string& key_prefix,
-                             const std::string& value,
-                             std::chrono::seconds timeout) {
-        auto deadline = std::chrono::steady_clock::now() + timeout;
-        int attempt = 0;
-        while (std::chrono::steady_clock::now() < deadline) {
-            std::string key = key_prefix + "_" + std::to_string(attempt++);
-            if (client.Put(key, value) == ErrorCode::OK) {
-                std::string got;
-                if (client.Get(key, got) == ErrorCode::OK && got == value) {
-                    return true;
-                }
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        }
-        return false;
-    }
-
-    bool WaitForClientGet(ClientTestWrapper& client, const std::string& key,
-                          const std::string& value,
-                          std::chrono::seconds timeout) {
-        auto deadline = std::chrono::steady_clock::now() + timeout;
-        while (std::chrono::steady_clock::now() < deadline) {
-            std::string got;
-            if (client.Get(key, got) == ErrorCode::OK && got == value) {
-                return true;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(500));
-        }
-        return false;
-    }
-
     bool WaitForReplicaOpLog(const std::string& key,
                              std::chrono::seconds timeout) {
         RedisOpLogStore store(FLAGS_redis_cluster_id, FLAGS_redis_endpoint,
@@ -545,6 +499,65 @@ class RedisChaosTest : public ::testing::Test {
         return false;
     }
 
+    bool WaitForMasterLog(int index, const std::string& needle,
+                          std::chrono::seconds timeout) {
+        return WaitForMasterLogSince(index, needle, std::streampos(0), timeout);
+    }
+
+    std::streampos MasterLogEndOffset(int index) {
+        const std::string path =
+            FLAGS_out_dir + "/master_" + std::to_string(index) + ".err";
+        std::ifstream input(path, std::ios::binary | std::ios::ate);
+        if (!input) {
+            return std::streampos(0);
+        }
+        return input.tellg();
+    }
+
+    bool WaitForMasterLogSince(int index, const std::string& needle,
+                               std::streampos offset,
+                               std::chrono::seconds timeout) {
+        const std::string path =
+            FLAGS_out_dir + "/master_" + std::to_string(index) + ".err";
+        auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            std::ifstream input(path, std::ios::binary);
+            if (!input) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(200));
+                continue;
+            }
+            input.seekg(offset);
+            std::string content((std::istreambuf_iterator<char>(input)),
+                                std::istreambuf_iterator<char>());
+            if (content.find(needle) != std::string::npos) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        return false;
+    }
+
+    bool WaitForSnapshotBaseline(int source_index, uint64_t expected_sequence,
+                                 std::chrono::seconds timeout) {
+        const std::string endpoint =
+            "127.0.0.1:" + std::to_string(kSnapshotPortBase + source_index);
+        auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (std::chrono::steady_clock::now() < deadline) {
+            P2PStandbyMetadataStore metadata;
+            P2PStandbySnapshotClient snapshot_client;
+            uint64_t baseline_sequence_id = 0;
+            if (snapshot_client.Bootstrap(endpoint, FLAGS_redis_cluster_id,
+                                          &metadata, baseline_sequence_id,
+                                          /*chunk_size=*/256) ==
+                    ErrorCode::OK &&
+                baseline_sequence_id >= expected_sequence) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        return false;
+    }
+
     std::vector<std::unique_ptr<MasterProcessHandler>> masters_;
     std::unique_ptr<RedisMasterViewHelper> master_view_helper_;
     inline static struct sigaction old_sigpipe_action_ = {};
@@ -565,6 +578,60 @@ TEST_F(RedisChaosTest, LeaderKilledFailover) {
         WaitForNewLeader(leader_index, version, new_leader_index, new_version));
     EXPECT_NE(new_leader_index, leader_index);
     EXPECT_GT(new_version, version);
+}
+
+TEST_F(RedisChaosTest, TrimmedStandbyAutoDiscoversPeerAndBootstraps) {
+    int leader_index = -1;
+    ViewVersionId version = 0;
+    ASSERT_TRUE(WaitForLeader(leader_index, version, std::chrono::seconds(10)));
+    WaitForLeaderServiceReady();
+
+    const int lagging_index = (leader_index + 1) % kMasterNum;
+    const int source_index = (leader_index + 2) % kMasterNum;
+    ASSERT_TRUE(WaitForMasterLog(source_index, "Redis Master registered",
+                                 std::chrono::seconds(10)));
+    ASSERT_TRUE(masters_[lagging_index]->kill());
+
+    ClientCtlProcess client(/*index=*/20, FLAGS_out_dir);
+    ASSERT_TRUE(client.Start());
+    ASSERT_TRUE(client.SendAndWait(
+        "create c_trim " + std::to_string(kClientPortBase + 20),
+        "Successfully created client: c_trim", std::chrono::seconds(30)));
+    const std::string key = "trim_rebootstrap_key";
+    const std::string value = "trim_rebootstrap_value";
+    ASSERT_TRUE(client.SendAndWait("put c_trim " + key + " " + value,
+                                   "Successfully put value for key: " + key,
+                                   std::chrono::seconds(10)));
+    ASSERT_TRUE(WaitForReplicaOpLog(key, std::chrono::seconds(10)));
+
+    RedisOpLogStore store(FLAGS_redis_cluster_id, FLAGS_redis_endpoint,
+                          /*enable_write=*/false, /*poll_interval_ms=*/100,
+                          FLAGS_redis_password, FLAGS_redis_username);
+    ASSERT_EQ(store.Init(), ErrorCode::OK);
+    uint64_t latest_sequence_id = 0;
+    ASSERT_EQ(store.GetLatestSequenceId(latest_sequence_id), ErrorCode::OK);
+    ASSERT_GT(latest_sequence_id, 0);
+    ASSERT_TRUE(WaitForSnapshotBaseline(source_index, latest_sequence_id,
+                                        std::chrono::seconds(10)));
+    ASSERT_EQ(store.CleanupOpLogBefore(latest_sequence_id + 1), ErrorCode::OK);
+
+    auto lagging_log_offset = MasterLogEndOffset(lagging_index);
+    ASSERT_TRUE(masters_[lagging_index]->start());
+    ASSERT_TRUE(WaitForMasterLogSince(
+        lagging_index, "Standby snapshot: bootstrap completed",
+        lagging_log_offset, std::chrono::seconds(20)));
+
+    ASSERT_TRUE(masters_[source_index]->kill());
+    ASSERT_TRUE(masters_[leader_index]->kill());
+    int new_leader_index = -1;
+    ViewVersionId new_version = 0;
+    ASSERT_TRUE(
+        WaitForNewLeader(leader_index, version, new_leader_index, new_version));
+    ASSERT_EQ(new_leader_index, lagging_index);
+    ASSERT_TRUE(WaitForClientCtlCommand(
+        client, "expect_get c_trim " + key + " " + value,
+        "Successfully expected value for key: " + key,
+        std::chrono::seconds(60)));
 }
 
 TEST_F(RedisChaosTest, LeaderKeyDeletedTriggersReElection) {

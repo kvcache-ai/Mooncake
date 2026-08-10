@@ -3,6 +3,7 @@
 #include <glog/logging.h>
 
 #include <algorithm>
+#include <charconv>
 #include <chrono>
 #include <csignal>
 
@@ -10,6 +11,9 @@
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 
 #include "ha/oplog/p2p_hot_standby_service.h"
+#ifdef STORE_USE_REDIS
+#include "redis_util.h"
+#endif
 
 namespace mooncake {
 
@@ -61,6 +65,11 @@ BeginStandbySnapshotResponse P2PStandbySnapshotService::BeginSnapshot(
     // Correctness depends on idempotent OpLog replay, and the restored node
     // must catch up from baseline_sequence_id to converge to the final state.
     Session session;
+    // Snapshot chunks are read from the live metadata store after the baseline
+    // sequence ID is captured, so concurrent updates may be partially
+    // reflected. This is intentional: P2P metadata OpLog operations are
+    // designed to be idempotent, and replay from baseline_sequence_id + 1
+    // reconciles the snapshot for the asynchronous HA consistency model.
     session.baseline_sequence_id = standby_->GetLatestAppliedSequenceId();
     auto* store = standby_->GetMetadataStore();
     session.object_keys = store->ListObjectKeys();
@@ -347,5 +356,325 @@ ErrorCode P2PStandbySnapshotClient::Bootstrap(const std::string& endpoint,
     }
     return result;
 }
+
+#ifdef STORE_USE_REDIS
+namespace {
+
+std::string SerializeMasterRegistryEntry(
+    const RedisMasterRegistryEntry& entry) {
+    return entry.master_endpoint + "\n" + entry.snapshot_endpoint + "\n" +
+           entry.role + "\n" + (entry.snapshot_ready ? "1" : "0") + "\n" +
+           std::to_string(entry.applied_sequence_id);
+}
+
+bool ParseMasterRegistryEntry(const std::string& instance_id,
+                              const std::string& value,
+                              RedisMasterRegistryEntry& entry) {
+    std::vector<std::string> fields;
+    size_t begin = 0;
+    while (true) {
+        const auto separator = value.find('\n', begin);
+        if (separator == std::string::npos) {
+            fields.emplace_back(value.substr(begin));
+            break;
+        }
+        fields.emplace_back(value.substr(begin, separator - begin));
+        begin = separator + 1;
+    }
+    if ((fields.size() != 4 && fields.size() != 5) ||
+        (fields[3] != "0" && fields[3] != "1")) {
+        LOG(WARNING) << "Redis Master registry entry has invalid metadata"
+                     << ", instance_id=" << instance_id
+                     << ", field_count=" << fields.size()
+                     << ", snapshot_ready_field="
+                     << (fields.size() > 3 ? fields[3] : "");
+        return false;
+    }
+    uint64_t applied_sequence_id = 0;
+    if (fields.size() == 5) {
+        const auto [end, error] = std::from_chars(
+            fields[4].data(), fields[4].data() + fields[4].size(),
+            applied_sequence_id);
+        if (error != std::errc() ||
+            end != fields[4].data() + fields[4].size()) {
+            LOG(WARNING)
+                << "Redis Master registry entry has invalid applied sequence"
+                << ", instance_id=" << instance_id
+                << ", applied_sequence_id_field=" << fields[4];
+            return false;
+        }
+    }
+    entry.instance_id = instance_id;
+    entry.master_endpoint = std::move(fields[0]);
+    entry.snapshot_endpoint = std::move(fields[1]);
+    entry.role = std::move(fields[2]);
+    entry.snapshot_ready = fields[3] == "1";
+    entry.applied_sequence_id = applied_sequence_id;
+    return true;
+}
+
+}  // namespace
+
+RedisMasterRegistry::RedisMasterRegistry(std::string cluster_id,
+                                         std::string redis_endpoint,
+                                         std::string username,
+                                         std::string password, int db_index)
+    : heartbeat_key_("mooncake:{" + cluster_id + "}:masters:heartbeat"),
+      metadata_key_("mooncake:{" + cluster_id + "}:masters:metadata"),
+      redis_endpoint_(std::move(redis_endpoint)),
+      username_(std::move(username)),
+      password_(std::move(password)),
+      db_index_(db_index) {}
+
+ErrorCode RedisMasterRegistry::Refresh(const RedisMasterRegistryEntry& entry) {
+    if (entry.instance_id.empty() || entry.master_endpoint.empty()) {
+        LOG(ERROR) << "Redis Master registry refresh got invalid entry"
+                   << ", instance_id=" << entry.instance_id
+                   << ", master_endpoint=" << entry.master_endpoint
+                   << ", snapshot_endpoint=" << entry.snapshot_endpoint
+                   << ", role=" << entry.role;
+        return ErrorCode::INVALID_PARAMS;
+    }
+    std::unique_ptr<redisContext, decltype(&redisFree)> ctx(
+        RedisUtil::CreateConnection(redis_endpoint_, username_, password_,
+                                    db_index_),
+        &redisFree);
+    if (!ctx) {
+        LOG(ERROR) << "Redis Master registry refresh failed to connect"
+                   << ", instance_id=" << entry.instance_id
+                   << ", role=" << entry.role;
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count();
+    const std::string metadata = SerializeMasterRegistryEntry(entry);
+    static constexpr const char* kRefreshScript =
+        "redis.call('HSET', KEYS[2], ARGV[1], ARGV[3]); "
+        "redis.call('ZADD', KEYS[1], ARGV[2], ARGV[1]); "
+        "return 1";
+    RedisReplyPtr reply((redisReply*)redisCommand(
+        ctx.get(), "EVAL %s 2 %b %b %b %lld %b", kRefreshScript,
+        heartbeat_key_.data(), heartbeat_key_.size(), metadata_key_.data(),
+        metadata_key_.size(), entry.instance_id.data(),
+        entry.instance_id.size(), static_cast<long long>(now_ms),
+        metadata.data(), metadata.size()));
+    return reply && reply->type != REDIS_REPLY_ERROR
+               ? ErrorCode::OK
+               : ErrorCode::INTERNAL_ERROR;
+}
+
+ErrorCode RedisMasterRegistry::Remove(const std::string& instance_id) {
+    if (instance_id.empty()) {
+        LOG(ERROR) << "Redis Master registry remove got empty instance_id";
+        return ErrorCode::INVALID_PARAMS;
+    }
+    std::unique_ptr<redisContext, decltype(&redisFree)> ctx(
+        RedisUtil::CreateConnection(redis_endpoint_, username_, password_,
+                                    db_index_),
+        &redisFree);
+    if (!ctx) {
+        LOG(ERROR) << "Redis Master registry remove failed to connect"
+                   << ", instance_id=" << instance_id;
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    static constexpr const char* kRemoveScript =
+        "redis.call('ZREM', KEYS[1], ARGV[1]); "
+        "redis.call('HDEL', KEYS[2], ARGV[1]); "
+        "return 1";
+    RedisReplyPtr reply((redisReply*)redisCommand(
+        ctx.get(), "EVAL %s 2 %b %b %b", kRemoveScript, heartbeat_key_.data(),
+        heartbeat_key_.size(), metadata_key_.data(), metadata_key_.size(),
+        instance_id.data(), instance_id.size()));
+    return reply && reply->type != REDIS_REPLY_ERROR
+               ? ErrorCode::OK
+               : ErrorCode::INTERNAL_ERROR;
+}
+
+ErrorCode RedisMasterRegistry::DiscoverAlive(
+    std::chrono::seconds ttl, std::vector<RedisMasterRegistryEntry>& entries) {
+    entries.clear();
+    std::unique_ptr<redisContext, decltype(&redisFree)> ctx(
+        RedisUtil::CreateConnection(redis_endpoint_, username_, password_,
+                                    db_index_),
+        &redisFree);
+    if (!ctx) {
+        LOG(ERROR) << "Redis Master registry discover failed to connect"
+                   << ", ttl_sec=" << ttl.count();
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    const auto cutoff_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch() - ttl)
+            .count();
+    // Entries exactly at cutoff are conservatively treated as stale.
+    static constexpr const char* kDiscoverScript =
+        "local stale = redis.call('ZRANGEBYSCORE', KEYS[1], '-inf', ARGV[1]); "
+        "for _, id in ipairs(stale) do redis.call('HDEL', KEYS[2], id); end; "
+        "redis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1]); "
+        "local alive = redis.call('ZRANGEBYSCORE', KEYS[1], ARGV[1], '+inf'); "
+        "local result = {}; "
+        "for _, id in ipairs(alive) do "
+        "local metadata = redis.call('HGET', KEYS[2], id); "
+        "if metadata then table.insert(result, id); "
+        "table.insert(result, metadata); end; end; "
+        "return result";
+    RedisReplyPtr reply((redisReply*)redisCommand(
+        ctx.get(), "EVAL %s 2 %b %b %lld", kDiscoverScript,
+        heartbeat_key_.data(), heartbeat_key_.size(), metadata_key_.data(),
+        metadata_key_.size(), static_cast<long long>(cutoff_ms)));
+    if (!reply || reply->type != REDIS_REPLY_ARRAY ||
+        reply->elements % 2 != 0) {
+        LOG(ERROR) << "Redis Master registry discover got invalid Redis reply"
+                   << ", reply_type=" << (reply ? reply->type : -1)
+                   << ", element_count=" << (reply ? reply->elements : 0);
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    for (size_t i = 0; i < reply->elements; i += 2) {
+        auto* id = reply->element[i];
+        auto* metadata = reply->element[i + 1];
+        if (!id || id->type != REDIS_REPLY_STRING || !metadata ||
+            metadata->type != REDIS_REPLY_STRING) {
+            continue;
+        }
+        RedisMasterRegistryEntry entry;
+        if (ParseMasterRegistryEntry(std::string(id->str, id->len),
+                                     std::string(metadata->str, metadata->len),
+                                     entry)) {
+            entries.push_back(std::move(entry));
+        }
+    }
+    return ErrorCode::OK;
+}
+
+RedisMasterRegistryHeartbeat::RedisMasterRegistryHeartbeat(
+    std::unique_ptr<RedisMasterRegistry> registry,
+    RedisMasterRegistryEntry entry, std::chrono::seconds interval)
+    : registry_(std::move(registry)),
+      entry_(std::move(entry)),
+      interval_(interval) {}
+
+RedisMasterRegistryHeartbeat::~RedisMasterRegistryHeartbeat() { Stop(); }
+
+ErrorCode RedisMasterRegistryHeartbeat::Start() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (thread_.joinable()) {
+        return ErrorCode::OK;
+    }
+    stopping_ = false;
+    auto err = registry_->Refresh(entry_);
+    thread_ = std::thread(&RedisMasterRegistryHeartbeat::Run, this);
+    if (err == ErrorCode::OK) {
+        LOG(INFO) << "Redis Master registered"
+                  << ", instance_id=" << entry_.instance_id
+                  << ", master_endpoint=" << entry_.master_endpoint
+                  << ", snapshot_endpoint=" << entry_.snapshot_endpoint
+                  << ", role=" << entry_.role;
+    } else {
+        LOG(ERROR) << "Redis Master initial registration failed"
+                   << ", instance_id=" << entry_.instance_id
+                   << ", master_endpoint=" << entry_.master_endpoint
+                   << ", snapshot_endpoint=" << entry_.snapshot_endpoint
+                   << ", role=" << entry_.role << ", error=" << toString(err);
+    }
+    return err;
+}
+
+void RedisMasterRegistryHeartbeat::UpdateRole(std::string role,
+                                              bool snapshot_ready) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    entry_.role = std::move(role);
+    entry_.snapshot_ready = snapshot_ready;
+    refresh_requested_ = true;
+    cv_.notify_all();
+}
+
+void RedisMasterRegistryHeartbeat::SetAppliedSequenceProvider(
+    std::function<uint64_t()> provider) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    applied_sequence_provider_ = std::move(provider);
+    refresh_requested_ = true;
+    cv_.notify_all();
+    cv_.wait(lock, [this] { return provider_in_flight_ == 0; });
+}
+
+void RedisMasterRegistryHeartbeat::SetSnapshotReadyProvider(
+    std::function<bool()> provider) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    snapshot_ready_provider_ = std::move(provider);
+    refresh_requested_ = true;
+    cv_.notify_all();
+    cv_.wait(lock, [this] { return provider_in_flight_ == 0; });
+}
+
+void RedisMasterRegistryHeartbeat::Stop() {
+    std::string instance_id;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!thread_.joinable()) {
+            return;
+        }
+        stopping_ = true;
+        instance_id = entry_.instance_id;
+    }
+    cv_.notify_all();
+    thread_.join();
+    (void)registry_->Remove(instance_id);
+}
+
+void RedisMasterRegistryHeartbeat::Run() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    while (!stopping_) {
+        cv_.wait_for(lock, interval_,
+                     [this] { return stopping_ || refresh_requested_; });
+        if (stopping_) {
+            break;
+        }
+        refresh_requested_ = false;
+
+        auto entry = entry_;
+        std::function<uint64_t()> applied_sequence_provider;
+        std::function<bool()> snapshot_ready_provider;
+        if (entry.role == "standby") {
+            applied_sequence_provider = applied_sequence_provider_;
+            snapshot_ready_provider = snapshot_ready_provider_;
+        }
+        bool has_provider =
+            applied_sequence_provider || snapshot_ready_provider;
+        if (has_provider) {
+            ++provider_in_flight_;
+        }
+
+        lock.unlock();
+        if (applied_sequence_provider) {
+            entry.applied_sequence_id = applied_sequence_provider();
+        }
+        if (snapshot_ready_provider) {
+            entry.snapshot_ready = snapshot_ready_provider();
+        }
+        lock.lock();
+
+        if (has_provider) {
+            --provider_in_flight_;
+            cv_.notify_all();
+        }
+        if (stopping_) {
+            break;
+        }
+        if (refresh_requested_) {
+            continue;
+        }
+        entry_ = entry;
+
+        lock.unlock();
+        if (registry_->Refresh(entry) != ErrorCode::OK) {
+            LOG(WARNING) << "Redis Master registry heartbeat failed"
+                         << ", instance_id=" << entry.instance_id
+                         << ", role=" << entry.role;
+        }
+        lock.lock();
+    }
+}
+#endif
 
 }  // namespace mooncake
