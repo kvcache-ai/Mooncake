@@ -433,20 +433,12 @@ TEST_F(TransferTaskTest, CanUseLocalMemcpyRequiresSameProcessEndpoint) {
     std::shared_ptr<StorageBackend> storage_backend;
     TransferSubmitter submitter(engine, storage_backend, "127.0.0.1:30991");
 
-    AllocatedBuffer::Descriptor handle{};
-    handle.size_ = 4096;
-    handle.buffer_address_ = 0x1000;
-    handle.protocol_ = "tcp";
+    const auto local_endpoint = engine.getLocalIpAndPort();
+    ASSERT_FALSE(local_endpoint.empty());
+    EXPECT_TRUE(submitter.canUseLocalMemcpy(local_endpoint));
 
-    handle.transport_endpoint_ = engine.getLocalIpAndPort();
-    ASSERT_FALSE(handle.transport_endpoint_.empty());
-    EXPECT_TRUE(submitter.CanUseLocalMemcpy(handle));
-
-    handle.transport_endpoint_ = "127.0.0.1:30992";
-    EXPECT_FALSE(submitter.CanUseLocalMemcpy(handle));
-
-    handle.transport_endpoint_.clear();
-    EXPECT_FALSE(submitter.CanUseLocalMemcpy(handle));
+    EXPECT_FALSE(submitter.canUseLocalMemcpy("127.0.0.1:30992"));
+    EXPECT_FALSE(submitter.canUseLocalMemcpy(""));
 }
 
 TEST_F(TransferTaskTest, CanUseLocalMemcpyHonorsMemcpyEnv) {
@@ -460,9 +452,7 @@ TEST_F(TransferTaskTest, CanUseLocalMemcpyHonorsMemcpyEnv) {
     std::shared_ptr<StorageBackend> storage_backend;
     TransferSubmitter submitter(engine, storage_backend, "127.0.0.1:30993");
 
-    AllocatedBuffer::Descriptor handle{4096, 0x1000, "tcp",
-                                       engine.getLocalIpAndPort()};
-    EXPECT_FALSE(submitter.CanUseLocalMemcpy(handle));
+    EXPECT_FALSE(submitter.canUseLocalMemcpy(engine.getLocalIpAndPort()));
 }
 
 // Test TransferStrategy enum and stream operator
