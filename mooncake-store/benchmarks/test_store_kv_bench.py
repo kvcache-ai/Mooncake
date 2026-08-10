@@ -197,9 +197,7 @@ class StoreSessionMetadataTest(unittest.TestCase):
         )
         store = FakeStore()
         runner = bench.BenchmarkRunner(args)
-        runner._sessions = [
-            bench.StoreSession(args, 0, runner.payload_factory, store)
-        ]
+        runner._sessions = [bench.StoreSession(args, 0, runner.payload_factory, store)]
 
         phases = runner.run()
 

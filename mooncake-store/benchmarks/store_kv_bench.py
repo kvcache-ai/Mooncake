@@ -1311,9 +1311,7 @@ class BenchmarkRunner:
                 )
                 self._record(stats, time.perf_counter() - start, result, 1)
 
-        remove_phase = self._run_single_session_phase(
-            "lifecycle_remove", remove_small
-        )
+        remove_phase = self._run_single_session_phase("lifecycle_remove", remove_small)
         if remove_phase.failed_kvs:
             raise RuntimeError(
                 f"lifecycle_remove failed for {remove_phase.failed_kvs} objects"
