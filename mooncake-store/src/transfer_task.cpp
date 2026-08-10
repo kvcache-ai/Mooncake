@@ -103,6 +103,86 @@ static int CountSpdkNofQueuedTasks(const mooncake::SpdkNofTask* head) {
     return count;
 }
 
+static void nvmf_reset_sgl(void* ctx, uint32_t offset) {
+    auto* sub_task = reinterpret_cast<mooncake::SpdkNofSubTask*>(ctx);
+    if (sub_task == nullptr) {
+        return;
+    }
+
+    sub_task->cursor_valid = false;
+    sub_task->cursor_sge_index = 0;
+    sub_task->cursor_sge_offset = 0;
+    sub_task->cursor_remaining = 0;
+
+    if (sub_task->task == nullptr ||
+        static_cast<uint64_t>(offset) > sub_task->payload_size ||
+        sub_task->payload_offset > std::numeric_limits<uint64_t>::max() - static_cast<uint64_t>(offset)) {
+        return;
+    }
+
+    uint64_t skip = sub_task->payload_offset + static_cast<uint64_t>(offset);
+    const auto& sgl = sub_task->task->sgl;
+    size_t index = 0;
+
+    while (index < sgl.size()) {
+        const auto& entry = sgl[index];
+        if (skip < entry.length) {
+            sub_task->cursor_sge_index = index;
+            sub_task->cursor_sge_offset = skip;
+            sub_task->cursor_remaining = sub_task->payload_size - static_cast<uint64_t>(offset);
+            sub_task->cursor_valid = true;
+            return;
+        }
+        skip -= entry.length;
+        ++index;
+    }
+
+    if (skip == 0 &&
+        static_cast<uint64_t>(offset) == sub_task->payload_size) {
+        sub_task->cursor_sge_index = sgl.size();
+        sub_task->cursor_sge_offset = 0;
+        sub_task->cursor_remaining = 0;
+        sub_task->cursor_valid = true;
+    }
+}
+
+static int nvmf_next_sge(void* ctx, void** address, uint32_t* length) {
+    auto* sub_task = reinterpret_cast<mooncake::SpdkNofSubTask*>(ctx);
+    if (sub_task == nullptr || sub_task->task == nullptr ||
+        address == nullptr || length == nullptr ||
+        !sub_task->cursor_valid || sub_task->cursor_remaining == 0) {
+        return -EINVAL;
+    }
+
+    const auto& sgl = sub_task->task->sgl;
+    while (sub_task->cursor_sge_index < sgl.size()) {
+        const auto& entry = sgl[sub_task->cursor_sge_index];
+
+        uint64_t available = entry.length - sub_task->cursor_sge_offset;
+        available = std::min(available, sub_task->cursor_remaining);
+        constexpr uint64_t kMaxSgeLength = static_cast<uint64_t>(UINT32_MAX) & ~3ULL;
+        available = std::min(available, kMaxSgeLength);
+        if (available == 0) {
+            return -EINVAL;
+        }
+
+        const uintptr_t base = reinterpret_cast<uintptr_t>(entry.address);
+        
+        *address = reinterpret_cast<void*>(base + sub_task->cursor_sge_offset);
+        *length = static_cast<uint32_t>(available);
+
+        sub_task->cursor_sge_offset += available;
+        sub_task->cursor_remaining -= available;
+        if (sub_task->cursor_sge_offset == entry.length) {
+            ++sub_task->cursor_sge_index;
+            sub_task->cursor_sge_offset = 0;
+        }
+        return 0;
+    }
+
+    return -EINVAL;
+}
+
 static inline void SpdkNofTaskCompletion(mooncake::SpdkNofTask* task) {
     if (task->remaining_lba == 0 && task->outstanding_sub_io == 0) {
         task->state->set_completed(task->failed
@@ -145,9 +225,10 @@ static void nvmf_io_complete(void* ctx, const struct spdk_nvme_cpl* cpl) {
         task->failed = true;
     }
 
+    auto* sub_task_pool = sub_task->sub_task_pool;
+    sub_task->task = nullptr;
+    sub_task_pool->push(sub_task);
     SpdkNofTaskCompletion(task);
-
-    sub_task->sub_task_pool->push(sub_task);
 }
 #endif
 namespace mooncake {
@@ -436,19 +517,24 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                 if (task == nullptr) {
                     LOG(ERROR)
                         << "alloc SpdkNofTask failed, worker " << work_idx;
+                    task_queue.front().state->set_completed(ErrorCode::TRANSFER_FAIL);
+                    task_queue.pop();
                     continue;
                 }
 
                 SpdkNofQos* nof_qos = nullptr;
                 auto it = seg_to_qos.find(task->seg_handle);
                 if (it == seg_to_qos.end()) {
-                    auto qos = std::make_unique<SpdkNofQos>(
-                        SpdkWrapper::GetInstance().GetBlockSize(
-                            task->seg_handle));
+                    std::unique_ptr<SpdkNofQos> qos(
+                        new (std::nothrow) SpdkNofQos(
+                            SpdkWrapper::GetInstance().GetBlockSize(
+                                task->seg_handle)));
                     if (qos == nullptr) {
                         LOG(ERROR)
                             << "alloc SpdkNofQos failed, worker " << work_idx;
+                        task->state->set_completed(ErrorCode::TRANSFER_FAIL);
                         delete task;
+                        task_queue.pop();
                         continue;
                     }
                     nof_qos = qos.get();
@@ -482,16 +568,29 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                                    nof_qos->inflight_blocks[i];
                 while (nof_qos->head[i] && avail_blocks > 0) {
                     SpdkNofTask* task = nof_qos->head[i];
-                    SpdkNofSubTask* sub_task;
+
                     while (task->remaining_lba > 0 && avail_blocks > 0) {
-                        uint32_t submit_lba_count = std::min(
-                            avail_blocks, std::min(task->remaining_lba,
-                                                   nof_qos->blocks_per_chunk));
-                        int lba_off = task->lba_count - task->remaining_lba;
-                        uint64_t submit_lba = task->lba + lba_off;
-                        void* submit_ptr = reinterpret_cast<void*>(
-                            reinterpret_cast<char*>(task->ptr) +
-                            lba_off * block_size);
+                        const uint32_t submit_budget = static_cast<uint32_t>(std::min(
+                                avail_blocks, nof_qos->blocks_per_chunk));
+                        const uint32_t submit_lba_count =
+                            std::min(task->remaining_lba, submit_budget);
+                        const uint64_t lba_offset =
+                            static_cast<uint64_t>(task->lba_count - task->remaining_lba);
+                        const uint64_t submit_lba = task->lba + lba_offset;
+                        const uint64_t payload_offset = lba_offset * block_size;
+                        const uint64_t payload_size = static_cast<uint64_t>(submit_lba_count) * block_size;
+
+                        if (payload_offset > task->sgl_size ||
+                            payload_size > task->sgl_size - payload_offset) {
+                            LOG(ERROR)
+                                << "Invalid NoF SGL window"
+                                << ", payload_offset=" << payload_offset
+                                << ", payload_size=" << payload_size
+                                << ", sgl_size=" << task->sgl_size;
+                            task->failed = true;
+                            task->remaining_lba = 0;
+                            break;
+                        }
 
                         if (!CheckSubTaskPool(sub_task_pool, sub_task_chunks,
                                               work_idx)) {
@@ -499,22 +598,39 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                             task->remaining_lba = 0;
                             break;
                         }
-                        sub_task = sub_task_pool.top();
+                        SpdkNofSubTask* sub_task = sub_task_pool.top();
                         sub_task_pool.pop();
                         sub_task->task = task;
                         sub_task->submit_lba_count = submit_lba_count;
+                        sub_task->payload_offset = payload_offset;
+                        sub_task->payload_size = payload_size;
 
-                        int ret = SpdkWrapper::GetInstance().SubmitRequest(
-                            task->seg_handle, submit_ptr, submit_lba,
-                            submit_lba_count, task->op, nvmf_io_complete,
-                            sub_task);
+                        nvmf_reset_sgl(sub_task, 0);
+                        if (!sub_task->cursor_valid) {
+                            LOG(ERROR)
+                                << "Failed to initialize NoF SGL cursor";
+                            sub_task->task = nullptr;
+                            sub_task_pool.push(sub_task);
+                            task->failed = true;
+                            task->remaining_lba = 0;
+                            break;
+                        }
+
+                        const int ret = SpdkWrapper::GetInstance().SubmitSglRequest(
+                                task->seg_handle, submit_lba,
+                                submit_lba_count, task->op, nvmf_io_complete,
+                                sub_task, nvmf_reset_sgl, nvmf_next_sge);
                         if (ret != 0) {
-                            LOG(ERROR) << "work " << work_idx << ", seg "
-                                       << task->seg_handle << " submit io fail";
+                            LOG(ERROR)
+                                << "worker " << work_idx << ", seg "
+                                << task->seg_handle
+                                << " submit SGL I/O failed, ret=" << ret;
+                            sub_task->task = nullptr;
+                            sub_task_pool.push(sub_task);
                             task->failed = true;
                             task->remaining_lba = 0;
                         } else {
-                            task->idx++;
+                            
                             task->remaining_lba -= submit_lba_count;
                             nof_qos->inflight_blocks[i] += submit_lba_count;
                             avail_blocks -= submit_lba_count;
@@ -1310,8 +1426,33 @@ std::optional<TransferFuture> TransferSubmitter::submitRangeRead(
 
         future = submitMemoryReadOperation(handle, slices, src_offset);
     } else if (replica.is_nof_replica()) {
-        LOG(ERROR) << "Range read not supported for NoF replicas";
+#ifdef USE_NOF
+        void* range_ptr = slices.front().ptr;
+        if (range_ptr == nullptr) {
+            return std::nullopt;
+        }
+
+        uintptr_t expected = reinterpret_cast<uintptr_t>(range_ptr);
+        size_t range_size = 0;
+        for (const auto& slice : slices) {
+            if (slice.ptr == nullptr ||
+                reinterpret_cast<uintptr_t>(slice.ptr) != expected ||
+                slice.size > std::numeric_limits<size_t>::max() - range_size ||
+                slice.size > std::numeric_limits<uintptr_t>::max() - expected) {
+                LOG(ERROR)
+                    << "NoF range read requires contiguous slices";
+                return std::nullopt;
+            }
+            range_size += slice.size;
+            expected += slice.size;
+        }
+        future = submitSpdkNofRangeReadOperation(
+            replica.get_nof_descriptor(), range_ptr, range_size, src_offset);
+#else
+        LOG(ERROR)
+            << "NoF range read requested while USE_NOF is disabled";
         return std::nullopt;
+#endif
     } else if (replica.is_disk_replica() || replica.is_local_disk_replica()) {
         LOG(ERROR)
             << "Range read not supported for disk replicas (use full read)";
@@ -1324,43 +1465,331 @@ std::optional<TransferFuture> TransferSubmitter::submitRangeRead(
 
     return future;
 }
-
 #ifdef USE_NOF
+namespace {
+bool AppendDmaSges(void* ptr, uint64_t size,
+                   std::vector<SpdkNofSge>* sgl) {
+    if (ptr == nullptr || size == 0 || sgl == nullptr) {
+        return false;
+    }
+
+    uintptr_t cursor = reinterpret_cast<uintptr_t>(ptr);
+    uint64_t remaining = size;
+    while (remaining != 0) {
+        uint64_t contiguous = remaining;
+        void* current = reinterpret_cast<void*>(cursor);
+        const uint64_t physical_address =
+            spdk_vtophys(current, &contiguous);
+        if (physical_address == SPDK_VTOPHYS_ERROR || contiguous == 0) {
+            LOG(ERROR) << "NoF buffer is not registered for SPDK DMA"
+                       << ", address=" << current
+                       << ", remaining=" << remaining;
+            return false;
+        }
+
+        contiguous = std::min(contiguous, remaining);
+        sgl->push_back(SpdkNofSge::Data(current, contiguous));
+        if (contiguous >
+            std::numeric_limits<uintptr_t>::max() - cursor) {
+            return false;
+        }
+        cursor += contiguous;
+        remaining -= contiguous;
+    }
+    return true;
+}
+
+bool ValidateSgl(const std::vector<SpdkNofSge>& sgl,
+                 uint64_t expected_size,
+                 const SpdkSglCapabilities& capabilities) {
+    if (!capabilities.supported || sgl.empty()) {
+        return false;
+    }
+
+    uint64_t total_size = 0;
+    for (const auto& entry : sgl) {
+        if (entry.address == nullptr || entry.length == 0 ||
+            total_size >
+                std::numeric_limits<uint64_t>::max() - entry.length) {
+            return false;
+        }
+        if (capabilities.requires_dword_alignment &&
+            ((reinterpret_cast<uintptr_t>(entry.address) & 3ULL) != 0 ||
+             (entry.length & 3ULL) != 0)) {
+            return false;
+        }
+        total_size += entry.length;
+    }
+    return total_size == expected_size;
+}
+
+bool SizeToLbaCount(uint64_t physical_size, uint32_t block_size,
+                    uint32_t* lba_count) {
+    if (lba_count == nullptr || block_size == 0 || physical_size == 0 ||
+        physical_size % block_size != 0) {
+        return false;
+    }
+
+    const uint64_t count = physical_size / block_size;
+    if (count == 0 || count > std::numeric_limits<uint32_t>::max()) {
+        return false;
+    }
+    *lba_count = static_cast<uint32_t>(count);
+    return true;
+}
+
+std::shared_ptr<void> AllocateDmaOwner(size_t size, size_t alignment,
+                                       void** buffer) {
+    if (buffer == nullptr || size == 0) {
+        return {};
+    }
+
+    *buffer = SpdkWrapper::GetInstance().Alloc(size, alignment, -1);
+    if (*buffer == nullptr) {
+        return {};
+    }
+
+    return std::shared_ptr<void>(
+        *buffer, [](void* ptr) { SpdkWrapper::GetInstance().Free(ptr); });
+}
+
+} 
+
 std::optional<TransferFuture> TransferSubmitter::submitSpdkNofOperation(
     const AllocatedBuffer::Descriptor& handle, void* ptr, size_t size,
     const TransferRequest::OpCode op_code) {
-    if (handle.transport_endpoint_.empty() || handle.size_ < size) {
+    if (handle.transport_endpoint_.empty()) {
         LOG(ERROR) << "Invalid NoF request endpoint="
-                   << handle.transport_endpoint_
-                   << ", buffer_size=" << handle.size_
-                   << ", request_size=" << size;
+                   << handle.transport_endpoint_;
         return std::nullopt;
     }
 
     nof_seg_handle* seg_handle =
         SpdkWrapper::GetInstance().OpenNofSegment(handle.transport_endpoint_);
-    if (!seg_handle) {
+    if (seg_handle == nullptr) {
         LOG(ERROR) << "Failed to open NoF segment endpoint="
                    << handle.transport_endpoint_;
         return std::nullopt;
     }
 
-    uint32_t block_size = SpdkWrapper::GetInstance().GetBlockSize(seg_handle);
-    if (block_size == INVALID_BLOCK_SIZE ||
-        handle.buffer_address_ % block_size != 0 || size % block_size != 0 ||
-        reinterpret_cast<std::uintptr_t>(ptr) % block_size != 0) {
-        LOG(ERROR) << "NoF request offset=" << handle.buffer_address_
-                   << ", ptr=" << ptr << ", size=" << size
-                   << " is not aligned to block size " << block_size;
+    const uint32_t block_size =
+        SpdkWrapper::GetInstance().GetBlockSize(seg_handle);
+    if (block_size == INVALID_BLOCK_SIZE || block_size == 0 ||
+        handle.buffer_address_ % block_size != 0 ||
+        handle.size_ % block_size != 0) {
+        LOG(ERROR) << "Invalid NoF block alignment"
+                   << ", remote_address=" << handle.buffer_address_
+                   << ", allocated_size=" << handle.size_
+                   << ", block_size=" << block_size;
+        return std::nullopt;
+    }
+
+    if (static_cast<uint64_t>(size) >
+        std::numeric_limits<uint64_t>::max() - (block_size - 1ULL)) {
+        LOG(ERROR) << "NoF physical size overflow";
+        return std::nullopt;
+    }
+
+    const uint64_t physical_size =
+        ((static_cast<uint64_t>(size) + block_size - 1ULL) / block_size) *
+        block_size;
+    if (physical_size > handle.size_) {
+        LOG(ERROR) << "NoF allocation is smaller than request"
+                   << ", logical_size=" << size
+                   << ", physical_size=" << physical_size
+                   << ", allocated_size=" << handle.size_;
+        return std::nullopt;
+    }
+
+    uint32_t lba_count = 0;
+    if (!SizeToLbaCount(physical_size, block_size, &lba_count)) {
+        return std::nullopt;
+    }
+
+    SpdkSglCapabilities capabilities;
+    if (!SpdkWrapper::GetInstance().GetSglCapabilities(
+            seg_handle, &capabilities) ||
+        !capabilities.supported) {
+        LOG(ERROR) << "NVMe Controller does not support SGL";
+        return std::nullopt;
+    }
+
+    std::vector<SpdkNofSge> sgl;
+    std::vector<std::shared_ptr<void>> owners;
+    if (!AppendDmaSges(ptr, static_cast<uint64_t>(size), &sgl)) {
+        return std::nullopt;
+    }
+
+    const uint64_t padding_size =
+        physical_size - static_cast<uint64_t>(size);
+    if (padding_size != 0) {
+        void* padding_buffer = nullptr;
+        auto padding_owner =
+            AllocateDmaOwner(block_size, block_size, &padding_buffer);
+        if (!padding_owner) {
+            LOG(ERROR) << "Failed to allocate NoF padding DMA buffer";
+            return std::nullopt;
+        }
+        if (!AppendDmaSges(padding_buffer, padding_size, &sgl)) {
+            return std::nullopt;
+        }
+        owners.push_back(std::move(padding_owner));
+    }
+
+    if (!ValidateSgl(sgl, physical_size, capabilities)) {
+        LOG(ERROR) << "NoF SGL does not satisfy Controller requirements"
+                   << ", dword_required="
+                   << capabilities.requires_dword_alignment
+                   << ", logical_size=" << size
+                   << ", physical_size=" << physical_size
+                   << ", ptr=" << ptr;
         return std::nullopt;
     }
 
     auto state = std::make_shared<SpdkNofOperationState>();
-    SpdkNofTask task(seg_handle, ptr, handle.buffer_address_ / block_size,
-                     size / block_size, op_code, state);
+    SpdkNofTask task(seg_handle, std::move(sgl),
+                     handle.buffer_address_ / block_size, lba_count, op_code,
+                     state, std::move(owners));
     spdk_nvmf_pool_->submitTask(std::move(task));
+    return TransferFuture(state);
+}
 
-    VLOG(1) << "SPDK NoF transfer submitted to " << handle.transport_endpoint_;
+std::optional<TransferFuture>
+TransferSubmitter::submitSpdkNofRangeReadOperation(
+    const NoFDescriptor& descriptor, void* ptr, size_t size,
+    uint64_t src_offset) {
+    const auto& handle = descriptor.buffer_descriptor;
+    if (handle.transport_endpoint_.empty() || ptr == nullptr || size == 0) {
+        LOG(ERROR) << "Invalid NoF range-read request";
+        return std::nullopt;
+    }
+
+    if (src_offset > descriptor.object_size ||
+        static_cast<uint64_t>(size) >
+            descriptor.object_size - src_offset) {
+        LOG(ERROR) << "NoF logical range-read overflow"
+                   << ", src_offset=" << src_offset
+                   << ", size=" << size
+                   << ", object_size=" << descriptor.object_size;
+        return std::nullopt;
+    }
+
+    nof_seg_handle* seg_handle =
+        SpdkWrapper::GetInstance().OpenNofSegment(handle.transport_endpoint_);
+    if (seg_handle == nullptr) {
+        LOG(ERROR) << "Failed to open NoF segment endpoint="
+                   << handle.transport_endpoint_;
+        return std::nullopt;
+    }
+
+    const uint32_t block_size =
+        SpdkWrapper::GetInstance().GetBlockSize(seg_handle);
+    if (block_size == INVALID_BLOCK_SIZE || block_size == 0 ||
+        descriptor.block_size == 0 || descriptor.block_size != block_size ||
+        handle.buffer_address_ % block_size != 0 ||
+        handle.size_ % block_size != 0) {
+        LOG(ERROR) << "Invalid NoF range-read metadata/alignment"
+                   << ", descriptor_block_size=" << descriptor.block_size
+                   << ", namespace_block_size=" << block_size
+                   << ", remote_address=" << handle.buffer_address_
+                   << ", allocated_size=" << handle.size_;
+        return std::nullopt;
+    }
+
+    const uint64_t physical_relative_start =
+        (src_offset / block_size) * block_size;
+    const uint64_t head_discard =
+        src_offset - physical_relative_start;
+    if (static_cast<uint64_t>(size) >
+        std::numeric_limits<uint64_t>::max() - head_discard) {
+        return std::nullopt;
+    }
+
+    const uint64_t covered_size =
+        head_discard + static_cast<uint64_t>(size);
+    if (covered_size >
+        std::numeric_limits<uint64_t>::max() - (block_size - 1ULL)) {
+        return std::nullopt;
+    }
+
+    const uint64_t physical_size =
+        ((covered_size + block_size - 1ULL) / block_size) * block_size;
+    if (physical_relative_start > handle.size_ ||
+        physical_size > handle.size_ - physical_relative_start) {
+        LOG(ERROR) << "NoF physical range-read overflow";
+        return std::nullopt;
+    }
+    const uint64_t tail_discard = physical_size - covered_size;
+
+    uint32_t lba_count = 0;
+    if (!SizeToLbaCount(physical_size, block_size, &lba_count)) {
+        return std::nullopt;
+    }
+
+    SpdkSglCapabilities capabilities;
+    if (!SpdkWrapper::GetInstance().GetSglCapabilities(
+            seg_handle, &capabilities) ||
+        !capabilities.supported) {
+        LOG(ERROR) << "NVMe Controller does not support SGL";
+        return std::nullopt;
+    }
+
+    std::vector<SpdkNofSge> sgl;
+    std::vector<std::shared_ptr<void>> owners;
+    void* discard_buffer = nullptr;
+    const uint64_t discard_size = head_discard + tail_discard;
+    if (discard_size > std::numeric_limits<size_t>::max()) {
+        LOG(ERROR) << "NoF discard DMA buffer size overflows size_t";
+        return std::nullopt;
+    }
+    std::shared_ptr<void> discard_owner;
+    if (discard_size != 0) {
+        discard_owner = AllocateDmaOwner(static_cast<size_t>(discard_size), block_size, &discard_buffer);
+        if (!discard_owner) {
+            LOG(ERROR) << "Failed to allocate NoF discard DMA buffer";
+            return std::nullopt;
+        }
+    }
+
+    if (head_discard != 0 &&
+        !AppendDmaSges(discard_buffer, head_discard, &sgl)) {
+        return std::nullopt;
+    }
+    if (!AppendDmaSges(ptr, static_cast<uint64_t>(size), &sgl)) {
+        return std::nullopt;
+    }
+    if (tail_discard != 0) {
+        const uintptr_t discard_address =
+            reinterpret_cast<uintptr_t>(discard_buffer);
+        if (head_discard >
+            std::numeric_limits<uintptr_t>::max() - discard_address) {
+            LOG(ERROR) << "NoF discard DMA buffer address overflows";
+            return std::nullopt;
+        }
+        const uintptr_t tail_address =
+            discard_address + static_cast<uintptr_t>(head_discard);
+        if (!AppendDmaSges(reinterpret_cast<void*>(tail_address), tail_discard, &sgl)) {
+            return std::nullopt;
+        }
+    }
+    if (discard_owner) {
+        owners.push_back(std::move(discard_owner));
+    }
+
+    if (!ValidateSgl(sgl, physical_size, capabilities)) {
+        LOG(ERROR) << "NoF range-read SGL violates Controller requirements"
+                   << ", dword_required=" << capabilities.requires_dword_alignment
+                   << ", src_offset=" << src_offset << ", destination=" << ptr
+                   << ", size=" << size << ", head_discard=" << head_discard
+                   << ", tail_discard=" << tail_discard;
+        return std::nullopt;
+    }
+
+    const uint64_t start_lba = handle.buffer_address_ / block_size + physical_relative_start / block_size;
+    auto state = std::make_shared<SpdkNofOperationState>();
+    SpdkNofTask task(seg_handle, std::move(sgl), start_lba, lba_count,
+                     TransferRequest::READ, state, std::move(owners));
+    spdk_nvmf_pool_->submitTask(std::move(task));
     return TransferFuture(state);
 }
 #endif
@@ -1414,7 +1843,7 @@ bool TransferSubmitter::validateTransferParams(
     for (auto slice : slices) {
         all_slice_len += slice.size;
     }
-    if (handle.size_ != all_slice_len) {
+    if (handle.size_ < all_slice_len) {
         LOG(ERROR) << "handles len:" << handle.size_
                    << ", all_slice_len:" << all_slice_len;
         return false;

@@ -370,6 +370,32 @@ uint32_t SpdkWrapper::GetBlockSize(const nof_seg_handle *seg_handle) {
     return spdk_nvme_ns_get_sector_size(seg_handle->ns);
 }
 
+bool SpdkWrapper::GetSglCapabilities(
+    const nof_seg_handle *seg_handle, SpdkSglCapabilities *capabilities) {
+    if (capabilities == nullptr) {
+        return false;
+    }
+
+    *capabilities = SpdkSglCapabilities{};
+    if (seg_handle == nullptr || seg_handle->ns == nullptr) {
+        return false;
+    }
+
+    struct spdk_nvme_ctrlr *ctrlr =
+        spdk_nvme_ns_get_ctrlr(seg_handle->ns);
+    if (ctrlr == nullptr) {
+        return false;
+    }
+
+    const uint64_t flags = spdk_nvme_ctrlr_get_flags(ctrlr);
+    capabilities->supported =
+        (flags & SPDK_NVME_CTRLR_SGL_SUPPORTED) != 0;
+    capabilities->requires_dword_alignment =
+        capabilities->supported &&
+        ((flags & SPDK_NVME_CTRLR_SGL_REQUIRES_DWORD_ALIGNMENT) != 0);
+    return true;
+}
+
 int SpdkWrapper::SubmitRequest(const nof_seg_handle *seg_handle, void *ptr,
                                uint64_t lba, uint32_t lba_count, int op,
                                spdk_nvme_cmd_cb cb_fn, void *cb_ctx) {
@@ -388,6 +414,34 @@ int SpdkWrapper::SubmitRequest(const nof_seg_handle *seg_handle, void *ptr,
                                       cb_ctx, 0);
     }
     return -1;
+}
+
+int SpdkWrapper::SubmitSglRequest(
+    const nof_seg_handle *seg_handle, uint64_t lba, uint32_t lba_count,
+    int op, spdk_nvme_cmd_cb cb_fn, void *cb_ctx,
+    spdk_nvme_req_reset_sgl_cb reset_sgl_fn,
+    spdk_nvme_req_next_sge_cb next_sge_fn) {
+    if (seg_handle == nullptr || seg_handle->qpair == nullptr ||
+        seg_handle->ns == nullptr || lba_count == 0 || cb_fn == nullptr ||
+        cb_ctx == nullptr || reset_sgl_fn == nullptr ||
+        next_sge_fn == nullptr) {
+        return -EINVAL;
+    }
+
+    
+
+    if (op == kSpdkNofOpRead) {
+        return spdk_nvme_ns_cmd_readv(
+            seg_handle->ns, seg_handle->qpair, lba, lba_count, cb_fn, cb_ctx, 0,
+            reset_sgl_fn, next_sge_fn);
+    }
+    if (op == kSpdkNofOpWrite) {
+        return spdk_nvme_ns_cmd_writev(
+            seg_handle->ns, seg_handle->qpair, lba, lba_count, cb_fn, cb_ctx, 0,
+            reset_sgl_fn, next_sge_fn);
+    }
+
+    return -EINVAL;
 }
 
 SpdkWrapper::ProbeBuffer *SpdkWrapper::GetOrCreateProbeBuffer(

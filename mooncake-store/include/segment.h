@@ -82,6 +82,7 @@ inline std::ostream& operator<<(
        << ", segment.name=" << snapshot.segment.name
        << ", segment.base=" << snapshot.segment.base
        << ", segment.size=" << snapshot.segment.size
+       << ", segment.block_size=" << snapshot.segment.block_size
        << ", segment.te_endpoint=" << snapshot.segment.te_endpoint
        << ", status=" << snapshot.status << "}";
     return os;
@@ -343,8 +344,8 @@ class ScopedNoFSegmentAccess {
 class ScopedAllocatorAccess {
    public:
     explicit ScopedAllocatorAccess(const AllocatorManager& allocator_manager,
-                                   std::shared_mutex& mutex)
-        : allocator_manager_(allocator_manager), lock_(mutex) {}
+                                   std::shared_mutex& mutex, const uint32_t& block_size)
+        : allocator_manager_(allocator_manager), lock_(mutex), block_size_(block_size) {}
 
     explicit ScopedAllocatorAccess(const AllocatorManager& allocator_manager,
                                    const HostSegmentIndex& segments_by_host,
@@ -357,11 +358,13 @@ class ScopedAllocatorAccess {
 
     std::vector<std::string> GetHostOrderedSegments(
         const std::string& writer_host_id, const std::string& key) const;
-
+    
+    uint32_t getBlockSize() const {return block_size_;}
    private:
     const AllocatorManager& allocator_manager_;
     const HostSegmentIndex* segments_by_host_{nullptr};
     std::shared_lock<std::shared_mutex> lock_;
+    uint32_t block_size_{0};
 };
 
 /**
@@ -549,7 +552,7 @@ class NoFSegmentManager {
      * @return ScopedAllocatorAccess object that holds the lock
      */
     ScopedAllocatorAccess getAllocatorAccess() {
-        return ScopedAllocatorAccess(allocator_manager_, segment_mutex_);
+        return ScopedAllocatorAccess(allocator_manager_, segment_mutex_, block_size_);
     }
 
     /**
@@ -593,7 +596,7 @@ class NoFSegmentManager {
 
     std::unordered_map<std::string, UUID>
         client_by_name_;  // segment name -> client_id
-
+    uint32_t block_size_{0};
     friend class ScopedNoFSegmentAccess;
     friend class SegmentTest;
 };

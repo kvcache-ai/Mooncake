@@ -203,6 +203,7 @@ class MooncakeNoFRegister:
                             'trsvcid': int(trsvcid),  # Ensure trsvcid is integer
                             'base': 0,
                             'size': size,
+                            'block_size': block_size,
                             'master_server_address': master_server_address,
                             'metadata_server': ''
                         }
@@ -244,6 +245,7 @@ class MooncakeNoFRegister:
                     cfg["trsvcid"],
                     cfg["base"],
                     cfg["size"],
+                    cfg["block_size"],
                     cfg["master_server_address"]
                 )
 
