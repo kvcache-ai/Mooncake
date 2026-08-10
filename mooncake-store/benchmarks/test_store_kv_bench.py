@@ -169,6 +169,60 @@ class StoreSessionMetadataTest(unittest.TestCase):
         self.assertTrue(summary["ok"])
         self.assertEqual(summary["journal_records"], 5)
 
+    def test_two_size_lifecycle_writes_removes_and_reuses_store(self):
+        class FakeStore:
+            def __init__(self):
+                self.values = {}
+
+            def put(self, key, value, _config):
+                self.values[key] = value
+                return 0
+
+            def isExist(self, key):
+                return int(key in self.values)
+
+            def remove(self, key):
+                return 0 if self.values.pop(key, None) is not None else -1
+
+        args = bench.build_parser().parse_args(
+            [
+                "--scenario=two_size_lifecycle",
+                "--value-size=512",
+                "--secondary-value-size=1024",
+                "--lifecycle-small-objects=6",
+                "--lifecycle-large-objects=3",
+                "--lifecycle-remove-stride=2",
+                "--key-size=24",
+            ]
+        )
+        store = FakeStore()
+        runner = bench.BenchmarkRunner(args)
+        runner._sessions = [
+            bench.StoreSession(args, 0, runner.payload_factory, store)
+        ]
+
+        phases = runner.run()
+
+        self.assertEqual(
+            [phase.name for phase in phases],
+            [
+                "lifecycle_small_write",
+                "lifecycle_remove",
+                "lifecycle_large_write",
+            ],
+        )
+        self.assertEqual([phase.successful_kvs for phase in phases], [6, 3, 3])
+        self.assertEqual([phase.failed_kvs for phase in phases], [0, 0, 0])
+        for object_id in (0, 2, 4):
+            key = bench.make_key(args.key_prefix, args.key_size, object_id)
+            self.assertNotIn(key, store.values)
+        for object_id in (1, 3, 5):
+            key = bench.make_key(args.key_prefix, args.key_size, object_id)
+            self.assertEqual(len(store.values[key]), 512)
+        for object_id in (6, 7, 8):
+            key = bench.make_key(args.key_prefix, args.key_size, object_id)
+            self.assertEqual(len(store.values[key]), 1024)
+
 
 if __name__ == "__main__":
     unittest.main()

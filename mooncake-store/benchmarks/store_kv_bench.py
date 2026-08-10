@@ -56,6 +56,7 @@ def build_parser() -> argparse.ArgumentParser:
             "metadata_smoke",
             "mixed_metadata",
             "remove_perf",
+            "two_size_lifecycle",
             "replay",
         ],
         help="Benchmark scenario to execute.",
@@ -93,6 +94,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--key-prefix", default="kvbench")
     parser.add_argument("--key-size", type=int, default=20)
     parser.add_argument("--value-size", type=int, default=4096)
+    parser.add_argument("--secondary-value-size", type=int, default=4 * 1024 * 1024)
+    parser.add_argument("--lifecycle-small-objects", type=int, default=0)
+    parser.add_argument("--lifecycle-large-objects", type=int, default=128)
+    parser.add_argument("--lifecycle-remove-stride", type=int, default=2)
     parser.add_argument("--rand-seed", type=int, default=1)
     parser.add_argument("--put-pct", type=int, default=40)
     parser.add_argument("--get-pct", type=int, default=40)
@@ -417,6 +422,14 @@ class StoreSession:
     def close(self) -> None:
         self._zcopy = None
 
+    def _is_exist(self, key: str) -> int:
+        method = getattr(self.store, "isExist", None)
+        if method is None:
+            method = getattr(self.store, "is_exist", None)
+        if method is None:
+            raise AttributeError("Mooncake Store binding has no exist-key method")
+        return method(key)
+
     def put_ids(self, object_ids: List[int]) -> RequestResult:
         keys = [
             make_key(self.args.key_prefix, self.args.key_size, object_id)
@@ -478,7 +491,7 @@ class StoreSession:
             lengths = self._get_lengths_zcopy(keys, len(object_ids))
             for slot, (object_id, length) in enumerate(zip(object_ids, lengths)):
                 if length < 0:
-                    if self.store.isExist(keys[slot]) == 0:
+                    if self._is_exist(keys[slot]) == 0:
                         misses += 1
                         errors["MISS"] += 1
                     else:
@@ -520,7 +533,7 @@ class StoreSession:
         if operation == "put":
             payload = self.payload_factory.build(object_id)
             result_code = self.store.put(key, payload, self.config)
-            actual_present = result_code == 0 or self.store.isExist(key) == 1
+            actual_present = result_code == 0 or self._is_exist(key) == 1
             success = result_code == 0 or (expected_present and actual_present)
             bytes_processed = len(payload) if success else 0
         elif operation == "get":
@@ -537,12 +550,12 @@ class StoreSession:
                 result_code = "PRESENCE_MISMATCH"
             bytes_processed = len(payload) if actual_present else 0
         elif operation == "exist":
-            result_code = self.store.isExist(key)
+            result_code = self._is_exist(key)
             actual_present = result_code == 1
             success = result_code >= 0 and actual_present == expected_present
         elif operation == "remove":
             result_code = self.store.remove(key)
-            actual_present = self.store.isExist(key) == 1
+            actual_present = self._is_exist(key) == 1
             success = not actual_present and (result_code == 0 or not expected_present)
         else:
             raise ValueError(f"unsupported metadata operation: {operation}")
@@ -874,6 +887,8 @@ class BenchmarkRunner:
             raise ValueError("batch-size must be > 0")
         if self.args.value_size <= 0:
             raise ValueError("value-size must be > 0")
+        if self.args.secondary_value_size <= 0:
+            raise ValueError("secondary-value-size must be > 0")
         if self.args.key_size <= 0:
             raise ValueError("key-size must be > 0")
         if self.args.nr_objects <= 0:
@@ -908,6 +923,21 @@ class BenchmarkRunner:
             raise ValueError("phase-gap-file must be set when phase-gap-mode=file")
         if self.args.scenario == "mixed_rw" and self.args.runtime <= 0:
             raise ValueError("mixed_rw requires --runtime > 0")
+        if self.args.scenario == "two_size_lifecycle":
+            if self.lane_count != 1 or self.args.batch_size != 1:
+                raise ValueError(
+                    "two_size_lifecycle requires one lane and batch-size=1"
+                )
+            if self.args.io_api != "plain":
+                raise ValueError("two_size_lifecycle currently requires io-api=plain")
+            if self.args.lifecycle_small_objects <= 0:
+                raise ValueError("lifecycle-small-objects must be > 0")
+            if self.args.lifecycle_large_objects <= 0:
+                raise ValueError("lifecycle-large-objects must be > 0")
+            if self.args.lifecycle_remove_stride <= 1:
+                raise ValueError("lifecycle-remove-stride must be > 1")
+            if self.args.secondary_value_size % 512 != 0:
+                raise ValueError("secondary-value-size must be 512B aligned")
         if self._scenario_has_write() and self.args.value_size % 512 != 0:
             raise ValueError(
                 "write-involved scenarios require value-size to be 512B aligned"
@@ -923,6 +953,7 @@ class BenchmarkRunner:
             "metadata_smoke",
             "mixed_metadata",
             "remove_perf",
+            "two_size_lifecycle",
             "replay",
         }
 
@@ -1233,6 +1264,84 @@ class BenchmarkRunner:
             )
         return stats
 
+    def _run_single_session_phase(
+        self,
+        phase_name: str,
+        operation: Callable[[StoreSession, PhaseStats], None],
+        session: Optional[StoreSession] = None,
+    ) -> PhaseStats:
+        active_session = session or self._make_sessions()[0]
+        stats = PhaseStats(name=phase_name)
+        stats.start_time = time.perf_counter()
+        operation(active_session, stats)
+        stats.end_time = time.perf_counter()
+        log_phase_stats(stats)
+        return stats
+
+    def _two_size_lifecycle(self) -> List[PhaseStats]:
+        small_count = self.args.lifecycle_small_objects
+        large_count = self.args.lifecycle_large_objects
+        object_id_start = self.args.object_id_start
+
+        def write_small(session: StoreSession, stats: PhaseStats) -> None:
+            for object_id in range(object_id_start, object_id_start + small_count):
+                start = time.perf_counter()
+                result = session.put_ids([object_id])
+                self._record(stats, time.perf_counter() - start, result, 1)
+
+        small_write = self._run_single_session_phase(
+            "lifecycle_small_write", write_small
+        )
+        if small_write.failed_kvs or small_write.successful_kvs != small_count:
+            raise RuntimeError(
+                "lifecycle_small_write must fill the intended baseline before "
+                f"fragmentation: success={small_write.successful_kvs}, "
+                f"failed={small_write.failed_kvs}"
+            )
+
+        def remove_small(session: StoreSession, stats: PhaseStats) -> None:
+            for object_id in range(
+                object_id_start,
+                object_id_start + small_count,
+                self.args.lifecycle_remove_stride,
+            ):
+                start = time.perf_counter()
+                result, _actual_present, _result_code = session.metadata_operation(
+                    "remove", object_id, True
+                )
+                self._record(stats, time.perf_counter() - start, result, 1)
+
+        remove_phase = self._run_single_session_phase(
+            "lifecycle_remove", remove_small
+        )
+        if remove_phase.failed_kvs:
+            raise RuntimeError(
+                f"lifecycle_remove failed for {remove_phase.failed_kvs} objects"
+            )
+
+        large_args = argparse.Namespace(**vars(self.args))
+        large_args.value_size = self.args.secondary_value_size
+        large_factory = PayloadFactory(large_args.value_size, self.pattern)
+        small_session = self._make_sessions()[0]
+        large_session = StoreSession(
+            large_args, small_session.lane_id, large_factory, small_session.store
+        )
+        large_start = object_id_start + small_count
+
+        def write_large(session: StoreSession, stats: PhaseStats) -> None:
+            for object_id in range(large_start, large_start + large_count):
+                start = time.perf_counter()
+                result = session.put_ids([object_id])
+                self._record(stats, time.perf_counter() - start, result, 1)
+
+        try:
+            large_write = self._run_single_session_phase(
+                "lifecycle_large_write", write_large, large_session
+            )
+        finally:
+            large_session.close()
+        return [small_write, remove_phase, large_write]
+
     def _run_time_based_write(self, phase_name: str, total_objects: int) -> PhaseStats:
         deadline = time.time() + self.args.runtime
         write_upper = self.dataset.next_write_id + total_objects
@@ -1457,6 +1566,9 @@ class BenchmarkRunner:
             )
             phases.append(self._remove_prepared())
             return phases
+
+        if self.args.scenario == "two_size_lifecycle":
+            return self._two_size_lifecycle()
 
         if self.args.scenario == "replay":
             phases.append(self._replay())
