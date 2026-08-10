@@ -10,6 +10,7 @@
 #include <ylt/util/tl/expected.hpp>
 
 #include "allocator.h"  // Contains BufferAllocator declaration
+#include "master_metric_manager.h"
 #include "replica.h"
 #include "types.h"
 #include "random.h"
@@ -524,23 +525,29 @@ class FreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
 
         // --- Fallback: Random allocation for any remaining replicas ---
         size_t fallback_idx = randomIndex(names.size());
-        const size_t max_retry = std::min(kMaxRetryLimit, names.size());
-        const size_t max_scan = std::min(kMaxFallbackScanLimit, names.size());
-        const bool retry_budget_truncates_search = max_retry < names.size();
-        size_t scan_count = 0;
-        size_t retry_budget_used = 0;
+        const size_t max_chargeable_positions =
+            std::min(kMaxChargeablePositions, names.size());
+        const size_t max_positions_scanned =
+            std::min(kMaxPositionsScanned, names.size());
+        const bool chargeable_budget_truncates_search =
+            max_chargeable_positions < names.size();
+        size_t positions_scanned = 0;
+        size_t chargeable_positions = 0;
+        FitAwareRequestStats fit_aware_stats;
 
-        while (replicas.size() < replica_num && scan_count < max_scan &&
-               retry_budget_used < max_retry) {
+        while (replicas.size() < replica_num &&
+               positions_scanned < max_positions_scanned &&
+               chargeable_positions < max_chargeable_positions) {
             auto index = fallback_idx % names.size();
             fallback_idx++;
-            scan_count++;
+            positions_scanned++;
 
-            // Preserve the legacy position budget for excluded and used
-            // segments. Only a proven no-fit hint earns an extra scan.
+            // The legacy retry counter advanced for every visited position,
+            // including excluded and already-used segments. Preserve that
+            // behavior; only a proven no-fit candidate earns a budget credit.
             if (excluded_segments.contains(names[index]) ||
                 used_segments.contains(names[index])) {
-                retry_budget_used++;
+                chargeable_positions++;
                 continue;
             }
 
@@ -548,23 +555,47 @@ class FreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
             // not spend the bounded fallback retry budget on a segment
             // whose conservative hints prove that no allocator can fit it.
             // Unknown or stale-high hints fail open to the allocator.
-            if (retry_budget_truncates_search && allocation_failed &&
-                segmentDefinitelyCannotFit(allocator_manager, names[index],
-                                           slice_length)) {
-                continue;
+            const bool fit_aware_active =
+                chargeable_budget_truncates_search && allocation_failed;
+            if (fit_aware_active) {
+                fit_aware_stats.activated = true;
+                fit_aware_stats.eligible_candidates_checked++;
+                if (segmentDefinitelyCannotFit(allocator_manager, names[index],
+                                               slice_length)) {
+                    fit_aware_stats.no_fit_budget_credits++;
+                    continue;
+                }
             }
 
-            retry_budget_used++;
+            chargeable_positions++;
+            if (fit_aware_active) {
+                fit_aware_stats.segment_allocate_calls++;
+            }
             auto buffer =
                 allocateSingle(allocator_manager, names[index], slice_length);
             if (buffer) {
                 replicas.emplace_back(std::move(buffer),
                                       ReplicaStatus::PROCESSING, replica_type);
                 used_segments.insert(names[index]);
+                if (fit_aware_active &&
+                    fit_aware_stats.no_fit_budget_credits > 0 &&
+                    positions_scanned > max_chargeable_positions) {
+                    fit_aware_stats.recovered_allocations++;
+                }
             } else {
                 allocation_failed = true;
             }
         }
+
+        if (fit_aware_stats.activated && replicas.size() < replica_num) {
+            if (positions_scanned >= max_positions_scanned) {
+                fit_aware_stats.scan_cap_exhausted = true;
+            } else if (chargeable_positions >= max_chargeable_positions) {
+                fit_aware_stats.chargeable_budget_exhausted = true;
+            }
+        }
+        recordFitAwareMetrics(fit_aware_stats, positions_scanned,
+                              chargeable_positions);
 
         if (replicas.empty()) {
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
@@ -573,9 +604,58 @@ class FreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
     }
 
    private:
-    static constexpr size_t kMaxRetryLimit = 100;
-    static constexpr size_t kMaxFallbackScanLimit = 2 * kMaxRetryLimit;
+    // A chargeable position is one that would have advanced the legacy retry
+    // counter. Fit-Aware only refunds positions proven unable to fit.
+    static constexpr size_t kMaxChargeablePositions = 100;
+    static constexpr size_t kMaxPositionsScanned = 2 * kMaxChargeablePositions;
     static constexpr size_t kCandidateMultiplier = 6;
+
+    struct FitAwareRequestStats {
+        int64_t eligible_candidates_checked = 0;
+        int64_t no_fit_budget_credits = 0;
+        int64_t segment_allocate_calls = 0;
+        int64_t recovered_allocations = 0;
+        bool activated = false;
+        bool chargeable_budget_exhausted = false;
+        bool scan_cap_exhausted = false;
+    };
+
+    void recordFitAwareMetrics(const FitAwareRequestStats& stats,
+                               size_t positions_scanned,
+                               size_t chargeable_positions) const {
+        if (!stats.activated) {
+            return;
+        }
+
+        // Flush once per request instead of issuing an atomic metric update for
+        // every scanned candidate on the latency-sensitive allocation path.
+        auto& metrics = MasterMetricManager::instance();
+        metrics.inc_fit_aware_fallback_requests();
+        metrics.inc_fit_aware_eligible_candidates_checked(
+            stats.eligible_candidates_checked);
+        if (stats.no_fit_budget_credits > 0) {
+            metrics.inc_fit_aware_no_fit_budget_credits(
+                stats.no_fit_budget_credits);
+        }
+        if (stats.segment_allocate_calls > 0) {
+            metrics.inc_fit_aware_segment_allocate_calls(
+                stats.segment_allocate_calls);
+        }
+        if (stats.recovered_allocations > 0) {
+            metrics.inc_fit_aware_recovered_allocations(
+                stats.recovered_allocations);
+        }
+        if (stats.chargeable_budget_exhausted) {
+            metrics.inc_fit_aware_chargeable_budget_exhaustions();
+        }
+        if (stats.scan_cap_exhausted) {
+            metrics.inc_fit_aware_scan_cap_exhaustions();
+        }
+        metrics.observe_fit_aware_positions_scanned(positions_scanned);
+        metrics.observe_fit_aware_chargeable_positions(chargeable_positions);
+        metrics.observe_fit_aware_no_fit_budget_credits(
+            stats.no_fit_budget_credits);
+    }
 
     bool segmentDefinitelyCannotFit(const AllocatorManager& allocator_manager,
                                     const std::string& name,

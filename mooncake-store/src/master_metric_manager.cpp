@@ -75,6 +75,48 @@ MasterMetricManager::MasterMetricManager()
           "master_put_start_partial_allocations_total",
           "Total number of PutStart requests that succeeded with fewer "
           "replicas than requested (best-effort degradation)"),
+      fit_aware_fallback_requests_(
+          "master_fit_aware_fallback_requests_total",
+          "Total number of FreeRatioFirst fallback requests that activated "
+          "fit-aware budget preservation"),
+      fit_aware_eligible_candidates_checked_(
+          "master_fit_aware_eligible_candidates_checked_total",
+          "Total number of eligible fallback candidates checked by the "
+          "fit-aware guard"),
+      fit_aware_no_fit_budget_credits_(
+          "master_fit_aware_no_fit_budget_credits_total",
+          "Total number of chargeable-position budget credits earned from "
+          "candidates proven unable to fit"),
+      fit_aware_segment_allocate_calls_(
+          "master_fit_aware_segment_allocate_calls_total",
+          "Total number of segment-level allocateSingle calls made while "
+          "fit-aware fallback was active"),
+      fit_aware_recovered_allocations_(
+          "master_fit_aware_recovered_allocations_total",
+          "Total number of allocations recovered beyond the legacy fallback "
+          "position budget"),
+      fit_aware_chargeable_budget_exhaustions_(
+          "master_fit_aware_chargeable_budget_exhaustions_total",
+          "Total number of fit-aware fallback requests stopped by the "
+          "chargeable-position budget"),
+      fit_aware_scan_cap_exhaustions_(
+          "master_fit_aware_scan_cap_exhaustions_total",
+          "Total number of fit-aware fallback requests stopped by the "
+          "physical scan cap"),
+      fit_aware_positions_scanned_(
+          "master_fit_aware_positions_scanned",
+          "Physical fallback positions scanned per activated fit-aware "
+          "request",
+          {1, 5, 10, 25, 50, 75, 100, 125, 150, 175, 200}),
+      fit_aware_chargeable_positions_(
+          "master_fit_aware_chargeable_positions",
+          "Chargeable fallback positions consumed per activated fit-aware "
+          "request",
+          {1, 5, 10, 25, 50, 75, 100}),
+      fit_aware_no_fit_budget_credits_distribution_(
+          "master_fit_aware_no_fit_budget_credits",
+          "No-fit budget credits earned per activated fit-aware request",
+          {0, 1, 5, 10, 25, 50, 75, 100, 125, 150, 175, 200}),
       put_end_requests_("master_put_end_requests_total",
                         "Total number of PutEnd requests received"),
       put_end_failures_("master_put_end_failures_total",
@@ -518,6 +560,16 @@ void MasterMetricManager::update_metrics_for_zero_output() {
     put_start_failures_.inc(0);
     put_start_alloc_failures_.inc(0);
     put_start_partial_allocations_.inc(0);
+    fit_aware_fallback_requests_.inc(0);
+    fit_aware_eligible_candidates_checked_.inc(0);
+    fit_aware_no_fit_budget_credits_.inc(0);
+    fit_aware_segment_allocate_calls_.inc(0);
+    fit_aware_recovered_allocations_.inc(0);
+    fit_aware_chargeable_budget_exhaustions_.inc(0);
+    fit_aware_scan_cap_exhaustions_.inc(0);
+    fit_aware_positions_scanned_.observe(0);
+    fit_aware_chargeable_positions_.observe(0);
+    fit_aware_no_fit_budget_credits_distribution_.observe(0);
     put_end_requests_.inc(0);
     put_end_failures_.inc(0);
     put_revoke_requests_.inc(0);
@@ -943,6 +995,38 @@ void MasterMetricManager::inc_put_start_alloc_failures(int64_t val) {
 void MasterMetricManager::inc_put_start_partial_allocations(int64_t val) {
     put_start_partial_allocations_.inc(val);
 }
+void MasterMetricManager::inc_fit_aware_fallback_requests(int64_t val) {
+    fit_aware_fallback_requests_.inc(val);
+}
+void MasterMetricManager::inc_fit_aware_eligible_candidates_checked(
+    int64_t val) {
+    fit_aware_eligible_candidates_checked_.inc(val);
+}
+void MasterMetricManager::inc_fit_aware_no_fit_budget_credits(int64_t val) {
+    fit_aware_no_fit_budget_credits_.inc(val);
+}
+void MasterMetricManager::inc_fit_aware_segment_allocate_calls(int64_t val) {
+    fit_aware_segment_allocate_calls_.inc(val);
+}
+void MasterMetricManager::inc_fit_aware_recovered_allocations(int64_t val) {
+    fit_aware_recovered_allocations_.inc(val);
+}
+void MasterMetricManager::inc_fit_aware_chargeable_budget_exhaustions(
+    int64_t val) {
+    fit_aware_chargeable_budget_exhaustions_.inc(val);
+}
+void MasterMetricManager::inc_fit_aware_scan_cap_exhaustions(int64_t val) {
+    fit_aware_scan_cap_exhaustions_.inc(val);
+}
+void MasterMetricManager::observe_fit_aware_positions_scanned(int64_t val) {
+    fit_aware_positions_scanned_.observe(val);
+}
+void MasterMetricManager::observe_fit_aware_chargeable_positions(int64_t val) {
+    fit_aware_chargeable_positions_.observe(val);
+}
+void MasterMetricManager::observe_fit_aware_no_fit_budget_credits(int64_t val) {
+    fit_aware_no_fit_budget_credits_distribution_.observe(val);
+}
 void MasterMetricManager::inc_put_end_requests(int64_t val) {
     put_end_requests_.inc(val);
 }
@@ -1247,6 +1331,34 @@ int64_t MasterMetricManager::get_put_start_alloc_failures() {
 
 int64_t MasterMetricManager::get_put_start_partial_allocations() {
     return put_start_partial_allocations_.value();
+}
+
+int64_t MasterMetricManager::get_fit_aware_fallback_requests() {
+    return fit_aware_fallback_requests_.value();
+}
+
+int64_t MasterMetricManager::get_fit_aware_eligible_candidates_checked() {
+    return fit_aware_eligible_candidates_checked_.value();
+}
+
+int64_t MasterMetricManager::get_fit_aware_no_fit_budget_credits() {
+    return fit_aware_no_fit_budget_credits_.value();
+}
+
+int64_t MasterMetricManager::get_fit_aware_segment_allocate_calls() {
+    return fit_aware_segment_allocate_calls_.value();
+}
+
+int64_t MasterMetricManager::get_fit_aware_recovered_allocations() {
+    return fit_aware_recovered_allocations_.value();
+}
+
+int64_t MasterMetricManager::get_fit_aware_chargeable_budget_exhaustions() {
+    return fit_aware_chargeable_budget_exhaustions_.value();
+}
+
+int64_t MasterMetricManager::get_fit_aware_scan_cap_exhaustions() {
+    return fit_aware_scan_cap_exhaustions_.value();
 }
 
 int64_t MasterMetricManager::get_put_end_requests() {
@@ -1823,6 +1935,16 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(put_start_failures_);
     serialize_metric(put_start_alloc_failures_);
     serialize_metric(put_start_partial_allocations_);
+    serialize_metric(fit_aware_fallback_requests_);
+    serialize_metric(fit_aware_eligible_candidates_checked_);
+    serialize_metric(fit_aware_no_fit_budget_credits_);
+    serialize_metric(fit_aware_segment_allocate_calls_);
+    serialize_metric(fit_aware_recovered_allocations_);
+    serialize_metric(fit_aware_chargeable_budget_exhaustions_);
+    serialize_metric(fit_aware_scan_cap_exhaustions_);
+    serialize_metric(fit_aware_positions_scanned_);
+    serialize_metric(fit_aware_chargeable_positions_);
+    serialize_metric(fit_aware_no_fit_budget_credits_distribution_);
     serialize_metric(put_end_requests_);
     serialize_metric(put_end_failures_);
     serialize_metric(put_revoke_requests_);

@@ -801,6 +801,14 @@ TEST_F(AllocationStrategyTest,
 
     ScopedRandomSeed seed(kSeed);
     FreeRatioFirstAllocationStrategy strategy;
+    auto& metrics = MasterMetricManager::instance();
+    const auto requests_before = metrics.get_fit_aware_fallback_requests();
+    const auto checked_before =
+        metrics.get_fit_aware_eligible_candidates_checked();
+    const auto credits_before = metrics.get_fit_aware_no_fit_budget_credits();
+    const auto segment_calls_before =
+        metrics.get_fit_aware_segment_allocate_calls();
+    const auto recovered_before = metrics.get_fit_aware_recovered_allocations();
     auto result = strategy.Allocate(allocator_manager, kRequestSize);
 
     ASSERT_TRUE(result.has_value());
@@ -812,6 +820,17 @@ TEST_F(AllocationStrategyTest,
                             return total + allocator->allocationCalls();
                         });
     EXPECT_EQ(total_calls, 7);
+    EXPECT_EQ(metrics.get_fit_aware_fallback_requests() - requests_before, 1);
+    EXPECT_EQ(
+        metrics.get_fit_aware_eligible_candidates_checked() - checked_before,
+        fit_offset + 1);
+    EXPECT_EQ(metrics.get_fit_aware_no_fit_budget_credits() - credits_before,
+              fit_offset);
+    EXPECT_EQ(
+        metrics.get_fit_aware_segment_allocate_calls() - segment_calls_before,
+        1);
+    EXPECT_EQ(metrics.get_fit_aware_recovered_allocations() - recovered_before,
+              1);
 }
 
 TEST_F(AllocationStrategyTest,
@@ -852,6 +871,15 @@ TEST_F(AllocationStrategyTest,
 
     ScopedRandomSeed seed(kSeed);
     FreeRatioFirstAllocationStrategy strategy;
+    auto& metrics = MasterMetricManager::instance();
+    const auto requests_before = metrics.get_fit_aware_fallback_requests();
+    const auto checked_before =
+        metrics.get_fit_aware_eligible_candidates_checked();
+    const auto credits_before = metrics.get_fit_aware_no_fit_budget_credits();
+    const auto segment_calls_before =
+        metrics.get_fit_aware_segment_allocate_calls();
+    const auto chargeable_exhaustions_before =
+        metrics.get_fit_aware_chargeable_budget_exhaustions();
     auto result = strategy.Allocate(allocator_manager, kRequestSize);
 
     ASSERT_FALSE(result.has_value());
@@ -863,6 +891,18 @@ TEST_F(AllocationStrategyTest,
                             return total + allocator->allocationCalls();
                         });
     EXPECT_EQ(total_calls, 106);
+    EXPECT_EQ(metrics.get_fit_aware_fallback_requests() - requests_before, 1);
+    EXPECT_EQ(
+        metrics.get_fit_aware_eligible_candidates_checked() - checked_before,
+        100);
+    EXPECT_EQ(metrics.get_fit_aware_no_fit_budget_credits() - credits_before,
+              0);
+    EXPECT_EQ(
+        metrics.get_fit_aware_segment_allocate_calls() - segment_calls_before,
+        100);
+    EXPECT_EQ(metrics.get_fit_aware_chargeable_budget_exhaustions() -
+                  chargeable_exhaustions_before,
+              1);
 }
 
 TEST_F(AllocationStrategyTest,
@@ -882,6 +922,8 @@ TEST_F(AllocationStrategyTest,
 
     ScopedRandomSeed seed(0x5A11C1A5);
     FreeRatioFirstAllocationStrategy strategy;
+    auto& metrics = MasterMetricManager::instance();
+    const auto requests_before = metrics.get_fit_aware_fallback_requests();
     auto result = strategy.Allocate(allocator_manager, kRequestSize);
 
     ASSERT_FALSE(result.has_value());
@@ -891,6 +933,82 @@ TEST_F(AllocationStrategyTest,
                             return total + allocator->hintQueries();
                         });
     EXPECT_EQ(total_hint_queries, 0);
+    EXPECT_EQ(metrics.get_fit_aware_fallback_requests() - requests_before, 0);
+}
+
+TEST_F(AllocationStrategyTest,
+       FreeRatioFirstReportsFitAwareScanLimitExhaustion) {
+    constexpr size_t kSegmentCount = 256;
+    constexpr size_t kRequestSize = 4096;
+
+    AllocatorManager allocator_manager;
+    for (size_t i = 0; i < kSegmentCount; ++i) {
+        const std::string name = "scan-limit-segment-" + std::to_string(i);
+        allocator_manager.addAllocator(
+            name, std::make_shared<HintTestAllocator>(name, 0, false));
+    }
+
+    auto& metrics = MasterMetricManager::instance();
+    const auto requests_before = metrics.get_fit_aware_fallback_requests();
+    const auto checked_before =
+        metrics.get_fit_aware_eligible_candidates_checked();
+    const auto credits_before = metrics.get_fit_aware_no_fit_budget_credits();
+    const auto scan_exhaustions_before =
+        metrics.get_fit_aware_scan_cap_exhaustions();
+
+    ScopedRandomSeed seed(0x5CA11E17);
+    FreeRatioFirstAllocationStrategy strategy;
+    auto result = strategy.Allocate(allocator_manager, kRequestSize);
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_EQ(metrics.get_fit_aware_fallback_requests() - requests_before, 1);
+    EXPECT_EQ(
+        metrics.get_fit_aware_eligible_candidates_checked() - checked_before,
+        200);
+    EXPECT_EQ(metrics.get_fit_aware_no_fit_budget_credits() - credits_before,
+              200);
+    EXPECT_EQ(
+        metrics.get_fit_aware_scan_cap_exhaustions() - scan_exhaustions_before,
+        1);
+}
+
+TEST_F(AllocationStrategyTest,
+       FreeRatioFirstReportsSegmentCallsNotBottomAllocatorCalls) {
+    constexpr size_t kSegmentCount = 128;
+    constexpr size_t kRequestSize = 4096;
+
+    AllocatorManager allocator_manager;
+    std::vector<std::shared_ptr<HintTestAllocator>> allocators;
+    allocators.reserve(2 * kSegmentCount);
+    for (size_t i = 0; i < kSegmentCount; ++i) {
+        const std::string name = "multi-allocator-segment-" + std::to_string(i);
+        for (size_t j = 0; j < 2; ++j) {
+            auto allocator = std::make_shared<HintTestAllocator>(
+                name, kAllocatorUnknownFreeSpace, false);
+            allocator_manager.addAllocator(name, allocator);
+            allocators.push_back(std::move(allocator));
+        }
+    }
+
+    auto& metrics = MasterMetricManager::instance();
+    const auto segment_calls_before =
+        metrics.get_fit_aware_segment_allocate_calls();
+
+    ScopedRandomSeed seed(0xA110CA7E);
+    FreeRatioFirstAllocationStrategy strategy;
+    auto result = strategy.Allocate(allocator_manager, kRequestSize);
+
+    ASSERT_FALSE(result.has_value());
+    const size_t bottom_allocator_calls =
+        std::accumulate(allocators.begin(), allocators.end(), size_t{0},
+                        [](size_t total, const auto& allocator) {
+                            return total + allocator->allocationCalls();
+                        });
+    EXPECT_EQ(bottom_allocator_calls, 212);
+    EXPECT_EQ(
+        metrics.get_fit_aware_segment_allocate_calls() - segment_calls_before,
+        100);
 }
 
 TEST_F(AllocationStrategyTest,
