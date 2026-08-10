@@ -56,7 +56,7 @@
                 .expect("active segment should remain open");
             assert!(segment
                 .deleted_extents
-                .contains(&(decoded.offset, decoded.record_len)));
+                .contains(&deleted_record_extent(&decoded)));
         }
         assert_eq!(
             std::fs::metadata(&journal_path)
