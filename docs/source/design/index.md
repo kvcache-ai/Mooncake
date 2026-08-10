@@ -30,7 +30,7 @@ distributed execution components.
 
 | Document | Description |
 |----------|-------------|
-| [Mooncake Backend (PG)](mooncake-backend-pg) | Fault-tolerant PyTorch process-group backend. |
+| [Mooncake PG](mooncake-backend-pg) | Elastic PyTorch process group. |
 | [Mooncake EP](mooncake-ep) | Expert-parallel communication and recovery. |
 | [TENT](tent/overview) | Next-generation transfer engine design. |
 | [TENT Benchmark](tent/tebench) | TENT benchmark framework and methodology. |
