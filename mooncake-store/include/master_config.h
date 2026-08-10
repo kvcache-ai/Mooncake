@@ -30,6 +30,7 @@ inline std::string ResolveConfiguredHABackendConnstring(
 struct MasterConfig {
     bool enable_metric_reporting;
     uint32_t metrics_port;
+    std::string metrics_host;
     uint32_t rpc_port;
     uint32_t rpc_thread_num;
     std::string rpc_address;
@@ -182,6 +183,7 @@ class MasterServiceSupervisorConfig {
 
     // Parameters with default values (optional parameters)
     std::string rpc_address = "0.0.0.0";
+    std::string metrics_host = "0.0.0.0";
     std::chrono::steady_clock::duration rpc_conn_timeout = std::chrono::seconds(
         0);  // Client connection timeout. 0 = no timeout (infinite)
     bool rpc_enable_tcp_no_delay = true;
@@ -269,6 +271,7 @@ class MasterServiceSupervisorConfig {
         // Set required parameters using RequiredParam
         enable_metric_reporting = config.enable_metric_reporting;
         metrics_port = static_cast<int>(config.metrics_port);
+        metrics_host = config.metrics_host;
         default_kv_lease_ttl = config.default_kv_lease_ttl;
         default_kv_soft_pin_ttl = config.default_kv_soft_pin_ttl;
         allow_evict_soft_pinned_objects =
