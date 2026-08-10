@@ -237,9 +237,9 @@ void ControlService::setBootstrapRdmaCallback(
         return;
     }
     bootstrap_callback_ = nullptr;
-    if (!bootstrap_cb_cv_.wait_for(
-            guard, callback_drain_timeout_,
-            [this] { return bootstrap_callbacks_in_flight_ == 0; })) {
+    if (!bootstrap_cb_cv_.wait_for(guard, callback_drain_timeout_, [this] {
+            return bootstrap_callbacks_in_flight_ == 0;
+        })) {
         LOG(ERROR)
             << "Timed out waiting for BootstrapRdma callbacks to drain, "
             << "in_flight=" << bootstrap_callbacks_in_flight_
@@ -256,9 +256,9 @@ void ControlService::setNotifyCallback(const OnNotify& callback) {
         return;
     }
     notify_callback_ = nullptr;
-    if (!notify_cb_cv_.wait_for(
-            guard, callback_drain_timeout_,
-            [this] { return notify_callbacks_in_flight_ == 0; })) {
+    if (!notify_cb_cv_.wait_for(guard, callback_drain_timeout_, [this] {
+            return notify_callbacks_in_flight_ == 0;
+        })) {
         LOG(ERROR) << "Timed out waiting for Notify callbacks to drain, "
                    << "in_flight=" << notify_callbacks_in_flight_
                    << ", timeout_ms=" << callback_drain_timeout_.count()
