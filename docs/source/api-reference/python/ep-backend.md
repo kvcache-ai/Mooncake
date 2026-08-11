@@ -1,14 +1,13 @@
-# Mooncake EP & Mooncake Backend (PG)
+# Mooncake EP & Mooncake PG
 
 ## Overview
 
 Mooncake provides two closely related components for fault-tolerant MoE
 inference:
 
-- **Mooncake Backend (PG)** is a `torch.distributed` ProcessGroup backend. It
-  registers the `mooncake` accelerator backend and the `mooncake-cpu` backend,
-  implements common collective and point-to-point APIs, tracks active ranks, and
-  exposes elastic recovery helpers.
+- **Mooncake PG** is a `torch.distributed` ProcessGroup backend. It registers
+  the `mooncake` accelerator backend and the `mooncake-cpu` backend, implements
+  collective and point-to-point APIs, and exposes dynamic-membership helpers.
 - **Mooncake EP** is an expert-parallel dispatch/combine runtime for
   latency-sensitive MoE inference. It follows the DeepEP low-latency programming
   model while adding rank activeness awareness and Mooncake transport support.
@@ -17,8 +16,9 @@ The usual integration pattern is to initialize a Mooncake process group first,
 then construct a Mooncake EP `Buffer` from that group. The process group is used
 both for regular collectives and for exchanging EP bootstrap metadata.
 
-For implementation details, see the [Mooncake Backend (PG) design guide](../../design/mooncake-backend-pg.md)
-and the [Mooncake EP design guide](../../design/mooncake-ep.md).
+For implementation details, see the
+[Mooncake PG design guide](../../design/mooncake-backend-pg.md) and the
+[Mooncake EP design guide](../../design/mooncake-ep.md).
 
 ## Installation and build notes
 
@@ -35,7 +35,7 @@ match the active `torch.__version__`. If the current PyTorch version does not
 match a built extension, import will fail with a message such as
 `Mooncake PG was not built against torch==...`.
 
-## Mooncake Backend (PG) quick start
+## Mooncake PG quick start
 
 ### CUDA backend
 
@@ -54,14 +54,10 @@ local_rank = int(os.environ.get("LOCAL_RANK", rank))
 torch.cuda.set_device(local_rank)
 device = torch.device("cuda", local_rank)
 
-# Backend-level active-rank mask. Use int32 and place it on the backend device.
-active_ranks = torch.ones(world_size, dtype=torch.int32, device=device)
-
 dist.init_process_group(
     backend="mooncake",
     rank=rank,
     world_size=world_size,
-    pg_options=pg.MooncakeBackendOptions(active_ranks),
 )
 
 x = torch.tensor([rank + 1], dtype=torch.int32, device=device)
@@ -77,17 +73,19 @@ torchrun --nproc-per-node=2 pg_quickstart.py
 
 ### CPU backend
 
-Use `backend="mooncake-cpu"` and put `active_ranks` on CPU:
+Use `backend="mooncake-cpu"`:
 
 ```python
-active_ranks = torch.ones(world_size, dtype=torch.int32)
 dist.init_process_group(
     backend="mooncake-cpu",
     rank=rank,
     world_size=world_size,
-    pg_options=pg.MooncakeBackendOptions(active_ranks),
 )
 ```
+
+`pg_options` is optional for a fixed-size group using the default failure
+handling. Pass `MooncakeBackendOptions` when reserving additional group
+capacity, joining as an extension, or selecting a non-default failure mode.
 
 ### Selecting network devices
 
@@ -103,27 +101,38 @@ pg.set_device_filter(["mlx5_1", "mlx5_2"])
 For test and benchmark commands, the same setting is commonly passed through
 `MOONCAKE_PGTEST_DEVICE_FILTERS=mlx5_1,mlx5_2`.
 
-## Mooncake Backend (PG) API reference
+## Mooncake PG Torch API reference
 
 ### `MooncakeBackendOptions`
 
 ```python
+pg.MooncakeBackendOptions(max_group_size)
+pg.MooncakeBackendOptions(max_group_size, is_extension)
+pg.MooncakeBackendOptions(
+    max_group_size,
+    is_extension,
+    auto_deactivate_on_failure,
+    auto_sync_on_failure,
+)
+
+# Explicit active-rank mirror overloads
 pg.MooncakeBackendOptions(active_ranks)
 pg.MooncakeBackendOptions(active_ranks, is_extension)
-pg.MooncakeBackendOptions(active_ranks, is_extension, max_world_size)
+pg.MooncakeBackendOptions(active_ranks, is_extension, max_group_size)
 ```
 
 Arguments:
 
-- `active_ranks`: `torch.int32` tensor used as the backend-level rank-health
-  mask. For `mooncake`, it must be on the accelerator device; for
-  `mooncake-cpu`, it must be on CPU. When `max_world_size` is set, size this
-  tensor to `max_world_size`, not the current visible world size.
+- `max_group_size`: fixed in-group slot capacity. It must be at least the
+  initially declared group size and cannot be increased later.
+- `active_ranks`: optional contiguous `torch.int32` storage used as a mirror of
+  committed PG membership. Its initial contents are ignored. Size it to
+  `max_group_size`; it may be on CPU or GPU.
 - `is_extension`: set to `True` for a replacement or joining process that will
   enter an existing group through `join_group()`.
-- `max_world_size`: optional upper bound for reserved rank slots. It lets
-  healthy ranks reserve inactive future ranks while keeping
-  `dist.get_world_size()` equal to the current active size.
+- `auto_deactivate_on_failure` and `auto_sync_on_failure`: select automatic or
+  framework-managed failure handling. Both default to `True`; auto-sync
+  requires auto-deactivation.
 
 ### Utility functions
 
@@ -133,15 +142,17 @@ Arguments:
 | `pg.set_device_filter(filters)` | Restrict NIC/HCA selection. | Call before `init_process_group()`. |
 | `pg.set_transfer_engine(engine)` | Reuse an external `TransferEngine`. | The engine must outlive all process groups. |
 | `pg.get_active_ranks(backend)` | Return the backend active-rank tensor. | Used by EP fallback and recovery paths. |
-| `pg.get_num_synced_ranks(backend)` | Return the number of ranks synchronized by the backend. | Diagnostic helper. |
-| `pg.extend_group_size_to(backend, size)` | Reserve additional inactive ranks. | Newly extended ranks do not participate until recovered. |
-| `pg.get_peer_state(backend, ranks)` | Check whether candidate ranks have published peer metadata. | Collective among healthy ranks. |
-| `pg.recover_ranks(backend, ranks)` | Activate ready ranks and publish extension state. | Requires peer metadata to be ready. |
-| `pg.join_group(backend)` | Joiner-side blocking call for extension ranks. | Used after `is_extension=True` initialization. |
+| `pg.get_num_synced_ranks(backend)` | Return the number of locally activatable group slots. | Diagnostic helper. |
+| `pg.get_peer_state(backend, ranks)` | Read locally mirrored activation readiness. | A lightweight, communication-free query. |
+| `pg.activate_ranks(backend, ranks)` | Propose activation through the Coordinator. | A single call from any online rank is sufficient. |
+| `pg.recover_ranks(backend, ranks)` | Propose activation through the Coordinator. | Compatibility alias to `activate_ranks`. |
+| `pg.deactivate_ranks(backend, ranks)` | Propose deactivation through the Coordinator. | A single call from any online rank is sufficient. |
+| `pg.join_group(backend)` | Confirm readiness for activation and remain blocked until activation actually occurs. | Used for scale-up, replacement, and in-place rejoin. |
+| `pg.sync_after_failure(backend)` | Report current link observations, wait for reconciliation, and apply the latest group view. | Called automatically when `auto_sync_on_failure=True`; it may also be called manually. |
 
 ### Supported distributed operations
 
-Mooncake Backend implements the following `torch.distributed` APIs. Support may
+Mooncake PG implements the following `torch.distributed` APIs. Support may
 depend on device type, dtype, PyTorch version, and whether the current backend is
 `mooncake` or `mooncake-cpu`; run the PG tests on the target environment before
 production use.
@@ -150,29 +161,27 @@ production use.
 | --- | --- | --- |
 | Collectives | `all_reduce`, `broadcast`, `all_gather`, `all_gather_into_tensor`, `reduce_scatter_tensor`, `all_to_all`, `barrier`, `reduce`, `gather`, `scatter` | Active ranks participate; inactive ranks are skipped by backend internals. |
 | Async work | `dist.all_reduce(..., async_op=True)` | Wait on the returned work object, then synchronize the device stream as needed. |
-| P2P | `isend`, `irecv`, `batch_isend_irecv` | Single-tensor P2P is routed through the Mooncake P2P shim. |
+| P2P | `isend`, `irecv`, `batch_isend_irecv` | Single-tensor P2P is routed through the Mooncake backend shim. |
 
 ## Elastic recovery protocol
 
-Mooncake PG supports a two-sided recovery protocol. Existing healthy ranks poll
-for replacement rank readiness, then activate those ranks. Replacement ranks
-start in extension mode, publish metadata, and wait until healthy ranks recover
-them.
+Mooncake PG separates join preparation from membership activation. A joining or
+recovering rank completes local warmup, calls `join_group()`, and waits. An
+existing rank may poll local readiness and then issue the activation proposal.
+The Coordinator validates and distributes the resulting membership.
 
 ### Healthy-rank side
 
 ```python
 from mooncake import pg
 
-active_ranks = torch.tensor([1, 1, 0], dtype=torch.int32, device=device)
 dist.init_process_group(
     backend="mooncake",
     rank=rank,
     world_size=2,
     pg_options=pg.MooncakeBackendOptions(
-        active_ranks,
+        3,                 # max_group_size
         False,             # is_extension
-        3,                 # max_world_size
     ),
 )
 
@@ -191,31 +200,35 @@ pg.recover_ranks(backend, join_ranks)
 ```python
 from mooncake import pg
 
-active_ranks = torch.tensor([1, 1, 1], dtype=torch.int32, device=device)
 dist.init_process_group(
     backend="mooncake",
     rank=2,
     world_size=3,
     pg_options=pg.MooncakeBackendOptions(
-        active_ranks,
+        3,                 # max_group_size
         True,              # is_extension
-        3,                 # max_world_size
     ),
 )
 
 backend = dist.group.WORLD
+
+# Collectives are local-only before join_group. Use this
+# window for framework-specific preparation, for example:
+# capture_cuda_graphs()
+# warm_up_model()
+
 pg.join_group(backend)
 ```
 
 Important semantics:
 
-- `get_peer_state()` is collective among the current healthy ranks. Call it in a
-  consistent order across those ranks.
-- New ranks are inactive after `extend_group_size_to()` and become collective
-  participants only after `recover_ranks()`.
-- A joining rank initialized with `is_extension=True` starts with local-only
-  behavior and blocks in `join_group()` until the corresponding healthy ranks
-  publish recovery state.
+- `get_peer_state()` is a local best-effort readiness query, not a collective.
+- Capacity must be reserved with `max_group_size` when founding members create
+  the group. A joining registration appends inactive slots within that capacity.
+- A joining rank starts with local-only collective behavior until `join_group`.
+  The join call then blocks until a Coordinator-approved activation commits.
+- A single `activate_ranks()` call, or its `recover_ranks()` alias, from any
+  online rank is sufficient; redundant equivalent calls are safe.
 - Subgroups must be created in the same order on healthy and joining processes,
   following PyTorch `new_group()` ordering rules.
 
@@ -403,15 +416,16 @@ updates rank activeness so EP transport metadata and QPs can be refreshed.
 
 There are two active-rank tensors in the API surface:
 
-- **PG active-rank mask**: passed to `pg.MooncakeBackendOptions`. This is the
-  backend-level health mask used by collective and recovery logic.
+- **PG active-rank mask**: passed to `pg.MooncakeBackendOptions`. This mirrors
+  the Coordinator's committed membership.
 - **EP active-rank tensor**: passed to `Buffer.dispatch()` and `Buffer.combine()`.
   It is also rank-level (`[num_ranks]`, `torch.int32`) and may be updated by EP
   kernels when timeout detection marks a peer as failed.
 
-In simple integrations these tensors often carry the same health information,
-but they are passed through different API layers. Keep their dtype, device, and
-shape consistent with the process group world size or reserved `max_world_size`.
+Their values may coincide in a simple integration, but their semantics are not
+interchangeable: PG membership is configuration, while EP may update its mask
+from kernel-level timeout observations. Keep the mapping, dtype, device, and
+capacity consistent when propagating committed PG membership into EP.
 
 ## Tests and examples
 

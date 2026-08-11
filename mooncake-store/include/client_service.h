@@ -31,6 +31,7 @@
 namespace mooncake {
 
 class PutOperation;
+class RealClient;
 
 /**
  * @brief Result of a query operation containing replica information and lease
@@ -225,6 +226,37 @@ class Client {
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
         const ReplicateConfig& config);
+
+    /**
+     * @brief Write slices into a memory replica at an object-byte offset.
+     */
+    ErrorCode TransferWriteRange(const Replica::Descriptor& replica_descriptor,
+                                 std::vector<Slice>& slices,
+                                 uint64_t dst_offset);
+
+    /**
+     * @brief Batch ranged read against cached replicas. Fragments from all
+     * entries are issued as one scatter transfer so the transport can coalesce
+     * everything bound for the same segment, then awaited together. Requires
+     * memory replicas. Returns per-entry total bytes transferred or an
+     * ErrorCode. Used by RealClient get sessions. No Master RPC.
+     */
+    std::vector<tl::expected<int64_t, ErrorCode>> BatchTransferReadRanges(
+        const std::vector<Replica::Descriptor>& replicas,
+        const std::vector<std::vector<Slice>>& slices,
+        const std::vector<std::vector<uint64_t>>& src_offsets);
+
+    /**
+     * @brief Batch ranged write into cached replicas (replication). Fragments
+     * from all entries and all memory replicas are issued as one scatter
+     * transfer, then awaited together. Returns per-entry logical bytes
+     * transferred (counted once, not per replica) or an ErrorCode. Used by
+     * RealClient put sessions.
+     */
+    std::vector<tl::expected<int64_t, ErrorCode>> BatchTransferWriteRanges(
+        const std::vector<std::vector<Replica::Descriptor>>& replicas_per_entry,
+        const std::vector<std::vector<Slice>>& slices,
+        const std::vector<std::vector<uint64_t>>& dst_offsets);
 
     /**
      * @brief Upserts data: inserts if key doesn't exist, updates if it does
@@ -495,13 +527,6 @@ class Client {
     /**
      * @brief Performs a batched read of multiple objects using a
      * high-throughput Transfer Engine.
-     * @param transfer_engine_addr Address of the Transfer Engine service (e.g.,
-     * "ip:port").
-     * @param keys List of keys identifying the data objects to be transferred
-     * @param pointers Array of destination memory addresses on the remote node
-     *                         where data will be written (one per key)
-     * @param batch_slices Map from object key to its data slice
-     * (`mooncake::Slice`), containing raw bytes to be written.
      */
     tl::expected<void, ErrorCode> BatchGetOffloadObject(
         const std::string& transfer_engine_addr,
@@ -509,6 +534,13 @@ class Client {
         const std::vector<uintptr_t>& pointers,
         const std::unordered_map<std::string, std::vector<Slice>>&
             batch_slices);
+
+    tl::expected<void, ErrorCode> BatchGetOffloadObject(
+        const std::string& transfer_engine_addr,
+        const std::vector<std::string>& keys,
+        const std::vector<uintptr_t>& pointers,
+        const std::unordered_map<std::string, std::vector<Slice>>& batch_slices,
+        OffloadBufferAccess buffer_access);
 
     /**
      * @brief Notifies the master that offloading of specified objects has
@@ -584,6 +616,11 @@ class Client {
 
     [[nodiscard]] const std::string& GetProtocol() const { return protocol_; }
 
+    [[nodiscard]] bool CanUseLocalMemcpy(const std::string& endpoint) const {
+        return transfer_submitter_ != nullptr &&
+               transfer_submitter_->canUseLocalMemcpy(endpoint);
+    }
+
     /**
      * @brief Get the endpoint address for segment operations.
      * @return For P2PHANDSHAKE mode, returns the actual RPC endpoint (IP:Port).
@@ -608,6 +645,12 @@ class Client {
             endpoints.insert(segment.te_endpoint);
         }
         return endpoints;
+    }
+
+    bool CanUseLocalMemcpy(const Replica::Descriptor& replica) const {
+        if (!replica.is_memory_replica()) return false;
+        return CanUseLocalMemcpy(replica.get_memory_descriptor()
+                                     .buffer_descriptor.transport_endpoint_);
     }
 
     /**
@@ -662,6 +705,23 @@ class Client {
 
     bool IsReplicaOnLocalMemory(const Replica::Descriptor& replica);
 
+    // First half of BatchPut only (size-only slices → StartBatchPut).
+    // Used by RealClient put sessions; not a Master API facade.
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    StartBatchPutForSizes(const std::vector<std::string>& keys,
+                          const std::vector<uint64_t>& object_sizes,
+                          const ReplicateConfig& config);
+
+    // Finalize/revoke a put session for a batch of keys. Thin wrappers over
+    // the master client, exposed so RealClient put sessions can end/revoke
+    // without touching Client internals. Same RPC path as FinalizeBatchPut.
+    std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
+        const std::vector<ObjectMeta>& object_metas,
+        ReplicaType replica_type = ReplicaType::ALL);
+    std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
+        const std::vector<std::string>& keys,
+        ReplicaType replica_type = ReplicaType::ALL);
+
    protected:
     /**
      * @brief Constructor exposed to subclasses for testing only; production
@@ -699,6 +759,15 @@ class Client {
     ErrorCode TransferReadInternal(
         const Replica::Descriptor& replica_descriptor,
         std::vector<Slice>& slices, uint64_t src_offset);
+    // Internal async range submission helpers (return the transfer future).
+    // Used by the synchronous TransferReadRange/WriteRange and the batch
+    // range transfer methods; not part of the public API.
+    std::optional<TransferFuture> SubmitRangeRead(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices, uint64_t src_offset);
+    std::optional<TransferFuture> SubmitRangeWrite(
+        const Replica::Descriptor& replica_descriptor,
+        std::vector<Slice>& slices, uint64_t dst_offset);
     ErrorCode TransferWrite(const Replica::Descriptor& replica_descriptor,
                             std::vector<Slice>& slices);
     ErrorCode TransferRead(const Replica::Descriptor& replica_descriptor,
