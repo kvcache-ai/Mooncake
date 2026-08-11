@@ -22,13 +22,6 @@
 namespace mooncake {
 namespace ha {
 
-WrappedMasterServiceConfig BuildServingMasterServiceConfig(
-    const MasterServiceSupervisorConfig& config,
-    const LeadershipSession& leadership_session) {
-    return WrappedMasterServiceConfig(config,
-                                      leadership_session.view.view_version);
-}
-
 namespace {
 
 constexpr auto kAcquireRetryInterval = std::chrono::seconds(1);
@@ -386,8 +379,8 @@ int RunSupervisorLoop(const HABackendSpec& spec,
             server.init_ibv();
         }
 
-        auto wrapped_config =
-            BuildServingMasterServiceConfig(config, *leadership_session);
+        mooncake::WrappedMasterServiceConfig wrapped_config(
+            config, leadership_session->view.view_version);
         // In HA serving-primary mode, snapshot bootstrap belongs to standby.
         // The new primary must restore from PromotionContext only.
         wrapped_config.enable_snapshot_restore = false;

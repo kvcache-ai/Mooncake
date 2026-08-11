@@ -14,7 +14,6 @@
 #endif
 #include "ha/leadership/leader_coordinator_factory.h"
 #include "ha/leadership/high_availability_test_fixture.h"
-#include "ha/leadership/master_service_supervisor.h"
 #include "master_service.h"
 #include "types.h"
 
@@ -176,8 +175,8 @@ TEST_F(HighAvailabilityTest, AcquiredViewFlowsIntoServingMasterService) {
         DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD;
     supervisor_config.enable_offload = false;
 
-    auto serving_config = ha::BuildServingMasterServiceConfig(
-        supervisor_config, *acquired->session);
+    WrappedMasterServiceConfig serving_config(
+        supervisor_config, acquired->session->view.view_version);
     MasterService service{MasterServiceConfig(serving_config)};
 
     auto ping = service.Ping(generate_uuid());
