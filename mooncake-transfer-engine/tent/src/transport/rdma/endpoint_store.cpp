@@ -122,6 +122,9 @@ void FIFOEndpointStore::evictOne() {
 void FIFOEndpointStore::reclaim() {
     std::vector<std::shared_ptr<RdmaEndPoint>> candidates;
     {
+        // Only protect the waiting_list_ iteration. finishDestroy() may wait
+        // for CQ drain and take the endpoint lock, so it must run after this
+        // store lock has been released.
         RWSpinlock::ReadGuard guard(endpoint_map_lock_);
         candidates.reserve(waiting_list_.size());
         for (auto& endpoint : waiting_list_) candidates.push_back(endpoint);
@@ -302,6 +305,9 @@ void SIEVEEndpointStore::reclaim() {
 
     std::vector<std::shared_ptr<RdmaEndPoint>> candidates;
     {
+        // Only protect the waiting_list_ iteration. finishDestroy() may wait
+        // for CQ drain and take the endpoint lock, so it must run after this
+        // store lock has been released.
         RWSpinlock::ReadGuard guard(endpoint_map_lock_);
         candidates.reserve(waiting_list_.size());
         for (auto& endpoint : waiting_list_) candidates.push_back(endpoint);
