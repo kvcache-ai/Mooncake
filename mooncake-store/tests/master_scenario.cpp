@@ -92,7 +92,7 @@ MasterScenario& MasterScenario::WhenPutStart(PutStartActionData action) {
     }
 
     ReplicateConfig config;
-    config.replica_num = 1;
+    config.replica_num = action.requested_replica_count;
     const auto result =
         service_->PutStart(ActorId(action.actor), action.key,
                            TenantId::Default(), action.size, config);
@@ -108,7 +108,7 @@ MasterScenario& MasterScenario::WhenUpsertStart(UpsertStartActionData action) {
     }
 
     ReplicateConfig config;
-    config.replica_num = 1;
+    config.replica_num = action.requested_replica_count;
     const auto result =
         service_->UpsertStart(ActorId(action.actor), action.key,
                               TenantId::Default(), action.size, config);

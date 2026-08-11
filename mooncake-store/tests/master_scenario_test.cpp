@@ -92,6 +92,20 @@ static_assert(SupportsThen<MissingObject>);
 
 }  // namespace
 
+TEST(MasterScenarioContractTest, HonorsRequestedPutStartReplicaCount) {
+    MasterScenario("requested put start replica count")
+        .Given(MemoryNode("memory-1"))
+        .Given(MemoryNode("memory-2"))
+        .When(PutStart("key", 1_KB).Replicas(2).ExpectReplicas(2));
+}
+
+TEST(MasterScenarioContractTest, HonorsRequestedUpsertStartReplicaCount) {
+    MasterScenario("requested upsert start replica count")
+        .Given(MemoryNode("memory-1"))
+        .Given(MemoryNode("memory-2"))
+        .When(UpsertStart("key", 1_KB).Replicas(2).ExpectReplicas(2));
+}
+
 TEST(MasterScenarioContractTest, ReportsUnexpectedActionError) {
     EXPECT_NONFATAL_FAILURE(MasterScenario("unexpected action error")
                                 .Given(MemoryNode("memory"))
