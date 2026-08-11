@@ -571,6 +571,9 @@ class MasterClient {
         const std::string& key, const std::string& tenant_id,
         const std::vector<std::string>& targets);
 
+    [[nodiscard]] tl::expected<ReplicaActionLease, ErrorCode>
+    SubmitReplicaActionProposal(const ReplicaActionProposal& proposal);
+
     /**
      * @brief Create a task to move an object's replica from source segment to
      * target segment

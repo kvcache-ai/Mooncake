@@ -288,6 +288,11 @@ struct RpcNameTraits<&WrappedMasterService::CreateCopyTask> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::SubmitReplicaActionProposal> {
+    static constexpr const char* value = "SubmitReplicaActionProposal";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::CreateMoveTask> {
     static constexpr const char* value = "CreateMoveTask";
 };
@@ -956,6 +961,19 @@ tl::expected<UUID, ErrorCode> MasterClient::CreateCopyTask(
 
     auto result = invoke_rpc<&WrappedMasterService::CreateCopyTask, UUID>(
         key, tenant_id, targets);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<ReplicaActionLease, ErrorCode>
+MasterClient::SubmitReplicaActionProposal(
+    const ReplicaActionProposal& proposal) {
+    ScopedVLogTimer timer(1, "MasterClient::SubmitReplicaActionProposal");
+    timer.LogRequest("key=", proposal.key, ", tenant_id=", proposal.tenant_id,
+                     ", action=", static_cast<int>(proposal.action));
+
+    auto result = invoke_rpc<&WrappedMasterService::SubmitReplicaActionProposal,
+                             ReplicaActionLease>(proposal);
     timer.LogResponseExpected(result);
     return result;
 }
