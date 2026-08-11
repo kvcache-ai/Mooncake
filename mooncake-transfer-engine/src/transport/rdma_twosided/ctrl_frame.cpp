@@ -36,6 +36,10 @@ int readPod(const uint8_t *&ptr, const uint8_t *end, T &v) {
     return 0;
 }
 
+int requireExactEnd(const uint8_t *ptr, const uint8_t *end) {
+    return ptr == end ? 0 : ERR_INVALID_ARGUMENT;
+}
+
 }  // namespace
 
 int encodeNotifyCompatPayload(const TransferMetadata::NotifyDesc &notify,
@@ -62,11 +66,19 @@ int decodeNotifyCompatPayload(const uint8_t *data, size_t len,
     uint32_t name_len = 0, msg_len = 0;
     if (readPod(ptr, end, name_len)) return ERR_INVALID_ARGUMENT;
     if (static_cast<size_t>(end - ptr) < name_len) return ERR_INVALID_ARGUMENT;
-    notify.name.assign(reinterpret_cast<const char *>(ptr), name_len);
+    // Preflight remaining length before mutating `notify`.
+    const uint8_t *name_ptr = ptr;
     ptr += name_len;
     if (readPod(ptr, end, msg_len)) return ERR_INVALID_ARGUMENT;
     if (static_cast<size_t>(end - ptr) < msg_len) return ERR_INVALID_ARGUMENT;
-    notify.notify_msg.assign(reinterpret_cast<const char *>(ptr), msg_len);
+    const uint8_t *msg_ptr = ptr;
+    ptr += msg_len;
+    if (requireExactEnd(ptr, end)) return ERR_INVALID_ARGUMENT;
+
+    TransferMetadata::NotifyDesc decoded;
+    decoded.name.assign(reinterpret_cast<const char *>(name_ptr), name_len);
+    decoded.notify_msg.assign(reinterpret_cast<const char *>(msg_ptr), msg_len);
+    notify = std::move(decoded);
     return 0;
 }
 
@@ -85,21 +97,28 @@ int encodeCreditGrantPayload(const std::vector<CreditAmount> &grants,
 
 int decodeCreditGrantPayload(const uint8_t *data, size_t len,
                              std::vector<CreditAmount> &grants) {
-    grants.clear();
     if (!data || len < sizeof(uint16_t)) return ERR_INVALID_ARGUMENT;
     const uint8_t *ptr = data;
     const uint8_t *end = data + len;
     uint16_t count = 0;
     if (readPod(ptr, end, count)) return ERR_INVALID_ARGUMENT;
-    grants.reserve(count);
+    constexpr size_t kEntrySize = sizeof(uint16_t) + sizeof(uint64_t);
+    if (count > 4) return ERR_INVALID_ARGUMENT;
+    const size_t need = static_cast<size_t>(count) * kEntrySize;
+    if (static_cast<size_t>(end - ptr) != need) return ERR_INVALID_ARGUMENT;
+
+    std::vector<CreditAmount> decoded;
+    decoded.reserve(count);
     for (uint16_t i = 0; i < count; ++i) {
         uint16_t resource = 0;
         uint64_t total = 0;
         if (readPod(ptr, end, resource) || readPod(ptr, end, total))
             return ERR_INVALID_ARGUMENT;
         if (resource < 1 || resource > 4) return ERR_INVALID_ARGUMENT;
-        grants.push_back({static_cast<CreditResource>(resource), total});
+        decoded.push_back({static_cast<CreditResource>(resource), total});
     }
+    if (requireExactEnd(ptr, end)) return ERR_INVALID_ARGUMENT;
+    grants = std::move(decoded);
     return 0;
 }
 
@@ -118,19 +137,26 @@ int encodeDataAckPayload(const std::vector<DataAckEntry> &acks,
 
 int decodeDataAckPayload(const uint8_t *data, size_t len,
                          std::vector<DataAckEntry> &acks) {
-    acks.clear();
     if (!data || len < sizeof(uint16_t)) return ERR_INVALID_ARGUMENT;
     const uint8_t *ptr = data;
     const uint8_t *end = data + len;
     uint16_t count = 0;
     if (readPod(ptr, end, count)) return ERR_INVALID_ARGUMENT;
-    acks.reserve(count);
+    constexpr size_t kEntrySize = sizeof(uint64_t) * 2;
+    const size_t need = static_cast<size_t>(count) * kEntrySize;
+    if (need / kEntrySize != count) return ERR_INVALID_ARGUMENT;  // overflow
+    if (static_cast<size_t>(end - ptr) != need) return ERR_INVALID_ARGUMENT;
+
+    std::vector<DataAckEntry> decoded;
+    decoded.reserve(count);
     for (uint16_t i = 0; i < count; ++i) {
         DataAckEntry e;
         if (readPod(ptr, end, e.task_id) || readPod(ptr, end, e.acked_bytes))
             return ERR_INVALID_ARGUMENT;
-        acks.push_back(e);
+        decoded.push_back(e);
     }
+    if (requireExactEnd(ptr, end)) return ERR_INVALID_ARGUMENT;
+    acks = std::move(decoded);
     return 0;
 }
 
@@ -145,11 +171,15 @@ int encodeSessionOpenPayload(uint32_t bounce_slots, uint32_t bounce_slot_size,
 int decodeSessionOpenPayload(const uint8_t *data, size_t len,
                              uint32_t &bounce_slots,
                              uint32_t &bounce_slot_size) {
-    if (!data || len < 8) return ERR_INVALID_ARGUMENT;
+    if (!data || len != 8) return ERR_INVALID_ARGUMENT;
     const uint8_t *ptr = data;
     const uint8_t *end = data + len;
-    if (readPod(ptr, end, bounce_slots) || readPod(ptr, end, bounce_slot_size))
+    uint32_t slots = 0, size = 0;
+    if (readPod(ptr, end, slots) || readPod(ptr, end, size))
         return ERR_INVALID_ARGUMENT;
+    if (requireExactEnd(ptr, end)) return ERR_INVALID_ARGUMENT;
+    bounce_slots = slots;
+    bounce_slot_size = size;
     return 0;
 }
 
@@ -161,6 +191,11 @@ bool isCtrlFrameMagic(const uint8_t *data, size_t len) {
 }
 
 int encodeCtrlFrame(const CtrlFrame &frame, std::vector<uint8_t> &out) {
+    if (frame.version != kCtrlFrameVersion) return ERR_INVALID_ARGUMENT;
+    if (!isKnownCtrlFrameType(static_cast<uint8_t>(frame.type)))
+        return ERR_INVALID_ARGUMENT;
+    if ((frame.flags & ~kCtrlFrameKnownFlagsMask) != 0)
+        return ERR_INVALID_ARGUMENT;
     if (frame.payload.size() > UINT32_MAX) return ERR_INVALID_ARGUMENT;
     out.clear();
     out.reserve(kCtrlFrameHeaderSize + frame.payload.size());
@@ -183,19 +218,34 @@ int decodeCtrlFrame(const uint8_t *data, size_t len, CtrlFrame &frame) {
     const uint8_t *ptr = data;
     const uint8_t *end = data + len;
     uint32_t magic = 0;
+    uint8_t version = 0;
     uint8_t type = 0;
+    uint16_t flags = 0;
+    uint64_t session = 0, epoch = 0, seq = 0, ack_seq = 0;
     uint32_t payload_len = 0;
     if (readPod(ptr, end, magic) || magic != kCtrlFrameMagic)
         return ERR_INVALID_ARGUMENT;
-    if (readPod(ptr, end, frame.version) || readPod(ptr, end, type) ||
-        readPod(ptr, end, frame.flags) || readPod(ptr, end, frame.session) ||
-        readPod(ptr, end, frame.epoch) || readPod(ptr, end, frame.seq) ||
-        readPod(ptr, end, frame.ack_seq) || readPod(ptr, end, payload_len))
+    if (readPod(ptr, end, version) || readPod(ptr, end, type) ||
+        readPod(ptr, end, flags) || readPod(ptr, end, session) ||
+        readPod(ptr, end, epoch) || readPod(ptr, end, seq) ||
+        readPod(ptr, end, ack_seq) || readPod(ptr, end, payload_len))
         return ERR_INVALID_ARGUMENT;
-    if (static_cast<size_t>(end - ptr) < payload_len)
+    if (version != kCtrlFrameVersion) return ERR_INVALID_ARGUMENT;
+    if (!isKnownCtrlFrameType(type)) return ERR_INVALID_ARGUMENT;
+    if ((flags & ~kCtrlFrameKnownFlagsMask) != 0) return ERR_INVALID_ARGUMENT;
+    if (static_cast<size_t>(end - ptr) != payload_len)
         return ERR_INVALID_ARGUMENT;
-    frame.type = static_cast<CtrlFrameType>(type);
-    frame.payload.assign(ptr, ptr + payload_len);
+
+    CtrlFrame decoded;
+    decoded.version = version;
+    decoded.type = static_cast<CtrlFrameType>(type);
+    decoded.flags = flags;
+    decoded.session = session;
+    decoded.epoch = epoch;
+    decoded.seq = seq;
+    decoded.ack_seq = ack_seq;
+    decoded.payload.assign(ptr, ptr + payload_len);
+    frame = std::move(decoded);
     return 0;
 }
 

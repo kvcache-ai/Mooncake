@@ -14,6 +14,10 @@
 
 #include <gtest/gtest.h>
 
+#include <cstring>
+#include <vector>
+
+#include "error.h"
 #include "transport/rdma_twosided/ctrl_frame.h"
 
 using namespace mooncake;
@@ -93,4 +97,74 @@ TEST(CtrlFrameTest, RejectsBadMagic) {
     CtrlFrame out;
     EXPECT_NE(decodeCtrlFrame(junk.data(), junk.size(), out), 0);
     EXPECT_FALSE(isCtrlFrameMagic(junk.data(), junk.size()));
+}
+
+TEST(CtrlFrameTest, RejectsUnsupportedVersionTypeFlagsAndTrailing) {
+    CtrlFrame frame;
+    frame.type = CtrlFrameType::SESSION_CLOSE;
+    frame.session = 1;
+    frame.epoch = 1;
+    frame.seq = 1;
+    std::vector<uint8_t> wired;
+    ASSERT_EQ(encodeCtrlFrame(frame, wired), 0);
+
+    // Trailing byte after an otherwise valid frame.
+    auto with_trail = wired;
+    with_trail.push_back(0xFF);
+    CtrlFrame out;
+    EXPECT_EQ(decodeCtrlFrame(with_trail.data(), with_trail.size(), out),
+              ERR_INVALID_ARGUMENT);
+
+    // Unsupported version.
+    auto bad_ver = wired;
+    bad_ver[4] = 99;  // version field
+    EXPECT_EQ(decodeCtrlFrame(bad_ver.data(), bad_ver.size(), out),
+              ERR_INVALID_ARGUMENT);
+
+    // Unknown type.
+    auto bad_type = wired;
+    bad_type[5] = 0xFE;
+    EXPECT_EQ(decodeCtrlFrame(bad_type.data(), bad_type.size(), out),
+              ERR_INVALID_ARGUMENT);
+
+    // Unknown flag bit.
+    auto bad_flags = wired;
+    uint16_t flags = 0x8000;
+    std::memcpy(bad_flags.data() + 6, &flags, sizeof(flags));
+    EXPECT_EQ(decodeCtrlFrame(bad_flags.data(), bad_flags.size(), out),
+              ERR_INVALID_ARGUMENT);
+}
+
+TEST(CtrlFrameTest, PayloadDecodersRejectTrailingAndPreserveOutputOnFailure) {
+    std::vector<uint8_t> grant_payload;
+    ASSERT_EQ(encodeCreditGrantPayload({{CreditResource::BounceSlots, 3}},
+                                       grant_payload),
+              0);
+    auto grant_trail = grant_payload;
+    grant_trail.push_back(0xAB);
+    std::vector<CreditAmount> grants = {{CreditResource::DataBytes, 42}};
+    EXPECT_EQ(decodeCreditGrantPayload(grant_trail.data(), grant_trail.size(),
+                                       grants),
+              ERR_INVALID_ARGUMENT);
+    ASSERT_EQ(grants.size(), 1u);
+    EXPECT_EQ(grants[0].resource, CreditResource::DataBytes);
+    EXPECT_EQ(grants[0].grant_total, 42u);
+
+    std::vector<uint8_t> session;
+    ASSERT_EQ(encodeSessionOpenPayload(1, 2, session), 0);
+    session.push_back(0);
+    uint32_t slots = 9, size = 9;
+    EXPECT_EQ(
+        decodeSessionOpenPayload(session.data(), session.size(), slots, size),
+        ERR_INVALID_ARGUMENT);
+    EXPECT_EQ(slots, 9u);
+    EXPECT_EQ(size, 9u);
+
+    // Inflated count must not reserve/parse before length check.
+    std::vector<uint8_t> tiny = {0xFF, 0xFF};  // count=65535, no entries
+    std::vector<DataAckEntry> acks = {{1, 2}};
+    EXPECT_EQ(decodeDataAckPayload(tiny.data(), tiny.size(), acks),
+              ERR_INVALID_ARGUMENT);
+    ASSERT_EQ(acks.size(), 1u);
+    EXPECT_EQ(acks[0].task_id, 1u);
 }

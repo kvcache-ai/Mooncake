@@ -27,7 +27,9 @@
 
 namespace mooncake {
 
-// Sender-side credit ledger keyed by peer server name + local session epoch.
+// Sender-side credit ledger keyed by (peer, session). Every mutator/query that
+// touches a session entry takes an epoch and rejects mismatches so stale work
+// from a prior generation cannot consume or roll back the new epoch's credits.
 // Cumulative grants; tryReserve fails with ERR_TOO_MANY_REQUESTS when short.
 class SenderCreditLedger {
    public:
@@ -43,13 +45,13 @@ class SenderCreditLedger {
                    int &disposition);
 
     int tryReserve(
-        const std::string &peer, uint64_t session,
+        const std::string &peer, uint64_t session, uint64_t epoch,
         const std::vector<std::pair<CreditResource, uint64_t>> &charge);
     int rollbackReservation(
-        const std::string &peer, uint64_t session,
+        const std::string &peer, uint64_t session, uint64_t epoch,
         const std::vector<std::pair<CreditResource, uint64_t>> &charge);
 
-    int available(const std::string &peer, uint64_t session,
+    int available(const std::string &peer, uint64_t session, uint64_t epoch,
                   CreditResource resource, uint64_t &out) const;
 
     // Sum available units of `resource` across all sessions for peer.

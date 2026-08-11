@@ -42,16 +42,17 @@ TEST(SenderCreditTest, ReserveIsAtomicAcrossResources) {
     SenderCreditLedger l;
     ASSERT_EQ(l.activate(kPeer, kSession, kEpoch), 0);
     grant(l, 1, 2, 100);
-    ASSERT_EQ(l.tryReserve(kPeer, kSession,
+    ASSERT_EQ(l.tryReserve(kPeer, kSession, kEpoch,
                            {{CreditResource::BounceSlots, 1},
                             {CreditResource::BounceBytes, 60}}),
               0);
-    EXPECT_EQ(l.tryReserve(kPeer, kSession,
+    EXPECT_EQ(l.tryReserve(kPeer, kSession, kEpoch,
                            {{CreditResource::BounceSlots, 1},
                             {CreditResource::BounceBytes, 50}}),
               ERR_TOO_MANY_REQUESTS);
     uint64_t avail = 0;
-    ASSERT_EQ(l.available(kPeer, kSession, CreditResource::BounceSlots, avail),
+    ASSERT_EQ(l.available(kPeer, kSession, kEpoch, CreditResource::BounceSlots,
+                          avail),
               0);
     EXPECT_EQ(avail, 1u);
 }
@@ -66,7 +67,8 @@ TEST(SenderCreditTest, DuplicateGrantDoesNotMint) {
               0);
     EXPECT_EQ(disposition, 1);
     uint64_t avail = 0;
-    ASSERT_EQ(l.available(kPeer, kSession, CreditResource::BounceSlots, avail),
+    ASSERT_EQ(l.available(kPeer, kSession, kEpoch, CreditResource::BounceSlots,
+                          avail),
               0);
     EXPECT_EQ(avail, 10u);
 }
@@ -81,9 +83,11 @@ TEST(SenderCreditTest, PartialGrantRetainsOmitted) {
               0);
     EXPECT_EQ(disposition, 0);
     uint64_t bytes = 0, slots = 0;
-    ASSERT_EQ(l.available(kPeer, kSession, CreditResource::BounceBytes, bytes),
+    ASSERT_EQ(l.available(kPeer, kSession, kEpoch, CreditResource::BounceBytes,
+                          bytes),
               0);
-    ASSERT_EQ(l.available(kPeer, kSession, CreditResource::BounceSlots, slots),
+    ASSERT_EQ(l.available(kPeer, kSession, kEpoch, CreditResource::BounceSlots,
+                          slots),
               0);
     EXPECT_EQ(bytes, 160u);
     EXPECT_EQ(slots, 5u);
@@ -93,16 +97,54 @@ TEST(SenderCreditTest, RollbackRestores) {
     SenderCreditLedger l;
     ASSERT_EQ(l.activate(kPeer, kSession, kEpoch), 0);
     grant(l, 1, 4, 400);
-    ASSERT_EQ(l.tryReserve(kPeer, kSession,
+    ASSERT_EQ(l.tryReserve(kPeer, kSession, kEpoch,
                            {{CreditResource::BounceSlots, 2},
                             {CreditResource::BounceBytes, 200}}),
               0);
-    ASSERT_EQ(l.rollbackReservation(kPeer, kSession,
+    ASSERT_EQ(l.rollbackReservation(kPeer, kSession, kEpoch,
                                     {{CreditResource::BounceSlots, 2},
                                      {CreditResource::BounceBytes, 200}}),
               0);
     uint64_t slots = 0;
-    ASSERT_EQ(l.available(kPeer, kSession, CreditResource::BounceSlots, slots),
+    ASSERT_EQ(l.available(kPeer, kSession, kEpoch, CreditResource::BounceSlots,
+                          slots),
               0);
     EXPECT_EQ(slots, 4u);
+}
+
+TEST(SenderCreditTest, StaleEpochCannotTouchNewGeneration) {
+    SenderCreditLedger l;
+    ASSERT_EQ(l.activate(kPeer, kSession, kEpoch), 0);
+    grant(l, 1, 8, 800);
+    ASSERT_EQ(l.tryReserve(kPeer, kSession, kEpoch,
+                           {{CreditResource::BounceSlots, 2}}),
+              0);
+
+    // Reactivate with a newer epoch clears grants/consumed.
+    constexpr uint64_t kNewEpoch = kEpoch + 1;
+    ASSERT_EQ(l.activate(kPeer, kSession, kNewEpoch), 0);
+    int disposition = -1;
+    ASSERT_EQ(l.applyGrant(kPeer, kSession, kNewEpoch, 1,
+                           {{CreditResource::BounceSlots, 8}}, disposition),
+              0);
+    ASSERT_EQ(disposition, 0);
+
+    EXPECT_EQ(l.tryReserve(kPeer, kSession, kEpoch,
+                           {{CreditResource::BounceSlots, 1}}),
+              ERR_INVALID_ARGUMENT);
+    EXPECT_EQ(l.rollbackReservation(kPeer, kSession, kEpoch,
+                                    {{CreditResource::BounceSlots, 2}}),
+              ERR_INVALID_ARGUMENT);
+    uint64_t avail = 0;
+    EXPECT_EQ(l.available(kPeer, kSession, kEpoch, CreditResource::BounceSlots,
+                          avail),
+              ERR_INVALID_ARGUMENT);
+
+    ASSERT_EQ(l.tryReserve(kPeer, kSession, kNewEpoch,
+                           {{CreditResource::BounceSlots, 1}}),
+              0);
+    ASSERT_EQ(l.available(kPeer, kSession, kNewEpoch,
+                          CreditResource::BounceSlots, avail),
+              0);
+    EXPECT_EQ(avail, 7u);
 }

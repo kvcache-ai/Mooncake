@@ -27,6 +27,8 @@ namespace mooncake {
 // | magic:u32 | ver:u8 | type:u8 | flags:u16 | session:u64 | epoch:u64 |
 // | seq:u64 | ack_seq:u64 | payload_len:u32 | payload... |
 constexpr uint32_t kCtrlFrameMagic = 0x434B434Du;  // 'MCKC' LE
+// Wire compatibility: only version 1 is accepted. Unknown versions are
+// rejected (no silent forward compatibility).
 constexpr uint8_t kCtrlFrameVersion = 1;
 constexpr size_t kCtrlFrameHeaderSize = 44;
 
@@ -47,6 +49,15 @@ enum class CtrlFrameFlags : uint16_t {
     None = 0,
     NeedsAck = 1 << 0,
 };
+
+// Bits allowed in CtrlFrame::flags for version 1. Any other bit is rejected.
+constexpr uint16_t kCtrlFrameKnownFlagsMask =
+    static_cast<uint16_t>(CtrlFrameFlags::NeedsAck);
+
+inline bool isKnownCtrlFrameType(uint8_t type) {
+    return type >= static_cast<uint8_t>(CtrlFrameType::CREDIT_GRANT) &&
+           type <= static_cast<uint8_t>(CtrlFrameType::NOTIFY_COMPAT);
+}
 
 enum class CreditResource : uint16_t {
     DataBytes = 1,

@@ -113,15 +113,17 @@ int SenderCreditLedger::applyGrant(const std::string &peer, uint64_t session,
 }
 
 int SenderCreditLedger::tryReserve(
-    const std::string &peer, uint64_t session,
+    const std::string &peer, uint64_t session, uint64_t epoch,
     const std::vector<std::pair<CreditResource, uint64_t>> &charge) {
+    if (epoch == 0) return ERR_INVALID_ARGUMENT;
     std::array<uint64_t, kResourceCount> n{};
     if (normalize(charge, n)) return ERR_INVALID_ARGUMENT;
     std::lock_guard<std::mutex> lock(mutex_);
     Key key{peer, session};
     auto it = entries_.find(key);
-    if (it == entries_.end() || !it->second.has_update)
-        return ERR_TOO_MANY_REQUESTS;
+    if (it == entries_.end() || it->second.epoch != epoch)
+        return ERR_INVALID_ARGUMENT;
+    if (!it->second.has_update) return ERR_TOO_MANY_REQUESTS;
     auto &e = it->second;
     for (size_t i = 0; i < kResourceCount; ++i) {
         if (e.consumed[i] > e.grants[i] || n[i] > e.grants[i] - e.consumed[i])
@@ -132,14 +134,16 @@ int SenderCreditLedger::tryReserve(
 }
 
 int SenderCreditLedger::rollbackReservation(
-    const std::string &peer, uint64_t session,
+    const std::string &peer, uint64_t session, uint64_t epoch,
     const std::vector<std::pair<CreditResource, uint64_t>> &charge) {
+    if (epoch == 0) return ERR_INVALID_ARGUMENT;
     std::array<uint64_t, kResourceCount> n{};
     if (normalize(charge, n)) return ERR_INVALID_ARGUMENT;
     std::lock_guard<std::mutex> lock(mutex_);
     Key key{peer, session};
     auto it = entries_.find(key);
-    if (it == entries_.end()) return ERR_INVALID_ARGUMENT;
+    if (it == entries_.end() || it->second.epoch != epoch)
+        return ERR_INVALID_ARGUMENT;
     for (size_t i = 0; i < kResourceCount; ++i) {
         if (n[i] > it->second.consumed[i]) return ERR_INVALID_ARGUMENT;
     }
@@ -148,14 +152,16 @@ int SenderCreditLedger::rollbackReservation(
 }
 
 int SenderCreditLedger::available(const std::string &peer, uint64_t session,
-                                  CreditResource resource,
+                                  uint64_t epoch, CreditResource resource,
                                   uint64_t &out) const {
+    if (epoch == 0) return ERR_INVALID_ARGUMENT;
     size_t i = 0;
     if (resourceIndex(resource, i)) return ERR_INVALID_ARGUMENT;
     std::lock_guard<std::mutex> lock(mutex_);
     Key key{peer, session};
     auto it = entries_.find(key);
-    if (it == entries_.end()) return ERR_INVALID_ARGUMENT;
+    if (it == entries_.end() || it->second.epoch != epoch)
+        return ERR_INVALID_ARGUMENT;
     const auto &e = it->second;
     out = (e.grants[i] > e.consumed[i]) ? (e.grants[i] - e.consumed[i]) : 0;
     return 0;
