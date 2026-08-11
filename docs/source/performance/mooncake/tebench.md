@@ -32,8 +32,8 @@ cmake --build . -j
 
 ### Role Selection
 
-* If `--target_seg_name` is **empty** → Target mode
-* If `--target_seg_name` is **set** → Initiator mode
+* If both `--target_seg_name` and `--target_seg_names` are **empty** → Target mode
+* If either `--target_seg_name` or `--target_seg_names` is **set** → Initiator mode
 
 ### Backend Selection
 
@@ -261,6 +261,8 @@ Example:
   Empty falls back to `--seg_type` (single type, existing behavior). See
   Section 5.8 for usage and the multi-transport configuration it requires.
 * `--target_seg_name` : target segment name (empty → Target mode)
+* `--target_seg_names` : comma-separated target segment names. When set,
+  worker threads are distributed across all listed target segments.
 
 **Scan ranges**
 
@@ -275,6 +277,54 @@ A test case is skipped when:
 ```
 block_size × batch_size × num_threads > total_buffer_size
 ```
+
+**Multi-target initiator**
+
+Use `--target_seg_names` when one initiator process should send traffic to
+multiple target segments:
+
+```bash
+./tebench \
+  --backend=tent \
+  --metadata_type=p2p \
+  --target_seg_names=<SEG_A>,<SEG_B>,<SEG_C> \
+  --op_type=read \
+  --start_num_threads=3 \
+  --max_num_threads=3
+```
+
+Thread `i` selects target `i % target_count`. Within the selected target, the
+local target-thread index is `i / target_count`, so increasing the thread count
+spreads traffic across targets before advancing to the next buffer slot inside
+each target. `--target_gpu_id` shifts the per-target buffer slot and does not
+change the target selection order.
+
+For multi-node benchmarks, tebench intentionally stays at the endpoint level:
+each process publishes its own segment, and an external launcher decides which
+target segment list each initiator receives. This keeps M-to-N, fan-out,
+incast, and all-to-all topologies as different launch configurations over the
+same `--target_seg_names` primitive.
+
+For multiple initiator processes sharing the same target segment, use
+`--target_offset` and `--target_range_size` to partition the remote address
+space. The range size is relative to each initiator; tebench also validates that
+`target_offset + relative_offset + transfer_size` stays inside the actual target
+buffer.
+
+```bash
+# Initiator 0 uses [0, 512MiB)
+./tebench --target_seg_name=<SEG> --target_offset=0 --target_range_size=536870912
+
+# Initiator 1 uses [512MiB, 1GiB)
+./tebench --target_seg_name=<SEG> --target_offset=536870912 --target_range_size=536870912
+```
+
+For read-only verification with multiple readers, first write deterministic data
+using `--op_type=write_seed`, then run readers with `--op_type=read_verify`
+against the same target range. `read_verify` performs pure READs and validates
+the local buffer without modifying the remote data. Do not combine these modes
+with `--check_consistency`; `--check_consistency` remains the existing
+WRITE→READ self-check mode.
 
 ---
 

@@ -54,12 +54,17 @@ class BenchRunner {
     virtual uint64_t getLocalBufferBase(int thread_id, uint64_t block_size,
                                         uint64_t batch_size) const = 0;
 
+    virtual size_t getTargetCount() const = 0;
+
+    virtual uint64_t getTargetSegmentId(int thread_id) const = 0;
+
     virtual uint64_t getTargetBufferBase(int thread_id, uint64_t block_size,
                                          uint64_t batch_size) const = 0;
 
-    virtual double runSingleTransfer(uint64_t local_addr, uint64_t target_addr,
-                                     uint64_t block_size, uint64_t batch_size,
-                                     OpCode opcode, uint64_t deadline_ns,
+    virtual double runSingleTransfer(uint64_t local_addr, uint64_t target_id,
+                                     uint64_t target_addr, uint64_t block_size,
+                                     uint64_t batch_size, OpCode opcode,
+                                     uint64_t deadline_ns,
                                      IntentType intent_type) = 0;
 };
 

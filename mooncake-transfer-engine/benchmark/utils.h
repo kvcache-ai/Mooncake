@@ -26,6 +26,7 @@
 #include <numeric>
 #include <stdexcept>
 #include <chrono>
+#include <limits>
 
 #include "tent/common/utils/os.h"
 #include "tent/common/utils/random.h"
@@ -60,6 +61,7 @@ struct XferBenchConfig {
     // "dram,vram". Empty falls back to --seg_type (single type).
     static std::string seg_type_mix;
     static std::string target_seg_name;
+    static std::string target_seg_names;
     static std::string op_type;
     static bool check_consistency;
 
@@ -71,6 +73,8 @@ struct XferBenchConfig {
     static int duration;
     static int max_num_threads;
     static int start_num_threads;
+    static size_t target_offset;
+    static size_t target_range_size;
     static std::string qos_classes;
     static std::string qos_classes_json;
     static std::string workload_classes_json;
@@ -182,6 +186,31 @@ void printStats(size_t block_size, size_t batch_size, XferBenchStats& stats,
 void printDeadlineGroupStats(const char* group, size_t block_size,
                              size_t batch_size, XferBenchStats& stats,
                              int num_threads, uint64_t deadline_us);
+
+std::vector<std::string> splitCommaSeparated(const std::string& value);
+
+uint8_t stableDataSeed(uint64_t target_addr);
+
+static inline uint64_t checkedMul(uint64_t lhs, uint64_t rhs,
+                                  const char* label) {
+    if (rhs != 0 && lhs > std::numeric_limits<uint64_t>::max() / rhs) {
+        LOG(FATAL) << label << " overflows uint64_t: " << lhs << " * " << rhs;
+    }
+    return lhs * rhs;
+}
+
+static inline uint64_t checkedAdd(uint64_t lhs, uint64_t rhs,
+                                  const char* label) {
+    if (lhs > std::numeric_limits<uint64_t>::max() - rhs) {
+        LOG(FATAL) << label << " overflows uint64_t: " << lhs << " + " << rhs;
+    }
+    return lhs + rhs;
+}
+
+static inline bool rangeContains(uint64_t offset, uint64_t bytes,
+                                 uint64_t limit) {
+    return offset <= limit && bytes <= limit - offset;
+}
 
 #if defined(USE_CUDA) || defined(USE_SUNRISE)
 static inline bool isCudaMemory(void* ptr) {

@@ -30,7 +30,12 @@ DEFINE_string(
     "concurrently. Empty falls back to --seg_type (single type, existing "
     "behavior). Requires transports to be enabled via MC_TENT_CONF.");
 DEFINE_string(target_seg_name, "", "Memory segment name for the target side");
-DEFINE_string(op_type, "read", "Operation type to benchmark: read|write|mix");
+DEFINE_string(target_seg_names, "",
+              "Comma-separated target segment names. When set, initiator "
+              "threads are distributed across all listed target segments.");
+DEFINE_string(
+    op_type, "read",
+    "Operation type to benchmark: read|write|mix|write_seed|read_verify");
 DEFINE_bool(check_consistency, false,
             "Enable data consistency check after transfer.");
 DEFINE_uint64(total_buffer_size, 1UL << 30,
@@ -44,6 +49,13 @@ DEFINE_int32(start_num_threads, 1,
              "Start number of concurrent worker threads.");
 DEFINE_int32(max_num_threads, 1,
              "Maximum number of concurrent worker threads.");
+DEFINE_uint64(target_offset, 0,
+              "Base offset added to every target buffer address. Useful when "
+              "multiple initiator processes share one target segment.");
+DEFINE_uint64(
+    target_range_size, 0,
+    "Per-initiator target range size. 0 disables range validation; "
+    "non-zero requires every target address to stay inside the range.");
 DEFINE_string(
     qos_classes, "",
     "QoS classes as name:threads:slo_us:weight[:isolated_gbps],...; "
@@ -102,6 +114,7 @@ std::string XferBenchConfig::seg_name;
 std::string XferBenchConfig::seg_type;
 std::string XferBenchConfig::seg_type_mix;
 std::string XferBenchConfig::target_seg_name;
+std::string XferBenchConfig::target_seg_names;
 std::string XferBenchConfig::op_type;
 bool XferBenchConfig::check_consistency = false;
 
@@ -113,6 +126,8 @@ size_t XferBenchConfig::max_batch_size = 0;
 int XferBenchConfig::duration = 0;
 int XferBenchConfig::max_num_threads = 0;
 int XferBenchConfig::start_num_threads = 0;
+size_t XferBenchConfig::target_offset = 0;
+size_t XferBenchConfig::target_range_size = 0;
 std::string XferBenchConfig::qos_classes;
 std::string XferBenchConfig::qos_classes_json;
 std::string XferBenchConfig::workload_classes_json;
@@ -140,6 +155,7 @@ void XferBenchConfig::loadFromFlags() {
     seg_type_mix = FLAGS_seg_type_mix;
     seg_name = FLAGS_seg_name;
     target_seg_name = FLAGS_target_seg_name;
+    target_seg_names = FLAGS_target_seg_names;
     op_type = FLAGS_op_type;
     check_consistency = FLAGS_check_consistency;
 
@@ -150,6 +166,8 @@ void XferBenchConfig::loadFromFlags() {
     max_batch_size = FLAGS_max_batch_size;
     start_num_threads = FLAGS_start_num_threads;
     max_num_threads = FLAGS_max_num_threads;
+    target_offset = FLAGS_target_offset;
+    target_range_size = FLAGS_target_range_size;
     qos_classes = FLAGS_qos_classes;
     qos_classes_json = FLAGS_qos_classes_json;
     workload_classes_json = FLAGS_workload_classes_json;
@@ -248,6 +266,28 @@ void printDeadlineGroupStats(const char* group, size_t block_size,
     std::cout << " operations=" << stats.transfer_duration.count()
               << " throughput=" << std::fixed << std::setprecision(6)
               << throughput_gbs << " GB/s" << std::endl;
+}
+
+std::vector<std::string> splitCommaSeparated(const std::string& value) {
+    std::vector<std::string> result;
+    std::stringstream ss(value);
+    std::string token;
+    while (std::getline(ss, token, ',')) {
+        const size_t begin = token.find_first_not_of(" \t\r\n");
+        if (begin == std::string::npos) continue;
+        const size_t end = token.find_last_not_of(" \t\r\n");
+        result.push_back(token.substr(begin, end - begin + 1));
+    }
+    return result;
+}
+
+uint8_t stableDataSeed(uint64_t target_addr) {
+    uint64_t value = target_addr;
+    value ^= value >> 33;
+    value *= 0xff51afd7ed558ccdULL;
+    value ^= value >> 33;
+    uint8_t seed = static_cast<uint8_t>(value);
+    return seed == 0 ? 1 : seed;
 }
 
 }  // namespace tent
