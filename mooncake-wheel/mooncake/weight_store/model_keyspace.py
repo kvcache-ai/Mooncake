@@ -5,6 +5,7 @@ import re
 
 
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_MAX_ID_LEN = 255
 
 
 def model_manifest_key(checkpoint_id: str) -> str:
@@ -44,5 +45,7 @@ def _sha256_text(value: str) -> str:
 
 
 def _validate_id(name: str, value: str) -> None:
+    if not isinstance(value, str) or not (1 <= len(value) <= _MAX_ID_LEN):
+        raise ValueError(f"invalid {name}: {value!r}")
     if not _ID_RE.fullmatch(value):
         raise ValueError(f"invalid {name}: {value!r}")

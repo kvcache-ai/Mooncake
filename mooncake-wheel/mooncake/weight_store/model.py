@@ -19,11 +19,15 @@ from .model_keyspace import (
     validate_checkpoint_id,
 )
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 READY = "READY"
 FAILED = "FAILED"
 VALID_STATUSES = {READY, FAILED}
 DEFAULT_FILE_CHUNK_SIZE = 64 * 1024 * 1024
+# Mooncake's native store.remove returns -704 for an object that is already
+# gone (see structured_object_store.MISSING_OBJECT_ERROR). Treat it as success
+# so that re-running a partially-completed delete stays idempotent.
+MISSING_OBJECT_ERROR = -704
 
 WEIGHT_SUFFIXES = {
     ".bin",
@@ -42,6 +46,11 @@ class ModelFileRecord:
     size: int
     sha256: str
     chunks: List[str] = field(default_factory=list)
+    # Authoritative fixed chunk size used at import. Readers mapping file
+    # offsets to chunks MUST use this value, not their own configured chunk
+    # size. 0 means unknown/legacy (pre-schema-2) and a reader MUST refuse
+    # to guess the layout of a multi-chunk file rather than assume a size.
+    chunk_size: int = 0
 
 
 @dataclass(frozen=True)
@@ -76,12 +85,13 @@ class ModelFileManifest:
     @classmethod
     def from_json_bytes(cls, payload: bytes) -> "ModelFileManifest":
         data = json.loads(payload.decode("utf-8"))
-        data["files"] = [
-            ModelFileRecord(chunks=[item["key"]], **item)
-            if "chunks" not in item
-            else ModelFileRecord(**item)
-            for item in data["files"]
-        ]
+        records = []
+        for item in data["files"]:
+            if "chunks" not in item:
+                item = {**item, "chunks": [item["key"]]}
+            # chunk_size defaults to 0 (legacy) when absent from old dicts.
+            records.append(ModelFileRecord(**item))
+        data["files"] = records
         return cls(**data)
 
 
@@ -119,7 +129,19 @@ class ModelFileCacheClient:
         if not source.is_dir():
             raise ValueError(f"source_uri must be a directory: {source_uri}")
         if self._exists(model_manifest_key(checkpoint_id)):
-            raise ValueError(f"model checkpoint already exists: {checkpoint_id}")
+            # A manifest already exists. Only a live (READY) checkpoint blocks a
+            # re-import; a FAILED leftover -- or an unreadable/corrupt manifest
+            # -- is reclaimable, so tear it down idempotently and fall through to
+            # import afresh.
+            try:
+                existing = self._read_manifest(checkpoint_id)
+            except (KeyError, ValueError):
+                existing = None
+            if existing is not None and existing.status == READY:
+                raise ValueError(
+                    f"model checkpoint already exists: {checkpoint_id}"
+                )
+            self.delete_model(checkpoint_id)
 
         files = _list_model_files(source)
         if not files:
@@ -147,12 +169,32 @@ class ModelFileCacheClient:
                         import_started_at,
                     )
                 )
-                size, digest, chunks = self._put_file_chunks(
-                    checkpoint_id=checkpoint_id,
-                    relative_path=rel,
-                    source_path=path,
-                    file_type=file_type,
-                )
+                journal: List[str] = []
+                try:
+                    size, digest, chunks = self._put_file_chunks(
+                        checkpoint_id=checkpoint_id,
+                        relative_path=rel,
+                        source_path=path,
+                        file_type=file_type,
+                        journal=journal,
+                    )
+                except BaseException:
+                    if journal:
+                        # Preserve the partial file's chunk keys so the FAILED
+                        # manifest and delete_model can sweep any survivor whose
+                        # immediate cleanup failed (Finding 3).
+                        records.append(
+                            ModelFileRecord(
+                                path=rel,
+                                type=file_type,
+                                key=key,
+                                size=0,
+                                sha256="",
+                                chunks=list(journal),
+                                chunk_size=self.file_chunk_size,
+                            )
+                        )
+                    raise
                 records.append(
                     ModelFileRecord(
                         path=rel,
@@ -161,6 +203,7 @@ class ModelFileCacheClient:
                         size=size,
                         sha256=digest,
                         chunks=chunks,
+                        chunk_size=self.file_chunk_size,
                     )
                 )
                 imported_bytes += size
@@ -177,6 +220,14 @@ class ModelFileCacheClient:
                     )
                 )
 
+            sorted_records = sorted(records, key=lambda record: record.path)
+            total_size = sum(record.size for record in records)
+
+            # Build the READY manifest but do NOT publish it yet. On a
+            # write-once store we cannot persist an in-progress state and later
+            # overwrite it with READY (the second put is dropped), so instead we
+            # verify from the in-memory records and make the READY manifest the
+            # single, final publication step (Finding 1).
             manifest = ModelFileManifest(
                 checkpoint_id=checkpoint_id,
                 model_id=model_id,
@@ -185,13 +236,16 @@ class ModelFileCacheClient:
                 source_uri=str(source),
                 created_at=now,
                 updated_at=now,
-                total_size=sum(record.size for record in records),
-                files=sorted(records, key=lambda record: record.path),
+                total_size=total_size,
+                files=sorted_records,
                 error=None,
             )
+            # Verify the just-written chunks while still unpublished.
+            self._verify_manifest(manifest)
+            # Publish: one manifest write (first write on an empty key), then
+            # index.
             self._write_manifest(manifest)
             self._add_to_indexes(manifest)
-            self.verify_model(checkpoint_id)
             return manifest
         except BaseException as exc:
             failed = ModelFileManifest(
@@ -217,9 +271,13 @@ class ModelFileCacheClient:
 
     def verify_model(self, checkpoint_id: str) -> ModelFileManifest:
         manifest = self._read_manifest(checkpoint_id)
+        return self._verify_manifest(manifest)
+
+    def _verify_manifest(self, manifest: ModelFileManifest) -> ModelFileManifest:
+        checkpoint_id = manifest.checkpoint_id
         if manifest.status != READY:
             raise ValueError(
-                f"model checkpoint {checkpoint_id!r} is not READY: "
+                f"model checkpoint {checkpoint_id!r} is not verifiable: "
                 f"{manifest.status}"
             )
 
@@ -249,11 +307,32 @@ class ModelFileCacheClient:
         return manifest
 
     def delete_model(self, checkpoint_id: str) -> None:
-        manifest = self._read_manifest(checkpoint_id)
+        # Delete is a multi-key operation over a store with no transactions, so
+        # it must be safe to crash after any step and re-run to completion.
+        try:
+            manifest = self._read_manifest(checkpoint_id)
+        except KeyError:
+            # Manifest already gone: a prior delete finished (or never wrote a
+            # manifest). Treat as an idempotent no-op success.
+            return
+        except ValueError:
+            # Manifest is present but unparseable (corrupt/non-JSON), so we
+            # cannot recover model_id to de-index. Best-effort drop the dangling
+            # manifest key so the checkpoint id is no longer stuck, then return.
+            self._remove(model_manifest_key(checkpoint_id), force=True)
+            return
+
+        # De-index FIRST while the manifest (and thus model_id) is still
+        # readable. Discard-based, so idempotent on retry. We deliberately do
+        # NOT persist an in-progress delete marker: on a write-once store that
+        # would mean remove(READY)+put(marker), whose crash window is the
+        # Finding-4 zombie (manifest gone while index/chunks survive).
+        self._remove_from_indexes(manifest)
         for record in manifest.files:
             self._remove_file_chunks(record)
+        # Remove the manifest LAST: only once every dependent key is gone do we
+        # drop the record that keeps this delete recoverable.
         self._remove(model_manifest_key(checkpoint_id), force=True)
-        self._remove_from_indexes(manifest)
 
     def materialize_file(self, checkpoint_id: str, path: str, output_path: str) -> None:
         manifest = self._read_manifest(checkpoint_id)
@@ -378,6 +457,7 @@ class ModelFileCacheClient:
         relative_path: str,
         source_path: Path,
         file_type: str,
+        journal: Optional[List[str]] = None,
     ) -> tuple[int, str, List[str]]:
         digest = hashlib.sha256()
         size = 0
@@ -400,6 +480,10 @@ class ModelFileCacheClient:
                     )
                     self._put(chunk_key, chunk, config)
                     chunks.append(chunk_key)
+                    if journal is not None:
+                        # Authoritative survivor list carried back to
+                        # import_model so a failed put still records its keys.
+                        journal.append(chunk_key)
                     digest.update(chunk)
                     size += len(chunk)
             except BaseException:
@@ -431,10 +515,12 @@ class ModelFileCacheClient:
             self._remove(chunk_key, force=True)
 
     def _record_chunks(self, record: ModelFileRecord) -> List[str]:
-        if record.size == 0:
-            return []
+        # ``chunks`` is authoritative when present (a partial-import record
+        # has size==0 but a non-empty chunks list that delete must sweep).
         if record.chunks:
             return record.chunks
+        if record.size == 0:
+            return []
         return [record.key]
 
     def _put(self, key: str, value: bytes, config) -> None:
@@ -443,10 +529,24 @@ class ModelFileCacheClient:
             raise RuntimeError(f"failed to put {key}: {result}")
 
     def _put_control(self, key: str, value: bytes, config) -> None:
-        writer = getattr(self.store, "upsert", None)
-        if writer is None:
-            writer = self.store.put
-        result = writer(key, value, config)
+        # Control objects (the manifest and the index sets) are the only
+        # mutable keys in this keyspace. The native store's ``put`` is
+        # write-once: a second put to an existing key returns OK but silently
+        # discards the new bytes (Client::Put maps OBJECT_ALREADY_EXISTS ->
+        # success). So an in-place overwrite would be dropped. Prefer a real
+        # ``upsert`` if the store offers one; otherwise emulate overwrite by
+        # removing any prior value first.
+        #
+        # Callers guarantee a *live* manifest is never overwritten this way
+        # (import never persists an in-progress state; delete removes the
+        # manifest last), so this pre-remove only ever clears an absent or
+        # superseded key.
+        upsert = getattr(self.store, "upsert", None)
+        if upsert is not None:
+            result = upsert(key, value, config)
+        else:
+            self._remove(key, force=True)  # idempotent; -704 tolerated
+            result = self.store.put(key, value, config)
         if result not in (0, None):
             raise RuntimeError(f"failed to write control object {key}: {result}")
 
@@ -463,7 +563,7 @@ class ModelFileCacheClient:
             result = self.store.remove(key, force)
         except TypeError:
             result = self.store.remove(key)
-        if result not in (0, None):
+        if result not in (0, None, MISSING_OBJECT_ERROR):
             raise RuntimeError(f"failed to remove {key}: {result}")
 
     def _exists(self, key: str) -> bool:
