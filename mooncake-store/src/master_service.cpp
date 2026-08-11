@@ -5122,8 +5122,8 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
 
     auto& tenant_state = accessor.GetTenantState();
     auto pending_validation = ValidateDynamicReplicaPendingForCopyStart(
-        tenant_state, key, src_segment, DynamicReplicationVersionEpoch(metadata),
-        tgt_segments);
+        tenant_state, key, src_segment,
+        DynamicReplicationVersionEpoch(metadata), tgt_segments);
     if (!pending_validation) {
         return tl::make_unexpected(pending_validation.error());
     }
@@ -7186,8 +7186,8 @@ void MasterService::ClearDynamicReplicationStateForKey(
     }
 }
 
-bool MasterService::HasDynamicReplicationPending(
-    TenantState& tenant_state, const std::string& key) {
+bool MasterService::HasDynamicReplicationPending(TenantState& tenant_state,
+                                                 const std::string& key) {
     auto it = tenant_state.dynamic_replication_pending.find(key);
     if (it == tenant_state.dynamic_replication_pending.end()) {
         return false;
@@ -10766,8 +10766,8 @@ MasterService::MetadataSerializer::DeserializeMetadata(
 tl::expected<void, ErrorCode>
 MasterService::ValidateDynamicReplicaPendingForCopyStart(
     TenantState& tenant_state, const std::string& key,
-    const std::string& source_segment,
-    uint64_t version_epoch, const std::vector<std::string>& target_segments) {
+    const std::string& source_segment, uint64_t version_epoch,
+    const std::vector<std::string>& target_segments) {
     auto pending_it = tenant_state.dynamic_replication_pending.find(key);
     if (pending_it == tenant_state.dynamic_replication_pending.end()) {
         return {};
@@ -10791,8 +10791,8 @@ MasterService::ValidateDynamicReplicaPendingForCopyStart(
 
 void MasterService::RegisterDynamicReplicaStart(
     TenantState& tenant_state, ObjectMetadata& metadata, const std::string& key,
-    const std::string& source_segment,
-    uint64_t version_epoch, const std::vector<std::string>& target_segments,
+    const std::string& source_segment, uint64_t version_epoch,
+    const std::vector<std::string>& target_segments,
     const std::vector<ReplicaID>& replica_ids) {
     auto pending_it = tenant_state.dynamic_replication_pending.find(key);
     if (pending_it == tenant_state.dynamic_replication_pending.end()) {
