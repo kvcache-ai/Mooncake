@@ -95,19 +95,7 @@ To reduce cache warm-up time after a master restart, the Master Service supports
 
 The Master Service can optionally enforce strict multi-tenant memory quota admission. This feature is disabled by default. When `enable_multi_tenants=false`, request tenant IDs are ignored for object placement, all objects use the `default` namespace, and tenant quota management requests return `UNAVAILABLE_IN_CURRENT_MODE`.
 
-When strict multi-tenant mode is enabled, the tenant quota policy is loaded from the configured connector. Supported connector types are `file` and, when the store is built with `STORE_USE_ETCD=ON`, `etcd`. The `file` connector uses `tenant_quota_connector_uri=<path>` as a writable YAML policy path. The `etcd` connector uses `tenant_quota_connector_uri=<endpoints>` as the etcd endpoints string and stores the same YAML policy in `mooncake-store/<cluster_id>/tenant_quota_policy`; if that key does not exist, the master starts with an empty policy so the first policy can be created through the admin API. The etcd connector shares the process-wide store etcd client used by HA/oplog, so deployments that enable both must configure matching etcd endpoints. Tenants must be explicitly present in that connector policy before they can write. Missing tenants, empty tenants, and an unregistered `default` tenant are rejected with `TENANT_NOT_REGISTERED`.
-
-The YAML policy uses schema version `1`:
-
-```yaml
-version: 1
-
-tenants:
-  - name: tenant-a
-    quota: 200GB
-```
-
-Tenant names must be non-empty, unique, must not start with `_`, and must not contain NUL or control characters. Quotas must be positive integers and may use `B`, `KB`, `MB`, `GB`, or `TB` units.
+See [Multi-Tenant Deployment](../deployment/multi-tenancy.md) for configuration details.
 
 Effective quota is recomputed from the current registered memory capacity:
 
@@ -118,16 +106,7 @@ Effective quota is recomputed from the current registered memory capacity:
 
 `PutStart` and size-changing `UpsertStart` charge quota before memory is allocated. If the first reservation fails, the master performs tenant-scoped memory eviction for the target tenant and retries the reservation. The retry is bounded to two eviction attempts. Tenant quota eviction scans only the target tenant, skips hard-pinned objects, honors soft-pin eviction configuration, and preserves grouped-object lease safety checks.
 
-Admin policy changes are persisted before the final in-memory policy is applied. `PUT` writes the connector first and then applies the policy in memory. `DELETE` first marks the tenant unregistered in memory to block concurrent writes, verifies the tenant is empty, writes the connector, and rolls back the in-memory mark if the connector write fails. The admin HTTP API exposes:
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/api/v1/tenant_quotas` | List quota snapshots for active or explicit tenants |
-| `GET` | `/api/v1/tenant_quotas?tenant_id=<tenant>` | Query one tenant quota snapshot |
-| `PUT` | `/api/v1/tenant_quotas?tenant_id=<tenant>` | Create or update a tenant quota policy |
-| `DELETE` | `/api/v1/tenant_quotas?tenant_id=<tenant>` | Delete an empty tenant quota policy |
-
-Tenant quota snapshots include `tenant_id`, `requested_quota_bytes`, `effective_quota_bytes`, `used_bytes`, `reserved_bytes`, `committed_count`, `metadata_object_count`, `over_quota`, and `has_explicit_policy`.
+Admin policy changes are persisted before the final in-memory policy is applied. `PUT` writes the connector first and then applies the policy in memory. `DELETE` first marks the tenant unregistered in memory to block concurrent writes, verifies the tenant is empty, writes the connector, and rolls back the in-memory mark if the connector write fails.
 
 Snapshots restore object runtime state only. Tenant quota policy is always loaded from the connector after metadata restore, then usage and effective quota are rebuilt from restored metadata and current registered capacity. If the connector cannot be loaded in strict multi-tenant mode, startup fails.
 
