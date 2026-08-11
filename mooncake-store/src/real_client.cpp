@@ -3390,7 +3390,9 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         auto runtime_accelerator =
             device::GetAcceleratorRegistry().RuntimeAccelerators();
         void *dst = static_cast<char *>(buffer) + dst_offset;
-        if (runtime_accelerator.FindDeviceForPointer(dst)) {
+        if (runtime_accelerator.FindDeviceForPointer(dst) &&
+            (!client_->CanUseLocalMemcpy(replica) ||
+             client_->IsHotCacheEnabled())) {
             if (!client_buffer_allocator_) {
                 LOG(ERROR) << "Client buffer allocator is not provided";
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -3527,7 +3529,9 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
     auto runtime_accelerator =
         device::GetAcceleratorRegistry().RuntimeAccelerators();
     void *dst = static_cast<char *>(buffer) + dst_offset;
-    if (runtime_accelerator.FindDeviceForPointer(dst)) {
+    auto filtered_qr = FilterQueryResult(query_result, replica, false);
+    if (runtime_accelerator.FindDeviceForPointer(dst) &&
+        !client_->CanUseLocalMemcpy(replica)) {
         if (!client_buffer_allocator_) {
             LOG(ERROR) << "Client buffer allocator is not provided";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -3543,7 +3547,7 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
         tmp_slices.emplace_back(Slice{tmp_handle.ptr(), size});
 
         auto get_result =
-            client_->Get(key, query_result, tmp_slices, src_offset);
+            client_->Get(key, filtered_qr, tmp_slices, src_offset);
         if (!get_result) {
             return tl::unexpected(get_result.error());
         }
@@ -3558,7 +3562,7 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
     std::vector<Slice> slices;
     slices.emplace_back(Slice{dst, size});
 
-    auto get_result = client_->Get(key, query_result, slices, src_offset);
+    auto get_result = client_->Get(key, filtered_qr, slices, src_offset);
     if (!get_result) {
         return tl::unexpected(get_result.error());
     }
@@ -3644,6 +3648,8 @@ RealClient::get_into_ranges_internal(
             .first->second;
     };
 
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
     struct ScatterLease {
         std::chrono::steady_clock::time_point expires_at;
         std::optional<ErrorCode> error;
@@ -3682,6 +3688,53 @@ RealClient::get_into_ranges_internal(
 
             const auto &metadata = metadata_result.value();
             if (metadata.replica.is_memory_replica()) {
+                if (client_->CanUseLocalMemcpy(metadata.replica) &&
+                    runtime_accelerator.FindDeviceForPointer(buffers[i])) {
+                    // Planning cache entries may be close to expiry. Renew and
+                    // reselect the replica before copying into device memory.
+                    auto refresh_result = resolve_ranged_read_metadata(keys[j]);
+                    if (!refresh_result) {
+                        std::fill(range_results.begin(), range_results.end(),
+                                  tl::unexpected(refresh_result.error()));
+                        continue;
+                    }
+                    std::optional<RangedReadMetadata> refreshed_metadata;
+                    refreshed_metadata.emplace(std::move(*refresh_result));
+                    auto lease_refresh_at =
+                        [](const RangedReadMetadata &value) {
+                            const auto now = std::chrono::steady_clock::now();
+                            return now +
+                                   (value.query_result.lease_timeout - now) / 2;
+                        };
+                    auto refresh_at = lease_refresh_at(*refreshed_metadata);
+                    for (size_t k = 0; k < range_results.size(); ++k) {
+                        // Renew halfway through the remaining lease in long
+                        // batches.
+                        const size_t dst_offset = dst_offsets[k];
+                        if (dst_offset > capacities[i] ||
+                            sizes[k] > capacities[i] - dst_offset) {
+                            continue;
+                        }
+                        if (std::chrono::steady_clock::now() >= refresh_at) {
+                            auto next_refresh_result =
+                                resolve_ranged_read_metadata(keys[j]);
+                            if (!next_refresh_result) {
+                                std::fill(range_results.begin() + k,
+                                          range_results.end(),
+                                          tl::unexpected(
+                                              next_refresh_result.error()));
+                                break;
+                            }
+                            refreshed_metadata.emplace(
+                                std::move(*next_refresh_result));
+                            refresh_at = lease_refresh_at(*refreshed_metadata);
+                        }
+                        range_results[k] = execute_ranged_read(
+                            keys[j], buffers[i], dst_offset, src_offsets[k],
+                            sizes[k], *refreshed_metadata, false, false);
+                    }
+                    continue;
+                }
                 const auto &handle =
                     metadata.replica.get_memory_descriptor().buffer_descriptor;
                 auto [lease_it, inserted] = scatter_leases.try_emplace(keys[j]);
@@ -4633,58 +4686,22 @@ RealClient::batch_get_into_cuda_ipc_dummy_helper(
 
     std::vector<tl::expected<int64_t, ErrorCode>> results(
         requests.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
-    std::vector<device::CudaIpcBufferMapping> mappings;
-    std::vector<void *> buffers;
-    std::vector<std::vector<std::string>> all_keys;
-    std::vector<std::vector<std::vector<size_t>>> all_dst_offsets;
-    std::vector<std::vector<std::vector<size_t>>> all_src_offsets;
-    std::vector<std::vector<std::vector<size_t>>> all_sizes;
-    std::vector<size_t> buffer_capacities;
-    std::vector<size_t> original_indices;
-    mappings.reserve(requests.size());
-    buffers.reserve(requests.size());
-    all_keys.reserve(requests.size());
-    all_dst_offsets.reserve(requests.size());
-    all_src_offsets.reserve(requests.size());
-    all_sizes.reserve(requests.size());
-    buffer_capacities.reserve(requests.size());
-    original_indices.reserve(requests.size());
 
     for (size_t i = 0; i < requests.size(); ++i) {
         const auto &request = requests[i];
+        if (request.size == 0) {
+            results[i] = 0;
+            continue;
+        }
         auto mapping = device::CudaIpcBufferMapping::Open(request.destination);
         if (!mapping) {
             results[i] = tl::unexpected(mapping.error());
             continue;
         }
-        mappings.push_back(std::move(*mapping));
-        buffers.push_back(mappings.back().ptr());
-        all_keys.push_back({request.key});
-        all_dst_offsets.push_back({{0}});
-        all_src_offsets.push_back(
-            {{static_cast<size_t>(request.source_offset)}});
-        all_sizes.push_back({{static_cast<size_t>(request.size)}});
-        buffer_capacities.push_back(static_cast<size_t>(request.size));
-        original_indices.push_back(i);
-    }
-
-    if (buffers.empty()) {
-        return results;
-    }
-
-    auto range_results = get_into_ranges_internal(
-        buffers, all_keys, all_dst_offsets, all_src_offsets, all_sizes,
-        &buffer_capacities, nullptr);
-    for (size_t i = 0; i < original_indices.size(); ++i) {
-        if (i < range_results.size() && range_results[i].size() == 1 &&
-            range_results[i][0].size() == 1) {
-            results[original_indices[i]] = range_results[i][0][0];
-        } else {
-            LOG(ERROR) << "Invalid cuda ipc tensor read result shape for key "
-                       << requests[original_indices[i]].key;
-            results[original_indices[i]] =
-                tl::unexpected(ErrorCode::INTERNAL_ERROR);
-        }
+        results[i] = get_into_range_internal(
+            request.key, mapping->ptr(), 0,
+            static_cast<size_t>(request.source_offset),
+            static_cast<size_t>(request.size), false, false);
     }
     return results;
 }
