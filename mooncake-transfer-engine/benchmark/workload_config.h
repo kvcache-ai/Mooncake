@@ -34,6 +34,8 @@ struct WorkloadClassConfig {
     IntentType intent_type = IntentType::INTENT_UNSPEC;
 };
 
+bool parseBenchIntentType(const std::string& value, IntentType* intent_type);
+
 bool parseWorkloadClassesJson(const std::string& spec,
                               std::vector<WorkloadClassConfig>* classes,
                               std::string* error);

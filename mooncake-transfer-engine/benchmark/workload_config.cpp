@@ -15,6 +15,7 @@
 #include "workload_config.h"
 
 #include <algorithm>
+#include <cctype>
 #include <limits>
 #include <unordered_map>
 
@@ -22,9 +23,15 @@
 
 namespace mooncake {
 namespace tent {
-namespace {
 
-bool parseIntentType(const std::string& value, IntentType* intent_type) {
+static std::string normalizeIntentTypeName(std::string value) {
+    for (auto& c : value) {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return value;
+}
+
+bool parseBenchIntentType(const std::string& value, IntentType* intent_type) {
     static const std::unordered_map<std::string, IntentType> kIntentTypes = {
         {"unspec", IntentType::INTENT_UNSPEC},
         {"intent_unspec", IntentType::INTENT_UNSPEC},
@@ -35,15 +42,15 @@ bool parseIntentType(const std::string& value, IntentType* intent_type) {
         {"weight_loading", IntentType::WEIGHT_LOADING},
         {"staging_internal", IntentType::STAGING_INTERNAL},
     };
-    const auto it = kIntentTypes.find(value);
+    const auto it = kIntentTypes.find(normalizeIntentTypeName(value));
     if (it == kIntentTypes.end()) return false;
     *intent_type = it->second;
     return true;
 }
 
-bool parsePositiveSize(const nlohmann::json& node, const char* field,
-                       const std::string& path, size_t* result,
-                       std::string* error) {
+static bool parsePositiveSize(const nlohmann::json& node, const char* field,
+                              const std::string& path, size_t* result,
+                              std::string* error) {
     if (!node.contains(field) || !node[field].is_number_unsigned()) {
         *error = path + "." + field + " must be an unsigned integer";
         return false;
@@ -56,8 +63,6 @@ bool parsePositiveSize(const nlohmann::json& node, const char* field,
     *result = static_cast<size_t>(value);
     return true;
 }
-
-}  // namespace
 
 bool parseWorkloadClassesJson(const std::string& spec,
                               std::vector<WorkloadClassConfig>* classes,
@@ -100,8 +105,8 @@ bool parseWorkloadClassesJson(const std::string& spec,
             }
             if (!node.contains("intent_type") ||
                 !node["intent_type"].is_string() ||
-                !parseIntentType(node["intent_type"].get<std::string>(),
-                                 &config.intent_type)) {
+                !parseBenchIntentType(node["intent_type"].get<std::string>(),
+                                      &config.intent_type)) {
                 *error = path + ".intent_type is invalid";
                 return false;
             }

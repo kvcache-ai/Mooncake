@@ -42,6 +42,7 @@ class RdmaCQ;
 class RdmaEndPoint;
 class EndpointStore;
 class RdmaTransport;
+struct RdmaTask;
 
 class RdmaContext {
     friend class RdmaCQ;
@@ -121,6 +122,14 @@ class RdmaContext {
     // Notification CQ (dedicated for notification QPs)
     RdmaCQ *notifyCq() { return notify_cq_; }
 
+    // Dedicated foreground CQ. Worker threads do not poll this CQ; callers
+    // drive it through getTransferStatus().
+    RdmaCQ *directCq() { return direct_cq_; }
+
+    bool tryAcquireDirectLane(RdmaTask *task);
+
+    void releaseDirectLane(RdmaTask *task);
+
    private:
     int openDevice(const std::string &device_name, uint8_t port);
 
@@ -157,6 +166,8 @@ class RdmaContext {
 
     // Dedicated CQ for notification QPs (one per device)
     RdmaCQ *notify_cq_ = nullptr;
+    RdmaCQ *direct_cq_ = nullptr;
+    std::atomic<RdmaTask *> direct_lane_owner_{nullptr};
 
     // PCIe Relaxed Ordering support
     bool relaxed_ordering_enabled_ = false;

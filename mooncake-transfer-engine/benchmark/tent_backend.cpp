@@ -14,6 +14,7 @@
 
 #include "tent_backend.h"
 #include "utils.h"
+#include "workload_config.h"
 #include "char_util.h"
 #include "tent/common/types.h"
 #include "tent/runtime/platform.h"
@@ -92,26 +93,6 @@ static TransportType getTransportType(const std::string& xport_type) {
     if (xport_type == "iouring") return IOURING;
     if (xport_type == "sunrise_link") return SUNRISE_LINK;
     return UNSPEC;
-}
-
-static IntentType getIntentType(const std::string& intent_type) {
-    std::string normalized_intent = intent_type;
-    for (auto& c : normalized_intent) c = to_lower(c);
-
-    static const std::unordered_map<std::string, IntentType> kIntentTypes = {
-        {"unspec", IntentType::INTENT_UNSPEC},
-        {"intent_unspec", IntentType::INTENT_UNSPEC},
-        {"foreground_get", IntentType::FOREGROUND_GET},
-        {"background_prefetch", IntentType::BACKGROUND_PREFETCH},
-        {"migration", IntentType::MIGRATION},
-        {"checkpoint", IntentType::CHECKPOINT},
-        {"weight_loading", IntentType::WEIGHT_LOADING},
-        {"staging_internal", IntentType::STAGING_INTERNAL},
-    };
-    auto it = kIntentTypes.find(normalized_intent);
-    LOG_ASSERT(it != kIntentTypes.end())
-        << "Invalid --tent_intent_type=" << intent_type;
-    return it->second;
 }
 
 // Resolve device prefix, start index, and buffer count for a single seg_type.
@@ -293,7 +274,9 @@ TENTBenchRunner::TENTBenchRunner() {
     signal(SIGTERM, signalHandlerV1);
     engine_ = std::make_unique<TransferEngine>(loadConfig());
     transport_hint_ = parseTransportType(XferBenchConfig::tent_transport_hint);
-    intent_type_ = getIntentType(XferBenchConfig::tent_intent_type);
+    LOG_ASSERT(parseBenchIntentType(XferBenchConfig::tent_intent_type,
+                                    &intent_type_))
+        << "Invalid --tent_intent_type=" << XferBenchConfig::tent_intent_type;
     allocateBuffers();
 }
 

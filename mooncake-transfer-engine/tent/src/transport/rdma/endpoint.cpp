@@ -147,13 +147,37 @@ int RdmaEndPoint::construct(RdmaContext* context, EndPointParams* params,
         return -1;
     }
 
+    auto direct_cq = context_->directCq()->cq();
+    ibv_qp_init_attr direct_attr;
+    memset(&direct_attr, 0, sizeof(direct_attr));
+    direct_attr.send_cq = direct_cq;
+    direct_attr.recv_cq = direct_cq;
+    direct_attr.sq_sig_all = false;
+    direct_attr.qp_type = IBV_QPT_RC;
+    direct_attr.qp_context = this;
+    direct_attr.cap.max_send_wr = 1;
+    direct_attr.cap.max_recv_wr = 1;
+    direct_attr.cap.max_send_sge = 1;
+    direct_attr.cap.max_recv_sge = 1;
+    direct_attr.cap.max_inline_data = params_->max_inline_bytes;
+    direct_qp_ =
+        context_->verbs_.ibv_create_qp(context_->nativePD(), &direct_attr);
+    if (!direct_qp_) {
+        PLOG(ERROR) << "Failed to create direct QP";
+        deconstruct();
+        return -1;
+    }
+    direct_wr_depth_.store(0, std::memory_order_relaxed);
+
     // Modify notification QP to INIT
     ibv_qp_attr qp_attr;
     memset(&qp_attr, 0, sizeof(qp_attr));
     qp_attr.qp_state = IBV_QPS_INIT;
     qp_attr.pkey_index = params_->pkey_index;
     qp_attr.port_num = context_->portNum();
-    qp_attr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE;
+    qp_attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
+                              IBV_ACCESS_REMOTE_WRITE |
+                              IBV_ACCESS_REMOTE_ATOMIC;
 
     if (context_->verbs_.ibv_modify_qp(notify_qp_, &qp_attr,
                                        IBV_QP_STATE | IBV_QP_PKEY_INDEX |
@@ -222,6 +246,16 @@ int RdmaEndPoint::deconstructUnlocked() {
     }
 
     int result = 0;
+    if (direct_qp_) {
+        int outstanding = direct_wr_depth_.load(std::memory_order_relaxed);
+        if (outstanding != 0) cancelDirectQuota();
+        if (context_->verbs_.ibv_destroy_qp(direct_qp_)) {
+            PLOG(ERROR) << "Failed to destroy direct QP";
+            result = -1;
+        } else {
+            direct_qp_ = nullptr;
+        }
+    }
 
     {
         std::lock_guard<std::mutex> notify_guard(notify_resource_mutex_);
@@ -292,10 +326,11 @@ int RdmaEndPoint::deconstructUnlocked() {
         wr_depth_list_ = nullptr;
     }
 
-    if (result == 0 && !notify_qp_ && notify_recv_mrs_.empty() &&
-        !notify_send_mr_ && qp_list_.empty()) {
+    if (result == 0 && !direct_qp_ && !notify_qp_ &&
+        notify_recv_mrs_.empty() && !notify_send_mr_ && qp_list_.empty()) {
         peer_server_name_.clear();
         peer_nic_name_.clear();
+        peer_direct_qp_num_ = 0;
         status_.store(EP_DESTROYED, std::memory_order_release);
         return 0;
     }
@@ -349,6 +384,10 @@ void RdmaEndPoint::beginDestroyNoLock() {
         PLOG(ERROR) << "Failed to modify notification QP to ERR in "
                        "beginDestroy";
     }
+    if (direct_qp_ &&
+        context_->verbs_.ibv_modify_qp(direct_qp_, &attr, IBV_QP_STATE)) {
+        PLOG(ERROR) << "Failed to modify direct QP to ERR in beginDestroy";
+    }
 }
 
 bool RdmaEndPoint::finishDestroy() {
@@ -372,6 +411,9 @@ bool RdmaEndPoint::finishDestroy() {
             has_outstanding = true;
             break;
         }
+    }
+    if (direct_wr_depth_.load(std::memory_order_relaxed) != 0) {
+        has_outstanding = true;
     }
     if (has_outstanding) {
         double elapsed = (getCurrentTimeInNano() - destroy_start_time_) / 1e9;
@@ -427,6 +469,7 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
         qp_num = qpNum();
         local_desc.qp_num = qp_num;
         local_desc.notify_qp_num = notifyQpNum();
+        local_desc.direct_qp_num = directQpNum();
         local_desc.local_lid = context_->lid();
         local_desc.local_gid = context_->gid();
 
@@ -523,6 +566,18 @@ Status RdmaEndPoint::connect(const std::string& peer_server_name,
                 "Failed to configure RDMA endpoint" LOC_MARK);
         }
         peer_qp_num_list_ = qp_num;
+        peer_direct_qp_num_ = peer_desc.direct_qp_num;
+        if (direct_qp_ && peer_desc.direct_qp_num != 0) {
+            rc = setupNotifyQpConnection(
+                direct_qp_, context_, peer_gid, peer_lid,
+                peer_desc.direct_qp_num, params_->pkey_index,
+                params_->service_level, params_->traffic_class);
+            if (rc) {
+                beginDestroyNoLock();
+                return mooncake::tent::Status::InternalError(
+                    "Failed to configure direct RDMA QP" LOC_MARK);
+            }
+        }
 
         // Setup notification QP connection if peer supports it
         if (peer_desc.notify_qp_num != 0 && notify_qp_) {
@@ -562,7 +617,8 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
             getNicNameFromNicPath(peer_desc.local_nic_path);
         if (incoming_peer_server == peer_server_name_ &&
             incoming_peer_nic == peer_nic_name_ &&
-            peer_desc.qp_num == peer_qp_num_list_) {
+            peer_desc.qp_num == peer_qp_num_list_ &&
+            peer_desc.direct_qp_num == peer_direct_qp_num_) {
             LOG(INFO) << "Endpoint already established with " << peer_nic_name_
                       << " of " << peer_server_name_
                       << " (duplicate bootstrap, reusing connection)";
@@ -574,6 +630,7 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
             local_desc.local_lid = context_->lid();
             local_desc.local_gid = context_->gid();
             local_desc.notify_qp_num = notifyQpNum();
+            local_desc.direct_qp_num = directQpNum();
             return mooncake::tent::Status::OK();
         }
         // The bootstrap does not match the established connection: the peer
@@ -610,6 +667,7 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
     local_desc.local_lid = context_->lid();
     local_desc.local_gid = context_->gid();
     local_desc.notify_qp_num = notifyQpNum();  // Pass notification QP number
+    local_desc.direct_qp_num = directQpNum();
     if (peer_desc.local_gid.empty()) {
         return mooncake::tent::Status::InvalidArgument(
             "Missing peer GID in bootstrap" LOC_MARK);
@@ -624,6 +682,18 @@ Status RdmaEndPoint::accept(const BootstrapDesc& peer_desc,
             "Failed to configure RDMA endpoint" LOC_MARK);
     }
     peer_qp_num_list_ = peer_desc.qp_num;
+    peer_direct_qp_num_ = peer_desc.direct_qp_num;
+    if (direct_qp_ && peer_desc.direct_qp_num != 0) {
+        rc = setupNotifyQpConnection(
+            direct_qp_, context_, peer_desc.local_gid, peer_desc.local_lid,
+            peer_desc.direct_qp_num, params_->pkey_index, params_->service_level,
+            params_->traffic_class);
+        if (rc) {
+            beginDestroyNoLock();
+            return mooncake::tent::Status::InternalError(
+                "Failed to configure direct RDMA QP" LOC_MARK);
+        }
+    }
 
     // Setup notification QP connection if peer supports it
     if (peer_desc.notify_qp_num != 0 && notify_qp_) {
@@ -715,6 +785,54 @@ static ibv_wr_opcode getOpCode(RdmaSlice* slice) {
         default:
             return IBV_WR_RDMA_READ;
     }
+}
+
+Status RdmaEndPoint::submitDirectSlice(RdmaSlice* slice) {
+    if (!slice) return Status::InvalidArgument("Invalid direct slice" LOC_MARK);
+    RWSpinlock::ReadGuard guard(lock_);
+    if (!direct_qp_ ||
+        status_.load(std::memory_order_relaxed) != EP_READY) {
+        return Status::InvalidArgument("Direct QP is not ready" LOC_MARK);
+    }
+    if (!reserveDirectQuota()) {
+        return Status::TooManyRequests("Direct QP is busy" LOC_MARK);
+    }
+
+    auto self = shared_from_this();
+    slice->ep_weak_ptr = self;
+    slice->qp_index = -1;
+    slice->failed = false;
+
+    ibv_sge sge;
+    memset(&sge, 0, sizeof(sge));
+    sge.addr = reinterpret_cast<uint64_t>(slice->source_addr);
+    sge.length = slice->length;
+    sge.lkey = slice->source_lkey;
+
+    ibv_send_wr wr;
+    memset(&wr, 0, sizeof(wr));
+    wr.wr_id = reinterpret_cast<uint64_t>(slice);
+    wr.opcode = getOpCode(slice);
+    wr.num_sge = 1;
+    wr.sg_list = &sge;
+    wr.send_flags = IBV_SEND_SIGNALED;
+    wr.wr.rdma.remote_addr = slice->target_addr;
+    wr.wr.rdma.rkey = slice->target_rkey;
+
+    ibv_send_wr* bad_wr = nullptr;
+    int rc = ibv_post_send(direct_qp_, &wr, &bad_wr);
+    if (rc) {
+        cancelDirectQuota();
+        return Status::RdmaError(
+            std::string("direct ibv_post_send: ") + strerror(abs(rc)) +
+            LOC_MARK);
+    }
+    return Status::OK();
+}
+
+void RdmaEndPoint::completeDirectSlice(RdmaSlice* slice) {
+    (void)slice;
+    cancelDirectQuota();
 }
 
 int RdmaEndPoint::submitSlices(std::vector<RdmaSlice*>& slice_list,
@@ -884,6 +1002,27 @@ void RdmaEndPoint::cancelQuota(int qp_index, int num_entries) {
     cq->cancelQuota(num_entries);
 }
 
+bool RdmaEndPoint::reserveDirectQuota() {
+    auto cq = context_->directCq();
+    if (!cq || !cq->reserveQuota(1)) return false;
+    int prev = direct_wr_depth_.fetch_add(1, std::memory_order_acq_rel);
+    if (prev >= 1) {
+        cancelDirectQuota();
+        return false;
+    }
+    return true;
+}
+
+void RdmaEndPoint::cancelDirectQuota() {
+    int prev = direct_wr_depth_.fetch_sub(1, std::memory_order_acq_rel);
+    if (prev <= 0) {
+        direct_wr_depth_.fetch_add(1, std::memory_order_acq_rel);
+        return;
+    }
+    auto cq = context_->directCq();
+    if (cq) cq->cancelQuota(1);
+}
+
 int RdmaEndPoint::setupOneQP(int qp_index, const std::string& peer_gid,
                              uint16_t peer_lid, uint32_t peer_qp_num,
                              std::string* reply_msg) {
@@ -1041,7 +1180,9 @@ static int setupNotifyQpConnection(ibv_qp* qp, RdmaContext* ctx,
     qp_attr.qp_state = IBV_QPS_INIT;
     qp_attr.pkey_index = pkey_index;
     qp_attr.port_num = ctx->portNum();
-    qp_attr.qp_access_flags = IBV_ACCESS_REMOTE_WRITE;
+    qp_attr.qp_access_flags = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ |
+                              IBV_ACCESS_REMOTE_WRITE |
+                              IBV_ACCESS_REMOTE_ATOMIC;
     ret = ibv_modify_qp(
         qp, &qp_attr,
         IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);

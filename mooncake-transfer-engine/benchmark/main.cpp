@@ -55,6 +55,15 @@ int processBatchSizes(
         exit(EXIT_FAILURE);
     }
 
+    IntentType sweep_intent_type = IntentType::INTENT_UNSPEC;
+    if (workload_classes.empty() &&
+        !parseBenchIntentType(XferBenchConfig::tent_intent_type,
+                              &sweep_intent_type)) {
+        LOG(ERROR) << "Invalid --tent_intent_type="
+                   << XferBenchConfig::tent_intent_type;
+        return -1;
+    }
+
     XferBenchStats stats;
     std::vector<XferBenchStats> qos_stats(qos_classes.size());
     XferBenchStats tight_stats;
@@ -98,7 +107,7 @@ int processBatchSizes(
         const size_t thread_batch_size =
             workload ? workload->batch_size : batch_size;
         const IntentType intent_type =
-            workload ? workload->intent_type : IntentType::INTENT_UNSPEC;
+            workload ? workload->intent_type : sweep_intent_type;
         const bool tight = XferBenchConfig::deadline_us > 0 &&
                            thread_id < XferBenchConfig::deadline_tight_threads;
         auto deadlineNs = [&]() -> uint64_t {
@@ -301,6 +310,11 @@ int main(int argc, char* argv[]) {
     if (XferBenchConfig::deadline_us > 0 &&
         XferBenchConfig::backend != "tent") {
         LOG(ERROR) << "deadline tagging is supported only by the tent backend";
+        return EXIT_FAILURE;
+    }
+    if (XferBenchConfig::tent_intent_type != "unspec" &&
+        XferBenchConfig::backend != "tent") {
+        LOG(ERROR) << "--tent_intent_type is supported only by the tent backend";
         return EXIT_FAILURE;
     }
     if (!workload_classes.empty() &&

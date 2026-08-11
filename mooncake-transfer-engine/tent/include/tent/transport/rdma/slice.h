@@ -60,6 +60,9 @@ struct RdmaTask {
     std::atomic<int> success_slices{0};
     std::atomic<int> resolved_slices{0};
     volatile TransferStatusEnum first_error = PENDING;
+    bool direct = false;
+    int direct_context_index = -1;
+    RdmaSlice* direct_slice = nullptr;
 
     // Set by the control thread. Workers observe this flag before posting or
     // retrying a slice. Already-posted WRs are allowed to drain normally.
@@ -109,6 +112,7 @@ struct RdmaSlice {
     // rotate through all combinations with wraparound instead of hammering one.
     int last_fallback_idx = -1;
     bool failed = false;
+    bool direct_posted = false;
     // True while DeviceSelector accounts this slice against source_dev_id.
     // The worker clears it exactly once on completion, failure, or cancel.
     bool quota_charged = false;

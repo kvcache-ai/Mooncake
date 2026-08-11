@@ -391,6 +391,15 @@ int RdmaContext::enable() {
         return notify_ret;
     }
 
+    direct_cq_ = new RdmaCQ();
+    int direct_ret = direct_cq_->construct(this, params_->device.max_cqe,
+                                          params_->device.num_cq_list + 1);
+    if (direct_ret) {
+        LOG(ERROR) << "Failed to create direct CQ for " << device_name_;
+        disable();
+        return direct_ret;
+    }
+
     // Check PCIe Relaxed Ordering support from config
     // Mode: 0 = disabled, 1 = enabled if supported, 2 = auto (default)
     auto mode =
@@ -475,6 +484,11 @@ void RdmaContext::cleanupResources() {
         delete notify_cq_;
         notify_cq_ = nullptr;
     }
+    if (direct_cq_) {
+        delete direct_cq_;
+        direct_cq_ = nullptr;
+    }
+    direct_lane_owner_.store(nullptr, std::memory_order_release);
 
     if (event_fd_ >= 0) {
         if (close(event_fd_)) PLOG(ERROR) << "close";
@@ -497,6 +511,18 @@ void RdmaContext::cleanupResources() {
             PLOG(ERROR) << "ibv_close_device";
         native_context_ = nullptr;
     }
+}
+
+bool RdmaContext::tryAcquireDirectLane(RdmaTask* task) {
+    RdmaTask* expected = nullptr;
+    return direct_lane_owner_.compare_exchange_strong(
+        expected, task, std::memory_order_acq_rel, std::memory_order_acquire);
+}
+
+void RdmaContext::releaseDirectLane(RdmaTask* task) {
+    RdmaTask* expected = task;
+    direct_lane_owner_.compare_exchange_strong(
+        expected, nullptr, std::memory_order_acq_rel, std::memory_order_acquire);
 }
 
 int RdmaContext::pause() {
