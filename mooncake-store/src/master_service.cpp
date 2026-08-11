@@ -1715,13 +1715,19 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
         });
     if (enable_multi_tenants_ && erased_memory_replicas > 0 &&
         has_processing_memory) {
-        const uint64_t completed_charge = CompletedMemoryQuotaCharge(metadata);
         const uint64_t committed_charge =
             metadata.quota_ledger.CommittedBytes();
-        const uint64_t release_bytes = committed_charge > completed_charge
-                                           ? committed_charge - completed_charge
-                                           : 0;
-        if (release_bytes > 0) {
+        if (metadata.size > committed_charge / erased_memory_replicas) {
+            LOG(ERROR) << "tenant quota removed-replica release exceeds "
+                          "committed bytes, tenant="
+                       << tenant_id.value()
+                       << ", key=" << durable_entry.object_key
+                       << ", object_size=" << metadata.size
+                       << ", erased_memory_replicas=" << erased_memory_replicas
+                       << ", committed_bytes=" << committed_charge;
+        } else {
+            const uint64_t release_bytes =
+                metadata.size * erased_memory_replicas;
             auto release_result = metadata.quota_ledger.ReleaseCommitted(
                 GetBoundTenantQuotaHandle(tenant_state), release_bytes);
             LogTenantQuotaLedgerError(release_result, "release_committed",

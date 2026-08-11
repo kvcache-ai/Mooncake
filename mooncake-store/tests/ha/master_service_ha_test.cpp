@@ -2460,6 +2460,88 @@ TEST_F(MasterServiceHATest,
 }
 
 TEST_F(MasterServiceHATest,
+       MoveFinalizeDuringSameSizeUpsertReleasesOnlyRemovedReplicaQuota) {
+    const std::string cluster_id = "test_batch_move_upsert_quota";
+    constexpr uint64_t object_size = 1024;
+    auto backend = std::make_shared<BlockingBatchHaKvBackend>();
+    auto service_config =
+        MasterServiceConfig::builder()
+            .set_default_kv_lease_ttl(50)
+            .set_enable_ha(true)
+            .set_enable_oplog(true)
+            .set_cluster_id(cluster_id)
+            .set_oplog_batch_max_entries(1)
+            .set_eviction_high_watermark_ratio(1.0)
+            .set_enable_multi_tenants(true)
+            .set_tenant_quota_connector_type("file")
+            .set_tenant_quota_connector_uri(WriteTenantPolicyFile(
+                {{kDefaultTenant.value(), 2 * object_size}}))
+            .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    const std::string source_name = "batch_move_upsert_quota_src";
+    const std::string target_name = "batch_move_upsert_quota_dst";
+    auto source = PrepareSimpleSegment(service, source_name,
+                                       kDefaultSegmentBase, object_size);
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+    PrepareSimpleSegment(service, target_name,
+                         kDefaultSegmentBase + kDefaultSegmentSize,
+                         object_size);
+    ReadBatchEventually(storage, 2, batch);
+
+    const std::string key = "batch_move_upsert_quota_key";
+    PutObjectOnSegment(service, source.client_id, key, source_name,
+                       object_size);
+    ReadBatchEventually(storage, 3, batch);
+    ASSERT_TRUE(service
+                    .MoveStart(source.client_id, key, kDefaultTenant,
+                               source_name, target_name)
+                    .has_value());
+
+    backend->BlockTxn();
+    auto move_future = std::async(std::launch::async, [&] {
+        return service.MoveEnd(source.client_id, key, kDefaultTenant);
+    });
+    const auto status = move_future.wait_for(std::chrono::milliseconds(200));
+    EXPECT_EQ(std::future_status::ready, status);
+    if (status != std::future_status::ready) {
+        backend->AllowTxn();
+    }
+    auto move_end = move_future.get();
+    ASSERT_TRUE(move_end.has_value()) << toString(move_end.error());
+    ASSERT_EQ(service.GetTenantQuotaSnapshot(kDefaultTenant)->charged_bytes,
+              2 * object_size);
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segments = {target_name};
+    auto upsert = service.UpsertStart(source.client_id, key, kDefaultTenant,
+                                      object_size, config);
+    ASSERT_TRUE(upsert.has_value()) << toString(upsert.error());
+
+    backend->AllowTxn();
+    ReadBatchEventually(storage, 4, batch);
+    uint64_t charged_bytes = 2 * object_size;
+    for (int i = 0; i < 50 && charged_bytes == 2 * object_size; ++i) {
+        charged_bytes =
+            service.GetTenantQuotaSnapshot(kDefaultTenant)->charged_bytes;
+        if (charged_bytes == 2 * object_size) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+        }
+    }
+    ASSERT_EQ(charged_bytes, object_size);
+
+    auto upsert_end = service.UpsertEnd(source.client_id, key, kDefaultTenant,
+                                        ReplicaType::MEMORY);
+    ASSERT_TRUE(upsert_end.has_value()) << toString(upsert_end.error());
+    EXPECT_EQ(service.GetTenantQuotaSnapshot(kDefaultTenant)->charged_bytes,
+              object_size);
+}
+
+TEST_F(MasterServiceHATest,
        NotifyOffloadSuccessFallbackWritesBatchRecordOpLog) {
     const std::string cluster_id = "test_batch_record_offload_cluster";
     auto backend = std::make_shared<FakeBatchHaKvBackend>();
