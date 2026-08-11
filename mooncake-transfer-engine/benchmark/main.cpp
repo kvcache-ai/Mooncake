@@ -28,8 +28,6 @@
 
 using namespace mooncake::tent;
 
-namespace {
-
 uint64_t steadyClockNs() {
     const auto now = std::chrono::steady_clock::now().time_since_epoch();
     return std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
@@ -39,8 +37,6 @@ double gbPerSecond(uint64_t bytes, double duration_us) {
     if (duration_us <= 0.0) return 0.0;
     return static_cast<double>(bytes) / (1000.0 * duration_us);
 }
-
-}  // namespace
 
 int processBatchSizes(
     BenchRunner& runner, size_t block_size, size_t batch_size, int num_threads,
