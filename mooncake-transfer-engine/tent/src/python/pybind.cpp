@@ -436,6 +436,9 @@ PYBIND11_MODULE(tent, m) {
         .def("get_segment_name", &TransferEngine::getSegmentName)
         .def("get_rpc_server_address", &TransferEngine::getRpcServerAddress)
         .def("get_rpc_server_port", &TransferEngine::getRpcServerPort)
+        .def("get_local_topology", &TransferEngine::getLocalTopologyString,
+             "Dump local topology as native TENT JSON (nics/mems with "
+             "rank0/1/2)")
 
         // ---------------------------------------------------------------------
         // export/import: out param -> return

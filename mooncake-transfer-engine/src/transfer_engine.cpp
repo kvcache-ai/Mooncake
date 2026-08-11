@@ -313,6 +313,11 @@ std::shared_ptr<Topology> TransferEngine::getLocalTopology() {
     return impl_->getLocalTopology();
 }
 
+std::string TransferEngine::getLocalTopologyString() {
+    auto topo = impl_->getLocalTopology();
+    return topo ? topo->toString() : "{}";
+}
+
 void TransferEngine::enableGracefulShutdown() {
     if (!shutdown_token_) {
         shutdown_token_ = registerTransferEngineShutdownToken(this);
@@ -332,6 +337,9 @@ std::string TransferEngine::showLinks(bool json) const {
 #include "transfer_engine_impl.h"
 #include "tent/transfer_engine.h"
 #include "tent/common/config.h"
+#include "tent/common/types.h"
+#include "tent/runtime/topology.h"
+#include "topology.h"
 
 #include <mutex>
 #include <utility>
@@ -865,10 +873,61 @@ int TransferEngine::numContexts() const {
 
 std::shared_ptr<Topology> TransferEngine::getLocalTopology() {
     if (use_tent_) {
-        LOG(WARNING) << "API deprecated in Mooncake TENT";
-        return std::make_shared<Topology>();
-    } else
+        // Classic Topology only supports a 2-tier priority matrix. Prefer
+        // getLocalTopologyString() for the full TENT nics/mems (rank0/1/2)
+        // representation. This method still projects into the classic format
+        // for existing C++ callers.
+        auto classic = std::make_shared<Topology>();
+        if (!impl_tent_ || !impl_tent_->available()) return classic;
+        auto tent_topo = impl_tent_->getLocalTopology();
+        if (!tent_topo) return classic;
+
+        Json::Value root(Json::objectValue);
+        for (size_t mi = 0; mi < tent_topo->getMemCount(); ++mi) {
+            const auto* mem =
+                tent_topo->getMemEntry(static_cast<tent::Topology::MemID>(mi));
+            if (!mem) continue;
+            if (mem->name.empty() || mem->name == tent::kWildcardLocation) {
+                continue;
+            }
+            Json::Value preferred(Json::arrayValue);
+            Json::Value avail(Json::arrayValue);
+            for (auto id : mem->device_list[0]) {
+                preferred.append(tent_topo->getNicName(id));
+            }
+            for (size_t rank = 1; rank < tent::Topology::DevicePriorityRanks;
+                 ++rank) {
+                for (auto id : mem->device_list[rank]) {
+                    avail.append(tent_topo->getNicName(id));
+                }
+            }
+            Json::Value entry(Json::arrayValue);
+            entry.append(preferred);
+            entry.append(avail);
+            root[mem->name] = entry;
+        }
+
+        Json::StreamWriterBuilder builder;
+        builder["indentation"] = "";
+        const std::string json = Json::writeString(builder, root);
+        if (classic->parse(json)) {
+            LOG(WARNING) << "Failed to translate TENT topology to classic "
+                            "priority matrix";
+            classic->clear();
+        }
+        return classic;
+    } else {
         return impl_->getLocalTopology();
+    }
+}
+
+std::string TransferEngine::getLocalTopologyString() {
+    if (use_tent_) {
+        if (!impl_tent_ || !impl_tent_->available()) return "{}";
+        return impl_tent_->getLocalTopologyString();
+    }
+    auto topo = impl_ ? impl_->getLocalTopology() : nullptr;
+    return topo ? topo->toString() : "{}";
 }
 
 void* TransferEngine::getBaseAddr() {

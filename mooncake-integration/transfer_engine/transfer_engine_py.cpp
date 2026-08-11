@@ -15,6 +15,7 @@
 #include "transfer_engine_py.h"
 
 #include <cassert>
+#include <cstdlib>
 #include <numeric>
 #include <fstream>
 
@@ -1068,13 +1069,38 @@ std::string TransferEnginePy::getLocalTopology(const char* device_name) {
     pybind11::gil_scoped_release release;
     auto device_name_safe = device_name ? std::string(device_name) : "";
     auto device_filter = buildDeviceFilter(device_name_safe);
+
+    // Under TENT, classic constructor filters are ignored; map device_name to
+    // MC_TE_FILTERS so topology discovery respects the whitelist.
+    std::string saved_filters;
+    bool restore_filters = false;
+    const bool use_tent =
+        getenv("MC_USE_TENT") != nullptr || getenv("MC_USE_TEV1") != nullptr;
+    if (use_tent && !device_name_safe.empty()) {
+        const char* old = getenv("MC_TE_FILTERS");
+        if (old) saved_filters = old;
+        setenv("MC_TE_FILTERS", device_name_safe.c_str(), 1);
+        restore_filters = true;
+    }
+
     std::shared_ptr<TransferEngine> tmp_engine =
         std::make_shared<TransferEngine>(true, device_filter);
 
     std::string metadata_conn_string{"P2PHANDSHAKE"}, local_server_name{};
     tmp_engine->init(metadata_conn_string, local_server_name);
 
-    return tmp_engine->getLocalTopology()->toString();
+    // Under TENT this returns native {"nics","mems"} with rank0/1/2; under
+    // classic TE it returns the priority-matrix JSON.
+    std::string result = tmp_engine->getLocalTopologyString();
+
+    if (restore_filters) {
+        if (saved_filters.empty()) {
+            unsetenv("MC_TE_FILTERS");
+        } else {
+            setenv("MC_TE_FILTERS", saved_filters.c_str(), 1);
+        }
+    }
+    return result;
 }
 
 std::vector<TransferEnginePy::TransferNotify> TransferEnginePy::getNotifies() {

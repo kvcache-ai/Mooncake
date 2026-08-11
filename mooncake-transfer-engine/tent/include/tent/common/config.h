@@ -165,6 +165,9 @@ class Config {
 
     std::string dump(int indent = 2) const;
 
+    // If key_path resolves to a JSON value, dump it into *out and return true.
+    bool dumpSubtree(const std::string& key_path, std::string* out) const;
+
    private:
     json config_data_;
     mutable std::mutex mutex_;
