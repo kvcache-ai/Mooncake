@@ -15,6 +15,12 @@ static constexpr int kOpLogBatchIdWidth = 20;
 struct DurablePrefix {
     uint64_t batch_id{0};
     uint64_t last_seq{0};
+    // Leadership view that produced this durable boundary. Zero means that
+    // the prefix has no producer-view metadata (legacy or not yet assigned).
+    ViewVersionId producer_view_version{0};
+
+    friend bool operator==(const DurablePrefix&,
+                           const DurablePrefix&) = default;
 };
 
 struct BatchRecordRange {
