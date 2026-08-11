@@ -4245,7 +4245,7 @@ TEST_F(MasterServiceTest, ConcurrentRemoveAllOperations) {
     }
 }
 
-TEST_F(MasterServiceTest, UnmountSegmentImmediateCleanup) {
+TEST_F(MasterServiceTest, UnmountSegmentHidesReplicasBeforeAsyncCleanup) {
     std::unique_ptr<MasterService> service_(new MasterService());
 
     // Mount two segments for testing
@@ -4270,19 +4270,28 @@ TEST_F(MasterServiceTest, UnmountSegmentImmediateCleanup) {
     ReplicateConfig config;
     config.replica_num = 1;
 
-    // Unmount segment1
+    // Unmount segment1. The allocator becomes unavailable synchronously while
+    // physical metadata cleanup runs on the background worker.
     auto unmount_result1 = service_->UnmountSegment(segment1.id, client_id);
     ASSERT_TRUE(unmount_result1.has_value());
-    // Umount will remove all objects in the segment, include the key1
-    ASSERT_EQ(1, service_->GetKeyCount());
-    // Verify objects in segment1 is gone
+
+    // Query paths must not expose the unavailable replica, even if the worker
+    // has not removed its metadata yet.
     auto get_result1 = service_->GetReplicaList(key1, TenantId::Default());
     ASSERT_FALSE(get_result1.has_value());
-    ASSERT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result1.error());
+    EXPECT_TRUE(get_result1.error() == ErrorCode::OBJECT_NOT_FOUND ||
+                get_result1.error() == ErrorCode::REPLICA_IS_NOT_READY);
 
     // Verify objects in segment2 is still there
     auto get_result2 = service_->GetReplicaList(key2, TenantId::Default());
     ASSERT_TRUE(get_result2.has_value());
+
+    // The worker eventually removes the old physical metadata, after which
+    // the same key can be inserted again.
+    for (size_t i = 0; i < 100 && service_->GetKeyCount() != 1; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    ASSERT_EQ(1u, service_->GetKeyCount());
 
     // Verify put key1 will put into segment2 rather than segment1
     auto put_start_result = service_->PutStart(
@@ -4299,6 +4308,23 @@ TEST_F(MasterServiceTest, UnmountSegmentImmediateCleanup) {
                   .get_memory_descriptor()
                   .buffer_descriptor.transport_endpoint_,
               segment2.name);
+    EXPECT_EQ(2u, service_->GetKeyCount());
+}
+
+TEST_F(MasterServiceTest, UnmountSegmentKeepsSynchronousCleanupInHaMode) {
+    auto config = MasterServiceConfig::builder().set_enable_ha(true).build();
+    auto service = std::make_unique<MasterService>(config);
+
+    auto segment = MakeSegment("ha_sync_segment");
+    UUID client_id = generate_uuid();
+    ASSERT_TRUE(service->MountSegment(segment, client_id).has_value());
+    const auto key = GenerateKeyForSegment(client_id, service, segment.name);
+    auto exists = service->ExistKey(key, TenantId::Default());
+    ASSERT_TRUE(exists.has_value());
+    ASSERT_TRUE(exists.value());
+
+    ASSERT_TRUE(service->UnmountSegment(segment.id, client_id).has_value());
+    EXPECT_EQ(0u, service->GetKeyCount());
 }
 
 TEST_F(MasterServiceTest, ReadableAfterPartialUnmountWithReplication) {
@@ -4355,6 +4381,10 @@ TEST_F(MasterServiceTest, ReadableAfterPartialUnmountWithReplication) {
     auto get_after_unmount = service_->GetReplicaList(key, TenantId::Default());
     ASSERT_TRUE(get_after_unmount.has_value())
         << "Object should remain accessible with surviving replica";
+    ASSERT_EQ(1u, get_after_unmount->replicas.size());
+    EXPECT_EQ(segment2.name, get_after_unmount->replicas[0]
+                                 .get_memory_descriptor()
+                                 .buffer_descriptor.transport_endpoint_);
 }
 
 TEST_F(MasterServiceTest, PutStartPartialAllocationIsObservable) {

@@ -180,6 +180,9 @@ MasterService::MasterService(const MasterServiceConfig& config)
                       << ", error=" << toString(result.error());
               }
           }),
+      replica_cleanup_worker_([this] { ClearInvalidHandles(); }),
+      enable_async_segment_cleanup_(
+          !config.enable_ha && !config.enable_snapshot && !config.enable_cxl),
       default_kv_lease_ttl_(config.default_kv_lease_ttl),
       default_kv_soft_pin_ttl_(config.default_kv_soft_pin_ttl),
       max_kv_soft_pin_ttl_(config.max_kv_soft_pin_ttl),
@@ -465,6 +468,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
         std::thread(&MasterService::TaskCleanupThreadFunc, this);
     VLOG(1) << "action=start_task_cleanup_thread";
 
+    replica_cleanup_worker_.Start();
+
     // NOTE: The async HTTP metadata cleanup worker is started lazily in
     // setHttpMetadataRemoteUrl() once http_metadata_remote_ is initialized,
     // since that happens after this constructor returns (in
@@ -610,6 +615,7 @@ MasterService::~MasterService() {
     job_dispatch_running_ = false;
     http_metadata_cleanup_running_ = false;
     graceful_unmount_scheduler_.Stop();
+    replica_cleanup_worker_.Stop();
 #ifdef USE_NOF
     nof_heartbeat_running_ = false;
 #endif
@@ -2511,11 +2517,16 @@ auto MasterService::UnmountSegment(const UUID& segment_id,
         if (err != ErrorCode::OK) {
             return tl::make_unexpected(err);
         }
-    }  // Release the segment mutex before long-running step 2 and avoid
-       // deadlocks
+    }
 
-    // 2. Remove the metadata of the related objects
-    ClearInvalidHandles();
+    // Keep HA, snapshot, and CXL behavior unchanged. Regular memory segments
+    // become unreadable as soon as PrepareUnmountSegment releases their
+    // allocator; only the physical metadata sweep is deferred.
+    if (enable_async_segment_cleanup_) {
+        replica_cleanup_worker_.Schedule();
+    } else {
+        ClearInvalidHandles();
+    }
 
     // Cache endpoint before commit removes segment from registry.
     std::string segment_name;
@@ -3448,7 +3459,12 @@ auto MasterService::GetReplicaListForAdmin(const std::string& key,
 
     std::vector<Replica::Descriptor> replica_list;
     metadata.VisitReplicas(
-        &Replica::fn_is_completed, [&replica_list](const Replica& replica) {
+        [](const Replica& replica) {
+            return replica.is_completed() &&
+                   !replica.has_invalid_mem_handle() &&
+                   !replica.has_invalid_nof_handle();
+        },
+        [&replica_list](const Replica& replica) {
             replica_list.emplace_back(replica.get_descriptor());
         });
 
@@ -3664,7 +3680,11 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
                 const auto& metadata = metadata_it->second;
                 std::vector<Replica::Descriptor> replica_list;
                 metadata.VisitReplicas(
-                    &Replica::fn_is_completed,
+                    [](const Replica& replica) {
+                        return replica.is_completed() &&
+                               !replica.has_invalid_mem_handle() &&
+                               !replica.has_invalid_nof_handle();
+                    },
                     [&replica_list](const Replica& replica) {
                         replica_list.emplace_back(replica.get_descriptor());
                     });
