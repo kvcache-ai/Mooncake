@@ -24,6 +24,8 @@
 
 namespace mooncake {
 
+struct DistributedStorageConfig;
+
 class DfsGlobalAllocator {
    public:
     struct EvictedKey {
@@ -38,8 +40,7 @@ class DfsGlobalAllocator {
     DfsGlobalAllocator(const DfsGlobalAllocator&) = delete;
     DfsGlobalAllocator& operator=(const DfsGlobalAllocator&) = delete;
 
-    bool Init(const std::string& mount_path, int shard_count,
-              uint64_t shard_capacity, uint64_t alignment);
+    tl::expected<void, ErrorCode> Init(const DistributedStorageConfig& config);
     bool IsInitialized() const {
         return initialized_.load(std::memory_order_acquire);
     }

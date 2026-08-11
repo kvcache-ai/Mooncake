@@ -50,6 +50,7 @@
 #include "utils/zstd_util.h"
 #include "utils/file_util.h"
 #include "storage/distributed/dfs_global_allocator.h"
+#include "storage/distributed/distributed_storage_backend.h"
 #include "random.h"
 #include "utils.h"
 #include "kv_event/kv_event_config.h"
@@ -527,32 +528,20 @@ void MasterService::InitDfsAllocatorFromEnvironment() {
             "DFS is incompatible with snapshot/oplog recovery");
     }
 
-    const bool single_tenant =
-        Environ::GetBool("MOONCAKE_DFS_SINGLE_TENANT", true);
-    if (!single_tenant) {
+    const auto config = DistributedStorageConfig::FromEnvironment();
+    if (!config.single_tenant) {
         LOG(ERROR) << "Currently, DFS backend is not supported in "
                       "multi-tenant mode";
         enable_dfs_ = false;
         return;
     }
 
-    const std::string root_dir =
-        Environ::GetString("MOONCAKE_DFS_ROOT_DIR",
-                           Environ::GetString("MOONCAKE_DISTRIBUTED_ROOT_DIR",
-                                              "/mnt/3fs/mooncake"));
-    const int shard_count = Environ::GetInt("MOONCAKE_DFS_SHARD_COUNT", 64);
-    const uint64_t shard_capacity = Environ::GetUInt64(
-        "MOONCAKE_DFS_SHARD_CAPACITY", 4ULL * 1024 * 1024 * 1024);
-    const uint64_t alignment =
-        Environ::GetUInt64("MOONCAKE_DFS_ALIGNMENT", 4096);
-
     dfs_allocator_ = std::make_unique<DfsGlobalAllocator>();
-    if (!dfs_allocator_->Init(root_dir, shard_count, shard_capacity,
-                              alignment)) {
-        LOG(ERROR) << "Failed to initialize DFS allocator, root_dir="
-                   << root_dir << ", shard_count=" << shard_count
-                   << ", shard_capacity=" << shard_capacity
-                   << ", alignment=" << alignment;
+    auto init_result = dfs_allocator_->Init(config);
+    if (!init_result) {
+        LOG(ERROR) << "Failed to initialize DFS allocator, error="
+                   << init_result.error() << ", config={" << config.FormatStr()
+                   << "}";
         dfs_allocator_.reset();
         enable_dfs_ = false;
         return;
@@ -562,10 +551,8 @@ void MasterService::InitDfsAllocatorFromEnvironment() {
         [this](const std::string& key, int shard_idx, uint64_t offset) {
             RemoveDfsReplicaByOffset(key, shard_idx, offset);
         });
-    LOG(INFO) << "DFS allocator initialized, root_dir=" << root_dir
-              << ", shard_count=" << shard_count
-              << ", shard_capacity=" << shard_capacity
-              << ", alignment=" << alignment;
+    LOG(INFO) << "DFS allocator initialized, config={" << config.FormatStr()
+              << "}";
 }
 
 std::unique_ptr<ha::SnapshotCatalogStore>

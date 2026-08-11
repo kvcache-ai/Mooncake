@@ -1,8 +1,8 @@
 #pragma once
 
-#include <string>
 #include <cstdint>
 #include <cstdlib>
+#include <string>
 
 namespace mooncake {
 
@@ -96,6 +96,7 @@ class Environ {
     static int64_t GetInt64(const char* name, int64_t default_value);
     static uint32_t GetUInt32(const char* name, uint32_t default_value);
     static uint64_t GetUInt64(const char* name, uint64_t default_value);
+    static double GetDouble(const char* name, double default_value);
     // Helper method to get size_t from env
     static size_t GetSizeT(const char* name, size_t default_value);
     // Helper method to get a canonical boolean from env. Invalid values use the

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <filesystem>
 #include <limits>
+#include <sstream>
 
 #include "environ.h"
 #include "storage/distributed/dfs_global_allocator.h"
@@ -74,6 +75,33 @@ bool DistributedStorageConfig::Validate() const {
     return true;
 }
 
+bool DistributedStorageConfig::ValidateForAllocator() const {
+    if (!Validate()) return false;
+
+    if (eviction_low_watermark < 0.0 || eviction_low_watermark > 1.0 ||
+        eviction_high_watermark < 0.0 || eviction_high_watermark > 1.0 ||
+        eviction_low_watermark >= eviction_high_watermark) {
+        LOG(ERROR) << "DistributedStorageConfig: eviction watermarks must "
+                      "satisfy 0 <= low < high <= 1, low="
+                   << eviction_low_watermark
+                   << ", high=" << eviction_high_watermark;
+        return false;
+    }
+    if (deferred_free_duration.count() < 0) {
+        LOG(ERROR) << "DistributedStorageConfig: deferred_free_duration must "
+                      "be non-negative, seconds="
+                   << deferred_free_duration.count();
+        return false;
+    }
+    if (eviction_enabled && eviction_check_interval.count() <= 0) {
+        LOG(ERROR) << "DistributedStorageConfig: eviction_check_interval must "
+                      "be positive when eviction is enabled, seconds="
+                   << eviction_check_interval.count();
+        return false;
+    }
+    return true;
+}
+
 DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
     DistributedStorageConfig config;
     config.fsdir = Environ::GetString(
@@ -96,7 +124,35 @@ DistributedStorageConfig DistributedStorageConfig::FromEnvironment() {
         Environ::GetUInt64("MOONCAKE_DFS_ALIGNMENT", config.alignment);
     config.single_tenant =
         Environ::GetBool("MOONCAKE_DFS_SINGLE_TENANT", config.single_tenant);
+    config.eviction_enabled = Environ::GetBool("MOONCAKE_DFS_EVICTION_ENABLED",
+                                               config.eviction_enabled);
+    config.eviction_high_watermark = Environ::GetDouble(
+        "MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", config.eviction_high_watermark);
+    config.eviction_low_watermark = Environ::GetDouble(
+        "MOONCAKE_DFS_EVICTION_LOW_WATERMARK", config.eviction_low_watermark);
+    config.deferred_free_duration = std::chrono::seconds(Environ::GetInt(
+        "MOONCAKE_DFS_DEFERRED_FREE_SECONDS",
+        static_cast<int>(config.deferred_free_duration.count())));
+    config.eviction_check_interval = std::chrono::seconds(Environ::GetInt(
+        "MOONCAKE_DFS_EVICTION_CHECK_INTERVAL",
+        static_cast<int>(config.eviction_check_interval.count())));
     return config;
+}
+
+std::string DistributedStorageConfig::FormatStr() const {
+    std::ostringstream oss;
+    oss << "fsdir=" << fsdir << ", fs_adapter_type=" << fs_adapter_type
+        << ", enable_health_check=" << enable_health_check
+        << ", shard_count=" << shard_count
+        << ", shard_capacity=" << shard_capacity << ", alignment=" << alignment
+        << ", single_tenant=" << single_tenant
+        << ", eviction_enabled=" << eviction_enabled
+        << ", eviction_high_watermark=" << eviction_high_watermark
+        << ", eviction_low_watermark=" << eviction_low_watermark
+        << ", deferred_free_seconds=" << deferred_free_duration.count()
+        << ", eviction_check_interval_seconds="
+        << eviction_check_interval.count();
+    return oss.str();
 }
 
 DistributedStorageBackend::DistributedStorageBackend(

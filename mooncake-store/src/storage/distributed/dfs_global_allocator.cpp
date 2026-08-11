@@ -6,7 +6,7 @@
 #include <limits>
 #include <sstream>
 
-#include "environ.h"
+#include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/fs_adapter.h"
 #include "storage/distributed/posix_fs_adapter.h"
 #include "utils.h"
@@ -15,20 +15,6 @@
 #endif
 
 namespace mooncake {
-
-namespace {
-
-std::optional<double> GetEnvDouble(const char* name) {
-    const char* value = std::getenv(name);
-    if (value == nullptr || value[0] == '\0') return std::nullopt;
-    try {
-        return std::stod(value);
-    } catch (...) {
-        return std::nullopt;
-    }
-}
-
-}  // namespace
 
 DfsGlobalAllocator::~DfsGlobalAllocator() {
     {
@@ -40,79 +26,80 @@ DfsGlobalAllocator::~DfsGlobalAllocator() {
     if (fs_adapter_) fs_adapter_->Shutdown();
 }
 
-bool DfsGlobalAllocator::Init(const std::string& mount_path, int shard_count,
-                              uint64_t shard_capacity, uint64_t alignment) {
-    if (initialized_.load(std::memory_order_acquire)) return true;
-    if (mount_path.empty() || shard_count <= 0 || shard_capacity == 0) {
-        return false;
-    }
-    if (alignment == 0 || (alignment & (alignment - 1)) != 0) {
-        return false;
+tl::expected<void, ErrorCode> DfsGlobalAllocator::Init(
+    const DistributedStorageConfig& config) {
+    if (initialized_.load(std::memory_order_acquire)) return {};
+    if (!config.ValidateForAllocator()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
-    mount_path_ = mount_path;
-    shard_count_ = shard_count;
-    alignment_ = alignment;
+    mount_path_ = config.fsdir;
+    shard_count_ = config.shard_count;
+    alignment_ = config.alignment;
     shards_.clear();
     shards_.resize(shard_count_);
 
-    eviction_enabled_ = Environ::GetBool("MOONCAKE_DFS_EVICTION_ENABLED", true);
-    eviction_high_watermark_ =
-        GetEnvDouble("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK").value_or(0.9);
-    eviction_low_watermark_ =
-        GetEnvDouble("MOONCAKE_DFS_EVICTION_LOW_WATERMARK").value_or(0.7);
-    deferred_free_duration_ = std::chrono::seconds(
-        Environ::GetInt("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", 30));
-    eviction_check_interval_ = std::chrono::seconds(
-        Environ::GetInt("MOONCAKE_DFS_EVICTION_CHECK_INTERVAL", 5));
+    eviction_enabled_ = config.eviction_enabled;
+    eviction_high_watermark_ = config.eviction_high_watermark;
+    eviction_low_watermark_ = config.eviction_low_watermark;
+    deferred_free_duration_ = config.deferred_free_duration;
+    eviction_check_interval_ = config.eviction_check_interval;
 
     std::error_code ec;
     std::filesystem::create_directories(mount_path_, ec);
     if (ec) {
         LOG(ERROR) << "Failed to create DFS mount path " << mount_path_ << ": "
                    << ec.message();
-        return false;
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
 
-    const auto adapter_type = Environ::GetString(
-        "MOONCAKE_DFS_FS_ADAPTER",
-        Environ::GetString("MOONCAKE_DISTRIBUTED_FS_TYPE", "hf3fs"));
-    if (adapter_type == "posix") {
+    if (config.fs_adapter_type == "posix") {
         fs_adapter_ = std::make_unique<PosixFsAdapter>();
-    } else if (adapter_type == "hf3fs") {
+    } else if (config.fs_adapter_type == "hf3fs") {
 #ifdef USE_3FS
         fs_adapter_ = std::make_unique<Hf3fsAdapter>();
 #else
-        LOG(ERROR) << "DFS allocator hf3fs adapter requires USE_3FS";
-        return false;
+        LOG(ERROR) << "The hf3fs DFS adapter requires Mooncake to be built "
+                      "with the USE_3FS compile-time option "
+                      "(-DUSE_3FS=ON)";
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
 #endif
-    } else {
-        LOG(ERROR) << "Unsupported DFS fs adapter: " << adapter_type;
-        return false;
     }
 
-    if (!fs_adapter_->Init(mount_path_)) return false;
+    auto adapter_init = fs_adapter_->Init(mount_path_);
+    if (!adapter_init) {
+        LOG(ERROR) << "Failed to initialize DFS fs adapter "
+                   << config.fs_adapter_type
+                   << " for mount_path=" << mount_path_
+                   << ", error=" << adapter_init.error();
+        return tl::make_unexpected(adapter_init.error());
+    }
 
     for (int i = 0; i < shard_count_; ++i) {
         std::string path = mount_path_ + "/dfs_shard_" +
                            FormatShardIdx(i, shard_count_) + ".data";
-        auto prealloc = fs_adapter_->PreallocateFile(path, shard_capacity);
+        auto prealloc =
+            fs_adapter_->PreallocateFile(path, config.shard_capacity);
         if (!prealloc) {
             LOG(ERROR) << "Failed to preallocate DFS shard " << path << ": "
                        << prealloc.error();
-            return false;
+            return tl::make_unexpected(prealloc.error());
         }
 
         auto shard = std::make_unique<ShardState>();
-        shard->capacity = shard_capacity;
+        shard->capacity = config.shard_capacity;
         uint32_t init_cap = static_cast<uint32_t>(std::max<uint64_t>(
-            1, std::min<uint64_t>(shard_capacity / 4096, 64ULL * 1024)));
+            1, std::min<uint64_t>(config.shard_capacity / 4096, 64ULL * 1024)));
         uint32_t max_cap = static_cast<uint32_t>(std::max<uint64_t>(
-            init_cap,
-            std::min<uint64_t>(shard_capacity / 1024, 64ULL * 1024 * 1024)));
-        shard->allocator =
-            OffsetAllocator::create(0, shard_capacity, init_cap, max_cap);
-        if (!shard->allocator) return false;
+            init_cap, std::min<uint64_t>(config.shard_capacity / 1024,
+                                         64ULL * 1024 * 1024)));
+        shard->allocator = OffsetAllocator::create(0, config.shard_capacity,
+                                                   init_cap, max_cap);
+        if (!shard->allocator) {
+            LOG(ERROR) << "Failed to create offset allocator for DFS shard "
+                       << i;
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
         shards_[i] = std::move(shard);
     }
 
@@ -122,7 +109,7 @@ bool DfsGlobalAllocator::Init(const std::string& mount_path, int shard_count,
             std::thread(&DfsGlobalAllocator::EvictionMonitor, this);
     }
     initialized_.store(true, std::memory_order_release);
-    return true;
+    return {};
 }
 
 tl::expected<DistributedFSDescriptor, ErrorCode> DfsGlobalAllocator::Allocate(

@@ -60,6 +60,7 @@ class EnvGuard {
         Save("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK");
         Save("MOONCAKE_DFS_EVICTION_LOW_WATERMARK");
         Save("MOONCAKE_DFS_DEFERRED_FREE_SECONDS");
+        Save("MOONCAKE_DFS_EVICTION_CHECK_INTERVAL");
         Save("MOONCAKE_DFS_ROOT_DIR");
         Save("MOONCAKE_DFS_SHARD_COUNT");
         Save("MOONCAKE_DFS_SHARD_CAPACITY");
@@ -118,8 +119,21 @@ class AlignedBuffer {
 
 void ConfigurePosixDfs(EnvGuard& env) {
     env.Set("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    env.Set("MOONCAKE_DFS_SINGLE_TENANT", "1");
     env.Set("MOONCAKE_DFS_EVICTION_ENABLED", "0");
     env.Set("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
+}
+
+DistributedStorageConfig MakeAllocatorConfig(const std::string& mount_path,
+                                             int shard_count,
+                                             uint64_t shard_capacity,
+                                             uint64_t alignment) {
+    auto config = DistributedStorageConfig::FromEnvironment();
+    config.fsdir = mount_path;
+    config.shard_count = shard_count;
+    config.shard_capacity = shard_capacity;
+    config.alignment = alignment;
+    return config;
 }
 
 class FsAdapterFdTest : public ::testing::Test {
@@ -288,7 +302,8 @@ TEST(DfsGlobalAllocatorTest, AllocateFreeAndFormatShardIdx) {
     TempDir tmp("dfs_alloc");
 
     DfsGlobalAllocator alloc;
-    ASSERT_TRUE(alloc.Init(tmp.path(), 4, 1024 * 1024, 4096));
+    ASSERT_TRUE(
+        alloc.Init(MakeAllocatorConfig(tmp.path(), 4, 1024 * 1024, 4096)));
 
     auto desc = alloc.Allocate("key1", 100);
     ASSERT_TRUE(desc.has_value());
@@ -308,13 +323,79 @@ TEST(DfsGlobalAllocatorTest, AllocateFreeAndFormatShardIdx) {
     EXPECT_EQ(DfsGlobalAllocator::FormatShardIdx(100, 1000), "100");
 }
 
+TEST(DistributedStorageConfigTest, ReadsValidatesAndFormatsEnvironment) {
+    EnvGuard env;
+    TempDir tmp("dfs_config");
+    env.Set("MOONCAKE_DFS_ROOT_DIR", tmp.path().c_str());
+    env.Set("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    env.Set("MOONCAKE_DFS_SHARD_COUNT", "8");
+    env.Set("MOONCAKE_DFS_SHARD_CAPACITY", "1048576");
+    env.Set("MOONCAKE_DFS_ALIGNMENT", "4096");
+    env.Set("MOONCAKE_DFS_SINGLE_TENANT", "1");
+    env.Set("MOONCAKE_DFS_EVICTION_ENABLED", "1");
+    env.Set("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", "0.85");
+    env.Set("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", "0.65");
+    env.Set("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "12");
+    env.Set("MOONCAKE_DFS_EVICTION_CHECK_INTERVAL", "3");
+
+    const auto config = DistributedStorageConfig::FromEnvironment();
+    EXPECT_EQ(config.fsdir, tmp.path());
+    EXPECT_EQ(config.fs_adapter_type, "posix");
+    EXPECT_EQ(config.shard_count, 8);
+    EXPECT_EQ(config.shard_capacity, 1048576);
+    EXPECT_EQ(config.alignment, 4096);
+    EXPECT_TRUE(config.eviction_enabled);
+    EXPECT_DOUBLE_EQ(config.eviction_high_watermark, 0.85);
+    EXPECT_DOUBLE_EQ(config.eviction_low_watermark, 0.65);
+    EXPECT_EQ(config.deferred_free_duration, std::chrono::seconds(12));
+    EXPECT_EQ(config.eviction_check_interval, std::chrono::seconds(3));
+    EXPECT_TRUE(config.Validate());
+    EXPECT_TRUE(config.ValidateForAllocator());
+
+    const std::string formatted = config.FormatStr();
+    EXPECT_NE(formatted.find("fs_adapter_type=posix"), std::string::npos);
+    EXPECT_NE(formatted.find("shard_count=8"), std::string::npos);
+    EXPECT_NE(formatted.find("eviction_high_watermark=0.85"),
+              std::string::npos);
+
+    auto invalid_eviction = config;
+    invalid_eviction.eviction_low_watermark = 0.9;
+    EXPECT_TRUE(invalid_eviction.Validate());
+    EXPECT_FALSE(invalid_eviction.ValidateForAllocator());
+}
+
+TEST(DfsGlobalAllocatorTest, InitReturnsSpecificErrors) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    TempDir tmp("dfs_init_error");
+
+    DistributedStorageConfig invalid_config =
+        MakeAllocatorConfig(tmp.path(), 1, 1024 * 1024, 3);
+    DfsGlobalAllocator invalid_allocator;
+    auto invalid_result = invalid_allocator.Init(invalid_config);
+    ASSERT_FALSE(invalid_result);
+    EXPECT_EQ(invalid_result.error(), ErrorCode::INVALID_PARAMS);
+
+    const std::string file_path = tmp.file("not_a_directory");
+    const int fd = ::open(file_path.c_str(), O_CREAT | O_WRONLY, 0600);
+    ASSERT_GE(fd, 0);
+    ASSERT_EQ(::close(fd), 0);
+
+    DistributedStorageConfig file_error_config =
+        MakeAllocatorConfig(file_path, 1, 1024 * 1024, 4096);
+    DfsGlobalAllocator file_error_allocator;
+    auto file_error_result = file_error_allocator.Init(file_error_config);
+    ASSERT_FALSE(file_error_result);
+    EXPECT_EQ(file_error_result.error(), ErrorCode::FILE_WRITE_FAIL);
+}
+
 TEST(DfsGlobalAllocatorTest, AllocateReservesAlignmentPadding) {
     EnvGuard env;
     ConfigurePosixDfs(env);
     TempDir tmp("dfs_alloc_padding");
 
     DfsGlobalAllocator alloc;
-    ASSERT_TRUE(alloc.Init(tmp.path(), 1, 8 * 1024, 4096));
+    ASSERT_TRUE(alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 8 * 1024, 4096)));
 
     auto desc = alloc.Allocate("key1", 100);
     ASSERT_TRUE(desc.has_value());
@@ -338,7 +419,8 @@ TEST(DfsGlobalAllocatorTest, ExhaustionAndEviction) {
     TempDir tmp("dfs_exhaust");
 
     DfsGlobalAllocator alloc;
-    ASSERT_TRUE(alloc.Init(tmp.path(), 1, 32 * 1024, 4096));
+    ASSERT_TRUE(
+        alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 32 * 1024, 4096)));
 
     std::vector<DistributedFSDescriptor> descs;
     for (int i = 0; i < 4; ++i) {
@@ -370,7 +452,8 @@ TEST(DfsGlobalAllocatorTest, EvictionCountsPendingFreeTowardWatermarks) {
     TempDir tmp("dfs_pending_watermark");
 
     DfsGlobalAllocator alloc;
-    ASSERT_TRUE(alloc.Init(tmp.path(), 1, 32 * 1024, 4096));
+    ASSERT_TRUE(
+        alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 32 * 1024, 4096)));
 
     for (int i = 0; i < 4; ++i) {
         const std::string key = "k" + std::to_string(i);
@@ -398,7 +481,7 @@ TEST(DfsGlobalAllocatorTest, FreeRemovesLruEntryBeforeOffsetReuse) {
     TempDir tmp("dfs_free_lru_reuse");
 
     DfsGlobalAllocator alloc;
-    ASSERT_TRUE(alloc.Init(tmp.path(), 1, 8 * 1024, 4096));
+    ASSERT_TRUE(alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 8 * 1024, 4096)));
 
     auto desc_a = alloc.Allocate("A", 100);
     ASSERT_TRUE(desc_a.has_value());
@@ -422,7 +505,7 @@ TEST(DfsGlobalAllocatorTest, StaleFreeDoesNotReleaseReusedOffset) {
     TempDir tmp("dfs_stale_free");
 
     DfsGlobalAllocator alloc;
-    ASSERT_TRUE(alloc.Init(tmp.path(), 1, 8 * 1024, 4096));
+    ASSERT_TRUE(alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 8 * 1024, 4096)));
 
     auto desc_a = alloc.Allocate("A", 100);
     ASSERT_TRUE(desc_a.has_value());
@@ -448,7 +531,8 @@ TEST(DfsGlobalAllocatorTest, ConcurrentAllocate) {
     TempDir tmp("dfs_concurrent");
 
     DfsGlobalAllocator alloc;
-    ASSERT_TRUE(alloc.Init(tmp.path(), 4, 128 * 1024, 4096));
+    ASSERT_TRUE(
+        alloc.Init(MakeAllocatorConfig(tmp.path(), 4, 128 * 1024, 4096)));
 
     constexpr int kThreadCount = 32;
     std::vector<std::thread> threads;
