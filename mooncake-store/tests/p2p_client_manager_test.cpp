@@ -11,7 +11,6 @@
 #undef protected
 #include "p2p_client_meta.h"
 #include "master_metric_manager.h"
-#include "p2p_master_metric_manager.h"
 #include <set>
 
 namespace mooncake {
@@ -21,8 +20,6 @@ class P2PClientManagerTest : public ::testing::Test {
     void SetUp() override {
         google::InitGoogleLogging("P2PClientManagerTest");
         FLAGS_logtostderr = 1;
-        // Register the metric singleton
-        P2PMasterMetricManager::instance();
     }
 
     void TearDown() override { google::ShutdownGoogleLogging(); }

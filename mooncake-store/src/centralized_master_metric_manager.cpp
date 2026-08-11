@@ -687,8 +687,7 @@ int64_t CentralizedMasterMetricManager::get_update_task_failures() {
 }
 
 // --- Serialization ---
-std::string CentralizedMasterMetricManager::serialize_metrics() {
-    std::string out = MasterMetricManager::serialize_metrics();
+std::string CentralizedMasterMetricManager::serialize_arch_metrics() {
     std::stringstream ss;
 
     auto serialize_metric = [&ss](auto& metric) {
@@ -760,13 +759,14 @@ std::string CentralizedMasterMetricManager::serialize_metrics() {
     serialize_metric(put_start_release_cnt_);
     serialize_metric(put_start_discarded_staging_size_);
 
-    return out + ss.str();
+    return ss.str();
 }
 
 // --- Human-Readable Summary ---
-std::string CentralizedMasterMetricManager::get_summary_string() {
+std::string CentralizedMasterMetricManager::get_arch_summary_string(
+    const std::string& shared_summary) {
     std::string summary = "[Arch: Centralization] ";
-    summary += MasterMetricManager::get_summary_string();
+    summary += shared_summary;
     std::stringstream ss;
 
     int64_t soft_pin_keys = soft_pin_key_count_.value();

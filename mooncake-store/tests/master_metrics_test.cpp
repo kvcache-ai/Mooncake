@@ -121,6 +121,7 @@ TEST_F(MasterMetricsTest, RegisterUnregisterRpcMetrics) {
     service_config.default_kv_lease_ttl = 100;
     service_config.enable_metric_reporting = true;
     WrappedCentralizedMasterService service_(service_config);
+    service_.init();
 
     UUID client_id = generate_uuid();
 
@@ -162,6 +163,7 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
     service_config.default_kv_lease_ttl = default_kv_lease_ttl;
     service_config.enable_metric_reporting = true;
     WrappedCentralizedMasterService service_(service_config);
+    service_.init();
 
     constexpr size_t kBufferAddress = 0x300000000;
     constexpr size_t kSegmentSize = 1024 * 1024 * 16;
@@ -304,6 +306,7 @@ TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
     service_config.default_kv_lease_ttl = default_kv_lease_ttl;
     service_config.enable_metric_reporting = true;
     WrappedCentralizedMasterService service_(service_config);
+    service_.init();
 
     constexpr size_t kBufferAddress = 0x300000000;
     constexpr size_t kSegmentSize = 1024 * 1024 * 16;
@@ -375,6 +378,7 @@ TEST_F(MasterMetricsTest, BatchRequestTest) {
     WrappedMasterServiceConfig service_config;
     service_config.default_kv_lease_ttl = default_kv_lease_ttl;
     WrappedCentralizedMasterService service_(service_config);
+    service_.init();
 
     constexpr size_t kBufferAddress = 0x300000000;
     constexpr size_t kSegmentSize = 1024 * 1024 * 64;

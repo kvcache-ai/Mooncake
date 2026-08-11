@@ -13,7 +13,6 @@
 #include "ha/oplog/oplog_store_factory.h"
 #include "ha/oplog/redis_oplog_store.h"
 #include "p2p_master_service.h"
-#include "p2p_master_metric_manager.h"
 #include "redis_util.h"
 #include "../../redis_test_utils.h"
 
@@ -54,8 +53,6 @@ TEST(RedisOpLogStoreStandaloneTest, OnlyAddReplicaIsBestEffort) {
 class RedisOpLogStoreTest : public ::testing::Test {
    protected:
     void SetUp() override {
-        // Register the metric singleton used by P2PMasterService below.
-        P2PMasterMetricManager::instance();
         const char* endpoint = std::getenv("MOONCAKE_REDIS_ENDPOINT");
         const char* username = std::getenv("MOONCAKE_REDIS_USERNAME");
         const char* password = std::getenv("MOONCAKE_REDIS_PASSWORD");

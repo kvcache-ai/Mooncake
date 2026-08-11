@@ -21,8 +21,6 @@ class MasterServiceTest : public ::testing::Test {
     void SetUp() override {
         google::InitGoogleLogging("MasterServiceTest");
         FLAGS_logtostderr = true;
-        // Register the metric singleton
-        CentralizedMasterMetricManager::instance();
     }
 
     struct MountedSegmentContext {

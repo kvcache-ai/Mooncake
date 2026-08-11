@@ -68,6 +68,7 @@ class InProcP2PMaster {
             }
 
             wrapped_ = std::make_unique<WrappedP2PMasterService>(wms_cfg);
+            wrapped_->init();
             RegisterP2PRpcService(*server_, *wrapped_);
 
             auto ec = server_->async_start();

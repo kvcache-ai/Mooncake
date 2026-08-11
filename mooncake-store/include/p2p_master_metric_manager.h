@@ -12,8 +12,6 @@ class P2PMasterMetricManager final : public MasterMetricManager {
    public:
     static P2PMasterMetricManager& instance();
 
-    std::string serialize_metrics() override;
-    std::string get_summary_string() override;
     void reset_all_metrics() override;
 
     // Operation Statistics (Counters)
@@ -54,6 +52,10 @@ class P2PMasterMetricManager final : public MasterMetricManager {
 
    private:
     P2PMasterMetricManager();
+
+    std::string serialize_arch_metrics() override;
+    std::string get_arch_summary_string(
+        const std::string& shared_summary) override;
 
     // Marks all arch metrics as changed once so zero values are serialized.
     void update_arch_metrics_for_zero_output();

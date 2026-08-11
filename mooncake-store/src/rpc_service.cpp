@@ -25,11 +25,12 @@ namespace mooncake {
 WrappedMasterService::WrappedMasterService(
     const WrappedMasterServiceConfig& config)
     : http_server_(4, config.http_port),
-      metric_report_running_(config.enable_metric_reporting) {
+      metric_report_running_(config.enable_metric_reporting) {}
 
+void WrappedMasterService::init() {
     init_http_server();
 
-    if (config.enable_metric_reporting) {
+    if (metric_report_running_) {
         metric_report_thread_ = std::thread([this]() {
             while (metric_report_running_) {
                 std::string metrics_summary =
@@ -40,6 +41,8 @@ WrappedMasterService::WrappedMasterService(
             }
         });
     }
+
+    init_http_handlers();
 }
 
 WrappedMasterService::~WrappedMasterService() {

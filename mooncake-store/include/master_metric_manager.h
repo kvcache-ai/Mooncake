@@ -180,9 +180,18 @@ class MasterMetricManager {
     int64_t get_batch_get_replica_list_items();
     int64_t get_batch_get_replica_list_failed_items();
 
-    virtual std::string serialize_metrics() = 0;
+    // --- Serialization ---
+    /**
+     * @brief Serializes all managed metrics into Prometheus text format.
+     * @return A string containing the metrics in Prometheus format.
+     */
+    std::string serialize_metrics();
 
-    virtual std::string get_summary_string() = 0;
+    /**
+     * @brief Generates a concise, human-readable summary of key metrics.
+     * @return A string containing the formatted summary.
+     */
+    std::string get_summary_string();
 
    protected:
     MasterMetricManager();
@@ -193,6 +202,11 @@ class MasterMetricManager {
 
     // Update all metrics once to ensure zero values are serialized
     void update_metrics_for_zero_output();
+
+    virtual std::string serialize_arch_metrics() = 0;
+
+    virtual std::string get_arch_summary_string(
+        const std::string& shared_summary) = 0;
 
    protected:
     static MasterMetricManager* instance_;

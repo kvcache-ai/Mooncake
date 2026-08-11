@@ -23,8 +23,6 @@ class MasterServiceSSDTest : public ::testing::Test {
     void SetUp() override {
         google::InitGoogleLogging("MasterServiceTest");
         FLAGS_logtostderr = true;
-        // Register the metric singleton
-        CentralizedMasterMetricManager::instance();
     }
 
     void TearDown() override { google::ShutdownGoogleLogging(); }

@@ -22,6 +22,7 @@ MasterMetricManager& MasterMetricManager::instance() {
     return *instance_;
 }
 
+// called by subclass instance
 void MasterMetricManager::RegisterInstance(MasterMetricManager* instance) {
     if (instance_ == instance) return;  // idempotent (in-place reset)
     if (instance_ != nullptr) {
@@ -770,7 +771,7 @@ std::string MasterMetricManager::serialize_metrics() {
     serialize_metric(batch_get_replica_list_items_);
     serialize_metric(batch_get_replica_list_failed_items_);
 
-    return ss.str();
+    return ss.str() + serialize_arch_metrics();
 }
 
 MasterMetricManager::CacheHitStatDict
@@ -933,7 +934,7 @@ std::string MasterMetricManager::get_summary_string() {
        << ", Item=" << batch_query_ip_items - batch_query_ip_failed_items << "/"
        << batch_query_ip_items << ")";
 
-    return ss.str();
+    return get_arch_summary_string(ss.str());
 }
 
 }  // namespace mooncake

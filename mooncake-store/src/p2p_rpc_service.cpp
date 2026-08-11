@@ -7,8 +7,11 @@ namespace mooncake {
 
 WrappedP2PMasterService::WrappedP2PMasterService(
     const WrappedMasterServiceConfig& config)
-    : WrappedMasterService(config),
-      master_service_(config) {}
+    : WrappedMasterService(config), master_service_(config) {}
+
+void WrappedP2PMasterService::init_http_handlers() {
+    // Currently, P2P has no architecture-specific HTTP endpoints
+}
 
 void RegisterP2PRpcService(
     coro_rpc::coro_rpc_server& server,

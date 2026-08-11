@@ -1,4 +1,5 @@
 #include "centralized_rpc_service.h"
+#include "centralized_master_metric_manager.h"
 #include "rpc_helper.h"
 #include <csignal>
 
@@ -7,7 +8,9 @@ namespace mooncake {
 WrappedCentralizedMasterService::WrappedCentralizedMasterService(
     const WrappedMasterServiceConfig& config)
     : WrappedMasterService(config),
-      master_service_(MasterServiceConfig(config)) {
+      master_service_(MasterServiceConfig(config)) {}
+
+void WrappedCentralizedMasterService::init_http_handlers() {
     init_centralized_http_server();
 }
 

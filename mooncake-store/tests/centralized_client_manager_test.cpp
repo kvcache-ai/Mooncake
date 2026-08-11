@@ -7,7 +7,6 @@
 #define private public
 #define protected public
 #include "centralized_client_manager.h"
-#include "centralized_master_metric_manager.h"
 #undef private
 #undef protected
 
@@ -18,8 +17,6 @@ class CentralizedClientManagerTest : public ::testing::Test {
     void SetUp() override {
         google::InitGoogleLogging("CentralizedClientManagerTest");
         FLAGS_logtostderr = 1;
-        // Register the metric singleton
-        CentralizedMasterMetricManager::instance();
     }
 
     void TearDown() override { google::ShutdownGoogleLogging(); }

@@ -3,7 +3,6 @@
 #include <atomic>
 #include <random>
 #include "centralized_client_meta.h"
-#include "centralized_master_metric_manager.h"
 
 namespace mooncake {
 
@@ -29,8 +28,6 @@ class ClientMetaTest : public ::testing::Test {
         // Initialize logging
         google::InitGoogleLogging("ClientMetaTest");
         FLAGS_logtostderr = 1;
-        // Register the metric singleton (no wrapped service in this binary).
-        CentralizedMasterMetricManager::instance();
     }
 
     void TearDown() override { google::ShutdownGoogleLogging(); }

@@ -198,8 +198,7 @@ int64_t P2PMasterMetricManager::get_batch_get_write_route_failed_items() {
 }
 
 // --- Serialization ---
-std::string P2PMasterMetricManager::serialize_metrics() {
-    std::string out = MasterMetricManager::serialize_metrics();
+std::string P2PMasterMetricManager::serialize_arch_metrics() {
     std::stringstream ss;
 
     auto serialize_metric = [&ss](auto& metric) {
@@ -226,13 +225,14 @@ std::string P2PMasterMetricManager::serialize_metrics() {
     serialize_metric(batch_get_write_route_items_);
     serialize_metric(batch_get_write_route_failed_items_);
 
-    return out + ss.str();
+    return ss.str();
 }
 
 // --- Human-Readable Summary ---
-std::string P2PMasterMetricManager::get_summary_string() {
+std::string P2PMasterMetricManager::get_arch_summary_string(
+    const std::string& shared_summary) {
     std::string summary = "[Arch: P2P] ";
-    summary += MasterMetricManager::get_summary_string();
+    summary += shared_summary;
     std::stringstream ss;
 
     int64_t get_write_routes = get_write_route_requests_.value();

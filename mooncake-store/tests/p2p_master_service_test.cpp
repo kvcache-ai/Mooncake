@@ -8,7 +8,6 @@
 #define private public
 #define protected public
 #include "p2p_master_service.h"
-#include "p2p_master_metric_manager.h"
 #undef protected
 #undef private
 
@@ -25,8 +24,6 @@ class P2PMasterServiceTest : public ::testing::Test {
     void SetUp() override {
         google::InitGoogleLogging("P2PMasterServiceTest");
         FLAGS_logtostderr = true;
-        // Register the metric singleton
-        P2PMasterMetricManager::instance();
     }
 
     void TearDown() override { google::ShutdownGoogleLogging(); }

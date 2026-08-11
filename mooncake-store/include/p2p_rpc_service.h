@@ -15,6 +15,8 @@ class WrappedP2PMasterService final : public WrappedMasterService {
 
     MasterService& GetMasterService() override { return master_service_; }
 
+    void init_http_handlers() override;
+
     tl::expected<WriteRouteResponse, ErrorCode> GetWriteRoute(
         const WriteRouteRequest& req);
 

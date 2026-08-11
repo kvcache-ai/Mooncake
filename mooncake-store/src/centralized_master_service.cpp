@@ -129,7 +129,9 @@ CentralizedMasterService::CentralizedObjectMetadata::IsReplicaRemovable(
 
 // ================= CentralizedMasterService implementation =================
 CentralizedMasterService::CentralizedMasterService()
-    : CentralizedMasterService(MasterServiceConfig()) {}
+    : CentralizedMasterService(MasterServiceConfig()) {
+    CentralizedMasterMetricManager::instance();
+}
 
 CentralizedMasterService::CentralizedMasterService(
     const MasterServiceConfig& config)
@@ -152,6 +154,7 @@ CentralizedMasterService::CentralizedMasterService(
       put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
       put_start_release_timeout_sec_(config.put_start_release_timeout_sec),
       task_manager_(config.task_manager_config) {
+    CentralizedMasterMetricManager::instance();
     if (eviction_ratio_ < 0.0 || eviction_ratio_ > 1.0) {
         LOG(ERROR) << "Eviction ratio must be between 0.0 and 1.0, "
                    << "current value: " << eviction_ratio_;
