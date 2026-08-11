@@ -115,13 +115,13 @@ class DynamicReplicationTest : public ::testing::Test {
         return false;
     }
 
-    void BumpVersionEpoch(MasterService& service, const std::string& key) const {
+    void BumpVersionEpoch(MasterService& service,
+                          const std::string& key) const {
         MasterService::MetadataAccessorRW accessor(
             &service, MasterService::ObjectIdentity{TenantId::Default(), key});
         ASSERT_TRUE(accessor.Exists());
         accessor.Get().put_start_time += std::chrono::milliseconds(1);
     }
-
 
     bool HasDynamicState(MasterService& service, const std::string& key) const {
         MasterService::MetadataAccessorRW accessor(
