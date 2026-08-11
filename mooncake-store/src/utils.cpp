@@ -31,6 +31,12 @@
 #include <sys/mman.h>
 #include <thread>
 #include <vector>
+#ifdef USE_CUDA
+#include <cuda_runtime.h>
+#endif
+#ifdef USE_INTRA_NVLINK
+#include "gpu_vendor/intra_nvlink.h"
+#endif
 
 // Feature flag to enable/disable arena allocator. Disabled by default so the
 // library does not pre-map a large pool unless the operator opts in via gflag
@@ -108,6 +114,36 @@ AutoPortBinder::~AutoPortBinder() {
     }
 }
 
+#ifdef USE_VRAM_SEGMENT
+tl::expected<void *, std::string> allocate_vram_memory(
+    size_t total_size, const std::string &protocol) {
+    cudaError_t res;
+    int device;
+    void *ptr = nullptr;
+    res = cudaGetDevice(&device);
+    if (res != cudaSuccess) {
+        LOG(ERROR) << "VRAM Segment cudaGetDevice failed.";
+        return tl::make_unexpected("VRAM Segment cudaGetDevice failed.");
+    }
+    if (protocol == "nvlink_intra") {
+#ifdef USE_INTRA_NVLINK
+        ptr = allocateFabricMemory_intra(total_size);
+        return ptr;
+#else
+        LOG(ERROR) << "Protocol nvlink_intra need USE_INTRA_NVLINK=ON. Please "
+                      "rebuild mooncake from source.";
+        return tl::make_unexpected("Protocol not supported");
+#endif
+    }
+    res = cudaMalloc((void **)&ptr, total_size);
+    if (res != cudaSuccess) {
+        LOG(ERROR) << "VRAM Segment cudaMalloc failed.";
+        return tl::make_unexpected("VRAM Segment cudaMalloc failed.");
+    }
+    return ptr;
+}
+#endif
+
 void *allocate_buffer_allocator_memory(size_t total_size,
                                        const std::string &protocol,
                                        size_t alignment, bool use_spdk_dma) {
@@ -139,6 +175,14 @@ void *allocate_buffer_allocator_memory(size_t total_size,
         return mooncake::SpdkWrapper::GetInstance().Alloc(total_size, alignment,
                                                           -1);
     }
+#endif
+#ifdef USE_VRAM_SEGMENT
+    auto ret = allocate_vram_memory(total_size, protocol);
+    if (!ret) {
+        LOG(ERROR) << ret.error();
+        return nullptr;
+    }
+    return *ret;
 #endif
     // Allocate aligned memory
     return aligned_alloc(alignment, total_size);
@@ -552,6 +596,14 @@ void free_memory(const std::string &protocol, void *ptr, bool use_spdk_dma) {
         mooncake::SpdkWrapper::GetInstance().Free(ptr);
         return;
     }
+#endif
+#ifdef USE_VRAM_SEGMENT
+#ifdef USE_INTRA_NVLINK
+    freeFabricMemory_intra(ptr);
+#else
+    cudaFree(ptr);
+#endif
+    return;
 #endif
     free(ptr);
 }

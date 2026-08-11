@@ -54,7 +54,51 @@ class TransferEngineImplTestPeer {
             engine.multi_transports_->transport_map_.emplace(name, transport);
         }
     }
+
+    static AutoDiscoverConfig autoDiscoverConfig(
+        const TransferEngineImpl& engine) {
+        return engine.auto_discover_config_;
+    }
+
+    static std::string autoDiscoverTransport(const TransferEngineImpl& engine) {
+        return engine.autoDiscoverTransport();
+    }
+
+    static void setUseBarex(TransferEngineImpl& engine, bool use_barex) {
+        engine.use_barex_ = use_barex;
+    }
 };
+
+TEST(TransferEngineAutoDiscoverTest, SelectsEfaForEfaProtocol) {
+    TransferEngineImpl engine(false);
+    engine.setAutoDiscover({.enabled = true, .protocol = "efa"});
+
+    const auto config = TransferEngineImplTestPeer::autoDiscoverConfig(engine);
+    EXPECT_TRUE(config.enabled);
+    EXPECT_EQ(config.protocol, "efa");
+    EXPECT_EQ(TransferEngineImplTestPeer::autoDiscoverTransport(engine), "efa");
+}
+
+TEST(TransferEngineAutoDiscoverTest, BarexOverrideTakesPrecedence) {
+    TransferEngineImpl engine(false);
+    engine.setAutoDiscover({.enabled = true, .protocol = "efa"});
+    TransferEngineImplTestPeer::setUseBarex(engine, true);
+
+    EXPECT_EQ(TransferEngineImplTestPeer::autoDiscoverTransport(engine),
+              "barex");
+}
+
+TEST(TransferEngineAutoDiscoverTest, BoolSetterPreservesDefaultSelection) {
+    TransferEngineImpl engine(false);
+    engine.setAutoDiscover({.enabled = true, .protocol = "efa"});
+    engine.setAutoDiscover(true);
+
+    const auto config = TransferEngineImplTestPeer::autoDiscoverConfig(engine);
+    EXPECT_TRUE(config.enabled);
+    EXPECT_TRUE(config.protocol.empty());
+    EXPECT_EQ(TransferEngineImplTestPeer::autoDiscoverTransport(engine),
+              "rdma");
+}
 
 class BatchResultTransport : public Transport {
    public:

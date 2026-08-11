@@ -27,8 +27,6 @@ bool RpcServer::start() {
     return true;
 }
 
-uint16_t RpcServer::getPort() const { return server_ ? server_->port() : 0; }
-
 std::string RpcServer::getListenAddr(const std::string& host_ip) const {
     if (!server_) return "";
     return host_ip + ":" + std::to_string(server_->port());

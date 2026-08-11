@@ -48,11 +48,21 @@ The data structure details of `ReplicateConfig` are as follows:
 ```C++
 struct ReplicateConfig {
     size_t replica_num{1};                    // Total number of replicas for the object
-    bool with_soft_pin{false};               // Whether to enable soft pin mechanism for this object
+    SoftPinAction soft_pin_action{SoftPinAction::PRESERVE};
+    std::optional<uint64_t> soft_pin_ttl_ms{}; // ENABLE override; omitted uses the Master default
     bool with_hard_pin{false};               // Whether to enable hard pin (never evicted)
     std::string preferred_segment{};         // Preferred segment for allocation
 };
 ```
+
+Soft pinning starts when the first replica becomes readable and has a fixed
+lifetime: reads do not extend it. `PRESERVE` keeps the committed deadline on an
+Upsert, `ENABLE` starts a new lifetime, and `DISABLE` removes it when the write
+commits. `soft_pin_ttl_ms` is valid only with `ENABLE`; zero commits ordinary
+cache, and values above the Master's configured maximum are rejected.
+Soft-pin state is not persisted in snapshots or the HA OpLog; after recovery or
+Standby promotion, restored objects are ordinary cache until a later write
+explicitly enables soft pinning again.
 
 ### Upsert
 
@@ -99,6 +109,11 @@ tl::expected<UUID, ErrorCode> CreateCopyTask(
    - On failure: `status = FAILED`, `message = <error description>`
 4. **Status Query**: You can query the task status at any time using `QueryTask` to monitor progress
 
+**Failure and retry behavior:**
+- New tasks enter the queue as `PENDING` and are moved to `PROCESSING` when a client starts execution.
+- The client only retries failures caused by `ErrorCode::NO_AVAILABLE_HANDLE`, up to the master-side `max_retry_attempts` limit.
+- Submission can fail immediately with `ErrorCode::TASK_PENDING_LIMIT_EXCEEDED` when the task queue is full.
+
 ### CreateMoveTask
 
 ```C++
@@ -117,6 +132,12 @@ tl::expected<UUID, ErrorCode> CreateMoveTask(
    - On success: `status = SUCCESS`, `message = "Task completed successfully"`
    - On failure: `status = FAILED`, `message = <error description>`
 4. **Status Query**: You can query the task status at any time using `QueryTask` to monitor progress
+
+**Failure and retry behavior:**
+- Move tasks follow the same state machine as copy tasks: `PENDING -> PROCESSING -> SUCCESS/FAILED`.
+- **Submission-time failures**: If the object or source replica is already missing when `CreateMoveTask` is called, the call returns `ErrorCode::OBJECT_NOT_FOUND` or `ErrorCode::INVALID_PARAMS` directly and no task is created.
+- **Execution-time failures**: If the object or source replica disappears after the task is successfully submitted, the task transitions to `FAILED` state. Only `ErrorCode::NO_AVAILABLE_HANDLE` execution failures are retried automatically.
+- Timeout and retry policy is configured on the master, not per request.
 
 ### QueryTask
 
@@ -139,6 +160,17 @@ struct QueryTaskResponse {
     std::string message;                        // Status message or error description
 };
 ```
+
+Typical query-time failure:
+- `ErrorCode::TASK_NOT_FOUND`: the task ID is unknown or the completed task has already been evicted from the master's retained finished-task history.
+
+**Master-side task manager settings affecting task APIs:**
+- `--max_total_finished_tasks`: number of completed tasks retained for subsequent `QueryTask` calls
+- `--max_total_pending_tasks`: maximum queued tasks before `CreateCopyTask`/`CreateMoveTask` fail with `TASK_PENDING_LIMIT_EXCEEDED`
+- `--max_total_processing_tasks`: cap on concurrently processing tasks
+- `--pending_task_timeout_sec`: timeout for tasks that remain in `PENDING` (`0` disables it)
+- `--processing_task_timeout_sec`: timeout for tasks that remain in `PROCESSING` (`0` disables it)
+- `--max_retry_attempts`: retry limit for `NO_AVAILABLE_HANDLE` execution failures
 
 ### BatchQueryIp
 

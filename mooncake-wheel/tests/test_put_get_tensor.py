@@ -3,8 +3,6 @@ import struct
 import unittest
 import os
 import time
-import threading
-import random
 
 try:
     import torch as _torch

@@ -67,7 +67,13 @@ if(ENABLE_KV_EVENTS)
 endif()
 add_store_test(master_service_test master_service_test.cpp)
 add_store_test(batch_evict_test batch_evict_test.cpp)
+add_store_test(master_scenario_test master_scenario.cpp
+               master_scenario_test.cpp)
+add_store_test(master_service_scenario_test master_scenario.cpp
+               master_service_scenario_test.cpp)
 add_store_test(master_service_config_test master_service_config_test.cpp)
+add_store_test(master_service_processing_key_double_erase_test
+               master_service_processing_key_double_erase_test.cpp)
 add_store_test(master_service_tenant_quota_test
                master_service_tenant_quota_test.cpp)
 add_store_test(batch_remove_test batch_remove_test.cpp)
@@ -100,6 +106,25 @@ add_store_test(master_admin_server_test master_admin_server_test.cpp)
 add_store_test(posix_file_test posix_file_test.cpp)
 add_store_test(thread_pool_test thread_pool_test.cpp)
 add_store_test(transfer_task_test transfer_task_test.cpp)
+find_package(CUDAToolkit QUIET)
+if(CUDAToolkit_FOUND)
+  target_compile_definitions(transfer_task_test PRIVATE MOONCAKE_TEST_CUDA_H2D)
+  target_link_libraries(transfer_task_test PRIVATE CUDA::cudart)
+endif()
+if(USE_CUDA)
+  find_package(CUDAToolkit REQUIRED)
+  target_compile_definitions(transfer_task_test PRIVATE USE_CUDA)
+  if(USE_TENT)
+    add_test(
+      NAME transfer_scatter_tent_test
+      COMMAND
+        transfer_task_test
+        --gtest_filter=TransferTaskTest.TransferScatterWritesGpuDestinationDirectly
+    )
+    set_tests_properties(transfer_scatter_tent_test PROPERTIES ENVIRONMENT
+                                                               "MC_USE_TENT=1")
+  endif()
+endif()
 add_store_test(tenant_quota_test tenant_quota_test.cpp)
 add_store_test(tenant_id_test tenant_id_test.cpp)
 add_store_test(segment_test segment_test.cpp)
@@ -109,6 +134,10 @@ add_store_test(client_buffer_test client_buffer_test.cpp)
 add_store_test(client_local_hot_cache_test client_local_hot_cache_test.cpp)
 add_store_test(client_tcp_local_memcpy_test client_tcp_local_memcpy_test.cpp)
 add_store_test(pybind_client_test pybind_client_test.cpp)
+if(CUDAToolkit_FOUND)
+  target_compile_definitions(pybind_client_test PRIVATE MOONCAKE_TEST_CUDA_H2D)
+  target_link_libraries(pybind_client_test PRIVATE CUDA::cudart)
+endif()
 add_store_test(ipv6_client_test ipv6_client_test.cpp)
 add_store_test(host_port_fix_test host_port_fix_test.cpp)
 add_store_test(client_metrics_test client_metrics_test.cpp)
@@ -127,6 +156,8 @@ add_store_test(snapshot_child_process_test
                ha/snapshot/snapshot_child_process_test.cpp)
 add_store_test(master_snapshot_codec_test
                ha/snapshot/master_snapshot_codec_test.cpp)
+add_ha_test(batch_oplog_snapshot_types_test
+            ha/snapshot/batch_oplog/metadata_test.cpp)
 add_store_test(master_service_test_for_snapshot
                ha/snapshot/master_service_test_for_snapshot.cpp)
 add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)

@@ -2,6 +2,7 @@
 // (C) Sebastian Aaltonen 2023
 // MIT License (see file: LICENSE)
 
+#include <atomic>
 #include <memory>
 #include <optional>
 #include <vector>
@@ -170,6 +171,14 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     // the request cannot be represented by this allocator.
     [[nodiscard]] uint64_t normalizedAllocationSize(size_t size) const;
 
+    // Returns a mutex-free atomic upper-bound hint for the largest allocatable
+    // free region. The hint may be larger than the current value after a
+    // successful allocation, is tightened on a locked allocation failure, and
+    // is raised when free creates a larger region.
+    [[nodiscard]] uint64_t getLargestFreeRegion() const noexcept {
+        return m_largest_free_region.load(std::memory_order_relaxed);
+    }
+
     // Get storage report (thread-safe)
     [[nodiscard]]
     OffsetAllocStorageReport storageReport() const;
@@ -200,6 +209,8 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     [[nodiscard]]
     OffsetAllocatorMetrics get_metrics_internal() const REQUIRES(m_mutex);
 
+    void refreshLargestFreeRegion() REQUIRES(m_mutex);
+
     std::unique_ptr<__Allocator> m_allocator GUARDED_BY(m_mutex);
     uint64_t m_base;
     // The real offset and size of the allocated memory need to be multiplied by
@@ -211,6 +222,8 @@ class OffsetAllocator : public std::enable_shared_from_this<OffsetAllocator> {
     // Lightweight metrics maintained during allocation/deallocation
     uint64_t m_allocated_size GUARDED_BY(m_mutex) = 0;
     uint64_t m_allocated_num GUARDED_BY(m_mutex) = 0;
+    std::atomic<uint64_t> m_largest_free_region{0};
+    bool m_largest_free_region_tightened GUARDED_BY(m_mutex) = false;
 
     // Private constructor - use create() factory method instead
     OffsetAllocator(uint64_t base, size_t size, uint32 init_capacity,
@@ -239,7 +252,9 @@ class __Allocator {
     void reset();
 
     OffsetAllocation allocate(uint32 size);
-    void free(OffsetAllocation allocation);
+    // Returns the size of the newly merged free region, or zero if allocator
+    // metadata capacity still prevents another allocation.
+    uint32 free(OffsetAllocation allocation);
 
     uint32 allocationSize(OffsetAllocation allocation) const;
     OffsetAllocStorageReport storageReport() const;
@@ -330,6 +345,14 @@ OffsetAllocator::OffsetAllocator(T& serializer) {
                 "Deserializing OffsetAllocator failed: corrupt header");
         }
         m_allocator = std::make_unique<__Allocator>(serializer);
+        const uint64_t largest_free_region =
+            m_allocator->storageReport().largestFreeRegion << m_multiplier_bits;
+        m_largest_free_region.store(largest_free_region,
+                                    std::memory_order_relaxed);
+        const uint64_t allocator_capacity =
+            static_cast<uint64_t>(m_allocator->m_size) << m_multiplier_bits;
+        m_largest_free_region_tightened =
+            largest_free_region < allocator_capacity;
     } catch (const std::exception& e) {
         LOG(ERROR) << "Deserializing OffsetAllocator failed, error="
                    << e.what();

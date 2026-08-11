@@ -111,6 +111,29 @@ TEST_F(BufferAllocatorTest, AllocateMultiple) {
     }
 }
 
+TEST_F(BufferAllocatorTest, OffsetLargestFreeRegionRemainsExact) {
+    constexpr size_t CAPACITY = 16 * 1024 * 1024;
+    auto allocator = std::make_shared<OffsetBufferAllocator>(
+        "exact-largest-free-region", 0x140000000ULL, CAPACITY,
+        "exact-largest-free-region");
+
+    EXPECT_EQ(allocator->getLargestFreeRegion(), CAPACITY);
+
+    auto buffer = allocator->allocate(CAPACITY / 2);
+    ASSERT_NE(buffer, nullptr);
+    const auto internal_allocator = allocator->getOffsetAllocator();
+
+    // Successful allocations intentionally leave the fast-fail hint high, but
+    // the segment-selection query must still return the authoritative value.
+    EXPECT_GT(internal_allocator->getLargestFreeRegion(),
+              allocator->getLargestFreeRegion());
+    EXPECT_EQ(allocator->getLargestFreeRegion(),
+              internal_allocator->storageReport().largestFreeRegion);
+
+    buffer.reset();
+    EXPECT_EQ(allocator->getLargestFreeRegion(), CAPACITY);
+}
+
 TEST_F(BufferAllocatorTest, RestoreOffsetAllocationsAtOriginalAddresses) {
     constexpr uintptr_t kBase = 0x180000000ULL;
     constexpr size_t kCapacity = 16 * 1024 * 1024;

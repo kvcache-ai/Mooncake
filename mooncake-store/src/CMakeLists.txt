@@ -39,6 +39,7 @@ set(MOONCAKE_STORE_SOURCES
     device/accelerator_registry.cpp
     device/runtime_accelerator.cpp
     device/cuda_like_accelerator_device.cpp
+    device/cuda_ipc_buffer.cpp
     device/hip_accelerator_device.cpp
     device/ascend_accelerator_device.cpp
     device/sunrise_accelerator_device.cpp
@@ -50,6 +51,7 @@ set(MOONCAKE_STORE_SOURCES
     ha/kv/etcd_ha_kv_backend.cpp
     ha/standby_controller.cpp
     ha/snapshot/catalog_backed_snapshot_provider.cpp
+    ha/snapshot/batch_oplog/metadata.cpp
     ha/snapshot/master_snapshot_codec.cpp
     ha/snapshot/object/snapshot_object_store.cpp
     ha/snapshot/object/backends/local/local_file_snapshot_object_store.cpp

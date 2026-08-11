@@ -30,8 +30,10 @@ concurrency:
 env:
   SCCACHE_GHA_ENABLED: "true"
 
+# Gate the dependency root so all downstream jobs are skipped in forks.
 jobs:
   version-stamp:
+    if: github.repository == 'kvcache-ai/Mooncake'
     runs-on: ubuntu-22.04
     outputs:
       nightly_version: ${{ steps.version.outputs.nightly_version }}
@@ -51,87 +53,33 @@ jobs:
           echo "nightly_version=$NIGHTLY_VERSION" >> "$GITHUB_OUTPUT"
           echo "Nightly version: $NIGHTLY_VERSION"
 
-  build-cuda128-x86:
+  build-wheels:
     needs: version-stamp
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: cuda
+            architecture: x86_64
+            artifact-prefix: nightly-cuda128-x86
+          - variant: cuda
+            architecture: arm64
+            artifact-prefix: nightly-cuda128-arm64
+          - variant: cuda13
+            architecture: x86_64
+            artifact-prefix: nightly-cuda13-x86
+          - variant: cuda13
+            architecture: arm64
+            artifact-prefix: nightly-cuda13-arm64
+          - variant: non-cuda
+            architecture: x86_64
+            artifact-prefix: nightly-non-cuda-x86
     uses: ./.github/workflows/_build-wheel.yaml
     with:
-      runner: ubuntu-22.04
-      container: pytorch/manylinux2_28-builder:cuda12.8
+      variant: ${{ matrix.variant }}
+      architecture: ${{ matrix.architecture }}
       python-versions: '["3.10", "3.12"]'
-      cuda: container
-      torch-cuda-arch-list: '8.0;9.0'
-      ep-torch-versions: '2.11.0;2.12.0;2.12.1;2.13.0'
-      build-nvlink-allocator: true
-      cmake-args: >-
-        -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON
-        -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
-      artifact-prefix: nightly-cuda128-x86
-      version-override: ${{ needs.version-stamp.outputs.nightly_version }}
-
-  build-cuda128-arm64:
-    needs: version-stamp
-    uses: ./.github/workflows/_build-wheel.yaml
-    with:
-      runner: ubuntu-22.04-arm
-      container: pytorch/manylinuxaarch64-builder:cuda12.8
-      python-versions: '["3.10", "3.12"]'
-      cuda: container
-      cmake-generator: Ninja
-      torch-cuda-arch-list: '9.0'
-      cmake-args: >-
-        -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=OFF
-        -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
-      artifact-prefix: nightly-cuda128-arm64
-      version-override: ${{ needs.version-stamp.outputs.nightly_version }}
-
-  build-cuda13-arm64:
-    needs: version-stamp
-    uses: ./.github/workflows/_build-wheel.yaml
-    with:
-      runner: ubuntu-22.04-arm
-      container: pytorch/manylinuxaarch64-builder:cuda13.0
-      python-versions: '["3.10", "3.12"]'
-      cuda: container
-      cmake-generator: Ninja
-      variant-flag: CU13_BUILD
-      torch-cuda-arch-list: '9.0'
-      cmake-args: >-
-        -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=OFF
-        -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
-      artifact-prefix: nightly-cuda13-arm64
-      version-override: ${{ needs.version-stamp.outputs.nightly_version }}
-
-  build-cuda13-x86:
-    needs: version-stamp
-    uses: ./.github/workflows/_build-wheel.yaml
-    with:
-      runner: ubuntu-22.04
-      container: pytorch/manylinux2_28-builder:cuda13.0
-      python-versions: '["3.10", "3.12"]'
-      cuda: container
-      variant-flag: CU13_BUILD
-      torch-cuda-arch-list: '8.0;9.0'
-      ep-torch-versions: '2.11.0;2.12.0;2.12.1;2.13.0'
-      build-nvlink-allocator: true
-      cmake-args: >-
-        -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON
-        -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
-      artifact-prefix: nightly-cuda13-x86
-      version-override: ${{ needs.version-stamp.outputs.nightly_version }}
-
-  build-non-cuda-x86:
-    needs: version-stamp
-    uses: ./.github/workflows/_build-wheel.yaml
-    with:
-      runner: ubuntu-22.04
-      container: pytorch/manylinux2_28-builder:cuda12.8
-      python-versions: '["3.10", "3.12"]'
-      cuda: container
-      variant-flag: NON_CUDA_BUILD
-      cmake-args: >-
-        -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=OFF -DWITH_EP=OFF
-        -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
-      artifact-prefix: nightly-non-cuda-x86
+      artifact-prefix: ${{ matrix.artifact-prefix }}
       version-override: ${{ needs.version-stamp.outputs.nightly_version }}
 
   build-musa:
@@ -191,7 +139,7 @@ jobs:
     secrets: inherit
 
   publish-testpypi:
-    needs: [version-stamp, build-cuda128-x86, build-cuda128-arm64, build-cuda13-x86, build-cuda13-arm64, build-non-cuda-x86, nightly-test]
+    needs: [version-stamp, build-wheels, nightly-test]
     if: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.skip_publish == 'true') }}
     runs-on: ubuntu-22.04
     environment: nightly
@@ -234,6 +182,7 @@ jobs:
           twine upload --repository testpypi --skip-existing dist-publish/*.whl
 
   nightly-test:
+    needs: version-stamp
     runs-on: ubuntu-22.04
     env:
       CI: "true"
@@ -299,17 +248,33 @@ jobs:
             -DSTORE_USE_ETCD=ON -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_UNIT_TESTS=ON -DENABLE_SCCACHE=ON
 
+      - name: Configure CUDA driver runtime
+        run: |
+          cuda_driver_library=$(sed -n \
+            's/^CUDA_cuda_driver_LIBRARY:FILEPATH=//p' build/CMakeCache.txt)
+          if [ -z "$cuda_driver_library" ] || [ ! -f "$cuda_driver_library" ]; then
+            echo "::error::CMake did not resolve the CUDA driver library"
+            exit 1
+          fi
+
+          cuda_driver_dir=$(dirname "$cuda_driver_library")
+          if [ ! -e "$cuda_driver_dir/libcuda.so.1" ]; then
+            sudo ln -s "$(basename "$cuda_driver_library")" \
+              "$cuda_driver_dir/libcuda.so.1"
+          fi
+          echo "LIBRARY_PATH=$cuda_driver_dir:${LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$cuda_driver_dir:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+
       - name: Build project
         run: |
           cd build
           cmake --build . -j$(nproc)
-          sudo cmake --install .
+          sudo -E cmake --install .
 
       - name: Build nvlink_allocator.so
         run: |
           mkdir -p build/mooncake-transfer-engine/nvlink-allocator
           cd mooncake-transfer-engine/nvlink-allocator
-          export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
           bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
 
       - name: Start Metadata Server
@@ -322,7 +287,7 @@ jobs:
       - name: Run CTest unit tests
         run: |
           cd build
-          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+          export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
           MC_METADATA_SERVER=http://127.0.0.1:8080/metadata \
           DEFAULT_KV_LEASE_TTL=500 \
             ctest --parallel $(nproc) --output-on-failure
@@ -336,20 +301,23 @@ jobs:
       - name: Run Go store binding integration tests
         env:
           MOONCAKE_STORE_CLUSTER_ID: nightly_go_cluster
-          MOONCAKE_STORE_GO_LINK_COMMON: "0"
           MOONCAKE_STORE_GO_SANITIZED: "0"
         run: ./scripts/ci/run_store_go_integration.sh
 
       - name: Build and install Python wheel for integration tests
         run: |
+          python -m venv "${RUNNER_TEMP}/mooncake-nightly-venv"
+          echo "${RUNNER_TEMP}/mooncake-nightly-venv/bin" >> "$GITHUB_PATH"
+          source "${RUNNER_TEMP}/mooncake-nightly-venv/bin/activate"
           export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
           export CUDA_HOME=/usr/local/cuda
           PYTHON_VERSION=3.12 OUTPUT_DIR=dist ./scripts/build_wheel.sh
-          pip install mooncake-wheel/dist/*.whl
+          python -m pip install mooncake-wheel/dist/*.whl
 
       - name: Run Python integration tests (full suite)
         env:
           MC_METADATA_SERVER: http://127.0.0.1:8080/metadata
+          RUN_TESTS_METADATA_SERVER_MODE: external
           DEFAULT_KV_LEASE_TTL: "500"
           TEST_SSD_OFFLOAD_IN_EVICT: "1"
           TEST_PROMOTION_ON_HIT: "1"
@@ -497,14 +465,11 @@ jobs:
           fi
 
   nightly-gate:
-    if: always()
+    # always() bypasses skipped dependencies, so this job needs its own guard.
+    if: ${{ always() && github.repository == 'kvcache-ai/Mooncake' }}
     needs:
       - version-stamp
-      - build-cuda128-x86
-      - build-cuda128-arm64
-      - build-cuda13-x86
-      - build-cuda13-arm64
-      - build-non-cuda-x86
+      - build-wheels
       - build-musa
       - build-docker
       - ascend-test

@@ -1,89 +1,84 @@
 #include <mooncake_backend.h>
+#include <torch_utils.h>
 #include <pybind11/gil.h>
 #include <pybind11/stl.h>
 #include <torch/csrc/utils/pybind.h>
 #include <torch/python.h>
 #include <torch/torch.h>
 
-#include <cstdlib>
-#include <glog/logging.h>
+#include <algorithm>
+#include <array>
 #include <mutex>
-
-#include "control_plane/agent_host.h"
+#include <string>
+#include <vector>
 
 namespace py = pybind11;
 
 namespace mooncake {
 
-static MooncakeProcessContext g_ctx;
+constexpr const char* kCoordinatorStoreKey = "coordinator_addr";
+constexpr size_t kCoordinatorAddressBufSize = 256;
 
-MooncakeProcessContext::MooncakeProcessContext() {
-    if (const char* val =
-            std::getenv("MOONCAKE_PG_FAULT_RECONCILIATION_WINDOW_US")) {
-        try {
-            fault_reconciliation_window_us = std::stoll(val);
-        } catch (...) {
-            LOG(WARNING)
-                << "Invalid MOONCAKE_PG_FAULT_RECONCILIATION_WINDOW_US: " << val
-                << ", using default " << fault_reconciliation_window_us
-                << " us";
-        }
+struct MooncakeProcessContext {
+    mooncakePgContext_t handle = nullptr;
+    c10::intrusive_ptr<c10d::Store> bootstrap_store;
+
+    ~MooncakeProcessContext() {
+        if (handle) (void)mooncakePgContextDestroy(handle);
     }
-}
+};
 
-MooncakeProcessContext::~MooncakeProcessContext() {
-    // Shutdown AgentHost first so its process-level unregisterAgent RPC can
-    // reach the local Coordinator before that Coordinator is torn down.
-    if (agent_host) agent_host->shutdown();
-    // Shutdown CoordinatorHost second so rank 0 fails pending proposals.
-    if (coordinator_host) coordinator_host->shutdown();
-}
-
+static MooncakeProcessContext g_ctx;
+static std::once_flag g_create_context_once;
 static std::once_flag g_init_control_plane_once;
 
-#ifdef USE_MACA
-static void requireMacaHostTransport() {
-    TORCH_CHECK(std::getenv("MC_MACA_HOST_TRANSPORT") != nullptr,
-                "MACA PG requires MC_MACA_HOST_TRANSPORT=1 so the transfer "
-                "engine uses a host transport.");
+mooncakePgContext_t getContext() {
+    std::call_once(g_create_context_once, [] {
+        mooncakePgContext_t context = nullptr;
+        checkResult(mooncakePgContextCreate(&context),
+                    "mooncakePgContextCreate");
+        g_ctx.handle = context;
+    });
+    return g_ctx.handle;
 }
 
-#endif
-
-static AgentHost& initControlPlane(const c10::intrusive_ptr<c10d::Store>& store,
-                                   int rank, int max_world_size) {
+static mooncakePgContext_t initControlPlane(
+    const c10::intrusive_ptr<c10d::Store>& store, int rank,
+    int max_world_size) {
+    auto context = getContext();
     std::call_once(g_init_control_plane_once, [&] {
-        g_ctx.max_world_size = max_world_size;
-
         // Ordering constraint: AgentHost::start() sends registerAgent
         // immediately, which includes LinkManager's localServerName() and
         // getWarmupRecvAddr().  These must be non-empty, so the engine and
         // LinkManager must be initialized BEFORE AgentHost starts.
-        if (!g_ctx.engine_initialized) {
-#ifdef USE_MACA
-            requireMacaHostTransport();
-#endif
-            g_ctx.engine->init(P2PHANDSHAKE, g_ctx.host_ip);
-            g_ctx.engine_initialized = true;
-        }
-        if (!g_ctx.link_manager.isInitialized()) {
-            g_ctx.link_manager.init(rank, max_world_size, g_ctx.engine);
-        }
+        checkResult(mooncakePgContextInitialize(context, rank, max_world_size),
+                    "mooncakePgContextInitialize");
 
         // Rank 0 hosts the Coordinator in-process.
         if (rank == 0) {
-            g_ctx.coordinator_host = std::make_unique<CoordinatorHost>(
-                store, g_ctx.host_ip, max_world_size,
-                g_ctx.fault_reconciliation_window_us);
-            g_ctx.coordinator_host->start();
+            std::array<char, kCoordinatorAddressBufSize>
+                coordinator_address_buf{};
+            checkResult(mooncakePgContextLaunchCoordinator(
+                            context, coordinator_address_buf.data(),
+                            coordinator_address_buf.size()),
+                        "mooncakePgContextLaunchCoordinator");
+            store->set(kCoordinatorStoreKey,
+                       std::string(coordinator_address_buf.data()));
         }
 
-        g_ctx.agent_host = std::make_unique<AgentHost>(
-            store, g_ctx.host_ip, rank, max_world_size, g_ctx.link_manager,
-            g_ctx.fault_reconciliation_window_us);
-        g_ctx.agent_host->start();
+        store->wait({kCoordinatorStoreKey});
+        const std::string value = store->get_to_str(kCoordinatorStoreKey);
+        TORCH_CHECK(!value.empty(),
+                    "invalid Mooncake coordinator address in Store");
+        checkResult(mooncakePgContextConnectCoordinator(context, value.c_str()),
+                    "mooncakePgContextConnectCoordinator");
+
+        // Keep the first rendezvous Store alive for the process-wide control
+        // plane. In particular, this keeps rank 0's TCPStore server alive while
+        // the default ProcessGroup is destroyed and re-created.
+        g_ctx.bootstrap_store = store;
     });
-    return *g_ctx.agent_host;
+    return context;
 }
 
 c10::intrusive_ptr<c10d::ProcessGroup> createMooncakeBackend(
@@ -91,9 +86,10 @@ c10::intrusive_ptr<c10d::ProcessGroup> createMooncakeBackend(
     c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>
         backendOptions) {
     int rank = distBackendOpts.group_rank;
-    auto& host = initControlPlane(distBackendOpts.store, rank, kMaxNumRanks);
+    auto context =
+        initControlPlane(distBackendOpts.store, rank, MOONCAKE_PG_MAX_RANKS);
     auto backend = c10::make_intrusive<MooncakeBackend>(
-        std::move(distBackendOpts), std::move(backendOptions), host, g_ctx);
+        std::move(distBackendOpts), std::move(backendOptions), context);
     return backend;
 }
 
@@ -102,10 +98,10 @@ c10::intrusive_ptr<c10d::ProcessGroup> createMooncakeCpuBackend(
     c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>
         backendOptions) {
     int rank = distBackendOpts.group_rank;
-    auto& host = initControlPlane(distBackendOpts.store, rank, kMaxNumRanks);
+    auto context =
+        initControlPlane(distBackendOpts.store, rank, MOONCAKE_PG_MAX_RANKS);
     auto backend = c10::make_intrusive<MooncakeBackend>(
-        std::move(distBackendOpts), std::move(backendOptions), host, g_ctx,
-        true);
+        std::move(distBackendOpts), std::move(backendOptions), context, true);
     return backend;
 }
 
@@ -128,13 +124,6 @@ __attribute__((constructor)) static void MooncakeBackendConstructor() {
     register_backend("mooncake", py::cpp_function(createMooncakeBackend),
                      /* extended_api */ true, **kwargsMusa);
 #endif
-}
-
-std::string getPreferredHca(c10::intrusive_ptr<c10d::ProcessGroup> backend,
-                            std::string location) {
-    auto mooncakeBackend =
-        c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
-    return mooncakeBackend->getPreferredHca(location);
 }
 
 at::Tensor getActiveRanks(c10::intrusive_ptr<c10d::ProcessGroup> backend) {
@@ -163,15 +152,15 @@ std::vector<bool> getPeerState(c10::intrusive_ptr<c10d::ProcessGroup> backend,
     return mooncakeBackend->getPeerState(ranks);
 }
 
-ProposeViewUpdateResponse recoverRanks(
+mooncakePgProposalResponse_t recoverRanks(
     c10::intrusive_ptr<c10d::ProcessGroup> backend,
     const std::vector<int>& ranks) {
     auto mooncakeBackend =
         c10::static_intrusive_pointer_cast<MooncakeBackend>(backend);
-    return mooncakeBackend->recoverRanks(ranks);
+    return mooncakeBackend->activateRanks(ranks);
 }
 
-ProposeViewUpdateResponse deactivateRanks(
+mooncakePgProposalResponse_t deactivateRanks(
     c10::intrusive_ptr<c10d::ProcessGroup> backend,
     const std::vector<int>& ranks) {
     auto mooncakeBackend =
@@ -179,7 +168,7 @@ ProposeViewUpdateResponse deactivateRanks(
     return mooncakeBackend->deactivateRanks(ranks);
 }
 
-ProposeViewUpdateResponse activateRanks(
+mooncakePgProposalResponse_t activateRanks(
     c10::intrusive_ptr<c10d::ProcessGroup> backend,
     const std::vector<int>& ranks) {
     auto mooncakeBackend =
@@ -231,28 +220,34 @@ int64_t getCurrentEpoch(c10::intrusive_ptr<c10d::ProcessGroup> backend) {
 /// TransferEnginePy object outlives all MooncakeBackend instances.
 void setTransferEnginePy(pybind11::object engine_obj) {
     if (engine_obj.is_none()) {
-        g_ctx.external_engine = nullptr;
-        g_ctx.engine = g_ctx.owned_engine.get();
-        g_ctx.engine_initialized = false;
+        checkResult(mooncakePgContextSetTransferEngine(getContext(), nullptr),
+                    "mooncakePgContextSetTransferEngine");
         return;
     }
     auto get_engine_ptr = engine_obj.attr("get_engine_ptr");
     uintptr_t ptr = get_engine_ptr().cast<uintptr_t>();
-    g_ctx.external_engine = reinterpret_cast<TransferEngine*>(ptr);
-    g_ctx.engine = g_ctx.external_engine;
-    g_ctx.engine_initialized = true;
+    checkResult(mooncakePgContextSetTransferEngine(
+                    getContext(), reinterpret_cast<void*>(ptr)),
+                "mooncakePgContextSetTransferEngine");
+}
+
+std::vector<int> droppedRanks(const mooncakePgProposalResponse_t& response) {
+    const size_t count = std::min(response.droppedRankCount,
+                                  static_cast<size_t>(MOONCAKE_PG_MAX_RANKS));
+    return std::vector<int>(response.droppedRanks,
+                            response.droppedRanks + count);
 }
 
 void shutdownProcessContext() {
-    if (g_ctx.agent_host) g_ctx.agent_host->shutdown();
-    // AgentHost::shutdown stops the control plane. Finish LinkManager's
-    // resource release before Python tears down an injected TransferEngine.
-    g_ctx.link_manager.shutdown();
-    g_ctx.agent_host.reset();
-    if (g_ctx.coordinator_host) g_ctx.coordinator_host->shutdown();
-    g_ctx.coordinator_host.reset();
-    g_ctx.external_engine = nullptr;
-    g_ctx.engine = nullptr;
+    auto context = g_ctx.handle;
+    if (!context) return;
+    // ContextDestroy rejects a parent-before-child teardown while a
+    // communicator is still alive. Keep the handle for the static-destructor
+    // fallback instead of losing ownership.
+    if (mooncakePgContextDestroy(context) == mooncakePgSuccess) {
+        g_ctx.handle = nullptr;
+        g_ctx.bootstrap_store.reset();
+    }
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
@@ -263,22 +258,45 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         py::cpp_function(&shutdownProcessContext));
     m.def("createMooncakeBackend", &createMooncakeBackend);
     m.def("createMooncakeCpuBackend", &createMooncakeCpuBackend);
-    m.def("set_host_ip", [](const std::string& host) { g_ctx.host_ip = host; });
+    m.def("set_host_ip", [](const std::string& host) {
+        checkResult(mooncakePgContextSetHostIp(getContext(), host.c_str()),
+                    "mooncakePgContextSetHostIp");
+    });
     m.def(
         "set_collective_timeout_us",
-        [](size_t us) { g_ctx.collective_timeout_us = us; }, py::arg("us"),
+        [](size_t us) {
+            checkResult(mooncakePgContextSetCollectiveTimeout(getContext(), us),
+                        "mooncakePgContextSetCollectiveTimeout");
+        },
+        py::arg("us"),
         "Set the default peer-liveness probe timeout (microseconds) for "
         "collective operations.");
     m.def(
-        "set_p2p_timeout_us", [](int64_t us) { g_ctx.p2p_timeout_us = us; },
+        "set_p2p_timeout_us",
+        [](int64_t us) {
+            checkResult(mooncakePgContextSetP2PTimeout(getContext(), us),
+                        "mooncakePgContextSetP2PTimeout");
+        },
         py::arg("us"), "Set the default P2P transfer timeout (microseconds).");
     m.def(
         "set_fault_reconciliation_window_us",
-        [](int64_t us) { g_ctx.fault_reconciliation_window_us = us; },
+        [](int64_t us) {
+            checkResult(
+                mooncakePgContextSetFaultReconciliationWindow(getContext(), us),
+                "mooncakePgContextSetFaultReconciliationWindow");
+        },
         py::arg("us"),
         "Set the coordinator fault reconciliation window (microseconds).");
     m.def("set_device_filter", [](std::vector<std::string> filters) {
-        if (g_ctx.engine) g_ctx.engine->setWhitelistFilters(std::move(filters));
+        std::vector<const char*> filter_pointers;
+        filter_pointers.reserve(filters.size());
+        for (const auto& filter : filters) {
+            filter_pointers.push_back(filter.c_str());
+        }
+        checkResult(
+            mooncakePgContextSetDeviceFilter(
+                getContext(), filter_pointers.data(), filter_pointers.size()),
+            "mooncakePgContextSetDeviceFilter");
     });
     m.def("set_transfer_engine", &setTransferEnginePy, py::arg("engine"),
           "Set an external TransferEngine to be used by MooncakeBackend. "
@@ -286,7 +304,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
           "be initialized. Pass None to reset to default behavior. "
           "The caller must ensure the TransferEngine object outlives all "
           "MooncakeBackend instances.");
-    m.def("get_preferred_hca", &getPreferredHca);
     m.def("get_active_ranks", &getActiveRanks);
     m.def("get_num_synced_ranks", &getNumSyncedRanks);
     m.def("extend_group_size_to", &extendGroupSizeTo);
@@ -313,31 +330,47 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         },
         py::arg("backend"));
 
-    py::enum_<SyncAfterFailureStatus>(m, "SyncAfterFailureStatus")
-        .value("Reconciled", SyncAfterFailureStatus::Reconciled)
-        .value("NoPending", SyncAfterFailureStatus::NoPending)
-        .value("Rejected", SyncAfterFailureStatus::Rejected);
+    py::enum_<mooncakePgSyncAfterFailureStatus_t>(m, "SyncAfterFailureStatus")
+        .value("Reconciled", mooncakePgSyncReconciled)
+        .value("NoPending", mooncakePgSyncNoPending)
+        .value("Rejected", mooncakePgSyncRejected);
 
-    auto proposal_status = py::enum_<ProposalStatus>(m, "ProposalStatus")
-                               .value("Rejected", ProposalStatus::Rejected)
-                               .value("Applied", ProposalStatus::Applied)
-                               .value("AppliedWithDroppedRanks",
-                                      ProposalStatus::AppliedWithDroppedRanks);
+    auto proposal_status =
+        py::enum_<mooncakePgProposalStatus_t>(m, "ProposalStatus")
+            .value("Rejected", mooncakePgProposalRejected)
+            .value("Applied", mooncakePgProposalApplied)
+            .value("AppliedWithDroppedRanks",
+                   mooncakePgProposalAppliedWithDroppedRanks);
     // Keep existing Python callers source-compatible with the renamed enum.
     m.attr("ViewUpdateStatus") = proposal_status;
 
-    py::class_<SyncAfterFailureResponse>(m, "SyncAfterFailureResponse")
-        .def_readonly("status", &SyncAfterFailureResponse::status)
-        .def_readonly("reject_reason",
-                      &SyncAfterFailureResponse::reject_reason);
+    py::class_<mooncakePgSyncAfterFailureResponse_t>(m,
+                                                     "SyncAfterFailureResponse")
+        .def_property_readonly(
+            "status",
+            [](const mooncakePgSyncAfterFailureResponse_t& value) {
+                return value.status;
+            })
+        .def_property_readonly(
+            "reject_reason",
+            [](const mooncakePgSyncAfterFailureResponse_t& value) {
+                return std::string(value.rejectReason);
+            });
 
-    py::class_<ProposeViewUpdateResponse>(m, "ProposeViewUpdateResponse")
-        .def_readonly("status", &ProposeViewUpdateResponse::status)
-        .def_readonly("new_epoch", &ProposeViewUpdateResponse::new_epoch)
-        .def_readonly("dropped_ranks",
-                      &ProposeViewUpdateResponse::dropped_ranks)
-        .def_readonly("reject_reason",
-                      &ProposeViewUpdateResponse::reject_reason);
+    py::class_<mooncakePgProposalResponse_t>(m, "ProposeViewUpdateResponse")
+        .def_property_readonly("status",
+                               [](const mooncakePgProposalResponse_t& value) {
+                                   return value.status;
+                               })
+        .def_property_readonly("new_epoch",
+                               [](const mooncakePgProposalResponse_t& value) {
+                                   return value.newEpoch;
+                               })
+        .def_property_readonly("dropped_ranks", &droppedRanks)
+        .def_property_readonly("reject_reason",
+                               [](const mooncakePgProposalResponse_t& value) {
+                                   return std::string(value.rejectReason);
+                               });
 
     py::class_<MooncakeBackend::MooncakeBackendOptions,
                c10::intrusive_ptr<MooncakeBackend::MooncakeBackendOptions>>(

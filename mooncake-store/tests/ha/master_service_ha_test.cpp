@@ -3,6 +3,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <condition_variable>
 #include <filesystem>
@@ -147,6 +148,74 @@ class FailingBatchHaKvBackend : public FakeBatchHaKvBackend {
     std::condition_variable cv_;
     ErrorCode txn_error_{ErrorCode::OK};
     size_t txn_calls_{0};
+};
+
+class GatedOrderedOpLogWriter : public OrderedOpLogWriter {
+   public:
+    GatedOrderedOpLogWriter(OrderedOpLogWriterConfig config,
+                            WriteBatchFn write_batch)
+        : OrderedOpLogWriter(std::move(config), std::move(write_batch)) {}
+
+    ~GatedOrderedOpLogWriter() override { Stop(); }
+
+    tl::expected<PendingHandle, ErrorCode> Commit(
+        Reservation&& reservation, OpLogEntry entry,
+        DurableCallback callback) override {
+        return OrderedOpLogWriter::Commit(
+            std::move(reservation), std::move(entry),
+            [this, callback = std::move(callback)](const OpLogEntry& durable) {
+                {
+                    std::unique_lock<std::mutex> lock(mutex_);
+                    cv_.wait(lock, [&] {
+                        return stopping_ ||
+                               durable.sequence_id <= released_through_;
+                    });
+                }
+                if (callback) {
+                    callback(durable);
+                }
+                {
+                    std::lock_guard<std::mutex> lock(mutex_);
+                    completed_through_ = durable.sequence_id;
+                }
+                cv_.notify_all();
+            });
+    }
+
+    bool PauseCallbacksAfter(
+        uint64_t sequence_id,
+        std::chrono::milliseconds timeout = std::chrono::seconds(1)) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        released_through_ = sequence_id;
+        return cv_.wait_for(lock, timeout,
+                            [&] { return completed_through_ >= sequence_id; });
+    }
+
+    bool RunCallbacksThrough(
+        uint64_t sequence_id,
+        std::chrono::milliseconds timeout = std::chrono::seconds(1)) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        released_through_ = std::max(released_through_, sequence_id);
+        cv_.notify_all();
+        return cv_.wait_for(lock, timeout,
+                            [&] { return completed_through_ >= sequence_id; });
+    }
+
+    void Stop() override {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+        }
+        cv_.notify_all();
+        OrderedOpLogWriter::Stop();
+    }
+
+   private:
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    uint64_t released_through_{UINT64_MAX};
+    uint64_t completed_through_{0};
+    bool stopping_{false};
 };
 
 class MasterServiceHATest : public ::testing::Test {
@@ -318,6 +387,26 @@ class MasterServiceHATest : public ::testing::Test {
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
         ASSERT_EQ(ErrorCode::OK, read_err);
+    }
+
+    static GatedOrderedOpLogWriter* InstallGatedWriter(
+        MasterService& service, std::shared_ptr<HaKvBackend> backend) {
+        service.SetBatchOpLogWriterFactoryForTesting(
+            [](OrderedOpLogWriterConfig config,
+               OrderedOpLogWriter::WriteBatchFn write_batch) {
+                return std::make_unique<GatedOrderedOpLogWriter>(
+                    std::move(config), std::move(write_batch));
+            });
+        EXPECT_EQ(ErrorCode::OK,
+                  service.SetBatchOpLogBackendForTesting(std::move(backend)));
+        return static_cast<GatedOrderedOpLogWriter*>(
+            service.ordered_oplog_writer_.get());
+    }
+
+    static uint64_t TenantUsedBytes(MasterService& service) {
+        auto snapshot = service.GetTenantQuotaSnapshot(kDefaultTenant);
+        EXPECT_TRUE(snapshot.has_value());
+        return snapshot ? snapshot->used_bytes : 0;
     }
 
     void ReadRemoveBatchEventually(OpLogBatchStorage& storage,
@@ -1822,7 +1911,7 @@ TEST_F(MasterServiceBatchRecordE2ETest,
                 WriteTenantPolicyFile({{kDefaultTenant.value(), 1024}}))
             .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    auto* writer = InstallGatedWriter(service, backend);
 
     auto mounted =
         PrepareSimpleSegment(service, "batch_e2e_remove_finalize_segment");
@@ -1834,6 +1923,7 @@ TEST_F(MasterServiceBatchRecordE2ETest,
     PutObjectOnSegment(service, mounted.client_id, key,
                        "batch_e2e_remove_finalize_segment");
     ReadBatchEventually(storage, 2, batch);
+    ASSERT_TRUE(writer->PauseCallbacksAfter(batch.last_seq));
 
     backend->BlockTxn();
     ASSERT_TRUE(
@@ -1848,6 +1938,9 @@ TEST_F(MasterServiceBatchRecordE2ETest,
 
     backend->AllowTxn();
     ReadBatchEventually(storage, 3, batch);
+    EXPECT_EQ(1024, TenantUsedBytes(service));
+    ASSERT_TRUE(writer->RunCallbacksThrough(batch.last_seq));
+    EXPECT_EQ(0, TenantUsedBytes(service));
 
     auto removed = service.ExistKey(key, kDefaultTenant);
     ASSERT_TRUE(removed.has_value());
@@ -2903,7 +2996,7 @@ TEST_F(MasterServiceHATest, RemoveHidesBeforeDurableAndReleasesAfterFinalize) {
                 WriteTenantPolicyFile({{kDefaultTenant.value(), 1024}}))
             .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    auto* writer = InstallGatedWriter(service, backend);
 
     auto mounted = PrepareSimpleSegment(service, "batch_remove_finalize_seg");
     OpLogBatchStorage storage(cluster_id, *backend);
@@ -2914,6 +3007,7 @@ TEST_F(MasterServiceHATest, RemoveHidesBeforeDurableAndReleasesAfterFinalize) {
     PutObjectOnSegment(service, mounted.client_id, key,
                        "batch_remove_finalize_seg");
     ReadBatchEventually(storage, 2, batch);
+    ASSERT_TRUE(writer->PauseCallbacksAfter(batch.last_seq));
 
     backend->BlockTxn();
     ASSERT_TRUE(
@@ -2929,15 +3023,14 @@ TEST_F(MasterServiceHATest, RemoveHidesBeforeDurableAndReleasesAfterFinalize) {
 
     backend->AllowTxn();
     ReadBatchEventually(storage, 3, batch);
+    EXPECT_EQ(1024, TenantUsedBytes(service));
+    ASSERT_TRUE(writer->RunCallbacksThrough(batch.last_seq));
+    EXPECT_EQ(0, TenantUsedBytes(service));
 
-    if (!before_finalize.has_value()) {
-        const std::string after_finalize_key = "after_remove_finalize_key";
-        auto after_finalize =
-            service.PutStart(mounted.client_id, after_finalize_key,
-                             kDefaultTenant, 1024, config);
-        EXPECT_TRUE(after_finalize.has_value())
-            << toString(after_finalize.error());
-    }
+    auto after_finalize =
+        service.PutStart(mounted.client_id, "after_remove_finalize_key",
+                         kDefaultTenant, 1024, config);
+    EXPECT_TRUE(after_finalize.has_value()) << toString(after_finalize.error());
 }
 
 TEST_F(MasterServiceHATest, BatchRemoveWritesBatchRecordOpLog) {
@@ -2991,7 +3084,7 @@ TEST_F(MasterServiceHATest, BatchRemoveFinalizesEachObjectAfterDurable) {
                 WriteTenantPolicyFile({{kDefaultTenant.value(), 1024}}))
             .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    auto* writer = InstallGatedWriter(service, backend);
 
     auto mounted =
         PrepareSimpleSegment(service, "batch_remove_finalize_segment");
@@ -3003,6 +3096,7 @@ TEST_F(MasterServiceHATest, BatchRemoveFinalizesEachObjectAfterDurable) {
     PutObjectOnSegment(service, mounted.client_id, key,
                        "batch_remove_finalize_segment");
     ReadBatchEventually(storage, 2, batch);
+    ASSERT_TRUE(writer->PauseCallbacksAfter(batch.last_seq));
 
     backend->BlockTxn();
     auto results = service.BatchRemove({key}, kDefaultTenant, /*force=*/true);
@@ -3019,16 +3113,14 @@ TEST_F(MasterServiceHATest, BatchRemoveFinalizesEachObjectAfterDurable) {
 
     backend->AllowTxn();
     ReadBatchEventually(storage, 3, batch);
+    EXPECT_EQ(1024, TenantUsedBytes(service));
+    ASSERT_TRUE(writer->RunCallbacksThrough(batch.last_seq));
+    EXPECT_EQ(0, TenantUsedBytes(service));
 
-    if (!before_finalize.has_value()) {
-        const std::string after_finalize_key =
-            "after_batch_remove_finalize_key";
-        auto after_finalize =
-            service.PutStart(mounted.client_id, after_finalize_key,
-                             kDefaultTenant, 1024, config);
-        EXPECT_TRUE(after_finalize.has_value())
-            << toString(after_finalize.error());
-    }
+    auto after_finalize =
+        service.PutStart(mounted.client_id, "after_batch_remove_finalize_key",
+                         kDefaultTenant, 1024, config);
+    EXPECT_TRUE(after_finalize.has_value()) << toString(after_finalize.error());
 }
 
 TEST_F(MasterServiceHATest, RemoveAllWritesBatchRecordOpLog) {
@@ -3080,7 +3172,7 @@ TEST_F(MasterServiceHATest, RemoveAllFinalizesAfterDurable) {
                 WriteTenantPolicyFile({{kDefaultTenant.value(), 1024}}))
             .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    auto* writer = InstallGatedWriter(service, backend);
 
     auto mounted = PrepareSimpleSegment(service, "remove_all_finalize_segment");
     OpLogBatchStorage storage(cluster_id, *backend);
@@ -3091,6 +3183,7 @@ TEST_F(MasterServiceHATest, RemoveAllFinalizesAfterDurable) {
     PutObjectOnSegment(service, mounted.client_id, key,
                        "remove_all_finalize_segment");
     ReadBatchEventually(storage, 2, batch);
+    ASSERT_TRUE(writer->PauseCallbacksAfter(batch.last_seq));
 
     backend->BlockTxn();
     EXPECT_EQ(1, service.RemoveAll(kDefaultTenant, /*force=*/true));
@@ -3105,15 +3198,14 @@ TEST_F(MasterServiceHATest, RemoveAllFinalizesAfterDurable) {
 
     backend->AllowTxn();
     ReadBatchEventually(storage, 3, batch);
+    EXPECT_EQ(1024, TenantUsedBytes(service));
+    ASSERT_TRUE(writer->RunCallbacksThrough(batch.last_seq));
+    EXPECT_EQ(0, TenantUsedBytes(service));
 
-    if (!before_finalize.has_value()) {
-        const std::string after_finalize_key = "after_remove_all_finalize_key";
-        auto after_finalize =
-            service.PutStart(mounted.client_id, after_finalize_key,
-                             kDefaultTenant, 1024, config);
-        EXPECT_TRUE(after_finalize.has_value())
-            << toString(after_finalize.error());
-    }
+    auto after_finalize =
+        service.PutStart(mounted.client_id, "after_remove_all_finalize_key",
+                         kDefaultTenant, 1024, config);
+    EXPECT_TRUE(after_finalize.has_value()) << toString(after_finalize.error());
 }
 
 TEST_F(MasterServiceHATest, BatchReplicaClearAllWritesBatchRecordOpLog) {
@@ -3218,7 +3310,7 @@ TEST_F(MasterServiceHATest, BatchReplicaClearAllReleasesAfterDurable) {
                 WriteTenantPolicyFile({{kDefaultTenant.value(), 1024}}))
             .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    auto* writer = InstallGatedWriter(service, backend);
 
     auto mounted = PrepareSimpleSegment(service, "clear_all_finalize_segment");
     OpLogBatchStorage storage(cluster_id, *backend);
@@ -3229,6 +3321,7 @@ TEST_F(MasterServiceHATest, BatchReplicaClearAllReleasesAfterDurable) {
     PutObjectOnSegment(service, mounted.client_id, key,
                        "clear_all_finalize_segment");
     ReadBatchEventually(storage, 2, batch);
+    ASSERT_TRUE(writer->PauseCallbacksAfter(batch.last_seq));
 
     std::this_thread::sleep_for(std::chrono::milliseconds(60));
     backend->BlockTxn();
@@ -3247,15 +3340,14 @@ TEST_F(MasterServiceHATest, BatchReplicaClearAllReleasesAfterDurable) {
 
     backend->AllowTxn();
     ReadBatchEventually(storage, 3, batch);
+    EXPECT_EQ(1024, TenantUsedBytes(service));
+    ASSERT_TRUE(writer->RunCallbacksThrough(batch.last_seq));
+    EXPECT_EQ(0, TenantUsedBytes(service));
 
-    if (!before_finalize.has_value()) {
-        const std::string after_finalize_key = "after_clear_all_finalize_key";
-        auto after_finalize =
-            service.PutStart(mounted.client_id, after_finalize_key,
-                             kDefaultTenant, 1024, config);
-        EXPECT_TRUE(after_finalize.has_value())
-            << toString(after_finalize.error());
-    }
+    auto after_finalize =
+        service.PutStart(mounted.client_id, "after_clear_all_finalize_key",
+                         kDefaultTenant, 1024, config);
+    EXPECT_TRUE(after_finalize.has_value()) << toString(after_finalize.error());
 }
 
 TEST_F(MasterServiceHATest, BatchReplicaClearSegmentReleasesAfterDurable) {
@@ -3274,7 +3366,7 @@ TEST_F(MasterServiceHATest, BatchReplicaClearSegmentReleasesAfterDurable) {
                 WriteTenantPolicyFile({{kDefaultTenant.value(), 2048}}))
             .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    auto* writer = InstallGatedWriter(service, backend);
 
     auto mounted = PrepareSimpleSegment(service, "clear_finalize_seg1");
     OpLogBatchStorage storage(cluster_id, *backend);
@@ -3307,6 +3399,7 @@ TEST_F(MasterServiceHATest, BatchReplicaClearSegmentReleasesAfterDurable) {
     ASSERT_TRUE(
         service.CopyEnd(mounted.client_id, key, kDefaultTenant).has_value());
     ReadBatchEventually(storage, 4, batch);
+    ASSERT_TRUE(writer->PauseCallbacksAfter(batch.last_seq));
 
     std::this_thread::sleep_for(std::chrono::milliseconds(60));
     backend->BlockTxn();
@@ -3325,16 +3418,14 @@ TEST_F(MasterServiceHATest, BatchReplicaClearSegmentReleasesAfterDurable) {
 
     backend->AllowTxn();
     ReadBatchEventually(storage, 5, batch);
+    EXPECT_EQ(2048, TenantUsedBytes(service));
+    ASSERT_TRUE(writer->RunCallbacksThrough(batch.last_seq));
+    EXPECT_EQ(1024, TenantUsedBytes(service));
 
-    if (!before_finalize.has_value()) {
-        const std::string after_finalize_key =
-            "after_clear_segment_finalize_key";
-        auto after_finalize =
-            service.PutStart(mounted.client_id, after_finalize_key,
-                             kDefaultTenant, 1024, config);
-        EXPECT_TRUE(after_finalize.has_value())
-            << toString(after_finalize.error());
-    }
+    auto after_finalize =
+        service.PutStart(mounted.client_id, "after_clear_segment_finalize_key",
+                         kDefaultTenant, 1024, config);
+    EXPECT_TRUE(after_finalize.has_value()) << toString(after_finalize.error());
 }
 
 TEST_F(MasterServiceHATest, BatchEvictWritesBatchRecordOpLog) {
@@ -3454,7 +3545,7 @@ TEST_F(MasterServiceHATest, BatchEvictReleasesMemoryAfterDurable) {
                 WriteTenantPolicyFile({{kDefaultTenant.value(), 1024}}))
             .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    auto* writer = InstallGatedWriter(service, backend);
 
     auto mounted = PrepareSimpleSegment(service, "batch_evict_finalize_seg");
     OpLogBatchStorage storage(cluster_id, *backend);
@@ -3465,6 +3556,7 @@ TEST_F(MasterServiceHATest, BatchEvictReleasesMemoryAfterDurable) {
     PutObjectOnSegment(service, mounted.client_id, key,
                        "batch_evict_finalize_seg");
     ReadBatchEventually(storage, 2, batch);
+    ASSERT_TRUE(writer->PauseCallbacksAfter(batch.last_seq));
 
     std::this_thread::sleep_for(std::chrono::milliseconds(60));
     backend->BlockTxn();
@@ -3481,15 +3573,14 @@ TEST_F(MasterServiceHATest, BatchEvictReleasesMemoryAfterDurable) {
 
     backend->AllowTxn();
     ReadBatchEventually(storage, 3, batch);
+    EXPECT_EQ(1024, TenantUsedBytes(service));
+    ASSERT_TRUE(writer->RunCallbacksThrough(batch.last_seq));
+    EXPECT_EQ(0, TenantUsedBytes(service));
 
-    if (!before_finalize.has_value()) {
-        const std::string after_finalize_key = "after_batch_evict_finalize_key";
-        auto after_finalize =
-            service.PutStart(mounted.client_id, after_finalize_key,
-                             kDefaultTenant, 1024, config);
-        EXPECT_TRUE(after_finalize.has_value())
-            << toString(after_finalize.error());
-    }
+    auto after_finalize =
+        service.PutStart(mounted.client_id, "after_batch_evict_finalize_key",
+                         kDefaultTenant, 1024, config);
+    EXPECT_TRUE(after_finalize.has_value()) << toString(after_finalize.error());
 }
 
 TEST_F(MasterServiceHATest, EvictDiskReplicaWritesBatchRecordOpLog) {
@@ -3550,7 +3641,7 @@ TEST_F(MasterServiceHATest, EvictDiskReplicaReleasesLocalDiskAfterDurable) {
                               .set_enable_offload(true)
                               .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    auto* writer = InstallGatedWriter(service, backend);
 
     const std::string segment_name = "batch_disk_evict_finalize_segment";
     auto mounted = PrepareSimpleSegment(service, segment_name);
@@ -3573,6 +3664,7 @@ TEST_F(MasterServiceHATest, EvictDiskReplicaReleasesLocalDiskAfterDurable) {
                                 local_disk_replica)
                     .has_value());
     ReadBatchEventually(storage, 3, batch);
+    ASSERT_TRUE(writer->PauseCallbacksAfter(batch.last_seq));
     SetLocalDiskUsedBytesForTesting(service, mounted.client_id, 1024);
 
     backend->BlockTxn();
@@ -3592,6 +3684,8 @@ TEST_F(MasterServiceHATest, EvictDiskReplicaReleasesLocalDiskAfterDurable) {
 
     backend->AllowTxn();
     ReadBatchEventually(storage, 4, batch);
+    EXPECT_EQ(1024, GetLocalDiskUsedBytesForTesting(service, segment_name));
+    ASSERT_TRUE(writer->RunCallbacksThrough(batch.last_seq));
     EXPECT_EQ(0, GetLocalDiskUsedBytesForTesting(service, segment_name));
 }
 
@@ -3652,7 +3746,7 @@ TEST_F(MasterServiceHATest, NoFBatchEvictReleasesNoFSpaceAfterDurable) {
                               .set_oplog_batch_max_entries(1)
                               .build();
     MasterService service(service_config);
-    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+    auto* writer = InstallGatedWriter(service, backend);
 
     NoFSegment nof_segment = MakeNoFSegment("batch_nof_evict_finalize_segment",
                                             "batch_nof_evict_finalize_endpoint",
@@ -3672,6 +3766,7 @@ TEST_F(MasterServiceHATest, NoFBatchEvictReleasesNoFSpaceAfterDurable) {
     OpLogBatchStorage storage(cluster_id, *backend);
     OpLogBatchRecord batch;
     ReadBatchEventually(storage, 1, batch);
+    ASSERT_TRUE(writer->PauseCallbacksAfter(batch.last_seq));
 
     std::this_thread::sleep_for(std::chrono::milliseconds(60));
     backend->BlockTxn();
@@ -3687,15 +3782,12 @@ TEST_F(MasterServiceHATest, NoFBatchEvictReleasesNoFSpaceAfterDurable) {
 
     backend->AllowTxn();
     ReadBatchEventually(storage, 2, batch);
+    ASSERT_TRUE(writer->RunCallbacksThrough(batch.last_seq));
 
-    if (!before_finalize.has_value()) {
-        const std::string after_finalize_key =
-            "after_batch_nof_evict_finalize_key";
-        auto after_finalize = service.PutStart(client_id, after_finalize_key,
-                                               kDefaultTenant, 1024, config);
-        EXPECT_TRUE(after_finalize.has_value())
-            << toString(after_finalize.error());
-    }
+    auto after_finalize =
+        service.PutStart(client_id, "after_batch_nof_evict_finalize_key",
+                         kDefaultTenant, 1024, config);
+    EXPECT_TRUE(after_finalize.has_value()) << toString(after_finalize.error());
 }
 #endif
 
