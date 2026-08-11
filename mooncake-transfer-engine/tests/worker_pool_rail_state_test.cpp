@@ -78,6 +78,19 @@ class WorkerPoolTestPeer {
         pool.rail_states_[path].last_error_ns -= age_ns;
     }
 
+    // These tests only read and write rail state, so the pool's threads have
+    // nothing to do. Left running they busy-poll: the context never opened, so
+    // monitorWorker spins on a failing epoll_wait() for the whole suite. Same
+    // shutdown as ~WorkerPool, ordered so a worker cannot miss the wakeup and
+    // park for its full 1s timeout; the destructor then sees workers_running_
+    // already false and does not join twice.
+    static void stopWorkers(WorkerPool &pool) {
+        if (!pool.workers_running_) return;
+        pool.workers_running_.store(false);
+        pool.cond_var_.notify_all();
+        for (auto &entry : pool.worker_thread_) entry.join();
+    }
+
     static int errorThreshold() { return WorkerPool::kRailErrorThreshold; }
 
     static uint64_t errorWindowNs() { return WorkerPool::kRailErrorWindowNs; }
@@ -93,9 +106,8 @@ constexpr const char *kPeerB = "10.0.0.1@mlx5_bond_1";
 class WorkerPoolRailStateTest : public ::testing::Test {
    protected:
     void SetUp() override {
-        // monitorWorker busy-polls epoll_wait() on an invalid fd for the whole
-        // lifetime of this pool because the context was never opened. Silence
-        // it so gtest failures stay readable.
+        // The context below is expected to fail to open, and that path is
+        // noisy. Silence it so gtest failures stay readable.
         previous_min_log_level_ = FLAGS_minloglevel;
         FLAGS_minloglevel = google::GLOG_FATAL;
 
@@ -106,10 +118,11 @@ class WorkerPoolRailStateTest : public ::testing::Test {
         MC_LSAN_IGNORE_OBJECT(transport_);
         context_ = std::make_unique<RdmaContext>(*transport_, "unused");
         // Always fails, on any host, because no device is named "unused". It
-        // still creates the endpoint store, which monitorWorker's reclaim tick
-        // needs to exist.
+        // still creates the endpoint store, which the monitor tick can touch
+        // in the window before it is stopped below.
         context_->construct();
         worker_pool_ = std::make_unique<WorkerPool>(*context_);
+        WorkerPoolTestPeer::stopWorkers(*worker_pool_);
     }
 
     void TearDown() override {
