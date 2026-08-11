@@ -126,6 +126,7 @@ python3 -m mooncake.spdk_tgt_create \
 | `ip` | IP address of the target node. |
 | `path` | SPDK installation path on the target node. |
 | `pci` | PCI addresses of SSDs to register with the target. Use commas to separate multiple PCI addresses. If this field is omitted, SPDK-ready or unmounted NVMe devices on the target node are registered. |
+| `--port` | SSH port used to connect to target nodes. The default value is `22`. |
 | `--core-mask` | CPU core mask used to start `nvmf_tgt` with `-m`. The default value is `0xff`. |
 
 **Tip**: Run `/path/scripts/setup.sh status` on a target node to list available PCI addresses.

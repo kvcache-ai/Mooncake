@@ -77,7 +77,8 @@ class BatchEvictTest : public ::testing::Test {
         ReplicateConfig config;
         config.replica_num = 1;
         config.preferred_segment = kSegmentName;
-        config.with_soft_pin = with_soft_pin;
+        config.soft_pin_action =
+            with_soft_pin ? SoftPinAction::ENABLE : SoftPinAction::PRESERVE;
         if (!group_id.empty()) {
             config.group_ids = std::vector<std::string>{group_id};
         }

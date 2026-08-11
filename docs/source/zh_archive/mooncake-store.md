@@ -103,7 +103,8 @@ tl::expected<void, ErrorCode> Put(const ObjectKey& key,
 ```C++
 struct ReplicateConfig {
     size_t replica_num{1};                    // 对象的总副本数
-    bool with_soft_pin{false};               // 是否为该对象启用软固定机制
+    SoftPinAction soft_pin_action{SoftPinAction::PRESERVE}; // 软固定状态转换
+    std::optional<uint64_t> soft_pin_ttl_ms{}; // ENABLE 时可覆盖默认 TTL
     std::string preferred_segment{};         // 首选的分配段
 };
 ```
@@ -628,11 +629,15 @@ virtual tl::expected<std::vector<Replica>, ErrorCode> Allocate(
 
 对于重要且频繁使用的对象，例如 system prompt，Mooncake Store 提供了软固定（soft pin）机制。在执行 `Put` 操作时，可以选择为特定的对象开启软固定机制。在执行替换任务时，系统会优先替换未被软固定的对象。仅当内存不足且没有其他对象可以被替换时，才会替换被软固定的对象。
 
-如果某个软固定的对象长时间未被访问，其软固定状态将被解除。而后当该对象再次被访问时，它将自动重新进入软固定状态。
+soft pin 生命周期从首个副本变为可读时开始。deadline 到达后，对象降级为普通 Cache；后续访问只授予普通读租约，不会重新启用 soft pin。后续写入仍可显式重新启用。
 
-`master_service` 中有两个与软固定机制相关的启动参数：
+soft pin 是仅在运行时生效的淘汰优先级状态，不会持久化到快照或 HA OpLog。恢复或 Standby 提升后，恢复出的对象将降级为普通 Cache；快照中的兼容字段仅用于保持格式，恢复时会被忽略。
 
-* `default_kv_soft_pin_ttl`：表示一个被软固定的对象在多长时间（毫秒）未被访问后会自动解除软固定状态。默认值为`30 分钟`。
+`master_service` 中有三个与软固定机制相关的启动参数：
+
+* `default_kv_soft_pin_ttl`：未显式传入 TTL 时使用的固定软固定生命周期。默认值为 `30 分钟`，访问不会续期。
+
+* `max_kv_soft_pin_ttl`：Master 接受的请求级 soft pin TTL 上限。默认值为 `24 小时`。
 
 * `allow_evict_soft_pinned_objects`：是否允许替换已被软固定的对象。默认值为 `true`。
 
@@ -661,7 +666,8 @@ Mooncake Store 提供了**首选段分配**功能，允许用户为对象分配�
 ```cpp
 struct ReplicateConfig {
     size_t replica_num{1};                    // 对象的总副本数
-    bool with_soft_pin{false};               // 是否为该对象启用软固定机制
+    SoftPinAction soft_pin_action{SoftPinAction::PRESERVE}; // 软固定状态转换
+    std::optional<uint64_t> soft_pin_ttl_ms{}; // ENABLE 时可覆盖默认 TTL
     std::string preferred_segment{};         // 首选的分配段
 };
 ```
