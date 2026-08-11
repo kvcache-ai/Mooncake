@@ -125,14 +125,13 @@ performance/vllm/index
 
 design/architecture
 design/transfer-engine/index
+design/tent/overview
 design/store/mooncake-store
 design/mooncake-backend-pg
 design/mooncake-ep
-design/hicache-design
 design/p2p-store
-design/tent/overview
-design/tent/tebench
 design/conductor/conductor-architecture-design
+design/hicache-design
 :::
 
 % API Documentation

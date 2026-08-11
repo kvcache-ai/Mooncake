@@ -262,6 +262,7 @@ redirects = {
     "design/engram": "store/engram.html",
     "design/unified-parallel-tensor-io":
     "store/unified-parallel-tensor-io.html",
+    "design/tent/tebench": "../../performance/mooncake/tebench.html",
     "deployment/ssd-offload": "ssd/ssd-offload.html",
     "deployment/nvmf-ssd-deployment-guide":
     "ssd/nvmf-ssd-deployment-guide.html",
