@@ -1159,8 +1159,7 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                         return replica.is_memory_replica() &&
                                IsReplicaReadable(replica);
                     })) {
-                    metadata->GrantLease(default_kv_lease_ttl_,
-                                         default_kv_soft_pin_ttl_);
+                    metadata->GrantReadLease(default_kv_lease_ttl_);
                 }
             }
         }

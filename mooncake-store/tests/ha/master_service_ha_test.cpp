@@ -3470,6 +3470,7 @@ TEST_F(MasterServiceHATest, BatchEvictStopsAfterFirstOpLogReservationFailure) {
                               .set_enable_ha(true)
                               .set_enable_oplog(true)
                               .set_cluster_id(cluster_id)
+                              .set_eviction_ratio(0.0)
                               .set_oplog_batch_max_entries(1)
                               .build());
     auto* writer = InstallGatedWriter(service, backend);
