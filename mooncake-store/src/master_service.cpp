@@ -4050,10 +4050,9 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
             LOG(INFO) << "key=" << key << ", info=object_already_exists";
             return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
         }
-        return AllocateAndInsertMetadata(shard, client_id, key, slice_length,
-                                         config, group_id, object_id.tenant_id,
-                                         now, *soft_pin_request,
-                                         quota_deficit_bytes);
+        return AllocateAndInsertMetadata(
+            shard, client_id, key, slice_length, config, group_id,
+            object_id.tenant_id, now, *soft_pin_request, quota_deficit_bytes);
     };
 
     for (int attempt = 0; attempt <= kMaxTenantQuotaEvictionRetries;
@@ -4872,8 +4871,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
         }
         return AllocateAndInsertMetadata(
             shard, client_id, key, slice_length, config, group_id,
-            object_id.tenant_id, now, *soft_pin_request,
-            quota_deficit_bytes,
+            object_id.tenant_id, now, *soft_pin_request, quota_deficit_bytes,
             std::move(case_a_committed_soft_pin_timeout));
     };
 
