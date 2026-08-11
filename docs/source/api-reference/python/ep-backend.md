@@ -412,16 +412,23 @@ matching dispatch `handle` and pass the resulting tensor back to `combine()` wit
 Reconnects EP peers after backend membership changes. Call it after PG recovery
 updates rank activeness so EP transport metadata and QPs can be refreshed.
 
-## Experimental NCCL backend for `ElasticBuffer`
+## Default NCCL backend for `ElasticBuffer`
 
-`mooncake.mooncake_elastic_buffer.ElasticBuffer` keeps IPC + IBGDA as its
-default transport. Source builds with the NCCL Device API enabled can opt into
-NCCL explicitly:
+`mooncake.mooncake_elastic_buffer.ElasticBuffer` now defaults to
+`transport="auto"`. Auto mode uses NCCL when the extension was built with the
+NCCL Device API and the inferred EP topology is supported by the compiled NCCL
+kernels. Existing constructor calls require no changes. If NCCL cannot be
+used, auto mode falls back to IPC + IBGDA and retains the previous backend
+behavior. As before, the requested workload must have a compiled elastic kernel
+shape.
 
-```bash
-cmake .. -DWITH_EP=ON -DUSE_CUDA=ON -DUSE_NCCL_DEVICE=ON \
-  -DNCCL_ROOT=/path/to/nccl
-```
+Fresh CUDA EP builds (`-DWITH_EP=ON -DUSE_CUDA=ON`) automatically enable the
+NCCL backend when NCCL 2.30.4 or newer and `nccl_device.h` are discoverable. Use
+`-DUSE_NCCL_DEVICE=ON` to require NCCL at configure time, or
+`-DUSE_NCCL_DEVICE=OFF` to build only IPC + IBGDA.
+
+No application-side communicator bootstrap is required. Auto mode creates one
+NCCL unique ID on process-group rank zero and broadcasts it to the group:
 
 ```python
 import torch.distributed as dist
@@ -435,40 +442,42 @@ buffer = ElasticBuffer(
     num_max_tokens_per_rank=128,
     hidden=4096,
     num_topk=8,
-    transport="nccl",
-    explicitly_destroy=True,
 )
+print(f"Mooncake EP selected {buffer.transport}")
 
 try:
     # Call buffer.dispatch(...) and buffer.combine(...).
     pass
 finally:
-    # This is collective for the NCCL backend.
+    # Deterministic collective cleanup is recommended when NCCL was selected.
     buffer.destroy()
 
 dist.destroy_process_group()
 ```
 
-The initial NCCL backend has the following constraints:
+For a controlled rollout, pass `transport="ibgda"` or set
+`MOONCAKE_EP_TRANSPORT=ibgda`. Explicit `transport="nccl"` disables automatic
+fallback and reports an error if NCCL support is unavailable. The
+`explicitly_destroy` argument remains optional for compatibility with the
+DeepEP API; calling `destroy()` collectively is still the most predictable way
+to release NCCL symmetric windows before destroying the process group.
+
+The NCCL backend currently has the following constraints:
 
 - It requires NCCL 2.30.4 or newer with Device API and GIN support. The NCCL
   headers used to build Mooncake must exactly match the loaded `libnccl`.
   Rebuild Mooncake after an NCCL upgrade. If PyTorch would load another NCCL
   first, configure or preload the matching runtime before initializing the
   process group.
-- Process-group ranks must form contiguous, equal-sized NCCL LSA teams. A
-  single LSA team uses the existing two-rank or eight-rank compiled kernel
-  shapes. Multi-node execution requires hybrid mode and currently supports two
-  LSA teams of four or eight GPUs (`2x4` or `2x8`).
-- Groups with more than one rank currently request GIN resources, including
-  runs whose data path remains inside one LSA team.
+- Process-group ranks must form contiguous, equal-sized NCCL LSA teams. The
+  compiled kernels support one team of two or eight GPUs (`1x2` or `1x8`), two
+  teams of four or eight GPUs (`2x4` or `2x8`), and four teams of four GPUs
+  (`4x4`). Cross-team communication uses hybrid mode and rail GIN. Auto mode
+  selects IPC + IBGDA for other shapes.
+- Groups with more than one rank request GIN resources, including runs whose
+  data path remains inside one LSA team.
 - Communicator membership is fixed. Create a new `ElasticBuffer` instead of
-  calling `update_ep_member()`.
-- Every rank must call `destroy()` after quiescing its work and before the
-  process group is destroyed. Rank-local garbage collection is not a safe
-  replacement for this collective teardown.
-- Rail GIN connectivity and general non-hybrid, cross-LSA kernels are not yet
-  supported.
+  calling `update_ep_member()` after membership changes.
 - A rank-local failure before the internal status collective is established
   (for example, mismatched configuration/runtime or failure to allocate its
   minimal CUDA control resources) is not recoverable in place and may require
