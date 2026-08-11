@@ -308,6 +308,49 @@ class EfaContext {
     // FI_THREAD_SAFE at the domain level.
     std::atomic_flag post_lock_;
 
+    // ---- Credit-flow diagnostics (observability only) ----
+    //
+    // wr_depth_ is released only by the CQ poller, so when a submitter runs out
+    // of credit the question that actually narrows things down is whether
+    // completions are still arriving at all.  These answer it without touching
+    // the healthy submit path: the poller stamps them once per non-empty
+    // fi_cq_read batch rather than once per completion, and only failure paths
+    // ever read them.  Every access is memory_order_relaxed -- these counters
+    // order nothing, they only get printed.
+    //
+    // Because the starvation logs print the cumulative values, two events hours
+    // apart can be diffed to separate a slow leak (posted - completed - errors
+    // drifting up) from ordinary saturation, with no periodic logging thread.
+    //
+    // alignas(64) is load-bearing, not decoration: the poller writes
+    // last_completion_ns_ on every batch, and without its own cache line these
+    // counters would share one with wr_depth_ / post_lock_ just above -- the
+    // exact words every submitter spins on.  Diagnostics must not add coherence
+    // traffic to the pacing hot path.
+    alignas(64) std::atomic<uint64_t> last_completion_ns_{0};
+    std::atomic<uint64_t> total_posted_{0};
+    std::atomic<uint64_t> total_completions_{0};
+    std::atomic<uint64_t> total_cq_errors_{0};
+    // Completions whose op_context or slice is null.  Both pollCq branches
+    // return the CQ reservation for these (they are counted in `ret` /
+    // `err_count`) but cannot return the matching wr_depth_ reservation, whose
+    // owner is reached only through op_ctx.  A nonzero value here is therefore
+    // a wr_depth_ leak, and its signature is wr_depth_ drifting above
+    // cq_outstanding -- the two are otherwise reserved and released in pairs.
+    std::atomic<uint64_t> orphan_completions_{0};
+
+    // Top-N AV slots by inflight, plus the total across all slots.  wr_depth_
+    // is per local NIC and shared by every peer, so one stalled peer can pin
+    // all of it and starve the rest; and a total far below wr_depth_ means the
+    // credit is held by operations with no slot, i.e. an accounting bug rather
+    // than a slow peer.  Walks av_slots_ under av_ref_lock_, so callers must
+    // not hold post_lock_ (keeps the post_lock_ -> av_ref_lock_ order intact).
+    std::string describeInflightBySlot(size_t top_n) const;
+
+    // Milliseconds since the CQ poller last reaped anything, or -1 if it never
+    // has.  Reads last_completion_ns_; failure paths only.
+    int64_t msSinceLastCompletion() const;
+
     std::vector<std::shared_ptr<EfaCq>> cq_list_;
 
     // ---- Peer handles (one entry per peer, each ~constant size) ----

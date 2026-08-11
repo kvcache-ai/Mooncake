@@ -47,6 +47,17 @@ constexpr int kCqErrorLogEveryN = 256;
 // (local NIC x remote NIC) pair for every new peer.
 constexpr int kEvictLogEveryN = 256;
 
+// Monotonic nanosecond stamp for the credit-flow diagnostics.  steady_clock
+// rather than getCurrentTimeInNano(): an age derived from CLOCK_REALTIME jumps
+// whenever NTP steps the clock, and this shares a clock domain with the
+// wall-clock wait measured in submitSlicesOnPeer().  vDSO, no syscall.
+inline uint64_t monotonicNowNs() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}
+
 // EFA provider errno values that mean "the address handle backing this peer is
 // gone" -- i.e. retrying on the same fi_addr_t can never succeed, but a fresh
 // handshake + fi_av_insert can.  These are provider-specific values from
@@ -1432,6 +1443,47 @@ int EfaContext::submitPostSend(
     return 0;
 }
 
+int64_t EfaContext::msSinceLastCompletion() const {
+    uint64_t last = last_completion_ns_.load(std::memory_order_relaxed);
+    if (last == 0) return -1;
+    uint64_t now = monotonicNowNs();
+    // The stamp is taken by another thread, so it can be marginally ahead of
+    // our own read of the clock; report 0 rather than a negative age.
+    return now > last ? static_cast<int64_t>((now - last) / 1000000) : 0;
+}
+
+std::string EfaContext::describeInflightBySlot(size_t top_n) const {
+    std::vector<std::pair<fi_addr_t, int>> busy;
+    int total = 0;
+    size_t slot_count = 0;
+    {
+        RWSpinlock::ReadGuard guard(av_ref_lock_);
+        slot_count = av_slots_.size();
+        busy.reserve(slot_count);
+        for (const auto& entry : av_slots_) {
+            int inflight =
+                entry.second->inflight.load(std::memory_order_relaxed);
+            if (inflight <= 0) continue;
+            total += inflight;
+            busy.emplace_back(entry.first, inflight);
+        }
+    }
+    std::partial_sort(
+        busy.begin(), busy.begin() + std::min(top_n, busy.size()), busy.end(),
+        [](const std::pair<fi_addr_t, int>& a,
+           const std::pair<fi_addr_t, int>& b) { return a.second > b.second; });
+
+    std::ostringstream os;
+    os << "slots=" << slot_count << " busy=" << busy.size()
+       << " sum_inflight=" << total << " top=[";
+    for (size_t i = 0; i < busy.size() && i < top_n; ++i) {
+        if (i) os << ", ";
+        os << "fi_addr=" << busy[i].first << ":" << busy[i].second;
+    }
+    os << "]";
+    return os.str();
+}
+
 int EfaContext::submitSlicesOnPeer(
     fi_addr_t peer_fi_addr, std::vector<Transport::Slice*>& slice_list,
     std::vector<Transport::Slice*>& failed_slice_list) {
@@ -1478,13 +1530,43 @@ int EfaContext::submitSlicesOnPeer(
     int stalled_waves = 0;
     while (cursor < slice_list.size() || !retry_slices.empty()) {
         if (stalled_waves > kMaxStalledWaves) {
+            // retry_slices holds the previous wave's bounced slices here (they
+            // are spliced back in just below), so either side can name the
+            // peer.
+            const Transport::Slice* probe =
+                !retry_slices.empty()
+                    ? retry_slices.front()
+                    : (cursor < slice_list.size() ? slice_list[cursor]
+                                                  : nullptr);
             LOG(WARNING) << "EFA submitSlicesOnPeer: " << kMaxStalledWaves
                          << " consecutive FI_EAGAIN waves posted nothing on "
-                         << nicPath() << "; failing "
+                         << nicPath() << " -> "
+                         << ((probe && !probe->peer_nic_path.empty())
+                                 ? probe->peer_nic_path
+                                 : "unknown")
+                         << " (fi_addr=" << peer_fi_addr << "); wr_depth="
+                         << wr_depth_.load(std::memory_order_relaxed) << "/"
+                         << max_wr_depth_ << "; cq_outstanding="
+                         << (cq_outstanding ? cq_outstanding->load(
+                                                  std::memory_order_relaxed)
+                                            : -1)
+                         << "/" << cq_limit
+                         << "; last_completion=" << msSinceLastCompletion()
+                         << "ms ago"
+                         << "; this_peer_inflight="
+                         << slot->inflight.load(std::memory_order_relaxed)
+                         << "; " << describeInflightBySlot(4)
+                         << "; totals posted="
+                         << total_posted_.load(std::memory_order_relaxed)
+                         << " completed="
+                         << total_completions_.load(std::memory_order_relaxed)
+                         << " cq_errors="
+                         << total_cq_errors_.load(std::memory_order_relaxed)
+                         << " orphans="
+                         << orphan_completions_.load(std::memory_order_relaxed)
+                         << "; failing "
                          << (retry_slices.size() + slice_list.size() - cursor)
-                         << " slice(s) (wr_depth="
-                         << wr_depth_.load(std::memory_order_relaxed)
-                         << ", max=" << max_wr_depth_ << ")";
+                         << " slice(s)";
             for (auto* slice : retry_slices) failed_slice_list.push_back(slice);
             for (size_t i = cursor; i < slice_list.size(); ++i)
                 failed_slice_list.push_back(slice_list[i]);
@@ -1511,10 +1593,48 @@ int EfaContext::submitSlicesOnPeer(
         int batch_count = 0;
         int backoff = 0;
         bool timed_out = false;
+
+        // Diagnostics for the starvation log below, armed lazily on the FIRST
+        // backoff so that the common case -- credit available on the first
+        // iteration -- pays nothing, not even a clock read.
+        //
+        // Two things the old log could not be reconstructed from.  First, the
+        // wall-clock wait: kMaxBackoffYields is a yield budget, not a deadline,
+        // and a yield costs anywhere from a few hundred nanoseconds when the
+        // core is idle to microseconds when it is contended, so the same code
+        // gives up after wildly different amounts of real time depending only
+        // on how loaded the box is.  Second, whether wr_depth_ moved at all
+        // while we waited: a counter pinned at max for the entire wait means
+        // completions are not coming back (stalled peer, starved poller, or
+        // leaked credit -- see orphan_completions_), whereas one oscillating
+        // just below max means we are simply saturated and the batch is
+        // ordinary backpressure.  Those two want opposite investigations.
+        std::chrono::steady_clock::time_point wait_t0;
+        const char* starved_on = "none";
+        int wr_first = -1, wr_min = 0, wr_max = 0, wr_moves = 0, wr_prev = -1;
+        // Runs once per yield: a handful of register-resident int compares next
+        // to a syscall.  Must be called before `backoff` is bumped, so that the
+        // first call is the one that arms the clock.
+        auto note_starved = [&](const char* which, int cur_wr) {
+            starved_on = which;
+            if (backoff == 0) {
+                wait_t0 = std::chrono::steady_clock::now();
+                wr_first = wr_min = wr_max = wr_prev = cur_wr;
+                return;
+            }
+            if (cur_wr < wr_min) wr_min = cur_wr;
+            if (cur_wr > wr_max) wr_max = cur_wr;
+            if (cur_wr != wr_prev) {
+                ++wr_moves;
+                wr_prev = cur_wr;
+            }
+        };
+
         while (batch_count == 0) {
             int cur_wr = wr_depth_.load(std::memory_order_relaxed);
             int wr_avail = max_wr_depth_ - cur_wr;
             if (wr_avail <= 0) {
+                note_starved("wr_depth", cur_wr);
                 if (++backoff > kMaxBackoffYields) {
                     timed_out = true;
                     break;
@@ -1527,6 +1647,7 @@ int EfaContext::submitSlicesOnPeer(
                 int cur_cq = cq_outstanding->load(std::memory_order_relaxed);
                 int cq_avail = cq_limit - cur_cq;
                 if (cq_avail <= 0) {
+                    note_starved("cq_outstanding", cur_wr);
                     if (++backoff > kMaxBackoffYields) {
                         timed_out = true;
                         break;
@@ -1563,14 +1684,39 @@ int EfaContext::submitSlicesOnPeer(
         }
 
         if (timed_out) {
-            LOG(WARNING) << "EFA submitSlicesOnPeer: timed out waiting for CQ"
-                         << " drain (wr_depth="
-                         << wr_depth_.load(std::memory_order_relaxed)
-                         << ", max=" << max_wr_depth_ << ", cq_outstanding="
-                         << (cq_outstanding ? cq_outstanding->load(
-                                                  std::memory_order_relaxed)
-                                            : -1)
-                         << ", max_cqe=" << cq_limit << ")";
+            const double waited_ms =
+                std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - wait_t0)
+                    .count();
+            const std::string& peer_path = slice_list[cursor]->peer_nic_path;
+            LOG(WARNING)
+                << "EFA submitSlicesOnPeer: timed out waiting for CQ drain on "
+                << nicPath() << " -> "
+                << (peer_path.empty() ? "unknown" : peer_path)
+                << " (fi_addr=" << peer_fi_addr
+                << "): starved_on=" << starved_on << ", waited=" << waited_ms
+                << "ms over " << backoff << " yields"
+                << "; wr_depth=" << wr_depth_.load(std::memory_order_relaxed)
+                << "/" << max_wr_depth_ << " (at first backoff " << wr_first
+                << ", observed min=" << wr_min << " max=" << wr_max
+                << ", moved " << wr_moves << "x while waiting)"
+                << "; cq_outstanding="
+                << (cq_outstanding
+                        ? cq_outstanding->load(std::memory_order_relaxed)
+                        : -1)
+                << "/" << cq_limit
+                << "; last_completion=" << msSinceLastCompletion() << "ms ago"
+                << "; this_peer_inflight="
+                << slot->inflight.load(std::memory_order_relaxed) << "; "
+                << describeInflightBySlot(4) << "; totals posted="
+                << total_posted_.load(std::memory_order_relaxed)
+                << " completed="
+                << total_completions_.load(std::memory_order_relaxed)
+                << " cq_errors="
+                << total_cq_errors_.load(std::memory_order_relaxed)
+                << " orphans="
+                << orphan_completions_.load(std::memory_order_relaxed)
+                << "; failing " << (slice_list.size() - cursor) << " slice(s)";
             for (size_t i = cursor; i < slice_list.size(); ++i) {
                 failed_slice_list.push_back(slice_list[i]);
             }
@@ -1608,6 +1754,9 @@ int EfaContext::submitSlicesOnPeer(
         }
 
         if (valid_count > 0) {
+            // Tallied once for the whole batch after the post burst, not per
+            // operation: one relaxed add per up-to-max_wr_depth_ slices.
+            int posted = 0;
             while (post_lock_.test_and_set(std::memory_order_acquire)) {
             }
             for (int i = 0; i < valid_count; i++) {
@@ -1635,6 +1784,7 @@ int EfaContext::submitSlicesOnPeer(
                                    &entry.op_ctx->fi_ctx);
                 }
                 if (ret == 0) {
+                    ++posted;
                     entry.slice->status = Transport::Slice::PENDING;
                     // Stamp the post time so MC_SLICE_TIMEOUT can fire.  EFA
                     // used to leave ts at 0, which made
@@ -1674,6 +1824,9 @@ int EfaContext::submitSlicesOnPeer(
                 }
             }
             post_lock_.clear(std::memory_order_release);
+            if (posted)
+                total_posted_.fetch_add(static_cast<uint64_t>(posted),
+                                        std::memory_order_relaxed);
             // The rollback paths above may have been the decrement that
             // quiesced a slot whose last holder already released it.  Settle it
             // here rather than leaking the AV entry until process exit.  Must
@@ -1731,6 +1884,12 @@ int EfaContext::pollCq(int max_entries, int cq_index) {
                     touched_slots.emplace_back(op_ctx->slot, op_ctx->slot_addr);
                 }
                 delete op_ctx;
+            } else {
+                // The CQ reservation is returned below for every entry in
+                // `ret`, but the wr_depth_ reservation is reachable only
+                // through op_ctx, so this entry leaks one WR credit.  See
+                // orphan_completions_.
+                orphan_completions_.fetch_add(1, std::memory_order_relaxed);
             }
         }
         for (auto& entry : wr_depth_set) {
@@ -1739,6 +1898,11 @@ int EfaContext::pollCq(int max_entries, int cq_index) {
         for (auto& s : touched_slots) retireSlotIfPending(s.first, s.second);
         cq_list_[cq_index]->outstanding.fetch_sub(static_cast<int>(ret),
                                                   std::memory_order_acq_rel);
+        // Liveness stamp for the starvation logs: once per non-empty batch of
+        // up to 64 completions, not once per completion.
+        total_completions_.fetch_add(static_cast<uint64_t>(ret),
+                                     std::memory_order_relaxed);
+        last_completion_ns_.store(monotonicNowNs(), std::memory_order_relaxed);
         return static_cast<int>(ret);
     } else if (ret == -FI_EAGAIN) {
         return 0;
@@ -1803,6 +1967,11 @@ int EfaContext::pollCq(int max_entries, int cq_index) {
                     touched_slots.emplace_back(op_ctx->slot, op_ctx->slot_addr);
                 }
                 delete op_ctx;
+            } else {
+                // Same asymmetry as the success path: err_count returns the CQ
+                // reservation, but the WR reservation is unreachable without
+                // op_ctx.  See orphan_completions_.
+                orphan_completions_.fetch_add(1, std::memory_order_relaxed);
             }
             err_count++;
         }
@@ -1814,6 +1983,12 @@ int EfaContext::pollCq(int max_entries, int cq_index) {
         if (err_count > 0) {
             cq_list_[cq_index]->outstanding.fetch_sub(
                 err_count, std::memory_order_acq_rel);
+            // An error completion is still the poller making progress and
+            // releasing credit, so it counts for liveness.
+            total_cq_errors_.fetch_add(static_cast<uint64_t>(err_count),
+                                       std::memory_order_relaxed);
+            last_completion_ns_.store(monotonicNowNs(),
+                                      std::memory_order_relaxed);
         }
 
         // Drop stale peer handles outside the drain loop:
