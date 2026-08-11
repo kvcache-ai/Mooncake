@@ -3,30 +3,25 @@
 # Invoked at build time via cmake -P from the root CMakeLists.txt when
 # WITH_EP=ON.  Variables are passed with -D from the custom target:
 #
-#   SOURCE_DIR          - mooncake-pg source directory
+#   SOURCE_DIR          - mooncake-pg/torch source directory
 #   EP_CUDA_MAJOR       - CUDA major version (integer)
 #   EP_CUDA_MINOR       - CUDA minor version (integer)
 #   EP_TORCH_VERSIONS   - pipe-separated (|) PyTorch versions to build for
 #                         (empty = use the currently-installed torch)
-#   TORCH_CUDA_ARCH_LIST - pipe-separated CUDA arch list forwarded to torch
 #   STAGING_DIR         - destination directory for the built .so files
-#   ENGINE_SO_PATH      - absolute path to the built engine.cpython-XYZ.so
-#   ASIO_SO_PATH        - absolute path to the libasio.so used by engine.so
-#   YLT_INCLUDE_DIRS    - pipe-separated YLT include directories used by CMake
+#   PG_CORE_SO_PATH     - absolute path to the built libmooncake_pg.so
+#   PG_DEVICE_SO_PATH   - absolute path to libmooncake_pg_device.so
 #   EP_USE_MUSA         - set to "1" when building for MUSA (MTLink path)
 #   EP_USE_MACA         - set to "1" when building for MACA (MTLink path)
 
 cmake_minimum_required(VERSION 3.16)
 
 # Include common build utilities.
-include("${SOURCE_DIR}/../mooncake-common/SetupPyTorchEnv.cmake")
+include("${SOURCE_DIR}/../../mooncake-common/SetupPyTorchEnv.cmake")
 
 # Restore pipe-separated strings back to CMake semicolon-separated lists.
 if(EP_TORCH_VERSIONS)
   string(REPLACE "|" ";" EP_TORCH_VERSIONS "${EP_TORCH_VERSIONS}")
-endif()
-if(TORCH_CUDA_ARCH_LIST)
-  string(REPLACE "|" ";" TORCH_CUDA_ARCH_LIST "${TORCH_CUDA_ARCH_LIST}")
 endif()
 
 # ---------------------------------------------------------------------------
@@ -38,15 +33,15 @@ endif()
 # file descriptors".
 set(ENV{MAKEFLAGS} "")
 set(ENV{MFLAGS} "")
-set(ENV{TORCH_CUDA_ARCH_LIST} "${TORCH_CUDA_ARCH_LIST}")
-if(NOT YLT_INCLUDE_DIRS)
-  message(FATAL_ERROR "[PG] YLT_INCLUDE_DIRS was not provided by CMake")
+if(NOT PG_CORE_SO_PATH OR NOT EXISTS "${PG_CORE_SO_PATH}")
+  message(FATAL_ERROR
+    "[PG] PG_CORE_SO_PATH is missing or does not exist: ${PG_CORE_SO_PATH}")
 endif()
-if(NOT ASIO_SO_PATH OR NOT EXISTS "${ASIO_SO_PATH}")
-  message(FATAL_ERROR "[PG] ASIO_SO_PATH is missing or does not exist: ${ASIO_SO_PATH}")
+if(NOT PG_DEVICE_SO_PATH OR NOT EXISTS "${PG_DEVICE_SO_PATH}")
+  message(FATAL_ERROR
+    "[PG] PG_DEVICE_SO_PATH is missing or does not exist: ${PG_DEVICE_SO_PATH}")
 endif()
-set(ENV{MOONCAKE_YLT_INCLUDE_DIRS} "${YLT_INCLUDE_DIRS}")
-set(ENV{MOONCAKE_ASIO_SO_PATH} "${ASIO_SO_PATH}")
+set(ENV{MOONCAKE_PG_CORE_SO_PATH} "${PG_CORE_SO_PATH}")
 if(EP_USE_MUSA)
   set(ENV{MOONCAKE_EP_USE_MUSA} "1")
 else()
@@ -64,22 +59,7 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
-# 2. Ensure engine.so exists in mooncake-wheel/mooncake/ for setup.py linking.
-# ---------------------------------------------------------------------------
-# setup.py links against -l:engine.so in ../mooncake-wheel/mooncake/.
-# During the make phase only the versioned engine.cpython-XYZ.so exists in
-# the build tree; create a bare engine.so symlink so the linker can find it.
-set(_wheel_mooncake_dir "${SOURCE_DIR}/../mooncake-wheel/mooncake")
-set(_engine_symlink "${_wheel_mooncake_dir}/engine.so")
-if(ENGINE_SO_PATH AND NOT EXISTS "${_engine_symlink}")
-  message(STATUS "[PG] Creating engine.so symlink -> ${ENGINE_SO_PATH}")
-  execute_process(
-    COMMAND ${CMAKE_COMMAND} -E create_symlink "${ENGINE_SO_PATH}" "${_engine_symlink}"
-  )
-endif()
-
-# ---------------------------------------------------------------------------
-# 3. Build the PG Python extension.
+# 2. Build the PG Python extension.
 # ---------------------------------------------------------------------------
 if("${EP_TORCH_VERSIONS}" STREQUAL "")
   message(STATUS "[PG] Building with currently-installed PyTorch")
@@ -108,10 +88,12 @@ else()
 endif()
 
 # ---------------------------------------------------------------------------
-# 4. Copy the built .so files to the staging directory.
+# 3. Stage only fatbin-bearing device and extension .so files. The host-only
+#    core is packaged before auditwheel so its dependencies are repaired.
 # ---------------------------------------------------------------------------
 file(MAKE_DIRECTORY "${STAGING_DIR}")
 file(GLOB _so_files "${SOURCE_DIR}/mooncake/*.so")
+list(APPEND _so_files "${PG_DEVICE_SO_PATH}")
 foreach(_so IN LISTS _so_files)
   get_filename_component(_fname "${_so}" NAME)
   message(STATUS "[PG] Staging ${_fname} -> ${STAGING_DIR}")

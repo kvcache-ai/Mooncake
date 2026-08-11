@@ -2,150 +2,140 @@
 // Compiled by g++ for both CUDA and MUSA builds. Uses kernel launch wrappers
 // from mooncake_worker_kernels.cuh instead of <<<>>> syntax.
 
-#include <mooncake_backend.h>
-#include <cstdio>
 #include <memory>
 #include <thread>
 #include <mooncake_worker.cuh>
 #include <mooncake_worker_kernels.cuh>
-#include <work_handles.h>
-#include <ATen/cuda/CUDAGraphsUtils.cuh>
 
-#include "pg_utils.h"
+#include "error_types.h"
 
 namespace mooncake {
 
-void launchReduceKernel(at::Tensor dst, size_t pos, size_t realSize, void* src,
-                        size_t numRanks, c10d::ReduceOp op, bool* activeRanks,
-                        cudaStream_t stream) {
-    TORCH_CHECK(op == c10d::ReduceOp::SUM || op == c10d::ReduceOp::MIN ||
-                    op == c10d::ReduceOp::MAX || op == c10d::ReduceOp::PRODUCT,
-                "Only support SUM/MIN/MAX/PRODUCT for reduction.");
-    auto ptr = (char*)dst.data_ptr() + pos;
-    size_t num = realSize / dst.element_size();
+void launchReduceKernel(void* dst, DataType dataType, size_t pos,
+                        size_t realSize, void* src, size_t numRanks,
+                        ReduceOp op, bool* activeRanks, cudaStream_t stream) {
+    PG_ASSERT(op == ReduceOp::Sum || op == ReduceOp::Min ||
+                  op == ReduceOp::Max || op == ReduceOp::Product,
+              "Only support SUM/MIN/MAX/PRODUCT for reduction.");
+    auto ptr = (char*)dst + pos;
+    size_t num = realSize / elementSize(dataType);
 
-    switch (dst.scalar_type()) {
-        case c10::kByte:
+    switch (dataType) {
+        case DataType::Uint8:
             launchReduceKernel_uint8((uint8_t*)ptr, (uint8_t*)src, num,
                                      numRanks, (int)op, activeRanks, stream);
             break;
-        case c10::kChar:
+        case DataType::Int8:
             launchReduceKernel_int8((int8_t*)ptr, (int8_t*)src, num, numRanks,
                                     (int)op, activeRanks, stream);
             break;
-        case c10::kShort:
+        case DataType::Int16:
             launchReduceKernel_int16((int16_t*)ptr, (int16_t*)src, num,
                                      numRanks, (int)op, activeRanks, stream);
             break;
-        case c10::kInt:
+        case DataType::Int32:
             launchReduceKernel_int32((int*)ptr, (int*)src, num, numRanks,
                                      (int)op, activeRanks, stream);
             break;
-        case c10::kLong:
+        case DataType::Int64:
             launchReduceKernel_int64((int64_t*)ptr, (int64_t*)src, num,
                                      numRanks, (int)op, activeRanks, stream);
             break;
-        case c10::kFloat:
+        case DataType::Float32:
             launchReduceKernel_float((float*)ptr, (float*)src, num, numRanks,
                                      (int)op, activeRanks, stream);
             break;
-        case c10::kDouble:
+        case DataType::Float64:
             launchReduceKernel_double((double*)ptr, (double*)src, num, numRanks,
                                       (int)op, activeRanks, stream);
             break;
-        case c10::kBool:
+        case DataType::Bool:
             launchReduceKernel_bool((bool*)ptr, (bool*)src, num, numRanks,
                                     (int)op, activeRanks, stream);
             break;
-        case c10::kBFloat16:
+        case DataType::Bfloat16:
             launchReduceKernel_bf16(ptr, src, num, numRanks, (int)op,
                                     activeRanks, stream);
             break;
         default:
-            TORCH_CHECK(false, c10::str("Unsupported reduce dtype: ",
-                                        dst.scalar_type()));
+            PG_ASSERT(false, "Unsupported reduce dtype: ", (int)dataType);
     }
 }
 
 template <typename T>
-T applyReduceOp(const T& a, const T& b, c10d::ReduceOp op) {
+T applyReduceOp(const T& a, const T& b, ReduceOp op) {
     switch (op) {
-        case c10d::ReduceOp::SUM:
+        case ReduceOp::Sum:
             return a + b;
-        case c10d::ReduceOp::PRODUCT:
+        case ReduceOp::Product:
             return a * b;
-        case c10d::ReduceOp::MIN:
+        case ReduceOp::Min:
             return std::min(a, b);
-        case c10d::ReduceOp::MAX:
+        case ReduceOp::Max:
             return std::max(a, b);
         default:
-            TORCH_CHECK(false, c10::str("Unsupported reduce op: ", op));
+            PG_ASSERT(false, "Unsupported reduce op: ", (int)op);
     }
 }
 
 template <typename T>
 void reduceCpu(T* dst, const T* src, size_t numElements, size_t numRanks,
-               c10d::ReduceOp op, bool* activeRanks) {
-    at::parallel_for(0, numElements, 1024, [&](int64_t begin, int64_t end) {
-        for (int64_t i = begin; i < end; ++i) {
-            bool valid = false;
-            T acc{};
-            for (int64_t rank = 0; rank < numRanks; ++rank) {
-                // Note: failedRanksHint is intentionally NOT checked here
-                // (same rationale as the GPU reduceKernel).
-                if (activeRanks[rank]) {
-                    if (!valid) {
-                        acc = src[i + rank * numElements];
-                        valid = true;
-                    } else {
-                        acc =
-                            applyReduceOp(acc, src[i + rank * numElements], op);
-                    }
+               ReduceOp op, bool* activeRanks) {
+    for (size_t i = 0; i < numElements; ++i) {
+        bool valid = false;
+        T acc{};
+        for (size_t rank = 0; rank < numRanks; ++rank) {
+            if (activeRanks[rank]) {
+                if (!valid) {
+                    acc = src[i + rank * numElements];
+                    valid = true;
+                } else {
+                    acc = applyReduceOp(acc, src[i + rank * numElements], op);
                 }
             }
-            dst[i] = acc;
         }
-    });
+        dst[i] = acc;
+    }
 }
 
-void launchReduceCpu(at::Tensor dst, size_t pos, size_t realSize, void* src,
-                     size_t numRanks, c10d::ReduceOp op, bool* activeRanks) {
-    auto ptr = (char*)dst.data_ptr() + pos;
-    size_t num = realSize / dst.element_size();
+void launchReduceCpu(void* dst, DataType dataType, size_t pos, size_t realSize,
+                     void* src, size_t numRanks, ReduceOp op,
+                     bool* activeRanks) {
+    auto ptr = (char*)dst + pos;
+    size_t num = realSize / elementSize(dataType);
 
-    switch (dst.scalar_type()) {
-        case c10::kByte:
+    switch (dataType) {
+        case DataType::Uint8:
             reduceCpu((uint8_t*)ptr, (uint8_t*)src, num, numRanks, op,
                       activeRanks);
             break;
-        case c10::kChar:
+        case DataType::Int8:
             reduceCpu((int8_t*)ptr, (int8_t*)src, num, numRanks, op,
                       activeRanks);
             break;
-        case c10::kShort:
+        case DataType::Int16:
             reduceCpu((int16_t*)ptr, (int16_t*)src, num, numRanks, op,
                       activeRanks);
             break;
-        case c10::kInt:
+        case DataType::Int32:
             reduceCpu((int*)ptr, (int*)src, num, numRanks, op, activeRanks);
             break;
-        case c10::kLong:
+        case DataType::Int64:
             reduceCpu((int64_t*)ptr, (int64_t*)src, num, numRanks, op,
                       activeRanks);
             break;
-        case c10::kFloat:
+        case DataType::Float32:
             reduceCpu((float*)ptr, (float*)src, num, numRanks, op, activeRanks);
             break;
-        case c10::kDouble:
+        case DataType::Float64:
             reduceCpu((double*)ptr, (double*)src, num, numRanks, op,
                       activeRanks);
             break;
-        case c10::kBool:
+        case DataType::Bool:
             reduceCpu((bool*)ptr, (bool*)src, num, numRanks, op, activeRanks);
             break;
         default:
-            TORCH_CHECK(false, c10::str("Unsupported reduce dtype: ",
-                                        dst.scalar_type()));
+            PG_ASSERT(false, "Unsupported reduce dtype: ", (int)dataType);
     }
 }
 
@@ -159,10 +149,15 @@ MooncakeWorker::MooncakeWorker(int cuda_device_index)
     } else {
         tasks_ = new Task[kNumTasks_];
     }
+
+    if (cuda_device_index_ >= 0) {
+        enqueue_stream_ = GpuStream::createNonBlocking(cuda_device_index_);
+    }
+
     for (size_t i = 0; i < kNumTasks_; ++i) {
         tasks_[i].active = false;
         tasks_[i].submitSequence = 0;
-        tasks_[i].hintRouteId = 0;
+        tasks_[i].failedRanksHint = nullptr;
         tasks_[i].resetFailedRanksHint = false;
         submitted_task_sequence_[i].store(0, std::memory_order_relaxed);
     }
@@ -175,22 +170,18 @@ MooncakeWorker::~MooncakeWorker() {
     }
 }
 
-void MooncakeWorker::removeHintRoute(uint64_t hint_route_id) {
-    std::lock_guard<std::mutex> lock(hint_routes_mutex_);
-    hint_routes_by_id_.erase(hint_route_id);
-}
-
-c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
-    c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
-    const std::shared_ptr<TransferGroupMeta>& meta,
-    FailedRanksHint failed_ranks_hint,
+std::unique_ptr<WorkCompletion> MooncakeWorker::putTaskCpu(
+    OpType opType, size_t tensorSize, int64_t broadcastRoot,
+    const std::shared_ptr<TransferGroupMeta>& meta, int32_t* failed_ranks_hint,
     const std::function<void(void* dst, size_t pos, size_t realSize)>&
-        tensorToBuffer,
+        copyToSendBuffer,
     const std::function<void(void* src, size_t pos, size_t realSize)>&
-        bufferToTensor) {
+        copyFromRecvBuffer) {
+    PG_ASSERT(failed_ranks_hint, "failed-ranks hint is null");
     size_t chunkSize = ((kBufferSize - 1) / meta->maxGroupSize) & ~(size_t)7;
-    auto future = c10::make_intrusive<c10::ivalue::Future>(
-        c10::ListType::create(c10::TensorType::get()));
+    auto completion = std::make_shared<std::promise<void>>();
+    auto future = completion->get_future().share();
+    auto result = std::make_unique<WorkCompletion>(std::move(future));
 
     struct IterState {
         size_t currentPos = 0;
@@ -201,53 +192,38 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
     std::weak_ptr<std::function<void()>> weakProcessNextChunk =
         processNextChunk;
 
-    auto failed_t = failed_ranks_hint.tensor;
-    const uint64_t hintRouteId =
-        next_hint_route_id_.fetch_add(1, std::memory_order_relaxed);
-
-    {
-        std::lock_guard<std::mutex> lock(hint_routes_mutex_);
-        hint_routes_by_id_[hintRouteId] = HintRoute{.tensor = failed_t};
-    }
-
     *processNextChunk = [this, weakProcessNextChunk, state, opType, tensorSize,
-                         chunkSize, broadcastRoot, meta, tensorToBuffer,
-                         bufferToTensor, future, hintRouteId]() {
+                         chunkSize, broadcastRoot, meta, copyToSendBuffer,
+                         copyFromRecvBuffer, completion, failed_ranks_hint]() {
         auto processNextChunk = weakProcessNextChunk.lock();
 
         if (state->currentPos >= tensorSize) {
-            future->markCompleted(c10::IValue());
+            completion->set_value();
             return;
         }
 
         int taskId = cpuTaskCount % 2;
-        TORCH_CHECK(!tasks_[taskId].active);
-
+        PG_ASSERT(!tasks_[taskId].active,
+                  "collective CPU task slot is still active");
         size_t realSize = std::min(chunkSize, tensorSize - state->currentPos);
         int bufferOffset = meta->taskCount % 2;
         tasks_[taskId].opType = (int)opType;
-        tasks_[taskId].tensorSize = realSize;
+        tasks_[taskId].dataSize = realSize;
         tasks_[taskId].broadcastRoot = broadcastRoot;
         tasks_[taskId].bufferOffset = bufferOffset;
         tasks_[taskId].submitSequence = 0;
-        tasks_[taskId].hintRouteId = hintRouteId;
+        tasks_[taskId].failedRanksHint = failed_ranks_hint;
         tasks_[taskId].resetFailedRanksHint = state->currentPos == 0;
         tasks_[taskId].transferGroupMeta = meta.get();
-        tensorToBuffer(
+        copyToSendBuffer(
             (void*)meta->segmentInfos[meta->rank].send_buffer[bufferOffset],
             state->currentPos, realSize);
 
         hasCallback_[taskId] = true;
 
-        callbacks_[taskId] = [processNextChunk, state, meta, bufferToTensor,
-                              bufferOffset, realSize, future]() {
-            if (meta->activeRanksTensor.device().is_cpu()) {
-                // activeRanks is InGroupRank-indexed, same order as the tensor.
-                for (int i = 0; i < meta->maxGroupSize; ++i) {
-                    meta->activeRanksTensor[i] = meta->activeRanks[i] ? 1 : 0;
-                }
-            }
-            bufferToTensor(
+        callbacks_[taskId] = [processNextChunk, state, meta, copyFromRecvBuffer,
+                              bufferOffset, realSize, completion]() {
+            copyFromRecvBuffer(
                 (void*)meta->segmentInfos[meta->rank].recv_buffer[bufferOffset],
                 state->currentPos, realSize);
 
@@ -263,31 +239,27 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCpu(
 
     (*processNextChunk)();
 
-    return c10::make_intrusive<MooncakeWorkCpu>(
-        opType, future, meta, this, hintRouteId, std::move(failed_ranks_hint));
+    return result;
 }
 
-c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
-    c10d::OpType opType, size_t tensorSize, int64_t broadcastRoot,
-    const std::shared_ptr<TransferGroupMeta>& meta,
-    const at::cuda::CUDAStream& issue_stream, FailedRanksHint failed_ranks_hint,
+void MooncakeWorker::putTaskCuda(
+    OpType opType, size_t tensorSize, int64_t broadcastRoot,
+    const std::shared_ptr<TransferGroupMeta>& meta, cudaStream_t issueStream,
+    int32_t* failed_ranks_hint,
     const std::function<void(void* dst, size_t pos, size_t realSize,
-                             const at::cuda::CUDAStream&)>& tensorToBuffer,
+                             cudaStream_t)>& copyToSendBuffer,
     const std::function<void(void* src, size_t pos, size_t realSize,
-                             const at::cuda::CUDAStream&)>& bufferToTensor) {
+                             cudaStream_t)>& copyFromRecvBuffer) {
     size_t chunkSize = ((kBufferSize - 1) / meta->maxGroupSize) & ~(size_t)7;
 
-    at::cuda::CUDAStream enq_stream =
-        at::cuda::getStreamFromPool(false, issue_stream.device_index());
+    const GpuDeviceGuard guard(cuda_device_index_);
+    const auto issue_stream =
+        GpuStream::borrow(issueStream, cuda_device_index_);
+    const auto& enq_stream = enqueue_stream_.value();
 
-    auto event_start = std::make_shared<torch::Event>(torch::kCUDA);
-    event_start->record(issue_stream);
-    event_start->block(enq_stream);
-
-    auto failed_t = failed_ranks_hint.tensor;
-
-    const uint64_t hintRouteId =
-        next_hint_route_id_.fetch_add(1, std::memory_order_relaxed);
+    GpuEvent event_start(issue_stream.deviceIndex());
+    event_start.record(issue_stream);
+    enq_stream.waitEvent(event_start);
 
     std::vector<CudaTaskSubmissionToken> submitted_tasks;
     submitted_tasks.reserve((tensorSize + chunkSize - 1) / chunkSize);
@@ -300,40 +272,33 @@ c10::intrusive_ptr<c10d::Work> MooncakeWorker::putTaskCuda(
             next_cuda_task_sequence_.fetch_add(1, std::memory_order_relaxed);
         submitted_tasks.push_back(
             {.task_id = static_cast<size_t>(taskId), .sequence = taskSequence});
-        tensorToBuffer(
+        copyToSendBuffer(
             (void*)meta->segmentInfos[meta->rank].send_buffer[bufferOffset],
-            pos, realSize, enq_stream);
+            pos, realSize, enq_stream.get());
 
         hasCallback_[taskId] = false;
 
-        if (pos == 0) {
-            std::lock_guard<std::mutex> lock(hint_routes_mutex_);
-            hint_routes_by_id_[hintRouteId] = HintRoute{.tensor = failed_t};
-        }
-
         launchEnqueueTaskKernel((int)opType, realSize, broadcastRoot,
-                                bufferOffset, taskSequence, hintRouteId,
+                                bufferOffset, taskSequence, failed_ranks_hint,
                                 pos == 0, meta.get(), tasks_device_, taskId,
-                                enq_stream.stream());
-        bufferToTensor(
+                                enq_stream.get());
+        copyFromRecvBuffer(
             (void*)meta->segmentInfos[meta->rank].recv_buffer[bufferOffset],
-            pos, realSize, enq_stream);
+            pos, realSize, enq_stream.get());
 
         ++cudaTaskCount;
         ++meta->taskCount;
     }
 
-    auto event_end = std::make_shared<torch::Event>(torch::kCUDA);
-    event_end->record(enq_stream);
-
-    if (opType == c10d::OpType::BARRIER) {
-        return c10::make_intrusive<MooncakeBarrierWorkCuda>(
-            opType, event_end, meta, this, hintRouteId,
-            std::move(submitted_tasks), std::move(failed_ranks_hint));
+    // During CUDA graph capture the kernels are recorded but not executed, so
+    // waiting for the worker thread to observe them would hang.
+    if (!issue_stream.isCapturing()) {
+        waitUntilTasksSubmitted(submitted_tasks);
     }
-    return c10::make_intrusive<MooncakeWorkCuda>(
-        opType, event_end, meta, this, hintRouteId, std::move(submitted_tasks),
-        std::move(failed_ranks_hint));
+
+    GpuEvent event_end(enq_stream.deviceIndex());
+    event_end.record(enq_stream);
+    issue_stream.waitEvent(event_end);
 }
 
 }  // namespace mooncake

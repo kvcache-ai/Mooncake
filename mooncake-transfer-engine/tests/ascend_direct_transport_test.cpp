@@ -54,6 +54,9 @@ static int g_set_device_call_count = 0;
 static std::set<int> g_set_device_ids;
 static std::map<const void*, aclrtMemLocation> g_memory_locations;
 static std::mutex g_acl_mutex;
+// 0 = no size limit; otherwise aclrtMallocPhysical fails when size > threshold.
+static size_t g_malloc_physical_max_success = 0;
+static int g_malloc_physical_call_count = 0;
 
 namespace mock_acl {
 void reset() {
@@ -67,6 +70,18 @@ void reset() {
     g_set_device_call_count = 0;
     g_set_device_ids.clear();
     g_memory_locations.clear();
+    g_malloc_physical_max_success = 0;
+    g_malloc_physical_call_count = 0;
+}
+
+void set_malloc_physical_max_success(size_t max_success) {
+    std::lock_guard<std::mutex> lock(g_acl_mutex);
+    g_malloc_physical_max_success = max_success;
+}
+
+int malloc_physical_call_count() {
+    std::lock_guard<std::mutex> lock(g_acl_mutex);
+    return g_malloc_physical_call_count;
 }
 
 void set_device_count(int count) {
@@ -256,9 +271,14 @@ aclError aclrtGetPhyDevIdByLogicDevId(int32_t logic_dev_id,
 
 aclError aclrtMallocPhysical(aclrtDrvMemHandle* handle, size_t size,
                              aclrtPhysicalMemProp* prop, uint32_t flags) {
-    (void)size;
     (void)prop;
     (void)flags;
+    std::lock_guard<std::mutex> lock(g_acl_mutex);
+    ++g_malloc_physical_call_count;
+    if (g_malloc_physical_max_success > 0 &&
+        size > g_malloc_physical_max_success) {
+        return ACL_ERROR_FAILURE;
+    }
     *handle = reinterpret_cast<aclrtDrvMemHandle>(malloc(1));
     return *handle ? ACL_ERROR_NONE : ACL_ERROR_FAILURE;
 }
@@ -268,7 +288,11 @@ aclError aclrtReserveMemAddress(void** va, size_t size, size_t alignment,
     (void)alignment;
     (void)hint_addr;
     (void)page_type;
-    *va = malloc(size);
+    // Stub VA only — do not malloc(size) (best-effort tests use multi-GB
+    // sizes).
+    (void)size;
+    constexpr size_t kStubVaBytes = 64;
+    *va = malloc(kStubVaBytes);
     return *va ? ACL_ERROR_NONE : ACL_ERROR_FAILURE;
 }
 
@@ -2001,6 +2025,85 @@ TEST_F(AscendDirectTransportTest,
 // -----------------------------------------------------------------------------
 // Roce mode detection (HCCL_INTRA_ROCE_ENABLE / ASCEND_GLOBAL_RESOURCE_CONFIG)
 // -----------------------------------------------------------------------------
+
+TEST(FabricMemBestEffortAllocTest, PercentileLadderFindsFeasibleSize) {
+    mock_acl::reset();
+    constexpr size_t kGiB = 1024ULL * 1024 * 1024;
+    constexpr size_t kTargetGiB = 40;
+    constexpr size_t kMaxOkGiB = 35;
+    constexpr size_t kExpectGiB = 32;  // 80% of 40GiB after 100%/90% fail
+    constexpr size_t kTarget = kTargetGiB * kGiB;
+    mock_acl::set_malloc_physical_max_success(kMaxOkGiB * kGiB);
+
+    globalConfig().ascend_use_fabric_mem = true;
+    size_t actual = 0;
+    void* ptr = ascend_allocate_memory_best_effort(kTarget, "ascend", &actual);
+    ASSERT_NE(ptr, nullptr);
+    EXPECT_EQ(actual, kExpectGiB * kGiB);
+    EXPECT_GT(mock_acl::malloc_physical_call_count(), 1);
+
+    ascend_free_memory("ascend", ptr);
+    globalConfig().ascend_use_fabric_mem = false;
+    mock_acl::reset();
+}
+
+TEST(FabricMemBestEffortAllocTest, BelowFiftyPercentReturnsNull) {
+    mock_acl::reset();
+    constexpr size_t kGiB = 1024ULL * 1024 * 1024;
+    constexpr size_t kTargetGiB = 40;
+    constexpr size_t kMaxOkGiB = 15;  // below 50% of 40GiB (=20GiB)
+    mock_acl::set_malloc_physical_max_success(kMaxOkGiB * kGiB);
+
+    globalConfig().ascend_use_fabric_mem = true;
+    size_t actual = 0;
+    void* ptr = ascend_allocate_memory_best_effort(kTargetGiB * kGiB, "ascend",
+                                                   &actual);
+    EXPECT_EQ(ptr, nullptr);
+    EXPECT_EQ(actual, 0);
+
+    globalConfig().ascend_use_fabric_mem = false;
+    mock_acl::reset();
+}
+
+// 2.1 GiB target: 50% = 1.05 GiB. Align-down of lower percentiles yields 1 GiB
+// (< 50%), which must be rejected even if physical alloc of 1 GiB would
+// succeed.
+TEST(FabricMemBestEffortAllocTest, AlignDownBelowMinPercentIsRejected) {
+    mock_acl::reset();
+    constexpr size_t kGiB = 1024ULL * 1024 * 1024;
+    constexpr size_t kTarget = (2 * kGiB) + (kGiB / 10);  // 2.1 GiB
+    mock_acl::set_malloc_physical_max_success(kGiB);  // 1 GiB ok, 2 GiB fails
+
+    globalConfig().ascend_use_fabric_mem = true;
+    size_t actual = 0;
+    void* ptr = ascend_allocate_memory_best_effort(kTarget, "ascend", &actual);
+    EXPECT_EQ(ptr, nullptr);
+    EXPECT_EQ(actual, 0);
+
+    globalConfig().ascend_use_fabric_mem = false;
+    mock_acl::reset();
+}
+
+TEST(FabricMemBestEffortAllocTest, FullTargetFirstSuccess) {
+    mock_acl::reset();
+    constexpr size_t kGiB = 1024ULL * 1024 * 1024;
+    constexpr size_t kTargetGiB = 40;
+    constexpr size_t kTarget = kTargetGiB * kGiB;
+    // Physical alloc is tried up to 3 attribute tiers per size.
+    constexpr int kMaxPhysicalTiersPerSize = 3;
+    mock_acl::set_malloc_physical_max_success(0);  // unlimited
+
+    globalConfig().ascend_use_fabric_mem = true;
+    size_t actual = 0;
+    void* ptr = ascend_allocate_memory_best_effort(kTarget, "ascend", &actual);
+    ASSERT_NE(ptr, nullptr);
+    EXPECT_EQ(actual, kTarget);  // 100% first
+    EXPECT_LE(mock_acl::malloc_physical_call_count(), kMaxPhysicalTiersPerSize);
+
+    ascend_free_memory("ascend", ptr);
+    globalConfig().ascend_use_fabric_mem = false;
+    mock_acl::reset();
+}
 
 TEST(RoceModeDetectionTest, GlobalResourceConfig_StringRoceDesc) {
     EXPECT_TRUE(HasRoceProtocolDescInGlobalResourceConfig(

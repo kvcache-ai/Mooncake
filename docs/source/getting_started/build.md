@@ -29,6 +29,34 @@ make -j
 sudo make install
 ```
 
+### Build with VRAM Segment
+
+To enable VRAM Segment, install CUDA toolkit and build Mooncake with 
+`USE_VRAM_SEGMENT` enabled:
+
+```bash
+sudo bash dependencies.sh 
+
+mkdir build
+cd build
+cmake .. -DUSE_VRAM_SEGMENT=ON
+make -j
+sudo make install
+```
+
+If NVLink is available in your environment, you can also enable it 
+with `-DUSE_INTRA_NVLINK=ON`:
+
+```bash
+sudo bash dependencies.sh
+
+mkdir build
+cd build
+cmake .. -DUSE_VRAM_SEGMENT=ON -DUSE_INTRA_NVLINK=ON
+make -j
+sudo make install
+```
+
 ### Build with NVMe-oF SSD Pool
 
 To enable the NVMe-oF SSD pool, install the SPDK dependencies and build
@@ -181,6 +209,7 @@ The following options can be passed to `cmake ..`.
 | `-DUSE_ASCEND_DIRECT=ON/OFF` | `OFF` | Enable Ascend Direct transport and HCCS support via the ADXL engine. Recommended for Ascend builds. |
 | `-DUSE_UBSHMEM=ON/OFF` | `OFF` | Enable Huawei Ascend NPU shared memory transport via CANN VMM APIs. |
 | `-DUSE_INTRA_NVLINK=ON/OFF` | `OFF` | Enable intranode NVLink transport. |
+| `-DUSE_VRAM_SEGMENT=ON/OFF` | `OFF` | Enable create VRAM Segment instead of (default) DRAM Segment. |
 | `-DUSE_CXL=ON/OFF` | `OFF` | Enable CXL support. |
 
 ### Vendor SDK Path Overrides

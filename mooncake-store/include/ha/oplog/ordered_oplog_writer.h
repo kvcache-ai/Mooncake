@@ -73,19 +73,18 @@ class OrderedOpLogWriter {
     OrderedOpLogWriter(OrderedOpLogWriterConfig config,
                        WriteBatchFn write_batch,
                        TerminalCallback terminal_callback = {});
-    ~OrderedOpLogWriter();
+    virtual ~OrderedOpLogWriter();
 
     tl::expected<Reservation, ErrorCode> Reserve();
-    tl::expected<PendingHandle, ErrorCode> Commit(Reservation&& reservation,
-                                                  OpLogEntry entry,
-                                                  DurableCallback callback);
+    virtual tl::expected<PendingHandle, ErrorCode> Commit(
+        Reservation&& reservation, OpLogEntry entry, DurableCallback callback);
     void Abort(Reservation&& reservation);
 
     bool IsAccepting() const;
     ErrorCode LastError() const;
     std::optional<OrderedOpLogWriterTerminalState> GetTerminalState() const;
     void Start();
-    void Stop();
+    virtual void Stop();
 
    private:
     struct Impl;

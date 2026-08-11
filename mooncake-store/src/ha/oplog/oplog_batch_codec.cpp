@@ -153,6 +153,10 @@ std::string EncodeDurablePrefix(const DurablePrefix& prefix) {
         static_cast<Json::UInt>(kDurablePrefixSchemaVersion);
     root["batch_id"] = static_cast<Json::UInt64>(prefix.batch_id);
     root["last_seq"] = static_cast<Json::UInt64>(prefix.last_seq);
+    if (prefix.producer_view_version != 0) {
+        root["producer_view_version"] =
+            static_cast<Json::Int64>(prefix.producer_view_version);
+    }
     return WriteJson(root);
 }
 
@@ -182,12 +186,24 @@ bool DecodeDurablePrefix(const std::string& value, DurablePrefix* prefix,
         SetReason(reason, "unsupported durable prefix schema_version");
         return false;
     }
-    if (!GetUInt64Field(root, "batch_id", &prefix->batch_id, reason)) {
+    DurablePrefix decoded;
+    if (root.isMember("producer_view_version")) {
+        const auto& producer_view = root["producer_view_version"];
+        if (!producer_view.isInt64() || producer_view.asInt64() < 0) {
+            SetReason(reason,
+                      "field must be a non-negative ViewVersionId: "
+                      "producer_view_version");
+            return false;
+        }
+        decoded.producer_view_version = producer_view.asInt64();
+    }
+    if (!GetUInt64Field(root, "batch_id", &decoded.batch_id, reason)) {
         return false;
     }
-    if (!GetUInt64Field(root, "last_seq", &prefix->last_seq, reason)) {
+    if (!GetUInt64Field(root, "last_seq", &decoded.last_seq, reason)) {
         return false;
     }
+    *prefix = decoded;
     return true;
 }
 
