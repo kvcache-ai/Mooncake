@@ -30,6 +30,7 @@
 #include "common.h"
 #include "config.h"
 #include "transport/rdma_transport/rdma_gid_probe.h"
+#include "transport/rdma_transport/rdma_transport.h"
 
 namespace mooncake {
 constexpr uint8_t kMaxHopLimit = 16;
@@ -213,7 +214,8 @@ int RdmaEndPoint::deconstructLocked() {
         if (!qp_list_[i]) continue;  // already destroyed in a previous call
         int ret = ibv_destroy_qp(qp_list_[i]);
         if (ret) {
-            LOG(ERROR) << "Failed to destroy QP[" << i << "]: " << strerror(ret);
+            LOG(ERROR) << "Failed to destroy QP[" << i
+                       << "]: " << strerror(ret);
             result = ERR_ENDPOINT;
         } else {
             qp_list_[i] = nullptr;
@@ -430,8 +432,14 @@ int RdmaEndPoint::setupConnectionsByActive() {
 
         // Perform the RPC without holding the lock to avoid deadlock and allow
         // "simultaneous open" handshake handling.
-        int rc = context_.engine().sendHandshake(peer_server_name, local_desc,
+        int rc;
+        {
+            // Hold a handshake slot for the RPC duration to limit concurrent
+            // connection storms; RAII guarantees release on any exit path.
+            HandshakeSlotGuard slot_guard(context_.engine());
+            rc = context_.engine().sendHandshake(peer_server_name, local_desc,
                                                  peer_desc);
+        }
 
         // We should check the RPC return code before comparing
         // `peer_qp_num_list_` with `peer_desc.qp_num`, since a failed RPC may
@@ -1194,8 +1202,7 @@ int RdmaEndPoint::doSetupConnection(int qp_index, const ibv_gid &peer_gid,
         LOG(ERROR) << "[Handshake] " << message
                    << ": local=" << context_.nicPath()
                    << ", peer=" << peer_nic_path_ << ", qp_index=" << qp_index
-                   << ", local_qp=" << qp->qp_num
-                   << ", peer_qp=" << peer_qp_num
+                   << ", local_qp=" << qp->qp_num << ", peer_qp=" << peer_qp_num
                    << ", local_gid=" << context_.gid()
                    << ", local_gid_index=" << local_gid_index
                    << ", peer_gid=" << gidToString(peer_gid)
