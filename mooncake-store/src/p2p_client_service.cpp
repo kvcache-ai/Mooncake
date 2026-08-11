@@ -1799,50 +1799,67 @@ async_simple::coro::Lazy<ErrorCode> P2PClientService::RunForwardReadOnRoute(
             << req->key << ", buffer_count=" << req->dest_buffers.size();
         co_return ErrorCode::NOT_IMPLEMENTED;
     }
-    PinKeyRequest pin_req;
-    pin_req.key = req->key;
-    auto pin = co_await route.peer->AsyncPinKey(pin_req);
-    if (!pin) {
-        if (pin.error() != ErrorCode::OBJECT_NOT_FOUND) {
-            LOG(ERROR) << "AsyncPinKey failed, key=" << req->key
-                       << ", error=" << pin.error();
-        }
-        co_return pin.error();
-    }
     void* base = reinterpret_cast<void*>(req->dest_buffers[0].addr);
     const size_t total = req->dest_buffers[0].size;
-    auto tr = co_await AwaitTeExpectedFuture(data_manager_->TransferDataAsync(
-        base, total, {pin.value().remote_buffer},
-        Transport::TransferRequest::READ));
+
+    // Scope `pin` so the tl::expected does not live across the TE-wait
+    // suspend point. Hold the produced Future in an optional (async_simple::
+    // Future has no default ctor) so only a Future/trivial locals cross the
+    // suspend. Works around gcc-11/12 coroutine-lowering ICE in
+    // build_special_member_call.
+    std::optional<async_simple::Future<tl::expected<void, ErrorCode>>>
+        transfer_fut;
+    UUID read_operation_id{};
+    {
+        PinKeyRequest pin_req;
+        pin_req.key = req->key;
+        auto pin = co_await route.peer->AsyncPinKey(pin_req);
+        if (!pin) {
+            if (pin.error() != ErrorCode::OBJECT_NOT_FOUND) {
+                LOG(ERROR) << "AsyncPinKey failed, key=" << req->key
+                           << ", error=" << pin.error();
+            }
+            co_return pin.error();
+        }
+        read_operation_id = pin.value().read_operation_id;
+        transfer_fut = data_manager_->TransferDataAsync(
+            base, total, {pin.value().remote_buffer},
+            Transport::TransferRequest::READ);
+    }
+
+    auto tr = co_await AwaitTeExpectedFuture(std::move(*transfer_fut));
     if (!tr) {
         LOG(ERROR) << "Forward TE read failed, key=" << req->key
                    << ", error=" << tr.error();
         UnPinKeyRequest cleanup;
         cleanup.key = req->key;
-        cleanup.read_operation_id = pin.value().read_operation_id;
+        cleanup.read_operation_id = read_operation_id;
         Stopwatch rollback_sw;
-        tl::expected<void, ErrorCode> cleanup_unpin;
+        bool cleanup_ok = false;
+        ErrorCode cleanup_error = ErrorCode::OK;
         for (int attempt = 0; attempt < kRevokeRetryMaxCnt; ++attempt) {
             if (metrics_) {
                 metrics_->rollback.unpin_key_requests.inc();
             }
-            cleanup_unpin = co_await route.peer->AsyncUnPinKey(cleanup);
-            if (cleanup_unpin) {
+            auto r = co_await route.peer->AsyncUnPinKey(cleanup);
+            if (r) {
+                cleanup_ok = true;
                 break;
             }
-            if (cleanup_unpin.error() == ErrorCode::LEASE_EXPIRED) {
-                cleanup_unpin = tl::expected<void, ErrorCode>{};
+            cleanup_error = r.error();
+            if (cleanup_error == ErrorCode::LEASE_EXPIRED) {
+                cleanup_ok = true;
                 break;
             }
             if (attempt + 1 < kRevokeRetryMaxCnt) {
                 LOG(WARNING)
                     << "AsyncUnPinKey retry after TE failure, key=" << req->key
                     << ", attempt=" << (attempt + 1)
-                    << ", error=" << cleanup_unpin.error();
+                    << ", error=" << cleanup_error;
             }
         }
         if (metrics_) {
-            if (cleanup_unpin) {
+            if (cleanup_ok) {
                 metrics_->rollback.unpin_key_latency_success.observe(
                     rollback_sw.elapsed_us());
             } else {
@@ -1851,16 +1868,15 @@ async_simple::coro::Lazy<ErrorCode> P2PClientService::RunForwardReadOnRoute(
                     rollback_sw.elapsed_us());
             }
         }
-        if (!cleanup_unpin) {
+        if (!cleanup_ok) {
             LOG(ERROR) << "AsyncUnPinKey failed after TE read failure, key="
-                       << req->key << ", error=" << cleanup_unpin.error();
+                       << req->key << ", error=" << cleanup_error;
         }
         co_return tr.error();
     }
     // Success: skip UnPinKey to save RPC latency; owner lease / scanner
     // releases pin.
-    tl::expected<void, ErrorCode> ok;
-    promise->setValue(std::move(ok));
+    promise->setValue(tl::expected<void, ErrorCode>{});
     co_return ErrorCode::OK;
 }
 
