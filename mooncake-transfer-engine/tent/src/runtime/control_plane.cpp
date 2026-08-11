@@ -17,6 +17,7 @@
 
 #include <cassert>
 #include <set>
+#include <utility>
 
 #include "tent/common/status.h"
 #include "tent/common/utils/os.h"
@@ -25,6 +26,25 @@
 
 namespace mooncake {
 namespace tent {
+namespace {
+
+template <typename Fn>
+class CallbackInvocationGuard {
+   public:
+    explicit CallbackInvocationGuard(Fn on_exit)
+        : on_exit_(std::move(on_exit)) {}
+
+    ~CallbackInvocationGuard() { on_exit_(); }
+
+    CallbackInvocationGuard(const CallbackInvocationGuard&) = delete;
+    CallbackInvocationGuard& operator=(const CallbackInvocationGuard&) =
+        delete;
+
+   private:
+    Fn on_exit_;
+};
+
+}  // namespace
 
 thread_local const ControlService* ControlService::active_bootstrap_service_ =
     nullptr;
@@ -309,25 +329,30 @@ void ControlService::onBootstrapRdma(const std::string_view& request,
     }
 
     BootstrapDesc response_desc;
-    const ControlService* previous_service = active_bootstrap_service_;
-    active_bootstrap_service_ = this;
-    try {
-        BootstrapDesc request_desc =
-            json::parse(mutable_request).get<BootstrapDesc>();
-        int rc = callback(request_desc, response_desc);
-        if (rc != 0 && response_desc.reply_msg.empty()) {
+    {
+        const ControlService* previous_service = active_bootstrap_service_;
+        active_bootstrap_service_ = this;
+        CallbackInvocationGuard invocation_guard([this, previous_service] {
+            active_bootstrap_service_ = previous_service;
+            finishBootstrapCallback();
+        });
+
+        try {
+            BootstrapDesc request_desc =
+                json::parse(mutable_request).get<BootstrapDesc>();
+            int rc = callback(request_desc, response_desc);
+            if (rc != 0 && response_desc.reply_msg.empty()) {
+                response_desc.reply_msg = "BootstrapRdma callback failed";
+            }
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "onBootstrapRdma failed: " << e.what();
+            response_desc.reply_msg =
+                std::string("BootstrapRdma callback failed: ") + e.what();
+        } catch (...) {
+            LOG(ERROR) << "onBootstrapRdma failed with unknown exception";
             response_desc.reply_msg = "BootstrapRdma callback failed";
         }
-    } catch (const std::exception& e) {
-        LOG(ERROR) << "onBootstrapRdma failed: " << e.what();
-        response_desc.reply_msg =
-            std::string("BootstrapRdma callback failed: ") + e.what();
-    } catch (...) {
-        LOG(ERROR) << "onBootstrapRdma failed with unknown exception";
-        response_desc.reply_msg = "BootstrapRdma callback failed";
     }
-    active_bootstrap_service_ = previous_service;
-    finishBootstrapCallback();
 
     json j = response_desc;
     response = j.dump();
@@ -397,6 +422,11 @@ void ControlService::onNotify(const std::string_view& request,
 
     const ControlService* previous_service = active_notify_service_;
     active_notify_service_ = this;
+    CallbackInvocationGuard invocation_guard([this, previous_service] {
+        active_notify_service_ = previous_service;
+        finishNotifyCallback();
+    });
+
     try {
         Notification message = json::parse(request).get<Notification>();
         callback(message);
@@ -405,8 +435,6 @@ void ControlService::onNotify(const std::string_view& request,
     } catch (...) {
         LOG(ERROR) << "onNotify failed with unknown exception";
     }
-    active_notify_service_ = previous_service;
-    finishNotifyCallback();
 }
 
 void ControlService::onProbe(const std::string_view& request,
