@@ -8,6 +8,61 @@ import torch.distributed as dist
 from .mooncake_ep_buffer import EventOverlap, _native_current_stream_ptr
 
 
+_VALID_TRANSPORTS = {"auto", "ibgda", "nccl"}
+
+
+def _requested_transport(transport: str) -> str:
+    """Return the normalized user request, including the rollout override."""
+    requested = transport.strip().lower()
+    if requested == "auto":
+        requested = os.getenv("MOONCAKE_EP_TRANSPORT", "auto").strip().lower()
+    if requested not in _VALID_TRANSPORTS:
+        choices = ", ".join(sorted(_VALID_TRANSPORTS))
+        raise ValueError(
+            f"ElasticBuffer transport must be one of {choices}, got {requested!r}"
+        )
+    return requested
+
+
+def _nccl_topology_supported(
+    num_ranks: int,
+    num_rdma_ranks: int,
+    num_nvlink_ranks: int,
+    allow_hybrid_mode: bool,
+) -> bool:
+    """Whether the compiled NCCL kernels cover the inferred EP topology."""
+    if num_ranks != num_rdma_ranks * num_nvlink_ranks:
+        return False
+    if num_rdma_ranks == 1:
+        return num_nvlink_ranks in {2, 8}
+    if not allow_hybrid_mode:
+        return False
+    if num_rdma_ranks == 2:
+        return num_nvlink_ranks in {4, 8}
+    return num_rdma_ranks == 4 and num_nvlink_ranks == 4
+
+
+def _select_transport(
+    requested: str,
+    nccl_available: bool,
+    num_ranks: int,
+    num_rdma_ranks: int,
+    num_nvlink_ranks: int,
+    allow_hybrid_mode: bool,
+) -> str:
+    """Prefer NCCL for auto mode without breaking unsupported deployments."""
+    if requested != "auto":
+        return requested
+    if nccl_available and _nccl_topology_supported(
+        num_ranks,
+        num_rdma_ranks,
+        num_nvlink_ranks,
+        allow_hybrid_mode,
+    ):
+        return "nccl"
+    return "ibgda"
+
+
 def _using_musa_backend() -> bool:
     return os.getenv("MOONCAKE_EP_USE_MUSA", "").upper() in {
         "1",
@@ -92,10 +147,10 @@ class ElasticBuffer:
     existing Mooncake Device API transport/bootstrap path for the native data
     movement backend.
 
-    ``transport="nccl"`` requires ``explicitly_destroy=True``. Every rank in
-    the process group must call :meth:`destroy` before the process group is
-    destroyed; NCCL symmetric-window teardown cannot be made safe by
-    rank-local Python garbage collection.
+    The default ``transport="auto"`` prefers NCCL when the extension contains
+    NCCL Device API support and the current topology has a compiled NCCL kernel.
+    It otherwise retains the IPC + IBGDA backend. Set ``transport="ibgda"`` or
+    ``MOONCAKE_EP_TRANSPORT=ibgda`` to force the legacy backend during rollout.
     """
 
     # Mirrors DeepEP's fixed workspace assumptions closely enough for sizing and
@@ -124,28 +179,17 @@ class ElasticBuffer:
         num_cpu_timeout_secs: int = 300,
         num_gpu_timeout_secs: int = 100,
         explicitly_destroy: bool = False,
-        transport: str = "ibgda",
+        transport: str = "auto",
     ) -> None:
         if not allow_multiple_reduction:
             raise NotImplementedError(
                 "Mooncake ElasticBuffer currently supports only "
                 "allow_multiple_reduction=True"
             )
-        if transport not in {"ibgda", "nccl"}:
-            raise ValueError(
-                "ElasticBuffer transport must be either 'ibgda' or 'nccl', "
-                f"got {transport!r}"
-            )
-        if transport == "nccl" and not explicitly_destroy:
-            raise ValueError(
-                "transport='nccl' requires explicitly_destroy=True; call "
-                "ElasticBuffer.destroy() collectively on every group rank "
-                "before destroying the process group"
-            )
         self.group = group
         self.rank_idx = group.rank()
         self.num_ranks = group.size()
-        self.transport = transport
+        self.requested_transport = _requested_transport(transport)
         self.allow_hybrid_mode = allow_hybrid_mode
         self.allow_multiple_reduction = allow_multiple_reduction
         self.prefer_overlap_with_compute = prefer_overlap_with_compute
@@ -188,6 +232,24 @@ class ElasticBuffer:
         # Native Mooncake transport/runtime.  This keeps the legacy Buffer ABI
         # untouched while giving ElasticBuffer users a dedicated native entrypoint.
         from mooncake import ep
+
+        has_nccl_device_support = getattr(ep, "has_nccl_device_support", None)
+        nccl_available = bool(
+            has_nccl_device_support is not None and has_nccl_device_support()
+        )
+        self.transport = _select_transport(
+            self.requested_transport,
+            nccl_available,
+            self.num_ranks,
+            self.num_rdma_ranks,
+            self.num_nvlink_ranks,
+            self.allow_hybrid_mode,
+        )
+        if self.transport == "nccl" and not nccl_available:
+            raise RuntimeError(
+                "transport='nccl' requires Mooncake EP built with NCCL Device "
+                "API support; use transport='auto' for transparent IBGDA fallback"
+            )
 
         nccl_unique_id = (
             self._exchange_nccl_unique_id(ep) if self.transport == "nccl" else []
@@ -549,7 +611,12 @@ class ElasticBuffer:
     @staticmethod
     def _calculate_physical_domain_size(group: dist.ProcessGroup) -> Tuple[int, int]:
         num_ranks = group.size()
-        num_local_ranks = int(os.getenv("MOONCAKE_EP_NUM_LOCAL_RANKS", "0"))
+        num_local_ranks = int(
+            os.getenv(
+                "MOONCAKE_EP_NUM_LOCAL_RANKS",
+                os.getenv("LOCAL_WORLD_SIZE", "0"),
+            )
+        )
         if num_local_ranks <= 0:
             try:
                 num_local_ranks = max(1, min(num_ranks, torch.cuda.device_count()))

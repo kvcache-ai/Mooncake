@@ -16,6 +16,13 @@ PYBIND11_MODULE(_ep, m) {
     m.def("calculate_elastic_buffer_size",
           &MooncakeElasticBuffer::calculate_buffer_size);
     m.def("create_nccl_unique_id", &create_elastic_nccl_unique_id);
+    m.def("has_nccl_device_support", []() {
+#ifdef USE_NCCL_DEVICE
+        return true;
+#else
+        return false;
+#endif
+    });
 
     py::class_<EventHandle>(m, "EventHandle")
         .def(py::init<uint64_t>(), py::arg("stream_ptr") = 0)
