@@ -3,6 +3,7 @@
 #include <thread>
 #include <atomic>
 #include <random>
+#include "p2p_master_metric_manager.h"
 #define private public
 #define protected public
 #include "p2p_client_meta.h"
@@ -16,6 +17,8 @@ class P2PClientMetaTest : public ::testing::Test {
     void SetUp() override {
         google::InitGoogleLogging("P2PClientMetaTest");
         FLAGS_logtostderr = 1;
+        // Register the metric singleton (no wrapped service in this binary).
+        P2PMasterMetricManager::instance();
         // Set short timeouts for health state testing
         ClientMeta::SetTimeouts(2, 5);
     }

@@ -21,10 +21,7 @@ static const uint64_t kMetricReportIntervalSeconds = 10;
 
 class WrappedMasterService {
    public:
-    // metric_manager registers itself before the HTTP server and the
-    // report thread start.
-    WrappedMasterService(const WrappedMasterServiceConfig& config,
-                         MasterMetricManager& metric_manager);
+    WrappedMasterService(const WrappedMasterServiceConfig& config);
 
     virtual ~WrappedMasterService();
 

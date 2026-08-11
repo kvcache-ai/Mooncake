@@ -11,7 +11,9 @@
 #include "default_config.h"
 #include "ha_helper.h"
 #include "http_metadata_server.h"
+#include "centralized_master_metric_manager.h"
 #include "centralized_rpc_service.h"
+#include "p2p_master_metric_manager.h"
 #include "p2p_rpc_service.h"
 #include "types.h"
 
@@ -885,6 +887,8 @@ int main(int argc, char* argv[]) {
         std::unique_ptr<mooncake::WrappedMasterService> master_service;
 
         if (master_config.deployment_mode == "Centralization") {
+            // Force the metric manager singleton to be constructed
+            mooncake::CentralizedMasterMetricManager::instance();
             master_service =
                 std::make_unique<mooncake::WrappedCentralizedMasterService>(
                     mooncake::WrappedMasterServiceConfig(master_config,
@@ -894,6 +898,8 @@ int main(int argc, char* argv[]) {
                 server, static_cast<mooncake::WrappedCentralizedMasterService&>(
                             *master_service));
         } else {
+            // Force the metric manager singleton to be constructed
+            mooncake::P2PMasterMetricManager::instance();
             master_service =
                 std::make_unique<mooncake::WrappedP2PMasterService>(
                     mooncake::WrappedMasterServiceConfig(master_config,

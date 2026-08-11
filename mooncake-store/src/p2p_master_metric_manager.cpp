@@ -226,7 +226,7 @@ std::string P2PMasterMetricManager::serialize_metrics() {
     serialize_metric(batch_get_write_route_items_);
     serialize_metric(batch_get_write_route_failed_items_);
 
-    return ss.str();
+    return out + ss.str();
 }
 
 // --- Human-Readable Summary ---

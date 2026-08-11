@@ -1,7 +1,9 @@
 #include "ha_helper.h"
 #include "etcd_helper.h"
+#include "centralized_master_metric_manager.h"
 #include "centralized_rpc_service.h"
 #include "ha/oplog/p2p_hot_standby_service.h"
+#include "p2p_master_metric_manager.h"
 #include "p2p_rpc_service.h"
 #include "utils.h"
 #ifdef STORE_USE_REDIS
@@ -245,6 +247,8 @@ int MasterServiceSupervisor::Start() {
         LOG(INFO) << "Starting master service...";
         std::unique_ptr<WrappedMasterService> wrapped_master_service;
         if (config_.deployment_mode == DeploymentMode::CENTRALIZATION) {
+            // Force the metric manager singleton to be constructed
+            CentralizedMasterMetricManager::instance();
             wrapped_master_service =
                 std::make_unique<WrappedCentralizedMasterService>(
                     WrappedMasterServiceConfig(config_, view_version));
@@ -252,6 +256,8 @@ int MasterServiceSupervisor::Start() {
                 server, static_cast<WrappedCentralizedMasterService&>(
                             *wrapped_master_service));
         } else {
+            // Force the metric manager singleton to be constructed
+            P2PMasterMetricManager::instance();
             auto p2p_wrapped_service =
                 std::make_unique<WrappedP2PMasterService>(
                     WrappedMasterServiceConfig(config_, view_version));

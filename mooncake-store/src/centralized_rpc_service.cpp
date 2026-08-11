@@ -6,7 +6,7 @@ namespace mooncake {
 
 WrappedCentralizedMasterService::WrappedCentralizedMasterService(
     const WrappedMasterServiceConfig& config)
-    : WrappedMasterService(config, CentralizedMasterMetricManager::instance()),
+    : WrappedMasterService(config),
       master_service_(MasterServiceConfig(config)) {
     init_centralized_http_server();
 }

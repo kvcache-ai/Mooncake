@@ -180,14 +180,15 @@ class MasterMetricManager {
     int64_t get_batch_get_replica_list_items();
     int64_t get_batch_get_replica_list_failed_items();
 
-    virtual std::string serialize_metrics();
+    virtual std::string serialize_metrics() = 0;
 
-    virtual std::string get_summary_string();
+    virtual std::string get_summary_string() = 0;
 
    protected:
     MasterMetricManager();
 
     // Registers the architecture singleton; the first registrant wins.
+    // Called only by each subclass singleton on construction
     static void RegisterInstance(MasterMetricManager* instance);
 
     // Update all metrics once to ensure zero values are serialized

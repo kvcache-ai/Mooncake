@@ -732,12 +732,24 @@ std::string CentralizedMasterMetricManager::serialize_metrics() {
 
     serialize_metric(batch_replica_clear_requests_);
     serialize_metric(batch_replica_clear_failures_);
+    serialize_metric(batch_replica_clear_partial_successes_);
+    serialize_metric(batch_replica_clear_items_);
+    serialize_metric(batch_replica_clear_failed_items_);
     serialize_metric(batch_put_start_requests_);
     serialize_metric(batch_put_start_failures_);
+    serialize_metric(batch_put_start_partial_successes_);
+    serialize_metric(batch_put_start_items_);
+    serialize_metric(batch_put_start_failed_items_);
     serialize_metric(batch_put_end_requests_);
     serialize_metric(batch_put_end_failures_);
+    serialize_metric(batch_put_end_partial_successes_);
+    serialize_metric(batch_put_end_items_);
+    serialize_metric(batch_put_end_failed_items_);
     serialize_metric(batch_put_revoke_requests_);
     serialize_metric(batch_put_revoke_failures_);
+    serialize_metric(batch_put_revoke_partial_successes_);
+    serialize_metric(batch_put_revoke_items_);
+    serialize_metric(batch_put_revoke_failed_items_);
 
     serialize_metric(eviction_success_);
     serialize_metric(eviction_attempts_);
@@ -748,7 +760,7 @@ std::string CentralizedMasterMetricManager::serialize_metrics() {
     serialize_metric(put_start_release_cnt_);
     serialize_metric(put_start_discarded_staging_size_);
 
-    return ss.str();
+    return out + ss.str();
 }
 
 // --- Human-Readable Summary ---

@@ -7,7 +7,7 @@ namespace mooncake {
 
 WrappedP2PMasterService::WrappedP2PMasterService(
     const WrappedMasterServiceConfig& config)
-    : WrappedMasterService(config, P2PMasterMetricManager::instance()),
+    : WrappedMasterService(config),
       master_service_(config) {}
 
 void RegisterP2PRpcService(
