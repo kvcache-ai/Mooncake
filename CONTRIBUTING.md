@@ -71,10 +71,11 @@ staged files (the first run may install hook environments):
 pre-commit run
 ```
 Before opening a PR, run hooks only on files changed against the PR base
-(default `main`). The C/C++ hook remains limited to staged or changed line
-ranges:
+(default `origin/main`). The C/C++ hook remains limited to staged or changed
+line ranges:
 ```bash
-pre-commit run --files $(git diff --name-only --diff-filter=ACMR main...HEAD)
+git fetch origin main
+pre-commit run --files $(git diff --name-only --diff-filter=ACMR origin/main...HEAD)
 ```
 Use full-repo checks only for intentional whole-project cleanup; do not fold
 unrelated rewrites into a feature PR. Prefer `./scripts/code_format.sh --all`
