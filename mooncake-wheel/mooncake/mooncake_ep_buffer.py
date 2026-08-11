@@ -17,6 +17,11 @@ _USE_MACA = (
 )
 _USE_SPLIT_SEND_RECV = _USE_MACA
 
+_ZERO_COPY_COMBINE_UNSUPPORTED = (
+    "Mooncake EP zero-copy combine is not supported; pass the expert output "
+    "tensor to combine() with zero_copy=False"
+)
+
 
 def _native_current_stream_ptr() -> int:
     return int(torch.cuda.current_stream().cuda_stream)
@@ -567,6 +572,9 @@ class Buffer:
         return_recv_hook: bool = False,
         out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, EventOverlap, Callable]:
+        if zero_copy:
+            raise NotImplementedError(_ZERO_COPY_COMBINE_UNSUPPORTED)
+
         assert x.dim() == 3 and x.is_contiguous()
         assert x.dtype == torch.bfloat16
         assert topk_idx.dim() == 2 and topk_idx.is_contiguous()
@@ -694,32 +702,7 @@ class Buffer:
         )
 
     def get_next_combine_buffer(self, handle: object):
-        (
-            src_info,
-            layout_range,
-            num_max_dispatch_tokens_per_rank,
-            hidden,
-            num_experts,
-        ) = handle
-        if (
-            self._fallback_next_combine_buffer is None
-            or self._fallback_next_combine_buffer.shape
-            != (
-                num_experts // self.group_size,
-                num_max_dispatch_tokens_per_rank * self.group_size,
-                hidden,
-            )
-        ):
-            self._fallback_next_combine_buffer = torch.empty(
-                (
-                    num_experts // self.group_size,
-                    num_max_dispatch_tokens_per_rank * self.group_size,
-                    hidden,
-                ),
-                dtype=torch.bfloat16,
-                device="cuda",
-            )
-        return self._fallback_next_combine_buffer
+        raise NotImplementedError(_ZERO_COPY_COMBINE_UNSUPPORTED)
 
     # -----------------
     # Fallback helpers
