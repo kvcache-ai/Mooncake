@@ -128,7 +128,9 @@ void loadGlobalConfig(GlobalConfig& config) {
     const char* port_env = std::getenv("MC_IB_PORT");
     if (port_env) {
         int val = atoi(port_env);
-        if (val >= 0 && val < 256)
+        // IB port numbers are 1-based. Accepting 0 made ibv_query_port fail on
+        // every device, disabling the whole topology.
+        if (val > 0 && val < 256)
             config.port = uint8_t(val);
         else
             LOG(WARNING) << "Ignore value from environment variable MC_IB_PORT";
