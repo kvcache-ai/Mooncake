@@ -97,7 +97,13 @@ void killAndReap(pid_t pid) {
     }
 
     int status = 0;
-    while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+    pid_t ret;
+    do {
+        ret = waitpid(pid, &status, 0);
+    } while (ret < 0 && errno == EINTR);
+    if (ret < 0) {
+        ADD_FAILURE() << "waitpid() failed while reaping child: "
+                      << strerror(errno);
     }
 }
 
@@ -154,8 +160,18 @@ bool waitForChildReady(int fd) {
     do {
         bytes_read = read(fd, &ready, sizeof(ready));
     } while (bytes_read < 0 && errno == EINTR);
-    if (bytes_read != static_cast<ssize_t>(sizeof(ready)) || ready != '1') {
+    if (bytes_read == 0) {
         ADD_FAILURE() << "child exited before reporting readiness";
+        return false;
+    }
+    if (bytes_read < 0) {
+        ADD_FAILURE() << "read() failed while waiting for readiness: "
+                      << strerror(errno);
+        return false;
+    }
+    if (ready != '1') {
+        ADD_FAILURE() << "unexpected readiness marker: "
+                      << static_cast<int>(static_cast<unsigned char>(ready));
         return false;
     }
     return true;
