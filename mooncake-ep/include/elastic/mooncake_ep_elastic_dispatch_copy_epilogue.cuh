@@ -32,8 +32,7 @@ __global__ void __launch_bounds__(kNumThreads, 1) dispatch_copy_epilogue_impl(
     const auto sm_idx = static_cast<int>(blockIdx.x),
                thread_idx = static_cast<int>(threadIdx.x);
     const auto warp_idx = ptx::get_warp_idx(), lane_idx = ptx::get_lane_idx();
-    const auto num_sms =
-        kNumSMs == 0 ? static_cast<int>(gridDim.x) : kNumSMs;
+    const auto num_sms = kNumSMs == 0 ? static_cast<int>(gridDim.x) : kNumSMs;
     const auto global_warp_idx = warp_idx * num_sms + sm_idx;
 
     // For top-k index transformations

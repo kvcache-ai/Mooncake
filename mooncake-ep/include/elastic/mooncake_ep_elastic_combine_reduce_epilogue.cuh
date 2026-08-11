@@ -42,8 +42,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
     // Utils
     const auto sm_idx = static_cast<int>(blockIdx.x);
     const auto warp_idx = ptx::get_warp_idx(), lane_idx = ptx::get_lane_idx();
-    const auto num_sms =
-        kNumSMs == 0 ? static_cast<int>(gridDim.x) : kNumSMs;
+    const auto num_sms = kNumSMs == 0 ? static_cast<int>(gridDim.x) : kNumSMs;
     const auto global_warp_idx =
         warp_idx * num_sms +
         sm_idx;  // NOTES: Here we prioritize distributing tasks to different

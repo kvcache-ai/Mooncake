@@ -50,8 +50,7 @@ struct NcclTransportConfig {
     // NCCL's rail team: peers are addressed by their rail-team rank rather
     // than by world rank.
     bool enable_gin = true;
-    NcclGinConnectionType gin_connection_type =
-        NcclGinConnectionType::kFull;
+    NcclGinConnectionType gin_connection_type = NcclGinConnectionType::kFull;
     int gin_context_count = 4;
     bool gin_exclusive_contexts = false;
     int gin_queue_depth = 0;
@@ -76,8 +75,7 @@ struct NcclTransportProperties {
     int lsa_team_count = 0;
     int lsa_barrier_count = 0;
     bool gin_enabled = false;
-    NcclGinConnectionType gin_connection_type =
-        NcclGinConnectionType::kNone;
+    NcclGinConnectionType gin_connection_type = NcclGinConnectionType::kNone;
     NcclGinBackend gin_backend = NcclGinBackend::kNone;
     int gin_connection_count = 0;
     int gin_context_count = 0;
@@ -125,8 +123,8 @@ class NcclDeviceContext {
 
    private:
     const void* native_comm_ = nullptr;
-    alignas(kNativeCommAlignment)
-        unsigned char native_comm_storage_[kNativeCommBytes]{};
+    alignas(kNativeCommAlignment) unsigned char native_comm_storage_
+        [kNativeCommBytes]{};
     const void* native_window_ = nullptr;
     const void* local_base_ = nullptr;
     int rank_ = -1;

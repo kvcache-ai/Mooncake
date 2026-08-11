@@ -38,9 +38,9 @@ int hybrid_num_channels(int num_sms, int channels_per_sm) {
 
 int hybrid_num_max_tokens_per_channel(int num_max_tokens_per_rank, int num_sms,
                                       int channels_per_sm) {
-    return static_cast<int>(ceil_div_i64(
-        num_max_tokens_per_rank,
-        hybrid_num_channels(num_sms, channels_per_sm)));
+    return static_cast<int>(
+        ceil_div_i64(num_max_tokens_per_rank,
+                     hybrid_num_channels(num_sms, channels_per_sm)));
 }
 
 int64_t elastic_workspace_num_bytes() {
@@ -155,9 +155,9 @@ struct NcclElasticState {
         config.rank = rank;
         config.num_ranks = num_ranks;
         config.enable_gin = num_ranks > 1;
-        config.gin_connection_type =
-            use_rail_gin ? device::NcclGinConnectionType::kRail
-                         : device::NcclGinConnectionType::kFull;
+        config.gin_connection_type = use_rail_gin
+                                         ? device::NcclGinConnectionType::kRail
+                                         : device::NcclGinConnectionType::kFull;
         config.gin_context_count = config.enable_gin ? gin_context_count : 0;
         config.gin_exclusive_contexts = config.enable_gin;
         config.gin_queue_depth = config.enable_gin ? 1024 : 0;
@@ -238,8 +238,7 @@ ElasticLaunchContext MooncakeElasticBuffer::make_launch_context(
         local_base = static_cast<char*>(nccl_state_->allocation);
         ctx.backend = ElasticTransportBackend::kNccl;
         ctx.nccl.device = nccl_state_->device_context;
-        ctx.num_qps =
-            std::max(1, nccl_state_->properties.gin_context_count);
+        ctx.num_qps = std::max(1, nccl_state_->properties.gin_context_count);
 #else
         throw std::logic_error(
             "NCCL ElasticBuffer state exists in a non-NCCL build");
@@ -735,9 +734,9 @@ std::optional<EventHandle> MooncakeElasticBuffer::dispatch(
     const int num_channels_per_sm = 1;
     const int num_channels = num_sms * num_channels_per_sm;
     const bool use_hybrid = topology_.num_scaleout_ranks != 1;
-    const int hybrid_channels_per_sm =
-        using_nccl() ? kNcclElasticHybridChannelsPerSm
-                     : kIbgdaElasticHybridChannelsPerSm;
+    const int hybrid_channels_per_sm = using_nccl()
+                                           ? kNcclElasticHybridChannelsPerSm
+                                           : kIbgdaElasticHybridChannelsPerSm;
     const int hybrid_channels =
         use_hybrid ? hybrid_num_channels(num_sms, hybrid_channels_per_sm) : 0;
     const int hybrid_max_tokens_per_channel =
@@ -876,9 +875,9 @@ std::optional<EventHandle> MooncakeElasticBuffer::combine(
     const int num_smem_bytes = device_smem_bytes_;
     const int num_channels = std::max(1, num_sms);
     const bool use_hybrid = topology_.num_scaleout_ranks != 1;
-    const int hybrid_channels_per_sm =
-        using_nccl() ? kNcclElasticHybridChannelsPerSm
-                     : kIbgdaElasticHybridChannelsPerSm;
+    const int hybrid_channels_per_sm = using_nccl()
+                                           ? kNcclElasticHybridChannelsPerSm
+                                           : kIbgdaElasticHybridChannelsPerSm;
     const int hybrid_channels =
         use_hybrid ? hybrid_num_channels(num_sms, hybrid_channels_per_sm) : 0;
     auto compute_stream_raw =
