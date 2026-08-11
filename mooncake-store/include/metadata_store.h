@@ -31,6 +31,8 @@ struct StandbyObjectMetadata {
     // 1. Standby does not perform eviction, so lease info is not used
     // 2. After promotion, new Primary should grant fresh leases, not restore
     // old ones
+    // Soft pin is also omitted because it is runtime-only eviction-priority
+    // state; promoted objects resume as ordinary cache.
     uint64_t last_sequence_id{
         0};                // Last OpLog sequence ID that modified this key
     std::string group_id;  // Tenant group identifier
