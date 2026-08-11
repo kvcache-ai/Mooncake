@@ -407,6 +407,31 @@ MasterService::MasterService(const MasterServiceConfig& config)
                   << ")";
     }
 
+    if (config.dynamic_replication_mode == "observe") {
+        dynamic_replication_mode_ = DynamicReplicationMode::kObserve;
+    } else if (config.dynamic_replication_mode == "enforce") {
+        dynamic_replication_mode_ = DynamicReplicationMode::kEnforce;
+    } else {
+        dynamic_replication_mode_ = DynamicReplicationMode::kOff;
+    }
+    dynamic_replication_heat_window_seconds_ =
+        std::max<uint32_t>(1, config.dynamic_replication_heat_window_seconds);
+    dynamic_replication_admission_qps_threshold_ =
+        config.dynamic_replication_admission_qps_threshold > 0.0
+            ? config.dynamic_replication_admission_qps_threshold
+            : 0.8;
+    dynamic_replication_max_memory_replicas_ =
+        std::max<size_t>(1, config.dynamic_replication_max_memory_replicas);
+    if (DynamicReplicationEnabled()) {
+        LOG(INFO) << "Dynamic MEMORY replication mode enabled: mode="
+                  << config.dynamic_replication_mode << ", heat_window_seconds="
+                  << dynamic_replication_heat_window_seconds_
+                  << ", admission_qps_threshold="
+                  << dynamic_replication_admission_qps_threshold_
+                  << ", max_memory_replicas="
+                  << dynamic_replication_max_memory_replicas_;
+    }
+
     InitDfsAllocatorFromEnvironment(config);
     kv_event_publisher_ =
         std::make_unique<KvEventPublisher>(BuildKvEventConfig(config));
@@ -1695,6 +1720,16 @@ size_t MasterService::EraseReplicasWithCacheTotalAccounting(
             erased_replica_ids->push_back(replica.id());
         }
     }
+    std::vector<ReplicaID> dynamic_erased_ids;
+    dynamic_erased_ids.reserve(erased_replicas.size());
+    for (const auto& replica : erased_replicas) {
+        dynamic_erased_ids.push_back(replica.id());
+    }
+    if (metadata.ForgetDynamicReplicas(dynamic_erased_ids) > 0) {
+        metadata.SetDynamicReplicationRecreateAfter(
+            std::chrono::steady_clock::now() +
+            kDynamicReplicationRecreateCooldown);
+    }
     // Release SSD/local-disk usage for any local-disk replicas being removed.
     // No-op for memory/noF replicas, so it is safe to call unconditionally.
     ReleaseLocalDiskUsage(erased_replicas);
@@ -2046,6 +2081,7 @@ MasterService::EraseMetadata(
         tenant_state.replication_tasks.erase(replication_task_it);
     }
     ErasePromotionTaskIfPresent(tenant_state, key);
+    ClearDynamicReplicationStateForKey(tenant_state, key);
 
     ReleaseLocalDiskUsage(metadata.GetAllReplicas());
     FreeDfsReplicas(key, metadata.GetAllReplicas());
@@ -3372,6 +3408,7 @@ auto MasterService::GetReplicaList(const std::string& key,
 
     GetReplicaListResponse resp({}, default_kv_lease_ttl_);
     bool promotion_eligible = false;
+    bool dynamic_replication_observed = false;
     {
         MetadataAccessorRO accessor(this, object_id);
 
@@ -3439,6 +3476,19 @@ auto MasterService::GetReplicaList(const std::string& key,
                 metadata.HasReplica(&Replica::fn_is_local_disk_replica);
             promotion_eligible = !any_memory && any_local_disk;
         }
+        if (DynamicReplicationEnabled()) {
+            size_t memory_replicas = 0;
+            metadata.VisitReplicas(
+                [this](const Replica& replica) {
+                    return IsReplicaReadable(replica) &&
+                           replica.is_memory_replica();
+                },
+                [&memory_replicas](const Replica&) { ++memory_replicas; });
+            dynamic_replication_observed =
+                dynamic_replication_mode_ == DynamicReplicationMode::kObserve &&
+                memory_replicas > 0 &&
+                memory_replicas < dynamic_replication_max_memory_replicas_;
+        }
 
         resp = GetReplicaListResponse(std::move(replica_list),
                                       default_kv_lease_ttl_,
@@ -3447,6 +3497,9 @@ auto MasterService::GetReplicaList(const std::string& key,
     // RO accessor released. Safe to take a fresh RW accessor now.
     if (promotion_eligible) {
         TryPushPromotionQueue(object_id);
+    }
+    if (dynamic_replication_observed) {
+        TrySubmitDynamicReplicaProposal(object_id);
     }
     return resp;
 }
@@ -3530,6 +3583,8 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
         }
 
         std::vector<ObjectIdentity> promotion_candidates;
+        std::vector<ObjectIdentity> dynamic_replication_candidates;
+        std::unordered_set<std::string> dynamic_replication_seen;
         std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
         {
             MetadataShardAccessorRO shard(this, shard_idx);
@@ -3605,6 +3660,32 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                             MakeObjectIdentity(key, normalized_tenant));
                     }
                 }
+                if (DynamicReplicationEnabled()) {
+                    size_t memory_replicas = 0;
+                    metadata.VisitReplicas(
+                        [this](const Replica& replica) {
+                            return IsReplicaReadable(replica) &&
+                                   replica.is_memory_replica();
+                        },
+                        [&memory_replicas](const Replica&) {
+                            ++memory_replicas;
+                        });
+                    if (memory_replicas > 0 &&
+                        dynamic_replication_mode_ ==
+                            DynamicReplicationMode::kObserve &&
+                        memory_replicas <
+                            dynamic_replication_max_memory_replicas_) {
+                        auto object_id =
+                            MakeObjectIdentity(key, normalized_tenant);
+                        if (dynamic_replication_seen
+                                .insert(object_id.tenant_id.MakeScopedKey(
+                                    object_id.user_key))
+                                .second) {
+                            dynamic_replication_candidates.push_back(
+                                std::move(object_id));
+                        }
+                    }
+                }
 
                 results[original_idx] = GetReplicaListResponse(
                     std::move(replica_list), default_kv_lease_ttl_,
@@ -3614,6 +3695,9 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
 
         for (const auto& object_id : promotion_candidates) {
             TryPushPromotionQueue(object_id);
+        }
+        for (const auto& object_id : dynamic_replication_candidates) {
+            TrySubmitDynamicReplicaProposal(object_id);
         }
     }
 
@@ -5333,6 +5417,13 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
         }
     }
 
+    auto pending_validation = ValidateDynamicReplicaPendingForCopyStart(
+        tenant_state, key, src_segment, DynamicReplicationVersionEpoch(metadata),
+        tgt_segments);
+    if (!pending_validation) {
+        return tl::make_unexpected(pending_validation.error());
+    }
+
     const uint64_t pending_quota_charge =
         SaturatingMultiply(static_cast<uint64_t>(metadata.size),
                            static_cast<uint64_t>(new_replica_count));
@@ -5352,6 +5443,8 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
 
     std::vector<Replica> replicas;
     replicas.reserve(new_replica_count);
+    std::vector<std::string> new_target_segments;
+    new_target_segments.reserve(new_replica_count);
     {
         ScopedAllocatorAccess allocator_access =
             segment_manager_.getAllocatorAccess();
@@ -5372,6 +5465,7 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
                 return tl::make_unexpected(replica.error());
             }
             replicas.push_back(std::move(*replica));
+            new_target_segments.push_back(tgt_segment);
         }
     }
 
@@ -5396,6 +5490,11 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
         refund_pending_quota();
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
     }
+
+    RegisterDynamicReplicaStart(tenant_state, metadata, key, src_segment,
+                                DynamicReplicationVersionEpoch(metadata),
+                                new_target_segments,
+                                task_insert.first->second.replica_ids);
 
     // Increase source refcnt to protect it from eviction.
     source->inc_refcnt();
@@ -5504,6 +5603,10 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
         }
     }
 
+    metadata.MarkDynamicReplicasComplete(commit_target_ids);
+
+    ClearDynamicReplicationStateForKey(accessor.GetTenantState(), key);
+
     if (enable_oplog_ && ordered_oplog_writer_) {
         std::vector<Replica::Descriptor> post;
         metadata.VisitReplicas(&Replica::fn_is_completed,
@@ -5602,6 +5705,9 @@ tl::expected<void, ErrorCode> MasterService::CopyRevoke(
     ReleaseTenantQuota(GetBoundTenantQuotaHandle(accessor.GetTenantState()),
                        task.pending_quota_charge_bytes);
     accessor.EraseReplicationTask();
+
+    metadata.ForgetDynamicReplicas(task.replica_ids);
+    ClearDynamicReplicationStateForKey(accessor.GetTenantState(), key);
 
     if (!metadata.IsValid()) {
         // Remove the object if it does not have any replicas.
@@ -7465,6 +7571,346 @@ size_t MasterService::RunPromotionCandidateRetry(size_t max_shards_to_scan) {
     }
 
     return queued;
+}
+
+bool MasterService::DynamicReplicationEnabled() const {
+    return dynamic_replication_mode_ != DynamicReplicationMode::kOff;
+}
+
+bool MasterService::DynamicReplicationEnforce() const {
+    return dynamic_replication_mode_ == DynamicReplicationMode::kEnforce;
+}
+
+uint32_t MasterService::DynamicReplicationAdmissionMinHits() const {
+    const double hits = std::ceil(dynamic_replication_admission_qps_threshold_ *
+                                  dynamic_replication_heat_window_seconds_);
+    return std::max<uint32_t>(1, static_cast<uint32_t>(hits));
+}
+
+bool MasterService::ObserveDynamicReplicationAccess(
+    const ObjectIdentity& object_id) {
+    if (!DynamicReplicationEnabled()) {
+        return false;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const auto window =
+        std::chrono::seconds(dynamic_replication_heat_window_seconds_);
+    const auto admission_key =
+        object_id.tenant_id.MakeScopedKey(object_id.user_key);
+
+    std::lock_guard<std::mutex> lock(dynamic_replication_mutex_);
+    if (dynamic_replication_windows_.size() >
+        kDynamicReplicationWindowEntryLimit) {
+        for (auto it = dynamic_replication_windows_.begin();
+             it != dynamic_replication_windows_.end();) {
+            if (now - it->second.window_start > window * 2) {
+                it = dynamic_replication_windows_.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    auto& counter = dynamic_replication_windows_[admission_key];
+    if (counter.window_start.time_since_epoch().count() == 0 ||
+        now - counter.window_start >= window) {
+        counter.window_start = now;
+        counter.hits = 0;
+    }
+    counter.hits++;
+    return counter.hits >= DynamicReplicationAdmissionMinHits();
+}
+
+void MasterService::TrySubmitDynamicReplicaProposal(
+    const ObjectIdentity& object_id) {
+    if (ObserveDynamicReplicationAccess(object_id)) {
+        VLOG(1) << "dynamic_replication_observe_would_propose key="
+                << object_id.user_key;
+    }
+}
+
+uint64_t MasterService::DynamicReplicationVersionEpoch(
+    const ObjectMetadata& metadata) const {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            metadata.put_start_time.time_since_epoch())
+            .count());
+}
+
+int64_t MasterService::DynamicReplicationNowMs() {
+    return static_cast<int64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch())
+            .count());
+}
+
+void MasterService::ClearDynamicReplicationStateForKey(
+    TenantState& tenant_state, const std::string& key) {
+    tenant_state.dynamic_replication_pending.erase(key);
+    tenant_state.dynamic_replication_cooldowns.erase(key);
+    for (auto it = tenant_state.dynamic_replication_leases.begin();
+         it != tenant_state.dynamic_replication_leases.end();) {
+        if (it->second.key == key) {
+            it = tenant_state.dynamic_replication_leases.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+bool MasterService::HasDynamicReplicationPending(
+    TenantState& tenant_state, const std::string& key) {
+    auto it = tenant_state.dynamic_replication_pending.find(key);
+    if (it == tenant_state.dynamic_replication_pending.end()) {
+        return false;
+    }
+    if (it->second.expire_at_ms_epoch >= DynamicReplicationNowMs()) {
+        return true;
+    }
+    ClearDynamicReplicationStateForKey(tenant_state, key);
+    return false;
+}
+
+std::optional<MasterService::DynamicReplicaPlan>
+MasterService::SelectDynamicReplicaPlan(
+    const ObjectMetadata& metadata,
+    const std::optional<std::string>& preferred_target_segment,
+    std::string target_domain) {
+    std::unordered_set<std::string> existing_segments;
+    std::optional<std::string> source_segment;
+    size_t memory_replicas = 0;
+
+    metadata.VisitReplicas(
+        [this](const Replica& replica) {
+            return IsReplicaReadable(replica) && replica.is_memory_replica();
+        },
+        [&](const Replica& replica) {
+            memory_replicas++;
+            for (const auto& segment_name : replica.get_segment_names()) {
+                if (!segment_name.has_value()) {
+                    continue;
+                }
+                existing_segments.insert(*segment_name);
+                if (!source_segment.has_value()) {
+                    source_segment = *segment_name;
+                }
+            }
+        });
+
+    if (!source_segment.has_value() || memory_replicas == 0 ||
+        memory_replicas >= dynamic_replication_max_memory_replicas_) {
+        return std::nullopt;
+    }
+
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    std::vector<std::pair<Segment, UUID>> segments;
+    if (segment_access.GetAllSegments(segments) != ErrorCode::OK) {
+        return std::nullopt;
+    }
+
+    auto is_valid_target = [&](const Segment& segment) {
+        if (existing_segments.contains(segment.name) ||
+            !segment_access.IsSegmentAllocatable(segment.name)) {
+            return false;
+        }
+        size_t used = 0;
+        size_t capacity = 0;
+        if (segment_access.QuerySegments(segment.name, used, capacity) !=
+                ErrorCode::OK ||
+            capacity == 0 || used >= capacity ||
+            capacity - used < metadata.size) {
+            return false;
+        }
+        const double util =
+            static_cast<double>(used) / static_cast<double>(capacity);
+        return util < kDynamicReplicationTargetHighWatermark;
+    };
+
+    std::optional<std::string> target_segment;
+    if (preferred_target_segment.has_value()) {
+        const auto preferred = std::find_if(
+            segments.begin(), segments.end(), [&](const auto& entry) {
+                return entry.first.name == *preferred_target_segment;
+            });
+        if (preferred != segments.end() && is_valid_target(preferred->first)) {
+            target_segment = preferred->first.name;
+        }
+    } else {
+        double best_util = std::numeric_limits<double>::max();
+        for (const auto& [segment, client_id] : segments) {
+            (void)client_id;
+            if (!is_valid_target(segment)) {
+                continue;
+            }
+            size_t used = 0;
+            size_t capacity = 0;
+            if (segment_access.QuerySegments(segment.name, used, capacity) !=
+                ErrorCode::OK) {
+                continue;
+            }
+            const double util =
+                static_cast<double>(used) / static_cast<double>(capacity);
+            if (util < best_util) {
+                best_util = util;
+                target_segment = segment.name;
+            }
+        }
+    }
+
+    if (!target_segment.has_value()) {
+        return std::nullopt;
+    }
+    return DynamicReplicaPlan{.source_segment = *source_segment,
+                              .target_segment = *target_segment,
+                              .target_domain = std::move(target_domain)};
+}
+
+tl::expected<ReplicaActionLease, ErrorCode>
+MasterService::SubmitReplicaActionProposal(
+    const ReplicaActionProposal& proposal) {
+    if (!DynamicReplicationEnforce()) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    if (proposal.action != ReplicaActionType::ADD || proposal.key.empty()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (proposal.proposal_id == UUID{0, 0}) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    const int64_t now_ms = DynamicReplicationNowMs();
+    if (proposal.expire_at_ms_epoch > 0 &&
+        proposal.expire_at_ms_epoch < now_ms) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto normalized_tenant_result =
+        ResolveTenantIdForWrite(TenantId(proposal.tenant_id));
+    if (!normalized_tenant_result) {
+        return tl::make_unexpected(normalized_tenant_result.error());
+    }
+    ObjectIdentity object_id{std::move(normalized_tenant_result.value()),
+                             proposal.key};
+    const UUID proposal_id = proposal.proposal_id;
+
+    MetadataAccessorRW accessor(this, object_id);
+    if (!accessor.Exists()) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+
+    auto& tenant_state = accessor.GetTenantState();
+    auto lease_it = tenant_state.dynamic_replication_leases.find(proposal_id);
+    if (lease_it != tenant_state.dynamic_replication_leases.end()) {
+        if (lease_it->second.expire_at_ms_epoch >= now_ms) {
+            const auto& lease = lease_it->second;
+            const bool same_request =
+                lease.action == proposal.action &&
+                lease.tenant_id == object_id.tenant_id.value() &&
+                lease.key == object_id.user_key &&
+                (proposal.observed_version_epoch == 0 ||
+                 lease.version_epoch == proposal.observed_version_epoch) &&
+                (!proposal.preferred_target_segment.has_value() ||
+                 lease.target_segment == *proposal.preferred_target_segment) &&
+                (proposal.target_domain.empty() ||
+                 lease.target_domain == proposal.target_domain);
+            if (!same_request) {
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            return lease_it->second;
+        }
+        tenant_state.dynamic_replication_leases.erase(lease_it);
+    }
+
+    if (proposal.access_frequency_qps <
+            dynamic_replication_admission_qps_threshold_ &&
+        proposal.hits < DynamicReplicationAdmissionMinHits()) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto cooldown_it =
+        tenant_state.dynamic_replication_cooldowns.find(object_id.user_key);
+    if (cooldown_it != tenant_state.dynamic_replication_cooldowns.end()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (cooldown_it->second > now) {
+            return tl::make_unexpected(
+                ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+        }
+        tenant_state.dynamic_replication_cooldowns.erase(cooldown_it);
+    }
+
+    if (accessor.InProcessing() || accessor.HasReplicationTask() ||
+        HasDynamicReplicationPending(tenant_state, object_id.user_key)) {
+        return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+    }
+
+    auto& metadata = accessor.Get();
+    if (proposal.observed_version_epoch != 0 &&
+        proposal.observed_version_epoch !=
+            DynamicReplicationVersionEpoch(metadata)) {
+        return tl::make_unexpected(ErrorCode::INVALID_VERSION);
+    }
+    if (proposal.object_size_bytes != 0 &&
+        proposal.object_size_bytes != metadata.size) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (metadata.DynamicReplicationRecreateBlocked(
+            std::chrono::steady_clock::now())) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+
+    auto plan = SelectDynamicReplicaPlan(
+        metadata, proposal.preferred_target_segment, proposal.target_domain);
+    if (!plan.has_value()) {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+
+    auto task = SubmitDynamicReplicaCopyTask(object_id, *plan);
+    if (!task.has_value()) {
+        return tl::make_unexpected(task.error());
+    }
+
+    ReplicaActionLease lease;
+    lease.proposal_id = proposal_id;
+    lease.lease_id = generate_uuid();
+    lease.action = ReplicaActionType::ADD;
+    lease.tenant_id = object_id.tenant_id.value();
+    lease.key = object_id.user_key;
+    lease.source_segment = plan->source_segment;
+    lease.target_segment = plan->target_segment;
+    lease.target_domain = plan->target_domain;
+    lease.version_epoch = DynamicReplicationVersionEpoch(metadata);
+    lease.expire_at_ms_epoch = now_ms + kDynamicReplicationLeaseTtl.count();
+    lease.task_id = task.value();
+
+    tenant_state.dynamic_replication_pending[object_id.user_key] =
+        DynamicReplicaPending{.proposal_id = proposal_id,
+                              .lease_id = lease.lease_id,
+                              .source_segment = lease.source_segment,
+                              .target_segment = lease.target_segment,
+                              .target_domain = lease.target_domain,
+                              .version_epoch = lease.version_epoch,
+                              .expire_at_ms_epoch = lease.expire_at_ms_epoch,
+                              .task_id = lease.task_id};
+    tenant_state.dynamic_replication_leases[proposal_id] = lease;
+    tenant_state.dynamic_replication_cooldowns[object_id.user_key] =
+        std::chrono::steady_clock::now() + kDynamicReplicationActionCooldown;
+    return lease;
+}
+
+tl::expected<UUID, ErrorCode> MasterService::SubmitDynamicReplicaCopyTask(
+    const ObjectIdentity& object_id, const DynamicReplicaPlan& plan) {
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    UUID source_client;
+    ErrorCode error = segment_access.GetClientIdBySegmentName(
+        plan.source_segment, source_client);
+    if (error != ErrorCode::OK) {
+        return tl::make_unexpected(error);
+    }
+    return task_manager_.get_write_access()
+        .submit_task_typed<TaskType::REPLICA_COPY>(
+            source_client, {.tenant_id = object_id.tenant_id.value(),
+                            .key = object_id.user_key,
+                            .source = plan.source_segment,
+                            .targets = {plan.target_segment}});
 }
 
 MasterService::PromotionQueueResult MasterService::TryPushPromotionQueue(
@@ -10816,6 +11262,64 @@ MasterService::MetadataSerializer::DeserializeMetadata(
         std::chrono::milliseconds(lease_timestamp));
 
     return metadata;
+}
+
+tl::expected<void, ErrorCode>
+MasterService::ValidateDynamicReplicaPendingForCopyStart(
+    TenantState& tenant_state, const std::string& key,
+    const std::string& source_segment,
+    uint64_t version_epoch, const std::vector<std::string>& target_segments) {
+    auto pending_it = tenant_state.dynamic_replication_pending.find(key);
+    if (pending_it == tenant_state.dynamic_replication_pending.end()) {
+        return {};
+    }
+    auto& pending = pending_it->second;
+    if (pending.expire_at_ms_epoch < DynamicReplicationNowMs()) {
+        ClearDynamicReplicationStateForKey(tenant_state, key);
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+    if (pending.version_epoch != version_epoch) {
+        ClearDynamicReplicationStateForKey(tenant_state, key);
+        return tl::make_unexpected(ErrorCode::INVALID_VERSION);
+    }
+    if (pending.source_segment != source_segment ||
+        target_segments.size() != 1 ||
+        target_segments.front() != pending.target_segment) {
+        return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+    }
+    return {};
+}
+
+void MasterService::RegisterDynamicReplicaStart(
+    TenantState& tenant_state, ObjectMetadata& metadata, const std::string& key,
+    const std::string& source_segment,
+    uint64_t version_epoch, const std::vector<std::string>& target_segments,
+    const std::vector<ReplicaID>& replica_ids) {
+    auto pending_it = tenant_state.dynamic_replication_pending.find(key);
+    if (pending_it == tenant_state.dynamic_replication_pending.end()) {
+        return;
+    }
+    auto pending = pending_it->second;
+    tenant_state.dynamic_replication_pending.erase(pending_it);
+    if (pending.source_segment != source_segment ||
+        pending.expire_at_ms_epoch < DynamicReplicationNowMs() ||
+        pending.version_epoch != version_epoch) {
+        return;
+    }
+    for (size_t i = 0; i < target_segments.size() && i < replica_ids.size();
+         ++i) {
+        if (target_segments[i] != pending.target_segment) {
+            continue;
+        }
+        metadata.MarkDynamicReplica(
+            replica_ids[i], ObjectMetadata::DynamicReplicaRecord{
+                                .created_at = std::chrono::system_clock::now(),
+                                .source_segment = pending.source_segment,
+                                .target_segment = pending.target_segment,
+                                .target_domain = pending.target_domain,
+                                .complete = false});
+        return;
+    }
 }
 
 tl::expected<UUID, ErrorCode> MasterService::CreateCopyTask(
