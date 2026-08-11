@@ -132,8 +132,8 @@ __forceinline__ __device__ void mooncake_barrier_wo_local_sync(
         thread_idx == 0, [=](const bool& is_last_check) {
             int observed = 0;
             if constexpr (kUseAggregateSignal) {
-                observed = ptx::ld_acquire_sys<int>(
-                    const_cast<int*>(base_signal));
+                observed =
+                    ptx::ld_acquire_sys<int>(const_cast<int*>(base_signal));
             } else {
 #pragma unroll
                 for (int i = 0; i < kNumRanks; ++i) {
@@ -175,8 +175,7 @@ __forceinline__ __device__ void nccl_gin_barrier_wo_local_sync(
 
     for (int src_team_rank = thread_idx; src_team_rank < kNumTeamRanks;
          src_team_rank += kNumThreads) {
-        const uint64_t target =
-            gin.gin_barrier_advance_shadow(src_team_rank);
+        const uint64_t target = gin.gin_barrier_advance_shadow(src_team_rank);
         timeout_while<kNumTimeoutCycles>([=](const bool& is_last_check) {
             const uint64_t observed =
                 gin.gin_barrier_read_signal(src_team_rank);
@@ -256,10 +255,10 @@ __forceinline__ __device__ void gpu_barrier(
                 kNumThreads, kNumTimeoutCycles, kTag>(
                 gin, workspace, scaleup_rank_idx, sm_idx, thread_idx);
         } else if (do_scaleout && !do_scaleup) {
-            nccl_gin_barrier_wo_local_sync<
-                transport::ScaleoutTeam, kNumScaleoutRanks, kNumThreads,
-                kNumTimeoutCycles, kTag>(gin, workspace, scaleout_rank_idx,
-                                         sm_idx, thread_idx);
+            nccl_gin_barrier_wo_local_sync<transport::ScaleoutTeam,
+                                           kNumScaleoutRanks, kNumThreads,
+                                           kNumTimeoutCycles, kTag>(
+                gin, workspace, scaleout_rank_idx, sm_idx, thread_idx);
         } else if (do_scaleup && do_scaleout) {
             if constexpr (kNumSMs > 1) {
                 // Separate blocks let LSA and GIN progress concurrently. They
@@ -268,10 +267,10 @@ __forceinline__ __device__ void gpu_barrier(
                     Ops, transport::ScaleupTeam, kNumScaleupRanks, kNumSMs,
                     kNumThreads, kNumTimeoutCycles, kTag>(
                     gin, workspace, scaleup_rank_idx, sm_idx, thread_idx);
-                nccl_gin_barrier_wo_local_sync<
-                    transport::ScaleoutTeam, kNumScaleoutRanks, kNumThreads,
-                    kNumTimeoutCycles, kTag>(gin, workspace, scaleout_rank_idx,
-                                             sm_idx - 1, thread_idx);
+                nccl_gin_barrier_wo_local_sync<transport::ScaleoutTeam,
+                                               kNumScaleoutRanks, kNumThreads,
+                                               kNumTimeoutCycles, kTag>(
+                    gin, workspace, scaleout_rank_idx, sm_idx - 1, thread_idx);
             } else {
                 // A one-block launch cannot overlap teams safely. Complete LSA
                 // first and then the GIN rail barrier.
@@ -279,10 +278,10 @@ __forceinline__ __device__ void gpu_barrier(
                                                kNumScaleupRanks, 1, kNumThreads,
                                                kNumTimeoutCycles, kTag>(
                     gin, workspace, scaleup_rank_idx, 0, thread_idx);
-                nccl_gin_barrier_wo_local_sync<
-                    transport::ScaleoutTeam, kNumScaleoutRanks, kNumThreads,
-                    kNumTimeoutCycles, kTag>(gin, workspace, scaleout_rank_idx,
-                                             0, thread_idx);
+                nccl_gin_barrier_wo_local_sync<transport::ScaleoutTeam,
+                                               kNumScaleoutRanks, kNumThreads,
+                                               kNumTimeoutCycles, kTag>(
+                    gin, workspace, scaleout_rank_idx, 0, thread_idx);
             }
         }
     } else

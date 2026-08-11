@@ -82,8 +82,7 @@ bool validGinConnectionType(NcclGinConnectionType type) {
            type == NcclGinConnectionType::kRail;
 }
 
-ncclGinConnectionType_t toNativeGinConnectionType(
-    NcclGinConnectionType type) {
+ncclGinConnectionType_t toNativeGinConnectionType(NcclGinConnectionType type) {
     switch (type) {
         case NcclGinConnectionType::kFull:
             return NCCL_GIN_CONNECTION_FULL;
@@ -256,9 +255,8 @@ class NcclDeviceTransportImpl final : public NcclTransport {
         }
 
         const bool local_dev_comm_valid =
-            reportNcclError(
-                ncclDevCommCreate(comm_, &requirements, &dev_comm_),
-                "ncclDevCommCreate") == 0;
+            reportNcclError(ncclDevCommCreate(comm_, &requirements, &dev_comm_),
+                            "ncclDevCommCreate") == 0;
         if (!collectiveAllSucceeded(local_dev_comm_valid)) {
             LOG(ERROR) << "[Device NCCL] device communicator creation failed "
                           "on one or more ranks";
@@ -317,12 +315,11 @@ class NcclDeviceTransportImpl final : public NcclTransport {
         lsa_topology_.first_rank = dev_comm_.rank - dev_comm_.lsaRank;
         properties_.lsa_barrier_count = config.lsa_barrier_count;
         properties_.gin_enabled = config.enable_gin;
-        properties_.gin_connection_type =
-            config.enable_gin ? config.gin_connection_type
-                              : NcclGinConnectionType::kNone;
-        properties_.gin_backend =
-            toGinBackend(config.enable_gin ? selected_gin_type
-                                           : NCCL_GIN_TYPE_NONE);
+        properties_.gin_connection_type = config.enable_gin
+                                              ? config.gin_connection_type
+                                              : NcclGinConnectionType::kNone;
+        properties_.gin_backend = toGinBackend(
+            config.enable_gin ? selected_gin_type : NCCL_GIN_TYPE_NONE);
         properties_.gin_connection_count = dev_comm_.ginConnectionCount;
         properties_.gin_context_count =
             static_cast<int>(dev_comm_.ginContextCount);
@@ -502,9 +499,9 @@ class NcclDeviceTransportImpl final : public NcclTransport {
         context.native_comm_ = device_comm_;
         static_assert(sizeof(dev_comm_) == NcclDeviceContext::kNativeCommBytes,
                       "Update embedded NCCL device communicator storage");
-        static_assert(alignof(ncclDevComm_t) <=
-                          NcclDeviceContext::kNativeCommAlignment,
-                      "Update embedded NCCL device communicator alignment");
+        static_assert(
+            alignof(ncclDevComm_t) <= NcclDeviceContext::kNativeCommAlignment,
+            "Update embedded NCCL device communicator alignment");
         std::memcpy(context.native_comm_storage_, &dev_comm_,
                     sizeof(dev_comm_));
         context.native_window_ = it->second.window;

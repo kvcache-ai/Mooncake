@@ -319,8 +319,7 @@ struct NcclOps {
     using Context = NcclContext;
     static constexpr bool kIsNccl = true;
     static constexpr int kNumQPs = 65;
-    static constexpr int kAggregateRequests =
-        ncclGinOptFlagsAggregateRequests;
+    static constexpr int kAggregateRequests = ncclGinOptFlagsAggregateRequests;
     static constexpr int kNumDispatchWarps = 27;
     static constexpr int kNumDispatchEpilogueWarps = 27;
     static constexpr int kNumCombineWarps = 28;
@@ -330,14 +329,17 @@ struct NcclOps {
     static constexpr int kNumHybridScaleupWarps = 8;
 
     // Keep this adapter compact: it is captured by several kernel lambdas.
-    // Team/rank/window state already lives in the pre-bound handle, so retaining
-    // a second NcclContext here would create per-thread local-memory spills.
+    // Team/rank/window state already lives in the pre-bound handle, so
+    // retaining a second NcclContext here would create per-thread local-memory
+    // spills.
     device::NcclGinHandle gin;
 
-    __device__ __forceinline__ NcclOps(
-        const Context& ctx, int qp_idx, int sharing_mode, int /*num_qps*/,
-        int /*scaleout_rank_idx*/ = 0, int /*scaleup_rank_idx*/ = 0,
-        int /*num_scaleup_ranks*/ = 0, int /*num_ranks*/ = 1)
+    __device__ __forceinline__ NcclOps(const Context& ctx, int qp_idx,
+                                       int sharing_mode, int /*num_qps*/,
+                                       int /*scaleout_rank_idx*/ = 0,
+                                       int /*scaleup_rank_idx*/ = 0,
+                                       int /*num_scaleup_ranks*/ = 0,
+                                       int /*num_ranks*/ = 1)
         : gin(ctx.device, static_cast<unsigned int>(qp_idx),
               sharing_mode == 0 ? device::NcclGinResourceSharing::kCta
                                 : device::NcclGinResourceSharing::kGpu) {}
@@ -359,8 +361,8 @@ struct NcclOps {
     }
 
     template <typename team_t, typename ptr_t>
-    __device__ __forceinline__ ptr_t* get_sym_ptr_impl(
-        ptr_t* ptr, int dst_rank) const {
+    __device__ __forceinline__ ptr_t* get_sym_ptr_impl(ptr_t* ptr,
+                                                       int dst_rank) const {
         if constexpr (std::is_same_v<team_t, ScaleupTeam>) {
             return static_cast<ptr_t*>(gin.lsaPeerPointer(dst_rank, ptr));
         } else if constexpr (std::is_same_v<team_t, ScaleoutTeam>) {
@@ -389,8 +391,8 @@ struct NcclOps {
                                         int num_bytes, int dst_rank,
                                         int flags = 0) const {
         if constexpr (std::is_same_v<team_t, ScaleupTeam>) {
-            auto* routed = static_cast<uint8_t*>(
-                get_sym_ptr<team_t>(dst_ptr, dst_rank));
+            auto* routed =
+                static_cast<uint8_t*>(get_sym_ptr<team_t>(dst_ptr, dst_rank));
             const auto src_addr = reinterpret_cast<uintptr_t>(src_ptr);
             const auto dst_addr = reinterpret_cast<uintptr_t>(routed);
             if (((src_addr | dst_addr | static_cast<uintptr_t>(num_bytes)) &
@@ -525,13 +527,13 @@ struct NcclOps {
         }
     }
 
-    __device__ __forceinline__ uint64_t gin_barrier_advance_shadow(
-        int signal_id) const {
+    __device__ __forceinline__ uint64_t
+    gin_barrier_advance_shadow(int signal_id) const {
         return gin.advanceSignalShadowContext0(signal_id);
     }
 
-    __device__ __forceinline__ uint64_t gin_barrier_read_signal(
-        int signal_id) const {
+    __device__ __forceinline__ uint64_t
+    gin_barrier_read_signal(int signal_id) const {
         return gin.readSignalContext0(signal_id);
     }
 
@@ -539,9 +541,8 @@ struct NcclOps {
 
     __device__ __forceinline__ void flush() const {
         const int warps_per_block = static_cast<int>(blockDim.x) / warpSize;
-        const int global_warp =
-            static_cast<int>(blockIdx.x) * warps_per_block +
-            static_cast<int>(threadIdx.x) / warpSize;
+        const int global_warp = static_cast<int>(blockIdx.x) * warps_per_block +
+                                static_cast<int>(threadIdx.x) / warpSize;
         const int num_warps = static_cast<int>(gridDim.x) * warps_per_block;
         for (int context_idx = global_warp; context_idx < gin.contextCount();
              context_idx += num_warps) {

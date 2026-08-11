@@ -118,7 +118,7 @@ __global__ void __launch_bounds__(kNumThreads, 1)
     // setmaxnreg is rejected by the SM90 build used in Mooncake validation,
     // but it materially improves the producer/forwarder split on Blackwell.
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000 && \
-    (defined(__CUDA_ARCH_SPECIFIC__) || \
+    (defined(__CUDA_ARCH_SPECIFIC__) ||                \
      defined(__CUDA_ARCH_FAMILY_SPECIFIC__))
     constexpr bool kAdjustRegisters =
         (kNumChannelsPerSM == 4 || kNumChannelsPerSM == 8) &&
@@ -477,9 +477,8 @@ __global__ void __launch_bounds__(kNumThreads, 1)
                         last_recv_token_buffer_ptr, last_send_token_buffer_ptr,
                         token_layout.get_num_bytes<false>(),
                         last_src_scaleout_rank_idx,
-                        last_is_token_last_in_chunk
-                            ? 0
-                            : Ops::kAggregateRequests);
+                        last_is_token_last_in_chunk ? 0
+                                                    : Ops::kAggregateRequests);
                 }
             }
             __syncwarp();
@@ -820,7 +819,6 @@ __global__ void __launch_bounds__(kNumThreads, 1)
         }
         __syncwarp();
     }
-
 }
 
 }  // namespace mooncake::elastic

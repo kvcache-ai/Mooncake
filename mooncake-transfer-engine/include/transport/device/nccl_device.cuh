@@ -58,12 +58,12 @@ namespace detail {
 struct NcclDeviceContextAccess {
     __device__ __forceinline__ static const ncclDevComm_t& comm(
         const NcclDeviceContext& ctx) {
-        static_assert(sizeof(ncclDevComm_t) ==
-                          NcclDeviceContext::kNativeCommBytes,
-                      "Update NcclDeviceContext storage for this NCCL version");
-        static_assert(alignof(ncclDevComm_t) <=
-                          NcclDeviceContext::kNativeCommAlignment,
-                      "Increase NcclDeviceContext communicator alignment");
+        static_assert(
+            sizeof(ncclDevComm_t) == NcclDeviceContext::kNativeCommBytes,
+            "Update NcclDeviceContext storage for this NCCL version");
+        static_assert(
+            alignof(ncclDevComm_t) <= NcclDeviceContext::kNativeCommAlignment,
+            "Increase NcclDeviceContext communicator alignment");
         return *reinterpret_cast<const ncclDevComm_t*>(
             ctx.native_comm_storage_);
     }
@@ -117,8 +117,8 @@ __device__ __forceinline__ int mc_nccl_gin_context(const NcclDeviceContext& ctx,
 }
 
 template <NcclGinTeam Team>
-__device__ __forceinline__ ncclTeam mc_nccl_gin_team(
-    const ncclDevComm_t& comm) {
+__device__ __forceinline__ ncclTeam
+mc_nccl_gin_team(const ncclDevComm_t& comm) {
     if constexpr (Team == NcclGinTeam::kRail) {
         return ncclTeamRail(comm);
     } else {
@@ -162,9 +162,9 @@ using NcclStrongVaSignalAdd = ncclGin_VASignalAdd;
 // selected NCCL cooperative operation.
 class NcclGinHandle {
    public:
-    __device__ __forceinline__ NcclGinHandle(
-        const NcclDeviceContext& ctx, unsigned int channel,
-        NcclGinResourceSharing sharing = NcclGinResourceSharing::kGpu)
+    __device__ __forceinline__
+    NcclGinHandle(const NcclDeviceContext& ctx, unsigned int channel,
+                  NcclGinResourceSharing sharing = NcclGinResourceSharing::kGpu)
         : comm_(detail::NcclDeviceContextAccess::comm(ctx)),
           gin_(comm_, detail::mc_nccl_gin_context(ctx, channel),
                detail::mc_nccl_gin_sharing_mode(sharing)),
@@ -180,9 +180,7 @@ class NcclGinHandle {
 
     __device__ __forceinline__ int lsaRank() const { return team_lsa_.rank; }
 
-    __device__ __forceinline__ int railRank() const {
-        return team_rail_.rank;
-    }
+    __device__ __forceinline__ int railRank() const { return team_rail_.rank; }
 
     __device__ __forceinline__ bool worldRankInLsa(int peer) const {
         const int first = team_rail_.rank * team_lsa_.nRanks;
@@ -194,18 +192,17 @@ class NcclGinHandle {
     }
 
     __device__ __forceinline__ size_t pointerOffset(const void* ptr) const {
-        return static_cast<size_t>(static_cast<const char*>(ptr) -
-                                   local_base_);
+        return static_cast<size_t>(static_cast<const char*>(ptr) - local_base_);
     }
 
-    __device__ __forceinline__ void* worldPeerPointer(
-        int peer, const void* ptr) const {
+    __device__ __forceinline__ void* worldPeerPointer(int peer,
+                                                      const void* ptr) const {
         if (peer == team_world_.rank) return const_cast<void*>(ptr);
         return ncclGetPeerPointer(window_, pointerOffset(ptr), peer);
     }
 
-    __device__ __forceinline__ void* lsaPeerPointer(
-        int peer, const void* ptr) const {
+    __device__ __forceinline__ void* lsaPeerPointer(int peer,
+                                                    const void* ptr) const {
         if (peer == team_lsa_.rank) return const_cast<void*>(ptr);
         return ncclGetLsaPointer(window_, pointerOffset(ptr), peer);
     }
@@ -225,15 +222,14 @@ class NcclGinHandle {
     __device__ __forceinline__ void putValue(
         int dst_rank, T* recv_ptr, T value,
         uint32_t opt_flags = ncclGinOptFlagsDefault) const {
-        static_assert(std::is_scalar<T>::value &&
-                          std::is_trivially_copyable<T>::value,
-                      "NcclGinHandle::putValue requires a scalar");
+        static_assert(
+            std::is_scalar<T>::value && std::is_trivially_copyable<T>::value,
+            "NcclGinHandle::putValue requires a scalar");
         static_assert(sizeof(T) == 1 || sizeof(T) == 2 || sizeof(T) == 4 ||
                           sizeof(T) == 8,
                       "NcclGinHandle::putValue supports 1, 2, 4, or 8 bytes");
-        gin_.putValue(team<Team>(), dst_rank, window_,
-                      pointerOffset(recv_ptr), value, ncclGin_None{},
-                      ncclCoopThread{}, ncclGin_None{},
+        gin_.putValue(team<Team>(), dst_rank, window_, pointerOffset(recv_ptr),
+                      value, ncclGin_None{}, ncclCoopThread{}, ncclGin_None{},
                       cuda::thread_scope_thread, cuda::thread_scope_device,
                       opt_flags);
     }
@@ -252,8 +248,8 @@ class NcclGinHandle {
         gin_.resetSignal(window_, pointerOffset(signal_ptr));
     }
 
-    __device__ __forceinline__ uint64_t readSignal(
-        const uint64_t* signal_ptr) const {
+    __device__ __forceinline__ uint64_t
+    readSignal(const uint64_t* signal_ptr) const {
         return gin_.readSignal(window_, pointerOffset(signal_ptr));
     }
 
@@ -268,23 +264,22 @@ class NcclGinHandle {
 
     template <NcclGinTeam Team>
     __device__ __forceinline__ void signalIncContext0(int dst_rank,
-                                                       int signal_id) const {
+                                                      int signal_id) const {
         ncclGin(comm_, 0, NCCL_GIN_RESOURCE_SHARING_CTA)
             .signal(team<Team>(), dst_rank,
-                    ncclGin_SignalInc{
-                        static_cast<ncclGinSignal_t>(signal_id)},
+                    ncclGin_SignalInc{static_cast<ncclGinSignal_t>(signal_id)},
                     ncclCoopThread{});
     }
 
-    __device__ __forceinline__ uint64_t advanceSignalShadowContext0(
-        int signal_id) const {
+    __device__ __forceinline__ uint64_t
+    advanceSignalShadowContext0(int signal_id) const {
         ncclGin barrier(comm_, 0, NCCL_GIN_RESOURCE_SHARING_CTA);
         return ++(*barrier.getSignalShadowPtr(
             static_cast<ncclGinSignal_t>(signal_id)));
     }
 
-    __device__ __forceinline__ uint64_t readSignalContext0(
-        int signal_id) const {
+    __device__ __forceinline__ uint64_t
+    readSignalContext0(int signal_id) const {
         return ncclGin(comm_, 0, NCCL_GIN_RESOURCE_SHARING_CTA)
             .readSignal(static_cast<ncclGinSignal_t>(signal_id));
     }
@@ -399,10 +394,10 @@ __device__ __forceinline__ void mc_nccl_put_team(
     const size_t dst_offset = detail::mc_nccl_pointer_offset(ctx, recv_ptr);
     const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
     const auto window = detail::NcclDeviceContextAccess::window(ctx);
-    ncclGin gin{comm,
-                detail::mc_nccl_gin_context(
-                    ctx, static_cast<unsigned int>(channel)),
-                detail::mc_nccl_gin_sharing_mode(sharing)};
+    ncclGin gin{
+        comm,
+        detail::mc_nccl_gin_context(ctx, static_cast<unsigned int>(channel)),
+        detail::mc_nccl_gin_sharing_mode(sharing)};
     gin.put(detail::mc_nccl_gin_team<Team>(comm), dst_rank, window, dst_offset,
             window, src_offset, nbytes, ncclGin_None{}, ncclGin_None{},
             ncclCoopThread{}, ncclGin_None{}, cuda::thread_scope_thread,
@@ -476,10 +471,10 @@ __device__ __forceinline__ void mc_nccl_put_value_team(
     const size_t dst_offset = detail::mc_nccl_pointer_offset(ctx, recv_ptr);
     const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
     const auto window = detail::NcclDeviceContextAccess::window(ctx);
-    ncclGin gin{comm,
-                detail::mc_nccl_gin_context(
-                    ctx, static_cast<unsigned int>(channel)),
-                detail::mc_nccl_gin_sharing_mode(sharing)};
+    ncclGin gin{
+        comm,
+        detail::mc_nccl_gin_context(ctx, static_cast<unsigned int>(channel)),
+        detail::mc_nccl_gin_sharing_mode(sharing)};
     gin.putValue(detail::mc_nccl_gin_team<Team>(comm), dst_rank, window,
                  dst_offset, value, ncclGin_None{}, ncclCoopThread{},
                  ncclGin_None{}, cuda::thread_scope_thread,
@@ -527,10 +522,10 @@ __device__ __forceinline__ void mc_nccl_gin_signal_add_team(
         detail::mc_nccl_pointer_offset(ctx, signal_ptr);
     const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
     const auto window = detail::NcclDeviceContextAccess::window(ctx);
-    ncclGin gin{comm,
-                detail::mc_nccl_gin_context(
-                    ctx, static_cast<unsigned int>(channel)),
-                detail::mc_nccl_gin_sharing_mode(sharing)};
+    ncclGin gin{
+        comm,
+        detail::mc_nccl_gin_context(ctx, static_cast<unsigned int>(channel)),
+        detail::mc_nccl_gin_sharing_mode(sharing)};
     gin.signal(detail::mc_nccl_gin_team<Team>(comm), dst_rank,
                detail::NcclStrongVaSignalAdd{window, signal_offset, value},
                ncclCoopThread{});
@@ -548,10 +543,10 @@ __device__ __forceinline__ void mc_nccl_gin_signal_inc_team(
     if (lane_id != 0) return;
 
     const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
-    ncclGin gin{comm,
-                detail::mc_nccl_gin_context(
-                    ctx, static_cast<unsigned int>(channel)),
-                detail::mc_nccl_gin_sharing_mode(sharing)};
+    ncclGin gin{
+        comm,
+        detail::mc_nccl_gin_context(ctx, static_cast<unsigned int>(channel)),
+        detail::mc_nccl_gin_sharing_mode(sharing)};
     gin.signal(detail::mc_nccl_gin_team<Team>(comm), dst_rank,
                ncclGin_SignalInc{static_cast<ncclGinSignal_t>(signal_id)},
                ncclCoopThread{});
@@ -563,22 +558,21 @@ __device__ __forceinline__ uint64_t mc_nccl_gin_advance_signal_shadow(
     const NcclDeviceContext& ctx, int channel, int signal_id,
     NcclGinResourceSharing sharing = NcclGinResourceSharing::kGpu) {
     const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
-    ncclGin gin{comm,
-                detail::mc_nccl_gin_context(
-                    ctx, static_cast<unsigned int>(channel)),
-                detail::mc_nccl_gin_sharing_mode(sharing)};
-    return ++(*gin.getSignalShadowPtr(
-        static_cast<ncclGinSignal_t>(signal_id)));
+    ncclGin gin{
+        comm,
+        detail::mc_nccl_gin_context(ctx, static_cast<unsigned int>(channel)),
+        detail::mc_nccl_gin_sharing_mode(sharing)};
+    return ++(*gin.getSignalShadowPtr(static_cast<ncclGinSignal_t>(signal_id)));
 }
 
 __device__ __forceinline__ uint64_t mc_nccl_gin_read_signal_id(
     const NcclDeviceContext& ctx, int channel, int signal_id,
     NcclGinResourceSharing sharing = NcclGinResourceSharing::kGpu) {
     const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
-    ncclGin gin{comm,
-                detail::mc_nccl_gin_context(
-                    ctx, static_cast<unsigned int>(channel)),
-                detail::mc_nccl_gin_sharing_mode(sharing)};
+    ncclGin gin{
+        comm,
+        detail::mc_nccl_gin_context(ctx, static_cast<unsigned int>(channel)),
+        detail::mc_nccl_gin_sharing_mode(sharing)};
     return gin.readSignal(static_cast<ncclGinSignal_t>(signal_id));
 }
 
@@ -611,10 +605,10 @@ __device__ __forceinline__ void mc_nccl_gin_reset_signal(
         detail::mc_nccl_pointer_offset(ctx, signal_ptr);
     const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
     const auto window = detail::NcclDeviceContextAccess::window(ctx);
-    ncclGin gin{comm,
-                detail::mc_nccl_gin_context(
-                    ctx, static_cast<unsigned int>(channel)),
-                detail::mc_nccl_gin_sharing_mode(sharing)};
+    ncclGin gin{
+        comm,
+        detail::mc_nccl_gin_context(ctx, static_cast<unsigned int>(channel)),
+        detail::mc_nccl_gin_sharing_mode(sharing)};
     gin.resetSignal(window, signal_offset);
 }
 
@@ -655,10 +649,10 @@ __device__ __forceinline__ void mc_nccl_flush(
     NcclGinResourceSharing sharing = NcclGinResourceSharing::kGpu) {
     if (lane_id != 0) return;
     const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
-    ncclGin gin{comm,
-                detail::mc_nccl_gin_context(
-                    ctx, static_cast<unsigned int>(channel)),
-                detail::mc_nccl_gin_sharing_mode(sharing)};
+    ncclGin gin{
+        comm,
+        detail::mc_nccl_gin_context(ctx, static_cast<unsigned int>(channel)),
+        detail::mc_nccl_gin_sharing_mode(sharing)};
     gin.flush(ncclCoopThread{});
 }
 
@@ -666,10 +660,10 @@ __device__ __forceinline__ void mc_nccl_flush_warp(
     const NcclDeviceContext& ctx, int channel,
     NcclGinResourceSharing sharing = NcclGinResourceSharing::kCta) {
     const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
-    ncclGin gin{comm,
-                detail::mc_nccl_gin_context(
-                    ctx, static_cast<unsigned int>(channel)),
-                detail::mc_nccl_gin_sharing_mode(sharing)};
+    ncclGin gin{
+        comm,
+        detail::mc_nccl_gin_context(ctx, static_cast<unsigned int>(channel)),
+        detail::mc_nccl_gin_sharing_mode(sharing)};
     gin.flush(ncclCoopWarp{});
 }
 
@@ -683,10 +677,10 @@ __device__ __forceinline__ uint64_t mc_nccl_gin_read_signal(
     const size_t signal_offset =
         detail::mc_nccl_pointer_offset(ctx, signal_ptr);
     const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
-    ncclGin gin{comm,
-                detail::mc_nccl_gin_context(
-                    ctx, static_cast<unsigned int>(channel)),
-                detail::mc_nccl_gin_sharing_mode(sharing)};
+    ncclGin gin{
+        comm,
+        detail::mc_nccl_gin_context(ctx, static_cast<unsigned int>(channel)),
+        detail::mc_nccl_gin_sharing_mode(sharing)};
     return gin.readSignal(detail::NcclDeviceContextAccess::window(ctx),
                           signal_offset);
 }
@@ -714,10 +708,10 @@ __device__ __forceinline__ void mc_nccl_gin_wait_signal(
     const size_t signal_offset =
         detail::mc_nccl_pointer_offset(ctx, signal_ptr);
     const auto& comm = detail::NcclDeviceContextAccess::comm(ctx);
-    ncclGin gin{comm,
-                detail::mc_nccl_gin_context(
-                    ctx, static_cast<unsigned int>(channel)),
-                detail::mc_nccl_gin_sharing_mode(sharing)};
+    ncclGin gin{
+        comm,
+        detail::mc_nccl_gin_context(ctx, static_cast<unsigned int>(channel)),
+        detail::mc_nccl_gin_sharing_mode(sharing)};
     gin.waitSignal(ncclCoopThread{},
                    detail::NcclDeviceContextAccess::window(ctx), signal_offset,
                    least);
