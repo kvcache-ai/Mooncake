@@ -70,6 +70,22 @@ add_test(NAME rdma_endpoint_reestablish_test
          COMMAND rdma_endpoint_reestablish_test)
 set_tests_properties(rdma_endpoint_reestablish_test PROPERTIES LABELS "rdma")
 
+# Regression test for the edge-triggered async event fd: one epoll wakeup must
+# drain the whole queue. Wraps ibv_get_async_event to script the event source,
+# so it needs no RDMA device. -Wl,--wrap is a GNU ld / lld feature that Apple's
+# linker lacks, and the test is meaningless without it, so skip the target there
+# rather than build one that calls the real symbols.
+if(UNIX AND NOT APPLE)
+  add_executable(rdma_async_event_drain_test
+                 ${WORKSPACE}/rdma_async_event_drain_test.cpp)
+  target_link_libraries(rdma_async_event_drain_test PUBLIC transfer_engine
+                                                           gtest gtest_main)
+  target_link_options(
+    rdma_async_event_drain_test PRIVATE "-Wl,--wrap=ibv_get_async_event"
+    "-Wl,--wrap=ibv_ack_async_event")
+  add_test(NAME rdma_async_event_drain_test COMMAND rdma_async_event_drain_test)
+endif()
+
 if(USE_CXL)
   add_executable(cxl_transport_test ${WORKSPACE}/cxl_transport_test.cpp)
   target_link_libraries(cxl_transport_test PUBLIC transfer_engine gtest
@@ -97,6 +113,8 @@ if(USE_TCP)
 
   add_executable(tcp_write_visibility_test
                  ${WORKSPACE}/tcp_write_visibility_test.cpp)
+  target_compile_definitions(tcp_write_visibility_test
+                             PRIVATE MOONCAKE_TCP_TRANSPORT_TEST_HOOKS)
   target_link_libraries(tcp_write_visibility_test PUBLIC transfer_engine gtest
                                                          gtest_main)
   add_test(NAME tcp_write_visibility_test COMMAND tcp_write_visibility_test)
@@ -343,8 +361,7 @@ if(ENABLE_MULTI_PROTOCOL)
 endif()
 
 add_executable(graceful_shutdown_test ${WORKSPACE}/graceful_shutdown_test.cpp)
-target_link_libraries(graceful_shutdown_test PUBLIC transfer_engine gtest
-                                                    gtest_main)
+target_link_libraries(graceful_shutdown_test PUBLIC transfer_engine gtest)
 add_test(NAME graceful_shutdown_test COMMAND graceful_shutdown_test)
 
 add_executable(show_links_test ${WORKSPACE}/show_links_test.cpp)

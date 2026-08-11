@@ -15,6 +15,10 @@ from pg_test_utils import (
     require_test_device,
     wait_until,
 )
+from transfer_fault_injection import (
+    TransferFault,
+    preload_transfer_fault,
+)
 
 
 BROKEN_RANK = 1
@@ -663,7 +667,6 @@ def _fault_detection_worker(
 ) -> None:
     """Worker for testing fault detection - survivors can continue without broken rank."""
     device = ctx.init_group()
-    backend = ctx.get_backend()
 
     # Step 1: All ranks participate in first collective
     tensor = torch.tensor([ctx.rank], dtype=torch.int32, device=device)
@@ -774,6 +777,250 @@ def _replacement_recovery_worker(
         dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
 
         ctx.record_result({"role": "replacement"})
+
+
+def _run_p2p_ping_pong(
+    ctx: MooncakePGWorkerContext,
+    device: torch.device,
+    logical_rank: int,
+) -> None:
+    """Exchange one message in each direction between two logical ranks."""
+    if ctx.world_size != 2:
+        raise AssertionError("recovery P2P test expects exactly two ranks")
+
+    peer = 1 - logical_rank
+    send_tensor = torch.tensor(
+        [logical_rank], dtype=torch.int64, device=device
+    )
+    recv_tensor = torch.empty_like(send_tensor)
+    works = dist.batch_isend_irecv(
+        [
+            dist.P2POp(op=dist.isend, tensor=send_tensor, peer=peer),
+            dist.P2POp(op=dist.irecv, tensor=recv_tensor, peer=peer),
+        ]
+    )
+    for work in works:
+        work.wait()
+
+    if not all(pg.get_local_success(work) for work in works):
+        raise AssertionError(
+            f"rank {logical_rank}: P2P with rank {peer} failed"
+        )
+    received = int(recv_tensor.cpu().item())
+    if received != peer:
+        raise AssertionError(
+            f"rank {logical_rank}: expected {peer}, received {received}"
+        )
+
+
+def _recovery_p2p_worker(
+    ctx: MooncakePGWorkerContext,
+    broken_exited: mp.Event,
+    start_recovery: mp.Event,
+    graceful_group_destroy: bool,
+) -> None:
+    """Replace logical rank 1, then repeat its P2P exchange with rank 0."""
+    logical_rank = ctx.rank if ctx.proc_rank < ctx.world_size else BROKEN_RANK
+
+    if ctx.proc_rank < ctx.world_size:
+        device = ctx.init_group(rank=logical_rank)
+        backend = ctx.get_backend()
+        _run_p2p_ping_pong(ctx, device, logical_rank)
+
+        if logical_rank == BROKEN_RANK:
+            if graceful_group_destroy:
+                resp = pg.deactivate_ranks(backend, [logical_rank])
+                assert resp.status == pg.ProposalStatus.Applied, \
+                    "graceful self-deactivation should apply, " \
+                    f"got {resp.status}: {resp.reject_reason}"
+
+                dist.destroy_process_group()
+                ctx.record_result({"role": "gracefully_removed"})
+                return
+
+            ctx.record_result({"role": "broken"})
+            broken_exited.set()
+            os._exit(0)
+
+        if not broken_exited.wait(timeout=120.0):
+            raise TimeoutError("timed out waiting for departed rank")
+
+        if not graceful_group_destroy:
+            probe = torch.tensor([logical_rank], device=device)
+            work = dist.isend(probe, dst=BROKEN_RANK)
+            work.wait()
+            if pg.get_local_success(work):
+                raise AssertionError(
+                    "P2P probe to the departed rank unexpectedly succeeded"
+                )
+
+        active_ranks = pg.get_active_ranks(backend).cpu().tolist()
+        assert active_ranks == [1, 0], (
+            "new group view should be applied before p2p completes, "
+            f"got active_ranks={active_ranks}"
+        )
+
+        start_recovery.set()
+
+        wait_until(
+            lambda: pg.get_peer_state(backend, [BROKEN_RANK])[0],
+            timeout_s=30.0,
+            poll_interval_s=0.05,
+            description=f"rank {logical_rank} waiting for replacement",
+        )
+        resp = pg.recover_ranks(backend, [BROKEN_RANK])
+        assert resp.status == pg.ProposalStatus.Applied, \
+            f"rank {logical_rank}: recover_ranks should apply, got {resp.status}"
+
+        role = "survivor"
+    else:
+        if not start_recovery.wait(timeout=60.0):
+            raise TimeoutError("timed out waiting to start replacement")
+
+        device = ctx.init_group(rank=logical_rank, is_extension=True)
+        backend = ctx.get_backend()
+        pg.join_group(backend)
+        role = "replacement"
+
+    _run_p2p_ping_pong(ctx, device, logical_rank)
+    ctx.record_result({"role": role})
+
+
+def _run_rejoin_operation(
+    ctx: MooncakePGWorkerContext,
+    device: torch.device,
+    operation: str,
+    *,
+    verify: bool,
+):
+    if operation == "collective":
+        tensor = torch.tensor(
+            [ctx.rank + 1], dtype=torch.int32, device=device
+        )
+        works = [
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM, async_op=True)
+        ]
+        for work in works:
+            work.wait()
+
+        if verify:
+            if not pg.get_local_success(works[0]):
+                raise AssertionError("collective failed locally")
+            expected = ctx.world_size * (ctx.world_size + 1) // 2
+            actual = int(tensor.cpu().item())
+            if actual != expected:
+                raise AssertionError(
+                    f"collective expected {expected}, got {actual}"
+                )
+        return works
+
+    if operation == "p2p":
+        peer = 1 - ctx.rank
+        send_tensor = torch.tensor(
+            [ctx.rank], dtype=torch.int64, device=device
+        )
+        recv_tensor = torch.empty_like(send_tensor)
+        works = dist.batch_isend_irecv(
+            [
+                dist.P2POp(op=dist.isend, tensor=send_tensor, peer=peer),
+                dist.P2POp(op=dist.irecv, tensor=recv_tensor, peer=peer),
+            ]
+        )
+        for work in works:
+            work.wait()
+
+        if verify:
+            if not all(pg.get_local_success(work) for work in works):
+                raise AssertionError(f"P2P with rank {peer} failed locally")
+            actual = int(recv_tensor.cpu().item())
+            if actual != peer:
+                raise AssertionError(f"expected {peer}, received {actual}")
+        return works
+
+    raise ValueError(f"unsupported in-place rejoin operation: {operation}")
+
+
+def _run_fault_round(
+    ctx: MooncakePGWorkerContext,
+    device: torch.device,
+    backend,
+    operation: str,
+    fault_library: str,
+    fault_started: mp.Event,
+) -> None:
+    fault = TransferFault(fault_library, local_rank=ctx.rank)
+    with fault.failing_link(BROKEN_RANK, 0):
+        if ctx.rank != BROKEN_RANK:
+            if not fault_started.wait(timeout=30.0):
+                raise TimeoutError("timed out waiting for fault injection")
+            _run_rejoin_operation(ctx, device, operation, verify=False)
+            return
+
+        fault_started.set()
+        works = _run_rejoin_operation(
+            ctx, device, operation, verify=False
+        )
+
+        if all(pg.get_local_success(work) for work in works):
+            raise AssertionError(f"injected {operation} unexpectedly succeeded")
+        if fault.injected_count == 0:
+            raise AssertionError("transfer fault was not injected")
+
+        active_ranks = pg.get_active_ranks(backend).cpu().tolist()
+        assert active_ranks == [1, 0], (
+            "auto sync should make the transiently failed rank inactive "
+            f"before {operation} completion, got {active_ranks}"
+        )
+
+
+def _inplace_rejoin_worker(
+    ctx: MooncakePGWorkerContext,
+    operation: str,
+    fault_library: str,
+    fault_started: mp.Event,
+) -> None:
+    """Temporarily fail rank 1's data plane, then rejoin the same process."""
+    if ctx.world_size != 2:
+        raise AssertionError("in-place rejoin test expects exactly two ranks")
+
+    device = ctx.init_group()
+    backend = ctx.get_backend()
+
+    # 1. Establish a healthy baseline on the selected data path.
+    _run_rejoin_operation(ctx, device, operation, verify=True)
+    epoch_before_failure = pg.get_current_epoch(backend)
+
+    # 2. Fail rank 1's data plane. Auto sync must make it inactive.
+    _run_fault_round(
+        ctx, device, backend, operation, fault_library, fault_started
+    )
+
+    # 3. At an application-selected safe point, the failed rank declares
+    # itself ready to rejoin.
+    if ctx.rank == BROKEN_RANK:
+        pg.join_group(backend)
+    else:
+        wait_until(
+            lambda: pg.get_current_epoch(backend) > epoch_before_failure,
+            timeout_s=60.0,
+            poll_interval_s=0.05,
+            description="waiting for the post-failure group view",
+        )
+        wait_until(
+            lambda: pg.get_peer_state(backend, [BROKEN_RANK])[0],
+            timeout_s=30.0,
+            poll_interval_s=0.05,
+            description="waiting for the original rank to become activatable",
+        )
+        response = pg.activate_ranks(backend, [BROKEN_RANK])
+        assert response.status == pg.ProposalStatus.Applied, (
+            "in-place activation should apply, "
+            f"got {response.status}: {response.reject_reason}"
+        )
+
+    # 4. Verify the same communicator can use the same data path again.
+    _run_rejoin_operation(ctx, device, operation, verify=True)
+    ctx.record_result({"operation": operation})
 
 
 def _manual_deactivate_recovery_worker(
@@ -994,6 +1241,61 @@ class _ElasticMixin:
         self.assertEqual(len(survivor_rows), self.world_size - 1)
         self.assertEqual(len(replacement_rows), 1)
         self.assertEqual(len(removed_rows), 1)
+
+    def _run_recovery_p2p(self, graceful_group_destroy: bool) -> None:
+        recovery_world_size = 2
+        spawn_ctx = mp.get_context("spawn")
+        broken_exited = spawn_ctx.Event()
+        start_recovery = spawn_ctx.Event()
+
+        rows = self.spawn_backend_and_collect(
+            _recovery_p2p_worker,
+            broken_exited,
+            start_recovery,
+            graceful_group_destroy,
+            world_size=recovery_world_size,
+            nprocs=recovery_world_size + 1,
+            timeout_s=75.0,
+            process_exit_events=(
+                {BROKEN_RANK: broken_exited}
+                if graceful_group_destroy
+                else None
+            ),
+        )
+
+        self.assert_all_ok(rows)
+
+    def test_recovery_p2p(self) -> None:
+        """P2P remains usable after an abruptly failed rank is replaced."""
+        self._run_recovery_p2p(graceful_group_destroy=False)
+
+    def test_recovery_p2p_after_graceful_group_destroy(self) -> None:
+        """P2P remains usable after a gracefully removed rank is replaced."""
+        self._run_recovery_p2p(graceful_group_destroy=True)
+
+    def _run_inplace_rejoin(self, operation: str) -> None:
+        spawn_ctx = mp.get_context("spawn")
+
+        with preload_transfer_fault() as fault_library:
+            fault_started = spawn_ctx.Event()
+            rows = self.spawn_backend_and_collect(
+                _inplace_rejoin_worker,
+                operation,
+                str(fault_library),
+                fault_started,
+                world_size=2,
+                nprocs=2,
+                timeout_s=75.0,
+            )
+            self.assert_all_ok(rows)
+
+    def test_inplace_rejoin_collective(self) -> None:
+        """Collectives recover when the same live process rejoins."""
+        self._run_inplace_rejoin("collective")
+
+    def test_inplace_rejoin_p2p(self) -> None:
+        """P2P recovers when the same live process rejoins."""
+        self._run_inplace_rejoin("p2p")
 
     def test_extension(self) -> None:
         """Test extension mode allows new ranks to join existing group."""

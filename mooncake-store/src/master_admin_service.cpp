@@ -248,10 +248,12 @@ tl::expected<HttpTenantQuotaPolicyRequest, std::string> ParseQuotaPolicyBody(
 }  // namespace
 
 MasterAdminServer::MasterAdminServer(uint16_t http_port,
-                                     bool enable_metric_reporting)
+                                     bool enable_metric_reporting,
+                                     std::string http_host)
     : http_port_(http_port),
+      http_host_(std::move(http_host)),
       enable_metric_reporting_(enable_metric_reporting),
-      http_server_(4, http_port) {}
+      http_server_(4, http_port, http_host_) {}
 
 MasterAdminServer::~MasterAdminServer() { Stop(); }
 
@@ -264,8 +266,8 @@ bool MasterAdminServer::Start() {
 
     auto ec = http_server_.async_start();
     if (ec.hasResult()) {
-        LOG(ERROR) << "Failed to start master admin server on port "
-                   << http_port_;
+        LOG(ERROR) << "Failed to start master admin server on " << http_host_
+                   << ":" << http_port_ << ": " << ec.value().message();
         return false;
     }
 

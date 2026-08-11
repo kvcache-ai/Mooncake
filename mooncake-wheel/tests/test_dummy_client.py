@@ -2,14 +2,13 @@ import unittest
 import os
 import time
 import threading
-import random
 
 try:
     import torch
 except ImportError:
     torch = None
 
-from mooncake.store import MooncakeDistributedStore
+from mooncake.store import MooncakeDistributedStore, SoftPinAction
 
 # The lease time of the kv object, should be set equal to
 # the master's value.
@@ -372,7 +371,6 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         self.assertGreater(buffer_size, 0)
         buffer_ptr = self.store.alloc_from_mem_pool(buffer_size)
         self.assertNotEqual(buffer_ptr, 0)
-        buffer = (ctypes.c_ubyte * buffer_size).from_address(buffer_ptr)
         self.assertEqual(self.store.register_buffer(buffer_ptr, buffer_size), 0)
         try:
             ctypes.memset(buffer_ptr, 0, buffer_size)
@@ -628,16 +626,16 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         # Test default constructor
         config = ReplicateConfig()
         self.assertEqual(config.replica_num, 1)
-        self.assertEqual(config.with_soft_pin, False)
+        self.assertEqual(config.soft_pin_action, SoftPinAction.PRESERVE)
         self.assertEqual(config.preferred_segment, "")
 
         # Test property assignment
         config.replica_num = 3
-        config.with_soft_pin = True
+        config.soft_pin_action = SoftPinAction.ENABLE
         config.preferred_segment = "node1:12345"
 
         self.assertEqual(config.replica_num, 3)
-        self.assertEqual(config.with_soft_pin, True)
+        self.assertEqual(config.soft_pin_action, SoftPinAction.ENABLE)
         self.assertEqual(config.preferred_segment, "node1:12345")
 
         # Test string representation

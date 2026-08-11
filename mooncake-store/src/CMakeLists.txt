@@ -40,6 +40,7 @@ set(MOONCAKE_STORE_SOURCES
     device/accelerator_registry.cpp
     device/runtime_accelerator.cpp
     device/cuda_like_accelerator_device.cpp
+    device/cuda_ipc_buffer.cpp
     device/hip_accelerator_device.cpp
     device/ascend_accelerator_device.cpp
     device/sunrise_accelerator_device.cpp
@@ -51,13 +52,13 @@ set(MOONCAKE_STORE_SOURCES
     ha/kv/etcd_ha_kv_backend.cpp
     ha/standby_controller.cpp
     ha/snapshot/catalog_backed_snapshot_provider.cpp
+    ha/snapshot/batch_oplog/metadata.cpp
     ha/snapshot/master_snapshot_codec.cpp
     ha/snapshot/object/snapshot_object_store.cpp
     ha/snapshot/object/backends/local/local_file_snapshot_object_store.cpp
     ha/snapshot/object/backends/s3/s3_snapshot_object_store.cpp
     ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store.cpp
     ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store.cpp
-    utils/type_util.cpp
     utils/file_util.cpp
     task_manager.cpp
     local_hot_cache.cpp
@@ -309,7 +310,9 @@ target_link_libraries(
          mooncake_common
          yaml-cpp
          asio_shared
-  PRIVATE transfer_engine)
+         mooncake_common
+         yalantinglibs::yalantinglibs
+  PRIVATE transfer_engine JsonCpp::JsonCpp)
 if(STORE_USE_ETCD)
   add_dependencies(mooncake_store build_etcd_wrapper)
 endif()

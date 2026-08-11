@@ -69,7 +69,7 @@ ErrorCode OpLogBatchStorage::InitDurablePrefix(DurablePrefix& prefix) {
     }
     err = ReadDurablePrefix(prefix);
     if (err == ErrorCode::OK) {
-        return ErrorCode::OK;
+        return ValidateDurablePrefixAtStartup(prefix);
     }
     if (err != ErrorCode::ETCD_KEY_NOT_EXIST) {
         return err;
@@ -104,7 +104,10 @@ ErrorCode OpLogBatchStorage::InitDurablePrefix(DurablePrefix& prefix) {
         return ErrorCode::OK;
     }
     if (err == ErrorCode::ETCD_TRANSACTION_FAIL) {
-        return ReadDurablePrefix(prefix);
+        if ((err = ReadDurablePrefix(prefix)) != ErrorCode::OK) {
+            return err;
+        }
+        return ValidateDurablePrefixAtStartup(prefix);
     }
     return err;
 }
@@ -122,6 +125,51 @@ ErrorCode OpLogBatchStorage::ReadDurablePrefix(DurablePrefix& prefix) {
     std::string reason;
     if (!DecodeDurablePrefix(value, &prefix, &reason)) {
         LOG(ERROR) << "Failed to decode durable prefix: " << reason;
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    return ErrorCode::OK;
+}
+
+ErrorCode OpLogBatchStorage::ValidateDurablePrefixAtStartup(
+    const DurablePrefix& prefix) {
+    if ((prefix.batch_id == 0) != (prefix.last_seq == 0)) {
+        LOG(ERROR) << "Durable prefix has inconsistent zero fields: cluster="
+                   << cluster_id_ << ", batch_id=" << prefix.batch_id
+                   << ", last_seq=" << prefix.last_seq;
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    if (prefix.batch_id == 0) {
+        const auto range = BuildBatchRecordRange(cluster_id_, 0);
+        std::vector<KvPair> batches;
+        ErrorCode err =
+            backend_.Range(range.begin_key, range.end_key, 1, batches);
+        if (err != ErrorCode::OK) {
+            return err;
+        }
+        if (!batches.empty()) {
+            LOG(ERROR) << "Zero durable prefix has batch records: cluster="
+                       << cluster_id_;
+            return ErrorCode::INTERNAL_ERROR;
+        }
+        return ErrorCode::OK;
+    }
+
+    OpLogBatchRecord batch;
+    ErrorCode err = ReadBatch(prefix.batch_id, batch);
+    if (err == ErrorCode::ETCD_KEY_NOT_EXIST) {
+        LOG(ERROR) << "Durable prefix terminal batch is missing: cluster="
+                   << cluster_id_ << ", batch_id=" << prefix.batch_id;
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    if (err != ErrorCode::OK) {
+        return err;
+    }
+    if (batch.last_seq != prefix.last_seq) {
+        LOG(ERROR) << "Durable prefix last sequence does not match batch: "
+                   << "cluster=" << cluster_id_
+                   << ", batch_id=" << prefix.batch_id
+                   << ", prefix_last_seq=" << prefix.last_seq
+                   << ", batch_last_seq=" << batch.last_seq;
         return ErrorCode::INTERNAL_ERROR;
     }
     return ErrorCode::OK;
@@ -170,19 +218,35 @@ ErrorCode OpLogBatchStorage::WriteBatchAndAdvancePrefix(
          .expected_value = EncodeDurablePrefix(expected_prefix)});
     txn.puts.push_back({.key = BuildBatchRecordKey(cluster_id_, batch.batch_id),
                         .value = encoded_batch});
-    txn.puts.push_back(
-        {.key = durable_key,
-         .value = EncodeDurablePrefix(
-             {.batch_id = batch.batch_id, .last_seq = batch.last_seq})});
+    txn.puts.push_back({.key = durable_key,
+                        .value = EncodeDurablePrefix(
+                            {.batch_id = batch.batch_id,
+                             .last_seq = batch.last_seq,
+                             .producer_view_version =
+                                 expected_prefix.producer_view_version})});
     ErrorCode err = backend_.Txn(txn);
+    if (err == ErrorCode::ETCD_TRANSACTION_FAIL) {
+        std::string raw_prefix;
+        DurablePrefix decoded_prefix;
+        if (backend_.Get(durable_key, raw_prefix) == ErrorCode::OK &&
+            raw_prefix != txn.compares[0].expected_value &&
+            DecodeDurablePrefix(raw_prefix, &decoded_prefix) &&
+            decoded_prefix == expected_prefix) {
+            txn.compares[0].expected_value = raw_prefix;
+            err = backend_.Txn(txn);
+        }
+    }
     if (err != ErrorCode::ETCD_TRANSACTION_FAIL) {
         return err;
     }
 
     DurablePrefix current_prefix;
     if (ReadDurablePrefix(current_prefix) != ErrorCode::OK ||
-        current_prefix.batch_id != batch.batch_id ||
-        current_prefix.last_seq != batch.last_seq) {
+        current_prefix !=
+            DurablePrefix{.batch_id = batch.batch_id,
+                          .last_seq = batch.last_seq,
+                          .producer_view_version =
+                              expected_prefix.producer_view_version}) {
         return err;
     }
     OpLogBatchRecord current_batch;
@@ -207,6 +271,11 @@ ErrorCode OpLogBatchStorage::ReadBatch(uint64_t batch_id,
     std::string reason;
     if (!DecodeOpLogBatchRecord(value, &batch, &reason)) {
         LOG(ERROR) << "Failed to decode OpLog batch record: " << reason;
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    if (batch.batch_id != batch_id) {
+        LOG(ERROR) << "OpLog batch id does not match key: requested="
+                   << batch_id << ", payload=" << batch.batch_id;
         return ErrorCode::INTERNAL_ERROR;
     }
     return ErrorCode::OK;

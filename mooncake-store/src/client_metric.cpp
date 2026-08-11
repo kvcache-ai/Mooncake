@@ -1,31 +1,23 @@
 #include "client_metric.h"
 
 #include <glog/logging.h>
-#include <algorithm>
-#include <cctype>
 #include <chrono>
 #include <cstdlib>
 #include <thread>
 
+#include "bool_parser.h"
+#include "integer_parser.h"
+
 namespace mooncake {
 
 namespace {
-
-std::string toLower(const std::string& str) {
-    std::string result = str;
-    std::transform(result.begin(), result.end(), result.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
-    return result;
-}
 
 bool parseMetricsEnabled() {
     const char* metric_env = std::getenv("MC_STORE_CLIENT_METRIC");
     if (!metric_env) {
         return true;
     }
-    std::string value = toLower(metric_env);
-    return (value == "1" || value == "true" || value == "yes" ||
-            value == "on" || value == "enable");
+    return TryParseBool(metric_env).value_or(false);
 }
 
 bool parseBoolEnv(const char* env_name, bool default_value) {
@@ -34,14 +26,9 @@ bool parseBoolEnv(const char* env_name, bool default_value) {
         return default_value;
     }
 
-    std::string value = toLower(env_value);
-    if (value == "1" || value == "true" || value == "yes" || value == "on" ||
-        value == "enable") {
-        return true;
-    }
-    if (value == "0" || value == "false" || value == "no" || value == "off" ||
-        value == "disable") {
-        return false;
+    const auto parsed = TryParseBool(env_value);
+    if (parsed.has_value()) {
+        return *parsed;
     }
 
     LOG(WARNING) << "Failed to parse " << env_name << ": " << env_value
@@ -56,21 +43,22 @@ uint64_t parseMetricsInterval() {
         return 0;
     }
 
-    try {
-        uint64_t interval = std::stoull(interval_env);
-        if (interval == 0) {
-            LOG(INFO) << "Client metrics reporting disabled (interval=0) via "
-                         "MC_STORE_CLIENT_METRIC_INTERVAL";
-        } else {
-            LOG(INFO) << "Client metrics interval set to " << interval
-                      << "s via MC_STORE_CLIENT_METRIC_INTERVAL";
-        }
-        return interval;
-    } catch (const std::exception& e) {
+    const auto interval = TryParseInteger<uint64_t>(
+        interval_env,
+        {.trim_ascii_whitespace = true, .allow_leading_plus = true});
+    if (!interval.has_value()) {
         LOG(WARNING) << "Failed to parse MC_STORE_CLIENT_METRIC_INTERVAL: "
                      << interval_env << ", disabling metrics reporting";
         return 0;
     }
+    if (*interval == 0) {
+        LOG(INFO) << "Client metrics reporting disabled (interval=0) via "
+                     "MC_STORE_CLIENT_METRIC_INTERVAL";
+    } else {
+        LOG(INFO) << "Client metrics interval set to " << *interval
+                  << "s via MC_STORE_CLIENT_METRIC_INTERVAL";
+    }
+    return *interval;
 }
 
 }  // anonymous namespace

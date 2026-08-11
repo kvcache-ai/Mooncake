@@ -177,6 +177,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
           }),
       default_kv_lease_ttl_(config.default_kv_lease_ttl),
       default_kv_soft_pin_ttl_(config.default_kv_soft_pin_ttl),
+      max_kv_soft_pin_ttl_(config.max_kv_soft_pin_ttl),
       allow_evict_soft_pinned_objects_(config.allow_evict_soft_pinned_objects),
       eviction_ratio_(config.eviction_ratio),
       eviction_high_watermark_ratio_(config.eviction_high_watermark_ratio),
@@ -193,19 +194,14 @@ MasterService::MasterService(const MasterServiceConfig& config)
           config.nof_heartbeat_failures_threshold),
       enable_ha_(config.enable_ha),
       enable_offload_(config.enable_offload),
-      ha_backend_type_(config.ha_backend_type),
-      ha_backend_connstring_(config.ha_backend_connstring),
       enable_oplog_(config.enable_ha && config.enable_oplog &&
                     config.ha_backend_type == "etcd"),
       oplog_batch_max_entries_(config.oplog_batch_max_entries),
       cluster_id_(config.cluster_id),
       root_fs_dir_(config.root_fs_dir),
-      global_file_segment_size_(config.global_file_segment_size),
       enable_disk_eviction_(config.enable_disk_eviction),
       quota_bytes_(config.quota_bytes),
       enable_multi_tenants_(config.enable_multi_tenants),
-      tenant_quota_connector_type_(config.tenant_quota_connector_type),
-      tenant_quota_connector_uri_(config.tenant_quota_connector_uri),
       segment_manager_(config.memory_allocator, config.enable_cxl),
       nof_segment_manager_(config.memory_allocator),
       memory_allocator_type_(config.memory_allocator),
@@ -213,23 +209,24 @@ MasterService::MasterService(const MasterServiceConfig& config)
                                     ? AllocationStrategyType::CXL
                                     : config.allocation_strategy_type),
       allocation_strategy_(CreateAllocationStrategy(allocation_strategy_type_)),
-      enable_snapshot_restore_(config.enable_snapshot_restore),
-      enable_snapshot_(config.enable_snapshot),
-      snapshot_backup_dir_(config.snapshot_backup_dir),
-      snapshot_interval_seconds_(config.snapshot_interval_seconds),
-      snapshot_child_timeout_seconds_(config.snapshot_child_timeout_seconds),
-      snapshot_retention_count_(config.snapshot_retention_count),
-      snapshot_catalog_store_type_(config.snapshot_catalog_store_type),
-      snapshot_catalog_store_connstring_(
-          config.snapshot_catalog_store_connstring),
       put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
       put_start_release_timeout_sec_(config.put_start_release_timeout_sec),
-      cxl_path_(config.cxl_path),
-      cxl_size_(config.cxl_size),
-      enable_cxl_(config.enable_cxl),
       offloading_queue_limit_(config.offloading_queue_limit),
       offload_cap_ratio_(config.offload_cap_ratio),
-      task_manager_(config.task_manager_config) {
+      task_manager_(config.task_manager_config),
+      batch_oplog_writer_factory_(
+          [](OrderedOpLogWriterConfig writer_config,
+             OrderedOpLogWriter::WriteBatchFn write_batch) {
+              return std::make_unique<OrderedOpLogWriter>(
+                  std::move(writer_config), std::move(write_batch));
+          }) {
+    if (default_kv_soft_pin_ttl_ > max_kv_soft_pin_ttl_) {
+        LOG(ERROR) << "Invalid soft-pin TTL configuration: default="
+                   << default_kv_soft_pin_ttl_
+                   << ", max=" << max_kv_soft_pin_ttl_;
+        throw std::invalid_argument("Invalid soft-pin TTL configuration");
+    }
+
     // Initialize HTTP metadata key prefix (read env var once at startup)
     const char* custom_prefix = std::getenv("MC_METADATA_CLUSTER_ID");
     if (custom_prefix && std::strlen(custom_prefix) > 0) {
@@ -244,47 +241,44 @@ MasterService::MasterService(const MasterServiceConfig& config)
         LOG(INFO) << "Local-first allocation strategy enabled";
     }
 
-    if (enable_snapshot_ || enable_snapshot_restore_) {
+    const bool use_snapshot_backup_dir = !config.snapshot_backup_dir.empty();
+    if (config.enable_snapshot || config.enable_snapshot_restore) {
         try {
             auto object_store_type =
                 ParseSnapshotObjectStoreType(config.snapshot_object_store_type);
             snapshot_object_store_ =
                 SnapshotObjectStore::Create(object_store_type);
-            snapshot_catalog_store_ = CreateSnapshotCatalogStore();
+            snapshot_catalog_store_ = CreateSnapshotCatalogStore(config);
         } catch (const std::exception& e) {
             LOG(ERROR) << "Failed to create snapshot stores: " << e.what();
             throw std::runtime_error(
                 fmt::format("Failed to create snapshot stores: {}", e.what()));
         }
-        if (!snapshot_backup_dir_.empty()) {
-            use_snapshot_backup_dir_ = true;
-        }
-
         // Initialize repository and codec for both save and restore
         snapshot_repository_ = std::make_unique<MasterSnapshotRepository>(
             snapshot_object_store_.get(), snapshot_catalog_store_.get(),
-            snapshot_backup_dir_, use_snapshot_backup_dir_);
+            config.snapshot_backup_dir, use_snapshot_backup_dir);
         snapshot_codec_ = std::make_unique<ha::MasterSnapshotCodec>();
     }
 
     if (enable_multi_tenants_) {
-        auto store = CreateTenantQuotaPolicyStore(tenant_quota_connector_type_,
-                                                  tenant_quota_connector_uri_,
-                                                  cluster_id_);
+        auto store = CreateTenantQuotaPolicyStore(
+            config.tenant_quota_connector_type,
+            config.tenant_quota_connector_uri, cluster_id_);
         if (!store) {
             throw std::invalid_argument(store.error());
         }
         tenant_quota_policy_store_ = std::move(store.value());
     }
 
-    if (enable_snapshot_restore_) {
+    if (config.enable_snapshot_restore) {
         RestoreState();
     }
     if (enable_multi_tenants_) {
         LoadTenantQuotaPoliciesFromStoreOrThrow();
         RebuildTenantQuotaUsageFromMetadata();
     }
-    if (enable_snapshot_ && snapshot_retention_count_ == 0) {
+    if (config.enable_snapshot && config.snapshot_retention_count == 0) {
         LOG(ERROR) << "snapshot_retention_count must be greater than 0";
         throw std::invalid_argument("snapshot_retention_count must be > 0");
     }
@@ -410,12 +404,12 @@ MasterService::MasterService(const MasterServiceConfig& config)
 
     if (enable_oplog_ && !cluster_id_.empty()) {
 #ifdef STORE_USE_ETCD
-        if (ha_backend_connstring_.empty()) {
+        if (config.ha_backend_connstring.empty()) {
             LOG(INFO) << "Skipping automatic batch-record OpLog writer "
                          "initialization; no HA backend connstring configured";
         } else {
             ErrorCode connect_err = EtcdHelper::ConnectToEtcdStoreClient(
-                ha_backend_connstring_.c_str());
+                config.ha_backend_connstring.c_str());
             if (connect_err != ErrorCode::OK) {
                 throw std::runtime_error(fmt::format(
                     "failed to connect HA batch-record OpLog writer to etcd: "
@@ -431,7 +425,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
             }
         }
 #else
-        if (ha_backend_connstring_.empty()) {
+        if (config.ha_backend_connstring.empty()) {
             LOG(INFO) << "Skipping automatic batch-record OpLog writer "
                          "initialization; no HA backend connstring configured";
         } else {
@@ -477,56 +471,50 @@ MasterService::MasterService(const MasterServiceConfig& config)
 
     if (!root_fs_dir_.empty()) {
         use_disk_replica_ = true;
-        if (global_file_segment_size_ == std::numeric_limits<int64_t>::max()) {
+        if (config.global_file_segment_size ==
+            std::numeric_limits<int64_t>::max()) {
             MasterMetricManager::instance().set_dfs_capacity_unlimited(true);
         } else {
             MasterMetricManager::instance().inc_total_file_capacity(
-                global_file_segment_size_);
+                config.global_file_segment_size);
         }
     }
 
-    if (enable_snapshot_ && !enable_oplog_) {
+    if (config.enable_snapshot && !enable_oplog_) {
         if (memory_allocator_type_ == BufferAllocatorType::OFFSET) {
             // Initialize and start snapshot manager
             MasterSnapshotManagerOptions snapshot_options;
-            snapshot_options.enable_snapshot = enable_snapshot_;
             snapshot_options.snapshot_interval_seconds =
-                snapshot_interval_seconds_;
+                config.snapshot_interval_seconds;
             snapshot_options.snapshot_child_timeout_seconds =
-                snapshot_child_timeout_seconds_;
+                config.snapshot_child_timeout_seconds;
             snapshot_options.snapshot_retention_count =
-                snapshot_retention_count_;
-            snapshot_options.snapshot_backup_dir = snapshot_backup_dir_;
-            snapshot_options.use_snapshot_backup_dir = use_snapshot_backup_dir_;
-            snapshot_options.snapshot_catalog_store_type =
-                snapshot_catalog_store_type_;
-            snapshot_options.snapshot_catalog_store_connstring =
-                snapshot_catalog_store_connstring_;
-            snapshot_options.ha_backend_type = ha_backend_type_;
-            snapshot_options.ha_backend_connstring = ha_backend_connstring_;
-            snapshot_options.cluster_id = cluster_id_;
-            snapshot_options.enable_ha = enable_ha_;
+                config.snapshot_retention_count;
+            snapshot_options.snapshot_backup_dir = config.snapshot_backup_dir;
+            snapshot_options.use_snapshot_backup_dir = use_snapshot_backup_dir;
 
             snapshot_manager_ = std::make_unique<MasterSnapshotManager>(
                 this, snapshot_options, snapshot_mutex_,
                 snapshot_object_store_.get(), snapshot_catalog_store_.get());
             snapshot_manager_->Start();
         }
-    } else if (enable_snapshot_ && enable_oplog_) {
+    } else if (config.enable_snapshot && enable_oplog_) {
         LOG(INFO) << "Skipping primary snapshot generation in batch-record "
                      "OpLog mode; snapshots are owned by standby";
     }
 
-    if (enable_cxl_) {
+    if (config.enable_cxl) {
         allocation_strategy_ = std::make_shared<CxlAllocationStrategy>();
-        segment_manager_.initializeCxlAllocator(cxl_path_, cxl_size_);
+        segment_manager_.initializeCxlAllocator(config.cxl_path,
+                                                config.cxl_size);
         VLOG(1) << "action=start_cxl_global_allocator";
     }
 }
 
 std::unique_ptr<ha::SnapshotCatalogStore>
-MasterService::CreateSnapshotCatalogStore() {
-    auto catalog_kind = ParseSnapshotCatalogKind(snapshot_catalog_store_type_);
+MasterService::CreateSnapshotCatalogStore(const MasterServiceConfig& config) {
+    auto catalog_kind =
+        ParseSnapshotCatalogKind(config.snapshot_catalog_store_type);
     if (!catalog_kind) {
         throw std::invalid_argument(catalog_kind.error());
     }
@@ -542,9 +530,10 @@ MasterService::CreateSnapshotCatalogStore() {
                 "redis snapshot catalog store is unavailable in the current "
                 "build");
 #else
-            const auto connstring = !snapshot_catalog_store_connstring_.empty()
-                                        ? snapshot_catalog_store_connstring_
-                                        : ha_backend_connstring_;
+            const auto connstring =
+                !config.snapshot_catalog_store_connstring.empty()
+                    ? config.snapshot_catalog_store_connstring
+                    : config.ha_backend_connstring;
             if (connstring.empty()) {
                 throw std::invalid_argument(
                     "redis snapshot catalog store requires a connection "
@@ -615,6 +604,7 @@ MasterService::~MasterService() {
     for (const auto& [segment, bytes] : standby_accounted_memory_bytes_) {
         MasterMetricManager::instance().dec_allocated_mem_size(
             segment, static_cast<int64_t>(bytes));
+        MasterMetricManager::instance().remove_segment_metrics(segment);
     }
 
     // Segments still mounted here never went through CommitUnmountSegment;
@@ -627,6 +617,13 @@ MasterService::~MasterService() {
 ErrorCode MasterService::SetBatchOpLogBackendForTesting(
     std::shared_ptr<HaKvBackend> backend) {
     return InitializeBatchOpLogWriter(std::move(backend));
+}
+
+void MasterService::SetBatchOpLogWriterFactoryForTesting(
+    BatchOpLogWriterFactory factory) {
+    assert(factory);
+    assert(!ordered_oplog_writer_);
+    batch_oplog_writer_factory_ = std::move(factory);
 }
 
 void MasterService::RunBatchEvictForTesting(double evict_ratio_target,
@@ -1636,9 +1633,17 @@ std::vector<Replica> MasterService::PopReplicasWithCacheTotalAccounting(
 
 size_t MasterService::EraseReplicasWithCacheTotalAccounting(
     ObjectMetadata& metadata,
-    const std::function<bool(const Replica&)>& pred_fn) {
+    const std::function<bool(const Replica&)>& pred_fn,
+    std::vector<ReplicaID>* erased_replica_ids) {
     auto erased_replicas =
         PopReplicasWithCacheTotalAccounting(metadata, pred_fn);
+    if (erased_replica_ids != nullptr) {
+        erased_replica_ids->reserve(erased_replica_ids->size() +
+                                    erased_replicas.size());
+        for (const auto& replica : erased_replicas) {
+            erased_replica_ids->push_back(replica.id());
+        }
+    }
     // Release SSD/local-disk usage for any local-disk replicas being removed.
     // No-op for memory/noF replicas, so it is safe to call unconditionally.
     ReleaseLocalDiskUsage(erased_replicas);
@@ -1706,6 +1711,11 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
     if (erased_replicas.empty()) {
         return;
     }
+    std::vector<ReplicaID> erased_replica_ids;
+    erased_replica_ids.reserve(erased_replicas.size());
+    for (const auto& replica : erased_replicas) {
+        erased_replica_ids.push_back(replica.id());
+    }
     const uint64_t erased_memory_replicas = static_cast<uint64_t>(std::count_if(
         erased_replicas.begin(), erased_replicas.end(),
         [](const Replica& replica) { return replica.is_memory_replica(); }));
@@ -1741,6 +1751,8 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
     if (erased_local_disk) {
         shard.OnDiskReplicaRemoved(erased_local_disk, metadata);
     }
+    CancelPromotionTaskForRemovedReplicas(tenant_state, metadata,
+                                          erased_replica_ids);
     if (!metadata.IsValid()) {
         EraseMetadata(tenant_state, metadata_it, tenant_id, quota_mode, &shard);
         if (tenant_state.Empty()) {
@@ -1982,6 +1994,9 @@ MasterService::EraseMetadata(
 
     ReleaseLocalDiskUsage(metadata.GetAllReplicas());
     AccountCacheTotalRemoval(metadata);
+    if (metadata.GetCommittedSoftPinTimeout()) {
+        soft_pin_deadline_index_.Remove(tenant_id.MakeScopedKey(key));
+    }
     switch (quota_mode) {
         case QuotaEraseMode::kFull:
             if (enable_multi_tenants_ &&
@@ -2074,16 +2089,224 @@ void MasterService::RebuildGroupRoutingIndex() {
     }
 }
 
+void MasterService::SoftPinDeadlineIndex::MaybeCompactLocked() {
+    const size_t live_count = registrations_.size();
+    const size_t ratio_limit =
+        live_count > std::numeric_limits<size_t>::max() / kCompactionRatio
+            ? std::numeric_limits<size_t>::max()
+            : live_count * kCompactionRatio;
+    const size_t threshold = std::max(kMinCompactionThreshold, ratio_limit);
+    if (heap_.size() <= threshold) {
+        return;
+    }
+
+    decltype(heap_) rebuilt;
+    for (const auto& [scoped_key, registration] : registrations_) {
+        rebuilt.push(
+            Entry{registration.deadline, registration.shard_idx, scoped_key});
+    }
+    heap_.swap(rebuilt);
+}
+
+void MasterService::SoftPinDeadlineIndex::Upsert(std::string scoped_key,
+                                                 size_t shard_idx,
+                                                 const TimePoint& deadline) {
+    std::lock_guard lock(mutex_);
+    const auto it = registrations_.find(scoped_key);
+    if (it != registrations_.end() && it->second.deadline == deadline &&
+        it->second.shard_idx == shard_idx) {
+        return;
+    }
+
+    auto [registration_it, inserted] = registrations_.insert_or_assign(
+        scoped_key, Registration{deadline, shard_idx});
+    (void)inserted;
+    heap_.push(Entry{deadline, shard_idx, registration_it->first});
+    MaybeCompactLocked();
+}
+
+void MasterService::SoftPinDeadlineIndex::Remove(
+    const std::string& scoped_key) {
+    std::lock_guard lock(mutex_);
+    if (registrations_.erase(scoped_key) > 0) {
+        MaybeCompactLocked();
+    }
+}
+
+void MasterService::SoftPinDeadlineIndex::RemoveIfMatches(
+    const std::string& scoped_key, size_t shard_idx,
+    const TimePoint& deadline) {
+    std::lock_guard lock(mutex_);
+    const auto it = registrations_.find(scoped_key);
+    if (it != registrations_.end() && it->second.deadline == deadline &&
+        it->second.shard_idx == shard_idx) {
+        registrations_.erase(it);
+        MaybeCompactLocked();
+    }
+}
+
+std::vector<MasterService::SoftPinDeadlineIndex::Entry>
+MasterService::SoftPinDeadlineIndex::PopExpired(const TimePoint& now) {
+    std::vector<Entry> expired;
+    std::lock_guard lock(mutex_);
+    while (!heap_.empty() && heap_.top().deadline <= now) {
+        Entry entry = heap_.top();
+        heap_.pop();
+
+        const auto it = registrations_.find(entry.scoped_key);
+        if (it == registrations_.end() ||
+            it->second.deadline != entry.deadline ||
+            it->second.shard_idx != entry.shard_idx) {
+            continue;
+        }
+        registrations_.erase(it);
+        expired.push_back(std::move(entry));
+    }
+    MaybeCompactLocked();
+    return expired;
+}
+
+void MasterService::SoftPinDeadlineIndex::Clear() {
+    std::lock_guard lock(mutex_);
+    registrations_.clear();
+    decltype(heap_) empty;
+    heap_.swap(empty);
+}
+
+size_t MasterService::SoftPinDeadlineIndex::HeapSizeForTest() const {
+    std::lock_guard lock(mutex_);
+    return heap_.size();
+}
+
+size_t MasterService::SoftPinDeadlineIndex::RegistrationCountForTest() const {
+    std::lock_guard lock(mutex_);
+    return registrations_.size();
+}
+
+auto MasterService::ResolveSoftPinRequest(const ReplicateConfig& config) const
+    -> tl::expected<ResolvedSoftPinRequest, ErrorCode> {
+    switch (config.soft_pin_action) {
+        case SoftPinAction::PRESERVE:
+        case SoftPinAction::DISABLE:
+            if (config.soft_pin_ttl_ms.has_value()) {
+                LOG(ERROR) << "soft_pin_action=" << config.soft_pin_action
+                           << ", soft_pin_ttl_ms=" << *config.soft_pin_ttl_ms
+                           << ", error=ttl_requires_enable";
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            return ResolvedSoftPinRequest{config.soft_pin_action, 0};
+        case SoftPinAction::ENABLE: {
+            const uint64_t ttl_ms =
+                config.soft_pin_ttl_ms.value_or(default_kv_soft_pin_ttl_);
+            if (ttl_ms > max_kv_soft_pin_ttl_) {
+                LOG(ERROR) << "soft_pin_ttl_ms=" << ttl_ms
+                           << ", max_kv_soft_pin_ttl=" << max_kv_soft_pin_ttl_
+                           << ", error=soft_pin_ttl_exceeds_limit";
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            return ResolvedSoftPinRequest{config.soft_pin_action, ttl_ms};
+        }
+    }
+    LOG(ERROR) << "soft_pin_action="
+               << static_cast<uint32_t>(config.soft_pin_action)
+               << ", error=invalid_soft_pin_action";
+    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+}
+
+void MasterService::ApplySoftPinMetricDelta(int metric_delta) {
+    if (metric_delta > 0) {
+        MasterMetricManager::instance().inc_soft_pin_key_count(metric_delta);
+    } else if (metric_delta < 0) {
+        MasterMetricManager::instance().dec_soft_pin_key_count(-metric_delta);
+    }
+}
+
+size_t MasterService::GetMetadataShardIndex(
+    const ObjectMetadata& metadata) const {
+    return metadata.group_id.empty()
+               ? getShardIndex(metadata.tenant_id, metadata.user_key)
+               : getShardIndex(metadata.group_id);
+}
+
+void MasterService::ApplySoftPinEvaluation(
+    const ObjectMetadata& metadata,
+    const ObjectMetadata::SoftPinEvaluation& result) const {
+    if (!result.deadline_to_index && !result.removed_deadline) {
+        ApplySoftPinMetricDelta(result.metric_delta);
+        return;
+    }
+
+    const size_t shard_idx = GetMetadataShardIndex(metadata);
+    const auto scoped_key = metadata.tenant_id.MakeScopedKey(metadata.user_key);
+    if (result.deadline_to_index) {
+        soft_pin_deadline_index_.Upsert(scoped_key, shard_idx,
+                                        *result.deadline_to_index);
+    } else if (result.removed_deadline) {
+        soft_pin_deadline_index_.RemoveIfMatches(scoped_key, shard_idx,
+                                                 *result.removed_deadline);
+    }
+    ApplySoftPinMetricDelta(result.metric_delta);
+}
+
+bool MasterService::IsSoftPinActive(
+    const ObjectMetadata& metadata,
+    const std::chrono::system_clock::time_point& now) const {
+    const auto evaluation = metadata.EvaluateSoftPin(now);
+    ApplySoftPinEvaluation(metadata, evaluation);
+    return evaluation.active;
+}
+
+void MasterService::CleanupExpiredSoftPins(
+    const std::chrono::system_clock::time_point& now) {
+    auto expired_entries = soft_pin_deadline_index_.PopExpired(now);
+    std::sort(expired_entries.begin(), expired_entries.end(),
+              [](const auto& lhs, const auto& rhs) {
+                  return lhs.shard_idx < rhs.shard_idx;
+              });
+
+    int expired_count = 0;
+    for (size_t begin = 0; begin < expired_entries.size();) {
+        const size_t shard_idx = expired_entries[begin].shard_idx;
+        size_t end = begin + 1;
+        while (end < expired_entries.size() &&
+               expired_entries[end].shard_idx == shard_idx) {
+            ++end;
+        }
+
+        MetadataShardAccessorRO shard(this, shard_idx);
+        for (size_t i = begin; i < end; ++i) {
+            const auto& entry = expired_entries[i];
+            const auto [tenant_id, key] =
+                TenantId::ParseScopedKey(entry.scoped_key);
+            const auto tenant_it = shard->tenants.find(tenant_id);
+            if (tenant_it == shard->tenants.end()) {
+                continue;
+            }
+            const auto metadata_it = tenant_it->second.metadata.find(key);
+            if (metadata_it == tenant_it->second.metadata.end()) {
+                continue;
+            }
+            if (metadata_it->second.ExpireSoftPinIfDeadlineMatches(
+                    entry.deadline, now)) {
+                ++expired_count;
+            }
+        }
+        begin = end;
+    }
+    if (expired_count > 0) {
+        MasterMetricManager::instance().dec_soft_pin_key_count(expired_count);
+    }
+}
+
 void MasterService::GrantLeaseForGroup(const TenantState& tenant_state,
                                        const std::string& key,
                                        const ObjectMetadata& metadata) const {
     if (!metadata.IsGrouped()) {
-        metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
+        metadata.GrantReadLease(default_kv_lease_ttl_);
         return;
     }
 
-    bool needs_refresh = metadata.NeedsLeaseRefresh(default_kv_lease_ttl_,
-                                                    default_kv_soft_pin_ttl_);
+    bool needs_refresh = metadata.NeedsReadLeaseRefresh(default_kv_lease_ttl_);
     if (!needs_refresh) {
         std::shared_lock<std::shared_mutex> lock(group_routing_mutex_);
         needs_refresh =
@@ -2096,19 +2319,18 @@ void MasterService::GrantLeaseForGroup(const TenantState& tenant_state,
 
     auto group_it = tenant_state.group_members.find(metadata.group_id);
     if (group_it == tenant_state.group_members.end()) {
-        metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
+        metadata.GrantReadLease(default_kv_lease_ttl_);
         return;
     }
 
     for (const auto& member_key : group_it->second) {
         auto mit = tenant_state.metadata.find(member_key);
         if (mit != tenant_state.metadata.end()) {
-            mit->second.GrantLease(default_kv_lease_ttl_,
-                                   default_kv_soft_pin_ttl_);
+            mit->second.GrantReadLease(default_kv_lease_ttl_);
         }
     }
     if (group_it->second.find(key) == group_it->second.end()) {
-        metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
+        metadata.GrantReadLease(default_kv_lease_ttl_);
     }
     {
         std::unique_lock<std::shared_mutex> lock(group_routing_mutex_);
@@ -2210,9 +2432,12 @@ void MasterService::TaskCleanupThreadFunc() {
         }
 
         std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-        auto write_access = task_manager_.get_write_access();
-        write_access.prune_expired_tasks();
-        write_access.prune_finished_tasks();
+        {
+            auto write_access = task_manager_.get_write_access();
+            write_access.prune_expired_tasks();
+            write_access.prune_finished_tasks();
+        }
+        CleanupExpiredSoftPins(std::chrono::system_clock::now());
     }
     LOG(INFO) << "Task cleanup thread stopped";
 }
@@ -2375,7 +2600,7 @@ auto MasterService::ExistKey(const std::string& key, const TenantId& tenant_id)
     if (ts) {
         GrantLeaseForGroup(*ts, key, metadata);
     } else {
-        metadata.GrantLease(default_kv_lease_ttl_, default_kv_soft_pin_ttl_);
+        metadata.GrantReadLease(default_kv_lease_ttl_);
     }
     return true;
 }
@@ -2691,8 +2916,9 @@ void MasterService::RestoreFromStandbySnapshot(
                 std::piecewise_construct, std::forward_as_tuple(user_key),
                 std::forward_as_tuple(
                     standby_meta.client_id, now, standby_meta.size,
-                    std::move(replicas), false, false, standby_meta.data_type,
-                    standby_meta.group_id, tenant_id, user_key));
+                    std::move(replicas), std::nullopt, false,
+                    standby_meta.data_type, standby_meta.group_id, tenant_id,
+                    user_key));
             if (!standby_meta.group_id.empty()) {
                 RegisterGroupMember(tenant_state, tenant_id, user_key,
                                     standby_meta.group_id);
@@ -3120,8 +3346,7 @@ auto MasterService::GetReplicaList(const std::string& key,
         if (ts) {
             GrantLeaseForGroup(*ts, key, metadata);
         } else {
-            metadata.GrantLease(default_kv_lease_ttl_,
-                                default_kv_soft_pin_ttl_);
+            metadata.GrantReadLease(default_kv_lease_ttl_);
         }
 
         // Promotion-on-hit eligibility: only when no MEMORY replica is
@@ -3406,8 +3631,12 @@ auto MasterService::AllocateAndInsertMetadata(
     const std::string& key, uint64_t value_length,
     const ReplicateConfig& config, const std::string& group_id,
     const TenantId& tenant_id, const std::chrono::system_clock::time_point& now,
-    uint64_t& quota_deficit_bytes)
+    const ResolvedSoftPinRequest& soft_pin_request,
+    uint64_t& quota_deficit_bytes,
+    std::optional<std::chrono::system_clock::time_point>
+        committed_soft_pin_timeout)
     -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode> {
+    const auto deadline_to_index = committed_soft_pin_timeout;
     auto& tenant_state = GetOrCreateTenantState(shard.get(), tenant_id);
     if (tenant_state.metadata.contains(key)) {
         LOG(INFO) << "key=" << key << ", info=object_already_exists";
@@ -3595,13 +3824,16 @@ auto MasterService::AllocateAndInsertMetadata(
     }
 
     std::vector<Replica::Descriptor> replica_list;
+    std::vector<ReplicaID> eligible_replica_ids;
     replica_list.reserve(replicas.size());
+    eligible_replica_ids.reserve(replicas.size());
     int i = 0;
     VLOG(1) << "PutStart, create replicas: client_id=" << client_id
             << ", key=" << key << ", value_length=" << value_length;
     for (const auto& replica : replicas) {
         const auto desc = replica.get_descriptor();
         replica_list.emplace_back(desc);
+        eligible_replica_ids.push_back(replica.id());
 
         if (replica.is_memory_replica()) {
             const auto& mem_desc = desc.get_memory_descriptor();
@@ -3621,8 +3853,9 @@ auto MasterService::AllocateAndInsertMetadata(
     auto [it, inserted] = tenant_state.metadata.emplace(
         std::piecewise_construct, std::forward_as_tuple(key),
         std::forward_as_tuple(client_id, now, value_length, std::move(replicas),
-                              config.with_soft_pin, config.with_hard_pin,
-                              config.data_type, group_id, tenant_id, key));
+                              std::move(committed_soft_pin_timeout),
+                              config.with_hard_pin, config.data_type, group_id,
+                              tenant_id, key));
     if (!inserted) {
         LOG(INFO) << "key=" << key << ", info=object_already_exists";
         refund_pending_quota();
@@ -3638,6 +3871,13 @@ auto MasterService::AllocateAndInsertMetadata(
             tenant_state.metadata.erase(it);
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
+    }
+    it->second.BeginSoftPinAction(soft_pin_request,
+                                  std::move(eligible_replica_ids));
+    if (deadline_to_index) {
+        soft_pin_deadline_index_.Upsert(tenant_id.MakeScopedKey(key),
+                                        GetMetadataShardIndex(it->second),
+                                        *deadline_to_index);
     }
     RegisterGroupMember(tenant_state, tenant_id, key, group_id);
     tenant_state.processing_keys.insert(key);
@@ -3675,6 +3915,11 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 #endif
+
+    auto soft_pin_request = ResolveSoftPinRequest(config);
+    if (!soft_pin_request) {
+        return tl::make_unexpected(soft_pin_request.error());
+    }
 
     UpdateClientHostId(client_id, config.host_id);
 
@@ -3789,7 +4034,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                 } else {
                     return AllocateAndInsertMetadata(
                         shard, client_id, key, slice_length, config, group_id,
-                        object_id.tenant_id, now, quota_deficit_bytes);
+                        object_id.tenant_id, now, *soft_pin_request,
+                        quota_deficit_bytes);
                 }
             }
         }
@@ -3806,7 +4052,8 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
         }
         return AllocateAndInsertMetadata(shard, client_id, key, slice_length,
                                          config, group_id, object_id.tenant_id,
-                                         now, quota_deficit_bytes);
+                                         now, *soft_pin_request,
+                                         quota_deficit_bytes);
     };
 
     for (int attempt = 0; attempt <= kMaxTenantQuotaEvictionRetries;
@@ -3845,25 +4092,69 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
 
+    auto is_target_replica = [replica_type](const Replica& replica) {
+        if (replica_type == ReplicaType::ALL) {
+            return (replica.is_memory_replica() &&
+                    !replica.has_invalid_mem_handle()) ||
+                   (replica.is_nof_replica() &&
+                    !replica.has_invalid_nof_handle());
+        }
+        if (replica_type == ReplicaType::MEMORY) {
+            return replica.is_memory_replica() &&
+                   !replica.has_invalid_mem_handle();
+        }
+        if (replica_type == ReplicaType::NOF_SSD) {
+            return replica.is_nof_replica() &&
+                   !replica.has_invalid_nof_handle();
+        }
+        return replica.type() == replica_type;
+    };
+
+    // A successful End removes the processing marker. Treat a retry as a
+    // no-op only when every replica targeted by that End is already COMPLETE.
+    // In particular, a promotion-owned PROCESSING replica keeps this check
+    // from accepting a MEMORY/ALL End and is never modified here.
+    if (!accessor.InProcessing()) {
+        bool has_target_replica = false;
+        bool all_target_replicas_complete = true;
+        for (const auto& replica : metadata.GetAllReplicas()) {
+            if (!is_target_replica(replica)) {
+                continue;
+            }
+            has_target_replica = true;
+            if (!replica.is_completed()) {
+                all_target_replicas_complete = false;
+                break;
+            }
+        }
+        if (has_target_replica && all_target_replicas_complete) {
+            return {};
+        }
+        LOG(ERROR) << "key=" << key << ", error=no_primary_write_in_progress";
+        return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+    }
+
+    const bool had_completed_replica =
+        metadata.HasReplica(&Replica::fn_is_completed);
+    bool completed_pending_replica = false;
     metadata.VisitReplicas(
-        [replica_type](const Replica& replica) {
-            if (replica_type == ReplicaType::ALL) {
-                return (replica.is_memory_replica() &&
-                        !replica.has_invalid_mem_handle()) ||
-                       (replica.is_nof_replica() &&
-                        !replica.has_invalid_nof_handle());
-            }
-            if (replica_type == ReplicaType::MEMORY) {
-                return replica.is_memory_replica() &&
-                       !replica.has_invalid_mem_handle();
-            }
-            if (replica_type == ReplicaType::NOF_SSD) {
-                return replica.is_nof_replica() &&
-                       !replica.has_invalid_nof_handle();
-            }
-            return replica.type() == replica_type;
+        [&is_target_replica](const Replica& replica) {
+            return replica.is_processing() && is_target_replica(replica);
         },
-        [](Replica& replica) { replica.mark_complete(); });
+        [&metadata, &completed_pending_replica](Replica& replica) {
+            if (replica.is_processing() &&
+                metadata.PendingSoftPinOwnsReplica(replica.id())) {
+                completed_pending_replica = true;
+            }
+            replica.mark_complete();
+        });
+
+    if (!had_completed_replica && completed_pending_replica &&
+        metadata.HasReplica(&Replica::fn_is_completed)) {
+        const auto soft_pin_result =
+            metadata.CommitPendingSoftPin(std::chrono::system_clock::now());
+        ApplySoftPinEvaluation(metadata, soft_pin_result);
+    }
 
     if (object_meta.object_checksum.has_value() ||
         replica_type == ReplicaType::ALL ||
@@ -3908,10 +4199,7 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
 
     SyncCacheTotalAccounting(metadata);
     // TODO: add inc_nof_cache_nums() (ranhaojia)
-    // 1. Set lease timeout to now, indicating that the object has no lease
-    // at beginning. 2. If this object has soft pin enabled, set it to be soft
-    // pinned.
-    metadata.GrantLease(0, default_kv_soft_pin_ttl_);
+    metadata.GrantReadLease(0);
     PublishKvStored(key, replica_type, metadata, object_id.tenant_id);
 
     if (enable_oplog_ && ordered_oplog_writer_) {
@@ -3949,7 +4237,7 @@ auto MasterService::AddReplica(const UUID& client_id, const std::string& key,
         accessor.Create(
             client_id,
             replica.get_descriptor().get_local_disk_descriptor().object_size,
-            std::vector<Replica>{}, false);
+            std::vector<Replica>{});
     }
     auto& metadata = accessor.Get();
     if (replica.type() != ReplicaType::LOCAL_DISK) {
@@ -4049,6 +4337,11 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
 
+    if (!accessor.InProcessing()) {
+        LOG(ERROR) << "key=" << key << ", error=no_primary_write_in_progress";
+        return tl::make_unexpected(ErrorCode::INVALID_WRITE);
+    }
+
     auto processing_rep = metadata.GetFirstReplica([replica_type](
                                                        const Replica& replica) {
         if (replica_type == ReplicaType::ALL) {
@@ -4064,6 +4357,9 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     }
 
     auto target_pred = [replica_type](const Replica& r) {
+        if (!r.is_processing()) {
+            return false;
+        }
         if (replica_type == ReplicaType::ALL) {
             return r.is_memory_replica() || r.is_nof_replica();
         }
@@ -4082,6 +4378,7 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
             removed_ids.push_back(r.id());
             r.mark_removed();
         });
+        metadata.ClearPendingSoftPinIfNoViableReplica();
 
         tl::expected<OpLogEntry, ErrorCode> persist_result;
         if (remaining.empty()) {
@@ -4114,6 +4411,7 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
 
     const uint64_t before_charge = CompletedMemoryQuotaCharge(metadata);
     EraseReplicasWithCacheTotalAccounting(metadata, target_pred);
+    metadata.ClearPendingSoftPinIfNoViableReplica();
     const uint64_t after_charge = CompletedMemoryQuotaCharge(metadata);
     if (enable_multi_tenants_ && before_charge > after_charge) {
         auto release_result = metadata.quota_ledger.ReleaseCommitted(
@@ -4224,6 +4522,11 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     }
 #endif
 
+    auto soft_pin_request = ResolveSoftPinRequest(config);
+    if (!soft_pin_request) {
+        return tl::make_unexpected(soft_pin_request.error());
+    }
+
     UpdateClientHostId(client_id, config.host_id);
 
     if ((memory_allocator_type_ == BufferAllocatorType::CACHELIB) &&
@@ -4252,6 +4555,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
         quota_deficit_bytes = 0;
         auto now = std::chrono::system_clock::now();
         std::optional<size_t> case_a_retry_shard_idx;
+        std::optional<std::chrono::system_clock::time_point>
+            case_a_committed_soft_pin_timeout;
         {
             // --- Lock acquisition ---
             auto alive_clients = getAliveClientsSnapshot();
@@ -4347,6 +4652,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 if (tenant_state.processing_keys.count(key) > 0) {
                     auto processing_replicas =
                         metadata.PopReplicas(&Replica::fn_is_processing);
+                    metadata.ClearPendingSoftPinAction();
                     if (!processing_replicas.empty()) {
                         std::lock_guard lock(discarded_replicas_mutex_);
                         discarded_replicas_.emplace_back(
@@ -4358,6 +4664,12 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     // If no COMPLETE replicas survive the preemption, this key
                     // effectively does not exist — fall through to Case A.
                     if (!metadata.HasReplica(&Replica::fn_is_completed)) {
+                        case_a_committed_soft_pin_timeout =
+                            metadata.GetCommittedSoftPinTimeout();
+                        if (case_a_committed_soft_pin_timeout &&
+                            *case_a_committed_soft_pin_timeout <= now) {
+                            case_a_committed_soft_pin_timeout.reset();
+                        }
                         EraseMetadata(tenant_state, it, object_id.tenant_id,
                                       QuotaEraseMode::kFull, &shard);
                         it = tenant_state.metadata.end();
@@ -4387,7 +4699,9 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 } else {
                     return AllocateAndInsertMetadata(
                         shard, client_id, key, slice_length, config, group_id,
-                        object_id.tenant_id, now, quota_deficit_bytes);
+                        object_id.tenant_id, now, *soft_pin_request,
+                        quota_deficit_bytes,
+                        std::move(case_a_committed_soft_pin_timeout));
                 }
             } else {
                 // --- Step 2: key exists with COMPLETE replicas → Case B or C
@@ -4415,28 +4729,18 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     metadata.client_id = client_id;
                     metadata.put_start_time = now;
 
-                    // Reconcile soft_pin state with the incoming config.
-                    {
-                        SpinLocker locker(&metadata.lock);
-                        if (config.with_soft_pin &&
-                            !metadata.soft_pin_timeout) {
-                            metadata.soft_pin_timeout.emplace();
-                            MasterMetricManager::instance()
-                                .inc_soft_pin_key_count(1);
-                        } else if (!config.with_soft_pin &&
-                                   metadata.soft_pin_timeout) {
-                            metadata.soft_pin_timeout.reset();
-                            MasterMetricManager::instance()
-                                .dec_soft_pin_key_count(1);
-                        }
-                    }
-
                     // Mark COMPLETE → PROCESSING so readers won't see stale
                     // data mid-transfer.  The key becomes unreadable until
                     // UpsertEnd.
+                    std::vector<ReplicaID> eligible_replica_ids;
                     metadata.VisitReplicas(
                         &Replica::fn_is_completed,
-                        [](Replica& replica) { replica.mark_processing(); });
+                        [&eligible_replica_ids](Replica& replica) {
+                            eligible_replica_ids.push_back(replica.id());
+                            replica.mark_processing();
+                        });
+                    metadata.BeginSoftPinAction(
+                        *soft_pin_request, std::move(eligible_replica_ids));
                     SyncCacheTotalAccounting(metadata);
 
                     tenant_state.processing_keys.insert(key);
@@ -4468,8 +4772,12 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 ReplicateConfig merged_config = config;
                 merged_config.with_hard_pin =
                     merged_config.with_hard_pin || metadata.IsHardPinned();
-                merged_config.with_soft_pin =
-                    merged_config.with_soft_pin || metadata.IsSoftPinned();
+                auto committed_soft_pin_timeout =
+                    metadata.GetCommittedSoftPinTimeout();
+                if (committed_soft_pin_timeout &&
+                    *committed_soft_pin_timeout <= now) {
+                    committed_soft_pin_timeout.reset();
+                }
 
                 const std::string existing_group_id = metadata.group_id;
                 TenantQuotaLedger replacement_charge;
@@ -4504,7 +4812,8 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                 auto allocate_result = AllocateAndInsertMetadata(
                     shard, client_id, key, slice_length, merged_config,
                     existing_group_id, object_id.tenant_id, now,
-                    quota_deficit_bytes);
+                    *soft_pin_request, quota_deficit_bytes,
+                    std::move(committed_soft_pin_timeout));
                 if (!allocate_result) {
                     if (has_replacement_charge) {
                         auto rollback_result =
@@ -4561,9 +4870,11 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             LOG(INFO) << "key=" << key << ", info=object_already_exists";
             return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
         }
-        return AllocateAndInsertMetadata(shard, client_id, key, slice_length,
-                                         config, group_id, object_id.tenant_id,
-                                         now, quota_deficit_bytes);
+        return AllocateAndInsertMetadata(
+            shard, client_id, key, slice_length, config, group_id,
+            object_id.tenant_id, now, *soft_pin_request,
+            quota_deficit_bytes,
+            std::move(case_a_committed_soft_pin_timeout));
     };
 
     for (int attempt = 0; attempt <= kMaxTenantQuotaEvictionRetries;
@@ -5996,6 +6307,41 @@ auto MasterService::BatchRemove(const std::vector<std::string>& keys,
     return results;
 }
 
+void MasterService::CancelPromotionTaskForRemovedReplicas(
+    TenantState& tenant_state, ObjectMetadata& metadata,
+    const std::vector<ReplicaID>& removed_replica_ids) {
+    if (removed_replica_ids.empty()) {
+        return;
+    }
+
+    auto task_it = tenant_state.promotion_tasks.find(metadata.user_key);
+    if (task_it == tenant_state.promotion_tasks.end() ||
+        task_it->second.alloc_id == 0 ||
+        std::find(removed_replica_ids.begin(), removed_replica_ids.end(),
+                  task_it->second.alloc_id) == removed_replica_ids.end()) {
+        return;
+    }
+
+    if (auto* source = metadata.GetReplicaByID(task_it->second.source_id);
+        source != nullptr) {
+        source->dec_refcnt();
+    }
+    const UUID holder_id = task_it->second.holder_id;
+    ErasePromotionTaskIfPresent(tenant_state, metadata.user_key);
+
+    // Best-effort cleanup of a task that may still be queued on the holder.
+    ScopedLocalDiskSegmentAccess local_disk_segment_access =
+        segment_manager_.getLocalDiskSegmentAccess();
+    auto& client_local_disk_segment =
+        local_disk_segment_access.getClientLocalDiskSegment();
+    auto segment_it = client_local_disk_segment.find(holder_id);
+    if (segment_it != client_local_disk_segment.end()) {
+        MutexLocker locker(&segment_it->second->offloading_mutex_);
+        segment_it->second->promotion_objects.erase(
+            metadata.tenant_id.MakeScopedKey(metadata.user_key));
+    }
+}
+
 bool MasterService::CleanupStaleHandles(
     TenantState& tenant_state, ObjectMetadata& metadata,
     const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients,
@@ -6006,13 +6352,18 @@ bool MasterService::CleanupStaleHandles(
     // Remove those with invalid allocators (memory replicas on unmounted
     // segments) and local_disk replicas whose owner client is no longer alive.
     const uint64_t before_charge = CompletedMemoryQuotaCharge(metadata);
+    std::vector<ReplicaID> removed_replica_ids;
     EraseReplicasWithCacheTotalAccounting(
-        metadata, [&alive_clients](const Replica& replica) {
+        metadata,
+        [&alive_clients](const Replica& replica) {
             return (replica.has_invalid_mem_handle() ||
                     replica.has_invalid_nof_handle() ||
                     replica.has_stale_local_disk_client(alive_clients)) &&
                    replica.is_completed();
-        });
+        },
+        &removed_replica_ids);
+    CancelPromotionTaskForRemovedReplicas(tenant_state, metadata,
+                                          removed_replica_ids);
     const uint64_t after_charge = CompletedMemoryQuotaCharge(metadata);
     if (enable_multi_tenants_ && before_charge > after_charge) {
         auto release_result = metadata.quota_ledger.ReleaseCommitted(
@@ -6730,6 +7081,7 @@ size_t MasterService::RunPromotionCandidateRetry(size_t max_shards_to_scan) {
                     auto meta_it = tenant_state.metadata.find(key);
                     if (meta_it == tenant_state.metadata.end() ||
                         !meta_it->second.IsValid() ||
+                        tenant_state.processing_keys.count(key) > 0 ||
                         tenant_state.promotion_tasks.count(key) > 0 ||
                         meta_it->second.HasReplica(
                             &Replica::fn_is_memory_replica) ||
@@ -6823,6 +7175,13 @@ MasterService::PromotionQueueResult MasterService::TryPushPromotionQueue(
     }
     auto& metadata = accessor.Get();
     auto& tenant_state = accessor.GetTenantState();
+
+    // A primary Put/Upsert owns all PROCESSING replicas while the key is in
+    // processing_keys. Promotion must not establish a second owner.
+    if (accessor.InProcessing()) {
+        EraseCandidate(tenant_state, key);
+        return PromotionQueueResult::kAlreadyInFlight;
+    }
 
     // Dedup: don't queue twice if a promotion is already in flight or if a
     // MEMORY replica has appeared since GetReplicaList observed only-disk.
@@ -6952,6 +7311,10 @@ auto MasterService::PromotionAllocStart(
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
     auto& metadata = accessor.Get();
+
+    if (accessor.InProcessing()) {
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
+    }
 
     // Verify the in-flight task still exists before allocating. The
     // reaper can sweep it between the holder's heartbeat and this
@@ -7343,6 +7706,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
             auto& metadata = it->second;
             if (!metadata.IsValid() ||
                 metadata.AllReplicas(&Replica::fn_is_completed)) {
+                metadata.ClearPendingSoftPinIfNoViableReplica();
                 if (!metadata.IsValid()) {
                     auto next_key_it = std::next(key_it);
                     EraseMetadata(tenant_state, it, tenant_it->first,
@@ -7416,6 +7780,7 @@ void MasterService::DiscardExpiredProcessingReplicas(
                 // Persist OK (or HA disabled / never published) — apply.
                 auto replicas =
                     metadata.PopReplicas(&Replica::fn_is_processing);
+                metadata.ClearPendingSoftPinIfNoViableReplica();
                 if (!replicas.empty()) {
                     discarded_replicas.emplace_back(std::move(replicas), ttl);
                 }
@@ -7779,8 +8144,7 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
                          it != tenant_state.metadata.end();) {
                         if (it->second.HasDiffRepStatus(
                                 ReplicaStatus::COMPLETE) ||
-                            (it->second.IsLeaseExpired(cleanup_now) &&
-                             !it->second.IsSoftPinned(cleanup_now))) {
+                            it->second.IsLeaseExpired(cleanup_now)) {
                             VLOG(1) << "clear metadata key=" << it->first;
                             it = EraseMetadata(tenant_state, it,
                                                tenant_it->first);
@@ -7835,6 +8199,9 @@ tl::expected<void, SerializationError> MasterService::ApplySnapshotState(
         LOG(INFO) << "[Restore] Total allocated size after restore: "
                   << MasterMetricManager::instance().get_allocated_mem_size();
     }
+
+    // Soft pin is runtime-only and is never restored from a snapshot.
+    soft_pin_deadline_index_.Clear();
 
     // Rebuild total capacity metrics
     {
@@ -8016,7 +8383,7 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
             auto& member_metadata = member_it->second;
             if (member_metadata.IsHardPinned() ||
                 !member_metadata.IsLeaseExpired(now) ||
-                (!allow_soft_pinned && member_metadata.IsSoftPinned(now)) ||
+                (!allow_soft_pinned && IsSoftPinActive(member_metadata, now)) ||
                 !can_evict_replicas(member_metadata)) {
                 continue;
             }
@@ -8054,7 +8421,8 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                     auto& metadata = it->second;
                     if (metadata.IsHardPinned() ||
                         !metadata.IsLeaseExpired(now) ||
-                        (!allow_soft_pinned && metadata.IsSoftPinned(now)) ||
+                        (!allow_soft_pinned &&
+                         IsSoftPinActive(metadata, now)) ||
                         !can_evict_replicas(metadata)) {
                         ++it;
                         continue;
@@ -8382,7 +8750,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
             auto& member_metadata = member_it->second;
             if (member_metadata.IsHardPinned() ||
                 !member_metadata.IsLeaseExpired(now) ||
-                (!allow_soft_pinned && member_metadata.IsSoftPinned(now)) ||
+                (!allow_soft_pinned && IsSoftPinActive(member_metadata, now)) ||
                 !can_evict_replicas(member_metadata)) {
                 continue;
             }
@@ -8425,13 +8793,31 @@ void MasterService::BatchEvict(double evict_ratio_target,
     size_t start_idx = randomIndex(kNumShards);
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
 
-    // ===== Phase 1: Parallel candidate collection =====
-    // N threads each scan a batch of shards, collecting Candidates with
-    // shard_idx + tenant_id + key for safe re-lookup in Phase 2.
+    // ===== Phase 1: Parallel candidate census =====
+    // N threads each scan a batch of shards. For selective ratios only the
+    // lease timestamps are collected here; full tenant/key identities are
+    // materialized afterwards for a bounded frontier around the eviction
+    // cutoff. High ratios collect full Candidates directly, because a census
+    // followed by a second scan would cost more than the identities it saves.
     int num_threads = std::min((int)kNumShards, 16);
     size_t shards_per_thread = (kNumShards + num_threads - 1) / num_threads;
 
+    constexpr size_t kMinReserveSlack = 1024;
+    constexpr size_t kMinFrontierLimit = 64 * 1024;
+    constexpr size_t kReserveSlackDivisor = 10;
+    constexpr size_t kFrontierDivisor = 4;
+    // Above this target ratio the reserve frontier would already cover a
+    // large share of the population, so selective materialization stops
+    // paying for the extra scan it costs.
+    constexpr double kCompactPrebypassTargetRatio =
+        static_cast<double>(kReserveSlackDivisor) /
+        static_cast<double>(kFrontierDivisor * (kReserveSlackDivisor + 1));
+    const bool compact_frontier_prebypass =
+        evict_ratio_target >= kCompactPrebypassTargetRatio;
+
     std::vector<std::vector<Candidate>> local_candidates(num_threads);
+    std::vector<std::vector<std::chrono::system_clock::time_point>>
+        local_no_pin(num_threads);
     std::vector<long> local_eviction_base(num_threads, 0);
     std::vector<long> local_object_count(num_threads, 0);
     std::vector<std::vector<std::chrono::system_clock::time_point>>
@@ -8457,10 +8843,15 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         if (has_evictable) shard_evictable_count++;
                         if (!it->second.IsLeaseExpired(now) || !has_evictable)
                             continue;
-                        if (!it->second.IsSoftPinned(now)) {
-                            local_candidates[t].push_back(
-                                {s, tenant_id, it->first,
-                                 it->second.lease_timeout});
+                        if (!IsSoftPinActive(it->second, now)) {
+                            if (compact_frontier_prebypass) {
+                                local_candidates[t].push_back(
+                                    {s, tenant_id, it->first,
+                                     it->second.lease_timeout});
+                            } else {
+                                local_no_pin[t].push_back(
+                                    it->second.lease_timeout);
+                            }
                         } else if (allow_evict_soft_pinned_objects_) {
                             local_soft_pin[t].push_back(
                                 it->second.lease_timeout);
@@ -8482,14 +8873,27 @@ void MasterService::BatchEvict(double evict_ratio_target,
     for (auto v : local_object_count) object_count += v;
 
     std::vector<Candidate> candidates;
-    {
+    if (compact_frontier_prebypass) {
         size_t total = 0;
         for (auto& v : local_candidates) total += v.size();
         candidates.reserve(total);
+        for (auto& v : local_candidates) {
+            candidates.insert(candidates.end(),
+                              std::make_move_iterator(v.begin()),
+                              std::make_move_iterator(v.end()));
+        }
     }
-    for (auto& v : local_candidates) {
-        candidates.insert(candidates.end(), std::make_move_iterator(v.begin()),
-                          std::make_move_iterator(v.end()));
+
+    std::vector<std::chrono::system_clock::time_point> no_pin_timeouts;
+    {
+        size_t total = 0;
+        for (auto& v : local_no_pin) total += v.size();
+        no_pin_timeouts.reserve(total);
+    }
+    for (auto& v : local_no_pin) {
+        no_pin_timeouts.insert(no_pin_timeouts.end(),
+                               std::make_move_iterator(v.begin()),
+                               std::make_move_iterator(v.end()));
     }
 
     std::vector<std::chrono::system_clock::time_point> soft_pin_objects;
@@ -8511,6 +8915,108 @@ void MasterService::BatchEvict(double evict_ratio_target,
         return;
     }
 
+    const long ideal_evict_num =
+        std::ceil(total_eviction_base * evict_ratio_target);
+    const size_t no_pin_count =
+        compact_frontier_prebypass ? candidates.size() : no_pin_timeouts.size();
+    const long primary_no_pin_num =
+        std::min(ideal_evict_num, static_cast<long>(no_pin_count));
+
+    // Re-scan metadata and copy full identities only for objects inside the
+    // requested timestamp range. The eligibility conditions are identical to
+    // the census above, so the selected set matches what the census counted.
+    auto collect_candidates = [&](bool use_cutoff,
+                                  std::chrono::system_clock::time_point cutoff,
+                                  bool collect_older_or_equal) {
+        std::vector<std::vector<Candidate>> local_frontier(num_threads);
+        std::vector<std::thread> collectors;
+        collectors.reserve(num_threads);
+
+        for (int t = 0; t < num_threads; t++) {
+            collectors.emplace_back([&, t] {
+                size_t s_start = t * shards_per_thread;
+                size_t s_end =
+                    std::min(s_start + shards_per_thread, kNumShards);
+                for (size_t s = s_start; s < s_end; s++) {
+                    MetadataShardAccessorRW shard(this, s);
+                    for (const auto& [tenant_id, tenant_state] :
+                         shard->tenants) {
+                        for (const auto& [key, metadata] :
+                             tenant_state.metadata) {
+                            if (metadata.IsHardPinned() ||
+                                !metadata.IsLeaseExpired(now) ||
+                                IsSoftPinActive(metadata, now) ||
+                                !can_evict_replicas(metadata)) {
+                                continue;
+                            }
+                            if (use_cutoff) {
+                                const bool in_range =
+                                    collect_older_or_equal
+                                        ? metadata.lease_timeout <= cutoff
+                                        : metadata.lease_timeout > cutoff;
+                                if (!in_range) continue;
+                            }
+                            local_frontier[t].push_back(
+                                {s, tenant_id, key, metadata.lease_timeout});
+                        }
+                    }
+                }
+            });
+        }
+        for (auto& collector : collectors) collector.join();
+
+        size_t total = 0;
+        for (const auto& v : local_frontier) total += v.size();
+        std::vector<Candidate> merged;
+        merged.reserve(total);
+        for (auto& v : local_frontier) {
+            merged.insert(merged.end(), std::make_move_iterator(v.begin()),
+                          std::make_move_iterator(v.end()));
+        }
+        return merged;
+    };
+
+    bool compact_frontier_used = false;
+    std::chrono::system_clock::time_point reserve_cutoff{};
+
+    if (primary_no_pin_num > 0 && !compact_frontier_prebypass) {
+        const size_t primary_count = static_cast<size_t>(primary_no_pin_num);
+        // The reserve absorbs objects that stop being evictable between the
+        // census and the eviction pass, so ordinary churn does not require a
+        // second materialization pass.
+        const size_t reserve_slack = std::max(
+            kMinReserveSlack,
+            (primary_count + kReserveSlackDivisor - 1) / kReserveSlackDivisor);
+        const size_t reserve_count =
+            std::min(no_pin_count, primary_count + reserve_slack);
+        const size_t frontier_limit =
+            std::max(kMinFrontierLimit,
+                     (no_pin_count + kFrontierDivisor - 1) / kFrontierDivisor);
+
+        if (reserve_count <= frontier_limit) {
+            std::nth_element(no_pin_timeouts.begin(),
+                             no_pin_timeouts.begin() + (reserve_count - 1),
+                             no_pin_timeouts.end());
+            reserve_cutoff = no_pin_timeouts[reserve_count - 1];
+            candidates = collect_candidates(/*use_cutoff=*/true, reserve_cutoff,
+                                            /*collect_older_or_equal=*/true);
+
+            // Shortfall guard: if churn left the frontier holding fewer
+            // objects than the target needs, fall back to the full candidate
+            // set so evict_num below still derives from the requested target
+            // rather than from a shrunken frontier.
+            if (candidates.size() >= primary_count) {
+                compact_frontier_used = true;
+            } else {
+                candidates =
+                    collect_candidates(/*use_cutoff=*/false, {},
+                                       /*collect_older_or_equal=*/true);
+            }
+        } else {
+            candidates = collect_candidates(/*use_cutoff=*/false, {},
+                                            /*collect_older_or_equal=*/true);
+        }
+    }
     // ===== Phase 2: Serial eviction via key lookup =====
     long evicted_count = 0;
     uint64_t total_freed_size = 0;
@@ -8519,8 +9025,6 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
     // First pass: evict candidates with no soft pin
     if (!candidates.empty()) {
-        long ideal_evict_num =
-            std::ceil(total_eviction_base * evict_ratio_target);
         long evict_num = std::min(ideal_evict_num, (long)candidates.size());
 
         std::nth_element(candidates.begin(),
@@ -8534,46 +9038,70 @@ void MasterService::BatchEvict(double evict_ratio_target,
         // continue trying the next one so actual evicted count reaches
         // evict_num. This matches the old per-shard over-eviction behavior.
         long evicted_this_pass = 0;
-        for (auto& c : candidates) {
-            if (evicted_this_pass >= evict_num &&
-                c.lease_timeout > target_timeout) {
-                no_pin_objects.push_back(c.lease_timeout);
-                continue;
-            }
-            {
-                MetadataShardAccessorRW shard(this, c.shard_idx);
-                auto tenant_it = shard->tenants.find(c.tenant_id);
-                if (tenant_it == shard->tenants.end()) continue;
-                auto& tenant_state = tenant_it->second;
-                auto it = tenant_state.metadata.find(c.key);
-                if (it == tenant_state.metadata.end()) continue;
-                // Re-validate: state may have changed since Phase 1
-                if (!it->second.IsLeaseExpired(now) ||
-                    it->second.IsSoftPinned(now) ||
-                    !can_evict_replicas(it->second)) {
+        auto evict_candidate_batch = [&](std::vector<Candidate>& batch) {
+            for (auto& c : batch) {
+                if (evicted_this_pass >= evict_num &&
+                    c.lease_timeout > target_timeout) {
                     no_pin_objects.push_back(c.lease_timeout);
                     continue;
                 }
-                auto evict_result = try_evict_group_or_object(
-                    c.tenant_id, c.key, it->second, shard, tenant_state,
-                    deferred_replicas,
-                    /*allow_soft_pinned=*/false);
-                total_freed_size += evict_result.freed_bytes;
-                if (!enable_oplog_ && !it->second.IsGrouped()) {
-                    PublishKvRemovedAfterEvict(c.key, evict_result.freed_bytes,
-                                               "cpu", it->second, c.tenant_id);
+                {
+                    MetadataShardAccessorRW shard(this, c.shard_idx);
+                    auto tenant_it = shard->tenants.find(c.tenant_id);
+                    if (tenant_it == shard->tenants.end()) continue;
+                    auto& tenant_state = tenant_it->second;
+                    auto it = tenant_state.metadata.find(c.key);
+                    if (it == tenant_state.metadata.end()) continue;
+
+                    // Re-validate: state may have changed since Phase 1
+                    if (!it->second.IsLeaseExpired(now) ||
+                        IsSoftPinActive(it->second, now) ||
+                        !can_evict_replicas(it->second)) {
+                        no_pin_objects.push_back(c.lease_timeout);
+                        continue;
+                    }
+
+                    auto evict_result = try_evict_group_or_object(
+                        c.tenant_id, c.key, it->second, shard, tenant_state,
+                        deferred_replicas,
+                        /*allow_soft_pinned=*/false);
+
+                    total_freed_size += evict_result.freed_bytes;
+
+                    if (!enable_oplog_ && !it->second.IsGrouped()) {
+                        PublishKvRemovedAfterEvict(
+                            c.key, evict_result.freed_bytes, "cpu", it->second,
+                            c.tenant_id);
+                    }
+
+                    if (!enable_oplog_ && !it->second.IsValid()) {
+                        EraseMetadata(tenant_state, it, c.tenant_id,
+                                      QuotaEraseMode::kFull, &shard);
+                    }
+
+                    if (tenant_state.Empty()) {
+                        shard->tenants.erase(tenant_it);
+                    }
+
+                    evicted_count += evict_result.evicted_objects;
+                    evicted_this_pass += evict_result.evicted_objects;
                 }
-                if (!enable_oplog_ && !it->second.IsValid()) {
-                    EraseMetadata(tenant_state, it, c.tenant_id,
-                                  QuotaEraseMode::kFull, &shard);
-                }
-                if (tenant_state.Empty()) {
-                    shard->tenants.erase(tenant_it);
-                }
-                evicted_count += evict_result.evicted_objects;
-                evicted_this_pass += evict_result.evicted_objects;
+                deferred_replicas.clear();
             }
-            deferred_replicas.clear();
+        };
+
+        evict_candidate_batch(candidates);
+
+        // Metadata may change after the frontier is materialized. If the
+        // reserve is exhausted before the target is met, refill from the
+        // remainder of the current no-soft-pin population. This recovery
+        // scan is paid only on churn and preserves the behavior of
+        // continuing past the cutoff until evict_num is reached.
+        if (compact_frontier_used && evicted_this_pass < evict_num) {
+            auto refill_candidates = collect_candidates(
+                /*use_cutoff=*/true, reserve_cutoff,
+                /*collect_older_or_equal=*/false);
+            evict_candidate_batch(refill_candidates);
         }
     }
 
@@ -8616,7 +9144,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                             if (!it->second.IsHardPinned() &&
                                 it->second.IsLeaseExpired(now) &&
                                 it->second.lease_timeout <= target_timeout &&
-                                !it->second.IsSoftPinned(now) &&
+                                !IsSoftPinActive(it->second, now) &&
                                 can_evict_replicas(it->second)) {
                                 auto evict_result = try_evict_group_or_object(
                                     tenant_it->first, it->first, it->second,
@@ -8680,7 +9208,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                 ++it;
                                 continue;
                             }
-                            if (!it->second.IsSoftPinned(now) ||
+                            if (!IsSoftPinActive(it->second, now) ||
                                 it->second.lease_timeout <=
                                     soft_target_timeout) {
                                 auto evict_result = try_evict_group_or_object(
@@ -8839,7 +9367,7 @@ void MasterService::NoFBatchEvict(double evict_ratio_target,
                  shard_evicted_count < ideal_evict_num;) {
                 auto& metadata = it->second;
                 if (metadata.IsHardPinned() || !metadata.IsLeaseExpired(now) ||
-                    metadata.IsSoftPinned(now)) {
+                    IsSoftPinActive(metadata, now)) {
                     ++it;
                     continue;
                 }
@@ -9566,6 +10094,7 @@ MasterService::MetadataSerializer::Deserialize(
 }
 
 void MasterService::MetadataSerializer::Reset() {
+    service_->soft_pin_deadline_index_.Clear();
     for (auto& shard : service_->metadata_shards_) {
         shard.tenants.clear();
     }
@@ -9708,13 +10237,11 @@ MasterService::MetadataSerializer::DeserializeShard(const msgpack::object& obj,
             std::piecewise_construct, std::forward_as_tuple(std::move(key)),
             std::forward_as_tuple(
                 metadata_ptr->client_id, metadata_ptr->put_start_time,
-                metadata_ptr->size, metadata_ptr->PopReplicas(),
-                metadata_ptr->soft_pin_timeout.has_value(),
+                metadata_ptr->size, metadata_ptr->PopReplicas(), std::nullopt,
                 metadata_ptr->IsHardPinned(), metadata_ptr->data_type,
                 metadata_ptr->group_id, tenant_id, user_key));
 
         it->second.lease_timeout = metadata_ptr->lease_timeout;
-        it->second.soft_pin_timeout = metadata_ptr->soft_pin_timeout;
         it->second.object_checksum = metadata_ptr->object_checksum;
 
         // Recompute disk_object_count for restored metadata
@@ -9766,18 +10293,10 @@ MasterService::MetadataSerializer::SerializeMetadata(
             .count();
     packer.pack(lease_timestamp);
 
-    // Serialize soft_pin_timeout (if exists)
-    if (metadata.soft_pin_timeout.has_value()) {
-        packer.pack(true);  // Mark soft_pin_timeout exists
-        auto soft_pin_timestamp =
-            std::chrono::duration_cast<std::chrono::milliseconds>(
-                metadata.soft_pin_timeout.value().time_since_epoch())
-                .count();
-        packer.pack(soft_pin_timestamp);
-    } else {
-        packer.pack(false);        // Mark soft_pin_timeout does not exist
-        packer.pack(uint64_t(0));  // Placeholder
-    }
+    // Keep the legacy snapshot slots for format compatibility, but soft pin is
+    // runtime-only state and is intentionally not persisted.
+    packer.pack(false);
+    packer.pack(uint64_t(0));
 
     // Serialize replicas count
     packer.pack(static_cast<uint32_t>(metadata.CountReplicas()));
@@ -9843,11 +10362,22 @@ MasterService::MetadataSerializer::DeserializeMetadata(
     // Deserialize lease_timeout
     uint64_t lease_timestamp = array[index++].as<uint64_t>();
 
-    // Deserialize soft_pin_timeout flag
-    bool has_soft_pin_timeout = array[index++].as<bool>();
+    // Parse and discard the legacy soft-pin fields. Recovered objects always
+    // become ordinary cache.
+    (void)array[index++].as<bool>();
+    (void)array[index++].as<uint64_t>();
 
-    // Deserialize soft_pin_timeout value
-    uint64_t soft_pin_timestamp = array[index++].as<uint64_t>();
+    const auto max_timestamp =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::time_point::max().time_since_epoch())
+            .count();
+    if (max_timestamp < 0 ||
+        put_start_time_timestamp > static_cast<uint64_t>(max_timestamp) ||
+        lease_timestamp > static_cast<uint64_t>(max_timestamp)) {
+        return tl::unexpected(SerializationError(
+            ErrorCode::DESERIALIZE_FAIL,
+            "ObjectMetadata timestamp exceeds system_clock range"));
+    }
 
     // Deserialize replicas count
     uint32_t replicas_count = array[index++].as<uint32_t>();
@@ -9923,24 +10453,16 @@ MasterService::MetadataSerializer::DeserializeMetadata(
             "deserialize ObjectMetadata optional field type mismatch"));
     }
 
-    // Create ObjectMetadata instance
-    bool enable_soft_pin = has_soft_pin_timeout;
+    // Create ObjectMetadata instance. Soft pin is not restored.
     auto metadata = std::make_unique<ObjectMetadata>(
         client_id,
         std::chrono::system_clock::time_point(
             std::chrono::milliseconds(put_start_time_timestamp)),
-        size, std::move(replicas), enable_soft_pin, is_hard_pinned, data_type,
+        size, std::move(replicas), std::nullopt, is_hard_pinned, data_type,
         group_id);
     metadata->object_checksum = object_checksum;
     metadata->lease_timeout = std::chrono::system_clock::time_point(
         std::chrono::milliseconds(lease_timestamp));
-
-    // Set soft_pin_timeout (if exists)
-    if (has_soft_pin_timeout) {
-        metadata->soft_pin_timeout.emplace(
-            std::chrono::system_clock::time_point(
-                std::chrono::milliseconds(soft_pin_timestamp)));
-    }
 
     return metadata;
 }
@@ -11003,12 +11525,17 @@ ErrorCode MasterService::InitializeBatchOpLogWriter(
     writer_config.max_entries_per_batch = oplog_batch_max_entries_;
     writer_config.initial_durable_prefix = durable_prefix;
     OpLogBatchStorage* storage_ptr = storage.get();
-    auto writer = std::make_unique<OrderedOpLogWriter>(
-        writer_config, [storage_ptr](const OpLogBatchRecord& batch,
-                                     const DurablePrefix& expected_prefix) {
+    OrderedOpLogWriter::WriteBatchFn write_batch =
+        [storage_ptr](const OpLogBatchRecord& batch,
+                      const DurablePrefix& expected_prefix) {
             return storage_ptr->WriteBatchAndAdvancePrefix(batch,
                                                            expected_prefix);
-        });
+        };
+    auto writer =
+        batch_oplog_writer_factory_(writer_config, std::move(write_batch));
+    if (!writer) {
+        return ErrorCode::INVALID_PARAMS;
+    }
     if (!writer->IsAccepting()) {
         return writer->LastError();
     }

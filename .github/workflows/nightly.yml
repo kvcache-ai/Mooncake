@@ -22,15 +22,18 @@ concurrency:
 #    that sorts AFTER the current release per PEP 440, e.g. "0.3.12.dev20260720".
 # 2. Build jobs pass the nightly version via `version-override` to _build-wheel.yaml
 #    so each wheel is stamped with the correct dev version for TestPyPI.
-# 3. publish-testpypi uploads all nightly-* artifacts to TestPyPI.
-# 4. nightly-gate aggregates ALL build + test results; notify-failure files an issue.
+# 3. Specialized platform and packaging checks run nightly instead of on every PR.
+# 4. publish-testpypi uploads all nightly-* artifacts to TestPyPI.
+# 5. nightly-gate aggregates ALL build + test results; notify-failure files an issue.
 # ──────────────────────────────────────────────────────────────────────────────
 
 env:
   SCCACHE_GHA_ENABLED: "true"
 
+# Gate the dependency root so all downstream jobs are skipped in forks.
 jobs:
   version-stamp:
+    if: github.repository == 'kvcache-ai/Mooncake'
     runs-on: ubuntu-22.04
     outputs:
       nightly_version: ${{ steps.version.outputs.nightly_version }}
@@ -50,73 +53,93 @@ jobs:
           echo "nightly_version=$NIGHTLY_VERSION" >> "$GITHUB_OUTPUT"
           echo "Nightly version: $NIGHTLY_VERSION"
 
-  build-cuda128-x86:
+  build-wheels:
     needs: version-stamp
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - variant: cuda
+            architecture: x86_64
+            artifact-prefix: nightly-cuda128-x86
+          - variant: cuda
+            architecture: arm64
+            artifact-prefix: nightly-cuda128-arm64
+          - variant: cuda13
+            architecture: x86_64
+            artifact-prefix: nightly-cuda13-x86
+          - variant: cuda13
+            architecture: arm64
+            artifact-prefix: nightly-cuda13-arm64
+          - variant: non-cuda
+            architecture: x86_64
+            artifact-prefix: nightly-non-cuda-x86
     uses: ./.github/workflows/_build-wheel.yaml
     with:
-      runner: ubuntu-22.04
-      container: pytorch/manylinux2_28-builder:cuda12.8
+      variant: ${{ matrix.variant }}
+      architecture: ${{ matrix.architecture }}
       python-versions: '["3.10", "3.12"]'
-      cuda: container
-      torch-cuda-arch-list: '8.0;9.0'
-      ep-torch-versions: '2.11.0;2.12.0;2.12.1;2.13.0'
-      build-nvlink-allocator: true
-      cmake-args: >-
-        -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON
-        -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
-      artifact-prefix: nightly-cuda128-x86
+      artifact-prefix: ${{ matrix.artifact-prefix }}
       version-override: ${{ needs.version-stamp.outputs.nightly_version }}
 
-  build-cuda128-arm64:
-    needs: version-stamp
-    uses: ./.github/workflows/_build-wheel.yaml
-    with:
-      runner: ubuntu-22.04-arm
-      python-versions: '["3.10", "3.12"]'
-      cuda: sbsa-12.8
-      cmake-generator: Ninja
-      torch-cuda-arch-list: '9.0'
-      cmake-args: >-
-        -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=OFF
-        -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
-      artifact-prefix: nightly-cuda128-arm64
-      version-override: ${{ needs.version-stamp.outputs.nightly_version }}
+  build-musa:
+    runs-on: ubuntu-22.04
+    container: registry.mthreads.com/mcconline/inference/pytorch:2.9.1.post1-py3.10-musa5.2.0-mp31-devel-ubuntu22.04-amd64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
-  build-cuda13-x86:
-    needs: version-stamp
-    uses: ./.github/workflows/_build-wheel.yaml
-    with:
-      runner: ubuntu-22.04
-      container: pytorch/manylinux2_28-builder:cuda13.0
-      python-versions: '["3.10", "3.12"]'
-      cuda: container
-      variant-flag: CU13_BUILD
-      torch-cuda-arch-list: '8.0;9.0'
-      ep-torch-versions: '2.11.0;2.12.0;2.12.1;2.13.0'
-      build-nvlink-allocator: true
-      cmake-args: >-
-        -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON
-        -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
-      artifact-prefix: nightly-cuda13-x86
-      version-override: ${{ needs.version-stamp.outputs.nightly_version }}
+      - name: Mark repository as safe
+        run: git config --global --add safe.directory $GITHUB_WORKSPACE
+        shell: bash
 
-  build-non-cuda-x86:
-    needs: version-stamp
-    uses: ./.github/workflows/_build-wheel.yaml
-    with:
-      runner: ubuntu-22.04
-      container: pytorch/manylinux2_28-builder:cuda12.8
-      python-versions: '["3.10", "3.12"]'
-      cuda: container
-      variant-flag: NON_CUDA_BUILD
-      cmake-args: >-
-        -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=OFF -DWITH_EP=OFF
-        -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
-      artifact-prefix: nightly-non-cuda-x86
-      version-override: ${{ needs.version-stamp.outputs.nightly_version }}
+      - name: Configure project
+        run: |
+          apt update -y
+          apt install -y ninja-build
+          bash -x dependencies.sh -y
+          mkdir build
+          cd build
+          cmake -G Ninja .. -DUSE_MUSA=ON -DUSE_MNNVL=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DUSE_CXL=ON -DUSE_TCP=ON -DWITH_EP=ON -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF -DENABLE_DEBUG_SYMBOLS=OFF
+        shell: bash
+
+      - name: Build project
+        run: |
+          cd build
+          source ~/.bashrc
+          cmake --build . --parallel 1
+          cmake --install .
+        shell: bash
+
+  build-docker:
+    name: Build Docker Image
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Free up disk space
+        uses: ./.github/actions/free-disk-space
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image
+        run: |
+          docker build -f docker/mooncake.Dockerfile \
+            --build-arg PYTHON_VERSION=3.10 \
+            --build-arg EP_TORCH_VERSIONS="2.13.0" \
+            --build-arg CLEAN_BUILD_ARTIFACTS=1 \
+            -t mooncake:from-source .
+
+  ascend-test:
+    uses: ./.github/workflows/ci_ascend.yml
+    secrets: inherit
 
   publish-testpypi:
-    needs: [version-stamp, build-cuda128-x86, build-cuda128-arm64, build-cuda13-x86, build-non-cuda-x86]
+    needs: [version-stamp, build-wheels, nightly-test]
     if: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.skip_publish == 'true') }}
     runs-on: ubuntu-22.04
     environment: nightly
@@ -159,6 +182,7 @@ jobs:
           twine upload --repository testpypi --skip-existing dist-publish/*.whl
 
   nightly-test:
+    needs: version-stamp
     runs-on: ubuntu-22.04
     env:
       CI: "true"
@@ -217,23 +241,40 @@ jobs:
         run: |
           sudo apt update -y
           sudo bash -x dependencies.sh -y
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
           mkdir build && cd build
           cmake -G Ninja .. \
             -DUSE_HTTP=ON -DUSE_CXL=ON -DUSE_UB=ON -DUSE_ETCD=ON -DUSE_CUDA=ON \
             -DSTORE_USE_ETCD=ON -DCMAKE_BUILD_TYPE=Release \
             -DBUILD_UNIT_TESTS=ON -DENABLE_SCCACHE=ON
 
+      - name: Configure CUDA driver runtime
+        run: |
+          cuda_driver_library=$(sed -n \
+            's/^CUDA_cuda_driver_LIBRARY:FILEPATH=//p' build/CMakeCache.txt)
+          if [ -z "$cuda_driver_library" ] || [ ! -f "$cuda_driver_library" ]; then
+            echo "::error::CMake did not resolve the CUDA driver library"
+            exit 1
+          fi
+
+          cuda_driver_dir=$(dirname "$cuda_driver_library")
+          if [ ! -e "$cuda_driver_dir/libcuda.so.1" ]; then
+            sudo ln -s "$(basename "$cuda_driver_library")" \
+              "$cuda_driver_dir/libcuda.so.1"
+          fi
+          echo "LIBRARY_PATH=$cuda_driver_dir:${LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+          echo "LD_LIBRARY_PATH=$cuda_driver_dir:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
+
       - name: Build project
         run: |
           cd build
           cmake --build . -j$(nproc)
-          sudo cmake --install .
+          sudo -E cmake --install .
 
       - name: Build nvlink_allocator.so
         run: |
           mkdir -p build/mooncake-transfer-engine/nvlink-allocator
           cd mooncake-transfer-engine/nvlink-allocator
-          export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
           bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
 
       - name: Start Metadata Server
@@ -246,7 +287,7 @@ jobs:
       - name: Run CTest unit tests
         run: |
           cd build
-          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+          export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
           MC_METADATA_SERVER=http://127.0.0.1:8080/metadata \
           DEFAULT_KV_LEASE_TTL=500 \
             ctest --parallel $(nproc) --output-on-failure
@@ -260,68 +301,208 @@ jobs:
       - name: Run Go store binding integration tests
         env:
           MOONCAKE_STORE_CLUSTER_ID: nightly_go_cluster
-          MOONCAKE_STORE_GO_LINK_COMMON: "0"
           MOONCAKE_STORE_GO_SANITIZED: "0"
         run: ./scripts/ci/run_store_go_integration.sh
 
       - name: Build and install Python wheel for integration tests
         run: |
+          python -m venv "${RUNNER_TEMP}/mooncake-nightly-venv"
+          echo "${RUNNER_TEMP}/mooncake-nightly-venv/bin" >> "$GITHUB_PATH"
+          source "${RUNNER_TEMP}/mooncake-nightly-venv/bin/activate"
           export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
           export CUDA_HOME=/usr/local/cuda
           PYTHON_VERSION=3.12 OUTPUT_DIR=dist ./scripts/build_wheel.sh
-          pip install mooncake-wheel/dist/*.whl
+          python -m pip install mooncake-wheel/dist/*.whl
 
       - name: Run Python integration tests (full suite)
         env:
           MC_METADATA_SERVER: http://127.0.0.1:8080/metadata
+          RUN_TESTS_METADATA_SERVER_MODE: external
           DEFAULT_KV_LEASE_TTL: "500"
           TEST_SSD_OFFLOAD_IN_EVICT: "1"
           TEST_PROMOTION_ON_HIT: "1"
+          TEST_CXL: "1"
         run: |
           export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
           bash scripts/run_tests.sh
 
+  nightly-coverage:
+    runs-on: ubuntu-22.04
+    env:
+      CI: "true"
+      SCCACHE_GHA_ENABLED: "true"
+      CXXFLAGS: --coverage
+      CFLAGS: --coverage
+      LDFLAGS: --coverage
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install and start etcd
+        run: |
+          wget -q https://github.com/etcd-io/etcd/releases/download/v3.6.1/etcd-v3.6.1-linux-amd64.tar.gz
+          tar xzf etcd-v3.6.1-linux-amd64.tar.gz
+          sudo mv etcd-v3.6.1-linux-amd64/etcd* /usr/local/bin/
+          etcd --advertise-client-urls http://127.0.0.1:2379 --listen-client-urls http://127.0.0.1:2379 &
+          sleep 3
+          ETCDCTL_API=3 etcdctl --endpoints=http://127.0.0.1:2379 endpoint health
+
+      - name: Free up disk space
+        uses: ./.github/actions/free-disk-space
+
+      - name: Install CUDA Toolkit
+        uses: Jimver/cuda-toolkit@v0.2.24
+        with:
+          cuda: '12.8.1'
+          linux-local-args: '["--toolkit"]'
+          method: 'network'
+          sub-packages: '["nvcc"]'
+
+      - name: Install coverage tools and build utilities
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lcov gcovr ninja-build
+
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Configure sccache
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Configure project with coverage support
+        run: |
+          sudo apt update -y
+          sudo bash -x dependencies.sh -y
+          mkdir build
+          cd build
+          cmake -G Ninja .. -DUSE_HTTP=ON -DUSE_CXL=ON -DUSE_UB=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Debug -DENABLE_DEBUG_SYMBOLS=OFF
+
+      - name: Build project
+        run: |
+          cd build
+          cmake --build . --parallel "$(nproc)"
+          sudo cmake --install .
+
+      - name: Start Metadata Server
+        run: |
+          cd mooncake-transfer-engine/example/http-metadata-server-python
+          pip install aiohttp
+          python ./bootstrap_server.py &
+          sleep 2
+
+      - name: Run CTest with coverage
+        run: |
+          cd build
+          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+          MC_METADATA_SERVER=http://127.0.0.1:8080/metadata \
+          DEFAULT_KV_LEASE_TTL=500 \
+            ctest --parallel $(nproc) --output-on-failure
+
+      - name: Generate coverage report
+        id: coverage
+        run: |
+          cd build
+          echo "=== Starting coverage report generation ==="
+          echo "Current directory: $(pwd)"
+
+          echo "=== Looking for .gcda files ==="
+          find . -name "*.gcda" 2>/dev/null | head -10 || echo "No .gcda files found"
+
+          echo "=== Running lcov ==="
+          lcov --capture --directory . --output-file coverage.info 2>&1 || {
+            echo "WARNING: lcov failed to capture coverage data"
+            echo "Creating minimal lcov-compliant coverage file to allow CI to continue"
+            echo "TN:dummy" > coverage.filtered.info
+            echo "SF:/dev/null" >> coverage.filtered.info
+            echo "DA:0,0" >> coverage.filtered.info
+            echo "end_of_record" >> coverage.filtered.info
+            echo "coverage_failed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+
+          echo "=== Processing coverage data ==="
+          lcov --remove coverage.info '/usr/*' '*/test/*' '*/third_party/*' '*/benchmarks/*' --output-file coverage.filtered.info 2>&1 || true
+
+          echo "=== Generating HTML report ==="
+          genhtml coverage.filtered.info --output-directory coverage_report 2>&1 || echo "genhtml failed, continuing..."
+
+          echo "=== Coverage summary ==="
+          lcov --list coverage.filtered.info 2>&1 || echo "lcov list failed"
+
+          echo "=== Coverage report generation completed ==="
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: build/coverage.filtered.info
+          flags: unittests
+          name: nightly-code-coverage-report
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+        continue-on-error: true
+
+      - name: Check coverage status
+        if: always()
+        run: |
+          if [ "${{ steps.coverage.outputs.coverage_failed }}" = "true" ]; then
+            echo "Coverage collection failed but the nightly workflow continued"
+            echo "::warning::Code coverage collection failed. Please check the logs."
+          else
+            echo "Coverage collected successfully"
+          fi
+
   nightly-gate:
-    if: always()
-    needs: [build-cuda128-x86, build-cuda128-arm64, build-cuda13-x86, build-non-cuda-x86, publish-testpypi, nightly-test]
+    # always() bypasses skipped dependencies, so this job needs its own guard.
+    if: ${{ always() && github.repository == 'kvcache-ai/Mooncake' }}
+    needs:
+      - version-stamp
+      - build-wheels
+      - build-musa
+      - build-docker
+      - ascend-test
+      - publish-testpypi
+      - nightly-test
+      - nightly-coverage
     runs-on: ubuntu-22.04
     steps:
       - name: Check results
         run: |
           echo "=== Nightly Gate Summary ==="
-          echo "Build CUDA 12.8 x86: ${{ needs.build-cuda128-x86.result }}"
-          echo "Build CUDA 12.8 arm64: ${{ needs.build-cuda128-arm64.result }}"
-          echo "Build CUDA 13 x86: ${{ needs.build-cuda13-x86.result }}"
-          echo "Build non-CUDA x86: ${{ needs.build-non-cuda-x86.result }}"
-          echo "Publish: ${{ needs.publish-testpypi.result }}"
-          echo "Test: ${{ needs.nightly-test.result }}"
-          # Fail if any build job did not succeed
-          if [ "${{ needs.build-cuda128-x86.result }}" != "success" ]; then
-            echo "::error::Build CUDA 12.8 x86 failed!"
-            exit 1
-          fi
-          if [ "${{ needs.build-cuda128-arm64.result }}" != "success" ]; then
-            echo "::error::Build CUDA 12.8 arm64 failed!"
-            exit 1
-          fi
-          if [ "${{ needs.build-cuda13-x86.result }}" != "success" ]; then
-            echo "::error::Build CUDA 13 x86 failed!"
-            exit 1
-          fi
-          if [ "${{ needs.build-non-cuda-x86.result }}" != "success" ]; then
-            echo "::error::Build non-CUDA x86 failed!"
-            exit 1
-          fi
-          if [ "${{ needs.nightly-test.result }}" != "success" ]; then
-            echo "::error::Nightly tests failed!"
-            exit 1
-          fi
-          # publish-testpypi may be skipped (skip_publish=true) — only fail on actual failure
-          if [ "${{ needs.publish-testpypi.result }}" == "failure" ]; then
-            echo "::error::Nightly publish failed!"
+          echo "$NEEDS_JSON" | jq -r '
+            to_entries[] | "\(.key): \(.value.result)"'
+
+          failing=$(echo "$NEEDS_JSON" | jq -r \
+            --arg allow_publish_skip "$ALLOW_PUBLISH_SKIP" '
+              to_entries[] |
+              select(
+                .value.result != "success" and
+                (.key != "publish-testpypi" or
+                 .value.result != "skipped" or
+                 $allow_publish_skip != "true")
+              ) |
+              "\(.key): \(.value.result)"')
+          if [ -n "$failing" ]; then
+            echo "::error::The following nightly jobs did not succeed:"
+            echo "$failing"
             exit 1
           fi
           echo "All nightly jobs passed!"
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
+          ALLOW_PUBLISH_SKIP: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.skip_publish == 'true' }}
 
   notify-failure:
     if: ${{ always() && needs.nightly-gate.result == 'failure' }}

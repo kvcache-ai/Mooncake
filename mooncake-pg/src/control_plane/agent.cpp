@@ -1,16 +1,17 @@
 #include "control_plane/agent.h"
 
 #include <algorithm>
+#include <utility>
 #include <glog/logging.h>
+
+#include "error_types.h"
 
 namespace mooncake {
 
 AgentStateMachine::AgentStateMachine(GlobalRank rank, int max_world_size)
     : rank_(rank), max_world_size_(max_world_size) {
-    CHECK_GT(max_world_size_, 0);
-    CHECK_LE(max_world_size_, kMaxNumRanks)
-        << "max_world_size " << max_world_size_ << " exceeds kMaxNumRanks ("
-        << kMaxNumRanks << ")";
+    PG_ASSERT(max_world_size_ > 0 && max_world_size_ <= kMaxNumRanks,
+              "invalid max_world_size: ", max_world_size_);
     global_rank_states_ = std::vector<RankState>(max_world_size_);
     global_rank_epochs_.assign(max_world_size_, 0);
     global_rank_state_versions_.assign(max_world_size_, 0);
@@ -30,9 +31,9 @@ void AgentStateMachine::appendApplyViewEffect(const GroupView& view,
                          (member.isActive() || member.isAwaitingActivation()) &&
                          member.hasEndpoint();
     }
-    effects.push_back(ApplyViewToBackend{view, global_rank_states_,
-                                         global_rank_epochs_,
-                                         std::move(activatable)});
+    effects.push_back(ApplyViewToCommunicator{view, global_rank_states_,
+                                              global_rank_epochs_,
+                                              std::move(activatable)});
 }
 
 AgentApplyResult AgentStateMachine::registerGroup(const GroupView& group) {
@@ -107,6 +108,7 @@ AgentApplyResult AgentStateMachine::handlePeerJoined(
     rank_connections_[push.rank] = RankConnectionMetadata{
         .rank = push.rank,
         .rank_epoch = push.rank_epoch,
+        .agent_addr = "",
         .te_server_name = push.te_server_name,
         .warmup_recv_addr = push.warmup_recv_addr,
     };
@@ -153,7 +155,7 @@ AgentApplyResult AgentStateMachine::handleRankStateUpdate(
     return effects;
 }
 
-std::pair<AgentApplyResult, bool> AgentStateMachine::applyGroupView(
+PGResult<AgentApplyResult> AgentStateMachine::applyGroupView(
     const GroupView& view) {
     AgentApplyResult effects;
     const auto& group_id = view.group_id;
@@ -161,7 +163,9 @@ std::pair<AgentApplyResult, bool> AgentStateMachine::applyGroupView(
     if (it == groups_.end()) {
         LOG(WARNING) << "[AGENT] applyGroupView group=" << group_id
                      << " NOT FOUND in groups_ (epoch=" << view.epoch << ")";
-        return {effects, false};
+        return makePGError(
+            PGErrorCode::InvalidState,
+            "group not found while applying GroupView: " + group_id);
     }
 
     const auto& old_view = it->second;
@@ -172,12 +176,14 @@ std::pair<AgentApplyResult, bool> AgentStateMachine::applyGroupView(
     if (view.epoch < old_view.epoch) {
         LOG(WARNING) << "[AGENT] Ignored stale GroupView for group=" << group_id
                      << " epoch=" << view.epoch;
-        return {effects, false};
+        return effects;
     } else if (view.epoch == old_view.epoch) {
-        if (view == old_view) return {effects, true};
+        if (view == old_view) return effects;
         LOG(ERROR) << "[AGENT] Ignored conflicting GroupView for group="
                    << group_id << " epoch=" << view.epoch;
-        return {effects, false};
+        return makePGError(PGErrorCode::InternalError,
+                           "conflicting GroupView for group " + group_id +
+                               " at epoch " + std::to_string(view.epoch));
     }
 
     // Collect peers whose segment caches must be refreshed.
@@ -230,16 +236,16 @@ std::pair<AgentApplyResult, bool> AgentStateMachine::applyGroupView(
 
     it->second = view;
 
-    // Must come AFTER ApplyViewToBackend: refreshSegmentID requires
+    // Must come AFTER ApplyViewToCommunicator: refreshSegmentID requires
     // latest meta_->rank_order.
     for (auto gr : need_segment_refresh) {
         effects.push_back(NotifyLinkRefreshed{gr});
     }
 
-    return {effects, true};
+    return effects;
 }
 
-std::pair<AgentApplyResult, bool> AgentStateMachine::handleViewUpdate(
+PGResult<AgentApplyResult> AgentStateMachine::handleViewUpdate(
     const ViewUpdatePush& push) {
     return applyGroupView(push.view);
 }
@@ -349,6 +355,8 @@ AgentApplyResult AgentStateMachine::pushLinkEvent(const LinkEvent& event) {
     for (int peer = 0; peer < max_world_size_; ++peer) {
         auto type = event.events[peer];
         if (type == LinkEvent::EventType::None) continue;
+        const bool has_prior_link_observation =
+            observed_link_state_[peer] != LinkEvent::EventType::None;
         if (!recordLinkEvent(peer, event.target_rank_epochs[peer], type))
             continue;
 
@@ -356,7 +364,11 @@ AgentApplyResult AgentStateMachine::pushLinkEvent(const LinkEvent& event) {
         if (type == LinkEvent::EventType::Failure) {
             effects.push_back(RequestLinkHealthCheck{peer});
         } else if (peer != rank_) {
-            effects.push_back(ResetPeerState{peer});
+            // Reset only when this success follows an earlier observation,
+            // i.e. a recovery or a new peer incarnation.
+            if (has_prior_link_observation) {
+                effects.push_back(ResetPeerState{peer});
+            }
             effects.push_back(NotifyLinkRefreshed{peer});
         }
     }

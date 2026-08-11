@@ -13,6 +13,8 @@
 #include <type_traits>
 #include <vector>
 
+#include "error_types.h"
+
 namespace mooncake {
 
 // Generic single-threaded serialized executor.
@@ -24,6 +26,23 @@ namespace mooncake {
 //   - post() may be called from any thread.
 //   - The tick callback and all tasks run on the executor thread.
 class SerializedExecutor {
+   private:
+    // Flatten postAndWait task results:
+    //   T           -> PGResult<T>
+    //   PGResult<T> -> PGResult<T>
+    template <typename T>
+    struct PostAndWaitResult {
+        using type = PGResult<T>;
+    };
+
+    template <typename T>
+    struct PostAndWaitResult<PGResult<T>> {
+        using type = PGResult<T>;
+    };
+
+    template <typename T>
+    using PostAndWaitResultT = typename PostAndWaitResult<T>::type;
+
    public:
     SerializedExecutor() = default;
     explicit SerializedExecutor(std::string name) : name_(std::move(name)) {}
@@ -71,16 +90,18 @@ class SerializedExecutor {
     }
 
     // Post a task and block the caller until it completes on the executor
-    // thread.  The task's return value (if any) is forwarded to the caller;
-    // exceptions thrown inside the task are re-raised on the caller.
+    // thread. The task's return value is wrapped in PGResult, while an existing
+    // PGResult is forwarded without nesting. Exceptions thrown inside the task
+    // are re-raised on the caller.
     //
     // Must NOT be called from the executor thread itself (deadlock).
     template <typename F>
-    auto postAndWait(F&& f) -> std::invoke_result_t<F> {
+    auto postAndWait(F&& f) -> PostAndWaitResultT<std::invoke_result_t<F>> {
         using R = std::invoke_result_t<F>;
+        using Result = PostAndWaitResultT<R>;
         std::promise<R> promise;
         auto future = promise.get_future();
-        bool ok = post([&promise, fn = std::forward<F>(f)]() mutable {
+        PG_TRY(post([&promise, fn = std::forward<F>(f)]() mutable {
             try {
                 if constexpr (std::is_void_v<R>) {
                     fn();
@@ -91,38 +112,34 @@ class SerializedExecutor {
             } catch (...) {
                 promise.set_exception(std::current_exception());
             }
-        });
-        if (!ok) {
-            throw std::runtime_error(
-                "SerializedExecutor::postAndWait: executor not running");
-        }
+        }));
         if constexpr (std::is_void_v<R>) {
             future.get();
+            return {};
         } else {
-            return future.get();
+            return Result{future.get()};
         }
     }
 
     // Post a task to the executor.  May be called from any thread.
     // Tasks are processed in FIFO order on the executor thread.
-    // Returns false if the executor is not running (task is silently dropped).
-    bool post(std::function<void()> task) {
-        if (!running_.load(std::memory_order_acquire)) {
-            return false;
-        }
+    // Returns InvalidState if the executor is not running.
+    PGResult<void> post(std::function<void()> task) {
+        PG_VALIDATE_STATE(running_.load(std::memory_order_acquire),
+                          "SerializedExecutor(" + name_ + ") is not running");
         {
             std::lock_guard<std::mutex> lock(mutex_);
             // Double-check: running_ may have flipped between the check above
             // and acquiring the mutex.  If the executor has stopped, drop
             // the task to avoid leaking it (shutdown already drained the
             // queue).
-            if (!running_.load(std::memory_order_acquire)) {
-                return false;
-            }
+            PG_VALIDATE_STATE(
+                running_.load(std::memory_order_acquire),
+                "SerializedExecutor(" + name_ + ") is not running");
             queue_.push_back(std::move(task));
         }
         cv_.notify_one();
-        return true;
+        return {};
     }
 
     // Set a callback that fires after every batch of tasks, even empty

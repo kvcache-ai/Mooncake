@@ -277,5 +277,179 @@ TEST_F(ConnPauseTtlEnvTest, EmptyStringKeepsDefault) {
     EXPECT_EQ(config.conn_pause_ttl_ms, 17);
 }
 
+// MC_MAX_CONCURRENT_REG_MR caps how many buffers registerLocalMemoryBatch()
+// registers at once; 0 (the default) means unbounded. 0 is therefore also what
+// a silent atol() fallback would produce on a typo, which would read as "the
+// knob was honored and asked for no cap" -- the opposite of what the operator
+// wanted. So a typo must be rejected loudly and leave the field untouched.
+class MaxConcurrentRegMrEnvTest : public ::testing::Test {
+   protected:
+    void TearDown() override { ::unsetenv("MC_MAX_CONCURRENT_REG_MR"); }
+};
+
+TEST_F(MaxConcurrentRegMrEnvTest, UnboundedWhenUnset) {
+    ::unsetenv("MC_MAX_CONCURRENT_REG_MR");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.max_concurrent_reg_mr, 0u);
+}
+
+TEST_F(MaxConcurrentRegMrEnvTest, ValidOverrideIsApplied) {
+    ASSERT_EQ(::setenv("MC_MAX_CONCURRENT_REG_MR", "8", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.max_concurrent_reg_mr, 8u);
+}
+
+TEST_F(MaxConcurrentRegMrEnvTest, ExplicitZeroSelectsUnbounded) {
+    ASSERT_EQ(::setenv("MC_MAX_CONCURRENT_REG_MR", "0", 1), 0);
+    GlobalConfig config;
+    config.max_concurrent_reg_mr = 99;  // sentinel must be overwritten by 0
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.max_concurrent_reg_mr, 0u);
+}
+
+TEST_F(MaxConcurrentRegMrEnvTest, OneIsAcceptedAndSerializes) {
+    ASSERT_EQ(::setenv("MC_MAX_CONCURRENT_REG_MR", "1", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.max_concurrent_reg_mr, 1u);
+}
+
+TEST_F(MaxConcurrentRegMrEnvTest, NegativeIsIgnored) {
+    ASSERT_EQ(::setenv("MC_MAX_CONCURRENT_REG_MR", "-1", 1), 0);
+    GlobalConfig config;
+    config.max_concurrent_reg_mr = 11;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.max_concurrent_reg_mr, 11u);
+}
+
+TEST_F(MaxConcurrentRegMrEnvTest, NonNumericKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_MAX_CONCURRENT_REG_MR", "abc", 1), 0);
+    GlobalConfig config;
+    config.max_concurrent_reg_mr = 13;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.max_concurrent_reg_mr, 13u);
+}
+
+TEST_F(MaxConcurrentRegMrEnvTest, NumericSuffixKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_MAX_CONCURRENT_REG_MR", "8x", 1), 0);
+    GlobalConfig config;
+    config.max_concurrent_reg_mr = 15;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.max_concurrent_reg_mr, 15u);
+}
+
+TEST_F(MaxConcurrentRegMrEnvTest, EmptyStringKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_MAX_CONCURRENT_REG_MR", "", 1), 0);
+    GlobalConfig config;
+    config.max_concurrent_reg_mr = 17;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.max_concurrent_reg_mr, 17u);
+}
+
+class EfaNicSelectionEnvTest : public ::testing::Test {
+   protected:
+    void TearDown() override { ::unsetenv("MC_EFA_NIC_SELECTION"); }
+};
+
+TEST_F(EfaNicSelectionEnvTest, DefaultsToAll) {
+    ::unsetenv("MC_EFA_NIC_SELECTION");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.efa_nic_selection, EfaNicSelection::ALL);
+}
+
+TEST_F(EfaNicSelectionEnvTest, LocalIsApplied) {
+    ASSERT_EQ(::setenv("MC_EFA_NIC_SELECTION", "local", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.efa_nic_selection, EfaNicSelection::LOCAL);
+}
+
+TEST_F(EfaNicSelectionEnvTest, AllIsAcceptedExplicitly) {
+    ASSERT_EQ(::setenv("MC_EFA_NIC_SELECTION", "all", 1), 0);
+    GlobalConfig config;
+    config.efa_nic_selection = EfaNicSelection::LOCAL;  // must be overwritten
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.efa_nic_selection, EfaNicSelection::ALL);
+}
+
+TEST_F(EfaNicSelectionEnvTest, CaseIsIgnored) {
+    ASSERT_EQ(::setenv("MC_EFA_NIC_SELECTION", "LOCAL", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.efa_nic_selection, EfaNicSelection::LOCAL);
+}
+
+TEST_F(EfaNicSelectionEnvTest, UnknownValueKeepsDefault) {
+    // A typo must not silently pick a policy: registering buffers on the wrong
+    // NIC set is a correctness-adjacent surprise, not a perf knob.
+    ASSERT_EQ(::setenv("MC_EFA_NIC_SELECTION", "topology", 1), 0);
+    GlobalConfig config;
+    config.efa_nic_selection = EfaNicSelection::LOCAL;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.efa_nic_selection, EfaNicSelection::LOCAL);
+}
+
+TEST_F(EfaNicSelectionEnvTest, EmptyStringKeepsDefault) {
+    ASSERT_EQ(::setenv("MC_EFA_NIC_SELECTION", "", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.efa_nic_selection, EfaNicSelection::ALL);
+}
+
+// max_wr_from_env distinguishes "the operator asked for this depth" from "this
+// is the compiled-in default".  The EFA transport needs that distinction: with
+// no override it adopts the provider's per-device transmit queue depth, which
+// no fixed default can match (2048 on p6-b300, 4096 on p5).  A rejected value
+// must NOT set the flag, or a typo would be treated as a deliberate override.
+class MaxWrEnvTest : public ::testing::Test {
+   protected:
+    void TearDown() override { ::unsetenv("MC_MAX_WR"); }
+};
+
+TEST_F(MaxWrEnvTest, NotFromEnvWhenUnset) {
+    ::unsetenv("MC_MAX_WR");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_FALSE(config.max_wr_from_env);
+    EXPECT_EQ(config.max_wr, 256u);  // default preserved for RDMA
+}
+
+TEST_F(MaxWrEnvTest, ValidOverrideSetsFlag) {
+    ASSERT_EQ(::setenv("MC_MAX_WR", "2048", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_TRUE(config.max_wr_from_env);
+    EXPECT_EQ(config.max_wr, 2048u);
+}
+
+TEST_F(MaxWrEnvTest, RejectedValueDoesNotSetFlag) {
+    // 0 is out of range.  The value is ignored, so the EFA transport must
+    // still treat this as "no override" and track the provider's depth.
+    ASSERT_EQ(::setenv("MC_MAX_WR", "0", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_FALSE(config.max_wr_from_env);
+    EXPECT_EQ(config.max_wr, 256u);
+}
+
+TEST_F(MaxWrEnvTest, NonNumericDoesNotSetFlag) {
+    ASSERT_EQ(::setenv("MC_MAX_WR", "abc", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_FALSE(config.max_wr_from_env);
+    EXPECT_EQ(config.max_wr, 256u);
+}
+
+TEST_F(MaxWrEnvTest, OutOfRangeDoesNotSetFlag) {
+    ASSERT_EQ(::setenv("MC_MAX_WR", "70000", 1), 0);  // > UINT16_MAX
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_FALSE(config.max_wr_from_env);
+    EXPECT_EQ(config.max_wr, 256u);
+}
+
 }  // namespace
 }  // namespace mooncake
