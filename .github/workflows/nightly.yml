@@ -306,10 +306,13 @@ jobs:
 
       - name: Build and install Python wheel for integration tests
         run: |
+          python -m venv "${RUNNER_TEMP}/mooncake-nightly-venv"
+          echo "${RUNNER_TEMP}/mooncake-nightly-venv/bin" >> "$GITHUB_PATH"
+          source "${RUNNER_TEMP}/mooncake-nightly-venv/bin/activate"
           export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
           export CUDA_HOME=/usr/local/cuda
           PYTHON_VERSION=3.12 OUTPUT_DIR=dist ./scripts/build_wheel.sh
-          pip install mooncake-wheel/dist/*.whl
+          python -m pip install mooncake-wheel/dist/*.whl
 
       - name: Run Python integration tests (full suite)
         env:
