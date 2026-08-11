@@ -37,8 +37,7 @@ class CallbackInvocationGuard {
     ~CallbackInvocationGuard() { on_exit_(); }
 
     CallbackInvocationGuard(const CallbackInvocationGuard&) = delete;
-    CallbackInvocationGuard& operator=(const CallbackInvocationGuard&) =
-        delete;
+    CallbackInvocationGuard& operator=(const CallbackInvocationGuard&) = delete;
 
    private:
     Fn on_exit_;
