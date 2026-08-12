@@ -3,6 +3,7 @@ from __future__ import annotations
 import ctypes
 import io
 import json
+import threading
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
@@ -23,6 +24,15 @@ try:
     from mooncake._fast_copy import concat_arrays_into as _concat_arrays_into
 except Exception:  # pragma: no cover
     _concat_arrays_into = None
+
+try:
+    from mooncake._fast_copy import (
+        export_arrow_u8 as _export_arrow_u8,
+        pillow_arrow_view as _pillow_arrow_view,
+    )
+except Exception:  # pragma: no cover
+    _export_arrow_u8 = None
+    _pillow_arrow_view = None
 
 DEFAULT_BUNDLE_CHUNK_BYTES = 64 * 1024**2
 AUTO_PARALLEL_MIN_BYTES = DEFAULT_BUNDLE_CHUNK_BYTES
@@ -215,6 +225,48 @@ class _PoolLeaseOwner:
         if not self.released:
             self.lease.release()
             self.released = True
+
+    def __del__(self) -> None:
+        self.release()
+
+
+class _SharedPoolOwner:
+    def __init__(self, owner: _PoolLeaseOwner) -> None:
+        self._owner = owner
+        self._references = 0
+        self._lock = threading.Lock()
+
+    def acquire(self) -> "_SharedPoolOwnerToken":
+        with self._lock:
+            if self._owner is None:
+                raise RuntimeError("BufferPool owner has already been released")
+            self._references += 1
+        return _SharedPoolOwnerToken(self)
+
+    def release(self) -> None:
+        owner = None
+        with self._lock:
+            if self._references <= 0:
+                return
+            self._references -= 1
+            if self._references == 0:
+                owner, self._owner = self._owner, None
+        if owner is not None:
+            owner.release()
+
+
+class _SharedPoolOwnerToken:
+    def __init__(self, shared: _SharedPoolOwner) -> None:
+        self._shared = shared
+        self._released = False
+        self._lock = threading.Lock()
+
+    def release(self) -> None:
+        with self._lock:
+            if self._released:
+                return
+            self._released = True
+        self._shared.release()
 
     def __del__(self) -> None:
         self.release()
@@ -3074,7 +3126,7 @@ def _validate_pil_state_tree(value: Any) -> None:
             )
 
 
-def _encode_pil_image(value: Any) -> tuple[bytes, bytes]:
+def _encode_pil_image(value: Any) -> tuple[bytes | memoryview, bytes]:
     frame_count = int(getattr(value, "n_frames", 1))
     if frame_count != 1:
         raise ValueError(
@@ -3114,8 +3166,26 @@ def _encode_pil_image(value: Any) -> tuple[bytes, bytes]:
             )
         ):
             raise ValueError("invalid PIL image palette")
+    pixels = None
+    storage = None
+    if value.mode == "RGB" and _pillow_arrow_view is not None:
+        try:
+            pixels = memoryview(_pillow_arrow_view(value))
+        except (
+            AttributeError,
+            NotImplementedError,
+            RuntimeError,
+            TypeError,
+            ValueError,
+        ):
+            pass
+        else:
+            if len(pixels) == width * height * 4:
+                storage = "RGBX"
+            else:
+                pixels = None
     state = [
-        1,
+        2 if storage is not None else 1,
         value.mode,
         int(width),
         int(height),
@@ -3123,6 +3193,8 @@ def _encode_pil_image(value: Any) -> tuple[bytes, bytes]:
         palette,
         dict(value.info),
     ]
+    if storage is not None:
+        state.append(storage)
     _validate_pil_state_tree(state)
     state_bytes = _msgpack.packb(
         state,
@@ -3132,7 +3204,7 @@ def _encode_pil_image(value: Any) -> tuple[bytes, bytes]:
     )
     if len(state_bytes) > _PIL_MEDIA_STATE_MAX_BYTES:
         raise ValueError(f"PIL image state is too large: {len(state_bytes)} bytes")
-    return value.tobytes(), state_bytes
+    return (pixels if pixels is not None else value.tobytes()), state_bytes
 
 
 def _value_to_media_parts(
@@ -3206,7 +3278,19 @@ def _multi_buffer_bytes_payload(
     return _MultiBufferPayload(buffers, tuple(parts))
 
 
-def _decode_pil_image(data: Any, state_bytes: Any) -> Any:
+class _ArrowU8Provider:
+    def __init__(self, data: Any) -> None:
+        self._data = data
+
+    def __arrow_c_array__(self, requested_schema: Any = None) -> Any:
+        if _export_arrow_u8 is None:
+            raise NotImplementedError("Pillow Arrow support is unavailable")
+        return _export_arrow_u8(self._data, requested_schema)
+
+
+def _decode_pil_image(
+    data: Any, state_bytes: Any, *, raw_fallback: bool = False
+) -> Any:
     try:
         if len(state_bytes) > _PIL_MEDIA_STATE_MAX_BYTES:
             raise ValueError("PIL image state is too large")
@@ -3229,11 +3313,13 @@ def _decode_pil_image(data: Any, state_bytes: Any) -> Any:
         _msgpack.UnpackException,
     ) as exc:
         raise ValueError("invalid PIL image state") from exc
-    if not isinstance(state, list) or len(state) != 7 or type(state[0]) is not int:
+    if not isinstance(state, list) or len(state) not in {7, 8}:
         raise ValueError("unsupported PIL image state")
-    if state[0] != 1:
+    version = state[0]
+    if type(version) is not int or version not in {1, 2} or len(state) != version + 6:
         raise ValueError("unsupported PIL image state")
-    _, mode, width, height, image_format, palette, info = state
+    _, mode, width, height, image_format, palette, info, *storage_state = state
+    storage = storage_state[0] if storage_state else None
     if not isinstance(mode, str) or (
         image_format is not None and not isinstance(image_format, str)
     ):
@@ -3251,17 +3337,18 @@ def _decode_pil_image(data: Any, state_bytes: Any) -> Any:
     ):
         raise ValueError("invalid PIL image mode, format, or dimensions")
     pixels = data
-    expected_pixel_bytes = _pil_pixel_bytes(mode, width, height)
+    if storage not in {None, "RGBX"} or (storage == "RGBX" and mode != "RGB"):
+        raise ValueError("invalid PIL image storage")
+    expected_pixel_bytes = (
+        width * height * 4
+        if storage == "RGBX"
+        else _pil_pixel_bytes(mode, width, height)
+    )
     if len(pixels) != expected_pixel_bytes:
         raise ValueError(
             f"invalid PIL image pixel length: {len(pixels)}, "
             f"expected {expected_pixel_bytes}"
         )
-    try:
-        from PIL import Image
-    except ImportError as exc:
-        raise ImportError("Pillow is required to decode PIL image payloads") from exc
-    image = Image.frombuffer(mode, (width, height), pixels, "raw", mode, 0, 1)
     if palette is not None:
         valid_palette = isinstance(palette, list) and len(palette) == 2
         palette_mode = palette[0] if valid_palette else None
@@ -3274,9 +3361,39 @@ def _decode_pil_image(data: Any, state_bytes: Any) -> Any:
             or len(palette_data) % len(palette_mode)
         ):
             raise ValueError("invalid PIL image palette")
-        image.putpalette(palette_data, palette_mode)
     if not isinstance(info, dict):
         raise ValueError("invalid PIL image info")
+    try:
+        from PIL import Image
+    except ImportError as exc:
+        if not raw_fallback:
+            raise ImportError(
+                "Pillow is required to decode PIL image payloads"
+            ) from exc
+        if storage == "RGBX":
+            return (
+                np.frombuffer(pixels, dtype=np.uint8)
+                .reshape(-1, 4)[:, :3]
+                .tobytes()
+            )
+        return bytes(pixels)
+    if storage == "RGBX":
+        fromarrow = getattr(Image, "fromarrow", None)
+        if _export_arrow_u8 is not None and callable(fromarrow):
+            try:
+                image = fromarrow(_ArrowU8Provider(pixels), mode, (width, height))
+            except (AttributeError, NotImplementedError, TypeError, ValueError):
+                image = Image.frombytes(
+                    mode, (width, height), pixels, "raw", "RGBX", 0, 1
+                )
+        else:
+            image = Image.frombytes(
+                mode, (width, height), pixels, "raw", "RGBX", 0, 1
+            )
+    else:
+        image = Image.frombuffer(mode, (width, height), pixels, "raw", mode, 0, 1)
+    if palette is not None:
+        image.putpalette(palette_data, palette_mode)
     image.info = info
     image.format = image_format
     return image
@@ -3285,7 +3402,7 @@ def _decode_pil_image(data: Any, state_bytes: Any) -> Any:
 def _decode_media_bytes(
     data: Any,
     framed: bool = False,
-    owner: Any = None,
+    owner: _SharedPoolOwner | None = None,
 ) -> Any:
     if not framed:
         return bytes(data)
@@ -3303,12 +3420,9 @@ def _decode_media_bytes(
     if state_size > _PIL_MEDIA_STATE_MAX_BYTES or state_end > len(data):
         raise ValueError("invalid framed PIL state")
     pixels = data[state_end:]
-    try:
-        image = _decode_pil_image(pixels, data[5:state_end])
-    except ImportError:
-        return bytes(pixels)
+    image = _decode_pil_image(pixels, data[5:state_end], raw_fallback=True)
     if owner is not None and bool(getattr(image, "readonly", False)):
-        image._mooncake_pool_owner = owner
+        image._mooncake_pool_owner = owner.acquire()
     return image
 
 
@@ -3327,21 +3441,16 @@ def _decode_bytes_like_values(
     nulls = payload["nulls"]
     framed = _media_framed(metadata)
     owner = getattr(data, "_mooncake_pool_owner", None)
-    has_owner = False
+    shared_owner = _SharedPoolOwner(owner) if owner is not None else None
     values = []
     for row in range(rows):
         if bool(nulls[row]):
             values.append(None)
             continue
         item = memoryview(data)[int(offsets[row]) : int(offsets[row + 1])]
-        value = _decode_media_bytes(item, framed, owner)
-        has_owner = (
-            has_owner or getattr(value, "_mooncake_pool_owner", None) is not None
-        )
+        value = _decode_media_bytes(item, framed, shared_owner)
         values.append(value)
-    return (
-        _OwnerBackedList(values, owner) if owner is not None and has_owner else values
-    )
+    return values
 
 
 def _encode_media_list_values(
@@ -3394,7 +3503,7 @@ def _decode_media_list_values(
     nulls = payload["nulls"]
     framed = _media_framed(metadata)
     owner = getattr(data, "_mooncake_pool_owner", None)
-    has_owner = False
+    shared_owner = _SharedPoolOwner(owner) if owner is not None else None
     values = []
     for row in range(rows):
         if bool(nulls[row]):
@@ -3405,15 +3514,10 @@ def _decode_media_list_values(
             item = memoryview(data)[
                 int(byte_offsets[item_index]) : int(byte_offsets[item_index + 1])
             ]
-            value = _decode_media_bytes(item, framed, owner)
-            has_owner = (
-                has_owner or getattr(value, "_mooncake_pool_owner", None) is not None
-            )
+            value = _decode_media_bytes(item, framed, shared_owner)
             items.append(value)
         values.append(items)
-    return (
-        _OwnerBackedList(values, owner) if owner is not None and has_owner else values
-    )
+    return values
 
 
 class _StructuredObjectLayer:
@@ -6082,7 +6186,7 @@ def _object_array_from_decoded_values(values: list[Any]) -> np.ndarray:
     owner = getattr(values, "_mooncake_pool_owner", None) or next(
         (getattr(v, "_mooncake_pool_owner", None) for v in values if v is not None), None
     )
-    if owner is None:
+    if owner is None or isinstance(owner, _SharedPoolOwnerToken):
         return array
     result = array.view(_OwnerBackedObjectArray)
     result._mooncake_pool_owner = owner
