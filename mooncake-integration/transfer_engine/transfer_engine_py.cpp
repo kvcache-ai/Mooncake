@@ -50,11 +50,11 @@ static void (*freeMemory)(void*) = nullptr;
 static std::string g_protocol;
 
 //  Handle allocateMemory function pointer based on protocol
-void initMemoryAllocator(const char* protocol) {
+bool initMemoryAllocator(const char* protocol) {
     if (allocateMemory != nullptr) {
         LOG(WARNING) << "Memory allocator already initialized with: "
                      << g_protocol;
-        return;
+        return true;
     }
     g_protocol = protocol;
     if (strcmp(protocol, "nvlink") == 0) {
@@ -68,6 +68,7 @@ void initMemoryAllocator(const char* protocol) {
         LOG(INFO) << "Selected MNNVL (NVLink) memory allocator";
 #else
         LOG(ERROR) << "Protocol 'nvlink' requires -DUSE_MNNVL=ON";
+        return false;
 #endif
     } else if (strcmp(protocol, "hip") == 0) {
 #ifdef USE_HIP
@@ -80,6 +81,7 @@ void initMemoryAllocator(const char* protocol) {
         LOG(INFO) << "Selected HIP memory allocator";
 #else
         LOG(ERROR) << "Protocol 'hip' requires -DUSE_HIP=ON";
+        return false;
 #endif
     } else if (strcmp(protocol, "nvlink_intra") == 0) {
 #ifdef USE_INTRA_NVLINK
@@ -93,12 +95,14 @@ void initMemoryAllocator(const char* protocol) {
         LOG(INFO) << "Selected Intra-NVLink memory allocator";
 #else
         LOG(ERROR) << "Protocol 'nvlink_intra' requires -DUSE_INTRA_NVLINK=ON";
+        return false;
 #endif
     } else {
         allocateMemory = malloc;
         freeMemory = free;
         LOG(WARNING) << "Using default malloc/free for protocol: " << protocol;
     }
+    return true;
 }
 
 TransferEnginePy::TransferEnginePy() {
@@ -169,7 +173,7 @@ int TransferEnginePy::initialize(const char* local_hostname,
                                  const char* metadata_server,
                                  const char* protocol,
                                  const char* device_name) {
-    initMemoryAllocator(protocol);
+    if (!initMemoryAllocator(protocol)) return -1;
 
     auto conn_string = parseConnectionString(metadata_server);
     return initializeExt(local_hostname, conn_string.second.c_str(), protocol,
