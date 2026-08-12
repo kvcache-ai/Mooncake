@@ -301,17 +301,8 @@ class OffsetBufferAllocator
     // offset allocator implementation
     std::shared_ptr<offset_allocator::OffsetAllocator> offset_allocator_;
 
-    // Keeps address gaps occupied after descriptor-based reconstruction.
-    std::vector<std::unique_ptr<AllocatedBuffer>> restored_gap_buffers_;
-
     friend class Serializer<OffsetBufferAllocator>;
     friend struct RestoredOffsetBufferAllocator;
-    friend std::optional<struct RestoredOffsetBufferAllocator>
-    RestoreOffsetBufferAllocator(
-        std::string segment_name, size_t base, size_t size,
-        std::string transport_endpoint,
-        const std::vector<AllocatedBuffer::Descriptor>& descriptors,
-        ReplicaType replica_type);
 };
 
 struct RestoredOffsetBufferAllocator {

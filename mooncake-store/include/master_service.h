@@ -2533,6 +2533,7 @@ class MasterService {
     ErrorCode ValidateStandbyRemountSegment(const Segment& segment) const;
 
     bool IsReplicaReadable(const Replica& replica) const;
+    bool IsMemoryReplicaEvictable(const Replica& replica) const;
 
     /**
      * Segment lifecycle persist helper. Tries to durably persist the

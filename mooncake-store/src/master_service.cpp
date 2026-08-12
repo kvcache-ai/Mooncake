@@ -1004,6 +1004,9 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
 
             bool ambiguous_endpoint = false;
             bool unsupported_cxl = false;
+            // Track pre-remount readability so the first successful recovery
+            // starts a fresh lease without extending already-readable objects.
+            std::unordered_map<ObjectMetadata*, bool> restored_objects;
             for (size_t shard_index = 0; shard_index < kNumShards;
                  ++shard_index) {
                 MetadataShardAccessorRW shard(this, shard_index);
@@ -1043,6 +1046,18 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                                     }
                                     descriptor.transport_endpoint_ =
                                         match->segment.te_endpoint;
+                                    if (!restored_objects.contains(&metadata)) {
+                                        restored_objects.emplace(
+                                            &metadata,
+                                            metadata.HasReplica(
+                                                [this](
+                                                    const Replica& candidate) {
+                                                    return candidate
+                                                               .is_memory_replica() &&
+                                                           IsReplicaReadable(
+                                                               candidate);
+                                                }));
+                                    }
                                     match->replicas.push_back(&replica);
                                     match->descriptors.push_back(descriptor);
                                 }
@@ -1137,6 +1152,15 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
                 invalid_replica_endpoints_.erase(restore.segment.name);
                 standby_allocator_keepalive_.erase(restore.segment.te_endpoint);
                 standby_allocator_keepalive_.erase(restore.segment.name);
+            }
+            for (const auto& [metadata, was_readable] : restored_objects) {
+                if (!was_readable &&
+                    metadata->HasReplica([this](const Replica& replica) {
+                        return replica.is_memory_replica() &&
+                               IsReplicaReadable(replica);
+                    })) {
+                    metadata->GrantReadLease(default_kv_lease_ttl_);
+                }
             }
         }
 
@@ -3170,6 +3194,11 @@ bool MasterService::IsReplicaReadable(const Replica& replica) const {
     return !endpoint || !invalid_replica_endpoints_.contains(*endpoint);
 }
 
+bool MasterService::IsMemoryReplicaEvictable(const Replica& replica) const {
+    return replica.is_memory_replica() && replica.is_completed() &&
+           replica.get_refcnt() == 0 && IsReplicaReadable(replica);
+}
+
 auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,
                                           const TenantId& tenant_id)
     -> tl::expected<
@@ -3591,6 +3620,7 @@ auto MasterService::AllocateAndInsertMetadata(
     const auto write_mode = DetermineReplicaWriteMode(config);
     size_t allocated_memory_replicas = 0;
     size_t allocated_nof_replicas = 0;
+    bool memory_eviction_may_help = false;
     if (config.replica_num > 0) {
         const bool use_local_first =
             allocation_strategy_type_ == AllocationStrategyType::LOCAL_FIRST &&
@@ -3604,6 +3634,19 @@ auto MasterService::AllocateAndInsertMetadata(
         ScopedAllocatorAccess allocator_access =
             segment_manager_.getAllocatorAccess();
         const auto& allocator_manager = allocator_access.getAllocatorManager();
+        if (allocator_manager.getNames().size() >= config.replica_num) {
+            for (const auto& name : allocator_manager.getNames()) {
+                const auto* allocators = allocator_manager.getAllocators(name);
+                if (allocators != nullptr &&
+                    std::any_of(allocators->begin(), allocators->end(),
+                                [](const auto& allocator) {
+                                    return allocator && allocator->size() > 0;
+                                })) {
+                    memory_eviction_may_help = true;
+                    break;
+                }
+            }
+        }
 
         std::vector<std::string> preferred_segments;
         auto append_preferred_segment = [&preferred_segments](
@@ -3657,7 +3700,9 @@ auto MasterService::AllocateAndInsertMetadata(
             }
             if (write_mode != ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
                 MasterMetricManager::instance().inc_put_start_alloc_failures();
-                need_mem_eviction_ = true;
+                if (memory_eviction_may_help) {
+                    need_mem_eviction_ = true;
+                }
                 abort_reserved_quota();
                 return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
             }
@@ -3711,7 +3756,8 @@ auto MasterService::AllocateAndInsertMetadata(
              allocated_nof_replicas != config.nof_replica_num)) {
             MasterMetricManager::instance().inc_put_start_alloc_failures();
             if (config.replica_num > 0 &&
-                allocated_memory_replicas != config.replica_num) {
+                allocated_memory_replicas != config.replica_num &&
+                memory_eviction_may_help) {
                 need_mem_eviction_ = true;
             }
             if (config.nof_replica_num > 0 &&
@@ -8113,9 +8159,8 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
     auto now = std::chrono::system_clock::now();
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
 
-    auto is_evictable_memory_replica = [](const Replica& replica) {
-        return replica.is_memory_replica() && replica.is_completed() &&
-               replica.get_refcnt() == 0;
+    auto is_evictable_memory_replica = [this](const Replica& replica) {
+        return IsMemoryReplicaEvictable(replica);
     };
     auto can_evict_replicas = [&](const ObjectMetadata& metadata) {
         return metadata.HasReplica(is_evictable_memory_replica);
@@ -8345,9 +8390,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
     auto now = std::chrono::system_clock::now();
 
-    auto is_evictable_memory_replica = [](const Replica& replica) {
-        return replica.is_memory_replica() && replica.is_completed() &&
-               replica.get_refcnt() == 0;
+    auto is_evictable_memory_replica = [this](const Replica& replica) {
+        return IsMemoryReplicaEvictable(replica);
     };
 
     auto can_evict_replicas = [&](const ObjectMetadata& metadata) {
@@ -8424,12 +8468,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
         // Queue one MEMORY replica for offload; others will be evicted below.
         bool queued = false;
         metadata.VisitReplicas(
-            [](const Replica& r) {
-                return r.is_memory_replica() && r.is_completed() &&
-                       r.get_refcnt() == 0;
-            },
-            [this, &tenant_id, &key, &tenant_state, &queued,
-             &now](Replica& replica) {
+            is_evictable_memory_replica, [this, &tenant_id, &key, &tenant_state,
+                                          &queued, &now](Replica& replica) {
                 if (queued) return;  // only need to pin one replica for offload
                 auto result = PushOffloadingQueue(
                     MakeObjectIdentity(key, tenant_id), replica);
@@ -8461,26 +8501,26 @@ void MasterService::BatchEvict(double evict_ratio_target,
         return 0;
     };
 
-    // HA strong-consistency: persist the post-eviction state BEFORE the
-    // helper mutates `metadata`. Returns true on success (or when HA is
-    // disabled). On false, the caller must NOT call try_evict_or_offload
-    // and must NOT erase the metadata entry — local state must stay in
-    // sync with what was published.
-    auto persist_evict_oplog_or_skip =
+    // kSubmitted means accepted by the ordered writer, not yet durable.
+    enum class EvictOpLogSubmissionResult {
+        kNotRequired,
+        kSubmitted,
+        kReservationFailed,
+        kSubmissionFailed,
+    };
+
+    // HA strong-consistency: submit the post-eviction state before the caller
+    // proceeds with eviction.
+    auto submit_evict_oplog_if_needed =
         [&, this](const TenantId& tenant_id, const std::string& key,
-                  ObjectMetadata& metadata) -> bool {
+                  ObjectMetadata& metadata) -> EvictOpLogSubmissionResult {
         if (!enable_oplog_ || !ordered_oplog_writer_) {
-            return true;
+            return EvictOpLogSubmissionResult::kNotRequired;
         }
 
-        // Predict the descriptor list after evict_replicas() runs:
-        // drop COMPLETE memory replicas with refcnt==0; keep everything else
-        // that is COMPLETE.
-        auto remaining =
-            BuildRemainingReplicaDescriptors(metadata, [](const Replica& r) {
-                return r.is_memory_replica() && r.is_completed() &&
-                       r.get_refcnt() == 0;
-            });
+        // Predict the descriptor list after evict_replicas() runs.
+        auto remaining = BuildRemainingReplicaDescriptors(
+            metadata, is_evictable_memory_replica);
 
         if (enable_oplog_) {
             auto reservation = ReserveBatchOpLogSlot();
@@ -8488,8 +8528,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 LOG(WARNING)
                     << "BatchEvict: OpLog reservation failed for key=" << key
                     << ", err=" << static_cast<int>(reservation.error())
-                    << ", skipping eviction";
-                return false;
+                    << ", stopping eviction cycle";
+                return EvictOpLogSubmissionResult::kReservationFailed;
             }
             std::vector<ReplicaID> removed_ids;
             metadata.VisitReplicas(is_evictable_memory_replica,
@@ -8497,9 +8537,9 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                        removed_ids.push_back(replica.id());
                                        replica.mark_removed();
                                    });
-            tl::expected<OpLogEntry, ErrorCode> persist_result;
+            tl::expected<OpLogEntry, ErrorCode> submission_result;
             if (remaining.empty()) {
-                persist_result = AppendReservedOpLogWithDurableFinalize(
+                submission_result = AppendReservedOpLogWithDurableFinalize(
                     std::move(reservation.value()), OpType::REMOVE,
                     tenant_id.value(), key, {},
                     [this, removed_ids = std::move(removed_ids)](
@@ -8508,7 +8548,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                             durable_entry, removed_ids, QuotaEraseMode::kFull);
                     });
             } else {
-                persist_result = AppendReservedOpLogWithDurableFinalize(
+                submission_result = AppendReservedOpLogWithDurableFinalize(
                     std::move(reservation.value()), OpType::PUT_END,
                     tenant_id.value(), key,
                     SerializeMetadataForOpLogFromReplicaDescriptors(
@@ -8520,40 +8560,42 @@ void MasterService::BatchEvict(double evict_ratio_target,
                             durable_entry, removed_ids, QuotaEraseMode::kFull);
                     });
             }
-            if (!persist_result) {
+            if (!submission_result) {
                 LOG(WARNING)
-                    << "BatchEvict: OpLog persist failed for key=" << key
-                    << ", err=" << static_cast<int>(persist_result.error())
-                    << ", skipping eviction";
-                return false;
+                    << "BatchEvict: OpLog submission failed for key=" << key
+                    << ", err=" << static_cast<int>(submission_result.error())
+                    << ", skipping object eviction";
+                return EvictOpLogSubmissionResult::kSubmissionFailed;
             }
-            return true;
+            return EvictOpLogSubmissionResult::kSubmitted;
         }
 
-        tl::expected<OpLogEntry, ErrorCode> persist_result;
+        tl::expected<OpLogEntry, ErrorCode> submission_result;
         if (remaining.empty()) {
-            persist_result = AppendOpLogWithDurableFinalize(
+            submission_result = AppendOpLogWithDurableFinalize(
                 OpType::REMOVE, tenant_id.value(), key, {}, nullptr);
         } else {
-            persist_result = AppendOpLogWithDurableFinalize(
+            submission_result = AppendOpLogWithDurableFinalize(
                 OpType::PUT_END, tenant_id.value(), key,
                 SerializeMetadataForOpLogFromReplicaDescriptors(
                     metadata.client_id, metadata.size, remaining,
                     metadata.group_id, metadata.data_type),
                 nullptr);
         }
-        if (!persist_result) {
-            LOG(WARNING) << "BatchEvict: OpLog persist failed for key=" << key
-                         << ", err=" << static_cast<int>(persist_result.error())
-                         << ", skipping eviction";
-            return false;
+        if (!submission_result) {
+            LOG(WARNING) << "BatchEvict: OpLog submission failed for key="
+                         << key << ", err="
+                         << static_cast<int>(submission_result.error())
+                         << ", skipping object eviction";
+            return EvictOpLogSubmissionResult::kSubmissionFailed;
         }
-        return true;
+        return EvictOpLogSubmissionResult::kSubmitted;
     };
 
     struct EvictionResult {
         uint64_t freed_bytes{0};
         long evicted_objects{0};
+        bool stop_cycle{false};
     };
 
     auto try_evict_group_or_object =
@@ -8563,7 +8605,14 @@ void MasterService::BatchEvict(double evict_ratio_target,
                   std::vector<std::vector<Replica>>& deferred_replicas,
                   bool allow_soft_pinned) -> EvictionResult {
         if (!metadata.IsGrouped()) {
-            if (!persist_evict_oplog_or_skip(tenant_id, key, metadata)) {
+            auto submission_result =
+                submit_evict_oplog_if_needed(tenant_id, key, metadata);
+            if (submission_result ==
+                EvictOpLogSubmissionResult::kReservationFailed) {
+                return {.stop_cycle = true};
+            }
+            if (submission_result ==
+                EvictOpLogSubmissionResult::kSubmissionFailed) {
                 return {};
             }
             uint64_t freed = try_evict_or_offload(
@@ -8573,7 +8622,14 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
         auto group_it = tenant_state.group_members.find(metadata.group_id);
         if (group_it == tenant_state.group_members.end()) {
-            if (!persist_evict_oplog_or_skip(tenant_id, key, metadata)) {
+            auto submission_result =
+                submit_evict_oplog_if_needed(tenant_id, key, metadata);
+            if (submission_result ==
+                EvictOpLogSubmissionResult::kReservationFailed) {
+                return {.stop_cycle = true};
+            }
+            if (submission_result ==
+                EvictOpLogSubmissionResult::kSubmissionFailed) {
                 return {};
             }
             uint64_t freed = try_evict_or_offload(
@@ -8605,8 +8661,15 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 continue;
             }
 
-            if (!persist_evict_oplog_or_skip(tenant_id, member_key,
-                                             member_metadata)) {
+            auto submission_result = submit_evict_oplog_if_needed(
+                tenant_id, member_key, member_metadata);
+            if (submission_result ==
+                EvictOpLogSubmissionResult::kReservationFailed) {
+                result.stop_cycle = true;
+                break;
+            }
+            if (submission_result ==
+                EvictOpLogSubmissionResult::kSubmissionFailed) {
                 continue;
             }
             uint64_t freed =
@@ -8872,6 +8935,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     uint64_t total_freed_size = 0;
     std::vector<std::chrono::system_clock::time_point> no_pin_objects;
     std::vector<std::vector<Replica>> deferred_replicas;
+    bool stop_eviction = false;
 
     // First pass: evict candidates with no soft pin
     if (!candidates.empty()) {
@@ -8890,6 +8954,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
         long evicted_this_pass = 0;
         auto evict_candidate_batch = [&](std::vector<Candidate>& batch) {
             for (auto& c : batch) {
+                if (stop_eviction) break;
                 if (evicted_this_pass >= evict_num &&
                     c.lease_timeout > target_timeout) {
                     no_pin_objects.push_back(c.lease_timeout);
@@ -8916,6 +8981,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                         deferred_replicas,
                         /*allow_soft_pinned=*/false);
 
+                    stop_eviction = evict_result.stop_cycle;
                     total_freed_size += evict_result.freed_bytes;
 
                     if (!enable_oplog_ && !it->second.IsGrouped()) {
@@ -8947,7 +9013,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
         // remainder of the current no-soft-pin population. This recovery
         // scan is paid only on churn and preserves the behavior of
         // continuing past the cutoff until evict_num is reached.
-        if (compact_frontier_used && evicted_this_pass < evict_num) {
+        if (!stop_eviction && compact_frontier_used &&
+            evicted_this_pass < evict_num) {
             auto refill_candidates = collect_candidates(
                 /*use_cutoff=*/true, reserve_cutoff,
                 /*collect_older_or_equal=*/false);
@@ -8957,7 +9024,8 @@ void MasterService::BatchEvict(double evict_ratio_target,
 
     // Try releasing discarded replicas before we decide whether to do the
     // second pass.
-    uint64_t released_discarded_cnt = ReleaseExpiredDiscardedReplicas(now);
+    uint64_t released_discarded_cnt =
+        stop_eviction ? 0 : ReleaseExpiredDiscardedReplicas(now);
 
     // The ideal number of objects to evict in the second pass
     long target_evict_num =
@@ -8971,7 +9039,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
     // Do second pass eviction only if 1). there are candidates that can be
     // evicted AND 2). The evicted number in the first pass is less than
     // evict_ratio_lowerbound.
-    if (target_evict_num > 0) {
+    if (!stop_eviction && target_evict_num > 0) {
         if (target_evict_num <= static_cast<long>(no_pin_objects.size())) {
             // Second pass A: only evict objects without soft pin.
             std::nth_element(no_pin_objects.begin(),
@@ -8980,17 +9048,19 @@ void MasterService::BatchEvict(double evict_ratio_target,
             auto target_timeout = no_pin_objects[target_evict_num - 1];
 
             // Evict via key lookup — avoid full metadata traversal
-            for (size_t i = 0; i < kNumShards && target_evict_num > 0; i++) {
+            for (size_t i = 0;
+                 i < kNumShards && target_evict_num > 0 && !stop_eviction;
+                 i++) {
                 {
                     MetadataShardAccessorRW shard(this,
                                                   (start_idx + i) % kNumShards);
                     for (auto tenant_it = shard->tenants.begin();
                          tenant_it != shard->tenants.end() &&
-                         target_evict_num > 0;) {
+                         target_evict_num > 0 && !stop_eviction;) {
                         auto& tenant_state = tenant_it->second;
                         auto it = tenant_state.metadata.begin();
                         while (it != tenant_state.metadata.end() &&
-                               target_evict_num > 0) {
+                               target_evict_num > 0 && !stop_eviction) {
                             if (!it->second.IsHardPinned() &&
                                 it->second.IsLeaseExpired(now) &&
                                 it->second.lease_timeout <= target_timeout &&
@@ -9000,6 +9070,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                     tenant_it->first, it->first, it->second,
                                     shard, tenant_state, deferred_replicas,
                                     /*allow_soft_pinned=*/false);
+                                stop_eviction = evict_result.stop_cycle;
                                 total_freed_size += evict_result.freed_bytes;
                                 if (!enable_oplog_ && !it->second.IsGrouped()) {
                                     PublishKvRemovedAfterEvict(
@@ -9016,6 +9087,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                 evicted_count += evict_result.evicted_objects;
                                 target_evict_num -=
                                     evict_result.evicted_objects;
+                                if (stop_eviction) break;
                             } else {
                                 ++it;
                             }
@@ -9040,18 +9112,20 @@ void MasterService::BatchEvict(double evict_ratio_target,
                 soft_pin_objects.end());
             auto soft_target_timeout = soft_pin_objects[soft_pin_evict_num - 1];
 
-            for (size_t i = 0; i < kNumShards && target_evict_num > 0; i++) {
+            for (size_t i = 0;
+                 i < kNumShards && target_evict_num > 0 && !stop_eviction;
+                 i++) {
                 {
                     MetadataShardAccessorRW shard(this,
                                                   (start_idx + i) % kNumShards);
 
                     for (auto tenant_it = shard->tenants.begin();
                          tenant_it != shard->tenants.end() &&
-                         target_evict_num > 0;) {
+                         target_evict_num > 0 && !stop_eviction;) {
                         auto& tenant_state = tenant_it->second;
                         auto it = tenant_state.metadata.begin();
                         while (it != tenant_state.metadata.end() &&
-                               target_evict_num > 0) {
+                               target_evict_num > 0 && !stop_eviction) {
                             if (it->second.IsHardPinned() ||
                                 !it->second.IsLeaseExpired(now) ||
                                 !can_evict_replicas(it->second)) {
@@ -9065,6 +9139,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                     tenant_it->first, it->first, it->second,
                                     shard, tenant_state, deferred_replicas,
                                     /*allow_soft_pinned=*/true);
+                                stop_eviction = evict_result.stop_cycle;
                                 total_freed_size += evict_result.freed_bytes;
                                 if (!enable_oplog_ && !it->second.IsGrouped()) {
                                     PublishKvRemovedAfterEvict(
@@ -9081,6 +9156,7 @@ void MasterService::BatchEvict(double evict_ratio_target,
                                 evicted_count += evict_result.evicted_objects;
                                 target_evict_num -=
                                     evict_result.evicted_objects;
+                                if (stop_eviction) break;
                             } else {
                                 ++it;
                             }
@@ -9107,7 +9183,19 @@ void MasterService::BatchEvict(double evict_ratio_target,
         }
     }
 
-    if (evicted_count > 0 || released_discarded_cnt > 0) {
+    if (stop_eviction) {
+        // Reservation backpressure is transient; retry remaining work later.
+        need_mem_eviction_ = true;
+        if (evicted_count > 0) {
+            MasterMetricManager::instance().inc_eviction_success(
+                evicted_count, total_freed_size);
+            MasterMetricManager::instance().inc_mem_eviction_success(
+                evicted_count, total_freed_size);
+        } else {
+            MasterMetricManager::instance().inc_eviction_fail();
+            MasterMetricManager::instance().inc_mem_eviction_fail();
+        }
+    } else if (evicted_count > 0 || released_discarded_cnt > 0) {
         need_mem_eviction_ = false;
         MasterMetricManager::instance().inc_eviction_success(evicted_count,
                                                              total_freed_size);
