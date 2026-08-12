@@ -95,7 +95,7 @@ To reduce cache warm-up time after a master restart, the Master Service supports
 
 The Master Service can optionally enforce strict multi-tenant memory quota admission. This feature is disabled by default. When `enable_multi_tenants=false`, request tenant IDs are ignored for object placement, all objects use the `default` namespace, and tenant quota management requests return `UNAVAILABLE_IN_CURRENT_MODE`.
 
-See [Multi-Tenant Deployment](../deployment/multi-tenancy.md) for configuration details.
+See [Multi-Tenant Deployment](../../deployment/multi-tenancy.md) for configuration details.
 
 Effective quota is recomputed from the current registered memory capacity:
 
