@@ -22,6 +22,8 @@ from sglang.test.test_utils import (
     is_in_ci,
 )
 
+DEFAULT_MHA_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-8B"
+
 
 class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
     """Base mixin class with common setup and utilities"""
@@ -29,6 +31,10 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
     # Default port ranges for Mooncake services - can be overridden in subclasses
     mooncake_master_port_base = 50051
     mooncake_metadata_port_base = 8080
+
+    @classmethod
+    def _get_model_name(cls):
+        return DEFAULT_MHA_MODEL_NAME_FOR_TEST
 
     @classmethod
     def setUpClass(cls):
