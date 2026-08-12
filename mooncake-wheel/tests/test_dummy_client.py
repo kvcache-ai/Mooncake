@@ -1,11 +1,15 @@
-import unittest
+import json
+import math
 import os
-import time
 import threading
+import time
+import unittest
 
 try:
     import torch
-except ImportError:
+except ModuleNotFoundError as error:
+    if error.name != "torch":
+        raise
     torch = None
 
 from mooncake.store import MooncakeDistributedStore, SoftPinAction
@@ -15,6 +19,262 @@ from mooncake.store import MooncakeDistributedStore, SoftPinAction
 DEFAULT_DEFAULT_KV_LEASE_TTL = 5000 # 5000 milliseconds
 # Use environment variable if set, otherwise use default
 default_kv_lease_ttl = int(os.getenv("DEFAULT_KV_LEASE_TTL", DEFAULT_DEFAULT_KV_LEASE_TTL))
+
+CUDA_IPC_STREAM_READINESS_PAYLOAD_BYTES = 16 * 1024 * 1024
+_CUDA_IPC_INITIAL_BYTE = 0x31
+_CUDA_IPC_FINAL_BYTE = 0xA7
+_CUDA_LAUNCH_BLOCKING_DISABLED_VALUES = {"", "0", "false", "no", "off"}
+
+
+class _CudaIpcStreamReadinessFailure(AssertionError):
+    """A CUDA readiness failure whose diagnostics are safe to publish."""
+
+    def __init__(self, diagnostics):
+        self.diagnostics = diagnostics
+        compact = json.dumps(diagnostics, sort_keys=True, separators=(",", ":"))
+        super().__init__(f"CUDA IPC stream readiness case failed: {compact}")
+
+
+def _cuda_launch_blocking_is_active():
+    value = os.environ.get("CUDA_LAUNCH_BLOCKING")
+    return (
+        value is not None
+        and value.strip().lower() not in _CUDA_LAUNCH_BLOCKING_DISABLED_VALUES
+    )
+
+
+def _cuda_stream_readiness_skip_reason():
+    if torch is None:
+        return "PyTorch is not available"
+    if getattr(torch.version, "cuda", None) is None:
+        return "PyTorch does not have CUDA support"
+    if not torch.cuda.is_available():
+        return "CUDA is not available"
+    if not callable(getattr(torch.cuda, "_sleep", None)):
+        return "torch.cuda._sleep is not available"
+    if _cuda_launch_blocking_is_active():
+        return "CUDA_LAUNCH_BLOCKING disables the asynchronous window"
+    return None
+
+
+def _calibrate_cuda_sleep_cycles():
+    target_ms = 300.0
+    minimum_ms = 200.0
+    maximum_ms = 750.0
+    minimum_cycles = 1
+    maximum_cycles = 2_000_000_000
+    cycles = 1_000_000
+    device = torch.device("cuda", torch.cuda.current_device())
+    calibration_stream = torch.cuda.Stream(device=device)
+
+    for _ in range(6):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        with torch.cuda.stream(calibration_stream):
+            start.record()
+            torch.cuda._sleep(cycles)
+            end.record()
+        end.synchronize()
+        elapsed_ms = float(start.elapsed_time(end))
+        if minimum_ms <= elapsed_ms <= maximum_ms:
+            return cycles
+        if not math.isfinite(elapsed_ms) or elapsed_ms <= 0.0:
+            break
+        cycles = round(cycles * target_ms / elapsed_ms)
+        cycles = max(minimum_cycles, min(maximum_cycles, cycles))
+
+    raise AssertionError("Unable to establish the CUDA asynchronous window")
+
+
+def _put_cuda_readiness_tensors(store, keys, tensors, batch_width):
+    if batch_width == 1:
+        return store.put_tensor(keys[0], tensors[0]) == 0
+    return list(store.batch_put_tensor(keys, tensors)) == [0] * batch_width
+
+
+def _get_cuda_readiness_tensors(store, keys, batch_width):
+    if batch_width == 1:
+        return [store.get_tensor(keys[0])]
+    return list(store.batch_get_tensor(keys))
+
+
+def _validate_cuda_readiness_payloads(
+    retrieved, batch_width, payload_bytes, expected_byte
+):
+    if len(retrieved) != batch_width:
+        return False, -1, 0
+
+    metadata_ok = True
+    mismatch_count = 0
+    checksum = 0
+    for actual in retrieved:
+        if not isinstance(actual, torch.Tensor):
+            metadata_ok = False
+            mismatch_count = -1
+            continue
+        actual_cpu = actual.detach().cpu()
+        checksum += int(actual_cpu.sum(dtype=torch.int64).item())
+        if actual_cpu.dtype != torch.uint8 or tuple(actual_cpu.shape) != (
+            payload_bytes,
+        ):
+            metadata_ok = False
+            mismatch_count = -1
+            continue
+        if mismatch_count >= 0:
+            mismatch_count += int(
+                torch.count_nonzero(actual_cpu != expected_byte).item()
+            )
+    return metadata_ok, mismatch_count, checksum
+
+
+def _new_cuda_readiness_diagnostics(batch_width, explicit_sync):
+    return {
+        "mode": "control" if explicit_sync else "async",
+        "batch_width": batch_width,
+        "pending_at_call": None,
+        "ready_at_return": None,
+        "latency_ms": None,
+        "mismatch_count": None,
+        "checksum": None,
+    }
+
+
+def _run_dummy_cuda_ipc_stream_readiness_case(
+    store,
+    batch_width,
+    explicit_sync,
+    sleep_cycles,
+    payload_bytes=CUDA_IPC_STREAM_READINESS_PAYLOAD_BYTES,
+):
+    if batch_width not in (1, 2) or payload_bytes <= 0:
+        raise ValueError("invalid synthetic CUDA readiness parameters")
+
+    diagnostics = _new_cuda_readiness_diagnostics(batch_width, explicit_sync)
+    prefix = f"dummy_cuda_ipc_readiness_{os.getpid()}_{time.monotonic_ns()}"
+    warm_keys = [f"{prefix}_warm_{index}" for index in range(batch_width)]
+    measured_keys = [f"{prefix}_measured_{index}" for index in range(batch_width)]
+    cleanup_keys = [*warm_keys, *measured_keys]
+    tensors = []
+    primary_failed = False
+    cleanup_failed = False
+
+    try:
+        device = torch.device("cuda", torch.cuda.current_device())
+        with torch.cuda.device(device):
+            current = torch.cuda.current_stream(device)
+            tensors = [
+                torch.full(
+                    (payload_bytes,),
+                    _CUDA_IPC_INITIAL_BYTE,
+                    dtype=torch.uint8,
+                    device=device,
+                ).contiguous()
+                for _ in range(batch_width)
+            ]
+
+            # Make the initial value host-ready before opening the async window.
+            current.synchronize()
+            if not all(
+                tensor.is_contiguous()
+                and tensor.dtype == torch.uint8
+                and tuple(tensor.shape) == (payload_bytes,)
+                for tensor in tensors
+            ):
+                primary_failed = True
+
+            if not primary_failed:
+                warm_ok = _put_cuda_readiness_tensors(
+                    store, warm_keys, tensors, batch_width
+                )
+                warm_payloads = _get_cuda_readiness_tensors(
+                    store, warm_keys, batch_width
+                )
+                warm_metadata_ok, warm_mismatch_count, _ = (
+                    _validate_cuda_readiness_payloads(
+                        warm_payloads,
+                        batch_width,
+                        payload_bytes,
+                        _CUDA_IPC_INITIAL_BYTE,
+                    )
+                )
+                if not warm_ok or not warm_metadata_ok or warm_mismatch_count != 0:
+                    primary_failed = True
+
+            if not primary_failed:
+                producer = torch.cuda.Stream(device=device)
+                ready = torch.cuda.Event()
+                try:
+                    with torch.cuda.stream(producer):
+                        torch.cuda._sleep(sleep_cycles)
+                        for tensor in tensors:
+                            tensor.fill_(_CUDA_IPC_FINAL_BYTE)
+                        ready.record(producer)
+
+                    current.wait_stream(producer)
+                    if explicit_sync:
+                        current.synchronize()
+
+                    ready_before_put = bool(ready.query())
+                    diagnostics["pending_at_call"] = not ready_before_put
+                    valid_window = (
+                        ready_before_put if explicit_sync else not ready_before_put
+                    )
+                    if not valid_window:
+                        primary_failed = True
+                    else:
+                        put_started = time.perf_counter()
+                        try:
+                            put_ok = _put_cuda_readiness_tensors(
+                                store, measured_keys, tensors, batch_width
+                            )
+                        finally:
+                            diagnostics["latency_ms"] = round(
+                                (time.perf_counter() - put_started) * 1000.0, 3
+                            )
+                        diagnostics["ready_at_return"] = bool(ready.query())
+                        if not put_ok or not diagnostics["ready_at_return"]:
+                            primary_failed = True
+                finally:
+                    producer.synchronize()
+
+            if not primary_failed:
+                retrieved = _get_cuda_readiness_tensors(
+                    store, measured_keys, batch_width
+                )
+                metadata_ok, mismatch_count, checksum = (
+                    _validate_cuda_readiness_payloads(
+                        retrieved,
+                        batch_width,
+                        payload_bytes,
+                        _CUDA_IPC_FINAL_BYTE,
+                    )
+                )
+                diagnostics["mismatch_count"] = mismatch_count
+                diagnostics["checksum"] = checksum
+                expected_checksum = _CUDA_IPC_FINAL_BYTE * payload_bytes * batch_width
+                if (
+                    not metadata_ok
+                    or mismatch_count != 0
+                    or checksum != expected_checksum
+                ):
+                    primary_failed = True
+    except Exception:
+        primary_failed = True
+    finally:
+        for key in cleanup_keys:
+            try:
+                if store.remove(key, force=True) != 0:
+                    cleanup_failed = True
+            except Exception:
+                cleanup_failed = True
+
+    # Preserve primary failure precedence while suppressing raw exception text,
+    # which may contain identifiers forbidden from public diagnostics.
+    if primary_failed:
+        raise _CudaIpcStreamReadinessFailure(diagnostics) from None
+    if cleanup_failed:
+        raise _CudaIpcStreamReadinessFailure(diagnostics) from None
+    return diagnostics
 
 
 def get_client(store, local_buffer_size_param=None):
@@ -482,6 +742,28 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
             self.store.unregister_buffer(buffer_ptr)
             for cleanup_key in cleanup_keys:
                 self.store.remove(cleanup_key)
+
+    def _run_dummy_cuda_ipc_stream_readiness_regression(self, batch_width):
+        skip_reason = _cuda_stream_readiness_skip_reason()
+        if skip_reason is not None:
+            self.skipTest(skip_reason)
+
+        sleep_cycles = _calibrate_cuda_sleep_cycles()
+        for explicit_sync in (False, True):
+            mode = "control" if explicit_sync else "async"
+            with self.subTest(mode=mode, batch_width=batch_width):
+                _run_dummy_cuda_ipc_stream_readiness_case(
+                    self.store,
+                    batch_width=batch_width,
+                    explicit_sync=explicit_sync,
+                    sleep_cycles=sleep_cycles,
+                )
+
+    def test_dummy_cuda_ipc_put_tensor_waits_for_current_stream(self):
+        self._run_dummy_cuda_ipc_stream_readiness_regression(batch_width=1)
+
+    def test_dummy_cuda_ipc_batch_put_tensor_waits_for_current_stream(self):
+        self._run_dummy_cuda_ipc_stream_readiness_regression(batch_width=2)
 
     def test_00_mixed_put_and_put_tensor_concurrency(self):
         """Regression test for regular put and tensor put sharing dummy SHM."""
