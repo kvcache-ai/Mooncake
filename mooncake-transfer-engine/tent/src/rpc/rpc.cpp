@@ -183,6 +183,7 @@ Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
     const auto started_at = std::chrono::steady_clock::now();
     auto remainingTimeout = [&]() -> std::optional<std::chrono::milliseconds> {
         if (!call_timeout.has_value()) return std::nullopt;
+        if (call_timeout->count() < 0) return call_timeout;
         const auto elapsed =
             std::chrono::duration_cast<std::chrono::milliseconds>(
                 std::chrono::steady_clock::now() - started_at);
@@ -197,7 +198,7 @@ Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
         lease.client = std::make_unique<coro_rpc_client>(
             GetTransferEngineRpcClientIoContextPool().get_executor());
         const auto connect_timeout = remainingTimeout();
-        if (connect_timeout.has_value() && connect_timeout->count() <= 0) {
+        if (connect_timeout.has_value() && connect_timeout->count() == 0) {
             lease.broken = true;
             auto msg =
                 "RPC timed out before connecting. server: " + server_addr +
@@ -222,7 +223,7 @@ Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
     auto request_config = coro_rpc::request_config_t{};
     request_config.request_timeout_duration = remainingTimeout();
     if (request_config.request_timeout_duration.has_value() &&
-        request_config.request_timeout_duration->count() <= 0) {
+        request_config.request_timeout_duration->count() == 0) {
         lease.broken = true;
         auto msg =
             "RPC timed out before sending request. server: " + server_addr +

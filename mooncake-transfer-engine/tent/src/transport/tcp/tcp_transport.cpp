@@ -233,11 +233,8 @@ Status TcpTransport::doTransferWithRetry(TcpTask *task) {
                           task->request.target_id, rpc_server_addr);
     if (!status.ok()) return status;
 
-    std::optional<std::chrono::milliseconds> data_rpc_timeout;
-    if (params_.data_rpc_timeout_ms > 0) {
-        data_rpc_timeout =
-            std::chrono::milliseconds(params_.data_rpc_timeout_ms);
-    }
+    std::optional<std::chrono::milliseconds> data_rpc_timeout{
+        std::chrono::milliseconds(params_.data_rpc_timeout_ms)};
 
     Status last_error;
     uint64_t delay_ms = params_.retry_base_delay_ms;
