@@ -140,6 +140,10 @@ struct MasterConfig {
     // liveness window. Default 1 is conservative; small-object or RDMA-
     // rich clusters may safely raise it.
     uint32_t promotion_max_per_heartbeat = 1;
+    // SLO-aware promotion budget (ms). 0 = disabled (FIFO).
+    // When set, tasks are sorted by deadline (queued_time + budget) and only
+    // tasks within budget are returned.
+    uint32_t promotion_max_budget_ms = 0;
 
     // KV Events publisher (RFC #1527) for cache-aware indexers.
     bool enable_kv_events = false;
@@ -242,6 +246,7 @@ class MasterServiceSupervisorConfig {
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
     uint32_t promotion_max_per_heartbeat = 1;
+    uint32_t promotion_max_budget_ms = 0;  // SLO-aware budget, 0=disabled
     bool enable_kv_events = false;
     std::string kv_events_bind_endpoint;
     std::string kv_events_model_name;
@@ -298,6 +303,7 @@ class MasterServiceSupervisorConfig {
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        promotion_max_budget_ms = config.promotion_max_budget_ms;
         enable_kv_events = config.enable_kv_events;
         kv_events_bind_endpoint = config.kv_events_bind_endpoint;
         kv_events_model_name = config.kv_events_model_name;
@@ -487,6 +493,7 @@ class WrappedMasterServiceConfig {
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
     uint32_t promotion_max_per_heartbeat = 1;
+    uint32_t promotion_max_budget_ms = 0;  // SLO-aware budget, 0=disabled
     bool enable_kv_events = false;
     std::string kv_events_bind_endpoint;
     std::string kv_events_model_name;
@@ -577,6 +584,7 @@ class WrappedMasterServiceConfig {
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        promotion_max_budget_ms = config.promotion_max_budget_ms;
         enable_kv_events = config.enable_kv_events;
         kv_events_bind_endpoint = config.kv_events_bind_endpoint;
         kv_events_model_name = config.kv_events_model_name;
@@ -694,6 +702,7 @@ class WrappedMasterServiceConfig {
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        promotion_max_budget_ms = config.promotion_max_budget_ms;
         enable_kv_events = config.enable_kv_events;
         kv_events_bind_endpoint = config.kv_events_bind_endpoint;
         kv_events_model_name = config.kv_events_model_name;
@@ -1146,6 +1155,7 @@ class MasterServiceConfig {
     uint32_t promotion_admission_threshold = 2;
     uint32_t promotion_queue_limit = 50000;
     uint32_t promotion_max_per_heartbeat = 1;
+    uint32_t promotion_max_budget_ms = 0;  // SLO-aware budget, 0=disabled
     bool enable_kv_events = false;
     std::string kv_events_bind_endpoint;
     std::string kv_events_model_name;
@@ -1232,6 +1242,7 @@ class MasterServiceConfig {
         promotion_admission_threshold = config.promotion_admission_threshold;
         promotion_queue_limit = config.promotion_queue_limit;
         promotion_max_per_heartbeat = config.promotion_max_per_heartbeat;
+        promotion_max_budget_ms = config.promotion_max_budget_ms;
         enable_kv_events = config.enable_kv_events;
         kv_events_bind_endpoint = config.kv_events_bind_endpoint;
         kv_events_model_name = config.kv_events_model_name;

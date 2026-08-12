@@ -237,6 +237,13 @@ DEFINE_uint32(promotion_max_per_heartbeat, 1,
               "SSD-read + RDMA-write on the client; serializing them avoids "
               "blocking past the client-liveness window. Default 1 is "
               "conservative.");
+DEFINE_uint32(promotion_max_budget_ms, 0,
+              "SLO-aware promotion scheduling: sort queued promotion tasks "
+              "by deadline (queue admission time + budget) and only return "
+              "tasks that have not yet exceeded the budget. 0 = disabled "
+              "(FIFO). "
+              "HiCache sets prefetch_timeout_base + per_ki_token*N; use "
+              "that value here so master promotes in SLO order.");
 DEFINE_bool(enable_kv_events, false,
             "Enable RFC #1527 KV cache event publisher over ZMQ");
 DEFINE_string(kv_events_bind_endpoint, "",
@@ -535,6 +542,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt32("promotion_max_per_heartbeat",
                              &master_config.promotion_max_per_heartbeat,
                              FLAGS_promotion_max_per_heartbeat);
+    default_config.GetUInt32("promotion_max_budget_ms",
+                             &master_config.promotion_max_budget_ms,
+                             FLAGS_promotion_max_budget_ms);
     default_config.GetBool("enable_kv_events", &master_config.enable_kv_events,
                            FLAGS_enable_kv_events);
     default_config.GetString("kv_events_bind_endpoint",
@@ -904,6 +914,11 @@ void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
         !conf_set) {
         master_config.promotion_max_per_heartbeat =
             FLAGS_promotion_max_per_heartbeat;
+    }
+    if ((google::GetCommandLineFlagInfo("promotion_max_budget_ms", &info) &&
+         !info.is_default) ||
+        !conf_set) {
+        master_config.promotion_max_budget_ms = FLAGS_promotion_max_budget_ms;
     }
     if ((google::GetCommandLineFlagInfo("enable_kv_events", &info) &&
          !info.is_default) ||
