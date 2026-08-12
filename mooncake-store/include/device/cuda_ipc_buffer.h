@@ -11,6 +11,9 @@ namespace device {
 tl::expected<CudaIpcBufferHandle, ErrorCode> ExportCudaIpcBuffer(
     const void *ptr, size_t size);
 
+tl::expected<void, ErrorCode> SynchronizeCudaStream(int32_t device_id,
+                                                    uintptr_t stream_handle);
+
 class CudaIpcBufferMapping {
    public:
     CudaIpcBufferMapping() = default;

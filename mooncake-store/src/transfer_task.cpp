@@ -19,6 +19,26 @@
 #include "spdk/spdk_wrapper.h"
 #endif
 
+static int GetPositiveEnvOrDefault(const char* name, int default_value) {
+    const char* raw_value = std::getenv(name);
+    if (!raw_value || raw_value[0] == '\0') {
+        return default_value;
+    }
+
+    errno = 0;
+    char* end_ptr = nullptr;
+    long parsed = std::strtol(raw_value, &end_ptr, 10);
+    if (errno != 0 || end_ptr == raw_value ||
+        (end_ptr != nullptr && *end_ptr != '\0') || parsed <= 0 ||
+        parsed > std::numeric_limits<int>::max()) {
+        LOG(WARNING) << "Invalid value for " << name << ": " << raw_value
+                     << ", using default " << default_value;
+        return default_value;
+    }
+
+    return static_cast<int>(parsed);
+}
+
 #ifdef USE_NOF
 static bool IsTruthyEnv(const char* value) {
     if (!value) {
@@ -52,26 +72,6 @@ static int GetSpdkNofDebugIntervalMs() {
         return static_cast<int>(parsed);
     }();
     return interval_ms;
-}
-
-static int GetPositiveEnvOrDefault(const char* name, int default_value) {
-    const char* raw_value = std::getenv(name);
-    if (!raw_value || raw_value[0] == '\0') {
-        return default_value;
-    }
-
-    errno = 0;
-    char* end_ptr = nullptr;
-    long parsed = std::strtol(raw_value, &end_ptr, 10);
-    if (errno != 0 || end_ptr == raw_value ||
-        (end_ptr != nullptr && *end_ptr != '\0') || parsed <= 0 ||
-        parsed > std::numeric_limits<int>::max()) {
-        LOG(WARNING) << "Invalid value for " << name << ": " << raw_value
-                     << ", using default " << default_value;
-        return default_value;
-    }
-
-    return static_cast<int>(parsed);
 }
 
 static int GetSpdkNofSubmitChunkBytes() {
@@ -178,14 +178,23 @@ SpdkNofQos::SpdkNofQos(uint32_t block_size) {
 // threads.
 constexpr int kDefaultFilereadWorkers = 10;
 
+// The number of fileread workers can be tuned via the MC_FILEREAD_WORKERS
+// environment variable. Falls back to kDefaultFilereadWorkers when unset,
+// empty, or invalid.
+static int GetFilereadWorkerCount() {
+    static const int value =
+        GetPositiveEnvOrDefault("MC_FILEREAD_WORKERS", kDefaultFilereadWorkers);
+    return value;
+}
+
 FilereadWorkerPool::FilereadWorkerPool(std::shared_ptr<StorageBackend>& backend)
     : shutdown_(false) {
-    VLOG(1) << "Creating FilereadWorkerPool with " << kDefaultFilereadWorkers
-            << " workers";
+    const int num_workers = GetFilereadWorkerCount();
+    VLOG(1) << "Creating FilereadWorkerPool with " << num_workers << " workers";
 
     // Start worker threads
-    workers_.reserve(kDefaultFilereadWorkers);
-    for (int i = 0; i < kDefaultFilereadWorkers; ++i) {
+    workers_.reserve(num_workers);
+    for (int i = 0; i < num_workers; ++i) {
         workers_.emplace_back(&FilereadWorkerPool::workerThread, this);
     }
     backend_ = backend;

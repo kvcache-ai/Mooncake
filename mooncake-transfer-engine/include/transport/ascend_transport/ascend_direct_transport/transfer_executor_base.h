@@ -60,6 +60,7 @@ class TransferExecutorBase {
         bool agent_mode = false;
         bool roce_mode = false;
         bool use_fabric_mem = false;
+        bool client_server_mode = false;
     };
 
     explicit TransferExecutorBase(const InitParams& params);
