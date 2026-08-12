@@ -109,7 +109,7 @@ int processBatchSizes(
             local_gpu_offset + thread_id, address_stride_bytes, 1);
         uint64_t target_addr = runner.getTargetBufferBase(
             target_thread_id, address_stride_bytes, 1);
-        uint64_t target_id = runner.getTargetSegmentId(thread_id);
+        uint64_t target_id = runner.getTargetSegmentId(target_thread_id);
         const bool qos_enabled = !qos_classes.empty();
         const size_t qos_class =
             qos_enabled ? qosClassForThread(qos_classes, thread_id) : 0;
@@ -263,13 +263,6 @@ int main(int argc, char* argv[]) {
         "Usage: ./tebench [options]");
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     XferBenchConfig::loadFromFlags();
-    if (!XferBenchConfig::target_seg_name.empty() &&
-        !XferBenchConfig::target_seg_names.empty()) {
-        LOG(ERROR) << "Use only one of --target_seg_name or "
-                      "--target_seg_names";
-        return EXIT_FAILURE;
-    }
-
     std::vector<WorkloadClassConfig> workload_classes;
     std::vector<QosClassConfig> qos_classes;
     if (!XferBenchConfig::workload_classes_json.empty() &&
@@ -380,8 +373,7 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
 #endif
     }
-    if (XferBenchConfig::target_seg_name.empty() &&
-        XferBenchConfig::target_seg_names.empty()) {
+    if (XferBenchConfig::target_seg_name.empty()) {
         std::cout << "\033[33mTo start initiators, run " << std::endl
                   << "  ./tebench --target_seg_name="
                   << runner->getSegmentName()

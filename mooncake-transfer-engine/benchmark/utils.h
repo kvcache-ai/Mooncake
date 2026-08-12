@@ -61,7 +61,6 @@ struct XferBenchConfig {
     // "dram,vram". Empty falls back to --seg_type (single type).
     static std::string seg_type_mix;
     static std::string target_seg_name;
-    static std::string target_seg_names;
     static std::string op_type;
     static bool check_consistency;
 

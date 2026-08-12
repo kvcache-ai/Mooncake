@@ -325,10 +325,7 @@ size_t TENTBenchRunner::getTargetCount() const {
 }
 
 int TENTBenchRunner::startInitiator(int num_threads) {
-    std::string target_names = XferBenchConfig::target_seg_names.empty()
-                                   ? XferBenchConfig::target_seg_name
-                                   : XferBenchConfig::target_seg_names;
-    auto names = splitCommaSeparated(target_names);
+    auto names = splitCommaSeparated(XferBenchConfig::target_seg_name);
     if (names.empty()) {
         LOG(ERROR) << "No target segment name specified";
         return -1;

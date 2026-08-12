@@ -32,8 +32,8 @@ cmake --build . -j
 
 ### Role Selection
 
-* If both `--target_seg_name` and `--target_seg_names` are **empty** → Target mode
-* If either `--target_seg_name` or `--target_seg_names` is **set** → Initiator mode
+* If `--target_seg_name` is **empty** → Target mode
+* If `--target_seg_name` is **set** → Initiator mode
 
 ### Backend Selection
 
@@ -260,9 +260,9 @@ Example:
   thus multiple transports — SHM for DRAM, NVLink for VRAM) concurrently.
   Empty falls back to `--seg_type` (single type, existing behavior). See
   Section 5.8 for usage and the multi-transport configuration it requires.
-* `--target_seg_name` : target segment name (empty → Target mode)
-* `--target_seg_names` : comma-separated target segment names. When set,
-  worker threads are distributed across all listed target segments.
+* `--target_seg_name` : target segment name (empty → Target mode).
+  A comma-separated list enables multi-target initiator mode, and worker
+  threads are distributed across all listed target segments.
 
 **Scan ranges**
 
@@ -280,14 +280,14 @@ block_size × batch_size × num_threads > total_buffer_size
 
 **Multi-target initiator**
 
-Use `--target_seg_names` when one initiator process should send traffic to
-multiple target segments:
+Use a comma-separated `--target_seg_name` value when one initiator process
+should send traffic to multiple target segments:
 
 ```bash
 ./tebench \
   --backend=tent \
   --metadata_type=p2p \
-  --target_seg_names=<SEG_A>,<SEG_B>,<SEG_C> \
+  --target_seg_name=<SEG_A>,<SEG_B>,<SEG_C> \
   --op_type=read \
   --start_num_threads=3 \
   --max_num_threads=3
@@ -303,7 +303,7 @@ For multi-node benchmarks, tebench intentionally stays at the endpoint level:
 each process publishes its own segment, and an external launcher decides which
 target segment list each initiator receives. This keeps M-to-N, fan-out,
 incast, and all-to-all topologies as different launch configurations over the
-same `--target_seg_names` primitive.
+same comma-separated `--target_seg_name` primitive.
 
 For multiple initiator processes sharing the same target segment, use
 `--target_offset` and `--target_range_size` to partition the remote address

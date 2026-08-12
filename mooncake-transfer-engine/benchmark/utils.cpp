@@ -29,10 +29,9 @@ DEFINE_string(
     "thus multiple transports — SHM for DRAM, NVLink for VRAM) "
     "concurrently. Empty falls back to --seg_type (single type, existing "
     "behavior). Requires transports to be enabled via MC_TENT_CONF.");
-DEFINE_string(target_seg_name, "", "Memory segment name for the target side");
-DEFINE_string(target_seg_names, "",
-              "Comma-separated target segment names. When set, initiator "
-              "threads are distributed across all listed target segments.");
+DEFINE_string(target_seg_name, "",
+              "Target segment name for the initiator side. A comma-separated "
+              "list enables multi-target initiator mode.");
 DEFINE_string(
     op_type, "read",
     "Operation type to benchmark: read|write|mix|write_seed|read_verify");
@@ -114,7 +113,6 @@ std::string XferBenchConfig::seg_name;
 std::string XferBenchConfig::seg_type;
 std::string XferBenchConfig::seg_type_mix;
 std::string XferBenchConfig::target_seg_name;
-std::string XferBenchConfig::target_seg_names;
 std::string XferBenchConfig::op_type;
 bool XferBenchConfig::check_consistency = false;
 
@@ -155,7 +153,6 @@ void XferBenchConfig::loadFromFlags() {
     seg_type_mix = FLAGS_seg_type_mix;
     seg_name = FLAGS_seg_name;
     target_seg_name = FLAGS_target_seg_name;
-    target_seg_names = FLAGS_target_seg_names;
     op_type = FLAGS_op_type;
     check_consistency = FLAGS_check_consistency;
 

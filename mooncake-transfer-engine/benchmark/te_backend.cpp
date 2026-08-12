@@ -265,10 +265,7 @@ int TEBenchRunner::startInitiator(int num_threads) {
         LOG(ERROR) << "Initiator cannot start: initialization failed";
         return -1;
     }
-    std::string target_names = XferBenchConfig::target_seg_names.empty()
-                                   ? XferBenchConfig::target_seg_name
-                                   : XferBenchConfig::target_seg_names;
-    auto names = splitCommaSeparated(target_names);
+    auto names = splitCommaSeparated(XferBenchConfig::target_seg_name);
     if (names.empty()) {
         LOG(ERROR) << "No target segment name specified";
         return -1;
