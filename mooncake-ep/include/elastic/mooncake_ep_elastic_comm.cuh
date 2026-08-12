@@ -169,8 +169,7 @@ __forceinline__ __device__ void nccl_gin_barrier_wo_local_sync(
 
     for (int dst_team_rank = thread_idx; dst_team_rank < kNumTeamRanks;
          dst_team_rank += kNumThreads) {
-        gin.template gin_barrier_signal_inc<team_t>(dst_team_rank,
-                                                    team_rank_idx);
+        gin.gin_barrier_signal_inc<team_t>(dst_team_rank, team_rank_idx);
     }
 
     for (int src_team_rank = thread_idx; src_team_rank < kNumTeamRanks;
