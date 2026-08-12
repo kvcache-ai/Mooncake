@@ -261,6 +261,9 @@ class WrappedMasterService {
         const std::string& key, const std::string& tenant_id,
         const std::vector<std::string>& targets);
 
+    tl::expected<ReplicaActionLease, ErrorCode> SubmitReplicaActionProposal(
+        const ReplicaActionProposal& proposal);
+
     tl::expected<UUID, ErrorCode> CreateMoveTask(const std::string& key,
                                                  const std::string& tenant_id,
                                                  const std::string& source,

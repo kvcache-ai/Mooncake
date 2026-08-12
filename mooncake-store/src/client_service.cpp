@@ -54,6 +54,14 @@ namespace {
 
 constexpr size_t kObjectChecksumD2HChunkSize = 8 * 1024 * 1024;
 
+std::string GetConfiguredStoreDomain() {
+    const char* raw_value = std::getenv("MOONCAKE_STORE_DOMAIN");
+    if (raw_value == nullptr || raw_value[0] == '\0') {
+        return {};
+    }
+    return raw_value;
+}
+
 class ScopedObjectChecksumBuffer {
    public:
     ScopedObjectChecksumBuffer(PinnedBufferPool& pool, size_t size)
@@ -3179,6 +3187,7 @@ tl::expected<UUID, ErrorCode> Client::MountSegmentAndGetId(
         segment.size = size;
         segment.protocol = protocol;
         segment.host_id = host_id_;
+        segment.domain = GetConfiguredStoreDomain();
         if (metadata_connstring_ == P2PHANDSHAKE) {
             segment.te_endpoint = transfer_engine_->getLocalIpAndPort();
         } else {

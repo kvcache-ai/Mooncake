@@ -1288,6 +1288,20 @@ tl::expected<UUID, ErrorCode> WrappedMasterService::CreateCopyTask(
         });
 }
 
+tl::expected<ReplicaActionLease, ErrorCode>
+WrappedMasterService::SubmitReplicaActionProposal(
+    const ReplicaActionProposal& proposal) {
+    return execute_rpc(
+        "SubmitReplicaActionProposal",
+        [&] { return master_service_.SubmitReplicaActionProposal(proposal); },
+        [&](auto& timer) {
+            timer.LogRequest("key=", proposal.key,
+                             ", tenant_id=", proposal.tenant_id,
+                             ", action=", static_cast<int>(proposal.action));
+        },
+        [] {}, [] {});
+}
+
 tl::expected<UUID, ErrorCode> WrappedMasterService::CreateMoveTask(
     const std::string& key, const std::string& tenant_id,
     const std::string& source, const std::string& target) {
@@ -1762,6 +1776,9 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::PollRemoveAll>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::CreateCopyTask>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::SubmitReplicaActionProposal>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::CreateMoveTask>(
         &wrapped_master_service);
