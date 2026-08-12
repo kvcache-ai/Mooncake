@@ -435,4 +435,93 @@ TEST_F(DynamicReplicationTest, EvictedDynamicReplicaBlocksImmediateRecreate) {
     EXPECT_EQ(rejected.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
 }
 
+TEST_F(DynamicReplicationTest, SourceSelectionUsesStableTieBreak) {
+    MasterServiceConfig config;
+    config.dynamic_replication_mode = "enforce";
+    config.dynamic_replication_max_memory_replicas = 4;
+    MasterService service(config);
+
+    auto source0 = PrepareSegment(service, "segment_0", 0x1400000000);
+    auto source1 = PrepareSegment(service, "segment_1", 0x1500000000);
+    auto target = PrepareSegment(service, "segment_2", 0x1600000000);
+    PutObject(service, source0.client_id, "source-fanout-key",
+              source0.segment_name);
+
+    auto copy_start = service.CopyStart(
+        source0.client_id, "source-fanout-key", TenantId::Default(),
+        source0.segment_name, {source1.segment_name});
+    ASSERT_TRUE(copy_start.has_value());
+    auto copy_end = service.CopyEnd(source0.client_id, "source-fanout-key",
+                                    TenantId::Default());
+    ASSERT_TRUE(copy_end.has_value());
+
+    auto proposal =
+        BuildProposal(service, "source-fanout-key", target.segment_name);
+    auto lease = service.SubmitReplicaActionProposal(proposal);
+    ASSERT_TRUE(lease.has_value());
+
+    auto stable_score = [](std::string_view key, std::string_view segment) {
+        uint64_t hash = 1469598103934665603ULL;
+        auto mix = [&hash](std::string_view value) {
+            for (const unsigned char c : value) {
+                hash ^= c;
+                hash *= 1099511628211ULL;
+            }
+            hash ^= 0xff;
+            hash *= 1099511628211ULL;
+        };
+        mix(key);
+        mix(segment);
+        return hash;
+    };
+    const auto score0 = stable_score("source-fanout-key", source0.segment_name);
+    const auto score1 = stable_score("source-fanout-key", source1.segment_name);
+    EXPECT_EQ(lease->source_segment,
+              score0 < score1 ? source0.segment_name : source1.segment_name);
+}
+
+TEST_F(DynamicReplicationTest, TargetSelectionPrefersDifferentHost) {
+    MasterServiceConfig config;
+    config.dynamic_replication_mode = "enforce";
+    config.dynamic_replication_max_memory_replicas = 2;
+    MasterService service(config);
+
+    Segment source_segment;
+    source_segment.id = generate_uuid();
+    source_segment.name = "source_segment";
+    source_segment.base = 0x1700000000;
+    source_segment.size = kDefaultSegmentSize;
+    source_segment.te_endpoint = source_segment.name;
+    source_segment.host_id = "host-a";
+    UUID source_client = generate_uuid();
+    ASSERT_TRUE(
+        service.MountSegment(source_segment, source_client).has_value());
+
+    Segment same_host_target;
+    same_host_target.id = generate_uuid();
+    same_host_target.name = "same_host_target";
+    same_host_target.base = 0x1800000000;
+    same_host_target.size = kDefaultSegmentSize;
+    same_host_target.te_endpoint = same_host_target.name;
+    same_host_target.host_id = "host-a";
+    ASSERT_TRUE(
+        service.MountSegment(same_host_target, generate_uuid()).has_value());
+
+    Segment other_host_target;
+    other_host_target.id = generate_uuid();
+    other_host_target.name = "other_host_target";
+    other_host_target.base = 0x1900000000;
+    other_host_target.size = kDefaultSegmentSize;
+    other_host_target.te_endpoint = other_host_target.name;
+    other_host_target.host_id = "host-b";
+    ASSERT_TRUE(
+        service.MountSegment(other_host_target, generate_uuid()).has_value());
+
+    PutObject(service, source_client, "target-host-key", source_segment.name);
+    auto lease = service.SubmitReplicaActionProposal(
+        BuildProposal(service, "target-host-key"));
+    ASSERT_TRUE(lease.has_value());
+    EXPECT_EQ(lease->target_segment, other_host_target.name);
+}
+
 }  // namespace mooncake::test

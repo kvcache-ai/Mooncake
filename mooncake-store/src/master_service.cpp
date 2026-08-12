@@ -7585,6 +7585,22 @@ bool MasterService::DynamicReplicationEnabled() const {
     return dynamic_replication_mode_ != DynamicReplicationMode::kOff;
 }
 
+uint64_t MasterService::DynamicReplicationStableScore(
+    const std::string& key, const std::string& segment) {
+    uint64_t hash = 1469598103934665603ULL;
+    auto mix = [&hash](std::string_view value) {
+        for (const unsigned char c : value) {
+            hash ^= c;
+            hash *= 1099511628211ULL;
+        }
+        hash ^= 0xff;
+        hash *= 1099511628211ULL;
+    };
+    mix(key);
+    mix(segment);
+    return hash;
+}
+
 bool MasterService::DynamicReplicationEnforce() const {
     return dynamic_replication_mode_ == DynamicReplicationMode::kEnforce;
 }
@@ -7684,9 +7700,22 @@ MasterService::SelectDynamicReplicaPlan(
     const ObjectMetadata& metadata,
     const std::optional<std::string>& preferred_target_segment,
     std::string target_domain) {
+    const std::string& object_key = metadata.user_key;
     std::unordered_set<std::string> existing_segments;
-    std::optional<std::string> source_segment;
+    std::unordered_set<std::string> existing_hosts;
+    std::vector<std::string> source_segments;
     size_t memory_replicas = 0;
+
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    std::vector<std::pair<Segment, UUID>> segments;
+    if (segment_access.GetAllSegments(segments) != ErrorCode::OK) {
+        return std::nullopt;
+    }
+    std::unordered_map<std::string, Segment> segments_by_name;
+    for (const auto& [segment, client_id] : segments) {
+        (void)client_id;
+        segments_by_name.emplace(segment.name, segment);
+    }
 
     metadata.VisitReplicas(
         [this](const Replica& replica) {
@@ -7699,22 +7728,30 @@ MasterService::SelectDynamicReplicaPlan(
                     continue;
                 }
                 existing_segments.insert(*segment_name);
-                if (!source_segment.has_value()) {
-                    source_segment = *segment_name;
+                source_segments.push_back(*segment_name);
+                auto segment_it = segments_by_name.find(*segment_name);
+                if (segment_it != segments_by_name.end() &&
+                    !segment_it->second.host_id.empty()) {
+                    existing_hosts.insert(segment_it->second.host_id);
                 }
             }
         });
 
-    if (!source_segment.has_value() || memory_replicas == 0 ||
+    if (source_segments.empty() || memory_replicas == 0 ||
         memory_replicas >= dynamic_replication_max_memory_replicas_) {
         return std::nullopt;
     }
 
-    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-    std::vector<std::pair<Segment, UUID>> segments;
-    if (segment_access.GetAllSegments(segments) != ErrorCode::OK) {
-        return std::nullopt;
-    }
+    std::sort(source_segments.begin(), source_segments.end());
+    source_segments.erase(
+        std::unique(source_segments.begin(), source_segments.end()),
+        source_segments.end());
+    const std::string source_segment = *std::min_element(
+        source_segments.begin(), source_segments.end(),
+        [&](const auto& lhs, const auto& rhs) {
+            return DynamicReplicationStableScore(object_key, lhs) <
+                   DynamicReplicationStableScore(object_key, rhs);
+        });
 
     auto is_valid_target = [&](const Segment& segment) {
         if (existing_segments.contains(segment.name) ||
@@ -7734,6 +7771,26 @@ MasterService::SelectDynamicReplicaPlan(
         return util < kDynamicReplicationTargetHighWatermark;
     };
 
+    auto target_score = [&](const Segment& segment) {
+        size_t used = 0;
+        size_t capacity = 0;
+        if (segment_access.QuerySegments(segment.name, used, capacity) !=
+                ErrorCode::OK ||
+            capacity == 0) {
+            return std::tuple<bool, double, uint64_t>(
+                false, std::numeric_limits<double>::max(),
+                std::numeric_limits<uint64_t>::max());
+        }
+        const bool different_host = segment.host_id.empty() ||
+                                    existing_hosts.empty() ||
+                                    !existing_hosts.contains(segment.host_id);
+        const double util =
+            static_cast<double>(used) / static_cast<double>(capacity);
+        return std::tuple<bool, double, uint64_t>(
+            different_host, util,
+            DynamicReplicationStableScore(object_key, segment.name));
+    };
+
     std::optional<std::string> target_segment;
     if (preferred_target_segment.has_value()) {
         const auto preferred = std::find_if(
@@ -7743,23 +7800,23 @@ MasterService::SelectDynamicReplicaPlan(
         if (preferred != segments.end() && is_valid_target(preferred->first)) {
             target_segment = preferred->first.name;
         }
-    } else {
-        double best_util = std::numeric_limits<double>::max();
+    }
+    if (!target_segment.has_value()) {
+        std::optional<std::tuple<bool, double, uint64_t>> best_score;
         for (const auto& [segment, client_id] : segments) {
             (void)client_id;
             if (!is_valid_target(segment)) {
                 continue;
             }
-            size_t used = 0;
-            size_t capacity = 0;
-            if (segment_access.QuerySegments(segment.name, used, capacity) !=
-                ErrorCode::OK) {
-                continue;
-            }
-            const double util =
-                static_cast<double>(used) / static_cast<double>(capacity);
-            if (util < best_util) {
-                best_util = util;
+            const auto score = target_score(segment);
+            if (!best_score.has_value() ||
+                std::get<0>(score) > std::get<0>(*best_score) ||
+                (std::get<0>(score) == std::get<0>(*best_score) &&
+                 std::get<1>(score) < std::get<1>(*best_score)) ||
+                (std::get<0>(score) == std::get<0>(*best_score) &&
+                 std::get<1>(score) == std::get<1>(*best_score) &&
+                 std::get<2>(score) < std::get<2>(*best_score))) {
+                best_score = score;
                 target_segment = segment.name;
             }
         }
@@ -7768,7 +7825,7 @@ MasterService::SelectDynamicReplicaPlan(
     if (!target_segment.has_value()) {
         return std::nullopt;
     }
-    return DynamicReplicaPlan{.source_segment = *source_segment,
+    return DynamicReplicaPlan{.source_segment = source_segment,
                               .target_segment = *target_segment,
                               .target_domain = std::move(target_domain)};
 }

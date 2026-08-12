@@ -2441,6 +2441,8 @@ class MasterService {
     static constexpr double kDynamicReplicationTargetHighWatermark = 0.85;
 
     bool DynamicReplicationEnabled() const;
+    static uint64_t DynamicReplicationStableScore(const std::string& key,
+                                                  const std::string& segment);
     bool DynamicReplicationEnforce() const;
     uint32_t DynamicReplicationAdmissionMinHits() const;
     bool ObserveDynamicReplicationAccess(const ObjectIdentity& object_id);
