@@ -81,10 +81,7 @@ class SnapshotChildProcessTest;
 // exposing test-only accessors on MasterService itself.
 class PromotionOnHitTest;
 class MasterServiceTenantQuotaTest;
-// Friended so the BatchEvict correctness tests can invoke the private
-// BatchEvict entry point and seed lease timestamps directly, instead of
-// relying on segment pressure plus the background eviction thread.
-class BatchEvictTest;
+class MasterScenario;
 class MasterServiceHATest;
 // Friended so the processing_keys double-erase reproduction test can
 // invalidate a segment allocator via PrepareUnmountSegment WITHOUT the
@@ -121,7 +118,9 @@ class MasterService {
     friend class test::PromotionOnHitTest;
     friend class benchmarks::BatchEvictBench;
     friend class test::MasterServiceTenantQuotaTest;
-    friend class test::BatchEvictTest;
+    // The scenario DSL controls lease timestamps so eviction tests do not
+    // depend on sleeps or the background eviction thread.
+    friend class test::MasterScenario;
     // double-erase processing_keys UAF repro (2026-08-03 prod segfault)
     friend class test::MasterServiceProcessingKeyDoubleEraseTest;
     friend class MasterSnapshotManager;    // Allow access to internal state for
