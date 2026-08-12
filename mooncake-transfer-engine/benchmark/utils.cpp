@@ -218,10 +218,6 @@ void printStats(size_t block_size, size_t batch_size, XferBenchStats& stats,
     throughput_gb = (((double)total_data_transferred / (1000 * 1000 * 1000)) /
                      (total_duration / 1e6));  // In GB/Sec
     const double avg_instant_gbps = stats.instant_bandwidth.avg();
-    if (avg_instant_gbps > 0.0) {
-        avg_latency = static_cast<double>(block_size * batch_size) /
-                      (avg_instant_gbps * 1000.0);
-    }
 
     // Tabulate print with fixed width for each string
     // clang-format off
