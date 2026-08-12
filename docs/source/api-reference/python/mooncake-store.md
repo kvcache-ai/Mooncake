@@ -193,9 +193,9 @@ metadata = result.metadata
 
 ### Structured object transfer policy
 
-By default, structured object writes use `BundleTransferPolicy(copy_mode="auto")`. This keeps the existing behavior: Mooncake uses the zero-copy `batch_put_from` fast path when buffer registration is available, and falls back to ordinary `store.put` when the fast path is unavailable.
+By default, structured object writes use `BundleTransferPolicy(copy_mode="auto")`. Non-tensor payloads are staged through a Mooncake BufferPool and written with `batch_put_from` when that path is available; otherwise Mooncake falls back to ordinary `store.put`. Typed-ragged ndarray rows use the native fast-copy extension to copy directly into the staging buffer without an intermediate concatenation.
 
-For very large tensors, buffer registration capacity can be exhausted. If the upper layer does not handle this failure mode yet, force the non-zero-copy path with `copy_mode="copy"`:
+Use `copy_mode="copy"` to force the regular `store.put` path:
 
 ```python
 from mooncake.structured_object_store import BundleTransferPolicy
@@ -208,11 +208,9 @@ ref = transfer.put_structured_object(
 
 Available modes:
 
-- `auto`: prefer zero-copy and fall back to regular `store.put` when zero-copy support is unavailable;
-- `copy`: force the non-zero-copy `store.put` path;
-- `zero_copy`: require the zero-copy `batch_put_from` path and raise an error if it is unavailable.
-
-If a caller has already registered a structured member buffer, pass `pre_registered_buffers={"member_name": True}` to avoid duplicate registration. The buffer must be the same writable, contiguous buffer used for transfer; read-only, non-contiguous, or internally copied buffers are rejected.
+- `auto`: prefer BufferPool staging plus `batch_put_from` for non-tensor payloads and fall back to regular `store.put` when that path is unavailable;
+- `copy`: force the regular `store.put` path;
+- `zero_copy`: require payloads to be explicit `tensor_object_buffer` instances; non-tensor structured payloads are rejected.
 
 ### Partial reads
 
@@ -611,15 +609,23 @@ config = ReplicateConfig()
 config.replica_num = 3  # Store 3 copies of the data
 ```
 
-#### with_soft_pin
-**Type:** `bool`
-**Default:** `False`
-**Description:** Enables soft pinning for the stored object. Soft pinned objects are prioritized to remain in memory during eviction - they are only evicted when memory is insufficient and no other objects are eligible for eviction. This is useful for frequently accessed or important objects like system prompts.
+#### soft_pin_action
+**Type:** `SoftPinAction`
+**Default:** `SoftPinAction.PRESERVE`
+**Description:** Controls the soft-pin transition committed when the first replica becomes readable. `PRESERVE` keeps an existing deadline during Upsert, `ENABLE` starts a fixed soft-pin lifetime, and `DISABLE` removes it. Reads do not extend the lifetime.
 
 ```python
+from mooncake.store import ReplicateConfig, SoftPinAction
+
 config = ReplicateConfig()
-config.with_soft_pin = True  # Keep this object in memory longer
+config.soft_pin_action = SoftPinAction.ENABLE
+config.soft_pin_ttl_ms = 60_000  # Optional; omitted uses the Master default
 ```
+
+`soft_pin_ttl_ms` is valid only with `ENABLE`. The Master rejects TTLs above
+`max_kv_soft_pin_ttl`; a value of zero commits the object as ordinary cache.
+Soft-pin state is not persisted in snapshots or the HA OpLog. Restored objects
+therefore become ordinary cache after recovery or Standby promotion.
 
 #### with_hard_pin
 **Type:** `bool`
@@ -1063,30 +1069,50 @@ def setup(
     self,
     local_hostname: str,
     metadata_server: str,
-    global_segment_size: int = 16777216,
-    local_buffer_size: int = 1073741824,
-    protocol: str = "tcp",
-    rdma_devices: str = "",
+    global_segment_size: int,
+    local_buffer_size: int,
+    protocol: str,
+    rdma_devices: str,
     master_server_addr: str,
     engine: Optional[TransferEngine] = None,
     enable_ssd_offload: bool = False,
     ssd_offload_path: str = "",
     tenant_id: str = "default",
+    enable_client_http_server: bool = False,
+    client_http_port: int = 9300,
 ) -> int
 ```
+
+The positional overload requires every argument through
+`master_server_addr`. To use defaults for those fields, pass a configuration
+dictionary instead:
+
+```python
+def setup(self, config: Dict[str, object]) -> int
+```
+
+The dictionary overload requires `local_hostname` and `metadata_server`. Its
+other keys are optional; the defaults are `16777216` (16 MiB) for both
+`global_segment_size` and `local_buffer_size`, `"tcp"` for `protocol`, an empty
+string for `rdma_devices`, and `"127.0.0.1:50051"` for
+`master_server_addr`. It also accepts `ipc_socket_path` and the optional
+configuration fields listed below. The `engine` argument is available only in
+the positional overload.
 
 **Parameters:**
 - `local_hostname` (str): **Required**. Local hostname and port (e.g., "localhost" or "localhost:12345")
 - `metadata_server` (str): **Required**. Metadata connection string, e.g. `"P2PHANDSHAKE"` or `"http://localhost:8080/metadata"`.
-- `global_segment_size` (int): Memory segment size in bytes for mounting.
-- `local_buffer_size` (int): Local buffer size in bytes.
-- `protocol` (str): Network protocol, usually `"tcp"`, `"rdma"`, `"efa"`, `"cxl"`, or `"ascend"` depending on the build.
-- `rdma_devices` (str): RDMA/EFA device name(s), e.g. `"mlx5_0"` or `"mlx5_0,mlx5_1"`. Leave empty to auto-discover NICs unless `MC_MS_AUTO_DISC=0`; always empty for TCP.
-- `master_server_addr` (str): **Required**. Master server address (e.g., "localhost:50051")
+- `global_segment_size` (int): **Required by the positional overload**. Memory segment size in bytes for mounting.
+- `local_buffer_size` (int): **Required by the positional overload**. Local buffer size in bytes.
+- `protocol` (str): **Required by the positional overload**. Network protocol, usually `"tcp"`, `"rdma"`, `"efa"`, `"cxl"`, or `"ascend"` depending on the build.
+- `rdma_devices` (str): **Required by the positional overload**. RDMA/EFA device name(s), e.g. `"mlx5_0"` or `"mlx5_0,mlx5_1"`. Leave empty to auto-discover NICs unless `MC_MS_AUTO_DISC=0`; always empty for TCP.
+- `master_server_addr` (str): **Required by the positional overload**. Master server address (e.g., "localhost:50051")
 - `engine` (Optional[TransferEngine]): Existing Transfer Engine instance to reuse. Defaults to `None`.
 - `enable_ssd_offload` (bool): Enable client-side SSD offload support. Defaults to `False`.
 - `ssd_offload_path` (str): SSD offload directory. When provided, overrides the storage path environment configuration.
 - `tenant_id` (str): Tenant namespace for object keys. Defaults to `"default"`.
+- `enable_client_http_server` (bool): Enable the client-local `/health`, `/metrics`, and `/metrics/summary` HTTP endpoints. Defaults to `False`.
+- `client_http_port` (int): Port for the client-local HTTP endpoints. Defaults to `9300`.
 
 **Store segment pinned memory:** CUDA-enabled builds can register Store-managed
 host segments as pinned memory when `MC_STORE_PIN_MEMORY_MAX_BYTES` is set to a
@@ -1926,6 +1952,12 @@ def create_copy_task(self, key: str, targets: List[str]) -> Tuple[UUID, int]
   - If successful: (task UUID, 0)
   - If failed: (UUID{0, 0}, error code)
 
+**Task lifecycle and failure behavior:**
+- New tasks start in `TaskStatus.PENDING`, move to `TaskStatus.PROCESSING` after a client picks them up, and finish as `TaskStatus.SUCCESS` or `TaskStatus.FAILED`.
+- The task payload is executed by a storage client in the background; the client reports the final status back to the master automatically.
+- Only allocation-pressure failures (`NO_AVAILABLE_HANDLE`) are retried automatically by the client, up to the master-side `max_retry_attempts` setting.
+- Submission can fail immediately with errors such as `TASK_PENDING_LIMIT_EXCEEDED` when the master-side pending queue is full.
+
 **Example:**
 ```python
 # Create an asynchronous copy task
@@ -1960,6 +1992,12 @@ def create_move_task(self, key: str, source: str, target: str) -> Tuple[UUID, in
   - If successful: (task UUID, 0)
   - If failed: (UUID{0, 0}, error code)
 
+**Task lifecycle and failure behavior:**
+- Move tasks use the same state machine as copy tasks: `PENDING -> PROCESSING -> SUCCESS/FAILED`.
+- **Submission-time failures**: If the object or source replica is already missing when `create_move_task` is called, the call returns an error code directly (e.g., `OBJECT_NOT_FOUND` or `INVALID_PARAMS`) and no task is created.
+- **Execution-time failures**: If the object or source replica disappears after the task is successfully submitted, the task transitions to `FAILED` state. Only `NO_AVAILABLE_HANDLE` execution failures are retried automatically.
+- Timeout and retry behavior is controlled on the master side rather than by the Python client API.
+
 **Example:**
 ```python
 # Create an asynchronous move task
@@ -1991,6 +2029,26 @@ def query_task(self, task_id: UUID) -> Tuple[QueryTaskResponse | None, int]
 - `Tuple[QueryTaskResponse | None, int]`: (QueryTaskResponse if success, error code)
   - If successful: (QueryTaskResponse, 0)
   - If failed: (None, error code)
+
+`QueryTaskResponse` includes:
+- `id`: task UUID
+- `type`: `TaskType.REPLICA_COPY` or `TaskType.REPLICA_MOVE`
+- `status`: `TaskStatus.PENDING`, `TaskStatus.PROCESSING`, `TaskStatus.SUCCESS`, or `TaskStatus.FAILED`
+- `created_at_ms_epoch`: creation timestamp in milliseconds
+- `last_updated_at_ms_epoch`: last state-change timestamp in milliseconds
+- `assigned_client`: UUID of the client currently assigned to the task
+- `message`: completion or failure message
+
+Typical query-time failures include:
+- `TASK_NOT_FOUND`: the task ID does not exist or the finished task has already been pruned from the master's in-memory history
+
+**Master-side task manager settings affecting task APIs:**
+- `--max_total_finished_tasks`: number of completed tasks retained for later `query_task` calls
+- `--max_total_pending_tasks`: maximum queued tasks before submissions fail with `TASK_PENDING_LIMIT_EXCEEDED`
+- `--max_total_processing_tasks`: cap on concurrently processing tasks
+- `--pending_task_timeout_sec`: how long a task may stay in `PENDING` before being failed by the master (`0` disables this timeout)
+- `--processing_task_timeout_sec`: how long a task may stay in `PROCESSING` before being failed by the master (`0` disables this timeout)
+- `--max_retry_attempts`: retry budget used only for `NO_AVAILABLE_HANDLE` execution failures
 
 **Example:**
 ```python
@@ -2118,7 +2176,7 @@ def pub_tensor(self, key: str, tensor: torch.Tensor, config: ReplicateConfig = N
 **Example:**
 ```python
 import torch
-from mooncake.store import ReplicateConfig
+from mooncake.store import ReplicateConfig, SoftPinAction
 
 # Create a tensor
 tensor = torch.randn(100, 100)
@@ -2126,7 +2184,7 @@ tensor = torch.randn(100, 100)
 # Create replication config
 config = ReplicateConfig()
 config.replica_num = 3
-config.with_soft_pin = True
+config.soft_pin_action = SoftPinAction.ENABLE
 
 # Publish tensor with replication settings
 result = store.pub_tensor("my_tensor", tensor, config)
@@ -2532,13 +2590,13 @@ shared-memory staging buffer.
 **Example:**
 ```python
 import torch
-from mooncake.store import ReplicateConfig
+from mooncake.store import ReplicateConfig, SoftPinAction
 
 tensor = torch.randn(100, 100)
 
 config = ReplicateConfig()
 config.replica_num = 2
-config.with_soft_pin = True
+config.soft_pin_action = SoftPinAction.ENABLE
 
 result = store.upsert_pub_tensor("my_tensor", tensor, config)
 if result == 0:
@@ -2884,6 +2942,197 @@ store.batch_get_into_multi_buffers(keys, all_remote_addrs, all_sizes, True)
 
 store.unregister_buffer(tensor.data_ptr())
 store.unregister_buffer(target_tensor.data_ptr())
+```
+</details>
+
+---
+
+### Session-based ranged multi-buffer transfer
+
+For layerwise KV load/save, resolve Master metadata once per object, then transfer
+object-byte ranges across multiple buffers without re-querying Master on every layer.
+
+Typical flow:
+
+- Get: `batch_get_session_start` → `batch_get_into_multi_buffer_ranges` (per layer) → `batch_get_session_end`
+- Put: `batch_put_session_start` → `batch_put_from_multi_buffer_ranges` (per layer) → `batch_put_session_end` / `batch_put_session_revoke`
+
+Get sessions cache a filtered `QueryResult` (single complete memory replica + lease).
+Range calls only check the cached lease locally (zero Master RPCs). Put sessions
+reserve object space via Master `BatchPutStart` and finalize with `BatchPutEnd`.
+
+Put sessions write MEMORY replicas only. `nof_replica_num > 0` is accepted only for
+flexible dual-replica configs (`replica_num == 1` and `nof_replica_num == 1`), where
+`batch_put_session_end` finalizes MEMORY and revokes the unused NoF reservation.
+Reliable multi-replica NoF configs are rejected at session start. `end` / `revoke`
+seal the session (no further range writes) and wait for in-flight range transfers
+before talking to Master.
+
+⚠️ **Store-managed Buffer Required**: All buffers must resolve to Store-managed
+registered memory before ranged zero-copy operations.
+
+#### batch_get_session_start()
+
+Query replicas once and open a get session for the given keys.
+
+```python
+def batch_get_session_start(self, keys: List[str]) -> List[int]
+```
+
+**Parameters:**
+- `keys` (List[str]): Object identifiers
+
+**Returns:**
+- `List[int]`: Per-key status (0 = success, negative = error)
+
+#### batch_get_into_multi_buffer_ranges()
+
+Ranged get into multiple buffers using an active get session (no Master RPC).
+
+```python
+def batch_get_into_multi_buffer_ranges(
+    self,
+    keys: List[str],
+    all_buffer_ptrs: List[List[int]],
+    all_sizes: List[List[int]],
+    all_src_offsets: List[List[int]],
+) -> List[int]
+```
+
+**Parameters:**
+- `keys` (List[str]): Object identifiers (must have an active get session)
+- `all_buffer_ptrs` (List[List[int]]): Per-key list of destination buffer addresses
+- `all_sizes` (List[List[int]]): Per-key list of transfer sizes in bytes
+- `all_src_offsets` (List[List[int]]): Per-key list of object-byte source offsets
+
+**Returns:**
+- `List[int]`: Bytes transferred per key (positive = success, negative = error)
+
+#### batch_get_session_end()
+
+Drop cached get-session metadata for the given keys.
+
+```python
+def batch_get_session_end(self, keys: List[str]) -> int
+```
+
+**Parameters:**
+- `keys` (List[str]): Object identifiers
+
+**Returns:**
+- `int`: 0 on success, negative on error
+
+#### batch_put_session_start()
+
+Reserve objects and open a put session without transferring data.
+
+```python
+def batch_put_session_start(
+    self,
+    keys: List[str],
+    sizes: List[int],
+    config: ReplicateConfig = None,
+) -> List[int]
+```
+
+**Parameters:**
+- `keys` (List[str]): Object identifiers
+- `sizes` (List[int]): Full object sizes in bytes
+- `config` (ReplicateConfig, optional): Replication configuration (applies at start only).
+  If `group_ids` is set, its length must equal `len(keys)`. When some keys already
+  have a put session, they are skipped and `group_ids` is filtered to match the
+  remaining keys.
+
+**Returns:**
+- `List[int]`: Per-key status (0 = success, negative = error)
+
+#### batch_put_from_multi_buffer_ranges()
+
+Ranged put from multiple buffers using an active put session (no Master RPC).
+
+```python
+def batch_put_from_multi_buffer_ranges(
+    self,
+    keys: List[str],
+    all_buffer_ptrs: List[List[int]],
+    all_sizes: List[List[int]],
+    all_dst_offsets: List[List[int]],
+) -> List[int]
+```
+
+**Parameters:**
+- `keys` (List[str]): Object identifiers (must have an active put session)
+- `all_buffer_ptrs` (List[List[int]]): Per-key list of source buffer addresses
+- `all_sizes` (List[List[int]]): Per-key list of transfer sizes in bytes
+- `all_dst_offsets` (List[List[int]]): Per-key list of object-byte destination offsets
+
+**Returns:**
+- `List[int]`: Bytes transferred per key (positive = success, negative = error)
+
+#### batch_put_session_end()
+
+Finalize a put session and make objects readable.
+
+```python
+def batch_put_session_end(self, keys: List[str]) -> List[int]
+```
+
+**Parameters:**
+- `keys` (List[str]): Object identifiers
+
+**Returns:**
+- `List[int]`: Per-key status (0 = success, negative = error)
+
+#### batch_put_session_revoke()
+
+Abort an incomplete put session and release reserved space.
+
+```python
+def batch_put_session_revoke(self, keys: List[str]) -> List[int]
+```
+
+**Parameters:**
+- `keys` (List[str]): Object identifiers
+
+**Returns:**
+- `List[int]`: Per-key status (0 = success, negative = error)
+
+**Example:**
+
+<details>
+<summary>Click to expand: Session ranged put/get example</summary>
+
+```python
+import numpy as np
+
+page = 1024
+layers = 4
+keys = ["block0", "block1"]
+object_sizes = [page * layers] * len(keys)
+
+# Prepare one registered buffer per layer for each key
+src = [np.full(page, i, dtype=np.uint8) for i in range(layers)]
+dst = [np.zeros(page, dtype=np.uint8) for _ in range(layers)]
+for buf in src + dst:
+    store.register_buffer(buf.ctypes.data, buf.nbytes)
+
+assert all(rc == 0 for rc in store.batch_put_session_start(keys, object_sizes))
+for layer in range(layers):
+    ptrs = [[src[layer].ctypes.data] for _ in keys]
+    sizes = [[page] for _ in keys]
+    offsets = [[layer * page] for _ in keys]
+    rcs = store.batch_put_from_multi_buffer_ranges(keys, ptrs, sizes, offsets)
+    assert all(rc == page for rc in rcs)
+assert all(rc == 0 for rc in store.batch_put_session_end(keys))
+
+assert all(rc == 0 for rc in store.batch_get_session_start(keys))
+for layer in range(layers):
+    ptrs = [[dst[layer].ctypes.data] for _ in keys]
+    sizes = [[page] for _ in keys]
+    offsets = [[layer * page] for _ in keys]
+    rcs = store.batch_get_into_multi_buffer_ranges(keys, ptrs, sizes, offsets)
+    assert all(rc == page for rc in rcs)
+assert store.batch_get_session_end(keys) == 0
 ```
 </details>
 

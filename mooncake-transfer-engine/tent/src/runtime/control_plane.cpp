@@ -17,6 +17,7 @@
 
 #include <cassert>
 #include <set>
+#include <utility>
 
 #include "tent/common/status.h"
 #include "tent/common/utils/os.h"
@@ -25,6 +26,29 @@
 
 namespace mooncake {
 namespace tent {
+namespace {
+
+template <typename Fn>
+class CallbackInvocationGuard {
+   public:
+    explicit CallbackInvocationGuard(Fn on_exit)
+        : on_exit_(std::move(on_exit)) {}
+
+    ~CallbackInvocationGuard() { on_exit_(); }
+
+    CallbackInvocationGuard(const CallbackInvocationGuard&) = delete;
+    CallbackInvocationGuard& operator=(const CallbackInvocationGuard&) = delete;
+
+   private:
+    Fn on_exit_;
+};
+
+}  // namespace
+
+thread_local const ControlService* ControlService::active_bootstrap_service_ =
+    nullptr;
+thread_local const ControlService* ControlService::active_notify_service_ =
+    nullptr;
 thread_local CoroRpcAgent tl_rpc_agent;
 
 Status ControlClient::getSegmentDesc(const std::string& server_addr,
@@ -218,7 +242,62 @@ ControlService::ControlService(const std::string& type,
         });
 }
 
-ControlService::~ControlService() {}
+ControlService::~ControlService() {
+    // Stop RPC workers while callback state and synchronization primitives are
+    // still alive. Member destruction would otherwise tear them down first.
+    rpc_server_.reset();
+}
+
+void ControlService::setBootstrapRdmaCallback(
+    const OnReceiveBootstrap& callback) {
+    std::unique_lock<std::mutex> guard(bootstrap_cb_mutex_);
+    if (active_bootstrap_service_ == this) {
+        bootstrap_callback_ = callback;
+        return;
+    }
+    bootstrap_callback_ = nullptr;
+    if (!bootstrap_cb_cv_.wait_for(guard, callback_drain_timeout_, [this] {
+            return bootstrap_callbacks_in_flight_ == 0;
+        })) {
+        LOG(ERROR)
+            << "Timed out waiting for BootstrapRdma callbacks to drain, "
+            << "in_flight=" << bootstrap_callbacks_in_flight_
+            << ", timeout_ms=" << callback_drain_timeout_.count()
+            << ". Continue replacing the callback to keep shutdown bounded.";
+    }
+    bootstrap_callback_ = callback;
+}
+
+void ControlService::setNotifyCallback(const OnNotify& callback) {
+    std::unique_lock<std::mutex> guard(notify_cb_mutex_);
+    if (active_notify_service_ == this) {
+        notify_callback_ = callback;
+        return;
+    }
+    notify_callback_ = nullptr;
+    if (!notify_cb_cv_.wait_for(guard, callback_drain_timeout_, [this] {
+            return notify_callbacks_in_flight_ == 0;
+        })) {
+        LOG(ERROR) << "Timed out waiting for Notify callbacks to drain, "
+                   << "in_flight=" << notify_callbacks_in_flight_
+                   << ", timeout_ms=" << callback_drain_timeout_.count()
+                   << ". Continue replacing the callback to keep shutdown "
+                   << "bounded.";
+    }
+    notify_callback_ = callback;
+}
+
+void ControlService::finishBootstrapCallback() {
+    std::lock_guard<std::mutex> guard(bootstrap_cb_mutex_);
+    --bootstrap_callbacks_in_flight_;
+    bootstrap_cb_cv_.notify_all();
+}
+
+void ControlService::finishNotifyCallback() {
+    std::lock_guard<std::mutex> guard(notify_cb_mutex_);
+    --notify_callbacks_in_flight_;
+    notify_cb_cv_.notify_all();
+}
 
 Status ControlService::start(uint16_t& port, bool ipv6_) {
     return rpc_server_->start(port, ipv6_);
@@ -234,10 +313,46 @@ void ControlService::onGetSegmentDesc(const std::string_view& request,
 void ControlService::onBootstrapRdma(const std::string_view& request,
                                      std::string& response) {
     std::string mutable_request(request);
-    BootstrapDesc request_desc =
-        json::parse(std::string(request)).get<BootstrapDesc>();
+    OnReceiveBootstrap callback;
+    {
+        std::lock_guard<std::mutex> guard(bootstrap_cb_mutex_);
+        if (!bootstrap_callback_) {
+            BootstrapDesc response_desc;
+            response_desc.reply_msg = "NOT_READY: transport not initialized";
+            json j = response_desc;
+            response = j.dump();
+            return;
+        }
+        callback = bootstrap_callback_;
+        ++bootstrap_callbacks_in_flight_;
+    }
+
     BootstrapDesc response_desc;
-    if (bootstrap_callback_) bootstrap_callback_(request_desc, response_desc);
+    {
+        const ControlService* previous_service = active_bootstrap_service_;
+        active_bootstrap_service_ = this;
+        CallbackInvocationGuard invocation_guard([this, previous_service] {
+            active_bootstrap_service_ = previous_service;
+            finishBootstrapCallback();
+        });
+
+        try {
+            BootstrapDesc request_desc =
+                json::parse(mutable_request).get<BootstrapDesc>();
+            int rc = callback(request_desc, response_desc);
+            if (rc != 0 && response_desc.reply_msg.empty()) {
+                response_desc.reply_msg = "BootstrapRdma callback failed";
+            }
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "onBootstrapRdma failed: " << e.what();
+            response_desc.reply_msg =
+                std::string("BootstrapRdma callback failed: ") + e.what();
+        } catch (...) {
+            LOG(ERROR) << "onBootstrapRdma failed with unknown exception";
+            response_desc.reply_msg = "BootstrapRdma callback failed";
+        }
+    }
+
     json j = response_desc;
     response = j.dump();
 }
@@ -295,8 +410,30 @@ void ControlService::onRecvData(const std::string_view& request,
 
 void ControlService::onNotify(const std::string_view& request,
                               std::string& response) {
-    Notification message = json::parse(request).get<Notification>();
-    if (notify_callback_) notify_callback_(message);
+    (void)response;
+    OnNotify callback;
+    {
+        std::lock_guard<std::mutex> guard(notify_cb_mutex_);
+        if (!notify_callback_) return;
+        callback = notify_callback_;
+        ++notify_callbacks_in_flight_;
+    }
+
+    const ControlService* previous_service = active_notify_service_;
+    active_notify_service_ = this;
+    CallbackInvocationGuard invocation_guard([this, previous_service] {
+        active_notify_service_ = previous_service;
+        finishNotifyCallback();
+    });
+
+    try {
+        Notification message = json::parse(request).get<Notification>();
+        callback(message);
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "onNotify failed: " << e.what();
+    } catch (...) {
+        LOG(ERROR) << "onNotify failed with unknown exception";
+    }
 }
 
 void ControlService::onProbe(const std::string_view& request,

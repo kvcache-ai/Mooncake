@@ -3,7 +3,6 @@
 Test script to verify that the mooncake_master entry point works correctly.
 """
 
-import os
 import sys
 import subprocess
 import time

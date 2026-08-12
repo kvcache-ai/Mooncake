@@ -7,7 +7,9 @@ import torch
 use_musa = os.getenv("MOONCAKE_EP_USE_MUSA", "").upper() in {"1", "ON", "TRUE", "YES"}
 if use_musa:
     try:
-        import torchada  # noqa: F401
+        import importlib
+
+        importlib.import_module("torchada")
     except ImportError as e:
         raise ImportError(
             "torchada is required to build the MUSA PG extension. "

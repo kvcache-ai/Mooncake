@@ -219,10 +219,6 @@ void P2PProxy::allocateResources() {
     }
 
     for (size_t i = 0; i < kMaxNumRanks; ++i) {
-        peer_epoch_[i].store(1, std::memory_order_release);
-    }
-
-    for (size_t i = 0; i < kMaxNumRanks; ++i) {
         send_peer_lanes_[i].pending_send_ops_.clear();
         send_peer_lanes_[i].active_send_op_.reset();
         send_peer_lanes_[i].credit_consume_seq_ = 0;
@@ -287,12 +283,6 @@ void P2PProxy::resetPeerState(int peer_rank) {
               "ResetPeerState: peer_rank out of range: ", peer_rank,
               " size: ", size_);
 
-    // Epoch update:
-    //   We bump epoch_ so that any slots still in flight from the
-    //   old session (written by the sender/receiver before it learned about
-    //   the Reset) are recognized as stale and skipped.
-    peer_epoch_[peer_rank].fetch_add(1, std::memory_order_acq_rel);
-
     // Request reset
     reset_send_req_[peer_rank].store(true, std::memory_order_release);
     reset_recv_req_[peer_rank].store(true, std::memory_order_release);
@@ -332,22 +322,35 @@ void P2PProxy::cleanupFailedRecvOp(RecvOpContext& op_ctx) {
     active_recv_tasks_.fetch_sub(1, std::memory_order_release);
 }
 
+void P2PProxy::reportPeerFailure(int peer_rank) {
+    // Reset P2P session state (epoch, lanes).
+    resetPeerState(peer_rank);
+    // link event vector is indexed by GlobalRank.
+    const auto peer_global = meta_->rank_order[peer_rank];
+    const auto target_rank_epoch = meta_->rankEpochs[peer_global];
+    auto* communicator = meta_->communicator;
+    if (!communicator) return;
+
+    LinkEvent event;
+    event.events.assign(kMaxNumRanks, LinkEvent::EventType::None);
+    event.target_rank_epochs.assign(kMaxNumRanks, 0);
+    event.events[peer_global] = LinkEvent::EventType::Failure;
+    event.target_rank_epochs[peer_global] = target_rank_epoch;
+    communicator->getAgent().pushLinkEvent(event);
+
+    if (meta_->autoSyncOnFailure) {
+        auto result = communicator->syncAfterFailure();
+        PG_ASSERT(result.has_value() &&
+                      result.value().status != SyncAfterFailureStatus::Rejected,
+                  "syncAfterFailure failed for rank ", meta_->globalRank);
+    }
+}
+
 void P2PProxy::handleFailedSendOp(SendOpContext& op_ctx) {
     cleanupFailedSendOp(op_ctx);
     op_ctx.failed_ranks_hint_[op_ctx.peer_rank_] = 1;
-    // Reset P2P session state (epoch, lanes).
-    resetPeerState(op_ctx.peer_rank_);
-    // link event vector is indexed by GlobalRank.
+    reportPeerFailure(op_ctx.peer_rank_);
     const auto peer_global = meta_->rank_order[op_ctx.peer_rank_];
-    const auto target_rank_epoch = meta_->rankEpochs[peer_global];
-    if (meta_->communicator) {
-        LinkEvent event;
-        event.events.assign(kMaxNumRanks, LinkEvent::EventType::None);
-        event.target_rank_epochs.assign(kMaxNumRanks, 0);
-        event.events[peer_global] = LinkEvent::EventType::Failure;
-        event.target_rank_epochs[peer_global] = target_rank_epoch;
-        meta_->communicator->getAgent().pushLinkEvent(event);
-    }
     op_ctx.completion_->set_value();
     LOG(ERROR) << "Rank " << meta_->rank << ": P2P SendOp to peer "
                << op_ctx.peer_rank_ << " (global=" << peer_global
@@ -357,19 +360,8 @@ void P2PProxy::handleFailedSendOp(SendOpContext& op_ctx) {
 void P2PProxy::handleFailedRecvOp(RecvOpContext& op_ctx) {
     cleanupFailedRecvOp(op_ctx);
     op_ctx.failed_ranks_hint_[op_ctx.peer_rank_] = 1;
-    // Reset P2P session state (epoch, lanes).
-    resetPeerState(op_ctx.peer_rank_);
-    // link event vector is indexed by GlobalRank.
+    reportPeerFailure(op_ctx.peer_rank_);
     const auto peer_global = meta_->rank_order[op_ctx.peer_rank_];
-    const auto target_rank_epoch = meta_->rankEpochs[peer_global];
-    if (meta_->communicator) {
-        LinkEvent event;
-        event.events.assign(kMaxNumRanks, LinkEvent::EventType::None);
-        event.target_rank_epochs.assign(kMaxNumRanks, 0);
-        event.events[peer_global] = LinkEvent::EventType::Failure;
-        event.target_rank_epochs[peer_global] = target_rank_epoch;
-        meta_->communicator->getAgent().pushLinkEvent(event);
-    }
     op_ctx.completion_->set_value();
     LOG(ERROR) << "Rank " << meta_->rank << ": P2P RecvOp from peer "
                << op_ctx.peer_rank_ << " (global=" << peer_global
@@ -518,15 +510,16 @@ void P2PProxy::enqueueRecv(RecvOp op) {
     if (device_worker_) device_worker_->wakeUpRecv();
 }
 
-P2PProxy::SendTransferTask::SendTransferTask(
-    uint64_t buffer_offset_in, uint32_t chunk_len_in, void* staging_addr_in,
-    uint64_t remote_addr_in, uint32_t sequence_in, uint32_t epoch_in)
+P2PProxy::SendTransferTask::SendTransferTask(uint64_t buffer_offset_in,
+                                             uint32_t chunk_len_in,
+                                             void* staging_addr_in,
+                                             uint64_t remote_addr_in,
+                                             uint32_t sequence_in)
     : buffer_offset_(buffer_offset_in),
       chunk_len_(chunk_len_in),
       staging_addr_(staging_addr_in),
       remote_addr_(remote_addr_in),
-      sequence_(sequence_in),
-      epoch_(epoch_in) {
+      sequence_(sequence_in) {
     last_update_time_ = std::chrono::steady_clock::now();
 }
 
@@ -543,13 +536,11 @@ P2PProxy::SendOpContext::SendOpContext(SendOp&& op_in)
 P2PProxy::RecvTransferTask::RecvTransferTask(uint64_t buffer_offset_in,
                                              uint32_t chunk_len_in,
                                              void* local_addr_in,
-                                             uint32_t sequence_in,
-                                             uint32_t epoch_in)
+                                             uint32_t sequence_in)
     : buffer_offset_(buffer_offset_in),
       chunk_len_(chunk_len_in),
       local_addr_(local_addr_in),
-      sequence_(sequence_in),
-      epoch_(epoch_in) {
+      sequence_(sequence_in) {
     last_update_time_ = std::chrono::steady_clock::now();
 }
 
@@ -632,15 +623,15 @@ bool P2PProxy::tryIssueRecvTask(RecvOpContext& op_ctx, RecvPeerLane& lane) {
     const uint64_t remote_credit_offset =
         getRemoteCreditSlot(op_ctx.peer_rank_, seq);
 
-    const uint32_t curr_epoch =
-        peer_epoch_[op_ctx.peer_rank_].load(std::memory_order_acquire);
+    const uint32_t group_epoch =
+        static_cast<uint32_t>(meta_->epoch.load(std::memory_order_acquire));
     op_ctx.tasks_.emplace_back(op_ctx.bytes_credited_, chunk_len, local_addr,
-                               seq, curr_epoch);
+                               seq);
     auto& task = op_ctx.tasks_.back();
 
     auto* credit_staging_buf = getLocalCreditStagingBuf(op_ctx.peer_rank_, seq);
     credit_staging_buf->publish(
-        curr_epoch, seq, reinterpret_cast<uint64_t>(local_addr), chunk_len);
+        group_epoch, seq, reinterpret_cast<uint64_t>(local_addr), chunk_len);
     const BatchID batch_id = engine_->allocateBatchID(1);
     engine_->submitTransfer(
         batch_id, {TransferRequest{
@@ -768,15 +759,15 @@ P2PProxy::IssueResult P2PProxy::tryIssueSendTask(SendOpContext& op_ctx,
         return IssueResult::kNoCredit;
     }
 
-    // Step 2 -- Stale packet: the slot carries data from a previous epoch
-    // (before a Reset).  Clear it so the fresh credit can land safely.
-    const uint32_t curr_epoch =
-        peer_epoch_[op_ctx.peer_rank_].load(std::memory_order_acquire);
-    if (slot_epoch != curr_epoch) {
+    // Step 2 -- Stale packet: the slot belongs to an older group view. Clear it
+    // so the fresh credit can land safely.
+    const uint32_t group_epoch =
+        static_cast<uint32_t>(meta_->epoch.load(std::memory_order_acquire));
+    if (slot_epoch != group_epoch) {
         LOG(WARNING) << "[P2PProxy][Send] tryIssueSendTask peer="
                      << op_ctx.peer_rank_ << " STALE_EPOCH seq=" << seq
                      << " slot.epoch=" << slot_epoch
-                     << " curr_epoch=" << curr_epoch;
+                     << " group_epoch=" << group_epoch;
         slot.reset();
         return IssueResult::kIssued;
     }
@@ -798,7 +789,7 @@ P2PProxy::IssueResult P2PProxy::tryIssueSendTask(SendOpContext& op_ctx,
               "P2P send got invalid chunk_len in credit slot.");
 
     op_ctx.tasks_.emplace_back(op_ctx.bytes_staged_, chunk_len, staging_addr,
-                               recv_addr, seq, slot_epoch);
+                               recv_addr, seq);
     auto& task = op_ctx.tasks_.back();
 
     slot.reset();
@@ -939,7 +930,9 @@ bool P2PProxy::stepSendAck(SendOpContext& op_ctx, SendTransferTask& task) {
     if (!task.ack_batch_id_.has_value()) {
         auto* ack_staging_buf =
             getLocalAckStagingBuf(op_ctx.peer_rank_, task.sequence_);
-        ack_staging_buf->publish(task.epoch_, task.sequence_, task.chunk_len_);
+        const uint32_t group_epoch =
+            static_cast<uint32_t>(meta_->epoch.load(std::memory_order_acquire));
+        ack_staging_buf->publish(group_epoch, task.sequence_, task.chunk_len_);
 
         const BatchID batch_id = engine_->allocateBatchID(1);
         engine_->submitTransfer(
@@ -1123,17 +1116,17 @@ bool P2PProxy::pollRecvAckSlot(RecvOpContext& op_ctx, RecvPeerLane& lane,
         return false;
     }
 
-    const uint32_t curr_epoch =
-        peer_epoch_[op_ctx.peer_rank_].load(std::memory_order_acquire);
+    const uint32_t group_epoch =
+        static_cast<uint32_t>(meta_->epoch.load(std::memory_order_acquire));
 
-    // Step 2 -- Stale packet: data from a previous epoch (before Reset).
-    // Clear the slot so the fresh ack can land safely.
-    if (slot_epoch != curr_epoch) {
+    // Step 2 -- Stale packet from an older group view. Clear the slot so the
+    // fresh ack can land safely.
+    if (slot_epoch != group_epoch) {
         LOG(WARNING) << "[P2PProxy][Recv] pollRecvAckSlot peer="
                      << op_ctx.peer_rank_
                      << " front-seq=" << head_task.sequence_
                      << " EPOCH_MISMATCH slot.epoch=" << slot_epoch
-                     << " curr_epoch=" << curr_epoch;
+                     << " group_epoch=" << group_epoch;
         slot.reset();
         return true;
     }

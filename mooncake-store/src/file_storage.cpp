@@ -108,6 +108,10 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
     config.local_buffer_size = Environ::GetInt64(
         "MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", config.local_buffer_size);
 
+    config.pinned_restore_arena_size =
+        Environ::GetInt64("MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES",
+                          config.pinned_restore_arena_size);
+
     config.scanmeta_iterator_keys_limit = Environ::GetInt64(
         "MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT",
         Environ::GetInt64("MOONCAKE_SCANMETA_ITERATOR_KEYS_LIMIT",
@@ -226,6 +230,11 @@ bool FileStorageConfig::Validate() const {
         LOG(ERROR) << "FileStorageConfig: total_size_limit should not be zero";
         return false;
     }
+    if (pinned_restore_arena_size < 0) {
+        LOG(ERROR) << "FileStorageConfig: pinned_restore_arena_size must be "
+                      "non-negative";
+        return false;
+    }
     if (heartbeat_interval_seconds <= 0) {
         LOG(ERROR) << "FileStorageConfig: heartbeat_interval_seconds must > 0";
         return false;
@@ -265,6 +274,29 @@ FileStorage::FileStorage(const FileStorageConfig& config,
           config.local_buffer_size, client ? client->GetProtocol() : "")) {
     if (!config.Validate()) {
         throw std::invalid_argument("Invalid FileStorage configuration");
+    }
+
+    if (config.pinned_restore_arena_size > 0) {
+        if (config.use_uring) {
+            LOG(WARNING) << "Pinned SSD restore is disabled with io_uring";
+        } else if (!client ||
+                   !client->CanUseLocalMemcpy(client->GetSegmentEndpoint())) {
+            LOG(WARNING)
+                << "Pinned SSD restore is disabled: local memcpy unavailable";
+        } else {
+            auto buffer = PinnedBufferPool::AllocatePinned(
+                static_cast<size_t>(config.pinned_restore_arena_size));
+            if (buffer.pinned_host.addr) {
+                pinned_restore_arena_ = std::move(buffer);
+                pinned_restore_arena_allocator_ = ClientBufferAllocator::create(
+                    pinned_restore_arena_.data, pinned_restore_arena_.capacity,
+                    client->GetProtocol());
+                LOG(INFO) << "Initialized pinned SSD restore arena, size="
+                          << pinned_restore_arena_.capacity;
+            } else {
+                LOG(WARNING) << "Failed to allocate pinned SSD restore arena";
+            }
+        }
     }
 
     auto create_storage_backend_result = CreateStorageBackend(config_);
@@ -398,15 +430,23 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
     return {};
 }
 
-tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
-    const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
-    auto start_time = std::chrono::steady_clock::now();
-    auto allocate_res = AllocateBatch(keys, sizes);
+tl::expected<std::shared_ptr<FileStorage::AllocatedBatch>, ErrorCode>
+FileStorage::LoadBatch(const std::vector<std::string>& keys,
+                       const std::vector<int64_t>& sizes, bool prefer_pinned) {
+    const bool use_pinned = prefer_pinned && pinned_restore_arena_allocator_;
+    auto& allocator = use_pinned ? *pinned_restore_arena_allocator_
+                                 : *client_buffer_allocator_;
+    auto allocate_res = AllocateBatch(keys, sizes, allocator);
+    if (!allocate_res && use_pinned &&
+        allocate_res.error() == ErrorCode::BUFFER_OVERFLOW) {
+        VLOG(1) << "Pinned SSD restore arena exhausted; using default arena";
+        allocate_res = AllocateBatch(keys, sizes, *client_buffer_allocator_);
+    }
     if (!allocate_res) {
         LOG(ERROR) << "Failed to allocate batch objects";
         return tl::make_unexpected(allocate_res.error());
     }
-    auto allocated_batch = allocate_res.value();
+    auto allocated_batch = std::move(allocate_res.value());
     auto result = BatchLoad(allocated_batch->slices);
     if (!result) {
         LOG(ERROR) << "Batch load object failed,err_code = " << result.error();
@@ -424,6 +464,16 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
         }
     }
 
+    return allocated_batch;
+}
+
+tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
+    const std::vector<std::string>& keys, const std::vector<int64_t>& sizes) {
+    auto start_time = std::chrono::steady_clock::now();
+    auto load_result = LoadBatch(keys, sizes, false);
+    if (!load_result) return tl::make_unexpected(load_result.error());
+
+    auto allocated_batch = std::move(load_result.value());
     uint64_t batch_id = allocated_batch->batch_id;
     BatchGetResult batch_result{batch_id, allocated_batch->pointers};
 
@@ -437,6 +487,19 @@ tl::expected<FileStorage::BatchGetResult, ErrorCode> FileStorage::BatchGet(
     VLOG(1) << "Time taken for FileStorage::BatchGet: " << elapsed_time
             << "us, key size: " << keys.size() << ", batch_id: " << batch_id;
     return batch_result;
+}
+
+tl::expected<FileStorage::LocalBatchResult, ErrorCode>
+FileStorage::BatchGetLocal(const std::vector<std::string>& keys,
+                           const std::vector<int64_t>& sizes) {
+    auto load_result = LoadBatch(keys, sizes, true);
+    if (!load_result) return tl::make_unexpected(load_result.error());
+
+    auto batch = std::move(load_result.value());
+    LocalBatchResult result;
+    result.pointers = std::move(batch->pointers);
+    result.owner = std::move(batch);
+    return result;
 }
 
 bool FileStorage::IsPerBucketSoftOffloadError(ErrorCode error) {
@@ -1023,7 +1086,8 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
         // staging space when the local goes out of scope.
         std::vector<std::string> single_key{storage_key};
         std::vector<int64_t> single_size{size};
-        auto allocate_res = AllocateBatch(single_key, single_size);
+        auto allocate_res =
+            AllocateBatch(single_key, single_size, *client_buffer_allocator_);
         if (!allocate_res) {
             LOG(WARNING) << "Promotion: AllocateBatch failed for key=" << key
                          << ", error=" << allocate_res.error();
@@ -1156,7 +1220,8 @@ tl::expected<void, ErrorCode> FileStorage::RegisterLocalMemory() {
 
 tl::expected<std::shared_ptr<FileStorage::AllocatedBatch>, ErrorCode>
 FileStorage::AllocateBatch(const std::vector<std::string>& keys,
-                           const std::vector<int64_t>& sizes) {
+                           const std::vector<int64_t>& sizes,
+                           ClientBufferAllocator& allocator) {
     if (keys.size() != sizes.size()) {
         LOG(ERROR) << "Mismatched keys and sizes count: keys=" << keys.size()
                    << ", sizes=" << sizes.size();
@@ -1187,8 +1252,9 @@ FileStorage::AllocateBatch(const std::vector<std::string>& keys,
         size_t alloc_size =
             align_up(data_size, kDirectIOAlignment) + 2 * kDirectIOAlignment;
 
-        auto alloc_result = client_buffer_allocator_->allocate(alloc_size);
-        if (!alloc_result && !gc_triggered) {
+        auto alloc_result = allocator.allocate(alloc_size);
+        if (!alloc_result && !gc_triggered &&
+            &allocator == client_buffer_allocator_.get()) {
             gc_triggered = true;
             {
                 MutexLocker locker(&client_buffer_mutex_);
@@ -1202,12 +1268,9 @@ FileStorage::AllocateBatch(const std::vector<std::string>& keys,
                     }
                 }
             }
-            alloc_result = client_buffer_allocator_->allocate(alloc_size);
+            alloc_result = allocator.allocate(alloc_size);
         }
         if (!alloc_result) {
-            LOG(ERROR) << "Failed to allocate slice buffer, size = "
-                       << alloc_size << " (data_size=" << data_size
-                       << "), key = " << keys[i];
             return tl::make_unexpected(ErrorCode::BUFFER_OVERFLOW);
         }
 

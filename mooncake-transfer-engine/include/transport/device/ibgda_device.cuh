@@ -118,16 +118,41 @@ __device__ __forceinline__ void mc_ibgda_poll_cq(mlx5gda_qp_devctx* qp,
 __device__ __forceinline__ void mc_ibgda_post_send_db(mlx5gda_qp_devctx* qp) {
     uint32_t num_posted = static_cast<uint32_t>(qp->wq_head);
     // DBR write — always done (NIC polls doorbell record in GPU memory)
+#if defined(MOONCAKE_EP_USE_MUSA) && __MUSA_ARCH__ == 310
+    // Match mtshmem's IBGDA publish sequence. The bypass atomic exchange makes
+    // the GPU-memory doorbell record visible to the NIC rather than retaining
+    // the write in the GPU cache hierarchy.
+    const uint32_t dbr_value = mc_bswap32(num_posted);
+    __threadfence_system_noflush();
+    asm volatile("LSU.ATOM_32.XCHG %0, %1, slc=byp;"
+                 :
+                 : "R"(reinterpret_cast<uint32_t*>(&qp->dbr->send_counter)),
+                   "R"(dbr_value));
+#else
     mc_st_release_u32(reinterpret_cast<uint32_t*>(&qp->dbr->send_counter),
                       mc_bswap32(num_posted));
+#endif
     // BF (Blue Flame) doorbell — only if BF register is mapped into GPU VA.
-    // On MUSA, musaHostRegisterIoMemory fails for MMIO addresses, so bf is
-    // NULL and we rely on DBR-only mode (slightly higher latency).
     if (qp->bf != nullptr) {
+#if defined(MOONCAKE_EP_USE_MUSA) && __MUSA_ARCH__ == 310
+        struct {
+            __be32 opmod_idx_opcode;
+            __be32 qpn_ds;
+        } doorbell{
+            mc_bswap32(num_posted << 8),
+            mc_bswap32(qp->qpn << 8),
+        };
+        __threadfence_system_noflush();
+        asm volatile("LSU.ATOM_64.XCHG %0, %1, slc=byp;"
+                     :
+                     : "R"(reinterpret_cast<uint64_t*>(qp->bf)),
+                       "R"(*reinterpret_cast<uint64_t*>(&doorbell)));
+#else
         auto* last_wqe = qp->wq + ((num_posted - 1) & qp->wqeid_mask);
         mc_st_release_u64(reinterpret_cast<uint64_t*>(qp->bf + qp->bf_offset),
                           *reinterpret_cast<uint64_t*>(last_wqe));
         qp->bf_offset ^= MLX5GDA_BF_SIZE;
+#endif
     }
 }
 

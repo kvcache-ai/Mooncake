@@ -108,12 +108,6 @@ void MasterSnapshotManager::SnapshotThreadFunc() {
             break;
         }
 
-        if (!options_.enable_snapshot) {
-            // Snapshot is disabled
-            LOG(INFO)
-                << "[Snapshot] Snapshot is disabled, waiting for next cycle";
-            continue;
-        }
         // Fork a child process to save current state
 
         std::string snapshot_id =
@@ -362,7 +356,7 @@ void MasterSnapshotManager::HandleChildExit(pid_t pid, int status,
 
 tl::expected<ha::OpLogSequenceId, SerializationError>
 MasterSnapshotManager::ResolveSnapshotSequenceId() const {
-    if (!options_.enable_ha || !master_service_->enable_oplog_) {
+    if (!master_service_->enable_ha_ || !master_service_->enable_oplog_) {
         // OpLog sequence ids start at 1. Returning 0 here is a sentinel that
         // means "no persisted OpLog boundary", so a standby that later calls
         // Recover(0) will replay from the first entry when oplog following is

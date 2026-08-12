@@ -2,11 +2,11 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdint>
 #include <filesystem>
 #include <limits>
 #include <memory>
-#include <optional>
 #include <string>
 #include <vector>
 
@@ -217,6 +217,30 @@ TEST_P(CatalogBackedSnapshotProviderTest,
     PublishSnapshotPayload(
         SnapshotMetadataFormat::kWithAgentHintsAndObjectChecksum);
     ExpectLoadsDefaultObject();
+}
+
+TEST_P(CatalogBackedSnapshotProviderTest,
+       LoadLatestSnapshotIgnoresSoftPinForRetention) {
+    const auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::system_clock::now().time_since_epoch())
+                            .count();
+    ASSERT_GT(now_ms, 0);
+    auto published = mooncake::test::PublishSnapshotPayloadBytes(
+        *object_store_, *catalog_store_, descriptor_,
+        BuildMetadataPayload(
+            UUID{1, 2}, kDefaultTestObjectKey, kDefaultTestDiskFilePath,
+            kDefaultTestObjectSize, kDefaultTestPutStartTimeMs,
+            static_cast<uint64_t>(now_ms - 1), SnapshotMetadataFormat::kLegacy,
+            static_cast<uint64_t>(now_ms + 60'000)));
+    ASSERT_TRUE(published.has_value()) << published.error();
+    snapshot_published_ = true;
+
+    auto provider = CreateProvider();
+    ASSERT_TRUE(provider.has_value()) << toString(provider.error());
+    auto snapshot = provider.value()->LoadLatestSnapshot(cluster_id_);
+    ASSERT_TRUE(snapshot.has_value()) << toString(snapshot.error());
+    ASSERT_TRUE(snapshot->has_value());
+    EXPECT_TRUE(snapshot->value().metadata.empty());
 }
 
 TEST_P(CatalogBackedSnapshotProviderTest, RejectsOverflowingReplicaCount) {

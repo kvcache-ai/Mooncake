@@ -4,6 +4,7 @@
 #include <gtest/gtest.h>
 #include <xxhash.h>
 
+#include <limits>
 #include <memory>
 #include <sstream>
 #include <string>
@@ -176,6 +177,99 @@ TEST(OpLogDurablePrefixCodecTest, RoundTripsNonZeroPrefix) {
     EXPECT_EQ(in.batch_id, out.batch_id);
     EXPECT_EQ(in.last_seq, out.last_seq);
     EXPECT_TRUE(reason.empty());
+}
+
+TEST(OpLogDurablePrefixCodecTest, PreservesLegacyEncodingWithoutProducerView) {
+    const std::string legacy =
+        R"({"batch_id":9,"last_seq":1024,"schema_version":1})";
+
+    DurablePrefix prefix;
+    std::string reason;
+    ASSERT_TRUE(DecodeDurablePrefix(legacy, &prefix, &reason));
+    EXPECT_EQ(0u, prefix.producer_view_version);
+    EXPECT_EQ(legacy, EncodeDurablePrefix(prefix));
+    EXPECT_TRUE(reason.empty());
+}
+
+TEST(OpLogDurablePrefixCodecTest, RoundTripsMaxProducerView) {
+    DurablePrefix in{
+        .batch_id = 9,
+        .last_seq = 1024,
+        .producer_view_version = std::numeric_limits<ViewVersionId>::max()};
+
+    DurablePrefix out;
+    std::string reason;
+    ASSERT_TRUE(DecodeDurablePrefix(EncodeDurablePrefix(in), &out, &reason));
+    EXPECT_EQ(in.producer_view_version, out.producer_view_version);
+    EXPECT_TRUE(reason.empty());
+}
+
+TEST(OpLogDurablePrefixCodecTest, OmitsExplicitZeroProducerViewOnReencode) {
+    const std::string with_explicit_zero =
+        R"({"batch_id":9,"last_seq":1024,"producer_view_version":0,"schema_version":1})";
+    const std::string without_view =
+        R"({"batch_id":9,"last_seq":1024,"schema_version":1})";
+
+    DurablePrefix prefix;
+    std::string reason;
+    ASSERT_TRUE(DecodeDurablePrefix(with_explicit_zero, &prefix, &reason));
+    EXPECT_EQ(0u, prefix.producer_view_version);
+    EXPECT_EQ(without_view, EncodeDurablePrefix(prefix));
+    EXPECT_TRUE(reason.empty());
+}
+
+TEST(OpLogDurablePrefixCodecTest, IgnoresUnknownFields) {
+    DurablePrefix prefix;
+    std::string reason;
+    ASSERT_TRUE(DecodeDurablePrefix(
+        R"({"batch_id":9,"last_seq":1024,"producer_view_version":7,"schema_version":1,"unknown":"ignored"})",
+        &prefix, &reason));
+    EXPECT_EQ(9u, prefix.batch_id);
+    EXPECT_EQ(1024u, prefix.last_seq);
+    EXPECT_EQ(7u, prefix.producer_view_version);
+    EXPECT_TRUE(reason.empty());
+}
+
+TEST(OpLogDurablePrefixCodecTest, RejectsInvalidProducerViews) {
+    const std::vector<std::string> invalid_values = {
+        R"("1")", "-1", "1.5", "9223372036854775808", "18446744073709551616"};
+
+    for (const auto& invalid_value : invalid_values) {
+        DurablePrefix prefix;
+        std::string reason;
+        const std::string encoded =
+            R"({"batch_id":9,"last_seq":1024,"producer_view_version":)" +
+            invalid_value + R"(,"schema_version":1})";
+        EXPECT_FALSE(DecodeDurablePrefix(encoded, &prefix, &reason))
+            << invalid_value;
+        EXPECT_FALSE(reason.empty()) << invalid_value;
+    }
+}
+
+TEST(OpLogDurablePrefixCodecTest, InvalidProducerViewLeavesOutputUnchanged) {
+    DurablePrefix prefix{
+        .batch_id = 11, .last_seq = 22, .producer_view_version = 33};
+    std::string reason;
+    EXPECT_FALSE(DecodeDurablePrefix(
+        R"({"batch_id":9,"last_seq":1024,"producer_view_version":"invalid","schema_version":1})",
+        &prefix, &reason));
+    EXPECT_EQ(11u, prefix.batch_id);
+    EXPECT_EQ(22u, prefix.last_seq);
+    EXPECT_EQ(33u, prefix.producer_view_version);
+    EXPECT_FALSE(reason.empty());
+}
+
+TEST(OpLogDurablePrefixCodecTest, InvalidLastSeqLeavesOutputUnchanged) {
+    DurablePrefix prefix{
+        .batch_id = 11, .last_seq = 22, .producer_view_version = 33};
+    std::string reason;
+    EXPECT_FALSE(DecodeDurablePrefix(
+        R"({"batch_id":9,"last_seq":"invalid","schema_version":1})", &prefix,
+        &reason));
+    EXPECT_EQ(11u, prefix.batch_id);
+    EXPECT_EQ(22u, prefix.last_seq);
+    EXPECT_EQ(33u, prefix.producer_view_version);
+    EXPECT_FALSE(reason.empty());
 }
 
 TEST(OpLogDurablePrefixCodecTest, RejectsMalformedPayload) {

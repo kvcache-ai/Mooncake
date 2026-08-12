@@ -1,7 +1,7 @@
 # Mooncake PG/EP Troubleshooting
 
 This page covers common setup, import, runtime, and recovery issues for
-Mooncake Backend (PG) and Mooncake EP.
+Mooncake PG and Mooncake EP.
 
 ## Import fails with a PyTorch version error
 
@@ -41,80 +41,25 @@ Fixes:
 3. Make sure the Python environment used at runtime is the same one used for the
    build.
 
-## `activeRanks must be int` or device mismatch
+## `dist.get_world_size()` differs from the number of active ranks
 
-Symptoms:
+Mooncake PG preserves stable in-group rank slots. Consequently:
 
-```text
-activeRanks must be int.
-activeRanks must be on CPU.
-activeRanks must be on GPU.
-activeRanks must be sized to max_world_size when max_world_size is set
-```
-
-Causes and fixes:
-
-- Use `torch.int32`, not `bool`, `int64`, or floating-point types.
-- For `backend="mooncake"`, put `active_ranks` on the accelerator device.
-- For `backend="mooncake-cpu"`, put `active_ranks` on CPU.
-- If `max_world_size` is set, allocate `active_ranks` with length
-  `max_world_size`, even if the initial visible `world_size` is smaller.
-
-Examples:
-
-```python
-# CUDA / accelerator backend
-active_ranks = torch.ones(max_world_size, dtype=torch.int32, device="cuda")
-
-# CPU backend
-active_ranks = torch.ones(max_world_size, dtype=torch.int32)
-```
-
-## `dist.get_world_size()` is smaller than `max_world_size`
-
-This is expected. Mooncake PG distinguishes reserved capacity from visible active
-membership:
-
-- `max_world_size` reserves future rank slots.
-- `dist.get_world_size()` returns the visible active size.
-- Reserved ranks are inactive until `recover_ranks()` activates them.
+- `max_group_size` is the fixed slot capacity;
+- `dist.get_world_size()` is the highest active in-group rank plus one;
+- holes below that extent remain visible in the rank space but are skipped by
+  the active mask.
 
 Use `pg.get_active_ranks(backend)` to inspect the current backend mask.
 
-## `get_peer_state()` or `join_group()` hangs
+## `join_group()` hangs or activation times out
 
 Common causes:
 
-- Healthy ranks are not all calling `get_peer_state()` in the same order.
-- The joining rank did not initialize with `is_extension=True`.
-- `max_world_size` / rank numbering differs between healthy and joining ranks.
-- Subgroups were created in different orders on healthy and joining processes.
-- The joining process has not published peer metadata yet.
-- Network device filters differ across ranks.
-
-Debug checklist:
-
-1. Confirm all ranks use the same rendezvous address and store.
-2. Print rank, visible `world_size`, and `max_world_size` at initialization.
-3. Confirm `active_ranks` length and values on every rank.
-4. Verify healthy ranks poll the same `join_ranks` list.
-5. For subgroup recovery, confirm every rank calls `dist.new_group()` in the same
-   order.
-6. If using RDMA, set the same HCA whitelist on every rank.
-
-## Newly extended ranks participate too early
-
-After `pg.extend_group_size_to(backend, new_size)`, new ranks are reserved but
-inactive. They should not participate in collectives until healthy ranks call
-`pg.recover_ranks(backend, ranks)`.
-
-If a new rank appears to participate early, check whether:
-
-- `active_ranks` was initialized with `1` for future ranks without masking them
-  through the backend protocol;
-- the application called collectives on the joining process before
-  `pg.join_group()` returned;
-- different ranks used inconsistent `max_world_size` or rank IDs.
+- No existing rank submitted `activate_ranks()` / `recover_ranks()` after the
+  joining process entered `join_group()`.
+- The future active set is not mutually connected, so the activation proposal
+  remains pending until timeout.
 
 ## EP dispatch/combine timeout marks a rank inactive
 

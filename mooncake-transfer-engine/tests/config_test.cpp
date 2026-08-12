@@ -277,6 +277,56 @@ TEST_F(ConnPauseTtlEnvTest, EmptyStringKeepsDefault) {
     EXPECT_EQ(config.conn_pause_ttl_ms, 17);
 }
 
+// MC_IB_PORT names the RDMA port opened on every device. Port numbers are
+// 1-based, so 0 is not a "disable" value: it makes ibv_query_port fail on
+// every device and takes the whole topology down.
+class IbPortEnvTest : public ::testing::Test {
+   protected:
+    void TearDown() override { ::unsetenv("MC_IB_PORT"); }
+};
+
+TEST_F(IbPortEnvTest, DefaultIsPortOneWhenUnset) {
+    ::unsetenv("MC_IB_PORT");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.port, 1);
+}
+
+TEST_F(IbPortEnvTest, ValidOverrideIsApplied) {
+    ASSERT_EQ(::setenv("MC_IB_PORT", "2", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.port, 2);
+}
+
+TEST_F(IbPortEnvTest, ZeroIsRejected) {
+    ASSERT_EQ(::setenv("MC_IB_PORT", "0", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.port, 1);
+}
+
+TEST_F(IbPortEnvTest, OutOfRangeIsRejected) {
+    ASSERT_EQ(::setenv("MC_IB_PORT", "256", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.port, 1);
+}
+
+TEST_F(IbPortEnvTest, NegativeIsRejected) {
+    ASSERT_EQ(::setenv("MC_IB_PORT", "-1", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.port, 1);
+}
+
+TEST_F(IbPortEnvTest, NonNumericIsRejected) {
+    ASSERT_EQ(::setenv("MC_IB_PORT", "abc", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_EQ(config.port, 1);
+}
+
 // MC_MAX_CONCURRENT_REG_MR caps how many buffers registerLocalMemoryBatch()
 // registers at once; 0 (the default) means unbounded. 0 is therefore also what
 // a silent atol() fallback would produce on a typo, which would read as "the
@@ -397,6 +447,58 @@ TEST_F(EfaNicSelectionEnvTest, EmptyStringKeepsDefault) {
     GlobalConfig config;
     loadGlobalConfig(config);
     EXPECT_EQ(config.efa_nic_selection, EfaNicSelection::ALL);
+}
+
+// max_wr_from_env distinguishes "the operator asked for this depth" from "this
+// is the compiled-in default".  The EFA transport needs that distinction: with
+// no override it adopts the provider's per-device transmit queue depth, which
+// no fixed default can match (2048 on p6-b300, 4096 on p5).  A rejected value
+// must NOT set the flag, or a typo would be treated as a deliberate override.
+class MaxWrEnvTest : public ::testing::Test {
+   protected:
+    void TearDown() override { ::unsetenv("MC_MAX_WR"); }
+};
+
+TEST_F(MaxWrEnvTest, NotFromEnvWhenUnset) {
+    ::unsetenv("MC_MAX_WR");
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_FALSE(config.max_wr_from_env);
+    EXPECT_EQ(config.max_wr, 256u);  // default preserved for RDMA
+}
+
+TEST_F(MaxWrEnvTest, ValidOverrideSetsFlag) {
+    ASSERT_EQ(::setenv("MC_MAX_WR", "2048", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_TRUE(config.max_wr_from_env);
+    EXPECT_EQ(config.max_wr, 2048u);
+}
+
+TEST_F(MaxWrEnvTest, RejectedValueDoesNotSetFlag) {
+    // 0 is out of range.  The value is ignored, so the EFA transport must
+    // still treat this as "no override" and track the provider's depth.
+    ASSERT_EQ(::setenv("MC_MAX_WR", "0", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_FALSE(config.max_wr_from_env);
+    EXPECT_EQ(config.max_wr, 256u);
+}
+
+TEST_F(MaxWrEnvTest, NonNumericDoesNotSetFlag) {
+    ASSERT_EQ(::setenv("MC_MAX_WR", "abc", 1), 0);
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_FALSE(config.max_wr_from_env);
+    EXPECT_EQ(config.max_wr, 256u);
+}
+
+TEST_F(MaxWrEnvTest, OutOfRangeDoesNotSetFlag) {
+    ASSERT_EQ(::setenv("MC_MAX_WR", "70000", 1), 0);  // > UINT16_MAX
+    GlobalConfig config;
+    loadGlobalConfig(config);
+    EXPECT_FALSE(config.max_wr_from_env);
+    EXPECT_EQ(config.max_wr, 256u);
 }
 
 }  // namespace

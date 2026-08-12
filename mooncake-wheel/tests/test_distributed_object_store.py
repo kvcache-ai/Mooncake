@@ -3,7 +3,7 @@ import os
 import time
 import threading
 import random
-from mooncake.store import MooncakeDistributedStore
+from mooncake.store import MooncakeDistributedStore, SoftPinAction
 
 # The lease time of the kv object, should be set equal to
 # the master's value.
@@ -52,6 +52,27 @@ def get_config_dict(global_segment_size, local_buffer_size):
         "rdma_devices": os.getenv("DEVICE_NAME", "ibp6s0"),
         "master_server_addr": os.getenv("MASTER_SERVER", "127.0.0.1:50051"),
     }
+
+
+class TestReplicateConfig(unittest.TestCase):
+    """Test ReplicateConfig bindings without a running store service."""
+
+    def test_soft_pin_ttl_optional_conversion(self):
+        from mooncake.store import ReplicateConfig
+
+        config = ReplicateConfig()
+        self.assertIsNone(config.soft_pin_ttl_ms)
+
+        config.soft_pin_ttl_ms = 1000
+        self.assertEqual(config.soft_pin_ttl_ms, 1000)
+
+        config.soft_pin_ttl_ms = None
+        self.assertIsNone(config.soft_pin_ttl_ms)
+
+        with self.assertRaises(TypeError):
+            config.soft_pin_ttl_ms = -1
+        with self.assertRaises(TypeError):
+            config.soft_pin_ttl_ms = 1 << 64
 
 
 class TestConfigDictSetup(unittest.TestCase):
@@ -156,6 +177,33 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         # Remove the key
         time.sleep(default_kv_lease_ttl / 1000)
         self.assertEqual(self.store.remove(key), 0)
+
+    def test_soft_pin_config_forwarding(self):
+        """Test soft-pin action and TTL forwarding through Store operations."""
+        from mooncake.store import ReplicateConfig
+
+        key = f"test_soft_pin_config_forwarding_{os.getpid()}"
+        test_data = b"soft-pin forwarding"
+
+        enable_config = ReplicateConfig()
+        enable_config.soft_pin_action = SoftPinAction.ENABLE
+        enable_config.soft_pin_ttl_ms = 1000
+        self.assertEqual(self.store.put(key, test_data, enable_config), 0)
+
+        preserve_with_ttl = ReplicateConfig()
+        preserve_with_ttl.soft_pin_ttl_ms = 1000
+        self.assertEqual(self.store.upsert(key, test_data, preserve_with_ttl), -600)
+
+        disable_with_ttl = ReplicateConfig()
+        disable_with_ttl.soft_pin_action = SoftPinAction.DISABLE
+        disable_with_ttl.soft_pin_ttl_ms = 1000
+        self.assertEqual(self.store.upsert(key, test_data, disable_with_ttl), -600)
+
+        self.assertEqual(self.store.upsert(key, test_data), 0)
+
+        disable_config = ReplicateConfig()
+        disable_config.soft_pin_action = SoftPinAction.DISABLE
+        self.assertEqual(self.store.upsert(key, test_data, disable_config), 0)
 
     def test_batch_is_exist_operations(self):
         """Test batch is_exist operations through the Python interface."""
@@ -663,16 +711,16 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         # Test default constructor
         config = ReplicateConfig()
         self.assertEqual(config.replica_num, 1)
-        self.assertEqual(config.with_soft_pin, False)
+        self.assertEqual(config.soft_pin_action, SoftPinAction.PRESERVE)
         self.assertEqual(config.preferred_segment, "")
         
         # Test property assignment
         config.replica_num = 3
-        config.with_soft_pin = True
+        config.soft_pin_action = SoftPinAction.ENABLE
         config.preferred_segment = "node1:12345"
         
         self.assertEqual(config.replica_num, 3)
-        self.assertEqual(config.with_soft_pin, True)
+        self.assertEqual(config.soft_pin_action, SoftPinAction.ENABLE)
         self.assertEqual(config.preferred_segment, "node1:12345")
         
         # Test string representation

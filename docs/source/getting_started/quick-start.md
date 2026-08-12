@@ -20,27 +20,18 @@ Install the Mooncake package from PyPI. The same package provides:
 - Transfer Engine Python bindings and runtime components for direct
   `mooncake.engine.TransferEngine` usage.
 
-**For CUDA-enabled systems:**
+Choose the package that matches your runtime environment. Install only one
+variant in an environment.
 
-- CUDA < 13.0
-```bash
-pip install mooncake-transfer-engine
-```
-
-- CUDA >= 13.0
-```bash
-pip install mooncake-transfer-engine-cuda13
-```
-
-**For non-CUDA systems:**
-```bash
-pip install mooncake-transfer-engine-non-cuda
-```
-
-**For NPU systems:**
-```bash
-pip install mooncake-transfer-engine-npu
-```
+| Runtime environment | PyPI package | Installation command |
+|---------------------|--------------|----------------------|
+| NVIDIA CUDA 12.1–12.9 | [`mooncake-transfer-engine`](https://pypi.org/project/mooncake-transfer-engine/) | `pip install mooncake-transfer-engine` |
+| NVIDIA CUDA 13.0/13.1 | [`mooncake-transfer-engine-cuda13`](https://pypi.org/project/mooncake-transfer-engine-cuda13/) | `pip install mooncake-transfer-engine-cuda13` |
+| Non-CUDA | [`mooncake-transfer-engine-non-cuda`](https://pypi.org/project/mooncake-transfer-engine-non-cuda/) | `pip install mooncake-transfer-engine-non-cuda` |
+| Ascend NPU | [`mooncake-transfer-engine-npu`](https://pypi.org/project/mooncake-transfer-engine-npu/) | `pip install mooncake-transfer-engine-npu` |
+| Moore Threads MUSA | [`mooncake-transfer-engine-musa`](https://pypi.org/project/mooncake-transfer-engine-musa/) | `pip install mooncake-transfer-engine-musa` |
+| AWS EFA with CUDA 12 | [`mooncake-transfer-engine-efa`](https://pypi.org/project/mooncake-transfer-engine-efa/) | `pip install mooncake-transfer-engine-efa` |
+| AWS EFA without CUDA | [`mooncake-transfer-engine-efa-non-cuda`](https://pypi.org/project/mooncake-transfer-engine-efa-non-cuda/) | `pip install mooncake-transfer-engine-efa-non-cuda` |
 
 > **Important**:
 > - The CUDA version (`mooncake-transfer-engine`) includes Mooncake-EP and GPU topology detection, requiring CUDA 12.1+.
@@ -48,6 +39,7 @@ pip install mooncake-transfer-engine-npu
 >   ```bash
 >   sudo apt-get update && sudo apt-get install -y libcurl4 libibverbs1 rdma-core librdmacm1 libnuma1 liburing2
 >   ```
+> - The EFA variants require the AWS EFA driver and libfabric at runtime. See the [EFA transport guide](../design/transfer-engine/efa_transport.md) for prerequisites and configuration.
 > - MLU support is currently available through source builds with `-DUSE_MLU=ON`; there is no dedicated prebuilt MLU wheel yet.
 > - If users encounter problems such as missing `lib*.so`, first install the corresponding system runtime libraries. If the issue persists, uninstall the package and build the binaries manually.
 

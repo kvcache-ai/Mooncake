@@ -86,6 +86,28 @@ class PromotionOnHitTest : public ::testing::Test {
         return service->promotion_in_flight_.load(std::memory_order_relaxed);
     }
 
+    static bool PromotionAdmissionBlockedByPrimaryWriteForTesting(
+        MasterService* service, const TenantId& tenant_id,
+        const std::string& key) {
+        const auto result =
+            service->TryPushPromotionQueue(MasterService::ObjectIdentity{
+                .tenant_id = tenant_id, .user_key = key});
+        return result == MasterService::PromotionQueueResult::kAlreadyInFlight;
+    }
+
+    static void MarkReplicaCompleteForTesting(MasterService* service,
+                                              const TenantId& tenant_id,
+                                              const std::string& key,
+                                              ReplicaID replica_id) {
+        MasterService::MetadataAccessorRW accessor(
+            service, MasterService::ObjectIdentity{.tenant_id = tenant_id,
+                                                   .user_key = key});
+        ASSERT_TRUE(accessor.Exists());
+        auto* replica = accessor.Get().GetReplicaByID(replica_id);
+        ASSERT_NE(replica, nullptr);
+        replica->mark_complete();
+    }
+
     static constexpr size_t kDefaultSegmentBase = 0x300000000;
 
     std::string WriteTenantQuotaPolicyFile(
@@ -426,6 +448,168 @@ TEST_F(PromotionOnHitTest, AllocStartUnknownKey) {
                                              TenantId::Default(), 1024, {});
     ASSERT_FALSE(resp.has_value());
     EXPECT_EQ(resp.error(), ErrorCode::OBJECT_NOT_FOUND);
+}
+
+TEST_F(PromotionOnHitTest, InvalidPrimaryEndCannotCompletePromotionReplica) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    Segment holder_segment =
+        MakeSegment("issue_3203_end", kDefaultSegmentBase, seg_size);
+    const UUID holder_id = generate_uuid();
+    ASSERT_TRUE(service->MountSegment(holder_segment, holder_id).has_value());
+    ASSERT_TRUE(service->MountLocalDiskSegment(holder_id, true).has_value());
+    ASSERT_TRUE(
+        service->ReMountSegment({holder_segment}, holder_id).has_value());
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, holder_id, "k_cold", 1024,
+                                       holder_segment.name));
+
+    ReplicateConfig upsert_config;
+    upsert_config.replica_num = 1;
+    ASSERT_TRUE(service
+                    ->UpsertStart(holder_id, "k_cold", TenantId::Default(),
+                                  1024, upsert_config)
+                    .has_value());
+    ASSERT_TRUE(service
+                    ->UpsertEnd(holder_id, "k_cold", TenantId::Default(),
+                                ReplicaType::LOCAL_DISK)
+                    .has_value());
+
+    auto read = service->GetReplicaList("k_cold", TenantId::Default());
+    ASSERT_TRUE(read.has_value());
+    auto alloc = service->PromotionAllocStart(holder_id, "k_cold",
+                                              TenantId::Default(), 1024, {});
+    ASSERT_TRUE(alloc.has_value());
+
+    // Retrying the completed End is a no-op: it succeeds, and the promotion
+    // still owns its PROCESSING MEMORY replica and task.
+    ASSERT_TRUE(service
+                    ->UpsertEnd(holder_id, "k_cold", TenantId::Default(),
+                                ReplicaType::LOCAL_DISK)
+                    .has_value());
+
+    // There was no primary PutStart. PutEnd must not complete the staged
+    // promotion replica even though the metadata client_id matches.
+    auto invalid_put_end = service->PutEnd(
+        holder_id, "k_cold", TenantId::Default(), ReplicaType::MEMORY);
+    ASSERT_FALSE(invalid_put_end.has_value());
+    EXPECT_EQ(invalid_put_end.error(), ErrorCode::INVALID_WRITE);
+
+    auto rejected_upsert = service->UpsertStart(
+        holder_id, "k_cold", TenantId::Default(), 1024, upsert_config);
+    ASSERT_FALSE(rejected_upsert.has_value());
+    EXPECT_EQ(rejected_upsert.error(), ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+
+    // A caller must not be able to finalize after the rejected UpsertStart.
+    auto invalid_upsert_end = service->UpsertEnd(
+        holder_id, "k_cold", TenantId::Default(), ReplicaType::MEMORY);
+    ASSERT_FALSE(invalid_upsert_end.has_value());
+    EXPECT_EQ(invalid_upsert_end.error(), ErrorCode::INVALID_WRITE);
+
+    // Only the promotion completion path owns the staged replica.
+    auto notify = service->NotifyPromotionSuccess(holder_id, "k_cold",
+                                                  TenantId::Default());
+    ASSERT_TRUE(notify.has_value());
+
+    service->RemoveAll();
+}
+
+TEST_F(PromotionOnHitTest, PrimaryWriteBlocksPromotionAdmission) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    auto holder = PrepareSegment(*service, "issue_3203_primary",
+                                 kDefaultSegmentBase, seg_size);
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, holder.client_id, "k_cold",
+                                       1024, holder.segment_name));
+
+    ReplicateConfig upsert_config;
+    upsert_config.replica_num = 1;
+    auto upsert = service->UpsertStart(
+        holder.client_id, "k_cold", TenantId::Default(), 1024, upsert_config);
+    ASSERT_TRUE(upsert.has_value());
+
+    EXPECT_TRUE(PromotionAdmissionBlockedByPrimaryWriteForTesting(
+        service.get(), TenantId::Default(), "k_cold"));
+    EXPECT_EQ(GetPromotionInFlightForTesting(service.get()), 0u);
+
+    auto end = service->UpsertEnd(holder.client_id, "k_cold",
+                                  TenantId::Default(), ReplicaType::LOCAL_DISK);
+    ASSERT_TRUE(end.has_value());
+
+    service->RemoveAll();
+}
+
+TEST_F(PromotionOnHitTest, StalePromotionReplicaCleanupErasesTask) {
+    MasterServiceConfig config;
+    config.enable_offload = true;
+    config.promotion_on_hit = true;
+    config.promotion_admission_threshold = 1;
+    auto service = std::make_unique<MasterService>(config);
+
+    constexpr size_t seg_size = 1024 * 1024 * 16;
+    Segment holder_segment =
+        MakeSegment("issue_3203_holder", kDefaultSegmentBase, seg_size);
+    const UUID holder_id = generate_uuid();
+    ASSERT_TRUE(service->MountSegment(holder_segment, holder_id).has_value());
+    ASSERT_TRUE(service->MountLocalDiskSegment(holder_id, true).has_value());
+    ASSERT_TRUE(
+        service->ReMountSegment({holder_segment}, holder_id).has_value());
+
+    Segment target_segment = MakeSegment(
+        "issue_3203_target", kDefaultSegmentBase + seg_size, seg_size);
+    const UUID target_id = generate_uuid();
+    ASSERT_TRUE(service->MountSegment(target_segment, target_id).has_value());
+
+    ASSERT_TRUE(InjectLocalDiskReplica(*service, holder_id, "k_cold", 1024,
+                                       holder_segment.name));
+    auto read = service->GetReplicaList("k_cold", TenantId::Default());
+    ASSERT_TRUE(read.has_value());
+    auto alloc = service->PromotionAllocStart(
+        holder_id, "k_cold", TenantId::Default(), 1024, {target_segment.name});
+    ASSERT_TRUE(alloc.has_value());
+    ASSERT_EQ(alloc->memory_descriptor.get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              target_segment.name);
+
+    // Recreate the legacy bad state: an invalid primary End used to mark the
+    // promotion-owned replica COMPLETE before stale-handle cleanup removed it.
+    MarkReplicaCompleteForTesting(service.get(), TenantId::Default(), "k_cold",
+                                  alloc->memory_descriptor.id);
+
+    auto& metrics = MasterMetricManager::instance();
+    const int64_t cancelled_before = metrics.get_promotion_cancelled();
+    ASSERT_EQ(GetPromotionInFlightForTesting(service.get()), 1u);
+
+    ASSERT_TRUE(
+        service->UnmountSegment(target_segment.id, target_id).has_value());
+
+    EXPECT_EQ(GetPromotionInFlightForTesting(service.get()), 0u);
+    EXPECT_EQ(metrics.get_promotion_cancelled() - cancelled_before, 1);
+    auto pending = service->PromotionObjectHeartbeat(holder_id);
+    ASSERT_TRUE(pending.has_value());
+    EXPECT_TRUE(pending->empty());
+
+    auto notify = service->NotifyPromotionSuccess(holder_id, "k_cold",
+                                                  TenantId::Default());
+    ASSERT_FALSE(notify.has_value());
+    EXPECT_EQ(notify.error(), ErrorCode::REPLICA_IS_NOT_READY);
+
+    auto remaining =
+        service->GetReplicaListForAdmin("k_cold", TenantId::Default());
+    ASSERT_TRUE(remaining.has_value());
+    ASSERT_EQ(remaining->replicas.size(), 1u);
+    EXPECT_TRUE(remaining->replicas[0].is_local_disk_replica());
+
+    service->RemoveAll();
 }
 
 // NotifyPromotionSuccess on a non-existent key returns OBJECT_NOT_FOUND.

@@ -2,7 +2,6 @@
 #define MOONCAKE_WORKER_KERNELS_CUH
 
 #include <cuda_alike.h>
-#include <transfer_engine.h>
 #include <cstddef>
 #include <cstdint>
 
@@ -23,7 +22,6 @@ __global__
     uint64_t submitSequence = 0;
     int32_t* failedRanksHint = nullptr;
     bool resetFailedRanksHint = false;
-    BatchID batchID;
     void* transferGroupMeta;
 };
 

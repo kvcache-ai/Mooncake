@@ -168,16 +168,7 @@ jobs:
     if: *run-ci-for-source-changes
     uses: ./.github/workflows/_build-wheel.yaml
     with:
-      runner: ubuntu-22.04
-      container: pytorch/manylinux2_28-builder:cuda12.8
       python-versions: '["3.10", "3.12"]'
-      cuda: container
-      torch-cuda-arch-list: '8.0;9.0'
-      ep-torch-versions: '2.11.0;2.12.0;2.12.1;2.13.0'
-      build-nvlink-allocator: true
-      cmake-args: >-
-        -DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON
-        -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release
       artifact-prefix: mooncake-wheel-ci
       version-override: 0.0.0.dev0
 
@@ -240,12 +231,6 @@ jobs:
         bash scripts/test_installation.sh
       shell: bash
 
-    - name: Start metadata server
-      run: |
-        source test_env/bin/activate
-        mooncake_http_metadata_server --port 8080 &
-      shell: bash
-
     - name: Run tests with ssd
       run: |
         # Reserve port 50052 (mooncake_client RPC port) so the kernel never
@@ -269,7 +254,8 @@ jobs:
         mooncake_master \
           --eviction_high_watermark_ratio=0.95 \
           --cluster_id=ci_test_cluster \
-          --port 50051 &
+          --port 50051 \
+          --enable_http_metadata_server=true &
         sleep 3
       shell: bash
 
@@ -713,8 +699,12 @@ jobs:
   build-wheel-cu13:
     needs: [spell-check, clang-format, check-paths]
     if: *run-ci-for-source-changes
-    uses: ./.github/workflows/ci_cu13.yml
-    secrets: inherit
+    uses: ./.github/workflows/_build-wheel.yaml
+    with:
+      variant: cuda13
+      python-versions: '["3.10", "3.12"]'
+      artifact-prefix: mooncake-wheel-cu130
+      version-override: 0.0.0.dev0
 
   build-wheel-efa:
     needs: [spell-check, clang-format, check-paths]
@@ -766,6 +756,12 @@ jobs:
             cmake_flags: '-DUSE_CUDA=OFF'
             need_cuda: false
             metrics_flags: '-DTENT_METRICS_ENABLED=ON'
+          # Exercise the native UB target with its injected mock adapter. A
+          # Debug build also catches ODR/link errors hidden by optimization.
+          - name: ub-mock
+            cmake_flags: '-DUSE_CUDA=OFF -DUSE_UB=ON -DCMAKE_BUILD_TYPE=Debug'
+            need_cuda: false
+            metrics_flags: ''
     name: tent-ci (${{ matrix.name }})
     env:
       CI: "true"

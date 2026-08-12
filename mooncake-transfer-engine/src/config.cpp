@@ -128,7 +128,9 @@ void loadGlobalConfig(GlobalConfig& config) {
     const char* port_env = std::getenv("MC_IB_PORT");
     if (port_env) {
         int val = atoi(port_env);
-        if (val >= 0 && val < 256)
+        // IB port numbers are 1-based. Accepting 0 made ibv_query_port fail on
+        // every device, disabling the whole topology.
+        if (val > 0 && val < 256)
             config.port = uint8_t(val);
         else
             LOG(WARNING) << "Ignore value from environment variable MC_IB_PORT";
@@ -206,10 +208,12 @@ void loadGlobalConfig(GlobalConfig& config) {
     const char* max_wr_env = std::getenv("MC_MAX_WR");
     if (max_wr_env) {
         size_t val = atoi(max_wr_env);
-        if (val > 0 && val <= UINT16_MAX)
+        if (val > 0 && val <= UINT16_MAX) {
             config.max_wr = val;
-        else
+            config.max_wr_from_env = true;
+        } else {
             LOG(WARNING) << "Ignore value from environment variable MC_MAX_WR";
+        }
     }
 
     const char* max_inline_env = std::getenv("MC_MAX_INLINE");
