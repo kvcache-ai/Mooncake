@@ -174,8 +174,8 @@ MasterScenario& MasterScenario::WhenPutStart(PutStartActionData action) {
     ReplicateConfig config;
     config.replica_num = action.requested_replica_count;
     config.preferred_segment = action.preferred_node;
-    config.soft_pin_action = action.with_soft_pin ? SoftPinAction::ENABLE
-                                                  : SoftPinAction::PRESERVE;
+    config.soft_pin_action =
+        action.with_soft_pin ? SoftPinAction::ENABLE : SoftPinAction::PRESERVE;
     config.with_hard_pin = action.with_hard_pin;
     if (!action.group_id.empty()) {
         config.group_ids = {action.group_id};
