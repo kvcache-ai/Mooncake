@@ -5693,7 +5693,8 @@ tl::expected<void, ErrorCode> MasterService::CopyRevoke(
     }
 
     auto& metadata = accessor.Get();
-    auto source_id = task.source_id;
+    const auto source_id = task.source_id;
+    const auto replica_ids = task.replica_ids;
     auto source = metadata.GetReplicaByID(source_id);
     if (source == nullptr) {
         LOG(WARNING) << "key=" << key << ", source_id=" << source_id
@@ -5704,7 +5705,6 @@ tl::expected<void, ErrorCode> MasterService::CopyRevoke(
     }
 
     // Erase all replica_ids
-    const auto replica_ids = task.replica_ids;
     for (const auto& replica_id : replica_ids) {
         EraseReplicasWithCacheTotalAccounting(
             metadata, [&replica_id](const Replica& replica) {
