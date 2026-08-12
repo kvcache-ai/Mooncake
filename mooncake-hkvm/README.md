@@ -43,11 +43,12 @@ In HKVM, a Global Master is tailored from original Master. Its functions are:
 
 We can adjust M and N for performance & reliability trade-off. Specially, when M=1, it will behave like the new P2P Arch; when N=1, it will degenerate into original centralized arch. In our practice, we set M to the scale of P/D group(such as 5 in 2P3D, or 2 in 1P1D), and N to number of P/D groups.
 
+
+# Further Design
+
 If we add a new level, HKVM naturally supports PrfaaS.
 
 <img src="images/hkvm-6.png"/>
-
-# Further Design
 
 Prefill Service(in the left) and P/D Service(in the right) can run on different clusters and heterogeneous hardwares (H200 + H20 in the paper). In each cluster, we create a global kvcache pool. Prefill Service will generate KVCache of long-input-requests continuously. P/D Service will processing normal requests in parallel. The newly added Inter-DC Master collects KVEvents of both sides, checks the diff and launchs incremental updates via WAN(cross-datacenter) or LAN(intra-datacenter). Thanks to the global kvcache pool, KVCaches transferred can be reused in the future before evicted. We need set the pool sizes in each side according to Prefill Service's and P/D Service's max throughput.
 Thanks again to the global kvcache pool, we don't need high-bandwidth network between these clusters, the transfer time is relaxed to KVCache eviction period(from minutes to hours in our real environment).
