@@ -1056,8 +1056,8 @@ class MasterService {
         };
 
         std::unordered_map<ReplicaID, DynamicReplicaRecord> dynamic_replicas;
-        std::chrono::steady_clock::time_point
-            dynamic_replication_recreate_after{};
+        std::unordered_map<std::string, std::chrono::steady_clock::time_point>
+            dynamic_replication_recreate_after_by_domain;
 
         void MarkDynamicReplica(ReplicaID replica_id,
                                 DynamicReplicaRecord record) {
@@ -1086,14 +1086,23 @@ class MasterService {
         size_t DynamicReplicaCount() const { return dynamic_replicas.size(); }
 
         bool DynamicReplicationRecreateBlocked(
+            const std::string& target_domain,
             std::chrono::steady_clock::time_point now) const {
-            return now < dynamic_replication_recreate_after;
+            const auto domain =
+                target_domain.empty() ? std::string("default") : target_domain;
+            auto it = dynamic_replication_recreate_after_by_domain.find(domain);
+            return it != dynamic_replication_recreate_after_by_domain.end() &&
+                   now < it->second;
         }
 
         void SetDynamicReplicationRecreateAfter(
+            const std::string& target_domain,
             std::chrono::steady_clock::time_point deadline) {
-            dynamic_replication_recreate_after =
-                std::max(dynamic_replication_recreate_after, deadline);
+            const auto domain =
+                target_domain.empty() ? std::string("default") : target_domain;
+            auto& recreate_after =
+                dynamic_replication_recreate_after_by_domain[domain];
+            recreate_after = std::max(recreate_after, deadline);
         }
 
         void AddReplicas(std::vector<Replica>&& replicas) {
@@ -1467,6 +1476,7 @@ class MasterService {
     struct DynamicReplicaPending {
         UUID proposal_id{};
         UUID lease_id{};
+        std::string key;
         std::string source_segment;
         std::string target_segment;
         std::string target_domain;
@@ -2429,16 +2439,22 @@ class MasterService {
     uint32_t DynamicReplicationAdmissionMinHits() const;
     bool ObserveDynamicReplicationAccess(const ObjectIdentity& object_id);
     void TrySubmitDynamicReplicaProposal(const ObjectIdentity& object_id);
+    static std::string NormalizeDynamicReplicationDomain(std::string domain);
+    static std::string DynamicReplicationControlKey(
+        const std::string& key, const std::string& target_domain);
+    static bool DynamicReplicationControlKeyMatchesObjectKey(
+        const std::string& control_key, const std::string& key);
     uint64_t DynamicReplicationVersionEpoch(
         const ObjectMetadata& metadata) const;
     void ClearDynamicReplicationStateForKey(TenantState& tenant_state,
                                             const std::string& key);
     bool HasDynamicReplicationPending(TenantState& tenant_state,
-                                      const std::string& key);
+                                      const std::string& key,
+                                      const std::string& target_domain);
     std::optional<DynamicReplicaPlan> SelectDynamicReplicaPlan(
         const ObjectMetadata& metadata,
         const std::optional<std::string>& preferred_target_segment,
-        std::string target_domain);
+        const std::string& requester_domain, std::string target_domain);
     tl::expected<UUID, ErrorCode> SubmitDynamicReplicaCopyTask(
         const ObjectIdentity& object_id, const DynamicReplicaPlan& plan);
     tl::expected<void, ErrorCode> ValidateDynamicReplicaPendingForCopyStart(

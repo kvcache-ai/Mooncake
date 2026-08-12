@@ -284,7 +284,8 @@ ErrorCode ScopedSegmentAccess::ValidateRemountSegment(
         authoritative.size != segment.size ||
         authoritative.te_endpoint != segment.te_endpoint ||
         authoritative.protocol != segment.protocol ||
-        authoritative.host_id != segment.host_id) {
+        authoritative.host_id != segment.host_id ||
+        authoritative.domain != segment.domain) {
         return ErrorCode::INVALID_PARAMS;
     }
     return ErrorCode::OK;

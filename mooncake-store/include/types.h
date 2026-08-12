@@ -446,9 +446,10 @@ struct Segment {
     std::string te_endpoint{};
     std::string protocol;
     std::string host_id{};
+    std::string domain{};
     Segment() = default;
 };
-YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol, host_id);
+YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol, host_id, domain);
 
 /**
  * @brief Allocation strategy type for segment allocation

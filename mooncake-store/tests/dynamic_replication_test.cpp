@@ -30,13 +30,17 @@ class DynamicReplicationTest : public ::testing::Test {
     };
 
     MountedSegmentContext PrepareSegment(MasterService& service,
-                                         std::string name, size_t base) const {
+                                         std::string name, size_t base,
+                                         std::string domain = "domain-a",
+                                         std::string host_id = {}) const {
         Segment segment;
         segment.id = generate_uuid();
         segment.name = std::move(name);
         segment.base = base;
         segment.size = kDefaultSegmentSize;
         segment.te_endpoint = segment.name;
+        segment.domain = std::move(domain);
+        segment.host_id = std::move(host_id);
         UUID client_id = generate_uuid();
         auto mount_result = service.MountSegment(segment, client_id);
         EXPECT_TRUE(mount_result.has_value());
@@ -131,8 +135,11 @@ class DynamicReplicationTest : public ::testing::Test {
             tenant_state.dynamic_replication_leases.begin(),
             tenant_state.dynamic_replication_leases.end(),
             [&key](const auto& entry) { return entry.second.key == key; });
-        return tenant_state.dynamic_replication_pending.contains(key) ||
-               tenant_state.dynamic_replication_cooldowns.contains(key) ||
+        const auto control_key =
+            MasterService::DynamicReplicationControlKey(key, "domain-a");
+        return tenant_state.dynamic_replication_pending.contains(control_key) ||
+               tenant_state.dynamic_replication_cooldowns.contains(
+                   control_key) ||
                has_lease;
     }
 
@@ -165,9 +172,33 @@ class DynamicReplicationTest : public ::testing::Test {
         MasterService::MetadataAccessorRW accessor(
             &service, MasterService::ObjectIdentity{TenantId::Default(), key});
         auto& tenant_state = accessor.GetTenantState();
-        auto pending_it = tenant_state.dynamic_replication_pending.find(key);
+        auto pending_it = tenant_state.dynamic_replication_pending.find(
+            MasterService::DynamicReplicationControlKey(key, "domain-a"));
         ASSERT_NE(pending_it, tenant_state.dynamic_replication_pending.end());
         pending_it->second.expire_at_ms_epoch = 1;
+    }
+
+    bool ClearStateMatchesDomainControlKeyExactly(
+        MasterService& service) const {
+        MasterService::MetadataAccessorRW accessor(
+            &service,
+            MasterService::ObjectIdentity{TenantId::Default(), "bar"});
+        auto& tenant_state = accessor.GetTenantState();
+        const auto bar_control_key =
+            MasterService::DynamicReplicationControlKey("bar", "domain-a");
+        const auto foo_bar_control_key =
+            MasterService::DynamicReplicationControlKey("foo:bar", "domain-a");
+        tenant_state.dynamic_replication_cooldowns[bar_control_key] =
+            std::chrono::steady_clock::now() + std::chrono::seconds(1);
+        tenant_state.dynamic_replication_cooldowns[foo_bar_control_key] =
+            std::chrono::steady_clock::now() + std::chrono::seconds(1);
+
+        service.ClearDynamicReplicationStateForKey(tenant_state, "bar");
+
+        return !tenant_state.dynamic_replication_cooldowns.contains(
+                   bar_control_key) &&
+               tenant_state.dynamic_replication_cooldowns.contains(
+                   foo_bar_control_key);
     }
 };
 
@@ -433,6 +464,177 @@ TEST_F(DynamicReplicationTest, EvictedDynamicReplicaBlocksImmediateRecreate) {
     auto rejected = service.SubmitReplicaActionProposal(immediate_recreate);
     ASSERT_FALSE(rejected.has_value());
     EXPECT_EQ(rejected.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+}
+
+TEST_F(DynamicReplicationTest, TargetDomainChoosesSegmentInRequesterDomain) {
+    MasterServiceConfig config;
+    config.dynamic_replication_mode = "enforce";
+    config.dynamic_replication_admission_qps_threshold = 0.1;
+    config.dynamic_replication_max_memory_replicas = 3;
+    MasterService service(config);
+
+    auto source =
+        PrepareSegment(service, "domain_a_source", 0x1400000000, "domain-a");
+    (void)PrepareSegment(service, "domain_a_target", 0x1500000000, "domain-a");
+    auto domain_b_target =
+        PrepareSegment(service, "domain_b_target", 0x1600000000, "domain-b");
+    PutObject(service, source.client_id, "domain-target-key",
+              source.segment_name);
+
+    auto proposal = BuildProposal(service, "domain-target-key");
+    proposal.requester_domain = "domain-b";
+    proposal.target_domain.clear();
+    auto lease = service.SubmitReplicaActionProposal(proposal);
+    ASSERT_TRUE(lease.has_value());
+    EXPECT_EQ(lease->target_domain, "domain-b");
+    EXPECT_EQ(lease->target_segment, domain_b_target.segment_name);
+}
+
+TEST_F(DynamicReplicationTest, TargetDomainRejectsWhenNoSegmentInDomain) {
+    MasterServiceConfig config;
+    config.dynamic_replication_mode = "enforce";
+    config.dynamic_replication_admission_qps_threshold = 0.1;
+    config.dynamic_replication_max_memory_replicas = 3;
+    MasterService service(config);
+
+    auto source =
+        PrepareSegment(service, "domain_a_source", 0x1700000000, "domain-a");
+    (void)PrepareSegment(service, "domain_a_target", 0x1800000000, "domain-a");
+    PutObject(service, source.client_id, "missing-domain-key",
+              source.segment_name);
+
+    auto proposal = BuildProposal(service, "missing-domain-key");
+    proposal.requester_domain = "domain-c";
+    proposal.target_domain.clear();
+    auto lease = service.SubmitReplicaActionProposal(proposal);
+    ASSERT_FALSE(lease.has_value());
+    EXPECT_EQ(lease.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+}
+
+TEST_F(DynamicReplicationTest, PreferredTargetOutsideDomainFallsBack) {
+    MasterServiceConfig config;
+    config.dynamic_replication_mode = "enforce";
+    config.dynamic_replication_admission_qps_threshold = 0.1;
+    config.dynamic_replication_max_memory_replicas = 3;
+    MasterService service(config);
+
+    auto source =
+        PrepareSegment(service, "domain_a_source", 0x1900000000, "domain-a");
+    auto wrong_domain_target =
+        PrepareSegment(service, "domain_a_target", 0x1a00000000, "domain-a");
+    auto domain_b_target =
+        PrepareSegment(service, "domain_b_target", 0x1b00000000, "domain-b");
+    PutObject(service, source.client_id, "preferred-domain-key",
+              source.segment_name);
+
+    auto proposal = BuildProposal(service, "preferred-domain-key",
+                                  wrong_domain_target.segment_name);
+    proposal.requester_domain = "domain-b";
+    proposal.target_domain.clear();
+    auto lease = service.SubmitReplicaActionProposal(proposal);
+    ASSERT_TRUE(lease.has_value());
+    EXPECT_EQ(lease->target_domain, "domain-b");
+    EXPECT_EQ(lease->target_segment, domain_b_target.segment_name);
+}
+
+TEST_F(DynamicReplicationTest,
+       ExistingReplicaInTargetDomainSuppressesCrossDomainCopy) {
+    MasterServiceConfig config;
+    config.dynamic_replication_mode = "enforce";
+    config.dynamic_replication_admission_qps_threshold = 0.1;
+    config.dynamic_replication_max_memory_replicas = 4;
+    MasterService service(config);
+
+    auto source =
+        PrepareSegment(service, "domain_a_source", 0x1c00000000, "domain-a");
+    auto first_b =
+        PrepareSegment(service, "domain_b_first", 0x1d00000000, "domain-b");
+    (void)PrepareSegment(service, "domain_b_second", 0x1e00000000, "domain-b");
+    PutObject(service, source.client_id, "target-domain-existing-key",
+              source.segment_name);
+
+    auto first = BuildProposal(service, "target-domain-existing-key",
+                               first_b.segment_name);
+    first.requester_domain = "domain-b";
+    first.target_domain = "domain-b";
+    auto first_lease = service.SubmitReplicaActionProposal(first);
+    ASSERT_TRUE(first_lease.has_value());
+    ASSERT_TRUE(service
+                    .CopyStart(source.client_id, "target-domain-existing-key",
+                               TenantId::Default(), first_lease->source_segment,
+                               {first_lease->target_segment})
+                    .has_value());
+    ASSERT_TRUE(service
+                    .CopyEnd(source.client_id, "target-domain-existing-key",
+                             TenantId::Default())
+                    .has_value());
+
+    auto duplicate = BuildProposal(service, "target-domain-existing-key");
+    duplicate.requester_domain = "domain-b";
+    duplicate.target_domain = "domain-b";
+    auto rejected = service.SubmitReplicaActionProposal(duplicate);
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(rejected.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+}
+
+TEST_F(DynamicReplicationTest, EvictionCooldownIsScopedToTargetDomain) {
+    MasterServiceConfig config;
+    config.dynamic_replication_mode = "enforce";
+    config.dynamic_replication_admission_qps_threshold = 0.1;
+    config.dynamic_replication_max_memory_replicas = 4;
+    MasterService service(config);
+
+    auto source =
+        PrepareSegment(service, "domain_a_source", 0x1f00000000, "domain-a");
+    auto domain_b_target =
+        PrepareSegment(service, "domain_b_target", 0x2000000000, "domain-b");
+    auto domain_a_target =
+        PrepareSegment(service, "domain_a_target", 0x2100000000, "domain-a");
+    PutObject(service, source.client_id, "domain-cooldown-key",
+              source.segment_name);
+
+    auto to_b = BuildProposal(service, "domain-cooldown-key",
+                              domain_b_target.segment_name);
+    to_b.requester_domain = "domain-b";
+    to_b.target_domain = "domain-b";
+    auto b_lease = service.SubmitReplicaActionProposal(to_b);
+    ASSERT_TRUE(b_lease.has_value());
+    ASSERT_TRUE(service
+                    .CopyStart(source.client_id, "domain-cooldown-key",
+                               TenantId::Default(), b_lease->source_segment,
+                               {b_lease->target_segment})
+                    .has_value());
+    ASSERT_TRUE(service
+                    .CopyEnd(source.client_id, "domain-cooldown-key",
+                             TenantId::Default())
+                    .has_value());
+
+    EXPECT_EQ(EvictReplicaOnSegment(service, "domain-cooldown-key",
+                                    domain_b_target.segment_name),
+              1u);
+
+    auto retry_b = BuildProposal(service, "domain-cooldown-key",
+                                 domain_b_target.segment_name);
+    retry_b.requester_domain = "domain-b";
+    retry_b.target_domain = "domain-b";
+    auto rejected_b = service.SubmitReplicaActionProposal(retry_b);
+    ASSERT_FALSE(rejected_b.has_value());
+    EXPECT_EQ(rejected_b.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+
+    auto same_domain = BuildProposal(service, "domain-cooldown-key",
+                                     domain_a_target.segment_name);
+    same_domain.requester_domain = "domain-a";
+    same_domain.target_domain = "domain-a";
+    auto accepted_a = service.SubmitReplicaActionProposal(same_domain);
+    ASSERT_TRUE(accepted_a.has_value());
+    EXPECT_EQ(accepted_a->target_segment, domain_a_target.segment_name);
+}
+
+TEST_F(DynamicReplicationTest, ClearStateMatchesDomainControlKeyExactly) {
+    MasterServiceConfig config;
+    MasterService service(config);
+
+    EXPECT_TRUE(ClearStateMatchesDomainControlKeyExactly(service));
 }
 
 }  // namespace mooncake::test

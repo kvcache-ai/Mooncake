@@ -1674,10 +1674,21 @@ void MasterService::RecordDynamicReplicaRemoval(
     if (replica_ids.empty()) {
         return;
     }
-    if (metadata.ForgetDynamicReplicas(replica_ids) > 0) {
+    std::unordered_set<std::string> removed_domains;
+    for (const auto& replica_id : replica_ids) {
+        auto it = metadata.dynamic_replicas.find(replica_id);
+        if (it != metadata.dynamic_replicas.end()) {
+            removed_domains.insert(
+                NormalizeDynamicReplicationDomain(it->second.target_domain));
+        }
+    }
+    if (metadata.ForgetDynamicReplicas(replica_ids) == 0) {
+        return;
+    }
+    for (const auto& domain : removed_domains) {
         metadata.SetDynamicReplicationRecreateAfter(
-            std::chrono::steady_clock::now() +
-            kDynamicReplicationRecreateCooldown);
+            domain, std::chrono::steady_clock::now() +
+                        kDynamicReplicationRecreateCooldown);
     }
 }
 
@@ -7158,6 +7169,41 @@ bool MasterService::ObserveDynamicReplicationAccess(
     return counter.hits >= DynamicReplicationAdmissionMinHits();
 }
 
+std::string MasterService::NormalizeDynamicReplicationDomain(
+    std::string domain) {
+    return domain.empty() ? "default" : std::move(domain);
+}
+
+std::string MasterService::DynamicReplicationControlKey(
+    const std::string& key, const std::string& target_domain) {
+    const std::string domain = NormalizeDynamicReplicationDomain(target_domain);
+    return std::to_string(domain.size()) + ":" + domain + ":" + key;
+}
+
+bool MasterService::DynamicReplicationControlKeyMatchesObjectKey(
+    const std::string& control_key, const std::string& key) {
+    if (control_key == key) {
+        return true;
+    }
+    const size_t domain_len_end = control_key.find(':');
+    if (domain_len_end == std::string::npos) {
+        return false;
+    }
+    size_t domain_len = 0;
+    try {
+        domain_len = std::stoull(control_key.substr(0, domain_len_end));
+    } catch (const std::exception&) {
+        return false;
+    }
+    const size_t domain_begin = domain_len_end + 1;
+    const size_t domain_end = domain_begin + domain_len;
+    const size_t key_begin = domain_end + 1;
+    if (key_begin > control_key.size() || control_key[domain_end] != ':') {
+        return false;
+    }
+    return control_key.compare(key_begin, std::string::npos, key) == 0;
+}
+
 void MasterService::TrySubmitDynamicReplicaProposal(
     const ObjectIdentity& object_id) {
     if (ObserveDynamicReplicationAccess(object_id)) {
@@ -7183,8 +7229,22 @@ int64_t MasterService::DynamicReplicationNowMs() {
 
 void MasterService::ClearDynamicReplicationStateForKey(
     TenantState& tenant_state, const std::string& key) {
-    tenant_state.dynamic_replication_pending.erase(key);
-    tenant_state.dynamic_replication_cooldowns.erase(key);
+    for (auto it = tenant_state.dynamic_replication_pending.begin();
+         it != tenant_state.dynamic_replication_pending.end();) {
+        if (it->second.key == key) {
+            it = tenant_state.dynamic_replication_pending.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    for (auto it = tenant_state.dynamic_replication_cooldowns.begin();
+         it != tenant_state.dynamic_replication_cooldowns.end();) {
+        if (DynamicReplicationControlKeyMatchesObjectKey(it->first, key)) {
+            it = tenant_state.dynamic_replication_cooldowns.erase(it);
+        } else {
+            ++it;
+        }
+    }
     for (auto it = tenant_state.dynamic_replication_leases.begin();
          it != tenant_state.dynamic_replication_leases.end();) {
         if (it->second.key == key) {
@@ -7195,9 +7255,11 @@ void MasterService::ClearDynamicReplicationStateForKey(
     }
 }
 
-bool MasterService::HasDynamicReplicationPending(TenantState& tenant_state,
-                                                 const std::string& key) {
-    auto it = tenant_state.dynamic_replication_pending.find(key);
+bool MasterService::HasDynamicReplicationPending(
+    TenantState& tenant_state, const std::string& key,
+    const std::string& target_domain) {
+    auto it = tenant_state.dynamic_replication_pending.find(
+        DynamicReplicationControlKey(key, target_domain));
     if (it == tenant_state.dynamic_replication_pending.end()) {
         return false;
     }
@@ -7212,10 +7274,27 @@ std::optional<MasterService::DynamicReplicaPlan>
 MasterService::SelectDynamicReplicaPlan(
     const ObjectMetadata& metadata,
     const std::optional<std::string>& preferred_target_segment,
-    std::string target_domain) {
+    const std::string& requester_domain, std::string target_domain) {
+    target_domain = NormalizeDynamicReplicationDomain(
+        target_domain.empty() ? requester_domain : std::move(target_domain));
     std::unordered_set<std::string> existing_segments;
+    std::unordered_set<std::string> existing_hosts;
     std::optional<std::string> source_segment;
+    std::optional<std::string> target_domain_source_segment;
     size_t memory_replicas = 0;
+    size_t target_domain_replicas = 0;
+    size_t outside_target_domain_replicas = 0;
+
+    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
+    std::vector<std::pair<Segment, UUID>> segments;
+    if (segment_access.GetAllSegments(segments) != ErrorCode::OK) {
+        return std::nullopt;
+    }
+    std::unordered_map<std::string, Segment> segments_by_name;
+    for (const auto& [segment, client_id] : segments) {
+        (void)client_id;
+        segments_by_name.emplace(segment.name, segment);
+    }
 
     metadata.VisitReplicas(
         [this](const Replica& replica) {
@@ -7231,6 +7310,23 @@ MasterService::SelectDynamicReplicaPlan(
                 if (!source_segment.has_value()) {
                     source_segment = *segment_name;
                 }
+                auto segment_it = segments_by_name.find(*segment_name);
+                if (segment_it == segments_by_name.end()) {
+                    continue;
+                }
+                const auto& segment = segment_it->second;
+                if (!segment.host_id.empty()) {
+                    existing_hosts.insert(segment.host_id);
+                }
+                if (NormalizeDynamicReplicationDomain(segment.domain) ==
+                    target_domain) {
+                    target_domain_replicas++;
+                    if (!target_domain_source_segment.has_value()) {
+                        target_domain_source_segment = *segment_name;
+                    }
+                } else {
+                    outside_target_domain_replicas++;
+                }
             }
         });
 
@@ -7239,13 +7335,16 @@ MasterService::SelectDynamicReplicaPlan(
         return std::nullopt;
     }
 
-    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-    std::vector<std::pair<Segment, UUID>> segments;
-    if (segment_access.GetAllSegments(segments) != ErrorCode::OK) {
+    if (target_domain_replicas > 0 && outside_target_domain_replicas > 0 &&
+        !preferred_target_segment.has_value()) {
         return std::nullopt;
     }
 
     auto is_valid_target = [&](const Segment& segment) {
+        if (NormalizeDynamicReplicationDomain(segment.domain) !=
+            target_domain) {
+            return false;
+        }
         if (existing_segments.contains(segment.name) ||
             !segment_access.IsSegmentAllocatable(segment.name)) {
             return false;
@@ -7272,8 +7371,10 @@ MasterService::SelectDynamicReplicaPlan(
         if (preferred != segments.end() && is_valid_target(preferred->first)) {
             target_segment = preferred->first.name;
         }
-    } else {
+    }
+    if (!target_segment.has_value()) {
         double best_util = std::numeric_limits<double>::max();
+        bool best_different_host = false;
         for (const auto& [segment, client_id] : segments) {
             (void)client_id;
             if (!is_valid_target(segment)) {
@@ -7287,8 +7388,14 @@ MasterService::SelectDynamicReplicaPlan(
             }
             const double util =
                 static_cast<double>(used) / static_cast<double>(capacity);
-            if (util < best_util) {
+            const bool different_host =
+                segment.host_id.empty() || existing_hosts.empty() ||
+                !existing_hosts.contains(segment.host_id);
+            if (!target_segment.has_value() ||
+                (different_host && !best_different_host) ||
+                (different_host == best_different_host && util < best_util)) {
                 best_util = util;
+                best_different_host = different_host;
                 target_segment = segment.name;
             }
         }
@@ -7296,6 +7403,9 @@ MasterService::SelectDynamicReplicaPlan(
 
     if (!target_segment.has_value()) {
         return std::nullopt;
+    }
+    if (target_domain_source_segment.has_value()) {
+        source_segment = target_domain_source_segment;
     }
     return DynamicReplicaPlan{.source_segment = *source_segment,
                               .target_segment = *target_segment,
@@ -7335,6 +7445,9 @@ MasterService::SubmitReplicaActionProposal(
     }
 
     auto& tenant_state = accessor.GetTenantState();
+    const std::string target_domain = NormalizeDynamicReplicationDomain(
+        proposal.target_domain.empty() ? proposal.requester_domain
+                                       : proposal.target_domain);
     auto lease_it = tenant_state.dynamic_replication_leases.find(proposal_id);
     if (lease_it != tenant_state.dynamic_replication_leases.end()) {
         if (lease_it->second.expire_at_ms_epoch >= now_ms) {
@@ -7347,8 +7460,7 @@ MasterService::SubmitReplicaActionProposal(
                  lease.version_epoch == proposal.observed_version_epoch) &&
                 (!proposal.preferred_target_segment.has_value() ||
                  lease.target_segment == *proposal.preferred_target_segment) &&
-                (proposal.target_domain.empty() ||
-                 lease.target_domain == proposal.target_domain);
+                lease.target_domain == target_domain;
             if (!same_request) {
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
@@ -7357,6 +7469,8 @@ MasterService::SubmitReplicaActionProposal(
         tenant_state.dynamic_replication_leases.erase(lease_it);
     }
 
+    const std::string control_key =
+        DynamicReplicationControlKey(object_id.user_key, target_domain);
     if (proposal.access_frequency_qps <
             dynamic_replication_admission_qps_threshold_ &&
         proposal.hits < DynamicReplicationAdmissionMinHits()) {
@@ -7364,7 +7478,7 @@ MasterService::SubmitReplicaActionProposal(
     }
 
     auto cooldown_it =
-        tenant_state.dynamic_replication_cooldowns.find(object_id.user_key);
+        tenant_state.dynamic_replication_cooldowns.find(control_key);
     if (cooldown_it != tenant_state.dynamic_replication_cooldowns.end()) {
         const auto now = std::chrono::steady_clock::now();
         if (cooldown_it->second > now) {
@@ -7375,7 +7489,8 @@ MasterService::SubmitReplicaActionProposal(
     }
 
     if (accessor.InProcessing() || accessor.HasReplicationTask() ||
-        HasDynamicReplicationPending(tenant_state, object_id.user_key)) {
+        HasDynamicReplicationPending(tenant_state, object_id.user_key,
+                                     target_domain)) {
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
     }
 
@@ -7390,12 +7505,13 @@ MasterService::SubmitReplicaActionProposal(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (metadata.DynamicReplicationRecreateBlocked(
-            std::chrono::steady_clock::now())) {
+            target_domain, std::chrono::steady_clock::now())) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
 
-    auto plan = SelectDynamicReplicaPlan(
-        metadata, proposal.preferred_target_segment, proposal.target_domain);
+    auto plan =
+        SelectDynamicReplicaPlan(metadata, proposal.preferred_target_segment,
+                                 proposal.requester_domain, target_domain);
     if (!plan.has_value()) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
@@ -7418,9 +7534,10 @@ MasterService::SubmitReplicaActionProposal(
     lease.expire_at_ms_epoch = now_ms + kDynamicReplicationLeaseTtl.count();
     lease.task_id = task.value();
 
-    tenant_state.dynamic_replication_pending[object_id.user_key] =
+    tenant_state.dynamic_replication_pending[control_key] =
         DynamicReplicaPending{.proposal_id = proposal_id,
                               .lease_id = lease.lease_id,
+                              .key = object_id.user_key,
                               .source_segment = lease.source_segment,
                               .target_segment = lease.target_segment,
                               .target_domain = lease.target_domain,
@@ -7428,7 +7545,7 @@ MasterService::SubmitReplicaActionProposal(
                               .expire_at_ms_epoch = lease.expire_at_ms_epoch,
                               .task_id = lease.task_id};
     tenant_state.dynamic_replication_leases[proposal_id] = lease;
-    tenant_state.dynamic_replication_cooldowns[object_id.user_key] =
+    tenant_state.dynamic_replication_cooldowns[control_key] =
         std::chrono::steady_clock::now() + kDynamicReplicationActionCooldown;
     return lease;
 }
@@ -10777,8 +10894,25 @@ MasterService::ValidateDynamicReplicaPendingForCopyStart(
     TenantState& tenant_state, const std::string& key,
     const std::string& source_segment, uint64_t version_epoch,
     const std::vector<std::string>& target_segments) {
-    auto pending_it = tenant_state.dynamic_replication_pending.find(key);
+    auto pending_it = tenant_state.dynamic_replication_pending.end();
+    bool has_pending_for_key = false;
+    for (auto it = tenant_state.dynamic_replication_pending.begin();
+         it != tenant_state.dynamic_replication_pending.end(); ++it) {
+        if (it->second.key != key) {
+            continue;
+        }
+        has_pending_for_key = true;
+        if (it->second.source_segment == source_segment &&
+            target_segments.size() == 1 &&
+            target_segments.front() == it->second.target_segment) {
+            pending_it = it;
+            break;
+        }
+    }
     if (pending_it == tenant_state.dynamic_replication_pending.end()) {
+        if (has_pending_for_key) {
+            return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+        }
         return {};
     }
     auto& pending = pending_it->second;
@@ -10803,7 +10937,17 @@ void MasterService::RegisterDynamicReplicaStart(
     const std::string& source_segment, uint64_t version_epoch,
     const std::vector<std::string>& target_segments,
     const std::vector<ReplicaID>& replica_ids) {
-    auto pending_it = tenant_state.dynamic_replication_pending.find(key);
+    auto pending_it = tenant_state.dynamic_replication_pending.end();
+    for (auto it = tenant_state.dynamic_replication_pending.begin();
+         it != tenant_state.dynamic_replication_pending.end(); ++it) {
+        if (it->second.key == key &&
+            it->second.source_segment == source_segment &&
+            target_segments.size() == 1 &&
+            target_segments.front() == it->second.target_segment) {
+            pending_it = it;
+            break;
+        }
+    }
     if (pending_it == tenant_state.dynamic_replication_pending.end()) {
         return;
     }
