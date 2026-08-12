@@ -69,28 +69,32 @@ Status ControlClient::bootstrap(const std::string& server_addr,
     return Status::OK();
 }
 
-Status ControlClient::sendData(const std::string& server_addr,
-                               uint64_t peer_mem_addr, void* local_mem_addr,
-                               size_t length) {
+Status ControlClient::sendData(
+    const std::string& server_addr, uint64_t peer_mem_addr,
+    void* local_mem_addr, size_t length,
+    std::optional<std::chrono::milliseconds> call_timeout) {
     std::string request, response;
     XferDataDesc desc{htole64(peer_mem_addr), htole64(length)};
     request.resize(sizeof(XferDataDesc) + length);
     memcpy(&request[0], &desc, sizeof(desc));
     Platform::getLoader().copy(&request[sizeof(desc)], local_mem_addr, length);
-    auto status = tl_rpc_agent.call(server_addr, SendData, request, response);
+    auto status = tl_rpc_agent.call(server_addr, SendData, request, response,
+                                    call_timeout);
     if (!status.ok()) return status;
     if (!response.empty()) return Status::RpcServiceError(response);
     return Status::OK();
 }
 
-Status ControlClient::recvData(const std::string& server_addr,
-                               uint64_t peer_mem_addr, void* local_mem_addr,
-                               size_t length) {
+Status ControlClient::recvData(
+    const std::string& server_addr, uint64_t peer_mem_addr,
+    void* local_mem_addr, size_t length,
+    std::optional<std::chrono::milliseconds> call_timeout) {
     std::string request, response;
     XferDataDesc desc{htole64(peer_mem_addr), htole64(length)};
     request.resize(sizeof(XferDataDesc));
     memcpy(&request[0], &desc, sizeof(desc));
-    auto status = tl_rpc_agent.call(server_addr, RecvData, request, response);
+    auto status = tl_rpc_agent.call(server_addr, RecvData, request, response,
+                                    call_timeout);
     if (!status.ok()) return status;
     if (response.size() != length)
         return Status::RpcServiceError(

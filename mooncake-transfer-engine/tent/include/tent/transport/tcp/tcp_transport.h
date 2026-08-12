@@ -16,6 +16,7 @@
 #define TCP_TRANSPORT_H_
 
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <iostream>
 #include <memory>
@@ -34,6 +35,7 @@ struct TcpParams {
     uint64_t retry_base_delay_ms = 100;   // 100ms initial backoff
     uint64_t retry_max_delay_ms = 2'000;  // 2s max backoff
     size_t max_concurrent_tasks = 16;     // worker thread pool size
+    int64_t data_rpc_timeout_ms = 5'000;  // per-attempt data RPC timeout
 };
 
 struct TcpTask {

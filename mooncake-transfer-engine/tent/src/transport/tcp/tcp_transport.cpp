@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <iomanip>
 #include <memory>
+#include <optional>
 #include <thread>
 
 #include "tent/common/status.h"
@@ -84,6 +85,14 @@ Status TcpTransport::install(std::string &local_segment_name,
         params_.max_concurrent_tasks =
             conf->get("transports/tcp/max_concurrent_tasks",
                       params_.max_concurrent_tasks);
+        params_.data_rpc_timeout_ms = conf->get(
+            "transports/tcp/data_rpc_timeout_ms", params_.data_rpc_timeout_ms);
+    }
+
+    if (params_.data_rpc_timeout_ms == 0 || params_.data_rpc_timeout_ms < -1) {
+        return Status::InvalidArgument(
+            "transports/tcp/data_rpc_timeout_ms must be positive, or -1 to "
+            "disable the per-attempt timeout" LOC_MARK);
     }
 
     thread_pool_ = std::make_unique<ThreadPool>(params_.max_concurrent_tasks);
@@ -103,7 +112,8 @@ Status TcpTransport::install(std::string &local_segment_name,
 
     LOG(INFO) << "TCP transport installed: max_retry_count="
               << params_.max_retry_count
-              << " max_concurrent_tasks=" << params_.max_concurrent_tasks;
+              << " max_concurrent_tasks=" << params_.max_concurrent_tasks
+              << " data_rpc_timeout_ms=" << params_.data_rpc_timeout_ms;
     return Status::OK();
 }
 
@@ -223,6 +233,12 @@ Status TcpTransport::doTransferWithRetry(TcpTask *task) {
                           task->request.target_id, rpc_server_addr);
     if (!status.ok()) return status;
 
+    std::optional<std::chrono::milliseconds> data_rpc_timeout;
+    if (params_.data_rpc_timeout_ms > 0) {
+        data_rpc_timeout =
+            std::chrono::milliseconds(params_.data_rpc_timeout_ms);
+    }
+
     Status last_error;
     uint64_t delay_ms = params_.retry_base_delay_ms;
 
@@ -247,11 +263,11 @@ Status TcpTransport::doTransferWithRetry(TcpTask *task) {
         if (task->request.opcode == Request::WRITE) {
             status = ControlClient::sendData(
                 rpc_server_addr, task->request.target_offset,
-                task->request.source, task->request.length);
+                task->request.source, task->request.length, data_rpc_timeout);
         } else {
             status = ControlClient::recvData(
                 rpc_server_addr, task->request.target_offset,
-                task->request.source, task->request.length);
+                task->request.source, task->request.length, data_rpc_timeout);
         }
 
         if (status.ok()) return Status::OK();
