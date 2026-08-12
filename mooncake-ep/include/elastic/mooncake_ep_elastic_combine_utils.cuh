@@ -37,8 +37,8 @@ template <int kHiddenBytes>
 struct CombineVecTraits {
 #if !defined(MOONCAKE_EP_USE_MUSA) && defined(__CUDA_ARCH__) && \
     (__CUDA_ARCH__ >= 1000)
-    // Upstream DeepEP found that 256-bit longlong4_t accesses regress this
-    // reduction on SM100+. Keep the faster 128-bit int4 path until a workload
+    // 256-bit longlong4_t accesses regress this reduction on the validated
+    // SM100+ kernel shapes. Keep the faster 128-bit int4 path until a workload
     // demonstrates that the wider vector is beneficial.
     static constexpr bool kUseLonglong4 = false;
     using vec_t = std::conditional_t<kUseLonglong4, longlong4_t, int4>;
