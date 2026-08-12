@@ -47,6 +47,7 @@ class SegmentTracker;
 class Platform;
 class ProxyManager;
 class ProgressWorker;
+struct PathScoringState;
 
 // How long a poll loop should pause before polling again. Zero means poll
 // immediately.
@@ -417,6 +418,8 @@ class TransferEngineImpl {
 
     ResolvedRoute resolveExecutionRoute(const Request& req, int transport_index,
                                         bool invalidate_on_fail = true);
+
+    PathScoringState snapshotPathScoringState() const;
 
     // Verify that req.transport_hint is usable for this request
     Status validateTransportHint(const Request& req, size_t request_index);

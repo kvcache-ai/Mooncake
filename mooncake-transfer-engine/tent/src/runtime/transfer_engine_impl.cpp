@@ -1202,6 +1202,49 @@ static void addStageCandidate(std::vector<StageCandidate>& candidates,
     if (!duplicate) candidates.push_back({location, memory_type});
 }
 
+PathScoringState TransferEngineImpl::snapshotPathScoringState() const {
+    PathScoringState state;
+    state.now_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+
+    if (runtime_queue_config_.enabled) {
+        double owner_pressure = 0.0;
+        if (runtime_queue_config_.max_dispatch_owners > 0) {
+            owner_pressure =
+                static_cast<double>(dispatch_inflight_owners_) /
+                static_cast<double>(runtime_queue_config_.max_dispatch_owners);
+        }
+        double byte_pressure = 0.0;
+        if (runtime_queue_config_.max_dispatch_bytes > 0) {
+            byte_pressure =
+                static_cast<double>(dispatch_inflight_bytes_) /
+                static_cast<double>(runtime_queue_config_.max_dispatch_bytes);
+        }
+        state.runtime_queue_pressure =
+            std::max(0.0, std::max(owner_pressure, byte_pressure));
+    }
+
+    const auto& rdma = transport_list_[static_cast<int>(RDMA)];
+    if (rdma) {
+        state.rdma_available = true;
+        std::vector<NicLoadStats> stats;
+        if (rdma->getNicLoadStats(stats).ok()) {
+            for (const auto& nic : stats) {
+                state.rdma_inflight_bytes += nic.inflight_bytes;
+                if (nic.ewma_bandwidth_bps > 0.0)
+                    state.rdma_ewma_bandwidth_bps += nic.ewma_bandwidth_bps;
+            }
+        }
+        if (state.rdma_ewma_bandwidth_bps <= 0.0) {
+            const double estimate = rdma->getEstimatedBandwidth();
+            if (estimate > 0.0) state.rdma_ewma_bandwidth_bps = estimate;
+        }
+    }
+    return state;
+}
+
 Status TransferEngineImpl::validateTransportHint(const Request& req,
                                                  size_t request_index) {
     if (req.transport_hint == UNSPEC) return Status::OK();
@@ -1635,7 +1678,9 @@ TransferEngineImpl::ResolvedRoute TransferEngineImpl::resolveExecutionRoute(
         input.transports[type].caps = caps;
     }
 
-    auto path = CapabilityPathSynthesizer::synthesize(input);
+    const auto scoring_state = snapshotPathScoringState();
+    const auto options = buildPathSynthesisOptions(req, scoring_state);
+    auto path = CapabilityPathSynthesizer::synthesize(input, options);
     if (!path.found) return resolved;
 
     auto selected = std::find_if(

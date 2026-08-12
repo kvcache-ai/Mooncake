@@ -15,6 +15,8 @@
 #include "tent/runtime/capability_graph.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cmath>
 #include <limits>
 #include <optional>
 #include <sstream>
@@ -49,6 +51,24 @@ double transportCost(TransportType type, const PathSynthesisOptions& options) {
         return options.transport_cost[idx];
     }
     return defaultTransportCost(type);
+}
+
+uint64_t steadyNowNs() {
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch())
+            .count());
+}
+
+void addTransportCostDelta(PathSynthesisOptions& options, TransportType type,
+                           double delta) {
+    const auto idx = static_cast<int>(type);
+    if (idx < 0 || idx >= kSupportedTransportTypes) return;
+    const double base =
+        options.transport_cost[idx] < std::numeric_limits<double>::infinity()
+            ? options.transport_cost[idx]
+            : defaultTransportCost(type);
+    options.transport_cost[idx] = std::max(0.01, base + delta);
 }
 
 struct Hop {
@@ -189,6 +209,100 @@ CapabilityPathCandidate makePublicCandidate(
 
 PathSynthesisOptions::PathSynthesisOptions() {
     transport_cost.fill(std::numeric_limits<double>::infinity());
+}
+
+PathSynthesisOptions buildPathSynthesisOptions(
+    const Request& request, const PathScoringState& state) {
+    PathSynthesisOptions options;
+
+    switch (request.intent_type) {
+        case IntentType::FOREGROUND_GET:
+            // Latency-sensitive foreground traffic pays heavily for extra hops.
+            options.staged_path_penalty += 1.50;
+            options.stage_hop_penalty += 0.35;
+            addTransportCostDelta(options, TCP, 1.00);
+            break;
+        case IntentType::BACKGROUND_PREFETCH:
+            // Background prefetch should make progress while avoiding the fast
+            // RDMA lane when a slower direct fallback exists.
+            options.staged_path_penalty = 0.05;
+            options.stage_hop_penalty = 0.05;
+            addTransportCostDelta(options, RDMA, 7.00);
+            addTransportCostDelta(options, UB, 7.00);
+            addTransportCostDelta(options, SUNRISE_LINK, 7.00);
+            addTransportCostDelta(options, AscendDirect, 7.00);
+            addTransportCostDelta(options, TCP, -3.00);
+            break;
+        case IntentType::MIGRATION:
+        case IntentType::CHECKPOINT:
+        case IntentType::WEIGHT_LOADING:
+            // Bulk movement prefers high-bandwidth fabrics and accepts staging
+            // when it unlocks a faster cross-node hop.
+            options.staged_path_penalty = 0.05;
+            options.stage_hop_penalty = 0.05;
+            addTransportCostDelta(options, RDMA, -0.20);
+            addTransportCostDelta(options, MNNVL, -0.05);
+            addTransportCostDelta(options, TCP, 3.00);
+            break;
+        case IntentType::STAGING_INTERNAL:
+            // Internal stage copies should not recursively synthesize another
+            // staged path unless there is no direct route left.
+            options.staged_path_penalty += 100.0;
+            options.stage_hop_penalty += 10.0;
+            break;
+        case IntentType::INTENT_UNSPEC:
+            break;
+    }
+
+    const double pressure = std::max(0.0, state.runtime_queue_pressure);
+    if (pressure > 0.0) {
+        options.direct_path_penalty += std::min(1.0, pressure * 0.10);
+        options.staged_path_penalty += std::min(2.0, pressure * 0.50);
+    }
+
+    if (state.rdma_available) {
+        if (state.rdma_ewma_bandwidth_bps > 0.0) {
+            const double queued_seconds =
+                static_cast<double>(state.rdma_inflight_bytes + request.length) /
+                state.rdma_ewma_bandwidth_bps;
+            addTransportCostDelta(options, RDMA,
+                                  std::min(20.0, queued_seconds * 100.0));
+        } else {
+            addTransportCostDelta(options, RDMA, 2.0);
+        }
+
+        if (state.rdma_inflight_bytes > 0 && request.length > 0) {
+            const double ratio =
+                static_cast<double>(state.rdma_inflight_bytes) /
+                static_cast<double>(request.length);
+            addTransportCostDelta(options, RDMA,
+                                  std::min(5.0, std::log1p(ratio) * 0.50));
+        }
+    }
+
+    if (request.deadline_ns != 0) {
+        const uint64_t now = state.now_ns != 0 ? state.now_ns : steadyNowNs();
+        if (request.deadline_ns <= now) {
+            options.staged_path_penalty += 20.0;
+            addTransportCostDelta(options, TCP, 20.0);
+        } else {
+            const double slack_seconds =
+                static_cast<double>(request.deadline_ns - now) / 1e9;
+            double rdma_seconds = 0.0;
+            if (state.rdma_ewma_bandwidth_bps > 0.0) {
+                rdma_seconds = static_cast<double>(request.length) /
+                               state.rdma_ewma_bandwidth_bps;
+            }
+            if (slack_seconds < 0.005 ||
+                (rdma_seconds > 0.0 && rdma_seconds * 2.0 > slack_seconds)) {
+                options.staged_path_penalty += 3.0;
+                options.stage_hop_penalty += 0.50;
+                addTransportCostDelta(options, TCP, 5.0);
+            }
+        }
+    }
+
+    return options;
 }
 
 bool CapabilityPathSynthesizer::canReach(const Capabilities& caps,
