@@ -136,6 +136,30 @@ class DynamicReplicationTest : public ::testing::Test {
                has_lease;
     }
 
+    size_t EvictReplicaOnSegment(MasterService& service, const std::string& key,
+                                 const std::string& target_segment) const {
+        MasterService::MetadataAccessorRW accessor(
+            &service, MasterService::ObjectIdentity{TenantId::Default(), key});
+        EXPECT_TRUE(accessor.Exists());
+        if (!accessor.Exists()) {
+            return 0;
+        }
+        std::vector<ReplicaID> erased_replica_ids;
+        return service.EraseReplicasWithCacheTotalAccounting(
+            accessor.Get(),
+            [&target_segment](const Replica& replica) {
+                if (!replica.is_memory_replica()) {
+                    return false;
+                }
+                const auto& segment_names = replica.get_segment_names();
+                return std::any_of(segment_names.begin(), segment_names.end(),
+                                   [&target_segment](const auto& name) {
+                                       return name && *name == target_segment;
+                                   });
+            },
+            &erased_replica_ids);
+    }
+
     void ExpireDynamicPending(MasterService& service,
                               const std::string& key) const {
         MasterService::MetadataAccessorRW accessor(
@@ -371,6 +395,44 @@ TEST_F(DynamicReplicationTest, ExpiredLeaseRejectsCopyStart) {
     EXPECT_EQ(copy_start.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     EXPECT_EQ(DynamicReplicaCount(service, "expired-key"), 0u);
     EXPECT_FALSE(HasDynamicState(service, "expired-key"));
+}
+
+TEST_F(DynamicReplicationTest, EvictedDynamicReplicaBlocksImmediateRecreate) {
+    MasterServiceConfig config;
+    config.dynamic_replication_mode = "enforce";
+    config.dynamic_replication_admission_qps_threshold = 0.1;
+    config.dynamic_replication_max_memory_replicas = 3;
+    MasterService service(config);
+
+    auto source = PrepareSegment(service, "segment_0", 0x1100000000);
+    auto target = PrepareSegment(service, "segment_1", 0x1200000000);
+    auto next_target = PrepareSegment(service, "segment_2", 0x1300000000);
+    PutObject(service, source.client_id, "evicted-dynamic-key",
+              source.segment_name);
+
+    auto proposal =
+        BuildProposal(service, "evicted-dynamic-key", target.segment_name);
+    auto lease = service.SubmitReplicaActionProposal(proposal);
+    ASSERT_TRUE(lease.has_value());
+    auto copy_start = service.CopyStart(
+        source.client_id, "evicted-dynamic-key", TenantId::Default(),
+        lease->source_segment, {lease->target_segment});
+    ASSERT_TRUE(copy_start.has_value());
+    auto copy_end = service.CopyEnd(source.client_id, "evicted-dynamic-key",
+                                    TenantId::Default());
+    ASSERT_TRUE(copy_end.has_value());
+    ASSERT_EQ(DynamicReplicaCount(service, "evicted-dynamic-key"), 1u);
+
+    EXPECT_EQ(EvictReplicaOnSegment(service, "evicted-dynamic-key",
+                                    target.segment_name),
+              1u);
+    EXPECT_EQ(DynamicReplicaCount(service, "evicted-dynamic-key"), 0u);
+
+    auto immediate_recreate =
+        BuildProposal(service, "evicted-dynamic-key", next_target.segment_name);
+    auto rejected = service.SubmitReplicaActionProposal(immediate_recreate);
+    ASSERT_FALSE(rejected.has_value());
+    EXPECT_EQ(rejected.error(), ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
 }
 
 }  // namespace mooncake::test

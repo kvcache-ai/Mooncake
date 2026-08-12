@@ -1655,6 +1655,8 @@ class MasterService {
         const std::function<bool(const Replica&)>& pred_fn);
     std::vector<Replica> PopReplicasWithCacheTotalAccounting(
         ObjectMetadata& metadata);
+    void RecordDynamicReplicaRemoval(ObjectMetadata& metadata,
+                                     const std::vector<ReplicaID>& replica_ids);
     size_t EraseReplicasWithCacheTotalAccounting(
         ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& pred_fn,

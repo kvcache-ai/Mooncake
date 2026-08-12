@@ -1669,6 +1669,18 @@ std::vector<Replica> MasterService::PopReplicasWithCacheTotalAccounting(
     return replicas;
 }
 
+void MasterService::RecordDynamicReplicaRemoval(
+    ObjectMetadata& metadata, const std::vector<ReplicaID>& replica_ids) {
+    if (replica_ids.empty()) {
+        return;
+    }
+    if (metadata.ForgetDynamicReplicas(replica_ids) > 0) {
+        metadata.SetDynamicReplicationRecreateAfter(
+            std::chrono::steady_clock::now() +
+            kDynamicReplicationRecreateCooldown);
+    }
+}
+
 size_t MasterService::EraseReplicasWithCacheTotalAccounting(
     ObjectMetadata& metadata,
     const std::function<bool(const Replica&)>& pred_fn,
@@ -1682,16 +1694,12 @@ size_t MasterService::EraseReplicasWithCacheTotalAccounting(
             erased_replica_ids->push_back(replica.id());
         }
     }
-    std::vector<ReplicaID> dynamic_erased_ids;
-    dynamic_erased_ids.reserve(erased_replicas.size());
+    std::vector<ReplicaID> erased_ids;
+    erased_ids.reserve(erased_replicas.size());
     for (const auto& replica : erased_replicas) {
-        dynamic_erased_ids.push_back(replica.id());
+        erased_ids.push_back(replica.id());
     }
-    if (metadata.ForgetDynamicReplicas(dynamic_erased_ids) > 0) {
-        metadata.SetDynamicReplicationRecreateAfter(
-            std::chrono::steady_clock::now() +
-            kDynamicReplicationRecreateCooldown);
-    }
+    RecordDynamicReplicaRemoval(metadata, erased_ids);
     // Release SSD/local-disk usage for any local-disk replicas being removed.
     // No-op for memory/noF replicas, so it is safe to call unconditionally.
     ReleaseLocalDiskUsage(erased_replicas);
@@ -1735,6 +1743,7 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
     for (const auto& replica : erased_replicas) {
         erased_replica_ids.push_back(replica.id());
     }
+    RecordDynamicReplicaRemoval(metadata, erased_replica_ids);
     const uint64_t erased_memory_replicas = static_cast<uint64_t>(std::count_if(
         erased_replicas.begin(), erased_replicas.end(),
         [](const Replica& replica) { return replica.is_memory_replica(); }));
@@ -5405,8 +5414,6 @@ tl::expected<void, ErrorCode> MasterService::CopyRevoke(
 
     AbortTenantQuota(metadata.tenant_id, task.reserved_quota_charge_bytes);
     accessor.EraseReplicationTask();
-
-    metadata.ForgetDynamicReplicas(replica_ids);
     ClearDynamicReplicationStateForKey(accessor.GetTenantState(), key);
 
     if (!metadata.IsValid()) {
