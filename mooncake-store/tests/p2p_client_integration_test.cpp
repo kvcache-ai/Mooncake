@@ -21,12 +21,100 @@
 #include <vector>
 
 #include "p2p_client_metric.h"
+#include "p2p_client_process_test_helper.h"
 #include "p2p_client_service.h"
 #include "test_p2p_server_helpers.h"
 #include "types.h"
 
 namespace mooncake {
 namespace testing {
+
+namespace {
+
+std::shared_ptr<P2PClientService> CreateClientForMaster(
+    const std::string& master_address, const std::string& host_name,
+    uint32_t rpc_port = 0, const std::string& local_transfer_mode = "te",
+    TransferDirectionMode transfer_direction_mode =
+        TransferDirectionMode::REVERSE) {
+    if (rpc_port == 0) {
+        rpc_port = getFreeTcpPort();
+    }
+
+    auto config = ClientConfigBuilder::build_p2p_real_client(
+        host_name, "P2PHANDSHAKE", "tcp", std::nullopt, master_address,
+        R"({"tiers": [{"type": "DRAM", "capacity": 67108864, "priority": 100}]})",
+        /*local_buffer_size=*/0, nullptr, "", rpc_port);
+    config.local_transfer_mode = local_transfer_mode == "te"
+                                     ? LocalTransferMode::TE
+                                     : LocalTransferMode::MEMCPY;
+    config.transfer_direction_mode = transfer_direction_mode;
+    config.async_sender_thread_count = 0;
+    config.enable_http_server = false;
+    config.http_port = 0;
+
+    auto client = std::make_shared<P2PClientService>(
+        config.metadata_connstring, config.http_port, config.enable_http_server,
+        config.labels);
+    if (const auto err = client->Init(config); err != ErrorCode::OK) {
+        LOG(ERROR) << "P2P client Init failed: " << static_cast<int>(err);
+        return nullptr;
+    }
+    return client;
+}
+
+// Owns a real cross-process cluster used only by the cross-process cases:
+//   parent process: local_client_
+//   child process:  master_process_
+//   child process:  remote_peer_process_
+// It is started from main() before any P2PClientService::Init() can create
+// background threads in the test runner.
+class P2PCrossProcessEnvironment {
+   public:
+    bool Start() {
+        Stop();
+        if (!master_process_.Start()) {
+            LOG(ERROR) << "Failed to start cross-process P2P master";
+            return false;
+        }
+        if (!remote_peer_process_.Start(master_process_.master_address())) {
+            LOG(ERROR) << "Failed to start cross-process remote peer";
+            Stop();
+            return false;
+        }
+
+        local_client_ = CreateClientForMaster(
+            master_process_.master_address(),
+            "localhost:" + std::to_string(getFreeTcpPort()));
+        if (!local_client_) {
+            Stop();
+            return false;
+        }
+        return true;
+    }
+
+    void Stop() {
+        local_client_.reset();
+        remote_peer_process_.Stop();
+        master_process_.Stop();
+    }
+
+    P2PClientService& local_client() { return *local_client_; }
+    const ScopedP2PRemotePeerProcess& remote_peer() const {
+        return remote_peer_process_;
+    }
+
+   private:
+    ScopedP2PMasterProcess master_process_;
+    ScopedP2PRemotePeerProcess remote_peer_process_;
+    std::shared_ptr<P2PClientService> local_client_;
+};
+
+P2PCrossProcessEnvironment& CrossProcessEnvironment() {
+    static P2PCrossProcessEnvironment environment;
+    return environment;
+}
+
+}  // namespace
 
 // ============================================================================
 // Test fixture
@@ -41,38 +129,16 @@ class P2PClientIntegrationTest : public ::testing::Test {
         const std::string& local_transfer_mode = "te",
         TransferDirectionMode transfer_direction_mode =
             TransferDirectionMode::REVERSE) {
-        if (rpc_port == 0) rpc_port = getFreeTcpPort();
-
-        auto config = ClientConfigBuilder::build_p2p_real_client(
-            host_name, "P2PHANDSHAKE", "tcp", std::nullopt, master_address_,
-            R"({"tiers": [{"type": "DRAM", "capacity": 67108864, "priority": 100}]})",
-            /*local_buffer_size=*/0, nullptr, "", rpc_port);
-        if (local_transfer_mode == "te") {
-            config.local_transfer_mode = LocalTransferMode::TE;
-        } else {
-            config.local_transfer_mode = LocalTransferMode::MEMCPY;
-        }
-        config.transfer_direction_mode = transfer_direction_mode;
-
-        config.async_sender_thread_count = 0;
-
-        auto client = std::make_shared<P2PClientService>(
-            config.metadata_connstring, config.http_port,
-            config.enable_http_server, config.labels);
-
-        auto err = client->Init(config);
-        EXPECT_EQ(err, ErrorCode::OK)
-            << "Init failed: " << static_cast<int>(err);
-
+        auto client = CreateClientForMaster(master_address_, host_name, rpc_port,
+                                            local_transfer_mode,
+                                            transfer_direction_mode);
+        EXPECT_NE(client, nullptr) << "Failed to initialize P2P client";
         return client;
     }
 
     // --- Suite-level setup / teardown ---
 
     static void SetUpTestSuite() {
-        google::InitGoogleLogging("P2PClientIntegrationTest");
-        FLAGS_logtostderr = 1;
-
         // 1. Start in-process P2P master
         ASSERT_TRUE(master_.Start()) << "Failed to start P2P master";
         master_address_ = master_.master_address();
@@ -90,7 +156,6 @@ class P2PClientIntegrationTest : public ::testing::Test {
         client2_.reset();
         client_.reset();
         master_.Stop();
-        google::ShutdownGoogleLogging();
     }
 
     // Shared across all tests in this suite
@@ -105,6 +170,109 @@ InProcP2PMaster P2PClientIntegrationTest::master_;
 std::string P2PClientIntegrationTest::master_address_;
 std::shared_ptr<P2PClientService> P2PClientIntegrationTest::client_ = nullptr;
 std::shared_ptr<P2PClientService> P2PClientIntegrationTest::client2_ = nullptr;
+
+// ============================================================================
+// Cross-process P2P data path
+// ============================================================================
+
+class P2PCrossProcessIntegrationTest : public ::testing::Test {
+   protected:
+    P2PClientService& client() {
+        return CrossProcessEnvironment().local_client();
+    }
+
+    const ScopedP2PRemotePeerProcess& remote_peer() const {
+        return CrossProcessEnvironment().remote_peer();
+    }
+
+    WriteRouteRequestConfig ForceRemoteWrite() const {
+        WriteRouteRequestConfig config;
+        config.remote_weight = 1.0;
+        config.local_write_waterline = 0.0;
+        config.max_candidates = 1;
+        return config;
+    }
+
+    void ExpectReplicaOwnedByRemoteChild(const std::string& key) {
+        auto replicas = client().GetMasterClient().GetReplicaList(key);
+        ASSERT_TRUE(replicas.has_value());
+        ASSERT_EQ(replicas->replicas.size(), 1u);
+        const auto& descriptor = replicas->replicas.front();
+        ASSERT_TRUE(std::holds_alternative<P2PProxyDescriptor>(
+            descriptor.descriptor_variant));
+        const auto& proxy =
+            std::get<P2PProxyDescriptor>(descriptor.descriptor_variant);
+        EXPECT_EQ(proxy.rpc_port, remote_peer().rpc_port());
+    }
+};
+
+TEST_F(P2PCrossProcessIntegrationTest, RemotePutAndGet) {
+    const std::string key = "cross_process_remote_put_get";
+    const std::string payload = "payload_owned_by_remote_child";
+    std::vector<Slice> slices{
+        {const_cast<char*>(payload.data()), payload.size()}};
+
+    auto put = client().Put(key, slices, ForceRemoteWrite());
+    ASSERT_TRUE(put.has_value())
+        << "Cross-process remote Put failed: "
+        << static_cast<int>(put.error());
+    ExpectReplicaOwnedByRemoteChild(key);
+
+    std::vector<char> output(payload.size(), 0);
+    auto get = client().Get(key, {output.data()}, {output.size()});
+    ASSERT_TRUE(get.has_value())
+        << "Cross-process remote Get failed: "
+        << static_cast<int>(get.error());
+    EXPECT_EQ(std::string(output.data(), output.size()), payload);
+}
+
+TEST_F(P2PCrossProcessIntegrationTest, RemoteBatchPutAndBatchGet) {
+    constexpr size_t kBatchSize = 4;
+    std::vector<std::string> keys;
+    std::vector<std::string> payloads;
+    std::vector<std::vector<Slice>> put_slices;
+    keys.reserve(kBatchSize);
+    payloads.reserve(kBatchSize);
+    put_slices.reserve(kBatchSize);
+
+    for (size_t i = 0; i < kBatchSize; ++i) {
+        keys.push_back("cross_process_batch_key_" + std::to_string(i));
+        payloads.push_back("cross_process_batch_payload_" +
+                           std::to_string(i));
+    }
+    for (auto& payload : payloads) {
+        put_slices.push_back({Slice{payload.data(), payload.size()}});
+    }
+
+    auto put_results = client().BatchPut(keys, put_slices, ForceRemoteWrite());
+    ASSERT_EQ(put_results.size(), kBatchSize);
+    for (size_t i = 0; i < kBatchSize; ++i) {
+        ASSERT_TRUE(put_results[i].has_value())
+            << "Cross-process BatchPut failed for " << keys[i] << ": "
+            << static_cast<int>(put_results[i].error());
+        ExpectReplicaOwnedByRemoteChild(keys[i]);
+    }
+
+    std::vector<std::vector<char>> outputs(kBatchSize);
+    std::vector<std::vector<void*>> buffers(kBatchSize);
+    std::vector<std::vector<size_t>> sizes(kBatchSize);
+    for (size_t i = 0; i < kBatchSize; ++i) {
+        outputs[i].resize(payloads[i].size());
+        buffers[i].push_back(outputs[i].data());
+        sizes[i].push_back(outputs[i].size());
+    }
+
+    auto get_results = client().BatchGet(keys, buffers, sizes,
+                                         ReadRouteConfig{});
+    ASSERT_EQ(get_results.size(), kBatchSize);
+    for (size_t i = 0; i < kBatchSize; ++i) {
+        ASSERT_TRUE(get_results[i].has_value())
+            << "Cross-process BatchGet failed for " << keys[i] << ": "
+            << static_cast<int>(get_results[i].error());
+        EXPECT_EQ(std::string(outputs[i].data(), outputs[i].size()),
+                  payloads[i]);
+    }
+}
 
 // ============================================================================
 // Put / Get (local WRITE_LOCAL mode)
@@ -1445,3 +1613,29 @@ TEST_F(P2PClientIntegrationTest, MetricPutFailure) {
 
 }  // namespace testing
 }  // namespace mooncake
+
+int main(int argc, char** argv) {
+    mooncake::testing::SetP2PClientIntegrationTestBinaryPath(argv[0]);
+    if (auto child_exit =
+            mooncake::testing::MaybeRunP2PClientIntegrationTestChildProcess(
+                argc, argv);
+        child_exit.has_value()) {
+        return *child_exit;
+    }
+
+    ::testing::InitGoogleTest(&argc, argv);
+    google::InitGoogleLogging("P2PClientIntegrationTest");
+    FLAGS_logtostderr = 1;
+
+    auto& environment = mooncake::testing::CrossProcessEnvironment();
+    if (!environment.Start()) {
+        LOG(ERROR) << "Failed to initialize cross-process test environment";
+        google::ShutdownGoogleLogging();
+        return 2;
+    }
+
+    const int result = RUN_ALL_TESTS();
+    environment.Stop();
+    google::ShutdownGoogleLogging();
+    return result;
+}
