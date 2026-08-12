@@ -112,10 +112,10 @@ __forceinline__ __device__ void mooncake_barrier_wo_local_sync(
     const int sign = status >> 1;
     const int* base_signal = workspace.get_nvl_barrier_signal_ptr(kTag, phase);
 
-    // NCCL LSA atomics can safely converge on one symmetric counter, which
-    // matches DeepEP and lets the waiter issue one acquire load. IBGDA retains
-    // one slot per source rank because its portable remote-atomic protocol must
-    // not rely on a shared remote word.
+    // NCCL LSA atomics can safely converge on one symmetric counter, letting
+    // the waiter issue one acquire load. IBGDA retains one slot per source rank
+    // because its portable remote-atomic protocol must not rely on a shared
+    // remote word.
     constexpr bool kUseAggregateSignal =
         Ops::kIsNccl && std::is_same_v<team_t, transport::ScaleupTeam>;
     if (thread_idx < kNumRanks) {
