@@ -51,6 +51,7 @@ struct PutStartActionData {
     std::string key;
     uint64_t size;
     std::string actor{"default"};
+    size_t requested_replica_count{1};
     std::optional<ErrorCode> expected_error{};
     std::optional<size_t> expected_replica_count{};
     std::optional<ReplicaStatus> expected_replica_status{};
@@ -68,6 +69,11 @@ struct PutStartAction : PutStartActionData {
 
     PutStartAction& By(std::string value) {
         actor = std::move(value);
+        return *this;
+    }
+
+    PutStartAction& Replicas(size_t value) {
+        requested_replica_count = value;
         return *this;
     }
 
@@ -126,6 +132,7 @@ struct UpsertStartActionData {
     std::string key;
     uint64_t size;
     std::string actor{"default"};
+    size_t requested_replica_count{1};
     std::optional<ErrorCode> expected_error{};
     std::optional<size_t> expected_replica_count{};
     std::optional<ReplicaStatus> expected_replica_status{};
@@ -143,6 +150,11 @@ struct UpsertStartAction : UpsertStartActionData {
 
     UpsertStartAction& By(std::string value) {
         actor = std::move(value);
+        return *this;
+    }
+
+    UpsertStartAction& Replicas(size_t value) {
+        requested_replica_count = value;
         return *this;
     }
 

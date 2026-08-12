@@ -201,7 +201,13 @@ MasterService::MasterService(const MasterServiceConfig& config)
       put_start_release_timeout_sec_(config.put_start_release_timeout_sec),
       offloading_queue_limit_(config.offloading_queue_limit),
       offload_cap_ratio_(config.offload_cap_ratio),
-      task_manager_(config.task_manager_config) {
+      task_manager_(config.task_manager_config),
+      batch_oplog_writer_factory_(
+          [](OrderedOpLogWriterConfig writer_config,
+             OrderedOpLogWriter::WriteBatchFn write_batch) {
+              return std::make_unique<OrderedOpLogWriter>(
+                  std::move(writer_config), std::move(write_batch));
+          }) {
     if (default_kv_soft_pin_ttl_ > max_kv_soft_pin_ttl_) {
         LOG(ERROR) << "Invalid soft-pin TTL configuration: default="
                    << default_kv_soft_pin_ttl_
@@ -599,6 +605,13 @@ MasterService::~MasterService() {
 ErrorCode MasterService::SetBatchOpLogBackendForTesting(
     std::shared_ptr<HaKvBackend> backend) {
     return InitializeBatchOpLogWriter(std::move(backend));
+}
+
+void MasterService::SetBatchOpLogWriterFactoryForTesting(
+    BatchOpLogWriterFactory factory) {
+    assert(factory);
+    assert(!ordered_oplog_writer_);
+    batch_oplog_writer_factory_ = std::move(factory);
 }
 
 void MasterService::RunBatchEvictForTesting(double evict_ratio_target,
@@ -11362,12 +11375,17 @@ ErrorCode MasterService::InitializeBatchOpLogWriter(
     writer_config.max_entries_per_batch = oplog_batch_max_entries_;
     writer_config.initial_durable_prefix = durable_prefix;
     OpLogBatchStorage* storage_ptr = storage.get();
-    auto writer = std::make_unique<OrderedOpLogWriter>(
-        writer_config, [storage_ptr](const OpLogBatchRecord& batch,
-                                     const DurablePrefix& expected_prefix) {
+    OrderedOpLogWriter::WriteBatchFn write_batch =
+        [storage_ptr](const OpLogBatchRecord& batch,
+                      const DurablePrefix& expected_prefix) {
             return storage_ptr->WriteBatchAndAdvancePrefix(batch,
                                                            expected_prefix);
-        });
+        };
+    auto writer =
+        batch_oplog_writer_factory_(writer_config, std::move(write_batch));
+    if (!writer) {
+        return ErrorCode::INVALID_PARAMS;
+    }
     if (!writer->IsAccepting()) {
         return writer->LastError();
     }

@@ -1,6 +1,8 @@
 # Pre-commit hooks configuration for Mooncake
 # Install: pip install -r requirements-dev.txt && pre-commit install
-# Run manually on all files: pre-commit run --all-files
+# Staged files: pre-commit run
+# PR-changed files: git fetch origin main && pre-commit run --files $(git diff --name-only --diff-filter=ACMR origin/main...HEAD)
+# Full-repo (intentional cleanup only): pre-commit run --all-files
 # Format all C/C++ files explicitly: ./scripts/code_format.sh --all
 # Note: clang-format should already be available (installed via system packages or dependencies.sh)
 # Exclusions: build artifacts, vendored extern code, generated wheels.

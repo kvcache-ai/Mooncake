@@ -136,6 +136,9 @@ class MasterService {
         std::function<bool(const std::string&, uint32_t, std::string*)>;
     using DurableFinalizeCallback =
         std::function<void(const OpLogEntry& durable_entry)>;
+    using BatchOpLogWriterFactory =
+        std::function<std::unique_ptr<OrderedOpLogWriter>(
+            OrderedOpLogWriterConfig, OrderedOpLogWriter::WriteBatchFn)>;
 
     MasterService();
     MasterService(const MasterServiceConfig& config);
@@ -158,6 +161,7 @@ class MasterService {
 
     ErrorCode SetBatchOpLogBackendForTesting(
         std::shared_ptr<HaKvBackend> backend);
+    void SetBatchOpLogWriterFactoryForTesting(BatchOpLogWriterFactory factory);
 
     /**
      * @brief Test-only wrapper around BatchEvict / NoFBatchEvict so that
@@ -2491,6 +2495,7 @@ class MasterService {
     std::shared_ptr<HaKvBackend> batch_oplog_kv_backend_;
     std::unique_ptr<OpLogBatchStorage> batch_oplog_storage_;
     std::unique_ptr<OrderedOpLogWriter> ordered_oplog_writer_;
+    BatchOpLogWriterFactory batch_oplog_writer_factory_;
 
     // OpLog publishing helpers
     std::string SerializeMetadataForOpLog(const ObjectMetadata& metadata) const;
