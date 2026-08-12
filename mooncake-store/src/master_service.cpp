@@ -5427,7 +5427,7 @@ tl::expected<CopyStartResponse, ErrorCode> MasterService::CopyStart(
     }
 
     auto pending_validation = ValidateDynamicReplicaPendingForCopyStart(
-        tenant_state, key, src_segment,
+        tenant_state, key, client_id, src_segment,
         DynamicReplicationVersionEpoch(metadata), tgt_segments);
     if (!pending_validation) {
         return tl::make_unexpected(pending_validation.error());
@@ -7699,7 +7699,8 @@ std::optional<MasterService::DynamicReplicaPlan>
 MasterService::SelectDynamicReplicaPlan(
     const ObjectMetadata& metadata,
     const std::optional<std::string>& preferred_target_segment,
-    std::string target_domain) {
+    std::string target_domain, bool allow_reader_local_promotion,
+    const UUID& requester_client_id) {
     const std::string& object_key = metadata.user_key;
     std::unordered_set<std::string> existing_segments;
     std::unordered_set<std::string> existing_hosts;
@@ -7792,6 +7793,7 @@ MasterService::SelectDynamicReplicaPlan(
     };
 
     std::optional<std::string> target_segment;
+    bool reader_local_promotion = false;
     if (preferred_target_segment.has_value()) {
         const auto preferred = std::find_if(
             segments.begin(), segments.end(), [&](const auto& entry) {
@@ -7799,6 +7801,9 @@ MasterService::SelectDynamicReplicaPlan(
             });
         if (preferred != segments.end() && is_valid_target(preferred->first)) {
             target_segment = preferred->first.name;
+            reader_local_promotion = allow_reader_local_promotion &&
+                                     requester_client_id != UUID{0, 0} &&
+                                     preferred->second == requester_client_id;
         }
     }
     if (!target_segment.has_value()) {
@@ -7827,7 +7832,9 @@ MasterService::SelectDynamicReplicaPlan(
     }
     return DynamicReplicaPlan{.source_segment = source_segment,
                               .target_segment = *target_segment,
-                              .target_domain = std::move(target_domain)};
+                              .target_domain = std::move(target_domain),
+                              .requester_client_id = requester_client_id,
+                              .reader_local_promotion = reader_local_promotion};
 }
 
 tl::expected<ReplicaActionLease, ErrorCode>
@@ -7840,6 +7847,10 @@ MasterService::SubmitReplicaActionProposal(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (proposal.proposal_id == UUID{0, 0}) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (proposal.allow_reader_local_promotion &&
+        proposal.requester_client_id == UUID{0, 0}) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     const int64_t now_ms = DynamicReplicationNowMs();
@@ -7876,7 +7887,10 @@ MasterService::SubmitReplicaActionProposal(
                 (!proposal.preferred_target_segment.has_value() ||
                  lease.target_segment == *proposal.preferred_target_segment) &&
                 (proposal.target_domain.empty() ||
-                 lease.target_domain == proposal.target_domain);
+                 lease.target_domain == proposal.target_domain) &&
+                (!lease.reader_local_promotion ||
+                 (proposal.allow_reader_local_promotion &&
+                  proposal.requester_client_id == lease.requester_client_id));
             if (!same_request) {
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
@@ -7923,14 +7937,19 @@ MasterService::SubmitReplicaActionProposal(
     }
 
     auto plan = SelectDynamicReplicaPlan(
-        metadata, proposal.preferred_target_segment, proposal.target_domain);
+        metadata, proposal.preferred_target_segment, proposal.target_domain,
+        proposal.allow_reader_local_promotion, proposal.requester_client_id);
     if (!plan.has_value()) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
 
-    auto task = SubmitDynamicReplicaCopyTask(object_id, *plan);
-    if (!task.has_value()) {
-        return tl::make_unexpected(task.error());
+    UUID task_id{};
+    if (!plan->reader_local_promotion) {
+        auto task = SubmitDynamicReplicaCopyTask(object_id, *plan);
+        if (!task.has_value()) {
+            return tl::make_unexpected(task.error());
+        }
+        task_id = task.value();
     }
 
     ReplicaActionLease lease;
@@ -7944,17 +7963,22 @@ MasterService::SubmitReplicaActionProposal(
     lease.target_domain = plan->target_domain;
     lease.version_epoch = DynamicReplicationVersionEpoch(metadata);
     lease.expire_at_ms_epoch = now_ms + kDynamicReplicationLeaseTtl.count();
-    lease.task_id = task.value();
+    lease.task_id = task_id;
+    lease.requester_client_id = plan->requester_client_id;
+    lease.reader_local_promotion = plan->reader_local_promotion;
 
     tenant_state.dynamic_replication_pending[object_id.user_key] =
-        DynamicReplicaPending{.proposal_id = proposal_id,
-                              .lease_id = lease.lease_id,
-                              .source_segment = lease.source_segment,
-                              .target_segment = lease.target_segment,
-                              .target_domain = lease.target_domain,
-                              .version_epoch = lease.version_epoch,
-                              .expire_at_ms_epoch = lease.expire_at_ms_epoch,
-                              .task_id = lease.task_id};
+        DynamicReplicaPending{
+            .proposal_id = proposal_id,
+            .lease_id = lease.lease_id,
+            .source_segment = lease.source_segment,
+            .target_segment = lease.target_segment,
+            .target_domain = lease.target_domain,
+            .version_epoch = lease.version_epoch,
+            .expire_at_ms_epoch = lease.expire_at_ms_epoch,
+            .task_id = lease.task_id,
+            .requester_client_id = plan->requester_client_id,
+            .reader_local_promotion = plan->reader_local_promotion};
     tenant_state.dynamic_replication_leases[proposal_id] = lease;
     tenant_state.dynamic_replication_cooldowns[object_id.user_key] =
         std::chrono::steady_clock::now() + kDynamicReplicationActionCooldown;
@@ -11331,7 +11355,7 @@ MasterService::MetadataSerializer::DeserializeMetadata(
 
 tl::expected<void, ErrorCode>
 MasterService::ValidateDynamicReplicaPendingForCopyStart(
-    TenantState& tenant_state, const std::string& key,
+    TenantState& tenant_state, const std::string& key, const UUID& client_id,
     const std::string& source_segment, uint64_t version_epoch,
     const std::vector<std::string>& target_segments) {
     auto pending_it = tenant_state.dynamic_replication_pending.find(key);
@@ -11351,6 +11375,21 @@ MasterService::ValidateDynamicReplicaPendingForCopyStart(
         target_segments.size() != 1 ||
         target_segments.front() != pending.target_segment) {
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
+    }
+    if (pending.reader_local_promotion) {
+        if (pending.requester_client_id != client_id) {
+            return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+        }
+        UUID target_client_id;
+        auto segment_access = segment_manager_.getSegmentAccess();
+        auto err = segment_access.GetClientIdBySegmentName(
+            pending.target_segment, target_client_id);
+        if (err != ErrorCode::OK) {
+            return tl::make_unexpected(err);
+        }
+        if (target_client_id != client_id) {
+            return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+        }
     }
     return {};
 }

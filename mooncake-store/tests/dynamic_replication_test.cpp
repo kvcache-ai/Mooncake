@@ -320,6 +320,35 @@ TEST_F(DynamicReplicationTest, ProposalIdempotencyRejectsConflictingRequest) {
     EXPECT_EQ(second.error(), ErrorCode::INVALID_PARAMS);
 }
 
+TEST_F(DynamicReplicationTest,
+       ReaderLocalPromotionIdempotencyRejectsDifferentRequester) {
+    MasterServiceConfig config;
+    config.dynamic_replication_mode = "enforce";
+    config.dynamic_replication_max_memory_replicas = 2;
+    MasterService service(config);
+
+    auto source = PrepareSegment(service, "segment_0", 0xc40000000);
+    auto reader_target = PrepareSegment(service, "segment_1", 0xc50000000);
+    PutObject(service, source.client_id, "reader-idempotency-key",
+              source.segment_name);
+
+    auto proposal = BuildProposal(service, "reader-idempotency-key",
+                                  reader_target.segment_name);
+    proposal.requester_client_id = reader_target.client_id;
+    proposal.allow_reader_local_promotion = true;
+
+    auto first = service.SubmitReplicaActionProposal(proposal);
+    ASSERT_TRUE(first.has_value());
+    ASSERT_TRUE(first->reader_local_promotion);
+    EXPECT_EQ(first->requester_client_id, reader_target.client_id);
+
+    auto conflicting = proposal;
+    conflicting.requester_client_id = generate_uuid();
+    auto second = service.SubmitReplicaActionProposal(conflicting);
+    ASSERT_FALSE(second.has_value());
+    EXPECT_EQ(second.error(), ErrorCode::INVALID_PARAMS);
+}
+
 TEST_F(DynamicReplicationTest, CopyLifecycleMarksDynamicReplicaComplete) {
     MasterServiceConfig config;
     config.dynamic_replication_mode = "enforce";
@@ -348,6 +377,95 @@ TEST_F(DynamicReplicationTest, CopyLifecycleMarksDynamicReplicaComplete) {
     EXPECT_TRUE(
         HasCompleteDynamicReplica(service, "copy-key", lease->target_segment));
     EXPECT_FALSE(HasDynamicState(service, "copy-key"));
+}
+
+TEST_F(DynamicReplicationTest, ReaderLocalPromotionReturnsLeaseWithoutTask) {
+    MasterServiceConfig config;
+    config.dynamic_replication_mode = "enforce";
+    config.dynamic_replication_max_memory_replicas = 2;
+    MasterService service(config);
+
+    auto source = PrepareSegment(service, "segment_0", 0xd10000000);
+    auto reader_target = PrepareSegment(service, "segment_1", 0xd20000000);
+    PutObject(service, source.client_id, "reader-promote-key",
+              source.segment_name);
+
+    auto proposal = BuildProposal(service, "reader-promote-key",
+                                  reader_target.segment_name);
+    proposal.requester_client_id = reader_target.client_id;
+    proposal.allow_reader_local_promotion = true;
+
+    auto lease = service.SubmitReplicaActionProposal(proposal);
+    ASSERT_TRUE(lease.has_value());
+    EXPECT_TRUE(lease->reader_local_promotion);
+    const UUID empty_task_id{0, 0};
+    EXPECT_EQ(lease->task_id, empty_task_id);
+    EXPECT_EQ(lease->target_segment, reader_target.segment_name);
+
+    auto source_tasks = service.FetchTasks(source.client_id, 16);
+    ASSERT_TRUE(source_tasks.has_value());
+    EXPECT_TRUE(source_tasks->empty());
+}
+
+TEST_F(DynamicReplicationTest, ReaderLocalPromotionCopyLifecycleCompletes) {
+    MasterServiceConfig config;
+    config.dynamic_replication_mode = "enforce";
+    config.dynamic_replication_max_memory_replicas = 2;
+    MasterService service(config);
+
+    auto source = PrepareSegment(service, "segment_0", 0xd30000000);
+    auto reader_target = PrepareSegment(service, "segment_1", 0xd40000000);
+    PutObject(service, source.client_id, "reader-copy-key",
+              source.segment_name);
+
+    auto proposal =
+        BuildProposal(service, "reader-copy-key", reader_target.segment_name);
+    proposal.requester_client_id = reader_target.client_id;
+    proposal.allow_reader_local_promotion = true;
+    auto lease = service.SubmitReplicaActionProposal(proposal);
+    ASSERT_TRUE(lease.has_value());
+    ASSERT_TRUE(lease->reader_local_promotion);
+
+    auto copy_start = service.CopyStart(
+        reader_target.client_id, "reader-copy-key", TenantId::Default(),
+        lease->source_segment, {lease->target_segment});
+    ASSERT_TRUE(copy_start.has_value());
+    EXPECT_EQ(DynamicReplicaCount(service, "reader-copy-key"), 1u);
+    EXPECT_FALSE(HasCompleteDynamicReplica(service, "reader-copy-key",
+                                           lease->target_segment));
+
+    auto copy_end = service.CopyEnd(reader_target.client_id, "reader-copy-key",
+                                    TenantId::Default());
+    ASSERT_TRUE(copy_end.has_value());
+    EXPECT_TRUE(HasCompleteDynamicReplica(service, "reader-copy-key",
+                                          lease->target_segment));
+    EXPECT_FALSE(HasDynamicState(service, "reader-copy-key"));
+}
+
+TEST_F(DynamicReplicationTest, ReaderLocalPromotionRejectsWrongClient) {
+    MasterServiceConfig config;
+    config.dynamic_replication_mode = "enforce";
+    config.dynamic_replication_max_memory_replicas = 2;
+    MasterService service(config);
+
+    auto source = PrepareSegment(service, "segment_0", 0xd50000000);
+    auto reader_target = PrepareSegment(service, "segment_1", 0xd60000000);
+    PutObject(service, source.client_id, "reader-illegal-key",
+              source.segment_name);
+
+    auto proposal = BuildProposal(service, "reader-illegal-key",
+                                  reader_target.segment_name);
+    proposal.requester_client_id = reader_target.client_id;
+    proposal.allow_reader_local_promotion = true;
+    auto lease = service.SubmitReplicaActionProposal(proposal);
+    ASSERT_TRUE(lease.has_value());
+    ASSERT_TRUE(lease->reader_local_promotion);
+
+    auto copy_start = service.CopyStart(
+        generate_uuid(), "reader-illegal-key", TenantId::Default(),
+        lease->source_segment, {lease->target_segment});
+    ASSERT_FALSE(copy_start.has_value());
+    EXPECT_EQ(copy_start.error(), ErrorCode::ILLEGAL_CLIENT);
 }
 
 TEST_F(DynamicReplicationTest, CopyStartRejectsVersionMismatch) {

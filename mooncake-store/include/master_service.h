@@ -805,9 +805,8 @@ class MasterService {
         const std::vector<std::string>& targets);
 
     /**
-     * @brief Submit a dynamic replica action proposal from a domain-local
-     * controller. The first phase grants ADD proposals and creates the
-     * corresponding REPLICA_COPY task.
+     * @brief Submit a dynamic replica action proposal from the Mooncake
+     * reader-side path.
      */
     tl::expected<ReplicaActionLease, ErrorCode> SubmitReplicaActionProposal(
         const ReplicaActionProposal& proposal);
@@ -1476,6 +1475,8 @@ class MasterService {
         uint64_t version_epoch{0};
         int64_t expire_at_ms_epoch{0};
         UUID task_id{};
+        UUID requester_client_id{};
+        bool reader_local_promotion{false};
     };
 
     struct ReplicationTask {
@@ -2421,6 +2422,8 @@ class MasterService {
         std::string source_segment;
         std::string target_segment;
         std::string target_domain;
+        UUID requester_client_id{};
+        bool reader_local_promotion{false};
     };
 
     DynamicReplicationMode dynamic_replication_mode_{
@@ -2456,12 +2459,14 @@ class MasterService {
     std::optional<DynamicReplicaPlan> SelectDynamicReplicaPlan(
         const ObjectMetadata& metadata,
         const std::optional<std::string>& preferred_target_segment,
-        std::string target_domain);
+        std::string target_domain, bool allow_reader_local_promotion,
+        const UUID& requester_client_id);
     tl::expected<UUID, ErrorCode> SubmitDynamicReplicaCopyTask(
         const ObjectIdentity& object_id, const DynamicReplicaPlan& plan);
     tl::expected<void, ErrorCode> ValidateDynamicReplicaPendingForCopyStart(
         TenantState& tenant_state, const std::string& key,
-        const std::string& source_segment, uint64_t version_epoch,
+        const UUID& client_id, const std::string& source_segment,
+        uint64_t version_epoch,
         const std::vector<std::string>& target_segments);
     void RegisterDynamicReplicaStart(
         TenantState& tenant_state, ObjectMetadata& metadata,
