@@ -25,7 +25,7 @@ add_test(NAME metrics_config_loader_test COMMAND metrics_config_loader_test)
 # listening endpoint.
 add_executable(tent_metrics_http_server_test metrics_http_server_test.cpp)
 target_link_libraries(tent_metrics_http_server_test
-                      PRIVATE tent_metrics tent_common gtest gtest_main glog)
+                      PRIVATE tent_metrics tent_common gtest gtest_main)
 if(TARGET asio_shared)
   target_link_libraries(tent_metrics_http_server_test PRIVATE asio_shared)
 endif()

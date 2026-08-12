@@ -47,7 +47,7 @@ if(USE_ETCD)
   endif()
 endif()
 if(USE_REDIS)
-  target_link_libraries(transfer_metadata_plugin PRIVATE hiredis::hiredis)
+  target_link_libraries(transfer_metadata_plugin PRIVATE Mooncake::hiredis)
 endif()
 if(USE_HTTP)
   find_package(CURL REQUIRED)
@@ -65,7 +65,6 @@ target_compile_definitions(transfer_engine PRIVATE MOONCAKE_USE_ETCD
 target_link_libraries(
   transfer_engine
   PUBLIC base
-         transport
          rdma_transport
          mooncake_common
          ibverbs
@@ -76,7 +75,7 @@ target_link_libraries(
          numa
          asio_shared
          yalantinglibs::yalantinglibs
-  PRIVATE transfer_metadata_plugin)
+  PRIVATE transport transfer_metadata_plugin)
 if(BUILD_SHARED_LIBS)
   install(TARGETS transfer_engine DESTINATION lib)
 endif()

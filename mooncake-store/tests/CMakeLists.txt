@@ -51,7 +51,7 @@ add_store_test(kv_event_publisher_test kv_event_publisher_test.cpp)
 if(ENABLE_KV_EVENTS)
   target_compile_definitions(kv_event_publisher_test
                              PRIVATE MOONCAKE_ENABLE_KV_EVENTS=1)
-  target_link_libraries(kv_event_publisher_test PRIVATE libzmq::libzmq)
+  target_link_libraries(kv_event_publisher_test PRIVATE Mooncake::libzmq)
 endif()
 add_store_test(master_service_test master_service_test.cpp)
 add_ha_test(master_service_evict_scenario_test master_scenario.cpp
@@ -192,7 +192,7 @@ if(STORE_USE_REDIS)
   target_sources(
     high_availability_test
     PRIVATE ha/leadership/backends/redis/high_availability_redis_test.cpp)
-  target_link_libraries(high_availability_test PRIVATE hiredis::hiredis)
+  target_link_libraries(high_availability_test PRIVATE Mooncake::hiredis)
 
   add_executable(
     redis_snapshot_catalog_store_test
@@ -210,7 +210,7 @@ if(STORE_USE_REDIS)
            ibverbs
            gtest
            pthread
-    PRIVATE hiredis::hiredis)
+    PRIVATE Mooncake::hiredis)
   add_test(NAME redis_snapshot_catalog_store_test
            COMMAND redis_snapshot_catalog_store_test)
 endif()
@@ -295,7 +295,7 @@ add_ha_test(catalog_backed_snapshot_provider_test
 if(STORE_USE_REDIS)
   foreach(target catalog_backed_snapshot_provider_test
                  hot_standby_snapshot_bootstrap_test)
-    target_link_libraries(${target} PRIVATE hiredis::hiredis)
+    target_link_libraries(${target} PRIVATE Mooncake::hiredis)
   endforeach()
 endif()
 
@@ -304,5 +304,5 @@ foreach(
   hot_standby_service_test oplog_applier_test oplog_batch_codec_test
   oplog_batch_standby_reader_test oplog_batch_storage_test
   ordered_oplog_writer_test)
-  target_link_libraries(${target} PRIVATE xxHash::xxhash)
+  target_link_libraries(${target} PRIVATE Mooncake::xxhash)
 endforeach()

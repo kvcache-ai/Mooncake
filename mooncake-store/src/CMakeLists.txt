@@ -7,6 +7,7 @@ set(MOONCAKE_STORE_SHARED_SOURCES
     thread_pool.cpp
     etcd_helper.cpp
     uds_transport.cpp
+    storage/distributed/distributed_storage_backend.cpp
     storage/distributed/posix_fs_adapter.cpp
     utils/file_util.cpp)
 
@@ -69,7 +70,6 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     dummy_client.cpp
     shm_helper.cpp
     file_storage.cpp
-    storage/distributed/distributed_storage_backend.cpp
     device/accelerator_device.cpp
     device/accelerator_registry.cpp
     device/runtime_accelerator.cpp
@@ -130,7 +130,7 @@ if(USE_3FS)
   list(APPEND EXTRA_LIBS ${HF3FS_API_LIB})
 endif()
 
-if(TARGET liburing::liburing)
+if(TARGET Mooncake::liburing)
   list(APPEND MOONCAKE_STORE_CLIENT_SOURCES uring_file.cpp)
 endif()
 
@@ -292,21 +292,21 @@ target_link_libraries(
           JsonCpp::JsonCpp
           yaml-cpp
           mooncake_common
-          zstd::libzstd
-          xxHash::xxhash
+          Mooncake::zstd
+          Mooncake::xxhash
           asio_shared
           yalantinglibs::yalantinglibs)
 if(KV_EVENTS_ZMQ_FOUND)
   target_compile_definitions(mooncake_store_master_objects
                              PRIVATE MOONCAKE_ENABLE_KV_EVENTS=1)
-  target_link_libraries(mooncake_store_master_objects PRIVATE libzmq::libzmq)
+  target_link_libraries(mooncake_store_master_objects PRIVATE Mooncake::libzmq)
 endif()
 if(MOONCAKE_ENABLE_OPLOG_PERF_METRICS)
   target_compile_definitions(mooncake_store_master_objects
                              PRIVATE MOONCAKE_ENABLE_OPLOG_PERF_METRICS)
 endif()
 if(STORE_USE_REDIS)
-  target_link_libraries(mooncake_store_master_objects PRIVATE hiredis::hiredis)
+  target_link_libraries(mooncake_store_master_objects PRIVATE Mooncake::hiredis)
 endif()
 if(STORE_USE_ETCD)
   add_dependencies(mooncake_store_master_objects build_etcd_wrapper)
@@ -331,7 +331,7 @@ target_link_libraries(
           gflags::gflags
           JsonCpp::JsonCpp
           yaml-cpp
-          xxHash::xxhash
+          Mooncake::xxhash
           mooncake_common
           numa
           asio_shared
@@ -340,10 +340,10 @@ if(USE_NOF)
   target_include_directories(mooncake_store_client_objects
                              PRIVATE ${SPDK_INCLUDE_DIR} ${DPDK_INCLUDE_DIR})
 endif()
-if(TARGET liburing::liburing)
+if(TARGET Mooncake::liburing)
   target_compile_definitions(mooncake_store_client_objects PRIVATE USE_URING)
   target_link_libraries(mooncake_store_client_objects
-                        PRIVATE liburing::liburing)
+                        PRIVATE Mooncake::liburing)
 endif()
 if(STORE_USE_ETCD)
   add_dependencies(mooncake_store_client_objects build_etcd_wrapper)
@@ -377,20 +377,20 @@ target_link_libraries(
           glog::glog
           ${EXTRA_LIBS}
           mooncake_common
-          zstd::libzstd
+          Mooncake::zstd
           asio_shared
           yalantinglibs::yalantinglibs
           transfer_metadata_plugin
           gflags::gflags
           JsonCpp::JsonCpp
           yaml-cpp
-          xxHash::xxhash
+          Mooncake::xxhash
           numa)
 if(KV_EVENTS_ZMQ_FOUND)
-  target_link_libraries(mooncake_store_master PRIVATE libzmq::libzmq)
+  target_link_libraries(mooncake_store_master PRIVATE Mooncake::libzmq)
 endif()
 if(STORE_USE_REDIS)
-  target_link_libraries(mooncake_store_master PRIVATE hiredis::hiredis)
+  target_link_libraries(mooncake_store_master PRIVATE Mooncake::hiredis)
 endif()
 if(USE_UB)
   target_link_libraries(mooncake_store_master PRIVATE ub_allocator)
@@ -411,20 +411,20 @@ target_link_libraries(
          ${EXTRA_LIBS}
          ${SPDK_STATIC_LIBS}
          mooncake_common
-         zstd::libzstd
+         Mooncake::zstd
          asio_shared
          transfer_engine
          yalantinglibs::yalantinglibs
-  PRIVATE gflags::gflags JsonCpp::JsonCpp yaml-cpp xxHash::xxhash numa)
+  PRIVATE gflags::gflags JsonCpp::JsonCpp yaml-cpp Mooncake::xxhash numa)
 if(KV_EVENTS_ZMQ_FOUND)
-  target_link_libraries(mooncake_store PRIVATE libzmq::libzmq)
+  target_link_libraries(mooncake_store PRIVATE Mooncake::libzmq)
 endif()
 if(STORE_USE_REDIS)
-  target_link_libraries(mooncake_store PRIVATE hiredis::hiredis)
+  target_link_libraries(mooncake_store PRIVATE Mooncake::hiredis)
 endif()
-if(TARGET liburing::liburing)
+if(TARGET Mooncake::liburing)
   target_compile_definitions(mooncake_store PUBLIC USE_URING)
-  target_link_libraries(mooncake_store PUBLIC liburing::liburing)
+  target_link_libraries(mooncake_store PUBLIC Mooncake::liburing)
 endif()
 if(CUDAToolkit_FOUND)
   target_link_libraries(mooncake_store PRIVATE CUDA::cudart)

@@ -362,7 +362,8 @@ struct FileStorageConfig {
 
 class StorageBackendInterface {
    public:
-    StorageBackendInterface(const FileStorageConfig& file_storage_config);
+    explicit StorageBackendInterface(const FileStorageConfig& config)
+        : file_storage_config_(config) {}
     virtual ~StorageBackendInterface() = default;
 
     using EvictionHandler = std::function<tl::expected<void, ErrorCode>(
