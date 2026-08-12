@@ -86,6 +86,17 @@ class PromotionOnHitTest : public ::testing::Test {
         return service->promotion_in_flight_.load(std::memory_order_relaxed);
     }
 
+    static bool HasPromotionTaskForTesting(MasterService* service,
+                                           const TenantId& tenant_id,
+                                           const std::string& key) {
+        MasterService::MetadataAccessorRO accessor(
+            service, MasterService::ObjectIdentity{.tenant_id = tenant_id,
+                                                   .user_key = key});
+        const auto* tenant_state = accessor.GetTenantState();
+        return tenant_state != nullptr &&
+               tenant_state->promotion_tasks.contains(key);
+    }
+
     static bool PromotionAdmissionBlockedByPrimaryWriteForTesting(
         MasterService* service, const TenantId& tenant_id,
         const std::string& key) {
@@ -592,6 +603,17 @@ TEST_F(PromotionOnHitTest, StalePromotionReplicaCleanupErasesTask) {
     ASSERT_TRUE(
         service->UnmountSegment(target_segment.id, target_id).has_value());
 
+    constexpr auto kCleanupTimeout = std::chrono::seconds(5);
+    constexpr auto kPollInterval = std::chrono::milliseconds(10);
+    const auto cleanup_deadline =
+        std::chrono::steady_clock::now() + kCleanupTimeout;
+    while (HasPromotionTaskForTesting(service.get(), TenantId::Default(),
+                                      "k_cold") &&
+           std::chrono::steady_clock::now() < cleanup_deadline) {
+        std::this_thread::sleep_for(kPollInterval);
+    }
+    ASSERT_FALSE(HasPromotionTaskForTesting(service.get(), TenantId::Default(),
+                                            "k_cold"));
     EXPECT_EQ(GetPromotionInFlightForTesting(service.get()), 0u);
     EXPECT_EQ(metrics.get_promotion_cancelled() - cancelled_before, 1);
     auto pending = service->PromotionObjectHeartbeat(holder_id);
