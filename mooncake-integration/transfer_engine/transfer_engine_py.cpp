@@ -23,7 +23,9 @@
 #include "transport/rpc_communicator/rpc_interface.h"
 
 #ifdef USE_TENT
+#include "tent/common/config.h"
 #include "tent/common/types.h"
+#include "tent/transfer_engine.h"
 #endif
 
 #ifdef USE_EFA
@@ -1068,39 +1070,39 @@ uintptr_t TransferEnginePy::getFirstBufferAddress(
 std::string TransferEnginePy::getLocalTopology(const char* device_name) {
     pybind11::gil_scoped_release release;
     auto device_name_safe = device_name ? std::string(device_name) : "";
-    auto device_filter = buildDeviceFilter(device_name_safe);
 
-    // Under TENT, classic constructor filters are ignored; map device_name to
-    // MC_TE_FILTERS so topology discovery respects the whitelist.
-    std::string saved_filters;
-    bool restore_filters = false;
     const bool use_tent =
         getenv("MC_USE_TENT") != nullptr || getenv("MC_USE_TEV1") != nullptr;
-    if (use_tent && !device_name_safe.empty()) {
-        const char* old = getenv("MC_TE_FILTERS");
-        if (old) saved_filters = old;
-        setenv("MC_TE_FILTERS", device_name_safe.c_str(), 1);
-        restore_filters = true;
+#ifdef USE_TENT
+    if (use_tent) {
+        // The classic shim (TransferEngine(true, filter)) silently drops the
+        // filter on the TENT path and builds its own Config in init(), so
+        // inject the whitelist via the per-instance Config that TENT's public
+        // constructor already accepts. Avoids touching the process-global
+        // MC_TE_FILTERS env var (racey under concurrent callers, leaked on
+        // throw). Note: if MC_TE_FILTERS is also set in env, loadFromEnv()
+        // inside TransferEngineImpl will override this — env takes priority.
+        auto conf = std::make_shared<mooncake::tent::Config>();
+        conf->set("metadata_type", "p2p");
+        if (!device_name_safe.empty()) {
+            conf->set("topology/rdma_whitelist",
+                      std::vector<std::string>{device_name_safe});
+        }
+        mooncake::tent::TransferEngine tent_engine(conf);
+        return tent_engine.available() ? tent_engine.getLocalTopologyString()
+                                       : "{}";
     }
+#else
+    (void)use_tent;
+#endif
 
+    // Classic path: device_filter is honored by classic TransferEngineImpl.
+    auto device_filter = buildDeviceFilter(device_name_safe);
     std::shared_ptr<TransferEngine> tmp_engine =
         std::make_shared<TransferEngine>(true, device_filter);
-
     std::string metadata_conn_string{"P2PHANDSHAKE"}, local_server_name{};
     tmp_engine->init(metadata_conn_string, local_server_name);
-
-    // Under TENT this returns native {"nics","mems"} with rank0/1/2; under
-    // classic TE it returns the priority-matrix JSON.
-    std::string result = tmp_engine->getLocalTopologyString();
-
-    if (restore_filters) {
-        if (saved_filters.empty()) {
-            unsetenv("MC_TE_FILTERS");
-        } else {
-            setenv("MC_TE_FILTERS", saved_filters.c_str(), 1);
-        }
-    }
-    return result;
+    return tmp_engine->getLocalTopologyString();
 }
 
 std::vector<TransferEnginePy::TransferNotify> TransferEnginePy::getNotifies() {
