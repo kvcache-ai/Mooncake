@@ -24,6 +24,37 @@ from sglang.test.test_utils import (
 
 DEFAULT_MHA_MODEL_NAME_FOR_TEST = "Qwen/Qwen3-8B"
 
+CGROUP_MEMORY_FILES = (
+    "/sys/fs/cgroup/memory.current",
+    "/sys/fs/cgroup/memory.peak",
+    "/sys/fs/cgroup/memory.max",
+    "/sys/fs/cgroup/memory.events",
+    "/sys/fs/cgroup/memory.events.local",
+    "/sys/fs/cgroup/memory.swap.current",
+    "/sys/fs/cgroup/memory.swap.max",
+    "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+    "/sys/fs/cgroup/memory/memory.max_usage_in_bytes",
+    "/sys/fs/cgroup/memory/memory.limit_in_bytes",
+    "/sys/fs/cgroup/memory/memory.failcnt",
+)
+
+DIAGNOSTIC_FILES = (
+    "/proc/meminfo",
+    "/proc/pressure/memory",
+    *CGROUP_MEMORY_FILES,
+)
+
+DIAGNOSTIC_COMMANDS = (
+    ("system memory", ["free", "-h"], None),
+    (
+        "largest processes",
+        ["ps", "-eo", "pid,ppid,stat,rss,vsz,comm,args", "--sort=-rss"],
+        25,
+    ),
+    ("ROCm VRAM", ["rocm-smi", "--showmeminfo", "vram", "--json"], None),
+    ("ROCm utilization", ["rocm-smi", "--showuse", "--json"], None),
+)
+
 
 class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
     """Base mixin class with common setup and utilities"""
@@ -35,6 +66,54 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
     @classmethod
     def _get_model_name(cls):
         return DEFAULT_MHA_MODEL_NAME_FOR_TEST
+
+    @classmethod
+    def _dump_server_failure_diagnostics(cls):
+        """Print resource state after an unexpected SGLang server exit."""
+        print("\n===== SGLang server failure diagnostics =====")
+        print(f"test_class={cls.__name__} model={getattr(cls, 'model', 'unknown')}")
+
+        for path in DIAGNOSTIC_FILES:
+            if not os.path.isfile(path):
+                continue
+            print(f"\n--- {path} ---")
+            try:
+                with open(path) as diagnostic_file:
+                    print(diagnostic_file.read().rstrip())
+            except OSError as error:
+                print(f"Unable to read {path}: {error}")
+
+        for label, command, max_lines in DIAGNOSTIC_COMMANDS:
+            print(f"\n--- {label}: {' '.join(command)} ---")
+            try:
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    timeout=15,
+                    check=False,
+                )
+            except (FileNotFoundError, subprocess.SubprocessError) as error:
+                print(f"Unable to run diagnostic command: {error}")
+                continue
+
+            output = "\n".join(
+                part.rstrip() for part in (result.stdout, result.stderr) if part
+            )
+            if max_lines is not None:
+                output = "\n".join(output.splitlines()[:max_lines])
+            print(output or "<no output>")
+            print(f"returncode={result.returncode}")
+
+        print("===== End SGLang server failure diagnostics =====\n")
+
+    @classmethod
+    def _launch_server_with_hicache(cls):
+        try:
+            return super()._launch_server_with_hicache()
+        except Exception:
+            cls._dump_server_failure_diagnostics()
+            raise
 
     @classmethod
     def setUpClass(cls):
@@ -212,6 +291,8 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
             "MOONCAKE_DEVICE": "",
             "MOONCAKE_TE_META_DATA_SERVER": f"http://127.0.0.1:{cls.mooncake_metadata_port}/metadata",
             "MOONCAKE_GLOBAL_SEGMENT_SIZE": "4294967296",  # 4 GiB
+            "PYTHONFAULTHANDLER": "1",
+            "PYTHONUNBUFFERED": "1",
         }
 
         return server_args, env_vars
