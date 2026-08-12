@@ -41,6 +41,8 @@ struct IbgdaOps {
     static constexpr bool kIsNccl = false;
     static constexpr int kNumQPs = MAX_QP_COUNT;
     static constexpr int kAggregateRequests = 0;
+    // Preserve the established IPC + IBGDA tail-publication granularity.
+    static constexpr int kScaleoutUpdateInterval = 3;
 #ifdef MOONCAKE_EP_USE_MUSA
     static constexpr int kNumDispatchWarps = 4;
     static constexpr int kNumDispatchEpilogueWarps = 4;
@@ -320,6 +322,8 @@ struct NcclOps {
     static constexpr bool kIsNccl = true;
     static constexpr int kNumQPs = 65;
     static constexpr int kAggregateRequests = ncclGinOptFlagsAggregateRequests;
+    // Match current DeepEP v2 NCCL rail tail batching.
+    static constexpr int kScaleoutUpdateInterval = 6;
     static constexpr int kNumDispatchWarps = 27;
     static constexpr int kNumDispatchEpilogueWarps = 27;
     static constexpr int kNumCombineWarps = 28;

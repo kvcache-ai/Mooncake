@@ -26,7 +26,7 @@ template <
     int kNumChannels = kNumScaleoutWarps * kNumSMs,
     int kNumMaxTokensPerChannel = math::constexpr_ceil_div(kNumMaxTokensPerRank,
                                                            kNumChannels),
-    int kScaleoutUpdateInterval = 6,
+    int kScaleoutUpdateInterval = Ops::kScaleoutUpdateInterval,
     int kNumSlotsPerForwardChunk = kScaleoutUpdateInterval,
     int kNumRanks = kNumScaleoutRanks * kNumScaleupRanks,
     int kNumNotifyThreads = kNumNotifyWarps * 32,
