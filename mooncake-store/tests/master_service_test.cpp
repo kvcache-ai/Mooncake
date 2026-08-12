@@ -88,6 +88,15 @@ class MasterServiceTest : public ::testing::Test {
     static constexpr size_t kDefaultSegmentSize = 1024 * 1024 * 16;
     static constexpr uint64_t kStrictTenantQuotaBytes = 4 * 1024 * 1024;
 
+    void PauseReplicaCleanup(MasterService& service) {
+        service.replica_cleanup_worker_.Stop();
+    }
+
+    void ResumeReplicaCleanup(MasterService& service) {
+        service.replica_cleanup_worker_.Start();
+        service.replica_cleanup_worker_.Schedule();
+    }
+
     std::optional<std::chrono::system_clock::time_point> GetSoftPinDeadline(
         MasterService& service, const std::string& key,
         const std::string& tenant_id = "default") {
@@ -4270,17 +4279,41 @@ TEST_F(MasterServiceTest, UnmountSegmentHidesReplicasBeforeAsyncCleanup) {
     ReplicateConfig config;
     config.replica_num = 1;
 
+    PauseReplicaCleanup(*service_);
+
     // Unmount segment1. The allocator becomes unavailable synchronously while
     // physical metadata cleanup runs on the background worker.
     auto unmount_result1 = service_->UnmountSegment(segment1.id, client_id);
     ASSERT_TRUE(unmount_result1.has_value());
 
-    // Query paths must not expose the unavailable replica, even if the worker
-    // has not removed its metadata yet.
+    // Query paths must not expose the unavailable replica while its physical
+    // metadata is still waiting for background cleanup.
+    ASSERT_EQ(2u, service_->GetKeyCount());
     auto get_result1 = service_->GetReplicaList(key1, TenantId::Default());
     ASSERT_FALSE(get_result1.has_value());
-    EXPECT_TRUE(get_result1.error() == ErrorCode::OBJECT_NOT_FOUND ||
-                get_result1.error() == ErrorCode::REPLICA_IS_NOT_READY);
+    EXPECT_EQ(ErrorCode::OBJECT_NOT_FOUND, get_result1.error());
+
+    auto exists1 = service_->ExistKey(key1, TenantId::Default());
+    ASSERT_TRUE(exists1.has_value());
+    EXPECT_FALSE(*exists1);
+    auto exists2 = service_->ExistKey(key2, TenantId::Default());
+    ASSERT_TRUE(exists2.has_value());
+    EXPECT_TRUE(*exists2);
+
+    auto batch_exists =
+        service_->BatchExistKey({key1, key2}, TenantId::Default());
+    ASSERT_EQ(2u, batch_exists.size());
+    ASSERT_TRUE(batch_exists[0].has_value());
+    EXPECT_FALSE(*batch_exists[0]);
+    ASSERT_TRUE(batch_exists[1].has_value());
+    EXPECT_TRUE(*batch_exists[1]);
+
+    auto all_keys = service_->GetAllKeys(TenantId::Default());
+    ASSERT_TRUE(all_keys.has_value());
+    EXPECT_EQ(all_keys->end(),
+              std::find(all_keys->begin(), all_keys->end(), key1));
+    EXPECT_NE(all_keys->end(),
+              std::find(all_keys->begin(), all_keys->end(), key2));
 
     // Verify objects in segment2 is still there
     auto get_result2 = service_->GetReplicaList(key2, TenantId::Default());
@@ -4288,6 +4321,7 @@ TEST_F(MasterServiceTest, UnmountSegmentHidesReplicasBeforeAsyncCleanup) {
 
     // The worker eventually removes the old physical metadata, after which
     // the same key can be inserted again.
+    ResumeReplicaCleanup(*service_);
     for (size_t i = 0; i < 100 && service_->GetKeyCount() != 1; ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }

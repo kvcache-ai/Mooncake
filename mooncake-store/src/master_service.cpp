@@ -2745,6 +2745,9 @@ auto MasterService::GetAllKeys(const TenantId& tenant_id)
             continue;
         }
         for (const auto& item : tenant_it->second.metadata) {
+            if (!item.second.IsValid()) {
+                continue;
+            }
             all_keys.push_back(item.second.user_key.empty()
                                    ? item.first
                                    : item.second.user_key);
