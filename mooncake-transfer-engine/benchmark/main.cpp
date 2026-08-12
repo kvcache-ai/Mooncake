@@ -22,7 +22,25 @@
 #include "tent_backend.h"
 #endif
 
+#include <atomic>
+#include <mutex>
+#include <thread>
+
 using namespace mooncake::tent;
+
+namespace {
+
+uint64_t steadyClockNs() {
+    const auto now = std::chrono::steady_clock::now().time_since_epoch();
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
+}
+
+double gbPerSecond(uint64_t bytes, double duration_us) {
+    if (duration_us <= 0.0) return 0.0;
+    return static_cast<double>(bytes) / (1000.0 * duration_us);
+}
+
+}  // namespace
 
 int processBatchSizes(
     BenchRunner& runner, size_t block_size, size_t batch_size, int num_threads,
@@ -46,6 +64,17 @@ int processBatchSizes(
     XferBenchStats tight_stats;
     XferBenchStats loose_stats;
     std::mutex mutex;
+    std::atomic<int> measurement_ready{0};
+    std::atomic<bool> measurement_started{false};
+    auto paceRequest = [&]() {
+        if (XferBenchConfig::request_interval_us == 0) return;
+        const uint64_t interval_ns =
+            XferBenchConfig::request_interval_us * 1000ull;
+        const uint64_t target_ns = steadyClockNs() + interval_ns;
+        while (steadyClockNs() < target_ns) {
+            std::this_thread::yield();
+        }
+    };
     size_t address_stride_bytes =
         XferBenchConfig::max_block_size * XferBenchConfig::max_batch_size;
     if (!workload_classes.empty()) {
@@ -94,24 +123,41 @@ int processBatchSizes(
                                      thread_batch_size, opcode, deadlineNs(),
                                      intent_type);
         }
+        if (measurement_ready.fetch_add(1, std::memory_order_acq_rel) + 1 ==
+            num_threads) {
+            measurement_started.store(true, std::memory_order_release);
+        } else {
+            while (!measurement_started.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+        }
         timer.reset();
         std::vector<double> transfer_duration;
+        std::vector<double> thread_instant_bandwidth;
         if (mixed_opcode) {
             while (timer.lap_us(false) <
                    XferBenchConfig::duration * 1000000ull) {
+                const uint64_t batch_bytes =
+                    thread_block_size * thread_batch_size;
                 uint8_t pattern = 0;
                 if (XferBenchConfig::check_consistency)
                     pattern = fillData((void*)local_addr,
                                        thread_block_size * thread_batch_size);
+                paceRequest();
                 auto val = runner.runSingleTransfer(
                     local_addr, target_addr, thread_block_size,
                     thread_batch_size, WRITE, deadlineNs(), intent_type);
+                thread_instant_bandwidth.push_back(gbPerSecond(batch_bytes,
+                                                               val));
                 transfer_duration.push_back(val);
                 fillData((void*)local_addr,
                          thread_block_size * thread_batch_size);
+                paceRequest();
                 val = runner.runSingleTransfer(
                     local_addr, target_addr, thread_block_size,
                     thread_batch_size, READ, deadlineNs(), intent_type);
+                thread_instant_bandwidth.push_back(gbPerSecond(batch_bytes,
+                                                               val));
                 if (XferBenchConfig::check_consistency)
                     verifyData((void*)local_addr,
                                thread_block_size * thread_batch_size, pattern);
@@ -120,9 +166,14 @@ int processBatchSizes(
         } else {
             while (timer.lap_us(false) <
                    XferBenchConfig::duration * 1000000ull) {
+                const uint64_t batch_bytes =
+                    thread_block_size * thread_batch_size;
+                paceRequest();
                 auto val = runner.runSingleTransfer(
                     local_addr, target_addr, thread_block_size,
                     thread_batch_size, opcode, deadlineNs(), intent_type);
+                thread_instant_bandwidth.push_back(gbPerSecond(batch_bytes,
+                                                               val));
                 transfer_duration.push_back(val);
             }
         }
@@ -130,6 +181,7 @@ int processBatchSizes(
         std::lock_guard<std::mutex> lock(mutex);
         stats.total_duration.add(total_duration);
         stats.transfer_duration.add(transfer_duration);
+        stats.instant_bandwidth.add(thread_instant_bandwidth);
         if (qos_enabled) {
             qos_stats[qos_class].total_duration.add(total_duration);
             qos_stats[qos_class].transfer_duration.add(transfer_duration);
