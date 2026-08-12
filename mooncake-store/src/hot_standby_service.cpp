@@ -654,19 +654,19 @@ bool HotStandbyService::ExportStandbySnapshot(StandbySnapshot& out) const {
 std::optional<BatchOpLogSnapshotCapture>
 HotStandbyService::BeginBatchOpLogSnapshotCapture() {
     std::unique_lock<std::mutex> service_lock(mutex_);
-    std::unique_lock<std::mutex> capture_lock(snapshot_capture_mutex_);
-    if (!IsRunning() || !batch_standby_reader_ || snapshot_capture_requested_ ||
-        snapshot_capture_active_) {
+    auto state = snapshot_capture_state_;
+    std::unique_lock<std::mutex> capture_lock(state->mutex);
+    if (!IsRunning() || !batch_standby_reader_ || state->requested ||
+        state->active) {
         return std::nullopt;
     }
 
-    ++snapshot_capture_generation_;
-    snapshot_capture_requested_ = true;
+    ++state->generation;
+    state->requested = true;
     service_lock.unlock();
     replication_loop_cv_.notify_all();
-    snapshot_capture_cv_.wait(capture_lock,
-                              [this] { return !snapshot_capture_requested_; });
-    if (!ready_snapshot_capture_ || !snapshot_capture_active_) {
+    state->cv.wait(capture_lock, [&state] { return !state->requested; });
+    if (!ready_snapshot_capture_ || !state->active) {
         return std::nullopt;
     }
 
@@ -678,10 +678,10 @@ HotStandbyService::BeginBatchOpLogSnapshotCapture() {
 bool HotStandbyService::CopyNextBatchOpLogSnapshotChunk(
     size_t count, BatchOpLogSnapshotCapture& capture,
     std::vector<StandbyObjectEntry>& out) {
-    std::lock_guard<std::mutex> lock(snapshot_capture_mutex_);
-    if (!snapshot_capture_active_ ||
-        capture.generation_ != snapshot_capture_generation_ ||
-        !metadata_store_) {
+    auto state = snapshot_capture_state_;
+    std::lock_guard<std::mutex> lock(state->mutex);
+    if (capture.lease_state_ != state || !state->active ||
+        capture.generation_ != state->generation || !metadata_store_) {
         out.clear();
         return false;
     }
@@ -690,22 +690,20 @@ bool HotStandbyService::CopyNextBatchOpLogSnapshotChunk(
 
 void HotStandbyService::EndBatchOpLogSnapshotCapture(
     BatchOpLogSnapshotCapture& capture) {
-    std::lock_guard<std::mutex> lock(snapshot_capture_mutex_);
-    if (snapshot_capture_active_ &&
-        capture.generation_ == snapshot_capture_generation_) {
-        snapshot_capture_active_ = false;
-        snapshot_capture_cv_.notify_all();
+    if (capture.lease_state_ == snapshot_capture_state_) {
+        capture.Release();
     }
 }
 
 void HotStandbyService::HandleSnapshotCaptureRequest(
     const OpLogBatchStandbyPollResult& result) {
-    std::unique_lock<std::mutex> lock(snapshot_capture_mutex_);
-    if (!snapshot_capture_requested_) {
+    auto state = snapshot_capture_state_;
+    std::unique_lock<std::mutex> lock(state->mutex);
+    if (!state->requested) {
         return;
     }
 
-    snapshot_capture_requested_ = false;
+    state->requested = false;
     auto applied_prefix = batch_standby_reader_->GetLastAppliedDurablePrefix();
     const uint64_t expected = oplog_applier_->GetExpectedSequenceId();
     const bool consistent =
@@ -717,25 +715,31 @@ void HotStandbyService::HandleSnapshotCaptureRequest(
             applied_prefix->last_seq, applied_prefix->batch_id,
             applied_prefix->producer_view_version,
             oplog_applier_->GetSegmentRegistry().GetAllSegments(),
-            metadata_store_->BeginSnapshotTraversal(),
-            snapshot_capture_generation_);
+            metadata_store_->BeginSnapshotTraversal(), state->generation,
+            state);
         ready_snapshot_capture_ = std::move(capture);
-        snapshot_capture_active_ = true;
+        state->active = true;
     }
-    snapshot_capture_cv_.notify_all();
+    state->cv.notify_all();
 
-    snapshot_capture_cv_.wait(lock, [this] {
-        return !snapshot_capture_active_ ||
+    state->cv.wait(lock, [this, &state] {
+        return !state->active ||
                !replication_loop_running_.load(std::memory_order_acquire);
     });
 }
 
 void HotStandbyService::CancelSnapshotCapture() {
-    std::lock_guard<std::mutex> lock(snapshot_capture_mutex_);
-    snapshot_capture_requested_ = false;
-    snapshot_capture_active_ = false;
-    ready_snapshot_capture_.reset();
-    snapshot_capture_cv_.notify_all();
+    auto state = snapshot_capture_state_;
+    std::optional<BatchOpLogSnapshotCapture> ready_capture;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->requested = false;
+        state->active = false;
+        ready_capture = std::move(ready_snapshot_capture_);
+        ready_snapshot_capture_.reset();
+        state->cv.notify_all();
+    }
+    ready_capture.reset();
 }
 
 void HotStandbyService::SetSnapshotProvider(

@@ -544,7 +544,8 @@ TEST_F(HotStandbyServiceTest, TestExportStandbySnapshot_Empty) {
     EXPECT_TRUE(snapshot.segments.empty());
 }
 
-TEST_F(HotStandbyServiceTest, SnapshotCaptureFreezesApplyUntilEnded) {
+TEST_F(HotStandbyServiceTest,
+       SnapshotCaptureLeaseTransfersAndReleasesOnDestruction) {
     auto backend = std::make_shared<FakeCaptureHaKvBackend>();
     SegmentMountOp mount;
     mount.segment_name = "segment-1";
@@ -580,10 +581,18 @@ TEST_F(HotStandbyServiceTest, SnapshotCaptureFreezesApplyUntilEnded) {
     EXPECT_EQ(mount.transport_endpoint,
               capture->segments[0].transport_endpoint);
 
-    std::vector<StandbyObjectEntry> chunk;
-    ASSERT_TRUE(service_->CopyNextBatchOpLogSnapshotChunk(2, *capture, chunk));
-    EXPECT_TRUE(chunk.empty());
+    std::optional<BatchOpLogSnapshotCapture> capture_owner(std::move(*capture));
     EXPECT_TRUE(capture->done());
+    std::vector<StandbyObjectEntry> moved_from_chunk;
+    EXPECT_FALSE(service_->CopyNextBatchOpLogSnapshotChunk(1, *capture,
+                                                           moved_from_chunk));
+    capture.reset();
+
+    std::vector<StandbyObjectEntry> chunk;
+    ASSERT_TRUE(
+        service_->CopyNextBatchOpLogSnapshotChunk(2, *capture_owner, chunk));
+    EXPECT_TRUE(chunk.empty());
+    EXPECT_TRUE(capture_owner->done());
 
     ASSERT_EQ(ErrorCode::OK,
               backend->Put(BuildBatchRecordKey(cluster_id_, 2),
@@ -596,7 +605,7 @@ TEST_F(HotStandbyServiceTest, SnapshotCaptureFreezesApplyUntilEnded) {
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     EXPECT_EQ(1u, service_->GetLatestAppliedSequenceId());
 
-    service_->EndBatchOpLogSnapshotCapture(*capture);
+    capture_owner.reset();
     for (int i = 0; i < 100 && service_->GetLatestAppliedSequenceId() != 2;
          ++i) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));

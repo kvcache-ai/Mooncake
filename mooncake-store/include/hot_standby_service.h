@@ -269,11 +269,9 @@ class HotStandbyService {
     std::mutex replication_loop_mutex_;
     std::condition_variable replication_loop_cv_;
 
-    std::condition_variable snapshot_capture_cv_;
-    std::mutex snapshot_capture_mutex_;
-    bool snapshot_capture_requested_{false};
-    bool snapshot_capture_active_{false};
-    uint64_t snapshot_capture_generation_{0};
+    std::shared_ptr<BatchOpLogSnapshotCapture::LeaseState>
+        snapshot_capture_state_{
+            std::make_shared<BatchOpLogSnapshotCapture::LeaseState>()};
     std::optional<BatchOpLogSnapshotCapture> ready_snapshot_capture_;
 
     // Synchronization
