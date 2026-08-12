@@ -36,6 +36,7 @@ namespace mooncake::test {
 class FakeBatchHaKvBackend : public HaKvBackend {
    public:
     ErrorCode Get(std::string_view key, std::string& value) override {
+        std::lock_guard<std::mutex> lock(mutex_);
         auto it = kvs_.find(std::string(key));
         if (it == kvs_.end()) {
             return ErrorCode::ETCD_KEY_NOT_EXIST;
@@ -45,12 +46,14 @@ class FakeBatchHaKvBackend : public HaKvBackend {
     }
 
     ErrorCode Put(std::string_view key, std::string_view value) override {
+        std::lock_guard<std::mutex> lock(mutex_);
         kvs_[std::string(key)] = std::string(value);
         return ErrorCode::OK;
     }
 
     ErrorCode Range(std::string_view begin_key, std::string_view end_key,
                     size_t limit, std::vector<KvPair>& kvs) override {
+        std::lock_guard<std::mutex> lock(mutex_);
         kvs.clear();
         for (auto it = kvs_.lower_bound(std::string(begin_key));
              it != kvs_.end() && it->first < end_key; ++it) {
@@ -65,6 +68,7 @@ class FakeBatchHaKvBackend : public HaKvBackend {
     bool SupportsTxn() const override { return true; }
 
     ErrorCode Txn(const KvTxn& txn) override {
+        std::lock_guard<std::mutex> lock(mutex_);
         for (const auto& compare : txn.compares) {
             auto it = kvs_.find(compare.key);
             if (compare.kind == KvCompareKind::kKeyNotExists) {
@@ -83,6 +87,7 @@ class FakeBatchHaKvBackend : public HaKvBackend {
     }
 
    private:
+    std::mutex mutex_;
     std::map<std::string, std::string> kvs_;
 };
 
