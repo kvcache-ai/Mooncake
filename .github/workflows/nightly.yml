@@ -286,6 +286,9 @@ jobs:
 
       - name: Run CTest unit tests
         run: |
+          # Keep ephemeral TIME_WAIT sockets off mooncake_client's RPC port.
+          reserved_ports=$(sysctl -n net.ipv4.ip_local_reserved_ports)
+          sudo sysctl -w "net.ipv4.ip_local_reserved_ports=${reserved_ports:+$reserved_ports,}50052"
           cd build
           export LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}:/usr/local/lib
           MC_METADATA_SERVER=http://127.0.0.1:8080/metadata \
