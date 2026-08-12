@@ -509,8 +509,8 @@ class SegmentManager {
     /**
      * @brief Return aggregate DRAM usage in O(1) without segment_mutex_.
      *
-     * Best-effort: used/capacity may tear briefly across mount/unmount, matching
-     * the previous metric-gauge watermark reads.
+     * Best-effort: used/capacity may tear briefly across mount/unmount,
+     * matching the previous metric-gauge watermark reads.
      */
     [[nodiscard]] StorageUsage GetMemoryUsage() const noexcept {
         return usage_tracker_->GetUsage();
@@ -606,8 +606,8 @@ class NoFSegmentManager {
     /**
      * @brief Return aggregate NoF usage in O(1) without segment_mutex_.
      *
-     * Best-effort: used/capacity may tear briefly across mount/unmount, matching
-     * the previous metric-gauge watermark reads.
+     * Best-effort: used/capacity may tear briefly across mount/unmount,
+     * matching the previous metric-gauge watermark reads.
      */
     [[nodiscard]] StorageUsage GetUsage() const noexcept {
         return usage_tracker_->GetUsage();
