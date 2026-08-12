@@ -136,6 +136,14 @@ DistributedStorageConfig MakeAllocatorConfig(const std::string& mount_path,
     return config;
 }
 
+std::vector<DfsGlobalAllocator::EvictionCandidate>
+PrepareAndCommitPreparedEviction(DfsGlobalAllocator& allocator) {
+    auto pending = allocator.PrepareEviction();
+    auto candidates = pending.Candidates();
+    allocator.CommitPreparedEviction(std::move(pending));
+    return candidates;
+}
+
 class FsAdapterFdTest : public ::testing::Test {
    protected:
     void SetUp() override {
@@ -435,12 +443,91 @@ TEST(DfsGlobalAllocatorTest, ExhaustionAndEviction) {
     EXPECT_FALSE(exhausted.has_value());
     EXPECT_EQ(exhausted.error(), ErrorCode::NO_AVAILABLE_HANDLE);
 
-    auto evicted = alloc.EvictIfNeeded();
+    auto pending = alloc.PrepareEviction();
+    auto evicted = pending.Candidates();
     ASSERT_FALSE(evicted.empty());
     EXPECT_EQ(evicted.front().key, "k0");
 
+    // Prepare only reserves candidates; their extents are not reusable until
+    // the master accepts and commits the transaction.
+    auto before_commit = alloc.Allocate("k_before_commit", 100);
+    EXPECT_FALSE(before_commit.has_value());
+
+    alloc.CommitPreparedEviction(std::move(pending));
+
     auto after_evict = alloc.Allocate("k_after_evict", 100);
     EXPECT_TRUE(after_evict.has_value());
+}
+
+TEST(DfsGlobalAllocatorTest, RestorePreparedEvictionPreservesCandidateOrder) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    env.Set("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", "0.9");
+    env.Set("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", "0.7");
+    TempDir tmp("dfs_abort_eviction");
+
+    DfsGlobalAllocator alloc;
+    ASSERT_TRUE(
+        alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 32 * 1024, 4096)));
+
+    for (int i = 0; i < 4; ++i) {
+        const std::string key = "k" + std::to_string(i);
+        auto desc = alloc.Allocate(key, 100);
+        ASSERT_TRUE(desc.has_value()) << "allocation " << i;
+        alloc.UpdateAccess(key, desc->shard_idx, desc->offset);
+    }
+
+    auto pending = alloc.PrepareEviction();
+    ASSERT_EQ(pending.Candidates().size(), 2);
+    EXPECT_EQ(pending.Candidates()[0].key, "k0");
+    EXPECT_EQ(pending.Candidates()[1].key, "k1");
+    alloc.RestorePreparedEviction(std::move(pending));
+
+    auto retry = alloc.PrepareEviction();
+    ASSERT_EQ(retry.Candidates().size(), 2);
+    EXPECT_EQ(retry.Candidates()[0].key, "k0");
+    EXPECT_EQ(retry.Candidates()[1].key, "k1");
+    alloc.RestorePreparedEviction(std::move(retry));
+}
+
+TEST(DfsGlobalAllocatorTest, PartialResolutionContinuesToLowWatermark) {
+    EnvGuard env;
+    ConfigurePosixDfs(env);
+    env.Set("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK", "0.9");
+    env.Set("MOONCAKE_DFS_EVICTION_LOW_WATERMARK", "0.7");
+    TempDir tmp("dfs_partial_eviction");
+
+    DfsGlobalAllocator alloc;
+    ASSERT_TRUE(
+        alloc.Init(MakeAllocatorConfig(tmp.path(), 1, 32 * 1024, 4096)));
+
+    std::vector<DistributedFSDescriptor> descs;
+    for (int i = 0; i < 4; ++i) {
+        const std::string key = "k" + std::to_string(i);
+        auto desc = alloc.Allocate(key, 100);
+        ASSERT_TRUE(desc.has_value()) << "allocation " << i;
+        alloc.UpdateAccess(key, desc->shard_idx, desc->offset);
+        descs.push_back(*desc);
+    }
+
+    auto pending = alloc.PrepareEviction();
+    ASSERT_EQ(pending.Candidates().size(), 2);
+    EXPECT_EQ(pending.Candidates()[0].key, "k0");
+    EXPECT_EQ(pending.Candidates()[1].key, "k1");
+
+    alloc.ResolvePreparedEviction(std::move(pending), {true, false});
+    alloc.UpdateAccess("k1", descs[1].shard_idx, descs[1].offset);
+
+    // Accepting only k0 drops usage below the high watermark but not the low
+    // watermark. The same active eviction cycle must therefore continue and
+    // reach k2 behind the restored, protected k1.
+    auto continuation = alloc.PrepareEviction();
+    ASSERT_EQ(continuation.Candidates().size(), 1);
+    EXPECT_EQ(continuation.Candidates().front().key, "k2");
+    alloc.CommitPreparedEviction(std::move(continuation));
+
+    auto complete = alloc.PrepareEviction();
+    EXPECT_TRUE(complete.Empty());
 }
 
 TEST(DfsGlobalAllocatorTest, EvictionCountsPendingFreeTowardWatermarks) {
@@ -462,12 +549,12 @@ TEST(DfsGlobalAllocatorTest, EvictionCountsPendingFreeTowardWatermarks) {
         alloc.UpdateAccess(key, desc->shard_idx, desc->offset);
     }
 
-    auto evicted = alloc.EvictIfNeeded();
+    auto evicted = PrepareAndCommitPreparedEviction(alloc);
     ASSERT_EQ(evicted.size(), 2);
     EXPECT_EQ(evicted[0].key, "k0");
     EXPECT_EQ(evicted[1].key, "k1");
 
-    auto repeated = alloc.EvictIfNeeded();
+    auto repeated = PrepareAndCommitPreparedEviction(alloc);
     EXPECT_TRUE(repeated.empty());
 
     auto before_release = alloc.Allocate("k_before_release", 100);
@@ -494,7 +581,7 @@ TEST(DfsGlobalAllocatorTest, FreeRemovesLruEntryBeforeOffsetReuse) {
     ASSERT_EQ(desc_b->offset, desc_a->offset);
     alloc.UpdateAccess("B", desc_b->shard_idx, desc_b->offset);
 
-    auto evicted = alloc.EvictIfNeeded();
+    auto evicted = PrepareAndCommitPreparedEviction(alloc);
     ASSERT_EQ(evicted.size(), 1);
     EXPECT_EQ(evicted.front().key, "B");
 }
@@ -520,7 +607,7 @@ TEST(DfsGlobalAllocatorTest, StaleFreeDoesNotReleaseReusedOffset) {
 
     alloc.Free(desc_a->offset, desc_a->aligned_size, desc_a->shard_idx, "A");
 
-    auto evicted = alloc.EvictIfNeeded();
+    auto evicted = PrepareAndCommitPreparedEviction(alloc);
     ASSERT_EQ(evicted.size(), 1);
     EXPECT_EQ(evicted.front().key, "B");
 }

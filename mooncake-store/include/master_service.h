@@ -165,6 +165,7 @@ class MasterService {
                                  double evict_ratio_lowerbound);
     void RunNoFBatchEvictForTesting(double evict_ratio_target,
                                     double evict_ratio_lowerbound);
+    void RunDfsEvictionForTesting();
 
     /**
      * @brief Mount a memory segment for buffer allocation. This function is
@@ -1586,8 +1587,7 @@ class MasterService {
         const std::chrono::system_clock::time_point& now);
     void FreeDfsReplicas(const std::string& key,
                          const std::vector<Replica>& replicas);
-    void RemoveDfsReplicaByOffset(const std::string& key, int shard_idx,
-                                  uint64_t offset);
+    void RunDfsEviction();
     void InitDfsAllocatorFromEnvironment();
     /**
      * @brief Helper to release space of expired discarded replicas.

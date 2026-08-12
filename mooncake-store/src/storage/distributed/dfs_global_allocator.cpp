@@ -5,6 +5,7 @@
 #include <iomanip>
 #include <limits>
 #include <sstream>
+#include <utility>
 
 #include "storage/distributed/distributed_storage_backend.h"
 #include "storage/distributed/fs_adapter.h"
@@ -16,13 +17,19 @@
 
 namespace mooncake {
 
-DfsGlobalAllocator::~DfsGlobalAllocator() {
-    {
-        std::lock_guard<std::mutex> lock(cv_mutex_);
-        running_.store(false, std::memory_order_release);
+DfsGlobalAllocator::PendingEviction::~PendingEviction() {
+    if (owner_ != nullptr) {
+        owner_->RestorePreparedEviction(std::move(*this));
     }
-    cv_.notify_all();
-    if (eviction_thread_.joinable()) eviction_thread_.join();
+}
+
+DfsGlobalAllocator::PendingEviction::PendingEviction(
+    PendingEviction&& other) noexcept
+    : owner_(std::exchange(other.owner_, nullptr)),
+      candidates_(std::move(other.candidates_)),
+      prepared_(std::move(other.prepared_)) {}
+
+DfsGlobalAllocator::~DfsGlobalAllocator() {
     if (fs_adapter_) fs_adapter_->Shutdown();
 }
 
@@ -103,11 +110,6 @@ tl::expected<void, ErrorCode> DfsGlobalAllocator::Init(
         shards_[i] = std::move(shard);
     }
 
-    running_.store(true, std::memory_order_release);
-    if (eviction_enabled_) {
-        eviction_thread_ =
-            std::thread(&DfsGlobalAllocator::EvictionMonitor, this);
-    }
     initialized_.store(true, std::memory_order_release);
     return {};
 }
@@ -187,6 +189,15 @@ void DfsGlobalAllocator::UpdateAccess(const std::string& key, int shard_idx,
 
     auto& shard = *shards_[shard_idx];
     std::lock_guard lru_lock(shard.lru_mutex);
+    {
+        std::shared_lock handle_lock(shard.handle_mutex);
+        auto handle_it = shard.offset_to_handle.find(offset);
+        if (handle_it == shard.offset_to_handle.end() ||
+            handle_it->second.key != key ||
+            handle_it->second.eviction_prepared) {
+            return;
+        }
+    }
     auto lru_it = shard.lru_index.find(key);
     if (lru_it != shard.lru_index.end()) {
         lru_it->second->second = offset;
@@ -198,20 +209,142 @@ void DfsGlobalAllocator::UpdateAccess(const std::string& key, int shard_idx,
     }
 }
 
-std::vector<DfsGlobalAllocator::EvictedKey>
-DfsGlobalAllocator::EvictIfNeeded() {
-    std::vector<EvictedKey> all_evicted;
-    if (!initialized_.load(std::memory_order_acquire)) return all_evicted;
+DfsGlobalAllocator::PendingEviction DfsGlobalAllocator::PrepareEviction() {
+    PendingEviction pending(this);
+    if (!initialized_.load(std::memory_order_acquire)) return pending;
+
     for (int i = 0; i < shard_count_; ++i) {
-        auto evicted = EvictFromShard(i);
-        all_evicted.insert(all_evicted.end(), evicted.begin(), evicted.end());
+        auto& shard = *shards_[i];
+        {
+            std::unique_lock handle_lock(shard.handle_mutex);
+            CleanupExpiredPendingFrees(shard, std::chrono::steady_clock::now());
+        }
+        PrepareEvictionFromShard(i, pending);
     }
-    return all_evicted;
+    return pending;
 }
 
-void DfsGlobalAllocator::SetEvictCallback(
-    std::function<void(const std::string&, int, uint64_t)> cb) {
-    on_evict_callback_ = std::move(cb);
+void DfsGlobalAllocator::CommitPreparedEviction(PendingEviction&& pending) {
+    if (pending.owner_ != this) return;
+
+    const auto free_at =
+        std::chrono::steady_clock::now() + deferred_free_duration_;
+    for (const auto& prepared : pending.prepared_) {
+        auto& shard = *shards_[prepared.candidate.shard_idx];
+        std::lock_guard handle_lock(shard.handle_mutex);
+        auto it = shard.offset_to_handle.find(prepared.candidate.offset);
+        if (it == shard.offset_to_handle.end() ||
+            it->second.key != prepared.candidate.key ||
+            it->second.handle != prepared.handle) {
+            // A concurrent metadata removal may already have called Free().
+            continue;
+        }
+
+        QueuePendingFree(shard, prepared.handle, prepared.bytes, free_at);
+        shard.offset_to_handle.erase(it);
+    }
+
+    pending.prepared_.clear();
+    pending.candidates_.clear();
+    pending.owner_ = nullptr;
+}
+
+void DfsGlobalAllocator::RestorePreparedEviction(PendingEviction&& pending) {
+    if (pending.owner_ != this) return;
+
+    // Candidates were removed oldest-first. Restore in reverse order so the
+    // original relative LRU order is preserved.
+    for (auto prepared_it = pending.prepared_.rbegin();
+         prepared_it != pending.prepared_.rend(); ++prepared_it) {
+        const auto& prepared = *prepared_it;
+        auto& shard = *shards_[prepared.candidate.shard_idx];
+        std::lock_guard lru_lock(shard.lru_mutex);
+        std::lock_guard handle_lock(shard.handle_mutex);
+
+        auto handle_it = shard.offset_to_handle.find(prepared.candidate.offset);
+        if (handle_it == shard.offset_to_handle.end() ||
+            handle_it->second.key != prepared.candidate.key ||
+            handle_it->second.handle != prepared.handle) {
+            // Free() or a replacement already retired this allocation.
+            continue;
+        }
+
+        handle_it->second.eviction_prepared = false;
+        if (shard.lru_index.find(prepared.candidate.key) ==
+            shard.lru_index.end()) {
+            shard.lru_list.push_back(
+                {prepared.candidate.key, prepared.candidate.offset});
+            shard.lru_index[prepared.candidate.key] =
+                std::prev(shard.lru_list.end());
+        }
+    }
+
+    pending.prepared_.clear();
+    pending.candidates_.clear();
+    pending.owner_ = nullptr;
+}
+
+void DfsGlobalAllocator::ResolvePreparedEviction(
+    PendingEviction&& pending, const std::vector<bool>& accepted) {
+    if (pending.owner_ != this) return;
+    if (accepted.size() != pending.prepared_.size()) {
+        LOG(ERROR) << "DFS eviction decision count " << accepted.size()
+                   << " does not match prepared candidate count "
+                   << pending.prepared_.size();
+        RestorePreparedEviction(std::move(pending));
+        return;
+    }
+
+    const auto free_at =
+        std::chrono::steady_clock::now() + deferred_free_duration_;
+    for (size_t i = 0; i < pending.prepared_.size(); ++i) {
+        if (!accepted[i]) continue;
+
+        const auto& prepared = pending.prepared_[i];
+        auto& shard = *shards_[prepared.candidate.shard_idx];
+        std::lock_guard handle_lock(shard.handle_mutex);
+        auto handle_it = shard.offset_to_handle.find(prepared.candidate.offset);
+        if (handle_it == shard.offset_to_handle.end() ||
+            handle_it->second.key != prepared.candidate.key ||
+            handle_it->second.handle != prepared.handle) {
+            // Free() or a replacement already retired this allocation.
+            continue;
+        }
+
+        QueuePendingFree(shard, prepared.handle, prepared.bytes, free_at);
+        shard.offset_to_handle.erase(handle_it);
+    }
+
+    // Candidates were removed oldest-first. Restore rejected entries in
+    // reverse order so their relative LRU order is preserved.
+    for (size_t i = pending.prepared_.size(); i > 0; --i) {
+        if (accepted[i - 1]) continue;
+
+        const auto& prepared = pending.prepared_[i - 1];
+        auto& shard = *shards_[prepared.candidate.shard_idx];
+        std::lock_guard lru_lock(shard.lru_mutex);
+        std::lock_guard handle_lock(shard.handle_mutex);
+
+        auto handle_it = shard.offset_to_handle.find(prepared.candidate.offset);
+        if (handle_it == shard.offset_to_handle.end() ||
+            handle_it->second.key != prepared.candidate.key ||
+            handle_it->second.handle != prepared.handle) {
+            continue;
+        }
+
+        handle_it->second.eviction_prepared = false;
+        if (shard.lru_index.find(prepared.candidate.key) ==
+            shard.lru_index.end()) {
+            shard.lru_list.push_back(
+                {prepared.candidate.key, prepared.candidate.offset});
+            shard.lru_index[prepared.candidate.key] =
+                std::prev(shard.lru_list.end());
+        }
+    }
+
+    pending.prepared_.clear();
+    pending.candidates_.clear();
+    pending.owner_ = nullptr;
 }
 
 std::string DfsGlobalAllocator::FormatShardIdx(int idx, int shard_count) {
@@ -276,75 +409,59 @@ double DfsGlobalAllocator::EffectiveUsage(ShardState& shard) {
                      static_cast<double>(shard.capacity);
 }
 
-std::vector<DfsGlobalAllocator::EvictedKey> DfsGlobalAllocator::EvictFromShard(
-    int shard_idx) {
-    std::vector<EvictedKey> evicted;
+void DfsGlobalAllocator::PrepareEvictionFromShard(int shard_idx,
+                                                  PendingEviction& pending) {
     auto& shard = *shards_[shard_idx];
 
-    {
-        const double usage = EffectiveUsage(shard);
-        if (usage < eviction_high_watermark_) return evicted;
+    const double usage = EffectiveUsage(shard);
+    uint64_t prepared_bytes = 0;
+    std::lock_guard lru_lock(shard.lru_mutex);
+    std::lock_guard handle_lock(shard.handle_mutex);
+
+    if (usage >= eviction_high_watermark_) {
+        shard.eviction_active = true;
+    }
+    if (!shard.eviction_active) return;
+    if (usage < eviction_low_watermark_) {
+        shard.eviction_active = false;
+        return;
     }
 
     while (true) {
-        std::string evict_key;
-        uint64_t evict_offset = 0;
-        {
-            std::lock_guard lru_lock(shard.lru_mutex);
-            if (shard.lru_list.empty()) break;
-            auto [key, offset] = shard.lru_list.back();
-            evict_key = key;
-            evict_offset = offset;
-            shard.lru_list.pop_back();
+        if (shard.lru_list.empty()) break;
+        auto lru_it = std::prev(shard.lru_list.end());
+        const std::string evict_key = lru_it->first;
+        const uint64_t evict_offset = lru_it->second;
+
+        auto handle_it = shard.offset_to_handle.find(evict_offset);
+        if (handle_it == shard.offset_to_handle.end() ||
+            handle_it->second.key != evict_key ||
+            handle_it->second.eviction_prepared) {
+            shard.lru_list.erase(lru_it);
             shard.lru_index.erase(evict_key);
+            continue;
         }
 
-        {
-            std::lock_guard handle_lock(shard.handle_mutex);
-            auto it = shard.offset_to_handle.find(evict_offset);
-            if (it == shard.offset_to_handle.end()) {
-                continue;
-            }
-            if (it->second.key != evict_key) {
-                continue;
-            }
-            QueuePendingFree(
-                shard, it->second.handle, it->second.bytes,
-                std::chrono::steady_clock::now() + deferred_free_duration_);
-            shard.offset_to_handle.erase(it);
+        EvictionCandidate candidate{evict_key, shard_idx, evict_offset};
+        PendingEviction::PreparedAllocation prepared{
+            candidate, handle_it->second.handle, handle_it->second.bytes};
+        pending.prepared_.push_back(std::move(prepared));
+        try {
+            pending.candidates_.push_back(std::move(candidate));
+        } catch (...) {
+            pending.prepared_.pop_back();
+            throw;
         }
 
-        evicted.push_back({evict_key, shard_idx, evict_offset});
+        handle_it->second.eviction_prepared = true;
+        prepared_bytes += handle_it->second.bytes;
+        shard.lru_list.erase(lru_it);
+        shard.lru_index.erase(evict_key);
 
-        const double usage = EffectiveUsage(shard);
-        if (usage < eviction_low_watermark_) break;
-    }
-    return evicted;
-}
-
-void DfsGlobalAllocator::EvictionMonitor() {
-    std::unique_lock<std::mutex> lock(cv_mutex_);
-    while (running_.load(std::memory_order_acquire)) {
-        lock.unlock();
-        const auto now = std::chrono::steady_clock::now();
-        for (int i = 0; i < shard_count_; ++i) {
-            auto& shard = *shards_[i];
-            std::unique_lock<std::shared_mutex> handle_lock(shard.handle_mutex);
-            CleanupExpiredPendingFrees(shard, now);
-        }
-
-        if (eviction_enabled_) {
-            auto evicted = EvictIfNeeded();
-            for (const auto& ev : evicted) {
-                if (on_evict_callback_) {
-                    on_evict_callback_(ev.key, ev.shard_idx, ev.offset);
-                }
-            }
-        }
-        lock.lock();
-        cv_.wait_for(lock, eviction_check_interval_, [this]() {
-            return !running_.load(std::memory_order_acquire);
-        });
+        const double projected_usage =
+            usage - static_cast<double>(prepared_bytes) /
+                        static_cast<double>(shard.capacity);
+        if (projected_usage < eviction_low_watermark_) break;
     }
 }
 

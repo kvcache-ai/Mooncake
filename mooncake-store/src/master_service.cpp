@@ -11,10 +11,12 @@
 #include <cstring>
 #include <future>
 #include <limits>
+#include <set>
 #include <shared_mutex>
 #include <sstream>
 #include <stdexcept>
 #include <thread>
+#include <tuple>
 #include <regex>
 #include <unordered_set>
 #include <unistd.h>
@@ -547,10 +549,6 @@ void MasterService::InitDfsAllocatorFromEnvironment() {
         return;
     }
 
-    dfs_allocator_->SetEvictCallback(
-        [this](const std::string& key, int shard_idx, uint64_t offset) {
-            RemoveDfsReplicaByOffset(key, shard_idx, offset);
-        });
     LOG(INFO) << "DFS allocator initialized, config={" << config.FormatStr()
               << "}";
 }
@@ -670,6 +668,8 @@ void MasterService::RunNoFBatchEvictForTesting(double evict_ratio_target,
                                                double evict_ratio_lowerbound) {
     NoFBatchEvict(evict_ratio_target, evict_ratio_lowerbound);
 }
+
+void MasterService::RunDfsEvictionForTesting() { RunDfsEviction(); }
 
 void MasterService::SetNoFProbeFnForTesting(NoFProbeFn fn) {
 #ifdef USE_NOF
@@ -6169,21 +6169,139 @@ void MasterService::FreeDfsReplicas(const std::string& key,
     }
 }
 
-void MasterService::RemoveDfsReplicaByOffset(const std::string& key,
-                                             int shard_idx, uint64_t offset) {
-    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    const auto object_id = MakeObjectIdentity(key, TenantId::Default());
-    MetadataAccessorRW accessor(this, object_id);
-    if (!accessor.Exists()) return;
+void MasterService::RunDfsEviction() {
+    if (!dfs_allocator_) return;
 
-    auto& metadata = accessor.Get();
-    metadata.EraseReplicas([shard_idx, offset](const Replica& replica) {
-        return replica.is_dfs_replica() && !replica.is_processing() &&
-               replica.get_dfs_descriptor().shard_idx == shard_idx &&
-               replica.get_dfs_descriptor().offset == offset;
-    });
-    if (!metadata.IsValid()) {
-        accessor.Erase();
+    const TenantId tenant_id = TenantId::Default();
+    using CandidateIdentity = std::tuple<std::string, int, uint64_t>;
+    std::set<CandidateIdentity> attempted;
+
+    while (true) {
+        auto pending = dfs_allocator_->PrepareEviction();
+        if (pending.Empty()) return;
+
+        const auto candidates = pending.Candidates();
+        std::vector<bool> accepted(candidates.size(), false);
+        std::vector<bool> considered(candidates.size(), false);
+        bool saw_repeated_candidate = false;
+
+        // Group prepared candidates by metadata shard, then validate and
+        // remove each group while holding only that shard. Prepared allocator
+        // extents remain unavailable until ResolvePreparedEviction(), so
+        // different metadata shards do not need one cross-shard transaction.
+        std::array<std::vector<size_t>, kNumShards> indexes_by_shard;
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            const auto& candidate = candidates[i];
+            if (!attempted
+                     .emplace(candidate.key, candidate.shard_idx,
+                              candidate.offset)
+                     .second) {
+                saw_repeated_candidate = true;
+                continue;
+            }
+            considered[i] = true;
+            indexes_by_shard[getMetadataShardIndex(tenant_id, candidate.key)]
+                .push_back(i);
+        }
+
+        auto matches_candidate = [](const Replica& replica,
+                                    const auto& candidate) {
+            return replica.is_dfs_replica() &&
+                   replica.get_dfs_descriptor().shard_idx ==
+                       candidate.shard_idx &&
+                   replica.get_dfs_descriptor().offset == candidate.offset;
+        };
+
+        auto now = std::chrono::system_clock::now();
+        for (size_t shard_idx = 0; shard_idx < kNumShards; ++shard_idx) {
+            if (indexes_by_shard[shard_idx].empty()) continue;
+
+            std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+            SharedMutexLocker shard_lock(&metadata_shards_[shard_idx].mutex);
+
+            // Validate and remove candidates under the same shard lock. Once a
+            // candidate has been seen in this cycle, it is excluded above;
+            // encountering it again means the LRU scan has wrapped.
+            for (const size_t i : indexes_by_shard[shard_idx]) {
+                const auto& candidate = candidates[i];
+                auto tenant_it =
+                    metadata_shards_[shard_idx].tenants.find(tenant_id);
+                if (tenant_it == metadata_shards_[shard_idx].tenants.end()) {
+                    accepted[i] = true;
+                    continue;
+                }
+                auto& tenant_state = tenant_it->second;
+                auto metadata_it = tenant_state.metadata.find(candidate.key);
+                if (metadata_it == tenant_state.metadata.end()) {
+                    accepted[i] = true;
+                    continue;
+                }
+
+                auto& metadata = metadata_it->second;
+                const bool has_candidate =
+                    metadata.HasReplica([&](const Replica& replica) {
+                        return matches_candidate(replica, candidate);
+                    });
+                if (!has_candidate) {
+                    accepted[i] = true;
+                    continue;
+                }
+
+                const bool candidate_is_processing =
+                    metadata.HasReplica([&](const Replica& replica) {
+                        return matches_candidate(replica, candidate) &&
+                               replica.is_processing();
+                    });
+                accepted[i] =
+                    !candidate_is_processing &&
+                    !tenant_state.processing_keys.contains(candidate.key) &&
+                    !metadata.IsHardPinned() && metadata.IsLeaseExpired(now) &&
+                    (!metadata.IsSoftPinned(now) ||
+                     allow_evict_soft_pinned_objects_);
+                if (!accepted[i]) continue;
+
+                // A missing descriptor was accepted above and is already
+                // evicted from the master's point of view. Otherwise remove
+                // the accepted descriptor before its allocator extent can be
+                // committed and reused.
+                const size_t erased =
+                    metadata.EraseReplicas([&](const Replica& replica) {
+                        return matches_candidate(replica, candidate) &&
+                               !replica.is_processing();
+                    });
+                if (erased > 0 && !metadata.IsValid()) {
+                    PublishKvRemovedAfterEvict(candidate.key,
+                                               metadata.size * erased, "disk",
+                                               metadata, tenant_id);
+                    EraseMetadata(tenant_state, metadata_it, tenant_id,
+                                  QuotaEraseMode::kFull);
+                }
+            }
+
+            auto tenant_it =
+                metadata_shards_[shard_idx].tenants.find(tenant_id);
+            if (tenant_it != metadata_shards_[shard_idx].tenants.end() &&
+                tenant_it->second.Empty()) {
+                metadata_shards_[shard_idx].tenants.erase(tenant_it);
+            }
+        }
+
+        dfs_allocator_->ResolvePreparedEviction(std::move(pending), accepted);
+
+        // A protected allocation stays live, but moving it to the MRU side
+        // lets this cycle inspect colder candidates behind it. The attempted
+        // set bounds the scan when every remaining allocation is protected.
+        for (size_t i = 0; i < candidates.size(); ++i) {
+            if (considered[i] && !accepted[i]) {
+                dfs_allocator_->UpdateAccess(candidates[i].key,
+                                             candidates[i].shard_idx,
+                                             candidates[i].offset);
+            }
+        }
+
+        if (saw_repeated_candidate) {
+            return;
+        }
     }
 }
 
@@ -7433,6 +7551,7 @@ void MasterService::EvictionThreadFunc() {
     VLOG(1) << "action=eviction_thread_started";
 
     auto last_discard_time = std::chrono::system_clock::now();
+    auto next_dfs_eviction_time = std::chrono::steady_clock::now();
     while (eviction_running_) {
         const auto now = std::chrono::system_clock::now();
         double used_ratio =
@@ -7482,6 +7601,16 @@ void MasterService::EvictionThreadFunc() {
             NoFBatchEvict(nof_evict_ratio_target, nof_evict_ratio_lowerbound);
         }
 #endif
+
+        if (dfs_allocator_ && dfs_allocator_->IsEvictionEnabled()) {
+            const auto steady_now = std::chrono::steady_clock::now();
+            if (steady_now >= next_dfs_eviction_time) {
+                RunDfsEviction();
+                next_dfs_eviction_time =
+                    std::chrono::steady_clock::now() +
+                    dfs_allocator_->GetEvictionCheckInterval();
+            }
+        }
 
         if (promotion_candidate_count_.load(std::memory_order_relaxed) > 0) {
             RunPromotionCandidateRetry();

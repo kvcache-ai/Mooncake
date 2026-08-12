@@ -3,15 +3,12 @@
 #include <array>
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <deque>
-#include <functional>
 #include <list>
 #include <memory>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
-#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -28,10 +25,44 @@ struct DistributedStorageConfig;
 
 class DfsGlobalAllocator {
    public:
-    struct EvictedKey {
+    struct EvictionCandidate {
         std::string key;
         int shard_idx;
         uint64_t offset;
+    };
+
+    // Keeps selected allocations pinned while the master decides which
+    // candidates can be evicted. An unresolved transaction is aborted on
+    // destruction so candidates cannot get stuck outside the LRU.
+    class PendingEviction {
+       public:
+        PendingEviction() = default;
+        ~PendingEviction();
+
+        PendingEviction(const PendingEviction&) = delete;
+        PendingEviction& operator=(const PendingEviction&) = delete;
+        PendingEviction(PendingEviction&& other) noexcept;
+        PendingEviction& operator=(PendingEviction&&) = delete;
+
+        bool Empty() const { return candidates_.empty(); }
+        const std::vector<EvictionCandidate>& Candidates() const {
+            return candidates_;
+        }
+
+       private:
+        friend class DfsGlobalAllocator;
+
+        struct PreparedAllocation {
+            EvictionCandidate candidate;
+            std::shared_ptr<offset_allocator::OffsetAllocationHandle> handle;
+            uint64_t bytes = 0;
+        };
+
+        explicit PendingEviction(DfsGlobalAllocator* owner) : owner_(owner) {}
+
+        DfsGlobalAllocator* owner_ = nullptr;
+        std::vector<EvictionCandidate> candidates_;
+        std::vector<PreparedAllocation> prepared_;
     };
 
     DfsGlobalAllocator() = default;
@@ -50,9 +81,16 @@ class DfsGlobalAllocator {
     void Free(uint64_t offset, uint64_t aligned_size, int shard_idx,
               const std::string& key);
     void UpdateAccess(const std::string& key, int shard_idx, uint64_t offset);
-    std::vector<EvictedKey> EvictIfNeeded();
-    void SetEvictCallback(
-        std::function<void(const std::string&, int, uint64_t)> cb);
+    PendingEviction PrepareEviction();
+    void CommitPreparedEviction(PendingEviction&& pending);
+    void RestorePreparedEviction(PendingEviction&& pending);
+    void ResolvePreparedEviction(PendingEviction&& pending,
+                                 const std::vector<bool>& accepted);
+
+    bool IsEvictionEnabled() const { return eviction_enabled_; }
+    std::chrono::seconds GetEvictionCheckInterval() const {
+        return eviction_check_interval_;
+    }
 
     static std::string FormatShardIdx(int idx, int shard_count);
 
@@ -68,6 +106,7 @@ class DfsGlobalAllocator {
             std::string key;
             std::shared_ptr<OffsetAllocationHandle> handle;
             uint64_t bytes = 0;
+            bool eviction_prepared = false;
         };
 
         std::shared_mutex handle_mutex;
@@ -76,6 +115,10 @@ class DfsGlobalAllocator {
         std::mutex lru_mutex;
         std::list<std::pair<std::string, uint64_t>> lru_list;
         std::unordered_map<std::string, decltype(lru_list)::iterator> lru_index;
+        // Once the high watermark is crossed, keep selecting candidates until
+        // effective usage falls below the low watermark. Protected candidates
+        // may make that span multiple prepare/resolve rounds.
+        bool eviction_active = false;
 
         struct PendingFree {
             std::shared_ptr<OffsetAllocationHandle> handle;
@@ -102,8 +145,7 @@ class DfsGlobalAllocator {
     void CleanupExpiredPendingFrees(ShardState& shard,
                                     std::chrono::steady_clock::time_point now);
     double EffectiveUsage(ShardState& shard);
-    std::vector<EvictedKey> EvictFromShard(int shard_idx);
-    void EvictionMonitor();
+    void PrepareEvictionFromShard(int shard_idx, PendingEviction& pending);
     int SelectShard(const std::string& key) const;
     uint64_t AlignSize(uint64_t size) const;
 
@@ -117,12 +159,7 @@ class DfsGlobalAllocator {
     double eviction_low_watermark_ = 0.7;
     std::chrono::seconds deferred_free_duration_{30};
     std::chrono::seconds eviction_check_interval_{5};
-    std::thread eviction_thread_;
-    std::mutex cv_mutex_;
-    std::condition_variable cv_;
-    std::atomic<bool> running_{false};
     std::atomic<bool> initialized_{false};
-    std::function<void(const std::string&, int, uint64_t)> on_evict_callback_;
     std::array<std::mutex, kNumKeyStripes> key_stripes_;
 };
 
