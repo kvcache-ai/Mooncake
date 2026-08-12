@@ -186,6 +186,20 @@ enum class BucketEvictionPolicy {
     LRU,   // Evict least recently read bucket first
 };
 
+inline std::ostream& operator<<(std::ostream& os,
+                                const BucketEvictionPolicy& policy) {
+    switch (policy) {
+        case BucketEvictionPolicy::NONE:
+            return os << "none";
+        case BucketEvictionPolicy::FIFO:
+            return os << "fifo";
+        case BucketEvictionPolicy::LRU:
+            return os << "lru";
+        default:
+            return os << "unknown";
+    }
+}
+
 struct BucketBackendConfig {
     int64_t bucket_size_limit =
         256 * kMB;  // Max total size of a single bucket (256 MB)
@@ -1109,6 +1123,12 @@ class BucketStorageBackend : public StorageBackendInterface {
      */
     tl::expected<std::shared_ptr<StorageFile>, ErrorCode> GetFileInstance()
         const;
+
+    // Test-only: number of entries in the LRU eviction index.
+    size_t GetLruIndexSizeForTest() const {
+        SharedMutexLocker lock(&mutex_, shared_lock);
+        return lru_index_.size();
+    }
 
    private:
     // Alignment helper functions for O_DIRECT I/O

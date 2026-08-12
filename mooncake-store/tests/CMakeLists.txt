@@ -66,7 +66,8 @@ if(ENABLE_KV_EVENTS)
   endif()
 endif()
 add_store_test(master_service_test master_service_test.cpp)
-add_store_test(batch_evict_test batch_evict_test.cpp)
+add_ha_test(master_service_evict_scenario_test master_scenario.cpp
+            master_service_evict_scenario_test.cpp)
 add_store_test(master_scenario_test master_scenario.cpp
                master_scenario_test.cpp)
 add_store_test(master_service_scenario_test master_scenario.cpp
@@ -126,6 +127,7 @@ if(USE_CUDA)
   endif()
 endif()
 add_store_test(tenant_quota_test tenant_quota_test.cpp)
+add_store_test(tenant_quota_ledger_test tenant_quota_ledger_test.cpp)
 add_store_test(tenant_id_test tenant_id_test.cpp)
 add_store_test(segment_test segment_test.cpp)
 add_store_test(offset_allocator_test offset_allocator_test.cpp)

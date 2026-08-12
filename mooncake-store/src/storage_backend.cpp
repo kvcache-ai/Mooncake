@@ -1774,6 +1774,7 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
         ReleasePreparedWrite(pending);
         return tl::make_unexpected(write_bucket_result.error());
     }
+    VLOG(1) << "Written bucket with id: " << bucket_id;
     // Save a copy of bucket->keys before std::move(bucket) into buckets_
     // consumes the shared_ptr. Needed for complete_handler and rollback.
     const auto bucket_keys = bucket->keys;
@@ -1807,8 +1808,16 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
                 CHECK(inserted)
                     << "Reserved key became duplicated: " << bucket_keys[i];
             }
+            auto ts = 0LL;
+            // Update LRU timestamp for in case of eviction.
+            if (bucket_backend_config_.eviction_policy ==
+                BucketEvictionPolicy::LRU) {
+                ts =
+                    std::chrono::steady_clock::now().time_since_epoch().count();
+                bucket->last_access_ns_.store(ts, std::memory_order_relaxed);
+            }
             buckets_.emplace(bucket_id, std::move(bucket));
-            lru_index_.emplace(0LL, bucket_id);
+            lru_index_.emplace(ts, bucket_id);
         }
         if (duplicate_found) {
             LOG(ERROR) << "Reserved key became duplicated before commit, "
@@ -2735,7 +2744,9 @@ void BucketStorageBackend::RollbackCommittedBucket(
 
         // Remove bucket metadata
         total_size_ -= bucket_meta->meta_size;
-        lru_index_.erase({0LL, bucket_id});
+        lru_index_.erase(
+            {bucket_meta->last_access_ns_.load(std::memory_order_relaxed),
+             bucket_id});
         buckets_.erase(bucket_it);
     }
 
@@ -3131,6 +3142,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::FinalizeEviction(
         if (bucket_cleanup_failed) {
             cleanup_failed_count++;
         }
+        VLOG(1) << "Evicted bucket with id: " << bucket_id
+                << ", policy: " << bucket_backend_config_.eviction_policy;
     }
     if (!pending.buckets.empty()) {
         LOG(INFO) << "[Evict] finalized: attempted=" << pending.buckets.size()

@@ -75,6 +75,15 @@ On the initiator machine:
   --duration=5
 ```
 
+### 3.3 Request Pacing
+
+Use `--request_interval_us=<N>` to add a per-thread delay before each
+transfer batch. The value is in microseconds; `0` disables pacing.
+
+When pacing is enabled, `Avg Lat (us)` includes the pacing gap because it is
+computed from wall-clock runtime, while `Avg Tx (us)` and Tx percentiles only
+measure transfer execution time.
+
 ## 4. Output Metrics
 
 Each output row corresponds to one benchmark configuration.
@@ -84,8 +93,9 @@ Each output row corresponds to one benchmark configuration.
 | `BlkSize (B)`  | Block size per request (bytes)                      |
 | `Batch`        | Number of requests per submission                   |
 | `BW (GB/S)`    | Throughput (total bytes / total time)               |
-| `Avg Lat (us)` | Average end-to-end latency (scaled by thread count) |
-| `Avg Tx (us)`  | Average per-transfer execution time                 |
+| `Avg Inst GB/s` | Average per-transfer instantaneous bandwidth       |
+| `Avg Lat (us)` | Average wall-clock per-operation latency, including pacing or scheduling gaps (scaled by thread count) |
+| `Avg Tx (us)`  | Average per-transfer execution time, excluding gaps |
 | `P99 Tx (us)`  | P99 transfer latency                                |
 | `P999 Tx (us)` | P999 transfer latency                               |
 
