@@ -79,6 +79,7 @@ Status BufIoTransport::install(std::string& local_segment_name,
     conf_ = conf;
 
     installed_ = true;
+    caps.file_transfer = true;
     caps.dram_to_file = true;
     if (Platform::getLoader().type() != "cpu") {
         caps.gpu_to_file = true;

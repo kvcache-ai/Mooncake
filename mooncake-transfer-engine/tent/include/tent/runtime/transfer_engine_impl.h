@@ -361,6 +361,7 @@ class TransferEngineImpl {
     class BatchRef;
 
     struct PreparedSubmit;
+    struct ResolvedRoute;
 
     Status submitTransfer(BatchID batch_id,
                           const std::vector<Request>& request_list,
@@ -417,13 +418,13 @@ class TransferEngineImpl {
     SelectionResult resolveTransport(const Request& req, int transport_index,
                                      bool invalidate_on_fail = true);
 
+    ResolvedRoute resolveExecutionRoute(const Request& req, int transport_index,
+                                        bool invalidate_on_fail = true);
+
     // Verify that req.transport_hint is usable for this request
     Status validateTransportHint(const Request& req, size_t request_index);
 
     Status loadTransports();
-
-    void findStagingPolicy(const Request& req,
-                           std::vector<std::string>& policy);
 
     Status maybeFireSubmitHooks(Batch* batch, bool check = true);
 

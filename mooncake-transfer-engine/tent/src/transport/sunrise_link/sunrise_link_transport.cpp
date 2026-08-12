@@ -286,6 +286,7 @@ thread_local ThreadLocalTangStreamPool tl_stream_pool;
 SunriseLinkTransport::SunriseLinkTransport() : installed_(false) {
     // Match NVLink-style caps: routing may see MTYPE_CPU if pointer probe fails
     // while the remote segment is VRAM; dram_to_gpu must still be available.
+    caps.cross_node_transfer = true;
     caps.dram_to_dram = true;
     caps.dram_to_gpu = true;
     caps.gpu_to_dram = true;

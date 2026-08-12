@@ -171,6 +171,7 @@ Status MnnvlTransport::install(std::string &local_segment_name,
         conf_->get("transports/nvlink/async_memcpy_threshold", 1024) * 1024 *
         128;
 
+    caps.cross_node_transfer = true;
     caps.dram_to_gpu = true;
     if (Platform::getLoader().type() != "cpu") caps.gpu_to_gpu = true;
 

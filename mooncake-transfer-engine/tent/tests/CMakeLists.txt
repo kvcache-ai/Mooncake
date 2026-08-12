@@ -321,6 +321,13 @@ target_include_directories(tent_topology_priority_matrix_test
 add_test(NAME tent_topology_priority_matrix_test
          COMMAND tent_topology_priority_matrix_test)
 
+add_executable(tent_capability_graph_test capability_graph_test.cpp)
+target_link_libraries(tent_capability_graph_test PRIVATE gtest gtest_main
+                                                         tent_link_group)
+target_include_directories(tent_capability_graph_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_capability_graph_test COMMAND tent_capability_graph_test)
+
 if(USE_UB)
   add_executable(
     tent_ub_teardown_test

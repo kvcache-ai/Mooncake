@@ -22,8 +22,32 @@ namespace tent {
 
 // MTYPE_TPU is appended last so the numeric values of the existing entries are
 // preserved. TPU HBM is not NIC-addressable, so transfers touching it are
-// staged through host DRAM by ProxyManager (see findStagingPolicy).
+// staged through host DRAM by capability path synthesis and ProxyManager.
 enum MemoryType { MTYPE_UNKNOWN, MTYPE_CPU, MTYPE_CUDA, MTYPE_ROCM, MTYPE_TPU };
+
+inline bool isKnownMemoryType(MemoryType type) {
+    return type != MTYPE_UNKNOWN;
+}
+
+inline bool isDeviceMemoryType(MemoryType type) {
+    return type == MTYPE_CUDA || type == MTYPE_ROCM || type == MTYPE_TPU;
+}
+
+inline const char *memoryTypeName(MemoryType type) {
+    switch (type) {
+        case MTYPE_CPU:
+            return "cpu";
+        case MTYPE_CUDA:
+            return "cuda";
+        case MTYPE_ROCM:
+            return "rocm";
+        case MTYPE_TPU:
+            return "tpu";
+        case MTYPE_UNKNOWN:
+            return "unknown";
+    }
+    return "unknown";
+}
 
 class Platform {
    public:

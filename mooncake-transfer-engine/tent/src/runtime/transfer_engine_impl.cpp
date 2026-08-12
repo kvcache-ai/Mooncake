@@ -29,6 +29,7 @@
 
 #include "tent/common/config.h"
 #include "tent/common/status.h"
+#include "tent/runtime/capability_graph.h"
 #include "tent/runtime/control_plane.h"
 #include "tent/runtime/segment.h"
 #include "tent/runtime/segment_tracker.h"
@@ -1157,19 +1158,11 @@ class TransferEngineImpl::BatchRef {
     Batch* batch_{nullptr};
 };
 
-static bool isGpuType(MemoryType t) {
-    // TPU HBM behaves like a GPU that lacks NIC access: it is a device-side
-    // memory that can only reach the network by staging through host DRAM.
-    // Treating it as a "gpu type" makes the capability checks route its
-    // device<->host hop to TpuTransport (gpu_to_dram / dram_to_gpu) while
-    // leaving gpu_to_gpu unsatisfiable, which forces host-DRAM staging.
-    return t == MTYPE_CUDA || t == MTYPE_ROCM || t == MTYPE_TPU;
-}
-
 static bool checkAvailability(const std::shared_ptr<Transport>& xport,
                               MemoryType local) {
     if (local == MTYPE_CPU) return xport && xport->capabilities().dram_to_file;
-    if (isGpuType(local)) return xport && xport->capabilities().gpu_to_file;
+    if (isDeviceMemoryType(local))
+        return xport && xport->capabilities().gpu_to_file;
     return false;
 }
 
@@ -1177,11 +1170,11 @@ static bool checkAvailability(const std::shared_ptr<Transport>& xport,
                               MemoryType local, MemoryType remote) {
     if (local == MTYPE_CPU && remote == MTYPE_CPU)
         return xport && xport->capabilities().dram_to_dram;
-    if (isGpuType(local) && isGpuType(remote))
+    if (isDeviceMemoryType(local) && isDeviceMemoryType(remote))
         return xport && xport->capabilities().gpu_to_gpu;
-    if (local == MTYPE_CPU && isGpuType(remote))
+    if (local == MTYPE_CPU && isDeviceMemoryType(remote))
         return xport && xport->capabilities().dram_to_gpu;
-    if (isGpuType(local) && remote == MTYPE_CPU)
+    if (isDeviceMemoryType(local) && remote == MTYPE_CPU)
         return xport && xport->capabilities().gpu_to_dram;
     return false;
 }
@@ -1193,6 +1186,20 @@ static MemoryType getTypeEnum(const std::string& type) {
     if (isAmdGpuLocationType(type)) return MTYPE_ROCM;
     if (type == "tpu") return MTYPE_TPU;
     return MTYPE_UNKNOWN;
+}
+
+static void addStageCandidate(std::vector<StageCandidate>& candidates,
+                              const std::string& location) {
+    if (location.empty()) return;
+    auto memory_type = getTypeEnum(LocationParser(location).type());
+    if (memory_type == MTYPE_UNKNOWN) return;
+    auto duplicate = std::any_of(
+        candidates.begin(), candidates.end(),
+        [&](const StageCandidate& candidate) {
+            return candidate.location == location &&
+                   candidate.memory_type == memory_type;
+        });
+    if (!duplicate) candidates.push_back({location, memory_type});
 }
 
 Status TransferEngineImpl::validateTransportHint(const Request& req,
@@ -1358,6 +1365,13 @@ struct TransferEngineImpl::PreparedSubmit {
     std::chrono::steady_clock::time_point submit_time{};
     std::vector<Task> tasks;
     std::vector<Owner> owners;
+};
+
+struct TransferEngineImpl::ResolvedRoute {
+    SelectionResult route{};
+    bool staging{false};
+    std::vector<std::string> staging_params;
+    SynthesizedPath path{};
 };
 
 namespace {
@@ -1542,100 +1556,6 @@ std::vector<RequestBoundaryInfo> resolveRequestBoundaries(
     return boundaries;
 }
 
-void TransferEngineImpl::findStagingPolicy(const Request& request,
-                                           std::vector<std::string>& policy) {
-    if (request.target_id == LOCAL_SEGMENT_ID) return;
-
-    SegmentDesc* desc = nullptr;
-    BufferDesc* entry = nullptr;
-    // Owning reference: `entry` is used after the lambda returns.
-    SegmentDescRef pin;
-    auto status = metadata_->segmentManager().withCachedSegment(
-        request.target_id, pin, [&](SegmentDesc* segment) {
-            desc = segment;
-            entry = desc->findBuffer(request.target_offset, request.length);
-            if (!entry)
-                return Status::NeedsRefreshCache(
-                    "Requested address is not in registered buffer" LOC_MARK);
-            return Status::OK();
-        });
-
-    if (!status.ok()) return;
-    auto local =
-        Platform::getLoader().getLocation(request.source, 1)[0].location;
-    auto remote = entry->location;
-    auto local_mtype = getTypeEnum(LocationParser(local).type());
-    auto remote_mtype = getTypeEnum(LocationParser(remote).type());
-    auto server_addr = desc->rpc_server_addr;
-    policy.clear();
-    // case 1: rdma without gpu direct
-    if (transport_list_[RDMA] && transport_list_[NVLINK]) {
-        auto& xport = transport_list_[RDMA];
-        auto& caps = xport->capabilities();
-        if (local_mtype == MTYPE_CUDA && remote_mtype == MTYPE_CUDA &&
-            !caps.gpu_to_gpu) {
-            policy.push_back(server_addr);
-            policy.push_back(topology_->findNearMem(local));
-            policy.push_back(desc->getMemory().topology.findNearMem(remote));
-        } else if (local_mtype == MTYPE_CUDA && remote_mtype == MTYPE_CPU &&
-                   !caps.gpu_to_dram) {
-            policy.push_back(server_addr);
-            policy.push_back(topology_->findNearMem(local));
-            policy.push_back("");  // no remote stage
-        } else if (local_mtype == MTYPE_CPU && remote_mtype == MTYPE_CUDA &&
-                   !caps.dram_to_gpu) {
-            policy.push_back(server_addr);
-            policy.push_back("");  // no local stage
-            policy.push_back(desc->getMemory().topology.findNearMem(remote));
-        }
-    }
-    // case 2: pure mnnvl
-    if (transport_list_[MNNVL] && transport_list_[NVLINK]) {
-        auto& xport = transport_list_[MNNVL];
-        auto& caps = xport->capabilities();
-        if (local_mtype == MTYPE_CPU && remote_mtype == MTYPE_CPU &&
-            !caps.dram_to_dram) {
-            policy.push_back(server_addr);
-            policy.push_back(topology_->findNearMem(local, Topology::MEM_CUDA));
-            policy.push_back("");  // remote stage
-        } else if (local_mtype == MTYPE_CUDA && remote_mtype == MTYPE_CPU &&
-                   !caps.gpu_to_dram) {
-            policy.push_back(server_addr);
-            policy.push_back("");  // no local stage
-            policy.push_back(desc->getMemory().topology.findNearMem(
-                remote, Topology::MEM_CUDA));
-        }
-    }
-    // case 3: TPU. HBM is not NIC-addressable, so any hop touching TPU memory
-    // is staged through host DRAM: TpuTransport performs the local HBM<->host
-    // copy (via the PJRT adapter) and the host<->host hop is carried by
-    // whatever host-DRAM network transport is present. TPU deployments (e.g.
-    // cloud TPU VMs) are typically TCP/multi-NIC rather than RDMA, so we gate
-    // on either; the cross stage itself is routed by capability (dram_to_dram),
-    // so TCP is selected when RDMA is absent. We also require TpuTransport (the
-    // local HBM<->host executor), mirroring how the CUDA cases gate on NVLINK.
-    // An empty stage location means "no staging needed on that side".
-    if (transport_list_[TPU] &&
-        (transport_list_[RDMA] || transport_list_[TCP])) {
-        if (local_mtype == MTYPE_TPU && remote_mtype == MTYPE_TPU) {
-            policy.clear();
-            policy.push_back(server_addr);
-            policy.push_back(topology_->findNearMem(local));
-            policy.push_back(desc->getMemory().topology.findNearMem(remote));
-        } else if (local_mtype == MTYPE_TPU && remote_mtype == MTYPE_CPU) {
-            policy.clear();
-            policy.push_back(server_addr);
-            policy.push_back(topology_->findNearMem(local));
-            policy.push_back("");  // remote already host DRAM
-        } else if (local_mtype == MTYPE_CPU && remote_mtype == MTYPE_TPU) {
-            policy.clear();
-            policy.push_back(server_addr);
-            policy.push_back("");  // local already host DRAM
-            policy.push_back(desc->getMemory().topology.findNearMem(remote));
-        }
-    }
-}
-
 SelectionResult TransferEngineImpl::resolveTransport(const Request& req,
                                                      int transport_index,
                                                      bool invalidate_on_fail) {
@@ -1645,6 +1565,106 @@ SelectionResult TransferEngineImpl::resolveTransport(const Request& req,
         result = getTransportType(req, transport_index);
     }
     return result;
+}
+
+TransferEngineImpl::ResolvedRoute TransferEngineImpl::resolveExecutionRoute(
+    const Request& req, int transport_index, bool invalidate_on_fail) {
+    ResolvedRoute resolved;
+
+    auto collect_candidates = [&]() {
+        std::vector<SelectionResult> results;
+        for (int i = transport_index; i < kSupportedTransportTypes; ++i) {
+            auto result = getTransportType(req, i);
+            if (result.transport == UNSPEC) break;
+            results.push_back(std::move(result));
+        }
+        return results;
+    };
+
+    auto route_candidates = collect_candidates();
+    if (route_candidates.empty() && invalidate_on_fail) {
+        metadata_->segmentManager().invalidateRemote(req.target_id);
+        route_candidates = collect_candidates();
+    }
+    if (route_candidates.empty()) return resolved;
+
+    resolved.route = route_candidates.front();
+
+    if (req.target_id == LOCAL_SEGMENT_ID) return resolved;
+
+    SegmentDesc* desc = nullptr;
+    BufferDesc* entry = nullptr;
+    SegmentDescRef pin;
+    auto status = metadata_->segmentManager().withCachedSegment(
+        req.target_id, pin, [&](SegmentDesc* segment) {
+            desc = segment;
+            entry = desc->findBuffer(req.target_offset, req.length);
+            if (!entry)
+                return Status::NeedsRefreshCache(
+                    "Requested address is not in registered buffer" LOC_MARK);
+            return Status::OK();
+        });
+    if (!status.ok() || !desc || !entry) return resolved;
+
+    auto source_locations =
+        Platform::getLoader().getLocation(req.source, 1, true);
+    if (source_locations.empty()) return resolved;
+
+    const auto local = source_locations[0].location;
+    const auto remote = entry->location;
+    CapabilityGraphInput input;
+    input.local_memory_type = getTypeEnum(LocationParser(local).type());
+    input.remote_memory_type = getTypeEnum(LocationParser(remote).type());
+    input.local_location = local;
+    input.remote_location = remote;
+    input.server_addr = desc->rpc_server_addr;
+
+    addStageCandidate(input.local_stage_candidates,
+                      topology_->findNearMem(local));
+    addStageCandidate(input.remote_stage_candidates,
+                      desc->getMemory().topology.findNearMem(remote));
+    addStageCandidate(input.local_stage_candidates,
+                      topology_->findNearMem(local, Topology::MEM_CUDA));
+    addStageCandidate(input.remote_stage_candidates,
+                      desc->getMemory().topology.findNearMem(
+                          remote, Topology::MEM_CUDA));
+
+    for (int i = 0; i < kSupportedTransportTypes; ++i) {
+        if (!transport_list_[i]) continue;
+        auto caps = transport_list_[i]->capabilities();
+        if (!caps.local_stage_executor) continue;
+        input.transports[i].enabled = true;
+        input.transports[i].caps = caps;
+    }
+
+    for (const auto& candidate : route_candidates) {
+        const auto type = candidate.transport;
+        if (type == UNSPEC || !transport_list_[type]) continue;
+        auto caps = transport_list_[type]->capabilities();
+        if (!caps.cross_node_transfer) continue;
+        input.transports[type].enabled = true;
+        input.transports[type].caps = caps;
+    }
+
+    auto path = CapabilityPathSynthesizer::synthesize(input);
+    if (!path.found) return resolved;
+
+    auto selected = std::find_if(
+        route_candidates.begin(), route_candidates.end(),
+        [&](const SelectionResult& candidate) {
+            return candidate.transport == path.cross_transport;
+        });
+    if (selected == route_candidates.end()) return resolved;
+
+    resolved.route = *selected;
+    resolved.path = std::move(path);
+    if (!resolved.path.direct && staging_proxy_) {
+        resolved.staging = true;
+        resolved.staging_params = {resolved.path.server_addr,
+                                   resolved.path.local_stage_location,
+                                   resolved.path.remote_stage_location};
+    }
+    return resolved;
 }
 
 Status TransferEngineImpl::prepareSubmit(
@@ -1670,11 +1690,10 @@ Status TransferEngineImpl::prepareSubmit(
     for (const auto& request : merged.request_list) {
         PreparedSubmit::Owner owner;
         owner.request = request;
-        owner.route = resolveTransport(owner.request, 0);
-        if (owner.route.transport == TCP) {
-            findStagingPolicy(owner.request, owner.staging_params);
-            owner.staging = !owner.staging_params.empty() && staging_proxy_;
-        }
+        auto resolved = resolveExecutionRoute(owner.request, 0);
+        owner.route = resolved.route;
+        owner.staging = resolved.staging;
+        owner.staging_params = std::move(resolved.staging_params);
         prepared.owners.push_back(std::move(owner));
     }
 
@@ -2025,28 +2044,25 @@ Status TransferEngineImpl::dispatchQueuedOwner(QueueOwnerId owner_id) {
     auto* batch = queued.batch;
     auto& task = batch->task_list[queued.owner_task_id];
     task.dispatch_time = std::chrono::steady_clock::now();
-    auto route = resolveTransport(task.request, 0);
-    task.type = route.transport;
-    task.device_mask = route.device_mask;
-    task.qp_pool = route.qp_pool.value_or("");
+    auto resolved = resolveExecutionRoute(task.request, 0);
+    task.type = resolved.route.transport;
+    task.device_mask = resolved.route.device_mask;
+    if (resolved.route.qp_pool) task.qp_pool = *resolved.route.qp_pool;
     if (task.type == UNSPEC) {
         return finishQueuedOwner(owner_id, FAILED);
     }
 
-    if (task.type == TCP) {
-        std::vector<std::string> staging_params;
-        findStagingPolicy(task.request, staging_params);
-        if (!staging_params.empty() && staging_proxy_) {
-            task.staging = true;
-            // Orchestration only; the real transport submissions issued by
-            // ProxyManager are counted where they recurse through the
-            // non-staging path below.
-            auto status =
-                staging_proxy_->submit(&task, (BatchID)batch, staging_params);
-            if (!status.ok()) return finishQueuedOwner(owner_id, FAILED);
-            task.post_time = std::chrono::steady_clock::now();
-            return markQueuedOwnerSubmitted(owner_id);
-        }
+    task.staging = false;
+    if (resolved.staging) {
+        task.staging = true;
+        // Orchestration only; the real transport submissions issued by
+        // ProxyManager are counted where they recurse through the
+        // non-staging path below.
+        auto status = staging_proxy_->submit(&task, (BatchID)batch,
+                                             resolved.staging_params);
+        if (!status.ok()) return finishQueuedOwner(owner_id, FAILED);
+        task.post_time = std::chrono::steady_clock::now();
+        return markQueuedOwnerSubmitted(owner_id);
     }
 
     if (!batch->sub_batch[task.type]) {
