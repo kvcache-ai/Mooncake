@@ -87,9 +87,10 @@ CoroRpcAgent::CoroRpcAgent() = default;
 
 CoroRpcAgent::~CoroRpcAgent() { stop(); }
 
-Status CoroRpcAgent::registerFunction(int func_id, const Function& func) {
+Status CoroRpcAgent::registerFunction(int func_id, const Function& func,
+                                      bool offload) {
     func_map_mutex_.lock();
-    func_map_[func_id] = func;
+    func_map_[func_id] = Handler{func, offload};
     func_map_mutex_.unlock();
     return Status::OK();
 }
@@ -145,16 +146,33 @@ Status CoroRpcAgent::stop() {
     return Status::OK();
 }
 
-void CoroRpcAgent::process(int func_id) {
-    RpcHandlerScope handler_scope(tl_inside_rpc_handler);
-    auto ctx = coro_rpc::get_context();
-    if (func_map_.count(func_id)) {
-        auto request = ctx->get_request_attachment();
-        std::string response;
-        auto func = func_map_.at(func_id);
-        func(request, response);
-        ctx->set_response_attachment(response);
+Lazy<void> CoroRpcAgent::process(int func_id) {
+    auto* ctx = co_await coro_rpc::get_context_in_coro();
+    auto it = func_map_.find(func_id);
+    if (it == func_map_.end()) co_return;
+    const auto handler = it->second;
+
+    auto request = ctx->get_request_attachment();
+    std::string response;
+    if (handler.offload) {
+        // Suspends this coroutine, freeing the io_context thread. The request
+        // buffer belongs to the context_info this coroutine keeps alive, so
+        // the view survives the hop. tl_inside_rpc_handler is deliberately
+        // not set: it guards against deadlocking the RPC thread, which an
+        // offloaded handler no longer occupies.
+        //
+        // post() reports a throwing handler through the Try instead of
+        // unwinding, so rethrow here: the router turns that into the same
+        // rpc_throw_exception an inline handler would produce. Dropping it
+        // would answer a malformed request with an empty success.
+        auto result =
+            co_await coro_io::post([&] { handler.func(request, response); });
+        result.value();
+    } else {
+        RpcHandlerScope handler_scope(tl_inside_rpc_handler);
+        handler.func(request, response);
     }
+    ctx->set_response_attachment(std::move(response));
 }
 
 std::shared_ptr<ClientPool> CoroRpcAgent::getOrCreatePool(
