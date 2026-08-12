@@ -363,9 +363,14 @@ def import_dataproto_ref(handle: Mapping[str, Any]) -> MooncakeDataProtoRef:
         manifest_key = _require_mapping(stage_ref, f"stage_refs[{stage!r}]").get(
             "manifest_key"
         )
-        if not isinstance(stage, str) or not isinstance(manifest_key, str):
+        if (
+            not isinstance(stage, str)
+            or not stage
+            or not isinstance(manifest_key, str)
+            or not manifest_key
+        ):
             raise ValueError(
-                "DataProto ref handle stage refs must contain string manifest_key values"
+                "DataProto ref handle stage refs must contain non-empty string names and manifest_key values"
             )
         stage_refs[stage] = RemoteBundleRef(manifest_key=manifest_key, manifest={})
     field_index: dict[str, StructuredFieldLocation] = {}
@@ -380,10 +385,15 @@ def import_dataproto_ref(handle: Mapping[str, Any]) -> MooncakeDataProtoRef:
         member = location.get("member")
         if (
             not isinstance(name, str)
+            or not name
             or not isinstance(stage, str)
+            or not stage
             or not isinstance(member, str)
+            or not member
         ):
-            raise ValueError("DataProto ref handle field locations must be strings")
+            raise ValueError(
+                "DataProto ref handle field locations must be non-empty strings"
+            )
         if stage not in stage_refs:
             raise ValueError(
                 f"DataProto ref handle field {name!r} references unknown stage {stage!r}"
@@ -999,6 +1009,15 @@ class MooncakeBundleTransfer:
         indices: Sequence[int],
         destination: Any,
     ) -> Any:
+        if payload_spec.get("format") == "torch_save":
+            if destination is not None:
+                raise ValueError(
+                    f"structured torch_save tensor member {name} does not support destinations"
+                )
+            value = _deserialize_torch_save_payload(
+                self._bundle_store.read_payload(payload_spec)
+            )
+            return value[list(indices)]
         metadata_bytes = int(payload_spec.get("metadata_bytes", -1))
         shape = field_spec.get("shape")
         element_size = int(field_spec.get("element_size", 0))
@@ -3301,6 +3320,20 @@ class _StructuredObjectLayer:
         member_slice: StructuredMemberSlice,
         destination: Any,
     ) -> Any:
+        if payload_spec.get("format") == "torch_save":
+            if destination is not None:
+                raise ValueError(
+                    f"structured torch_save tensor member {name} does not support destinations"
+                )
+            if member_slice.axis != 0:
+                raise ValueError(
+                    "structured tensor slicing currently supports axis=0 only"
+                )
+            value = _deserialize_torch_save_payload(
+                self._bundle_store.read_payload(payload_spec)
+            )
+            start, end, step = _normalized_member_slice(member_slice, len(value))
+            return value[start:end:step]
         metadata_bytes = int(payload_spec.get("metadata_bytes", -1))
         shape = field_spec.get("shape")
         element_size = int(field_spec.get("element_size", 0))

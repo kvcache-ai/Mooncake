@@ -40,9 +40,19 @@ PutStartAction<> PutStart(std::string key, uint64_t size) {
     return PutStartAction<>(std::move(key), size);
 }
 
+UpsertStartAction<> UpsertStart(std::string key, uint64_t size) {
+    return UpsertStartAction<>(std::move(key), size);
+}
+
 PutEndAction PutEnd(std::string key) { return {.key = std::move(key)}; }
 
+UpsertEndAction UpsertEnd(std::string key) { return {.key = std::move(key)}; }
+
 PutRevokeAction PutRevoke(std::string key) { return {.key = std::move(key)}; }
+
+UpsertRevokeAction UpsertRevoke(std::string key) {
+    return {.key = std::move(key)};
+}
 
 RemoveAction Remove(std::string key) { return {.key = std::move(key)}; }
 
@@ -82,28 +92,29 @@ MasterScenario& MasterScenario::WhenPutStart(PutStartActionData action) {
     }
 
     ReplicateConfig config;
-    config.replica_num = 1;
+    config.replica_num = action.requested_replica_count;
     const auto result =
         service_->PutStart(ActorId(action.actor), action.key,
                            TenantId::Default(), action.size, config);
-    ValidateActionResult("PutStart(" + action.key + ")", action.expected_error,
-                         result.has_value(),
-                         result ? ErrorCode::OK : result.error());
-    if (!result) {
+    ValidateStartResult("PutStart(" + action.key + ")", action.expected_error,
+                        action.expected_replica_count,
+                        action.expected_replica_status, result);
+    return *this;
+}
+
+MasterScenario& MasterScenario::WhenUpsertStart(UpsertStartActionData action) {
+    if (!EnsureService()) {
         return *this;
     }
-    if (action.expected_replica_count.has_value() &&
-        result->size() != *action.expected_replica_count) {
-        Fail("PutStart(" + action.key + ") returned " +
-             std::to_string(result->size()) + " replicas; expected " +
-             std::to_string(*action.expected_replica_count));
-    }
-    if (action.expected_replica_status.has_value() &&
-        std::any_of(result->begin(), result->end(), [&](const auto& replica) {
-            return replica.status != *action.expected_replica_status;
-        })) {
-        Fail("PutStart(" + action.key + ") replica status mismatch");
-    }
+
+    ReplicateConfig config;
+    config.replica_num = action.requested_replica_count;
+    const auto result =
+        service_->UpsertStart(ActorId(action.actor), action.key,
+                              TenantId::Default(), action.size, config);
+    ValidateStartResult("UpsertStart(" + action.key + ")",
+                        action.expected_error, action.expected_replica_count,
+                        action.expected_replica_status, result);
     return *this;
 }
 
@@ -121,6 +132,20 @@ MasterScenario& MasterScenario::When(PutEndAction action) {
     return *this;
 }
 
+MasterScenario& MasterScenario::When(UpsertEndAction action) {
+    if (!EnsureService()) {
+        return *this;
+    }
+
+    const auto result =
+        service_->UpsertEnd(ActorId(action.actor), action.key,
+                            TenantId::Default(), ReplicaType::MEMORY);
+    ValidateActionResult("UpsertEnd(" + action.key + ")", action.expected_error,
+                         result.has_value(),
+                         result ? ErrorCode::OK : result.error());
+    return *this;
+}
+
 MasterScenario& MasterScenario::When(PutRevokeAction action) {
     if (!EnsureService()) {
         return *this;
@@ -131,6 +156,20 @@ MasterScenario& MasterScenario::When(PutRevokeAction action) {
                             TenantId::Default(), ReplicaType::MEMORY);
     ValidateActionResult("PutRevoke(" + action.key + ")", action.expected_error,
                          result.has_value(),
+                         result ? ErrorCode::OK : result.error());
+    return *this;
+}
+
+MasterScenario& MasterScenario::When(UpsertRevokeAction action) {
+    if (!EnsureService()) {
+        return *this;
+    }
+
+    const auto result =
+        service_->UpsertRevoke(ActorId(action.actor), action.key,
+                               TenantId::Default(), ReplicaType::MEMORY);
+    ValidateActionResult("UpsertRevoke(" + action.key + ")",
+                         action.expected_error, result.has_value(),
                          result ? ErrorCode::OK : result.error());
     return *this;
 }
@@ -155,6 +194,15 @@ MasterScenario& MasterScenario::ThenObject(ObjectSpecData object,
 
     const auto result =
         service_->GetReplicaList(object.key, TenantId::Default());
+    if (expectation == ObjectExpectation::MISSING) {
+        if (result) {
+            Fail("Object(" + object.key + ") exists; expected it not to exist");
+        } else if (result.error() != ErrorCode::OBJECT_NOT_FOUND) {
+            Fail("Object(" + object.key + ") lookup failed with " +
+                 toString(result.error()) + "; expected OBJECT_NOT_FOUND");
+        }
+        return *this;
+    }
     if (expectation == ObjectExpectation::NOT_READY) {
         if (result || result.error() != ErrorCode::REPLICA_IS_NOT_READY) {
             Fail("Object(" + object.key + ") was expected to be not ready");
@@ -242,6 +290,30 @@ void MasterScenario::ValidateActionResult(
     } else if (error != *expected_error) {
         Fail(std::string(action) + " failed with " + toString(error) +
              "; expected " + toString(*expected_error));
+    }
+}
+
+void MasterScenario::ValidateStartResult(
+    std::string_view action, const std::optional<ErrorCode>& expected_error,
+    const std::optional<size_t>& expected_replica_count,
+    const std::optional<ReplicaStatus>& expected_replica_status,
+    const StartResult& result) {
+    ValidateActionResult(action, expected_error, result.has_value(),
+                         result ? ErrorCode::OK : result.error());
+    if (!result) {
+        return;
+    }
+    if (expected_replica_count.has_value() &&
+        result->size() != *expected_replica_count) {
+        Fail(std::string(action) + " returned " +
+             std::to_string(result->size()) + " replicas; expected " +
+             std::to_string(*expected_replica_count));
+    }
+    if (expected_replica_status.has_value() &&
+        std::any_of(result->begin(), result->end(), [&](const auto& replica) {
+            return replica.status != *expected_replica_status;
+        })) {
+        Fail(std::string(action) + " replica status mismatch");
     }
 }
 

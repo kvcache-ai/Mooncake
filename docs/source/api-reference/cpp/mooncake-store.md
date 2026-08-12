@@ -26,14 +26,7 @@ tl::expected<void, ErrorCode> Get(const std::string& object_key,
                                   std::vector<Slice>& slices);
 ```
 
-`Get` retrieves the value of `object_key` into the provided `slices`. The
-returned data is guaranteed to be complete and correct. Each slice must
-reference local DRAM/VRAM memory that has been pre-registered with
-`registerLocalMemory(addr, len)` (not the global segments that contribute to
-the distributed memory pool). The master returns the readable replica list and
-the client selects a complete replica. Depending on the selected replica, the
-data may be read from memory, NoF SSD, legacy shared-filesystem `DISK`,
-client-owned `LOCAL_DISK`, or the configured descriptor-based DFS backend.
+`Get` retrieves the value of `object_key` into the provided `slices`. The returned data is guaranteed to be complete and correct. Each slice must reference local DRAM/VRAM memory that has been pre-registered with `registerLocalMemory(addr, len)` (not the global segments that contribute to the distributed memory pool). The master returns the readable replica list and the client selects a complete replica. Depending on the selected replica, the data may be read from memory, NoF SSD, legacy shared-filesystem `DISK`, client-owned `LOCAL_DISK`, or the configured descriptor-based DFS backend.
 
 ### Put
 
@@ -43,27 +36,17 @@ tl::expected<void, ErrorCode> Put(const ObjectKey& key,
                                   const ReplicateConfig& config);
 ```
 
-`Put` stores the value associated with `key` in the configured replica tiers.
-The `config` parameter controls the number of memory, NoF, and DFS replicas as
-well as placement preferences. Legacy `DISK` persistence and client-owned
-`LOCAL_DISK` SSD offload remain asynchronous.
-When `dfs_replica_num` is `1`, `Put` waits for the requested DFS `WriteAt`
-operation before returning success; this does not provide an additional
-`fsync` durability guarantee.
+`Put` stores the value associated with `key` in the configured replica tiers. The `config` parameter controls the number of memory, NoF, and DFS replicas as well as placement preferences. Legacy `DISK` persistence and client-owned `LOCAL_DISK` SSD offload remain asynchronous. When `dfs_replica_num` is `1`, `Put` waits for the requested DFS `WriteAt` operation before returning success; this does not provide an additional `fsync` durability guarantee.
 
 **Memory Replication Guarantees and Best Effort Behavior:**
 - Each slice of an object is guaranteed to be replicated to different segments, ensuring distribution across separate storage nodes
 - Different slices from different objects may be placed in the same segment
 - Replication operates on a best-effort basis: if insufficient space is available for all requested replicas, the object will still be written with as many replicas as possible
 
-Requests with `dfs_replica_num == 1` use reliable multi-replica mode: allocation
-and every requested transfer must succeed, otherwise `Put` fails and allocated
-replicas are revoked.
+Requests with `dfs_replica_num == 1` use reliable multi-replica mode: allocation and every requested transfer must succeed, otherwise `Put` fails and allocated replicas are revoked.
 
 ```{warning}
-Descriptor-based DFS is a work-in-progress feature for development and
-evaluation. It is not covered by the Store's production fault-tolerance, HA,
-durability, or multi-tenant guarantees.
+Descriptor-based DFS is a work-in-progress feature for development and evaluation. It is not covered by the Store's production fault-tolerance, HA, durability, or multi-tenant guarantees.
 ```
 
 The DFS-related replica-count fields of `ReplicateConfig` are as follows:
@@ -73,20 +56,24 @@ struct ReplicateConfig {
     size_t replica_num{1};                       // Memory replicas
     size_t nof_replica_num{0};                   // NoF SSD replicas
     size_t dfs_replica_num{0};                   // Shared DFS replicas (0 or 1)
-    // Existing pinning, placement, data-type, and grouping fields are omitted.
+    SoftPinAction soft_pin_action{SoftPinAction::PRESERVE};
+    std::optional<uint64_t> soft_pin_ttl_ms{};   // ENABLE override; omitted uses the Master default
+    bool with_hard_pin{false};                   // Whether to enable hard pin (never evicted)
+    std::string preferred_segment{};             // Preferred segment for allocation
+    // Other placement, data-type, and grouping fields are omitted.
 };
 ```
 
-`dfs_replica_num` may currently be `0` or `1`. When it is `1`,
-`replica_num >= 1` is required, so DFS-only placement is not supported. DFS
-replicas currently support only the `default` tenant and require the master and
-client DFS backends to be configured with the same shared root and shard
-layout. See the {ref}`DFS deployment documentation <dfs-storage>` for setup and
-lifecycle limitations. Native C++ clients must initialize a
-`DistributedStorageBackend` and attach it with `SetDfsStorageBackend()` before
-issuing DFS reads or writes. DFS descriptors are carried by each `PutStart`,
-`UpsertStart`, or query response; there is no client-side descriptor cache. The
-Python/RealClient setup path attaches the backend through `FileStorage`.
+`dfs_replica_num` may currently be `0` or `1`. When it is `1`, `replica_num >= 1` is required, so DFS-only placement is not supported. DFS replicas currently support only the `default` tenant and require the master and client DFS backends to be configured with the same shared root and shard layout. See the {ref}`DFS deployment documentation <dfs-storage>` for setup and lifecycle limitations. Native C++ clients must initialize a `DistributedStorageBackend` and attach it with `SetDfsStorageBackend()` before issuing DFS reads or writes. DFS descriptors are carried by each `PutStart`, `UpsertStart`, or query response; there is no client-side descriptor cache. The Python/RealClient setup path attaches the backend through `FileStorage`.
+
+Soft pinning starts when the first replica becomes readable and has a fixed
+lifetime: reads do not extend it. `PRESERVE` keeps the committed deadline on an
+Upsert, `ENABLE` starts a new lifetime, and `DISABLE` removes it when the write
+commits. `soft_pin_ttl_ms` is valid only with `ENABLE`; zero commits ordinary
+cache, and values above the Master's configured maximum are rejected.
+Soft-pin state is not persisted in snapshots or the HA OpLog; after recovery or
+Standby promotion, restored objects are ordinary cache until a later write
+explicitly enables soft pinning again.
 
 ### Upsert
 
