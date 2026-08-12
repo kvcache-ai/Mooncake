@@ -2652,7 +2652,7 @@ auto MasterService::ExistKey(const std::string& key, const TenantId& tenant_id)
     }
 
     const auto& metadata = accessor.Get();
-    if (!metadata.HasReplica(&Replica::fn_is_completed)) {
+    if (!HasReadableReplica(metadata)) {
         return false;
     }
 
@@ -2723,7 +2723,7 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
             }
 
             const auto& metadata = it->second;
-            if (!metadata.HasReplica(&Replica::fn_is_completed)) {
+            if (!HasReadableReplica(metadata)) {
                 results[i] = false;
                 continue;
             }
@@ -2737,6 +2737,7 @@ std::vector<tl::expected<bool, ErrorCode>> MasterService::BatchExistKey(
 auto MasterService::GetAllKeys(const TenantId& tenant_id)
     -> tl::expected<std::vector<std::string>, ErrorCode> {
     std::vector<std::string> all_keys;
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     const TenantId& normalized_tenant = ResolveRequestTenantId(tenant_id);
     for (size_t i = 0; i < kNumShards; i++) {
         MetadataShardAccessorRO shard(this, i);
@@ -2745,7 +2746,7 @@ auto MasterService::GetAllKeys(const TenantId& tenant_id)
             continue;
         }
         for (const auto& item : tenant_it->second.metadata) {
-            if (!item.second.IsValid()) {
+            if (!HasReadableReplica(item.second)) {
                 continue;
             }
             all_keys.push_back(item.second.user_key.empty()
@@ -3305,6 +3306,11 @@ bool MasterService::IsReplicaReadable(const Replica& replica) const {
         endpoint = descriptor.get_local_disk_descriptor().transport_endpoint;
     }
     return !endpoint || !invalid_replica_endpoints_.contains(*endpoint);
+}
+
+bool MasterService::HasReadableReplica(const ObjectMetadata& metadata) const {
+    return metadata.HasReplica(
+        [this](const Replica& replica) { return IsReplicaReadable(replica); });
 }
 
 auto MasterService::GetReplicaListByRegex(const std::string& regex_pattern,

@@ -97,6 +97,27 @@ class MasterServiceTest : public ::testing::Test {
         service.replica_cleanup_worker_.Schedule();
     }
 
+    void ExpectKeyHiddenFromReadApis(MasterService& service,
+                                     const std::string& key) {
+        auto get = service.GetReplicaList(key, TenantId::Default());
+        ASSERT_FALSE(get.has_value());
+        EXPECT_EQ(ErrorCode::REPLICA_IS_NOT_READY, get.error());
+
+        auto exists = service.ExistKey(key, TenantId::Default());
+        ASSERT_TRUE(exists.has_value());
+        EXPECT_FALSE(*exists);
+
+        auto batch_exists = service.BatchExistKey({key}, TenantId::Default());
+        ASSERT_EQ(1u, batch_exists.size());
+        ASSERT_TRUE(batch_exists[0].has_value());
+        EXPECT_FALSE(*batch_exists[0]);
+
+        auto all_keys = service.GetAllKeys(TenantId::Default());
+        ASSERT_TRUE(all_keys.has_value());
+        EXPECT_EQ(all_keys->end(),
+                  std::find(all_keys->begin(), all_keys->end(), key));
+    }
+
     std::optional<std::chrono::system_clock::time_point> GetSoftPinDeadline(
         MasterService& service, const std::string& key,
         const std::string& tenant_id = "default") {
@@ -4359,6 +4380,62 @@ TEST_F(MasterServiceTest, UnmountSegmentKeepsSynchronousCleanupInHaMode) {
 
     ASSERT_TRUE(service->UnmountSegment(segment.id, client_id).has_value());
     EXPECT_EQ(0u, service->GetKeyCount());
+}
+
+TEST_F(MasterServiceTest, CopyInProgressDoesNotKeepUnmountedSourceVisible) {
+    auto service = std::make_unique<MasterService>();
+    const auto source =
+        PrepareSimpleSegment(*service, "copy_source", kDefaultSegmentBase);
+    PrepareSimpleSegment(*service, "copy_target",
+                         kDefaultSegmentBase + kDefaultSegmentSize);
+
+    const UUID client_id = generate_uuid();
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "copy_source";
+    PutCompletedObject(*service, client_id, "copy_key", config);
+    ASSERT_TRUE(service
+                    ->CopyStart(client_id, "copy_key", TenantId::Default(),
+                                "copy_source", {"copy_target"})
+                    .has_value());
+
+    PauseReplicaCleanup(*service);
+    ASSERT_TRUE(service->UnmountSegment(source.segment_id, source.client_id)
+                    .has_value());
+
+    ExpectKeyHiddenFromReadApis(*service, "copy_key");
+
+    ASSERT_TRUE(service->CopyRevoke(client_id, "copy_key", TenantId::Default())
+                    .has_value());
+    ResumeReplicaCleanup(*service);
+}
+
+TEST_F(MasterServiceTest, MoveInProgressDoesNotKeepUnmountedSourceVisible) {
+    auto service = std::make_unique<MasterService>();
+    const auto source =
+        PrepareSimpleSegment(*service, "move_source", kDefaultSegmentBase);
+    PrepareSimpleSegment(*service, "move_target",
+                         kDefaultSegmentBase + kDefaultSegmentSize);
+
+    const UUID client_id = generate_uuid();
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segment = "move_source";
+    PutCompletedObject(*service, client_id, "move_key", config);
+    ASSERT_TRUE(service
+                    ->MoveStart(client_id, "move_key", TenantId::Default(),
+                                "move_source", "move_target")
+                    .has_value());
+
+    PauseReplicaCleanup(*service);
+    ASSERT_TRUE(service->UnmountSegment(source.segment_id, source.client_id)
+                    .has_value());
+
+    ExpectKeyHiddenFromReadApis(*service, "move_key");
+
+    ASSERT_TRUE(service->MoveRevoke(client_id, "move_key", TenantId::Default())
+                    .has_value());
+    ResumeReplicaCleanup(*service);
 }
 
 TEST_F(MasterServiceTest, ReadableAfterPartialUnmountWithReplication) {
