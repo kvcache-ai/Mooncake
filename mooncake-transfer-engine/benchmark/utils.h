@@ -76,6 +76,7 @@ struct XferBenchConfig {
     static std::string workload_classes_json;
     static double qos_link_capacity_gbps;
     static std::string qos_output_jsonl;
+    static uint64_t request_interval_us;
     static uint64_t deadline_us;
     static int deadline_tight_threads;
     static bool deadline_bw_arbitration;
@@ -147,6 +148,7 @@ struct XferMetricStats {
 struct XferBenchStats {
     XferMetricStats total_duration;
     XferMetricStats transfer_duration;
+    XferMetricStats instant_bandwidth;
 };
 
 class XferBenchTimer {
