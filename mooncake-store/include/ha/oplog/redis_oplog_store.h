@@ -108,7 +108,9 @@ class RedisOpLogStore : public OpLogStore {
     // - latest: committed progress watermark; dropped entries may leave holes
     // - trimmed: highest sequence already removed by cleanup
     // - entry:<seq>: serialized oplog payload
-    std::string key_tag_;
+    // OpLog keys intentionally avoid Redis Cluster hash tags so
+    // high-cardinality entry keys can spread across slots.
+    std::string key_prefix_;
     std::string latest_key_;
     std::string trimmed_key_;
     std::string snapshot_prefix_;

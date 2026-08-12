@@ -6,6 +6,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <vector>
 #include <string>
 #include <thread>
 
@@ -35,7 +36,7 @@ TEST(RedisOpLogStoreStandaloneTest, InvalidEndpointReturnsError) {
 }
 
 TEST(RedisOpLogStoreStandaloneTest, EndpointRequiresExplicitPort) {
-    for (const std::string& endpoint : {"", "127.0.0.1", "[::1]", "::1"}) {
+    for (const char* endpoint : {"", "127.0.0.1", "[::1]", "::1"}) {
         RedisOpLogStore store("invalid_endpoint_test", endpoint,
                               /*enable_write=*/true,
                               /*poll_interval_ms=*/10);
@@ -101,16 +102,16 @@ class RedisOpLogStoreTest : public ::testing::Test {
         return {host, port};
     }
 
-    void CleanupKeys() const {
+    std::vector<std::string> ScanKeys(const std::string& pattern) const {
+        std::vector<std::string> keys;
         auto [host, port] = ParseEndpoint();
         redisContext* ctx = redisConnect(host.c_str(), port);
         if (!testing::AuthenticateRedisContext(ctx, redis_username_,
                                                redis_password_)) {
             if (ctx) redisFree(ctx);
-            return;
+            return keys;
         }
         std::string cursor = "0";
-        const std::string pattern = "mooncake:{" + cluster_id_ + "}:oplog*";
         do {
             RedisReplyPtr scan((redisReply*)redisCommand(
                 ctx, "SCAN %b MATCH %b COUNT 100", cursor.data(), cursor.size(),
@@ -123,14 +124,30 @@ class RedisOpLogStoreTest : public ::testing::Test {
                 break;
             }
             cursor.assign(scan->element[0]->str, scan->element[0]->len);
-            redisReply* keys = scan->element[1];
-            for (size_t i = 0; i < keys->elements; ++i) {
-                redisReply* key = keys->element[i];
+            redisReply* scanned_keys = scan->element[1];
+            for (size_t i = 0; i < scanned_keys->elements; ++i) {
+                redisReply* key = scanned_keys->element[i];
                 if (!key || key->type != REDIS_REPLY_STRING) continue;
-                RedisReplyPtr del((redisReply*)redisCommand(
-                    ctx, "DEL %b", key->str, key->len));
+                keys.emplace_back(key->str, key->len);
             }
         } while (cursor != "0");
+        redisFree(ctx);
+        return keys;
+    }
+
+    void CleanupKeys() const {
+        auto keys = ScanKeys("mooncake:" + cluster_id_ + ":oplog*");
+        auto [host, port] = ParseEndpoint();
+        redisContext* ctx = redisConnect(host.c_str(), port);
+        if (!testing::AuthenticateRedisContext(ctx, redis_username_,
+                                               redis_password_)) {
+            if (ctx) redisFree(ctx);
+            return;
+        }
+        for (const auto& key : keys) {
+            RedisReplyPtr del((redisReply*)redisCommand(
+                ctx, "DEL %b", key.data(), key.size()));
+        }
         redisFree(ctx);
     }
 
@@ -182,6 +199,32 @@ TEST_F(RedisOpLogStoreTest, WriteReadAndLatestSequence) {
     uint64_t latest = 0;
     ASSERT_EQ(ErrorCode::OK, reader->GetLatestSequenceId(latest));
     EXPECT_EQ(2u, latest);
+}
+
+TEST_F(RedisOpLogStoreTest, OpLogKeysDoNotUseRedisHashTags) {
+    auto writer = CreateWriter();
+    ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(MakeEntry(1), true));
+    ASSERT_EQ(ErrorCode::OK, writer->RecordSnapshotSequenceId("snap-a", 1));
+
+    const std::string key_prefix = "mooncake:" + cluster_id_ + ":oplog";
+    auto keys = ScanKeys(key_prefix + "*");
+    EXPECT_NE(std::find(keys.begin(), keys.end(), key_prefix + ":latest"),
+              keys.end());
+    EXPECT_NE(std::find(keys.begin(), keys.end(), key_prefix + ":trimmed"),
+              keys.end());
+    EXPECT_NE(std::find(keys.begin(), keys.end(),
+                        key_prefix + ":entry:00000000000000000001"),
+              keys.end());
+    EXPECT_NE(
+        std::find(keys.begin(), keys.end(), key_prefix + ":snapshot:snap-a"),
+        keys.end());
+    for (const auto& key : keys) {
+        EXPECT_EQ(std::string::npos, key.find('{')) << key;
+        EXPECT_EQ(std::string::npos, key.find('}')) << key;
+    }
+
+    auto old_hash_tag_keys = ScanKeys("mooncake:{" + cluster_id_ + "}:oplog*");
+    EXPECT_TRUE(old_hash_tag_keys.empty());
 }
 
 TEST_F(RedisOpLogStoreTest, ReadSinceReturnsOrderedEntries) {

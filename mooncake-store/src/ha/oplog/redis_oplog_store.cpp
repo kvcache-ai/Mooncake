@@ -63,10 +63,10 @@ RedisOpLogStore::RedisOpLogStore(
     if (cluster_id_.empty()) {
         cluster_id_ = "default";
     }
-    key_tag_ = "mooncake:{" + cluster_id_ + "}:oplog";
-    latest_key_ = key_tag_ + ":latest";
-    trimmed_key_ = key_tag_ + ":trimmed";
-    snapshot_prefix_ = key_tag_ + ":snapshot:";
+    key_prefix_ = "mooncake:" + cluster_id_ + ":oplog";
+    latest_key_ = key_prefix_ + ":latest";
+    trimmed_key_ = key_prefix_ + ":trimmed";
+    snapshot_prefix_ = key_prefix_ + ":snapshot:";
 }
 
 RedisOpLogStore::~RedisOpLogStore() {
@@ -154,7 +154,7 @@ ErrorCode RedisOpLogStore::Init() {
 }
 
 std::string RedisOpLogStore::EntryKey(uint64_t sequence_id) const {
-    return key_tag_ + ":entry:" + SequenceMember(sequence_id);
+    return key_prefix_ + ":entry:" + SequenceMember(sequence_id);
 }
 
 std::string RedisOpLogStore::SnapshotKey(const std::string& snapshot_id) const {

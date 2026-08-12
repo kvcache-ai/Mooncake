@@ -119,7 +119,7 @@ void CleanupRedisKeys() {
     keys.push_back("mooncake:{" + FLAGS_redis_cluster_id +
                    "}:masters:metadata");
     std::string oplog_pattern =
-        "mooncake:{" + FLAGS_redis_cluster_id + "}:oplog*";
+        "mooncake:" + FLAGS_redis_cluster_id + ":oplog*";
     redisReply* keys_reply = static_cast<redisReply*>(redisCommand(
         ctx, "KEYS %b", oplog_pattern.data(), oplog_pattern.size()));
     if (keys_reply && keys_reply->type == REDIS_REPLY_ARRAY) {
