@@ -321,9 +321,36 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
     for (size_t i = 0; i < chunks.size(); ++i) event_queue.push(i);
     std::vector<std::future<Status>> remote_futures(chunks.size());
 
+    // The loop below can leave through the CHECK_STATUS on progressBatch or
+    // through the FAILED branch, which only drains the queue. Either way the
+    // chunks still in flight own a batch that nobody would free.
+    struct PendingBatches {
+        TransferEngineImpl* impl;
+        std::vector<Chunk>& chunks;
+        ~PendingBatches() {
+            for (auto& chunk : chunks) {
+                if (!chunk.batch) continue;
+                auto status = impl->freeBatch(chunk.batch);
+                if (!status.ok())
+                    LOG(WARNING)
+                        << "failed to free chunk batch: " << status.ToString();
+                chunk.batch = 0;
+            }
+        }
+    } pending_batches{impl_, chunks};
+
+    // An in-flight chunk goes straight back on the queue, so this loop spins
+    // with nothing to do -- and the INFLIGHT case takes progress_mutex_ every
+    // pass. Back off only after a whole sweep advanced no chunk, so a queue
+    // that is progressing still runs at full speed.
+    size_t sweep_remaining = event_queue.size();
+    bool swept_progress = false;
+    uint64_t idle_sweeps = 0;
+
     while (!event_queue.empty()) {
         auto id = event_queue.front();
         auto& chunk = chunks[id];
+        const auto state_before = chunk.state;
         event_queue.pop();
         switch (chunk.state) {
             case StageState::PRE: {
@@ -494,6 +521,17 @@ Status ProxyManager::transferEventLoop(StagingTask& task,
                 }
                 break;
             }
+        }
+
+        if (chunk.state != state_before) swept_progress = true;
+        if (sweep_remaining > 0) --sweep_remaining;
+        if (sweep_remaining == 0) {
+            if (swept_progress)
+                idle_sweeps = 0;
+            else
+                waitBeforeNextPoll(idle_sweeps++);
+            swept_progress = false;
+            sweep_remaining = event_queue.size();
         }
     }
 

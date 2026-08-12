@@ -48,6 +48,18 @@ class Platform;
 class ProxyManager;
 class ProgressWorker;
 
+// How long a poll loop should pause before polling again. Zero means poll
+// immediately.
+//
+// progressBatch takes progress_mutex_ every call, so an unthrottled loop does
+// not just burn a core -- it contends with every other thread's submit and
+// poll path. Hot for the first iterations so short transfers keep their
+// latency, then exponential backoff to a cap.
+std::chrono::microseconds nextPollDelay(uint64_t poll_count);
+
+// One backoff step: yields while nextPollDelay is zero, sleeps after that.
+void waitBeforeNextPoll(uint64_t poll_count);
+
 struct TaskInfo {
     TransportType type{UNSPEC};
     int sub_task_id{-1};
@@ -189,6 +201,13 @@ class TransferEngineImpl {
         if (type >= 0 && type < (TransportType)kSupportedTransportTypes) {
             transport_list_[type] = std::move(xport);
         }
+    }
+
+    // Test-only hook: how many batches are still alive. Lets a test assert
+    // that a failed transfer released its batch rather than leaking it.
+    size_t aliveBatchCountForTest() {
+        std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+        return alive_batches_.size();
     }
 
     // Wake the optional event-driven progress worker for `batch_id`. No-op if
