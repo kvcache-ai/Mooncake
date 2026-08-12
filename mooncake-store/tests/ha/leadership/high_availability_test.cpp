@@ -14,6 +14,7 @@
 #endif
 #include "ha/leadership/leader_coordinator_factory.h"
 #include "ha/leadership/high_availability_test_fixture.h"
+#include "master_service.h"
 #include "types.h"
 
 namespace mooncake {
@@ -95,7 +96,93 @@ std::unique_ptr<ha::LeaderCoordinator> CreateEtcdCoordinatorOrNull(
     return std::move(coordinator.value());
 }
 
+class FakeLeaderCoordinator : public ha::LeaderCoordinator {
+   public:
+    explicit FakeLeaderCoordinator(ViewVersionId view_version)
+        : session_{.view = {.leader_address = "fake-leader",
+                            .view_version = view_version},
+                   .owner_token = "fake-owner",
+                   .lease_ttl = std::chrono::milliseconds(0)} {}
+
+    tl::expected<std::optional<ha::MasterView>, ErrorCode> ReadCurrentView()
+        override {
+        return std::optional<ha::MasterView>{};
+    }
+
+    tl::expected<ha::AcquireLeadershipResult, ErrorCode> TryAcquireLeadership(
+        const std::string& /*leader_address*/) override {
+        return ha::AcquireLeadershipResult{
+            .status = ha::AcquireLeadershipStatus::ACQUIRED,
+            .session = session_,
+            .observed_view = std::nullopt,
+        };
+    }
+
+    tl::expected<bool, ErrorCode> RenewLeadership(
+        const ha::LeadershipSession& /*session*/) override {
+        return true;
+    }
+
+    tl::expected<ha::ViewChangeResult, ErrorCode> WaitForViewChange(
+        std::optional<ViewVersionId> /*known_version*/,
+        std::chrono::milliseconds /*timeout*/) override {
+        return ha::ViewChangeResult{};
+    }
+
+    tl::expected<std::unique_ptr<ha::LeadershipMonitorHandle>, ErrorCode>
+    StartLeadershipMonitor(
+        const ha::LeadershipSession& /*session*/,
+        ha::LeadershipLostCallback /*on_leadership_lost*/) override {
+        return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
+    }
+
+    ErrorCode ReleaseLeadership(
+        const ha::LeadershipSession& /*session*/) override {
+        return ErrorCode::OK;
+    }
+
+   private:
+    ha::LeadershipSession session_;
+};
+
 }  // namespace
+
+TEST_F(HighAvailabilityTest, AcquiredViewFlowsIntoServingMasterService) {
+    constexpr ViewVersionId kAcquiredView = 42;
+    FakeLeaderCoordinator coordinator(kAcquiredView);
+    auto acquired = coordinator.TryAcquireLeadership("primary");
+    ASSERT_TRUE(acquired.has_value());
+    ASSERT_TRUE(acquired->session.has_value());
+
+    MasterServiceSupervisorConfig supervisor_config;
+    supervisor_config.default_kv_lease_ttl = DEFAULT_DEFAULT_KV_LEASE_TTL;
+    supervisor_config.default_kv_soft_pin_ttl = DEFAULT_KV_SOFT_PIN_TTL_MS;
+    supervisor_config.allow_evict_soft_pinned_objects = true;
+    supervisor_config.enable_metric_reporting = false;
+    supervisor_config.metrics_port = 0;
+    supervisor_config.eviction_ratio = DEFAULT_EVICTION_RATIO;
+    supervisor_config.eviction_high_watermark_ratio =
+        DEFAULT_EVICTION_HIGH_WATERMARK_RATIO;
+    supervisor_config.nof_eviction_ratio = DEFAULT_NOF_EVICTION_RATIO;
+    supervisor_config.nof_eviction_high_watermark_ratio =
+        DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO;
+    supervisor_config.client_live_ttl_sec = DEFAULT_CLIENT_LIVE_TTL_SEC;
+    supervisor_config.nof_heartbeat_interval_sec =
+        DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC;
+    supervisor_config.nof_heartbeat_probe_timeout_ms =
+        DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS;
+    supervisor_config.nof_heartbeat_failures_threshold =
+        DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD;
+    supervisor_config.enable_offload = false;
+
+    WrappedMasterServiceConfig serving_config(
+        supervisor_config, acquired->session->view.view_version);
+    MasterService service{MasterServiceConfig(serving_config)};
+
+    auto ping = service.Ping(generate_uuid());
+    ASSERT_TRUE(ping.has_value());
+    EXPECT_EQ(kAcquiredView, ping->view_version_id);
+}
 
 #ifdef STORE_USE_ETCD
 
