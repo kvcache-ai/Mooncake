@@ -131,13 +131,11 @@ tl::expected<DistributedFSDescriptor, ErrorCode> DfsGlobalAllocator::Allocate(
     std::unique_lock handle_lock(shard.handle_mutex);
     ProcessPendingFrees(shard_idx);
 
-    const uint64_t free_before =
-        shard.allocator->storageReport().totalFreeSpace;
-    auto handle = shard.allocator->allocate(aligned_size + alignment_ - 1);
-    if (!handle) return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
-    const uint64_t free_after = shard.allocator->storageReport().totalFreeSpace;
+    const uint64_t allocation_size = aligned_size + alignment_ - 1;
     const uint64_t reserved_bytes =
-        free_before > free_after ? free_before - free_after : handle->size();
+        shard.allocator->normalizedAllocationSize(allocation_size);
+    auto handle = shard.allocator->allocate(allocation_size);
+    if (!handle) return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
 
     uint64_t raw_offset = handle->address();
     uint64_t alloc_offset = AlignSize(raw_offset);
