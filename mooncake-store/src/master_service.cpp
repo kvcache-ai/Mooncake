@@ -5695,7 +5695,8 @@ tl::expected<void, ErrorCode> MasterService::CopyRevoke(
     }
 
     // Erase all replica_ids
-    for (const auto& replica_id : task.replica_ids) {
+    const auto replica_ids = task.replica_ids;
+    for (const auto& replica_id : replica_ids) {
         EraseReplicasWithCacheTotalAccounting(
             metadata, [&replica_id](const Replica& replica) {
                 return replica.id() == replica_id;
@@ -5706,7 +5707,7 @@ tl::expected<void, ErrorCode> MasterService::CopyRevoke(
                        task.pending_quota_charge_bytes);
     accessor.EraseReplicationTask();
 
-    metadata.ForgetDynamicReplicas(task.replica_ids);
+    metadata.ForgetDynamicReplicas(replica_ids);
     ClearDynamicReplicationStateForKey(accessor.GetTenantState(), key);
 
     if (!metadata.IsValid()) {
