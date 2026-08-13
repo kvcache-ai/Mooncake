@@ -3541,6 +3541,24 @@ RealClient::resolve_writable_buffer_region(void *buffer) const {
     return std::nullopt;
 }
 
+bool RealClient::can_use_direct_memory_read(const Replica::Descriptor &replica,
+                                            void *buffer, size_t size) const {
+    if (!replica.is_memory_replica()) return false;
+    // The selected replica's descriptor controls Transfer Engine routing.
+    // NVLink accepts ordinary CUDA allocations as local endpoints, while RDMA
+    // requires the destination range to have a local memory registration.
+    const std::string &replica_protocol =
+        replica.get_memory_descriptor().buffer_descriptor.protocol_;
+    if (replica_protocol == "nvlink") {
+        return true;
+    }
+    if (replica_protocol != "rdma") {
+        return false;
+    }
+    auto region = resolve_writable_buffer_region(buffer);
+    return region.has_value() && size <= region->size - region->offset;
+}
+
 tl::expected<RealClient::RangedReadMetadata, ErrorCode>
 RealClient::resolve_ranged_read_metadata(
     const std::string &key, const QueryResultCache *query_result_cache) {
@@ -3646,7 +3664,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
             device::GetAcceleratorRegistry().RuntimeAccelerators();
         void *dst = static_cast<char *>(buffer) + dst_offset;
         if (runtime_accelerator.FindDeviceForPointer(dst) &&
-            (!client_->CanUseLocalMemcpy(replica) ||
+            ((!client_->CanUseLocalMemcpy(replica) &&
+              !can_use_direct_memory_read(replica, dst, total_size)) ||
              client_->IsHotCacheEnabled())) {
             if (!client_buffer_allocator_) {
                 LOG(ERROR) << "Client buffer allocator is not provided";
@@ -3788,7 +3807,8 @@ tl::expected<int64_t, ErrorCode> RealClient::execute_ranged_read(
     void *dst = static_cast<char *>(buffer) + dst_offset;
     auto filtered_qr = FilterQueryResult(query_result, replica, false);
     if (runtime_accelerator.FindDeviceForPointer(dst) &&
-        !client_->CanUseLocalMemcpy(replica)) {
+        !client_->CanUseLocalMemcpy(replica) &&
+        !can_use_direct_memory_read(replica, dst, size)) {
         if (!client_buffer_allocator_) {
             LOG(ERROR) << "Client buffer allocator is not provided";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
