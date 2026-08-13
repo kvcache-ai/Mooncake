@@ -256,15 +256,27 @@ template <>
 struct RpcNameTraits<&WrappedMasterService::CopyStart> {
     static constexpr const char* value = "CopyStart";
 };
+template <>
+struct RpcNameTraits<&WrappedMasterService::DynamicReplicaCopyStart> {
+    static constexpr const char* value = "DynamicReplicaCopyStart";
+};
 
 template <>
 struct RpcNameTraits<&WrappedMasterService::CopyEnd> {
     static constexpr const char* value = "CopyEnd";
 };
+template <>
+struct RpcNameTraits<&WrappedMasterService::DynamicReplicaCopyEnd> {
+    static constexpr const char* value = "DynamicReplicaCopyEnd";
+};
 
 template <>
 struct RpcNameTraits<&WrappedMasterService::CopyRevoke> {
     static constexpr const char* value = "CopyRevoke";
+};
+template <>
+struct RpcNameTraits<&WrappedMasterService::DynamicReplicaCopyRevoke> {
+    static constexpr const char* value = "DynamicReplicaCopyRevoke";
 };
 
 template <>
@@ -285,11 +297,6 @@ struct RpcNameTraits<&WrappedMasterService::MoveRevoke> {
 template <>
 struct RpcNameTraits<&WrappedMasterService::CreateCopyTask> {
     static constexpr const char* value = "CreateCopyTask";
-};
-
-template <>
-struct RpcNameTraits<&WrappedMasterService::SubmitReplicaActionProposal> {
-    static constexpr const char* value = "SubmitReplicaActionProposal";
 };
 
 template <>
@@ -965,19 +972,6 @@ tl::expected<UUID, ErrorCode> MasterClient::CreateCopyTask(
     return result;
 }
 
-tl::expected<ReplicaActionLease, ErrorCode>
-MasterClient::SubmitReplicaActionProposal(
-    const ReplicaActionProposal& proposal) {
-    ScopedVLogTimer timer(1, "MasterClient::SubmitReplicaActionProposal");
-    timer.LogRequest("key=", proposal.key, ", tenant_id=", proposal.tenant_id,
-                     ", action=", static_cast<int>(proposal.action));
-
-    auto result = invoke_rpc<&WrappedMasterService::SubmitReplicaActionProposal,
-                             ReplicaActionLease>(proposal);
-    timer.LogResponseExpected(result);
-    return result;
-}
-
 tl::expected<UUID, ErrorCode> MasterClient::CreateMoveTask(
     const std::string& key, const std::string& source,
     const std::string& target) {
@@ -1144,6 +1138,26 @@ tl::expected<CopyStartResponse, ErrorCode> MasterClient::CopyStart(
     return result;
 }
 
+tl::expected<CopyStartResponse, ErrorCode>
+MasterClient::DynamicReplicaCopyStart(
+    const std::string& key, const std::string& tenant_id,
+    const std::string& src_segment,
+    const std::vector<std::string>& tgt_segments,
+    const UUID& dynamic_replication_lease_id,
+    uint64_t dynamic_replication_version_epoch) {
+    ScopedVLogTimer timer(1, "MasterClient::DynamicReplicaCopyStart");
+    timer.LogRequest("key=", key, ", tenant_id=", tenant_id,
+                     ", src_segment=", src_segment,
+                     ", tgt_segments_count=", tgt_segments.size());
+
+    auto result = invoke_rpc<&WrappedMasterService::DynamicReplicaCopyStart,
+                             CopyStartResponse>(
+        client_id_, key, tenant_id, src_segment, tgt_segments,
+        dynamic_replication_lease_id, dynamic_replication_version_epoch);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<QueryTaskResponse, ErrorCode> MasterClient::QueryTask(
     const UUID& task_id) {
     ScopedVLogTimer timer(1, "MasterClient::QueryTask");
@@ -1171,6 +1185,21 @@ tl::expected<void, ErrorCode> MasterClient::CopyEnd(
     return result;
 }
 
+tl::expected<void, ErrorCode> MasterClient::DynamicReplicaCopyEnd(
+    const std::string& key, const std::string& tenant_id,
+    const UUID& dynamic_replication_lease_id,
+    uint64_t dynamic_replication_version_epoch) {
+    ScopedVLogTimer timer(1, "MasterClient::DynamicReplicaCopyEnd");
+    timer.LogRequest("key=", key, ", tenant_id=", tenant_id);
+
+    auto result =
+        invoke_rpc<&WrappedMasterService::DynamicReplicaCopyEnd, void>(
+            client_id_, key, tenant_id, dynamic_replication_lease_id,
+            dynamic_replication_version_epoch);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
 tl::expected<std::vector<TaskAssignment>, ErrorCode> MasterClient::FetchTasks(
     size_t batch_size) {
     ScopedVLogTimer timer(1, "MasterClient::FetchTasks");
@@ -1193,6 +1222,21 @@ tl::expected<void, ErrorCode> MasterClient::CopyRevoke(
 
     auto result = invoke_rpc<&WrappedMasterService::CopyRevoke, void>(
         client_id_, key, tenant_id);
+    timer.LogResponseExpected(result);
+    return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::DynamicReplicaCopyRevoke(
+    const std::string& key, const std::string& tenant_id,
+    const UUID& dynamic_replication_lease_id,
+    uint64_t dynamic_replication_version_epoch) {
+    ScopedVLogTimer timer(1, "MasterClient::DynamicReplicaCopyRevoke");
+    timer.LogRequest("key=", key, ", tenant_id=", tenant_id);
+
+    auto result =
+        invoke_rpc<&WrappedMasterService::DynamicReplicaCopyRevoke, void>(
+            client_id_, key, tenant_id, dynamic_replication_lease_id,
+            dynamic_replication_version_epoch);
     timer.LogResponseExpected(result);
     return result;
 }

@@ -8,6 +8,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <list>
 #include <limits>
@@ -587,15 +588,21 @@ class MasterService {
     tl::expected<CopyStartResponse, ErrorCode> CopyStart(
         const UUID& client_id, const std::string& key,
         const TenantId& tenant_id, const std::string& src_segment,
-        const std::vector<std::string>& tgt_segments);
+        const std::vector<std::string>& tgt_segments,
+        const UUID& dynamic_replication_lease_id = UUID{},
+        uint64_t dynamic_replication_version_epoch = 0);
 
-    tl::expected<void, ErrorCode> CopyEnd(const UUID& client_id,
-                                          const std::string& key,
-                                          const TenantId& tenant_id);
+    tl::expected<void, ErrorCode> CopyEnd(
+        const UUID& client_id, const std::string& key,
+        const TenantId& tenant_id,
+        const UUID& dynamic_replication_lease_id = UUID{},
+        uint64_t dynamic_replication_version_epoch = 0);
 
-    tl::expected<void, ErrorCode> CopyRevoke(const UUID& client_id,
-                                             const std::string& key,
-                                             const TenantId& tenant_id);
+    tl::expected<void, ErrorCode> CopyRevoke(
+        const UUID& client_id, const std::string& key,
+        const TenantId& tenant_id,
+        const UUID& dynamic_replication_lease_id = UUID{},
+        uint64_t dynamic_replication_version_epoch = 0);
 
     /**
      * @brief Start a move operation
@@ -805,8 +812,8 @@ class MasterService {
         const std::vector<std::string>& targets);
 
     /**
-     * @brief Submit a dynamic replica action proposal from the Mooncake
-     * reader-side path.
+     * @brief Submit a dynamic replica action proposal after Master-side
+     * hotness admission.
      */
     tl::expected<ReplicaActionLease, ErrorCode> SubmitReplicaActionProposal(
         const ReplicaActionProposal& proposal);
@@ -950,6 +957,7 @@ class MasterService {
     // And also we can add some task ttl mechanism in the future
     void TaskCleanupThreadFunc();
     void JobDispatchThreadFunc();
+    void DynamicReplicationAdmissionThreadFunc();
 
     // Internal data structures
     struct ObjectIdentity {
@@ -1487,6 +1495,9 @@ class MasterService {
         ReplicaID source_id;
         std::vector<ReplicaID> replica_ids;
         uint64_t pending_quota_charge_bytes{0};
+        UUID dynamic_replication_lease_id{};
+        uint64_t dynamic_replication_version_epoch{0};
+        bool durable_cleanup_pending{false};
     };
 
     struct OffloadingTask {
@@ -1561,8 +1572,7 @@ class MasterService {
         TenantQuotaHandle quota_account{nullptr};
         std::unordered_map<std::string, ObjectMetadata> metadata;
         std::unordered_set<std::string> processing_keys;
-        std::unordered_map<std::string, const ReplicationTask>
-            replication_tasks;
+        std::unordered_map<std::string, ReplicationTask> replication_tasks;
         std::unordered_map<std::string, const OffloadingTask> offloading_tasks;
         std::unordered_map<std::string, PromotionTask> promotion_tasks;
         std::unordered_map<std::string, PromotionCandidate>
@@ -1658,8 +1668,8 @@ class MasterService {
         const std::function<bool(const Replica&)>& pred_fn);
     std::vector<Replica> PopReplicasWithCacheTotalAccounting(
         ObjectMetadata& metadata);
-    void RecordDynamicReplicaRemoval(ObjectMetadata& metadata,
-                                     const std::vector<ReplicaID>& replica_ids);
+    size_t RecordDynamicReplicaRemoval(
+        ObjectMetadata& metadata, const std::vector<ReplicaID>& replica_ids);
     size_t EraseReplicasWithCacheTotalAccounting(
         ObjectMetadata& metadata,
         const std::function<bool(const Replica&)>& pred_fn,
@@ -1837,6 +1847,8 @@ class MasterService {
     void FinalizeExpiredReplicationTaskAfterDurable(
         const OpLogEntry& durable_entry, ReplicaID source_id,
         const std::vector<ReplicaID>& target_ids,
+        const UUID& dynamic_replication_lease_id,
+        uint64_t dynamic_replication_version_epoch,
         const std::chrono::system_clock::time_point& ttl);
     struct StaleHandleCleanupPlan {
         std::vector<ReplicaID> removed_ids;
@@ -2133,7 +2145,7 @@ class MasterService {
         // Get metadata (only call when Exists() is true)
         ObjectMetadata& Get() NO_THREAD_SAFETY_ANALYSIS { return it_->second; }
 
-        const ReplicationTask& GetReplicationTask() NO_THREAD_SAFETY_ANALYSIS {
+        ReplicationTask& GetReplicationTask() NO_THREAD_SAFETY_ANALYSIS {
             return replication_task_it_->second;
         }
 
@@ -2181,7 +2193,7 @@ class MasterService {
             std::unordered_map<std::string, ObjectMetadata>::iterator;
         using ProcessingIterator = std::unordered_set<std::string>::iterator;
         using ReplicationTaskIterator =
-            std::unordered_map<std::string, const ReplicationTask>::iterator;
+            std::unordered_map<std::string, ReplicationTask>::iterator;
 
         void EnsureTenantState() NO_THREAD_SAFETY_ANALYSIS {
             if (tenant_state_ != nullptr) {
@@ -2430,13 +2442,28 @@ class MasterService {
     std::mutex dynamic_replication_mutex_;
     std::unordered_map<std::string, DynamicReplicationWindow>
         dynamic_replication_windows_;
+    std::deque<std::string> dynamic_replication_window_order_;
+    std::chrono::steady_clock::time_point
+        dynamic_replication_next_window_cleanup_{};
+    std::mutex dynamic_replication_admission_mutex_;
+    std::condition_variable dynamic_replication_admission_cv_;
+    std::queue<ObjectIdentity> dynamic_replication_admission_queue_;
+    std::unordered_set<std::string> dynamic_replication_admission_queued_;
+    std::thread dynamic_replication_admission_thread_;
+    std::atomic<bool> dynamic_replication_admission_running_{false};
     static constexpr std::chrono::milliseconds
         kDynamicReplicationActionCooldown{30000};
     static constexpr std::chrono::milliseconds kDynamicReplicationLeaseTtl{
         30000};
     static constexpr std::chrono::milliseconds
         kDynamicReplicationRecreateCooldown{60000};
+    static constexpr std::chrono::milliseconds
+        kDynamicReplicationWindowCleanupInterval{1000};
+    static constexpr uint64_t kDynamicReplicationAdmissionThreadSleepMs = 100;
     static constexpr size_t kDynamicReplicationWindowEntryLimit = 50000;
+    static constexpr size_t kDynamicReplicationWindowCleanupBudget = 256;
+    static constexpr size_t kDynamicReplicationAdmissionQueueLimit = 50000;
+    static constexpr size_t kDynamicReplicationAdmissionBatchSize = 64;
     static constexpr double kDynamicReplicationTargetHighWatermark = 0.85;
 
     bool DynamicReplicationEnabled() const;
@@ -2444,13 +2471,20 @@ class MasterService {
                                                   const std::string& segment);
     bool DynamicReplicationEnforce() const;
     uint32_t DynamicReplicationAdmissionMinHits() const;
+    void CleanupDynamicReplicationWindowsLocked(
+        std::chrono::steady_clock::time_point now, std::chrono::seconds window);
     bool ObserveDynamicReplicationAccess(const ObjectIdentity& object_id);
     bool DynamicReplicationHeatAdmitted(const ObjectIdentity& object_id);
+    void MaybeQueueDynamicReplicaProposal(const ObjectIdentity& object_id);
+    void EnqueueDynamicReplicaProposal(const ObjectIdentity& object_id);
     void TrySubmitDynamicReplicaProposal(const ObjectIdentity& object_id);
+    tl::expected<ReplicaActionLease, ErrorCode>
+    SubmitReplicaActionProposalLocked(const ReplicaActionProposal& proposal);
     uint64_t DynamicReplicationVersionEpoch(
         const ObjectMetadata& metadata) const;
     void ClearDynamicReplicationStateForKey(TenantState& tenant_state,
                                             const std::string& key);
+    void CleanupExpiredDynamicReplicationState();
     bool HasDynamicReplicationPending(TenantState& tenant_state,
                                       const std::string& key);
     std::optional<DynamicReplicaPlan> SelectDynamicReplicaPlan(
@@ -2458,11 +2492,13 @@ class MasterService {
         const std::optional<std::string>& preferred_target_segment,
         std::string target_domain);
     tl::expected<UUID, ErrorCode> SubmitDynamicReplicaCopyTask(
-        const ObjectIdentity& object_id, const DynamicReplicaPlan& plan);
+        const ObjectIdentity& object_id, const DynamicReplicaPlan& plan,
+        const UUID& lease_id, uint64_t version_epoch);
     tl::expected<void, ErrorCode> ValidateDynamicReplicaPendingForCopyStart(
         TenantState& tenant_state, const std::string& key,
-        const UUID& client_id, const std::string& source_segment,
-        uint64_t version_epoch,
+        const UUID& dynamic_replication_lease_id, const UUID& client_id,
+        const std::string& source_segment, uint64_t current_version_epoch,
+        uint64_t dynamic_replication_version_epoch,
         const std::vector<std::string>& target_segments);
     void RegisterDynamicReplicaStart(
         TenantState& tenant_state, ObjectMetadata& metadata,
