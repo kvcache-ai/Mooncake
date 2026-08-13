@@ -55,14 +55,12 @@ GIT_REPO=${GIT_REPO:-}
 
 if [ "$MOONCAKE_CI_TIER" = "core-4gpu" ]; then
     # The upstream heterogeneous-TP test starts TP4 and TP2 workers on the
-    # same host and therefore needs eight GPUs. Keep the permanent 4+4 ROCm
-    # allocation honest: all other SGLang and vLLM external-PD cases run here,
-    # while this one remains an explicitly reported capacity exception.
+    # same host and therefore needs eight GPUs. Mooncake Elastic EP is also
+    # CUDA-only, so neither test belongs in the permanent 4+4 ROCm tier.
     All_TEST_SCRIPTS_SGLANG=(
         "test_hicache_storage_mooncake_backend.sh"
         "test_1p1d_erdma.sh"
         "test_epd_sglang.sh"
-        "test_moe_mooncake.sh"
     )
 elif [ "$MOONCAKE_CI_TIER" = "full" ]; then
     All_TEST_SCRIPTS_SGLANG=(

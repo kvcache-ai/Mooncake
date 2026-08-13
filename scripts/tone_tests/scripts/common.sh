@@ -205,7 +205,15 @@ docker_launch(){
     fi
     local relative_path=${TEST_RUN_DIR#$BASE_DIR}
     local cleaned_path=${relative_path#/}
-    pip_cmd=$(append_str "${pip_cmd}" "pip install --force-reinstall /test_run/$cleaned_path/whls/$mooncake_whl_file")
+    if [ "${CI_ACCELERATOR:-cuda}" = "rocm" ]; then
+        # SGLang and vLLM images may already contain the CUDA distribution.
+        # The CUDA and ROCm distributions share the same `mooncake` package,
+        # so installing the ROCm wheel on top leaves a mixture of old and new
+        # Python modules/native libraries and breaks the Store RPC ABI.
+        pip_cmd=$(append_str "${pip_cmd}" \
+            "python3 -m pip uninstall -y mooncake-transfer-engine mooncake-transfer-engine-rocm")
+    fi
+    pip_cmd=$(append_str "${pip_cmd}" "python3 -m pip install --force-reinstall /test_run/$cleaned_path/whls/$mooncake_whl_file")
 
     # Check if sglang-router is needed and missing
     if [[ "$registry_addr" == *"sglang"* ]]; then
@@ -317,6 +325,14 @@ case \"\$gid\" in ''|'::'|'0:0:0:0:0:0:0:0') echo 'RDMA GID is empty' >&2; exit 
     if ! ${docker_exec} "${pip_cmd}"; then
         echo "ERROR: Failed to install Mooncake dependencies" >&2
         return 1
+    fi
+
+    if [ "${CI_ACCELERATOR:-cuda}" = "rocm" ]; then
+        local mooncake_install_check="python3 -c 'import importlib.metadata as md, mooncake; assert md.version(\"mooncake-transfer-engine-rocm\"); print(\"Mooncake package:\", mooncake.__file__); print(\"Mooncake ROCm distribution:\", md.version(\"mooncake-transfer-engine-rocm\"))' && ! python3 -m pip show mooncake-transfer-engine >/dev/null 2>&1"
+        if ! ${docker_exec} "${mooncake_install_check}"; then
+            echo "ERROR: Conflicting Mooncake distributions remain after ROCm wheel installation" >&2
+            return 1
+        fi
     fi
     
     return 0
