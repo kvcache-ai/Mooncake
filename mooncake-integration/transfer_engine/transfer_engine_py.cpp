@@ -111,7 +111,7 @@ TransferEnginePy::TransferEnginePy() {
         int timeout_sec = std::max(5, atoi(getenv("MC_TRANSFER_TIMEOUT")));
         transfer_timeout_nsec_ = timeout_sec * kNanosPerSecond;
     } else {
-        transfer_timeout_nsec_ = 30 * kNanosPerSecond;
+        transfer_timeout_nsec_ = 60 * kNanosPerSecond;
     }
 }
 

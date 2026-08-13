@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Modified by Hygon Information Technology Co., Ltd., 2026.
+
 #include "config.h"
 
 #include <charconv>
@@ -486,8 +490,11 @@ void loadGlobalConfig(GlobalConfig& config) {
         }
     }
 
-    if (std::getenv("MC_ENABLE_DEST_DEVICE_AFFINITY")) {
-        config.enable_dest_device_affinity = true;
+    if (const char* dest_device_affinity_env =
+            std::getenv("MC_ENABLE_DEST_DEVICE_AFFINITY")) {
+        parseBoolConfigEnv(dest_device_affinity_env,
+                           "MC_ENABLE_DEST_DEVICE_AFFINITY",
+                           config.enable_dest_device_affinity);
     }
 
     const char* enable_hca_peer_affinity_env =

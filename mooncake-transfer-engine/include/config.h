@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+// SPDX-License-Identifier: Apache-2.0
+// Modified by Hygon Information Technology Co., Ltd., 2026.
+
 #ifndef CONFIG_H
 #define CONFIG_H
 
@@ -83,7 +87,7 @@ struct GlobalConfig {
     uint16_t rpc_max_port = 17000;
     bool use_ipv6 = false;
     size_t fragment_limit = 16384;
-    bool enable_dest_device_affinity = false;
+    bool enable_dest_device_affinity = true;
     bool enable_hca_peer_affinity = false;
     std::unordered_map<std::string, std::vector<std::string>> nic_peer_affinity;
     bool log_rdma_slice_affinity = false;

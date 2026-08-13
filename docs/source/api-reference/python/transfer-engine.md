@@ -631,7 +631,7 @@ blacklist).
 
 The Transfer Engine respects the following environment variables:
 
-- `MC_TRANSFER_TIMEOUT`: Sets the transfer timeout in seconds (default: 30)
+- `MC_TRANSFER_TIMEOUT`: Sets the transfer timeout in seconds (default: 60)
 - `MC_METADATA_SERVER`: Default metadata server address
 - `MC_LEGACY_RPC_PORT_BINDING`: Enables legacy RPC port binding behavior
 - `MC_TCP_BIND_ADDRESS`: Specifies the TCP bind address

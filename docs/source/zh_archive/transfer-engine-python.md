@@ -283,7 +283,7 @@ TransferOpcode.WRITE  # 写操作
 
 传输引擎支持以下环境变量：
 
-- `MC_TRANSFER_TIMEOUT`: 设置传输超时时间（秒）（默认：30）
+- `MC_TRANSFER_TIMEOUT`: 设置传输超时时间（秒）（默认：60）
 - `MC_METADATA_SERVER`: 默认元数据服务器地址
 - `MC_LEGACY_RPC_PORT_BINDING`: 启用传统RPC端口绑定行为
 - `MC_TCP_BIND_ADDRESS`: 指定TCP绑定地址
