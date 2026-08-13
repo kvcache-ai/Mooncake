@@ -348,6 +348,10 @@ class TestMooncakeBackendMLAModel(
         # Keep arena coverage explicit in the self-hosted integration suite.
         env_vars.pop("MC_DISABLE_MMAP_ARENA", None)
         env_vars["MC_MMAP_ARENA_POOL_SIZE"] = "8gb"
+        if os.getenv("CI_ACCELERATOR") == "rocm":
+            # SGLang v0.5.13's fused ROCm MLA path treats ForwardMetadata as
+            # the legacy tuple shape and terminates the server during warmup.
+            env_vars["SGLANG_ROCM_FUSED_DECODE_MLA"] = "false"
         return server_args, env_vars
 
 

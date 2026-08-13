@@ -11,9 +11,15 @@ on:
         description: 'PR number (passed from parent workflow for workflow_dispatch)'
         required: false
         type: string
+      run_sglang:
+        description: 'Run the SGLang integration test through T-one'
+        required: false
+        default: true
+        type: boolean
 
 jobs:
   test-sglang-integration:
+    if: inputs.run_sglang
     runs-on: ubuntu-latest
     env:
       tone_user_name: ${{ secrets.TONE_USER_NAME }}
@@ -164,6 +170,22 @@ jobs:
       group: mooncake-rocm-mi350x
       cancel-in-progress: false
     steps:
+      # Pytest previously ran as root in a bind-mounted container and left
+      # caches that the non-root runner could not remove on the next checkout.
+      # Use the already-pinned ROCm test image to repair only those generated
+      # paths before actions/checkout invokes git clean.
+      - name: Remove root-owned Python test caches
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm --network=none \
+            -v "${GITHUB_WORKSPACE}:/workspace" \
+            --entrypoint /bin/rm \
+            "lmsysorg/sglang:v0.5.13.post1-rocm720-mi35x@sha256:552e7038a9309796ad0cd6c62e80568eca4f88ef1e1eb42db2f7ffaafcd79693" \
+            -rf \
+            /workspace/scripts/tone_tests/python/.pytest_cache \
+            /workspace/scripts/tone_tests/python/__pycache__
+
       # pull_request_target keeps this workflow definition on the trusted base
       # branch. A maintainer must apply run-e2e-ci before PR code can reach the
       # persistent GPU hosts.

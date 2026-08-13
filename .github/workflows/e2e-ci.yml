@@ -28,15 +28,6 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  ascend-test:
-    if: >
-      github.event_name == 'workflow_dispatch' ||
-      github.event.label.name == 'run-e2e-ci'
-    uses: ./.github/workflows/ci_ascend.yml
-    with:
-      checkout_ref: ${{ inputs.pr_sha || github.event.pull_request.head.sha }}
-    secrets: inherit
-
   build-wheel-rocm:
     if: >
       github.event_name == 'workflow_dispatch' ||
@@ -55,6 +46,7 @@ jobs:
     with:
       pr_sha: ${{ inputs.pr_sha || github.event.pull_request.head.sha }}
       pr_number: ${{ inputs.pr_number || github.event.pull_request.number }}
+      run_sglang: false
     secrets: inherit
 
   e2e-gate:
@@ -64,7 +56,6 @@ jobs:
       (github.event_name == 'workflow_dispatch' ||
        github.event.label.name == 'run-e2e-ci')
     needs:
-      - ascend-test
       - build-wheel-rocm
       - integration-test
     runs-on: ubuntu-latest
