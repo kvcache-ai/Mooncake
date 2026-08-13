@@ -125,6 +125,7 @@ performance/vllm/index
 
 design/architecture
 design/transfer-engine/index
+design/reshard-manifest
 design/tent/overview
 design/store/mooncake-store
 design/mooncake-backend-pg
