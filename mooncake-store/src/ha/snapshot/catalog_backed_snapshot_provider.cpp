@@ -505,8 +505,7 @@ class CatalogBackedSnapshotProvider final : public SnapshotProvider {
         // (segment_manager.mounted_segments_, where buf_allocator is non-null
         // by construction — MountSegment is the only path that populates it).
         //
-        // Local-disk segments are serialized as per-client offloading
-        // bookkeeping (client_local_disk_segment_'s offloading_objects map)
+        // LocalSSD state is serialized as per-client offloading bookkeeping
         // without the transport_endpoint / file_path / capacity fields that
         // StandbySegmentInfo needs, and NoF segments are not serialized at
         // all in this snapshot path. Both have to be re-mounted explicitly
