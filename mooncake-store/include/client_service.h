@@ -421,15 +421,6 @@ class Client {
         const std::vector<std::string>& targets);
 
     /**
-     * @brief Promote a dynamic replica from bytes already read by this client.
-     *
-     * The lease must be granted with reader_local_promotion=true. The caller
-     * must keep slices alive until this call returns.
-     */
-    tl::expected<void, ErrorCode> PromoteDynamicReplicaFromReadBuffer(
-        const ReplicaActionLease& lease, std::vector<Slice>& slices);
-
-    /**
      * @brief Create a move task to move an object's replica from source segment
      * to target segment
      * @param key Object key

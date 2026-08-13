@@ -3819,62 +3819,6 @@ tl::expected<UUID, ErrorCode> Client::CreateCopyTask(
     return master_client_.CreateCopyTask(key, tenant_id, targets);
 }
 
-tl::expected<void, ErrorCode> Client::PromoteDynamicReplicaFromReadBuffer(
-    const ReplicaActionLease& lease, std::vector<Slice>& slices) {
-    if (!lease.reader_local_promotion || lease.key.empty() ||
-        lease.source_segment.empty() || lease.target_segment.empty()) {
-        return tl::unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    auto revoke_copy = [&]() {
-        auto revoke_result =
-            master_client_.CopyRevoke(lease.key, lease.tenant_id);
-        if (!revoke_result.has_value()) {
-            LOG(WARNING) << "action=reader_local_promote_revoke_failed"
-                         << ", key=" << lease.key
-                         << ", error_code=" << revoke_result.error();
-        }
-    };
-
-    auto start_result =
-        master_client_.CopyStart(lease.key, lease.tenant_id,
-                                 lease.source_segment, {lease.target_segment});
-    if (!start_result.has_value()) {
-        return tl::unexpected(start_result.error());
-    }
-
-    const auto& response = start_result.value();
-    if (response.targets.empty()) {
-        auto end_result = master_client_.CopyEnd(lease.key, lease.tenant_id);
-        if (!end_result.has_value()) {
-            return tl::unexpected(end_result.error());
-        }
-        return {};
-    }
-
-    const size_t slice_size = CalculateSliceSize(slices);
-    for (const auto& target : response.targets) {
-        if (target.is_memory_replica()) {
-            const auto& descriptor = target.get_memory_descriptor();
-            if (slice_size < descriptor.buffer_descriptor.size_) {
-                revoke_copy();
-                return tl::unexpected(ErrorCode::INVALID_PARAMS);
-            }
-        }
-        if (TransferWrite(target, slices) != ErrorCode::OK) {
-            revoke_copy();
-            return tl::unexpected(ErrorCode::TRANSFER_FAIL);
-        }
-    }
-
-    auto end_result = master_client_.CopyEnd(lease.key, lease.tenant_id);
-    if (!end_result.has_value()) {
-        revoke_copy();
-        return tl::unexpected(end_result.error());
-    }
-    return {};
-}
-
 tl::expected<UUID, ErrorCode> Client::CreateMoveTask(
     const std::string& key, const std::string& source,
     const std::string& target) {

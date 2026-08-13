@@ -25,19 +25,14 @@ struct ReplicaActionProposal {
     std::string key;
     std::string requester_domain;
     uint64_t observed_version_epoch{0};
-    double access_frequency_qps{0.0};
-    uint32_t hits{0};
     uint64_t object_size_bytes{0};
     std::string target_domain;
     std::optional<std::string> preferred_target_segment;
-    UUID requester_client_id{};
-    bool allow_reader_local_promotion{false};
     int64_t expire_at_ms_epoch{0};
 };
 YLT_REFL(ReplicaActionProposal, action, proposal_id, tenant_id, key,
-         requester_domain, observed_version_epoch, access_frequency_qps, hits,
-         object_size_bytes, target_domain, preferred_target_segment,
-         requester_client_id, allow_reader_local_promotion, expire_at_ms_epoch);
+         requester_domain, observed_version_epoch, object_size_bytes,
+         target_domain, preferred_target_segment, expire_at_ms_epoch);
 
 struct ReplicaActionLease {
     UUID proposal_id{};
@@ -51,13 +46,10 @@ struct ReplicaActionLease {
     uint64_t version_epoch{0};
     int64_t expire_at_ms_epoch{0};
     UUID task_id{};
-    UUID requester_client_id{};
-    bool reader_local_promotion{false};
 };
 YLT_REFL(ReplicaActionLease, proposal_id, lease_id, action, tenant_id, key,
          source_segment, target_segment, target_domain, version_epoch,
-         expire_at_ms_epoch, task_id, requester_client_id,
-         reader_local_promotion);
+         expire_at_ms_epoch, task_id);
 
 /**
  * @brief Response structure for Ping operation

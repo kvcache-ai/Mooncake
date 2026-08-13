@@ -1475,8 +1475,6 @@ class MasterService {
         uint64_t version_epoch{0};
         int64_t expire_at_ms_epoch{0};
         UUID task_id{};
-        UUID requester_client_id{};
-        bool reader_local_promotion{false};
     };
 
     struct ReplicationTask {
@@ -2422,8 +2420,6 @@ class MasterService {
         std::string source_segment;
         std::string target_segment;
         std::string target_domain;
-        UUID requester_client_id{};
-        bool reader_local_promotion{false};
     };
 
     DynamicReplicationMode dynamic_replication_mode_{
@@ -2449,6 +2445,7 @@ class MasterService {
     bool DynamicReplicationEnforce() const;
     uint32_t DynamicReplicationAdmissionMinHits() const;
     bool ObserveDynamicReplicationAccess(const ObjectIdentity& object_id);
+    bool DynamicReplicationHeatAdmitted(const ObjectIdentity& object_id);
     void TrySubmitDynamicReplicaProposal(const ObjectIdentity& object_id);
     uint64_t DynamicReplicationVersionEpoch(
         const ObjectMetadata& metadata) const;
@@ -2459,8 +2456,7 @@ class MasterService {
     std::optional<DynamicReplicaPlan> SelectDynamicReplicaPlan(
         const ObjectMetadata& metadata,
         const std::optional<std::string>& preferred_target_segment,
-        std::string target_domain, bool allow_reader_local_promotion,
-        const UUID& requester_client_id);
+        std::string target_domain);
     tl::expected<UUID, ErrorCode> SubmitDynamicReplicaCopyTask(
         const ObjectIdentity& object_id, const DynamicReplicaPlan& plan);
     tl::expected<void, ErrorCode> ValidateDynamicReplicaPendingForCopyStart(

@@ -3494,7 +3494,6 @@ auto MasterService::GetReplicaList(const std::string& key,
                 },
                 [&memory_replicas](const Replica&) { ++memory_replicas; });
             dynamic_replication_observed =
-                dynamic_replication_mode_ == DynamicReplicationMode::kObserve &&
                 memory_replicas > 0 &&
                 memory_replicas < dynamic_replication_max_memory_replicas_;
         }
@@ -3680,8 +3679,6 @@ MasterService::BatchGetReplicaList(const std::vector<std::string>& keys,
                             ++memory_replicas;
                         });
                     if (memory_replicas > 0 &&
-                        dynamic_replication_mode_ ==
-                            DynamicReplicationMode::kObserve &&
                         memory_replicas <
                             dynamic_replication_max_memory_replicas_) {
                         auto object_id =
@@ -7657,14 +7654,56 @@ bool MasterService::ObserveDynamicReplicationAccess(
         counter.hits = 0;
     }
     counter.hits++;
+    return counter.hits == DynamicReplicationAdmissionMinHits();
+}
+
+bool MasterService::DynamicReplicationHeatAdmitted(
+    const ObjectIdentity& object_id) {
+    if (!DynamicReplicationEnabled()) {
+        return false;
+    }
+    const auto now = std::chrono::steady_clock::now();
+    const auto window =
+        std::chrono::seconds(dynamic_replication_heat_window_seconds_);
+    const auto admission_key =
+        object_id.tenant_id.MakeScopedKey(object_id.user_key);
+
+    std::lock_guard<std::mutex> lock(dynamic_replication_mutex_);
+    auto counter_it = dynamic_replication_windows_.find(admission_key);
+    if (counter_it == dynamic_replication_windows_.end()) {
+        return false;
+    }
+    const auto& counter = counter_it->second;
+    if (counter.window_start.time_since_epoch().count() == 0 ||
+        now - counter.window_start >= window) {
+        return false;
+    }
     return counter.hits >= DynamicReplicationAdmissionMinHits();
 }
 
 void MasterService::TrySubmitDynamicReplicaProposal(
     const ObjectIdentity& object_id) {
-    if (ObserveDynamicReplicationAccess(object_id)) {
+    if (!ObserveDynamicReplicationAccess(object_id)) {
+        return;
+    }
+    if (dynamic_replication_mode_ == DynamicReplicationMode::kObserve) {
         VLOG(1) << "dynamic_replication_observe_would_propose key="
                 << object_id.user_key;
+        return;
+    }
+
+    ReplicaActionProposal proposal;
+    proposal.action = ReplicaActionType::ADD;
+    proposal.proposal_id = generate_uuid();
+    proposal.tenant_id = object_id.tenant_id.value();
+    proposal.key = object_id.user_key;
+    proposal.expire_at_ms_epoch =
+        DynamicReplicationNowMs() + kDynamicReplicationLeaseTtl.count();
+
+    auto lease = SubmitReplicaActionProposal(proposal);
+    if (!lease.has_value()) {
+        VLOG(1) << "dynamic_replication_auto_proposal_rejected key="
+                << object_id.user_key << ", error_code=" << lease.error();
     }
 }
 
@@ -7714,8 +7753,7 @@ std::optional<MasterService::DynamicReplicaPlan>
 MasterService::SelectDynamicReplicaPlan(
     const ObjectMetadata& metadata,
     const std::optional<std::string>& preferred_target_segment,
-    std::string target_domain, bool allow_reader_local_promotion,
-    const UUID& requester_client_id) {
+    std::string target_domain) {
     const std::string& object_key = metadata.user_key;
     std::unordered_set<std::string> existing_segments;
     std::unordered_set<std::string> existing_hosts;
@@ -7808,7 +7846,6 @@ MasterService::SelectDynamicReplicaPlan(
     };
 
     std::optional<std::string> target_segment;
-    bool reader_local_promotion = false;
     if (preferred_target_segment.has_value()) {
         const auto preferred = std::find_if(
             segments.begin(), segments.end(), [&](const auto& entry) {
@@ -7816,9 +7853,6 @@ MasterService::SelectDynamicReplicaPlan(
             });
         if (preferred != segments.end() && is_valid_target(preferred->first)) {
             target_segment = preferred->first.name;
-            reader_local_promotion = allow_reader_local_promotion &&
-                                     requester_client_id != UUID{0, 0} &&
-                                     preferred->second == requester_client_id;
         }
     }
     if (!target_segment.has_value()) {
@@ -7847,9 +7881,7 @@ MasterService::SelectDynamicReplicaPlan(
     }
     return DynamicReplicaPlan{.source_segment = source_segment,
                               .target_segment = *target_segment,
-                              .target_domain = std::move(target_domain),
-                              .requester_client_id = requester_client_id,
-                              .reader_local_promotion = reader_local_promotion};
+                              .target_domain = std::move(target_domain)};
 }
 
 tl::expected<ReplicaActionLease, ErrorCode>
@@ -7862,10 +7894,6 @@ MasterService::SubmitReplicaActionProposal(
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (proposal.proposal_id == UUID{0, 0}) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-    if (proposal.allow_reader_local_promotion &&
-        proposal.requester_client_id == UUID{0, 0}) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
     const int64_t now_ms = DynamicReplicationNowMs();
@@ -7902,10 +7930,7 @@ MasterService::SubmitReplicaActionProposal(
                 (!proposal.preferred_target_segment.has_value() ||
                  lease.target_segment == *proposal.preferred_target_segment) &&
                 (proposal.target_domain.empty() ||
-                 lease.target_domain == proposal.target_domain) &&
-                (!lease.reader_local_promotion ||
-                 (proposal.allow_reader_local_promotion &&
-                  proposal.requester_client_id == lease.requester_client_id));
+                 lease.target_domain == proposal.target_domain);
             if (!same_request) {
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
@@ -7914,9 +7939,7 @@ MasterService::SubmitReplicaActionProposal(
         tenant_state.dynamic_replication_leases.erase(lease_it);
     }
 
-    if (proposal.access_frequency_qps <
-            dynamic_replication_admission_qps_threshold_ &&
-        proposal.hits < DynamicReplicationAdmissionMinHits()) {
+    if (!DynamicReplicationHeatAdmitted(object_id)) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
@@ -7952,19 +7975,14 @@ MasterService::SubmitReplicaActionProposal(
     }
 
     auto plan = SelectDynamicReplicaPlan(
-        metadata, proposal.preferred_target_segment, proposal.target_domain,
-        proposal.allow_reader_local_promotion, proposal.requester_client_id);
+        metadata, proposal.preferred_target_segment, proposal.target_domain);
     if (!plan.has_value()) {
         return tl::make_unexpected(ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS);
     }
 
-    UUID task_id{};
-    if (!plan->reader_local_promotion) {
-        auto task = SubmitDynamicReplicaCopyTask(object_id, *plan);
-        if (!task.has_value()) {
-            return tl::make_unexpected(task.error());
-        }
-        task_id = task.value();
+    auto task = SubmitDynamicReplicaCopyTask(object_id, *plan);
+    if (!task.has_value()) {
+        return tl::make_unexpected(task.error());
     }
 
     ReplicaActionLease lease;
@@ -7978,22 +7996,17 @@ MasterService::SubmitReplicaActionProposal(
     lease.target_domain = plan->target_domain;
     lease.version_epoch = DynamicReplicationVersionEpoch(metadata);
     lease.expire_at_ms_epoch = now_ms + kDynamicReplicationLeaseTtl.count();
-    lease.task_id = task_id;
-    lease.requester_client_id = plan->requester_client_id;
-    lease.reader_local_promotion = plan->reader_local_promotion;
+    lease.task_id = task.value();
 
     tenant_state.dynamic_replication_pending[object_id.user_key] =
-        DynamicReplicaPending{
-            .proposal_id = proposal_id,
-            .lease_id = lease.lease_id,
-            .source_segment = lease.source_segment,
-            .target_segment = lease.target_segment,
-            .target_domain = lease.target_domain,
-            .version_epoch = lease.version_epoch,
-            .expire_at_ms_epoch = lease.expire_at_ms_epoch,
-            .task_id = lease.task_id,
-            .requester_client_id = plan->requester_client_id,
-            .reader_local_promotion = plan->reader_local_promotion};
+        DynamicReplicaPending{.proposal_id = proposal_id,
+                              .lease_id = lease.lease_id,
+                              .source_segment = lease.source_segment,
+                              .target_segment = lease.target_segment,
+                              .target_domain = lease.target_domain,
+                              .version_epoch = lease.version_epoch,
+                              .expire_at_ms_epoch = lease.expire_at_ms_epoch,
+                              .task_id = lease.task_id};
     tenant_state.dynamic_replication_leases[proposal_id] = lease;
     tenant_state.dynamic_replication_cooldowns[object_id.user_key] =
         std::chrono::steady_clock::now() + kDynamicReplicationActionCooldown;
@@ -11390,21 +11403,6 @@ MasterService::ValidateDynamicReplicaPendingForCopyStart(
         target_segments.size() != 1 ||
         target_segments.front() != pending.target_segment) {
         return tl::make_unexpected(ErrorCode::OBJECT_HAS_REPLICATION_TASK);
-    }
-    if (pending.reader_local_promotion) {
-        if (pending.requester_client_id != client_id) {
-            return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
-        }
-        UUID target_client_id;
-        auto segment_access = segment_manager_.getSegmentAccess();
-        auto err = segment_access.GetClientIdBySegmentName(
-            pending.target_segment, target_client_id);
-        if (err != ErrorCode::OK) {
-            return tl::make_unexpected(err);
-        }
-        if (target_client_id != client_id) {
-            return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
-        }
     }
     return {};
 }
