@@ -2609,7 +2609,7 @@ void MasterService::RestoreFromStandbySnapshot(
                     Replica replica(
                         std::make_unique<AllocatedBuffer>(alloc, nof_desc.buffer_descriptor),
                         desc.status,ReplicaType::NOF_SSD);
-                    replica.set_nof_metadata(object_size, block_size)
+                    replica.set_nof_metadata(object_size, block_size);
                     replicas.emplace_back(std::move(replica));
                 } else if (desc.is_disk_replica()) {
                     const auto& disk_desc = desc.get_disk_descriptor();
