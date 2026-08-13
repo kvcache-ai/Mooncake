@@ -177,7 +177,16 @@ mkdir -p ${OUTPUT_DIR}
 
 echo "Installing required build packages"
 pip install --upgrade pip
-pip install build setuptools wheel auditwheel
+# TEMPORARY FIX: auditwheel 6.8.0 corrupts the wheel when used with
+# patchelf < 0.14.4 (upstream pypa/auditwheel#722, fixed in patchelf 0.14.4).
+# The ubuntu-22.04 CI runner only ships patchelf 0.14.3, producing wheels that
+# fail to import with "libgflags.so.2.2: cannot open shared object file".
+# Pin auditwheel to 6.7.0 until the CI wheel is built inside the manylinux
+# container (pytorch/manylinux2_28-builder, patchelf >= 0.14.4), i.e. once
+# ci.yml's test-wheel-ubuntu consumes the build-wheel/mooncake-wheel-ci
+# artifact (main commits #3137 + #3283, first released after v0.3.12).
+# Keep this pin through the v0.3.10 / v0.3.11 / v0.3.12 merges.
+pip install build setuptools wheel "auditwheel==6.7.0"
 
 # Create directory for repaired wheels
 REPAIRED_DIR="repaired_wheels_${PYTHON_VERSION}"

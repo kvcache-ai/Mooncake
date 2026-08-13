@@ -1,5 +1,5 @@
 #include "centralized_segment_manager.h"
-#include "master_metric_manager.h"
+#include "centralized_master_metric_manager.h"
 #include <unordered_set>
 #include <glog/logging.h>
 
@@ -127,6 +127,17 @@ tl::expected<void, ErrorCode> CentralizedSegmentManager::InnerMountSegment(
                            << ", error=failed_to_create_allocator";
                 return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
             }
+
+            // Keep master capacity-usage metrics in sync with allocations.
+            allocator->set_usage_observers(
+                [segment_name = segment.name](int64_t bytes) {
+                    CentralizedMasterMetricManager::instance()
+                        .inc_allocated_mem_size(segment_name, bytes);
+                },
+                [segment_name = segment.name](int64_t bytes) {
+                    CentralizedMasterMetricManager::instance()
+                        .dec_allocated_mem_size(segment_name, bytes);
+                });
         } catch (...) {
             LOG(ERROR) << "segment_name=" << segment.name
                        << ", error=exception_during_allocator_creation";
@@ -143,8 +154,8 @@ tl::expected<void, ErrorCode> CentralizedSegmentManager::InnerMountSegment(
                 return tl::make_unexpected(ret.error());
             }
         }
-        MasterMetricManager::instance().inc_total_mem_capacity(segment.name,
-                                                               size);
+        CentralizedMasterMetricManager::instance().inc_total_mem_capacity(
+            segment.name, size);
     }
 
     auto mounted_segment = std::make_shared<MountedCentralizedSegment>();
@@ -287,8 +298,8 @@ auto CentralizedSegmentManager::OnUnmountSegment(
     }
 
     if (segment->GetCentralizedExtra().protocol != "cxl") {
-        MasterMetricManager::instance().dec_total_mem_capacity(segment->name,
-                                                               segment->size);
+        CentralizedMasterMetricManager::instance().dec_total_mem_capacity(
+            segment->name, segment->size);
     }
 
     return {};

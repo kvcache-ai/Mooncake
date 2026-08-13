@@ -121,6 +121,7 @@ class InProcMaster {
 
             wrapped_ =
                 std::make_unique<WrappedCentralizedMasterService>(wms_cfg);
+            wrapped_->init();
             RegisterCentralizedRpcService(*server_, *wrapped_);
 
             auto ec = server_->async_start();

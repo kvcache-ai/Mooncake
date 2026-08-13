@@ -31,11 +31,18 @@ class FileStorageTest : public ::testing::Test {
         UnsetEnv("MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT");
         UnsetEnv("MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES");
         UnsetEnv("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS");
-        data_path = std::filesystem::current_path().string() + "/data";
+        // Use a dedicated directory so this binary never shares test data
+        // with other test binaries running in parallel under `ctest -j`
+        // (e.g. storage_backend_test also uses <cwd>/data and wipes it).
+        data_path = std::filesystem::current_path().string() +
+                    "/file_storage_test_data";
         fs::create_directories(data_path);
         for (const auto& entry : fs::directory_iterator(data_path)) {
-            if (entry.is_regular_file()) {
-                fs::remove(entry.path());
+            std::error_code ec;
+            if (entry.is_directory()) {
+                fs::remove_all(entry.path(), ec);
+            } else {
+                fs::remove(entry.path(), ec);
             }
         }
     }
@@ -93,8 +100,11 @@ class FileStorageTest : public ::testing::Test {
         google::ShutdownGoogleLogging();
         LOG(INFO) << "Clear test data...";
         for (const auto& entry : fs::directory_iterator(data_path)) {
-            if (entry.is_regular_file()) {
-                fs::remove(entry.path());
+            std::error_code ec;
+            if (entry.is_directory()) {
+                fs::remove_all(entry.path(), ec);
+            } else {
+                fs::remove(entry.path(), ec);
             }
         }
     }

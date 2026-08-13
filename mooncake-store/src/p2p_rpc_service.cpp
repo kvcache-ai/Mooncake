@@ -1,4 +1,5 @@
 #include "p2p_rpc_service.h"
+#include "p2p_master_metric_manager.h"
 #include "rpc_helper.h"
 #include <csignal>
 
@@ -7,6 +8,10 @@ namespace mooncake {
 WrappedP2PMasterService::WrappedP2PMasterService(
     const WrappedMasterServiceConfig& config)
     : WrappedMasterService(config), master_service_(config) {}
+
+void WrappedP2PMasterService::init_http_handlers() {
+    // Currently, P2P has no architecture-specific HTTP endpoints
+}
 
 void RegisterP2PRpcService(
     coro_rpc::coro_rpc_server& server,
@@ -37,8 +42,12 @@ WrappedP2PMasterService::GetWriteRoute(const WriteRouteRequest& req) {
     return execute_rpc(
         "GetWriteRoute", [&] { return master_service_.GetWriteRoute(req); },
         [&](auto& timer) { timer.LogRequest("key=", req.key); },
-        [] { MasterMetricManager::instance().inc_get_write_route_requests(); },
-        [] { MasterMetricManager::instance().inc_get_write_route_failures(); });
+        [] {
+            P2PMasterMetricManager::instance().inc_get_write_route_requests();
+        },
+        [] {
+            P2PMasterMetricManager::instance().inc_get_write_route_failures();
+        });
 }
 
 BatchGetWriteRouteResponse WrappedP2PMasterService::BatchGetWriteRoute(
@@ -46,7 +55,8 @@ BatchGetWriteRouteResponse WrappedP2PMasterService::BatchGetWriteRoute(
     ScopedVLogTimer timer(1, "BatchGetWriteRoute");
     const size_t total = req.keys.size();
     timer.LogRequest("client_id=", req.client_id, ", key_count=", total);
-    MasterMetricManager::instance().inc_batch_get_write_route_requests(total);
+    P2PMasterMetricManager::instance().inc_batch_get_write_route_requests(
+        total);
 
     auto response = master_service_.BatchGetWriteRoute(req);
 
@@ -59,10 +69,10 @@ BatchGetWriteRouteResponse WrappedP2PMasterService::BatchGetWriteRoute(
         }
     }
     if (failure_count == total && total > 0) {
-        MasterMetricManager::instance().inc_batch_get_write_route_failures(
+        P2PMasterMetricManager::instance().inc_batch_get_write_route_failures(
             failure_count);
     } else if (failure_count != 0) {
-        MasterMetricManager::instance()
+        P2PMasterMetricManager::instance()
             .inc_batch_get_write_route_partial_success(failure_count);
     }
     timer.LogResponse("total=", total, ", success=", total - failure_count,
@@ -75,8 +85,8 @@ tl::expected<void, ErrorCode> WrappedP2PMasterService::AddReplica(
     return execute_rpc(
         "AddReplica", [&] { return master_service_.AddReplica(req); },
         [&](auto& timer) { timer.LogRequest("key=", req.key); },
-        [] { MasterMetricManager::instance().inc_add_replica_requests(); },
-        [] { MasterMetricManager::instance().inc_add_replica_failures(); });
+        [] { P2PMasterMetricManager::instance().inc_add_replica_requests(); },
+        [] { P2PMasterMetricManager::instance().inc_add_replica_failures(); });
 }
 
 tl::expected<void, ErrorCode> WrappedP2PMasterService::RemoveReplica(
@@ -84,8 +94,12 @@ tl::expected<void, ErrorCode> WrappedP2PMasterService::RemoveReplica(
     return execute_rpc(
         "RemoveReplica", [&] { return master_service_.RemoveReplica(req); },
         [&](auto& timer) { timer.LogRequest("key=", req.key); },
-        [] { MasterMetricManager::instance().inc_remove_replica_requests(); },
-        [] { MasterMetricManager::instance().inc_remove_replica_failures(); });
+        [] {
+            P2PMasterMetricManager::instance().inc_remove_replica_requests();
+        },
+        [] {
+            P2PMasterMetricManager::instance().inc_remove_replica_failures();
+        });
 }
 
 std::vector<tl::expected<void, ErrorCode>>
@@ -94,7 +108,7 @@ WrappedP2PMasterService::BatchRemoveReplica(
     ScopedVLogTimer timer(1, "BatchRemoveReplica");
     const size_t total_requests = req.segment_ids.size();
     timer.LogRequest("key=", req.key, "segment_count=", total_requests);
-    MasterMetricManager::instance().inc_batch_remove_replica_requests(
+    P2PMasterMetricManager::instance().inc_batch_remove_replica_requests(
         total_requests);
 
     auto results = master_service_.BatchRemoveReplica(req);
@@ -111,10 +125,10 @@ WrappedP2PMasterService::BatchRemoveReplica(
     }
 
     if (failure_count == total_requests && total_requests > 0) {
-        MasterMetricManager::instance().inc_batch_remove_replica_failures(
+        P2PMasterMetricManager::instance().inc_batch_remove_replica_failures(
             failure_count);
     } else if (failure_count != 0) {
-        MasterMetricManager::instance()
+        P2PMasterMetricManager::instance()
             .inc_batch_remove_replica_partial_success(failure_count);
     }
 
@@ -142,12 +156,12 @@ BatchSyncReplicaResponse WrappedP2PMasterService::BatchSyncReplica(
         if (ec != ErrorCode::OK) remove_failures++;
     }
 
-    MasterMetricManager::instance().inc_add_replica_requests(
+    P2PMasterMetricManager::instance().inc_add_replica_requests(
         req.add_keys.size());
-    MasterMetricManager::instance().inc_add_replica_failures(add_failures);
-    MasterMetricManager::instance().inc_remove_replica_requests(
+    P2PMasterMetricManager::instance().inc_add_replica_failures(add_failures);
+    P2PMasterMetricManager::instance().inc_remove_replica_requests(
         req.remove_keys.size());
-    MasterMetricManager::instance().inc_remove_replica_failures(
+    P2PMasterMetricManager::instance().inc_remove_replica_failures(
         remove_failures);
     timer.LogResponse("add_failures=", add_failures,
                       ", remove_failures=", remove_failures);

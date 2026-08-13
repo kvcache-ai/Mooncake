@@ -3229,8 +3229,8 @@ TEST_F(MasterServiceTest, BatchQueryIpMultipleSegmentsEmptyTeEndpointTest) {
 
 TEST_F(MasterServiceTest, PutStartExpiringTest) {
     // Reset storage space metrics.
-    MasterMetricManager::instance().reset_allocated_mem_size();
-    MasterMetricManager::instance().reset_total_mem_capacity();
+    CentralizedMasterMetricManager::instance().reset_allocated_mem_size();
+    CentralizedMasterMetricManager::instance().reset_total_mem_capacity();
 
     MasterServiceConfig master_config;
     master_config.put_start_discard_timeout_sec = 3;
@@ -3872,8 +3872,8 @@ TEST_F(MasterServiceTest, DisconnectionAndRecovery) {
 
 TEST_F(MasterServiceTest, CreateCopyTaskTest) {
     // Reset storage space metrics.
-    MasterMetricManager::instance().reset_allocated_mem_size();
-    MasterMetricManager::instance().reset_total_mem_capacity();
+    CentralizedMasterMetricManager::instance().reset_allocated_mem_size();
+    CentralizedMasterMetricManager::instance().reset_total_mem_capacity();
 
     // Create CentralizedMasterService
     std::unique_ptr<CentralizedMasterService> service_(
@@ -3938,8 +3938,8 @@ TEST_F(MasterServiceTest, CreateCopyTaskTest) {
 
 TEST_F(MasterServiceTest, CreateMoveTaskTest) {
     // Reset storage space metrics.
-    MasterMetricManager::instance().reset_allocated_mem_size();
-    MasterMetricManager::instance().reset_total_mem_capacity();
+    CentralizedMasterMetricManager::instance().reset_allocated_mem_size();
+    CentralizedMasterMetricManager::instance().reset_total_mem_capacity();
 
     // Create CentralizedMasterService
     std::unique_ptr<CentralizedMasterService> service_(
@@ -4017,8 +4017,8 @@ TEST_F(MasterServiceTest, CreateMoveTaskTest) {
 
 TEST_F(MasterServiceTest, QueryTaskTest) {
     // Reset storage space metrics.
-    MasterMetricManager::instance().reset_allocated_mem_size();
-    MasterMetricManager::instance().reset_total_mem_capacity();
+    CentralizedMasterMetricManager::instance().reset_allocated_mem_size();
+    CentralizedMasterMetricManager::instance().reset_total_mem_capacity();
 
     // Create CentralizedMasterService
     std::unique_ptr<CentralizedMasterService> service_(

@@ -94,6 +94,8 @@ class WrappedCentralizedMasterService final : public WrappedMasterService {
         return master_service_;
     }
 
+    void init_http_handlers() override;
+
    private:
     CentralizedMasterService master_service_;
 };

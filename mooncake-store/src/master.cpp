@@ -903,6 +903,7 @@ int main(int argc, char* argv[]) {
                 std::make_unique<mooncake::WrappedCentralizedMasterService>(
                     mooncake::WrappedMasterServiceConfig(master_config,
                                                          version));
+            master_service->init();
 
             mooncake::RegisterCentralizedRpcService(
                 server, static_cast<mooncake::WrappedCentralizedMasterService&>(
@@ -912,6 +913,7 @@ int main(int argc, char* argv[]) {
                 std::make_unique<mooncake::WrappedP2PMasterService>(
                     mooncake::WrappedMasterServiceConfig(master_config,
                                                          version));
+            master_service->init();
 
             mooncake::RegisterP2PRpcService(
                 server, static_cast<mooncake::WrappedP2PMasterService&>(

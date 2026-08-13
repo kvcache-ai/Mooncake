@@ -3,7 +3,7 @@
 
 #include <glog/logging.h>
 
-#include "master_metric_manager.h"
+#include "centralized_master_metric_manager.h"
 
 namespace mooncake {
 CentralizedClientManager::CentralizedClientManager(
@@ -19,8 +19,18 @@ CentralizedClientManager::CentralizedClientManager(
         allocation_strategy_ = std::make_shared<CxlAllocationStrategy>();
         cxl_global_allocator_ = std::make_shared<CachelibBufferAllocator>(
             cxl_path_, DEFAULT_CXL_BASE, cxl_size_, cxl_path_, generate_uuid());
-        MasterMetricManager::instance().inc_total_mem_capacity(cxl_path_,
-                                                               cxl_size_);
+        // Keep master capacity-usage metrics in sync with allocations.
+        cxl_global_allocator_->set_usage_observers(
+            [cxl_path = cxl_path_](int64_t bytes) {
+                CentralizedMasterMetricManager::instance()
+                    .inc_allocated_mem_size(cxl_path, bytes);
+            },
+            [cxl_path = cxl_path_](int64_t bytes) {
+                CentralizedMasterMetricManager::instance()
+                    .dec_allocated_mem_size(cxl_path, bytes);
+            });
+        CentralizedMasterMetricManager::instance().inc_total_mem_capacity(
+            cxl_path_, cxl_size_);
         VLOG(1) << "CXL global allocator initialized";
     } else {
         allocation_strategy_ = std::make_shared<RandomAllocationStrategy>();
@@ -29,8 +39,8 @@ CentralizedClientManager::CentralizedClientManager(
 
 CentralizedClientManager::~CentralizedClientManager() {
     if (cxl_global_allocator_) {
-        MasterMetricManager::instance().dec_total_mem_capacity(cxl_path_,
-                                                               cxl_size_);
+        CentralizedMasterMetricManager::instance().dec_total_mem_capacity(
+            cxl_path_, cxl_size_);
     }
 }
 

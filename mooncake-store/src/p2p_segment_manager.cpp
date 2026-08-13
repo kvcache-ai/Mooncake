@@ -1,5 +1,5 @@
 #include "p2p_segment_manager.h"
-#include "master_metric_manager.h"
+#include "p2p_master_metric_manager.h"
 #include <glog/logging.h>
 
 namespace mooncake {
@@ -42,8 +42,8 @@ tl::expected<void, ErrorCode> P2PSegmentManager::InnerMountSegment(
         on_segment_added_(*new_segment);
     }
 
-    MasterMetricManager::instance().inc_total_mem_capacity(segment.name,
-                                                           segment.size);
+    P2PMasterMetricManager::instance().inc_total_mem_capacity(segment.name,
+                                                              segment.size);
     return {};
 }
 
@@ -53,8 +53,8 @@ tl::expected<void, ErrorCode> P2PSegmentManager::OnUnmountSegment(
         on_segment_removed_(*segment);
     }
 
-    MasterMetricManager::instance().dec_total_mem_capacity(segment->name,
-                                                           segment->size);
+    P2PMasterMetricManager::instance().dec_total_mem_capacity(segment->name,
+                                                              segment->size);
     return {};
 }
 

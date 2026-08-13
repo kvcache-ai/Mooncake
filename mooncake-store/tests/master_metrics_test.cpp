@@ -7,7 +7,9 @@
 #include "centralized_rpc_service.h"
 #include "types.h"
 #include "master_config.h"
+#include "centralized_master_metric_manager.h"
 #include "master_metric_manager.h"
+#include "p2p_master_metric_manager.h"
 
 namespace mooncake::test {
 
@@ -16,7 +18,7 @@ class MasterMetricsTest : public ::testing::Test {
     void SetUp() override {
         google::InitGoogleLogging("MasterMetricsTest");
         FLAGS_logtostderr = true;
-        MasterMetricManager::instance().reset_all_metrics();
+        CentralizedMasterMetricManager::instance().reset_all_metrics();
     }
 
     std::vector<Replica::Descriptor> replica_list;
@@ -25,7 +27,7 @@ class MasterMetricsTest : public ::testing::Test {
 };
 
 TEST_F(MasterMetricsTest, InitialStatusTest) {
-    auto& metrics = MasterMetricManager::instance();
+    auto& metrics = CentralizedMasterMetricManager::instance();
 
     // Mem Storage Metrics
     ASSERT_EQ(metrics.get_allocated_mem_size(), 0);
@@ -114,11 +116,12 @@ TEST_F(MasterMetricsTest, InitialStatusTest) {
 }
 
 TEST_F(MasterMetricsTest, RegisterUnregisterRpcMetrics) {
-    auto& metrics = MasterMetricManager::instance();
+    auto& metrics = CentralizedMasterMetricManager::instance();
     WrappedMasterServiceConfig service_config;
     service_config.default_kv_lease_ttl = 100;
     service_config.enable_metric_reporting = true;
     WrappedCentralizedMasterService service_(service_config);
+    service_.init();
 
     UUID client_id = generate_uuid();
 
@@ -154,12 +157,13 @@ TEST_F(MasterMetricsTest, RegisterUnregisterRpcMetrics) {
 
 TEST_F(MasterMetricsTest, BasicRequestTest) {
     const uint64_t default_kv_lease_ttl = 100;
-    auto& metrics = MasterMetricManager::instance();
+    auto& metrics = CentralizedMasterMetricManager::instance();
     // Use a wrapped master service to test the metrics manager
     WrappedMasterServiceConfig service_config;
     service_config.default_kv_lease_ttl = default_kv_lease_ttl;
     service_config.enable_metric_reporting = true;
     WrappedCentralizedMasterService service_(service_config);
+    service_.init();
 
     constexpr size_t kBufferAddress = 0x300000000;
     constexpr size_t kSegmentSize = 1024 * 1024 * 16;
@@ -296,12 +300,13 @@ TEST_F(MasterMetricsTest, BasicRequestTest) {
 
 TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
     const uint64_t default_kv_lease_ttl = 100;
-    auto& metrics = MasterMetricManager::instance();
+    auto& metrics = CentralizedMasterMetricManager::instance();
     // Use a wrapped master service to test the metrics manager
     WrappedMasterServiceConfig service_config;
     service_config.default_kv_lease_ttl = default_kv_lease_ttl;
     service_config.enable_metric_reporting = true;
     WrappedCentralizedMasterService service_(service_config);
+    service_.init();
 
     constexpr size_t kBufferAddress = 0x300000000;
     constexpr size_t kSegmentSize = 1024 * 1024 * 16;
@@ -369,10 +374,11 @@ TEST_F(MasterMetricsTest, CalcCacheStatsTest) {
 
 TEST_F(MasterMetricsTest, BatchRequestTest) {
     const uint64_t default_kv_lease_ttl = 100;
-    auto& metrics = MasterMetricManager::instance();
+    auto& metrics = CentralizedMasterMetricManager::instance();
     WrappedMasterServiceConfig service_config;
     service_config.default_kv_lease_ttl = default_kv_lease_ttl;
     WrappedCentralizedMasterService service_(service_config);
+    service_.init();
 
     constexpr size_t kBufferAddress = 0x300000000;
     constexpr size_t kSegmentSize = 1024 * 1024 * 64;

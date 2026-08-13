@@ -5,7 +5,7 @@
 #include <random>
 #include <ylt/util/tl/expected.hpp>
 
-#include "master_metric_manager.h"
+#include "centralized_master_metric_manager.h"
 #include "mutex.h"
 #include "types.h"
 
@@ -15,7 +15,7 @@ namespace mooncake {
 CentralizedMasterService::CentralizedObjectMetadata::
     ~CentralizedObjectMetadata() {
     if (soft_pin_timeout_) {
-        MasterMetricManager::instance().dec_soft_pin_key_count(1);
+        CentralizedMasterMetricManager::instance().dec_soft_pin_key_count(1);
     }
 }
 
@@ -31,7 +31,7 @@ CentralizedMasterService::CentralizedObjectMetadata::CentralizedObjectMetadata(
       replication_task_cnt_(0) {
     if (enable_soft_pin) {
         soft_pin_timeout_.emplace();
-        MasterMetricManager::instance().inc_soft_pin_key_count(1);
+        CentralizedMasterMetricManager::instance().inc_soft_pin_key_count(1);
     }
 }
 
@@ -129,7 +129,9 @@ CentralizedMasterService::CentralizedObjectMetadata::IsReplicaRemovable(
 
 // ================= CentralizedMasterService implementation =================
 CentralizedMasterService::CentralizedMasterService()
-    : CentralizedMasterService(MasterServiceConfig()) {}
+    : CentralizedMasterService(MasterServiceConfig()) {
+    CentralizedMasterMetricManager::instance();
+}
 
 CentralizedMasterService::CentralizedMasterService(
     const MasterServiceConfig& config)
@@ -152,6 +154,7 @@ CentralizedMasterService::CentralizedMasterService(
       put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
       put_start_release_timeout_sec_(config.put_start_release_timeout_sec),
       task_manager_(config.task_manager_config) {
+    CentralizedMasterMetricManager::instance();
     if (eviction_ratio_ < 0.0 || eviction_ratio_ > 1.0) {
         LOG(ERROR) << "Eviction ratio must be between 0.0 and 1.0, "
                    << "current value: " << eviction_ratio_;
@@ -187,7 +190,7 @@ CentralizedMasterService::CentralizedMasterService(
 
     if (!root_fs_dir_.empty()) {
         use_disk_replica_ = true;
-        MasterMetricManager::instance().inc_total_file_capacity(
+        CentralizedMasterMetricManager::instance().inc_total_file_capacity(
             global_file_segment_size_);
     }
 
@@ -316,19 +319,19 @@ void CentralizedMasterService::OnObjectAccessed(
 void CentralizedMasterService::OnObjectHit(const ObjectMetadata& metadata) {
     auto& replica = metadata.replicas_[0];
     if (replica.is_memory_replica()) {
-        MasterMetricManager::instance().inc_mem_cache_hit_nums();
+        CentralizedMasterMetricManager::instance().inc_mem_cache_hit_nums();
     } else if (replica.is_disk_replica()) {
-        MasterMetricManager::instance().inc_file_cache_hit_nums();
+        CentralizedMasterMetricManager::instance().inc_file_cache_hit_nums();
     }
-    MasterMetricManager::instance().inc_valid_get_nums();
+    CentralizedMasterMetricManager::instance().inc_valid_get_nums();
 }
 
 void CentralizedMasterService::OnReplicaRemoved(const Replica& replica) {
     if (replica.status() == ReplicaStatus::COMPLETE) {
         if (replica.is_memory_replica()) {
-            MasterMetricManager::instance().dec_mem_cache_nums();
+            CentralizedMasterMetricManager::instance().dec_mem_cache_nums();
         } else if (replica.is_disk_replica()) {
-            MasterMetricManager::instance().dec_file_cache_nums();
+            CentralizedMasterMetricManager::instance().dec_file_cache_nums();
         }
     }
 }
@@ -336,9 +339,9 @@ void CentralizedMasterService::OnReplicaRemoved(const Replica& replica) {
 void CentralizedMasterService::OnReplicaAdded(const Replica& replica) {
     if (replica.status() == ReplicaStatus::COMPLETE) {
         if (replica.is_memory_replica()) {
-            MasterMetricManager::instance().inc_mem_cache_nums();
+            CentralizedMasterMetricManager::instance().inc_mem_cache_nums();
         } else if (replica.is_disk_replica()) {
-            MasterMetricManager::instance().inc_file_cache_nums();
+            CentralizedMasterMetricManager::instance().inc_file_cache_nums();
         }
     }
 }
@@ -777,8 +780,8 @@ void CentralizedMasterService::EvictionThreadFunc() {
     auto last_discard_time = std::chrono::steady_clock::now();
     while (eviction_running_) {
         const auto now = std::chrono::steady_clock::now();
-        double used_ratio =
-            MasterMetricManager::instance().get_global_mem_used_ratio();
+        double used_ratio = CentralizedMasterMetricManager::instance()
+                                .get_global_mem_used_ratio();
         if (used_ratio > eviction_high_watermark_ratio_ ||
             (need_eviction_ && eviction_ratio_ > 0.0)) {
             double evict_ratio_target = std::max(
@@ -1245,14 +1248,14 @@ void CentralizedMasterService::BatchEvict(double evict_ratio_target,
 
     if (evicted_count > 0 || released_discarded_cnt > 0) {
         need_eviction_ = false;
-        MasterMetricManager::instance().inc_eviction_success(evicted_count,
-                                                             total_freed_size);
+        CentralizedMasterMetricManager::instance().inc_eviction_success(
+            evicted_count, total_freed_size);
     } else {
         if (object_count == 0) {
             // No objects to evict, no need to check again
             need_eviction_ = false;
         }
-        MasterMetricManager::instance().inc_eviction_fail();
+        CentralizedMasterMetricManager::instance().inc_eviction_fail();
     }
     VLOG(1) << "action=evict_objects"
             << ", evicted_count=" << evicted_count

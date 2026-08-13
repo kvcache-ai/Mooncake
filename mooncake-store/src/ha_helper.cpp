@@ -352,6 +352,7 @@ int MasterServiceSupervisor::Start() {
             wrapped_master_service =
                 std::make_unique<WrappedCentralizedMasterService>(
                     WrappedMasterServiceConfig(config_, view_version));
+            wrapped_master_service->init();
             RegisterCentralizedRpcService(
                 server, static_cast<WrappedCentralizedMasterService&>(
                             *wrapped_master_service));
@@ -359,6 +360,7 @@ int MasterServiceSupervisor::Start() {
             auto p2p_wrapped_service =
                 std::make_unique<WrappedP2PMasterService>(
                     WrappedMasterServiceConfig(config_, view_version));
+            p2p_wrapped_service->init();
             if (p2p_promoted_metadata.has_value()) {
                 auto& p2p_master_service = static_cast<P2PMasterService&>(
                     p2p_wrapped_service->GetMasterService());

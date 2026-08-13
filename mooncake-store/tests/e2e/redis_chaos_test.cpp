@@ -1,8 +1,11 @@
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
+#include <arpa/inet.h>
 #include <fcntl.h>
+#include <netinet/in.h>
 #include <signal.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -144,6 +147,30 @@ int MasterIndexFromAddress(const std::string& master_address) {
     }
     int port = std::stoi(master_address.substr(colon_pos + 1));
     return port - kMasterPortBase;
+}
+
+bool TcpPortAccepting(const std::string& master_address) {
+    auto colon_pos = master_address.rfind(':');
+    if (colon_pos == std::string::npos) {
+        return false;
+    }
+    const std::string host = master_address.substr(0, colon_pos);
+    const int port = std::stoi(master_address.substr(colon_pos + 1));
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        return false;
+    }
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<uint16_t>(port));
+    if (inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
+        close(fd);
+        return false;
+    }
+    bool accepting =
+        connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0;
+    close(fd);
+    return accepting;
 }
 
 class ClientCtlProcess {
@@ -449,6 +476,27 @@ class RedisChaosTest : public ::testing::Test {
     }
 
     void WaitForLeaderServiceReady() {
+        // The leader master only starts serving RPCs after the election lease
+        // elapses, and a fixed TTL+1s sleep is too tight on slow CI runners:
+        // clients that start before the RPC server is up fall back to
+        // DEGRADED mode and write locally without notifying the master, so no
+        // ADD_REPLICA OpLog entry is produced. Poll the leader's RPC port so
+        // the test controls the deployment order deterministically.
+        auto deadline =
+            std::chrono::steady_clock::now() +
+            std::chrono::seconds(FLAGS_redis_master_view_ttl_sec * 4);
+        while (std::chrono::steady_clock::now() < deadline) {
+            std::string master_address;
+            ViewVersionId version = 0;
+            if (master_view_helper_->GetMasterView(master_address, version) ==
+                    ErrorCode::OK &&
+                MasterIndexFromAddress(master_address) >= 0 &&
+                TcpPortAccepting(master_address)) {
+                return;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        // Fallback to the original heuristic if the probe cannot complete.
         std::this_thread::sleep_for(
             std::chrono::seconds(FLAGS_redis_master_view_ttl_sec + 1));
     }

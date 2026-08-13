@@ -24,7 +24,7 @@ class WrappedMasterService {
 
     virtual ~WrappedMasterService();
 
-    void init_http_server();
+    void init();
 
     uint16_t GetHttpPort() const { return http_server_.port(); }
 
@@ -84,7 +84,10 @@ class WrappedMasterService {
     tl::expected<std::string, ErrorCode> ServiceReady();
 
    protected:
+    void init_http_server();
     virtual MasterService& GetMasterService() = 0;
+
+    virtual void init_http_handlers() = 0;
 
    protected:
     std::thread metric_report_thread_;

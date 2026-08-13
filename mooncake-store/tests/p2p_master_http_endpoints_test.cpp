@@ -58,6 +58,7 @@ class P2PMasterHttpEndpointsTest : public ::testing::Test {
         wms_cfg.http_port = http_port;
 
         wrapped_ = std::make_unique<WrappedP2PMasterService>(wms_cfg);
+        wrapped_->init();
         // Give the HTTP server a moment to come up (mirrors InProcP2PMaster).
         std::this_thread::sleep_for(std::chrono::milliseconds(200));
         ASSERT_EQ(wrapped_->GetHttpPort(), http_port);

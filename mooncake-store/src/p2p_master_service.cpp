@@ -10,6 +10,7 @@
 #include "ha/oplog/oplog_store_factory.h"
 #include "p2p_client_meta.h"
 #include "ha_metric_manager.h"
+#include "p2p_master_metric_manager.h"
 
 namespace mooncake {
 
@@ -18,6 +19,7 @@ P2PMasterService::P2PMasterService(const MasterServiceConfig& config)
       max_client_per_key_(config.max_client_per_key),
       enable_async_oplog_write_(ParseOpLogStoreType(config.oplog_store_type) ==
                                 OpLogStoreType::REDIS) {
+    P2PMasterMetricManager::instance();
     client_manager_ = std::make_shared<P2PClientManager>(
         config.client_live_ttl_sec, config.client_crashed_ttl_sec,
         config.view_version);
