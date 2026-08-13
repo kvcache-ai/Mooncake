@@ -3723,6 +3723,7 @@ auto MasterService::AllocateAndInsertMetadata(
     const auto write_mode = DetermineReplicaWriteMode(config);
     size_t allocated_memory_replicas = 0;
     size_t allocated_nof_replicas = 0;
+    bool has_enough_memory_segments = false;
     if (config.replica_num > 0) {
         const bool use_local_first =
             allocation_strategy_type_ == AllocationStrategyType::LOCAL_FIRST &&
@@ -3736,6 +3737,8 @@ auto MasterService::AllocateAndInsertMetadata(
         ScopedAllocatorAccess allocator_access =
             segment_manager_.getAllocatorAccess();
         const auto& allocator_manager = allocator_access.getAllocatorManager();
+        has_enough_memory_segments =
+            allocator_manager.getNames().size() >= config.replica_num;
 
         std::vector<std::string> preferred_segments;
         auto append_preferred_segment = [&preferred_segments](
@@ -3789,7 +3792,9 @@ auto MasterService::AllocateAndInsertMetadata(
             }
             if (write_mode != ReplicaWriteMode::FLEXIBLE_DUAL_REPLICA) {
                 MasterMetricManager::instance().inc_put_start_alloc_failures();
-                need_mem_eviction_ = true;
+                if (has_enough_memory_segments) {
+                    need_mem_eviction_ = true;
+                }
                 refund_pending_quota();
                 return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
             }
@@ -3843,7 +3848,8 @@ auto MasterService::AllocateAndInsertMetadata(
              allocated_nof_replicas != config.nof_replica_num)) {
             MasterMetricManager::instance().inc_put_start_alloc_failures();
             if (config.replica_num > 0 &&
-                allocated_memory_replicas != config.replica_num) {
+                allocated_memory_replicas != config.replica_num &&
+                has_enough_memory_segments) {
                 need_mem_eviction_ = true;
             }
             if (config.nof_replica_num > 0 &&
