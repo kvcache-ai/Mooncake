@@ -805,10 +805,10 @@ TEST_F(MasterServiceHATest, RemountMakesRestoredMemoryReplicaReady) {
                   .get_memory_descriptor()
                   .buffer_descriptor.buffer_address_,
               kDefaultSegmentBase + 4096);
-    EXPECT_EQ(SegmentAllocatedSizeForTesting(service, endpoint), 5120);
+    EXPECT_EQ(SegmentAllocatedSizeForTesting(service, endpoint), 2048);
     EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size() -
                   metric_before,
-              5120);
+              2048);
 
     const std::string new_key = "post_remount_allocation";
     PutObjectOnSegment(service, generate_uuid(), new_key, endpoint);
@@ -821,12 +821,12 @@ TEST_F(MasterServiceHATest, RemountMakesRestoredMemoryReplicaReady) {
               kDefaultSegmentBase + 1024);
     EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size() -
                   metric_before,
-              6144);
+              3072);
 
     EraseObjectForTesting(service, kDefaultTenant, first_key);
     EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size() -
                   metric_before,
-              5120);
+              2048);
     const std::string replacement_key = "post_remount_replacement";
     PutObjectOnSegment(service, generate_uuid(), replacement_key, endpoint);
     auto replacement =
@@ -838,7 +838,7 @@ TEST_F(MasterServiceHATest, RemountMakesRestoredMemoryReplicaReady) {
               kDefaultSegmentBase);
     EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size() -
                   metric_before,
-              6144);
+              3072);
 }
 
 TEST_F(MasterServiceHATest, RemountRestoresCachelibMemoryReplica) {
