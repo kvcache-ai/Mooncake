@@ -1,3 +1,6 @@
+// Modified by Hygon Information Technology Co., Ltd., 2026.
+
+#include <csignal>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>

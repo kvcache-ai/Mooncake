@@ -159,7 +159,10 @@ build_variant() {
     echo "==> Building ${package_basename}"
     run_cmd mkdir -p "${BUILD_DIR}" "${FINAL_DIST_DIR}"
     unset VERBOSE || true
-    run_cmd cmake -S "${REPO_ROOT}" -B "${BUILD_DIR}" "${cmake_args[@]}" -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" -DBUILD_SHARED_LIBS=ON -DCMAKE_VERBOSE_MAKEFILE=OFF
+    run_cmd cmake -S "${REPO_ROOT}" -B "${BUILD_DIR}" "${cmake_args[@]}" \
+        -DCMAKE_BUILD_TYPE="${BUILD_TYPE}" -DBUILD_SHARED_LIBS=ON \
+        -DCMAKE_VERBOSE_MAKEFILE=OFF -DCMAKE_CXX_FLAGS="" \
+        -DCMAKE_IGNORE_PREFIX_PATH="${CONDA_PREFIX:-/opt/hyhal/hbm/Miniconda3}"
     run_cmd cmake --build "${BUILD_DIR}" -j"${JOBS}"
     run_wheel_build
 }

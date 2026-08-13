@@ -1,3 +1,6 @@
+// Modified by Hygon Information Technology Co., Ltd., 2026.
+
+#include <csignal>
 #include <gtest/gtest.h>
 
 #include <chrono>
