@@ -68,6 +68,8 @@ class HAMetricManager {
     void set_standby_degraded(bool value);
     void set_primary_degraded(bool value);
     void set_oplog_last_successful_poll_timestamp_ms(int64_t timestamp_ms);
+    void set_p2p_snapshot_bootstrap_baseline_sequence_id(int64_t seq_id);
+    void set_p2p_bootstrap_catchup_target_sequence_id(int64_t seq_id);
 
     // ========== Error Counters ==========
 
@@ -131,6 +133,10 @@ class HAMetricManager {
     void inc_promotion_restore_failures(int64_t val = 1);
     void inc_promotion_skipped_replicas(int64_t val = 1);
     void inc_promotion_skipped_objects(int64_t val = 1);
+    void inc_p2p_snapshot_bootstrap_success(int64_t val = 1);
+    void inc_p2p_snapshot_bootstrap_failures(int64_t val = 1);
+    void inc_p2p_snapshot_resync_success(int64_t val = 1);
+    void inc_p2p_snapshot_resync_failures(int64_t val = 1);
 
     /**
      * @brief Increment counter for watch disconnections
@@ -224,6 +230,8 @@ class HAMetricManager {
     ylt::metric::gauge_t standby_degraded_;
     ylt::metric::gauge_t primary_degraded_;
     ylt::metric::gauge_t oplog_last_successful_poll_timestamp_ms_;
+    ylt::metric::gauge_t p2p_snapshot_bootstrap_baseline_sequence_id_;
+    ylt::metric::gauge_t p2p_bootstrap_catchup_target_sequence_id_;
 
     // Error Counters
     ylt::metric::counter_t oplog_skipped_entries_total_;
@@ -254,6 +262,10 @@ class HAMetricManager {
     ylt::metric::counter_t promotion_restore_failures_total_;
     ylt::metric::counter_t promotion_skipped_replicas_total_;
     ylt::metric::counter_t promotion_skipped_objects_total_;
+    ylt::metric::counter_t p2p_snapshot_bootstrap_success_total_;
+    ylt::metric::counter_t p2p_snapshot_bootstrap_failures_total_;
+    ylt::metric::counter_t p2p_snapshot_resync_success_total_;
+    ylt::metric::counter_t p2p_snapshot_resync_failures_total_;
     ylt::metric::counter_t oplog_watch_disconnections_total_;
     ylt::metric::counter_t oplog_applied_entries_total_;
     ylt::metric::counter_t oplog_dropped_put_end_total_;

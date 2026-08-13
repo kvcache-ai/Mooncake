@@ -39,6 +39,8 @@ class P2POpLogApplier : public OpLogApplier {
    protected:
     bool ApplyCustomOpLogEntry(const OpLogEntry& entry) override;
     bool IsBestEffortOpLogEntry(const OpLogEntry& entry) const override;
+    bool IsLateSkippedDeleteLikeOpLogEntry(
+        const OpLogEntry& entry) const override;
 
    private:
     // Apply individual P2P OpTypes. Return true on success.

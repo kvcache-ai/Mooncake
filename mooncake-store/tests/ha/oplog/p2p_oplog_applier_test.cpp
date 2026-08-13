@@ -90,6 +90,22 @@ Segment MakeSegment(const UUID& id, size_t size) {
     segment.size = size;
     return segment;
 }
+
+void SkipSequenceWithFutureAdd(P2POpLogApplier& applier,
+                               uint64_t skipped_sequence_id,
+                               const std::string& future_key) {
+    AddReplicaPayload future;
+    future.object_key = future_key;
+    future.client_id = MakeUUID(1000 + skipped_sequence_id, 0);
+    future.segment_id = MakeUUID(2000 + skipped_sequence_id, 0);
+    future.size = 1024;
+
+    ASSERT_FALSE(applier.ApplyOpLogEntry(
+        MakeAddReplicaEntry(skipped_sequence_id + 1, future_key, future)));
+    applier.ConfirmMissingSequenceIds({skipped_sequence_id});
+    EXPECT_EQ(applier.ProcessPendingEntries(), 1u);
+    EXPECT_EQ(applier.GetExpectedSequenceId(), skipped_sequence_id + 2);
+}
 }  // namespace
 
 // ============================================================================
@@ -342,6 +358,181 @@ TEST(P2POpLogApplierTest, ApplyUnregisterClient) {
 }
 
 // ============================================================================
+// P2POpLogApplier - Snapshot replay idempotency
+// ============================================================================
+
+TEST(P2POpLogApplierTest, ReplayAddReplicaAlreadyInSnapshotIsNoOp) {
+    P2PStandbyMetadataStore store;
+    P2POpLogApplier applier(&store, "test-cluster");
+
+    auto client = MakeUUID(1, 0);
+    auto seg = MakeUUID(10, 0);
+    store.RegisterClient(client, "192.168.1.100", 50051,
+                         {MakeSegment(seg, 4096)});
+    store.AddReplica("snapshot-key", client, seg, 1024, 101);
+    applier.Recover(100);
+
+    AddReplicaPayload payload;
+    payload.object_key = "snapshot-key";
+    payload.client_id = client;
+    payload.segment_id = seg;
+    payload.size = 1024;
+    EXPECT_TRUE(applier.ApplyOpLogEntry(
+        MakeAddReplicaEntry(101, "snapshot-key", payload)));
+
+    auto objects = store.GetObjects();
+    ASSERT_EQ(objects.size(), 1u);
+    ASSERT_EQ(objects.at("snapshot-key").replicas.size(), 1u);
+    EXPECT_EQ(objects.at("snapshot-key").last_sequence_id, 101u);
+    EXPECT_EQ(applier.GetExpectedSequenceId(), 102u);
+}
+
+TEST(P2POpLogApplierTest, ReplayMountSegmentAlreadyInSnapshotIsNoOp) {
+    P2PStandbyMetadataStore store;
+    P2POpLogApplier applier(&store, "test-cluster");
+
+    auto client = MakeUUID(1, 0);
+    auto seg = MakeUUID(10, 0);
+    Segment segment = MakeSegment(seg, 4096);
+    store.RegisterClient(client, "192.168.1.100", 50051, {segment});
+    applier.Recover(100);
+
+    MountSegmentPayload payload;
+    payload.client_id = client;
+    payload.segment = segment;
+    EXPECT_TRUE(applier.ApplyOpLogEntry(MakeMountSegmentEntry(101, payload)));
+
+    auto info = store.GetClient(client);
+    ASSERT_NE(info, nullptr);
+    ASSERT_EQ(info->segments.size(), 1u);
+    EXPECT_EQ(info->segments[0].id, seg);
+    EXPECT_EQ(applier.GetExpectedSequenceId(), 102u);
+}
+
+TEST(P2POpLogApplierTest, ReplayRegisterClientAlreadyInSnapshotIsStable) {
+    P2PStandbyMetadataStore store;
+    P2POpLogApplier applier(&store, "test-cluster");
+
+    auto client = MakeUUID(1, 0);
+    auto registration_seg = MakeUUID(10, 0);
+    auto later_seg = MakeUUID(20, 0);
+    Segment registration_segment = MakeSegment(registration_seg, 4096);
+    Segment later_segment = MakeSegment(later_seg, 8192);
+    store.RegisterClient(client, "192.168.1.100", 50051,
+                         {registration_segment, later_segment});
+    applier.Recover(100);
+
+    RegisterClientPayload payload;
+    payload.client_id = client;
+    payload.ip_address = "192.168.1.100";
+    payload.rpc_port = 50051;
+    payload.segments = {registration_segment};
+    EXPECT_TRUE(applier.ApplyOpLogEntry(MakeRegisterClientEntry(101, payload)));
+
+    auto info = store.GetClient(client);
+    ASSERT_NE(info, nullptr);
+    EXPECT_EQ(info->ip_address, "192.168.1.100");
+    EXPECT_EQ(info->rpc_port, 50051u);
+    ASSERT_EQ(info->segments.size(), 2u);
+    EXPECT_EQ(info->segments[0].id, registration_seg);
+    EXPECT_EQ(info->segments[1].id, later_seg);
+    EXPECT_EQ(applier.GetExpectedSequenceId(), 102u);
+}
+
+TEST(P2POpLogApplierTest, ReplayRemoveReplicaAlreadyReflectedInSnapshotIsNoOp) {
+    P2PStandbyMetadataStore store;
+    P2POpLogApplier applier(&store, "test-cluster");
+    applier.Recover(100);
+
+    RemoveReplicaPayload payload;
+    payload.object_key = "removed-key";
+    payload.client_id = MakeUUID(1, 0);
+    payload.segment_id = MakeUUID(10, 0);
+    EXPECT_TRUE(applier.ApplyOpLogEntry(
+        MakeRemoveReplicaEntry(101, "removed-key", payload)));
+
+    EXPECT_EQ(store.GetKeyCount(), 0u);
+    EXPECT_EQ(applier.GetExpectedSequenceId(), 102u);
+}
+
+TEST(P2POpLogApplierTest,
+     ReplayUnmountSegmentAlreadyReflectedInSnapshotIsNoOp) {
+    P2PStandbyMetadataStore store;
+    P2POpLogApplier applier(&store, "test-cluster");
+    applier.Recover(100);
+
+    UnmountSegmentPayload payload;
+    payload.client_id = MakeUUID(1, 0);
+    payload.segment_id = MakeUUID(10, 0);
+    EXPECT_TRUE(applier.ApplyOpLogEntry(MakeUnmountSegmentEntry(101, payload)));
+
+    EXPECT_EQ(store.GetKeyCount(), 0u);
+    EXPECT_EQ(store.GetClients().size(), 0u);
+    EXPECT_EQ(applier.GetExpectedSequenceId(), 102u);
+}
+
+TEST(P2POpLogApplierTest,
+     ReplayUnregisterClientAlreadyReflectedInSnapshotIsNoOp) {
+    P2PStandbyMetadataStore store;
+    P2POpLogApplier applier(&store, "test-cluster");
+    auto client = MakeUUID(1, 0);
+    applier.Recover(100);
+
+    UnregisterClientPayload payload;
+    payload.client_id = client;
+    EXPECT_TRUE(
+        applier.ApplyOpLogEntry(MakeUnregisterClientEntry(101, payload)));
+
+    EXPECT_EQ(store.GetClient(client), nullptr);
+    EXPECT_EQ(store.GetKeyCount(), 0u);
+    EXPECT_EQ(applier.GetExpectedSequenceId(), 102u);
+}
+
+TEST(P2POpLogApplierTest, ReplayRemoveAllAlreadyReflectedInSnapshotIsNoOp) {
+    P2PStandbyMetadataStore store;
+    P2POpLogApplier applier(&store, "test-cluster");
+    applier.Recover(100);
+
+    EXPECT_TRUE(
+        applier.ApplyOpLogEntry(MakeEntry(101, OpType_REMOVE_ALL, "", "")));
+
+    EXPECT_EQ(store.GetKeyCount(), 0u);
+    EXPECT_EQ(store.GetClients().size(), 0u);
+    EXPECT_EQ(applier.GetExpectedSequenceId(), 102u);
+}
+
+TEST(P2POpLogApplierTest, AlreadyAppliedP2PSequenceIsNoOp) {
+    P2PStandbyMetadataStore store;
+    P2POpLogApplier applier(&store, "test-cluster");
+
+    auto client = MakeUUID(1, 0);
+    auto seg = MakeUUID(10, 0);
+
+    AddReplicaPayload first;
+    first.object_key = "committed-key";
+    first.client_id = client;
+    first.segment_id = seg;
+    first.size = 1024;
+    EXPECT_TRUE(applier.ApplyOpLogEntry(
+        MakeAddReplicaEntry(1, "committed-key", first)));
+    EXPECT_EQ(applier.GetExpectedSequenceId(), 2u);
+
+    AddReplicaPayload stale;
+    stale.object_key = "stale-key";
+    stale.client_id = MakeUUID(2, 0);
+    stale.segment_id = MakeUUID(20, 0);
+    stale.size = 2048;
+    EXPECT_TRUE(
+        applier.ApplyOpLogEntry(MakeAddReplicaEntry(1, "stale-key", stale)));
+
+    auto objects = store.GetObjects();
+    ASSERT_EQ(objects.size(), 1u);
+    EXPECT_NE(objects.find("committed-key"), objects.end());
+    EXPECT_EQ(objects.find("stale-key"), objects.end());
+    EXPECT_EQ(applier.GetExpectedSequenceId(), 2u);
+}
+
+// ============================================================================
 // P2POpLogApplier - Ordering and gap detection
 // ============================================================================
 
@@ -438,6 +629,84 @@ TEST(P2POpLogApplierTest, MissingEntryTimeoutSkipsGapAndDrainsP2PEntry) {
     EXPECT_EQ(1u, applier.ProcessPendingEntries());
     EXPECT_EQ(1u, store.GetKeyCount());
     EXPECT_EQ(3u, applier.GetExpectedSequenceId());
+}
+
+TEST(P2POpLogApplierTest, LateSkippedP2PDeleteLikeEntriesAreApplied) {
+    P2PStandbyMetadataStore store;
+    P2POpLogApplier applier(&store, "test-cluster");
+    applier.Recover(1);
+
+    auto remove_client = MakeUUID(1, 0);
+    auto remove_seg = MakeUUID(10, 0);
+    store.RegisterClient(remove_client, "192.168.1.100", 50051,
+                         {MakeSegment(remove_seg, 4096)});
+    store.AddReplica("late-remove-replica", remove_client, remove_seg, 1024, 1);
+    SkipSequenceWithFutureAdd(applier, 2, "future-after-remove-replica");
+
+    RemoveReplicaPayload remove_payload;
+    remove_payload.object_key = "late-remove-replica";
+    remove_payload.client_id = remove_client;
+    remove_payload.segment_id = remove_seg;
+    EXPECT_TRUE(applier.ApplyOpLogEntry(
+        MakeRemoveReplicaEntry(2, "late-remove-replica", remove_payload)));
+    EXPECT_EQ(store.GetObjects().count("late-remove-replica"), 0u);
+    EXPECT_EQ(applier.GetExpectedSequenceId(), 4u);
+
+    auto unmount_client = MakeUUID(2, 0);
+    auto unmount_seg = MakeUUID(20, 0);
+    store.RegisterClient(unmount_client, "192.168.1.101", 50052,
+                         {MakeSegment(unmount_seg, 4096)});
+    store.AddReplica("late-unmount-segment", unmount_client, unmount_seg, 1024,
+                     3);
+    SkipSequenceWithFutureAdd(applier, 4, "future-after-unmount-segment");
+
+    UnmountSegmentPayload unmount_payload;
+    unmount_payload.client_id = unmount_client;
+    unmount_payload.segment_id = unmount_seg;
+    EXPECT_TRUE(
+        applier.ApplyOpLogEntry(MakeUnmountSegmentEntry(4, unmount_payload)));
+    EXPECT_EQ(store.GetObjects().count("late-unmount-segment"), 0u);
+    auto unmount_info = store.GetClient(unmount_client);
+    ASSERT_NE(unmount_info, nullptr);
+    EXPECT_TRUE(unmount_info->segments.empty());
+    EXPECT_EQ(applier.GetExpectedSequenceId(), 6u);
+
+    auto unregister_client = MakeUUID(3, 0);
+    auto unregister_seg = MakeUUID(30, 0);
+    store.RegisterClient(unregister_client, "192.168.1.102", 50053,
+                         {MakeSegment(unregister_seg, 4096)});
+    store.AddReplica("late-unregister-client", unregister_client,
+                     unregister_seg, 1024, 5);
+    SkipSequenceWithFutureAdd(applier, 6, "future-after-unregister-client");
+
+    UnregisterClientPayload unregister_payload;
+    unregister_payload.client_id = unregister_client;
+    EXPECT_TRUE(applier.ApplyOpLogEntry(
+        MakeUnregisterClientEntry(6, unregister_payload)));
+    EXPECT_EQ(store.GetClient(unregister_client), nullptr);
+    EXPECT_EQ(store.GetObjects().count("late-unregister-client"), 0u);
+    EXPECT_EQ(applier.GetExpectedSequenceId(), 8u);
+}
+
+TEST(P2POpLogApplierTest, LateSkippedP2PAddLikeEntryIsDiscarded) {
+    P2PStandbyMetadataStore store;
+    P2POpLogApplier applier(&store, "test-cluster");
+    applier.Recover(1);
+
+    SkipSequenceWithFutureAdd(applier, 2, "future-after-add-like");
+
+    AddReplicaPayload stale;
+    stale.object_key = "late-add-replica";
+    stale.client_id = MakeUUID(1, 0);
+    stale.segment_id = MakeUUID(10, 0);
+    stale.size = 1024;
+    EXPECT_TRUE(
+        applier.ApplyOpLogEntry(MakeAddReplicaEntry(2, "late-add", stale)));
+
+    auto objects = store.GetObjects();
+    EXPECT_EQ(objects.count("late-add-replica"), 0u);
+    EXPECT_EQ(objects.count("future-after-add-like"), 1u);
+    EXPECT_EQ(applier.GetExpectedSequenceId(), 4u);
 }
 
 // ============================================================================
