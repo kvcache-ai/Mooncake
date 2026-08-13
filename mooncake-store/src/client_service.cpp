@@ -2130,6 +2130,13 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config) {
+    return BatchUpsert(keys, batched_slices, config, {});
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
+    const std::vector<ObjectKey>& keys,
+    std::vector<std::vector<Slice>>& batched_slices,
+    const ReplicateConfig& config, const WriteBufferStager& stager) {
     ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
@@ -2142,10 +2149,12 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
                 keys.size(), tl::unexpected(*err));
         }
         StartBatchUpsert(ops, client_cfg);
+        StageWriteBuffersForRemoteReplicas(ops, stager);
         return BatchWriteWhenPreferSameNode(ops, true);
     }
 
     StartBatchUpsert(ops, client_cfg);
+    StageWriteBuffersForRemoteReplicas(ops, stager);
     auto t0 = std::chrono::steady_clock::now();
     SubmitTransfers(ops);
     WaitForTransfers(ops);
@@ -3082,6 +3091,29 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
     return results;
 }
 
+void Client::StageWriteBuffersForRemoteReplicas(
+    std::vector<PutOperation>& ops, const WriteBufferStager& stager) {
+    if (!stager) return;
+
+    for (auto& op : ops) {
+        if (op.IsResolved() || op.replicas.empty() ||
+            std::all_of(op.replicas.begin(), op.replicas.end(),
+                        [this](const Replica::Descriptor& replica) {
+                            return CanUseLocalMemcpy(replica);
+                        })) {
+            continue;
+        }
+        auto staged_slices = stager(op.slices);
+        if (!staged_slices) {
+            op.SetError(staged_slices.error(),
+                        "Failed to stage non-local write buffers");
+            continue;
+        }
+        op.slices = std::move(*staged_slices);
+        VLOG(1) << "Staged write buffers for non-local replica, key=" << op.key;
+    }
+}
+
 std::vector<tl::expected<void, ErrorCode>> Client::BatchWriteWhenPreferSameNode(
     std::vector<PutOperation>& ops, bool is_upsert) {
     auto t0 = std::chrono::steady_clock::now();
@@ -3191,6 +3223,13 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config) {
+    return BatchPut(keys, batched_slices, config, {});
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
+    const std::vector<ObjectKey>& keys,
+    std::vector<std::vector<Slice>>& batched_slices,
+    const ReplicateConfig& config, const WriteBufferStager& stager) {
     ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
@@ -3203,9 +3242,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
                 keys.size(), tl::unexpected(*err));
         }
         StartBatchPut(ops, client_cfg);
+        StageWriteBuffersForRemoteReplicas(ops, stager);
         return BatchWriteWhenPreferSameNode(ops, false);
     }
     StartBatchPut(ops, client_cfg);
+    StageWriteBuffersForRemoteReplicas(ops, stager);
 
     auto t0 = std::chrono::steady_clock::now();
     SubmitTransfers(ops);

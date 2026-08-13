@@ -1038,7 +1038,7 @@ class MooncakeStorePyWrapper {
                    const std::vector<std::vector<size_t>> &sizes,
                    const ReplicateConfig &write_config) {
                 return real_client_->batch_put_from_multi_buffers(
-                    write_keys, buffers, sizes, write_config);
+                    write_keys, buffers, sizes, write_config, true);
             });
     }
 
@@ -1064,7 +1064,7 @@ class MooncakeStorePyWrapper {
                    const std::vector<std::vector<size_t>> &sizes,
                    const ReplicateConfig &write_config) {
                 return real_client_->batch_upsert_from_multi_buffers(
-                    write_keys, buffers, sizes, write_config);
+                    write_keys, buffers, sizes, write_config, true);
             });
     }
 

@@ -293,8 +293,7 @@ std::vector<int> batch_write_tensor_impl(
             return results;
         };
 
-        if (use_dummy_client_ || !config.prefer_alloc_in_same_node)
-            return run_staged_write();
+        if (use_dummy_client_) return run_staged_write();
 
         if (!real_client_) {
             LOG(ERROR) << operation_name << ": real client is not available";

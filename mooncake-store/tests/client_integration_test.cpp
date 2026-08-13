@@ -568,6 +568,78 @@ TEST_F(ClientIntegrationTest, LocalPreferredAllocationTest) {
         << "Remove operation failed: " << toString(remove_result2.error());
 }
 
+TEST_F(ClientIntegrationTest, BatchWriteStagesActualNonLocalAllocation) {
+    size_t stage_calls = 0;
+    std::vector<std::pair<void*, size_t>> staged_allocations;
+    Client::WriteBufferStager stager = [&](const std::vector<Slice>& slices)
+        -> tl::expected<std::vector<Slice>, ErrorCode> {
+        size_t total_size = 0;
+        for (const auto& slice : slices) total_size += slice.size;
+        void* buffer = client_buffer_allocator_->allocate(total_size);
+        if (!buffer) return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+
+        std::vector<Slice> staged_slices;
+        size_t offset = 0;
+        for (const auto& slice : slices) {
+            std::memcpy(static_cast<char*>(buffer) + offset, slice.ptr,
+                        slice.size);
+            staged_slices.emplace_back(static_cast<char*>(buffer) + offset,
+                                       slice.size);
+            offset += slice.size;
+        }
+        staged_allocations.emplace_back(buffer, total_size);
+        ++stage_calls;
+        return staged_slices;
+    };
+    auto write = [&](const std::string& key, std::string& value,
+                     const ReplicateConfig& config, bool upsert) {
+        std::vector<std::string> keys{key};
+        std::vector<std::vector<Slice>> slices{{{value.data(), value.size()}}};
+        return upsert ? test_client_->BatchUpsert(keys, slices, config, stager)
+                      : test_client_->BatchPut(keys, slices, config, stager);
+    };
+
+    ReplicateConfig config;
+    config.preferred_segment = "localhost:17813";
+    size_t expected_stage_calls =
+        test_client_->CanUseLocalMemcpy(test_client_->GetTransportEndpoint())
+            ? 0
+            : 1;
+    std::string local_value = "local direct write";
+    auto local_result =
+        write("batch_write_actual_local", local_value, config, false);
+    ASSERT_TRUE(local_result[0]);
+    EXPECT_EQ(stage_calls, expected_stage_calls);
+
+    config.prefer_alloc_in_same_node = true;
+    config.preferred_segment = "localhost:17812";
+    std::string remote_value = "remote staged write";
+    auto remote_result =
+        write("batch_write_actual_remote", remote_value, config, false);
+    ASSERT_TRUE(remote_result[0]);
+    ++expected_stage_calls;
+    EXPECT_EQ(stage_calls, expected_stage_calls);
+    auto query = test_client_->Query("batch_write_actual_remote");
+    ASSERT_TRUE(query);
+    EXPECT_EQ(query->replicas[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              segment_provider_client_->GetTransportEndpoint());
+
+    remote_value = "remote staged upsert";
+    auto upsert_result =
+        write("batch_write_actual_remote", remote_value, config, true);
+    ASSERT_TRUE(upsert_result[0]);
+    ++expected_stage_calls;
+    EXPECT_EQ(stage_calls, expected_stage_calls);
+
+    EXPECT_TRUE(test_client_->Remove("batch_write_actual_local", true));
+    EXPECT_TRUE(test_client_->Remove("batch_write_actual_remote", true));
+    for (const auto& [ptr, size] : staged_allocations) {
+        client_buffer_allocator_->deallocate(ptr, size);
+    }
+}
+
 // Test heavy workload operations
 TEST_F(ClientIntegrationTest, DISABLED_AllocateTest) {
     const size_t data_size = 1 * 1024 * 1024;  // 1MB

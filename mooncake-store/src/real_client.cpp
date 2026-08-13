@@ -140,15 +140,57 @@ BuildNestedSlicesFromBuffers(
     return batched_slices;
 }
 
+tl::expected<std::vector<Slice>, ErrorCode> StageWriteSlices(
+    const std::shared_ptr<ClientBufferAllocator> &allocator,
+    const std::vector<Slice> &slices,
+    std::vector<BufferHandle> &staging_handles) {
+    if (!allocator) {
+        LOG(ERROR) << "Client buffer allocator is not provided";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    size_t total_size = 0;
+    for (const auto &slice : slices) {
+        if (slice.size > std::numeric_limits<size_t>::max() - total_size) {
+            return tl::unexpected(ErrorCode::BUFFER_OVERFLOW);
+        }
+        total_size += slice.size;
+    }
+    auto allocation = allocator->allocate(total_size);
+    if (!allocation) {
+        return tl::unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+    }
+
+    auto runtime_accelerator =
+        device::GetAcceleratorRegistry().RuntimeAccelerators();
+    char *destination = static_cast<char *>(allocation->ptr());
+    std::vector<Slice> staged_slices;
+    staged_slices.reserve(slices.size());
+    size_t offset = 0;
+    for (const auto &slice : slices) {
+        if (!runtime_accelerator.CopyToHost(destination + offset, slice.ptr,
+                                            slice.size)) {
+            LOG(ERROR) << "Failed to stage non-local write buffer";
+            return tl::unexpected(ErrorCode::TRANSFER_FAIL);
+        }
+        staged_slices.emplace_back(destination + offset, slice.size);
+        offset += slice.size;
+    }
+    staging_handles.emplace_back(std::move(*allocation));
+    return staged_slices;
+}
+
 using BatchWriteMethod = std::vector<tl::expected<void, ErrorCode>> (Client::*)(
     const std::vector<ObjectKey> &, std::vector<std::vector<Slice>> &,
-    const ReplicateConfig &);
+    const ReplicateConfig &, const Client::WriteBufferStager &);
 
 std::vector<tl::expected<void, ErrorCode>> BatchWriteFromMultiBuffers(
     const std::shared_ptr<Client> &client, const std::vector<std::string> &keys,
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &all_sizes,
-    const ReplicateConfig &config, BatchWriteMethod write) {
+    const ReplicateConfig &config,
+    const std::shared_ptr<ClientBufferAllocator> &allocator,
+    bool stage_nonlocal, BatchWriteMethod write) {
     if (!client) {
         LOG(ERROR) << "Client is not initialized";
         return std::vector<tl::expected<void, ErrorCode>>(
@@ -160,7 +202,16 @@ std::vector<tl::expected<void, ErrorCode>> BatchWriteFromMultiBuffers(
         return std::vector<tl::expected<void, ErrorCode>>(
             keys.size(), tl::unexpected(batched_slices.error()));
     }
-    return ((*client).*write)(keys, batched_slices.value(), config);
+
+    std::vector<BufferHandle> staging_handles;
+    staging_handles.reserve(stage_nonlocal ? keys.size() : 0);
+    Client::WriteBufferStager stager;
+    if (stage_nonlocal) {
+        stager = [&](const std::vector<Slice> &slices) {
+            return StageWriteSlices(allocator, slices, staging_handles);
+        };
+    }
+    return ((*client).*write)(keys, batched_slices.value(), config, stager);
 }
 
 #ifdef USE_ASCEND_DIRECT
@@ -4752,11 +4803,11 @@ RealClient::batch_write_from_cuda_ipc_dummy_helper(
     }
 
     if (is_upsert) {
-        return batch_upsert_from_multi_buffers_internal(keys, all_buffers,
-                                                        all_sizes, config);
+        return batch_upsert_from_multi_buffers_internal(
+            keys, all_buffers, all_sizes, config, true);
     }
     return batch_put_from_multi_buffers_internal(keys, all_buffers, all_sizes,
-                                                 config);
+                                                 config, true);
 }
 
 std::vector<tl::expected<int64_t, ErrorCode>>
@@ -5316,11 +5367,20 @@ std::vector<int> RealClient::batch_put_from_multi_buffers(
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &sizes,
     const ReplicateConfig &config) {
+    return batch_put_from_multi_buffers(keys, all_buffers, sizes, config,
+                                        false);
+}
+
+std::vector<int> RealClient::batch_put_from_multi_buffers(
+    const std::vector<std::string> &keys,
+    const std::vector<std::vector<void *>> &all_buffers,
+    const std::vector<std::vector<size_t>> &sizes,
+    const ReplicateConfig &config, bool stage_nonlocal) {
     auto internal_results =
         execute_timed_operation<std::vector<tl::expected<void, ErrorCode>>>(
             [&]() {
-                return batch_put_from_multi_buffers_internal(keys, all_buffers,
-                                                             sizes, config);
+                return batch_put_from_multi_buffers_internal(
+                    keys, all_buffers, sizes, config, stage_nonlocal);
             },
             [](const auto &) { return true; },
             [&](uint64_t latency_us, const auto &ret) {
@@ -5925,11 +5985,20 @@ std::vector<int> RealClient::batch_upsert_from_multi_buffers(
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &sizes,
     const ReplicateConfig &config) {
+    return batch_upsert_from_multi_buffers(keys, all_buffers, sizes, config,
+                                           false);
+}
+
+std::vector<int> RealClient::batch_upsert_from_multi_buffers(
+    const std::vector<std::string> &keys,
+    const std::vector<std::vector<void *>> &all_buffers,
+    const std::vector<std::vector<size_t>> &sizes,
+    const ReplicateConfig &config, bool stage_nonlocal) {
     auto internal_results =
         execute_timed_operation<std::vector<tl::expected<void, ErrorCode>>>(
             [&]() {
                 return batch_upsert_from_multi_buffers_internal(
-                    keys, all_buffers, sizes, config);
+                    keys, all_buffers, sizes, config, stage_nonlocal);
             },
             [](const auto &) { return true; },
             [&](uint64_t latency_us, const auto &ret) {
@@ -5947,9 +6016,10 @@ RealClient::batch_upsert_from_multi_buffers_internal(
     const std::vector<std::string> &keys,
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &all_sizes,
-    const ReplicateConfig &config) {
+    const ReplicateConfig &config, bool stage_nonlocal) {
     return BatchWriteFromMultiBuffers(client_, keys, all_buffers, all_sizes,
-                                      config, &Client::BatchUpsert);
+                                      config, client_buffer_allocator_,
+                                      stage_nonlocal, &Client::BatchUpsert);
 }
 
 std::vector<tl::expected<void, ErrorCode>>
@@ -5957,9 +6027,10 @@ RealClient::batch_put_from_multi_buffers_internal(
     const std::vector<std::string> &keys,
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &all_sizes,
-    const ReplicateConfig &config) {
+    const ReplicateConfig &config, bool stage_nonlocal) {
     return BatchWriteFromMultiBuffers(client_, keys, all_buffers, all_sizes,
-                                      config, &Client::BatchPut);
+                                      config, client_buffer_allocator_,
+                                      stage_nonlocal, &Client::BatchPut);
 }
 
 std::vector<int> RealClient::batch_get_into_multi_buffers(
