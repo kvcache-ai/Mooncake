@@ -940,14 +940,11 @@ class MasterService {
     TenantQuotaEvictionResult EvictTenantMemoryForQuota(
         const TenantId& tenant_id, uint64_t target_bytes);
 
-    // Helper to get a snapshot of alive clients (under client_mutex_ shared
-    // lock)
-    std::unordered_set<UUID, boost::hash<UUID>> getAliveClientsSnapshot() const;
     void UpdateClientHostId(const UUID& client_id, const std::string& host_id);
     std::string GetClientHostId(const UUID& client_id) const;
 
-    // Clear invalid handles in all shards
     void ClearInvalidHandles();
+    // Caller owns snapshot_mutex_ (shared) while metadata is swept.
     void ClearInvalidHandles(
         const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients);
 
@@ -2746,6 +2743,7 @@ class MasterService {
 
     bool IsReplicaReadable(const Replica& replica) const;
     bool HasReadableReplica(const ObjectMetadata& metadata) const;
+    bool IsEvictableMemoryReplica(const Replica& replica) const;
 
     /**
      * Segment lifecycle persist helper. Tries to durably persist the

@@ -586,6 +586,10 @@ class MasterServiceHATest : public ::testing::Test {
         service.ClearInvalidHandles(alive_clients);
     }
 
+    static void ClearInvalidHandlesForTesting(MasterService& service) {
+        service.ClearInvalidHandles();
+    }
+
     static size_t ReplicaCountForTesting(MasterService& service,
                                          const TenantId& tenant_id,
                                          const std::string& key) {
@@ -623,6 +627,53 @@ class MasterServiceHATest : public ::testing::Test {
             }
         }
         return false;
+    }
+
+    static bool HasReadableReplicaForTesting(MasterService& service,
+                                             const TenantId& tenant_id,
+                                             const std::string& key) {
+        MasterService::MetadataAccessorRO accessor(
+            &service, MasterService::ObjectIdentity{tenant_id, key});
+        return accessor.Exists() &&
+               accessor.Get().HasReplica([&service](const Replica& replica) {
+                   return service.IsReplicaReadable(replica);
+               });
+    }
+
+    static void SetLeaseDeadlineForTesting(
+        MasterService& service, const TenantId& tenant_id,
+        const std::string& key,
+        std::chrono::system_clock::time_point deadline) {
+        MasterService::MetadataAccessorRW accessor(
+            &service, MasterService::ObjectIdentity{tenant_id, key});
+        ASSERT_TRUE(accessor.Exists());
+        SpinLocker locker(&accessor.Get().lock);
+        accessor.Get().lease_timeout = deadline;
+    }
+
+    static std::chrono::system_clock::time_point LeaseDeadlineForTesting(
+        MasterService& service, const TenantId& tenant_id,
+        const std::string& key) {
+        MasterService::MetadataAccessorRO accessor(
+            &service, MasterService::ObjectIdentity{tenant_id, key});
+        EXPECT_TRUE(accessor.Exists());
+        if (!accessor.Exists()) {
+            return {};
+        }
+        SpinLocker locker(&accessor.Get().lock);
+        return accessor.Get().lease_timeout;
+    }
+
+    static uint64_t EvictTenantMemoryForQuotaForTesting(
+        MasterService& service, const TenantId& tenant_id,
+        uint64_t target_bytes) {
+        return service.EvictTenantMemoryForQuota(tenant_id, target_bytes)
+            .freed_bytes;
+    }
+
+    static std::unique_lock<std::shared_mutex> LockSnapshotForTesting(
+        MasterService& service) {
+        return std::unique_lock<std::shared_mutex>(service.snapshot_mutex_);
     }
 
     static size_t SegmentAllocatedSizeForTesting(MasterService& service,
@@ -947,6 +998,152 @@ TEST_F(MasterServiceHATest, RestoreFromStandbyRebuildsTenantQuotaAccounting) {
     EXPECT_EQ(service.GetTenantQuotaSnapshot(tenant_id)->charged_bytes, 0);
 }
 
+TEST_F(MasterServiceHATest, UnreadableRestoredMemoryReplicaIsNotEvictable) {
+    constexpr uint64_t object_size = 1024;
+    auto config = MasterServiceConfig::builder()
+                      .set_default_kv_lease_ttl(10000)
+                      .set_enable_multi_tenants(true)
+                      .set_tenant_quota_connector_type("file")
+                      .set_tenant_quota_connector_uri(WriteTenantPolicyFile(
+                          {{kDefaultTenant.value(), object_size}}))
+                      .build();
+    MasterService service(config);
+    const std::string key = "unreadable_restored_evict_key";
+    const std::string endpoint = "unreadable_restored_evict_segment";
+    ASSERT_TRUE(service
+                    .RestoreFromStandbySnapshot(
+                        {MakeStandbyObject(key, endpoint, object_size)}, 7,
+                        {MakeStandbyMemorySegment(endpoint)})
+                    .has_value());
+    SetLeaseDeadlineForTesting(service, kDefaultTenant, key,
+                               std::chrono::system_clock::time_point{});
+
+    service.RunBatchEvictForTesting(/*evict_ratio_target=*/1.0,
+                                    /*evict_ratio_lowerbound=*/1.0);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, key), 1);
+    EXPECT_EQ(EvictTenantMemoryForQuotaForTesting(service, kDefaultTenant,
+                                                  object_size),
+              0);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, key), 1);
+    EXPECT_FALSE(HasReadableReplicaForTesting(service, kDefaultTenant, key));
+    auto get = service.GetReplicaList(key, kDefaultTenant);
+    ASSERT_FALSE(get.has_value());
+    EXPECT_EQ(get.error(), ErrorCode::REPLICA_IS_NOT_READY);
+}
+
+TEST_F(MasterServiceHATest, SuccessfulRemountGrantsEvictionLease) {
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(false)
+                              .set_default_kv_lease_ttl(10000)
+                              .build());
+    const std::string key = "remount_lease_key";
+    const std::string endpoint = "remount_lease_segment";
+    auto object = MakeStandbyObject(key, endpoint);
+    object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    ASSERT_TRUE(service
+                    .RestoreFromStandbySnapshot(
+                        {object}, 7, {MakeStandbyMemorySegment(endpoint)})
+                    .has_value());
+    SetLeaseDeadlineForTesting(service, kDefaultTenant, key,
+                               std::chrono::system_clock::time_point{});
+
+    ASSERT_TRUE(service.ReMountSegment({MakeSegment(endpoint)}, generate_uuid())
+                    .has_value());
+    EXPECT_TRUE(HasReadableReplicaForTesting(service, kDefaultTenant, key));
+    EXPECT_GT(LeaseDeadlineForTesting(service, kDefaultTenant, key),
+              std::chrono::system_clock::now());
+    service.RunBatchEvictForTesting(/*evict_ratio_target=*/1.0,
+                                    /*evict_ratio_lowerbound=*/1.0);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, key), 1);
+
+    SetLeaseDeadlineForTesting(service, kDefaultTenant, key,
+                               std::chrono::system_clock::time_point{});
+    service.RunBatchEvictForTesting(/*evict_ratio_target=*/1.0,
+                                    /*evict_ratio_lowerbound=*/1.0);
+    EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant, key), 0);
+}
+
+TEST_F(MasterServiceHATest, RemountRefreshesLeaseWhenAnotherReplicaIsReadable) {
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(false)
+                              .set_default_kv_lease_ttl(10000)
+                              .build());
+    const std::string key = "remount_existing_readable_key";
+    const std::string recovered_endpoint = "remount_recovered_segment";
+    const std::string readable_endpoint = "remount_readable_segment";
+    Segment readable_segment = MakeSegment(
+        readable_endpoint, kDefaultSegmentBase + kDefaultSegmentSize);
+    ASSERT_TRUE(
+        service.MountSegment(readable_segment, generate_uuid()).has_value());
+
+    auto object = MakeStandbyObject(key, recovered_endpoint);
+    object.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    auto readable_replica = MakeStandbyMemoryReplica(readable_endpoint);
+    readable_replica.id = 2;
+    readable_replica.get_memory_descriptor().buffer_descriptor.buffer_address_ =
+        kDefaultSegmentBase + kDefaultSegmentSize;
+    object.metadata.replicas.push_back(std::move(readable_replica));
+    ASSERT_TRUE(service
+                    .RestoreFromStandbySnapshot(
+                        {object}, 7,
+                        {MakeStandbyMemorySegment(recovered_endpoint),
+                         MakeStandbyMemorySegment(readable_endpoint)})
+                    .has_value());
+    ASSERT_TRUE(HasReadableReplicaForTesting(service, kDefaultTenant, key));
+    SetLeaseDeadlineForTesting(service, kDefaultTenant, key,
+                               std::chrono::system_clock::time_point{});
+
+    ASSERT_TRUE(
+        service
+            .ReMountSegment({MakeSegment(recovered_endpoint)}, generate_uuid())
+            .has_value());
+    EXPECT_GT(LeaseDeadlineForTesting(service, kDefaultTenant, key),
+              std::chrono::system_clock::now());
+}
+
+TEST_F(MasterServiceHATest, NoFBatchEvictWaitsForSnapshotBarrier) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    auto snapshot_lock = LockSnapshotForTesting(service);
+    std::promise<void> started;
+    auto started_future = started.get_future();
+    auto eviction = std::async(std::launch::async, [&] {
+        started.set_value();
+        service.RunNoFBatchEvictForTesting(/*evict_ratio_target=*/1.0,
+                                           /*evict_ratio_lowerbound=*/1.0);
+    });
+    started_future.wait();
+    EXPECT_EQ(eviction.wait_for(std::chrono::milliseconds(100)),
+              std::future_status::timeout);
+    snapshot_lock.unlock();
+    ASSERT_EQ(eviction.wait_for(std::chrono::seconds(5)),
+              std::future_status::ready);
+    eviction.get();
+}
+
+TEST_F(MasterServiceHATest, InvalidHandleCleanupWaitsForSnapshotBarrier) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+    auto snapshot_lock = LockSnapshotForTesting(service);
+    std::promise<void> started;
+    auto started_future = started.get_future();
+    auto cleanup = std::async(std::launch::async, [&] {
+        started.set_value();
+        ClearInvalidHandlesForTesting(service);
+    });
+    started_future.wait();
+    EXPECT_EQ(cleanup.wait_for(std::chrono::milliseconds(100)),
+              std::future_status::timeout);
+    snapshot_lock.unlock();
+    ASSERT_EQ(cleanup.wait_for(std::chrono::seconds(5)),
+              std::future_status::ready);
+    cleanup.get();
+}
+
 TEST_F(MasterServiceHATest, RemountMakesRestoredMemoryReplicaReady) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
@@ -1127,6 +1324,64 @@ TEST_F(MasterServiceHATest, RestoreRejectsOverlappingMemoryDescriptors) {
     EXPECT_EQ(ReplicaCountForTesting(service, kDefaultTenant,
                                      "standby_overlap_second"),
               0);
+}
+
+TEST_F(MasterServiceHATest, FailedRemountKeepsReplicaInvalidAndCanBeRetried) {
+    MasterService service(
+        MasterServiceConfig::builder().set_enable_ha(false).build());
+
+    const std::string endpoint = "standby_retry_remount_segment";
+    auto first = MakeStandbyObject("standby_retry_first", endpoint);
+    auto out_of_range =
+        MakeStandbyObject("standby_retry_out_of_range", endpoint);
+    first.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ = kDefaultSegmentBase;
+    out_of_range.metadata.replicas.front()
+        .get_memory_descriptor()
+        .buffer_descriptor.buffer_address_ =
+        kDefaultSegmentBase + kDefaultSegmentSize - 1;
+    ASSERT_TRUE(service
+                    .RestoreFromStandbySnapshot(
+                        {first, out_of_range}, 7,
+                        {MakeStandbyMemorySegment(endpoint)})
+                    .has_value());
+    SetLeaseDeadlineForTesting(service, kDefaultTenant, "standby_retry_first",
+                               std::chrono::system_clock::time_point{});
+
+    Segment segment = MakeSegment(endpoint);
+    auto failed = service.ReMountSegment({segment}, generate_uuid());
+    ASSERT_FALSE(failed.has_value());
+    EXPECT_EQ(failed.error(), ErrorCode::INVALID_PARAMS);
+    auto get_after_failure =
+        service.GetReplicaList("standby_retry_first", kDefaultTenant);
+    ASSERT_FALSE(get_after_failure.has_value());
+    EXPECT_EQ(get_after_failure.error(), ErrorCode::REPLICA_IS_NOT_READY);
+    auto batch_after_failure =
+        service.BatchGetReplicaList({"standby_retry_first"}, kDefaultTenant);
+    ASSERT_EQ(batch_after_failure.size(), 1);
+    ASSERT_FALSE(batch_after_failure[0].has_value());
+    EXPECT_EQ(batch_after_failure[0].error(), ErrorCode::REPLICA_IS_NOT_READY);
+    EXPECT_EQ(
+        LeaseDeadlineForTesting(service, kDefaultTenant, "standby_retry_first"),
+        std::chrono::system_clock::time_point{});
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.preferred_segments = {endpoint};
+    auto allocation = service.PutStart(generate_uuid(), "must_not_allocate",
+                                       kDefaultTenant, 1024, config);
+    EXPECT_FALSE(allocation.has_value());
+
+    EraseObjectForTesting(service, kDefaultTenant,
+                          "standby_retry_out_of_range");
+    ASSERT_TRUE(service.ReMountSegment({segment}, generate_uuid()).has_value());
+    EXPECT_FALSE(HasInvalidMemoryHandleForTesting(service, kDefaultTenant,
+                                                  "standby_retry_first"));
+    EXPECT_GT(
+        LeaseDeadlineForTesting(service, kDefaultTenant, "standby_retry_first"),
+        std::chrono::system_clock::now());
+    EXPECT_TRUE(service.GetReplicaList("standby_retry_first", kDefaultTenant)
+                    .has_value());
 }
 
 TEST_F(MasterServiceHATest, MultiSegmentRemountFailurePublishesNeitherSegment) {
