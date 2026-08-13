@@ -39,6 +39,7 @@
 #include <cstdlib>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "transfer_engine.h"
@@ -177,9 +178,8 @@ class EFAGpuLoopbackTest : public ::testing::Test {
     std::string local_server_name_;
 };
 
-// A loopback copy on a nonzero GPU must not create a CUDA context on GPU 0.
-// CUDA device selection is thread-local, so this specifically exercises the
-// EFA worker thread that performs the copy.
+// A loopback copy submitted from a fresh thread must bind the buffer's device,
+// not the thread's default CUDA device (GPU 0).
 TEST_F(EFAGpuLoopbackTest, LoopbackUsesBufferDevice) {
     int device_count = 0;
     ASSERT_EQ(cudaGetDeviceCount(&device_count), cudaSuccess);
@@ -189,20 +189,13 @@ TEST_F(EFAGpuLoopbackTest, LoopbackUsesBufferDevice) {
     ASSERT_EQ(cuDeviceGet(&device_zero, 0), CUDA_SUCCESS);
 
     unsigned int flags = 0;
-    int active = 0;
-    ASSERT_EQ(cuDevicePrimaryCtxGetState(device_zero, &flags, &active),
+    int device_zero_active_before = 0;
+    ASSERT_EQ(cuDevicePrimaryCtxGetState(device_zero, &flags,
+                                         &device_zero_active_before),
               CUDA_SUCCESS);
-    if (active) GTEST_SKIP() << "CUDA device 0 context is already active";
 
     auto setup = createEngine(1);
     if (!setup.ok) GTEST_SKIP() << "EFA/CUDA setup unavailable";
-
-    ASSERT_EQ(cuDevicePrimaryCtxGetState(device_zero, &flags, &active),
-              CUDA_SUCCESS);
-    if (active) {
-        destroyEngine(setup);
-        GTEST_SKIP() << "setup activated CUDA device 0";
-    }
 
     auto segment_desc =
         setup.engine->getMetadata()->getSegmentDescByID(setup.segment_id);
@@ -211,14 +204,44 @@ TEST_F(EFAGpuLoopbackTest, LoopbackUsesBufferDevice) {
 
     const size_t kDataLength = 4096;
     ASSERT_EQ(cudaMemset(setup.dev_buf, 0xAB, kDataLength), cudaSuccess);
-    ASSERT_TRUE(submitAndWait(setup.engine.get(), setup.segment_id,
-                              setup.dev_buf,
-                              remote_base + (setup.buffer_size / 2),
-                              kDataLength, TransferRequest::WRITE));
 
-    ASSERT_EQ(cuDevicePrimaryCtxGetState(device_zero, &flags, &active),
+    bool started_without_context = false;
+    bool transfer_ok = false;
+    CUresult context_result = CUDA_ERROR_UNKNOWN;
+    CUresult device_result = CUDA_ERROR_UNKNOWN;
+    CUdevice worker_device = -1;
+    std::thread submitter([&] {
+        CUcontext context = nullptr;
+        context_result = cuCtxGetCurrent(&context);
+        started_without_context =
+            context_result == CUDA_SUCCESS && context == nullptr;
+
+        transfer_ok =
+            submitAndWait(setup.engine.get(), setup.segment_id, setup.dev_buf,
+                          remote_base + (setup.buffer_size / 2), kDataLength,
+                          TransferRequest::WRITE);
+
+        context_result = cuCtxGetCurrent(&context);
+        if (context_result == CUDA_SUCCESS && context != nullptr) {
+            device_result = cuCtxGetDevice(&worker_device);
+        }
+    });
+    submitter.join();
+
+    ASSERT_TRUE(started_without_context);
+    ASSERT_TRUE(transfer_ok);
+    ASSERT_EQ(context_result, CUDA_SUCCESS);
+    ASSERT_EQ(device_result, CUDA_SUCCESS);
+    EXPECT_EQ(worker_device, 1);
+
+    int device_zero_active_after = 0;
+    ASSERT_EQ(cuDevicePrimaryCtxGetState(device_zero, &flags,
+                                         &device_zero_active_after),
               CUDA_SUCCESS);
-    EXPECT_EQ(active, 0) << "loopback copy activated CUDA device 0";
+    if (!device_zero_active_before) {
+        EXPECT_EQ(device_zero_active_after, 0)
+            << "loopback copy activated CUDA device 0";
+    }
 
     destroyEngine(setup);
 }
