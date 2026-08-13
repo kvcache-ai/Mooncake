@@ -2176,6 +2176,71 @@ TEST(RoceModeDetectionTest, IsRoceModeEnabled_FromHcclEnv) {
     unsetenv("HCCL_INTRA_ROCE_ENABLE");
 }
 
+TEST(FabricMemConfigDetectionTest, GlobalResourceConfig_FlatFabricMemory) {
+    EXPECT_TRUE(HasFabricMemoryInGlobalResourceConfig(
+        R"({"fabric_memory.max_capacity":32})"));
+    EXPECT_TRUE(HasFabricMemoryInGlobalResourceConfig(
+        R"({"fabric_memory.start_address":"72","comm_resource_config.protocol_desc":"hccs:device"})"));
+}
+
+TEST(FabricMemConfigDetectionTest, GlobalResourceConfig_NestedFabricMemory) {
+    EXPECT_TRUE(HasFabricMemoryInGlobalResourceConfig(
+        R"({"fabric_memory":{"max_capacity":32,"start_address":40}})"));
+}
+
+TEST(FabricMemConfigDetectionTest, GlobalResourceConfig_NoFabricMemory) {
+    EXPECT_FALSE(HasFabricMemoryInGlobalResourceConfig(
+        R"({"comm_resource_config.protocol_desc":"hccs:device"})"));
+    EXPECT_FALSE(HasFabricMemoryInGlobalResourceConfig("{}"));
+    EXPECT_FALSE(HasFabricMemoryInGlobalResourceConfig(nullptr));
+}
+
+TEST(FabricMemConfigDetectionTest,
+     IsFabricMemEnabled_FromGlobalResourceConfig) {
+    globalConfig().ascend_store_te_init = false;
+    globalConfig().ascend_use_fabric_mem = false;
+    setenv("ASCEND_GLOBAL_RESOURCE_CONFIG",
+           R"({"fabric_memory.max_capacity":32})", 1);
+    EXPECT_TRUE(IsFabricMemEnabledFromGlobalResourceConfig());
+    unsetenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
+}
+
+TEST_F(AscendDirectTransportTest,
+       Standalone_FabricMem_FromGlobalResourceConfig) {
+    // Normal/P2P TE enables fabric mem when ASCEND_GLOBAL_RESOURCE_CONFIG
+    // carries fabric_memory, without ASCEND_ENABLE_USE_FABRIC_MEM / store init.
+    globalConfig().ascend_agent_mode = false;
+    globalConfig().ascend_store_te_init = false;
+    globalConfig().ascend_use_fabric_mem = false;
+    unsetenv("HCCL_INTRA_ROCE_ENABLE");
+    setenv("ASCEND_GLOBAL_RESOURCE_CONFIG",
+           R"({"fabric_memory.max_capacity":32})", 1);
+    constexpr int kDeviceCount = 4;
+    mock_acl::set_device_count(kDeviceCount);
+    g_device_id = 1;
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    ASSERT_EQ(transport->registerLocalMemory(test_buffer_src_, kRegisterMemSize,
+                                             "cpu:0", true, true),
+              0);
+
+    std::vector<std::string> endpoints = {"127.0.0.1:8000", "127.0.0.1:8100",
+                                          "127.0.0.1:8200", "127.0.0.1:8300"};
+    addMultiEndpointRemoteSegment(transport->meta(), 1, "fabric_via_grc",
+                                  "127.0.0.1", endpoints);
+
+    initTestData(kTransferBufSize);
+    auto result = runRemoteTransfer(transport.get(), test_buffer_src_, 1,
+                                    0x10000, kTransferBufSize);
+    ASSERT_TRUE(result.finished);
+    EXPECT_FALSE(result.failed);
+    EXPECT_EQ(adxl_mock::get_last_connect_target(), "127.0.0.1:8000")
+        << "Normal TE with fabric_memory in GLOBAL_RESOURCE_CONFIG should use "
+           "fabric path (front endpoint)";
+
+    unsetenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
+}
+
 // -----------------------------------------------------------------------------
 // Store vs P2P protocol split via a single ASCEND_GLOBAL_RESOURCE_CONFIG:
 // top-level = default (P2P, e.g. HCCS), optional "store" sub-object overrides
