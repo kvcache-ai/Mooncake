@@ -353,6 +353,12 @@ add_executable(config_test ${WORKSPACE}/config_test.cpp)
 target_link_libraries(config_test PUBLIC transfer_engine gtest gtest_main)
 add_test(NAME config_test COMMAND config_test)
 
+add_executable(glog_preinitialized_test
+               ${WORKSPACE}/glog_preinitialized_test.cpp)
+target_link_libraries(glog_preinitialized_test PUBLIC transfer_engine gtest
+                                                      gtest_main glog::glog)
+add_test(NAME glog_preinitialized_test COMMAND glog_preinitialized_test)
+
 add_executable(rdma_gid_probe_test ${WORKSPACE}/rdma_gid_probe_test.cpp)
 target_link_libraries(rdma_gid_probe_test PUBLIC transfer_engine gtest
                                                  gtest_main)
