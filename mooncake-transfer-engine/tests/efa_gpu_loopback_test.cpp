@@ -30,6 +30,7 @@
 // Requires EFA hardware (fi_info -p efa) AND at least one CUDA GPU.  Self-
 // skips cleanly when either is absent.
 
+#include <cuda.h>
 #include <cuda_runtime.h>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
@@ -37,6 +38,7 @@
 
 #include <cstdlib>
 #include <memory>
+#include <string>
 #include <vector>
 
 #include "transfer_engine.h"
@@ -80,12 +82,13 @@ class EFAGpuLoopbackTest : public ::testing::Test {
 
     // Create engine, install EFA transport, allocate + register a CUDA
     // device buffer, and open our own segment for loopback.
-    EngineSetup createEngine(size_t buffer_size = 1ull << 26 /* 64 MB */) {
+    EngineSetup createEngine(int device_id = 0,
+                             size_t buffer_size = 1ull << 26 /* 64 MB */) {
         EngineSetup s;
         s.buffer_size = buffer_size;
 
-        if (cudaSetDevice(0) != cudaSuccess) {
-            LOG(WARNING) << "cudaSetDevice(0) failed";
+        if (cudaSetDevice(device_id) != cudaSuccess) {
+            LOG(WARNING) << "cudaSetDevice(" << device_id << ") failed";
             return s;
         }
 
@@ -108,8 +111,9 @@ class EFAGpuLoopbackTest : public ::testing::Test {
 
         // Register as GPU memory so the EFA transport tags the MR with
         // FI_HMEM_CUDA (the registration path under test).
-        rc = s.engine->registerLocalMemory(s.dev_buf, buffer_size, "cuda:0");
-        EXPECT_EQ(rc, 0) << "registerLocalMemory(cuda:0) failed";
+        std::string location = "cuda:" + std::to_string(device_id);
+        rc = s.engine->registerLocalMemory(s.dev_buf, buffer_size, location);
+        EXPECT_EQ(rc, 0) << "registerLocalMemory(" << location << ") failed";
         if (rc != 0) return s;
 
         auto actual_addr = s.engine->getLocalIpAndPort();
@@ -172,6 +176,52 @@ class EFAGpuLoopbackTest : public ::testing::Test {
     std::string metadata_server_;
     std::string local_server_name_;
 };
+
+// A loopback copy on a nonzero GPU must not create a CUDA context on GPU 0.
+// CUDA device selection is thread-local, so this specifically exercises the
+// EFA worker thread that performs the copy.
+TEST_F(EFAGpuLoopbackTest, LoopbackUsesBufferDevice) {
+    int device_count = 0;
+    ASSERT_EQ(cudaGetDeviceCount(&device_count), cudaSuccess);
+    if (device_count < 2) GTEST_SKIP() << "At least two CUDA GPUs required";
+
+    CUdevice device_zero;
+    ASSERT_EQ(cuDeviceGet(&device_zero, 0), CUDA_SUCCESS);
+
+    unsigned int flags = 0;
+    int active = 0;
+    ASSERT_EQ(cuDevicePrimaryCtxGetState(device_zero, &flags, &active),
+              CUDA_SUCCESS);
+    if (active) GTEST_SKIP() << "CUDA device 0 context is already active";
+
+    auto setup = createEngine(1);
+    if (!setup.ok) GTEST_SKIP() << "EFA/CUDA setup unavailable";
+
+    ASSERT_EQ(cuDevicePrimaryCtxGetState(device_zero, &flags, &active),
+              CUDA_SUCCESS);
+    if (active) {
+        destroyEngine(setup);
+        GTEST_SKIP() << "setup activated CUDA device 0";
+    }
+
+    auto segment_desc =
+        setup.engine->getMetadata()->getSegmentDescByID(setup.segment_id);
+    ASSERT_NE(segment_desc, nullptr);
+    uint64_t remote_base = (uint64_t)segment_desc->buffers[0].addr;
+
+    const size_t kDataLength = 4096;
+    ASSERT_EQ(cudaMemset(setup.dev_buf, 0xAB, kDataLength), cudaSuccess);
+    ASSERT_TRUE(submitAndWait(setup.engine.get(), setup.segment_id,
+                              setup.dev_buf,
+                              remote_base + (setup.buffer_size / 2),
+                              kDataLength, TransferRequest::WRITE));
+
+    ASSERT_EQ(cuDevicePrimaryCtxGetState(device_zero, &flags, &active),
+              CUDA_SUCCESS);
+    EXPECT_EQ(active, 0) << "loopback copy activated CUDA device 0";
+
+    destroyEngine(setup);
+}
 
 // Test 1: GPU loopback WRITE must not crash.
 //
