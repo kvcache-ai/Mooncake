@@ -978,6 +978,202 @@ TEST_F(MasterServiceTest, PutStartOnePlusOneAllowsSingleAllocatedReplica) {
 }
 #endif
 
+TEST_F(MasterServiceTest, DfsPutEndAllAndUpsertTopologyAreAtomic) {
+    const auto dfs_root = (std::filesystem::temp_directory_path() /
+                           ("master_dfs_sync_" + std::to_string(::getpid())))
+                              .string();
+    std::filesystem::create_directories(dfs_root);
+    ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
+    ScopedEnvVar fs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
+    ScopedEnvVar root_dir("MOONCAKE_DFS_ROOT_DIR", dfs_root.c_str());
+    ScopedEnvVar shard_count("MOONCAKE_DFS_SHARD_COUNT", "1");
+    ScopedEnvVar shard_capacity("MOONCAKE_DFS_SHARD_CAPACITY", "1048576");
+    ScopedEnvVar alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
+    ScopedEnvVar eviction("MOONCAKE_DFS_EVICTION_ENABLED", "0");
+    ScopedEnvVar deferred_free("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
+    ScopedEnvVar single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
+
+    {
+        MasterService service;
+        const auto context = PrepareSimpleSegment(service);
+        ReplicateConfig config;
+        config.replica_num = 1;
+        config.dfs_replica_num = 1;
+
+        auto start = service.PutStart(context.client_id, "dfs_atomic",
+                                      TenantId::Default(), 4096, config);
+        ASSERT_TRUE(start.has_value());
+        ASSERT_EQ(start->size(), 2);
+        ASSERT_TRUE(service
+                        .PutEnd(context.client_id, "dfs_atomic",
+                                TenantId::Default(), ReplicaType::ALL)
+                        .has_value());
+
+        auto query = service.GetReplicaList("dfs_atomic", TenantId::Default());
+        ASSERT_TRUE(query.has_value());
+        ASSERT_EQ(query->replicas.size(), 2);
+        for (const auto& replica : query->replicas) {
+            EXPECT_EQ(replica.status, ReplicaStatus::COMPLETE);
+        }
+
+        ReplicateConfig mismatched_config;
+        mismatched_config.replica_num = 1;
+        auto upsert =
+            service.UpsertStart(context.client_id, "dfs_atomic",
+                                TenantId::Default(), 4096, mismatched_config);
+        ASSERT_FALSE(upsert.has_value());
+        EXPECT_EQ(upsert.error(), ErrorCode::INVALID_PARAMS);
+
+        query = service.GetReplicaList("dfs_atomic", TenantId::Default());
+        ASSERT_TRUE(query.has_value());
+        ASSERT_EQ(query->replicas.size(), 2);
+        for (const auto& replica : query->replicas) {
+            EXPECT_EQ(replica.status, ReplicaStatus::COMPLETE);
+        }
+
+        auto revoke_start = service.PutStart(context.client_id, "dfs_revoke",
+                                             TenantId::Default(), 4096, config);
+        ASSERT_TRUE(revoke_start.has_value());
+        ASSERT_TRUE(service
+                        .PutRevoke(context.client_id, "dfs_revoke",
+                                   TenantId::Default(), ReplicaType::ALL)
+                        .has_value());
+        auto revoked =
+            service.GetReplicaList("dfs_revoke", TenantId::Default());
+        ASSERT_FALSE(revoked.has_value());
+        EXPECT_EQ(revoked.error(), ErrorCode::OBJECT_NOT_FOUND);
+    }
+
+    {
+        MasterService service(MakeStrictTenantConfig({"default"}));
+        const auto context = PrepareSimpleSegment(service);
+        ReplicateConfig dfs_config;
+        dfs_config.replica_num = 1;
+        dfs_config.dfs_replica_num = 1;
+
+        auto failed = service.PutStart(context.client_id, "dfs_quota_failure",
+                                       TenantId::Default(),
+                                       kStrictTenantQuotaBytes, dfs_config);
+        ASSERT_FALSE(failed.has_value());
+        EXPECT_EQ(failed.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+
+        ReplicateConfig memory_config;
+        memory_config.replica_num = 1;
+        auto retry = service.PutStart(
+            context.client_id, "quota_after_dfs_failure", TenantId::Default(),
+            kStrictTenantQuotaBytes, memory_config);
+        ASSERT_TRUE(retry.has_value()) << toString(retry.error());
+        ASSERT_TRUE(service
+                        .PutRevoke(context.client_id, "quota_after_dfs_failure",
+                                   TenantId::Default(), ReplicaType::ALL)
+                        .has_value());
+    }
+    std::error_code ec;
+    std::filesystem::remove_all(dfs_root, ec);
+}
+
+TEST_F(MasterServiceTest, DfsEvictionSplitsAcceptedAndRejectedCandidates) {
+    auto run_case = [&](const std::string& case_name,
+                        const std::vector<size_t>& leased_indexes,
+                        const std::vector<std::optional<size_t>>&
+                            expected_replica_counts,
+                        bool evict_memory_first = false) {
+        const auto dfs_root = (std::filesystem::temp_directory_path() /
+                               ("master_dfs_evict_" +
+                                std::to_string(::getpid()) + "_" + case_name))
+                                  .string();
+        std::filesystem::create_directories(dfs_root);
+        ScopedEnvVar enable_dfs("MOONCAKE_ENABLE_DFS", "1");
+        ScopedEnvVar fs_adapter("MOONCAKE_DFS_FS_ADAPTER", "posix");
+        ScopedEnvVar root_dir("MOONCAKE_DFS_ROOT_DIR", dfs_root.c_str());
+        ScopedEnvVar shard_count("MOONCAKE_DFS_SHARD_COUNT", "1");
+        ScopedEnvVar shard_capacity("MOONCAKE_DFS_SHARD_CAPACITY", "32768");
+        ScopedEnvVar alignment("MOONCAKE_DFS_ALIGNMENT", "4096");
+        // Keep the background path disabled so the test drives one exact
+        // transaction through the public test hook.
+        ScopedEnvVar eviction("MOONCAKE_DFS_EVICTION_ENABLED", "0");
+        ScopedEnvVar high_watermark("MOONCAKE_DFS_EVICTION_HIGH_WATERMARK",
+                                    "0.9");
+        ScopedEnvVar low_watermark("MOONCAKE_DFS_EVICTION_LOW_WATERMARK",
+                                   "0.7");
+        ScopedEnvVar deferred_free("MOONCAKE_DFS_DEFERRED_FREE_SECONDS", "0");
+        ScopedEnvVar single_tenant("MOONCAKE_DFS_SINGLE_TENANT", "true");
+
+        {
+            MasterService service;
+            const auto context = PrepareSimpleSegment(service);
+            ReplicateConfig config;
+            config.replica_num = 1;
+            config.dfs_replica_num = 1;
+
+            std::vector<std::string> keys;
+            for (int i = 0; i < 4; ++i) {
+                keys.push_back("dfs_evict_" + std::to_string(i));
+                auto start = service.PutStart(context.client_id, keys.back(),
+                                              TenantId::Default(), 100, config);
+                ASSERT_TRUE(start.has_value()) << "allocation " << i;
+                ASSERT_TRUE(service
+                                .PutEnd(context.client_id, keys.back(),
+                                        TenantId::Default(), ReplicaType::ALL)
+                                .has_value());
+            }
+
+            for (const size_t index : leased_indexes) {
+                ASSERT_LT(index, keys.size());
+                ASSERT_TRUE(
+                    service.GetReplicaList(keys[index], TenantId::Default())
+                        .has_value());
+            }
+
+            if (evict_memory_first) {
+                service.RunBatchEvictForTesting(1.0, 1.0);
+            }
+            service.RunDfsEvictionForTesting();
+
+            for (size_t i = 0; i < keys.size(); ++i) {
+                auto result =
+                    service.GetReplicaList(keys[i], TenantId::Default());
+                if (!expected_replica_counts[i].has_value()) {
+                    ASSERT_FALSE(result.has_value()) << "key=" << keys[i];
+                    EXPECT_EQ(result.error(), ErrorCode::OBJECT_NOT_FOUND)
+                        << "key=" << keys[i];
+                    continue;
+                }
+                ASSERT_TRUE(result.has_value());
+                EXPECT_EQ(result->replicas.size(), *expected_replica_counts[i])
+                    << "key=" << keys[i];
+            }
+
+            if (evict_memory_first) {
+                auto reclaimed =
+                    service.PutStart(context.client_id, "dfs_evict_reclaimed",
+                                     TenantId::Default(), 100, config);
+                ASSERT_TRUE(reclaimed.has_value()) << reclaimed.error();
+                ASSERT_TRUE(
+                    service
+                        .PutRevoke(context.client_id, "dfs_evict_reclaimed",
+                                   TenantId::Default(), ReplicaType::ALL)
+                        .has_value());
+            }
+        }
+
+        std::error_code ec;
+        std::filesystem::remove_all(dfs_root, ec);
+    };
+
+    run_case("commit", {}, {1, 1, 2, 2});
+    run_case("reject", {0, 1, 2, 3}, {2, 2, 2, 2});
+    // k1 shares the first prepared batch with k0. Rejecting k1 must not roll
+    // back k0, and the same high-watermark trigger must continue to k2 so the
+    // shard reaches its low watermark.
+    run_case("mixed", {1}, {1, 2, 1, 2});
+    // Memory eviction may leave DFS as the only remaining replica. DFS
+    // eviction must still reclaim those allocations and erase metadata for
+    // objects whose final replica was removed.
+    run_case("last_replica", {},
+             {std::nullopt, std::nullopt, size_t{1}, size_t{1}}, true);
+}
+
 TEST_F(MasterServiceTest, PutStartGroupIdsValidation) {
     std::unique_ptr<MasterService> service_(new MasterService());
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);

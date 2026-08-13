@@ -67,6 +67,14 @@ Replica::Descriptor MakeLocalDisk(const std::string& endpoint) {
     return d;
 }
 
+Replica::Descriptor MakeDfs(const std::string& path) {
+    Replica::Descriptor d;
+    d.id = 0;
+    d.descriptor_variant = DistributedFSDescriptor{path, 0, 1024, 4096, 0};
+    d.status = ReplicaStatus::COMPLETE;
+    return d;
+}
+
 // A test fixture that guarantees scoring state is reset between tests, since
 // the enable flag / injected scorer are process-wide.
 class ReplicaSelectionTest : public ::testing::Test {
@@ -278,6 +286,28 @@ TEST_F(ReplicaSelectionTest, DiskIsLastCompleteFallback) {
     const auto* sel = SelectBestReplica(reps, local);
     ASSERT_NE(sel, nullptr);
     EXPECT_TRUE(sel->is_disk_replica());
+}
+
+TEST_F(ReplicaSelectionTest, DfsPrecedesDisk) {
+    std::unordered_set<std::string> local;
+    std::vector<Replica::Descriptor> reps = {
+        MakeDisk("/remote/object"),
+        MakeDfs("/dfs/object"),
+    };
+    const auto* sel = SelectBestReplica(reps, local);
+    ASSERT_NE(sel, nullptr);
+    EXPECT_TRUE(sel->is_dfs_replica());
+}
+
+TEST_F(ReplicaSelectionTest, LocalDiskPrecedesDfs) {
+    std::unordered_set<std::string> local;
+    std::vector<Replica::Descriptor> reps = {
+        MakeDfs("/dfs/object"),
+        MakeLocalDisk("nodeA"),
+    };
+    const auto* sel = SelectBestReplica(reps, local);
+    ASSERT_NE(sel, nullptr);
+    EXPECT_TRUE(sel->is_local_disk_replica());
 }
 
 TEST_F(ReplicaSelectionTest, NoCompleteReplicaReturnsNull) {

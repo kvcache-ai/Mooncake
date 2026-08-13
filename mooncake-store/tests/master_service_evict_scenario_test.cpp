@@ -491,18 +491,18 @@ TEST_F(MasterServiceEvictScenarioTest,
     backend->BlockTxn();
     scenario.When(EvictMemory(1.0))
         .Then(Object("cold").DoesNotExist())
-        .Then(TenantQuota(tenant).Uses(kObjectSize).Reserves(0))
+        .Then(TenantQuota(tenant).Charges(kObjectSize))
         .When(PutStart("before-durable", kObjectSize)
                   .ForTenant(tenant)
                   .ExpectError(ErrorCode::TENANT_QUOTA_EXCEEDED));
 
     backend->AllowTxn();
     ReadBatchEventually(storage, 3, batch);
-    scenario.Then(TenantQuota(tenant).Uses(0).Reserves(0).Eventually())
+    scenario.Then(TenantQuota(tenant).Charges(0).Eventually())
         .When(PutStart("after-durable", kObjectSize)
                   .ForTenant(tenant)
                   .ExpectReplicas(1))
-        .Then(TenantQuota(tenant).Uses(0).Reserves(kObjectSize));
+        .Then(TenantQuota(tenant).Charges(kObjectSize));
 }
 
 TEST_F(MasterServiceEvictScenarioTest,
@@ -558,8 +558,8 @@ TEST_F(MasterServiceEvictScenarioTest,
         .When(EvictMemory(0.5))
         .Then(Object("same-key").ForTenant("tenant-a").DoesNotExist())
         .Then(Object("same-key").ForTenant("tenant-b").IsReadable())
-        .Then(TenantQuota("tenant-a").Uses(0).Reserves(0))
-        .Then(TenantQuota("tenant-b").Uses(kObjectSize).Reserves(0));
+        .Then(TenantQuota("tenant-a").Charges(0))
+        .Then(TenantQuota("tenant-b").Charges(kObjectSize));
 }
 
 TEST_F(MasterServiceEvictScenarioTest,
@@ -582,10 +582,10 @@ TEST_F(MasterServiceEvictScenarioTest,
                   .ExpectReplicas(1))
         .Then(Object("tenant-a-old").ForTenant("tenant-a").DoesNotExist())
         .Then(Object("tenant-b-object").ForTenant("tenant-b").IsReadable())
-        .Then(TenantQuota("tenant-a").Uses(0).Reserves(kObjectSize))
+        .Then(TenantQuota("tenant-a").Charges(kObjectSize))
         .When(PutEnd("tenant-a-new").ForTenant("tenant-a"))
-        .Then(TenantQuota("tenant-a").Uses(kObjectSize).Reserves(0))
-        .Then(TenantQuota("tenant-b").Uses(kObjectSize).Reserves(0));
+        .Then(TenantQuota("tenant-a").Charges(kObjectSize))
+        .Then(TenantQuota("tenant-b").Charges(kObjectSize));
 }
 
 }  // namespace
