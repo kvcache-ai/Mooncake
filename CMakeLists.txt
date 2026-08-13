@@ -119,7 +119,7 @@ if (WITH_EP)
       mooncake_pg_torch_ide
       PRIVATE mooncake-pg/torch/include
               mooncake-pg/include
-              $<TARGET_PROPERTY:mooncake_ep,INCLUDE_DIRECTORIES>)
+              $<TARGET_PROPERTY:_ep,INCLUDE_DIRECTORIES>)
   else ()
     message(STATUS "WITH_EP enabled: building Mooncake EP natively and PG via setup.py")
     if(USE_CUDA)
