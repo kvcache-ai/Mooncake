@@ -88,6 +88,8 @@ static constexpr uint64_t DEFAULT_DEFAULT_KV_LEASE_TTL =
     10000;  // in milliseconds
 static constexpr uint64_t DEFAULT_KV_SOFT_PIN_TTL_MS =
     30 * 60 * 1000;  // 30 minutes
+static constexpr uint64_t DEFAULT_MAX_KV_SOFT_PIN_TTL_MS =
+    24 * 60 * 60 * 1000;  // 24 hours
 static constexpr bool DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS = true;
 static constexpr double DEFAULT_EVICTION_RATIO = 0.05;
 static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.90;
@@ -359,7 +361,8 @@ enum class ErrorCode : int32_t {
     UNAVAILABLE_IN_CURRENT_STATUS =
         -1010,  ///< Request cannot be done in current status.
     UNAVAILABLE_IN_CURRENT_MODE =
-        -1011,  ///< Request cannot be done in current mode.
+        -1011,              ///< Request cannot be done in current mode.
+    NOT_SUPPORTED = -1012,  ///< Operation is not supported in current mode.
 
     // FILE errors (Range: -1100 to -1199)
     FILE_NOT_FOUND = -1100,       ///< File not found.

@@ -44,8 +44,10 @@ message("${PYTHON_SYS_PATH}")
 set(PYTHON_PACKAGE_NAME "mooncake")
 
 if(WITH_TE)
-  pybind11_add_module(engine ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
-                      transfer_engine/transfer_engine_py.cpp)
+  pybind11_add_module(
+    engine ${SOURCES} ${CACHE_ALLOCATOR_SOURCES}
+    transfer_engine/transfer_engine_py.cpp
+    transfer_engine/shared_segment_py.cpp)
   set_target_properties(engine PROPERTIES INSTALL_RPATH "$ORIGIN")
 
   # Propagate EFA compile definition to engine target
@@ -157,6 +159,11 @@ endif()
 install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/store/async_store.py"
         DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
 
+if(WITH_TE)
+  install(FILES "${CMAKE_CURRENT_SOURCE_DIR}/shared_segment.py"
+          DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
+endif()
+
 # Install Python scripts from mooncake - wheel / mooncake / directory
 install(
   FILES
@@ -205,6 +212,7 @@ if(WITH_TE)
 endif()
 
 if(WITH_EP)
+  install(TARGETS _ep DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
   install(
     DIRECTORY "${EP_PG_STAGING_DIR}/"
     DESTINATION "${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME}"

@@ -186,6 +186,20 @@ enum class BucketEvictionPolicy {
     LRU,   // Evict least recently read bucket first
 };
 
+inline std::ostream& operator<<(std::ostream& os,
+                                const BucketEvictionPolicy& policy) {
+    switch (policy) {
+        case BucketEvictionPolicy::NONE:
+            return os << "none";
+        case BucketEvictionPolicy::FIFO:
+            return os << "fifo";
+        case BucketEvictionPolicy::LRU:
+            return os << "lru";
+        default:
+            return os << "unknown";
+    }
+}
+
 struct BucketBackendConfig {
     int64_t bucket_size_limit =
         256 * kMB;  // Max total size of a single bucket (256 MB)
@@ -321,6 +335,8 @@ struct FileStorageConfig {
     // Use io_uring for file I/O instead of POSIX pread/pwrite
     bool use_uring = false;
 
+    // DFS page-offset mode. Enabled automatically for kDistributed.
+    bool enable_dfs = false;
     // Proactively evict local disk objects from the heartbeat thread once
     // backend usage crosses the high watermark.
     bool enable_disk_watermark_eviction = true;
@@ -347,6 +363,7 @@ struct FileStorageConfig {
 class StorageBackendInterface {
    public:
     StorageBackendInterface(const FileStorageConfig& file_storage_config);
+    virtual ~StorageBackendInterface() = default;
 
     using EvictionHandler = std::function<tl::expected<void, ErrorCode>(
         const std::vector<std::string>& evicted_keys)>;
@@ -1106,6 +1123,12 @@ class BucketStorageBackend : public StorageBackendInterface {
      */
     tl::expected<std::shared_ptr<StorageFile>, ErrorCode> GetFileInstance()
         const;
+
+    // Test-only: number of entries in the LRU eviction index.
+    size_t GetLruIndexSizeForTest() const {
+        SharedMutexLocker lock(&mutex_, shared_lock);
+        return lru_index_.size();
+    }
 
    private:
     // Alignment helper functions for O_DIRECT I/O

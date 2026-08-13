@@ -602,22 +602,69 @@ config = ReplicateConfig()
 #### replica_num
 **Type:** `int`
 **Default:** `1`
-**Description:** Specifies the total number of replicas to create for the stored object.
+**Description:** Specifies the number of memory replicas to create for the
+stored object.
 
 ```python
 config = ReplicateConfig()
-config.replica_num = 3  # Store 3 copies of the data
+config.replica_num = 3  # Store 3 memory replicas
 ```
 
-#### with_soft_pin
-**Type:** `bool`
-**Default:** `False`
-**Description:** Enables soft pinning for the stored object. Soft pinned objects are prioritized to remain in memory during eviction - they are only evicted when memory is insufficient and no other objects are eligible for eviction. This is useful for frequently accessed or important objects like system prompts.
+#### nof_replica_num
+**Type:** `int`
+**Default:** `0`
+**Description:** Specifies the number of replicas to create in the configured
+NVMe-oF SSD pool.
 
 ```python
 config = ReplicateConfig()
-config.with_soft_pin = True  # Keep this object in memory longer
+config.replica_num = 1
+config.nof_replica_num = 1
 ```
+
+#### dfs_replica_num
+**Type:** `int`
+**Default:** `0`
+**Status:** **Work in progress; development and evaluation only.**
+**Description:** Requests an additional replica in the configured shared
+distributed filesystem. The supported values are currently `0` and `1`. When
+set to `1`, `replica_num` must be at least `1`, so DFS-only placement is not
+supported. DFS replicas currently support only the `default` tenant.
+
+```python
+config = ReplicateConfig()
+config.replica_num = 1
+config.dfs_replica_num = 1
+```
+
+Writes that request a DFS replica return success after the DFS `WriteAt`
+operation completes, but without an additional `fsync` durability guarantee.
+The master and client DFS backends must be enabled and configured with the same
+absolute shared-root path and shard layout. See the
+{ref}`DFS deployment documentation <dfs-storage>` for the required environment
+variables and current limitations.
+
+For a same-size `upsert`, if either the existing object or the new request has
+a DFS replica, the requested memory, NoF, and DFS replica counts must match the
+existing topology. A different-size update allocates a new topology.
+
+#### soft_pin_action
+**Type:** `SoftPinAction`
+**Default:** `SoftPinAction.PRESERVE`
+**Description:** Controls the soft-pin transition committed when the first replica becomes readable. `PRESERVE` keeps an existing deadline during Upsert, `ENABLE` starts a fixed soft-pin lifetime, and `DISABLE` removes it. Reads do not extend the lifetime.
+
+```python
+from mooncake.store import ReplicateConfig, SoftPinAction
+
+config = ReplicateConfig()
+config.soft_pin_action = SoftPinAction.ENABLE
+config.soft_pin_ttl_ms = 60_000  # Optional; omitted uses the Master default
+```
+
+`soft_pin_ttl_ms` is valid only with `ENABLE`. The Master rejects TTLs above
+`max_kv_soft_pin_ttl`; a value of zero commits the object as ordinary cache.
+Soft-pin state is not persisted in snapshots or the HA OpLog. Restored objects
+therefore become ordinary cache after recovery or Standby promotion.
 
 #### with_hard_pin
 **Type:** `bool`
@@ -1054,30 +1101,57 @@ def setup(
     self,
     local_hostname: str,
     metadata_server: str,
-    global_segment_size: int = 16777216,
-    local_buffer_size: int = 1073741824,
-    protocol: str = "tcp",
-    rdma_devices: str = "",
+    global_segment_size: int,
+    local_buffer_size: int,
+    protocol: str,
+    rdma_devices: str,
     master_server_addr: str,
     engine: Optional[TransferEngine] = None,
     enable_ssd_offload: bool = False,
     ssd_offload_path: str = "",
     tenant_id: str = "default",
+    enable_client_http_server: bool = False,
+    client_http_port: int = 9300,
 ) -> int
 ```
+
+The positional overload requires every argument through
+`master_server_addr`. To use defaults for those fields, pass a configuration
+dictionary instead:
+
+```python
+def setup(self, config: Dict[str, object]) -> int
+```
+
+The dictionary overload requires `local_hostname` and `metadata_server`. Its
+other keys are optional; the defaults are `16777216` (16 MiB) for both
+`global_segment_size` and `local_buffer_size`, `"tcp"` for `protocol`, an empty
+string for `rdma_devices`, and `"127.0.0.1:50051"` for
+`master_server_addr`. It also accepts `ipc_socket_path` and the optional
+configuration fields listed below. The `engine` argument is available only in
+the positional overload.
 
 **Parameters:**
 - `local_hostname` (str): **Required**. Local hostname and port (e.g., "localhost" or "localhost:12345")
 - `metadata_server` (str): **Required**. Metadata connection string, e.g. `"P2PHANDSHAKE"` or `"http://localhost:8080/metadata"`.
-- `global_segment_size` (int): Memory segment size in bytes for mounting.
-- `local_buffer_size` (int): Local buffer size in bytes.
-- `protocol` (str): Network protocol, usually `"tcp"`, `"rdma"`, `"efa"`, `"cxl"`, or `"ascend"` depending on the build.
-- `rdma_devices` (str): RDMA/EFA device name(s), e.g. `"mlx5_0"` or `"mlx5_0,mlx5_1"`. Leave empty to auto-discover NICs unless `MC_MS_AUTO_DISC=0`; always empty for TCP.
-- `master_server_addr` (str): **Required**. Master server address (e.g., "localhost:50051")
+- `global_segment_size` (int): **Required by the positional overload**. Memory segment size in bytes for mounting.
+- `local_buffer_size` (int): **Required by the positional overload**. Local buffer size in bytes.
+- `protocol` (str): **Required by the positional overload**. Network protocol, usually `"tcp"`, `"rdma"`, `"efa"`, `"cxl"`, or `"ascend"` depending on the build.
+- `rdma_devices` (str): **Required by the positional overload**. RDMA/EFA device name(s), e.g. `"mlx5_0"` or `"mlx5_0,mlx5_1"`. Leave empty to auto-discover NICs unless `MC_MS_AUTO_DISC=0`; always empty for TCP.
+- `master_server_addr` (str): **Required by the positional overload**. Master server address (e.g., "localhost:50051")
 - `engine` (Optional[TransferEngine]): Existing Transfer Engine instance to reuse. Defaults to `None`.
-- `enable_ssd_offload` (bool): Enable client-side SSD offload support. Defaults to `False`.
-- `ssd_offload_path` (str): SSD offload directory. When provided, overrides the storage path environment configuration.
+- `enable_ssd_offload` (bool): Initialize client-side `FileStorage`. With a
+  normal file backend this enables SSD offload; with
+  `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=distributed_storage_backend`,
+  it initializes the DFS backend and is required for DFS reads and writes.
+  Defaults to `False`.
+- `ssd_offload_path` (str): FileStorage directory. When provided, it overrides
+  `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`. With the distributed backend, DFS shard
+  data is stored under `MOONCAKE_DFS_ROOT_DIR`, but this separate directory is
+  still validated during FileStorage initialization.
 - `tenant_id` (str): Tenant namespace for object keys. Defaults to `"default"`.
+- `enable_client_http_server` (bool): Enable the client-local `/health`, `/metrics`, and `/metrics/summary` HTTP endpoints. Defaults to `False`.
+- `client_http_port` (int): Port for the client-local HTTP endpoints. Defaults to `9300`.
 
 **Store segment pinned memory:** CUDA-enabled builds can register Store-managed
 host segments as pinned memory when `MC_STORE_PIN_MEMORY_MAX_BYTES` is set to a
@@ -2141,7 +2215,7 @@ def pub_tensor(self, key: str, tensor: torch.Tensor, config: ReplicateConfig = N
 **Example:**
 ```python
 import torch
-from mooncake.store import ReplicateConfig
+from mooncake.store import ReplicateConfig, SoftPinAction
 
 # Create a tensor
 tensor = torch.randn(100, 100)
@@ -2149,7 +2223,7 @@ tensor = torch.randn(100, 100)
 # Create replication config
 config = ReplicateConfig()
 config.replica_num = 3
-config.with_soft_pin = True
+config.soft_pin_action = SoftPinAction.ENABLE
 
 # Publish tensor with replication settings
 result = store.pub_tensor("my_tensor", tensor, config)
@@ -2555,13 +2629,13 @@ shared-memory staging buffer.
 **Example:**
 ```python
 import torch
-from mooncake.store import ReplicateConfig
+from mooncake.store import ReplicateConfig, SoftPinAction
 
 tensor = torch.randn(100, 100)
 
 config = ReplicateConfig()
 config.replica_num = 2
-config.with_soft_pin = True
+config.soft_pin_action = SoftPinAction.ENABLE
 
 result = store.upsert_pub_tensor("my_tensor", tensor, config)
 if result == 0:

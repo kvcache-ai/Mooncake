@@ -18,6 +18,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <regex>
 #include <string>
 #include <thread>
@@ -237,6 +238,26 @@ class SnapshotChildProcessTest : public ::testing::Test {
         return tenant_it != shard.tenants.end() &&
                tenant_it->second.metadata.find(key) !=
                    tenant_it->second.metadata.end();
+    }
+
+    size_t SoftPinRegistrationCount(MasterService* svc) {
+        return svc->soft_pin_deadline_index_.RegistrationCountForTest();
+    }
+
+    std::optional<std::chrono::system_clock::time_point> GetSoftPinDeadline(
+        MasterService* svc, const std::string& key) {
+        const size_t shard_idx =
+            svc->getMetadataShardIndex(TenantId::Default(), key);
+        MasterService::MetadataShardAccessorRO shard(svc, shard_idx);
+        const auto tenant_it = shard->tenants.find(TenantId::Default());
+        if (tenant_it == shard->tenants.end()) {
+            return std::nullopt;
+        }
+        const auto metadata_it = tenant_it->second.metadata.find(key);
+        if (metadata_it == tenant_it->second.metadata.end()) {
+            return std::nullopt;
+        }
+        return metadata_it->second.GetCommittedSoftPinTimeout();
     }
 
     uint32_t GetShardIndexForTest(const std::string& key) {
@@ -1154,7 +1175,8 @@ TEST_F(SnapshotChildProcessTest, RestoreCleansExpiredLease) {
     ASSERT_TRUE(mount_result.has_value()) << "MountSegment failed";
 
     // Add two complete objects via PutStart + PutEnd
-    // Note: PutEnd calls GrantLease(0, ...) so lease is immediately expired
+    // PutEnd only grants a zero-duration read lease, so it is immediately
+    // expired.
     std::string expired_key = "expired_lease_object";
     auto put_exp =
         service_->PutStart(client_id, expired_key, TenantId::Default(), {1024},
@@ -1176,9 +1198,27 @@ TEST_F(SnapshotChildProcessTest, RestoreCleansExpiredLease) {
                     .has_value())
         << "PutEnd normal failed";
 
+    const int64_t soft_pin_baseline =
+        MasterMetricManager::instance().get_soft_pin_key_count();
+    std::string soft_pinned_key = "soft_pin_valid_lease_object";
+    ReplicateConfig soft_pin_config;
+    soft_pin_config.soft_pin_action = SoftPinAction::ENABLE;
+    soft_pin_config.soft_pin_ttl_ms = 60'000;
+    auto put_soft =
+        service_->PutStart(client_id, soft_pinned_key, TenantId::Default(),
+                           {1024}, soft_pin_config);
+    ASSERT_TRUE(put_soft.has_value()) << "PutStart soft pin failed";
+    ASSERT_TRUE(service_
+                    ->PutEnd(client_id, soft_pinned_key, TenantId::Default(),
+                             ReplicaType::MEMORY)
+                    .has_value())
+        << "PutEnd soft pin failed";
+
     // ExistKey grants a fresh lease (now + 600s) to normal_key
     EXPECT_TRUE(
         service_->ExistKey(normal_key, TenantId::Default()).value_or(false));
+    EXPECT_TRUE(service_->ExistKey(soft_pinned_key, TenantId::Default())
+                    .value_or(false));
     // Do NOT call ExistKey on expired_key, its lease stays expired from PutEnd
 
     // Step 2: Persist state
@@ -1205,6 +1245,17 @@ TEST_F(SnapshotChildProcessTest, RestoreCleansExpiredLease) {
         << "Normal object with valid lease should survive restore";
     EXPECT_FALSE(KeyExistsInMetadata(restored_service.get(), expired_key))
         << "Lease-expired object should be cleaned during restore";
+    EXPECT_TRUE(restored_service->ExistKey(soft_pinned_key, TenantId::Default())
+                    .value_or(false))
+        << "Soft-pinned object with a valid read lease should restore as cache";
+    EXPECT_FALSE(
+        GetSoftPinDeadline(restored_service.get(), soft_pinned_key).has_value())
+        << "Snapshot restore must discard soft-pin state";
+    EXPECT_EQ(MasterMetricManager::instance().get_soft_pin_key_count(),
+              soft_pin_baseline)
+        << "Restored soft pins must not remain in the active gauge";
+    EXPECT_EQ(SoftPinRegistrationCount(restored_service.get()), 0u)
+        << "Restored soft pins must not remain in the deadline index";
 
     restored_service.reset();
 }

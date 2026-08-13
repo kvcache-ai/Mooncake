@@ -24,6 +24,15 @@ target_link_libraries(endpoint_store_test PUBLIC transfer_engine gtest
                                                  gtest_main)
 add_test(NAME endpoint_store_test COMMAND endpoint_store_test)
 
+# Fingerprint, blob and option checks run without a VMM backend.
+add_executable(shared_segment_test ${WORKSPACE}/shared_segment_test.cpp)
+target_include_directories(
+  shared_segment_test
+  PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../src/shared_segment)
+target_link_libraries(shared_segment_test PUBLIC transfer_engine gtest
+                                                 gtest_main)
+add_test(NAME shared_segment_test COMMAND shared_segment_test)
+
 add_executable(rdma_endpoint_state_test
                ${WORKSPACE}/rdma_endpoint_state_test.cpp)
 target_link_libraries(rdma_endpoint_state_test PUBLIC transfer_engine gtest
@@ -113,6 +122,8 @@ if(USE_TCP)
 
   add_executable(tcp_write_visibility_test
                  ${WORKSPACE}/tcp_write_visibility_test.cpp)
+  target_compile_definitions(tcp_write_visibility_test
+                             PRIVATE MOONCAKE_TCP_TRANSPORT_TEST_HOOKS)
   target_link_libraries(tcp_write_visibility_test PUBLIC transfer_engine gtest
                                                          gtest_main)
   add_test(NAME tcp_write_visibility_test COMMAND tcp_write_visibility_test)
@@ -359,8 +370,7 @@ if(ENABLE_MULTI_PROTOCOL)
 endif()
 
 add_executable(graceful_shutdown_test ${WORKSPACE}/graceful_shutdown_test.cpp)
-target_link_libraries(graceful_shutdown_test PUBLIC transfer_engine gtest
-                                                    gtest_main)
+target_link_libraries(graceful_shutdown_test PUBLIC transfer_engine gtest)
 add_test(NAME graceful_shutdown_test COMMAND graceful_shutdown_test)
 
 add_executable(show_links_test ${WORKSPACE}/show_links_test.cpp)

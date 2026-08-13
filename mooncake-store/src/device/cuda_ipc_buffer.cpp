@@ -122,6 +122,37 @@ tl::expected<CudaIpcBufferHandle, ErrorCode> ExportCudaIpcBuffer(
 #endif
 }
 
+tl::expected<void, ErrorCode> SynchronizeCudaStream(int32_t device_id,
+                                                    uintptr_t stream_handle) {
+#if defined(USE_CUDA)
+    int current_device = -1;
+    if (cudaGetDevice(&current_device) != cudaSuccess) {
+        ClearCudaError();
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    cudaError_t operation_status = cudaSetDevice(device_id);
+    if (operation_status == cudaSuccess) {
+        const cudaStream_t stream =
+            stream_handle == 0 ? nullptr
+                               : reinterpret_cast<cudaStream_t>(stream_handle);
+        operation_status = cudaStreamSynchronize(stream);
+    }
+    if (operation_status != cudaSuccess) ClearCudaError();
+
+    const cudaError_t restore_status = cudaSetDevice(current_device);
+    if (restore_status != cudaSuccess) ClearCudaError();
+    if (operation_status != cudaSuccess || restore_status != cudaSuccess) {
+        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    return {};
+#else
+    (void)device_id;
+    (void)stream_handle;
+    return tl::unexpected(ErrorCode::INVALID_PARAMS);
+#endif
+}
+
 CudaIpcBufferMapping::~CudaIpcBufferMapping() { Close(); }
 
 CudaIpcBufferMapping::CudaIpcBufferMapping(

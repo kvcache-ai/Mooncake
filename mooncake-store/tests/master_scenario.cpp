@@ -3,8 +3,10 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <thread>
 #include <utility>
 
+#include "mutex.h"
 #include "types.h"
 
 namespace mooncake::test {
@@ -56,9 +58,40 @@ UpsertRevokeAction UpsertRevoke(std::string key) {
 
 RemoveAction Remove(std::string key) { return {.key = std::move(key)}; }
 
+ExpireAtAction ExpireAt(std::string key,
+                        std::chrono::system_clock::time_point lease_timeout) {
+    return {.key = std::move(key), .lease_timeout = lease_timeout};
+}
+
+MemoryEvictAction EvictMemory(double target_ratio) {
+    return {.target_ratio = target_ratio, .lower_bound_ratio = target_ratio};
+}
+
 ObjectSpec<> Object(std::string key) { return ObjectSpec<>(std::move(key)); }
 
+ObjectsSpec<> Objects(size_t begin, size_t end) {
+    return ObjectsSpec<>(begin, end);
+}
+
+ObjectsSpec<> Objects(std::initializer_list<std::string> keys) {
+    return ObjectsSpec<>(std::vector<std::string>(keys));
+}
+
+KeyCountSpec KeyCount(size_t value) { return {.value = value}; }
+
+TenantQuotaSpec TenantQuota(std::string tenant) {
+    return {.tenant = std::move(tenant)};
+}
+
+OpLogUnavailableSpec OpLogUnavailable() { return {}; }
+
 MasterScenario::MasterScenario(std::string name) : name_(std::move(name)) {}
+
+MasterScenario::MasterScenario(std::string name, MasterServiceConfig config,
+                               std::shared_ptr<HaKvBackend> batch_oplog_backend)
+    : name_(std::move(name)),
+      config_(std::move(config)),
+      batch_oplog_backend_(std::move(batch_oplog_backend)) {}
 
 MasterScenario::~MasterScenario() = default;
 
@@ -86,16 +119,70 @@ MasterScenario& MasterScenario::Given(MemoryNodeSpec node) {
     return *this;
 }
 
+MasterScenario& MasterScenario::Given(ObjectsSpec<> objects) {
+    if (objects.keys.empty()) {
+        Fail(
+            "Objects requires at least one key; indexed ranges must use "
+            "NamedBy");
+        return *this;
+    }
+    if (objects.size == 0) {
+        Fail("Objects requires non-zero Size");
+        return *this;
+    }
+    if (objects.preferred_node.empty()) {
+        Fail("Objects requires CompleteOn");
+        return *this;
+    }
+
+    for (size_t offset = 0; offset < objects.keys.size(); ++offset) {
+        const auto& key = objects.keys[offset];
+        auto put = PutStart(key, objects.size)
+                       .By(objects.actor)
+                       .ForTenant(objects.tenant)
+                       .OnNode(objects.preferred_node);
+        if (!objects.group_id.empty()) {
+            put.InGroup(objects.group_id);
+        }
+        if (objects.with_soft_pin) {
+            put.WithSoftPin();
+        }
+        if (objects.with_hard_pin) {
+            put.WithHardPin();
+        }
+        When(std::move(put));
+        When(PutEnd(key).By(objects.actor).ForTenant(objects.tenant));
+
+        if (objects.lease_timeout_base.has_value()) {
+            auto expire = ExpireAt(key, *objects.lease_timeout_base +
+                                            objects.lease_timeout_step * offset)
+                              .ForTenant(objects.tenant);
+            if (objects.soft_pin_timeout.has_value()) {
+                expire.SoftPinnedUntil(*objects.soft_pin_timeout);
+            }
+            When(std::move(expire));
+        }
+    }
+    return *this;
+}
+
 MasterScenario& MasterScenario::WhenPutStart(PutStartActionData action) {
     if (!EnsureService()) {
         return *this;
     }
 
     ReplicateConfig config;
-    config.replica_num = 1;
+    config.replica_num = action.requested_replica_count;
+    config.preferred_segment = action.preferred_node;
+    config.soft_pin_action =
+        action.with_soft_pin ? SoftPinAction::ENABLE : SoftPinAction::PRESERVE;
+    config.with_hard_pin = action.with_hard_pin;
+    if (!action.group_id.empty()) {
+        config.group_ids = {action.group_id};
+    }
     const auto result =
         service_->PutStart(ActorId(action.actor), action.key,
-                           TenantId::Default(), action.size, config);
+                           TenantId(action.tenant), action.size, config);
     ValidateStartResult("PutStart(" + action.key + ")", action.expected_error,
                         action.expected_replica_count,
                         action.expected_replica_status, result);
@@ -108,7 +195,7 @@ MasterScenario& MasterScenario::WhenUpsertStart(UpsertStartActionData action) {
     }
 
     ReplicateConfig config;
-    config.replica_num = 1;
+    config.replica_num = action.requested_replica_count;
     const auto result =
         service_->UpsertStart(ActorId(action.actor), action.key,
                               TenantId::Default(), action.size, config);
@@ -124,8 +211,8 @@ MasterScenario& MasterScenario::When(PutEndAction action) {
     }
 
     const auto result =
-        service_->PutEnd(ActorId(action.actor), action.key, TenantId::Default(),
-                         ReplicaType::MEMORY);
+        service_->PutEnd(ActorId(action.actor), action.key,
+                         TenantId(action.tenant), ReplicaType::MEMORY);
     ValidateActionResult("PutEnd(" + action.key + ")", action.expected_error,
                          result.has_value(),
                          result ? ErrorCode::OK : result.error());
@@ -153,7 +240,7 @@ MasterScenario& MasterScenario::When(PutRevokeAction action) {
 
     const auto result =
         service_->PutRevoke(ActorId(action.actor), action.key,
-                            TenantId::Default(), ReplicaType::MEMORY);
+                            TenantId(action.tenant), ReplicaType::MEMORY);
     ValidateActionResult("PutRevoke(" + action.key + ")", action.expected_error,
                          result.has_value(),
                          result ? ErrorCode::OK : result.error());
@@ -179,10 +266,55 @@ MasterScenario& MasterScenario::When(RemoveAction action) {
         return *this;
     }
 
-    const auto result = service_->Remove(action.key, TenantId::Default());
+    const auto result = service_->Remove(action.key, TenantId(action.tenant));
     ValidateActionResult("Remove(" + action.key + ")", action.expected_error,
                          result.has_value(),
                          result ? ErrorCode::OK : result.error());
+    return *this;
+}
+
+MasterScenario& MasterScenario::When(ExpireAtAction action) {
+    if (!EnsureService()) {
+        return *this;
+    }
+
+    const TenantId tenant(action.tenant);
+    auto update = [&](size_t shard_idx) {
+        MasterService::MetadataShardAccessorRW shard(service_.get(), shard_idx);
+        auto tenant_it = shard->tenants.find(tenant);
+        if (tenant_it == shard->tenants.end()) {
+            return false;
+        }
+        auto metadata_it = tenant_it->second.metadata.find(action.key);
+        if (metadata_it == tenant_it->second.metadata.end()) {
+            return false;
+        }
+        SpinLocker locker(&metadata_it->second.lock);
+        metadata_it->second.lease_timeout = action.lease_timeout;
+        metadata_it->second.soft_pin_timeout = action.soft_pin_timeout;
+        return true;
+    };
+
+    const size_t routed = service_->getMetadataShardIndex(tenant, action.key);
+    if (update(routed)) {
+        return *this;
+    }
+    for (size_t shard_idx = 0; shard_idx < MasterService::kNumShards;
+         ++shard_idx) {
+        if (shard_idx != routed && update(shard_idx)) {
+            return *this;
+        }
+    }
+    Fail("ExpireAt(" + action.key + ") could not find object");
+    return *this;
+}
+
+MasterScenario& MasterScenario::When(MemoryEvictAction action) {
+    if (!EnsureService()) {
+        return *this;
+    }
+    service_->RunBatchEvictForTesting(action.target_ratio,
+                                      action.lower_bound_ratio);
     return *this;
 }
 
@@ -193,7 +325,7 @@ MasterScenario& MasterScenario::ThenObject(ObjectSpecData object,
     }
 
     const auto result =
-        service_->GetReplicaList(object.key, TenantId::Default());
+        service_->GetReplicaList(object.key, TenantId(object.tenant));
     if (expectation == ObjectExpectation::MISSING) {
         if (result) {
             Fail("Object(" + object.key + ") exists; expected it not to exist");
@@ -238,6 +370,90 @@ MasterScenario& MasterScenario::ThenObject(ObjectSpecData object,
     return *this;
 }
 
+MasterScenario& MasterScenario::ThenObjects(ObjectsSpecData objects,
+                                            ObjectExpectation expectation) {
+    if (objects.keys.empty()) {
+        Fail(
+            "Objects requires at least one key; indexed ranges must use "
+            "NamedBy");
+        return *this;
+    }
+    for (auto& key : objects.keys) {
+        ObjectSpecData object(std::move(key));
+        object.tenant = objects.tenant;
+        ThenObject(std::move(object), expectation);
+    }
+    return *this;
+}
+
+MasterScenario& MasterScenario::Then(KeyCountSpec key_count) {
+    if (!EnsureService()) {
+        return *this;
+    }
+    const size_t actual = service_->GetKeyCount();
+    if (actual != key_count.value) {
+        Fail("KeyCount is " + std::to_string(actual) + "; expected " +
+             std::to_string(key_count.value));
+    }
+    return *this;
+}
+
+MasterScenario& MasterScenario::Then(TenantQuotaSpec tenant_quota) {
+    if (!EnsureService()) {
+        return *this;
+    }
+
+    auto snapshot =
+        service_->GetTenantQuotaSnapshot(TenantId(tenant_quota.tenant));
+    if (!snapshot.has_value()) {
+        Fail("TenantQuota(" + tenant_quota.tenant + ") is not registered");
+        return *this;
+    }
+
+    const auto matches = [&tenant_quota](const TenantQuotaSnapshot& value) {
+        return !tenant_quota.charged_bytes.has_value() ||
+               value.charged_bytes == *tenant_quota.charged_bytes;
+    };
+    const auto deadline =
+        std::chrono::steady_clock::now() + tenant_quota.eventual_timeout;
+    while (!matches(*snapshot) && std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        snapshot =
+            service_->GetTenantQuotaSnapshot(TenantId(tenant_quota.tenant));
+        if (!snapshot.has_value()) {
+            Fail("TenantQuota(" + tenant_quota.tenant + ") is not registered");
+            return *this;
+        }
+    }
+
+    if (tenant_quota.charged_bytes.has_value() &&
+        snapshot->charged_bytes != *tenant_quota.charged_bytes) {
+        Fail("TenantQuota(" + tenant_quota.tenant + ") charges " +
+             std::to_string(snapshot->charged_bytes) + "; expected " +
+             std::to_string(*tenant_quota.charged_bytes));
+    }
+    return *this;
+}
+
+MasterScenario& MasterScenario::Then(OpLogUnavailableSpec oplog) {
+    if (!EnsureService()) {
+        return *this;
+    }
+    if (!service_->ordered_oplog_writer_) {
+        Fail("OpLog writer is not configured");
+        return *this;
+    }
+    const auto deadline = std::chrono::steady_clock::now() + oplog.timeout;
+    while (service_->ordered_oplog_writer_->IsAccepting() &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (service_->ordered_oplog_writer_->IsAccepting()) {
+        Fail("OpLog writer was expected to be unavailable");
+    }
+    return *this;
+}
+
 bool MasterScenario::EnsureService() {
     if (service_) {
         return true;
@@ -248,7 +464,16 @@ bool MasterScenario::EnsureService() {
         return false;
     }
 
-    service_ = std::make_unique<MasterService>();
+    service_ = std::make_unique<MasterService>(config_);
+    if (batch_oplog_backend_) {
+        const auto result =
+            service_->SetBatchOpLogBackendForTesting(batch_oplog_backend_);
+        if (result != ErrorCode::OK) {
+            Fail("failed to install batch OpLog backend: " + toString(result));
+            service_.reset();
+            return false;
+        }
+    }
     for (const auto& node : nodes_) {
         Segment segment;
         segment.id = StableUuid("segment", node.name);

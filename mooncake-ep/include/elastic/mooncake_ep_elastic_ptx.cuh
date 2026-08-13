@@ -3,7 +3,7 @@
 // transport references are replaced with Mooncake Device API adapters.
 #pragma once
 
-#include <cuda_bf16.h>
+#include <cuda_alike.h>
 #include <cstdint>
 
 #include <elastic/mooncake_ep_elastic_compiled.cuh>
@@ -22,7 +22,7 @@ using arrival_phase = uint32_t;
 // More than TMA, `longlong4` requires 32 bytes aligned
 static constexpr int kNumTMAAlignBytes = 32;
 
-#ifdef __CUDACC__
+#if defined(__CUDACC__) || defined(__MUSACC__)
 
 /// Exceptions
 __forceinline__ __device__ void trap() {

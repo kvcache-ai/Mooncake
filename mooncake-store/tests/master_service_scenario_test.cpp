@@ -1,5 +1,7 @@
 #include "master_scenario.h"
 
+#include <array>
+
 #include <gtest/gtest.h>
 
 namespace mooncake::test {
@@ -24,6 +26,61 @@ TEST(MasterServiceTest, PutStartEndFlow) {
                   .IsReadable()
                   .HasReplicas(1)
                   .HasCompleteReplicas(1));
+}
+
+TEST(MasterServiceTest, PutLifecycleForEveryReplicaCount) {
+    constexpr std::array<size_t, 5> kReplicaCounts{1, 2, 3, 4, 5};
+    MasterScenario scenario(
+        "put lifecycle for replica counts one through five");
+    for (size_t index : kReplicaCounts) {
+        scenario.Given(MemoryNode("memory-" + std::to_string(index)));
+    }
+    for (size_t replica_count : kReplicaCounts) {
+        const std::string key = "key-" + std::to_string(replica_count);
+        scenario
+            .When(PutStart(key, 1_KB)
+                      .Replicas(replica_count)
+                      .ExpectReplicas(replica_count)
+                      .ExpectStatus(ReplicaStatus::PROCESSING))
+            .Then(Object(key).IsNotReady())
+            .When(Remove(key).ExpectError(ErrorCode::REPLICA_IS_NOT_READY))
+            .When(PutEnd(key))
+            .Then(Object(key)
+                      .IsReadable()
+                      .HasReplicas(replica_count)
+                      .HasCompleteReplicas(replica_count));
+    }
+}
+
+TEST(MasterServiceTest, GetReplicaListDistinguishesMissingAndReadable) {
+    MasterScenario("get replica list distinguishes missing and readable")
+        .Given(MemoryNode("memory"))
+        .Then(Object("missing").DoesNotExist())
+        .When(PutStart("key", 1_KB))
+        .When(PutEnd("key"))
+        .Then(Object("key").IsReadable().HasReplicas(1));
+}
+
+TEST(MasterServiceTest, RemoveObjectAndRejectMissingObject) {
+    MasterScenario("remove object and reject a missing object")
+        .Given(MemoryNode("memory"))
+        .When(PutStart("key", 1_KB))
+        .When(PutEnd("key"))
+        .When(Remove("key"))
+        .Then(Object("key").DoesNotExist())
+        .When(Remove("missing").ExpectError(ErrorCode::OBJECT_NOT_FOUND));
+}
+
+TEST(MasterServiceTest, RepeatedPutAndRemoveIsDeterministic) {
+    MasterScenario scenario("repeated put and remove with fixed keys");
+    scenario.Given(MemoryNode("memory"));
+    for (int index = 0; index < 10; ++index) {
+        const std::string key = "key-" + std::to_string(index);
+        scenario.When(PutStart(key, 1_KB))
+            .When(PutEnd(key))
+            .When(Remove(key))
+            .Then(Object(key).DoesNotExist());
+    }
 }
 
 TEST(MasterServiceTest, UpsertNewKey) {

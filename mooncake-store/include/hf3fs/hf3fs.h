@@ -5,11 +5,11 @@
 #include <mutex>
 #include <thread>
 #include <hf3fs_usrbio.h>
+
+#include "file_interface.h"
 #include "types.h"
 
 namespace mooncake {
-
-class StorageFile;
 
 // Forward declaration of USRBIOResourceManager
 struct Hf3fsConfig {

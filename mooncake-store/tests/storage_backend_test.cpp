@@ -4725,4 +4725,114 @@ TEST_F(StorageBackendTest,
               std::make_optional(value_b));
 }
 
+TEST_F(StorageBackendTest,
+       BucketStorageBackend_OffloadSetsBucketAccessTimestamp) {
+    // Regression test for "update bucket ts after offload": BatchOffload must
+    // stamp the new bucket's last_access_ns_ with the current time when
+    // committing metadata. The timestamp itself is private, so we verify it
+    // through LRU eviction behavior:
+    //   - Bucket A is offloaded and then read, so its timestamp is t1 > 0.
+    //   - Bucket B is offloaded afterwards; with the fix its timestamp is
+    //     t2 > t1, without the fix it stays 0.
+    //   - Offloading bucket C overflows the quota and evicts exactly one
+    //     bucket. The LRU victim must be A (oldest timestamp). If B's
+    //     timestamp were 0, B would be evicted immediately instead.
+    // Additionally, a failing complete_handler must roll back the committed
+    // bucket, including its lru_index_ entry (checked via
+    // GetLruIndexSizeForTest at every stage).
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    BucketBackendConfig bucket_config;
+    bucket_config.eviction_policy = BucketEvictionPolicy::LRU;
+    // Each bucket holds one 64 KB object (plus a small metadata blob); the
+    // quota fits two buckets but not three, so the third offload evicts
+    // exactly one bucket.
+    constexpr size_t kValueSize = 64 * 1024;
+    bucket_config.max_total_size = 150 * 1024;
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init());
+
+    auto offload_one = [&](const std::string& key,
+                           std::vector<std::string>* evicted_keys) {
+        auto buf = std::make_unique<char[]>(kValueSize);
+        std::memset(buf.get(), 'x', kValueSize);
+        std::unordered_map<std::string, std::vector<Slice>> batch;
+        batch.emplace(key, std::vector<Slice>{Slice{buf.get(), kValueSize}});
+        auto result = storage_backend.BatchOffload(
+            batch,
+            [](const std::vector<std::string>&,
+               std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; },
+            [evicted_keys](const std::vector<std::string>& keys)
+                -> tl::expected<void, ErrorCode> {
+                if (evicted_keys != nullptr) {
+                    evicted_keys->insert(evicted_keys->end(), keys.begin(),
+                                         keys.end());
+                }
+                return {};
+            });
+        ASSERT_TRUE(result.has_value()) << "Offload failed for key " << key;
+    };
+
+    // Bucket A: offload, then read so its access timestamp becomes t1 > 0.
+    offload_one("lru_ts_key_a", nullptr);
+    EXPECT_EQ(storage_backend.GetLruIndexSizeForTest(), 1u);
+
+    // Rollback on complete_handler failure: the committed bucket must be
+    // rolled back and its lru_index_ entry removed. Use a small value so this
+    // offload stays under the quota and does not trigger eviction.
+    {
+        std::string rollback_key = "lru_ts_rollback_key";
+        std::string rollback_data = "rollback_data";
+        std::unordered_map<std::string, std::vector<Slice>> batch;
+        batch.emplace(rollback_key,
+                      std::vector<Slice>{
+                          Slice{rollback_data.data(), rollback_data.size()}});
+        auto rollback_res = storage_backend.BatchOffload(
+            batch, [](const std::vector<std::string>&,
+                      std::vector<StorageObjectMetadata>&) {
+                return ErrorCode::INTERNAL_ERROR;
+            });
+        ASSERT_FALSE(rollback_res.has_value());
+        EXPECT_EQ(rollback_res.error(), ErrorCode::INTERNAL_ERROR);
+
+        auto exist_res = storage_backend.IsExist(rollback_key);
+        ASSERT_TRUE(exist_res.has_value());
+        EXPECT_FALSE(exist_res.value()) << "Rolled-back key must not exist";
+
+        EXPECT_EQ(storage_backend.GetLruIndexSizeForTest(), 1u)
+            << "Rolled-back bucket's lru_index_ entry must be removed";
+    }
+
+    {
+        auto read_buf = std::make_unique<char[]>(kValueSize);
+        std::unordered_map<std::string, Slice> load_slices;
+        load_slices.emplace("lru_ts_key_a", Slice{read_buf.get(), kValueSize});
+        ASSERT_TRUE(storage_backend.BatchLoad(load_slices).has_value());
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+
+    // Bucket B: freshly offloaded. Its timestamp must be t2 > t1 (it would
+    // be 0 without the timestamp update in BatchOffload).
+    offload_one("lru_ts_key_b", nullptr);
+    EXPECT_EQ(storage_backend.GetLruIndexSizeForTest(), 2u);
+
+    // Bucket C: overflows the quota and forces eviction of one bucket.
+    std::vector<std::string> evicted_keys;
+    offload_one("lru_ts_key_c", &evicted_keys);
+    EXPECT_EQ(storage_backend.GetLruIndexSizeForTest(), 2u)
+        << "lru_index_ must stay in sync with buckets_ after eviction";
+
+    ASSERT_EQ(evicted_keys.size(), 1u)
+        << "Exactly one bucket should be evicted";
+    EXPECT_EQ(evicted_keys[0], "lru_ts_key_a")
+        << "LRU victim should be the previously read bucket A, not the "
+           "freshly offloaded bucket B";
+
+    auto exist_b = storage_backend.IsExist("lru_ts_key_b");
+    ASSERT_TRUE(exist_b.has_value());
+    EXPECT_TRUE(exist_b.value())
+        << "Freshly offloaded bucket must not be evicted immediately "
+           "(its access timestamp must not be 0)";
+}
+
 }  // namespace mooncake::test

@@ -5,6 +5,7 @@
 #include <gtest/gtest.h>
 
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -21,6 +22,36 @@
 namespace mooncake {
 
 // Test fixture for TransferTask tests
+// TODO: Currently, this test does not cover TransferSubmitter and
+// TransferEngine integration. Will add more tests in the future.
+class ScopedEnvVar {
+   public:
+    ScopedEnvVar(const char* name, const char* value) : name_(name) {
+        if (const char* old_value = std::getenv(name)) {
+            had_old_value_ = true;
+            old_value_ = old_value;
+        }
+        if (value) {
+            setenv(name_.c_str(), value, 1);
+        } else {
+            unsetenv(name_.c_str());
+        }
+    }
+
+    ~ScopedEnvVar() {
+        if (had_old_value_) {
+            setenv(name_.c_str(), old_value_.c_str(), 1);
+        } else {
+            unsetenv(name_.c_str());
+        }
+    }
+
+   private:
+    std::string name_;
+    bool had_old_value_ = false;
+    std::string old_value_;
+};
+
 class TransferTaskTest : public ::testing::Test {
    protected:
     void SetUp() override {
@@ -391,6 +422,38 @@ TEST_F(TransferTaskTest, BatchGetOffloadObjectCopiesPinnedHostToGpu) {
     EXPECT_EQ(cudaFree(gpu_destination), cudaSuccess);
 }
 #endif
+TEST_F(TransferTaskTest, CanUseLocalMemcpyRequiresSameProcessEndpoint) {
+    ScopedEnvVar memcpy_enabled("MC_STORE_MEMCPY", "1");
+
+    TransferEngine engine(false);
+    ASSERT_EQ(
+        engine.init("P2PHANDSHAKE", "127.0.0.1:30991", "127.0.0.1", 30991), 0);
+    ASSERT_NE(engine.installTransport("tcp", nullptr), nullptr);
+
+    std::shared_ptr<StorageBackend> storage_backend;
+    TransferSubmitter submitter(engine, storage_backend, "127.0.0.1:30991");
+
+    const auto local_endpoint = engine.getLocalIpAndPort();
+    ASSERT_FALSE(local_endpoint.empty());
+    EXPECT_TRUE(submitter.canUseLocalMemcpy(local_endpoint));
+
+    EXPECT_FALSE(submitter.canUseLocalMemcpy("127.0.0.1:30992"));
+    EXPECT_FALSE(submitter.canUseLocalMemcpy(""));
+}
+
+TEST_F(TransferTaskTest, CanUseLocalMemcpyHonorsMemcpyEnv) {
+    ScopedEnvVar memcpy_disabled("MC_STORE_MEMCPY", "0");
+
+    TransferEngine engine(false);
+    ASSERT_EQ(
+        engine.init("P2PHANDSHAKE", "127.0.0.1:30993", "127.0.0.1", 30993), 0);
+    ASSERT_NE(engine.installTransport("tcp", nullptr), nullptr);
+
+    std::shared_ptr<StorageBackend> storage_backend;
+    TransferSubmitter submitter(engine, storage_backend, "127.0.0.1:30993");
+
+    EXPECT_FALSE(submitter.canUseLocalMemcpy(engine.getLocalIpAndPort()));
+}
 
 // Test TransferStrategy enum and stream operator
 TEST_F(TransferTaskTest, TransferStrategyEnum) {

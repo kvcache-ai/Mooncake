@@ -19,6 +19,7 @@
 #include <fstream>
 
 #include <pybind11/stl.h>
+#include "shared_segment_py.h"
 #include "transport/rpc_communicator/rpc_interface.h"
 
 #ifdef USE_TENT
@@ -1272,6 +1273,8 @@ PYBIND11_MODULE(engine, m) {
 
     py::class_<TransferEngine, std::shared_ptr<TransferEngine>>(
         m, "InnerTransferEngine");
+
+    mooncake::bind_shared_segment(m);
 
     // Bind RpcInterface (this also registers ReceivedData, ReceivedTensor, and
     // factory functions)
