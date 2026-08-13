@@ -245,6 +245,11 @@ class RealClient : public PyClient {
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
         const ReplicateConfig &config = ReplicateConfig{});
+    std::vector<int> batch_put_from_multi_buffers(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const ReplicateConfig &config, bool stage_nonlocal);
 
     std::vector<int> batch_get_session_start(
         const std::vector<std::string> &keys) override;
@@ -286,11 +291,21 @@ class RealClient : public PyClient {
 
     int upsert_from(const std::string &key, void *buffer, size_t size,
                     const ReplicateConfig &config = ReplicateConfig{});
-
     std::vector<int> batch_upsert_from(
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
         const ReplicateConfig &config = ReplicateConfig{});
+
+    std::vector<int> batch_upsert_from_multi_buffers(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const ReplicateConfig &config = ReplicateConfig{});
+    std::vector<int> batch_upsert_from_multi_buffers(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const ReplicateConfig &config, bool stage_nonlocal);
 
     int upsert_parts(const std::string &key,
                      std::vector<std::span<const char>> values,
@@ -483,9 +498,22 @@ class RealClient : public PyClient {
         const std::vector<CudaIpcWriteRequest> &requests,
         const ReplicateConfig &config, const UUID &client_id);
 
+    std::vector<tl::expected<void, ErrorCode>>
+    batch_upsert_from_cuda_ipc_dummy_helper(
+        const std::vector<CudaIpcWriteRequest> &requests,
+        const ReplicateConfig &config, const UUID &client_id);
+
     std::vector<tl::expected<int64_t, ErrorCode>>
     batch_get_into_cuda_ipc_dummy_helper(
         const std::vector<CudaIpcReadRequest> &requests, const UUID &client_id);
+
+    std::vector<tl::expected<void, ErrorCode>>
+    batch_upsert_from_multi_buffers_dummy_helper(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<uint64_t>> &dummy_all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const ReplicateConfig &config, int32_t device_id,
+        const UUID &client_id);
 
     std::vector<tl::expected<int64_t, ErrorCode>>
     batch_get_into_multi_buffers_dummy_helper(
@@ -638,11 +666,18 @@ class RealClient : public PyClient {
     tl::expected<void, ErrorCode> upsert_from_internal(
         const std::string &key, void *buffer, size_t size,
         const ReplicateConfig &config = ReplicateConfig{});
-
     std::vector<tl::expected<void, ErrorCode>> batch_upsert_from_internal(
         const std::vector<std::string> &keys,
         const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
         const ReplicateConfig &config = ReplicateConfig{});
+
+    std::vector<tl::expected<void, ErrorCode>>
+    batch_upsert_from_multi_buffers_internal(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const ReplicateConfig &config = ReplicateConfig{},
+        bool stage_nonlocal = false);
 
     tl::expected<void, ErrorCode> upsert_parts_internal(
         const std::string &key, std::vector<std::span<const char>> values,
@@ -667,7 +702,8 @@ class RealClient : public PyClient {
         const std::vector<std::string> &keys,
         const std::vector<std::vector<void *>> &all_buffers,
         const std::vector<std::vector<size_t>> &all_sizes,
-        const ReplicateConfig &config = ReplicateConfig{});
+        const ReplicateConfig &config = ReplicateConfig{},
+        bool stage_nonlocal = false);
 
     tl::expected<void, ErrorCode> put_parts_internal(
         const std::string &key,
@@ -813,6 +849,11 @@ class RealClient : public PyClient {
     };
 
     void FreeAllocatedStoreSegment(AllocatedSegmentRecord &record);
+
+    std::vector<tl::expected<void, ErrorCode>>
+    batch_write_from_cuda_ipc_dummy_helper(
+        const std::vector<CudaIpcWriteRequest> &requests,
+        const ReplicateConfig &config, const UUID &client_id, bool is_upsert);
 
     std::unique_ptr<AutoPortBinder> port_binder_ = nullptr;
 

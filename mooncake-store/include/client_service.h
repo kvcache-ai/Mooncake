@@ -70,6 +70,10 @@ class Client {
    public:
     virtual ~Client();
 
+    using WriteBufferStager =
+        std::function<tl::expected<std::vector<Slice>, ErrorCode>(
+            const std::vector<Slice>&)>;
+
     const UUID& getClientId() const { return client_id_; }
     const std::string& tenant_id() const { return master_client_.tenant_id(); }
 
@@ -227,6 +231,10 @@ class Client {
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
         const ReplicateConfig& config);
+    std::vector<tl::expected<void, ErrorCode>> BatchPut(
+        const std::vector<ObjectKey>& keys,
+        std::vector<std::vector<Slice>>& batched_slices,
+        const ReplicateConfig& config, const WriteBufferStager& stager);
 
     /**
      * @brief Write slices into a memory replica at an object-byte offset.
@@ -280,6 +288,10 @@ class Client {
         const std::vector<ObjectKey>& keys,
         std::vector<std::vector<Slice>>& batched_slices,
         const ReplicateConfig& config);
+    std::vector<tl::expected<void, ErrorCode>> BatchUpsert(
+        const std::vector<ObjectKey>& keys,
+        std::vector<std::vector<Slice>>& batched_slices,
+        const ReplicateConfig& config, const WriteBufferStager& stager);
 
     /**
      * @brief Removes an object and all its replicas
@@ -856,6 +868,8 @@ class Client {
     void StartBatchPut(std::vector<PutOperation>& ops,
                        const ReplicateConfig& config);
     void ComputeBatchObjectChecksums(std::vector<PutOperation>& ops);
+    void StageWriteBuffersForRemoteReplicas(std::vector<PutOperation>& ops,
+                                            const WriteBufferStager& stager);
     void SubmitTransfers(std::vector<PutOperation>& ops);
     void WaitForTransfers(std::vector<PutOperation>& ops);
     void SubmitDfsWrites(std::vector<PutOperation>& ops);
@@ -871,8 +885,8 @@ class Client {
         const std::vector<const std::vector<Slice>*>& slice_lists,
         const std::vector<DistributedFSDescriptor>& descriptors);
 
-    std::vector<tl::expected<void, ErrorCode>> BatchPutWhenPreferSameNode(
-        std::vector<PutOperation>& ops);
+    std::vector<tl::expected<void, ErrorCode>> BatchWriteWhenPreferSameNode(
+        std::vector<PutOperation>& ops, bool is_upsert);
     std::vector<tl::expected<void, ErrorCode>> BatchGetWhenPreferSameNode(
         const std::vector<std::string>& object_keys,
         const std::vector<QueryResult>& query_results,

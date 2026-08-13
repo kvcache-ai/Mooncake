@@ -2493,6 +2493,30 @@ TEST_F(MasterServiceTest, LocalFirstPutPrefersWriterHost) {
               "segment_host1");
 }
 
+TEST_F(MasterServiceTest, PreferSameNodeUsesHostAwareLocalFirstPlacement) {
+    MasterService service;
+    const UUID writer_client_id = generate_uuid();
+
+    [[maybe_unused]] const auto host0 = PrepareSimpleSegment(
+        service, "segment_host0", 0x300000000, kDefaultSegmentSize, "host0");
+    [[maybe_unused]] const auto host1 = PrepareSimpleSegment(
+        service, "segment_host1", 0x400000000, kDefaultSegmentSize, "host1");
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    config.prefer_alloc_in_same_node = true;
+    config.host_id = "host1";
+
+    auto put_start = service.PutStart(writer_client_id, "prefer_same_node_key",
+                                      TenantId::Default(), 1024, config);
+    ASSERT_TRUE(put_start.has_value());
+    ASSERT_EQ(put_start->size(), 1u);
+    EXPECT_EQ((*put_start)[0]
+                  .get_memory_descriptor()
+                  .buffer_descriptor.transport_endpoint_,
+              "segment_host1");
+}
+
 TEST_F(MasterServiceTest, LocalFirstPutFallsBackToNextOrderedHost) {
     auto service_config =
         MasterServiceConfig::builder()
