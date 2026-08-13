@@ -69,6 +69,8 @@ docker_launch(){
             --shm-size=128g
             --stop-timeout=120
             -e CI_ACCELERATOR=rocm
+            -e PYTHONDONTWRITEBYTECODE=1
+            -e "PYTEST_ADDOPTS=-p no:cacheprovider"
             -e NCCL_GIN_TYPE=0
             -e "NCCL_IB_HCA=${MOONCAKE_RDMA_DEVICES:-ionic_0,ionic_1,ionic_2,ionic_3}"
             -e "NCCL_SOCKET_IFNAME=${MOONCAKE_RDMA_NETDEVS:-eth2,eth3,eth4,eth5}"
@@ -197,8 +199,25 @@ docker_launch(){
     fi
 
     if [ "${CI_ACCELERATOR:-cuda}" = "rocm" ]; then
-        rocm_rdma_cmd='if command -v ibv_devinfo >/dev/null 2>&1; then echo "standard RoCE userspace already present"; else apt-get update && apt-get install -y --no-install-recommends libibverbs1 ibverbs-providers ibverbs-utils librdmacm1 && rm -rf /var/lib/apt/lists/*; fi'
-        echo "Checking standard RoCE userspace"
+        local rocm_rdma_cmd="set -euo pipefail
+if command -v ibv_devinfo >/dev/null 2>&1 && ibv_devinfo >/dev/null 2>&1; then
+    echo 'ROCm RoCE userspace is functional'
+else
+    echo 'Installing AMD Pensando AINIC userspace ${AINIC_VERSION}'
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        apt-transport-https ca-certificates curl gnupg
+    install -d -m 0755 /etc/apt/keyrings
+    curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key \
+        | gpg --dearmor --yes --output /etc/apt/keyrings/amdainic.gpg
+    echo 'deb [arch=amd64 signed-by=/etc/apt/keyrings/amdainic.gpg] https://repo.radeon.com/amdainic/pensando/ubuntu/${AINIC_VERSION} ${ubuntu_codename} main' \
+        > /etc/apt/sources.list.d/amdainic.list
+    apt-get update
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ibverbs-utils ionic-common libionic-dev librdmacm1
+    rm -rf /var/lib/apt/lists/*
+fi"
+        echo "Checking ROCm RoCE userspace"
         if ! ${docker_exec} "${rocm_rdma_cmd}"; then
             echo "ERROR: Failed to install ROCm RoCE userspace" >&2
             return 1
@@ -544,7 +563,7 @@ for card, values in data.items():
     if card not in indices:
         continue
     for key, value in values.items():
-        if "Total Memory Used" in key:
+        if "VRAM Total Used Memory" in key:
             used.append(int(value) // (1024 * 1024))
 print(max(used) if used else -1)
 ' "${MOONCAKE_GPU_INDICES:-0,1,2,3}"
@@ -567,7 +586,7 @@ wait_gpu_idle() {
     while [ $elapsed -lt $max_seconds ]; do
         max_used=$(gpu_max_used_mb)
         if ! [[ "$max_used" =~ ^[0-9]+$ ]]; then
-            echo "ERROR: nvidia-smi query failed; cannot verify GPU drain" >&2
+            echo "ERROR: ${CI_ACCELERATOR:-CUDA} GPU memory query failed; cannot verify GPU drain" >&2
             return 1
         fi
         if [ "$max_used" -le "$threshold_mb" ]; then
