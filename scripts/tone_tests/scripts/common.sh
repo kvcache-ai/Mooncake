@@ -1,6 +1,6 @@
 #!/bin/bash
 
-TEST_CASE_RESULT_PATH="run/logs/$test_case_name"
+TEST_CASE_RESULT_PATH="run/logs/${test_case_name:-}"
 docker_exec="docker exec ${CONTAINER_NAME} bash -c"
 
 setup_directory(){
@@ -55,6 +55,7 @@ docker_launch(){
             --cap-add=CHOWN
             --cap-add=DAC_OVERRIDE
             --cap-add=FOWNER
+            --cap-add=IPC_LOCK
             --cap-add=SETGID
             --cap-add=SETUID
             # Mooncake queries page placement with move_pages(2) to select the
@@ -69,12 +70,15 @@ docker_launch(){
             --shm-size=128g
             --stop-timeout=120
             -e CI_ACCELERATOR=rocm
+            -e CI=true
             -e PYTHONDONTWRITEBYTECODE=1
+            -e PYTHONFAULTHANDLER=1
+            -e PYTHONUNBUFFERED=1
             -e "PYTEST_ADDOPTS=-p no:cacheprovider"
             -e NCCL_GIN_TYPE=0
             -e "NCCL_IB_HCA=${MOONCAKE_RDMA_DEVICES:-ionic_0,ionic_1,ionic_2,ionic_3}"
             -e "NCCL_SOCKET_IFNAME=${MOONCAKE_RDMA_NETDEVS:-eth2,eth3,eth4,eth5}"
-            -e "MOONCAKE_DEVICE=${MOONCAKE_RDMA_DEVICES:-ionic_0,ionic_1,ionic_2,ionic_3}"
+            -e "MOONCAKE_DEVICE=${MOONCAKE_TRANSFER_DEVICE:-ionic_0}"
             -e "MC_GID_INDEX=${MOONCAKE_GID_INDEX:-1}"
             -e MC_FORCE_HCA=1
             # The MI35x image enables a host-wide SGLang affinity heuristic.
@@ -86,6 +90,30 @@ docker_launch(){
             -v "${BASE_DIR}:/test_run"
             --entrypoint bash
         )
+        local host_libionic=""
+        if command -v ldconfig >/dev/null 2>&1; then
+            host_libionic=$(ldconfig -p 2>/dev/null | awk '/libionic[.]so[.]1/{print $NF; exit}')
+        fi
+        if [ -z "$host_libionic" ]; then
+            local ionic_candidate
+            for ionic_candidate in \
+                /usr/lib/x86_64-linux-gnu/libionic.so.1 \
+                /lib/x86_64-linux-gnu/libionic.so.1; do
+                if [ -r "$ionic_candidate" ]; then
+                    host_libionic=$ionic_candidate
+                    break
+                fi
+            done
+        fi
+        if [ -n "$host_libionic" ]; then
+            host_libionic=$(readlink -f "$host_libionic")
+        fi
+        if [ -n "$host_libionic" ] && [ -r "$host_libionic" ]; then
+            echo "Using host-matched Ionic provider library: $host_libionic"
+            docker_args+=(-v "${host_libionic}:/opt/mooncake-host-rdma/libionic.so.1:ro")
+        else
+            echo "WARNING: Host libionic.so.1 is unavailable; ROCm images must provide a compatible Ionic provider" >&2
+        fi
         local -a render_nodes
         read -r -a render_nodes <<<"${MOONCAKE_RENDER_DEVICES:-}"
         if [ "${#render_nodes[@]}" -ne 4 ]; then
@@ -195,9 +223,13 @@ docker_launch(){
 
     if [ "${CI_ACCELERATOR:-cuda}" = "rocm" ]; then
         local rocm_rdma_cmd="set -euo pipefail
-if command -v ibv_devinfo >/dev/null 2>&1 && ibv_devinfo >/dev/null 2>&1; then
+rdma_ready=false
+if command -v ibv_devinfo >/dev/null 2>&1 && ibv_devinfo >/tmp/mooncake-ibv-devinfo.log 2>&1; then
+    rdma_ready=true
     echo 'ROCm RoCE userspace is functional'
 else
+    echo 'Initial ibv_devinfo failure:' >&2
+    cat /tmp/mooncake-ibv-devinfo.log >&2 2>/dev/null || true
     echo 'Installing AMD Pensando AINIC userspace ${AINIC_VERSION}'
     apt-get update
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -211,6 +243,25 @@ else
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
         ibverbs-utils ionic-common libionic-dev librdmacm1
     rm -rf /var/lib/apt/lists/*
+fi
+
+if [ \"\$rdma_ready\" != true ] && [ -r /opt/mooncake-host-rdma/libionic.so.1 ]; then
+    echo 'Overlaying host-matched Ionic provider library'
+    install -m 0644 /opt/mooncake-host-rdma/libionic.so.1 \
+        /usr/lib/x86_64-linux-gnu/libionic-host.so.1
+    ln -sfn libionic-host.so.1 /usr/lib/x86_64-linux-gnu/libionic.so.1
+    ln -sfn libionic-host.so.1 /usr/lib/x86_64-linux-gnu/libionic.so
+
+    verbs_abi=\$(find /usr/lib/x86_64-linux-gnu/libibverbs -maxdepth 1 \
+        -type f -o -type l 2>/dev/null \
+        | sed -n 's/.*-rdmav\([0-9][0-9]*\)[.]so$/\1/p' | head -n 1)
+    if [ -n \"\$verbs_abi\" ]; then
+        ln -sfn ../libionic.so.1 \
+            /usr/lib/x86_64-linux-gnu/libibverbs/libionic-rdmav\${verbs_abi}.so
+    else
+        echo 'WARNING: Unable to determine the container libibverbs provider ABI' >&2
+    fi
+    ldconfig
 fi"
         echo "Checking ROCm RoCE userspace"
         if ! ${docker_exec} "${rocm_rdma_cmd}"; then
@@ -227,14 +278,28 @@ fi"
         fi
     fi
 
-    echo "Checking RDMA devices"
-    echo "Executing ibv_devinfo check command:"
-    echo "ibv_devinfo"
-    if ! ${docker_exec} "ibv_devinfo" >/dev/null 2>&1; then
-        echo "ibv_devinfo execution failed" >&2
+    echo "Checking RDMA device ${MOONCAKE_TRANSFER_DEVICE:-ionic_0}"
+    local rdma_device=${MOONCAKE_TRANSFER_DEVICE:-ionic_0}
+    if ! [[ "$rdma_device" =~ ^[a-zA-Z0-9_.-]+$ ]]; then
+        echo "ERROR: Invalid MOONCAKE_TRANSFER_DEVICE: $rdma_device" >&2
+        return 1
+    fi
+    local rdma_preflight_cmd="set -e
+echo '=== ibv_devinfo ==='
+ibv_devinfo -d '${rdma_device}'
+echo '=== RDMA link state ==='
+if command -v rdma >/dev/null 2>&1; then rdma link show; fi
+state=\$(cat '/sys/class/infiniband/${rdma_device}/ports/1/state')
+echo '${rdma_device} port 1 state:' \"\$state\"
+case \"\$state\" in *ACTIVE*) ;; *) echo 'RDMA port is not active' >&2; exit 1;; esac
+gid=\$(cat '/sys/class/infiniband/${rdma_device}/ports/1/gids/${MOONCAKE_GID_INDEX:-1}')
+echo '${rdma_device} GID index ${MOONCAKE_GID_INDEX:-1}:' \"\$gid\"
+case \"\$gid\" in ''|'::'|'0:0:0:0:0:0:0:0') echo 'RDMA GID is empty' >&2; exit 1;; esac"
+    if ! ${docker_exec} "${rdma_preflight_cmd}"; then
+        echo "RDMA preflight failed for $rdma_device" >&2
         return 1
     else
-        echo "ibv_devinfo execution successful"
+        echo "RDMA preflight successful"
     fi
 
     # install mooncake and upgrade sglang
@@ -737,40 +802,42 @@ setup_node_env() {
 }
 
 launch_and_track_process() {
-    local full_cmd="$1"
-    local grep_pattern="$2"
-    local pid_file="$3"
+    local process_cmd=$1
+    local log_path=$2
+    local pid_file=$3
+    local escaped_cmd escaped_log launch_cmd container_pid process_group
 
-    echo "Executing command..."
-    echo "$full_cmd"
-    eval "$full_cmd"
+    printf -v escaped_cmd '%q' "$process_cmd"
+    printf -v escaped_log '%q' "$log_path"
+    launch_cmd="setsid bash -c ${escaped_cmd} > ${escaped_log} 2>&1 < /dev/null & echo \$!"
 
-    echo "Waiting for process to initialize..."
+    echo "Executing command in a dedicated container process group..."
+    echo "$process_cmd"
+    container_pid=$(docker exec "${CONTAINER_NAME}" bash -c "$launch_cmd") || {
+        echo "ERROR: Failed to launch process in ${CONTAINER_NAME}" >&2
+        return 1
+    }
+    container_pid=$(printf '%s\n' "$container_pid" | tail -n 1 | tr -d '[:space:]')
+    if ! [[ "$container_pid" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: Invalid container PID returned by launcher: $container_pid" >&2
+        return 1
+    fi
+
     for i in {1..15}; do
-        local container_main_pid=$(docker inspect --format '{{.State.Pid}}' "${CONTAINER_NAME}" 2>/dev/null)
-        if [ -n "$container_main_pid" ] && [ "$container_main_pid" != "0" ]; then
-            pid=$(ps -eo pid,ppid,cmd | awk -v root="$container_main_pid" -v pattern="$grep_pattern" '
-                BEGIN { pids[root] = 1 }
-                {
-                    if ($2 in pids && $0 ~ pattern) {
-                        print $1
-                        exit
-                    }
-                }
-            ')
-        fi
-
-        if [ -n "$pid" ]; then
-            echo "$pid" > "$pid_file"
-            echo "PID $pid (on host) saved to $pid_file"
+        process_group=$(docker exec "${CONTAINER_NAME}" \
+            ps -o pgid= -p "$container_pid" 2>/dev/null | tr -d '[:space:]')
+        if [[ "$process_group" =~ ^[0-9]+$ ]]; then
+            mkdir -p "$(dirname "$pid_file")"
+            echo "$process_group" > "$pid_file"
+            echo "Container process group $process_group saved to $pid_file"
             return 0
         fi
         
-        echo "  Attempt $i/15..."
+        echo "  Waiting for process group... ($i/15)"
         sleep 2
     done
 
-    echo "Process not found after 30 seconds"
+    echo "ERROR: Container process group not found after 30 seconds" >&2
     return 1
 }
 
@@ -783,22 +850,59 @@ kill_process() {
         return 0
     fi
 
-    local pid=$(cat "$pid_file")
-    if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+    local process_group
+    process_group=$(tr -d '[:space:]' < "$pid_file")
+    if ! [[ "$process_group" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: Invalid process group in $pid_file" >&2
+        rm -f "$pid_file"
+        return 1
+    fi
+
+    if ! docker exec "${CONTAINER_NAME}" bash -c \
+        "kill -0 -- -${process_group} 2>/dev/null"; then
         rm -f "$pid_file"
         return 0
     fi
 
-    echo "Stopping $service_name (PID: $pid)..."
-    
-    kill -TERM "$pid" 2>/dev/null
+    echo "Stopping $service_name (container process group: $process_group)..."
+    docker exec "${CONTAINER_NAME}" bash -c \
+        "kill -TERM -- -${process_group} 2>/dev/null || true"
+    local attempt
+    for attempt in {1..15}; do
+        if ! docker exec "${CONTAINER_NAME}" bash -c \
+            "kill -0 -- -${process_group} 2>/dev/null"; then
+            rm -f "$pid_file"
+            echo "✓ $service_name stopped"
+            return 0
+        fi
+        sleep 2
+    done
+
+    echo "Process group $process_group did not stop after SIGTERM; sending SIGKILL" >&2
+    docker exec "${CONTAINER_NAME}" bash -c \
+        "kill -KILL -- -${process_group} 2>/dev/null || true"
     sleep 2
-    if kill -0 "$pid" 2>/dev/null; then
-        kill -KILL "$pid" 2>/dev/null
+    if docker exec "${CONTAINER_NAME}" bash -c \
+        "kill -0 -- -${process_group} 2>/dev/null"; then
+        echo "ERROR: $service_name process group $process_group survived SIGKILL" >&2
+        return 1
     fi
     
     rm -f "$pid_file"
     echo "✓ $service_name stopped"
+    return 0
+}
+
+verify_model_processes_stopped() {
+    local process_pattern='sglang[.]launch_server|sglang_router[.]launch_router|sglang::router|vllm[.]entrypoints[.]openai[.]api_server|mooncake_connector_proxy[.]py|toy_proxy_server[.]py'
+    local remaining
+    remaining=$(docker exec "${CONTAINER_NAME}" bash -c \
+        "ps -eo pid,ppid,pgid,stat,args | grep -E '${process_pattern}' | grep -v grep" 2>/dev/null || true)
+    if [ -n "$remaining" ]; then
+        echo "ERROR: Model processes remain in ${CONTAINER_NAME}:" >&2
+        echo "$remaining" >&2
+        return 1
+    fi
     return 0
 }
 
@@ -924,23 +1028,32 @@ cleanup_model_processes() {
     local test_case_name=$2
     
     echo "===== Killing model processes ====="
+    local cleanup_failed=false
     
     if [ -d "$pid_dir" ]; then
         echo "Cleaning up by PID files in $pid_dir..."
         for pid_file in "${pid_dir}"/*.pid; do
             if [ -f "$pid_file" ]; then
                 local service_name=$(basename "$pid_file" .pid)
-                kill_process "$pid_file" "$service_name"
+                kill_process "$pid_file" "$service_name" || cleanup_failed=true
             fi
         done
     fi
     
+    verify_model_processes_stopped || cleanup_failed=true
+
     if [ "$ISREMOTE" == "0" ] && [ -n "$REMOTE_IP" ]; then
         echo "===== Killing model processes (remote: $REMOTE_IP) ====="
-        ${SSH_CMD} "${REMOTE_SSH_TARGET:-$REMOTE_IP}" "source $REMOTE_TEST_DIR/run/.shrc; cd \$BASE_DIR/scripts && ./$test_case_name.sh stop_server" 2>/dev/null || true
+        if ! ${SSH_CMD} "${REMOTE_SSH_TARGET:-$REMOTE_IP}" \
+            "source $REMOTE_TEST_DIR/run/.shrc; cd \$BASE_DIR/scripts && ./$test_case_name.sh stop_server"; then
+            echo "ERROR: Remote model-process cleanup failed" >&2
+            cleanup_failed=true
+        fi
     fi
     
     echo "Process cleanup completed."
+    $cleanup_failed && return 1
+    return 0
 }
 
 collect_remote_log_file() {
@@ -1206,7 +1319,7 @@ launch_sglang_server() {
     fi
     
     local offline_prefix=$(hf_offline_prefix "$model_path")
-    local sglang_cmd="${docker_exec} \"${offline_prefix}python -m sglang.launch_server --model-path ${model_path} --host ${host} --port ${port}"
+    local sglang_cmd="${offline_prefix}exec python -m sglang.launch_server --model-path ${model_path} --host ${host} --port ${port}"
     if [ -n "$extra_args" ]; then
         sglang_cmd="${sglang_cmd} ${extra_args}"
     fi
@@ -1216,13 +1329,10 @@ launch_sglang_server() {
     fi
     
 
-    sglang_cmd="${sglang_cmd} > ${log_path} 2>&1 &\""
-    
     local pid_file="${PID_DIR}/server_${pid_suffix}.pid"
-    local grep_pattern="python -m sglang.launch_server.*${model_path}"
     
     echo "Starting SGLang Server..."
-    if ! launch_and_track_process "$sglang_cmd" "$grep_pattern" "$pid_file"; then
+    if ! launch_and_track_process "$sglang_cmd" "$log_path" "$pid_file"; then
         return 1
     fi
     
@@ -1262,20 +1372,17 @@ launch_vllm_server() {
     fi
     env_prefix="${env_prefix}$(hf_offline_prefix "$model_path")"
     
-    local vllm_cmd="${docker_exec} \"${env_prefix}python3 -m vllm.entrypoints.openai.api_server --model '${model_path}' --host '${host}' --port ${port}"
+    local vllm_cmd="${env_prefix}exec python3 -m vllm.entrypoints.openai.api_server --model '${model_path}' --host '${host}' --port ${port}"
     
     if [ -n "$extra_args" ]; then
         vllm_cmd="${vllm_cmd} ${extra_args}"
     fi
     
-    vllm_cmd="${vllm_cmd} > '${log_path}' 2>&1 &\""
-    
     local pid_file="${PID_DIR}/server_${pid_suffix}.pid"
-    local grep_pattern="python3 -m vllm.entrypoints.openai.api_server.*${model_path}"
     
     echo "Starting vLLM Server..."
     echo "Command: $vllm_cmd"
-    if ! launch_and_track_process "$vllm_cmd" "$grep_pattern" "$pid_file"; then
+    if ! launch_and_track_process "$vllm_cmd" "$log_path" "$pid_file"; then
         return 1
     fi
     
@@ -1307,19 +1414,16 @@ launch_sglang_router() {
     
     echo "===== Starting SGLang Router ====="
     
-    local router_cmd="${docker_exec} \"python3 -m sglang_router.launch_router --pd-disaggregation --prefill ${prefill_url} --decode ${decode_url} --host ${host} --port ${port}"
+    local router_cmd="exec python3 -m sglang_router.launch_router --pd-disaggregation --prefill ${prefill_url} --decode ${decode_url} --host ${host} --port ${port}"
     if [ -n "$extra_args" ]; then
         router_cmd="${router_cmd} ${extra_args}"
     fi
     
-    router_cmd="${router_cmd} > ${log_path} 2>&1 &\""
-    
     local pid_file="${PID_DIR}/proxy.pid"
-    local grep_pattern="sglang::router"
     
     echo "Load balancer starting..."
     echo "Command: $router_cmd"
-    if ! launch_and_track_process "$router_cmd" "$grep_pattern" "$pid_file"; then
+    if ! launch_and_track_process "$router_cmd" "$log_path" "$pid_file"; then
         return 1
     fi
     
