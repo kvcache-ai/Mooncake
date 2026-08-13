@@ -132,12 +132,11 @@ class RealClient : public PyClient {
     /**
      * @brief Get object data directly into a pre-allocated buffer
      * @param key Key of the object to get
-     * @param buffer Pointer to a writable Store buffer, either explicitly
-     * registered with register_buffer() or inside the setup-time local buffer
+     * @param buffer Pointer to a writable Store buffer
      * @param size Size of the buffer
      * @return Number of bytes read on success, negative value on error
-     * @note The buffer address must resolve to Store-managed registered memory
-     * for zero-copy operations
+     * @note Direct RDMA reads require register_buffer() or the setup-time local
+     * buffer. NVLink can read directly into an ordinary device allocation.
      */
     int64_t get_into(const std::string &key, void *buffer, size_t size);
 
@@ -1082,6 +1081,10 @@ class RealClient : public PyClient {
 
    private:
     friend class EgmStorePoolTestPeer;
+    friend class DirectGpuReadTest;
+
+    bool can_use_direct_memory_read(const Replica::Descriptor &replica,
+                                    void *buffer, size_t size) const;
 
     using TransferEngineFactory =
         std::function<tl::expected<std::shared_ptr<TransferEngine>, ErrorCode>(
