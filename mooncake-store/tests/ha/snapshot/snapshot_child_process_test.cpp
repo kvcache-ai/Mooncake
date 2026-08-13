@@ -750,6 +750,7 @@ TEST_F(SnapshotChildProcessTest, RestorePreservesAgentHintsMetadata) {
         service_
             ->PutEnd(client_id, key, TenantId::Default(), ReplicaType::MEMORY)
             .has_value());
+    ASSERT_TRUE(service_->ExistKey(key, TenantId::Default()).value_or(false));
 
     auto persist_result = CallPersistState("20240701_140000_000");
     ASSERT_TRUE(persist_result.has_value())

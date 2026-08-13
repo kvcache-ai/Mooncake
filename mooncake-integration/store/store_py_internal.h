@@ -861,7 +861,8 @@ bool parallelism_specs_equal_by_kind(const TensorParallelismSpec &lhs,
 }
 
 bool is_default_replicate_config(const ReplicateConfig &config) {
-    return config.replica_num == 1 &&
+    return config.replica_num == 1 && config.nof_replica_num == 0 &&
+           config.dfs_replica_num == 0 &&
            config.soft_pin_action == SoftPinAction::PRESERVE &&
            !config.soft_pin_ttl_ms.has_value() && !config.with_hard_pin &&
            config.preferred_segments.empty() &&

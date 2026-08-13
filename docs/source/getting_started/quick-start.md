@@ -125,4 +125,4 @@ allocation strategies, SSD offload, and runtime tuning, continue to the
 [Mooncake Store Deployment & Tuning Guide](../deployment/mooncake-store-deployment-guide.md).
 
 For API details, see the [Mooncake Store Python API](../api-reference/python/mooncake-store.md)
-and [Mooncake Store design](../design/mooncake-store.md).
+and [Mooncake Store design](../design/store/mooncake-store.md).

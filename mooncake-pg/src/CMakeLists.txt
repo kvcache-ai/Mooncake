@@ -119,6 +119,7 @@ set_target_properties(
   PROPERTIES POSITION_INDEPENDENT_CODE ON
              BUILD_RPATH "$ORIGIN"
              BUILD_RPATH_USE_ORIGIN YES)
+target_link_libraries(mooncake_pg_device PRIVATE yalantinglibs::yalantinglibs)
 
 add_library(mooncake_pg SHARED
     control_plane/link_manager.cpp

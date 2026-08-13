@@ -411,10 +411,8 @@ MasterScenario& MasterScenario::Then(TenantQuotaSpec tenant_quota) {
     }
 
     const auto matches = [&tenant_quota](const TenantQuotaSnapshot& value) {
-        return (!tenant_quota.used_bytes.has_value() ||
-                value.used_bytes == *tenant_quota.used_bytes) &&
-               (!tenant_quota.reserved_bytes.has_value() ||
-                value.reserved_bytes == *tenant_quota.reserved_bytes);
+        return !tenant_quota.charged_bytes.has_value() ||
+               value.charged_bytes == *tenant_quota.charged_bytes;
     };
     const auto deadline =
         std::chrono::steady_clock::now() + tenant_quota.eventual_timeout;
@@ -428,17 +426,11 @@ MasterScenario& MasterScenario::Then(TenantQuotaSpec tenant_quota) {
         }
     }
 
-    if (tenant_quota.used_bytes.has_value() &&
-        snapshot->used_bytes != *tenant_quota.used_bytes) {
-        Fail("TenantQuota(" + tenant_quota.tenant + ") uses " +
-             std::to_string(snapshot->used_bytes) + "; expected " +
-             std::to_string(*tenant_quota.used_bytes));
-    }
-    if (tenant_quota.reserved_bytes.has_value() &&
-        snapshot->reserved_bytes != *tenant_quota.reserved_bytes) {
-        Fail("TenantQuota(" + tenant_quota.tenant + ") reserves " +
-             std::to_string(snapshot->reserved_bytes) + "; expected " +
-             std::to_string(*tenant_quota.reserved_bytes));
+    if (tenant_quota.charged_bytes.has_value() &&
+        snapshot->charged_bytes != *tenant_quota.charged_bytes) {
+        Fail("TenantQuota(" + tenant_quota.tenant + ") charges " +
+             std::to_string(snapshot->charged_bytes) + "; expected " +
+             std::to_string(*tenant_quota.charged_bytes));
     }
     return *this;
 }

@@ -151,11 +151,13 @@ int AscendDirectTransport::allocateLocalSegmentID() {
 
     agent_mode_ = globalConfig().ascend_agent_mode;
     roce_mode_ = IsRoceModeEnabled();
-    // Only a Store-init TE may use fabric mem; gate on ascend_store_te_init so
-    // a P2P/HCCS TE does not inherit a Store TE's fabric flag left in the
-    // process-global config.
-    use_fabric_mem_ = globalConfig().ascend_use_fabric_mem &&
-                      globalConfig().ascend_store_te_init;
+    // Store path: ASCEND_ENABLE_USE_FABRIC_MEM sets the process-global flag,
+    // gated on ascend_store_te_init so a P2P TE does not inherit it.
+    // Normal/P2P path: enable when the resolved ASCEND_GLOBAL_RESOURCE_CONFIG
+    // for this TE role contains fabric_memory (flat or nested).
+    use_fabric_mem_ = (globalConfig().ascend_use_fabric_mem &&
+                       globalConfig().ascend_store_te_init) ||
+                      IsFabricMemEnabledFromGlobalResourceConfig();
     LOG(INFO) << "[AscendTE] init local segment, te is created for store="
               << (globalConfig().ascend_store_te_init ? "true" : "false")
               << ", roce_mode=" << (roce_mode_ ? "true" : "false")
