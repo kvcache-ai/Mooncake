@@ -268,30 +268,31 @@ class Buffer:
             # export also avoids unnecessary driver IPC calls on MACA.
             self._use_fallback = False
             return
-        if not self.runtime.p2p_enabled():
-            return
-        try:
-            local_handle_ints = self.runtime.get_ipc_handle()
-            # pybind11 converts std::vector<int32_t> to a list of integers
-            local_handle_tensor = torch.tensor(
-                local_handle_ints, dtype=torch.int32, device="cuda"
-            )
-            handles = [
-                torch.empty(len(local_handle_ints), dtype=torch.int32, device="cuda")
-                for _ in range(self.group_size)
-            ]
-            dist.all_gather(handles, local_handle_tensor, self.group)
-            remote_handles = [h.tolist() for h in handles]
-            active_ranks_mask = self._active_ranks_list(torch.device("cuda"))
-            self.runtime.sync_nvlink_ipc_handles(remote_handles, active_ranks_mask)
-        except Exception as e:
-            import warnings
+        if self.runtime.p2p_enabled():
+            try:
+                local_handle_ints = self.runtime.get_ipc_handle()
+                # pybind11 converts std::vector<int32_t> to a list of integers
+                local_handle_tensor = torch.tensor(
+                    local_handle_ints, dtype=torch.int32, device="cuda"
+                )
+                handles = [
+                    torch.empty(len(local_handle_ints), dtype=torch.int32, device="cuda")
+                    for _ in range(self.group_size)
+                ]
+                dist.all_gather(handles, local_handle_tensor, self.group)
+                remote_handles = [h.tolist() for h in handles]
+                active_ranks_mask = self._active_ranks_list(torch.device("cuda"))
+                self.runtime.sync_nvlink_ipc_handles(remote_handles, active_ranks_mask)
+            except Exception as e:
+                import warnings
 
-            warnings.warn(
-                f"[Rank {self.rank}] Failed to exchange IPC handles: {e}. Falling back.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
+                warnings.warn(
+                    f"[Rank {self.rank}] Failed to exchange IPC handles: {e}. Falling back.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+        else:
+            return
 
         use_fast_path = False
         try:
