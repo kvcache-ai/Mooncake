@@ -108,6 +108,7 @@ When this variable is set, the `mooncake::TransferEngine` class internally deleg
 
 Passing a NIC priority matrix through `installTransport(..., args)` is **not** supported under TENT. Configure custom topology via `MC_TENT_CONF` or `MC_CUSTOM_TOPO_JSON` instead (see below).
 
+(custom-nic-priority-matrix)=
 ### Custom NIC Priority Matrix
 
 TENT accepts the same classic Transfer Engine priority-matrix JSON format:
