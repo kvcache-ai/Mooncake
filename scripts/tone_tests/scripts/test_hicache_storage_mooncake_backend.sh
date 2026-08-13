@@ -48,7 +48,8 @@ run_test()
     ${docker_exec} "\
         export PYTHONPATH=/sgl-workspace/sglang/test/registered/hicache:\$PYTHONPATH && \
         cd /test_run/python && \
-        python3 -m pytest test_hicache_storage_mooncake_backend.py -v -s --tb=long" | tee "$log_file"
+        python3 -m pytest test_hicache_storage_mooncake_backend.py -v -s --tb=long" \
+        2>&1 | tee "$log_file"
 
     local test_exit_code=${PIPESTATUS[0]}
     if [ "$test_exit_code" -ne 0 ]; then

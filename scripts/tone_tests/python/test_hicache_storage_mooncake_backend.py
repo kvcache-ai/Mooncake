@@ -73,6 +73,21 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
         print("\n===== SGLang server failure diagnostics =====")
         print(f"test_class={cls.__name__} model={getattr(cls, 'model', 'unknown')}")
 
+        process = getattr(cls, "process", None)
+        if process is not None:
+            print(
+                f"server_pid={getattr(process, 'pid', 'unknown')} "
+                f"returncode={process.poll()}"
+            )
+            status_path = f"/proc/{process.pid}/status"
+            if os.path.isfile(status_path):
+                print(f"\n--- {status_path} ---")
+                try:
+                    with open(status_path) as status_file:
+                        print(status_file.read().rstrip())
+                except OSError as error:
+                    print(f"Unable to read {status_path}: {error}")
+
         for path in DIAGNOSTIC_FILES:
             if not os.path.isfile(path):
                 continue

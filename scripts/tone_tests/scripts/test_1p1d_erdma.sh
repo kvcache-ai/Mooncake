@@ -113,8 +113,10 @@ run_single_model()
     fi
 
     echo "===== Cleaning up model processes for $model_name ====="
-    kill_model_processes
-    sleep 2
+    if ! kill_model_processes; then
+        echo "ERROR: Model process cleanup failed for $model_name" >&2
+        status=1
+    fi
 
     return $status
 }
@@ -132,10 +134,17 @@ run_test()
     fi
 
     local test_failed=false
+    local model_index=0
+    local model_count=${#SUPPORT_MODELS[@]}
     for model in "${SUPPORT_MODELS[@]}"; do
+        model_index=$((model_index + 1))
         if ! run_single_model "$model"; then
             echo "ERROR: Test case $test_case_name failed for model $model"
             test_failed=true
+        fi
+        if [ "$model_index" -lt "$model_count" ] && ! drain_gpu_between_tests; then
+            echo "ERROR: Failed to isolate the next model from $model" >&2
+            return 1
         fi
     done
 
@@ -169,7 +178,7 @@ case "$1" in
         ;;
     "stop_server")
         kill_model_processes
-        exit 0
+        exit $?
         ;;
     *)
         if [ "${BASH_SOURCE[0]}" == "${0}" ]; then

@@ -207,8 +207,10 @@ run_single_model()
     fi
 
     echo "===== Cleaning up model processes for $model_name ====="
-    kill_model_processes
-    sleep 2
+    if ! kill_model_processes; then
+        echo "ERROR: Model process cleanup failed for $model_name" >&2
+        status=1
+    fi
 
     return $status
 }
@@ -260,7 +262,7 @@ case "$1" in
         ;;
     "stop_server")
         kill_model_processes
-        exit 0
+        exit $?
         ;;
     *)
         if [ "${BASH_SOURCE[0]}" == "${0}" ]; then

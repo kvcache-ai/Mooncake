@@ -7,6 +7,31 @@ TEST_TYPE="single"
 BASE_DIR=${BASE_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && cd .. && pwd)}
 . ${BASE_DIR}/scripts/common.sh
 
+collect_failure_diagnostics()
+{
+    local log_file=$1
+
+    {
+        echo
+        echo "===== MoE host failure diagnostics ====="
+        date -u '+timestamp=%Y-%m-%dT%H:%M:%SZ'
+        free -h 2>&1 || true
+        docker inspect --format \
+            'state={{json .State}} restart_count={{.RestartCount}}' \
+            "$CONTAINER_NAME" 2>&1 || true
+        docker stats --no-stream --format \
+            'name={{.Name}} memory={{.MemUsage}} memory_percent={{.MemPerc}} pids={{.PIDs}}' \
+            "$CONTAINER_NAME" 2>&1 || true
+        docker top "$CONTAINER_NAME" -eo pid,ppid,stat,rss,vsz,comm,args 2>&1 || true
+        if command -v journalctl >/dev/null 2>&1; then
+            journalctl -k --since '-15 minutes' --no-pager 2>&1 | tail -n 200 || true
+        elif command -v dmesg >/dev/null 2>&1; then
+            dmesg --ctime 2>&1 | tail -n 200 || true
+        fi
+        echo "===== End MoE host failure diagnostics ====="
+    } | tee -a "$log_file"
+}
+
 run_test()
 { 
     echo "===== Running pytest tests ====="
@@ -26,9 +51,14 @@ run_test()
     ${docker_exec} "\
         export PYTHONPATH=/sgl-workspace/sglang:\$PYTHONPATH && \
         cd /test_run/python && \
-        ${offline_prefix}python3 -m pytest test_moe_mooncake.py -v -s --tb=long" | tee "$log_file"
+        ${offline_prefix}python3 -m pytest test_moe_mooncake.py -v -s --tb=long" \
+        2>&1 | tee "$log_file"
 
-    return ${PIPESTATUS[0]}
+    local test_exit_code=${PIPESTATUS[0]}
+    if [ "$test_exit_code" -ne 0 ]; then
+        collect_failure_diagnostics "$log_file"
+    fi
+    return "$test_exit_code"
 }
 
 parse()
