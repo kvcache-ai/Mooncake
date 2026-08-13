@@ -26,6 +26,7 @@ class DynamicReplicationTest : public ::testing::Test {
 
     struct MountedSegmentContext {
         UUID client_id;
+        UUID segment_id;
         std::string segment_name;
     };
 
@@ -40,7 +41,9 @@ class DynamicReplicationTest : public ::testing::Test {
         UUID client_id = generate_uuid();
         auto mount_result = service.MountSegment(segment, client_id);
         EXPECT_TRUE(mount_result.has_value());
-        return {.client_id = client_id, .segment_name = segment.name};
+        return {.client_id = client_id,
+                .segment_id = segment.id,
+                .segment_name = segment.name};
     }
 
     void PutObject(MasterService& service, const UUID& client_id,
@@ -115,6 +118,24 @@ class DynamicReplicationTest : public ::testing::Test {
         return false;
     }
 
+    bool HasIncompleteDynamicReplica(MasterService& service,
+                                     const std::string& key,
+                                     const std::string& target_segment) const {
+        MasterService::MetadataAccessorRO accessor(
+            &service, MasterService::ObjectIdentity{TenantId::Default(), key});
+        EXPECT_TRUE(accessor.Exists());
+        if (!accessor.Exists()) {
+            return false;
+        }
+        return std::any_of(accessor.Get().dynamic_replicas.begin(),
+                           accessor.Get().dynamic_replicas.end(),
+                           [&target_segment](const auto& entry) {
+                               return entry.second.target_segment ==
+                                          target_segment &&
+                                      !entry.second.complete;
+                           });
+    }
+
     void BumpVersionEpoch(MasterService& service,
                           const std::string& key) const {
         MasterService::MetadataAccessorRW accessor(
@@ -134,6 +155,20 @@ class DynamicReplicationTest : public ::testing::Test {
         return tenant_state.dynamic_replication_pending.contains(key) ||
                tenant_state.dynamic_replication_cooldowns.contains(key) ||
                has_lease;
+    }
+
+    size_t DynamicReplicationWindowEntryLimit() const {
+        return MasterService::kDynamicReplicationWindowEntryLimit;
+    }
+
+    size_t DynamicReplicationWindowCount(MasterService& service) const {
+        return service.dynamic_replication_windows_.size();
+    }
+
+    bool ObserveDynamicReplicationAccess(MasterService& service,
+                                         const std::string& key) const {
+        return service.ObserveDynamicReplicationAccess(
+            MasterService::ObjectIdentity{TenantId::Default(), key});
     }
 
     size_t EvictReplicaOnSegment(MasterService& service, const std::string& key,
@@ -466,6 +501,59 @@ TEST_F(DynamicReplicationTest, ReaderLocalPromotionRejectsWrongClient) {
         lease->source_segment, {lease->target_segment});
     ASSERT_FALSE(copy_start.has_value());
     EXPECT_EQ(copy_start.error(), ErrorCode::ILLEGAL_CLIENT);
+}
+
+TEST_F(DynamicReplicationTest,
+       CopyEndForInvalidTargetClearsIncompleteDynamicReplica) {
+    MasterServiceConfig config;
+    config.dynamic_replication_mode = "enforce";
+    config.dynamic_replication_max_memory_replicas = 2;
+    MasterService service(config);
+
+    auto source = PrepareSegment(service, "segment_0", 0xd70000000);
+    auto target = PrepareSegment(service, "segment_1", 0xd80000000);
+    PutObject(service, source.client_id, "invalid-target-key",
+              source.segment_name);
+
+    auto proposal =
+        BuildProposal(service, "invalid-target-key", target.segment_name);
+    auto lease = service.SubmitReplicaActionProposal(proposal);
+    ASSERT_TRUE(lease.has_value());
+
+    auto copy_start = service.CopyStart(
+        source.client_id, "invalid-target-key", TenantId::Default(),
+        lease->source_segment, {lease->target_segment});
+    ASSERT_TRUE(copy_start.has_value());
+    ASSERT_TRUE(HasIncompleteDynamicReplica(service, "invalid-target-key",
+                                            lease->target_segment));
+
+    ASSERT_TRUE(service.UnmountSegment(target.segment_id, target.client_id)
+                    .has_value());
+
+    auto copy_end = service.CopyEnd(source.client_id, "invalid-target-key",
+                                    TenantId::Default());
+    ASSERT_FALSE(copy_end.has_value());
+    EXPECT_EQ(copy_end.error(), ErrorCode::REPLICA_IS_GONE);
+    EXPECT_FALSE(HasIncompleteDynamicReplica(service, "invalid-target-key",
+                                             lease->target_segment));
+    EXPECT_FALSE(HasDynamicState(service, "invalid-target-key"));
+}
+
+TEST_F(DynamicReplicationTest, ObserveWindowDropsNewKeysAtEntryLimit) {
+    MasterServiceConfig config;
+    config.dynamic_replication_mode = "observe";
+    MasterService service(config);
+
+    for (size_t i = 0; i < DynamicReplicationWindowEntryLimit(); ++i) {
+        ObserveDynamicReplicationAccess(service,
+                                        "window-key-" + std::to_string(i));
+    }
+    EXPECT_EQ(DynamicReplicationWindowCount(service),
+              DynamicReplicationWindowEntryLimit());
+
+    ObserveDynamicReplicationAccess(service, "window-overflow-key");
+    EXPECT_EQ(DynamicReplicationWindowCount(service),
+              DynamicReplicationWindowEntryLimit());
 }
 
 TEST_F(DynamicReplicationTest, CopyStartRejectsVersionMismatch) {

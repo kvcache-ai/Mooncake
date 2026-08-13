@@ -3827,7 +3827,8 @@ tl::expected<void, ErrorCode> Client::PromoteDynamicReplicaFromReadBuffer(
     }
 
     auto revoke_copy = [&]() {
-        auto revoke_result = master_client_.CopyRevoke(lease.key, lease.tenant_id);
+        auto revoke_result =
+            master_client_.CopyRevoke(lease.key, lease.tenant_id);
         if (!revoke_result.has_value()) {
             LOG(WARNING) << "action=reader_local_promote_revoke_failed"
                          << ", key=" << lease.key
@@ -3835,9 +3836,9 @@ tl::expected<void, ErrorCode> Client::PromoteDynamicReplicaFromReadBuffer(
         }
     };
 
-    auto start_result = master_client_.CopyStart(
-        lease.key, lease.tenant_id, lease.source_segment,
-        {lease.target_segment});
+    auto start_result =
+        master_client_.CopyStart(lease.key, lease.tenant_id,
+                                 lease.source_segment, {lease.target_segment});
     if (!start_result.has_value()) {
         return tl::unexpected(start_result.error());
     }

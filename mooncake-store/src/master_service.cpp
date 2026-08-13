@@ -5567,6 +5567,7 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
         ReleaseTenantQuota(GetBoundTenantQuotaHandle(accessor.GetTenantState()),
                            task.pending_quota_charge_bytes);
         accessor.EraseReplicationTask();
+        ClearDynamicReplicationStateForKey(accessor.GetTenantState(), key);
         if (!metadata.IsValid()) {
             // Remove the object if it does not have any replicas.
             accessor.Erase();
@@ -5580,6 +5581,7 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
     bool all_complete = true;
     uint64_t completed_quota_charge = 0;
     std::vector<ReplicaID> commit_target_ids;
+    std::vector<ReplicaID> failed_target_ids;
     commit_target_ids.reserve(task.replica_ids.size());
     for (const auto& replica_id : task.replica_ids) {
         auto replica = metadata.GetReplicaByID(replica_id);
@@ -5588,6 +5590,7 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
                 << "key=" << key << ", replica_id=" << replica_id
                 << ", copy target becomes invalid during data transfer";
             all_complete = false;
+            failed_target_ids.push_back(replica_id);
         } else {
             commit_target_ids.push_back(replica_id);
         }
@@ -5613,6 +5616,7 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
     }
 
     metadata.MarkDynamicReplicasComplete(commit_target_ids);
+    metadata.ForgetDynamicReplicas(failed_target_ids);
 
     ClearDynamicReplicationStateForKey(accessor.GetTenantState(), key);
 
@@ -7635,7 +7639,18 @@ bool MasterService::ObserveDynamicReplicationAccess(
         }
     }
 
-    auto& counter = dynamic_replication_windows_[admission_key];
+    auto counter_it = dynamic_replication_windows_.find(admission_key);
+    if (counter_it == dynamic_replication_windows_.end()) {
+        if (dynamic_replication_windows_.size() >=
+            kDynamicReplicationWindowEntryLimit) {
+            return false;
+        }
+        counter_it = dynamic_replication_windows_
+                         .emplace(admission_key, DynamicReplicationWindow{})
+                         .first;
+    }
+
+    auto& counter = counter_it->second;
     if (counter.window_start.time_since_epoch().count() == 0 ||
         now - counter.window_start >= window) {
         counter.window_start = now;
