@@ -583,7 +583,6 @@ TEST_F(MasterServiceEvictScenarioTest,
         .Then(Object("tenant-a-old").ForTenant("tenant-a").DoesNotExist())
         .Then(Object("tenant-b-object").ForTenant("tenant-b").IsReadable())
         .Then(TenantQuota("tenant-a").Charges(kObjectSize))
-        // PutEnd completes the object without taking a second charge.
         .When(PutEnd("tenant-a-new").ForTenant("tenant-a"))
         .Then(TenantQuota("tenant-a").Charges(kObjectSize))
         .Then(TenantQuota("tenant-b").Charges(kObjectSize));

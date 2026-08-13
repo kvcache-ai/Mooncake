@@ -9,6 +9,7 @@
 #include <linux/mman.h>
 #include <string>
 #include <limits>
+#include <type_traits>
 #include <ylt/util/tl/expected.hpp>
 
 #include "rpc_types.h"

@@ -599,9 +599,6 @@ KeyCountSpec KeyCount(size_t value);
 
 struct TenantQuotaSpec {
     std::string tenant;
-    // Quota accounting is a single charge taken at PutStart and held until the
-    // object is released, so reserved and committed bytes are indistinguishable
-    // in a snapshot; assert on the combined charge.
     std::optional<uint64_t> charged_bytes{};
     std::chrono::milliseconds eventual_timeout{};
 
