@@ -22,7 +22,7 @@
 #include <unordered_set>
 #include <vector>
 
-#include "spdk/spdk_wrapper.h"
+#include "nof/nof_runtime.h"
 #include "transfer_task.h"
 
 namespace {
@@ -39,11 +39,10 @@ constexpr uint64_t kDefaultRangeBytes = 1 * GiB;
 constexpr uint64_t kDefaultWarmupSec = 3;
 constexpr char kDefaultOp[] = "read";
 
-DEFINE_string(
-    endpoints, "",
-    "Comma-separated NoF transport endpoints. To use multiple "
-    "SpdkNofWorkerPool workers with the current implementation, provide "
-    "multiple distinct endpoints/namespaces/targets.");
+DEFINE_string(endpoints, "",
+              "Comma-separated NoF transport endpoints. To use multiple "
+              "NofWorkerPool workers with the current implementation, provide "
+              "multiple distinct endpoints/namespaces/targets.");
 DEFINE_string(op, "read", "Benchmark operation: read, write, or mixed.");
 DEFINE_string(
     rw, "",
@@ -276,7 +275,7 @@ struct BenchStats {
 
 struct EndpointContext {
     std::string endpoint;
-    mooncake::nof_seg_handle *seg_handle{nullptr};
+    mooncake::NofSegmentHandle *seg_handle{nullptr};
     uint32_t block_size{0};
     uint64_t range_blocks{0};
     uint64_t io_blocks{0};
@@ -295,7 +294,7 @@ struct EndpointStats {
 struct Slot {
     void *buffer{nullptr};
     size_t buffer_size{0};
-    std::shared_ptr<mooncake::SpdkNofOperationState> state;
+    std::shared_ptr<mooncake::NofOperationState> state;
     std::unique_ptr<mooncake::TransferFuture> future;
     uint64_t io_bytes{0};
     size_t endpoint_index{0};
@@ -339,16 +338,16 @@ void PublishSubmit(LiveCounters &live);
 void PublishSuccess(LiveCounters &live, uint64_t io_bytes);
 void PublishFailure(LiveCounters &live);
 void SubmitSlot(Slot &slot, EndpointContext &endpoint, size_t endpoint_index,
-                mooncake::SpdkNofWorkerPool &pool, BenchOp op_mode,
+                mooncake::NofWorkerPool &pool, BenchOp op_mode,
                 uint64_t submit_seq, bool measure_now,
                 EndpointStats &endpoint_stats);
 void WorkerLoop(BenchThreadContext *thread_context,
                 std::vector<EndpointContext> *endpoints,
                 std::vector<EndpointStats> *endpoint_stats,
-                mooncake::SpdkNofWorkerPool *pool, BenchOp op_mode,
+                mooncake::NofWorkerPool *pool, BenchOp op_mode,
                 TimePoint warmup_end, TimePoint end,
                 std::atomic<size_t> *active_threads);
-void FreeThreadSlots(mooncake::SpdkWrapper &wrapper,
+void FreeThreadSlots(mooncake::DmaBufferAllocator &allocator,
                      std::vector<BenchThreadContext> &thread_contexts);
 
 void LatencyHistogram::Record(uint64_t latency_ns) {
@@ -534,7 +533,7 @@ void PublishFailure(LiveCounters &live) {
 }
 
 void SubmitSlot(Slot &slot, EndpointContext &endpoint, size_t endpoint_index,
-                mooncake::SpdkNofWorkerPool &pool, BenchOp op_mode,
+                mooncake::NofWorkerPool &pool, BenchOp op_mode,
                 uint64_t submit_seq, bool measure_now,
                 EndpointStats &endpoint_stats) {
     int op = PickTaskOp(op_mode, endpoint.rng);
@@ -545,14 +544,17 @@ void SubmitSlot(Slot &slot, EndpointContext &endpoint, size_t endpoint_index,
     uint64_t lba = NextLba(endpoint, FLAGS_random_lba);
     slot.io_bytes = slot.buffer_size;
     slot.endpoint_index = endpoint_index;
-    slot.state = std::make_shared<mooncake::SpdkNofOperationState>();
+    slot.state = std::make_shared<mooncake::NofOperationState>();
     slot.future = std::make_unique<mooncake::TransferFuture>(slot.state);
     slot.measure = measure_now;
     slot.submit_time = Clock::now();
 
-    mooncake::SpdkNofTask task(endpoint.seg_handle, slot.buffer, lba,
-                               static_cast<uint32_t>(endpoint.io_blocks), op,
-                               slot.state);
+    const mooncake::NofIOOp nof_op =
+        op == 0 ? mooncake::NofIOOp::kRead : mooncake::NofIOOp::kWrite;
+    const uint64_t byte_offset = lba * endpoint.block_size;
+    const uint64_t byte_length = endpoint.io_blocks * endpoint.block_size;
+    mooncake::NofTask task(endpoint.seg_handle, slot.buffer, byte_offset,
+                           byte_length, nof_op, slot.state);
     pool.submitTask(std::move(task));
     slot.active = true;
 
@@ -565,7 +567,7 @@ void SubmitSlot(Slot &slot, EndpointContext &endpoint, size_t endpoint_index,
 void WorkerLoop(BenchThreadContext *thread_context,
                 std::vector<EndpointContext> *endpoints,
                 std::vector<EndpointStats> *endpoint_stats,
-                mooncake::SpdkNofWorkerPool *pool, BenchOp op_mode,
+                mooncake::NofWorkerPool *pool, BenchOp op_mode,
                 TimePoint warmup_end, TimePoint end,
                 std::atomic<size_t> *active_threads) {
     uint64_t submit_seq = static_cast<uint64_t>(thread_context->thread_index)
@@ -637,13 +639,13 @@ void WorkerLoop(BenchThreadContext *thread_context,
     active_threads->fetch_sub(1, std::memory_order_relaxed);
 }
 
-void FreeThreadSlots(mooncake::SpdkWrapper &wrapper,
+void FreeThreadSlots(mooncake::DmaBufferAllocator &allocator,
                      std::vector<BenchThreadContext> &thread_contexts) {
     for (auto &thread_context : thread_contexts) {
         for (auto &thread_endpoint : thread_context.endpoints) {
             for (auto &slot : thread_endpoint.slots) {
                 if (slot.buffer) {
-                    wrapper.Free(slot.buffer);
+                    allocator.Free(slot.buffer);
                     slot.buffer = nullptr;
                 }
             }
@@ -725,25 +727,26 @@ int main(int argc, char **argv) {
             return 1;
         }
 
-        auto &wrapper = mooncake::SpdkWrapper::GetInstance();
-        if (!wrapper.InitializeEnv()) {
-            LOG(ERROR) << "Failed to initialize SPDK environment";
+        auto runtime = mooncake::CreateNofRuntime();
+        if (!runtime.initiator) {
+            LOG(ERROR) << "NoF is unavailable in this build";
             return 1;
         }
+        auto &initiator = *runtime.initiator;
 
         std::vector<EndpointContext> endpoints;
         endpoints.reserve(endpoint_strings.size());
-        std::unordered_set<mooncake::nof_seg_handle *> unique_handles;
+        std::unordered_set<mooncake::NofSegmentHandle *> unique_handles;
         for (size_t i = 0; i < endpoint_strings.size(); ++i) {
             EndpointContext endpoint(endpoint_strings[i], FLAGS_seed + i);
-            endpoint.seg_handle = wrapper.OpenNofSegment(endpoint.endpoint);
+            endpoint.seg_handle = initiator.OpenSegment(endpoint.endpoint);
             if (!endpoint.seg_handle) {
                 LOG(ERROR) << "Failed to open NoF endpoint: "
                            << endpoint.endpoint;
                 return 1;
             }
-            endpoint.block_size = wrapper.GetBlockSize(endpoint.seg_handle);
-            if (endpoint.block_size == INVALID_BLOCK_SIZE ||
+            endpoint.block_size = initiator.GetBlockSize(endpoint.seg_handle);
+            if (endpoint.block_size == mooncake::kInvalidBlockSize ||
                 endpoint.block_size == 0) {
                 LOG(ERROR) << "Invalid block size for endpoint: "
                            << endpoint.endpoint;
@@ -782,12 +785,12 @@ int main(int argc, char **argv) {
         LOG(INFO) << "Bench config: endpoints=" << endpoints.size()
                   << ", unique_handles=" << unique_handles.size()
                   << ", configured_nof_workers="
-                  << (FLAGS_nof_workers == 0 ? mooncake::kDefaultSpdkNofWorkers
+                  << (FLAGS_nof_workers == 0 ? mooncake::kDefaultNofWorkers
                                              : FLAGS_nof_workers)
                   << ", effective_worker_bindings<="
                   << std::min<uint64_t>(unique_handles.size(),
                                         FLAGS_nof_workers == 0
-                                            ? mooncake::kDefaultSpdkNofWorkers
+                                            ? mooncake::kDefaultNofWorkers
                                             : FLAGS_nof_workers)
                   << ", io_size=" << FLAGS_io_size
                   << ", iodepth_per_endpoint=" << FLAGS_iodepth
@@ -797,8 +800,8 @@ int main(int argc, char **argv) {
                   << ", duration_sec=" << FLAGS_duration_sec;
         if (unique_handles.size() < endpoints.size()) {
             LOG(WARNING)
-                << "Some endpoints resolved to the same nof_seg_handle. In the "
-                   "current SpdkNofWorkerPool implementation, the same handle "
+                << "Some endpoints resolved to the same NofSegmentHandle. In "
+                   "the current NofWorkerPool implementation, the same handle "
                    "binds to a single worker thread, so duplicate endpoints "
                    "will "
                    "not increase worker parallelism.";
@@ -824,12 +827,13 @@ int main(int argc, char **argv) {
             for (auto &thread_endpoint : thread_context.endpoints) {
                 for (auto &slot : thread_endpoint.slots) {
                     slot.buffer_size = FLAGS_io_size;
-                    slot.buffer = wrapper.Alloc(slot.buffer_size, 0x1000,
-                                                FLAGS_socket_id);
+                    slot.buffer = runtime.dma_allocator->Alloc(
+                        slot.buffer_size, 0x1000, FLAGS_socket_id);
                     if (!slot.buffer) {
                         LOG(ERROR) << "Failed to allocate DMA buffer of size "
                                    << slot.buffer_size;
-                        FreeThreadSlots(wrapper, thread_contexts);
+                        FreeThreadSlots(*runtime.dma_allocator,
+                                        thread_contexts);
                         return 1;
                     }
                 }
@@ -837,7 +841,7 @@ int main(int argc, char **argv) {
         }
 
         std::vector<EndpointStats> endpoint_stats(endpoints.size());
-        mooncake::SpdkNofWorkerPool pool;
+        mooncake::NofWorkerPool pool(runtime.initiator, FLAGS_socket_id);
 
         TimePoint start = Clock::now();
         TimePoint warmup_end = start + std::chrono::seconds(FLAGS_warmup_sec);
@@ -928,7 +932,7 @@ int main(int argc, char **argv) {
             worker.join();
         }
 
-        FreeThreadSlots(wrapper, thread_contexts);
+        FreeThreadSlots(*runtime.dma_allocator, thread_contexts);
 
         BenchStats total_measured;
         for (const auto &stats : endpoint_stats) {
@@ -947,13 +951,13 @@ int main(int argc, char **argv) {
         std::cout << "endpoints=" << endpoints.size() << "\n";
         std::cout << "unique_handles=" << unique_handles.size() << "\n";
         std::cout << "configured_nof_workers="
-                  << (FLAGS_nof_workers == 0 ? mooncake::kDefaultSpdkNofWorkers
+                  << (FLAGS_nof_workers == 0 ? mooncake::kDefaultNofWorkers
                                              : FLAGS_nof_workers)
                   << "\n";
         std::cout << "effective_worker_bindings<="
                   << std::min<uint64_t>(unique_handles.size(),
                                         FLAGS_nof_workers == 0
-                                            ? mooncake::kDefaultSpdkNofWorkers
+                                            ? mooncake::kDefaultNofWorkers
                                             : FLAGS_nof_workers)
                   << "\n";
         std::cout << "numjobs=" << effective_submit_threads << "\n";

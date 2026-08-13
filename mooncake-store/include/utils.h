@@ -265,15 +265,21 @@ constexpr size_t SZ_2MB = 2 * 1024 * 1024;
 constexpr size_t SZ_1GB = 1024 * 1024 * 1024;
 constexpr double BYTES_PER_GIB = static_cast<double>(SZ_1GB);
 
+class DmaBufferAllocator;
+
 /**
  * @brief Allocates memory for the `BufferAllocator` class.
  * @param total_size The total size of the memory to allocate.
+ * @param dma_allocator Optional DMA-specialized allocator (e.g. SPDK hugepage
+ * pool). When non-null and total_size > 0, it takes precedence over the
+ * generic path; when null the historical protocol→VRAM→aligned_alloc order is
+ * preserved.
  * @return A pointer to the allocated memory.
  */
 void* allocate_buffer_allocator_memory(
     size_t total_size, const std::string& protocol = "",
     size_t alignment = facebook::cachelib::Slab::kSize,
-    bool use_spdk_dma = false);
+    DmaBufferAllocator* dma_allocator = nullptr);
 
 inline size_t align_up(size_t size, size_t alignment) {
     if (alignment == 0) {
@@ -424,7 +430,7 @@ void* allocate_buffer_numa_segments(size_t total_size,
                                     size_t page_size = 0);
 
 void free_memory(const std::string& protocol, void* ptr,
-                 bool use_spdk_dma = false);
+                 DmaBufferAllocator* dma_allocator = nullptr);
 
 // Network utility functions
 
