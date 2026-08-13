@@ -252,6 +252,7 @@ jobs:
         source test_env/bin/activate
         mkdir -p /tmp/mooncake_storage
         mooncake_master \
+          --default_kv_lease_ttl=500 \
           --eviction_high_watermark_ratio=0.95 \
           --cluster_id=ci_test_cluster \
           --port 50051 \
