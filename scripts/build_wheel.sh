@@ -514,6 +514,39 @@ if [ -n "$CUDA_EP_STAGING_TEMP" ]; then
     rm -rf "$CUDA_EP_STAGING_TEMP"
 fi
 
+# auditwheel/patchelf can scramble SONAME (e.g. transfer_engine -> glog) and leave
+# absolute build RPATHs. Force SONAME=basename and $ORIGIN RPATH before shipping.
+REPAIRED_WHEEL=$(ls ${REPAIRED_DIR}/*.whl 2>/dev/null | head -1)
+if [ -n "$REPAIRED_WHEEL" ]; then
+    echo "Fixing SONAME/RPATH after auditwheel..."
+    WHEEL_UNPACK_DIR=$(mktemp -d)
+    python${PYTHON_VERSION} -m wheel unpack "$REPAIRED_WHEEL" -d "$WHEEL_UNPACK_DIR"
+    UNPACKED_PKG_DIR=$(find "$WHEEL_UNPACK_DIR" -mindepth 1 -maxdepth 1 -type d | head -1)
+    VENDORED_LIBS_DIR=$(find "$UNPACKED_PKG_DIR" -mindepth 1 -maxdepth 1 -type d -name "*.libs" | head -1)
+
+    if [ -n "$VENDORED_LIBS_DIR" ]; then
+        for f in "$VENDORED_LIBS_DIR"/*; do
+            [ -f "$f" ] || continue
+            file "$f" | grep -q ELF || continue
+            patchelf --set-soname "$(basename "$f")" "$f"
+            patchelf --force-rpath --set-rpath '$ORIGIN' "$f"
+        done
+        PKG_RPATH="\$ORIGIN:\$ORIGIN/../$(basename "$VENDORED_LIBS_DIR")"
+    else
+        PKG_RPATH='$ORIGIN'
+    fi
+
+    find "${UNPACKED_PKG_DIR}/mooncake" -type f -print0 2>/dev/null \
+        | while IFS= read -r -d '' f; do
+            file "$f" | grep -q ELF || continue
+            patchelf --force-rpath --set-rpath "$PKG_RPATH" "$f"
+        done
+
+    rm "$REPAIRED_WHEEL"
+    python${PYTHON_VERSION} -m wheel pack "$UNPACKED_PKG_DIR" -d "${REPAIRED_DIR}/"
+    rm -rf "$WHEEL_UNPACK_DIR"
+fi
+
 # NPU only: move auditwheel-vendored .libs into mooncake/ and set RPATH=$ORIGIN
 # on all ELF files so everything resolves from a single directory.
 if [ "$NPU_BUILD" = "1" ]; then
