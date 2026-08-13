@@ -12,6 +12,7 @@
 #include "bool_parser.h"
 #include "environ.h"
 #include "storage_backend.h"
+#include "storage/distributed/distributed_storage_backend.h"
 #include "client_metric.h"
 #include "utils.h"
 #include "device/accelerator_registry.h"
@@ -98,6 +99,7 @@ FileStorageConfig FileStorageConfig::FromEnvironment() {
         config.storage_backend_type = StorageBackendType::kOffsetAllocator;
     } else if (storage_backend_descriptor == "distributed_storage_backend") {
         config.storage_backend_type = StorageBackendType::kDistributed;
+        config.enable_dfs = true;
     } else {
         LOG(ERROR) << "Unknown storage backend.";
     }
@@ -272,6 +274,9 @@ FileStorage::FileStorage(const FileStorageConfig& config,
       pinned_buffer_pool_(std::make_unique<PinnedBufferPool>()),
       client_buffer_allocator_(AlignedClientBufferAllocator::create(
           config.local_buffer_size, client ? client->GetProtocol() : "")) {
+    if (config_.storage_backend_type == StorageBackendType::kDistributed) {
+        config_.enable_dfs = true;
+    }
     if (!config.Validate()) {
         throw std::invalid_argument("Invalid FileStorage configuration");
     }
@@ -306,6 +311,13 @@ FileStorage::FileStorage(const FileStorageConfig& config,
     }
 
     storage_backend_ = create_storage_backend_result.value();
+    if (auto distributed_backend =
+            std::dynamic_pointer_cast<DistributedStorageBackend>(
+                storage_backend_)) {
+        if (client_) {
+            client_->SetDfsStorageBackend(distributed_backend);
+        }
+    }
 
     // Register the client buffer with the process-wide io_uring fixed-buffer
     // mechanism. This must happen before any I/O threads start so that they
@@ -353,6 +365,12 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
         LOG(ERROR) << "Failed to init storage backend: "
                    << init_storage_backend_result.error();
         return init_storage_backend_result;
+    }
+    if (config_.enable_dfs) {
+        client_buffer_gc_running_.store(true);
+        client_buffer_gc_thread_ =
+            std::thread(&FileStorage::ClientBufferGCThreadFunc, this);
+        return {};
     }
     auto enable_offloading_result = IsEnableOffloading();
     if (enable_offloading_result.has_value()) {
@@ -408,9 +426,15 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
         });
 
     if (!scan_meta_result) {
-        LOG(ERROR) << "Failed to scan meta and send to master: "
-                   << scan_meta_result.error();
-        return scan_meta_result;
+        if (config_.enable_dfs &&
+            scan_meta_result.error() == ErrorCode::NOT_SUPPORTED) {
+            LOG(INFO) << "Currently, DFS backend does not support ScanMeta; "
+                         "skip re-registering offloaded objects";
+        } else {
+            LOG(ERROR) << "Failed to scan meta and send to master: "
+                       << scan_meta_result.error();
+            return scan_meta_result;
+        }
     }
 
     heartbeat_running_.store(true);
@@ -879,8 +903,11 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
     // === STEP 1: Send heartbeat and get offloading decisions ===
     {
         MutexLocker locker(&offloading_mutex_);
-        auto heartbeat_result = client_->OffloadObjectHeartbeat(
-            enable_offloading_, offloading_objects);
+        auto fetch_offload_tasks = [&]() -> tl::expected<void, ErrorCode> {
+            return client_->OffloadObjectHeartbeat(enable_offloading_,
+                                                   offloading_objects);
+        };
+        auto heartbeat_result = fetch_offload_tasks();
         if (!heartbeat_result) {
             ErrorCode err = heartbeat_result.error();
             if (err == ErrorCode::SEGMENT_NOT_FOUND) {
@@ -907,8 +934,7 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
                                 << "heartbeat recovery: " << cap_result.error();
                         }
                     }
-                    heartbeat_result = client_->OffloadObjectHeartbeat(
-                        enable_offloading_, offloading_objects);
+                    heartbeat_result = fetch_offload_tasks();
                     if (!heartbeat_result) {
                         LOG(ERROR) << "Heartbeat failed after re-registration: "
                                    << heartbeat_result.error();
@@ -1377,6 +1403,12 @@ tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {
     LOG(INFO) << "ReRegisterOffloadedObjects: ScanMeta returned. success="
               << scan_meta_result.has_value();
     if (!scan_meta_result) {
+        if (config_.enable_dfs &&
+            scan_meta_result.error() == ErrorCode::NOT_SUPPORTED) {
+            LOG(INFO) << "ReRegisterOffloadedObjects: Currently, DFS ScanMeta "
+                         "is not supported; skip";
+            return {};
+        }
         LOG(ERROR) << "ReRegisterOffloadedObjects: ScanMeta failed: "
                    << scan_meta_result.error();
         return scan_meta_result;

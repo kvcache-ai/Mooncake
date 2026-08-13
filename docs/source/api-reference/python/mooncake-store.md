@@ -602,12 +602,51 @@ config = ReplicateConfig()
 #### replica_num
 **Type:** `int`
 **Default:** `1`
-**Description:** Specifies the total number of replicas to create for the stored object.
+**Description:** Specifies the number of memory replicas to create for the
+stored object.
 
 ```python
 config = ReplicateConfig()
-config.replica_num = 3  # Store 3 copies of the data
+config.replica_num = 3  # Store 3 memory replicas
 ```
+
+#### nof_replica_num
+**Type:** `int`
+**Default:** `0`
+**Description:** Specifies the number of replicas to create in the configured
+NVMe-oF SSD pool.
+
+```python
+config = ReplicateConfig()
+config.replica_num = 1
+config.nof_replica_num = 1
+```
+
+#### dfs_replica_num
+**Type:** `int`
+**Default:** `0`
+**Status:** **Work in progress; development and evaluation only.**
+**Description:** Requests an additional replica in the configured shared
+distributed filesystem. The supported values are currently `0` and `1`. When
+set to `1`, `replica_num` must be at least `1`, so DFS-only placement is not
+supported. DFS replicas currently support only the `default` tenant.
+
+```python
+config = ReplicateConfig()
+config.replica_num = 1
+config.dfs_replica_num = 1
+```
+
+Writes that request a DFS replica return success after the DFS `WriteAt`
+operation completes, but without an additional `fsync` durability guarantee.
+The master and client DFS backends must be enabled and configured with the same
+absolute shared-root path and shard layout. See the
+{ref}`DFS deployment documentation <dfs-storage>` for the required environment
+variables and current limitations.
+
+For a same-size `upsert`, if either the existing object or the new request has
+a DFS replica, the requested memory, NoF, and DFS replica counts must match the
+existing topology. A different-size update allocates a new topology.
 
 #### soft_pin_action
 **Type:** `SoftPinAction`
@@ -1101,8 +1140,15 @@ the positional overload.
 - `rdma_devices` (str): **Required by the positional overload**. RDMA/EFA device name(s), e.g. `"mlx5_0"` or `"mlx5_0,mlx5_1"`. Leave empty to auto-discover NICs unless `MC_MS_AUTO_DISC=0`; always empty for TCP.
 - `master_server_addr` (str): **Required by the positional overload**. Master server address (e.g., "localhost:50051")
 - `engine` (Optional[TransferEngine]): Existing Transfer Engine instance to reuse. Defaults to `None`.
-- `enable_ssd_offload` (bool): Enable client-side SSD offload support. Defaults to `False`.
-- `ssd_offload_path` (str): SSD offload directory. When provided, overrides the storage path environment configuration.
+- `enable_ssd_offload` (bool): Initialize client-side `FileStorage`. With a
+  normal file backend this enables SSD offload; with
+  `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=distributed_storage_backend`,
+  it initializes the DFS backend and is required for DFS reads and writes.
+  Defaults to `False`.
+- `ssd_offload_path` (str): FileStorage directory. When provided, it overrides
+  `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`. With the distributed backend, DFS shard
+  data is stored under `MOONCAKE_DFS_ROOT_DIR`, but this separate directory is
+  still validated during FileStorage initialization.
 - `tenant_id` (str): Tenant namespace for object keys. Defaults to `"default"`.
 - `enable_client_http_server` (bool): Enable the client-local `/health`, `/metrics`, and `/metrics/summary` HTTP endpoints. Defaults to `False`.
 - `client_http_port` (int): Port for the client-local HTTP endpoints. Defaults to `9300`.
