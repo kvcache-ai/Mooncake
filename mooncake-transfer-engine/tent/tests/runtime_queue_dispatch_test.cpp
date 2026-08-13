@@ -103,7 +103,9 @@ class FakeTransport : public Transport {
             return Status::InvalidArgument("bad task_id" LOC_MARK);
         }
         ++fake->poll_counts[task_id];
-        if (poll_status_factory_) {
+        if (fake->statuses[task_id].s == TransferStatusEnum::CANCELED) {
+            status = fake->statuses[task_id];
+        } else if (poll_status_factory_) {
             status = poll_status_factory_(fake->requests[task_id],
                                           fake->poll_counts[task_id]);
         } else {
@@ -430,7 +432,10 @@ TEST(RuntimeQueueDispatch, CancelsDispatchedRdmaTaskIdempotently) {
     TransferEngineImpl engine(cfg);
     ASSERT_TRUE(engine.available());
 
-    auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
+    auto fake_rdma = std::make_shared<FakeTransport>(
+        RDMA, [](const Request&, int) {
+            return TransferStatus{TransferStatusEnum::PENDING, 0};
+        });
     installFakeRdma(engine, fake_rdma);
 
     constexpr size_t kReqLen = 4096;
