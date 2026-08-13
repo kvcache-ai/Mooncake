@@ -108,7 +108,10 @@ jobs:
         run: |
           cd build
           source ~/.bashrc
-          cmake --build . --parallel 1
+          # Limit concurrency of Mooncake PG's setup.py build to avoid OOM
+          export MAX_JOBS=2
+          # Does not affect the Ninja system
+          cmake --build .
           cmake --install .
         shell: bash
 
