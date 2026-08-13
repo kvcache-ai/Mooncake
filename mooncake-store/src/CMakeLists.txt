@@ -19,6 +19,7 @@ set(MOONCAKE_STORE_SOURCES
     segment.cpp
     transfer_task.cpp
     tenant_quota.cpp
+    tenant_quota_ledger.cpp
     tenant_quota_policy_store.cpp
     rpc_service.cpp
     master_admin_service.cpp
@@ -51,6 +52,7 @@ set(MOONCAKE_STORE_SOURCES
     ha/kv/etcd_ha_kv_backend.cpp
     ha/standby_controller.cpp
     ha/snapshot/catalog_backed_snapshot_provider.cpp
+    ha/snapshot/batch_oplog/metadata.cpp
     ha/snapshot/master_snapshot_codec.cpp
     ha/snapshot/object/snapshot_object_store.cpp
     ha/snapshot/object/backends/local/local_file_snapshot_object_store.cpp

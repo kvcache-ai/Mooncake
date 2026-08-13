@@ -16,7 +16,6 @@ elseif(USE_MUSA OR USE_MACA)
   set(_pg_device_flags
       -std=c++20
       -O3
-      --compiler-options=-fPIC
       -MMD
       -MT "${_pg_device_object}"
       -MF "${_pg_device_depfile}"
@@ -45,13 +44,15 @@ elseif(USE_MUSA OR USE_MACA)
       set(_pg_device_compiler_hint /usr/local/musa/bin)
     endif()
     set(_pg_platform_device_flags
+        -x musa
+        -fPIC
         --cuda-gpu-arch=mp_21
         --cuda-gpu-arch=mp_31)
   elseif(USE_MACA)
     set(_pg_platform_name MACA)
     set(_pg_device_compiler_name mxcc)
     set(_pg_device_compiler_hint "${MACA_ROOT}/bin")
-    set(_pg_platform_device_flags)
+    set(_pg_platform_device_flags --compiler-options=-fPIC)
   endif()
 
   find_program(_pg_device_compiler NAMES "${_pg_device_compiler_name}"
@@ -91,9 +92,11 @@ target_include_directories(
           ${CMAKE_CURRENT_SOURCE_DIR}/../../mooncake-transfer-engine/include)
 
 if(USE_CUDA)
+  # The standalone device worker only needs CUDA C++17. Host-side PG remains
+  # C++20 and must not leak its headers into the device translation unit.
   set_target_properties(
     mooncake_pg_device
-    PROPERTIES CUDA_STANDARD 20
+    PROPERTIES CUDA_STANDARD 17
                CUDA_STANDARD_REQUIRED ON
                CUDA_EXTENSIONS OFF
                CUDA_RUNTIME_LIBRARY Shared)

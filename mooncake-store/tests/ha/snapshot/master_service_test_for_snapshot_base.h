@@ -176,20 +176,11 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         EnsureSnapshotStores(service);
 
         MasterSnapshotManagerOptions options;
-        options.enable_snapshot = true;
         options.snapshot_interval_seconds = 300;
         options.snapshot_child_timeout_seconds = 300;
         options.snapshot_retention_count = 3;
         options.snapshot_backup_dir = "";
         options.use_snapshot_backup_dir = false;
-        options.snapshot_catalog_store_type =
-            service->snapshot_catalog_store_type_;
-        options.snapshot_catalog_store_connstring =
-            service->snapshot_catalog_store_connstring_;
-        options.ha_backend_type = service->ha_backend_type_;
-        options.ha_backend_connstring = service->ha_backend_connstring_;
-        options.cluster_id = service->cluster_id_;
-        options.enable_ha = service->enable_ha_;
 
         auto temp_manager = std::make_unique<MasterSnapshotManager>(
             service, options, service->snapshot_mutex_,
@@ -207,7 +198,7 @@ class MasterServiceSnapshotTestBase : public ::testing::Test {
         if (!service->snapshot_catalog_store_ &&
             service->snapshot_object_store_) {
             service->snapshot_catalog_store_ =
-                service->CreateSnapshotCatalogStore();
+                service->CreateSnapshotCatalogStore(MasterServiceConfig{});
         }
     }
 

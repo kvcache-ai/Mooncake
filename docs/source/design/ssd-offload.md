@@ -93,7 +93,7 @@ Step by step:
 
 ### Load (SSD → memory)
 
-The load path involves three parties: the **requesting client**, the **target client** that holds the SSD data, and the **Transfer Engine** for zero-copy data movement.
+The default load path involves three parties: the **requesting client**, the **target client** that holds the SSD data, and the **Transfer Engine** for data movement.
 
 ```
 Requesting Client                 Target Client                    Master
@@ -119,13 +119,15 @@ Requesting Client                 Target Client                    Master
        │                                    │ (free ClientBuffer slot)│
 ```
 
+For a same-process GPU destination, FileStorage reads into a quota-bounded pinned restore arena and submits H2D copies to the caller's GPU slices. Tensor ranges use a source offset, avoiding another CPU staging allocation. This path requires local memcpy and a pinned quota; CPU and remote restores are unchanged.
+
 Step by step:
 
 1. **Query master**: The requesting client calls `client_->BatchGet(keys, ...)` to query the master for replica locations. If the object has been offloaded, the master returns a `LOCAL_DISK` replica descriptor containing the target client's RPC address (`transport_endpoint`).
-2. **RPC to target client**: The requesting client calls `batch_get_offload_object(keys, sizes)` on the target client identified by `transport_endpoint`. The target client calls `FileStorage::BatchGet`, which allocates slots in `ClientBuffer` and reads the requested objects from SSD via `StorageBackend::BatchLoad`.
-3. **Response with buffer pointers**: The target client returns a `BatchGetOffloadObjectResponse` containing `batch_id`, a list of buffer `pointers` (addresses within `ClientBuffer`), the Transfer Engine address, and `gc_ttl_ms` (the buffer lease TTL).
-4. **Zero-copy transfer**: The requesting client invokes `client_->BatchGetOffloadObject(transfer_engine_addr, keys, pointers, slices)`, which uses the Transfer Engine (RDMA or TCP) to pull the data directly from the target client's `ClientBuffer` into the application's target memory (DRAM or VRAM). No intermediate copy is made on the requesting client side.
-5. **Release buffer**: After the transfer completes, the requesting client immediately calls `release_offload_buffer(batch_id)` on the target client to free the `ClientBuffer` slots. If the transfer takes longer than `gc_ttl_ms`, the buffer GC thread reclaims the slot automatically as a fallback.
+2. **Select the owner path**: For a different process, the requesting client calls `batch_get_offload_object(keys, sizes)` on the target client identified by `transport_endpoint`. For a same-process GPU restore with pinned quota and local memcpy enabled, it calls the local `FileStorage::BatchGetLocal` path.
+3. **Response with buffer pointers**: Remote requests receive pointers within `ClientBuffer`, plus a `batch_id`, Transfer Engine address, and buffer lease TTL. The local path receives pointers within the pinned restore arena and keeps their allocation owner in the requesting process.
+4. **Transfer data**: Remote restores use the Transfer Engine (RDMA or TCP). The same-process pinned branch submits H2D copies from the local restore arena and supports per-object source offsets for tensor payloads.
+5. **Release buffer**: Remote restores call `release_offload_buffer(batch_id)` and retain TTL GC as a failure fallback. A same-process allocation is held by an RAII owner through the synchronous H2D operation and released automatically on success or failure; it is never published in the remote batch map.
 
 ---
 

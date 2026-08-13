@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <list>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -122,6 +123,11 @@ class RdmaContext {
 
    private:
     int openDevice(const std::string &device_name, uint8_t port);
+
+    // Release every resource currently owned by this context. This is
+    // intentionally state-independent so it can clean up a partially completed
+    // enable() and can safely be retried.
+    void cleanupResources();
 
    private:
     // initialized during ctor, will never be changed during the context's

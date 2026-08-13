@@ -616,15 +616,16 @@ PGResult<void> MooncakeCommunicator::checkOpState(OpType op) const {
             "rank " + std::to_string(meta_->globalRank) +
                 " is offline and cannot perform operations");
     }
-    // P2P operations don't require the rank to be active in the group.
+    PG_VALIDATE_STATE(mode != CollectiveExtensionState::Quiescing,
+                      "rank is quiescing and cannot issue operations");
+
     const bool is_p2p = op == OpType::Send || op == OpType::Recv;
-    if (!isValidGroup() && is_p2p) {
-        return makePGError(PGErrorCode::NotSupported,
-                           "P2P is unavailable for an invalid Mooncake group");
-    }
-    if (!is_p2p) {
-        PG_VALIDATE_STATE(mode != CollectiveExtensionState::Quiescing,
-                          "rank is quiescing and cannot issue collectives");
+    if (is_p2p) {
+        // P2P operations require an valid group
+        PG_VALIDATE_STATE(isValidGroup(),
+                          "P2P is unavailable for an invalid group");
+    } else {
+        // Collectives in an invalid group remain local-only
         PG_VALIDATE_STATE(mode == CollectiveExtensionState::Isolated ||
                               meta_->activeRanks[rank_],
                           "rank is not active in this group");
@@ -1433,18 +1434,31 @@ PGResult<ProposeViewUpdateResponse> MooncakeCommunicator::deactivateRanks(
 PGResult<void> MooncakeCommunicator::joinGroup() {
     PG_TRY(checkValidGroup("joinGroup"));
     auto mode = meta_->extensionMode.load(std::memory_order_acquire);
-    PG_VALIDATE_STATE(
-        mode == CollectiveExtensionState::Isolated,
-        "joinGroup may only be called once on an isolated joining "
-        "communicator");
-    // Stop admitting isolated collectives before advertising readiness.
+    const bool is_initial_join = mode == CollectiveExtensionState::Isolated;
+    const bool is_inplace_rejoin =
+        mode == CollectiveExtensionState::Normal && !meta_->activeRanks[rank_];
+    PG_VALIDATE_STATE(is_initial_join || is_inplace_rejoin,
+                      "joinGroup requires an isolated or inactive rank");
+    // Stop admitting operations before advertising readiness.
     meta_->extensionMode.store(CollectiveExtensionState::Quiescing,
                                std::memory_order_release);
+    if (!p2p_proxy_->drainTasks()) {
+        return makePGError(PGErrorCode::Timeout,
+                           "timed out draining join preparation P2P tasks for "
+                           "rank " +
+                               std::to_string(meta_->globalRank));
+    }
     if (!worker_->drainTasks(meta_.get())) {
         return makePGError(
             PGErrorCode::Timeout,
             "timed out draining join preparation collectives for rank " +
                 std::to_string(meta_->globalRank));
+    }
+    // Auto-deactivation removes the old endpoint from the GroupView. The
+    // process and its registered buffers are still alive, so republish the
+    // current endpoint under a fresh endpoint epoch before declaring ready.
+    if (is_inplace_rejoin) {
+        PG_TRY(agent_.publishLocalEndpoint(buildEndpointMetadata()));
     }
     PG_TRY(agent_.confirmReadyForActivation(meta_->group_id));
     // Block until the Coordinator activates this rank in the group.

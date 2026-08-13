@@ -705,6 +705,11 @@ int64_t MasterMetricManager::get_segment_total_mem_capacity(
     return mem_total_capacity_per_segment_.value({segment});
 }
 
+void MasterMetricManager::remove_segment_metrics(const std::string& segment) {
+    mem_allocated_size_per_segment_.remove_label_value({{"segment", segment}});
+    mem_total_capacity_per_segment_.remove_label_value({{"segment", segment}});
+}
+
 double MasterMetricManager::get_segment_mem_used_ratio(
     const std::string& segment) {
     double allocated = get_segment_allocated_mem_size(segment);
@@ -773,6 +778,12 @@ int64_t MasterMetricManager::get_segment_allocated_nof_size(
 int64_t MasterMetricManager::get_segment_total_nof_capacity(
     const std::string& segment) {
     return nof_total_capacity_per_segment_.value({segment});
+}
+
+void MasterMetricManager::remove_nof_segment_metrics(
+    const std::string& segment) {
+    nof_allocated_size_per_segment_.remove_label_value({{"segment", segment}});
+    nof_total_capacity_per_segment_.remove_label_value({{"segment", segment}});
 }
 
 double MasterMetricManager::get_segment_nof_used_ratio(

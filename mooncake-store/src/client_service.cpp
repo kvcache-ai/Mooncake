@@ -149,6 +149,71 @@ std::optional<ContiguousSliceRange> GetContiguousSliceRange(
                                 .size = total_size};
 }
 
+ErrorCode ScatterFragmentError(const Status& status) {
+    return status.IsInvalidArgument() ? ErrorCode::INVALID_PARAMS
+                                      : ErrorCode::TRANSFER_FAIL;
+}
+
+// Collects the fragments of many ranged entries into a single scatter submit.
+//
+// One submit per entry would hand the transport one tiny transfer per key per
+// layer; batching them lets the transport coalesce every fragment bound for the
+// same segment into one transfer, which is what keeps layer-wise sessions at
+// full bandwidth.
+//
+// ScatterTransferRange holds non-owning spans, so the offset/length storage
+// lives here and must outlive the submit. Both vectors are reserved to the
+// exact fragment count up front so pushes never reallocate under a live span.
+class ScatterRangeBuilder {
+   public:
+    explicit ScatterRangeBuilder(size_t fragment_count)
+        : zero_offsets_(fragment_count, 0) {
+        remote_offsets_.reserve(fragment_count);
+        lengths_.reserve(fragment_count);
+        ranges_.reserve(fragment_count);
+    }
+
+    // `error_slot` is shared by every fragment of one entry and keeps the first
+    // failure. Callbacks run on the waiting thread, so no locking is needed.
+    void Add(TransferRequest::OpCode opcode,
+             const AllocatedBuffer::Descriptor& handle, const Slice& slice,
+             uint64_t remote_offset, std::optional<ErrorCode>* error_slot) {
+        const size_t index = remote_offsets_.size();
+        remote_offsets_.push_back(static_cast<size_t>(remote_offset));
+        lengths_.push_back(slice.size);
+        ranges_.push_back(TransferEngine::ScatterTransferRange{
+            .opcode = opcode,
+            .remote_segment = handle.transport_endpoint_,
+            .remote_base_offset = handle.buffer_address_,
+            .remote_size = static_cast<size_t>(handle.size_),
+            .local_buffer = slice.ptr,
+            .local_capacity = slice.size,
+            .local_offsets = std::span<const size_t>(&zero_offsets_[index], 1),
+            .remote_offsets =
+                std::span<const size_t>(&remote_offsets_[index], 1),
+            .lengths = std::span<const size_t>(&lengths_[index], 1),
+            .on_fragment_complete =
+                [error_slot](size_t, const Status& status) {
+                    if (!status.ok() && !error_slot->has_value()) {
+                        *error_slot = ScatterFragmentError(status);
+                    }
+                },
+        });
+    }
+
+    bool empty() const { return ranges_.empty(); }
+
+    const std::vector<TransferEngine::ScatterTransferRange>& ranges() const {
+        return ranges_;
+    }
+
+   private:
+    std::vector<size_t> zero_offsets_;
+    std::vector<size_t> remote_offsets_;
+    std::vector<size_t> lengths_;
+    std::vector<TransferEngine::ScatterTransferRange> ranges_;
+};
+
 struct ReplicaTransferSummary {
     size_t allocated_memory_replicas = 0;
     size_t allocated_nof_replicas = 0;
@@ -2854,6 +2919,50 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     return CollectResults(ops);
 }
 
+std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+Client::StartBatchPutForSizes(const std::vector<std::string>& keys,
+                              const std::vector<uint64_t>& object_sizes,
+                              const ReplicateConfig& config) {
+    std::vector<tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+        results(keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    if (keys.size() != object_sizes.size()) {
+        LOG(ERROR) << "StartBatchPutForSizes size mismatch: keys="
+                   << keys.size() << ", sizes=" << object_sizes.size();
+        return results;
+    }
+
+    ReplicateConfig client_cfg = AttachHostId(config);
+    if (protocol_ == "cxl") {
+        client_cfg.preferred_segment = local_hostname_;
+    }
+
+    std::vector<std::vector<Slice>> batched_slices(keys.size());
+    for (size_t i = 0; i < keys.size(); ++i) {
+        batched_slices[i] = {Slice{nullptr, object_sizes[i]}};
+    }
+    std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
+    StartBatchPut(ops, client_cfg);
+
+    for (size_t i = 0; i < ops.size(); ++i) {
+        if (ops[i].IsResolved()) {
+            results[i] = tl::unexpected(ops[i].result.error());
+            continue;
+        }
+        results[i] = std::move(ops[i].replicas);
+    }
+    return results;
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::BatchPutEnd(
+    const std::vector<ObjectMeta>& object_metas, ReplicaType replica_type) {
+    return master_client_.BatchPutEnd(object_metas, replica_type);
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::BatchPutRevoke(
+    const std::vector<std::string>& keys, ReplicaType replica_type) {
+    return master_client_.BatchPutRevoke(keys, replica_type);
+}
+
 tl::expected<void, ErrorCode> Client::Remove(const ObjectKey& key, bool force) {
     if (hot_cache_) {
         hot_cache_->BumpKeyGeneration(key);
@@ -3314,8 +3423,19 @@ tl::expected<void, ErrorCode> Client::BatchGetOffloadObject(
     const std::vector<std::string>& keys,
     const std::vector<uintptr_t>& pointers,
     const std::unordered_map<std::string, std::vector<Slice>>& batch_slices) {
+    return BatchGetOffloadObject(transfer_engine_addr, keys, pointers,
+                                 batch_slices,
+                                 OffloadBufferAccess::kTransferEngine);
+}
+
+tl::expected<void, ErrorCode> Client::BatchGetOffloadObject(
+    const std::string& transfer_engine_addr,
+    const std::vector<std::string>& keys,
+    const std::vector<uintptr_t>& pointers,
+    const std::unordered_map<std::string, std::vector<Slice>>& batch_slices,
+    OffloadBufferAccess buffer_access) {
     auto future = transfer_submitter_->submit_batch_get_offload_object(
-        transfer_engine_addr, keys, pointers, batch_slices);
+        transfer_engine_addr, keys, pointers, batch_slices, buffer_access);
     if (!future) {
         LOG(ERROR) << "Failed to submit transfer operation";
         return tl::make_unexpected(ErrorCode::TRANSFER_FAIL);
@@ -3755,16 +3875,193 @@ ErrorCode Client::TransferData(const Replica::Descriptor& replica_descriptor,
     return future->get();
 }
 
-ErrorCode Client::TransferReadInternal(
+std::optional<TransferFuture> Client::SubmitRangeRead(
     const Replica::Descriptor& replica_descriptor, std::vector<Slice>& slices,
     uint64_t src_offset) {
     if (!transfer_submitter_) {
         LOG(ERROR) << "TransferSubmitter not initialized";
-        return ErrorCode::INVALID_PARAMS;
+        return std::nullopt;
+    }
+    return transfer_submitter_->submitRangeRead(replica_descriptor, slices,
+                                                src_offset);
+}
+
+std::optional<TransferFuture> Client::SubmitRangeWrite(
+    const Replica::Descriptor& replica_descriptor, std::vector<Slice>& slices,
+    uint64_t dst_offset) {
+    if (!transfer_submitter_) {
+        LOG(ERROR) << "TransferSubmitter not initialized";
+        return std::nullopt;
+    }
+    return transfer_submitter_->submitRangeWrite(replica_descriptor, slices,
+                                                 dst_offset);
+}
+
+std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferReadRanges(
+    const std::vector<Replica::Descriptor>& replicas,
+    const std::vector<std::vector<Slice>>& slices,
+    const std::vector<std::vector<uint64_t>>& src_offsets) {
+    std::vector<tl::expected<int64_t, ErrorCode>> results(
+        replicas.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    if (replicas.size() != slices.size() ||
+        replicas.size() != src_offsets.size()) {
+        LOG(ERROR) << "BatchTransferReadRanges size mismatch: replicas="
+                   << replicas.size() << ", slices=" << slices.size()
+                   << ", offsets=" << src_offsets.size();
+        return results;
     }
 
-    auto future = transfer_submitter_->submitRangeRead(replica_descriptor,
-                                                       slices, src_offset);
+    size_t fragment_count = 0;
+    for (const auto& entry : slices) {
+        fragment_count += entry.size();
+    }
+
+    // Every fragment of every entry goes into one scatter submit so the
+    // transport sees the whole layer at once instead of one transfer per key.
+    ScatterRangeBuilder builder(fragment_count);
+    std::vector<std::optional<ErrorCode>> entry_errors(replicas.size());
+    for (size_t i = 0; i < replicas.size(); ++i) {
+        if (slices[i].size() != src_offsets[i].size()) {
+            LOG(ERROR) << "BatchTransferReadRanges fragment count mismatch, "
+                       << "entry=" << i << ", slices=" << slices[i].size()
+                       << ", offsets=" << src_offsets[i].size();
+            continue;  // results[i] stays INVALID_PARAMS
+        }
+        if (!replicas[i].is_memory_replica()) {
+            LOG(ERROR) << "Range read requires a memory replica, entry=" << i;
+            continue;
+        }
+
+        const auto& handle =
+            replicas[i].get_memory_descriptor().buffer_descriptor;
+        int64_t transferred = 0;
+        for (size_t j = 0; j < slices[i].size(); ++j) {
+            builder.Add(TransferRequest::READ, handle, slices[i][j],
+                        src_offsets[i][j], &entry_errors[i]);
+            transferred += static_cast<int64_t>(slices[i][j].size);
+        }
+        results[i] = transferred;  // optimistic; corrected on await
+    }
+
+    if (builder.empty()) {
+        return results;
+    }
+
+    auto operation = SubmitScatter(builder.ranges());
+    if (!operation) {
+        LOG(ERROR) << "Failed to submit batch range read";
+        for (auto& result : results) {
+            if (result.has_value()) {
+                result = tl::unexpected(ErrorCode::TRANSFER_FAIL);
+            }
+        }
+        return results;
+    }
+    (void)operation->wait();
+
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (!results[i].has_value() || !entry_errors[i].has_value()) {
+            continue;
+        }
+        LOG(ERROR) << "Range read failed, entry=" << i
+                   << ", error=" << static_cast<int>(entry_errors[i].value());
+        results[i] = tl::unexpected(entry_errors[i].value());
+    }
+    return results;
+}
+
+std::vector<tl::expected<int64_t, ErrorCode>> Client::BatchTransferWriteRanges(
+    const std::vector<std::vector<Replica::Descriptor>>& replicas_per_entry,
+    const std::vector<std::vector<Slice>>& slices,
+    const std::vector<std::vector<uint64_t>>& dst_offsets) {
+    std::vector<tl::expected<int64_t, ErrorCode>> results(
+        replicas_per_entry.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    if (replicas_per_entry.size() != slices.size() ||
+        replicas_per_entry.size() != dst_offsets.size()) {
+        LOG(ERROR) << "BatchTransferWriteRanges size mismatch: entries="
+                   << replicas_per_entry.size() << ", slices=" << slices.size()
+                   << ", offsets=" << dst_offsets.size();
+        return results;
+    }
+
+    size_t fragment_count = 0;
+    for (size_t i = 0; i < replicas_per_entry.size(); ++i) {
+        for (const auto& replica : replicas_per_entry[i]) {
+            if (replica.is_memory_replica()) {
+                fragment_count += slices[i].size();
+            }
+        }
+    }
+
+    // One scatter submit covers every replica of every entry, so replication
+    // fans out inside a single transfer instead of one submit per fragment.
+    ScatterRangeBuilder builder(fragment_count);
+    std::vector<std::optional<ErrorCode>> entry_errors(
+        replicas_per_entry.size());
+    for (size_t i = 0; i < replicas_per_entry.size(); ++i) {
+        if (slices[i].size() != dst_offsets[i].size()) {
+            LOG(ERROR) << "BatchTransferWriteRanges fragment count mismatch, "
+                       << "entry=" << i << ", slices=" << slices[i].size()
+                       << ", offsets=" << dst_offsets[i].size();
+            continue;  // results[i] stays INVALID_PARAMS
+        }
+
+        // Logical bytes: counted once per fragment, not per replica.
+        int64_t transferred = 0;
+        for (const auto& slice : slices[i]) {
+            transferred += static_cast<int64_t>(slice.size);
+        }
+        bool submitted = false;
+        for (const auto& replica : replicas_per_entry[i]) {
+            if (!replica.is_memory_replica()) {
+                continue;
+            }
+            const auto& handle =
+                replica.get_memory_descriptor().buffer_descriptor;
+            for (size_t j = 0; j < slices[i].size(); ++j) {
+                builder.Add(TransferRequest::WRITE, handle, slices[i][j],
+                            dst_offsets[i][j], &entry_errors[i]);
+                submitted = true;
+            }
+        }
+        if (!submitted) {
+            results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
+            continue;
+        }
+        results[i] = transferred;  // optimistic; corrected on await
+    }
+
+    if (builder.empty()) {
+        return results;
+    }
+
+    auto operation = SubmitScatter(builder.ranges());
+    if (!operation) {
+        LOG(ERROR) << "Failed to submit batch range write";
+        for (auto& result : results) {
+            if (result.has_value()) {
+                result = tl::unexpected(ErrorCode::TRANSFER_FAIL);
+            }
+        }
+        return results;
+    }
+    (void)operation->wait();
+
+    for (size_t i = 0; i < results.size(); ++i) {
+        if (!results[i].has_value() || !entry_errors[i].has_value()) {
+            continue;
+        }
+        LOG(ERROR) << "Range write failed, entry=" << i
+                   << ", error=" << static_cast<int>(entry_errors[i].value());
+        results[i] = tl::unexpected(entry_errors[i].value());
+    }
+    return results;
+}
+
+ErrorCode Client::TransferReadInternal(
+    const Replica::Descriptor& replica_descriptor, std::vector<Slice>& slices,
+    uint64_t src_offset) {
+    auto future = SubmitRangeRead(replica_descriptor, slices, src_offset);
     if (!future) {
         LOG(ERROR) << "Failed to submit range read operation";
         return ErrorCode::TRANSFER_FAIL;
@@ -3778,6 +4075,19 @@ ErrorCode Client::TransferReadInternal(
 ErrorCode Client::TransferWrite(const Replica::Descriptor& replica_descriptor,
                                 std::vector<Slice>& slices) {
     return TransferData(replica_descriptor, slices, TransferRequest::WRITE);
+}
+
+ErrorCode Client::TransferWriteRange(
+    const Replica::Descriptor& replica_descriptor, std::vector<Slice>& slices,
+    uint64_t dst_offset) {
+    auto future = SubmitRangeWrite(replica_descriptor, slices, dst_offset);
+    if (!future) {
+        LOG(ERROR) << "Failed to submit range write operation";
+        return ErrorCode::TRANSFER_FAIL;
+    }
+
+    VLOG(1) << "Using transfer strategy: " << future->strategy();
+    return future->get();
 }
 
 ErrorCode Client::TransferRead(const Replica::Descriptor& replica_descriptor,

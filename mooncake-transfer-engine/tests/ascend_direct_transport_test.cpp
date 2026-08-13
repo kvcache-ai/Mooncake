@@ -355,6 +355,9 @@ static int g_transfer_async_count = 0;
 static int g_register_mem_count = 0;
 static int g_deregister_mem_count = 0;
 static std::string g_last_connect_target;
+static adxl::Status g_get_capability_result = adxl::SUCCESS;
+static int32_t g_get_capability_value = 0;
+static std::map<std::string, std::string> g_last_init_options;
 
 namespace adxl_mock {
 void reset() {
@@ -380,6 +383,15 @@ void reset() {
     g_register_mem_count = 0;
     g_deregister_mem_count = 0;
     g_last_connect_target.clear();
+    g_get_capability_result = adxl::SUCCESS;
+    g_get_capability_value = 0;
+    g_last_init_options.clear();
+}
+
+void set_capability_result(adxl::Status status, int32_t value) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    g_get_capability_result = status;
+    g_get_capability_value = value;
 }
 
 void set_connect_result(adxl::Status status) {
@@ -478,6 +490,11 @@ std::string get_last_connect_target() {
     std::lock_guard<std::mutex> lock(g_mutex);
     return g_last_connect_target;
 }
+
+std::map<std::string, std::string> get_last_init_options() {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    return g_last_init_options;
+}
 }  // namespace adxl_mock
 
 }  // namespace
@@ -494,8 +511,12 @@ Status AdxlEngine::Initialize(
     const AscendString& name,
     const std::map<AscendString, AscendString>& options) {
     (void)name;
-    (void)options;
     g_was_initialize_called = true;
+    g_last_init_options.clear();
+    for (const auto& kv : options) {
+        g_last_init_options[std::string(kv.first.GetString())] =
+            std::string(kv.second.GetString());
+    }
     return g_initialize_result;
 }
 
@@ -609,6 +630,13 @@ Status AdxlEngine::DeregisterMem(MemHandle mem_handle) {
     g_deregistered_mem_handles.push_back(
         reinterpret_cast<uintptr_t>(mem_handle));
     return SUCCESS;
+}
+
+Status AdxlEngine::GetCapability(FeatureType feature_type, int32_t& value) {
+    (void)feature_type;
+    std::lock_guard<std::mutex> lock(g_mutex);
+    value = g_get_capability_value;
+    return g_get_capability_result;
 }
 
 }  // namespace adxl
@@ -2298,6 +2326,53 @@ TEST(StoreResourceConfigSplitTest, IsRoceModeEnabled_StoreRoceP2pHccs) {
         EXPECT_FALSE(IsRoceModeEnabled()) << "P2P TE should resolve to HCCS";
     }
     unsetenv("ASCEND_GLOBAL_RESOURCE_CONFIG");
+}
+
+// -----------------------------------------------------------------------------
+// Client-Server mode: when capability is supported and user did not set
+// ASCEND_LOCAL_COMM_RES, Mooncake auto-injects LocalCommRes={"version":"1.3"}
+// so EngineFactory selects HixlEngine (HixlCS path).
+// -----------------------------------------------------------------------------
+
+class ClientServerModeTest : public AscendDirectTransportTest {
+   protected:
+    void SetUp() override {
+        AscendDirectTransportTest::SetUp();
+        unsetenv("ASCEND_LOCAL_COMM_RES");
+    }
+    void TearDown() override {
+        unsetenv("ASCEND_LOCAL_COMM_RES");
+        AscendDirectTransportTest::TearDown();
+    }
+};
+
+TEST_F(ClientServerModeTest, AutoInjectLocalCommResWhenSupported) {
+    adxl_mock::set_capability_result(adxl::SUCCESS, 1);
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    const auto opts = adxl_mock::get_last_init_options();
+    auto it = opts.find("adxl.LocalCommRes");
+    ASSERT_NE(it, opts.end());
+    EXPECT_EQ(it->second, R"({"version":"1.3"})");
+}
+
+TEST_F(ClientServerModeTest, NoInjectWhenNotSupported) {
+    adxl_mock::set_capability_result(adxl::SUCCESS, 0);
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    const auto opts = adxl_mock::get_last_init_options();
+    EXPECT_EQ(opts.find("adxl.LocalCommRes"), opts.end());
+}
+
+TEST_F(ClientServerModeTest, UserEnvOverridesAutoInject) {
+    adxl_mock::set_capability_result(adxl::SUCCESS, 1);
+    setenv("ASCEND_LOCAL_COMM_RES", R"({"version":"1.2"})", 1);
+    auto transport = createTransport();
+    ASSERT_NE(transport, nullptr);
+    const auto opts = adxl_mock::get_last_init_options();
+    auto it = opts.find("adxl.LocalCommRes");
+    ASSERT_NE(it, opts.end());
+    EXPECT_EQ(it->second, R"({"version":"1.2"})");
 }
 
 int main(int argc, char** argv) {

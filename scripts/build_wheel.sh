@@ -303,7 +303,7 @@ if [ "$NPU_BUILD" = "1" ]; then
     max_attempts=3
     attempt=1
     while [ $attempt -le $max_attempts ]; do
-        if "$PYTHON_CMD" -m pip install --upgrade pip build setuptools wheel auditwheel; then
+        if "$PYTHON_CMD" -m pip install --upgrade pip build setuptools wheel auditwheel numpy; then
             break
         fi
         echo "pip install attempt $attempt/$max_attempts failed, retrying in 5s..."

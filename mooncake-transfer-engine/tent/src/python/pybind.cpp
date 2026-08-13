@@ -300,6 +300,8 @@ PYBIND11_MODULE(tent, m) {
         .value("TCP", TransportType::TCP)
         .value("AscendDirect", TransportType::AscendDirect)
         .value("SUNRISE_LINK", TransportType::SUNRISE_LINK)
+        .value("TPU", TransportType::TPU)
+        .value("UB", TransportType::UB)
         .export_values();
 
     py::enum_<IntentType>(m, "IntentType")

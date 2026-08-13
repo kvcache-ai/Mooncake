@@ -60,6 +60,21 @@
                 "rail_topo_path": "/path/to/rail_topo.json"
             }
         },
+        "ub": {
+            "enable": false,
+            "device_filter": [],
+            "worker_count": 4,
+            "poller_count": 1,
+            "jfc_per_context": 1,
+            "jetty_per_endpoint": 4,
+            "max_endpoints": 4096,
+            "slice_size": 65536,
+            "max_retries": 3,
+            "slice_timeout_ms": 10000,
+            "endpoint_cooldown_ms": 30000,
+            "enable_bandwidth_estimation": true,
+            "enable_notifications": false
+        },
         "tcp": {
             "enable": true,
             "max_retry_count": 3,
