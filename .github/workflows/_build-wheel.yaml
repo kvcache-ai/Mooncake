@@ -26,6 +26,10 @@ on:
         # Used by nightly builds to stamp date-based dev versions.
         type: string
         default: ''
+      with-ep:
+        description: 'Enable Mooncake EP for the selected build profile'
+        type: boolean
+        default: false
 
 env:
   SCCACHE_GHA_ENABLED: "true"
@@ -47,6 +51,7 @@ jobs:
     env:
       BUILD_ARCHITECTURE: ${{ inputs.architecture }}
       BUILD_VARIANT: ${{ inputs.variant }}
+      ENABLE_EP: ${{ inputs.with-ep }}
     steps:
       - name: Checkout source
         uses: actions/checkout@v4
@@ -92,6 +97,10 @@ jobs:
               ep_versions=''
               build_nvlink=false
               cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=OFF -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release'
+              if [ "$ENABLE_EP" = "true" ]; then
+                ep_versions='2.13.0'
+                cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=ON -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release'
+              fi
               ;;
             non-cuda:arm64)
               variant_flag=NON_CUDA_BUILD
