@@ -1981,6 +1981,59 @@ tl::expected<void, ErrorCode> MasterService::PersistStaleHandleCleanupForHA(
     return {};
 }
 
+namespace {
+
+constexpr int kOplogRetryMaxAttempts = 10;
+constexpr int kOplogRetryMaxAttemptsUnavailable = 5;
+constexpr int kOplogRetryMaxDelayMs = 16;
+
+// RetryOplogPersist retries an oplog persist operation on transient
+// backpressure with bounded exponential backoff, so that a momentary
+// hiccup does not defer stale-handle cleanup to the next sweep.
+// Persistent or non-backpressure failures keep the existing behavior:
+// the caller skips the key and retries on the next cleanup round.
+template <typename F>
+auto RetryOplogPersist(F&& persist_fn) -> decltype(std::declval<F>()()) {
+    for (int attempt = 0; attempt <= kOplogRetryMaxAttempts; ++attempt) {
+        auto result = persist_fn();
+        if (result) {
+            return result;
+        }
+        const ErrorCode err = result.error();
+
+        if (err == ErrorCode::TASK_PENDING_LIMIT_EXCEEDED) {
+            // Slots full: writer is sealing the current batch and will
+            // free capacity imminently. Worth waiting.
+            if (attempt == kOplogRetryMaxAttempts) {
+                return result;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(
+                std::min(1 << attempt, kOplogRetryMaxDelayMs)));
+            continue;
+        }
+
+        if (err == ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS) {
+            // Writer not accepting: write_batch is retrying against the
+            // KV backend. Recovery depends on the backend; bail out
+            // earlier to avoid spinning on a persistent outage.
+            if (attempt >= kOplogRetryMaxAttemptsUnavailable) {
+                LOG(WARNING) << "Oplog writer not accepting after " << attempt
+                             << " retries, giving up this sweep";
+                return result;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(
+                std::min(1 << attempt, kOplogRetryMaxDelayMs)));
+            continue;
+        }
+
+        // Non-backpressure errors (INVALID_PARAMS etc.) — no retry.
+        return result;
+    }
+    return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+}
+
+}  // namespace
+
 std::unordered_map<std::string, MasterService::ObjectMetadata>::iterator
 MasterService::EraseMetadata(
     TenantState& tenant_state,
@@ -2413,10 +2466,11 @@ void MasterService::ClearInvalidHandles(
                 if (!cleanup_plan.removed_ids.empty()) {
                     if (enable_ha_) {
                         if (enable_oplog_) {
-                            auto persist_result =
-                                PersistStaleHandleCleanupForHA(
+                            auto persist_result = RetryOplogPersist([&]() {
+                                return PersistStaleHandleCleanupForHA(
                                     "ClearInvalidHandles", tenant_it->first,
                                     it->first, it->second, cleanup_plan);
+                            });
                             if (!persist_result) {
                                 ++it;
                                 continue;
@@ -2435,8 +2489,8 @@ void MasterService::ClearInvalidHandles(
                 } else if (!it->second.IsValid()) {
                     if (enable_ha_) {
                         if (enable_oplog_) {
-                            auto persist_result =
-                                AppendOpLogWithDurableFinalize(
+                            auto persist_result = RetryOplogPersist([&]() {
+                                return AppendOpLogWithDurableFinalize(
                                     OpType::REMOVE, tenant_it->first.value(),
                                     it->first, {},
                                     [this](const OpLogEntry& durable_entry) {
@@ -2444,6 +2498,7 @@ void MasterService::ClearInvalidHandles(
                                             durable_entry,
                                             QuotaEraseMode::kFull);
                                     });
+                            });
                             if (!persist_result) {
                                 LOG(WARNING)
                                     << "ClearInvalidHandles(last replica)"
