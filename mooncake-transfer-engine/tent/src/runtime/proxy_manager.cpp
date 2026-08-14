@@ -38,6 +38,8 @@ Status ProxyManager::deconstruct() {
         shards_[i].cv.notify_all();
         shards_[i].thread.join();
     }
+    // The workers are joined above, but Pin/Unpin arrive on the RPC thread.
+    std::unique_lock<std::shared_mutex> guard(stage_buffers_mutex_);
     for (auto entry : stage_buffers_) {
         impl_->unregisterLocalMemory(entry.second.chunks);
         impl_->freeLocalMemory(entry.second.chunks);
@@ -561,6 +563,10 @@ Status ProxyManager::transferSync(StagingTask& task, StageBufferCache* cache) {
 }
 
 Status ProxyManager::allocateStageBuffers(const std::string& location) {
+    // Held across the slow allocate + register, which run once per location.
+    // Racing instead would register the same hundreds of MB twice, then throw
+    // one away.
+    std::unique_lock<std::shared_mutex> guard(stage_buffers_mutex_);
     if (stage_buffers_.count(location)) return Status::OK();
     StageBuffers buf;
     auto total_size = chunk_size_ * chunk_count_;
@@ -575,6 +581,7 @@ Status ProxyManager::allocateStageBuffers(const std::string& location) {
 }
 
 Status ProxyManager::freeStageBuffers(const std::string& location) {
+    std::unique_lock<std::shared_mutex> guard(stage_buffers_mutex_);
     auto it = stage_buffers_.find(location);
     if (it == stage_buffers_.end())
         return Status::InvalidArgument("Stage buffer not allocated" LOC_MARK);
@@ -587,10 +594,17 @@ Status ProxyManager::freeStageBuffers(const std::string& location) {
 
 Status ProxyManager::pinStageBuffer(const std::string& location,
                                     uint64_t& addr) {
+    std::shared_lock<std::shared_mutex> guard(stage_buffers_mutex_);
     auto it = stage_buffers_.find(location);
     if (it == stage_buffers_.end()) {
+        // allocateStageBuffers needs the lock exclusively, so drop ours. It
+        // re-checks under its own lock, so losing the race here is harmless.
+        guard.unlock();
         CHECK_STATUS(allocateStageBuffers(location));
+        guard.lock();
         it = stage_buffers_.find(location);
+        if (it == stage_buffers_.end())
+            return Status::InternalError("Stage buffer disappeared" LOC_MARK);
     }
 
     auto& buf = it->second;
@@ -605,6 +619,7 @@ Status ProxyManager::pinStageBuffer(const std::string& location,
 }
 
 Status ProxyManager::unpinStageBuffer(uint64_t addr) {
+    std::shared_lock<std::shared_mutex> guard(stage_buffers_mutex_);
     for (auto& [location, buf] : stage_buffers_) {
         auto base = reinterpret_cast<uint64_t>(buf.chunks);
         auto end = base + chunk_size_ * chunk_count_;

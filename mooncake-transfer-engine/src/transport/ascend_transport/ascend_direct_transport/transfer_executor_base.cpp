@@ -111,6 +111,8 @@ void TransferExecutorBase::ParseExecutorEnvIntoInitParams(InitParams& params) {
         params.auto_connect = true;
         LOG(INFO) << "AutoConnect enabled by capability probe";
     }
+    params.client_server_mode =
+        adxl::IsAdxlFeatureSupported(adxl::CLIENT_SERVER_COMM);
     char* buffer_pool = std::getenv("ASCEND_BUFFER_POOL");
     if (buffer_pool && std::strcmp(buffer_pool, "0:0") != 0) {
         params.use_buffer_pool = true;
@@ -173,6 +175,10 @@ int TransferExecutorBase::initEngines() {
     if (local_comm_res) {
         options["adxl.LocalCommRes"] = local_comm_res;
         LOG(INFO) << "Set LocalCommRes to:" << local_comm_res;
+    } else if (params_.client_server_mode) {
+        options["adxl.LocalCommRes"] = R"({"version":"1.3"})";
+        LOG(INFO) << "Client-Server mode enabled, set LocalCommRes to "
+                     "{\"version\":\"1.3\"}";
     }
 
     options[kAutoConnect] = params_.auto_connect ? kEnabled : kDisabled;

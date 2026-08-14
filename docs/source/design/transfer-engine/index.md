@@ -543,6 +543,14 @@ kunpeng_ub_transport
 sunrise_link_transport
 :::
 
+## MPComm Transport Component
+
+::::{toctree}
+:maxdepth: 1
+
+mpcomm_transport
+::::
+
 ## Benchmark and Tuning Guide
 
 :::{toctree}

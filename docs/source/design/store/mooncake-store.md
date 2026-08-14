@@ -21,7 +21,7 @@ Key features of Mooncake Store include:
 
 ## Architecture
 
-![architecture](../image/mooncake-store-preview.png)
+![architecture](../../image/mooncake-store-preview.png)
 
 As shown in the figure above, there are two key components in Mooncake Store: **Master Service** and **Client**.
 
@@ -67,7 +67,7 @@ The `Client` class provides the primary interface for Mooncake Store operations:
 | `BatchReplicaClear` | Batch clear replicas on specific segments |
 | `QueryByRegex` / `RemoveByRegex` | Query or delete objects matching a regex |
 
-For full API signatures, parameter details, and usage examples, see the [Mooncake Store C++ API Reference](../api-reference/cpp/mooncake-store.md).
+For full API signatures, parameter details, and usage examples, see the [Mooncake Store C++ API Reference](../../api-reference/cpp/mooncake-store.md).
 
 ## Master Service
 
@@ -95,19 +95,7 @@ To reduce cache warm-up time after a master restart, the Master Service supports
 
 The Master Service can optionally enforce strict multi-tenant memory quota admission. This feature is disabled by default. When `enable_multi_tenants=false`, request tenant IDs are ignored for object placement, all objects use the `default` namespace, and tenant quota management requests return `UNAVAILABLE_IN_CURRENT_MODE`.
 
-When strict multi-tenant mode is enabled, the tenant quota policy is loaded from the configured connector. Supported connector types are `file` and, when the store is built with `STORE_USE_ETCD=ON`, `etcd`. The `file` connector uses `tenant_quota_connector_uri=<path>` as a writable YAML policy path. The `etcd` connector uses `tenant_quota_connector_uri=<endpoints>` as the etcd endpoints string and stores the same YAML policy in `mooncake-store/<cluster_id>/tenant_quota_policy`; if that key does not exist, the master starts with an empty policy so the first policy can be created through the admin API. The etcd connector shares the process-wide store etcd client used by HA/oplog, so deployments that enable both must configure matching etcd endpoints. Tenants must be explicitly present in that connector policy before they can write. Missing tenants, empty tenants, and an unregistered `default` tenant are rejected with `TENANT_NOT_REGISTERED`.
-
-The YAML policy uses schema version `1`:
-
-```yaml
-version: 1
-
-tenants:
-  - name: tenant-a
-    quota: 200GB
-```
-
-Tenant names must be non-empty, unique, must not start with `_`, and must not contain NUL or control characters. Quotas must be positive integers and may use `B`, `KB`, `MB`, `GB`, or `TB` units.
+See [Multi-Tenant Deployment](../../deployment/multi-tenancy.md) for configuration details.
 
 Effective quota is recomputed from the current registered memory capacity:
 
@@ -118,16 +106,7 @@ Effective quota is recomputed from the current registered memory capacity:
 
 `PutStart` and size-changing `UpsertStart` charge quota before memory is allocated. If the first reservation fails, the master performs tenant-scoped memory eviction for the target tenant and retries the reservation. The retry is bounded to two eviction attempts. Tenant quota eviction scans only the target tenant, skips hard-pinned objects, honors soft-pin eviction configuration, and preserves grouped-object lease safety checks.
 
-Admin policy changes are persisted before the final in-memory policy is applied. `PUT` writes the connector first and then applies the policy in memory. `DELETE` first marks the tenant unregistered in memory to block concurrent writes, verifies the tenant is empty, writes the connector, and rolls back the in-memory mark if the connector write fails. The admin HTTP API exposes:
-
-| Method | Path | Description |
-|--------|------|-------------|
-| `GET` | `/api/v1/tenant_quotas` | List quota snapshots for active or explicit tenants |
-| `GET` | `/api/v1/tenant_quotas?tenant_id=<tenant>` | Query one tenant quota snapshot |
-| `PUT` | `/api/v1/tenant_quotas?tenant_id=<tenant>` | Create or update a tenant quota policy |
-| `DELETE` | `/api/v1/tenant_quotas?tenant_id=<tenant>` | Delete an empty tenant quota policy |
-
-Tenant quota snapshots include `tenant_id`, `requested_quota_bytes`, `effective_quota_bytes`, `used_bytes`, `reserved_bytes`, `committed_count`, `metadata_object_count`, `over_quota`, and `has_explicit_policy`.
+Admin policy changes are persisted before the final in-memory policy is applied. `PUT` writes the connector first and then applies the policy in memory. `DELETE` first marks the tenant unregistered in memory to block concurrent writes, verifies the tenant is empty, writes the connector, and rolls back the in-memory mark if the connector write fails.
 
 Snapshots restore object runtime state only. Tenant quota policy is always loaded from the connector after metadata restore, then usage and effective quota are rebuilt from restored metadata and current registered capacity. If the connector cannot be loaded in strict multi-tenant mode, startup fails.
 
@@ -494,7 +473,7 @@ Mooncake Store provides two concrete implementations of `BufferAllocatorBase`:
 
 **OffsetBufferAllocator (default and recommended)**: This allocator is derived from [OffsetAllocator](https://github.com/sebbbi/OffsetAllocator), which uses a custom bin-based allocation strategy that supports fast hard realtime `O(1)` offset allocation with minimal fragmentation. Mooncake Store optimizes this allocator based on the specific memory usage characteristics of LLM inference workloads, thereby enhancing memory utilization in LLM scenarios.
 
-For measured utilization and allocation latency across LLM-style workloads, see [Allocator Performance](../performance/mooncake/allocator-benchmark-result.md).
+For measured utilization and allocation latency across LLM-style workloads, see [Allocator Performance](../../performance/mooncake/allocator-benchmark-result.md).
 
 **CachelibBufferAllocator (deprecated)**: This allocator leverages Facebook's [CacheLib](https://github.com/facebook/CacheLib) to manage memory using a slab-based allocation strategy. It provides efficient memory allocation with good fragmentation resistance and is well-suited for high-performance scenarios. However, in our modified version, it does not handle workloads with highly variable object sizes effectively, so it is currently marked as deprecated.
 
@@ -588,7 +567,7 @@ Valid values are: `random` (default), `free_ratio_first`, `ssd_free_ratio_first`
 
 **Use `local_first`** when inference workers and Mooncake Store memory segments are colocated and you want writes to prefer the writer's host before falling back to other hosts. For this strategy to work correctly, all writer and store processes on the same physical or logical host must use the same stable, globally unique host part in `local_hostname`.
 
-For benchmark data comparing `random` and `free_ratio_first` across segment counts, replica counts, and skewed capacities, see [AllocationStrategy Performance](../performance/mooncake/allocation-strategy-benchmark-result.md).
+For benchmark data comparing `random` and `free_ratio_first` across segment counts, replica counts, and skewed capacities, see [AllocationStrategy Performance](../../performance/mooncake/allocation-strategy-benchmark-result.md).
 
 #### Strategy Details
 
@@ -706,15 +685,19 @@ Mooncake Store provides a **preferred segment allocation** feature that allows u
 
 ### How It Works
 
-The preferred segment allocation feature is implemented through the `AllocationStrategy` system and is controlled via the `preferred_segment` field in the `ReplicateConfig` structure:
+The preferred segment allocation feature is implemented through the
+`AllocationStrategy` system. The following excerpt shows the legacy
+single-segment field and the memory-replica count used by this path; other
+`ReplicateConfig` fields are omitted:
 
 ```cpp
 struct ReplicateConfig {
-    size_t replica_num{1};                    // Total number of replicas for the object
+    size_t replica_num{1};                    // Number of memory replicas
     SoftPinAction soft_pin_action{SoftPinAction::PRESERVE};
     std::optional<uint64_t> soft_pin_ttl_ms{}; // ENABLE override; omitted uses the Master default
     bool with_hard_pin{false};               // Whether to enable hard pin (never evicted)
     std::string preferred_segment{};         // Preferred segment for allocation
+    // Other fields, including nof_replica_num and dfs_replica_num, are omitted.
 };
 ```
 
@@ -731,38 +714,80 @@ When a `Put` operation is initiated with a non-empty `preferred_segment` value, 
 
 ## Multi-layer Storage Support
 
-This system provides support for a hierarchical cache architecture, enabling efficient data access through a combination of in-memory caching and persistent storage. Data is initially stored in memory cache and asynchronously backed up to a Distributed File System (DFS), forming a two-tier "memory-SSD persistent storage" cache structure.
+Mooncake Store supports three file-backed storage models in addition to memory
+and NoF replicas:
 
-### Enabling Persistence Functionality
+- `DISK` is the legacy shared-filesystem persistence path enabled by the
+  master's `--root_fs_dir` flag.
+- `LOCAL_DISK` replicas are owned by a real client and use the asynchronous SSD
+  offload and heartbeat protocol.
+- `DFS` replicas occupy globally allocated ranges in shard files on a shared
+  distributed filesystem. Any correctly configured client can access them.
 
-When the user specifies `--root_fs_dir=/path/to/dir` when starting the master, and this path is a valid DFS-mounted directory on all machines where the clients reside, Mooncake Store's tiered caching functionality will work properly. Additionally, during master initialization, a `cluster_id` is loaded. This ID can be specified during master initialization (`--cluster_id=xxxx`). If not specified, the default value `mooncake_cluster` will be used. Subsequently, the root directory for client persistence will be `<root_fs_dir>/<cluster_id>`.
+These models have independent placement, metadata, and lifecycle rules.
 
-​Note​​: When enabling this feature, the user must ensure that the DFS-mounted directory (`root_fs_dir=/path/to/dir`) is valid and consistent across all client hosts. If some clients have invalid or incorrect mount paths, it may cause abnormal behavior in Mooncake Store.
+### Legacy shared-filesystem `DISK` replicas
 
-This `root_fs_dir` path is a legacy persistence path. SSD offload uses `--enable_offload=true` on the master and real client, stores data under the real client's `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH`, and records `LOCAL_DISK` replicas. Do not use `--root_fs_dir` with `--enable_offload=true`.
+When the master starts with `--root_fs_dir=/shared/path`, it adds a legacy
+`DISK` replica to each new object. Clients write that replica asynchronously to
+the per-cluster directory `<root_fs_dir>/<cluster_id>` and can read it when the
+normal replica-selection path chooses `DISK`. The path must identify the same
+shared filesystem location on every participating client.
 
-### Persistent Storage Space Configuration​
-Mooncake provides configurable DFS available space. Users can specify `--global_file_segment_size=1048576` when starting the master, indicating a maximum usable space of 1MB on DFS.
-The current default setting is the maximum value of int64 (as we generally do not restrict DFS storage usage), which is displayed as `infinite` in `mooncake_maseter`'s console logs.
-**Notice**  The DFS cache space configuration must be used together with the `--root_fs_dir` parameter. Otherwise, you will observe that the `SSD Storage` usage consistently shows: `0 B / 0 B`
-**Notice** The capability for file eviction on DFS has not been provided yet
+`--global_file_segment_size` declares the legacy file capacity used by master
+metrics; its default is unlimited. It does not configure or limit the
+descriptor-based DFS shard allocator. Do not combine the legacy path with the
+client-owned SSD-offload mode; see the deployment guide for the corresponding
+flags and restrictions.
 
-### Data Access Mechanism
+### Descriptor-based DFS replicas
 
-The persistence feature also follows Mooncake Store's design principle of separating control flow from data flow. The read/write operations of kvcache objects are completed on the client side, while the query and management functions of kvcache objects are handled on the master side. In the file system, the key -> kvcache object index information is maintained by a fixed indexing mechanism, with each file corresponding to one kvcache object (the filename serves as the associated key name).
+```{warning}
+**Work in progress.** Descriptor-based DFS is not production-ready and is not
+covered by the general fault-tolerance, HA continuity, durability, or
+multi-tenant guarantees described elsewhere in this design document.
+```
 
-After enabling the persistence feature:
+The master owns DFS placement metadata and an allocator for the shared shard
+files. During `PutStart` or `UpsertStart`, it allocates an aligned range and
+returns a descriptor containing the shard path, shard index, offset, object
+size, and aligned size. The replica remains `PROCESSING` until the request is
+finalized. Removal, revocation, replacement, and allocator eviction release
+the range, with a configurable deferred-free interval preventing immediate
+offset reuse.
 
-- For each `Put` or `BatchPut` operation, both a synchronous memory pool write operation and an asynchronous DFS persistence operation will be initiated.
-- For each `Get` or `BatchGet` operation, if the corresponding kvcache is not found in the memory pool, the system will attempt to read the file data from DFS and return it to the user.
+The client owns the DFS data plane. `DistributedStorageBackend` validates the
+descriptor and delegates positional I/O to either `PosixFsAdapter` or
+`Hf3fsAdapter`. The master and clients must use the same DFS root and shard
+layout so that a descriptor identifies the same physical file everywhere.
 
-### 3FS USRBIO Plugin (Experimental)
+For a write, the client first completes the requested memory and NoF transfers,
+then writes the DFS replica. `Put`, `BatchPut`, `Upsert`, and `BatchUpsert`
+acknowledge success only after the requested DFS `WriteAt` operations return
+successfully. This is request-synchronous acknowledgement, not an `fsync`
+durability guarantee. If either an existing object or an incoming same-size
+`Upsert` has a DFS replica, the requested memory, NoF, and DFS replica counts
+must match the existing topology.
+
+For a read, the master returns the readable replica list through the normal
+query path. The client selects the first complete replica; if that replica is a
+DFS replica, it uses the descriptor to read the requested range directly from
+the shared shard file.
+
+See the {ref}`Mooncake Store deployment guide <dfs-storage>` for
+configuration, usage, and current limitations.
+
+### HF3FS USRBIO Adapter (Experimental)
 
 ```{note}
 This integration is **experimental** and incomplete; see the plugin page for details before relying on it.
 ```
 
-If you need to use 3FS's native API (USRBIO) to achieve high-performance persistent file reads and writes, you can refer to the configuration instructions in this document [3FS USRBIO Plugin](../getting_started/plugin-usage/3FS-USRBIO-Plugin.md).
+The descriptor-based DFS data plane can use the native HF3FS USRBIO API instead
+of POSIX I/O. Select it with `MOONCAKE_DFS_FS_ADAPTER=hf3fs`; the legacy
+`--root_fs_dir` option does not enable this path, and there is no automatic
+fallback to POSIX. See the [HF3FS USRBIO adapter guide](../../getting_started/plugin-usage/3FS-USRBIO-Plugin.md)
+for build prerequisites and configuration.
 
 ## Builtin Metadata Server
 Mooncake Store provides a built-in HTTP metadata server as an alternative to etcd for storing cluster metadata. This feature is particularly useful for development environments or scenarios where etcd is not available.
@@ -793,7 +818,7 @@ To start the master service with the HTTP metadata server enabled:
 When enabled, the HTTP metadata server will start automatically and provide metadata services for the Mooncake Store cluster. This eliminates the need for an external etcd deployment, simplifying the setup process for development and testing environments.
 Note that the HTTP metadata server is designed for single-node deployments and does not provide the high availability features that etcd offers. For production environments requiring high availability, etcd is still the recommended choice.
 
-For detailed guidance on monitoring master metrics, Prometheus endpoints, and health checks, see the [Observability guide](../getting_started/observability.md).
+For detailed guidance on monitoring master metrics, Prometheus endpoints, and health checks, see the [Observability guide](../../getting_started/observability.md).
 
 ## Mooncake Store Python API
 
@@ -817,4 +842,8 @@ When to bump the version:
 :maxdepth: 1
 
 ssd-offload
+unified-parallel-tensor-io
+ssd-free-ratio-first-allocation
+engram
+
 :::

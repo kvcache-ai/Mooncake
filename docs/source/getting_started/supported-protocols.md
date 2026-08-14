@@ -17,6 +17,7 @@ Mooncake Transfer Engine supports multiple communication protocols for data tran
 | **cxl** | CXL-capable hardware | Memory pooling and sharing | ⚠️ Advanced |
 | **ascend** | Huawei Ascend NPU | Ascend NPU communication | ⚠️ Advanced |
 | **tpu** | Google TPU (PJRT) | TPU KV-cache transfer via host-DRAM staging | 🧪 Experimental (TENT) |
+| **mpcomm** | RDMA-capable NIC(s) | Multi-NIC memory pooling with NIC/QP load balancing | ⚠️ Advanced (TENT) |
 
 ## Commonly Used Protocols (Python API)
 
@@ -299,6 +300,35 @@ planned as a follow-up.
   transport and the cross-node hop to RDMA/TCP.
 - DMA-mapped (pinned) staging buffers for true async device DMA are a planned
   performance follow-up.
+
+### MPComm Transport (mpcomm)
+
+**Description:** UCL-MPComm (Unified Communication Library - Memory Pool Communication) is an RDMA
+library for heterogeneous memory pooling, integrated as a TENT transport. It drives multiple RDMA
+NICs concurrently with two-level load balancing (across NICs, and across QPs within a NIC) and
+NUMA-aware worker placement, exposing one-sided put/get primitives. It is shortened to MPComm
+below.
+
+**Status:** TENT only. There is no MPComm backend on the legacy Transfer Engine transport path,
+so it cannot be selected through `MOONCAKE_PROTOCOL` or `transfer_engine_bench --protocol=`.
+
+**Use When:**
+- The host has several RDMA NICs and you want them saturated by a single transfer stream
+- Multi-NUMA hosts where NIC-to-NUMA affinity matters
+
+**Requirements:**
+- Built with `-DUSE_TENT=ON -DUSE_MPCOMM=ON -DMPCOMM_ROOT=<prefix>`
+- MPComm installed, providing `include/mpcomm.h` and `lib/libmpcomm.so`
+  (<https://github.com/Tencent/UCL-MPComm>)
+- `libmpcomm.so` reachable by the dynamic linker at run time
+
+**Enable:**
+```json
+{ "transports": { "mpcomm": { "enable": true } } }
+```
+
+See [MPComm Transport](../design/transfer-engine/mpcomm_transport.md) for the full guide,
+including selection via transport policy, tuning environment variables, and troubleshooting.
 
 ## Configuration Examples
 

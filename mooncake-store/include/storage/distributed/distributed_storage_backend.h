@@ -1,27 +1,64 @@
 #pragma once
 
+#include <chrono>
+#include <cstdint>
 #include <memory>
+#include <mutex>
+#include <string>
+#include <vector>
 
 #include "fs_adapter.h"
+#include "replica.h"
+#include "storage/distributed/object_storage_adapter.h"
 #include "storage_backend.h"
 
 namespace mooncake {
 
+// Filesystem mode is the descriptor-based shard/offset DFS data path. Object
+// storage remains a separate, logical-key-oriented I/O mode.
+enum class DistributedStorageMode {
+    kFileSystem,
+    kObjectStorage,
+};
+
 struct DistributedStorageConfig {
-    std::string fsdir = "distributed_dir";
+    std::string fsdir = "/mnt/3fs/mooncake";
     std::string fs_adapter_type = "hf3fs";
     bool enable_health_check = false;
-    int hash_bucket_count = 256;
+    int shard_count = 64;
+    uint64_t shard_capacity = 4ULL * 1024 * 1024 * 1024;
+    uint64_t alignment = 4096;
+    bool single_tenant = true;
+    bool eviction_enabled = true;
+    double eviction_high_watermark = 0.9;
+    double eviction_low_watermark = 0.7;
+    std::chrono::seconds deferred_free_duration{30};
+    std::chrono::seconds eviction_check_interval{5};
 
     bool Validate() const;
+    bool ValidateForAllocator() const;
     static DistributedStorageConfig FromEnvironment();
+    std::string FormatStr() const;
+};
+
+struct DfsWriteRequest {
+    std::string key;
+    DistributedFSDescriptor descriptor;
+    std::vector<Slice> slices;
+};
+
+struct DfsReadRequest {
+    std::string key;
+    DistributedFSDescriptor descriptor;
+    std::vector<Slice> slices;
 };
 
 /**
- * @brief Distributed filesystem storage backend.
+ * @brief Distributed filesystem and object storage backend.
  *
- * Implements StorageBackendInterface, delegating I/O to a FileSystemAdapter.
- * Does not handle eviction (DFS manages its own space).
+ * Uses a FileSystemAdapter for descriptor-based DFS reads and writes, or an
+ * ObjectStorageAdapter for whole-object offload operations. Does not handle
+ * eviction.
  */
 class DistributedStorageBackend : public StorageBackendInterface {
    public:
@@ -29,6 +66,20 @@ class DistributedStorageBackend : public StorageBackendInterface {
         const FileStorageConfig& file_storage_config,
         const DistributedStorageConfig& distributed_config,
         std::unique_ptr<FileSystemAdapter> fs_adapter);
+    ~DistributedStorageBackend() override;
+
+    // Exactly one adapter must be non-null.
+    DistributedStorageBackend(
+        const FileStorageConfig& file_storage_config,
+        const DistributedStorageConfig& distributed_config,
+        std::unique_ptr<FileSystemAdapter> fs_adapter,
+        std::unique_ptr<ObjectStorageAdapter> object_storage_adapter);
+
+    DistributedStorageMode GetStorageMode() const { return storage_mode_; }
+
+    bool UsesObjectStorage() const {
+        return storage_mode_ == DistributedStorageMode::kObjectStorage;
+    }
 
     tl::expected<void, ErrorCode> Init() override;
 
@@ -39,6 +90,14 @@ class DistributedStorageBackend : public StorageBackendInterface {
             complete_handler,
         EvictionHandler eviction_handler = nullptr) override;
 
+    std::vector<tl::expected<void, ErrorCode>> BatchWrite(
+        const std::vector<DfsWriteRequest>& requests);
+
+    std::vector<tl::expected<void, ErrorCode>> BatchRead(
+        const std::vector<DfsReadRequest>& requests);
+
+    // Key-only storage backend operations cannot safely address DFS objects;
+    // callers must use BatchRead/BatchWrite with request-scoped descriptors.
     tl::expected<void, ErrorCode> BatchLoad(
         std::unordered_map<std::string, Slice>& batched_slices) override;
 
@@ -52,14 +111,18 @@ class DistributedStorageBackend : public StorageBackendInterface {
             std::vector<StorageObjectMetadata>& metadatas)>& handler) override;
 
    private:
-    std::string GetObjectPath(const std::string& key) const;
-    static std::string EscapeFilename(const std::string& key);
-    static std::string UnescapeFilename(const std::string& name);
+    struct ShardFile {
+        std::string path;
+        int fd = -1;
+        std::mutex mutex;
+    };
 
     std::unique_ptr<FileSystemAdapter> fs_adapter_;
+    std::unique_ptr<ObjectStorageAdapter> object_storage_adapter_;
     DistributedStorageConfig distributed_config_;
     std::string root_dir_;
-    int hash_bucket_count_;
+    std::vector<std::unique_ptr<ShardFile>> shard_files_;
+    DistributedStorageMode storage_mode_ = DistributedStorageMode::kFileSystem;
     bool initialized_ = false;
 };
 

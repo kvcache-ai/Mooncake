@@ -38,6 +38,9 @@ if [ -f "${BUILD_DIR}/mooncake-pg/src/libmooncake_pg.so" ]; then
     cp "${BUILD_DIR}/mooncake-pg/src/libmooncake_pg.so" mooncake-wheel/mooncake/libmooncake_pg.so
 fi
 
+# Copy the shared segment wrapper, which builds on engine.so
+cp mooncake-integration/shared_segment.py mooncake-wheel/mooncake/shared_segment.py
+
 # Copy libasio.so to mooncake directory (runtime dependency of engine.so)
 cp ${BUILD_DIR}/mooncake-common/libasio.so mooncake-wheel/mooncake/libasio.so
 
@@ -163,6 +166,17 @@ if [ "$NPU_BUILD" = "1" ]; then
 fi
 
 echo "Building wheel package..."
+# Stage the reshard Python package for the combined Mooncake wheel. The tracked
+# source of truth remains in the top-level module.
+RESHARD_SOURCE_DIR="mooncake-reshard/python/mooncake/reshard"
+RESHARD_STAGING_DIR="$(pwd)/mooncake-wheel/mooncake/reshard"
+cleanup_reshard_staging() {
+    rm -rf "${RESHARD_STAGING_DIR}"
+}
+trap cleanup_reshard_staging EXIT
+rm -rf "${RESHARD_STAGING_DIR}"
+cp -R "${RESHARD_SOURCE_DIR}" "${RESHARD_STAGING_DIR}"
+
 # Build the wheel package
 cd mooncake-wheel
 
@@ -176,6 +190,7 @@ WHEEL_DIR="$(pwd)"
 cleanup_wheel_metadata_state() {
     [[ -f "${WHEEL_DIR}/pyproject.toml.backup" ]] && mv "${WHEEL_DIR}/pyproject.toml.backup" "${WHEEL_DIR}/pyproject.toml"
     rm -f "${WHEEL_DIR}/README.md"
+    cleanup_reshard_staging
 }
 trap cleanup_wheel_metadata_state EXIT
 
@@ -388,6 +403,15 @@ else
     AUDITWHEEL_CMD="auditwheel"
 fi
 
+# `--exclude libmpcomm.so*` below is deliberate, not an oversight. MPComm ships
+# its own wheel / CMake install and is upgraded independently of Mooncake, so
+# engine.so keeps its DT_NEEDED on libmpcomm.so.<N> and the dynamic linker
+# resolves it at run time (e.g. LD_LIBRARY_PATH=$MPCOMM_ROOT/lib). Vendoring it
+# would: (a) freeze one MPComm build inside the wheel, where the RPATH injected
+# by auditwheel outranks LD_LIBRARY_PATH and would silently shadow any newer
+# libmpcomm.so; and (b) let patchelf rewrite a library carrying CUDA fatbins
+# (MPComm builds TMA kernels with USE_CUDA_KERNELS=ON by default), the same
+# corruption risk the EP/PG extensions are kept away from below.
 ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude libcurl.so* \
     --exclude libfabric.so* \
@@ -479,6 +503,7 @@ ${AUDITWHEEL_CMD} repair ${OUTPUT_DIR}/*.whl \
     --exclude ascend_transport*.so \
     --exclude libaccl_barex.so* \
     --exclude liburma.so* \
+    --exclude libmpcomm.so* \
     -w ${REPAIRED_DIR}/ --plat ${PLATFORM_TAG}
 
 # Inject CUDA extensions into the repaired wheel.  patchelf (used by auditwheel)

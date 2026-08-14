@@ -681,6 +681,7 @@ std::vector<TransportType> TransferEngineImpl::getSupportedTransports(
     if (transport_list_[SHM]) result.push_back(SHM);
     if (transport_list_[TCP]) result.push_back(TCP);
     if (transport_list_[GDS]) result.push_back(GDS);
+    if (transport_list_[MPCOMM]) result.push_back(MPCOMM);
     if (transport_list_[TPU]) result.push_back(TPU);
     return result;
 }

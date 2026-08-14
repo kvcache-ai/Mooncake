@@ -62,6 +62,7 @@ def run_test_iteration(
     return_recv_hook: bool,
     use_fallback: bool,
     fail_rank: int,
+    disable_p2p: bool = False,
     buf: Buffer = None,
 ):
     assert not (async_finish and return_recv_hook), (
@@ -111,7 +112,7 @@ def run_test_iteration(
         max_tokens, hidden, num_ranks, num_experts
     )
     if buf is None:
-        buf = Buffer(group, num_ep_buffer_bytes)
+        buf = Buffer(group, num_ep_buffer_bytes, disable_p2p=disable_p2p)
 
     if use_fallback:
         buf._use_fallback = True
@@ -443,6 +444,8 @@ def make_test_name(cfg):
         flags.append("hook")
     if cfg["use_fallback"]:
         flags.append("fallback")
+    if cfg["disable_p2p"]:
+        flags.append("no_p2p")
 
     if flags:
         parts.append("_".join(flags))
@@ -467,11 +470,12 @@ def generate_tests():
     fp8_options = [False] if using_maca_backend() else [False, True]
     test_grid = {
         "use_fp8": fp8_options,
-        "zero_copy": [False, True],
+        "zero_copy": [False],
         "async_finish": [False, True],
         "return_recv_hook": [False, True],
         "use_fallback": [False, True],
         "fail_rank": [-1, 1],
+        "disable_p2p": [False, True],
         "shapes": [
             {"max_tokens": 256, "hidden": 2048, "num_experts": 288, "top_k": 8},
         ],

@@ -151,25 +151,24 @@ TEST_F(BufferAllocatorTest, RestoreOffsetAllocationsAtOriginalAddresses) {
 
     std::vector<AllocatedBuffer::Descriptor> descriptors = {
         first->get_descriptor(), last->get_descriptor()};
+    const auto removed_descriptor = removed->get_descriptor();
     removed.reset();
 
     auto restored = RestoreOffsetBufferAllocator(segment, kBase, kCapacity,
                                                  endpoint, descriptors);
     ASSERT_TRUE(restored.has_value());
     ASSERT_EQ(restored->buffers.size(), descriptors.size());
+    EXPECT_EQ(restored->allocator->size(),
+              descriptors[0].size_ + descriptors[1].size_);
     EXPECT_EQ(restored->buffers[0]->get_descriptor().buffer_address_,
               descriptors[0].buffer_address_);
     EXPECT_EQ(restored->buffers[1]->get_descriptor().buffer_address_,
               descriptors[1].buffer_address_);
 
-    auto new_buffer = restored->allocator->allocate(1024);
+    auto new_buffer = restored->allocator->allocate(removed_descriptor.size_);
     ASSERT_NE(new_buffer, nullptr);
-    const auto new_address = reinterpret_cast<uintptr_t>(new_buffer->data());
-    for (const auto& descriptor : descriptors) {
-        EXPECT_TRUE(
-            new_address + new_buffer->size() <= descriptor.buffer_address_ ||
-            descriptor.buffer_address_ + descriptor.size_ <= new_address);
-    }
+    EXPECT_EQ(reinterpret_cast<uintptr_t>(new_buffer->data()),
+              removed_descriptor.buffer_address_);
 
     auto wrong_endpoint = descriptors;
     wrong_endpoint[0].transport_endpoint_ = "other-endpoint";
@@ -238,7 +237,7 @@ TEST_F(BufferAllocatorTest, RestoredOffsetHandleReleasesItsExactAddress) {
     constexpr size_t kCapacity = 4096;
     const std::string endpoint = "restore-release";
     std::vector<AllocatedBuffer::Descriptor> descriptors = {
-        {64, kBase + 128, "tcp", endpoint}, {64, kBase + 512, "tcp", endpoint}};
+        {64, kBase, "tcp", endpoint}, {64, kBase + 512, "tcp", endpoint}};
     auto restored = RestoreOffsetBufferAllocator(
         "restore-release", kBase, kCapacity, endpoint, descriptors);
     ASSERT_TRUE(restored.has_value());

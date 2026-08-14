@@ -65,7 +65,8 @@ std::shared_ptr<Config> loadConfig() {
             {"gds", "gds"},
             {"mnnvl", "mnnvl"},
             {"nvlink", "nvlink"},
-            {"sunrise_link", "sunrise_link"}};
+            {"sunrise_link", "sunrise_link"},
+            {"mpcomm", "mpcomm"}};
 
         // Disable all transports by default
         for (const auto& entry : transport_map) {
@@ -91,6 +92,7 @@ static TransportType getTransportType(const std::string& xport_type) {
     if (xport_type == "tcp") return TCP;
     if (xport_type == "iouring") return IOURING;
     if (xport_type == "sunrise_link") return SUNRISE_LINK;
+    if (xport_type == "mpcomm") return MPCOMM;
     return UNSPEC;
 }
 

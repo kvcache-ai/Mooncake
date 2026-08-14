@@ -1,6 +1,9 @@
 #include "environ.h"
 
 #include <algorithm>
+#include <cerrno>
+#include <cctype>
+#include <cmath>
 #include <iostream>
 #include <string_view>
 #include <thread>
@@ -64,6 +67,29 @@ size_t ReadSizeT(const EnvironSource& source, const char* name,
     return ReadInteger(source, name, default_value);
 }
 
+double ReadDouble(const EnvironSource& source, const char* name,
+                  double default_value) {
+    const char* value = source.Get(name);
+    if (value == nullptr || value[0] == '\0') {
+        return default_value;
+    }
+
+    char* end = nullptr;
+    errno = 0;
+    const double parsed = std::strtod(value, &end);
+    while (end != nullptr && std::isspace(static_cast<unsigned char>(*end))) {
+        ++end;
+    }
+    if (end != value && end != nullptr && *end == '\0' && errno != ERANGE &&
+        std::isfinite(parsed)) {
+        return parsed;
+    }
+
+    std::cerr << "[Mooncake] Warning: invalid value '" << value << "' for env "
+              << name << ", using default " << default_value << std::endl;
+    return default_value;
+}
+
 bool ReadBool(const EnvironSource& source, const char* name,
               bool default_value) {
     const char* value = source.Get(name);
@@ -115,6 +141,10 @@ uint32_t Environ::GetUInt32(const char* name, uint32_t default_value) {
 
 uint64_t Environ::GetUInt64(const char* name, uint64_t default_value) {
     return ReadInteger(GetOsEnvironSource(), name, default_value);
+}
+
+double Environ::GetDouble(const char* name, double default_value) {
+    return ReadDouble(GetOsEnvironSource(), name, default_value);
 }
 
 size_t Environ::GetSizeT(const char* name, size_t default_value) {

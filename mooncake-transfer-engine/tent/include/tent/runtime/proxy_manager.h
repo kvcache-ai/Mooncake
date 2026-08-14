@@ -15,6 +15,8 @@
 #ifndef PROXY_MANAGER_H_
 #define PROXY_MANAGER_H_
 
+#include <shared_mutex>
+
 #include "tent/common/types.h"
 #include "tent/common/status.h"
 #include "tent/common/concurrent/thread_pool.h"
@@ -100,6 +102,11 @@ class ProxyManager {
     const size_t chunk_size_;
     const size_t chunk_count_;
     TransferEngineImpl* impl_;
+    // Guards the map, not the chunk bitmaps in it: those are atomic_flags and
+    // stay lock-free under a shared lock. Exclusive only to insert or erase an
+    // entry, at most once per location. Reached by the kShards staging workers
+    // via StageBufferCache and by the RPC thread via Pin/Unpin.
+    mutable std::shared_mutex stage_buffers_mutex_;
     std::unordered_map<std::string, StageBuffers> stage_buffers_;
     std::atomic<bool> running_;
     struct WorkerShard {

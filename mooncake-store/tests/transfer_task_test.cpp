@@ -455,6 +455,42 @@ TEST_F(TransferTaskTest, CanUseLocalMemcpyHonorsMemcpyEnv) {
     EXPECT_FALSE(submitter.canUseLocalMemcpy(engine.getLocalIpAndPort()));
 }
 
+TEST_F(TransferTaskTest, BatchWriteHonorsLocalMemcpySetting) {
+    ScopedEnvVar memcpy_enabled("MC_STORE_MEMCPY", "1");
+
+    TransferEngine engine(false);
+    ASSERT_EQ(
+        engine.init("P2PHANDSHAKE", "127.0.0.1:30995", "127.0.0.1", 30995), 0);
+
+    std::vector<char> source(512, 'A');
+    std::vector<char> destination(source.size(), 0);
+    MemoryDescriptor memory;
+    memory.buffer_descriptor.buffer_address_ =
+        reinterpret_cast<uintptr_t>(destination.data());
+    memory.buffer_descriptor.size_ = destination.size();
+    memory.buffer_descriptor.transport_endpoint_ = engine.getLocalIpAndPort();
+    memory.buffer_descriptor.protocol_ = "tcp";
+    Replica::Descriptor replica;
+    replica.descriptor_variant = memory;
+    replica.status = ReplicaStatus::PROCESSING;
+
+    std::shared_ptr<StorageBackend> storage_backend;
+    {
+        TransferSubmitter submitter(engine, storage_backend,
+                                    engine.getLocalIpAndPort());
+        std::vector<std::vector<Slice>> slices{
+            {{source.data(), source.size()}}};
+        auto future =
+            submitter.submit_batch({replica}, slices, TransferRequest::WRITE);
+
+        ASSERT_TRUE(future);
+        EXPECT_EQ(future->strategy(), TransferStrategy::LOCAL_MEMCPY);
+        EXPECT_EQ(future->get(), ErrorCode::OK);
+    }
+    EXPECT_EQ(destination, source);
+    EXPECT_EQ(engine.freeEngine(), 0);
+}
+
 // Test TransferStrategy enum and stream operator
 TEST_F(TransferTaskTest, TransferStrategyEnum) {
     // Test enum values
