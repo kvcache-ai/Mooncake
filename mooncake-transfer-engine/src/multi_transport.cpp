@@ -21,6 +21,7 @@
 #include "config.h"
 #include "multi_transport_locality.h"
 #include "transport/rdma_transport/rdma_transport.h"
+#include "transport/rdma_twosided/rdma_twosided_transport.h"
 #ifdef USE_BAREX
 #include "transport/barex_transport/barex_transport.h"
 #endif
@@ -352,8 +353,18 @@ Transport* MultiTransport::installTransport(const std::string& proto,
     }
 #endif
     Transport* transport = nullptr;
-    if (std::string(proto) == "rdma") {
-        transport = new RdmaTransport();
+    if (std::string(proto) == "rdma" || std::string(proto) == "rdma_twosided") {
+        if ((proto == "rdma" && transport_map_.count("rdma_twosided")) ||
+            (proto == "rdma_twosided" && transport_map_.count("rdma"))) {
+            LOG(ERROR) << "Cannot install both rdma and rdma_twosided "
+                          "transports in the same Transfer Engine instance";
+            return nullptr;
+        }
+        if (std::string(proto) == "rdma") {
+            transport = new RdmaTransport();
+        } else {
+            transport = new RdmaTwoSidedTransport();
+        }
     }
 #ifdef USE_UB
     else if (std::string(proto) == "ub") {
@@ -553,6 +564,10 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
                 "segment " +
                 std::to_string(entry.target_id));
         }
+        if (!transport_map_.count(chosen) && chosen == "rdma" &&
+            transport_map_.count("rdma_twosided")) {
+            chosen = "rdma_twosided";
+        }
         if (!transport_map_.count(chosen)) {
             return Status::NotSupportedTransport("Transport " + chosen +
                                                  " not installed");
@@ -575,6 +590,13 @@ Status MultiTransport::selectTransport(const TransferRequest& entry,
         proto = "ascend";
     }
 #endif
+    // RdmaTwoSidedTransport still publishes segment protocol "rdma" (one-sided
+    // memory path). Route those segments to the installed twosided transport.
+    if (!transport_map_.count(proto) && proto == "rdma" &&
+        transport_map_.count("rdma_twosided")) {
+        transport = transport_map_["rdma_twosided"].get();
+        return Status::OK();
+    }
     if (!transport_map_.count(proto)) {
         return Status::NotSupportedTransport("Transport " + proto +
                                              " not installed");
@@ -631,11 +653,18 @@ Status MultiTransport::mp_selectTransport(const TransferRequest& entry,
         preferred_proto = "ascend";
     }
 #endif
+    if (!transport_map_.count(preferred_proto) && preferred_proto == "rdma" &&
+        transport_map_.count("rdma_twosided")) {
+        preferred_proto = "rdma_twosided";
+    }
     if (!transport_map_.count(preferred_proto)) {
         return Status::NotSupportedTransport("Transport " + preferred_proto +
                                              " not installed");
     }
-    if (std::find(protos.begin(), protos.end(), preferred_proto) ==
+    // Segment metadata still advertises "rdma" for the twosided install.
+    const std::string segment_proto =
+        (preferred_proto == "rdma_twosided") ? "rdma" : preferred_proto;
+    if (std::find(protos.begin(), protos.end(), segment_proto) ==
         protos.end()) {
         return Status::NotSupportedTransport(
             "Transport " + preferred_proto +

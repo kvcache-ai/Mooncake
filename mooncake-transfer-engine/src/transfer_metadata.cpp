@@ -81,6 +81,11 @@ struct TransferHandshakeUtil {
         root["qp_num"] = qpNums;
         if (desc.ready_ack_supported || desc.ready_ack)
             root["ready_ack"] = desc.ready_ack;
+        if (desc.notify_qp_num != 0 || desc.ctrl_channel) {
+            root["notify_qp_num"] = Json::UInt(desc.notify_qp_num);
+            root["notify_rq_depth"] = Json::UInt(desc.notify_rq_depth);
+            root["ctrl_channel"] = desc.ctrl_channel;
+        }
         root["reply_msg"] = desc.reply_msg;
 #ifdef USE_EFA
         root["efa_addr"] = desc.efa_addr;  // EFA endpoint address
@@ -124,6 +129,20 @@ struct TransferHandshakeUtil {
             desc.ready_ack = root["ready_ack"].asBool();
         } else {
             desc.ready_ack = false;
+        }
+        desc.notify_qp_num = 0;
+        desc.notify_rq_depth = 0;
+        desc.ctrl_channel = false;
+        if (root.isMember("notify_qp_num") && root["notify_qp_num"].isUInt()) {
+            desc.notify_qp_num = root["notify_qp_num"].asUInt();
+        }
+        if (root.isMember("notify_rq_depth") &&
+            root["notify_rq_depth"].isUInt()) {
+            desc.notify_rq_depth =
+                static_cast<uint16_t>(root["notify_rq_depth"].asUInt());
+        }
+        if (root.isMember("ctrl_channel") && root["ctrl_channel"].isBool()) {
+            desc.ctrl_channel = root["ctrl_channel"].asBool();
         }
         desc.reply_msg = root["reply_msg"].asString();
 #ifdef USE_EFA
@@ -290,6 +309,11 @@ int TransferMetadata::getNotifies(std::vector<NotifyDesc> &notifies) {
         notifys.clear();
     }
     return 0;
+}
+
+void TransferMetadata::pushNotify(const NotifyDesc &notify) {
+    RWSpinlock::WriteGuard guard(notify_lock_);
+    notifys.push_back(notify);
 }
 
 #ifdef ENABLE_MULTI_PROTOCOL
