@@ -45,6 +45,10 @@
 #include "tent/transport/tpu/tpu_transport.h"
 #endif
 
+#ifdef USE_MPCOMM
+#include "tent/transport/mpcomm/mpcomm_transport.h"
+#endif
+
 namespace mooncake {
 namespace tent {
 
@@ -102,6 +106,11 @@ Status TransferEngineImpl::loadTransports() {
 #ifdef USE_TPU
     if (conf_->get("transports/tpu/enable", true))
         transport_list_[TPU] = std::make_shared<TpuTransport>();
+#endif
+
+#ifdef USE_MPCOMM
+    if (conf_->get("transports/mpcomm/enable", true))
+        transport_list_[MPCOMM] = std::make_shared<MpcommTransport>();
 #endif
 
     return Status::OK();
