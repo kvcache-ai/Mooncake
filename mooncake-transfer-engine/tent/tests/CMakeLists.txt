@@ -315,6 +315,20 @@ target_include_directories(tent_progress_worker_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_progress_worker_test COMMAND tent_progress_worker_test)
 
+# stage_buffers_ is reached from the staging workers and the RPC thread. Drives
+# a real ProxyManager concurrently; no RDMA device required.
+add_executable(tent_stage_buffer_concurrency_test
+               stage_buffer_concurrency_test.cpp)
+target_link_libraries(tent_stage_buffer_concurrency_test
+                      PRIVATE gtest gtest_main tent_link_group)
+if(TARGET asio_shared)
+  target_link_libraries(tent_stage_buffer_concurrency_test PRIVATE asio_shared)
+endif()
+target_include_directories(tent_stage_buffer_concurrency_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_stage_buffer_concurrency_test
+         COMMAND tent_stage_buffer_concurrency_test)
+
 add_executable(tent_runtime_queue_dispatch_test runtime_queue_dispatch_test.cpp)
 target_link_libraries(tent_runtime_queue_dispatch_test PRIVATE gtest gtest_main
                                                                tent_link_group)
