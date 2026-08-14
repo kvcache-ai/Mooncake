@@ -435,18 +435,15 @@ static void logCudaFailure(const char* call, CUresult ret, int device_ordinal) {
 // Who arrives here without the right context: registerLocalMemoryBatch() runs
 // one std::async(std::launch::async) per buffer and registerLocalMemory() can
 // fan out one std::thread per NIC, so a registering thread may have touched no
-// CUDA API at all.  Loopback copies run on the caller's thread, so
-// tryLoopbackCopy() restores a different previous context before returning.
+// CUDA API at all; and since std::async may reuse threads, one thread can
+// register buffers on several devices in turn.
 //
 // cuDevicePrimaryCtxRetain() returns the same primary context the CUDA runtime
 // uses, so this attaches to the process's existing context rather than creating
-// another.  Registration keeps its retain for the process lifetime.  Scoped
-// callers request `retained_primary` and release that reference after restoring
-// the previous context.
-static bool bindCudaContextIfNeeded(int device_ordinal,
-                                    bool* retained_primary = nullptr) {
-    if (retained_primary) *retained_primary = false;
-
+// another.  The retain is intentionally not released: the primary context
+// outlives every registration, and dropping the last reference here would tear
+// down the context the rest of the process is using.
+static bool bindCudaContextIfNeeded(int device_ordinal) {
     CUdevice want;
     CUresult ret = cuDeviceGet(&want, device_ordinal);
     if (ret != CUDA_SUCCESS) {
@@ -461,15 +458,13 @@ static bool bindCudaContextIfNeeded(int device_ordinal,
         logCudaFailure("cuCtxGetCurrent", ret, device_ordinal);
         return false;
     }
-    bool same_device = false;
     if (cur != nullptr) {
         ret = cuCtxGetDevice(&cur_dev);
         if (ret != CUDA_SUCCESS) {
             logCudaFailure("cuCtxGetDevice", ret, device_ordinal);
             return false;
         }
-        same_device = cur_dev == want;
-        if (same_device && !retained_primary) return true;
+        if (cur_dev == want) return true;
     }
 
     CUcontext primary = nullptr;
@@ -478,9 +473,6 @@ static bool bindCudaContextIfNeeded(int device_ordinal,
         logCudaFailure("cuDevicePrimaryCtxRetain", ret, device_ordinal);
         return false;
     }
-    if (retained_primary) *retained_primary = true;
-    if (same_device && cur == primary) return true;
-
     ret = cuCtxSetCurrent(primary);
     if (ret != CUDA_SUCCESS) {
         logCudaFailure("cuCtxSetCurrent", ret, device_ordinal);
@@ -488,6 +480,86 @@ static bool bindCudaContextIfNeeded(int device_ordinal,
     }
     return true;
 }
+
+// Loopback runs synchronously on the caller's thread. Temporarily use the
+// buffer's primary context, then restore the caller and balance the retain.
+class ScopedCudaContext {
+   public:
+    ScopedCudaContext() {
+        CUresult ret = cuCtxGetCurrent(&previous_);
+        if (ret != CUDA_SUCCESS) {
+            logCudaFailure("cuCtxGetCurrent", ret, -1);
+            return;
+        }
+        valid_ = true;
+    }
+
+    ScopedCudaContext(const ScopedCudaContext&) = delete;
+    ScopedCudaContext& operator=(const ScopedCudaContext&) = delete;
+
+    ~ScopedCudaContext() {
+        if (!restored_) restore();
+    }
+
+    bool valid() const { return valid_; }
+
+    bool bind(int device_ordinal) {
+        if (!valid_ || retained_) return false;
+        device_ordinal_ = device_ordinal;
+
+        CUresult ret = cuDeviceGet(&device_, device_ordinal_);
+        if (ret != CUDA_SUCCESS) {
+            logCudaFailure("cuDeviceGet", ret, device_ordinal_);
+            return false;
+        }
+
+        CUcontext primary = nullptr;
+        ret = cuDevicePrimaryCtxRetain(&primary, device_);
+        if (ret != CUDA_SUCCESS) {
+            logCudaFailure("cuDevicePrimaryCtxRetain", ret, device_ordinal_);
+            return false;
+        }
+        retained_ = true;
+
+        ret = cuCtxSetCurrent(primary);
+        if (ret != CUDA_SUCCESS) {
+            logCudaFailure("cuCtxSetCurrent", ret, device_ordinal_);
+            return false;
+        }
+        return true;
+    }
+
+    bool restore() {
+        if (restored_) return restore_ok_;
+        restored_ = true;
+        if (!valid_) return false;
+
+        CUresult ret = cuCtxSetCurrent(previous_);
+        restore_ok_ = ret == CUDA_SUCCESS;
+        if (!restore_ok_) {
+            logCudaFailure("cuCtxSetCurrent (restore)", ret, device_ordinal_);
+        }
+
+        if (retained_) {
+            ret = cuDevicePrimaryCtxRelease(device_);
+            if (ret != CUDA_SUCCESS) {
+                logCudaFailure("cuDevicePrimaryCtxRelease", ret,
+                               device_ordinal_);
+                restore_ok_ = false;
+            }
+        }
+        return restore_ok_;
+    }
+
+   private:
+    CUcontext previous_ = nullptr;
+    CUdevice device_ = 0;
+    int device_ordinal_ = -1;
+    bool valid_ = false;
+    bool retained_ = false;
+    bool restored_ = false;
+    bool restore_ok_ = false;
+};
 
 static int getCudaDeviceForPointer(const void* ptr, cudaError_t& status) {
     cudaPointerAttributes attributes;
@@ -845,10 +917,8 @@ bool EfaContext::tryLoopbackCopy(Transport::Slice* slice) {
     // The caller's context is restored afterward, and CUDA copies synchronize
     // before the slice is reported complete.
 #if defined(USE_CUDA)
-    CUcontext previous = nullptr;
-    CUresult context_rc = cuCtxGetCurrent(&previous);
-    if (context_rc != CUDA_SUCCESS) {
-        logCudaFailure("cuCtxGetCurrent", context_rc, -1);
+    ScopedCudaContext context;
+    if (!context.valid()) {
         slice->markFailed();
         return true;
     }
@@ -859,10 +929,6 @@ bool EfaContext::tryLoopbackCopy(Transport::Slice* slice) {
     int src_device = getCudaDeviceForPointer(src, src_status);
     if (dst_status != cudaSuccess || src_status != cudaSuccess) {
         cudaError_t rc = dst_status != cudaSuccess ? dst_status : src_status;
-        context_rc = cuCtxSetCurrent(previous);
-        if (context_rc != CUDA_SUCCESS) {
-            logCudaFailure("cuCtxSetCurrent (restore)", context_rc, -1);
-        }
         LOG(ERROR) << "EFA loopback cudaPointerGetAttributes failed: "
                    << cudaGetErrorString(rc) << " (dst=" << dst
                    << ", src=" << src << ", len=" << len << ")";
@@ -873,38 +939,19 @@ bool EfaContext::tryLoopbackCopy(Transport::Slice* slice) {
     int device = dst_device >= 0 ? dst_device : src_device;
     if (device < 0) {
         memcpy(dst, src, len);
-        context_rc = cuCtxSetCurrent(previous);
-        if (context_rc != CUDA_SUCCESS) {
-            logCudaFailure("cuCtxSetCurrent (restore)", context_rc, -1);
+        if (!context.restore()) {
             slice->markFailed();
             return true;
         }
     } else {
-        bool retained_primary = false;
-        bool bound = bindCudaContextIfNeeded(device, &retained_primary);
-        cudaError_t rc = cudaSuccess;
-        if (bound) {
-            rc = cudaMemcpy(dst, src, len, cudaMemcpyDefault);
-            if (rc == cudaSuccess) rc = cudaStreamSynchronize(0);
-        }
-
-        context_rc = cuCtxSetCurrent(previous);
-        if (context_rc != CUDA_SUCCESS) {
-            logCudaFailure("cuCtxSetCurrent (restore)", context_rc, device);
-        }
-
-        CUresult release_rc = CUDA_SUCCESS;
-        if (retained_primary) {
-            release_rc = cuDevicePrimaryCtxRelease(device);
-            if (release_rc != CUDA_SUCCESS) {
-                logCudaFailure("cuDevicePrimaryCtxRelease", release_rc, device);
-            }
-        }
-
-        if (!bound) {
+        if (!context.bind(device)) {
             slice->markFailed();
             return true;
         }
+
+        cudaError_t rc = cudaMemcpy(dst, src, len, cudaMemcpyDefault);
+        if (rc == cudaSuccess) rc = cudaStreamSynchronize(0);
+        bool restored = context.restore();
         if (rc != cudaSuccess) {
             LOG(ERROR) << "EFA loopback CUDA copy failed: "
                        << cudaGetErrorString(rc) << " (dst=" << dst
@@ -912,11 +959,7 @@ bool EfaContext::tryLoopbackCopy(Transport::Slice* slice) {
             slice->markFailed();
             return true;
         }
-        if (context_rc != CUDA_SUCCESS) {
-            slice->markFailed();
-            return true;
-        }
-        if (release_rc != CUDA_SUCCESS) {
+        if (!restored) {
             slice->markFailed();
             return true;
         }
