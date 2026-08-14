@@ -75,6 +75,15 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::Init() {
     if (UsesObjectStorage()) {
         auto init_result = object_storage_adapter_->Init();
         if (!init_result) return init_result;
+        if (distributed_config_.enable_health_check) {
+            auto health_result = object_storage_adapter_->CheckHealth();
+            if (!health_result) {
+                LOG(ERROR) << "Object storage health check failed, adapter="
+                           << object_storage_adapter_->GetName() << ", error="
+                           << static_cast<int>(health_result.error());
+                return health_result;
+            }
+        }
         initialized_ = true;
         LOG(INFO) << "DistributedStorageBackend initialized, object adapter="
                   << object_storage_adapter_->GetName();

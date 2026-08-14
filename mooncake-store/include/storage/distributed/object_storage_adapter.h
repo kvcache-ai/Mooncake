@@ -52,6 +52,10 @@ class ObjectStorageAdapter {
     virtual tl::expected<std::vector<KeyInfo>, ErrorCode> ListKeys() = 0;
 
     virtual tl::expected<void, ErrorCode> Init() = 0;
+
+    // Performs an end-to-end service check after Init(). Implementations may
+    // create a temporary object but must make a best effort to clean it up.
+    virtual tl::expected<void, ErrorCode> CheckHealth() = 0;
     virtual const char* GetName() const = 0;
 };
 
