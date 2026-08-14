@@ -1423,6 +1423,11 @@ class MasterService {
     struct OffloadingTask {
         ReplicaID source_id;
         std::chrono::system_clock::time_point start_time;
+        // Clients whose LocalDiskSegment::offloading_objects hold a mirror
+        // for this key. One marker can cover several mirrors, since the
+        // offload is pushed once per completed MEMORY replica and those
+        // replicas may live on different clients.
+        std::vector<UUID> mirror_clients;
     };
 
     // Tracks an in-flight LOCAL_DISK -> MEMORY copy. The source
@@ -1833,8 +1838,20 @@ class MasterService {
     bool ProbeNoFSegment(const std::string& te_endpoint,
                          std::string* error_reason);
 
+    // Pushes an offload mirror for `replica` onto its host client's
+    // LocalDiskSegment. When `mirror_clients` is non-null, the destination
+    // client is appended to it on success.
     tl::expected<void, ErrorCode> PushOffloadingQueue(
-        const ObjectIdentity& object_id, Replica& replica);
+        const ObjectIdentity& object_id, Replica& replica,
+        std::vector<UUID>* mirror_clients = nullptr);
+
+    // Cancels the offload task on `object_id`, releasing the source refcnt
+    // and dropping the task marker along with its mirrors. Returns false
+    // without touching the task if any mirror has already been drained by a
+    // store worker.
+    bool CancelQueuedOffloadTask(TenantState& tenant_state,
+                                 ObjectMetadata& metadata,
+                                 const ObjectIdentity& object_id);
 
     struct GracefulUnmountDeadlineRecord {
         UUID segment_id;
