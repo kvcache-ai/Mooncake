@@ -379,6 +379,11 @@ std::string BuildBatchOpLogSnapshotCompactionFloorKey(
     return BuildControlKey(cluster_id, "compaction_floor");
 }
 
+std::string BuildBatchOpLogSnapshotArtifactPrefix(
+    const std::string& snapshot_root, std::string_view snapshot_id) {
+    return BuildArtifactPrefix(snapshot_root, snapshot_id);
+}
+
 std::string BuildBatchOpLogSnapshotDescriptorKey(
     const std::string& snapshot_root, std::string_view snapshot_id) {
     const std::string prefix = BuildArtifactPrefix(snapshot_root, snapshot_id);

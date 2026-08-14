@@ -30,6 +30,7 @@
 #include <aws/core/client/ClientConfiguration.h>
 #include "environ.h"
 #include "fmt/format.h"
+#include "utils/base64.h"
 
 namespace mooncake {
 
@@ -187,6 +188,42 @@ tl::expected<void, std::string> S3Helper::UploadString(
     if (!outcome.IsSuccess()) {
         return tl::make_unexpected(
             fmt::format("Upload failed: {}", outcome.GetError().GetMessage()));
+    }
+    return {};
+}
+
+tl::expected<void, std::string> S3Helper::InspectObject(
+    const std::string &key, uint64_t &stored_size,
+    std::optional<uint32_t> &crc32c) {
+    Aws::S3::Model::HeadObjectRequest request;
+    request.SetBucket(bucket_.c_str());
+    request.SetKey(key.c_str());
+    request.SetChecksumMode(Aws::S3::Model::ChecksumMode::ENABLED);
+
+    auto outcome = s3_client_.HeadObject(request);
+    if (!outcome.IsSuccess()) {
+        return tl::make_unexpected(fmt::format(
+            "HeadObject failed: {}", outcome.GetError().GetMessage()));
+    }
+    const auto content_length = outcome.GetResult().GetContentLength();
+    if (content_length < 0) {
+        return tl::make_unexpected(
+            fmt::format("Invalid content length: {}", content_length));
+    }
+    stored_size = static_cast<uint64_t>(content_length);
+    crc32c.reset();
+
+    const std::string encoded = outcome.GetResult().GetChecksumCRC32C();
+    const std::string decoded = base64::Decode(encoded);
+    if (!encoded.empty() && decoded.size() == sizeof(uint32_t) &&
+        base64::Encode(decoded) == encoded) {
+        crc32c = (static_cast<uint32_t>(static_cast<unsigned char>(decoded[0]))
+                  << 24) |
+                 (static_cast<uint32_t>(static_cast<unsigned char>(decoded[1]))
+                  << 16) |
+                 (static_cast<uint32_t>(static_cast<unsigned char>(decoded[2]))
+                  << 8) |
+                 static_cast<uint32_t>(static_cast<unsigned char>(decoded[3]));
     }
     return {};
 }
