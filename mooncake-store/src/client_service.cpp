@@ -291,6 +291,22 @@ bool HasExpectedReplicaAllocation(const ReplicateConfig& config,
            summary.allocated_dfs_replicas == config.dfs_replica_num;
 }
 
+std::optional<ErrorCode> ValidatePreferSameNodeWriteConfig(
+    const ReplicateConfig& config) {
+    if (config.nof_replica_num > 0) {
+        LOG(ERROR) << "prefer_alloc_in_same_node is not supported with "
+                      "NoF replicas";
+        return ErrorCode::INVALID_PARAMS;
+    }
+    if (config.replica_num != 1) {
+        LOG(ERROR) << "prefer_alloc_in_same_node is not supported with "
+                      "replica_num != 1";
+        return ErrorCode::INVALID_PARAMS;
+    }
+
+    return std::nullopt;
+}
+
 // success describes whether the overall put should succeed. Reliable modes
 // require all allocated replicas to complete. Flexible dual-replica mode only
 // requires one replica type to succeed, so success may be true while
@@ -2114,20 +2130,31 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config) {
+    return BatchUpsert(keys, batched_slices, config, {});
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::BatchUpsert(
+    const std::vector<ObjectKey>& keys,
+    std::vector<std::vector<Slice>>& batched_slices,
+    const ReplicateConfig& config, const WriteBufferStager& stager) {
     ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
     }
-    if (client_cfg.prefer_alloc_in_same_node) {
-        LOG(ERROR) << "prefer_alloc_in_same_node is not supported for upsert";
-        return std::vector<tl::expected<void, ErrorCode>>(
-            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
-    }
-
     std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
     ComputeBatchObjectChecksums(ops);
-    StartBatchUpsert(ops, client_cfg);
+    if (client_cfg.prefer_alloc_in_same_node) {
+        if (auto err = ValidatePreferSameNodeWriteConfig(client_cfg)) {
+            return std::vector<tl::expected<void, ErrorCode>>(
+                keys.size(), tl::unexpected(*err));
+        }
+        StartBatchUpsert(ops, client_cfg);
+        StageWriteBuffersForRemoteReplicas(ops, stager);
+        return BatchWriteWhenPreferSameNode(ops, true);
+    }
 
+    StartBatchUpsert(ops, client_cfg);
+    StageWriteBuffersForRemoteReplicas(ops, stager);
     auto t0 = std::chrono::steady_clock::now();
     SubmitTransfers(ops);
     WaitForTransfers(ops);
@@ -3064,8 +3091,31 @@ std::vector<tl::expected<void, ErrorCode>> Client::CollectResults(
     return results;
 }
 
-std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenPreferSameNode(
-    std::vector<PutOperation>& ops) {
+void Client::StageWriteBuffersForRemoteReplicas(
+    std::vector<PutOperation>& ops, const WriteBufferStager& stager) {
+    if (!stager) return;
+
+    for (auto& op : ops) {
+        if (op.IsResolved() || op.replicas.empty() ||
+            std::all_of(op.replicas.begin(), op.replicas.end(),
+                        [this](const Replica::Descriptor& replica) {
+                            return CanUseLocalMemcpy(replica);
+                        })) {
+            continue;
+        }
+        auto staged_slices = stager(op.slices);
+        if (!staged_slices) {
+            op.SetError(staged_slices.error(),
+                        "Failed to stage non-local write buffers");
+            continue;
+        }
+        op.slices = std::move(*staged_slices);
+        VLOG(1) << "Staged write buffers for non-local replica, key=" << op.key;
+    }
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::BatchWriteWhenPreferSameNode(
+    std::vector<PutOperation>& ops, bool is_upsert) {
     auto t0 = std::chrono::steady_clock::now();
     std::unordered_map<std::string, PutOperation> seg_to_ops{};
     for (auto& op : ops) {
@@ -3161,7 +3211,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPutWhenPreferSameNode(
     if (metrics_) {
         metrics_->transfer_metric.batch_put_latency_us.observe(us);
     }
-    FinalizeBatchPut(ops);
+    if (is_upsert) {
+        FinalizeBatchUpsert(ops);
+    } else {
+        FinalizeBatchPut(ops);
+    }
     return CollectResults(ops);
 }
 
@@ -3169,6 +3223,13 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     const std::vector<ObjectKey>& keys,
     std::vector<std::vector<Slice>>& batched_slices,
     const ReplicateConfig& config) {
+    return BatchPut(keys, batched_slices, config, {});
+}
+
+std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
+    const std::vector<ObjectKey>& keys,
+    std::vector<std::vector<Slice>>& batched_slices,
+    const ReplicateConfig& config, const WriteBufferStager& stager) {
     ReplicateConfig client_cfg = AttachHostId(config);
     if (protocol_ == "cxl") {
         client_cfg.preferred_segment = local_hostname_;
@@ -3176,22 +3237,16 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
     std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
     ComputeBatchObjectChecksums(ops);
     if (client_cfg.prefer_alloc_in_same_node) {
-        if (client_cfg.nof_replica_num > 0) {
-            LOG(ERROR) << "prefer_alloc_in_same_node is not supported with "
-                          "NoF replicas";
+        if (auto err = ValidatePreferSameNodeWriteConfig(client_cfg)) {
             return std::vector<tl::expected<void, ErrorCode>>(
-                keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
-        }
-        if (client_cfg.replica_num != 1) {
-            LOG(ERROR) << "prefer_alloc_in_same_node is not supported with "
-                          "replica_num != 1";
-            return std::vector<tl::expected<void, ErrorCode>>(
-                keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+                keys.size(), tl::unexpected(*err));
         }
         StartBatchPut(ops, client_cfg);
-        return BatchPutWhenPreferSameNode(ops);
+        StageWriteBuffersForRemoteReplicas(ops, stager);
+        return BatchWriteWhenPreferSameNode(ops, false);
     }
     StartBatchPut(ops, client_cfg);
+    StageWriteBuffersForRemoteReplicas(ops, stager);
 
     auto t0 = std::chrono::steady_clock::now();
     SubmitTransfers(ops);

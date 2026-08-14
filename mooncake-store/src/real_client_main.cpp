@@ -49,6 +49,12 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
         &RealClient::batch_put_from_multi_buffers_dummy_helper>(&real_client);
     server.register_handler<&RealClient::batch_put_from_cuda_ipc_dummy_helper>(
         &real_client);
+    server
+        .register_handler<&RealClient::batch_upsert_from_cuda_ipc_dummy_helper>(
+            &real_client);
+    server.register_handler<
+        &RealClient::batch_upsert_from_multi_buffers_dummy_helper>(
+        &real_client);
     server.register_handler<&RealClient::upsert_dummy_helper>(&real_client);
     server.register_handler<&RealClient::upsert_from_dummy_helper>(
         &real_client);

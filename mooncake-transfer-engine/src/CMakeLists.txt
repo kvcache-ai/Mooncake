@@ -66,6 +66,7 @@ target_link_libraries(
   transfer_engine
   PUBLIC base
          rdma_transport
+         rdma_twosided
          mooncake_common
          ibverbs
          glog::glog

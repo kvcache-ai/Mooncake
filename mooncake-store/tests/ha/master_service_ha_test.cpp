@@ -534,6 +534,10 @@ class MasterServiceHATest : public ::testing::Test {
         return service.snapshot_manager_ != nullptr;
     }
 
+    static bool NeedMemoryEvictionForTesting(const MasterService& service) {
+        return service.need_mem_eviction_.load(std::memory_order_relaxed);
+    }
+
     static tl::expected<uint64_t, ErrorCode> AppendVisibleForTesting(
         MasterService& service, OpType type, const std::string& tenant_id,
         const std::string& key, const std::string& payload) {
@@ -690,6 +694,97 @@ class MasterServiceHATest : public ::testing::Test {
 
 class MasterServiceBatchRecordE2ETest : public MasterServiceHATest {};
 
+TEST_F(MasterServiceHATest, PutStartWithoutMemorySegmentsDoesNotArmEviction) {
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(false)
+                              .set_eviction_ratio(0.0)
+                              .set_eviction_high_watermark_ratio(1.0)
+                              .build());
+    ReplicateConfig config;
+    config.replica_num = 1;
+
+    auto result = service.PutStart(generate_uuid(), "no_memory_segments",
+                                   kDefaultTenant, 1024, config);
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_FALSE(NeedMemoryEvictionForTesting(service));
+}
+
+TEST_F(MasterServiceHATest,
+       PutStartWithFewerMemorySegmentsThanReplicasDoesNotArmEviction) {
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(false)
+                              .set_eviction_ratio(0.0)
+                              .set_eviction_high_watermark_ratio(1.0)
+                              .build());
+    const auto mounted =
+        PrepareSimpleSegment(service, "insufficient_segment_count");
+    ReplicateConfig config;
+    config.replica_num = 2;
+
+    auto result =
+        service.PutStart(mounted.client_id, "insufficient_segment_count",
+                         kDefaultTenant, 2 * kDefaultSegmentSize, config);
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_FALSE(NeedMemoryEvictionForTesting(service));
+}
+
+TEST_F(MasterServiceHATest,
+       PutStartAllocationFailureWithEnoughMemorySegmentsArmsEviction) {
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(false)
+                              .set_eviction_ratio(0.0)
+                              .set_eviction_high_watermark_ratio(1.0)
+                              .build());
+    const auto first = PrepareSimpleSegment(service, "full_segment_1");
+    PrepareSimpleSegment(service, "full_segment_2",
+                         kDefaultSegmentBase + kDefaultSegmentSize);
+    ReplicateConfig config;
+    config.replica_num = 2;
+
+    auto result =
+        service.PutStart(first.client_id, "enough_full_segments",
+                         kDefaultTenant, 2 * kDefaultSegmentSize, config);
+
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_TRUE(NeedMemoryEvictionForTesting(service));
+}
+
+TEST_F(MasterServiceHATest,
+       PutStartWithTooFewMemorySegmentsPreservesArmedEviction) {
+    MasterService service(MasterServiceConfig::builder()
+                              .set_enable_ha(false)
+                              .set_eviction_ratio(0.0)
+                              .set_eviction_high_watermark_ratio(1.0)
+                              .build());
+    const auto first = PrepareSimpleSegment(service, "preserve_flag_segment_1");
+    const auto second =
+        PrepareSimpleSegment(service, "preserve_flag_segment_2",
+                             kDefaultSegmentBase + kDefaultSegmentSize);
+    ReplicateConfig config;
+    config.replica_num = 2;
+
+    auto first_result =
+        service.PutStart(first.client_id, "arm_eviction", kDefaultTenant,
+                         2 * kDefaultSegmentSize, config);
+    ASSERT_FALSE(first_result.has_value());
+    ASSERT_TRUE(NeedMemoryEvictionForTesting(service));
+    ASSERT_TRUE(service.UnmountSegment(second.segment_id, second.client_id)
+                    .has_value());
+
+    auto second_result =
+        service.PutStart(first.client_id, "preserve_armed_eviction",
+                         kDefaultTenant, 2 * kDefaultSegmentSize, config);
+
+    ASSERT_FALSE(second_result.has_value());
+    EXPECT_EQ(second_result.error(), ErrorCode::NO_AVAILABLE_HANDLE);
+    EXPECT_TRUE(NeedMemoryEvictionForTesting(service));
+}
+
 TEST_F(MasterServiceHATest, RestoreFromStandbyPreservesMemoryBufferDescriptor) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());
@@ -805,10 +900,10 @@ TEST_F(MasterServiceHATest, RemountMakesRestoredMemoryReplicaReady) {
                   .get_memory_descriptor()
                   .buffer_descriptor.buffer_address_,
               kDefaultSegmentBase + 4096);
-    EXPECT_EQ(SegmentAllocatedSizeForTesting(service, endpoint), 5120);
+    EXPECT_EQ(SegmentAllocatedSizeForTesting(service, endpoint), 2048);
     EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size() -
                   metric_before,
-              5120);
+              2048);
 
     const std::string new_key = "post_remount_allocation";
     PutObjectOnSegment(service, generate_uuid(), new_key, endpoint);
@@ -821,12 +916,12 @@ TEST_F(MasterServiceHATest, RemountMakesRestoredMemoryReplicaReady) {
               kDefaultSegmentBase + 1024);
     EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size() -
                   metric_before,
-              6144);
+              3072);
 
     EraseObjectForTesting(service, kDefaultTenant, first_key);
     EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size() -
                   metric_before,
-              5120);
+              2048);
     const std::string replacement_key = "post_remount_replacement";
     PutObjectOnSegment(service, generate_uuid(), replacement_key, endpoint);
     auto replacement =
@@ -838,7 +933,7 @@ TEST_F(MasterServiceHATest, RemountMakesRestoredMemoryReplicaReady) {
               kDefaultSegmentBase);
     EXPECT_EQ(MasterMetricManager::instance().get_allocated_mem_size() -
                   metric_before,
-              6144);
+              3072);
 }
 
 TEST_F(MasterServiceHATest, RemountRestoresCachelibMemoryReplica) {
