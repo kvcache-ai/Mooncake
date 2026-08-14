@@ -31,6 +31,7 @@
 #include "tent/common/status.h"
 #include "tent/runtime/capability_graph.h"
 #include "tent/runtime/control_plane.h"
+#include "tent/runtime/direct_path_policy.h"
 #include "tent/runtime/segment.h"
 #include "tent/runtime/segment_tracker.h"
 #include "tent/runtime/progress_worker.h"
@@ -1797,17 +1798,8 @@ Status TransferEngineImpl::commitPreparedSubmit(
             continue;
         }
 
-        task.failover_count = 0;
-        task.xport_priority = 0;
-        task.status = PENDING;
-        task.request = merged_request;
-        task.staging = false;
-        task.start_time =
-            prepared.submit_time;  // Record start time for latency tracking
-        task.dispatch_time = prepared.submit_time;  // No queue wait on direct
-        task.type = owner.route.transport;
-        task.device_mask = owner.route.device_mask;
-        if (owner.route.qp_pool) task.qp_pool = *owner.route.qp_pool;
+        initializeTaskFromRoute(task, merged_request, owner.route,
+                                prepared.submit_time, prepared.submit_time);
         if (task.type == UNSPEC) {
             LOG(WARNING) << "Unable to find registered buffer for request: "
                          << printRequest(merged_request);
@@ -1931,6 +1923,22 @@ Status TransferEngineImpl::commitPreparedSubmit(
     }
 
     return Status::OK();
+}
+
+void TransferEngineImpl::initializeTaskFromRoute(
+    TaskInfo& task, const Request& request, const SelectionResult& route,
+    std::chrono::steady_clock::time_point start_time,
+    std::chrono::steady_clock::time_point dispatch_time) {
+    task.failover_count = 0;
+    task.xport_priority = 0;
+    task.status = PENDING;
+    task.request = request;
+    task.staging = false;
+    task.start_time = start_time;
+    task.dispatch_time = dispatch_time;
+    task.type = route.transport;
+    task.device_mask = route.device_mask;
+    task.qp_pool = route.qp_pool.value_or(std::string());
 }
 
 Status TransferEngineImpl::enqueuePreparedSubmit(Batch* batch,
@@ -2207,6 +2215,56 @@ bool TransferEngineImpl::shouldQueueSubmit(const PreparedSubmit& prepared,
         [](const PreparedSubmit::Owner& owner) { return owner.staging; });
 }
 
+Status TransferEngineImpl::trySubmitDirectShortcut(
+    Batch* batch, const std::vector<Request>& request_list,
+    const Notification* notifi, QueueOwnerKind owner_kind, bool& submitted) {
+    submitted = false;
+    if (!batch) return Status::InvalidArgument("Invalid batch" LOC_MARK);
+    if (notifi || owner_kind != QueueOwnerKind::User) return Status::OK();
+    if (runtime_queue_config_.enabled) return Status::OK();
+    if (request_list.size() != 1) return Status::OK();
+    if (batch->task_list.size() + 1 > batch->max_size)
+        return Status::TooManyRequests("Exceed batch capacity" LOC_MARK);
+
+    const auto& request = request_list.front();
+    const auto direct_decision = DirectPathPolicy::decide(request);
+    if (!DirectPathPolicy::shouldAttemptDirectPath(direct_decision))
+        return Status::OK();
+    CHECK_STATUS(validateTransportHint(request, 0));
+    auto route = getTransportType(request, 0);
+    if (route.transport != RDMA) return Status::OK();
+    auto& transport = transport_list_[RDMA];
+    if (!transport) return Status::OK();
+
+    auto& sub_batch = batch->sub_batch[RDMA];
+    if (!sub_batch) {
+        CHECK_STATUS(transport->allocateSubBatch(sub_batch, batch->max_size));
+        attachProgressNotifier(batch, sub_batch);
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    TaskInfo task;
+    initializeTaskFromRoute(task, request, route, now, now);
+    task.sub_task_id = sub_batch->size();
+    task.derived = false;
+
+    sub_batch->device_mask = task.device_mask;
+    sub_batch->qp_pool = task.qp_pool;
+    batch->task_list.push_back(task);
+
+    auto& stored_task = batch->task_list.back();
+    startTransportAttempt(stored_task, RDMA, now);
+    auto status = transport->submitTransferTasks(sub_batch, {request});
+    if (!status.ok()) {
+        finishTransportAttempt(stored_task, FAILED,
+                               std::chrono::steady_clock::now());
+        batch->task_list.pop_back();
+        return status;
+    }
+    submitted = true;
+    return Status::OK();
+}
+
 Status TransferEngineImpl::submitTransfer(
     BatchID batch_id, const std::vector<Request>& request_list,
     const Notification* notifi, QueueOwnerKind owner_kind) {
@@ -2214,6 +2272,12 @@ Status TransferEngineImpl::submitTransfer(
     CHECK_STATUS(retainBatch(batch_id, batch));
     BatchRef batch_ref(*this, batch);
     const size_t start_task_id = batch_ref.get()->task_list.size();
+    bool direct_shortcut = false;
+    CHECK_STATUS(trySubmitDirectShortcut(batch_ref.get(), request_list, notifi,
+                                         owner_kind, direct_shortcut));
+    if (direct_shortcut) {
+        return batch_ref.release();
+    }
     PreparedSubmit prepared;
     CHECK_STATUS(prepareSubmit(batch_ref.get(), request_list, prepared));
 
