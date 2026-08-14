@@ -473,7 +473,8 @@ tl::expected<std::string, ErrorCode> WrappedMasterService::ServiceReady() {
 
 void RegisterRpcService(
     coro_rpc::coro_rpc_server& server,
-    mooncake::WrappedMasterService& wrapped_master_service) {
+    mooncake::WrappedMasterService& wrapped_master_service,
+    bool include_heartbeat) {
     server.register_handler<&mooncake::WrappedMasterService::ExistKey>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchQueryIp>(
@@ -496,8 +497,10 @@ void RegisterRpcService(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::MountSegment>(
         &wrapped_master_service);
-    server.register_handler<&mooncake::WrappedMasterService::Heartbeat>(
-        &wrapped_master_service);
+    if (include_heartbeat) {
+        server.register_handler<&mooncake::WrappedMasterService::Heartbeat>(
+            &wrapped_master_service);
+    }
     server.register_handler<&mooncake::WrappedMasterService::QueryClientStatus>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::RegisterClient>(
@@ -507,6 +510,13 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::BatchExistKey>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::ServiceReady>(
+        &wrapped_master_service);
+}
+
+void RegisterHeartbeatRpcService(
+    coro_rpc::coro_rpc_server& server,
+    mooncake::WrappedMasterService& wrapped_master_service) {
+    server.register_handler<&mooncake::WrappedMasterService::Heartbeat>(
         &wrapped_master_service);
 }
 

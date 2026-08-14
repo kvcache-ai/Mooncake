@@ -96,6 +96,14 @@ class WrappedMasterService {
 };
 
 void RegisterRpcService(coro_rpc::coro_rpc_server& server,
-                        mooncake::WrappedMasterService& wrapped_master_service);
+                        mooncake::WrappedMasterService& wrapped_master_service,
+                        bool include_heartbeat = true);
+
+// Registers only the Heartbeat handler on a dedicated heartbeat server. Used
+// by the priority-scheduling path to serve heartbeats on a separate
+// coro_rpc_server so heavy RPCs cannot head-of-line-block them.
+void RegisterHeartbeatRpcService(
+    coro_rpc::coro_rpc_server& server,
+    mooncake::WrappedMasterService& wrapped_master_service);
 
 }  // namespace mooncake

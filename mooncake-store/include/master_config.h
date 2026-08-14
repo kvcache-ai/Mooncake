@@ -20,6 +20,13 @@ struct MasterConfig {
     int32_t rpc_conn_timeout_seconds;
     bool rpc_enable_tcp_no_delay;
 
+    // Dedicated heartbeat RPC server. When heartbeat_rpc_port > 0, Heartbeat is
+    // served by a separate coro_rpc_server with its own thread pool so that
+    // heavy metadata RPCs cannot head-of-line-block heartbeats. 0 = disabled,
+    // heartbeat is served on the main RPC server (legacy behavior).
+    uint32_t heartbeat_rpc_port = 0;
+    uint32_t heartbeat_rpc_thread_num = 1;
+
     uint64_t default_kv_lease_ttl;
     uint64_t default_kv_soft_pin_ttl;
     bool allow_evict_soft_pinned_objects;
@@ -121,6 +128,9 @@ class MasterServiceSupervisorConfig {
     std::chrono::steady_clock::duration rpc_conn_timeout = std::chrono::seconds(
         0);  // Client connection timeout. 0 = no timeout (infinite)
     bool rpc_enable_tcp_no_delay = true;
+    // Dedicated heartbeat RPC server (0 = disabled, serve on main server).
+    uint32_t heartbeat_rpc_port = 0;
+    uint32_t heartbeat_rpc_thread_num = 1;
     std::string etcd_endpoints = "0.0.0.0:2379";
     std::string local_hostname = "0.0.0.0:50051";
     std::string cluster_id = DEFAULT_CLUSTER_ID;
@@ -188,6 +198,8 @@ class MasterServiceSupervisorConfig {
         rpc_conn_timeout =
             std::chrono::seconds(config.rpc_conn_timeout_seconds);
         rpc_enable_tcp_no_delay = config.rpc_enable_tcp_no_delay;
+        heartbeat_rpc_port = config.heartbeat_rpc_port;
+        heartbeat_rpc_thread_num = config.heartbeat_rpc_thread_num;
         etcd_endpoints = config.etcd_endpoints;
         local_hostname = rpc_address + ":" + std::to_string(rpc_port);
         cluster_id = config.cluster_id;

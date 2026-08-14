@@ -87,6 +87,12 @@ struct RealClientConfigBase {
     // 3. "redis://IP:Port" for Redis-based HA mode
     std::string master_server_entry = "127.0.0.1:50051";
 
+    // Port of the master's dedicated heartbeat RPC server. When > 0,
+    // heartbeats are sent to <master host>:heartbeat_rpc_port instead of the
+    // main RPC port, so they are not head-of-line-blocked by heavy metadata
+    // RPCs. Must match the master's --heartbeat_rpc_port. 0 = legacy behavior.
+    uint16_t heartbeat_rpc_port = 0;
+
     // Size of the local buffer (0 to skip).
     // For the case which separately deploys real client and dummy client,
     // the `local_buffer_size` could be 0, which means the local buffer is

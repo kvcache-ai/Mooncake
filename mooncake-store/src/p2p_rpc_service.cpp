@@ -15,8 +15,9 @@ void WrappedP2PMasterService::init_http_handlers() {
 
 void RegisterP2PRpcService(
     coro_rpc::coro_rpc_server& server,
-    mooncake::WrappedP2PMasterService& wrapped_master_service) {
-    RegisterRpcService(server, wrapped_master_service);
+    mooncake::WrappedP2PMasterService& wrapped_master_service,
+    bool include_heartbeat) {
+    RegisterRpcService(server, wrapped_master_service, include_heartbeat);
     server.register_handler<&mooncake::WrappedP2PMasterService::GetWriteRoute>(
         &wrapped_master_service);
     server.register_handler<

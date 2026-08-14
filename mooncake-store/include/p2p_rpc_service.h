@@ -42,6 +42,7 @@ class WrappedP2PMasterService final : public WrappedMasterService {
 
 void RegisterP2PRpcService(
     coro_rpc::coro_rpc_server& server,
-    mooncake::WrappedP2PMasterService& wrapped_master_service);
+    mooncake::WrappedP2PMasterService& wrapped_master_service,
+    bool include_heartbeat = true);
 
 }  // namespace mooncake

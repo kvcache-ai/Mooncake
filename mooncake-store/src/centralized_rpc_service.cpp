@@ -624,8 +624,9 @@ WrappedCentralizedMasterService::NotifyOffloadSuccess(
 
 void RegisterCentralizedRpcService(
     coro_rpc::coro_rpc_server& server,
-    mooncake::WrappedCentralizedMasterService& wrapped_master_service) {
-    RegisterRpcService(server, wrapped_master_service);
+    mooncake::WrappedCentralizedMasterService& wrapped_master_service,
+    bool include_heartbeat) {
+    RegisterRpcService(server, wrapped_master_service, include_heartbeat);
     server.register_handler<
         &mooncake::WrappedCentralizedMasterService::BatchReplicaClear>(
         &wrapped_master_service);
