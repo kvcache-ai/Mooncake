@@ -283,6 +283,66 @@ TEST_F(P2PClientManagerTest, HeartbeatSuccess) {
     EXPECT_EQ(res.value().status, ClientStatus::HEALTH);
 }
 
+TEST_F(P2PClientManagerTest, HeartbeatSyncClientMetric) {
+    auto mgr = CreateManager();
+    mgr->Start();
+
+    ASSERT_TRUE(mgr->RegisterClient(MakeP2PRegisterRequest()).has_value());
+
+    // First snapshot is added in full: cluster counter becomes 5.
+    ClientMetricSnapshot first;
+    first.total_request.get_requests = 5;
+    HeartbeatTask task1(HeartbeatTaskType::SYNC_CLIENT_METRIC,
+                        SyncClientMetricParam{.snapshot = first});
+    HeartbeatRequest hb_req1;
+    hb_req1.client_id = {100, 200};
+    hb_req1.tasks.push_back(task1);
+    auto res1 = mgr->Heartbeat(hb_req1);
+    ASSERT_TRUE(res1.has_value());
+    ASSERT_EQ(res1.value().task_results.size(), 1);
+    EXPECT_EQ(res1.value().task_results[0].error, ErrorCode::OK);
+    EXPECT_NE(
+        MasterMetricManager::instance()
+            .serialize_metrics()
+            .find("master_cluster_total_get_requests 5\n"),
+        std::string::npos);
+
+    // Second snapshot applies total 8.
+    ClientMetricSnapshot second;
+    second.total_request.get_requests = 8;
+    HeartbeatTask task2(HeartbeatTaskType::SYNC_CLIENT_METRIC,
+                        SyncClientMetricParam{.snapshot = second});
+    HeartbeatRequest hb_req2;
+    hb_req2.client_id = {100, 200};
+    hb_req2.tasks.push_back(task2);
+    auto res2 = mgr->Heartbeat(hb_req2);
+    ASSERT_TRUE(res2.has_value());
+    EXPECT_EQ(res2.value().task_results[0].error, ErrorCode::OK);
+    EXPECT_NE(
+        MasterMetricManager::instance()
+            .serialize_metrics()
+            .find("master_cluster_total_get_requests 8\n"),
+        std::string::npos);
+}
+
+TEST_F(P2PClientManagerTest, HeartbeatSyncClientMetricInvalidParam) {
+    auto mgr = CreateManager();
+    mgr->Start();
+
+    ASSERT_TRUE(mgr->RegisterClient(MakeP2PRegisterRequest()).has_value());
+
+    // Wrong variant alternative for the SYNC_CLIENT_METRIC type.
+    HeartbeatTask task(HeartbeatTaskType::SYNC_CLIENT_METRIC,
+                       SyncSegmentMetaParam{});
+    HeartbeatRequest hb_req;
+    hb_req.client_id = {100, 200};
+    hb_req.tasks.push_back(task);
+    auto res = mgr->Heartbeat(hb_req);
+    ASSERT_TRUE(res.has_value());
+    ASSERT_EQ(res.value().task_results.size(), 1);
+    EXPECT_EQ(res.value().task_results[0].error, ErrorCode::INVALID_PARAMS);
+}
+
 TEST_F(P2PClientManagerTest, HeartbeatUnregisteredClient) {
     auto mgr = CreateManager();
     mgr->Start();

@@ -535,6 +535,14 @@ HeartbeatRequest P2PClientService::build_heartbeat_request() {
                                std::move(param));
     }
 
+    if (metrics_ && ++metric_sync_heartbeat_count_ >= METRIC_SYNC_FREQ) {
+        metric_sync_heartbeat_count_ = 0;
+        SyncClientMetricParam param;
+        param.snapshot = metrics_->BuildSyncSnapshot();
+        req.tasks.emplace_back(HeartbeatTaskType::SYNC_CLIENT_METRIC,
+                               std::move(param));
+    }
+
     return req;
 }
 

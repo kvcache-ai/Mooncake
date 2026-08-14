@@ -571,6 +571,42 @@ TEST_F(ClientMetricsTest, DataMetricRecordGetSemanticsTest) {
     EXPECT_TRUE(summary.find("success: count=1") != std::string::npos);
 }
 
+TEST_F(ClientMetricsTest, BuildSyncSnapshotGoldenValues) {
+    P2PClientMetric metrics;
+
+    // total_request (batch granularity).
+    metrics.total_request.RecordGet(100, ErrorCode::OK, 64);
+    metrics.total_request.RecordGet(200, ErrorCode::OK, 128);
+    metrics.total_request.RecordGet(50, ErrorCode::OBJECT_NOT_FOUND, 0);
+    metrics.total_request.RecordPut(300, ErrorCode::OK, 256);
+
+    // local/remote (per-op granularity).
+    metrics.local_request.RecordGet(150, ErrorCode::OK, 64);
+    metrics.remote_request.RecordGet(250, ErrorCode::OK, 64);
+    metrics.remote_request.read_retries.inc();
+    metrics.remote_request.write_retries.inc(2);
+
+    auto snap = metrics.BuildSyncSnapshot();
+
+    EXPECT_EQ(snap.total_request.get_requests, 3);
+    EXPECT_EQ(snap.total_request.get_hits, 2);
+    EXPECT_EQ(snap.total_request.get_misses, 1);
+    EXPECT_EQ(snap.total_request.get_failures, 0);
+    EXPECT_EQ(snap.total_request.get_bytes, 192);
+    EXPECT_EQ(snap.total_request.put_requests, 1);
+    EXPECT_EQ(snap.total_request.put_failures, 0);
+    EXPECT_EQ(snap.total_request.put_bytes, 256);
+
+    EXPECT_EQ(snap.local_request.get_requests, 1);
+    EXPECT_EQ(snap.local_request.get_hits, 1);
+    EXPECT_EQ(snap.local_request.get_bytes, 64);
+
+    EXPECT_EQ(snap.remote_request.data.get_requests, 1);
+    EXPECT_EQ(snap.remote_request.data.get_bytes, 64);
+    EXPECT_EQ(snap.remote_request.read_retries, 1);
+    EXPECT_EQ(snap.remote_request.write_retries, 2);
+}
+
 TEST_F(ClientMetricsTest, DataMetricRecordPutSemanticsTest) {
     DataMetric dm("mooncake_p2p_test");
 

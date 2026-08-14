@@ -34,6 +34,12 @@ void MasterMetricManager::RegisterInstance(MasterMetricManager* instance) {
     instance_ = instance;
 }
 
+MasterMetricManager::~MasterMetricManager() {
+    if (instance_ == this) {
+        instance_ = nullptr;
+    }
+}
+
 MasterMetricManager::MasterMetricManager()
     // Initialize Gauges
     : mem_allocated_size_(

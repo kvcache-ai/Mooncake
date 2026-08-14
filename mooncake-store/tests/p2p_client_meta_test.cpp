@@ -1,5 +1,6 @@
 #include <gtest/gtest.h>
 #include <glog/logging.h>
+#include <chrono>
 #include <thread>
 #include <atomic>
 #include <random>
@@ -8,6 +9,7 @@
 #include "p2p_client_meta.h"
 #undef private
 #undef protected
+#include "p2p_master_metric_manager.h"
 
 namespace mooncake {
 
@@ -424,6 +426,107 @@ TEST_F(P2PClientMetaTest, UpdateSegmentUsagesMixedResults) {
     EXPECT_EQ(meta->GetAvailableCapacity(), 2600);
 }
 
+TEST_F(P2PClientMetaTest, UpdateSegmentUsagesMaintainMemGauges) {
+    P2PMasterMetricManager::instance().reset_all_metrics();
+    auto& metrics = P2PMasterMetricManager::instance();
+
+    auto meta = CreateMeta();
+    meta->Heartbeat();
+    auto seg = MakeP2PSegment({1, 1}, "seg1", 1000, 1, 250);
+    ASSERT_TRUE(meta->MountSegment(seg).has_value());
+
+    // Mount initializes the gauge with the mount-time usage (250).
+    EXPECT_EQ(metrics.get_allocated_mem_size(), 250);
+    EXPECT_EQ(metrics.get_segment_allocated_mem_size("seg1"), 250);
+
+    // First report: delta from 250 -> 300.
+    std::vector<TierUsageInfo> usages1 = {
+        TierUsageInfo{.segment_id = {1, 1}, .usage = 300},
+    };
+    meta->UpdateSegmentUsages(usages1);
+    EXPECT_EQ(metrics.get_allocated_mem_size(), 300);
+    EXPECT_EQ(metrics.get_segment_allocated_mem_size("seg1"), 300);
+
+    // Positive delta: 300 -> 500.
+    std::vector<TierUsageInfo> usages2 = {
+        TierUsageInfo{.segment_id = {1, 1}, .usage = 500},
+    };
+    meta->UpdateSegmentUsages(usages2);
+    EXPECT_EQ(metrics.get_allocated_mem_size(), 500);
+
+    // Negative delta (client-side deletes data): 500 -> 200.
+    std::vector<TierUsageInfo> usages3 = {
+        TierUsageInfo{.segment_id = {1, 1}, .usage = 200},
+    };
+    meta->UpdateSegmentUsages(usages3);
+    EXPECT_EQ(metrics.get_allocated_mem_size(), 200);
+    EXPECT_EQ(metrics.get_segment_allocated_mem_size("seg1"), 200);
+
+    // Unmount drops the last reported usage.
+    ASSERT_TRUE(meta->UnmountSegment({1, 1}).has_value());
+    EXPECT_EQ(metrics.get_allocated_mem_size(), 0);
+    EXPECT_EQ(metrics.get_segment_allocated_mem_size("seg1"), 0);
+}
+
+TEST_F(P2PClientMetaTest, UpdateSegmentUsagesMaintainFileGauges) {
+    P2PMasterMetricManager::instance().reset_all_metrics();
+    auto& metrics = P2PMasterMetricManager::instance();
+
+    auto meta = CreateMeta();
+    meta->Heartbeat();
+    Segment nvme = MakeP2PSegment({1, 1}, "nvme_seg", 2000, 1, 100);
+    nvme.extra = P2PSegmentExtraData{.priority = 0,
+                                     .tags = {},
+                                     .memory_type = MemoryType::NVME,
+                                     .usage = 100};
+    ASSERT_TRUE(meta->MountSegment(nvme).has_value());
+
+    // Mount initializes the file gauge with the mount-time usage (100).
+    EXPECT_EQ(metrics.get_allocated_file_size(), 100);
+
+    std::vector<TierUsageInfo> usages1 = {
+        TierUsageInfo{.segment_id = {1, 1}, .usage = 700},
+    };
+    meta->UpdateSegmentUsages(usages1);
+    EXPECT_EQ(metrics.get_allocated_file_size(), 700);  // 100 + 600
+    // NVME never touches the mem family.
+    EXPECT_EQ(metrics.get_allocated_mem_size(), 0);
+
+    std::vector<TierUsageInfo> usages2 = {
+        TierUsageInfo{.segment_id = {1, 1}, .usage = 300},
+    };
+    meta->UpdateSegmentUsages(usages2);
+    EXPECT_EQ(metrics.get_allocated_file_size(), 300);
+
+    ASSERT_TRUE(meta->UnmountSegment({1, 1}).has_value());
+    EXPECT_EQ(metrics.get_allocated_file_size(), 0);
+}
+
+TEST_F(P2PClientMetaTest, ClientRemovalRecyclesSegmentsAndZeroesGauges) {
+    P2PMasterMetricManager::instance().reset_all_metrics();
+    auto& metrics = P2PMasterMetricManager::instance();
+
+    auto meta = CreateMeta();
+    meta->Heartbeat();
+    ASSERT_TRUE(meta->MountSegment(MakeP2PSegment({1, 1}, "seg1", 1000, 1, 0))
+                    .has_value());
+    ASSERT_TRUE(meta->MountSegment(MakeP2PSegment({2, 2}, "seg2", 2000, 1, 0))
+                    .has_value());
+
+    std::vector<TierUsageInfo> usages = {
+        TierUsageInfo{.segment_id = {1, 1}, .usage = 400},
+        TierUsageInfo{.segment_id = {2, 2}, .usage = 300},
+    };
+    meta->UpdateSegmentUsages(usages);
+    EXPECT_EQ(metrics.get_allocated_mem_size(), 700);
+    EXPECT_EQ(meta->GetAvailableCapacity(), 2300);
+
+    // Crash removal unmounts every segment, so the gauges return to zero.
+    meta->OnCrashed();
+    EXPECT_EQ(metrics.get_total_mem_capacity(), 0);
+    EXPECT_EQ(metrics.get_allocated_mem_size(), 0);
+}
+
 // ============================================================
 // QueryIp
 // ============================================================
@@ -725,7 +828,7 @@ TEST_F(P2PClientMetaTest, GetWriteScoreCapacity) {
 }
 
 // ============================================================
-// Concurrent mount + health changes
+// Concurrent test
 // ============================================================
 
 TEST_F(P2PClientMetaExtendedTest, ConcurrentHealthChangeAndMount) {
@@ -781,6 +884,120 @@ TEST_F(P2PClientMetaExtendedTest, ConcurrentHealthChangeAndMount) {
 
     EXPECT_EQ(success_count.load() + fail_unhealthy_count.load(),
               op_count.load());
+}
+
+TEST_F(P2PClientMetaTest, ConcurrentMountUnmountAndUsageSyncNoDeadlock) {
+    P2PMasterMetricManager::instance().reset_all_metrics();
+
+    auto meta = CreateMeta();
+    meta->Heartbeat();
+
+    std::atomic<bool> stop{false};
+    // Mount/unmount takes segment_mutex_ -> capacity_mutex_ (segment-change
+    // callbacks); usage sync takes segment_mutex_ alone. Must not deadlock.
+    std::thread mounter([&]() {
+        int i = 0;
+        while (!stop.load(std::memory_order_relaxed)) {
+            UUID id{1, static_cast<uint64_t>(i % 32)};
+            Segment seg = MakeP2PSegment(
+                id, "concurrent_seg_" + std::to_string(i % 32), 1000, 1, 0);
+            meta->MountSegment(seg);
+            std::this_thread::yield();
+            meta->UnmountSegment(id);
+            ++i;
+        }
+    });
+    std::thread syncer([&]() {
+        int i = 0;
+        while (!stop.load(std::memory_order_relaxed)) {
+            std::vector<TierUsageInfo> usages;
+            for (int j = 0; j < 8; ++j) {
+                uint64_t idx = static_cast<uint64_t>((i + j) % 32);
+                usages.push_back(TierUsageInfo{
+                    .segment_id = {1, idx},
+                    .usage = static_cast<size_t>((i * 31 + j * 7) % 1000),
+                });
+            }
+            meta->UpdateSegmentUsages(usages);
+            ++i;
+        }
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    stop.store(true, std::memory_order_relaxed);
+    mounter.join();
+    syncer.join();
+
+    // client_usage_ must equal the sum of the stored per-segment usages.
+    auto segments = meta->GetSegmentManager()->GetSegments();
+    ASSERT_TRUE(segments.has_value());
+    size_t total_capacity = 0;
+    size_t total_usage = 0;
+    for (const auto& seg : segments.value()) {
+        total_capacity += seg.size;
+        total_usage += seg.GetP2PExtra().usage;
+    }
+    const size_t expected_free =
+        total_capacity > total_usage ? total_capacity - total_usage : 0;
+    EXPECT_EQ(meta->GetAvailableCapacity(), expected_free);
+}
+
+TEST_F(P2PClientMetaTest, UpdateSegmentUsagesConsistentUnderMountUnmountRace) {
+    auto meta = CreateMeta();
+    meta->Heartbeat();
+
+    constexpr int kSegmentCount = 8;
+    constexpr size_t kSegmentSize = 1000;
+    for (int i = 0; i < kSegmentCount / 2; ++i) {
+        ASSERT_TRUE(meta->MountSegment(MakeP2PSegment(UUID{i, i},
+                                                      "seg" + std::to_string(i),
+                                                      kSegmentSize))
+                        .has_value());
+    }
+
+    // Churn mounts/unmounts while usage syncs run; Heartbeat() keeps the
+    // meta healthy so mount/unmount are admitted.
+    std::atomic<bool> stop{false};
+    std::thread churn([&] {
+        for (int i = 0; !stop.load(std::memory_order_acquire); ++i) {
+            meta->Heartbeat();
+            const int id = i % kSegmentCount;
+            if (i % 2 == 0) {
+                meta->MountSegment(MakeP2PSegment(
+                    UUID{id, id}, "seg" + std::to_string(id), kSegmentSize));
+            } else {
+                meta->UnmountSegment(UUID{id, id});
+            }
+        }
+    });
+
+    for (int round = 0; round < 500; ++round) {
+        meta->Heartbeat();
+        std::vector<TierUsageInfo> usages;
+        for (int i = 0; i < kSegmentCount; ++i) {
+            usages.push_back(TierUsageInfo{
+                .segment_id = UUID{i, i},
+                .usage =
+                    static_cast<size_t>((round * 7 + i * 13) % kSegmentSize),
+            });
+        }
+        meta->UpdateSegmentUsages(usages);
+    }
+
+    stop.store(true, std::memory_order_release);
+    churn.join();
+
+    // client_usage_ must equal the sum of the stored per-segment usages.
+    size_t expected_usage = 0;
+    size_t expected_capacity = 0;
+    meta->segment_manager_->ForEachSegment([&](const Segment& seg) {
+        expected_usage += seg.GetP2PExtra().usage;
+        expected_capacity += seg.size;
+        return false;
+    });
+    EXPECT_EQ(meta->client_usage_, expected_usage);
+    EXPECT_EQ(meta->client_capacity_, expected_capacity);
+    EXPECT_EQ(meta->GetAvailableCapacity(), expected_capacity - expected_usage);
 }
 
 }  // namespace mooncake

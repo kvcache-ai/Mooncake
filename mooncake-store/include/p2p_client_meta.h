@@ -15,6 +15,8 @@ class P2PClientMeta final : public ClientMeta {
     P2PClientMeta(const UUID& client_id, const std::string& ip_address,
                   uint16_t rpc_port);
 
+    ~P2PClientMeta() override;
+
     std::shared_ptr<SegmentManager> GetSegmentManager() override;
     auto QueryIp(const UUID& client_id)
         -> tl::expected<std::vector<std::string>, ErrorCode> override;

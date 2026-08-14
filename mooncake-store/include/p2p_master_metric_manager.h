@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <string>
 
+#include "client_metrics_aggregator.h"
 #include "master_metric_manager.h"
 
 namespace mooncake {
@@ -50,6 +51,10 @@ class P2PMasterMetricManager final : public MasterMetricManager {
     int64_t get_batch_get_write_route_items();
     int64_t get_batch_get_write_route_failed_items();
 
+    void UpdateClientMetrics(const UUID& client_id,
+                             const ClientMetricSnapshot& snapshot);
+    void OnClientRemoved(const UUID& client_id);
+
    private:
     P2PMasterMetricManager();
 
@@ -79,6 +84,9 @@ class P2PMasterMetricManager final : public MasterMetricManager {
     ylt::metric::counter_t batch_get_write_route_partial_successes_;
     ylt::metric::counter_t batch_get_write_route_items_;
     ylt::metric::counter_t batch_get_write_route_failed_items_;
+
+    // Cluster-wide data-plane metrics aggregated from client heartbeats.
+    ClientMetricsAggregator client_metrics_aggregator_;
 };
 
 }  // namespace mooncake

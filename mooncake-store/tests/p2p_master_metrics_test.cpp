@@ -9,6 +9,7 @@
 
 #include "master_metric_manager.h"
 #include "p2p_master_metric_manager.h"
+#include "heartbeat_type.h"
 
 namespace mooncake::test {
 
@@ -104,6 +105,34 @@ TEST_F(P2PMasterMetricsTest, SummaryArchTagTest) {
     EXPECT_NE(summary.find("RemoveReplica="), std::string::npos);
     EXPECT_NE(summary.find("GetWriteRoute:(Req="), std::string::npos);
     EXPECT_NE(summary.find("RemoveReplica:(Req="), std::string::npos);
+}
+
+TEST_F(P2PMasterMetricsTest, ResetClearsClusterMetrics) {
+    auto& metrics = P2PMasterMetricManager::instance();
+
+    ClientMetricSnapshot first;
+    first.total_request.get_requests = 4;
+    metrics.UpdateClientMetrics({1, 1}, first);  // adds 4
+    ClientMetricSnapshot second;
+    second.total_request.get_requests = 9;
+    metrics.UpdateClientMetrics({1, 1}, second);  // total 9
+    EXPECT_NE(
+        MasterMetricManager::instance().serialize_metrics().find(
+            "master_cluster_total_get_requests 9\n"),
+        std::string::npos);
+
+    metrics.reset_all_metrics();
+    const std::string text = MasterMetricManager::instance().serialize_metrics();
+    EXPECT_NE(text.find("master_cluster_total_get_requests 0\n"),
+              std::string::npos);
+
+    // Reset must also drop the per-client baselines: the same snapshot is
+    // added in full again (fresh join), not applied as a zero delta.
+    metrics.UpdateClientMetrics({1, 1}, second);
+    EXPECT_NE(
+        MasterMetricManager::instance().serialize_metrics().find(
+            "master_cluster_total_get_requests 9\n"),
+        std::string::npos);
 }
 
 }  // namespace mooncake::test

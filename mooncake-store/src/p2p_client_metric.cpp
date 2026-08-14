@@ -10,6 +10,23 @@
 
 namespace mooncake {
 
+namespace {
+
+DataMetricSnapshot SnapshotDataMetric(DataMetric& m) {
+    DataMetricSnapshot s;
+    s.get_requests = m.get_requests.value();
+    s.get_hits = m.get_hits.value();
+    s.get_misses = m.get_misses.value();
+    s.get_failures = m.get_failures.value();
+    s.get_bytes = m.get_bytes.value();
+    s.put_requests = m.put_requests.value();
+    s.put_failures = m.put_failures.value();
+    s.put_bytes = m.put_bytes.value();
+    return s;
+}
+
+}  // namespace
+
 // ============================================================================
 // DataMetric
 // ============================================================================
@@ -475,6 +492,17 @@ P2PClientMetric::P2PClientMetric(
       rollback("mooncake_p2p_rollback", labels),
       peer_request_metrics("mooncake_p2p_peer", labels),
       tier_metric(std::make_shared<TierMetric>()) {}
+
+ClientMetricSnapshot P2PClientMetric::BuildSyncSnapshot() {
+    ClientMetricSnapshot snap;
+
+    snap.total_request = SnapshotDataMetric(total_request);
+    snap.local_request = SnapshotDataMetric(local_request);
+    snap.remote_request.data = SnapshotDataMetric(remote_request);
+    snap.remote_request.read_retries = remote_request.read_retries.value();
+    snap.remote_request.write_retries = remote_request.write_retries.value();
+    return snap;
+}
 
 void P2PClientMetric::serialize(std::string& str) {
     ClientMetric::serialize(str);
