@@ -47,5 +47,5 @@ readonly LAST_TEST_LOG="$3"
     fi
 
     echo
-    echo "Download the ctest-diagnostics artifact for the complete CTest log and JUnit report."
+    echo "Download the CTest diagnostics artifact for the complete log and JUnit report."
 } >> "$GITHUB_STEP_SUMMARY"

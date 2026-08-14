@@ -1,0 +1,49 @@
+name: Preserve CTest failure diagnostics
+description: Summarize a failed CTest run and upload its logs and JUnit report
+
+inputs:
+  summary-title:
+    description: Heading to add to the GitHub Actions job summary
+    required: true
+  artifact-name:
+    description: Name of the uploaded diagnostics artifact
+    required: true
+  junit-report:
+    description: Path to the CTest JUnit XML report
+    required: true
+  failed-tests-log:
+    description: Path to CTest's LastTestsFailed.log
+    required: true
+  last-test-log:
+    description: Path to CTest's LastTest.log
+    required: true
+  retention-days:
+    description: Number of days to retain the diagnostics artifact
+    required: false
+    default: "14"
+
+runs:
+  using: composite
+  steps:
+    - name: Add CTest failure summary
+      env:
+        SUMMARY_TITLE: ${{ inputs.summary-title }}
+        FAILED_TESTS_LOG: ${{ inputs.failed-tests-log }}
+        LAST_TEST_LOG: ${{ inputs.last-test-log }}
+      shell: bash
+      run: |
+        "$GITHUB_ACTION_PATH/summarize.sh" \
+          "$SUMMARY_TITLE" \
+          "$FAILED_TESTS_LOG" \
+          "$LAST_TEST_LOG"
+
+    - name: Upload CTest diagnostics
+      uses: actions/upload-artifact@v4
+      with:
+        name: ${{ inputs.artifact-name }}
+        if-no-files-found: warn
+        retention-days: ${{ inputs.retention-days }}
+        path: |
+          ${{ inputs.junit-report }}
+          ${{ inputs.last-test-log }}
+          ${{ inputs.failed-tests-log }}

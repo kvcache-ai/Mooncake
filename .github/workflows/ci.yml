@@ -155,26 +155,15 @@ jobs:
             --output-junit "$GITHUB_WORKSPACE/build/test-results/ctest.xml"
       shell: bash
 
-    - name: Summarize CTest failure
+    - name: Preserve CTest diagnostics
       if: ${{ always() && steps.ctest.outcome == 'failure' }}
-      run: |
-        scripts/ci/summarize_ctest_failure.sh \
-          "CTest failure (Python ${{ matrix.python-version }})" \
-          build/Testing/Temporary/LastTestsFailed.log \
-          build/Testing/Temporary/LastTest.log
-      shell: bash
-
-    - name: Upload CTest diagnostics
-      if: ${{ always() && steps.ctest.outcome == 'failure' }}
-      uses: actions/upload-artifact@v4
+      uses: ./.github/actions/ctest-diagnostics
       with:
-        name: ctest-diagnostics-py${{ matrix.python-version }}
-        if-no-files-found: warn
-        retention-days: 14
-        path: |
-          build/test-results/ctest.xml
-          build/Testing/Temporary/LastTest.log
-          build/Testing/Temporary/LastTestsFailed.log
+        summary-title: CTest failure (Python ${{ matrix.python-version }})
+        artifact-name: ctest-diagnostics-py${{ matrix.python-version }}
+        junit-report: build/test-results/ctest.xml
+        failed-tests-log: build/Testing/Temporary/LastTestsFailed.log
+        last-test-log: build/Testing/Temporary/LastTest.log
 
     - name: Drain HTTP E2E test
       if: matrix.python-version == '3.12'
@@ -884,26 +873,15 @@ jobs:
           --output-junit "$GITHUB_WORKSPACE/build-tent/test-results/ctest.xml"
       shell: bash
 
-    - name: Summarize TENT CTest failure
+    - name: Preserve TENT CTest diagnostics
       if: ${{ always() && steps.ctest.outcome == 'failure' }}
-      run: |
-        scripts/ci/summarize_ctest_failure.sh \
-          "TENT CTest failure (${{ matrix.name }})" \
-          build-tent/mooncake-transfer-engine/tent/tests/Testing/Temporary/LastTestsFailed.log \
-          build-tent/mooncake-transfer-engine/tent/tests/Testing/Temporary/LastTest.log
-      shell: bash
-
-    - name: Upload TENT CTest diagnostics
-      if: ${{ always() && steps.ctest.outcome == 'failure' }}
-      uses: actions/upload-artifact@v4
+      uses: ./.github/actions/ctest-diagnostics
       with:
-        name: ctest-diagnostics-tent-${{ matrix.name }}
-        if-no-files-found: warn
-        retention-days: 14
-        path: |
-          build-tent/test-results/ctest.xml
-          build-tent/mooncake-transfer-engine/tent/tests/Testing/Temporary/LastTest.log
-          build-tent/mooncake-transfer-engine/tent/tests/Testing/Temporary/LastTestsFailed.log
+        summary-title: TENT CTest failure (${{ matrix.name }})
+        artifact-name: ctest-diagnostics-tent-${{ matrix.name }}
+        junit-report: build-tent/test-results/ctest.xml
+        failed-tests-log: build-tent/mooncake-transfer-engine/tent/tests/Testing/Temporary/LastTestsFailed.log
+        last-test-log: build-tent/mooncake-transfer-engine/tent/tests/Testing/Temporary/LastTest.log
 
     - name: Run sccache stat for check
       if: ${{ env.SCCACHE_PATH != '' }}
