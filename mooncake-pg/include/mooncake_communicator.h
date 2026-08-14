@@ -13,16 +13,27 @@
 
 #include <transfer_engine.h>
 
+#include "common_types.h"
 #include "control_plane/agent_host.h"
 #include "control_plane/coordinator_host.h"
 #include "control_plane/link_manager.h"
+#include "device_comm/device_collective/device_collective_feature.h"
+#if MOONCAKE_PG_HAS_COLLECTIVE_V2
+#include "device_comm/device_arena.h"
+#include "device_comm/device_collective/device_collective_recovery.h"
+#include "device_comm/device_transfer/transfer_service.h"
+#endif
 #include "error_types.h"
 #include "mooncake_pg.h"
 #include "mooncake_worker.cuh"
 #include "p2p_proxy.h"
-#include "comm_types.h"
 
 namespace mooncake {
+
+#if MOONCAKE_PG_HAS_COLLECTIVE_V2
+class DeviceCollectiveRuntime;
+class StrongStream;
+#endif
 
 static constexpr size_t kDefaultCollectiveTimeoutUs = 10000000;  // 10 s
 static constexpr int64_t kDefaultP2PTimeoutUs = 10000000;        // 10 s
@@ -56,7 +67,16 @@ struct MooncakePGContext {
     std::unique_ptr<CoordinatorHost> coordinator_host;
     std::unique_ptr<AgentHost> agent_host;
 
-    MooncakePGContext() = default;
+#if MOONCAKE_PG_HAS_COLLECTIVE_V2
+    std::unique_ptr<DeviceTransferService> device_transfer_service;
+    std::unique_ptr<DeviceArena> device_arena;
+    std::optional<DeviceArenaSlice> device_collective_workspace;
+    std::unique_ptr<StrongStream> device_collective_strong_stream;
+    std::unique_ptr<DeviceCollectiveRecoveryWorker>
+        device_collective_recovery_worker;
+#endif
+
+    MooncakePGContext();
     ~MooncakePGContext();
 
     // Non-copyable: engine points to either owned_engine or an external engine
@@ -95,6 +115,7 @@ struct MooncakeCommunicatorConfig {
     GroupBootstrapId group_bootstrap_id;
     bool is_cpu = false;
     int device_index = -1;
+    std::optional<GpuCollectiveBackend> preferred_gpu_collective_backend;
     GroupBootstrapIdResolvePolicy group_resolve_policy =
         GroupBootstrapIdResolvePolicy::CreateOrAttach;
     bool auto_deactivate_on_failure = true;
@@ -228,13 +249,17 @@ class MooncakeCommunicator {
     // decision has been made and the Agent has ACKed the resulting ViewUpdate.
     PGResult<SyncAfterFailureResponse> syncAfterFailure();
 
-    // Update the data-plane view. Called by AgentHost when a ViewUpdatePush is
-    // received or rank states change. rank_states and activatable are computed
-    // by the state machine.
-    void applyViewUpdate(const GroupView& view,
+    // Apply an authoritative group view together with the current rank-state
+    // snapshot as one communicator update.
+    void applyGroupState(const GroupView& view,
                          const std::vector<RankState>& rank_states,
                          const std::vector<uint64_t>& rank_epochs,
                          const std::vector<bool>& activatable);
+    // Apply one rank-state change without reapplying the GroupView or
+    // propagating to the selected collective backend.
+    void applyRankStateUpdate(GlobalRank rank, InGroupRank in_group_rank,
+                              RankState state, uint64_t rank_epoch,
+                              bool activatable);
     // Called by AgentHost when a TE link to a peer comes back up.
     void onPeerLinkReset(InGroupRank peer);
 
@@ -277,7 +302,7 @@ class MooncakeCommunicator {
 
     // Sync the caller-provided host/device active-ranks mirror from the current
     // GroupView.
-    void syncActiveRanksMirror() const;
+    PGResult<void> syncActiveRanksMirror() const;
 
     MooncakePGContext& context_;
     AgentInterface& agent_;
@@ -287,11 +312,18 @@ class MooncakeCommunicator {
         1;  // per-group capacity (max active members for this group)
     int device_index_ = -1;
     bool is_cpu_ = false;
-    bool is_shutdown_ = false;
+    std::optional<GpuCollectiveBackend> preferred_gpu_collective_backend_;
+    bool shutdown_requested_ = false;
     int32_t* active_ranks_mirror_ = nullptr;
     bool active_ranks_mirror_is_device_ = false;
     int active_ranks_mirror_device_index_ = -1;
     std::optional<GpuStream> active_ranks_mirror_stream_;
+#if MOONCAKE_PG_HAS_COLLECTIVE_V2
+    std::unique_ptr<DeviceCollectiveRuntime> device_collective_;
+#endif
+    // Active GPU members follow the latest applied GroupView decision.
+    // All other states use Legacy.
+    GpuCollectiveBackend gpu_collective_backend_ = GpuCollectiveBackend::Legacy;
 
     std::shared_ptr<MooncakeWorker> worker_;
     std::array<void*, 2> send_buffer_{};
