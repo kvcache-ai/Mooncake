@@ -15,6 +15,7 @@
 #ifndef TENT_RUNTIME_DIRECT_PATH_POLICY_H_
 #define TENT_RUNTIME_DIRECT_PATH_POLICY_H_
 
+#include <cstddef>
 #include <cstdlib>
 #include <string>
 
@@ -32,6 +33,11 @@ enum class DirectPathDecision {
 
 class DirectPathPolicy {
    public:
+    static constexpr size_t kDirectPathSmallRequestMaxBytes =
+        1ULL * 1024 * 1024;
+    static constexpr size_t kDirectPathLargeRequestMinBytes =
+        8ULL * 1024 * 1024;
+
     static DirectPathMode mode() {
         static const DirectPathMode cached_mode = [] {
             const char* env = std::getenv("MC_EXP_FORCE_DIRECT");
@@ -50,9 +56,39 @@ class DirectPathPolicy {
         return cached_mode;
     }
 
-    static bool prefersDirectPath(const Request& request) {
+    static bool hasLatencySignal(const Request& request) {
         return request.deadline_ns != 0 ||
                request.intent_type == IntentType::FOREGROUND_GET;
+    }
+
+    static bool hasThroughputSignal(const Request& request) {
+        switch (request.intent_type) {
+            case IntentType::BACKGROUND_PREFETCH:
+            case IntentType::MIGRATION:
+            case IntentType::CHECKPOINT:
+            case IntentType::WEIGHT_LOADING:
+            case IntentType::STAGING_INTERNAL:
+                return true;
+            case IntentType::INTENT_UNSPEC:
+            case IntentType::FOREGROUND_GET:
+                return false;
+        }
+        return false;
+    }
+
+    static bool prefersDirectPath(const Request& request) {
+        return hasLatencySignal(request) &&
+               request.length <= kDirectPathSmallRequestMaxBytes;
+    }
+
+    static DirectPathDecision decideAuto(const Request& request) {
+        if (hasThroughputSignal(request))
+            return DirectPathDecision::UseScheduledPath;
+        if (request.length >= kDirectPathLargeRequestMinBytes)
+            return DirectPathDecision::UseScheduledPath;
+        return prefersDirectPath(request)
+                   ? DirectPathDecision::TryDirectPath
+                   : DirectPathDecision::UseScheduledPath;
     }
 
     static DirectPathDecision decide(const Request& request) {
@@ -62,9 +98,7 @@ class DirectPathPolicy {
             case DirectPathMode::Enabled:
                 return DirectPathDecision::RequireDirectPath;
             case DirectPathMode::Auto:
-                return prefersDirectPath(request)
-                           ? DirectPathDecision::TryDirectPath
-                           : DirectPathDecision::UseScheduledPath;
+                return decideAuto(request);
         }
         return DirectPathDecision::UseScheduledPath;
     }
