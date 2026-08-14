@@ -13,13 +13,15 @@
 // limitations under the License.
 //
 // Correctness checks for RDMA CtrlChannel notify path via
-// RdmaTwoSidedTransport. Requires an RDMA device. Self-skips when none is
-// present.
+// RdmaTwoSidedTransport. Requires a usable RDMA device (active port with a
+// GID). Self-skips when none is present, including CI runners that enumerate
+// a phantom mlx5_0.
 //
 // Env:
-//   MC_TE_FILTERS / MC_TEST_DEVICE_NAME — pin NIC (default: first ibv device)
-//   MC_USE_RDMA_TWOSIDED=1               — install rdma_twosided (set by test)
-//   MC_RDMA_NOTIFY_OOB_FALLBACK=0        — force RDMA path (set by this test)
+//   MC_TE_FILTERS / MC_TEST_DEVICE_NAME — pin NIC
+//     (default: first usable ibv device)
+//   MC_USE_RDMA_TWOSIDED=1 — install rdma_twosided (set by test)
+//   MC_RDMA_NOTIFY_OOB_FALLBACK=0 — force RDMA path (set by this test)
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
@@ -41,6 +43,27 @@ using namespace mooncake;
 
 namespace {
 
+bool rdmaDeviceUsable(ibv_device *device) {
+    ibv_context *ctx = ibv_open_device(device);
+    if (!ctx) return false;
+    ibv_device_attr attr{};
+    if (ibv_query_device(ctx, &attr) != 0) {
+        ibv_close_device(ctx);
+        return false;
+    }
+    bool ok = false;
+    for (uint8_t port = 1; port <= attr.phys_port_cnt; ++port) {
+        ibv_port_attr port_attr{};
+        if (ibv_query_port(ctx, port, &port_attr) != 0) continue;
+        if (port_attr.gid_tbl_len > 0 && port_attr.state == IBV_PORT_ACTIVE) {
+            ok = true;
+            break;
+        }
+    }
+    ibv_close_device(ctx);
+    return ok;
+}
+
 std::string pickRdmaDevice() {
     const char *override_name = std::getenv("MC_TEST_DEVICE_NAME");
     if (override_name && *override_name) return override_name;
@@ -50,7 +73,13 @@ std::string pickRdmaDevice() {
         if (list) ibv_free_device_list(list);
         return "";
     }
-    std::string name = ibv_get_device_name(list[0]);
+    std::string name;
+    for (int i = 0; i < num_devices; ++i) {
+        if (rdmaDeviceUsable(list[i])) {
+            name = ibv_get_device_name(list[i]);
+            break;
+        }
+    }
     ibv_free_device_list(list);
     return name;
 }
@@ -78,7 +107,7 @@ class RdmaNotifyTest : public ::testing::Test {
     void SetUp() override {
         device_ = pickRdmaDevice();
         if (device_.empty()) {
-            GTEST_SKIP() << "no RDMA device available";
+            GTEST_SKIP() << "no usable RDMA device available";
         }
         ASSERT_EQ(setenv("MC_TE_FILTERS", device_.c_str(), 1), 0);
         ASSERT_EQ(setenv("MC_USE_RDMA_TWOSIDED", "1", 1), 0);

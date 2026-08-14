@@ -138,8 +138,9 @@ struct TransferHandshakeUtil {
         }
         if (root.isMember("notify_rq_depth") &&
             root["notify_rq_depth"].isUInt()) {
-            desc.notify_rq_depth =
-                static_cast<uint16_t>(root["notify_rq_depth"].asUInt());
+            unsigned int depth = root["notify_rq_depth"].asUInt();
+            if (depth > 0xFFFFu) return ERR_INVALID_ARGUMENT;
+            desc.notify_rq_depth = static_cast<uint16_t>(depth);
         }
         if (root.isMember("ctrl_channel") && root["ctrl_channel"].isBool()) {
             desc.ctrl_channel = root["ctrl_channel"].asBool();
@@ -1484,7 +1485,11 @@ int TransferMetadata::startHandshakeDaemon(
         [on_receive_handshake](const Json::Value &peer,
                                Json::Value &local) -> int {
             HandShakeDesc local_desc, peer_desc;
-            TransferHandshakeUtil::decode(peer, peer_desc);
+            if (TransferHandshakeUtil::decode(peer, peer_desc)) {
+                local_desc.reply_msg = "Invalid handshake notify_rq_depth";
+                local = TransferHandshakeUtil::encode(local_desc);
+                return 0;
+            }
             if (on_receive_handshake) {
                 int ret = on_receive_handshake(peer_desc, local_desc);
                 if (ret) {
@@ -1531,7 +1536,11 @@ int TransferMetadata::sendHandshake(const std::string &peer_server_name,
     int ret = handshake_plugin_->send(peer_location.ip_or_host_name,
                                       peer_location.rpc_port, local, peer);
     if (ret) return ret;
-    TransferHandshakeUtil::decode(peer, peer_desc);
+    if (TransferHandshakeUtil::decode(peer, peer_desc)) {
+        LOG(ERROR) << "Handshake from " << peer_server_name
+                   << " has invalid notify_rq_depth";
+        return ERR_INVALID_ARGUMENT;
+    }
     if (!peer_desc.reply_msg.empty()) {
         LOG(ERROR) << "Handshake rejected by " << peer_server_name << ": "
                    << peer_desc.reply_msg;

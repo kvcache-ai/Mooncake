@@ -167,7 +167,8 @@ void RdmaTwoSidedTransport::ctrlWorkerLoop() {
         }
         int processed = 0;
         for (auto &channel : channels) {
-            processed += channel->pollCompletions(16);
+            int ret = channel->pollCompletions(16);
+            if (ret > 0) processed += ret;
         }
         if (processed == 0) {
             std::this_thread::sleep_for(std::chrono::microseconds(100));
