@@ -1725,6 +1725,8 @@ Status TransferEngineImpl::prepareSubmit(
     for (const auto& request : merged.request_list) {
         PreparedSubmit::Owner owner;
         owner.request = request;
+        owner.request.priority =
+            DirectPathPolicy::priorityForRequest(owner.request);
         auto resolved = resolveExecutionRoute(owner.request, 0);
         owner.route = resolved.route;
         owner.staging = resolved.staging;
@@ -1933,6 +1935,7 @@ void TransferEngineImpl::initializeTaskFromRoute(
     task.xport_priority = 0;
     task.status = PENDING;
     task.request = request;
+    task.request.priority = DirectPathPolicy::priorityForRequest(request);
     task.staging = false;
     task.start_time = start_time;
     task.dispatch_time = dispatch_time;
@@ -2215,56 +2218,6 @@ bool TransferEngineImpl::shouldQueueSubmit(const PreparedSubmit& prepared,
         [](const PreparedSubmit::Owner& owner) { return owner.staging; });
 }
 
-Status TransferEngineImpl::trySubmitDirectShortcut(
-    Batch* batch, const std::vector<Request>& request_list,
-    const Notification* notifi, QueueOwnerKind owner_kind, bool& submitted) {
-    submitted = false;
-    if (!batch) return Status::InvalidArgument("Invalid batch" LOC_MARK);
-    if (notifi || owner_kind != QueueOwnerKind::User) return Status::OK();
-    if (runtime_queue_config_.enabled) return Status::OK();
-    if (request_list.size() != 1) return Status::OK();
-    if (batch->task_list.size() + 1 > batch->max_size)
-        return Status::TooManyRequests("Exceed batch capacity" LOC_MARK);
-
-    const auto& request = request_list.front();
-    const auto direct_decision = DirectPathPolicy::decide(request);
-    if (!DirectPathPolicy::shouldAttemptDirectPath(direct_decision))
-        return Status::OK();
-    CHECK_STATUS(validateTransportHint(request, 0));
-    auto route = getTransportType(request, 0);
-    if (route.transport != RDMA) return Status::OK();
-    auto& transport = transport_list_[RDMA];
-    if (!transport) return Status::OK();
-
-    auto& sub_batch = batch->sub_batch[RDMA];
-    if (!sub_batch) {
-        CHECK_STATUS(transport->allocateSubBatch(sub_batch, batch->max_size));
-        attachProgressNotifier(batch, sub_batch);
-    }
-
-    const auto now = std::chrono::steady_clock::now();
-    TaskInfo task;
-    initializeTaskFromRoute(task, request, route, now, now);
-    task.sub_task_id = sub_batch->size();
-    task.derived = false;
-
-    sub_batch->device_mask = task.device_mask;
-    sub_batch->qp_pool = task.qp_pool;
-    batch->task_list.push_back(task);
-
-    auto& stored_task = batch->task_list.back();
-    startTransportAttempt(stored_task, RDMA, now);
-    auto status = transport->submitTransferTasks(sub_batch, {request});
-    if (!status.ok()) {
-        finishTransportAttempt(stored_task, FAILED,
-                               std::chrono::steady_clock::now());
-        batch->task_list.pop_back();
-        return status;
-    }
-    submitted = true;
-    return Status::OK();
-}
-
 Status TransferEngineImpl::submitTransfer(
     BatchID batch_id, const std::vector<Request>& request_list,
     const Notification* notifi, QueueOwnerKind owner_kind) {
@@ -2272,12 +2225,6 @@ Status TransferEngineImpl::submitTransfer(
     CHECK_STATUS(retainBatch(batch_id, batch));
     BatchRef batch_ref(*this, batch);
     const size_t start_task_id = batch_ref.get()->task_list.size();
-    bool direct_shortcut = false;
-    CHECK_STATUS(trySubmitDirectShortcut(batch_ref.get(), request_list, notifi,
-                                         owner_kind, direct_shortcut));
-    if (direct_shortcut) {
-        return batch_ref.release();
-    }
     PreparedSubmit prepared;
     CHECK_STATUS(prepareSubmit(batch_ref.get(), request_list, prepared));
 

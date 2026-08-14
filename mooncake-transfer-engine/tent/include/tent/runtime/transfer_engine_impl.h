@@ -390,12 +390,6 @@ class TransferEngineImpl {
                                  std::chrono::steady_clock::time_point
                                      dispatch_time);
 
-    Status trySubmitDirectShortcut(Batch* batch,
-                                   const std::vector<Request>& request_list,
-                                   const Notification* notifi,
-                                   QueueOwnerKind owner_kind,
-                                   bool& submitted);
-
     void attachProgressNotifier(Batch* batch, Transport::SubBatchRef sub_batch);
 
     uint64_t nextBatchToken();

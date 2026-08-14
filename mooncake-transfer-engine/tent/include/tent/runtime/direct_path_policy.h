@@ -38,6 +38,29 @@ class DirectPathPolicy {
     static constexpr size_t kDirectPathLargeRequestMinBytes =
         8ULL * 1024 * 1024;
 
+    static int priorityForIntent(IntentType intent) {
+        switch (intent) {
+            case IntentType::FOREGROUND_GET:
+                return PRIO_HIGH;
+            case IntentType::BACKGROUND_PREFETCH:
+            case IntentType::MIGRATION:
+            case IntentType::CHECKPOINT:
+                return PRIO_LOW;
+            case IntentType::WEIGHT_LOADING:
+                return PRIO_MEDIUM;
+            case IntentType::STAGING_INTERNAL:
+            case IntentType::INTENT_UNSPEC:
+                return PRIO_HIGH;
+        }
+        return PRIO_HIGH;
+    }
+
+    static int priorityForRequest(const Request& request) {
+        if (request.priority != PRIO_UNSPEC) return request.priority;
+        if (request.deadline_ns != 0) return PRIO_HIGH;
+        return priorityForIntent(request.intent_type);
+    }
+
     static DirectPathMode mode() {
         static const DirectPathMode cached_mode = [] {
             const char* env = std::getenv("MC_EXP_FORCE_DIRECT");

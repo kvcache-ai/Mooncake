@@ -28,6 +28,49 @@ Request makeRequest(size_t length, IntentType intent, uint64_t deadline_ns = 0) 
     return request;
 }
 
+TEST(DirectPathPolicyTest, ForegroundGetPriorityIsHigh) {
+    EXPECT_EQ(DirectPathPolicy::priorityForIntent(IntentType::FOREGROUND_GET),
+              PRIO_HIGH);
+}
+
+TEST(DirectPathPolicyTest, BackgroundIntentPrioritiesAreLow) {
+    for (const auto intent : {IntentType::BACKGROUND_PREFETCH,
+                             IntentType::MIGRATION,
+                             IntentType::CHECKPOINT}) {
+        EXPECT_EQ(DirectPathPolicy::priorityForIntent(intent), PRIO_LOW);
+    }
+}
+
+TEST(DirectPathPolicyTest, WeightLoadingPriorityIsMedium) {
+    EXPECT_EQ(DirectPathPolicy::priorityForIntent(IntentType::WEIGHT_LOADING),
+              PRIO_MEDIUM);
+}
+
+TEST(DirectPathPolicyTest, StagingInternalPriorityIsHigh) {
+    EXPECT_EQ(DirectPathPolicy::priorityForIntent(IntentType::STAGING_INTERNAL),
+              PRIO_HIGH);
+}
+
+TEST(DirectPathPolicyTest, UnspecPriorityDefaultsToHigh) {
+    auto request = makeRequest(4096, IntentType::INTENT_UNSPEC);
+    EXPECT_EQ(request.priority, PRIO_UNSPEC);
+    EXPECT_EQ(DirectPathPolicy::priorityForRequest(request), PRIO_HIGH);
+}
+
+TEST(DirectPathPolicyTest, ExplicitPriorityIsPreserved) {
+    auto request = makeRequest(4096, IntentType::FOREGROUND_GET, 12345);
+    request.priority = PRIO_LOW;
+    EXPECT_EQ(DirectPathPolicy::priorityForRequest(request), PRIO_LOW);
+}
+
+TEST(DirectPathPolicyTest, UnspecPriorityWithDeadlineBecomesHigh) {
+    auto request = makeRequest(4096, IntentType::MIGRATION, 12345);
+    EXPECT_EQ(DirectPathPolicy::priorityForRequest(request), PRIO_HIGH);
+
+    request = makeRequest(4096, IntentType::MIGRATION);
+    EXPECT_EQ(DirectPathPolicy::priorityForRequest(request), PRIO_LOW);
+}
+
 TEST(DirectPathPolicyTest, AutoUsesDirectForSmallLatencyRequests) {
     auto request = makeRequest(DirectPathPolicy::kDirectPathSmallRequestMaxBytes,
                                IntentType::FOREGROUND_GET);
