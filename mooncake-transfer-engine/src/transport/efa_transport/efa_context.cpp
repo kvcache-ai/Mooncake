@@ -1496,7 +1496,17 @@ int EfaContext::submitSlicesOnPeer(
     // 1. Reserve N WR+CQ slots in bulk (single CAS each)
     // 2. Prepare MR descriptors and op contexts outside the lock
     // 3. Hold post_lock_ once for the entire batch of fi_write calls
-    const int kMaxBackoffYields = 100000;
+    // Deadline for the WR/CQ credit wait below.  It is deliberately a wall
+    // clock and not a yield budget: a yield costs a few hundred nanoseconds on
+    // an idle core and microseconds on a loaded one, so a fixed yield count
+    // gives up after wildly different amounts of real time depending only on
+    // how many threads happen to be runnable.  Measured on a healthy 2-node
+    // p6-b300 pair, the old budget of 100000 yields was worth ~22 ms at 64
+    // submitter threads and ~460 ms at 192 -- and self-resolving stalls of up
+    // to 21 ms occur under ordinary load, so the 64-thread case failed live
+    // transfers that were about to make progress.
+    const double drain_timeout_ms =
+        static_cast<double>(globalConfig().efa_cq_drain_timeout_ms);
     // Not globalConfig().max_cqe: that is the requested value, while max_cqe_
     // is what this device's CQ was actually opened with (see construct()).
     const int cq_limit = static_cast<int>(max_cqe_);
@@ -1599,14 +1609,12 @@ int EfaContext::submitSlicesOnPeer(
         // iteration -- pays nothing, not even a clock read.
         //
         // Two things the old log could not be reconstructed from.  First, the
-        // wall-clock wait: kMaxBackoffYields is a yield budget, not a deadline,
-        // and a yield costs anywhere from a few hundred nanoseconds when the
-        // core is idle to microseconds when it is contended, so the same code
-        // gives up after wildly different amounts of real time depending only
-        // on how loaded the box is.  Second, whether wr_depth_ moved at all
-        // while we waited: a counter pinned at max for the entire wait means
-        // completions are not coming back (stalled peer, starved poller, or
-        // leaked credit -- see orphan_completions_), whereas one oscillating
+        // wall-clock wait, which is now what decides the timeout as well; the
+        // yield count is still reported because its ratio to the elapsed time
+        // says how contended the box was.  Second, whether wr_depth_ moved at
+        // all while we waited: a counter pinned at max for the entire wait
+        // means completions are not coming back (stalled peer, starved poller,
+        // or leaked credit -- see orphan_completions_), whereas one oscillating
         // just below max means we are simply saturated and the batch is
         // ordinary backpressure.  Those two want opposite investigations.
         std::chrono::steady_clock::time_point wait_t0;
@@ -1629,13 +1637,26 @@ int EfaContext::submitSlicesOnPeer(
                 wr_prev = cur_wr;
             }
         };
+        // Counts the yield and reports whether the deadline has passed.  Must
+        // be called after note_starved(), which arms wait_t0 on the first call.
+        // The clock is read once per 1024 yields: at ~0.2 us per yield that
+        // bounds the overshoot at well under a millisecond while keeping
+        // clock_gettime off the hot path.
+        auto drain_deadline_hit = [&]() -> bool {
+            ++backoff;
+            if (drain_timeout_ms <= 0.0) return false;
+            if ((backoff & 1023) != 0) return false;
+            return std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now() - wait_t0)
+                       .count() > drain_timeout_ms;
+        };
 
         while (batch_count == 0) {
             int cur_wr = wr_depth_.load(std::memory_order_relaxed);
             int wr_avail = max_wr_depth_ - cur_wr;
             if (wr_avail <= 0) {
                 note_starved("wr_depth", cur_wr);
-                if (++backoff > kMaxBackoffYields) {
+                if (drain_deadline_hit()) {
                     timed_out = true;
                     break;
                 }
@@ -1648,7 +1669,7 @@ int EfaContext::submitSlicesOnPeer(
                 int cq_avail = cq_limit - cur_cq;
                 if (cq_avail <= 0) {
                     note_starved("cq_outstanding", cur_wr);
-                    if (++backoff > kMaxBackoffYields) {
+                    if (drain_deadline_hit()) {
                         timed_out = true;
                         break;
                     }
@@ -1695,7 +1716,8 @@ int EfaContext::submitSlicesOnPeer(
                 << (peer_path.empty() ? "unknown" : peer_path)
                 << " (fi_addr=" << peer_fi_addr
                 << "): starved_on=" << starved_on << ", waited=" << waited_ms
-                << "ms over " << backoff << " yields"
+                << "ms over " << backoff << " yields (deadline "
+                << drain_timeout_ms << "ms, MC_EFA_CQ_DRAIN_TIMEOUT_MS)"
                 << "; wr_depth=" << wr_depth_.load(std::memory_order_relaxed)
                 << "/" << max_wr_depth_ << " (at first backoff " << wr_first
                 << ", observed min=" << wr_min << " max=" << wr_max

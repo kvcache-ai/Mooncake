@@ -542,6 +542,12 @@ void loadGlobalConfig(GlobalConfig& config) {
                            config.efa_homogeneous_peers);
     }
 
+    const char* efa_cq_drain_timeout_env =
+        std::getenv("MC_EFA_CQ_DRAIN_TIMEOUT_MS");
+    if (efa_cq_drain_timeout_env) {
+        config.efa_cq_drain_timeout_ms = atoll(efa_cq_drain_timeout_env);
+    }
+
     const char* enable_parallel_reg_mr =
         std::getenv("MC_ENABLE_PARALLEL_REG_MR");
     if (enable_parallel_reg_mr) {
@@ -751,6 +757,7 @@ void dumpGlobalConfig() {
     LOG(INFO) << "mtu_length = " << mtuLengthToString(config.mtu_length);
     LOG(INFO) << "parallel_reg_mr = " << config.parallel_reg_mr;
     LOG(INFO) << "efa_homogeneous_peers = " << config.efa_homogeneous_peers;
+    LOG(INFO) << "efa_cq_drain_timeout_ms = " << config.efa_cq_drain_timeout_ms;
     LOG(INFO) << "efa_nic_selection = "
               << (config.efa_nic_selection == EfaNicSelection::LOCAL ? "local"
                                                                      : "all");

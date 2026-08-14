@@ -99,6 +99,13 @@ struct GlobalConfig {
     // MC_EFA_HOMOGENEOUS_PEERS=0 for a fleet mixing EFA generations or
     // Mooncake builds. See buildSharedEndpoint() for the full rationale.
     bool efa_homogeneous_peers = true;
+    // Wall-clock safety net for the WR/CQ credit wait in
+    // EfaContext::submitSlicesOnPeer, in milliseconds.  A credit wait is
+    // ordinary backpressure and resolves on its own; only a wait this long
+    // means completions have genuinely stopped coming back.  Override with
+    // MC_EFA_CQ_DRAIN_TIMEOUT_MS; <= 0 waits forever (the stalled-wave escape
+    // hatch still bounds a provider that refuses every post).
+    int64_t efa_cq_drain_timeout_ms = 1000;
     uint16_t rpc_min_port = 15000;
     uint16_t rpc_max_port = 17000;
     bool use_ipv6 = false;
