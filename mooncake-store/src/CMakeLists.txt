@@ -107,6 +107,25 @@ endif()
 set(EXTRA_LIBS "")
 set(SPDK_STATIC_LIBS "")
 
+# Alibaba Cloud OSS adapter (REST API with OSS V4 signing).
+find_package(CURL QUIET)
+find_package(OpenSSL QUIET)
+if(CURL_FOUND AND OpenSSL_FOUND)
+  message(STATUS "Alibaba Cloud OSS adapter: Enabled")
+  set(MOONCAKE_OSS_ADAPTER_ENABLED
+      TRUE
+      CACHE INTERNAL "Whether the Alibaba Cloud OSS adapter is built")
+  list(APPEND MOONCAKE_STORE_CLIENT_SOURCES storage/distributed/oss_adapter.cpp)
+  list(APPEND EXTRA_LIBS CURL::libcurl OpenSSL::Crypto)
+  add_definitions(-DHAVE_OSS_ADAPTER)
+else()
+  message(
+    STATUS "Alibaba Cloud OSS adapter: Disabled (requires CURL and OpenSSL)")
+  set(MOONCAKE_OSS_ADAPTER_ENABLED
+      FALSE
+      CACHE INTERNAL "Whether the Alibaba Cloud OSS adapter is built")
+endif()
+
 # Find AWS SDK
 find_package(AWSSDK QUIET COMPONENTS s3)
 if(AWSSDK_FOUND)

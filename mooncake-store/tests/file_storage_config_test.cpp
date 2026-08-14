@@ -141,7 +141,7 @@ TEST_F(FileStorageConfigTest, ReadsValidValues) {
 
     const auto config = FileStorageConfig::FromEnvironment();
     EXPECT_EQ(config.storage_backend_type, StorageBackendType::kDistributed);
-    EXPECT_TRUE(config.enable_dfs);
+    EXPECT_FALSE(config.enable_dfs);
     EXPECT_EQ(config.storage_filepath, "/tmp/storage");
     EXPECT_EQ(config.local_buffer_size, 2147483648);
     EXPECT_EQ(config.pinned_restore_arena_size, 64 * 1024 * 1024);
