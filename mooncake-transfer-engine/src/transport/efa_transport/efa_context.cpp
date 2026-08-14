@@ -408,12 +408,16 @@ int EfaContext::deconstruct() {
 }
 
 #if defined(USE_CUDA)
+// A silent failure here resurfaces as an opaque provider error, so name the
+// driver call that actually failed.
 static void logCudaFailure(const char* call, CUresult ret, int device_ordinal) {
     const char* err = nullptr;
     cuGetErrorString(ret, &err);
     LOG(WARNING) << "EFA: " << call << " failed for CUDA device "
                  << device_ordinal << ": " << (err ? err : "unknown") << " ("
-                 << ret << "); CUDA operation may fail";
+                 << ret
+                 << "); GPU memory registration or a GPU-aware copy may fail"
+                    " with a bare \"Operation not supported\"";
 }
 
 // Make `device_ordinal`'s primary context current on the calling thread, unless
@@ -429,48 +433,60 @@ static void logCudaFailure(const char* call, CUresult ret, int device_ordinal) {
 // Who arrives here without the right context: registerLocalMemoryBatch() runs
 // one std::async(std::launch::async) per buffer and registerLocalMemory() can
 // fan out one std::thread per NIC, so a registering thread may have touched no
-// CUDA API at all.  Loopback copies also run on EFA worker threads.  Since
-// these threads may be reused for buffers on different devices, bind by device
-// rather than merely checking whether any context is current.
+// CUDA API at all.  Loopback copies run on the caller's thread, so
+// tryLoopbackCopy() restores a different previous context before returning.
 //
 // cuDevicePrimaryCtxRetain() returns the same primary context the CUDA runtime
 // uses, so this attaches to the process's existing context rather than creating
 // another.  The retain is intentionally not released: the primary context
 // outlives every registration, and dropping the last reference here would tear
 // down the context the rest of the process is using.
-static void bindCudaContextIfNeeded(int device_ordinal) {
+static bool bindCudaContextIfNeeded(int device_ordinal) {
     CUdevice want;
     CUresult ret = cuDeviceGet(&want, device_ordinal);
     if (ret != CUDA_SUCCESS) {
         logCudaFailure("cuDeviceGet", ret, device_ordinal);
-        return;
+        return false;
     }
 
     CUcontext cur = nullptr;
     CUdevice cur_dev;
-    if (cuCtxGetCurrent(&cur) == CUDA_SUCCESS && cur != nullptr &&
-        cuCtxGetDevice(&cur_dev) == CUDA_SUCCESS && cur_dev == want)
-        return;
+    ret = cuCtxGetCurrent(&cur);
+    if (ret != CUDA_SUCCESS) {
+        logCudaFailure("cuCtxGetCurrent", ret, device_ordinal);
+        return false;
+    }
+    if (cur != nullptr) {
+        ret = cuCtxGetDevice(&cur_dev);
+        if (ret != CUDA_SUCCESS) {
+            logCudaFailure("cuCtxGetDevice", ret, device_ordinal);
+            return false;
+        }
+        if (cur_dev == want) return true;
+    }
 
     CUcontext primary = nullptr;
     ret = cuDevicePrimaryCtxRetain(&primary, want);
     if (ret != CUDA_SUCCESS) {
         logCudaFailure("cuDevicePrimaryCtxRetain", ret, device_ordinal);
-        return;
+        return false;
     }
     ret = cuCtxSetCurrent(primary);
-    if (ret != CUDA_SUCCESS)
+    if (ret != CUDA_SUCCESS) {
         logCudaFailure("cuCtxSetCurrent", ret, device_ordinal);
+        return false;
+    }
+    return true;
 }
 
-static int getCudaDeviceForPointer(const void* ptr) {
+static int getCudaDeviceForPointer(const void* ptr, cudaError_t& status) {
     cudaPointerAttributes attributes;
-    cudaError_t ret = cudaPointerGetAttributes(&attributes, ptr);
-    if (ret != cudaSuccess) {
-        cudaGetLastError();
-        return -1;
+    status = cudaPointerGetAttributes(&attributes, ptr);
+    if (status != cudaSuccess) return -1;
+    if (attributes.type == cudaMemoryTypeDevice ||
+        attributes.type == cudaMemoryTypeManaged) {
+        return attributes.device;
     }
-    if (attributes.type == cudaMemoryTypeDevice) return attributes.device;
     return -1;
 }
 #endif
@@ -502,10 +518,11 @@ int EfaContext::registerMemoryRegionInternal(void* addr, size_t length,
     int device_ordinal = 0;
 
 #if defined(USE_CUDA)
-    int cuda_device = getCudaDeviceForPointer(addr);
-    if (cuda_device >= 0) {
+    cudaPointerAttributes attributes;
+    cudaError_t cuda_ret = cudaPointerGetAttributes(&attributes, addr);
+    if (cuda_ret == cudaSuccess && attributes.type == cudaMemoryTypeDevice) {
         iface = FI_HMEM_CUDA;
-        device_ordinal = cuda_device;
+        device_ordinal = attributes.device;
     }
 #elif defined(USE_HIP)
     hipPointerAttribute_t attributes;
@@ -519,7 +536,7 @@ int EfaContext::registerMemoryRegionInternal(void* addr, size_t length,
     int ret;
     if (iface != FI_HMEM_SYSTEM) {
 #if defined(USE_CUDA)
-        bindCudaContextIfNeeded(device_ordinal);
+        if (!bindCudaContextIfNeeded(device_ordinal)) return ERR_CONTEXT;
 #endif
         // GPU memory: use fi_mr_regattr with explicit iface and device
         struct iovec iov = {.iov_base = addr, .iov_len = length};
@@ -815,23 +832,67 @@ bool EfaContext::tryLoopbackCopy(Transport::Slice* slice) {
     // backends do not expose the cuda* symbols).  CUDA host-only copies also
     // use memcpy; copies involving device memory use cudaMemcpyDefault after
     // binding the destination device, or the source device for D2H copies.
+    // The caller's context is restored afterward, and D2D copies synchronize
+    // before the slice is reported complete.
 #if defined(USE_CUDA)
-    int device = getCudaDeviceForPointer(dst);
-    if (device < 0) device = getCudaDeviceForPointer(src);
+    cudaError_t dst_status;
+    cudaError_t src_status;
+    int dst_device = getCudaDeviceForPointer(dst, dst_status);
+    int src_device = getCudaDeviceForPointer(src, src_status);
+    if (dst_status != cudaSuccess || src_status != cudaSuccess) {
+        cudaError_t rc = dst_status != cudaSuccess ? dst_status : src_status;
+        LOG(ERROR) << "EFA loopback cudaPointerGetAttributes failed: "
+                   << cudaGetErrorString(rc) << " (dst=" << dst
+                   << ", src=" << src << ", len=" << len << ")";
+        slice->markFailed();
+        return true;
+    }
+
+    int device = dst_device >= 0 ? dst_device : src_device;
     if (device < 0) {
         memcpy(dst, src, len);
     } else {
-        bindCudaContextIfNeeded(device);
-        auto rc = cudaMemcpy(dst, src, len, cudaMemcpyDefault);
+        CUcontext previous = nullptr;
+        CUresult context_rc = cuCtxGetCurrent(&previous);
+        if (context_rc != CUDA_SUCCESS) {
+            logCudaFailure("cuCtxGetCurrent", context_rc, device);
+            slice->markFailed();
+            return true;
+        }
+
+        bool bound = bindCudaContextIfNeeded(device);
+        cudaError_t rc = cudaSuccess;
+        if (bound) {
+            rc = cudaMemcpy(dst, src, len, cudaMemcpyDefault);
+            if (rc == cudaSuccess && dst_device >= 0 && src_device >= 0) {
+                rc = cudaStreamSynchronize(0);
+            }
+        }
+
+        context_rc = cuCtxSetCurrent(previous);
+        if (context_rc != CUDA_SUCCESS) {
+            logCudaFailure("cuCtxSetCurrent (restore)", context_rc, device);
+        }
+
+        if (!bound) {
+            slice->markFailed();
+            return true;
+        }
         if (rc != cudaSuccess) {
-            LOG(ERROR) << "EFA loopback cudaMemcpy failed: "
+            LOG(ERROR) << "EFA loopback CUDA copy failed: "
                        << cudaGetErrorString(rc) << " (dst=" << dst
                        << ", src=" << src << ", len=" << len << ")";
             slice->markFailed();
             return true;
         }
+        if (context_rc != CUDA_SUCCESS) {
+            slice->markFailed();
+            return true;
+        }
     }
 #elif defined(USE_HIP)
+    // EFA is not deployed with HIP, so CUDA context binding is intentionally
+    // not mirrored here.
     auto rc = hipMemcpy(dst, src, len, hipMemcpyDefault);
     if (rc != hipSuccess) {
         LOG(ERROR) << "EFA loopback hipMemcpy failed: " << hipGetErrorString(rc)

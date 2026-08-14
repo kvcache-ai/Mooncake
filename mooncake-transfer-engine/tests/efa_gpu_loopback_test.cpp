@@ -133,6 +133,17 @@ class EFAGpuLoopbackTest : public ::testing::Test {
         }
     }
 
+    class EngineCleanup {
+       public:
+        EngineCleanup(EFAGpuLoopbackTest *test, EngineSetup &setup)
+            : test_(test), setup_(setup) {}
+        ~EngineCleanup() { test_->destroyEngine(setup_); }
+
+       private:
+        EFAGpuLoopbackTest *test_;
+        EngineSetup &setup_;
+    };
+
     bool submitAndWait(TransferEngine *engine, SegmentID segment_id,
                        void *source, uint64_t target_offset, size_t length,
                        TransferRequest::OpCode opcode) {
@@ -178,9 +189,9 @@ class EFAGpuLoopbackTest : public ::testing::Test {
     std::string local_server_name_;
 };
 
-// A loopback copy submitted from a fresh thread must bind the buffer's device,
-// not the thread's default CUDA device (GPU 0).
-TEST_F(EFAGpuLoopbackTest, LoopbackUsesBufferDevice) {
+// A loopback copy submitted from a fresh thread must not activate GPU 0 or
+// leave a CUDA context current on the caller's thread.
+TEST_F(EFAGpuLoopbackTest, LoopbackPreservesEmptyCallerContext) {
     int device_count = 0;
     ASSERT_EQ(cudaGetDeviceCount(&device_count), cudaSuccess);
     if (device_count < 2) GTEST_SKIP() << "At least two CUDA GPUs required";
@@ -196,6 +207,7 @@ TEST_F(EFAGpuLoopbackTest, LoopbackUsesBufferDevice) {
 
     auto setup = createEngine(1);
     if (!setup.ok) GTEST_SKIP() << "EFA/CUDA setup unavailable";
+    EngineCleanup cleanup(this, setup);
 
     auto segment_desc =
         setup.engine->getMetadata()->getSegmentDescByID(setup.segment_id);
@@ -203,36 +215,32 @@ TEST_F(EFAGpuLoopbackTest, LoopbackUsesBufferDevice) {
     uint64_t remote_base = (uint64_t)segment_desc->buffers[0].addr;
 
     const size_t kDataLength = 4096;
-    ASSERT_EQ(cudaMemset(setup.dev_buf, 0xAB, kDataLength), cudaSuccess);
+    uint8_t *dev = (uint8_t *)setup.dev_buf;
+    const uint64_t destination = setup.buffer_size / 2;
+    ASSERT_EQ(cudaMemset(dev, 0xAB, kDataLength), cudaSuccess);
+    ASSERT_EQ(cudaMemset(dev + destination, 0, kDataLength), cudaSuccess);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
 
-    bool started_without_context = false;
     bool transfer_ok = false;
-    CUresult context_result = CUDA_ERROR_UNKNOWN;
-    CUresult device_result = CUDA_ERROR_UNKNOWN;
-    CUdevice worker_device = -1;
+    CUresult before_result = CUDA_ERROR_UNKNOWN;
+    CUresult after_result = CUDA_ERROR_UNKNOWN;
+    CUcontext before_context = nullptr;
+    CUcontext after_context = nullptr;
     std::thread submitter([&] {
-        CUcontext context = nullptr;
-        context_result = cuCtxGetCurrent(&context);
-        started_without_context =
-            context_result == CUDA_SUCCESS && context == nullptr;
-
-        transfer_ok =
-            submitAndWait(setup.engine.get(), setup.segment_id, setup.dev_buf,
-                          remote_base + (setup.buffer_size / 2), kDataLength,
-                          TransferRequest::WRITE);
-
-        context_result = cuCtxGetCurrent(&context);
-        if (context_result == CUDA_SUCCESS && context != nullptr) {
-            device_result = cuCtxGetDevice(&worker_device);
-        }
+        before_result = cuCtxGetCurrent(&before_context);
+        transfer_ok = submitAndWait(setup.engine.get(), setup.segment_id,
+                                    setup.dev_buf, remote_base + destination,
+                                    kDataLength, TransferRequest::WRITE);
+        after_result = cuCtxGetCurrent(&after_context);
     });
     submitter.join();
 
-    ASSERT_TRUE(started_without_context);
+    ASSERT_EQ(before_result, CUDA_SUCCESS);
+    ASSERT_EQ(before_context, nullptr);
     ASSERT_TRUE(transfer_ok);
-    ASSERT_EQ(context_result, CUDA_SUCCESS);
-    ASSERT_EQ(device_result, CUDA_SUCCESS);
-    EXPECT_EQ(worker_device, 1);
+    ASSERT_EQ(after_result, CUDA_SUCCESS);
+    EXPECT_EQ(after_context, before_context)
+        << "loopback copy changed the caller's CUDA context";
 
     int device_zero_active_after = 0;
     ASSERT_EQ(cuDevicePrimaryCtxGetState(device_zero, &flags,
@@ -243,7 +251,77 @@ TEST_F(EFAGpuLoopbackTest, LoopbackUsesBufferDevice) {
             << "loopback copy activated CUDA device 0";
     }
 
-    destroyEngine(setup);
+    std::vector<uint8_t> readback(kDataLength);
+    ASSERT_EQ(cudaMemcpy(readback.data(), dev + destination, kDataLength,
+                         cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    std::vector<uint8_t> expected(kDataLength, 0xAB);
+    EXPECT_EQ(0, memcmp(readback.data(), expected.data(), kDataLength))
+        << "loopback copy did not complete before reporting success";
+}
+
+// A loopback copy to another GPU must preserve an existing caller device so
+// subsequent CUDA work remains on the device selected by the application.
+TEST_F(EFAGpuLoopbackTest, LoopbackPreservesCallerDevice) {
+    int device_count = 0;
+    ASSERT_EQ(cudaGetDeviceCount(&device_count), cudaSuccess);
+    if (device_count < 2) GTEST_SKIP() << "At least two CUDA GPUs required";
+
+    auto setup = createEngine(1);
+    if (!setup.ok) GTEST_SKIP() << "EFA/CUDA setup unavailable";
+    EngineCleanup cleanup(this, setup);
+
+    auto segment_desc =
+        setup.engine->getMetadata()->getSegmentDescByID(setup.segment_id);
+    ASSERT_NE(segment_desc, nullptr);
+    uint64_t remote_base = (uint64_t)segment_desc->buffers[0].addr;
+
+    const size_t kDataLength = 4096;
+    ASSERT_EQ(cudaMemset(setup.dev_buf, 0xAB, kDataLength), cudaSuccess);
+
+    bool transfer_ok = false;
+    int device_before = -1;
+    int device_after = -1;
+    int allocation_device = -1;
+    cudaError_t set_result = cudaErrorUnknown;
+    cudaError_t before_result = cudaErrorUnknown;
+    cudaError_t after_result = cudaErrorUnknown;
+    cudaError_t allocation_result = cudaErrorUnknown;
+    cudaError_t attributes_result = cudaErrorUnknown;
+    cudaError_t free_result = cudaErrorUnknown;
+    std::thread submitter([&] {
+        set_result = cudaSetDevice(0);
+        before_result = cudaGetDevice(&device_before);
+        transfer_ok =
+            submitAndWait(setup.engine.get(), setup.segment_id, setup.dev_buf,
+                          remote_base + (setup.buffer_size / 2), kDataLength,
+                          TransferRequest::WRITE);
+        after_result = cudaGetDevice(&device_after);
+
+        void *probe = nullptr;
+        allocation_result = cudaMalloc(&probe, 1 << 20);
+        if (allocation_result == cudaSuccess) {
+            cudaPointerAttributes attributes;
+            attributes_result = cudaPointerGetAttributes(&attributes, probe);
+            if (attributes_result == cudaSuccess) {
+                allocation_device = attributes.device;
+            }
+            free_result = cudaFree(probe);
+        }
+    });
+    submitter.join();
+
+    ASSERT_EQ(set_result, cudaSuccess);
+    ASSERT_EQ(before_result, cudaSuccess);
+    ASSERT_TRUE(transfer_ok);
+    ASSERT_EQ(after_result, cudaSuccess);
+    EXPECT_EQ(device_after, device_before)
+        << "loopback copy changed the caller's CUDA device";
+    ASSERT_EQ(allocation_result, cudaSuccess);
+    ASSERT_EQ(attributes_result, cudaSuccess);
+    EXPECT_EQ(allocation_device, device_before)
+        << "subsequent allocation landed on the wrong GPU";
+    EXPECT_EQ(free_result, cudaSuccess);
 }
 
 // Test 1: GPU loopback WRITE must not crash.
