@@ -104,7 +104,6 @@ jobs:
       python-versions: '["3.12"]'
       artifact-prefix: mooncake-wheel-ci-arm64-ep
       version-override: 0.0.0.dev0
-      with-ep: true
 
   ci-gate:
     if: always()
