@@ -78,6 +78,7 @@ class EFAGpuLoopbackTest : public ::testing::Test {
         void *dev_buf = nullptr;  // CUDA device buffer
         size_t buffer_size = 0;
         SegmentID segment_id = 0;
+        bool registered = false;
         bool ok = false;
     };
 
@@ -116,6 +117,7 @@ class EFAGpuLoopbackTest : public ::testing::Test {
         rc = s.engine->registerLocalMemory(s.dev_buf, buffer_size, location);
         EXPECT_EQ(rc, 0) << "registerLocalMemory(" << location << ") failed";
         if (rc != 0) return s;
+        s.registered = true;
 
         auto actual_addr = s.engine->getLocalIpAndPort();
         s.segment_id = s.engine->openSegment(actual_addr);
@@ -124,8 +126,9 @@ class EFAGpuLoopbackTest : public ::testing::Test {
     }
 
     void destroyEngine(EngineSetup &s) {
-        if (s.engine && s.dev_buf) {
+        if (s.engine && s.dev_buf && s.registered) {
             s.engine->unregisterLocalMemory(s.dev_buf);
+            s.registered = false;
         }
         if (s.dev_buf) {
             cudaFree(s.dev_buf);
@@ -199,15 +202,15 @@ TEST_F(EFAGpuLoopbackTest, LoopbackPreservesEmptyCallerContext) {
     CUdevice device_zero;
     ASSERT_EQ(cuDeviceGet(&device_zero, 0), CUDA_SUCCESS);
 
+    auto setup = createEngine(1);
+    EngineCleanup cleanup(this, setup);
+    if (!setup.ok) GTEST_SKIP() << "EFA/CUDA setup unavailable";
+
     unsigned int flags = 0;
     int device_zero_active_before = 0;
     ASSERT_EQ(cuDevicePrimaryCtxGetState(device_zero, &flags,
                                          &device_zero_active_before),
               CUDA_SUCCESS);
-
-    auto setup = createEngine(1);
-    if (!setup.ok) GTEST_SKIP() << "EFA/CUDA setup unavailable";
-    EngineCleanup cleanup(this, setup);
 
     auto segment_desc =
         setup.engine->getMetadata()->getSegmentDescByID(setup.segment_id);
@@ -257,7 +260,7 @@ TEST_F(EFAGpuLoopbackTest, LoopbackPreservesEmptyCallerContext) {
               cudaSuccess);
     std::vector<uint8_t> expected(kDataLength, 0xAB);
     EXPECT_EQ(0, memcmp(readback.data(), expected.data(), kDataLength))
-        << "loopback copy did not complete before reporting success";
+        << "loopback copy did not produce the expected bytes";
 }
 
 // A loopback copy to another GPU must preserve an existing caller device so
@@ -268,8 +271,8 @@ TEST_F(EFAGpuLoopbackTest, LoopbackPreservesCallerDevice) {
     if (device_count < 2) GTEST_SKIP() << "At least two CUDA GPUs required";
 
     auto setup = createEngine(1);
-    if (!setup.ok) GTEST_SKIP() << "EFA/CUDA setup unavailable";
     EngineCleanup cleanup(this, setup);
+    if (!setup.ok) GTEST_SKIP() << "EFA/CUDA setup unavailable";
 
     auto segment_desc =
         setup.engine->getMetadata()->getSegmentDescByID(setup.segment_id);
