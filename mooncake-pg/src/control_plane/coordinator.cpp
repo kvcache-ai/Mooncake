@@ -11,6 +11,21 @@
 #include "pg_utils.h"
 
 namespace mooncake {
+namespace {
+
+bool memberSupportsGpuCollectiveBackend(const GroupMember& member,
+                                        GpuCollectiveBackend backend) {
+    switch (backend) {
+        case GpuCollectiveBackend::Legacy:
+            return true;
+        case GpuCollectiveBackend::New:
+            return member.endpoint.has_value() &&
+                   member.endpoint->collective_v2.has_value();
+    }
+    return false;
+}
+
+}  // namespace
 
 CentralizedCoordinatorStateMachine::CentralizedCoordinatorStateMachine(
     int max_world_size, std::chrono::microseconds fault_reconciliation_window)
@@ -53,6 +68,13 @@ CentralizedCoordinatorStateMachine::handleRegisterAgent(
             result.response.require_new_session = true;
             return result;
         }
+        if (info.transfer_service_endpoint != req.transfer_service_endpoint) {
+            result.response.success = false;
+            result.response.reject_reason =
+                "transfer-service endpoint changed within one agent session";
+            result.response.require_new_session = true;
+            return result;
+        }
         info.last_heartbeat = std::chrono::steady_clock::now();
         populateRegisterAgentResponse(result.response, req.rank);
         return result;
@@ -78,6 +100,7 @@ CentralizedCoordinatorStateMachine::handleRegisterAgent(
     ++info.rank_epoch;
     info.agent_addr = req.agent_addr;
     info.te_server_name = req.te_server_name;
+    info.transfer_service_endpoint = req.transfer_service_endpoint;
     info.agent_session_id = req.agent_session_id;
     info.warmup_recv_addr = req.warmup_recv_addr;
     info.last_heartbeat = std::chrono::steady_clock::now();
@@ -119,9 +142,13 @@ CentralizedCoordinatorStateMachine::handleRegisterAgent(
     info.state = RankState::Synced;
     ++info.rank_state_version;
 
-    result.effects.push_back(BroadcastPeerJoined{
-        PeerJoinedPush{req.rank, info.rank_epoch, info.te_server_name,
-                       info.warmup_recv_addr}});
+    result.effects.push_back(BroadcastPeerJoined{PeerJoinedPush{
+        .rank = req.rank,
+        .rank_epoch = info.rank_epoch,
+        .te_server_name = info.te_server_name,
+        .warmup_recv_addr = info.warmup_recv_addr,
+        .transfer_service_endpoint = info.transfer_service_endpoint,
+    }});
     result.effects.push_back(makeRankStateEffect(req.rank));
 
     populateRegisterAgentResponse(result.response, req.rank);
@@ -168,6 +195,8 @@ void CentralizedCoordinatorStateMachine::populateRegisterAgentResponse(
         connection.agent_addr = ranks_[i].agent_addr;
         connection.te_server_name = ranks_[i].te_server_name;
         connection.warmup_recv_addr = ranks_[i].warmup_recv_addr;
+        connection.transfer_service_endpoint =
+            ranks_[i].transfer_service_endpoint;
         response.rank_connections.push_back(std::move(connection));
     }
 }
@@ -346,6 +375,14 @@ CentralizedCoordinatorStateMachine::handlePublishEndpoint(
 
         auto& view = it->second;
         auto& member = view.members[req.rank];
+        if (view.gpu_collective_backend == GpuCollectiveBackend::New &&
+            member.isActive() && !ep.endpoint_info.collective_v2.has_value()) {
+            result.response.success = false;
+            result.response.reject_reason =
+                "active member does not support the group's new GPU collective "
+                "backend";
+            return result;
+        }
         member.endpoint = ep.endpoint_info;
         member.endpoint->endpoint_epoch = ++endpoint_epochs_[req.rank];
 
@@ -658,6 +695,7 @@ void CentralizedCoordinatorStateMachine::handleTimedOutAgent(
     for (auto& [group_id, view] : group_views_) {
         auto& member = view.members[rank];
         bool view_changed = false;
+        bool membership_changed = false;
 
         // AwaitingActivation must be revoked in every group when the rank goes
         // Offline, independently of that group's auto_deactivate policy. Active
@@ -679,9 +717,13 @@ void CentralizedCoordinatorStateMachine::handleTimedOutAgent(
         if (view.auto_deactivate && member.isActive()) {
             member.status = GroupMemberState::Inactive;
             view_changed = true;
+            membership_changed = true;
         }
 
         if (view_changed) {
+            if (membership_changed) {
+                resolveGpuCollectiveBackend(view);
+            }
             view.epoch++;
             effects.push_back(PushViewUpdate{view});
         }
@@ -890,6 +932,7 @@ void CentralizedCoordinatorStateMachine::applyAutoDeactivate(
             }
         }
         if (!deactivated_ranks.empty()) {
+            resolveGpuCollectiveBackend(view);
             view.epoch++;
             effects.push_back(PushViewUpdate{view});
             LOG(INFO) << "[COORD] auto_deactivate view update group="
@@ -1017,6 +1060,8 @@ void CentralizedCoordinatorStateMachine::tryAdmitPendingProposals(
                 view.members[rank].status = GroupMemberState::Inactive;
             }
         }
+
+        resolveGpuCollectiveBackend(view);
 
         const auto propose_id = pending.propose_id;
         queue.pop_front();
@@ -1160,6 +1205,64 @@ bool CentralizedCoordinatorStateMachine::isRankActivatable(
            member.hasEndpoint();
 }
 
+void CentralizedCoordinatorStateMachine::resolveGpuCollectiveBackend(
+    GroupView& view) {
+    std::optional<GpuCollectiveBackend> consensus;
+    bool has_active_rank = false;
+    bool preferences_conflict = false;
+    size_t active_rank_count = 0;
+
+    for (const auto& member : view.members) {
+        if (!member.isActive()) continue;
+        ++active_rank_count;
+
+        const auto& preferred = member.preferred_gpu_collective_backend;
+        if (!has_active_rank) {
+            consensus = preferred;
+            has_active_rank = true;
+            continue;
+        }
+        preferences_conflict |= consensus != preferred;
+    }
+
+    if (!has_active_rank) return;
+
+    if (preferences_conflict) {
+        LOG(WARNING) << "[PG] Conflicting GPU collective backend preferences; "
+                        "falling back to legacy"
+                     << " group=" << view.group_id
+                     << " active_rank_count=" << active_rank_count;
+        consensus = GpuCollectiveBackend::Legacy;
+    }
+
+    // CPU groups consistently have no GPU backend preference.
+    if (!consensus.has_value()) return;
+
+    auto selected = *consensus;
+    const bool all_support_selected = std::all_of(
+        view.members.begin(), view.members.end(),
+        [&](const GroupMember& member) {
+            return !member.isActive() ||
+                   memberSupportsGpuCollectiveBackend(member, selected);
+        });
+    if (!all_support_selected) {
+        LOG(WARNING) << "[PG] Preferred GPU collective backend is not "
+                        "available on every active rank; falling back to legacy"
+                     << " group=" << view.group_id
+                     << " preferred=" << gpuCollectiveBackendName(selected)
+                     << " active_rank_count=" << active_rank_count;
+        selected = GpuCollectiveBackend::Legacy;
+    }
+
+    if (view.gpu_collective_backend != selected) {
+        view.gpu_collective_backend = selected;
+        LOG(INFO) << "[PG] Coordinator selected GPU collective backend"
+                  << " group=" << view.group_id
+                  << " backend=" << gpuCollectiveBackendName(selected)
+                  << " active_rank_count=" << active_rank_count;
+    }
+}
+
 void CentralizedCoordinatorStateMachine::checkGroupTransitions(
     std::vector<CoordinatorEffect>& effects) {
     for (auto& [group_id, view] : group_views_) {
@@ -1183,6 +1286,10 @@ void CentralizedCoordinatorStateMachine::checkGroupTransitions(
 
             if (has_any_active && all_ready) {
                 // All active ranks have endpoints and are Healthy.
+                // Resolve preferences before starting the bootstrap barrier.
+                // Every active rank installs this decision before Ready.
+                resolveGpuCollectiveBackend(view);
+
                 // Transition to BootstrapSyncing and initiate a barrier.
                 view.status = GroupStatus::BootstrapSyncing;
                 view.epoch++;
@@ -1208,6 +1315,15 @@ void CentralizedCoordinatorStateMachine::checkGroupTransitions(
 bool CentralizedCoordinatorStateMachine::validateGroupRegistration(
     const RegisterGroupRequest& request,
     RegisterGroupResponse& response) const {
+    const auto& preferred = request.preferred_gpu_collective_backend;
+    if (preferred.has_value() && *preferred != GpuCollectiveBackend::Legacy &&
+        *preferred != GpuCollectiveBackend::New) {
+        response.success = false;
+        response.reject_reason =
+            "preferred GPU collective backend is not recognized";
+        return false;
+    }
+
     if (request.max_group_size <= 0 ||
         request.max_group_size > max_world_size_) {
         response.success = false;
@@ -1390,6 +1506,8 @@ void CentralizedCoordinatorStateMachine::processGroupRegistration(
         for (GlobalRank r : request.rank_order) {
             view.members[r].status = GroupMemberState::Active;
         }
+        view.members[request.rank].preferred_gpu_collective_backend =
+            request.preferred_gpu_collective_backend;
         view.status = GroupStatus::Bootstrapping;
         group_views_[group_id] = std::move(view);
         group_views_[group_id].auto_deactivate = request.auto_deactivate;
@@ -1413,6 +1531,12 @@ void CentralizedCoordinatorStateMachine::processGroupRegistration(
     }
 
     auto& joining_member = view.members[request.rank];
+    if (joining_member.preferred_gpu_collective_backend !=
+        request.preferred_gpu_collective_backend) {
+        joining_member.preferred_gpu_collective_backend =
+            request.preferred_gpu_collective_backend;
+        view_changed = true;
+    }
     if (joining_member.status == GroupMemberState::None ||
         joining_member.status == GroupMemberState::Left) {
         joining_member.status = GroupMemberState::Inactive;

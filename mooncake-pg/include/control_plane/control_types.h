@@ -6,24 +6,15 @@
 #include <string>
 #include <vector>
 
-namespace mooncake {
+#include "common_types.h"
 
-// There are two rank namespaces that are easy to confuse:
-//
-//   * GlobalRank  - process-wide identifier, range 0 .. max_world_size-1.
-//                   Used for process-level states
-//   * InGroupRank - group-local identifier, range 0 .. group_size-1.
-//                   Used inside a single process group and mapped to a
-//                   GlobalRank through GroupView::rank_order.
-using GlobalRank = int32_t;
-using InGroupRank = int32_t;
+namespace mooncake {
 
 // Bootstrap ID: Backend type ("cpu:" or "device:") + PyTorch-assigned group_id.
 using GroupBootstrapId = std::string;
 // Coordinator-assigned unique group id
 using GroupId = std::string;
 
-constexpr GlobalRank kInvalidGlobalRank = -1;
 constexpr int kMaxNumRanks = 64;
 
 // Resolves a registration only against runtime groups stored under the same
@@ -55,6 +46,37 @@ enum class RankState : uint8_t {
     Healthy = 2,
 };
 
+// Route-specific bootstrap metadata published by one device transfer service.
+// `route_key` and `version` identify the in-process RouteProvider that can
+// interpret `metadata`. Unknown routes are intentionally preserved so peers
+// with different locally available hardware can still exchange endpoints.
+struct RouteEndpoint {
+    std::string route_key;
+    uint32_t version = 0;
+    std::vector<uint8_t> metadata;
+
+    bool operator==(const RouteEndpoint&) const = default;
+};
+
+// Process-level bootstrap metadata for the device transfer service.
+// A peer publishes one immutable value for each rank epoch.
+struct DeviceTransferEndpoint {
+    uint64_t region_address = 0;
+    uint64_t region_size = 0;
+
+    std::vector<RouteEndpoint> routes;
+
+    bool operator==(const DeviceTransferEndpoint&) const = default;
+};
+
+// Group-level device state inside the rank's transfer-service arena.
+struct DeviceCollectiveEndpoint {
+    uint64_t control_offset = 0;
+    uint64_t control_size = 0;
+
+    bool operator==(const DeviceCollectiveEndpoint&) const = default;
+};
+
 // Group-level, per-(group_id, rank) buffer/sync/P2P addresses.
 struct GroupEndpointInfo {
     // Coordinator-assigned endpoint version.
@@ -71,6 +93,10 @@ struct GroupEndpointInfo {
     // p2p
     uint64_t p2p_credit_region = 0;
     uint64_t p2p_ack_region = 0;
+
+    // Capability metadata for the new GPU collective backend. CPU communicators
+    // and GPU ranks without this capability leave it empty.
+    std::optional<DeviceCollectiveEndpoint> collective_v2;
 
     bool operator==(const GroupEndpointInfo&) const = default;
 };
@@ -104,6 +130,9 @@ enum class GroupMemberState : uint8_t {
 // Rank state inside a single GroupView.
 struct GroupMember {
     GroupMemberState status = GroupMemberState::None;
+    // GPU ranks advertise a concrete preference at registration. CPU ranks
+    // leave it empty because this decision does not govern CPU collectives.
+    std::optional<GpuCollectiveBackend> preferred_gpu_collective_backend;
     std::optional<GroupEndpointInfo> endpoint;
 
     bool isNone() const { return status == GroupMemberState::None; }
@@ -144,6 +173,9 @@ struct GroupView {
     GroupStatus status = GroupStatus::Bootstrapping;
     uint64_t epoch = 0;
     bool auto_deactivate = true;
+    // Coordinator-selected implementation for active GPU group members. It is
+    // empty for CPU groups and until a GPU group leaves Bootstrapping.
+    std::optional<GpuCollectiveBackend> gpu_collective_backend;
     int32_t max_group_size = 0;          // fixed in-group slot capacity
     std::vector<GlobalRank> rank_order;  // InGroupRank -> GlobalRank
     std::vector<GroupMember> members;    // indexed by GlobalRank
