@@ -5941,10 +5941,20 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
             LOG(WARNING)
                 << "key=" << key << ", replica_id=" << target_id
                 << ", move target becomes invalid during data transfer";
+            // Release the refcnt taken in MoveStart. The success path below
+            // does this once the move completes; this error path must do it
+            // too, or the source replica stays pinned.
+            source->dec_refcnt();
+            // Discard target replica and clear the replication task.
+            EraseReplicasWithCacheTotalAccounting(
+                metadata, [&task](const Replica& replica) {
+                    return std::find(task.replica_ids.begin(),
+                                     task.replica_ids.end(),
+                                     replica.id()) != task.replica_ids.end();
+                });
             ReleaseTenantQuota(
                 GetBoundTenantQuotaHandle(accessor.GetTenantState()),
                 task.pending_quota_charge_bytes);
-            // Source untouched; safe to drop the broken task.
             accessor.EraseReplicationTask();
             return tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
         }
