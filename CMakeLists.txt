@@ -159,6 +159,20 @@ if (WITH_EP)
     string(REPLACE ";" "|" _ep_torch_versions_pipe "${EP_TORCH_VERSIONS}")
     string(REPLACE ";" "|" _torch_cuda_arch_list_pipe "${TORCH_CUDA_ARCH_LIST}")
 
+    # Stage the native EP extension (_ep) into EP_PG_STAGING_DIR so build_wheel.sh
+    # injects it into the wheel the same way PG extensions are staged below.
+    # Without this, _ep.so stays under build/mooncake-ep/src/ and never reaches the
+    # wheel, so the installed package is missing mooncake._ep (post-#2883 native EP).
+    add_custom_target(mooncake_ep_stage ALL
+      COMMAND ${CMAKE_COMMAND} -E make_directory "${EP_PG_STAGING_DIR}"
+      COMMAND ${CMAKE_COMMAND} -E copy_if_different
+              "$<TARGET_FILE:_ep>"
+              "${EP_PG_STAGING_DIR}/"
+      COMMENT "Staging Mooncake EP native extension (_ep)"
+      DEPENDS _ep
+      VERBATIM
+    )
+
     add_custom_target(mooncake_pg_ext ALL
       COMMAND ${CMAKE_COMMAND} -E make_directory "${EP_PG_STAGING_DIR}"
       COMMAND ${CMAKE_COMMAND}
