@@ -143,12 +143,38 @@ jobs:
       shell: bash
 
     - name: Test (in build env)
+      id: ctest
       run: |
         cd build
+        mkdir -p test-results
         export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
         ldconfig -v || echo "always continue"
-        MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 ctest -j --output-on-failure
+        MC_METADATA_SERVER=http://127.0.0.1:8080/metadata \
+          DEFAULT_KV_LEASE_TTL=500 \
+          ctest -j --output-on-failure \
+            --output-junit "$GITHUB_WORKSPACE/build/test-results/ctest.xml"
       shell: bash
+
+    - name: Summarize CTest failure
+      if: ${{ always() && steps.ctest.outcome == 'failure' }}
+      run: |
+        scripts/ci/summarize_ctest_failure.sh \
+          "CTest failure (Python ${{ matrix.python-version }})" \
+          build/Testing/Temporary/LastTestsFailed.log \
+          build/Testing/Temporary/LastTest.log
+      shell: bash
+
+    - name: Upload CTest diagnostics
+      if: ${{ always() && steps.ctest.outcome == 'failure' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: ctest-diagnostics-py${{ matrix.python-version }}
+        if-no-files-found: warn
+        retention-days: 14
+        path: |
+          build/test-results/ctest.xml
+          build/Testing/Temporary/LastTest.log
+          build/Testing/Temporary/LastTestsFailed.log
 
     - name: Drain HTTP E2E test
       if: matrix.python-version == '3.12'
@@ -848,11 +874,36 @@ jobs:
     # unit tests rely on, causing false failures. cuda-on still validates
     # that every #ifdef USE_CUDA branch compiles.
     - name: Test (TENT)
+      id: ctest
       if: '!matrix.need_cuda'
       run: |
         cd build-tent
-        ctest --test-dir mooncake-transfer-engine/tent/tests -j --output-on-failure
+        mkdir -p test-results
+        ctest --test-dir mooncake-transfer-engine/tent/tests -j \
+          --output-on-failure \
+          --output-junit "$GITHUB_WORKSPACE/build-tent/test-results/ctest.xml"
       shell: bash
+
+    - name: Summarize TENT CTest failure
+      if: ${{ always() && steps.ctest.outcome == 'failure' }}
+      run: |
+        scripts/ci/summarize_ctest_failure.sh \
+          "TENT CTest failure (${{ matrix.name }})" \
+          build-tent/mooncake-transfer-engine/tent/tests/Testing/Temporary/LastTestsFailed.log \
+          build-tent/mooncake-transfer-engine/tent/tests/Testing/Temporary/LastTest.log
+      shell: bash
+
+    - name: Upload TENT CTest diagnostics
+      if: ${{ always() && steps.ctest.outcome == 'failure' }}
+      uses: actions/upload-artifact@v4
+      with:
+        name: ctest-diagnostics-tent-${{ matrix.name }}
+        if-no-files-found: warn
+        retention-days: 14
+        path: |
+          build-tent/test-results/ctest.xml
+          build-tent/mooncake-transfer-engine/tent/tests/Testing/Temporary/LastTest.log
+          build-tent/mooncake-transfer-engine/tent/tests/Testing/Temporary/LastTestsFailed.log
 
     - name: Run sccache stat for check
       if: ${{ env.SCCACHE_PATH != '' }}
