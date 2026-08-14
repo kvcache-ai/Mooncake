@@ -14,7 +14,7 @@
 #include <type_traits>
 #include <utility>
 #include <vector>
-#include "comm_types.h"
+#include "common_types.h"
 #include "error_types.h"
 
 using namespace mooncake;
@@ -146,6 +146,21 @@ PGResult<MooncakeCommunicatorConfig> parseCommConfig(
     internal.device_index = config->deviceIndex == MOONCAKE_PG_CONFIG_UNDEF_INT
                                 ? -1
                                 : config->deviceIndex;
+    if (!internal.is_cpu) {
+        switch (config->preferredGpuCollectiveBackend) {
+            case mooncakePgGpuCollectiveBackendLegacy:
+                internal.preferred_gpu_collective_backend =
+                    GpuCollectiveBackend::Legacy;
+                break;
+            case mooncakePgGpuCollectiveBackendNew:
+                internal.preferred_gpu_collective_backend =
+                    GpuCollectiveBackend::New;
+                break;
+            default:
+                return makePGError(PGErrorCode::InvalidArgument,
+                                   "invalid preferred GPU collective backend");
+        }
+    }
     switch (config->idResolvePolicy) {
         case mooncakePgIdResolveCreateOrAttach:
             internal.group_resolve_policy =
@@ -461,10 +476,12 @@ mooncakePgResult_t mooncakePgCommCreate(mooncakePgContext_t context,
 
 mooncakePgResult_t mooncakePgCommDestroy(mooncakePgComm_t comm) {
     return asCApiResult([&]() -> PGResult<void> {
-        std::unique_ptr<mooncakePgComm> holder(comm);
-        if (holder && holder->impl) {
-            return holder->impl->shutdown();
+        // Keep ownership with the caller until shutdown succeeds so the same
+        // handle remains valid for retry after an error or exception.
+        if (comm && comm->impl) {
+            PG_TRY(comm->impl->shutdown());
         }
+        delete comm;
         return {};
     });
 }

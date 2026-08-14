@@ -20,8 +20,8 @@ AgentStateMachine::AgentStateMachine(GlobalRank rank, int max_world_size)
     observed_target_rank_epochs_.assign(max_world_size_, 0);
 }
 
-void AgentStateMachine::appendApplyViewEffect(const GroupView& view,
-                                              AgentApplyResult& effects) const {
+void AgentStateMachine::appendApplyGroupStateEffect(
+    const GroupView& view, AgentApplyResult& effects) const {
     std::vector<bool> activatable(view.rank_order.size());
     for (size_t i = 0; i < view.rank_order.size(); ++i) {
         GlobalRank gr = view.rank_order[i];
@@ -31,15 +31,15 @@ void AgentStateMachine::appendApplyViewEffect(const GroupView& view,
                          (member.isActive() || member.isAwaitingActivation()) &&
                          member.hasEndpoint();
     }
-    effects.push_back(ApplyViewToCommunicator{view, global_rank_states_,
-                                              global_rank_epochs_,
-                                              std::move(activatable)});
+    effects.push_back(ApplyGroupStateToCommunicator{view, global_rank_states_,
+                                                    global_rank_epochs_,
+                                                    std::move(activatable)});
 }
 
 AgentApplyResult AgentStateMachine::registerGroup(const GroupView& group) {
     AgentApplyResult effects;
     groups_.insert_or_assign(group.group_id, group);
-    appendApplyViewEffect(group, effects);
+    appendApplyGroupStateEffect(group, effects);
     return effects;
 }
 
@@ -55,13 +55,28 @@ GroupView AgentStateMachine::getGroupView(GroupId group_id) const {
     return GroupView{};
 }
 
-void AgentStateMachine::appendApplyViewEffectsForRank(
+void AgentStateMachine::appendApplyRankStateEffects(
     GlobalRank rank, AgentApplyResult& effects) const {
     for (const auto& [group_id, view] : groups_) {
-        if (std::find(view.rank_order.begin(), view.rank_order.end(), rank) !=
-            view.rank_order.end()) {
-            appendApplyViewEffect(view, effects);
-        }
+        const auto it =
+            std::find(view.rank_order.begin(), view.rank_order.end(), rank);
+        if (it == view.rank_order.end()) continue;
+
+        const auto in_group_rank = static_cast<InGroupRank>(
+            std::distance(view.rank_order.begin(), it));
+        const auto& member = view.members[rank];
+        const bool healthy = global_rank_states_[rank] == RankState::Healthy;
+        const bool activatable =
+            healthy && (member.isActive() || member.isAwaitingActivation()) &&
+            member.hasEndpoint();
+        effects.push_back(ApplyRankStateToCommunicator{
+            .group_id = group_id,
+            .rank = rank,
+            .in_group_rank = in_group_rank,
+            .state = global_rank_states_[rank],
+            .rank_epoch = global_rank_epochs_[rank],
+            .activatable = activatable,
+        });
     }
 }
 
@@ -96,7 +111,7 @@ AgentApplyResult AgentStateMachine::handlePeerJoined(
         push.rank_epoch > global_rank_epochs_[push.rank];
     if (new_rank_epoch) {
         resetRankForNewEpoch(push.rank, push.rank_epoch, effects);
-        appendApplyViewEffectsForRank(push.rank, effects);
+        appendApplyRankStateEffects(push.rank, effects);
     } else if (global_rank_states_[push.rank] == RankState::Offline) {
         // Offline is terminal within a rank epoch. A delayed PeerJoined for
         // that epoch must not restart the old connection.
@@ -111,7 +126,12 @@ AgentApplyResult AgentStateMachine::handlePeerJoined(
         .agent_addr = "",
         .te_server_name = push.te_server_name,
         .warmup_recv_addr = push.warmup_recv_addr,
+        .transfer_service_endpoint = push.transfer_service_endpoint,
     };
+    effects.push_back(InstallDeviceTransferEndpoint{
+        .rank = push.rank,
+        .endpoint = push.transfer_service_endpoint,
+    });
     effects.push_back(EnablePeerProbe{push.rank, push.rank_epoch,
                                       push.te_server_name,
                                       push.warmup_recv_addr});
@@ -140,7 +160,7 @@ AgentApplyResult AgentStateMachine::handleRankStateUpdate(
 
     global_rank_states_[push.rank] = push.new_state;
     global_rank_state_versions_[push.rank] = push.rank_state_version;
-    appendApplyViewEffectsForRank(push.rank, effects);
+    appendApplyRankStateEffects(push.rank, effects);
 
     // Remote Offline: tear down TE link AND stop candidate probe.
     if (push.rank != rank_ && push.new_state == RankState::Offline) {
@@ -210,7 +230,7 @@ PGResult<AgentApplyResult> AgentStateMachine::applyGroupView(
     // Applying the view must happen-before waking group/rank waiters: callers
     // may submit a collective as soon as waitUntilGroupReady()/joinGroup()
     // returns, and that collective must observe the new data-plane metadata.
-    appendApplyViewEffect(view, effects);
+    appendApplyGroupStateEffect(view, effects);
 
     // Detect rank activation transitions.
     if (!old_view.members.empty()) {
@@ -236,7 +256,7 @@ PGResult<AgentApplyResult> AgentStateMachine::applyGroupView(
 
     it->second = view;
 
-    // Must come AFTER ApplyViewToCommunicator: refreshSegmentID requires
+    // Must come AFTER ApplyGroupStateToCommunicator: refreshSegmentID requires
     // latest meta_->rank_order.
     for (auto gr : need_segment_refresh) {
         effects.push_back(NotifyLinkRefreshed{gr});
@@ -290,25 +310,36 @@ AgentApplyResult AgentStateMachine::applyRegisterAgentResponse(
         global_rank_state_versions_[rank] = response_version;
     }
 
-    for (const auto& gv : resp.groups) {
-        groups_[gv.group_id] = gv;
-        appendApplyViewEffect(gv, effects);
-    }
-
     // The connection list belongs to the same snapshot. Do not install an
     // entry invalidated by above.
     for (const auto& connection : resp.rank_connections) {
+        if (!rankInRange(connection.rank)) {
+            LOG(ERROR) << "AgentStateMachine: malformed rank connection";
+            coordinator_connection_ = CoordinatorConnection::Disconnected;
+            return {};
+        }
         if (connection.rank_epoch != global_rank_epochs_[connection.rank] ||
             global_rank_states_[connection.rank] == RankState::Offline)
             continue;
 
         rank_connections_[connection.rank] = connection;
+        // Install rank-scoped transfer endpoints before applying any restored
+        // group state that may reference them.
+        effects.push_back(InstallDeviceTransferEndpoint{
+            .rank = connection.rank,
+            .endpoint = connection.transfer_service_endpoint,
+        });
         effects.push_back(EnablePeerProbe{
             .rank = connection.rank,
             .rank_epoch = connection.rank_epoch,
             .te_server_name = connection.te_server_name,
             .warmup_recv_addr = connection.warmup_recv_addr,
         });
+    }
+
+    for (const auto& view : resp.groups) {
+        groups_[view.group_id] = view;
+        appendApplyGroupStateEffect(view, effects);
     }
 
     coordinator_connection_ = CoordinatorConnection::Connected;

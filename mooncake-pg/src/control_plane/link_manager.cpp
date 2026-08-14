@@ -44,7 +44,7 @@ bool LinkManager::supportFabricMem() {
 
 PGResult<void> LinkManager::init(GlobalRank rank, int max_world_size,
                                  TransferEngine* engine) {
-    PG_VALIDATE_STATE(!shutdown_.load(std::memory_order_acquire),
+    PG_VALIDATE_STATE(!shutdown_requested_.load(std::memory_order_acquire),
                       "LinkManager cannot be initialized after shutdown");
     if (initialized_.load(std::memory_order_acquire)) return {};
     PG_VALIDATE_ARG(max_world_size > 0 && max_world_size <= kMaxNumRanks,
@@ -86,7 +86,7 @@ void LinkManager::start(uint64_t self_rank_epoch) {
         LOG(ERROR) << "LinkManager: start() called before init()";
         return;
     }
-    if (shutdown_.load(std::memory_order_acquire)) return;
+    if (shutdown_requested_.load(std::memory_order_acquire)) return;
     if (started_.exchange(true, std::memory_order_acq_rel)) return;
 
     TransferMetadata::SegmentID self_target_id{};
@@ -141,7 +141,7 @@ void LinkManager::stop() {
 }
 
 void LinkManager::shutdown() {
-    if (shutdown_.exchange(true, std::memory_order_acq_rel)) return;
+    if (shutdown_requested_.exchange(true, std::memory_order_acq_rel)) return;
 
     stop();
 

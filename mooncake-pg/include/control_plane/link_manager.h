@@ -141,7 +141,7 @@ class LinkManager {
 
     std::atomic<bool> initialized_{false};
     std::atomic<bool> started_{false};
-    std::atomic<bool> shutdown_{false};
+    std::atomic<bool> shutdown_requested_{false};
 
     void pollerLoop();
     bool advanceConnection(GlobalRank peer);

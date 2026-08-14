@@ -141,6 +141,7 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
         std::vector<uint8_t> link_status;
         uint64_t last_link_event_report_id = 0;
         uint64_t warmup_recv_addr = 0;
+        DeviceTransferEndpoint transfer_service_endpoint;
     };
 
     // Per-GlobalRank coordinator state.
@@ -257,6 +258,10 @@ class CentralizedCoordinatorStateMachine : public CoordinatorStateMachine {
     //
     // Called after every state-changing operation.
     void checkGroupTransitions(std::vector<CoordinatorEffect>& effects);
+
+    // Resolve actives members' preferences into the backend published in the
+    // next GroupView. Called before bootstrap and membership ViewUpdates.
+    void resolveGpuCollectiveBackend(GroupView& view);
 
     void processGroupRegistration(const RegisterGroupRequest& request,
                                   const GroupId& group_id,
