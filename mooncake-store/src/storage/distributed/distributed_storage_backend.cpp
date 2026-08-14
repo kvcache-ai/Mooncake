@@ -159,10 +159,25 @@ DistributedStorageBackend::DistributedStorageBackend(
     const FileStorageConfig& file_storage_config,
     const DistributedStorageConfig& distributed_config,
     std::unique_ptr<FileSystemAdapter> fs_adapter)
+    : DistributedStorageBackend(file_storage_config, distributed_config,
+                                std::move(fs_adapter), nullptr) {}
+
+DistributedStorageBackend::DistributedStorageBackend(
+    const FileStorageConfig& file_storage_config,
+    const DistributedStorageConfig& distributed_config,
+    std::unique_ptr<FileSystemAdapter> fs_adapter,
+    std::unique_ptr<ObjectStorageAdapter> object_storage_adapter)
     : StorageBackendInterface(file_storage_config),
       fs_adapter_(std::move(fs_adapter)),
+      object_storage_adapter_(std::move(object_storage_adapter)),
       distributed_config_(distributed_config),
-      root_dir_(distributed_config.fsdir) {}
+      root_dir_(distributed_config.fsdir) {
+    CHECK((fs_adapter_ != nullptr) != (object_storage_adapter_ != nullptr))
+        << "DistributedStorageBackend: exactly one I/O adapter is required";
+    if (object_storage_adapter_) {
+        storage_mode_ = DistributedStorageMode::kObjectStorage;
+    }
+}
 
 DistributedStorageBackend::~DistributedStorageBackend() {
     for (auto& shard : shard_files_) {
@@ -179,6 +194,16 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::Init() {
         LOG(WARNING) << "DistributedStorageBackend is already initialized";
         return {};
     }
+
+    if (UsesObjectStorage()) {
+        auto init_result = object_storage_adapter_->Init();
+        if (!init_result) return init_result;
+        initialized_ = true;
+        LOG(INFO) << "DistributedStorageBackend initialized, object adapter="
+                  << object_storage_adapter_->GetName();
+        return {};
+    }
+
     std::error_code ec;
     std::filesystem::create_directories(root_dir_, ec);
     if (ec) {
@@ -213,12 +238,72 @@ tl::expected<void, ErrorCode> DistributedStorageBackend::Init() {
 }
 
 tl::expected<int64_t, ErrorCode> DistributedStorageBackend::BatchOffload(
-    const std::unordered_map<std::string, std::vector<Slice>>& /*batch_object*/,
+    const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
     std::function<ErrorCode(const std::vector<std::string>& keys,
                             std::vector<StorageObjectMetadata>& metadatas)>
-    /*complete_handler*/,
-    EvictionHandler /*eviction_handler*/) {
-    return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+        complete_handler,
+    EvictionHandler eviction_handler) {
+    if (!UsesObjectStorage()) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+    if (!initialized_) {
+        LOG(ERROR) << "DistributedStorageBackend is not initialized";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    if (eviction_handler) {
+        LOG_FIRST_N(WARNING, 1)
+            << "DistributedStorageBackend does not support eviction, "
+               "eviction_handler ignored";
+    }
+
+    std::vector<std::string> success_keys;
+    std::vector<StorageObjectMetadata> success_metas;
+    for (const auto& [key, slices] : batch_object) {
+        if (slices.size() >
+            static_cast<size_t>(std::numeric_limits<int>::max())) {
+            LOG(WARNING) << "Failed to offload key " << key
+                         << ": slice count exceeds INT_MAX";
+            continue;
+        }
+        const int iovcnt = static_cast<int>(slices.size());
+
+        std::vector<iovec> iovs;
+        iovs.reserve(slices.size());
+        size_t total_size = 0;
+        bool total_size_overflow = false;
+        for (const auto& slice : slices) {
+            if (slice.size > std::numeric_limits<size_t>::max() - total_size) {
+                total_size_overflow = true;
+                break;
+            }
+            iovs.push_back({slice.ptr, slice.size});
+            total_size += slice.size;
+        }
+        if (total_size_overflow) {
+            LOG(WARNING) << "Failed to offload key " << key
+                         << ": total slice size overflows size_t";
+            continue;
+        }
+
+        auto result = object_storage_adapter_->PutV(key, iovs.data(), iovcnt);
+        if (!result) {
+            LOG(WARNING) << "Failed to offload key " << key << ": "
+                         << static_cast<int>(result.error());
+            continue;
+        }
+
+        success_keys.push_back(key);
+        success_metas.emplace_back(-1, 0, static_cast<int64_t>(key.size()),
+                                   static_cast<int64_t>(total_size), "");
+    }
+
+    if (complete_handler && !success_keys.empty()) {
+        auto err = complete_handler(success_keys, success_metas);
+        if (err != ErrorCode::OK) {
+            return tl::make_unexpected(err);
+        }
+    }
+    return static_cast<int64_t>(success_keys.size());
 }
 
 std::vector<tl::expected<void, ErrorCode>>
@@ -227,6 +312,11 @@ DistributedStorageBackend::BatchWrite(
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(requests.size());
 
+    if (UsesObjectStorage()) {
+        results.assign(requests.size(),
+                       tl::make_unexpected(ErrorCode::NOT_SUPPORTED));
+        return results;
+    }
     if (!initialized_) {
         LOG(ERROR) << "DistributedStorageBackend is not initialized";
         results.assign(requests.size(),
@@ -317,6 +407,11 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
     std::vector<tl::expected<void, ErrorCode>> results;
     results.reserve(requests.size());
 
+    if (UsesObjectStorage()) {
+        results.assign(requests.size(),
+                       tl::make_unexpected(ErrorCode::NOT_SUPPORTED));
+        return results;
+    }
     if (!initialized_) {
         LOG(ERROR) << "DistributedStorageBackend is not initialized";
         results.assign(requests.size(),
@@ -411,24 +506,84 @@ std::vector<tl::expected<void, ErrorCode>> DistributedStorageBackend::BatchRead(
 }
 
 tl::expected<void, ErrorCode> DistributedStorageBackend::BatchLoad(
-    std::unordered_map<std::string, Slice>& /*batched_slices*/) {
-    return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    std::unordered_map<std::string, Slice>& batched_slices) {
+    if (!UsesObjectStorage()) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+    if (!initialized_) {
+        LOG(ERROR) << "DistributedStorageBackend is not initialized";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    for (auto& [key, slice] : batched_slices) {
+        auto result = object_storage_adapter_->Get(key, slice.ptr, slice.size);
+        if (!result) {
+            return tl::make_unexpected(result.error());
+        }
+        if (*result != slice.size) {
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+    }
+    return {};
 }
 
 tl::expected<bool, ErrorCode> DistributedStorageBackend::IsExist(
-    const std::string& /*key*/) {
-    return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    const std::string& key) {
+    if (!UsesObjectStorage()) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+    if (!initialized_) {
+        LOG(ERROR) << "DistributedStorageBackend is not initialized";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    return object_storage_adapter_->Exists(key);
 }
 
 tl::expected<bool, ErrorCode> DistributedStorageBackend::IsEnableOffloading() {
-    return false;
+    return UsesObjectStorage();
 }
 
 tl::expected<void, ErrorCode> DistributedStorageBackend::ScanMeta(
-    const std::function<ErrorCode(
-        const std::vector<std::string>& keys,
-        std::vector<StorageObjectMetadata>& metadatas)>& /*handler*/) {
-    return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    const std::function<
+        ErrorCode(const std::vector<std::string>& keys,
+                  std::vector<StorageObjectMetadata>& metadatas)>& handler) {
+    if (!UsesObjectStorage()) {
+        return tl::make_unexpected(ErrorCode::NOT_SUPPORTED);
+    }
+    if (!initialized_) {
+        LOG(ERROR) << "DistributedStorageBackend is not initialized";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    std::vector<std::string> batch_keys;
+    std::vector<StorageObjectMetadata> batch_metas;
+    const size_t batch_limit = static_cast<size_t>(std::max<int64_t>(
+        1, file_storage_config_.scanmeta_iterator_keys_limit));
+
+    auto key_infos = object_storage_adapter_->ListKeys();
+    if (!key_infos) {
+        LOG(ERROR) << "Failed to list keys from object storage adapter: "
+                   << static_cast<int>(key_infos.error());
+        return tl::make_unexpected(key_infos.error());
+    }
+
+    for (const auto& info : *key_infos) {
+        batch_keys.push_back(info.logical_key);
+        batch_metas.emplace_back(-1, 0,
+                                 static_cast<int64_t>(info.logical_key.size()),
+                                 static_cast<int64_t>(info.size), "");
+        if (batch_keys.size() >= batch_limit) {
+            auto err = handler(batch_keys, batch_metas);
+            if (err != ErrorCode::OK) return tl::make_unexpected(err);
+            batch_keys.clear();
+            batch_metas.clear();
+        }
+    }
+    if (!batch_keys.empty()) {
+        auto err = handler(batch_keys, batch_metas);
+        if (err != ErrorCode::OK) return tl::make_unexpected(err);
+    }
+    return {};
 }
 
 }  // namespace mooncake

@@ -9,9 +9,17 @@
 
 #include "fs_adapter.h"
 #include "replica.h"
+#include "storage/distributed/object_storage_adapter.h"
 #include "storage_backend.h"
 
 namespace mooncake {
+
+// Filesystem mode is the descriptor-based shard/offset DFS data path. Object
+// storage remains a separate, logical-key-oriented I/O mode.
+enum class DistributedStorageMode {
+    kFileSystem,
+    kObjectStorage,
+};
 
 struct DistributedStorageConfig {
     std::string fsdir = "/mnt/3fs/mooncake";
@@ -46,10 +54,11 @@ struct DfsReadRequest {
 };
 
 /**
- * @brief Distributed filesystem storage backend.
+ * @brief Distributed filesystem and object storage backend.
  *
- * Implements StorageBackendInterface, delegating I/O to a FileSystemAdapter.
- * Does not handle eviction (DFS manages its own space).
+ * Uses a FileSystemAdapter for descriptor-based DFS reads and writes, or an
+ * ObjectStorageAdapter for whole-object offload operations. Does not handle
+ * eviction.
  */
 class DistributedStorageBackend : public StorageBackendInterface {
    public:
@@ -58,6 +67,19 @@ class DistributedStorageBackend : public StorageBackendInterface {
         const DistributedStorageConfig& distributed_config,
         std::unique_ptr<FileSystemAdapter> fs_adapter);
     ~DistributedStorageBackend() override;
+
+    // Exactly one adapter must be non-null.
+    DistributedStorageBackend(
+        const FileStorageConfig& file_storage_config,
+        const DistributedStorageConfig& distributed_config,
+        std::unique_ptr<FileSystemAdapter> fs_adapter,
+        std::unique_ptr<ObjectStorageAdapter> object_storage_adapter);
+
+    DistributedStorageMode GetStorageMode() const { return storage_mode_; }
+
+    bool UsesObjectStorage() const {
+        return storage_mode_ == DistributedStorageMode::kObjectStorage;
+    }
 
     tl::expected<void, ErrorCode> Init() override;
 
@@ -96,9 +118,11 @@ class DistributedStorageBackend : public StorageBackendInterface {
     };
 
     std::unique_ptr<FileSystemAdapter> fs_adapter_;
+    std::unique_ptr<ObjectStorageAdapter> object_storage_adapter_;
     DistributedStorageConfig distributed_config_;
     std::string root_dir_;
     std::vector<std::unique_ptr<ShardFile>> shard_files_;
+    DistributedStorageMode storage_mode_ = DistributedStorageMode::kFileSystem;
     bool initialized_ = false;
 };
 
