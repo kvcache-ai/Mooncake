@@ -269,6 +269,11 @@ class TransferEngine {
 
     std::shared_ptr<Topology> getLocalTopology();
 
+    // String dump of the live local topology. Under TENT this is the native
+    // {"nics","mems"} JSON (with rank0/1/2). Under classic TE it is the
+    // priority-matrix JSON.
+    std::string getLocalTopologyString();
+
     void enableGracefulShutdown();
     std::string showLinks(bool json = false) const;
 

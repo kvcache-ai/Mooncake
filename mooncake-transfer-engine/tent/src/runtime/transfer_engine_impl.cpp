@@ -329,7 +329,7 @@ Status TransferEngineImpl::construct() {
 
     topology_ = std::make_shared<Topology>();
     auto loader = &Platform::getLoader(conf_);
-    CHECK_STATUS(topology_->discover({loader}));
+    CHECK_STATUS(topology_->loadFromConfig(*conf_, {loader}));
 
     metadata_ =
         std::make_shared<ControlService>(metadata_type, metadata_servers, this);
@@ -522,6 +522,10 @@ const std::string TransferEngineImpl::getRpcServerAddress() const {
 }
 
 uint16_t TransferEngineImpl::getRpcServerPort() const { return port_; }
+
+std::shared_ptr<Topology> TransferEngineImpl::getLocalTopology() const {
+    return topology_;
+}
 
 Status TransferEngineImpl::exportLocalSegment(std::string& shared_handle) {
     return Status::NotImplemented(

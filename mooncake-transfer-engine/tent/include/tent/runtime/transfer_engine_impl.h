@@ -97,6 +97,9 @@ class TransferEngineImpl {
 
     uint16_t getRpcServerPort() const;
 
+    // Local topology discovered (or loaded from custom matrix) at construct.
+    std::shared_ptr<Topology> getLocalTopology() const;
+
    public:
     Status exportLocalSegment(std::string& shared_handle);
 
