@@ -82,16 +82,18 @@ jobs:
               build_nvlink=false
               cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=OFF -DWITH_EP=OFF -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release'
               ;;
-            cuda:arm64|cuda13:arm64)
+            cuda:arm64)
               variant_flag=''
-              if [ "$BUILD_VARIANT" = cuda13 ]; then
-                variant_flag=CU13_BUILD
-              fi
               generator=Ninja
               arch_list='9.0'
-              if [ "$BUILD_VARIANT" = cuda13 ]; then
-                arch_list='9.0;10.3'
-              fi
+              ep_versions='2.11.0;2.12.0;2.12.1;2.13.0'
+              build_nvlink=false
+              cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=ON -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release'
+              ;;
+            cuda13:arm64)
+              variant_flag=CU13_BUILD
+              generator=Ninja
+              arch_list='9.0;10.3'
               ep_versions='2.11.0;2.12.0;2.12.1;2.13.0'
               build_nvlink=false
               cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=ON -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release'
