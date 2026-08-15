@@ -156,27 +156,11 @@ if (WITH_EP)
     # Device EP/PG .so files are placed here during make and later injected
     # into the wheel AFTER auditwheel, so patchelf never touches CUDA fatbins.
     set(EP_PG_STAGING_DIR "${CMAKE_BINARY_DIR}/ep_pg_staging")
-    # The native EP host binding is repaired by auditwheel before packaging;
-    # only its CUDA device library remains in EP_PG_STAGING_DIR.
-    set(EP_HOST_STAGING_DIR "${CMAKE_BINARY_DIR}/ep_host_staging")
 
     # Convert semicolon-separated lists to pipe-separated strings so they survive
     # CMake's COMMAND list-splitting (semicolons are CMake list separators).
     string(REPLACE ";" "|" _ep_torch_versions_pipe "${EP_TORCH_VERSIONS}")
     string(REPLACE ";" "|" _torch_cuda_arch_list_pipe "${TORCH_CUDA_ARCH_LIST}")
-
-    # Stage the native EP host extension before auditwheel.  The host binding has
-    # no CUDA fatbin and must be visible to auditwheel so its dependencies are
-    # vendored into the wheel.
-    add_custom_target(mooncake_ep_stage ALL
-      COMMAND ${CMAKE_COMMAND} -E make_directory "${EP_HOST_STAGING_DIR}"
-      COMMAND ${CMAKE_COMMAND} -E copy_if_different
-              "$<TARGET_FILE:_ep>"
-              "${EP_HOST_STAGING_DIR}/"
-      COMMENT "Staging Mooncake EP host extension (_ep)"
-      DEPENDS _ep
-      VERBATIM
-    )
 
     if(USE_CUDA)
       add_custom_target(mooncake_ep_device_stage ALL

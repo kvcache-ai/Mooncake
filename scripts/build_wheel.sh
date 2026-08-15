@@ -11,8 +11,8 @@ PYTHON_VERSION=${PYTHON_VERSION:-${1:-$(python -c "import sys; print(f'{sys.vers
 # Get output directory from environment variable or argument
 OUTPUT_DIR=${OUTPUT_DIR:-${2:-"dist"}}
 # CMake build directory (default: build).  EP/PG device extensions are staged
-# under ${BUILD_DIR}/ep_pg_staging; the host EP binding is staged separately so
-# auditwheel can repair its dependencies before the device library is injected.
+# under ${BUILD_DIR}/ep_pg_staging. Host extensions are copied directly from
+# their normal CMake output paths before auditwheel, like the PG core library.
 BUILD_DIR="${BUILD_DIR:-build}"
 BUILD_DIR_ABS="$(pwd)/${BUILD_DIR}"
 echo "Building wheel for Python ${PYTHON_VERSION} with output directory ${OUTPUT_DIR}"
@@ -37,6 +37,15 @@ cp ${BUILD_DIR}/mooncake-integration/engine.*.so mooncake-wheel/mooncake/engine.
 if [ -f "${BUILD_DIR}/mooncake-pg/src/libmooncake_pg.so" ]; then
     echo "Copying libmooncake_pg.so..."
     cp "${BUILD_DIR}/mooncake-pg/src/libmooncake_pg.so" mooncake-wheel/mooncake/libmooncake_pg.so
+fi
+
+# Copy the native EP host binding to mooncake directory before auditwheel.
+# CUDA EP device libraries remain in the shared EP/PG staging directory and
+# are injected after auditwheel, matching the existing PG packaging flow.
+EP_HOST_SO=$(compgen -G "${BUILD_DIR}/mooncake-ep/src/_ep.*.so" | head -1 || true)
+if [ -n "$EP_HOST_SO" ]; then
+    echo "Copying native EP host extension..."
+    cp "$EP_HOST_SO" mooncake-wheel/mooncake/
 fi
 
 # Copy the shared segment wrapper, which builds on engine.so
@@ -134,19 +143,17 @@ else
 fi
 
 # EP/PG extensions are built during the cmake/make process when the project is
-# configured with -DWITH_EP=ON.  The host EP binding is repaired by auditwheel;
+# configured with -DWITH_EP=ON. Host extensions are repaired by auditwheel;
 # CUDA device libraries and PG extensions remain in the post-repair staging
 # directory so patchelf never touches CUDA fatbins.
 # Use an absolute path: the script later `cd`s into mooncake-wheel/ and a
 # relative path would silently point to the wrong location.
 CUDA_EP_STAGING_DIR="${BUILD_DIR_ABS}/ep_pg_staging"
-EP_HOST_STAGING_DIR="${BUILD_DIR_ABS}/ep_host_staging"
 
 # CI only: remove build/ to free disk before python -m build (set FREE_BUILD_DIR=1 to enable locally).
 # If EP/PG .so files were staged inside the build directory, preserve them in a
 # temporary location so they survive the cleanup.
 CUDA_EP_STAGING_TEMP=""
-EP_HOST_STAGING_TEMP=""
 if [ "$CI" = "true" ] || [ "$FREE_BUILD_DIR" = "1" ]; then
     if [ -d "$CUDA_EP_STAGING_DIR" ] && ls "$CUDA_EP_STAGING_DIR"/*.so &>/dev/null; then
         CUDA_EP_STAGING_TEMP=$(mktemp -d)
@@ -159,24 +166,11 @@ if [ "$CI" = "true" ] || [ "$FREE_BUILD_DIR" = "1" ]; then
     if [ -n "$CUDA_EP_STAGING_TEMP" ]; then
         CUDA_EP_STAGING_DIR="$CUDA_EP_STAGING_TEMP"
     fi
-    if [ -d "$EP_HOST_STAGING_DIR" ] && ls "$EP_HOST_STAGING_DIR"/*.so &>/dev/null; then
-        EP_HOST_STAGING_TEMP=$(mktemp -d)
-        cp "$EP_HOST_STAGING_DIR"/*.so "$EP_HOST_STAGING_TEMP/"
-        echo "Preserved EP host .so files to ${EP_HOST_STAGING_TEMP} before build-dir cleanup"
-    fi
-    if [ -n "$EP_HOST_STAGING_TEMP" ]; then
-        EP_HOST_STAGING_DIR="$EP_HOST_STAGING_TEMP"
-    fi
 fi
 
 # Make the post-repair device library discoverable while auditwheel resolves
 # the host extension.  It is explicitly excluded below and injected later.
 export LD_LIBRARY_PATH="${CUDA_EP_STAGING_DIR}:${LD_LIBRARY_PATH}"
-
-if [ -d "$EP_HOST_STAGING_DIR" ] && ls "$EP_HOST_STAGING_DIR"/*.so &>/dev/null; then
-    echo "Copying EP host extension into wheel before auditwheel..."
-    cp "$EP_HOST_STAGING_DIR"/*.so mooncake-wheel/mooncake/
-fi
 
 if [ "$NPU_BUILD" = "1" ]; then
     echo "Stripping shared libraries to reduce wheel size..."
@@ -564,10 +558,6 @@ fi
 if [ -n "$CUDA_EP_STAGING_TEMP" ]; then
     rm -rf "$CUDA_EP_STAGING_TEMP"
 fi
-if [ -n "$EP_HOST_STAGING_TEMP" ]; then
-    rm -rf "$EP_HOST_STAGING_TEMP"
-fi
-
 # NPU only: move auditwheel-vendored .libs into mooncake/ and set RPATH=$ORIGIN
 # on all ELF files so everything resolves from a single directory.
 if [ "$NPU_BUILD" = "1" ]; then
