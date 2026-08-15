@@ -289,8 +289,10 @@ class basic_hybrid_histogram : public dynamic_metric {
             return;
         }
 
+        const auto initial_size = str.size();
         serialize_head(str);
 
+        bool emitted_any = false;
         std::string value_str;
         auto bucket_counts = get_bucket_counts();
         for (auto& e : value_map) {
@@ -300,6 +302,7 @@ class basic_hybrid_histogram : public dynamic_metric {
                 continue;
             }
 
+            value_str.clear();
             value_type count = 0;
             for (size_t i = 0; i < bucket_counts.size(); i++) {
                 auto counter = bucket_counts[i];
@@ -324,6 +327,7 @@ class basic_hybrid_histogram : public dynamic_metric {
             }
 
             str.append(value_str);
+            emitted_any = true;
 
             std::string labels_str;
             build_label_string_with_static(labels_str, sum_->labels_name(),
@@ -341,8 +345,8 @@ class basic_hybrid_histogram : public dynamic_metric {
             str.append(std::to_string(count));
             str.append("\n");
         }
-        if (value_str.empty()) {
-            str.clear();
+        if (!emitted_any) {
+            str.resize(initial_size);
         }
     }
 
