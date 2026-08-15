@@ -364,6 +364,18 @@ target_include_directories(tent_stage_buffer_concurrency_test
 add_test(NAME tent_stage_buffer_concurrency_test
          COMMAND tent_stage_buffer_concurrency_test)
 
+# Backoff policy for the synchronous wait loops. Pure function, no engine
+# required.
+add_executable(tent_poll_backoff_test poll_backoff_test.cpp)
+target_link_libraries(tent_poll_backoff_test PRIVATE gtest gtest_main
+                                                     tent_link_group)
+if(TARGET asio_shared)
+  target_link_libraries(tent_poll_backoff_test PRIVATE asio_shared)
+endif()
+target_include_directories(tent_poll_backoff_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_poll_backoff_test COMMAND tent_poll_backoff_test)
+
 add_executable(tent_runtime_queue_dispatch_test runtime_queue_dispatch_test.cpp)
 target_link_libraries(tent_runtime_queue_dispatch_test PRIVATE gtest gtest_main
                                                                tent_link_group)
