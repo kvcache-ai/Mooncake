@@ -1871,8 +1871,7 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
         // Update LRU timestamp for in case of eviction.
         if (bucket_backend_config_.eviction_policy ==
             BucketEvictionPolicy::LRU) {
-            ts =
-                std::chrono::steady_clock::now().time_since_epoch().count();
+            ts = std::chrono::steady_clock::now().time_since_epoch().count();
             bucket->last_access_ns_.store(ts, std::memory_order_relaxed);
         }
         buckets_.emplace(bucket_id, std::move(bucket));
