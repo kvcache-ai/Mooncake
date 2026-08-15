@@ -53,6 +53,7 @@ class DiskHashTable(Storage):
 
     def __init__(self, storage_dir: str, page_size: int,
                  max_pages: int = 100000,
+                 file_mode: str = 'single',
                  fsync_mode: str = 'batch', fsync_batch_size: int = 100):
         """Initialize disk hash table
 
@@ -60,6 +61,8 @@ class DiskHashTable(Storage):
             storage_dir: Storage directory
             page_size: Size of each entry (page) in bytes
             max_pages: Maximum number of entries (creates circular mapping if trace is larger)
+            file_mode: 'single' = one big data.bin with slot offsets (default);
+                       'per-file' = one file per page (open/read-write/close per op)
             fsync_mode: When to fsync ('batch', 'always', 'end', 'none')
             fsync_batch_size: Writes between fsync
         """
@@ -67,11 +70,13 @@ class DiskHashTable(Storage):
         self.page_size = page_size
         self.max_pages = max_pages
         self.max_page_id = max_pages - 1
+        self.file_mode = file_mode
         self.fsync_mode = fsync_mode
         self.fsync_batch_size = fsync_batch_size
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         self.storage_file = self.storage_dir / "data.bin"
-        self._allocate_file()
+        if self.file_mode == 'single':
+            self._allocate_file()
         self.fd = None
         self._buffer = os.urandom(page_size)
         self.stats = {
@@ -147,6 +152,20 @@ class DiskHashTable(Storage):
         """
         return page_id % self.max_pages
 
+    def _open_page(self, page_id: int, write: bool):
+        """Resolve a page access to (fd, base_offset, owned).
+
+        single: reuse the persistent data.bin fd, base = physical * page_size.
+        per-file: open page_<physical>.bin for this op, base = 0, owned = True
+                  (caller must close fd when done).
+        """
+        physical_page_id = self._map_page_id(page_id)
+        if self.file_mode == 'per-file':
+            path = self.storage_dir / f"page_{physical_page_id}.bin"
+            flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC if write else os.O_RDONLY
+            return os.open(str(path), flags, 0o644), 0, True
+        return self._get_fd(), physical_page_id * self.page_size, False
+
     def read(self, page_id: int, offset_in_page: int = 0, length: int = None) -> float:
         """Read entry from disk
 
@@ -167,14 +186,12 @@ class DiskHashTable(Storage):
         if length <= 0 or offset_in_page + length > self.page_size:
             raise ValueError(f"length {length} invalid with offset_in_page {offset_in_page} (page_size={self.page_size})")
 
-        # Map to physical page_id and calculate offset
-        physical_page_id = self._map_page_id(page_id)
-        offset = physical_page_id * self.page_size + offset_in_page
         start = time.perf_counter()
-
+        fd = None
+        owned = False
         try:
-            fd = self._get_fd()
-            os.pread(fd, length, offset)
+            fd, base, owned = self._open_page(page_id, write=False)
+            os.pread(fd, length, base + offset_in_page)
 
             latency = (time.perf_counter() - start) * 1000.0
             self.stats['read_count'] += 1
@@ -184,8 +201,14 @@ class DiskHashTable(Storage):
             self.stats['hit'] += 1
             return latency
         except OSError as e:
-            print(f"Read error (page_id={page_id}, physical_page_id={physical_page_id}): {e}")
+            print(f"Read error (page_id={page_id}): {e}")
             return 0.0
+        finally:
+            if owned and fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
 
     def write(self, page_id: int, offset_in_page: int = 0, length: int = None) -> float:
         """Write entry to disk
@@ -207,15 +230,13 @@ class DiskHashTable(Storage):
         if length <= 0 or offset_in_page + length > self.page_size:
             raise ValueError(f"length {length} invalid with offset_in_page {offset_in_page} (page_size={self.page_size})")
 
-        # Map to physical page_id and calculate offset
-        physical_page_id = self._map_page_id(page_id)
-        offset = physical_page_id * self.page_size + offset_in_page
         start = time.perf_counter()
-
+        fd = None
+        owned = False
         try:
-            fd = self._get_fd()
+            fd, base, owned = self._open_page(page_id, write=True)
             # Use corresponding portion of buffer
-            os.pwrite(fd, self._buffer[:length], offset)
+            os.pwrite(fd, self._buffer[:length], base + offset_in_page)
             write_done = time.perf_counter()
 
             # Fsync
@@ -244,6 +265,12 @@ class DiskHashTable(Storage):
         except OSError as e:
             print(f"Write error (page_id={page_id}, offset_in_page={offset_in_page}, length={length}): {e}")
             return 0.0
+        finally:
+            if owned and fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
 
     # ========================================================================
     # Storage interface methods

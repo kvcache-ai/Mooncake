@@ -73,6 +73,7 @@ class StorageBenchmark:
     def __init__(self, storage_dir: str, model_config: dict,
                  page_size_tokens: int = 512,
                  max_pages: int = 100000,
+                 file_mode: str = 'single',
                  fsync_mode: str = 'none', fsync_batch_size: int = 100):
         """Initialize benchmark
 
@@ -81,6 +82,8 @@ class StorageBenchmark:
             model_config: Model configuration dict
             page_size_tokens: Tokens per page (default: 512)
             max_pages: Maximum number of pages
+            file_mode: 'single' = one big data.bin with slot offsets (default);
+                       'per-file' = one file per page
             fsync_mode: When to fsync ('none', 'batch', 'always', 'end')
             fsync_batch_size: Number of writes between fsync in batch mode
         """
@@ -93,6 +96,7 @@ class StorageBenchmark:
             storage_dir=storage_dir,
             page_size=self.page_size_bytes,
             max_pages=max_pages,
+            file_mode=file_mode,
             fsync_mode=fsync_mode,
             fsync_batch_size=fsync_batch_size
         )
@@ -412,6 +416,7 @@ def run_multi_thread(benchmarks: List[StorageBenchmark],
 def run_benchmark(trace_path: str, storage_dir: str, model_config: dict,
                   max_requests: int = None, max_pages: int = None,
                   page_size_tokens: int = 512,
+                  file_mode: str = 'single',
                   fsync_mode: str = 'none', fsync_batch_size: int = 100,
                   threads: int = 1, replay_scale: float = 0.0,
                   progress_interval: int = 100) -> Dict:
@@ -424,6 +429,8 @@ def run_benchmark(trace_path: str, storage_dir: str, model_config: dict,
         max_requests: Maximum number of requests (None = all)
         max_pages: Maximum number of pages (None = auto-calculate)
         page_size_tokens: Tokens per page
+        file_mode: 'single' = one big data.bin with slot offsets (default);
+                   'per-file' = one file per page
         fsync_mode: When to fsync
         fsync_batch_size: Number of writes between fsync
         threads: Benchmark client worker threads
@@ -438,6 +445,7 @@ def run_benchmark(trace_path: str, storage_dir: str, model_config: dict,
     print(f"Model: {model_config['name']}")
     print(f"Layers: {model_config['num_layers']}")
     print(f"Page size: {page_size_tokens} tokens")
+    print(f"File mode: {file_mode}")
     print(f"Threads: {threads}")
     print(f"Fast-forward: {replay_scale:g}x" if replay_scale > 0 else "Fast-forward: unpaced")
     print(f"{'='*80}")
@@ -501,6 +509,7 @@ def run_benchmark(trace_path: str, storage_dir: str, model_config: dict,
                 model_config=model_config,
                 page_size_tokens=page_size_tokens,
                 max_pages=max_pages,
+                file_mode=file_mode,
                 fsync_mode=fsync_mode,
                 fsync_batch_size=fsync_batch_size
             ) as benchmark:
@@ -514,6 +523,7 @@ def run_benchmark(trace_path: str, storage_dir: str, model_config: dict,
                         model_config=model_config,
                         page_size_tokens=page_size_tokens,
                         max_pages=max_pages,
+                        file_mode=file_mode,
                         fsync_mode=fsync_mode,
                         fsync_batch_size=fsync_batch_size
                     ))
@@ -667,6 +677,10 @@ def main():
                        help='Model preset')
     parser.add_argument('--page-size-tokens', type=int, default=512,
                        help='Page size in tokens (default: 512)')
+    parser.add_argument('--file-mode', type=str, choices=['single', 'per-file'],
+                       default='single',
+                       help='Storage layout: single = one big data.bin with slot '
+                            'offsets (default); per-file = one file per page')
     parser.add_argument('--max-requests', type=int, default=None,
                        help='Maximum number of requests')
     parser.add_argument('--max-pages', type=int, default=2000,
@@ -725,6 +739,7 @@ def main():
                     args.max_requests,
                     args.max_pages,
                     args.page_size_tokens,
+                    args.file_mode,
                     args.fsync_mode,
                     args.fsync_batch_size,
                     args.threads,
