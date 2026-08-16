@@ -463,6 +463,11 @@ class TransferEngineImpl {
     std::vector<AllocatedMemory> allocated_memory_;
     std::mutex mutex_;
 
+    // Self-targeted notifications (target == LOCAL_SEGMENT_ID) are delivered
+    // in-process rather than through a transport; see sendNotification().
+    std::mutex local_notifi_mutex_;
+    std::vector<Notification> local_notifi_list_;
+
     std::string hostname_;
     uint16_t port_;
     bool ipv6_;
