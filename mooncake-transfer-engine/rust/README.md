@@ -88,15 +88,24 @@ restrict NICs.
 
 ## Integration smoke test
 
+Unit tests (`cargo test --lib`) do not start an engine. The env-gated
+`minimal_smoke` test initializes TCP, registers an 8KiB pool, and does a
+loopback WRITE/READ of 4KiB on the local segment. It defaults to
+`P2PHANDSHAKE` so no HTTP metadata server is required.
+
 ```bash
 cd mooncake-transfer-engine/rust
 
 MC_RUST_TE_RUN_INTEGRATION=1 \
-MC_METADATA_SERVER=http://127.0.0.1:8080/metadata \
-MC_RUST_TE_LOCAL_HOSTNAME=127.0.0.1:12345 \
+MC_METADATA_SERVER=P2PHANDSHAKE \
 MC_RUST_TE_PROTOCOL=tcp \
 cargo test --test minimal_smoke -- --nocapture
 ```
+
+GitHub Actions runs the same smoke (plus `cargo test --lib`) from
+`scripts/ci/run_transfer_engine_rust_smoke.sh` after the C++ build. ASan
+jobs set `MOONCAKE_TE_RUST_LINK_ASAN=1`; nightly Release jobs leave it at
+`0`. CI points `MC_METADATA_SERVER` at the HTTP metadata bootstrap server.
 
 ## Benchmark example
 

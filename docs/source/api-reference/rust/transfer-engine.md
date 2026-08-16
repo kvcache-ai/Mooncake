@@ -25,7 +25,9 @@ For Transfer Engine design docs and non-Rust APIs, see:
     `MOONCAKE_TE_INCLUDE_DIR` (see `mooncake-transfer-engine/rust/README.md`).
 - **Runtime**:
   - Dynamic linker must find Transfer Engine shared libraries (`libasio.so`, …).
-  - A metadata server (HTTP metadata or etcd) must be reachable.
+  - A metadata server (HTTP metadata, etcd, or `P2PHANDSHAKE`) must be reachable.
+  - GitHub Actions runs `scripts/ci/run_transfer_engine_rust_smoke.sh` after the
+    C++ build (`cargo test --lib` plus the TCP loopback `minimal_smoke` test).
 
 ## Quick start
 

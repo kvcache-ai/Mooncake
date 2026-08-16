@@ -14,6 +14,7 @@
 
 use std::env;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 fn flag_on(name: &str) -> bool {
     env::var(name)
@@ -34,6 +35,45 @@ fn emit_link_searches(dirs: &[PathBuf]) {
     }
 }
 
+fn has_library(search_dirs: &[PathBuf], name: &str) -> bool {
+    let file_names = [
+        format!("lib{name}.so"),
+        format!("lib{name}.a"),
+        format!("lib{name}.dylib"),
+    ];
+    search_dirs
+        .iter()
+        .any(|dir| file_names.iter().any(|file| dir.join(file).exists()))
+        || ["/usr/lib/x86_64-linux-gnu", "/usr/lib64", "/usr/local/lib"]
+            .into_iter()
+            .any(|dir| {
+                file_names
+                    .iter()
+                    .any(|file| Path::new(dir).join(file).exists())
+            })
+}
+
+fn compiler_print_file_name(file_name: &str) -> Option<PathBuf> {
+    for tool in ["cc", "gcc", "clang", "c++"] {
+        let output = match Command::new(tool)
+            .arg(format!("-print-file-name={file_name}"))
+            .output()
+        {
+            Ok(output) if output.status.success() => output,
+            _ => continue,
+        };
+        let Ok(path) = String::from_utf8(output.stdout) else {
+            continue;
+        };
+        let path = PathBuf::from(path.trim());
+        if path.as_os_str().is_empty() || path == PathBuf::from(file_name) || !path.exists() {
+            continue;
+        }
+        return Some(path);
+    }
+    None
+}
+
 fn main() {
     println!("cargo:rerun-if-env-changed=MOONCAKE_BUILD_DIR");
     println!("cargo:rerun-if-env-changed=MOONCAKE_TE_LIB_DIR");
@@ -41,7 +81,9 @@ fn main() {
     println!("cargo:rerun-if-env-changed=MOONCAKE_WITH_ETCD");
     println!("cargo:rerun-if-env-changed=MOONCAKE_WITH_CUDA");
     println!("cargo:rerun-if-env-changed=MOONCAKE_WITHOUT_LIBFABRIC");
+    println!("cargo:rerun-if-env-changed=MOONCAKE_LINK_ASAN");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
+    println!("cargo:rerun-if-env-changed=CUDA_PATH");
     println!("cargo:rerun-if-env-changed=CUDART_LIB_DIR");
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -59,6 +101,7 @@ fn main() {
             build_dir.join("mooncake-asio"),
             build_dir.join("mooncake-common"),
             build_dir.join("mooncake-common/src"),
+            build_dir.join("mooncake-common/etcd"),
             build_dir.join("src"),
             build_dir.join("src/common/base"),
         ] {
@@ -76,6 +119,7 @@ fn main() {
         manifest_dir.join("../../build/mooncake-transfer-engine/src/common/base"),
         manifest_dir.join("../../build/mooncake-asio"),
         manifest_dir.join("../../build/mooncake-common"),
+        manifest_dir.join("../../build/mooncake-common/etcd"),
     ] {
         push_dir(&mut search_dirs, dir);
     }
@@ -84,7 +128,34 @@ fn main() {
         push_dir(&mut search_dirs, PathBuf::from("/opt/amazon/efa/lib"));
     }
 
+    if let Ok(dir) = env::var("CUDART_LIB_DIR") {
+        push_dir(&mut search_dirs, PathBuf::from(dir));
+    }
+    let cuda_home = env::var("CUDA_HOME")
+        .or_else(|_| env::var("CUDA_PATH"))
+        .unwrap_or_else(|_| "/usr/local/cuda".to_string());
+    for dir in [
+        PathBuf::from(&cuda_home).join("lib64/stubs"),
+        PathBuf::from(&cuda_home).join("lib64"),
+        PathBuf::from(&cuda_home).join("lib/stubs"),
+        PathBuf::from(&cuda_home).join("lib"),
+    ] {
+        push_dir(&mut search_dirs, dir);
+    }
+
     emit_link_searches(&search_dirs);
+
+    // Only link the AddressSanitizer runtime when explicitly requested.
+    // Sanitized CI libraries need libasan first; Release builds must not
+    // pull it in (see mooncake-store/rust/build.rs).
+    if flag_on("MOONCAKE_LINK_ASAN") {
+        if let Some(path) = compiler_print_file_name("libasan.so") {
+            if let Some(parent) = path.parent() {
+                println!("cargo:rustc-link-search=native={}", parent.display());
+            }
+        }
+        println!("cargo:rustc-link-lib=asan");
+    }
 
     println!("cargo:rustc-link-lib=static=transfer_engine");
     println!("cargo:rustc-link-lib=static=base");
@@ -120,26 +191,43 @@ fn main() {
 
     println!("cargo:rerun-if-env-changed=MOONCAKE_WITH_LIBFABRIC");
 
-    if flag_on("MOONCAKE_WITH_ETCD") {
-        println!("cargo:rustc-link-lib=etcd-cpp-api");
+    if has_library(&search_dirs, "mooncake_common") {
+        println!("cargo:rustc-link-lib=static=mooncake_common");
+    }
+    if has_library(&search_dirs, "yaml-cpp") {
+        println!("cargo:rustc-link-lib=yaml-cpp");
     }
 
-    if flag_on("MOONCAKE_WITH_CUDA") {
-        if let Ok(dir) = env::var("CUDART_LIB_DIR") {
-            println!("cargo:rustc-link-search=native={dir}");
-        } else if let Ok(cuda_home) = env::var("CUDA_HOME") {
-            let lib64 = PathBuf::from(&cuda_home).join("lib64");
-            let lib = PathBuf::from(&cuda_home).join("lib");
-            if lib64.exists() {
-                println!("cargo:rustc-link-search=native={}", lib64.display());
-            }
-            if lib.exists() {
-                println!("cargo:rustc-link-search=native={}", lib.display());
-            }
-        } else {
-            println!("cargo:rustc-link-search=native=/usr/local/cuda/lib64");
+    // Default CMake USE_ETCD=ON links etcd_wrapper, not etcd-cpp-api.
+    if flag_on("MOONCAKE_WITH_ETCD")
+        || has_library(&search_dirs, "etcd_wrapper")
+        || has_library(&search_dirs, "etcd-cpp-api")
+    {
+        if has_library(&search_dirs, "etcd_wrapper") {
+            println!("cargo:rustc-link-lib=etcd_wrapper");
+        } else if has_library(&search_dirs, "etcd-cpp-api") {
+            println!("cargo:rustc-link-lib=etcd-cpp-api");
+            println!("cargo:rustc-link-lib=cpprest");
+            println!("cargo:rustc-link-lib=ssl");
+            println!("cargo:rustc-link-lib=crypto");
         }
+    }
+
+    if flag_on("MOONCAKE_WITH_CUDA")
+        || has_library(&search_dirs, "cudart")
+        || has_library(&search_dirs, "cuda")
+    {
         println!("cargo:rustc-link-lib=cudart");
+        if has_library(&search_dirs, "cuda") {
+            println!("cargo:rustc-link-lib=cuda");
+        }
+        println!("cargo:rustc-link-lib=rt");
+    }
+
+    for name in ["hiredis", "mlx5"] {
+        if has_library(&search_dirs, name) {
+            println!("cargo:rustc-link-lib={name}");
+        }
     }
 
     let include_dir = env::var("MOONCAKE_TE_INCLUDE_DIR").unwrap_or_else(|_| {

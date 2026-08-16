@@ -134,6 +134,12 @@ jobs:
       run: ./scripts/ci/run_store_rust_smoke.sh
       shell: bash
 
+    - name: Run Transfer Engine Rust smoke test
+      env:
+        MOONCAKE_TE_RUST_LINK_ASAN: "1"
+      run: ./scripts/ci/run_transfer_engine_rust_smoke.sh
+      shell: bash
+
     - name: Run Go store binding integration tests
       env:
         MOONCAKE_STORE_CLUSTER_ID: ci_go_test_cluster
@@ -473,7 +479,7 @@ jobs:
     - name: Configure project with unit tests and examples
       run: |
         cd build
-        cmake -G Ninja .. -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DWITH_STORE_RUST=ON -DENABLE_SCCACHE=ON -DENABLE_DEBUG_SYMBOLS=OFF
+        cmake -G Ninja .. -DBUILD_UNIT_TESTS=ON -DBUILD_EXAMPLES=ON -DWITH_STORE_RUST=ON -DWITH_RUST_EXAMPLE=ON -DENABLE_SCCACHE=ON -DENABLE_DEBUG_SYMBOLS=OFF
       shell: bash
 
     - name: Build project with unit tests and examples
@@ -500,6 +506,22 @@ jobs:
         MOONCAKE_STORE_LIB_DIR=$GITHUB_WORKSPACE/build/mooncake-store/src \
         MOONCAKE_STORE_INCLUDE_DIR=$GITHUB_WORKSPACE/mooncake-store/include \
           cargo test --examples --tests --no-run
+        cargo clean
+      shell: bash
+
+    - name: Check Transfer Engine Rust bindings, examples, and tests
+      run: |
+        if [ -f /usr/local/cuda/lib64/stubs/libcuda.so ] && \
+           [ ! -e /usr/local/cuda/lib64/stubs/libcuda.so.1 ]; then
+          sudo ln -s libcuda.so /usr/local/cuda/lib64/stubs/libcuda.so.1
+        fi
+        export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
+        cd mooncake-transfer-engine/rust
+        export MOONCAKE_BUILD_DIR=$GITHUB_WORKSPACE/build
+        export MOONCAKE_TE_LIB_DIR=$GITHUB_WORKSPACE/build/mooncake-transfer-engine/src
+        export MOONCAKE_TE_INCLUDE_DIR=$GITHUB_WORKSPACE/mooncake-transfer-engine/include
+        cargo test --lib
+        cargo test --examples --tests --no-run
         cargo clean
       shell: bash
 

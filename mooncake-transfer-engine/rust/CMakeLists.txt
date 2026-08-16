@@ -18,6 +18,9 @@ endif()
 if(NOT USE_EFA)
   list(APPEND _te_rust_env MOONCAKE_WITHOUT_LIBFABRIC=1)
 endif()
+if(ENABLE_ASAN)
+  list(APPEND _te_rust_env MOONCAKE_LINK_ASAN=1)
+endif()
 
 add_custom_target(build_transfer_engine_rust DEPENDS transfer_engine)
 add_custom_command(

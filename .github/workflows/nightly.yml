@@ -304,6 +304,11 @@ jobs:
           MOONCAKE_STORE_RUST_LINK_ASAN: "0"
         run: ./scripts/ci/run_store_rust_smoke.sh
 
+      - name: Run Transfer Engine Rust smoke test
+        env:
+          MOONCAKE_TE_RUST_LINK_ASAN: "0"
+        run: ./scripts/ci/run_transfer_engine_rust_smoke.sh
+
       - name: Run Go store binding integration tests
         env:
           MOONCAKE_STORE_CLUSTER_ID: nightly_go_cluster
