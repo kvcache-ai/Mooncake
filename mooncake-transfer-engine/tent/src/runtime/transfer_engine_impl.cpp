@@ -802,6 +802,7 @@ BatchID TransferEngineImpl::allocateBatch(size_t batch_size) {
     Batch* batch = Slab<Batch>::Get().allocate();
     if (!batch) return (BatchID)0;
     batch->max_size = batch_size;
+    batch->task_list.reserve(batch_size);
     BatchID batch_id = (BatchID)batch;
     std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
     batch_set_.active.insert(batch);
@@ -1464,6 +1465,11 @@ void TransferEngineImpl::attachProgressNotifier(
 Status TransferEngineImpl::commitPreparedSubmit(
     Batch* batch, const PreparedSubmit& prepared) {
     if (!batch) return Status::InvalidArgument("Invalid batch" LOC_MARK);
+    if (batch->task_list.size() > batch->max_size ||
+        prepared.tasks.size() > batch->max_size - batch->task_list.size()) {
+        return Status::TooManyRequests(
+            "batch public task capacity exceeded" LOC_MARK);
+    }
 
     std::vector<Request> classified_request_list[kSupportedTransportTypes];
     std::vector<size_t> task_id_list[kSupportedTransportTypes];

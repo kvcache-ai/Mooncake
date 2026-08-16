@@ -347,7 +347,8 @@ if(TARGET asio_shared)
   target_link_libraries(tent_progress_worker_test PRIVATE asio_shared)
 endif()
 target_include_directories(tent_progress_worker_test
-                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include
+                                   ${CMAKE_CURRENT_SOURCE_DIR}/../src/runtime)
 add_test(NAME tent_progress_worker_test COMMAND tent_progress_worker_test)
 
 # stage_buffers_ is reached from the staging workers and the RPC thread. Drives
