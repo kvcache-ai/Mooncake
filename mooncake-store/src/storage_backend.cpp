@@ -105,6 +105,9 @@ BucketBackendConfig BucketBackendConfig::FromEnvironment() {
                           Environ::GetInt64("MOONCAKE_BUCKET_MAX_TOTAL_SIZE",
                                             config.max_total_size));
 
+    config.max_physical_bytes = Environ::GetInt64(
+        "MOONCAKE_OFFLOAD_MAX_PHYSICAL_BYTES", config.max_physical_bytes);
+
     const auto policy_str = Environ::GetString(
         "MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY",
         Environ::GetString("MOONCAKE_BUCKET_EVICTION_POLICY", "fifo"));
@@ -2891,8 +2894,31 @@ BucketStorageBackend::PrepareEviction(
         namespace fs = std::filesystem;
         std::error_code ec;
         auto space_info = fs::space(storage_path_, ec);
+        uint64_t actual_available = 0;
+        bool have_space = false;
         if (!ec) {
-            uint64_t actual_available = space_info.available;
+            actual_available = space_info.available;
+            have_space = true;
+        } else {
+            LOG(WARNING) << "[Evict] Failed to get disk space info for "
+                         << storage_path_ << ": " << ec.message();
+        }
+        // Container quotas (emptyDir sizeLimit / cgroup) are invisible to
+        // fs::space(); when configured, also bound available by physical cap.
+        if (bucket_backend_config_.max_physical_bytes > 0) {
+            const int64_t used = total_size_ + pending_eviction_size_ +
+                                 pending_write_size_;
+            const int64_t remaining =
+                bucket_backend_config_.max_physical_bytes > used
+                    ? bucket_backend_config_.max_physical_bytes - used
+                    : 0;
+            const uint64_t capped = static_cast<uint64_t>(remaining);
+            if (!have_space || capped < actual_available) {
+                actual_available = capped;
+                have_space = true;
+            }
+        }
+        if (have_space) {
             constexpr uint64_t kMinFreeSpace = 256 * kMB;
             // Watermark eviction passes a synthetic required_size to drive
             // quota-based cleanup. It is not a real incoming write, so it
@@ -2906,11 +2932,10 @@ BucketStorageBackend::PrepareEviction(
                 LOG(WARNING) << "[Evict] Actual disk space too low: available="
                              << actual_available << ", required=" << req_sz
                              << ", deficit=" << deficit
+                             << ", max_physical_bytes="
+                             << bucket_backend_config_.max_physical_bytes
                              << ". Will evict buckets to free space.";
             }
-        } else {
-            LOG(WARNING) << "[Evict] Failed to get disk space info for "
-                         << storage_path_ << ": " << ec.message();
         }
     }
 
