@@ -40,20 +40,109 @@ docker_launch(){
     local registry_addr=$1
     local extra_args=$2
 
-    docker_run_cmd="docker run  --init --name ${CONTAINER_NAME} \
-    -d --ipc=host --cap-add=SYS_PTRACE --network=host --gpus all \
-    --ulimit memlock=-1 --ulimit stack=67108864 --shm-size=128g \
-    -v ${MODEL_CACHE}:/root/.cache $extra_args --privileged \
-    -v $BASE_DIR:/test_run \
-    -v /root/test.jsonl:/tmp/test.jsonl \
-    --entrypoint bash \
-    ${registry_addr} -c \"hostname;sleep 360000\""
+    if [ "${CI_ACCELERATOR:-cuda}" = "rocm" ]; then
+        local -a docker_args=(
+            run --init --name "${CONTAINER_NAME}" -d
+            --network=host
+            --device=/dev/kfd
+            --cpuset-cpus="${MOONCAKE_CPUSET_CPUS:-0-95}"
+            --cpuset-mems="${MOONCAKE_CPUSET_MEMS:-0}"
+            --cap-drop=ALL
+            # apt/dpkg drops privileges to _apt while installing the standard
+            # verbs userspace. Retain only the filesystem/identity capabilities
+            # needed for that setup; serving never receives the default Docker
+            # capability set.
+            --cap-add=CHOWN
+            --cap-add=DAC_OVERRIDE
+            --cap-add=FOWNER
+            --cap-add=SETGID
+            --cap-add=SETUID
+            # Mooncake queries page placement with move_pages(2) to select the
+            # nearest RoCE rail. Docker's default seccomp profile rejects that
+            # syscall with EPERM even for the container's own pages. Keep the
+            # capability and device allowlists above as the security boundary.
+            --security-opt=seccomp=unconfined
+            --security-opt=no-new-privileges:true
+            --pids-limit=32768
+            --ulimit memlock=-1:-1
+            --ulimit stack=67108864:67108864
+            --shm-size=128g
+            --stop-timeout=120
+            -e CI_ACCELERATOR=rocm
+            -e NCCL_GIN_TYPE=0
+            -e "NCCL_IB_HCA=${MOONCAKE_RDMA_DEVICES:-ionic_0,ionic_1,ionic_2,ionic_3}"
+            -e "NCCL_SOCKET_IFNAME=${MOONCAKE_RDMA_NETDEVS:-eth2,eth3,eth4,eth5}"
+            -e "MOONCAKE_DEVICE=${MOONCAKE_RDMA_DEVICES:-ionic_0,ionic_1,ionic_2,ionic_3}"
+            -e "MC_GID_INDEX=${MOONCAKE_GID_INDEX:-1}"
+            -e MC_FORCE_HCA=1
+            # The MI35x image enables a host-wide SGLang affinity heuristic.
+            # It ignores Docker's cpuset and assigns TP rank 1 to CPU96+, which
+            # is outside this NUMA0 allocation. Docker already enforces the
+            # correct affinity, so disable the conflicting inner policy.
+            -e SGLANG_SET_CPU_AFFINITY=0
+            -v "${MODEL_CACHE}:/root/.cache"
+            -v "${BASE_DIR}:/test_run"
+            --entrypoint bash
+        )
+        local -a render_nodes
+        read -r -a render_nodes <<<"${MOONCAKE_RENDER_DEVICES:-}"
+        if [ "${#render_nodes[@]}" -ne 4 ]; then
+            echo "ERROR: ROCm profile must expose exactly four render nodes" >&2
+            return 1
+        fi
+        local device
+        for device in "${render_nodes[@]}"; do
+            if [[ ! "$device" =~ ^/dev/dri/render[D][0-9]+$ ]] || [ ! -c "$device" ]; then
+                echo "ERROR: Invalid or missing ROCm render node: $device" >&2
+                return 1
+            fi
+            docker_args+=(--device="$device")
+        done
+        local uverbs
+        for uverbs in 0 1 2 3; do
+            device="/dev/infiniband/uverbs${uverbs}"
+            [ -c "$device" ] || { echo "ERROR: Missing RDMA device $device" >&2; return 1; }
+            docker_args+=(--device="$device")
+        done
+        if [ -c /dev/infiniband/rdma_cm ]; then
+            docker_args+=(--device=/dev/infiniband/rdma_cm)
+        fi
+        if [ "${USE_HUGGINGFACE_MIRROR}" = "true" ]; then
+            docker_args+=(-e "HF_ENDPOINT=${HUGGINGFACE_MIRROR}" -e HF_HUB_ENABLE_HF_TRANSFER=1)
+        fi
+        if [ "${USE_MODELSCOPE}" = "true" ]; then
+            docker_args+=(-e SGLANG_USE_MODELSCOPE=true)
+        fi
+        if [ -n "${HF_TOKEN_FILE:-}" ] && [ -r "$HF_TOKEN_FILE" ]; then
+            local hf_token
+            hf_token=$(<"$HF_TOKEN_FILE")
+            [ -n "$hf_token" ] || { echo "ERROR: $HF_TOKEN_FILE is empty" >&2; return 1; }
+            export HF_TOKEN="$hf_token"
+            docker_args+=(-e HF_TOKEN)
+        fi
+        printf 'Executing Docker run command:'
+        printf ' %q' docker "${docker_args[@]}" "$registry_addr" -c 'hostname; sleep 360000'
+        printf '\n'
+        if ! docker "${docker_args[@]}" "$registry_addr" -c 'hostname; sleep 360000'; then
+            echo "ERROR: Failed to launch ROCm container" >&2
+            return 1
+        fi
+    else
+        docker_run_cmd="docker run  --init --name ${CONTAINER_NAME} \
+        -d --ipc=host --cap-add=SYS_PTRACE --network=host --gpus all \
+        --ulimit memlock=-1 --ulimit stack=67108864 --shm-size=128g \
+        -v ${MODEL_CACHE}:/root/.cache $extra_args --privileged \
+        -v $BASE_DIR:/test_run \
+        -v /root/test.jsonl:/tmp/test.jsonl \
+        --entrypoint bash \
+        ${registry_addr} -c \"hostname;sleep 360000\""
 
-    echo "Executing Docker run command:"
-    echo "$docker_run_cmd"
-    if ! eval "$docker_run_cmd"; then
-        echo "ERROR: Failed to launch docker container" >&2
-        return 1
+        echo "Executing Docker run command:"
+        echo "$docker_run_cmd"
+        if ! eval "$docker_run_cmd"; then
+            echo "ERROR: Failed to launch docker container" >&2
+            return 1
+        fi
     fi
 
     pip_cmd=""
@@ -102,12 +191,21 @@ docker_launch(){
         fi
     fi
 
-    echo "Installing ERDMA drivers"
-    echo "Executing ERDMA driver installation command:"
-    echo "${erdma_driver_cmd}"
-    if ! ${docker_exec} "${erdma_driver_cmd}"; then
-        echo "ERROR: Failed to install ERDMA drivers" >&2
-        return 1
+    if [ "${CI_ACCELERATOR:-cuda}" = "rocm" ]; then
+        rocm_rdma_cmd='if command -v ibv_devinfo >/dev/null 2>&1; then echo "standard RoCE userspace already present"; else apt-get update && apt-get install -y --no-install-recommends libibverbs1 ibverbs-providers ibverbs-utils librdmacm1 && rm -rf /var/lib/apt/lists/*; fi'
+        echo "Checking standard RoCE userspace"
+        if ! ${docker_exec} "${rocm_rdma_cmd}"; then
+            echo "ERROR: Failed to install ROCm RoCE userspace" >&2
+            return 1
+        fi
+    else
+        echo "Installing ERDMA drivers"
+        echo "Executing ERDMA driver installation command:"
+        echo "${erdma_driver_cmd}"
+        if ! ${docker_exec} "${erdma_driver_cmd}"; then
+            echo "ERROR: Failed to install ERDMA drivers" >&2
+            return 1
+        fi
     fi
 
     echo "Checking RDMA devices"
@@ -215,6 +313,12 @@ check_server_ready_with_pattern() {
                 echo "Server is ready!"
                 return 0
             fi
+            if grep -qE 'Fatal Python error|Segfault encountered|Subprocess .* crashed with exit code' \
+                "$server_log_path" 2>/dev/null; then
+                echo "ERROR: Server process crashed during startup; see $server_log_path" >&2
+                tail -n 80 "$server_log_path" >&2
+                return 1
+            fi
             echo "Waiting... ($i/$max_attempts)"
             sleep 2
         fi
@@ -229,9 +333,25 @@ get_whl(){
     echo "whls_path: $whls_path and mkdir..."
     mkdir -p "$whls_path"
 
-    echo "get whl file from github action"
+    echo "get whl file from CI artifacts"
     rm -f "$whls_path/mooncake.zip"
     rm -f "$whls_path"/*.whl
+
+    if [ -n "${WHEEL_DIR:-}" ]; then
+        local local_wheel=""
+        local local_wheel_count=0
+        while IFS= read -r wheel; do
+            local_wheel=$wheel
+            local_wheel_count=$((local_wheel_count + 1))
+        done < <(find "$WHEEL_DIR" -type f -name '*.whl' -print)
+        if [ "$local_wheel_count" -ne 1 ]; then
+            echo "ERROR: Expected exactly one wheel in $WHEEL_DIR, found $local_wheel_count" >&2
+            return 1
+        fi
+        cp -L "$local_wheel" "$whls_path/"
+        echo "Copied self-hosted Actions wheel: $(basename "$local_wheel")"
+        return 0
+    fi
 
     local max_retries=5
     local base_delay=5 # seconds
@@ -361,7 +481,12 @@ stop_container(){
     echo "Stopping ${location} Docker container: ${container_name}"
     
     if [ "$location" == "remote" ]; then
-        ssh -o StrictHostKeyChecking=no $remote_host "docker stop ${container_name} >/dev/null 2>&1"
+        local ssh_target=$remote_host
+        if [ "${CI_ACCELERATOR:-cuda}" = "rocm" ]; then
+            ssh_target=${REMOTE_SSH_TARGET:-$remote_host}
+        fi
+        ${SSH_CMD:-ssh -o StrictHostKeyChecking=no} "$ssh_target" \
+            "docker stop ${container_name} >/dev/null 2>&1"
     else
         docker stop ${container_name} >/dev/null 2>&1
     fi
@@ -401,22 +526,41 @@ cleanup_test_env() {
     echo "Cleanup completed"
 }
 
-# Wait until GPU memory on the local host drains below a threshold.
+# Return the maximum used memory, in MiB, for only this CI allocation.
+gpu_max_used_mb() {
+    if [ "${CI_ACCELERATOR:-cuda}" = "rocm" ]; then
+        command -v rocm-smi >/dev/null 2>&1 || return 1
+        rocm-smi --showmeminfo vram --json 2>/dev/null | python3 -c '
+import json, sys
+indices = {f"card{i}" for i in sys.argv[1].split(",")}
+data = json.load(sys.stdin)
+used = []
+for card, values in data.items():
+    if card not in indices:
+        continue
+    for key, value in values.items():
+        if "Total Memory Used" in key:
+            used.append(int(value) // (1024 * 1024))
+print(max(used) if used else -1)
+' "${MOONCAKE_GPU_INDICES:-0,1,2,3}"
+    else
+        command -v nvidia-smi >/dev/null 2>&1 || return 1
+        nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null \
+            | sort -n | tail -n 1
+    fi
+}
+
+# Wait until GPU memory on the allocated devices drains below a threshold.
 # Returns 0 once drained, 1 if it times out.
 wait_gpu_idle() {
     local max_seconds=${1:-90}
     local threshold_mb=${2:-1024}
 
-    if ! command -v nvidia-smi >/dev/null 2>&1; then
-        echo "ERROR: nvidia-smi not available; cannot verify GPU drain" >&2
-        return 1
-    fi
-
     echo "Waiting for GPU memory to drain (threshold ${threshold_mb}MB, timeout ${max_seconds}s)..."
     local elapsed=0
     local max_used=0
     while [ $elapsed -lt $max_seconds ]; do
-        max_used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | sort -n | tail -n 1)
+        max_used=$(gpu_max_used_mb)
         if ! [[ "$max_used" =~ ^[0-9]+$ ]]; then
             echo "ERROR: nvidia-smi query failed; cannot verify GPU drain" >&2
             return 1
@@ -442,6 +586,10 @@ gpu_pid_belongs_to_container() {
 }
 
 force_kill_container_gpu_procs() {
+    if [ "${CI_ACCELERATOR:-cuda}" = "rocm" ]; then
+        echo "ROCm cleanup refuses host PID killing; quarantine the allocation if container restart does not drain it" >&2
+        return 1
+    fi
     command -v nvidia-smi >/dev/null 2>&1 || return 1
 
     local container_id
@@ -520,7 +668,7 @@ drain_gpu_between_tests() {
 
     if [ -n "$REMOTE_IP" ]; then
         echo "Resetting environment on remote node $REMOTE_IP..."
-        if ! ${SSH_CMD} "$REMOTE_IP" "
+        if ! ${SSH_CMD} "${REMOTE_SSH_TARGET:-$REMOTE_IP}" "
             source ${REMOTE_TEST_DIR}/run/.shrc && \
             source ${REMOTE_TEST_DIR}/scripts/common.sh && \
             drain_gpu_local
@@ -550,7 +698,9 @@ setup_node_env() {
 
     local extra_args=""
     extra_args="$extra_args -e NCCL_GIN_TYPE=0 "
-    extra_args="$extra_args --device=/dev/infiniband/uverbs0 --device=/dev/infiniband/uverbs1 --device=/dev/infiniband/rdma_cm "
+    if [ "${CI_ACCELERATOR:-cuda}" != "rocm" ]; then
+        extra_args="$extra_args --device=/dev/infiniband/uverbs0 --device=/dev/infiniband/uverbs1 --device=/dev/infiniband/rdma_cm "
+    fi
     if [ "${USE_HUGGINGFACE_MIRROR}" = "true" ]; then
         extra_args="$extra_args -e HF_ENDPOINT=${HUGGINGFACE_MIRROR} -e HF_HUB_ENABLE_HF_TRANSFER=1"
     fi
@@ -746,7 +896,7 @@ setup_log_directory_dual() {
     setup_log_directory "$TEST_RUN_DIR/logs/$test_case_name/$model_name_clean"
     
     if [ -n "$REMOTE_IP" ]; then
-        ${SSH_CMD} $REMOTE_IP "source $REMOTE_TEST_DIR/run/.shrc; cd \$BASE_DIR/scripts && source ./common.sh && setup_log_directory \"\$TEST_RUN_DIR/logs/$test_case_name/$model_name_clean\""
+        ${SSH_CMD} "${REMOTE_SSH_TARGET:-$REMOTE_IP}" "source $REMOTE_TEST_DIR/run/.shrc; cd \$BASE_DIR/scripts && source ./common.sh && setup_log_directory \"\$TEST_RUN_DIR/logs/$test_case_name/$model_name_clean\""
     fi
 }
 
@@ -768,7 +918,7 @@ cleanup_model_processes() {
     
     if [ "$ISREMOTE" == "0" ] && [ -n "$REMOTE_IP" ]; then
         echo "===== Killing model processes (remote: $REMOTE_IP) ====="
-        ${SSH_CMD} "$REMOTE_IP" "source $REMOTE_TEST_DIR/run/.shrc; cd \$BASE_DIR/scripts && ./$test_case_name.sh stop_server" 2>/dev/null || true
+        ${SSH_CMD} "${REMOTE_SSH_TARGET:-$REMOTE_IP}" "source $REMOTE_TEST_DIR/run/.shrc; cd \$BASE_DIR/scripts && ./$test_case_name.sh stop_server" 2>/dev/null || true
     fi
     
     echo "Process cleanup completed."
@@ -783,8 +933,9 @@ collect_remote_log_file() {
     local local_log_dir="${BASE_DIR}/${TEST_CASE_RESULT_PATH}/${model_name_clean}"
     
     echo "  Copying remote ${remote_log_filename}..."
-    scp ${REMOTE_IP}:${remote_log_dir}/${remote_log_filename} \
-        ${local_log_dir}/ 2>/dev/null
+    ${SCP_CMD:-scp} \
+        "${REMOTE_SSH_TARGET:-$REMOTE_IP}:${remote_log_dir}/${remote_log_filename}" \
+        "${local_log_dir}/" 2>/dev/null
     
     if [ $? -eq 0 ]; then
         echo "  ✓ Successfully copied ${remote_log_filename} for $model_name_clean"
@@ -974,15 +1125,48 @@ collect_and_validate_model_results() {
     fi
 }
 
-# Echo an offline env prefix when the given model already exists in the
-# container's HuggingFace cache, so servers use the local snapshot instead of
-# querying the hub (skips downloads and avoids hf-mirror 429 rate limiting).
-# Models are pre-cached under MODEL_CACHE (mounted at /root/.cache) on both nodes.
+# Echo an offline env prefix only when a complete set of model weights exists.
+# A config-only or interrupted snapshot must stay online so Hugging Face can
+# resume it instead of failing later with "Cannot find any model weights".
 hf_offline_prefix() {
     local model_name=$1
     [ -z "$model_name" ] && return 0
     local cache_dir="models--$(echo "$model_name" | sed 's#/#--#g')"
-    if ${docker_exec} "ls /root/.cache/huggingface/hub/${cache_dir}/snapshots/*/config.json >/dev/null 2>&1"; then
+    if docker exec -i "${CONTAINER_NAME}" python3 - \
+        "/root/.cache/huggingface/hub/${cache_dir}/snapshots/*" <<'PY'
+import glob
+import json
+import os
+import sys
+
+
+def snapshot_complete(snapshot):
+    if not os.path.isfile(os.path.join(snapshot, "config.json")):
+        return False
+    for index_name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
+        index_path = os.path.join(snapshot, index_name)
+        if not os.path.isfile(index_path):
+            continue
+        try:
+            with open(index_path, encoding="utf-8") as index_file:
+                weights = set(json.load(index_file).get("weight_map", {}).values())
+        except (OSError, ValueError):
+            return False
+        return bool(weights) and all(
+            os.path.isfile(os.path.join(snapshot, weight))
+            and os.path.getsize(os.path.join(snapshot, weight)) > 0
+            for weight in weights
+        )
+    return any(
+        os.path.isfile(path) and os.path.getsize(path) > 0
+        for pattern in ("*.safetensors", "pytorch_model*.bin", "*.pt")
+        for path in glob.glob(os.path.join(snapshot, pattern))
+    )
+
+
+sys.exit(0 if any(snapshot_complete(path) for path in glob.glob(sys.argv[1])) else 1)
+PY
+    then
         echo "HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 "
     fi
 }
@@ -1006,6 +1190,10 @@ launch_sglang_server() {
     local sglang_cmd="${docker_exec} \"${offline_prefix}python -m sglang.launch_server --model-path ${model_path} --host ${host} --port ${port}"
     if [ -n "$extra_args" ]; then
         sglang_cmd="${sglang_cmd} ${extra_args}"
+    fi
+    if [ -n "${MOONCAKE_SGLANG_MEM_FRACTION_STATIC:-}" ] && \
+        [[ " $extra_args " != *" --mem-fraction-static "* ]]; then
+        sglang_cmd="${sglang_cmd} --mem-fraction-static ${MOONCAKE_SGLANG_MEM_FRACTION_STATIC}"
     fi
     
 

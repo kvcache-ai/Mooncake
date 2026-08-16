@@ -36,7 +36,12 @@ start_server()
 
     local extra_args="--tensor-parallel-size 2 --max-model-len 32768 --gpu-memory-utilization 0.85 --no-enable-prefix-caching --kv-transfer-config '$kv_config_json'"
     
-    local env_vars="CUDA_VISIBLE_DEVICES=6,7"
+    local env_vars
+    if [ "${CI_ACCELERATOR:-cuda}" = "rocm" ]; then
+        env_vars="ROCR_VISIBLE_DEVICES=${MOONCAKE_VLLM_VISIBLE_DEVICES:-0,1} HIP_VISIBLE_DEVICES=${MOONCAKE_VLLM_VISIBLE_DEVICES:-0,1}"
+    else
+        env_vars="CUDA_VISIBLE_DEVICES=${MOONCAKE_VLLM_VISIBLE_DEVICES:-6,7}"
+    fi
     
     if ! launch_vllm_server "$model_name" "$host" "$port" "$vllm_server_log_path" "$kv_role" "$extra_args" "$env_vars"; then
         return 1
@@ -148,7 +153,7 @@ run_single_model()
         status=1
     else
         # Remote start server
-        if ! ${SSH_CMD} $REMOTE_IP "source $REMOTE_TEST_DIR/run/.shrc; cd \$BASE_DIR/scripts && ./$test_case_name.sh start_server $model_name $model_name_clean"; then
+        if ! ${SSH_CMD} "${REMOTE_SSH_TARGET:-$REMOTE_IP}" "source $REMOTE_TEST_DIR/run/.shrc; cd \$BASE_DIR/scripts && ./$test_case_name.sh start_server $model_name $model_name_clean"; then
             echo "ERROR: Failed to start remote server for model $model_name"
             status=1
         else
