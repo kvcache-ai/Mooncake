@@ -41,6 +41,8 @@ int GetTestPort(std::unordered_set<int>& used_ports) {
 }
 
 size_t CountOccurrences(const std::string& text, const std::string& needle) {
+    if (needle.empty()) return 0;
+
     size_t count = 0;
     size_t position = 0;
     while ((position = text.find(needle, position)) != std::string::npos) {
