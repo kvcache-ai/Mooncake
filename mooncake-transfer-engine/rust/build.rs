@@ -98,9 +98,27 @@ fn main() {
     println!("cargo:rustc-link-lib=numa");
     println!("cargo:rustc-link-lib=curl");
 
-    if !flag_on("MOONCAKE_WITHOUT_LIBFABRIC") {
+    if flag_on("MOONCAKE_WITHOUT_LIBFABRIC") {
+        // skip
+    } else if flag_on("MOONCAKE_WITH_LIBFABRIC")
+        || search_dirs.iter().any(|dir| {
+            ["so", "a", "dylib"]
+                .into_iter()
+                .any(|ext| dir.join(format!("libfabric.{ext}")).exists())
+        })
+        || [
+            "/usr/lib/x86_64-linux-gnu/libfabric.so",
+            "/usr/lib64/libfabric.so",
+            "/usr/local/lib/libfabric.so",
+            "/opt/amazon/efa/lib/libfabric.so",
+        ]
+        .into_iter()
+        .any(|path| Path::new(path).exists())
+    {
         println!("cargo:rustc-link-lib=fabric");
     }
+
+    println!("cargo:rerun-if-env-changed=MOONCAKE_WITH_LIBFABRIC");
 
     if flag_on("MOONCAKE_WITH_ETCD") {
         println!("cargo:rustc-link-lib=etcd-cpp-api");

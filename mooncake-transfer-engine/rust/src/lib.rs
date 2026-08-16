@@ -53,6 +53,3 @@ pub use types::{
     BatchId, BufferEntry, NicLoadStat, NotifyMsg, Opcode, SegmentId, TransferRequest,
     TransferStatus, TransferStatusCode, INVALID_BATCH, LOCAL_SEGMENT, WILDCARD_LOCATION,
 };
-
-// Historical module path used by the old example binary.
-pub use engine as transfer_engine;
