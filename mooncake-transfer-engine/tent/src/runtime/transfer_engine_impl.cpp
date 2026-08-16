@@ -2117,6 +2117,17 @@ void TransferEngineImpl::updateTaskStatusAfterPoll(Batch* batch, size_t task_id,
 
 Status TransferEngineImpl::sendNotification(SegmentID target_id,
                                             const Notification& notifi) {
+    if (target_id == LOCAL_SEGMENT_ID) {
+        // Self-targeted notification: deliver in-process. The data plane
+        // already short-circuits LOCAL_SEGMENT_ID transfers to the local
+        // path; notifications need the same treatment. Routing them through
+        // a transport cannot work: the RDMA local pseudo-endpoint never
+        // establishes a notification QP, so sending fails and the receiver
+        // polls forever.
+        std::lock_guard<std::mutex> lk(local_notifi_mutex_);
+        local_notifi_list_.push_back(notifi);
+        return Status::OK();
+    }
     for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
         auto& transport = transport_list_[type];
         if (!transport || !transport->supportNotification()) continue;
@@ -2146,12 +2157,31 @@ Status TransferEngineImpl::probePeerAliveByID(SegmentID target_id) {
 
 Status TransferEngineImpl::receiveNotification(
     std::vector<Notification>& notifi_list) {
+    Status status = Status::OK();
+    bool has_transport = false;
     for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
         auto& transport = transport_list_[type];
         if (!transport || !transport->supportNotification()) continue;
-        return transport->receiveNotification(notifi_list);
+        has_transport = true;
+        status = transport->receiveNotification(notifi_list);
+        break;
     }
-    return Status::InvalidArgument("Notification not supported" LOC_MARK);
+    if (!has_transport) notifi_list.clear();
+    // Append self-targeted notifications queued by sendNotification(). They
+    // are deliverable even when no transport supports notifications at all.
+    {
+        std::lock_guard<std::mutex> lk(local_notifi_mutex_);
+        if (!local_notifi_list_.empty()) {
+            notifi_list.insert(
+                notifi_list.end(),
+                std::make_move_iterator(local_notifi_list_.begin()),
+                std::make_move_iterator(local_notifi_list_.end()));
+            local_notifi_list_.clear();
+        }
+    }
+    if (!has_transport && notifi_list.empty())
+        return Status::InvalidArgument("Notification not supported" LOC_MARK);
+    return status;
 }
 
 Status TransferEngineImpl::getTransferStatus(BatchID batch_id, size_t task_id,
