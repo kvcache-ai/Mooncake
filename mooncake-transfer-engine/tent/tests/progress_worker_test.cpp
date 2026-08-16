@@ -39,12 +39,15 @@
 #include "tent/common/config.h"
 #include "tent/common/types.h"
 #include "tent/runtime/segment.h"
+#include "tent/runtime/proxy_manager.h"
 #include "tent/runtime/transfer_engine_impl.h"
 #include "tent/runtime/transport.h"
 #include "tent/transport/fault_proxy/fault_proxy_transport.h"
+#include "remote_stage_operation.h"
 
 namespace mooncake {
 namespace tent {
+
 namespace {
 
 // ---------------------------------------------------------------------------
@@ -181,6 +184,77 @@ class FakeTransport : public Transport {
     StatusFactory status_factory_;
     PollStatusFactory poll_status_factory_;
 };
+
+class DeferredCleanupProbeTransport : public FakeTransport {
+   public:
+    DeferredCleanupProbeTransport() : FakeTransport(TCP) {}
+
+    Status submitTransferTasks(
+        SubBatchRef batch, const std::vector<Request>& request_list) override {
+        const int attempt =
+            submit_attempts.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (attempt == 2) {
+            return Status::InternalError(
+                "injected second staging submission failure" LOC_MARK);
+        }
+        return FakeTransport::submitTransferTasks(batch, request_list);
+    }
+
+    Status getTransferStatus(SubBatchRef batch, int task_id,
+                             TransferStatus& status) override {
+        poll_attempts.fetch_add(1, std::memory_order_relaxed);
+        if (fail_polling.load(std::memory_order_acquire)) {
+            return Status::InternalError(
+                "injected deferred cleanup poll failure" LOC_MARK);
+        }
+
+        auto* fake_batch = static_cast<FakeSubBatch*>(batch);
+        if (task_id < 0 || task_id >= (int)fake_batch->requests.size()) {
+            return Status::InvalidArgument("bad task_id" LOC_MARK);
+        }
+        if (stay_pending.load(std::memory_order_acquire)) {
+            status.s = TransferStatusEnum::PENDING;
+            status.transferred_bytes = 0;
+        } else {
+            status.s = TransferStatusEnum::COMPLETED;
+            status.transferred_bytes = fake_batch->requests[task_id].length;
+        }
+        return Status::OK();
+    }
+
+    Status freeLocalMemory(void* addr, size_t size) override {
+        free_local_memory_calls.fetch_add(1, std::memory_order_relaxed);
+        if (stay_pending.load(std::memory_order_acquire)) {
+            free_local_memory_while_pending.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+        return FakeTransport::freeLocalMemory(addr, size);
+    }
+
+    std::atomic<int> submit_attempts{0};
+    std::atomic<int> poll_attempts{0};
+    std::atomic<int> free_local_memory_calls{0};
+    std::atomic<int> free_local_memory_while_pending{0};
+    std::atomic<bool> stay_pending{true};
+    std::atomic<bool> fail_polling{false};
+};
+
+TransferStatus waitForStagingTerminal(ProxyManager& manager, TaskInfo& task) {
+    TransferStatus status;
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto poll_status = manager.getStatus(&task, status);
+        if (!poll_status.ok()) {
+            ADD_FAILURE() << "getStatus failed: " << poll_status.ToString();
+            status.s = INVALID;
+            return status;
+        }
+        if (status.s != PENDING) return status;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return status;
+}
 
 std::shared_ptr<Config> makeMinimalP2PConfig() {
     auto cfg = std::make_shared<Config>();
@@ -520,6 +594,570 @@ TEST(ProgressWorker, EngineDestructorJoinsWorker) {
     // If teardown hangs or crashes here, gtest fails this test on timeout
     // / signal — no further assert needed.
     SUCCEED();
+}
+
+TEST(ProxyManager, ConcurrentFirstAllocationIsBounded) {
+    auto cfg = makeMinimalP2PConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_tcp = std::make_shared<FakeTransport>(TCP);
+    std::string seg = engine.getSegmentName();
+    ASSERT_TRUE(fake_tcp->install(seg, nullptr, nullptr).ok());
+    engine.swapTransportForTest(TCP, fake_tcp);
+
+    ProxyManager manager(&engine, 4096, 4);
+    constexpr int kCallers = 8;
+    std::atomic<int> ready{0};
+    std::atomic<int> attempted{0};
+    std::atomic<int> successful{0};
+    std::atomic<int> exhausted{0};
+    std::atomic<int> unpin_failures{0};
+    std::atomic<bool> start{false};
+    std::vector<std::thread> callers;
+    callers.reserve(kCallers);
+
+    for (int i = 0; i < kCallers; ++i) {
+        callers.emplace_back([&] {
+            ready.fetch_add(1, std::memory_order_release);
+            while (!start.load(std::memory_order_acquire))
+                std::this_thread::yield();
+
+            uint64_t addr = 0;
+            auto status = manager.pinStageBuffer(kWildcardLocation, addr);
+            if (status.ok()) {
+                successful.fetch_add(1, std::memory_order_relaxed);
+            } else if (status.IsTooManyRequests()) {
+                exhausted.fetch_add(1, std::memory_order_relaxed);
+            }
+            attempted.fetch_add(1, std::memory_order_release);
+            while (attempted.load(std::memory_order_acquire) != kCallers)
+                std::this_thread::yield();
+            if (status.ok() && !manager.unpinStageBuffer(addr).ok())
+                unpin_failures.fetch_add(1, std::memory_order_relaxed);
+        });
+    }
+
+    while (ready.load(std::memory_order_acquire) != kCallers)
+        std::this_thread::yield();
+    start.store(true, std::memory_order_release);
+    for (auto& caller : callers) caller.join();
+
+    EXPECT_EQ(successful.load(), 4);
+    EXPECT_EQ(exhausted.load(), 4);
+    EXPECT_EQ(unpin_failures.load(), 0);
+}
+
+TEST(ProxyManager, ReclaimsStageBuffersBetweenWorkerTasks) {
+    auto cfg = makeMinimalP2PConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_tcp = std::make_shared<FakeTransport>(TCP);
+    std::string seg = engine.getSegmentName();
+    ASSERT_TRUE(fake_tcp->install(seg, nullptr, nullptr).ok());
+    engine.swapTransportForTest(TCP, fake_tcp);
+
+    constexpr size_t kBufferLength = 128;
+    std::vector<uint8_t> source(kBufferLength, 0x21);
+    std::vector<uint8_t> target(kBufferLength, 0x00);
+    ASSERT_TRUE(engine.registerLocalMemory(source.data(), source.size()).ok());
+    ASSERT_TRUE(engine.registerLocalMemory(target.data(), target.size()).ok());
+
+    {
+        ProxyManager manager(&engine, 64, 2);
+        Request request;
+        request.opcode = Request::WRITE;
+        request.source = source.data();
+        request.target_id = LOCAL_SEGMENT_ID;
+        request.target_offset = reinterpret_cast<uint64_t>(target.data());
+        request.length = kBufferLength;
+        const std::vector<std::string> params = {"", kWildcardLocation, ""};
+
+        for (int i = 0; i < 8; ++i) {
+            TaskInfo task;
+            task.request = request;
+            task.staging = true;
+            Status submit_status;
+            std::thread submitter(
+                [&] { submit_status = manager.submit(&task, 0, params); });
+            submitter.join();
+            ASSERT_TRUE(submit_status.ok());
+
+            TransferStatus status;
+            const auto deadline =
+                std::chrono::steady_clock::now() + std::chrono::seconds(2);
+            while (std::chrono::steady_clock::now() < deadline) {
+                ASSERT_TRUE(manager.getStatus(&task, status).ok());
+                if (status.s != PENDING) break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            ASSERT_TRUE(manager.getStatus(&task, status).ok());
+            EXPECT_EQ(status.s, COMPLETED);
+        }
+    }
+
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(source.data(), source.size()).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(target.data(), target.size()).ok());
+}
+
+TEST(ProxyManager, DrainsInflightBatchesAfterProgressError) {
+    class FailOncePollTransport : public FakeTransport {
+       public:
+        explicit FailOncePollTransport(TransportType type)
+            : FakeTransport(type) {}
+
+        Status getTransferStatus(SubBatchRef batch, int task_id,
+                                 TransferStatus& status) override {
+            const int attempt =
+                poll_attempts.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (attempt == 1) {
+                return Status::InternalError("injected poll failure" LOC_MARK);
+            }
+            return FakeTransport::getTransferStatus(batch, task_id, status);
+        }
+
+        std::atomic<int> poll_attempts{0};
+    };
+
+    auto cfg = makeMinimalP2PConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_tcp = std::make_shared<FailOncePollTransport>(TCP);
+    std::string seg = engine.getSegmentName();
+    ASSERT_TRUE(fake_tcp->install(seg, nullptr, nullptr).ok());
+    engine.swapTransportForTest(TCP, fake_tcp);
+
+    constexpr size_t kBufferLength = 128;
+    std::vector<uint8_t> source(kBufferLength, 0x31);
+    std::vector<uint8_t> target(kBufferLength, 0x00);
+    ASSERT_TRUE(engine.registerLocalMemory(source.data(), source.size()).ok());
+    ASSERT_TRUE(engine.registerLocalMemory(target.data(), target.size()).ok());
+
+    {
+        ProxyManager manager(&engine, 64, 2);
+        Request request;
+        request.opcode = Request::WRITE;
+        request.source = source.data();
+        request.target_id = LOCAL_SEGMENT_ID;
+        request.target_offset = reinterpret_cast<uint64_t>(target.data());
+        request.length = kBufferLength;
+        const std::vector<std::string> params = {"", kWildcardLocation, ""};
+
+        TaskInfo task;
+        task.request = request;
+        task.staging = true;
+        ASSERT_TRUE(manager.submit(&task, 0, params).ok());
+
+        TransferStatus status;
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            ASSERT_TRUE(manager.getStatus(&task, status).ok());
+            if (status.s != PENDING) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        ASSERT_TRUE(manager.getStatus(&task, status).ok());
+        EXPECT_EQ(status.s, FAILED);
+        EXPECT_GE(fake_tcp->poll_attempts.load(), 3);
+
+        uint64_t first = 0;
+        uint64_t second = 0;
+        uint64_t exhausted = 0;
+        ASSERT_TRUE(manager.pinStageBuffer(kWildcardLocation, first).ok());
+        ASSERT_TRUE(manager.pinStageBuffer(kWildcardLocation, second).ok());
+        EXPECT_TRUE(manager.pinStageBuffer(kWildcardLocation, exhausted)
+                        .IsTooManyRequests());
+        EXPECT_TRUE(manager.unpinStageBuffer(first).ok());
+        EXPECT_TRUE(manager.unpinStageBuffer(second).ok());
+    }
+
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(source.data(), source.size()).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(target.data(), target.size()).ok());
+}
+
+TEST(TransferEngineImpl, DirectSubmitRejectsBatchCapacityOverflow) {
+    auto cfg = makeMinimalP2PConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_tcp = std::make_shared<FakeTransport>(TCP);
+    std::string seg = engine.getSegmentName();
+    ASSERT_TRUE(fake_tcp->install(seg, nullptr, nullptr).ok());
+    engine.swapTransportForTest(TCP, fake_tcp);
+
+    constexpr size_t kBufferLength = 128;
+    std::vector<uint8_t> buffer(kBufferLength, 0x41);
+    ASSERT_TRUE(engine.registerLocalMemory(buffer.data(), buffer.size()).ok());
+
+    BatchID batch = engine.allocateBatch(1);
+    ASSERT_NE(batch, (BatchID)0);
+    Request request;
+    request.opcode = Request::WRITE;
+    request.source = buffer.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(buffer.data());
+    request.length = buffer.size();
+
+    ASSERT_TRUE(engine.submitTransfer(batch, {request}).ok());
+    EXPECT_TRUE(engine.submitTransfer(batch, {request}).IsTooManyRequests());
+
+    EXPECT_TRUE(engine.waitTransferCompletion(batch).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(buffer.data(), buffer.size()).ok());
+}
+
+TEST(ProxyManager, CleansUpDeferredStageBuffersWhenPendingBatchCompletes) {
+    class ControlledTransport : public FakeTransport {
+       public:
+        explicit ControlledTransport(TransportType type)
+            : FakeTransport(type) {}
+
+        Status submitTransferTasks(
+            SubBatchRef batch,
+            const std::vector<Request>& request_list) override {
+            int count =
+                submit_count.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (count == 2) {
+                return Status::InternalError(
+                    "injected submit failure" LOC_MARK);
+            }
+            return FakeTransport::submitTransferTasks(batch, request_list);
+        }
+
+        Status getTransferStatus(SubBatchRef batch, int task_id,
+                                 TransferStatus& status) override {
+            if (stay_pending.load(std::memory_order_relaxed)) {
+                status.s = TransferStatusEnum::PENDING;
+                return Status::OK();
+            }
+            status.s = TransferStatusEnum::COMPLETED;
+            return Status::OK();
+        }
+
+        std::atomic<int> submit_count{0};
+        std::atomic<bool> stay_pending{true};
+    };
+
+    auto cfg = makeMinimalP2PConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_tcp = std::make_shared<ControlledTransport>(TCP);
+    std::string seg = engine.getSegmentName();
+    ASSERT_TRUE(fake_tcp->install(seg, nullptr, nullptr).ok());
+    engine.swapTransportForTest(TCP, fake_tcp);
+
+    constexpr size_t kBufferLength = 128;
+    std::vector<uint8_t> source(kBufferLength, 0x51);
+    std::vector<uint8_t> target(kBufferLength, 0x00);
+    ASSERT_TRUE(engine.registerLocalMemory(source.data(), source.size()).ok());
+    ASSERT_TRUE(engine.registerLocalMemory(target.data(), target.size()).ok());
+
+    {
+        ProxyManager manager(&engine, 64, 2);
+        Request request;
+        request.opcode = Request::WRITE;
+        request.source = source.data();
+        request.target_id = LOCAL_SEGMENT_ID;
+        request.target_offset = reinterpret_cast<uint64_t>(target.data());
+        request.length = kBufferLength;
+        const std::vector<std::string> params = {"", kWildcardLocation, ""};
+
+        TaskInfo task1;
+        task1.request = request;
+        task1.staging = true;
+        ASSERT_TRUE(manager.submit(&task1, 0, params).ok());
+
+        TransferStatus status;
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            ASSERT_TRUE(manager.getStatus(&task1, status).ok());
+            if (status.s != PENDING) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        ASSERT_TRUE(manager.getStatus(&task1, status).ok());
+        EXPECT_EQ(status.s, FAILED);
+
+        // While task1's batch is still PENDING, its stage buffer remains
+        // deferred and pinned.
+        uint64_t addr = 0;
+        EXPECT_TRUE(manager.pinStageBuffer(kWildcardLocation, addr)
+                        .IsTooManyRequests());
+
+        // Allow in-flight batches to complete.
+        fake_tcp->stay_pending.store(false, std::memory_order_relaxed);
+
+        // Submit task2 to trigger flushPendingCleanups() in worker thread.
+        TaskInfo task2;
+        task2.request = request;
+        task2.request.length =
+            64;  // 1 chunk so submitSubBatch count 3 succeeds
+        task2.staging = true;
+        ASSERT_TRUE(manager.submit(&task2, 0, params).ok());
+
+        const auto deadline2 =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline2) {
+            ASSERT_TRUE(manager.getStatus(&task2, status).ok());
+            if (status.s != PENDING) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        ASSERT_TRUE(manager.getStatus(&task2, status).ok());
+
+        // Now deferred stage buffers from task1 have been reclaimed!
+        ASSERT_TRUE(manager.pinStageBuffer(kWildcardLocation, addr).ok());
+        EXPECT_TRUE(manager.unpinStageBuffer(addr).ok());
+    }
+
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(source.data(), source.size()).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(target.data(), target.size()).ok());
+}
+
+TEST(ProxyManager, RetainsBatchToPreventSlabReuseLeak) {
+    class ControlledTransport : public FakeTransport {
+       public:
+        explicit ControlledTransport(TransportType type)
+            : FakeTransport(type) {}
+
+        Status submitTransferTasks(
+            SubBatchRef batch,
+            const std::vector<Request>& request_list) override {
+            int count =
+                submit_count.fetch_add(1, std::memory_order_relaxed) + 1;
+            if (count == 2) {
+                return Status::InternalError(
+                    "injected submit failure" LOC_MARK);
+            }
+            return FakeTransport::submitTransferTasks(batch, request_list);
+        }
+
+        Status getTransferStatus(SubBatchRef batch, int task_id,
+                                 TransferStatus& status) override {
+            if (stay_pending.load(std::memory_order_relaxed)) {
+                status.s = TransferStatusEnum::PENDING;
+                return Status::OK();
+            }
+            status.s = TransferStatusEnum::COMPLETED;
+            return Status::OK();
+        }
+
+        std::atomic<int> submit_count{0};
+        std::atomic<bool> stay_pending{true};
+    };
+
+    auto cfg = makeMinimalP2PConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_tcp = std::make_shared<ControlledTransport>(TCP);
+    std::string seg = engine.getSegmentName();
+    ASSERT_TRUE(fake_tcp->install(seg, nullptr, nullptr).ok());
+    engine.swapTransportForTest(TCP, fake_tcp);
+
+    constexpr size_t kBufferLength = 128;
+    std::vector<uint8_t> source(kBufferLength, 0x61);
+    std::vector<uint8_t> target(kBufferLength, 0x00);
+    ASSERT_TRUE(engine.registerLocalMemory(source.data(), source.size()).ok());
+    ASSERT_TRUE(engine.registerLocalMemory(target.data(), target.size()).ok());
+
+    {
+        ProxyManager manager(&engine, 64, 2);
+        Request request;
+        request.opcode = Request::WRITE;
+        request.source = source.data();
+        request.target_id = LOCAL_SEGMENT_ID;
+        request.target_offset = reinterpret_cast<uint64_t>(target.data());
+        request.length = kBufferLength;
+        const std::vector<std::string> params = {"", kWildcardLocation, ""};
+
+        TaskInfo task1;
+        task1.request = request;
+        task1.staging = true;
+        ASSERT_TRUE(manager.submit(&task1, 0, params).ok());
+
+        TransferStatus status;
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            ASSERT_TRUE(manager.getStatus(&task1, status).ok());
+            if (status.s != PENDING) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        ASSERT_TRUE(manager.getStatus(&task1, status).ok());
+        EXPECT_EQ(status.s, FAILED);
+
+        // Allow task1 in-flight batch to finish on transport
+        fake_tcp->stay_pending.store(false, std::memory_order_relaxed);
+
+        // Attempting to allocate a new batch should not collide with retained
+        // batch
+        BatchID new_batch = engine.allocateBatch(1);
+        ASSERT_NE(new_batch, (BatchID)0);
+
+        // Submit task2 to trigger flushPendingCleanups()
+        TaskInfo task2;
+        task2.request = request;
+        task2.request.length = 64;
+        task2.staging = true;
+        ASSERT_TRUE(manager.submit(&task2, 0, params).ok());
+
+        const auto deadline2 =
+            std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline2) {
+            ASSERT_TRUE(manager.getStatus(&task2, status).ok());
+            if (status.s != PENDING) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
+        // Verify task1 stage buffers were successfully reclaimed after retained
+        // batch completed
+        uint64_t addr = 0;
+        ASSERT_TRUE(manager.pinStageBuffer(kWildcardLocation, addr).ok());
+        EXPECT_TRUE(manager.unpinStageBuffer(addr).ok());
+
+        engine.freeBatch(new_batch);
+    }
+
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(source.data(), source.size()).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(target.data(), target.size()).ok());
+}
+
+TEST(ProxyManager, DeferredCleanupPollErrorKeepsStageBuffersPinned) {
+    auto cfg = makeMinimalP2PConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_tcp = std::make_shared<DeferredCleanupProbeTransport>();
+    std::string seg = engine.getSegmentName();
+    ASSERT_TRUE(fake_tcp->install(seg, nullptr, nullptr).ok());
+    engine.swapTransportForTest(TCP, fake_tcp);
+
+    constexpr size_t kBufferLength = 128;
+    std::vector<uint8_t> source(kBufferLength, 0x71);
+    std::vector<uint8_t> target(kBufferLength, 0x00);
+    ASSERT_TRUE(engine.registerLocalMemory(source.data(), source.size()).ok());
+    ASSERT_TRUE(engine.registerLocalMemory(target.data(), target.size()).ok());
+
+    {
+        ProxyManager manager(&engine, 64, 2);
+        Request request;
+        request.opcode = Request::WRITE;
+        request.source = source.data();
+        request.target_id = LOCAL_SEGMENT_ID;
+        request.target_offset = reinterpret_cast<uint64_t>(target.data());
+        request.length = kBufferLength;
+        const std::vector<std::string> params = {"", kWildcardLocation, ""};
+
+        TaskInfo task;
+        task.request = request;
+        task.staging = true;
+        ASSERT_TRUE(manager.submit(&task, 0, params).ok());
+        ASSERT_EQ(waitForStagingTerminal(manager, task).s, FAILED);
+
+        fake_tcp->fail_polling.store(true, std::memory_order_release);
+        uint64_t addr = 0;
+        auto pin_status = manager.pinStageBuffer(kWildcardLocation, addr);
+        EXPECT_TRUE(pin_status.IsTooManyRequests())
+            << "a polling error must not release an in-flight stage buffer: "
+            << pin_status.ToString();
+        if (pin_status.ok()) {
+            EXPECT_TRUE(manager.unpinStageBuffer(addr).ok());
+        }
+
+        fake_tcp->fail_polling.store(false, std::memory_order_release);
+        fake_tcp->stay_pending.store(false, std::memory_order_release);
+        ASSERT_TRUE(manager.pinStageBuffer(kWildcardLocation, addr).ok());
+        EXPECT_TRUE(manager.unpinStageBuffer(addr).ok());
+    }
+
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(source.data(), source.size()).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(target.data(), target.size()).ok());
+}
+
+TEST(ProxyManager, RemoteCleanupProbeDoesNotBlockOnPendingOperation) {
+    auto operation = std::make_shared<internal::RemoteStageOperation>();
+    std::vector<internal::RemoteStageOperationPtr> remote_operations = {
+        operation};
+
+    EXPECT_FALSE(internal::pollRemoteOperations(remote_operations));
+    ASSERT_EQ(remote_operations.size(), 1);
+
+    operation->complete(Status::OK());
+    EXPECT_TRUE(internal::pollRemoteOperations(remote_operations));
+    EXPECT_TRUE(remote_operations.empty());
+}
+
+TEST(ProxyManager, DestructorWaitsForDeferredBatchBeforeFreeingStageMemory) {
+    auto cfg = makeMinimalP2PConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_tcp = std::make_shared<DeferredCleanupProbeTransport>();
+    std::string seg = engine.getSegmentName();
+    ASSERT_TRUE(fake_tcp->install(seg, nullptr, nullptr).ok());
+    engine.swapTransportForTest(TCP, fake_tcp);
+
+    constexpr size_t kBufferLength = 128;
+    std::vector<uint8_t> source(kBufferLength, 0x81);
+    std::vector<uint8_t> target(kBufferLength, 0x00);
+    ASSERT_TRUE(engine.registerLocalMemory(source.data(), source.size()).ok());
+    ASSERT_TRUE(engine.registerLocalMemory(target.data(), target.size()).ok());
+
+    auto manager = std::make_unique<ProxyManager>(&engine, 64, 2);
+    Request request;
+    request.opcode = Request::WRITE;
+    request.source = source.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = reinterpret_cast<uint64_t>(target.data());
+    request.length = kBufferLength;
+    const std::vector<std::string> params = {"", kWildcardLocation, ""};
+
+    TaskInfo task;
+    task.request = request;
+    task.staging = true;
+    ASSERT_TRUE(manager->submit(&task, 0, params).ok());
+    ASSERT_EQ(waitForStagingTerminal(*manager, task).s, FAILED);
+
+    std::atomic<bool> destroyed{false};
+    std::thread destroyer([&] {
+        manager.reset();
+        destroyed.store(true, std::memory_order_release);
+    });
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    EXPECT_FALSE(destroyed.load(std::memory_order_acquire));
+    EXPECT_EQ(fake_tcp->free_local_memory_calls.load(std::memory_order_acquire),
+              0);
+    EXPECT_EQ(fake_tcp->free_local_memory_while_pending.load(
+                  std::memory_order_acquire),
+              0);
+
+    fake_tcp->stay_pending.store(false, std::memory_order_release);
+    destroyer.join();
+    EXPECT_TRUE(destroyed.load(std::memory_order_acquire));
+    EXPECT_GT(fake_tcp->free_local_memory_calls.load(std::memory_order_acquire),
+              0);
+    EXPECT_EQ(fake_tcp->free_local_memory_while_pending.load(
+                  std::memory_order_acquire),
+              0);
+
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(source.data(), source.size()).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(target.data(), target.size()).ok());
 }
 
 }  // namespace

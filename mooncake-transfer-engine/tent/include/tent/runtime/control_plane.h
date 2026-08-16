@@ -97,6 +97,11 @@ class ControlClient {
     static Status delegate(const std::string& server_addr,
                            const Request& request);
 
+    using DelegateCallback = std::function<void(Status)>;
+    static void delegateAsync(const std::string& server_addr,
+                              const Request& request,
+                              DelegateCallback callback);
+
     static Status pinStageBuffer(const std::string& server_addr,
                                  const std::string& location, uint64_t& addr);
 

@@ -155,6 +155,25 @@ Status ControlClient::delegate(const std::string& server_addr,
                                 : Status::RpcServiceError(response_raw);
 }
 
+void ControlClient::delegateAsync(const std::string& server_addr,
+                                  const Request& request,
+                                  DelegateCallback callback) {
+    json j = request;
+    std::string request_raw = j.dump();
+    tl_rpc_agent.callAsync(
+        server_addr, Delegate, request_raw,
+        [callback = std::move(callback)](Status status,
+                                         std::string response_raw) mutable {
+            if (!status.ok()) {
+                callback(std::move(status));
+                return;
+            }
+            callback(response_raw.empty()
+                         ? Status::OK()
+                         : Status::RpcServiceError(response_raw));
+        });
+}
+
 Status ControlClient::pinStageBuffer(const std::string& server_addr,
                                      const std::string& location,
                                      uint64_t& addr) {
