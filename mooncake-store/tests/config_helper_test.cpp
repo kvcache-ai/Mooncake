@@ -8,14 +8,13 @@
 namespace mooncake::test {
 namespace {
 
-void ExpectUnsetErrorNames(const RequiredParam<int>& param,
-                           const std::string& name) {
+void ExpectUnsetError(const RequiredParam<int>& param,
+                      const std::string& expected_message) {
     try {
         (void)param.Get();
         FAIL() << "Expected an unset RequiredParam to throw";
     } catch (const std::runtime_error& error) {
-        EXPECT_NE(std::string(error.what()).find(name), std::string::npos)
-            << error.what();
+        EXPECT_EQ(std::string(error.what()), expected_message);
     }
 }
 
@@ -28,7 +27,7 @@ TEST(ConfigHelperTest, CopyAssignmentPreservesParameterName) {
 
     EXPECT_EQ(copy.Get(), 42);
     copy.Clear();
-    ExpectUnsetErrorNames(copy, "metrics_port");
+    ExpectUnsetError(copy, "Required parameter metrics_port has not been set");
 }
 
 TEST(ConfigHelperTest, CopyConstructionPreservesParameterName) {
@@ -42,7 +41,19 @@ TEST(ConfigHelperTest, CopyConstructionPreservesParameterName) {
 
     EXPECT_EQ(observable.Get(), 42);
     observable.Clear();
-    ExpectUnsetErrorNames(observable, "metrics_port");
+    ExpectUnsetError(observable,
+                     "Required parameter metrics_port has not been set");
+}
+
+TEST(ConfigHelperTest, CopyUnsetPreservesNullName) {
+    RequiredParam<int> source;
+    RequiredParam<int> copy(source);
+    RequiredParam<int> assigned("old_name");
+
+    assigned = source;
+
+    ExpectUnsetError(copy, "Required parameter has not been set");
+    ExpectUnsetError(assigned, "Required parameter has not been set");
 }
 
 }  // namespace
