@@ -139,6 +139,13 @@ target_include_directories(request_merge_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME request_merge_test COMMAND request_merge_test)
 
+add_executable(local_notification_test local_notification_test.cpp)
+target_link_libraries(local_notification_test
+                      PRIVATE gtest gtest_main tent_link_group)
+target_include_directories(local_notification_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME local_notification_test COMMAND local_notification_test)
+
 add_executable(transfer_engine_config_override_test
                transfer_engine_config_override_test.cpp)
 target_link_libraries(transfer_engine_config_override_test
