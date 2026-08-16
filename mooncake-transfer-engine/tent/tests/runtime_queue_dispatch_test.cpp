@@ -293,7 +293,15 @@ TEST(RuntimeQueueDispatch, DispatchesOnlyOneWindowOnSubmit) {
     TransferEngineImpl engine(cfg);
     ASSERT_TRUE(engine.available());
 
-    auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
+    std::atomic<bool> complete_first{false};
+    auto fake_rdma = std::make_shared<FakeTransport>(
+        RDMA, [&complete_first](const Request& request, int) {
+            if (!complete_first.load()) {
+                return TransferStatus{TransferStatusEnum::PENDING, 0};
+            }
+            return TransferStatus{TransferStatusEnum::COMPLETED,
+                                  request.length};
+        });
     installFakeRdma(engine, fake_rdma);
 
     constexpr size_t kReqLen = 4096;
@@ -310,6 +318,8 @@ TEST(RuntimeQueueDispatch, DispatchesOnlyOneWindowOnSubmit) {
                              makeLocalWrite(buffer.data() + kReqLen, kReqLen)})
             .ok());
     EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
+
+    complete_first.store(true);
 
     TransferStatus first{};
     ASSERT_TRUE(engine.getTransferStatus(batch, 0, first).ok());
@@ -432,8 +442,8 @@ TEST(RuntimeQueueDispatch, CancelsDispatchedRdmaTaskIdempotently) {
     TransferEngineImpl engine(cfg);
     ASSERT_TRUE(engine.available());
 
-    auto fake_rdma = std::make_shared<FakeTransport>(
-        RDMA, [](const Request&, int) {
+    auto fake_rdma =
+        std::make_shared<FakeTransport>(RDMA, [](const Request&, int) {
             return TransferStatus{TransferStatusEnum::PENDING, 0};
         });
     installFakeRdma(engine, fake_rdma);
