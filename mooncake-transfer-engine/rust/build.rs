@@ -13,43 +13,84 @@
 // limitations under the License.
 
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-fn main() {
-    println!("cargo:rustc-link-search=native=../build/src");
-    println!("cargo:rustc-link-search=native=../../build/mooncake-transfer-engine/src");
-    println!("cargo:rustc-link-lib=static=transfer_engine");
-
-    // libbase.a holds mooncake::Status, which libtransfer_engine.a references.
-    println!("cargo:rustc-link-search=native=../build/src/common/base");
-    println!("cargo:rustc-link-search=native=../../build/mooncake-transfer-engine/src/common/base");
-    println!("cargo:rustc-link-lib=static=base");
-
-    // The transfer_engine build uses ASIO_SEPARATE_COMPILATION + ASIO_DYN_LINK,
-    // so the asio symbols live in mooncake-asio/libasio.so.  Link it whenever
-    // we can find it (standalone cmake build places it alongside src/).
-    println!("cargo:rustc-link-search=native=../build/mooncake-asio");
-    println!("cargo:rustc-link-search=native=../../build/mooncake-asio");
-    println!("cargo:rustc-link-lib=asio");
-
-    // EFA on AWS installs libfabric under /opt/amazon/efa/lib.
-    if std::path::Path::new("/opt/amazon/efa/lib").exists() {
-        println!("cargo:rustc-link-search=native=/opt/amazon/efa/lib");
-    }
-
-    println!("cargo:rustc-link-lib=stdc++");
-    println!("cargo:rustc-link-lib=ibverbs");
-    // libfabric (fi_*): only needed for EFA transport, but harmless when
-    // the system has it installed; required on AWS EFA hosts.  Opt-out by
-    // setting MOONCAKE_WITHOUT_LIBFABRIC=1 if building on a box without it.
-    if env::var("MOONCAKE_WITHOUT_LIBFABRIC")
+fn flag_on(name: &str) -> bool {
+    env::var(name)
         .map(|v| v == "1" || v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false)
-    {
-        // skip
-    } else {
-        println!("cargo:rustc-link-lib=fabric");
+}
+
+fn push_dir(dirs: &mut Vec<PathBuf>, dir: PathBuf) {
+    if dir.is_dir() && !dirs.iter().any(|existing| existing == &dir) {
+        dirs.push(dir);
     }
+}
+
+fn emit_link_searches(dirs: &[PathBuf]) {
+    for dir in dirs {
+        println!("cargo:rustc-link-search=native={}", dir.display());
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", dir.display());
+    }
+}
+
+fn main() {
+    println!("cargo:rerun-if-env-changed=MOONCAKE_BUILD_DIR");
+    println!("cargo:rerun-if-env-changed=MOONCAKE_TE_LIB_DIR");
+    println!("cargo:rerun-if-env-changed=MOONCAKE_TE_INCLUDE_DIR");
+    println!("cargo:rerun-if-env-changed=MOONCAKE_WITH_ETCD");
+    println!("cargo:rerun-if-env-changed=MOONCAKE_WITH_CUDA");
+    println!("cargo:rerun-if-env-changed=MOONCAKE_WITHOUT_LIBFABRIC");
+    println!("cargo:rerun-if-env-changed=CUDA_HOME");
+    println!("cargo:rerun-if-env-changed=CUDART_LIB_DIR");
+
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let mut search_dirs = Vec::new();
+
+    if let Ok(dir) = env::var("MOONCAKE_TE_LIB_DIR") {
+        push_dir(&mut search_dirs, PathBuf::from(dir));
+    }
+
+    if let Ok(build_dir) = env::var("MOONCAKE_BUILD_DIR") {
+        let build_dir = PathBuf::from(build_dir);
+        for dir in [
+            build_dir.join("mooncake-transfer-engine/src"),
+            build_dir.join("mooncake-transfer-engine/src/common/base"),
+            build_dir.join("mooncake-asio"),
+            build_dir.join("mooncake-common"),
+            build_dir.join("mooncake-common/src"),
+            build_dir.join("src"),
+            build_dir.join("src/common/base"),
+        ] {
+            push_dir(&mut search_dirs, dir);
+        }
+    }
+
+    // Standalone cargo from mooncake-transfer-engine/rust, after a top-level
+    // or in-tree CMake build.
+    for dir in [
+        manifest_dir.join("../build/src"),
+        manifest_dir.join("../build/src/common/base"),
+        manifest_dir.join("../build/mooncake-asio"),
+        manifest_dir.join("../../build/mooncake-transfer-engine/src"),
+        manifest_dir.join("../../build/mooncake-transfer-engine/src/common/base"),
+        manifest_dir.join("../../build/mooncake-asio"),
+        manifest_dir.join("../../build/mooncake-common"),
+    ] {
+        push_dir(&mut search_dirs, dir);
+    }
+
+    if Path::new("/opt/amazon/efa/lib").exists() {
+        push_dir(&mut search_dirs, PathBuf::from("/opt/amazon/efa/lib"));
+    }
+
+    emit_link_searches(&search_dirs);
+
+    println!("cargo:rustc-link-lib=static=transfer_engine");
+    println!("cargo:rustc-link-lib=static=base");
+    println!("cargo:rustc-link-lib=asio");
+    println!("cargo:rustc-link-lib=stdc++");
+    println!("cargo:rustc-link-lib=ibverbs");
     println!("cargo:rustc-link-lib=glog");
     println!("cargo:rustc-link-lib=gflags");
     println!("cargo:rustc-link-lib=pthread");
@@ -57,30 +98,17 @@ fn main() {
     println!("cargo:rustc-link-lib=numa");
     println!("cargo:rustc-link-lib=curl");
 
-    let flag_on = |name: &str| {
-        env::var(name)
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("on") || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false)
-    };
+    if !flag_on("MOONCAKE_WITHOUT_LIBFABRIC") {
+        println!("cargo:rustc-link-lib=fabric");
+    }
 
-    // etcd-cpp-api: only needed when transfer_engine was built with
-    // USE_ETCD=ON.  Opt-in via MOONCAKE_WITH_ETCD=1 to keep non-etcd builds
-    // (e.g. EFA-only on AWS) linkable.
     if flag_on("MOONCAKE_WITH_ETCD") {
         println!("cargo:rustc-link-lib=etcd-cpp-api");
     }
 
-    // CUDA runtime: libtransfer_engine.a built with USE_CUDA=ON pulls in
-    // cudaMemcpy/cudaStream* symbols.  The Rust demos themselves don't call
-    // CUDA — this is purely a transitive archive dep.  Enable with
-    // MOONCAKE_WITH_CUDA=1 and optional CUDA_HOME override for lib path.
     if flag_on("MOONCAKE_WITH_CUDA") {
-        // Accept either a CUDA_HOME (append lib64/lib) or an explicit
-        // CUDART_LIB_DIR that already points at the directory containing
-        // libcudart.so.  This covers both /usr/local/cuda installs and
-        // pip-wheel layouts like .../nvidia/cu13/lib.
         if let Ok(dir) = env::var("CUDART_LIB_DIR") {
-            println!("cargo:rustc-link-search=native={}", dir);
+            println!("cargo:rustc-link-search=native={dir}");
         } else if let Ok(cuda_home) = env::var("CUDA_HOME") {
             let lib64 = PathBuf::from(&cuda_home).join("lib64");
             let lib = PathBuf::from(&cuda_home).join("lib");
@@ -96,13 +124,22 @@ fn main() {
         println!("cargo:rustc-link-lib=cudart");
     }
 
-    let bindings = bindgen::builder()
-        .header("../include/transfer_engine_c.h")
+    let include_dir = env::var("MOONCAKE_TE_INCLUDE_DIR").unwrap_or_else(|_| {
+        manifest_dir
+            .join("../include")
+            .to_string_lossy()
+            .into_owned()
+    });
+    let header = format!("{include_dir}/transfer_engine_c.h");
+    println!("cargo:rerun-if-changed={header}");
+
+    let bindings = bindgen::Builder::default()
+        .header(&header)
         .generate()
-        .expect("Unable to generate bindings");
+        .expect("Unable to generate Transfer Engine bindings");
 
     let out_path = PathBuf::from(env::var("OUT_DIR").unwrap());
     bindings
         .write_to_file(out_path.join("bindings.rs"))
-        .expect("Couldn't write bindings!");
+        .expect("Couldn't write bindings");
 }
