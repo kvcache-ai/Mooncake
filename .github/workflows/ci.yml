@@ -262,9 +262,6 @@ jobs:
         df -h
       shell: bash
 
-    - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
-
     - name: Build transfer engine only
       run: |
         cd mooncake-transfer-engine
