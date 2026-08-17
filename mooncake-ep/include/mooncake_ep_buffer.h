@@ -92,8 +92,9 @@ struct MooncakeEpBuffer {
     bool p2p_enabled_ = true;
 
     int USE_QP_COUNT = MAX_QP_COUNT;
-    // Active CUDA RoCE QP cap per peer. MUSA always uses one active QP until
-    // its independent per-QP staging protocol is implemented.
+    // Active RoCE QPs per peer. The platform-specific default is selected in
+    // active_qps_per_rank_for_ep(); a positive
+    // MOONCAKE_EP_ACTIVE_QPS_PER_RANK value forces an explicit count.
     int active_qps_cap_ = 0;
 
     // Stream for communication
