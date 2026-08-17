@@ -138,6 +138,10 @@ MASTER_PID=$!
 sleep 1
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_distributed_object_store.py
 MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_replicated_distributed_object_store.py
+
+pip install torch numpy safetensors packaging
+MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_put_get_tensor.py
+MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_safetensor_functions.py
 sleep 1
 mooncake_client &
 CLIENT_PID=$!
@@ -149,10 +153,6 @@ MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 pytho
 DUMMY_TEST_PID_2=$!
 wait $DUMMY_TEST_PID_1 $DUMMY_TEST_PID_2
 kill $CLIENT_PID || true
-
-pip install torch numpy safetensors packaging
-MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_put_get_tensor.py
-MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_safetensor_functions.py
 kill $MASTER_PID || true
 wait $MASTER_PID 2>/dev/null || true
 
