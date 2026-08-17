@@ -113,10 +113,10 @@ class NcclBufferRegistration {
 class NcclDeviceContext {
    public:
     // ncclDevComm is embedded so kernels read its hot fields from parameter
-    // memory instead of chasing a global-memory pointer. The exact-size check
-    // in nccl_device.cuh intentionally forces an update/rebuild if NCCL changes
-    // this version-specific layout.
-    static constexpr size_t kNativeCommBytes = 240;
+    // memory instead of chasing a global-memory pointer. Keep a small amount of
+    // headroom because the version-specific NCCL structure can grow between
+    // releases; nccl_device.cuh verifies that the headers in use still fit.
+    static constexpr size_t kNativeCommCapacity = 256;
     static constexpr size_t kNativeCommAlignment = 8;
 
     bool valid() const { return native_comm_ != nullptr; }
@@ -124,7 +124,7 @@ class NcclDeviceContext {
    private:
     const void* native_comm_ = nullptr;
     alignas(kNativeCommAlignment) unsigned char native_comm_storage_
-        [kNativeCommBytes]{};
+        [kNativeCommCapacity]{};
     const void* native_window_ = nullptr;
     const void* local_base_ = nullptr;
     int rank_ = -1;
