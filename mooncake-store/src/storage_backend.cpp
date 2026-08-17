@@ -2870,12 +2870,36 @@ int64_t BucketStorageBackend::ActualDiskBytesUsedLocked() const {
     }
     int64_t total = 0;
     std::error_code ec;
-    for (fs::directory_iterator it(storage_path_, ec), end;
-         !ec && it != end; it.increment(ec)) {
+    // Recursive scan: matches Init()'s recursive_directory_iterator and the
+    // du/kubelet accounting basis (the whole subtree, not just top-level
+    // entries), so nested content can never be silently missed.
+    fs::recursive_directory_iterator it(storage_path_, ec), end;
+    if (ec) {
+        // Cannot even open storage_path_. This is a hard safety cap, so fail
+        // CLOSED: report the cap as reached so eviction/rejection engages
+        // instead of letting the disk overflow, and do NOT cache the result
+        // (next call re-scans once the directory is readable again).
+        LOG(WARNING) << "[Bucket] physcap disk scan could not open "
+                     << storage_path_ << ": " << ec.message()
+                     << ", failing closed";
+        return bucket_backend_config_.max_physical_bytes;
+    }
+    for (; it != end; it.increment(ec)) {
+        if (ec) {
+            // Iteration errored partway. Returning the partial total would
+            // under-count and silently open the cap; fail closed and skip
+            // caching so the next call re-scans.
+            LOG(WARNING) << "[Bucket] physcap disk scan error under "
+                         << storage_path_ << ": " << ec.message()
+                         << ", failing closed";
+            return bucket_backend_config_.max_physical_bytes;
+        }
         struct stat st;
         // st_blocks counts 512-byte blocks actually allocated on disk — the
         // same basis as du / kubelet's emptyDir accounting (handles block
-        // rounding; ignores apparent size). Failures are skipped (best effort).
+        // rounding; ignores apparent size). A per-entry stat failure (e.g. a
+        // file concurrently deleted during eviction) is skipped best-effort:
+        // that only under-counts by ~one file and avoids spurious fail-closed.
         if (::stat(it->path().c_str(), &st) == 0) {
             total += static_cast<int64_t>(st.st_blocks) * 512;
         }
