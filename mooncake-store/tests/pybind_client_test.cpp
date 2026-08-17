@@ -22,6 +22,7 @@
 #endif
 
 #include "real_client.h"
+#include "config.h"
 #include "test_server_helpers.h"
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
@@ -61,6 +62,19 @@ class ScopedEnvVar {
    private:
     std::string name_;
     std::optional<std::string> previous_;
+};
+
+class ScopedMaxMrSize {
+   public:
+    explicit ScopedMaxMrSize(size_t max_mr_size)
+        : old_max_mr_size_(globalConfig().max_mr_size) {
+        globalConfig().max_mr_size = max_mr_size;
+    }
+
+    ~ScopedMaxMrSize() { globalConfig().max_mr_size = old_max_mr_size_; }
+
+   private:
+    size_t old_max_mr_size_;
 };
 
 class RealClientTest : public ::testing::Test {
@@ -277,6 +291,59 @@ TEST_F(RealClientTest, AllocateAndMountSegmentAlignsAndUnmounts) {
     EXPECT_EQ(allocated_size, slab_size * 2);
     ASSERT_FALSE(segment_ids.empty());
     EXPECT_EQ(py_client_->unmountAndFreeSegment(segment_ids), 0);
+}
+
+TEST_F(RealClientTest, TcpSetupDoesNotSplitAtMaxMrSize) {
+    const size_t slab_size = facebook::cachelib::Slab::kSize;
+    ScopedMaxMrSize limit(2 * slab_size);
+
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(
+        py_client_->setup_real("localhost:17814", "P2PHANDSHAKE", 6 * slab_size,
+                               0, "tcp", "", master_address_),
+        0);
+
+    auto details = master_.service()->GetSegmentsDetailForAdmin();
+    ASSERT_TRUE(details.has_value());
+    ASSERT_EQ(details->size(), 1u);
+    EXPECT_EQ(details->front().size_bytes, 6 * slab_size);
+}
+
+TEST_F(RealClientTest, DynamicMountApisBalanceLimitedSegments) {
+    const size_t slab_size = facebook::cachelib::Slab::kSize;
+    ScopedMaxMrSize limit(4 * slab_size);
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(py_client_->setup_real("localhost:17815", "P2PHANDSHAKE", 0, 0,
+                                     "tcp", "", master_address_),
+              0);
+
+    std::vector<std::string> allocated_ids;
+    size_t allocated_size = 0;
+    ASSERT_EQ(py_client_->allocateAndMountSegment(
+                  6 * slab_size, "rdma", "", allocated_ids, &allocated_size),
+              0);
+    ASSERT_EQ(allocated_ids.size(), 2u);
+
+    const std::string path = CreateTempSegmentFile(6 * slab_size);
+    ASSERT_FALSE(path.empty());
+    std::vector<std::string> mounted_ids;
+    ASSERT_EQ(py_client_->mountSegment(path, 0, 6 * slab_size, "rdma", "",
+                                       mounted_ids),
+              0);
+    ASSERT_EQ(mounted_ids.size(), 2u);
+
+    auto details = master_.service()->GetSegmentsDetailForAdmin();
+    ASSERT_TRUE(details.has_value());
+    ASSERT_EQ(details->size(), 4u);
+    for (const auto& detail : *details) {
+        EXPECT_EQ(detail.size_bytes, 3 * slab_size);
+    }
+
+    EXPECT_EQ(py_client_->unmountAndFreeSegment(allocated_ids), 0);
+    EXPECT_EQ(py_client_->unmountSegment(mounted_ids), 0);
+    EXPECT_EQ(std::remove(path.c_str()), 0);
 }
 
 TEST_F(RealClientTest, AllocateAndMountSegmentRejectsOverflowSize) {
