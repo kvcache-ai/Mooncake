@@ -191,8 +191,8 @@ int processBatchSizes(
                                "operation payload size");
                 const uint64_t batch_bytes = bytes;
                 if (write_seed) {
-                    memset((void*)local_addr, stableDataSeed(target_addr),
-                           bytes);
+                    fillData((void*)local_addr, bytes,
+                             stableDataSeed(target_addr));
                 }
                 paceRequest();
                 auto val = runner.runSingleTransfer(

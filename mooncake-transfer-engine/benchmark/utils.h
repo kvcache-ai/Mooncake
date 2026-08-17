@@ -237,32 +237,36 @@ static inline bool isGpuMemory(void* ptr) {
     return false;
 }
 
-static inline uint8_t fillData(void* addr, size_t length) {
-    uint8_t seed = (uint8_t)SimpleRandom::Get().next(256);
+static inline void fillData(void* addr, size_t length, uint8_t seed) {
 #if defined(USE_CUDA)
     if (isCudaMemory(addr)) {
-        std::vector<uint8_t> ref_data(length, seed);
-        cudaMemcpy(addr, ref_data.data(), length, cudaMemcpyDefault);
-        return seed;
+        auto err = cudaMemset(addr, seed, length);
+        LOG_ASSERT(err == cudaSuccess)
+            << "cudaMemset failed: " << cudaGetErrorString(err);
+        return;
     }
 #elif defined(USE_SUNRISE)
     if (isCudaMemory(addr)) {
-        std::vector<uint8_t> ref_data(length, seed);
-        auto err =
-            cudaMemcpy(addr, ref_data.data(), length, cudaMemcpyHostToDevice);
+        auto err = cudaMemset(addr, seed, length);
         LOG_ASSERT(err == cudaSuccess)
-            << "cudaMemcpy failed: " << cudaGetErrorString(err);
-        return seed;
+            << "cudaMemset failed: " << cudaGetErrorString(err);
+        return;
     }
 #endif
 #ifdef USE_HIP
     if (isHipMemory(addr)) {
-        std::vector<uint8_t> ref_data(length, seed);
-        hipMemcpy(addr, ref_data.data(), length, hipMemcpyDefault);
-        return seed;
+        auto err = hipMemset(addr, seed, length);
+        LOG_ASSERT(err == hipSuccess)
+            << "hipMemset failed: " << hipGetErrorString(err);
+        return;
     }
 #endif
     memset(addr, seed, length);
+}
+
+static inline uint8_t fillData(void* addr, size_t length) {
+    uint8_t seed = (uint8_t)SimpleRandom::Get().next(256);
+    fillData(addr, length, seed);
     return seed;
 }
 
