@@ -2,8 +2,11 @@
 # Consumer directories only link the resulting Mooncake::* targets.
 
 function(mooncake_provide_zstd)
-  find_path(MOONCAKE_ZSTD_INCLUDE_DIR zstd.h REQUIRED)
-  find_library(MOONCAKE_ZSTD_LIBRARY zstd REQUIRED)
+  find_path(MOONCAKE_ZSTD_INCLUDE_DIR zstd.h)
+  find_library(MOONCAKE_ZSTD_LIBRARY zstd)
+  if(NOT MOONCAKE_ZSTD_INCLUDE_DIR OR NOT MOONCAKE_ZSTD_LIBRARY)
+    message(FATAL_ERROR "zstd development files not found")
+  endif()
   add_library(Mooncake::zstd UNKNOWN IMPORTED)
   set_target_properties(
     Mooncake::zstd
@@ -12,8 +15,11 @@ function(mooncake_provide_zstd)
 endfunction()
 
 function(mooncake_provide_xxhash)
-  find_path(MOONCAKE_XXHASH_INCLUDE_DIR xxhash.h REQUIRED)
-  find_library(MOONCAKE_XXHASH_LIBRARY NAMES xxhash libxxhash REQUIRED)
+  find_path(MOONCAKE_XXHASH_INCLUDE_DIR xxhash.h)
+  find_library(MOONCAKE_XXHASH_LIBRARY NAMES xxhash libxxhash)
+  if(NOT MOONCAKE_XXHASH_INCLUDE_DIR OR NOT MOONCAKE_XXHASH_LIBRARY)
+    message(FATAL_ERROR "xxHash development files not found")
+  endif()
   add_library(Mooncake::xxhash UNKNOWN IMPORTED)
   set_target_properties(
     Mooncake::xxhash
@@ -35,8 +41,11 @@ function(mooncake_provide_liburing)
 endfunction()
 
 function(mooncake_provide_libzmq)
-  find_path(MOONCAKE_LIBZMQ_INCLUDE_DIR zmq.h REQUIRED)
-  find_library(MOONCAKE_LIBZMQ_LIBRARY NAMES zmq libzmq REQUIRED)
+  find_path(MOONCAKE_LIBZMQ_INCLUDE_DIR zmq.h)
+  find_library(MOONCAKE_LIBZMQ_LIBRARY NAMES zmq libzmq)
+  if(NOT MOONCAKE_LIBZMQ_INCLUDE_DIR OR NOT MOONCAKE_LIBZMQ_LIBRARY)
+    message(FATAL_ERROR "libzmq development files not found")
+  endif()
   add_library(Mooncake::libzmq UNKNOWN IMPORTED)
   set_target_properties(
     Mooncake::libzmq
@@ -46,12 +55,12 @@ endfunction()
 
 function(mooncake_provide_hiredis)
   cmake_parse_arguments(ARG "REQUIRED" "" "" ${ARGN})
+  find_path(MOONCAKE_HIREDIS_INCLUDE_DIR hiredis/hiredis.h)
+  find_library(MOONCAKE_HIREDIS_LIBRARY hiredis)
   if(ARG_REQUIRED)
-    find_path(MOONCAKE_HIREDIS_INCLUDE_DIR hiredis/hiredis.h REQUIRED)
-    find_library(MOONCAKE_HIREDIS_LIBRARY hiredis REQUIRED)
-  else()
-    find_path(MOONCAKE_HIREDIS_INCLUDE_DIR hiredis/hiredis.h)
-    find_library(MOONCAKE_HIREDIS_LIBRARY hiredis)
+    if(NOT MOONCAKE_HIREDIS_INCLUDE_DIR OR NOT MOONCAKE_HIREDIS_LIBRARY)
+      message(FATAL_ERROR "hiredis development files not found")
+    endif()
   endif()
 
   if(MOONCAKE_HIREDIS_INCLUDE_DIR AND MOONCAKE_HIREDIS_LIBRARY)

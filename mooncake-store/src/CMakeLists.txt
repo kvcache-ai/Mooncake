@@ -129,8 +129,8 @@ endif()
 
 if(USE_3FS)
   add_subdirectory(hf3fs)
-  list(APPEND MOONCAKE_STORE_CLIENT_SOURCES ${HF3FS_SOURCES})
-  list(APPEND MOONCAKE_STORE_CLIENT_SOURCES
+  list(APPEND MOONCAKE_STORE_SHARED_SOURCES ${HF3FS_SOURCES})
+  list(APPEND MOONCAKE_STORE_SHARED_SOURCES
        storage/distributed/hf3fs_adapter.cpp)
   find_library(
     HF3FS_API_LIB hf3fs_api_shared
