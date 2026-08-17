@@ -73,6 +73,7 @@ add_store_test(master_scenario_test master_scenario.cpp
                master_scenario_test.cpp)
 add_store_test(master_service_scenario_test master_scenario.cpp
                master_service_scenario_test.cpp)
+add_store_test(config_helper_test config_helper_test.cpp)
 add_store_test(master_service_config_test master_service_config_test.cpp)
 add_store_test(master_service_processing_key_double_erase_test
                master_service_processing_key_double_erase_test.cpp)
