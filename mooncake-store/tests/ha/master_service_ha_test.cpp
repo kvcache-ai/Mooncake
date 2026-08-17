@@ -676,6 +676,40 @@ class MasterServiceHATest : public ::testing::Test {
         return std::unique_lock<std::shared_mutex>(service.snapshot_mutex_);
     }
 
+    static std::unique_lock<SharedMutex> LockMetadataShardForTesting(
+        MasterService& service, const TenantId& tenant_id,
+        const std::string& key) {
+        const size_t shard_idx = service.getMetadataShardIndex(tenant_id, key);
+        return std::unique_lock<SharedMutex>(
+            service.metadata_shards_[shard_idx].mutex);
+    }
+
+    static bool PutStartHoldsSnapshotAfterClientReleaseForTesting(
+        MasterService& service, const TenantId& tenant_id,
+        const std::string& key) {
+        const auto scoped_key = tenant_id.MakeScopedKey(key);
+        const size_t stripe_idx = std::hash<std::string>{}(scoped_key) %
+                                  MasterService::kObjectOperationLockStripes;
+        std::unique_lock<std::mutex> object_lock(
+            service.object_operation_locks_[stripe_idx], std::try_to_lock);
+        if (object_lock.owns_lock()) {
+            return false;
+        }
+        std::unique_lock<std::shared_mutex> client_lock(service.client_mutex_,
+                                                        std::try_to_lock);
+        if (!client_lock.owns_lock()) {
+            return false;
+        }
+        std::unique_lock<std::shared_mutex> snapshot_lock(
+            service.snapshot_mutex_, std::try_to_lock);
+        return !snapshot_lock.owns_lock();
+    }
+
+    static std::unique_lock<std::shared_mutex> LockClientForTesting(
+        MasterService& service) {
+        return std::unique_lock<std::shared_mutex>(service.client_mutex_);
+    }
+
     static size_t SegmentAllocatedSizeForTesting(MasterService& service,
                                                  const std::string& name) {
         auto access = service.segment_manager_.getAllocatorAccess();
@@ -1103,6 +1137,61 @@ TEST_F(MasterServiceHATest, RemountRefreshesLeaseWhenAnotherReplicaIsReadable) {
             .has_value());
     EXPECT_GT(LeaseDeadlineForTesting(service, kDefaultTenant, key),
               std::chrono::system_clock::now());
+}
+
+TEST_F(MasterServiceHATest,
+       LocalFirstAllocationDoesNotReacquireClientLockUnderSnapshotBarrier) {
+    MasterService service(
+        MasterServiceConfig::builder()
+            .set_allocation_strategy_type(AllocationStrategyType::LOCAL_FIRST)
+            .build());
+    const UUID client_id = generate_uuid();
+    const std::string key = "local_first_lock_order_key";
+    Segment segment = MakeSegment("local_first_lock_order_segment");
+    segment.host_id = "writer-host";
+    ASSERT_TRUE(service.MountSegment(segment, client_id).has_value());
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto shard_lock = LockMetadataShardForTesting(service, kDefaultTenant, key);
+    auto put = std::async(std::launch::async, [&] {
+        return service.PutStart(client_id, key, kDefaultTenant, 1024, config);
+    });
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    bool reached_snapshot = false;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (PutStartHoldsSnapshotAfterClientReleaseForTesting(
+                service, kDefaultTenant, key)) {
+            reached_snapshot = true;
+            break;
+        }
+        std::this_thread::yield();
+    }
+    if (!reached_snapshot) {
+        shard_lock.unlock();
+        EXPECT_EQ(put.wait_for(std::chrono::seconds(5)),
+                  std::future_status::ready);
+        if (put.wait_for(std::chrono::seconds(0)) ==
+            std::future_status::ready) {
+            (void)put.get();
+        }
+        FAIL() << "PutStart did not reach the snapshot barrier";
+    }
+
+    // ReMountSegment holds client_mutex_ exclusively while waiting for the
+    // snapshot barrier. PutStart must not reacquire it inside that barrier.
+    auto client_lock = LockClientForTesting(service);
+    shard_lock.unlock();
+    const bool completed_while_client_locked =
+        put.wait_for(std::chrono::seconds(1)) == std::future_status::ready;
+    client_lock.unlock();
+
+    ASSERT_EQ(put.wait_for(std::chrono::seconds(5)), std::future_status::ready);
+    auto result = put.get();
+    ASSERT_TRUE(result.has_value()) << toString(result.error());
+    EXPECT_TRUE(completed_while_client_locked);
 }
 
 TEST_F(MasterServiceHATest, NoFBatchEvictWaitsForSnapshotBarrier) {

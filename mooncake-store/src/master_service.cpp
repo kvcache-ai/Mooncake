@@ -3993,8 +3993,9 @@ MasterService::BatchGetReplicaListForAdmin(const std::vector<std::string>& keys,
 auto MasterService::AllocateAndInsertMetadata(
     MetadataShardAccessorRW& shard, const UUID& client_id,
     const std::string& key, uint64_t value_length,
-    const ReplicateConfig& config, const std::string& group_id,
-    const TenantId& tenant_id, const std::chrono::system_clock::time_point& now,
+    const ReplicateConfig& config, const std::string& writer_host_id,
+    const std::string& group_id, const TenantId& tenant_id,
+    const std::chrono::system_clock::time_point& now,
     const ResolvedSoftPinRequest& soft_pin_request,
     uint64_t& quota_deficit_bytes,
     std::optional<std::chrono::system_clock::time_point>
@@ -4030,16 +4031,6 @@ auto MasterService::AllocateAndInsertMetadata(
     size_t allocated_nof_replicas = 0;
     bool has_enough_memory_segments = false;
     if (config.replica_num > 0) {
-        const bool use_local_first =
-            (allocation_strategy_type_ == AllocationStrategyType::LOCAL_FIRST ||
-             config.prefer_alloc_in_same_node) &&
-            config.replica_num == 1;
-        std::string writer_host_id;
-        if (use_local_first) {
-            writer_host_id = config.host_id.empty() ? GetClientHostId(client_id)
-                                                    : config.host_id;
-        }
-
         ScopedAllocatorAccess allocator_access =
             segment_manager_.getAllocatorAccess();
         const auto& allocator_manager = allocator_access.getAllocatorManager();
@@ -4335,6 +4326,13 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
     }
 
     UpdateClientHostId(client_id, config.host_id);
+    std::string writer_host_id;
+    if ((allocation_strategy_type_ == AllocationStrategyType::LOCAL_FIRST ||
+         config.prefer_alloc_in_same_node) &&
+        config.replica_num == 1) {
+        writer_host_id = config.host_id.empty() ? GetClientHostId(client_id)
+                                                : config.host_id;
+    }
 
     if ((memory_allocator_type_ == BufferAllocatorType::CACHELIB) &&
         (slice_length > kMaxSliceSize)) {
@@ -4449,9 +4447,9 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
                     }
                 } else {
                     return AllocateAndInsertMetadata(
-                        shard, client_id, key, slice_length, config, group_id,
-                        object_id.tenant_id, now, *soft_pin_request,
-                        quota_deficit_bytes);
+                        shard, client_id, key, slice_length, config,
+                        writer_host_id, group_id, object_id.tenant_id, now,
+                        *soft_pin_request, quota_deficit_bytes);
                 }
             }
         }
@@ -4467,8 +4465,9 @@ auto MasterService::PutStart(const UUID& client_id, const std::string& key,
             return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
         }
         return AllocateAndInsertMetadata(
-            shard, client_id, key, slice_length, config, group_id,
-            object_id.tenant_id, now, *soft_pin_request, quota_deficit_bytes);
+            shard, client_id, key, slice_length, config, writer_host_id,
+            group_id, object_id.tenant_id, now, *soft_pin_request,
+            quota_deficit_bytes);
     };
 
     for (int attempt = 0; attempt <= kMaxTenantQuotaEvictionRetries;
@@ -4979,6 +4978,13 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
     }
 
     UpdateClientHostId(client_id, config.host_id);
+    std::string writer_host_id;
+    if ((allocation_strategy_type_ == AllocationStrategyType::LOCAL_FIRST ||
+         config.prefer_alloc_in_same_node) &&
+        config.replica_num == 1) {
+        writer_host_id = config.host_id.empty() ? GetClientHostId(client_id)
+                                                : config.host_id;
+    }
 
     if ((memory_allocator_type_ == BufferAllocatorType::CACHELIB) &&
         (slice_length > kMaxSliceSize)) {
@@ -5155,9 +5161,9 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                     }
                 } else {
                     return AllocateAndInsertMetadata(
-                        shard, client_id, key, slice_length, config, group_id,
-                        object_id.tenant_id, now, *soft_pin_request,
-                        quota_deficit_bytes,
+                        shard, client_id, key, slice_length, config,
+                        writer_host_id, group_id, object_id.tenant_id, now,
+                        *soft_pin_request, quota_deficit_bytes,
                         std::move(case_a_committed_soft_pin_timeout));
                 }
             } else {
@@ -5296,7 +5302,7 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                         << ", action=upsert_start_case_c_reallocate";
                 auto allocate_result = AllocateAndInsertMetadata(
                     shard, client_id, key, slice_length, merged_config,
-                    existing_group_id, object_id.tenant_id, now,
+                    writer_host_id, existing_group_id, object_id.tenant_id, now,
                     *soft_pin_request, quota_deficit_bytes,
                     std::move(committed_soft_pin_timeout));
                 if (!allocate_result) {
@@ -5356,9 +5362,9 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
             return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
         }
         return AllocateAndInsertMetadata(
-            shard, client_id, key, slice_length, config, group_id,
-            object_id.tenant_id, now, *soft_pin_request, quota_deficit_bytes,
-            std::move(case_a_committed_soft_pin_timeout));
+            shard, client_id, key, slice_length, config, writer_host_id,
+            group_id, object_id.tenant_id, now, *soft_pin_request,
+            quota_deficit_bytes, std::move(case_a_committed_soft_pin_timeout));
     };
 
     for (int attempt = 0; attempt <= kMaxTenantQuotaEvictionRetries;
