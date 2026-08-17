@@ -103,7 +103,9 @@ class FakeTransport : public Transport {
             return Status::InvalidArgument("bad task_id" LOC_MARK);
         }
         ++fake->poll_counts[task_id];
-        if (poll_status_factory_) {
+        if (fake->statuses[task_id].s == TransferStatusEnum::CANCELED) {
+            status = fake->statuses[task_id];
+        } else if (poll_status_factory_) {
             status = poll_status_factory_(fake->requests[task_id],
                                           fake->poll_counts[task_id]);
         } else {
@@ -291,7 +293,15 @@ TEST(RuntimeQueueDispatch, DispatchesOnlyOneWindowOnSubmit) {
     TransferEngineImpl engine(cfg);
     ASSERT_TRUE(engine.available());
 
-    auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
+    std::atomic<bool> complete_first{false};
+    auto fake_rdma = std::make_shared<FakeTransport>(
+        RDMA, [&complete_first](const Request& request, int) {
+            if (!complete_first.load()) {
+                return TransferStatus{TransferStatusEnum::PENDING, 0};
+            }
+            return TransferStatus{TransferStatusEnum::COMPLETED,
+                                  request.length};
+        });
     installFakeRdma(engine, fake_rdma);
 
     constexpr size_t kReqLen = 4096;
@@ -308,6 +318,8 @@ TEST(RuntimeQueueDispatch, DispatchesOnlyOneWindowOnSubmit) {
                              makeLocalWrite(buffer.data() + kReqLen, kReqLen)})
             .ok());
     EXPECT_EQ(fake_rdma->submit_calls.load(), 1);
+
+    complete_first.store(true);
 
     TransferStatus first{};
     ASSERT_TRUE(engine.getTransferStatus(batch, 0, first).ok());
@@ -430,7 +442,10 @@ TEST(RuntimeQueueDispatch, CancelsDispatchedRdmaTaskIdempotently) {
     TransferEngineImpl engine(cfg);
     ASSERT_TRUE(engine.available());
 
-    auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
+    auto fake_rdma =
+        std::make_shared<FakeTransport>(RDMA, [](const Request&, int) {
+            return TransferStatus{TransferStatusEnum::PENDING, 0};
+        });
     installFakeRdma(engine, fake_rdma);
 
     constexpr size_t kReqLen = 4096;

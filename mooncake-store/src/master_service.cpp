@@ -4316,24 +4316,28 @@ auto MasterService::PutEnd(const UUID& client_id, const ObjectMeta& object_meta,
             return replica.is_dfs_replica() && replica.is_processing();
         })) {
         auto& tenant_state = accessor.GetTenantState();
-        bool task_created = false;
+        // One marker covers every mirror pushed below, so the mirrors are
+        // collected before the marker is recorded.
+        std::optional<ReplicaID> source_id;
+        std::vector<UUID> mirror_clients;
         metadata.VisitReplicas(
             [](const Replica& replica) {
                 return replica.is_completed() && replica.is_memory_replica();
             },
-            [this, &object_id, &tenant_state, &task_created](Replica& replica) {
-                auto result = PushOffloadingQueue(object_id, replica);
-                if (result) {
-                    if (!task_created) {
-                        replica.inc_refcnt();
-                        tenant_state.offloading_tasks.emplace(
-                            object_id.user_key,
-                            OffloadingTask{replica.id(),
-                                           std::chrono::system_clock::now()});
-                        task_created = true;
-                    }
+            [this, &object_id, &source_id, &mirror_clients](Replica& replica) {
+                auto result =
+                    PushOffloadingQueue(object_id, replica, &mirror_clients);
+                if (result && !source_id.has_value()) {
+                    replica.inc_refcnt();
+                    source_id = replica.id();
                 }
             });
+        if (source_id.has_value()) {
+            tenant_state.offloading_tasks.emplace(
+                object_id.user_key,
+                OffloadingTask{*source_id, std::chrono::system_clock::now(),
+                               std::move(mirror_clients)});
+        }
     }
 
     // If the object is completed, remove it from the processing set.
@@ -4803,9 +4807,12 @@ auto MasterService::UpsertStart(const UUID& client_id, const std::string& key,
                         ErrorCode::OBJECT_HAS_REPLICATION_TASK);
                 }
 
-                // Reject if an offload-to-disk task is in progress (same
-                // reason).
-                if (tenant_state.offloading_tasks.count(key) > 0) {
+                // Cancel a still-queued offload so the upsert can take the key
+                // over. Once a store worker owns the task it is reading the
+                // source buffer for its SSD write, so the upsert waits for
+                // NotifyOffloadSuccess to clear the marker instead.
+                if (!CancelQueuedOffloadTask(tenant_state, metadata,
+                                             object_id)) {
                     LOG(INFO) << "key=" << key
                               << ", error=object_has_offloading_task";
                     return tl::make_unexpected(
@@ -7087,7 +7094,8 @@ auto MasterService::NotifyOffloadSuccess(
 }
 
 tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
-    const ObjectIdentity& object_id, Replica& replica) {
+    const ObjectIdentity& object_id, Replica& replica,
+    std::vector<UUID>* mirror_clients) {
     const auto& segment_names = replica.get_segment_names();
     if (segment_names.empty()) {
         return {};
@@ -7130,8 +7138,78 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
         if (!res.second) {
             return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
         }
+        if (mirror_clients != nullptr) {
+            mirror_clients->push_back(client_id_it->second);
+        }
     }
     return {};
+}
+
+bool MasterService::CancelQueuedOffloadTask(TenantState& tenant_state,
+                                            ObjectMetadata& metadata,
+                                            const ObjectIdentity& object_id) {
+    auto task_it = tenant_state.offloading_tasks.find(object_id.user_key);
+    if (task_it == tenant_state.offloading_tasks.end()) {
+        return true;
+    }
+    const auto& mirror_clients = task_it->second.mirror_clients;
+    if (mirror_clients.empty()) {
+        return false;
+    }
+
+    const std::string scoped_key =
+        object_id.tenant_id.MakeScopedKey(object_id.user_key);
+    // Reclaim every mirror the task covers before committing to the
+    // cancellation. OffloadObjectHeartbeat hands a whole segment's queue to
+    // its store worker without clearing the marker, so a missing mirror means
+    // a worker owns the task and is reading the source buffer for its SSD
+    // write. Mirrors are reclaimed one segment at a time, so a heartbeat may
+    // drain a later segment mid-traversal; restoring the reclaimed mirrors
+    // leaves the queues as if they had never been touched.
+    std::vector<std::pair<UUID, OffloadTaskItem>> reclaimed;
+    reclaimed.reserve(mirror_clients.size());
+    bool all_queued = true;
+    {
+        ScopedLocalDiskSegmentAccess ssd_access =
+            segment_manager_.getLocalDiskSegmentAccess();
+        auto& segments = ssd_access.getClientLocalDiskSegment();
+        for (const auto& mirror_client : mirror_clients) {
+            auto segment_it = segments.find(mirror_client);
+            if (segment_it == segments.end()) {
+                all_queued = false;
+                break;
+            }
+            MutexLocker locker(&segment_it->second->offloading_mutex_);
+            auto node =
+                segment_it->second->offloading_objects.extract(scoped_key);
+            if (!node) {
+                all_queued = false;
+                break;
+            }
+            reclaimed.emplace_back(mirror_client, std::move(node.mapped()));
+        }
+        if (!all_queued) {
+            for (auto& [mirror_client, item] : reclaimed) {
+                auto segment_it = segments.find(mirror_client);
+                if (segment_it == segments.end()) {
+                    continue;
+                }
+                MutexLocker locker(&segment_it->second->offloading_mutex_);
+                segment_it->second->offloading_objects.emplace(scoped_key,
+                                                               std::move(item));
+            }
+        }
+    }
+    if (!all_queued) {
+        return false;
+    }
+
+    auto source = metadata.GetReplicaByID(task_it->second.source_id);
+    if (source != nullptr) {
+        source->dec_refcnt();
+    }
+    tenant_state.offloading_tasks.erase(task_it);
+    return true;
 }
 
 // Promotion-on-hit
@@ -8679,12 +8757,15 @@ MasterService::EvictTenantMemoryForQuota(const TenantId& tenant_id,
                 if (queued) {
                     return;
                 }
+                std::vector<UUID> mirror_clients;
                 auto result = PushOffloadingQueue(
-                    MakeObjectIdentity(key, normalized_tenant), replica);
+                    MakeObjectIdentity(key, normalized_tenant), replica,
+                    &mirror_clients);
                 if (result) {
                     replica.inc_refcnt();
                     tenant_state.offloading_tasks.emplace(
-                        key, OffloadingTask{replica.id(), now});
+                        key, OffloadingTask{replica.id(), now,
+                                            std::move(mirror_clients)});
                     queued = true;
                 }
             });
@@ -8939,12 +9020,15 @@ void MasterService::BatchEvict(double evict_ratio_target,
             [this, &tenant_id, &key, &tenant_state, &queued,
              &now](Replica& replica) {
                 if (queued) return;  // only need to pin one replica for offload
-                auto result = PushOffloadingQueue(
-                    MakeObjectIdentity(key, tenant_id), replica);
+                std::vector<UUID> mirror_clients;
+                auto result =
+                    PushOffloadingQueue(MakeObjectIdentity(key, tenant_id),
+                                        replica, &mirror_clients);
                 if (result) {
                     replica.inc_refcnt();
                     tenant_state.offloading_tasks.emplace(
-                        key, OffloadingTask{replica.id(), now});
+                        key, OffloadingTask{replica.id(), now,
+                                            std::move(mirror_clients)});
                     queued = true;
                 }
             });

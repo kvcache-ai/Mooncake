@@ -16,6 +16,7 @@
 #include "tent/runtime/control_plane.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <limits>
@@ -23,6 +24,7 @@
 #include <optional>
 #include <random>
 #include <stdexcept>
+#include <thread>
 
 #include "tent/common/config.h"
 #include "tent/common/status.h"
@@ -329,7 +331,7 @@ Status TransferEngineImpl::construct() {
 
     topology_ = std::make_shared<Topology>();
     auto loader = &Platform::getLoader(conf_);
-    CHECK_STATUS(topology_->discover({loader}));
+    CHECK_STATUS(topology_->loadFromConfig(*conf_, {loader}));
 
     metadata_ =
         std::make_shared<ControlService>(metadata_type, metadata_servers, this);
@@ -522,6 +524,10 @@ const std::string TransferEngineImpl::getRpcServerAddress() const {
 }
 
 uint16_t TransferEngineImpl::getRpcServerPort() const { return port_; }
+
+std::shared_ptr<Topology> TransferEngineImpl::getLocalTopology() const {
+    return topology_;
+}
 
 Status TransferEngineImpl::exportLocalSegment(std::string& shared_handle) {
     return Status::NotImplemented(
@@ -796,6 +802,7 @@ BatchID TransferEngineImpl::allocateBatch(size_t batch_size) {
     Batch* batch = Slab<Batch>::Get().allocate();
     if (!batch) return (BatchID)0;
     batch->max_size = batch_size;
+    batch->task_list.reserve(batch_size);
     BatchID batch_id = (BatchID)batch;
     std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
     batch_set_.active.insert(batch);
@@ -1458,6 +1465,11 @@ void TransferEngineImpl::attachProgressNotifier(
 Status TransferEngineImpl::commitPreparedSubmit(
     Batch* batch, const PreparedSubmit& prepared) {
     if (!batch) return Status::InvalidArgument("Invalid batch" LOC_MARK);
+    if (batch->task_list.size() > batch->max_size ||
+        prepared.tasks.size() > batch->max_size - batch->task_list.size()) {
+        return Status::TooManyRequests(
+            "batch public task capacity exceeded" LOC_MARK);
+    }
 
     std::vector<Request> classified_request_list[kSupportedTransportTypes];
     std::vector<size_t> task_id_list[kSupportedTransportTypes];
@@ -2355,37 +2367,93 @@ void TransferEngineImpl::notifyRuntimeQueueReady() {
     if (progress_worker_) progress_worker_->notifyRuntimeQueueReady();
 }
 
+std::chrono::microseconds nextPollDelay(uint64_t poll_count) {
+    // Covers a fast completion, so short transfers usually finish before the
+    // sleeping phase.
+    constexpr uint64_t kHotPolls = 128;
+    constexpr auto kMaxDelay = std::chrono::microseconds(200);
+    if (poll_count < kHotPolls) return std::chrono::microseconds(0);
+    const uint64_t shift = std::min<uint64_t>(poll_count - kHotPolls, 20);
+    const auto delay = std::chrono::microseconds(uint64_t(1) << shift);
+    return delay < kMaxDelay ? delay : kMaxDelay;
+}
+
+void waitBeforeNextPoll(uint64_t poll_count) {
+    const auto delay = nextPollDelay(poll_count);
+    if (delay.count() == 0)
+        std::this_thread::yield();
+    else
+        std::this_thread::sleep_for(delay);
+}
+
+namespace {
+// Frees the batch on every exit unless reset() already did. The wait loops
+// below leave through CHECK_STATUS early returns that used to skip freeBatch()
+// and leak the Batch slab with whatever SubBatches it held.
+class BatchGuard {
+   public:
+    BatchGuard(TransferEngineImpl& engine, BatchID batch_id)
+        : engine_(engine), batch_id_(batch_id) {}
+
+    ~BatchGuard() {
+        auto status = reset();
+        if (!status.ok())
+            LOG(WARNING) << "failed to free batch: " << status.ToString();
+    }
+
+    BatchGuard(const BatchGuard&) = delete;
+    BatchGuard& operator=(const BatchGuard&) = delete;
+
+    Status reset() {
+        if (!batch_id_) return Status::OK();
+        auto batch_id = batch_id_;
+        batch_id_ = 0;
+        return engine_.freeBatch(batch_id);
+    }
+
+   private:
+    TransferEngineImpl& engine_;
+    BatchID batch_id_;
+};
+}  // namespace
+
 Status TransferEngineImpl::waitTransferCompletion(BatchID batch_id) {
+    BatchGuard batch_guard(*this, batch_id);
     TransferStatus xfer_status;
-    while (true) {
+    for (uint64_t poll_count = 0;; ++poll_count) {
         CHECK_STATUS(progressBatch(batch_id, xfer_status));
         if (xfer_status.s != PENDING) {
-            freeBatch(batch_id);
+            // Deliberately dropping the free status, as the pre-existing code
+            // did: callers of this path get the transfer outcome, not the
+            // cleanup outcome. transferSync() propagates it instead.
+            (void)batch_guard.reset();
             return xfer_status.s == COMPLETED
                        ? Status::OK()
                        : Status::InternalError(
                              "Transfer failed: " +
                              std::to_string((int)xfer_status.s));
         }
+        waitBeforeNextPoll(poll_count);
     }
 }
 
 Status TransferEngineImpl::transferSync(
     const std::vector<Request>& request_list) {
     auto batch_id = allocateBatch(request_list.size());
+    BatchGuard batch_guard(*this, batch_id);
     CHECK_STATUS(submitTransfer(batch_id, request_list));
-    while (true) {
+    for (uint64_t poll_count = 0;; ++poll_count) {
         TransferStatus xfer_status;
         CHECK_STATUS(progressBatch(batch_id, xfer_status));
         if (xfer_status.s == COMPLETED) break;
         if (xfer_status.s != PENDING) {
-            CHECK_STATUS(freeBatch(batch_id));
+            CHECK_STATUS(batch_guard.reset());
             return Status::InternalError(
                 "Transfer via stage buffer failed" LOC_MARK);
         }
+        waitBeforeNextPoll(poll_count);
     }
-    CHECK_STATUS(freeBatch(batch_id));
-    return Status::OK();
+    return batch_guard.reset();
 }
 
 uint64_t TransferEngineImpl::lockStageBuffer(const std::string& location) {

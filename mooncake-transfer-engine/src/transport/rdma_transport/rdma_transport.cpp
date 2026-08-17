@@ -865,12 +865,18 @@ Status RdmaTransport::submitTransferTask(
         fail_unstarted_tasks(task_index + 1);
     };
     uint64_t nr_slices;
-    for (size_t index = 0; index < task_list.size(); ++index) {
-        assert(task_list[index]);
-        auto &task = *task_list[index];
+    size_t task_index = 0, request_index = 0;
+    while (task_index < task_list.size()) {
+        assert(task_list[task_index]);
+        auto &task = *task_list[task_index];
+        const size_t current_task_index = task_index;
         nr_slices = 0;
         assert(task.request);
-        auto &request = *task.request;
+        auto &request = task.request[request_index++];
+        if (request_index == task.request_count) {
+            ++task_index;
+            request_index = 0;
+        }
         auto target_desc_it = target_segment_descs.find(request.target_id);
         if (target_desc_it == target_segment_descs.end()) {
             target_desc_it =
@@ -945,7 +951,7 @@ Status RdmaTransport::submitTransferTask(
             }
             if (!found_device) {
                 auto source_addr = slice->source_addr;
-                fail_task_and_cleanup(task, slice, index);
+                fail_task_and_cleanup(task, slice, current_task_index);
                 LOG(ERROR)
                     << "Memory region not registered by any active device(s): "
                     << source_addr;
@@ -955,7 +961,7 @@ Status RdmaTransport::submitTransferTask(
             } else {
                 auto &context = context_list_[device_id];
                 if (!context->active()) {
-                    fail_task_and_cleanup(task, slice, index);
+                    fail_task_and_cleanup(task, slice, current_task_index);
                     LOG(ERROR) << "Device " << device_id << " is not active";
                     return Status::InvalidArgument("Device " +
                                                    std::to_string(device_id) +
@@ -997,8 +1003,10 @@ Status RdmaTransport::getTransferStatus(BatchID batch_id,
     for (size_t task_id = 0; task_id < task_count; task_id++) {
         auto &task = batch_desc.task_list[task_id];
         status[task_id].transferred_bytes = task.transferred_bytes;
-        uint64_t success_slice_count = task.success_slice_count;
-        uint64_t failed_slice_count = task.failed_slice_count;
+        uint64_t success_slice_count =
+            __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+        uint64_t failed_slice_count =
+            __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
         if (success_slice_count + failed_slice_count == task.slice_count) {
             if (failed_slice_count)
                 status[task_id].s = TransferStatusEnum::FAILED;
@@ -1023,8 +1031,10 @@ Status RdmaTransport::getTransferStatus(BatchID batch_id, size_t task_id,
     }
     auto &task = batch_desc.task_list[task_id];
     status.transferred_bytes = task.transferred_bytes;
-    uint64_t success_slice_count = task.success_slice_count;
-    uint64_t failed_slice_count = task.failed_slice_count;
+    uint64_t success_slice_count =
+        __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+    uint64_t failed_slice_count =
+        __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
     if (success_slice_count + failed_slice_count == task.slice_count) {
         if (failed_slice_count)
             status.s = TransferStatusEnum::FAILED;

@@ -306,6 +306,11 @@ rm -rf ${OUTPUT_DIR}/
 mkdir -p ${OUTPUT_DIR}
 
 echo "Installing required build packages"
+# patchelf is installed from PyPI alongside auditwheel: auditwheel >= 6.8
+# requires patchelf >= 0.14.5, but the distro package on Ubuntu 22.04 (and the
+# rocm/musa CI images built on it) is 0.14.3, which makes `auditwheel repair`
+# abort. The PyPI wheel lands ahead of /usr/bin on PATH and works everywhere
+# the Python toolchain does.
 if [ "$NPU_BUILD" = "1" ]; then
     PYTHON_CMD="python${PYTHON_VERSION}"
     if ! command -v "$PYTHON_CMD" &>/dev/null; then
@@ -315,7 +320,7 @@ if [ "$NPU_BUILD" = "1" ]; then
     max_attempts=3
     attempt=1
     while [ $attempt -le $max_attempts ]; do
-        if "$PYTHON_CMD" -m pip install --upgrade pip build setuptools wheel auditwheel numpy; then
+        if "$PYTHON_CMD" -m pip install --upgrade pip build setuptools wheel auditwheel patchelf numpy; then
             break
         fi
         echo "pip install attempt $attempt/$max_attempts failed, retrying in 5s..."
@@ -327,10 +332,10 @@ if [ "$NPU_BUILD" = "1" ]; then
         exit 1
     fi
 elif command -v pip &>/dev/null; then
-    python${PYTHON_VERSION} -m pip install --upgrade pip build setuptools wheel auditwheel
+    python${PYTHON_VERSION} -m pip install --upgrade pip build setuptools wheel auditwheel patchelf
 elif command -v uv &>/dev/null; then
     uv pip install --upgrade pip
-    uv pip install build setuptools wheel auditwheel
+    uv pip install build setuptools wheel auditwheel patchelf
 else
     echo "Error: Neither python${PYTHON_VERSION}, pip nor uv found"
     exit 1

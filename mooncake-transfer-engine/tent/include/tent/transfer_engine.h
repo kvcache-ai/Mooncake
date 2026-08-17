@@ -240,6 +240,7 @@ namespace mooncake {
 namespace tent {
 class TransferEngineImpl;
 class Config;
+class Topology;
 class TransferEngine {
    public:
     TransferEngine();
@@ -262,6 +263,12 @@ class TransferEngine {
     const std::string getRpcServerAddress() const;
 
     uint16_t getRpcServerPort() const;
+
+    // Returns the live local topology (nics/mems). Empty if engine unavailable.
+    std::shared_ptr<Topology> getLocalTopology() const;
+
+    // Native {"nics","mems"} JSON dump (includes rank0/1/2). "{}" if empty.
+    std::string getLocalTopologyString() const;
 
    public:
     Status exportLocalSegment(std::string& shared_handle);

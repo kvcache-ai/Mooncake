@@ -15,6 +15,7 @@
 #include "transfer_engine_py.h"
 
 #include <cassert>
+#include <cstdlib>
 #include <numeric>
 #include <fstream>
 
@@ -23,7 +24,9 @@
 #include "transport/rpc_communicator/rpc_interface.h"
 
 #ifdef USE_TENT
+#include "tent/common/config.h"
 #include "tent/common/types.h"
+#include "tent/transfer_engine.h"
 #endif
 
 #ifdef USE_EFA
@@ -1068,14 +1071,39 @@ uintptr_t TransferEnginePy::getFirstBufferAddress(
 std::string TransferEnginePy::getLocalTopology(const char* device_name) {
     pybind11::gil_scoped_release release;
     auto device_name_safe = device_name ? std::string(device_name) : "";
+
+    const bool use_tent =
+        getenv("MC_USE_TENT") != nullptr || getenv("MC_USE_TEV1") != nullptr;
+#ifdef USE_TENT
+    if (use_tent) {
+        // The classic shim (TransferEngine(true, filter)) silently drops the
+        // filter on the TENT path and builds its own Config in init(), so
+        // inject the whitelist via the per-instance Config that TENT's public
+        // constructor already accepts. Avoids touching the process-global
+        // MC_TE_FILTERS env var (racey under concurrent callers, leaked on
+        // throw). Note: if MC_TE_FILTERS is also set in env, loadFromEnv()
+        // inside TransferEngineImpl will override this — env takes priority.
+        auto conf = std::make_shared<mooncake::tent::Config>();
+        conf->set("metadata_type", "p2p");
+        if (!device_name_safe.empty()) {
+            conf->set("topology/rdma_whitelist",
+                      std::vector<std::string>{device_name_safe});
+        }
+        mooncake::tent::TransferEngine tent_engine(conf);
+        return tent_engine.available() ? tent_engine.getLocalTopologyString()
+                                       : "{}";
+    }
+#else
+    (void)use_tent;
+#endif
+
+    // Classic path: device_filter is honored by classic TransferEngineImpl.
     auto device_filter = buildDeviceFilter(device_name_safe);
     std::shared_ptr<TransferEngine> tmp_engine =
         std::make_shared<TransferEngine>(true, device_filter);
-
     std::string metadata_conn_string{"P2PHANDSHAKE"}, local_server_name{};
     tmp_engine->init(metadata_conn_string, local_server_name);
-
-    return tmp_engine->getLocalTopology()->toString();
+    return tmp_engine->getLocalTopologyString();
 }
 
 std::vector<TransferEnginePy::TransferNotify> TransferEnginePy::getNotifies() {

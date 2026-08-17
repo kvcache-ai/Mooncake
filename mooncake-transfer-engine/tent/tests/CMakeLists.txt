@@ -284,6 +284,16 @@ target_include_directories(tent_transport_selector_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_transport_selector_test COMMAND tent_transport_selector_test)
 
+add_executable(tent_topology_priority_matrix_test
+               topology_priority_matrix_test.cpp)
+target_link_libraries(tent_topology_priority_matrix_test PRIVATE gtest
+                                                                 gtest_main
+                                                                 tent_link_group)
+target_include_directories(tent_topology_priority_matrix_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_topology_priority_matrix_test
+         COMMAND tent_topology_priority_matrix_test)
+
 if(USE_UB)
   add_executable(
     tent_ub_teardown_test
@@ -337,7 +347,8 @@ if(TARGET asio_shared)
   target_link_libraries(tent_progress_worker_test PRIVATE asio_shared)
 endif()
 target_include_directories(tent_progress_worker_test
-                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include
+                                   ${CMAKE_CURRENT_SOURCE_DIR}/../src/runtime)
 add_test(NAME tent_progress_worker_test COMMAND tent_progress_worker_test)
 
 # stage_buffers_ is reached from the staging workers and the RPC thread. Drives
@@ -353,6 +364,18 @@ target_include_directories(tent_stage_buffer_concurrency_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_stage_buffer_concurrency_test
          COMMAND tent_stage_buffer_concurrency_test)
+
+# Backoff policy for the synchronous wait loops. Pure function, no engine
+# required.
+add_executable(tent_poll_backoff_test poll_backoff_test.cpp)
+target_link_libraries(tent_poll_backoff_test PRIVATE gtest gtest_main
+                                                     tent_link_group)
+if(TARGET asio_shared)
+  target_link_libraries(tent_poll_backoff_test PRIVATE asio_shared)
+endif()
+target_include_directories(tent_poll_backoff_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_poll_backoff_test COMMAND tent_poll_backoff_test)
 
 add_executable(tent_runtime_queue_dispatch_test runtime_queue_dispatch_test.cpp)
 target_link_libraries(tent_runtime_queue_dispatch_test PRIVATE gtest gtest_main

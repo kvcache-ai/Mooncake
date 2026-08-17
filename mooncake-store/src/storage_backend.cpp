@@ -24,6 +24,7 @@
 #include <ylt/struct_pb.hpp>
 
 #include "mutex.h"
+#include "nvme_kv_backend.h"
 #include "utils.h"
 #include "crc32c.h"
 #include "ascii_string.h"
@@ -5543,6 +5544,9 @@ CreateStorageBackend(const FileStorageConfig& config) {
             return std::make_shared<OffsetAllocatorStorageBackend>(
                 config, offset_backend_config);
         }
+        case StorageBackendType::kNvmeKv:
+            return std::make_shared<NvmeKvStorageBackend>(config);
+
         case StorageBackendType::kDistributed: {
             auto distributed_config =
                 DistributedStorageConfig::FromEnvironment();

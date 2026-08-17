@@ -61,6 +61,14 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     client_metric.cpp
     master_client.cpp
     storage_backend.cpp
+    nvme_kv_backend.cpp
+    nvme_kv_connector.cpp
+    nvme_kv_executor_io_uring.cpp
+    nvme_kv_executor_ioctl.cpp
+    nvme_kv_executor_util.cpp
+    nvme_kv_key_codec.cpp
+    nvme_kv_key_conflict_policy.cpp
+    nvme_kv_object_layout.cpp
     transfer_task.cpp
     posix_file.cpp
     client_buffer.cpp
@@ -83,6 +91,10 @@ set(MOONCAKE_STORE_CLIENT_SOURCES
     memory_alloc.cpp
     ssd_register_client.cpp
     engram/engram_store.cpp)
+
+if(BUILD_UNIT_TESTS)
+  list(APPEND MOONCAKE_STORE_CLIENT_SOURCES nvme_kv_executor_stub.cpp)
+endif()
 
 set(EXTRA_LIBS "")
 set(SPDK_STATIC_LIBS "")
@@ -130,8 +142,38 @@ if(USE_3FS)
   list(APPEND EXTRA_LIBS ${HF3FS_API_LIB})
 endif()
 
+set(MOONCAKE_HAVE_NVME_URING_CMD OFF)
 if(TARGET Mooncake::liburing)
   list(APPEND MOONCAKE_STORE_CLIENT_SOURCES uring_file.cpp)
+
+  include(CheckCXXSourceCompiles)
+  get_target_property(MOONCAKE_LIBURING_INCLUDE_DIRS Mooncake::liburing
+                      INTERFACE_INCLUDE_DIRECTORIES)
+  set(CMAKE_REQUIRED_INCLUDES_SAVE ${CMAKE_REQUIRED_INCLUDES})
+  set(CMAKE_REQUIRED_INCLUDES ${MOONCAKE_LIBURING_INCLUDE_DIRS})
+  check_cxx_source_compiles(
+    "
+#include <liburing.h>
+#include <linux/nvme_ioctl.h>
+int main() {
+    struct nvme_uring_cmd cmd{};
+    io_uring_sqe sqe{};
+    sqe.cmd_op = NVME_URING_CMD_IO;
+    (void)sqe.cmd;
+    io_uring_cqe cqe{};
+    (void)cqe.big_cqe;
+    unsigned flags = IORING_OP_URING_CMD | IORING_SETUP_CQE32;
+    return static_cast<int>(flags) + cmd.opcode;
+}
+"
+    MOONCAKE_NVME_URING_CMD_COMPILES)
+  set(CMAKE_REQUIRED_INCLUDES ${CMAKE_REQUIRED_INCLUDES_SAVE})
+  if(MOONCAKE_NVME_URING_CMD_COMPILES)
+    set(MOONCAKE_HAVE_NVME_URING_CMD ON)
+    message(STATUS "io_uring: NVMe uring command support enabled")
+  else()
+    message(STATUS "io_uring: NVMe uring command support unavailable, NVMe KV io_uring executor disabled")
+  endif()
 endif()
 
 list(APPEND MOONCAKE_STORE_MASTER_SOURCES k8s_lease_helper.cpp)
@@ -336,6 +378,10 @@ target_link_libraries(
           numa
           asio_shared
           yalantinglibs::yalantinglibs)
+if(BUILD_UNIT_TESTS)
+  target_compile_definitions(mooncake_store_client_objects
+                             PRIVATE MOONCAKE_ENABLE_NVME_KV_TEST_STUB=1)
+endif()
 if(USE_NOF)
   target_include_directories(mooncake_store_client_objects
                              PRIVATE ${SPDK_INCLUDE_DIR} ${DPDK_INCLUDE_DIR})
@@ -344,6 +390,10 @@ if(TARGET Mooncake::liburing)
   target_compile_definitions(mooncake_store_client_objects PRIVATE USE_URING)
   target_link_libraries(mooncake_store_client_objects
                         PRIVATE Mooncake::liburing)
+  if(MOONCAKE_HAVE_NVME_URING_CMD)
+    target_compile_definitions(mooncake_store_client_objects
+                               PRIVATE MOONCAKE_HAVE_NVME_URING_CMD=1)
+  endif()
 endif()
 if(STORE_USE_ETCD)
   add_dependencies(mooncake_store_client_objects build_etcd_wrapper)

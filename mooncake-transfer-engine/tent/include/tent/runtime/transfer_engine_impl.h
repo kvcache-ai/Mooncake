@@ -48,6 +48,18 @@ class Platform;
 class ProxyManager;
 class ProgressWorker;
 
+// How long a poll loop should pause before polling again. Zero means poll
+// immediately.
+//
+// progressBatch takes progress_mutex_ every call, so an unthrottled loop does
+// not just burn a core -- it contends with every other thread's submit and
+// poll path. Hot for the first iterations so short transfers keep their
+// latency, then exponential backoff to a cap.
+std::chrono::microseconds nextPollDelay(uint64_t poll_count);
+
+// One backoff step: yields while nextPollDelay is zero, sleeps after that.
+void waitBeforeNextPoll(uint64_t poll_count);
+
 struct TaskInfo {
     TransportType type{UNSPEC};
     int sub_task_id{-1};
@@ -60,7 +72,7 @@ struct TaskInfo {
     bool staging{false};
     bool cancel_requested{false};
     TransferStatusEnum status{TransferStatusEnum::PENDING};
-    volatile TransferStatusEnum staging_status{TransferStatusEnum::PENDING};
+    std::atomic<TransferStatusEnum> staging_status{TransferStatusEnum::PENDING};
     std::chrono::steady_clock::time_point start_time{};     // Request submit
     std::chrono::steady_clock::time_point dispatch_time{};  // Initial dispatch
     std::chrono::steady_clock::time_point post_time{};      // Initial post
@@ -72,6 +84,100 @@ struct TaskInfo {
     std::chrono::steady_clock::time_point attempt_post_time{};
     TransportType attempt_type{UNSPEC};
     bool attempt_active{false};
+
+    TaskInfo() = default;
+
+    TaskInfo(const TaskInfo& other)
+        : type(other.type),
+          sub_task_id(other.sub_task_id),
+          derived(other.derived),
+          xport_priority(other.xport_priority),
+          failover_count(other.failover_count),
+          device_mask(other.device_mask),
+          qp_pool(other.qp_pool),
+          request(other.request),
+          staging(other.staging),
+          cancel_requested(other.cancel_requested),
+          status(other.status),
+          staging_status(other.staging_status.load(std::memory_order_relaxed)),
+          start_time(other.start_time),
+          dispatch_time(other.dispatch_time),
+          post_time(other.post_time),
+          attempt_post_time(other.attempt_post_time),
+          attempt_type(other.attempt_type),
+          attempt_active(other.attempt_active) {}
+
+    TaskInfo(TaskInfo&& other) noexcept
+        : type(other.type),
+          sub_task_id(other.sub_task_id),
+          derived(other.derived),
+          xport_priority(other.xport_priority),
+          failover_count(other.failover_count),
+          device_mask(other.device_mask),
+          qp_pool(std::move(other.qp_pool)),
+          request(std::move(other.request)),
+          staging(other.staging),
+          cancel_requested(other.cancel_requested),
+          status(other.status),
+          staging_status(other.staging_status.load(std::memory_order_relaxed)),
+          start_time(other.start_time),
+          dispatch_time(other.dispatch_time),
+          post_time(other.post_time),
+          attempt_post_time(other.attempt_post_time),
+          attempt_type(other.attempt_type),
+          attempt_active(other.attempt_active) {}
+
+    TaskInfo& operator=(const TaskInfo& other) {
+        if (this != &other) {
+            type = other.type;
+            sub_task_id = other.sub_task_id;
+            derived = other.derived;
+            xport_priority = other.xport_priority;
+            failover_count = other.failover_count;
+            device_mask = other.device_mask;
+            qp_pool = other.qp_pool;
+            request = other.request;
+            staging = other.staging;
+            cancel_requested = other.cancel_requested;
+            status = other.status;
+            staging_status.store(
+                other.staging_status.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            start_time = other.start_time;
+            dispatch_time = other.dispatch_time;
+            post_time = other.post_time;
+            attempt_post_time = other.attempt_post_time;
+            attempt_type = other.attempt_type;
+            attempt_active = other.attempt_active;
+        }
+        return *this;
+    }
+
+    TaskInfo& operator=(TaskInfo&& other) noexcept {
+        if (this != &other) {
+            type = other.type;
+            sub_task_id = other.sub_task_id;
+            derived = other.derived;
+            xport_priority = other.xport_priority;
+            failover_count = other.failover_count;
+            device_mask = other.device_mask;
+            qp_pool = std::move(other.qp_pool);
+            request = std::move(other.request);
+            staging = other.staging;
+            cancel_requested = other.cancel_requested;
+            status = other.status;
+            staging_status.store(
+                other.staging_status.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            start_time = other.start_time;
+            dispatch_time = other.dispatch_time;
+            post_time = other.post_time;
+            attempt_post_time = other.attempt_post_time;
+            attempt_type = other.attempt_type;
+            attempt_active = other.attempt_active;
+        }
+        return *this;
+    }
 };
 
 class TransferEngineImpl {
@@ -96,6 +202,9 @@ class TransferEngineImpl {
     const std::string getRpcServerAddress() const;
 
     uint16_t getRpcServerPort() const;
+
+    // Local topology discovered (or loaded from custom matrix) at construct.
+    std::shared_ptr<Topology> getLocalTopology() const;
 
    public:
     Status exportLocalSegment(std::string& shared_handle);
@@ -189,6 +298,13 @@ class TransferEngineImpl {
         if (type >= 0 && type < (TransportType)kSupportedTransportTypes) {
             transport_list_[type] = std::move(xport);
         }
+    }
+
+    // Test-only hook: how many batches are still alive. Lets a test assert
+    // that a failed transfer released its batch rather than leaking it.
+    size_t aliveBatchCountForTest() {
+        std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+        return alive_batches_.size();
     }
 
     // Wake the optional event-driven progress worker for `batch_id`. No-op if
