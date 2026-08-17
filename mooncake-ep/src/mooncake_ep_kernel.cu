@@ -641,7 +641,6 @@ combine(void* combined_x, int32_t* active_ranks,
                 // Local or P2P path — warp-cooperative copy
                 const auto dst_int4_ptr = reinterpret_cast<int4*>(write_dst);
                 UNROLLED_WARP_COPY(7, lane_id, hidden_bf16_int4, dst_int4_ptr, x_int4, mc_ld_nc, mc_st_na);
-                mc_fence();
             } else {
                 // IBGDA path — stage to send buffer then RDMA write
                 const auto buf_int4_ptr = reinterpret_cast<int4*>(buf_ptr);
@@ -657,7 +656,13 @@ combine(void* combined_x, int32_t* active_ranks,
         }
         // Put finishing flag
         EP_STATIC_ASSERT(kNumWarpsPerGroup > 1, "Requires more than one warp per group");
+#ifdef MOONCAKE_EP_USE_MUSA
+        // Publish all local/P2P payload stores once for this CTA before any
+        // expert completion word is made observable by a peer.
+        mc_fence_barrier_fence();
+#else
         mc_bar_sync(warp_group_id + 1, kNumWarpsPerGroup * 32);
+#endif
         if (sub_warp_id == 1 and lane_id == 0) {
             while (mc_ld_acquire(atomic_clean_flag) == 0);
             if (dst_rank != rank) {
@@ -673,7 +678,11 @@ combine(void* combined_x, int32_t* active_ranks,
         }
         __syncwarp();
     } else {
+#ifdef MOONCAKE_EP_USE_MUSA
+        mc_fence_barrier_fence();
+#else
         mc_bar_sync(warp_group_id + 1, kNumWarpsPerGroup * 32);
+#endif
     }
 
     // Receiving phase
