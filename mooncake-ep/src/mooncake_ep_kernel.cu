@@ -721,12 +721,31 @@ combine(void* combined_x, int32_t* active_ranks,
     EP_DEVICE_ASSERT(num_topk <= 32 and hidden_bf16_int4 <= num_threads);
     EP_STATIC_ASSERT(kHidden % (32 * kNumElemsPerInt4) == 0, "Invalid vectorization");
 #ifdef MOONCAKE_EP_USE_MUSA
+    // A completion word is stable for the entire combine. When the expert
+    // count is smaller than the token/expert fanout, acquire every expert
+    // once per reduction CTA instead of repeatedly acquiring the same words
+    // for every token.
+    const bool wait_all_experts =
+        num_experts <= num_combined_tokens * num_topk;
+    if (wait_all_experts && thread_id == 0) {
+        for (int expert_idx = 0; expert_idx < num_experts; ++expert_idx) {
+            const int expert_src_rank = expert_idx / num_local_experts;
+            const unsigned long long start_time = clock64();
+            while (mc_ld_acquire(rdma_recv_signal_buffer + expert_idx) == 0 &&
+                   active_ranks[expert_src_rank]) {
+                const unsigned long long end_time = clock64();
+                if (timeout_ticks != -1 && end_time - start_time > timeout_ticks)
+                    active_ranks[expert_src_rank] = 0;
+            }
+        }
+    }
+    __syncthreads();
     for (int token_idx = sm_id; token_idx < num_combined_tokens;
          token_idx += num_sms) {
         // CUDA's cooperative grid barrier above orders an expert-owning block
         // before every token-reduction block. MUSA has no grid barrier, so
         // the reduction block waits only on the experts selected by its token.
-        if (thread_id == 0) {
+        if (!wait_all_experts && thread_id == 0) {
             #pragma unroll
             for (int i = 0; i < num_topk; ++i) {
                 const int expert_idx =
