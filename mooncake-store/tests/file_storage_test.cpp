@@ -284,6 +284,9 @@ TEST_F(FileStorageTest, GroupOffloadingKeysByBucket_bucket_keys_limit) {
         ASSERT_EQ(bucket_keys.size(), 10);
     }
     ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 5);
+    for (size_t i = 35; i < 40; ++i) {
+        offloading_objects.emplace("test" + std::to_string(i), 1);
+    }
     buckets_keys.clear();
     ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
         fileStorage, offloading_objects, buckets_keys));
@@ -292,6 +295,35 @@ TEST_F(FileStorageTest, GroupOffloadingKeysByBucket_bucket_keys_limit) {
         ASSERT_EQ(bucket_keys.size(), 10);
     }
     ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 0);
+}
+
+TEST_F(FileStorageTest, GroupOffloadingKeysByBucket_deduplicates_carryover) {
+    std::unordered_map<std::string, int64_t> offloading_objects;
+    offloading_objects.emplace("duplicate", 1);
+
+    std::vector<std::vector<std::string>> buckets_keys;
+    auto file_storage_config = FileStorageConfig::FromEnvironment();
+    file_storage_config.storage_filepath = data_path;
+    SetEnv("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "10");
+    FileStorage fileStorage(file_storage_config, nullptr, "localhost:9003");
+
+    ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
+        fileStorage, offloading_objects, buckets_keys));
+    ASSERT_TRUE(buckets_keys.empty());
+    ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 1);
+
+    for (size_t i = 0; i < 9; ++i) {
+        offloading_objects.emplace("new" + std::to_string(i), 1);
+    }
+    ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
+        fileStorage, offloading_objects, buckets_keys));
+
+    ASSERT_EQ(buckets_keys.size(), 1);
+    ASSERT_EQ(buckets_keys.front().size(), 10);
+    std::unordered_set<std::string> unique_keys(buckets_keys.front().begin(),
+                                                 buckets_keys.front().end());
+    EXPECT_EQ(unique_keys.size(), 10);
+    EXPECT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 0);
 }
 
 TEST_F(FileStorageTest, GroupOffloadingKeysByBucket_bucket_size_limit) {
@@ -311,6 +343,9 @@ TEST_F(FileStorageTest, GroupOffloadingKeysByBucket_bucket_size_limit) {
         ASSERT_EQ(bucket_keys.size(), 10);
     }
     ASSERT_EQ(GetUngroupedOffloadingObjectsSize(fileStorage), 5);
+    for (size_t i = 35; i < 40; ++i) {
+        offloading_objects.emplace("test" + std::to_string(i), 1);
+    }
     buckets_keys.clear();
     ASSERT_TRUE(FileStorageGroupOffloadingKeysByBucket(
         fileStorage, offloading_objects, buckets_keys));

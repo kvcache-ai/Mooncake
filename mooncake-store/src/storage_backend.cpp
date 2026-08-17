@@ -2411,6 +2411,11 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
     MutexLocker offloading_locker(&offloading_mutex_);
     auto& ungrouped_offloading_objects = ungrouped_offloading_objects_;
     auto it = offloading_objects.cbegin();
+    std::unordered_set<std::string> carryover_keys;
+    carryover_keys.reserve(ungrouped_offloading_objects.size());
+    for (const auto& [key, _] : ungrouped_offloading_objects) {
+        carryover_keys.insert(key);
+    }
     int64_t residue_count = static_cast<int64_t>(
         offloading_objects.size() + ungrouped_offloading_objects.size());
     int64_t total_count = residue_count;
@@ -2437,8 +2442,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
             ungrouped_offloading_objects.clear();
         }
 
-        for (int64_t i = static_cast<int64_t>(bucket_keys.size());
-             i < bucket_backend_config_.bucket_keys_limit; ++i) {
+        while (static_cast<int64_t>(bucket_keys.size()) <
+               bucket_backend_config_.bucket_keys_limit) {
             if (it == offloading_objects.cend()) {
                 for (const auto& bucket_object : bucket_objects) {
                     ungrouped_offloading_objects.emplace(bucket_object.first,
@@ -2448,6 +2453,11 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
                         << "Total ungrouped count: "
                         << ungrouped_offloading_objects.size();
                 return {};
+            }
+
+            if (carryover_keys.find(it->first) != carryover_keys.end()) {
+                ++it;
+                continue;
             }
 
             if (it->second > bucket_backend_config_.bucket_size_limit) {
