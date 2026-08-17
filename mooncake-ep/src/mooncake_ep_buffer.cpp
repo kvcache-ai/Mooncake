@@ -11,19 +11,21 @@ namespace {
 
 int active_qps_per_rank_for_ep(int qps_per_rank, bool is_roce, int cap,
                                int num_local_experts) {
+#ifdef MOONCAKE_EP_USE_MUSA
+    // MUSA cannot safely issue reads of one just-written staging row from
+    // multiple QPs. Keep the verified single-QP protocol until every QP owns
+    // an independent source row.
+    return 1;
+#else
     if (!is_roce) return qps_per_rank;
     // CUDA RoCE shares HCAs across local GPUs; spreading small EP messages
-    // over all expert QPs adds doorbell/progress overhead. MUSA keeps the
-    // existing expert-scaled policy until its high-QP path is fully tuned.
+    // over all expert QPs adds doorbell/progress overhead.
     int target = cap;
     if (target <= 0) {
-#ifdef MOONCAKE_EP_USE_MUSA
-        target = std::max(8, num_local_experts);
-#else
         target = 8;
-#endif
     }
     return std::min(qps_per_rank, target);
+#endif
 }
 
 cudaStream_t create_comm_stream() {
@@ -81,9 +83,9 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
       comm_stream(create_comm_stream()) {
     USE_QP_COUNT = MAX_QP_COUNT / num_ranks * num_ranks;
 
-    // Optional runtime override for the RoCE active-QP count. Without an
-    // override, CUDA uses eight QPs and MUSA scales up to local experts.
+    // Optional runtime override for the CUDA RoCE active-QP count.
     active_qps_cap_ = 0;
+#ifndef MOONCAKE_EP_USE_MUSA
     if (const char* env = std::getenv("MOONCAKE_EP_ACTIVE_QPS_PER_RANK")) {
         char* end = nullptr;
         long v = std::strtol(env, &end, 10);
@@ -98,6 +100,9 @@ MooncakeEpBuffer::MooncakeEpBuffer(int rank, int num_ranks,
     LOG(INFO) << "[EP] RoCE active QPs/rank override = "
               << (active_qps_cap_ > 0 ? std::to_string(active_qps_cap_)
                                       : "auto");
+#else
+    LOG(INFO) << "[EP] MUSA active QPs/rank = 1";
+#endif
 
     // Get ranks
     CUDA_CHECK(cudaGetDevice(&device_id));
