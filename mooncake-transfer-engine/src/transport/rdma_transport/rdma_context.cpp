@@ -77,12 +77,11 @@ bool containsAddress(const MemoryRegionMeta &region, uintptr_t addr) {
 // Result is cached after the first call.
 bool isKernelDmabufSupported() {
     static const bool supported = []() {
-        if (const char *env = std::getenv("MOONCAKE_DISABLE_HIP_DMABUF")) {
-            if (std::string(env) != "0") {
-                LOG(INFO)
-                    << "HIP dmabuf disabled via MOONCAKE_DISABLE_HIP_DMABUF";
-                return false;
-            }
+        const char *env = std::getenv("MOONCAKE_DISABLE_HIP_DMABUF");
+        if (std::string(env ? env : "1") != "0") {
+            LOG(INFO) << "HIP dmabuf disabled (MOONCAKE_DISABLE_HIP_DMABUF="
+                      << (env ? env : "1, default") << ")";
+            return false;
         }
         struct utsname uts{};
         std::string release;
