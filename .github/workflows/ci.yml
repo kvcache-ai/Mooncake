@@ -143,12 +143,27 @@ jobs:
       shell: bash
 
     - name: Test (in build env)
+      id: ctest
       run: |
         cd build
+        mkdir -p test-results
         export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
         ldconfig -v || echo "always continue"
-        MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 ctest -j --output-on-failure
+        MC_METADATA_SERVER=http://127.0.0.1:8080/metadata \
+          DEFAULT_KV_LEASE_TTL=500 \
+          ctest -j --output-on-failure \
+            --output-junit "$GITHUB_WORKSPACE/build/test-results/ctest.xml"
       shell: bash
+
+    - name: Preserve CTest diagnostics
+      if: ${{ always() && steps.ctest.outcome == 'failure' }}
+      uses: ./.github/actions/ctest-diagnostics
+      with:
+        summary-title: CTest failure (Python ${{ matrix.python-version }})
+        artifact-name: ctest-diagnostics-py${{ matrix.python-version }}
+        junit-report: build/test-results/ctest.xml
+        failed-tests-log: build/Testing/Temporary/LastTestsFailed.log
+        last-test-log: build/Testing/Temporary/LastTest.log
 
     - name: Drain HTTP E2E test
       if: matrix.python-version == '3.12'
@@ -848,11 +863,25 @@ jobs:
     # unit tests rely on, causing false failures. cuda-on still validates
     # that every #ifdef USE_CUDA branch compiles.
     - name: Test (TENT)
+      id: ctest
       if: '!matrix.need_cuda'
       run: |
         cd build-tent
-        ctest --test-dir mooncake-transfer-engine/tent/tests -j --output-on-failure
+        mkdir -p test-results
+        ctest --test-dir mooncake-transfer-engine/tent/tests -j \
+          --output-on-failure \
+          --output-junit "$GITHUB_WORKSPACE/build-tent/test-results/ctest.xml"
       shell: bash
+
+    - name: Preserve TENT CTest diagnostics
+      if: ${{ always() && steps.ctest.outcome == 'failure' }}
+      uses: ./.github/actions/ctest-diagnostics
+      with:
+        summary-title: TENT CTest failure (${{ matrix.name }})
+        artifact-name: ctest-diagnostics-tent-${{ matrix.name }}
+        junit-report: build-tent/test-results/ctest.xml
+        failed-tests-log: build-tent/mooncake-transfer-engine/tent/tests/Testing/Temporary/LastTestsFailed.log
+        last-test-log: build-tent/mooncake-transfer-engine/tent/tests/Testing/Temporary/LastTest.log
 
     - name: Run sccache stat for check
       if: ${{ env.SCCACHE_PATH != '' }}
