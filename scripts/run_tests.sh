@@ -161,23 +161,34 @@ kill $MASTER_PID || true
 wait $MASTER_PID 2>/dev/null || true
 
 
-# Check if MOONCAKE_STORAGE_ROOT_DIR is set and not empty
 if [ -n "$TEST_SSD_OFFLOAD_IN_EVICT" ]; then
-    TEST_ROOT_DIR="/tmp/mooncake_test_ssd"
-    mkdir -p $TEST_ROOT_DIR
-    echo "MOONCAKE_STORAGE_ROOT_DIR is set to: $TEST_ROOT_DIR"
-    echo "Running with ssd offload in evict tests..."
-    # Set a small kv lease ttl to make the test faster.
-    # Must be consistent with the client test parameters.
-    mooncake_master --default_kv_lease_ttl=500 --root_fs_dir=$TEST_ROOT_DIR &
+    TEST_ROOT_DIR="${MOONCAKE_STORAGE_ROOT_DIR:-/tmp}/mooncake_test_ssd_$$"
+    mkdir -p "$TEST_ROOT_DIR"
+    echo "SSD offload path: $TEST_ROOT_DIR"
+    echo "Running SSD offload-on-eviction tests..."
+    # Keep root_fs_dir empty so a global DISK replica cannot mask failures in
+    # the LOCAL_DISK offload path exercised by this test.
+    mooncake_master --default_kv_lease_ttl=500 \
+        --enable_offload=true --offload_on_evict=true --root_fs_dir= &
     MASTER_PID=$!
     sleep 1
-    MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 python test_ssd_offload_in_evict.py
+    set +e
+    MC_METADATA_SERVER=http://127.0.0.1:8080/metadata \
+        DEFAULT_KV_LEASE_TTL=500 \
+        MOONCAKE_OFFLOAD_FILE_STORAGE_PATH="$TEST_ROOT_DIR" \
+        MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS=1 \
+        MOONCAKE_OFFLOAD_USE_URING=true \
+        python test_ssd_offload_regression.py
+    SSD_TEST_STATUS=$?
+    set -e
     kill $MASTER_PID || true
     wait $MASTER_PID 2>/dev/null || true
-    rm -rf $TEST_ROOT_DIR
+    rm -rf "$TEST_ROOT_DIR"
+    if [ "$SSD_TEST_STATUS" -ne 0 ]; then
+        exit "$SSD_TEST_STATUS"
+    fi
 else
-    echo "Skipping test: MOONCAKE_STORAGE_ROOT_DIR environment variable is not set"
+    echo "Skipping SSD offload-on-eviction tests"
 fi
 
 if [ -n "$TEST_PROMOTION_ON_HIT" ]; then
