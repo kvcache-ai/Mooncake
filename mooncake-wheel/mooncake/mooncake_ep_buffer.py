@@ -453,9 +453,10 @@ class Buffer:
                 dtype=torch.float8_e4m3fn if use_fp8 else torch.bfloat16,
                 device=x.device,
             )
-            # The dispatch SEND phase resets every local-expert counter before
-            # the RECV phase reads it, so this output need not be pre-cleared.
-            packed_recv_count = torch.empty(
+            # The receive phase uses atomicAdd on this counter. Start from a
+            # defined value even though the device send phase subsequently
+            # clears the local expert slots.
+            packed_recv_count = torch.zeros(
                 (num_local_experts,), dtype=torch.int32, device=x.device
             )
             packed_recv_src_info = torch.empty(

@@ -711,8 +711,36 @@ combine(void* combined_x, int32_t* active_ranks,
     // Reduce tokens with FP8 cast
     EP_DEVICE_ASSERT(num_topk <= 32 and hidden_bf16_int4 <= num_threads);
     EP_STATIC_ASSERT(kHidden % (32 * kNumElemsPerInt4) == 0, "Invalid vectorization");
+#ifdef MOONCAKE_EP_USE_MUSA
+    for (int token_idx = sm_id; token_idx < num_combined_tokens;
+         token_idx += num_sms) {
+        // CUDA's cooperative grid barrier above orders an expert-owning block
+        // before every token-reduction block. MUSA has no grid barrier, so
+        // the reduction block waits only on the experts selected by its token.
+        if (thread_id == 0) {
+            #pragma unroll
+            for (int i = 0; i < num_topk; ++i) {
+                const int expert_idx =
+                    static_cast<int>(__ldg(topk_idx + token_idx * num_topk + i));
+                if (expert_idx < 0)
+                    continue;
+                const int expert_src_rank = expert_idx / num_local_experts;
+                const unsigned long long start_time = clock64();
+                while (mc_ld_acquire(rdma_recv_signal_buffer + expert_idx) == 0 &&
+                       active_ranks[expert_src_rank]) {
+                    const unsigned long long end_time = clock64();
+                    if (timeout_ticks != -1 && end_time - start_time > timeout_ticks)
+                        active_ranks[expert_src_rank] = 0;
+                }
+            }
+        }
+        __syncthreads();
+        if (thread_id < hidden_bf16_int4) {
+#else
     if (thread_id < hidden_bf16_int4) {
-        for (int token_idx = sm_id; token_idx < num_combined_tokens; token_idx += num_sms) {
+        for (int token_idx = sm_id; token_idx < num_combined_tokens;
+             token_idx += num_sms) {
+#endif
             mc_fence();
             // Read top-k indices and weights
             int reg_topk_idx[kNumMaxTopk];
@@ -749,8 +777,13 @@ combine(void* combined_x, int32_t* active_ranks,
             for (int j = 0; j < kNumElemsPerInt4; ++ j)
                 combined_bf16[j] = __float2bfloat16(combined_values[j]);
             (reinterpret_cast<int4*>(combined_x) + token_idx * hidden_bf16_int4)[thread_id] = combined_int4;
+#ifdef MOONCAKE_EP_USE_MUSA
         }
+#endif
     }
+#ifndef MOONCAKE_EP_USE_MUSA
+    }
+#endif
 }
 
 void combine(void* combined_x, int32_t* active_ranks,
