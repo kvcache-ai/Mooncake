@@ -280,13 +280,28 @@ class WrappedMasterService {
         const std::string& tenant_id, const std::string& src_segment,
         const std::vector<std::string>& tgt_segments);
 
+    tl::expected<CopyStartResponse, ErrorCode> DynamicReplicaCopyStart(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, const std::string& src_segment,
+        const std::vector<std::string>& tgt_segments,
+        const UUID& dynamic_replication_lease_id,
+        uint64_t dynamic_replication_version_epoch);
+
     tl::expected<void, ErrorCode> CopyEnd(const UUID& client_id,
                                           const std::string& key,
                                           const std::string& tenant_id);
+    tl::expected<void, ErrorCode> DynamicReplicaCopyEnd(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, const UUID& dynamic_replication_lease_id,
+        uint64_t dynamic_replication_version_epoch);
 
     tl::expected<void, ErrorCode> CopyRevoke(const UUID& client_id,
                                              const std::string& key,
                                              const std::string& tenant_id);
+    tl::expected<void, ErrorCode> DynamicReplicaCopyRevoke(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id, const UUID& dynamic_replication_lease_id,
+        uint64_t dynamic_replication_version_epoch);
 
     tl::expected<MoveStartResponse, ErrorCode> MoveStart(
         const UUID& client_id, const std::string& key,
