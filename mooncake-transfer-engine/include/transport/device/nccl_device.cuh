@@ -46,11 +46,11 @@ enum class NcclGinTeam : uint8_t {
 };
 
 // Values intentionally match Mooncake EP's backend-neutral sharing-mode
-// contract, not NCCL's enum values.
+// contract, not NCCL's enum values. Keep this to the GPU and CTA modes that
+// exist in every supported NCCL release; EP does not require thread mode.
 enum class NcclGinResourceSharing : uint8_t {
     kCta = 0,
     kGpu = 1,
-    kThread = 2,
 };
 
 namespace detail {
@@ -59,8 +59,8 @@ struct NcclDeviceContextAccess {
     __device__ __forceinline__ static const ncclDevComm_t& comm(
         const NcclDeviceContext& ctx) {
         static_assert(
-            sizeof(ncclDevComm_t) == NcclDeviceContext::kNativeCommBytes,
-            "Update NcclDeviceContext storage for this NCCL version");
+            sizeof(ncclDevComm_t) <= NcclDeviceContext::kNativeCommCapacity,
+            "Increase NcclDeviceContext communicator capacity");
         static_assert(
             alignof(ncclDevComm_t) <= NcclDeviceContext::kNativeCommAlignment,
             "Increase NcclDeviceContext communicator alignment");
@@ -131,8 +131,6 @@ mc_nccl_gin_sharing_mode(NcclGinResourceSharing mode) {
     switch (mode) {
         case NcclGinResourceSharing::kCta:
             return NCCL_GIN_RESOURCE_SHARING_CTA;
-        case NcclGinResourceSharing::kThread:
-            return NCCL_GIN_RESOURCE_SHARING_THREAD;
         case NcclGinResourceSharing::kGpu:
         default:
             return NCCL_GIN_RESOURCE_SHARING_GPU;

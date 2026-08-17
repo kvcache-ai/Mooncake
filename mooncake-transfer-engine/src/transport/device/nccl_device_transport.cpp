@@ -497,8 +497,9 @@ class NcclDeviceTransportImpl final : public NcclTransport {
         }
 
         context.native_comm_ = device_comm_;
-        static_assert(sizeof(dev_comm_) == NcclDeviceContext::kNativeCommBytes,
-                      "Update embedded NCCL device communicator storage");
+        static_assert(
+            sizeof(dev_comm_) <= NcclDeviceContext::kNativeCommCapacity,
+            "Increase embedded NCCL device communicator capacity");
         static_assert(
             alignof(ncclDevComm_t) <= NcclDeviceContext::kNativeCommAlignment,
             "Update embedded NCCL device communicator alignment");

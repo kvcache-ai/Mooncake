@@ -83,8 +83,8 @@ class NcclCommStream {
             cudaGetLastError();
             greatest_priority = 0;
         }
-        CUDA_CHECK(cudaStreamCreateWithPriority(
-            &stream_, cudaStreamNonBlocking, greatest_priority));
+        CUDA_CHECK(cudaStreamCreateWithPriority(&stream_, cudaStreamNonBlocking,
+                                                greatest_priority));
     }
 
     NcclCommStream(const NcclCommStream&) = delete;
@@ -740,10 +740,10 @@ std::optional<EventHandle> MooncakeElasticBuffer::dispatch(
     const int hybrid_channels =
         use_hybrid ? hybrid_num_channels(num_sms, hybrid_channels_per_sm) : 0;
     const int hybrid_max_tokens_per_channel =
-        use_hybrid ? hybrid_num_max_tokens_per_channel(
-                         num_max_tokens_per_rank, num_sms,
-                         hybrid_channels_per_sm)
-                   : 0;
+        use_hybrid
+            ? hybrid_num_max_tokens_per_channel(num_max_tokens_per_rank,
+                                                num_sms, hybrid_channels_per_sm)
+            : 0;
 
     EP_HOST_ASSERT(x_ptr != 0 && topk_idx_ptr != 0 && active_ranks_ptr != 0);
     EP_HOST_ASSERT(psum_num_recv_tokens_per_scaleup_rank_ptr != 0);
@@ -831,9 +831,8 @@ std::optional<EventHandle> MooncakeElasticBuffer::dispatch(
         num_max_tokens_per_rank, hidden, x_element_size, num_sf_packs,
         recv_sf_token_stride, recv_sf_hidden_stride, num_experts, num_topk,
         num_sms, physical_num_sms_, num_smem_bytes,
-        use_hybrid ? hybrid_channels : num_channels,
-        do_expand, cached_mode, launch_ctx,
-        psum_num_recv_tokens_per_scaleup_rank,
+        use_hybrid ? hybrid_channels : num_channels, do_expand, cached_mode,
+        launch_ctx, psum_num_recv_tokens_per_scaleup_rank,
         epilogue_psum_num_recv_tokens_per_expert, launch_stream);
 
     (void)active_ranks;
@@ -901,8 +900,7 @@ std::optional<EventHandle> MooncakeElasticBuffer::combine(
     launch_mooncake_elastic_combine_reduce_epilogue(
         combined_x, topk_weights, topk_idx, num_combined_tokens,
         num_max_tokens_per_rank, hidden, num_experts, num_topk, reduce_buffer,
-        nullptr, nullptr, num_sms, physical_num_sms_, num_smem_bytes,
-        do_expand,
+        nullptr, nullptr, num_sms, physical_num_sms_, num_smem_bytes, do_expand,
         config_.allow_multiple_reduction, launch_ctx, launch_stream);
 
     (void)active_ranks;
