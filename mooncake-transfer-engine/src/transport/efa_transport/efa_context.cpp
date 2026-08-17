@@ -422,67 +422,8 @@ static void logCudaFailure(const char* call, CUresult ret, int device_ordinal) {
                     " with a bare \"Operation not supported\"";
 }
 
-// Make `device_ordinal`'s primary context current on the calling thread, unless
-// a context for that same device already is.
-//
-// Why a context is needed at all: fi_mr_regattr() on FI_HMEM_CUDA memory
-// reaches libfabric's cuda_get_dmabuf_fd(), which calls the driver API
-// cuMemGetHandleForAddressRange() and does no context management of its own.
-// The export also runs against the CURRENT context, so a context belonging to
-// another device is no better than none -- both end up as a bare "Operation not
-// supported" from the provider.
-//
-// Who arrives here without the right context: registerLocalMemoryBatch() runs
-// one std::async(std::launch::async) per buffer and registerLocalMemory() can
-// fan out one std::thread per NIC, so a registering thread may have touched no
-// CUDA API at all; and since std::async may reuse threads, one thread can
-// register buffers on several devices in turn.
-//
-// cuDevicePrimaryCtxRetain() returns the same primary context the CUDA runtime
-// uses, so this attaches to the process's existing context rather than creating
-// another.  The retain is intentionally not released: the primary context
-// outlives every registration, and dropping the last reference here would tear
-// down the context the rest of the process is using.
-static bool bindCudaContextIfNeeded(int device_ordinal) {
-    CUdevice want;
-    CUresult ret = cuDeviceGet(&want, device_ordinal);
-    if (ret != CUDA_SUCCESS) {
-        logCudaFailure("cuDeviceGet", ret, device_ordinal);
-        return false;
-    }
-
-    CUcontext cur = nullptr;
-    CUdevice cur_dev;
-    ret = cuCtxGetCurrent(&cur);
-    if (ret != CUDA_SUCCESS) {
-        logCudaFailure("cuCtxGetCurrent", ret, device_ordinal);
-        return false;
-    }
-    if (cur != nullptr) {
-        ret = cuCtxGetDevice(&cur_dev);
-        if (ret != CUDA_SUCCESS) {
-            logCudaFailure("cuCtxGetDevice", ret, device_ordinal);
-            return false;
-        }
-        if (cur_dev == want) return true;
-    }
-
-    CUcontext primary = nullptr;
-    ret = cuDevicePrimaryCtxRetain(&primary, want);
-    if (ret != CUDA_SUCCESS) {
-        logCudaFailure("cuDevicePrimaryCtxRetain", ret, device_ordinal);
-        return false;
-    }
-    ret = cuCtxSetCurrent(primary);
-    if (ret != CUDA_SUCCESS) {
-        logCudaFailure("cuCtxSetCurrent", ret, device_ordinal);
-        return false;
-    }
-    return true;
-}
-
-// Loopback runs synchronously on the caller's thread. Temporarily use the
-// buffer's primary context, then restore the caller and balance the retain.
+// RAII guard: temporarily make a device's primary context current, then restore
+// the caller's original context and release the retain on destruction.
 class ScopedCudaContext {
    public:
     ScopedCudaContext() {
@@ -618,7 +559,9 @@ int EfaContext::registerMemoryRegionInternal(void* addr, size_t length,
     int ret;
     if (iface != FI_HMEM_SYSTEM) {
 #if defined(USE_CUDA)
-        if (!bindCudaContextIfNeeded(device_ordinal)) return ERR_CONTEXT;
+        ScopedCudaContext reg_context;
+        if (!reg_context.valid() || !reg_context.bind(device_ordinal))
+            return ERR_CONTEXT;
 #endif
         // GPU memory: use fi_mr_regattr with explicit iface and device
         struct iovec iov = {.iov_base = addr, .iov_len = length};
@@ -917,12 +860,6 @@ bool EfaContext::tryLoopbackCopy(Transport::Slice* slice) {
     // The caller's context is restored afterward, and CUDA copies synchronize
     // before the slice is reported complete.
 #if defined(USE_CUDA)
-    ScopedCudaContext context;
-    if (!context.valid()) {
-        slice->markFailed();
-        return true;
-    }
-
     cudaError_t dst_status;
     cudaError_t src_status;
     int dst_device = getCudaDeviceForPointer(dst, dst_status);
@@ -939,27 +876,20 @@ bool EfaContext::tryLoopbackCopy(Transport::Slice* slice) {
     int device = dst_device >= 0 ? dst_device : src_device;
     if (device < 0) {
         memcpy(dst, src, len);
-        if (!context.restore()) {
-            slice->markFailed();
-            return true;
-        }
     } else {
-        if (!context.bind(device)) {
+        ScopedCudaContext context;
+        if (!context.valid() || !context.bind(device)) {
             slice->markFailed();
             return true;
         }
 
         cudaError_t rc = cudaMemcpy(dst, src, len, cudaMemcpyDefault);
         if (rc == cudaSuccess) rc = cudaStreamSynchronize(0);
-        bool restored = context.restore();
+        context.restore();
         if (rc != cudaSuccess) {
             LOG(ERROR) << "EFA loopback CUDA copy failed: "
                        << cudaGetErrorString(rc) << " (dst=" << dst
                        << ", src=" << src << ", len=" << len << ")";
-            slice->markFailed();
-            return true;
-        }
-        if (!restored) {
             slice->markFailed();
             return true;
         }

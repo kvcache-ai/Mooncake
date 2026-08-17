@@ -327,6 +327,60 @@ TEST_F(EFAGpuLoopbackTest, LoopbackPreservesCallerDevice) {
     EXPECT_EQ(free_result, cudaSuccess);
 }
 
+// Loopback WRITE between buffers on two different GPUs.  The engine buffer
+// lives on GPU 1 and the source buffer on GPU 0, exercising the cross-device
+// cudaMemcpyDefault path.
+TEST_F(EFAGpuLoopbackTest, CrossDeviceLoopback) {
+    int device_count = 0;
+    ASSERT_EQ(cudaGetDeviceCount(&device_count), cudaSuccess);
+    if (device_count < 2) GTEST_SKIP() << "At least two CUDA GPUs required";
+
+    // Engine buffer on GPU 1.
+    auto setup = createEngine(1);
+    EngineCleanup cleanup(this, setup);
+    if (!setup.ok) GTEST_SKIP() << "EFA/CUDA setup unavailable";
+
+    auto segment_desc =
+        setup.engine->getMetadata()->getSegmentDescByID(setup.segment_id);
+    ASSERT_NE(segment_desc, nullptr);
+    uint64_t remote_base = (uint64_t)segment_desc->buffers[0].addr;
+
+    // Source buffer on GPU 0.
+    const size_t kDataLength = 4096;
+    ASSERT_EQ(cudaSetDevice(0), cudaSuccess);
+    void *dev0_buf = nullptr;
+    ASSERT_EQ(cudaMalloc(&dev0_buf, kDataLength), cudaSuccess);
+
+    std::vector<uint8_t> pattern(kDataLength);
+    for (size_t i = 0; i < kDataLength; ++i) pattern[i] = (uint8_t)(i ^ 0x3C);
+    ASSERT_EQ(cudaMemcpy(dev0_buf, pattern.data(), kDataLength,
+                         cudaMemcpyHostToDevice),
+              cudaSuccess);
+    ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+    // Register the GPU 0 buffer with the engine.
+    int rc = setup.engine->registerLocalMemory(dev0_buf, kDataLength, "cuda:0");
+    ASSERT_EQ(rc, 0) << "registerLocalMemory(cuda:0) failed";
+
+    // WRITE: GPU 0 buffer -> second half of GPU 1 buffer.
+    const uint64_t dst_offset = setup.buffer_size / 2;
+    ASSERT_TRUE(submitAndWait(setup.engine.get(), setup.segment_id, dev0_buf,
+                              remote_base + dst_offset, kDataLength,
+                              TransferRequest::WRITE))
+        << "cross-device WRITE should succeed";
+
+    // Verify bytes landed on GPU 1.
+    std::vector<uint8_t> readback(kDataLength, 0xFF);
+    ASSERT_EQ(cudaMemcpy(readback.data(), (uint8_t *)setup.dev_buf + dst_offset,
+                         kDataLength, cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_EQ(0, memcmp(readback.data(), pattern.data(), kDataLength))
+        << "cross-device loopback did not produce the expected bytes";
+
+    setup.engine->unregisterLocalMemory(dev0_buf);
+    cudaFree(dev0_buf);
+}
+
 // Test 1: GPU loopback WRITE must not crash.
 //
 // Without the fix this segfaults inside the EFA provider's SHM path
