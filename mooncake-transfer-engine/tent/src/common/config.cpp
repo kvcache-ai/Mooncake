@@ -167,6 +167,8 @@ Status ConfigHelper::loadFromEnv(Config& config) {
               "transports/rdma/disable_gpu_direct_rdma");
     setConfig(config, "MC_LOG_RDMA_SLICE_AFFINITY",
               "transports/rdma/log_slice_affinity");
+    setConfig(config, "MC_STRICT_LOCAL_NUMA",
+              "transports/rdma/strict_local_numa");
     // Restrict which RDMA NICs the engine discovers/uses (comma-separated
     // device names). MC_TE_FILTERS is an allow-list — same name and semantics
     // as the legacy Transfer Engine's device whitelist, so a single env works
