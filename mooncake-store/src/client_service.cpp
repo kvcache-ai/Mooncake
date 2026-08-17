@@ -3952,14 +3952,33 @@ tl::expected<void, ErrorCode> Client::Copy(
 tl::expected<void, ErrorCode> Client::Copy(
     const std::string& key, const std::string& tenant_id,
     const std::string& source, const std::vector<std::string>& targets) {
+    return Copy(key, tenant_id, source, targets, UUID{}, 0);
+}
+
+tl::expected<void, ErrorCode> Client::Copy(
+    const std::string& key, const std::string& tenant_id,
+    const std::string& source, const std::vector<std::string>& targets,
+    const UUID& dynamic_replication_lease_id,
+    uint64_t dynamic_replication_version_epoch) {
     LOG(INFO) << "action=replica_copy_start" << ", key=" << key
               << ", targets_count=" << targets.size();
 
     // Call CopyStart first - it validates existence and allocates replicas
     auto start_result =
-        master_client_.CopyStart(key, tenant_id, source, targets);
+        dynamic_replication_lease_id == UUID{}
+            ? master_client_.CopyStart(key, tenant_id, source, targets)
+            : master_client_.DynamicReplicaCopyStart(
+                  key, tenant_id, source, targets, dynamic_replication_lease_id,
+                  dynamic_replication_version_epoch);
     if (!start_result.has_value()) {
         ErrorCode error = start_result.error();
+        if (dynamic_replication_lease_id != UUID{} &&
+            error == ErrorCode::OBJECT_ALREADY_EXISTS) {
+            LOG(INFO) << "action=replica_copy_skipped"
+                      << ", key=" << key
+                      << ", info=target_replicas_already_exist";
+            return {};
+        }
         LOG(ERROR) << "action=replica_copy_failed" << ", key=" << key
                    << ", source=" << source << ", error=copy_start_failed"
                    << ", error_code=" << error;
@@ -3971,7 +3990,12 @@ tl::expected<void, ErrorCode> Client::Copy(
         LOG(INFO) << "action=replica_copy_skipped" << ", key=" << key
                   << ", info=target_replicas_already_exist";
         // Target replicas already exist, consider it success
-        auto copy_end_result = master_client_.CopyEnd(key, tenant_id);
+        auto copy_end_result =
+            dynamic_replication_lease_id == UUID{}
+                ? master_client_.CopyEnd(key, tenant_id)
+                : master_client_.DynamicReplicaCopyEnd(
+                      key, tenant_id, dynamic_replication_lease_id,
+                      dynamic_replication_version_epoch);
         if (!copy_end_result.has_value()) {
             ErrorCode error = copy_end_result.error();
             LOG(ERROR) << "action=replica_copy_failed" << ", key=" << key
@@ -3981,10 +4005,22 @@ tl::expected<void, ErrorCode> Client::Copy(
         return {};
     }
 
-    auto result = ExecuteReplicaTransfer(
-        key, "copy", [&]() { return master_client_.CopyEnd(key, tenant_id); },
-        [&]() { return master_client_.CopyRevoke(key, tenant_id); },
-        response.source, response.targets);
+    auto copy_end = [&]() {
+        return dynamic_replication_lease_id == UUID{}
+                   ? master_client_.CopyEnd(key, tenant_id)
+                   : master_client_.DynamicReplicaCopyEnd(
+                         key, tenant_id, dynamic_replication_lease_id,
+                         dynamic_replication_version_epoch);
+    };
+    auto copy_revoke = [&]() {
+        return dynamic_replication_lease_id == UUID{}
+                   ? master_client_.CopyRevoke(key, tenant_id)
+                   : master_client_.DynamicReplicaCopyRevoke(
+                         key, tenant_id, dynamic_replication_lease_id,
+                         dynamic_replication_version_epoch);
+    };
+    auto result = ExecuteReplicaTransfer(key, "copy", copy_end, copy_revoke,
+                                         response.source, response.targets);
 
     if (result.has_value()) {
         LOG(INFO) << "action=replica_copy_success" << ", key=" << key
@@ -4563,8 +4599,13 @@ void Client::ExecuteTask(const ClientTask& client_task) {
             case TaskType::REPLICA_COPY: {
                 ReplicaCopyPayload payload;
                 struct_json::from_json(payload, assignment.payload);
-                auto copy_result = Copy(payload.key, payload.tenant_id,
-                                        payload.source, payload.targets);
+                const UUID dynamic_lease_id{
+                    payload.dynamic_replication_lease_id_high,
+                    payload.dynamic_replication_lease_id_low};
+                auto copy_result =
+                    Copy(payload.key, payload.tenant_id, payload.source,
+                         payload.targets, dynamic_lease_id,
+                         payload.dynamic_replication_version_epoch);
                 if (copy_result.has_value()) {
                     result = ErrorCode::OK;
                 } else {

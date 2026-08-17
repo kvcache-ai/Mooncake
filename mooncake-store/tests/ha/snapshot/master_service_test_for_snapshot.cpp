@@ -1216,7 +1216,15 @@ TEST_F(MasterServiceSnapshotTest, ConcurrentRemoveAllOperations) {
 }
 
 TEST_F(MasterServiceSnapshotTest, UnmountSegmentImmediateCleanup) {
-    service_.reset(new MasterService());
+    // Snapshot mode keeps the invalid-handle sweep synchronous inside
+    // UnmountSegment. A default-configured MasterService would instead defer
+    // it to the replica cleanup worker, making the key-count assertion below
+    // race with that worker.
+    auto service_config = MasterServiceConfig::builder()
+                              .set_enable_snapshot(true)
+                              .set_snapshot_object_store_type("local")
+                              .build();
+    service_.reset(new MasterService(service_config));
 
     // Mount two segments for testing
     constexpr size_t buffer1 = 0x300000000;

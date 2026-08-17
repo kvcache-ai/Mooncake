@@ -73,6 +73,7 @@ add_store_test(master_scenario_test master_scenario.cpp
                master_scenario_test.cpp)
 add_store_test(master_service_scenario_test master_scenario.cpp
                master_service_scenario_test.cpp)
+add_store_test(config_helper_test config_helper_test.cpp)
 add_store_test(master_service_config_test master_service_config_test.cpp)
 add_store_test(master_service_processing_key_double_erase_test
                master_service_processing_key_double_erase_test.cpp)
@@ -82,6 +83,7 @@ add_store_test(batch_remove_test batch_remove_test.cpp)
 add_store_test(master_service_ssd_test master_service_ssd_test.cpp)
 add_store_test(offload_on_evict_test offload_on_evict_test.cpp)
 add_store_test(promotion_on_hit_test promotion_on_hit_test.cpp)
+add_store_test(dynamic_replication_test dynamic_replication_test.cpp)
 add_store_test(file_storage_promotion_test file_storage_promotion_test.cpp)
 add_store_test(master_service_ssd_test_for_snapshot
                ha/snapshot/master_service_ssd_test_for_snapshot.cpp)
@@ -174,8 +176,10 @@ add_ha_test(batch_oplog_snapshot_types_test
 add_store_test(master_service_test_for_snapshot
                ha/snapshot/master_service_test_for_snapshot.cpp)
 add_store_test(non_ha_reconnect_test non_ha_reconnect_test.cpp)
+add_store_test(nvme_kv_storage_backend_test nvme_kv_storage_backend_test.cpp)
 add_store_test(storage_backend_test storage_backend_test.cpp)
 add_store_test(client_storage_backend_test client_storage_backend_test.cpp)
+add_store_test(object_storage_adapter_test object_storage_adapter_test.cpp)
 add_store_test(mutex_test mutex_test.cpp)
 add_store_test(file_storage_test file_storage_test.cpp)
 add_store_test(task_manager_test task_manager_test.cpp)

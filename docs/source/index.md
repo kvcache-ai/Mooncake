@@ -128,6 +128,7 @@ design/transfer-engine/index
 design/reshard-manifest
 design/tent/overview
 design/store/mooncake-store
+design/nvme-kv-backend
 design/mooncake-backend-pg
 design/mooncake-ep
 design/p2p-store

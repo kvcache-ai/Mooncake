@@ -601,6 +601,37 @@ TEST(EngineFailoverE2E, TransferSyncUsesProgressBatchWhenPollDisabled) {
     EXPECT_TRUE(engine.unregisterLocalMemory(buf.data(), kBufLen).ok());
 }
 
+// transferSync() allocates a batch before submitting, so every error path out
+// of it has to release that batch. submitTransfer() rejecting an unregistered
+// buffer is the reachable one; the poll-failure path leaves through the same
+// guard.
+TEST(EngineFailoverE2E, TransferSyncFreesBatchWhenSubmitFails) {
+    auto cfg = makeMinimalP2PConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_rdma = std::make_shared<FakeTransport>(RDMA);
+    std::string seg_name = engine.getSegmentName();
+    ASSERT_TRUE(fake_rdma->install(seg_name, nullptr, nullptr).ok());
+    engine.swapTransportForTest(RDMA, fake_rdma);
+
+    const size_t alive_before = engine.aliveBatchCountForTest();
+
+    // Never registered, so submitTransfer() fails before anything is posted.
+    std::vector<uint8_t> unregistered(4096, 0xD3);
+    Request req;
+    req.opcode = Request::WRITE;
+    req.source = unregistered.data();
+    req.target_id = LOCAL_SEGMENT_ID;
+    req.target_offset = reinterpret_cast<uint64_t>(unregistered.data());
+    req.length = unregistered.size();
+
+    EXPECT_FALSE(engine.transferSync({req}).ok());
+    EXPECT_EQ(fake_rdma->submit_calls.load(), 0);
+    EXPECT_EQ(engine.aliveBatchCountForTest(), alive_before)
+        << "the batch allocated by transferSync outlived the failed submit";
+}
+
 TEST(EngineFailoverE2E, ProgressBatchAdvancesExactlyOneStepPerCall) {
     auto cfg = makeMinimalP2PConfig();
     cfg->set("enable_auto_failover_on_poll", false);

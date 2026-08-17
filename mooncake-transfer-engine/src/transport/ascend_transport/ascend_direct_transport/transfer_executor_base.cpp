@@ -610,8 +610,15 @@ std::string TransferExecutorBase::resolveTargetAdxlEngineName(
 
         auto local_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
         const auto& remote_host_ip = segment_desc->rank_info.hostIp;
-        if (local_desc && !local_desc->rank_info.hostIp.empty() &&
-            !remote_host_ip.empty() &&
+
+        // CS mode (CANN 9.1+) supports same-device connections natively.
+        // The same-host +1 offset was a workaround for older HIXL that did
+        // not support same-device links. When CS mode is available, skip
+        // the offset to allow the optimal same-device HCCS path.
+        bool cs_mode_available =
+            adxl::IsAdxlFeatureSupported(adxl::CLIENT_SERVER_COMM);
+        if (!cs_mode_available && local_desc &&
+            !local_desc->rank_info.hostIp.empty() && !remote_host_ip.empty() &&
             local_desc->rank_info.hostIp == remote_host_ip &&
             endpoints.size() > 1) {
             base_idx = (base_idx + 1) % endpoints.size();

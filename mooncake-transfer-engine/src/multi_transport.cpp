@@ -117,8 +117,15 @@ Status MultiTransport::freeBatchID(BatchID batch_id) {
 
 Status MultiTransport::submitTransfer(
     BatchID batch_id, const std::vector<TransferRequest>& entries) {
+    return submitTransfer(batch_id, entries, nullptr);
+}
+
+Status MultiTransport::submitTransfer(
+    BatchID batch_id, const std::vector<TransferRequest>& entries,
+    std::vector<size_t>* task_sizes) {
     auto& batch_desc = *((BatchDesc*)(batch_id));
-    if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
+    if (!task_sizes &&
+        batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
         return Status::TooManyRequests(
             "Exceed the limitation of batch capacity");
     }
@@ -133,53 +140,66 @@ Status MultiTransport::submitTransfer(
         transports.push_back(transport);
     }
 
-    size_t task_id = batch_desc.task_list.size();
-    batch_desc.task_list.resize(task_id + entries.size());
-
-    struct TaskGroup {
-        uint64_t id;
-        Transport* transport;
-        std::vector<Transport::TransferTask*> tasks;
-    };
+    auto& task_list = batch_desc.task_list;
+    task_list.reserve(task_list.size() + entries.size());
     std::unordered_map<Transport*, std::vector<Transport::TransferTask*> >
         submit_tasks;
-    std::vector<TaskGroup> task_groups;
-    for (size_t i = 0; i < entries.size(); ++i) {
-        const auto& request = entries[i];
-        auto* transport = transports[i];
-        auto& task = batch_desc.task_list[task_id];
-        task.batch_id = batch_id;
-        task.transport_ = transport;
-#ifdef USE_ASCEND_HETEROGENEOUS
-        task.request = const_cast<Transport::TransferRequest*>(&request);
-#else
-        task.request = &request;
-#endif
-        ++task_id;
-        if (request.task_group_id == TransferRequest::kNoTaskGroup) {
-            submit_tasks[transport].push_back(&task);
-        } else if (!task_groups.empty() &&
-                   task_groups.back().id == request.task_group_id &&
-                   task_groups.back().transport == transport) {
-            task_groups.back().tasks.push_back(&task);
-        } else {
-            task_groups.push_back({request.task_group_id, transport, {&task}});
+    if (task_sizes) task_sizes->reserve(entries.size());
+    for (size_t i = 0; i < entries.size();) {
+        size_t count = 1;
+        const auto group_id = entries[i].task_group_id;
+        if (task_sizes && group_id != TransferRequest::kNoTaskGroup &&
+            transports[i]->supportsGroupedScatter()) {
+            while (i + count < entries.size() &&
+                   entries[i + count].task_group_id == group_id &&
+                   transports[i + count] == transports[i])
+                ++count;
         }
+        auto& task = task_list.emplace_back();
+        task.batch_id = batch_id;
+        task.transport_ = transports[i];
+#ifdef USE_ASCEND_HETEROGENEOUS
+        task.request = const_cast<Transport::TransferRequest*>(&entries[i]);
+#else
+        task.request = &entries[i];
+#endif
+        task.request_count = count;
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+        if (count > 1) task.submission_sealed = false;
+#endif
+        submit_tasks[transports[i]].push_back(&task);
+        if (task_sizes) task_sizes->push_back(count);
+        i += count;
     }
+    if (task_sizes) batch_desc.batch_size = task_list.size();
     Status overall_status = Status::OK();
     for (auto& entry : submit_tasks) {
         auto status = entry.first->submitTransferTask(entry.second);
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+        for (auto* task : entry.second)
+            if (task->request_count > 1)
+                Transport::Slice::sealTaskSubmission(task);
+#endif
         if (!status.ok()) {
             // LOG(ERROR) << "Failed to submit transfer task to "
             //            << entry.first->getName();
             overall_status = status;
         }
     }
-    for (auto& group : task_groups) {
-        auto status = group.transport->submitTransferTaskGroup(group.tasks);
-        if (!status.ok()) overall_status = status;
-    }
     return overall_status;
+}
+
+Status MultiTransport::submitScatter(
+    const std::vector<TransferRequest>& entries,
+    ScatterSubmission& submission) {
+    submission = {};
+    if (entries.empty())
+        return Status::InvalidArgument("scatter transfer is empty");
+    submission.batch_id = allocateBatchID(0);
+    if (submission.batch_id == static_cast<BatchID>(-1))
+        return Status::InvalidArgument(
+            "failed to allocate scatter transfer batch");
+    return submitTransfer(submission.batch_id, entries, &submission.task_sizes);
 }
 
 #ifdef ENABLE_MULTI_PROTOCOL
@@ -274,8 +294,10 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
 
     // Fallback for tasks without a transport pointer (legacy path)
     status.transferred_bytes = task.transferred_bytes;
-    uint64_t success_slice_count = task.success_slice_count;
-    uint64_t failed_slice_count = task.failed_slice_count;
+    uint64_t success_slice_count =
+        __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+    uint64_t failed_slice_count =
+        __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
     assert(task.slice_count);
     if (success_slice_count + failed_slice_count == task.slice_count) {
         if (failed_slice_count) {
@@ -291,6 +313,43 @@ Status MultiTransport::getTransferStatus(BatchID batch_id, size_t task_id,
             status.s = Transport::TransferStatusEnum::WAITING;
         }
     }
+    return Status::OK();
+}
+
+Status MultiTransport::getScatterRequestStatuses(
+    BatchID batch_id, size_t task_id,
+    std::vector<TransferStatusEnum>& request_statuses) {
+    auto& batch_desc = *((BatchDesc*)(batch_id));
+    if (task_id >= batch_desc.task_list.size())
+        return Status::InvalidArgument("Task ID out of range");
+
+    const auto& task = batch_desc.task_list[task_id];
+    if (!task.request || task.request_count == 0)
+        return Status::InvalidArgument("Invalid grouped scatter task");
+    const auto success_count =
+        __atomic_load_n(&task.success_slice_count, __ATOMIC_ACQUIRE);
+    const auto failed_count =
+        __atomic_load_n(&task.failed_slice_count, __ATOMIC_ACQUIRE);
+    if (success_count + failed_count != task.slice_count)
+        return Status::InvalidArgument("Grouped scatter task is not complete");
+
+    request_statuses.assign(task.request_count, TransferStatusEnum::COMPLETED);
+    size_t slice_index = 0;
+    for (size_t i = 0; i < task.request_count; ++i) {
+        size_t remaining = task.request[i].length;
+        while (remaining != 0 && slice_index < task.slice_list.size()) {
+            const auto* slice = task.slice_list[slice_index++];
+            if (slice->length > remaining)
+                return Status::InvalidArgument(
+                    "Invalid grouped scatter slice layout");
+            remaining -= slice->length;
+            if (slice->status != Transport::Slice::SUCCESS)
+                request_statuses[i] = TransferStatusEnum::FAILED;
+        }
+        if (remaining != 0) request_statuses[i] = TransferStatusEnum::FAILED;
+    }
+    if (slice_index != task.slice_list.size())
+        return Status::InvalidArgument("Invalid grouped scatter slice layout");
     return Status::OK();
 }
 

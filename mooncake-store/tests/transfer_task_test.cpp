@@ -186,6 +186,7 @@ TEST_F(TransferTaskTest, TransferScatterHandlesFragmentedCpuBuffers) {
     constexpr size_t kFragmentCount = 128;
     std::vector<char> source(kBufferSize), destination(kBufferSize, 0);
     std::iota(source.begin(), source.end(), 0);
+    std::vector<size_t> completions(kFragmentCount, 0);
     std::vector<size_t> destination_offsets, source_offsets,
         lengths(kFragmentCount, 1);
     for (size_t i = 0; i < kFragmentCount; ++i) {
@@ -216,12 +217,17 @@ TEST_F(TransferTaskTest, TransferScatterHandlesFragmentedCpuBuffers) {
                         .local_offsets = destination_offsets,
                         .remote_offsets = source_offsets,
                         .lengths = lengths,
-                        .on_fragment_complete = {},
+                        .on_fragment_complete =
+                            [&](size_t i, const Status& status) {
+                                EXPECT_TRUE(status.ok());
+                                ++completions[i];
+                            },
                     }})
                     .ok());
     for (size_t i = 0; i < kFragmentCount; ++i) {
         EXPECT_EQ(destination[destination_offsets[i]],
                   source[source_offsets[i]]);
+        EXPECT_EQ(completions[i], 1u);
     }
 }
 
