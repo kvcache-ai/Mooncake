@@ -208,6 +208,11 @@ Status DeviceSelector::buildCandidates(const Topology::MemEntry* entry,
 
     // First pass: filter by device priority (QoS filtering)
     for (size_t rank = 0; rank < Topology::DevicePriorityRanks; ++rank) {
+        // Skip last (cross-NUMA) rank; empty-candidates fallback still retries all tiers.
+        if (sched_params_.strict_local_numa &&
+            rank == Topology::DevicePriorityRanks - 1) {
+            continue;
+        }
         for (int dev_id : entry->device_list[rank]) {
             if (!usable(dev_id)) continue;
             if ((device_mask & (1ULL << dev_id)) == 0) continue;

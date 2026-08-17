@@ -390,6 +390,11 @@ Status TransferEngineImpl::construct() {
     auto loader = &Platform::getLoader(conf_);
     CHECK_STATUS(topology_->loadFromConfig(*conf_, {loader}));
 
+    if (conf_->get("verbose", false)) {
+        LOG(INFO) << "Discovered topology after Topology::discover():";
+        topology_->print();
+    }
+
     metadata_ =
         std::make_shared<ControlService>(metadata_type, metadata_servers, this);
 

@@ -182,6 +182,9 @@ class DeviceSelector {
         double numa_tier_weights[Topology::DevicePriorityRanks] = {1.0, 5.0,
                                                                    10.0};
 
+        // Skip last (cross-NUMA) rank; fall back only if no same-NUMA NIC.
+        bool strict_local_numa = false;
+
         // EWMA bandwidth learning rate (0.0 = full adaptation, 1.0 = no
         // learning)
         double bandwidth_learning_rate = 0.01;

@@ -111,6 +111,9 @@ Workers::Workers(RdmaTransport* transport)
         }
     }
 
+    params.strict_local_numa =
+        conf->get("transports/rdma/strict_local_numa", false);
+
     // ============================================================
     // Bandwidth Estimation (EWMA)
     // ============================================================
