@@ -3,7 +3,10 @@
 #include <glog/logging.h>
 #include <zmq_addon.hpp>
 
+#include <algorithm>
+#include <array>
 #include <iterator>
+#include <limits>
 #include <utility>
 #include <vector>
 
@@ -28,6 +31,11 @@ void U64ToBigEndian(uint64_t v, unsigned char* out) {
         out[i] = static_cast<unsigned char>(v & 0xFF);
         v >>= 8;
     }
+}
+
+bool ReplayEnabled(const ZMQClientConfig& config) {
+    return config.publisher_kind == common::PublisherKind::kVllm &&
+           !config.replay_endpoint.empty();
 }
 
 }  // namespace
@@ -122,14 +130,44 @@ void ZMQClient::HandleReconnect() {
         return;
     }
 
-    const int64_t last_seq = GetLastSequence();
-    if (last_seq >= 0 && !config_.replay_endpoint.empty()) {
-        LOG(INFO) << "Reconnected service=" << config_.cache_pool_key
-                  << " resuming_from=" << (last_seq + 1);
-        if (auto err = RequestReplay(last_seq + 1); !err.empty()) {
-            LOG(WARNING) << "Failed to request replay after reconnect "
-                            "service="
-                         << config_.cache_pool_key << " error=" << err;
+    int64_t last_seq;
+    std::deque<ReplayRange> pending_ranges;
+    {
+        std::shared_lock lock(mu_);
+        last_seq = last_seq_;
+        pending_ranges = pending_replay_ranges_;
+    }
+    if (ReplayEnabled(config_) && (last_seq >= 0 || !pending_ranges.empty())) {
+        bool replay_succeeded = true;
+        for (const auto& range : pending_ranges) {
+            LOG(INFO) << "Reconnected service=" << config_.cache_pool_key
+                      << " resuming_from=" << range.from
+                      << " resuming_until=" << range.until;
+            if (auto err = RequestReplay(range.from, range.until);
+                !err.empty()) {
+                LOG(WARNING) << "Failed to request replay after reconnect "
+                                "service="
+                             << config_.cache_pool_key << " from=" << range.from
+                             << " until=" << range.until << " error=" << err;
+                replay_succeeded = false;
+                break;
+            }
+            std::unique_lock lock(mu_);
+            if (!pending_replay_ranges_.empty() &&
+                pending_replay_ranges_.front().from == range.from &&
+                pending_replay_ranges_.front().until == range.until) {
+                pending_replay_ranges_.pop_front();
+            }
+        }
+        if (replay_succeeded && last_seq >= 0) {
+            const int64_t replay_from = last_seq + 1;
+            LOG(INFO) << "Reconnected service=" << config_.cache_pool_key
+                      << " resuming_from=" << replay_from;
+            if (auto err = RequestReplay(replay_from); !err.empty()) {
+                LOG(WARNING) << "Failed to request replay after reconnect "
+                                "service="
+                             << config_.cache_pool_key << " error=" << err;
+            }
         }
     }
 }
@@ -149,12 +187,17 @@ std::string ZMQClient::Connect() {
                                                       ::zmq::socket_type::sub);
         // Enable IPv6 for dual-stack support
         sock->set(::zmq::sockopt::ipv6, 1);
+        // Set the receive HWM before connect; ZeroMQ applies it at connection
+        // setup.
+        if (config_.rcv_hwm > 0) {
+            sock->set(::zmq::sockopt::rcvhwm, config_.rcv_hwm);
+        }
         sock->connect(config_.endpoint);
         // Important: Subscribe to all topics
         sock->set(::zmq::sockopt::subscribe, "");
 
         sub_socket_ = std::move(sock);
-        if (!config_.replay_endpoint.empty()) {
+        if (ReplayEnabled(config_)) {
             auto replay_socket = std::make_unique<::zmq::socket_t>(
                 zmq_context_, ::zmq::socket_type::dealer);
             replay_socket->set(::zmq::sockopt::ipv6, 1);
@@ -174,7 +217,12 @@ std::string ZMQClient::Connect() {
               << config_.cache_pool_key << " endpoint=" << config_.endpoint
               << " publisher_kind="
               << common::PublisherKindName(config_.publisher_kind)
-              << " live_only=" << config_.replay_endpoint.empty();
+              << " live_only=" << !ReplayEnabled(config_);
+    if (!config_.replay_endpoint.empty() && !ReplayEnabled(config_)) {
+        LOG(WARNING) << "Ignoring replay_endpoint for publisher kind="
+                     << common::PublisherKindName(config_.publisher_kind)
+                     << "; replay is supported only for vLLM";
+    }
 
     return "";
 }
@@ -251,47 +299,85 @@ std::string ZMQClient::ProcessMessage() {
     const int64_t seq = static_cast<int64_t>(
         BigEndianToU64(static_cast<const unsigned char*>(seq_msg.data())));
 
+    const std::string topic(static_cast<const char*>(topic_msg.data()),
+                            topic_msg.size());
     int64_t last_seq;
     {
         std::shared_lock lock(mu_);
         last_seq = last_seq_;
     }
 
-    if (last_seq != -1 && seq > last_seq + 1) {
+    const bool new_gap = last_seq != -1 && seq > last_seq + 1;
+    if (new_gap) {
+        const int64_t missed = seq - last_seq - 1;
+        const int64_t total = dropped_events_.fetch_add(missed) + missed;
+        const int64_t gaps = gap_count_.fetch_add(1) + 1;
         LOG(WARNING) << "Event gap detected service=" << config_.cache_pool_key
-                     << " missed=" << (seq - last_seq - 1)
-                     << " last=" << last_seq << " current=" << seq;
-        // BUG: seq gap detected but no automatic replay triggered.
+                     << " missed=" << missed << " last=" << last_seq
+                     << " current=" << seq << " cumulative_dropped=" << total
+                     << " gaps=" << gaps;
+        if (!ReplayEnabled(config_)) {
+            LOG(WARNING) << "No replay_endpoint configured; " << missed
+                         << " events are permanently lost from the index "
+                            "service="
+                         << config_.cache_pool_key;
+        } else {
+            std::unique_lock lock(mu_);
+            pending_replay_ranges_.push_back({last_seq + 1, seq});
+        }
     }
 
-    // Update Sequence immediately to keep state fresh
-    {
-        std::unique_lock lock(mu_);
-        last_seq_ = seq;
+    if (ReplayEnabled(config_)) {
+        while (true) {
+            ReplayRange range;
+            {
+                std::shared_lock lock(mu_);
+                if (pending_replay_ranges_.empty()) break;
+                range = pending_replay_ranges_.front();
+            }
+            if (auto err = RequestReplay(range.from, range.until);
+                !err.empty()) {
+                LOG(WARNING) << "Gap replay request failed service="
+                             << config_.cache_pool_key << " from=" << range.from
+                             << " until=" << range.until << " error=" << err;
+                break;
+            }
+            std::unique_lock lock(mu_);
+            if (!pending_replay_ranges_.empty() &&
+                pending_replay_ranges_.front().from == range.from &&
+                pending_replay_ranges_.front().until == range.until) {
+                pending_replay_ranges_.pop_front();
+            }
+        }
     }
 
-    const std::string topic(static_cast<const char*>(topic_msg.data()),
-                            topic_msg.size());
+    UpdateLastSequence(seq);
+    return DispatchMessage(topic, seq,
+                           static_cast<const char*>(payload_msg.data()),
+                           payload_msg.size());
+}
+
+std::string ZMQClient::DispatchMessage(const std::string& topic,
+                                       int64_t sequence, const char* payload,
+                                       size_t payload_size) {
     const MessageMetadata metadata{
         .publisher_kind = config_.publisher_kind,
         .endpoint = config_.endpoint,
         .topic = topic,
-        .sequence = seq,
+        .sequence = sequence,
     };
 
     DecodedBatch batch;
     std::string decode_error;
     if (config_.publisher_kind == common::PublisherKind::kMooncake) {
-        auto decoded = DecodeMooncakeEventBatch(
-            static_cast<const char*>(payload_msg.data()), payload_msg.size());
+        auto decoded = DecodeMooncakeEventBatch(payload, payload_size);
         if (decoded.ok) {
             batch = std::move(decoded.batch);
         } else {
             decode_error = std::move(decoded.error);
         }
     } else {
-        auto decoded = DecodeVllmEventBatch(
-            static_cast<const char*>(payload_msg.data()), payload_msg.size());
+        auto decoded = DecodeVllmEventBatch(payload, payload_size);
         if (decoded.ok) {
             batch = std::move(decoded.batch);
         } else {
@@ -317,11 +403,17 @@ std::string ZMQClient::ProcessMessage() {
     }
 
     VLOG(1) << "Processed batch service=" << config_.cache_pool_key
-            << " seq=" << seq << " topic=" << topic;
+            << " seq=" << sequence << " topic=" << topic;
     return "";
 }
 
-std::string ZMQClient::RequestReplay(int64_t from_seq) {
+void ZMQClient::UpdateLastSequence(int64_t sequence) {
+    std::unique_lock lock(mu_);
+    last_seq_ = std::max(last_seq_, sequence);
+}
+
+std::string ZMQClient::RequestReplay(int64_t from_seq,
+                                     std::optional<int64_t> until_seq) {
     ::zmq::socket_t* socket;
     {
         std::shared_lock lock(mu_);
@@ -331,30 +423,137 @@ std::string ZMQClient::RequestReplay(int64_t from_seq) {
         return "replay socket is nil";
     }
 
+    auto fail = [this](std::string error) {
+        if (auto reset_error = ResetReplaySocket(); !reset_error.empty()) {
+            error += "; failed to reset replay socket: " + reset_error;
+        }
+        return error;
+    };
+
     unsigned char req[8];
     U64ToBigEndian(static_cast<uint64_t>(from_seq), req);
 
     try {
-        if (!socket->send(::zmq::buffer(req, sizeof(req)),
-                          ::zmq::send_flags::none)) {
-            return "failed to send replay request";
-        }
-
-        // Ideally we should wait for an ACK here if the protocol supports
-        // it; read a response from the DEALER socket.
         socket->set(::zmq::sockopt::rcvtimeo,
                     static_cast<int>(config_.replay_timeout.count()));
 
-        ::zmq::message_t resp;
-        if (!socket->recv(resp, ::zmq::recv_flags::none)) {
-            return "failed to receive replay response: resource temporarily "
-                   "unavailable";
+        // A DEALER must add the empty delimiter that a REQ socket would add
+        // automatically. vLLM's ROUTER expects [identity, empty, from_seq].
+        const std::string empty;
+        const std::array<::zmq::const_buffer, 2> request = {
+            ::zmq::buffer(empty),
+            ::zmq::buffer(req, sizeof(req)),
+        };
+        if (!::zmq::send_multipart(*socket, request)) {
+            return fail("failed to send replay request");
         }
 
-        LOG(INFO) << "Replay requested service=" << config_.cache_pool_key
-                  << " from=" << from_seq << " resp_len=" << resp.size();
+        struct ReplayMessage {
+            std::string topic;
+            int64_t sequence;
+            std::string payload;
+        };
+        std::vector<ReplayMessage> messages;
+        int64_t next_expected = from_seq;
+        while (true) {
+            std::vector<::zmq::message_t> frames;
+            const auto frame_count = ::zmq::recv_multipart(
+                *socket, std::back_inserter(frames), ::zmq::recv_flags::none);
+            if (!frame_count) {
+                return fail("failed to receive replay response: timed out");
+            }
+            if (frames.size() != 4 || !frames[0].empty()) {
+                return fail("invalid replay response frame count or delimiter");
+            }
+
+            auto& topic_msg = frames[1];
+            auto& seq_msg = frames[2];
+            auto& payload_msg = frames[3];
+            if (seq_msg.size() != 8) {
+                return fail("invalid replay sequence length");
+            }
+            const uint64_t raw_seq = BigEndianToU64(
+                static_cast<const unsigned char*>(seq_msg.data()));
+            if (raw_seq == std::numeric_limits<uint64_t>::max()) {
+                if (!topic_msg.empty() || !payload_msg.empty()) {
+                    return fail("invalid replay end marker");
+                }
+                if (until_seq.has_value() && next_expected < *until_seq) {
+                    return fail(
+                        "replay buffer did not contain every missing sequence");
+                }
+                for (const auto& message : messages) {
+                    if (auto err = DispatchMessage(
+                            message.topic, message.sequence,
+                            message.payload.data(), message.payload.size());
+                        !err.empty()) {
+                        return fail("failed to process replay message: " + err);
+                    }
+                    UpdateLastSequence(message.sequence);
+                }
+                LOG(INFO) << "Replay completed service="
+                          << config_.cache_pool_key << " from=" << from_seq
+                          << " replayed=" << messages.size();
+                return "";
+            }
+            if (raw_seq >
+                static_cast<uint64_t>(std::numeric_limits<int64_t>::max())) {
+                return fail("replay sequence exceeds int64 range");
+            }
+
+            const int64_t replay_seq = static_cast<int64_t>(raw_seq);
+            if (replay_seq < from_seq ||
+                (until_seq.has_value() && replay_seq >= *until_seq)) {
+                continue;
+            }
+            if (replay_seq < next_expected) {
+                continue;
+            }
+            if (replay_seq > next_expected) {
+                return fail("replay response skipped a sequence");
+            }
+            if (replay_seq == std::numeric_limits<int64_t>::max()) {
+                return fail("replay sequence cannot be incremented");
+            }
+            next_expected = replay_seq + 1;
+
+            messages.push_back(
+                {.topic =
+                     std::string(static_cast<const char*>(topic_msg.data()),
+                                 topic_msg.size()),
+                 .sequence = replay_seq,
+                 .payload =
+                     std::string(static_cast<const char*>(payload_msg.data()),
+                                 payload_msg.size())});
+        }
     } catch (const ::zmq::error_t& e) {
-        return std::string("failed to send replay request: ") + e.what();
+        return fail(std::string("replay request failed: ") + e.what());
+    }
+}
+
+std::string ZMQClient::ResetReplaySocket() {
+    std::unique_lock lock(mu_);
+    if (replay_socket_) {
+        try {
+            replay_socket_->close();
+        } catch (const ::zmq::error_t& e) {
+            replay_socket_.reset();
+            return e.what();
+        }
+        replay_socket_.reset();
+    }
+    if (!connected_ || !ReplayEnabled(config_)) {
+        return "";
+    }
+
+    try {
+        auto socket = std::make_unique<::zmq::socket_t>(
+            zmq_context_, ::zmq::socket_type::dealer);
+        socket->set(::zmq::sockopt::ipv6, 1);
+        socket->connect(config_.replay_endpoint);
+        replay_socket_ = std::move(socket);
+    } catch (const ::zmq::error_t& e) {
+        return e.what();
     }
     return "";
 }

@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <list>
 #include <map>
 #include <memory>
 #include <optional>
@@ -33,9 +34,15 @@ struct BlockPresence {
     }
 };
 
+// Maximum number of prefixes tracked for each context.
+constexpr size_t kDefaultMaxBlocks = 200000;
+// Target occupancy ratio for a batched capacity eviction.
+constexpr double kEvictTargetRatio = 0.9;
+
 struct ContextState {
-    explicit ContextState(HashProfile registered_profile)
-        : profile(std::move(registered_profile)) {}
+    explicit ContextState(HashProfile registered_profile,
+                          size_t block_limit = kDefaultMaxBlocks)
+        : profile(std::move(registered_profile)), max_blocks(block_limit) {}
 
     // Lock order is global context-map mutex, then this mutex. Code holding
     // this mutex must never reacquire the global mutex.
@@ -43,6 +50,15 @@ struct ContextState {
     const HashProfile profile;
     std::map<std::string, std::set<int64_t>> instance_ranks;
     std::unordered_map<ProjectedPrefix, BlockPresence> blocks;
+
+    // Store order: newest prefix at the front, oldest at the back. Query does
+    // not update this order, so read-only queries can keep a shared lock.
+    std::list<ProjectedPrefix> write_order;
+    std::unordered_map<ProjectedPrefix, std::list<ProjectedPrefix>::iterator>
+        order_pos;
+    const size_t max_blocks;
+    // Cumulative number of entries removed by capacity eviction.
+    int64_t evicted_by_capacity = 0;
 };
 
 struct RankCacheHitResult {
@@ -77,6 +93,8 @@ struct GlobalView {
 class PrefixCacheTable {
    public:
     PrefixCacheTable() = default;
+    // Per-context block limit; zero disables capacity eviction.
+    explicit PrefixCacheTable(size_t block_limit) : block_limit_(block_limit) {}
     PrefixCacheTable(const PrefixCacheTable&) = delete;
     PrefixCacheTable& operator=(const PrefixCacheTable&) = delete;
 
@@ -112,6 +130,7 @@ class PrefixCacheTable {
 
     mutable std::shared_mutex context_map_mutex_;
     std::unordered_map<ContextKey, std::shared_ptr<ContextState>> contexts_;
+    const size_t block_limit_ = kDefaultMaxBlocks;
 };
 
 }  // namespace prefixindex

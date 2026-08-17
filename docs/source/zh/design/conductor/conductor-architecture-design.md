@@ -189,7 +189,11 @@ CPU 和 Disk 最大值；Conductor 不会拼接不同 rank 的 GPU 块来制造�
 ## 当前限制
 
 - Conductor 连接后只能看到实时事件。当前 Mooncake 发布端不会在启动时发送此前已经缓存的对象列表。
-- 传输序号向前跳跃时，Conductor 会记录警告，但保留现有缓存记录。重新连接后，只有配置了 `replay_endpoint` 且 Conductor 已知上一个序号时，才会请求缺失事件；发出请求并不保证能够恢复全部记录。当前 Mooncake publisher 没有 replay 服务。
+- 传输序号向前跳跃时，Conductor 会记录警告，但保留现有缓存记录。对于配置了
+  `replay_endpoint` 的 vLLM 订阅，Conductor 会立即读取发布端的 multipart 重放流，
+  并在触发空缺的实时事件之前派发缺失事件。失败或不完整的区间会保留到后续实时
+  事件或重连时重试；如果发布端已经淘汰该区间，则不保证能够恢复。当前 Mooncake
+  publisher 没有 replay 服务。
 - Conductor 按收到的批次顺序处理 Mooncake 事件。它不会仅仅因为 `event_id` 重复就自动忽略事件。
 - vLLM 只提供 GPU 信息，Mooncake 只提供 CPU 或 Disk 信息。其他缓存位置会被忽略，并记录警告。
 - Conductor 会读取连接器 key 中的层和并行 rank 信息，但在报告共享缓存可用之前，不会检查是否已经收到所有层，也不会检查是否已经收到所有张量并行（tensor parallel，TP）、预填充上下文并行（prefill context parallel，PCP）、解码上下文并行（decode context parallel，DCP）或流水线并行（pipeline parallel，PP）部分。

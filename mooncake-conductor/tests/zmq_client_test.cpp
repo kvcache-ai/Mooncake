@@ -6,6 +6,7 @@
 #include <zmq.hpp>
 #include <zmq_addon.hpp>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -101,6 +102,15 @@ class MockEventHandler : public EventHandler {
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
         return FindBatch(sequence, endpoint).has_value();
+    }
+
+    size_t CountBatches(int64_t sequence, const std::string& endpoint) {
+        std::lock_guard<std::mutex> lock(mu_);
+        return static_cast<size_t>(std::count_if(
+            batches_.begin(), batches_.end(), [&](const HandledBatch& handled) {
+                return handled.metadata.sequence == sequence &&
+                       handled.metadata.endpoint == endpoint;
+            }));
     }
 
    private:
@@ -260,6 +270,16 @@ class MockPublisher {
 
     size_t ReplayRequestCount() const { return replay_requests_.load(); }
 
+    size_t ReplayEventCount() const { return replay_events_.load(); }
+
+    void SetReplayEndDelay(std::chrono::milliseconds delay) {
+        replay_end_delay_ms_.store(delay.count());
+    }
+
+    void SetReplayMaxSequence(uint64_t sequence) {
+        replay_max_sequence_.store(sequence);
+    }
+
     uint64_t LastReplayFromSequence() const {
         return last_replay_from_sequence_.load();
     }
@@ -282,10 +302,15 @@ class MockPublisher {
             const auto count = ::zmq::recv_multipart(
                 router_, std::back_inserter(frames), ::zmq::recv_flags::none);
             if (!count) continue;
-            if (frames.size() != 2 || frames[1].size() != 8) continue;
+            // REQ adds the empty delimiter automatically; Conductor's DEALER
+            // adds it explicitly. ROUTER therefore sees the vLLM shape below.
+            if (frames.size() != 3 || !frames[1].empty() ||
+                frames[2].size() != 8) {
+                continue;
+            }
 
             const auto* bytes =
-                static_cast<const unsigned char*>(frames[1].data());
+                static_cast<const unsigned char*>(frames[2].data());
             uint64_t from_sequence = 0;
             for (int index = 0; index < 8; ++index) {
                 from_sequence = (from_sequence << 8) | bytes[index];
@@ -293,11 +318,44 @@ class MockPublisher {
             last_replay_from_sequence_.store(from_sequence);
             replay_requests_.fetch_add(1);
 
-            std::array<::zmq::const_buffer, 2> reply = {
+            const std::string empty;
+            const std::string topic;
+            const uint64_t max_sequence = replay_max_sequence_.load();
+            for (uint64_t sequence = from_sequence; sequence <= max_sequence;
+                 ++sequence) {
+                std::array<unsigned char, 8> sequence_bytes{};
+                uint64_t value = sequence;
+                for (int index = 7; index >= 0; --index) {
+                    sequence_bytes[index] =
+                        static_cast<unsigned char>(value & 0xFF);
+                    value >>= 8;
+                }
+                const auto payload = PackVllmStoredBatch(sequence);
+                std::array<::zmq::const_buffer, 5> reply = {
+                    ::zmq::buffer(frames[0].data(), frames[0].size()),
+                    ::zmq::buffer(empty),
+                    ::zmq::buffer(topic),
+                    ::zmq::buffer(sequence_bytes),
+                    ::zmq::buffer(payload),
+                };
+                ::zmq::send_multipart(router_, reply);
+                replay_events_.fetch_add(1);
+            }
+
+            const auto delay = replay_end_delay_ms_.load();
+            if (delay > 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+            }
+            std::array<unsigned char, 8> end_sequence{};
+            end_sequence.fill(0xFF);
+            std::array<::zmq::const_buffer, 5> end = {
                 ::zmq::buffer(frames[0].data(), frames[0].size()),
-                ::zmq::buffer(std::string("OK")),
+                ::zmq::buffer(empty),
+                ::zmq::buffer(empty),
+                ::zmq::buffer(end_sequence),
+                ::zmq::buffer(empty),
             };
-            ::zmq::send_multipart(router_, reply);
+            ::zmq::send_multipart(router_, end);
         }
     }
 
@@ -306,6 +364,9 @@ class MockPublisher {
     ::zmq::socket_t router_;
     std::atomic<bool> closed_{false};
     std::atomic<size_t> replay_requests_{0};
+    std::atomic<size_t> replay_events_{0};
+    std::atomic<int64_t> replay_end_delay_ms_{0};
+    std::atomic<uint64_t> replay_max_sequence_{15};
     std::atomic<uint64_t> last_replay_from_sequence_{0};
     std::thread replay_thread_;
 };
@@ -368,6 +429,17 @@ TEST(ZMQClient, ConnectSuccessWithReplaySocket) {
     ZMQClient client(TestConfig(publisher), handler);
     EXPECT_EQ(client.Connect(), "");
     EXPECT_TRUE(ZMQClientTestPeer::HasReplaySocket(client));
+    client.Stop();
+}
+
+TEST(ZMQClient, MooncakeIgnoresVllmReplayEndpoint) {
+    MockPublisher publisher;
+    auto handler = std::make_shared<MockEventHandler>();
+    auto config = TestConfig(publisher);
+    config.publisher_kind = PublisherKind::kMooncake;
+    ZMQClient client(config, handler);
+    ASSERT_EQ(client.Connect(), "");
+    EXPECT_FALSE(ZMQClientTestPeer::HasReplaySocket(client));
     client.Stop();
 }
 
@@ -617,7 +689,7 @@ TEST(ZMQClient, SequenceTrackingWithReplayConfigured) {
     client.Stop();
 }
 
-TEST(ZMQClient, EventGapIsProcessedWithoutAutomaticReplay) {
+TEST(ZMQClient, EventGapReplaysMissingMessagesBeforeLiveMessage) {
     MockPublisher publisher;
     auto handler = std::make_shared<MockEventHandler>();
     const auto config = TestConfig(publisher);
@@ -629,10 +701,112 @@ TEST(ZMQClient, EventGapIsProcessedWithoutAutomaticReplay) {
     ASSERT_TRUE(PublishUntilHandled(*handler, 10, endpoint, [&] {
         publisher.Publish("", first_payload, 10);
     }));
+    EXPECT_EQ(client.GetDroppedEvents(), 0);
+    EXPECT_EQ(client.GetGapCount(), 0);
+
     publisher.Publish("", PackVllmStoredBatch(2), 15);
+    for (int64_t sequence = 11; sequence <= 14; ++sequence) {
+        ASSERT_TRUE(
+            handler->WaitForBatch(sequence, endpoint, std::chrono::seconds(2)));
+    }
     ASSERT_TRUE(handler->WaitForBatch(15, endpoint, std::chrono::seconds(2)));
     EXPECT_EQ(client.GetLastSequence(), 15);
+    EXPECT_EQ(publisher.ReplayRequestCount(), 1u);
+    EXPECT_EQ(publisher.ReplayEventCount(), 5u);
+    EXPECT_EQ(handler->CountBatches(15, endpoint), 1u);
+    EXPECT_EQ(client.GetDroppedEvents(), 4);
+    EXPECT_EQ(client.GetGapCount(), 1);
+    client.Stop();
+}
+
+TEST(ZMQClient, ReplayTimeoutResetsSocketBeforeNextRequest) {
+    MockPublisher publisher;
+    auto handler = std::make_shared<MockEventHandler>();
+    auto config = TestConfig(publisher);
+    config.replay_timeout = std::chrono::milliseconds(100);
+    const std::string endpoint = config.endpoint;
+    ZMQClient client(config, handler);
+    ASSERT_EQ(client.Start(), "");
+
+    ASSERT_TRUE(PublishUntilHandled(*handler, 10, endpoint, [&] {
+        publisher.Publish("", PackVllmStoredBatch(1), 10);
+    }));
+
+    publisher.SetReplayEndDelay(std::chrono::milliseconds(150));
+    publisher.Publish("", PackVllmStoredBatch(2), 15);
+    ASSERT_TRUE(handler->WaitForBatch(15, endpoint, std::chrono::seconds(2)));
+    ASSERT_TRUE(publisher.WaitForReplayRequests(1, std::chrono::seconds(1)));
+
+    publisher.SetReplayEndDelay(std::chrono::milliseconds(0));
+    publisher.SetReplayMaxSequence(20);
+    publisher.Publish("", PackVllmStoredBatch(3), 20);
+    for (int64_t sequence = 16; sequence <= 19; ++sequence) {
+        ASSERT_TRUE(
+            handler->WaitForBatch(sequence, endpoint, std::chrono::seconds(2)));
+    }
+    EXPECT_TRUE(handler->WaitForBatch(20, endpoint, std::chrono::seconds(2)));
+    for (int64_t sequence = 11; sequence <= 14; ++sequence) {
+        EXPECT_EQ(handler->CountBatches(sequence, endpoint), 1u);
+    }
+    EXPECT_EQ(handler->CountBatches(15, endpoint), 1u);
+    EXPECT_EQ(publisher.ReplayRequestCount(), 3u);
+    EXPECT_EQ(client.GetLastSequence(), 20);
+    client.Stop();
+}
+
+TEST(ZMQClient, PendingReplayRangeRetainsLiveBoundaryAcrossReconnect) {
+    MockPublisher publisher;
+    auto handler = std::make_shared<MockEventHandler>();
+    auto config = TestConfig(publisher);
+    config.replay_timeout = std::chrono::milliseconds(100);
+    const std::string endpoint = config.endpoint;
+    ZMQClient client(config, handler);
+    ASSERT_EQ(client.Start(), "");
+
+    ASSERT_TRUE(PublishUntilHandled(*handler, 10, endpoint, [&] {
+        publisher.Publish("", PackVllmStoredBatch(1), 10);
+    }));
+
+    publisher.SetReplayEndDelay(std::chrono::milliseconds(150));
+    publisher.Publish("", PackVllmStoredBatch(2), 15);
+    ASSERT_TRUE(handler->WaitForBatch(15, endpoint, std::chrono::seconds(2)));
+    ASSERT_TRUE(publisher.WaitForReplayRequests(1, std::chrono::seconds(1)));
+
+    publisher.SetReplayEndDelay(std::chrono::milliseconds(0));
+    publisher.SetReplayMaxSequence(15);
+    ZMQClientTestPeer::MarkDisconnected(client);
+    ASSERT_TRUE(publisher.WaitForReplayRequests(3, std::chrono::seconds(3)));
+
+    for (int64_t sequence = 11; sequence <= 14; ++sequence) {
+        ASSERT_TRUE(
+            handler->WaitForBatch(sequence, endpoint, std::chrono::seconds(2)));
+    }
+    EXPECT_EQ(handler->CountBatches(15, endpoint), 1u);
+    EXPECT_EQ(client.GetLastSequence(), 15);
+    EXPECT_EQ(publisher.ReplayRequestCount(), 3u);
+    EXPECT_EQ(publisher.LastReplayFromSequence(), 16u);
+    client.Stop();
+}
+
+TEST(ZMQClient, EventGapIsAccountedWhenReplayUnavailable) {
+    MockPublisher publisher;
+    auto handler = std::make_shared<MockEventHandler>();
+    auto config = TestConfig(publisher);
+    config.replay_endpoint.clear();
+    const std::string endpoint = config.endpoint;
+    ZMQClient client(config, handler);
+    ASSERT_EQ(client.Start(), "");
+
+    const auto first_payload = PackVllmStoredBatch(1);
+    ASSERT_TRUE(PublishUntilHandled(*handler, 10, endpoint, [&] {
+        publisher.Publish("", first_payload, 10);
+    }));
+    publisher.Publish("", PackVllmStoredBatch(2), 13);
+    ASSERT_TRUE(handler->WaitForBatch(13, endpoint, std::chrono::seconds(2)));
+    EXPECT_EQ(client.GetLastSequence(), 13);
     EXPECT_EQ(publisher.ReplayRequestCount(), 0u);
+    EXPECT_EQ(client.GetDroppedEvents(), 2);
+    EXPECT_EQ(client.GetGapCount(), 1);
     client.Stop();
 }
 
@@ -649,8 +823,14 @@ TEST(ZMQClient, ReconnectRequestsReplayFromNextSequence) {
 
     EXPECT_TRUE(ZMQClientTestPeer::IsConnected(client));
     ASSERT_TRUE(publisher.WaitForReplayRequests(1, std::chrono::seconds(2)));
+    for (int64_t sequence = 11; sequence <= 15; ++sequence) {
+        ASSERT_TRUE(handler->WaitForBatch(sequence, publisher.PubEndpoint(),
+                                          std::chrono::seconds(2)));
+    }
     EXPECT_EQ(publisher.ReplayRequestCount(), 1u);
     EXPECT_EQ(publisher.LastReplayFromSequence(), 11u);
+    EXPECT_EQ(publisher.ReplayEventCount(), 5u);
+    EXPECT_EQ(client.GetLastSequence(), 15);
     client.Stop();
 }
 

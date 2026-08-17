@@ -206,15 +206,25 @@ event context.
 ## Plan for sequence gaps and reconnects
 
 Conductor records the last transport sequence received for each subscription.
-When a later value jumps forward, Conductor logs a warning and keeps its
-current cache records. The gap does not trigger an immediate resend request or
-invalidate possibly stale records.
+When a later value jumps forward, Conductor logs the gap and updates its
+cumulative dropped-event and gap counters. For a vLLM subscription with a
+configured `replay_endpoint`, it requests messages beginning at the first
+missing sequence, consumes the vLLM multipart replay stream through its end
+marker, and dispatches recovered messages before the live message that exposed
+the gap. Replay messages at or beyond that live sequence are drained but not
+dispatched twice.
+
+If the replay request fails, its buffer no longer contains every missing
+sequence, or no `replay_endpoint` is configured, Conductor logs a warning and
+continues with the live message. A failed vLLM range remains pending and is
+retried by a later live message or reconnect, while cache records can still
+remain incomplete or stale if the publisher has evicted the range; Conductor
+does not invalidate them automatically.
 
 After a disconnect, Conductor reconnects the live subscription. Only when
 `replay_endpoint` was configured and a previous sequence is known does it ask
-that endpoint for messages beginning at the next sequence. Sending the request
-and receiving a response do not guarantee that every missed cache change is
-recovered. An empty replay endpoint is valid and creates a live-only
+that endpoint for messages beginning at the next sequence and dispatch the
+returned stream. An empty replay endpoint is valid and creates a live-only
 subscription.
 
 The current Mooncake publisher has no replay endpoint and sends no startup
