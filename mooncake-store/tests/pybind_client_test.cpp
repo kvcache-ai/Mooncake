@@ -254,6 +254,54 @@ TEST_F(RealClientTest, PinnedSsdRestoreReadsNonTailRangeIntoGpu) {
 }
 #endif
 
+TEST_F(RealClientTest, SsdOffloadConfigDefaultsToStableRpcPort) {
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+
+    char path[] = "/tmp/mooncake_ssd_default_rpc_port_XXXXXX";
+    const char* created = mkdtemp(path);
+    ASSERT_NE(created, nullptr);
+    ssd_path_ = created;
+
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(10)
+                                  .build()));
+    master_address_ = master_.master_address();
+    auto config = MakeConfigDict("localhost:17813", "16MB", "16MB");
+    config["enable_ssd_offload"] = "true";
+    config["ssd_offload_path"] = ssd_path_;
+    ASSERT_FALSE(config.contains(CONFIG_KEY_LOCAL_RPC_PORT));
+    ASSERT_TRUE(py_client_->setup_internal(config).has_value());
+
+    const std::string key = "default_ssd_rpc_port";
+    std::vector<char> value(64 * 1024, 'x');
+    ASSERT_EQ(py_client_->put(key, value), 0);
+
+    std::optional<Replica::Descriptor> local_disk_replica;
+    const auto offload_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (std::chrono::steady_clock::now() < offload_deadline &&
+           !local_disk_replica.has_value()) {
+        for (const auto& replica : py_client_->get_replica_desc(key)) {
+            if (replica.is_local_disk_replica()) {
+                local_disk_replica = replica;
+                break;
+            }
+        }
+        if (!local_disk_replica.has_value()) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+
+    ASSERT_TRUE(local_disk_replica.has_value());
+    EXPECT_EQ("localhost:50052", local_disk_replica->get_local_disk_descriptor()
+                                       .transport_endpoint);
+}
+
 TEST_F(RealClientTest, AllocateAndMountSegmentAlignsAndUnmounts) {
     StartMasterAndSetupClient();
 

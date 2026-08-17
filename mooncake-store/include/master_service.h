@@ -1812,6 +1812,16 @@ class MasterService {
     void ReleaseLocalDiskUsage(
         const std::unordered_map<UUID, int64_t, boost::hash<UUID>>&
             bytes_by_client);
+    struct LocalDiskReplicaTransition {
+        bool transferred_ownership = false;
+        std::unordered_map<UUID, int64_t, boost::hash<UUID>> replaced_usage;
+    };
+    auto AddReplicaImpl(const UUID& client_id, const std::string& key,
+                        const TenantId& tenant_id, Replica& replica,
+                        bool allow_existing_offloading_task,
+                        bool reporting_segment_mounted,
+                        LocalDiskReplicaTransition& transition)
+        -> tl::expected<bool, ErrorCode>;
     enum class QuotaEraseMode {
         kFull,
         kPreserveOld,

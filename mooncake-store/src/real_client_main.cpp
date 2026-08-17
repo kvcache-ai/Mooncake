@@ -32,7 +32,8 @@ DECLARE_int32(http_port);
 
 namespace mooncake {
 void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
-                              RealClient &real_client) {
+                              RealClient &real_client,
+                              bool expose_offload_rpc) {
     server.register_handler<&RealClient::put_dummy_helper>(&real_client);
     server.register_handler<&RealClient::put_batch_dummy_helper>(&real_client);
     server.register_handler<&RealClient::put_parts_dummy_helper>(&real_client);
@@ -97,9 +98,12 @@ void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
     server.register_handler<&RealClient::create_copy_task>(&real_client);
     server.register_handler<&RealClient::create_move_task>(&real_client);
     server.register_handler<&RealClient::query_task>(&real_client);
-    server.register_handler<&RealClient::batch_get_offload_object>(
-        &real_client);
-    server.register_handler<&RealClient::release_offload_buffer>(&real_client);
+    if (expose_offload_rpc) {
+        server.register_handler<&RealClient::batch_get_offload_object>(
+            &real_client);
+        server.register_handler<&RealClient::release_offload_buffer>(
+            &real_client);
+    }
 }
 }  // namespace mooncake
 
@@ -128,7 +132,8 @@ int main(int argc, char *argv[]) {
         local_buffer_size, FLAGS_protocol, FLAGS_device_names,
         FLAGS_master_server_address, nullptr,
         "@mooncake_client_" + std::to_string(FLAGS_port) + ".sock", FLAGS_port,
-        FLAGS_enable_offload, FLAGS_start_offload_rpc_server, "",
+        FLAGS_enable_offload,
+        /*start_offload_rpc_server=*/false, "",
         FLAGS_tenant_id, FLAGS_enable_http_server, FLAGS_http_port);
     if (!res) {
         LOG(FATAL) << "Failed to setup client: " << toString(res.error());
@@ -142,7 +147,9 @@ int main(int argc, char *argv[]) {
 
     auto rpc_bind_host = getHostNameWithoutPort(FLAGS_host);
     coro_rpc::coro_rpc_server server(FLAGS_threads, FLAGS_port, rpc_bind_host);
-    RegisterClientRpcService(server, *client_inst);
+    RegisterClientRpcService(server, *client_inst,
+                             FLAGS_enable_offload &&
+                                 FLAGS_start_offload_rpc_server);
 
     LOG(INFO) << "Starting real client service on " << rpc_bind_host << ":"
               << FLAGS_port;

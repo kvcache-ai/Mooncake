@@ -702,6 +702,31 @@ class MasterServiceHATest : public ::testing::Test {
         return access.getSsdUsedBytes(segment_name);
     }
 
+    static void EnsureOffloadingTaskForTesting(MasterService& service,
+                                               const TenantId& tenant_id,
+                                               const std::string& key) {
+        MasterService::MetadataAccessorRW accessor(
+            &service, MasterService::ObjectIdentity{tenant_id, key});
+        ASSERT_TRUE(accessor.Exists());
+        auto& tenant_state = accessor.GetTenantState();
+        if (tenant_state.offloading_tasks.contains(key)) {
+            return;
+        }
+
+        ReplicaID source_id = 0;
+        accessor.Get().VisitReplicas(
+            [](const Replica& replica) {
+                return replica.is_memory_replica() && replica.is_completed();
+            },
+            [&source_id](Replica& replica) {
+                source_id = replica.id();
+                replica.inc_refcnt();
+            });
+        ASSERT_NE(source_id, 0);
+        tenant_state.offloading_tasks.emplace(
+            key, OffloadingTask{source_id, std::chrono::system_clock::now(), {}});
+    }
+
     std::vector<std::string> policy_files_;
     int next_policy_file_{0};
 };
@@ -1770,6 +1795,62 @@ TEST_F(MasterServiceBatchRecordE2ETest, StandbyAppliesPrimaryBatchRecords) {
     EXPECT_EQ(2u, result.applied_entries);
     EXPECT_EQ(3u, applier.GetExpectedSequenceId());
     EXPECT_TRUE(standby_metadata.Exists(kDefaultTenant.value(), key));
+}
+
+TEST_F(MasterServiceBatchRecordE2ETest,
+       NotifyOffloadSuccessWithTaskPersistsSharedLocalDiskTransition) {
+    const std::string cluster_id = "test_local_disk_task_transition";
+    auto backend = std::make_shared<FakeBatchHaKvBackend>();
+    auto service_config = MasterServiceConfig::builder()
+                              .set_enable_ha(true)
+                              .set_enable_oplog(true)
+                              .set_enable_offload(true)
+                              .set_cluster_id(cluster_id)
+                              .set_oplog_batch_max_entries(1)
+                              .build();
+    MasterService service(service_config);
+    ASSERT_EQ(ErrorCode::OK, service.SetBatchOpLogBackendForTesting(backend));
+
+    const std::string segment_name = "local_disk_task_transition_segment";
+    auto mounted = PrepareSimpleSegment(service, segment_name);
+    ASSERT_TRUE(
+        service.MountLocalDiskSegment(mounted.client_id, true).has_value());
+    OpLogBatchStorage storage(cluster_id, *backend);
+    OpLogBatchRecord batch;
+    ReadBatchEventually(storage, 1, batch);
+
+    const std::string key = "local_disk_task_transition_key";
+    PutObjectOnSegment(service, mounted.client_id, key, segment_name);
+    ReadBatchEventually(storage, 2, batch);
+    EnsureOffloadingTaskForTesting(service, kDefaultTenant, key);
+
+    OffloadTaskItem task{
+        .tenant_id = kDefaultTenant.value(), .key = key, .size = 1024};
+    StorageObjectMetadata metadata{};
+    metadata.data_size = 1024;
+    metadata.transport_endpoint = "local_disk_task_transition_endpoint";
+    ASSERT_TRUE(service.NotifyOffloadSuccess(mounted.client_id, {task}, {metadata})
+                    .has_value());
+    ReadBatchEventually(storage, 3, batch);
+    ASSERT_EQ(1u, batch.entries.size());
+    EXPECT_EQ(OpType::PUT_END, batch.entries[0].op_type);
+
+    MetadataPayload payload;
+    ASSERT_EQ(struct_pack::errc::ok,
+              struct_pack::deserialize_to(payload, batch.entries[0].payload));
+    auto persisted_local_disk =
+        std::find_if(payload.replicas.begin(), payload.replicas.end(),
+                     [](const Replica::Descriptor& replica) {
+                         return replica.is_local_disk_replica();
+                     });
+    ASSERT_NE(payload.replicas.end(), persisted_local_disk);
+    EXPECT_EQ(mounted.client_id,
+              persisted_local_disk->get_local_disk_descriptor().client_id);
+    EXPECT_EQ("local_disk_task_transition_endpoint",
+              persisted_local_disk->get_local_disk_descriptor()
+                  .transport_endpoint);
+    EXPECT_EQ(1024,
+              GetLocalDiskUsedBytesForTesting(service, segment_name));
 }
 
 TEST_F(MasterServiceBatchRecordE2ETest,

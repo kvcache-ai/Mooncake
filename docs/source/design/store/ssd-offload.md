@@ -89,7 +89,7 @@ Step by step:
 2. **Read slices from memory**: `FileStorage::OffloadObjects` groups the keys into buckets (for `BucketStorageBackend`) and calls `BatchQuerySegmentSlices` to obtain `{key → Slice}` from the local memory segment via `client_->BatchQuery`.
 3. **Eviction** (if capacity limit is set): Before writing, `PrepareEviction` removes old buckets from metadata under the exclusive lock and collects their keys. The `eviction_handler` callback calls `client_->BatchEvictDiskReplica` to notify the master in one batched RPC. `FinalizeEviction` then deletes the corresponding files.
 4. **Write to SSD**: `StorageBackend::BatchOffload` serializes and writes the key-value data to disk.
-5. **Notify master**: On success, the `complete_handler` calls `client_->NotifyOffloadSuccess(keys, metadatas)`. The master adds a `LOCAL_DISK` replica entry (carrying the real client's RPC address as `transport_endpoint`) to the object's replica list. For restart recovery, this endpoint must remain stable across client UUID rotations and uniquely identify one physical local-disk instance.
+5. **Notify master**: On success, the `complete_handler` calls `client_->NotifyOffloadSuccess(keys, metadatas)`. The master adds a `LOCAL_DISK` replica entry carrying the real client's RPC address as `transport_endpoint`. For restart recovery, this endpoint is derived from the configured `local_rpc_port` (default `50052`), not an OS-assigned port; it must remain stable across client UUID rotations and uniquely identify one physical local-disk instance. Deployments with multiple real clients on one host must assign each client a distinct stable port.
 
 ### Load (SSD → memory)
 
