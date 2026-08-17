@@ -2858,45 +2858,18 @@ auto MasterService::QuerySegmentStatusById(const UUID& segment_id)
     return status;
 }
 
-void MasterService::RestoreFromStandbySnapshot(
+tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
     const std::vector<StandbyObjectEntry>& objects,
     uint64_t initial_oplog_sequence_id,
     const std::vector<StandbySegmentInfo>& segments) {
     if (enable_dfs_) {
-        throw std::runtime_error(
-            "DFS standby restore requires DFS allocator state restoration");
+        LOG(ERROR) << "RestoreFromStandbySnapshot: DFS allocator state "
+                      "restoration is not supported";
+        return tl::make_unexpected(ErrorCode::DFS_SERVICE_UNAVAILABLE);
     }
     // The ordered writer initializes its sequence from durable_prefix.
-    (void)initial_oplog_sequence_id;
+    std::unique_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
 
-    // 2. Build allocator keepalive map for standby segments.
-    for (const auto& [segment, bytes] : standby_accounted_memory_bytes_) {
-        MasterMetricManager::instance().dec_allocated_mem_size(
-            segment, static_cast<int64_t>(bytes));
-    }
-    standby_accounted_memory_bytes_.clear();
-    standby_memory_segments_.clear();
-    standby_allocator_keepalive_.clear();
-    invalid_replica_endpoints_.clear();
-    for (const auto& seg : segments) {
-        if (seg.is_memory_segment) {
-            standby_memory_segments_.push_back(seg);
-            auto allocator = std::make_shared<DummyBufferAllocator>(
-                seg.segment_name, seg.transport_endpoint);
-            standby_allocator_keepalive_[seg.transport_endpoint] = allocator;
-            if (seg.segment_name != seg.transport_endpoint) {
-                standby_allocator_keepalive_[seg.segment_name] = allocator;
-            }
-        }
-        if (!segment_manager_.HasSegmentByEndpoint(seg.transport_endpoint)) {
-            invalid_replica_endpoints_.insert(seg.transport_endpoint);
-            if (seg.segment_name != seg.transport_endpoint) {
-                invalid_replica_endpoints_.insert(seg.segment_name);
-            }
-        }
-    }
-
-    // 3. Restore object metadata.
     const auto resolve_standby_object = [](const StandbyObjectEntry& entry) {
         auto [scoped_tenant_id, user_key] = TenantId::ParseScopedKey(entry.key);
         TenantId tenant_id(entry.tenant_id);
@@ -2906,93 +2879,242 @@ void MasterService::RestoreFromStandbySnapshot(
         return std::make_pair(std::move(tenant_id), std::move(user_key));
     };
 
-    std::unordered_map<size_t, std::vector<const StandbyObjectEntry*>>
-        objects_by_shard;
+    std::vector<StandbySegmentInfo> restored_memory_segments;
+    std::unordered_map<std::string, const StandbySegmentInfo*>
+        memory_segments_by_alias;
+    std::unordered_map<std::string, std::shared_ptr<BufferAllocatorBase>>
+        restored_allocators;
+    std::unordered_set<std::string> restored_invalid_endpoints;
+    for (const auto& seg : segments) {
+        if (!seg.is_memory_segment) {
+            continue;
+        }
+        if (seg.segment_name.empty() || seg.transport_endpoint.empty() ||
+            seg.capacity == 0) {
+            LOG(ERROR) << "RestoreFromStandbySnapshot: invalid memory segment "
+                       << "name=" << seg.segment_name
+                       << ", endpoint=" << seg.transport_endpoint
+                       << ", capacity=" << seg.capacity;
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        const auto add_alias = [&](const std::string& alias) {
+            return memory_segments_by_alias.emplace(alias, &seg).second;
+        };
+        if (!add_alias(seg.transport_endpoint) ||
+            (seg.segment_name != seg.transport_endpoint &&
+             !add_alias(seg.segment_name))) {
+            LOG(ERROR)
+                << "RestoreFromStandbySnapshot: ambiguous memory segment "
+                << "name=" << seg.segment_name
+                << ", endpoint=" << seg.transport_endpoint;
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+
+        restored_memory_segments.push_back(seg);
+        auto allocator = std::make_shared<DummyBufferAllocator>(
+            seg.segment_name, seg.transport_endpoint);
+        restored_allocators[seg.transport_endpoint] = allocator;
+        if (seg.segment_name != seg.transport_endpoint) {
+            restored_allocators[seg.segment_name] = allocator;
+        }
+        if (!segment_manager_.HasSegmentByEndpoint(seg.transport_endpoint)) {
+            restored_invalid_endpoints.insert(seg.transport_endpoint);
+            if (seg.segment_name != seg.transport_endpoint) {
+                restored_invalid_endpoints.insert(seg.segment_name);
+            }
+        }
+    }
+
+    struct PreparedObject {
+        const StandbyObjectEntry* entry;
+        TenantId tenant_id;
+        std::string user_key;
+        std::vector<Replica> replicas;
+    };
+    std::unordered_map<size_t, std::vector<PreparedObject>> objects_by_shard;
+    std::unordered_set<std::string> object_ids;
+    std::unordered_map<const StandbySegmentInfo*,
+                       std::vector<std::pair<uintptr_t, uint64_t>>>
+        memory_ranges;
+    std::unordered_map<std::string, uint64_t> restored_accounted_memory_bytes;
+
     for (const auto& entry : objects) {
         auto [tenant_id, user_key] = resolve_standby_object(entry);
         if (!tenant_id.IsValid()) {
-            LOG(WARNING) << "RestoreFromStandbySnapshot: invalid tenant_id="
-                         << entry.tenant_id << ", key=" << entry.key
-                         << ", skipping";
-            continue;
+            LOG(ERROR) << "RestoreFromStandbySnapshot: invalid tenant_id="
+                       << entry.tenant_id << ", key=" << entry.key;
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
+        if (!object_ids.insert(tenant_id.MakeScopedKey(user_key)).second) {
+            LOG(ERROR)
+                << "RestoreFromStandbySnapshot: duplicate object, tenant="
+                << tenant_id.value() << ", key=" << user_key;
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if (entry.metadata.last_sequence_id > initial_oplog_sequence_id) {
+            LOG(ERROR) << "RestoreFromStandbySnapshot: object cursor "
+                       << entry.metadata.last_sequence_id
+                       << " exceeds snapshot cursor "
+                       << initial_oplog_sequence_id
+                       << ", tenant=" << tenant_id.value()
+                       << ", key=" << user_key;
+            return tl::make_unexpected(ErrorCode::INVALID_VERSION);
+        }
+
         const auto shard_idx = entry.metadata.group_id.empty()
                                    ? getShardIndex(tenant_id, user_key)
                                    : getShardIndex(entry.metadata.group_id);
-        objects_by_shard[shard_idx].push_back(&entry);
+        const auto& standby_meta = entry.metadata;
+        std::vector<Replica> replicas;
+        replicas.reserve(standby_meta.replicas.size());
+
+        for (const auto& desc : standby_meta.replicas) {
+            if (desc.is_memory_replica()) {
+                const auto& buffer =
+                    desc.get_memory_descriptor().buffer_descriptor;
+                auto segment_it =
+                    memory_segments_by_alias.find(buffer.transport_endpoint_);
+                if (segment_it == memory_segments_by_alias.end()) {
+                    LOG(ERROR) << "RestoreFromStandbySnapshot: unknown memory "
+                               << "endpoint=" << buffer.transport_endpoint_
+                               << ", tenant=" << tenant_id.value()
+                               << ", key=" << user_key;
+                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                }
+                if (buffer.size_ != standby_meta.size || buffer.size_ == 0 ||
+                    buffer.buffer_address_ >
+                        std::numeric_limits<uintptr_t>::max() - buffer.size_) {
+                    LOG(ERROR) << "RestoreFromStandbySnapshot: invalid memory "
+                               << "descriptor, tenant=" << tenant_id.value()
+                               << ", key=" << user_key;
+                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                }
+
+                const auto* segment = segment_it->second;
+                if (desc.status != ReplicaStatus::REMOVED &&
+                    desc.status != ReplicaStatus::FAILED) {
+                    auto& bytes =
+                        restored_accounted_memory_bytes[segment->segment_name];
+                    if (bytes > segment->capacity ||
+                        buffer.size_ > segment->capacity - bytes) {
+                        LOG(ERROR)
+                            << "RestoreFromStandbySnapshot: memory descriptors "
+                            << "exceed segment capacity, segment="
+                            << segment->segment_name;
+                        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                    }
+                    bytes += buffer.size_;
+                    memory_ranges[segment].emplace_back(buffer.buffer_address_,
+                                                        buffer.size_);
+                }
+
+                auto alloc = restored_allocators.at(buffer.transport_endpoint_);
+                replicas.emplace_back(
+                    std::make_unique<AllocatedBuffer>(alloc, buffer),
+                    desc.status);
+            } else if (desc.is_nof_replica()) {
+                const auto& buffer =
+                    desc.get_nof_descriptor().buffer_descriptor;
+                if (buffer.size_ != standby_meta.size || buffer.size_ == 0) {
+                    LOG(ERROR) << "RestoreFromStandbySnapshot: invalid NoF "
+                               << "descriptor, tenant=" << tenant_id.value()
+                               << ", key=" << user_key;
+                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                }
+                auto& alloc = restored_allocators[buffer.transport_endpoint_];
+                if (!alloc) {
+                    alloc = std::make_shared<DummyBufferAllocator>(
+                        buffer.transport_endpoint_, buffer.transport_endpoint_);
+                }
+                replicas.emplace_back(
+                    std::make_unique<AllocatedBuffer>(alloc, buffer),
+                    desc.status, ReplicaType::NOF_SSD);
+            } else if (desc.is_disk_replica()) {
+                const auto& disk_desc = desc.get_disk_descriptor();
+                if (disk_desc.object_size != standby_meta.size) {
+                    LOG(ERROR) << "RestoreFromStandbySnapshot: invalid disk "
+                               << "descriptor, tenant=" << tenant_id.value()
+                               << ", key=" << user_key;
+                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                }
+                replicas.emplace_back(disk_desc.file_path,
+                                      disk_desc.object_size, desc.status);
+            } else {
+                const auto& local_disk_desc = desc.get_local_disk_descriptor();
+                if (local_disk_desc.object_size != standby_meta.size) {
+                    LOG(ERROR)
+                        << "RestoreFromStandbySnapshot: invalid local disk "
+                        << "descriptor, tenant=" << tenant_id.value()
+                        << ", key=" << user_key;
+                    return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+                }
+                replicas.emplace_back(
+                    local_disk_desc.client_id, local_disk_desc.object_size,
+                    local_disk_desc.transport_endpoint, desc.status);
+            }
+        }
+        objects_by_shard[shard_idx].push_back({&entry, std::move(tenant_id),
+                                               std::move(user_key),
+                                               std::move(replicas)});
+    }
+
+    for (auto& [segment, ranges] : memory_ranges) {
+        (void)segment;
+        std::sort(ranges.begin(), ranges.end());
+        for (size_t i = 1; i < ranges.size(); ++i) {
+            if (ranges[i].first < ranges[i - 1].first + ranges[i - 1].second) {
+                LOG(ERROR) << "RestoreFromStandbySnapshot: overlapping memory "
+                           << "descriptors";
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+        }
     }
 
     for (const auto& [shard_idx, shard_objects] : objects_by_shard) {
         MetadataShardAccessorRW shard(this, shard_idx);
-        auto now = std::chrono::system_clock::now();
-        for (const auto* entry_ptr : shard_objects) {
-            const auto& entry = *entry_ptr;
-            auto [tenant_id, user_key] = resolve_standby_object(entry);
-            const auto& standby_meta = entry.metadata;
-            std::vector<Replica> replicas;
-            replicas.reserve(standby_meta.replicas.size());
-
-            for (const auto& desc : standby_meta.replicas) {
-                if (desc.is_memory_replica()) {
-                    const auto& mem_desc = desc.get_memory_descriptor();
-                    const std::string& endpoint =
-                        mem_desc.buffer_descriptor.transport_endpoint_;
-                    auto it = standby_allocator_keepalive_.find(endpoint);
-                    if (it != standby_allocator_keepalive_.end()) {
-                        auto alloc = it->second;
-                        replicas.emplace_back(
-                            std::make_unique<AllocatedBuffer>(
-                                alloc, mem_desc.buffer_descriptor),
-                            desc.status);
-                        MasterMetricManager::instance().inc_allocated_mem_size(
-                            alloc->getSegmentName(),
-                            static_cast<int64_t>(
-                                mem_desc.buffer_descriptor.size_));
-                        standby_accounted_memory_bytes_
-                            [alloc->getSegmentName()] +=
-                            mem_desc.buffer_descriptor.size_;
-                    } else {
-                        invalid_replica_endpoints_.insert(endpoint);
-                    }
-                } else if (desc.is_nof_replica()) {
-                    const auto& nof_desc = desc.get_nof_descriptor();
-                    const std::string& endpoint =
-                        nof_desc.buffer_descriptor.transport_endpoint_;
-                    auto& alloc = standby_allocator_keepalive_[endpoint];
-                    if (!alloc) {
-                        alloc = std::make_shared<DummyBufferAllocator>(
-                            endpoint, endpoint);
-                    }
-                    replicas.emplace_back(
-                        std::make_unique<AllocatedBuffer>(
-                            alloc, nof_desc.buffer_descriptor),
-                        desc.status, ReplicaType::NOF_SSD);
-                } else if (desc.is_disk_replica()) {
-                    const auto& disk_desc = desc.get_disk_descriptor();
-                    replicas.emplace_back(disk_desc.file_path,
-                                          disk_desc.object_size, desc.status);
-                } else if (desc.is_local_disk_replica()) {
-                    const auto& local_disk_desc =
-                        desc.get_local_disk_descriptor();
-                    replicas.emplace_back(
-                        local_disk_desc.client_id, local_disk_desc.object_size,
-                        local_disk_desc.transport_endpoint, desc.status);
-                }
+        for (const auto& object : shard_objects) {
+            auto tenant = shard->tenants.find(object.tenant_id);
+            if (tenant != shard->tenants.end() &&
+                tenant->second.metadata.contains(object.user_key)) {
+                return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
             }
+        }
+    }
 
-            auto& tenant_state = GetOrCreateTenantState(shard.get(), tenant_id);
+    for (const auto& [segment, bytes] : standby_accounted_memory_bytes_) {
+        MasterMetricManager::instance().dec_allocated_mem_size(
+            segment, static_cast<int64_t>(bytes));
+    }
+    for (const auto& [segment, bytes] : restored_accounted_memory_bytes) {
+        MasterMetricManager::instance().inc_allocated_mem_size(
+            segment, static_cast<int64_t>(bytes));
+    }
+    standby_accounted_memory_bytes_ =
+        std::move(restored_accounted_memory_bytes);
+    standby_memory_segments_ = std::move(restored_memory_segments);
+    standby_allocator_keepalive_ = std::move(restored_allocators);
+    invalid_replica_endpoints_ = std::move(restored_invalid_endpoints);
+
+    const auto now = std::chrono::system_clock::now();
+    for (auto& [shard_idx, shard_objects] : objects_by_shard) {
+        MetadataShardAccessorRW shard(this, shard_idx);
+        for (auto& object : shard_objects) {
+            const auto& standby_meta = object.entry->metadata;
+            auto& tenant_state =
+                GetOrCreateTenantState(shard.get(), object.tenant_id);
             tenant_state.metadata.emplace(
-                std::piecewise_construct, std::forward_as_tuple(user_key),
+                std::piecewise_construct,
+                std::forward_as_tuple(object.user_key),
                 std::forward_as_tuple(
                     standby_meta.client_id, now, standby_meta.size,
-                    std::move(replicas), std::nullopt, false,
-                    standby_meta.data_type, standby_meta.group_id, tenant_id,
-                    user_key));
+                    std::move(object.replicas), std::nullopt, false,
+                    standby_meta.data_type, standby_meta.group_id,
+                    object.tenant_id, object.user_key));
             if (!standby_meta.group_id.empty()) {
-                RegisterGroupMember(tenant_state, tenant_id, user_key,
-                                    standby_meta.group_id);
+                RegisterGroupMember(tenant_state, object.tenant_id,
+                                    object.user_key, standby_meta.group_id);
             }
-            tenant_state.processing_keys.erase(user_key);
+            tenant_state.processing_keys.erase(object.user_key);
         }
     }
 
@@ -3000,11 +3122,11 @@ void MasterService::RestoreFromStandbySnapshot(
         RebuildTenantQuotaUsageFromMetadata();
     }
 
-    // 4. Log the result.
     LOG(INFO) << "Restored from standby: " << objects.size() << " objects, "
               << segments.size()
               << " segments, initial_seq_id=" << initial_oplog_sequence_id
               << ", invalid_endpoints=" << invalid_replica_endpoints_.size();
+    return {};
 }
 
 auto MasterService::QueryIp(const UUID& client_id)
