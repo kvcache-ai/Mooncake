@@ -1,6 +1,6 @@
 import os
 import warnings
-from typing import Any, List, Optional, Tuple, Union
+from typing import Any, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.distributed as dist
@@ -9,6 +9,8 @@ from .mooncake_ep_buffer import EventOverlap, _native_current_stream_ptr
 
 
 _VALID_TRANSPORTS = {"auto", "ibgda", "nccl"}
+_TRANSPORT_TO_CODE = {"auto": 0, "ibgda": 1, "nccl": 2}
+_CODE_TO_TRANSPORT = {code: name for name, code in _TRANSPORT_TO_CODE.items()}
 
 
 def _requested_transport(transport: str) -> str:
@@ -61,6 +63,93 @@ def _select_transport(
     ):
         return "nccl"
     return "ibgda"
+
+
+def _resolve_transport_consensus(
+    rank_states: Sequence[Tuple[str, bool]],
+) -> str:
+    """Resolve rank-local NCCL readiness into one group-wide choice."""
+    if not rank_states:
+        raise RuntimeError(
+            "cannot select an ElasticBuffer transport for an empty group"
+        )
+
+    requested_modes = {requested for requested, _ in rank_states}
+    if len(requested_modes) != 1:
+        details = ", ".join(
+            f"rank {rank}={requested!r}"
+            for rank, (requested, _) in enumerate(rank_states)
+        )
+        raise RuntimeError(
+            "ElasticBuffer transport requests differ across process-group ranks: "
+            f"{details}. Pass the same transport argument and "
+            "MOONCAKE_EP_TRANSPORT setting to every rank."
+        )
+
+    requested = rank_states[0][0]
+    unready_ranks = [
+        rank for rank, (_, nccl_ready) in enumerate(rank_states) if not nccl_ready
+    ]
+    if requested == "nccl":
+        if unready_ranks:
+            ranks = ", ".join(str(rank) for rank in unready_ranks)
+            raise RuntimeError(
+                "transport='nccl' requires NCCL Device API support and a "
+                "supported NCCL kernel topology on every process-group rank; "
+                f"requirements are not met on ranks: {ranks}"
+            )
+        return "nccl"
+
+    # In auto mode, a single rank that cannot use NCCL makes the whole group
+    # choose IBGDA. No rank enters transport-specific bootstrap until this
+    # collective decision has completed.
+    if requested == "auto" and not unready_ranks:
+        return "nccl"
+    return "ibgda"
+
+
+def _select_transport_for_group(
+    group: dist.ProcessGroup,
+    requested: str,
+    nccl_available: bool,
+    num_ranks: int,
+    num_rdma_ranks: int,
+    num_nvlink_ranks: int,
+    allow_hybrid_mode: bool,
+) -> str:
+    """Agree on one transport before starting transport-specific bootstrap."""
+    local_auto_choice = _select_transport(
+        "auto",
+        nccl_available,
+        num_ranks,
+        num_rdma_ranks,
+        num_nvlink_ranks,
+        allow_hybrid_mode,
+    )
+    collective_device = (
+        "cpu" if str(dist.get_backend(group)).lower() == "gloo" else "cuda"
+    )
+    local_state = torch.tensor(
+        [
+            _TRANSPORT_TO_CODE[requested],
+            int(local_auto_choice == "nccl"),
+        ],
+        dtype=torch.int32,
+        device=collective_device,
+    )
+    gathered_states = [torch.empty_like(local_state) for _ in range(group.size())]
+    dist.all_gather(gathered_states, local_state, group=group)
+
+    rank_states = []
+    for state in gathered_states:
+        requested_code, rank_nccl_ready = state.cpu().tolist()
+        rank_states.append(
+            (
+                _CODE_TO_TRANSPORT[int(requested_code)],
+                bool(rank_nccl_ready),
+            )
+        )
+    return _resolve_transport_consensus(rank_states)
 
 
 def _using_musa_backend() -> bool:
@@ -233,7 +322,8 @@ class ElasticBuffer:
         nccl_available = bool(
             has_nccl_device_support is not None and has_nccl_device_support()
         )
-        self.transport = _select_transport(
+        self.transport = _select_transport_for_group(
+            self.group,
             self.requested_transport,
             nccl_available,
             self.num_ranks,
@@ -241,11 +331,6 @@ class ElasticBuffer:
             self.num_nvlink_ranks,
             self.allow_hybrid_mode,
         )
-        if self.transport == "nccl" and not nccl_available:
-            raise RuntimeError(
-                "transport='nccl' requires Mooncake EP built with NCCL Device "
-                "API support; use transport='auto' for transparent IBGDA fallback"
-            )
 
         nccl_unique_id = (
             self._exchange_nccl_unique_id(ep) if self.transport == "nccl" else []

@@ -5,11 +5,14 @@ from __future__ import annotations
 import inspect
 
 import pytest
+import torch.distributed as dist
 
 from mooncake.mooncake_elastic_buffer import (
     ElasticBuffer,
     _requested_transport,
+    _resolve_transport_consensus,
     _select_transport,
+    _select_transport_for_group,
 )
 
 
@@ -104,3 +107,52 @@ def test_invalid_transport_is_rejected(monkeypatch) -> None:
     monkeypatch.setenv("MOONCAKE_EP_TRANSPORT", "tcp")
     with pytest.raises(ValueError, match="transport must be one of"):
         _requested_transport("auto")
+
+
+def test_group_transport_selection_uses_every_rank_capability(monkeypatch) -> None:
+    class Group:
+        @staticmethod
+        def size() -> int:
+            return 2
+
+    test_group = Group()
+    monkeypatch.setattr(dist, "get_backend", lambda _: "gloo")
+
+    def fake_all_gather(gathered_states, local_state, group=None) -> None:
+        assert group is test_group
+        for state in gathered_states:
+            state.copy_(local_state)
+        # Simulate rank 1 having the same request but no usable NCCL backend.
+        gathered_states[1][1] = 0
+
+    monkeypatch.setattr(dist, "all_gather", fake_all_gather)
+    assert (
+        _select_transport_for_group(test_group, "auto", True, 2, 1, 2, True) == "ibgda"
+    )
+
+
+def test_transport_consensus_selects_nccl_when_every_rank_is_ready() -> None:
+    assert _resolve_transport_consensus([("auto", True), ("auto", True)]) == "nccl"
+
+
+@pytest.mark.parametrize(
+    "rank_states",
+    [
+        [("auto", True), ("auto", False)],
+        [("auto", False), ("auto", True)],
+    ],
+)
+def test_transport_consensus_falls_back_to_ibgda_group_wide(
+    rank_states: list[tuple[str, bool]],
+) -> None:
+    assert _resolve_transport_consensus(rank_states) == "ibgda"
+
+
+def test_transport_consensus_rejects_inconsistent_requests() -> None:
+    with pytest.raises(RuntimeError, match="requests differ"):
+        _resolve_transport_consensus([("auto", True), ("ibgda", True)])
+
+
+def test_transport_consensus_rejects_explicit_nccl_when_a_rank_is_unready() -> None:
+    with pytest.raises(RuntimeError, match="requirements are not met on ranks: 1"):
+        _resolve_transport_consensus([("nccl", True), ("nccl", False)])
