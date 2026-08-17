@@ -108,6 +108,20 @@ target_include_directories(tent_ip_utils_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_ip_utils_test COMMAND tent_ip_utils_test)
 
+# RedisMetaStore thread-safety test: drives the real get()/set()/remove() code
+# paths against a fake command runner (no live Redis), asserting that
+# client_mutex_ serializes concurrent access and that get() preserves binary
+# values with embedded NULs. Only built when hiredis is available.
+if(TARGET metastore_redis)
+  add_executable(tent_redis_metastore_test redis_metastore_test.cpp)
+  target_link_libraries(tent_redis_metastore_test
+                        PRIVATE metastore_redis tent_common gtest gtest_main
+                                glog)
+  target_include_directories(tent_redis_metastore_test
+                             PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+  add_test(NAME tent_redis_metastore_test COMMAND tent_redis_metastore_test)
+endif()
+
 add_executable(tent_qp_pool_layout_test qp_pool_layout_test.cpp)
 target_link_libraries(tent_qp_pool_layout_test PRIVATE tent_common gtest
                                                        gtest_main)
