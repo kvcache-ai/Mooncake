@@ -1,11 +1,13 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <memory>
 #include <string>
 #include <set>
 #include <unordered_map>
 #include <iterator>
+#include <vector>
 #include <time.h>
 #include <ylt/util/tl/expected.hpp>
 
@@ -437,6 +439,62 @@ class FreeRatioFirstAllocationStrategy : public RandomAllocationStrategy {
         const auto& names = allocator_manager.getNames();
         if (names.empty()) {
             return tl::make_unexpected(ErrorCode::NO_AVAILABLE_HANDLE);
+        }
+
+        // Fast path for the common single-replica case. Avoid building a
+        // temporary candidate vector on every allocation; keep the sampled
+        // candidates on the stack and try by descending free ratio.
+        if (replica_num == 1 && preferred_segments.empty() &&
+            excluded_segments.empty()) {
+            struct Candidate {
+                size_t name_idx;
+                double free_ratio;
+            };
+
+            std::array<Candidate, kCandidateMultiplier> candidates{};
+            const size_t sample_count =
+                std::min(kCandidateMultiplier, names.size());
+            const size_t start_idx = randomIndex(names.size());
+
+            for (size_t i = 0; i < sample_count; ++i) {
+                const size_t idx = (start_idx + i) % names.size();
+                candidates[i] = {
+                    idx, getSegmentFreeRatio(allocator_manager, names[idx])};
+            }
+
+            // Select only as much of the order as allocation needs. The sample
+            // is capped at six, so this avoids std::sort's generic machinery
+            // and can return before ordering the remaining candidates.
+            for (size_t attempt = 0; attempt < sample_count; ++attempt) {
+                size_t best_pos = attempt;
+                for (size_t i = attempt + 1; i < sample_count; ++i) {
+                    if (candidates[i].free_ratio >
+                        candidates[best_pos].free_ratio) {
+                        best_pos = i;
+                    }
+                }
+                if (best_pos != attempt) {
+                    const Candidate displaced = candidates[attempt];
+                    candidates[attempt] = candidates[best_pos];
+                    candidates[best_pos] = displaced;
+                }
+
+                const auto& name = names[candidates[attempt].name_idx];
+                if (auto buffer =
+                        allocateSingle(allocator_manager, name, slice_length)) {
+                    std::vector<Replica> replicas;
+                    replicas.emplace_back(std::move(buffer),
+                                          ReplicaStatus::PROCESSING,
+                                          replica_type);
+                    return replicas;
+                }
+            }
+
+            // All sampled candidates failed; fall back to the base Random
+            // strategy (same behavior as the non-fast-path code below).
+            return RandomAllocationStrategy::Allocate(
+                allocator_manager, slice_length, replica_num,
+                preferred_segments, excluded_segments, replica_type);
         }
 
         std::vector<Replica> replicas;
