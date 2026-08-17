@@ -378,6 +378,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y lcov gcovr ninja-build
 
+      - name: Test HugeTLB sizing helper
+        run: python3 scripts/test_hicache_hugepage_requirements.py
+
       - name: Run sccache-cache
         uses: mozilla-actions/sccache-action@v0.0.9
 
@@ -416,6 +419,18 @@ jobs:
           MC_METADATA_SERVER=http://127.0.0.1:8080/metadata \
           DEFAULT_KV_LEASE_TTL=500 \
             ctest --parallel $(nproc) --output-on-failure
+
+      - name: Run Mooncake Store Rust sanitizer smoke test
+        env:
+          MOONCAKE_STORE_CLUSTER_ID: nightly_asan_rust_cluster
+          MOONCAKE_STORE_RUST_LINK_ASAN: "1"
+        run: ./scripts/ci/run_store_rust_smoke.sh
+
+      - name: Run Go store binding sanitizer integration tests
+        env:
+          MOONCAKE_STORE_CLUSTER_ID: nightly_asan_go_cluster
+          MOONCAKE_STORE_GO_SANITIZED: "1"
+        run: ./scripts/ci/run_store_go_integration.sh
 
       - name: Generate coverage report
         id: coverage
