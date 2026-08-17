@@ -162,6 +162,22 @@ A single pre-allocated file (`kv_cache.data`) is shared by all objects. Space wi
 
 When `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` is set, the backend evicts existing buckets to make room before writing a new one. Eviction is disabled by default (`BucketEvictionPolicy::NONE`).
 
+### Physical disk cap (BucketStorageBackend)
+
+`MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` bounds `total_size_`, a *logical* byte counter kept in memory: incremented on write, decremented per object as buckets are evicted. Two properties limit what it can guarantee:
+
+- It is **per backend instance**. When several `BucketStorageBackend` instances share one offload directory (e.g. one instance per tensor-parallel rank, all using the same `ssd_offload_path`), each instance's `total_size_` only accounts for the bytes *it* wrote, so each caps roughly `1/N` of the shared directory and the directory as a whole is never bounded.
+- It is **logical, not physical**. It ignores filesystem block rounding and can lag the real on-disk footprint — a 256 MB bucket file stays on disk until every object packed into it has been evicted.
+
+`MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES` (default `0` = disabled) adds a hard cap on the *real* on-disk usage of the offload directory, measured by `ActualDiskBytesUsedLocked()`:
+
+- It scans `storage_path_` with `std::filesystem::recursive_directory_iterator` and sums `stat.st_blocks * 512` over the entries. `st_blocks` is the number of 512-byte blocks actually allocated to a file — a fixed POSIX unit, independent of the filesystem block size — so the total equals what `du` reports and what a Kubernetes `emptyDir` `sizeLimit` is accounted against (it includes block rounding and excludes sparse holes).
+- Because every instance scans the *same* directory, all instances sharing an offload path observe the same true usage and converge on the same limit — the property `total_size_` cannot provide.
+- The scan is cached for `MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS` (default 500 ms; `<= 0` re-scans on every check) to bound its cost, and is snapshotted once per `PrepareEviction` call under the metadata lock. `FinalizeEviction` invalidates the cache after deleting files so the next check re-measures.
+- If the directory cannot be scanned — an open error, or an iteration error partway through — the function **fails closed**: it reports the cap as reached and does not cache the partial total, so a transient scan failure drives eviction/rejection instead of silently disabling the cap.
+
+The two caps are independent and may be combined; when both are set a write must satisfy both, and eviction continues until the projected post-eviction usage is under both limits.
+
 ### Proactive watermark eviction
 
 `FileStorage::Heartbeat()` also calls the backend-level proactive disk watermark path when `MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION=true`. The high watermark decides when eviction starts and the low watermark decides the target usage after eviction. This path is independent of write admission, so disk usage can move back toward the low watermark even when no new write arrives.
@@ -191,7 +207,7 @@ Eviction is split into two phases to ensure that the master is notified before f
 
 **Phase 1 — `PrepareEviction(required_size)`** (called under exclusive lock):
 
-1. Repeatedly call `SelectEvictionCandidate()` until `total_size_ + required_size <= max_total_size`.
+1. Repeatedly call `SelectEvictionCandidate()` until the projected post-eviction usage is within every configured cap: `total_size_ + required_size <= max_total_size` (logical), and — when `max_physical_bytes > 0` — `physical_used_start + required_size - accumulated_freed_space <= max_physical_bytes` (physical), where `physical_used_start` is the `ActualDiskBytesUsedLocked()` snapshot taken once at the start of the call. If the candidate supply is exhausted before the caps are satisfied, the write is rejected with `FILE_WRITE_FAIL`.
 2. For each selected bucket: remove it from `buckets_` and `object_bucket_map_`, subtract its size from `total_size_`.
 3. Collect all evicted keys and bucket metadata into a `PendingEviction` struct and return it — no file I/O at this point.
 

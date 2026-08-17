@@ -159,6 +159,8 @@ Applies when `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
 | `MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT` | `500` | Max keys per bucket |
 | `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` | `0` | Eviction threshold in bytes. When set to `0`, the backend uses **90% of the physical disk capacity** as the quota — it does not mean unlimited. Set an explicit value to control disk usage precisely. |
 | `MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY` | `fifo` | Eviction policy: `none` / `fifo` / `lru` |
+| `MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES` | `0` (disabled) | Hard cap on **real on-disk** usage of the offload directory. `0` disables it.|
+| `MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS` | `500` | How long the directory-scan result is cached before re-scanning, to bound the cost of the physical-usage check. `<=0`=scan every check|
 
 ### File-per-key backend settings
 
@@ -215,7 +217,7 @@ Best for: high-concurrency scenarios with many small objects where restart durab
 
 ### Write-time eviction
 
-When `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` is set, the backend automatically evicts buckets before writing new ones if total disk usage would exceed the limit.
+When `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` or `MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES` is set, the backend automatically evicts buckets before writing new ones if total disk usage would exceed the limit.
 
 | Policy | Behavior |
 |--------|----------|
@@ -224,6 +226,19 @@ When `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` is set, the backend automatically 
 | `lru` | Evict the least recently read bucket first |
 
 Eviction is two-phase: the bucket is removed from metadata and master is notified first, then in-flight reads are drained before files are deleted.
+
+**When to prefer MAX_PHYSICAL_BYTES over MAX_TOTAL_SIZE**
+
+ MAX_TOTAL_SIZE is a logical, per-backend counter: each BucketStorageBackend instance tracks only the bytes it has written and checks the limit against that number. That is accurate and sufficient when a single backend owns a dedicated offload directory.
+
+ Prefer MAX_PHYSICAL_BYTES in either of these cases:
+
+ - Several backends share one offload directory (SGLang's default setting). A tensor-parallel deployment, for example, creates one backend per rank, all pointing at the same ssd_offload_path. Since MAX_TOTAL_SIZE is per-instance, each backend only bounds its own share (~1/N of the directory), so the directory as a whole is never capped and can overflow. MAX_PHYSICAL_BYTES measures the real on-disk size of the whole directory, so every backend sees the same usage and converges on the same limit.
+ - The disk is a bounded, externally-accounted volume — most commonly a Kubernetes emptyDir with a sizeLimit. The kubelet enforces that quota by the volume's actual on-disk usage (equivalent to du) and evicts the pod when it is exceeded. MAX_PHYSICAL_BYTES is computed the same way, so it tracks exactly what the kubelet enforces, whereas the logical MAX_TOTAL_SIZE can drift below real usage and let the volume blow past its quota before eviction triggers.
+
+ The two limits are independent and may be set together — eviction fires when either would be exceeded. In shared-directory or emptyDir deployments, set MAX_PHYSICAL_BYTES to the real capacity you must stay under (e.g. the emptyDir sizeLimit), and set an eviction policy so the cap can actually evict.
+
+---
 
 ### Proactive watermark eviction
 
@@ -269,6 +284,8 @@ mooncake_master \
 export MOONCAKE_OFFLOAD_FILE_STORAGE_PATH=/nvme/mooncake_offload
 export MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
 export MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE=$((200 * 1024 * 1024 * 1024))  # 200 GB
+export MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES=$((200 * 1024 * 1024 * 1024)) # optional
+export MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS=500 # optional
 export MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY=lru
 
 mooncake_client \
