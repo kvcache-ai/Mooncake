@@ -377,6 +377,31 @@ target_include_directories(tent_poll_backoff_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_poll_backoff_test COMMAND tent_poll_backoff_test)
 
+# Delegate RPC end to end: ControlClient::delegate -> onDelegate ->
+# transferSync, against a real engine on loopback with a FakeTransport.
+add_executable(tent_delegate_rpc_test delegate_rpc_test.cpp)
+target_link_libraries(tent_delegate_rpc_test PRIVATE gtest gtest_main
+                                                     tent_link_group)
+if(TARGET asio_shared)
+  target_link_libraries(tent_delegate_rpc_test PRIVATE asio_shared)
+endif()
+target_include_directories(tent_delegate_rpc_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_delegate_rpc_test COMMAND tent_delegate_rpc_test)
+
+# A slow handler must not stall the single-io_context RPC server. Starts a real
+# CoroRpcAgent on loopback; no RDMA device required.
+add_executable(tent_rpc_handler_isolation_test rpc_handler_isolation_test.cpp)
+target_link_libraries(tent_rpc_handler_isolation_test PRIVATE gtest gtest_main
+                                                              tent_link_group)
+if(TARGET asio_shared)
+  target_link_libraries(tent_rpc_handler_isolation_test PRIVATE asio_shared)
+endif()
+target_include_directories(tent_rpc_handler_isolation_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+add_test(NAME tent_rpc_handler_isolation_test
+         COMMAND tent_rpc_handler_isolation_test)
+
 add_executable(tent_runtime_queue_dispatch_test runtime_queue_dispatch_test.cpp)
 target_link_libraries(tent_runtime_queue_dispatch_test PRIVATE gtest gtest_main
                                                                tent_link_group)

@@ -236,11 +236,14 @@ ControlService::ControlService(const std::string& type,
         Probe, [this](const std::string_view& request, std::string& response) {
             onProbe(request, response);
         });
+    // onDelegate runs a whole transfer to completion; holding the io_context
+    // thread for that long blocked every other RPC on this node.
     rpc_server_->registerFunction(
         Delegate,
         [this](const std::string_view& request, std::string& response) {
             onDelegate(request, response);
-        });
+        },
+        /*offload=*/true);
     rpc_server_->registerFunction(
         Pin, [this](const std::string_view& request, std::string& response) {
             onPinStageBuffer(request, response);
@@ -324,7 +327,7 @@ Status ControlService::start(uint16_t& port, bool ipv6_) {
 
 void ControlService::onGetSegmentDesc(const std::string_view& request,
                                       std::string& response) {
-    // Re-use the cached dump shared across concurrent peer fetches.
+    // Reuse the cached dump shared across concurrent peer fetches.
     auto cached = manager_->getLocalDumpedJson();
     response = *cached;
 }
