@@ -20,7 +20,9 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build:
+  # Build the artifact tested below through the exact release wheel path. The
+  # Ubuntu jobs remain consumer tests, not an alternate wheel build environment.
+  build-wheel:
     needs: [spell-check, clang-format, check-paths]
     if: &run-ci-for-source-changes >-
       (needs.check-paths.outputs.should-run-downstream == 'true' ||
@@ -29,143 +31,6 @@ jobs:
        github.event_name == 'workflow_dispatch' ||
        github.event.action == 'opened' ||
        contains(github.event.pull_request.labels.*.name, 'run-ci'))
-    runs-on: ubuntu-22.04
-    strategy:
-      matrix:
-        python-version: ['3.10', '3.12']
-    env:
-      CI: "true"
-      SCCACHE_GHA_ENABLED: "true"
-
-    steps:
-    - uses: actions/checkout@v4
-      with:
-        persist-credentials: false
-
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v5
-      with:
-        python-version: ${{ matrix.python-version }}
-
-    - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
-
-    - name: Install and start etcd
-      run: |
-        wget https://github.com/etcd-io/etcd/releases/download/v3.6.1/etcd-v3.6.1-linux-amd64.tar.gz
-        tar xzf etcd-v3.6.1-linux-amd64.tar.gz
-        sudo mv etcd-v3.6.1-linux-amd64/etcd* /usr/local/bin/
-        etcd --advertise-client-urls http://127.0.0.1:2379 --listen-client-urls http://127.0.0.1:2379 &
-        sleep 3 # Give etcd time to start
-        etcdctl --endpoints=http://127.0.0.1:2379 endpoint health
-      shell: bash
-
-    - name: Free up disk space
-      uses: ./.github/actions/free-disk-space
-
-    - name: Install CUDA Toolkit
-      uses: Jimver/cuda-toolkit@v0.2.24
-      with:
-        cuda: '12.8.1'
-        linux-local-args: '["--toolkit"]'
-        method: 'network'
-        sub-packages: '["nvcc"]'
-
-    - name: Install build utilities
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y ninja-build
-
-    - name: Test HugeTLB sizing helper
-      run: |
-        python3 scripts/test_hicache_hugepage_requirements.py
-      shell: bash
-
-    - name: Run sccache-cache
-      uses: mozilla-actions/sccache-action@v0.0.9
-
-    - name: Configure sccache
-      uses: actions/github-script@v7
-      with:
-        script: |
-          core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
-          core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
-
-    - name: Configure project
-      run: |
-        sudo apt update -y
-        sudo bash -x dependencies.sh -y
-        mkdir build
-        cd build
-        cmake -G Ninja .. -DUSE_HTTP=ON -DUSE_CXL=ON -DUSE_UB=ON -DUSE_ETCD=ON -DSTORE_USE_ETCD=ON -DENABLE_ASAN=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Debug -DENABLE_DEBUG_SYMBOLS=OFF
-      shell: bash
-
-    - name: Build project
-      run: |
-        cd build
-        cmake --build .
-        sudo cmake --install .
-      shell: bash
-
-    - name: Build nvlink_allocator.so
-      run: |
-        mkdir -p build/mooncake-transfer-engine/nvlink-allocator
-        cd mooncake-transfer-engine/nvlink-allocator
-        export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
-        bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
-      shell: bash
-
-    - name: Run sccache stat for check
-      if: ${{ env.SCCACHE_PATH != '' }}
-      shell: bash
-      run: ${SCCACHE_PATH} --show-stats
-
-    - name: Start Metadata Server
-      run: |
-        cd mooncake-transfer-engine/example/http-metadata-server-python
-        pip install aiohttp
-        python ./bootstrap_server.py &
-      shell: bash
-
-    - name: Run Mooncake Store Rust smoke test and benchmark
-      env:
-        MOONCAKE_STORE_CLUSTER_ID: ci_rust_test_cluster
-        MOONCAKE_STORE_RUST_LINK_ASAN: "1"
-      run: ./scripts/ci/run_store_rust_smoke.sh
-      shell: bash
-
-    - name: Run Go store binding integration tests
-      env:
-        MOONCAKE_STORE_CLUSTER_ID: ci_go_test_cluster
-        MOONCAKE_STORE_GO_LINK_COMMON: "1"
-        MOONCAKE_STORE_GO_SANITIZED: "1"
-      run: ./scripts/ci/run_store_go_integration.sh
-      shell: bash
-
-    - name: Test (in build env)
-      run: |
-        cd build
-        export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
-        ldconfig -v || echo "always continue"
-        MC_METADATA_SERVER=http://127.0.0.1:8080/metadata DEFAULT_KV_LEASE_TTL=500 ctest -j --output-on-failure
-      shell: bash
-
-    - name: Drain HTTP E2E test
-      if: matrix.python-version == '3.12'
-      run: |
-        cd build
-        export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
-        # Keep the sanitizer gate on the C++ integration test. The Python
-        # drain script is manual/nightly only because pybind + ASan teardown in
-        # a Python host process is not stable.
-        DEFAULT_KV_LEASE_TTL=500 ./mooncake-store/tests/task_integration_test --gtest_filter='TaskExecutorIntegrationTest.DrainJobCompleteFlow'
-      shell: bash
-
-  # Build the artifact tested below through the exact release wheel path. The
-  # Ubuntu jobs remain consumer tests, not an alternate wheel build environment.
-  build-wheel:
-    needs: [spell-check, clang-format, check-paths]
-    if: *run-ci-for-source-changes
     uses: ./.github/workflows/_build-wheel.yaml
     with:
       python-versions: '["3.10", "3.12"]'
@@ -746,7 +611,7 @@ jobs:
     secrets: inherit
 
   integration-test:
-    needs: [build, build-wheel-cu13, check-paths]
+    needs: [build-wheel-cu13, check-paths]
     if: needs.check-paths.outputs.should-run-downstream == 'true'
     uses: ./.github/workflows/integration-test.yml
     secrets: inherit
@@ -866,7 +731,6 @@ jobs:
       - spell-check
       - clang-format
       - docs-check
-      - build
       - build-wheel
       - build-flags
       - test-wheel-ubuntu
