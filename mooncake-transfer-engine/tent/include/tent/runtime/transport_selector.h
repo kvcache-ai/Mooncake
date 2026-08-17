@@ -120,17 +120,28 @@ struct SelectionPolicy {
     // Transport preference list (evaluated in order)
     std::vector<TransportType> transports;
 
-    // Per-policy link-layer QoS. nullopt = fall back to the global RdmaParams
-    // value. InfiniBand Service Level (0-15) and Traffic Class / DSCP (0-255).
+    // Superseded, and read by nothing: link-layer QoS is a property of the QP
+    // a transfer lands on, so it is defined per pool in
+    // transports/rdma/endpoint/qp_pools and applied at QP setup
+    // (endpoint.cpp, setupOneQP). Still parsed so a config that sets them here
+    // is reported rather than silently ignored.
     std::optional<int> service_level;
     std::optional<int> traffic_class;
-    // Named QP pool this policy's traffic should land on; parsed and stored for
-    // now, routing to be wired later. Unset = the current single "data QP".
+    // Named QP pool this policy's traffic lands on. Routed end to end:
+    // SelectionResult -> TaskInfo -> SubBatch -> RdmaTask -> selectQpInPool().
+    // Unset (or a name no configured pool matches) sprays across *all* QPs --
+    // there is no reserved default pool, so once qp_pools is configured such
+    // traffic also lands on the named pools' QPs and inherits their SL/TC.
     std::optional<std::string> qp_pool;
 
     // Optional business-intent filter. nullopt preserves the historical
     // catch-all behavior; otherwise the request intent must match exactly.
     std::optional<IntentType> intent_type;
+
+    // `devices` resolved against the topology by setTopology(), so select()
+    // does not repeat a name lookup per request. ~0ULL means "all devices":
+    // no device filter, no topology yet, or a filter that resolved to nothing.
+    uint64_t resolved_device_mask{~0ULL};
 };
 
 /**
@@ -139,9 +150,11 @@ struct SelectionPolicy {
 struct SelectionResult {
     TransportType transport = UNSPEC;
     uint64_t device_mask = ~0ULL;  // Bitmask of allowed devices (~0 = all)
-    // Resolved link-layer QoS from the matched policy (nullopt = default).
+    // Copied from the matched policy for diagnostics only; QP setup takes
+    // SL/TC from the QP pool, not from here. See SelectionPolicy.
     std::optional<int> service_level;
     std::optional<int> traffic_class;
+    // Consumed: names the QP pool the transfer is routed to.
     std::optional<std::string> qp_pool;
 };
 
@@ -154,10 +167,12 @@ class TransportSelector {
 
     /**
      * @brief Set topology for device name to ID conversion
+     *
+     * Resolves every policy's `devices` list into a mask here, once, and
+     * reports what did not resolve. Safe to call again if the topology is
+     * replaced.
      */
-    void setTopology(std::shared_ptr<Topology> topology) {
-        topology_ = topology;
-    }
+    void setTopology(std::shared_ptr<Topology> topology);
 
     /**
      * @brief Select the best transport for a given context
@@ -189,8 +204,13 @@ class TransportSelector {
         const std::vector<TransportType>& raw, TransportType hint);
 
    private:
+    // Width of SelectionResult::device_mask; a NIC past this index cannot be
+    // named by a policy at all.
+    static constexpr int kDeviceMaskBits = 64;
+
     std::vector<SelectionPolicy> getDefaultPolicies();
     void loadPolicies();
+    void resolveDeviceMasks();
     bool matchesMemoryPattern(const std::string& pattern,
                               MemoryType type) const;
     bool matchesPolicy(const SelectionPolicy& policy,
