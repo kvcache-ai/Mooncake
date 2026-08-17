@@ -1341,11 +1341,11 @@ TEST_F(MasterServiceHATest, FailedRemountKeepsReplicaInvalidAndCanBeRetried) {
         .get_memory_descriptor()
         .buffer_descriptor.buffer_address_ =
         kDefaultSegmentBase + kDefaultSegmentSize - 1;
-    ASSERT_TRUE(service
-                    .RestoreFromStandbySnapshot(
-                        {first, out_of_range}, 7,
-                        {MakeStandbyMemorySegment(endpoint)})
-                    .has_value());
+    ASSERT_TRUE(
+        service
+            .RestoreFromStandbySnapshot({first, out_of_range}, 7,
+                                        {MakeStandbyMemorySegment(endpoint)})
+            .has_value());
     SetLeaseDeadlineForTesting(service, kDefaultTenant, "standby_retry_first",
                                std::chrono::system_clock::time_point{});
 
