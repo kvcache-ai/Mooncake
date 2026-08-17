@@ -2984,18 +2984,19 @@ BucketStorageBackend::PrepareEviction(
     const int64_t incoming_physical_size =
         write_keys.empty() ? 0 : required_size;
 
-    // Ground-truth physical usage of the offload directory (cached), snapshotted
-    // once. As buckets are selected for eviction their files get deleted in the
-    // later FinalizeEviction, so (physical_used_start - accumulated_freed_space)
-    // projects the physical bytes that will remain after this round.
+    // Ground-truth physical usage of the offload directory (cached),
+    // snapshotted once. As buckets are selected for eviction their files get
+    // deleted in the later FinalizeEviction, so (physical_used_start -
+    // accumulated_freed_space) projects the physical bytes that will remain
+    // after this round.
     const int64_t physical_used_start =
         bucket_backend_config_.max_physical_bytes > 0
             ? ActualDiskBytesUsedLocked()
             : 0;
     // True when the projected physical usage after this round — real disk usage
     // minus what we free here, plus the incoming write — would still exceed the
-    // physical cap. Shared by the in-loop "keep evicting" test and the post-loop
-    // "reject the write" test.
+    // physical cap. Shared by the in-loop "keep evicting" test and the
+    // post-loop "reject the write" test.
     const auto phys_over_cap = [&](uint64_t freed) {
         return bucket_backend_config_.max_physical_bytes > 0 &&
                physical_used_start + incoming_physical_size -
