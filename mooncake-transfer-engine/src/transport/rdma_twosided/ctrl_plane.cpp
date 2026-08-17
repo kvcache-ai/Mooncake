@@ -63,7 +63,18 @@ int RdmaTwoSidedTransport::onSetupCtrlChannel(const HandShakeDesc &peer_desc,
         ctrl_channels_[peer_server_name] = channel;
     }
     if (old) old->disconnect();
-    return channel->acceptPassive(peer_desc, local_desc);
+    int ret = channel->acceptPassive(peer_desc, local_desc);
+    {
+        std::lock_guard<std::mutex> lock(ctrl_mutex_);
+        if (ret) {
+            auto it = ctrl_channels_.find(peer_server_name);
+            if (it != ctrl_channels_.end() && it->second == channel) {
+                ctrl_channels_.erase(it);
+            }
+        }
+        ctrl_cv_.notify_all();
+    }
+    return ret;
 }
 
 std::shared_ptr<CtrlChannel> RdmaTwoSidedTransport::ensureCtrlChannel(
@@ -74,29 +85,39 @@ std::shared_ptr<CtrlChannel> RdmaTwoSidedTransport::ensureCtrlChannel(
     }
 
     std::unique_lock<std::mutex> lock(ctrl_mutex_);
-    auto it = ctrl_channels_.find(peer_server_name);
-    if (it != ctrl_channels_.end() && it->second && it->second->connected()) {
-        return it->second;
-    }
+    while (true) {
+        auto it = ctrl_channels_.find(peer_server_name);
+        if (it != ctrl_channels_.end() && it->second) {
+            if (it->second->connected()) return it->second;
+            // Active or passive connect is already in flight for this peer.
+            ctrl_cv_.wait(lock);
+            continue;
+        }
 
-    // Serialize active connect per peer to avoid duplicate handshakes.
-    auto channel =
-        std::make_shared<CtrlChannel>(*this, *contexts[0], peer_server_name);
-    // Release lock during handshake I/O; re-check afterwards.
-    lock.unlock();
-    if (channel->connectActive()) {
-        return nullptr;
+        auto channel = std::make_shared<CtrlChannel>(*this, *contexts[0],
+                                                     peer_server_name);
+        ctrl_channels_[peer_server_name] = channel;
+        lock.unlock();
+        int ret = channel->connectActive();
+        lock.lock();
+
+        auto again = ctrl_channels_.find(peer_server_name);
+        const bool still_ours =
+            again != ctrl_channels_.end() && again->second == channel;
+        if (ret) {
+            if (still_ours) ctrl_channels_.erase(again);
+            ctrl_cv_.notify_all();
+            if (still_ours) return nullptr;
+            continue;
+        }
+        if (!still_ours) {
+            channel->disconnect();
+            ctrl_cv_.notify_all();
+            continue;
+        }
+        ctrl_cv_.notify_all();
+        return channel;
     }
-    lock.lock();
-    auto again = ctrl_channels_.find(peer_server_name);
-    if (again != ctrl_channels_.end() && again->second &&
-        again->second->connected()) {
-        // Another thread won the race; keep the already-connected channel.
-        channel->disconnect();
-        return again->second;
-    }
-    ctrl_channels_[peer_server_name] = channel;
-    return channel;
 }
 
 int RdmaTwoSidedTransport::sendRdmaNotify(const std::string &peer_server_name,

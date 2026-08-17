@@ -83,6 +83,9 @@ class CtrlChannel {
 
    private:
     int createResources();
+    // IB teardown only. Caller must hold resource_mutex_ (or be disconnect(),
+    // which acquires it). Must not acquire send_mutex_.
+    void releaseIbResources();
     void destroyResources();
     int postRecv(size_t idx);
     int repostAllRecvs();
@@ -114,6 +117,10 @@ class CtrlChannel {
     size_t buffer_size_ = 0;
     size_t max_pending_sends_ = 0;
 
+    // send_mutex_ guards SQ slot accounting (pending_sends_, send_wr_id_).
+    // resource_mutex_ guards qp_/cq_/MRs. Nested order, when both are held,
+    // is send_mutex_ then resource_mutex_. disconnect() does not nest them:
+    // it wakes send waiters, drops send_mutex_, then tears down IB resources.
     std::mutex send_mutex_;
     std::condition_variable send_cv_;
     size_t pending_sends_ = 0;

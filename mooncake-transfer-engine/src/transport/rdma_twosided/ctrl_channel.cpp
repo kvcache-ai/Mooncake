@@ -65,7 +65,7 @@ CtrlChannel::CtrlChannel(RdmaTwoSidedTransport &transport, RdmaContext &context,
     max_pending_sends_ = cfg.rdma_notify_max_pending_sends;
 }
 
-CtrlChannel::~CtrlChannel() { destroyResources(); }
+CtrlChannel::~CtrlChannel() { disconnect(); }
 
 int CtrlChannel::construct() {
     std::lock_guard<std::mutex> lock(resource_mutex_);
@@ -151,13 +151,7 @@ int CtrlChannel::createResources() {
     return 0;
 }
 
-void CtrlChannel::destroyResources() {
-    connected_.store(false, std::memory_order_release);
-    {
-        std::lock_guard<std::mutex> lock(send_mutex_);
-        pending_sends_ = 0;
-        send_cv_.notify_all();
-    }
+void CtrlChannel::releaseIbResources() {
     if (qp_) {
         ibv_destroy_qp(qp_);
         qp_ = nullptr;
@@ -176,6 +170,25 @@ void CtrlChannel::destroyResources() {
     recv_mrs_.clear();
     recv_buffers_.clear();
     send_buffer_.clear();
+}
+
+void CtrlChannel::destroyResources() {
+    // Called from createResources() while resource_mutex_ is already held.
+    // Do not acquire send_mutex_ here (lock-order inversion with
+    // sendCtrlFrame).
+    connected_.store(false, std::memory_order_release);
+    releaseIbResources();
+}
+
+void CtrlChannel::disconnect() {
+    connected_.store(false, std::memory_order_release);
+    {
+        std::lock_guard<std::mutex> lock(send_mutex_);
+        pending_sends_ = 0;
+        send_cv_.notify_all();
+    }
+    std::lock_guard<std::mutex> lock(resource_mutex_);
+    releaseIbResources();
 }
 
 int CtrlChannel::postRecv(size_t idx) {
@@ -570,11 +583,6 @@ int CtrlChannel::pollSendCompletions(int max_entries) {
 
 int CtrlChannel::pollCompletions(int max_entries) {
     return drainCompletions(max_entries, /*log_poll_error=*/true);
-}
-
-void CtrlChannel::disconnect() {
-    std::lock_guard<std::mutex> lock(resource_mutex_);
-    destroyResources();
 }
 
 }  // namespace mooncake

@@ -38,6 +38,7 @@ RdmaTwoSidedTransport::~RdmaTwoSidedTransport() {
         if (entry.second) entry.second->disconnect();
     }
     ctrl_channels_.clear();
+    ctrl_cv_.notify_all();
 }
 
 int RdmaTwoSidedTransport::install(std::string &local_server_name,

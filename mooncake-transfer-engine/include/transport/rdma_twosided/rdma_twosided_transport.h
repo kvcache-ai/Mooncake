@@ -16,6 +16,7 @@
 #define RDMA_TWOSIDED_TRANSPORT_H_
 
 #include <atomic>
+#include <condition_variable>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -71,6 +72,7 @@ class RdmaTwoSidedTransport : public RdmaTransport {
     void ctrlWorkerLoop();
 
     std::mutex ctrl_mutex_;
+    std::condition_variable ctrl_cv_;
     std::unordered_map<std::string, std::shared_ptr<CtrlChannel>>
         ctrl_channels_;
     std::thread ctrl_worker_;
