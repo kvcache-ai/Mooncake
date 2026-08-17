@@ -38,6 +38,7 @@ runs:
           "$LAST_TEST_LOG"
 
     - name: Upload CTest diagnostics
+      if: ${{ always() }}
       uses: actions/upload-artifact@v4
       with:
         name: ${{ inputs.artifact-name }}

@@ -25,7 +25,11 @@ readonly LAST_TEST_LOG="$3"
     fi
 
     if [[ -s "$LAST_TEST_LOG" ]]; then
-        failed_cases=$(grep -E '^\[  FAILED  \]' "$LAST_TEST_LOG" | sort -u || true)
+        failed_cases=$(grep -E '^\[  FAILED  \]' "$LAST_TEST_LOG" |
+            sed -E \
+                -e '/^\[  FAILED  \] [0-9]+ tests?, listed below:$/d' \
+                -e 's/ \([0-9]+ ms\)$//' |
+            sort -u || true)
         if [[ -n "$failed_cases" ]]; then
             echo "### Failed test cases"
             echo '```text'
@@ -34,7 +38,10 @@ readonly LAST_TEST_LOG="$3"
         fi
 
         failure_context=$(grep -n -B2 -A8 -E \
-            ':[0-9]+: Failure$|ERROR: (AddressSanitizer|LeakSanitizer|ThreadSanitizer|UndefinedBehaviorSanitizer)|runtime error:|Segmentation fault|terminate called' \
+            -e ':[0-9]+: Failure$' \
+            -e 'Assertion .* failed\.$' \
+            -e '(ERROR|WARNING): (AddressSanitizer|LeakSanitizer|ThreadSanitizer|UndefinedBehaviorSanitizer)' \
+            -e 'runtime error:|Segmentation fault|terminate called' \
             "$LAST_TEST_LOG" | sed -n '1,200p' || true)
         if [[ -n "$failure_context" ]]; then
             echo "### Failure context"
