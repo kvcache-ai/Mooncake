@@ -50,6 +50,7 @@ TEST(P2POpLogTypesTest, RoundTrip_RegisterClientPayload) {
     original.client_id = {100, 200};
     original.ip_address = "192.168.1.1";
     original.rpc_port = 50051;
+    original.last_mutation_id = 12345;
     Segment seg;
     seg.id = {300, 400};
     seg.name = "seg_001";
@@ -67,6 +68,7 @@ TEST(P2POpLogTypesTest, RoundTrip_RegisterClientPayload) {
     EXPECT_EQ(decoded.client_id.second, 200u);
     EXPECT_EQ(decoded.ip_address, "192.168.1.1");
     EXPECT_EQ(decoded.rpc_port, 50051u);
+    EXPECT_EQ(decoded.last_mutation_id, 12345u);
     ASSERT_EQ(decoded.segments.size(), 1u);
     EXPECT_EQ(decoded.segments[0].id.first, 300u);
     EXPECT_EQ(decoded.segments[0].id.second, 400u);
@@ -80,6 +82,7 @@ TEST(P2POpLogTypesTest, RoundTrip_RegisterClientPayload_EmptyFields) {
     original.client_id = {0, 0};
     original.ip_address = "";
     original.rpc_port = 0;
+    original.last_mutation_id = 0;
 
     std::string data = SerializeP2PPayload(original);
     RegisterClientPayload decoded;
@@ -89,6 +92,7 @@ TEST(P2POpLogTypesTest, RoundTrip_RegisterClientPayload_EmptyFields) {
     EXPECT_EQ(decoded.client_id.second, 0u);
     EXPECT_EQ(decoded.ip_address, "");
     EXPECT_EQ(decoded.rpc_port, 0u);
+    EXPECT_EQ(decoded.last_mutation_id, 0u);
     EXPECT_EQ(decoded.segments.size(), 0u);
 }
 

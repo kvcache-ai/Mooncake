@@ -2,7 +2,9 @@
 #include <gtest/gtest.h>
 
 #include <memory>
+#include <mutex>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #define private public
@@ -12,6 +14,7 @@
 #undef private
 
 #include "master_config.h"
+#include "master_metric_manager.h"
 #include "p2p_client_meta.h"
 #include "p2p_rpc_types.h"
 #include "rpc_types.h"
@@ -108,15 +111,146 @@ TEST_F(P2PMasterServiceTest, RegisterClientDuplicate) {
     auto seg = MakeP2PSegment();
     auto client_id = generate_uuid();
     RegisterP2PClient(*service, client_id, {seg}, "127.0.0.1", 50051);
+    ASSERT_TRUE(service->SetSyncCompleted(client_id).has_value());
+    {
+        std::lock_guard<std::mutex> lock(service->client_replay_cursor_mutex_);
+        service->client_last_mutation_ids_[client_id] = 123;
+    }
 
-    // Try registering the same client_id again
+    auto duplicate_segment = MakeP2PSegment("seg2");
     RegisterClientRequest req;
     req.client_id = client_id;
-    req.segments = {MakeP2PSegment("seg2")};
+    req.ip_address = "127.0.0.2";
+    req.rpc_port = 50052;
+    req.segments = {duplicate_segment};
     req.deployment_mode = DeploymentMode::P2P;
     auto res = service->RegisterClient(req);
-    EXPECT_FALSE(res.has_value());
-    EXPECT_EQ(ErrorCode::CLIENT_ALREADY_EXISTS, res.error());
+    ASSERT_TRUE(res.has_value());
+    EXPECT_EQ(res->last_mutation_id, 123);
+
+    auto client = service->client_manager_->GetClient(client_id);
+    ASSERT_NE(client, nullptr);
+    auto p2p_client = std::dynamic_pointer_cast<P2PClientMeta>(client);
+    ASSERT_NE(p2p_client, nullptr);
+    EXPECT_EQ(p2p_client->get_ip_address(), "127.0.0.2");
+    EXPECT_EQ(p2p_client->get_rpc_port(), 50052);
+    EXPECT_TRUE(p2p_client->IsSyncing());
+    EXPECT_FALSE(p2p_client->QuerySegment(duplicate_segment.id).has_value());
+}
+
+TEST_F(P2PMasterServiceTest, RegisterClientDuplicateRejectsWrongMode) {
+    auto service = CreateService();
+    auto seg = MakeP2PSegment();
+    auto client_id = generate_uuid();
+    RegisterP2PClient(*service, client_id, {seg}, "127.0.0.1", 50051);
+
+    RegisterClientRequest req;
+    req.client_id = client_id;
+    req.ip_address = "127.0.0.2";
+    req.rpc_port = 50052;
+    req.deployment_mode = DeploymentMode::CENTRALIZATION;
+
+    auto res = service->RegisterClient(req);
+    ASSERT_FALSE(res.has_value());
+    EXPECT_EQ(res.error(), ErrorCode::ILLEGAL_CLIENT);
+
+    auto client = service->client_manager_->GetClient(client_id);
+    ASSERT_NE(client, nullptr);
+    auto p2p_client = std::dynamic_pointer_cast<P2PClientMeta>(client);
+    ASSERT_NE(p2p_client, nullptr);
+    EXPECT_EQ(p2p_client->get_ip_address(), "127.0.0.1");
+    EXPECT_EQ(p2p_client->get_rpc_port(), 50051);
+}
+
+TEST_F(P2PMasterServiceTest, RegisterClientDuplicateRejectsCrashedClient) {
+    auto service = CreateService();
+    auto seg = MakeP2PSegment();
+    auto client_id = generate_uuid();
+    RegisterP2PClient(*service, client_id, {seg}, "127.0.0.1", 50051);
+
+    auto client = service->client_manager_->GetClient(client_id);
+    ASSERT_NE(client, nullptr);
+    auto p2p_client = std::dynamic_pointer_cast<P2PClientMeta>(client);
+    ASSERT_NE(p2p_client, nullptr);
+    {
+        SharedMutexLocker lock(&p2p_client->client_mutex_);
+        p2p_client->health_state_.status = ClientStatus::CRASHED;
+    }
+
+    RegisterClientRequest req;
+    req.client_id = client_id;
+    req.ip_address = "127.0.0.2";
+    req.rpc_port = 50052;
+    req.deployment_mode = DeploymentMode::P2P;
+
+    auto res = service->RegisterClient(req);
+    ASSERT_FALSE(res.has_value());
+    EXPECT_EQ(res.error(), ErrorCode::CLIENT_UNHEALTHY);
+    EXPECT_EQ(p2p_client->get_ip_address(), "127.0.0.1");
+    EXPECT_EQ(p2p_client->get_rpc_port(), 50051);
+}
+
+TEST_F(P2PMasterServiceTest, RegisterClientDuplicateRecoversDisconnected) {
+    MasterMetricManager::instance().reset_all_metrics();
+    auto& metrics = MasterMetricManager::instance();
+
+    auto service = CreateService();
+    auto seg = MakeP2PSegment();
+    auto client_id = generate_uuid();
+    RegisterP2PClient(*service, client_id, {seg}, "127.0.0.1", 50051);
+    ASSERT_EQ(metrics.get_active_clients(), 1);
+
+    auto client = service->client_manager_->GetClient(client_id);
+    ASSERT_NE(client, nullptr);
+    auto p2p_client = std::dynamic_pointer_cast<P2PClientMeta>(client);
+    ASSERT_NE(p2p_client, nullptr);
+    {
+        SharedMutexLocker lock(&p2p_client->client_mutex_);
+        p2p_client->health_state_.status = ClientStatus::DISCONNECTION;
+    }
+    p2p_client->OnDisconnected();
+    ASSERT_EQ(metrics.get_active_clients(), 0);
+
+    RegisterClientRequest req;
+    req.client_id = client_id;
+    req.ip_address = "127.0.0.2";
+    req.rpc_port = 50052;
+    req.deployment_mode = DeploymentMode::P2P;
+
+    auto res = service->RegisterClient(req);
+    ASSERT_TRUE(res.has_value());
+    EXPECT_EQ(p2p_client->get_health_state().status, ClientStatus::HEALTH);
+    EXPECT_EQ(metrics.get_clients_recovered_total(), 1);
+    EXPECT_EQ(metrics.get_active_clients(), 1);
+}
+
+TEST_F(P2PMasterServiceTest, RestoreMetadataPreservesRegisterClientCursor) {
+    auto service = CreateService();
+    auto client_id = generate_uuid();
+    auto seg = MakeP2PSegment();
+
+    P2PStandbyMetadataStore::ExportedMetadata metadata;
+    P2PStandbyClientInfo client_info;
+    client_info.client_id = client_id;
+    client_info.ip_address = "127.0.0.1";
+    client_info.rpc_port = 50051;
+    client_info.last_mutation_id = 456;
+    client_info.segments = {seg};
+    metadata.clients.emplace(client_id, client_info);
+
+    ASSERT_EQ(service->RestoreFromStandbyMetadata(metadata), ErrorCode::OK);
+    EXPECT_EQ(service->GetClientLastMutationId(client_id), 456u);
+
+    RegisterClientRequest req;
+    req.client_id = client_id;
+    req.ip_address = "127.0.0.2";
+    req.rpc_port = 50052;
+    req.segments = {seg};
+    req.deployment_mode = DeploymentMode::P2P;
+
+    auto result = service->RegisterClient(req);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->last_mutation_id, 456u);
 }
 
 // ============================================================

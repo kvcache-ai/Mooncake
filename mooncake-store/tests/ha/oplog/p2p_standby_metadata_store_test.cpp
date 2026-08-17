@@ -229,12 +229,13 @@ TEST(P2PStandbyMetadataStoreTest, RegisterClientBasic) {
     std::vector<Segment> segments;
     segments.push_back(MakeSegment(MakeUUID(100, 0)));
 
-    store.RegisterClient(client_id, "192.168.1.1", 50051, segments);
+    store.RegisterClient(client_id, "192.168.1.1", 50051, segments, 42);
 
     auto info = store.GetClient(client_id);
     ASSERT_NE(info, nullptr);
     EXPECT_EQ(info->ip_address, "192.168.1.1");
     EXPECT_EQ(info->rpc_port, 50051u);
+    EXPECT_EQ(info->last_mutation_id, 42u);
     EXPECT_EQ(info->segments.size(), 1u);
 }
 
@@ -242,14 +243,15 @@ TEST(P2PStandbyMetadataStoreTest, RegisterClientUpdatesExisting) {
     P2PStandbyMetadataStore store;
     auto client_id = MakeUUID(1, 0);
 
-    store.RegisterClient(client_id, "192.168.1.1", 50051, {});
+    store.RegisterClient(client_id, "192.168.1.1", 50051, {}, 100);
     store.RegisterClient(client_id, "10.0.0.1", 50052,
-                         {MakeSegment(MakeUUID(100, 0))});
+                         {MakeSegment(MakeUUID(100, 0))}, 90);
 
     auto info = store.GetClient(client_id);
     ASSERT_NE(info, nullptr);
     EXPECT_EQ(info->ip_address, "10.0.0.1");
     EXPECT_EQ(info->rpc_port, 50052u);
+    EXPECT_EQ(info->last_mutation_id, 100u);
     EXPECT_EQ(info->segments.size(), 1u);
 }
 
@@ -529,7 +531,8 @@ TEST(P2PStandbyMetadataStoreTest, ExportMetadata) {
     auto seg = MakeUUID(10, 0);
 
     store.AddReplica("key1", client, seg, 1024, 1);
-    store.RegisterClient(client, "1.2.3.4", 50051, {MakeSegment(seg, 1024)});
+    store.RegisterClient(client, "1.2.3.4", 50051, {MakeSegment(seg, 1024)},
+                         123);
 
     auto exported = store.ExportMetadata();
 
@@ -538,6 +541,7 @@ TEST(P2PStandbyMetadataStoreTest, ExportMetadata) {
     EXPECT_EQ(exported.clients.size(), 1u);
     EXPECT_NE(exported.clients.find(client), exported.clients.end());
     EXPECT_EQ(exported.clients.at(client).ip_address, "1.2.3.4");
+    EXPECT_EQ(exported.clients.at(client).last_mutation_id, 123u);
 }
 
 TEST(P2PStandbyMetadataStoreTest, ExportMetadataNoBackfillForUnknownClient) {

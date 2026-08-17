@@ -24,10 +24,12 @@ struct P2PStandbyClientInfo {
     UUID client_id{0, 0};
     std::string ip_address;
     uint16_t rpc_port = 0;
+    uint64_t last_mutation_id = 0;
     // Segments owned by this client.
     std::vector<Segment> segments;
 
-    YLT_REFL(P2PStandbyClientInfo, client_id, ip_address, rpc_port, segments);
+    YLT_REFL(P2PStandbyClientInfo, client_id, ip_address, rpc_port,
+             last_mutation_id, segments);
 };
 
 /// P2P-specific standby metadata store.
@@ -78,8 +80,8 @@ class P2PStandbyMetadataStore : public MetadataStore {
 
     /// Register or update a client.
     void RegisterClient(const UUID& client_id, const std::string& ip_address,
-                        uint16_t rpc_port,
-                        const std::vector<Segment>& segments);
+                        uint16_t rpc_port, const std::vector<Segment>& segments,
+                        uint64_t last_mutation_id = 0);
 
     /// Unregister a client.
     /// Also removes all replicas owned by this client from their objects

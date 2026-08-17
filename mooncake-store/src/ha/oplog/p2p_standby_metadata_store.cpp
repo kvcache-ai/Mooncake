@@ -1,5 +1,7 @@
 #include "ha/oplog/p2p_standby_metadata_store.h"
 
+#include <algorithm>
+
 #include <glog/logging.h>
 #include <xxhash.h>
 
@@ -159,12 +161,13 @@ void P2PStandbyMetadataStore::RemoveReplica(const std::string& object_key,
 
 void P2PStandbyMetadataStore::RegisterClient(
     const UUID& client_id, const std::string& ip_address, uint16_t rpc_port,
-    const std::vector<Segment>& segments) {
+    const std::vector<Segment>& segments, uint64_t last_mutation_id) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto& info = clients_[client_id];
     info.client_id = client_id;
     info.ip_address = ip_address;
     info.rpc_port = rpc_port;
+    info.last_mutation_id = std::max(info.last_mutation_id, last_mutation_id);
     // Merge segments instead of overwriting to preserve segments added by
     // out-of-order AddSegment (MOUNT_SEGMENT) calls that arrived before
     // REGISTER_CLIENT.
@@ -180,6 +183,7 @@ void P2PStandbyMetadataStore::RegisterClient(
     VLOG(1) << "P2PStandbyMetadataStore::RegisterClient "
             << "client=" << client_id.first << ":" << client_id.second
             << " ip=" << ip_address << ":" << rpc_port
+            << " last_mutation_id=" << info.last_mutation_id
             << " segments=" << segments.size();
 
     // IP/port backfilling is deferred to ExportMetadata() to avoid O(N*M)

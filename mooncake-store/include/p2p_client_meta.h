@@ -26,6 +26,8 @@ class P2PClientMeta final : public ClientMeta {
 
     const std::string& get_ip_address() const { return ip_address_; }
     uint16_t get_rpc_port() const { return rpc_port_; }
+    auto RefreshRegistration(const std::string& ip_address, uint16_t rpc_port)
+        -> tl::expected<ClientStatus, ErrorCode>;
 
    public:
     /**

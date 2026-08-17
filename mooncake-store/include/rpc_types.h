@@ -151,11 +151,13 @@ YLT_REFL(RegisterClientRequest, client_id, segments, deployment_mode,
 /**
  * @brief Response structure for RegisterClient operation.
  * Returns the master's view_version to client for crash checking.
+ * P2P clients also use last_mutation_id as the HA replay cursor.
  */
 struct RegisterClientResponse {
     ViewVersionId view_version = 0;
+    uint64_t last_mutation_id = 0;
 };
-YLT_REFL(RegisterClientResponse, view_version);
+YLT_REFL(RegisterClientResponse, view_version, last_mutation_id);
 
 /**
  * @brief Request structure for UnregisterClient operation.

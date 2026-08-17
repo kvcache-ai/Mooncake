@@ -272,6 +272,8 @@ TEST_F(P2PHotStandbyServiceTest, BootstrapsFromStandbySnapshotSource) {
     ASSERT_EQ(source.Start(), ErrorCode::OK);
     ASSERT_TRUE(
         source.WaitForAppliedSequence(2, std::chrono::milliseconds(2000)));
+    source.GetMetadataStore()->RegisterClient(client_id, "127.0.0.1", 50051,
+                                              {MakeSegment(segment_id)}, 321);
 
     auto target_config = MakeStandbyConfig();
     target_config.snapshot_source_endpoints = {
@@ -283,6 +285,7 @@ TEST_F(P2PHotStandbyServiceTest, BootstrapsFromStandbySnapshotSource) {
 
     auto exported = target.ExportMetadata();
     ASSERT_NE(exported.clients.find(client_id), exported.clients.end());
+    EXPECT_EQ(exported.clients.at(client_id).last_mutation_id, 321u);
     auto object = exported.objects.find("snapshot-key");
     ASSERT_NE(object, exported.objects.end());
     EXPECT_EQ(object->second.size, 8192);
@@ -320,7 +323,9 @@ TEST_F(P2PHotStandbyServiceTest,
     ASSERT_EQ(fromInt(chunk.error_code), ErrorCode::OK);
     ASSERT_TRUE(chunk.done);
     ASSERT_EQ(chunk.objects.size(), 1);
+    ASSERT_EQ(chunk.clients.size(), 1);
     EXPECT_EQ(chunk.objects.front().key, "before-snapshot");
+    EXPECT_EQ(chunk.clients.front().info.last_mutation_id, 0u);
     EXPECT_EQ(snapshot.EndSnapshot({begin.session_id}), toInt(ErrorCode::OK));
 }
 

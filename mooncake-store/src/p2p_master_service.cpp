@@ -48,32 +48,105 @@ ErrorCode P2PMasterService::RecordOplog(OpType type, const std::string& key,
     return ErrorCode::OK;
 }
 
+uint64_t P2PMasterService::GetClientLastMutationId(
+    const UUID& client_id) const {
+    std::lock_guard<std::mutex> lock(client_replay_cursor_mutex_);
+    auto it = client_last_mutation_ids_.find(client_id);
+    if (it == client_last_mutation_ids_.end()) {
+        return 0;
+    }
+    return it->second;
+}
+
+void P2PMasterService::EnsureClientReplayCursor(const UUID& client_id) {
+    std::lock_guard<std::mutex> lock(client_replay_cursor_mutex_);
+    client_last_mutation_ids_.try_emplace(client_id, 0);
+}
+
+void P2PMasterService::SetClientLastMutationId(const UUID& client_id,
+                                               uint64_t last_mutation_id) {
+    std::lock_guard<std::mutex> lock(client_replay_cursor_mutex_);
+    client_last_mutation_ids_[client_id] = last_mutation_id;
+}
+
+void P2PMasterService::EraseClientReplayCursor(const UUID& client_id) {
+    std::lock_guard<std::mutex> lock(client_replay_cursor_mutex_);
+    client_last_mutation_ids_.erase(client_id);
+}
+
 auto P2PMasterService::RegisterClient(const RegisterClientRequest& req)
     -> tl::expected<RegisterClientResponse, ErrorCode> {
-    if (GetClientManager().GetClient(req.client_id)) {
-        LOG(WARNING) << "RegisterClient(P2P): client already exists"
-                     << ", client_id=" << req.client_id;
-        return tl::make_unexpected(ErrorCode::CLIENT_ALREADY_EXISTS);
+    if (req.deployment_mode != DeploymentMode::P2P) {
+        LOG(ERROR) << "RegisterClient(P2P): architecture mismatch"
+                   << ", client_mode=" << static_cast<int>(req.deployment_mode)
+                   << ", master_mode=" << static_cast<int>(DeploymentMode::P2P)
+                   << ", client_id=" << req.client_id;
+        return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
 
-    if (!req.ip_address || !req.rpc_port) {
+    if (!req.ip_address || req.ip_address->empty() || !req.rpc_port ||
+        *req.rpc_port == 0) {
         LOG(ERROR) << "RegisterClient(P2P): missing endpoint"
                    << ", client_id=" << req.client_id;
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    auto build_existing_response =
+        [this, &req](const std::shared_ptr<ClientMeta>& existing_client)
+        -> tl::expected<RegisterClientResponse, ErrorCode> {
+        auto p2p_client =
+            std::dynamic_pointer_cast<P2PClientMeta>(existing_client);
+        if (!p2p_client) {
+            LOG(ERROR) << "RegisterClient(P2P): existing client is not P2P"
+                       << ", client_id=" << req.client_id;
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+
+        auto refresh_result =
+            p2p_client->RefreshRegistration(*req.ip_address, *req.rpc_port);
+        if (!refresh_result.has_value()) {
+            return tl::make_unexpected(refresh_result.error());
+        }
+        if (refresh_result.value() == ClientStatus::DISCONNECTION) {
+            p2p_client->OnRecovered();
+        }
+        p2p_client->SetSyncing(true);
+        EnsureClientReplayCursor(req.client_id);
+
+        RegisterClientResponse response;
+        response.view_version = view_version_;
+        response.last_mutation_id = GetClientLastMutationId(req.client_id);
+        LOG(INFO) << "RegisterClient(P2P): client already registered"
+                  << ", client_id=" << req.client_id
+                  << ", last_mutation_id=" << response.last_mutation_id;
+        return response;
+    };
+
+    auto existing_client = GetClientManager().GetClient(req.client_id);
+    if (existing_client) {
+        return build_existing_response(existing_client);
+    }
+
     auto result = MasterService::RegisterClient(req);
     if (!result.has_value()) {
+        if (result.error() == ErrorCode::CLIENT_ALREADY_EXISTS) {
+            auto raced_client = GetClientManager().GetClient(req.client_id);
+            if (raced_client) {
+                return build_existing_response(raced_client);
+            }
+        }
         LOG(ERROR) << "RegisterClient(P2P): failed"
                    << ", client_id=" << req.client_id
                    << ", error=" << result.error();
         return result;
     }
+    EnsureClientReplayCursor(req.client_id);
 
     RegisterClientPayload payload;
     payload.client_id = req.client_id;
     payload.ip_address = *req.ip_address;
     payload.rpc_port = *req.rpc_port;
+    payload.last_mutation_id = GetClientLastMutationId(req.client_id);
     payload.segments = req.segments;
     auto err =
         RecordOplog(OpType_REGISTER_CLIENT, "", SerializeP2PPayload(payload));
@@ -83,6 +156,7 @@ auto P2PMasterService::RegisterClient(const RegisterClientRequest& req)
                    << ", error=" << toString(err);
         return tl::make_unexpected(err);
     }
+    result->last_mutation_id = payload.last_mutation_id;
     return result;
 }
 
@@ -95,6 +169,7 @@ auto P2PMasterService::UnregisterClient(const UnregisterClientRequest& req)
                    << ", error=" << result.error();
         return result;
     }
+    EraseClientReplayCursor(req.client_id);
 
     UnregisterClientPayload payload;
     payload.client_id = req.client_id;
@@ -761,6 +836,7 @@ ErrorCode P2PMasterService::RestoreFromStandbyMetadata(
         if (p2p_client) {
             p2p_client->SetSyncing(false);
         }
+        SetClientLastMutationId(client_id, client_info.last_mutation_id);
         ++restored_clients;
     }
 

@@ -125,7 +125,8 @@ bool P2POpLogApplier::ApplyRegisterClient(const OpLogEntry& entry) {
     }
 
     p2p_store_->RegisterClient(payload.client_id, payload.ip_address,
-                               payload.rpc_port, payload.segments);
+                               payload.rpc_port, payload.segments,
+                               payload.last_mutation_id);
     return true;
 }
 

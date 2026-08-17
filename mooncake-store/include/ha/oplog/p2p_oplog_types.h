@@ -46,10 +46,12 @@ struct RegisterClientPayload {
     UUID client_id{0, 0};
     std::string ip_address;
     uint16_t rpc_port = 0;
+    uint64_t last_mutation_id = 0;
     // Segments registered by this client at registration time.
     std::vector<Segment> segments;
 
-    YLT_REFL(RegisterClientPayload, client_id, ip_address, rpc_port, segments);
+    YLT_REFL(RegisterClientPayload, client_id, ip_address, rpc_port,
+             last_mutation_id, segments);
 };
 
 /// Payload for UNREGISTER_CLIENT (OpType=16, sync).

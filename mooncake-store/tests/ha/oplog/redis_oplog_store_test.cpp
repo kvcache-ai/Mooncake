@@ -15,6 +15,7 @@
 
 #include "ha/oplog/oplog_store_factory.h"
 #include "ha/oplog/redis_oplog_store.h"
+#include "ha/oplog/p2p_oplog_types.h"
 #include "ha/oplog/p2p_standby_snapshot_service.h"
 #include "p2p_master_service.h"
 #include "redis_util.h"
@@ -199,6 +200,32 @@ TEST_F(RedisOpLogStoreTest, WriteReadAndLatestSequence) {
     uint64_t latest = 0;
     ASSERT_EQ(ErrorCode::OK, reader->GetLatestSequenceId(latest));
     EXPECT_EQ(2u, latest);
+}
+
+TEST_F(RedisOpLogStoreTest, WriteReadP2PRegisterClientCursorPayload) {
+    auto writer = CreateWriter();
+
+    RegisterClientPayload payload;
+    payload.client_id = {1, 2};
+    payload.ip_address = "127.0.0.1";
+    payload.rpc_port = 50051;
+    payload.last_mutation_id = 789;
+
+    OpLogEntry entry;
+    entry.sequence_id = 1;
+    entry.op_type = OpType_REGISTER_CLIENT;
+    entry.payload = SerializeP2PPayload(payload);
+    ASSERT_EQ(ErrorCode::OK, writer->WriteOpLog(entry, true));
+
+    auto reader = CreateReader();
+    OpLogEntry restored;
+    ASSERT_EQ(ErrorCode::OK, reader->ReadOpLog(1, restored));
+    EXPECT_EQ(restored.op_type, OpType_REGISTER_CLIENT);
+
+    RegisterClientPayload restored_payload;
+    ASSERT_TRUE(DeserializeP2PPayload(restored.payload, restored_payload));
+    EXPECT_EQ(restored_payload.client_id, payload.client_id);
+    EXPECT_EQ(restored_payload.last_mutation_id, 789u);
 }
 
 TEST_F(RedisOpLogStoreTest, OpLogKeysDoNotUseRedisHashTags) {

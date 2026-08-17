@@ -1,5 +1,7 @@
 #pragma once
 
+#include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 
 #include "master_service.h"
@@ -85,6 +87,7 @@ class P2PMasterService : public MasterService {
 
     ErrorCode RecordOplog(OpType type, const std::string& key,
                           const std::string& payload = std::string());
+    uint64_t GetClientLastMutationId(const UUID& client_id) const;
 
     std::vector<Replica::Descriptor> FilterReplicas(
         const GetReplicaListRequestConfig& config,
@@ -131,6 +134,10 @@ class P2PMasterService : public MasterService {
     tl::expected<void, ErrorCode> InnerRemoveReplica(
         MetadataShard& shard, std::string_view key, const UUID& client_id,
         const UUID& segment_id) NO_THREAD_SAFETY_ANALYSIS;
+    void EnsureClientReplayCursor(const UUID& client_id);
+    void SetClientLastMutationId(const UUID& client_id,
+                                 uint64_t last_mutation_id);
+    void EraseClientReplayCursor(const UUID& client_id);
 
     std::shared_ptr<P2PClientManager> client_manager_;
     std::array<P2PMetadataShard, kNumShards> metadata_shards_;
@@ -139,6 +146,10 @@ class P2PMasterService : public MasterService {
     // 2. max_client_per_key_ > 0 means the max client owner count
     uint64_t max_client_per_key_;
     bool enable_async_oplog_write_{false};
+
+    mutable std::mutex client_replay_cursor_mutex_;
+    std::unordered_map<UUID, uint64_t, boost::hash<UUID>>
+        client_last_mutation_ids_;
 };
 
 }  // namespace mooncake

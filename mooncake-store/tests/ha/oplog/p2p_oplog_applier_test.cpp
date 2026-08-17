@@ -287,6 +287,7 @@ TEST(P2POpLogApplierTest, ApplyRegisterClient) {
     payload.client_id = client;
     payload.ip_address = "192.168.1.100";
     payload.rpc_port = 50051;
+    payload.last_mutation_id = 77;
     payload.segments = {segment};
 
     auto entry = MakeRegisterClientEntry(1, payload);
@@ -296,6 +297,7 @@ TEST(P2POpLogApplierTest, ApplyRegisterClient) {
     ASSERT_NE(info, nullptr);
     EXPECT_EQ(info->ip_address, "192.168.1.100");
     EXPECT_EQ(info->rpc_port, 50051u);
+    EXPECT_EQ(info->last_mutation_id, 77u);
     ASSERT_EQ(info->segments.size(), 1u);
     EXPECT_EQ(info->segments[0].id, seg_id);
 }

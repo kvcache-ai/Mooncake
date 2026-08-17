@@ -75,6 +75,24 @@ size_t P2PClientMeta::GetAvailableCapacity() const {
     return client_capacity_ - client_usage_;
 }
 
+auto P2PClientMeta::RefreshRegistration(const std::string& ip_address,
+                                        uint16_t rpc_port)
+    -> tl::expected<ClientStatus, ErrorCode> {
+    SharedMutexLocker lock(&client_mutex_);
+    if (health_state_.status == ClientStatus::CRASHED) {
+        LOG(WARNING) << "RegisterClient(P2P): rejected crashed client"
+                     << ", client_id=" << client_id_;
+        return tl::make_unexpected(ErrorCode::CLIENT_UNHEALTHY);
+    }
+
+    auto old_status = health_state_.status;
+    ip_address_ = ip_address;
+    rpc_port_ = rpc_port;
+    health_state_.last_heartbeat = std::chrono::steady_clock::now();
+    health_state_.status = ClientStatus::HEALTH;
+    return old_status;
+}
+
 P2PClientMeta::CapacityStat P2PClientMeta::GetWriteScoreCapacity(
     const std::vector<std::string>& tag_filters, int priority_limit,
     bool top_tier_only) const {

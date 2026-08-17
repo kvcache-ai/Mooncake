@@ -302,7 +302,8 @@ ErrorCode P2PStandbySnapshotClient::Bootstrap(const std::string& endpoint,
         }
         for (const auto& record : chunk->clients) {
             target->RegisterClient(record.client_id, record.info.ip_address,
-                                   record.info.rpc_port, record.info.segments);
+                                   record.info.rpc_port, record.info.segments,
+                                   record.info.last_mutation_id);
         }
         for (const auto& record : chunk->objects) {
             target->RestoreMetadata(record.key, record.metadata);
