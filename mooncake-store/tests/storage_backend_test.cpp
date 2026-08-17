@@ -8,10 +8,12 @@
 #include <iostream>
 #include <limits>
 #include <ranges>
+#include <string_view>
 #include <thread>
 #include <atomic>
 #include <algorithm>
 #include <cstring>
+#include <cstdlib>
 #include <mutex>
 #include <fcntl.h>
 #include <unistd.h>
@@ -4834,5 +4836,122 @@ TEST_F(StorageBackendTest,
         << "Freshly offloaded bucket must not be evicted immediately "
            "(its access timestamp must not be 0)";
 }
+
+#ifdef USE_URING
+TEST_F(StorageBackendTest, BucketBatchLoadUsesUringAcrossQueueDepth) {
+    constexpr int kKeyCount = 40;
+    constexpr size_t kValueSize = 1024;
+    constexpr size_t kReadBufferSize = 8192;
+
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.use_uring = true;
+
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = kKeyCount;
+    bucket_config.bucket_size_limit = 1024 * 1024;
+    bucket_config.max_total_size = 4 * 1024 * 1024;
+
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init().has_value());
+
+    std::vector<std::string> keys(kKeyCount);
+    std::vector<std::string> values(kKeyCount);
+    std::unordered_map<std::string, std::vector<Slice>> offload_batch;
+    for (int i = 0; i < kKeyCount; ++i) {
+        keys[i] = "uring_batch_key_" + std::to_string(i);
+        values[i] = std::string(kValueSize, static_cast<char>('A' + i % 26));
+        offload_batch.emplace(
+            keys[i],
+            std::vector<Slice>{Slice{values[i].data(), values[i].size()}});
+    }
+
+    auto offload_result = storage_backend.BatchOffload(
+        offload_batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_TRUE(offload_result.has_value()) << offload_result.error();
+
+    using AlignedBuffer = std::unique_ptr<void, decltype(&std::free)>;
+    std::vector<AlignedBuffer> read_buffers;
+    std::unordered_map<std::string, Slice> load_batch;
+    read_buffers.reserve(kKeyCount);
+    for (int i = 0; i < kKeyCount; ++i) {
+        void* buffer = nullptr;
+        ASSERT_EQ(posix_memalign(&buffer, 4096, kReadBufferSize), 0);
+        read_buffers.emplace_back(buffer, &std::free);
+        load_batch.emplace(keys[i], Slice{buffer, kValueSize});
+    }
+
+    auto load_result = storage_backend.BatchLoad(load_batch);
+    ASSERT_TRUE(load_result.has_value()) << load_result.error();
+    for (int i = 0; i < kKeyCount; ++i) {
+        const auto& loaded = load_batch.at(keys[i]);
+        EXPECT_EQ(std::string_view(static_cast<char*>(loaded.ptr), loaded.size),
+                  values[i]);
+    }
+}
+
+TEST_F(StorageBackendTest, BucketBatchLoadRejectsShortRead) {
+    constexpr int kKeyCount = 2;
+    constexpr size_t kValueSize = 4096;
+    constexpr size_t kReadBufferSize = 8192;
+
+    FileStorageConfig config;
+    config.storage_filepath = data_path;
+    config.use_uring = true;
+
+    BucketBackendConfig bucket_config;
+    bucket_config.bucket_keys_limit = kKeyCount;
+    bucket_config.bucket_size_limit = 64 * 1024;
+    bucket_config.max_total_size = 1024 * 1024;
+
+    BucketStorageBackend storage_backend(config, bucket_config);
+    ASSERT_TRUE(storage_backend.Init().has_value());
+
+    std::vector<std::string> keys{"short_read_key_0", "short_read_key_1"};
+    std::vector<std::string> values{std::string(kValueSize, 'A'),
+                                    std::string(kValueSize, 'B')};
+    std::unordered_map<std::string, std::vector<Slice>> offload_batch;
+    for (int i = 0; i < kKeyCount; ++i) {
+        offload_batch.emplace(
+            keys[i],
+            std::vector<Slice>{Slice{values[i].data(), values[i].size()}});
+    }
+
+    auto offload_result = storage_backend.BatchOffload(
+        offload_batch,
+        [](const std::vector<std::string>&,
+           std::vector<StorageObjectMetadata>&) { return ErrorCode::OK; });
+    ASSERT_TRUE(offload_result.has_value()) << offload_result.error();
+
+    std::filesystem::path bucket_path;
+    for (const auto& entry : std::filesystem::directory_iterator(data_path)) {
+        if (entry.path().extension() == ".bucket") {
+            bucket_path = entry.path();
+            break;
+        }
+    }
+    ASSERT_FALSE(bucket_path.empty());
+    auto bucket_size = std::filesystem::file_size(bucket_path);
+    ASSERT_GT(bucket_size, kValueSize / 2);
+    std::filesystem::resize_file(bucket_path, bucket_size - kValueSize / 2);
+
+    using AlignedBuffer = std::unique_ptr<void, decltype(&std::free)>;
+    std::vector<AlignedBuffer> read_buffers;
+    std::unordered_map<std::string, Slice> load_batch;
+    for (int i = 0; i < kKeyCount; ++i) {
+        void* buffer = nullptr;
+        ASSERT_EQ(posix_memalign(&buffer, 4096, kReadBufferSize), 0);
+        read_buffers.emplace_back(buffer, &std::free);
+        load_batch.emplace(keys[i], Slice{buffer, kValueSize});
+    }
+
+    auto load_result = storage_backend.BatchLoad(load_batch);
+    ASSERT_FALSE(load_result.has_value());
+    EXPECT_EQ(load_result.error(), ErrorCode::FILE_READ_FAIL);
+}
+
+#endif
 
 }  // namespace mooncake::test
