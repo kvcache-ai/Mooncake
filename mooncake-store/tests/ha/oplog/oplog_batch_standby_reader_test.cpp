@@ -256,7 +256,9 @@ TEST(OpLogBatchStandbyReaderTest, FullPageContinuesOnNextPoll) {
     FakeHaKvBackend backend;
     ASSERT_EQ(ErrorCode::OK,
               backend.Put(BuildDurablePrefixKey("clusterA"),
-                          EncodeDurablePrefix({.batch_id = 3, .last_seq = 3})));
+                          EncodeDurablePrefix({.batch_id = 3,
+                                               .last_seq = 3,
+                                               .producer_view_version = 7})));
     for (uint64_t id = 1; id <= 3; ++id) {
         ASSERT_EQ(ErrorCode::OK,
                   backend.Put(BuildBatchRecordKey("clusterA", id),
@@ -270,11 +272,36 @@ TEST(OpLogBatchStandbyReaderTest, FullPageContinuesOnNextPoll) {
     ASSERT_EQ(ErrorCode::OK, first.error);
     EXPECT_EQ(2u, first.applied_entries);
     EXPECT_EQ(3u, applier.GetExpectedSequenceId());
+    EXPECT_FALSE(reader.GetLastAppliedDurablePrefix().has_value());
 
     auto second = reader.PollOnce(/*max_batches=*/2);
     ASSERT_EQ(ErrorCode::OK, second.error);
     EXPECT_EQ(1u, second.applied_entries);
     EXPECT_EQ(4u, applier.GetExpectedSequenceId());
+    auto applied_prefix = reader.GetLastAppliedDurablePrefix();
+    ASSERT_TRUE(applied_prefix.has_value());
+    EXPECT_EQ(3u, applied_prefix->batch_id);
+    EXPECT_EQ(3u, applied_prefix->last_seq);
+    EXPECT_EQ(7u, applied_prefix->producer_view_version);
+}
+
+TEST(OpLogBatchStandbyReaderTest, ReportsValidZeroBoundaryAsComplete) {
+    FakeHaKvBackend backend;
+    ASSERT_EQ(ErrorCode::OK,
+              backend.Put(BuildDurablePrefixKey("clusterA"),
+                          EncodeDurablePrefix({.batch_id = 0,
+                                               .last_seq = 0,
+                                               .producer_view_version = 7})));
+    MockMetadataStore metadata_store;
+    OpLogApplier applier(&metadata_store, "clusterA");
+    OpLogBatchStandbyReader reader("clusterA", backend, applier);
+
+    ASSERT_EQ(ErrorCode::OK, reader.PollOnce().error);
+    auto applied_prefix = reader.GetLastAppliedDurablePrefix();
+    ASSERT_TRUE(applied_prefix.has_value());
+    EXPECT_EQ(0u, applied_prefix->batch_id);
+    EXPECT_EQ(0u, applied_prefix->last_seq);
+    EXPECT_EQ(7u, applied_prefix->producer_view_version);
 }
 
 TEST(OpLogBatchStandbyReaderTest, RejectsPrefixPointingIntoBatch) {
@@ -300,7 +327,9 @@ TEST(OpLogBatchStandbyReaderTest, AppliesExpandedEntriesInSequenceOrder) {
     FakeHaKvBackend backend;
     ASSERT_EQ(ErrorCode::OK,
               backend.Put(BuildDurablePrefixKey("clusterA"),
-                          EncodeDurablePrefix({.batch_id = 2, .last_seq = 3})));
+                          EncodeDurablePrefix({.batch_id = 2,
+                                               .last_seq = 3,
+                                               .producer_view_version = 9})));
     ASSERT_EQ(ErrorCode::OK,
               backend.Put(BuildBatchRecordKey("clusterA", 1),
                           EncodeOpLogBatchRecord(MakeBatch(1, 1, 1))));
@@ -316,6 +345,11 @@ TEST(OpLogBatchStandbyReaderTest, AppliesExpandedEntriesInSequenceOrder) {
     ASSERT_EQ(ErrorCode::OK, result.error);
     EXPECT_EQ(3u, result.applied_entries);
     EXPECT_EQ(4u, applier.GetExpectedSequenceId());
+    auto applied_prefix = reader.GetLastAppliedDurablePrefix();
+    ASSERT_TRUE(applied_prefix.has_value());
+    EXPECT_EQ(2u, applied_prefix->batch_id);
+    EXPECT_EQ(3u, applied_prefix->last_seq);
+    EXPECT_EQ(9u, applied_prefix->producer_view_version);
 }
 
 TEST(OpLogBatchStandbyReaderTest, AcceptsFirstBatchAfterSnapshotBaseline) {
@@ -358,6 +392,7 @@ TEST(OpLogBatchStandbyReaderTest, FailsWhenLaterBatchHasSequenceGap) {
     EXPECT_NE(ErrorCode::OK, result.error);
     EXPECT_EQ(2u, result.applied_entries);
     EXPECT_EQ(3u, applier.GetExpectedSequenceId());
+    EXPECT_FALSE(reader.GetLastAppliedDurablePrefix().has_value());
 }
 
 TEST(OpLogBatchStandbyReaderTest, MissingBatchMarksReaderUnhealthy) {
