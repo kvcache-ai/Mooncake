@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "device_comm/device_transfer/routes/route_provider.h"
+#include "gpu_runtime.h"
 
 namespace mooncake {
 
@@ -22,6 +23,8 @@ class P2pRoute : public RouteProvider {
 
     P2pRoute(device::P2pTransport& transport, void* local_region,
              int device_index, GlobalRank self_rank, uint32_t max_world_size);
+
+    [[nodiscard]] PGResult<void> initialize();
 
     [[nodiscard]] std::string_view routeKey() const noexcept override;
     [[nodiscard]] uint32_t routeVersion() const noexcept override;
@@ -38,6 +41,7 @@ class P2pRoute : public RouteProvider {
     int device_index_ = -1;
     GlobalRank self_rank_ = kInvalidGlobalRank;
     uint32_t max_world_size_ = 0;
+    std::optional<GpuStream> snapshot_stream_;
 };
 
 }  // namespace mooncake
