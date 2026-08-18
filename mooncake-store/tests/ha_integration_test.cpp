@@ -139,7 +139,7 @@ class HAIntegrationTest : public ::testing::Test {
             << "Expected DEGRADED state after MASTER_UNREACHABLE";
     }
 
-    static bool RegisterOrAlreadyRestored(
+    static bool RegisterClientForRecovery(
         std::shared_ptr<P2PClientService>& client, ErrorCode& error) {
         auto reg = client->RegisterClient();
         if (reg.has_value()) {
@@ -147,7 +147,7 @@ class HAIntegrationTest : public ::testing::Test {
             return true;
         }
         error = reg.error();
-        return error == ErrorCode::CLIENT_ALREADY_EXISTS;
+        return false;
     }
 
     static void ForceRecover(std::shared_ptr<P2PClientService>& client) {
@@ -573,20 +573,13 @@ TEST_F(HAIntegrationTest, MasterRestartRecovery) {
         if (attempt == 9) FAIL() << "Reconnect client2 failed after retries";
     }
 
-    // Re-register clients with the restarted master. After P2P master metadata
-    // restore is enabled, background HA recovery can race with this manual
-    // re-register and restore the same client first. In that case
-    // CLIENT_ALREADY_EXISTS means the restarted master already has the client,
-    // which is acceptable for this recovery test.
-    //
-    // TODO: Split client registration into strict user-initiated register and
-    // HA recovery register, so this idempotent "already restored" case is
-    // modeled by a dedicated recovery API instead of test-side interpretation.
+    // Re-register clients with the restarted master. Duplicate P2P
+    // registration is handled as an idempotent HA re-register by the master.
     ErrorCode reg1_error = ErrorCode::OK;
-    ASSERT_TRUE(RegisterOrAlreadyRestored(client1_, reg1_error))
+    ASSERT_TRUE(RegisterClientForRecovery(client1_, reg1_error))
         << "Re-register client1 failed: " << static_cast<int>(reg1_error);
     ErrorCode reg2_error = ErrorCode::OK;
-    ASSERT_TRUE(RegisterOrAlreadyRestored(client2_, reg2_error))
+    ASSERT_TRUE(RegisterClientForRecovery(client2_, reg2_error))
         << "Re-register client2 failed: " << static_cast<int>(reg2_error);
 
     // Recovery: DEGRADED → SYNCING → FULL
