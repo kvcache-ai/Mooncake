@@ -33,8 +33,8 @@ struct MasterRunnerConfig {
     std::string redis_username;
     std::string redis_password;
     int redis_db_index = 0;
-    int redis_master_view_ttl_sec = 5;
-    int redis_heartbeat_interval_sec = 2;
+    int redis_master_view_ttl_sec = 4;
+    int redis_heartbeat_interval_sec = 1;
     std::string cluster_id;
     std::string rpc_address = "0.0.0.0";
     std::string deployment_mode = "Centralization";

@@ -24,9 +24,9 @@ DEFINE_string(redis_password, "",
               "Redis AUTH password for redis:// master discovery");
 DEFINE_int32(redis_db_index, 0,
              "Redis database index for redis:// master discovery");
-DEFINE_int32(redis_master_view_ttl_sec, 5,
+DEFINE_int32(redis_master_view_ttl_sec, 4,
              "Redis master view TTL for redis:// master discovery");
-DEFINE_int32(redis_heartbeat_interval_sec, 2,
+DEFINE_int32(redis_heartbeat_interval_sec, 1,
              "Redis heartbeat interval for redis:// master discovery");
 DEFINE_string(global_segment_size, "4 GB", "Size of global segment");
 DEFINE_int32(threads, 1, "Number of rpc threads for dummy client");

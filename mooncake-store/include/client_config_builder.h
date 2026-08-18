@@ -130,8 +130,8 @@ struct RealClientConfigBase {
     std::string redis_username;
     std::string redis_password;
     int redis_db_index = 0;
-    int redis_master_view_ttl_sec = 5;
-    int redis_heartbeat_interval_sec = 2;
+    int redis_master_view_ttl_sec = 4;
+    int redis_heartbeat_interval_sec = 1;
 };
 
 /**
@@ -252,7 +252,7 @@ class ClientConfigBuilder {
         uint64_t metric_report_interval_seconds = 60,
         const std::string& redis_cluster_id = DEFAULT_CLUSTER_ID,
         const std::string& redis_password = "", int redis_db_index = 0,
-        int redis_master_view_ttl_sec = 5, int redis_heartbeat_interval_sec = 2,
+        int redis_master_view_ttl_sec = 4, int redis_heartbeat_interval_sec = 1,
         const std::string& redis_username = "") {
         CentralizedClientConfig config;
         fill_real_client_config_base(
@@ -345,7 +345,7 @@ class ClientConfigBuilder {
         uint64_t metric_report_interval_seconds = 60,
         const std::string& redis_cluster_id = DEFAULT_CLUSTER_ID,
         const std::string& redis_password = "", int redis_db_index = 0,
-        int redis_master_view_ttl_sec = 5, int redis_heartbeat_interval_sec = 2,
+        int redis_master_view_ttl_sec = 4, int redis_heartbeat_interval_sec = 1,
         const std::string& redis_username = "") {
         P2PClientConfig config;
         fill_real_client_config_base(
@@ -477,8 +477,8 @@ class ClientConfigBuilder {
         std::string username;
         std::string password;
         int db_index = 0;
-        int master_view_ttl_sec = 5;
-        int heartbeat_interval_sec = 2;
+        int master_view_ttl_sec = 4;
+        int heartbeat_interval_sec = 1;
     };
 
     // Dict key constants and defaults, grouped by deployment mode
@@ -653,9 +653,11 @@ class ClientConfigBuilder {
         redis_config.db_index =
             get_config_int(config, DictCommon::kRedisDbIndex, 0);
         redis_config.master_view_ttl_sec =
-            get_config_int(config, DictCommon::kRedisMasterViewTtlSec, 5);
+            get_config_int(config, DictCommon::kRedisMasterViewTtlSec,
+                           redis_config.master_view_ttl_sec);
         redis_config.heartbeat_interval_sec =
-            get_config_int(config, DictCommon::kRedisHeartbeatIntervalSec, 2);
+            get_config_int(config, DictCommon::kRedisHeartbeatIntervalSec,
+                           redis_config.heartbeat_interval_sec);
         return redis_config;
     }
 

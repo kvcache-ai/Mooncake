@@ -161,11 +161,11 @@ DEFINE_string(redis_username, "", "Redis ACL username (empty = one-arg AUTH)");
 DEFINE_string(redis_password, "", "Redis AUTH password (empty = no auth)");
 DEFINE_int32(redis_db_index, 0, "Redis database index (default: 0)");
 DEFINE_int32(
-    redis_master_view_ttl_sec, 5,
-    "TTL in seconds for the leader key in Redis election (default: 5)");
-DEFINE_int32(redis_heartbeat_interval_sec, 2,
+    redis_master_view_ttl_sec, 4,
+    "TTL in seconds for the leader key in Redis election (default: 4)");
+DEFINE_int32(redis_heartbeat_interval_sec, 1,
              "KeepLeader heartbeat interval in seconds for Redis election "
-             "(default: 2, should be < ttl)");
+             "(default: 1, should be < ttl)");
 void InitMasterConf(const mooncake::DefaultConfig& default_config,
                     mooncake::MasterConfig& master_config) {
     // Initialize the master service configuration from the default config

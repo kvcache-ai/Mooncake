@@ -44,9 +44,9 @@ DEFINE_string(redis_password, "",
               "Redis password for Redis master failover test");
 DEFINE_string(redis_cluster_id, "redis_chaos_test",
               "Redis cluster ID for Redis master failover test");
-DEFINE_int32(redis_master_view_ttl_sec, 5,
+DEFINE_int32(redis_master_view_ttl_sec, 4,
              "Redis master view TTL for Redis master failover test");
-DEFINE_int32(redis_heartbeat_interval_sec, 2,
+DEFINE_int32(redis_heartbeat_interval_sec, 1,
              "Redis heartbeat interval for Redis master failover test");
 
 constexpr int kMasterPortBase = 51051;

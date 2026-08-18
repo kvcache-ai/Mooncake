@@ -35,7 +35,7 @@ class RedisElectionHelper {
     RedisElectionHelper(const std::string& cluster_id,
                         const std::string& redis_endpoint,
                         const std::string& password = "", int db_index = 0,
-                        int ttl_sec = 5, int heartbeat_interval_sec = 2,
+                        int ttl_sec = 4, int heartbeat_interval_sec = 1,
                         const std::string& username = "");
     ~RedisElectionHelper();
 
@@ -193,8 +193,8 @@ class RedisElectionHelper {
 
     // === Configuration ===
 
-    int ttl_sec_ = 5;                 // redis_master_view_ttl_sec
-    int heartbeat_interval_sec_ = 2;  // TTL/3, rounded up
+    int ttl_sec_ = 4;                 // redis_master_view_ttl_sec
+    int heartbeat_interval_sec_ = 1;  // KeepLeader renewal interval
     int connect_timeout_ms_ = 5000;
     int command_timeout_ms_ = 3000;
 
