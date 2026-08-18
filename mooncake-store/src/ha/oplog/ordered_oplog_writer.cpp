@@ -397,11 +397,8 @@ void OrderedOpLogWriter::Start() {
 #endif
                     {
                         std::lock_guard<std::mutex> lock(impl_->mutex);
-                        impl_->durable_prefix = {
-                            .batch_id = batch.batch_id,
-                            .last_seq = batch.last_seq,
-                            .producer_view_version =
-                                expected_prefix.producer_view_version};
+                        impl_->durable_prefix = {.batch_id = batch.batch_id,
+                                                 .last_seq = batch.last_seq};
                         impl_->last_error = ErrorCode::OK;
                         impl_->accepting = !impl_->stop_requested;
                         for (size_t i = 0; i < entries.size(); ++i) {
