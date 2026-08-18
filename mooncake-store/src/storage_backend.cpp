@@ -129,6 +129,14 @@ BucketBackendConfig BucketBackendConfig::FromEnvironment() {
                           Environ::GetInt64("MOONCAKE_BUCKET_MAX_TOTAL_SIZE",
                                             config.max_total_size));
 
+    config.max_physical_bytes =
+        Environ::GetInt64("MOONCAKE_OFFLOAD_BUCKET_MAX_PHYSICAL_BYTES",
+                          config.max_physical_bytes);
+
+    config.disk_scan_cache_ms =
+        Environ::GetInt64("MOONCAKE_OFFLOAD_BUCKET_DISK_SCAN_CACHE_MS",
+                          config.disk_scan_cache_ms);
+
     const auto policy_str = Environ::GetString(
         "MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY",
         Environ::GetString("MOONCAKE_BUCKET_EVICTION_POLICY", "fifo"));
@@ -2873,6 +2881,56 @@ BucketStorageBackend::SelectEvictionCandidate() {
     }
 }
 
+int64_t BucketStorageBackend::ActualDiskBytesUsedLocked() const {
+    namespace fs = std::filesystem;
+    auto now = std::chrono::steady_clock::now();
+    if (cached_disk_bytes_ >= 0 &&
+        now - cached_disk_bytes_at_ <
+            std::chrono::milliseconds(
+                bucket_backend_config_.disk_scan_cache_ms)) {
+        return cached_disk_bytes_;
+    }
+    int64_t total = 0;
+    std::error_code ec;
+    // Recursive scan: matches Init()'s recursive_directory_iterator and the
+    // du/kubelet accounting basis (the whole subtree, not just top-level
+    // entries), so nested content can never be silently missed.
+    fs::recursive_directory_iterator it(storage_path_, ec), end;
+    if (ec) {
+        // Cannot even open storage_path_. This is a hard safety cap, so fail
+        // CLOSED: report the cap as reached so eviction/rejection engages
+        // instead of letting the disk overflow, and do NOT cache the result
+        // (next call re-scans once the directory is readable again).
+        LOG(WARNING) << "[Bucket] physcap disk scan could not open "
+                     << storage_path_ << ": " << ec.message()
+                     << ", failing closed";
+        return bucket_backend_config_.max_physical_bytes;
+    }
+    for (; it != end; it.increment(ec)) {
+        if (ec) {
+            // Iteration errored partway. Returning the partial total would
+            // under-count and silently open the cap; fail closed and skip
+            // caching so the next call re-scans.
+            LOG(WARNING) << "[Bucket] physcap disk scan error under "
+                         << storage_path_ << ": " << ec.message()
+                         << ", failing closed";
+            return bucket_backend_config_.max_physical_bytes;
+        }
+        struct stat st;
+        // st_blocks counts 512-byte blocks actually allocated on disk — the
+        // same basis as du / kubelet's emptyDir accounting (handles block
+        // rounding; ignores apparent size). A per-entry stat failure (e.g. a
+        // file concurrently deleted during eviction) is skipped best-effort:
+        // that only under-counts by ~one file and avoids spurious fail-closed.
+        if (::stat(it->path().c_str(), &st) == 0) {
+            total += static_cast<int64_t>(st.st_blocks) * 512;
+        }
+    }
+    cached_disk_bytes_ = total;
+    cached_disk_bytes_at_ = now;
+    return total;
+}
+
 tl::expected<BucketStorageBackend::PendingEviction, ErrorCode>
 BucketStorageBackend::PrepareEviction(
     int64_t required_size, const std::vector<std::string>& write_keys) {
@@ -2941,6 +2999,32 @@ BucketStorageBackend::PrepareEviction(
     uint64_t accumulated_freed_space = 0;
     const int64_t synthetic_required_size =
         write_keys.empty() ? required_size : 0;
+    // On-disk footprint of the incoming write (~required_size); 0 for
+    // watermark-driven eviction, which has no incoming write. Added to the
+    // physical check below so we free enough room for THIS write, not merely
+    // enough to bring current usage back under the cap.
+    const int64_t incoming_physical_size =
+        write_keys.empty() ? 0 : required_size;
+
+    // Ground-truth physical usage of the offload directory (cached),
+    // snapshotted once. As buckets are selected for eviction their files get
+    // deleted in the later FinalizeEviction, so (physical_used_start -
+    // accumulated_freed_space) projects the physical bytes that will remain
+    // after this round.
+    const int64_t physical_used_start =
+        bucket_backend_config_.max_physical_bytes > 0
+            ? ActualDiskBytesUsedLocked()
+            : 0;
+    // True when the projected physical usage after this round — real disk usage
+    // minus what we free here, plus the incoming write — would still exceed the
+    // physical cap. Shared by the in-loop "keep evicting" test and the
+    // post-loop "reject the write" test.
+    const auto phys_over_cap = [&](uint64_t freed) {
+        return bucket_backend_config_.max_physical_bytes > 0 &&
+               physical_used_start + incoming_physical_size -
+                       static_cast<int64_t>(freed) >
+                   bucket_backend_config_.max_physical_bytes;
+    };
 
     while (!buckets_.empty() && evict_count < kMaxEvictionBuckets) {
         bool quota_exceeded = total_size_ + pending_eviction_size_ +
@@ -2951,11 +3035,18 @@ BucketStorageBackend::PrepareEviction(
         bool disk_still_full =
             initial_disk_full && (accumulated_freed_space < deficit);
 
-        if (!quota_exceeded && !disk_still_full) break;
+        // Physical hard cap on real on-disk usage (not total_size_, which
+        // under-counts lingering bucket files, and not fs::space(), which is
+        // blind to cgroup/emptyDir quotas).
+        bool phys_exceeded = phys_over_cap(accumulated_freed_space);
+
+        if (!quota_exceeded && !disk_still_full && !phys_exceeded) break;
 
         if (evict_count == 0) {
             LOG(INFO) << "[Evict] triggered: total=" << total_size_ << "/"
                       << bucket_backend_config_.max_total_size
+                      << " physical=" << physical_used_start << "/"
+                      << bucket_backend_config_.max_physical_bytes
                       << " required=" << required_size
                       << " disk_full=" << initial_disk_full;
         }
@@ -3000,8 +3091,12 @@ BucketStorageBackend::PrepareEviction(
                                     pending_write_size_ +
                                     synthetic_required_size >
                                 bucket_backend_config_.max_total_size;
+    // Physical cap still exceeded after evicting up to kMaxEvictionBuckets:
+    // reject the write (FILE_WRITE_FAIL, handled as an offload miss upstream)
+    // rather than overrun the disk quota and get OOM-evicted.
+    const bool phys_exceeded = phys_over_cap(accumulated_freed_space);
     pending_eviction_size_ += result.evicted_size;
-    if (!write_keys.empty() && quota_exceeded) {
+    if (!write_keys.empty() && (quota_exceeded || phys_exceeded)) {
         RestorePreparedEvictionLocked(std::move(result));
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
@@ -3171,6 +3266,12 @@ tl::expected<void, ErrorCode> BucketStorageBackend::FinalizeEviction(
     if (!pending.buckets.empty()) {
         LOG(INFO) << "[Evict] finalized: attempted=" << pending.buckets.size()
                   << " cleanup_failed=" << cleanup_failed_count;
+        // Files were just deleted; force the next physical-usage query to
+        // rescan rather than return the now-stale (higher) cached value.
+        {
+            SharedMutexLocker lock(&mutex_);
+            cached_disk_bytes_ = -1;
+        }
     }
     if (cleanup_failed_count != 0) {
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
