@@ -354,6 +354,10 @@ int MasterServiceSupervisor::Start() {
         // (no init_ibv) to avoid contending for IB resources with the main
         // server.
         const bool dedicated_heartbeat = config_.heartbeat_rpc_port > 0;
+        // In dual mode (heartbeat_keep_on_main), keep Heartbeat on the main
+        // server too so legacy clients keep working during migration.
+        const bool main_includes_heartbeat =
+            !dedicated_heartbeat || config_.heartbeat_keep_on_main;
         std::unique_ptr<WrappedMasterService> wrapped_master_service;
         if (config_.deployment_mode == DeploymentMode::CENTRALIZATION) {
             wrapped_master_service =
@@ -363,7 +367,7 @@ int MasterServiceSupervisor::Start() {
             RegisterCentralizedRpcService(
                 server, static_cast<WrappedCentralizedMasterService&>(
                             *wrapped_master_service),
-                /*include_heartbeat=*/!dedicated_heartbeat);
+                /*include_heartbeat=*/main_includes_heartbeat);
         } else {
             auto p2p_wrapped_service =
                 std::make_unique<WrappedP2PMasterService>(
@@ -385,7 +389,7 @@ int MasterServiceSupervisor::Start() {
                 }
             }
             RegisterP2PRpcService(server, *p2p_wrapped_service,
-                                  /*include_heartbeat=*/!dedicated_heartbeat);
+                                  /*include_heartbeat=*/main_includes_heartbeat);
             wrapped_master_service = std::move(p2p_wrapped_service);
         }
 #ifdef STORE_USE_REDIS

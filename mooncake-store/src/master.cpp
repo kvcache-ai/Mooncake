@@ -62,6 +62,12 @@ DEFINE_uint32(heartbeat_rpc_port, 0,
               "heartbeat served on the main RPC server)");
 DEFINE_uint32(heartbeat_rpc_thread_num, 1,
               "Thread count for the dedicated heartbeat RPC server");
+DEFINE_bool(heartbeat_keep_on_main, false,
+            "Dual-mode rollout flag. When true and heartbeat_rpc_port > 0, "
+            "Heartbeat is ALSO kept on the main RPC server so legacy clients "
+            "(heartbeat_rpc_port=0) keep working during migration. Set false "
+            "once all clients are migrated. No effect when "
+            "heartbeat_rpc_port == 0.");
 DEFINE_validator(eviction_ratio, [](const char* flagname, double value) {
     if (value < 0.0 || value > 1.0) {
         LOG(FATAL) << "Eviction ratio must be between 0.0 and 1.0";
@@ -205,6 +211,9 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt32("heartbeat_rpc_thread_num",
                              &master_config.heartbeat_rpc_thread_num,
                              FLAGS_heartbeat_rpc_thread_num);
+    default_config.GetBool("heartbeat_keep_on_main",
+                           &master_config.heartbeat_keep_on_main,
+                           FLAGS_heartbeat_keep_on_main);
     default_config.GetUInt64("default_kv_lease_ttl",
                              &master_config.default_kv_lease_ttl,
                              FLAGS_default_kv_lease_ttl);
@@ -914,6 +923,10 @@ int main(int argc, char* argv[]) {
         // contending for IB resources with the main server.
         const bool dedicated_heartbeat =
             master_config.heartbeat_rpc_port > 0;
+        // In dual mode (heartbeat_keep_on_main), keep Heartbeat on the main
+        // server too so legacy clients keep working during migration.
+        const bool main_includes_heartbeat =
+            !dedicated_heartbeat || master_config.heartbeat_keep_on_main;
         std::optional<coro_rpc::coro_rpc_server> heartbeat_server;
         if (dedicated_heartbeat) {
             heartbeat_server.emplace(
@@ -937,7 +950,7 @@ int main(int argc, char* argv[]) {
             mooncake::RegisterCentralizedRpcService(
                 server, static_cast<mooncake::WrappedCentralizedMasterService&>(
                             *master_service),
-                /*include_heartbeat=*/!dedicated_heartbeat);
+                /*include_heartbeat=*/main_includes_heartbeat);
         } else {
             master_service =
                 std::make_unique<mooncake::WrappedP2PMasterService>(
@@ -948,7 +961,7 @@ int main(int argc, char* argv[]) {
             mooncake::RegisterP2PRpcService(
                 server, static_cast<mooncake::WrappedP2PMasterService&>(
                             *master_service),
-                /*include_heartbeat=*/!dedicated_heartbeat);
+                /*include_heartbeat=*/main_includes_heartbeat);
         }
 
         if (dedicated_heartbeat) {

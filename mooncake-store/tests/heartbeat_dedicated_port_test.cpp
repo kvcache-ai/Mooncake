@@ -113,5 +113,37 @@ TEST(HeartbeatDedicatedPortDisabledTest,
     master.Stop();
 }
 
+// Dual-mode (heartbeat_keep_on_main=true): during migration the master serves
+// Heartbeat on BOTH the dedicated port and the main port, so legacy clients
+// (heartbeat_rpc_port=0) and migrated clients (heartbeat_rpc_port=P) both work.
+TEST(HeartbeatDedicatedPortDualModeTest, HeartbeatServedOnBothPorts) {
+    const int heartbeat_port = getFreeTcpPort();
+    InProcMaster master;
+    ASSERT_TRUE(master.Start(InProcMasterConfigBuilder()
+                                 .set_heartbeat_rpc_port(heartbeat_port)
+                                 .set_heartbeat_keep_on_main(true)
+                                 .build()))
+        << "Failed to start InProcMaster in dual mode";
+
+    // Migrated client -> dedicated port: succeeds.
+    UUID migrated_id = generate_uuid();
+    CentralizedMasterClient migrated(migrated_id);
+    migrated.SetHeartbeatRpcPort(static_cast<uint16_t>(heartbeat_port));
+    ASSERT_EQ(migrated.Connect(master.master_address()), ErrorCode::OK);
+    auto hb_dedicated = migrated.Heartbeat(MakeHeartbeatRequest(migrated_id));
+    EXPECT_TRUE(hb_dedicated.has_value())
+        << "Heartbeat via the dedicated port should succeed in dual mode";
+
+    // Legacy client -> main port: also succeeds (dual mode keeps it on main).
+    UUID legacy_id = generate_uuid();
+    CentralizedMasterClient legacy(legacy_id);  // heartbeat_rpc_port_ == 0
+    ASSERT_EQ(legacy.Connect(master.master_address()), ErrorCode::OK);
+    auto hb_main = legacy.Heartbeat(MakeHeartbeatRequest(legacy_id));
+    EXPECT_TRUE(hb_main.has_value())
+        << "Heartbeat via the main port should still succeed in dual mode";
+
+    master.Stop();
+}
+
 }  // namespace testing
 }  // namespace mooncake
