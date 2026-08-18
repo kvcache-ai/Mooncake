@@ -216,7 +216,8 @@ MasterService::MasterService(const MasterServiceConfig& config)
       allocation_strategy_type_(config.enable_cxl
                                     ? AllocationStrategyType::CXL
                                     : config.allocation_strategy_type),
-      allocation_strategy_(CreateAllocationStrategy(allocation_strategy_type_)),
+      allocation_strategy_(CreateAllocationStrategy(allocation_strategy_type_,
+                                                    local_ssd_manager_)),
       put_start_discard_timeout_sec_(config.put_start_discard_timeout_sec),
       put_start_release_timeout_sec_(config.put_start_release_timeout_sec),
       offloading_queue_limit_(config.offloading_queue_limit),
@@ -2104,16 +2105,10 @@ MasterService::EraseMetadata(
         }
         tenant_state.offloading_tasks.erase(offload_it);
 
-        // Mirror entry in local_disk_segment.offloading_objects must be
-        // dropped too, otherwise the next OffloadObjectHeartbeat drains a
-        // task-less key back to the client and produces an orphan bucket.
-        const std::string scoped_key = tenant_id.MakeScopedKey(key);
-        ScopedLocalDiskSegmentAccess ssd_access =
-            segment_manager_.getLocalDiskSegmentAccess();
-        for (auto& [_, segment] : ssd_access.getClientLocalDiskSegment()) {
-            MutexLocker locker(&segment->offloading_mutex_);
-            segment->offloading_objects.erase(scoped_key);
-        }
+        // The mailbox entry must be dropped too, otherwise the next
+        // OffloadObjectHeartbeat drains a task-less key back to the client and
+        // produces an orphan bucket.
+        local_ssd_manager_.RemoveOffloadFromAll(tenant_id, key);
     }
     tenant_state.processing_keys.erase(key);
     auto replication_task_it = tenant_state.replication_tasks.find(key);
@@ -2191,15 +2186,8 @@ void MasterService::ReleaseLocalDiskUsage(
         return;
     }
 
-    ScopedLocalDiskSegmentAccess ssd_access =
-        segment_manager_.getLocalDiskSegmentAccess();
-    auto& client_segments = ssd_access.getClientLocalDiskSegment();
     for (const auto& [client_id, bytes] : bytes_by_client) {
-        auto disk_it = client_segments.find(client_id);
-        if (disk_it != client_segments.end()) {
-            disk_it->second->ssd_used_bytes.fetch_sub(
-                bytes, std::memory_order_relaxed);
-        }
+        local_ssd_manager_.AdjustUsedBytes(client_id, -bytes);
     }
 }
 
@@ -4052,18 +4040,9 @@ auto MasterService::AllocateAndInsertMetadata(
             }
         }
 
-        const SsdMetricsProvider* ssd_provider = nullptr;
-        std::optional<ScopedLocalDiskSegmentAccess> ssd_access;
-        if (allocation_strategy_type_ ==
-            AllocationStrategyType::SSD_FREE_RATIO_FIRST) {
-            ssd_access.emplace(segment_manager_.getLocalDiskSegmentAccess());
-            ssd_provider = &*ssd_access;
-        }
-
         auto allocation_result = allocation_strategy_->Allocate(
-            allocator_manager, value_length, config.replica_num,
-            preferred_segments, std::set<std::string>(), ReplicaType::MEMORY,
-            ssd_provider);
+            allocator_access, value_length, config.replica_num,
+            preferred_segments, std::set<std::string>(), ReplicaType::MEMORY);
 
         if (!allocation_result.has_value()) {
             VLOG(1) << "Failed to allocate replicas for key=" << key
@@ -6528,18 +6507,9 @@ long MasterService::RemoveAll(bool force) {
     auto now = std::chrono::system_clock::now();
 
     // Since RemoveAll clears everything, signal ALL clients with a
-    // LocalDiskSegment to physically clear their SSD immediately.
+    // LocalSSD clients to physically clear their SSD immediately.
     // This lets client cleanup overlap with master metadata deletion.
-    {
-        ScopedLocalDiskSegmentAccess local_disk_segment_access =
-            segment_manager_.getLocalDiskSegmentAccess();
-        auto& client_local_disk_segment =
-            local_disk_segment_access.getClientLocalDiskSegment();
-        for (auto& [client_id, segment] : client_local_disk_segment) {
-            MutexLocker locker(&segment->offloading_mutex_);
-            segment->pending_remove_all = true;
-        }
-    }
+    local_ssd_manager_.RequestRemoveAll();
 
     // Delete metadata — runs concurrently with client SSD cleanup.
     for (size_t i = 0; i < kNumShards; i++) {
@@ -6697,19 +6667,8 @@ long MasterService::RemoveAll(const TenantId& tenant_id, bool force) {
         }
     }
 
-    if (!clients_with_disk_replicas.empty()) {
-        ScopedLocalDiskSegmentAccess local_disk_segment_access =
-            segment_manager_.getLocalDiskSegmentAccess();
-        auto& client_local_disk_segment =
-            local_disk_segment_access.getClientLocalDiskSegment();
-        for (const auto& client_id : clients_with_disk_replicas) {
-            auto seg_it = client_local_disk_segment.find(client_id);
-            if (seg_it != client_local_disk_segment.end()) {
-                MutexLocker locker(&seg_it->second->offloading_mutex_);
-                seg_it->second->pending_remove_all = true;
-            }
-        }
-    }
+    local_ssd_manager_.RequestRemoveAll(std::vector<UUID>(
+        clients_with_disk_replicas.begin(), clients_with_disk_replicas.end()));
 
     VLOG(1) << "action=remove_all_objects"
             << ", tenant_id=" << normalized_tenant.value()
@@ -6895,16 +6854,8 @@ void MasterService::CancelPromotionTaskForRemovedReplicas(
     ErasePromotionTaskIfPresent(tenant_state, metadata.user_key);
 
     // Best-effort cleanup of a task that may still be queued on the holder.
-    ScopedLocalDiskSegmentAccess local_disk_segment_access =
-        segment_manager_.getLocalDiskSegmentAccess();
-    auto& client_local_disk_segment =
-        local_disk_segment_access.getClientLocalDiskSegment();
-    auto segment_it = client_local_disk_segment.find(holder_id);
-    if (segment_it != client_local_disk_segment.end()) {
-        MutexLocker locker(&segment_it->second->offloading_mutex_);
-        segment_it->second->promotion_objects.erase(
-            metadata.tenant_id.MakeScopedKey(metadata.user_key));
-    }
+    local_ssd_manager_.RemovePromotion(holder_id, metadata.tenant_id,
+                                       metadata.user_key);
 }
 
 bool MasterService::CleanupStaleHandles(
@@ -7159,10 +7110,7 @@ auto MasterService::MountLocalDiskSegment(const UUID& client_id,
         return tl::make_unexpected(ErrorCode::UNABLE_OFFLOAD);
     }
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    ScopedSegmentAccess segment_access = segment_manager_.getSegmentAccess();
-
-    auto err =
-        segment_access.MountLocalDiskSegment(client_id, enable_offloading);
+    auto err = local_ssd_manager_.RegisterClient(client_id, enable_offloading);
     if (err == ErrorCode::SEGMENT_ALREADY_EXISTS) {
         // Return OK because this is an idempotent operation
         return {};
@@ -7171,7 +7119,7 @@ auto MasterService::MountLocalDiskSegment(const UUID& client_id,
     }
 
     // Notify the client monitor thread to start tracking this client's TTL.
-    // Without this, a client that only mounts a LOCAL_DISK segment (and
+    // Without this, a client that only registers LocalSSD (and
     // doesn't ping) would be considered expired by ClientMonitorFunc, which
     // would then clear all its LOCAL_DISK replicas.
     PodUUID pod_client_id;
@@ -7190,45 +7138,22 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
                                            bool enable_offloading)
     -> tl::expected<std::vector<OffloadTaskItem>, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    ScopedLocalDiskSegmentAccess local_disk_segment_access =
-        segment_manager_.getLocalDiskSegmentAccess();
-    auto& client_local_disk_segment =
-        local_disk_segment_access.getClientLocalDiskSegment();
-    auto local_disk_segment_it = client_local_disk_segment.find(client_id);
-    if (local_disk_segment_it == client_local_disk_segment.end()) {
+    auto pending = local_ssd_manager_.SetOffloadingAndTakePending(
+        client_id, enable_offloading);
+    if (!pending) {
         LOG(ERROR) << "Local disk segment not found with client id = "
                    << client_id;
-        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+        return tl::make_unexpected(pending.error());
     }
-    std::vector<OffloadTaskItem> result;
-    std::unordered_map<std::string, OffloadTaskItem> offloading_objects_copy;
-    {
-        MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
-        local_disk_segment_it->second->enable_offloading = enable_offloading;
-        if (enable_offloading) {
-            result.reserve(
-                local_disk_segment_it->second->offloading_objects.size());
-            for (const auto& [_, task] :
-                 local_disk_segment_it->second->offloading_objects) {
-                result.push_back(task);
-            }
-            local_disk_segment_it->second->offloading_objects.clear();
-            return result;
-        }
-        // Offloading is disabled: clear the pending queue to prevent
-        // unbounded growth that would trigger KEYS_ULTRA_LIMIT in
-        // PushOffloadingQueue. We must also clean up corresponding
-        // offloading_tasks and decrement source replica refcounts to avoid
-        // resource leaks and blocked writes (OBJECT_HAS_REPLICATION_TASK).
-        // Copy keys out before releasing the mutex to avoid lock order
-        // violation: the lock order is Shard Lock -> offloading_mutex_, so we
-        // must release offloading_mutex_ before taking shard locks via
-        // MetadataAccessorRW.
-        offloading_objects_copy =
-            std::move(local_disk_segment_it->second->offloading_objects);
+    if (enable_offloading) {
+        return std::move(*pending);
     }
-
-    for (auto& [_, task] : offloading_objects_copy) {
+    // Offloading is disabled: clear the pending queue to prevent unbounded
+    // growth that would trigger KEYS_ULTRA_LIMIT in PushOffloadingQueue. We
+    // must also clean up corresponding offloading_tasks and decrement source
+    // replica refcounts to avoid resource leaks and blocked writes
+    // (OBJECT_HAS_REPLICATION_TASK).
+    for (auto& task : *pending) {
         const auto object_id =
             MakeObjectIdentity(task.key, TenantId(task.tenant_id));
         MetadataAccessorRW accessor(this, object_id);
@@ -7246,52 +7171,30 @@ auto MasterService::OffloadObjectHeartbeat(const UUID& client_id,
             }
         }
     }
-    return result;
+    return std::vector<OffloadTaskItem>{};
 }
 
 auto MasterService::PollRemoveAll(const UUID& client_id)
     -> tl::expected<bool, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    ScopedLocalDiskSegmentAccess local_disk_segment_access =
-        segment_manager_.getLocalDiskSegmentAccess();
-    auto& client_local_disk_segment =
-        local_disk_segment_access.getClientLocalDiskSegment();
-    auto local_disk_segment_it = client_local_disk_segment.find(client_id);
-    if (local_disk_segment_it == client_local_disk_segment.end()) {
-        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
-    }
-    bool result;
-    {
-        MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
-        result = local_disk_segment_it->second->pending_remove_all;
-        local_disk_segment_it->second->pending_remove_all = false;
-    }
-    return result;
+    return local_ssd_manager_.ConsumeRemoveAll(client_id);
 }
 
 auto MasterService::ReportSsdCapacity(const UUID& client_id,
                                       int64_t ssd_total_capacity_bytes)
     -> tl::expected<void, ErrorCode> {
-    if (ssd_total_capacity_bytes < 0) {
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    ScopedLocalDiskSegmentAccess local_disk_segment_access =
-        segment_manager_.getLocalDiskSegmentAccess();
-    auto& client_local_disk_segment =
-        local_disk_segment_access.getClientLocalDiskSegment();
-    auto local_disk_segment_it = client_local_disk_segment.find(client_id);
-    if (local_disk_segment_it == client_local_disk_segment.end()) {
-        LOG(ERROR) << "Local disk segment not found with client id = "
-                   << client_id;
-        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+    auto capacity =
+        local_ssd_manager_.ReportCapacity(client_id, ssd_total_capacity_bytes);
+    if (!capacity) {
+        if (capacity.error() == ErrorCode::SEGMENT_NOT_FOUND) {
+            LOG(ERROR) << "Local disk segment not found with client id = "
+                       << client_id;
+        }
+        return tl::make_unexpected(capacity.error());
     }
-    MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
-    int64_t old_capacity =
-        local_disk_segment_it->second->ssd_total_capacity_bytes;
+    int64_t old_capacity = capacity->previous_bytes;
     if (ssd_total_capacity_bytes != old_capacity) {
-        local_disk_segment_it->second->ssd_total_capacity_bytes =
-            ssd_total_capacity_bytes;
         if (old_capacity > 0) {
             MasterMetricManager::instance().dec_total_file_capacity(
                 old_capacity);
@@ -7311,17 +7214,6 @@ auto MasterService::NotifyOffloadSuccess(
     if (tasks.size() != metadatas.size()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    std::shared_ptr<LocalDiskSegment> local_disk_segment;
-    {
-        ScopedLocalDiskSegmentAccess ssd_access =
-            segment_manager_.getLocalDiskSegmentAccess();
-        auto& client_segments = ssd_access.getClientLocalDiskSegment();
-        auto disk_it = client_segments.find(client_id);
-        if (disk_it != client_segments.end()) {
-            local_disk_segment = disk_it->second;
-        }
-    }
-
     for (size_t i = 0; i < tasks.size(); ++i) {
         const auto& task = tasks[i];
         const auto& metadata = metadatas[i];
@@ -7443,10 +7335,8 @@ auto MasterService::NotifyOffloadSuccess(
             }
             added_new_local_disk_replica = res.value();
         }
-        if (local_disk_segment && metadata.data_size > 0 &&
-            added_new_local_disk_replica) {
-            local_disk_segment->ssd_used_bytes.fetch_add(
-                metadata.data_size, std::memory_order_relaxed);
+        if (metadata.data_size > 0 && added_new_local_disk_replica) {
+            local_ssd_manager_.AdjustUsedBytes(client_id, metadata.data_size);
         }
     }
 
@@ -7464,42 +7354,29 @@ tl::expected<void, ErrorCode> MasterService::PushOffloadingQueue(
         if (!segment_name_it.has_value()) {
             continue;
         }
-        ScopedLocalDiskSegmentAccess local_disk_segment_access =
-            segment_manager_.getLocalDiskSegmentAccess();
-        const auto& client_by_name =
-            local_disk_segment_access.getClientByName();
-        auto client_id_it = client_by_name.find(segment_name_it.value());
-        if (client_id_it == client_by_name.end()) {
+        auto allocator_access = segment_manager_.getAllocatorAccess();
+        auto client_id =
+            allocator_access.GetOwnerClientId(segment_name_it.value());
+        if (!client_id) {
             return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
-        }
-        auto& client_local_disk_segment =
-            local_disk_segment_access.getClientLocalDiskSegment();
-        auto local_disk_segment_it =
-            client_local_disk_segment.find(client_id_it->second);
-        if (local_disk_segment_it == client_local_disk_segment.end()) {
-            return tl::make_unexpected(ErrorCode::UNABLE_OFFLOADING);
-        }
-        MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
-        if (!local_disk_segment_it->second->enable_offloading) {
-            return tl::make_unexpected(ErrorCode::UNABLE_OFFLOADING);
-        }
-        if (local_disk_segment_it->second->offloading_objects.size() >=
-            offloading_queue_limit_) {
-            return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
         }
         const int64_t size = replica.get_descriptor()
                                  .get_memory_descriptor()
                                  .buffer_descriptor.size_;
-        auto res = local_disk_segment_it->second->offloading_objects.emplace(
-            object_id.tenant_id.MakeScopedKey(object_id.user_key),
+        auto err = local_ssd_manager_.EnqueueOffload(
+            *client_id,
             OffloadTaskItem{.tenant_id = object_id.tenant_id.value(),
                             .key = object_id.user_key,
-                            .size = size});
-        if (!res.second) {
-            return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+                            .size = size},
+            offloading_queue_limit_);
+        if (err == ErrorCode::SEGMENT_NOT_FOUND) {
+            return tl::make_unexpected(ErrorCode::UNABLE_OFFLOADING);
+        }
+        if (err != ErrorCode::OK) {
+            return tl::make_unexpected(err);
         }
         if (mirror_clients != nullptr) {
-            mirror_clients->push_back(client_id_it->second);
+            mirror_clients->push_back(*client_id);
         }
     }
     return {};
@@ -7517,50 +7394,8 @@ bool MasterService::CancelQueuedOffloadTask(TenantState& tenant_state,
         return false;
     }
 
-    const std::string scoped_key =
-        object_id.tenant_id.MakeScopedKey(object_id.user_key);
-    // Reclaim every mirror the task covers before committing to the
-    // cancellation. OffloadObjectHeartbeat hands a whole segment's queue to
-    // its store worker without clearing the marker, so a missing mirror means
-    // a worker owns the task and is reading the source buffer for its SSD
-    // write. Mirrors are reclaimed one segment at a time, so a heartbeat may
-    // drain a later segment mid-traversal; restoring the reclaimed mirrors
-    // leaves the queues as if they had never been touched.
-    std::vector<std::pair<UUID, OffloadTaskItem>> reclaimed;
-    reclaimed.reserve(mirror_clients.size());
-    bool all_queued = true;
-    {
-        ScopedLocalDiskSegmentAccess ssd_access =
-            segment_manager_.getLocalDiskSegmentAccess();
-        auto& segments = ssd_access.getClientLocalDiskSegment();
-        for (const auto& mirror_client : mirror_clients) {
-            auto segment_it = segments.find(mirror_client);
-            if (segment_it == segments.end()) {
-                all_queued = false;
-                break;
-            }
-            MutexLocker locker(&segment_it->second->offloading_mutex_);
-            auto node =
-                segment_it->second->offloading_objects.extract(scoped_key);
-            if (!node) {
-                all_queued = false;
-                break;
-            }
-            reclaimed.emplace_back(mirror_client, std::move(node.mapped()));
-        }
-        if (!all_queued) {
-            for (auto& [mirror_client, item] : reclaimed) {
-                auto segment_it = segments.find(mirror_client);
-                if (segment_it == segments.end()) {
-                    continue;
-                }
-                MutexLocker locker(&segment_it->second->offloading_mutex_);
-                segment_it->second->offloading_objects.emplace(scoped_key,
-                                                               std::move(item));
-            }
-        }
-    }
-    if (!all_queued) {
+    if (!local_ssd_manager_.CancelOffloadsIfAllPending(
+            mirror_clients, object_id.tenant_id, object_id.user_key)) {
         return false;
     }
 
@@ -7574,38 +7409,30 @@ bool MasterService::CancelQueuedOffloadTask(TenantState& tenant_state,
 
 // Promotion-on-hit
 
-// Push a key onto the holder client's promotion_objects map. Resolves the
-// holder via the LOCAL_DISK replica's embedded client_id rather than via
-// the segment-name reverse lookup.
+// Push a key into the holder client's promotion mailbox. Resolve the holder
+// via the LOCAL_DISK replica's embedded client_id rather than via the
+// segment-name reverse lookup.
 tl::expected<void, ErrorCode> MasterService::PushPromotionQueue(
     const ObjectIdentity& object_id, Replica& source_replica) {
     auto holder_id = source_replica.get_local_disk_client_id();
     if (!holder_id.has_value()) {
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    ScopedLocalDiskSegmentAccess local_disk_segment_access =
-        segment_manager_.getLocalDiskSegmentAccess();
-    auto& client_local_disk_segment =
-        local_disk_segment_access.getClientLocalDiskSegment();
-    auto local_disk_segment_it =
-        client_local_disk_segment.find(holder_id.value());
-    if (local_disk_segment_it == client_local_disk_segment.end()) {
-        // Holder client expired or never had a LocalDiskSegment registered;
+    auto err = local_ssd_manager_.EnqueuePromotion(
+        *holder_id, PromotionTaskItem{.tenant_id = object_id.tenant_id.value(),
+                                      .key = object_id.user_key,
+                                      .size = static_cast<int64_t>(
+                                          source_replica.get_descriptor()
+                                              .get_local_disk_descriptor()
+                                              .object_size)});
+    if (err == ErrorCode::SEGMENT_NOT_FOUND) {
+        // Holder client expired or never registered LocalSSD;
         // the LOCAL_DISK replica will be cleaned up by ClientMonitorFunc on
         // its own schedule.
         return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
     }
-    MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
-    auto res = local_disk_segment_it->second->promotion_objects.emplace(
-        object_id.tenant_id.MakeScopedKey(object_id.user_key),
-        PromotionTaskItem{
-            .tenant_id = object_id.tenant_id.value(),
-            .key = object_id.user_key,
-            .size = static_cast<int64_t>(source_replica.get_descriptor()
-                                             .get_local_disk_descriptor()
-                                             .object_size)});
-    if (!res.second) {
-        return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+    if (err != ErrorCode::OK) {
+        return tl::make_unexpected(err);
     }
     return {};
 }
@@ -8662,29 +8489,15 @@ MasterService::PromotionQueueResult MasterService::TryPushPromotionQueue(
 auto MasterService::PromotionObjectHeartbeat(const UUID& client_id)
     -> tl::expected<std::vector<PromotionTaskItem>, ErrorCode> {
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
-    ScopedLocalDiskSegmentAccess local_disk_segment_access =
-        segment_manager_.getLocalDiskSegmentAccess();
-    auto& client_local_disk_segment =
-        local_disk_segment_access.getClientLocalDiskSegment();
-    auto local_disk_segment_it = client_local_disk_segment.find(client_id);
-    if (local_disk_segment_it == client_local_disk_segment.end()) {
-        return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
-    }
-    MutexLocker locker(&local_disk_segment_it->second->offloading_mutex_);
     // Return at most promotion_max_per_heartbeat_ tasks. Each task does
     // a synchronous SSD read + RDMA write on the client side; allowing
     // more than one per heartbeat risks blocking past the client-
     // liveness window and the master marking the client dead. The rest
-    // stay queued in promotion_objects for subsequent heartbeats. The
+    // stay queued in the mailbox for subsequent heartbeats. The
     // cap must live here (server side) rather than on the client so
     // leftover work isn't silently dropped.
-    auto& src = local_disk_segment_it->second->promotion_objects;
-    std::vector<PromotionTaskItem> result;
-    while (result.size() < promotion_max_per_heartbeat_ && !src.empty()) {
-        auto node = src.extract(src.begin());
-        result.push_back(std::move(node.mapped()));
-    }
-    return result;
+    return local_ssd_manager_.TakePromotions(client_id,
+                                             promotion_max_per_heartbeat_);
 }
 
 auto MasterService::PromotionAllocStart(
@@ -8918,20 +8731,10 @@ auto MasterService::NotifyPromotionSuccess(const UUID& client_id,
         MasterMetricManager::instance().inc_promotion_cancelled();
     }
 
-    // Erase the per-client promotion_objects entry (best-effort; the
+    // Erase the per-client promotion mailbox entry (best-effort; the
     // heartbeat may have already drained it).
-    {
-        ScopedLocalDiskSegmentAccess local_disk_segment_access =
-            segment_manager_.getLocalDiskSegmentAccess();
-        auto& client_local_disk_segment =
-            local_disk_segment_access.getClientLocalDiskSegment();
-        auto it = client_local_disk_segment.find(client_id);
-        if (it != client_local_disk_segment.end()) {
-            MutexLocker locker(&it->second->offloading_mutex_);
-            it->second->promotion_objects.erase(
-                object_id.tenant_id.MakeScopedKey(object_id.user_key));
-        }
-    }
+    local_ssd_manager_.RemovePromotion(client_id, object_id.tenant_id,
+                                       object_id.user_key);
 
     if (!committed) {
         return tl::make_unexpected(ErrorCode::REPLICA_IS_NOT_READY);
@@ -8987,21 +8790,11 @@ auto MasterService::NotifyPromotionFailure(const UUID& client_id,
     MasterMetricManager::instance().dec_promotion_in_flight();
     MasterMetricManager::instance().inc_promotion_failed();
 
-    // Clear the holder's per-client promotion_objects entry. Same
+    // Clear the holder's per-client promotion mailbox entry. Same
     // best-effort cleanup pattern as NotifyPromotionSuccess — the
     // heartbeat may have already drained it.
-    {
-        ScopedLocalDiskSegmentAccess local_disk_segment_access =
-            segment_manager_.getLocalDiskSegmentAccess();
-        auto& client_local_disk_segment =
-            local_disk_segment_access.getClientLocalDiskSegment();
-        auto it = client_local_disk_segment.find(client_id);
-        if (it != client_local_disk_segment.end()) {
-            MutexLocker locker(&it->second->offloading_mutex_);
-            it->second->promotion_objects.erase(
-                object_id.tenant_id.MakeScopedKey(object_id.user_key));
-        }
-    }
+    local_ssd_manager_.RemovePromotion(client_id, object_id.tenant_id,
+                                       object_id.user_key);
 
     return {};
 }
@@ -9526,6 +9319,7 @@ void MasterService::ResetStateAfterFailedRestoreAttempt() {
     task_manager_serializer.Reset();
     metadata_serializer.Reset();
     segment_serializer.Reset();
+    local_ssd_manager_.Clear();
 
     {
         std::unique_lock<std::shared_mutex> lock(client_mutex_);
@@ -11067,8 +10861,12 @@ void MasterService::ClientMonitorFunc() {
                     // Clean up HTTP metadata if enabled
                     cleanupHttpMetadata(segment_names[i]);
                 }
-                for (auto& client_id : expired_clients) {
-                    segment_access.UnmountLocalDiskSegment(client_id);
+            }
+            for (const auto& client_id : expired_clients) {
+                auto capacity = local_ssd_manager_.UnregisterClient(client_id);
+                if (capacity && *capacity > 0) {
+                    MasterMetricManager::instance().dec_total_file_capacity(
+                        *capacity);
                 }
             }
             RecomputeTenantEffectiveQuotas();

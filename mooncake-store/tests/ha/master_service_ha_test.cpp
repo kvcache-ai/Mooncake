@@ -681,15 +681,21 @@ class MasterServiceHATest : public ::testing::Test {
     static void SetLocalDiskUsedBytesForTesting(MasterService& service,
                                                 const UUID& client_id,
                                                 int64_t used_bytes) {
-        auto access = service.segment_manager_.getLocalDiskSegmentAccess();
-        access.getClientLocalDiskSegment().at(client_id)->ssd_used_bytes.store(
-            used_bytes, std::memory_order_relaxed);
+        auto usage = service.local_ssd_manager_.GetUsage(client_id);
+        ASSERT_TRUE(usage.has_value());
+        service.local_ssd_manager_.AdjustUsedBytes(
+            client_id, used_bytes - usage->used_bytes);
     }
 
     static int64_t GetLocalDiskUsedBytesForTesting(
         MasterService& service, const std::string& segment_name) {
-        auto access = service.segment_manager_.getLocalDiskSegmentAccess();
-        return access.getSsdUsedBytes(segment_name);
+        auto access = service.segment_manager_.getAllocatorAccess();
+        auto client_id = access.GetOwnerClientId(segment_name);
+        if (!client_id) {
+            return 0;
+        }
+        auto usage = service.local_ssd_manager_.GetUsage(*client_id);
+        return usage ? usage->used_bytes : 0;
     }
 
     std::vector<std::string> policy_files_;

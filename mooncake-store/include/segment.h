@@ -4,6 +4,7 @@
 #include <chrono>
 #include <map>
 #include <ostream>
+#include <optional>
 #include <set>
 #include <shared_mutex>
 #include <string>
@@ -13,6 +14,7 @@
 
 #include "allocation_strategy.h"
 #include "allocator.h"
+#include "local_ssd/persisted_state.h"
 #include "rpc_types.h"
 #include "types.h"
 
@@ -87,34 +89,6 @@ inline std::ostream& operator<<(
     return os;
 }
 
-struct LocalDiskSegment {
-    mutable Mutex offloading_mutex_;
-    bool enable_offloading;
-    int64_t ssd_total_capacity_bytes = 0;  // last reported by client heartbeat
-    std::atomic<int64_t> ssd_used_bytes{0};
-    std::unordered_map<std::string, OffloadTaskItem> GUARDED_BY(
-        offloading_mutex_) offloading_objects;
-    // Promotion-on-hit pending work for this client. Populated by master's
-    // TryPushPromotionQueue when a Get hits a LOCAL_DISK-only key on this
-    // client. Drained by PromotionObjectHeartbeat. Same locking as
-    // offloading_objects (offloading_mutex_).
-    std::unordered_map<std::string, PromotionTaskItem> GUARDED_BY(
-        offloading_mutex_) promotion_objects;
-    // Set by master's RemoveAll. When the client sees this flag via
-    // PollRemoveAll, it calls FileStorage::RemoveAll() to physically
-    // delete all SSD files. Same locking as offloading_objects
-    // (offloading_mutex_).
-    bool GUARDED_BY(offloading_mutex_) pending_remove_all = false;
-    explicit LocalDiskSegment(bool enable_offloading)
-        : enable_offloading(enable_offloading) {}
-
-    LocalDiskSegment(const LocalDiskSegment&) = delete;
-    LocalDiskSegment& operator=(const LocalDiskSegment&) = delete;
-
-    LocalDiskSegment(LocalDiskSegment&&) = delete;
-    LocalDiskSegment& operator=(LocalDiskSegment&&) = delete;
-};
-
 // Forward declarations
 class SegmentManager;
 
@@ -135,9 +109,6 @@ class ScopedSegmentAccess {
      * @brief Mount a segment
      */
     ErrorCode MountSegment(const Segment& segment, const UUID& client_id);
-
-    ErrorCode MountLocalDiskSegment(const UUID& client_id,
-                                    bool enable_offloading);
 
     /**
      * @brief Re-mount a segment. To avoid infinite remount trying, only the
@@ -254,12 +225,6 @@ class ScopedSegmentAccess {
     ErrorCode SetSegmentStatusByName(const std::string& segment_name,
                                      SegmentStatus status);
 
-    /**
-     * @brief Remove the local disk segment entry for a client.
-     * Called when a client expires to clean up its local disk segment.
-     */
-    void UnmountLocalDiskSegment(const UUID& client_id);
-
    private:
     SegmentManager* segment_manager_;
     std::unique_lock<std::shared_mutex> lock_;
@@ -346,57 +311,29 @@ class ScopedAllocatorAccess {
                                    std::shared_mutex& mutex)
         : allocator_manager_(allocator_manager), lock_(mutex) {}
 
-    explicit ScopedAllocatorAccess(const AllocatorManager& allocator_manager,
-                                   const HostSegmentIndex& segments_by_host,
-                                   std::shared_mutex& mutex)
+    explicit ScopedAllocatorAccess(
+        const AllocatorManager& allocator_manager,
+        const HostSegmentIndex& segments_by_host,
+        const std::unordered_map<std::string, UUID>& client_by_name,
+        std::shared_mutex& mutex)
         : allocator_manager_(allocator_manager),
           segments_by_host_(&segments_by_host),
+          client_by_name_(&client_by_name),
           lock_(mutex) {}
 
-    const AllocatorManager& getAllocatorManager() { return allocator_manager_; }
+    const AllocatorManager& getAllocatorManager() const {
+        return allocator_manager_;
+    }
 
     std::vector<std::string> GetHostOrderedSegments(
         const std::string& writer_host_id, const std::string& key) const;
 
+    std::optional<UUID> GetOwnerClientId(const std::string& segment_name) const;
+
    private:
     const AllocatorManager& allocator_manager_;
     const HostSegmentIndex* segments_by_host_{nullptr};
-    std::shared_lock<std::shared_mutex> lock_;
-};
-
-/**
- * @brief RAII-style access to LocalDiskOffloadingQueues for thread-safe
- * LocalDiskOffloadingQueue usage
- */
-class ScopedLocalDiskSegmentAccess : public SsdMetricsProvider {
-   public:
-    explicit ScopedLocalDiskSegmentAccess(
-        std::unordered_map<std::string, UUID>& client_by_name,
-        std::unordered_map<UUID, std::shared_ptr<LocalDiskSegment>,
-                           boost::hash<UUID>>& client_local_disk_segment,
-        std::shared_mutex& mutex)
-        : client_by_name_(client_by_name),
-          client_local_disk_segment_(client_local_disk_segment),
-          lock_(mutex) {}
-
-    const std::unordered_map<std::string, UUID>& getClientByName() {
-        return client_by_name_;
-    }
-
-    std::unordered_map<UUID, std::shared_ptr<LocalDiskSegment>,
-                       boost::hash<UUID>>&
-    getClientLocalDiskSegment() {
-        return client_local_disk_segment_;
-    }
-
-    int64_t getSsdTotalCapacity(const std::string& segment_name) const override;
-    int64_t getSsdUsedBytes(const std::string& segment_name) const override;
-
-   private:
-    const std::unordered_map<std::string, UUID>&
-        client_by_name_;  // segment name -> client_id
-    std::unordered_map<UUID, std::shared_ptr<LocalDiskSegment>,
-                       boost::hash<UUID>>& client_local_disk_segment_;
+    const std::unordered_map<std::string, UUID>* client_by_name_{nullptr};
     std::shared_lock<std::shared_mutex> lock_;
 };
 
@@ -429,9 +366,10 @@ class SegmentSerializer {
     explicit SegmentSerializer(SegmentManager* segment_manager)
         : segment_manager_(segment_manager) {}
 
-    tl::expected<std::vector<uint8_t>, SerializationError> Serialize();
+    tl::expected<std::vector<uint8_t>, SerializationError> Serialize(
+        const LocalSsdPersistedState& local_ssd_state);
 
-    tl::expected<void, SerializationError> Deserialize(
+    tl::expected<LocalSsdPersistedState, SerializationError> Deserialize(
         const std::vector<uint8_t>& data);
 
     void Reset();
@@ -477,12 +415,7 @@ class SegmentManager {
      */
     ScopedAllocatorAccess getAllocatorAccess() {
         return ScopedAllocatorAccess(allocator_manager_, segments_by_host_,
-                                     segment_mutex_);
-    }
-
-    ScopedLocalDiskSegmentAccess getLocalDiskSegmentAccess() {
-        return ScopedLocalDiskSegmentAccess(
-            client_by_name_, client_local_disk_segment_, segment_mutex_);
+                                     client_by_name_, segment_mutex_);
     }
 
     SegmentView getView() const { return SegmentView(this); }
@@ -516,10 +449,6 @@ class SegmentManager {
         segment_id_by_name_;             // segment name -> segment_id
     HostSegmentIndex segments_by_host_;  // host_id -> segment name -> segment
                                          // ids for allocatable segments
-    std::unordered_map<UUID, std::shared_ptr<LocalDiskSegment>,
-                       boost::hash<UUID>>
-        client_local_disk_segment_;  // client_id -> local_disk_segment
-
     friend class ScopedSegmentAccess;
     friend class SegmentTest;        // for unit tests
     friend class SegmentView;        // for fork serialize
