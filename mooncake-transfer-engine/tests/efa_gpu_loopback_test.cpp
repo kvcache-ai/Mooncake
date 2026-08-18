@@ -39,6 +39,7 @@
 #include <memory>
 #include <vector>
 
+#include "cuda_alike.h"
 #include "transfer_engine.h"
 #include "transport/efa_transport/efa_transport.h"
 #include "transport/transport.h"
@@ -108,8 +109,9 @@ class EFAGpuLoopbackTest : public ::testing::Test {
 
         // Register as GPU memory so the EFA transport tags the MR with
         // FI_HMEM_CUDA (the registration path under test).
-        rc = s.engine->registerLocalMemory(s.dev_buf, buffer_size, "cuda:0");
-        EXPECT_EQ(rc, 0) << "registerLocalMemory(cuda:0) failed";
+        rc = s.engine->registerLocalMemory(s.dev_buf, buffer_size,
+                                           GPU_PREFIX + "0");
+        EXPECT_EQ(rc, 0) << "registerLocalMemory(" << GPU_PREFIX << "0) failed";
         if (rc != 0) return s;
 
         auto actual_addr = s.engine->getLocalIpAndPort();

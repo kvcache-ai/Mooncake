@@ -24,10 +24,11 @@
 #include <memory>
 #include <sstream>
 #include <unordered_map>
+#include "acl/acl.h"
 #include "common/base/status.h"
+#include "cuda_alike.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
-#include "acl/acl.h"
 
 DEFINE_string(local_server_name, "10.20.130.154:12345",
               "Local server name for segment discovery");
@@ -163,8 +164,8 @@ std::string loadNicPriorityMatrix() {
            " \"npu:0\": [[" +
            device_names +
            "], []], "
-           " \"cuda:0\": [[" +
-           device_names +
+           " \"" +
+           GPU_PREFIX + "0\": [[" + device_names +
            "], []], "
            " \"musa:0\": [[" +
            device_names +

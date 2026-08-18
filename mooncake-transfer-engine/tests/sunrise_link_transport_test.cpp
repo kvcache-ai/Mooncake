@@ -48,7 +48,7 @@ TEST(SunriseLinkTransportTest, WriteAndRead) {
 
     void* server_buffer = allocateSunriseBuffer(kDataLength * 2, gpu_id);
     int rc = server_engine->registerLocalMemory(
-        server_buffer, kDataLength * 2, "cuda:" + std::to_string(gpu_id));
+        server_buffer, kDataLength * 2, GPU_PREFIX + std::to_string(gpu_id));
     ASSERT_EQ(rc, 0);
 
     auto segment_id = server_engine->openSegment(FLAGS_segment_id);
@@ -60,8 +60,8 @@ TEST(SunriseLinkTransportTest, WriteAndRead) {
     ASSERT_NE(client_transport, nullptr);
 
     void* client_buffer = allocateSunriseBuffer(kDataLength * 2, gpu_id);
-    rc = client_engine->registerLocalMemory(client_buffer, kDataLength * 2,
-                                            "cuda:" + std::to_string(gpu_id));
+    rc = client_engine->registerLocalMemory(
+        client_buffer, kDataLength * 2, GPU_PREFIX + std::to_string(gpu_id));
     ASSERT_EQ(rc, 0);
 
     {

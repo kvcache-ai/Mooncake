@@ -62,7 +62,7 @@ void RunWriteReadCase(int server_gpu, int client_gpu) {
         if (tangSetDevice(server_gpu) != tangSuccess) _exit(3);
         if (tangMalloc(&server_buf, kDataLength * 2) != tangSuccess) _exit(4);
         MemoryOptions server_opts;
-        server_opts.location = "cuda:" + std::to_string(server_gpu);
+        server_opts.location = GPU_PREFIX + std::to_string(server_gpu);
         auto s = server_engine->registerLocalMemory(server_buf, kDataLength * 2,
                                                     server_opts);
         if (!s.ok()) _exit(5);
@@ -130,7 +130,7 @@ void RunWriteReadCase(int server_gpu, int client_gpu) {
     CheckTangError(tangMalloc(&client_buf, kDataLength * 2),
                    "tangMalloc(client)");
     MemoryOptions client_opts;
-    client_opts.location = "cuda:" + std::to_string(client_gpu);
+    client_opts.location = GPU_PREFIX + std::to_string(client_gpu);
     auto s = client_engine->registerLocalMemory(client_buf, kDataLength * 2,
                                                 client_opts);
     ASSERT_TRUE(s.ok()) << s.ToString();
