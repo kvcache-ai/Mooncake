@@ -134,6 +134,29 @@ TEST_F(BufferAllocatorTest, OffsetLargestFreeRegionRemainsExact) {
     EXPECT_EQ(allocator->getLargestFreeRegion(), CAPACITY);
 }
 
+TEST_F(BufferAllocatorTest, OffsetLargestFreeRegionHintIsConservative) {
+    constexpr size_t kCapacity = 16 * 1024 * 1024;
+    auto allocator = std::make_shared<OffsetBufferAllocator>(
+        "largest-free-region-hint", 0x150000000ULL, kCapacity,
+        "largest-free-region-hint");
+
+    EXPECT_EQ(allocator->getLargestFreeRegionHint(), kCapacity);
+
+    auto buffer = allocator->allocate(kCapacity / 2);
+    ASSERT_NE(buffer, nullptr);
+    const size_t exact_largest = allocator->getLargestFreeRegion();
+
+    EXPECT_GT(allocator->getLargestFreeRegionHint(), exact_largest);
+    EXPECT_EQ(allocator->getLargestFreeRegionHint(),
+              allocator->getOffsetAllocator()->getLargestFreeRegion());
+
+    ASSERT_EQ(allocator->allocate(exact_largest + 1), nullptr);
+    EXPECT_EQ(allocator->getLargestFreeRegionHint(), exact_largest);
+
+    buffer.reset();
+    EXPECT_EQ(allocator->getLargestFreeRegionHint(), kCapacity);
+}
+
 TEST_F(BufferAllocatorTest, RestoreOffsetAllocationsAtOriginalAddresses) {
     constexpr uintptr_t kBase = 0x180000000ULL;
     constexpr size_t kCapacity = 16 * 1024 * 1024;
