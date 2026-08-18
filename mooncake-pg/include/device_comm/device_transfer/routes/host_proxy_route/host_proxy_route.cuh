@@ -6,6 +6,7 @@
 #include <cooperative_groups.h>
 #include <transport/device/device_ops.cuh>
 
+#include "device_comm/device_assert.cuh"
 #include "device_comm/device_transfer/transfer_types.cuh"
 #include "device_comm/device_transfer/routes/host_proxy_route/host_proxy_types.cuh"
 
@@ -37,10 +38,7 @@ class HostProxyTransferTicket {
     // Every thread in the lane CTA must enter wait() together.
     __device__ __forceinline__ TransferResult
     wait(cooperative_groups::thread_block block) const {
-        if (!wait_result_) {
-            __trap();
-            return TransferResult::Failed;
-        }
+        PG_DEVICE_ASSERT(wait_result_);
 
         if (block.thread_rank() == 0) {
             device::mc_st_release_u64(wait_result_,
@@ -89,11 +87,8 @@ __device__ __forceinline__ HostProxyTransferTicket hostProxyPutAndSignal(
     // reads the leader's private ticket state and broadcasts its result.
     if (block.thread_rank() != 0) return ticket;
 
-    if (!command_slots || lane >= kTransferLaneCount ||
-        remote_region_address == 0 || !wait_result) {
-        __trap();
-        return ticket;
-    }
+    PG_DEVICE_ASSERT(command_slots && lane < kTransferLaneCount &&
+                     remote_region_address != 0 && wait_result);
     auto* const slot = command_slots + lane;
     const uint64_t start_ticks = clock64();
 
@@ -103,16 +98,10 @@ __device__ __forceinline__ HostProxyTransferTicket hostProxyPutAndSignal(
         const uint64_t completed =
             device::mc_ld_acquire_u64(&slot->completed_sequence);
         if (completed == submitted) break;
-        if (completed > submitted) {
-            __trap();
-            return ticket;
-        }
+        PG_DEVICE_ASSERT(completed < submitted);
         if (hostProxyTimedOut(start_ticks, timeout_ticks)) return ticket;
     }
-    if (submitted == UINT64_MAX) {
-        __trap();
-        return ticket;
-    }
+    PG_DEVICE_ASSERT(submitted != UINT64_MAX);
 
     const uint64_t sequence = submitted + 1;
     HostProxyCommand command;
@@ -145,18 +134,12 @@ HostProxyTransferTicket::waitLeader() const {
     if (state_ == State::TimedOut) {
         return TransferResult::TimedOut;
     }
-    if (!slot_ || expected_sequence_ == 0) {
-        __trap();
-        return TransferResult::Failed;
-    }
+    PG_DEVICE_ASSERT(slot_ && expected_sequence_ != 0);
     while (true) {
         const uint64_t completed =
             device::mc_ld_acquire_u64(&slot_->completed_sequence);
         if (completed == expected_sequence_) break;
-        if (completed > expected_sequence_) {
-            __trap();
-            return TransferResult::Failed;
-        }
+        PG_DEVICE_ASSERT(completed < expected_sequence_);
         if (hostProxyTimedOut(start_ticks_, timeout_ticks_)) {
             return TransferResult::TimedOut;
         }
@@ -167,10 +150,10 @@ HostProxyTransferTicket::waitLeader() const {
         case HostProxyCommandResult::Failed:
             return TransferResult::Failed;
         case HostProxyCommandResult::Pending:
-            __trap();
+            PG_DEVICE_UNREACHABLE();
             return TransferResult::Failed;
     }
-    __trap();
+    PG_DEVICE_UNREACHABLE();
     return TransferResult::Failed;
 }
 

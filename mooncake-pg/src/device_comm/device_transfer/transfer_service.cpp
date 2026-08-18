@@ -191,6 +191,7 @@ struct DeviceTransferService::DeviceState {
             state->p2p_route = std::make_unique<P2pRoute>(
                 *p2p_transport, state->region.addr(), device_index, self_rank,
                 max_world_size);
+            PG_TRY(state->p2p_route->initialize());
             state->route_providers.push_back(state->p2p_route.get());
         }
         state->host_proxy_route = std::make_unique<HostProxyRoute>(

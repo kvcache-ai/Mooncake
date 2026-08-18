@@ -6,6 +6,7 @@
 #include <cooperative_groups.h>
 #include <transport/device/device_ops.cuh>
 
+#include "device_comm/device_assert.cuh"
 #include "device_comm/device_transfer/transfer_types.cuh"
 
 namespace mooncake {
@@ -66,10 +67,7 @@ p2pPutAndSignal(uint64_t mapped_region_address, const void* source,
                 uint64_t remote_payload_offset, uint64_t size,
                 uint64_t remote_signal_offset, uint64_t signal_delta,
                 cooperative_groups::thread_block block) {
-    if (mapped_region_address == 0) {
-        __trap();
-        return {};
-    }
+    PG_DEVICE_ASSERT(mapped_region_address != 0);
     auto* const remote_region =
         reinterpret_cast<char*>(static_cast<uintptr_t>(mapped_region_address));
     if (size != 0) {
@@ -83,10 +81,7 @@ p2pPutAndSignal(uint64_t mapped_region_address, const void* source,
 __device__ __forceinline__ P2pTransferTicket
 p2pSignal(uint64_t mapped_region_address, uint64_t remote_signal_offset,
           uint64_t signal_delta, cooperative_groups::thread_block block) {
-    if (mapped_region_address == 0) {
-        __trap();
-        return {};
-    }
+    PG_DEVICE_ASSERT(mapped_region_address != 0);
     auto* const remote_region =
         reinterpret_cast<char*>(static_cast<uintptr_t>(mapped_region_address));
     addToP2pSignal(remote_region, remote_signal_offset, signal_delta, block);
