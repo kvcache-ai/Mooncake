@@ -171,6 +171,24 @@ class TransferEngineImplTestPeer {
         return slice;
     }
 
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+    static void prepareFinishedBatchWithActiveCallback(
+        MultiTransport& transport, Transport::BatchID batch_id) {
+        auto& batch = Transport::toBatchDesc(batch_id);
+        auto& task = batch.task_list.emplace_back();
+        task.batch_id = batch_id;
+        task.slice_count = 1;
+        task.is_finished = true;
+        batch.active_completion_callbacks.store(1, std::memory_order_release);
+    }
+
+    static void finishActiveCompletionCallback(MultiTransport& transport,
+                                               Transport::BatchID batch_id) {
+        auto& batch = Transport::toBatchDesc(batch_id);
+        batch.active_completion_callbacks.store(0, std::memory_order_release);
+    }
+#endif
+
     static bool isCleanupDeferred(MultiTransport& transport,
                                   Transport::BatchID batch_id) {
         std::lock_guard<std::mutex> guard(transport.deferred_cleanup_mutex_);
@@ -960,7 +978,8 @@ TEST_F(TransportTest, RealSliceTimeoutDefersBatchCleanup) {
               Status::OK());
     EXPECT_EQ(status.s, Transport::TransferStatusEnum::TIMEOUT);
 
-    EXPECT_EQ(multi_transport.freeBatchID(batch_id), Status::OK());
+    Status free_status = multi_transport.freeBatchID(batch_id);
+    EXPECT_TRUE(free_status.IsBatchBusy());
     EXPECT_TRUE(TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
                                                               batch_id));
 
@@ -985,10 +1004,10 @@ TEST_F(TransportTest, TimedOutBatchIsReclaimedAfterCallbacksFinish) {
                                                  &task_transport);
 
     std::atomic<bool> callback_called{false};
-    EXPECT_EQ(TransferEngineImplTestPeer::freeBatchWithCallback(
-                  multi_transport, batch_id,
-                  [&] { callback_called.store(true, std::memory_order_release); }),
-              Status::OK());
+    Status free_status = TransferEngineImplTestPeer::freeBatchWithCallback(
+        multi_transport, batch_id,
+        [&] { callback_called.store(true, std::memory_order_release); });
+    EXPECT_TRUE(free_status.IsBatchBusy());
     EXPECT_TRUE(TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
                                                               batch_id));
     EXPECT_FALSE(callback_called.load(std::memory_order_acquire));
@@ -1005,6 +1024,33 @@ TEST_F(TransportTest, TimedOutBatchIsReclaimedAfterCallbacksFinish) {
                                                                batch_id));
     EXPECT_TRUE(callback_called.load(std::memory_order_acquire));
 }
+
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+TEST_F(TransportTest, FinishedBatchWaitsForCompletionCallbackQuiescence) {
+    std::string server_name = "unit-test-server:1234";
+    MultiTransport multi_transport(nullptr, server_name);
+    auto batch_id = multi_transport.allocateBatchID(1);
+    TransferEngineImplTestPeer::prepareFinishedBatchWithActiveCallback(
+        multi_transport, batch_id);
+
+    Status free_status = multi_transport.freeBatchID(batch_id);
+    EXPECT_TRUE(free_status.IsBatchBusy());
+    EXPECT_TRUE(TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
+                                                              batch_id));
+
+    TransferEngineImplTestPeer::finishActiveCompletionCallback(multi_transport,
+                                                               batch_id);
+    constexpr auto kCleanupDeadline = std::chrono::seconds(2);
+    const auto deadline = std::chrono::steady_clock::now() + kCleanupDeadline;
+    while (TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
+                                                         batch_id) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    EXPECT_FALSE(TransferEngineImplTestPeer::isCleanupDeferred(multi_transport,
+                                                               batch_id));
+}
+#endif
 
 TEST_F(TransportTest, TransferTaskDestructorRunsSliceCleanup) {
     int cleanup_count = 0;
