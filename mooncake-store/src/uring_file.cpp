@@ -9,6 +9,7 @@
 #include <string>
 #include <sys/mman.h>
 #include <sys/uio.h>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
@@ -16,6 +17,7 @@
 #include <liburing.h>
 
 #include "file_interface.h"
+#include "uring_submit.h"
 
 namespace mooncake {
 
@@ -110,6 +112,8 @@ class SharedUringRing {
 
     tl::expected<size_t, ErrorCode> read(int fd, void* buf, size_t len,
                                          off_t off) {
+        if (!initialized_)
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         ensure_buf_registered();
         bool fix = in_registered_buf(buf, len);
         return submit_rw(/*write=*/false, fd, buf, len, off, fix);
@@ -117,17 +121,23 @@ class SharedUringRing {
 
     tl::expected<size_t, ErrorCode> write(int fd, const void* buf, size_t len,
                                           off_t off) {
+        if (!initialized_)
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         return submit_rw(/*write=*/true, fd, const_cast<void*>(buf), len, off,
                          /*use_fixed_buf=*/false);
     }
 
     tl::expected<size_t, ErrorCode> vector_read(int fd, const iovec* iovs,
                                                 int cnt, off_t off) {
+        if (!initialized_)
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         return submit_vector(/*write=*/false, fd, iovs, cnt, off);
     }
 
     tl::expected<size_t, ErrorCode> vector_write(int fd, const iovec* iovs,
                                                  int cnt, off_t off) {
+        if (!initialized_)
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         return submit_vector(/*write=*/true, fd, iovs, cnt, off);
     }
 
@@ -211,28 +221,98 @@ class SharedUringRing {
     // Construction / destruction
     // -----------------------------------------------------------------
 
-    SharedUringRing() {
+    SharedUringRing() { initialize_ring(); }
+
+    ~SharedUringRing() { shutdown_ring(); }
+
+    // -----------------------------------------------------------------
+    // Internal helpers
+    // -----------------------------------------------------------------
+
+    bool initialize_ring() {
+        ring_ = {};
         int ret = io_uring_queue_init(QUEUE_DEPTH, &ring_, 0);
         if (ret < 0) {
             LOG(ERROR) << "[SharedUringRing] io_uring_queue_init failed: "
                        << strerror(-ret);
-            return;
+            return false;
         }
         initialized_ = true;
         LOG(INFO) << "[SharedUringRing] thread-local ring initialised "
                      "queue_depth="
                   << QUEUE_DEPTH;
+        return true;
     }
 
-    ~SharedUringRing() {
+    void shutdown_ring() {
         if (!initialized_) return;
         if (buf_registered_) io_uring_unregister_buffers(&ring_);
         io_uring_queue_exit(&ring_);
+        initialized_ = false;
+        buf_registered_ = false;
+        buf_base_ = nullptr;
+        buf_size_ = 0;
     }
 
-    // -----------------------------------------------------------------
-    // Internal helpers
-    // -----------------------------------------------------------------
+    void reset_ring() {
+        shutdown_ring();
+        if (!initialize_ring()) {
+            LOG(ERROR) << "[SharedUringRing] failed to recover io_uring";
+        }
+    }
+
+    detail::UringSubmitResult submit_pending() {
+        return detail::submit_all_pending(
+            [this] { return io_uring_sq_ready(&ring_); },
+            [this](unsigned pending) {
+                return io_uring_submit_and_wait(&ring_, pending);
+            },
+            [] { std::this_thread::yield(); });
+    }
+
+    bool wait_cqe(struct io_uring_cqe** cqe) {
+        unsigned transient_retries = 0;
+        while (true) {
+            int ret = io_uring_peek_cqe(&ring_, cqe);
+            if (ret == -EAGAIN) ret = io_uring_wait_cqe(&ring_, cqe);
+            if (ret == 0) return true;
+            if ((ret == -EINTR || ret == -EAGAIN) && transient_retries++ < 64) {
+                std::this_thread::yield();
+                continue;
+            }
+            LOG(ERROR) << "[SharedUringRing] CQE wait error: "
+                       << strerror(-ret);
+            return false;
+        }
+    }
+
+    bool drain_submitted(unsigned submitted, uint64_t op_id) {
+        unsigned processed = 0;
+        while (processed < submitted) {
+            struct io_uring_cqe* cqe;
+            if (!wait_cqe(&cqe)) return false;
+            if ((cqe->user_data & ~BATCH_INDEX_MASK) == op_id) ++processed;
+            io_uring_cq_advance(&ring_, 1);
+        }
+        return true;
+    }
+
+    bool prepare_completions(int expected, uint64_t op_id) {
+        auto submit = submit_pending();
+        if (submit.error == 0 && submit.pending == 0 &&
+            submit.submitted == static_cast<unsigned>(expected)) {
+            return true;
+        }
+
+        LOG(ERROR) << "[SharedUringRing] io_uring submission incomplete: "
+                   << "expected=" << expected
+                   << " submitted=" << submit.submitted
+                   << " pending=" << submit.pending
+                   << " error=" << submit.error;
+        drain_submitted(submit.submitted, op_id);
+        reset_ring();
+        return false;
+    }
 
     bool in_registered_buf(const void* buf, size_t len) const {
         if (!buf_registered_ || !buf_base_ || !buf_size_) return false;
@@ -287,10 +367,7 @@ class SharedUringRing {
     // a syscall in the common case.  io_uring_wait_cqe() only kicks
     // in when the ring is unexpectedly drained (stale CQE storms).
     tl::expected<size_t, ErrorCode> collect(int expected, uint64_t op_id) {
-        int ret = io_uring_submit_and_wait(&ring_, expected);
-        if (ret < 0) {
-            LOG(ERROR) << "[SharedUringRing] io_uring_submit_and_wait: "
-                       << strerror(-ret);
+        if (!prepare_completions(expected, op_id)) {
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
         size_t total = 0;
@@ -299,13 +376,8 @@ class SharedUringRing {
 
         while (processed < expected) {
             struct io_uring_cqe* cqe;
-            int wait_ret = io_uring_peek_cqe(&ring_, &cqe);
-            if (wait_ret == -EAGAIN) {
-                wait_ret = io_uring_wait_cqe(&ring_, &cqe);
-            }
-            if (wait_ret < 0) {
-                LOG(ERROR) << "[SharedUringRing] CQE wait error: "
-                           << strerror(-wait_ret);
+            if (!wait_cqe(&cqe)) {
+                reset_ring();
                 return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
             }
             if (cqe->user_data != op_id) {
@@ -329,10 +401,7 @@ class SharedUringRing {
 
     tl::expected<void, ErrorCode> collect_batch(int expected, uint64_t op_id,
                                                 ReadDesc* descs) {
-        int ret = io_uring_submit_and_wait(&ring_, expected);
-        if (ret < 0) {
-            LOG(ERROR) << "[SharedUringRing] io_uring_submit_and_wait: "
-                       << strerror(-ret);
+        if (!prepare_completions(expected, op_id)) {
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
 
@@ -340,13 +409,8 @@ class SharedUringRing {
         int processed = 0;
         while (processed < expected) {
             struct io_uring_cqe* cqe;
-            int wait_ret = io_uring_peek_cqe(&ring_, &cqe);
-            if (wait_ret == -EAGAIN) {
-                wait_ret = io_uring_wait_cqe(&ring_, &cqe);
-            }
-            if (wait_ret < 0) {
-                LOG(ERROR) << "[SharedUringRing] CQE wait error: "
-                           << strerror(-wait_ret);
+            if (!wait_cqe(&cqe)) {
+                reset_ring();
                 return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
             }
 

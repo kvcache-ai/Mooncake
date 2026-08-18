@@ -7,6 +7,7 @@
 #include <string_view>
 #include <vector>
 #include "file_interface.h"
+#include "../src/uring_submit.h"
 
 namespace mooncake {
 
@@ -33,6 +34,68 @@ class PosixFileTest : public ::testing::Test {
     std::string test_filename;
     int test_fd = -1;
 };
+
+#ifdef USE_URING
+TEST(UringSubmitTest, ContinuesAfterPositiveShortSubmit) {
+    unsigned pending = 8;
+    std::vector<unsigned> requested;
+    std::array<int, 2> returns{3, 5};
+    size_t call = 0;
+
+    auto result = detail::submit_all_pending(
+        [&] { return pending; },
+        [&](unsigned requested_count) {
+            requested.push_back(requested_count);
+            int submitted = returns[call++];
+            pending -= static_cast<unsigned>(submitted);
+            return submitted;
+        },
+        [] {});
+
+    EXPECT_EQ(result.error, 0);
+    EXPECT_EQ(result.submitted, 8U);
+    EXPECT_EQ(result.pending, 0U);
+    EXPECT_EQ(requested, (std::vector<unsigned>{8, 5}));
+}
+
+TEST(UringSubmitTest, RetriesTransientSubmissionErrors) {
+    unsigned pending = 4;
+    std::array<int, 3> returns{-EINTR, -EAGAIN, 4};
+    size_t call = 0;
+    unsigned yields = 0;
+
+    auto result = detail::submit_all_pending(
+        [&] { return pending; },
+        [&](unsigned) {
+            int ret = returns[call++];
+            if (ret > 0) pending -= static_cast<unsigned>(ret);
+            return ret;
+        },
+        [&] { ++yields; });
+
+    EXPECT_EQ(result.error, 0);
+    EXPECT_EQ(result.submitted, 4U);
+    EXPECT_EQ(result.pending, 0U);
+    EXPECT_EQ(yields, 2U);
+}
+
+TEST(UringSubmitTest, StopsAfterBoundedNoProgress) {
+    unsigned pending = 4;
+    unsigned calls = 0;
+    auto submit = [&](unsigned) {
+        ++calls;
+        return -ENOMEM;
+    };
+
+    auto result =
+        detail::submit_all_pending([&] { return pending; }, submit, [] {}, 2);
+
+    EXPECT_EQ(result.error, -ENOMEM);
+    EXPECT_EQ(result.submitted, 0U);
+    EXPECT_EQ(result.pending, pending);
+    EXPECT_EQ(calls, 3U);
+}
+#endif
 
 // Test basic file lifecycle
 TEST_F(PosixFileTest, FileLifecycle) {
