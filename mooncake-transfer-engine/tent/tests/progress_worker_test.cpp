@@ -38,6 +38,7 @@
 
 #include "tent/common/config.h"
 #include "tent/common/types.h"
+#include "tent/rpc/rpc.h"
 #include "tent/runtime/segment.h"
 #include "tent/runtime/proxy_manager.h"
 #include "tent/runtime/transfer_engine_impl.h"
@@ -1098,6 +1099,125 @@ TEST(ProxyManager, RemoteCleanupProbeDoesNotBlockOnPendingOperation) {
     operation->complete(Status::OK());
     EXPECT_TRUE(internal::pollRemoteOperations(remote_operations));
     EXPECT_TRUE(remote_operations.empty());
+}
+
+TEST(ProxyManager, LateRemoteCompletionReleasesAbandonedStageBuffer) {
+    auto cfg = makeMinimalP2PConfig();
+    TransferEngineImpl engine(cfg);
+    ASSERT_TRUE(engine.available());
+
+    auto fake_tcp = std::make_shared<FakeTransport>(TCP);
+    std::string segment_name = engine.getSegmentName();
+    ASSERT_TRUE(fake_tcp->install(segment_name, nullptr, nullptr).ok());
+    engine.swapTransportForTest(TCP, fake_tcp);
+
+    constexpr size_t kBufferLength = 64;
+    std::vector<uint8_t> source(kBufferLength, 0x91);
+    std::vector<uint8_t> remote_stage(kBufferLength, 0x00);
+    ASSERT_TRUE(engine.registerLocalMemory(source.data(), source.size()).ok());
+    ASSERT_TRUE(
+        engine.registerLocalMemory(remote_stage.data(), remote_stage.size())
+            .ok());
+
+    CoroRpcAgent remote_server;
+    std::atomic<bool> buffer_pinned{false};
+    std::atomic<bool> delegate_started{false};
+    std::atomic<bool> release_delegate{false};
+    std::atomic<int> unpin_calls{0};
+    const auto remote_stage_addr =
+        reinterpret_cast<uint64_t>(remote_stage.data());
+
+    ASSERT_TRUE(
+        remote_server
+            .registerFunction(
+                Pin,
+                [&](const std::string_view&, std::string& response) {
+                    bool expected = false;
+                    response = buffer_pinned.compare_exchange_strong(expected,
+                                                                      true)
+                                   ? std::to_string(remote_stage_addr)
+                                   : "0";
+                })
+            .ok());
+    ASSERT_TRUE(
+        remote_server
+            .registerFunction(
+                Unpin,
+                [&](const std::string_view&, std::string&) {
+                    buffer_pinned.store(false, std::memory_order_release);
+                    unpin_calls.fetch_add(1, std::memory_order_relaxed);
+                })
+            .ok());
+    ASSERT_TRUE(
+        remote_server
+            .registerFunction(
+                Delegate,
+                [&](const std::string_view&, std::string&) {
+                    delegate_started.store(true, std::memory_order_release);
+                    while (!release_delegate.load(std::memory_order_acquire)) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    }
+                },
+                /*offload=*/true)
+            .ok());
+
+    uint16_t port = 0;
+    ASSERT_TRUE(remote_server.start(port).ok());
+    const std::string server_addr =
+        "127.0.0.1:" + std::to_string(static_cast<unsigned>(port));
+
+    auto manager = std::make_unique<ProxyManager>(&engine, kBufferLength, 1);
+    Request request;
+    request.opcode = Request::WRITE;
+    request.source = source.data();
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = remote_stage_addr;
+    request.length = kBufferLength;
+    const std::vector<std::string> params = {server_addr, "", "remote"};
+
+    TaskInfo task;
+    task.request = request;
+    task.staging = true;
+    ASSERT_TRUE(manager->submit(&task, 0, params).ok());
+
+    const auto start_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!delegate_started.load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < start_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (!delegate_started.load(std::memory_order_acquire)) {
+        release_delegate.store(true, std::memory_order_release);
+        manager.reset();
+        FAIL() << "remote Delegate never started";
+        return;
+    }
+
+    manager.reset();
+    release_delegate.store(true, std::memory_order_release);
+
+    const auto cleanup_deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (unpin_calls.load(std::memory_order_acquire) == 0 &&
+           std::chrono::steady_clock::now() < cleanup_deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    EXPECT_EQ(unpin_calls.load(std::memory_order_acquire), 1);
+
+    uint64_t repinned_addr = 0;
+    ASSERT_TRUE(
+        ControlClient::pinStageBuffer(server_addr, "remote", repinned_addr)
+            .ok());
+    EXPECT_EQ(repinned_addr, remote_stage_addr);
+    if (repinned_addr != 0) {
+        EXPECT_TRUE(
+            ControlClient::unpinStageBuffer(server_addr, repinned_addr).ok());
+    }
+
+    EXPECT_TRUE(engine.unregisterLocalMemory(source.data(), source.size()).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(remote_stage.data(), remote_stage.size())
+            .ok());
 }
 
 TEST(ProxyManager, DestructorWaitsForDeferredBatchBeforeFreeingStageMemory) {
