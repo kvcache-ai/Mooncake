@@ -48,6 +48,18 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
     result.durable_prefix_present = true;
     result.durable_prefix = prefix;
 
+    ViewVersionId producer_view_version = 0;
+    err = storage_.ReadProducerView(producer_view_version);
+    if (err == ErrorCode::ETCD_KEY_NOT_EXIST) {
+        // A prefix written before producer-view fencing has no separate view.
+        // Keep the existing zero-value snapshot metadata for that layout.
+    } else if (err != ErrorCode::OK) {
+        SetPollError(result, err, IsRetryableBackendError(err));
+        return result;
+    } else {
+        result.producer_view_version = producer_view_version;
+    }
+
     if (last_observed_prefix_ &&
         (prefix.batch_id < last_observed_prefix_->batch_id ||
          prefix.last_seq < last_observed_prefix_->last_seq ||
@@ -63,8 +75,10 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
         last_observed_prefix_ = prefix;
         if (prefix.last_seq != 0) {
             SetPollError(result, ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, false);
-        } else if (applier_.GetExpectedSequenceId() == 1) {
+        } else if (applier_.GetExpectedSequenceId() == 1 &&
+                   !last_applied_durable_prefix_) {
             last_applied_durable_prefix_ = prefix;
+            last_applied_producer_view_version_ = result.producer_view_version;
         }
         return result;
     }
@@ -149,6 +163,7 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
         const uint64_t expected = applier_.GetExpectedSequenceId();
         if (expected > 0 && expected - 1 == prefix.last_seq) {
             last_applied_durable_prefix_ = prefix;
+            last_applied_producer_view_version_ = result.producer_view_version;
         }
     }
     return result;

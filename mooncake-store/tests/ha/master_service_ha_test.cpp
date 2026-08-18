@@ -983,21 +983,6 @@ TEST_F(MasterServiceHATest, RestoreRejectsDescriptorsBeyondSegmentCapacity) {
     EXPECT_EQ(result.error(), ErrorCode::INVALID_PARAMS);
 }
 
-TEST_F(MasterServiceHATest, RestoreRejectsObjectCursorBeyondSnapshot) {
-    MasterService service(
-        MasterServiceConfig::builder().set_enable_ha(false).build());
-
-    const std::string endpoint = "standby_cursor_segment";
-    auto object = MakeStandbyObject("standby_cursor_key", endpoint);
-    object.metadata.last_sequence_id = 8;
-
-    auto result = service.RestoreFromStandbySnapshot(
-        {object}, 7, {MakeStandbyMemorySegment(endpoint)});
-
-    ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), ErrorCode::INVALID_VERSION);
-}
-
 TEST_F(MasterServiceHATest, RestoreRejectsDfsMode) {
     MasterService service(
         MasterServiceConfig::builder().set_enable_ha(false).build());

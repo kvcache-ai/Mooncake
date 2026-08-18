@@ -560,11 +560,12 @@ TEST_F(HotStandbyServiceTest,
             EncodeOpLogBatchRecord(MakeCaptureBatch(
                 1, 1, OpType::SEGMENT_MOUNT, mount.segment_name,
                 std::string(mount_payload.begin(), mount_payload.end())))));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend->Put(BuildDurablePrefixKey(cluster_id_),
+                     EncodeDurablePrefix({.batch_id = 1, .last_seq = 1})));
     ASSERT_EQ(ErrorCode::OK,
-              backend->Put(BuildDurablePrefixKey(cluster_id_),
-                           EncodeDurablePrefix({.batch_id = 1,
-                                                .last_seq = 1,
-                                                .producer_view_version = 7})));
+              backend->Put(BuildProducerViewKey(cluster_id_), "7"));
     config_.enable_oplog_following = true;
     config_.oplog_poll_interval_ms = 1;
     service_ = std::make_unique<HotStandbyService>(config_);
@@ -597,11 +598,10 @@ TEST_F(HotStandbyServiceTest,
     ASSERT_EQ(ErrorCode::OK,
               backend->Put(BuildBatchRecordKey(cluster_id_, 2),
                            EncodeOpLogBatchRecord(MakeCaptureBatch(2, 2))));
-    ASSERT_EQ(ErrorCode::OK,
-              backend->Put(BuildDurablePrefixKey(cluster_id_),
-                           EncodeDurablePrefix({.batch_id = 2,
-                                                .last_seq = 2,
-                                                .producer_view_version = 7})));
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend->Put(BuildDurablePrefixKey(cluster_id_),
+                     EncodeDurablePrefix({.batch_id = 2, .last_seq = 2})));
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     EXPECT_EQ(1u, service_->GetLatestAppliedSequenceId());
 
@@ -615,11 +615,12 @@ TEST_F(HotStandbyServiceTest,
 
 TEST_F(HotStandbyServiceTest, PromotionCancelsActiveSnapshotCapture) {
     auto backend = std::make_shared<FakeCaptureHaKvBackend>();
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend->Put(BuildDurablePrefixKey(cluster_id_),
+                     EncodeDurablePrefix({.batch_id = 0, .last_seq = 0})));
     ASSERT_EQ(ErrorCode::OK,
-              backend->Put(BuildDurablePrefixKey(cluster_id_),
-                           EncodeDurablePrefix({.batch_id = 0,
-                                                .last_seq = 0,
-                                                .producer_view_version = 7})));
+              backend->Put(BuildProducerViewKey(cluster_id_), "7"));
     config_.enable_oplog_following = true;
     config_.oplog_poll_interval_ms = 1;
     service_ = std::make_unique<HotStandbyService>(config_);
@@ -636,11 +637,12 @@ TEST_F(HotStandbyServiceTest, PromotionCancelsActiveSnapshotCapture) {
 
 TEST_F(HotStandbyServiceTest, SnapshotCaptureRejectsInconsistentSequence) {
     auto backend = std::make_shared<FakeCaptureHaKvBackend>();
+    ASSERT_EQ(
+        ErrorCode::OK,
+        backend->Put(BuildDurablePrefixKey(cluster_id_),
+                     EncodeDurablePrefix({.batch_id = 0, .last_seq = 0})));
     ASSERT_EQ(ErrorCode::OK,
-              backend->Put(BuildDurablePrefixKey(cluster_id_),
-                           EncodeDurablePrefix({.batch_id = 0,
-                                                .last_seq = 0,
-                                                .producer_view_version = 7})));
+              backend->Put(BuildProducerViewKey(cluster_id_), "7"));
     config_.enable_snapshot_bootstrap = true;
     config_.enable_oplog_following = true;
     config_.oplog_poll_interval_ms = 1;

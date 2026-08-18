@@ -26,6 +26,8 @@ struct OpLogBatchStandbyPollResult {
     bool durable_prefix_present{false};
     size_t applied_entries{0};
     DurablePrefix durable_prefix{};
+    // Producer view is stored independently from the durable prefix.
+    ViewVersionId producer_view_version{0};
 };
 
 class OpLogBatchStandbyReader {
@@ -37,6 +39,9 @@ class OpLogBatchStandbyReader {
     std::optional<DurablePrefix> GetLastAppliedDurablePrefix() const {
         return last_applied_durable_prefix_;
     }
+    std::optional<ViewVersionId> GetLastAppliedProducerViewVersion() const {
+        return last_applied_producer_view_version_;
+    }
 
    private:
     OpLogBatchStorage storage_;
@@ -44,6 +49,7 @@ class OpLogBatchStandbyReader {
     bool batch_format_seen_{false};
     std::optional<DurablePrefix> last_observed_prefix_;
     std::optional<DurablePrefix> last_applied_durable_prefix_;
+    std::optional<ViewVersionId> last_applied_producer_view_version_;
     std::optional<uint64_t> last_scanned_batch_last_seq_;
     uint64_t last_applied_batch_id_{0};
 };

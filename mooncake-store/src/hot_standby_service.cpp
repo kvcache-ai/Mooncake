@@ -705,15 +705,18 @@ void HotStandbyService::HandleSnapshotCaptureRequest(
 
     state->requested = false;
     auto applied_prefix = batch_standby_reader_->GetLastAppliedDurablePrefix();
+    auto applied_producer_view =
+        batch_standby_reader_->GetLastAppliedProducerViewVersion();
     const uint64_t expected = oplog_applier_->GetExpectedSequenceId();
-    const bool consistent =
-        result.error == ErrorCode::OK && result.durable_prefix_present &&
-        applied_prefix && *applied_prefix == result.durable_prefix &&
-        expected > 0 && expected - 1 == applied_prefix->last_seq;
+    const bool consistent = result.error == ErrorCode::OK &&
+                            result.durable_prefix_present && applied_prefix &&
+                            *applied_prefix == result.durable_prefix &&
+                            applied_producer_view && expected > 0 &&
+                            expected - 1 == applied_prefix->last_seq;
     if (consistent && IsRunning() && metadata_store_) {
         BatchOpLogSnapshotCapture capture(
             applied_prefix->last_seq, applied_prefix->batch_id,
-            applied_prefix->producer_view_version,
+            *applied_producer_view,
             oplog_applier_->GetSegmentRegistry().GetAllSegments(),
             metadata_store_->BeginSnapshotTraversal(), state->generation,
             state);

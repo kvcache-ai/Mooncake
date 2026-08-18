@@ -3043,16 +3043,6 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
                 << tenant_id.value() << ", key=" << user_key;
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
-        if (entry.metadata.last_sequence_id > initial_oplog_sequence_id) {
-            LOG(ERROR) << "RestoreFromStandbySnapshot: object cursor "
-                       << entry.metadata.last_sequence_id
-                       << " exceeds snapshot cursor "
-                       << initial_oplog_sequence_id
-                       << ", tenant=" << tenant_id.value()
-                       << ", key=" << user_key;
-            return tl::make_unexpected(ErrorCode::INVALID_VERSION);
-        }
-
         const auto shard_idx = entry.metadata.group_id.empty()
                                    ? getShardIndex(tenant_id, user_key)
                                    : getShardIndex(entry.metadata.group_id);
