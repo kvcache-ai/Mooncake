@@ -79,8 +79,8 @@ struct MasterConfig {
     std::string redis_username;         // Redis ACL username
     std::string redis_password;         // Redis AUTH password (empty = no auth)
     int redis_db_index = 0;             // Redis DB index
-    int redis_master_view_ttl_sec = 5;  // Leader key TTL in seconds
-    int redis_heartbeat_interval_sec = 2;  // KeepLeader renewal interval
+    int redis_master_view_ttl_sec = 4;  // Leader key TTL in seconds
+    int redis_heartbeat_interval_sec = 1;  // KeepLeader renewal interval
 
     void ApplyRedisEndpointDefaults() {
         if (redis_endpoint.empty()) {
@@ -161,8 +161,8 @@ class MasterServiceSupervisorConfig {
     std::string redis_username;            // Redis ACL username
     std::string redis_password;            // Redis AUTH password
     int redis_db_index = 0;                // Redis DB index
-    int redis_master_view_ttl_sec = 5;     // Leader key TTL in seconds
-    int redis_heartbeat_interval_sec = 2;  // KeepLeader renewal interval
+    int redis_master_view_ttl_sec = 4;     // Leader key TTL in seconds
+    int redis_heartbeat_interval_sec = 1;  // KeepLeader renewal interval
 
     MasterServiceSupervisorConfig() = default;
 

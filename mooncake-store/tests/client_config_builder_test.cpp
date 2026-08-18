@@ -34,6 +34,37 @@ TEST(ClientConfigBuilderTest, BuildP2PClientConfigUsesDefaults) {
     EXPECT_EQ(config.p2p_key_lease_scan_interval_ms,
               P2PClientConfig::kP2pDefaultKeyLeaseScanIntervalMs);
     EXPECT_EQ(config.transfer_direction_mode, TransferDirectionMode::REVERSE);
+    EXPECT_EQ(config.redis_master_view_ttl_sec, 4);
+    EXPECT_EQ(config.redis_heartbeat_interval_sec, 1);
+}
+
+TEST(ClientConfigBuilderTest, BuildP2PClientConfigUsesRedisDiscoveryDefaults) {
+    std::unordered_map<std::string, std::string> raw_config = {
+        {"local_hostname", "127.0.0.1:12345"},
+        {"metadata_server", "http://127.0.0.1:8080/metadata"},
+        {"master_server_addr", "redis://127.0.0.1:6379"},
+        {"tiered_backend_config", kTieredConfigJson},
+    };
+
+    auto config = ClientConfigBuilder::build_p2p_real_client(raw_config);
+
+    EXPECT_EQ(config.redis_master_view_ttl_sec, 4);
+    EXPECT_EQ(config.redis_heartbeat_interval_sec, 1);
+}
+
+TEST(ClientConfigBuilderTest,
+     BuildCentralizedClientConfigUsesRedisDiscoveryDefaults) {
+    std::unordered_map<std::string, std::string> raw_config = {
+        {"local_hostname", "127.0.0.1:12345"},
+        {"metadata_server", "http://127.0.0.1:8080/metadata"},
+        {"master_server_addr", "redis://127.0.0.1:6379"},
+    };
+
+    auto config =
+        ClientConfigBuilder::build_centralized_real_client(raw_config);
+
+    EXPECT_EQ(config.redis_master_view_ttl_sec, 4);
+    EXPECT_EQ(config.redis_heartbeat_interval_sec, 1);
 }
 
 TEST(ClientConfigBuilderTest, BuildP2PClientConfigKeyLeaseOverrides) {

@@ -35,13 +35,17 @@ This page summarizes useful flags, environment variables, and HTTP endpoints to 
   - `--redis_username` (str, default empty): Redis ACL username for Redis-based HA.
   - `--redis_password` (str, default empty): Redis AUTH password for Redis-based HA.
   - `--redis_db_index` (int, default `0`): Redis DB index for Redis-based HA.
-  - `--redis_master_view_ttl_sec` (int, default `5`): TTL for the Redis master view key.
-  - `--redis_heartbeat_interval_sec` (int, default `2`): Redis leader renewal interval. It must be smaller than `--redis_master_view_ttl_sec`.
+  - `--redis_master_view_ttl_sec` (int, default `4`): TTL for the Redis master view key.
+  - `--redis_heartbeat_interval_sec` (int, default `1`): Redis leader renewal interval. It must be smaller than `--redis_master_view_ttl_sec`.
   - `--client_ttl` (int64, default `10` s): Client alive TTL after last ping (HA mode).
   - `--cluster_id` (str, default `mooncake_cluster`): Cluster ID for persistence and HA metadata isolation.
   - `--enable_oplog` (bool, default `false`): Enable master metadata OpLog recording.
   - `--oplog_store_type` (str, default `localfs`): OpLog backend, for example `localfs` or `redis`.
   - `--oplog_data_dir` (str, default `/tmp/mooncake_oplog`): OpLog data path for `localfs`; Redis endpoint for `redis`.
+  - `--standby_snapshot_service_port` (uint32, default `0`): Port for serving P2P Standby metadata snapshots. `0` disables the snapshot service.
+  - `--standby_snapshot_service_endpoint` (str, default empty): Optional advertised snapshot endpoint. If empty, it is derived from the master endpoint and snapshot service port.
+  - `--standby_snapshot_sources` (str, default empty): Optional comma-separated snapshot source override. If empty, sources are discovered from Redis master registry.
+  - `--standby_snapshot_chunk_size` (uint32, default `256`): Maximum metadata records per snapshot RPC chunk.
 
 ### P2P HA OpLog Coverage
 
@@ -111,7 +115,7 @@ The client Redis cluster ID must match the masters' `--cluster_id`. If the clien
 
 Operational notes:
 
-- Keep `--redis_heartbeat_interval_sec` smaller than `--redis_master_view_ttl_sec`. The default pair is `2` seconds and `5` seconds.
+- Keep `--redis_heartbeat_interval_sec` smaller than `--redis_master_view_ttl_sec`. The default pair is `1` second and `4` seconds.
 - A smaller TTL reduces failover latency but is more sensitive to transient Redis or scheduling delays. Increase the TTL if CI or production logs show unexpected leader churn.
 - The active leader renews the Redis master view key periodically. If the leader process exits or loses renewal, the key expires and another master can be elected.
 - Clients using `redis://` resolve the current leader from Redis and reconnect after heartbeat failures. Existing requests may fail during the failover window and should be retried by the caller.
@@ -131,7 +135,19 @@ mooncake_master \
   --enable_oplog=true \
   --oplog_store_type=redis \
   --oplog_data_dir=10.0.0.10:6379 \
+  --standby_snapshot_service_port=52051 \
   --rpc_address=10.0.0.1
+```
+
+For P2P Redis HA, set `--standby_snapshot_service_port` on every master so a Standby that falls behind the Redis OpLog trim horizon can rebootstrap from another ready Standby. Use `--standby_snapshot_service_endpoint` when the advertised host or port differs from the derived endpoint. Use `--standby_snapshot_sources` only for fixed-source deployments or tests; otherwise Redis registry discovery is preferred.
+
+Recommended test/staging flags:
+
+```text
+--redis_heartbeat_interval_sec=1
+--redis_master_view_ttl_sec=4
+--standby_snapshot_service_port=<unique_port_per_master>
+--standby_snapshot_chunk_size=256
 ```
 
 P2P clients should also use Redis master discovery and the same cluster ID:
