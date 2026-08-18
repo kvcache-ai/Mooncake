@@ -294,7 +294,7 @@ std::vector<int32_t> create_elastic_nccl_unique_id() {
 #else
     throw std::runtime_error(
         "Mooncake EP was built without NCCL Device API support; rebuild with "
-        "MOONCAKE_EP_USE_NCCL_DEVICE=1");
+        "-DUSE_NCCL_DEVICE=ON");
 #endif
 }
 
@@ -434,7 +434,7 @@ MooncakeElasticBuffer::MooncakeElasticBuffer(
         (void)nccl_unique_id;
         throw std::runtime_error(
             "transport='nccl' requires a Mooncake EP build with "
-            "MOONCAKE_EP_USE_NCCL_DEVICE=1");
+            "-DUSE_NCCL_DEVICE=ON");
 #endif
     } else {
         if (!nccl_unique_id.empty()) {

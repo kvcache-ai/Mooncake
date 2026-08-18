@@ -735,9 +735,7 @@ class ElasticBuffer:
     def _hybrid_num_max_tokens_per_channel(
         self, num_max_tokens_per_rank: int, num_sms: int
     ) -> int:
-        return _ceil_div(
-            num_max_tokens_per_rank, self._hybrid_num_channels(num_sms)
-        )
+        return _ceil_div(num_max_tokens_per_rank, self._hybrid_num_channels(num_sms))
 
     def barrier(
         self, use_comm_stream: bool = True, with_cpu_sync: bool = False
@@ -1074,30 +1072,30 @@ class ElasticBuffer:
         if async_with_compute_stream:
             tensors_to_record = (
                 x_data,
-            topk_idx,
-            active_ranks,
-            recv_x,
-            recv_topk_idx,
-            elastic_handle.topk_idx,
-            elastic_handle.psum_num_recv_tokens_per_scaleup_rank,
-            elastic_handle.psum_num_recv_tokens_per_expert,
-            elastic_handle.recv_src_metadata,
-            elastic_handle.dst_buffer_slot_idx,
-            *(() if sf is None else (sf,)),
-            *(() if topk_weights is None else (topk_weights,)),
-            *(() if recv_x_scales is None else (recv_x_scales,)),
-            *(() if recv_topk_weights is None else (recv_topk_weights,)),
-            *(
-                ()
-                if elastic_handle.token_metadata_at_forward is None
-                else (elastic_handle.token_metadata_at_forward,)
-            ),
-            *(
-                ()
-                if elastic_handle.channel_linked_list is None
-                else (elastic_handle.channel_linked_list,)
-            ),
-        )
+                topk_idx,
+                active_ranks,
+                recv_x,
+                recv_topk_idx,
+                elastic_handle.topk_idx,
+                elastic_handle.psum_num_recv_tokens_per_scaleup_rank,
+                elastic_handle.psum_num_recv_tokens_per_expert,
+                elastic_handle.recv_src_metadata,
+                elastic_handle.dst_buffer_slot_idx,
+                *(() if sf is None else (sf,)),
+                *(() if topk_weights is None else (topk_weights,)),
+                *(() if recv_x_scales is None else (recv_x_scales,)),
+                *(() if recv_topk_weights is None else (recv_topk_weights,)),
+                *(
+                    ()
+                    if elastic_handle.token_metadata_at_forward is None
+                    else (elastic_handle.token_metadata_at_forward,)
+                ),
+                *(
+                    ()
+                    if elastic_handle.channel_linked_list is None
+                    else (elastic_handle.channel_linked_list,)
+                ),
+            )
         return (
             recv_x_out,
             recv_topk_idx,
@@ -1157,25 +1155,25 @@ class ElasticBuffer:
         if async_with_compute_stream:
             tensors_to_record = (
                 x,
-            topk_weights,
-            active_ranks,
-            combined_x,
-            handle.topk_idx,
-            handle.psum_num_recv_tokens_per_scaleup_rank,
-            handle.psum_num_recv_tokens_per_expert,
-            handle.recv_src_metadata,
-            handle.dst_buffer_slot_idx,
-            *(
-                ()
-                if handle.token_metadata_at_forward is None
-                else (handle.token_metadata_at_forward,)
-            ),
-            *(
-                ()
-                if handle.channel_linked_list is None
-                else (handle.channel_linked_list,)
-            ),
-        )
+                topk_weights,
+                active_ranks,
+                combined_x,
+                handle.topk_idx,
+                handle.psum_num_recv_tokens_per_scaleup_rank,
+                handle.psum_num_recv_tokens_per_expert,
+                handle.recv_src_metadata,
+                handle.dst_buffer_slot_idx,
+                *(
+                    ()
+                    if handle.token_metadata_at_forward is None
+                    else (handle.token_metadata_at_forward,)
+                ),
+                *(
+                    ()
+                    if handle.channel_linked_list is None
+                    else (handle.channel_linked_list,)
+                ),
+            )
         return (
             combined_x,
             None,
