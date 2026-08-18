@@ -1,15 +1,8 @@
 #include "environ.h"
 
 #include <algorithm>
-#include <cerrno>
-#include <cctype>
-#include <cmath>
 #include <iostream>
-#include <string_view>
 #include <thread>
-
-#include "bool_parser.h"
-#include "integer_parser.h"
 
 namespace mooncake {
 
@@ -41,9 +34,7 @@ Integer ReadInteger(const EnvironSource& source, const char* name,
         return default_value;
     }
 
-    const auto parsed = TryParseInteger<Integer>(
-        std::string_view(value),
-        {.trim_ascii_whitespace = true, .allow_leading_plus = true});
+    const auto parsed = TryParseEnvironmentValue<Integer>(value);
     if (parsed.has_value()) {
         return *parsed;
     }
@@ -74,15 +65,9 @@ double ReadDouble(const EnvironSource& source, const char* name,
         return default_value;
     }
 
-    char* end = nullptr;
-    errno = 0;
-    const double parsed = std::strtod(value, &end);
-    while (end != nullptr && std::isspace(static_cast<unsigned char>(*end))) {
-        ++end;
-    }
-    if (end != value && end != nullptr && *end == '\0' && errno != ERANGE &&
-        std::isfinite(parsed)) {
-        return parsed;
+    const auto parsed = TryParseEnvironmentValue<double>(value);
+    if (parsed.has_value()) {
+        return *parsed;
     }
 
     std::cerr << "[Mooncake] Warning: invalid value '" << value << "' for env "
@@ -97,7 +82,7 @@ bool ReadBool(const EnvironSource& source, const char* name,
         return default_value;
     }
 
-    const auto parsed = TryParseBool(value);
+    const auto parsed = TryParseEnvironmentValue<bool>(value);
     if (parsed.has_value()) {
         return *parsed;
     }

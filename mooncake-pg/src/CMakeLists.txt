@@ -1,10 +1,14 @@
 set(_pg_device_source "${CMAKE_CURRENT_SOURCE_DIR}/mooncake_worker.cu")
 if(USE_CUDA)
-  # Preserve the existing sm_80/sm_90 coverage unless the caller selects
+  # Preserve the existing sm_80/sm_90 coverage on CUDA 12 unless the caller selects
   # architectures through CMake's standard variable or CUDAARCHS environment.
   if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES AND
      "$ENV{CUDAARCHS}" STREQUAL "")
-    set(CMAKE_CUDA_ARCHITECTURES 80-real 90-real)
+    if(CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.0")
+      set(CMAKE_CUDA_ARCHITECTURES 80-real 90-real 103-real)
+    else()
+      set(CMAKE_CUDA_ARCHITECTURES 80-real 90-real)
+    endif()
   endif()
   enable_language(CUDA)
   set(_pg_device_input "${_pg_device_source}")

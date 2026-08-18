@@ -63,7 +63,18 @@ class CoroRpcAgent {
    public:
     using Function = std::function<void(const std::string_view & /* request */,
                                         std::string & /* response */)>;
-    Status registerFunction(int func_id, const Function &func);
+
+    // Handlers run on the single io_context (kRpcThreads), so a blocking one
+    // stalls every connection, not just its own.
+    //
+    // offload=false (default): inline, no thread hop. Right for anything that
+    // returns promptly.
+    // offload=true: runs on ylt's blocking executor while the connection
+    // coroutine suspends, keeping the io_context free. Callers see the same
+    // request/response, but ordering within a connection is no longer
+    // guaranteed.
+    Status registerFunction(int func_id, const Function &func,
+                            bool offload = false);
 
     Status start(uint16_t &port, bool ipv6 = false);
 
@@ -80,18 +91,23 @@ class CoroRpcAgent {
         std::string server_addr, int func_id, std::string request);
 
    private:
-    void process(int func_id);
+    async_simple::coro::Lazy<void> process(int func_id);
 
     std::shared_ptr<ClientPool> getOrCreatePool(const std::string &server_addr);
 
    private:
+    struct Handler {
+        Function func;
+        bool offload = false;
+    };
+
     coro_rpc::coro_rpc_server *server_ = nullptr;
 
     std::mutex pools_mutex_;
     std::unordered_map<std::string, std::shared_ptr<ClientPool>> pools_;
 
     std::mutex func_map_mutex_;
-    std::unordered_map<int, Function> func_map_;
+    std::unordered_map<int, Handler> func_map_;
 
     std::atomic<bool> running_{false};
     constexpr static size_t kRpcThreads = 1;

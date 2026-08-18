@@ -40,6 +40,18 @@ int GetTestPort(std::unordered_set<int>& used_ports) {
     return -1;
 }
 
+size_t CountOccurrences(const std::string& text, const std::string& needle) {
+    if (needle.empty()) return 0;
+
+    size_t count = 0;
+    size_t position = 0;
+    while ((position = text.find(needle, position)) != std::string::npos) {
+        ++count;
+        position += needle.size();
+    }
+    return count;
+}
+
 class ScopedEnv {
    public:
     explicit ScopedEnv(const char* name) : name_(name) {
@@ -248,6 +260,34 @@ TEST_F(ClientMetricsTest, CompareWithSerializedMetrics) {
                 summary.find("No data") != std::string::npos);
     EXPECT_TRUE(summary.find("max<") != std::string::npos ||
                 summary.find("No data") != std::string::npos);
+}
+
+TEST_F(ClientMetricsTest, HybridHistogramSerializesEachLabelOnce) {
+    ylt::metric::hybrid_histogram_1t histogram(
+        "request_latency", "Request latency", {10.0, 20.0}, {}, {"route"});
+    histogram.observe({"alpha"}, 5);
+    histogram.observe({"beta"}, 15);
+
+    std::string serialized;
+    histogram.serialize(serialized);
+
+    EXPECT_EQ(
+        CountOccurrences(serialized, "request_latency_bucket{route=\"alpha\","),
+        3);
+    EXPECT_EQ(
+        CountOccurrences(serialized, "request_latency_bucket{route=\"beta\","),
+        3);
+}
+
+TEST_F(ClientMetricsTest, ZeroSumHybridHistogramPreservesExistingMetrics) {
+    ylt::metric::hybrid_histogram_1t histogram(
+        "request_latency", "Request latency", {10.0}, {}, {"route"});
+    histogram.observe({"idle"}, 0);
+    std::string serialized = "existing_metric 1\n";
+
+    histogram.serialize(serialized);
+
+    EXPECT_EQ(serialized, "existing_metric 1\n");
 }
 
 TEST_F(ClientMetricsTest, BandwidthSummaryRespectsEnvFlag) {

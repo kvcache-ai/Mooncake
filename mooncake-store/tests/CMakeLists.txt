@@ -60,6 +60,7 @@ add_store_test(master_scenario_test master_scenario.cpp
                master_scenario_test.cpp)
 add_store_test(master_service_scenario_test master_scenario.cpp
                master_service_scenario_test.cpp)
+add_store_test(config_helper_test config_helper_test.cpp)
 add_store_test(master_service_config_test master_service_config_test.cpp)
 add_store_test(master_service_processing_key_double_erase_test
                master_service_processing_key_double_erase_test.cpp)
@@ -69,6 +70,7 @@ add_store_test(batch_remove_test batch_remove_test.cpp)
 add_store_test(master_service_ssd_test master_service_ssd_test.cpp)
 add_store_test(offload_on_evict_test offload_on_evict_test.cpp)
 add_store_test(promotion_on_hit_test promotion_on_hit_test.cpp)
+add_store_test(dynamic_replication_test dynamic_replication_test.cpp)
 add_store_test(file_storage_promotion_test file_storage_promotion_test.cpp)
 add_store_test(master_service_ssd_test_for_snapshot
                ha/snapshot/master_service_ssd_test_for_snapshot.cpp)
@@ -118,6 +120,12 @@ add_store_test(tenant_quota_test tenant_quota_test.cpp)
 add_store_test(tenant_quota_ledger_test tenant_quota_ledger_test.cpp)
 add_store_test(tenant_id_test tenant_id_test.cpp)
 add_store_test(segment_test segment_test.cpp)
+add_executable(local_ssd_test local_ssd/local_ssd_test.cpp)
+target_include_directories(local_ssd_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(local_ssd_test PRIVATE mooncake_local_ssd gtest
+                                             gtest_main)
+add_test(NAME local_ssd_test COMMAND local_ssd_test)
+add_store_test(local_ssd_codec_test ha/snapshot/local_ssd_codec_test.cpp)
 add_store_test(offset_allocator_test offset_allocator_test.cpp)
 add_store_test(utils_test utils_test.cpp)
 add_store_test(client_buffer_test client_buffer_test.cpp)

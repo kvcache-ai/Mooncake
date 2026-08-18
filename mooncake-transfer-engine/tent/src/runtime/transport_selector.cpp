@@ -42,6 +42,15 @@ static const std::unordered_map<std::string, IntentType> kIntentTypeNameMap = {
     {"staging_internal", IntentType::STAGING_INTERNAL},
 };
 
+static std::string joinNames(const std::vector<std::string>& names) {
+    std::string out;
+    for (const auto& name : names) {
+        if (!out.empty()) out += ", ";
+        out += name;
+    }
+    return out;
+}
+
 static std::optional<IntentType> parseIntentType(const json& value) {
     if (value.is_string()) {
         auto name = value.get<std::string>();
@@ -269,16 +278,84 @@ void TransportSelector::loadPolicies() {
             }
         }
 
-        policies_.push_back(std::move(policy));
+        // Link-layer QoS is defined on the QP pool, not on the policy: a QP
+        // carries the SL/TC of the pool it was created in, and a policy only
+        // selects a pool by name. These fields are a superseded duplicate that
+        // nothing reads, so say where the values actually belong.
+        if (policy.service_level || policy.traffic_class) {
+            LOG(WARNING)
+                << "Transport policy " << policy.name
+                << " sets service_level/traffic_class, which have NO effect "
+                   "here. Link-layer QoS belongs to the QP pool: define it in "
+                   "transports/rdma/endpoint/qp_pools and point this policy at "
+                   "it with \"qp_pool\": \"<name>\". Otherwise its traffic "
+                   "runs with the global transports/rdma SL/TC.";
+        }
+
         LOG(INFO) << "Loaded transport policy: " << policy.name
                   << " (segment_type=" << segment_type_str
                   << ", transports_count=" << policy.transports.size() << ")";
+        policies_.push_back(std::move(policy));
     }
 }
 
 TransportSelector::TransportSelector(std::shared_ptr<Config> config)
     : config_(config) {
     loadPolicies();
+}
+
+void TransportSelector::resolveDeviceMasks() {
+    for (auto& policy : policies_) {
+        // Unconditional: a mask resolved against a topology we no longer hold
+        // would keep naming NIC ids that now mean something else.
+        if (!topology_ || policy.devices.empty()) {
+            policy.resolved_device_mask = ~0ULL;
+            continue;
+        }
+        uint64_t mask = 0;
+        std::vector<std::string> unresolved;
+        for (const auto& name : policy.devices) {
+            int dev_id = topology_->getNicId(name);
+            if (dev_id < 0) {
+                unresolved.push_back(name + " (no such device)");
+            } else if (dev_id >= kDeviceMaskBits) {
+                // The NIC exists but sits past the mask width, so no policy
+                // can ever name it. Say so explicitly: "not found" would send
+                // the operator looking for a typo that is not there.
+                unresolved.push_back(
+                    name + " (index " + std::to_string(dev_id) +
+                    " >= " + std::to_string(kDeviceMaskBits) + ")");
+            } else {
+                mask |= (1ULL << dev_id);
+            }
+        }
+
+        if (mask == 0) {
+            // Fail open, as before — a typo must not stop transfers. But an
+            // ignored device filter is the opposite of what it was written
+            // for, so it is an error, reported once with every name that
+            // failed rather than once per request.
+            policy.resolved_device_mask = ~0ULL;
+            LOG(ERROR) << "Transport policy " << policy.name
+                       << ": no device in its list resolved, so the device "
+                          "restriction is IGNORED and all devices are allowed. "
+                          "Unresolved: "
+                       << joinNames(unresolved);
+            continue;
+        }
+
+        policy.resolved_device_mask = mask;
+        if (!unresolved.empty()) {
+            LOG(WARNING) << "Transport policy " << policy.name
+                         << ": ignoring unresolved devices: "
+                         << joinNames(unresolved);
+        }
+    }
+}
+
+void TransportSelector::setTopology(std::shared_ptr<Topology> topology) {
+    topology_ = std::move(topology);
+    resolveDeviceMasks();
 }
 
 bool TransportSelector::matchesMemoryPattern(const std::string& pattern,
@@ -463,29 +540,17 @@ SelectionResult TransportSelector::select(
         return result;  // UNSPEC, all devices
     }
 
-    // Carry the matched policy's link-layer QoS out to the caller (RFC #2519 /
-    // #2568, step 1). These are plumbed but not yet applied at QP setup; that
-    // is the per-class QP pool follow-up (step 2).
+    // qp_pool is what actually routes: it picks the QP pool, and the pool's
+    // own SL/TC were applied when those QPs were set up. The two SL/TC fields
+    // below are carried for diagnostics only (see SelectionPolicy).
     result.service_level = matching_policy->service_level;
     result.traffic_class = matching_policy->traffic_class;
     result.qp_pool = matching_policy->qp_pool;
 
-    // Convert device names to mask
-    result.device_mask = ~0ULL;  // Default: all devices
-    if (!matching_policy->devices.empty() && topology_) {
-        result.device_mask = 0;
-        for (const auto& name : matching_policy->devices) {
-            int dev_id = topology_->getNicId(name);
-            if (dev_id >= 0 && dev_id < 64) {
-                result.device_mask |= (1ULL << dev_id);
-            } else {
-                LOG(WARNING) << "RDMA device not found or ID >= 64: " << name;
-            }
-        }
-        if (result.device_mask == 0) {
-            result.device_mask = ~0ULL;  // Fallback to all if none found
-        }
-    }
+    // Resolved once by setTopology(), not per request: the names and the
+    // topology are both fixed by then, and repeating the lookup here also
+    // repeated its diagnostics on every single select().
+    result.device_mask = matching_policy->resolved_device_mask;
 
     // The "raw" candidate set is whatever the matching policy authorizes:
     // the policy's explicit transports list, or the buffer's registered

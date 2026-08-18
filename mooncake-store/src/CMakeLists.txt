@@ -1,4 +1,5 @@
 add_subdirectory(cachelib_memory_allocator)
+add_subdirectory(local_ssd)
 
 set(MOONCAKE_STORE_SHARED_SOURCES
     types.cpp
@@ -12,6 +13,7 @@ set(MOONCAKE_STORE_SHARED_SOURCES
     utils/file_util.cpp)
 
 set(MOONCAKE_STORE_MASTER_SOURCES
+    allocation_strategy.cpp
     allocator.cpp
     master_service.cpp
     master_snapshot_manager.cpp
@@ -37,6 +39,7 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     ha/snapshot/catalog_backed_snapshot_provider.cpp
     ha/snapshot/batch_oplog/metadata.cpp
     ha/snapshot/master_snapshot_codec.cpp
+    ha/snapshot/local_ssd_codec.cpp
     ha/snapshot/object/snapshot_object_store.cpp
     ha/snapshot/object/backends/local/local_file_snapshot_object_store.cpp
     ha/snapshot/object/backends/s3/s3_snapshot_object_store.cpp
@@ -327,6 +330,7 @@ target_include_directories(mooncake_store_master_objects
 target_link_libraries(
   mooncake_store_master_objects
   PRIVATE mooncake_store_shared_objects
+          mooncake_local_ssd
           transfer_metadata_plugin
           cachelib_memory_allocator
           glog::glog
@@ -422,7 +426,8 @@ target_include_directories(mooncake_store_master
                            PUBLIC ${MOONCAKE_STORE_INCLUDE_DIRS})
 target_link_libraries(
   mooncake_store_master
-  PRIVATE cachelib_memory_allocator
+  PRIVATE mooncake_local_ssd
+          cachelib_memory_allocator
           ${ETCD_WRAPPER_LIB}
           glog::glog
           ${EXTRA_LIBS}
@@ -455,7 +460,8 @@ add_library(
 target_include_directories(mooncake_store PUBLIC ${MOONCAKE_STORE_INCLUDE_DIRS})
 target_link_libraries(
   mooncake_store
-  PUBLIC cachelib_memory_allocator
+  PUBLIC mooncake_local_ssd
+         cachelib_memory_allocator
          ${ETCD_WRAPPER_LIB}
          glog::glog
          ${EXTRA_LIBS}
