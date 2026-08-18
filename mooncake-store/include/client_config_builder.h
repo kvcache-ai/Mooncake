@@ -259,7 +259,8 @@ class ClientConfigBuilder {
         const std::string& redis_cluster_id = DEFAULT_CLUSTER_ID,
         const std::string& redis_password = "", int redis_db_index = 0,
         int redis_master_view_ttl_sec = 4, int redis_heartbeat_interval_sec = 1,
-        const std::string& redis_username = "") {
+        const std::string& redis_username = "",
+        uint16_t heartbeat_rpc_port = 0) {
         CentralizedClientConfig config;
         fill_real_client_config_base(
             config, local_hostname, metadata_connstring, protocol, rdma_devices,
@@ -274,6 +275,7 @@ class ClientConfigBuilder {
         config.global_segment_size = global_segment_size;
         config.enable_offload = enable_offload;
         config.local_rpc_port = local_rpc_port;
+        config.heartbeat_rpc_port = heartbeat_rpc_port;
         return config;
     }
 
@@ -352,7 +354,8 @@ class ClientConfigBuilder {
         const std::string& redis_cluster_id = DEFAULT_CLUSTER_ID,
         const std::string& redis_password = "", int redis_db_index = 0,
         int redis_master_view_ttl_sec = 4, int redis_heartbeat_interval_sec = 1,
-        const std::string& redis_username = "") {
+        const std::string& redis_username = "",
+        uint16_t heartbeat_rpc_port = 0) {
         P2PClientConfig config;
         fill_real_client_config_base(
             config, local_hostname, metadata_connstring, protocol, rdma_devices,
@@ -400,6 +403,7 @@ class ClientConfigBuilder {
         config.transfer_direction_mode =
             parse_p2p_transfer_direction_mode(p2p_transfer_direction_mode);
 
+        config.heartbeat_rpc_port = heartbeat_rpc_port;
         return config;
     }
 
