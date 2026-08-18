@@ -118,5 +118,30 @@ class TestMooncakeConfig(unittest.TestCase):
             MooncakeConfig.load_from_env()
         self.assertIn("Neither the environment variable 'MOONCAKE_CONFIG_PATH' nor 'MOONCAKE_MASTER' is set.", str(cm.exception))
 
+    def test_heartbeat_rpc_port_default_and_from_file(self):
+        """heartbeat_rpc_port defaults to 0 and is read from config file."""
+        # Default when absent.
+        self.write_config(self.valid_config)
+        config = MooncakeConfig.from_file(self.config_file)
+        self.assertEqual(config.heartbeat_rpc_port, 0)
+
+        # Read when present.
+        cfg = self.valid_config.copy()
+        cfg["heartbeat_rpc_port"] = 50099
+        self.write_config(cfg)
+        config = MooncakeConfig.from_file(self.config_file)
+        self.assertEqual(config.heartbeat_rpc_port, 50099)
+
+    def test_heartbeat_rpc_port_from_env(self):
+        """heartbeat_rpc_port is read from MOONCAKE_HEARTBEAT_RPC_PORT."""
+        os.environ['MOONCAKE_MASTER'] = self.valid_config["master_server_address"]
+        os.environ['MOONCAKE_HEARTBEAT_RPC_PORT'] = '50099'
+        try:
+            config = MooncakeConfig.load_from_env()
+            self.assertEqual(config.heartbeat_rpc_port, 50099)
+        finally:
+            del os.environ['MOONCAKE_MASTER']
+            del os.environ['MOONCAKE_HEARTBEAT_RPC_PORT']
+
 if __name__ == '__main__':
     unittest.main()
