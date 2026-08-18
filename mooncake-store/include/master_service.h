@@ -1536,6 +1536,7 @@ class MasterService {
         UUID dynamic_replication_lease_id{};
         uint64_t dynamic_replication_version_epoch{0};
         bool durable_cleanup_pending{false};
+        bool source_removed{false};
     };
 
     struct OffloadingTask {
@@ -2071,6 +2072,10 @@ class MasterService {
         TenantState& tenant_state, ObjectMetadata& metadata,
         const std::vector<ReplicaID>& removed_replica_ids)
         NO_THREAD_SAFETY_ANALYSIS;
+    void CancelReplicationTaskForRemovedSource(
+        TenantState& tenant_state, ObjectMetadata& metadata,
+        const std::vector<ReplicaID>& removed_replica_ids)
+        NO_THREAD_SAFETY_ANALYSIS;
 
     // Lease related members
     const uint64_t default_kv_lease_ttl_;     // in milliseconds
@@ -2172,8 +2177,14 @@ class MasterService {
                             << ", bytes=" << before_charge - after_charge;
                     }
                 }
-                // If no valid replicas remain, delete the whole object.
-                if (!it_->second.IsValid()) {
+                // If no valid replicas remain, delete the whole object unless
+                // a cancelled replication task still preserves End/Revoke
+                // protocol semantics.
+                const bool preserve_cancelled_replication =
+                    replication_task_it_ !=
+                        tenant_state_->replication_tasks.end() &&
+                    replication_task_it_->second.source_removed;
+                if (!it_->second.IsValid() && !preserve_cancelled_replication) {
                     // NOTE: Erase() -> EraseMetadata() already removes the key
                     // from processing_keys (by key), so calling
                     // EraseFromProcessing() here would re-erase the same node

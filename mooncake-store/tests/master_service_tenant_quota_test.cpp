@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <future>
 #include <fstream>
@@ -18,10 +19,89 @@
 #include <unistd.h>
 
 #include "allocation_strategy.h"
+#include "ha/kv/ha_kv_backend.h"
 #include "tenant_quota_policy_store.h"
 #include "types.h"
 
 namespace mooncake::test {
+
+class BlockingQuotaOpLogBackend final : public HaKvBackend {
+   public:
+    ErrorCode Get(std::string_view key, std::string& value) override {
+        std::lock_guard lock(kvs_mutex_);
+        auto it = kvs_.find(std::string(key));
+        if (it == kvs_.end()) {
+            return ErrorCode::ETCD_KEY_NOT_EXIST;
+        }
+        value = it->second;
+        return ErrorCode::OK;
+    }
+
+    ErrorCode Put(std::string_view key, std::string_view value) override {
+        std::lock_guard lock(kvs_mutex_);
+        kvs_[std::string(key)] = std::string(value);
+        return ErrorCode::OK;
+    }
+
+    ErrorCode Range(std::string_view begin_key, std::string_view end_key,
+                    size_t limit, std::vector<KvPair>& kvs) override {
+        std::lock_guard lock(kvs_mutex_);
+        kvs.clear();
+        for (auto it = kvs_.lower_bound(std::string(begin_key));
+             it != kvs_.end() && it->first < end_key; ++it) {
+            kvs.push_back({.key = it->first, .value = it->second});
+            if (limit != 0 && kvs.size() >= limit) {
+                break;
+            }
+        }
+        return ErrorCode::OK;
+    }
+
+    bool SupportsTxn() const override { return true; }
+
+    ErrorCode Txn(const KvTxn& txn) override {
+        {
+            std::unique_lock lock(block_mutex_);
+            block_cv_.wait(lock, [this] { return !blocked_; });
+        }
+        std::lock_guard lock(kvs_mutex_);
+        for (const auto& compare : txn.compares) {
+            auto it = kvs_.find(compare.key);
+            if (compare.kind == KvCompareKind::kKeyNotExists) {
+                if (it != kvs_.end()) {
+                    return ErrorCode::ETCD_TRANSACTION_FAIL;
+                }
+            } else if (it == kvs_.end() ||
+                       it->second != compare.expected_value) {
+                return ErrorCode::ETCD_TRANSACTION_FAIL;
+            }
+        }
+        for (const auto& put : txn.puts) {
+            kvs_[put.key] = put.value;
+        }
+        return ErrorCode::OK;
+    }
+
+    void BlockTransactions() {
+        std::lock_guard lock(block_mutex_);
+        blocked_ = true;
+    }
+
+    void AllowTransactions() {
+        {
+            std::lock_guard lock(block_mutex_);
+            blocked_ = false;
+        }
+        block_cv_.notify_all();
+    }
+
+   private:
+    std::mutex kvs_mutex_;
+    std::map<std::string, std::string> kvs_;
+    std::mutex block_mutex_;
+    std::condition_variable block_cv_;
+    bool blocked_{false};
+};
 
 class BlockingTenantQuotaPolicyStore final : public TenantQuotaPolicyStore {
    public:
@@ -136,7 +216,8 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
     }
 
     UUID MountSegment(MasterService& service, size_t size = 4096,
-                      std::string name = "quota_segment") {
+                      std::string name = "quota_segment",
+                      UUID* segment_id = nullptr) {
         Segment segment;
         segment.id = generate_uuid();
         segment.name = std::move(name);
@@ -148,6 +229,7 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         UUID client_id = generate_uuid();
         auto result = service.MountSegment(segment, client_id);
         EXPECT_TRUE(result.has_value()) << toString(result.error());
+        if (segment_id != nullptr) *segment_id = segment.id;
         return client_id;
     }
 
@@ -191,6 +273,27 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         auto snapshot = service.GetTenantQuotaSnapshot(tenant_id);
         EXPECT_TRUE(snapshot.has_value());
         return *snapshot;
+    }
+
+    bool HasReplicationTask(MasterService& service, const TenantId& tenant_id,
+                            const std::string& key) {
+        const size_t shard_index =
+            service.getMetadataShardIndex(tenant_id, key);
+        MasterService::MetadataShardAccessorRO shard(&service, shard_index);
+        auto tenant_it = shard->tenants.find(tenant_id);
+        return tenant_it != shard->tenants.end() &&
+               tenant_it->second.replication_tasks.contains(key);
+    }
+
+    bool WaitForChargedBytes(MasterService& service, const TenantId& tenant_id,
+                             uint64_t expected) {
+        for (int attempt = 0; attempt < 200; ++attempt) {
+            if (Snapshot(service, tenant_id).charged_bytes == expected) {
+                return true;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return false;
     }
 
     void ReloadTenantQuotaPolicyFromStore(MasterService& service) {
@@ -948,6 +1051,121 @@ TEST_F(MasterServiceTenantQuotaTest, MoveEndSettlesToFinalReplicaCharge) {
     ASSERT_TRUE(
         service.MoveEnd(client_id, "key", TenantId("tenant-a")).has_value());
     EXPECT_EQ(Snapshot(service, TenantId("tenant-a")).charged_bytes, 100);
+}
+
+TEST_F(MasterServiceTenantQuotaTest,
+       CopySourceCleanupReleasesTargetAndReservedQuota) {
+    MasterService service(MakeConfig({{TenantId("tenant-a"), 200}}));
+    UUID source_segment_id;
+    UUID source_client =
+        MountSegment(service, 4096, "segment-a", &source_segment_id);
+    MountSegment(service, 4096, "segment-b");
+
+    ReplicateConfig config = MemoryConfig();
+    config.preferred_segment = "segment-a";
+    ASSERT_TRUE(
+        service
+            .PutStart(source_client, "key", TenantId("tenant-a"), 100, config)
+            .has_value());
+    ASSERT_TRUE(service
+                    .PutEnd(source_client, "key", TenantId("tenant-a"),
+                            ReplicaType::MEMORY)
+                    .has_value());
+    ASSERT_TRUE(service
+                    .CopyStart(source_client, "key", TenantId("tenant-a"),
+                               "segment-a", {"segment-b"})
+                    .has_value());
+    EXPECT_EQ(Snapshot(service, TenantId("tenant-a")).charged_bytes, 200);
+
+    ASSERT_TRUE(
+        service.UnmountSegment(source_segment_id, source_client).has_value());
+    ASSERT_TRUE(WaitForChargedBytes(service, TenantId("tenant-a"), 0));
+    auto copy_end = service.CopyEnd(source_client, "key", TenantId("tenant-a"));
+    ASSERT_FALSE(copy_end.has_value());
+    EXPECT_EQ(copy_end.error(), ErrorCode::REPLICA_IS_GONE);
+    EXPECT_FALSE(HasReplicationTask(service, TenantId("tenant-a"), "key"));
+    PutComplete(service, source_client, "replacement", TenantId("tenant-a"),
+                200);
+}
+
+TEST_F(MasterServiceTenantQuotaTest,
+       MoveSourceCleanupReleasesTargetAndReservedQuota) {
+    MasterService service(MakeConfig({{TenantId("tenant-a"), 200}}));
+    UUID source_segment_id;
+    UUID source_client =
+        MountSegment(service, 4096, "segment-a", &source_segment_id);
+    MountSegment(service, 4096, "segment-b");
+
+    ReplicateConfig config = MemoryConfig();
+    config.preferred_segment = "segment-a";
+    ASSERT_TRUE(
+        service
+            .PutStart(source_client, "key", TenantId("tenant-a"), 100, config)
+            .has_value());
+    ASSERT_TRUE(service
+                    .PutEnd(source_client, "key", TenantId("tenant-a"),
+                            ReplicaType::MEMORY)
+                    .has_value());
+    ASSERT_TRUE(service
+                    .MoveStart(source_client, "key", TenantId("tenant-a"),
+                               "segment-a", "segment-b")
+                    .has_value());
+    EXPECT_EQ(Snapshot(service, TenantId("tenant-a")).charged_bytes, 200);
+
+    ASSERT_TRUE(
+        service.UnmountSegment(source_segment_id, source_client).has_value());
+    ASSERT_TRUE(WaitForChargedBytes(service, TenantId("tenant-a"), 0));
+    ASSERT_TRUE(service.MoveRevoke(source_client, "key", TenantId("tenant-a"))
+                    .has_value());
+    EXPECT_FALSE(HasReplicationTask(service, TenantId("tenant-a"), "key"));
+    PutComplete(service, source_client, "replacement", TenantId("tenant-a"),
+                200);
+}
+
+TEST_F(MasterServiceTenantQuotaTest, CopySourceCleanupWaitsForOpLogDurability) {
+    auto config = MakeConfig({{TenantId("tenant-a"), 200}});
+    config.enable_ha = true;
+    config.enable_oplog = true;
+    config.cluster_id = "quota_copy_source_cleanup";
+    config.oplog_batch_max_entries = 16;
+    MasterService service(config);
+    auto backend = std::make_shared<BlockingQuotaOpLogBackend>();
+    ASSERT_EQ(service.SetBatchOpLogBackendForTesting(backend), ErrorCode::OK);
+
+    UUID source_segment_id;
+    UUID source_client =
+        MountSegment(service, 4096, "segment-a", &source_segment_id);
+    MountSegment(service, 4096, "segment-b");
+
+    ReplicateConfig replicate_config = MemoryConfig();
+    replicate_config.preferred_segment = "segment-a";
+    ASSERT_TRUE(service
+                    .PutStart(source_client, "key", TenantId("tenant-a"), 100,
+                              replicate_config)
+                    .has_value());
+    ASSERT_TRUE(service
+                    .PutEnd(source_client, "key", TenantId("tenant-a"),
+                            ReplicaType::MEMORY)
+                    .has_value());
+    ASSERT_TRUE(service
+                    .CopyStart(source_client, "key", TenantId("tenant-a"),
+                               "segment-a", {"segment-b"})
+                    .has_value());
+    EXPECT_EQ(Snapshot(service, TenantId("tenant-a")).charged_bytes, 200);
+
+    backend->BlockTransactions();
+    ASSERT_TRUE(
+        service.UnmountSegment(source_segment_id, source_client).has_value());
+    EXPECT_EQ(Snapshot(service, TenantId("tenant-a")).charged_bytes, 200);
+
+    backend->AllowTransactions();
+    ASSERT_TRUE(WaitForChargedBytes(service, TenantId("tenant-a"), 0));
+    auto copy_end = service.CopyEnd(source_client, "key", TenantId("tenant-a"));
+    ASSERT_FALSE(copy_end.has_value());
+    EXPECT_EQ(copy_end.error(), ErrorCode::REPLICA_IS_GONE);
+    EXPECT_FALSE(HasReplicationTask(service, TenantId("tenant-a"), "key"));
+    PutComplete(service, source_client, "replacement", TenantId("tenant-a"),
+                200);
 }
 
 TEST_F(MasterServiceTenantQuotaTest, DeletePolicyRequiresTenantWithoutObjects) {

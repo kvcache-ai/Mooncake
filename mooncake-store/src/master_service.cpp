@@ -1876,7 +1876,14 @@ void MasterService::FinalizeRemovedReplicasAfterDurable(
     }
     CancelPromotionTaskForRemovedReplicas(tenant_state, metadata,
                                           erased_replica_ids);
+    CancelReplicationTaskForRemovedSource(tenant_state, metadata,
+                                          erased_replica_ids);
     if (!metadata.IsValid()) {
+        auto task_it = tenant_state.replication_tasks.find(metadata.user_key);
+        if (task_it != tenant_state.replication_tasks.end() &&
+            task_it->second.source_removed) {
+            return;
+        }
         EraseMetadata(tenant_state, metadata_it, tenant_id, quota_mode, &shard);
         if (tenant_state.Empty()) {
             shard->tenants.erase(tenant_it);
@@ -2545,6 +2552,13 @@ void MasterService::ClearStaleHandles(
                         ++it;
                     }
                 } else if (!it->second.IsValid()) {
+                    auto task_it = tenant_state.replication_tasks.find(
+                        it->second.user_key);
+                    if (task_it != tenant_state.replication_tasks.end() &&
+                        task_it->second.source_removed) {
+                        ++it;
+                        continue;
+                    }
                     if (enable_ha_) {
                         if (enable_oplog_) {
                             auto persist_result =
@@ -5797,7 +5811,8 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRW accessor(this,
                                 MakeObjectIdentityForRequest(key, tenant_id));
-    if (!accessor.Exists()) {
+    const bool object_exists = accessor.Exists();
+    if (!object_exists && !accessor.HasReplicationTask()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
@@ -5828,6 +5843,10 @@ tl::expected<void, ErrorCode> MasterService::CopyEnd(
         LOG(ERROR) << "key=" << key
                    << ", error=dynamic_replication_token_mismatch";
         return tl::make_unexpected(ErrorCode::INVALID_VERSION);
+    }
+    if (!object_exists && task.source_removed) {
+        accessor.Erase();
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
     }
 
     auto& metadata = accessor.Get();
@@ -5969,7 +5988,8 @@ tl::expected<void, ErrorCode> MasterService::CopyRevoke(
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRW accessor(this,
                                 MakeObjectIdentityForRequest(key, tenant_id));
-    if (!accessor.Exists()) {
+    const bool object_exists = accessor.Exists();
+    if (!object_exists && !accessor.HasReplicationTask()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
@@ -6000,6 +6020,10 @@ tl::expected<void, ErrorCode> MasterService::CopyRevoke(
         LOG(ERROR) << "key=" << key
                    << ", error=dynamic_replication_token_mismatch";
         return tl::make_unexpected(ErrorCode::INVALID_VERSION);
+    }
+    if (!object_exists && task.source_removed) {
+        accessor.Erase();
+        return {};
     }
 
     auto& metadata = accessor.Get();
@@ -6166,7 +6190,8 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRW accessor(this,
                                 MakeObjectIdentityForRequest(key, tenant_id));
-    if (!accessor.Exists()) {
+    const bool object_exists = accessor.Exists();
+    if (!object_exists && !accessor.HasReplicationTask()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
@@ -6187,6 +6212,10 @@ tl::expected<void, ErrorCode> MasterService::MoveEnd(
     if (task.type != ReplicationTask::Type::MOVE) {
         LOG(ERROR) << "Ongoing replication task type is COPY instead of MOVE";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!object_exists && task.source_removed) {
+        accessor.Erase();
+        return tl::make_unexpected(ErrorCode::REPLICA_IS_GONE);
     }
 
     auto& metadata = accessor.Get();
@@ -6351,7 +6380,8 @@ tl::expected<void, ErrorCode> MasterService::MoveRevoke(
     std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
     MetadataAccessorRW accessor(this,
                                 MakeObjectIdentityForRequest(key, tenant_id));
-    if (!accessor.Exists()) {
+    const bool object_exists = accessor.Exists();
+    if (!object_exists && !accessor.HasReplicationTask()) {
         LOG(ERROR) << "key=" << key << ", error=object_not_found";
         return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
     }
@@ -6372,6 +6402,10 @@ tl::expected<void, ErrorCode> MasterService::MoveRevoke(
     if (task.type != ReplicationTask::Type::MOVE) {
         LOG(ERROR) << "Ongoing replication task type is COPY instead of MOVE";
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (!object_exists && task.source_removed) {
+        accessor.Erase();
+        return {};
     }
 
     auto& metadata = accessor.Get();
@@ -6937,6 +6971,32 @@ void MasterService::CancelPromotionTaskForRemovedReplicas(
                                        metadata.user_key);
 }
 
+void MasterService::CancelReplicationTaskForRemovedSource(
+    TenantState& tenant_state, ObjectMetadata& metadata,
+    const std::vector<ReplicaID>& removed_replica_ids) {
+    if (removed_replica_ids.empty()) return;
+
+    auto task_it = tenant_state.replication_tasks.find(metadata.user_key);
+    if (task_it == tenant_state.replication_tasks.end() ||
+        std::find(removed_replica_ids.begin(), removed_replica_ids.end(),
+                  task_it->second.source_id) == removed_replica_ids.end()) {
+        return;
+    }
+
+    const auto target_ids = task_it->second.replica_ids;
+    EraseReplicasWithCacheTotalAccounting(
+        metadata, [&target_ids](const Replica& replica) {
+            return std::find(target_ids.begin(), target_ids.end(),
+                             replica.id()) != target_ids.end();
+        });
+    ReleaseTenantQuota(GetBoundTenantQuotaHandle(tenant_state),
+                       task_it->second.pending_quota_charge_bytes);
+    task_it->second.pending_quota_charge_bytes = 0;
+    task_it->second.durable_cleanup_pending = false;
+    task_it->second.source_removed = true;
+    ClearDynamicReplicationStateForKey(tenant_state, metadata.user_key);
+}
+
 bool MasterService::CleanupStaleHandles(
     TenantState& tenant_state, ObjectMetadata& metadata,
     const std::unordered_set<UUID, boost::hash<UUID>>& alive_clients,
@@ -6970,6 +7030,8 @@ bool MasterService::CleanupStaleHandles(
                                           &removed_replica_ids);
     CancelPromotionTaskForRemovedReplicas(tenant_state, metadata,
                                           removed_replica_ids);
+    CancelReplicationTaskForRemovedSource(tenant_state, metadata,
+                                          removed_replica_ids);
     const uint64_t after_charge = CompletedMemoryQuotaCharge(metadata);
     if (enable_multi_tenants_ && before_charge > after_charge) {
         auto release_result = metadata.quota_ledger.ReleaseCommitted(
@@ -6985,8 +7047,11 @@ bool MasterService::CleanupStaleHandles(
         shard->OnDiskReplicaRemoved(had_completed_disk, metadata);
     }
 
-    // Return true if no valid replicas remain after cleanup
-    return !metadata.IsValid();
+    auto task_it = tenant_state.replication_tasks.find(metadata.user_key);
+    const bool preserve_cancelled_task =
+        task_it != tenant_state.replication_tasks.end() &&
+        task_it->second.source_removed;
+    return !metadata.IsValid() && !preserve_cancelled_task;
 }
 
 void MasterService::FreeDfsReplicas(const std::string& key,
