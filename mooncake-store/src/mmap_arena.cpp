@@ -185,23 +185,35 @@ void* MmapArena::allocate(size_t size, size_t alignment) {
     }
 
     size_t pool_size = pool_size_.load(std::memory_order_acquire);
+    const uintptr_t base_addr = reinterpret_cast<uintptr_t>(pool_base);
 
     // CAS loop: Reserve aligned space atomically with bounds check.
-    // We align the OFFSET (not just the size) so the returned pointer
-    // honours the caller's alignment contract even when the cursor sits
-    // at a non-aligned position from a previous smaller-alignment alloc.
+    // Align the absolute address, not only the offset. Regular-page mmap
+    // fallback does not guarantee the pool base itself is aligned to large
+    // caller-requested boundaries such as 2MB.
     size_t aligned_offset;
     size_t next;
     while (true) {
         size_t raw = alloc_cursor_.load(std::memory_order_relaxed);
 
-        // Align the offset up to effective_alignment
-        if (!safe_align_up(raw, effective_alignment, &aligned_offset)) {
+        if (raw > UINTPTR_MAX - base_addr) {
             num_failed_allocs_.fetch_add(1, std::memory_order_relaxed);
-            LOG(ERROR) << "Arena offset alignment overflow: raw=" << raw
+            LOG(ERROR) << "Arena address overflow: base=" << pool_base
+                       << ", raw=" << raw;
+            return nullptr;
+        }
+
+        size_t aligned_addr_size;
+        const uintptr_t raw_addr = base_addr + raw;
+        if (!safe_align_up(static_cast<size_t>(raw_addr), effective_alignment,
+                           &aligned_addr_size)) {
+            num_failed_allocs_.fetch_add(1, std::memory_order_relaxed);
+            LOG(ERROR) << "Arena address alignment overflow: raw=" << raw
+                       << ", base=" << pool_base
                        << ", alignment=" << effective_alignment;
             return nullptr;
         }
+        aligned_offset = aligned_addr_size - base_addr;
 
         next = aligned_offset + aligned_size;
 

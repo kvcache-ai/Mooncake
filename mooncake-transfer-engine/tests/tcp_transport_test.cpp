@@ -64,7 +64,7 @@ class TCPTransportTest : public ::testing::Test {
         if (env)
             metadata_server = env;
         else
-            metadata_server = metadata_server;
+            metadata_server = P2PHANDSHAKE;
         LOG(INFO) << "metadata_server: " << metadata_server;
 
         env = std::getenv("MC_LOCAL_SERVER_NAME");
@@ -102,6 +102,10 @@ TEST_F(TCPTransportTest, GetTcpTest) {
 }
 
 TEST_F(TCPTransportTest, Writetest) {
+    if (metadata_server == P2PHANDSHAKE) {
+        GTEST_SKIP() << "TCP write integration requires an external metadata "
+                        "server and reachable peer endpoint.";
+    }
     const size_t kDataLength = 4096000;
     void *addr = nullptr;
     const size_t ram_buffer_size = 1ull << 30;
@@ -147,6 +151,10 @@ TEST_F(TCPTransportTest, Writetest) {
 }
 
 TEST_F(TCPTransportTest, WriteAndReadtest) {
+    if (metadata_server == P2PHANDSHAKE) {
+        GTEST_SKIP() << "TCP read/write integration requires an external "
+                        "metadata server and reachable peer endpoint.";
+    }
     const size_t kDataLength = 4096000;
     void *addr = nullptr;
     const size_t ram_buffer_size = 1ull << 30;
@@ -219,6 +227,10 @@ TEST_F(TCPTransportTest, WriteAndReadtest) {
 }
 
 TEST_F(TCPTransportTest, WriteAndRead2test) {
+    if (metadata_server == P2PHANDSHAKE) {
+        GTEST_SKIP() << "TCP read/write integration requires an external "
+                        "metadata server and reachable peer endpoint.";
+    }
     const size_t kDataLength = 4096000;
     void *addr = nullptr;
     const size_t ram_buffer_size = 1ull << 30;
