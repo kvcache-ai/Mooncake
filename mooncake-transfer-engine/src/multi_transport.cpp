@@ -114,7 +114,8 @@ MultiTransport::BatchID MultiTransport::allocateBatchID(size_t batch_size) {
 Status MultiTransport::freeBatchID(BatchID batch_id) {
     std::lock_guard<std::mutex> guard(deferred_cleanup_mutex_);
     if (deferred_cleanup_batches_.count(batch_id) != 0) {
-        return Status::OK();
+        return Status::BatchBusy(
+            "BatchID cleanup is already deferred because the batch is busy");
     }
 
     Status status = tryFreeBatchID(batch_id);
@@ -124,18 +125,17 @@ Status MultiTransport::freeBatchID(BatchID batch_id) {
 
     deferred_cleanup_batches_.insert(batch_id);
     if (!deferred_cleanup_thread_.joinable()) {
-        // Start the cleanup worker lazily only after a timed-out or failed
-        // batch is still busy. TIMEOUT does not mean transport callbacks have
-        // stopped touching the batch, so immediate deletion can cause UAF; the
-        // worker retries reclamation off the hot path until callbacks make the
-        // batch terminal, while normal completed transfers never create it.
+        // Start the cleanup worker lazily after a caller observes BatchBusy.
+        // Deferred cleanup is only a safety net for timed-out or failed batches;
+        // freeBatchID still preserves the public contract that BatchBusy means
+        // transfer buffers may remain owned by in-flight transport work.
         deferred_cleanup_thread_ =
             std::thread(&MultiTransport::deferredCleanupLoop, this);
     }
     deferred_cleanup_cv_.notify_one();
     LOG(WARNING) << "Batch " << batch_id
                  << " is still busy; cleanup has been deferred";
-    return Status::OK();
+    return status;
 }
 
 Status MultiTransport::tryFreeBatchID(BatchID batch_id) {
@@ -156,14 +156,24 @@ Status MultiTransport::tryFreeBatchID(BatchID batch_id) {
         if (!query_status.ok()) {
             return query_status;
         }
-        // TIMEOUT does not guarantee that the transport callback has returned.
-        // Keep the batch alive until every slice reports completion or failure.
+        // A terminal transfer status only means the task published completion;
+        // event-driven completion callbacks may still be unwinding while
+        // holding raw BatchDesc access. Keep the batch alive until the explicit
+        // quiescence counter reaches zero below.
         if (status.s != Transport::TransferStatusEnum::COMPLETED &&
             status.s != Transport::TransferStatusEnum::FAILED) {
             return Status::BatchBusy(
                 "BatchID cannot be freed until all tasks are done");
         }
     }
+
+#ifdef USE_EVENT_DRIVEN_COMPLETION
+    if (batch_desc.active_completion_callbacks.load(std::memory_order_acquire) !=
+        0) {
+        return Status::BatchBusy(
+            "BatchID cannot be freed until completion callbacks are quiescent");
+    }
+#endif
 
     delete &batch_desc;
 #ifdef CONFIG_USE_BATCH_DESC_SET
