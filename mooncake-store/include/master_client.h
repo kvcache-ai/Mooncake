@@ -271,14 +271,6 @@ class MasterClient {
                 std::forward<Args>(args)...));
     }
 
-    template <auto ServiceMethod, typename ReturnType, typename... Args>
-    [[nodiscard]] tl::expected<ReturnType, ErrorCode> invoke_rpc_via(
-        RpcClientAccessor& accessor, Args&&... args) {
-        return async_simple::coro::syncAwait(
-            invoke_rpc_async_with_pool<ServiceMethod, ReturnType>(
-                accessor.GetClientPool(), std::forward<Args>(args)...));
-    }
-
     /**
      * @brief Generic RPC invocation helper for batch operations
      * @tparam ServiceMethod Pointer to WrappedMasterService member function
@@ -364,6 +356,13 @@ class MasterClient {
         std::shared_ptr<coro_io::client_pool<coro_rpc::coro_rpc_client>>
             client_pool_;
     };
+    template <auto ServiceMethod, typename ReturnType, typename... Args>
+    [[nodiscard]] tl::expected<ReturnType, ErrorCode> invoke_rpc_via(
+        RpcClientAccessor& accessor, Args&&... args) {
+        return async_simple::coro::syncAwait(
+            invoke_rpc_async_with_pool<ServiceMethod, ReturnType>(
+                accessor.GetClientPool(), std::forward<Args>(args)...));
+    }
 
    protected:
     RpcClientAccessor client_accessor_;
