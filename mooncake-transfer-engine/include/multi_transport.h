@@ -15,7 +15,12 @@
 #ifndef MULTI_TRANSPORT_H_
 #define MULTI_TRANSPORT_H_
 
+#include <condition_variable>
+#include <map>
+#include <mutex>
+#include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "transport/transport.h"
 
@@ -91,6 +96,10 @@ class MultiTransport {
 
     Status selectTransport(const TransferRequest &entry, Transport *&transport);
 
+    Status tryFreeBatchID(BatchID batch_id);
+
+    void deferredCleanupLoop();
+
 #ifdef ENABLE_MULTI_PROTOCOL
     Status mp_selectTransport(const TransferRequest &entry,
                               Transport *&transport,
@@ -103,6 +112,12 @@ class MultiTransport {
     std::map<std::string, std::shared_ptr<Transport>> transport_map_;
     RWSpinlock batch_desc_lock_;
     std::unordered_map<BatchID, std::shared_ptr<BatchDesc>> batch_desc_set_;
+
+    std::mutex deferred_cleanup_mutex_;
+    std::condition_variable deferred_cleanup_cv_;
+    std::unordered_set<BatchID> deferred_cleanup_batches_;
+    bool stop_deferred_cleanup_ = false;
+    std::thread deferred_cleanup_thread_;
 };
 }  // namespace mooncake
 
