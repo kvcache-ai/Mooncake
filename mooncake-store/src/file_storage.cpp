@@ -1,16 +1,11 @@
 #include "file_storage.h"
 
-#include <cmath>
-#include <locale>
 #include <memory>
 #include <optional>
-#include <sstream>
 #include <utility>
 #include <vector>
 
 #include "aligned_client_buffer.h"
-#include "bool_parser.h"
-#include "environ.h"
 #include "storage_backend.h"
 #include "storage/distributed/distributed_storage_backend.h"
 #include "client_metric.h"
@@ -23,47 +18,6 @@
 namespace mooncake {
 
 namespace {
-
-double ParseEnvRatioOr(const std::string& raw_value, double default_value) {
-    if (raw_value.empty()) {
-        return default_value;
-    }
-
-    std::istringstream stream(raw_value);
-    stream.imbue(std::locale::classic());
-
-    double value = 0.0;
-    stream >> value;
-    if (stream.fail()) {
-        return default_value;
-    }
-    if (!stream.eof() || !std::isfinite(value) || value <= 0.0 || value > 1.0) {
-        return default_value;
-    }
-    return value;
-}
-
-double GetEnvRatioOr(const char* name, double default_value) {
-    const auto raw_value = Environ::GetString(name, "");
-    return ParseEnvRatioOr(raw_value, default_value);
-}
-
-double GetEnvRatioOr(const char* preferred_name, const char* fallback_name,
-                     double default_value) {
-    const auto preferred_value = Environ::GetString(preferred_name, "");
-    if (!preferred_value.empty()) {
-        return ParseEnvRatioOr(preferred_value, default_value);
-    }
-    return GetEnvRatioOr(fallback_name, default_value);
-}
-
-bool GetEnvBoolStringOr(const char* name, bool default_value) {
-    const auto raw_value =
-        Environ::GetString(name, default_value ? "true" : "false");
-    return TryParseBool(raw_value, {.token_set = BoolTokenSet::kTrueFalse,
-                                    .trim_ascii_whitespace = false})
-        .value_or(default_value);
-}
 
 std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
     const std::vector<std::string>& storage_keys,
@@ -82,188 +36,6 @@ std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
 }
 
 }  // namespace
-
-FileStorageConfig FileStorageConfig::FromEnvironment() {
-    FileStorageConfig config;
-
-    auto storage_backend_descriptor =
-        Environ::GetString("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
-                           "bucket_storage_backend");
-
-    if (storage_backend_descriptor == "bucket_storage_backend") {
-        config.storage_backend_type = StorageBackendType::kBucket;
-    } else if (storage_backend_descriptor == "file_per_key_storage_backend") {
-        config.storage_backend_type = StorageBackendType::kFilePerKey;
-    } else if (storage_backend_descriptor ==
-               "offset_allocator_storage_backend") {
-        config.storage_backend_type = StorageBackendType::kOffsetAllocator;
-    } else if (storage_backend_descriptor == "distributed_storage_backend") {
-        config.storage_backend_type = StorageBackendType::kDistributed;
-        config.enable_dfs = true;
-    } else if (storage_backend_descriptor == "nvme_kv_storage_backend") {
-        config.storage_backend_type = StorageBackendType::kNvmeKv;
-    } else {
-        LOG(ERROR) << "Unknown storage backend.";
-    }
-
-    config.storage_filepath = Environ::GetString(
-        "MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", config.storage_filepath);
-
-    config.local_buffer_size = Environ::GetInt64(
-        "MOONCAKE_OFFLOAD_LOCAL_BUFFER_SIZE_BYTES", config.local_buffer_size);
-
-    config.pinned_restore_arena_size =
-        Environ::GetInt64("MC_STORE_PINNED_RESTORE_ARENA_SIZE_BYTES",
-                          config.pinned_restore_arena_size);
-
-    config.scanmeta_iterator_keys_limit = Environ::GetInt64(
-        "MOONCAKE_OFFLOAD_SCANMETA_ITERATOR_KEYS_LIMIT",
-        Environ::GetInt64("MOONCAKE_SCANMETA_ITERATOR_KEYS_LIMIT",
-                          config.scanmeta_iterator_keys_limit));
-
-    config.total_keys_limit = Environ::GetInt64(
-        "MOONCAKE_OFFLOAD_TOTAL_KEYS_LIMIT", config.total_keys_limit);
-
-    config.total_size_limit = Environ::GetInt64(
-        "MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES", config.total_size_limit);
-
-    config.heartbeat_interval_seconds =
-        Environ::GetUInt32("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS",
-                           config.heartbeat_interval_seconds);
-    config.client_buffer_gc_interval_seconds =
-        Environ::GetUInt32("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_INTERVAL_SECONDS",
-                           config.client_buffer_gc_interval_seconds);
-
-    config.client_buffer_gc_ttl_ms =
-        Environ::GetUInt64("MOONCAKE_OFFLOAD_CLIENT_BUFFER_GC_TTL_MS",
-                           config.client_buffer_gc_ttl_ms);
-
-    config.enable_disk_watermark_eviction =
-        GetEnvBoolStringOr("MOONCAKE_OFFLOAD_ENABLE_DISK_WATERMARK_EVICTION",
-                           config.enable_disk_watermark_eviction);
-    config.disk_eviction_high_watermark_ratio =
-        GetEnvRatioOr("MOONCAKE_OFFLOAD_DISK_EVICTION_HIGH_WATERMARK_RATIO",
-                      "MOONCAKE_DISK_EVICTION_HIGH_WATERMARK_RATIO",
-                      config.disk_eviction_high_watermark_ratio);
-    config.disk_eviction_low_watermark_ratio =
-        GetEnvRatioOr("MOONCAKE_OFFLOAD_DISK_EVICTION_LOW_WATERMARK_RATIO",
-                      "MOONCAKE_DISK_EVICTION_LOW_WATERMARK_RATIO",
-                      config.disk_eviction_low_watermark_ratio);
-
-    const auto use_uring_str =
-        Environ::GetString("MOONCAKE_OFFLOAD_USE_URING",
-                           Environ::GetString("MOONCAKE_USE_URING", "false"));
-    config.use_uring =
-        TryParseBool(use_uring_str, {.token_set = BoolTokenSet::kTrueFalse,
-                                     .trim_ascii_whitespace = false})
-            .value_or(false);
-
-    return config;
-}
-
-bool FileStorageConfig::ValidatePath(std::string path) const {
-    if (path.empty()) {
-        LOG(ERROR) << "FileStorageConfig: storage_filepath is invalid";
-        return false;
-    }
-    namespace fs = std::filesystem;
-    // 1. Must be an absolute path
-    if (!fs::path(path).is_absolute()) {
-        LOG(ERROR)
-            << "FileStorageConfig: storage_filepath must be an absolute path: "
-            << path;
-        return false;
-    }
-
-    // 2. Check if the path contains ".." components that could lead to path
-    // traversal (static check)
-    fs::path p(path);
-    for (const auto& component : p) {
-        if (component == "..") {
-            LOG(ERROR) << "FileStorageConfig: path traversal is not allowed: "
-                       << path;
-            return false;
-        }
-    }
-
-    struct stat stat_buf;
-
-    // 3. Use stat() to check if the path exists
-    if (::stat(path.c_str(), &stat_buf) != 0) {
-        LOG(ERROR) << "FileStorageConfig: storage_filepath does not exist: "
-                   << path;
-        return false;
-    }
-    // Path exists — check if it is a directory
-    if (!S_ISDIR(stat_buf.st_mode)) {
-        LOG(ERROR) << "FileStorageConfig: storage_filepath is not a directory: "
-                   << path;
-        return false;
-    }
-
-    // (Optional) Check write permission
-    if (::access(path.c_str(), W_OK) != 0) {
-        LOG(ERROR) << "FileStorageConfig: no write permission on directory: "
-                   << path;
-        return false;
-    }
-
-    // 4. Additional security: prevent symlink bypass (optional)
-    // Use lstat to avoid automatic dereferencing of symbolic links
-    struct stat lstat_buf;
-    if (::lstat(path.c_str(), &lstat_buf) == 0) {
-        if (S_ISLNK(lstat_buf.st_mode)) {
-            LOG(ERROR) << "FileStorageConfig: symbolic link is not allowed: "
-                       << path;
-            return false;
-        }
-    }
-
-    return true;
-}
-
-bool FileStorageConfig::Validate() const {
-    if (!ValidatePath(storage_filepath)) {
-        return false;
-    }
-    if (total_keys_limit <= 0) {
-        LOG(ERROR) << "FileStorageConfig: total_keys_limit must > 0";
-        return false;
-    }
-    if (total_size_limit == 0) {
-        LOG(ERROR) << "FileStorageConfig: total_size_limit should not be zero";
-        return false;
-    }
-    if (pinned_restore_arena_size < 0) {
-        LOG(ERROR) << "FileStorageConfig: pinned_restore_arena_size must be "
-                      "non-negative";
-        return false;
-    }
-    if (heartbeat_interval_seconds <= 0) {
-        LOG(ERROR) << "FileStorageConfig: heartbeat_interval_seconds must > 0";
-        return false;
-    }
-    if (disk_eviction_low_watermark_ratio <= 0.0 ||
-        disk_eviction_low_watermark_ratio > 1.0) {
-        LOG(ERROR) << "FileStorageConfig: "
-                   << "disk_eviction_low_watermark_ratio must be in (0, 1]";
-        return false;
-    }
-    if (disk_eviction_high_watermark_ratio <= 0.0 ||
-        disk_eviction_high_watermark_ratio > 1.0) {
-        LOG(ERROR) << "FileStorageConfig: "
-                   << "disk_eviction_high_watermark_ratio must be in (0, 1]";
-        return false;
-    }
-    if (disk_eviction_low_watermark_ratio >=
-        disk_eviction_high_watermark_ratio) {
-        LOG(ERROR) << "FileStorageConfig: "
-                   << "disk_eviction_low_watermark_ratio must be lower than "
-                   << "disk_eviction_high_watermark_ratio";
-        return false;
-    }
-    return true;
-}
 
 FileStorage::FileStorage(const FileStorageConfig& config,
                          std::shared_ptr<Client> client,
