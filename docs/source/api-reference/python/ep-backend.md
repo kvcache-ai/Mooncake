@@ -422,10 +422,12 @@ used, auto mode falls back to IPC + IBGDA and retains the previous backend
 behavior. As before, the requested workload must have a compiled elastic kernel
 shape.
 
-Fresh CUDA EP builds (`-DWITH_EP=ON -DUSE_CUDA=ON`) automatically enable the
-NCCL backend when NCCL 2.30.4 or newer and `nccl_device.h` are discoverable. Use
-`-DUSE_NCCL_DEVICE=ON` to require NCCL at configure time, or
-`-DUSE_NCCL_DEVICE=OFF` to build only IPC + IBGDA.
+NCCL support is opt-in. Build with
+`-DWITH_EP=ON -DUSE_CUDA=ON -DUSE_NCCL_DEVICE=ON`; the option defaults to
+`OFF`. NCCL-enabled EP extensions currently link directly to `libnccl`, so
+importing `mooncake.ep` requires a matching NCCL runtime even when the NCCL
+transport is not selected. Keep the option disabled for deployments that must
+remain compatible with older NCCL runtimes.
 
 No application-side communicator bootstrap is required. Auto mode creates one
 NCCL unique ID on process-group rank zero and broadcasts it to the group:

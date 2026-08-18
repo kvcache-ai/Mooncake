@@ -214,18 +214,8 @@ if(USE_VRAM_SEGMENT)
   message(STATUS "VRAM SEGMENT is ON")
 endif()
 
-set(_MOONCAKE_NCCL_DEVICE_DEFAULT OFF)
-if(WITH_EP AND USE_CUDA AND NOT USE_MUSA AND NOT USE_MACA AND
-   NOT USE_NCCL_HOST)
-  set(_MOONCAKE_NCCL_DEVICE_DEFAULT ON)
-endif()
-set(_MOONCAKE_NCCL_DEVICE_EXPLICIT FALSE)
-if(DEFINED CACHE{USE_NCCL_DEVICE})
-  set(_MOONCAKE_NCCL_DEVICE_EXPLICIT TRUE)
-endif()
 option(USE_NCCL_DEVICE "option for enabling the NCCL DeviceTransport backend"
-       ${_MOONCAKE_NCCL_DEVICE_DEFAULT})
-unset(_MOONCAKE_NCCL_DEVICE_DEFAULT)
+       OFF)
 
 if(USE_CUDA)
   find_package(CUDAToolkit REQUIRED)
@@ -244,20 +234,8 @@ if(USE_NCCL_DEVICE OR USE_NCCL_HOST)
     message(FATAL_ERROR "USE_NCCL_DEVICE and USE_NCCL_HOST require USE_CUDA=ON")
   endif()
   list(APPEND CMAKE_MODULE_PATH ${CMAKE_CURRENT_LIST_DIR})
-  if(USE_NCCL_DEVICE AND NOT _MOONCAKE_NCCL_DEVICE_EXPLICIT AND
-     NOT USE_NCCL_HOST)
-    find_package(NCCLDevice 2.30.4 QUIET MODULE)
-    if(NOT NCCLDevice_FOUND)
-      set(USE_NCCL_DEVICE OFF CACHE BOOL
-          "option for enabling the NCCL DeviceTransport backend" FORCE)
-      message(STATUS
-        "NCCL Device API 2.30.4+ was not found; Mooncake EP will use IPC + IBGDA")
-    endif()
-  else()
-    find_package(NCCLDevice 2.30.4 REQUIRED MODULE)
-  endif()
+  find_package(NCCLDevice 2.30.4 REQUIRED MODULE)
 endif()
-unset(_MOONCAKE_NCCL_DEVICE_EXPLICIT)
 
 if(USE_NCCL_DEVICE)
   add_compile_definitions(USE_NCCL_DEVICE)
