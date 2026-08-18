@@ -158,6 +158,65 @@ TEST_F(RpcHandlerIsolationTest, OffloadedHandlerExceptionReachesTheCaller) {
     EXPECT_FALSE(client.call(addr_, kThrowingFunc, "", response).ok());
 }
 
+TEST(ControlRpcCompatibility, LegacyIdsReachExpectedHandlers) {
+    constexpr int kLegacyDelegate = 6;
+    constexpr int kLegacyPin = 7;
+    constexpr int kLegacyUnpin = 8;
+
+    CoroRpcAgent server;
+    std::atomic<int> probe_calls{0};
+    std::atomic<int> delegate_calls{0};
+    std::atomic<int> pin_calls{0};
+    std::atomic<int> unpin_calls{0};
+
+    ASSERT_TRUE(
+        server
+            .registerFunction(
+                Probe,
+                [&](const std::string_view&, std::string&) { ++probe_calls; })
+            .ok());
+    ASSERT_TRUE(
+        server
+            .registerFunction(
+                Delegate,
+                [&](const std::string_view&, std::string&) {
+                    ++delegate_calls;
+                },
+                /*offload=*/true)
+            .ok());
+    ASSERT_TRUE(
+        server
+            .registerFunction(
+                Pin,
+                [&](const std::string_view&, std::string&) { ++pin_calls; })
+            .ok());
+    ASSERT_TRUE(
+        server
+            .registerFunction(
+                Unpin,
+                [&](const std::string_view&, std::string&) { ++unpin_calls; })
+            .ok());
+
+    uint16_t port = 0;
+    ASSERT_TRUE(server.start(port).ok());
+    const std::string addr =
+        "127.0.0.1:" + std::to_string(static_cast<unsigned>(port));
+
+    CoroRpcAgent client;
+    std::string response;
+    ASSERT_TRUE(client.call(addr, kLegacyDelegate, "{}", response).ok());
+    EXPECT_EQ(delegate_calls.load(), 1);
+    EXPECT_EQ(probe_calls.load(), 0);
+
+    ASSERT_TRUE(client.call(addr, kLegacyPin, "\"remote\"", response).ok());
+    EXPECT_EQ(pin_calls.load(), 1);
+    EXPECT_EQ(delegate_calls.load(), 1);
+
+    ASSERT_TRUE(client.call(addr, kLegacyUnpin, "1234", response).ok());
+    EXPECT_EQ(unpin_calls.load(), 1);
+    EXPECT_EQ(pin_calls.load(), 1);
+}
+
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake
