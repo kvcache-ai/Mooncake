@@ -34,7 +34,7 @@
 #include "transfer_metadata_plugin.h"
 #endif
 #ifdef USE_NOF
-#include "spdk/spdk_wrapper.h"
+#include "nof/nof_runtime.h"
 #endif
 #ifdef STORE_USE_ETCD
 #include "etcd_helper.h"
@@ -64,6 +64,25 @@
 namespace mooncake {
 
 namespace {
+
+#ifdef USE_NOF
+// Shared NoF probe default, used by both the constructor and the test-seam
+// reset. A single function-static initiator keeps the probe path aligned with
+// the process-global NofPageRegistry (R-2) and avoids duplicating the lambda
+// body in two places.
+bool DefaultProbeNofSegment(const std::string& te_endpoint, uint32_t timeout_ms,
+                            std::string* error_reason) {
+    static const std::shared_ptr<NVMeoFInitiator> initiator =
+        CreateNofRuntime().initiator;
+    if (!initiator) {
+        if (error_reason) {
+            *error_reason = "nof_unavailable";
+        }
+        return false;
+    }
+    return initiator->ProbeSegment(te_endpoint, timeout_ms, error_reason);
+}
+#endif
 
 constexpr int kMaxTenantQuotaEvictionRetries = 2;
 
@@ -349,11 +368,7 @@ MasterService::MasterService(const MasterServiceConfig& config)
         throw std::invalid_argument("Invalid nof heartbeat failure threshold");
     }
 
-    nof_probe_fn_ = [](const std::string& te_endpoint, uint32_t timeout_ms,
-                       std::string* error_reason) {
-        return SpdkWrapper::GetInstance().ProbeNofSegment(
-            te_endpoint, timeout_ms, error_reason);
-    };
+    nof_probe_fn_ = &DefaultProbeNofSegment;
 #endif
 
     // Offload-on-evict: defer LOCAL_DISK offload to eviction time
@@ -730,11 +745,7 @@ void MasterService::SetNoFProbeFnForTesting(NoFProbeFn fn) {
         nof_probe_fn_ = std::move(fn);
         return;
     }
-    nof_probe_fn_ = [](const std::string& te_endpoint, uint32_t timeout_ms,
-                       std::string* error_reason) {
-        return SpdkWrapper::GetInstance().ProbeNofSegment(
-            te_endpoint, timeout_ms, error_reason);
-    };
+    nof_probe_fn_ = &DefaultProbeNofSegment;
 #else
     (void)fn;
 #endif

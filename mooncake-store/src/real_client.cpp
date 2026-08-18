@@ -37,9 +37,7 @@
 #include "device/cuda_ipc_buffer.h"
 #include "shm_helper.h"
 #include "memory_location.h"
-#ifdef USE_NOF
-#include "spdk/spdk_wrapper.h"
-#endif
+#include "nof/nof_runtime.h"
 #ifdef USE_ASCEND_DIRECT
 #include "acl/acl_rt.h"
 #include "transport/ascend_transport/ascend_direct_transport/context_manager.h"
@@ -757,12 +755,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
 #endif
 
-#ifdef USE_NOF
-    if (!SpdkWrapper::GetInstance().InitializeEnv()) {
-        LOG(ERROR) << "spdk env init fail";
-        return tl::unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-#endif
+    // Env 首次使用时惰性初始化,setup 不再快速失败(兼容性 C-1)。
+    nof_runtime_ = CreateNofRuntime();
 
     std::optional<std::string> device_name =
         ((rdma_devices.empty() || rdma_devices == "auto-discovery")
@@ -787,7 +781,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         auto client_opt = mooncake::Client::Create(
             this->local_hostname, metadata_server, protocol, device_name,
             master_server_addr, transfer_engine, {{"client_mode", "real"}},
-            tenant_id);
+            tenant_id, nof_runtime_.initiator);
         if (!client_opt) {
             LOG(ERROR) << "Failed to create client";
             return tl::unexpected(ErrorCode::INVALID_PARAMS);
@@ -825,7 +819,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             auto client_opt = mooncake::Client::Create(
                 this->local_hostname, metadata_server, protocol, device_name,
                 master_server_addr, transfer_engine, {{"client_mode", "real"}},
-                tenant_id);
+                tenant_id, nof_runtime_.initiator);
             if (client_opt) {
                 client_ = *client_opt;
                 success = true;
@@ -854,13 +848,12 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     // fail in some rdma implementations.
     // Dummy Client can create shm and share it with Real Client, so Real Client
     // can create client buffer allocator on the shared memory later.
-    bool use_spdk_dma_for_client_buffer = false;
-#ifdef USE_NOF
-    use_spdk_dma_for_client_buffer = true;
-#endif
+    // 评审 #2:仅当 NoF 真正可用时才注入 SPDK DMA allocator;否则传 nullptr,
+    // 让 allocate_buffer_allocator_memory 落到与今天 use_spdk_dma=false
+    // 完全相同的路径(协议专用分配 → VRAM → aligned_alloc)。
     client_buffer_allocator_ = ClientBufferAllocator::create(
         local_buffer_size, this->protocol, should_use_hugepage,
-        use_spdk_dma_for_client_buffer);
+        nof_runtime_.initiator ? nof_runtime_.dma_allocator : nullptr);
     if (local_buffer_size > 0 && protocol != "cxl") {
         LOG(INFO) << "Registering local memory: " << local_buffer_size
                   << " bytes";
@@ -3330,6 +3323,23 @@ tl::expected<void, ErrorCode> RealClient::register_buffer_internal(
     if (!result) {
         return result;
     }
+    // #3131: SPDK 的 RDMA 传输维护独立的 translation table,TE 注册对它
+    // 不可见。TE 注册成功后,向 initiator 注册;失败则回滚 TE 注册,
+    // 不留半注册状态。
+    if (nof_runtime_.initiator) {
+        auto rc = nof_runtime_.initiator->RegisterMemory(buffer, size);
+        if (rc != ErrorCode::OK) {
+            LOG(ERROR) << "Initiator memory registration failed, rolling "
+                          "back TE registration: "
+                       << toString(rc);
+            auto rollback = client_->unregisterLocalMemory(buffer, true);
+            if (!rollback) {
+                LOG(ERROR) << "TE rollback failed for buffer " << buffer << ": "
+                           << toString(rollback.error());
+            }
+            return tl::unexpected(rc);
+        }
+    }
     {
         std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);
         registered_buffer_sizes_[buffer] = size;
@@ -3352,6 +3362,14 @@ tl::expected<void, ErrorCode> RealClient::unregister_buffer_internal(
         LOG(ERROR) << "Unregister buffer failed with error: "
                    << toString(unregister_result.error());
         return tl::unexpected(unregister_result.error());
+    }
+    if (nof_runtime_.initiator) {
+        auto rc = nof_runtime_.initiator->UnregisterMemory(buffer);
+        if (rc != ErrorCode::OK) {
+            // 已无法回滚 TE 注销;告警并继续(与既有 unregister 失败同级)。
+            LOG(WARNING) << "Initiator memory unregistration failed: "
+                         << toString(rc);
+        }
     }
     {
         std::unique_lock<std::shared_mutex> lock(registered_buffer_mutex_);

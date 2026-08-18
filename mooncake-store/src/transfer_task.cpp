@@ -15,9 +15,7 @@
 #include "device/accelerator_registry.h"
 #include "transfer_engine.h"
 #include "transport/transport.h"
-#ifdef USE_NOF
-#include "spdk/spdk_wrapper.h"
-#endif
+#include "nof/nvmeof_initiator.h"
 
 static int GetPositiveEnvOrDefault(const char* name, int default_value) {
     const char* raw_value = std::getenv(name);
@@ -39,7 +37,6 @@ static int GetPositiveEnvOrDefault(const char* name, int default_value) {
     return static_cast<int>(parsed);
 }
 
-#ifdef USE_NOF
 static bool IsTruthyEnv(const char* value) {
     if (!value) {
         return false;
@@ -52,12 +49,12 @@ static bool IsTruthyEnv(const char* value) {
            normalized == "on";
 }
 
-static bool IsSpdkNofDebugEnabled() {
+static bool IsNofDebugEnabled() {
     static const bool enabled = IsTruthyEnv(std::getenv("MC_NOF_DEBUG"));
     return enabled;
 }
 
-static int GetSpdkNofDebugIntervalMs() {
+static int GetNofDebugIntervalMs() {
     static const int interval_ms = []() {
         const char* raw_value = std::getenv("MC_NOF_DEBUG_INTERVAL_MS");
         if (!raw_value) {
@@ -74,28 +71,27 @@ static int GetSpdkNofDebugIntervalMs() {
     return interval_ms;
 }
 
-static int GetSpdkNofSubmitChunkBytes() {
+static int GetNofSubmitChunkBytes() {
     static const int value = GetPositiveEnvOrDefault(
-        "MC_NOF_SUBMIT_CHUNK_BYTES", mooncake::kDefaultSpdkNofSubmitChunkBytes);
+        "MC_NOF_SUBMIT_CHUNK_BYTES", mooncake::kDefaultNofSubmitChunkBytes);
     return value;
 }
 
-static int GetSpdkNofInflightBytesLimit() {
+static int GetNofInflightBytesLimit() {
+    static const int value = GetPositiveEnvOrDefault(
+        "MC_NOF_INFLIGHT_BYTES_LIMIT", mooncake::kDefaultNofInflightBytesLimit);
+    return value;
+}
+
+static int GetNofWorkerCount() {
     static const int value =
-        GetPositiveEnvOrDefault("MC_NOF_INFLIGHT_BYTES_LIMIT",
-                                mooncake::kDefaultSpdkNofInflightBytesLimit);
+        GetPositiveEnvOrDefault("MC_NOF_WORKERS", mooncake::kDefaultNofWorkers);
     return value;
 }
 
-static int GetSpdkNofWorkerCount() {
-    static const int value = GetPositiveEnvOrDefault(
-        "MC_NOF_WORKERS", mooncake::kDefaultSpdkNofWorkers);
-    return value;
-}
-
-static int CountSpdkNofQueuedTasks(const mooncake::SpdkNofTask* head) {
+static int CountNofQueuedTasks(const mooncake::NofTask* head) {
     int count = 0;
-    const mooncake::SpdkNofTask* cursor = head;
+    const mooncake::NofTask* cursor = head;
     while (cursor != nullptr) {
         ++count;
         cursor = cursor->nxt;
@@ -103,29 +99,32 @@ static int CountSpdkNofQueuedTasks(const mooncake::SpdkNofTask* head) {
     return count;
 }
 
-static inline void SpdkNofTaskCompletion(mooncake::SpdkNofTask* task) {
-    if (task->remaining_lba == 0 && task->outstanding_sub_io == 0) {
+static inline void NofTaskCompletion(mooncake::NofTask* task) {
+    if (task->remaining_bytes == 0 && task->outstanding_sub_io == 0) {
         task->state->set_completed(task->failed
                                        ? mooncake::ErrorCode::TRANSFER_FAIL
-                                       : mooncake::ErrorCode::OK);
+                                       : mooncake::ErrorCode::OK,
+                                   std::move(task->error_detail));
         if (!task->on_chain) {
             delete task;
         }
     }
 }
 
-static void nvmf_io_complete(void* ctx, const struct spdk_nvme_cpl* cpl) {
+static void nof_io_complete(void* ctx, const mooncake::NofIOCompletion& c) {
     if (!ctx) {
-        LOG(ERROR) << "nvmf_io_complete ctx is null";
+        LOG(ERROR) << "nof_io_complete ctx is null";
         return;
     }
 
-    mooncake::SpdkNofSubTask* sub_task =
-        reinterpret_cast<mooncake::SpdkNofSubTask*>(ctx);
-    mooncake::SpdkNofTask* task = sub_task->task;
-    mooncake::SpdkNofQos* nof_qos = task->nof_qos;
-    int op = task->op;
-    if (--(*task->io_count) < 0) {
+    mooncake::NofSubTask* sub_task =
+        reinterpret_cast<mooncake::NofSubTask*>(ctx);
+    mooncake::NofTask* task = sub_task->task;
+    mooncake::NofQos* nof_qos = task->nof_qos;
+    size_t op = static_cast<size_t>(task->op);
+
+    if (task->io_count &&
+        task->io_count->fetch_sub(1, std::memory_order_acq_rel) <= 0) {
         LOG(ERROR) << "total outstanding io < 0";
     }
 
@@ -133,43 +132,40 @@ static void nvmf_io_complete(void* ctx, const struct spdk_nvme_cpl* cpl) {
         LOG(ERROR) << "task outstanding io < 0";
     }
 
-    nof_qos->inflight_blocks[op] -= sub_task->submit_lba_count;
+    nof_qos->inflight_blocks[op] -=
+        static_cast<int>(sub_task->submit_bytes / nof_qos->block_size);
     if (nof_qos->inflight_blocks[op] < 0) {
-        LOG(ERROR) << "task outstanding io < 0";
+        LOG(ERROR) << "qos inflight blocks < 0";
     }
 
-    if (spdk_nvme_cpl_is_error(cpl)) {
-        LOG(ERROR) << "task_complete: I/O failed"
-                   << spdk_nvme_cpl_get_status_string(&cpl->status);
-        task->remaining_lba = 0;
+    if (!c.success) {
+        LOG(ERROR) << "nof task I/O failed: sc=" << c.sc << " sct=" << c.sct
+                   << " " << c.error_string;
+        task->remaining_bytes = 0;
         task->failed = true;
+        if (task->error_detail.empty()) {
+            task->error_detail = c.error_string;  // 保留首个错误详情
+        }
     }
 
-    SpdkNofTaskCompletion(task);
+    NofTaskCompletion(task);
 
     sub_task->sub_task_pool->push(sub_task);
 }
-#endif
 namespace mooncake {
 
-#ifdef USE_NOF
-SpdkNofQos::SpdkNofQos(uint32_t block_size) {
-    int block_size_int = static_cast<int>(block_size);
-    if (block_size_int <= 0) {
-        block_size_int = 1;
-    }
-
-    blocks_per_chunk =
-        std::max(1, GetSpdkNofSubmitChunkBytes() / block_size_int);
-    inflight_blocks_limit =
-        std::max(1, GetSpdkNofInflightBytesLimit() / block_size_int);
-    for (int i = 0; i < kSpdkNofOpNum; ++i) {
+NofQos::NofQos(uint32_t bs)
+    : block_size(bs == 0 || bs == kInvalidBlockSize ? 1 : bs),
+      blocks_per_chunk(
+          std::max(1, GetNofSubmitChunkBytes() / static_cast<int>(block_size))),
+      inflight_blocks_limit(std::max(
+          1, GetNofInflightBytesLimit() / static_cast<int>(block_size))) {
+    for (size_t i = 0; i < static_cast<size_t>(NofIOOp::kNum); ++i) {
         inflight_blocks[i] = 0;
         head[i] = nullptr;
         tail[i] = nullptr;
     }
 }
-#endif
 
 // ============================================================================
 // FilereadWorkerPool Implementation
@@ -288,30 +284,30 @@ void FilereadWorkerPool::workerThread() {
 }
 
 // ============================================================================
-// SpdkNofWorkerPool Implementation
+// NofWorkerPool Implementation
 // ============================================================================
 // to fully utilize the available ssd bandwidth, we use a default of 4 worker
 // threads.
 
-#ifdef USE_NOF
-SpdkNofWorkerPool::SpdkNofWorkerPool(int numa_socket_id)
-    : worker_count_(GetSpdkNofWorkerCount()),
+NofWorkerPool::NofWorkerPool(std::shared_ptr<NVMeoFInitiator> initiator,
+                             int numa_socket_id)
+    : initiator_(std::move(initiator)),
+      worker_count_(GetNofWorkerCount()),
       numa_socket_id_(numa_socket_id),
-      task_queue_(std::make_unique<std::queue<SpdkNofTask>[]>(worker_count_)),
+      task_queue_(std::make_unique<std::queue<NofTask>[]>(worker_count_)),
       queue_mutex_(std::make_unique<std::mutex[]>(worker_count_)),
       queue_cv_(std::make_unique<std::condition_variable[]>(worker_count_)),
       shutdown_(false) {
-    VLOG(1) << "Creating SpdkNofWorkerPool with " << worker_count_
-            << " workers";
+    VLOG(1) << "Creating NofWorkerPool with " << worker_count_ << " workers";
 
     // Start worker threads
     workers_.reserve(worker_count_);
     for (int i = 0; i < worker_count_; ++i) {
-        workers_.emplace_back(&SpdkNofWorkerPool::workerThread, this, i);
+        workers_.emplace_back(&NofWorkerPool::workerThread, this, i);
     }
 }
 
-SpdkNofWorkerPool::~SpdkNofWorkerPool() {
+NofWorkerPool::~NofWorkerPool() {
     if (shutdown_.exchange(true)) {
         return;
     }
@@ -326,18 +322,17 @@ SpdkNofWorkerPool::~SpdkNofWorkerPool() {
         }
     }
 
-    VLOG(1) << "SpdkNofWorkerPool destroyed";
+    VLOG(1) << "NofWorkerPool destroyed";
 }
 
-void SpdkNofWorkerPool::submitTask(SpdkNofTask task) {
+void NofWorkerPool::submitTask(NofTask task) {
     if (!task.state) {
-        LOG(ERROR) << "Attempting to submit spdk nof task without state";
+        LOG(ERROR) << "Attempting to submit nof task without state";
         return;
     }
 
     if (shutdown_.load()) {
-        LOG(WARNING)
-            << "Attempting to submit task to shutdown SpdkNofWorkerPool";
+        LOG(WARNING) << "Attempting to submit task to shutdown NofWorkerPool";
         task.state->set_completed(ErrorCode::TRANSFER_FAIL);
         return;
     }
@@ -345,7 +340,7 @@ void SpdkNofWorkerPool::submitTask(SpdkNofTask task) {
     int worker_idx = -1;
     {
         std::lock_guard<std::mutex> lock(seg_mutex_);
-        nof_seg_handle* seg = task.seg_handle;
+        NofSegmentHandle* seg = task.seg_handle;
         bool new_binding = false;
         if (seg_to_worker_.find(seg) != seg_to_worker_.end()) {
             worker_idx = seg_to_worker_[seg];
@@ -354,7 +349,7 @@ void SpdkNofWorkerPool::submitTask(SpdkNofTask task) {
             seg_to_worker_[seg] = worker_idx;
             new_binding = true;
         }
-        if (new_binding && IsSpdkNofDebugEnabled()) {
+        if (new_binding && IsNofDebugEnabled()) {
             LOG(INFO) << "nof_worker_bind seg_handle=" << seg
                       << " worker_idx=" << worker_idx;
         }
@@ -373,7 +368,7 @@ void SpdkNofWorkerPool::submitTask(SpdkNofTask task) {
 }
 
 static bool HasBufferedTask(
-    const std::map<nof_seg_handle*, std::unique_ptr<SpdkNofQos>>& seg_to_qos) {
+    const std::map<NofSegmentHandle*, std::unique_ptr<NofQos>>& seg_to_qos) {
     for (const auto& [_, nof_qos] : seg_to_qos) {
         if (!nof_qos->Empty()) {
             return true;
@@ -382,23 +377,23 @@ static bool HasBufferedTask(
     return false;
 }
 
-constexpr int kSpdkNofSubTaskChunkSize = 4096;
+constexpr int kDefaultNofSubTaskChunkSize = 4096;
 
-static inline bool CheckSubTaskPool(
-    std::stack<SpdkNofSubTask*>& sub_task_pool,
-    std::vector<SpdkNofSubTask*>& sub_task_chunks, int work_idx) {
+static inline bool CheckSubTaskPool(std::stack<NofSubTask*>& sub_task_pool,
+                                    std::vector<NofSubTask*>& sub_task_chunks,
+                                    int work_idx) {
     if (!sub_task_pool.empty()) {
         return true;
     }
-    SpdkNofSubTask* sub_tasks =
-        new (std::nothrow) SpdkNofSubTask[kSpdkNofSubTaskChunkSize];
+    NofSubTask* sub_tasks =
+        new (std::nothrow) NofSubTask[kDefaultNofSubTaskChunkSize];
     if (!sub_tasks) {
-        LOG(ERROR) << "alloc SpdkNofSubTask failed, worker " << work_idx;
+        LOG(ERROR) << "alloc NofSubTask failed, worker " << work_idx;
         return false;
     }
     sub_task_chunks.push_back(sub_tasks);
 
-    for (int i = 0; i < kSpdkNofSubTaskChunkSize; ++i) {
+    for (int i = 0; i < kDefaultNofSubTaskChunkSize; ++i) {
         sub_tasks[i].sub_task_pool = &sub_task_pool;
         sub_task_pool.push(&sub_tasks[i]);
     }
@@ -406,15 +401,15 @@ static inline bool CheckSubTaskPool(
     return true;
 }
 
-void SpdkNofWorkerPool::workerThread(int work_idx) {
+void NofWorkerPool::workerThread(int work_idx) {
     bindToSocket(numa_socket_id_);
-    VLOG(2) << "SpdkNofWorkerPool worker thread started";
+    VLOG(2) << "NofWorkerPool worker thread started";
 
-    int64_t total_outstanding_io = 0;
-    // std::set<nof_seg_handle *> seg_set;
-    std::map<nof_seg_handle*, std::unique_ptr<SpdkNofQos>> seg_to_qos;
-    std::stack<SpdkNofSubTask*> sub_task_pool;
-    std::vector<SpdkNofSubTask*> sub_task_chunks;
+    // C2 fix: 不再是栈变量地址;worker 与 task 共享所有权。
+    auto total_outstanding_io = std::make_shared<std::atomic<int64_t>>(0);
+    std::map<NofSegmentHandle*, std::unique_ptr<NofQos>> seg_to_qos;
+    std::stack<NofSubTask*> sub_task_pool;
+    std::vector<NofSubTask*> sub_task_chunks;
     auto& task_queue = task_queue_[work_idx];
     auto& queue_cv = queue_cv_[work_idx];
     auto& queue_mutex = queue_mutex_[work_idx];
@@ -428,41 +423,42 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
         // Wait for task or shutdown signal
         {
             std::unique_lock<std::mutex> lock(queue_mutex);
-            queue_cv.wait(
-                lock, [this, &task_queue, &total_outstanding_io, &seg_to_qos] {
-                    return shutdown_.load() || !task_queue.empty() ||
-                           total_outstanding_io || HasBufferedTask(seg_to_qos);
-                });
+            queue_cv.wait(lock, [this, &task_queue, &total_outstanding_io,
+                                 &seg_to_qos] {
+                return shutdown_.load() || !task_queue.empty() ||
+                       total_outstanding_io->load(std::memory_order_acquire) !=
+                           0 ||
+                       HasBufferedTask(seg_to_qos);
+            });
 
             if (shutdown_.load() && task_queue.empty() &&
-                (total_outstanding_io == 0) && !HasBufferedTask(seg_to_qos)) {
+                total_outstanding_io->load(std::memory_order_acquire) == 0 &&
+                !HasBufferedTask(seg_to_qos)) {
                 break;
             }
 
             while (!task_queue.empty()) {
-                SpdkNofTask* task = new (std::nothrow)
-                    SpdkNofTask(std::move(task_queue.front()));
+                NofTask* task =
+                    new (std::nothrow) NofTask(std::move(task_queue.front()));
                 if (task == nullptr) {
-                    LOG(ERROR)
-                        << "alloc SpdkNofTask failed, worker " << work_idx;
+                    LOG(ERROR) << "alloc NofTask failed, worker " << work_idx;
                     continue;
                 }
 
-                SpdkNofQos* nof_qos = nullptr;
+                NofQos* nof_qos = nullptr;
                 auto it = seg_to_qos.find(task->seg_handle);
                 if (it == seg_to_qos.end()) {
-                    auto qos = std::make_unique<SpdkNofQos>(
-                        SpdkWrapper::GetInstance().GetBlockSize(
-                            task->seg_handle));
+                    auto qos = std::make_unique<NofQos>(
+                        initiator_->GetBlockSize(task->seg_handle));
                     if (qos == nullptr) {
                         LOG(ERROR)
-                            << "alloc SpdkNofQos failed, worker " << work_idx;
+                            << "alloc NofQos failed, worker " << work_idx;
                         delete task;
                         continue;
                     }
                     nof_qos = qos.get();
                     seg_to_qos[task->seg_handle] = std::move(qos);
-                    if (IsSpdkNofDebugEnabled()) {
+                    if (IsNofDebugEnabled()) {
                         LOG(INFO)
                             << "nof_qos_create worker_idx=" << work_idx
                             << " seg_handle=" << task->seg_handle
@@ -475,7 +471,7 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                 } else {
                     nof_qos = it->second.get();
                 }
-                task->io_count = &total_outstanding_io;
+                task->io_count = total_outstanding_io;
                 task->nof_qos = nof_qos;
                 task->on_chain = true;
                 nof_qos->PushTask(task);
@@ -484,79 +480,89 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
         }
 
         for (auto& [seg_handle, nof_qos] : seg_to_qos) {
-            uint32_t block_size =
-                SpdkWrapper::GetInstance().GetBlockSize(seg_handle);
-            for (int i = 0; i < kSpdkNofOpNum; ++i) {
+            // block_size 取自 QoS 缓存;热循环不再查询 initiator。
+            const uint32_t block_size = nof_qos->block_size;
+            const uint64_t chunk_bytes =
+                static_cast<uint64_t>(nof_qos->blocks_per_chunk) * block_size;
+            for (size_t i = 0; i < static_cast<size_t>(NofIOOp::kNum); ++i) {
                 int avail_blocks = nof_qos->inflight_blocks_limit -
                                    nof_qos->inflight_blocks[i];
                 while (nof_qos->head[i] && avail_blocks > 0) {
-                    SpdkNofTask* task = nof_qos->head[i];
-                    SpdkNofSubTask* sub_task;
-                    while (task->remaining_lba > 0 && avail_blocks > 0) {
-                        uint32_t submit_lba_count = std::min(
-                            avail_blocks, std::min(task->remaining_lba,
-                                                   nof_qos->blocks_per_chunk));
-                        int lba_off = task->lba_count - task->remaining_lba;
-                        uint64_t submit_lba = task->lba + lba_off;
-                        void* submit_ptr = reinterpret_cast<void*>(
-                            reinterpret_cast<char*>(task->ptr) +
-                            lba_off * block_size);
+                    NofTask* task = nof_qos->head[i];
+                    NofSubTask* sub_task;
+                    while (task->remaining_bytes > 0 && avail_blocks > 0) {
+                        const uint64_t avail_bytes =
+                            static_cast<uint64_t>(avail_blocks) * block_size;
+                        const uint64_t sent_bytes =
+                            task->byte_length - task->remaining_bytes;
+                        const uint32_t submit_bytes =
+                            static_cast<uint32_t>(std::min<uint64_t>(
+                                {avail_bytes, task->remaining_bytes,
+                                 chunk_bytes}));
+                        const uint64_t submit_off =
+                            task->byte_offset + sent_bytes;
+                        void* submit_ptr =
+                            reinterpret_cast<char*>(task->ptr) + sent_bytes;
 
                         if (!CheckSubTaskPool(sub_task_pool, sub_task_chunks,
                                               work_idx)) {
                             task->failed = true;
-                            task->remaining_lba = 0;
+                            task->remaining_bytes = 0;
                             break;
                         }
                         sub_task = sub_task_pool.top();
                         sub_task_pool.pop();
                         sub_task->task = task;
-                        sub_task->submit_lba_count = submit_lba_count;
+                        sub_task->submit_bytes = submit_bytes;
+                        sub_task->adaptor = {&nof_io_complete, sub_task};
 
-                        int ret = SpdkWrapper::GetInstance().SubmitRequest(
-                            task->seg_handle, submit_ptr, submit_lba,
-                            submit_lba_count, task->op, nvmf_io_complete,
-                            sub_task);
+                        int ret = initiator_->SubmitIO(
+                            task->seg_handle, submit_ptr, submit_off,
+                            submit_bytes, task->op, &sub_task->adaptor);
                         if (ret != 0) {
                             LOG(ERROR) << "work " << work_idx << ", seg "
                                        << task->seg_handle << " submit io fail";
+                            // 归还池槽位(评审 #3):取出后提交失败若不归还,
+                            // 重复失败会耗尽 4096 槽并无界分配新 chunk。
+                            sub_task->sub_task_pool->push(sub_task);
                             task->failed = true;
-                            task->remaining_lba = 0;
+                            task->remaining_bytes = 0;
                         } else {
+                            const int submit_blocks =
+                                static_cast<int>(submit_bytes / block_size);
                             task->idx++;
-                            task->remaining_lba -= submit_lba_count;
-                            nof_qos->inflight_blocks[i] += submit_lba_count;
-                            avail_blocks -= submit_lba_count;
+                            task->remaining_bytes -= submit_bytes;
+                            nof_qos->inflight_blocks[i] += submit_blocks;
+                            avail_blocks -= submit_blocks;
                             task->outstanding_sub_io++;
-                            total_outstanding_io++;
+                            total_outstanding_io->fetch_add(
+                                1, std::memory_order_acq_rel);
                         }
                     }
-                    if (task->remaining_lba == 0) {
-                        nof_qos->PopTask(i);
+                    if (task->remaining_bytes == 0) {
+                        nof_qos->PopTask(static_cast<NofIOOp>(i));
                         task->on_chain = false;
-                        SpdkNofTaskCompletion(task);
+                        NofTaskCompletion(task);
                     }
                 }
             }
         }
 
-        if (total_outstanding_io > 0) {
-            int64_t ret = 0;
+        if (total_outstanding_io->load(std::memory_order_acquire) > 0) {
             for (auto& it : seg_to_qos) {
-                ret = SpdkWrapper::GetInstance().NvmePollProcessCompletion(
-                    it.first, 0);
+                int64_t ret = initiator_->PollCompletion(it.first, 0);
                 if (ret < 0) {
                     LOG(ERROR) << "poll completion error: ret " << ret;
                 }
             }
         }
 
-        if (IsSpdkNofDebugEnabled()) {
+        if (IsNofDebugEnabled()) {
             auto now = std::chrono::steady_clock::now();
             auto elapsed =
                 std::chrono::duration_cast<std::chrono::milliseconds>(
                     now - last_debug_snapshot);
-            if (elapsed.count() >= GetSpdkNofDebugIntervalMs()) {
+            if (elapsed.count() >= GetNofDebugIntervalMs()) {
                 for (const auto& [seg_handle, nof_qos] : seg_to_qos) {
                     LOG(INFO)
                         << "nof_qos_state worker_idx=" << work_idx
@@ -565,10 +571,12 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
                         << " inflight_write=" << nof_qos->inflight_blocks[1]
                         << " inflight_limit=" << nof_qos->inflight_blocks_limit
                         << " queued_read="
-                        << CountSpdkNofQueuedTasks(nof_qos->head[0])
+                        << CountNofQueuedTasks(nof_qos->head[0])
                         << " queued_write="
-                        << CountSpdkNofQueuedTasks(nof_qos->head[1])
-                        << " total_outstanding_io=" << total_outstanding_io;
+                        << CountNofQueuedTasks(nof_qos->head[1])
+                        << " total_outstanding_io="
+                        << total_outstanding_io->load(
+                               std::memory_order_acquire);
                 }
                 last_debug_snapshot = now;
             }
@@ -578,12 +586,11 @@ void SpdkNofWorkerPool::workerThread(int work_idx) {
     for (auto* sub_tasks : sub_task_chunks) {
         delete[] sub_tasks;
     }
-    // seg_to_qos will automatically clean up SpdkNofQos objects using
+    // seg_to_qos will automatically clean up NofQos objects using
     // unique_ptr
 
-    VLOG(2) << "SpdkNofWorkerPool worker thread exiting";
+    VLOG(2) << "NofWorkerPool worker thread exiting";
 }
-#endif
 
 // ============================================================================
 // MemcpyWorkerPool Implementation
@@ -941,17 +948,14 @@ TransferStrategy TransferFuture::strategy() const {
 // TransferSubmitter Implementation
 // ============================================================================
 
-TransferSubmitter::TransferSubmitter(TransferEngine& engine,
-                                     std::shared_ptr<StorageBackend>& backend,
-                                     const std::string& local_hostname,
-                                     TransferMetric* transfer_metric,
-                                     int numa_socket_id)
+TransferSubmitter::TransferSubmitter(
+    TransferEngine& engine, std::shared_ptr<StorageBackend>& backend,
+    const std::string& local_hostname, TransferMetric* transfer_metric,
+    int numa_socket_id, std::shared_ptr<NVMeoFInitiator> nof_initiator)
     : engine_(engine),
       local_endpoint_(engine.getLocalIpAndPort()),
       memcpy_pool_(std::make_unique<MemcpyWorkerPool>()),
-#ifdef USE_NOF
-      spdk_nvmf_pool_(std::make_unique<SpdkNofWorkerPool>(numa_socket_id)),
-#endif
+      nof_initiator_(std::move(nof_initiator)),
       fileread_pool_(std::make_unique<FilereadWorkerPool>(backend)),
       local_hostname_(local_hostname),
       transfer_metric_(transfer_metric) {
@@ -982,6 +986,11 @@ TransferSubmitter::TransferSubmitter(TransferEngine& engine,
                          << ", defaulting to enabled";
             memcpy_enabled_ = true;
         }
+    }
+
+    if (nof_initiator_) {
+        nof_pool_ =
+            std::make_unique<NofWorkerPool>(nof_initiator_, numa_socket_id);
     }
 
     VLOG(1) << "TransferSubmitter initialized with memcpy_enabled="
@@ -1020,7 +1029,6 @@ std::optional<TransferFuture> TransferSubmitter::submit(
             }
         }
     } else if (replica.is_nof_replica()) {
-#ifdef USE_NOF
         auto& ssd_desc = replica.get_nof_descriptor();
         auto& handle = ssd_desc.buffer_descriptor;
 
@@ -1028,11 +1036,7 @@ std::optional<TransferFuture> TransferSubmitter::submit(
             return std::nullopt;
         }
 
-        future = submitSpdkNofOperation(handle, ptr, size, op_code);
-#else
-        LOG(ERROR) << "NoF transfer requested while USE_NOF is disabled";
-        return std::nullopt;
-#endif
+        future = submitNofOperation(handle, ptr, size, op_code);
     } else {
         future = submitFileReadOperation(replica, slices, op_code);
     }
@@ -1420,10 +1424,16 @@ std::optional<TransferFuture> TransferSubmitter::submitRangeWrite(
     return future;
 }
 
-#ifdef USE_NOF
-std::optional<TransferFuture> TransferSubmitter::submitSpdkNofOperation(
+std::optional<TransferFuture> TransferSubmitter::submitNofOperation(
     const AllocatedBuffer::Descriptor& handle, void* ptr, size_t size,
     const TransferRequest::OpCode op_code) {
+    if (!nof_pool_) {
+        // 原 "NoF transfer requested while USE_NOF is disabled" 的等价
+        // 运行期形式。
+        LOG(ERROR) << "NoF transfer requested but NoF is unavailable "
+                      "(no initiator in this process)";
+        return std::nullopt;
+    }
     if (handle.transport_endpoint_.empty() || handle.size_ < size) {
         LOG(ERROR) << "Invalid NoF request endpoint="
                    << handle.transport_endpoint_
@@ -1432,33 +1442,39 @@ std::optional<TransferFuture> TransferSubmitter::submitSpdkNofOperation(
         return std::nullopt;
     }
 
-    nof_seg_handle* seg_handle =
-        SpdkWrapper::GetInstance().OpenNofSegment(handle.transport_endpoint_);
+    NofSegmentHandle* seg_handle =
+        nof_initiator_->OpenSegment(handle.transport_endpoint_);
     if (!seg_handle) {
         LOG(ERROR) << "Failed to open NoF segment endpoint="
                    << handle.transport_endpoint_;
         return std::nullopt;
     }
 
-    uint32_t block_size = SpdkWrapper::GetInstance().GetBlockSize(seg_handle);
-    if (block_size == INVALID_BLOCK_SIZE ||
+    uint32_t block_size = nof_initiator_->GetBlockSize(seg_handle);
+    // dma_alignment 的消费点(评审 #7):无 SGL 时 ptr 仍须块对齐
+    // (RFC §5.3 的现状前置条件);#3251 的 SGL 落地后 supports_sgl=true,
+    // ptr 对齐自动放宽到 DWORD,接口不变。
+    const auto caps = nof_initiator_->GetCapabilities();
+    const uint64_t ptr_alignment =
+        caps.supports_sgl ? caps.dma_alignment : block_size;
+    if (block_size == kInvalidBlockSize ||
         handle.buffer_address_ % block_size != 0 || size % block_size != 0 ||
-        reinterpret_cast<std::uintptr_t>(ptr) % block_size != 0) {
+        reinterpret_cast<std::uintptr_t>(ptr) % ptr_alignment != 0) {
         LOG(ERROR) << "NoF request offset=" << handle.buffer_address_
                    << ", ptr=" << ptr << ", size=" << size
                    << " is not aligned to block size " << block_size;
         return std::nullopt;
     }
 
-    auto state = std::make_shared<SpdkNofOperationState>();
-    SpdkNofTask task(seg_handle, ptr, handle.buffer_address_ / block_size,
-                     size / block_size, op_code, state);
-    spdk_nvmf_pool_->submitTask(std::move(task));
+    const NofIOOp op =
+        (op_code == TransferRequest::READ) ? NofIOOp::kRead : NofIOOp::kWrite;
+    auto state = std::make_shared<NofOperationState>();
+    NofTask task(seg_handle, ptr, handle.buffer_address_, size, op, state);
+    nof_pool_->submitTask(std::move(task));
 
-    VLOG(1) << "SPDK NoF transfer submitted to " << handle.transport_endpoint_;
+    VLOG(1) << "NoF transfer submitted to " << handle.transport_endpoint_;
     return TransferFuture(state);
 }
-#endif
 
 std::optional<TransferFuture> TransferSubmitter::submitFileReadOperation(
     const Replica::Descriptor& replica, std::vector<Slice>& slices,

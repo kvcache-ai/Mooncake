@@ -8,6 +8,7 @@
 #include "offset_allocator/offset_allocator.h"
 #include "types.h"
 #include "replica.h"
+#include "nof/dma_buffer_allocator.h"
 
 namespace mooncake {
 
@@ -30,7 +31,8 @@ class ClientBufferAllocator
     // Create for heap-allocated memory
     static std::shared_ptr<ClientBufferAllocator> create(
         size_t size, const std::string& protocol = "",
-        bool use_hugepage = false, bool use_spdk_dma = false);
+        bool use_hugepage = false,
+        std::shared_ptr<DmaBufferAllocator> dma_allocator = nullptr);
 
     // Create for shared memory
     static std::shared_ptr<ClientBufferAllocator> create(
@@ -62,13 +64,14 @@ class ClientBufferAllocator
 
    private:
     ClientBufferAllocator(size_t size, const std::string& protocol,
-                          bool use_hugepage, bool use_spdk_dma);
+                          bool use_hugepage,
+                          std::shared_ptr<DmaBufferAllocator> dma_allocator);
 
     std::shared_ptr<offset_allocator::OffsetAllocator> allocator_;
 
     std::string protocol;
     bool is_external_memory_ = false;
-    bool use_spdk_dma_ = false;
+    std::shared_ptr<DmaBufferAllocator> dma_allocator_;  // 替换 use_spdk_dma_
 };
 
 /**

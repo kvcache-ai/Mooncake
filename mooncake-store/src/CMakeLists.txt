@@ -91,7 +91,8 @@ set(MOONCAKE_STORE_SOURCES
     store_c.cpp
     memory_alloc.cpp
     ssd_register_client.cpp
-    engram/engram_store.cpp)
+    engram/engram_store.cpp
+    nof/nof_runtime.cpp)
 
 if(BUILD_UNIT_TESTS)
   list(APPEND MOONCAKE_STORE_SOURCES nvme_kv_executor_stub.cpp)
@@ -246,9 +247,6 @@ if(STORE_USE_K8S_LEASE)
 endif()
 
 if(USE_NOF)
-  add_subdirectory(spdk)
-  list(APPEND MOONCAKE_STORE_SOURCES ${SPDK_WRAPPER_SOURCES})
-
   set(SPDK_INCLUDE_DIR
       "/usr/local/include"
       CACHE PATH "SPDK include directory")
@@ -320,6 +318,43 @@ if(USE_NOF)
       rdmacm
       ssl
       bsd)
+
+  # ---------------------------------------------------------------------------
+  # SPDK-backed NoF initiator implementation, linked PRIVATE so SPDK/DPDK
+  # static libs stop propagating as usage requirements to client/master.
+  # ---------------------------------------------------------------------------
+  add_library(mooncake_nof_spdk STATIC nof/spdk_initiator.cpp)
+  target_include_directories(
+    mooncake_nof_spdk
+    PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../include
+    PRIVATE ${SPDK_INCLUDE_DIR} ${DPDK_INCLUDE_DIR})
+  target_link_libraries(mooncake_nof_spdk PRIVATE ${SPDK_STATIC_LIBS}
+                                                   glog::glog)
+
+  # spdk_mem_register (SPDK >= 22.05) compile-time probe.
+  # CMAKE_TRY_COMPILE_TARGET_TYPE was added in CMake 3.6 (project requires
+  # 3.16), so check_cxx_source_compiles compiles to a static library and never
+  # links; (void)&spdk_mem_register only needs the declaration to exist.
+  set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)
+  include(CheckCXXSourceCompiles)
+  set(CMAKE_REQUIRED_INCLUDES ${SPDK_INCLUDE_DIR})
+  check_cxx_source_compiles(
+    "#include <spdk/env.h>
+     int main() { (void)&spdk_mem_register; return 0; }"
+    HAVE_SPDK_MEM_REGISTER)
+  unset(CMAKE_REQUIRED_INCLUDES)
+  unset(CMAKE_TRY_COMPILE_TARGET_TYPE)
+  if(HAVE_SPDK_MEM_REGISTER)
+    target_compile_definitions(mooncake_nof_spdk
+                               PRIVATE HAVE_SPDK_MEM_REGISTER=1)
+  else()
+    message(
+      WARNING
+      "spdk_mem_register not found under ${SPDK_INCLUDE_DIR} "
+      "(SPDK < 22.05?). NoF-over-RDMA user-buffer registration (#3131) "
+      "will remain unfixed: pure-NoF writes over RDMA will fail with "
+      "'No translation for ptr' errors.")
+  endif()
 endif()
 
 # The cache_allocator library
@@ -337,11 +372,10 @@ if(MOONCAKE_ENABLE_OPLOG_PERF_METRICS)
                              PRIVATE MOONCAKE_ENABLE_OPLOG_PERF_METRICS)
 endif()
 target_include_directories(mooncake_store PUBLIC ${XXHASH_INCLUDE_DIR})
-if(USE_NOF)
-  target_include_directories(mooncake_store PRIVATE ${SPDK_INCLUDE_DIR}
-                                                    ${DPDK_INCLUDE_DIR})
-endif()
 target_link_libraries(mooncake_store PUBLIC ${XXHASH_LIBRARY})
+if(USE_NOF)
+  target_link_libraries(mooncake_store PRIVATE mooncake_nof_spdk)
+endif()
 if(STORE_USE_REDIS)
   target_include_directories(mooncake_store
                              PRIVATE ${MOONCAKE_STORE_HIREDIS_INCLUDE_DIR})
@@ -357,7 +391,6 @@ target_link_libraries(
          glog::glog
          gflags::gflags
          ${EXTRA_LIBS}
-         ${SPDK_STATIC_LIBS}
          mooncake_common
          yaml-cpp
          asio_shared

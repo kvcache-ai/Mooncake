@@ -68,13 +68,18 @@ Create `store_service.json` under `/home`:
 
 #### Start the Service
 
-The store service initializes the SPDK environment during startup. Configure hugepages on the store service node, 192.168.65.81:
+The store service initializes the SPDK environment lazily on its first NoF
+operation (segment probe, buffer registration, or data I/O) rather than
+during startup, so a successful startup alone does not prove the SPDK
+environment is usable. Configure hugepages on the store service node,
+192.168.65.81, before the first NoF traffic arrives:
 
 ```bash
 echo 512 > /proc/sys/vm/nr_hugepages
 ```
 
-Only a small number of hugepages is required during startup. In most cases, 512 hugepages are sufficient.
+Only a small number of hugepages is required for the SPDK environment itself.
+In most cases, 512 hugepages are sufficient.
 
 Start the store service:
 
@@ -277,7 +282,16 @@ extra_config:
 - `global_segment_size: 0` means the inference process does not contribute a
   memory segment to the Mooncake cluster.
 - Keep `local_buffer_size` non-zero because the client still needs local
-  staging buffers for Mooncake transfers.
+  staging buffers for Mooncake transfers. With NoF enabled (and
+  `MC_STORE_USE_HUGEPAGE` unset), this staging buffer is allocated from the
+  SPDK hugepage pool and is therefore DMA-registered by construction.
+- Buffers registered through the store client's `register_buffer` are also
+  registered with the SPDK RDMA translation table, so NoF-over-RDMA I/O can
+  address them directly. This requires SPDK 22.05 or newer on the client
+  node (older versions build with a CMake warning and leave NoF-over-RDMA
+  user-buffer I/O failing with "No translation" errors). Hugepage-backed,
+  2MB-aligned buffers are expected; a non-aligned buffer is registered by
+  its containing 2MB pages and logs a `RegisterMemory` warning.
 - The parameters in `extra_config` should use the same Mooncake master,
   metadata server, protocol, and RDMA device as the store service.
 
@@ -286,5 +300,6 @@ extra_config:
 | `MC_NOF_WORKERS` | Number of worker threads used to process SPDK NoF I/O operations. | 4 |
 | `MC_NOF_SUBMIT_CHUNK_BYTES` | Size of each I/O operation submitted to SPDK. | 128KB |
 | `MC_NOF_INFLIGHT_BYTES_LIMIT` | Maximum number of in-flight I/O bytes allowed in the system. | 32MB |
+| `MC_NOF_BACKEND` | NoF backend pair: `spdk` or `none`. `none` disables NoF at runtime in a `USE_NOF` build — one binary can be deployed on nodes without a working SPDK/hugepage environment. Case-insensitive; unrecognized values fall back to `spdk` with a warning. | `spdk` |
 
 These three parameters together provide QoS control for SPDK NoF I/O.
