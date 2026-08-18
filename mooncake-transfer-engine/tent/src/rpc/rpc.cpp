@@ -39,6 +39,18 @@ struct RpcHandlerScope {
     bool& flag_;
     bool prev_;
 };
+
+int normalizeLegacyControlRpcId(int func_id, std::string_view request) {
+    const auto first = request.find_first_not_of(" \t\r\n");
+    if (first == std::string_view::npos) return func_id;
+
+    const char request_type = request[first];
+    if (func_id == Probe && request_type == '{') return Delegate;
+    if (func_id == Delegate && request_type == '"') return Pin;
+    if (func_id == Pin && request_type >= '0' && request_type <= '9')
+        return Unpin;
+    return func_id;
+}
 }  // namespace
 
 class ClientPool {
@@ -148,11 +160,15 @@ Status CoroRpcAgent::stop() {
 
 Lazy<void> CoroRpcAgent::process(int func_id) {
     auto* ctx = co_await coro_rpc::get_context_in_coro();
-    auto it = func_map_.find(func_id);
+    auto request = ctx->get_request_attachment();
+    const int normalized_func_id =
+        normalizeLegacyControlRpcId(func_id, request);
+    auto it = func_map_.find(normalized_func_id);
+    if (it == func_map_.end() && normalized_func_id != func_id)
+        it = func_map_.find(func_id);
     if (it == func_map_.end()) co_return;
     const auto handler = it->second;
 
-    auto request = ctx->get_request_attachment();
     std::string response;
     if (handler.offload) {
         // Suspends this coroutine, freeing the io_context thread. The request

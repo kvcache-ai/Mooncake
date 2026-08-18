@@ -171,30 +171,25 @@ TEST(ControlRpcCompatibility, LegacyIdsReachExpectedHandlers) {
 
     ASSERT_TRUE(
         server
-            .registerFunction(
-                Probe,
-                [&](const std::string_view&, std::string&) { ++probe_calls; })
+            .registerFunction(Probe, [&](const std::string_view&,
+                                         std::string&) { ++probe_calls; })
             .ok());
+    ASSERT_TRUE(server
+                    .registerFunction(
+                        Delegate,
+                        [&](const std::string_view&, std::string&) {
+                            ++delegate_calls;
+                        },
+                        /*offload=*/true)
+                    .ok());
+    ASSERT_TRUE(server
+                    .registerFunction(Pin, [&](const std::string_view&,
+                                               std::string&) { ++pin_calls; })
+                    .ok());
     ASSERT_TRUE(
         server
-            .registerFunction(
-                Delegate,
-                [&](const std::string_view&, std::string&) {
-                    ++delegate_calls;
-                },
-                /*offload=*/true)
-            .ok());
-    ASSERT_TRUE(
-        server
-            .registerFunction(
-                Pin,
-                [&](const std::string_view&, std::string&) { ++pin_calls; })
-            .ok());
-    ASSERT_TRUE(
-        server
-            .registerFunction(
-                Unpin,
-                [&](const std::string_view&, std::string&) { ++unpin_calls; })
+            .registerFunction(Unpin, [&](const std::string_view&,
+                                         std::string&) { ++unpin_calls; })
             .ok());
 
     uint16_t port = 0;
