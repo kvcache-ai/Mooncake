@@ -64,6 +64,22 @@ namespace mooncake {
 namespace {
 constexpr std::chrono::seconds kIpcRequestRecvTimeout{5};
 
+size_t DivideRoundUp(size_t value, size_t divisor) {
+    return value / divisor + (value % divisor != 0);
+}
+
+size_t GetNextSegmentSize(size_t remaining,
+                          const std::optional<size_t> &split_limit,
+                          size_t alignment) {
+    if (!split_limit.has_value()) return remaining;
+    const size_t aligned_limit = (*split_limit / alignment) * alignment;
+    if (aligned_limit == 0) return 0;
+    const size_t segment_count = DivideRoundUp(remaining, aligned_limit);
+    const size_t balanced_size = DivideRoundUp(remaining, segment_count);
+    return std::min(remaining,
+                    DivideRoundUp(balanced_size, alignment) * alignment);
+}
+
 bool IsHostStoreSegmentProtocol(const std::string &protocol) {
     return protocol.empty() || protocol == "tcp" || protocol == "rdma" ||
            protocol == "efa" || protocol == "cxi" || protocol == "rpc_only";
@@ -868,9 +884,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         LOG(INFO) << "Local buffer size is 0, skip registering local memory";
     }
 
-    // If global_segment_size is 0, skip mount segment;
-    // If global_segment_size is larger than max_mr_size, split to multiple
-    // mapped_shms.
+    // If global_segment_size is 0, skip mount segment. Transports with a
+    // registration limit split it into balanced chunks; other transports use
+    // one segment.
     if (protocol == "cxl") {
         size_t cxl_dev_size = 0;
         const char *env = std::getenv("MC_CXL_DEV_SIZE");
@@ -895,9 +911,11 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
 
     } else {
-        auto max_mr_size = globalConfig().max_mr_size;     // Max segment size
         uint64_t total_glbseg_size = global_segment_size;  // For logging
         uint64_t current_glbseg_size = 0;                  // For logging
+
+        const auto split_limit = GetTransportRegistrationLimit(protocol);
+        const size_t alignment = facebook::cachelib::Slab::kSize;
 
         // For RDMA, auto-discover NUMA nodes with NICs and distribute
         // global_segment across them for full NIC utilization.
@@ -921,7 +939,13 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             protocol == "rdma" && should_use_hugepage;
 
         while (global_segment_size > 0) {
-            size_t segment_size = std::min(global_segment_size, max_mr_size);
+            size_t segment_size =
+                GetNextSegmentSize(global_segment_size, split_limit, alignment);
+            if (segment_size == 0) {
+                LOG(ERROR) << "Registration limit is smaller than segment "
+                              "alignment";
+                return tl::unexpected(ErrorCode::INVALID_PARAMS);
+            }
             global_segment_size -= segment_size;
 
             size_t mapped_size = segment_size;
@@ -963,8 +987,10 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
                 LOG(ERROR) << "Failed to allocate segment memory";
                 return tl::unexpected(ErrorCode::INVALID_PARAMS);
             }
-            current_glbseg_size += mapped_size;
-            LOG(INFO) << "Mounting segment: " << mapped_size << " bytes, "
+            const size_t mount_size =
+                split_limit.has_value() ? segment_size : mapped_size;
+            current_glbseg_size += mount_size;
+            LOG(INFO) << "Mounting segment: " << mount_size << " bytes, "
                       << current_glbseg_size << " of " << total_glbseg_size;
 
             if (this->protocol == "ascend" || this->protocol == "ubshmem") {
@@ -1010,7 +1036,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             auto pinned_region =
                 TryPinStoreSegment(ptr, mapped_size, this->protocol, "setup");
             auto mount_result =
-                client_->MountSegment(ptr, mapped_size, protocol, seg_location);
+                client_->MountSegment(ptr, mount_size, protocol, seg_location);
             if (!mount_result.has_value()) {
                 if (!ReleasePinnedRegionForFree(pinned_region,
                                                 "Store setup segment")) {
@@ -1214,8 +1240,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         get_config(config, CONFIG_KEY_IPC_SOCKET_PATH);
 
     // A size of 0 keeps the pure client/server setup semantics.
-    // global_segment_size is a total capacity and may exceed max_mr_size; the
-    // setup path splits it into mountable chunks below.
+    // global_segment_size is a total capacity; protocols with a registration
+    // limit split it into mountable chunks below.
     auto validate_min_size = [](const char *key, size_t value) {
         if (value != 0 && value < MIN_SEGMENT_SIZE) {
             LOG(ERROR) << "Invalid " << key << ": " << value
@@ -1372,18 +1398,7 @@ int RealClient::mountSegment(const std::string &path, size_t offset,
         return -1;
     }
 
-    size_t max_mr_size = globalConfig().max_mr_size;
-    if (max_mr_size == 0) {
-        LOG(ERROR) << "Invalid max_mr_size: 0";
-        return -1;
-    }
-
     size_t page_size = sysconf(_SC_PAGESIZE);
-    if (max_mr_size < page_size) {
-        LOG(ERROR) << "max_mr_size " << max_mr_size
-                   << " is smaller than page_size " << page_size;
-        return -1;
-    }
 
     int fd = open(path.c_str(), O_RDWR);
     if (fd < 0) {
@@ -1412,14 +1427,15 @@ int RealClient::mountSegment(const std::string &path, size_t offset,
         return -1;
     }
 
-    size_t aligned_max_chunk = (max_mr_size / page_size) * page_size;
+    const auto split_limit = GetTransportRegistrationLimit(protocol);
     size_t remaining = size;
     size_t current_offset = offset;
     std::vector<std::string> mounted_ids;
     std::vector<MountedSegmentRecord> mounted_records;
 
     while (remaining > 0) {
-        size_t chunk_size = std::min(remaining, aligned_max_chunk);
+        size_t chunk_size =
+            GetNextSegmentSize(remaining, split_limit, page_size);
         if (chunk_size == 0) break;
 
         void *ptr = mmap(nullptr, chunk_size, PROT_READ | PROT_WRITE,
@@ -1625,34 +1641,12 @@ int RealClient::allocateAndMountSegment(
         return -1;
     }
 
-    size_t max_mr_size = globalConfig().max_mr_size;
-    if (max_mr_size == 0) {
-        LOG(ERROR) << "Invalid max_mr_size: 0";
-        return -1;
-    }
-
     if (size == 0) {
         LOG(ERROR) << "size is 0";
         return -1;
     }
 
     const size_t slab_size = facebook::cachelib::Slab::kSize;
-    size_t page_size = sysconf(_SC_PAGESIZE);
-    if (max_mr_size < page_size) {
-        LOG(ERROR) << "max_mr_size " << max_mr_size
-                   << " is smaller than page_size " << page_size;
-        return -1;
-    }
-
-    size_t aligned_max_chunk = (max_mr_size / page_size) * page_size;
-    if (aligned_max_chunk < slab_size) {
-        LOG(ERROR) << "max_mr_size " << max_mr_size
-                   << " is smaller than slab_size " << slab_size;
-        return -1;
-    }
-    // Round down chunk size to slab_size multiple
-    aligned_max_chunk = (aligned_max_chunk / slab_size) * slab_size;
-
     // Check overflow before aligning up to slab_size
     if (size > std::numeric_limits<size_t>::max() - (slab_size - 1)) {
         LOG(ERROR) << "size " << size
@@ -1662,12 +1656,14 @@ int RealClient::allocateAndMountSegment(
     // Round up total size to slab_size multiple
     size_t aligned_total_size =
         ((size + slab_size - 1) / slab_size) * slab_size;
+    const auto split_limit = GetTransportRegistrationLimit(protocol);
     size_t remaining = aligned_total_size;
     std::vector<std::string> mounted_ids;
     std::vector<AllocatedSegmentRecord> allocated_records;
 
     while (remaining > 0) {
-        size_t chunk_size = std::min(remaining, aligned_max_chunk);
+        size_t chunk_size =
+            GetNextSegmentSize(remaining, split_limit, slab_size);
         if (chunk_size == 0) break;
 
         void *ptr = allocate_buffer_allocator_memory(chunk_size, protocol);
