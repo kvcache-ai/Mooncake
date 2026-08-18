@@ -87,6 +87,9 @@ class HotStandbyServiceTest : public ::testing::Test {
 
 namespace {
 
+constexpr char kEtcdBehaviorCoverageIssue[] =
+    "https://github.com/kvcache-ai/Mooncake/issues/3496";
+
 std::unique_ptr<HotStandbyService> CreateSnapshotOnlyReadyStandby(
     HotStandbyConfig config, const std::string& cluster_id) {
     config.enable_snapshot_bootstrap = true;
@@ -112,7 +115,25 @@ std::unique_ptr<HotStandbyService> CreateSnapshotOnlyReadyStandby(
 
 }  // namespace
 
-// ========== 6.1.1 Stop tests ==========
+// ========== 6.1.1 Start/Stop tests ==========
+
+TEST_F(HotStandbyServiceTest, TestStart) {
+    GTEST_SKIP() << "Requires deterministic etcd-backed Start coverage; see "
+                 << kEtcdBehaviorCoverageIssue;
+}
+
+TEST_F(HotStandbyServiceTest, TestStart_AlreadyRunning) {
+    service_ = CreateSnapshotOnlyReadyStandby(config_, cluster_id_);
+
+    EXPECT_EQ(ErrorCode::OK,
+              service_->Start("unused", "unused", "unused-cluster"));
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+}
+
+TEST_F(HotStandbyServiceTest, TestStart_InvalidEtcdEndpoints) {
+    GTEST_SKIP() << "Requires deterministic invalid-endpoint coverage; see "
+                 << kEtcdBehaviorCoverageIssue;
+}
 
 TEST_F(HotStandbyServiceTest, TestStop_WhenNotRunning) {
     EXPECT_EQ(StandbyState::STOPPED, service_->GetState());
@@ -120,6 +141,24 @@ TEST_F(HotStandbyServiceTest, TestStop_WhenNotRunning) {
     EXPECT_EQ(StandbyState::STOPPED, service_->GetState());
     service_->Stop();
     EXPECT_EQ(StandbyState::STOPPED, service_->GetState());
+}
+
+// ========== 6.1.2 State transition tests ==========
+
+TEST_F(HotStandbyServiceTest, TestStateTransition_StartToWatching) {
+    GTEST_SKIP() << "Requires deterministic etcd-backed state coverage; see "
+                 << kEtcdBehaviorCoverageIssue;
+}
+
+TEST_F(HotStandbyServiceTest, TestStateTransition_ConnectionFailed) {
+    GTEST_SKIP() << "Requires deterministic connection-failure coverage; see "
+                 << kEtcdBehaviorCoverageIssue;
+}
+
+TEST_F(HotStandbyServiceTest, TestStateTransition_SyncFailed) {
+    GTEST_SKIP() << "Requires deterministic synchronization-failure coverage; "
+                    "see "
+                 << kEtcdBehaviorCoverageIssue;
 }
 
 // ========== 6.1.3 Sync status tests ==========
@@ -132,6 +171,11 @@ TEST_F(HotStandbyServiceTest, TestGetSyncStatus_InitialState) {
     EXPECT_FALSE(status.is_syncing);
     EXPECT_FALSE(status.is_connected);
     EXPECT_EQ(StandbyState::STOPPED, status.state);
+}
+
+TEST_F(HotStandbyServiceTest, TestGetSyncStatus_AfterSync) {
+    GTEST_SKIP() << "Requires deterministic post-sync status coverage; see "
+                 << kEtcdBehaviorCoverageIssue;
 }
 
 // ========== 6.1.4 Promotion tests ==========
@@ -191,6 +235,26 @@ TEST_F(HotStandbyServiceTest, TestPromoteAndExportSnapshot_FinalCatchUp) {
     EXPECT_EQ(10u, post_snapshot.oplog_sequence_id);
     ASSERT_EQ(1u, post_snapshot.objects.size());
     EXPECT_EQ("key-1", post_snapshot.objects[0].key);
+}
+
+// ========== 6.1.5 Warm start tests ==========
+
+TEST_F(HotStandbyServiceTest, TestWarmStart_WithLocalState) {
+    GTEST_SKIP() << "Requires deterministic local-state warm-start coverage; "
+                    "see "
+                 << kEtcdBehaviorCoverageIssue;
+}
+
+TEST_F(HotStandbyServiceTest, TestWarmStart_WithoutLocalState) {
+    GTEST_SKIP() << "Requires deterministic empty-state warm-start coverage; "
+                    "see "
+                 << kEtcdBehaviorCoverageIssue;
+}
+
+TEST_F(HotStandbyServiceTest, TestWarmStart_WithSnapshot) {
+    GTEST_SKIP() << "Requires deterministic etcd-backed snapshot warm-start "
+                    "coverage; see "
+                 << kEtcdBehaviorCoverageIssue;
 }
 
 TEST_F(HotStandbyServiceTest, TestStart_SnapshotOnlyWithSnapshot) {
@@ -321,6 +385,35 @@ TEST_F(HotStandbyServiceTest, TestExportStandbySnapshot_Empty) {
     EXPECT_EQ(0u, snapshot.oplog_sequence_id);
     EXPECT_TRUE(snapshot.objects.empty());
     EXPECT_TRUE(snapshot.segments.empty());
+}
+
+// ========== 6.1.7 Replication loop tests ==========
+
+TEST_F(HotStandbyServiceTest, TestReplicationLoop_UpdatesMetrics) {
+    GTEST_SKIP() << "Requires deterministic replication-loop metric coverage; "
+                    "see "
+                 << kEtcdBehaviorCoverageIssue;
+}
+
+TEST_F(HotStandbyServiceTest, TestReplicationLoop_HandlesDisconnect) {
+    GTEST_SKIP() << "Requires deterministic replication disconnect coverage; "
+                    "see "
+                 << kEtcdBehaviorCoverageIssue;
+}
+
+// ========== 6.1.8 Verification loop tests ==========
+
+TEST_F(HotStandbyServiceTest, TestVerificationLoop_WhenEnabled) {
+    GTEST_SKIP()
+        << "Requires deterministic enabled verification-loop coverage; "
+           "see "
+        << kEtcdBehaviorCoverageIssue;
+}
+
+TEST_F(HotStandbyServiceTest, TestVerificationLoop_WhenDisabled) {
+    GTEST_SKIP()
+        << "Requires deterministic disabled verification-loop coverage; see "
+        << kEtcdBehaviorCoverageIssue;
 }
 
 // ========== Issue 2 fail-closed catch-up ==========
