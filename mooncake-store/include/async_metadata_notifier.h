@@ -18,8 +18,9 @@
 
 namespace mooncake {
 
-// Called when an async ADD fails with a non-transient error.
-// Caller should delete the local replica.
+// Called when an async ADD reaches Master but Master rejects the mutation.
+// Caller should delete the local replica. Transport/RPC failures are treated as
+// dropped metadata notifications and do not invoke this callback.
 using SyncFailureCallback = std::function<void(
     std::string_view key, const UUID& segment_id, ErrorCode error)>;
 

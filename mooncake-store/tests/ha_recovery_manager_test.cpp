@@ -118,20 +118,24 @@ class HARecoveryManagerTest : public ::testing::Test {
         return seg;
     }
 
-    std::unique_ptr<HARecoveryManager> CreateManager() {
-        return std::make_unique<HARecoveryManager>(client_id_, *master_client_,
-                                                   data_manager_, notifier_,
-                                                   view_version_);
+    std::unique_ptr<HARecoveryManager> CreateManager(
+        HARecoveryManager::RecoveryMode recovery_mode =
+            HARecoveryManager::RecoveryMode::FullMetadataSync) {
+        return std::make_unique<HARecoveryManager>(
+            client_id_, *master_client_, data_manager_, notifier_,
+            view_version_, HAClientState::FULL, recovery_mode);
     }
 
-    std::unique_ptr<HARecoveryManager> CreateManagerWithNotifier() {
+    std::unique_ptr<HARecoveryManager> CreateManagerWithNotifier(
+        HARecoveryManager::RecoveryMode recovery_mode =
+            HARecoveryManager::RecoveryMode::FullMetadataSync) {
         notifier_ =
             std::make_unique<AsyncMetadataNotifier>(*master_client_, client_id_,
                                                     /*sender_thread_count=*/1,
                                                     /*max_batch_size=*/2000,
                                                     /*queue_capacity=*/4000);
         notifier_->Start();
-        return CreateManager();
+        return CreateManager(recovery_mode);
     }
 
     std::optional<UUID> InitLocalDataManagerAndPut(const std::string& key,
@@ -407,6 +411,33 @@ TEST_F(HARecoveryManagerTest, ReconnectResyncsLocalReplicaToP2PMaster) {
     const auto& desc = replica.get_p2p_proxy_descriptor();
     EXPECT_EQ(desc.client_id, client_id_);
     EXPECT_EQ(desc.segment_id, tier_id.value());
+}
+
+TEST_F(HARecoveryManagerTest, RegisterOnlyRecoverySkipsLocalReplicaResync) {
+    const std::string key = "register-only-key-" +
+                            std::to_string(client_id_.first) + "-" +
+                            std::to_string(client_id_.second);
+    const std::string value = "register-only-value";
+    auto tier_id = InitLocalDataManagerAndPut(key, value);
+    ASSERT_TRUE(tier_id.has_value());
+    MountLocalTierOnMaster(tier_id.value());
+
+    auto mgr = CreateManagerWithNotifier(
+        HARecoveryManager::RecoveryMode::RegisterOnly);
+    mgr->SetReadyForRecovery();
+
+    mgr->HandleEvent(HAEvent::MASTER_UNREACHABLE);
+    EXPECT_EQ(mgr->GetState(), HAClientState::DEGRADED);
+    EXPECT_FALSE(notifier_->running_.load());
+
+    mgr->HandleEvent(HAEvent::MASTER_RECONNECTED);
+    EXPECT_TRUE(notifier_->running_.load());
+    WaitUntilFull(*mgr);
+
+    auto& svc = master_.GetWrapped().GetMasterService();
+    auto result = svc.GetReplicaList(key);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), ErrorCode::OBJECT_NOT_FOUND);
 }
 
 // ============================================================================

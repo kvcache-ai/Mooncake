@@ -50,6 +50,13 @@ ErrorCode P2PMasterService::RecordOplog(OpType type, const std::string& key,
 
 auto P2PMasterService::RegisterClient(const RegisterClientRequest& req)
     -> tl::expected<RegisterClientResponse, ErrorCode> {
+    if (req.deployment_mode != DeploymentMode::P2P) {
+        LOG(ERROR) << "RegisterClient(P2P): rejected non-P2P client"
+                   << ", client_id=" << req.client_id << ", deployment_mode="
+                   << static_cast<int>(req.deployment_mode);
+        return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+    }
+
     if (GetClientManager().GetClient(req.client_id)) {
         LOG(WARNING) << "RegisterClient(P2P): client already exists"
                      << ", client_id=" << req.client_id;

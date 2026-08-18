@@ -24,7 +24,7 @@ namespace mooncake {
  * State machine (2 events: MASTER_UNREACHABLE, MASTER_REACHABLE):
  *   FULL ──MASTER_UNREACHABLE─────> DEGRADED
  *   FULL ──MASTER_REACHABLE───────> SYNCING  (Master restarted)
- *   DEGRADED ──MASTER_REACHABLE───> SYNCING  (always full re-sync)
+ *   DEGRADED ──MASTER_REACHABLE───> SYNCING  (recovery mode decides work)
  *   SYNCING ──recovery complete───> FULL
  *   SYNCING ──MASTER_UNREACHABLE──> DEGRADED
  *   SYNCING ──MASTER_REACHABLE────> SYNCING  (restart pipeline)
@@ -37,11 +37,18 @@ namespace mooncake {
  */
 class HARecoveryManager {
    public:
-    HARecoveryManager(const UUID& client_id, P2PMasterClient& master_client,
-                      std::optional<DataManager>& data_manager,
-                      std::unique_ptr<AsyncMetadataNotifier>& notifier,
-                      std::atomic<ViewVersionId>& view_version,
-                      HAClientState initial_state = HAClientState::FULL);
+    enum class RecoveryMode {
+        FullMetadataSync,
+        RegisterOnly,
+    };
+
+    HARecoveryManager(
+        const UUID& client_id, P2PMasterClient& master_client,
+        std::optional<DataManager>& data_manager,
+        std::unique_ptr<AsyncMetadataNotifier>& notifier,
+        std::atomic<ViewVersionId>& view_version,
+        HAClientState initial_state = HAClientState::FULL,
+        RecoveryMode recovery_mode = RecoveryMode::FullMetadataSync);
     ~HARecoveryManager();
 
     HARecoveryManager(const HARecoveryManager&) = delete;
@@ -90,6 +97,7 @@ class HARecoveryManager {
     void TransitionState(HAClientState to, const std::string& reason);
     void StartRecoveryThread();
     void RecoveryPipelineMain(AbortToken need_abort);
+    void FinishRecovery(AbortToken need_abort);
 
     /**
      * @brief Retry enqueue until success or abort is signalled.
@@ -114,6 +122,7 @@ class HARecoveryManager {
     std::optional<DataManager>& data_manager_;
     std::unique_ptr<AsyncMetadataNotifier>& notifier_;
     std::atomic<ViewVersionId>& view_version_;
+    RecoveryMode recovery_mode_;
 
     std::atomic<HAClientState> state_;
     std::atomic<bool> ready_for_recovery_{
