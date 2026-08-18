@@ -46,98 +46,6 @@ HotStandbyService::HotStandbyService(const HotStandbyConfig& config)
     });
 }
 
-// StandbyMetadataStore implementation
-bool HotStandbyService::StandbyMetadataStore::PutMetadata(
-    const std::string& tenant_id, const std::string& key,
-    const StandbyObjectMetadata& metadata) {
-    const auto normalized = NormalizeTenantId(tenant_id);
-    std::lock_guard<std::mutex> lock(mutex_);
-    store_[normalized][key] = metadata;
-    VLOG(2) << "StandbyMetadataStore: stored metadata for tenant=" << normalized
-            << ", key=" << key << ", replicas=" << metadata.replicas.size()
-            << ", size=" << metadata.size;
-    return true;
-}
-
-bool HotStandbyService::StandbyMetadataStore::Put(const std::string& key,
-                                                  const std::string& payload) {
-    // Legacy interface - create empty metadata for default tenant
-    StandbyObjectMetadata metadata;
-    std::lock_guard<std::mutex> lock(mutex_);
-    store_["default"][key] = metadata;
-    return true;
-}
-
-std::optional<StandbyObjectMetadata>
-HotStandbyService::StandbyMetadataStore::GetMetadata(
-    const std::string& tenant_id, const std::string& key) const {
-    const auto normalized = NormalizeTenantId(tenant_id);
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto tenant_it = store_.find(normalized);
-    if (tenant_it == store_.end()) return std::nullopt;
-    auto it = tenant_it->second.find(key);
-    if (it == tenant_it->second.end()) return std::nullopt;
-    return it->second;
-}
-
-bool HotStandbyService::StandbyMetadataStore::Remove(
-    const std::string& tenant_id, const std::string& key) {
-    const auto normalized = NormalizeTenantId(tenant_id);
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto tenant_it = store_.find(normalized);
-    if (tenant_it == store_.end()) return false;
-    auto it = tenant_it->second.find(key);
-    if (it == tenant_it->second.end()) return false;
-    tenant_it->second.erase(it);
-    if (tenant_it->second.empty()) {
-        store_.erase(tenant_it);
-    }
-    return true;
-}
-
-bool HotStandbyService::StandbyMetadataStore::Exists(
-    const std::string& tenant_id, const std::string& key) const {
-    const auto normalized = NormalizeTenantId(tenant_id);
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto tenant_it = store_.find(normalized);
-    if (tenant_it == store_.end()) return false;
-    return tenant_it->second.find(key) != tenant_it->second.end();
-}
-
-size_t HotStandbyService::StandbyMetadataStore::GetKeyCount() const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    size_t total = 0;
-    for (const auto& [tid, tenant_map] : store_) {
-        total += tenant_map.size();
-    }
-    return total;
-}
-
-size_t HotStandbyService::StandbyMetadataStore::GetKeyCountForTenant(
-    const std::string& tenant_id) const {
-    const auto normalized = NormalizeTenantId(tenant_id);
-    std::lock_guard<std::mutex> lock(mutex_);
-    auto it = store_.find(normalized);
-    return it == store_.end() ? 0 : it->second.size();
-}
-
-void HotStandbyService::StandbyMetadataStore::Clear() {
-    std::lock_guard<std::mutex> lock(mutex_);
-    store_.clear();
-}
-
-void HotStandbyService::StandbyMetadataStore::Snapshot(
-    std::vector<StandbyObjectEntry>& out) const {
-    std::lock_guard<std::mutex> lock(mutex_);
-    out.clear();
-    for (const auto& [tenant_id, tenant_store] : store_) {
-        for (const auto& [key, metadata] : tenant_store) {
-            out.push_back(StandbyObjectEntry{NormalizeTenantId(tenant_id), key,
-                                             metadata});
-        }
-    }
-}
-
 HotStandbyService::~HotStandbyService() {
     // Always ensure threads are joined, regardless of state
     // This prevents std::terminate() if threads are still joinable
@@ -324,8 +232,13 @@ ErrorCode HotStandbyService::LoadSnapshotBaselineLocked(
               << ", snapshot_seq_id=" << snapshot.snapshot_sequence_id
               << ", keys=" << snapshot.metadata.size();
     for (const auto& entry : snapshot.metadata) {
-        metadata_store_->PutMetadata(entry.tenant_id, entry.key,
-                                     entry.metadata);
+        if (!metadata_store_->RestoreMetadata(entry.tenant_id, entry.key,
+                                              entry.metadata)) {
+            LOG(ERROR) << "Snapshot baseline contains duplicate object: tenant="
+                       << entry.tenant_id << ", key=" << entry.key;
+            metadata_store_->Clear();
+            return ErrorCode::DESERIALIZE_FAIL;
+        }
     }
     // Load segment registry from snapshot
     if (oplog_applier_) {
@@ -395,6 +308,7 @@ void HotStandbyService::SetCatchUpBatchKvBackendForTesting(
 }
 
 void HotStandbyService::StopReplicationLoop() {
+    CancelSnapshotCapture();
     replication_loop_running_.store(false, std::memory_order_release);
     replication_loop_cv_.notify_all();
     if (replication_thread_.joinable()) {
@@ -737,6 +651,97 @@ bool HotStandbyService::ExportStandbySnapshot(StandbySnapshot& out) const {
     return true;
 }
 
+std::optional<BatchOpLogSnapshotCapture>
+HotStandbyService::BeginBatchOpLogSnapshotCapture() {
+    std::unique_lock<std::mutex> service_lock(mutex_);
+    auto state = snapshot_capture_state_;
+    std::unique_lock<std::mutex> capture_lock(state->mutex);
+    if (!IsRunning() || !batch_standby_reader_ || state->requested ||
+        state->active) {
+        return std::nullopt;
+    }
+
+    ++state->generation;
+    state->requested = true;
+    service_lock.unlock();
+    replication_loop_cv_.notify_all();
+    state->cv.wait(capture_lock, [&state] { return !state->requested; });
+    if (!ready_snapshot_capture_ || !state->active) {
+        return std::nullopt;
+    }
+
+    auto capture = std::move(*ready_snapshot_capture_);
+    ready_snapshot_capture_.reset();
+    return capture;
+}
+
+bool HotStandbyService::CopyNextBatchOpLogSnapshotChunk(
+    size_t count, BatchOpLogSnapshotCapture& capture,
+    std::vector<StandbyObjectEntry>& out) {
+    auto state = snapshot_capture_state_;
+    std::lock_guard<std::mutex> lock(state->mutex);
+    if (capture.lease_state_ != state || !state->active ||
+        capture.generation_ != state->generation || !metadata_store_) {
+        out.clear();
+        return false;
+    }
+    return metadata_store_->CopyNextSnapshotChunk(count, capture.cursor_, out);
+}
+
+void HotStandbyService::EndBatchOpLogSnapshotCapture(
+    BatchOpLogSnapshotCapture& capture) {
+    if (capture.lease_state_ == snapshot_capture_state_) {
+        capture.Release();
+    }
+}
+
+void HotStandbyService::HandleSnapshotCaptureRequest(
+    const OpLogBatchStandbyPollResult& result) {
+    auto state = snapshot_capture_state_;
+    std::unique_lock<std::mutex> lock(state->mutex);
+    if (!state->requested) {
+        return;
+    }
+
+    state->requested = false;
+    auto applied_prefix = batch_standby_reader_->GetLastAppliedDurablePrefix();
+    const uint64_t expected = oplog_applier_->GetExpectedSequenceId();
+    const bool consistent =
+        result.error == ErrorCode::OK && result.durable_prefix_present &&
+        applied_prefix && *applied_prefix == result.durable_prefix &&
+        expected > 0 && expected - 1 == applied_prefix->last_seq;
+    if (consistent && IsRunning() && metadata_store_) {
+        BatchOpLogSnapshotCapture capture(
+            applied_prefix->last_seq, applied_prefix->batch_id,
+            applied_prefix->producer_view_version,
+            oplog_applier_->GetSegmentRegistry().GetAllSegments(),
+            metadata_store_->BeginSnapshotTraversal(), state->generation,
+            state);
+        ready_snapshot_capture_ = std::move(capture);
+        state->active = true;
+    }
+    state->cv.notify_all();
+
+    state->cv.wait(lock, [this, &state] {
+        return !state->active ||
+               !replication_loop_running_.load(std::memory_order_acquire);
+    });
+}
+
+void HotStandbyService::CancelSnapshotCapture() {
+    auto state = snapshot_capture_state_;
+    std::optional<BatchOpLogSnapshotCapture> ready_capture;
+    {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->requested = false;
+        state->active = false;
+        ready_capture = std::move(ready_snapshot_capture_);
+        ready_snapshot_capture_.reset();
+        state->cv.notify_all();
+    }
+    ready_capture.reset();
+}
+
 void HotStandbyService::SetSnapshotProvider(
     std::unique_ptr<SnapshotProvider> provider) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -779,6 +784,7 @@ void HotStandbyService::ReplicationLoop() {
             const uint64_t expected_before =
                 oplog_applier_->GetExpectedSequenceId();
             auto result = batch_standby_reader_->PollOnce();
+            HandleSnapshotCaptureRequest(result);
             if (result.durable_prefix_present) {
                 const uint64_t current_primary = primary_seq_id_.load();
                 if (result.durable_prefix.last_seq > current_primary) {
@@ -851,6 +857,9 @@ void HotStandbyService::ReplicationLoop() {
             std::chrono::milliseconds(config_.oplog_poll_interval_ms));
     }
 
+    replication_loop_running_.store(false, std::memory_order_release);
+    CancelSnapshotCapture();
+    replication_loop_cv_.notify_all();
     LOG(INFO) << "Replication loop stopped";
 }
 
