@@ -834,6 +834,15 @@ Status TransferEngineImpl::freeBatch(BatchID batch_id) {
 
 Status TransferEngineImpl::lazyFreeBatch() {
     std::lock_guard<std::recursive_mutex> lk(progress_mutex_);
+    // freelist is insertion-ordered. A batch that cannot be reclaimed on this
+    // pass (poll error, queue owners not yet terminal) must not stop the sweep:
+    // returning early would strand every batch queued behind it, and a
+    // permanent error would strand them for good. Skip it, keep going, and
+    // report the first error once the pass is complete. Most callers drop the
+    // returned status (the ProgressWorker sweeps on every step), so the skip is
+    // also logged here, rate-limited, or a permanently stuck batch would be
+    // re-polled forever without a trace.
+    Status first_error = Status::OK();
     for (auto it = batch_set_.freelist.begin();
          it != batch_set_.freelist.end();) {
         auto& batch = *it;
@@ -842,13 +851,23 @@ Status TransferEngineImpl::lazyFreeBatch() {
             continue;
         }
         TransferStatus overall_status;
-        CHECK_STATUS(getTransferStatus((BatchID)batch, overall_status));
-        if (overall_status.s == PENDING) {
+        auto status = getTransferStatus((BatchID)batch, overall_status);
+        if (status.ok() && overall_status.s == PENDING) {
             it++;
             continue;
         }
-        if (runtime_queue_config_.enabled && batch->queue_token != 0) {
-            CHECK_STATUS(retireQueueForBatch(batch));
+        if (status.ok() && runtime_queue_config_.enabled &&
+            batch->queue_token != 0) {
+            status = retireQueueForBatch(batch);
+        }
+        if (!status.ok()) {
+            LOG_EVERY_N(WARNING, 100)
+                << "lazyFreeBatch: batch " << batch
+                << " cannot be reclaimed yet, left in freelist: "
+                << status.ToString();
+            if (first_error.ok()) first_error = status;
+            it++;
+            continue;
         }
         for (size_t type = 0; type < kSupportedTransportTypes; ++type) {
             auto& transport = transport_list_[type];
@@ -860,7 +879,7 @@ Status TransferEngineImpl::lazyFreeBatch() {
         Slab<Batch>::Get().deallocate(batch);
         it = batch_set_.freelist.erase(it);
     }
-    return Status::OK();
+    return first_error;
 }
 
 Status TransferEngineImpl::retainBatch(BatchID batch_id, Batch*& batch) {
