@@ -34,6 +34,9 @@ class OpLogBatchStandbyReader {
                             OpLogApplier& applier);
 
     OpLogBatchStandbyPollResult PollOnce(size_t max_batches = 1024);
+    ErrorCode ReadProducerView(ViewVersionId& producer_view_version) const {
+        return storage_.ReadProducerView(producer_view_version);
+    }
     std::optional<DurablePrefix> GetLastAppliedDurablePrefix() const {
         return last_applied_durable_prefix_;
     }
