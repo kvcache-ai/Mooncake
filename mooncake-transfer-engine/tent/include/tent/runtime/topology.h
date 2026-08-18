@@ -31,6 +31,7 @@
 
 #include "tent/common/config.h"
 #include "tent/common/status.h"
+#include "tent/runtime/amd_location.h"
 namespace mooncake {
 namespace tent {
 class Platform;
@@ -158,6 +159,23 @@ class LocationParser {
     std::string type_;
     int index_;
 };
+
+// Canonical AMD GPU location prefix and alias handling live in
+// amd_location.h, shared with the rocm device plugin.
+
+inline std::string makeAmdGpuLocation(int device) {
+    return std::string(kAmdGpuLocationType) + ":" + std::to_string(device);
+}
+
+inline Topology::MemType memTypeFromLocation(const std::string& location) {
+    LocationParser parser(location);
+    const auto type = parser.type();
+    if (type == "cpu") return Topology::MEM_HOST;
+    if (type == "cuda" || type == "gpu") return Topology::MEM_CUDA;
+    if (isAmdGpuLocationType(type)) return Topology::MEM_ROCM;
+    if (type == "ascend") return Topology::MEM_ASCEND;
+    return Topology::MEM_UNKNOWN;
+}
 
 struct RangeLocation {
     uint64_t start;

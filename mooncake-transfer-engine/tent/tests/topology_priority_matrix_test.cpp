@@ -109,6 +109,31 @@ TEST(TopologyPriorityMatrixTest, RejectsMalformedMatrixEntries) {
         topology.parsePriorityMatrix(R"({"cpu:0": [[1], ["mlx5_1"]]})").ok());
 }
 
+TEST(TopologyPriorityMatrixTest, AmdGpuLocationUsesHipPrefixAndRocmAlias) {
+    EXPECT_EQ(memTypeFromLocation("hip:0"), Topology::MEM_ROCM);
+    EXPECT_EQ(memTypeFromLocation("rocm:3"), Topology::MEM_ROCM);
+    EXPECT_EQ(makeAmdGpuLocation(2), "hip:2");
+    EXPECT_TRUE(isAmdGpuLocationType("hip"));
+    EXPECT_TRUE(isAmdGpuLocationType("rocm"));
+    EXPECT_FALSE(isAmdGpuLocationType("cuda"));
+
+    Topology topology;
+    ASSERT_TRUE(topology
+                    .parsePriorityMatrix(R"json({
+          "hip:0": [["mlx5_0"], ["mlx5_1"]],
+          "rocm:1": [["mlx5_1"], ["mlx5_0"]]
+        })json")
+                    .ok());
+
+    const auto* hip0 = topology.getMemEntry("hip:0");
+    ASSERT_NE(hip0, nullptr);
+    EXPECT_EQ(hip0->type, Topology::MEM_ROCM);
+
+    const auto* rocm1 = topology.getMemEntry("rocm:1");
+    ASSERT_NE(rocm1, nullptr);
+    EXPECT_EQ(rocm1->type, Topology::MEM_ROCM);
+}
+
 TEST(TopologyPriorityMatrixTest, ParseCustomRoutesNativeFormat) {
     constexpr const char* kNative = R"json(
         {
