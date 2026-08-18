@@ -159,6 +159,46 @@ Applies when `MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR=bucket_storage_backend
 | `MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT` | `500` | Max keys per bucket |
 | `MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE` | `0` | Eviction threshold in bytes. When set to `0`, the backend uses **90% of the physical disk capacity** as the quota — it does not mean unlimited. Set an explicit value to control disk usage precisely. |
 | `MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY` | `fifo` | Eviction policy: `none` / `fifo` / `lru` |
+| `MOONCAKE_OFFLOAD_BUCKET_PERSIST_MODE` | `disabled` | How bucket data is flushed before its metadata is committed: `disabled` / `relaxed` / `strict`. Costs offload throughput; see [Bucket data durability](#bucket-data-durability) for what each level does and does not guarantee |
+
+#### Bucket data durability
+
+A bucket is written as two files: `<id>.bucket` holds the data and `<id>.meta` holds the metadata that restart recovery walks. Neither is flushed by default, so which of the two reaches the device first is decided by kernel writeback. If a crash lands after `.meta` is on the device but while part of `<id>.bucket` is still in the page cache, recovery finds metadata pointing at data that was never persisted, and those keys read back as corrupt.
+
+`MOONCAKE_OFFLOAD_BUCKET_PERSIST_MODE` chooses what the offload path does about that window. It applies to the **data** file only:
+
+| Value | After the data write | What it changes |
+|---|---|---|
+| `disabled` (default) | nothing | Nothing. Existing behavior |
+| `relaxed` | `sync_file_range(WAIT_BEFORE\|WRITE\|WAIT_AFTER)` on the data file | The bucket data is written back and waited for before `.meta` is written, instead of both files racing on writeback scheduling. On a filesystem whose metadata journal commits in order (ext4, xfs), that is enough to stop `.meta` from becoming durable ahead of the data |
+| `strict` | `fdatasync()` on the data file | The same, and additionally makes the bucket data itself durable: `fdatasync()` writes the file metadata needed to read the data back and flushes the device cache |
+
+Two limits are worth being explicit about, because they bound what any level can promise:
+
+- **`sync_file_range()` is not a data-integrity operation.** It does not write out file metadata; `sync_file_range(2)` warns that unless the application is strictly overwriting already-instantiated blocks — which this path is not, since each bucket is a freshly created file — there is no guarantee the data is available after a crash. `relaxed` buys ordering, not durability. It also adds nothing for a process crash: a dying process leaves the page cache intact, and the kernel still writes both files out.
+- **No level makes an offloaded object durable, because `.meta` is never flushed.** After `strict` returns, the bucket data is on the device but `.meta` is still only in the page cache. A crash in that window loses `.meta`, so restart recovery never sees the bucket and deletes the orphaned `.bucket` — the object is lost, exactly as it would be at `disabled`. What the setting removes is the *corrupt* outcome (metadata durable, data not), not the *lost* one. `strict`'s power-loss guarantee also assumes the device honors cache flushes and the filesystem is not mounted with barriers disabled, and it does not cover the directory entry.
+
+Both levels above `disabled` cost write throughput on the offload path. The cost is dominated by writing the bucket's own data out, so it grows with bucket size; `strict` adds a further roughly constant amount for what `fdatasync()` does beyond that (filesystem journal commit and device cache flush). Measured at the 62.5 MiB bucket that `MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT=500` produces at 128 KiB values, on one Samsung 990 PRO NVMe with a dedicated ext4 partition, single-threaded, 5 repetitions of 60 offloads:
+
+| Value | Per bucket (p50) | Offload throughput (mean) |
+|---|---|---|
+| `disabled` | 10.55 ms | 5693 MiB/s |
+| `relaxed` | 20.15 ms | 3006 MiB/s |
+| `strict` | 25.56 ms | 2398 MiB/s |
+
+```bash
+./build/mooncake-store/benchmarks/storage_backend_bench \
+  --backend=bucket --test=offload --value_size=131072 --batch_size=500 \
+  --num_operations=60 --warmup_operations=6 --verify=false \
+  --storage_path=<directory on the target device> \
+  --bucket_persist_mode=disabled   # then relaxed, then strict
+```
+
+`--storage_path` matters: its default is under `/tmp`, which is often a different device, or a tmpfs. The two columns are not two views of the same statistic — the per-bucket figure is the p50 latency and the throughput is derived from mean latency — so they do not divide into each other. The ratios travel better than the absolute numbers; measure on the target device before choosing.
+
+`disabled` does not avoid the write, it defers it: the bucket data stays dirty in the page cache until kernel writeback picks it up, so its cost lands on whatever else is using the device at that moment rather than on the offload call. Its 5693 MiB/s is the rate of filling the page cache, not a device rate. For the same reason, benchmarking these levels against each other requires a `sync` between runs, or `disabled`'s deferred writeback is charged to whichever level runs next.
+
+This setting is independent of `MOONCAKE_OFFSET_PERSIST_MODE`, which controls the offset-allocator backend.
 
 ### File-per-key backend settings
 
@@ -287,6 +327,7 @@ mooncake_client \
 
 - `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` must be an absolute path to an existing, writable directory. Symbolic links and paths containing `..` are rejected.
 - On real client restart, `bucket_storage_backend` and `file_per_key_storage_backend` scan existing SSD metadata and report it to the master, so previously offloaded objects remain accessible. `offset_allocator_storage_backend` does not support restart recovery.
+- What `bucket_storage_backend` recovers after an unclean shutdown depends on `MOONCAKE_OFFLOAD_BUCKET_PERSIST_MODE`; see [Bucket data durability](#bucket-data-durability).
 - Eviction only notifies the master and deletes local files; objects replicated on other nodes are unaffected.
 - Each machine requires its own real client process. In multi-node deployments, ensure `--host` and `--port` are correctly set so nodes can reach each other.
 
