@@ -1197,7 +1197,8 @@ PYBIND11_MODULE(store, m) {
                const py::object& engine = py::none(),
                const std::string& runtime_config = "",
                bool enable_metric_collection = true,
-               uint64_t metric_report_interval_seconds = 60) {
+               uint64_t metric_report_interval_seconds = 60,
+               uint16_t heartbeat_rpc_port = 0) {
                 auto real_client = self.init_real_client();
                 std::shared_ptr<mooncake::TransferEngine> transfer_engine =
                     nullptr;
@@ -1222,6 +1223,7 @@ PYBIND11_MODULE(store, m) {
                     p2p_key_lease_scan_interval_ms, p2p_transfer_direction_mode,
                     runtime_config, enable_metric_collection,
                     metric_report_interval_seconds);
+                config.heartbeat_rpc_port = heartbeat_rpc_port;
 
                 auto ret = real_client->setup(config);
                 return ret;
@@ -1246,6 +1248,7 @@ PYBIND11_MODULE(store, m) {
             py::arg("engine") = py::none(), py::arg("runtime_config") = "",
             py::arg("enable_metric_collection") = true,
             py::arg("metric_report_interval_seconds") = 60,
+            py::arg("heartbeat_rpc_port") = 0,
             "Setup the store in P2P architecture.")
         .def(
             "setup",
@@ -1261,7 +1264,8 @@ PYBIND11_MODULE(store, m) {
                bool enable_http_server = true,
                const std::string& runtime_config = "",
                bool enable_metric_collection = true,
-               uint64_t metric_report_interval_seconds = 60) {
+               uint64_t metric_report_interval_seconds = 60,
+               uint16_t heartbeat_rpc_port = 0) {
                 auto real_client = self.init_real_client();
                 std::shared_ptr<mooncake::TransferEngine> transfer_engine =
                     nullptr;
@@ -1280,6 +1284,7 @@ PYBIND11_MODULE(store, m) {
                         http_port, enable_http_server, {}, 50052,
                         runtime_config, enable_metric_collection,
                         metric_report_interval_seconds);
+                config.heartbeat_rpc_port = heartbeat_rpc_port;
 
                 auto ret = real_client->setup(config);
                 return ret;
@@ -1292,7 +1297,8 @@ PYBIND11_MODULE(store, m) {
             py::arg("enable_http_server") = true,
             py::arg("runtime_config") = "",
             py::arg("enable_metric_collection") = true,
-            py::arg("metric_report_interval_seconds") = 60)
+            py::arg("metric_report_interval_seconds") = 60,
+            py::arg("heartbeat_rpc_port") = 0)
         .def(
             "setup",
             [](MooncakeStorePyWrapper& self, const py::dict& config_dict) {
@@ -1321,7 +1327,9 @@ PYBIND11_MODULE(store, m) {
             "  protocol: Transfer protocol (default 'tcp').\n"
             "  rdma_devices: RDMA device list.\n"
             "  master_server_addr: Master server address.\n"
-            "  ipc_socket_path: IPC socket path.")
+            "  ipc_socket_path: IPC socket path.\n"
+            "  heartbeat_rpc_port: Dedicated heartbeat RPC port on the master "
+            "(0 = disabled, default 0).")
         .def(
             "setup_p2p_real_client",
             [](MooncakeStorePyWrapper& self, const py::dict& config_dict) {
@@ -1365,7 +1373,9 @@ PYBIND11_MODULE(store, m) {
             "  async_max_batch_size: Async route max batch size (default "
             "2000).\n"
             "  async_route_queue_size: Async route queue size (default 0).\n"
-            "  ipc_socket_path: IPC socket path.")
+            "  ipc_socket_path: IPC socket path.\n"
+            "  heartbeat_rpc_port: Dedicated heartbeat RPC port on the master "
+            "(0 = disabled, default 0).")
         .def(
             "setup_dummy",
             [](MooncakeStorePyWrapper& self, size_t mem_pool_size,
