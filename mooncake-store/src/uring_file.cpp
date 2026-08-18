@@ -272,6 +272,8 @@ class SharedUringRing {
     static constexpr unsigned BATCH_INDEX_BITS = 8;
     static constexpr uint64_t BATCH_INDEX_MASK =
         (uint64_t{1} << BATCH_INDEX_BITS) - 1;
+    static_assert(QUEUE_DEPTH <= BATCH_INDEX_MASK,
+                  "QUEUE_DEPTH exceeds batch index capacity");
 
     uint64_t next_operation_tag() { return (++op_id_) << BATCH_INDEX_BITS; }
 
@@ -502,7 +504,7 @@ class SharedUringRing {
     // -----------------------------------------------------------------
     // Data members
     // -----------------------------------------------------------------
-    struct io_uring ring_ {};
+    struct io_uring ring_{};
     bool initialized_ = false;
 
     bool buf_registered_ = false;

@@ -2016,8 +2016,9 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
                 const auto& batch_plan = batch_read_plans[i];
                 const auto& plan = *batch_plan.plan;
                 if (!desc.completed) {
-                    LOG(ERROR) << "batch_read did not complete for key: "
-                               << plan.key << ", bucket_id=" << plan.bucket_id;
+                    LOG(ERROR)
+                        << "batch_read did not complete for key: " << plan.key
+                        << ", bucket_id=" << plan.bucket_id;
                     return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
                 }
                 if (desc.bytes_read < batch_plan.min_required) {
