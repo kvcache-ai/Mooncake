@@ -13,6 +13,7 @@ enum class NvmeKvTransport {
     kAuto,
     kIoUring,
     kIoctl,
+    kSpdk,
 };
 
 const char* NvmeKvTransportName(NvmeKvTransport transport);

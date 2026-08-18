@@ -44,35 +44,14 @@ bool CanSubmitCallerBufferDirectly(std::string_view value,
 }
 
 bool IsCharacterDevice(const std::filesystem::path& path) {
-    struct stat st{};
+    struct stat st {};
     return ::stat(path.c_str(), &st) == 0 && S_ISCHR(st.st_mode);
-}
-
-std::string ResolveIoUringDevicePath(const std::string& device_path) {
-    const std::filesystem::path path(device_path);
-    if (IsCharacterDevice(path)) {
-        return device_path;
-    }
-
-    const std::string filename = path.filename().string();
-    if (filename.rfind("nvme", 0) != 0) {
-        return device_path;
-    }
-    const std::filesystem::path generic_path =
-        path.parent_path() / ("ng" + filename.substr(4));
-    if (IsCharacterDevice(generic_path)) {
-        LOG(INFO) << "[NvmeKvIoUringExecutor] using NVMe generic char device "
-                  << generic_path << " for namespace block device "
-                  << device_path;
-        return generic_path.string();
-    }
-    return device_path;
 }
 
 class SharedNvmeUringRing {
    public:
     struct BatchCommand {
-        struct nvme_uring_cmd cmd{};
+        struct nvme_uring_cmd cmd {};
         bool is_write = false;
         size_t context_index = 0;
         uint32_t observed_result = 0;
@@ -383,8 +362,13 @@ class NvmeKvIoUringExecutor : public NvmeKvCommandExecutor {
           capabilities_(capabilities) {}
 
     tl::expected<void, ErrorCode> Init() {
-        const std::string io_uring_device_path =
-            ResolveIoUringDevicePath(device_path_);
+        auto resolved_path = ResolveNvmeKvDevicePath(
+            device_path_, NvmeKvDevicePathType::kGenericCharacter, nsid_);
+        if (!resolved_path.has_value()) {
+            return tl::make_unexpected(resolved_path.error());
+        }
+        const std::string io_uring_device_path = resolved_path->path;
+        nsid_ = resolved_path->nsid;
         if (!IsCharacterDevice(io_uring_device_path)) {
             LOG(WARNING) << "[NvmeKvIoUringExecutor] io_uring requires an NVMe "
                             "generic character device, configured path="

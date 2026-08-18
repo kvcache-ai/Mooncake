@@ -359,6 +359,7 @@ target_link_libraries(mooncake_nof_core
                       PUBLIC glog::glog yalantinglibs::yalantinglibs
                              cachelib_memory_allocator mooncake_common)
 
+set(MOONCAKE_HAVE_SPDK_NVME_KV OFF)
 if(USE_NOF)
   set(SPDK_INCLUDE_DIR
       "/usr/local/include"
@@ -443,6 +444,12 @@ if(USE_NOF)
       ssl
       bsd)
 
+  if(EXISTS "${SPDK_INCLUDE_DIR}/spdk/nvme_kv.h")
+    set(MOONCAKE_HAVE_SPDK_NVME_KV ON)
+    list(APPEND MOONCAKE_STORE_CLIENT_SOURCES nvme_kv/executor_spdk.cpp)
+    message(STATUS "SPDK NVMe KV typed API enabled")
+  endif()
+
   # ---------------------------------------------------------------------------
   # SPDK-backed NoF initiator implementation, linked PRIVATE so SPDK/DPDK
   # static libs stop propagating as usage requirements to client/master.
@@ -456,6 +463,11 @@ if(USE_NOF)
   target_link_libraries(mooncake_nof_spdk
                         PRIVATE ${SPDK_STATIC_LIBS} glog::glog
                                 mooncake_nof_core yalantinglibs::yalantinglibs)
+
+  if(MOONCAKE_HAVE_SPDK_NVME_KV)
+    target_compile_definitions(mooncake_nof_spdk
+                               PRIVATE MOONCAKE_HAVE_SPDK_NVME_KV=1)
+  endif()
 
   # spdk_mem_register (SPDK >= 22.05) compile-time probe.
   # CMAKE_TRY_COMPILE_TARGET_TYPE was added in CMake 3.6 (project requires
@@ -616,6 +628,10 @@ target_link_libraries(
 if(BUILD_UNIT_TESTS)
   target_compile_definitions(mooncake_store_client_objects
                              PRIVATE MOONCAKE_ENABLE_NVME_KV_TEST_STUB=1)
+endif()
+if(MOONCAKE_HAVE_SPDK_NVME_KV)
+  target_compile_definitions(mooncake_store_client_objects
+                             PRIVATE MOONCAKE_HAVE_SPDK_NVME_KV=1)
 endif()
 if(TARGET Mooncake::liburing)
   target_compile_definitions(mooncake_store_client_objects PRIVATE USE_URING)
