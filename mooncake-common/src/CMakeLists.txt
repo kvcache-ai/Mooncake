@@ -1,5 +1,8 @@
 find_package(yaml-cpp REQUIRED)
-find_path(ASIO_INCLUDE_DIR asio.hpp REQUIRED)
+find_path(ASIO_INCLUDE_DIR asio.hpp)
+if(NOT ASIO_INCLUDE_DIR)
+  message(FATAL_ERROR "standalone Asio headers not found")
+endif()
 
 set(MOONCAKE_COMMON_SOURCES crc_checksum.cpp default_config.cpp environ.cpp
                             rpc_client_io_context.cpp)
