@@ -108,6 +108,11 @@ class ControlClient {
     static Status unpinStageBuffer(const std::string& server_addr,
                                    uint64_t addr);
 
+    using UnpinStageBufferCallback = std::function<void(Status)>;
+    static void unpinStageBufferAsync(const std::string& server_addr,
+                                      uint64_t addr,
+                                      UnpinStageBufferCallback callback);
+
     static void subscribeSegmentUpdateAsync(const std::string& server_addr,
                                             const std::string& subscriber_addr);
 

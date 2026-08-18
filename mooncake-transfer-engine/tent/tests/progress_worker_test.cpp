@@ -1127,27 +1127,26 @@ TEST(ProxyManager, LateRemoteCompletionReleasesAbandonedStageBuffer) {
     const auto remote_stage_addr =
         reinterpret_cast<uint64_t>(remote_stage.data());
 
-    ASSERT_TRUE(
-        remote_server
-            .registerFunction(
-                Pin,
-                [&](const std::string_view&, std::string& response) {
-                    bool expected = false;
-                    response = buffer_pinned.compare_exchange_strong(expected,
-                                                                      true)
-                                   ? std::to_string(remote_stage_addr)
-                                   : "0";
-                })
-            .ok());
-    ASSERT_TRUE(
-        remote_server
-            .registerFunction(
-                Unpin,
-                [&](const std::string_view&, std::string&) {
-                    buffer_pinned.store(false, std::memory_order_release);
-                    unpin_calls.fetch_add(1, std::memory_order_relaxed);
-                })
-            .ok());
+    ASSERT_TRUE(remote_server
+                    .registerFunction(
+                        Pin,
+                        [&](const std::string_view&, std::string& response) {
+                            bool expected = false;
+                            response = buffer_pinned.compare_exchange_strong(
+                                           expected, true)
+                                           ? std::to_string(remote_stage_addr)
+                                           : "0";
+                        })
+                    .ok());
+    ASSERT_TRUE(remote_server
+                    .registerFunction(
+                        Unpin,
+                        [&](const std::string_view&, std::string&) {
+                            buffer_pinned.store(false,
+                                                std::memory_order_release);
+                            unpin_calls.fetch_add(1, std::memory_order_relaxed);
+                        })
+                    .ok());
     ASSERT_TRUE(
         remote_server
             .registerFunction(
@@ -1155,7 +1154,8 @@ TEST(ProxyManager, LateRemoteCompletionReleasesAbandonedStageBuffer) {
                 [&](const std::string_view&, std::string&) {
                     delegate_started.store(true, std::memory_order_release);
                     while (!release_delegate.load(std::memory_order_acquire)) {
-                        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                        std::this_thread::sleep_for(
+                            std::chrono::milliseconds(1));
                     }
                 },
                 /*offload=*/true)
@@ -1214,7 +1214,8 @@ TEST(ProxyManager, LateRemoteCompletionReleasesAbandonedStageBuffer) {
             ControlClient::unpinStageBuffer(server_addr, repinned_addr).ok());
     }
 
-    EXPECT_TRUE(engine.unregisterLocalMemory(source.data(), source.size()).ok());
+    EXPECT_TRUE(
+        engine.unregisterLocalMemory(source.data(), source.size()).ok());
     EXPECT_TRUE(
         engine.unregisterLocalMemory(remote_stage.data(), remote_stage.size())
             .ok());

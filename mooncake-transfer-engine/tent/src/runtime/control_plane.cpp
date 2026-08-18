@@ -196,6 +196,25 @@ Status ControlClient::unpinStageBuffer(const std::string& server_addr,
     return Status::OK();
 }
 
+void ControlClient::unpinStageBufferAsync(const std::string& server_addr,
+                                          uint64_t addr,
+                                          UnpinStageBufferCallback callback) {
+    json j = addr;
+    std::string request_raw = j.dump();
+    tl_rpc_agent.callAsync(
+        server_addr, Unpin, request_raw,
+        [callback = std::move(callback)](Status status,
+                                         std::string response_raw) mutable {
+            if (!status.ok()) {
+                callback(std::move(status));
+                return;
+            }
+            callback(response_raw.empty()
+                         ? Status::OK()
+                         : Status::RpcServiceError(response_raw));
+        });
+}
+
 ControlService::ControlService(const std::string& type,
                                const std::string& servers,
                                TransferEngineImpl* impl)
