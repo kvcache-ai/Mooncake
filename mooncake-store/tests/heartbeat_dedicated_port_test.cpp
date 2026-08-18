@@ -79,17 +79,18 @@ TEST_F(HeartbeatDedicatedPortTest, HeartbeatNotRegisteredOnMainPort) {
         << "heartbeat server is enabled";
 }
 
-// 3. Non-heartbeat RPCs (ServiceReady) still reach the main port and succeed,
-// proving the main server still serves the rest of the API.
+// 3. Non-heartbeat RPCs still reach the main port and succeed, proving the
+// main server still serves the rest of the API (Connect already exercises
+// ServiceReady internally; ExistKey covers a data-path RPC).
 TEST_F(HeartbeatDedicatedPortTest, NonHeartbeatRpcStillServedOnMainPort) {
     UUID client_id = generate_uuid();
     CentralizedMasterClient client(client_id);
     client.SetHeartbeatRpcPort(static_cast<uint16_t>(heartbeat_port_));
     ASSERT_EQ(client.Connect(master_.master_address()), ErrorCode::OK);
 
-    auto ready = client.ServiceReady();
-    EXPECT_TRUE(ready.has_value())
-        << "ServiceReady should reach the main port and succeed";
+    auto exists = client.ExistKey("nonexistent_key_for_heartbeat_test");
+    EXPECT_TRUE(exists.has_value())
+        << "ExistKey should reach the main port and succeed";
 }
 
 // 4. With no dedicated heartbeat server configured (port=0, default), the
