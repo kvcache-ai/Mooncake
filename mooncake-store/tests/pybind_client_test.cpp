@@ -357,6 +357,42 @@ TEST_F(RealClientTest, DynamicMountApisBalanceLimitedSegments) {
     EXPECT_EQ(std::remove(path.c_str()), 0);
 }
 
+TEST_F(RealClientTest, DynamicMountApisDoNotSplitRdma) {
+    const size_t slab_size = facebook::cachelib::Slab::kSize;
+    ScopedMaxMrSize limit(4 * slab_size);
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder().build()));
+    master_address_ = master_.master_address();
+    ASSERT_EQ(py_client_->setup_real("localhost:17816", "P2PHANDSHAKE", 0, 0,
+                                     "tcp", "", master_address_),
+              0);
+
+    std::vector<std::string> allocated_ids;
+    size_t allocated_size = 0;
+    ASSERT_EQ(py_client_->allocateAndMountSegment(
+                  6 * slab_size, "rdma", "", allocated_ids, &allocated_size),
+              0);
+    ASSERT_EQ(allocated_ids.size(), 1u);
+
+    const std::string path = CreateTempSegmentFile(6 * slab_size);
+    ASSERT_FALSE(path.empty());
+    std::vector<std::string> mounted_ids;
+    ASSERT_EQ(py_client_->mountSegment(path, 0, 6 * slab_size, "rdma", "",
+                                       mounted_ids),
+              0);
+    ASSERT_EQ(mounted_ids.size(), 1u);
+
+    auto details = master_.service()->GetSegmentsDetailForAdmin();
+    ASSERT_TRUE(details.has_value());
+    ASSERT_EQ(details->size(), 2u);
+    for (const auto& detail : *details) {
+        EXPECT_EQ(detail.size_bytes, 6 * slab_size);
+    }
+
+    EXPECT_EQ(py_client_->unmountAndFreeSegment(allocated_ids), 0);
+    EXPECT_EQ(py_client_->unmountSegment(mounted_ids), 0);
+    EXPECT_EQ(std::remove(path.c_str()), 0);
+}
+
 TEST_F(RealClientTest, AllocateAndMountSegmentRejectsOverflowSize) {
     StartMasterAndSetupClient();
 
