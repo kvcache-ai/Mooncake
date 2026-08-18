@@ -1,6 +1,7 @@
 #include "device_comm/device_transfer/routes/p2p_route/p2p_route.h"
 
 #include <cstring>
+#include <utility>
 
 #include <transport/device/device_transport.h>
 
@@ -39,6 +40,13 @@ P2pRoute::P2pRoute(device::P2pTransport& transport, void* local_region,
       self_rank_(self_rank),
       max_world_size_(max_world_size) {}
 
+PGResult<void> P2pRoute::initialize() {
+    PG_VALIDATE_STATE(!snapshot_stream_, "P2P route is already initialized");
+    PG_TRY(auto snapshot_stream, GpuStream::createNonBlocking(device_index_));
+    snapshot_stream_.emplace(std::move(snapshot_stream));
+    return {};
+}
+
 std::string_view P2pRoute::routeKey() const noexcept { return kRouteKey; }
 
 uint32_t P2pRoute::routeVersion() const noexcept { return kEndpointVersion; }
@@ -59,6 +67,7 @@ std::vector<int32_t> P2pRoute::localHandle() const {
 
 PGResult<std::vector<DeviceTransferRoute>> P2pRoute::resolveRoutes(
     std::span<const std::optional<DeviceTransferEndpoint>> endpoints) {
+    PG_VALIDATE_STATE(snapshot_stream_, "P2P route is not initialized");
     PG_VALIDATE_ARG(endpoints.size() == max_world_size_,
                     "P2P route endpoint snapshot size does not match max world "
                     "size");
@@ -80,12 +89,15 @@ PGResult<std::vector<DeviceTransferRoute>> P2pRoute::resolveRoutes(
 
     std::vector<int32_t> available(max_world_size_, 0);
     std::vector<void*> region_bases(max_world_size_, nullptr);
-    PG_TRY_CUDA(cudaMemcpy(available.data(), transport_.availableTablePtr(),
-                           available.size() * sizeof(int32_t),
-                           cudaMemcpyDeviceToHost));
-    PG_TRY_CUDA(cudaMemcpy(region_bases.data(), transport_.peerPtrsTablePtr(),
-                           region_bases.size() * sizeof(void*),
-                           cudaMemcpyDeviceToHost));
+    PG_TRY_CUDA(
+        cudaMemcpyAsync(available.data(), transport_.availableTablePtr(),
+                        available.size() * sizeof(int32_t),
+                        cudaMemcpyDeviceToHost, snapshot_stream_->get()));
+    PG_TRY_CUDA(
+        cudaMemcpyAsync(region_bases.data(), transport_.peerPtrsTablePtr(),
+                        region_bases.size() * sizeof(void*),
+                        cudaMemcpyDeviceToHost, snapshot_stream_->get()));
+    PG_TRY(snapshot_stream_->synchronize());
 
     std::vector<DeviceTransferRoute> routes(max_world_size_);
     for (GlobalRank rank = 0; rank < static_cast<GlobalRank>(max_world_size_);

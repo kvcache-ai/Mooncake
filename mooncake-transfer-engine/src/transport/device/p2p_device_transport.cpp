@@ -246,6 +246,12 @@ class P2pDeviceTransportImpl : public P2pTransport {
         cudaMalloc(&peer_ptrs_dev_, num_ranks_ * sizeof(void*));
         for (int i = 0; i < num_ranks_; ++i) peer_ptrs_host_[i] = nullptr;
         cudaMemset(peer_ptrs_dev_, 0, num_ranks_ * sizeof(void*));
+        cudaError_t err = cudaStreamCreateWithFlags(&peer_table_stream_,
+                                                    cudaStreamNonBlocking);
+        if (err != cudaSuccess) {
+            LOG(FATAL) << "[EP P2P] failed to create peer table stream: "
+                       << cudaGetErrorString(err);
+        }
 #if defined(USE_CUDA)
         fabric_peer_mappings_.resize(num_ranks_);
 #endif
@@ -256,6 +262,7 @@ class P2pDeviceTransportImpl : public P2pTransport {
         cleanupFabricPeerMappings();
         cleanupFabricAllocations();
 #endif
+        if (peer_table_stream_) cudaStreamDestroy(peer_table_stream_);
         if (available_table_) cudaFree(available_table_);
         if (peer_ptrs_dev_) cudaFree(peer_ptrs_dev_);
         if (peer_ptrs_host_) {
@@ -580,10 +587,13 @@ class P2pDeviceTransportImpl : public P2pTransport {
                 available[dst] = 1;
                 peer_ptrs_host_[dst] = peer_ptr;
             }
-            cudaMemcpy(available_table_, available.data(),
-                       num_ranks_ * sizeof(int32_t), cudaMemcpyHostToDevice);
-            cudaMemcpy(peer_ptrs_dev_, peer_ptrs_host_,
-                       num_ranks_ * sizeof(void*), cudaMemcpyHostToDevice);
+            cudaMemcpyAsync(available_table_, available.data(),
+                            num_ranks_ * sizeof(int32_t),
+                            cudaMemcpyHostToDevice, peer_table_stream_);
+            cudaMemcpyAsync(peer_ptrs_dev_, peer_ptrs_host_,
+                            num_ranks_ * sizeof(void*), cudaMemcpyHostToDevice,
+                            peer_table_stream_);
+            cudaStreamSynchronize(peer_table_stream_);
             return;
         }
 #endif
@@ -708,10 +718,13 @@ class P2pDeviceTransportImpl : public P2pTransport {
             if (first_node != last_node) all_peers_accessible_ = false;
         }
 
-        cudaMemcpy(available_table_, available.data(),
-                   num_ranks_ * sizeof(int32_t), cudaMemcpyHostToDevice);
-        cudaMemcpy(peer_ptrs_dev_, peer_ptrs_host_, num_ranks_ * sizeof(void*),
-                   cudaMemcpyHostToDevice);
+        cudaMemcpyAsync(available_table_, available.data(),
+                        num_ranks_ * sizeof(int32_t), cudaMemcpyHostToDevice,
+                        peer_table_stream_);
+        cudaMemcpyAsync(peer_ptrs_dev_, peer_ptrs_host_,
+                        num_ranks_ * sizeof(void*), cudaMemcpyHostToDevice,
+                        peer_table_stream_);
+        cudaStreamSynchronize(peer_table_stream_);
     }
 
     int32_t* availableTablePtr() override { return available_table_; }
@@ -836,6 +849,7 @@ class P2pDeviceTransportImpl : public P2pTransport {
     int32_t* available_table_ = nullptr;
     void** peer_ptrs_host_ = nullptr;
     void** peer_ptrs_dev_ = nullptr;
+    cudaStream_t peer_table_stream_ = nullptr;
     bool all_peers_accessible_ = false;
 #if defined(USE_CUDA)
     std::vector<FabricPeerMapping> fabric_peer_mappings_;

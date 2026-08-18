@@ -5,6 +5,7 @@
 
 #include <cooperative_groups.h>
 
+#include "device_comm/device_assert.cuh"
 #include "device_comm/device_transfer/transfer_lane.cuh"
 
 namespace mooncake {
@@ -185,10 +186,7 @@ __device__ __forceinline__ SignalWaitStatus waitForRecvBufferReady(
 
     // Exactly one peer publishes this slot once per invocation. A later
     // value means peers entered collectives in different orders.
-    if (recv_ready.observed != ready_sequence) {
-        __trap();
-        return SignalWaitStatus::TimedOut;
-    }
+    PG_DEVICE_ASSERT(recv_ready.observed == ready_sequence);
     return SignalWaitStatus::Reached;
 }
 
@@ -200,10 +198,10 @@ failedRankForRingStep(const DeviceAllReducePlan& plan, RingStepResult result) {
         case RingStepResult::ConsumedAckTimedOut:
             return plan.successor.in_group_rank;
         case RingStepResult::Succeeded:
-            __trap();
+            PG_DEVICE_UNREACHABLE();
             return kInvalidInGroupRank;
     }
-    __trap();
+    PG_DEVICE_UNREACHABLE();
     return kInvalidInGroupRank;
 }
 
@@ -285,10 +283,7 @@ runRingStep(const DeviceCollectiveKernelResources& resources,
     // This Ring permits only one outstanding step per peer and channel. The
     // generic Service accepts any value at least `step_sequence`; observing a
     // later value here means the collective schedules have diverged.
-    if (arrival.observed != step_sequence) {
-        __trap();
-        return RingStepResult::DataSignalTimedOut;
-    }
+    PG_DEVICE_ASSERT(arrival.observed == step_sequence);
 
     if (reduce_received_values) {
         reduceValues<T, Op>(output + recv_begin, recv_buffer, recv_count,
@@ -320,10 +315,7 @@ runRingStep(const DeviceCollectiveKernelResources& resources,
     if (ack.status == SignalWaitStatus::TimedOut) {
         return RingStepResult::ConsumedAckTimedOut;
     }
-    if (ack.observed != step_sequence) {
-        __trap();
-        return RingStepResult::ConsumedAckTimedOut;
-    }
+    PG_DEVICE_ASSERT(ack.observed == step_sequence);
     return RingStepResult::Succeeded;
 }
 
@@ -337,12 +329,9 @@ __global__ void flatRingAllReduceKernel(
     const auto* const plan_slot = resources.control.all_reduce_plan;
     // Recovery may update the host-constructed Plan between Graph replays, so
     // status must be read on every execution.
-    if (plan_slot->status != DevicePlanStatus::Ready) {
-        // A non-Ready Plan is an internal launch-contract violation, not a
-        // peer failure.
-        __trap();
-        return;
-    }
+    // A non-Ready Plan is an internal launch-contract violation, not a peer
+    // failure.
+    PG_DEVICE_ASSERT(plan_slot->status == DevicePlanStatus::Ready);
     const auto plan = plan_slot->plan;
     if (request.count == 0) {
         completeChannel(request, resources, block);
