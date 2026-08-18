@@ -19,9 +19,7 @@ namespace mooncake {
 namespace test {
 namespace {
 
-ClientMetricSnapshot MakeSnapshot() {
-    return ClientMetricSnapshot{};
-}
+ClientMetricSnapshot MakeSnapshot() { return ClientMetricSnapshot{}; }
 
 std::optional<int64_t> ParseMetricValue(const std::string& text,
                                         const std::string& name) {
@@ -164,10 +162,8 @@ TEST_F(ClientMetricsAggregatorTest, RetryCountersSupportNegativeDeltas) {
 
     Remove(client);
     const std::string after_removal = Serialize();
-    ExpectMetricValue(after_removal, "master_cluster_remote_read_retries",
-                      0);
-    ExpectMetricValue(after_removal,
-                      "master_cluster_remote_write_retries", 0);
+    ExpectMetricValue(after_removal, "master_cluster_remote_read_retries", 0);
+    ExpectMetricValue(after_removal, "master_cluster_remote_write_retries", 0);
 }
 
 TEST_F(ClientMetricsAggregatorTest, SerializeFormat) {
@@ -220,10 +216,9 @@ TEST_F(ClientMetricsAggregatorTest, SummaryContent) {
         P2PMasterMetricManager::instance().get_summary_string();
     EXPECT_NE(summary.find("Cluster Data Plane: "), std::string::npos);
     // hit_rate = 160 / (160 + 30) = 84.2%.
-    EXPECT_NE(
-        summary.find("Get(total): requests=200, hits=160, misses=30, "
-                     "failures=10, bytes=0 B (hit_rate=84.2%)"),
-        std::string::npos);
+    EXPECT_NE(summary.find("Get(total): requests=200, hits=160, misses=30, "
+                           "failures=10, bytes=0 B (hit_rate=84.2%)"),
+              std::string::npos);
     EXPECT_NE(summary.find("Get(local): requests=120"), std::string::npos);
     EXPECT_NE(summary.find("Get(remote): requests=80"), std::string::npos);
     EXPECT_NE(summary.find("Put(total): requests=80, failures=4"),
@@ -258,7 +253,6 @@ TEST_F(ClientMetricsAggregatorTest, SummaryNoData) {
     EXPECT_EQ(summary.find("hit_rate="), std::string::npos);
     EXPECT_NE(summary.find("Retries: read=0, write=0"), std::string::npos);
 }
-
 
 // Concurrent Update()/OnClientRemoved()/Serialize(): final gauges must equal
 // the sum of the last snapshots of the still-registered clients.
@@ -312,8 +306,8 @@ TEST_F(ClientMetricsAggregatorTest, ConcurrentUpdateSerializeAndRemove) {
 
     // Only the writers' clients remain; each last snapshot carries
     // get_requests = kIterations.
-    const int64_t expected_requests = static_cast<int64_t>(kNumWriters) *
-                                      kClientsPerWriter * kIterations;
+    const int64_t expected_requests =
+        static_cast<int64_t>(kNumWriters) * kClientsPerWriter * kIterations;
     const std::string text = Serialize();
     ExpectMetricValue(text, "master_cluster_total_get_requests",
                       expected_requests);

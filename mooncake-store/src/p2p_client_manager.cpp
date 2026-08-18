@@ -112,7 +112,8 @@ HeartbeatTaskResult P2PClientManager::ProcessTask(const UUID& client_id,
             break;
         }
         case HeartbeatTaskType::SYNC_CLIENT_METRIC: {
-            const auto* param = std::get_if<SyncClientMetricParam>(&task.param_);
+            const auto* param =
+                std::get_if<SyncClientMetricParam>(&task.param_);
             if (param == nullptr) {
                 result.error = ErrorCode::INVALID_PARAMS;
                 LOG(ERROR) << "SYNC_CLIENT_METRIC: invalid param"

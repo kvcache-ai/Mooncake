@@ -301,11 +301,9 @@ TEST_F(P2PClientManagerTest, HeartbeatSyncClientMetric) {
     ASSERT_TRUE(res1.has_value());
     ASSERT_EQ(res1.value().task_results.size(), 1);
     EXPECT_EQ(res1.value().task_results[0].error, ErrorCode::OK);
-    EXPECT_NE(
-        MasterMetricManager::instance()
-            .serialize_metrics()
-            .find("master_cluster_total_get_requests 5\n"),
-        std::string::npos);
+    EXPECT_NE(MasterMetricManager::instance().serialize_metrics().find(
+                  "master_cluster_total_get_requests 5\n"),
+              std::string::npos);
 
     // Second snapshot applies total 8.
     ClientMetricSnapshot second;
@@ -318,11 +316,9 @@ TEST_F(P2PClientManagerTest, HeartbeatSyncClientMetric) {
     auto res2 = mgr->Heartbeat(hb_req2);
     ASSERT_TRUE(res2.has_value());
     EXPECT_EQ(res2.value().task_results[0].error, ErrorCode::OK);
-    EXPECT_NE(
-        MasterMetricManager::instance()
-            .serialize_metrics()
-            .find("master_cluster_total_get_requests 8\n"),
-        std::string::npos);
+    EXPECT_NE(MasterMetricManager::instance().serialize_metrics().find(
+                  "master_cluster_total_get_requests 8\n"),
+              std::string::npos);
 }
 
 TEST_F(P2PClientManagerTest, HeartbeatSyncClientMetricInvalidParam) {
