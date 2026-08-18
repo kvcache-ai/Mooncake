@@ -14,6 +14,7 @@ enum class NvmeKvTransport {
     kAuto,
     kIoUring,
     kIoctl,
+    kSpdk,
 };
 
 tl::expected<NvmeKvTransport, ErrorCode> ParseNvmeKvTransport(
