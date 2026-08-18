@@ -21,8 +21,8 @@
 #include <cuda_runtime_api.h>
 #endif
 
-#include "real_client.h"
 #include "config.h"
+#include "real_client.h"
 #include "test_server_helpers.h"
 
 DEFINE_string(protocol, "tcp", "Transfer protocol: rdma|tcp");
@@ -76,6 +76,17 @@ class ScopedMaxMrSize {
    private:
     size_t old_max_mr_size_;
 };
+
+TEST(TransportRegistrationLimitTest, ClassifiesProtocols) {
+    constexpr size_t kMaxMrSize = 64 * 1024 * 1024;
+    ScopedMaxMrSize limit(kMaxMrSize);
+
+    EXPECT_EQ(GetTransportRegistrationLimit("rdma"), std::nullopt);
+    EXPECT_EQ(GetTransportRegistrationLimit("tcp"), std::nullopt);
+    EXPECT_EQ(GetTransportRegistrationLimit("efa"), kMaxMrSize);
+    EXPECT_EQ(GetTransportRegistrationLimit("cxi"), kMaxMrSize);
+    EXPECT_TRUE(GetTransportRegistrationLimit("ub").has_value());
+}
 
 class RealClientTest : public ::testing::Test {
    protected:
@@ -322,14 +333,14 @@ TEST_F(RealClientTest, DynamicMountApisBalanceLimitedSegments) {
     std::vector<std::string> allocated_ids;
     size_t allocated_size = 0;
     ASSERT_EQ(py_client_->allocateAndMountSegment(
-                  6 * slab_size, "rdma", "", allocated_ids, &allocated_size),
+                  6 * slab_size, "efa", "", allocated_ids, &allocated_size),
               0);
     ASSERT_EQ(allocated_ids.size(), 2u);
 
     const std::string path = CreateTempSegmentFile(6 * slab_size);
     ASSERT_FALSE(path.empty());
     std::vector<std::string> mounted_ids;
-    ASSERT_EQ(py_client_->mountSegment(path, 0, 6 * slab_size, "rdma", "",
+    ASSERT_EQ(py_client_->mountSegment(path, 0, 6 * slab_size, "efa", "",
                                        mounted_ids),
               0);
     ASSERT_EQ(mounted_ids.size(), 2u);

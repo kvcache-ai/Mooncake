@@ -53,7 +53,7 @@ namespace mooncake {
 
 std::optional<size_t> GetTransportRegistrationLimit(
     const std::string& protocol) {
-    if (protocol == "rdma" || protocol == "efa" || protocol == "cxi") {
+    if (protocol == "efa" || protocol == "cxi") {
         return globalConfig().max_mr_size;
     }
     if (protocol == "ub") {

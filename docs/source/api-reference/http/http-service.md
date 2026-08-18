@@ -282,8 +282,8 @@ mc_store_rest_server --config /path/to/mooncake_config.json --port 8080
 ### `/api/mount_shm`
 Mount a named shared memory object as one or more Mooncake store segments.
 Protocols with a registration-size limit split oversized regions and return
-multiple segment ids. Protocols without such a limit, such as TCP, use a single
-segment regardless of `max_mr_size`.
+multiple segment ids. Protocols without such a Store-level limit, such as TCP
+and RDMA, use a single segment regardless of `max_mr_size`.
 
 **Method**: `POST`
 **Content-Type**: `application/json`
@@ -368,9 +368,9 @@ curl -X POST http://localhost:8080/api/unmount_shm \
 ### `/api/mount`
 Allocate memory inside the store process and mount it as one or more Mooncake
 store segments. Protocols with a registration-size limit split oversized
-requests and return multiple segment ids. Protocols without such a limit, such
-as TCP, use a single segment regardless of `max_mr_size`. The response includes
-the actual allocated size after alignment.
+requests and return multiple segment ids. Protocols without such a Store-level
+limit, such as TCP and RDMA, use a single segment regardless of `max_mr_size`.
+The response includes the actual allocated size after alignment.
 
 **Method**: `POST`
 **Content-Type**: `application/json`
