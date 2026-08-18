@@ -897,6 +897,10 @@ struct InProcMasterConfig {
     std::optional<size_t> cxl_size;
     std::optional<int64_t> client_live_ttl_sec;
     std::optional<int64_t> client_crashed_ttl_sec;
+    // Dedicated heartbeat RPC server port (>0 enables; nullopt => free port
+    // only honored when explicitly requested via Start).
+    std::optional<int> heartbeat_rpc_port;
+    std::optional<uint32_t> heartbeat_rpc_thread_num;
 };
 
 // Builder class for InProcMasterConfig
@@ -911,6 +915,8 @@ class InProcMasterConfigBuilder {
     std::optional<size_t> cxl_size_ = std::nullopt;
     std::optional<int64_t> client_live_ttl_sec_ = std::nullopt;
     std::optional<int64_t> client_crashed_ttl_sec_ = std::nullopt;
+    std::optional<int> heartbeat_rpc_port_ = std::nullopt;
+    std::optional<uint32_t> heartbeat_rpc_thread_num_ = std::nullopt;
 
    public:
     InProcMasterConfigBuilder() = default;
@@ -960,6 +966,16 @@ class InProcMasterConfigBuilder {
         return *this;
     }
 
+    InProcMasterConfigBuilder& set_heartbeat_rpc_port(int port) {
+        heartbeat_rpc_port_ = port;
+        return *this;
+    }
+
+    InProcMasterConfigBuilder& set_heartbeat_rpc_thread_num(uint32_t num) {
+        heartbeat_rpc_thread_num_ = num;
+        return *this;
+    }
+
     InProcMasterConfig build() const;
 };
 
@@ -975,6 +991,8 @@ inline InProcMasterConfig InProcMasterConfigBuilder::build() const {
     config.cxl_size = cxl_size_;
     config.client_live_ttl_sec = client_live_ttl_sec_;
     config.client_crashed_ttl_sec = client_crashed_ttl_sec_;
+    config.heartbeat_rpc_port = heartbeat_rpc_port_;
+    config.heartbeat_rpc_thread_num = heartbeat_rpc_thread_num_;
     return config;
 }
 
