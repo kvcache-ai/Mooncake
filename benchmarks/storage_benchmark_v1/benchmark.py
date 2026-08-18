@@ -679,8 +679,10 @@ def main():
                        help='Page size in tokens (default: 512)')
     parser.add_argument('--file-mode', type=str, choices=['single', 'per-file'],
                        default='single',
-                       help='Storage layout: single = one big data.bin with slot '
-                            'offsets (default); per-file = one file per page')
+                       help='Storage layout: single = one data.bin with slot '
+                            'offsets (default); per-file = one file per page. '
+                            'Per-file writes open with O_TRUNC and replace the '
+                            'whole page file')
     parser.add_argument('--max-requests', type=int, default=None,
                        help='Maximum number of requests')
     parser.add_argument('--max-pages', type=int, default=2000,

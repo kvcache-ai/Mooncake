@@ -24,6 +24,7 @@ python benchmark.py --scenario conversation \
 | `--storage-dir` | `/tmp/mooncake_bench` | Directory for storage files |
 | `--model` | `glm5` | Model preset: `glm5` or `kimi-k2.6` |
 | `--page-size-tokens` | `512` | Page size in tokens |
+| `--file-mode` | `single` | Storage layout: `single` = one `data.bin` with slot offsets; `per-file` = one file per page. Per-file writes open with `O_TRUNC` and replace the whole page file |
 | `--max-requests` | `None` | Maximum number of requests to process |
 | `--max-pages` | `2000` | Maximum number of pages (creates modulo mapping if trace is larger) |
 | `--fsync-mode` | `none` | When to fsync: `none`, `batch`, `always`, or `end` |
@@ -58,10 +59,25 @@ python benchmark.py --scenario toolagent \
 ```
 
 With `--threads > 1`, each benchmark client thread uses an independent storage
-file under `thread_N/data.bin`, similar to running multiple clients at the same
+directory under `thread_N/`, similar to running multiple clients at the same
 time. Final results aggregate the per-thread counters and latency samples. For
 strict single-client trace-order read/write and hit-rate accounting, use
 `--threads 1`.
+
+### File Mode
+
+`--file-mode` selects the on-disk layout:
+
+- `single` (default): one preallocated `data.bin`. Each page is a slot at
+  `physical_page_id * page_size`. Partial writes keep the rest of the file.
+- `per-file`: one `page_<id>.bin` per page. Each operation opens, reads or
+  writes, then closes that file. A write opens with `O_WRONLY | O_CREAT |
+  O_TRUNC`, so it replaces the entire page file and does not preserve earlier
+  bytes in that file.
+
+With `--threads > 1`, each thread still uses its own `thread_N/` directory.
+In `single` mode that directory contains `data.bin`; in `per-file` mode it
+contains `page_*.bin`.
 
 ## Output Format
 
