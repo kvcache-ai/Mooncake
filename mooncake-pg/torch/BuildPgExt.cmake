@@ -85,7 +85,7 @@ endif()
 if("${EP_TORCH_VERSIONS}" STREQUAL "")
   message(STATUS "[PG] Building with currently-installed PyTorch")
   execute_process(
-    COMMAND ${Python3_EXECUTABLE} setup.py build_ext --build-lib . --force
+    COMMAND ${Python3_EXECUTABLE} setup.py build_ext --build-lib .
     WORKING_DIRECTORY "${SOURCE_DIR}"
     RESULT_VARIABLE _ret
   )
