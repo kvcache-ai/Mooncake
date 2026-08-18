@@ -13,10 +13,6 @@
 #   PG_DEVICE_SO_PATH   - absolute path to libmooncake_pg_device.so
 #   EP_USE_MUSA         - set to "1" when building for MUSA (MTLink path)
 #   EP_USE_MACA         - set to "1" when building for MACA (MTLink path)
-#   EP_USE_NCCL_DEVICE  - set to "1" for the NCCL Device API backend
-#   EP_NCCL_ROOT        - optional NCCL installation root
-#   EP_NCCL_INCLUDE_DIR - optional discovered NCCL include directory
-#   EP_NCCL_LIBRARY     - optional exact libnccl path
 
 cmake_minimum_required(VERSION 3.16)
 
@@ -60,23 +56,6 @@ if(EP_USE_MACA)
   endif()
 else()
   unset(ENV{MOONCAKE_EP_USE_MACA})
-endif()
-
-if(EP_USE_NCCL_DEVICE)
-  set(ENV{MOONCAKE_EP_USE_NCCL_DEVICE} "1")
-  if(NOT "${EP_NCCL_ROOT}" STREQUAL "")
-    set(ENV{NCCL_ROOT} "${EP_NCCL_ROOT}")
-  endif()
-  if(NOT "${EP_NCCL_INCLUDE_DIR}" STREQUAL "")
-    set(ENV{MOONCAKE_EP_NCCL_INCLUDE_DIR} "${EP_NCCL_INCLUDE_DIR}")
-  endif()
-  if(NOT "${EP_NCCL_LIBRARY}" STREQUAL "")
-    set(ENV{MOONCAKE_EP_NCCL_LIBRARY} "${EP_NCCL_LIBRARY}")
-  endif()
-else()
-  unset(ENV{MOONCAKE_EP_USE_NCCL_DEVICE})
-  unset(ENV{MOONCAKE_EP_NCCL_INCLUDE_DIR})
-  unset(ENV{MOONCAKE_EP_NCCL_LIBRARY})
 endif()
 
 # ---------------------------------------------------------------------------
