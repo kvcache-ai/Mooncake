@@ -4,7 +4,7 @@ add_library(cxi_transport OBJECT ${CXI_SOURCES})
 # Link against libfabric (fabric) instead of ibverbs for AWS EFA
 target_link_libraries(
   cxi_transport
-  PUBLIC glog::glog
+  PUBLIC glog::glog gflags::gflags
   PRIVATE fabric)
 
 target_include_directories(

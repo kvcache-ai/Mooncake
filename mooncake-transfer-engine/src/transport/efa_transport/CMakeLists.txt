@@ -4,7 +4,7 @@ add_library(efa_transport OBJECT ${EFA_SOURCES})
 # Link against libfabric (fabric) instead of ibverbs for AWS EFA
 target_link_libraries(
   efa_transport
-  PUBLIC glog::glog
+  PUBLIC glog::glog gflags::gflags
   PRIVATE fabric)
 
 target_include_directories(
