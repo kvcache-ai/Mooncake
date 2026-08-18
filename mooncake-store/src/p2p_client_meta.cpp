@@ -4,6 +4,8 @@
 #include <glog/logging.h>
 #include <limits>
 
+#include "p2p_master_metric_manager.h"
+
 namespace mooncake {
 P2PClientMeta::P2PClientMeta(const UUID& client_id,
                              const std::string& ip_address, uint16_t rpc_port)
@@ -22,6 +24,10 @@ P2PClientMeta::P2PClientMeta(const UUID& client_id,
             client_capacity_ -= segment.size;
             client_usage_ -= segment.GetP2PExtra().usage;
         });
+}
+
+P2PClientMeta::~P2PClientMeta() {
+    P2PMasterMetricManager::instance().OnClientRemoved(client_id_);
 }
 
 std::shared_ptr<SegmentManager> P2PClientMeta::GetSegmentManager() {
@@ -44,7 +50,7 @@ tl::expected<std::vector<std::string>, ErrorCode> P2PClientMeta::QueryIp(
 SyncSegmentMetaResult P2PClientMeta::UpdateSegmentUsages(
     const std::vector<TierUsageInfo>& usages) {
     SyncSegmentMetaResult result;
-    SpinRWLockLocker lock(&capacity_mutex_);
+    int64_t usage_delta = 0;
     for (const auto& usage : usages) {
         SyncSegmentMetaResult::SubResult sub_res;
         sub_res.segment_id = usage.segment_id;
@@ -62,9 +68,23 @@ SyncSegmentMetaResult P2PClientMeta::UpdateSegmentUsages(
             continue;
         }
 
-        client_usage_ = client_usage_ - old_usage.value() + usage.usage;
+        usage_delta += static_cast<int64_t>(usage.usage) -
+                       static_cast<int64_t>(old_usage.value());
         sub_res.error = ErrorCode::OK;
         result.sub_results.push_back(sub_res);
+    }
+
+    if (usage_delta != 0) {
+        SpinRWLockLocker lock(&capacity_mutex_);
+        const int64_t new_usage =
+            static_cast<int64_t>(client_usage_) + usage_delta;
+        if (new_usage < 0) {
+            LOG(ERROR) << "client usage would go negative, clamp to 0"
+                       << ", client_id=" << client_id_
+                       << ", client_usage=" << client_usage_
+                       << ", usage_delta=" << usage_delta;
+        }
+        client_usage_ = new_usage > 0 ? static_cast<size_t>(new_usage) : 0;
     }
     return result;
 }

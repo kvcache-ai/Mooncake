@@ -8,6 +8,7 @@
 #include <ylt/metric/gauge.hpp>
 
 #include "client_metric.h"
+#include "heartbeat_type.h"
 #include "types.h"
 
 namespace mooncake {
@@ -200,6 +201,7 @@ struct TierMetric {
 };
 
 struct P2PClientMetric : public ClientMetric {
+   public:
     // total_request is recorded at request (Batch) granularity:
     // BatchPut/BatchGet counts as one request, and every key in the batch
     // shares same latency sample (the time cost depend on the slowest key).
@@ -214,6 +216,7 @@ struct P2PClientMetric : public ClientMetric {
     // Per-tier storage metrics; initially empty. Shared with TieredBackend.
     std::shared_ptr<TierMetric> tier_metric;
 
+   public:
     static std::unique_ptr<P2PClientMetric> Create(
         const std::map<std::string, std::string>& labels = {}) {
         return CreatePtr<P2PClientMetric>(labels);
@@ -222,6 +225,8 @@ struct P2PClientMetric : public ClientMetric {
     explicit P2PClientMetric(
         uint64_t interval_seconds = 0,
         const std::map<std::string, std::string>& labels = {});
+
+    ClientMetricSnapshot BuildSyncSnapshot();
 
     void serialize(std::string& str) override;
     std::string summary_metrics() override;

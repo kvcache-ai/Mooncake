@@ -136,6 +136,15 @@ void P2PMasterMetricManager::inc_batch_get_write_route_partial_success(
     batch_get_write_route_failed_items_.inc(failed_items);
 }
 
+void P2PMasterMetricManager::UpdateClientMetrics(
+    const UUID& client_id, const ClientMetricSnapshot& snapshot) {
+    client_metrics_aggregator_.Update(client_id, snapshot);
+}
+
+void P2PMasterMetricManager::OnClientRemoved(const UUID& client_id) {
+    client_metrics_aggregator_.OnClientRemoved(client_id);
+}
+
 // Operation Statistics Getters
 int64_t P2PMasterMetricManager::get_get_write_route_requests() {
     return get_write_route_requests_.value();
@@ -225,6 +234,10 @@ std::string P2PMasterMetricManager::serialize_arch_metrics() {
     serialize_metric(batch_get_write_route_items_);
     serialize_metric(batch_get_write_route_failed_items_);
 
+    std::string cluster_part;
+    client_metrics_aggregator_.Serialize(cluster_part);
+    ss << cluster_part;
+
     return ss.str();
 }
 
@@ -282,6 +295,7 @@ std::string P2PMasterMetricManager::get_arch_summary_string(
 
     summary += " | ";
     summary += ss.str();
+    summary += client_metrics_aggregator_.Summary();
     return summary;
 }
 

@@ -10,6 +10,7 @@
 #include "p2p_segment_manager.h"
 #undef private
 #undef protected
+#include "p2p_master_metric_manager.h"
 
 namespace mooncake {
 
@@ -386,6 +387,82 @@ TEST_F(P2PSegmentManagerTest, UpdateSegmentUsageLifeCycleRace) {
     stop = true;
     mounter.join();
     for (auto& t : updaters) t.join();
+}
+
+TEST_F(P2PSegmentManagerTest, MountCapacityClassifiedByMemoryType) {
+    P2PMasterMetricManager::instance().reset_all_metrics();
+    auto& metrics = P2PMasterMetricManager::instance();
+
+    P2PSegmentManager mgr;
+
+    // DRAM -> mem capacity family.
+    auto dram = MakeSegment({1, 1}, "dram_seg", 1000);
+    ASSERT_TRUE(mgr.MountSegment(dram).has_value());
+    EXPECT_EQ(metrics.get_total_mem_capacity(), 1000);
+    EXPECT_EQ(metrics.get_total_file_capacity(), 0);
+
+    // NVME -> file capacity family.
+    Segment nvme = MakeSegment({2, 2}, "nvme_seg", 2000);
+    nvme.extra = P2PSegmentExtraData{
+        .priority = 0, .tags = {}, .memory_type = MemoryType::NVME, .usage = 0};
+    ASSERT_TRUE(mgr.MountSegment(nvme).has_value());
+    EXPECT_EQ(metrics.get_total_mem_capacity(), 1000);
+    EXPECT_EQ(metrics.get_total_file_capacity(), 2000);
+
+    // Unmount drops the capacity symmetrically.
+    ASSERT_TRUE(mgr.UnmountSegment(nvme.id).has_value());
+    EXPECT_EQ(metrics.get_total_mem_capacity(), 1000);
+    EXPECT_EQ(metrics.get_total_file_capacity(), 0);
+}
+
+TEST_F(P2PSegmentManagerTest, UpdateSegmentUsageMaintainsGauges) {
+    P2PMasterMetricManager::instance().reset_all_metrics();
+    auto& metrics = P2PMasterMetricManager::instance();
+
+    P2PSegmentManager mgr;
+
+    // DRAM usage deltas go to the mem gauge family (total + per-segment).
+    auto dram = MakeSegment({1, 1}, "dram_seg", 1000);
+    ASSERT_TRUE(mgr.MountSegment(dram).has_value());
+    ASSERT_TRUE(mgr.UpdateSegmentUsage({1, 1}, 400).has_value());
+    EXPECT_EQ(metrics.get_allocated_mem_size(), 400);
+    EXPECT_EQ(metrics.get_segment_allocated_mem_size("dram_seg"), 400);
+
+    // Negative delta (usage fell back) is applied via dec().
+    ASSERT_TRUE(mgr.UpdateSegmentUsage({1, 1}, 100).has_value());
+    EXPECT_EQ(metrics.get_allocated_mem_size(), 100);
+
+    // NVME usage deltas go to the file gauge family only.
+    Segment nvme = MakeSegment({2, 2}, "nvme_seg", 2000);
+    nvme.extra = P2PSegmentExtraData{
+        .priority = 0, .tags = {}, .memory_type = MemoryType::NVME, .usage = 0};
+    ASSERT_TRUE(mgr.MountSegment(nvme).has_value());
+    ASSERT_TRUE(mgr.UpdateSegmentUsage({2, 2}, 700).has_value());
+    EXPECT_EQ(metrics.get_allocated_file_size(), 700);
+    EXPECT_EQ(metrics.get_allocated_mem_size(), 100);
+
+    // Unmount subtracts the last reported usage.
+    ASSERT_TRUE(mgr.UnmountSegment({2, 2}).has_value());
+    EXPECT_EQ(metrics.get_allocated_file_size(), 0);
+    ASSERT_TRUE(mgr.UnmountSegment({1, 1}).has_value());
+    EXPECT_EQ(metrics.get_allocated_mem_size(), 0);
+}
+
+TEST_F(P2PSegmentManagerTest, UnmountBeforeUsageSyncKeepsZeroUsage) {
+    P2PMasterMetricManager::instance().reset_all_metrics();
+    auto& metrics = P2PMasterMetricManager::instance();
+
+    P2PSegmentManager mgr;
+    auto seg = MakeSegment({1, 1}, "seg1", 1000);
+    ASSERT_TRUE(mgr.MountSegment(seg).has_value());
+    EXPECT_EQ(metrics.get_total_mem_capacity(), 1000);
+
+    // No usage sync yet: stored usage is still 0, so unmount only drops
+    // capacity and the usage gauge stays 0.
+    EXPECT_EQ(metrics.get_allocated_mem_size(), 0);
+    ASSERT_TRUE(mgr.UnmountSegment(seg.id).has_value());
+    EXPECT_EQ(metrics.get_total_mem_capacity(), 0);
+    EXPECT_EQ(metrics.get_allocated_mem_size(), 0);
 }
 
 }  // namespace mooncake

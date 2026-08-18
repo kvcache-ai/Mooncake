@@ -22,16 +22,14 @@ class MasterMetricManager {
     // (for tests).
     virtual void reset_all_metrics() = 0;
 
-    virtual ~MasterMetricManager() = default;
+    virtual ~MasterMetricManager();
 
     MasterMetricManager(const MasterMetricManager&) = delete;
     MasterMetricManager& operator=(const MasterMetricManager&) = delete;
     MasterMetricManager(MasterMetricManager&&) = delete;
     MasterMetricManager& operator=(MasterMetricManager&&) = delete;
 
-    // Memory capacity/usage Metrics (global & segment).
-    // TODO(wanyue-wy): in P2P mode the master does not see client-side segment
-    // usage; allocated sizes stay 0 until client heartbeats aggregate them.
+    // Memory capacity/usage Metrics (global & segment)
     void inc_allocated_mem_size(const std::string& segment, int64_t val = 1);
     void dec_allocated_mem_size(const std::string& segment, int64_t val = 1);
     void reset_allocated_mem_size();
