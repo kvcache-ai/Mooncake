@@ -1088,6 +1088,39 @@ TEST_F(MasterServiceTenantQuotaTest,
                 200);
 }
 
+TEST_F(MasterServiceTenantQuotaTest, CopySourceCleanupAllowsDelayedRevoke) {
+    MasterService service(MakeConfig({{TenantId("tenant-a"), 200}}));
+    UUID source_segment_id;
+    UUID source_client =
+        MountSegment(service, 4096, "segment-a", &source_segment_id);
+    MountSegment(service, 4096, "segment-b");
+
+    ReplicateConfig config = MemoryConfig();
+    config.preferred_segment = "segment-a";
+    ASSERT_TRUE(
+        service
+            .PutStart(source_client, "key", TenantId("tenant-a"), 100, config)
+            .has_value());
+    ASSERT_TRUE(service
+                    .PutEnd(source_client, "key", TenantId("tenant-a"),
+                            ReplicaType::MEMORY)
+                    .has_value());
+    ASSERT_TRUE(service
+                    .CopyStart(source_client, "key", TenantId("tenant-a"),
+                               "segment-a", {"segment-b"})
+                    .has_value());
+    EXPECT_EQ(Snapshot(service, TenantId("tenant-a")).charged_bytes, 200);
+
+    ASSERT_TRUE(
+        service.UnmountSegment(source_segment_id, source_client).has_value());
+    ASSERT_TRUE(WaitForChargedBytes(service, TenantId("tenant-a"), 0));
+    ASSERT_TRUE(service.CopyRevoke(source_client, "key", TenantId("tenant-a"))
+                    .has_value());
+    EXPECT_FALSE(HasReplicationTask(service, TenantId("tenant-a"), "key"));
+    PutComplete(service, source_client, "replacement", TenantId("tenant-a"),
+                200);
+}
+
 TEST_F(MasterServiceTenantQuotaTest,
        MoveSourceCleanupReleasesTargetAndReservedQuota) {
     MasterService service(MakeConfig({{TenantId("tenant-a"), 200}}));
@@ -1117,6 +1150,40 @@ TEST_F(MasterServiceTenantQuotaTest,
     ASSERT_TRUE(WaitForChargedBytes(service, TenantId("tenant-a"), 0));
     ASSERT_TRUE(service.MoveRevoke(source_client, "key", TenantId("tenant-a"))
                     .has_value());
+    EXPECT_FALSE(HasReplicationTask(service, TenantId("tenant-a"), "key"));
+    PutComplete(service, source_client, "replacement", TenantId("tenant-a"),
+                200);
+}
+
+TEST_F(MasterServiceTenantQuotaTest, MoveSourceCleanupRejectsDelayedEnd) {
+    MasterService service(MakeConfig({{TenantId("tenant-a"), 200}}));
+    UUID source_segment_id;
+    UUID source_client =
+        MountSegment(service, 4096, "segment-a", &source_segment_id);
+    MountSegment(service, 4096, "segment-b");
+
+    ReplicateConfig config = MemoryConfig();
+    config.preferred_segment = "segment-a";
+    ASSERT_TRUE(
+        service
+            .PutStart(source_client, "key", TenantId("tenant-a"), 100, config)
+            .has_value());
+    ASSERT_TRUE(service
+                    .PutEnd(source_client, "key", TenantId("tenant-a"),
+                            ReplicaType::MEMORY)
+                    .has_value());
+    ASSERT_TRUE(service
+                    .MoveStart(source_client, "key", TenantId("tenant-a"),
+                               "segment-a", "segment-b")
+                    .has_value());
+    EXPECT_EQ(Snapshot(service, TenantId("tenant-a")).charged_bytes, 200);
+
+    ASSERT_TRUE(
+        service.UnmountSegment(source_segment_id, source_client).has_value());
+    ASSERT_TRUE(WaitForChargedBytes(service, TenantId("tenant-a"), 0));
+    auto move_end = service.MoveEnd(source_client, "key", TenantId("tenant-a"));
+    ASSERT_FALSE(move_end.has_value());
+    EXPECT_EQ(move_end.error(), ErrorCode::REPLICA_IS_GONE);
     EXPECT_FALSE(HasReplicationTask(service, TenantId("tenant-a"), "key"));
     PutComplete(service, source_client, "replacement", TenantId("tenant-a"),
                 200);
