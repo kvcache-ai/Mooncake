@@ -253,6 +253,19 @@ class MasterClient {
         const std::vector<std::string>& keys,
         ReplicaType replica_type = ReplicaType::ALL);
 
+    [[nodiscard]] tl::expected<void, ErrorCode> RegisterGdsStorage(
+        const std::string& storage_id, uint64_t storage_generation);
+    [[nodiscard]] tl::expected<void, ErrorCode> UnregisterGdsStorage(
+        const std::string& storage_id, uint64_t storage_generation);
+    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>>
+    BatchAddGdsReplicaStart(
+        const std::vector<std::string>& keys,
+        const std::vector<GdsDescriptor>& descriptors);
+    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>>
+    BatchCreateGdsOnlyObjects(const std::vector<std::string>& keys,
+                              const std::vector<GdsDescriptor>& descriptors,
+                              const ReplicateConfig& config);
+
     /**
      * @brief Starts an upsert operation (insert or update)
      * @param key Object key

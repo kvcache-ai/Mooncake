@@ -158,6 +158,8 @@ class TransferEngineImpl {
 
     Status waitTransferCompletion(BatchID batch_id);
 
+    bool hasTransport(TransportType type) const;
+
     Status transferSync(const std::vector<Request>& request_list);
 
     uint64_t lockStageBuffer(const std::string& location);

@@ -15,6 +15,7 @@
 #include <unordered_set>
 
 #include "client_metric.h"
+#include "gds_storage.h"
 #include "ha/leadership/leader_coordinator.h"
 #include "master_client.h"
 #include "storage_backend.h"
@@ -66,6 +67,10 @@ class Client {
 
     const UUID& getClientId() const { return client_id_; }
     const std::string& tenant_id() const { return master_client_.tenant_id(); }
+
+    tl::expected<void, ErrorCode> ConfigureGdsOffload(
+        const std::string& file_path, uint64_t capacity);
+    bool IsGdsOffloadEnabled() const { return gds_storage_ != nullptr; }
 
     /**
      * @brief Creates and initializes a new Client instance
@@ -597,6 +602,9 @@ class Client {
         return endpoints;
     }
 
+    [[nodiscard]] bool IsLocalGdsDescriptor(
+        const GdsDescriptor& descriptor) const;
+
     /**
      * @brief Check if local hot cache is enabled
      * @return true if hot cache is enabled, false otherwise
@@ -683,6 +691,10 @@ class Client {
                                 std::vector<Slice>& slices,
                                 uint64_t src_offset);
 
+    tl::expected<void, ErrorCode> ConfigureFileOffload(
+        const std::string& file_path, uint64_t capacity,
+        const std::string& transport);
+
     /**
      * @brief Prepare and use the storage backend for persisting data
      */
@@ -753,6 +765,10 @@ class Client {
         const std::vector<Replica::Descriptor>& replica_list,
         Replica::Descriptor& replica);
 
+    ErrorCode FindPreferredCompleteReplicaForRead(
+        const std::vector<Replica::Descriptor>& replica_list,
+        Replica::Descriptor& replica) const;
+
     /**
      * @brief Batch put helper methods for structured approach
      */
@@ -788,6 +804,7 @@ class Client {
     std::shared_ptr<TransferEngine> transfer_engine_;
     MasterClient master_client_;
     std::unique_ptr<TransferSubmitter> transfer_submitter_;
+    std::unique_ptr<GdsStorageManager> gds_storage_;
 
     // Mutex to protect mounted_segments_
     mutable std::mutex mounted_segments_mutex_;

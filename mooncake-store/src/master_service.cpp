@@ -3216,7 +3216,8 @@ auto MasterService::PutEnd(const UUID& client_id, const std::string& key,
                 return (replica.is_memory_replica() &&
                         !replica.has_invalid_mem_handle()) ||
                        (replica.is_nof_replica() &&
-                        !replica.has_invalid_nof_handle());
+                        !replica.has_invalid_nof_handle()) ||
+                       replica.is_gds_replica();
             }
             if (replica_type == ReplicaType::MEMORY) {
                 return replica.is_memory_replica() &&
@@ -3374,7 +3375,8 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     auto processing_rep = metadata.GetFirstReplica([replica_type](
                                                        const Replica& replica) {
         if (replica_type == ReplicaType::ALL) {
-            return (replica.is_memory_replica() || replica.is_nof_replica()) &&
+            return (replica.is_memory_replica() || replica.is_nof_replica() ||
+                    replica.is_gds_replica()) &&
                    !replica.is_processing();
         }
         return replica.type() == replica_type && !replica.is_processing();
@@ -3389,7 +3391,8 @@ auto MasterService::PutRevoke(const UUID& client_id, const std::string& key,
     EraseReplicasWithCacheTotalAccounting(
         metadata, [replica_type](const Replica& replica) {
             if (replica_type == ReplicaType::ALL) {
-                return replica.is_memory_replica() || replica.is_nof_replica();
+                return replica.is_memory_replica() || replica.is_nof_replica() ||
+                       replica.is_gds_replica();
             }
             return replica.type() == replica_type;
         });
@@ -3434,6 +3437,275 @@ std::vector<tl::expected<void, ErrorCode>> MasterService::BatchPutRevoke(
     for (const auto& key : keys) {
         results.emplace_back(
             PutRevoke(client_id, key, tenant_id, replica_type));
+    }
+    return results;
+}
+
+tl::expected<void, ErrorCode> MasterService::RegisterGdsStorage(
+    const UUID& client_id, const std::string& storage_id,
+    uint64_t storage_generation) {
+    if (storage_id.empty() || storage_generation == 0) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    std::lock_guard<std::mutex> lock(gds_storage_mutex_);
+    auto it = gds_storages_.find(client_id);
+    if (it != gds_storages_.end()) {
+        if (it->second.storage_id == storage_id &&
+            it->second.generation == storage_generation) {
+            return {};
+        }
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    gds_storages_.emplace(
+        client_id, GdsStorageIdentity{storage_id, storage_generation});
+    return {};
+}
+
+tl::expected<void, ErrorCode> MasterService::UnregisterGdsStorage(
+    const UUID& client_id, const std::string& storage_id,
+    uint64_t storage_generation) {
+    {
+        std::lock_guard<std::mutex> lock(gds_storage_mutex_);
+        auto it = gds_storages_.find(client_id);
+        if (it == gds_storages_.end()) {
+            return {};
+        }
+        if (it->second.storage_id != storage_id ||
+            it->second.generation != storage_generation) {
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        gds_storages_.erase(it);
+    }
+
+    std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+    for (size_t shard_index = 0; shard_index < kNumShards; ++shard_index) {
+        MetadataShardAccessorRW shard(this, shard_index);
+        for (auto tenant_it = shard->tenants.begin();
+             tenant_it != shard->tenants.end();) {
+            auto& tenant_id = tenant_it->first;
+            auto& tenant_state = tenant_it->second;
+            for (auto metadata_it = tenant_state.metadata.begin();
+                 metadata_it != tenant_state.metadata.end();) {
+                auto& metadata = metadata_it->second;
+                EraseReplicasWithCacheTotalAccounting(
+                    metadata, [&](const Replica& replica) {
+                        if (!replica.is_gds_replica()) {
+                            return false;
+                        }
+                        const auto& descriptor =
+                            replica.get_descriptor().get_gds_descriptor();
+                        return descriptor.owner_client_id == client_id &&
+                               descriptor.storage_id == storage_id &&
+                               descriptor.storage_generation ==
+                                   storage_generation;
+                    });
+                if (!metadata.IsValid()) {
+                    metadata_it = EraseMetadata(
+                        tenant_state, metadata_it, tenant_id,
+                        QuotaEraseMode::kFull, &shard);
+                } else {
+                    ++metadata_it;
+                }
+            }
+            if (tenant_state.Empty()) {
+                tenant_it = shard->tenants.erase(tenant_it);
+            } else {
+                ++tenant_it;
+            }
+        }
+    }
+    return {};
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+MasterService::BatchAddGdsReplicaStart(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    const std::vector<GdsDescriptor>& descriptors,
+    const std::string& tenant_id) {
+    std::vector<tl::expected<void, ErrorCode>> results;
+    results.reserve(keys.size());
+    if (keys.size() != descriptors.size()) {
+        results.assign(keys.size(),
+                       tl::unexpected(ErrorCode::INVALID_PARAMS));
+        return results;
+    }
+
+    GdsStorageIdentity identity;
+    {
+        std::lock_guard<std::mutex> lock(gds_storage_mutex_);
+        auto storage_it = gds_storages_.find(client_id);
+        if (storage_it == gds_storages_.end()) {
+            results.assign(keys.size(),
+                           tl::unexpected(ErrorCode::INVALID_PARAMS));
+            return results;
+        }
+        identity = storage_it->second;
+    }
+
+    std::shared_lock<std::shared_mutex> shared_lock(snapshot_mutex_);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto& descriptor = descriptors[i];
+        if (descriptor.owner_client_id != client_id ||
+            descriptor.storage_id != identity.storage_id ||
+            descriptor.storage_generation != identity.generation ||
+            descriptor.value_size == 0 ||
+            descriptor.allocated_size < descriptor.value_size) {
+            results.emplace_back(
+                tl::unexpected(ErrorCode::INVALID_PARAMS));
+            continue;
+        }
+
+        const auto object_id =
+            MakeObjectIdentityForRequest(keys[i], tenant_id);
+        MetadataAccessorRW accessor(this, object_id);
+        if (!accessor.Exists()) {
+            results.emplace_back(
+                tl::unexpected(ErrorCode::OBJECT_NOT_FOUND));
+            continue;
+        }
+        auto& metadata = accessor.Get();
+        if (metadata.client_id != client_id) {
+            results.emplace_back(tl::unexpected(ErrorCode::ILLEGAL_CLIENT));
+            continue;
+        }
+        if (metadata.size != descriptor.value_size) {
+            results.emplace_back(
+                tl::unexpected(ErrorCode::INVALID_PARAMS));
+            continue;
+        }
+
+        auto* existing = metadata.GetFirstReplica(
+            [&descriptor](const Replica& replica) {
+                if (!replica.is_gds_replica()) {
+                    return false;
+                }
+                const auto& current =
+                    replica.get_descriptor().get_gds_descriptor();
+                return current.owner_client_id == descriptor.owner_client_id &&
+                       current.storage_id == descriptor.storage_id &&
+                       current.storage_generation ==
+                           descriptor.storage_generation;
+            });
+        if (existing) {
+            const auto& current =
+                existing->get_descriptor().get_gds_descriptor();
+            if (current.value_offset == descriptor.value_offset &&
+                current.value_size == descriptor.value_size &&
+                current.allocated_size == descriptor.allocated_size) {
+                results.emplace_back();
+            } else {
+                results.emplace_back(
+                    tl::unexpected(ErrorCode::INVALID_PARAMS));
+            }
+            continue;
+        }
+
+        std::vector<Replica> replicas;
+        replicas.emplace_back(descriptor, ReplicaStatus::PROCESSING);
+        metadata.AddReplicas(std::move(replicas));
+        results.emplace_back();
+    }
+    return results;
+}
+
+tl::expected<void, ErrorCode> MasterService::CreateGdsOnlyObject(
+    const UUID& client_id, const std::string& key,
+    const GdsDescriptor& descriptor, const ReplicateConfig& config,
+    const std::string& tenant_id) {
+    auto normalized_tenant_result = NormalizeTenantIdForWrite(tenant_id);
+    if (!normalized_tenant_result) {
+        return tl::make_unexpected(normalized_tenant_result.error());
+    }
+    if (key.empty() || descriptor.value_size == 0 ||
+        descriptor.allocated_size < descriptor.value_size ||
+        descriptor.owner_client_id != client_id) {
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
+    auto group_id_result = GetGroupIdForKey(config, 1, 0);
+    if (!group_id_result) {
+        return tl::make_unexpected(group_id_result.error());
+    }
+    const std::string group_id = group_id_result.value();
+    const std::string normalized_tenant = normalized_tenant_result.value();
+
+    [[maybe_unused]] auto object_operation_lock =
+        AcquireObjectOperationLock(normalized_tenant, key);
+    std::unique_lock<std::mutex> zero_charge_policy_lock(
+        tenant_quota_policy_mutex_, std::defer_lock);
+    if (ShouldProtectZeroChargeMetadataCreate(0)) {
+        zero_charge_policy_lock.lock();
+        auto latest_tenant_result =
+            NormalizeTenantIdForWriteLocked(normalized_tenant);
+        if (!latest_tenant_result) {
+            return tl::make_unexpected(latest_tenant_result.error());
+        }
+    }
+
+    std::shared_lock<std::shared_mutex> snapshot_lock(snapshot_mutex_);
+    const size_t shard_index = group_id.empty()
+                                   ? getShardIndex(normalized_tenant, key)
+                                   : getShardIndex(group_id);
+    MetadataShardAccessorRW shard(this, shard_index);
+    auto& tenant_state = shard->tenants[normalized_tenant];
+    if (tenant_state.metadata.contains(key) ||
+        GetGroupRoute(normalized_tenant, key).has_value()) {
+        return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+    }
+
+    std::vector<Replica> replicas;
+    replicas.emplace_back(descriptor, ReplicaStatus::PROCESSING);
+    auto [it, inserted] = tenant_state.metadata.emplace(
+        std::piecewise_construct, std::forward_as_tuple(key),
+        std::forward_as_tuple(
+            client_id, std::chrono::system_clock::now(), descriptor.value_size,
+            std::move(replicas), config.with_soft_pin, config.with_hard_pin,
+            config.data_type, group_id, normalized_tenant, key));
+    if (!inserted) {
+        return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+    }
+    IncrementTenantMetadataObjectCount(normalized_tenant);
+    RegisterGroupMember(tenant_state, normalized_tenant, key, group_id);
+    tenant_state.processing_keys.insert(key);
+    return {};
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+MasterService::BatchCreateGdsOnlyObjects(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    const std::vector<GdsDescriptor>& descriptors,
+    const ReplicateConfig& config, const std::string& tenant_id) {
+    std::vector<tl::expected<void, ErrorCode>> results;
+    results.reserve(keys.size());
+    if (keys.size() != descriptors.size() ||
+        (config.group_ids.has_value() &&
+         config.group_ids->size() != keys.size())) {
+        results.assign(keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+        return results;
+    }
+
+    GdsStorageIdentity identity;
+    {
+        std::lock_guard<std::mutex> lock(gds_storage_mutex_);
+        auto storage_it = gds_storages_.find(client_id);
+        if (storage_it == gds_storages_.end()) {
+            results.assign(keys.size(),
+                           tl::unexpected(ErrorCode::INVALID_PARAMS));
+            return results;
+        }
+        identity = storage_it->second;
+    }
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        const auto& descriptor = descriptors[i];
+        if (descriptor.owner_client_id != client_id ||
+            descriptor.storage_id != identity.storage_id ||
+            descriptor.storage_generation != identity.generation) {
+            results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
+            continue;
+        }
+        results.emplace_back(CreateGdsOnlyObject(
+            client_id, keys[i], descriptor, config.ForSingleKey(i), tenant_id));
     }
     return results;
 }
@@ -4775,7 +5047,8 @@ bool MasterService::CleanupStaleHandles(
         metadata, [&alive_clients](const Replica& replica) {
             return (replica.has_invalid_mem_handle() ||
                     replica.has_invalid_nof_handle() ||
-                    replica.has_stale_local_disk_client(alive_clients)) &&
+                    replica.has_stale_local_disk_client(alive_clients) ||
+                    replica.has_stale_gds_client(alive_clients)) &&
                    replica.is_completed();
         });
     const uint64_t after_charge = CompletedMemoryQuotaCharge(metadata);

@@ -655,6 +655,11 @@ std::vector<TransportType> TransferEngineImpl::getSupportedTransports(
     return result;
 }
 
+bool TransferEngineImpl::hasTransport(TransportType type) const {
+    return type >= 0 && type < kSupportedTransportTypes &&
+           transport_list_[type] != nullptr;
+}
+
 Status TransferEngineImpl::registerLocalMemory(std::vector<void*> addr_list,
                                                std::vector<size_t> size_list,
                                                MemoryOptions& options) {

@@ -277,14 +277,14 @@ inline tl::expected<void, ErrorCode> scatter_host_to_maybe_device(
     return {};
 }
 
-// Select the best replica from a list: prefer local MEMORY, then any
-// MEMORY, then LOCAL_DISK, then DISK.  Master may return replicas in any
+// Select the best replica from a list: local MEMORY, any MEMORY, local GDS,
+// then the existing NoF/disk fallbacks. Master may return replicas in any
 // order, so we always scan.
 inline const Replica::Descriptor *SelectBestReplica(
     const std::vector<Replica::Descriptor> &replicas,
-    const std::unordered_set<std::string> &local_endpoints) {
+    const std::unordered_set<std::string> &local_endpoints,
+    const Client *client) {
     const Replica::Descriptor *first_memory = nullptr;
-    const Replica::Descriptor *first_nof = nullptr;
     for (const auto &r : replicas) {
         if (r.status != ReplicaStatus::COMPLETE) continue;
         if (r.is_memory_replica()) {
@@ -294,7 +294,23 @@ inline const Replica::Descriptor *SelectBestReplica(
                 return &r;  // local MEMORY — best case
             }
             if (!first_memory) first_memory = &r;
-        } else if (r.is_nof_replica()) {
+        }
+    }
+    if (first_memory) return first_memory;
+
+    if (client) {
+        for (const auto &r : replicas) {
+            if (r.status == ReplicaStatus::COMPLETE && r.is_gds_replica() &&
+                client->IsLocalGdsDescriptor(r.get_gds_descriptor())) {
+                return &r;
+            }
+        }
+    }
+
+    const Replica::Descriptor *first_nof = nullptr;
+    for (const auto &r : replicas) {
+        if (r.status != ReplicaStatus::COMPLETE) continue;
+        if (r.is_nof_replica()) {
             if (local_endpoints.count(
                     r.get_nof_descriptor()
                         .buffer_descriptor.transport_endpoint_)) {
@@ -303,7 +319,6 @@ inline const Replica::Descriptor *SelectBestReplica(
             if (!first_nof) first_nof = &r;
         }
     }
-    if (first_memory) return first_memory;
     if (first_nof) return first_nof;
 
     const Replica::Descriptor *best = nullptr;
@@ -629,6 +644,25 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     const std::string &ssd_offload_path, const std::string &tenant_id) {
     this->protocol = protocol;
     this->ipc_socket_path_ = ipc_socket_path;
+
+    bool enable_gds_offload = false;
+    if (const char *value = std::getenv("MOONCAKE_GDS_OFFLOAD_ENABLED")) {
+        const std::string enabled(value);
+        if (enabled != "0" && enabled != "1") {
+            LOG(ERROR) << "MOONCAKE_GDS_OFFLOAD_ENABLED must be 0 or 1";
+            return tl::unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        enable_gds_offload = enabled == "1";
+    }
+    const char *gds_path_env = std::getenv("MOONCAKE_GDS_OFFLOAD_PATH");
+    const std::string gds_offload_path =
+        gds_path_env == nullptr ? "" : gds_path_env;
+
+    if (enable_gds_offload && gds_offload_path.empty()) {
+        LOG(ERROR) << "MOONCAKE_GDS_OFFLOAD_PATH must be set when GDS "
+                      "offload is enabled";
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
     const bool should_use_hugepage =
         use_hugepage_ && this->protocol != "ubshmem";
 #ifdef USE_ASCEND_DIRECT
@@ -729,6 +763,19 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
             LOG(ERROR) << "Failed to create client after " << kMaxRetries
                        << " retries";
             return tl::unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+    }
+
+    if (enable_gds_offload) {
+        auto file_storage_config = FileStorageConfig::FromEnvironment();
+        const auto capacity =
+            static_cast<uint64_t>(file_storage_config.total_size_limit);
+        auto offload_result =
+            client_->ConfigureGdsOffload(gds_offload_path, capacity);
+        if (!offload_result) {
+            LOG(ERROR) << "Failed to initialize file offload: "
+                       << toString(offload_result.error());
+            return tl::unexpected(offload_result.error());
         }
     }
 
@@ -2584,7 +2631,8 @@ std::shared_ptr<BufferHandle> RealClient::get_buffer_internal(
     // LOCAL_DISK data is on a remote node's SSD — must use offload RPC.
     // MEMORY / DISK are handled via client_->Get below.
     auto local_endpoints = client_->GetLocalEndpoints();
-    const auto *best_replica = SelectBestReplica(replica_list, local_endpoints);
+    const auto *best_replica =
+        SelectBestReplica(replica_list, local_endpoints, client_.get());
     if (!best_replica) {
         LOG(ERROR) << "No usable replica for key: " << key;
         return nullptr;
@@ -2895,8 +2943,8 @@ RealClient::batch_get_buffer_internal(
 
         // Select best replica: prefer local MEMORY, then any MEMORY,
         // then LOCAL_DISK, then DISK.
-        const auto *best_replica =
-            SelectBestReplica(query_result_values.replicas, local_endpoints);
+        const auto *best_replica = SelectBestReplica(
+            query_result_values.replicas, local_endpoints, client_.get());
         if (!best_replica) {
             LOG(ERROR) << "No usable replica for key: " << key;
             continue;
@@ -3541,7 +3589,8 @@ RealClient::build_ranged_read_metadata_from_query_result(
     }
 
     auto local_endpoints = client_->GetLocalEndpoints();
-    const auto *best_replica = SelectBestReplica(replica_list, local_endpoints);
+    const auto *best_replica =
+        SelectBestReplica(replica_list, local_endpoints, client_.get());
     if (!best_replica) {
         LOG(ERROR) << "No usable replica for key: " << key;
         return tl::unexpected(ErrorCode::INVALID_REPLICA);
@@ -4450,8 +4499,8 @@ RealClient::batch_get_into_internal(const std::vector<std::string> &keys,
 
         // Select best replica: prefer local MEMORY, then any MEMORY,
         // then LOCAL_DISK, then DISK.
-        const auto *best_replica =
-            SelectBestReplica(query_result_values.replicas, local_endpoints);
+        const auto *best_replica = SelectBestReplica(
+            query_result_values.replicas, local_endpoints, client_.get());
         if (!best_replica) {
             LOG(ERROR) << "No usable replica for key: " << key;
             results[i] = tl::unexpected(ErrorCode::INVALID_REPLICA);
@@ -4740,6 +4789,17 @@ std::vector<int> RealClient::batch_put_from_multi_buffers(
     const std::vector<std::vector<void *>> &all_buffers,
     const std::vector<std::vector<size_t>> &sizes,
     const ReplicateConfig &config) {
+    size_t total_size = 0;
+    const size_t key_count = std::min(keys.size(), sizes.size());
+    for (size_t i = 0; i < key_count; ++i) {
+        const size_t key_size = sum_sizes(sizes[i]);
+        total_size += key_size;
+        // LOG(INFO) << "batch_put_from_multi_buffers key: " << keys[i]
+        //           << ", size: " << key_size << ", buffer[0].ptr: " << all_buffers[i][0]
+        //           << ", buffer[1].ptr: " << (all_buffers[i].size() > 1 ? all_buffers[i][1] : nullptr);
+    }
+    // LOG(INFO) << "batch_put_from_multi_buffers total size: " << total_size;
+
     auto internal_results =
         execute_timed_operation<std::vector<tl::expected<void, ErrorCode>>>(
             [&]() {
@@ -4787,22 +4847,63 @@ RealClient::batch_put_from_multi_buffers_internal(
             keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
     }
 
-    std::vector<std::vector<mooncake::Slice>> batched_slices(keys.size());
+    if (config.group_ids.has_value() &&
+        config.group_ids->size() != keys.size()) {
+        LOG(ERROR) << "Mismatched group_ids and keys";
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+
+    std::vector<tl::expected<void, ErrorCode>> results(
+        keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    std::vector<std::string> valid_keys;
+    std::vector<std::vector<mooncake::Slice>> batched_slices;
+    std::vector<size_t> valid_indices;
+    valid_keys.reserve(keys.size());
+    batched_slices.reserve(keys.size());
+    valid_indices.reserve(keys.size());
     for (size_t i = 0; i < all_buffers.size(); ++i) {
         const auto &buffers = all_buffers[i];
         const auto &sizes = all_sizes[i];
         if (buffers.size() != sizes.size()) {
             LOG(ERROR) << "Mismatched buffers and sizes of key:" << keys[i];
-            return std::vector<tl::expected<void, ErrorCode>>(
-                keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+            continue;
         }
-        batched_slices[i].reserve(buffers.size());
+        std::vector<mooncake::Slice> slices;
+        slices.reserve(buffers.size());
         for (size_t j = 0; j < buffers.size(); ++j) {
-            batched_slices[i].emplace_back(Slice{buffers[j], sizes[j]});
+            slices.emplace_back(Slice{buffers[j], sizes[j]});
         }
+        valid_keys.emplace_back(keys[i]);
+        batched_slices.emplace_back(std::move(slices));
+        valid_indices.emplace_back(i);
     }
-    // Call client BatchPut and return the vector<expected> directly
-    return client_->BatchPut(keys, batched_slices, config);
+    if (valid_keys.empty()) {
+        return results;
+    }
+
+    ReplicateConfig valid_config = config;
+    if (config.group_ids.has_value()) {
+        std::vector<std::string> valid_group_ids;
+        valid_group_ids.reserve(valid_indices.size());
+        for (size_t index : valid_indices) {
+            valid_group_ids.emplace_back(config.group_ids->at(index));
+        }
+        valid_config.group_ids = std::move(valid_group_ids);
+    }
+
+    auto valid_results =
+        client_->BatchPut(valid_keys, batched_slices, valid_config);
+    if (valid_results.size() != valid_indices.size()) {
+        for (size_t index : valid_indices) {
+            results[index] = tl::unexpected(ErrorCode::RPC_FAIL);
+        }
+        return results;
+    }
+    for (size_t i = 0; i < valid_results.size(); ++i) {
+        results[valid_indices[i]] = std::move(valid_results[i]);
+    }
+    return results;
 }
 
 std::vector<int> RealClient::batch_get_into_multi_buffers(
@@ -4909,11 +5010,10 @@ RealClient::batch_get_into_multi_buffers_internal(
             results.emplace_back(tl::unexpected(ErrorCode::INVALID_REPLICA));
             continue;
         }
-        // Select best replica: prefer MEMORY (direct RDMA to GPU), then
-        // LOCAL_DISK, then DISK. Master may return multiple replicas in any
-        // order, so always scan rather than blindly taking replicas[0].
-        const auto *best_replica =
-            SelectBestReplica(query_result_values.replicas, local_endpoints);
+        // Select best replica: MEMORY first, then local GDS, then the existing
+        // NoF/disk fallbacks.
+        const auto *best_replica = SelectBestReplica(
+            query_result_values.replicas, local_endpoints, client_.get());
         if (!best_replica) {
             LOG(ERROR) << "No usable replica for key: " << key;
             results.emplace_back(tl::unexpected(ErrorCode::INVALID_REPLICA));
@@ -4922,6 +5022,14 @@ RealClient::batch_get_into_multi_buffers_internal(
         const auto replica = *best_replica;
         uint64_t total_size = calculate_total_size(replica);
         const auto &sizes = all_sizes[i];
+        const auto &buffers = all_buffers[i];
+        if (buffers.size() != sizes.size()) {
+            LOG(ERROR) << "Buffer/size count mismatch for key '" << key
+                       << "': buffers=" << buffers.size()
+                       << ", sizes=" << sizes.size();
+            results.emplace_back(tl::unexpected(ErrorCode::INVALID_PARAMS));
+            continue;
+        }
         uint64_t dst_total_size = 0;
         for (auto &size : sizes) {
             dst_total_size += size;
@@ -4934,11 +5042,11 @@ RealClient::batch_get_into_multi_buffers_internal(
             continue;
         }
         // Create slices for this key's buffer
-        const auto &buffers = all_buffers[i];
         std::vector<Slice> key_slices;
         key_slices.reserve(buffers.size());
-        if (replica.is_memory_replica()) {
-            // MEMORY: RDMA from remote memory directly to GPU (GPUDirect).
+        if (replica.is_memory_replica() || replica.is_gds_replica()) {
+            // MEMORY uses RDMA/GPUDirect; local GDS reads directly into the
+            // same registered destination slices.
             for (size_t j = 0; j < buffers.size(); ++j) {
                 key_slices.emplace_back(Slice{buffers[j], sizes[j]});
             }

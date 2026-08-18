@@ -318,6 +318,17 @@ TEST_F(ClientBufferTest, CalculateTotalSizeDiskReplica) {
     EXPECT_EQ(total_size, 4096);
 }
 
+TEST_F(ClientBufferTest, CalculateTotalSizeGdsReplica) {
+    Replica::Descriptor replica;
+    GdsDescriptor gds_desc;
+    gds_desc.value_size = 8192;
+
+    replica.descriptor_variant = gds_desc;
+    replica.status = ReplicaStatus::COMPLETE;
+
+    EXPECT_EQ(calculate_total_size(replica), 8192);
+}
+
 // Test calculate_total_size function with zero-size memory replica
 TEST_F(ClientBufferTest, CalculateTotalSizeZeroSizeMemoryReplica) {
     // Create a memory replica descriptor with zero size
@@ -405,6 +416,27 @@ TEST_F(ClientBufferTest, AllocateSlicesDiskReplica) {
     }
 
     EXPECT_EQ(total_slice_size, 8192);
+}
+
+TEST_F(ClientBufferTest, AllocateSlicesGdsReplica) {
+    constexpr size_t kValueSize = 8192;
+    auto allocator = ClientBufferAllocator::create(1024 * 1024);
+    ASSERT_NE(allocator, nullptr);
+    auto handle_opt = allocator->allocate(kValueSize);
+    ASSERT_TRUE(handle_opt.has_value());
+    BufferHandle handle = std::move(handle_opt.value());
+
+    Replica::Descriptor replica;
+    GdsDescriptor gds_desc;
+    gds_desc.value_size = kValueSize;
+    replica.descriptor_variant = gds_desc;
+    replica.status = ReplicaStatus::COMPLETE;
+
+    std::vector<Slice> slices;
+    EXPECT_EQ(allocateSlices(slices, replica, handle.ptr()), 0);
+    ASSERT_EQ(slices.size(), 1);
+    EXPECT_EQ(slices[0].ptr, handle.ptr());
+    EXPECT_EQ(slices[0].size, kValueSize);
 }
 
 // Test allocateSlices function with zero-size memory replica

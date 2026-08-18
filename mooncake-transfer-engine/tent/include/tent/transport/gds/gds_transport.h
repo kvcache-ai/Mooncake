@@ -18,6 +18,7 @@
 #include <bits/stdint-uintn.h>
 
 #include <cstddef>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -94,6 +95,10 @@ class GdsTransport : public Transport {
 
     GdsFileContext* findFileContext(SegmentID target_id);
 
+    Status findRegisteredBuffer(void* source, size_t length,
+                                void*& registered_base,
+                                size_t& registered_offset);
+
    private:
     bool installed_;
     std::string local_segment_name_;
@@ -106,6 +111,9 @@ class GdsTransport : public Transport {
         std::unordered_map<SegmentID, std::shared_ptr<GdsFileContext>>;
     FileContextMap file_context_map_;
     size_t io_batch_depth_;
+
+    RWSpinlock registered_buffer_lock_;
+    std::map<uint64_t, uint64_t> registered_buffers_;
 
     // Object pool for BatchHandle to avoid frequent cuFileBatchIOSetUp/Destroy
     // CUfileBatchHandle_t is reusable per cuFile API documentation

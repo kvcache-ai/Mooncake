@@ -528,6 +528,11 @@ class FilereadWorkerPool {
  */
 class TransferSubmitter {
    public:
+    struct FileSubmitResult {
+        std::vector<TransferFuture> futures;
+        ErrorCode error{ErrorCode::OK};
+    };
+
     explicit TransferSubmitter(TransferEngine& engine,
                                std::shared_ptr<StorageBackend>& backend,
                                const std::string& local_hostname,
@@ -571,6 +576,11 @@ class TransferSubmitter {
         const std::vector<uint64_t>& pointers,
         const std::unordered_map<std::string, std::vector<Slice>>&
             batched_slices);
+
+    /** Submit aligned raw-value I/O to an already-open Tent file segment. */
+    FileSubmitResult submitFile(
+        SegmentHandle segment, uint64_t target_offset,
+        const std::vector<Slice>& slices, TransferRequest::OpCode op_code);
 
     /**
      * @brief Pure comparison helper: returns true iff both endpoints are

@@ -93,6 +93,26 @@ struct RpcNameTraits<&WrappedMasterService::BatchPutRevoke> {
 };
 
 template <>
+struct RpcNameTraits<&WrappedMasterService::RegisterGdsStorage> {
+    static constexpr const char* value = "RegisterGdsStorage";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::UnregisterGdsStorage> {
+    static constexpr const char* value = "UnregisterGdsStorage";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchAddGdsReplicaStart> {
+    static constexpr const char* value = "BatchAddGdsReplicaStart";
+};
+
+template <>
+struct RpcNameTraits<&WrappedMasterService::BatchCreateGdsOnlyObjects> {
+    static constexpr const char* value = "BatchCreateGdsOnlyObjects";
+};
+
+template <>
 struct RpcNameTraits<&WrappedMasterService::UpsertStart> {
     static constexpr const char* value = "UpsertStart";
 };
@@ -642,6 +662,37 @@ std::vector<tl::expected<void, ErrorCode>> MasterClient::BatchPutRevoke(
         keys.size(), client_id_, keys, replica_type, tenant_id_);
     timer.LogResponse("result=", result.size(), " operations");
     return result;
+}
+
+tl::expected<void, ErrorCode> MasterClient::RegisterGdsStorage(
+    const std::string& storage_id, uint64_t storage_generation) {
+    return invoke_rpc<&WrappedMasterService::RegisterGdsStorage, void>(
+        client_id_, storage_id, storage_generation);
+}
+
+tl::expected<void, ErrorCode> MasterClient::UnregisterGdsStorage(
+    const std::string& storage_id, uint64_t storage_generation) {
+    return invoke_rpc<&WrappedMasterService::UnregisterGdsStorage, void>(
+        client_id_, storage_id, storage_generation);
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+MasterClient::BatchAddGdsReplicaStart(
+    const std::vector<std::string>& keys,
+    const std::vector<GdsDescriptor>& descriptors) {
+    return invoke_batch_rpc<&WrappedMasterService::BatchAddGdsReplicaStart,
+                            void>(keys.size(), client_id_, keys, descriptors,
+                                  tenant_id_);
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+MasterClient::BatchCreateGdsOnlyObjects(
+    const std::vector<std::string>& keys,
+    const std::vector<GdsDescriptor>& descriptors,
+    const ReplicateConfig& config) {
+    return invoke_batch_rpc<&WrappedMasterService::BatchCreateGdsOnlyObjects,
+                            void>(keys.size(), client_id_, keys, descriptors,
+                                  config, tenant_id_);
 }
 
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>

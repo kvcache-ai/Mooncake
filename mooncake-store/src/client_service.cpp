@@ -305,6 +305,16 @@ Client::Client(const std::string& local_hostname,
 }
 
 Client::~Client() {
+    if (gds_storage_) {
+        auto unregister_result = master_client_.UnregisterGdsStorage(
+            gds_storage_->storage_id(), gds_storage_->generation());
+        if (!unregister_result) {
+            LOG(WARNING) << "Failed to unregister GDS storage: "
+                         << toString(unregister_result.error());
+        }
+        gds_storage_.reset();
+    }
+
     task_poll_running_ = false;
     if (task_poll_thread_.joinable()) {
         task_poll_thread_.join();
@@ -882,6 +892,36 @@ void Client::InitTransferSubmitter() {
 #endif
 }
 
+tl::expected<void, ErrorCode> Client::ConfigureGdsOffload(
+    const std::string& file_path, uint64_t capacity) {
+    return ConfigureFileOffload(file_path, capacity, "gds");
+}
+
+tl::expected<void, ErrorCode> Client::ConfigureFileOffload(
+    const std::string& file_path, uint64_t capacity,
+    const std::string& transport) {
+    if (!transfer_engine_ || !transfer_submitter_ || gds_storage_) {
+        return tl::unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    auto storage =
+        std::make_unique<GdsStorageManager>(*transfer_engine_, client_id_);
+    auto init_result = storage->Init(file_path, capacity, transport);
+    if (!init_result) {
+        return tl::unexpected(init_result.error());
+    }
+    auto register_result = master_client_.RegisterGdsStorage(
+        storage->storage_id(), storage->generation());
+    if (!register_result) {
+        return tl::unexpected(register_result.error());
+    }
+    gds_storage_ = std::move(storage);
+    return {};
+}
+
+bool Client::IsLocalGdsDescriptor(const GdsDescriptor& descriptor) const {
+    return gds_storage_ && gds_storage_->MatchesStorage(descriptor);
+}
+
 std::optional<std::shared_ptr<Client>> Client::Create(
     const std::string& local_hostname, const std::string& metadata_connstring,
     const std::string& protocol, const std::optional<std::string>& device_names,
@@ -1367,11 +1407,16 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         return BatchGetWhenPreferSameNode(object_keys, query_results, slices);
     }
 
-    // Collect all transfer operations for parallel execution
-    // Tuple: (index, key, future, replica, cache_used)
-    std::vector<std::tuple<size_t, std::string, TransferFuture,
-                           Replica::Descriptor, bool>>
-        pending_transfers;
+    struct PendingGetTransfer {
+        size_t index;
+        std::string key;
+        std::vector<TransferFuture> futures;
+        Replica::Descriptor replica;
+        bool cache_used;
+        ErrorCode submission_error;
+        std::optional<GdsStorageManager::ReadLease> gds_read_lease;
+    };
+    std::vector<PendingGetTransfer> pending_transfers;
     std::vector<tl::expected<void, ErrorCode>> results(object_keys.size());
     // Record batch get transfer latency (Submit + Wait)
     auto t0_batch_get = std::chrono::steady_clock::now();
@@ -1391,10 +1436,11 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             continue;
         }
 
-        // Find the first complete replica for this key
+        // MEMORY replicas always take precedence. GDS is only eligible when
+        // the descriptor belongs to this Client's current storage generation.
         Replica::Descriptor replica;
         ErrorCode err =
-            FindFirstCompleteReplica(query_result.replicas, replica);
+            FindPreferredCompleteReplicaForRead(query_result.replicas, replica);
         if (err != ErrorCode::OK) {
             if (err == ErrorCode::INVALID_REPLICA) {
                 LOG(ERROR) << "no_complete_replicas_found key=" << key;
@@ -1411,7 +1457,58 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
             }
         }
 
-        // Submit transfer operation asynchronously
+        if (replica.is_gds_replica()) {
+            const auto& descriptor = replica.get_gds_descriptor();
+            uint64_t slice_bytes = 0;
+            bool invalid_size = false;
+            for (const auto& slice : slices_it->second) {
+                if (slice.size >
+                    std::numeric_limits<uint64_t>::max() - slice_bytes) {
+                    invalid_size = true;
+                    break;
+                }
+                slice_bytes += slice.size;
+            }
+            if (invalid_size || slice_bytes != descriptor.value_size) {
+                LOG(ERROR) << "GDS read size mismatch for key " << key
+                           << ": descriptor=" << descriptor.value_size
+                           << ", slices=" << slice_bytes;
+                results[i] = tl::unexpected(ErrorCode::INVALID_PARAMS);
+                continue;
+            }
+
+            auto read_lease = gds_storage_->AcquireRead(key, descriptor);
+            if (!read_lease) {
+                LOG(ERROR) << "GDS descriptor does not match local extent for "
+                           << "key: " << key;
+                results[i] = tl::unexpected(read_lease.error());
+                continue;
+            }
+
+            auto submit_result = transfer_submitter_->submitFile(
+                gds_storage_->segment_handle(), descriptor.value_offset,
+                slices_it->second, TransferRequest::READ);
+            if (submit_result.futures.empty() &&
+                submit_result.error != ErrorCode::OK) {
+                LOG(ERROR) << "Failed to submit GDS read for key: " << key;
+                results[i] = tl::unexpected(submit_result.error);
+                continue;
+            }
+
+            VLOG(1) << "Submitted " << submit_result.futures.size()
+                    << " GDS read transfer(s) for key " << key;
+            pending_transfers.push_back(PendingGetTransfer{
+                .index = i,
+                .key = key,
+                .futures = std::move(submit_result.futures),
+                .replica = replica,
+                .cache_used = false,
+                .submission_error = submit_result.error,
+                .gds_read_lease = std::move(read_lease.value())});
+            continue;
+        }
+
+        // Submit a non-GDS transfer operation asynchronously.
         std::optional<TransferFuture> future;
         if (replica.is_nof_replica()) {
             auto contiguous_range = GetContiguousSliceRange(slices_it->second);
@@ -1441,34 +1538,50 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchGet(
         VLOG(1) << "Submitted transfer for key " << key
                 << " using strategy: " << static_cast<int>(future->strategy());
 
-        pending_transfers.emplace_back(i, key, std::move(*future), replica,
-                                       cache_used);
+        std::vector<TransferFuture> futures;
+        futures.emplace_back(std::move(*future));
+        pending_transfers.push_back(
+            PendingGetTransfer{.index = i,
+                               .key = key,
+                               .futures = std::move(futures),
+                               .replica = replica,
+                               .cache_used = cache_used,
+                               .submission_error = ErrorCode::OK,
+                               .gds_read_lease = std::nullopt});
     }
 
     // Wait for all transfers to complete
-    for (auto& [index, key, future, stored_replica, cache_used] :
-         pending_transfers) {
-        ErrorCode result = future.get();
+    for (auto& pending : pending_transfers) {
+        ErrorCode result = pending.submission_error;
+        for (auto& future : pending.futures) {
+            const ErrorCode future_result = future.get();
+            if (result == ErrorCode::OK && future_result != ErrorCode::OK) {
+                result = future_result;
+            }
+        }
+        pending.gds_read_lease.reset();
 
         // Release the cache block after transfer completes (memcpy is done)
-        if (hot_cache_ && cache_used) {
-            hot_cache_->ReleaseHotKey(key);
+        if (hot_cache_ && pending.cache_used) {
+            hot_cache_->ReleaseHotKey(pending.key);
         }
         if (result != ErrorCode::OK) {
-            LOG(ERROR) << "Transfer failed for key: " << key
+            LOG(ERROR) << "Transfer failed for key: " << pending.key
                        << " with error: " << static_cast<int>(result);
-            results[index] = tl::unexpected(result);
+            results[pending.index] = tl::unexpected(result);
         } else {
-            VLOG(1) << "Transfer completed successfully for key: " << key;
-            results[index] = {};
+            VLOG(1) << "Transfer completed successfully for key: "
+                    << pending.key;
+            results[pending.index] = {};
 
             // Frequency admission: only promote frequently accessed keys.
             // Skip when cache was used (data served from local cache).
             if (hot_cache_) {
-                auto slices_it = slices.find(key);
+                auto slices_it = slices.find(pending.key);
                 if (slices_it != slices.end() &&
-                    ShouldAdmitToHotCache(key, cache_used)) {
-                    ProcessSlicesAsync(key, slices_it->second, stored_replica);
+                    ShouldAdmitToHotCache(pending.key, pending.cache_used)) {
+                    ProcessSlicesAsync(pending.key, slices_it->second,
+                                       pending.replica);
                 }
             }
         }
@@ -1795,6 +1908,12 @@ class PutOperation {
     tl::expected<void, ErrorCode> result;
     std::vector<Replica::Descriptor> replicas;
     std::vector<PendingTransferRecord> pending_transfers;
+    std::optional<GdsStorageManager::Reservation> gds_reservation;
+    bool gds_required = false;
+    bool master_started = false;
+    size_t submitted_gds_transfers = 0;
+    size_t successful_gds_transfers = 0;
+    ErrorCode gds_error = ErrorCode::OK;
 
     size_t requested_memory_replicas = 0;
     size_t requested_nof_replicas = 0;
@@ -1888,9 +2007,11 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
                            const ReplicateConfig& config) {
     std::vector<std::string> keys;
     std::vector<std::vector<uint64_t>> slice_lengths;
+    std::vector<size_t> active_indices;
 
     keys.reserve(ops.size());
     slice_lengths.reserve(ops.size());
+    active_indices.reserve(ops.size());
 
     if (hot_cache_) {
         std::vector<std::string> hot_keys;
@@ -1899,7 +2020,12 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
         hot_cache_->RemoveHotKeys(hot_keys);
     }
 
-    for (const auto& op : ops) {
+    for (size_t i = 0; i < ops.size(); ++i) {
+        const auto& op = ops[i];
+        if (op.IsResolved()) {
+            continue;
+        }
+        active_indices.push_back(i);
         keys.emplace_back(op.key);
 
         std::vector<uint64_t> slice_sizes;
@@ -1910,42 +2036,146 @@ void Client::StartBatchPut(std::vector<PutOperation>& ops,
         slice_lengths.emplace_back(std::move(slice_sizes));
     }
 
+    if (active_indices.empty()) {
+        return;
+    }
+
+    ReplicateConfig active_config = config;
+    if (config.group_ids.has_value()) {
+        std::vector<std::string> active_group_ids;
+        active_group_ids.reserve(active_indices.size());
+        for (size_t index : active_indices) {
+            active_group_ids.emplace_back(config.group_ids->at(index));
+        }
+        active_config.group_ids = std::move(active_group_ids);
+    }
+
     auto start_responses =
-        master_client_.BatchPutStart(keys, slice_lengths, config);
+        master_client_.BatchPutStart(keys, slice_lengths, active_config);
 
     // Ensure response size matches request size
-    if (start_responses.size() != ops.size()) {
+    if (start_responses.size() != active_indices.size()) {
         LOG(ERROR) << "BatchPutStart response size mismatch: expected "
-                   << ops.size() << ", got " << start_responses.size();
-        for (auto& op : ops) {
-            op.SetError(ErrorCode::RPC_FAIL,
-                        "BatchPutStart response size mismatch");
+                   << active_indices.size() << ", got "
+                   << start_responses.size();
+        for (size_t index : active_indices) {
+            ops[index].SetTerminalError(
+                ErrorCode::RPC_FAIL, PutOperationState::MASTER_FAILED,
+                "BatchPutStart response size mismatch");
         }
         return;
     }
 
     // Process individual responses with robust error handling
-    for (size_t i = 0; i < ops.size(); ++i) {
-        ops[i].InitializeRequestedReplicas(config);
+    std::vector<std::string> gds_fallback_keys;
+    std::vector<GdsDescriptor> gds_fallback_descriptors;
+    std::vector<size_t> gds_fallback_indices;
+    std::vector<std::string> gds_fallback_group_ids;
+    for (size_t i = 0; i < active_indices.size(); ++i) {
+        auto& op = ops[active_indices[i]];
+        op.InitializeRequestedReplicas(config);
         if (!start_responses[i]) {
-            ops[i].SetTerminalError(start_responses[i].error(),
-                                    PutOperationState::MASTER_FAILED,
-                                    "Master failed to start put operation");
+            const auto error = start_responses[i].error();
+            const bool can_fallback_to_gds =
+                gds_storage_ && op.gds_reservation.has_value() &&
+                (error == ErrorCode::NO_AVAILABLE_HANDLE ||
+                 error == ErrorCode::TENANT_QUOTA_EXCEEDED);
+            if (can_fallback_to_gds) {
+                gds_fallback_keys.emplace_back(op.key);
+                gds_fallback_descriptors.emplace_back(
+                    op.gds_reservation->descriptor());
+                gds_fallback_indices.emplace_back(active_indices[i]);
+                if (config.group_ids.has_value()) {
+                    gds_fallback_group_ids.emplace_back(
+                        config.group_ids->at(i));
+                }
+                continue;
+            }
+            op.SetTerminalError(error, PutOperationState::MASTER_FAILED,
+                                "Master failed to start put operation");
         } else {
-            ops[i].replicas = start_responses[i].value();
-            ops[i].RecordAllocatedReplicas();
+            op.replicas = start_responses[i].value();
+            op.master_started = true;
+            op.RecordAllocatedReplicas();
             if (!HasExpectedReplicaAllocation(config,
-                                              ops[i].transfer_summary)) {
-                ops[i].SetTerminalError(ErrorCode::NO_AVAILABLE_HANDLE,
+                                              op.transfer_summary)) {
+                if (!op.gds_required) {
+                    op.SetTerminalError(ErrorCode::NO_AVAILABLE_HANDLE,
                                         PutOperationState::MASTER_FAILED,
                                         "Allocated replicas do not satisfy "
                                         "requested replica policy");
-                continue;
+                    continue;
+                }
+                op.AppendFailureContext(
+                    "Regular replica allocation did not satisfy the requested "
+                    "policy; continuing with required GDS replica");
             }
             // Operation continues to next stage - result remains INTERNAL_ERROR
             // until fully successful
-            VLOG(1) << "Successfully started put for key " << ops[i].key
-                    << " with " << ops[i].replicas.size() << " replicas";
+            VLOG(1) << "Successfully started put for key " << op.key
+                    << " with " << op.replicas.size() << " replicas";
+        }
+    }
+
+    if (!gds_fallback_keys.empty()) {
+        ReplicateConfig fallback_config = config;
+        if (config.group_ids.has_value()) {
+            fallback_config.group_ids = std::move(gds_fallback_group_ids);
+        }
+        auto fallback_responses = master_client_.BatchCreateGdsOnlyObjects(
+            gds_fallback_keys, gds_fallback_descriptors, fallback_config);
+        if (fallback_responses.size() != gds_fallback_indices.size()) {
+            for (size_t index : gds_fallback_indices) {
+                ops[index].SetTerminalError(
+                    ErrorCode::RPC_FAIL, PutOperationState::MASTER_FAILED,
+                    "BatchCreateGdsOnlyObjects response size mismatch");
+            }
+        } else {
+            for (size_t i = 0; i < fallback_responses.size(); ++i) {
+                if (!fallback_responses[i]) {
+                    ops[gds_fallback_indices[i]].SetTerminalError(
+                        fallback_responses[i].error(),
+                        PutOperationState::MASTER_FAILED,
+                        "Master failed to create GDS-only object");
+                } else {
+                    ops[gds_fallback_indices[i]].master_started = true;
+                }
+            }
+        }
+    }
+
+    if (gds_storage_) {
+        std::vector<std::string> gds_keys;
+        std::vector<GdsDescriptor> gds_descriptors;
+        std::vector<size_t> gds_indices;
+        for (size_t index : active_indices) {
+            auto& op = ops[index];
+            if (!op.IsResolved() && op.gds_reservation.has_value()) {
+                gds_keys.emplace_back(op.key);
+                gds_descriptors.emplace_back(
+                    op.gds_reservation->descriptor());
+                gds_indices.emplace_back(index);
+            }
+        }
+        if (gds_keys.empty()) {
+            return;
+        }
+        auto responses = master_client_.BatchAddGdsReplicaStart(
+            gds_keys, gds_descriptors);
+        if (responses.size() != gds_indices.size()) {
+            for (size_t index : gds_indices) {
+                ops[index].SetTerminalError(
+                    ErrorCode::RPC_FAIL, PutOperationState::MASTER_FAILED,
+                    "BatchAddGdsReplicaStart response size mismatch");
+            }
+        } else {
+            for (size_t i = 0; i < responses.size(); ++i) {
+                if (!responses[i]) {
+                    ops[gds_indices[i]].SetTerminalError(
+                        responses[i].error(), PutOperationState::MASTER_FAILED,
+                        "Master failed to add GDS replica");
+                }
+            }
         }
     }
 }
@@ -2021,7 +2251,8 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
         }
 
         // Skip operations that don't have replicas (failed in StartBatchPut)
-        if (op.replicas.empty()) {
+        if (op.replicas.empty() &&
+            !(op.gds_required && op.gds_reservation.has_value())) {
             op.SetTerminalError(ErrorCode::INTERNAL_ERROR,
                                 PutOperationState::MASTER_FAILED,
                                 "No replicas available for transfer");
@@ -2085,6 +2316,22 @@ void Client::SubmitTransfers(std::vector<PutOperation>& ops) {
             }
         }
 
+        if (op.gds_required && op.gds_reservation.has_value()) {
+            auto submit_result = transfer_submitter_->submitFile(
+                gds_storage_->segment_handle(),
+                op.gds_reservation->descriptor().value_offset, op.slices,
+                TransferRequest::WRITE);
+            op.submitted_gds_transfers = submit_result.futures.size();
+            for (auto& future : submit_result.futures) {
+                op.pending_transfers.emplace_back(ReplicaType::GDS,
+                                                  std::move(future));
+            }
+            if (submit_result.error != ErrorCode::OK) {
+                op.gds_error = submit_result.error;
+                op.AppendFailureContext("Failed to submit all GDS transfers");
+            }
+        }
+
         VLOG(1) << "Submitted " << op.pending_transfers.size()
                 << " transfers for key " << op.key;
     }
@@ -2100,6 +2347,16 @@ void Client::WaitForTransfers(std::vector<PutOperation>& ops) {
         for (size_t i = 0; i < op.pending_transfers.size(); ++i) {
             auto& pending_transfer = op.pending_transfers[i];
             ErrorCode transfer_result = pending_transfer.future.get();
+            if (pending_transfer.replica_type == ReplicaType::GDS) {
+                if (transfer_result == ErrorCode::OK) {
+                    ++op.successful_gds_transfers;
+                } else if (op.gds_error == ErrorCode::OK) {
+                    op.gds_error = transfer_result;
+                    op.AppendFailureContext(
+                        "GDS transfer " + std::to_string(i) + " failed");
+                }
+                continue;
+            }
             if (transfer_result != ErrorCode::OK) {
                 op.transfer_summary.RecordFailure(pending_transfer.replica_type,
                                                   transfer_result);
@@ -2129,9 +2386,11 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
     BatchFinalizeGroup end_all_group;
     BatchFinalizeGroup end_memory_group;
     BatchFinalizeGroup end_nof_group;
+    BatchFinalizeGroup end_gds_group;
     BatchFinalizeGroup revoke_all_group;
     BatchFinalizeGroup revoke_memory_group;
     BatchFinalizeGroup revoke_nof_group;
+    BatchFinalizeGroup revoke_gds_group;
 
     std::vector<size_t> pending_finalize_actions(ops.size(), 0);
     std::vector<bool> should_succeed(ops.size(), false);
@@ -2167,6 +2426,11 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
                                     key, index);
                     ++pending_finalize_actions[index];
                     break;
+                case ReplicaType::GDS:
+                    add_group_entry(is_end ? end_gds_group : revoke_gds_group,
+                                    key, index);
+                    ++pending_finalize_actions[index];
+                    break;
                 default:
                     LOG(ERROR) << "Unexpected replica type in batch finalize: "
                                << *replica_type;
@@ -2184,7 +2448,7 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
     for (size_t i = 0; i < ops.size(); ++i) {
         auto& op = ops[i];
         if (op.IsResolved()) {
-            if (!op.IsSuccessful() && !op.replicas.empty()) {
+            if (!op.IsSuccessful() && op.master_started) {
                 terminal_errors[i] = op.result.has_value()
                                          ? ErrorCode::INTERNAL_ERROR
                                          : op.result.error();
@@ -2192,19 +2456,64 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
             }
             continue;
         }
-        if (op.replicas.empty()) {
+        if (op.replicas.empty() && !op.gds_required) {
             op.SetTerminalError(ErrorCode::INTERNAL_ERROR,
                                 PutOperationState::MASTER_FAILED,
                                 "Operation has no replicas to finalize");
             continue;
         }
 
-        const auto finalize_decision = DetermineFinalizeDecision(
+        auto finalize_decision = DetermineFinalizeDecision(
             op.ToReplicateConfig(), op.transfer_summary);
+        bool gds_survives_regular_failure = false;
+        if (op.gds_required) {
+            const bool gds_succeeded =
+                op.gds_error == ErrorCode::OK &&
+                op.submitted_gds_transfers > 0 &&
+                op.successful_gds_transfers == op.submitted_gds_transfers;
+            if (!gds_succeeded) {
+                finalize_decision.end_type.reset();
+                finalize_decision.revoke_type = ReplicaType::ALL;
+                finalize_decision.success = false;
+                finalize_decision.error =
+                    op.gds_error == ErrorCode::OK ? ErrorCode::TRANSFER_FAIL
+                                                  : op.gds_error;
+            } else {
+                auto commit_result =
+                    gds_storage_->Commit(op.gds_reservation.value());
+                if (!commit_result) {
+                    finalize_decision.end_type.reset();
+                    finalize_decision.revoke_type = ReplicaType::ALL;
+                    finalize_decision.success = false;
+                    finalize_decision.error = commit_result.error();
+                } else if (!finalize_decision.success) {
+                    finalize_decision.end_type = ReplicaType::GDS;
+                    finalize_decision.revoke_type.reset();
+                    finalize_decision.success = true;
+                    finalize_decision.error = ErrorCode::OK;
+                    gds_survives_regular_failure = true;
+                }
+            }
+        }
         should_succeed[i] = finalize_decision.success;
         terminal_errors[i] = finalize_decision.error;
         add_finalize_action(finalize_decision.end_type, true, op.key, i);
-        add_finalize_action(finalize_decision.revoke_type, false, op.key, i);
+        if (op.gds_required && finalize_decision.success &&
+            finalize_decision.end_type != ReplicaType::ALL &&
+            finalize_decision.end_type != ReplicaType::GDS) {
+            add_finalize_action(ReplicaType::GDS, true, op.key, i);
+        }
+        if (gds_survives_regular_failure) {
+            if (op.transfer_summary.allocated_memory_replicas > 0) {
+                add_finalize_action(ReplicaType::MEMORY, false, op.key, i);
+            }
+            if (op.transfer_summary.allocated_nof_replicas > 0) {
+                add_finalize_action(ReplicaType::NOF_SSD, false, op.key, i);
+            }
+        } else {
+            add_finalize_action(finalize_decision.revoke_type, false, op.key,
+                                i);
+        }
     }
 
     auto process_end_group = [&](BatchFinalizeGroup& group,
@@ -2263,9 +2572,11 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
     process_end_group(end_all_group, ReplicaType::ALL);
     process_end_group(end_memory_group, ReplicaType::MEMORY);
     process_end_group(end_nof_group, ReplicaType::NOF_SSD);
+    process_end_group(end_gds_group, ReplicaType::GDS);
     process_revoke_group(revoke_all_group, ReplicaType::ALL);
     process_revoke_group(revoke_memory_group, ReplicaType::MEMORY);
     process_revoke_group(revoke_nof_group, ReplicaType::NOF_SSD);
+    process_revoke_group(revoke_gds_group, ReplicaType::GDS);
 
     auto append_finalize_error_context = [&](PutOperation& op, size_t index) {
         if (finalize_rpc_errors[index].has_value()) {
@@ -2283,11 +2594,21 @@ void Client::FinalizeBatchPut(std::vector<PutOperation>& ops) {
         if (op.IsResolved()) {
             if (!op.IsSuccessful()) {
                 append_finalize_error_context(op, i);
+                if ((finalize_rpc_errors[i].has_value() ||
+                     pending_finalize_actions[i] != 0) &&
+                    op.gds_reservation.has_value() &&
+                    op.gds_reservation->valid()) {
+                    gds_storage_->Preserve(op.gds_reservation.value());
+                }
             }
             continue;
         }
         if (finalize_rpc_errors[i].has_value() ||
             pending_finalize_actions[i] != 0) {
+            if (op.gds_reservation.has_value() &&
+                op.gds_reservation->valid()) {
+                gds_storage_->Preserve(op.gds_reservation.value());
+            }
             if (!should_succeed[i] && terminal_errors[i] != ErrorCode::OK) {
                 append_finalize_error_context(op, i);
                 op.SetTerminalError(
@@ -2574,6 +2895,51 @@ std::vector<tl::expected<void, ErrorCode>> Client::BatchPut(
         client_cfg.preferred_segment = local_hostname_;
     }
     std::vector<PutOperation> ops = CreatePutOperations(keys, batched_slices);
+    if (client_cfg.group_ids.has_value() &&
+        client_cfg.group_ids->size() != keys.size()) {
+        return std::vector<tl::expected<void, ErrorCode>>(
+            keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+    }
+    if (gds_storage_) {
+        if (client_cfg.prefer_alloc_in_same_node) {
+            LOG(ERROR) << "prefer_alloc_in_same_node is not supported with "
+                          "GDS offload";
+            return std::vector<tl::expected<void, ErrorCode>>(
+                keys.size(), tl::unexpected(ErrorCode::INVALID_PARAMS));
+        }
+        for (auto& op : ops) {
+            op.gds_required = true;
+            uint64_t value_size = 0;
+            bool valid = !op.slices.empty();
+            for (const auto& slice : op.slices) {
+                const auto address = reinterpret_cast<uintptr_t>(slice.ptr);
+                if (!slice.ptr || slice.size == 0 ||
+                    address % GdsStorageManager::kAlignment != 0 ||
+                    slice.size % GdsStorageManager::kAlignment != 0 ||
+                    value_size >
+                        std::numeric_limits<uint64_t>::max() - slice.size) {
+                    valid = false;
+                    break;
+                }
+                value_size += slice.size;
+            }
+            if (!valid || value_size == 0) {
+                op.SetTerminalError(
+                    ErrorCode::INVALID_PARAMS,
+                    PutOperationState::TRANSFER_FAILED,
+                    "GDS requires 4 KiB-aligned non-empty buffers and sizes");
+                continue;
+            }
+            auto reservation = gds_storage_->Reserve(op.key, value_size);
+            if (!reservation) {
+                op.SetTerminalError(reservation.error(),
+                                    PutOperationState::MASTER_FAILED,
+                                    "Failed to reserve GDS extent");
+                continue;
+            }
+            op.gds_reservation.emplace(std::move(reservation.value()));
+        }
+    }
     if (client_cfg.prefer_alloc_in_same_node) {
         if (client_cfg.nof_replica_num > 0) {
             LOG(ERROR) << "prefer_alloc_in_same_node is not supported with "
@@ -3899,6 +4265,52 @@ ErrorCode Client::FindFirstCompleteReplica(
     }
 
     // No complete replica found
+    return ErrorCode::INVALID_REPLICA;
+}
+
+ErrorCode Client::FindPreferredCompleteReplicaForRead(
+    const std::vector<Replica::Descriptor>& replica_list,
+    Replica::Descriptor& replica) const {
+    const auto local_endpoints = GetLocalEndpoints();
+    const Replica::Descriptor* first_memory = nullptr;
+
+    for (const auto& candidate : replica_list) {
+        if (candidate.status != ReplicaStatus::COMPLETE ||
+            !candidate.is_memory_replica()) {
+            continue;
+        }
+        const auto& endpoint = candidate.get_memory_descriptor()
+                                   .buffer_descriptor.transport_endpoint_;
+        if (local_endpoints.count(endpoint) != 0) {
+            replica = candidate;
+            return ErrorCode::OK;
+        }
+        if (!first_memory) {
+            first_memory = &candidate;
+        }
+    }
+    if (first_memory) {
+        replica = *first_memory;
+        return ErrorCode::OK;
+    }
+
+    for (const auto& candidate : replica_list) {
+        if (candidate.status == ReplicaStatus::COMPLETE &&
+            candidate.is_gds_replica() &&
+            IsLocalGdsDescriptor(candidate.get_gds_descriptor())) {
+            replica = candidate;
+            return ErrorCode::OK;
+        }
+    }
+
+    for (const auto& candidate : replica_list) {
+        if (candidate.status == ReplicaStatus::COMPLETE &&
+            !candidate.is_memory_replica() && !candidate.is_gds_replica()) {
+            replica = candidate;
+            return ErrorCode::OK;
+        }
+    }
+
     return ErrorCode::INVALID_REPLICA;
 }
 

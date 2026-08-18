@@ -240,6 +240,8 @@ class TransferEngine {
    public:
     bool available() const;
 
+    bool hasTransport(TransportType type) const;
+
     const std::string getSegmentName() const;
 
     const std::string getRpcServerAddress() const;

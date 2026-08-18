@@ -95,6 +95,11 @@ class TransferEngine {
 
     bool isUsingTent() const { return use_tent_; }
 
+    /// Returns whether a transport is available in the active engine.
+    /// This is primarily used by callers that require a specific data path
+    /// and must not silently fall back to another transport.
+    bool hasTransport(const std::string& proto) const;
+
     SegmentHandle openSegment(const std::string& segment_name);
 
     Status CheckSegmentStatus(SegmentID sid);

@@ -139,6 +139,11 @@ Status GdsTransport::uninstall() {
         }
         handle_pool_.clear();
 
+        {
+            RWSpinlock::WriteGuard guard(registered_buffer_lock_);
+            registered_buffers_.clear();
+        }
+
         metadata_.reset();
         installed_ = false;
     }
@@ -263,6 +268,30 @@ GdsFileContext* GdsTransport::findFileContext(SegmentID target_id) {
     return tl_file_context_map[target_id].get();
 }
 
+Status GdsTransport::findRegisteredBuffer(void* source, size_t length,
+                                          void*& registered_base,
+                                          size_t& registered_offset) {
+    const uint64_t source_addr =
+        static_cast<uint64_t>(reinterpret_cast<std::uintptr_t>(source));
+
+    RWSpinlock::ReadGuard guard(registered_buffer_lock_);
+    auto it = registered_buffers_.upper_bound(source_addr);
+    if (it == registered_buffers_.begin())
+        return Status::AddressNotRegistered(
+            "GDS source address is not in a registered buffer" LOC_MARK);
+    --it;
+
+    const uint64_t offset = source_addr - it->first;
+    if (offset > it->second || length > it->second - offset)
+        return Status::AddressNotRegistered(
+            "GDS source range is not in a registered buffer" LOC_MARK);
+
+    registered_base =
+        reinterpret_cast<void*>(static_cast<std::uintptr_t>(it->first));
+    registered_offset = static_cast<size_t>(offset);
+    return Status::OK();
+}
+
 Status GdsTransport::submitTransferTasks(
     SubBatchRef batch, const std::vector<Request>& request_list) {
     const static size_t kMaxSliceSize = 16ull << 20;
@@ -276,6 +305,11 @@ Status GdsTransport::submitTransferTasks(
     if (first_param_index + num_params > io_batch_depth_)
         return Status::TooManyRequests("Exceed batch capacity" LOC_MARK);
     for (auto& request : request_list) {
+        void* registered_base = nullptr;
+        size_t registered_offset = 0;
+        CHECK_STATUS(findRegisteredBuffer(request.source, request.length,
+                                          registered_base, registered_offset));
+
         GdsFileContext* context = findFileContext(request.target_id);
         if (!context || !context->ready())
             return Status::InvalidArgument("Invalid remote segment" LOC_MARK);
@@ -291,8 +325,8 @@ Status GdsTransport::submitTransferTasks(
                 (request.opcode == Request::READ) ? CUFILE_READ : CUFILE_WRITE;
             params.cookie =
                 reinterpret_cast<void*>(static_cast<std::uintptr_t>(task_id));
-            params.u.batch.devPtr_base = request.source;
-            params.u.batch.devPtr_offset = offset;
+            params.u.batch.devPtr_base = registered_base;
+            params.u.batch.devPtr_offset = registered_offset + offset;
             params.u.batch.file_offset = request.target_offset + offset;
             params.u.batch.size = length;
             params.fh = context->getHandle();
@@ -355,13 +389,19 @@ Status GdsTransport::getTransferStatus(SubBatchRef batch, int task_id,
 
 Status GdsTransport::addMemoryBuffer(BufferDesc& desc,
                                      const MemoryOptions& options) {
-    LocationParser location(options.location);
+    LocationParser location(desc.location);
     if (location.type() != "cuda") return Status::OK();
     auto result = cuFileBufRegister((void*)desc.addr, desc.length, 0);
+    LOG(INFO) << "GDS cuFile buffer register addr: " << desc.addr
+              << ", length: " << desc.length;
     if (result.err != CU_FILE_SUCCESS)
         return Status::InternalError(
             std::string("Failed to register GDS buffer: Code ") +
             std::to_string(result.err) + LOC_MARK);
+    {
+        RWSpinlock::WriteGuard guard(registered_buffer_lock_);
+        registered_buffers_[desc.addr] = desc.length;
+    }
     desc.transports.push_back(GDS);
     return Status::OK();
 }
@@ -374,6 +414,10 @@ Status GdsTransport::removeMemoryBuffer(BufferDesc& desc) {
         return Status::InternalError(
             std::string("Failed to deregister GDS buffer: Code ") +
             std::to_string(result.err) + LOC_MARK);
+    {
+        RWSpinlock::WriteGuard guard(registered_buffer_lock_);
+        registered_buffers_.erase(desc.addr);
+    }
     return Status::OK();
 }
 

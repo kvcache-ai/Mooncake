@@ -411,6 +411,21 @@ class MasterService {
         const std::string& tenant_id,
         ReplicaType replica_type = ReplicaType::ALL);
 
+    tl::expected<void, ErrorCode> RegisterGdsStorage(
+        const UUID& client_id, const std::string& storage_id,
+        uint64_t storage_generation);
+    tl::expected<void, ErrorCode> UnregisterGdsStorage(
+        const UUID& client_id, const std::string& storage_id,
+        uint64_t storage_generation);
+    std::vector<tl::expected<void, ErrorCode>> BatchAddGdsReplicaStart(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const std::vector<GdsDescriptor>& descriptors,
+        const std::string& tenant_id);
+    std::vector<tl::expected<void, ErrorCode>> BatchCreateGdsOnlyObjects(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const std::vector<GdsDescriptor>& descriptors,
+        const ReplicateConfig& config, const std::string& tenant_id);
+
     /**
      * @brief Start an upsert operation. If the key does not exist, behaves
      * like PutStart. If the key exists with the same size, performs in-place
@@ -1059,7 +1074,8 @@ class MasterService {
             return EraseReplicas([replica_type](const Replica& replica) {
                 if (replica_type == ReplicaType::ALL) {
                     return replica.is_memory_replica() ||
-                           replica.is_nof_replica();
+                           replica.is_nof_replica() ||
+                           replica.is_gds_replica();
                 }
                 return replica.type() == replica_type;
             });
@@ -1483,6 +1499,10 @@ class MasterService {
         const std::string& tenant_id,
         const std::chrono::system_clock::time_point& now)
         -> tl::expected<std::vector<Replica::Descriptor>, ErrorCode>;
+    tl::expected<void, ErrorCode> CreateGdsOnlyObject(
+        const UUID& client_id, const std::string& key,
+        const GdsDescriptor& descriptor, const ReplicateConfig& config,
+        const std::string& tenant_id);
 
     /**
      * @brief Helper to discard expired processing keys.
@@ -2022,6 +2042,13 @@ class MasterService {
     std::unique_ptr<SnapshotObjectStore> snapshot_object_store_;
     std::unique_ptr<ha::SnapshotCatalogStore> snapshot_catalog_store_;
     mutable std::shared_mutex snapshot_mutex_;
+    struct GdsStorageIdentity {
+        std::string storage_id;
+        uint64_t generation;
+    };
+    mutable std::mutex gds_storage_mutex_;
+    std::unordered_map<UUID, GdsStorageIdentity, boost::hash<UUID>>
+        gds_storages_ GUARDED_BY(gds_storage_mutex_);
 #ifdef STORE_USE_ETCD
     mutable std::mutex snapshot_boundary_oplog_store_mutex_;
     mutable std::unique_ptr<EtcdOpLogStore> snapshot_boundary_oplog_store_;

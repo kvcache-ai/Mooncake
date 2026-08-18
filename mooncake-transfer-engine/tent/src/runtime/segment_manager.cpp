@@ -129,7 +129,7 @@ Status SegmentManager::getRemoteCached(SegmentDescRef &desc, SegmentID handle) {
             ControlClient::subscribeSegmentUpdateAsync(peer_rpc_addr,
                                                        local_rpc_addr);
         } else {
-            LOG(ERROR) << "Unexpected empty RPC address, peer: '"
+            VLOG(1) << "Unexpected empty RPC address, peer: '"
                        << peer_rpc_addr << "', local: '" << local_rpc_addr
                        << "'.";
         }

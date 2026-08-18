@@ -1023,8 +1023,12 @@ std::optional<TransferFuture> TransferSubmitter::submit(
         LOG(ERROR) << "NoF transfer requested while USE_NOF is disabled";
         return std::nullopt;
 #endif
-    } else {
+    } else if (replica.is_disk_replica() ||
+               replica.is_local_disk_replica()) {
         future = submitFileReadOperation(replica, slices, op_code);
+    } else {
+        LOG(ERROR) << "Unsupported replica type for generic transfer submit";
+        return std::nullopt;
     }
 
     // Update metrics on successful submission
@@ -1115,6 +1119,67 @@ TransferSubmitter::submit_batch_get_offload_object(
         }
     }
     return submitTransfer(requests);
+}
+
+TransferSubmitter::FileSubmitResult
+TransferSubmitter::submitFile(SegmentHandle segment, uint64_t target_offset,
+                              const std::vector<Slice>& slices,
+                              TransferRequest::OpCode op_code) {
+    constexpr size_t kGdsAlignment = 4096;
+    constexpr size_t kMaxGdsEntrySize = 16 * 1024 * 1024;
+    constexpr size_t kMaxEntriesPerBatch = 128;
+
+    if (segment == static_cast<SegmentHandle>(-1) || slices.empty() ||
+        target_offset % kGdsAlignment != 0) {
+        return {{}, ErrorCode::INVALID_PARAMS};
+    }
+
+    std::vector<std::vector<TransferRequest>> batches(1);
+    uint64_t object_offset = 0;
+    for (const auto& slice : slices) {
+        const uintptr_t address = reinterpret_cast<uintptr_t>(slice.ptr);
+        if (!slice.ptr || slice.size == 0 || address % kGdsAlignment != 0 ||
+            slice.size % kGdsAlignment != 0) {
+            LOG(ERROR) << "GDS file I/O requires 4 KiB-aligned non-empty "
+                          "buffers and lengths";
+            return {{}, ErrorCode::INVALID_PARAMS};
+        }
+
+        size_t remaining = slice.size;
+        size_t slice_offset = 0;
+        while (remaining > 0) {
+            const size_t length = std::min(remaining, kMaxGdsEntrySize);
+            if (batches.back().size() == kMaxEntriesPerBatch) {
+                batches.emplace_back();
+            }
+            TransferRequest request;
+            request.opcode = op_code;
+            request.source = static_cast<char*>(slice.ptr) + slice_offset;
+            request.target_id = segment;
+            request.target_offset =
+                target_offset + object_offset + slice_offset;
+            request.length = length;
+            batches.back().push_back(request);
+            remaining -= length;
+            slice_offset += length;
+        }
+        object_offset += slice.size;
+    }
+
+    FileSubmitResult result;
+    result.futures.reserve(batches.size());
+    for (auto& requests : batches) {
+        auto future = submitTransfer(requests);
+        if (!future.has_value()) {
+            // Already-submitted futures remain owned by the caller and must
+            // be driven to a terminal state before its buffers are reused.
+            result.error = ErrorCode::TRANSFER_FAIL;
+            return result;
+        }
+        result.futures.emplace_back(std::move(future.value()));
+    }
+    updateTransferMetrics(slices, op_code);
+    return result;
 }
 
 std::optional<TransferFuture> TransferSubmitter::submitMemcpyOperation(

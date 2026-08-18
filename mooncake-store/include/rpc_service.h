@@ -105,6 +105,22 @@ class WrappedMasterService {
         ReplicaType replica_type = ReplicaType::ALL,
         const std::string& tenant_id = "default");
 
+    tl::expected<void, ErrorCode> RegisterGdsStorage(
+        const UUID& client_id, const std::string& storage_id,
+        uint64_t storage_generation);
+    tl::expected<void, ErrorCode> UnregisterGdsStorage(
+        const UUID& client_id, const std::string& storage_id,
+        uint64_t storage_generation);
+    std::vector<tl::expected<void, ErrorCode>> BatchAddGdsReplicaStart(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const std::vector<GdsDescriptor>& descriptors,
+        const std::string& tenant_id = "default");
+    std::vector<tl::expected<void, ErrorCode>> BatchCreateGdsOnlyObjects(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const std::vector<GdsDescriptor>& descriptors,
+        const ReplicateConfig& config,
+        const std::string& tenant_id = "default");
+
     tl::expected<std::vector<Replica::Descriptor>, ErrorCode> UpsertStart(
         const UUID& client_id, const std::string& key,
         const uint64_t slice_length, const ReplicateConfig& config,

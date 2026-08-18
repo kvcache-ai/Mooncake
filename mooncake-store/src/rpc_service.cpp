@@ -473,6 +473,38 @@ std::vector<tl::expected<void, ErrorCode>> WrappedMasterService::BatchPutRevoke(
     return results;
 }
 
+tl::expected<void, ErrorCode> WrappedMasterService::RegisterGdsStorage(
+    const UUID& client_id, const std::string& storage_id,
+    uint64_t storage_generation) {
+    return master_service_.RegisterGdsStorage(client_id, storage_id,
+                                              storage_generation);
+}
+
+tl::expected<void, ErrorCode> WrappedMasterService::UnregisterGdsStorage(
+    const UUID& client_id, const std::string& storage_id,
+    uint64_t storage_generation) {
+    return master_service_.UnregisterGdsStorage(client_id, storage_id,
+                                                storage_generation);
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+WrappedMasterService::BatchAddGdsReplicaStart(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    const std::vector<GdsDescriptor>& descriptors,
+    const std::string& tenant_id) {
+    return master_service_.BatchAddGdsReplicaStart(
+        client_id, keys, descriptors, tenant_id);
+}
+
+std::vector<tl::expected<void, ErrorCode>>
+WrappedMasterService::BatchCreateGdsOnlyObjects(
+    const UUID& client_id, const std::vector<std::string>& keys,
+    const std::vector<GdsDescriptor>& descriptors,
+    const ReplicateConfig& config, const std::string& tenant_id) {
+    return master_service_.BatchCreateGdsOnlyObjects(
+        client_id, keys, descriptors, config, tenant_id);
+}
+
 tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
 WrappedMasterService::UpsertStart(const UUID& client_id, const std::string& key,
                                   const uint64_t slice_length,
@@ -1286,6 +1318,17 @@ void RegisterRpcService(
     server.register_handler<&mooncake::WrappedMasterService::BatchPutEnd>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::BatchPutRevoke>(
+        &wrapped_master_service);
+    server.register_handler<&mooncake::WrappedMasterService::RegisterGdsStorage>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::UnregisterGdsStorage>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::BatchAddGdsReplicaStart>(
+        &wrapped_master_service);
+    server.register_handler<
+        &mooncake::WrappedMasterService::BatchCreateGdsOnlyObjects>(
         &wrapped_master_service);
     server.register_handler<&mooncake::WrappedMasterService::UpsertStart>(
         &wrapped_master_service);

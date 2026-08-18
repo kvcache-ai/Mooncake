@@ -2,6 +2,7 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <barrier>
 #include <chrono>
 #include <cstdio>
@@ -13,6 +14,10 @@
 #include <string>
 #include <thread>
 #include <unistd.h>
+
+#if defined(USE_TENT) && defined(USE_CUDA)
+#include <cuda_runtime.h>
+#endif
 
 #include "real_client.h"
 #include "test_server_helpers.h"
@@ -35,6 +40,61 @@ class GLogMuter {
    private:
     int original_log_level_;
 };
+
+class ScopedEnvironmentVariable {
+   public:
+    ScopedEnvironmentVariable(const char* name, const std::string& value)
+        : name_(name) {
+        const char* old_value = std::getenv(name);
+        if (old_value) {
+            old_value_ = old_value;
+        }
+        EXPECT_EQ(::setenv(name_.c_str(), value.c_str(), 1), 0);
+    }
+
+    ~ScopedEnvironmentVariable() {
+        if (old_value_.has_value()) {
+            (void)::setenv(name_.c_str(), old_value_->c_str(), 1);
+        } else {
+            (void)::unsetenv(name_.c_str());
+        }
+    }
+
+   private:
+    std::string name_;
+    std::optional<std::string> old_value_;
+};
+
+#if defined(USE_TENT) && defined(USE_CUDA)
+class AlignedCudaAllocation {
+   public:
+    ~AlignedCudaAllocation() {
+        if (base_) {
+            (void)::cudaFree(base_);
+        }
+    }
+
+    cudaError_t Allocate(size_t size, size_t alignment) {
+        size_ = size;
+        auto error = ::cudaMalloc(&base_, size + alignment);
+        if (error != cudaSuccess) {
+            return error;
+        }
+        const uintptr_t base = reinterpret_cast<uintptr_t>(base_);
+        const uintptr_t aligned = (base + alignment - 1) & ~(alignment - 1);
+        data_ = reinterpret_cast<void*>(aligned);
+        return cudaSuccess;
+    }
+
+    void* data() const { return data_; }
+    size_t size() const { return size_; }
+
+   private:
+    void* base_{nullptr};
+    void* data_{nullptr};
+    size_t size_{0};
+};
+#endif
 
 class RealClientTest : public ::testing::Test {
    protected:
@@ -804,6 +864,160 @@ TEST_F(RealClientTest, TestBatchPutAndGetMultiBuffers) {
     ASSERT_EQ(unreg_result_dst, 0)
         << "Dst data buffer unregistration should succeed";
 }
+
+#if defined(USE_TENT) && defined(USE_CUDA)
+TEST_F(RealClientTest, BatchPutMultiBuffersWritesGdsAndReadsBack) {
+    if (!std::getenv("MOONCAKE_RUN_GDS_TEST")) {
+        GTEST_SKIP() << "Set MOONCAKE_RUN_GDS_TEST=1 to run the GDS test";
+    }
+    const char* test_path_env = std::getenv("MOONCAKE_GDS_TEST_PATH");
+    if (!test_path_env || !*test_path_env) {
+        GTEST_SKIP() << "Set MOONCAKE_GDS_TEST_PATH to a disposable file on "
+                        "a GDS-capable filesystem";
+    }
+
+    int device_count = 0;
+    if (::cudaGetDeviceCount(&device_count) != cudaSuccess ||
+        device_count == 0) {
+        GTEST_SKIP() << "No CUDA device is available";
+    }
+    ASSERT_EQ(::cudaSetDevice(0), cudaSuccess);
+
+    const std::string gds_path(test_path_env);
+    (void)::unlink(gds_path.c_str());
+    struct FileCleanup {
+        explicit FileCleanup(std::string path) : path(std::move(path)) {}
+        ~FileCleanup() { (void)::unlink(path.c_str()); }
+        std::string path;
+    } file_cleanup(gds_path);
+
+    ScopedEnvironmentVariable use_tent("MC_USE_TENT", "1");
+    ScopedEnvironmentVariable disable_memcpy("MC_STORE_MEMCPY", "0");
+    ScopedEnvironmentVariable capacity(
+        "MOONCAKE_OFFLOAD_TOTAL_SIZE_LIMIT_BYTES", "16777216");
+    ScopedEnvironmentVariable enable_gds_offload("MOONCAKE_GDS_OFFLOAD_ENABLED",
+                                                 "1");
+    ScopedEnvironmentVariable gds_offload_path("MOONCAKE_GDS_OFFLOAD_PATH",
+                                               gds_path);
+    ScopedEnvironmentVariable tent_config(
+        "MC_TENT_CONF",
+        R"({"transports":{"tcp":{"enable":true},"gds":{"enable":true,"io_batch_depth":32},"io_uring":{"enable":false}}})");
+
+    constexpr uint64_t kLeaseTtlMs = 20;
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_default_kv_lease_ttl(kLeaseTtlMs)
+                                  .build()))
+        << "Failed to start in-proc master";
+    master_address_ = master_.master_address();
+
+    const std::string client_address = "localhost:17813";
+    auto transfer_engine = std::make_shared<TransferEngine>();
+    ASSERT_EQ(transfer_engine->init("P2PHANDSHAKE", client_address), 0);
+    ASSERT_EQ(
+        py_client_->setup_real(client_address, "P2PHANDSHAKE", 16 * 1024 * 1024,
+                               0, "tcp", "", master_address_, transfer_engine,
+                               "", false, "", "default"),
+        0);
+
+    constexpr size_t kSliceSize = 4096;
+    constexpr size_t kSliceCount = 2;
+    constexpr size_t kObjectSize = kSliceSize * kSliceCount;
+    AlignedCudaAllocation source;
+    AlignedCudaAllocation destination;
+    ASSERT_EQ(source.Allocate(kObjectSize, kSliceSize), cudaSuccess);
+    ASSERT_EQ(destination.Allocate(kObjectSize, kSliceSize), cudaSuccess);
+    ASSERT_EQ(reinterpret_cast<uintptr_t>(source.data()) % kSliceSize, 0u);
+    ASSERT_EQ(reinterpret_cast<uintptr_t>(destination.data()) % kSliceSize, 0u);
+
+    std::vector<uint8_t> expected(kObjectSize);
+    for (size_t i = 0; i < expected.size(); ++i) {
+        expected[i] = static_cast<uint8_t>((i * 37 + 11) & 0xff);
+    }
+    ASSERT_EQ(::cudaMemcpy(source.data(), expected.data(), expected.size(),
+                           cudaMemcpyHostToDevice),
+              cudaSuccess);
+    ASSERT_EQ(::cudaMemset(destination.data(), 0, destination.size()),
+              cudaSuccess);
+
+    ASSERT_EQ(py_client_->register_buffer(source.data(), source.size()), 0);
+    ASSERT_EQ(
+        py_client_->register_buffer(destination.data(), destination.size()), 0);
+
+    const std::string key = "gds_batch_put_multi_buffers";
+    std::vector<std::string> keys{key};
+    std::vector<std::vector<void*>> all_buffers{
+        {source.data(), static_cast<char*>(source.data()) + kSliceSize}};
+    std::vector<std::vector<size_t>> all_sizes{{kSliceSize, kSliceSize}};
+    auto put_results = py_client_->batch_put_from_multi_buffers(
+        keys, all_buffers, all_sizes, ReplicateConfig{});
+    ASSERT_EQ(put_results, std::vector<int>({0}));
+
+    const auto replicas = py_client_->get_replica_desc(key);
+    const GdsDescriptor* gds_descriptor = nullptr;
+    bool found_complete_memory = false;
+    for (const auto& replica : replicas) {
+        if (replica.is_memory_replica() &&
+            replica.status == ReplicaStatus::COMPLETE) {
+            found_complete_memory = true;
+        }
+        if (replica.is_gds_replica() &&
+            replica.status == ReplicaStatus::COMPLETE) {
+            gds_descriptor = &replica.get_gds_descriptor();
+        }
+    }
+    ASSERT_TRUE(found_complete_memory);
+    ASSERT_NE(gds_descriptor, nullptr);
+    ASSERT_EQ(gds_descriptor->value_size, kObjectSize);
+    ASSERT_EQ(gds_descriptor->value_offset % kSliceSize, 0u);
+
+    std::vector<std::vector<void*>> destination_buffers{
+        {destination.data(),
+         static_cast<char*>(destination.data()) + kSliceSize}};
+
+    // With both replicas present, BatchGet must keep the existing MEMORY-first
+    // behavior.
+    auto get_results = py_client_->batch_get_into_multi_buffers(
+        keys, destination_buffers, all_sizes, false);
+    ASSERT_EQ(get_results, std::vector<int>({static_cast<int>(kObjectSize)}));
+    std::vector<uint8_t> actual(kObjectSize);
+    ASSERT_EQ(::cudaMemcpy(actual.data(), destination.data(), actual.size(),
+                           cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    ASSERT_EQ(actual, expected);
+    ASSERT_EQ(::cudaMemset(destination.data(), 0, destination.size()),
+              cudaSuccess);
+
+    // Remove only the MEMORY replica. BatchReplicaClear requires the metadata
+    // read lease above to expire; the GDS replica has no segment name and is
+    // therefore retained.
+    std::this_thread::sleep_for(std::chrono::milliseconds(kLeaseTtlMs + 20));
+    ASSERT_EQ(py_client_->batch_replica_clear(keys, client_address), keys);
+
+    const auto gds_only_replicas = py_client_->get_replica_desc(key);
+    ASSERT_FALSE(gds_only_replicas.empty());
+    for (const auto& replica : gds_only_replicas) {
+        EXPECT_FALSE(replica.is_memory_replica());
+    }
+    ASSERT_TRUE(std::any_of(gds_only_replicas.begin(), gds_only_replicas.end(),
+                            [](const Replica::Descriptor& replica) {
+                                return replica.is_gds_replica() &&
+                                       replica.status ==
+                                           ReplicaStatus::COMPLETE;
+                            }));
+
+    get_results = py_client_->batch_get_into_multi_buffers(
+        keys, destination_buffers, all_sizes, false);
+    ASSERT_EQ(get_results, std::vector<int>({static_cast<int>(kObjectSize)}));
+
+    ASSERT_EQ(::cudaMemcpy(actual.data(), destination.data(), actual.size(),
+                           cudaMemcpyDeviceToHost),
+              cudaSuccess);
+    EXPECT_EQ(actual, expected);
+
+    EXPECT_EQ(py_client_->unregister_buffer(destination.data()), 0);
+    EXPECT_EQ(py_client_->unregister_buffer(source.data()), 0);
+}
+#endif
 
 TEST_F(RealClientTest, TestBatchAndNormalGetReplicaDesc) {
     // Start in-proc master

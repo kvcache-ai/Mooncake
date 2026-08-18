@@ -1586,6 +1586,64 @@ TEST_F(MasterServiceTest, WrappedBatchPutStartMixedGroupIdsPreservesOrder) {
     }
 }
 
+TEST_F(MasterServiceTest, BatchCreateGdsOnlyObjectsWithoutMemorySegments) {
+    const std::string tenant_id = "gds-only-tenant";
+    MasterService service(MakeStrictTenantConfig({tenant_id}));
+    const UUID client_id = generate_uuid();
+    const std::string storage_id = "gds-fallback-storage";
+    constexpr uint64_t storage_generation = 7;
+    ASSERT_TRUE(
+        service.RegisterGdsStorage(client_id, storage_id, storage_generation)
+            .has_value());
+
+    const std::vector<std::string> keys = {"gds_only_grouped",
+                                           "gds_only_ungrouped"};
+    const std::vector<GdsDescriptor> descriptors = {
+        GdsDescriptor{client_id, storage_id, storage_generation, 0, 4096, 4096},
+        GdsDescriptor{client_id, storage_id, storage_generation, 4096, 8192,
+                      8192},
+    };
+    ReplicateConfig config;
+    config.group_ids =
+        std::vector<std::string>{FindGroupIdOnDifferentShard(keys[0]), ""};
+
+    auto start_results = service.BatchCreateGdsOnlyObjects(
+        client_id, keys, descriptors, config, tenant_id);
+    ASSERT_EQ(start_results.size(), keys.size());
+    for (const auto& result : start_results) {
+        ASSERT_TRUE(result.has_value());
+    }
+
+    for (const auto& key : keys) {
+        auto pending = service.GetReplicaList(key, tenant_id);
+        ASSERT_FALSE(pending.has_value());
+        EXPECT_EQ(pending.error(), ErrorCode::REPLICA_IS_NOT_READY);
+    }
+
+    auto end_results =
+        service.BatchPutEnd(client_id, keys, tenant_id, ReplicaType::GDS);
+    ASSERT_EQ(end_results.size(), keys.size());
+    for (const auto& result : end_results) {
+        ASSERT_TRUE(result.has_value());
+    }
+    auto quota = service.GetTenantQuotaSnapshotForTesting(tenant_id);
+    ASSERT_TRUE(quota.has_value());
+    EXPECT_EQ(quota->used_bytes, 0u);
+    EXPECT_EQ(quota->reserved_bytes, 0u);
+    EXPECT_EQ(quota->metadata_object_count, keys.size());
+
+    for (size_t i = 0; i < keys.size(); ++i) {
+        auto completed = service.GetReplicaList(keys[i], tenant_id);
+        ASSERT_TRUE(completed.has_value());
+        ASSERT_EQ(completed->replicas.size(), 1u);
+        const auto& replica = completed->replicas.front();
+        EXPECT_TRUE(replica.is_gds_replica());
+        EXPECT_EQ(replica.status, ReplicaStatus::COMPLETE);
+        EXPECT_EQ(replica.get_gds_descriptor().value_offset,
+                  descriptors[i].value_offset);
+    }
+}
+
 TEST_F(MasterServiceTest, PutStartEndFlow) {
     std::unique_ptr<MasterService> service_(new MasterService());
     [[maybe_unused]] const auto context = PrepareSimpleSegment(*service_);

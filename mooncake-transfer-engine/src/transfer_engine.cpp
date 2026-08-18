@@ -59,6 +59,10 @@ std::string TransferEngine::getLocalIpAndPort() {
 
 int TransferEngine::getRpcPort() { return impl_->getRpcPort(); }
 
+bool TransferEngine::hasTransport(const std::string& proto) const {
+    return impl_ && impl_->getTransport(proto) != nullptr;
+}
+
 SegmentHandle TransferEngine::openSegment(const std::string& segment_name) {
     return impl_->openSegment(segment_name);
 }
@@ -343,6 +347,22 @@ int TransferEngine::getRpcPort() {
         return impl_tent_->getRpcServerPort();
     } else
         return impl_->getRpcPort();
+}
+
+bool TransferEngine::hasTransport(const std::string& proto) const {
+    if (!use_tent_) {
+        return impl_ && impl_->getTransport(proto) != nullptr;
+    }
+    if (!impl_tent_) {
+        return false;
+    }
+    if (proto == "gds") {
+        return impl_tent_->hasTransport(mooncake::tent::GDS);
+    }
+    if (proto == "io_uring") {
+        return impl_tent_->hasTransport(mooncake::tent::IOURING);
+    }
+    return false;
 }
 
 SegmentHandle TransferEngine::openSegment(const std::string& segment_name) {

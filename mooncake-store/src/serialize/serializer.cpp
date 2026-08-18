@@ -712,6 +712,23 @@ tl::expected<void, SerializationError> Serializer<Replica>::serialize(
             packer.pack(local_data->transport_endpoint);
             break;
         }
+        case ReplicaType::GDS: {
+            const auto *gds_data =
+                std::get_if<GdsReplicaData>(&replica.data_);
+            if (!gds_data) {
+                return tl::unexpected(SerializationError(
+                    ErrorCode::DESERIALIZE_FAIL,
+                    "serialize_msgpack Replica missing GdsReplicaData"));
+            }
+            packer.pack_array(6);
+            packer.pack(UuidToString(gds_data->owner_client_id));
+            packer.pack(gds_data->storage_id);
+            packer.pack(gds_data->storage_generation);
+            packer.pack(gds_data->value_offset);
+            packer.pack(gds_data->value_size);
+            packer.pack(gds_data->allocated_size);
+            break;
+        }
         default:
             // Unsupported replica type
             packer.pack(static_cast<int8_t>(255));
@@ -810,6 +827,33 @@ auto Serializer<Replica>::deserialize(const msgpack::object &obj,
 
             replica = std::make_shared<Replica>(
                 client_id, object_size, std::move(transport_endpoint), status);
+            break;
+        }
+        case static_cast<int8_t>(ReplicaType::GDS): {
+            const auto &payload = array_items[3];
+            if (payload.type != msgpack::type::ARRAY ||
+                payload.via.array.size != 6) {
+                return tl::unexpected(SerializationError(
+                    ErrorCode::DESERIALIZE_FAIL,
+                    "deserialize_msgpack Replica GDS payload is not valid "
+                    "array[6]"));
+            }
+            auto *payload_items = payload.via.array.ptr;
+            UUID owner_client_id;
+            const std::string owner = payload_items[0].as<std::string>();
+            if (!StringToUuid(owner, owner_client_id)) {
+                return tl::unexpected(SerializationError(
+                    ErrorCode::DESERIALIZE_FAIL,
+                    "deserialize_msgpack Replica invalid GDS owner UUID"));
+            }
+            GdsDescriptor descriptor{
+                owner_client_id, payload_items[1].as<std::string>(),
+                payload_items[2].as<uint64_t>(),
+                payload_items[3].as<uint64_t>(),
+                payload_items[4].as<uint64_t>(),
+                payload_items[5].as<uint64_t>()};
+            replica =
+                std::make_shared<Replica>(std::move(descriptor), status);
             break;
         }
         default:
