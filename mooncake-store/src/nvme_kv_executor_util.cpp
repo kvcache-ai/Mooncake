@@ -4,8 +4,16 @@
 #include <algorithm>
 #include <cerrno>
 #include <cstdlib>
+#include <cctype>
+#include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <limits>
+#include <optional>
+#include <sstream>
+#include <unordered_map>
+
+#include <glog/logging.h>
 
 namespace mooncake {
 namespace {
@@ -19,6 +27,12 @@ constexpr uint32_t kNvmeKvStatusInvalidKeySize = 0x86;
 constexpr uint32_t kNvmeKvStatusKeyNotFound = 0x87;
 constexpr uint32_t kNvmeKvStatusUnrecoveredRead = 0x88;
 constexpr uint32_t kNvmeKvStatusKeyExists = 0x89;
+constexpr char kNvmeKvSysfsRootEnv[] = "MOONCAKE_NVME_KV_SYSFS_ROOT";
+constexpr char kNvmeKvDevRootEnv[] = "MOONCAKE_NVME_KV_DEV_ROOT";
+constexpr char kDefaultNvmeKvSysfsRoot[] = "/sys/class/nvme";
+constexpr char kDefaultNvmeKvDevRoot[] = "/dev";
+
+using EndpointFields = std::unordered_map<std::string, std::string>;
 
 uint32_t ReadLe32(const uint8_t *p) {
     return static_cast<uint32_t>(p[0]) | (static_cast<uint32_t>(p[1]) << 8) |
@@ -26,17 +40,252 @@ uint32_t ReadLe32(const uint8_t *p) {
            (static_cast<uint32_t>(p[3]) << 24);
 }
 
+std::string Trim(std::string value) {
+    const auto is_space = [](unsigned char ch) {
+        return std::isspace(ch) != 0;
+    };
+    value.erase(value.begin(),
+                std::find_if(value.begin(), value.end(),
+                             [&](char ch) { return !is_space(ch); }));
+    value.erase(std::find_if(value.rbegin(), value.rend(),
+                             [&](char ch) { return !is_space(ch); })
+                    .base(),
+                value.end());
+    return value;
+}
+
+std::string ToLower(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char ch) { return std::tolower(ch); });
+    return value;
+}
+
+std::string GetEnvOrDefault(const char *name, const char *fallback) {
+    const char *value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0') return fallback;
+    return value;
+}
+
+bool FileExists(const std::filesystem::path &path) {
+    std::error_code ec;
+    return std::filesystem::exists(path, ec);
+}
+
+std::optional<std::string> ReadFirstLine(const std::filesystem::path &path) {
+    std::ifstream stream(path);
+    if (!stream.is_open()) return std::nullopt;
+    std::string line;
+    if (!std::getline(stream, line)) return std::nullopt;
+    return Trim(line);
+}
+
+EndpointFields ParseFields(const std::string &text) {
+    EndpointFields fields;
+    std::string normalized = text;
+    std::replace(normalized.begin(), normalized.end(), ',', ' ');
+
+    std::istringstream stream(normalized);
+    std::string token;
+    while (stream >> token) {
+        auto separator = token.find('=');
+        if (separator == std::string::npos) separator = token.find(':');
+        if (separator == std::string::npos || separator == 0) continue;
+
+        std::string key = ToLower(Trim(token.substr(0, separator)));
+        std::string value = Trim(token.substr(separator + 1));
+        if (!key.empty() && !value.empty()) fields[key] = value;
+    }
+    return fields;
+}
+
+bool LooksLikeNofEndpoint(const EndpointFields &fields) {
+    return fields.find("traddr") != fields.end() &&
+           fields.find("subnqn") != fields.end();
+}
+
+bool HasNamespaceIdField(const EndpointFields &fields) {
+    return fields.find("ns") != fields.end() ||
+           fields.find("nsid") != fields.end();
+}
+
+std::optional<uint32_t> ParseNamespaceId(const EndpointFields &fields) {
+    auto it = fields.find("ns");
+    if (it == fields.end()) it = fields.find("nsid");
+    if (it == fields.end()) return std::nullopt;
+
+    char *end_ptr = nullptr;
+    errno = 0;
+    const unsigned long value = std::strtoul(it->second.c_str(), &end_ptr, 10);
+    if (errno != 0 || end_ptr == it->second.c_str() || *end_ptr != '\0' ||
+        value == 0 || value > std::numeric_limits<uint32_t>::max()) {
+        return std::nullopt;
+    }
+    return static_cast<uint32_t>(value);
+}
+
+bool FieldEquals(const EndpointFields &expected, const EndpointFields &actual,
+                 const char *key, bool case_insensitive) {
+    const auto expected_it = expected.find(key);
+    if (expected_it == expected.end()) return true;
+
+    const auto actual_it = actual.find(key);
+    if (actual_it == actual.end()) return false;
+    if (case_insensitive) {
+        return ToLower(expected_it->second) == ToLower(actual_it->second);
+    }
+    return expected_it->second == actual_it->second;
+}
+
+bool AddressMatches(const EndpointFields &endpoint,
+                    const EndpointFields &address) {
+    return FieldEquals(endpoint, address, "traddr", false) &&
+           FieldEquals(endpoint, address, "trsvcid", false) &&
+           FieldEquals(endpoint, address, "host_traddr", false) &&
+           FieldEquals(endpoint, address, "host_iface", false) &&
+           FieldEquals(endpoint, address, "trtype", true) &&
+           FieldEquals(endpoint, address, "adrfam", true);
+}
+
+std::optional<std::string> NamespaceDeviceName(
+    const std::filesystem::path &controller_path, uint32_t expected_nsid) {
+    std::error_code ec;
+    for (std::filesystem::directory_iterator it(controller_path, ec), end;
+         !ec && it != end; it.increment(ec)) {
+        const std::string name = it->path().filename().string();
+        if (name.rfind("nvme", 0) != 0 ||
+            name.find('n', 4) == std::string::npos) {
+            continue;
+        }
+
+        auto nsid = ReadFirstLine(it->path() / "nsid");
+        if (!nsid.has_value()) continue;
+
+        char *end_ptr = nullptr;
+        errno = 0;
+        const unsigned long value = std::strtoul(nsid->c_str(), &end_ptr, 10);
+        if (errno != 0 || end_ptr == nsid->c_str() || *end_ptr != '\0' ||
+            value != expected_nsid) {
+            continue;
+        }
+        return name;
+    }
+    return std::nullopt;
+}
+
+std::optional<NvmeKvResolvedDevicePath> ResolveNofEndpoint(
+    const EndpointFields &endpoint, NvmeKvDevicePathType type,
+    uint32_t configured_nsid) {
+    const std::filesystem::path sysfs_root =
+        GetEnvOrDefault(kNvmeKvSysfsRootEnv, kDefaultNvmeKvSysfsRoot);
+    const std::filesystem::path dev_root =
+        GetEnvOrDefault(kNvmeKvDevRootEnv, kDefaultNvmeKvDevRoot);
+    const auto parsed_nsid = ParseNamespaceId(endpoint);
+    if (!parsed_nsid.has_value() && HasNamespaceIdField(endpoint)) {
+        return std::nullopt;
+    }
+    const uint32_t effective_nsid = parsed_nsid.value_or(configured_nsid);
+    if (effective_nsid == 0) return std::nullopt;
+
+    std::error_code ec;
+    for (std::filesystem::directory_iterator it(sysfs_root, ec), end;
+         !ec && it != end; it.increment(ec)) {
+        const std::filesystem::path controller_path = it->path();
+        const std::string controller_name = controller_path.filename().string();
+        if (controller_name.rfind("nvme", 0) != 0) continue;
+
+        auto subsysnqn = ReadFirstLine(controller_path / "subsysnqn");
+        if (!subsysnqn.has_value() || *subsysnqn != endpoint.at("subnqn")) {
+            continue;
+        }
+
+        auto address = ReadFirstLine(controller_path / "address");
+        if (!address.has_value() ||
+            !AddressMatches(endpoint, ParseFields(*address))) {
+            continue;
+        }
+
+        auto namespace_name =
+            NamespaceDeviceName(controller_path, effective_nsid);
+        if (!namespace_name.has_value()) continue;
+
+        std::string device_name = *namespace_name;
+        if (type == NvmeKvDevicePathType::kGenericCharacter) {
+            device_name = "ng" + device_name.substr(4);
+        }
+        const std::filesystem::path device_path = dev_root / device_name;
+        if (FileExists(device_path)) {
+            return NvmeKvResolvedDevicePath{device_path.string(),
+                                            effective_nsid};
+        }
+    }
+    return std::nullopt;
+}
+
+std::string ResolveGenericCharacterDevicePath(const std::string &device_path) {
+    const std::filesystem::path path(device_path);
+    const std::string filename = path.filename().string();
+    if (filename.rfind("ng", 0) == 0) return device_path;
+    if (filename.rfind("nvme", 0) != 0) return device_path;
+
+    const std::filesystem::path generic_path =
+        path.parent_path() / ("ng" + filename.substr(4));
+    if (FileExists(generic_path)) {
+        LOG(INFO) << "[NvmeKvExecutor] using NVMe generic char device "
+                  << generic_path << " for namespace block device "
+                  << device_path;
+        return generic_path.string();
+    }
+    return device_path;
+}
+
 }  // namespace
+
+std::string NvmeKvTransportIdWithNsid(const std::string &configured_path,
+                                      uint32_t configured_nsid) {
+    const auto fields = ParseFields(configured_path);
+    if (!LooksLikeNofEndpoint(fields) || HasNamespaceIdField(fields)) {
+        return configured_path;
+    }
+    if (configured_nsid == 0) {
+        return configured_path;
+    }
+
+    std::ostringstream stream;
+    stream << configured_path << " ns:" << configured_nsid;
+    return stream.str();
+}
+
+tl::expected<NvmeKvResolvedDevicePath, ErrorCode> ResolveNvmeKvDevicePath(
+    const std::string &configured_path, NvmeKvDevicePathType type,
+    uint32_t configured_nsid) {
+    const auto fields = ParseFields(configured_path);
+    if (LooksLikeNofEndpoint(fields)) {
+        auto resolved = ResolveNofEndpoint(fields, type, configured_nsid);
+        if (!resolved.has_value()) {
+            LOG(ERROR) << "[NvmeKvExecutor] failed to resolve NVMe-oF endpoint "
+                       << "to a local NVMe device: " << configured_path;
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        return resolved.value();
+    }
+
+    if (type == NvmeKvDevicePathType::kGenericCharacter) {
+        return NvmeKvResolvedDevicePath{
+            ResolveGenericCharacterDevicePath(configured_path),
+            configured_nsid};
+    }
+    return NvmeKvResolvedDevicePath{configured_path, configured_nsid};
+}
 
 uint32_t ParseNvmeKvU32EnvOr(const char *name, uint32_t fallback) {
     const char *value = std::getenv(name);
     if (value == nullptr || value[0] == '\0') {
         return fallback;
     }
-    char *end = nullptr;
+    char *end_ptr = nullptr;
     errno = 0;
-    unsigned long parsed = std::strtoul(value, &end, 0);
-    if (errno != 0 || end == value || *end != '\0' ||
+    unsigned long parsed = std::strtoul(value, &end_ptr, 0);
+    if (errno != 0 || end_ptr == value || *end_ptr != '\0' ||
         parsed > std::numeric_limits<uint32_t>::max()) {
         return fallback;
     }

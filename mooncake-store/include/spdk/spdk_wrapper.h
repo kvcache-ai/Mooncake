@@ -52,6 +52,20 @@ class SpdkWrapper {
 
     bool ProbeNofSegment(const std::string &tr_str, uint32_t timeout_ms,
                          std::string *error_reason = nullptr);
+#ifdef MOONCAKE_HAVE_SPDK_NVME_KV
+    bool IsKvNamespace(const nof_seg_handle *seg_handle);
+
+    int SubmitKvStore(const nof_seg_handle *seg_handle, const void *key,
+                      uint8_t key_len, const void *value, uint32_t value_len,
+                      uint8_t options, spdk_nvme_cmd_cb cb_fn, void *cb_ctx);
+
+    int SubmitKvRetrieve(const nof_seg_handle *seg_handle, const void *key,
+                         uint8_t key_len, void *value, uint32_t value_len,
+                         uint8_t options, spdk_nvme_cmd_cb cb_fn, void *cb_ctx);
+
+    int SubmitKvDelete(const nof_seg_handle *seg_handle, const void *key,
+                       uint8_t key_len, spdk_nvme_cmd_cb cb_fn, void *cb_ctx);
+#endif
 
    private:
     struct ProbeBuffer {

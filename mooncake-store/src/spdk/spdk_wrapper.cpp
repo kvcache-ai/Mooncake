@@ -3,6 +3,10 @@
 #include <atomic>
 #include <cerrno>
 #include <chrono>
+#ifdef MOONCAKE_HAVE_SPDK_NVME_KV
+#include <spdk/nvme_kv.h>
+#include <spdk/nvme_spec.h>
+#endif
 #include <cstring>
 #include <cstdlib>
 #include <thread>
@@ -389,6 +393,53 @@ int SpdkWrapper::SubmitRequest(const nof_seg_handle *seg_handle, void *ptr,
     }
     return -1;
 }
+
+#ifdef MOONCAKE_HAVE_SPDK_NVME_KV
+bool SpdkWrapper::IsKvNamespace(const nof_seg_handle *seg_handle) {
+    if (!seg_handle || !seg_handle->ns) {
+        return false;
+    }
+    return spdk_nvme_ns_get_csi(seg_handle->ns) == SPDK_NVME_CSI_KV &&
+           spdk_nvme_kv_ns_get_data(seg_handle->ns) != nullptr;
+}
+
+int SpdkWrapper::SubmitKvStore(const nof_seg_handle *seg_handle,
+                               const void *key, uint8_t key_len,
+                               const void *value, uint32_t value_len,
+                               uint8_t options, spdk_nvme_cmd_cb cb_fn,
+                               void *cb_ctx) {
+    if (!seg_handle || !seg_handle->qpair || !seg_handle->ns || !key ||
+        key_len == 0 || !value || value_len == 0) {
+        return -EINVAL;
+    }
+    return spdk_nvme_kv_store(seg_handle->ns, seg_handle->qpair, key, key_len,
+                              value, value_len, cb_fn, cb_ctx, options);
+}
+
+int SpdkWrapper::SubmitKvRetrieve(const nof_seg_handle *seg_handle,
+                                  const void *key, uint8_t key_len, void *value,
+                                  uint32_t value_len, uint8_t options,
+                                  spdk_nvme_cmd_cb cb_fn, void *cb_ctx) {
+    if (!seg_handle || !seg_handle->qpair || !seg_handle->ns || !key ||
+        key_len == 0 || !value || value_len == 0) {
+        return -EINVAL;
+    }
+    return spdk_nvme_kv_retrieve(seg_handle->ns, seg_handle->qpair, key,
+                                 key_len, value, value_len, cb_fn, cb_ctx,
+                                 options);
+}
+
+int SpdkWrapper::SubmitKvDelete(const nof_seg_handle *seg_handle,
+                                const void *key, uint8_t key_len,
+                                spdk_nvme_cmd_cb cb_fn, void *cb_ctx) {
+    if (!seg_handle || !seg_handle->qpair || !seg_handle->ns || !key ||
+        key_len == 0) {
+        return -EINVAL;
+    }
+    return spdk_nvme_kv_delete(seg_handle->ns, seg_handle->qpair, key, key_len,
+                               cb_fn, cb_ctx);
+}
+#endif
 
 SpdkWrapper::ProbeBuffer *SpdkWrapper::GetOrCreateProbeBuffer(
     const std::string &tr_str, uint32_t block_size, std::string *error_reason) {

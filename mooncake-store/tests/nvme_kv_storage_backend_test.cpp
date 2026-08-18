@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <fstream>
 #include <optional>
 #include <string>
 #include <unordered_map>
@@ -61,7 +62,130 @@ class NvmeKvStorageBackendTest : public ::testing::Test {
     std::string data_path_;
 };
 
+void WriteFile(const fs::path &path, const std::string &contents) {
+    std::ofstream stream(path);
+    ASSERT_TRUE(stream.is_open());
+    stream << contents;
+}
+
 }  // namespace
+
+TEST_F(NvmeKvStorageBackendTest, ResolvesNofEndpointToKernelDevices) {
+    const fs::path sysfs_root = fs::path(data_path_) / "sys" / "class" / "nvme";
+    const fs::path dev_root = fs::path(data_path_) / "dev";
+    const fs::path controller_path = sysfs_root / "nvme7";
+    const fs::path namespace_path = controller_path / "nvme7n3";
+    ASSERT_TRUE(fs::create_directories(namespace_path));
+    ASSERT_TRUE(fs::create_directories(dev_root));
+
+    WriteFile(controller_path / "address",
+              "trtype=rdma,traddr=192.168.65.56,trsvcid=4420,adrfam=ipv4\n");
+    WriteFile(controller_path / "subsysnqn", "nqn.2016-06.io.spdk:cnode1\n");
+    WriteFile(namespace_path / "nsid", "3\n");
+    WriteFile(dev_root / "nvme7n3", "");
+    WriteFile(dev_root / "ng7n3", "");
+
+    const std::string sysfs_root_string = sysfs_root.string();
+    const std::string dev_root_string = dev_root.string();
+    EnvVarGuard sysfs_guard("MOONCAKE_NVME_KV_SYSFS_ROOT",
+                            sysfs_root_string.c_str());
+    EnvVarGuard dev_guard("MOONCAKE_NVME_KV_DEV_ROOT", dev_root_string.c_str());
+
+    const std::string endpoint =
+        "traddr:192.168.65.56 trsvcid:4420 "
+        "subnqn:nqn.2016-06.io.spdk:cnode1 trtype:RDMA adrfam:IPv4 ns:3";
+
+    auto block_path = ResolveNvmeKvDevicePath(
+        endpoint, NvmeKvDevicePathType::kBlockNamespace, 1);
+    ASSERT_TRUE(block_path.has_value());
+    EXPECT_EQ((dev_root / "nvme7n3").string(), block_path->path);
+    EXPECT_EQ(3, block_path->nsid);
+
+    auto generic_path = ResolveNvmeKvDevicePath(
+        endpoint, NvmeKvDevicePathType::kGenericCharacter, 1);
+    ASSERT_TRUE(generic_path.has_value());
+    EXPECT_EQ((dev_root / "ng7n3").string(), generic_path->path);
+    EXPECT_EQ(3, generic_path->nsid);
+
+    const std::string equals_endpoint =
+        "traddr=192.168.65.56 trsvcid=4420 "
+        "subnqn=nqn.2016-06.io.spdk:cnode1 trtype=rdma adrfam=ipv4 nsid=3";
+    auto equals_path = ResolveNvmeKvDevicePath(
+        equals_endpoint, NvmeKvDevicePathType::kGenericCharacter, 1);
+    ASSERT_TRUE(equals_path.has_value());
+    EXPECT_EQ((dev_root / "ng7n3").string(), equals_path->path);
+    EXPECT_EQ(3, equals_path->nsid);
+}
+
+TEST_F(NvmeKvStorageBackendTest, UsesConfiguredNsidWhenEndpointOmitsNsid) {
+    const fs::path sysfs_root = fs::path(data_path_) / "sys" / "class" / "nvme";
+    const fs::path dev_root = fs::path(data_path_) / "dev";
+    const fs::path controller_path = sysfs_root / "nvme7";
+    const fs::path namespace_path = controller_path / "nvme7n3";
+    ASSERT_TRUE(fs::create_directories(namespace_path));
+    ASSERT_TRUE(fs::create_directories(dev_root));
+
+    WriteFile(controller_path / "address",
+              "trtype=rdma,traddr=192.168.65.56,trsvcid=4420,adrfam=ipv4\n");
+    WriteFile(controller_path / "subsysnqn", "nqn.2016-06.io.spdk:cnode1\n");
+    WriteFile(namespace_path / "nsid", "3\n");
+    WriteFile(dev_root / "ng7n3", "");
+
+    const std::string sysfs_root_string = sysfs_root.string();
+    const std::string dev_root_string = dev_root.string();
+    EnvVarGuard sysfs_guard("MOONCAKE_NVME_KV_SYSFS_ROOT",
+                            sysfs_root_string.c_str());
+    EnvVarGuard dev_guard("MOONCAKE_NVME_KV_DEV_ROOT", dev_root_string.c_str());
+
+    auto path = ResolveNvmeKvDevicePath(
+        "traddr:192.168.65.56 subnqn:nqn.2016-06.io.spdk:cnode1",
+        NvmeKvDevicePathType::kGenericCharacter, 3);
+    ASSERT_TRUE(path.has_value());
+    EXPECT_EQ((dev_root / "ng7n3").string(), path->path);
+    EXPECT_EQ(3, path->nsid);
+}
+
+TEST_F(NvmeKvStorageBackendTest, RejectsInvalidNofNamespaceId) {
+    const fs::path sysfs_root = fs::path(data_path_) / "sys" / "class" / "nvme";
+    const fs::path dev_root = fs::path(data_path_) / "dev";
+    const fs::path controller_path = sysfs_root / "nvme7";
+    const fs::path namespace_path = controller_path / "nvme7n3";
+    ASSERT_TRUE(fs::create_directories(namespace_path));
+    ASSERT_TRUE(fs::create_directories(dev_root));
+
+    WriteFile(controller_path / "address",
+              "trtype=rdma,traddr=192.168.65.56,trsvcid=4420,adrfam=ipv4\n");
+    WriteFile(controller_path / "subsysnqn", "nqn.2016-06.io.spdk:cnode1\n");
+    WriteFile(namespace_path / "nsid", "3\n");
+    WriteFile(dev_root / "ng7n3", "");
+
+    const std::string sysfs_root_string = sysfs_root.string();
+    const std::string dev_root_string = dev_root.string();
+    EnvVarGuard sysfs_guard("MOONCAKE_NVME_KV_SYSFS_ROOT",
+                            sysfs_root_string.c_str());
+    EnvVarGuard dev_guard("MOONCAKE_NVME_KV_DEV_ROOT", dev_root_string.c_str());
+
+    auto path = ResolveNvmeKvDevicePath(
+        "traddr:192.168.65.56 subnqn:nqn.2016-06.io.spdk:cnode1 ns:bad",
+        NvmeKvDevicePathType::kGenericCharacter, 1);
+    ASSERT_FALSE(path.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, path.error());
+}
+
+TEST_F(NvmeKvStorageBackendTest, RejectsUnmatchedNofEndpoint) {
+    const fs::path sysfs_root =
+        fs::path(data_path_) / "empty-sys" / "class" / "nvme";
+    ASSERT_TRUE(fs::create_directories(sysfs_root));
+    const std::string sysfs_root_string = sysfs_root.string();
+    EnvVarGuard sysfs_guard("MOONCAKE_NVME_KV_SYSFS_ROOT",
+                            sysfs_root_string.c_str());
+
+    auto path = ResolveNvmeKvDevicePath(
+        "traddr:192.168.65.57 subnqn:nqn.2016-06.io.spdk:cnode1",
+        NvmeKvDevicePathType::kGenericCharacter, 1);
+    ASSERT_FALSE(path.has_value());
+    EXPECT_EQ(ErrorCode::INVALID_PARAMS, path.error());
+}
 
 TEST_F(NvmeKvStorageBackendTest, PhysicalKeyPackingEncodesCommandSet) {
     NvmeKvCommandExecutor::PhysicalKey key{};

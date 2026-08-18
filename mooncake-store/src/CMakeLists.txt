@@ -245,20 +245,39 @@ if(USE_NOF)
   add_subdirectory(spdk)
   list(APPEND MOONCAKE_STORE_SOURCES ${SPDK_WRAPPER_SOURCES})
 
+  set(SPDK_PREFIX_HINT
+      "$ENV{SPDK_PREFIX}"
+      CACHE PATH "SPDK installation prefix")
+  if(SPDK_PREFIX_HINT)
+    set(_SPDK_DEFAULT_INCLUDE_DIR "${SPDK_PREFIX_HINT}/include")
+    set(_SPDK_DEFAULT_LIB_DIR "${SPDK_PREFIX_HINT}/lib")
+  else()
+    set(_SPDK_DEFAULT_INCLUDE_DIR "/usr/local/include")
+    set(_SPDK_DEFAULT_LIB_DIR "/usr/local/lib")
+  endif()
+  option(SPDK_USE_PKG_CONFIG "Resolve SPDK libraries through pkg-config" OFF)
+
   set(SPDK_INCLUDE_DIR
-      "/usr/local/include"
+      "${_SPDK_DEFAULT_INCLUDE_DIR}"
       CACHE PATH "SPDK include directory")
   set(DPDK_INCLUDE_DIR
-      "/usr/local/include"
+      "${_SPDK_DEFAULT_INCLUDE_DIR}"
       CACHE PATH "DPDK include directory")
   set(SPDK_LIB_DIR
-      "/usr/local/lib"
+      "${_SPDK_DEFAULT_LIB_DIR}"
       CACHE PATH "SPDK static library directory")
   set(DPDK_LIB_DIR
-      "/usr/local/lib"
+      "${_SPDK_DEFAULT_LIB_DIR}"
       CACHE PATH "DPDK static library directory")
 
-  set(SPDK_STATIC_LIBS
+  if(SPDK_USE_PKG_CONFIG)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(SPDK REQUIRED IMPORTED_TARGET spdk_nvme spdk_env_dpdk)
+    set(SPDK_INCLUDE_DIR ${SPDK_INCLUDE_DIRS})
+    set(DPDK_INCLUDE_DIR ${SPDK_INCLUDE_DIRS})
+    set(SPDK_STATIC_LIBS PkgConfig::SPDK)
+  else()
+    set(SPDK_STATIC_LIBS
       -Wl,--whole-archive
       ${SPDK_LIB_DIR}/libspdk_event.a
       ${SPDK_LIB_DIR}/libspdk_rdma.a
@@ -316,6 +335,14 @@ if(USE_NOF)
       rdmacm
       ssl
       bsd)
+  endif()
+
+  set(MOONCAKE_HAVE_SPDK_NVME_KV OFF)
+  if(EXISTS "${SPDK_INCLUDE_DIR}/spdk/nvme_kv.h")
+    set(MOONCAKE_HAVE_SPDK_NVME_KV ON)
+    list(APPEND MOONCAKE_STORE_SOURCES nvme_kv_executor_spdk.cpp)
+    message(STATUS "SPDK NVMe KV typed API enabled")
+  endif()
 endif()
 
 # The cache_allocator library
@@ -324,6 +351,10 @@ add_library(mooncake_store ${MOONCAKE_STORE_SOURCES})
 if(BUILD_UNIT_TESTS)
   target_compile_definitions(mooncake_store
                              PRIVATE MOONCAKE_ENABLE_NVME_KV_TEST_STUB=1)
+endif()
+if(MOONCAKE_HAVE_SPDK_NVME_KV)
+  target_compile_definitions(mooncake_store
+                             PRIVATE MOONCAKE_HAVE_SPDK_NVME_KV=1)
 endif()
 if(KV_EVENTS_ZMQ_FOUND)
   target_compile_definitions(mooncake_store PRIVATE MOONCAKE_ENABLE_KV_EVENTS=1)
