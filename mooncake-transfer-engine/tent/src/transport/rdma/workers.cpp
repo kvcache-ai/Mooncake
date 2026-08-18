@@ -307,8 +307,70 @@ bool Workers::cancelUnpostedSlice(WorkerContext& worker, RdmaSlice* slice) {
 
 void Workers::releaseSliceQuota(RdmaSlice* slice, double latency) {
     if (!slice || !slice->quota_charged || !device_selector_) return;
-    device_selector_->release(slice->source_dev_id, slice->length, latency);
+    // Release against the device the bytes were actually charged on, and unwind
+    // exactly the bytes that were charged, not the current routing NIC or the
+    // slice length: a fallback re-route can leave source_dev_id pointing at a
+    // different device, and the allocator's per-slice estimate can differ from
+    // slice->length.
+    device_selector_->release(slice->charged_dev_id, slice->charged_bytes,
+                              latency);
     slice->quota_charged = false;
+    slice->charged_dev_id = -1;
+    slice->charged_bytes = 0;
+}
+
+void Workers::chargeSliceQuota(RdmaSlice* slice) {
+    // Reconcile the inflight charge so it lands on the device the slice will
+    // actually post on (slice->source_dev_id) and reflects the slice's real
+    // length. This keeps DeviceSelector's per-NIC inflight view both symmetric
+    // with releaseSliceQuota and an accurate load signal, across three paths
+    // that would otherwise skew local telemetry:
+    //   - initial allocate: the aggregated allocator charges a per-slice
+    //     estimate (ceil(total/num_slices)); convert it to the exact length so
+    //     inflight equals the bytes really put on the wire.
+    //   - fallback re-route: the charge was made on the originally selected NIC
+    //     but the slice now posts on a different one -> migrate the charge.
+    //   - retry: the previous attempt released the quota, so re-enter the
+    //     inflight view instead of running uncounted.
+    if (!device_selector_ || slice->source_dev_id < 0) return;
+    if (slice->quota_charged && slice->charged_dev_id == slice->source_dev_id &&
+        slice->charged_bytes == slice->length)
+        return;  // already charged exactly this slice's length on the right NIC
+    if (slice->quota_charged) {
+        // Stale device and/or estimate -> unwind exactly what was charged
+        // first. Order is deliberate: releasing before charging makes inflight
+        // dip slightly below reality for the instant between the two calls,
+        // whereas charging first would transiently double-count during a
+        // fallback migration. inflight is only a scoring signal (not an
+        // admission gate), so a momentary dip merely perturbs one selection,
+        // while a double-count would over-penalize the NIC -- the dip is the
+        // lesser, intended bias.
+        device_selector_->release(slice->charged_dev_id, slice->charged_bytes,
+                                  0.0);
+        slice->quota_charged = false;
+        slice->charged_dev_id = -1;
+        slice->charged_bytes = 0;
+    }
+    // Charge this slice's real length on the routing NIC. Only commit the
+    // bookkeeping if the charge actually succeeded, so a failed charge is never
+    // released later (which would underflow the counter).
+    Status status =
+        device_selector_->chargeDevice(slice->source_dev_id, slice->length);
+    if (status.ok()) {
+        slice->charged_dev_id = slice->source_dev_id;
+        slice->charged_bytes = slice->length;
+        slice->quota_charged = true;
+    } else {
+        // The routing NIC is not tracked by DeviceSelector (a topology/quota
+        // mismatch, e.g. a device that never entered devices_). The data
+        // transfer can still proceed, so we do not fail the slice, but the
+        // slice runs without inflight accounting -- surface it (rate-limited on
+        // the hot path) instead of silently under-counting the device's load.
+        LOG_EVERY_N(WARNING, 100)
+            << "chargeSliceQuota: source_dev_id " << slice->source_dev_id
+            << " is not tracked by DeviceSelector; slice " << slice
+            << " proceeds without inflight accounting: " << status.ToString();
+    }
 }
 
 std::shared_ptr<RdmaEndPoint> Workers::getEndpoint(Workers::PostPath path) {
@@ -623,6 +685,10 @@ void Workers::asyncPollCq() {
             auto ep = slice->ep_weak_ptr.lock();
             LOG(WARNING) << "Slice " << slice
                          << " failed: transfer timeout (software)";
+            // A software timeout is terminal (no retry), so release the
+            // inflight charge here or it leaks on charged_dev_id forever. No
+            // latency sample: a timeout is not a valid bandwidth observation.
+            releaseSliceQuota(slice);
             if (!ep) {
                 updateSliceStatus(slice, TIMEOUT);
                 slice_to_remove.push_back(slice);
@@ -652,8 +718,18 @@ void Workers::asyncPollCq() {
             double enqueue_lat =
                 (slice->submit_ts - slice->enqueue_ts) / 1000.0;
             double inflight_lat = (poll_ts - slice->submit_ts) / 1000.0;
-            double overall_lat_sec = (poll_ts - slice->enqueue_ts) / 1e9;
-            releaseSliceQuota(slice, overall_lat_sec);
+            // EWMA bandwidth must learn only from successful transfers, and
+            // only from the current NIC attempt's inflight time -- not the
+            // cumulative time since first enqueue, which folds in queueing
+            // delay and prior failed attempts on other NICs and would bias the
+            // estimate low. A failed/flushed WC or an already-resolved slice
+            // contributes no sample (latency 0), so releaseSliceQuota only
+            // frees the charge.
+            bool ewma_sample =
+                ep && slice->word == PENDING && wc[i].status == IBV_WC_SUCCESS;
+            double sample_lat_sec =
+                ewma_sample ? (poll_ts - slice->submit_ts) / 1e9 : 0.0;
+            releaseSliceQuota(slice, sample_lat_sec);
             if (slice->word != PENDING) continue;
             if (!ep) {
                 updateSliceStatus(slice, FAILED);
@@ -926,6 +1002,10 @@ Status Workers::selectOptimalDevice(RouteHint& source, RouteHint& target,
         CHECK_STATUS(device_selector_->allocate(
             slice->length, source.buffer->location, slice->source_dev_id));
         slice->quota_charged = true;
+        slice->charged_dev_id = slice->source_dev_id;
+        // Single-slice allocate charges exactly slice->length on the chosen
+        // device.
+        slice->charged_bytes = slice->length;
     }
 
     if (slice->source_dev_id < 0)
@@ -1133,6 +1213,10 @@ Status Workers::generatePostPath(RdmaSlice* slice) {
             "Selected device has no registered memory key" LOC_MARK);
     slice->source_lkey = lkeys[slice->source_dev_id];
     slice->target_rkey = rkeys[slice->target_dev_id];
+    // The routing NIC is now final for this (re)submit. Reconcile the inflight
+    // charge onto it so a fallback re-route or a retry does not leave the
+    // original NIC charged (residue) or run uncounted.
+    chargeSliceQuota(slice);
     // Cache the RailMonitor pointer so asyncPollCq / disableEndpoint can
     // update rail state without a segment lookup or string-keyed map
     // lookup on the hot path.

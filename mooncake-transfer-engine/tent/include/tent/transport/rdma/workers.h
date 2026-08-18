@@ -75,6 +75,10 @@ class Workers {
 
     void releaseSliceQuota(RdmaSlice* slice, double latency = 0.0);
 
+    // Reconcile a slice's inflight charge onto its current routing NIC
+    // (source_dev_id), migrating a stale charge or re-charging after a retry.
+    void chargeSliceQuota(RdmaSlice* slice);
+
     void monitorThread();
 
     // 1 Hz heartbeat from monitorThread(): drains every context's retiring
