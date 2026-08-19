@@ -55,6 +55,8 @@ class Workers {
 
     Status submit(RdmaSlice* slice);
 
+    Status submit(RdmaSlice* slice, int worker_id);
+
     Status submit(RdmaSliceList& slice_list, int worker_id = -1);
 
     Status cancel(RdmaTask* task);

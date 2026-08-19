@@ -28,6 +28,7 @@
 #include "tent/common/types.h"
 #include "tent/transport/rdma/context.h"
 #include "tent/transport/rdma/endpoint_store.h"
+#include "tent/transport/rdma/qp_pool_routing.h"
 #include "tent/common/utils/os.h"
 #include "tent/common/utils/string_builder.h"
 #include "tent/thirdparty/nlohmann/json.h"
@@ -670,11 +671,28 @@ int RdmaEndPoint::resetConnection(const std::string& reason) {
 }
 
 const QpPoolSegment* RdmaEndPoint::poolForQp(int qp_index) const {
-    for (const auto& seg : qp_pool_segments_) {
-        if (qp_index >= seg.begin && qp_index < seg.begin + seg.num_qp)
-            return &seg;
-    }
-    return nullptr;
+    return findQpPoolSegment(qp_pool_segments_, qp_index);
+}
+
+int RdmaEndPoint::selectQpIndex(const std::string& qp_pool, int candidate) {
+    RWSpinlock::ReadGuard guard(lock_);
+    if (qp_list_.empty()) return -1;
+    return selectQpInPool(qp_pool_segments_, qp_pool, candidate,
+                          (int)qp_list_.size());
+}
+
+int RdmaEndPoint::selectQpOwnerWorker(const std::string& qp_pool, int candidate,
+                                      size_t num_workers) {
+    RWSpinlock::ReadGuard guard(lock_);
+    if (qp_list_.empty()) return candidate;
+    return selectQpPoolRoute(qp_pool_segments_, qp_pool, candidate,
+                             (int)qp_list_.size(), num_workers, candidate)
+        .worker_id;
+}
+
+bool RdmaEndPoint::qpPoolRoutingEnabled() {
+    RWSpinlock::ReadGuard guard(lock_);
+    return !qp_pool_segments_.empty();
 }
 
 int RdmaEndPoint::setupAllQPs(const std::string& peer_gid, uint16_t peer_lid,
@@ -893,15 +911,9 @@ int RdmaEndPoint::setupOneQP(int qp_index, const std::string& peer_gid,
     // Resolve link-layer QoS for this QP. When it belongs to a pool that
     // overrides SL/TC, use the pool's values; otherwise fall back to the global
     // endpoint SL/TC (unchanged default behavior).
-    const QpPoolSegment* pool = poolForQp(qp_index);
-    const uint8_t qp_service_level =
-        (pool && pool->service_level >= 0)
-            ? static_cast<uint8_t>(pool->service_level)
-            : params_->service_level;
-    const uint8_t qp_traffic_class =
-        (pool && pool->traffic_class >= 0)
-            ? static_cast<uint8_t>(pool->traffic_class)
-            : params_->traffic_class;
+    const QpLinkLayerQos qp_qos = resolveQpLinkLayerQos(
+        qp_pool_segments_, qp_index, params_->service_level,
+        params_->traffic_class);
 
     // RESET -> INIT
     ibv_qp_attr attr;
@@ -942,9 +954,9 @@ int RdmaEndPoint::setupOneQP(int qp_index, const std::string& peer_gid,
     attr.ah_attr.grh.sgid_index = context().gidIndex();
     attr.ah_attr.grh.hop_limit = params_->hop_limit;
     attr.ah_attr.grh.flow_label = params_->flow_label;
-    attr.ah_attr.grh.traffic_class = qp_traffic_class;
+    attr.ah_attr.grh.traffic_class = qp_qos.traffic_class;
     attr.ah_attr.dlid = peer_lid;
-    attr.ah_attr.sl = qp_service_level;
+    attr.ah_attr.sl = qp_qos.service_level;
     attr.ah_attr.src_path_bits = params_->src_path_bits;
     attr.ah_attr.static_rate = params_->static_rate;
     attr.ah_attr.is_global = 1;

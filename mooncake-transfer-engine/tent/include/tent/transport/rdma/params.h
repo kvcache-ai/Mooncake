@@ -94,6 +94,11 @@ struct QpPoolLayout {
     bool valid = false;  // false = invalid config (non-positive total).
 };
 
+struct QpLinkLayerQos {
+    uint8_t service_level = 0;
+    uint8_t traffic_class = 0;
+};
+
 // Pure resolver used by RdmaEndPoint::construct(). Kept free-standing (no RDMA
 // handles) so the layout math can be unit-tested. Empty `pools` reproduces the
 // historical single homogeneous run of `qp_mul_factor` data QPs (segments left
@@ -124,6 +129,28 @@ inline QpPoolLayout computeQpPoolSegments(
     }
     layout.valid = layout.total_qp > 0;
     return layout;
+}
+
+inline const QpPoolSegment* findQpPoolSegment(
+    const std::vector<QpPoolSegment>& segments, int qp_index) {
+    for (const auto& seg : segments) {
+        if (qp_index >= seg.begin && qp_index < seg.begin + seg.num_qp)
+            return &seg;
+    }
+    return nullptr;
+}
+
+inline QpLinkLayerQos resolveQpLinkLayerQos(
+    const std::vector<QpPoolSegment>& segments, int qp_index,
+    uint8_t default_service_level, uint8_t default_traffic_class) {
+    const QpPoolSegment* pool = findQpPoolSegment(segments, qp_index);
+    return QpLinkLayerQos{
+        (pool && pool->service_level >= 0)
+            ? static_cast<uint8_t>(pool->service_level)
+            : default_service_level,
+        (pool && pool->traffic_class >= 0)
+            ? static_cast<uint8_t>(pool->traffic_class)
+            : default_traffic_class};
 }
 
 // Pure QP router used by RdmaEndPoint::submitSlices (RFC #2568 step 3). Given
