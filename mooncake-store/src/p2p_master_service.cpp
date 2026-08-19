@@ -57,20 +57,32 @@ auto P2PMasterService::RegisterClient(const RegisterClientRequest& req)
         return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
     }
 
-    if (GetClientManager().GetClient(req.client_id)) {
-        LOG(WARNING) << "RegisterClient(P2P): client already exists"
-                     << ", client_id=" << req.client_id;
-        return tl::make_unexpected(ErrorCode::CLIENT_ALREADY_EXISTS);
-    }
-
     if (!req.ip_address || !req.rpc_port) {
         LOG(ERROR) << "RegisterClient(P2P): missing endpoint"
                    << ", client_id=" << req.client_id;
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
 
+    auto make_idempotent_response = [&]() {
+        RegisterClientResponse response;
+        response.view_version = view_version_;
+        LOG(INFO) << "RegisterClient(P2P): client already registered, "
+                     "treating as idempotent re-register"
+                  << ", client_id=" << req.client_id
+                  << ", view_version=" << response.view_version;
+        return response;
+    };
+
+    if (GetClientManager().GetClient(req.client_id)) {
+        return make_idempotent_response();
+    }
+
     auto result = MasterService::RegisterClient(req);
     if (!result.has_value()) {
+        if (result.error() == ErrorCode::CLIENT_ALREADY_EXISTS &&
+            GetClientManager().GetClient(req.client_id)) {
+            return make_idempotent_response();
+        }
         LOG(ERROR) << "RegisterClient(P2P): failed"
                    << ", client_id=" << req.client_id
                    << ", error=" << result.error();

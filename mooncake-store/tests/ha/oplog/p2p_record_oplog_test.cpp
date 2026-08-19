@@ -220,6 +220,28 @@ TEST_F(P2PRecordOplogTest, RegisterClientRecordsOplog) {
     EXPECT_EQ(payload.segments[0].name, segment.name);
 }
 
+TEST_F(P2PRecordOplogTest, DuplicateRegisterClientDoesNotRecordOplog) {
+    P2PMasterService service(MakeConfig());
+    const UUID client_id{1, 1};
+    const UUID segment_id{2, 2};
+    RegisterClient(service, client_id, MakeSegment(segment_id));
+
+    RegisterClientRequest req;
+    req.client_id = client_id;
+    req.ip_address = "127.0.0.1";
+    req.rpc_port = 50051;
+    req.segments = {MakeSegment({3, 3})};
+    req.deployment_mode = DeploymentMode::P2P;
+
+    auto duplicate_result = service.RegisterClient(req);
+    ASSERT_TRUE(duplicate_result.has_value())
+        << toString(duplicate_result.error());
+
+    auto* manager = service.GetOpLogManager();
+    ASSERT_NE(manager, nullptr);
+    EXPECT_EQ(manager->GetLastSequenceId(), 1);
+}
+
 TEST_F(P2PRecordOplogTest, RegisterClientRejectsMissingEndpoint) {
     P2PMasterService service(MakeConfig());
     const UUID segment_id{2, 2};
