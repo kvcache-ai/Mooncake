@@ -186,6 +186,14 @@ class PromotionOnHitTest : public ::testing::Test {
         MasterService& service, const UUID& client_id, const std::string& key,
         int64_t size, const std::string& transport_endpoint,
         std::string tenant_id = std::string(TenantId::kDefaultValue)) {
+        // NotifyOffloadSuccess registers replicas only for a client with a
+        // mounted LOCAL_DISK segment, the way the real offload pipeline
+        // mounts before registering. Idempotent, so repeat injections for
+        // the same client are fine.
+        auto mount = service.MountLocalDiskSegment(client_id, true);
+        if (!mount.has_value()) {
+            return false;
+        }
         std::vector<OffloadTaskItem> tasks{
             OffloadTaskItem{.tenant_id = tenant_id, .key = key, .size = size}};
         StorageObjectMetadata sm;
