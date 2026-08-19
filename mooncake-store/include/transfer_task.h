@@ -414,6 +414,34 @@ struct SpdkNofQos {
                 head[kSpdkNofOpWrite] == nullptr);
     }
 
+    /**
+     * @brief Update the inflight limit based on the qpair pool capacity.
+     *
+     * When the number of qpairs changes (degradation or TryGrow recovery),
+     * adjust the inflight cap accordingly.
+     * inflight_blocks_limit = min(absolute limit, qpair pool I/O capacity).
+     * blocks_per_chunk serves as the lower bound, guaranteeing that at least
+     * one chunk can be submitted.
+     *
+     * @param num_qpairs              Current number of qpairs.
+     * @param max_inflight_per_qpair  Maximum inflight I/Os per qpair.
+     *
+     * Changelog:
+     * - 2026-08-03 | Added (this PR)
+     */
+    void UpdateInflightLimit(int num_qpairs, int max_inflight_per_qpair) {
+        // num_qpairs * max_inflight_per_qpair yields an I/O count, but
+        // inflight_blocks_limit is compared against block counts later in
+        // the worker loop.  Multiply by blocks_per_chunk to convert from
+        // "max concurrent I/Os" to "max concurrent blocks", matching the
+        // unit used by the constructor (GetSpdkNofInflightBytesLimit /
+        // block_size).  Without this conversion, a degraded 4‑qpair pool
+        // would be throttled at 256 blocks (~1 MiB) instead of the intended
+        // 8192 blocks (~32 MiB).
+        int pool_limit = num_qpairs * max_inflight_per_qpair * blocks_per_chunk;
+        inflight_blocks_limit = std::max(blocks_per_chunk, pool_limit);
+    }
+
     void PushTask(SpdkNofTask* task) {
         int op = task->op;
         if (head[op] == nullptr) {
@@ -465,11 +493,26 @@ class SpdkNofWorkerPool {
     std::unique_ptr<std::queue<SpdkNofTask>[]> task_queue_;
     std::unique_ptr<std::mutex[]> queue_mutex_;
     std::unique_ptr<std::condition_variable[]> queue_cv_;
+
+    // Changelog:
+    // - 2026-08-03 | Added task queue backpressure (this PR)
+    // When task_queue_ depth reaches max_queue_depth_, submitTask blocks.
+    // Prevents unbounded request accumulation from causing memory
+    // exhaustion in degradation scenarios.
+    std::unique_ptr<std::condition_variable[]> queue_not_full_cv_;
+    int max_queue_depth_;
+
     std::atomic<bool> shutdown_;
     std::mutex seg_mutex_;
     int seg_num = 0;
     std::map<nof_seg_handle*, int> seg_to_worker_;
 };
+
+/// Rebalance check interval (seconds). Worker threads check at this interval
+/// whether a degraded qpair pool can be recovered via TryGrow.
+/// Changelog:
+/// - 2026-08-03 | Added (this PR)
+constexpr int kRebalanceIntervalSeconds = 30;
 #endif
 
 /**
@@ -538,6 +581,10 @@ class TransferSubmitter {
                                const std::string& local_hostname,
                                TransferMetric* transfer_metric = nullptr,
                                int numa_socket_id = 0);
+
+    // Added 2026-07-31: release cached NoF handles via CloseNofSegment
+    // so QIDs are recycled when client is closed.
+    ~TransferSubmitter();
 
     /**
      * @brief Submit an asynchronous transfer operation
@@ -608,6 +655,15 @@ class TransferSubmitter {
     std::unique_ptr<MemcpyWorkerPool> memcpy_pool_;
 #ifdef USE_NOF
     std::unique_ptr<SpdkNofWorkerPool> spdk_nvmf_pool_;
+    // [Added 2026-07-31] Per-TransferSubmitter handle cache.
+    // Each client independently caches its nof_seg_handle, so multiple put()
+    // calls from the same client reuse the same connection. Not shared across
+    // TransferSubmitters, to avoid multiple WorkerPools concurrently accessing
+    // the same SPDK qpair pool.
+    // Protected by nof_cache_mutex_ — concurrent submissions on the same
+    // TransferSubmitter must not race on the first-use cache-insertion path.
+    std::map<std::string, nof_seg_handle*> nof_handle_cache_;
+    mutable std::mutex nof_cache_mutex_;
 #endif
     std::unique_ptr<FilereadWorkerPool> fileread_pool_;
     bool memcpy_enabled_;
