@@ -16,6 +16,8 @@
 #include <glog/logging.h>
 #include <async_simple/executors/SimpleExecutor.h>
 
+#include <cstdlib>
+
 #include "transfer_engine_rpc_client_io_context.h"
 #include "tent/common/utils/ip.h"
 #include "tent/common/utils/random.h"
@@ -85,6 +87,30 @@ struct ClientLease {
 
 CoroRpcAgent::CoroRpcAgent() = default;
 
+size_t CoroRpcAgent::rpcServerThreads() {
+    static const size_t val = [] {
+        const char* env = std::getenv("MC_TENT_RPC_THREADS");
+        if (env) {
+            try {
+                int v = std::stoi(env);
+                if (v > 0) {
+                    LOG(INFO) << "CoroRpcAgent: RPC server threads set to " << v
+                              << " via MC_TENT_RPC_THREADS";
+                    return static_cast<size_t>(v);
+                }
+                LOG(WARNING)
+                    << "Ignore non-positive MC_TENT_RPC_THREADS value: " << env
+                    << ", using default 1";
+            } catch (const std::exception& e) {
+                LOG(WARNING) << "Invalid MC_TENT_RPC_THREADS value: " << env
+                             << ". Error: " << e.what() << ", using default 1";
+            }
+        }
+        return size_t(1);
+    }();
+    return val;
+}
+
 CoroRpcAgent::~CoroRpcAgent() { stop(); }
 
 Status CoroRpcAgent::registerFunction(int func_id, const Function& func,
@@ -106,7 +132,7 @@ Status CoroRpcAgent::start(uint16_t& port, bool ipv6) {
         try {
             if (port == 0)
                 port = kStartPort + SimpleRandom::Get().next(kPortRange);
-            server_ = new coro_rpc::coro_rpc_server(kRpcThreads, port,
+            server_ = new coro_rpc::coro_rpc_server(rpcServerThreads(), port,
                                                     ipv6 ? "::" : "0.0.0.0");
             server_->register_handler<&CoroRpcAgent::process>(this);
             server_->async_start();
