@@ -30,6 +30,16 @@ constexpr uint8_t kNvmeKvStoreOpcode = 0x01;
 constexpr uint8_t kNvmeKvRetrieveOpcode = 0x02;
 constexpr uint8_t kNvmeKvDeleteOpcode = 0x10;
 
+enum class NvmeKvDevicePathType {
+    kBlockNamespace,
+    kGenericCharacter,
+};
+
+struct NvmeKvResolvedDevicePath {
+    std::string path;
+    uint32_t nsid = 1;
+};
+
 struct NvmeKvFreeDeleter {
     void operator()(void *ptr) const { std::free(ptr); }
 };
@@ -57,9 +67,16 @@ NvmeKvCommandExecutor::Capabilities BuildNvmeKvCapabilities(
     uint32_t runtime_transfer_limit);
 std::string NvmeKvPhysicalKeyToHex(
     const NvmeKvCommandExecutor::PhysicalKey &key);
+tl::expected<NvmeKvResolvedDevicePath, ErrorCode> ResolveNvmeKvDevicePath(
+    const std::string &configured_path, NvmeKvDevicePathType type,
+    uint32_t configured_nsid);
+std::string NvmeKvTransportIdWithNsid(const std::string &configured_path,
+                                      uint32_t configured_nsid);
 NvmeKvPackedKeyFields PackNvmeKvPhysicalKey(
     const NvmeKvCommandExecutor::PhysicalKey &key);
 ErrorCode MapNvmeKvStatus(uint32_t status, bool is_write);
+ErrorCode MapNvmeKvCompletionStatus(uint32_t status_code_type,
+                                    uint32_t status_code, bool is_write);
 ErrorCode MapNvmeKvTransportError(int err, bool is_write);
 bool IsNvmeKvControlFlowError(ErrorCode error);
 

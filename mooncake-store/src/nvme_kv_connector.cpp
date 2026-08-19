@@ -27,6 +27,7 @@ enum class RuntimeTransport {
     kAuto,
     kIoUring,
     kIoctl,
+    kSpdk,
 };
 
 const char *RuntimeTransportName(RuntimeTransport transport) {
@@ -37,6 +38,8 @@ const char *RuntimeTransportName(RuntimeTransport transport) {
             return "io_uring";
         case RuntimeTransport::kIoctl:
             return "ioctl";
+        case RuntimeTransport::kSpdk:
+            return "spdk";
     }
     return "unknown";
 }
@@ -51,6 +54,10 @@ tl::expected<RuntimeTransport, ErrorCode> ParseRuntimeTransport() {
     }
     if (transport == "ioctl") {
         return RuntimeTransport::kIoctl;
+    }
+    if (transport == "spdk" || transport == "spdk_nof" ||
+        transport == "nof_spdk") {
+        return RuntimeTransport::kSpdk;
     }
     LOG(ERROR) << "Unknown MOONCAKE_NVME_KV_TRANSPORT: " << transport;
     return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
@@ -110,6 +117,15 @@ tl::expected<void, ErrorCode> NvmeKvConnector::InitRealExecutor() {
             case RuntimeTransport::kIoctl:
                 return CreateNvmeKvIoctlExecutor(device_path, nsid, queue_depth,
                                                  runtime_transfer_limit);
+            case RuntimeTransport::kSpdk:
+#if defined(USE_NOF) && defined(MOONCAKE_HAVE_SPDK_NVME_KV)
+                return CreateNvmeKvSpdkExecutor(device_path, nsid, queue_depth,
+                                                runtime_transfer_limit);
+#else
+                LOG(ERROR) << "SPDK NVMe KV executor requires USE_NOF and SPDK "
+                           << "26.05+ typed KV API support";
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+#endif
             case RuntimeTransport::kAuto:
                 break;
         }

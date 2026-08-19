@@ -223,7 +223,10 @@ int main() {
     set(MOONCAKE_HAVE_NVME_URING_CMD ON)
     message(STATUS "io_uring: NVMe uring command support enabled")
   else()
-    message(STATUS "io_uring: NVMe uring command support unavailable, NVMe KV io_uring executor disabled")
+    message(
+      STATUS
+        "io_uring: NVMe uring command support unavailable, NVMe KV io_uring executor disabled"
+    )
   endif()
 else()
   message(STATUS "io_uring: Disabled (liburing not found)")
@@ -249,77 +252,127 @@ if(USE_NOF)
   add_subdirectory(spdk)
   list(APPEND MOONCAKE_STORE_SOURCES ${SPDK_WRAPPER_SOURCES})
 
+  set(SPDK_PREFIX_HINT
+      "$ENV{SPDK_PREFIX}"
+      CACHE PATH "SPDK installation prefix")
+  if(SPDK_PREFIX_HINT)
+    set(_SPDK_DEFAULT_INCLUDE_DIR "${SPDK_PREFIX_HINT}/include")
+    set(_SPDK_DEFAULT_LIB_DIR "${SPDK_PREFIX_HINT}/lib")
+  else()
+    set(_SPDK_DEFAULT_INCLUDE_DIR "/usr/local/include")
+    set(_SPDK_DEFAULT_LIB_DIR "/usr/local/lib")
+  endif()
+  option(SPDK_USE_PKG_CONFIG "Resolve SPDK libraries through pkg-config" OFF)
+
   set(SPDK_INCLUDE_DIR
-      "/usr/local/include"
+      "${_SPDK_DEFAULT_INCLUDE_DIR}"
       CACHE PATH "SPDK include directory")
   set(DPDK_INCLUDE_DIR
-      "/usr/local/include"
+      "${_SPDK_DEFAULT_INCLUDE_DIR}"
       CACHE PATH "DPDK include directory")
   set(SPDK_LIB_DIR
-      "/usr/local/lib"
+      "${_SPDK_DEFAULT_LIB_DIR}"
       CACHE PATH "SPDK static library directory")
   set(DPDK_LIB_DIR
-      "/usr/local/lib"
+      "${_SPDK_DEFAULT_LIB_DIR}"
       CACHE PATH "DPDK static library directory")
 
-  set(SPDK_STATIC_LIBS
-      -Wl,--whole-archive
-      ${SPDK_LIB_DIR}/libspdk_event.a
-      ${SPDK_LIB_DIR}/libspdk_rdma.a
-      ${SPDK_LIB_DIR}/libspdk_nvme.a
-      ${SPDK_LIB_DIR}/libspdk_sock_posix.a
-      -Wl,--no-whole-archive
-      ${SPDK_LIB_DIR}/libspdk_vfio_user.a
-      ${SPDK_LIB_DIR}/libspdk_dma.a
-      ${SPDK_LIB_DIR}/libspdk_init.a
-      ${SPDK_LIB_DIR}/libspdk_env_dpdk.a
-      ${SPDK_LIB_DIR}/libspdk_log.a
-      ${SPDK_LIB_DIR}/libspdk_util.a
-      ${SPDK_LIB_DIR}/libspdk_blob.a
-      ${SPDK_LIB_DIR}/libspdk_blobfs.a
-      ${SPDK_LIB_DIR}/libspdk_bdev.a
-      ${SPDK_LIB_DIR}/libspdk_conf.a
-      ${SPDK_LIB_DIR}/libspdk_json.a
-      ${SPDK_LIB_DIR}/libspdk_jsonrpc.a
-      ${SPDK_LIB_DIR}/libspdk_sock.a
-      ${SPDK_LIB_DIR}/libspdk_thread.a
-      ${SPDK_LIB_DIR}/libspdk_trace.a
-      ${SPDK_LIB_DIR}/libspdk_vmd.a
-      ${SPDK_LIB_DIR}/libspdk_rpc.a
-      ${DPDK_LIB_DIR}/librte_eal.a
-      ${DPDK_LIB_DIR}/librte_mempool.a
-      ${DPDK_LIB_DIR}/librte_ring.a
-      ${DPDK_LIB_DIR}/librte_bus_pci.a
-      ${DPDK_LIB_DIR}/librte_pci.a
-      ${DPDK_LIB_DIR}/librte_timer.a
-      ${DPDK_LIB_DIR}/librte_telemetry.a
-      ${DPDK_LIB_DIR}/librte_kvargs.a
-      ${DPDK_LIB_DIR}/librte_mbuf.a
-      -Wl,--whole-archive
-      ${DPDK_LIB_DIR}/librte_mempool_ring.a
-      -Wl,--no-whole-archive
-      ${DPDK_LIB_DIR}/librte_power.a
-      ${DPDK_LIB_DIR}/librte_ethdev.a
-      ${DPDK_LIB_DIR}/librte_net.a
-      ${DPDK_LIB_DIR}/librte_vhost.a
-      ${DPDK_LIB_DIR}/librte_cryptodev.a
-      ${DPDK_LIB_DIR}/librte_hash.a
-      ${DPDK_LIB_DIR}/librte_rcu.a
-      pthread
-      dl
-      numa
-      rt
-      m
-      uuid
-      crypto
-      aio
-      z
-      isal
-      elf
-      ibverbs
-      rdmacm
-      ssl
-      bsd)
+  if(SPDK_USE_PKG_CONFIG)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(SPDK REQUIRED IMPORTED_TARGET spdk_nvme spdk_env_dpdk)
+    pkg_check_modules(SPDK_SYSLIBS REQUIRED IMPORTED_TARGET spdk_syslibs)
+    set(_SPDK_LIBRARY_SUFFIXES_SAVE ${CMAKE_FIND_LIBRARY_SUFFIXES})
+    set(CMAKE_FIND_LIBRARY_SUFFIXES ".so")
+    unset(SPDK_NVME_SHARED_LIBRARY CACHE)
+    find_library(
+      SPDK_NVME_SHARED_LIBRARY
+      NAMES spdk_nvme
+      HINTS ${SPDK_LIBRARY_DIRS})
+    set(CMAKE_FIND_LIBRARY_SUFFIXES ${_SPDK_LIBRARY_SUFFIXES_SAVE})
+    if(NOT SPDK_NVME_SHARED_LIBRARY)
+      message(
+        FATAL_ERROR
+          "SPDK_USE_PKG_CONFIG requires shared SPDK libraries; use the manual SPDK_LIB_DIR/DPDK_LIB_DIR mode for static linking"
+      )
+    endif()
+    set(SPDK_INCLUDE_DIR ${SPDK_INCLUDE_DIRS})
+    set(DPDK_INCLUDE_DIR ${SPDK_INCLUDE_DIRS})
+    set(SPDK_STATIC_LIBS -Wl,--no-as-needed PkgConfig::SPDK -Wl,--as-needed
+                         PkgConfig::SPDK_SYSLIBS)
+  else()
+    set(SPDK_STATIC_LIBS
+        -Wl,--whole-archive
+        ${SPDK_LIB_DIR}/libspdk_event.a
+        ${SPDK_LIB_DIR}/libspdk_rdma.a
+        ${SPDK_LIB_DIR}/libspdk_nvme.a
+        ${SPDK_LIB_DIR}/libspdk_sock_posix.a
+        -Wl,--no-whole-archive
+        ${SPDK_LIB_DIR}/libspdk_vfio_user.a
+        ${SPDK_LIB_DIR}/libspdk_dma.a
+        ${SPDK_LIB_DIR}/libspdk_init.a
+        ${SPDK_LIB_DIR}/libspdk_env_dpdk.a
+        ${SPDK_LIB_DIR}/libspdk_log.a
+        ${SPDK_LIB_DIR}/libspdk_util.a
+        ${SPDK_LIB_DIR}/libspdk_blob.a
+        ${SPDK_LIB_DIR}/libspdk_blobfs.a
+        ${SPDK_LIB_DIR}/libspdk_bdev.a
+        ${SPDK_LIB_DIR}/libspdk_conf.a
+        ${SPDK_LIB_DIR}/libspdk_json.a
+        ${SPDK_LIB_DIR}/libspdk_jsonrpc.a
+        ${SPDK_LIB_DIR}/libspdk_sock.a
+        ${SPDK_LIB_DIR}/libspdk_thread.a
+        ${SPDK_LIB_DIR}/libspdk_trace.a
+        ${SPDK_LIB_DIR}/libspdk_vmd.a
+        ${SPDK_LIB_DIR}/libspdk_rpc.a
+        ${DPDK_LIB_DIR}/librte_eal.a
+        ${DPDK_LIB_DIR}/librte_mempool.a
+        ${DPDK_LIB_DIR}/librte_ring.a
+        ${DPDK_LIB_DIR}/librte_bus_pci.a
+        ${DPDK_LIB_DIR}/librte_pci.a
+        ${DPDK_LIB_DIR}/librte_timer.a
+        ${DPDK_LIB_DIR}/librte_telemetry.a
+        ${DPDK_LIB_DIR}/librte_kvargs.a
+        ${DPDK_LIB_DIR}/librte_mbuf.a
+        -Wl,--whole-archive
+        ${DPDK_LIB_DIR}/librte_mempool_ring.a
+        -Wl,--no-whole-archive
+        ${DPDK_LIB_DIR}/librte_power.a
+        ${DPDK_LIB_DIR}/librte_ethdev.a
+        ${DPDK_LIB_DIR}/librte_net.a
+        ${DPDK_LIB_DIR}/librte_vhost.a
+        ${DPDK_LIB_DIR}/librte_cryptodev.a
+        ${DPDK_LIB_DIR}/librte_hash.a
+        ${DPDK_LIB_DIR}/librte_rcu.a
+        pthread
+        dl
+        numa
+        rt
+        m
+        uuid
+        crypto
+        aio
+        z
+        isal
+        elf
+        ibverbs
+        rdmacm
+        ssl
+        bsd)
+  endif()
+
+  set(MOONCAKE_HAVE_SPDK_NVME_KV OFF)
+  unset(SPDK_NVME_KV_INCLUDE_DIR CACHE)
+  find_path(
+    SPDK_NVME_KV_INCLUDE_DIR
+    NAMES spdk/nvme_kv.h
+    HINTS ${SPDK_INCLUDE_DIR} ${DPDK_INCLUDE_DIR})
+  if(SPDK_NVME_KV_INCLUDE_DIR)
+    list(APPEND SPDK_INCLUDE_DIR ${SPDK_NVME_KV_INCLUDE_DIR})
+    list(REMOVE_DUPLICATES SPDK_INCLUDE_DIR)
+    set(MOONCAKE_HAVE_SPDK_NVME_KV ON)
+    list(APPEND MOONCAKE_STORE_SOURCES nvme_kv_executor_spdk.cpp)
+    message(STATUS "SPDK NVMe KV typed API enabled")
+  endif()
 endif()
 
 # The cache_allocator library
@@ -328,6 +381,9 @@ add_library(mooncake_store ${MOONCAKE_STORE_SOURCES})
 if(BUILD_UNIT_TESTS)
   target_compile_definitions(mooncake_store
                              PRIVATE MOONCAKE_ENABLE_NVME_KV_TEST_STUB=1)
+endif()
+if(MOONCAKE_HAVE_SPDK_NVME_KV)
+  target_compile_definitions(mooncake_store PUBLIC MOONCAKE_HAVE_SPDK_NVME_KV=1)
 endif()
 if(KV_EVENTS_ZMQ_FOUND)
   target_compile_definitions(mooncake_store PRIVATE MOONCAKE_ENABLE_KV_EVENTS=1)
@@ -375,7 +431,8 @@ if(URING_LIB AND URING_INCLUDE)
   target_compile_definitions(mooncake_store PUBLIC USE_URING)
   target_include_directories(mooncake_store PRIVATE ${URING_INCLUDE})
   if(MOONCAKE_HAVE_NVME_URING_CMD)
-    target_compile_definitions(mooncake_store PRIVATE MOONCAKE_HAVE_NVME_URING_CMD=1)
+    target_compile_definitions(mooncake_store
+                               PRIVATE MOONCAKE_HAVE_NVME_URING_CMD=1)
   endif()
 endif()
 
