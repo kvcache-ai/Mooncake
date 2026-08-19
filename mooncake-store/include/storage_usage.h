@@ -2,6 +2,8 @@
 
 #include <atomic>
 #include <cstddef>
+#include <memory>
+#include <utility>
 
 namespace mooncake {
 
@@ -56,6 +58,49 @@ class StorageUsageTracker {
    private:
     std::atomic_size_t used_bytes_{0};
     std::atomic_size_t capacity_bytes_{0};
+};
+
+/**
+ * RAII registration of one allocator into a StorageUsageTracker.
+ *
+ * Attach once before the allocator is published. The registration stays
+ * immutable for the allocator's lifetime and detaches from the destructor,
+ * after in-flight allocate/deallocate calls have dropped their local
+ * shared_ptr and the allocator can be destroyed.
+ */
+class StorageUsageRegistration {
+   public:
+    StorageUsageRegistration(std::shared_ptr<StorageUsageTracker> tracker,
+                             std::atomic_size_t& used_bytes,
+                             size_t capacity_bytes) noexcept
+        : tracker_(std::move(tracker)),
+          used_bytes_(used_bytes),
+          capacity_bytes_(capacity_bytes) {
+        tracker_->AttachAllocator(used_bytes_.load(std::memory_order_relaxed),
+                                  capacity_bytes_);
+    }
+
+    ~StorageUsageRegistration() {
+        tracker_->DetachAllocator(used_bytes_.load(std::memory_order_relaxed),
+                                  capacity_bytes_);
+    }
+
+    StorageUsageRegistration(const StorageUsageRegistration&) = delete;
+    StorageUsageRegistration& operator=(const StorageUsageRegistration&) =
+        delete;
+
+    void AddUsedBytes(size_t bytes) noexcept {
+        tracker_->AddUsedBytes(bytes);
+    }
+
+    void RemoveUsedBytes(size_t bytes) noexcept {
+        tracker_->RemoveUsedBytes(bytes);
+    }
+
+   private:
+    std::shared_ptr<StorageUsageTracker> tracker_;
+    std::atomic_size_t& used_bytes_;
+    size_t capacity_bytes_;
 };
 
 }  // namespace mooncake

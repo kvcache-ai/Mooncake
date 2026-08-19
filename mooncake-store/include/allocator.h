@@ -110,7 +110,7 @@ class AllocatedBuffer {
  */
 class BufferAllocatorBase {
    public:
-    virtual ~BufferAllocatorBase();
+    virtual ~BufferAllocatorBase() = default;
 
     virtual std::unique_ptr<AllocatedBuffer> allocate(size_t size) = 0;
     virtual void deallocate(AllocatedBuffer* handle) = 0;
@@ -130,9 +130,17 @@ class BufferAllocatorBase {
      */
     virtual size_t getLargestFreeRegion() const = 0;
 
+    /**
+     * Attach this allocator to a domain usage tracker exactly once, before it
+     * is published. Registration is immutable afterward and is released by
+     * RAII when the last shared_ptr to the allocator is dropped.
+     */
     void AttachUsageTracker(
         const std::shared_ptr<StorageUsageTracker>& usage_tracker);
-    void DetachUsageTracker();
+
+    static void SetRecordDeallocationHookForTesting(void (*hook)()) noexcept {
+        record_deallocation_hook_.store(hook, std::memory_order_release);
+    }
 
    protected:
     [[nodiscard]] size_t GetUsageBytes() const noexcept {
@@ -146,8 +154,8 @@ class BufferAllocatorBase {
 
    private:
     std::atomic_size_t cur_size_{0};
-    std::shared_ptr<StorageUsageTracker> usage_tracker_;
-    size_t tracked_capacity_{0};
+    std::unique_ptr<StorageUsageRegistration> usage_registration_;
+    static std::atomic<void (*)()> record_deallocation_hook_;
 };
 
 /**

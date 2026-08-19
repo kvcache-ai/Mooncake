@@ -8,11 +8,13 @@
 #include <boost/functional/hash.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <functional>
 #include <future>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace mooncake {
@@ -152,9 +154,6 @@ class SegmentTest : public ::testing::Test {
         const std::shared_ptr<BufferAllocatorBase>& allocator,
         const std::vector<Segment>& segments) {
         if (segment_manager.cxl_global_allocator_ != allocator) {
-            if (segment_manager.cxl_global_allocator_) {
-                segment_manager.cxl_global_allocator_->DetachUsageTracker();
-            }
             segment_manager.cxl_global_allocator_ = allocator;
             allocator->AttachUsageTracker(segment_manager.usage_tracker_);
         }
@@ -256,6 +255,7 @@ TEST_F(SegmentTest, MemoryUsageSnapshotTracksMountedAllocatorState) {
                                                       metrics_dec_capacity),
                   ErrorCode::OK);
     }
+    allocator.reset();
 
     snapshot = segment_manager.GetMemoryUsageSnapshot();
     usage = segment_manager.GetMemoryUsage();
@@ -278,6 +278,81 @@ TEST_F(SegmentTest, AggregateMemoryUsageDoesNotTakeSegmentMutex) {
 
     ASSERT_EQ(status, std::future_status::ready);
     EXPECT_EQ(usage.get().capacity_bytes, 0u);
+}
+
+TEST_F(SegmentTest, AggregateUsageSurvivesConcurrentUnmountAndDeallocate) {
+    SegmentManager segment_manager(BufferAllocatorType::OFFSET);
+    constexpr size_t kSegmentSize = 16 * 1024 * 1024;
+    constexpr size_t kAllocationSize = 4 * 1024 * 1024;
+
+    Segment segment;
+    segment.id = generate_uuid();
+    segment.name = "usage_race_segment";
+    segment.size = kSegmentSize;
+    segment.base = 0x1C0000000;
+    UUID client_id = generate_uuid();
+
+    std::shared_ptr<BufferAllocatorBase> allocator;
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        ASSERT_EQ(segment_access.MountSegment(segment, client_id),
+                  ErrorCode::OK);
+        allocator = segment_access.GetAllocator(segment.id);
+    }
+    ASSERT_NE(allocator, nullptr);
+    auto buffer = allocator->allocate(kAllocationSize);
+    ASSERT_NE(buffer, nullptr);
+
+    std::atomic<int> phase{0};
+    static std::atomic<int>* phase_ptr = nullptr;
+    phase_ptr = &phase;
+    BufferAllocatorBase::SetRecordDeallocationHookForTesting([]() {
+        phase_ptr->store(1, std::memory_order_release);
+        while (phase_ptr->load(std::memory_order_acquire) != 2) {
+            std::this_thread::yield();
+        }
+    });
+
+    std::thread dealloc_thread([&buffer] { buffer.reset(); });
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    struct Cleanup {
+        std::atomic<int>& phase;
+        std::thread& thread;
+        ~Cleanup() {
+            phase.store(2, std::memory_order_release);
+            if (thread.joinable()) {
+                thread.join();
+            }
+            BufferAllocatorBase::SetRecordDeallocationHookForTesting(nullptr);
+        }
+    } cleanup{phase, dealloc_thread};
+
+    while (phase.load(std::memory_order_acquire) != 1) {
+        ASSERT_LT(std::chrono::steady_clock::now(), deadline)
+            << "deallocate did not enter RecordDeallocation";
+        std::this_thread::yield();
+    }
+
+    {
+        auto segment_access = segment_manager.getSegmentAccess();
+        size_t metrics_dec_capacity = 0;
+        ASSERT_EQ(segment_access.PrepareUnmountSegment(segment.id,
+                                                       metrics_dec_capacity),
+                  ErrorCode::OK);
+        ASSERT_EQ(segment_access.CommitUnmountSegment(segment.id, client_id,
+                                                      metrics_dec_capacity),
+                  ErrorCode::OK);
+    }
+
+    cleanup.phase.store(2, std::memory_order_release);
+    dealloc_thread.join();
+    BufferAllocatorBase::SetRecordDeallocationHookForTesting(nullptr);
+    allocator.reset();
+
+    const auto usage = segment_manager.GetMemoryUsage();
+    EXPECT_EQ(usage.used_bytes, 0u);
+    EXPECT_EQ(usage.capacity_bytes, 0u);
 }
 
 TEST_F(SegmentTest, AggregateMemoryUsageFollowsAllocatorReplacement) {
@@ -313,6 +388,7 @@ TEST_F(SegmentTest, AggregateMemoryUsageFollowsAllocatorReplacement) {
         ASSERT_TRUE(segment_access.ReplaceAllocators(
             {{segment.id, old_allocator, replacement}}));
     }
+    old_allocator.reset();
 
     auto usage = segment_manager.GetMemoryUsage();
     EXPECT_EQ(usage.used_bytes, kRestoredAllocationSize);
@@ -333,6 +409,7 @@ TEST_F(SegmentTest, AggregateMemoryUsageFollowsAllocatorReplacement) {
                                                       metrics_dec_capacity),
                   ErrorCode::OK);
     }
+    replacement.reset();
     EXPECT_EQ(segment_manager.GetMemoryUsage().capacity_bytes, 0u);
 }
 
@@ -439,6 +516,7 @@ TEST_F(SegmentTest, NoFUsageSnapshotSurvivesMetricsReset) {
                                                       metrics_dec_capacity),
                   ErrorCode::OK);
     }
+    allocator.reset();
     EXPECT_EQ(segment_manager.GetUsage().used_bytes, 0u);
     EXPECT_EQ(segment_manager.GetUsage().capacity_bytes, 0u);
 }

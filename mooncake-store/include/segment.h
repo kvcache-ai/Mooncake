@@ -510,7 +510,9 @@ class SegmentManager {
      * @brief Return aggregate DRAM usage in O(1) without segment_mutex_.
      *
      * Best-effort: used/capacity may tear briefly across mount/unmount,
-     * matching the previous metric-gauge watermark reads.
+     * matching the previous metric-gauge watermark reads. An unmounted
+     * allocator may remain in the aggregate until in-flight allocate or
+     * deallocate calls drain and the last shared_ptr is dropped.
      */
     [[nodiscard]] StorageUsage GetMemoryUsage() const noexcept {
         return usage_tracker_->GetUsage();
@@ -526,7 +528,6 @@ class SegmentManager {
 
    private:
     void AttachMountedUsageTrackers();
-    void DetachMountedUsageTrackers();
 
     std::shared_ptr<StorageUsageTracker> usage_tracker_ =
         std::make_shared<StorageUsageTracker>();
@@ -607,7 +608,9 @@ class NoFSegmentManager {
      * @brief Return aggregate NoF usage in O(1) without segment_mutex_.
      *
      * Best-effort: used/capacity may tear briefly across mount/unmount,
-     * matching the previous metric-gauge watermark reads.
+     * matching the previous metric-gauge watermark reads. An unmounted
+     * allocator may remain in the aggregate until in-flight allocate or
+     * deallocate calls drain and the last shared_ptr is dropped.
      */
     [[nodiscard]] StorageUsage GetUsage() const noexcept {
         return usage_tracker_->GetUsage();

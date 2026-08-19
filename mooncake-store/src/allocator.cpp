@@ -11,46 +11,32 @@
 
 namespace mooncake {
 
-BufferAllocatorBase::~BufferAllocatorBase() { DetachUsageTracker(); }
+std::atomic<void (*)()> BufferAllocatorBase::record_deallocation_hook_{
+    nullptr};
 
 void BufferAllocatorBase::AttachUsageTracker(
     const std::shared_ptr<StorageUsageTracker>& usage_tracker) {
-    if (!usage_tracker) {
+    if (!usage_tracker || usage_registration_) {
         return;
     }
-    if (usage_tracker_ == usage_tracker) {
-        return;
-    }
-    if (usage_tracker_) {
-        DetachUsageTracker();
-    }
-
-    tracked_capacity_ = capacity();
-    usage_tracker_ = usage_tracker;
-    usage_tracker_->AttachAllocator(GetUsageBytes(), tracked_capacity_);
-}
-
-void BufferAllocatorBase::DetachUsageTracker() {
-    if (!usage_tracker_) {
-        return;
-    }
-
-    usage_tracker_->DetachAllocator(GetUsageBytes(), tracked_capacity_);
-    usage_tracker_.reset();
-    tracked_capacity_ = 0;
+    usage_registration_ = std::make_unique<StorageUsageRegistration>(
+        usage_tracker, cur_size_, capacity());
 }
 
 void BufferAllocatorBase::RecordAllocation(size_t bytes) noexcept {
     cur_size_.fetch_add(bytes, std::memory_order_relaxed);
-    if (usage_tracker_) {
-        usage_tracker_->AddUsedBytes(bytes);
+    if (usage_registration_) {
+        usage_registration_->AddUsedBytes(bytes);
     }
 }
 
 void BufferAllocatorBase::RecordDeallocation(size_t bytes) noexcept {
+    if (auto hook = record_deallocation_hook_.load(std::memory_order_acquire)) {
+        hook();
+    }
     cur_size_.fetch_sub(bytes, std::memory_order_relaxed);
-    if (usage_tracker_) {
-        usage_tracker_->RemoveUsedBytes(bytes);
+    if (usage_registration_) {
+        usage_registration_->RemoveUsedBytes(bytes);
     }
 }
 
