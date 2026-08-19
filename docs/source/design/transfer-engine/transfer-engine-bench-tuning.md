@@ -59,7 +59,7 @@ By default, all NICs are used. To test a single NIC, replace `--auto_discovery` 
 
 Some advanced tuning parameters are passed via environment variables:
 
-* **`MC_SLICE_SIZE`**: Request slicing granularity (default 65536).
+* **`MC_SLICE_SIZE`**: Request slicing granularity (default 1048576).
   Larger values reduce CPU overhead but may limit multi-NIC aggregation. Smaller values increase parallelism but add software overhead.
 
 Refer to the Mooncake TE API documentation for additional parameters.

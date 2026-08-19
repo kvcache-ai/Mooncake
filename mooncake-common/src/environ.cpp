@@ -105,7 +105,7 @@ Environ::Environ() {
     max_inline_ = GetInt("MC_MAX_INLINE", 64);
     mtu_ = GetInt("MC_MTU", 4096);
     workers_per_ctx_ = GetInt("MC_WORKERS_PER_CTX", 2);
-    slice_size_ = GetSizeT("MC_SLICE_SIZE", 65536);
+    slice_size_ = GetSizeT("MC_SLICE_SIZE", 1048576);
     retry_cnt_ = GetInt("MC_RETRY_CNT", 9);
     log_level_ = GetString("MC_LOG_LEVEL", "INFO");
     disable_metacache_ = GetBool("MC_DISABLE_METACACHE", false);

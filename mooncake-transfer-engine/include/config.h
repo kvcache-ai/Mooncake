@@ -53,7 +53,7 @@ struct GlobalConfig {
     ibv_mtu mtu_length = IBV_MTU_4096;
     uint16_t handshake_port = 12001;
     int workers_per_ctx = 2;
-    size_t slice_size = 65536;
+    size_t slice_size = 1048576;
     int retry_cnt = 9;
     int auto_gid_max_retries = 2;
     int handshake_listen_backlog = 128;
