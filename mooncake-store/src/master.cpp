@@ -24,6 +24,7 @@
 #include "utils.h"
 
 #include "master_config.h"
+#include "p2p/p2p_rpc_service.h"
 #include "version.h"
 
 using namespace coro_rpc;
@@ -402,6 +403,15 @@ DEFINE_string(cxl_path, mooncake::DEFAULT_CXL_PATH,
 DEFINE_uint64(cxl_size, mooncake::DEFAULT_CXL_SIZE, "CXL memory size in bytes");
 DEFINE_bool(enable_cxl, false, "Whether to enable CXL memory support");
 
+DEFINE_string(deployment_mode, "Centralization",
+              "the deployment mode of mooncake-store, master and client must "
+              "run in same mode. Options: Centralization, P2P");
+DEFINE_uint64(max_client_per_key, 1,
+              "Maximum number of client owners per key in P2P mode (0 = no limit)");
+DEFINE_int64(client_crashed_ttl, -1,
+             "TTL in seconds before a client is considered crashed (P2P mode). "
+             "-1 to use default of 3x client_live_ttl_sec");
+
 namespace {
 
 std::string ResolveHABackendConnstring(
@@ -697,12 +707,15 @@ void InitMasterConf(const mooncake::DefaultConfig& default_config,
     default_config.GetUInt64("pending_task_timeout_sec",
                              &master_config.pending_task_timeout_sec,
                              FLAGS_pending_task_timeout_sec);
-    default_config.GetUInt64("processing_task_timeout_sec",
-                             &master_config.processing_task_timeout_sec,
-                             FLAGS_processing_task_timeout_sec);
+default_config.GetUInt64("processing_task_timeout_sec",
+                              &master_config.processing_task_timeout_sec,
+                              FLAGS_processing_task_timeout_sec);
     default_config.GetUInt32("max_retry_attempts",
-                             &master_config.max_retry_attempts,
-                             FLAGS_max_retry_attempts);
+                              &master_config.max_retry_attempts,
+                              FLAGS_max_retry_attempts);
+    master_config.deployment_mode = FLAGS_deployment_mode;
+    master_config.max_client_per_key = FLAGS_max_client_per_key;
+    master_config.client_crashed_ttl_sec = FLAGS_client_crashed_ttl;
 }
 
 void LoadConfigFromCmdline(mooncake::MasterConfig& master_config,
@@ -1546,6 +1559,13 @@ int main(int argc, char* argv[]) {
         metadata_server_ptr = http_metadata_server.get();
     }
 
+    if (master_config.deployment_mode != "Centralization" &&
+        master_config.deployment_mode != "P2P") {
+        LOG(FATAL) << "Invalid deployment mode: "
+                   << master_config.deployment_mode;
+        return 1;
+    }
+
     if (master_config.enable_ha) {
         mooncake::MasterServiceSupervisorConfig supervisor_config{
             master_config};
@@ -1565,10 +1585,22 @@ int main(int argc, char* argv[]) {
         if (value && std::string_view(value) == "rdma") {
             server.init_ibv();
         }
-        auto wrapped_master_service =
-            std::make_shared<mooncake::WrappedMasterService>(
-                mooncake::WrappedMasterServiceConfig(master_config, version),
-                metadata_server_ptr, http_metadata_remote_url);
+        std::shared_ptr<mooncake::WrappedMasterService> wrapped_master_service;
+
+        if (master_config.deployment_mode == "Centralization") {
+            wrapped_master_service =
+                std::make_shared<mooncake::WrappedMasterService>(
+                    mooncake::WrappedMasterServiceConfig(master_config, version),
+                    metadata_server_ptr, http_metadata_remote_url);
+            mooncake::RegisterRpcService(server, *wrapped_master_service);
+        } else {
+            auto p2p_service =
+                std::make_unique<mooncake::WrappedP2PMasterService>(
+                    mooncake::WrappedMasterServiceConfig(master_config, version));
+            mooncake::RegisterP2PRpcService(server, *p2p_service);
+            // wrapped_master_service = std::move(p2p_service);
+        }
+
         mooncake::MasterAdminServer admin_server(
             static_cast<uint16_t>(master_config.metrics_port),
             master_config.enable_metric_reporting, master_config.metrics_host);
@@ -1580,8 +1612,6 @@ int main(int argc, char* argv[]) {
             mooncake::ha::MasterRuntimeState::kServing);
         admin_server.SetServiceDelegate(wrapped_master_service);
         admin_server.SetServiceAvailable(true);
-
-        mooncake::RegisterRpcService(server, *wrapped_master_service);
 
         static std::atomic<bool> shutdown_requested{false};
         auto signal_handler = [](int /* signum */) {

@@ -6,6 +6,7 @@
 #include "common.h"
 #include "config.h"
 #include "real_client.h"
+#include "p2p/client/p2p_client_service.h"
 
 using namespace mooncake;
 
@@ -29,6 +30,26 @@ DEFINE_bool(start_offload_rpc_server, true,
             "Disable for a write-only owner.");
 DECLARE_bool(enable_http_server);
 DECLARE_int32(http_port);
+
+DEFINE_string(deployment_mode, "Centralization",
+              "Client type: 'Centralization' or 'P2P'");
+DEFINE_uint32(client_rpc_port, 12345, "Client RPC service port (P2P mode)");
+DEFINE_uint32(rpc_thread_num, 16, "Number of threads for P2P RPC service");
+DEFINE_uint64(lock_shard_count, 1024, "Lock shard count (P2P mode)");
+DEFINE_string(route_cache_max_memory, "300 MB", "Max memory for RouteCache");
+DEFINE_uint64(route_cache_ttl_ms, 60000, "TTL for RouteCache entries in ms");
+DEFINE_string(p2p_local_transfer_mode, "te", "Local transfer mode for P2P");
+DEFINE_string(p2p_transfer_direction_mode, "reverse", "Cross-node transfer direction");
+DEFINE_uint64(local_memcpy_async_worker_num, 32, "Async memcpy workers");
+DEFINE_string(tiered_backend_config, "", "Tiered backend config");
+DEFINE_uint64(async_sender_thread_count, 4, "Async route notifier sender threads");
+DEFINE_uint64(async_max_batch_size, 2000, "Max ops per batch");
+DEFINE_uint64(async_route_queue_size, 0, "Async route notifier queue size");
+DEFINE_uint64(p2p_key_lease_duration_ms, 0, "Key lease duration ms");
+DEFINE_uint64(p2p_key_lease_scan_interval_ms, 0, "Key lease scan interval ms");
+DEFINE_bool(enable_client_metric_collection, false, "Enable client metric collection");
+DEFINE_uint32(metric_report_interval_seconds, 5, "Metric report interval seconds");
+DEFINE_string(runtime_config, "", "Runtime config JSON");
 
 namespace mooncake {
 void RegisterClientRpcService(coro_rpc::coro_rpc_server &server,
@@ -117,6 +138,40 @@ int main(int argc, char *argv[]) {
 #endif
 
     auto client_inst = RealClient::create();
+
+    if (FLAGS_deployment_mode == "P2P") {
+        LOG(INFO) << "Using P2P client mode";
+        auto res = client_inst->setup_p2p(
+            FLAGS_host, FLAGS_metadata_server, FLAGS_protocol,
+            FLAGS_device_names, FLAGS_master_server_address,
+            FLAGS_tiered_backend_config,
+            local_buffer_size,
+            "@mooncake_client_" + std::to_string(FLAGS_port) + ".sock",
+            static_cast<uint16_t>(FLAGS_client_rpc_port),
+            static_cast<uint32_t>(FLAGS_rpc_thread_num),
+            FLAGS_lock_shard_count,
+            string_to_byte_size(FLAGS_route_cache_max_memory),
+            FLAGS_route_cache_ttl_ms,
+            FLAGS_p2p_local_transfer_mode,
+            static_cast<size_t>(FLAGS_local_memcpy_async_worker_num),
+            static_cast<uint16_t>(FLAGS_http_port),
+            FLAGS_enable_http_server,
+            FLAGS_async_sender_thread_count,
+            FLAGS_async_max_batch_size,
+            FLAGS_async_route_queue_size,
+            FLAGS_p2p_key_lease_duration_ms,
+            FLAGS_p2p_key_lease_scan_interval_ms,
+            FLAGS_p2p_transfer_direction_mode,
+            FLAGS_runtime_config,
+            FLAGS_enable_client_metric_collection,
+            FLAGS_metric_report_interval_seconds);
+        if (res != 0) {
+            LOG(ERROR) << "Failed to setup P2P client";
+            return -1;
+        }
+        return 0;
+    }
+
     auto res = client_inst->setup_internal(
         FLAGS_host, FLAGS_metadata_server, global_segment_size,
         local_buffer_size, FLAGS_protocol, FLAGS_device_names,

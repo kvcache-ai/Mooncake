@@ -14,6 +14,7 @@
 #include <chrono>
 #include <unordered_set>
 
+#include "client_service_base.h"
 #include "client_metric.h"
 #include "ha/leadership/leader_coordinator.h"
 #include "master_client.h"
@@ -33,35 +34,6 @@ namespace mooncake {
 class PutOperation;
 class DistributedStorageBackend;
 class RealClient;
-
-/**
- * @brief Result of a query operation containing replica information and lease
- * timeout
- */
-class QueryResult {
-   public:
-    /** @brief List of available replicas for the queried key */
-    const std::vector<Replica::Descriptor> replicas;
-    /** @brief Time point when the lease for this key expires */
-    const std::chrono::steady_clock::time_point lease_timeout;
-    /** @brief Optional full-object checksum */
-    const std::optional<uint64_t> object_checksum;
-
-    QueryResult(std::vector<Replica::Descriptor>&& replicas_param,
-                std::chrono::steady_clock::time_point lease_timeout_param,
-                std::optional<uint64_t> object_checksum_param = std::nullopt)
-        : replicas(std::move(replicas_param)),
-          lease_timeout(lease_timeout_param),
-          object_checksum(object_checksum_param) {}
-
-    bool IsLeaseExpired() const {
-        return std::chrono::steady_clock::now() >= lease_timeout;
-    }
-
-    bool IsLeaseExpired(std::chrono::steady_clock::time_point& now) const {
-        return now >= lease_timeout;
-    }
-};
 
 /**
  * @brief Client for interacting with the mooncake distributed object store

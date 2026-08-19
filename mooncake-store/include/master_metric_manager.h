@@ -26,6 +26,7 @@ class MasterMetricManager {
     void inc_allocated_mem_size(const std::string& segment, int64_t val = 1);
     void dec_allocated_mem_size(const std::string& segment, int64_t val = 1);
     void reset_allocated_mem_size();
+    void reset_all_metrics();
     void inc_total_mem_capacity(const std::string& segment, int64_t val = 1);
     void dec_total_mem_capacity(const std::string& segment, int64_t val = 1);
     void reset_total_mem_capacity();
@@ -130,6 +131,24 @@ class MasterMetricManager {
     void dec_active_clients(int64_t val = 1);
     int64_t get_active_clients();
 
+    // Client RPC Metrics (requests / failures, like other RPCs)
+    void inc_register_client_requests(int64_t val = 1);
+    void inc_register_client_failures(int64_t val = 1);
+    void inc_unregister_client_requests(int64_t val = 1);
+    void inc_unregister_client_failures(int64_t val = 1);
+    int64_t get_register_client_requests();
+    int64_t get_register_client_failures();
+    int64_t get_unregister_client_requests();
+    int64_t get_unregister_client_failures();
+
+    // Client Lifecycle Metrics (Counters)
+    void inc_clients_disconnected_total(int64_t val = 1);
+    void inc_clients_recovered_total(int64_t val = 1);
+    void inc_clients_crashed_total(int64_t val = 1);
+    int64_t get_clients_disconnected_total();
+    int64_t get_clients_recovered_total();
+    int64_t get_clients_crashed_total();
+
     // Snapshot Metrics
     void set_snapshot_duration_ms(int64_t size);
     void inc_snapshot_success();
@@ -176,6 +195,16 @@ class MasterMetricManager {
     void inc_nof_segments_unmounted_by_heartbeat_total(int64_t val = 1);
     void observe_nof_heartbeat_probe_latency_ms(int64_t latency_ms);
 
+    // P2P-RPC Metrics
+    void inc_heartbeat_requests(int64_t val = 1);
+    void inc_heartbeat_failures(int64_t val = 1);
+    void inc_get_write_route_requests(int64_t val = 1);
+    void inc_get_write_route_failures(int64_t val = 1);
+    void inc_add_replica_requests(int64_t val = 1);
+    void inc_add_replica_failures(int64_t val = 1);
+    void inc_remove_replica_requests(int64_t val = 1);
+    void inc_remove_replica_failures(int64_t val = 1);
+
     // Batch Operation Statistics (Counters)
     void inc_batch_exist_key_requests(int64_t items);
     void inc_batch_exist_key_failures(int64_t failed_items);
@@ -198,6 +227,12 @@ class MasterMetricManager {
     void inc_batch_put_revoke_requests(int64_t items);
     void inc_batch_put_revoke_failures(int64_t failed_items);
     void inc_batch_put_revoke_partial_success(int64_t failed_items);
+    void inc_batch_remove_replica_requests(int64_t items);
+    void inc_batch_remove_replica_failures(int64_t failed_items);
+    void inc_batch_remove_replica_partial_success(int64_t failed_items);
+    void inc_batch_get_write_route_requests(int64_t items);
+    void inc_batch_get_write_route_failures(int64_t failed_items);
+    void inc_batch_get_write_route_partial_success(int64_t failed_items);
 
     // Operation Statistics Getters
     int64_t get_put_start_requests();
@@ -228,6 +263,16 @@ class MasterMetricManager {
     int64_t get_remount_segment_failures();
     int64_t get_ping_requests();
     int64_t get_ping_failures();
+
+    // P2P-RPC Metrics Getters
+    int64_t get_heartbeat_requests();
+    int64_t get_heartbeat_failures();
+    int64_t get_get_write_route_requests();
+    int64_t get_get_write_route_failures();
+    int64_t get_add_replica_requests();
+    int64_t get_add_replica_failures();
+    int64_t get_remove_replica_requests();
+    int64_t get_remove_replica_failures();
 
     // Batch Operation Statistics Getters
     int64_t get_batch_exist_key_requests();
@@ -265,6 +310,14 @@ class MasterMetricManager {
     int64_t get_batch_put_revoke_partial_successes();
     int64_t get_batch_put_revoke_items();
     int64_t get_batch_put_revoke_failed_items();
+    int64_t get_batch_remove_replica_requests();
+    int64_t get_batch_remove_replica_failures();
+    int64_t get_batch_remove_replica_partial_successes();
+    int64_t get_batch_remove_replica_items();
+    int64_t get_batch_remove_replica_failed_items();
+    int64_t get_batch_get_write_route_requests();
+    int64_t get_batch_get_write_route_failures();
+    int64_t get_batch_get_write_route_partial_successes();
 
     // Eviction Metrics
     // total eviction metrics
@@ -607,6 +660,27 @@ class MasterMetricManager {
     ylt::metric::counter_t nof_segments_unmounted_by_heartbeat_total_;
     ylt::metric::histogram_t nof_heartbeat_probe_latency_ms_;
 
+    // Client RPC Metrics (register/unregister requests + failures)
+    ylt::metric::counter_t register_client_requests_;
+    ylt::metric::counter_t register_client_failures_;
+    ylt::metric::counter_t unregister_client_requests_;
+    ylt::metric::counter_t unregister_client_failures_;
+
+    // Client Lifecycle Metrics
+    ylt::metric::counter_t clients_disconnected_total_;
+    ylt::metric::counter_t clients_recovered_total_;
+    ylt::metric::counter_t clients_crashed_total_;
+
+    // P2P-RPC Metrics
+    ylt::metric::counter_t heartbeat_requests_;
+    ylt::metric::counter_t heartbeat_failures_;
+    ylt::metric::counter_t get_write_route_requests_;
+    ylt::metric::counter_t get_write_route_failures_;
+    ylt::metric::counter_t add_replica_requests_;
+    ylt::metric::counter_t add_replica_failures_;
+    ylt::metric::counter_t remove_replica_requests_;
+    ylt::metric::counter_t remove_replica_failures_;
+
     // Batch Operation Statistics
     ylt::metric::counter_t batch_exist_key_requests_;
     ylt::metric::counter_t batch_exist_key_failures_;
@@ -643,6 +717,14 @@ class MasterMetricManager {
     ylt::metric::counter_t batch_put_revoke_partial_successes_;
     ylt::metric::counter_t batch_put_revoke_items_;
     ylt::metric::counter_t batch_put_revoke_failed_items_;
+    ylt::metric::counter_t batch_remove_replica_requests_;
+    ylt::metric::counter_t batch_remove_replica_failures_;
+    ylt::metric::counter_t batch_remove_replica_partial_successes_;
+    ylt::metric::counter_t batch_remove_replica_items_;
+    ylt::metric::counter_t batch_remove_replica_failed_items_;
+    ylt::metric::counter_t batch_get_write_route_requests_;
+    ylt::metric::counter_t batch_get_write_route_failures_;
+    ylt::metric::counter_t batch_get_write_route_partial_successes_;
 
     // Store-observed cache reuse statistics. These counters do not represent
     // end-to-end request/token-level cache hit ratio.

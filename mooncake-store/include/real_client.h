@@ -21,6 +21,8 @@
 #include "mutex.h"
 #include "utils.h"
 #include "rpc_types.h"
+#include "p2p/client/p2p_client_service.h"
+#include "p2p/client_config_builder.h"
 #if defined(USE_SUNRISE)
 #include "sunrise_allocator.h"
 #endif
@@ -103,6 +105,34 @@ class RealClient : public PyClient {
         // Real client does not support dummy setup
         return -1;
     };
+
+    // P2P mode support
+    int setup_p2p(const std::string& local_hostname,
+                  const std::string& metadata_server,
+                  const std::string& protocol,
+                  const std::string& device_names,
+                  const std::string& master_server_address,
+                  const std::string& tiered_backend_config,
+                  size_t local_buffer_size,
+                  const std::string& ipc_socket_path,
+                  uint16_t client_rpc_port,
+                  uint32_t rpc_thread_num,
+                  uint64_t lock_shard_count,
+                  size_t route_cache_max_memory,
+                  uint64_t route_cache_ttl_ms,
+                  const std::string& p2p_local_transfer_mode,
+                  size_t local_memcpy_async_worker_num,
+                  uint16_t http_port,
+                  bool enable_http_server,
+                  uint64_t async_sender_thread_count,
+                  uint64_t async_max_batch_size,
+                  uint64_t async_route_queue_size,
+                  uint64_t p2p_key_lease_duration_ms,
+                  uint64_t p2p_key_lease_scan_interval_ms,
+                  const std::string& p2p_transfer_direction_mode,
+                  const std::string& runtime_config,
+                  bool enable_metric_collection,
+                  uint32_t metric_report_interval_seconds);
 
     int initAll(const std::string &protocol, const std::string &device_name,
                 size_t mount_segment_size = 1024 * 1024 * 16);  // Default 16MB
@@ -331,6 +361,13 @@ class RealClient : public PyClient {
     int tearDownAll();
 
     int health_check() override;
+
+    // Rate-limited master reachability probe backing health_check().
+    // ClientService::is_ping_healthy only reflects the keepalive thread
+    // state, so an active probe is needed to detect master outages.
+    mutable std::mutex health_probe_mutex_;
+    std::chrono::steady_clock::time_point last_health_probe_time_{};
+    bool last_health_probe_ok_{true};
 
     /**
      * @brief Check if an object exists
@@ -587,8 +624,12 @@ class RealClient : public PyClient {
 
     tl::expected<RangedReadMetadata, ErrorCode>
     build_ranged_read_metadata_from_query_result(
+        const std::string &key, tl::expected<QueryResult, ErrorCode> query_result);
+
+    tl::expected<RangedReadMetadata, ErrorCode>
+    build_ranged_read_metadata_from_query_result(
         const std::string &key,
-        tl::expected<QueryResult, ErrorCode> query_result);
+        tl::expected<std::unique_ptr<QueryResult>, ErrorCode> query_result);
 
     tl::expected<RangedReadMetadata, ErrorCode> resolve_ranged_read_metadata(
         const std::string &key,

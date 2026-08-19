@@ -1,0 +1,391 @@
+#include "p2p/client_manager.h"
+#include "master_metric_manager.h"
+#include <glog/logging.h>
+
+namespace mooncake {
+
+ClientManager::ClientManager(const int64_t disconnect_timeout_sec,
+                             const int64_t crash_timeout_sec,
+                             const ViewVersionId view_version)
+    : view_version_(view_version) {
+    ClientMeta::SetTimeouts(disconnect_timeout_sec, crash_timeout_sec);
+}
+
+void ClientManager::Start() { StartClientMonitor(); }
+
+void ClientManager::StartClientMonitor() {
+    if (client_monitor_running_) return;
+    client_monitor_running_ = true;
+    client_monitor_thread_ = std::thread([this]() {
+        while (client_monitor_running_) {
+            std::this_thread::sleep_for(
+                std::chrono::milliseconds(kClientMonitorSleepMs));
+            if (client_monitor_running_) ClientMonitorFunc();
+        }
+    });
+    VLOG(1) << "action=start_client_monitor_thread";
+}
+
+void ClientManager::Stop() { StopClientMonitor(); }
+
+void ClientManager::StopClientMonitor() {
+    client_monitor_running_ = false;
+    if (client_monitor_thread_.joinable()) {
+        client_monitor_thread_.join();
+    }
+}
+
+ClientManager::~ClientManager() { Stop(); }
+
+auto ClientManager::GetClient(const UUID& client_id)
+    -> std::shared_ptr<ClientMeta> {
+    SharedMutexLocker lock(&clients_mutex_, shared_lock);
+    auto it = client_metas_.find(client_id);
+    if (it == client_metas_.end()) {
+        return nullptr;
+    }
+    return it->second;
+}
+
+std::vector<std::shared_ptr<ClientMeta>> ClientManager::GetAllClients() {
+    SharedMutexLocker lock(&clients_mutex_, shared_lock);
+    std::vector<std::shared_ptr<ClientMeta>> clients;
+    clients.reserve(client_metas_.size());
+    for (const auto& [id, meta] : client_metas_) {
+        clients.push_back(meta);
+    }
+    return clients;
+}
+
+std::unique_ptr<ClientIterator> ClientManager::InnerBuildClientIterator(
+    ObjectIterateStrategy strategy) {
+    switch (strategy) {
+        case ObjectIterateStrategy::ORDERED:
+            return std::make_unique<OrderedClientIterator>(client_metas_);
+        case ObjectIterateStrategy::RANDOM:
+            return std::make_unique<RandomClientIterator>(client_metas_);
+        default:
+            return nullptr;
+    }
+}
+
+auto ClientManager::ForEachClient(ObjectIterateStrategy strategy,
+                                  const ClientVisitor& visitor)
+    -> tl::expected<void, ErrorCode> {
+    SharedMutexLocker lock(&clients_mutex_, shared_lock);
+    auto iterator = InnerBuildClientIterator(strategy);
+    if (!iterator) {
+        LOG(WARNING) << "fail to get client iterator"
+                     << ", strategy=" << strategy;
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    while (auto client = iterator->Next()) {
+        auto ret = visitor(client);
+        if (!ret) {
+            LOG(WARNING) << "client visitor returned error"
+                         << ", strategy=" << strategy
+                         << ", client_id=" << client->get_client_id()
+                         << ", ret=" << ret.error();
+            return tl::make_unexpected(ret.error());
+        }
+        if (ret.value()) {
+            break;
+        }
+    }
+    return {};
+}
+
+tl::expected<std::vector<std::string>, ErrorCode>
+ClientManager::GetAllSegments() {
+    SharedMutexLocker lock(&clients_mutex_, shared_lock);
+    std::vector<std::string> all_segments;
+    for (const auto& [id, meta] : client_metas_) {
+        auto segments_res = meta->GetSegments();
+        if (!segments_res) {
+            LOG(WARNING) << "GetAllSegments: failed to get segments"
+                         << ", client_id=" << id
+                         << ", error=" << segments_res.error();
+            continue;
+        }
+        for (const auto& seg : segments_res.value()) {
+            all_segments.emplace_back(std::move(seg.name));
+        }
+    }
+    return all_segments;
+}
+
+tl::expected<std::vector<std::string>, ErrorCode>
+ClientManager::GetClientSegments(const UUID& client_id) {
+    SharedMutexLocker lock(&clients_mutex_, shared_lock);
+    auto it = client_metas_.find(client_id);
+    if (it == client_metas_.end()) {
+        LOG(WARNING) << "GetClientSegments: client not found"
+                     << ", client_id=" << client_id;
+        return tl::make_unexpected(ErrorCode::CLIENT_NOT_FOUND);
+    }
+    auto segments_res = it->second->GetSegments();
+    if (!segments_res) {
+        LOG(WARNING) << "GetClientSegments: failed to get segments"
+                     << ", client_id=" << client_id
+                     << ", error=" << segments_res.error();
+        return tl::make_unexpected(segments_res.error());
+    }
+    std::vector<std::string> segment_names;
+    segment_names.reserve(segments_res.value().size());
+    for (const auto& seg : segments_res.value()) {
+        segment_names.emplace_back(std::move(seg.name));
+    }
+    return segment_names;
+}
+
+tl::expected<std::pair<size_t, size_t>, ErrorCode> ClientManager::QuerySegments(
+    const std::string& segment) {
+    SharedMutexLocker lock(&clients_mutex_, shared_lock);
+    for (const auto& [id, meta] : client_metas_) {
+        auto ret = meta->QuerySegments(segment);
+        if (ret.has_value()) {
+            return ret;
+        } else if (ret.error() != ErrorCode::SEGMENT_NOT_FOUND) {
+            LOG(ERROR)
+                << "QuerySegments: failed to query segments for client_id="
+                << id << ", error=" << ret.error();
+            return ret;
+        }
+    }
+    LOG(WARNING) << "QuerySegments: segment not found"
+                 << ", segment=" << segment;
+    return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+}
+
+tl::expected<UUID, ErrorCode> ClientManager::GetClientIdBySegmentName(
+    const std::string& segment_name) {
+    SharedMutexLocker lock(&clients_mutex_, shared_lock);
+    for (const auto& [client_id, meta] : client_metas_) {
+        auto segs = meta->GetSegments();
+        if (!segs.has_value()) continue;
+        for (const auto& seg : segs.value()) {
+            if (seg.name == segment_name) return client_id;
+        }
+    }
+    LOG(WARNING) << "GetClientIdBySegmentName: segment not found"
+                 << ", segment_name=" << segment_name;
+    return tl::make_unexpected(ErrorCode::SEGMENT_NOT_FOUND);
+}
+
+tl::expected<std::vector<std::string>, ErrorCode> ClientManager::QueryIp(
+    const UUID& client_id) {
+    SharedMutexLocker lock(&clients_mutex_, shared_lock);
+    auto it = client_metas_.find(client_id);
+    if (it == client_metas_.end()) {
+        LOG(WARNING) << "QueryIp: client not found"
+                     << ", client_id=" << client_id;
+        return tl::make_unexpected(ErrorCode::CLIENT_NOT_FOUND);
+    }
+    return it->second->QueryIp(client_id);
+}
+
+tl::expected<std::shared_ptr<Segment>, ErrorCode> ClientManager::QuerySegment(
+    const UUID& client_id, const UUID& segment_id) {
+    SharedMutexLocker lock(&clients_mutex_, shared_lock);
+    auto it = client_metas_.find(client_id);
+    if (it == client_metas_.end()) {
+        LOG(WARNING) << "QuerySegment: client not found"
+                     << ", client_id=" << client_id;
+        return tl::make_unexpected(ErrorCode::CLIENT_NOT_FOUND);
+    }
+    return it->second->QuerySegment(segment_id);
+}
+
+void ClientManager::SetSegmentRemovalCallback(SegmentRemovalCallback cb) {
+    segment_removal_cb_ = std::move(cb);
+}
+
+auto ClientManager::RegisterClient(const RegisterClientRequest& req)
+    -> tl::expected<RegisterClientResponse, ErrorCode> {
+    if (req.deployment_mode != GetDeploymentMode()) {
+        LOG(ERROR) << "RegisterClient: architecture mismatch"
+                   << ", client_mode=" << static_cast<int>(req.deployment_mode)
+                   << ", master_mode=" << static_cast<int>(GetDeploymentMode())
+                   << ", client_id=" << req.client_id;
+        return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+    }
+
+    const auto& client_id = req.client_id;
+    {
+        SharedMutexLocker lock(&clients_mutex_, shared_lock);
+        auto it = client_metas_.find(client_id);
+        if (it != client_metas_.end()) {
+            LOG(WARNING) << "RegisterClient: client already exists"
+                         << ", client_id=" << client_id;
+            return tl::make_unexpected(ErrorCode::CLIENT_ALREADY_EXISTS);
+        }
+    }
+
+    if (auto valid = ValidateRegisterRequest(req); !valid) {
+        LOG(WARNING) << "RegisterClient: register request failed"
+                     << ", client_id=" << client_id;
+        return tl::make_unexpected(valid.error());
+    }
+
+    auto meta = CreateClientMeta(req);
+    if (segment_removal_cb_) {
+        meta->SetSegmentRemovalCallback(segment_removal_cb_);
+    }
+    for (const auto& segment : req.segments) {
+        auto result = meta->MountSegment(segment);
+        if (!result) {
+            LOG(ERROR) << "RegisterClient: failed to mount segment"
+                       << ", segment_name=" << segment.name
+                       << ", client_id=" << client_id
+                       << ", error=" << result.error();
+            return tl::make_unexpected(result.error());
+        }
+    }
+
+    OnClientRegistered(meta);
+
+    SharedMutexLocker lock(&clients_mutex_);
+    if (client_metas_.count(client_id)) {
+        LOG(WARNING)
+            << "RegisterClient: client already exists (lost registration race)"
+            << ", client_id=" << client_id;
+        return tl::make_unexpected(ErrorCode::CLIENT_ALREADY_EXISTS);
+    }
+    client_metas_[client_id] = std::move(meta);
+
+    MasterMetricManager::instance().inc_active_clients();
+
+    RegisterClientResponse response;
+    response.view_version = view_version_;
+
+    LOG(INFO) << "RegisterClient: client_id=" << client_id
+              << ", segments=" << req.segments.size()
+              << ", view_version=" << response.view_version;
+
+    return response;
+}
+
+auto ClientManager::UnregisterClient(const UnregisterClientRequest& req)
+    -> tl::expected<UnregisterClientResponse, ErrorCode> {
+    if (req.deployment_mode != GetDeploymentMode()) {
+        LOG(ERROR) << "UnregisterClient: architecture mismatch"
+                   << ", client_mode=" << static_cast<int>(req.deployment_mode)
+                   << ", master_mode=" << static_cast<int>(GetDeploymentMode())
+                   << ", client_id=" << req.client_id;
+        return tl::make_unexpected(ErrorCode::ILLEGAL_CLIENT);
+    }
+
+    const auto& client_id = req.client_id;
+    std::shared_ptr<ClientMeta> meta;
+    bool was_health = false;
+    {
+        SharedMutexLocker lock(&clients_mutex_);
+        auto it = client_metas_.find(client_id);
+        if (it == client_metas_.end()) {
+            UnregisterClientResponse response;
+            response.view_version = view_version_;
+            LOG(INFO) << "UnregisterClient: client not found (idempotent ok)"
+                      << ", client_id=" << client_id;
+            return response;
+        }
+        meta = std::move(it->second);
+        was_health =
+            (meta->get_health_state().status == P2PClientStatus::HEALTH);
+        client_metas_.erase(it);
+    }
+
+    meta->RecycleMeta();
+
+    if (was_health) {
+        MasterMetricManager::instance().dec_active_clients();
+    }
+
+    UnregisterClientResponse response;
+    response.view_version = view_version_;
+    LOG(INFO) << "UnregisterClient: client_id=" << client_id
+              << ", was_health=" << was_health;
+    return response;
+}
+
+auto ClientManager::Heartbeat(const HeartbeatRequest& req)
+    -> tl::expected<HeartbeatResponse, ErrorCode> {
+    const auto& client_id = req.client_id;
+    HeartbeatResponse response;
+    response.view_version = view_version_;
+
+    SharedMutexLocker lock(&clients_mutex_, shared_lock);
+    auto it = client_metas_.find(client_id);
+    if (it == client_metas_.end()) {
+        response.status = P2PClientStatus::UNDEFINED;
+        return response;
+    }
+
+    auto& meta = it->second;
+
+    auto [old_status, new_status] = meta->Heartbeat();
+    response.status = new_status;
+    if (new_status == P2PClientStatus::HEALTH) {
+        if (old_status != new_status) {
+            LOG(INFO) << "client recovered"
+                      << ", client_id=" << client_id;
+            meta->OnRecovered();
+        }
+        for (const auto& task : req.tasks) {
+            response.task_results.push_back(ProcessTask(client_id, task));
+        }
+    }
+
+    return response;
+}
+
+auto ClientManager::QueryClientStatus(const QueryClientStatusRequest& req)
+    -> tl::expected<QueryClientStatusResponse, ErrorCode> {
+    const auto& client_id = req.client_id;
+    QueryClientStatusResponse response;
+
+    SharedMutexLocker lock(&clients_mutex_, shared_lock);
+    auto it = client_metas_.find(client_id);
+    if (it == client_metas_.end()) {
+        response.status = P2PClientStatus::UNDEFINED;
+    } else {
+        response.status = it->second->get_health_state().status;
+    }
+
+    return response;
+}
+
+void ClientManager::ClientMonitorFunc() {
+    std::vector<std::shared_ptr<ClientMeta>> newly_disconnected;
+    std::vector<std::shared_ptr<ClientMeta>> newly_crashed;
+
+    {
+        SharedMutexLocker lock(&clients_mutex_, shared_lock);
+        for (auto& [client_id, meta] : client_metas_) {
+            auto [old_status, new_status] = meta->CheckHealth();
+            if (old_status != new_status) {
+                if (new_status == P2PClientStatus::DISCONNECTION) {
+                    newly_disconnected.push_back(meta);
+                } else if (new_status == P2PClientStatus::CRASHED) {
+                    newly_crashed.push_back(meta);
+                }
+            }
+        }
+    }
+
+    for (const auto& client : newly_disconnected) {
+        client->OnDisconnected();
+    }
+
+    for (const auto& client : newly_crashed) {
+        client->OnCrashed();
+    }
+
+    if (!newly_crashed.empty()) {
+        SharedMutexLocker lock(&clients_mutex_);
+        for (const auto& client : newly_crashed) {
+            client_metas_.erase(client->get_client_id());
+        }
+    }
+}
+
+}  // namespace mooncake

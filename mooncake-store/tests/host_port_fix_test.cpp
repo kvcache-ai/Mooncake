@@ -1,5 +1,6 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
+#include <csignal>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
 #include "common.h"

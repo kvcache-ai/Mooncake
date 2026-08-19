@@ -1,6 +1,6 @@
 #pragma once
 
-#include "client_service.h"
+#include "client_service_base.h"
 #include "client_buffer.h"
 #include "storage_backend.h"
 #include "pinned_buffer_pool.h"
@@ -11,7 +11,8 @@ struct SsdMetric;
 
 class FileStorage {
    public:
-    FileStorage(const FileStorageConfig& config, std::shared_ptr<Client> client,
+    FileStorage(const FileStorageConfig& config,
+                std::shared_ptr<ClientService> client,
                 const std::string& local_rpc_addr,
                 SsdMetric* ssd_metric = nullptr);
     ~FileStorage();
@@ -174,7 +175,7 @@ class FileStorage {
      */
     tl::expected<void, ErrorCode> ReRegisterOffloadedObjects();
 
-    std::shared_ptr<Client> client_;
+    std::shared_ptr<ClientService> client_;
     SsdMetric* ssd_metric_{nullptr};
     std::string local_rpc_addr_;
     // Pinned memory for GPU staging and SSD-to-GPU restores.

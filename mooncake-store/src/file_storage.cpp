@@ -65,6 +65,16 @@ bool GetEnvBoolStringOr(const char* name, bool default_value) {
         .value_or(default_value);
 }
 
+std::vector<std::string> OffloadTaskKeys(
+    const std::vector<OffloadTaskItem>& tasks) {
+    std::vector<std::string> keys;
+    keys.reserve(tasks.size());
+    for (const auto& task : tasks) {
+        keys.push_back(task.key);
+    }
+    return keys;
+}
+
 std::vector<OffloadTaskItem> BuildOffloadTasksFromStorageKeys(
     const std::vector<std::string>& storage_keys,
     const std::vector<StorageObjectMetadata>& metadatas) {
@@ -264,7 +274,7 @@ bool FileStorageConfig::Validate() const {
 }
 
 FileStorage::FileStorage(const FileStorageConfig& config,
-                         std::shared_ptr<Client> client,
+                         std::shared_ptr<ClientService> client,
                          const std::string& local_rpc_addr,
                          SsdMetric* ssd_metric)
     : config_(config),
@@ -284,8 +294,7 @@ FileStorage::FileStorage(const FileStorageConfig& config,
     if (config.pinned_restore_arena_size > 0) {
         if (config.use_uring) {
             LOG(WARNING) << "Pinned SSD restore is disabled with io_uring";
-        } else if (!client ||
-                   !client->CanUseLocalMemcpy(client->GetSegmentEndpoint())) {
+        } else if (!client || !client->CanUseLocalMemcpy()) {
             LOG(WARNING)
                 << "Pinned SSD restore is disabled: local memcpy unavailable";
         } else {
@@ -416,7 +425,8 @@ tl::expected<void, ErrorCode> FileStorage::Init() {
             }
             auto tasks = BuildOffloadTasksFromStorageKeys(keys, metadatas);
             auto add_object_result =
-                client_->NotifyOffloadSuccess(tasks, metadatas);
+                client_->NotifyOffloadSuccess(OffloadTaskKeys(tasks),
+                                              metadatas);
             if (!add_object_result) {
                 LOG(ERROR) << "Failed to add object to master: "
                            << add_object_result.error();
@@ -584,7 +594,8 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
             }
             tasks.push_back(it->second);
         }
-        auto result = client_->NotifyOffloadSuccess(tasks, metadatas);
+        auto result = client_->NotifyOffloadSuccess(OffloadTaskKeys(tasks),
+                                                    metadatas);
         if (!result) {
             LOG(ERROR) << "[OFFLOAD] NotifyOffloadSuccess failed with error: "
                        << result.error() << " keys count: " << keys.size();
@@ -773,8 +784,8 @@ tl::expected<void, ErrorCode> FileStorage::OffloadObjects(
         for (size_t i = 0; i < failed_tasks.size(); ++i) {
             failed_metadatas.push_back(StorageObjectMetadata{-1, 0, 0, -1, ""});
         }
-        auto result =
-            client_->NotifyOffloadSuccess(failed_tasks, failed_metadatas);
+        auto result = client_->NotifyOffloadSuccess(
+            OffloadTaskKeys(failed_tasks), failed_metadatas);
         if (!result) {
             LOG(WARNING) << "[OFFLOAD] NotifyOffloadSuccess for failed tasks "
                             "returned error: "
@@ -801,8 +812,9 @@ tl::expected<void, ErrorCode> FileStorage::NotifyEvictedDiskReplicas(
     }
 
     for (const auto& [tenant_id, keys] : keys_by_tenant) {
-        auto results = client_->BatchEvictDiskReplica(keys, tenant_id.value(),
-                                                      ReplicaType::LOCAL_DISK);
+        (void)tenant_id;
+        auto results =
+            client_->BatchEvictDiskReplica(keys, ReplicaType::LOCAL_DISK);
         if (results.size() != keys.size()) {
             LOG(ERROR) << "BatchEvictDiskReplica returned " << results.size()
                        << " result(s) for " << keys.size()
@@ -904,8 +916,18 @@ tl::expected<void, ErrorCode> FileStorage::Heartbeat() {
     {
         MutexLocker locker(&offloading_mutex_);
         auto fetch_offload_tasks = [&]() -> tl::expected<void, ErrorCode> {
-            return client_->OffloadObjectHeartbeat(enable_offloading_,
-                                                   offloading_objects);
+            auto heartbeat_result =
+                client_->OffloadObjectHeartbeat(enable_offloading_);
+            if (!heartbeat_result) {
+                return tl::unexpected(heartbeat_result.error());
+            }
+            offloading_objects.clear();
+            offloading_objects.reserve(heartbeat_result->size());
+            for (const auto& [key, size] : heartbeat_result.value()) {
+                offloading_objects.push_back(OffloadTaskItem{
+                    TenantId::Default().value(), key, size});
+            }
+            return {};
         };
         auto heartbeat_result = fetch_offload_tasks();
         if (!heartbeat_result) {
@@ -1068,7 +1090,7 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
         }
 
         auto alloc_result = client_->PromotionAllocStart(
-            key, tenant_id, static_cast<uint64_t>(size), preferred_segments);
+            key, static_cast<uint64_t>(size), preferred_segments);
         if (!alloc_result) {
             // AllocStart failed (typically NO_AVAILABLE_HANDLE under
             // DRAM pressure). No staged buffer to release, but the
@@ -1081,7 +1103,7 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
             VLOG(1) << "PromotionAllocStart failed for key=" << key
                     << ", error=" << alloc_result.error()
                     << " (likely no free DRAM); releasing master slot";
-            auto release = client_->NotifyPromotionFailure(key, tenant_id);
+            auto release = client_->NotifyPromotionFailure(key);
             if (!release) {
                 VLOG(1) << "Promotion: NotifyPromotionFailure failed for key="
                         << key << ", error=" << release.error()
@@ -1097,8 +1119,8 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
         // throttling or RDMA flakes saturate promotion_queue_limit_
         // for the full reaper TTL. NotifyPromotionFailure is
         // idempotent and best-effort — the reaper is the long-stop.
-        auto release_master_state = [this, &key, &tenant_id]() {
-            auto release = client_->NotifyPromotionFailure(key, tenant_id);
+        auto release_master_state = [this, &key]() {
+            auto release = client_->NotifyPromotionFailure(key);
             if (!release) {
                 VLOG(1) << "Promotion: NotifyPromotionFailure failed for key="
                         << key << ", error=" << release.error()
@@ -1150,7 +1172,7 @@ tl::expected<void, ErrorCode> FileStorage::ProcessPromotionTasks() {
 
         // (c) Commit. Master flips the PROCESSING replica to COMPLETE and it
         // becomes visible to readers.
-        auto notify_res = client_->NotifyPromotionSuccess(key, tenant_id);
+        auto notify_res = client_->NotifyPromotionSuccess(key);
         if (!notify_res) {
             // The write landed but the commit failed. We can't retry the
             // commit (the success path is one-shot via alloc_id), and we
@@ -1202,14 +1224,15 @@ tl::expected<void, ErrorCode> FileStorage::BatchLoad(
 tl::expected<void, ErrorCode> FileStorage::BatchQuerySegmentSlices(
     const std::vector<std::string>& keys, const std::string& tenant_id,
     std::unordered_map<std::string, std::vector<Slice>>& batched_slices) {
-    auto batched_query_results = client_->BatchQuery(keys, tenant_id);
+    (void)tenant_id;
+    auto batched_query_results = client_->BatchQuery(keys);
     if (batched_query_results.empty()) {
         return {};
     }
     for (size_t i = 0; i < batched_query_results.size(); ++i) {
         if (batched_query_results[i]) {
             for (const auto& descriptor :
-                 batched_query_results[i].value().replicas) {
+                 batched_query_results[i].value()->replicas) {
                 if (client_->IsReplicaOnLocalMemory(descriptor)) {
                     const auto& memory_descriptor =
                         descriptor.get_memory_descriptor();
@@ -1384,7 +1407,8 @@ tl::expected<void, ErrorCode> FileStorage::ReRegisterOffloadedObjects() {
                 }
                 auto tasks = BuildOffloadTasksFromStorageKeys(keys, metadatas);
                 auto add_object_result =
-                    client_->NotifyOffloadSuccess(tasks, metadatas);
+                    client_->NotifyOffloadSuccess(OffloadTaskKeys(tasks),
+                                                  metadatas);
                 if (!add_object_result) {
                     total_failures++;
                     LOG(ERROR)

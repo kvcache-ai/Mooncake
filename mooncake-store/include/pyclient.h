@@ -11,11 +11,13 @@
 #include <unordered_map>
 #include <vector>
 
-#include "client_service.h"
+#include "client_service_base.h"
 #include "client_buffer.h"
 #include "mutex.h"
 #include "utils.h"
 #include "file_storage.h"
+#include <ylt/coro_io/coro_io.hpp>
+#include <ylt/coro_rpc/coro_rpc_client.hpp>
 
 namespace mooncake {
 
@@ -429,7 +431,7 @@ class PyClient {
         return client_buffer_allocator_->allocate(size);
     }
 
-    std::shared_ptr<mooncake::Client> client_ = nullptr;
+    std::shared_ptr<mooncake::ClientService> client_ = nullptr;
     std::shared_ptr<mooncake::ClientRequester> client_requester_ = nullptr;
     std::shared_ptr<mooncake::FileStorage> file_storage_ = nullptr;
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_ = nullptr;

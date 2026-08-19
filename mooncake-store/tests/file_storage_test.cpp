@@ -155,7 +155,7 @@ class FileStorageTest : public ::testing::Test {
             auto query_result = fileStorage.client_->Query(key);
             ASSERT_TRUE(query_result.has_value());
             bool has_local_disk_replica = false;
-            for (const auto& replica : query_result->replicas) {
+            for (const auto& replica : (*query_result)->replicas) {
                 has_local_disk_replica |= replica.is_local_disk_replica();
             }
             EXPECT_TRUE(has_local_disk_replica);
@@ -456,8 +456,13 @@ TEST_F(FileStorageTest, HeartbeatRunsDiskWatermarkEvictionWithoutOffloadWork) {
 
     std::string local_rpc_addr =
         "127.0.0.1:" + std::to_string(getFreeTcpPort());
-    auto client = Client::Create(local_rpc_addr, master.metadata_url(), "tcp",
-                                 std::nullopt, master.master_address());
+    auto client_config = ClientConfigBuilder::build_centralized_real_client(
+        local_rpc_addr, master.metadata_url(), "tcp", std::nullopt,
+        master.master_address(),
+        /*global_segment_size=*/0, /*local_buffer_size=*/0, nullptr,
+        /*ipc_socket_path=*/"", /*enable_offload=*/true,
+        /*http_port=*/0, /*enable_http_server=*/false);
+    auto client = ClientService::Create(client_config);
     ASSERT_TRUE(client.has_value());
     auto mount_result = client.value()->MountLocalDiskSegment(true);
     ASSERT_TRUE(mount_result.has_value())
@@ -502,8 +507,13 @@ TEST_F(FileStorageTest, NotifyEvictedDiskReplicasUsesTenantScopedKeys) {
 
     std::string local_rpc_addr =
         "127.0.0.1:" + std::to_string(getFreeTcpPort());
-    auto client = Client::Create(local_rpc_addr, master.metadata_url(), "tcp",
-                                 std::nullopt, master.master_address());
+    auto client_config = ClientConfigBuilder::build_centralized_real_client(
+        local_rpc_addr, master.metadata_url(), "tcp", std::nullopt,
+        master.master_address(),
+        /*global_segment_size=*/0, /*local_buffer_size=*/0, nullptr,
+        /*ipc_socket_path=*/"", /*enable_offload=*/true,
+        /*http_port=*/0, /*enable_http_server=*/false);
+    auto client = ClientService::Create(client_config);
     ASSERT_TRUE(client.has_value());
     auto mount_result = client.value()->MountLocalDiskSegment(true);
     ASSERT_TRUE(mount_result.has_value())
@@ -531,14 +541,19 @@ TEST_F(FileStorageTest, NotifyEvictedDiskReplicasUsesTenantScopedKeys) {
             .transport_endpoint = local_rpc_addr,
         });
     }
-    ASSERT_TRUE(client.value()->NotifyOffloadSuccess(tasks, metadatas));
+    std::vector<std::string> task_keys;
+    task_keys.reserve(tasks.size());
+    for (const auto& task : tasks) {
+        task_keys.push_back(task.key);
+    }
+    ASSERT_TRUE(client.value()->NotifyOffloadSuccess(task_keys, metadatas));
 
     for (const auto& task : tasks) {
-        auto before = client.value()->BatchQuery({key}, task.tenant_id);
+        auto before = client.value()->BatchQuery({key});
         ASSERT_EQ(before.size(), 1);
         ASSERT_TRUE(before[0].has_value());
         bool has_local_disk_replica = false;
-        for (const auto& replica : before[0]->replicas) {
+        for (const auto& replica : (*before[0])->replicas) {
             has_local_disk_replica |= replica.is_local_disk_replica();
         }
         ASSERT_TRUE(has_local_disk_replica);
@@ -550,7 +565,7 @@ TEST_F(FileStorageTest, NotifyEvictedDiskReplicasUsesTenantScopedKeys) {
     ASSERT_TRUE(notify_result.has_value());
 
     for (const auto& task : tasks) {
-        auto after = client.value()->BatchQuery({key}, task.tenant_id);
+        auto after = client.value()->BatchQuery({key});
         ASSERT_EQ(after.size(), 1);
         ASSERT_FALSE(after[0].has_value());
         EXPECT_EQ(after[0].error(), ErrorCode::OBJECT_NOT_FOUND);

@@ -97,6 +97,8 @@ Result execute_timed_operation(Operation&& operation, SuccessFn&& success_fn,
 
 enum class TransferOperationKind { kRead, kWrite };
 
+std::string format_latency_summary(ylt::metric::histogram_t& hist);
+
 struct TransferMetric {
     TransferMetric(std::map<std::string, std::string> labels = {})
         : total_read_bytes("mooncake_transfer_read_bytes", "Total bytes read",
@@ -169,67 +171,59 @@ struct TransferMetric {
             std::chrono::steady_clock::now() - start_time_);
         return std::max(elapsed.count(), 1e-9);
     }
-
-    std::string format_latency_summary(ylt::metric::histogram_t& hist) {
-        // Access the internal sum and bucket counts
-        auto sum_ptr =
-            const_cast<ylt::metric::histogram_t&>(hist).get_bucket_counts();
-        if (sum_ptr.empty()) {
-            return "No data";
-        }
-
-        // Calculate total count from all buckets
-        int64_t total_count = 0;
-        for (auto& bucket : sum_ptr) {
-            total_count += bucket->value();
-        }
-
-        if (total_count == 0) {
-            return "No data";
-        }
-
-        // Get sum from the histogram's internal sum gauge
-        // Note: We need to access the private sum_ member, which requires
-        // friendship or reflection For now, let's use a simpler approach
-        // showing just count
-        std::stringstream ss;
-        ss << "count=" << total_count;
-
-        // Find P95
-        int64_t p95_target = (total_count * 95) / 100;
-        int64_t cumulative = 0;
-        double p95_bucket = 0;
-
-        for (size_t i = 0; i < sum_ptr.size() && i < kLatencyBucket.size();
-             i++) {
-            cumulative += sum_ptr[i]->value();
-            if (cumulative >= p95_target && p95_bucket == 0) {
-                p95_bucket = kLatencyBucket[i];
-                break;
-            }
-        }
-
-        if (p95_bucket > 0) {
-            ss << ", p95<" << p95_bucket << "μs";
-        }
-
-        // Find max bucket (highest bucket with data)
-        double max_bucket = 0;
-        for (size_t i = sum_ptr.size(); i > 0; i--) {
-            size_t idx = i - 1;
-            if (idx < kLatencyBucket.size() && sum_ptr[idx]->value() > 0) {
-                max_bucket = kLatencyBucket[idx];
-                break;
-            }
-        }
-
-        if (max_bucket > 0) {
-            ss << ", max<" << max_bucket << "μs";
-        }
-
-        return ss.str();
-    }
 };
+
+inline std::string format_latency_summary(ylt::metric::histogram_t& hist) {
+    auto sum_ptr =
+        const_cast<ylt::metric::histogram_t&>(hist).get_bucket_counts();
+    if (sum_ptr.empty()) {
+        return "No data";
+    }
+
+    int64_t total_count = 0;
+    for (auto& bucket : sum_ptr) {
+        total_count += bucket->value();
+    }
+
+    if (total_count == 0) {
+        return "No data";
+    }
+
+    std::stringstream ss;
+    ss << "count=" << total_count;
+
+    int64_t p95_target = (total_count * 95) / 100;
+    int64_t cumulative = 0;
+    double p95_bucket = 0;
+
+    for (size_t i = 0; i < sum_ptr.size() && i < kLatencyBucket.size();
+         i++) {
+        cumulative += sum_ptr[i]->value();
+        if (cumulative >= p95_target && p95_bucket == 0) {
+            p95_bucket = kLatencyBucket[i];
+            break;
+        }
+    }
+
+    if (p95_bucket > 0) {
+        ss << ", p95<" << p95_bucket << "μs";
+    }
+
+    double max_bucket = 0;
+    for (size_t i = sum_ptr.size(); i > 0; i--) {
+        size_t idx = i - 1;
+        if (idx < kLatencyBucket.size() && sum_ptr[idx]->value() > 0) {
+            max_bucket = kLatencyBucket[idx];
+            break;
+        }
+    }
+
+    if (max_bucket > 0) {
+        ss << ", max<" << max_bucket << "μs";
+    }
+
+    return ss.str();
+}
 
 struct MasterClientMetric {
     std::array<std::string, 1> rpc_names = {"rpc_name"};
@@ -691,6 +685,9 @@ struct ClientMetric {
                           bool master_rpc_metrics_enabled = true);
     ~ClientMetric();
 
+   void StartMetricsReportingThread();
+    void StopMetricsReportingThread();
+
    private:
     struct TransferSnapshot {
         uint64_t read_bytes;
@@ -707,8 +704,6 @@ struct ClientMetric {
     std::mutex snapshot_mutex_;
     std::optional<TransferSnapshot> last_report_snapshot_;
 
-    void StartMetricsReportingThread();
-    void StopMetricsReportingThread();
     std::string BuildBandwidthReport();
 };
 };  // namespace mooncake

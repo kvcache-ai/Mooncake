@@ -10,8 +10,8 @@
 #include <set>
 #include <thread>
 
-#include "client_service.h"
 #include "file_storage.h"
+#include "p2p/client/centralized_client_service.h"
 #include "storage_backend.h"
 
 namespace mooncake {
@@ -21,13 +21,15 @@ namespace fs_test {
 // Programmable fake. Each Set* method records what the next call should
 // return; the call itself records that it happened so tests can assert on
 // invocation count and ordering.
-class FakeClient : public Client {
+class FakeClient : public CentralizedClientService {
    public:
     FakeClient()
-        : Client(/*local_hostname=*/"localhost:9003",
-                 /*metadata_connstring=*/"",
-                 /*protocol=*/"tcp",
-                 /*labels=*/{}) {}
+        : CentralizedClientService(/*metadata_connstring=*/"",
+                                   /*protocol=*/"tcp",
+                                   /*http_port=*/0,
+                                   /*enable_http_server=*/false,
+                                   /*labels=*/{},
+                                   /*enable_metric_collection=*/false) {}
 
     // Drives the queue returned to the heartbeat caller.
     std::vector<PromotionTaskItem> heartbeat_queue;
@@ -65,13 +67,6 @@ class FakeClient : public Client {
     tl::expected<PromotionAllocStartResponse, ErrorCode> PromotionAllocStart(
         const std::string& key, uint64_t size,
         const std::vector<std::string>& preferred_segments) override {
-        return PromotionAllocStart(key, "default", size, preferred_segments);
-    }
-
-    tl::expected<PromotionAllocStartResponse, ErrorCode> PromotionAllocStart(
-        const std::string& key, const std::string& tenant_id, uint64_t size,
-        const std::vector<std::string>& preferred_segments) override {
-        (void)tenant_id;
         (void)size;
         (void)preferred_segments;
         alloc_calls.fetch_add(1);
@@ -106,12 +101,6 @@ class FakeClient : public Client {
 
     tl::expected<void, ErrorCode> NotifyPromotionSuccess(
         const std::string& key) override {
-        return NotifyPromotionSuccess(key, "default");
-    }
-
-    tl::expected<void, ErrorCode> NotifyPromotionSuccess(
-        const std::string& key, const std::string& tenant_id) override {
-        (void)tenant_id;
         notify_calls.fetch_add(1);
         notify_keys.push_back(key);
         auto it = notify_overrides.find(key);
@@ -129,12 +118,6 @@ class FakeClient : public Client {
     // notify the master.
     tl::expected<void, ErrorCode> NotifyPromotionFailure(
         const std::string& key) override {
-        return NotifyPromotionFailure(key, "default");
-    }
-
-    tl::expected<void, ErrorCode> NotifyPromotionFailure(
-        const std::string& key, const std::string& tenant_id) override {
-        (void)tenant_id;
         notify_failure_calls.fetch_add(1);
         notify_failure_keys.push_back(key);
         return {};

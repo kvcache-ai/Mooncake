@@ -29,7 +29,8 @@ target_link_libraries(file_interface_bench PRIVATE mooncake_store glog::glog)
 add_executable(storage_backend_bench storage_backend_bench.cpp)
 target_link_libraries(
   storage_backend_bench PRIVATE mooncake_store cachelib_memory_allocator
-                                gflags::gflags glog::glog pthread)
+                                gflags::gflags glog::glog pthread
+                                JsonCpp::JsonCpp)
 
 # Add allocation strategy benchmark executable
 # This benchmark tests AllocationStrategy performance with configurable

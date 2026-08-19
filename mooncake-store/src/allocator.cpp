@@ -87,12 +87,14 @@ std::ostream& operator<<(std::ostream& os, const AllocatedBuffer& buffer) {
 CachelibBufferAllocator::CachelibBufferAllocator(std::string segment_name,
                                                  size_t base, size_t size,
                                                  std::string transport_endpoint,
+                                                 const UUID& segment_id,
                                                  ReplicaType replica_type)
     : segment_name_(segment_name),
       base_(base),
       total_size_(size),
       cur_size_(0),
       transport_endpoint_(std::move(transport_endpoint)),
+      segment_id_(segment_id),
       replica_type_(replica_type) {
     VLOG(1) << "initializing_buffer_allocator segment_name=" << segment_name
             << " base_address=" << reinterpret_cast<void*>(base)
@@ -210,7 +212,7 @@ std::optional<RestoredCachelibBufferAllocator> RestoreCachelibBufferAllocator(
     std::string segment_name, size_t base, size_t size,
     std::string transport_endpoint,
     const std::vector<AllocatedBuffer::Descriptor>& descriptors,
-    ReplicaType replica_type) {
+    ReplicaType replica_type, const UUID& segment_id) {
     if (replica_type != ReplicaType::MEMORY ||
         base % facebook::cachelib::Slab::kSize != 0 ||
         size < facebook::cachelib::Slab::kSize ||
@@ -236,7 +238,8 @@ std::optional<RestoredCachelibBufferAllocator> RestoreCachelibBufferAllocator(
     }
 
     auto allocator = std::make_shared<CachelibBufferAllocator>(
-        std::move(segment_name), base, size, transport_endpoint, replica_type);
+        std::move(segment_name), base, size, transport_endpoint, segment_id,
+        replica_type);
     if (!allocator->memory_allocator_->importAllocations(allocator->pool_id_,
                                                          imports)) {
         return std::nullopt;
@@ -255,12 +258,14 @@ std::optional<RestoredCachelibBufferAllocator> RestoreCachelibBufferAllocator(
 OffsetBufferAllocator::OffsetBufferAllocator(std::string segment_name,
                                              size_t base, size_t size,
                                              std::string transport_endpoint,
+                                             const UUID& segment_id,
                                              ReplicaType replica_type)
     : segment_name_(segment_name),
       base_(base),
       total_size_(size),
       cur_size_(0),
       transport_endpoint_(std::move(transport_endpoint)),
+      segment_id_(segment_id),
       replica_type_(replica_type) {
     VLOG(1) << "initializing_offset_buffer_allocator segment_name="
             << segment_name << " base_address=" << reinterpret_cast<void*>(base)
@@ -396,13 +401,14 @@ std::optional<RestoredOffsetBufferAllocator> RestoreOffsetBufferAllocator(
     std::string segment_name, size_t base, size_t size,
     std::string transport_endpoint,
     const std::vector<AllocatedBuffer::Descriptor>& descriptors,
-    ReplicaType replica_type) {
+    ReplicaType replica_type, const UUID& segment_id) {
     if (base > std::numeric_limits<size_t>::max() - size) {
         return std::nullopt;
     }
     const size_t end = base + size;
     auto allocator = std::make_shared<OffsetBufferAllocator>(
-        std::move(segment_name), base, size, transport_endpoint, replica_type);
+        std::move(segment_name), base, size, transport_endpoint, segment_id,
+        replica_type);
     const auto offset_allocator = allocator->getOffsetAllocator();
 
     std::vector<size_t> order(descriptors.size());

@@ -34,6 +34,7 @@ set(MOONCAKE_STORE_SOURCES
     shm_helper.cpp
     http_metadata_server.cpp
     file_storage.cpp
+    replica.cpp
     serialize/serializer.cpp
     storage/distributed/dfs_global_allocator.cpp
     storage/distributed/distributed_storage_backend.cpp
@@ -79,7 +80,54 @@ set(MOONCAKE_STORE_SOURCES
     store_c.cpp
     memory_alloc.cpp
     ssd_register_client.cpp
-    engram/engram_store.cpp)
+    engram/engram_store.cpp
+    p2p/client/p2p_client_service.cpp
+    p2p/p2p_client_metric.cpp
+    p2p/p2p_segment_manager.cpp
+    p2p/client_meta.cpp
+    p2p/p2p_client_meta.cpp
+    p2p/client_manager.cpp
+    p2p/p2p_client_manager.cpp
+    p2p/p2p_master_service.cpp
+    p2p/p2p_rpc_service.cpp
+    p2p/p2p_master_client.cpp
+    p2p/peer_client.cpp
+    p2p/client_rpc_service.cpp
+    p2p/route_cache.cpp
+    p2p/async_metadata_notifier.cpp
+    p2p/ha_recovery_manager.cpp
+    p2p/data_manager.cpp
+    p2p/async_memcpy_executor.cpp
+    p2p/tiered_cache/tiers/dram_tier.cpp
+    p2p/tiered_cache/tiers/storage_tier.cpp
+    p2p/tiered_cache/scheduler/simple_policy.cpp
+    p2p/tiered_cache/scheduler/lru_policy.cpp
+    p2p/tiered_cache/scheduler/client_scheduler.cpp
+    p2p/tiered_cache/scheduler/scheduler_factory.cpp
+    p2p/tiered_cache/event_driven_scheduler/multi_lru_stats_collector.cpp
+    p2p/tiered_cache/event_driven_scheduler/multi_lru_policy.cpp
+    p2p/tiered_cache/event_driven_scheduler/event_driven_client_scheduler.cpp
+    p2p/tiered_cache/copier_registry.cpp
+    p2p/tiered_cache/data_copier.cpp
+    p2p/tiered_cache/tiered_backend.cpp
+    p2p/p2p_ha_metric_manager.cpp
+    p2p/p2p_standby_state_machine.cpp
+    p2p/ha/oplog/p2p_oplog_applier_base.cpp
+    p2p/ha/oplog/oplog_manager.cpp
+    p2p/ha/oplog/oplog_replicator.cpp
+    p2p/ha/oplog/oplog_serializer.cpp
+    p2p/ha/oplog/oplog_store_factory.cpp
+    p2p/ha/oplog/localfs_oplog_store.cpp
+    p2p/ha/oplog/polling_oplog_change_notifier.cpp
+    p2p/ha/oplog/p2p_oplog_applier.cpp
+    p2p/ha/oplog/p2p_oplog_types.cpp
+    p2p/ha/oplog/p2p_standby_metadata_store.cpp
+    p2p/ha/oplog/p2p_standby_snapshot_service.cpp
+    p2p/ha/oplog/p2p_hot_standby_service.cpp
+    client_service_base.cpp
+    runtime_config_store.cpp
+    ha_helper.cpp
+    p2p/client/centralized_client_service.cpp)
 
 set(EXTRA_LIBS "")
 set(SPDK_STATIC_LIBS "")
@@ -186,6 +234,9 @@ else()
 endif()
 
 if(STORE_USE_REDIS)
+  list(APPEND MOONCAKE_STORE_SOURCES p2p/ha/oplog/redis_oplog_store.cpp)
+  list(APPEND MOONCAKE_STORE_SOURCES p2p/redis_election_helper.cpp)
+  list(APPEND MOONCAKE_STORE_SOURCES p2p/redis_master_view_helper.cpp)
   list(APPEND EXTRA_LIBS ${MOONCAKE_STORE_HIREDIS_LIBRARY})
 endif()
 
@@ -281,6 +332,12 @@ endif()
 # The cache_allocator library
 include_directories(${Python3_INCLUDE_DIRS})
 add_library(mooncake_store ${MOONCAKE_STORE_SOURCES})
+
+if(USE_ASCEND_CACHE_TIER)
+    target_sources(mooncake_store PRIVATE
+        p2p/tiered_cache/tiers/ascend_tier.cpp
+    )
+endif()
 if(KV_EVENTS_ZMQ_FOUND)
   target_compile_definitions(mooncake_store PRIVATE MOONCAKE_ENABLE_KV_EVENTS=1)
 endif()

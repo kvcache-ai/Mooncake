@@ -17,6 +17,17 @@
 
 namespace mooncake {
 
+struct StringHash {
+    using is_transparent = void;
+    size_t operator()(std::string_view sv) const noexcept {
+        return std::hash<std::string_view>{}(sv);
+    }
+};
+
+inline bool IsZeroUUID(const UUID& uuid) {
+    return uuid.first == 0 && uuid.second == 0;
+}
+
 // Convert ErrorCode to integer for Python bindings
 template <class T>
 constexpr bool is_supported_return_type_v =
@@ -481,4 +492,6 @@ std::string ResolveMooncakeHostId(const std::string& local_hostname);
 std::string ResolvePathFromKey(const std::string& key,
                                const std::string& root_dir,
                                const std::string& fsdir);
+
+// getHostNameWithoutPort is provided by common.h (static inline)
 }  // namespace mooncake

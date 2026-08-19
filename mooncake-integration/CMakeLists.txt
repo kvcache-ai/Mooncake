@@ -12,6 +12,8 @@ endif()
 
 if(WITH_STORE)
   include_directories("../mooncake-store/include")
+  include_directories("../mooncake-store/include/p2p")
+  include_directories("../mooncake-store/include/p2p/client")
   include_directories("../mooncake-store/include/cachelib_memory_allocator")
   include_directories("../mooncake-store/include/engram")
 
@@ -207,8 +209,8 @@ endif()
 
 if(WITH_TE)
   install(TARGETS engine DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
-  install(TARGETS asio_shared
-          DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
+  # install(TARGETS asio_shared
+  #         DESTINATION ${PYTHON_SYS_PATH}/${PYTHON_PACKAGE_NAME})
 endif()
 
 if(WITH_EP)

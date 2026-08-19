@@ -2238,7 +2238,7 @@ PYBIND11_MODULE(store, m) {
             py::arg("enable_client_http_server") = false,
             py::arg("client_http_port") = DEFAULT_CLIENT_HTTP_PORT)
         .def(
-            "setup",
+             "setup",
             [](MooncakeStorePyWrapper &self, const py::dict &config_dict) {
                 auto real_client = self.init_real_client();
 
@@ -2250,6 +2250,83 @@ PYBIND11_MODULE(store, m) {
                     config[key] = value;
                 }
 
+                // Unified entry: dispatch on deployment_mode.
+                // "P2P" -> setup_p2p path; anything else -> centralized.
+                auto get_str = [&config](const char *key,
+                                         const std::string &def = "") {
+                    auto it = config.find(key);
+                    return it != config.end() ? it->second : def;
+                };
+                auto get_size = [&config](const char *key,
+                                          size_t def) -> size_t {
+                    auto it = config.find(key);
+                    if (it == config.end() || it->second.empty()) return def;
+                    try {
+                        return static_cast<size_t>(
+                            std::stoull(it->second));
+                    } catch (...) {
+                        return def;
+                    }
+                };
+                auto get_double = [&config](const char *key,
+                                            double def) -> double {
+                    auto it = config.find(key);
+                    if (it == config.end() || it->second.empty()) return def;
+                    try {
+                        return std::stod(it->second);
+                    } catch (...) {
+                        return def;
+                    }
+                };
+                auto get_bool = [&config](const char *key, bool def) -> bool {
+                    auto it = config.find(key);
+                    if (it == config.end() || it->second.empty()) return def;
+                    return it->second == "true" || it->second == "True" ||
+                           it->second == "1";
+                };
+
+                const std::string deployment_mode =
+                    get_str("deployment_mode", "Centralization");
+                if (deployment_mode == "P2P") {
+                    int ret = real_client->setup_p2p(
+                        get_str("local_hostname"),
+                        get_str("metadata_server"),
+                        get_str("protocol", "tcp"),
+                        get_str("rdma_devices"),
+                        get_str("master_server_addr",
+                                "127.0.0.1:50051"),
+                        get_str("tiered_backend_config"),
+                        get_size("local_buffer_size",
+                                 1024 * 1024 * 16),
+                        get_str("ipc_socket_path"),
+                        static_cast<uint16_t>(
+                            get_size("client_rpc_port", 12345)),
+                        static_cast<uint32_t>(
+                            get_size("rpc_thread_num", 16)),
+                        get_size("lock_shard_count", 1024),
+                        static_cast<size_t>(get_double(
+                            "route_cache_max_memory",
+                            300.0 * 1024 * 1024)),
+                        get_size("route_cache_ttl_ms", 60000),
+                        get_str("p2p_local_transfer_mode", "te"),
+                        get_size("local_memcpy_async_worker_num", 32),
+                        static_cast<uint16_t>(get_size(
+                            "client_http_port", 9003)),
+                        get_bool("enable_client_http_server", true),
+                        get_size("async_sender_thread_count", 4),
+                        get_size("async_max_batch_size", 2000),
+                        get_size("async_route_queue_size", 0),
+                        get_size("p2p_key_lease_duration_ms", 0),
+                        get_size("p2p_key_lease_scan_interval_ms", 0),
+                        get_str("p2p_transfer_direction_mode",
+                                "reverse"),
+                        get_str("runtime_config"),
+                        get_bool("enable_metric_collection", true),
+                        static_cast<uint32_t>(get_size(
+                            "metric_report_interval_seconds", 5)));
+                    return ret;
+                }
+
                 auto result = real_client->setup_internal(config);
                 return result.has_value() ? 0
                                           : static_cast<int>(result.error());
@@ -2257,6 +2334,7 @@ PYBIND11_MODULE(store, m) {
             py::arg("config"),
             "Setup the store with a configuration dictionary.\n"
             "Supported keys:\n"
+            "  deployment_mode: 'Centralization' (default) or 'P2P'.\n"
             "  local_hostname (required): Local hostname.\n"
             "  metadata_server (required): Metadata server address.\n"
             "  global_segment_size: Global segment size (default 16MB).\n"
@@ -2271,7 +2349,89 @@ PYBIND11_MODULE(store, m) {
             "  tenant_id: Tenant identifier (default 'default').\n"
             "  enable_client_http_server: Enable client HTTP endpoints "
             "(default false).\n"
-            "  client_http_port: Client HTTP metrics port (default 9300).")
+            "  client_http_port: Client HTTP metrics port (default 9300).\n"
+            "P2P mode additionally supports: tiered_backend_config, "
+            "client_rpc_port,\n"
+            "  rpc_thread_num, lock_shard_count, route_cache_max_memory, "
+            "route_cache_ttl_ms,\n"
+            "  p2p_local_transfer_mode, local_memcpy_async_worker_num, "
+            "async_sender_thread_count,\n"
+            "  async_max_batch_size, async_route_queue_size, "
+            "p2p_key_lease_duration_ms,\n"
+            "  p2p_key_lease_scan_interval_ms, "
+            "p2p_transfer_direction_mode, runtime_config,\n"
+            "  enable_metric_collection, metric_report_interval_seconds.")
+        .def(
+            "setup_p2p",
+            [](MooncakeStorePyWrapper &self,
+               const std::string &local_hostname,
+               const std::string &metadata_server,
+               const std::string &protocol = "tcp",
+               const std::string &device_names = "",
+               const std::string &master_server_address = "127.0.0.1:50051",
+               const std::string &tiered_backend_config = "",
+               size_t local_buffer_size = 1024 * 1024 * 16,
+               const std::string &ipc_socket_path = "",
+               uint16_t client_rpc_port = 12345,
+               uint32_t rpc_thread_num = 16,
+               uint64_t lock_shard_count = 1024,
+               size_t route_cache_max_memory = 300 * 1024 * 1024,
+               uint64_t route_cache_ttl_ms = 60000,
+               const std::string &p2p_local_transfer_mode = "te",
+               size_t local_memcpy_async_worker_num = 32,
+               uint16_t http_port = 9003,
+               bool enable_http_server = true,
+               uint64_t async_sender_thread_count = 4,
+               uint64_t async_max_batch_size = 2000,
+               uint64_t async_route_queue_size = 0,
+               uint64_t p2p_key_lease_duration_ms = 0,
+               uint64_t p2p_key_lease_scan_interval_ms = 0,
+               const std::string &p2p_transfer_direction_mode = "reverse",
+               const std::string &runtime_config = "",
+               bool enable_metric_collection = true,
+               uint32_t metric_report_interval_seconds = 5) {
+                auto real_client = self.init_real_client();
+                return real_client->setup_p2p(
+                    local_hostname, metadata_server, protocol, device_names,
+                    master_server_address, tiered_backend_config,
+                    local_buffer_size, ipc_socket_path,
+                    client_rpc_port, rpc_thread_num, lock_shard_count,
+                    route_cache_max_memory, route_cache_ttl_ms,
+                    p2p_local_transfer_mode, local_memcpy_async_worker_num,
+                    http_port, enable_http_server,
+                    async_sender_thread_count, async_max_batch_size,
+                    async_route_queue_size, p2p_key_lease_duration_ms,
+                    p2p_key_lease_scan_interval_ms, p2p_transfer_direction_mode,
+                    runtime_config, enable_metric_collection,
+                    metric_report_interval_seconds);
+            },
+            py::arg("local_hostname"),
+            py::arg("metadata_server"),
+            py::arg("protocol") = "tcp",
+            py::arg("device_names") = "",
+            py::arg("master_server_address") = "127.0.0.1:50051",
+            py::arg("tiered_backend_config") = "",
+            py::arg("local_buffer_size") = 1024 * 1024 * 16,
+            py::arg("ipc_socket_path") = "",
+            py::arg("client_rpc_port") = 12345,
+            py::arg("rpc_thread_num") = 16,
+            py::arg("lock_shard_count") = 1024,
+            py::arg("route_cache_max_memory") = 300 * 1024 * 1024,
+            py::arg("route_cache_ttl_ms") = 60000,
+            py::arg("p2p_local_transfer_mode") = "te",
+            py::arg("local_memcpy_async_worker_num") = 32,
+            py::arg("http_port") = 9003,
+            py::arg("enable_http_server") = true,
+            py::arg("async_sender_thread_count") = 4,
+            py::arg("async_max_batch_size") = 2000,
+            py::arg("async_route_queue_size") = 0,
+            py::arg("p2p_key_lease_duration_ms") = 0,
+            py::arg("p2p_key_lease_scan_interval_ms") = 0,
+            py::arg("p2p_transfer_direction_mode") = "reverse",
+            py::arg("runtime_config") = "",
+            py::arg("enable_metric_collection") = true,
+            py::arg("metric_report_interval_seconds") = 5,
+            "Setup the store in P2P mode.")
         .def(
             "setup_dummy",
             [](MooncakeStorePyWrapper &self, size_t mem_pool_size,

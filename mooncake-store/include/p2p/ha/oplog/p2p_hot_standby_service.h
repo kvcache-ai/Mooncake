@@ -1,0 +1,152 @@
+// mooncake-store/include/ha/oplog/p2p_hot_standby_service.h
+#pragma once
+
+#include <chrono>
+#include <condition_variable>
+#include <csignal>
+#include <cstdint>
+#include <functional>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include <ylt/coro_rpc/coro_rpc_server.hpp>
+
+#include "p2p/ha/oplog/oplog_replicator.h"
+#include "p2p/ha/oplog/oplog_store_factory.h"
+#include "p2p/ha/oplog/p2p_oplog_applier.h"
+#include "p2p/ha/oplog/p2p_standby_metadata_store.h"
+#include "p2p/ha/oplog/p2p_standby_snapshot_service.h"
+#include "p2p/p2p_standby_state_machine.h"
+#include "types.h"
+
+namespace mooncake {
+
+struct P2PHotStandbyConfig {
+    std::string cluster_id;
+    OpLogStoreType oplog_store_type{kDefaultOpLogStoreType};
+    std::string oplog_store_root_dir{kDefaultOpLogRootDir};
+    std::string redis_endpoint;
+    std::string redis_username;
+    std::string redis_password;
+    int redis_db_index{0};
+    int oplog_poll_interval_ms{kDefaultOpLogPollIntervalMs};
+    int reconnect_initial_backoff_ms{100};
+    int reconnect_max_backoff_ms{5000};
+    uint16_t snapshot_service_port{0};
+    std::string master_instance_id;
+    std::vector<std::string> snapshot_source_endpoints;
+    uint32_t snapshot_chunk_size{256};
+    int master_registry_ttl_sec{10};
+};
+
+struct P2PStandbySyncStatus {
+    uint64_t applied_seq_id{0};
+    uint64_t primary_seq_id{0};
+    uint64_t lag_entries{0};
+    bool is_connected{false};
+    bool apply_healthy{true};
+    uint64_t failed_sequence_id{0};
+    int failed_op_type{-1};
+    std::string failure_reason;
+    StandbyState state{StandbyState::STOPPED};
+    std::chrono::milliseconds time_in_state{0};
+};
+
+// NOTE: P2PHotStandbyService intentionally does not inherit from the
+// centralized HotStandbyService. The centralized service owns centralized
+// metadata/apply/export semantics, while P2P promotion needs
+// P2PStandbyMetadataStore, P2POpLogApplier, and an export shape that includes
+// clients, segments, objects, and replicas. This class reuses the shared
+// lower-level components (P2PStandbyStateMachine, OpLogStoreFactory,
+// OpLogChangeNotifier, and OpLogReplicator) and keeps only the orchestration
+// layer P2P-specific.
+class P2PHotStandbyService {
+   public:
+    using ReaderStoreFactory = std::function<std::unique_ptr<OpLogStore>()>;
+
+    explicit P2PHotStandbyService(P2PHotStandbyConfig config,
+                                  ReaderStoreFactory reader_store_factory = {});
+    ~P2PHotStandbyService();
+
+    P2PHotStandbyService(const P2PHotStandbyService&) = delete;
+    P2PHotStandbyService& operator=(const P2PHotStandbyService&) = delete;
+
+    ErrorCode Start(uint64_t baseline_sequence_id = 0);
+    void Stop();
+    // TODO(P2P HA): Expose force promotion only through an explicit operator
+    // CLI/RPC that reports the failed sequence/type/reason and requires
+    // confirmation. The supervisor must not enable it automatically.
+    ErrorCode Promote(bool force = false);
+
+    P2PStandbySyncStatus GetSyncStatus() const;
+    bool IsReadyForPromotion() const;
+    uint64_t GetLatestAppliedSequenceId() const;
+
+    P2PStandbyMetadataStore::ExportedMetadata ExportMetadata() const;
+    bool WaitForAppliedSequence(
+        uint64_t sequence_id,
+        std::chrono::milliseconds timeout = std::chrono::seconds(5)) const;
+
+    StandbyState GetState() const { return state_machine_.GetState(); }
+    P2PStandbyMetadataStore* GetMetadataStore() const {
+        return metadata_store_.get();
+    }
+    const std::string& GetClusterId() const { return config_.cluster_id; }
+    bool IsReadyForSnapshot() const;
+
+   private:
+    ErrorCode StartOplogFollowingLocked(
+        uint64_t baseline_sequence_id,
+        std::unique_ptr<OpLogStore> prepared_reader_store = nullptr);
+    std::unique_ptr<OpLogStore> CreateReaderStore() const;
+    void ResetOplogFollowingLocked();
+    ErrorCode FinalCatchUpForPromotionLocked(uint64_t current_applied_seq_id);
+    uint64_t GetLocalLastAppliedSequenceIdLocked() const;
+    void OnWatcherEvent(StandbyEvent event);
+    void StartRecoveryWorker();
+    void StopRecoveryWorker();
+    void RestoreRecoveryWorker();
+    void RequestRecovery();
+    void RecoveryLoop();
+    ErrorCode BootstrapFromSnapshotSources(
+        uint64_t& baseline_sequence_id,
+        const std::vector<std::string>& discovered_endpoints = {});
+    ErrorCode ResyncFromSnapshotLocked();
+    ErrorCode GetLatestOpLogSequenceId(uint64_t& sequence_id) const;
+    bool WaitForAppliedSequenceLocked(
+        uint64_t sequence_id,
+        std::chrono::milliseconds timeout = std::chrono::seconds(30),
+        bool stop_on_snapshot_resync = false) const;
+    ErrorCode StartSnapshotServer();
+    void StopSnapshotServer();
+    std::vector<std::string> DiscoverSnapshotSources() const;
+
+    P2PHotStandbyConfig config_;
+    ReaderStoreFactory reader_store_factory_;
+
+    std::unique_ptr<P2PStandbyMetadataStore> metadata_store_;
+    std::unique_ptr<P2POpLogApplier> oplog_applier_;
+    std::shared_ptr<OpLogStore> watcher_oplog_store_;
+    std::unique_ptr<OpLogChangeNotifier> oplog_change_notifier_;
+    std::unique_ptr<OpLogReplicator> oplog_replicator_;
+
+    P2PStandbyStateMachine state_machine_;
+    // Serializes Start(), Stop(), and Promote().
+    std::mutex lifecycle_mutex_;
+    mutable std::mutex mutex_;
+
+    std::mutex recovery_mutex_;
+    std::condition_variable recovery_cv_;
+    std::thread recovery_thread_;
+    bool recovery_requested_{false};
+    bool recovery_stopping_{false};
+    std::atomic<bool> snapshot_resync_required_{false};
+
+    std::unique_ptr<P2PStandbySnapshotService> snapshot_service_;
+    std::unique_ptr<coro_rpc::coro_rpc_server> snapshot_server_;
+};
+
+}  // namespace mooncake

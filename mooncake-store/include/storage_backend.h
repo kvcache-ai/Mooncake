@@ -1,10 +1,13 @@
 #pragma once
 
 #include <glog/logging.h>
+#include <json/json.h>
 
 #include <array>
 #include <atomic>
+#include <condition_variable>
 #include <cstring>
+#include <deque>
 #include <filesystem>
 #include <functional>
 #include <map>
@@ -178,6 +181,7 @@ struct FilePerKeyConfig {
     bool Validate() const;
 
     static FilePerKeyConfig FromEnvironment();
+    void MergeFromJson(const Json::Value& v);
 };
 
 enum class BucketEvictionPolicy {
@@ -216,6 +220,7 @@ struct BucketBackendConfig {
     bool Validate() const;
 
     static BucketBackendConfig FromEnvironment();
+    void MergeFromJson(const Json::Value& v);
 };
 
 enum class OffsetEvictionPolicy {
@@ -348,6 +353,8 @@ struct FileStorageConfig {
 
     bool ValidatePath(std::string path) const;
 
+    void MergeFromJson(const Json::Value& v);
+
     /**
      * @brief Creates a config instance by reading values from environment
      * variables.
@@ -406,6 +413,14 @@ class StorageBackendInterface {
     // Remove all persisted objects from disk. Called during RemoveAll to
     // clean up physical SSD files alongside master metadata deletion.
     virtual void RemoveAll() {}
+
+    virtual tl::expected<void, ErrorCode> MarkKeyDeleted(
+        const std::string& /* key */) {
+        return {};
+    }
+
+    // Wipe all files in the storage path. Used by P2P StorageTier on exit.
+    void CleanStoragePath();
 
     virtual tl::expected<std::vector<std::string>, ErrorCode>
     EvictAboveDiskWatermark(double /* high_watermark_ratio */,
@@ -843,6 +858,45 @@ class StorageBackendAdaptor : public StorageBackendInterface {
     };
 };
 
+class LocalStorageSpaceManager {
+   public:
+    explicit LocalStorageSpaceManager(
+        std::filesystem::path storage_root = std::filesystem::path());
+
+    void SetStorageRoot(std::filesystem::path storage_root);
+
+    tl::expected<void, ErrorCode> Init(uint64_t used_space_bytes,
+                                       uint64_t quota_bytes = 0);
+
+    tl::expected<bool, ErrorCode> HasPhysicalSpace(
+        uint64_t required_size) const;
+
+    bool IsInitialized() const;
+
+    bool TryReserve(uint64_t required_size);
+
+    void Release(uint64_t size_to_release);
+
+    uint64_t TotalSpace() const;
+
+    uint64_t UsedSpace() const;
+
+    uint64_t AvailableSpace() const;
+
+    bool IsOverQuota() const;
+
+   private:
+    void RecalculateAvailableSpaceLocked();
+
+   private:
+    std::filesystem::path storage_root_;
+    mutable std::shared_mutex mutex_;
+    uint64_t total_space_ = 0;
+    uint64_t used_space_ = 0;
+    uint64_t available_space_ = 0;
+    std::atomic<bool> initialized_{false};
+};
+
 class BucketStorageBackend : public StorageBackendInterface {
    public:
     BucketStorageBackend(const FileStorageConfig& file_storage_config_,
@@ -999,6 +1053,26 @@ class BucketStorageBackend : public StorageBackendInterface {
     tl::expected<std::vector<std::string>, ErrorCode> EvictAboveDiskWatermark(
         double high_watermark_ratio, double low_watermark_ratio,
         EvictionHandler eviction_handler = nullptr) override;
+
+    // P2P bucket management methods
+    tl::expected<void, ErrorCode> MarkKeyDeleted(const std::string& key);
+    tl::expected<int64_t, ErrorCode> SelectBucketForEviction() const;
+    tl::expected<size_t, ErrorCode> EvictBucket(int64_t bucket_id);
+
+    struct PendingBucketDeletion {
+        int64_t bucket_id;
+        uint64_t data_bytes;
+        uint64_t meta_bytes;
+        uint64_t queued_bytes;
+        std::string data_path;
+        std::string meta_path;
+    };
+    void EnqueueBucketDeletion(PendingBucketDeletion task);
+    void BucketDeletionWorker();
+    tl::expected<bool, ErrorCode> CanAcceptAnotherBucket() const;
+    uint64_t MaxPendingDeletionBytes() const;
+    void StartDeletionWorker();
+    void StopDeletionWorker();
 
    private:
     tl::expected<std::shared_ptr<BucketMetadata>, ErrorCode> BuildBucket(
@@ -1179,6 +1253,8 @@ class BucketStorageBackend : public StorageBackendInterface {
     std::set<std::pair<int64_t, int64_t>> GUARDED_BY(mutex_) lru_index_;
     int64_t GUARDED_BY(mutex_) next_bucket_ = -1;
     BucketBackendConfig bucket_backend_config_;
+    std::unordered_map<int64_t, int> GUARDED_BY(mutex_) bucket_valid_keys_;
+    std::deque<PendingBucketDeletion> pending_bucket_deletions_;
 
     mutable Mutex offloading_mutex_;
     std::unordered_map<std::string, int64_t> GUARDED_BY(offloading_mutex_)
@@ -1195,6 +1271,16 @@ class BucketStorageBackend : public StorageBackendInterface {
 
     // Clear file cache (called on destruction or when needed)
     void ClearFileCache();
+
+    // P2P async deletion infrastructure
+    std::mutex deletion_mutex_;
+    std::condition_variable deletion_cv_;
+    std::thread deletion_thread_;
+    std::atomic<bool> stop_deletion_worker_{false};
+    std::atomic<int64_t> pending_deletion_bytes_{0};
+    std::atomic<int64_t> pending_deletion_count_{0};
+    LocalStorageSpaceManager space_manager_;
+    int64_t GUARDED_BY(mutex_) physical_used_bytes_ = 0;
 };
 
 class OffsetAllocatorStorageBackend : public StorageBackendInterface {
@@ -1676,5 +1762,10 @@ class OffsetAllocatorStorageBackend : public StorageBackendInterface {
 
 tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>
 CreateStorageBackend(const FileStorageConfig& config);
+tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>
+CreateStorageBackend(const FileStorageConfig& config,
+                     const Json::Value& tier_config);
+tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>
+CreateStorageBackend(const Json::Value& tier_config);
 
 }  // namespace mooncake

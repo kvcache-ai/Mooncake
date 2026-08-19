@@ -1,6 +1,8 @@
 #pragma once
+#include <utility>
 #include "file_storage.h"
 #include "storage_backend.h"
+#include "tiered_cache/tiered_backend.h"
 namespace mooncake {
 namespace fs = std::filesystem;
 inline tl::expected<void, ErrorCode> BatchOffloadUtil(
@@ -55,5 +57,16 @@ inline tl::expected<void, ErrorCode> BatchOffloadUtil(
         buckets.emplace_back(batch_store_object_one_result.value());
     }
     return {};
+}
+
+inline tl::expected<void, ErrorCode> InitTieredBackendForTest(
+    TieredBackend& backend, Json::Value config,
+    TransferEngine* engine = nullptr,
+    AddReplicaCallback add_replica_callback = nullptr,
+    RemoveReplicaCallback remove_replica_callback = nullptr,
+    SegmentSyncCallback segment_sync_callback = nullptr) {
+    return backend.Init(
+        std::move(config), engine, std::move(add_replica_callback),
+        std::move(remove_replica_callback), std::move(segment_sync_callback));
 }
 }  // namespace mooncake

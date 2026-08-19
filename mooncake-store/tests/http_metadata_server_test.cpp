@@ -5,6 +5,7 @@
 #include <thread>
 
 #include <async_simple/coro/SyncAwait.h>
+#include <csignal>
 #include <ylt/coro_http/coro_http_client.hpp>
 
 #include "http_metadata_server.h"

@@ -62,6 +62,8 @@ struct MasterConfig {
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
     uint32_t batch_oplog_retry_timeout_sec = 180;
+    std::string oplog_store_type = "localfs";
+    std::string oplog_data_dir = "/tmp/mooncake_oplog";
 
     std::string cluster_id;
     std::string root_fs_dir;
@@ -92,6 +94,17 @@ struct MasterConfig {
     bool enable_multi_tenants = false;
     std::string tenant_quota_connector_type = "file";
     std::string tenant_quota_connector_uri;
+
+    std::string deployment_mode = "Centralization";
+    int64_t client_crashed_ttl_sec = -1;
+    uint64_t max_client_per_key = 1;
+    std::string election_backend = "etcd";
+    std::string redis_endpoint;
+    std::string redis_username;
+    std::string redis_password;
+    int redis_db_index = 0;
+    int64_t redis_master_view_ttl_sec = 5;
+    int64_t redis_heartbeat_interval_sec = 1;
 
     bool enable_snapshot_restore;
     bool enable_snapshot;
@@ -183,6 +196,16 @@ class MasterServiceSupervisorConfig {
     RequiredParam<size_t> rpc_thread_num{"rpc_thread_num"};
 
     // Parameters with default values (optional parameters)
+    DeploymentMode deployment_mode = DeploymentMode::CENTRALIZATION;
+    RequiredParam<int64_t> client_crashed_ttl_sec{"client_crashed_ttl_sec"};
+    uint64_t max_client_per_key = 1;
+    ElectionBackend election_backend = ElectionBackend::ETCD;
+    std::string redis_endpoint;
+    std::string redis_username;
+    std::string redis_password;
+    int redis_db_index = 0;
+    int64_t redis_master_view_ttl_sec = 5;
+    int64_t redis_heartbeat_interval_sec = 1;
     uint64_t max_kv_soft_pin_ttl = DEFAULT_MAX_KV_SOFT_PIN_TTL_MS;
     std::string rpc_address = "0.0.0.0";
     std::string metrics_host = "0.0.0.0";
@@ -197,6 +220,8 @@ class MasterServiceSupervisorConfig {
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
     uint32_t batch_oplog_retry_timeout_sec = 180;
+    std::string oplog_store_type = "localfs";
+    std::string oplog_data_dir = "/tmp/mooncake_oplog";
     std::string local_hostname = "0.0.0.0:50051";
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
@@ -325,6 +350,8 @@ class MasterServiceSupervisorConfig {
         enable_oplog = config.enable_oplog;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
+        oplog_store_type = config.oplog_store_type;
+        oplog_data_dir = config.oplog_data_dir;
         batch_oplog_retry_timeout_sec = config.batch_oplog_retry_timeout_sec;
         local_hostname = rpc_address + ":" + std::to_string(rpc_port);
         cluster_id = config.cluster_id;
@@ -477,6 +504,12 @@ class WrappedMasterServiceConfig {
         DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS;
     uint32_t nof_heartbeat_failures_threshold =
         DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD;
+    int64_t client_crashed_ttl_sec = DEFAULT_CLIENT_CRASHED_TTL_SEC;
+    uint64_t max_client_per_key = 1;
+    std::string redis_endpoint;
+    std::string redis_username;
+    std::string redis_password;
+    int redis_db_index = 0;
     bool enable_ha = false;
     bool enable_offload = false;
     bool offload_on_evict = false;
@@ -505,6 +538,8 @@ class WrappedMasterServiceConfig {
     bool enable_oplog = false;
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
+    std::string oplog_store_type = "localfs";
+    std::string oplog_data_dir = "/tmp/mooncake_oplog";
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
@@ -596,6 +631,8 @@ class WrappedMasterServiceConfig {
         enable_oplog = config.enable_oplog;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
+        oplog_store_type = config.oplog_store_type;
+        oplog_data_dir = config.oplog_data_dir;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
@@ -713,6 +750,8 @@ class WrappedMasterServiceConfig {
         enable_oplog = config.enable_oplog;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
+        oplog_store_type = config.oplog_store_type;
+        oplog_data_dir = config.oplog_data_dir;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
@@ -781,6 +820,8 @@ class MasterServiceConfigBuilder {
     bool enable_oplog_ = false;
     int oplog_poll_interval_ms_ = 1000;
     uint32_t oplog_batch_max_entries_ = 1024;
+    std::string oplog_store_type_ = "localfs";
+    std::string oplog_data_dir_ = "/tmp/mooncake_oplog";
     std::string cluster_id_ = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir_ = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size_ = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
@@ -810,6 +851,7 @@ class MasterServiceConfigBuilder {
     uint64_t pending_task_timeout_sec_ = DEFAULT_PENDING_TASK_TIMEOUT_SEC;
     uint64_t processing_task_timeout_sec_ = DEFAULT_PROCESSING_TASK_TIMEOUT_SEC;
     uint32_t max_retry_attempts_ = DEFAULT_MAX_RETRY_ATTEMPTS;
+    uint64_t max_client_per_key_ = 1;
 
     std::string cxl_path_ = DEFAULT_CXL_PATH;
     size_t cxl_size_ = DEFAULT_CXL_SIZE;
@@ -922,6 +964,16 @@ class MasterServiceConfigBuilder {
 
     MasterServiceConfigBuilder& set_oplog_batch_max_entries(uint32_t entries) {
         oplog_batch_max_entries_ = entries;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_oplog_store_type(const std::string& type) {
+        oplog_store_type_ = type;
+        return *this;
+    }
+
+    MasterServiceConfigBuilder& set_oplog_data_dir(const std::string& dir) {
+        oplog_data_dir_ = dir;
         return *this;
     }
 
@@ -1088,6 +1140,12 @@ class MasterServiceConfigBuilder {
         return *this;
     }
 
+    MasterServiceConfigBuilder& set_max_client_per_key(
+        uint64_t max_client_per_key) {
+        max_client_per_key_ = max_client_per_key;
+        return *this;
+    }
+
     MasterServiceConfigBuilder& set_cxl_path(const std::string& path) {
         cxl_path_ = path;
         return *this;
@@ -1136,6 +1194,8 @@ class MasterServiceConfig {
         DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS;
     uint32_t nof_heartbeat_failures_threshold =
         DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD;
+    int64_t client_crashed_ttl_sec = DEFAULT_CLIENT_CRASHED_TTL_SEC;
+    uint64_t max_client_per_key = 1;
     bool enable_ha = false;
     bool enable_offload = false;
     bool offload_on_evict = false;
@@ -1164,6 +1224,15 @@ class MasterServiceConfig {
     bool enable_oplog = false;
     int oplog_poll_interval_ms = 1000;
     uint32_t oplog_batch_max_entries = 1024;
+    std::string oplog_store_type = "localfs";
+    std::string oplog_data_dir = "/tmp/mooncake_oplog";
+    std::string redis_endpoint;
+    std::string redis_username;
+    std::string redis_password;
+    int redis_db_index = 0;
+    uint64_t oplog_async_queue_max_entries = 100000;
+    std::string oplog_async_queue_overflow_mode = "reject";
+    uint64_t oplog_best_effort_max_retries = 3;
     std::string cluster_id = DEFAULT_CLUSTER_ID;
     std::string root_fs_dir = DEFAULT_ROOT_FS_DIR;
     int64_t global_file_segment_size = DEFAULT_GLOBAL_FILE_SEGMENT_SIZE;
@@ -1249,6 +1318,8 @@ class MasterServiceConfig {
         enable_oplog = config.enable_oplog;
         oplog_poll_interval_ms = config.oplog_poll_interval_ms;
         oplog_batch_max_entries = config.oplog_batch_max_entries;
+        oplog_store_type = config.oplog_store_type;
+        oplog_data_dir = config.oplog_data_dir;
         cluster_id = config.cluster_id;
         root_fs_dir = config.root_fs_dir;
         global_file_segment_size = config.global_file_segment_size;
@@ -1318,6 +1389,8 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.enable_oplog = enable_oplog_;
     config.oplog_poll_interval_ms = oplog_poll_interval_ms_;
     config.oplog_batch_max_entries = oplog_batch_max_entries_;
+    config.oplog_store_type = oplog_store_type_;
+    config.oplog_data_dir = oplog_data_dir_;
     config.cluster_id = cluster_id_;
     config.root_fs_dir = root_fs_dir_;
     config.global_file_segment_size = global_file_segment_size_;
@@ -1351,6 +1424,7 @@ inline MasterServiceConfig MasterServiceConfigBuilder::build() const {
     config.task_manager_config.processing_task_timeout_sec =
         processing_task_timeout_sec_;
     config.task_manager_config.max_retry_attempts = max_retry_attempts_;
+    config.max_client_per_key = max_client_per_key_;
     config.cxl_path = cxl_path_;
     config.cxl_size = cxl_size_;
     config.enable_cxl = enable_cxl_;
@@ -1376,6 +1450,8 @@ struct InProcMasterConfig {
     std::optional<std::string> root_fs_dir;
     std::optional<bool> enable_disk_eviction;
     std::optional<uint64_t> quota_bytes;
+    std::optional<int64_t> client_crashed_ttl_sec;
+    std::optional<int64_t> client_live_ttl_sec;
 };
 
 // Builder class for InProcMasterConfig
@@ -1393,6 +1469,8 @@ class InProcMasterConfigBuilder {
     std::optional<std::string> root_fs_dir_ = std::nullopt;
     std::optional<bool> enable_disk_eviction_ = std::nullopt;
     std::optional<uint64_t> quota_bytes_ = std::nullopt;
+    std::optional<int64_t> client_crashed_ttl_sec_ = std::nullopt;
+    std::optional<int64_t> client_live_ttl_sec_ = std::nullopt;
 
    public:
     InProcMasterConfigBuilder() = default;
@@ -1461,6 +1539,16 @@ class InProcMasterConfigBuilder {
         return *this;
     }
 
+    InProcMasterConfigBuilder& set_client_crashed_ttl_sec(int64_t ttl) {
+        client_crashed_ttl_sec_ = ttl;
+        return *this;
+    }
+
+    InProcMasterConfigBuilder& set_client_live_ttl_sec(int64_t ttl) {
+        client_live_ttl_sec_ = ttl;
+        return *this;
+    }
+
     InProcMasterConfig build() const;
 };
 
@@ -1479,6 +1567,8 @@ inline InProcMasterConfig InProcMasterConfigBuilder::build() const {
     config.root_fs_dir = root_fs_dir_;
     config.enable_disk_eviction = enable_disk_eviction_;
     config.quota_bytes = quota_bytes_;
+    config.client_crashed_ttl_sec = client_crashed_ttl_sec_;
+    config.client_live_ttl_sec = client_live_ttl_sec_;
     return config;
 }
 

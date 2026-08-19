@@ -25,6 +25,7 @@ enum class ReplicaType {
     LOCAL_DISK = 2,  // Local disk replica
     NOF_SSD = 3,     // Nvme-oF SSD replica
     ALL = 4,         // All synchronous replicas in put finalize path
+    P2P_PROXY = 5,   // P2P proxy replica
     DFS = 100,       // Distributed filesystem page-offset replica
 };
 
@@ -49,6 +50,17 @@ class AllocatedBuffer {
         : allocator_(std::move(allocator)),
           buffer_ptr_(buffer_ptr),
           size_(size),
+          segment_id_(0, 0),
+          offset_handle_(std::move(offset_handle)) {}
+
+    AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
+                    void* buffer_ptr, std::size_t size, const UUID& segment_id,
+                    std::optional<offset_allocator::OffsetAllocationHandle>&&
+                        offset_handle = std::nullopt)
+        : allocator_(std::move(allocator)),
+          buffer_ptr_(buffer_ptr),
+          size_(size),
+          segment_id_(segment_id),
           offset_handle_(std::move(offset_handle)) {}
 
     AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
@@ -74,6 +86,8 @@ class AllocatedBuffer {
 
     [[nodiscard]] std::string getSegmentName() const noexcept;
 
+    [[nodiscard]] UUID getSegmentId() const noexcept { return segment_id_; }
+
     // Friend declaration for operator<<
     friend std::ostream& operator<<(std::ostream& os,
                                     const AllocatedBuffer& buffer);
@@ -97,6 +111,7 @@ class AllocatedBuffer {
     void* buffer_ptr_{nullptr};
     std::size_t size_{0};
     std::string protocol{"tcp"};
+    UUID segment_id_{0, 0};
     // RAII handle for buffer allocated by offset allocator
     std::optional<offset_allocator::OffsetAllocationHandle> offset_handle_{
         std::nullopt};
@@ -117,6 +132,7 @@ class BufferAllocatorBase {
     virtual size_t capacity() const = 0;
     virtual size_t size() const = 0;
     virtual std::string getSegmentName() const = 0;
+    virtual UUID getSegmentId() const = 0;
     virtual std::string getTransportEndpoint() const = 0;
 
     /**
@@ -153,6 +169,7 @@ class DummyBufferAllocator final : public BufferAllocatorBase {
     }
     size_t size() const override { return 0; }
     std::string getSegmentName() const override { return segment_name_; }
+    UUID getSegmentId() const override { return UUID{0, 0}; }
     std::string getTransportEndpoint() const override {
         return transport_endpoint_;
     }
@@ -190,6 +207,7 @@ class CachelibBufferAllocator
    public:
     CachelibBufferAllocator(std::string segment_name, size_t base, size_t size,
                             std::string transport_endpoint,
+                            const UUID& segment_id = UUID{0, 0},
                             ReplicaType replica_type = ReplicaType::MEMORY);
 
     ~CachelibBufferAllocator() override;
@@ -201,6 +219,7 @@ class CachelibBufferAllocator
     size_t capacity() const override { return total_size_; }
     size_t size() const override { return cur_size_.load(); }
     std::string getSegmentName() const override { return segment_name_; }
+    UUID getSegmentId() const override { return segment_id_; }
     std::string getTransportEndpoint() const override {
         return transport_endpoint_;
     }
@@ -223,6 +242,7 @@ class CachelibBufferAllocator
     const size_t total_size_;
     std::atomic_size_t cur_size_;
     const std::string transport_endpoint_;
+    const UUID segment_id_;
     const ReplicaType replica_type_;
 
     // metrics - removed allocated_bytes_ member
@@ -239,7 +259,7 @@ class CachelibBufferAllocator
         std::string segment_name, size_t base, size_t size,
         std::string transport_endpoint,
         const std::vector<AllocatedBuffer::Descriptor>& descriptors,
-        ReplicaType replica_type);
+        ReplicaType replica_type, const UUID& segment_id);
 };
 
 struct RestoredCachelibBufferAllocator {
@@ -251,7 +271,8 @@ std::optional<RestoredCachelibBufferAllocator> RestoreCachelibBufferAllocator(
     std::string segment_name, size_t base, size_t size,
     std::string transport_endpoint,
     const std::vector<AllocatedBuffer::Descriptor>& descriptors,
-    ReplicaType replica_type = ReplicaType::MEMORY);
+    ReplicaType replica_type = ReplicaType::MEMORY,
+    const UUID& segment_id = UUID{0, 0});
 
 /**
  * OffsetBufferAllocator manages memory allocation using the OffsetAllocator
@@ -264,6 +285,7 @@ class OffsetBufferAllocator
    public:
     OffsetBufferAllocator(std::string segment_name, size_t base, size_t size,
                           std::string transport_endpoint,
+                          const UUID& segment_id = UUID{0, 0},
                           ReplicaType replica_type = ReplicaType::MEMORY);
 
     ~OffsetBufferAllocator() override;
@@ -275,6 +297,7 @@ class OffsetBufferAllocator
     size_t capacity() const override { return total_size_; }
     size_t size() const override { return cur_size_.load(); }
     std::string getSegmentName() const override { return segment_name_; }
+    UUID getSegmentId() const override { return segment_id_; }
     std::string getTransportEndpoint() const override {
         return transport_endpoint_;
     }
@@ -297,6 +320,7 @@ class OffsetBufferAllocator
     const size_t total_size_;
     std::atomic_size_t cur_size_;
     const std::string transport_endpoint_;
+    const UUID segment_id_;
     const ReplicaType replica_type_;
 
     // offset allocator implementation
@@ -312,7 +336,7 @@ class OffsetBufferAllocator
         std::string segment_name, size_t base, size_t size,
         std::string transport_endpoint,
         const std::vector<AllocatedBuffer::Descriptor>& descriptors,
-        ReplicaType replica_type);
+        ReplicaType replica_type, const UUID& segment_id);
 };
 
 struct RestoredOffsetBufferAllocator {
@@ -327,7 +351,8 @@ std::optional<RestoredOffsetBufferAllocator> RestoreOffsetBufferAllocator(
     std::string segment_name, size_t base, size_t size,
     std::string transport_endpoint,
     const std::vector<AllocatedBuffer::Descriptor>& descriptors,
-    ReplicaType replica_type = ReplicaType::MEMORY);
+    ReplicaType replica_type = ReplicaType::MEMORY,
+    const UUID& segment_id = UUID{0, 0});
 
 // The main difference is that it allocates real memory and returns it, while
 // BufferAllocator allocates an address

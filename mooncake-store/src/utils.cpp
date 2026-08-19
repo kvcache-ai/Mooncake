@@ -788,4 +788,15 @@ std::string ResolvePathFromKey(const std::string &key,
 
     return full_path.lexically_normal().string();
 }
+
+// getHostNameWithoutPort is provided by common.h (static inline)
+/*
+std::string getHostNameWithoutPort(const std::string& hostname) {
+    auto pos = hostname.find(':');
+    if (pos != std::string::npos) {
+        return hostname.substr(0, pos);
+    }
+    return hostname;
+}
+*/
 }  // namespace mooncake

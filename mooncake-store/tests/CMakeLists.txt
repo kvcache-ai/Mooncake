@@ -314,3 +314,6 @@ if(STORE_USE_REDIS)
     target_link_libraries(${target} PRIVATE ${MOONCAKE_STORE_HIREDIS_LIBRARY})
   endforeach()
 endif()
+
+# === P2P Tests ===
+add_subdirectory(p2p)

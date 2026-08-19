@@ -44,6 +44,8 @@ struct StandbyObjectMetadata {
     // Check if this metadata has valid replicas
     bool HasReplicas() const { return !replicas.empty(); }
 };
+YLT_REFL(StandbyObjectMetadata, client_id, size, replicas, last_sequence_id,
+         group_id, data_type);
 
 /**
  * Segment info stored in standby's segment registry.

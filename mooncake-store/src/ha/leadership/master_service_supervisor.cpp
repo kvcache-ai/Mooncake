@@ -17,6 +17,7 @@
 #include "ha/standby_controller.h"
 #include "k8s_lease_helper.h"
 #include "master_admin_service.h"
+#include "p2p/p2p_rpc_service.h"
 #include "rpc_service.h"
 
 namespace mooncake {
@@ -386,20 +387,29 @@ int RunSupervisorLoop(const HABackendSpec& spec,
         wrapped_config.enable_snapshot_restore = false;
         // The serving primary handles heartbeats/unmounts, so forward the
         // metadata cleanup config here like the non-HA path does.
-        auto wrapped_master_service = std::make_shared<WrappedMasterService>(
-            wrapped_config, config.http_metadata_server,
-            config.http_metadata_remote_url);
 
-        // Restore from standby if we have context
-        if (promotion_ctx->applied_seq_id > 0 ||
-            !promotion_ctx->objects.empty() ||
-            !promotion_ctx->segments.empty()) {
-            wrapped_master_service->RestoreFromStandby(
-                promotion_ctx->objects, promotion_ctx->applied_seq_id,
-                promotion_ctx->segments);
+        std::shared_ptr<WrappedMasterService> wrapped_master_service;
+
+        if (config.deployment_mode == DeploymentMode::CENTRALIZATION) {
+            wrapped_master_service = std::make_shared<WrappedMasterService>(
+                wrapped_config, config.http_metadata_server,
+                config.http_metadata_remote_url);
+
+            // Restore from standby if we have context
+            if (promotion_ctx->applied_seq_id > 0 ||
+                !promotion_ctx->objects.empty() ||
+                !promotion_ctx->segments.empty()) {
+                wrapped_master_service->RestoreFromStandby(
+                    promotion_ctx->objects, promotion_ctx->applied_seq_id,
+                    promotion_ctx->segments);
+            }
+
+            mooncake::RegisterRpcService(server, *wrapped_master_service);
+        } else {
+            auto p2p_wrapped = std::make_unique<WrappedP2PMasterService>(
+                wrapped_config);
+            mooncake::RegisterP2PRpcService(server, *p2p_wrapped);
         }
-
-        mooncake::RegisterRpcService(server, *wrapped_master_service);
 
         auto serve_preflight =
             leader_coordinator.RenewLeadership(*leadership_session);
