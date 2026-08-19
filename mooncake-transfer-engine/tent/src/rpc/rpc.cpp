@@ -225,8 +225,11 @@ Lazy<std::pair<Status, std::string>> CoroRpcAgent::callCoroutine(
         co_return std::make_pair(Status::RpcServiceError(msg + LOC_MARK), "");
     }
 
-    std::string response{lease->get_resp_attachment()};
-    lease->release_resp_attachment();
+    // The internal buffer is padded for small attachments; trim the moved
+    // string to the real attachment length from the view.
+    const size_t len = lease->get_resp_attachment().size();
+    std::string response = lease->release_resp_attachment();
+    response.resize(len);
 
     co_return std::make_pair(Status::OK(), std::move(response));
 }

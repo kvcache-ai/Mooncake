@@ -159,6 +159,21 @@ target_include_directories(tent_tcp_transport_test
                            PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
 add_test(NAME tent_tcp_transport_test COMMAND tent_tcp_transport_test)
 
+add_executable(tent_tcp_datapath_roundtrip_test
+               tcp_datapath_roundtrip_test.cpp)
+target_link_libraries(tent_tcp_datapath_roundtrip_test PRIVATE gtest gtest_main
+                                                      tent_link_group)
+target_include_directories(tent_tcp_datapath_roundtrip_test
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+# Each case runs in its own process: the test forks a server child, which
+# must happen before the client process initializes any engine state.
+add_test(NAME tent_tcp_datapath_roundtrip_test_single_threaded
+         COMMAND tent_tcp_datapath_roundtrip_test
+                 --gtest_filter=TcpDataPathRoundtripTest.WriteThenReadAcrossProcesses)
+add_test(NAME tent_tcp_datapath_roundtrip_test_multi_threaded_rpc
+         COMMAND tent_tcp_datapath_roundtrip_test
+                 --gtest_filter=TcpDataPathRoundtripTest.WriteThenReadAcrossProcessesMultiThreadedRpc)
+
 add_executable(tent_shm_transport_test shm_transport_test.cpp)
 target_link_libraries(tent_shm_transport_test PRIVATE gtest gtest_main
                                                       tent_link_group)
