@@ -672,7 +672,7 @@ void TcpTransport::startTransfer(Slice* slice,
     // disabled. Fixed lanes provide the same serial socket reuse without
     // reviving the old unbounded dynamic pool.
     if (enable_connection_pool_ || reuse_connection) {
-        enqueuePooledTransfer(key, std::move(work));
+        enqueuePooledTransfer(desc->name, key, std::move(work));
         return;
     }
 
