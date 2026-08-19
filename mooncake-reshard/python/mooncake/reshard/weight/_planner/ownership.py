@@ -45,26 +45,54 @@ def has_dp_ownership(tensor: TensorDescriptor) -> bool:
     )
 
 
-def require_supported_dp_semantics(
-    tensors: Sequence[TensorDescriptor],
-) -> None:
-    """Reject MoE-DP ownership until a semantic owner resolver is introduced.
+def complete_dp_owned_source_owners(
+    source_tensors: dict[TensorId, TensorDescriptor],
+    source_fragments: Sequence[PlacementFragment],
+) -> dict[TensorId, RuntimeTensorOwner]:
+    """Return the complete declared source owner for each DP-owned tensor.
 
-    Normal data parallelism is represented by ``ReplicatedAxis("dp")`` and is
-    supported. ``OwnershipAxis("dp")`` means different DP ranks can own
-    different logical parameters; selecting or expanding those parameters
-    requires framework-provided ownership semantics, not rank arithmetic in
-    the canonical planner.
+    Unlike a replicated DP tensor, an ``OwnershipAxis("dp")`` tensor is not
+    expected to exist on every DP rank. Its placement fragments name the owner
+    directly. A logical tensor may have exactly one complete owner; a partial
+    or duplicate owner declaration is ambiguous and rejected before planning.
     """
 
-    unsupported = sorted(
-        tensor.tensor_id for tensor in tensors if has_dp_ownership(tensor)
+    owned_tensors = tuple(
+        tensor for tensor in source_tensors.values() if has_dp_ownership(tensor)
     )
-    if unsupported:
-        raise ValueError(
-            "DP ownership reshard is not supported in this version: "
-            + ", ".join(unsupported)
+    if not owned_tensors:
+        return {}
+
+    fragments_by_tensor: dict[TensorId, list[PlacementFragment]] = {}
+    for fragment in source_fragments:
+        fragments_by_tensor.setdefault(fragment.tensor_id, []).append(fragment)
+
+    owners: dict[TensorId, RuntimeTensorOwner] = {}
+    for tensor in owned_tensors:
+        fragments_by_owner: dict[RuntimeTensorOwner, list[PlacementFragment]] = {}
+        for fragment in fragments_by_tensor.get(tensor.tensor_id, ()):
+            fragments_by_owner.setdefault(
+                parallel_tensor_owner(tensor, fragment), []
+            ).append(fragment)
+        complete_owners = sorted(
+            owner
+            for owner, fragments in fragments_by_owner.items()
+            if _fragments_fully_cover_tensor(tensor, fragments)
         )
+        if len(complete_owners) != 1 or len(complete_owners) != len(
+            fragments_by_owner
+        ):
+            if not complete_owners:
+                raise ValueError(
+                    "DP-owned source tensor has no complete declared owner: "
+                    f"{tensor.tensor_id}"
+                )
+            raise ValueError(
+                "DP-owned source tensor has ambiguous declared owners: "
+                f"{tensor.tensor_id}"
+            )
+        owners[tensor.tensor_id] = complete_owners[0]
+    return owners
 
 
 def _validate_target_coverage(
@@ -185,8 +213,8 @@ def _validate_local_target_inventory(
 
 
 __all__ = [
+    "complete_dp_owned_source_owners",
     "complete_parallel_source_replicas",
     "has_dp_ownership",
     "parallel_tensor_owner",
-    "require_supported_dp_semantics",
 ]
