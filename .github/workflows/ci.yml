@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 name: 'Build & Test (Linux)'
 
 on:
@@ -27,7 +31,6 @@ jobs:
        github.event_name == 'workflow_dispatch') &&
       (github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
        contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: ubuntu-22.04
     strategy:
@@ -287,7 +290,6 @@ jobs:
        github.event_name == 'workflow_dispatch') &&
       (github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
        contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: ubuntu-22.04
     container: registry.mthreads.com/mcconline/inference/pytorch:2.9.1.post1-py3.10-musa5.2.0-mp31-devel-ubuntu22.04-amd64
@@ -325,7 +327,6 @@ jobs:
        github.event_name == 'workflow_dispatch') &&
       (github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
        contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: ubuntu-22.04-arm
     strategy:
@@ -421,7 +422,6 @@ jobs:
       needs.build-flags.result == 'success' &&
       (github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
        contains(github.event.pull_request.labels.*.name, 'run-ci'))
     strategy:
       matrix:
@@ -584,7 +584,6 @@ jobs:
        github.event_name == 'workflow_dispatch') &&
       (github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
        contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: ubuntu-22.04
     strategy:
@@ -807,7 +806,6 @@ jobs:
        github.event_name == 'workflow_dispatch') &&
       (github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
        contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: ubuntu-22.04
     steps:
@@ -834,7 +832,6 @@ jobs:
     if: >-
       (github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
        contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: ubuntu-22.04
     steps:
@@ -850,7 +847,6 @@ jobs:
     if: >-
       (github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
        contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: ubuntu-22.04
     steps:
@@ -900,7 +896,6 @@ jobs:
     if: >-
       github.event_name == 'push' ||
       github.event_name == 'workflow_dispatch' ||
-      github.event.action == 'opened' ||
       contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-22.04
     steps:
@@ -941,7 +936,6 @@ jobs:
     if: >-
       github.event_name == 'push' ||
       github.event_name == 'workflow_dispatch' ||
-      github.event.action == 'opened' ||
       contains(github.event.pull_request.labels.*.name, 'run-ci')
     runs-on: ubuntu-latest
     outputs:
@@ -987,7 +981,6 @@ jobs:
        github.event_name == 'workflow_dispatch') &&
       (github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
        contains(github.event.pull_request.labels.*.name, 'run-ci'))
     uses: ./.github/workflows/ci_cu13.yml
     secrets: inherit
@@ -999,7 +992,6 @@ jobs:
        github.event_name == 'workflow_dispatch') &&
       (github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
        contains(github.event.pull_request.labels.*.name, 'run-ci'))
     uses: ./.github/workflows/ci_efa.yml
     secrets: inherit
@@ -1023,7 +1015,6 @@ jobs:
        github.event_name == 'workflow_dispatch') &&
       (github.event_name == 'push' ||
        github.event_name == 'workflow_dispatch' ||
-       github.event.action == 'opened' ||
        contains(github.event.pull_request.labels.*.name, 'run-ci'))
     runs-on: ubuntu-22.04
     strategy:

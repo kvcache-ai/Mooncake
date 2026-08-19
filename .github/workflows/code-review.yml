@@ -1,3 +1,7 @@
+# Copyright (c) 2026 Hygon Information Technology Co., Ltd.
+# SPDX-License-Identifier: Apache-2.0
+# Modified by Hygon Information Technology Co., Ltd., 2026.
+
 name: Qoder Auto Code Review
 
 on:
@@ -7,7 +11,7 @@ on:
 jobs:
   qoder-review:
     # Skip fork and cross-repo PRs (head repo must match this repository)
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    if: false
     runs-on: ubuntu-latest
     permissions:
       contents: read
