@@ -75,6 +75,8 @@ std::string NvmeKvTransportIdWithNsid(const std::string &configured_path,
 NvmeKvPackedKeyFields PackNvmeKvPhysicalKey(
     const NvmeKvCommandExecutor::PhysicalKey &key);
 ErrorCode MapNvmeKvStatus(uint32_t status, bool is_write);
+ErrorCode MapNvmeKvCompletionStatus(uint32_t status_code_type,
+                                    uint32_t status_code, bool is_write);
 ErrorCode MapNvmeKvTransportError(int err, bool is_write);
 bool IsNvmeKvControlFlowError(ErrorCode error);
 

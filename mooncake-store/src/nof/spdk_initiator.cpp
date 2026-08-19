@@ -373,9 +373,11 @@ class SpdkInitiator::Impl {
         std::lock_guard<std::mutex> controllers_lock(ctrlrs_mutex_);
         for (auto& [_, info] : connected_ctrlrs_) {
             std::lock_guard<std::mutex> namespaces_lock(info->ns_mutex);
-            auto it = std::find_if(
-                info->kv_segments.begin(), info->kv_segments.end(),
-                [handle](const auto& segment) { return segment.get() == handle; });
+            auto it =
+                std::find_if(info->kv_segments.begin(), info->kv_segments.end(),
+                             [handle](const auto& segment) {
+                                 return segment.get() == handle;
+                             });
             if (it == info->kv_segments.end()) {
                 continue;
             }
@@ -996,8 +998,7 @@ int SpdkInitiator::SubmitKvStore(NofSegmentHandle* handle, const void* key,
 
 int SpdkInitiator::SubmitKvRetrieve(NofSegmentHandle* handle, const void* key,
                                     uint8_t key_len, void* value,
-                                    uint32_t value_len,
-                                    NofKvAdaptor* adaptor) {
+                                    uint32_t value_len, NofKvAdaptor* adaptor) {
     return impl_->SubmitKvRetrieve(handle, key, key_len, value, value_len,
                                    adaptor);
 }

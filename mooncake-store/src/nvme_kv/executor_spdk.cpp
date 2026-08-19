@@ -110,7 +110,7 @@ class NvmeKvSpdkExecutor : public NvmeKvCommandExecutor {
             }
             submit_sizes[index] = submission_bytes;
             void *buffer = allocator_->Alloc(submission_bytes,
-                                          NvmeKvTransferAlignmentBytes());
+                                             NvmeKvTransferAlignmentBytes());
             if (buffer == nullptr) {
                 request.result =
                     tl::make_unexpected(ErrorCode::BUFFER_OVERFLOW);
@@ -123,7 +123,8 @@ class NvmeKvSpdkExecutor : public NvmeKvCommandExecutor {
                 std::memset(static_cast<char *>(buffer) + request.value.size(),
                             0, submission_bytes - request.value.size());
             }
-            dma_buffers[index] = SpdkDmaBuffer(buffer, SpdkDmaBufferDeleter{allocator_});
+            dma_buffers[index] =
+                SpdkDmaBuffer(buffer, SpdkDmaBufferDeleter{allocator_});
             submit_buffers[index] = buffer;
         }
 
@@ -358,8 +359,8 @@ class NvmeKvSpdkExecutor : public NvmeKvCommandExecutor {
             if (inflight == 0) {
                 continue;
             }
-            const int rc = static_cast<int>(
-                initiator_->PollCompletion(segment_, 0));
+            const int rc =
+                static_cast<int>(initiator_->PollCompletion(segment_, 0));
             const size_t observed = drain_completed();
             if (rc < 0) {
                 LOG(ERROR) << "SPDK NVMe KV completion polling failed: " << rc;
@@ -416,7 +417,8 @@ class NvmeKvSpdkExecutor : public NvmeKvCommandExecutor {
                     tl::make_unexpected(ErrorCode::BUFFER_OVERFLOW);
                 continue;
             }
-            dma_buffers[index] = SpdkDmaBuffer(buffer, SpdkDmaBufferDeleter{allocator_});
+            dma_buffers[index] =
+                SpdkDmaBuffer(buffer, SpdkDmaBufferDeleter{allocator_});
             request_bytes[index] = bytes;
         }
 
