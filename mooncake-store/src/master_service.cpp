@@ -3043,6 +3043,19 @@ tl::expected<void, ErrorCode> MasterService::RestoreFromStandbySnapshot(
                 << tenant_id.value() << ", key=" << user_key;
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
+        const size_t existing_shard_idx =
+            getMetadataShardIndex(tenant_id, user_key);
+        {
+            MetadataShardAccessorRO existing_shard(this, existing_shard_idx);
+            auto existing_tenant = existing_shard->tenants.find(tenant_id);
+            if (existing_tenant != existing_shard->tenants.end() &&
+                existing_tenant->second.metadata.contains(user_key)) {
+                LOG(ERROR)
+                    << "RestoreFromStandbySnapshot: object already exists, "
+                    << "tenant=" << tenant_id.value() << ", key=" << user_key;
+                return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+            }
+        }
         const auto shard_idx = entry.metadata.group_id.empty()
                                    ? getShardIndex(tenant_id, user_key)
                                    : getShardIndex(entry.metadata.group_id);
