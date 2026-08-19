@@ -171,8 +171,3 @@ if(USE_NCCL_HOST AND BUILD_NCCL_HOST_TRANSPORT_EXAMPLE)
   target_link_libraries(nccl_host_transport_example PRIVATE
     transfer_engine NCCL::nccl glog::glog gflags::gflags)
 endif()
-
-if(USE_FLAGCX)
-  add_executable(flagcx_demo ${WORKSPACE}/flagcx_demo.cpp)
-  target_link_libraries(flagcx_demo PUBLIC transfer_engine)
-endif()
