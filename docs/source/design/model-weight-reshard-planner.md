@@ -1,9 +1,9 @@
-# Model Weight Logical Reshard Planner
+# Model Weight Reshard Planner And Runtime Binding
 
 `mooncake-reshard` plans an address-free conversion between complete model
-weight placements. It turns a source placement or committed logical Store
-snapshot and a target placement into compact N-D transfer regions. It does not
-inspect framework runtime objects or assign physical GPU addresses.
+weight placements, then binds the selected logical regions to immutable
+runtime snapshots. It does not inspect framework runtime objects or submit a
+transfer.
 
 ## Inputs and Output
 
@@ -23,6 +23,11 @@ The public APIs are:
 Each API returns a `LogicalTransferPlan`. It contains only canonical tensor
 descriptors, selected placement participants, and logical regions. It contains
 no GPU address, endpoint, allocation range, lease, or backend handle.
+
+`bind_logical_transfer_plan(logical_plan, target_bindings, ...)` is the second
+public step. It accepts typed `WeightRuntimeBindingManifest` values and returns
+a `TransferPlan` with selected runtime fragments, binding attestations, and
+executor projections.
 
 ## N-D Regions
 
@@ -72,15 +77,20 @@ For 3-D and higher logical boxes, exact intersection remains supported under an
 explicit pairwise-comparison budget; inputs that exceed it fail closed rather
 than making validation work unbounded.
 
-## Boundary to the Next Phase
+## Runtime Binding
 
-This PR is intentionally limited to logical planning. A later runtime-binding
-phase receives a `LogicalTransferPlan` and concrete
-`WeightRuntimeBindingManifest` values, revalidates physical address bounds,
-leases, generations, and alias scope, then produces an executor-facing bound
-plan.
+Binding rechecks the exact source and target placement identities, placement
+digests, participant selection, runtime fragment geometry, device/allocation
+bounds, lease generation, and declared alias scope. It rejects a reconstructed
+logical plan with incomplete target coverage, forged Store fragments, or
+conflicting physical target ranges.
+
+The returned `TransferPlan` is a bound, attested snapshot. It has no `execute`
+or `submit` operation and does not retain allocation lifetime. A later Transfer
+Engine executor must acquire real allocation guards and revalidate its bindings
+atomically with submission.
 
 Transfer Engine lowering, DMA submission, Store persistence/lifecycle, and
-framework activation remain outside this logical planner. Framework adapters
-own model semantics and conversion into canonical manifests; Mooncake core does
-not infer those semantics from framework objects or parameter names.
+framework activation remain outside this phase. Framework adapters own model
+semantics and conversion into canonical manifests; Mooncake core does not infer
+those semantics from framework objects or parameter names.
