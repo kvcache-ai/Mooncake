@@ -239,6 +239,27 @@ def test_catalog_transfer_lifecycle_and_failure_retries() -> None:
     assert transfer.cleaned[-1] == "manifest/put-3"
 
 
+def test_catalog_transfer_drain_resolves_pending_publications() -> None:
+    catalog, transfer = DataProtoCatalog(), FakeTransfer()
+    fail_publication = True
+
+    def call(method, *args, **kwargs):
+        if method == "publish" and fail_publication:
+            raise RuntimeError("publication failed")
+        return getattr(catalog, method)(*args, **kwargs)
+
+    client = DataProtoCatalogTransfer(transfer, call)
+    data = type("FakeData", (list,), {"fields": ("value",)})([None])
+    with pytest.raises(RuntimeError, match="publication failed"):
+        client.put(data, partition="train", keys=["a"])
+    with pytest.raises(RuntimeError, match="publish pending"):
+        client.drain()
+
+    fail_publication = False
+    client.drain()
+    assert transfer.cleaned == ["manifest/put-1"]
+
+
 def test_catalog_retry_does_not_resurrect_a_superseded_fragment() -> None:
     catalog, transfer = DataProtoCatalog(), FakeTransfer()
 
