@@ -5,6 +5,7 @@
 #include "client_service.h"
 #include "common.h"
 #include "config.h"
+#include "crash_handler.h"
 #include "real_client.h"
 
 using namespace mooncake;
@@ -109,6 +110,7 @@ int main(int argc, char *argv[]) {
     // Otherwise, the main thread will not apply signal mask before other
     // spawning threads, leading to missing signal processing.
     mooncake::ResourceTracker::getInstance();
+    mooncake::InstallCrashHandler();
 
     gflags::ParseCommandLineFlags(&argc, &argv, true);
     if (!FLAGS_log_dir.empty()) {

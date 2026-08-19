@@ -1,7 +1,8 @@
 find_package(yaml-cpp REQUIRED)
 
-set(MOONCAKE_COMMON_SOURCES crc_checksum.cpp default_config.cpp environ.cpp
-                            rpc_client_io_context.cpp)
+set(MOONCAKE_COMMON_SOURCES
+    crash_handler.cpp crc_checksum.cpp default_config.cpp environ.cpp
+    rpc_client_io_context.cpp)
 
 add_library(asio_shared SHARED asio_impl.cpp)
 
@@ -39,8 +40,9 @@ target_include_directories(
   PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../include>
          $<INSTALL_INTERFACE:include>)
 
-target_link_libraries(mooncake_common PUBLIC asio_shared yaml-cpp jsoncpp
-                                             yalantinglibs::yalantinglibs)
+target_link_libraries(
+  mooncake_common PUBLIC asio_shared yaml-cpp jsoncpp
+                         yalantinglibs::yalantinglibs glog::glog)
 
 if(BUILD_SHARED_LIBS)
   install(TARGETS mooncake_common DESTINATION lib)
