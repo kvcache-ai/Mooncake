@@ -19,6 +19,7 @@
 
 #include "allocation_strategy.h"
 #include "tenant_quota_policy_store.h"
+#include "test_buffer_allocator.h"
 #include "types.h"
 
 namespace mooncake::test {
@@ -53,54 +54,6 @@ class BlockingTenantQuotaPolicyStore final : public TenantQuotaPolicyStore {
     std::promise<void> allow_save_promise_;
     std::future<void> allow_save_;
 };
-
-#ifdef USE_NOF
-class BlockingAllocationStrategy final : public AllocationStrategy {
-   public:
-    BlockingAllocationStrategy()
-        : allow_allocation_(allow_allocation_promise_.get_future()) {}
-
-    std::future<void> AllocationStarted() {
-        return allocation_started_promise_.get_future();
-    }
-
-    void AllowAllocation() { allow_allocation_promise_.set_value(); }
-
-    tl::expected<std::vector<Replica>, ErrorCode> Allocate(
-        const AllocatorManager& allocator_manager, const size_t slice_length,
-        const size_t replica_num,
-        const std::vector<std::string>& preferred_segments,
-        const std::set<std::string>& excluded_segments,
-        const ReplicaType replica_type) override {
-        BlockOnce();
-        return delegate_.Allocate(allocator_manager, slice_length, replica_num,
-                                  preferred_segments, excluded_segments,
-                                  replica_type);
-    }
-
-    tl::expected<Replica, ErrorCode> AllocateFrom(
-        const AllocatorManager& allocator_manager, const size_t slice_length,
-        const std::string& segment_name) override {
-        return delegate_.AllocateFrom(allocator_manager, slice_length,
-                                      segment_name);
-    }
-
-   private:
-    void BlockOnce() {
-        bool expected = true;
-        if (block_next_allocation_.compare_exchange_strong(expected, false)) {
-            allocation_started_promise_.set_value();
-            allow_allocation_.wait();
-        }
-    }
-
-    RandomAllocationStrategy delegate_;
-    std::atomic<bool> block_next_allocation_{true};
-    std::promise<void> allocation_started_promise_;
-    std::promise<void> allow_allocation_promise_;
-    std::future<void> allow_allocation_;
-};
-#endif
 
 class MasterServiceTenantQuotaTest : public ::testing::Test {
    protected:
@@ -213,9 +166,31 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
     }
 
 #ifdef USE_NOF
-    void ReplaceAllocationStrategy(
-        MasterService& service, std::shared_ptr<AllocationStrategy> strategy) {
-        service.allocation_strategy_ = std::move(strategy);
+    std::shared_ptr<TestBufferAllocator> ReplaceNoFAllocator(
+        MasterService& service, std::string_view segment_name) {
+        auto allocator = std::make_shared<TestBufferAllocator>(
+            std::string(segment_name), std::string(segment_name), 4096,
+            kSegmentBase);
+        auto target = std::make_unique<AllocationTarget>(
+            allocator.get(), AllocationTargetKind::STANDARD);
+
+        auto& manager = service.nof_segment_manager_;
+        std::unique_lock lock(manager.pool_mutex_);
+        auto mounted = std::find_if(
+            manager.mounted_segments_.begin(), manager.mounted_segments_.end(),
+            [&](const auto& entry) {
+                return entry.second.segment.name == segment_name;
+            });
+        EXPECT_NE(mounted, manager.mounted_segments_.end());
+        if (mounted == manager.mounted_segments_.end()) {
+            return nullptr;
+        }
+        EXPECT_TRUE(manager.placement_index_.ReplaceTarget(
+            segment_name, mounted->second.allocation_target.get(),
+            target.get()));
+        mounted->second.buf_allocator = allocator;
+        mounted->second.allocation_target = std::move(target);
+        return allocator;
     }
 #endif
 
@@ -336,7 +311,7 @@ class MasterServiceTenantQuotaTest : public ::testing::Test {
         segment.te_endpoint = segment.name;
         next_segment_offset_ += size + 4096;
 
-        auto segment_access = service.segment_manager_.getSegmentAccess();
+        auto segment_access = service.segment_pool_.getSegmentPoolAccess();
         return segment_access.MountSegment(segment, generate_uuid());
     }
 
@@ -1079,10 +1054,10 @@ TEST_F(MasterServiceTenantQuotaTest,
     MasterService service(MakeConfig({{TenantId("tenant-a"), 1000}}));
     UUID client_id = MountNoFSegment(service);
 
-    auto blocking_strategy = std::make_shared<BlockingAllocationStrategy>();
-    auto* blocking_strategy_ptr = blocking_strategy.get();
-    auto allocation_started = blocking_strategy_ptr->AllocationStarted();
-    ReplaceAllocationStrategy(service, std::move(blocking_strategy));
+    auto blocking_allocator = ReplaceNoFAllocator(service, "quota_nof_segment");
+    ASSERT_NE(blocking_allocator, nullptr);
+    blocking_allocator->BlockNext();
+    auto allocation_started = blocking_allocator->AllocationStarted();
 
     ReplicateConfig config;
     config.replica_num = 0;
@@ -1099,7 +1074,7 @@ TEST_F(MasterServiceTenantQuotaTest,
     if (allocation_started.wait_for(std::chrono::seconds(5)) !=
         std::future_status::ready) {
         policy_lock.unlock();
-        blocking_strategy_ptr->AllowAllocation();
+        blocking_allocator->AllowAllocation();
         put_thread.join();
         FAIL() << "zero-charge PutStart waited for tenant quota policy mutex";
     }
@@ -1119,7 +1094,7 @@ TEST_F(MasterServiceTenantQuotaTest,
         << "tenant deletion passed the metadata scan while zero-charge "
            "PutStart still held the target metadata shard";
 
-    blocking_strategy_ptr->AllowAllocation();
+    blocking_allocator->AllowAllocation();
     put_thread.join();
     delete_thread.join();
 

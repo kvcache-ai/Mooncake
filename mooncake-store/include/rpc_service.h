@@ -13,7 +13,6 @@
 #include "rpc_types.h"
 #include "master_config.h"
 #include "kv_event/kv_event_publisher.h"
-#include "segment.h"
 
 namespace mooncake {
 

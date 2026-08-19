@@ -27,13 +27,14 @@
 #include <ylt/util/expected.hpp>
 #include <ylt/util/tl/expected.hpp>
 
-#include "allocation_strategy.h"
 #include "background_worker.h"
 #include "count_min_sketch.h"
 #include "deadline_scheduler.h"
 #include "master_metric_manager.h"
 #include "mutex.h"
-#include "segment.h"
+#include "nof_segment_manager.h"
+#include "segment_pool.h"
+#include "segment_pool_access.h"
 #include "local_ssd/manager.h"
 #include "tenant_quota_ledger.h"
 #include "tenant_quota_sharded.h"
@@ -68,7 +69,6 @@ class EtcdOpLogStore;
 class DfsGlobalAllocator;
 
 // Forward declarations
-class AllocationStrategy;
 class EvictionStrategy;
 class HaKvBackend;
 class HttpMetadataServer;
@@ -113,7 +113,7 @@ class BatchEvictBench;
  * 3. snapshot_mutex_
  * 4. metadata_shards_[shard_idx_].mutex
  * 5. tenant_quota_recompute_mutex_
- * 6. ShardedTenantQuotaTable internal mutex or segment_mutex_
+ * 6. ShardedTenantQuotaTable internal mutex or pool_mutex_
  * 7. soft_pin_deadline_index_ mutex
  *
  * Strict tenant admission and policy mutation paths that need both
@@ -788,7 +788,7 @@ class MasterService {
 
     /**
      * @brief Stage a PROCESSING MEMORY replica for an existing key. Allocates
-     * DRAM via the existing AllocationStrategy, optionally biased toward the
+     * DRAM via SegmentPool placement, optionally biased toward the
      * caller's local memory segment via preferred_segments. The new replica is
      * invisible to readers until NotifyPromotionSuccess flips it to COMPLETE.
      *
@@ -2628,12 +2628,12 @@ class MasterService {
     std::unique_ptr<DfsGlobalAllocator> dfs_allocator_;
 
     // Segment management
-    SegmentManager segment_manager_;
+    SegmentPool segment_pool_;
     LocalSsdManager local_ssd_manager_;
     NoFSegmentManager nof_segment_manager_;
     BufferAllocatorType memory_allocator_type_;
-    const AllocationStrategyType allocation_strategy_type_;
-    std::shared_ptr<AllocationStrategy> allocation_strategy_;
+    const PlacementPolicyType memory_policy_type_;
+    const PlacementPolicyType nof_policy_type_;
 
     std::unique_ptr<SnapshotObjectStore> snapshot_object_store_;
     std::unique_ptr<ha::SnapshotCatalogStore> snapshot_catalog_store_;
@@ -2721,7 +2721,7 @@ class MasterService {
     tl::expected<void, ErrorCode> ValidateDrainRequest(
         const CreateDrainJobRequest& request);
     tl::expected<void, ErrorCode> ValidateDrainRequestLocked(
-        ScopedSegmentAccess& segment_access,
+        ScopedSegmentPoolAccess& segment_access,
         const CreateDrainJobRequest& request);
     void ProcessDrainJobs();
     void RefreshDrainJobTasks(DrainJob& job);

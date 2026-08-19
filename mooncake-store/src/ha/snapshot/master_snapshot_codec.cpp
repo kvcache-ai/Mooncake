@@ -6,8 +6,10 @@
 #include <vector>
 
 #include "master_service.h"
-#include "segment.h"
+#include "nof_segment_manager.h"
+#include "segment_pool.h"
 #include "serialize/serializer.h"
+#include "ha/snapshot/segment_pool_snapshot_codec.h"
 #include "task_manager.h"
 
 namespace mooncake::ha {
@@ -120,17 +122,17 @@ tl::expected<void, SerializationError> MasterSnapshotCodec::DecodeMetadata(
 
 tl::expected<std::vector<uint8_t>, SerializationError>
 MasterSnapshotCodec::EncodeSegments(
-    SegmentManager& segment_manager, LocalSsdManager& local_ssd_manager,
+    SegmentPool& segment_manager, LocalSsdManager& local_ssd_manager,
     NoFSegmentManager& nof_segment_manager) const {
     // Note: NoFSegmentManager is not currently serialized in snapshots
-    SegmentSerializer serializer(&segment_manager);
-    return serializer.Serialize(local_ssd_manager.ExportPersistedState());
+    return SegmentPoolSnapshotCodec::Encode(
+        segment_manager, local_ssd_manager.ExportPersistedState());
 }
 
 tl::expected<void, SerializationError> MasterSnapshotCodec::DecodeSegments(
     MasterService* master_service, const std::vector<uint8_t>& data) const {
-    SegmentSerializer serializer(&master_service->segment_manager_);
-    auto local_ssd_state = serializer.Deserialize(data);
+    auto local_ssd_state =
+        SegmentPoolSnapshotCodec::Decode(master_service->segment_pool_, data);
     if (!local_ssd_state) {
         return tl::unexpected(local_ssd_state.error());
     }

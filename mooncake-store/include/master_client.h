@@ -14,7 +14,7 @@
 
 #include "client_metric.h"
 #include "replica.h"
-#include "segment.h"
+#include "nof_segment_manager.h"
 #include "types.h"
 #include "rpc_types.h"
 #include "master_metric_manager.h"

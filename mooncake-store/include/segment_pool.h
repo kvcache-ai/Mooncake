@@ -1,0 +1,77 @@
+#pragma once
+
+#include <boost/functional/hash.hpp>
+#include <optional>
+#include <shared_mutex>
+#include <span>
+#include <string>
+#include <string_view>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+
+#include "allocation_strategy.h"
+#include "region_driver.h"
+#include "segment_pool_types.h"
+
+namespace mooncake {
+
+class MasterServiceConfig;
+class ScopedSegmentPoolAccess;
+class SegmentPoolView;
+
+class SegmentPool final {
+   public:
+    explicit SegmentPool(const MasterServiceConfig& config);
+    explicit SegmentPool(const RegionDriverConfig& config);
+    explicit SegmentPool(RegionDriverRegistry region_drivers)
+        : region_drivers_(std::move(region_drivers)) {}
+
+    void releaseCapacityMetrics();
+
+    ScopedSegmentPoolAccess getSegmentPoolAccess();
+    SegmentPoolView getView() const;
+
+    tl::expected<std::vector<Replica>, ErrorCode> Allocate(
+        PlacementPolicyType policy_type,
+        const SegmentAllocationRequest& request,
+        std::optional<LocalSSDMetricsView> local_ssd_metrics = std::nullopt,
+        AllocationDiagnostics* diagnostics = nullptr);
+    tl::expected<Replica, ErrorCode> AllocateFrom(
+        size_t size, std::string_view group_name,
+        ReplicaType replica_type = ReplicaType::MEMORY);
+    std::optional<UUID> GetOwnerClientId(std::string_view group_name) const;
+    tl::expected<RegionInitialState, ErrorCode> BuildInitialState(
+        const Segment& segment,
+        std::span<const AllocatedBuffer::Descriptor> descriptors) const;
+
+    bool HasSegmentByEndpoint(const std::string& endpoint) const;
+    bool IsResourceInactive(
+        const std::shared_ptr<BufferAllocatorBase>& allocator) const;
+    bool GetSegmentBasicInfo(const UUID& segment_id, std::string& segment_name,
+                             std::string& te_endpoint) const;
+
+   private:
+    RegionDriver* GetDriver(RegionKind kind);
+    const RegionDriver* GetDriver(RegionKind kind) const;
+    RegionResource* GetResource(const MountedRegion& mounted);
+    const RegionResource* GetResource(const MountedRegion& mounted) const;
+
+    mutable std::shared_mutex pool_mutex_;
+    PlacementIndex placement_index_;
+    ReplicaAllocator replica_allocator_;
+    RegionDriverRegistry region_drivers_;
+    std::unordered_map<UUID, MountedRegion, boost::hash<UUID>> mounted_regions_;
+    std::unordered_map<UUID, std::vector<UUID>, boost::hash<UUID>>
+        client_segments_;
+    ClientByRegionName client_by_name_;
+    std::unordered_map<std::string, UUID> segment_id_by_name_;
+    HostRegionIndex regions_by_host_;
+    std::unordered_set<UUID, boost::hash<UUID>> capacity_accounted_regions_;
+
+    friend class ScopedSegmentPoolAccess;
+    friend class SegmentPoolView;
+    friend class SegmentTest;
+};
+
+}  // namespace mooncake

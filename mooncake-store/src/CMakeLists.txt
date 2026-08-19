@@ -19,7 +19,12 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     master_snapshot_manager.cpp
     master_snapshot_repository.cpp
     master_metric_manager.cpp
-    segment.cpp
+    segment_pool.cpp
+    segment_pool_access.cpp
+    segment_pool_view.cpp
+    nof_segment_manager.cpp
+    region_driver.cpp
+    region_initial_state.cpp
     tenant_quota.cpp
     tenant_quota_ledger.cpp
     tenant_quota_policy_store.cpp
@@ -39,6 +44,8 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     ha/standby_metadata_store.cpp
     ha/snapshot/catalog_backed_snapshot_provider.cpp
     ha/snapshot/batch_oplog/codec.cpp
+    ha/snapshot/allocator_snapshot_codec.cpp
+    ha/snapshot/segment_pool_snapshot_codec.cpp
     ha/snapshot/batch_oplog/metadata.cpp
     ha/snapshot/batch_oplog/writer.cpp
     ha/snapshot/master_snapshot_codec.cpp
@@ -178,7 +185,10 @@ int main() {
     set(MOONCAKE_HAVE_NVME_URING_CMD ON)
     message(STATUS "io_uring: NVMe uring command support enabled")
   else()
-    message(STATUS "io_uring: NVMe uring command support unavailable, NVMe KV io_uring executor disabled")
+    message(
+      STATUS
+        "io_uring: NVMe uring command support unavailable, NVMe KV io_uring executor disabled"
+    )
   endif()
 endif()
 
