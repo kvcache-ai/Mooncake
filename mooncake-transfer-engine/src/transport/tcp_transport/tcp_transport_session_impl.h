@@ -401,6 +401,21 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
     }
     std::optional<asio::steady_timer> status_timer_;
     bool status_deadline_disarmed_ = false;
+    // Unlike the status-frame deadline above, this is a sliding liveness
+    // deadline for the whole request. It is refreshed only after an Asio
+    // completion reports actual protocol or payload progress.
+    static int progressTimeoutSec() {
+        const char* env = std::getenv("MC_TCP_PROGRESS_TIMEOUT_SEC");
+        if (env) {
+            int v = std::atoi(env);
+            if (v > 0) return v;
+        }
+        return 30;
+    }
+    std::optional<asio::steady_timer> progress_timer_;
+    uint64_t progress_epoch_ = 0;
+    bool progress_deadline_disarmed_ = true;
+    bool progress_timeout_committed_ = false;
     bool terminal_reported_ = false;
     OnTerminal on_terminal_;
 
@@ -416,6 +431,7 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
 
     void cancel() noexcept {
         cancelStatusDeadline();
+        cancelProgressDeadline();
         if (!socket_) return;
         asio::error_code cancel_ec;
         socket_->cancel(cancel_ec);
@@ -424,10 +440,10 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
     }
 
    private:
-    // All handlers run on the transport's single io thread, so arm/cancel
-    // and the expiry handler never race. Expiry only closes the socket: the
-    // pending status read then completes with an error and its handler owns
-    // the failure path (including source-buffer quiescence for WRITE).
+    // The status-frame deadline is separate from the sliding progress
+    // deadline below. Its expiry closes the socket, but a status completion
+    // already ready in the executor queue retains its original result; the
+    // status handler still owns the terminal path.
     void armStatusDeadline() {
         auto self(shared_from_this());
         status_deadline_disarmed_ = false;
@@ -461,6 +477,83 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         }
     }
 
+    void refreshProgressDeadline() {
+        if (terminal_reported_ || progress_timeout_committed_) return;
+        auto self(shared_from_this());
+        progress_deadline_disarmed_ = false;
+        ++progress_epoch_;
+        if (progress_epoch_ == 0) ++progress_epoch_;
+        const uint64_t progress_epoch = progress_epoch_;
+        if (!progress_timer_) progress_timer_.emplace(socket_->get_executor());
+        progress_timer_->expires_after(
+            std::chrono::seconds(progressTimeoutSec()));
+        progress_timer_->async_wait(
+            [this, self, progress_epoch](const asio::error_code& ec) {
+                handleProgressDeadline(progress_epoch, ec);
+            });
+    }
+
+    void handleProgressDeadline(uint64_t progress_epoch,
+                                const asio::error_code& ec) {
+        if (ec == asio::error::operation_aborted ||
+            progress_deadline_disarmed_ || terminal_reported_ ||
+            progress_epoch != progress_epoch_) {
+#ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
+            (void)invokeSessionProgressHook(kSessionTimeoutStale, false);
+#endif
+            return;
+        }
+        progress_timeout_committed_ = true;
+        progress_deadline_disarmed_ = true;
+        ++progress_epoch_;
+        if (progress_epoch_ == 0) ++progress_epoch_;
+        if ((header_.opcode & ~kOpcodeV2Flag) ==
+            static_cast<uint8_t>(TransferRequest::WRITE)) {
+            write_abort_requested_ = true;
+        }
+#ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
+        (void)invokeSessionProgressHook(kSessionTimeoutCommitted,
+                                        write_body_in_flight_);
+#endif
+        LOG(ERROR) << "ClientSession: no transfer progress within "
+                   << progressTimeoutSec() << "s; dropping connection";
+        if (socket_ && socket_->is_open()) {
+            asio::error_code cancel_ec;
+            socket_->cancel(cancel_ec);
+            asio::error_code close_ec;
+            socket_->close(close_ec);
+        }
+    }
+
+    bool acceptProgress() {
+        if (progress_timeout_committed_) return false;
+        refreshProgressDeadline();
+        return !progress_timeout_committed_;
+    }
+
+#ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
+    bool acceptProgressForTest(int event) {
+        const uint64_t previous_epoch = progress_epoch_;
+        const int action = invokeSessionProgressHook(event, false);
+        if (action == kSessionCommitTimeoutBeforeProgress)
+            handleProgressDeadline(previous_epoch, asio::error_code{});
+        if (!acceptProgress()) return false;
+        if (action == kSessionReplayPreviousTimeoutAfterProgress)
+            handleProgressDeadline(previous_epoch, asio::error_code{});
+        return !progress_timeout_committed_;
+    }
+#endif
+
+    void cancelProgressDeadline() {
+        progress_deadline_disarmed_ = true;
+        ++progress_epoch_;
+        if (progress_epoch_ == 0) ++progress_epoch_;
+        if (progress_timer_) {
+            asio::error_code ec;
+            progress_timer_->cancel(ec);
+        }
+    }
+
     // Single terminal path. The invoking Asio operation has already released
     // its buffer before entering its completion handler. The lane posts any
     // follow-up pump, so a clean socket cannot be reused inline here.
@@ -468,6 +561,10 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
         if (terminal_reported_) return;
         terminal_reported_ = true;
         cancelStatusDeadline();
+        cancelProgressDeadline();
+#ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
+        (void)invokeSessionProgressHook(kSessionTerminal, clean);
+#endif
         auto on_terminal = std::move(on_terminal_);
         if (on_terminal) on_terminal(status, clean);
     }
@@ -497,6 +594,15 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                     finalize(TransferStatusEnum::FAILED, false);
                     return;
                 }
+                if (!acceptProgress()) {
+                    if ((header_.opcode & ~kOpcodeV2Flag) ==
+                        static_cast<uint8_t>(TransferRequest::WRITE)) {
+                        abortWrite();
+                    } else {
+                        finalize(TransferStatusEnum::FAILED, false);
+                    }
+                    return;
+                }
                 if ((header_.opcode & ~kOpcodeV2Flag) ==
                     (uint8_t)TransferRequest::WRITE) {
                     if (v2_) readWriteAck();  // concurrent with the body
@@ -507,6 +613,10 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                     readBody();
                 }
             });
+        // Asio does not invoke the completion handler inline. Arm only after
+        // initiation succeeds so a synchronous initiation exception cannot
+        // leave a timer handler retaining this otherwise-abandoned session.
+        refreshProgressDeadline();
     }
 
     // v2 READ: the server prefixes the data with a status frame.
@@ -522,6 +632,10 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                         << "ClientSession: failed to read READ status "
                            "frame. Error: "
                         << ec.message() << " (value: " << ec.value() << ")";
+                    finalize(TransferStatusEnum::FAILED, false);
+                    return;
+                }
+                if (!acceptProgress()) {
                     finalize(TransferStatusEnum::FAILED, false);
                     return;
                 }
@@ -566,6 +680,17 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                                "ack frame. Error: "
                             << ec.message() << " (value: " << ec.value() << ")";
                     }
+                    abortWrite();
+                    return;
+                }
+                bool progress_accepted = false;
+#ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
+                progress_accepted =
+                    acceptProgressForTest(kSessionWriteAckSuccess);
+#else
+                progress_accepted = acceptProgress();
+#endif
+                if (!progress_accepted) {
                     abortWrite();
                     return;
                 }
@@ -631,6 +756,25 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                         << " using buffer " << static_cast<void*>(dram_buffer)
                         << ". Error: " << ec.message()
                         << " (value: " << ec.value() << ")";
+#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
+    defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
+    defined(USE_COREX)
+                    if (cuda_device >= 0) delete[] dram_buffer;
+#endif
+                    finalize(TransferStatusEnum::FAILED, false);
+                    return;
+                }
+
+                bool progress_accepted = !progress_timeout_committed_;
+                if (progress_accepted && transferred_bytes > 0) {
+#ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
+                    progress_accepted =
+                        acceptProgressForTest(kSessionReadBodySuccess);
+#else
+                    progress_accepted = acceptProgress();
+#endif
+                }
+                if (!progress_accepted) {
 #if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP) ||  \
     defined(USE_MLU) || defined(USE_MACA) || defined(USE_HYGON) || \
     defined(USE_COREX)
@@ -753,9 +897,14 @@ struct ClientSession : public std::enable_shared_from_this<ClientSession> {
                     return;
                 }
                 if (write_abort_requested_) {
-                    // The early ack path closed the socket while this
-                    // operation still owned the caller's source buffer. It is
-                    // safe to publish failure now that the handler has run.
+                    // An early ACK failure or a committed progress timeout
+                    // closed the socket while this operation still owned the
+                    // caller's source buffer. It is safe to publish failure
+                    // now that the handler has run.
+                    finalize(TransferStatusEnum::FAILED, false);
+                    return;
+                }
+                if (transferred_bytes > 0 && !acceptProgress()) {
                     finalize(TransferStatusEnum::FAILED, false);
                     return;
                 }

@@ -56,6 +56,7 @@ using LaneRetryHandlerHook = void (*)() noexcept;
 using LaneAdmissionHandlerHook = void (*)() noexcept;
 using LaneObserverHook = void (*)(int, size_t, uint64_t, size_t, bool) noexcept;
 using LaneFailureReasonHook = void (*)(int) noexcept;
+using SessionProgressHook = int (*)(int, bool) noexcept;
 
 std::mutex lane_test_hook_mutex;
 LaneConnectHandlerHook lane_connect_handler_hook = nullptr;
@@ -64,6 +65,7 @@ LaneRetryHandlerHook lane_retry_handler_hook = nullptr;
 LaneAdmissionHandlerHook lane_admission_handler_hook = nullptr;
 LaneObserverHook lane_observer_hook = nullptr;
 LaneFailureReasonHook lane_failure_reason_hook = nullptr;
+SessionProgressHook session_progress_hook = nullptr;
 
 enum LaneTestEvent {
     kLaneQueueAdmitted = 1,
@@ -83,6 +85,20 @@ enum LaneTestEvent {
     kLaneAdmissionTimerFired = 15,
     kLaneAdmissionTimerLate = 16,
     kLaneAdmissionHardRejected = 17,
+};
+
+enum SessionProgressTestEvent {
+    kSessionReadBodySuccess = 1,
+    kSessionWriteAckSuccess = 2,
+    kSessionTimeoutCommitted = 3,
+    kSessionTimeoutStale = 4,
+    kSessionTerminal = 5,
+};
+
+enum SessionProgressTestAction {
+    kSessionProgressNoAction = 0,
+    kSessionCommitTimeoutBeforeProgress = 1,
+    kSessionReplayPreviousTimeoutAfterProgress = 2,
 };
 
 void invokeLaneConnectHandlerHook() noexcept {
@@ -142,6 +158,15 @@ void invokeLaneFailureReasonHook(int reason) noexcept {
     }
     if (hook) hook(reason);
 }
+
+int invokeSessionProgressHook(int event, bool detail) noexcept {
+    SessionProgressHook hook;
+    {
+        std::lock_guard<std::mutex> lock(lane_test_hook_mutex);
+        hook = session_progress_hook;
+    }
+    return hook ? hook(event, detail) : kSessionProgressNoAction;
+}
 }  // namespace
 
 void tcpTransportSetLaneConnectHandlerHookForTest(
@@ -177,6 +202,12 @@ void tcpTransportSetLaneFailureReasonHookForTest(
     LaneFailureReasonHook hook) noexcept {
     std::lock_guard<std::mutex> lock(lane_test_hook_mutex);
     lane_failure_reason_hook = hook;
+}
+
+void tcpTransportSetSessionProgressHookForTest(
+    SessionProgressHook hook) noexcept {
+    std::lock_guard<std::mutex> lock(lane_test_hook_mutex);
+    session_progress_hook = hook;
 }
 
 bool tcpTransportLaneTypesAreMoveOnlyForTest() noexcept {

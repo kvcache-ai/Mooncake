@@ -64,6 +64,8 @@ void tcpTransportSetLaneAdmissionHandlerHookForTest(
     void (*hook)() noexcept) noexcept;
 void tcpTransportSetLaneFailureReasonHookForTest(
     void (*hook)(int) noexcept) noexcept;
+void tcpTransportSetSessionProgressHookForTest(
+    int (*hook)(int, bool) noexcept) noexcept;
 bool tcpTransportLaneTypesAreMoveOnlyForTest() noexcept;
 }  // namespace mooncake
 #endif
@@ -108,6 +110,20 @@ enum WorkFailureReasonForTest {
     kWorkShutdown = 5,
 };
 
+enum SessionProgressTestEvent {
+    kSessionReadBodySuccess = 1,
+    kSessionWriteAckSuccess = 2,
+    kSessionTimeoutCommitted = 3,
+    kSessionTimeoutStale = 4,
+    kSessionTerminal = 5,
+};
+
+enum SessionProgressTestAction {
+    kSessionProgressNoAction = 0,
+    kSessionCommitTimeoutBeforeProgress = 1,
+    kSessionReplayPreviousTimeoutAfterProgress = 2,
+};
+
 std::atomic<bool> lane_connect_handler_entered{false};
 std::atomic<int> lane_connect_injection_call_count{0};
 std::atomic<bool> release_lane_connect_handler{false};
@@ -130,6 +146,7 @@ std::atomic<int> queue_rejection_count{0};
 std::atomic<int> lane_connecting_count{0};
 std::atomic<int> lane_busy_count{0};
 std::atomic<int> lane_terminal_count{0};
+std::atomic<size_t> lane_terminal_socket_count{0};
 std::atomic<int> lane_shutdown_clean_count{0};
 std::atomic<int> late_lane_handler_count{0};
 std::atomic<int> retry_armed_count{0};
@@ -148,6 +165,16 @@ std::atomic<int> connect_failure_count{0};
 std::atomic<int> runtime_unavailable_failure_count{0};
 std::atomic<int> session_failure_count{0};
 std::atomic<int> shutdown_failure_count{0};
+std::atomic<int> session_progress_target_event{0};
+std::atomic<int> session_progress_action{0};
+std::atomic<int> session_timeout_committed_count{0};
+std::atomic<int> session_timeout_stale_count{0};
+std::atomic<int> session_terminal_count{0};
+std::atomic<int> session_dirty_terminal_count{0};
+std::atomic<bool> session_timeout_commit_entered{false};
+std::atomic<bool> session_timeout_commit_had_write_in_flight{false};
+std::atomic<bool> hold_session_timeout_commit{false};
+std::atomic<bool> release_session_timeout_commit{false};
 
 template <typename Predicate, typename Rep, typename Period>
 bool waitForPredicate(Predicate&& predicate,
@@ -192,6 +219,7 @@ void resetLaneTestState() noexcept {
     lane_connecting_count.store(0, std::memory_order_release);
     lane_busy_count.store(0, std::memory_order_release);
     lane_terminal_count.store(0, std::memory_order_release);
+    lane_terminal_socket_count.store(0, std::memory_order_release);
     lane_shutdown_clean_count.store(0, std::memory_order_release);
     late_lane_handler_count.store(0, std::memory_order_release);
     retry_armed_count.store(0, std::memory_order_release);
@@ -210,6 +238,20 @@ void resetLaneTestState() noexcept {
     runtime_unavailable_failure_count.store(0, std::memory_order_release);
     session_failure_count.store(0, std::memory_order_release);
     shutdown_failure_count.store(0, std::memory_order_release);
+}
+
+void resetSessionProgressTestState() noexcept {
+    session_progress_target_event.store(0, std::memory_order_release);
+    session_progress_action.store(0, std::memory_order_release);
+    session_timeout_committed_count.store(0, std::memory_order_release);
+    session_timeout_stale_count.store(0, std::memory_order_release);
+    session_terminal_count.store(0, std::memory_order_release);
+    session_dirty_terminal_count.store(0, std::memory_order_release);
+    session_timeout_commit_entered.store(false, std::memory_order_release);
+    session_timeout_commit_had_write_in_flight.store(false,
+                                                     std::memory_order_release);
+    hold_session_timeout_commit.store(false, std::memory_order_release);
+    release_session_timeout_commit.store(false, std::memory_order_release);
 }
 
 bool failSecondLaneConnectAttemptOnce(size_t) noexcept {
@@ -278,8 +320,11 @@ void observeLaneState(int event, size_t queue_depth, uint64_t,
     }
     if (event == kLaneQueueRejected)
         queue_rejection_count.fetch_add(1, std::memory_order_relaxed);
-    if (event == kLaneTerminal)
+    if (event == kLaneTerminal) {
         lane_terminal_count.fetch_add(1, std::memory_order_relaxed);
+        lane_terminal_socket_count.store(active_sockets,
+                                         std::memory_order_release);
+    }
     if (event == kLaneShutdownClean)
         lane_shutdown_clean_count.fetch_add(1, std::memory_order_relaxed);
     if (event == kLaneLateHandler)
@@ -334,6 +379,36 @@ void observeWorkFailureReason(int reason) noexcept {
         shutdown_failure_count.fetch_add(1, std::memory_order_relaxed);
 }
 
+int observeSessionProgress(int event, bool detail) noexcept {
+    if (event == kSessionTimeoutCommitted) {
+        session_timeout_committed_count.fetch_add(1, std::memory_order_relaxed);
+        session_timeout_commit_had_write_in_flight.store(
+            detail, std::memory_order_release);
+        if (hold_session_timeout_commit.load(std::memory_order_acquire)) {
+            session_timeout_commit_entered.store(true,
+                                                 std::memory_order_release);
+            while (!release_session_timeout_commit.load(
+                std::memory_order_acquire)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        }
+    }
+    if (event == kSessionTimeoutStale)
+        session_timeout_stale_count.fetch_add(1, std::memory_order_relaxed);
+    if (event == kSessionTerminal) {
+        session_terminal_count.fetch_add(1, std::memory_order_relaxed);
+        if (!detail)
+            session_dirty_terminal_count.fetch_add(1,
+                                                   std::memory_order_relaxed);
+    }
+    if (event !=
+        session_progress_target_event.load(std::memory_order_acquire)) {
+        return kSessionProgressNoAction;
+    }
+    return session_progress_action.exchange(kSessionProgressNoAction,
+                                            std::memory_order_acq_rel);
+}
+
 class ScopedLaneHooks {
    public:
     explicit ScopedLaneHooks(bool block_first_connect_handler = false,
@@ -384,6 +459,37 @@ class ScopedLaneHooks {
         tcpTransportSetLaneAdmissionHandlerHookForTest(nullptr);
         tcpTransportSetLaneObserverHookForTest(nullptr);
         tcpTransportSetLaneFailureReasonHookForTest(nullptr);
+        active_ = false;
+    }
+
+   private:
+    bool active_ = true;
+};
+
+class ScopedSessionProgressHooks {
+   public:
+    ScopedSessionProgressHooks(int target_event = 0,
+                               int action = kSessionProgressNoAction,
+                               bool block_timeout_commit = false) {
+        resetSessionProgressTestState();
+        session_progress_target_event.store(target_event,
+                                            std::memory_order_release);
+        session_progress_action.store(action, std::memory_order_release);
+        hold_session_timeout_commit.store(block_timeout_commit,
+                                          std::memory_order_release);
+        tcpTransportSetSessionProgressHookForTest(observeSessionProgress);
+    }
+
+    ~ScopedSessionProgressHooks() { reset(); }
+
+    void releaseTimeoutCommit() noexcept {
+        release_session_timeout_commit.store(true, std::memory_order_release);
+    }
+
+    void reset() noexcept {
+        if (!active_) return;
+        releaseTimeoutCommit();
+        tcpTransportSetSessionProgressHookForTest(nullptr);
         active_ = false;
     }
 
@@ -1096,6 +1202,18 @@ TransferRequest makeWriteRequest(const EngineHandle& handle, size_t length,
     request.opcode = TransferRequest::WRITE;
     request.length = length;
     request.source = handle.pool;
+    request.target_id = handle.segment_id;
+    request.target_offset =
+        target_offset == 0 ? handle.remote_base : target_offset;
+    return request;
+}
+
+TransferRequest makeReadRequest(const EngineHandle& handle, void* destination,
+                                size_t length, uint64_t target_offset = 0) {
+    TransferRequest request;
+    request.opcode = TransferRequest::READ;
+    request.length = length;
+    request.source = destination;
     request.target_id = handle.segment_id;
     request.target_offset =
         target_offset == 0 ? handle.remote_base : target_offset;
@@ -3036,6 +3154,157 @@ TEST(TcpWriteVisibilityTest,
     reclaimBatchDescAfterEngineShutdownForTest(busy_batch_id);
     for (const auto batch_id : batch_ids)
         reclaimBatchDescAfterEngineShutdownForTest(batch_id);
+}
+
+TEST(TcpWriteVisibilityTest,
+     ProgressTimeoutWinsAgainstQueuedFinalReadCompletion) {
+    ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "1");
+    ScopedEnvVar progress_timeout("MC_TCP_PROGRESS_TIMEOUT_SEC", "30");
+    ScopedLaneHooks lane_hooks;
+    ScopedSessionProgressHooks session_hooks(
+        kSessionReadBodySuccess, kSessionCommitTimeoutBeforeProgress);
+
+    EngineHandle h;
+    h.init(P2PHANDSHAKE, "127.0.0.2:18052", 16ull << 20);
+    ASSERT_TRUE(h.ok);
+
+    char* source = static_cast<char*>(h.pool);
+    char* first_destination = source + kRegionAlign;
+    for (size_t i = 0; i < kSmallLength; ++i)
+        source[i] = static_cast<char>(i * 17 + 3);
+
+    const auto first_batch = h.engine->allocateBatchID(1);
+    ASSERT_TRUE(h.engine
+                    ->submitTransfer(
+                        first_batch,
+                        {makeReadRequest(h, first_destination, kSmallLength)})
+                    .ok());
+    TransferStatusEnum first_status = TransferStatusEnum::WAITING;
+    ASSERT_TRUE(waitForTaskTerminal(h.engine.get(), first_batch,
+                                    std::chrono::seconds(5), &first_status));
+    EXPECT_EQ(first_status, TransferStatusEnum::FAILED);
+    expectEverySliceCompletedExactlyOnce(first_batch);
+    EXPECT_EQ(session_timeout_committed_count.load(std::memory_order_acquire),
+              1);
+    EXPECT_EQ(session_dirty_terminal_count.load(std::memory_order_acquire), 1);
+    ASSERT_TRUE(waitForPredicate(
+        [] { return lane_terminal_count.load(std::memory_order_acquire) >= 1; },
+        std::chrono::seconds(5)));
+    EXPECT_EQ(lane_terminal_socket_count.load(std::memory_order_acquire), 0);
+    ASSERT_TRUE(h.engine->freeBatchID(first_batch).ok());
+    EXPECT_EQ(session_terminal_count.load(std::memory_order_acquire), 1);
+    EXPECT_EQ(session_dirty_terminal_count.load(std::memory_order_acquire), 1);
+}
+
+TEST(TcpWriteVisibilityTest,
+     ProgressTimeoutWinsAgainstQueuedFinalWriteAndAckCompletion) {
+    ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "1");
+    ScopedEnvVar progress_timeout("MC_TCP_PROGRESS_TIMEOUT_SEC", "30");
+    ScopedLaneHooks lane_hooks;
+    ScopedSessionProgressHooks session_hooks(
+        kSessionWriteAckSuccess, kSessionCommitTimeoutBeforeProgress);
+    ReusingWriteServer fake_peer;
+    ASSERT_TRUE(fake_peer.ok());
+
+    EngineHandle h;
+    h.init(P2PHANDSHAKE, "127.0.0.2:18053", 8ull << 20);
+    ASSERT_TRUE(h.ok);
+    pointTcpSegmentAt(h, fake_peer.port());
+    memset(h.pool, 0x5A, kBigLength);
+
+    const auto first_batch = h.engine->allocateBatchID(1);
+    ASSERT_TRUE(
+        h.engine->submitTransfer(first_batch, {makeWriteRequest(h, kBigLength)})
+            .ok());
+    TransferStatusEnum first_status = TransferStatusEnum::WAITING;
+    ASSERT_TRUE(waitForTaskTerminal(h.engine.get(), first_batch,
+                                    std::chrono::seconds(5), &first_status));
+    EXPECT_EQ(first_status, TransferStatusEnum::FAILED);
+    expectEverySliceCompletedExactlyOnce(first_batch);
+    EXPECT_EQ(session_timeout_committed_count.load(std::memory_order_acquire),
+              1);
+    EXPECT_EQ(session_dirty_terminal_count.load(std::memory_order_acquire), 1);
+    ASSERT_TRUE(waitForPredicate(
+        [] { return lane_terminal_count.load(std::memory_order_acquire) >= 1; },
+        std::chrono::seconds(5)));
+    EXPECT_EQ(lane_terminal_socket_count.load(std::memory_order_acquire), 0);
+    ASSERT_TRUE(h.engine->freeBatchID(first_batch).ok());
+    EXPECT_EQ(fake_peer.acceptedCount(), 1);
+    EXPECT_EQ(session_terminal_count.load(std::memory_order_acquire), 1);
+    EXPECT_EQ(session_dirty_terminal_count.load(std::memory_order_acquire), 1);
+}
+
+TEST(TcpWriteVisibilityTest, ProgressBeforeDeadlineMakesOldTimerStale) {
+    ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "1");
+    ScopedEnvVar progress_timeout("MC_TCP_PROGRESS_TIMEOUT_SEC", "30");
+    ScopedSessionProgressHooks session_hooks(
+        kSessionReadBodySuccess, kSessionReplayPreviousTimeoutAfterProgress);
+
+    EngineHandle h;
+    h.init(P2PHANDSHAKE, "127.0.0.2:18054", 8ull << 20);
+    ASSERT_TRUE(h.ok);
+
+    char* source = static_cast<char*>(h.pool);
+    char* destination = source + kRegionAlign;
+    for (size_t i = 0; i < kSmallLength; ++i)
+        source[i] = static_cast<char>(i * 29 + 11);
+
+    EXPECT_EQ(
+        runOne(h.engine.get(), makeReadRequest(h, destination, kSmallLength)),
+        TransferStatusEnum::COMPLETED);
+    EXPECT_EQ(memcmp(destination, source, kSmallLength), 0);
+    EXPECT_EQ(session_timeout_committed_count.load(std::memory_order_acquire),
+              0);
+    EXPECT_GE(session_timeout_stale_count.load(std::memory_order_acquire), 1);
+    EXPECT_EQ(session_terminal_count.load(std::memory_order_acquire), 1);
+    EXPECT_EQ(session_dirty_terminal_count.load(std::memory_order_acquire), 0);
+}
+
+TEST(TcpWriteVisibilityTest,
+     ProgressTimeoutWaitsForOutstandingWriteBeforeTerminal) {
+    constexpr size_t kRequestSize = 64ull << 20;
+    ScopedEnvVar lanes("MC_TCP_LANES_PER_PEER", "1");
+    ScopedEnvVar progress_timeout("MC_TCP_PROGRESS_TIMEOUT_SEC", "1");
+    ScopedSessionProgressHooks session_hooks(
+        /*target_event=*/0, kSessionProgressNoAction,
+        /*block_timeout_commit=*/true);
+    PayloadStallingWriteServer fake_peer(/*payload_prefix_to_read=*/0);
+    ASSERT_TRUE(fake_peer.ok());
+
+    EngineHandle h;
+    h.init(P2PHANDSHAKE, "127.0.0.2:18055", kRequestSize);
+    ASSERT_TRUE(h.ok);
+    pointTcpSegmentAt(h, fake_peer.port());
+
+    const auto batch_id = h.engine->allocateBatchID(1);
+    ASSERT_TRUE(
+        h.engine->submitTransfer(batch_id, {makeWriteRequest(h, kRequestSize)})
+            .ok());
+    ASSERT_TRUE(fake_peer.waitForHeader(std::chrono::seconds(5)));
+    ASSERT_TRUE(waitForPredicate(
+        [] {
+            return session_timeout_commit_entered.load(
+                std::memory_order_acquire);
+        },
+        std::chrono::seconds(5)));
+    EXPECT_TRUE(session_timeout_commit_had_write_in_flight.load(
+        std::memory_order_acquire));
+
+    TransferStatus status;
+    status.s = TransferStatusEnum::WAITING;
+    ASSERT_TRUE(h.engine->getTransferStatus(batch_id, 0, status).ok());
+    EXPECT_EQ(status.s, TransferStatusEnum::WAITING);
+    EXPECT_EQ(session_terminal_count.load(std::memory_order_acquire), 0);
+
+    session_hooks.releaseTimeoutCommit();
+    TransferStatusEnum final_status = TransferStatusEnum::WAITING;
+    ASSERT_TRUE(waitForTaskTerminal(h.engine.get(), batch_id,
+                                    std::chrono::seconds(5), &final_status));
+    EXPECT_EQ(final_status, TransferStatusEnum::FAILED);
+    expectEverySliceCompletedExactlyOnce(batch_id);
+    EXPECT_EQ(session_dirty_terminal_count.load(std::memory_order_acquire), 1);
+    ASSERT_TRUE(h.engine->freeBatchID(batch_id).ok());
+    fake_peer.release();
 }
 
 TEST(TcpWriteVisibilityTest, WritePayloadNoProgressFailsWithinBoundedDeadline) {
