@@ -27,7 +27,7 @@
 // Read private heartbeat_running_ / registered_ for state assertions.
 #define private public
 #define protected public
-#include "p2p_client_service.h"
+#include "p2p/client/p2p_client_service.h"
 #undef protected
 #undef private
 
@@ -135,12 +135,9 @@ TEST_F(P2PRegisterConcurrencyTest, ConcurrentRegisterNoCrash) {
     go.store(true, std::memory_order_release);
     for (auto& t : threads) t.join();
 
-    // Registers serialize on registration_mutex_, so exactly one re-registers
-    // the client (HTTP 200); the rest hit the master with the same client_id
-    // and get CLIENT_ALREADY_EXISTS -> non-200. The point of the test is no
-    // crash and a consistent terminal state, not that every concurrent register
-    // succeeds.
-    EXPECT_EQ(ok_count.load(), 1);
+    // The first request creates the client; later requests may observe the
+    // existing client and complete as idempotent re-registers.
+    EXPECT_GE(ok_count.load(), 1);
     ASSERT_TRUE(WaitFor([&] { return client->heartbeat_running_.load(); }));
     EXPECT_TRUE(client->registered_.load());
 
@@ -242,16 +239,14 @@ TEST_F(P2PRegisterConcurrencyTest, RegisterFromLocalOnlyRecovers) {
     client->Stop();
 }
 
-// A redundant /register while already registered (master returns
-// CLIENT_ALREADY_EXISTS) must not crash nor change state.
+// A redundant /register while already registered must not crash nor change
+// state.
 TEST_F(P2PRegisterConcurrencyTest, DuplicateRegisterIsNoop) {
     auto client = CreateClient();
     ASSERT_TRUE(WaitFor([&] { return client->registered_.load(); }));
     const bool hb_before = client->heartbeat_running_.load();
 
-    // Status is expected non-200 (ALREADY_EXISTS); we only care that state
-    // holds.
-    HttpPost(Url(client, "/register"));
+    EXPECT_EQ(HttpPost(Url(client, "/register")), 200);
     EXPECT_TRUE(client->registered_.load());
     EXPECT_EQ(client->heartbeat_running_.load(), hb_before);
 

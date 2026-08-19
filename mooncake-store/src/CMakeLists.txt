@@ -98,6 +98,7 @@ set(MOONCAKE_STORE_SOURCES
     p2p/ha_recovery_manager.cpp
     p2p/data_manager.cpp
     p2p/async_memcpy_executor.cpp
+    p2p/client_metrics_aggregator.cpp
     p2p/tiered_cache/tiers/dram_tier.cpp
     p2p/tiered_cache/tiers/storage_tier.cpp
     p2p/tiered_cache/scheduler/simple_policy.cpp

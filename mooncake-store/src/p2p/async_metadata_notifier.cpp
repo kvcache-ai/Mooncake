@@ -1,4 +1,4 @@
-#include "async_metadata_notifier.h"
+#include "p2p/async_metadata_notifier.h"
 
 #include <glog/logging.h>
 
@@ -407,15 +407,11 @@ void AsyncMetadataNotifier::SendBatch(std::vector<PendingOp>& batch,
         }
     }
     RecordFailure();
-    LOG(ERROR) << "BatchSyncReplica failed after " << MaxRetryCount + 1
-               << " attempts, dropping " << count << " ops";
-    // Rollback: notify failure for all ADD ops so local replicas get cleaned up
-    if (failure_cb_) {
-        for (size_t i = 0; i < req.add_keys.size(); ++i) {
-            failure_cb_(req.add_keys[i], req.add_segment_ids[i],
-                        ErrorCode::INTERNAL_ERROR);
-        }
-    }
+    LOG(ERROR) << "BatchSyncReplica failed after " << MaxRetryCount
+               << " attempts, dropping " << count << " metadata notifications";
+    // Transport/RPC failures usually mean Master is unreachable or failing
+    // over. Drop only the metadata notification; keep local replicas so HA
+    // recovery can rebuild the Master's route view from current local state.
 }
 
 void AsyncMetadataNotifier::RecordSuccess() {

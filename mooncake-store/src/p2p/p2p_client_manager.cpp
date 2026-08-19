@@ -1,4 +1,5 @@
 #include "p2p/p2p_client_manager.h"
+#include "p2p/p2p_master_metric_manager.h"
 #include "p2p/p2p_client_meta.h"
 #include <glog/logging.h>
 #include <algorithm>
@@ -97,6 +98,8 @@ HeartbeatTaskResult P2PClientManager::ProcessTask(const UUID& client_id,
                 result.detail = sync_res;
                 for (const auto& sub : sync_res.sub_results) {
                     if (sub.error != ErrorCode::OK) {
+                        // result.error means the task is failed.
+                        // here just sub task error, don't affect task result.
                         LOG(ERROR) << "fail to update segment usages"
                                    << ", client_id=" << client_id
                                    << ", segment_id=" << sub.segment_id
@@ -106,6 +109,19 @@ HeartbeatTaskResult P2PClientManager::ProcessTask(const UUID& client_id,
             } else {
                 result.error = ErrorCode::INVALID_PARAMS;
             }
+            break;
+        }
+        case HeartbeatTaskType::SYNC_CLIENT_METRIC: {
+            const auto* param =
+                std::get_if<SyncClientMetricParam>(&task.param_);
+            if (param == nullptr) {
+                result.error = ErrorCode::INVALID_PARAMS;
+                LOG(ERROR) << "SYNC_CLIENT_METRIC: invalid param"
+                           << ", client_id=" << client_id;
+                break;
+            }
+            P2PMasterMetricManager::instance().UpdateClientMetrics(
+                client_id, param->snapshot);
             break;
         }
         default:

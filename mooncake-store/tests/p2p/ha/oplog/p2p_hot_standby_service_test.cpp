@@ -16,9 +16,9 @@
 
 #include "p2p/ha/oplog/localfs_oplog_store.h"
 #include "mock_oplog_store.h"
-#include "p2p_master_service.h"
-#include "p2p_rpc_service.h"
-#include "p2p_rpc_types.h"
+#include "p2p/p2p_master_service.h"
+#include "p2p/p2p_rpc_service.h"
+#include "p2p/p2p_rpc_types.h"
 
 namespace mooncake::test {
 namespace {

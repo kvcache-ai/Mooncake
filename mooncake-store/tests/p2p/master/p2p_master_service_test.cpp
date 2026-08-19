@@ -7,13 +7,13 @@
 
 #define private public
 #define protected public
-#include "p2p_master_service.h"
+#include "p2p/p2p_master_service.h"
 #undef protected
 #undef private
 
 #include "master_config.h"
-#include "p2p_client_meta.h"
-#include "p2p_rpc_types.h"
+#include "p2p/p2p_client_meta.h"
+#include "p2p/p2p_rpc_types.h"
 #include "rpc_types.h"
 #include "types.h"
 
@@ -109,14 +109,20 @@ TEST_F(P2PMasterServiceTest, RegisterClientDuplicate) {
     auto client_id = generate_uuid();
     RegisterP2PClient(*service, client_id, {seg}, "127.0.0.1", 50051);
 
-    // Try registering the same client_id again
+    // HA re-registering the same client_id is idempotent.
     RegisterClientRequest req;
     req.client_id = client_id;
     req.segments = {MakeP2PSegment("seg2")};
     req.deployment_mode = DeploymentMode::P2P;
+    req.ip_address = "127.0.0.1";
+    req.rpc_port = 50051;
     auto res = service->RegisterClient(req);
-    EXPECT_FALSE(res.has_value());
-    EXPECT_EQ(ErrorCode::CLIENT_ALREADY_EXISTS, res.error());
+    ASSERT_TRUE(res.has_value()) << res.error();
+
+    // Duplicate registration does not merge new segment metadata.
+    auto seg_res = service->QuerySegments("seg2");
+    EXPECT_FALSE(seg_res.has_value());
+    EXPECT_EQ(ErrorCode::SEGMENT_NOT_FOUND, seg_res.error());
 }
 
 // ============================================================

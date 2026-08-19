@@ -14,7 +14,7 @@
 #include <random>
 #include <sstream>
 
-#include "ha_metric_manager.h"
+#include "p2p/p2p_ha_metric_manager.h"
 
 namespace mooncake {
 

@@ -273,9 +273,13 @@ ErrorCode P2PClientService::Init(const P2PClientConfig& config) {
 
     HAClientState initial_state =
         client_registered ? HAClientState::FULL : HAClientState::DEGRADED;
+    auto recovery_mode =
+        config.master_server_entry.rfind("redis://", 0) == 0
+            ? HARecoveryManager::RecoveryMode::RegisterOnly
+            : HARecoveryManager::RecoveryMode::FullMetadataSync;
     ha_manager_ = std::make_unique<HARecoveryManager>(
         client_id_, master_client_, data_manager_, async_route_notifier_,
-        view_version_, initial_state);
+        view_version_, initial_state, recovery_mode);
 
     StartHeartbeat(config.master_server_entry);
 
@@ -658,6 +662,14 @@ HeartbeatRequest P2PClientService::build_heartbeat_request() {
             param.tier_usages.push_back(info);
         }
         req.tasks.emplace_back(HeartbeatTaskType::SYNC_SEGMENT_META,
+                               std::move(param));
+    }
+
+    if (metrics_ && ++metric_sync_heartbeat_count_ >= METRIC_SYNC_FREQ) {
+        metric_sync_heartbeat_count_ = 0;
+        SyncClientMetricParam param;
+        param.snapshot = metrics_->BuildSyncSnapshot();
+        req.tasks.emplace_back(HeartbeatTaskType::SYNC_CLIENT_METRIC,
                                std::move(param));
     }
 

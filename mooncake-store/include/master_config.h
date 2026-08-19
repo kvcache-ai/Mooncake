@@ -103,7 +103,7 @@ struct MasterConfig {
     std::string redis_username;
     std::string redis_password;
     int redis_db_index = 0;
-    int64_t redis_master_view_ttl_sec = 5;
+    int64_t redis_master_view_ttl_sec = 4;
     int64_t redis_heartbeat_interval_sec = 1;
 
     bool enable_snapshot_restore;
@@ -204,7 +204,7 @@ class MasterServiceSupervisorConfig {
     std::string redis_username;
     std::string redis_password;
     int redis_db_index = 0;
-    int64_t redis_master_view_ttl_sec = 5;
+    int64_t redis_master_view_ttl_sec = 4;
     int64_t redis_heartbeat_interval_sec = 1;
     uint64_t max_kv_soft_pin_ttl = DEFAULT_MAX_KV_SOFT_PIN_TTL_MS;
     std::string rpc_address = "0.0.0.0";

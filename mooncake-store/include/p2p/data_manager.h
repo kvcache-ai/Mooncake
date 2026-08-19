@@ -17,8 +17,8 @@
 #include <ylt/util/tl/expected.hpp>
 #include "async_memcpy_executor.h"
 #include "client_buffer.h"
-#include "client_config_builder.h"
-#include "task_handle.h"
+#include "p2p/client_config_builder.h"
+#include "p2p/task_handle.h"
 #include "tiered_cache/tiered_backend.h"
 #include "transfer_engine.h"
 #include "types.h"

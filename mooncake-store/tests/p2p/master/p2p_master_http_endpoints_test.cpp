@@ -24,7 +24,7 @@
 #include <ylt/coro_http/coro_http_client.hpp>
 
 #include "master_config.h"
-#include "p2p_rpc_service.h"
+#include "p2p/p2p_rpc_service.h"
 #include "types.h"
 #include "utils.h"
 

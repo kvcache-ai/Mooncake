@@ -14,10 +14,10 @@
 #include <async_simple/coro/SyncAwait.h>
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 
-#include "client_rpc_service.h"
+#include "p2p/client_rpc_service.h"
 #include "client_rpc_types.h"
-#include "data_manager.h"
-#include "peer_client.h"
+#include "p2p/data_manager.h"
+#include "p2p/peer_client.h"
 #include "tiered_cache/tiered_backend.h"
 #include "common.h"
 #include "utils/common.h"

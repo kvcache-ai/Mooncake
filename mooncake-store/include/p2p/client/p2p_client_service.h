@@ -461,6 +461,10 @@ class P2PClientService final : public ClientService {
 
    private:
     std::shared_ptr<P2PClientMetric> metrics_;
+    // Attach a SYNC_CLIENT_METRIC task every METRIC_SYNC_FREQ heartbeats.
+    static constexpr int METRIC_SYNC_FREQ = 10;
+    // Heartbeats since the last SYNC_CLIENT_METRIC task.
+    int metric_sync_heartbeat_count_ = 0;
     P2PMasterClient master_client_;
     uint16_t client_rpc_port_ = 12345;
 

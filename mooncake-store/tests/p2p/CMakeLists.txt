@@ -21,6 +21,9 @@ add_store_test(peer_client_test client/peer_client_test.cpp)
 add_store_test(client_rpc_service_test client/client_rpc_service_test.cpp)
 add_store_test(inflight_tracker_test client/inflight_tracker_test.cpp)
 add_store_test(p2p_client_http_endpoints_test client/p2p_client_http_endpoints_test.cpp)
+add_store_test(async_metadata_notifier_test client/async_metadata_notifier_test.cpp)
+add_store_test(ha_recovery_manager_test client/ha_recovery_manager_test.cpp)
+add_store_test(client_metrics_aggregator_test client/client_metrics_aggregator_test.cpp)
 
 # P2P Tiered Cache tests
 add_store_test(tiered_backend_test client/tiered_backend_test.cpp)

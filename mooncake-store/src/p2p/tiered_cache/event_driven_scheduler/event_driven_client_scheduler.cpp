@@ -12,7 +12,7 @@
 #include <utility>
 #include <vector>
 
-#include "p2p_client_metric.h"
+#include "p2p/p2p_client_metric.h"
 #include "tiered_cache/event_driven_scheduler/json_config_util.h"
 #include "tiered_cache/tiered_backend.h"
 #include "tiered_cache/tiers/cache_tier.h"

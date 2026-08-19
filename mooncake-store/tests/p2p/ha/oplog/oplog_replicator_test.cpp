@@ -14,7 +14,7 @@
 #include <xxhash.h>
 
 #include "metadata_store.h"
-#include "ha/oplog/oplog_applier.h"
+#include "p2p/ha/oplog/oplog_applier.h"
 #include "p2p/ha/oplog/oplog_change_notifier.h"
 #include "p2p/ha/oplog/oplog_manager.h"
 #include "p2p/ha/oplog/oplog_serializer.h"

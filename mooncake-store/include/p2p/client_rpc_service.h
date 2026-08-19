@@ -5,9 +5,9 @@
 #include <memory>
 #include <ylt/util/tl/expected.hpp>
 #include "client_rpc_types.h"
-#include "data_manager.h"
+#include "p2p/data_manager.h"
 #include "inflight_tracker.h"
-#include "p2p_client_metric.h"
+#include "p2p/p2p_client_metric.h"
 #include "types.h"
 #include <ylt/coro_rpc/coro_rpc_server.hpp>
 

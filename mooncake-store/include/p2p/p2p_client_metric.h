@@ -9,6 +9,7 @@
 #include <ylt/metric/gauge.hpp>
 
 #include "client_metric.h"
+#include "p2p/heartbeat_type.h"
 #include "types.h"
 
 namespace mooncake {
@@ -223,6 +224,8 @@ struct P2PClientMetric : public ClientMetric {
     explicit P2PClientMetric(
         uint64_t interval_seconds = 0,
         const std::map<std::string, std::string>& labels = {});
+
+    ClientMetricSnapshot BuildSyncSnapshot();
 
     void serialize(std::string& str);
     std::string summary_metrics();

@@ -12,7 +12,7 @@
 #include "acl/acl.h"
 #endif
 
-#include "p2p_client_metric.h"
+#include "p2p/p2p_client_metric.h"
 #include "tiered_cache/tiered_backend.h"
 #include "tiered_cache/tiers/cache_tier.h"
 #include "common.h"

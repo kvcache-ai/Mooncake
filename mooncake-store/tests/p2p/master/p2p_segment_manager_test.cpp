@@ -7,7 +7,7 @@
 
 #define private public
 #define protected public
-#include "p2p_segment_manager.h"
+#include "p2p/p2p_segment_manager.h"
 #undef private
 #undef protected
 

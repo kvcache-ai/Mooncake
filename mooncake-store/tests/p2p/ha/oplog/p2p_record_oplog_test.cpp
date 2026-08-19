@@ -1,4 +1,4 @@
-#include "p2p_master_service.h"
+#include "p2p/p2p_master_service.h"
 
 #include <unistd.h>
 
@@ -18,7 +18,7 @@
 #include "p2p/ha/oplog/oplog_store.h"
 #include "p2p/ha/oplog/p2p_oplog_types.h"
 #include "master_config.h"
-#include "p2p_rpc_types.h"
+#include "p2p/p2p_rpc_types.h"
 #include "types.h"
 
 namespace mooncake::test {

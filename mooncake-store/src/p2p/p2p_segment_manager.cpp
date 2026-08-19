@@ -105,8 +105,24 @@ tl::expected<void, ErrorCode> P2PSegmentManager::InnerMountSegment(
         on_segment_added_(*new_segment);
     }
 
-    MasterMetricManager::instance().inc_total_mem_capacity(segment.name,
-                                                           segment.size);
+    const MemoryType type = new_segment->GetP2PExtra().memory_type;
+    if (type == MemoryType::NVME) {
+        MasterMetricManager::instance().inc_total_file_capacity(segment.size);
+        MasterMetricManager::instance().inc_allocated_file_size(
+            segment.GetP2PExtra().usage);
+    } else {
+        if (type != MemoryType::DRAM) {
+            LOG(WARNING) << "mounting segment with unsupported memory type, "
+                            "counting toward mem capacity"
+                         << ", segment_id=" << segment.id
+                         << ", name=" << segment.name
+                         << ", memory_type=" << MemoryTypeToString(type);
+        }
+        MasterMetricManager::instance().inc_total_mem_capacity(segment.name,
+                                                               segment.size);
+        MasterMetricManager::instance().inc_allocated_mem_size(
+            segment.name, segment.GetP2PExtra().usage);
+    }
     return {};
 }
 
@@ -116,8 +132,24 @@ tl::expected<void, ErrorCode> P2PSegmentManager::OnUnmountSegment(
         on_segment_removed_(*segment);
     }
 
-    MasterMetricManager::instance().dec_total_mem_capacity(segment->name,
-                                                           segment->size);
+    const MemoryType type = segment->GetP2PExtra().memory_type;
+    const size_t usage = segment->GetP2PExtra().usage;
+    if (type == MemoryType::NVME) {
+        MasterMetricManager::instance().dec_total_file_capacity(segment->size);
+        MasterMetricManager::instance().dec_allocated_file_size(usage);
+    } else {
+        if (type != MemoryType::DRAM) {
+            LOG(WARNING) << "unmounting segment with unsupported memory type, "
+                            "counting toward mem capacity"
+                         << ", segment_id=" << segment->id
+                         << ", name=" << segment->name
+                         << ", memory_type=" << MemoryTypeToString(type);
+        }
+        MasterMetricManager::instance().dec_total_mem_capacity(
+            segment->name, segment->size);
+        MasterMetricManager::instance().dec_allocated_mem_size(segment->name,
+                                                               usage);
+    }
     return {};
 }
 
@@ -135,8 +167,27 @@ tl::expected<size_t, ErrorCode> P2PSegmentManager::UpdateSegmentUsage(
                    << ", segment_size=" << it->second->size;
         return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
     }
-    size_t old_usage = it->second->p2p_extra->usage;
+    const size_t old_usage = it->second->p2p_extra->usage;
     it->second->p2p_extra->usage = usage;
+
+    const MemoryType memory_type = it->second->p2p_extra->memory_type;
+    const int64_t delta = usage >= old_usage
+                              ? static_cast<int64_t>(usage - old_usage)
+                              : -static_cast<int64_t>(old_usage - usage);
+    auto& metrics = MasterMetricManager::instance();
+    if (memory_type == MemoryType::NVME) {
+        if (delta >= 0) {
+            metrics.inc_allocated_file_size(delta);
+        } else {
+            metrics.dec_allocated_file_size(-delta);
+        }
+    } else {
+        if (delta >= 0) {
+            metrics.inc_allocated_mem_size(it->second->name, delta);
+        } else {
+            metrics.dec_allocated_mem_size(it->second->name, -delta);
+        }
+    }
     return old_usage;
 }
 
