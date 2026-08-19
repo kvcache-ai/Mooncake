@@ -14,8 +14,7 @@ struct NofKvCompletion {
     uint32_t result = 0;
 };
 
-using NofKvCallback = void (*)(void* ctx,
-                               const NofKvCompletion& completion);
+using NofKvCallback = void (*)(void* ctx, const NofKvCompletion& completion);
 
 struct NofKvAdaptor {
     NofKvCallback cb = nullptr;
@@ -46,7 +45,6 @@ class SpdkInitiator : public NVMeoFInitiator {
     ErrorCode UnregisterMemory(void* ptr) override;
     NofCapabilities GetCapabilities() const override;
 
-#ifdef MOONCAKE_HAVE_SPDK_NVME_KV
     NofSegmentHandle* OpenKvSegment(const std::string& transport_str);
     void CloseKvSegment(NofSegmentHandle* handle);
     void AbortKvSegment(NofSegmentHandle* handle);
@@ -59,7 +57,6 @@ class SpdkInitiator : public NVMeoFInitiator {
                          NofKvAdaptor* adaptor);
     int SubmitKvDelete(NofSegmentHandle* handle, const void* key,
                        uint8_t key_len, NofKvAdaptor* adaptor);
-#endif
 
    private:
     class Impl;
