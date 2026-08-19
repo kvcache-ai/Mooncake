@@ -254,7 +254,7 @@ TEST_F(RealClientTest, PinnedSsdRestoreReadsNonTailRangeIntoGpu) {
 }
 #endif
 
-TEST_F(RealClientTest, SsdOffloadConfigDefaultsToStableRpcPort) {
+TEST_F(RealClientTest, SsdOffloadConfigUsesExplicitStableRpcPort) {
     ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
     ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
     ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
@@ -274,7 +274,7 @@ TEST_F(RealClientTest, SsdOffloadConfigDefaultsToStableRpcPort) {
     auto config = MakeConfigDict("localhost:17813", "16MB", "16MB");
     config["enable_ssd_offload"] = "true";
     config["ssd_offload_path"] = ssd_path_;
-    ASSERT_FALSE(config.contains(CONFIG_KEY_LOCAL_RPC_PORT));
+    config[CONFIG_KEY_LOCAL_RPC_PORT] = "50052";
     ASSERT_TRUE(py_client_->setup_internal(config).has_value());
 
     const std::string key = "default_ssd_rpc_port";
@@ -300,6 +300,48 @@ TEST_F(RealClientTest, SsdOffloadConfigDefaultsToStableRpcPort) {
     ASSERT_TRUE(local_disk_replica.has_value());
     EXPECT_EQ("localhost:50052", local_disk_replica->get_local_disk_descriptor()
                                        .transport_endpoint);
+}
+
+TEST_F(RealClientTest, SsdOffloadConfigDefaultsToAutoBoundRpcPort) {
+    ScopedEnvVar local_memcpy("MC_STORE_MEMCPY", "1");
+    ScopedEnvVar heartbeat("MOONCAKE_OFFLOAD_HEARTBEAT_INTERVAL_SECONDS", "1");
+    ScopedEnvVar storage_backend("MOONCAKE_OFFLOAD_STORAGE_BACKEND_DESCRIPTOR",
+                                 "bucket_storage_backend");
+    ScopedEnvVar bucket_keys("MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", "1");
+
+    char first_path[] = "/tmp/mooncake_ssd_auto_rpc_port_1_XXXXXX";
+    const char* first_created = mkdtemp(first_path);
+    ASSERT_NE(first_created, nullptr);
+    ssd_path_ = first_created;
+
+    char second_path[] = "/tmp/mooncake_ssd_auto_rpc_port_2_XXXXXX";
+    const char* second_created = mkdtemp(second_path);
+    ASSERT_NE(second_created, nullptr);
+    std::string second_ssd_path = second_created;
+
+    ASSERT_TRUE(master_.Start(InProcMasterConfigBuilder()
+                                  .set_enable_offload(true)
+                                  .set_default_kv_lease_ttl(10)
+                                  .build()));
+    master_address_ = master_.master_address();
+
+    auto first_config = MakeConfigDict("localhost:17813", "16MB", "16MB");
+    first_config["enable_ssd_offload"] = "true";
+    first_config["ssd_offload_path"] = ssd_path_;
+    ASSERT_FALSE(first_config.contains(CONFIG_KEY_LOCAL_RPC_PORT));
+    ASSERT_TRUE(py_client_->setup_internal(first_config).has_value());
+
+    auto second_client = RealClient::create();
+    auto second_config = MakeConfigDict("localhost:17814", "16MB", "16MB");
+    second_config["enable_ssd_offload"] = "true";
+    second_config["ssd_offload_path"] = second_ssd_path;
+    ASSERT_FALSE(second_config.contains(CONFIG_KEY_LOCAL_RPC_PORT));
+
+    auto second_setup = second_client->setup_internal(second_config);
+    EXPECT_TRUE(second_setup.has_value());
+
+    second_client->tearDownAll();
+    std::filesystem::remove_all(second_ssd_path);
 }
 
 TEST_F(RealClientTest, AllocateAndMountSegmentAlignsAndUnmounts) {

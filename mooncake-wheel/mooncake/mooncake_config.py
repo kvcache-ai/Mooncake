@@ -189,8 +189,9 @@ class MooncakeConfig:
         master_server_address (str): The address of the master server.
         enable_ssd_offload (bool): Enable SSD offload. Default is False.
         ssd_offload_path (str): The path to the SSD directory for offloading.
-        local_rpc_port (int): Stable local RPC port for SSD offload reads.
-            Defaults to 50052.
+        local_rpc_port (int): SSD offload RPC port. Use 0 to auto-bind.
+            Set a stable positive port to preserve LOCAL_DISK replicas across
+            client UUID changes. Defaults to 0.
         tenant_id (str): Tenant identifier. Default is "default".
         enable_client_http_server (bool): Enable the client HTTP health/metrics
             endpoints. Default is False.
@@ -208,7 +209,7 @@ class MooncakeConfig:
             "master_server_address": "localhost:8081",
             "enable_ssd_offload": true,
             "ssd_offload_path": "/nvme/mooncake_offload",
-            "local_rpc_port": 50052,
+            "local_rpc_port": 0,
             "tenant_id": "default",
             "enable_client_http_server": false,
             "client_http_port": 9300
@@ -225,7 +226,7 @@ class MooncakeConfig:
             "master_server_address": "master:8081",
             "enable_ssd_offload": true,
             "ssd_offload_path": "/nvme/mooncake_offload",
-            "local_rpc_port": 50052,
+            "local_rpc_port": 0,
             "tenant_id": "default",
             "enable_client_http_server": false,
             "client_http_port": 9300
@@ -241,7 +242,7 @@ class MooncakeConfig:
     master_server_address: str
     enable_ssd_offload: bool = False
     ssd_offload_path: str = ""
-    local_rpc_port: int = 50052
+    local_rpc_port: int = 0
     tenant_id: str = "default"
     enable_client_http_server: bool = False
     client_http_port: int = 9300
@@ -290,10 +291,10 @@ class MooncakeConfig:
 
         if not isinstance(self.local_rpc_port, int) or isinstance(
             self.local_rpc_port, bool
-        ) or not 1 <= self.local_rpc_port <= 65535:
+        ) or not 0 <= self.local_rpc_port <= 65535:
             raise ValueError(
                 "Invalid local_rpc_port: "
-                f"{self.local_rpc_port!r}. It must be an integer from 1 to 65535."
+                f"{self.local_rpc_port!r}. It must be an integer from 0 to 65535."
             )
 
         for field_name in _REQUIRED_NON_EMPTY_FIELDS:
@@ -319,10 +320,10 @@ class MooncakeConfig:
                 raise ValueError(f"Missing required config field: {field}")
         ssd_offload_path = config.get("ssd_offload_path")
         tenant_id = config.get("tenant_id")
-        local_rpc_port = config.get("local_rpc_port", 50052)
+        local_rpc_port = config.get("local_rpc_port", 0)
         if isinstance(local_rpc_port, bool):
             raise ValueError(
-                "Invalid local_rpc_port: it must be an integer from 1 to 65535."
+                "Invalid local_rpc_port: it must be an integer from 0 to 65535."
             )
         return MooncakeConfig(
             local_hostname=config.get("local_hostname"),
@@ -382,7 +383,7 @@ class MooncakeConfig:
                     os.getenv("MOONCAKE_OFFLOAD_ENABLED", "false")
                 ),
                 ssd_offload_path=os.getenv("MOONCAKE_OFFLOAD_FILE_STORAGE_PATH", ""),
-                local_rpc_port=int(os.getenv("MOONCAKE_LOCAL_RPC_PORT", 50052)),
+                local_rpc_port=int(os.getenv("MOONCAKE_LOCAL_RPC_PORT", 0)),
                 tenant_id=os.getenv("MOONCAKE_TENANT_ID", "default"),
                 enable_client_http_server=_parse_bool(
                     os.getenv("MOONCAKE_ENABLE_CLIENT_HTTP_SERVER", "false")

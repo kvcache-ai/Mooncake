@@ -78,7 +78,7 @@ class TestMooncakeConfig(unittest.TestCase):
         self.assertEqual(config.device_name, "")
         self.assertEqual(config.enable_ssd_offload, False)
         self.assertEqual(config.ssd_offload_path, "")
-        self.assertEqual(config.local_rpc_port, 50052)
+        self.assertEqual(config.local_rpc_port, 0)
         self.assertEqual(config.tenant_id, "default")
         self.assertEqual(config.enable_client_http_server, False)
         self.assertEqual(config.client_http_port, 9300)
@@ -475,13 +475,14 @@ class TestMooncakeConfigValidation(unittest.TestCase):
             self.make(local_buffer_size=-1024)
         self.assertIn("local_buffer_size", str(cm.exception))
 
-    def test_local_rpc_port_must_be_a_valid_tcp_port(self):
-        for value in [0, -1, 65536, True, "50052"]:
+    def test_local_rpc_port_must_be_a_valid_tcp_port_or_zero(self):
+        for value in [-1, 65536, True, "50052"]:
             with self.subTest(value=value):
                 with self.assertRaises(ValueError) as cm:
                     self.make(local_rpc_port=value)
                 self.assertIn("local_rpc_port", str(cm.exception))
 
+        self.assertEqual(self.make(local_rpc_port=0).local_rpc_port, 0)
         self.assertEqual(self.make(local_rpc_port=65535).local_rpc_port, 65535)
 
     def test_empty_required_field_raises(self):

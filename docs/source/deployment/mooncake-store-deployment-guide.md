@@ -949,7 +949,7 @@ Arguments of `MooncakeDistributedStore.setup(...)`:
 | `tenant_id` | str | `default` | *(advanced)* Tenant identifier |
 | `enable_client_http_server` | bool | `false` | Enable the client-side HTTP `/health`, `/metrics`, and `/metrics/summary` endpoints |
 | `client_http_port` | int | `9300` | Client-side HTTP endpoint port, used only when `enable_client_http_server=true` |
-| `local_rpc_port` | int | `50052` | *(advanced)* Stable RPC port advertised by `LOCAL_DISK` replicas; must be unique per real client on a host |
+| `local_rpc_port` | int | `0` | *(advanced)* SSD offload RPC port. `0` auto-binds for embedded clients; use a positive stable port for restart recovery |
 
 ```{note}
 The first seven arguments have **no Python default** — the C++ defaults are not exposed by the pybind binding, so they must all be supplied (a bare `setup(local_hostname, metadata_server)` raises `TypeError`). The later arguments (`engine`, SSD offload fields, `tenant_id`, client HTTP endpoint fields, and `local_rpc_port`) are optional. In Method A, launcher-level `MOONCAKE_*` variables used only by `MooncakeConfig` are ignored. Variables consumed directly by the C++ client, including the FileStorage/DFS backend variables and low-level `MC_*` engine variables below, are still read.
@@ -978,7 +978,7 @@ The store service CLI only accepts `--config`, `-D/--define`, `--port`, and `--m
 | `MOONCAKE_LOCAL_HOSTNAME` | `local_hostname` | `localhost` | |
 | `MOONCAKE_OFFLOAD_ENABLED` | `enable_ssd_offload` | `false` | Initialize client-side `FileStorage`; required for SSD offload and descriptor-based DFS |
 | `MOONCAKE_OFFLOAD_FILE_STORAGE_PATH` | `ssd_offload_path` | empty | FileStorage path; DFS shard data uses `MOONCAKE_DFS_ROOT_DIR` with the distributed backend |
-| `MOONCAKE_LOCAL_RPC_PORT` | `local_rpc_port` | `50052` | Stable RPC port advertised by `LOCAL_DISK` replicas; must be unique per real client on a host |
+| `MOONCAKE_LOCAL_RPC_PORT` | `local_rpc_port` | `0` | SSD offload RPC port. `0` auto-binds for embedded clients; use a positive stable port for restart recovery |
 | `MOONCAKE_TENANT_ID` | `tenant_id` | `default` | Tenant identifier |
 | `MOONCAKE_ENABLE_CLIENT_HTTP_SERVER` | `enable_client_http_server` | `false` | Enable client-side `/health`, `/metrics`, and `/metrics/summary` endpoints |
 | `MOONCAKE_CLIENT_HTTP_PORT` | `client_http_port` | `9300` | Client-side HTTP endpoint port |

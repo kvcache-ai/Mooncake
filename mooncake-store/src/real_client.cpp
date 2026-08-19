@@ -759,9 +759,11 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
     if (enable_ssd_offload &&
-        (local_rpc_port <= 0 || local_rpc_port > 65535)) {
-        LOG(ERROR) << "local_rpc_port must be between 1 and 65535 when SSD "
-                      "offload is enabled";
+        (local_rpc_port < 0 || local_rpc_port > 65535 ||
+         (!start_offload_rpc_server && local_rpc_port == 0))) {
+        LOG(ERROR) << "local_rpc_port must be between 1 and 65535 when using "
+                      "an external SSD offload RPC server, or 0 to auto-bind "
+                      "the embedded server";
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
 
@@ -1046,8 +1048,9 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     }
     if (enable_ssd_offload && start_offload_rpc_server) {
         // Start RPC server for offload operations (batch_get / release_buffer).
-        // A LOCAL_DISK replica uses this endpoint as its restart identity, so
-        // it must use the configured stable port rather than an OS-assigned one.
+        // local_rpc_port=0 preserves the previous embedded-client behavior:
+        // let the OS pick a free port so multiple clients can share one host.
+        // A positive port opts into a stable restart identity.
         offload_rpc_server_ =
             std::make_unique<coro_rpc::coro_rpc_server>(1, local_rpc_port,
                                                          "0.0.0.0");
@@ -1065,6 +1068,8 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
         }
         offload_rpc_port_ = offload_rpc_server_->port();
         LOG(INFO) << "Offload RPC server started on port " << offload_rpc_port_;
+        this->local_rpc_addr = buildHostNameWithPort(
+            getHostNameWithoutPort(this->local_hostname), offload_rpc_port_);
     }
     if (enable_ssd_offload) {
         auto file_storage_config = FileStorageConfig::FromEnvironment();
@@ -1250,8 +1255,7 @@ tl::expected<void, ErrorCode> RealClient::setup_internal(
     std::string tenant_id = get_config(config, CONFIG_KEY_TENANT_ID, "default");
     bool enable_ssd_offload =
         get_config_bool(config, "enable_ssd_offload", false);
-    auto local_rpc_port_opt =
-        get_config_int(config, CONFIG_KEY_LOCAL_RPC_PORT, 50052);
+    auto local_rpc_port_opt = get_config_int(config, CONFIG_KEY_LOCAL_RPC_PORT, 0);
     if (!local_rpc_port_opt.has_value()) {
         return tl::unexpected(ErrorCode::INVALID_PARAMS);
     }
