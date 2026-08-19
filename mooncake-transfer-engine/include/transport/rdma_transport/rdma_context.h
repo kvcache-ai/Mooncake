@@ -131,14 +131,18 @@ class RdmaContext {
     int registerMemoryRegion(void *addr, size_t length, int access,
                              const DmabufExport &exp);
 
-    // Exports a single dma_buf fd for the allocation backing addr. GPU device
+    // Exports a single dma_buf fd covering [addr, addr + length). GPU device
     // memory yields kDmabufReg with a live fd; host memory and the
     // nvidia-peermem path yield kHostReg with no fd. Any fd placed in out.fd
     // MUST be closed by the caller (via closeDmabufExport) AFTER every
     // registerMemoryRegion() call consuming it has returned — each successful
     // registration takes its own reference, so closing earlier would invalidate
     // the fd for the remaining NICs.
-    static int exportDmabuf(void *addr, DmabufExport &out);
+    // `length` is the length of the whole buffer the caller is going to
+    // register (chunked registrations derive their own offset from out.offset),
+    // and is used to guarantee the exported dma_buf really covers that range —
+    // see the VMM note in exportDmabuf().
+    static int exportDmabuf(void *addr, size_t length, DmabufExport &out);
 
     // Closes the fd held by a DmabufExport, if any. Idempotent.
     static void closeDmabufExport(DmabufExport &exp);
