@@ -24,6 +24,7 @@
 #include <cstdint>
 #include <list>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -77,6 +78,11 @@ class RdmaContext {
 
     MemReg registerMemReg(void *addr, size_t length, int access);
 
+    // Warm up RDMA MR registration by temporarily registering/deregistering.
+    // This targets RDMA driver-side pinning/metadata and differs from CPU
+    // prefault (madvise/mlock/touch) used before NUMA probing.
+    int warmupMrRegistration(void *addr, size_t length);
+
     int unregisterMemReg(MemReg id);
 
     const std::pair<uint32_t, uint32_t> queryMemRegKey(MemReg id) const {
@@ -109,11 +115,19 @@ class RdmaContext {
 
     RdmaParams &params() const { return *params_.get(); }
 
+    // PCIe Relaxed Ordering support
+    bool isRelaxedOrderingEnabled() const { return relaxed_ordering_enabled_; }
+
     // Notification CQ (dedicated for notification QPs)
     RdmaCQ *notifyCq() { return notify_cq_; }
 
    private:
     int openDevice(const std::string &device_name, uint8_t port);
+
+    // Release every resource currently owned by this context. This is
+    // intentionally state-independent so it can clean up a partially completed
+    // enable() and can safely be retried.
+    void cleanupResources();
 
    private:
     // initialized during ctor, will never be changed during the context's
@@ -143,6 +157,9 @@ class RdmaContext {
 
     // Dedicated CQ for notification QPs (one per device)
     RdmaCQ *notify_cq_ = nullptr;
+
+    // PCIe Relaxed Ordering support
+    bool relaxed_ordering_enabled_ = false;
 
     const IbvSymbols &verbs_;
 };

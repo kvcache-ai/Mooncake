@@ -32,20 +32,29 @@ sudo apt-get install -y $SYSTEM_PACKAGES
 
 echo "Verifying that import succeeds after installation..."
 python -c "import mooncake.engine" && echo "Success: Import succeeded after installation" || { echo "ERROR: Import failed after installation!"; exit 1; }
+python -c "import mooncake.reshard.weight" && echo "Success: Reshard import succeeded after installation" || { echo "ERROR: Reshard import failed after installation!"; exit 1; }
 
 echo "Running import structure test..."
 # Run the import structure test
 cp -r mooncake-wheel/tests test_env/
+cp -r mooncake-reshard/tests test_env/reshard_tests
 cd test_env
-pip install torch==2.10.0 numpy
+pip install torch==2.11.0 numpy
+python -c "import mooncake._fast_copy"
+python tests/test_fast_copy.py
 python tests/test_import_structure.py
 
 echo "Running mooncake config test..."
 python tests/test_mooncake_config.py
 
+echo "Running reshard contract tests..."
+python -m pip install pytest
+python -m pytest reshard_tests -q
+
 echo "Verifying mooncake_master entry point..."
 # Check if the mooncake_master entry point is installed and executable
 which mooncake_master || { echo "ERROR: mooncake_master entry point not found!"; exit 1; }
+mooncake_master --version
 echo "Success: mooncake_master entry point found"
 
 # Check if the mooncake_client entry point is installed and executable

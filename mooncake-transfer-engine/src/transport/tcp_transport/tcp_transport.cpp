@@ -17,13 +17,25 @@
 #include <bits/stdint-uintn.h>
 #include <glog/logging.h>
 #include <asio/ip/v6_only.hpp>
+#include <asio/post.hpp>
+#include <asio/steady_timer.hpp>
 
 #include <algorithm>
+#include <array>
 #include <cassert>
+#include <cctype>
+#include <chrono>
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
+#include <deque>
+#include <functional>
+#include <limits>
 #include <memory>
-#include <random>
+#include <mutex>
+#include <optional>
+#include <type_traits>
 
 #include "common.h"
 #include "transfer_engine.h"
@@ -35,282 +47,251 @@
 
 namespace mooncake {
 using tcpsocket = asio::ip::tcp::socket;
-const static size_t kDefaultBufferSize = 65536;
 
-struct SessionHeader {
-    uint64_t size;
-    uint64_t addr;
-    uint8_t opcode;
+#ifdef MOONCAKE_TCP_TRANSPORT_TEST_HOOKS
+namespace {
+using LaneConnectHandlerHook = void (*)() noexcept;
+using LaneConnectFailureInjectionHook = bool (*)(size_t) noexcept;
+using LaneRetryHandlerHook = void (*)() noexcept;
+using LaneAdmissionHandlerHook = void (*)() noexcept;
+using LaneObserverHook = void (*)(int, size_t, uint64_t, size_t, bool) noexcept;
+using LaneFailureReasonHook = void (*)(int) noexcept;
+
+std::mutex lane_test_hook_mutex;
+LaneConnectHandlerHook lane_connect_handler_hook = nullptr;
+LaneConnectFailureInjectionHook lane_connect_failure_injection_hook = nullptr;
+LaneRetryHandlerHook lane_retry_handler_hook = nullptr;
+LaneAdmissionHandlerHook lane_admission_handler_hook = nullptr;
+LaneObserverHook lane_observer_hook = nullptr;
+LaneFailureReasonHook lane_failure_reason_hook = nullptr;
+
+enum LaneTestEvent {
+    kLaneQueueAdmitted = 1,
+    kLaneQueueRejected = 2,
+    kLaneConnecting = 3,
+    kLaneBusy = 4,
+    kLaneTerminal = 5,
+    kLaneShutdownClean = 6,
+    kLaneLateHandler = 7,
+    kLaneRetryArmed = 8,
+    kLaneRetryFired = 9,
+    kLaneRetryLate = 10,
+    kLaneCooldownStarted = 11,
+    kLaneAdmissionPending = 12,
+    kLaneAdmissionPromoted = 13,
+    kLaneAdmissionTimerArmed = 14,
+    kLaneAdmissionTimerFired = 15,
+    kLaneAdmissionTimerLate = 16,
+    kLaneAdmissionHardRejected = 17,
 };
 
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
-static bool isCudaMemory(void *addr) {
-    cudaPointerAttributes attributes;
-    auto status = cudaPointerGetAttributes(&attributes, addr);
-    if (status != cudaSuccess) return false;
-    if (attributes.type == cudaMemoryTypeDevice) return true;
-    return false;
+void invokeLaneConnectHandlerHook() noexcept {
+    LaneConnectHandlerHook hook;
+    {
+        std::lock_guard<std::mutex> lock(lane_test_hook_mutex);
+        hook = lane_connect_handler_hook;
+    }
+    if (hook) hook();
+}
+
+bool invokeLaneConnectFailureInjectionHook(size_t lane_id) noexcept {
+    LaneConnectFailureInjectionHook hook;
+    {
+        std::lock_guard<std::mutex> lock(lane_test_hook_mutex);
+        hook = lane_connect_failure_injection_hook;
+    }
+    return hook && hook(lane_id);
+}
+
+void invokeLaneRetryHandlerHook() noexcept {
+    LaneRetryHandlerHook hook;
+    {
+        std::lock_guard<std::mutex> lock(lane_test_hook_mutex);
+        hook = lane_retry_handler_hook;
+    }
+    if (hook) hook();
+}
+
+void invokeLaneAdmissionHandlerHook() noexcept {
+    LaneAdmissionHandlerHook hook;
+    {
+        std::lock_guard<std::mutex> lock(lane_test_hook_mutex);
+        hook = lane_admission_handler_hook;
+    }
+    if (hook) hook();
+}
+
+void invokeLaneObserverHook(int event, size_t queue_depth,
+                            uint64_t queued_bytes, size_t active_sockets,
+                            bool lane_has_current) noexcept {
+    LaneObserverHook hook;
+    {
+        std::lock_guard<std::mutex> lock(lane_test_hook_mutex);
+        hook = lane_observer_hook;
+    }
+    if (hook)
+        hook(event, queue_depth, queued_bytes, active_sockets,
+             lane_has_current);
+}
+
+void invokeLaneFailureReasonHook(int reason) noexcept {
+    LaneFailureReasonHook hook;
+    {
+        std::lock_guard<std::mutex> lock(lane_test_hook_mutex);
+        hook = lane_failure_reason_hook;
+    }
+    if (hook) hook(reason);
+}
+}  // namespace
+
+void tcpTransportSetLaneConnectHandlerHookForTest(
+    LaneConnectHandlerHook hook) noexcept {
+    std::lock_guard<std::mutex> lock(lane_test_hook_mutex);
+    lane_connect_handler_hook = hook;
+}
+
+void tcpTransportSetLaneConnectFailureInjectionHookForTest(
+    LaneConnectFailureInjectionHook hook) noexcept {
+    std::lock_guard<std::mutex> lock(lane_test_hook_mutex);
+    lane_connect_failure_injection_hook = hook;
+}
+
+void tcpTransportSetLaneObserverHookForTest(LaneObserverHook hook) noexcept {
+    std::lock_guard<std::mutex> lock(lane_test_hook_mutex);
+    lane_observer_hook = hook;
+}
+
+void tcpTransportSetLaneRetryHandlerHookForTest(
+    LaneRetryHandlerHook hook) noexcept {
+    std::lock_guard<std::mutex> lock(lane_test_hook_mutex);
+    lane_retry_handler_hook = hook;
+}
+
+void tcpTransportSetLaneAdmissionHandlerHookForTest(
+    LaneAdmissionHandlerHook hook) noexcept {
+    std::lock_guard<std::mutex> lock(lane_test_hook_mutex);
+    lane_admission_handler_hook = hook;
+}
+
+void tcpTransportSetLaneFailureReasonHookForTest(
+    LaneFailureReasonHook hook) noexcept {
+    std::lock_guard<std::mutex> lock(lane_test_hook_mutex);
+    lane_failure_reason_hook = hook;
+}
+
+bool tcpTransportLaneTypesAreMoveOnlyForTest() noexcept {
+    return std::is_move_constructible<TcpTransport::TcpWorkItem>::value &&
+           !std::is_copy_constructible<TcpTransport::TcpWorkItem>::value &&
+           !std::is_copy_assignable<TcpTransport::TcpWorkItem>::value &&
+           std::is_move_constructible<TcpTransport::TerminalAction>::value &&
+           !std::is_copy_constructible<TcpTransport::TerminalAction>::value &&
+           !std::is_copy_assignable<TcpTransport::TerminalAction>::value;
 }
 #endif
 
-struct Session : public std::enable_shared_from_this<Session> {
-    explicit Session(tcpsocket socket) : socket_(std::move(socket)) {}
+#include "tcp_transport_session_impl.h"
 
-    tcpsocket socket_;
-    SessionHeader header_;
-    uint64_t total_transferred_bytes_;
-    char *local_buffer_;
-    std::function<void(TransferStatusEnum)> on_finalize_;
-    std::mutex session_mutex_;
+namespace {
+constexpr size_t kMaxTcpLanesPerPeer = 16;
 
-    void initiate(void *buffer, uint64_t dest_addr, size_t size,
-                  TransferRequest::OpCode opcode) {
-        session_mutex_.lock();
-        local_buffer_ = (char *)buffer;
-        header_.addr = htole64(dest_addr);
-        header_.size = htole64(size);
-        header_.opcode = (uint8_t)opcode;
-        total_transferred_bytes_ = 0;
-        writeHeader();
-    }
+size_t parseBoundedTcpSetting(const char* name, const char* value,
+                              size_t default_value, size_t minimum,
+                              size_t maximum) {
+    if (!value) return default_value;
 
-    void onAccept() {
-        session_mutex_.lock();
-        total_transferred_bytes_ = 0;
-        readHeader();
-    }
-
-   private:
-    void writeHeader() {
-        // LOG(INFO) << "writeHeader";
-        auto self(shared_from_this());
-        asio::async_write(
-            socket_, asio::buffer(&header_, sizeof(SessionHeader)),
-            [this, self](const asio::error_code &ec, std::size_t len) {
-                if (ec || len != sizeof(SessionHeader)) {
-                    LOG(ERROR) << "Session::writeHeader failed. Error: "
-                               << ec.message() << " (value: " << ec.value()
-                               << ")" << ", bytes written: " << len
-                               << ", expected: " << sizeof(SessionHeader);
-                    if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
-                    session_mutex_.unlock();
-                    return;
-                }
-                if (header_.opcode == (uint8_t)TransferRequest::WRITE)
-                    writeBody();
-                else
-                    readBody();
-            });
-    }
-
-    void readHeader() {
-        // LOG(INFO) << "readHeader";
-        auto self(shared_from_this());
-        asio::async_read(
-            socket_, asio::buffer(&header_, sizeof(SessionHeader)),
-            [this, self](const asio::error_code &ec, std::size_t len) {
-                if (ec || len != sizeof(SessionHeader)) {
-                    LOG(ERROR)
-                        << "Session::readHeader failed. Error: " << ec.message()
-                        << " (value: " << ec.value() << ")"
-                        << ", bytes read: " << len
-                        << ", expected: " << sizeof(SessionHeader);
-                    if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
-                    session_mutex_.unlock();
-                    return;
-                }
-
-                local_buffer_ = (char *)(le64toh(header_.addr));
-                if (header_.opcode == (uint8_t)TransferRequest::WRITE)
-                    readBody();
-                else
-                    writeBody();
-            });
-    }
-
-    void writeBody() {
-        // LOG(INFO) << "writeBody";
-        auto self(shared_from_this());
-        uint64_t size = le64toh(header_.size);
-        char *addr = local_buffer_;
-
-        size_t buffer_size =
-            std::min(kDefaultBufferSize, size - total_transferred_bytes_);
-        if (buffer_size == 0) {
-            if (on_finalize_) on_finalize_(TransferStatusEnum::COMPLETED);
-            session_mutex_.unlock();
-            return;
+    const std::string text(value);
+    size_t parsed = 0;
+    bool valid = !text.empty();
+    for (char c : text) {
+        if (c < '0' || c > '9') {
+            valid = false;
+            break;
         }
-
-        char *dram_buffer = addr + total_transferred_bytes_;
-
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
-        if (isCudaMemory(addr)) {
-            dram_buffer = new char[buffer_size];
-            cudaError_t cuda_status =
-                cudaMemcpy(dram_buffer, addr + total_transferred_bytes_,
-                           buffer_size, cudaMemcpyDefault);
-            if (cuda_status != cudaSuccess) {
-                LOG(ERROR)
-                    << "Session::writeBody failed to copy from CUDA memory. "
-                    << "Error: " << cudaGetErrorString(cuda_status);
-                if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
-                session_mutex_.unlock();
-                delete[] dram_buffer;
-                return;
-            }
+        const size_t digit = static_cast<size_t>(c - '0');
+        if (parsed > (maximum - digit) / size_t(10)) {
+            valid = false;
+            break;
         }
-#endif
+        parsed = parsed * 10 + digit;
+    }
+    if (valid && parsed >= minimum && parsed <= maximum) return parsed;
 
-        asio::async_write(
-            socket_, asio::buffer(dram_buffer, buffer_size),
-            [this, addr, dram_buffer, self](const asio::error_code &ec,
-                                            std::size_t transferred_bytes) {
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
-                if (isCudaMemory(addr)) {
-                    delete[] dram_buffer;
-                }
-#endif
-                if (ec) {
-                    LOG(ERROR)
-                        << "Session::writeBody failed. "
-                        << "Attempt to write data " << static_cast<void *>(addr)
-                        << " using buffer " << static_cast<void *>(dram_buffer)
-                        << ". Error: " << ec.message()
-                        << " (value: " << ec.value() << ")"
-                        << ", total_transferred_bytes_: "
-                        << total_transferred_bytes_
-                        << ", current transferred_bytes: " << transferred_bytes;
-                    if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
-                    session_mutex_.unlock();
-                    return;
-                }
-                total_transferred_bytes_ += transferred_bytes;
-                writeBody();
-            });
+    LOG(WARNING) << "Invalid " << name << " value: " << text
+                 << ", using default " << default_value;
+    return default_value;
+}
+
+bool validateTcpAddress(const std::shared_ptr<TransferMetadata>& metadata,
+                        uint64_t addr, uint64_t size) {
+    if (size == 0 || addr + size < addr) return false;
+
+    auto desc = metadata->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    if (!desc) return false;
+    for (const auto& buffer : desc->buffers) {
+        if (buffer.addr + buffer.length < buffer.addr) continue;
+        if (buffer.addr <= addr && addr + size <= buffer.addr + buffer.length)
+            return true;
+    }
+    return false;
+}
+}  // namespace
+
+TcpTransport::TcpTransport()
+    : context_(nullptr),
+      running_(false),
+      lane_state_(std::make_shared<ConnectionLaneState>()) {
+    if (getenv("MC_TCP_ENABLE_CONNECTION_POOL") != nullptr) {
+        std::string val(getenv("MC_TCP_ENABLE_CONNECTION_POOL"));
+        std::transform(val.begin(), val.end(), val.begin(),
+                       [](unsigned char c) -> char { return std::tolower(c); });
+        if (val == "0" || val == "false" || val == "no") {
+            enable_connection_pool_ = false;
+        } else {
+            enable_connection_pool_ = true;
+        }
     }
 
-    void readBody() {
-        // LOG(INFO) << "readBody";
-        auto self(shared_from_this());
-        uint64_t size = le64toh(header_.size);
-        char *addr = local_buffer_;
+    constexpr size_t kDefaultLanesPerPeer = 4;
+    constexpr size_t kDefaultQueuedTransfersPerPeer = 1024;
+    constexpr size_t kMaxQueuedTransfersPerPeer = 65535;
+    constexpr size_t kDefaultPendingAdmissionsPerPeer = 1024;
+    constexpr size_t kMaxPendingAdmissionsPerPeer = 65535;
+    constexpr size_t kDefaultAdmissionTimeoutMs = 1000;
+    constexpr size_t kMaxAdmissionTimeoutMs = 600000;
 
-        size_t buffer_size =
-            std::min(kDefaultBufferSize, size - total_transferred_bytes_);
-        if (buffer_size == 0) {
-            if (on_finalize_) on_finalize_(TransferStatusEnum::COMPLETED);
-            session_mutex_.unlock();
-            return;
+    const char* lanes_env = getenv("MC_TCP_LANES_PER_PEER");
+    if (lanes_env) {
+        lane_state_->lanes_per_peer = parseBoundedTcpSetting(
+            "MC_TCP_LANES_PER_PEER", lanes_env, kDefaultLanesPerPeer, 1,
+            kMaxTcpLanesPerPeer);
+    } else {
+        const char* deprecated_env = getenv("MC_TCP_MAX_CONNECTIONS_PER_PEER");
+        if (deprecated_env) {
+            LOG(WARNING) << "MC_TCP_MAX_CONNECTIONS_PER_PEER is deprecated; "
+                            "use MC_TCP_LANES_PER_PEER";
+            lane_state_->lanes_per_peer = parseBoundedTcpSetting(
+                "MC_TCP_MAX_CONNECTIONS_PER_PEER", deprecated_env,
+                kDefaultLanesPerPeer, 1, kMaxTcpLanesPerPeer);
         }
-
-        char *dram_buffer = addr + total_transferred_bytes_;
-
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
-        bool is_cuda_memory = isCudaMemory(addr);
-        if (is_cuda_memory) {
-            dram_buffer = new char[buffer_size];
-        }
-#else
-        bool is_cuda_memory = false;
-#endif
-
-        asio::async_read(
-            socket_, asio::buffer(dram_buffer, buffer_size),
-            [this, addr, dram_buffer, is_cuda_memory, self](
-                const asio::error_code &ec, std::size_t transferred_bytes) {
-                if (ec) {
-                    LOG(ERROR)
-                        << "Session::readBody failed. "
-                        << "Attempt to read data " << static_cast<void *>(addr)
-                        << " using buffer " << static_cast<void *>(dram_buffer)
-                        << ". Error: " << ec.message()
-                        << " (value: " << ec.value() << ")"
-                        << ", total_transferred_bytes_: "
-                        << total_transferred_bytes_
-                        << ", current transferred_bytes: " << transferred_bytes;
-                    if (on_finalize_) on_finalize_(TransferStatusEnum::FAILED);
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
-                    if (is_cuda_memory) delete[] dram_buffer;
-#endif
-                    session_mutex_.unlock();
-                    return;
-                }
-
-#if defined(USE_CUDA) || defined(USE_MUSA) || defined(USE_HIP)
-                if (is_cuda_memory) {
-                    cudaError_t cuda_status =
-                        cudaMemcpy(addr + total_transferred_bytes_, dram_buffer,
-                                   transferred_bytes, cudaMemcpyDefault);
-                    if (cuda_status != cudaSuccess) {
-                        LOG(ERROR)
-                            << "Session::readBody failed to copy to CUDA "
-                               "memory. "
-                            << "Error: " << cudaGetErrorString(cuda_status);
-                        if (on_finalize_)
-                            on_finalize_(TransferStatusEnum::FAILED);
-                        delete[] dram_buffer;
-                        session_mutex_.unlock();
-                        return;
-                    }
-                    delete[] dram_buffer;
-                }
-#endif
-                total_transferred_bytes_ += transferred_bytes;
-                readBody();
-            });
-    }
-};
-
-struct TcpContext {
-    TcpContext(short port) : acceptor(io_context) {
-        std::error_code ec;
-        asio::ip::tcp::endpoint endpoint(asio::ip::tcp::v6(), port);
-
-        acceptor.open(endpoint.protocol(), ec);
-        if (!ec) {
-            acceptor.set_option(asio::ip::v6_only(false), ec);
-            if (!ec) {
-                acceptor.set_option(
-                    asio::ip::tcp::acceptor::reuse_address(true));
-                acceptor.bind(endpoint, ec);
-                if (!ec) {
-                    acceptor.listen();
-                    return;
-                }
-            }
-            acceptor.close();
-        }
-        LOG(ERROR) << "Failed to set up IPv6 dual-stack listener: "
-                   << ec.message() << " (error code: " << ec.value() << ")";
-        asio::ip::tcp::endpoint endpoint_v4(asio::ip::tcp::v4(), port);
-        acceptor.open(endpoint_v4.protocol());
-        acceptor.set_option(asio::ip::tcp::acceptor::reuse_address(true));
-        acceptor.bind(endpoint_v4);
-        acceptor.listen();
     }
 
-    void doAccept() {
-        acceptor.async_accept([this](asio::error_code ec, tcpsocket socket) {
-            if (!ec) std::make_shared<Session>(std::move(socket))->onAccept();
-            doAccept();
-        });
-    }
-
-    asio::io_context io_context;
-    asio::ip::tcp::acceptor acceptor;
-};
-
-TcpTransport::TcpTransport() : context_(nullptr), running_(false) {
-    // TODO
+    lane_state_->max_queued_transfers_per_peer = parseBoundedTcpSetting(
+        "MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER",
+        getenv("MC_TCP_MAX_QUEUED_TRANSFERS_PER_PEER"),
+        kDefaultQueuedTransfersPerPeer, 1, kMaxQueuedTransfersPerPeer);
+    lane_state_->max_pending_admissions_per_peer = parseBoundedTcpSetting(
+        "MC_TCP_MAX_PENDING_ADMISSIONS_PER_PEER",
+        getenv("MC_TCP_MAX_PENDING_ADMISSIONS_PER_PEER"),
+        kDefaultPendingAdmissionsPerPeer, 1, kMaxPendingAdmissionsPerPeer);
+    lane_state_->admission_timeout =
+        std::chrono::milliseconds(parseBoundedTcpSetting(
+            "MC_TCP_ADMISSION_TIMEOUT_MS",
+            getenv("MC_TCP_ADMISSION_TIMEOUT_MS"), kDefaultAdmissionTimeoutMs,
+            1, kMaxAdmissionTimeoutMs));
 }
 
 TcpTransport::~TcpTransport() {
-    if (running_) {
-        running_ = false;
-        context_->io_context.stop();
-        thread_.join();
-    }
+    shutdownConnectionLanes();
 
     if (context_) {
         delete context_;
@@ -326,7 +307,7 @@ int TcpTransport::startHandshakeDaemon() {
                                            metadata_->localRpcMeta().sockfd);
 }
 
-int TcpTransport::install(std::string &local_server_name,
+int TcpTransport::install(std::string& local_server_name,
                           std::shared_ptr<TransferMetadata> meta,
                           std::shared_ptr<Topology> topo) {
     metadata_ = meta;
@@ -360,25 +341,40 @@ int TcpTransport::install(std::string &local_server_name,
 
     close(sockfd);  // the above function has opened a socket
     LOG(INFO) << "TcpTransport: listen on port " << tcp_port;
-    context_ = new TcpContext(tcp_port);
+    auto metadata = metadata_;
+    context_ = new TcpContext(tcp_port, [metadata = std::move(metadata)](
+                                            uint64_t addr, uint64_t size) {
+        return validateTcpAddress(metadata, addr, size);
+    });
+    lane_runtime_ =
+        std::make_shared<ConnectionLaneRuntime>(context_->io_context);
+    lane_state_->runtime = lane_runtime_;
     running_ = true;
     thread_ = std::thread(&TcpTransport::worker, this);
     return 0;
 }
 
 int TcpTransport::allocateLocalSegmentID(int tcp_data_port) {
-    auto desc = std::make_shared<SegmentDesc>();
-    if (!desc) return ERR_MEMORY;
+    auto desc = metadata_->getSegmentDesc(local_server_name_);
+    if (!desc) desc = std::make_shared<SegmentDesc>();
     desc->name = local_server_name_;
+#ifdef ENABLE_MULTI_PROTOCOL
+    if (!desc->protocol.empty()) desc->protocol += ",";
+    desc->protocol += "tcp";
+#else
     desc->protocol = "tcp";
+#endif
     desc->tcp_data_port = tcp_data_port;
+    // Advertise acknowledged framing (#2086); initiators fall back to v1
+    // against descriptors that do not carry the field.
+    desc->tcp_proto_version = 2;
     metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
                                std::move(desc));
     return 0;
 }
 
-int TcpTransport::registerLocalMemory(void *addr, size_t length,
-                                      const std::string &location,
+int TcpTransport::registerLocalMemory(void* addr, size_t length,
+                                      const std::string& location,
                                       bool remote_accessible,
                                       bool update_metadata) {
     (void)remote_accessible;
@@ -386,37 +382,48 @@ int TcpTransport::registerLocalMemory(void *addr, size_t length,
     buffer_desc.name = local_server_name_;
     buffer_desc.addr = (uint64_t)addr;
     buffer_desc.length = length;
+#ifdef ENABLE_MULTI_PROTOCOL
+    buffer_desc.protocol = "tcp";
+#endif
     return metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
 }
 
-int TcpTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
+int TcpTransport::unregisterLocalMemory(void* addr, bool update_metadata) {
     return metadata_->removeLocalMemoryBuffer(addr, update_metadata);
 }
 
 int TcpTransport::registerLocalMemoryBatch(
-    const std::vector<Transport::BufferEntry> &buffer_list,
-    const std::string &location) {
-    for (auto &buffer : buffer_list)
-        registerLocalMemory(buffer.addr, buffer.length, location, true, false);
+    const std::vector<Transport::BufferEntry>& buffer_list,
+    const std::string& location) {
+    for (auto& buffer : buffer_list) {
+        int ret = registerLocalMemory(buffer.addr, buffer.length, location,
+                                      true, false);
+        if (ret) return ret;
+    }
     return metadata_->updateLocalSegmentDesc();
 }
 
 int TcpTransport::unregisterLocalMemoryBatch(
-    const std::vector<void *> &addr_list) {
-    for (auto &addr : addr_list) unregisterLocalMemory(addr, false);
-    return metadata_->updateLocalSegmentDesc();
+    const std::vector<void*>& addr_list) {
+    int first_error = 0;
+    for (auto& addr : addr_list) {
+        int ret = unregisterLocalMemory(addr, false);
+        if (ret && !first_error) first_error = ret;
+    }
+    int metadata_ret = metadata_->updateLocalSegmentDesc();
+    return first_error ? first_error : metadata_ret;
 }
 
 Status TcpTransport::getTransferStatus(BatchID batch_id, size_t task_id,
-                                       TransferStatus &status) {
-    auto &batch_desc = *((BatchDesc *)(batch_id));
+                                       TransferStatus& status) {
+    auto& batch_desc = *((BatchDesc*)(batch_id));
     const size_t task_count = batch_desc.task_list.size();
     if (task_id >= task_count) {
         return Status::InvalidArgument(
             "TcpTransport::getTransportStatus invalid argument, batch id: " +
             std::to_string(batch_id));
     }
-    auto &task = batch_desc.task_list[task_id];
+    auto& task = batch_desc.task_list[task_id];
     status.transferred_bytes = task.transferred_bytes;
     uint64_t success_slice_count = task.success_slice_count;
     uint64_t failed_slice_count = task.failed_slice_count;
@@ -434,8 +441,8 @@ Status TcpTransport::getTransferStatus(BatchID batch_id, size_t task_id,
 }
 
 Status TcpTransport::submitTransfer(
-    BatchID batch_id, const std::vector<TransferRequest> &entries) {
-    auto &batch_desc = *((BatchDesc *)(batch_id));
+    BatchID batch_id, const std::vector<TransferRequest>& entries) {
+    auto& batch_desc = *((BatchDesc*)(batch_id));
     if (batch_desc.task_list.size() + entries.size() > batch_desc.batch_size) {
         LOG(ERROR) << "TcpTransport: Exceed the limitation of current batch's "
                       "capacity";
@@ -447,49 +454,119 @@ Status TcpTransport::submitTransfer(
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
 
-    for (auto &request : entries) {
-        TransferTask &task = batch_desc.task_list[task_id];
+    for (auto& request : entries) {
+        TransferTask& task = batch_desc.task_list[task_id];
         ++task_id;
-        task.total_bytes = request.length;
-        Slice *slice = getSliceCache().allocate();
-        slice->source_addr = (char *)request.source;
-        slice->length = request.length;
-        slice->opcode = request.opcode;
-        slice->tcp.dest_addr = request.target_offset;
-        slice->task = &task;
-        slice->target_id = request.target_id;
-        slice->status = Slice::PENDING;
-        slice->ts = 0;
-        task.slice_list.push_back(slice);
-        __sync_fetch_and_add(&task.slice_count, 1);
-        startTransfer(slice);
+        startTransfer(prepareTransfer(&task, request));
     }
 
     return Status::OK();
 }
 
 Status TcpTransport::submitTransferTask(
-    const std::vector<TransferTask *> &task_list) {
-    for (size_t index = 0; index < task_list.size(); ++index) {
-        assert(task_list[index]);
-        auto &task = *task_list[index];
-        assert(task.request);
-        auto &request = *task.request;
-        task.total_bytes = request.length;
-        Slice *slice = getSliceCache().allocate();
-        slice->source_addr = (char *)request.source;
-        slice->length = request.length;
-        slice->opcode = request.opcode;
-        slice->tcp.dest_addr = request.target_offset;
-        slice->task = &task;
-        slice->target_id = request.target_id;
-        slice->status = Slice::PENDING;
-        slice->ts = 0;
-        task.slice_list.push_back(slice);
-        __sync_fetch_and_add(&task.slice_count, 1);
-        startTransfer(slice);
+    const std::vector<TransferTask*>& task_list) {
+    for (auto* task : task_list) {
+        assert(task && task->request);
+        startTransfer(prepareTransfer(task, *task->request));
     }
     return Status::OK();
+}
+
+Status TcpTransport::submitTransferTaskGroup(
+    const std::vector<TransferTask*>& task_list) {
+    std::vector<Slice*> slices;
+    slices.reserve(task_list.size());
+    for (auto* task : task_list) {
+        assert(task && task->request);
+        slices.push_back(prepareTransfer(task, *task->request));
+    }
+    startTransferSequence(std::move(slices));
+    return Status::OK();
+}
+
+Transport::Slice* TcpTransport::prepareTransfer(
+    TransferTask* task, const TransferRequest& request) {
+    task->total_bytes = request.length;
+    Slice* slice = getSliceCache().allocate();
+    slice->source_addr = static_cast<char*>(request.source);
+    slice->length = request.length;
+    slice->opcode = request.opcode;
+    slice->tcp.dest_addr = request.target_offset;
+    slice->task = task;
+    slice->target_id = request.target_id;
+    slice->status = Slice::PENDING;
+    slice->ts = 0;
+    task->slice_list.push_back(slice);
+    __sync_fetch_and_add(&task->slice_count, 1);
+    return slice;
+}
+
+void TcpTransport::startTransferSequence(std::vector<Slice*> slices) {
+    struct Sequence {
+        std::mutex mutex;
+        std::vector<Slice*> slices;
+        size_t next = 0;
+        bool advancing = false;
+        bool resume_requested = false;
+    };
+
+    auto sequence = std::make_shared<Sequence>();
+    sequence->slices = std::move(slices);
+
+    auto advance = std::make_shared<std::function<void()>>();
+    std::weak_ptr<std::function<void()>> weak_advance = advance;
+
+    *advance = [this, sequence, weak_advance]() {
+        auto advance = weak_advance.lock();
+        if (!advance) return;
+
+        {
+            std::lock_guard<std::mutex> lock(sequence->mutex);
+            if (sequence->next == sequence->slices.size()) return;
+            if (sequence->advancing) {
+                sequence->resume_requested = true;
+                return;
+            }
+            sequence->advancing = true;
+        }
+
+        while (true) {
+            Slice* slice = nullptr;
+            bool has_more = false;
+            {
+                std::lock_guard<std::mutex> lock(sequence->mutex);
+                if (sequence->next == sequence->slices.size()) {
+                    sequence->advancing = false;
+                    return;
+                }
+                slice = sequence->slices[sequence->next++];
+                has_more = sequence->next < sequence->slices.size();
+                sequence->resume_requested = false;
+            }
+
+            std::function<void()> continuation;
+            if (has_more) {
+                continuation = [advance]() { (*advance)(); };
+            }
+
+            // startTransfer may fail synchronously (including during shutdown).
+            // The trampoline above turns a synchronous continuation into
+            // another loop iteration rather than recursive calls. For an
+            // asynchronous completion, this invocation returns and the
+            // continuation becomes the next runner.
+            startTransfer(slice, std::move(continuation), true);
+
+            {
+                std::lock_guard<std::mutex> lock(sequence->mutex);
+                if (!sequence->resume_requested) {
+                    sequence->advancing = false;
+                    return;
+                }
+            }
+        }
+    };
+
+    (*advance)();
 }
 
 void TcpTransport::worker() {
@@ -497,55 +574,157 @@ void TcpTransport::worker() {
         try {
             context_->doAccept();
             context_->io_context.run();
-        } catch (std::exception &e) {
+        } catch (std::exception& e) {
             LOG(ERROR) << "TcpTransport::worker encountered an exception "
                           "during doAccept/run: "
                        << e.what();
+            context_->io_context.restart();
         }
     }
 }
 
-void TcpTransport::startTransfer(Slice *slice) {
+std::shared_ptr<asio::ip::tcp::socket> TcpTransport::getConnection(
+    const std::string& host, uint16_t port) {
+    // The reusable path is owned by fixed connection lanes. This helper is
+    // only for the connection-pool-disabled one-shot path.
     try {
         asio::ip::tcp::resolver resolver(context_->io_context);
-        asio::ip::tcp::socket socket(context_->io_context);
-        auto desc = metadata_->getSegmentDescByID(slice->target_id);
-        if (!desc) {
-            LOG(ERROR) << "TcpTransport::startTransfer failed to get segment "
-                          "description for target_id: "
-                       << slice->target_id;
-            slice->markFailed();
-            return;
-        }
+        auto endpoint_iterator = resolver.resolve(host, std::to_string(port));
+        auto socket_ptr =
+            std::make_shared<asio::ip::tcp::socket>(context_->io_context);
+        asio::connect(*socket_ptr, endpoint_iterator);
+        socket_ptr->set_option(asio::ip::tcp::no_delay(true));
+        return socket_ptr;
+    } catch (std::exception& e) {
+        LOG(ERROR)
+            << "TcpTransport::getConnection failed to create connection to "
+            << host << ":" << port << ". Error: " << e.what();
+        return nullptr;
+    }
+}
 
-        TransferMetadata::RpcMetaDesc meta_entry;
-        if (metadata_->getRpcMetaEntry(desc->name, meta_entry)) {
-            LOG(ERROR) << "TcpTransport::startTransfer failed to get RPC meta "
-                          "entry for segment name: "
-                       << desc->name;
+#include "tcp_transport_lane_impl.h"
+
+void TcpTransport::startTransfer(Slice* slice,
+                                 std::function<void()> continuation,
+                                 bool reuse_connection) {
+    auto finish = [slice, &continuation](TransferStatusEnum status) mutable {
+        if (status == TransferStatusEnum::COMPLETED)
+            slice->markSuccess();
+        else
             slice->markFailed();
-            return;
+        if (continuation) {
+            auto next = std::move(continuation);
+            next();
         }
-        auto endpoint_iterator = resolver.resolve(
-            meta_entry.ip_or_host_name, std::to_string(desc->tcp_data_port));
-        asio::connect(socket, endpoint_iterator);
-        auto session = std::make_shared<Session>(std::move(socket));
-        session->on_finalize_ = [slice](TransferStatusEnum status) {
-            if (status == TransferStatusEnum::COMPLETED)
-                slice->markSuccess();
-            else
-                slice->markFailed();
-        };
-        session->initiate(slice->source_addr, slice->tcp.dest_addr,
-                          slice->length, slice->opcode);
-    } catch (std::exception &e) {
-        LOG(ERROR) << "TcpTransport::startTransfer encountered an ASIO "
-                      "exception. Slice details - source_addr: "
+    };
+
+    auto desc = metadata_->getSegmentDescByID(slice->target_id);
+    if (!desc) {
+        LOG(ERROR) << "TcpTransport::startTransfer failed to get segment "
+                      "description for target_id: "
+                   << slice->target_id;
+        finish(TransferStatusEnum::FAILED);
+        return;
+    }
+
+    TransferMetadata::RpcMetaDesc meta_entry;
+    if (metadata_->getRpcMetaEntry(desc->name, meta_entry)) {
+        LOG(ERROR) << "TcpTransport::startTransfer failed to get RPC meta "
+                      "entry for segment name: "
+                   << desc->name;
+        finish(TransferStatusEnum::FAILED);
+        return;
+    }
+
+    // Zero-length requests are complete by definition. v1 reported them
+    // COMPLETED while the server silently rejected size==0 in address
+    // validation; preserve that outcome without a round trip.
+    if (slice->length == 0) {
+        finish(TransferStatusEnum::COMPLETED);
+        return;
+    }
+
+    const ConnectionKey key{meta_entry.ip_or_host_name,
+                            static_cast<uint16_t>(desc->tcp_data_port)};
+    const bool use_v2 = desc->tcp_proto_version >= 2 && !forceLegacyTcpProto();
+    TcpWorkItem work(slice, use_v2, std::move(continuation));
+
+    // Scatter task groups request reuse even when the general pool setting is
+    // disabled. Fixed lanes provide the same serial socket reuse without
+    // reviving the old unbounded dynamic pool.
+    if (enable_connection_pool_ || reuse_connection) {
+        enqueuePooledTransfer(key, std::move(work));
+        return;
+    }
+
+    // Preserve the connection-pool-disabled synchronous one-shot path.
+    auto socket = getConnection(key.host, key.port);
+    if (!socket) {
+        LOG(ERROR) << "TcpTransport::startTransfer failed to get connection to "
+                   << key.host << ":" << key.port;
+        completeTerminalAction(
+            TerminalAction(std::move(work), TransferStatusEnum::FAILED, false));
+        return;
+    }
+    startTransferWithSocket(std::move(work), std::move(socket));
+}
+
+void TcpTransport::startTransferWithSocket(
+    TcpWorkItem work, std::shared_ptr<asio::ip::tcp::socket> socket) noexcept {
+    const Slice* slice = work.slice;
+    std::shared_ptr<std::optional<TcpWorkItem>> terminal_work;
+    try {
+        terminal_work =
+            std::make_shared<std::optional<TcpWorkItem>>(std::move(work));
+        auto session = std::make_shared<ClientSession>(
+            socket, terminal_work->value().use_v2,
+            [terminal_work, socket](TransferStatusEnum status, bool) noexcept {
+                closeSocketNoThrow(socket);
+                if (!terminal_work->has_value()) return;
+                auto completed = std::move(terminal_work->value());
+                terminal_work->reset();
+                completeTerminalAction(
+                    TerminalAction(std::move(completed), status, false));
+            });
+        session->initiate(terminal_work->value().slice->source_addr,
+                          terminal_work->value().slice->tcp.dest_addr,
+                          terminal_work->value().slice->length,
+                          terminal_work->value().slice->opcode);
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "TcpTransport::startTransfer encountered an exception. "
+                      "Slice details - source_addr: "
                    << slice->source_addr << ", length: " << slice->length
                    << ", opcode: " << (int)slice->opcode
                    << ", target_id: " << slice->target_id
                    << ". Exception: " << e.what();
-        slice->markFailed();
+        closeSocketNoThrow(socket);
+        if (terminal_work && terminal_work->has_value()) {
+            auto failed = std::move(terminal_work->value());
+            terminal_work->reset();
+            failWorkItem(std::move(failed), WorkFailureReason::SESSION_FAILED,
+                         lane_state_->failure_counters);
+        } else if (work.slice) {
+            failWorkItem(std::move(work), WorkFailureReason::SESSION_FAILED,
+                         lane_state_->failure_counters);
+        }
+    } catch (...) {
+        LOG(ERROR) << "TcpTransport::startTransfer encountered an unknown "
+                      "exception. Slice details - source_addr: "
+                   << slice->source_addr << ", length: " << slice->length
+                   << ", opcode: " << (int)slice->opcode
+                   << ", target_id: " << slice->target_id;
+        closeSocketNoThrow(socket);
+        if (terminal_work && terminal_work->has_value()) {
+            auto failed = std::move(terminal_work->value());
+            terminal_work->reset();
+            failWorkItem(std::move(failed), WorkFailureReason::SESSION_FAILED,
+                         lane_state_->failure_counters);
+        } else if (work.slice) {
+            failWorkItem(std::move(work), WorkFailureReason::SESSION_FAILED,
+                         lane_state_->failure_counters);
+        }
     }
 }
+
 }  // namespace mooncake

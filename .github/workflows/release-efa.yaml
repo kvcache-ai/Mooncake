@@ -1,0 +1,35 @@
+name: Release EFA
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Publishes mooncake-transfer-engine-efa, the CUDA 12-aware AWS EFA wheel.
+jobs:
+  build:
+    permissions:
+      contents: write
+    uses: ./.github/workflows/_build-efa-wheel.yaml
+    with:
+      variant: cuda
+      use-cuda: true
+      cuda-version: '12.8.1'
+      python-versions: '["3.10", "3.11", "3.12", "3.13"]'
+      build-profile: release
+      cmake-args: >-
+        -DUSE_HTTP=ON -DUSE_ETCD=ON -DWITH_EP=OFF -DSTORE_USE_ETCD=ON
+      variant-flag: EFA_BUILD
+      artifact-prefix: mooncake-wheel-efa
+
+  publish-release:
+    if: ${{ !contains(github.ref_name, '-') }}
+    needs: build
+    permissions:
+      contents: write
+      id-token: write
+    uses: ./.github/workflows/_publish-wheel.yaml
+    with:
+      artifact-pattern: 'mooncake-wheel-efa-py*'
+    secrets:
+      pypi-token: ${{ secrets.PYPI_API_TOKEN }}

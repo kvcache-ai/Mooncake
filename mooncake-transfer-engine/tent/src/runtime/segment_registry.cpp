@@ -34,13 +34,6 @@ CentralSegmentRegistry::CentralSegmentRegistry(const std::string &type,
     plugin_ = MetaStore::Create(type, servers);
 }
 
-CentralSegmentRegistry::CentralSegmentRegistry(const std::string &type,
-                                               const std::string &servers,
-                                               const std::string &password,
-                                               uint8_t db_index) {
-    plugin_ = MetaStore::Create(type, servers, password, db_index);
-}
-
 Status CentralSegmentRegistry::getSegmentDesc(SegmentDescRef &desc,
                                               const std::string &segment_name) {
     if (!plugin_)

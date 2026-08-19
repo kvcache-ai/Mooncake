@@ -1,83 +1,84 @@
 #include "client_metric.h"
 
 #include <glog/logging.h>
-#include <algorithm>
-#include <cctype>
 #include <chrono>
 #include <cstdlib>
 #include <thread>
 
+#include "bool_parser.h"
+#include "integer_parser.h"
+
 namespace mooncake {
 
-std::string TransferMetric::summary_metrics() {
-    std::stringstream ss;
-    ss << "=== Transfer Metrics Summary ===\n";
+namespace {
 
-    // Bytes transferred
-    auto read_bytes = total_read_bytes.value();
-    auto write_bytes = total_write_bytes.value();
-    ss << "Total Read: " << byte_size_to_string(read_bytes) << "\n";
-    ss << "Total Write: " << byte_size_to_string(write_bytes) << "\n";
-
-    // Latency summaries
-    ss << "\n=== Latency Summary (microseconds) ===\n";
-    ss << "Get: " << format_latency_summary(get_latency_us) << "\n";
-    ss << "Put: " << format_latency_summary(put_latency_us) << "\n";
-    ss << "Batch Get: " << format_latency_summary(batch_get_latency_us) << "\n";
-    ss << "Batch Put: " << format_latency_summary(batch_put_latency_us) << "\n";
-
-    return ss.str();
+bool parseMetricsEnabled() {
+    const char* metric_env = std::getenv("MC_STORE_CLIENT_METRIC");
+    if (!metric_env) {
+        return true;
+    }
+    return TryParseBool(metric_env).value_or(false);
 }
 
-std::string MasterClientMetric::summary_metrics() {
-    std::stringstream ss;
-    ss << "=== RPC Metrics Summary ===\n";
-
-    if (rpc_count.label_value_count() == 0) {
-        ss << "No RPC calls recorded\n";
-        return ss.str();
+bool parseBoolEnv(const char* env_name, bool default_value) {
+    const char* env_value = std::getenv(env_name);
+    if (!env_value) {
+        return default_value;
     }
 
-    // Dynamically iterate all recorded RPC names from rpc_count.
-    // rpc_latency only observes successful calls, so its bucket counts
-    // provide both the success count and the success latency distribution.
-    auto count_map = rpc_count.copy();
-    auto bucket_counts = rpc_latency.get_bucket_counts();
-    bool found_any = false;
-
-    for (auto& entry : count_map) {
-        const auto& rpc_name = entry->label[0];
-        std::array<std::string, 1> label_array = {rpc_name};
-
-        int64_t total_calls = entry->value.load(std::memory_order::relaxed);
-        if (total_calls == 0) continue;
-        found_any = true;
-
-        auto success_summary = format_latency_summary_from_buckets(
-            bucket_counts.size(),
-            [&](size_t i) { return bucket_counts[i]->value(label_array); },
-            "success");
-        if (success_summary == "No data") {
-            ss << rpc_name << ": total=" << total_calls << ", success=0\n";
-        } else {
-            ss << rpc_name << ": total=" << total_calls << ", "
-               << success_summary << "\n";
-        }
+    const auto parsed = TryParseBool(env_value);
+    if (parsed.has_value()) {
+        return *parsed;
     }
 
-    if (!found_any) {
-        ss << "No RPC calls recorded\n";
-    }
-
-    return ss.str();
+    LOG(WARNING) << "Failed to parse " << env_name << ": " << env_value
+                 << ", fallback to default=" << default_value;
+    return default_value;
 }
+
+uint64_t parseMetricsInterval() {
+    const char* interval_env = std::getenv("MC_STORE_CLIENT_METRIC_INTERVAL");
+    if (!interval_env) {
+        // Default to disabled
+        return 0;
+    }
+
+    const auto interval = TryParseInteger<uint64_t>(
+        interval_env,
+        {.trim_ascii_whitespace = true, .allow_leading_plus = true});
+    if (!interval.has_value()) {
+        LOG(WARNING) << "Failed to parse MC_STORE_CLIENT_METRIC_INTERVAL: "
+                     << interval_env << ", disabling metrics reporting";
+        return 0;
+    }
+    if (*interval == 0) {
+        LOG(INFO) << "Client metrics reporting disabled (interval=0) via "
+                     "MC_STORE_CLIENT_METRIC_INTERVAL";
+    } else {
+        LOG(INFO) << "Client metrics interval set to " << *interval
+                  << "s via MC_STORE_CLIENT_METRIC_INTERVAL";
+    }
+    return *interval;
+}
+
+}  // anonymous namespace
 
 ClientMetric::ClientMetric(uint64_t interval_seconds,
-                           const std::map<std::string, std::string>& labels)
+                           const std::map<std::string, std::string>& labels,
+                           bool bandwidth_reporting_enabled,
+                           bool master_rpc_metrics_enabled)
     : transfer_metric(labels),
       master_client_metric(labels),
+      transfer_operation_metric(labels),
+      ssd_metric(labels),
       should_stop_metrics_thread_(false),
-      metrics_interval_seconds_(interval_seconds) {
+      metrics_interval_seconds_(interval_seconds),
+      bandwidth_reporting_enabled_(bandwidth_reporting_enabled),
+      master_rpc_metrics_enabled_(master_rpc_metrics_enabled) {
+    last_report_snapshot_ = TransferSnapshot{
+        static_cast<uint64_t>(transfer_metric.total_read_bytes.value()),
+        static_cast<uint64_t>(transfer_metric.total_write_bytes.value()),
+        std::chrono::steady_clock::now()};
     if (metrics_interval_seconds_ > 0) {
         StartMetricsReportingThread();
     }
@@ -85,54 +86,126 @@ ClientMetric::ClientMetric(uint64_t interval_seconds,
 
 ClientMetric::~ClientMetric() { StopMetricsReportingThread(); }
 
+std::unique_ptr<ClientMetric> ClientMetric::Create(
+    const std::map<std::string, std::string>& labels,
+    bool master_rpc_metrics_enabled) {
+    if (!parseMetricsEnabled()) {
+        LOG(INFO) << "Client metrics disabled (set MC_STORE_CLIENT_METRIC=0 to "
+                     "disable)";
+        return nullptr;
+    }
+
+    uint64_t interval = parseMetricsInterval();
+    bool bandwidth_reporting_enabled =
+        parseBoolEnv("MC_STORE_CLIENT_METRIC_BANDWIDTH", true);
+
+    LOG(INFO) << "Client metrics enabled (default enabled)";
+    LOG(INFO) << "Client bandwidth summary "
+              << (bandwidth_reporting_enabled ? "enabled" : "disabled")
+              << " via MC_STORE_CLIENT_METRIC_BANDWIDTH";
+
+    return std::make_unique<ClientMetric>(interval, labels,
+                                          bandwidth_reporting_enabled,
+                                          master_rpc_metrics_enabled);
+}
+
 void ClientMetric::serialize(std::string& str) {
     transfer_metric.serialize(str);
-    master_client_metric.serialize(str);
+    if (master_rpc_metrics_enabled_) {
+        master_client_metric.serialize(str);
+    }
+    transfer_operation_metric.serialize(str);
+    ssd_metric.serialize(str);
 }
 
 std::string ClientMetric::summary_metrics() {
     std::stringstream ss;
     ss << "Client Metrics Summary\n";
-    ss << transfer_metric.summary_metrics();
+    ss << transfer_metric.summary_metrics(bandwidth_reporting_enabled_);
     ss << "\n";
-    ss << master_client_metric.summary_metrics();
+    if (master_rpc_metrics_enabled_) {
+        ss << master_client_metric.summary_metrics();
+        ss << "\n";
+    }
+    ss << transfer_operation_metric.summary_metrics();
+    ss << "\n";
+    ss << ssd_metric.summary_metrics();
     return ss.str();
 }
 
-void ClientMetric::StartMetricReporting(uint64_t interval_seconds) {
-    StopMetricsReportingThread();
-    metrics_interval_seconds_ = interval_seconds;
-    if (metrics_interval_seconds_ > 0) {
-        StartMetricsReportingThread();
+std::string ClientMetric::BuildBandwidthReport() {
+    if (!bandwidth_reporting_enabled_) {
+        return "";
     }
+
+    const auto now = std::chrono::steady_clock::now();
+    const uint64_t read_bytes = transfer_metric.total_read_bytes.value();
+    const uint64_t write_bytes = transfer_metric.total_write_bytes.value();
+
+    std::lock_guard<std::mutex> lock(snapshot_mutex_);
+    if (!last_report_snapshot_.has_value()) {
+        last_report_snapshot_ = TransferSnapshot{read_bytes, write_bytes, now};
+        return "";
+    }
+
+    const auto previous = *last_report_snapshot_;
+    last_report_snapshot_ = TransferSnapshot{read_bytes, write_bytes, now};
+
+    const double elapsed_seconds = std::max(
+        std::chrono::duration<double>(now - previous.timestamp).count(), 1e-9);
+    const uint64_t read_delta = read_bytes >= previous.read_bytes
+                                    ? read_bytes - previous.read_bytes
+                                    : 0;
+    const uint64_t write_delta = write_bytes >= previous.write_bytes
+                                     ? write_bytes - previous.write_bytes
+                                     : 0;
+
+    std::stringstream ss;
+    ss << "=== Interval Throughput Summary ===\n";
+    ss << "Read Throughput: "
+       << format_metric_rate(read_delta / elapsed_seconds, "B/s") << " ("
+       << byte_size_to_string(read_delta) << " over " << std::fixed
+       << std::setprecision(2) << elapsed_seconds << "s)\n";
+    ss << "Write Throughput: "
+       << format_metric_rate(write_delta / elapsed_seconds, "B/s") << " ("
+       << byte_size_to_string(write_delta) << " over " << std::fixed
+       << std::setprecision(2) << elapsed_seconds << "s)";
+    return ss.str();
 }
 
 void ClientMetric::StartMetricsReportingThread() {
     should_stop_metrics_thread_ = false;
-    metrics_reporting_thread_ = std::jthread([this](
-                                                 std::stop_token stop_token) {
-        LOG(INFO) << "Client metrics reporting thread started (interval: "
-                  << metrics_interval_seconds_ << "s)";
+    metrics_reporting_thread_ =
+        std::jthread([this](const std::stop_token& stop_token) {
+            LOG(INFO) << "Client metrics reporting thread started (interval: "
+                      << metrics_interval_seconds_ << "s)";
 
-        while (!stop_token.stop_requested() && !should_stop_metrics_thread_) {
-            // Sleep for the interval, checking periodically for stop signal
-            for (uint64_t i = 0;
-                 i < metrics_interval_seconds_ &&
-                 !stop_token.stop_requested() && !should_stop_metrics_thread_;
-                 ++i) {
-                std::this_thread::sleep_for(std::chrono::seconds(1));
+            while (!stop_token.stop_requested() &&
+                   !should_stop_metrics_thread_) {
+                // Sleep for the interval, checking periodically for stop signal
+                for (uint64_t i = 0; i < metrics_interval_seconds_ &&
+                                     !stop_token.stop_requested() &&
+                                     !should_stop_metrics_thread_;
+                     ++i) {
+                    std::this_thread::sleep_for(std::chrono::seconds(1));
+                }
+
+                if (stop_token.stop_requested() ||
+                    should_stop_metrics_thread_) {
+                    break;  // Exit if stopped during sleep
+                }
+
+                // Print metrics summary
+                std::string summary = summary_metrics();
+                std::string bandwidth_report = BuildBandwidthReport();
+                std::string report = "Client Metrics Report:\n" + summary;
+                if (!bandwidth_report.empty()) {
+                    report += "\n" + bandwidth_report;
+                }
+                LOG(INFO) << report;
             }
-
-            if (stop_token.stop_requested() || should_stop_metrics_thread_) {
-                break;  // Exit if stopped during sleep
-            }
-
-            // Print metrics summary
-            std::string summary = summary_metrics();
-            LOG(INFO) << "Client Metrics Report:\n" << summary;
-        }
-        LOG(INFO) << "Client metrics reporting thread stopped";
-    });
+            LOG(INFO) << "Client metrics reporting thread stopped";
+        });
 }
 
 void ClientMetric::StopMetricsReportingThread() {

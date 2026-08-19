@@ -44,6 +44,16 @@ target_link_libraries(client_runner PUBLIC
     ${ETCD_WRAPPER_LIB}
 )
 
+add_executable(oplog_ha_client oplog_ha_client.cpp client_wrapper.cpp)
+target_link_libraries(oplog_ha_client PUBLIC
+    mooncake_store
+    transfer_engine
+    cachelib_memory_allocator
+    glog
+    pthread
+    ${ETCD_WRAPPER_LIB}
+)
+
 add_executable(chaos_test chaos_test.cpp ${MOONCAKE_E2E_TEST_SOURCES})
 target_link_libraries(chaos_test PUBLIC
     mooncake_store
@@ -66,27 +76,23 @@ target_link_libraries(chaos_rand_test PUBLIC
     ${ETCD_WRAPPER_LIB}
 )
 
-if(STORE_USE_REDIS)
-    add_executable(redis_chaos_test redis_chaos_test.cpp ${MOONCAKE_E2E_TEST_SOURCES})
-    target_link_libraries(redis_chaos_test PUBLIC
-        mooncake_store
-        transfer_engine
-        cachelib_memory_allocator
-        glog
-        gtest
-        pthread
-        ${ETCD_WRAPPER_LIB}
-    )
-    add_test(
-        NAME redis_chaos_test
-        COMMAND redis_chaos_test
-            --master_path=${CMAKE_BINARY_DIR}/mooncake-store/src/mooncake_master
-            --clientctl_path=${CMAKE_BINARY_DIR}/mooncake-store/tests/e2e/clientctl
-            --out_dir=${CMAKE_BINARY_DIR}/redis_chaos_output
-    )
-    set_tests_properties(redis_chaos_test PROPERTIES
-        LABELS "redis_ha"
-        RUN_SERIAL TRUE
-        TIMEOUT 180
-    )
-endif()
+add_executable(storage_backend_e2e_test storage_backend_e2e_test.cpp client_wrapper.cpp)
+target_include_directories(storage_backend_e2e_test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
+)
+target_link_libraries(storage_backend_e2e_test PUBLIC
+    mooncake_store
+    transfer_engine
+    cachelib_memory_allocator
+    glog
+    gtest
+    pthread
+    ${ETCD_WRAPPER_LIB}
+)
+
+add_test(NAME storage_backend_e2e_test COMMAND storage_backend_e2e_test)
+
+add_executable(oplog_batch_e2e_test oplog_batch_e2e_test.cpp process_handler.cpp)
+target_link_libraries(oplog_batch_e2e_test PUBLIC glog gtest pthread)
+add_test(NAME oplog_batch_e2e_test COMMAND oplog_batch_e2e_test)
+set_tests_properties(oplog_batch_e2e_test PROPERTIES LABELS oplog_batch_smoke)

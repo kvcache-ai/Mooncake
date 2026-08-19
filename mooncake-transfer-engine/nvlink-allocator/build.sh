@@ -2,10 +2,13 @@
 
 set -e
 
+source "$(dirname "$(readlink -f "$0")")/../scripts/allocator_build_common.sh"
+
 # Check for flags
 USE_NVCC=false
 USE_HIPCC=false
 USE_MCC=false
+USE_MACA=false
 CI_BUILD=false
 
 if [[ "$1" == "--use-nvcc" ]]; then
@@ -17,6 +20,9 @@ elif [[ "$1" == "--use-hipcc" ]]; then
 elif [[ "$1" == "--use-mcc" ]]; then
     USE_MCC=true
     shift
+elif [[ "$1" == "--use-maca" ]]; then
+    USE_MACA=true
+    shift
 elif [[ "$1" == "--ci-build" ]]; then
     CI_BUILD=true
     shift
@@ -25,27 +31,11 @@ fi
 # Get output directory from command line argument, default to current directory
 OUTPUT_DIR=${1:-.}
 
-# Get include directories from second argument (if provided)
-INCLUDE_LIST=""
-if [ $# -ge 2 ]; then
-    INCLUDE_LIST=${2}
-fi
-
-# Add include directory for cuda_alike.h (relative to build.sh location)
-SCRIPT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
-INCLUDE_LIST="${INCLUDE_LIST:+${INCLUDE_LIST} }${SCRIPT_DIR}/../include"
-
-# Process include directories into flags
-INCLUDE_FLAGS=""
-if [ -n "$INCLUDE_LIST" ]; then
-    INCLUDE_FLAGS=$(echo "$INCLUDE_LIST" | tr ' ' '\n' | sed 's/^/-I/' | paste -sd' ' -)
-fi
+prepare_allocator_build_env "$OUTPUT_DIR" "${2:-}"
 
 echo "Building nvlink allocator to: $OUTPUT_DIR"
-# Create output directory if it doesn't exist
-mkdir -p "$OUTPUT_DIR"
 
-CPP_FILE=$(dirname $(readlink -f $0))/nvlink_allocator.cpp  # get cpp file path, under same dir with this script
+CPP_FILE="${SCRIPT_DIR}/nvlink_allocator.cpp"
 
 # Choose build command based on flags
 if [ "$CI_BUILD" = true ]; then
@@ -59,6 +49,11 @@ elif [ "$USE_HIPCC" = true ]; then
     hipcc "$OUTPUT_DIR/nvlink_allocator.cpp" -o "$OUTPUT_DIR/nvlink_allocator.so" -shared -fPIC -lamdhip64 -I/opt/rocm/include ${INCLUDE_FLAGS} -DUSE_HIP=1
 elif [ "$USE_MCC" = true ]; then
     mcc "$CPP_FILE" -o "$OUTPUT_DIR/nvlink_allocator.so" --shared -fPIC -lmusa -I/usr/local/musa/include ${INCLUDE_FLAGS} -DUSE_MUSA=1
+elif [ "$USE_MACA" = true ]; then
+    MACA_ROOT=${MACA_HOME:-/opt/maca}
+    g++ "$CPP_FILE" -o "$OUTPUT_DIR/nvlink_allocator.so" --shared -fPIC \
+        -I"${MACA_ROOT}/include" ${INCLUDE_FLAGS} \
+        -L"${MACA_ROOT}/lib64" -L"${MACA_ROOT}/lib" -lmcruntime -DUSE_MACA=1
 else
     # Default g++ build
     g++ "$CPP_FILE" -o "$OUTPUT_DIR/nvlink_allocator.so" --shared -fPIC -lcuda -I/usr/local/cuda/include ${INCLUDE_FLAGS} -DUSE_CUDA=1

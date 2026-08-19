@@ -1,37 +1,88 @@
 #pragma once
 
-#include <coroutine>
-#include <async_simple/coro/FutureAwaiter.h>
-#include <async_simple/coro/Lazy.h>
-#include <async_simple/coro/SyncAwait.h>
-#include <glog/logging.h>
 #include <csignal>
 #include <memory>
 #include <string>
-#include <string_view>
+#include <type_traits>
 #include <vector>
+#include <variant>
 #include <cstdlib>
 #include <boost/functional/hash.hpp>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 #include <ylt/coro_io/client_pool.hpp>
+#include <ylt/coro_io/ibverbs/ib_socket.hpp>
 
 #include "client_metric.h"
+#include "replica.h"
+#include "segment.h"
 #include "types.h"
 #include "rpc_types.h"
+#include "master_metric_manager.h"
+#include "store_rpc_client_io_context.h"
+#include "task_manager.h"
 
 namespace mooncake {
 
-template <auto Method>
-struct RpcNameTraits;
-
 static const std::string kDefaultMasterAddress = "localhost:50051";
+
+namespace detail {
+
+template <typename Variant, typename T>
+struct variant_contains : std::false_type {};
+
+template <typename... Ts, typename T>
+struct variant_contains<std::variant<Ts...>, T>
+    : std::bool_constant<(std::is_same_v<Ts, T> || ...)> {};
+
+template <typename Variant, typename T>
+inline constexpr bool variant_contains_v =
+    variant_contains<std::decay_t<Variant>, T>::value;
+
+template <typename SocketConfigVariant>
+inline void MaybeEnableRdmaSocketConfig(SocketConfigVariant& socket_config) {
+    if constexpr (variant_contains_v<SocketConfigVariant,
+                                     coro_io::ib_socket_t::config_t>) {
+        socket_config = coro_io::ib_socket_t::config_t{};
+    }
+}
+
+inline RpcClientPool::PoolConfig MakeMasterRpcClientPoolConfig() {
+    RpcClientPool::PoolConfig config;
+    const char* value = std::getenv("MC_RPC_PROTOCOL");
+    if (value && std::string_view(value) == "rdma") {
+        MaybeEnableRdmaSocketConfig(config.client_config.socket_config);
+    }
+
+    // Default request and connect timeouts remain coro_rpc's built-in 30s.
+    // A negative request timeout disables the per-request timer.
+    if (const char* timeout_ms = std::getenv("MC_RPC_TIMEOUT_MS")) {
+        config.client_config.request_timeout_duration =
+            std::chrono::milliseconds(std::atoll(timeout_ms));
+    }
+    if (const char* connect_ms = std::getenv("MC_RPC_CONNECT_TIMEOUT_MS")) {
+        config.client_config.connect_timeout_duration =
+            std::chrono::milliseconds(std::atoll(connect_ms));
+    }
+    return config;
+}
+
+}  // namespace detail
 
 /**
  * @brief Client for interacting with the mooncake master service
  */
 class MasterClient {
    public:
-    virtual ~MasterClient() = default;
+    MasterClient(const UUID& client_id, MasterClientMetric* metrics = nullptr,
+                 std::string tenant_id = "default")
+        : client_accessor_(GetStoreRpcClientIoContextPool(),
+                           detail::MakeMasterRpcClientPoolConfig()),
+          client_id_(client_id),
+          tenant_id_(std::move(tenant_id)),
+          metrics_(metrics) {}
+    ~MasterClient();
+
+    const std::string& tenant_id() const { return tenant_id_.value(); }
 
     MasterClient(const MasterClient&) = delete;
     MasterClient& operator=(const MasterClient&) = delete;
@@ -50,7 +101,7 @@ class MasterClient {
      * @return tl::expected<bool, ErrorCode> indicating exist or not
      */
     [[nodiscard]] tl::expected<bool, ErrorCode> ExistKey(
-        std::string_view object_key);
+        const std::string& object_key);
 
     /**
      * @brief Checks if multiple objects exist
@@ -58,36 +109,14 @@ class MasterClient {
      * @return Vector containing existence status for each key
      */
     [[nodiscard]] std::vector<tl::expected<bool, ErrorCode>> BatchExistKey(
-        const std::vector<std::string_view>& object_keys);
-    /**
-     * @brief Gets replica list for an object
-     * @param object_key Key to query
-     * @param config Filter configuration for getting replica list
-     * @return ErrorCode indicating success/failure
-     */
-    [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
-    GetReplicaList(std::string_view key,
-                   const GetReplicaListRequestConfig& config =
-                       GetReplicaListRequestConfig());
-
-    [[nodiscard]] async_simple::coro::Lazy<
-        tl::expected<GetReplicaListResponse, ErrorCode>>
-    AsyncGetReplicaList(std::string_view key,
-                        const GetReplicaListRequestConfig& config =
-                            GetReplicaListRequestConfig());
+        const std::vector<std::string>& object_keys);
 
     /**
-     * @brief Batch query read routes
-     */
-    [[nodiscard]] std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
-    BatchGetReplicaList(const std::vector<std::string_view>& keys,
-                        const GetReplicaListRequestConfig& config =
-                            GetReplicaListRequestConfig());
-
-    /**
-     * @brief Calculate cache hit rate metrics
+     * @brief Calculate Store-observed cache reuse metrics
      * @param object_keys None
-     * @return Map containing metrics
+     * @return Map containing metrics. Legacy hit-rate keys describe cumulative
+     * Store-side hits normalized by current cached object counts, not
+     * end-to-end request/token hit ratios.
      */
     [[nodiscard]] tl::expected<MasterMetricManager::CacheHitStatDict, ErrorCode>
     CalcCacheStats();
@@ -104,6 +133,31 @@ class MasterClient {
     BatchQueryIp(const std::vector<UUID>& client_ids);
 
     /**
+     * @brief Batch clear KV cache for specified object keys on a specific
+     * segment for a given client.
+     * @param object_keys Vector of object key strings to clear.
+     * @param client_id The UUID of the client that owns the object keys.
+     * @param segment_name The name of the segment (storage device) to clear
+     * from.
+     * @return An expected object containing a vector of successfully cleared
+     * object keys on success, or an ErrorCode on failure.
+     */
+    [[nodiscard]] tl::expected<std::vector<std::string>, ErrorCode>
+    BatchReplicaClear(const std::vector<std::string>& object_keys,
+                      const UUID& client_id, const std::string& segment_name);
+
+    /**
+     * @brief Gets object metadata without transferring data
+     * @param object_key Key to query
+     * @param object_info Output parameter for object metadata
+     * @return ErrorCode indicating success/failure
+     */
+    [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
+    GetReplicaList(const std::string& object_key);
+    [[nodiscard]] tl::expected<GetReplicaListResponse, ErrorCode>
+    GetReplicaList(const std::string& object_key, const std::string& tenant_id);
+
+    /**
      * @brief Retrieves replica lists for object keys that match a regex
      * pattern.
      * @param str The regular expression string to match against object keys.
@@ -116,12 +170,117 @@ class MasterClient {
     GetReplicaListByRegex(const std::string& str);
 
     /**
+     * @brief Gets object metadata without transferring data
+     * @param object_keys Keys to query
+     * @param object_infos Output parameter for object metadata
+     * @return ErrorCode indicating success/failure
+     */
+    [[nodiscard]] std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    BatchGetReplicaList(const std::vector<std::string>& object_keys);
+    [[nodiscard]] std::vector<tl::expected<GetReplicaListResponse, ErrorCode>>
+    BatchGetReplicaList(const std::vector<std::string>& object_keys,
+                        const std::string& tenant_id);
+
+    /**
+     * @brief Starts a put operation
+     * @param key Object key
+     * @param slice_lengths Vector of slice lengths
+     * @param value_length Total value length
+     * @param config Replication configuration
+     * @return tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+     * indicating success/failure
+     */
+    [[nodiscard]] tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+    PutStart(const std::string& key, const std::vector<size_t>& slice_lengths,
+             const ReplicateConfig& config);
+
+    /**
+     * @brief Starts a batch of put operations for N objects
+     * @param keys Vector of object key
+     * @param value_lengths Vector of total value lengths
+     * @param slice_lengths Vector of vectors of slice lengths
+     * @param config Replication configuration
+     * @return ErrorCode indicating success/failure
+     */
+    [[nodiscard]] std::vector<
+        tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    BatchPutStart(const std::vector<std::string>& keys,
+                  const std::vector<std::vector<uint64_t>>& slice_lengths,
+                  const ReplicateConfig& config);
+
+    /**
+     * @brief Ends a put operation
+     * @param object_meta Object key and optional checksum
+     * @param replica_type Type of replica (memory or disk)
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> PutEnd(
+        const ObjectMeta& object_meta, ReplicaType replica_type);
+
+    /**
+     * @brief Ends a put operation for a batch of objects
+     * @param keys Vector of object keys
+     * @return ErrorCode indicating success/failure
+     */
+    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchPutEnd(
+        const std::vector<ObjectMeta>& object_metas,
+        ReplicaType replica_type = ReplicaType::ALL);
+
+    /**
+     * @brief Revokes a put operation
+     * @param key Object key
+     * @param replica_type Type of replica (memory or disk)
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> PutRevoke(
+        const std::string& key, ReplicaType replica_type);
+
+    /**
+     * @brief Revokes a put operation for a batch of objects
+     * @param keys Vector of object keys
+     * @return ErrorCode indicating success/failure
+     */
+    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchPutRevoke(
+        const std::vector<std::string>& keys,
+        ReplicaType replica_type = ReplicaType::ALL);
+
+    /**
+     * @brief Starts an upsert operation (insert or update)
+     * @param key Object key
+     * @param slice_lengths Vector of slice lengths
+     * @param config Replication configuration
+     * @return Replica descriptors on success, ErrorCode on failure
+     */
+    [[nodiscard]] tl::expected<std::vector<Replica::Descriptor>, ErrorCode>
+    UpsertStart(const std::string& key,
+                const std::vector<size_t>& slice_lengths,
+                const ReplicateConfig& config);
+
+    [[nodiscard]] std::vector<
+        tl::expected<std::vector<Replica::Descriptor>, ErrorCode>>
+    BatchUpsertStart(const std::vector<std::string>& keys,
+                     const std::vector<std::vector<uint64_t>>& slice_lengths,
+                     const ReplicateConfig& config);
+
+    [[nodiscard]] tl::expected<void, ErrorCode> UpsertEnd(
+        const ObjectMeta& object_meta, ReplicaType replica_type);
+
+    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchUpsertEnd(
+        const std::vector<ObjectMeta>& object_metas);
+
+    [[nodiscard]] tl::expected<void, ErrorCode> UpsertRevoke(
+        const std::string& key, ReplicaType replica_type);
+
+    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchUpsertRevoke(
+        const std::vector<std::string>& keys);
+
+    /**
      * @brief Removes an object and all its replicas
      * @param key Key to remove
      * @param force If true, skip lease and replication task checks
      * @return tl::expected<void, ErrorCode> indicating success/failure
      */
-    [[nodiscard]] tl::expected<void, ErrorCode> Remove(std::string_view key,
+    [[nodiscard]] tl::expected<void, ErrorCode> Remove(const std::string& key,
                                                        bool force = false);
 
     /**
@@ -132,7 +291,7 @@ class MasterClient {
      * success, or an ErrorCode on failure.
      */
     [[nodiscard]] tl::expected<long, ErrorCode> RemoveByRegex(
-        std::string_view str, bool force = false);
+        const std::string& str, bool force = false);
 
     /**
      * @brief Removes all objects and all its replicas
@@ -142,28 +301,13 @@ class MasterClient {
     [[nodiscard]] tl::expected<long, ErrorCode> RemoveAll(bool force = false);
 
     /**
-     * @brief Unregisters a memory segment from master
-     * @param segment_id ID of the segment to unmount
-     * @return tl::expected<void, ErrorCode> indicating success/failure
+     * @brief Batch remove objects and all their replicas
+     * @param keys List of keys to remove
+     * @param force If true, skip lease and replication task checks
+     * @return Vector of expected results for each key
      */
-    [[nodiscard]] tl::expected<void, ErrorCode> UnmountSegment(
-        const UUID& segment_id);
-
-    /**
-     * @brief Queries the status of a client.
-     * @param client_id The UUID of the client to query.
-     * @return tl::expected<QueryClientStatusResponse, ErrorCode>
-     */
-    [[nodiscard]] tl::expected<QueryClientStatusResponse, ErrorCode>
-    QueryClientStatus(const UUID& client_id);
-
-    /**
-     * @brief Sends heartbeat to master to maintain client liveness
-     * @return tl::expected<HeartbeatResponse, ErrorCode>
-     * containing view version and client status
-     */
-    [[nodiscard]] tl::expected<HeartbeatResponse, ErrorCode> Heartbeat(
-        const HeartbeatRequest& req);
+    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>> BatchRemove(
+        const std::vector<std::string>& keys, bool force = false);
 
     /**
      * @brief Registers a segment to master for allocation
@@ -173,36 +317,330 @@ class MasterClient {
     [[nodiscard]] tl::expected<void, ErrorCode> MountSegment(
         const Segment& segment);
 
-    /**
-     * @brief Register client with the master on startup.
-     * @param req request with registration information
-     * @return tl::expected<RegisterClientResponse, ErrorCode>
-     */
-    [[nodiscard]] tl::expected<RegisterClientResponse, ErrorCode>
-    RegisterClient(const RegisterClientRequest& req);
+    [[nodiscard]] tl::expected<void, ErrorCode> MountSSDSegment(
+        const Segment& segment);
 
     /**
-     * @brief Unregister client from the master
-     * @param req request with the client id to unregister
-     * @return tl::expected<UnregisterClientResponse, ErrorCode>
+     * @brief Registers a NoF ssd segment to master for allocation
+     * @param segment Segment to register
+     * @return tl::expected<void, ErrorCode> indicating success/failure
      */
-    [[nodiscard]] tl::expected<UnregisterClientResponse, ErrorCode>
-    UnregisterClient(const UnregisterClientRequest& req);
+    [[nodiscard]] tl::expected<void, ErrorCode> MountNoFSegment(
+        const NoFSegment& segment);
 
-   protected:
-    MasterClient(const UUID& client_id, MasterClientMetric* metrics = nullptr)
-        : client_id_(client_id), metrics_(metrics) {
-        coro_io::client_pool<coro_rpc::coro_rpc_client>::pool_config
-            pool_conf{};
-        const char* value = std::getenv("MC_RPC_PROTOCOL");
-        if (value && std::string_view(value) == "rdma") {
-            pool_conf.client_config.socket_config =
-                coro_io::ib_socket_t::config_t{};
-        }
-        client_pools_ =
-            std::make_shared<coro_io::client_pools<coro_rpc::coro_rpc_client>>(
-                pool_conf);
-    }
+    /**
+     * @brief Re-mount segments, invoked when the client is the first time to
+     * connect to the master or the client Ping TTL is expired and need
+     * to remount. This function is idempotent. Client should retry if the
+     * return code is not ErrorCode::OK.
+     * @param segments Segments to remount
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> ReMountSegment(
+        const std::vector<Segment>& segments);
+
+    /**
+     * @brief Re-mount NoF ssd segments, invoked when the client is the first
+     * time to connect to the master or the client Ping TTL is expired and need
+     * to remount. This function is idempotent. Client should retry if the
+     * return code is not ErrorCode::OK.
+     * @param segments Segments to remount
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> ReMountNoFSegment(
+        const std::vector<NoFSegment>& segments);
+
+    /**
+     * @brief Unregisters a memory segment from master
+     * @param segment_id ID of the segment to unmount
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> UnmountSegment(
+        const UUID& segment_id);
+
+    [[nodiscard]] tl::expected<void, ErrorCode> GracefulUnmountSegment(
+        const UUID& segment_id, uint64_t grace_period_ms);
+
+    /**
+     * @brief Unregisters a NoF ssd segment from master
+     * @param segment_id ID of the segment to unmount
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> UnmountNoFSegment(
+        const UUID& segment_id);
+
+    /**
+     * @brief Gets all mounted NoF ssd segments from master
+     * @return tl::expected<std::vector<MountedNoFSegmentSnapshot>, ErrorCode>
+     * containing all mounted segments
+     */
+    [[nodiscard]] tl::expected<std::vector<NoFSegment>, ErrorCode>
+    GetAllNoFSegments();
+
+    /**
+     * @brief Gets all mounted NoF segments that match a segment name together
+     * with their owner client ids.
+     * @param segment_name Mounted NoF segment name
+     * @return Matching segment owner info list
+     */
+    [[nodiscard]] tl::expected<std::vector<NoFSegmentOwnerInfo>, ErrorCode>
+    GetNoFSegmentsByName(const std::string& segment_name);
+
+    /**
+     * @brief Gets the cluster ID for the current client to use as subdirectory
+     * name
+     * @return GetClusterIdResponse containing the cluster ID
+     */
+    [[nodiscard]] tl::expected<std::string, ErrorCode> GetFsdir();
+
+    [[nodiscard]] tl::expected<SegmentStatus, ErrorCode> QuerySegmentStatusById(
+        const UUID& segment_id);
+
+    [[nodiscard]] tl::expected<GetStorageConfigResponse, ErrorCode>
+    GetStorageConfig();
+
+    /**
+     * @brief Pings master to check its availability
+     * @return tl::expected<PingResponse, ErrorCode>
+     * containing view version and client status
+     */
+    [[nodiscard]] tl::expected<PingResponse, ErrorCode> Ping();
+
+    /**
+     * @brief Mounts a local disk segment into the master.
+     * @param enable_offloading If true, enables offloading (write-to-file).
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> MountLocalDiskSegment(
+        const UUID& client_id, bool enable_offloading);
+
+    /**
+     * @brief Heartbeat call to collect object-level statistics and retrieve the
+     * set of non-persisted objects.
+     * @param enable_offloading Indicates whether persistence is enabled for
+     * this segment.
+     */
+    [[nodiscard]] tl::expected<std::vector<OffloadTaskItem>, ErrorCode>
+    OffloadObjectHeartbeat(const UUID& client_id, bool enable_offloading);
+
+    /**
+     * @brief Poll whether master has requested a full SSD clear.
+     * @return true if client should clear all SSD files
+     */
+    [[nodiscard]] tl::expected<bool, ErrorCode> PollRemoveAll();
+
+    [[nodiscard]] tl::expected<void, ErrorCode> ReportSsdCapacity(
+        const UUID& client_id, int64_t ssd_total_capacity_bytes);
+
+    /**
+     * @brief Adds multiple new objects to a specified client in batch.
+     * @param keys         A list of object keys (names) that were successfully
+     * offloaded.
+     * @param metadatas    The corresponding metadata for each offloaded object,
+     * including size, storage location, etc.
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> NotifyOffloadSuccess(
+        const UUID& client_id, const std::vector<std::string>& keys,
+        const std::vector<StorageObjectMetadata>& metadatas);
+    [[nodiscard]] tl::expected<void, ErrorCode> NotifyOffloadSuccess(
+        const UUID& client_id, const std::vector<OffloadTaskItem>& tasks,
+        const std::vector<StorageObjectMetadata>& metadatas);
+
+    /**
+     * @brief Heartbeat-driven pull of pending L2->L1 promotion work for a
+     * client. Returns tenant-scoped tasks the caller should read from local
+     * SSD and stage as MEMORY replicas via PromotionAllocStart +
+     * NotifyPromotionSuccess.
+     */
+    [[nodiscard]] tl::expected<std::vector<PromotionTaskItem>, ErrorCode>
+    PromotionObjectHeartbeat(const UUID& client_id);
+
+    /**
+     * @brief Stage a PROCESSING MEMORY replica for an existing key during
+     * promotion. Returns the new replica's descriptor that the caller writes
+     * via Transfer Engine.
+     */
+    [[nodiscard]] tl::expected<PromotionAllocStartResponse, ErrorCode>
+    PromotionAllocStart(const UUID& client_id, const std::string& key,
+                        uint64_t size,
+                        const std::vector<std::string>& preferred_segments);
+    [[nodiscard]] tl::expected<PromotionAllocStartResponse, ErrorCode>
+    PromotionAllocStart(const UUID& client_id, const std::string& key,
+                        const std::string& tenant_id, uint64_t size,
+                        const std::vector<std::string>& preferred_segments);
+
+    /**
+     * @brief Release master-side promotion task state after a client-side
+     * failure that prevents the holder from calling NotifyPromotionSuccess.
+     * Idempotent; returns OK if the task was already swept by the reaper.
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> NotifyPromotionFailure(
+        const UUID& client_id, const std::string& key);
+    [[nodiscard]] tl::expected<void, ErrorCode> NotifyPromotionFailure(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id);
+
+    /**
+     * @brief Commit a staged MEMORY replica to COMPLETE; called after the
+     * client has written the bytes via Transfer Engine.
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> NotifyPromotionSuccess(
+        const UUID& client_id, const std::string& key);
+    [[nodiscard]] tl::expected<void, ErrorCode> NotifyPromotionSuccess(
+        const UUID& client_id, const std::string& key,
+        const std::string& tenant_id);
+
+    /**
+     * @brief Start a copy operation
+     * @param key Object key
+     * @param src_segment Source segment name
+     * @param tgt_segments Target segment names
+     * @return tl::expected<CopyStartResponse, ErrorCode> indicating
+     * success/failure
+     */
+    [[nodiscard]] tl::expected<CopyStartResponse, ErrorCode> CopyStart(
+        const std::string& key, const std::string& src_segment,
+        const std::vector<std::string>& tgt_segments);
+    [[nodiscard]] tl::expected<CopyStartResponse, ErrorCode> CopyStart(
+        const std::string& key, const std::string& tenant_id,
+        const std::string& src_segment,
+        const std::vector<std::string>& tgt_segments);
+
+    /**
+     * @brief End a copy operation
+     * @param key Object key
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> CopyEnd(const std::string& key);
+    [[nodiscard]] tl::expected<void, ErrorCode> CopyEnd(
+        const std::string& key, const std::string& tenant_id);
+
+    /**
+     * @brief Revoke a copy operation
+     * @param key Object key
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> CopyRevoke(
+        const std::string& key);
+    [[nodiscard]] tl::expected<void, ErrorCode> CopyRevoke(
+        const std::string& key, const std::string& tenant_id);
+
+    /**
+     * @brief Start a move operation
+     * @param key Object key
+     * @param src_segment Source segment name
+     * @param tgt_segment Target segment name
+     * @return tl::expected<MoveStartResponse, ErrorCode> indicating
+     * success/failure
+     */
+    [[nodiscard]] tl::expected<MoveStartResponse, ErrorCode> MoveStart(
+        const std::string& key, const std::string& src_segment,
+        const std::string& tgt_segment);
+    [[nodiscard]] tl::expected<MoveStartResponse, ErrorCode> MoveStart(
+        const std::string& key, const std::string& tenant_id,
+        const std::string& src_segment, const std::string& tgt_segment);
+
+    /**
+     * @brief End a move operation
+     * @param key Object key
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> MoveEnd(const std::string& key);
+    [[nodiscard]] tl::expected<void, ErrorCode> MoveEnd(
+        const std::string& key, const std::string& tenant_id);
+
+    /**
+     * @brief Revoke a move operation
+     * @param key Object key
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> MoveRevoke(
+        const std::string& key);
+    [[nodiscard]] tl::expected<void, ErrorCode> MoveRevoke(
+        const std::string& key, const std::string& tenant_id);
+
+    /**
+     * @brief Create a task to copy an object's replica to target segments
+     * @param key Object key
+     * @param targets Target segments
+     * @return tl::expected<UUID, ErrorCode> Copy task ID on success,
+     * ErrorCode on failure
+     */
+    [[nodiscard]] tl::expected<UUID, ErrorCode> CreateCopyTask(
+        const std::string& key, const std::vector<std::string>& targets);
+    [[nodiscard]] tl::expected<UUID, ErrorCode> CreateCopyTask(
+        const std::string& key, const std::string& tenant_id,
+        const std::vector<std::string>& targets);
+
+    /**
+     * @brief Create a task to move an object's replica from source segment to
+     * target segment
+     * @param key Object key
+     * @param source Source segment
+     * @param target Target segment
+     * @return tl::expected<UUID, ErrorCode> Move task ID on success,
+     * ErrorCode on failure
+     */
+    [[nodiscard]] tl::expected<UUID, ErrorCode> CreateMoveTask(
+        const std::string& key, const std::string& source,
+        const std::string& target);
+    [[nodiscard]] tl::expected<UUID, ErrorCode> CreateMoveTask(
+        const std::string& key, const std::string& tenant_id,
+        const std::string& source, const std::string& target);
+
+    /**
+     * @brief Query a task by task id
+     * @param task_id Task ID to query
+     * @return tl::expected<QueryTaskResponse, ErrorCode> Task basic info
+     * on success, ErrorCode on failure
+     */
+    [[nodiscard]] tl::expected<QueryTaskResponse, ErrorCode> QueryTask(
+        const UUID& task_id);
+
+    /**
+     * @brief Fetch tasks assigned to a client
+     * @param batch_size Number of tasks to fetch
+     * @return tl::expected<std::vector<TaskAssignment>, ErrorCode> list of
+     * tasks on success, ErrorCode on failure
+     */
+    [[nodiscard]] tl::expected<std::vector<TaskAssignment>, ErrorCode>
+    FetchTasks(size_t batch_size);
+
+    /**
+     * @brief Mark the task as complete
+     * @param task_complete Task complete request
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> MarkTaskToComplete(
+        const TaskCompleteRequest& task_complete);
+
+    /**
+     * @brief Notify master that a disk replica was evicted locally
+     * @param key The evicted object key
+     * @param replica_type DISK or LOCAL_DISK
+     * @return tl::expected<void, ErrorCode> indicating success/failure
+     */
+    [[nodiscard]] tl::expected<void, ErrorCode> EvictDiskReplica(
+        const std::string& key, ReplicaType replica_type);
+    [[nodiscard]] tl::expected<void, ErrorCode> EvictDiskReplica(
+        const std::string& key, const std::string& tenant_id,
+        ReplicaType replica_type);
+
+    /**
+     * @brief Batch notify master that disk replicas were evicted locally.
+     * @param keys The evicted object keys
+     * @param replica_type DISK or LOCAL_DISK
+     * @return Per-key results (RPC_FAIL on transport error, else per-key
+     * status)
+     */
+    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>>
+    BatchEvictDiskReplica(const std::vector<std::string>& keys,
+                          ReplicaType replica_type);
+    [[nodiscard]] std::vector<tl::expected<void, ErrorCode>>
+    BatchEvictDiskReplica(const std::vector<std::string>& keys,
+                          const std::string& tenant_id,
+                          ReplicaType replica_type);
+
+   private:
     /**
      * @brief Generic RPC invocation helper for single-result operations
      * @tparam ServiceMethod Pointer to WrappedMasterService member function
@@ -212,48 +650,8 @@ class MasterClient {
      * @return The result of the RPC call
      */
     template <auto ServiceMethod, typename ReturnType, typename... Args>
-    [[nodiscard]] async_simple::coro::Lazy<tl::expected<ReturnType, ErrorCode>>
-    invoke_rpc_async(Args&&... args) {
-        auto pool = client_accessor_.GetClientPool();
-
-        // Increment RPC counter
-        if (metrics_) {
-            metrics_->rpc_count.inc({RpcNameTraits<ServiceMethod>::value});
-        }
-
-        auto start_time = std::chrono::steady_clock::now();
-        auto ret = co_await pool->send_request(
-            [&](coro_io::client_reuse_hint, coro_rpc::coro_rpc_client& client) {
-                return client.send_request<ServiceMethod>(
-                    std::forward<Args>(args)...);
-            });
-        if (!ret.has_value()) {
-            LOG(ERROR) << "Client not available";
-            co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
-        }
-        auto result = co_await std::move(ret.value());
-        if (!result) {
-            LOG(ERROR) << "RPC call failed: " << result.error().msg;
-            co_return tl::make_unexpected(ErrorCode::RPC_FAIL);
-        }
-        if (metrics_) {
-            auto end_time = std::chrono::steady_clock::now();
-            auto latency =
-                std::chrono::duration_cast<std::chrono::microseconds>(
-                    end_time - start_time);
-            metrics_->rpc_latency.observe({RpcNameTraits<ServiceMethod>::value},
-                                          latency.count());
-        }
-        co_return result->result();
-    }
-
-    template <auto ServiceMethod, typename ReturnType, typename... Args>
     [[nodiscard]] tl::expected<ReturnType, ErrorCode> invoke_rpc(
-        Args&&... args) {
-        return async_simple::coro::syncAwait(
-            invoke_rpc_async<ServiceMethod, ReturnType>(
-                std::forward<Args>(args)...));
-    }
+        Args&&... args);
 
     /**
      * @brief Generic RPC invocation helper for batch operations
@@ -266,92 +664,18 @@ class MasterClient {
      */
     template <auto ServiceMethod, typename ResultType, typename... Args>
     [[nodiscard]] std::vector<tl::expected<ResultType, ErrorCode>>
-    invoke_batch_rpc(size_t input_size, Args&&... args) {
-        auto pool = client_accessor_.GetClientPool();
+    invoke_batch_rpc(size_t input_size, Args&&... args);
 
-        // Increment RPC counter
-        if (metrics_) {
-            metrics_->rpc_count.inc({RpcNameTraits<ServiceMethod>::value});
-        }
-
-        auto start_time = std::chrono::steady_clock::now();
-        return async_simple::coro::syncAwait(
-            [&]() -> async_simple::coro::Lazy<
-                      std::vector<tl::expected<ResultType, ErrorCode>>> {
-                auto ret = co_await pool->send_request(
-                    [&](coro_io::client_reuse_hint,
-                        coro_rpc::coro_rpc_client& client) {
-                        return client.send_request<ServiceMethod>(
-                            std::forward<Args>(args)...);
-                    });
-                if (!ret.has_value()) {
-                    LOG(ERROR) << "Client not available";
-                    co_return std::vector<tl::expected<ResultType, ErrorCode>>(
-                        input_size, tl::make_unexpected(ErrorCode::RPC_FAIL));
-                }
-                auto result = co_await std::move(ret.value());
-                if (!result) {
-                    LOG(ERROR)
-                        << "Batch RPC call failed: " << result.error().msg;
-                    std::vector<tl::expected<ResultType, ErrorCode>>
-                        error_results;
-                    error_results.reserve(input_size);
-                    for (size_t i = 0; i < input_size; ++i) {
-                        error_results.emplace_back(
-                            tl::make_unexpected(ErrorCode::RPC_FAIL));
-                    }
-                    co_return error_results;
-                }
-                if (metrics_) {
-                    auto end_time = std::chrono::steady_clock::now();
-                    auto latency =
-                        std::chrono::duration_cast<std::chrono::microseconds>(
-                            end_time - start_time);
-                    metrics_->rpc_latency.observe(
-                        {RpcNameTraits<ServiceMethod>::value}, latency.count());
-                }
-                co_return result->result();
-            }());
-    }
-
-    /**
-     * @brief Accessor for the coro_rpc_client pool. Since coro_rpc_client pool
-     * cannot reconnect to a different address, a new coro_rpc_client pool is
-     * created if the address is different from the current one.
-     */
-   protected:
-    class RpcClientAccessor {
-       public:
-        void SetClientPool(
-            std::shared_ptr<coro_io::client_pool<coro_rpc::coro_rpc_client>>
-                client_pool) {
-            std::lock_guard<std::shared_mutex> lock(client_mutex_);
-            client_pool_ = client_pool;
-        }
-
-        std::shared_ptr<coro_io::client_pool<coro_rpc::coro_rpc_client>>
-        GetClientPool() {
-            std::shared_lock<std::shared_mutex> lock(client_mutex_);
-            return client_pool_;
-        }
-
-       private:
-        mutable std::shared_mutex client_mutex_;
-        std::shared_ptr<coro_io::client_pool<coro_rpc::coro_rpc_client>>
-            client_pool_;
-    };
-
-   protected:
-    RpcClientAccessor client_accessor_;
+    RpcClientPool client_accessor_;
 
     // The client identification.
     const UUID client_id_;
 
+    // Tenant identity for this client instance.
+    const TenantId tenant_id_;
+
     // Metrics for tracking RPC operations
     MasterClientMetric* metrics_;
-    std::shared_ptr<coro_io::client_pools<coro_rpc::coro_rpc_client>>
-        client_pools_;
-
     // Mutex to insure the Connect function is atomic.
     mutable Mutex connect_mutex_;
     // The address which is passed to the coro_rpc_client

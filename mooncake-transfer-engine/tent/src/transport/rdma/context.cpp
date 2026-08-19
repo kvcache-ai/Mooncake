@@ -26,6 +26,13 @@
 #include <fstream>
 #include <memory>
 #include <thread>
+#include <cstdlib>
+#include <dlfcn.h>
+
+#ifdef USE_CUDA
+#include <cuda.h>
+#include <cuda_runtime.h>
+#endif
 
 #include "tent/common/status.h"
 #include "tent/transport/rdma/endpoint_store.h"
@@ -294,9 +301,7 @@ RdmaContext::RdmaContext(RdmaTransport& transport)
     std::call_once(g_once_flag, fork_init);
 }
 
-RdmaContext::~RdmaContext() {
-    if (status_ != DEVICE_UNINIT) disable();
-}
+RdmaContext::~RdmaContext() { disable(); }
 
 int RdmaContext::construct(const std::string& device_name,
                            std::shared_ptr<RdmaParams> params) {
@@ -313,9 +318,14 @@ int RdmaContext::construct(const std::string& device_name,
 }
 
 int RdmaContext::enable() {
-    if (status_ != DEVICE_DISABLED) {
+    if (status_ == DEVICE_ENABLED || status_ == DEVICE_PAUSED) {
         LOG(WARNING) << "RDMA context " << name() << " has been enabled";
         return 0;
+    }
+    if (status_ != DEVICE_DISABLED) {
+        LOG(ERROR) << "RDMA context " << name() << " cannot be enabled from "
+                   << statusToString(status_);
+        return -1;
     }
     if (openDevice(device_name_, params_->device.port)) {
         LOG(ERROR) << "Failed to open device [" << device_name_ << "] on port ["
@@ -362,13 +372,13 @@ int RdmaContext::enable() {
     }
 
     for (int i = 0; i < params_->device.num_cq_list; ++i) {
-        auto cq = new RdmaCQ();
+        auto cq = std::make_unique<RdmaCQ>();
         int ret = cq->construct(this, params_->device.max_cqe, i);
         if (ret) {
             disable();
             return ret;
         }
-        cq_list_.push_back(cq);
+        cq_list_.push_back(cq.release());
     }
 
     // Create dedicated notification CQ
@@ -381,15 +391,38 @@ int RdmaContext::enable() {
         return notify_ret;
     }
 
+    // Check PCIe Relaxed Ordering support from config
+    // Mode: 0 = disabled, 1 = enabled if supported, 2 = auto (default)
+    auto mode =
+        transport_.config()->get("transports/rdma/pci_relaxed_ordering", 1);
+    if (mode != 0) {
+        // Check if ibv_reg_mr_iova2 symbol is available (IBVERBS_1.8+)
+        void* sym = dlsym(RTLD_DEFAULT, "ibv_reg_mr_iova2");
+        if (sym) {
+            relaxed_ordering_enabled_ = true;
+            LOG(INFO) << "[RDMA] Relaxed ordering is supported and enabled for "
+                      << device_name_;
+        } else {
+            if (mode == 1) {
+                LOG(WARNING) << "[RDMA] Relaxed ordering requested but NOT "
+                             << "supported (ibv_reg_mr_iova2 missing). "
+                             << "Falling back to strict ordering.";
+            }
+            relaxed_ordering_enabled_ = false;
+        }
+    } else {
+        LOG(INFO) << "[RDMA] Relaxed ordering disabled via config for "
+                  << device_name_;
+        relaxed_ordering_enabled_ = false;
+    }
+
     ibv_port_attr port_attr;
     int ret = verbs_.ibv_query_port_default(native_context_,
                                             params_->device.port, &port_attr);
     if (ret) {
         PLOG(ERROR) << "Failed to query port " << params_->device.port << " on "
                     << device_name_;
-        if (verbs_.ibv_close_device(native_context_)) {
-            PLOG(ERROR) << "ibv_close_device";
-        }
+        disable();
         return -1;
     }
 
@@ -407,17 +440,31 @@ int RdmaContext::enable() {
 }
 
 int RdmaContext::disable() {
-    if (status_ == DEVICE_UNINIT || status_ == DEVICE_DISABLED) {
+    if (!native_context_ && !native_pd_ && event_fd_ < 0 &&
+        comp_channel_.empty() && cq_list_.empty() && !notify_cq_) {
         LOG(WARNING) << "RDMA context " << name() << " has been deconstructed";
         return 0;
     }
-    endpoint_store_->clear();
-
-    for (auto& entry : mr_set_) {
-        int ret = verbs_.ibv_dereg_mr(entry);
-        if (ret) PLOG(ERROR) << "ibv_dereg_mr";
+    if (endpoint_store_ && endpoint_store_->clear()) {
+        LOG(ERROR) << "Failed to destroy all endpoints for context " << name()
+                   << "; preserving CQ, PD and device resources for retry";
+        return -1;
     }
-    mr_set_.clear();
+
+    cleanupResources();
+    status_ = DEVICE_DISABLED;
+    return 0;
+}
+
+void RdmaContext::cleanupResources() {
+    {
+        std::lock_guard<std::mutex> lock(mr_set_mutex_);
+        for (auto& entry : mr_set_) {
+            int ret = verbs_.ibv_dereg_mr(entry);
+            if (ret) PLOG(ERROR) << "ibv_dereg_mr";
+        }
+        mr_set_.clear();
+    }
     for (auto& entry : cq_list_) {
         delete entry;
     }
@@ -450,9 +497,6 @@ int RdmaContext::disable() {
             PLOG(ERROR) << "ibv_close_device";
         native_context_ = nullptr;
     }
-
-    status_ = DEVICE_DISABLED;
-    return 0;
 }
 
 int RdmaContext::pause() {
@@ -473,17 +517,101 @@ RdmaContext::MemReg RdmaContext::registerMemReg(void* addr, size_t length,
         LOG(FATAL) << "RDMA context " << name() << " not constructed";
         return nullptr;
     }
+
+#ifdef USE_CUDA
+    // Ensure CUDA context is current for GPU memory registration
+    // This is needed for worker threads or callers from non-CUDA threads
+    CUmemorytype memType;
+    CUresult result = cuPointerGetAttribute(
+        &memType, CU_POINTER_ATTRIBUTE_MEMORY_TYPE, (CUdeviceptr)addr);
+
+    if (result == CUDA_SUCCESS && memType == CU_MEMORYTYPE_DEVICE) {
+        // Get device ordinal and set primary context current
+        unsigned int devOrd = 0;
+        result = cuPointerGetAttribute(
+            &devOrd, CU_POINTER_ATTRIBUTE_DEVICE_ORDINAL, (CUdeviceptr)addr);
+        if (result != CUDA_SUCCESS) {
+            LOG(ERROR) << "Failed to get CUDA device ordinal: " << result;
+            return nullptr;
+        }
+
+        CUdevice cuDev;
+        result = cuDeviceGet(&cuDev, devOrd);
+        if (result != CUDA_SUCCESS) {
+            LOG(ERROR) << "Failed to get CUDA device: " << result;
+            return nullptr;
+        }
+
+        CUcontext cuCtx;
+        result = cuDevicePrimaryCtxRetain(&cuCtx, cuDev);
+        if (result != CUDA_SUCCESS) {
+            LOG(ERROR) << "Failed to retain CUDA primary context: " << result;
+            return nullptr;
+        }
+
+        result = cuCtxSetCurrent(cuCtx);
+        if (result != CUDA_SUCCESS) {
+            LOG(ERROR) << "Failed to set CUDA context current: " << result;
+            cuDevicePrimaryCtxRelease(cuDev);
+            return nullptr;
+        }
+
+        // Register GPU memory
+        ibv_mr* entry =
+            verbs_.ibv_reg_mr_default(native_pd_, addr, length, access);
+
+        // Release primary context reference
+        cuDevicePrimaryCtxRelease(cuDev);
+
+        if (!entry) {
+            const void* end = static_cast<const char*>(addr) + length;
+            PLOG(ERROR) << "Failed to register GPU memory from " << addr
+                        << " to " << end << " in RDMA device " << device_name_;
+            return nullptr;
+        }
+        mr_set_mutex_.lock();
+        mr_set_.insert(entry);
+        mr_set_mutex_.unlock();
+        return entry;
+    }
+#endif
+
+    // Standard CPU memory registration
     ibv_mr* entry = verbs_.ibv_reg_mr_default(native_pd_, addr, length, access);
     if (!entry) {
+        const void* end = static_cast<const char*>(addr) + length;
         PLOG(ERROR) << "Failed to register memory from " << addr << " to "
-                    << (char*)addr + length << " in RDMA device "
-                    << device_name_;
+                    << end << " in RDMA device " << device_name_;
         return nullptr;
     }
     mr_set_mutex_.lock();
     mr_set_.insert(entry);
     mr_set_mutex_.unlock();
     return entry;
+}
+
+int RdmaContext::warmupMrRegistration(void* addr, size_t length) {
+    if (status_ == DEVICE_DISABLED || status_ == DEVICE_UNINIT) {
+        LOG(FATAL) << "RDMA context " << name() << " not constructed";
+        return -1;
+    }
+    int access_flags = IBV_ACCESS_LOCAL_WRITE;
+    if (relaxed_ordering_enabled_) access_flags |= IBV_ACCESS_RELAXED_ORDERING;
+    ibv_mr* entry =
+        verbs_.ibv_reg_mr_default(native_pd_, addr, length, access_flags);
+    if (!entry) {
+        PLOG(WARNING) << "ibv_reg_mr warm-up failed on " << device_name_
+                      << " for [" << addr << ", " << length << " bytes]";
+        return -1;
+    }
+
+    int deregister_rc = verbs_.ibv_dereg_mr(entry);
+    if (deregister_rc != 0) {
+        LOG(WARNING) << "Failed to deregister warm-up MR (rc=" << deregister_rc
+                     << "), may cause resource leak";
+        return -1;
+    }
+    return 0;
 }
 
 int RdmaContext::unregisterMemReg(MemReg id) {
@@ -497,9 +625,9 @@ int RdmaContext::unregisterMemReg(MemReg id) {
     mr_set_mutex_.unlock();
 
     if (verbs_.ibv_dereg_mr(entry)) {
+        const void* end = static_cast<const char*>(entry->addr) + entry->length;
         LOG(ERROR) << "Failed to unregister memory from " << entry->addr
-                   << " to " << (char*)entry->addr + entry->length
-                   << " in RDMA device " << device_name_;
+                   << " to " << end << " in RDMA device " << device_name_;
     }
 
     return 0;
@@ -517,7 +645,9 @@ std::string RdmaContext::gid() const {
 }
 
 RdmaCQ* RdmaContext::cq(int index) {
-    if (index < 0 || index >= params_->device.num_cq_list) return nullptr;
+    // params_ is null until construct(): an inert context has no CQs.
+    if (!params_ || index < 0 || index >= params_->device.num_cq_list)
+        return nullptr;
     return cq_list_.empty() ? nullptr : cq_list_[index];
 }
 
@@ -578,7 +708,13 @@ int RdmaContext::openDevice(const std::string& device_name, uint8_t port) {
     }
 
     MIN(params_->device.max_cqe, device_attr.max_cqe);
-    MIN(params_->device.num_cq_list, device_attr.max_cq);
+    if (params_->device.num_cq_list + 1 > device_attr.max_cq) {
+        LOG(ERROR) << "Device " << device_name << " supports at most "
+                   << device_attr.max_cq << " CQs, but RDMA num_lanes requires "
+                   << params_->device.num_cq_list
+                   << " data CQs plus 1 notification CQ";
+        return -1;
+    }
     MIN(params_->endpoint.path_mtu, port_attr.active_mtu);
     MIN(params_->endpoint.max_sge, device_attr.max_sge);
     MIN(params_->endpoint.max_qp_wr, device_attr.max_qp_wr);

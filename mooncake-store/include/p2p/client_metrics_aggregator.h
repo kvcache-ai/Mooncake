@@ -1,0 +1,64 @@
+#pragma once
+
+#include <cstdint>
+#include <mutex>
+#include <string>
+#include <unordered_map>
+
+#include <boost/functional/hash.hpp>
+#include <ylt/metric/gauge.hpp>
+
+#include "p2p/heartbeat_type.h"
+#include "types.h"
+
+namespace mooncake {
+
+// Aggregates per-client cumulative metric snapshots into cluster-wide
+// master_cluster_* gauges
+class ClientMetricsAggregator {
+   public:
+    ClientMetricsAggregator();
+
+    void Update(const UUID& client_id, const ClientMetricSnapshot& snapshot);
+    void OnClientRemoved(const UUID& client_id);
+
+    void Serialize(std::string& out);
+    std::string Summary();
+
+    // Test-only: subtract all known client snapshots and clear the map.
+    void ResetAllForTest();
+
+   private:
+    struct CounterGroup {
+        CounterGroup(const std::string& prefix,
+                     const std::string& granularity_help);
+
+        ylt::metric::gauge_t get_requests;
+        ylt::metric::gauge_t get_hits;
+        ylt::metric::gauge_t get_misses;
+        ylt::metric::gauge_t get_failures;
+        ylt::metric::gauge_t get_bytes;
+        ylt::metric::gauge_t put_requests;
+        ylt::metric::gauge_t put_failures;
+        ylt::metric::gauge_t put_bytes;
+    };
+
+    // Applies a signed delta to a gauge (dec for negative deltas).
+    static void ApplyDelta(int64_t delta, ylt::metric::gauge_t& gauge);
+
+    void ApplyDataMetricDelta(const DataMetricSnapshot& old_v,
+                              const DataMetricSnapshot& new_v,
+                              CounterGroup& group);
+
+    mutable std::mutex mutex_;
+    // Per-client baseline for signed deltas; subtracted on client removal.
+    std::unordered_map<UUID, ClientMetricSnapshot, boost::hash<UUID>> client_snapshots_;
+
+    CounterGroup total_;   // batch request granularity
+    CounterGroup local_;   // per-op granularity
+    CounterGroup remote_;  // per-op granularity
+    ylt::metric::gauge_t remote_read_retries_;
+    ylt::metric::gauge_t remote_write_retries_;
+};
+
+}  // namespace mooncake

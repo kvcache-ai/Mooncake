@@ -14,16 +14,6 @@
 // Command line flags
 USE_engine_flags DEFINE_string(master_server_entry, "localhost:50051",
                                "Master server address");
-DEFINE_string(deployment_mode, "Centralization",
-              "Client deployment mode: Centralization or P2P");
-DEFINE_string(p2p_local_transfer_mode, "memcpy",
-              "P2P local transfer mode: memcpy or te");
-DEFINE_string(redis_cluster_id, "",
-              "Redis HA cluster ID for redis:// master discovery");
-DEFINE_string(redis_username, "",
-              "Redis ACL username for redis:// master discovery");
-DEFINE_string(redis_password, "",
-              "Redis AUTH password for redis:// master discovery");
 
 namespace mooncake {
 namespace testing {
@@ -49,10 +39,14 @@ class ClientCtl {
                 HandlePut(iss);
             } else if (cmd == "get") {
                 HandleGet(iss);
-            } else if (cmd == "expect_get") {
-                HandleExpectGet(iss);
+            } else if (cmd == "delete") {
+                HandleDelete(iss);
+            } else if (cmd == "batch-smoke") {
+                HandleBatchSmoke(iss);
             } else if (cmd == "mount") {
                 HandleMount(iss);
+            } else if (cmd == "unmount") {
+                HandleUnmount(iss);
             } else if (cmd == "remove") {
                 HandleRemove(iss);
             } else if (cmd == "sleep") {
@@ -85,12 +79,7 @@ class ClientCtl {
 
         auto client_opt = ClientTestWrapper::CreateClientWrapper(
             hostname, FLAGS_engine_meta_url, FLAGS_protocol, FLAGS_device_name,
-            FLAGS_master_server_entry,
-            /*local_buffer_size=*/1024 * 1024 * 128, FLAGS_redis_cluster_id,
-            /*enable_http_server=*/false, FLAGS_deployment_mode,
-            FLAGS_p2p_local_transfer_mode,
-            static_cast<uint16_t>(std::stoi(port)), FLAGS_redis_username,
-            FLAGS_redis_password);
+            FLAGS_master_server_entry);
 
         if (!client_opt.has_value()) {
             std::cout << "Failed to create client: " << name << std::endl;
@@ -152,37 +141,50 @@ class ClientCtl {
         std::cout << "Get value: " << value << std::endl;
     }
 
-    void HandleExpectGet(std::istringstream& iss) {
-        std::string name, key, expected;
-        iss >> name >> key >> expected;
+    void HandleDelete(std::istringstream& iss) {
+        std::string name, key;
+        iss >> name >> key;
 
         auto it = clients_.find(name);
         if (it == clients_.end()) {
-            std::cout << "Failed to expect value: client not found: " << name
-                      << std::endl;
+            std::cout << "Client not found: " << name << std::endl;
+            return;
+        }
+        if (key.empty()) {
+            std::cout << "Empty key" << std::endl;
             return;
         }
 
-        if (key.empty() || expected.empty()) {
-            std::cout << "Failed to expect value: empty key or value"
-                      << std::endl;
-            return;
-        }
-
-        std::string value;
-        ErrorCode error_code = it->second.client->Get(key, value);
+        ErrorCode error_code = it->second.client->Delete(key);
         if (error_code != ErrorCode::OK) {
-            std::cout << "Failed to expect value: " << toString(error_code)
+            std::cout << "Failed to delete value: " << toString(error_code)
                       << std::endl;
             return;
         }
-        if (value != expected) {
-            std::cout << "Failed to expect value: key=" << key
-                      << " expected=" << expected << " actual=" << value
+        std::cout << "Successfully deleted value for key: " << key << std::endl;
+    }
+
+    void HandleBatchSmoke(std::istringstream& iss) {
+        std::string name, key_prefix;
+        iss >> name >> key_prefix;
+
+        auto it = clients_.find(name);
+        if (it == clients_.end()) {
+            std::cout << "Client not found: " << name << std::endl;
+            return;
+        }
+        if (key_prefix.empty()) {
+            std::cout << "Empty key prefix" << std::endl;
+            return;
+        }
+
+        ErrorCode error_code = it->second.client->BatchSmoke(key_prefix);
+        if (error_code != ErrorCode::OK) {
+            std::cout << "Failed batch smoke: " << toString(error_code)
                       << std::endl;
             return;
         }
-        std::cout << "Successfully expected value for key: " << key
+        std::cout << "Successfully completed batch smoke: " << key_prefix
                   << std::endl;
     }
 
@@ -224,6 +226,34 @@ class ClientCtl {
 
         std::cout << "Successfully mounted segment on client " << client_name
                   << std::endl;
+    }
+
+    void HandleUnmount(std::istringstream& iss) {
+        std::string client_name;
+        std::string segment_name;
+        iss >> client_name >> segment_name;
+
+        auto client_it = clients_.find(client_name);
+        if (client_it == clients_.end()) {
+            std::cout << "Client not found: " << client_name << std::endl;
+            return;
+        }
+        auto segment_it = client_it->second.segments.find(segment_name);
+        if (segment_it == client_it->second.segments.end()) {
+            std::cout << "Segment not found: " << segment_name << std::endl;
+            return;
+        }
+
+        ErrorCode error_code =
+            client_it->second.client->Unmount(segment_it->second);
+        if (error_code != ErrorCode::OK) {
+            std::cout << "Failed to unmount segment: " << toString(error_code)
+                      << std::endl;
+            return;
+        }
+        client_it->second.segments.erase(segment_it);
+        std::cout << "Successfully unmounted segment from client "
+                  << client_name << std::endl;
     }
 
     void HandleRemove(std::istringstream& iss) {

@@ -37,6 +37,14 @@
 #include "tent/transport/ascend/ascend_direct_transport.h"
 #endif
 
+#ifdef USE_SUNRISE
+#include "tent/transport/sunrise_link/sunrise_link_transport.h"
+#endif
+
+#ifdef USE_TPU
+#include "tent/transport/tpu/tpu_transport.h"
+#endif
+
 namespace mooncake {
 namespace tent {
 
@@ -44,7 +52,8 @@ Status TransferEngineImpl::loadTransports() {
     if (conf_->get("transports/tcp/enable", true))
         transport_list_[TCP] = std::make_shared<TcpTransport>();
 
-    // TODO affect the end-to-end performance because it is not numa aware
+    // SHM is opt-in: default false because the current path is not NUMA-aware
+    // (see tent/config/transfer-engine.json for an example that enables it).
     if (conf_->get("transports/shm/enable", false))
         transport_list_[SHM] = std::make_shared<ShmTransport>();
 
@@ -81,6 +90,18 @@ Status TransferEngineImpl::loadTransports() {
         transport_list_[AscendDirect] =
             std::make_shared<AscendDirectTransport>();
     }
+#endif
+
+#ifdef USE_SUNRISE
+    if (conf_->get("transports/sunrise_link/enable", true)) {
+        transport_list_[SUNRISE_LINK] =
+            std::make_shared<SunriseLinkTransport>();
+    }
+#endif
+
+#ifdef USE_TPU
+    if (conf_->get("transports/tpu/enable", true))
+        transport_list_[TPU] = std::make_shared<TpuTransport>();
 #endif
 
     return Status::OK();

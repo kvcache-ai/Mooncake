@@ -11,8 +11,9 @@ Mooncake Transfer Engine is a high-performance, zero-copy data transfer library 
 
 As shown in the diagram, each specific client corresponds to a `TransferEngine`, which not only includes a RAM Segment but also integrates management for high-speed transfers across multiple threads and network cards. The RAM Segment, in principle, corresponds to the entire virtual address space of this `TransferEngine`, but in reality, only parts of it (known as a `Buffer`) are registered for (GPUDirect) RDMA Read/Write. Each Buffer can have separate permissions (corresponding to RDMA `rkey`, etc.) and network card affinity (e.g., preferred NICs for different types of memory).
 
-Mooncake Transfer Engine provides interfaces through the `TransferEngine` class (located in `mooncake-transfer-engine/include/transfer_engine.h`), where the specific data transfer functions for different backends are implemented by the `Transport` class, currently supporting `TcpTransport`, `RdmaTransport`, `NVMeoFTransport`, `NvlinkTransport`, `IntraNodeNvlinkTransport`, and `HipTransport`.
+Mooncake Transfer Engine provides interfaces through the `TransferEngine` class (located in `mooncake-transfer-engine/include/transfer_engine.h`), where the specific data transfer functions for different backends are implemented by the `Transport` class, currently supporting `TcpTransport`, `RdmaTransport`, `EfaTransport`, `NVMeoFTransport`, `NvlinkTransport`, `IntraNodeNvlinkTransport`, and `HipTransport`.
 
+(segment)=
 ### Segment
 Segment represents a collection of source address ranges and target address ranges available during the data transfer process in Transfer Engine. That is, all local and remote addresses involved in `BatchTransfer` requests must be within the valid segment range. Transfer Engine supports the following two types of Segments.
 
@@ -28,6 +29,7 @@ In addition, Transfer Engine also supports registering some **local DRAM areas**
 #### 2. NVMeof Segment
 Transfer Engine also leverages the NVMeof protocol to support direct data transfer from files on NVMe to DRAM/VRAM via PCIe, without going through the CPU and achieving zero-copy. Users need to follow the instructions to mount remote storage nodes locally and use the `openSegment` interface for reference to complete data read/write operations.
 
+(batchtransfer)=
 ### BatchTransfer
 
 With the help of Transfer Engine, Mooncake Store can achieve local DRAM/VRAM reading and writing of specified parts in valid segments  through TCP, (GPUDirect) RDMA, NVMe-of protocols, etc.
@@ -74,6 +76,8 @@ use the SIEVE algorithm to manage endpoint eviction.
 If a connection fails due to link errors, it is removed from the
 endpoint pools on both sides and re-established during the
 next data transfer attempt.
+
+Evicted and deleted endpoints are moved to an internal `waiting_list_` and reclaimed asynchronously once their outstanding slices drain. Reclaim runs on every new endpoint insertion, and additionally on a ~1 Hz heartbeat from the per-context `monitorWorker`, so the waiting list drains even under failure load where new insertions stall while evictions continue.
 
 ### Fault Handling
 In a multi-NIC environment, one common failure scenario is the temporary unavailability of a specific NIC, while other routes may still connect two nodes.
@@ -146,7 +150,7 @@ After successfully compiling Transfer Engine, the test program `transfer_engine_
    The initiator node can also configure the following test parameters: `--operation` (can be `"read"` or `"write"`), `batch_size`, `block_size`, `duration`, `threads`, etc.
 
 > [!NOTE]
-> If an exception occurs during execution, it is usually due to incorrect parameter settings. It is recommended to refer to the [troubleshooting document](troubleshooting.md) for preliminary troubleshooting.
+> If an exception occurs during execution, it is usually due to incorrect parameter settings. It is recommended to refer to the [troubleshooting document](../../troubleshooting/troubleshooting.md) for preliminary troubleshooting.
 
 ### Sample Run
 
@@ -155,9 +159,9 @@ The following video shows a normal run as described above, with the Target on th
 ![transfer-engine-running](../../image/transfer-engine-running.gif)
 
 ## Transfer Engine C/C++ API
-Transfer Engine provides interfaces through the `TransferEngine` class (located in `mooncake-transfer-engine/include/transfer_engine.h`), where the specific data transfer functions for different backends are implemented by the `Transport` class, currently supporting `TcpTransport`, `RdmaTransport`, `NVMeoFTransport`, `NvlinkTransport` (for NVIDIA GPUs), `IntraNodeNvlinkTransport` (for NVIDIA GPUs), and `HipTransport` (for AMD GPUs).
+Transfer Engine provides interfaces through the `TransferEngine` class (located in `mooncake-transfer-engine/include/transfer_engine.h`), where the specific data transfer functions for different backends are implemented by the `Transport` class, currently supporting `TcpTransport`, `RdmaTransport`, `EfaTransport` (for AWS EFA), `NVMeoFTransport`, `NvlinkTransport` (for NVIDIA GPUs), `IntraNodeNvlinkTransport` (for NVIDIA GPUs), and `HipTransport` (for AMD GPUs).
 
-For a complete C++ API reference, see [Transfer Engine C++ API Reference](cpp-api.md).
+For a complete C++ API reference, see [Transfer Engine C++ API Reference](../../api-reference/cpp/transfer-engine.md).
 
 ### Data Transfer
 Transfer Engine provides batch-based read/write transfers between segments (DRAM/VRAM/NVMeof). A typical flow is: register local memory, open a target segment, submit a batch, and poll status. Detailed function signatures and usage are documented in the C++ API reference.
@@ -165,7 +169,7 @@ Transfer Engine provides batch-based read/write transfers between segments (DRAM
 ### Multi-Transport Management
 
 The `TransferEngine` class internally manages multiple backend `Transport` classes.
-And it will discover the toplogy between CPU/CUDA and RDMA devices automatically
+And it will discover the topology between CPU/CUDA and RDMA devices automatically
 (more device types are working in progress, feedbacks are welcome when the automatic discovery mechanism is not accurate),
 and it will install `Transport` automatically based on the topology.
 
@@ -250,9 +254,188 @@ The HTTP server should implement three following RESTful APIs, while the metadat
 2. `PUT /metadata?key=$KEY`: Update the metadata corresponding to `$KEY` to the value of the request body.
 3. `DELETE /metadata?key=$KEY`: Delete the metadata corresponding to `$KEY`.
 
-For specific implementation, refer to the demo service implemented in Golang at [mooncake-transfer-engine/example/http-metadata-server](../../../mooncake-transfer-engine/example/http-metadata-server).
+For specific implementation, refer to the demo service implemented in Golang at [mooncake-transfer-engine/example/http-metadata-server](gh-dir:mooncake-transfer-engine/example/http-metadata-server).
 
-## Using Transfer Engine to Your Projects
+## Using Transfer Engine in Your Projects
+
+(using-python-interface)=
+### Using Python Interface
+
+For Python applications, use `mooncake.engine.TransferEngine` directly. Most
+serving-framework users should configure Mooncake through vLLM or SGLang
+instead; this example is for developers who need to call the low-level Transfer
+Engine API.
+
+Install Mooncake from PyPI before running this example. The package selected in
+the [Quick Start installation step](../../getting_started/quick-start.md#installation)
+also provides the Transfer Engine Python bindings and runtime components.
+
+#### Runtime prerequisites
+
+The Python scripts below only import the Python standard library and
+`mooncake.engine`, but the Mooncake package still depends on the system runtime
+libraries used by the transfer stack. On Ubuntu, install them with:
+
+```bash
+sudo apt-get update && sudo apt-get install -y libcurl4 libibverbs1 rdma-core librdmacm1 libnuma1 liburing2
+```
+
+The local TCP example uses `P2PHANDSHAKE`, so it does not require a separate
+metadata service. When using RDMA, make sure RDMA drivers, devices, and device
+permissions are configured; you may need to run with `sudo` or adjust device
+permissions.
+
+The following two-process TCP example keeps the Python-side dependencies minimal
+by using only the Python standard library plus the Mooncake package.
+
+::::{dropdown} Receiver (`receiver.py`)
+
+Save the following as `receiver.py`, then run it in the first terminal:
+
+```python
+import ctypes
+import json
+import socket
+
+from mooncake.engine import TransferEngine
+
+
+HOSTNAME = "localhost"
+METADATA_SERVER = "P2PHANDSHAKE"
+PROTOCOL = "tcp"
+DEVICE_NAME = ""
+BUFFER_SIZE = 1024 * 1024
+
+
+def main():
+    engine = TransferEngine()
+    engine.initialize(HOSTNAME, METADATA_SERVER, PROTOCOL, DEVICE_NAME)
+    session_id = f"{HOSTNAME}:{engine.get_rpc_port()}"
+
+    server_buffer = (ctypes.c_uint8 * BUFFER_SIZE)()
+    server_ptr = ctypes.addressof(server_buffer)
+    server_len = ctypes.sizeof(server_buffer)
+
+    ret = engine.register_memory(server_ptr, server_len)
+    if ret != 0:
+        raise RuntimeError("Mooncake memory registration failed.")
+
+    print(f"Receiver session ID: {session_id}")
+    print(f"Receiver buffer address: {server_ptr}, length: {server_len}")
+
+    listener = None
+    try:
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        listener.bind(("0.0.0.0", 5555))
+        listener.listen(1)
+
+        print("Waiting for sender to connect on port 5555...")
+        conn, _ = listener.accept()
+        with conn:
+            payload = {
+                "session_id": session_id,
+                "ptr": server_ptr,
+                "len": server_len,
+            }
+            conn.sendall(json.dumps(payload).encode("utf-8") + b"\n")
+            print("Buffer information sent to sender.")
+
+        input("Press Enter after the sender finishes...")
+        print(f"First byte in receiver buffer: {server_buffer[0]}")
+    finally:
+        ret = engine.unregister_memory(server_ptr)
+        if ret != 0:
+            raise RuntimeError("Mooncake memory deregistration failed.")
+        if listener is not None:
+            listener.close()
+
+
+if __name__ == "__main__":
+    main()
+```
+
+::::
+
+::::{dropdown} Sender (`sender.py`)
+
+Save the following as `sender.py`, then run it in a second terminal:
+
+```python
+import ctypes
+import json
+import socket
+
+from mooncake.engine import TransferEngine
+
+
+HOSTNAME = "localhost"
+METADATA_SERVER = "P2PHANDSHAKE"
+PROTOCOL = "tcp"
+DEVICE_NAME = ""
+BUFFER_SIZE = 1024 * 1024
+
+
+def recv_json_line(sock):
+    chunks = []
+    while True:
+        chunk = sock.recv(4096)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        if b"\n" in chunk:
+            break
+    return json.loads(b"".join(chunks).split(b"\n", 1)[0].decode("utf-8"))
+
+
+def main():
+    with socket.create_connection(("localhost", 5555)) as sock:
+        buffer_info = recv_json_line(sock)
+
+    server_session_id = buffer_info["session_id"]
+    server_ptr = buffer_info["ptr"]
+    server_len = buffer_info["len"]
+    print(f"Receiver session ID: {server_session_id}")
+    print(f"Receiver buffer address: {server_ptr}, length: {server_len}")
+
+    engine = TransferEngine()
+    engine.initialize(HOSTNAME, METADATA_SERVER, PROTOCOL, DEVICE_NAME)
+    session_id = f"{HOSTNAME}:{engine.get_rpc_port()}"
+
+    client_buffer = (ctypes.c_uint8 * BUFFER_SIZE)()
+    client_ptr = ctypes.addressof(client_buffer)
+    client_len = ctypes.sizeof(client_buffer)
+    ctypes.memset(client_ptr, 1, client_len)
+
+    ret = engine.register_memory(client_ptr, client_len)
+    if ret != 0:
+        raise RuntimeError("Mooncake memory registration failed.")
+
+    try:
+        print(f"Sender session ID: {session_id}")
+        print("Transferring data to receiver...")
+        ret = engine.transfer_sync_write(
+            server_session_id,
+            client_ptr,
+            server_ptr,
+            min(client_len, server_len),
+        )
+        if ret < 0:
+            raise RuntimeError("Transfer failed.")
+        print("Transfer successful.")
+    finally:
+        ret = engine.unregister_memory(client_ptr)
+        if ret != 0:
+            raise RuntimeError("Mooncake memory deregistration failed.")
+
+
+if __name__ == "__main__":
+    main()
+```
+
+::::
+
+For more Python APIs, see [Transfer Engine Python API](../../api-reference/python/transfer-engine.md).
 
 ### Using C/C++ Interface
 After compiling Mooncake Store, you can move the compiled static library file `libtransfer_engine.a` and the C header file `transfer_engine_c.h` into your own project. There is no need to reference other files under `src/transfer_engine`.
@@ -263,7 +446,7 @@ To support the operational needs of P2P Store, Transfer Engine provides a Golang
 When compiling the project, enable the `-DWITH_P2P_STORE=ON` option to compile the P2P Store example program at the same time.
 
 ### Using Rust Interface
-Under `mooncake-transfer-engine/rust`, the Rust interface implementation of TransferEngine is provided, and a Rust version of the benchmark is implemented based on the interface, similar to [transfer_engine_bench.cpp](../../../mooncake-transfer-engine/example/transfer_engine_bench.cpp). To compile the rust example, you need to install the Rust SDK and add `-DWITH_RUST_EXAMPLE=ON` in the cmake command.
+Under `mooncake-transfer-engine/rust`, the Rust interface implementation of TransferEngine is provided, and a Rust version of the benchmark is implemented based on the interface, similar to [transfer_engine_bench.cpp](gh-file:mooncake-transfer-engine/example/transfer_engine_bench.cpp). To compile the rust example, you need to install the Rust SDK and add `-DWITH_RUST_EXAMPLE=ON` in the cmake command.
 
 ## Advanced Runtime Options
 For advanced users, TransferEngine provides the following advanced runtime options, all of which can be passed in through **environment variables**.
@@ -272,44 +455,74 @@ For advanced users, TransferEngine provides the following advanced runtime optio
 - `MC_NUM_COMP_CHANNELS_PER_CTX` The number of Completion Channel created per device instance, default value 1
 - `MC_IB_PORT` The IB port number used per device instance, default value 1
 - `MC_IB_TC` Adjust RDMA NIC Traffic Class when switch/NIC defaults differ or for traffic planning. Default value -1
-- `MC_IB_PCI_RELAXED_ORDERING` Setting the PCIe ordering to relaxed for the network adapter sometimes results in better performance. Can set 1 to enable RO function. Default value 0
+- `MC_IB_SL` Set the InfiniBand Service Level (0-15) of RDMA QPs. The switch maps SL to a Virtual Lane for QoS isolation, e.g. to steer KV-cache traffic into a different VL than Expert-Parallel all-to-all traffic that shares the same NIC. -1 keeps the default (0). Default value -1
+- `MC_IB_PCI_RELAXED_ORDERING` Controls PCIe Relaxed Ordering (RO) for RDMA memory regions. `0`: disabled, `1`: enabled if supported by hardware (default), `2`: auto. Requires `ibv_reg_mr_iova2` (libibverbs ≥ 1.8); falls back to strict ordering if unavailable.
+- `MC_MLX5_QP_UDP_SPORTS` Comma-separated list of UDP source ports (0-65535) used to override the RoCEv2 UDP source port of each QP, for spreading traffic across different ECMP/LAG paths. QP at index *i* uses `list[i % size]`. Default empty (driver chooses). **Requires** an mlx5 NIC + RoCEv2, and the binary built with `-DUSE_MLX5DV=ON`. Recommend ports in the dynamic range 49152-65535. Example: `MC_MLX5_QP_UDP_SPORTS="49152,49153,49154,49155"`
+- `MC_MLX5_QP_LAG_PORT_BALANCE` Set to `1` or `true` to enable automatic LAG port balancing across bonded physical ports. QP at index *i* is pinned to port `(i % num_lag_ports) + 1`; the number of LAG ports is queried from hardware via `mlx5dv_query_device` at startup and printed in the device log. If the device is not in LAG mode the setting is a no-op. Default: disabled. **Requires** the binary built with `-DUSE_MLX5DV=ON`. Example: `MC_MLX5_QP_LAG_PORT_BALANCE=1`
 - `MC_GID_INDEX` The GID index used per device instance, default value 3 (or the maximum value supported by the platform)
+- `MC_PKEY_INDEX` The QP `pkey_index` (partition key table index) used when transitioning the QP to the INIT state. Valid range: 0 to 65535. Default value 0. Set this when the partition key required for your fabric is not at index 0 of the HCA's pkey table
 - `MC_MAX_CQE_PER_CTX` The CQ buffer size per device instance, default value 4096
 - `MC_MAX_EP_PER_CTX` The maximum number of active EndPoint per device instance, default value 65536. **Note:** For versions prior to 0.3.7.post1, the default value is 256, and it cannot be manually set to 65536. The maximum supported value is 65535!
 - `MC_NUM_QP_PER_EP` The number of QPs per EndPoint, the more the number, the better the fine-grained I/O performance, default value 2
 - `MC_MAX_SGE` The maximum number of SGEs supported per QP, default value 4 (or the highest value supported by the platform)
-- `MC_MAX_WR` The maximum number of Work Request supported per QP, default value 256 (or the highest value supported by the platform)
+- `MC_MAX_WR` The maximum number of Work Request supported per QP, default value 256 (or the highest value supported by the platform). **On EFA this should be left unset:** the transport derives the depth from the libfabric provider's transmit queue (a per-device attribute, so no fixed value is right on every instance type), and an override that exceeds it is clamped. See the EFA transport page.
 - `MC_MAX_INLINE` The maximum Inline write data volume (bytes) supported per QP, default value 64 (or the highest value supported by the platform)
 - `MC_MTU` The MTU length used per device instance, can be 512, 1024, 2048, 4096, default value 4096 (or the maximum length supported by the platform)
 - `MC_WORKERS_PER_CTX` The number of asynchronous worker threads corresponding to each device instance
 - `MC_SLICE_SIZE` The segmentation granularity of user requests in Transfer Engine
 - `MC_RETRY_CNT` The maximum number of retries in Transfer Engine
+- `MC_TE_FILTERS` Restrict which RDMA NICs the engine discovers and uses, as a comma-separated allow-list of device names (e.g. `mlx5_bond_0,mlx5_bond_1`). Only the listed NICs are kept; all others are ignored. Unset (default) discovers all NICs. This is the **same env var and semantics as the legacy Transfer Engine's device whitelist** (see below), so a single variable scopes NICs across both engines. Useful on multi-NIC / multi-NUMA hosts to keep the engine (and its rail selection) off NICs that are not routable to the peer.
+- `MC_TE_FILTERS_EXCLUDE` The deny-list counterpart of `MC_TE_FILTERS`: a comma-separated list of device names to exclude from discovery. Ignored if `MC_TE_FILTERS` is set (allow-list takes precedence). Unset (default) excludes nothing. (New; the legacy engine has an allow-list only.)
+- `MC_AUTO_GID_MAX_RETRIES` The maximum number of automatic local GID reprobe retries during classic RDMA handshake recovery. Default value 2. Set to 0 to disable automatic GID retry.
 - `MC_LOG_LEVEL` This option can be set as `TRACE`/`INFO`/`WARNING`/`ERROR` (see [glog doc](https://github.com/google/glog/blob/master/docs/logging.md)), and more detailed logs will be output during runtime
 - `MC_DISABLE_METACACHE` Disable local meta cache to prevent transfer failure due to dynamic memory registrations, which may downgrades the performance
+- `MC_TE_METADATA_REFRESH_INTERVAL_SECONDS` Periodically refresh Transfer Engine metadata-derived local caches. Currently refreshes cached remote segment descriptors from the metadata service. Default value 0 disables background polling; callers may still manually invoke `syncSegmentCache()`. Set a positive interval in seconds when peers may re-register the same segment name after restart and cached descriptors must converge automatically
 - `MC_HANDSHAKE_LISTEN_BACKLOG` The backlog size of socket listening for handshaking, default value is 128
+- `MC_HANDSHAKE_CONNECT_TIMEOUT` Connect timeout in seconds for outbound handshake-port requests (QP handshake, probe, notify, metadata exchange), default value is 5. Bounds the stall when the peer address is unreachable; without it, a connect to an unroutable address (e.g. a removed node) blocks for the kernel's full TCP SYN retry cycle, which can take minutes
 - `MC_HANDSHAKE_MAX_LENGTH` The maximum handshake message length in bytes for P2P mode. Valid range: 1MB to 128MB. Default value is 1MB (1048576 bytes). Increase this value when using a single RDMA instance with many registered memory buffers (>10,000) to avoid handshake failures. Example: set to 10485760 for 10MB
 - `MC_LOG_DIR` Specify the directory path for log redirection files. If invalid, log to stderr instead.
 - `MC_REDIS_PASSWORD` The password for Redis storage plugin, only takes effect when Redis is specified as the metadata server. If not set, no authentication will be attempted to log in to the Redis.
 - `MC_REDIS_DB_INDEX` The database index for Redis storage plugin, must be an integer between 0 and 255. Only takes effect when Redis is specified as the metadata server. If not set or invalid, the default value is 0.
 - `MC_FRAGMENT_RATIO ` In RdmaTransport::submitTransferTask, if the last data piece after division is ≤ 1/MC_FRAGMENT_RATIO of the block size, it merges with the previous block to reduce overhead. The default value is 4
 - `MC_ENABLE_DEST_DEVICE_AFFINITY` Enable device affinity for RDMA performance optimization. When enabled, Transfer Engine will prioritize communication with remote NICs that have the same name as local NICs to reduce QP count and improve network performance in rail-optimized topologies. The default value is false
+- `MC_TRACK_RDMA_POSTED_SLICES` Enable RDMA posted-slice tracking for timeout diagnostics. When enabled, CQ timeout logs include stuck transfer groups by peer NIC path, slice count, bytes, oldest post age, and sample addresses. This adds synchronization on the RDMA post and poll hot paths, so it is disabled by default and should be enabled only while diagnosing stuck completions.
 - `MC_ENABLE_PARALLEL_REG_MR` Control parallel memory region registration across multiple RDMA NICs. Valid values: -1 (auto, default), 0 (disabled), 1 (enabled). When set to -1, parallel registration is automatically enabled when multiple RNICs exist and memory has been pre-touched. Note: If memory hasn't been touched before registration, parallel registration can be slower than sequential registration
+- `MC_MAX_CONCURRENT_REG_MR` Cap on how many buffers `registerLocalMemoryBatch` registers concurrently (EFA transport). The default 0 means unbounded — one thread per buffer, the historical behavior. Note the cap is **per process**, so a framework running one `TransferEngine` per TP rank multiplies it by the rank count. Capping can cut registration time substantially when a batch holds many large GPU buffers. Registration is CPU-bound, so a reasonable value is `cores / processes-per-node` — on a 192-core node running 8 ranks, around 16. Oversubscribing costs more than undersubscribing, and the result also depends on the order the caller passes buffers in, so a poorly chosen cap can be slower than unbounded — hence opt-in.
+- `MC_EFA_NIC_SELECTION` Which NICs the EFA transport registers a buffer on. `all` (the default) registers every buffer on every NIC. `local` restricts **device** memory to the NICs the topology reports as closest to that GPU, which on p5.48xlarge is the 4 EFA devices sharing the GPU's PCIe root complex. Because EFA charges device-memory registration in proportion to the device bytes already registered on the same libfabric domain, narrowing the NIC set cuts registration time by close to the fan-out ratio. Set it when registering many GPU buffers is a startup bottleneck; it is opt-in because fewer NICs can serve a transfer touching that buffer, so a job whose working set sits behind a single GPU is capped at that rail group's bandwidth rather than the node's. Host memory is unaffected. Combine with `MC_MAX_CONCURRENT_REG_MR`, which bounds a different variable: this reduces the cost per registration, that one reduces how many run at once.
+- `MC_EFA_CQ_THREADS` Cap on the number of CQ polling threads in the EFA transport, default value 1 (which already reaches ~99.9% of peak throughput). Pollers busy-wait, so each extra thread costs a full core. Set 0 to lift the cap (one poller per EFA device). Values above the device count are ignored
 - `MC_FORCE_HCA` Force to use RDMA as the active transport, return error if no HCA has been found.
 - `MC_FORCE_MNNVL` Force to use Multi-Node NVLink as the active transport regardless whether RDMA devices are installed.
 - `MC_INTRA_NVLINK` Enable intra-node NVLINK transport, and cannot be used together with MC_FORCE_MNNVL.
 - `MC_FORCE_TCP` Force to use TCP as the active transport regardless whether RDMA devices are installed.
-- `MC_MIN_PRC_PORT` Specifies the minimum port number for RPC service. The default value is 15000.
-- `MC_MAX_PRC_PORT` Specifies the maximum port number for RPC service. The default value is 17000.
+- `MC_MIN_RPC_PORT` Specifies the minimum port number for RPC service. The default value is 15000.
+- `MC_MAX_RPC_PORT` Specifies the maximum port number for RPC service. The default value is 17000.
 - `MC_PATH_ROUNDROBIN` Use round-robin mode in the RDMA path selection. This may be beneficial for transferring large bulks.
+- `MC_TE_FILTERS` Optional comma-separated whitelist of IB device names (e.g. `mlx5_0,mlx5_2`) for legacy Transfer Engine topology discovery. When unset, all available devices are discovered.
+- `WITH_NVIDIA_PEERMEM` When set to `1`, `ON`, or `TRUE`, Mooncake uses `ibv_reg_mr()` directly for GPU memory registration (requires the `nvidia-peermem` kernel module). By default (unset or `0`), Mooncake uses the DMA-BUF path which does not require `nvidia-peermem`.
 - `MC_ENDPOINT_STORE_TYPE` Choose FIFO Endpoint Store (`FIFO`) or Sieve Endpoint Store (`SIEVE`), default is `SIEVE`.
+- `MC_TCP_ENABLE_CONNECTION_POOL` Enable TCP Connection Pool to avoid excessive sockets.
+- `MC_TCP_SLICE_SIZE` The segmentation granularity (in bytes) of TCP transport for splitting large transfers into socket read/write operations. Corresponds to `MC_SLICE_SIZE` for RDMA. Default value 65536 (64KB).
+- `MC_TCP_PROTO` When set to `1`, TCP initiators use the legacy unacknowledged framing even against servers that support acknowledged framing (protocol v2). Under v2 (the default against v2-capable servers), a WRITE completes only after the receiver confirms the payload has been applied to destination memory, and server-side rejections surface as failed transfers instead of silent data loss. Use this variable only as a rollback escape hatch during mixed-version upgrades.
 
 ## C++ API Reference
 
-::::{toctree}
+For the complete C++ API reference, see [Transfer Engine C++ API](../../api-reference/cpp/index).
+
+## Supported Protocols
+
+:::{toctree}
 :maxdepth: 1
 
-cpp-api
-::::
+../../getting_started/supported-protocols
+:::
+
+## EFA Transport (AWS)
+
+:::{toctree}
+:maxdepth: 1
+
+efa_transport
+:::
 
 ## Ascend Transport Component
 
@@ -319,6 +532,15 @@ cpp-api
 ascend_direct_transport
 ascend_transport
 heterogeneous_ascend
+:::
+
+## Sunrise Link Transport Component
+
+:::{toctree}
+:maxdepth: 1
+
+kunpeng_ub_transport
+sunrise_link_transport
 :::
 
 ## Benchmark and Tuning Guide

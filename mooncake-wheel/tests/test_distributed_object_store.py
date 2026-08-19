@@ -3,7 +3,7 @@ import os
 import time
 import threading
 import random
-from mooncake.store import MooncakeDistributedStore
+from mooncake.store import MooncakeDistributedStore, SoftPinAction
 
 # The lease time of the kv object, should be set equal to
 # the master's value.
@@ -37,6 +37,67 @@ def get_client(store, local_buffer_size_param=None):
     
     if retcode:
         raise RuntimeError(f"Failed to setup store client. Return code: {retcode}")
+
+
+def get_config_dict(global_segment_size, local_buffer_size):
+    """Build a config dictionary for the MooncakeDistributedStore setup wrapper."""
+    return {
+        "local_hostname": os.getenv("LOCAL_HOSTNAME", "localhost"),
+        "metadata_server": os.getenv(
+            "MC_METADATA_SERVER", "http://127.0.0.1:8080/metadata"
+        ),
+        "global_segment_size": global_segment_size,
+        "local_buffer_size": local_buffer_size,
+        "protocol": os.getenv("PROTOCOL", "tcp"),
+        "rdma_devices": os.getenv("DEVICE_NAME", "ibp6s0"),
+        "master_server_addr": os.getenv("MASTER_SERVER", "127.0.0.1:50051"),
+    }
+
+
+class TestReplicateConfig(unittest.TestCase):
+    """Test ReplicateConfig bindings without a running store service."""
+
+    def test_soft_pin_ttl_optional_conversion(self):
+        from mooncake.store import ReplicateConfig
+
+        config = ReplicateConfig()
+        self.assertIsNone(config.soft_pin_ttl_ms)
+
+        config.soft_pin_ttl_ms = 1000
+        self.assertEqual(config.soft_pin_ttl_ms, 1000)
+
+        config.soft_pin_ttl_ms = None
+        self.assertIsNone(config.soft_pin_ttl_ms)
+
+        with self.assertRaises(TypeError):
+            config.soft_pin_ttl_ms = -1
+        with self.assertRaises(TypeError):
+            config.soft_pin_ttl_ms = 1 << 64
+
+
+class TestConfigDictSetup(unittest.TestCase):
+    """Test configuration-dictionary setup through the Python store wrapper."""
+
+    def test_human_readable_sizes(self):
+        store = MooncakeDistributedStore()
+        self.addCleanup(store.close)
+
+        retcode = store.setup(get_config_dict("16MB", "16 MB"))
+        self.assertEqual(retcode, 0)
+
+        test_data = b"test_config_dict_human_readable_value"
+        key = f"test_config_dict_human_readable_key_{os.getpid()}"
+
+        self.assertEqual(store.put(key, test_data), 0)
+        self.assertEqual(store.get(key), test_data)
+
+    def test_unsupported_percentage_size(self):
+        store = MooncakeDistributedStore()
+        self.addCleanup(store.close)
+
+        retcode = store.setup(get_config_dict("50%", "16MB"))
+        self.assertNotEqual(retcode, 0)
+
 
 class TestZeroLocalBufferSize(unittest.TestCase):
     """Test class for zero local buffer size scenarios."""
@@ -116,6 +177,33 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         # Remove the key
         time.sleep(default_kv_lease_ttl / 1000)
         self.assertEqual(self.store.remove(key), 0)
+
+    def test_soft_pin_config_forwarding(self):
+        """Test soft-pin action and TTL forwarding through Store operations."""
+        from mooncake.store import ReplicateConfig
+
+        key = f"test_soft_pin_config_forwarding_{os.getpid()}"
+        test_data = b"soft-pin forwarding"
+
+        enable_config = ReplicateConfig()
+        enable_config.soft_pin_action = SoftPinAction.ENABLE
+        enable_config.soft_pin_ttl_ms = 1000
+        self.assertEqual(self.store.put(key, test_data, enable_config), 0)
+
+        preserve_with_ttl = ReplicateConfig()
+        preserve_with_ttl.soft_pin_ttl_ms = 1000
+        self.assertEqual(self.store.upsert(key, test_data, preserve_with_ttl), -600)
+
+        disable_with_ttl = ReplicateConfig()
+        disable_with_ttl.soft_pin_action = SoftPinAction.DISABLE
+        disable_with_ttl.soft_pin_ttl_ms = 1000
+        self.assertEqual(self.store.upsert(key, test_data, disable_with_ttl), -600)
+
+        self.assertEqual(self.store.upsert(key, test_data), 0)
+
+        disable_config = ReplicateConfig()
+        disable_config.soft_pin_action = SoftPinAction.DISABLE
+        self.assertEqual(self.store.upsert(key, test_data, disable_config), 0)
 
     def test_batch_is_exist_operations(self):
         """Test batch is_exist operations through the Python interface."""
@@ -223,6 +311,76 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         self.assertEqual(self.store.unregister_buffer(buffer_ptr), 0, "Buffer unregistration should succeed")
         self.assertEqual(self.store.unregister_buffer(small_buffer_ptr), 0)
         self.assertEqual(self.store.remove(key), 0)
+
+    def test_get_into_ranges_operations(self):
+        """Test buffer-major multi-key range reads into registered buffers."""
+        import ctypes
+
+        key1 = "test_get_into_ranges_key_1"
+        key2 = "test_get_into_ranges_key_2"
+        data1 = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        data2 = b"abcdefghijklmnopqrstuvwxyz0123456789"
+        buffer_size = 32
+
+        self.assertEqual(self.store.put(key1, data1), 0)
+        self.assertEqual(self.store.put(key2, data2), 0)
+
+        buffer0 = (ctypes.c_ubyte * buffer_size)()
+        buffer1 = (ctypes.c_ubyte * buffer_size)()
+        buffer_ptr0 = ctypes.addressof(buffer0)
+        buffer_ptr1 = ctypes.addressof(buffer1)
+        self.assertEqual(self.store.register_buffer(buffer_ptr0, buffer_size), 0)
+        self.assertEqual(self.store.register_buffer(buffer_ptr1, buffer_size), 0)
+
+        ctypes.memset(buffer0, ord("_"), buffer_size)
+        ctypes.memset(buffer1, ord("_"), buffer_size)
+
+        results = self.store.get_into_ranges(
+            [buffer_ptr0, buffer_ptr1],
+            [[key1, key2], [key2, key1]],
+            [[[0, 20], [8]], [[4], [16]]],
+            [[[1, 30], [2]], [[0], [10]]],
+            [[[4, 3], [5]], [[6], [4]]],
+        )
+
+        self.assertEqual(results, [[[4, 3], [5]], [[6], [4]]])
+        self.assertEqual(bytes(buffer0[0:4]), data1[1:5])
+        self.assertEqual(bytes(buffer0[8:13]), data2[2:7])
+        self.assertEqual(bytes(buffer0[20:23]), data1[30:33])
+        self.assertEqual(bytes(buffer1[4:10]), data2[0:6])
+        self.assertEqual(bytes(buffer1[16:20]), data1[10:14])
+
+        mismatch_results = self.store.get_into_ranges(
+            [buffer_ptr0], [[key1, key2]], [[[0], []]], [[[0, 1], []]], [[[], []]]
+        )
+        self.assertEqual(len(mismatch_results), 1)
+        self.assertEqual(len(mismatch_results[0]), 2)
+        self.assertLess(mismatch_results[0][0][0], 0, "mismatched ranges should fail")
+        self.assertEqual(len(mismatch_results[0][1]), 0)
+
+        source_overflow_results = self.store.get_into_ranges(
+            [buffer_ptr0], [[key1]], [[[0]]], [[[len(data1) - 1]]], [[[4]]]
+        )
+        self.assertEqual(len(source_overflow_results), 1)
+        self.assertLess(source_overflow_results[0][0][0], 0)
+
+        destination_overflow_results = self.store.get_into_ranges(
+            [buffer_ptr0], [[key1]], [[[buffer_size - 1]]], [[[0]]], [[[4]]]
+        )
+        self.assertEqual(len(destination_overflow_results), 1)
+        self.assertLess(destination_overflow_results[0][0][0], 0)
+
+        missing_key_results = self.store.get_into_ranges(
+            [buffer_ptr0], [["missing-key", key1]], [[[0], [8]]], [[[0], [0]]], [[[4], [4]]]
+        )
+        self.assertLess(missing_key_results[0][0][0], 0)
+        self.assertEqual(missing_key_results[0][1][0], 4)
+
+        time.sleep(default_kv_lease_ttl / 1000)
+        self.assertEqual(self.store.unregister_buffer(buffer_ptr0), 0)
+        self.assertEqual(self.store.unregister_buffer(buffer_ptr1), 0)
+        self.assertEqual(self.store.remove(key1), 0)
+        self.assertEqual(self.store.remove(key2), 0)
 
     def test_batch_get_into_operations(self):
         """Test batch_get_into operations for multiple keys."""
@@ -553,16 +711,16 @@ class TestDistributedObjectStoreSingleStore(unittest.TestCase):
         # Test default constructor
         config = ReplicateConfig()
         self.assertEqual(config.replica_num, 1)
-        self.assertEqual(config.with_soft_pin, False)
+        self.assertEqual(config.soft_pin_action, SoftPinAction.PRESERVE)
         self.assertEqual(config.preferred_segment, "")
         
         # Test property assignment
         config.replica_num = 3
-        config.with_soft_pin = True
+        config.soft_pin_action = SoftPinAction.ENABLE
         config.preferred_segment = "node1:12345"
         
         self.assertEqual(config.replica_num, 3)
-        self.assertEqual(config.with_soft_pin, True)
+        self.assertEqual(config.soft_pin_action, SoftPinAction.ENABLE)
         self.assertEqual(config.preferred_segment, "node1:12345")
         
         # Test string representation

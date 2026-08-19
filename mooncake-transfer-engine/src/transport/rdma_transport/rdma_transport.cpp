@@ -18,17 +18,21 @@
 #include <sys/mman.h>
 #include <sys/time.h>
 
+#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <cstddef>
+#include <cstdlib>
 #include <future>
 #include <set>
 #include <thread>
+#include <utility>
 
 #include <dlfcn.h>
 
 #include "common.h"
 #include "config.h"
+#include "environ.h"
 #include "memory_location.h"
 #include "topology.h"
 #include "transport/rdma_transport/rdma_context.h"
@@ -39,8 +43,91 @@ namespace mooncake {
 static bool MCIbRelaxedOrderingEnabled = false;
 static int MCIbRelaxedOrderingMode = 2;
 
+static std::string resolveBufferLocation(
+    const TransferMetadata::BufferDesc &buffer, uint64_t offset) {
+    std::string location = buffer.name;
+    SegmentsLocationInfo seg_info;
+    if (parseSegmentsLocation(buffer.name, seg_info)) {
+        location = resolveSegmentsLocation(seg_info, buffer.length,
+                                           offset - buffer.addr);
+    }
+    return location;
+}
+
+// Calculate remaining bytes in buffer for 'address'.
+// Caches 'last_buffer_idx' across sequential slices to avoid rescanning
+// buffers.
+static uint64_t bytesUntilBufferEnd(
+    const TransferMetadata::SegmentDesc *segment_desc, uint64_t address,
+    bool require_remote_key, size_t *last_buffer_idx = nullptr) {
+    if (!segment_desc || segment_desc->buffers.empty()) return 0;
+
+    auto is_valid_buffer = [&](const TransferMetadata::BufferDesc &buffer) {
+#ifdef ENABLE_MULTI_PROTOCOL
+        if (!buffer.protocol.empty() && buffer.protocol != "rdma") return false;
+#endif
+        if (require_remote_key ? buffer.rkey.empty() : buffer.lkey.empty())
+            return false;
+        if (address < buffer.addr || address - buffer.addr >= buffer.length)
+            return false;
+        return true;
+    };
+
+    if (last_buffer_idx && *last_buffer_idx < segment_desc->buffers.size()) {
+        const auto &buffer = segment_desc->buffers[*last_buffer_idx];
+        if (is_valid_buffer(buffer)) {
+            return buffer.length - (address - buffer.addr);
+        }
+    }
+
+    uint64_t max_remaining = 0;
+    for (size_t i = 0; i < segment_desc->buffers.size(); ++i) {
+        const auto &buffer = segment_desc->buffers[i];
+        if (is_valid_buffer(buffer)) {
+            uint64_t remaining = buffer.length - (address - buffer.addr);
+            if (remaining > max_remaining) {
+                max_remaining = remaining;
+                if (last_buffer_idx) *last_buffer_idx = i;
+            }
+        }
+    }
+    return max_remaining;
+}
+
+// Calculate slice length capped at MR boundary to avoid multi-MR WRs.
+// Caches source and target buffer indices across slices for a single request.
+struct SliceLengthCalculator {
+    const Transport::TransferRequest &request;
+    size_t block_size;
+    size_t fragment_size;
+    const TransferMetadata::SegmentDesc *local_desc;
+    const TransferMetadata::SegmentDesc *target_desc;
+
+    size_t src_buffer_idx = 0;
+    size_t tgt_buffer_idx = 0;
+
+    inline size_t calculate(uint64_t offset) {
+        const size_t remaining = request.length - offset;
+        size_t slice_length =
+            remaining <= block_size + fragment_size ? remaining : block_size;
+
+        const uint64_t src_rem = bytesUntilBufferEnd(
+            local_desc, reinterpret_cast<uint64_t>(request.source) + offset,
+            false, &src_buffer_idx);
+        if (src_rem > 0)
+            slice_length = std::min<uint64_t>(slice_length, src_rem);
+
+        const uint64_t tgt_rem = bytesUntilBufferEnd(
+            target_desc, request.target_offset + offset, true, &tgt_buffer_idx);
+        if (tgt_rem > 0)
+            slice_length = std::min<uint64_t>(slice_length, tgt_rem);
+
+        return slice_length;
+    }
+};
+
 // Mode definition for MC_IB_PCI_RELAXED_ORDERING env.
-// 0 - disabled, 1 - enabled if supported, 2 - auto (default, same as 1 today).
+// 0 - disabled, 1 - enabled if supported (default), 2 - auto (same as 1 today).
 static int getIbRelaxedOrderingMode() {
     int val = globalConfig().ib_pci_relaxed_ordering_mode;
     if (val < 0 || val > 2) {
@@ -100,6 +187,21 @@ int RdmaTransport::install(std::string &local_server_name,
     metadata_ = meta;
     local_server_name_ = local_server_name;
     local_topology_ = topo;
+
+    // In dual-NIC environments (e.g. separate TCP and RDMA interfaces),
+    // MC_RDMA_BIND_ADDRESS allows NIC paths to use an RDMA-reachable IP
+    // while local_server_name_ keeps the TCP-reachable address for P2P.
+    const char *rdma_bind_addr = std::getenv("MC_RDMA_BIND_ADDRESS");
+    if (rdma_bind_addr && rdma_bind_addr[0] != '\0') {
+        auto [host_name, port] = parseHostNameWithPort(local_server_name);
+        rdma_server_name_ =
+            std::string(rdma_bind_addr) + ":" + std::to_string(port);
+        LOG(INFO) << "RdmaTransport: using RDMA bind address "
+                  << rdma_server_name_
+                  << " (TCP address: " << local_server_name_ << ")";
+    } else {
+        rdma_server_name_ = local_server_name_;
+    }
 
     auto ret = initializeRdmaResources();
     if (ret) {
@@ -184,118 +286,252 @@ int RdmaTransport::registerLocalMemoryInternal(void *addr, size_t length,
                                                bool remote_accessible,
                                                bool update_metadata,
                                                bool force_sequential) {
-    (void)remote_accessible;
-    BufferDesc buffer_desc;
-    const int kBaseAccessRights = IBV_ACCESS_LOCAL_WRITE |
-                                  IBV_ACCESS_REMOTE_WRITE |
-                                  IBV_ACCESS_REMOTE_READ;
-
-    static int access_rights = kBaseAccessRights;
+    int access_rights = IBV_ACCESS_LOCAL_WRITE;
+    if (remote_accessible)
+        access_rights |= IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ;
     if (MCIbRelaxedOrderingEnabled) {
         access_rights |= IBV_ACCESS_RELAXED_ORDERING;
     }
-    bool do_pre_touch = context_list_.size() > 0 &&
-                        std::thread::hardware_concurrency() >= 4 &&
-                        length >= (size_t)4 * 1024 * 1024 * 1024;
-    if (do_pre_touch) {
-        // Parallel Pre-touch the memory to speedup the registration process.
-        int ret = preTouchMemory(addr, length);
-        if (ret != 0) {
-            return ret;
+
+    // Mooncake#2017: ibv_reg_mr silently truncates a registration to the device
+    // max_mr_size, but the metadata would still advertise the full BufferDesc
+    // length, so any remote RDMA op past the boundary fails with
+    // IBV_WC_REM_ACCESS_ERR (ionic CQE error 10). Split buffers larger than
+    // max_mr_size into chunks of <= max_mr_size, register each as its own MR,
+    // and publish one BufferDesc per chunk (the per-context rkey/lkey lookups
+    // are address-range based, so each chunk gets the correct key).
+    size_t chunk_limit = (size_t)globalConfig().max_mr_size;
+    std::vector<std::pair<void *, size_t>> chunks;
+    if (chunk_limit > 0 && length > chunk_limit) {
+        for (size_t offset = 0; offset < length;) {
+            size_t chunk_len = std::min(chunk_limit, length - offset);
+            chunks.emplace_back(static_cast<char *>(addr) + offset, chunk_len);
+            offset += chunk_len;
         }
-    }
-
-    /* Parallel register when:
-    1. parallel_reg_mr is enabled via MC_ENABLE_PARALLEL_REG_MR;
-    2. parallel_reg_mr not set and multiple contexts exist and memory has been
-    pre-touched
-    Note: If memory hasn't been touched, parallel register can be
-    slower. Details in: https://github.com/kvcache-ai/Mooncake/issues/848
-    Note: force_sequential is used by batch operations to avoid nested
-    parallelism.
-    */
-    int use_parallel_reg = 0;
-    if (!force_sequential) {
-        use_parallel_reg = globalConfig().parallel_reg_mr;
-        if (use_parallel_reg == -1) {
-            use_parallel_reg = context_list_.size() > 1 && do_pre_touch;
-        }
-    }
-
-    auto reg_start = std::chrono::steady_clock::now();
-
-    if (use_parallel_reg) {
-        std::vector<std::thread> reg_threads;
-        reg_threads.reserve(context_list_.size());
-        std::vector<int> ret_codes(context_list_.size(), 0);
-        const int ar = access_rights;  // Local copy for lambda capture
-
-        for (size_t i = 0; i < context_list_.size(); ++i) {
-            reg_threads.emplace_back([this, &ret_codes, i, addr, length, ar]() {
-                ret_codes[i] =
-                    context_list_[i]->registerMemoryRegion(addr, length, ar);
-            });
-        }
-
-        for (auto &thread : reg_threads) {
-            thread.join();
-        }
-
-        for (size_t i = 0; i < ret_codes.size(); ++i) {
-            if (ret_codes[i] != 0) {
-                LOG(ERROR) << "Failed to register memory region with context "
-                           << i;
-                return ret_codes[i];
-            }
-        }
+        LOG(WARNING) << "Auto-splitting buffer " << addr << " (" << length
+                     << " bytes) into " << chunks.size()
+                     << " chunks of <= " << chunk_limit
+                     << " bytes each (device max_mr_size; Mooncake#2017)";
     } else {
-        for (size_t i = 0; i < context_list_.size(); ++i) {
-            int ret = context_list_[i]->registerMemoryRegion(addr, length,
-                                                             access_rights);
-            if (ret) {
-                LOG(ERROR) << "Failed to register memory region with context "
-                           << i;
-                return ret;
-            }
-        }
+        chunks.emplace_back(addr, length);
     }
 
-    auto reg_end = std::chrono::steady_clock::now();
-    auto reg_duration_ms =
-        std::chrono::duration_cast<std::chrono::milliseconds>(reg_end -
-                                                              reg_start)
-            .count();
-
-    if (globalConfig().trace) {
-        LOG(INFO) << "registerMemoryRegion: addr=" << addr
-                  << ", length=" << length
-                  << ", contexts=" << context_list_.size()
-                  << ", parallel=" << (use_parallel_reg ? "true" : "false")
-                  << ", duration=" << reg_duration_ms << "ms";
-    }
-
-    // Collect keys from all contexts
-    for (auto &context : context_list_) {
-        buffer_desc.lkey.push_back(context->lkey(addr));
-        buffer_desc.rkey.push_back(context->rkey(addr));
-    }
-
-    // Get the memory location automatically after registered MR(pinned),
-    // when the name is kWildcardLocation("*").
+    // Resolve the location name once, from the original buffer.
+    std::string resolved_name;
     if (name == kWildcardLocation) {
         bool only_first_page = true;
         const std::vector<MemoryLocationEntry> entries =
             getMemoryLocation(addr, length, only_first_page);
         if (entries.empty()) return -1;
-        buffer_desc.name = entries[0].location;
+        resolved_name = entries[0].location;
     } else {
-        buffer_desc.name = name;
+        resolved_name = name;
     }
 
-    buffer_desc.addr = (uint64_t)addr;
-    buffer_desc.length = length;
-    int rc = metadata_->addLocalMemoryBuffer(buffer_desc, update_metadata);
-    if (rc) return rc;
+    // Export a single dma_buf fd for the whole buffer and import it into every
+    // NIC's PD during each chunk's registration below (one dma_buf object
+    // shared across NICs keeps a single BAR1 window for the buffer instead of
+    // one per NIC). Host memory yields an empty export (plain ibv_reg_mr). The
+    // fd must stay open across every registration that consumes it (each MR
+    // takes its own reference), so it is closed once, on any return path, by
+    // the RAII guard below.
+    DmabufExport dmabuf_exp;
+    if (!context_list_.empty()) {
+        int eret = RdmaContext::exportDmabuf(addr, dmabuf_exp);
+        if (eret != 0) {
+            LOG(ERROR) << "Failed to export dma_buf for addr=" << addr;
+            return eret;
+        }
+    }
+    struct DmabufCloser {
+        DmabufExport &exp;
+        ~DmabufCloser() { RdmaContext::closeDmabufExport(exp); }
+    } dmabuf_closer{dmabuf_exp};
+
+    // Best-effort unregister of ONE chunk's MRs across all contexts. Used to
+    // clean up a chunk whose registration failed part-way (some contexts
+    // succeeded, one failed) BEFORE its metadata was committed — that chunk is
+    // not a "committed" chunk, so rollbackChunks() below must not touch its
+    // (never-added) metadata, but its partial MRs still need releasing.
+    auto unregisterChunkMRs = [&](void *chunk_addr) {
+        for (auto &context : context_list_) {
+            int ret = context->unregisterMemoryRegion(chunk_addr);
+            if (ret)
+                LOG(WARNING) << "Rollback: failed to unregister chunk MR at "
+                             << chunk_addr << " (ret=" << ret << ")";
+        }
+    };
+
+    // Best-effort rollback of the first `committed` FULLY-committed chunks
+    // (metadata added to the local segment desc AND MRs registered), i.e.
+    // chunks [0, committed). Pass the count of chunks whose
+    // addLocalMemoryBuffer has succeeded — `committed == 0` is a no-op (nothing
+    // to undo). Metadata is removed WITHOUT a per-chunk publish; one
+    // updateLocalSegmentDesc() at the end republishes the cleaned desc.
+    auto rollbackChunks = [&](size_t committed) {
+        size_t n = std::min(committed, chunks.size());
+        for (size_t ri = 0; ri < n; ++ri) {
+            int rc = metadata_->removeLocalMemoryBuffer(
+                chunks[ri].first, /*update_metadata=*/false);
+            if (rc)
+                LOG(WARNING) << "Rollback: failed to remove metadata for chunk "
+                                "at "
+                             << chunks[ri].first << " (ret=" << rc << ")";
+            unregisterChunkMRs(chunks[ri].first);
+        }
+        if (n > 0 && update_metadata) metadata_->updateLocalSegmentDesc();
+    };
+
+    // Pre-touch decision is loop-invariant: it depends only on context_list_,
+    // hardware_concurrency(), and the ORIGINAL buffer length (never chunk_len,
+    // which is capped at max_mr_size and would silently disable pre-touch for a
+    // >=4GiB buffer). Compute once above the loop to avoid repeated
+    // hardware_concurrency() OS queries per chunk.
+    const bool do_pre_touch = context_list_.size() > 0 &&
+                              std::thread::hardware_concurrency() >= 4 &&
+                              length >= (size_t)4 * 1024 * 1024 * 1024;
+
+    for (size_t ci = 0; ci < chunks.size(); ++ci) {
+        void *chunk_addr = chunks[ci].first;
+        size_t chunk_len = chunks[ci].second;
+        const uint64_t chunk_offset = reinterpret_cast<uintptr_t>(chunk_addr) -
+                                      reinterpret_cast<uintptr_t>(addr);
+        DmabufExport chunk_dmabuf_exp = dmabuf_exp;
+        if (chunk_dmabuf_exp.method == DmabufExport::Method::kDmabufReg)
+            chunk_dmabuf_exp.offset += chunk_offset;
+
+        if (do_pre_touch) {
+            // Parallel pre-touch the memory to speed up registration.
+            int ret = preTouchMemory(chunk_addr, chunk_len);
+            if (ret != 0) {
+                // pre-touch is before MR registration for chunk ci, so ci has
+                // no MR/metadata yet: roll back only committed chunks [0, ci).
+                rollbackChunks(ci);
+                return ret;
+            }
+        }
+
+        /* Parallel register when:
+        1. parallel_reg_mr is enabled via MC_ENABLE_PARALLEL_REG_MR;
+        2. parallel_reg_mr not set, multiple contexts exist, memory pre-touched.
+        force_sequential is used by batch operations to avoid nested
+        parallelism.
+        */
+        int use_parallel_reg = 0;
+        if (!force_sequential) {
+            use_parallel_reg = globalConfig().parallel_reg_mr;
+            if (use_parallel_reg == -1) {
+                use_parallel_reg = context_list_.size() > 1 && do_pre_touch;
+            }
+        }
+
+        auto reg_start = std::chrono::steady_clock::now();
+
+        if (use_parallel_reg) {
+            std::vector<std::thread> reg_threads;
+            reg_threads.reserve(context_list_.size());
+            std::vector<int> ret_codes(context_list_.size(), 0);
+            const int ar = access_rights;  // Local copy for lambda capture
+
+            for (size_t i = 0; i < context_list_.size(); ++i) {
+                reg_threads.emplace_back([this, &ret_codes, chunk_dmabuf_exp, i,
+                                          chunk_addr, chunk_len, ar]() {
+                    ret_codes[i] = context_list_[i]->registerMemoryRegion(
+                        chunk_addr, chunk_len, ar, chunk_dmabuf_exp);
+                });
+            }
+
+            for (auto &thread : reg_threads) thread.join();
+
+            for (size_t i = 0; i < ret_codes.size(); ++i) {
+                if (ret_codes[i] != 0) {
+                    LOG(ERROR) << "Failed to register memory region (chunk "
+                               << ci << ") with context " << i;
+                    // chunk ci's MRs are partially registered but its metadata
+                    // was never added; release ci's MRs, then roll back the
+                    // committed chunks [0, ci).
+                    unregisterChunkMRs(chunk_addr);
+                    rollbackChunks(ci);
+                    return ret_codes[i];
+                }
+            }
+        } else {
+            for (size_t i = 0; i < context_list_.size(); ++i) {
+                int ret = context_list_[i]->registerMemoryRegion(
+                    chunk_addr, chunk_len, access_rights, chunk_dmabuf_exp);
+                if (ret) {
+                    LOG(ERROR) << "Failed to register memory region (chunk "
+                               << ci << ") with context " << i;
+                    // chunk ci's MRs are partially registered but its metadata
+                    // was never added; release ci's MRs, then roll back [0,
+                    // ci).
+                    unregisterChunkMRs(chunk_addr);
+                    rollbackChunks(ci);
+                    return ret;
+                }
+            }
+        }
+
+        auto reg_end = std::chrono::steady_clock::now();
+        auto reg_duration_ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(reg_end -
+                                                                  reg_start)
+                .count();
+        if (globalConfig().trace) {
+            LOG(INFO) << "registerMemoryRegion: chunk " << ci << "/"
+                      << chunks.size() << ", addr=" << chunk_addr
+                      << ", length=" << chunk_len
+                      << ", contexts=" << context_list_.size()
+                      << ", parallel=" << (use_parallel_reg ? "true" : "false")
+                      << ", duration=" << reg_duration_ms << "ms";
+        }
+
+        // Collect per-context keys for THIS chunk (address-range lookup).
+        BufferDesc buffer_desc;
+        for (auto &context : context_list_) {
+            buffer_desc.lkey.push_back(context->lkey(chunk_addr));
+            if (remote_accessible)
+                buffer_desc.rkey.push_back(context->rkey(chunk_addr));
+        }
+        buffer_desc.name = resolved_name;
+        buffer_desc.addr = (uint64_t)chunk_addr;
+        buffer_desc.length = chunk_len;
+#ifdef ENABLE_MULTI_PROTOCOL
+        buffer_desc.protocol = "rdma";
+#endif
+        // Add to the LOCAL segment desc only (update_metadata=false); a chunked
+        // buffer otherwise publishes to the metadata server once PER CHUNK. We
+        // publish once, below, after every chunk has been added.
+        int rc = metadata_->addLocalMemoryBuffer(buffer_desc,
+                                                 /*update_metadata=*/false);
+        if (rc) {
+            // ci's MRs are registered but its metadata add failed; release ci's
+            // MRs, then roll back the committed chunks [0, ci).
+            unregisterChunkMRs(chunk_addr);
+            rollbackChunks(ci);
+            return rc;
+        }
+    }
+
+    // Publish the accumulated per-chunk BufferDescs in a SINGLE metadata update
+    // (a chunked buffer otherwise publishes once per chunk).
+    if (update_metadata) {
+        int rc = metadata_->updateLocalSegmentDesc();
+        if (rc) {
+            rollbackChunks(chunks.size());
+            return rc;
+        }
+    }
+
+    // Remember chunk start-addresses so unregisterLocalMemory(addr) (which only
+    // gets the base addr) can clean up every chunk.
+    if (chunks.size() > 1) {
+        std::lock_guard<std::mutex> lock(chunk_map_mutex_);
+        std::vector<uint64_t> chunk_addrs;
+        chunk_addrs.reserve(chunks.size());
+        for (auto &c : chunks) chunk_addrs.push_back((uint64_t)c.first);
+        chunk_map_[(uint64_t)addr] = std::move(chunk_addrs);
+    }
     return 0;
 }
 
@@ -306,6 +542,80 @@ int RdmaTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
 int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
                                                  bool update_metadata,
                                                  bool force_sequential) {
+    // Mooncake#2017: if this base buffer was split into chunks at registration,
+    // unregister each chunk's MR + metadata entry (unregisterLocalMemory only
+    // receives the base addr).
+    std::vector<uint64_t> chunk_addrs;
+    {
+        std::lock_guard<std::mutex> lock(chunk_map_mutex_);
+        auto it = chunk_map_.find((uint64_t)addr);
+        if (it != chunk_map_.end()) {
+            chunk_addrs = std::move(it->second);
+            chunk_map_.erase(it);
+        }
+    }
+    if (!chunk_addrs.empty()) {
+        // Unregister EVERY chunk even if one fails; chunk_map_ was already
+        // erased, so an early return would leak the remaining chunks' MRs +
+        // metadata. Remember the first error and report it at the end.
+        int first_err = 0;
+
+        // Metadata: remove each chunk from the local desc WITHOUT publishing (a
+        // chunked buffer otherwise publishes to the metadata server once per
+        // chunk); publish once after all removals, below.
+        for (uint64_t ca : chunk_addrs) {
+            int rc = metadata_->removeLocalMemoryBuffer(
+                reinterpret_cast<void *>(ca), /*update_metadata=*/false);
+            if (rc && !first_err) first_err = rc;
+        }
+
+        // MRs: unregister across contexts in PARALLEL (one thread per context,
+        // each releasing all chunks) — the previous code did chunks × contexts
+        // fully sequentially (e.g. 4 chunks × 8 NICs = 32 sequential
+        // ibv_dereg_mr). Mirrors the parallel path used for single buffers.
+        int use_parallel_unreg = 0;
+        if (!force_sequential) {
+            use_parallel_unreg = globalConfig().parallel_reg_mr;
+            if (use_parallel_unreg == -1)
+                use_parallel_unreg = context_list_.size() > 1;
+        }
+        if (use_parallel_unreg) {
+            std::vector<std::thread> threads;
+            threads.reserve(context_list_.size());
+            std::vector<int> ret_codes(context_list_.size(), 0);
+            for (size_t i = 0; i < context_list_.size(); ++i) {
+                threads.emplace_back([this, &ret_codes, i, &chunk_addrs]() {
+                    for (uint64_t ca : chunk_addrs) {
+                        int ret = context_list_[i]->unregisterMemoryRegion(
+                            reinterpret_cast<void *>(ca));
+                        if (ret && !ret_codes[i]) ret_codes[i] = ret;
+                    }
+                });
+            }
+            for (auto &t : threads) t.join();
+            for (int rc : ret_codes)
+                if (rc && !first_err) first_err = rc;
+        } else {
+            for (uint64_t ca : chunk_addrs)
+                for (auto &context : context_list_) {
+                    int ret = context->unregisterMemoryRegion(
+                        reinterpret_cast<void *>(ca));
+                    if (ret) {
+                        LOG(ERROR) << "Failed to unregister chunk MR at "
+                                   << reinterpret_cast<void *>(ca);
+                        if (!first_err) first_err = ret;
+                    }
+                }
+        }
+
+        // Single metadata publish covering all removed chunks.
+        if (update_metadata) {
+            int rc = metadata_->updateLocalSegmentDesc();
+            if (rc && !first_err) first_err = rc;
+        }
+        return first_err;
+    }
+
     int rc = metadata_->removeLocalMemoryBuffer(addr, update_metadata);
     if (rc) return rc;
 
@@ -355,10 +665,20 @@ int RdmaTransport::unregisterLocalMemoryInternal(void *addr,
 }
 
 int RdmaTransport::allocateLocalSegmentID() {
-    auto desc = std::make_shared<SegmentDesc>();
-    if (!desc) return ERR_MEMORY;
+    auto desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    if (!desc) desc = std::make_shared<SegmentDesc>();
     desc->name = local_server_name_;
+    // Store RDMA server name for dual-NIC setups; when it differs from
+    // local_server_name_ the peer will use it for NIC path construction.
+    if (rdma_server_name_ != local_server_name_) {
+        desc->rdma_server_name = rdma_server_name_;
+    }
+#ifdef ENABLE_MULTI_PROTOCOL
+    if (!desc->protocol.empty()) desc->protocol += ",";
+    desc->protocol += "rdma";
+#else
     desc->protocol = "rdma";
+#endif
     for (auto &entry : context_list_) {
         TransferMetadata::DeviceDesc device_desc;
         device_desc.name = entry->deviceName();
@@ -372,36 +692,76 @@ int RdmaTransport::allocateLocalSegmentID() {
     return 0;
 }
 
+int RdmaTransport::refreshLocalDeviceDesc(const std::string &device_name,
+                                          uint16_t lid,
+                                          const std::string &gid) {
+    std::lock_guard<std::mutex> guard(local_desc_lock_);
+    auto original_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
+    if (!original_desc) {
+        return ERR_ADDRESS_NOT_REGISTERED;
+    }
+
+    auto updated_desc = std::make_shared<SegmentDesc>(*original_desc);
+    for (auto &device : updated_desc->devices) {
+        if (device.name != device_name) continue;
+        device.lid = lid;
+        device.gid = gid;
+        metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
+                                   std::move(updated_desc));
+        int ret = metadata_->updateLocalSegmentDesc();
+        if (ret) {
+            auto rollback_desc = original_desc;
+            metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
+                                       std::move(rollback_desc));
+        }
+        return ret;
+    }
+
+    return ERR_DEVICE_NOT_FOUND;
+}
+
 int RdmaTransport::registerLocalMemoryBatch(
     const std::vector<RdmaTransport::BufferEntry> &buffer_list,
     const std::string &location) {
-#if !defined(WITH_NVIDIA_PEERMEM) && defined(USE_CUDA)
-    for (auto &buffer : buffer_list) {
-        int ret = registerLocalMemory(buffer.addr, buffer.length, location,
-                                      true, false);
-        if (ret) {
-            LOG(WARNING) << "RdmaTransport: Failed to register memory: addr "
-                         << buffer.addr << " length " << buffer.length;
+#if defined(USE_CUDA) || defined(USE_SUPA)
+    if (!Environ::Get().GetWithNvidiaPeermem()) {
+        for (auto &buffer : buffer_list) {
+            int ret = registerLocalMemory(buffer.addr, buffer.length, location,
+                                          true, false);
+            if (ret) {
+                LOG(WARNING)
+                    << "RdmaTransport: Failed to register memory: addr "
+                    << buffer.addr << " length " << buffer.length;
+                return ret;
+            }
         }
-    }
-#else
-    std::vector<std::future<int>> results;
-    for (auto &buffer : buffer_list) {
-        results.emplace_back(
-            std::async(std::launch::async, [this, buffer, location]() -> int {
-                // Use force_sequential=true to avoid nested parallelism
-                return registerLocalMemoryInternal(buffer.addr, buffer.length,
-                                                   location, true, false, true);
-            }));
-    }
+    } else {
+#endif
+        std::vector<std::future<int>> results;
+        for (auto &buffer : buffer_list) {
+            results.emplace_back(std::async(
+                std::launch::async, [this, buffer, location]() -> int {
+                    // Use force_sequential=true to avoid nested parallelism
+                    return registerLocalMemoryInternal(buffer.addr,
+                                                       buffer.length, location,
+                                                       true, false, true);
+                }));
+        }
 
-    for (size_t i = 0; i < buffer_list.size(); ++i) {
-        if (results[i].get()) {
-            LOG(WARNING) << "RdmaTransport: Failed to register memory: addr "
-                         << buffer_list[i].addr << " length "
-                         << buffer_list[i].length;
+        int first_error = 0;
+        for (size_t i = 0; i < buffer_list.size(); ++i) {
+            int ret = results[i].get();
+            if (ret) {
+                LOG(WARNING)
+                    << "RdmaTransport: Failed to register memory: addr "
+                    << buffer_list[i].addr << " length "
+                    << buffer_list[i].length;
+                if (!first_error) first_error = ret;
+            }
         }
-    }
+        if (first_error) return first_error;
+#if defined(USE_CUDA) || defined(USE_SUPA)
+    }  // Environ::Get().GetWithNvidiaPeermem()
 #endif
 
     return metadata_->updateLocalSegmentDesc();
@@ -418,13 +778,17 @@ int RdmaTransport::unregisterLocalMemoryBatch(
             }));
     }
 
+    int first_error = 0;
     for (size_t i = 0; i < addr_list.size(); ++i) {
-        if (results[i].get())
+        int ret = results[i].get();
+        if (ret) {
             LOG(WARNING) << "RdmaTransport: Failed to unregister memory: addr "
                          << addr_list[i];
+            if (!first_error) first_error = ret;
+        }
     }
-
-    return metadata_->updateLocalSegmentDesc();
+    int metadata_ret = metadata_->updateLocalSegmentDesc();
+    return first_error ? first_error : metadata_ret;
 }
 
 Status RdmaTransport::submitTransfer(
@@ -441,7 +805,17 @@ Status RdmaTransport::submitTransfer(
     size_t task_id = batch_desc.task_list.size();
     batch_desc.task_list.resize(task_id + entries.size());
     std::vector<TransferTask *> task_list;
-    for (auto &task : batch_desc.task_list) task_list.push_back(&task);
+    for (auto &request : entries) {
+        auto &task = batch_desc.task_list[task_id];
+        ++task_id;
+        task.batch_id = batch_id;
+#ifdef USE_ASCEND_HETEROGENEOUS
+        task.request = const_cast<TransferRequest *>(&request);
+#else
+        task.request = &request;
+#endif
+        task_list.push_back(&task);
+    }
     return submitTransferTask(task_list);
 }
 
@@ -449,6 +823,8 @@ Status RdmaTransport::submitTransferTask(
     const std::vector<TransferTask *> &task_list) {
     std::unordered_map<std::shared_ptr<RdmaContext>, std::vector<Slice *>>
         slices_to_post;
+    std::unordered_map<SegmentID, std::shared_ptr<SegmentDesc>>
+        target_segment_descs;
     auto local_segment_desc = metadata_->getSegmentDescByID(LOCAL_SEGMENT_ID);
     assert(local_segment_desc.get());
     const size_t kBlockSize = globalConfig().slice_size;
@@ -456,6 +832,38 @@ Status RdmaTransport::submitTransferTask(
     const size_t kFragmentSize = globalConfig().fragment_limit;
     const size_t kSubmitWatermark =
         globalConfig().max_wr * globalConfig().num_qp_per_ep;
+    auto fail_unposted_slices = [&]() {
+        for (auto &entry : slices_to_post)
+            for (auto *slice : entry.second) slice->markFailed();
+        slices_to_post.clear();
+    };
+
+    // Fabricate a zero-length failed slice for unstarted tasks so that the
+    // existing success + failed == slice_count terminal check can drive the
+    // task to FAILED without special-casing, and ~TransferTask reclaims the
+    // slice.
+    auto fail_unstarted_tasks = [&](size_t first_task_index) {
+        for (size_t i = first_task_index; i < task_list.size(); ++i) {
+            auto &task = *task_list[i];
+            Slice *slice = getSliceCache().allocate();
+            assert(slice);
+            slice->source_addr = nullptr;
+            slice->length = 0;
+            slice->task = &task;
+            slice->status = Slice::PENDING;
+            task.slice_list.push_back(slice);
+            __sync_fetch_and_add(&task.slice_count, 1);
+            slice->markFailed();
+        }
+    };
+    auto fail_task_and_cleanup = [&](TransferTask &task, Slice *slice,
+                                     size_t task_index) {
+        task.total_bytes += slice->length;
+        __sync_fetch_and_add(&task.slice_count, 1);
+        slice->markFailed();
+        fail_unposted_slices();
+        fail_unstarted_tasks(task_index + 1);
+    };
     uint64_t nr_slices;
     for (size_t index = 0; index < task_list.size(); ++index) {
         assert(task_list[index]);
@@ -463,6 +871,15 @@ Status RdmaTransport::submitTransferTask(
         nr_slices = 0;
         assert(task.request);
         auto &request = *task.request;
+        auto target_desc_it = target_segment_descs.find(request.target_id);
+        if (target_desc_it == target_segment_descs.end()) {
+            target_desc_it =
+                target_segment_descs
+                    .emplace(request.target_id,
+                             metadata_->getSegmentDescByID(request.target_id))
+                    .first;
+        }
+        const auto &target_segment_desc = target_desc_it->second;
 
         auto request_buffer_id = -1, request_device_id = -1;
         if (selectDevice(local_segment_desc.get(), (uint64_t)request.source,
@@ -472,20 +889,21 @@ Status RdmaTransport::submitTransferTask(
             request_device_id = -1;
         }
 
-        for (uint64_t offset = 0; offset < request.length;
-             offset += kBlockSize) {
+        SliceLengthCalculator slice_calc{request, kBlockSize, kFragmentSize,
+                                         local_segment_desc.get(),
+                                         target_segment_desc.get()};
+        for (uint64_t offset = 0; offset < request.length;) {
+            size_t slice_length = slice_calc.calculate(offset);
+
             Slice *slice = getSliceCache().allocate();
             assert(slice);
             if (!slice->from_cache) {
                 nr_slices++;
             }
 
-            bool merge_final_slice =
-                request.length - offset <= kBlockSize + kFragmentSize;
-
             slice->source_addr = (char *)request.source + offset;
-            slice->length =
-                merge_final_slice ? request.length - offset : kBlockSize;
+            slice->length = slice_length;
+            slice->source_location.clear();
             slice->opcode = request.opcode;
             slice->rdma.dest_addr = request.target_offset + offset;
             slice->rdma.retry_cnt = request.advise_retry_cnt;
@@ -500,9 +918,12 @@ Status RdmaTransport::submitTransferTask(
                 retry_cnt = request.advise_retry_cnt;
             bool found_device = false;
             if (request_buffer_id >= 0 && request_device_id >= 0) {
-                found_device = true;
-                buffer_id = request_buffer_id;
-                device_id = request_device_id;
+                auto &request_context = context_list_[request_device_id];
+                if (request_context && request_context->active()) {
+                    found_device = true;
+                    buffer_id = request_buffer_id;
+                    device_id = request_device_id;
+                }
             }
             while (retry_cnt < kMaxRetryCount && !found_device) {
                 if (selectDevice(local_segment_desc.get(),
@@ -524,8 +945,7 @@ Status RdmaTransport::submitTransferTask(
             }
             if (!found_device) {
                 auto source_addr = slice->source_addr;
-                for (auto &entry : slices_to_post)
-                    for (auto s : entry.second) getSliceCache().deallocate(s);
+                fail_task_and_cleanup(task, slice, index);
                 LOG(ERROR)
                     << "Memory region not registered by any active device(s): "
                     << source_addr;
@@ -535,6 +955,7 @@ Status RdmaTransport::submitTransferTask(
             } else {
                 auto &context = context_list_[device_id];
                 if (!context->active()) {
+                    fail_task_and_cleanup(task, slice, index);
                     LOG(ERROR) << "Device " << device_id << " is not active";
                     return Status::InvalidArgument("Device " +
                                                    std::to_string(device_id) +
@@ -542,6 +963,11 @@ Status RdmaTransport::submitTransferTask(
                 }
                 slice->rdma.source_lkey =
                     local_segment_desc->buffers[buffer_id].lkey[device_id];
+                if (globalConfig().log_rdma_slice_affinity) {
+                    slice->source_location = resolveBufferLocation(
+                        local_segment_desc->buffers[buffer_id],
+                        reinterpret_cast<uint64_t>(slice->source_addr));
+                }
                 slices_to_post[context].push_back(slice);
                 task.total_bytes += slice->length;
                 __sync_fetch_and_add(&task.slice_count, 1);
@@ -554,9 +980,7 @@ Status RdmaTransport::submitTransferTask(
                 nr_slices = 0;
             }
 
-            if (merge_final_slice) {
-                break;
-            }
+            offset += slice->length;
         }
     }
 
@@ -621,7 +1045,11 @@ RdmaTransport::SegmentID RdmaTransport::getSegmentID(
 int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
                                           HandShakeDesc &local_desc) {
     auto local_nic_name = getNicNameFromNicPath(peer_desc.peer_nic_path);
-    if (local_nic_name.empty()) return ERR_INVALID_ARGUMENT;
+    if (local_nic_name.empty()) {
+        local_desc.reply_msg =
+            "Invalid peer_nic_path in handshake: " + peer_desc.peer_nic_path;
+        return ERR_INVALID_ARGUMENT;
+    }
 
     std::shared_ptr<RdmaContext> context;
     int index = 0;
@@ -632,14 +1060,43 @@ int RdmaTransport::onSetupRdmaConnections(const HandShakeDesc &peer_desc,
         }
         index++;
     }
-    if (!context) return ERR_INVALID_ARGUMENT;
+    if (!context) {
+        local_desc.reply_msg =
+            "Local RDMA context not found for handshake NIC: " + local_nic_name;
+        return ERR_INVALID_ARGUMENT;
+    }
 
-#ifdef CONFIG_ERDMA
-    if (context->deleteEndpoint(peer_desc.local_nic_path)) return ERR_ENDPOINT;
-#endif
+    // Use existing endpoint or create new one.
     auto endpoint = context->endpoint(peer_desc.local_nic_path);
-    if (!endpoint) return ERR_ENDPOINT;
-    return endpoint->setupConnectionsByPassive(peer_desc, local_desc);
+    if (!endpoint) {
+        local_desc.reply_msg = "Local RDMA endpoint unavailable for " +
+                               local_nic_name + " <- " +
+                               peer_desc.local_nic_path;
+        return ERR_ENDPOINT;
+    }
+    int ret = endpoint->setupConnectionsByPassive(peer_desc, local_desc);
+    if (endpoint->retired()) {
+        context->deleteEndpointByPtr(endpoint.get());
+        if (ret == ERR_ENDPOINT) {
+            // setupConnectionsByPassive() can retire a stale endpoint before
+            // creating a usable passive connection for this incoming handshake.
+            // That is a local endpoint-store race, not necessarily a peer
+            // handshake failure, so absorb it once with a fresh endpoint.
+            local_desc = HandShakeDesc();
+            endpoint = context->endpoint(peer_desc.local_nic_path);
+            if (!endpoint) {
+                local_desc.reply_msg =
+                    "Fresh local RDMA endpoint unavailable after retiring "
+                    "stale endpoint for " +
+                    local_nic_name + " <- " + peer_desc.local_nic_path;
+                return ERR_ENDPOINT;
+            }
+            ret = endpoint->setupConnectionsByPassive(peer_desc, local_desc);
+            if (endpoint->retired())
+                context->deleteEndpointByPtr(endpoint.get());
+        }
+    }
+    return ret;
 }
 
 int RdmaTransport::initializeRdmaResources() {
@@ -654,6 +1111,16 @@ int RdmaTransport::initializeRdmaResources() {
         if (ret) {
             local_topology_->disableDevice(device_name);
             LOG(WARNING) << "Disable device " << device_name;
+            // Keep context_list_ index-aligned with getHcaList(): both it and
+            // BufferDesc::lkey are subscripted by the HCA index, which
+            // disableDevice() leaves in place. Dropping a slot would make a
+            // later device_id name the wrong RNIC or run off the end. A
+            // never-constructed context is an inert placeholder; the partially
+            // built one is released so it does not pin an open uverbs fd.
+            auto placeholder =
+                std::make_shared<RdmaContext>(*this, device_name);
+            placeholder->set_active(false);
+            context_list_.push_back(std::move(placeholder));
         } else {
             context_list_.push_back(context);
         }
@@ -685,21 +1152,73 @@ int RdmaTransport::selectDevice(SegmentDesc *desc, uint64_t offset,
          ++buffer_id) {
         const auto &buffer = buffers[buffer_id];
 
+#ifdef ENABLE_MULTI_PROTOCOL
+        // The RDMA transport must only bind buffers registered under the rdma
+        // protocol. Device (hip) buffers alias the same GPU addresses but carry
+        // no lkey/rkey, so picking one yields an empty-lkey out-of-bounds read
+        // in the submit path. The !empty() guard leaves legacy single-protocol
+        // descriptors (empty protocol field) unaffected.
+        if (!buffer.protocol.empty() && buffer.protocol != "rdma") {
+            continue;
+        }
+#endif
+
         // Check if offset is within buffer range
         if (offset < buffer.addr || length > buffer.length ||
             offset - buffer.addr > buffer.length - length) {
             continue;
         }
 
+        // Resolve NUMA-aware location for segmented buffers
+        std::string location = buffer.name;
+        SegmentsLocationInfo seg_info;
+        if (parseSegmentsLocation(buffer.name, seg_info)) {
+            location = resolveSegmentsLocation(seg_info, buffer.length,
+                                               offset - buffer.addr);
+        }
+
         device_id =
             hint.empty()
-                ? desc->topology.selectDevice(buffer.name, retry_count)
-                : desc->topology.selectDevice(buffer.name, hint, retry_count);
+                ? desc->topology.selectDevice(location, retry_count)
+                : desc->topology.selectDevice(location, hint, retry_count);
         if (device_id >= 0) return 0;
         device_id = hint.empty() ? desc->topology.selectDevice(
                                        kWildcardLocation, retry_count)
                                  : desc->topology.selectDevice(
                                        kWildcardLocation, hint, retry_count);
+        if (device_id >= 0) return 0;
+    }
+    return ERR_ADDRESS_NOT_REGISTERED;
+}
+
+int RdmaTransport::selectDeviceByLocalHca(SegmentDesc *desc, uint64_t offset,
+                                          size_t length,
+                                          std::string_view local_hca,
+                                          int &buffer_id, int &device_id,
+                                          int retry_count) {
+    if (desc == nullptr) return ERR_ADDRESS_NOT_REGISTERED;
+    const auto &buffers = desc->buffers;
+    for (buffer_id = 0; buffer_id < static_cast<int>(buffers.size());
+         ++buffer_id) {
+        const auto &buffer = buffers[buffer_id];
+
+#ifdef ENABLE_MULTI_PROTOCOL
+        if (!buffer.protocol.empty() && buffer.protocol != "rdma") {
+            continue;
+        }
+#endif
+
+        if (offset < buffer.addr || length > buffer.length ||
+            offset - buffer.addr > buffer.length - length) {
+            continue;
+        }
+
+        const auto location = resolveBufferLocation(buffer, offset);
+        device_id = desc->topology.selectDeviceByLocalHca(location, local_hca,
+                                                          retry_count);
+        if (device_id >= 0) return 0;
+        device_id = desc->topology.selectDeviceByLocalHca(
+            kWildcardLocation, local_hca, retry_count);
         if (device_id >= 0) return 0;
     }
     return ERR_ADDRESS_NOT_REGISTERED;

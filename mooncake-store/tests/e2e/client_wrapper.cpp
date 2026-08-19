@@ -3,16 +3,14 @@
 #include <cstring>
 #include <stdexcept>
 
-#include "p2p_client_service.h"
 #include "utils.h"
 
 namespace mooncake {
 namespace testing {
 
-ClientTestWrapper::ClientTestWrapper(std::shared_ptr<ClientService> client,
-                                     std::shared_ptr<SimpleAllocator> allocator,
-                                     bool is_p2p)
-    : client_(client), is_p2p_(is_p2p), allocator_(allocator) {}
+ClientTestWrapper::ClientTestWrapper(std::shared_ptr<Client> client,
+                                     std::shared_ptr<SimpleAllocator> allocator)
+    : client_(client), allocator_(allocator) {}
 
 ClientTestWrapper::~ClientTestWrapper() {
     for (auto& [base, segment] : segments_) {
@@ -21,56 +19,22 @@ ClientTestWrapper::~ClientTestWrapper() {
 }
 
 std::optional<std::shared_ptr<ClientTestWrapper>>
-ClientTestWrapper::CreateClientWrapper(
-    const std::string& hostname, const std::string& metadata_connstring,
-    const std::string& protocol, const std::string& device_name,
-    const std::string& master_server_entry, size_t local_buffer_size,
-    const std::string& redis_cluster_id, bool enable_http_server,
-    const std::string& deployment_mode,
-    const std::string& p2p_local_transfer_mode, uint16_t p2p_client_rpc_port,
-    const std::string& redis_username, const std::string& redis_password) {
-    std::shared_ptr<ClientService> client;
-    if (deployment_mode == "P2P") {
-        static constexpr const char* kP2PTierConfig =
-            R"({"tiers": [{"type": "DRAM", "capacity": 67108864, "priority": 100}]})";
-        auto config = ClientConfigBuilder::build_p2p_real_client(
-            hostname, metadata_connstring, protocol, device_name,
-            master_server_entry, kP2PTierConfig, local_buffer_size, nullptr, "",
-            p2p_client_rpc_port, /*rpc_thread_num=*/2,
-            /*lock_shard_count=*/1024,
-            /*route_cache_max_memory_bytes=*/300 * 1024 * 1024,
-            /*route_cache_ttl_ms=*/60 * 1000, p2p_local_transfer_mode,
-            /*local_memcpy_async_worker_num=*/32, /*http_port=*/9003,
-            enable_http_server);
-        if (!redis_cluster_id.empty()) {
-            config.redis_cluster_id = redis_cluster_id;
-        }
-        config.redis_username = redis_username;
-        config.redis_password = redis_password;
-        auto p2p_client = std::make_shared<P2PClientService>(
-            config.metadata_connstring, config.http_port,
-            config.enable_http_server, config.labels);
-        auto err = p2p_client->Init(config);
-        if (err != ErrorCode::OK) {
-            LOG(ERROR) << "failed to init P2P client, error=" << err;
-            return std::nullopt;
-        }
-        client = std::move(p2p_client);
-    } else {
-        auto config = ClientConfigBuilder::build_centralized_real_client(
-            hostname, metadata_connstring, protocol, device_name,
-            master_server_entry, 0, local_buffer_size, nullptr, "", false, 9003,
-            enable_http_server);
-        if (!redis_cluster_id.empty()) {
-            config.redis_cluster_id = redis_cluster_id;
-        }
-        config.redis_username = redis_username;
-        config.redis_password = redis_password;
-        auto client_opt = ClientService::Create(config);
-        if (!client_opt.has_value()) {
-            return std::nullopt;
-        }
-        client = client_opt.value();
+ClientTestWrapper::CreateClientWrapper(const std::string& hostname,
+                                       const std::string& metadata_connstring,
+                                       const std::string& protocol,
+                                       const std::string& device_name,
+                                       const std::string& master_server_entry,
+                                       size_t local_buffer_size) {
+    std::optional<std::string> device_names = std::nullopt;
+    if (!device_name.empty()) {
+        device_names = device_name;
+    }
+
+    auto client_opt = Client::Create(hostname, metadata_connstring, protocol,
+                                     device_names, master_server_entry);
+
+    if (!client_opt.has_value()) {
+        return std::nullopt;
     }
 
     std::shared_ptr<SimpleAllocator> allocator =
@@ -80,7 +44,7 @@ ClientTestWrapper::CreateClientWrapper(
         return std::nullopt;
     }
 
-    auto register_result = client->RegisterLocalMemory(
+    auto register_result = client_opt.value()->RegisterLocalMemory(
         allocator->getBase(), local_buffer_size, "cpu:0", false, false);
     ErrorCode error_code =
         register_result.has_value() ? ErrorCode::OK : register_result.error();
@@ -90,8 +54,7 @@ ClientTestWrapper::CreateClientWrapper(
                    << ", error=" << error_code;
         return std::nullopt;
     }
-    return std::make_shared<ClientTestWrapper>(client, allocator,
-                                               deployment_mode == "P2P");
+    return std::make_shared<ClientTestWrapper>(client_opt.value(), allocator);
 }
 
 ErrorCode ClientTestWrapper::Mount(const size_t size, void*& buffer) {
@@ -139,30 +102,32 @@ ErrorCode ClientTestWrapper::Get(const std::string& key, std::string& value) {
     if (!query_result.has_value()) {
         return query_result.error();
     }
-    if (query_result.value()->replicas.empty()) {
-        return ErrorCode::INVALID_REPLICA;
-    }
-    uint64_t total_size =
-        calculate_total_size(query_result.value()->replicas[0]);
-    if (total_size == 0) {
-        value.clear();
-        return ErrorCode::OK;
+
+    const std::vector<Replica::Descriptor>& replica_list =
+        query_result.value().replicas;
+    if (replica_list.empty()) {
+        return ErrorCode::OBJECT_NOT_FOUND;
     }
 
-    void* buffer = allocator_->allocate(total_size);
-    if (!buffer) {
-        LOG(ERROR) << "Failed to allocate memory for Get";
-        throw std::runtime_error("Failed to allocate memory for Get");
+    // Create slices
+    const AllocatedBuffer::Descriptor& descriptor =
+        replica_list[0].get_memory_descriptor().buffer_descriptor;
+    SliceGuard slice_guard(descriptor.size_, allocator_);
+
+    // Perform get operation
+    auto get_result =
+        client_->Get(key, query_result.value(), slice_guard.slices_);
+    ErrorCode error_code =
+        get_result.has_value() ? ErrorCode::OK : get_result.error();
+    if (error_code != ErrorCode::OK) {
+        return error_code;
     }
 
-    auto get_result = client_->Get(key, {buffer}, {(size_t)total_size});
-    if (!get_result.has_value()) {
-        allocator_->deallocate(buffer, total_size);
-        return get_result.error();
+    // Fill value
+    value.clear();
+    for (const auto& slice : slice_guard.slices_) {
+        value.append(static_cast<const char*>(slice.ptr), slice.size);
     }
-
-    value.assign(static_cast<const char*>(buffer), total_size);
-    allocator_->deallocate(buffer, total_size);
     return ErrorCode::OK;
 }
 
@@ -176,11 +141,11 @@ ErrorCode ClientTestWrapper::Put(const std::string& key,
         offset += slice.size;
     }
 
+    // Configure replication
+    ReplicateConfig config;
+    config.replica_num = 1;
+
     // Perform put operation
-    ReplicateConfig replicate_config;
-    replicate_config.replica_num = 1;
-    WriteConfig config = is_p2p_ ? WriteConfig{WriteRouteRequestConfig{}}
-                                 : WriteConfig{replicate_config};
     auto put_result = client_->Put(key, slice_guard.slices_, config);
     return put_result.has_value() ? ErrorCode::OK : put_result.error();
 }
@@ -188,6 +153,138 @@ ErrorCode ClientTestWrapper::Put(const std::string& key,
 ErrorCode ClientTestWrapper::Delete(const std::string& key) {
     auto remove_result = client_->Remove(key);
     return remove_result.has_value() ? ErrorCode::OK : remove_result.error();
+}
+
+ErrorCode ClientTestWrapper::BatchSmoke(const std::string& key_prefix) {
+    constexpr size_t kCount = 3;
+    std::vector<std::string> keys;
+    std::vector<std::string> values;
+    std::vector<std::unique_ptr<SliceGuard>> put_guards;
+    std::vector<std::vector<Slice>> put_slices;
+    for (size_t i = 0; i < kCount; ++i) {
+        keys.push_back(key_prefix + "-" + std::to_string(i));
+        values.push_back("batch-value-" + std::to_string(i));
+        auto guard =
+            std::make_unique<SliceGuard>(values.back().size(), allocator_);
+        size_t offset = 0;
+        for (const auto& slice : guard->slices_) {
+            memcpy(slice.ptr, values.back().data() + offset, slice.size);
+            offset += slice.size;
+        }
+        put_slices.push_back(guard->slices_);
+        put_guards.push_back(std::move(guard));
+    }
+
+    ReplicateConfig config;
+    config.replica_num = 1;
+    auto put_results = client_->BatchPut(keys, put_slices, config);
+    if (put_results.size() != kCount) return ErrorCode::INTERNAL_ERROR;
+    for (const auto& result : put_results) {
+        if (!result) return result.error();
+    }
+
+    std::vector<std::string> mixed_keys = keys;
+    mixed_keys.push_back(key_prefix + "-missing");
+    auto exist_results = client_->BatchIsExist(mixed_keys);
+    if (exist_results.size() != mixed_keys.size()) {
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    for (size_t i = 0; i < kCount; ++i) {
+        if (!exist_results[i] || !*exist_results[i]) {
+            return ErrorCode::INTERNAL_ERROR;
+        }
+    }
+    if (!exist_results.back() || *exist_results.back()) {
+        return ErrorCode::INTERNAL_ERROR;
+    }
+
+    std::vector<std::unique_ptr<SliceGuard>> get_guards;
+    std::unordered_map<std::string, std::vector<Slice>> get_slices;
+    for (size_t i = 0; i < mixed_keys.size(); ++i) {
+        const size_t size = i < kCount ? values[i].size() : 1;
+        auto guard = std::make_unique<SliceGuard>(size, allocator_);
+        get_slices.emplace(mixed_keys[i], guard->slices_);
+        get_guards.push_back(std::move(guard));
+    }
+    auto get_results = client_->BatchGet(mixed_keys, get_slices);
+    if (get_results.size() != mixed_keys.size()) {
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    for (size_t i = 0; i < kCount; ++i) {
+        if (!get_results[i]) return get_results[i].error();
+        std::string actual;
+        for (const auto& slice : get_slices.at(keys[i])) {
+            actual.append(static_cast<const char*>(slice.ptr), slice.size);
+        }
+        if (actual != values[i]) return ErrorCode::INTERNAL_ERROR;
+    }
+    if (get_results.back() ||
+        get_results.back().error() != ErrorCode::OBJECT_NOT_FOUND) {
+        return ErrorCode::INTERNAL_ERROR;
+    }
+
+    auto remove_results = client_->BatchRemove(mixed_keys, /*force=*/true);
+    if (remove_results.size() != mixed_keys.size()) {
+        return ErrorCode::INTERNAL_ERROR;
+    }
+    for (size_t i = 0; i < kCount; ++i) {
+        if (!remove_results[i]) return remove_results[i].error();
+    }
+    if (remove_results.back() ||
+        remove_results.back().error() != ErrorCode::OBJECT_NOT_FOUND) {
+        return ErrorCode::INTERNAL_ERROR;
+    }
+
+    exist_results = client_->BatchIsExist(keys);
+    if (exist_results.size() != kCount) return ErrorCode::INTERNAL_ERROR;
+    for (const auto& result : exist_results) {
+        if (!result || *result) return ErrorCode::INTERNAL_ERROR;
+    }
+    return ErrorCode::OK;
+}
+
+bool ClientTestWrapper::HasDiskReplica(const std::string& key) {
+    auto query_result = client_->Query(key);
+    if (!query_result.has_value()) return false;
+    for (const auto& replica : query_result.value().replicas) {
+        if (replica.is_disk_replica()) return true;
+    }
+    return false;
+}
+
+bool ClientTestWrapper::HasLocalDiskReplica(const std::string& key) {
+    auto query_result = client_->Query(key);
+    if (!query_result.has_value()) return false;
+    for (const auto& replica : query_result.value().replicas) {
+        if (replica.is_local_disk_replica()) return true;
+    }
+    return false;
+}
+
+bool ClientTestWrapper::HasMemoryReplica(const std::string& key) {
+    auto query_result = client_->Query(key);
+    if (!query_result.has_value()) return false;
+    for (const auto& replica : query_result.value().replicas) {
+        if (replica.is_memory_replica()) return true;
+    }
+    return false;
+}
+
+ErrorCode ClientTestWrapper::GetWithExpectedSize(const std::string& key,
+                                                 size_t expected_size,
+                                                 std::string& value) {
+    SliceGuard slice_guard(expected_size, allocator_);
+    auto get_result = client_->Get(key, slice_guard.slices_);
+    ErrorCode error_code =
+        get_result.has_value() ? ErrorCode::OK : get_result.error();
+    if (error_code != ErrorCode::OK) {
+        return error_code;
+    }
+    value.clear();
+    for (const auto& slice : slice_guard.slices_) {
+        value.append(static_cast<const char*>(slice.ptr), slice.size);
+    }
+    return ErrorCode::OK;
 }
 
 ClientTestWrapper::SliceGuard::SliceGuard(

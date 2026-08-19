@@ -1,0 +1,41 @@
+name: 'Build Wheel (AWS EFA)'
+
+on:
+  workflow_call: {}
+
+# No EFA hardware is required to build. PR validation covers the CUDA and
+# non-CUDA variants with one Python version each; releases use the full matrix.
+jobs:
+  build-wheel-efa:
+    strategy:
+      matrix:
+        include:
+          - variant: cuda
+            use_cuda: "ON"
+            build_env: "EFA_BUILD"
+            cuda-version: "12.8.1"
+            python-version: "3.12"
+          - variant: cuda13
+            use_cuda: "ON"
+            build_env: "EFA_CU13_BUILD"
+            cuda-version: "13.0.2"
+            python-version: "3.12"
+          - variant: non-cuda
+            use_cuda: "OFF"
+            build_env: "EFA_NON_CUDA_BUILD"
+            cuda-version: "12.8.1"
+            python-version: "3.10"
+    uses: ./.github/workflows/_build-efa-wheel.yaml
+    with:
+      variant: ${{ matrix.variant }}
+      use-cuda: ${{ matrix.use_cuda == 'ON' }}
+      python-versions: ${{ format('["{0}"]', matrix.python-version) }}
+      build-profile: ci
+      cmake-args: >-
+        -DUSE_ETCD=ON -DUSE_HTTP=ON -DWITH_STORE=ON -DWITH_METRICS=ON
+        -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=ON -DBUILD_BENCHMARK=ON
+        -DENABLE_DEBUG_SYMBOLS=OFF
+      variant-flag: ${{ matrix.build_env }}
+      cuda-version: ${{ matrix.cuda-version }}
+      torch-cuda-arch-list: '8.0;9.0'
+      artifact-prefix: mooncake-wheel-efa-${{ matrix.variant }}-ubuntu

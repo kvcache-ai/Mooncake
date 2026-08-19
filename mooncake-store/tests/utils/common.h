@@ -1,14 +1,10 @@
 #pragma once
-
 #include <utility>
-
 #include "file_storage.h"
 #include "storage_backend.h"
 #include "tiered_cache/tiered_backend.h"
-
 namespace mooncake {
 namespace fs = std::filesystem;
-
 inline tl::expected<void, ErrorCode> BatchOffloadUtil(
     StorageBackendInterface& storage_backend, std::vector<std::string>& keys,
     std::vector<int64_t>& sizes,

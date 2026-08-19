@@ -2,19 +2,32 @@
 #define BUFFER_ALLOCATOR_H
 
 #include <atomic>
-#include <functional>
 #include <limits>
 #include <memory>
 #include <string>
+#include <vector>
 
 #include "cachelib_memory_allocator/MemoryAllocator.h"
-#include "offset_allocator/offset_allocator.hpp"
+#include "offset_allocator/offset_allocator.h"
 #include "types.h"
 
 using facebook::cachelib::MemoryAllocator;
 using facebook::cachelib::PoolId;
 
 namespace mooncake {
+
+/**
+ * @brief Type of buffer allocator used in the system
+ */
+enum class ReplicaType {
+    MEMORY = 0,      // Memory replica
+    DISK = 1,        // Disk replica
+    LOCAL_DISK = 2,  // Local disk replica
+    NOF_SSD = 3,     // Nvme-oF SSD replica
+    ALL = 4,         // All synchronous replicas in put finalize path
+    P2P_PROXY = 5,   // P2P proxy replica
+    DFS = 100,       // Distributed filesystem page-offset replica
+};
 
 // Constant for unknown free space in allocators that don't track it precisely
 static constexpr size_t kAllocatorUnknownFreeSpace =
@@ -31,6 +44,16 @@ class AllocatedBuffer {
     struct Descriptor;
 
     AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
+                    void* buffer_ptr, std::size_t size,
+                    std::optional<offset_allocator::OffsetAllocationHandle>&&
+                        offset_handle = std::nullopt)
+        : allocator_(std::move(allocator)),
+          buffer_ptr_(buffer_ptr),
+          size_(size),
+          segment_id_(0, 0),
+          offset_handle_(std::move(offset_handle)) {}
+
+    AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
                     void* buffer_ptr, std::size_t size, const UUID& segment_id,
                     std::optional<offset_allocator::OffsetAllocationHandle>&&
                         offset_handle = std::nullopt)
@@ -39,6 +62,9 @@ class AllocatedBuffer {
           size_(size),
           segment_id_(segment_id),
           offset_handle_(std::move(offset_handle)) {}
+
+    AllocatedBuffer(std::shared_ptr<BufferAllocatorBase> allocator,
+                    const Descriptor& descriptor);
 
     ~AllocatedBuffer();
 
@@ -85,10 +111,12 @@ class AllocatedBuffer {
     void* buffer_ptr_{nullptr};
     std::size_t size_{0};
     std::string protocol{"tcp"};
-    UUID segment_id_;
+    UUID segment_id_{0, 0};
     // RAII handle for buffer allocated by offset allocator
     std::optional<offset_allocator::OffsetAllocationHandle> offset_handle_{
         std::nullopt};
+
+    friend class Serializer<AllocatedBuffer>;
 };
 
 /**
@@ -98,13 +126,6 @@ class AllocatedBuffer {
 class BufferAllocatorBase {
    public:
     virtual ~BufferAllocatorBase() = default;
-
-    using UsageObserver = std::function<void(int64_t)>;
-    void set_usage_observers(UsageObserver on_allocated,
-                             UsageObserver on_deallocated) {
-        on_allocated_ = std::move(on_allocated);
-        on_deallocated_ = std::move(on_deallocated);
-    }
 
     virtual std::unique_ptr<AllocatedBuffer> allocate(size_t size) = 0;
     virtual void deallocate(AllocatedBuffer* handle) = 0;
@@ -124,10 +145,38 @@ class BufferAllocatorBase {
      * allocation may still fail due to race conditions or fragmentation.
      */
     virtual size_t getLargestFreeRegion() const = 0;
+};
 
-   protected:
-    UsageObserver on_allocated_;
-    UsageObserver on_deallocated_;
+/**
+ * A no-op buffer allocator used only for keeping standby promotion metadata
+ * alive. It does not actually allocate memory - replicas constructed from
+ * this allocator are invalid for actual I/O but preserve endpoint info.
+ */
+class DummyBufferAllocator final : public BufferAllocatorBase {
+   public:
+    explicit DummyBufferAllocator(std::string segment_name,
+                                  std::string transport_endpoint)
+        : segment_name_(std::move(segment_name)),
+          transport_endpoint_(std::move(transport_endpoint)) {}
+
+    std::unique_ptr<AllocatedBuffer> allocate(size_t size) override {
+        return nullptr;
+    }
+    void deallocate(AllocatedBuffer* handle) override {}
+    size_t capacity() const override { return kAllocatorUnknownFreeSpace; }
+    size_t getLargestFreeRegion() const override {
+        return kAllocatorUnknownFreeSpace;
+    }
+    size_t size() const override { return 0; }
+    std::string getSegmentName() const override { return segment_name_; }
+    UUID getSegmentId() const override { return UUID{0, 0}; }
+    std::string getTransportEndpoint() const override {
+        return transport_endpoint_;
+    }
+
+   private:
+    std::string segment_name_;
+    std::string transport_endpoint_;
 };
 
 /**
@@ -158,7 +207,8 @@ class CachelibBufferAllocator
    public:
     CachelibBufferAllocator(std::string segment_name, size_t base, size_t size,
                             std::string transport_endpoint,
-                            const UUID& segment_id);
+                            const UUID& segment_id = UUID{0, 0},
+                            ReplicaType replica_type = ReplicaType::MEMORY);
 
     ~CachelibBufferAllocator() override;
 
@@ -184,6 +234,8 @@ class CachelibBufferAllocator
     }
 
    private:
+    std::unique_ptr<AllocatedBuffer> adoptImportedBuffer(
+        const AllocatedBuffer::Descriptor& descriptor);
     // metadata
     const std::string segment_name_;
     const size_t base_;
@@ -191,6 +243,7 @@ class CachelibBufferAllocator
     std::atomic_size_t cur_size_;
     const std::string transport_endpoint_;
     const UUID segment_id_;
+    const ReplicaType replica_type_;
 
     // metrics - removed allocated_bytes_ member
     // ylt::metric::gauge_t* allocated_bytes_{nullptr};
@@ -199,7 +252,27 @@ class CachelibBufferAllocator
     size_t header_region_size_;
     std::unique_ptr<facebook::cachelib::MemoryAllocator> memory_allocator_;
     facebook::cachelib::PoolId pool_id_;
+
+    friend struct RestoredCachelibBufferAllocator;
+    friend std::optional<struct RestoredCachelibBufferAllocator>
+    RestoreCachelibBufferAllocator(
+        std::string segment_name, size_t base, size_t size,
+        std::string transport_endpoint,
+        const std::vector<AllocatedBuffer::Descriptor>& descriptors,
+        ReplicaType replica_type, const UUID& segment_id);
 };
+
+struct RestoredCachelibBufferAllocator {
+    std::shared_ptr<CachelibBufferAllocator> allocator;
+    std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
+};
+
+std::optional<RestoredCachelibBufferAllocator> RestoreCachelibBufferAllocator(
+    std::string segment_name, size_t base, size_t size,
+    std::string transport_endpoint,
+    const std::vector<AllocatedBuffer::Descriptor>& descriptors,
+    ReplicaType replica_type = ReplicaType::MEMORY,
+    const UUID& segment_id = UUID{0, 0});
 
 /**
  * OffsetBufferAllocator manages memory allocation using the OffsetAllocator
@@ -212,7 +285,8 @@ class OffsetBufferAllocator
    public:
     OffsetBufferAllocator(std::string segment_name, size_t base, size_t size,
                           std::string transport_endpoint,
-                          const UUID& segment_id);
+                          const UUID& segment_id = UUID{0, 0},
+                          ReplicaType replica_type = ReplicaType::MEMORY);
 
     ~OffsetBufferAllocator() override;
 
@@ -233,6 +307,12 @@ class OffsetBufferAllocator
      */
     size_t getLargestFreeRegion() const override;
 
+    // Public method to get offset_allocator
+    std::shared_ptr<offset_allocator::OffsetAllocator> getOffsetAllocator()
+        const {
+        return offset_allocator_;
+    }
+
    private:
     // metadata
     const std::string segment_name_;
@@ -241,10 +321,38 @@ class OffsetBufferAllocator
     std::atomic_size_t cur_size_;
     const std::string transport_endpoint_;
     const UUID segment_id_;
+    const ReplicaType replica_type_;
 
     // offset allocator implementation
     std::shared_ptr<offset_allocator::OffsetAllocator> offset_allocator_;
+
+    // Keeps address gaps occupied after descriptor-based reconstruction.
+    std::vector<std::unique_ptr<AllocatedBuffer>> restored_gap_buffers_;
+
+    friend class Serializer<OffsetBufferAllocator>;
+    friend struct RestoredOffsetBufferAllocator;
+    friend std::optional<struct RestoredOffsetBufferAllocator>
+    RestoreOffsetBufferAllocator(
+        std::string segment_name, size_t base, size_t size,
+        std::string transport_endpoint,
+        const std::vector<AllocatedBuffer::Descriptor>& descriptors,
+        ReplicaType replica_type, const UUID& segment_id);
 };
+
+struct RestoredOffsetBufferAllocator {
+    std::shared_ptr<OffsetBufferAllocator> allocator;
+    std::vector<std::unique_ptr<AllocatedBuffer>> buffers;
+};
+
+// Reconstructs an empty OffsetBufferAllocator from final live descriptors.
+// The returned buffers follow descriptor input order. No state is exposed on
+// validation or allocation failure.
+std::optional<RestoredOffsetBufferAllocator> RestoreOffsetBufferAllocator(
+    std::string segment_name, size_t base, size_t size,
+    std::string transport_endpoint,
+    const std::vector<AllocatedBuffer::Descriptor>& descriptors,
+    ReplicaType replica_type = ReplicaType::MEMORY,
+    const UUID& segment_id = UUID{0, 0});
 
 // The main difference is that it allocates real memory and returns it, while
 // BufferAllocator allocates an address

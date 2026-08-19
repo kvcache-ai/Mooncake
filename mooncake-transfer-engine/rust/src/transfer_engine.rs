@@ -91,6 +91,27 @@ impl TransferEngine {
         Ok(Self { engine })
     }
 
+    pub fn discover_topology(&self) -> Result<()> {
+        let ret = unsafe { bindings::discoverTopology(self.engine) };
+        if ret != 0 {
+            bail!("Failed to discover topology")
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn install_transport(&self, proto: &str) -> Result<()> {
+        let proto_c = CString::new(proto).map_err(|_| anyhow!("CString::new failed"))?;
+        let ret = unsafe {
+            bindings::installTransport(self.engine, proto_c.as_ptr(), std::ptr::null_mut())
+        };
+        if ret.is_null() {
+            bail!("Failed to install transport '{}'", proto)
+        } else {
+            Ok(())
+        }
+    }
+
     pub fn close(&mut self) -> Result<()> {
         unsafe {
             bindings::destroyTransferEngine(self.engine);
@@ -129,6 +150,9 @@ impl TransferEngine {
         buffer_list: &[BufferEntry],
         location: &str,
     ) -> Result<()> {
+        if buffer_list.is_empty() {
+            return Ok(());
+        }
         let location_c = CString::new(location).map_err(|_| anyhow!("CString::new failed"))?;
         let mut buffer_list_c: Vec<bindings::buffer_entry_t> = vec![];
         let buffer_len_c = buffer_list.len();
@@ -154,6 +178,9 @@ impl TransferEngine {
     }
 
     pub fn unregister_local_memory_batch(&self, buffer_list: &[BufferEntry]) -> Result<()> {
+        if buffer_list.is_empty() {
+            return Ok(());
+        }
         let mut addr_list: Vec<*mut c_void> = buffer_list.iter().map(|entry| entry.addr).collect();
         let addr_len = buffer_list.len();
         let ret = unsafe {
@@ -180,6 +207,9 @@ impl TransferEngine {
         batch_id: BatchID,
         requests: &mut [TransferRequest],
     ) -> Result<()> {
+        if requests.is_empty() {
+            return Ok(());
+        }
         let mut requests_c: Vec<bindings::transfer_request_t> = vec![];
         for i in 0..requests.len() {
             requests_c.push(bindings::transfer_request_t {
@@ -237,6 +267,20 @@ impl TransferEngine {
         let ret = unsafe { bindings::closeSegment(self.engine, segment_id) };
         if ret < 0 {
             bail!("Failed to close segment with ID {}", segment_id)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Eagerly establish EFA endpoints to `segment_name` so the first
+    /// `submit_transfer` doesn't pay the serial fi_av_insert cost. No-op on
+    /// non-EFA transports. Call after `open_segment` (and after the metadata
+    /// has the peer's NIC list published).
+    pub fn warmup_efa_segment(&self, name: &str) -> Result<()> {
+        let name_c = CString::new(name).map_err(|_| anyhow!("CString::new failed"))?;
+        let ret = unsafe { bindings::warmupEfaSegment(self.engine, name_c.as_ptr()) };
+        if ret < 0 {
+            bail!("warmupEfaSegment failed for {}: {}", name, ret)
         } else {
             Ok(())
         }

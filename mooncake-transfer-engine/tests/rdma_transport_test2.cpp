@@ -28,8 +28,6 @@
 
 using namespace mooncake;
 
-namespace mooncake {
-
 DEFINE_string(local_server_name, getHostname(),
               "Local server name for segment discovery");
 DEFINE_string(metadata_server, "127.0.0.1:2379", "etcd server host address");
@@ -46,6 +44,8 @@ DEFINE_string(nic_priority_matrix, "",
               "Path to RDMA NIC priority matrix file (Advanced)");
 
 DEFINE_string(segment_id, "127.0.0.2", "Segment ID to access data");
+
+namespace mooncake {
 
 std::string formatDeviceNames(const std::string &device_names) {
     std::stringstream ss(device_names);
@@ -86,6 +86,9 @@ std::string loadNicPriorityMatrix() {
            device_names +
            "], []], "
            " \"musa:0\": [[" +
+           device_names +
+           "], []], "
+           " \"maca:0\": [[" +
            device_names + "], []]}";
 }
 
@@ -247,6 +250,7 @@ TEST_F(RDMATransportTest, MultipleRead) {
 }  // namespace mooncake
 
 int main(int argc, char **argv) {
+    ::testing::InitGoogleTest(&argc, argv);
     gflags::ParseCommandLineFlags(&argc, &argv, false);
     ::testing::InitGoogleTest(&argc, argv);
     return RUN_ALL_TESTS();

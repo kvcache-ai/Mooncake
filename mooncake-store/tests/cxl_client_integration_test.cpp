@@ -17,9 +17,7 @@
 #include <sys/mman.h>
 
 #include "allocator.h"
-#include "centralized_client_service.h"
 #include "client_service.h"
-#include "client_config_builder.h"
 #include "types.h"
 #include "utils.h"
 #include "test_server_helpers.h"
@@ -35,6 +33,8 @@ DEFINE_uint64(cxl_device_size, 1073741824, "Device Size for cxl");
 DEFINE_bool(auto_disc, false, "Auto discover tcp devices");
 DEFINE_string(transfer_engine_metadata_url, "127.0.0.1:2379",
               "Metadata connection string for transfer engine");
+DEFINE_double(eviction_high_watermark_ratio, 0.1,
+              "Ratio of high watermark trigger eviction");
 
 namespace mooncake {
 namespace testing {
@@ -93,20 +93,20 @@ class ClientIdCaptureSink : public google::LogSink {
 
 class ClientIntegrationTestCxl : public ::testing::Test {
    protected:
-    static std::shared_ptr<CentralizedClientService> CreateClient(
-        const std::string& host_name) {
-        auto config = ClientConfigBuilder::build_centralized_real_client(
-            host_name, FLAGS_transfer_engine_metadata_url, FLAGS_protocol,
-            std::nullopt, master_address_);
-        auto client_opt = ClientService::Create(config);
+    static std::shared_ptr<Client> CreateClient(const std::string& host_name) {
+        auto client_opt = Client::Create(
+            host_name,                           // Local hostname
+            FLAGS_transfer_engine_metadata_url,  // Metadata connection string
+            FLAGS_protocol,                      // Transfer protocol
+            std::nullopt,  // RDMA device names (auto-discovery)
+            master_address_);
 
         EXPECT_TRUE(client_opt.has_value())
             << "Failed to create client with host_name: " << host_name;
         if (!client_opt.has_value()) {
             return nullptr;
         }
-        return std::static_pointer_cast<CentralizedClientService>(
-            client_opt.value());
+        return client_opt.value();
     }
 
     static void SetUpTestSuite() {
@@ -137,6 +137,8 @@ class ClientIntegrationTestCxl : public ::testing::Test {
                                         .set_enable_cxl(true)
                                         .set_cxl_path(FLAGS_cxl_device_name)
                                         .set_cxl_size(FLAGS_cxl_device_size)
+                                        .set_eviction_high_watermark_ratio(
+                                            FLAGS_eviction_high_watermark_ratio)
                                         .build();
 
         ASSERT_TRUE(master_.Start(config)) << "Failed to start InProcMaster!";
@@ -236,13 +238,11 @@ class ClientIntegrationTestCxl : public ::testing::Test {
         }
     }
 
-    static std::shared_ptr<CentralizedClientService> test_client_;
+    static std::shared_ptr<Client> test_client_;
     // Here we use a simple allocator for the client buffer. In a real
     // application, user should manage the memory allocation and deallocation
     // themselves.
     static std::unique_ptr<SimpleAllocator> client_buffer_allocator_;
-    static void* segment_ptr_;
-    static size_t ram_buffer_size_;
     static void* test_client_segment_ptr_;
     static size_t test_client_ram_buffer_size_;
     static uint64_t default_kv_lease_ttl_;
@@ -255,13 +255,10 @@ class ClientIntegrationTestCxl : public ::testing::Test {
 };
 
 // Static members initialization
-std::shared_ptr<CentralizedClientService>
-    ClientIntegrationTestCxl::test_client_ = nullptr;
-void* ClientIntegrationTestCxl::segment_ptr_ = nullptr;
+std::shared_ptr<Client> ClientIntegrationTestCxl::test_client_ = nullptr;
 void* ClientIntegrationTestCxl::test_client_segment_ptr_ = nullptr;
 std::unique_ptr<SimpleAllocator>
     ClientIntegrationTestCxl::client_buffer_allocator_ = nullptr;
-size_t ClientIntegrationTestCxl::ram_buffer_size_ = 0;
 size_t ClientIntegrationTestCxl::test_client_ram_buffer_size_ = 0;
 uint64_t ClientIntegrationTestCxl::default_kv_lease_ttl_ = 0;
 InProcMaster ClientIntegrationTestCxl::master_;
@@ -290,14 +287,16 @@ TEST_F(ClientIntegrationTestCxl, BasicPutGetOperations) {
     client_buffer_allocator_->deallocate(buffer, test_data.size());
 
     buffer = client_buffer_allocator_->allocate(1 * 1024 * 1024);
+    slices.clear();
+    slices.emplace_back(Slice{buffer, test_data.size()});
     // Verify data through Get operation
-    std::vector<void*> get_buffers = {buffer};
-    std::vector<size_t> get_sizes = {test_data.size()};
-    auto get_result = test_client_->Get(key, get_buffers, get_sizes);
+    auto get_result = test_client_->Get(key, slices);
     ASSERT_TRUE(get_result.has_value())
         << "Get operation failed: " << toString(get_result.error());
-    ASSERT_EQ(get_result.value(), test_data.size());
-    ASSERT_EQ(memcmp(buffer, test_data.data(), test_data.size()), 0);
+    ASSERT_EQ(slices.size(), 1);
+    ASSERT_EQ(slices[0].size, test_data.size());
+    ASSERT_EQ(slices[0].ptr, buffer);
+    ASSERT_EQ(memcmp(slices[0].ptr, test_data.data(), test_data.size()), 0);
     client_buffer_allocator_->deallocate(buffer, test_data.size());
 
     // Put again with the same key, should succeed
@@ -355,11 +354,11 @@ TEST_F(ClientIntegrationTestCxl, BatchPutGetOperations) {
 
     start = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < batch_sz; i++) {
+        std::vector<Slice> slices;
         target_buffer =
             client_buffer_allocator_->allocate(test_data_list[i].size());
-        std::vector<void*> bufs = {target_buffer};
-        std::vector<size_t> szs = {test_data_list[i].size()};
-        auto get_result = test_client_->Get(keys[i], bufs, szs);
+        slices.emplace_back(Slice{target_buffer, test_data_list[i].size()});
+        auto get_result = test_client_->Get(keys[i], slices);
         ASSERT_TRUE(get_result.has_value())
             << "Get operation failed: " << toString(get_result.error());
         client_buffer_allocator_->deallocate(target_buffer,
@@ -373,29 +372,19 @@ TEST_F(ClientIntegrationTestCxl, BatchPutGetOperations) {
               << "us";
 
     start = std::chrono::high_resolution_clock::now();
-    std::vector<std::string> batch_keys;
-    std::vector<std::vector<void*>> batch_buffers;
-    std::vector<std::vector<size_t>> batch_sizes;
-    std::vector<void*> batch_ptrs;
+    std::unordered_map<std::string, std::vector<Slice>> target_batched_slices;
     for (int i = 0; i < batch_sz; i++) {
+        std::vector<Slice> target_slices;
         target_buffer =
             client_buffer_allocator_->allocate(test_data_list[i].size());
-        batch_keys.push_back(keys[i]);
-        batch_buffers.push_back({target_buffer});
-        batch_sizes.push_back({test_data_list[i].size()});
-        batch_ptrs.push_back(target_buffer);
+        target_slices.emplace_back(
+            Slice{target_buffer, test_data_list[i].size()});
+        target_batched_slices.emplace(keys[i], target_slices);
     }
     auto batch_get_results =
-        test_client_->BatchGet(batch_keys, batch_buffers, batch_sizes);
-    for (size_t i = 0; i < batch_get_results.size(); i++) {
-        ASSERT_TRUE(batch_get_results[i].has_value())
-            << "BatchGet operation failed for key " << batch_keys[i];
-        ASSERT_EQ(batch_get_results[i].value(), test_data_list[i].size());
-        ASSERT_EQ(memcmp(batch_ptrs[i], test_data_list[i].data(),
-                         test_data_list[i].size()),
-                  0);
-        client_buffer_allocator_->deallocate(batch_ptrs[i],
-                                             test_data_list[i].size());
+        test_client_->BatchGet(keys, target_batched_slices);
+    for (const auto& result : batch_get_results) {
+        ASSERT_TRUE(result.has_value()) << "BatchGet operation failed";
     }
     end = std::chrono::high_resolution_clock::now();
     LOG(INFO) << "Time taken for BatchGet: "
@@ -403,6 +392,75 @@ TEST_F(ClientIntegrationTestCxl, BatchPutGetOperations) {
                                                                        start)
                      .count()
               << "us";
+
+    for (int i = 0; i < batch_sz; i++) {
+        ASSERT_EQ(target_batched_slices[keys[i]][0].size,
+                  test_data_list[i].size());
+        ASSERT_EQ(memcmp(target_batched_slices[keys[i]][0].ptr,
+                         test_data_list[i].data(), test_data_list[i].size()),
+                  0);
+        client_buffer_allocator_->deallocate(
+            target_batched_slices[keys[i]][0].ptr, test_data_list[i].size());
+    }
+}
+
+// Test Evict operation through the client
+TEST_F(ClientIntegrationTestCxl, EvictOperation) {
+    // Test data
+    const size_t test_data_size = 1ULL * 1024 * 1024;
+    const size_t test_total_size = 1000ULL * 1024 * 1024;
+    std::vector<char> test_data(test_data_size, 'T');
+    size_t test_put_size = 0;
+    std::vector<std::string> inserted_keys;
+
+    for (uint64_t i = 0;; ++i) {
+        std::string key = "evict_key_" + std::to_string(i);
+        inserted_keys.push_back(key);
+        void* buffer = client_buffer_allocator_->allocate(test_data_size);
+
+        // write
+        memcpy(buffer, test_data.data(), test_data_size);
+        std::vector<Slice> slices;
+        slices.emplace_back(Slice{buffer, test_data_size});
+
+        // Test Put operation
+        ReplicateConfig config;
+        config.replica_num = 1;
+        auto put_result = test_client_->Put(key, slices, config);
+        ASSERT_TRUE(put_result.has_value())
+            << "Put failed at i=" << i << " " << toString(put_result.error());
+
+        client_buffer_allocator_->deallocate(buffer, test_data_size);
+        test_put_size += test_data_size;
+
+        if (i % 100 == 0) {
+            LOG(INFO) << "put count=" << i + 1
+                      << ", total_put_size=" << test_put_size / 1048576 << "MB";
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        if (test_put_size >= test_total_size) {
+            LOG(INFO) << "stop";
+            break;
+        }
+    }
+    LOG(INFO) << "Test finished, put_data=" << test_put_size / 1048576 << "MB";
+
+    // Verify that some keys were actually evicted.
+    std::this_thread::sleep_for(std::chrono::seconds(5));
+    bool evict_worked = false;
+    for (const auto& key : inserted_keys) {
+        auto exist_result = test_client_->IsExist(key);
+        ASSERT_TRUE(exist_result.has_value());
+
+        if (!exist_result.value()) {
+            evict_worked = true;
+            LOG(INFO) << "Key " << key << " was evicted.";
+            break;
+        }
+    }
+
+    ASSERT_TRUE(evict_worked) << "No keys were evicted, the eviction mechanism "
+                                 "might not be working correctly.";
 }
 
 }  // namespace testing

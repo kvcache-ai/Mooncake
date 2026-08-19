@@ -38,8 +38,8 @@ class CpuPlatform : public Platform {
 
     virtual MemoryType getMemoryType(void *addr) { return MTYPE_CPU; }
 
-    virtual const std::vector<RangeLocation> getLocation(void *start,
-                                                         size_t len);
+    virtual const std::vector<RangeLocation> getLocation(
+        void *start, size_t len, bool skip_prefault = false);
 
     virtual const std::string type() const { return "cpu"; }
 

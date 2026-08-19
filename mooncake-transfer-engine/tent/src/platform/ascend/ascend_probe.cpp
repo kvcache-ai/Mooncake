@@ -14,6 +14,7 @@
 
 #include "tent/platform/ascend.h"
 #include "tent/common/status.h"
+#include "tent/common/utils/prefault.h"
 #include "tent/common/utils/random.h"
 
 #include <acl/acl.h>
@@ -66,7 +67,7 @@ static std::vector<Topology::NicEntry> listInfiniBandDevices() {
         std::ifstream(path) >> numa_node;
 
         devices.push_back(
-            Topology::NicEntry{.name = std::move(device_name),
+            Topology::NicEntry{.name = device_name,
                                .pci_bus_id = std::move(pci_bus_id),
                                .type = Topology::NIC_RDMA,
                                .numa_node = numa_node});
@@ -171,8 +172,8 @@ static inline std::string genCpuNodeName(int node) {
     return kWildcardLocation;
 }
 
-const std::vector<RangeLocation> AscendPlatform::getLocation(void* start,
-                                                             size_t len) {
+const std::vector<RangeLocation> AscendPlatform::getLocation(
+    void* start, size_t len, bool skip_prefault) {
     const static size_t kPageSize = 4096;
     std::vector<RangeLocation> entries;
 
@@ -200,6 +201,10 @@ const std::vector<RangeLocation> AscendPlatform::getLocation(void* start,
 
     for (int i = 0; i < n; i++) {
         pages[i] = (void*)((char*)aligned_start + i * kPageSize);
+    }
+
+    if (!skip_prefault) {
+        prefaultBeforeProbe(pages, n, aligned_start, "AscendPlatform");
     }
 
     int rc = numa_move_pages(0, n, pages, nullptr, status, 0);

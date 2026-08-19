@@ -86,7 +86,21 @@ docker_launch(){
     fi
     local relative_path=${TEST_RUN_DIR#$BASE_DIR}
     local cleaned_path=${relative_path#/}
-    pip_cmd=$(append_str "${pip_cmd}" "pip install /test_run/$cleaned_path/whls/$mooncake_whl_file")
+    pip_cmd=$(append_str "${pip_cmd}" "pip install --force-reinstall /test_run/$cleaned_path/whls/$mooncake_whl_file")
+
+    # Check if sglang-router is needed and missing
+    if [[ "$registry_addr" == *"sglang"* ]]; then
+        echo "=== Detected sglang image, checking sglang-router ==="
+        if ! ${docker_exec} "python -c 'import sglang_router' 2>/dev/null"; then
+            echo "sglang-router not found, will install it"
+            pip_cmd=$(append_str "${pip_cmd}" \
+                "pip config set global.index-url https://mirrors.aliyun.com/pypi/simple/")
+            pip_cmd=$(append_str "${pip_cmd}" \
+                "pip install sglang-router")
+        else
+            echo "sglang-router already installed, skipping"
+        fi
+    fi
 
     echo "Installing ERDMA drivers"
     echo "Executing ERDMA driver installation command:"
@@ -184,6 +198,32 @@ check_server_ready() {
     return 1
 }
 
+check_server_ready_with_pattern() {
+    local server_log_path=$1
+    local ready_pattern=$2
+    local max_attempts=${3:-120}
+
+    if [ -z "$server_log_path" ] || [ -z "$ready_pattern" ]; then
+        echo "ERROR: Server log path or ready pattern not provided" >&2
+        return 1
+    fi
+
+    echo "Waiting for server to be ready (pattern: '$ready_pattern')..."
+    for i in $(seq 1 $max_attempts); do
+        if [ -f "$server_log_path" ]; then
+            if grep -q "$ready_pattern" "$server_log_path" 2>/dev/null; then
+                echo "Server is ready!"
+                return 0
+            fi
+            echo "Waiting... ($i/$max_attempts)"
+            sleep 2
+        fi
+    done
+    
+    echo "ERROR: Server did not become ready in time" >&2
+    return 1
+}
+
 get_whl(){
     whls_path="$1/whls"
     echo "whls_path: $whls_path and mkdir..."
@@ -191,7 +231,7 @@ get_whl(){
 
     echo "get whl file from github action"
     rm -f "$whls_path/mooncake.zip"
-    rm -f "$whls_path/*.whl"
+    rm -f "$whls_path"/*.whl
 
     local max_retries=5
     local base_delay=5 # seconds
@@ -267,15 +307,18 @@ check_proxy_ready() {
     echo "Checking log file: $proxy_log_path"
     
     for i in $(seq 1 $max_attempts); do
+        activated_count=0
+        tokenizer_ready=0
+        server_started=0
         if [ -f "$proxy_log_path" ]; then
             # "Activated 1 worker(s) (marked as healthy)"
-            activated_count=$(grep -c "Activated 1 worker(s) (marked as healthy)" "$proxy_log_path" 2>/dev/null) || activated_count=0
+            activated_count=$(grep -cF "Activated 1 worker(s) (marked as healthy)" "$proxy_log_path" 2>/dev/null) || activated_count=0
             
             # "Successfully loaded tokenizer"
-            tokenizer_ready=$(grep -c "Successfully loaded tokenizer" "$proxy_log_path" 2>/dev/null) || tokenizer_ready=0
+            tokenizer_ready=$(grep -cE "Successfully (loaded|registered) tokenizer" "$proxy_log_path" 2>/dev/null) || tokenizer_ready=0
 
             # "Starting server on 0.0.0.0:8000"
-            server_started=$(grep -c "Starting server on 0.0.0.0" "$proxy_log_path" 2>/dev/null) || server_started=0
+            server_started=$(grep -cF "Starting server on 0.0.0.0" "$proxy_log_path" 2>/dev/null) || server_started=0
             
             if [ "$activated_count" -ge "$expected_workers" ] && [ "$tokenizer_ready" -gt 0 ]; then
                 echo "Router is ready!"
@@ -358,6 +401,139 @@ cleanup_test_env() {
     echo "Cleanup completed"
 }
 
+# Wait until GPU memory on the local host drains below a threshold.
+# Returns 0 once drained, 1 if it times out.
+wait_gpu_idle() {
+    local max_seconds=${1:-90}
+    local threshold_mb=${2:-1024}
+
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        echo "ERROR: nvidia-smi not available; cannot verify GPU drain" >&2
+        return 1
+    fi
+
+    echo "Waiting for GPU memory to drain (threshold ${threshold_mb}MB, timeout ${max_seconds}s)..."
+    local elapsed=0
+    local max_used=0
+    while [ $elapsed -lt $max_seconds ]; do
+        max_used=$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits 2>/dev/null | sort -n | tail -n 1)
+        if ! [[ "$max_used" =~ ^[0-9]+$ ]]; then
+            echo "ERROR: nvidia-smi query failed; cannot verify GPU drain" >&2
+            return 1
+        fi
+        if [ "$max_used" -le "$threshold_mb" ]; then
+            echo "GPU memory drained (max used ${max_used}MB)"
+            return 0
+        fi
+        sleep 3
+        elapsed=$((elapsed + 3))
+    done
+    echo "GPU memory not drained within ${max_seconds}s (max used ${max_used}MB)"
+    return 1
+}
+
+# Kill only GPU processes whose cgroup still identifies them as belonging to
+# the reused test container. Unknown or unrelated processes must be left alone;
+# the caller will quarantine the environment if GPU memory remains occupied.
+gpu_pid_belongs_to_container() {
+    local pid=$1
+    local container_id=$2
+    [ -r "/proc/${pid}/cgroup" ] && grep -Fq "$container_id" "/proc/${pid}/cgroup"
+}
+
+force_kill_container_gpu_procs() {
+    command -v nvidia-smi >/dev/null 2>&1 || return 1
+
+    local container_id
+    container_id=$(docker inspect --format '{{.Id}}' "${CONTAINER_NAME}" 2>/dev/null) || {
+        echo "ERROR: Cannot inspect container ${CONTAINER_NAME}; refusing to kill host GPU processes" >&2
+        return 1
+    }
+    if [ -z "$container_id" ]; then
+        echo "ERROR: Empty container ID for ${CONTAINER_NAME}; refusing to kill host GPU processes" >&2
+        return 1
+    fi
+
+    local gpu_pids
+    gpu_pids=$(nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | tr -cd '0-9\n' | grep -E '^[0-9]+$' | sort -u)
+    [ -z "$gpu_pids" ] && return 0
+
+    local container_pids=""
+    local pid
+    for pid in $gpu_pids; do
+        if gpu_pid_belongs_to_container "$pid" "$container_id"; then
+            container_pids="${container_pids} ${pid}"
+        else
+            echo "WARNING: GPU PID ${pid} is not owned by ${CONTAINER_NAME}; leaving it untouched" >&2
+        fi
+    done
+
+    if [ -z "$container_pids" ]; then
+        echo "No container-owned GPU processes are safe to kill"
+        return 0
+    fi
+
+    echo "Force-killing container-owned GPU PIDs:${container_pids}"
+    for pid in $container_pids; do
+        if ! kill -9 "$pid" 2>/dev/null; then
+            echo "ERROR: Failed to kill container-owned GPU PID ${pid}" >&2
+            return 1
+        fi
+    done
+    sleep 3
+}
+
+# Fully clear GPU memory on the current node: restart the container first, then
+# kill only container-owned GPU processes that survived the restart.
+# Restart the reused container to reset all in-container state (processes, GPU
+# memory, ERDMA queue-pairs / RDMA contexts). 'docker restart' keeps the
+# writable layer, so the mooncake wheel and ERDMA drivers are NOT reinstalled.
+drain_gpu_local() {
+    echo "Restarting container ${CONTAINER_NAME} to reset GPU/ERDMA state..."
+    if ! docker restart "${CONTAINER_NAME}" >/dev/null 2>&1; then
+        echo "ERROR: Failed to restart container ${CONTAINER_NAME}; environment is unhealthy" >&2
+        return 1
+    fi
+
+    if ! wait_gpu_idle 60; then
+        echo "GPU memory remains occupied; checking for container-owned processes..."
+        force_kill_container_gpu_procs || return 1
+        if ! wait_gpu_idle 45; then
+            echo "ERROR: GPU still occupied after bounded cleanup; environment is unhealthy" >&2
+            return 1
+        fi
+    fi
+
+    return 0
+}
+
+# Between test cases in run-all the container is reused; reset in-container
+# state on both the local and (for double-machine runs) remote nodes via a
+# lightweight container restart (no wheel / ERDMA driver reinstall).
+drain_gpu_between_tests() {
+    echo "===== Resetting environment between test cases ====="
+    local reset_failed=false
+    if ! drain_gpu_local; then
+        echo "ERROR: Failed to reset the local test environment" >&2
+        reset_failed=true
+    fi
+
+    if [ -n "$REMOTE_IP" ]; then
+        echo "Resetting environment on remote node $REMOTE_IP..."
+        if ! ${SSH_CMD} "$REMOTE_IP" "
+            source ${REMOTE_TEST_DIR}/run/.shrc && \
+            source ${REMOTE_TEST_DIR}/scripts/common.sh && \
+            drain_gpu_local
+        "; then
+            echo "ERROR: Failed to reset the remote test environment on ${REMOTE_IP}" >&2
+            reset_failed=true
+        fi
+    fi
+
+    $reset_failed && return 1
+    return 0
+}
+
 setup_node_env() {
     local registry_addr=$1
     echo "===== Setting up docker environment ====="
@@ -373,6 +549,7 @@ setup_node_env() {
     fi
 
     local extra_args=""
+    extra_args="$extra_args -e NCCL_GIN_TYPE=0 "
     extra_args="$extra_args --device=/dev/infiniband/uverbs0 --device=/dev/infiniband/uverbs1 --device=/dev/infiniband/rdma_cm "
     if [ "${USE_HUGGINGFACE_MIRROR}" = "true" ]; then
         extra_args="$extra_args -e HF_ENDPOINT=${HUGGINGFACE_MIRROR} -e HF_HUB_ENABLE_HF_TRANSFER=1"
@@ -481,6 +658,33 @@ check_vllm_server_ready(){
     return 1
 }
 
+check_vllm_proxy_ready(){
+    local proxy_log_path=$1
+    local ready_pattern=${2:-"All prefiller instances are ready."}
+    local max_attempts=${3:-120}
+
+    if [ -z "$proxy_log_path" ]; then
+        echo "ERROR: Proxy log path not provided" >&2
+        return 1
+    fi
+
+    echo "Waiting for proxy to be ready (checking: $proxy_log_path)..."
+    echo "Looking for pattern: '$ready_pattern'"
+    for i in $(seq 1 $max_attempts); do
+        if [ -f "$proxy_log_path" ]; then
+            if grep -q "$ready_pattern" "$proxy_log_path" 2>/dev/null; then
+                echo "Proxy is ready!"
+                return 0
+            fi
+            echo "Waiting... ($i/$max_attempts)"
+            sleep 2
+        fi
+    done
+    
+    echo "ERROR: Proxy failed to start within timeout"
+    return 1
+}
+
 wait_for_server_ready() {
     local host=$1
     local port=$2
@@ -513,4 +717,409 @@ wait_for_server_ready() {
     
     echo "ERROR: Server failed to become ready within timeout (last response: $response_code)"
     return 1
+}
+
+detect_remote_mode() {
+    if [ -z "${ISREMOTE}" ]; then
+        if [ -n "${REMOTE_IP}" ] && [ -n "${REMOTE_TEST_DIR}" ] && [[ "$PWD" == "${REMOTE_TEST_DIR}"* ]]; then
+            export ISREMOTE=1
+        else
+            export ISREMOTE=0
+        fi
+    fi
+}
+
+sanitize_model_name() {
+    local model_name=$1
+    echo "$model_name" | sed 's/\//__/g'
+}
+
+convert_container_path_to_host() {
+    local container_path=$1
+    echo "$container_path" | sed "s|/test_run/|$BASE_DIR/|"
+}
+
+setup_log_directory_dual() {
+    local test_case_name=$1
+    local model_name_clean=$2
+    
+    setup_log_directory "$TEST_RUN_DIR/logs/$test_case_name/$model_name_clean"
+    
+    if [ -n "$REMOTE_IP" ]; then
+        ${SSH_CMD} $REMOTE_IP "source $REMOTE_TEST_DIR/run/.shrc; cd \$BASE_DIR/scripts && source ./common.sh && setup_log_directory \"\$TEST_RUN_DIR/logs/$test_case_name/$model_name_clean\""
+    fi
+}
+
+cleanup_model_processes() {
+    local pid_dir=$1
+    local test_case_name=$2
+    
+    echo "===== Killing model processes ====="
+    
+    if [ -d "$pid_dir" ]; then
+        echo "Cleaning up by PID files in $pid_dir..."
+        for pid_file in "${pid_dir}"/*.pid; do
+            if [ -f "$pid_file" ]; then
+                local service_name=$(basename "$pid_file" .pid)
+                kill_process "$pid_file" "$service_name"
+            fi
+        done
+    fi
+    
+    if [ "$ISREMOTE" == "0" ] && [ -n "$REMOTE_IP" ]; then
+        echo "===== Killing model processes (remote: $REMOTE_IP) ====="
+        ${SSH_CMD} "$REMOTE_IP" "source $REMOTE_TEST_DIR/run/.shrc; cd \$BASE_DIR/scripts && ./$test_case_name.sh stop_server" 2>/dev/null || true
+    fi
+    
+    echo "Process cleanup completed."
+}
+
+collect_remote_log_file() {
+    local model_name_clean=$1
+    local remote_log_filename=$2
+    local test_case_name=$3
+    
+    local remote_log_dir="${REMOTE_TEST_DIR}/${TEST_CASE_RESULT_PATH}/${model_name_clean}"
+    local local_log_dir="${BASE_DIR}/${TEST_CASE_RESULT_PATH}/${model_name_clean}"
+    
+    echo "  Copying remote ${remote_log_filename}..."
+    scp ${REMOTE_IP}:${remote_log_dir}/${remote_log_filename} \
+        ${local_log_dir}/ 2>/dev/null
+    
+    if [ $? -eq 0 ]; then
+        echo "  ✓ Successfully copied ${remote_log_filename} for $model_name_clean"
+        return 0
+    else
+        echo "  ✗ Failed to copy ${remote_log_filename} for $model_name_clean (file may not exist)"
+        return 1
+    fi
+}
+
+# Checks for API error responses containing "object":"error"
+validate_json_response_error() {
+    local response=$1
+    local model_name=${2:-"unknown"}
+    
+    if echo "$response" | grep -q "\"object\":\"error\""; then
+        local error_message=$(echo "$response" | grep -o '"message":"[^"]*"' | sed 's/"message":"//' | sed 's/"$//')
+        echo "  ERROR: $error_message" >&2
+        echo "  $model_name: Fail"
+        return 1
+    fi
+    
+    return 0
+}
+
+# Validates HTTP status codes (default expectation: 200)
+validate_http_status() {
+    local status_code=$1
+    local expected_code=${2:-200}
+    
+    if [ -z "$status_code" ]; then
+        echo "ERROR: HTTP status code is empty" >&2
+        return 1
+    fi
+    
+    if ! [[ "$status_code" =~ ^[0-9]+$ ]]; then
+        echo "ERROR: HTTP status code is not a valid number: '$status_code'" >&2
+        return 1
+    fi
+    
+    if [ "$status_code" -eq "$expected_code" ]; then
+        return 0
+    else
+        echo "ERROR: HTTP request failed with status code $status_code (expected: $expected_code)" >&2
+        return 1
+    fi
+}
+
+# Extracts JSON values using jq paths and matches patterns
+validate_response_content() {
+    local response=$1
+    local json_query=$2
+    local expected_pattern=${3:-""}
+
+    if [ -z "$json_query" ]; then
+        return 0
+    fi
+    
+    local content=$(echo "$response" | jq -r "$json_query" 2>/dev/null)
+    if [ -z "$content" ] || [ "$content" = "null" ]; then
+        echo "ERROR: Failed to extract content from JSON with query: $json_query" >&2
+        return 1
+    fi
+    
+    if [ -n "$expected_pattern" ]; then
+        if [[ "${content,,}" =~ ${expected_pattern,,} ]]; then
+            echo "Content validation passed: found '$expected_pattern'"
+            echo "Full content: $content"
+            return 0
+        else
+            echo "ERROR: Content validation failed: '$expected_pattern' not found" >&2
+            echo "Actual content: $content" >&2
+            return 1
+        fi
+    fi
+    
+    echo "Content extracted successfully: $content"
+    return 0
+}
+
+validate_api_response() {
+    local response_body=$1
+    local status_code=$2
+    local json_query=${3:-""}
+    local expected_pattern=${4:-""}
+    
+    if ! validate_http_status "$status_code" 200; then
+        return 1
+    fi
+    
+    if ! validate_json_response_error "$response_body"; then
+        return 1
+    fi
+    
+    if [ -n "$json_query" ]; then
+        if ! validate_response_content "$response_body" "$json_query" "$expected_pattern"; then
+            return 1
+        fi
+    else
+        echo "Basic validation passed"
+    fi
+    
+    return 0
+}
+
+validate_curl_response_from_log() {
+    local log_file=$1
+    local model_name=$2
+    local expected_pattern=${3:-""}
+    
+    if [ ! -f "$log_file" ]; then
+        echo "  ERROR: Curl response log not found at $log_file" >&2
+        echo "  $model_name: Fail"
+        return 1
+    fi
+    
+    local curl_response=$(cat "$log_file")
+    if [ -z "$curl_response" ]; then
+        echo "  ERROR: Curl response log is empty" >&2
+        echo "  $model_name: Fail"
+        return 1
+    fi
+    
+    if ! validate_json_response_error "$curl_response" "$model_name"; then
+        return 1
+    fi
+    
+    if [ -n "$expected_pattern" ]; then
+        if echo "$curl_response" | grep -qEi "$expected_pattern"; then
+            echo "  $model_name: Pass (pattern matched)"
+        else
+            echo "  ERROR: Expected pattern '$expected_pattern' not found in response" >&2
+            echo "  $model_name: Fail"
+            return 1
+        fi
+    else
+        echo "  $model_name: Pass"
+    fi
+    
+    return 0
+}
+
+collect_and_validate_model_results() {
+    local models_array_name=$1[@]
+    local models=("${!models_array_name}")
+    local remote_log_filename=$2
+    local test_case_name=$3
+    local expected_pattern=${4:-""}
+    
+    local all_passed=true
+    
+    if [ -z "$REMOTE_IP" ]; then
+        echo "ERROR: No REMOTE_IP specified, skipping result parsing" >&2
+        return 1
+    fi
+    
+    echo "Getting remote results from remote server..."
+    
+    for model in "${models[@]}"; do
+        local model_name_clean=$(sanitize_model_name "$model")
+        
+        local remote_log_dir="${REMOTE_TEST_DIR}/${TEST_CASE_RESULT_PATH}/${model_name_clean}"
+        local local_log_dir="${BASE_DIR}/${TEST_CASE_RESULT_PATH}/${model_name_clean}"
+        
+        echo "Processing model: $model_name_clean"
+        echo "  Remote log dir: $remote_log_dir"
+        echo "  Local log dir: $local_log_dir"
+        
+        collect_remote_log_file "$model_name_clean" "$remote_log_filename" "$test_case_name"
+        
+        local log_file="${local_log_dir}/curl_response.log"
+        echo "  Checking results for model: $model"
+        
+        if ! validate_curl_response_from_log "$log_file" "$model" "$expected_pattern"; then
+            all_passed=false
+        fi
+        
+        echo ""
+    done
+    
+    echo "Remote log collection completed"
+    
+    if [ "$all_passed" = true ]; then
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Echo an offline env prefix when the given model already exists in the
+# container's HuggingFace cache, so servers use the local snapshot instead of
+# querying the hub (skips downloads and avoids hf-mirror 429 rate limiting).
+# Models are pre-cached under MODEL_CACHE (mounted at /root/.cache) on both nodes.
+hf_offline_prefix() {
+    local model_name=$1
+    [ -z "$model_name" ] && return 0
+    local cache_dir="models--$(echo "$model_name" | sed 's#/#--#g')"
+    if ${docker_exec} "ls /root/.cache/huggingface/hub/${cache_dir}/snapshots/*/config.json >/dev/null 2>&1"; then
+        echo "HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 "
+    fi
+}
+
+launch_sglang_server() {
+    local model_path=$1
+    local host=$2
+    local port=$3
+    local log_path=$4
+    local pid_suffix=$5
+    local extra_args=${6:-""}
+    local ready_pattern=${7:-"The server is fired up and ready to roll!"}
+    
+    if [ -z "$model_path" ] || [ -z "$host" ] || [ -z "$port" ] || [ -z "$log_path" ] || [ -z "$pid_suffix" ]; then
+        echo "ERROR: Missing required parameters for launch_sglang_server" >&2
+        echo "Usage: launch_sglang_server <model_path> <host> <port> <log_path> <pid_suffix> [extra_args] [ready_pattern]" >&2
+        return 1
+    fi
+    
+    local offline_prefix=$(hf_offline_prefix "$model_path")
+    local sglang_cmd="${docker_exec} \"${offline_prefix}python -m sglang.launch_server --model-path ${model_path} --host ${host} --port ${port}"
+    if [ -n "$extra_args" ]; then
+        sglang_cmd="${sglang_cmd} ${extra_args}"
+    fi
+    
+
+    sglang_cmd="${sglang_cmd} > ${log_path} 2>&1 &\""
+    
+    local pid_file="${PID_DIR}/server_${pid_suffix}.pid"
+    local grep_pattern="python -m sglang.launch_server.*${model_path}"
+    
+    echo "Starting SGLang Server..."
+    if ! launch_and_track_process "$sglang_cmd" "$grep_pattern" "$pid_file"; then
+        return 1
+    fi
+    
+    local host_log_path=$(convert_container_path_to_host "$log_path")
+    if ! check_server_ready_with_pattern "$host_log_path" "$ready_pattern"; then
+        return 1
+    fi
+
+    echo "Performing health check for ${pid_suffix}..."
+    if ! wait_for_server_ready "$host" "$port" "/health"; then
+        echo "ERROR: Health check failed for ${pid_suffix} at http://$host:$port/health"
+        return 1
+    fi
+    echo "${pid_suffix} health check passed"
+    
+    return 0
+}
+
+launch_vllm_server() {
+    local model_path=$1
+    local host=$2
+    local port=$3
+    local log_path=$4
+    local pid_suffix=$5
+    local extra_args=${6:-""}
+    local env_vars=${7:-""}
+    
+    if [ -z "$model_path" ] || [ -z "$host" ] || [ -z "$port" ] || [ -z "$log_path" ] || [ -z "$pid_suffix" ]; then
+        echo "ERROR: Missing required parameters for launch_vllm_server" >&2
+        echo "Usage: launch_vllm_server <model_path> <host> <port> <log_path> <pid_suffix> [extra_args] [env_vars]" >&2
+        return 1
+    fi
+    
+    local env_prefix=""
+    if [ -n "$env_vars" ]; then
+        env_prefix="${env_vars} "
+    fi
+    env_prefix="${env_prefix}$(hf_offline_prefix "$model_path")"
+    
+    local vllm_cmd="${docker_exec} \"${env_prefix}python3 -m vllm.entrypoints.openai.api_server --model '${model_path}' --host '${host}' --port ${port}"
+    
+    if [ -n "$extra_args" ]; then
+        vllm_cmd="${vllm_cmd} ${extra_args}"
+    fi
+    
+    vllm_cmd="${vllm_cmd} > '${log_path}' 2>&1 &\""
+    
+    local pid_file="${PID_DIR}/server_${pid_suffix}.pid"
+    local grep_pattern="python3 -m vllm.entrypoints.openai.api_server.*${model_path}"
+    
+    echo "Starting vLLM Server..."
+    echo "Command: $vllm_cmd"
+    if ! launch_and_track_process "$vllm_cmd" "$grep_pattern" "$pid_file"; then
+        return 1
+    fi
+    
+    local host_log_path=$(convert_container_path_to_host "$log_path")
+    if ! check_vllm_server_ready "$host_log_path"; then
+        return 1
+    fi
+    
+    if ! wait_for_server_ready "$host" "$port" "/health"; then
+        return 1
+    fi
+    
+    return 0
+}
+
+launch_sglang_router() {
+    local prefill_url=$1
+    local decode_url=$2
+    local host=$3
+    local port=$4
+    local log_path=$5
+    local extra_args=${6:-""}
+    
+    if [ -z "$prefill_url" ] || [ -z "$decode_url" ] || [ -z "$host" ] || [ -z "$port" ] || [ -z "$log_path" ]; then
+        echo "ERROR: Missing required parameters for launch_sglang_router" >&2
+        echo "Usage: launch_sglang_router <prefill_url> <decode_url> <host> <port> <log_path> [extra_args]" >&2
+        return 1
+    fi
+    
+    echo "===== Starting SGLang Router ====="
+    
+    local router_cmd="${docker_exec} \"python3 -m sglang_router.launch_router --pd-disaggregation --prefill ${prefill_url} --decode ${decode_url} --host ${host} --port ${port}"
+    if [ -n "$extra_args" ]; then
+        router_cmd="${router_cmd} ${extra_args}"
+    fi
+    
+    router_cmd="${router_cmd} > ${log_path} 2>&1 &\""
+    
+    local pid_file="${PID_DIR}/proxy.pid"
+    local grep_pattern="sglang::router"
+    
+    echo "Load balancer starting..."
+    echo "Command: $router_cmd"
+    if ! launch_and_track_process "$router_cmd" "$grep_pattern" "$pid_file"; then
+        return 1
+    fi
+    
+    local host_log_path=$(convert_container_path_to_host "$log_path")
+    if ! check_proxy_ready "$host_log_path"; then
+        return 1
+    fi
+    
+    return 0
 }

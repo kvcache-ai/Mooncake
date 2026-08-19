@@ -25,7 +25,7 @@ TransferEngine::TransferEngine()
 
 TransferEngine::TransferEngine(const std::string config_path) {
     auto conf = std::make_shared<Config>();
-    auto status = conf->load(config_path);
+    auto status = conf->loadFile(config_path);
     if (!status.ok()) {
         LOG(WARNING) << "Failed to read config file " << config_path;
     }
@@ -140,6 +140,10 @@ Status TransferEngine::submitTransfer(BatchID batch_id,
     return impl_->submitTransfer(batch_id, request_list, notifi);
 }
 
+Status TransferEngine::cancelTransfer(BatchID batch_id, size_t task_id) {
+    return impl_->cancelTransfer(batch_id, task_id);
+}
+
 Status TransferEngine::sendNotification(SegmentID target_id,
                                         const Notification& notifi) {
     return impl_->sendNotification(target_id, notifi);
@@ -148,6 +152,10 @@ Status TransferEngine::sendNotification(SegmentID target_id,
 Status TransferEngine::receiveNotification(
     std::vector<Notification>& notifi_list) {
     return impl_->receiveNotification(notifi_list);
+}
+
+Status TransferEngine::probePeerAliveByID(SegmentID target_id) {
+    return impl_->probePeerAliveByID(target_id);
 }
 
 Status TransferEngine::getTransferStatus(BatchID batch_id, size_t task_id,
@@ -163,6 +171,15 @@ Status TransferEngine::getTransferStatus(
 Status TransferEngine::getTransferStatus(BatchID batch_id,
                                          TransferStatus& overall_status) {
     return impl_->getTransferStatus(batch_id, overall_status);
+}
+
+Status TransferEngine::progressBatch(BatchID batch_id,
+                                     TransferStatus& overall_status) {
+    return impl_->progressBatch(batch_id, overall_status);
+}
+
+Status TransferEngine::getNicLoadStats(std::vector<NicLoadStats>& stats) const {
+    return impl_->getNicLoadStats(stats);
 }
 
 }  // namespace tent

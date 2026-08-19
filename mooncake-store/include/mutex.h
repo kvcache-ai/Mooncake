@@ -1,9 +1,9 @@
 #ifndef THREAD_SAFETY_ANALYSIS_MUTEX_H
 #define THREAD_SAFETY_ANALYSIS_MUTEX_H
 
+#include <atomic>
 #include <mutex>
 #include <shared_mutex>
-#include <atomic>
 
 #if defined(__x86_64__)
 #include <immintrin.h>
@@ -134,6 +134,10 @@ class CAPABILITY("mutex") SpinLock {
    public:
     // Acquire/lock the spinlock.
     void lock() ACQUIRE() {
+        // Fast path: try to acquire directly
+        if (!flag.test_and_set(std::memory_order_acquire)) return;
+
+        // Slow path: spin wait with relaxed loads, acquire on success
         do {
             while (flag.test(std::memory_order_relaxed)) {
                 PAUSE();

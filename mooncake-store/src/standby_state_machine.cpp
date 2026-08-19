@@ -2,8 +2,6 @@
 
 #include <glog/logging.h>
 
-#include "ha_metric_manager.h"
-
 namespace mooncake {
 
 StandbyStateMachine::StandbyStateMachine()
@@ -56,10 +54,6 @@ StateTransitionResult StandbyStateMachine::ValidateTransition(
                     result.allowed = true;
                     result.new_state = StandbyState::RECONNECTING;
                     break;
-                case StandbyEvent::RESYNC_REQUIRED:
-                    result.allowed = true;
-                    result.new_state = StandbyState::SYNCING;
-                    break;
                 case StandbyEvent::STOP:
                     result.allowed = true;
                     result.new_state = StandbyState::STOPPED;
@@ -79,10 +73,6 @@ StateTransitionResult StandbyStateMachine::ValidateTransition(
                 case StandbyEvent::DISCONNECTED:
                     result.allowed = true;
                     result.new_state = StandbyState::RECONNECTING;
-                    break;
-                case StandbyEvent::RESYNC_REQUIRED:
-                    result.allowed = true;
-                    result.new_state = StandbyState::SYNCING;
                     break;
                 case StandbyEvent::MAX_ERRORS_REACHED:
                     result.allowed = true;
@@ -136,10 +126,6 @@ StateTransitionResult StandbyStateMachine::ValidateTransition(
 
         case StandbyState::RECONNECTING:
             switch (event) {
-                case StandbyEvent::RESYNC_REQUIRED:
-                    result.allowed = true;
-                    result.new_state = StandbyState::SYNCING;
-                    break;
                 case StandbyEvent::CONNECTED:
                     result.allowed = true;
                     result.new_state = StandbyState::SYNCING;
@@ -207,9 +193,6 @@ StateTransitionResult StandbyStateMachine::ValidateTransition(
                 // Allow restart from FAILED state
                 result.allowed = true;
                 result.new_state = StandbyState::CONNECTING;
-            } else if (event == StandbyEvent::FORCE_PROMOTE) {
-                result.allowed = true;
-                result.new_state = StandbyState::PROMOTING;
             }
             break;
     }
@@ -258,9 +241,6 @@ StateTransitionResult StandbyStateMachine::ProcessEvent(StandbyEvent event) {
         // Update state
         current_state_.store(result.new_state, std::memory_order_release);
         state_enter_time_ = record.timestamp;
-        HAMetricManager::instance().set_standby_state(
-            static_cast<int64_t>(result.new_state));
-        HAMetricManager::instance().inc_state_transitions();
 
         LOG(INFO) << "Standby state transition: "
                   << StandbyStateToString(old_state) << " -> "

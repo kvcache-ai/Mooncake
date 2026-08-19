@@ -19,9 +19,12 @@
 #include <netdb.h>
 
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <unordered_map>
@@ -42,12 +45,16 @@ struct BootstrapDesc {
     std::string local_nic_path;
     std::string peer_nic_path;
     std::vector<uint32_t> qp_num;
+    // RDMA address of local_nic_path.
+    uint16_t local_lid = 0;
+    std::string local_gid;
     std::string reply_msg;       // on error
     uint32_t notify_qp_num = 0;  // Notification QP number (0 = not supported)
 
    public:
     NLOHMANN_DEFINE_TYPE_INTRUSIVE(BootstrapDesc, local_nic_path, peer_nic_path,
-                                   qp_num, reply_msg, notify_qp_num);
+                                   qp_num, local_lid, local_gid, reply_msg,
+                                   notify_qp_num);
 };
 
 struct XferDataDesc {
@@ -85,6 +92,8 @@ class ControlClient {
     static Status notify(const std::string& server_addr,
                          const Notification& message);
 
+    static Status probe(const std::string& server_addr);
+
     static Status delegate(const std::string& server_addr,
                            const Request& request);
 
@@ -93,15 +102,19 @@ class ControlClient {
 
     static Status unpinStageBuffer(const std::string& server_addr,
                                    uint64_t addr);
+
+    static void subscribeSegmentUpdateAsync(const std::string& server_addr,
+                                            const std::string& subscriber_addr);
+
+    using onNotifySegmentUpdateFailure = std::function<void()>;
+    static void notifySegmentUpdatedAsync(
+        const std::string& server_addr, const std::string& segment_name,
+        const onNotifySegmentUpdateFailure& on_failure);
 };
 
 class ControlService {
    public:
     ControlService(const std::string& type, const std::string& servers,
-                   TransferEngineImpl* impl);
-
-    ControlService(const std::string& type, const std::string& servers,
-                   const std::string& password, uint8_t db_index,
                    TransferEngineImpl* impl);
 
     ~ControlService();
@@ -111,13 +124,9 @@ class ControlService {
 
     SegmentManager& segmentManager() { return *manager_.get(); }
 
-    void setBootstrapRdmaCallback(const OnReceiveBootstrap& callback) {
-        bootstrap_callback_ = callback;
-    }
+    void setBootstrapRdmaCallback(const OnReceiveBootstrap& callback);
 
-    void setNotifyCallback(const OnNotify& callback) {
-        notify_callback_ = callback;
-    }
+    void setNotifyCallback(const OnNotify& callback);
 
     Status start(uint16_t& port, bool ipv6_ = false);
 
@@ -134,6 +143,8 @@ class ControlService {
 
     void onNotify(const std::string_view& request, std::string& response);
 
+    void onProbe(const std::string_view& request, std::string& response);
+
     void onDelegate(const std::string_view& request, std::string& response);
 
     void onPinStageBuffer(const std::string_view& request,
@@ -142,12 +153,33 @@ class ControlService {
     void onUnpinStageBuffer(const std::string_view& request,
                             std::string& response);
 
+    void onSubscribeSegmentUpdate(const std::string_view& request,
+                                  std::string& response);
+
+    void onSegmentUpdated(const std::string_view& request,
+                          std::string& response);
+
+    void finishBootstrapCallback();
+
+    void finishNotifyCallback();
+
    private:
     std::unique_ptr<SegmentManager> manager_;
     std::shared_ptr<CoroRpcAgent> rpc_server_;
 
+    std::mutex bootstrap_cb_mutex_;
+    std::condition_variable bootstrap_cb_cv_;
+    size_t bootstrap_callbacks_in_flight_ = 0;
+    std::chrono::milliseconds callback_drain_timeout_{std::chrono::seconds(5)};
     OnReceiveBootstrap bootstrap_callback_;
+    static thread_local const ControlService* active_bootstrap_service_;
+
+    std::mutex notify_cb_mutex_;
+    std::condition_variable notify_cb_cv_;
+    size_t notify_callbacks_in_flight_ = 0;
     OnNotify notify_callback_;
+    static thread_local const ControlService* active_notify_service_;
+
     TransferEngineImpl* impl_;
 };
 

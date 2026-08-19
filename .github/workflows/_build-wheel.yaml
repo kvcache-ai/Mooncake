@@ -1,0 +1,262 @@
+name: _build-wheel
+
+# Shared build for one supported wheel variant (matrixed over Python version).
+# Callers choose the package variant and architecture; toolchain and CMake
+# details live here so CI, nightly, pre-release, and release cannot drift.
+
+on:
+  workflow_call:
+    inputs:
+      variant:
+        # cuda | cuda13 | non-cuda
+        type: string
+        default: cuda
+      architecture:
+        # x86_64 | arm64
+        type: string
+        default: x86_64
+      python-versions:
+        type: string
+        default: '["3.10", "3.11", "3.12", "3.13"]'
+      artifact-prefix:
+        type: string
+        required: true
+      version-override:
+        # Optional: override the wheel version instead of deriving from git tag.
+        # Used by nightly builds to stamp date-based dev versions.
+        type: string
+        default: ''
+
+env:
+  SCCACHE_GHA_ENABLED: "true"
+
+jobs:
+  build:
+    runs-on: ${{ inputs.architecture == 'arm64' && 'ubuntu-22.04-arm' || 'ubuntu-22.04' }}
+    # manylinux2_28 keeps the x86 wheel's libstdc++/glibc floor compatible with
+    # RHEL/Rocky/Alma 8+. The CUDA image is also the toolchain for non-CUDA builds.
+    container: >-
+      ${{ inputs.architecture == 'arm64' &&
+          (inputs.variant == 'cuda13' && 'pytorch/manylinuxaarch64-builder:cuda13.0' || 'pytorch/manylinuxaarch64-builder:cuda12.8') ||
+          (inputs.variant == 'cuda13' && 'pytorch/manylinux2_28-builder:cuda13.0' || 'pytorch/manylinux2_28-builder:cuda12.8') }}
+    permissions:
+      contents: read
+    strategy:
+      matrix:
+        python-version: ${{ fromJSON(inputs.python-versions) }}
+    env:
+      BUILD_ARCHITECTURE: ${{ inputs.architecture }}
+      BUILD_VARIANT: ${{ inputs.variant }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Mark workspace safe for git
+        run: git config --global --add safe.directory '*'
+
+      - name: Configure build profile
+        shell: bash
+        run: |
+          case "$BUILD_VARIANT:$BUILD_ARCHITECTURE" in
+            cuda:x86_64)
+              variant_flag=''
+              generator=''
+              arch_list='8.0;9.0'
+              ep_versions='2.11.0;2.12.0;2.12.1;2.13.0'
+              build_nvlink=true
+              cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release'
+              ;;
+            cuda13:x86_64)
+              variant_flag=CU13_BUILD
+              generator=''
+              arch_list='8.0;9.0'
+              ep_versions='2.11.0;2.12.0;2.12.1;2.13.0'
+              build_nvlink=true
+              cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=ON -DWITH_EP=ON -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release'
+              ;;
+            non-cuda:x86_64)
+              variant_flag=NON_CUDA_BUILD
+              generator=''
+              arch_list=''
+              ep_versions=''
+              build_nvlink=false
+              cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=OFF -DWITH_EP=OFF -DSTORE_USE_ETCD=ON -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release'
+              ;;
+            cuda:arm64|cuda13:arm64)
+              variant_flag=''
+              if [ "$BUILD_VARIANT" = cuda13 ]; then
+                variant_flag=CU13_BUILD
+              fi
+              generator=Ninja
+              arch_list='9.0'
+              ep_versions=''
+              build_nvlink=false
+              cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_CUDA=ON -DUSE_MNNVL=ON -DWITH_EP=OFF -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release'
+              ;;
+            non-cuda:arm64)
+              variant_flag=NON_CUDA_BUILD
+              generator=Ninja
+              arch_list=''
+              ep_versions=''
+              build_nvlink=false
+              cmake_args='-DBUILD_UNIT_TESTS=OFF -DUSE_HTTP=ON -DUSE_ETCD=ON -DUSE_CUDA=OFF -DWITH_EP=OFF -DSTORE_USE_ETCD=ON -DWITH_STORE_RUST=OFF -DENABLE_SCCACHE=ON -DCMAKE_BUILD_TYPE=Release'
+              ;;
+            *)
+              echo "::error::Unsupported wheel profile: $BUILD_VARIANT/$BUILD_ARCHITECTURE"
+              exit 1
+              ;;
+          esac
+
+          {
+            echo "VARIANT_FLAG=$variant_flag"
+            echo "CMAKE_GEN=$generator"
+            echo "TORCH_CUDA_ARCH_LIST=$arch_list"
+            echo "EP_TORCH_VERSIONS_INPUT=$ep_versions"
+            echo "BUILD_NVLINK_ALLOCATOR=$build_nvlink"
+            echo "CMAKE_ARGS=$cmake_args"
+          } >> "$GITHUB_ENV"
+
+      - name: Set version
+        run: |
+          if [ -n "${{ inputs.version-override }}" ]; then
+            echo "VERSION=${{ inputs.version-override }}" >> "$GITHUB_ENV"
+          else
+            echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+          fi
+
+      - name: Patch wheel version in pyproject.toml
+        if: ${{ inputs.version-override != '' }}
+        run: |
+          sed -i "s/^version = .*/version = \"$VERSION\"/" mooncake-wheel/pyproject.toml
+          echo "Patched mooncake-wheel/pyproject.toml version to: $VERSION"
+
+      - name: Select Python ${{ matrix.python-version }} from manylinux image
+        run: |
+          PYV_NODOT=$(echo "${{ matrix.python-version }}" | tr -d '.')
+          PYBIN="/opt/python/cp${PYV_NODOT}-cp${PYV_NODOT}/bin"
+          echo "$PYBIN" >> "$GITHUB_PATH"
+          "$PYBIN/pip" install --quiet "cmake<4" setuptools wheel
+
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Configure sccache
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Configure project
+        run: |
+          SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
+          if [ -n "$SUDO" ] && command -v apt-get >/dev/null 2>&1; then
+            $SUDO apt-get update -y || true
+          fi
+          $SUDO bash -x dependencies.sh -y
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+          gen=(); [ -n "$CMAKE_GEN" ] && gen=(-G "$CMAKE_GEN")
+          ep=(); [ -n "$EP_TORCH_VERSIONS_INPUT" ] && ep=(-DEP_TORCH_VERSIONS="$EP_TORCH_VERSIONS_INPUT")
+          mkdir -p build && cd build
+          # shellcheck disable=SC2086
+          cmake "${gen[@]}" .. $CMAKE_ARGS "${ep[@]}" -DPython3_EXECUTABLE="$(which python3)"
+
+      - name: Build project
+        env:
+          # Bound the nested Ninja build used by torch.utils.cpp_extension.
+          MAX_JOBS: "2"
+        run: |
+          for dir in /usr/local/cuda/lib64/stubs /usr/local/cuda/targets/*/lib/stubs; do
+            [ -d "$dir" ] && export LIBRARY_PATH="$dir:${LIBRARY_PATH:-}"
+          done
+          [ -d /usr/local/cuda ] && export CUDA_HOME=/usr/local/cuda
+          SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -E"
+          cd build
+          cmake --build . -j"$(nproc)"
+          $SUDO cmake --install .
+
+      - name: Build nvlink_allocator.so
+        if: ${{ env.BUILD_NVLINK_ALLOCATOR == 'true' }}
+        run: |
+          export PATH=/usr/local/nvidia/bin:/usr/local/nvidia/lib64:$PATH
+          if [ -d /usr/local/cuda/lib64/stubs ]; then
+            export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH:-}
+            export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:${LIBRARY_PATH:-}
+          fi
+          mkdir -p build/mooncake-transfer-engine/nvlink-allocator
+          cd mooncake-transfer-engine/nvlink-allocator
+          bash build.sh ../../build/mooncake-transfer-engine/nvlink-allocator/
+
+      - name: Run sccache stat for check
+        if: ${{ env.SCCACHE_PATH != '' }}
+        run: ${SCCACHE_PATH} --show-stats
+
+      - name: Generate Python version tag
+        id: pytag
+        run: echo "tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> "$GITHUB_OUTPUT"
+
+      - name: Build Python wheel
+        run: |
+          [ -d /usr/local/cuda ] && export CUDA_HOME=/usr/local/cuda
+          export LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}:/usr/local/lib"
+          variant=()
+          [ -n "$VARIANT_FLAG" ] && variant=("$VARIANT_FLAG=1")
+          env "${variant[@]}" \
+            PYTHON_VERSION="${{ matrix.python-version }}" \
+            OUTPUT_DIR="dist-py${{ steps.pytag.outputs.tag }}" \
+            ./scripts/build_wheel.sh
+        env:
+          VERSION: ${{ env.VERSION }}
+
+      - name: Smoke test repaired wheel
+        run: |
+          smoke_venv=$(mktemp -d)
+          python -m venv "$smoke_venv"
+          "$smoke_venv/bin/python" -m pip install --no-deps \
+            mooncake-wheel/dist-py${{ steps.pytag.outputs.tag }}/*.whl
+
+          if [ "${VARIANT_FLAG:-}" = "NON_CUDA_BUILD" ]; then
+            site_packages=$("$smoke_venv/bin/python" -c \
+              'import sysconfig; print(sysconfig.get_paths()["purelib"])')
+            master="$site_packages/mooncake/mooncake_master"
+            if readelf -d "$master" | grep -Eq \
+              'Shared library: \[(libcuda|libcudart)\.so'; then
+              echo "Non-CUDA mooncake_master depends on CUDA"
+              readelf -d "$master" | grep 'Shared library:'
+              exit 1
+            fi
+          fi
+
+          export LD_LIBRARY_PATH="/usr/local/lib:${LD_LIBRARY_PATH:-}"
+          for dir in /usr/local/cuda/lib64 \
+                     /usr/local/cuda/lib64/stubs \
+                     /usr/local/cuda/targets/*/lib \
+                     /usr/local/cuda/targets/*/lib/stubs; do
+            [ -d "$dir" ] && export LD_LIBRARY_PATH="$dir:$LD_LIBRARY_PATH"
+          done
+
+          # CUDA builder images contain the link-time driver stub but not the
+          # real libcuda.so.1 supplied by an NVIDIA driver. Non-CUDA wheels must
+          # not receive this alias, so an accidental CUDA dependency still fails.
+          if [ "${VARIANT_FLAG:-}" != "NON_CUDA_BUILD" ]; then
+            cuda_stub=
+            for candidate in /usr/local/cuda/lib64/stubs/libcuda.so \
+                             /usr/local/cuda/targets/*/lib/stubs/libcuda.so; do
+              if [ -f "$candidate" ]; then
+                cuda_stub="$candidate"
+                break
+              fi
+            done
+            if [ -n "$cuda_stub" ]; then
+              ln -s "$cuda_stub" "$smoke_venv/libcuda.so.1"
+              export LD_LIBRARY_PATH="$smoke_venv:$LD_LIBRARY_PATH"
+            fi
+          fi
+
+          "$smoke_venv/bin/mooncake_master" --version
+
+      - name: Upload Python wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact-prefix }}-py${{ steps.pytag.outputs.tag }}
+          path: mooncake-wheel/dist-py${{ steps.pytag.outputs.tag }}/*.whl

@@ -1,0 +1,609 @@
+#include "local_hot_cache.h"
+
+#include <algorithm>
+#include <cstring>
+#include <cstdlib>
+#include <cstdint>
+#include <regex>
+#include <shared_mutex>
+#include <glog/logging.h>
+
+namespace mooncake {
+namespace {
+constexpr size_t DEFAULT_BLOCK_SIZE = 16 * 1024 * 1024;  // 16MB default block
+}
+
+// ---------------------------------------------------------------------------
+// LocalHotCache
+// ---------------------------------------------------------------------------
+
+LocalHotCache::LocalHotCache(size_t total_size_bytes, size_t block_size_bytes,
+                             bool use_shm)
+    : block_size_((block_size_bytes > 0) ? block_size_bytes
+                                         : DEFAULT_BLOCK_SIZE),
+      bulk_memory_standard_(nullptr),
+      use_shm_(use_shm) {
+    size_t block_num = 0;
+    if (total_size_bytes > 0) {
+        block_num = total_size_bytes / block_size_;
+    }
+
+    blocks_.reserve(block_num);
+    size_t total_size = block_num * block_size_;
+    bulk_memory_size_ = total_size;
+
+    if (block_num == 0 || total_size == 0) return;
+
+    // Allocate bulk region: memfd (cross-process shareable) or malloc (private)
+    if (use_shm_) {
+        try {
+            bulk_memory_standard_ =
+                ShmHelper::getInstance()->allocate(total_size);
+            shm_segment_ =
+                ShmHelper::getInstance()->get_shm(bulk_memory_standard_);
+            LOG(INFO) << "Hot cache allocated via shm, size=" << total_size
+                      << " fd=" << shm_segment_->fd;
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "Failed to allocate shm for hot cache: " << e.what();
+            return;
+        }
+    } else {
+        bulk_memory_standard_ = std::malloc(total_size);
+        if (!bulk_memory_standard_) return;
+    }
+
+    // Split bulk region into fixed-size blocks
+    char* base_ptr = static_cast<char*>(bulk_memory_standard_);
+    for (size_t i = 0; i < block_num; ++i) {
+        auto block = std::make_unique<HotMemBlock>();
+        block->addr = base_ptr + i * block_size_;
+        block->size = block_size_;
+        block->ref_count = 0;
+        block->key_.clear();
+        lru_queue_.push_back(block.get());
+        blocks_.emplace_back(std::move(block));
+    }
+}
+
+LocalHotCache::~LocalHotCache() {
+    if (use_shm_ && bulk_memory_standard_) {
+        // ShmHelper owns the mapping; release via its free()
+        ShmHelper::getInstance()->free(bulk_memory_standard_);
+    } else if (bulk_memory_standard_) {
+        std::free(bulk_memory_standard_);
+    }
+}
+
+bool LocalHotCache::PutHotKey(HotMemBlock* block) {
+    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+    return putHotKeyLocked(block);
+}
+
+bool LocalHotCache::PutHotKey(HotMemBlock* block,
+                              const HotCachePutToken& token) {
+    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+    // Validate the token and publish under the same lock so a concurrent
+    // Remove/Bump cannot slip in between the check and the publish.
+    if (block && !block->key_.empty() &&
+        !isPutTokenValidLocked(block->key_, token)) {
+        // Stale async fill: drop the data and return the block to the pool.
+        block->key_.clear();
+    }
+    return putHotKeyLocked(block);
+}
+
+bool LocalHotCache::putHotKeyLocked(HotMemBlock* block) {
+    // Drain deferred LRU touches
+    drainDeferredTouches();
+
+    if (!block) return false;
+
+    // Handle return-to-lru tail case (empty key or cancelled task)
+    if (block->key_.empty()) {
+        block->ref_count = 0;
+        lru_queue_.push_back(block);  // Add to tail as free block
+        return false;
+    }
+
+    const std::string& key = block->key_;
+
+    // Race condition check: did someone else insert this key while we were
+    // copying
+    if (key_to_lru_it_.find(key) != key_to_lru_it_.end() ||
+        hasActiveBlockForKeyLocked(key)) {
+        // Lost race -> Return to lru tail as free block
+        block->key_.clear();
+        block->ref_count = 0;
+        lru_queue_.push_back(block);
+        return false;
+    }
+
+    // Publish the new mapping
+    block->ref_count = 0;
+    lru_queue_.push_front(block);
+    key_to_lru_it_[key] = lru_queue_.begin();
+    return true;
+}
+
+bool LocalHotCache::HasHotKey(const std::string& key) const {
+    std::shared_lock<std::shared_mutex> lk(lru_mutex_);
+    return key_to_lru_it_.find(key) != key_to_lru_it_.end();
+}
+
+HotMemBlock* LocalHotCache::GetHotKey(const std::string& key) {
+    std::shared_lock<std::shared_mutex> lk(lru_mutex_);
+    auto it = key_to_lru_it_.find(key);
+    if (it == key_to_lru_it_.end()) {
+        return nullptr;
+    }
+    HotMemBlock* blk = *(it->second);
+    if (!blk) {
+        LOG(ERROR) << "Invalid block for key: " << key;
+        return nullptr;
+    }
+
+    // Mark block as in use to prevent it from being reused during memcpy
+    blk->ref_count++;
+
+    // Defer LRU reordering via atomic flag (drained before eviction)
+    blk->accessed.store(true, std::memory_order_relaxed);
+
+    return blk;
+}
+
+void LocalHotCache::ReleaseHotKey(const std::string& key) {
+    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+    auto it = key_to_lru_it_.find(key);
+    if (it != key_to_lru_it_.end()) {
+        HotMemBlock* block = *(it->second);
+        if (block && block->ref_count > 0) {
+            block->ref_count--;
+            return;
+        }
+    }
+
+    // The entry may have been removed while a reader still holds the block.
+    // Keep the key on active removed blocks so release can find and retire it.
+    for (auto& owned_block : blocks_) {
+        HotMemBlock* block = owned_block.get();
+        if (block && block->key_ == key && block->ref_count > 0) {
+            block->ref_count--;
+            if (block->ref_count == 0 &&
+                key_to_lru_it_.find(key) == key_to_lru_it_.end()) {
+                block->key_.clear();
+                block->accessed.store(false, std::memory_order_relaxed);
+            }
+            return;
+        }
+    }
+}
+
+bool LocalHotCache::hasActiveBlockForKeyLocked(const std::string& key) const {
+    for (const auto& owned_block : blocks_) {
+        const HotMemBlock* block = owned_block.get();
+        if (block && block->key_ == key && block->ref_count > 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool LocalHotCache::removeHotKeyLocked(const std::string& key) {
+    auto it = key_to_lru_it_.find(key);
+    if (it == key_to_lru_it_.end()) {
+        return false;
+    }
+
+    HotMemBlock* block = *(it->second);
+    lru_queue_.erase(it->second);
+    key_to_lru_it_.erase(it);
+
+    if (block->ref_count == 0) {
+        block->key_.clear();
+        block->accessed.store(false, std::memory_order_relaxed);
+    }
+    lru_queue_.push_back(block);
+
+    return true;
+}
+
+bool LocalHotCache::RemoveHotKey(const std::string& key) {
+    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+
+    key_generation_[key]++;
+    drainDeferredTouches();
+
+    const bool removed = removeHotKeyLocked(key);
+    if (removed) {
+        VLOG(2) << "Removed hot key: " << key << " from hot cache";
+    }
+    return removed;
+}
+
+size_t LocalHotCache::RemoveHotKeys(const std::vector<std::string>& keys) {
+    if (keys.empty()) {
+        return 0;
+    }
+
+    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+    drainDeferredTouches();
+
+    size_t removed = 0;
+    for (const auto& key : keys) {
+        key_generation_[key]++;
+        if (removeHotKeyLocked(key)) {
+            ++removed;
+        }
+    }
+    return removed;
+}
+
+size_t LocalHotCache::RemoveHotKeysByRegex(const std::string& regex_pattern) {
+    std::regex pattern;
+    try {
+        pattern = std::regex(regex_pattern, std::regex::ECMAScript);
+    } catch (const std::regex_error& e) {
+        LOG(ERROR) << "RemoveHotKeysByRegex: invalid pattern: " << regex_pattern
+                   << ", error: " << e.what();
+        return 0;
+    }
+
+    std::vector<std::string> matching_keys;
+    {
+        std::shared_lock<std::shared_mutex> lk(lru_mutex_);
+        matching_keys.reserve(key_to_lru_it_.size());
+        for (const auto& [key, _] : key_to_lru_it_) {
+            if (std::regex_search(key, pattern)) {
+                matching_keys.emplace_back(key);
+            }
+        }
+    }
+
+    if (matching_keys.empty()) {
+        return 0;
+    }
+
+    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+    drainDeferredTouches();
+
+    size_t removed = 0;
+    for (const auto& key : matching_keys) {
+        key_generation_[key]++;
+        if (removeHotKeyLocked(key)) {
+            ++removed;
+        }
+    }
+    return removed;
+}
+
+size_t LocalHotCache::RemoveAllHotKeys() {
+    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+    cache_epoch_.fetch_add(1, std::memory_order_relaxed);
+
+    std::vector<std::string> keys;
+    keys.reserve(key_to_lru_it_.size());
+    for (const auto& [key, _] : key_to_lru_it_) {
+        keys.emplace_back(key);
+    }
+
+    size_t removed = 0;
+    for (const auto& key : keys) {
+        if (removeHotKeyLocked(key)) {
+            ++removed;
+        }
+    }
+    key_generation_.clear();
+    return removed;
+}
+
+void LocalHotCache::BumpKeyGeneration(const std::string& key) {
+    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+    key_generation_[key]++;
+}
+
+void LocalHotCache::BumpKeyGenerations(const std::vector<std::string>& keys) {
+    if (keys.empty()) {
+        return;
+    }
+
+    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+    for (const auto& key : keys) {
+        key_generation_[key]++;
+    }
+}
+
+void LocalHotCache::BumpCacheEpoch() {
+    cache_epoch_.fetch_add(1, std::memory_order_relaxed);
+}
+
+void LocalHotCache::Clear() {
+    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+    cache_epoch_.fetch_add(1, std::memory_order_relaxed);
+
+    std::vector<std::string> keys;
+    keys.reserve(key_to_lru_it_.size());
+    for (const auto& [key, _] : key_to_lru_it_) {
+        keys.emplace_back(key);
+    }
+
+    for (const auto& key : keys) {
+        removeHotKeyLocked(key);
+    }
+    key_generation_.clear();
+}
+
+HotCachePutToken LocalHotCache::AcquirePutToken(const std::string& key) {
+    std::shared_lock<std::shared_mutex> lk(lru_mutex_);
+    HotCachePutToken token;
+    token.cache_epoch = cache_epoch_.load(std::memory_order_relaxed);
+    auto it = key_generation_.find(key);
+    token.key_generation = (it != key_generation_.end()) ? it->second : 0;
+    return token;
+}
+
+bool LocalHotCache::isPutTokenValidLocked(const std::string& key,
+                                          const HotCachePutToken& token) const {
+    if (token.cache_epoch != cache_epoch_.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    auto it = key_generation_.find(key);
+    const uint64_t current_gen = (it != key_generation_.end()) ? it->second : 0;
+    return token.key_generation == current_gen;
+}
+
+bool LocalHotCache::IsPutTokenValid(const std::string& key,
+                                    const HotCachePutToken& token) const {
+    std::shared_lock<std::shared_mutex> lk(lru_mutex_);
+    return isPutTokenValidLocked(key, token);
+}
+
+bool LocalHotCache::TouchHotKey(const std::string& key) {
+    std::shared_lock<std::shared_mutex> lk(lru_mutex_);
+    auto it = key_to_lru_it_.find(key);
+    if (it == key_to_lru_it_.end()) {
+        return false;
+    }
+    HotMemBlock* blk = *(it->second);
+    if (blk) {
+        blk->accessed.store(true, std::memory_order_relaxed);
+    }
+    return true;
+}
+
+HotMemBlock* LocalHotCache::GetFreeBlock() {
+    std::unique_lock<std::shared_mutex> lk(lru_mutex_);
+
+    // Drain deferred LRU touches before scanning for victims
+    drainDeferredTouches();
+
+    if (lru_queue_.empty()) {
+        return nullptr;
+    }
+
+    // Find the first block from the tail that is not in use
+    auto victim_it = lru_queue_.end();
+    for (auto it = lru_queue_.rbegin(); it != lru_queue_.rend(); ++it) {
+        if ((*it)->ref_count == 0) {
+            // Convert reverse iterator to forward iterator
+            victim_it = std::next(it).base();
+            break;
+        }
+    }
+
+    // If all blocks are in use, cannot reuse any block
+    if (victim_it == lru_queue_.end()) {
+        return nullptr;
+    }
+
+    HotMemBlock* victim = *victim_it;
+
+    // Remove from LRU list completely (detach)
+    lru_queue_.erase(victim_it);
+
+    // If victim was bound to an old key, remove the old mapping
+    if (!victim->key_.empty()) {
+        auto it_map = key_to_lru_it_.find(victim->key_);
+        if (it_map != key_to_lru_it_.end()) {
+            key_to_lru_it_.erase(it_map);
+        }
+        victim->key_.clear();
+    }
+
+    // Now this block is exclusively owned by the caller.
+    // It is detached from the cache structure.
+    victim->ref_count = 0;
+
+    return victim;
+}
+
+void LocalHotCache::drainDeferredTouches() {
+    // Caller must hold exclusive lock on lru_mutex_.
+    // Iterate the LRU list and splice any block with accessed=true to front.
+    for (auto it = lru_queue_.begin(); it != lru_queue_.end();) {
+        HotMemBlock* blk = *it;
+        if (blk && blk->accessed.exchange(false, std::memory_order_relaxed)) {
+            if (it != lru_queue_.begin()) {
+                auto cur = it++;
+                lru_queue_.splice(lru_queue_.begin(), lru_queue_, cur);
+                // Update the map iterator
+                if (!blk->key_.empty()) {
+                    auto map_it = key_to_lru_it_.find(blk->key_);
+                    if (map_it != key_to_lru_it_.end()) {
+                        map_it->second = lru_queue_.begin();
+                    }
+                }
+            } else {
+                ++it;
+            }
+        } else {
+            ++it;
+        }
+    }
+}
+
+size_t LocalHotCache::GetCacheSize() const {
+    std::shared_lock<std::shared_mutex> lk(lru_mutex_);
+    return lru_queue_.size();
+}
+
+size_t LocalHotCache::GetBlockOffset(const void* addr) const {
+    if (!bulk_memory_standard_ || !addr) return SIZE_MAX;
+    auto base = reinterpret_cast<uintptr_t>(bulk_memory_standard_);
+    auto target = reinterpret_cast<uintptr_t>(addr);
+    if (target < base || target >= base + bulk_memory_size_) return SIZE_MAX;
+    return static_cast<size_t>(target - base);
+}
+
+constexpr size_t kDefaultHotCacheWorkers = 2;
+
+LocalHotCacheHandler::LocalHotCacheHandler(
+    std::shared_ptr<LocalHotCache> hot_cache, size_t num_worker_threads,
+    size_t max_queue_capacity)
+    : hot_cache_(hot_cache),
+      max_queue_capacity_(max_queue_capacity),
+      shutdown_(false) {
+    size_t workers =
+        (num_worker_threads > 0) ? num_worker_threads : kDefaultHotCacheWorkers;
+
+    // Start worker threads
+    workers_.reserve(workers);
+    for (size_t i = 0; i < workers; ++i) {
+        workers_.emplace_back(&LocalHotCacheHandler::workerThread, this);
+    }
+}
+
+LocalHotCacheHandler::~LocalHotCacheHandler() {
+    // Signal shutdown
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        shutdown_ = true;
+    }
+    queue_cv_.notify_all();
+
+    // Wait for all workers to finish
+    for (auto& worker : workers_) {
+        if (worker.joinable()) {
+            worker.join();
+        }
+    }
+}
+
+bool LocalHotCacheHandler::SubmitPutTask(const std::string& key,
+                                         const Slice& slice) {
+    if (!hot_cache_) {
+        return false;
+    }
+
+    if (slice.ptr == nullptr || slice.size == 0) {
+        return false;
+    }
+
+    // Optimization: if key exists, just touch LRU to avoid data copy
+    if (hot_cache_->TouchHotKey(key)) {
+        return true;
+    }
+
+    // Check queue capacity before copy
+    if (max_queue_capacity_ > 0) {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        if (task_queue_.size() >= max_queue_capacity_) {
+            LOG_EVERY_N(WARNING, 100)
+                << "Hot cache task queue full (" << task_queue_.size()
+                << "), dropping key: " << key;
+            return false;
+        }
+    }
+
+    // Try to get a free block (may evict from LRU tail)
+    HotCachePutToken token = hot_cache_->AcquirePutToken(key);
+    HotMemBlock* block = hot_cache_->GetFreeBlock();
+    if (!block) {
+        LOG(ERROR) << "Hot cache is fully in-use, fail to get a free block: "
+                   << key;
+        return false;
+    }
+
+    // Check size compatibility against the block's physical capacity.
+    // block->size carries the *logical* length of the last object stored in
+    // the block (set below and relied upon as the object length on the read
+    // path), and GetFreeBlock() does not reset it on reuse. Comparing against
+    // block->size would therefore reject any object larger than the previous
+    // one a recycled block happened to hold, permanently shrinking the block's
+    // usable capacity. The true capacity is the fixed block size.
+    if (slice.size > hot_cache_->GetBlockSize()) {
+        // Slice too big for block, return block to pool
+        block->key_.clear();
+        hot_cache_->PutHotKey(block);
+        return false;
+    }
+
+    // Copy data directly into the block (No Lock held here!)
+    // This is the only copy operation: Source -> Block
+    std::memcpy(block->addr, slice.ptr, slice.size);
+    block->size = slice.size;
+    block->key_ = key;  // Set key for insertion
+
+    HotCachePutTask task(key, slice, block, hot_cache_, token);
+
+    {
+        std::lock_guard<std::mutex> lock(queue_mutex_);
+        if (shutdown_) {
+            // Must return block to avoid leak
+            hot_cache_->PutHotKey(block);
+            LOG(WARNING)
+                << "Attempting to submit task to shutdown LocalHotCacheHandler";
+            return false;
+        }
+        task_queue_.push(std::move(task));
+    }
+    queue_cv_.notify_one();
+    return true;
+}
+
+void LocalHotCacheHandler::workerThread() {
+    VLOG(2) << "LocalHotCacheHandler worker thread started";
+
+    while (true) {
+        HotCachePutTask task;
+
+        // Wait for task or shutdown signal
+        {
+            std::unique_lock<std::mutex> lock(queue_mutex_);
+            while (!shutdown_ && task_queue_.empty()) {
+                queue_cv_.wait(lock);
+            }
+
+            if (shutdown_ && task_queue_.empty()) {
+                break;
+            }
+
+            if (!task_queue_.empty()) {
+                task = std::move(task_queue_.front());
+                task_queue_.pop();
+            }
+        }
+
+        // Execute the task if we have one
+        if (task.hot_cache && task.block) {
+            try {
+                // Validate token and publish atomically: a Remove/Bump that
+                // races after the check can no longer resurrect a stale fill.
+                if (task.hot_cache->PutHotKey(task.block, task.token)) {
+                    VLOG(2) << "Put task completed: " << task.key;
+                } else {
+                    VLOG(2) << "Put task skipped or cancelled: " << task.key;
+                }
+            } catch (const std::exception& e) {
+                LOG(ERROR) << "Exception during async hot cache put for key "
+                           << task.key << ": " << e.what();
+                // Ensure block is returned to pool on exception
+                // Clear key to force return-to-pool behavior
+                task.block->key_.clear();
+                task.hot_cache->PutHotKey(task.block);
+            }
+        }
+    }
+
+    VLOG(2) << "LocalHotCacheHandler worker thread exiting";
+}
+}  // namespace mooncake

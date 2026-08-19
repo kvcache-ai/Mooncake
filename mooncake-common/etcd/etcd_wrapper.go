@@ -4,35 +4,119 @@ package main
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+
+// Trampolines to invoke C/C++ function pointers safely from Go via cgo.
+// NOTE: Calling a C function pointer by converting it to a Go func is undefined
+// and can crash. Always go through a C helper like these.
+
+#ifndef MOONCAKE_ETCD_CALLBACK_TRAMPOLINES
+#define MOONCAKE_ETCD_CALLBACK_TRAMPOLINES
+
+typedef void (*watch_cb_t)(void* ctx,
+                             const char* key, size_t keySize,
+                             const char* value, size_t valueSize,
+                             int eventType,
+                             long long modRev);
+
+static inline void call_watch_cb(void* func,
+                                    void* ctx,
+                                    const char* key, size_t keySize,
+                                    const char* value, size_t valueSize,
+                                    int eventType,
+                                    long long modRev) {
+  ((watch_cb_t)func)(ctx, key, keySize, value, valueSize, eventType, modRev);
+}
+
+#endif  // MOONCAKE_ETCD_CALLBACK_TRAMPOLINES
 */
 import "C"
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"strings"
 	"sync"
 	"time"
+	"unsafe"
 
+	rpctypes "go.etcd.io/etcd/api/v3/v3rpc/rpctypes"
 	clientv3 "go.etcd.io/etcd/client/v3"
 )
+
+// prefixWatchInfo stores cancel function and callback context for a prefix watch
+type prefixWatchInfo struct {
+	cancel          context.CancelFunc
+	callbackContext unsafe.Pointer
+	// done is closed when the watch goroutine fully exits (no more callbacks).
+	done chan struct{}
+	// broken means this watch ended because reset/error made it untrustworthy.
+	broken bool
+	// brokenNotified prevents duplicate WATCH_BROKEN callbacks from exit races.
+	brokenNotified bool
+}
 
 // Use different etcd client so they are not affected by each other,
 // and can be configured separately.
 var (
 	// etcd client for transform engine
-	globalClient *clientv3.Client
-	globalMutex        sync.Mutex
-	globalRefCount     int
+	globalClient   *clientv3.Client
+	globalMutex    sync.Mutex
+	globalRefCount int
 	// etcd client for store
-	storeClient  *clientv3.Client
-	storeMutex   sync.Mutex
+	storeClient *clientv3.Client
+	storeMutex  sync.Mutex
 	// keep alive contexts for store
-	storeKeepAliveCtx = make(map[int64]context.CancelFunc)
-	storeKeepAliveMutex    sync.Mutex
+	storeKeepAliveCtx   = make(map[int64]context.CancelFunc)
+	storeKeepAliveMutex sync.Mutex
 	// watch contexts for store
-	storeWatchCtx = make(map[string]context.CancelFunc)
-	storeWatchMutex    sync.Mutex
+	storeWatchCtx   = make(map[string]context.CancelFunc)
+	storeWatchMutex sync.Mutex
+	// etcd client for HA snapshot
+	snapshotClient *clientv3.Client
+	snapshotMutex  sync.Mutex
+	// watch contexts for prefix watch
+	storePrefixWatchCtx   = make(map[string]prefixWatchInfo)
+	storePrefixWatchMutex sync.Mutex
 )
+
+const (
+	// Snapshot client config (for GB-level snapshot files)
+	snapshotMaxMsgSize = 2000 * 1000 * 1000 // 2GB
+	snapshotTimeout    = 60 * time.Second   // 1 minute for large files
+)
+
+const (
+	storeDialKeepAliveTime    = 10 * time.Second
+	storeDialKeepAliveTimeout = 3 * time.Second
+)
+
+func newStoreClientConfig(validEndpoints []string) clientv3.Config {
+	return clientv3.Config{
+		Endpoints:            validEndpoints,
+		DialTimeout:          5 * time.Second,
+		DialKeepAliveTime:    storeDialKeepAliveTime,
+		DialKeepAliveTimeout: storeDialKeepAliveTimeout,
+	}
+}
+
+func parseEtcdEndpoints(endpoints *C.char) []string {
+	if endpoints == nil {
+		return nil
+	}
+	endpointStr := C.GoString(endpoints)
+	endpointStr = strings.ReplaceAll(endpointStr, ",", ";")
+	endpointList := strings.Split(endpointStr, ";")
+
+	var validEndpoints []string
+	for _, ep := range endpointList {
+		ep = strings.TrimSpace(ep)
+		if ep != "" {
+			validEndpoints = append(validEndpoints, ep)
+		}
+	}
+	return validEndpoints
+}
 
 //export NewEtcdClient
 func NewEtcdClient(endpoints *C.char, errMsg **C.char) int {
@@ -43,30 +127,30 @@ func NewEtcdClient(endpoints *C.char, errMsg **C.char) int {
 		return 0
 	}
 
-	MaxMsgSize := 32*1024*1024
-    endpointStr := C.GoString(endpoints)
-    // Support multiple endpoints separated by comma or semicolon
-    // Normalize separators to semicolon first, then split
-    endpointStr = strings.ReplaceAll(endpointStr, ",", ";")
-    parts := strings.Split(endpointStr, ";")
-    var validEndpoints []string
-    for _, ep := range parts {
-        ep = strings.TrimSpace(ep)
-        if ep != "" {
-            validEndpoints = append(validEndpoints, ep)
-        }
-    }
-    if len(validEndpoints) == 0 {
-        *errMsg = C.CString("no valid endpoints provided")
-        return -1
-    }
+	MaxMsgSize := 32 * 1024 * 1024
+	endpointStr := C.GoString(endpoints)
+	// Support multiple endpoints separated by comma or semicolon
+	// Normalize separators to semicolon first, then split
+	endpointStr = strings.ReplaceAll(endpointStr, ",", ";")
+	parts := strings.Split(endpointStr, ";")
+	var validEndpoints []string
+	for _, ep := range parts {
+		ep = strings.TrimSpace(ep)
+		if ep != "" {
+			validEndpoints = append(validEndpoints, ep)
+		}
+	}
+	if len(validEndpoints) == 0 {
+		*errMsg = C.CString("no valid endpoints provided")
+		return -1
+	}
 
-    cli, err := clientv3.New(clientv3.Config{
-        Endpoints:          validEndpoints,
-        DialTimeout:        5 * time.Second,
-        MaxCallSendMsgSize: MaxMsgSize,
-        MaxCallRecvMsgSize: MaxMsgSize,
-    })
+	cli, err := clientv3.New(clientv3.Config{
+		Endpoints:          validEndpoints,
+		DialTimeout:        5 * time.Second,
+		MaxCallSendMsgSize: MaxMsgSize,
+		MaxCallRecvMsgSize: MaxMsgSize,
+	})
 
 	if err != nil {
 		*errMsg = C.CString(err.Error())
@@ -149,6 +233,12 @@ func EtcdCloseWrapper() {
 	}
 }
 
+func getStoreClient() *clientv3.Client {
+	storeMutex.Lock()
+	defer storeMutex.Unlock()
+	return storeClient
+}
+
 //export NewStoreEtcdClient
 func NewStoreEtcdClient(endpoints *C.char, errMsg **C.char) int {
 	storeMutex.Lock()
@@ -158,12 +248,71 @@ func NewStoreEtcdClient(endpoints *C.char, errMsg **C.char) int {
 		return -2
 	}
 
+	validEndpoints := parseEtcdEndpoints(endpoints)
+	if len(validEndpoints) == 0 {
+		*errMsg = C.CString("no valid endpoints provided")
+		return -1
+	}
+
+	cli, err := clientv3.New(newStoreClientConfig(validEndpoints))
+
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+
+	storeClient = cli
+	return 0
+}
+
+//export EtcdStoreResetClientWrapper
+func EtcdStoreResetClientWrapper(endpoints *C.char, errMsg **C.char) int {
+	validEndpoints := parseEtcdEndpoints(endpoints)
+	if len(validEndpoints) == 0 {
+		*errMsg = C.CString("no valid endpoints provided")
+		return -1
+	}
+
+	cli, err := clientv3.New(newStoreClientConfig(validEndpoints))
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+
+	cancelAllStoreKeepAlives()
+	cancelAllStoreWatches()
+	cancelAllStorePrefixWatches()
+
+	storeMutex.Lock()
+	oldClient := storeClient
+	storeClient = cli
+	storeMutex.Unlock()
+
+	if oldClient != nil {
+		oldClient.Close()
+	}
+
+	return 0
+}
+
+//export NewSnapshotEtcdClient
+func NewSnapshotEtcdClient(endpoints *C.char, errMsg **C.char) int {
+	snapshotMutex.Lock()
+	defer snapshotMutex.Unlock()
+	if snapshotClient != nil {
+		*errMsg = C.CString("etcd snapshot client can be initialized only once")
+		return -2
+	}
+
 	endpointStr := C.GoString(endpoints)
+	// Support multiple endpoints separated by comma or semicolon
+	endpointStr = strings.ReplaceAll(endpointStr, ",", ";")
 	endpointList := strings.Split(endpointStr, ";")
-	
+
 	// Filter out any empty strings that might result from splitting
 	var validEndpoints []string
 	for _, ep := range endpointList {
+		ep = strings.TrimSpace(ep)
 		if ep != "" {
 			validEndpoints = append(validEndpoints, ep)
 		}
@@ -175,8 +324,10 @@ func NewStoreEtcdClient(endpoints *C.char, errMsg **C.char) int {
 	}
 
 	cli, err := clientv3.New(clientv3.Config{
-		Endpoints:   validEndpoints,
-		DialTimeout: 5 * time.Second,
+		Endpoints:          validEndpoints,
+		DialTimeout:        10 * time.Second,
+		MaxCallSendMsgSize: snapshotMaxMsgSize,
+		MaxCallRecvMsgSize: snapshotMaxMsgSize,
 	})
 
 	if err != nil {
@@ -184,21 +335,22 @@ func NewStoreEtcdClient(endpoints *C.char, errMsg **C.char) int {
 		return -1
 	}
 
-	storeClient = cli
+	snapshotClient = cli
 	return 0
 }
 
 //export EtcdStoreGetWrapper
 func EtcdStoreGetWrapper(key *C.char, keySize C.int, value **C.char,
 	valueSize *C.int, revisionId *int64, errMsg **C.char) int {
-	if storeClient == nil {
+	cli := getStoreClient()
+	if cli == nil {
 		*errMsg = C.CString("etcd client not initialized")
 		return -1
 	}
 	k := C.GoStringN(key, keySize)
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	resp, err := storeClient.Get(ctx, k)
+	resp, err := cli.Get(ctx, k)
 	if err != nil {
 		*errMsg = C.CString(err.Error())
 		return -1
@@ -217,13 +369,14 @@ func EtcdStoreGetWrapper(key *C.char, keySize C.int, value **C.char,
 
 //export EtcdStoreGrantLeaseWrapper
 func EtcdStoreGrantLeaseWrapper(ttl int64, leaseId *int64, errMsg **C.char) int {
-	if storeClient == nil {
+	cli := getStoreClient()
+	if cli == nil {
 		*errMsg = C.CString("etcd client not initialized")
 		return -1
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	resp, err := storeClient.Grant(ctx, ttl)
+	resp, err := cli.Grant(ctx, ttl)
 	if err != nil {
 		*errMsg = C.CString(err.Error())
 		return -1
@@ -232,40 +385,61 @@ func EtcdStoreGrantLeaseWrapper(ttl int64, leaseId *int64, errMsg **C.char) int 
 	return 0
 }
 
+//export EtcdStoreRevokeLeaseWrapper
+func EtcdStoreRevokeLeaseWrapper(leaseId int64, errMsg **C.char) int {
+	cli := getStoreClient()
+	if cli == nil {
+		*errMsg = C.CString("etcd client not initialized")
+		return -1
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := cli.Revoke(ctx, clientv3.LeaseID(leaseId))
+	if err != nil {
+		if errors.Is(err, rpctypes.ErrLeaseNotFound) {
+			return 0
+		}
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	return 0
+}
+
 //export EtcdStoreCreateWithLeaseWrapper
 func EtcdStoreCreateWithLeaseWrapper(key *C.char, keySize C.int, value *C.char, valueSize C.int,
 	leaseId int64, revisionId *int64, errMsg **C.char) int {
-    if storeClient == nil {
-        *errMsg = C.CString("etcd client not initialized")
-        return -1
-    }
-    k := C.GoStringN(key, keySize)
-    v := C.GoStringN(value, valueSize)
-    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-    defer cancel()
+	cli := getStoreClient()
+	if cli == nil {
+		*errMsg = C.CString("etcd client not initialized")
+		return -1
+	}
+	k := C.GoStringN(key, keySize)
+	v := C.GoStringN(value, valueSize)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
 
-    // Create a transaction
-    txn := storeClient.Txn(ctx)
+	// Create a transaction
+	txn := cli.Txn(ctx)
 
-    // Only put the key if it does not exist
-    resp, err := txn.If(clientv3.Compare(clientv3.CreateRevision(k), "=", 0)).
-        Then(clientv3.OpPut(k, v, clientv3.WithLease(clientv3.LeaseID(leaseId)))).
-        Commit()
+	// Only put the key if it does not exist
+	resp, err := txn.If(clientv3.Compare(clientv3.CreateRevision(k), "=", 0)).
+		Then(clientv3.OpPut(k, v, clientv3.WithLease(clientv3.LeaseID(leaseId)))).
+		Commit()
 
-    if err != nil {
-        *errMsg = C.CString(err.Error())
-        return -1
-    }
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
 
-    // If the key already existed, resp.Succeeded will be false
-    // If we created the key, resp.Succeeded will be true
-    if resp.Succeeded {
-        *revisionId = resp.Header.Revision
-		return 0;
-    } else {
-        *errMsg = C.CString("etcd transaction failed")
-        return -2
-    }
+	// If the key already existed, resp.Succeeded will be false
+	// If we created the key, resp.Succeeded will be true
+	if resp.Succeeded {
+		*revisionId = resp.Header.Revision
+		return 0
+	} else {
+		*errMsg = C.CString("etcd transaction failed")
+		return -2
+	}
 }
 
 /*
@@ -274,77 +448,149 @@ func EtcdStoreCreateWithLeaseWrapper(key *C.char, keySize C.int, value *C.char, 
 *        other than the one we want to delete. In that case, that context will
 *        be deleted before being cancelled and will not be able to be cancelled
 *        anymore.
-*/
+ */
 func cancelAndDeleteWatch(k string) int {
-    storeWatchMutex.Lock()
-    defer storeWatchMutex.Unlock()
+	storeWatchMutex.Lock()
+	defer storeWatchMutex.Unlock()
 
-    if cancel, exists := storeWatchCtx[k]; exists {
-        cancel()
-        delete(storeWatchCtx, k)
-        return 0
-    }
+	if cancel, exists := storeWatchCtx[k]; exists {
+		cancel()
+		delete(storeWatchCtx, k)
+		return 0
+	}
 	return -1
+}
+
+func cancelAllStoreKeepAlives() {
+	storeKeepAliveMutex.Lock()
+	cancels := make([]context.CancelFunc, 0, len(storeKeepAliveCtx))
+	for leaseId, cancel := range storeKeepAliveCtx {
+		cancels = append(cancels, cancel)
+		delete(storeKeepAliveCtx, leaseId)
+	}
+	storeKeepAliveMutex.Unlock()
+
+	for _, cancel := range cancels {
+		cancel()
+	}
+}
+
+func cancelAllStoreWatches() {
+	storeWatchMutex.Lock()
+	cancels := make([]context.CancelFunc, 0, len(storeWatchCtx))
+	for key, cancel := range storeWatchCtx {
+		cancels = append(cancels, cancel)
+		delete(storeWatchCtx, key)
+	}
+	storeWatchMutex.Unlock()
+
+	for _, cancel := range cancels {
+		cancel()
+	}
+}
+
+func cancelAllStorePrefixWatches() {
+	storePrefixWatchMutex.Lock()
+	cancels := make([]context.CancelFunc, 0, len(storePrefixWatchCtx))
+	for prefix, watchInfo := range storePrefixWatchCtx {
+		watchInfo.broken = true
+		storePrefixWatchCtx[prefix] = watchInfo
+		cancels = append(cancels, watchInfo.cancel)
+		// Do not delete map entries here; let goroutine defer clean up.
+	}
+	storePrefixWatchMutex.Unlock()
+
+	for _, cancel := range cancels {
+		cancel()
+	}
+}
+
+// notifyStorePrefixWatchBrokenOnce delivers a WATCH_BROKEN callback for the
+// prefix watch `p` at most once. If markBroken is true the watch is first
+// marked broken (used by reset/error exit paths); explicit cancel passes
+// markBroken=false so a normal shutdown does not generate a spurious
+// WATCH_BROKEN. The cgo callback is invoked outside storePrefixWatchMutex
+// to avoid deadlocks from cgo re-entry while holding a Go mutex.
+func notifyStorePrefixWatchBrokenOnce(p string, callbackContext unsafe.Pointer, callbackFunc unsafe.Pointer, markBroken bool) {
+	shouldNotify := false
+
+	storePrefixWatchMutex.Lock()
+	if watchInfo, exists := storePrefixWatchCtx[p]; exists {
+		if markBroken {
+			watchInfo.broken = true
+		}
+		if watchInfo.broken && !watchInfo.brokenNotified {
+			watchInfo.brokenNotified = true
+			shouldNotify = true
+		}
+		storePrefixWatchCtx[p] = watchInfo
+	}
+	storePrefixWatchMutex.Unlock()
+
+	if shouldNotify {
+		C.call_watch_cb(callbackFunc, callbackContext, nil, 0, nil, 0, C.int(2) /*WATCH_BROKEN*/, C.longlong(0))
+	}
 }
 
 //export EtcdStoreWatchUntilDeletedWrapper
 func EtcdStoreWatchUntilDeletedWrapper(key *C.char, keySize C.int, errMsg **C.char) int {
-    if storeClient == nil {
-        *errMsg = C.CString("etcd client not initialized")
-        return -1
-    }
-    k := C.GoStringN(key, keySize)
+	cli := getStoreClient()
+	if cli == nil {
+		*errMsg = C.CString("etcd client not initialized")
+		return -1
+	}
+	k := C.GoStringN(key, keySize)
 
-    // Create a context with cancel function
-    ctx, cancel := context.WithCancel(context.Background())
+	// Create a context with cancel function
+	ctx, cancel := context.WithCancel(context.Background())
 
-    // Store the cancel function
-    storeWatchMutex.Lock()
-    if _, exists := storeWatchCtx[k]; exists {
+	// Store the cancel function
+	storeWatchMutex.Lock()
+	if _, exists := storeWatchCtx[k]; exists {
 		storeWatchMutex.Unlock()
-        *errMsg = C.CString("This key is already being watched")
-        return -1
-    }
-    storeWatchCtx[k] = cancel
-    storeWatchMutex.Unlock()
+		*errMsg = C.CString("This key is already being watched")
+		return -1
+	}
+	storeWatchCtx[k] = cancel
+	storeWatchMutex.Unlock()
 
 	// Make sure to delete from the map before returning
 	defer cancelAndDeleteWatch(k)
 
-    // Start watching the key
-    watchChan := storeClient.Watch(ctx, k)
+	// Start watching the key
+	watchChan := cli.Watch(ctx, k)
 
-    // Wait for the key to be deleted
-    for {
-        select {
-        case watchResp, ok := <-watchChan:
-            if !ok {
-                // Channel closed unexpectedly
-                *errMsg = C.CString("watch channel closed unexpectedly")
-                return -1
-            }
-            for _, event := range watchResp.Events {
-                if event.Type == clientv3.EventTypeDelete {
-                    // Clean up the context when done
-                    return 0
-                }
-            }
-        case <-ctx.Done():
-            // Context was cancelled
+	// Wait for the key to be deleted
+	for {
+		select {
+		case watchResp, ok := <-watchChan:
+			if !ok {
+				// Channel closed unexpectedly
+				*errMsg = C.CString("watch channel closed unexpectedly")
+				return -1
+			}
+			for _, event := range watchResp.Events {
+				if event.Type == clientv3.EventTypeDelete {
+					// Clean up the context when done
+					return 0
+				}
+			}
+		case <-ctx.Done():
+			// Context was cancelled
 			*errMsg = C.CString("watch context cancelled")
-            return -2
-        }
-    }
+			return -2
+		}
+	}
 }
 
 //export EtcdStoreCancelWatchWrapper
 func EtcdStoreCancelWatchWrapper(key *C.char, keySize C.int, errMsg **C.char) int {
-    k := C.GoStringN(key, keySize)
-    if cancelAndDeleteWatch(k) == -1 {
-        *errMsg = C.CString("no watch context found for the given key")
-        return -1
-    }
-    return 0
+	k := C.GoStringN(key, keySize)
+	if cancelAndDeleteWatch(k) == -1 {
+		*errMsg = C.CString("no watch context found for the given key")
+		return -1
+	}
+	return 0
 }
 
 /*
@@ -353,76 +599,740 @@ func EtcdStoreCancelWatchWrapper(key *C.char, keySize C.int, errMsg **C.char) in
 *        other than the one we want to delete. In that case, that context will
 *        be deleted before being cancelled and will not be able to be cancelled
 *        anymore.
-*/
+ */
 func cancelAndDeleteKeepAlive(leaseId int64) int {
-    storeKeepAliveMutex.Lock()
-    defer storeKeepAliveMutex.Unlock()
+	storeKeepAliveMutex.Lock()
+	defer storeKeepAliveMutex.Unlock()
 
-    if cancel, exists := storeKeepAliveCtx[leaseId]; exists {
-        cancel()
-        delete(storeKeepAliveCtx, leaseId)
-        return 0
-    }
+	if cancel, exists := storeKeepAliveCtx[leaseId]; exists {
+		cancel()
+		delete(storeKeepAliveCtx, leaseId)
+		return 0
+	}
 	return -1
+}
+
+func hasKeepAliveContext(leaseId int64) bool {
+	storeKeepAliveMutex.Lock()
+	defer storeKeepAliveMutex.Unlock()
+
+	_, exists := storeKeepAliveCtx[leaseId]
+	return exists
 }
 
 //export EtcdStoreKeepAliveWrapper
 func EtcdStoreKeepAliveWrapper(leaseId int64, errMsg **C.char) int {
-    if storeClient == nil {
-        *errMsg = C.CString("etcd client not initialized")
-        return -1
-    }
+	cli := getStoreClient()
+	if cli == nil {
+		*errMsg = C.CString("etcd client not initialized")
+		return -1
+	}
 
-    // Create a context with cancel function
-    ctx, cancel := context.WithCancel(context.Background())
-    
-    // Store the cancel function
-    storeKeepAliveMutex.Lock()
+	// Create a context with cancel function
+	ctx, cancel := context.WithCancel(context.Background())
+
+	// Store the cancel function
+	storeKeepAliveMutex.Lock()
 	if _, exists := storeKeepAliveCtx[leaseId]; exists {
 		storeKeepAliveMutex.Unlock()
-        *errMsg = C.CString("This lease id is already being kept alive")
-        return -1
-    }
-    storeKeepAliveCtx[leaseId] = cancel
-    storeKeepAliveMutex.Unlock()
+		*errMsg = C.CString("This lease id is already being kept alive")
+		return -1
+	}
+	storeKeepAliveCtx[leaseId] = cancel
+	storeKeepAliveMutex.Unlock()
 	// Make sure to delete from the map before returning
-    defer cancelAndDeleteKeepAlive(leaseId)
+	defer cancelAndDeleteKeepAlive(leaseId)
 
-    // Start keep alive
-    keepAliveChan, err := storeClient.KeepAlive(ctx, clientv3.LeaseID(leaseId))
-    if err != nil {
-        *errMsg = C.CString(err.Error())
-        return -1
-    }
+	// Start keep alive
+	keepAliveChan, err := cli.KeepAlive(ctx, clientv3.LeaseID(leaseId))
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
 
-    // Wait for keep alive responses
-    for {
-        select {
-        case resp, ok := <-keepAliveChan:
-            if !ok {
-                *errMsg = C.CString("keep alive channel closed")
-                return -1
-            }
-            if resp == nil {
-                *errMsg = C.CString("keep alive response is nil")
-                return -1
-            }
-            // Keep alive successful, continue
-        case <-ctx.Done():
+	// Wait for keep alive responses
+	for {
+		select {
+		case resp, ok := <-keepAliveChan:
+			if !ok {
+				*errMsg = C.CString("keep alive channel closed")
+				return -1
+			}
+			if resp == nil {
+				*errMsg = C.CString("keep alive response is nil")
+				return -1
+			}
+			// Keep alive successful, continue
+		case <-ctx.Done():
 			// Context cancelled
 			*errMsg = C.CString("keep alive context cancelled")
-            return -2
-        }
-    }
+			return -2
+		}
+	}
 }
 
 //export EtcdStoreCancelKeepAliveWrapper
 func EtcdStoreCancelKeepAliveWrapper(leaseId int64, errMsg **C.char) int {
-    if cancelAndDeleteKeepAlive(leaseId) == -1 {
-        *errMsg = C.CString("no keep alive context found for the given lease ID")
-        return -1
-    }
-    return 0
+	if cancelAndDeleteKeepAlive(leaseId) == -1 {
+		*errMsg = C.CString("no keep alive context found for the given lease ID")
+		return -1
+	}
+	return 0
+}
+
+//export EtcdStoreWaitKeepAliveReadyWrapper
+func EtcdStoreWaitKeepAliveReadyWrapper(leaseId int64, timeoutMs int, errMsg **C.char) int {
+	deadline := time.Now().Add(time.Duration(timeoutMs) * time.Millisecond)
+	for {
+		if hasKeepAliveContext(leaseId) {
+			return 0
+		}
+		if timeoutMs <= 0 || !time.Now().Before(deadline) {
+			*errMsg = C.CString("keep alive context did not become ready before timeout")
+			return -1
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
+//export EtcdStorePutWrapper
+func EtcdStorePutWrapper(key *C.char, keySize C.int, value *C.char, valueSize C.int, errMsg **C.char) int {
+	cli := getStoreClient()
+	if cli == nil {
+		*errMsg = C.CString("etcd client not initialized")
+		return -1
+	}
+	k := C.GoStringN(key, keySize)
+	v := C.GoStringN(value, valueSize)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_, err := cli.Put(ctx, k, v)
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	return 0
+}
+
+// Create key if absent (CAS on CreateRevision==0).
+// Return:
+// - 0 on success
+// - -2 if key already exists
+// - -1 on error
+//
+//export EtcdStoreCreateWrapper
+func EtcdStoreCreateWrapper(key *C.char, keySize C.int, value *C.char, valueSize C.int, errMsg **C.char) int {
+	cli := getStoreClient()
+	if cli == nil {
+		*errMsg = C.CString("etcd client not initialized")
+		return -1
+	}
+	k := C.GoStringN(key, keySize)
+	v := C.GoStringN(value, valueSize)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	txn := cli.Txn(ctx)
+	resp, err := txn.If(clientv3.Compare(clientv3.CreateRevision(k), "=", 0)).
+		Then(clientv3.OpPut(k, v)).
+		Commit()
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	if resp.Succeeded {
+		return 0
+	}
+	*errMsg = C.CString("key already exists")
+	return -2
+}
+
+//export EtcdStoreBatchCreateWrapper
+func EtcdStoreBatchCreateWrapper(keys **C.char, values **C.char, count C.int, errMsg **C.char) int {
+	cli := getStoreClient()
+	if cli == nil {
+		*errMsg = C.CString("etcd client not initialized")
+		return -1
+	}
+
+	n := int(count)
+	if n == 0 {
+		return 0
+	}
+
+	// Unsafe casting to access C arrays as Go slices
+	keyPtrs := (*[1 << 28]*C.char)(unsafe.Pointer(keys))[:n:n]
+	valPtrs := (*[1 << 28]*C.char)(unsafe.Pointer(values))[:n:n]
+
+	ops := make([]clientv3.Op, 0, n)
+	cmps := make([]clientv3.Cmp, 0, n)
+	for i := 0; i < n; i++ {
+		k := C.GoString(keyPtrs[i])
+		v := C.GoString(valPtrs[i])
+		ops = append(ops, clientv3.OpPut(k, v))
+		// Ensure none of the keys exist
+		cmps = append(cmps, clientv3.Compare(clientv3.CreateRevision(k), "=", 0))
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Use Txn to ensure atomicity of the batch
+	resp, err := cli.Txn(ctx).If(cmps...).Then(ops...).Commit()
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+
+	if !resp.Succeeded {
+		*errMsg = C.CString("transaction failed: one or more keys already exist")
+		return -2
+	}
+	return 0
+}
+
+//export EtcdStoreTxnCompareAndPutWrapper
+func EtcdStoreTxnCompareAndPutWrapper(compareKeys **C.char, compareKeySizes *C.int, compareKinds *C.int, compareValues **C.char, compareValueSizes *C.int, compareCount C.int, putKeys **C.char, putKeySizes *C.int, putValues **C.char, putValueSizes *C.int, putCount C.int, errMsg **C.char) int {
+	cli := getStoreClient()
+	if cli == nil {
+		*errMsg = C.CString("etcd client not initialized")
+		return -1
+	}
+
+	cmpN := int(compareCount)
+	putN := int(putCount)
+
+	cmps := make([]clientv3.Cmp, 0, cmpN)
+	if cmpN > 0 {
+		compareKeyPtrs := (*[1 << 28]*C.char)(unsafe.Pointer(compareKeys))[:cmpN:cmpN]
+		compareKeySizeList := (*[1 << 28]C.int)(unsafe.Pointer(compareKeySizes))[:cmpN:cmpN]
+		compareKindList := (*[1 << 28]C.int)(unsafe.Pointer(compareKinds))[:cmpN:cmpN]
+		compareValuePtrs := (*[1 << 28]*C.char)(unsafe.Pointer(compareValues))[:cmpN:cmpN]
+		compareValueSizeList := (*[1 << 28]C.int)(unsafe.Pointer(compareValueSizes))[:cmpN:cmpN]
+		for i := 0; i < cmpN; i++ {
+			k := C.GoStringN(compareKeyPtrs[i], compareKeySizeList[i])
+			switch int(compareKindList[i]) {
+			case 0:
+				v := C.GoStringN(compareValuePtrs[i], compareValueSizeList[i])
+				cmps = append(cmps, clientv3.Compare(clientv3.Value(k), "=", v))
+			case 1:
+				cmps = append(cmps, clientv3.Compare(clientv3.CreateRevision(k), "=", 0))
+			default:
+				*errMsg = C.CString("unsupported compare kind")
+				return -1
+			}
+		}
+	}
+
+	ops := make([]clientv3.Op, 0, putN)
+	if putN > 0 {
+		putKeyPtrs := (*[1 << 28]*C.char)(unsafe.Pointer(putKeys))[:putN:putN]
+		putKeySizeList := (*[1 << 28]C.int)(unsafe.Pointer(putKeySizes))[:putN:putN]
+		putValuePtrs := (*[1 << 28]*C.char)(unsafe.Pointer(putValues))[:putN:putN]
+		putValueSizeList := (*[1 << 28]C.int)(unsafe.Pointer(putValueSizes))[:putN:putN]
+		for i := 0; i < putN; i++ {
+			k := C.GoStringN(putKeyPtrs[i], putKeySizeList[i])
+			v := C.GoStringN(putValuePtrs[i], putValueSizeList[i])
+			ops = append(ops, clientv3.OpPut(k, v))
+		}
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := cli.Txn(ctx).If(cmps...).Then(ops...).Commit()
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	if !resp.Succeeded {
+		*errMsg = C.CString("transaction compare failed")
+		return -2
+	}
+	return 0
+}
+
+//export EtcdStoreGetWithPrefixWrapper
+func EtcdStoreGetWithPrefixWrapper(prefix *C.char, prefixSize C.int, keys **C.char, keySizes **C.int, values **C.char, valueSizes **C.int, count *C.int, errMsg **C.char) int {
+	cli := getStoreClient()
+	if cli == nil {
+		*errMsg = C.CString("etcd client not initialized")
+		return -1
+	}
+	p := C.GoStringN(prefix, prefixSize)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	resp, err := cli.Get(ctx, p, clientv3.WithPrefix(), clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend))
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+
+	if len(resp.Kvs) == 0 {
+		*count = 0
+		return 0
+	}
+
+	// Allocate arrays for keys and values
+	keyCount := len(resp.Kvs)
+	*count = C.int(keyCount)
+
+	// Allocate memory for arrays
+	keysArray := (*[1 << 30]*C.char)(C.malloc(C.size_t(keyCount) * C.size_t(unsafe.Sizeof((*C.char)(nil)))))
+	keySizesArray := (*[1 << 30]C.int)(C.malloc(C.size_t(keyCount) * C.size_t(unsafe.Sizeof(C.int(0)))))
+	valuesArray := (*[1 << 30]*C.char)(C.malloc(C.size_t(keyCount) * C.size_t(unsafe.Sizeof((*C.char)(nil)))))
+	valueSizesArray := (*[1 << 30]C.int)(C.malloc(C.size_t(keyCount) * C.size_t(unsafe.Sizeof(C.int(0)))))
+
+	for i, kv := range resp.Kvs {
+		keysArray[i] = C.CString(string(kv.Key))
+		keySizesArray[i] = C.int(len(kv.Key))
+		valuesArray[i] = C.CString(string(kv.Value))
+		valueSizesArray[i] = C.int(len(kv.Value))
+	}
+
+	*keys = (*C.char)(unsafe.Pointer(keysArray))
+	*keySizes = (*C.int)(unsafe.Pointer(keySizesArray))
+	*values = (*C.char)(unsafe.Pointer(valuesArray))
+	*valueSizes = (*C.int)(unsafe.Pointer(valueSizesArray))
+
+	return 0
+}
+
+//export EtcdStoreGetRangeAsJsonWrapper
+func EtcdStoreGetRangeAsJsonWrapper(startKey *C.char, startKeySize C.int, endKey *C.char, endKeySize C.int, limit C.int, outJson **C.char, outJsonSize *C.int, revisionId *C.longlong, errMsg **C.char) int {
+	cli := getStoreClient()
+	if cli == nil {
+		*errMsg = C.CString("etcd client not initialized")
+		return -1
+	}
+	start := C.GoStringN(startKey, startKeySize)
+	end := C.GoStringN(endKey, endKeySize)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	opts := []clientv3.OpOption{
+		clientv3.WithRange(end),
+		clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend),
+	}
+	if limit > 0 {
+		opts = append(opts, clientv3.WithLimit(int64(limit)))
+	}
+	resp, err := cli.Get(ctx, start, opts...)
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+
+	if resp != nil && resp.Header != nil {
+		*revisionId = C.longlong(resp.Header.Revision)
+	} else {
+		*revisionId = 0
+	}
+
+	type kvPair struct {
+		Key   string `json:"key"`
+		Value string `json:"value"`
+	}
+	kvs := make([]kvPair, 0, len(resp.Kvs))
+	for _, kv := range resp.Kvs {
+		kvs = append(kvs, kvPair{Key: string(kv.Key), Value: string(kv.Value)})
+	}
+	b, jerr := json.Marshal(kvs)
+	if jerr != nil {
+		*errMsg = C.CString(jerr.Error())
+		return -1
+	}
+
+	*outJson = C.CString(string(b))
+	*outJsonSize = C.int(len(b))
+	return 0
+}
+
+//export EtcdStoreGetFirstKeyWithPrefixWrapper
+func EtcdStoreGetFirstKeyWithPrefixWrapper(prefix *C.char, prefixSize C.int, firstKey **C.char, firstKeySize *C.int, errMsg **C.char) int {
+	cli := getStoreClient()
+	if cli == nil {
+		*errMsg = C.CString("etcd client not initialized")
+		return -1
+	}
+	p := C.GoStringN(prefix, prefixSize)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resp, err := cli.Get(ctx, p, clientv3.WithPrefix(), clientv3.WithSort(clientv3.SortByKey, clientv3.SortAscend), clientv3.WithLimit(1))
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	if len(resp.Kvs) == 0 {
+		*errMsg = C.CString("no key found with prefix")
+		return -2
+	}
+	kv := resp.Kvs[0]
+	*firstKey = C.CString(string(kv.Key))
+	*firstKeySize = C.int(len(kv.Key))
+	return 0
+}
+
+//export EtcdStoreGetLastKeyWithPrefixWrapper
+func EtcdStoreGetLastKeyWithPrefixWrapper(prefix *C.char, prefixSize C.int, lastKey **C.char, lastKeySize *C.int, errMsg **C.char) int {
+	cli := getStoreClient()
+	if cli == nil {
+		*errMsg = C.CString("etcd client not initialized")
+		return -1
+	}
+	p := C.GoStringN(prefix, prefixSize)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	resp, err := cli.Get(
+		ctx, p,
+		clientv3.WithPrefix(),
+		clientv3.WithSort(clientv3.SortByKey, clientv3.SortDescend),
+		clientv3.WithLimit(1),
+	)
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	if len(resp.Kvs) == 0 {
+		*errMsg = C.CString("no key found with prefix")
+		return -2
+	}
+	kv := resp.Kvs[0]
+	*lastKey = C.CString(string(kv.Key))
+	*lastKeySize = C.int(len(kv.Key))
+	return 0
+}
+
+//export EtcdStoreDeleteRangeWrapper
+func EtcdStoreDeleteRangeWrapper(startKey *C.char, startKeySize C.int, endKey *C.char, endKeySize C.int, errMsg **C.char) int {
+	cli := getStoreClient()
+	if cli == nil {
+		*errMsg = C.CString("etcd client not initialized")
+		return -1
+	}
+	start := C.GoStringN(startKey, startKeySize)
+	end := C.GoStringN(endKey, endKeySize)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err := cli.Delete(ctx, start, clientv3.WithRange(end))
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	return 0
+}
+
+//export EtcdStoreWatchWithPrefixFromRevisionWrapper
+func EtcdStoreWatchWithPrefixFromRevisionWrapper(prefix *C.char, prefixSize C.int, startRevision C.longlong, callbackContext unsafe.Pointer, callbackFunc unsafe.Pointer, errMsg **C.char) int {
+	cli := getStoreClient()
+	if cli == nil {
+		*errMsg = C.CString("etcd client not initialized")
+		return -1
+	}
+	if callbackFunc == nil {
+		*errMsg = C.CString("callback function is nil")
+		return -1
+	}
+	p := C.GoStringN(prefix, prefixSize)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	storePrefixWatchMutex.Lock()
+	if _, exists := storePrefixWatchCtx[p]; exists {
+		storePrefixWatchMutex.Unlock()
+		*errMsg = C.CString("This prefix is already being watched")
+		cancel()
+		return -1
+	}
+	doneCh := make(chan struct{})
+	// createdCh reports whether the server-side watch was successfully
+	// established. The goroutine sends exactly one value: true once etcd
+	// confirms the watch (clientv3.WithCreatedNotify), or false if the
+	// goroutine exits before that confirmation. The wrapper blocks on it before
+	// returning, so callers can rely on "watch is live server-side" the moment
+	// WatchWithPrefixFromRevision returns OK. This closes the race where the
+	// goroutine had not yet issued storeClient.Watch() when the caller
+	// proceeded to read the current view. Buffered (size 1) so the goroutine
+	// never blocks on the send even if the wrapper has already timed out.
+	createdCh := make(chan bool, 1)
+	storePrefixWatchCtx[p] = prefixWatchInfo{
+		cancel:          cancel,
+		callbackContext: callbackContext,
+		done:            doneCh,
+		broken:          false,
+		brokenNotified:  false,
+	}
+	storePrefixWatchMutex.Unlock()
+
+	go func(doneCh chan struct{}, createdCh chan bool) {
+		// createdSignalled guards against sending on createdCh more than once.
+		createdSignalled := false
+		signalCreated := func(ok bool) {
+			if !createdSignalled {
+				createdSignalled = true
+				createdCh <- ok
+			}
+		}
+		defer func() {
+			// Report failure if the watch was never confirmed (e.g. the
+			// goroutine exits before any response), then remove the watch
+			// entry and signal completion. Ordering matters: the failure
+			// signal is sent before `done` is closed.
+			signalCreated(false)
+			storePrefixWatchMutex.Lock()
+			delete(storePrefixWatchCtx, p)
+			storePrefixWatchMutex.Unlock()
+			close(doneCh)
+		}()
+
+		// WithCreatedNotify makes etcd send an initial response with
+		// Created == true as soon as the watch is registered server-side.
+		opts := []clientv3.OpOption{clientv3.WithPrefix(), clientv3.WithCreatedNotify()}
+		if startRevision > 0 {
+			opts = append(opts, clientv3.WithRev(int64(startRevision)))
+		}
+		watchChan := cli.Watch(ctx, p, opts...)
+
+		for {
+			select {
+			case watchResp, ok := <-watchChan:
+				if !ok {
+					// Channel closed. Check if context was cancelled.
+					select {
+					case <-ctx.Done():
+						notifyStorePrefixWatchBrokenOnce(p, callbackContext, callbackFunc, false)
+						return
+					default:
+						// Channel closed unexpectedly (not cancelled). Notify C++ watcher to reconnect.
+						notifyStorePrefixWatchBrokenOnce(p, callbackContext, callbackFunc, true)
+						return
+					}
+				}
+				// The first response with Created == true confirms the
+				// server-side watch is established; release the waiter.
+				if watchResp.Created {
+					signalCreated(true)
+				}
+				if watchResp.Err() != nil {
+					// Watch error. Check if context was cancelled.
+					select {
+					case <-ctx.Done():
+						notifyStorePrefixWatchBrokenOnce(p, callbackContext, callbackFunc, false)
+						return
+					default:
+						notifyStorePrefixWatchBrokenOnce(p, callbackContext, callbackFunc, true)
+						return
+					}
+				}
+
+				// Use response-level revision as a more stable resume point.
+				respRev := int64(0)
+				if watchResp.Header.Revision > 0 {
+					respRev = watchResp.Header.Revision
+				}
+
+				for _, event := range watchResp.Events {
+					select {
+					case <-ctx.Done():
+						notifyStorePrefixWatchBrokenOnce(p, callbackContext, callbackFunc, false)
+						return
+					default:
+					}
+
+					keyStr := string(event.Kv.Key)
+					keyPtr := C.CString(keyStr)
+					keySize := C.size_t(len(keyStr))
+
+					var valuePtr *C.char
+					var valueSize C.size_t
+					var eventType C.int
+
+					if event.Type == clientv3.EventTypePut {
+						eventType = C.int(0)
+						valueStr := string(event.Kv.Value)
+						valuePtr = C.CString(valueStr)
+						valueSize = C.size_t(len(valueStr))
+					} else if event.Type == clientv3.EventTypeDelete {
+						eventType = C.int(1)
+						valuePtr = nil
+						valueSize = 0
+					}
+
+					modRev := C.longlong(0)
+					if event.Kv != nil {
+						evRev := event.Kv.ModRevision
+						if respRev > evRev {
+							evRev = respRev
+						}
+						modRev = C.longlong(evRev)
+					} else if respRev > 0 {
+						modRev = C.longlong(respRev)
+					}
+
+					C.call_watch_cb(callbackFunc, callbackContext, keyPtr, keySize, valuePtr, valueSize, eventType, modRev)
+
+					C.free(unsafe.Pointer(keyPtr))
+					if valuePtr != nil {
+						C.free(unsafe.Pointer(valuePtr))
+					}
+				}
+			case <-ctx.Done():
+				notifyStorePrefixWatchBrokenOnce(p, callbackContext, callbackFunc, false)
+				return
+			}
+		}
+	}(doneCh, createdCh)
+
+	// Block until the server confirms the watch is established. Returning OK
+	// then guarantees the watch is live server-side, so a caller that arms the
+	// watch before reading state will not miss an event in between.
+	const watchCreatedTimeout = 5 * time.Second
+	select {
+	case created := <-createdCh:
+		if !created {
+			// The goroutine exited before the watch was confirmed (e.g. the
+			// Watch RPC failed). It has already torn itself down; wait for it
+			// to finish so the prefix entry is gone and no callback is in
+			// flight, then report failure.
+			cancel()
+			<-doneCh
+			*errMsg = C.CString("etcd watch goroutine exited before the watch was established")
+			return -1
+		}
+		return 0
+	case <-time.After(watchCreatedTimeout):
+		// The watch was not established within the timeout. Tear down the
+		// goroutine and report failure so the caller can fall back. Wait for
+		// the goroutine to fully exit so the prefix entry is removed and no
+		// callback can be in flight when we return.
+		cancel()
+		<-doneCh
+		*errMsg = C.CString("timeout waiting for etcd watch to be created")
+		return -1
+	}
+}
+
+func cancelAndDeletePrefixWatch(p string) int {
+	// NOTE: We intentionally do NOT delete the prefix entry here.
+	// The watch goroutine owns deletion + closing `done`, so callers can Wait safely.
+	storePrefixWatchMutex.Lock()
+	watchInfo, exists := storePrefixWatchCtx[p]
+	storePrefixWatchMutex.Unlock()
+
+	if !exists {
+		return -1
+	}
+
+	watchInfo.cancel()
+	return 0
+}
+
+//export EtcdStoreWaitWatchWithPrefixStoppedWrapper
+func EtcdStoreWaitWatchWithPrefixStoppedWrapper(prefix *C.char, prefixSize C.int, timeoutMs C.int, errMsg **C.char) int {
+	p := C.GoStringN(prefix, prefixSize)
+	storePrefixWatchMutex.Lock()
+	watchInfo, exists := storePrefixWatchCtx[p]
+	storePrefixWatchMutex.Unlock()
+
+	// If there is no watch, it's already stopped (idempotent).
+	if !exists {
+		return 0
+	}
+
+	timeout := time.Duration(timeoutMs) * time.Millisecond
+	if timeout <= 0 {
+		timeout = 5000 * time.Millisecond
+	}
+
+	select {
+	case <-watchInfo.done:
+		return 0
+	case <-time.After(timeout):
+		if errMsg != nil {
+			*errMsg = C.CString("timeout waiting for prefix watch to stop")
+		}
+		return -1
+	}
+}
+
+//export EtcdStoreCancelWatchWithPrefixWrapper
+func EtcdStoreCancelWatchWithPrefixWrapper(prefix *C.char, prefixSize C.int, errMsg **C.char) int {
+	p := C.GoStringN(prefix, prefixSize)
+	// Idempotent cancel: callers may cancel pre-emptively before starting a watch.
+	// If no context exists, treat it as success.
+	_ = cancelAndDeletePrefixWatch(p)
+	// Intentionally does not wait; use EtcdStoreWaitWatchWithPrefixStoppedWrapper.
+	_ = errMsg
+	return 0
+}
+
+//export SnapshotStorePutWrapper
+func SnapshotStorePutWrapper(key *C.char, keySize C.int, value *C.char, valueSize C.int, errMsg **C.char) int {
+	if snapshotClient == nil {
+		*errMsg = C.CString("etcd snapshot client not initialized")
+		return -1
+	}
+	k := C.GoStringN(key, keySize)
+	v := C.GoStringN(value, valueSize)
+	ctx, cancel := context.WithTimeout(context.Background(), snapshotTimeout)
+	defer cancel()
+	_, err := snapshotClient.Put(ctx, k, v)
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	return 0
+}
+
+//export SnapshotStoreGetWrapper
+func SnapshotStoreGetWrapper(key *C.char, keySize C.int, value **C.char,
+	valueSize *C.int, revisionId *int64, errMsg **C.char) int {
+	if snapshotClient == nil {
+		*errMsg = C.CString("etcd snapshot client not initialized")
+		return -1
+	}
+	k := C.GoStringN(key, keySize)
+	ctx, cancel := context.WithTimeout(context.Background(), snapshotTimeout)
+	defer cancel()
+	resp, err := snapshotClient.Get(ctx, k)
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	if len(resp.Kvs) == 0 {
+		*errMsg = C.CString("key not found in etcd")
+		return -2
+	} else {
+		kv := resp.Kvs[0]
+		*value = (*C.char)(C.CBytes(kv.Value))
+		*valueSize = C.int(len(kv.Value))
+		*revisionId = kv.CreateRevision
+		return 0
+	}
+}
+
+//export SnapshotStoreDeleteWrapper
+func SnapshotStoreDeleteWrapper(key *C.char, keySize C.int, usePrefix C.int, errMsg **C.char) int {
+	if snapshotClient == nil {
+		*errMsg = C.CString("etcd snapshot client not initialized")
+		return -1
+	}
+	k := C.GoStringN(key, keySize)
+	ctx, cancel := context.WithTimeout(context.Background(), snapshotTimeout)
+	defer cancel()
+
+	var opts []clientv3.OpOption
+	if usePrefix != 0 {
+		opts = append(opts, clientv3.WithPrefix())
+	}
+
+	_, err := snapshotClient.Delete(ctx, k, opts...)
+	if err != nil {
+		*errMsg = C.CString(err.Error())
+		return -1
+	}
+	return 0
 }
 
 func main() {}

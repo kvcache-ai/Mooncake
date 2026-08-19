@@ -14,6 +14,8 @@
 
 #include "tent/runtime/memory_prober.h"
 #include "tent/device_plugin.h"
+#include "tent/common/utils/prefault.h"
+#include "char_util.h"
 
 #include <filesystem>
 #include <dlfcn.h>
@@ -188,7 +190,8 @@ static inline std::string genCpuNodeName(int node) {
     return kWildcardLocation;
 }
 
-const std::vector<RangeLocation> getCpuLocation(void* start, size_t len) {
+const std::vector<RangeLocation> getCpuLocation(void* start, size_t len,
+                                                bool skip_prefault = false) {
     const static size_t kPageSize = 4096;
     std::vector<RangeLocation> entries;
 
@@ -201,6 +204,10 @@ const std::vector<RangeLocation> getCpuLocation(void* start, size_t len) {
 
     for (int i = 0; i < n; i++) {
         pages[i] = (void*)((char*)aligned_start + i * kPageSize);
+    }
+
+    if (!skip_prefault) {
+        prefaultBeforeProbe(pages, n, aligned_start, "MemoryProber");
     }
 
     int rc = numa_move_pages(0, n, pages, nullptr, status, 0);
@@ -230,7 +237,8 @@ const std::vector<RangeLocation> getCpuLocation(void* start, size_t len) {
     return entries;
 }
 
-const std::vector<RangeLocation> MemoryProber::locate(void* addr, size_t size) {
+const std::vector<RangeLocation> MemoryProber::locate(void* addr, size_t size,
+                                                      bool skip_prefault) {
     location_t list_buf[64];
     for (auto& p : plugins_) {
         if (!p.iface.query_location) continue;
@@ -245,7 +253,7 @@ const std::vector<RangeLocation> MemoryProber::locate(void* addr, size_t size) {
             return out;
         }
     }
-    return getCpuLocation(addr, size);
+    return getCpuLocation(addr, size, skip_prefault);
 }
 
 std::string MemoryProber::type(void* addr) {
@@ -367,7 +375,7 @@ void MemoryProber::probeDeviceMemory(
                                                      sizeof(pci_bus_id));
         if (err) continue;
 
-        for (char* ch = pci_bus_id; (*ch = tolower(*ch)); ch++);
+        for (char* ch = pci_bus_id; (*ch = to_lower(*ch)); ch++);
         int numa_node = getNumaNodeFromPciDevice(pci_bus_id);
         int min_distance = INT_MAX;
         std::unordered_map<int, std::vector<int>> distance_map;

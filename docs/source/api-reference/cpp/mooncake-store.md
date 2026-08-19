@@ -1,0 +1,224 @@
+# Mooncake Store C++ API Reference
+
+## Client C++ API
+
+### Constructor and Initialization `Init`
+
+```C++
+ErrorCode Init(const std::string& local_hostname,
+               const std::string& metadata_connstring,
+               const std::string& protocol,
+               void** protocol_args,
+               const std::string& master_server_entry);
+```
+
+Initializes the Mooncake Store client. The parameters are as follows:
+- `local_hostname`: The `IP:Port` of the local machine or an accessible domain name (default value used if port is not included)
+- `metadata_connstring`: The address of the metadata service (e.g., etcd/Redis) required for Transfer Engine initialization
+- `protocol`: The protocol supported by the Transfer Engine, including RDMA and TCP
+- `protocol_args`: Protocol parameters required by the Transfer Engine
+- `master_server_entry`: The address information of the Master (`IP:Port` for default mode and `etcd://IP:Port;IP:Port;...;IP:Port` for high availability mode)
+
+### Get
+
+```C++
+tl::expected<void, ErrorCode> Get(const std::string& object_key,
+                                  std::vector<Slice>& slices);
+```
+
+`Get` retrieves the value of `object_key` into the provided `slices`. The returned data is guaranteed to be complete and correct. Each slice must reference local DRAM/VRAM memory that has been pre-registered with `registerLocalMemory(addr, len)` (not the global segments that contribute to the distributed memory pool). The master returns the readable replica list and the client selects a complete replica. Depending on the selected replica, the data may be read from memory, NoF SSD, legacy shared-filesystem `DISK`, client-owned `LOCAL_DISK`, or the configured descriptor-based DFS backend.
+
+### Put
+
+```C++
+tl::expected<void, ErrorCode> Put(const ObjectKey& key,
+                                  std::vector<Slice>& slices,
+                                  const ReplicateConfig& config);
+```
+
+`Put` stores the value associated with `key` in the configured replica tiers. The `config` parameter controls the number of memory, NoF, and DFS replicas as well as placement preferences. Legacy `DISK` persistence and client-owned `LOCAL_DISK` SSD offload remain asynchronous. When `dfs_replica_num` is `1`, `Put` waits for the requested DFS `WriteAt` operation before returning success; this does not provide an additional `fsync` durability guarantee.
+
+**Memory Replication Guarantees and Best Effort Behavior:**
+- Each slice of an object is guaranteed to be replicated to different segments, ensuring distribution across separate storage nodes
+- Different slices from different objects may be placed in the same segment
+- Replication operates on a best-effort basis: if insufficient space is available for all requested replicas, the object will still be written with as many replicas as possible
+
+Requests with `dfs_replica_num == 1` use reliable multi-replica mode: allocation and every requested transfer must succeed, otherwise `Put` fails and allocated replicas are revoked.
+
+```{warning}
+Descriptor-based DFS is a work-in-progress feature for development and evaluation. It is not covered by the Store's production fault-tolerance, HA, durability, or multi-tenant guarantees.
+```
+
+The DFS-related replica-count fields of `ReplicateConfig` are as follows:
+
+```C++
+struct ReplicateConfig {
+    size_t replica_num{1};                       // Memory replicas
+    size_t nof_replica_num{0};                   // NoF SSD replicas
+    size_t dfs_replica_num{0};                   // Shared DFS replicas (0 or 1)
+    SoftPinAction soft_pin_action{SoftPinAction::PRESERVE};
+    std::optional<uint64_t> soft_pin_ttl_ms{};   // ENABLE override; omitted uses the Master default
+    bool with_hard_pin{false};                   // Whether to enable hard pin (never evicted)
+    std::string preferred_segment{};             // Preferred segment for allocation
+    // Other placement, data-type, and grouping fields are omitted.
+};
+```
+
+`dfs_replica_num` may currently be `0` or `1`. When it is `1`, `replica_num >= 1` is required, so DFS-only placement is not supported. DFS replicas currently support only the `default` tenant and require the master and client DFS backends to be configured with the same shared root and shard layout. See the {ref}`DFS deployment documentation <dfs-storage>` for setup and lifecycle limitations. Native C++ clients must initialize a `DistributedStorageBackend` and attach it with `SetDfsStorageBackend()` before issuing DFS reads or writes. DFS descriptors are carried by each `PutStart`, `UpsertStart`, or query response; there is no client-side descriptor cache. The Python/RealClient setup path attaches the backend through `FileStorage`.
+
+Soft pinning starts when the first replica becomes readable and has a fixed
+lifetime: reads do not extend it. `PRESERVE` keeps the committed deadline on an
+Upsert, `ENABLE` starts a new lifetime, and `DISABLE` removes it when the write
+commits. `soft_pin_ttl_ms` is valid only with `ENABLE`; zero commits ordinary
+cache, and values above the Master's configured maximum are rejected.
+Soft-pin state is not persisted in snapshots or the HA OpLog; after recovery or
+Standby promotion, restored objects are ordinary cache until a later write
+explicitly enables soft pinning again.
+
+### Upsert
+
+```C++
+tl::expected<void, ErrorCode> Upsert(const ObjectKey& key,
+                                     std::vector<Slice>& slices,
+                                     const ReplicateConfig& config);
+
+std::vector<tl::expected<void, ErrorCode>> BatchUpsert(
+    const std::vector<ObjectKey>& keys,
+    std::vector<std::vector<Slice>>& batched_slices,
+    const ReplicateConfig& config);
+```
+
+`Upsert` inserts `key` if it does not exist and updates the existing object if
+it does. It uses the same replication configuration model as `Put`, while
+allowing the store to reuse existing placement for in-place updates when the
+current layout permits it. If either the existing object or the new request has
+a DFS replica, a same-size update requires the requested memory, NoF, and DFS
+replica counts to match the existing topology. A different-size update releases
+the old placement and allocates a new topology. `BatchUpsert` performs the same
+operation for multiple keys using a shared replication configuration.
+
+### Remove
+
+```C++
+tl::expected<void, ErrorCode> Remove(const ObjectKey& key);
+```
+
+Used to delete the object corresponding to the specified key. This interface marks all data replicas associated with the key in the storage engine as deleted, without needing to communicate with the corresponding storage node (Client).
+
+### CreateCopyTask
+
+```C++
+tl::expected<UUID, ErrorCode> CreateCopyTask(
+    const std::string& key,
+    const std::vector<std::string>& targets);
+```
+
+`CreateCopyTask` creates an asynchronous copy task that will be executed by the client's task execution system. This is useful when you want to submit multiple copy operations without waiting for each one to complete. The task is submitted to the master service, assigned a unique task ID, and executed asynchronously by an available client. The task status can be queried using `QueryTask`.
+
+**Task Execution and Result Reporting:**
+1. **Task Assignment**: The master service assigns the task to an available client during the client's periodic ping operation
+2. **Task Execution**: The assigned client executes the copy operation asynchronously in a background thread pool
+3. **Result Reporting**: Upon completion (success or failure), the client automatically reports the result to the master service via `MarkTaskToComplete`:
+   - On success: `status = SUCCESS`, `message = "Task completed successfully"`
+   - On failure: `status = FAILED`, `message = <error description>`
+4. **Status Query**: You can query the task status at any time using `QueryTask` to monitor progress
+
+**Failure and retry behavior:**
+- New tasks enter the queue as `PENDING` and are moved to `PROCESSING` when a client starts execution.
+- The client only retries failures caused by `ErrorCode::NO_AVAILABLE_HANDLE`, up to the master-side `max_retry_attempts` limit.
+- Submission can fail immediately with `ErrorCode::TASK_PENDING_LIMIT_EXCEEDED` when the task queue is full.
+
+### CreateMoveTask
+
+```C++
+tl::expected<UUID, ErrorCode> CreateMoveTask(
+    const std::string& key,
+    const std::string& source,
+    const std::string& target);
+```
+
+`CreateMoveTask` creates an asynchronous move task that will be executed by the client's task execution system. This is useful when you want to submit multiple move operations without waiting for each one to complete. The task is submitted to the master service, assigned a unique task ID, and executed asynchronously by an available client. The task status can be queried using `QueryTask`.
+
+**Task Execution and Result Reporting:**
+1. **Task Assignment**: The master service assigns the task to an available client during the client's periodic ping operation
+2. **Task Execution**: The assigned client executes the move operation asynchronously in a background thread pool
+3. **Result Reporting**: Upon completion (success or failure), the client automatically reports the result to the master service via `MarkTaskToComplete`:
+   - On success: `status = SUCCESS`, `message = "Task completed successfully"`
+   - On failure: `status = FAILED`, `message = <error description>`
+4. **Status Query**: You can query the task status at any time using `QueryTask` to monitor progress
+
+**Failure and retry behavior:**
+- Move tasks follow the same state machine as copy tasks: `PENDING -> PROCESSING -> SUCCESS/FAILED`.
+- **Submission-time failures**: If the object or source replica is already missing when `CreateMoveTask` is called, the call returns `ErrorCode::OBJECT_NOT_FOUND` or `ErrorCode::INVALID_PARAMS` directly and no task is created.
+- **Execution-time failures**: If the object or source replica disappears after the task is successfully submitted, the task transitions to `FAILED` state. Only `ErrorCode::NO_AVAILABLE_HANDLE` execution failures are retried automatically.
+- Timeout and retry policy is configured on the master, not per request.
+
+### QueryTask
+
+```C++
+tl::expected<QueryTaskResponse, ErrorCode> QueryTask(const UUID& task_id);
+```
+
+`QueryTask` queries the status of an asynchronous task (copy or move). This allows you to monitor the progress of task-based operations. The response includes task status, type, creation time, last update time, assigned client, and status message.
+
+The data structure details of `QueryTaskResponse` are as follows:
+
+```C++
+struct QueryTaskResponse {
+    UUID id;                                    // Task UUID
+    TaskType type;                              // Task type (REPLICA_COPY or REPLICA_MOVE)
+    TaskStatus status;                          // Task status (PENDING, PROCESSING, SUCCESS, or FAILED)
+    int64_t created_at_ms_epoch;                // Task creation timestamp in milliseconds
+    int64_t last_updated_at_ms_epoch;           // Last update timestamp in milliseconds
+    UUID assigned_client;                       // UUID of the client assigned to execute the task
+    std::string message;                        // Status message or error description
+};
+```
+
+Typical query-time failure:
+- `ErrorCode::TASK_NOT_FOUND`: the task ID is unknown or the completed task has already been evicted from the master's retained finished-task history.
+
+**Master-side task manager settings affecting task APIs:**
+- `--max_total_finished_tasks`: number of completed tasks retained for subsequent `QueryTask` calls
+- `--max_total_pending_tasks`: maximum queued tasks before `CreateCopyTask`/`CreateMoveTask` fail with `TASK_PENDING_LIMIT_EXCEEDED`
+- `--max_total_processing_tasks`: cap on concurrently processing tasks
+- `--pending_task_timeout_sec`: timeout for tasks that remain in `PENDING` (`0` disables it)
+- `--processing_task_timeout_sec`: timeout for tasks that remain in `PROCESSING` (`0` disables it)
+- `--max_retry_attempts`: retry limit for `NO_AVAILABLE_HANDLE` execution failures
+
+### BatchQueryIp
+
+```C++
+tl::expected<std::unordered_map<UUID, std::vector<std::string>, boost::hash<UUID>>, ErrorCode>
+BatchQueryIp(const std::vector<UUID>& client_ids);
+```
+
+Used to batch query the IP addresses for multiple client IDs. For each client ID in the input list, this interface retrieves the unique IP addresses from all segments mounted by that client. The operation is performed on the Master Service and returns a map from client ID to their IP address lists. Only client IDs that have successfully mounted segments are included in the result map. This is useful for discovering the network locations of storage nodes in the cluster.
+
+### BatchReplicaClear
+
+```C++
+tl::expected<std::vector<std::string>, ErrorCode>
+BatchReplicaClear(const std::vector<std::string>& object_keys,
+                  const UUID& client_id,
+                  const std::string& segment_name);
+```
+
+Used to batch clear replicas for multiple object keys belonging to a specific client ID. This interface allows clearing replicas either on a specific segment or across all segments. If segment_name is empty, all replicas of the specified objects are cleared (the objects are deleted entirely). If segment_name is provided, only replicas located on that specific segment are cleared. The operation is performed on the Master Service and returns a list of object keys that were successfully cleared. Only objects that belong to the specified `client_id`, have expired leases, and meet the clearing criteria are processed. This is useful for managing storage resources and cleaning up data on specific storage nodes.
+
+### QueryByRegex
+
+```C++
+tl::expected<std::unordered_map<std::string, std::vector<Replica::Descriptor>>, ErrorCode>
+QueryByRegex(const std::string& str);
+```
+
+Used to query the replica information for all objects whose keys match the given regular expression. This is useful for batch operations or for retrieving a group of related objects. The operation is performed on the Master and returns a map of keys to their replica lists.
+
+### RemoveByRegex
+
+```C++
+tl::expected<long, ErrorCode> RemoveByRegex(const ObjectKey& str);
+```
+
+Used to delete all objects from the store whose keys match the specified regular expression. This provides a powerful way to perform bulk deletions. The command returns the number of objects that were successfully removed.

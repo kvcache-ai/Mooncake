@@ -18,6 +18,9 @@
 
 #include <cassert>
 #include <set>
+#include <algorithm>
+#include <chrono>
+#include <exception>
 
 #include "common.h"
 #include "config.h"
@@ -25,6 +28,18 @@
 #include "transfer_metadata_plugin.h"
 
 namespace mooncake {
+#ifdef ENABLE_MULTI_PROTOCOL
+// Split comma-separated protocol string into vector
+static std::vector<std::string> splitProtocols(const std::string &protocols) {
+    std::vector<std::string> result;
+    std::stringstream ss(protocols);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        if (!item.empty()) result.push_back(item);
+    }
+    return result;
+}
+#endif
 
 static inline std::string extractProtocolFromConnString(
     const std::string &conn_string) {
@@ -53,7 +68,10 @@ struct TransferNotifyUtil {
 struct TransferHandshakeUtil {
     static Json::Value encode(const TransferMetadata::HandShakeDesc &desc) {
         Json::Value root;
+        root["payload"] = desc.payload;
         root["local_nic_path"] = desc.local_nic_path;
+        root["local_lid"] = desc.local_lid;
+        root["local_gid"] = desc.local_gid;
         root["peer_nic_path"] = desc.peer_nic_path;
 #ifdef USE_BAREX
         root["barex_port"] = desc.barex_port;
@@ -61,19 +79,69 @@ struct TransferHandshakeUtil {
         Json::Value qpNums(Json::arrayValue);
         for (const auto &qp : desc.qp_num) qpNums.append(qp);
         root["qp_num"] = qpNums;
+        if (desc.ready_ack_supported || desc.ready_ack)
+            root["ready_ack"] = desc.ready_ack;
         root["reply_msg"] = desc.reply_msg;
+#ifdef USE_EFA
+        root["efa_addr"] = desc.efa_addr;  // EFA endpoint address
+#endif
+#ifdef USE_CXI
+        root["cxi_addr"] = desc.cxi_addr;
+#endif
+
+#ifdef USE_UB
+        Json::Value jettyNums(Json::arrayValue);
+        for (const auto &jetty : desc.jetty_num) jettyNums.append(jetty);
+        root["jetty_num"] = jettyNums;
+        LOG(INFO) << "Encode: local_nic_path is " << desc.local_nic_path
+                  << " peer_nic_path is " << desc.peer_nic_path
+                  << " jetty_num size is " << desc.jetty_num.size();
+#endif
         return root;
     }
 
     static int decode(Json::Value root, TransferMetadata::HandShakeDesc &desc) {
+        desc.payload = root["payload"].asString();
         desc.local_nic_path = root["local_nic_path"].asString();
+        if (root.isMember("local_lid") && root["local_lid"].isUInt()) {
+            desc.local_lid = root["local_lid"].asUInt();
+        } else {
+            desc.local_lid = 0;
+        }
+        if (root.isMember("local_gid") && root["local_gid"].isString()) {
+            desc.local_gid = root["local_gid"].asString();
+        } else {
+            desc.local_gid.clear();
+        }
         desc.peer_nic_path = root["peer_nic_path"].asString();
 #ifdef USE_BAREX
         desc.barex_port = root["barex_port"].asInt();
 #endif
         for (const auto &qp : root["qp_num"])
             desc.qp_num.push_back(qp.asUInt());
+        desc.ready_ack_supported = root.isMember("ready_ack");
+        if (desc.ready_ack_supported && root["ready_ack"].isBool()) {
+            desc.ready_ack = root["ready_ack"].asBool();
+        } else {
+            desc.ready_ack = false;
+        }
         desc.reply_msg = root["reply_msg"].asString();
+#ifdef USE_EFA
+        desc.efa_addr = root["efa_addr"].asString();  // EFA endpoint address
+#endif
+
+#ifdef USE_CXI
+        desc.cxi_addr = root["cxi_addr"].asString();
+#endif
+
+#ifdef USE_UB
+        for (const auto &jetty : root["jetty_num"]) {
+            desc.jetty_num.push_back(jetty.asUInt());
+        }
+        LOG(INFO) << "Decode: remote_nic_path is " << desc.local_nic_path
+                  << " peer_nic_path is " << desc.peer_nic_path
+                  << " jetty_num size is " << desc.jetty_num.size();
+#endif
         return 0;
     }
 };
@@ -105,6 +173,7 @@ TransferMetadata::TransferMetadata(const std::string &conn_string) {
     }
     if (conn_string == P2PHANDSHAKE) {
         p2p_handshake_mode_ = true;
+        startMetadataRefreshPollingIfNeeded();
         return;
     }
     storage_plugin_ = MetadataStoragePlugin::Create(conn_string);
@@ -113,9 +182,68 @@ TransferMetadata::TransferMetadata(const std::string &conn_string) {
             << "Unable to create metadata storage plugin with conn string "
             << conn_string;
     }
+    startMetadataRefreshPollingIfNeeded();
 }
 
-TransferMetadata::~TransferMetadata() { handshake_plugin_.reset(); }
+TransferMetadata::~TransferMetadata() {
+    stopMetadataRefreshPollingThread();
+    handshake_plugin_.reset();
+    storage_plugin_.reset();
+}
+
+void TransferMetadata::startMetadataRefreshPollingIfNeeded() {
+    const auto &config = globalConfig();
+    if (!config.metacache || config.te_metadata_refresh_interval_seconds == 0) {
+        return;
+    }
+    if (!p2p_handshake_mode_ && !storage_plugin_) {
+        return;
+    }
+
+    const auto refresh_interval_seconds =
+        config.te_metadata_refresh_interval_seconds;
+    should_stop_metadata_refresh_thread_ = false;
+    metadata_refresh_thread_ = std::thread([this, refresh_interval_seconds]() {
+        metadataRefreshPollingLoop(refresh_interval_seconds);
+    });
+    LOG(INFO) << "TE metadata refresh polling enabled, interval_seconds="
+              << refresh_interval_seconds;
+}
+
+void TransferMetadata::stopMetadataRefreshPollingThread() {
+    should_stop_metadata_refresh_thread_ = true;
+    metadata_refresh_cv_.notify_all();
+    if (metadata_refresh_thread_.joinable()) {
+        metadata_refresh_thread_.join();
+    }
+}
+
+void TransferMetadata::metadataRefreshPollingLoop(
+    uint64_t refresh_interval_seconds) {
+    std::unique_lock<std::mutex> lock(metadata_refresh_mutex_);
+    while (!should_stop_metadata_refresh_thread_) {
+        if (metadata_refresh_cv_.wait_for(
+                lock, std::chrono::seconds(refresh_interval_seconds), [this]() {
+                    return should_stop_metadata_refresh_thread_.load();
+                })) {
+            break;
+        }
+        lock.unlock();
+        try {
+            int ret = syncSegmentCache("");
+            if (ret) {
+                LOG(WARNING)
+                    << "TE metadata refresh polling failed, ret=" << ret;
+            }
+        } catch (const std::exception &e) {
+            LOG(ERROR) << "Exception in TE metadata refresh polling: "
+                       << e.what();
+        } catch (...) {
+            LOG(ERROR) << "Unknown exception in TE metadata refresh polling";
+        }
+        lock.lock();
+    }
+}
 
 std::string TransferMetadata::getFullMetadataKey(
     const std::string &segment_name) const {
@@ -147,6 +275,14 @@ int TransferMetadata::receivePeerNotify(const Json::Value &peer_json,
     return 0;
 }
 
+int TransferMetadata::receivePeerProbe(const Json::Value &peer_json,
+                                       Json::Value &local_json) {
+    (void)peer_json;
+    local_json = Json::Value(Json::objectValue);
+    local_json["status"] = "success";
+    return 0;
+}
+
 int TransferMetadata::getNotifies(std::vector<NotifyDesc> &notifies) {
     RWSpinlock::WriteGuard guard(notify_lock_);
     if (notifys.size() > 0) {
@@ -156,15 +292,116 @@ int TransferMetadata::getNotifies(std::vector<NotifyDesc> &notifies) {
     return 0;
 }
 
+#ifdef ENABLE_MULTI_PROTOCOL
+static int encodeMultiProtocolSegmentDesc(
+    const std::vector<std::string> &protocols,
+    const TransferMetadata::SegmentDesc &desc, Json::Value &segmentJSON) {
+    // Multi-protocol encoding for CXL+TCP or CXL+RDMA combination
+    segmentJSON["name"] = desc.name;
+    if (!desc.rdma_server_name.empty()) {
+        segmentJSON["rdma_server_name"] = desc.rdma_server_name;
+    }
+    Json::Value protocolJSON(Json::arrayValue);
+    for (const auto &proto : protocols) {
+        if (proto == "rdma") {
+            Json::Value devicesJSON(Json::arrayValue);
+            for (const auto &device : desc.devices) {
+                Json::Value deviceJSON;
+                deviceJSON["name"] = device.name;
+                deviceJSON["lid"] = device.lid;
+                deviceJSON["gid"] = device.gid;
+                devicesJSON.append(deviceJSON);
+            }
+            segmentJSON["devices"] = devicesJSON;
+            segmentJSON["priority_matrix"] = desc.topology.toJson();
+        } else if (proto == "cxl") {
+            segmentJSON["cxl_name"] = desc.cxl_name;
+            segmentJSON["cxl_base_addr"] =
+                static_cast<Json::UInt64>(desc.cxl_base_addr);
+        }
+        protocolJSON.append(proto);
+    }
+
+    Json::Value buffersJSON(Json::arrayValue);
+    for (const auto &buffer : desc.buffers) {
+        Json::Value bufferJSON;
+        bufferJSON["name"] = buffer.name;
+        bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
+        bufferJSON["protocol"] = buffer.protocol;
+
+        if (buffer.protocol == "cxl") {
+            bufferJSON["offset"] = static_cast<Json::UInt64>(buffer.offset);
+        } else if (buffer.protocol == "rdma") {
+            bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
+            Json::Value rkeyJSON(Json::arrayValue);
+            for (auto &entry : buffer.rkey) rkeyJSON.append(entry);
+            bufferJSON["rkey"] = rkeyJSON;
+            Json::Value lkeyJSON(Json::arrayValue);
+            for (auto &entry : buffer.lkey) lkeyJSON.append(entry);
+            bufferJSON["lkey"] = lkeyJSON;
+        } else if (buffer.protocol == "tcp") {
+            bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
+        } else if (buffer.protocol == "hip" || buffer.protocol == "maca") {
+            bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
+            bufferJSON["shm_name"] = buffer.shm_name;
+        }
+        buffersJSON.append(bufferJSON);
+    }
+    segmentJSON["buffers"] = buffersJSON;
+    segmentJSON["protocol"] = protocolJSON;
+    segmentJSON["tcp_data_port"] = desc.tcp_data_port;
+    segmentJSON["tcp_proto_version"] = desc.tcp_proto_version;
+    segmentJSON["timestamp"] = getCurrentDateTime();
+
+    return 0;
+}
+#endif
+
 int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
                                         Json::Value &segmentJSON) {
+#ifdef ENABLE_MULTI_PROTOCOL
+    // A segment is multi-protocol when more than one transport registered
+    // buffers on it (e.g. tcp+hip or rdma+hip for intra-node disagg). Every
+    // protocol must have a per-buffer emitter below; otherwise its buffers
+    // would be silently dropped.
+    std::vector<std::string> protocols = splitProtocols(desc.protocol);
+    bool is_multi_protocol = false;
+    if (protocols.size() >= 2) {
+        is_multi_protocol = true;
+        for (const auto &proto : protocols) {
+            if (proto != "cxl" && proto != "tcp" && proto != "rdma" &&
+                proto != "hip" && proto != "maca") {
+                is_multi_protocol = false;
+                break;
+            }
+        }
+        if (!is_multi_protocol) {
+            LOG(ERROR) << "Unsupported multi-protocol combination: "
+                       << desc.protocol
+                       << ". Only cxl, tcp, rdma, hip and maca may be "
+                          "combined.";
+            return ERR_INVALID_ARGUMENT;
+        }
+    }
+
+    // If multi-protocol scenario, use multi-protocol encoding
+    if (is_multi_protocol) {
+        return encodeMultiProtocolSegmentDesc(protocols, desc, segmentJSON);
+    }
+#endif
+
     segmentJSON["name"] = desc.name;
     segmentJSON["protocol"] = desc.protocol;
     segmentJSON["tcp_data_port"] = desc.tcp_data_port;
+    segmentJSON["tcp_proto_version"] = desc.tcp_proto_version;
     segmentJSON["timestamp"] = getCurrentDateTime();
+    if (!desc.rdma_server_name.empty()) {
+        segmentJSON["rdma_server_name"] = desc.rdma_server_name;
+    }
 
     if (segmentJSON["protocol"] == "rdma" ||
-        segmentJSON["protocol"] == "barex") {
+        segmentJSON["protocol"] == "barex" ||
+        segmentJSON["protocol"] == "efa" || segmentJSON["protocol"] == "cxi") {
         Json::Value devicesJSON(Json::arrayValue);
         for (const auto &device : desc.devices) {
             Json::Value deviceJSON;
@@ -191,6 +428,29 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
         }
         segmentJSON["buffers"] = buffersJSON;
         segmentJSON["priority_matrix"] = desc.topology.toJson();
+    } else if (segmentJSON["protocol"] == "ub") {
+        Json::Value devicesJSON(Json::arrayValue);
+        for (const auto &device : desc.devices) {
+            Json::Value deviceJSON;
+            deviceJSON["name"] = device.name;
+            deviceJSON["eid"] = device.eid;
+            devicesJSON.append(deviceJSON);
+        }
+        segmentJSON["devices"] = devicesJSON;
+
+        Json::Value buffersJSON(Json::arrayValue);
+        for (const auto &buffer : desc.buffers) {
+            Json::Value bufferJSON;
+            bufferJSON["name"] = buffer.name;
+            bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
+            bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
+            Json::Value tsegJSON(Json::arrayValue);
+            for (auto &entry : buffer.tseg) tsegJSON.append(entry);
+            bufferJSON["tseg"] = tsegJSON;
+            buffersJSON.append(bufferJSON);
+        }
+        segmentJSON["buffers"] = buffersJSON;
+        segmentJSON["priority_matrix"] = desc.topology.toJson();
     } else if (segmentJSON["protocol"] == "tcp") {
         Json::Value buffersJSON(Json::arrayValue);
         for (const auto &buffer : desc.buffers) {
@@ -198,6 +458,17 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
             bufferJSON["name"] = buffer.name;
             bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
             bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
+            buffersJSON.append(bufferJSON);
+        }
+        segmentJSON["buffers"] = buffersJSON;
+    } else if (segmentJSON["protocol"] == "nccl") {
+        Json::Value buffersJSON(Json::arrayValue);
+        for (const auto &buffer : desc.buffers) {
+            Json::Value bufferJSON;
+            bufferJSON["name"] = buffer.name;
+            bufferJSON["addr"] = static_cast<Json::UInt64>(buffer.addr);
+            bufferJSON["length"] = static_cast<Json::UInt64>(buffer.length);
+            bufferJSON["device_id"] = buffer.device_id;
             buffersJSON.append(bufferJSON);
         }
         segmentJSON["buffers"] = buffersJSON;
@@ -236,12 +507,19 @@ int TransferMetadata::encodeSegmentDesc(const SegmentDesc &desc,
         rankInfoJSON["devicePort"] =
             static_cast<Json::UInt64>(desc.rank_info.devicePort);
         rankInfoJSON["pid"] = static_cast<Json::UInt64>(desc.rank_info.pid);
+        Json::Value endpointsJSON(Json::arrayValue);
+        for (const auto &endpoint : desc.rank_info.endpoints) {
+            endpointsJSON.append(endpoint);
+        }
+        rankInfoJSON["endpoints"] = endpointsJSON;
 
         segmentJSON["rank_info"] = rankInfoJSON;
     } else if (segmentJSON["protocol"] == "nvlink" ||
                segmentJSON["protocol"] == "nvlink_intra" ||
                segmentJSON["protocol"] == "hip" ||
-               segmentJSON["protocol"] == "ubshmem") {
+               segmentJSON["protocol"] == "maca" ||
+               segmentJSON["protocol"] == "ubshmem" ||
+               segmentJSON["protocol"] == "sunrise_link") {
         Json::Value buffersJSON(Json::arrayValue);
         for (const auto &buffer : desc.buffers) {
             Json::Value bufferJSON;
@@ -296,6 +574,7 @@ int TransferMetadata::updateSegmentDesc(const std::string &segment_name,
 
 int TransferMetadata::removeSegmentDesc(const std::string &segment_name) {
     if (p2p_handshake_mode_) {
+        RWSpinlock::WriteGuard guard(segment_lock_);
         auto iter = segment_name_to_id_map_.find(segment_name);
         if (iter != segment_name_to_id_map_.end()) {
             LOG(INFO) << "removeSegmentDesc " << segment_name << " finish";
@@ -315,17 +594,187 @@ int TransferMetadata::removeSegmentDesc(const std::string &segment_name) {
     return 0;
 }
 
+#ifdef ENABLE_MULTI_PROTOCOL
+static std::shared_ptr<TransferMetadata::SegmentDesc>
+decodeMultiProtocolSegmentDesc(Json::Value &segmentJSON,
+                               const std::string &segment_name) {
+    auto desc = std::make_shared<TransferMetadata::SegmentDesc>();
+    desc->name = segmentJSON["name"].asString();
+    desc->tcp_data_port = segmentJSON["tcp_data_port"].asInt();
+    desc->tcp_proto_version = segmentJSON.isMember("tcp_proto_version")
+                                  ? segmentJSON["tcp_proto_version"].asInt()
+                                  : 1;
+    if (segmentJSON.isMember("timestamp"))
+        desc->timestamp = segmentJSON["timestamp"].asString();
+    if (segmentJSON.isMember("rdma_server_name"))
+        desc->rdma_server_name = segmentJSON["rdma_server_name"].asString();
+
+    for (const auto &protocolStr : segmentJSON["protocol"]) {
+        std::string proto = protocolStr.asString();
+        if (!desc->protocol.empty()) desc->protocol += ",";
+        desc->protocol += proto;
+
+        if (proto == "rdma") {
+            if (desc->devices.empty()) {
+                for (const auto &deviceJSON : segmentJSON["devices"]) {
+                    TransferMetadata::DeviceDesc device;
+                    device.name = deviceJSON["name"].asString();
+                    device.lid = deviceJSON["lid"].asUInt();
+                    device.gid = deviceJSON["gid"].asString();
+                    if (device.name.empty() || device.gid.empty()) {
+                        LOG(WARNING) << "Corrupted segment descriptor, name "
+                                     << segment_name << " protocol " << proto;
+                        return nullptr;
+                    }
+                    desc->devices.push_back(device);
+                }
+
+                int ret = desc->topology.parse(
+                    segmentJSON["priority_matrix"].toStyledString());
+                if (ret) {
+                    LOG(WARNING) << "Corrupted segment descriptor, name "
+                                 << segment_name << " protocol " << proto;
+                }
+            }
+        } else if (proto == "cxl") {
+            desc->cxl_name = segmentJSON["cxl_name"].asString();
+            desc->cxl_base_addr = segmentJSON["cxl_base_addr"].asUInt64();
+        }
+    }
+
+    for (const auto &bufferJSON : segmentJSON["buffers"]) {
+        std::string buffer_protocol = bufferJSON["protocol"].asString();
+
+        if (buffer_protocol == "cxl") {
+            TransferMetadata::BufferDesc buffer;
+            buffer.name = bufferJSON["name"].asString();
+            buffer.offset = bufferJSON["offset"].asUInt64();
+            buffer.length = bufferJSON["length"].asUInt64();
+            buffer.protocol = buffer_protocol;
+            if (buffer.name.empty() || !buffer.length) {
+                LOG(WARNING)
+                    << "Corrupted segment descriptor, name " << segment_name
+                    << " buffer_protocol " << buffer_protocol;
+                return nullptr;
+            }
+            desc->buffers.push_back(buffer);
+        } else if (buffer_protocol == "rdma") {
+            TransferMetadata::BufferDesc buffer;
+            buffer.name = bufferJSON["name"].asString();
+            buffer.addr = bufferJSON["addr"].asUInt64();
+            buffer.length = bufferJSON["length"].asUInt64();
+            buffer.protocol = buffer_protocol;
+            for (const auto &rkeyJSON : bufferJSON["rkey"])
+                buffer.rkey.push_back(
+                    static_cast<decltype(buffer.rkey)::value_type>(
+                        rkeyJSON.asUInt64()));
+            for (const auto &lkeyJSON : bufferJSON["lkey"])
+                buffer.lkey.push_back(
+                    static_cast<decltype(buffer.lkey)::value_type>(
+                        lkeyJSON.asUInt64()));
+            // The same topology-derived device_id indexes both rkey and
+            // devices, and a publisher emits exactly one key per device, so a
+            // key vector longer than the device list lets that index run past
+            // the end of devices[]. See the comment in decodeSegmentDesc.
+            if (buffer.name.empty() || !buffer.addr || !buffer.length ||
+                (!buffer.rkey.empty() &&
+                 (buffer.rkey.size() != buffer.lkey.size() ||
+                  buffer.rkey.size() != desc->devices.size()))) {
+                LOG(WARNING)
+                    << "Corrupted segment descriptor, name " << segment_name
+                    << " buffer_protocol " << buffer_protocol << ", "
+                    << buffer.name << ", " << buffer.addr << ", "
+                    << buffer.length << ", " << buffer.rkey.size() << ", "
+                    << buffer.lkey.size() << ", " << desc->devices.size();
+                return nullptr;
+            }
+            desc->buffers.push_back(buffer);
+        } else if (buffer_protocol == "tcp") {
+            TransferMetadata::BufferDesc buffer;
+            buffer.name = bufferJSON["name"].asString();
+            buffer.addr = bufferJSON["addr"].asUInt64();
+            buffer.length = bufferJSON["length"].asUInt64();
+            buffer.protocol = buffer_protocol;
+            if (buffer.name.empty() || !buffer.addr || !buffer.length) {
+                LOG(WARNING)
+                    << "Corrupted segment descriptor, name " << segment_name
+                    << " buffer_protocol " << buffer_protocol;
+                return nullptr;
+            }
+            desc->buffers.push_back(buffer);
+        } else if (buffer_protocol == "hip" || buffer_protocol == "maca") {
+            TransferMetadata::BufferDesc buffer;
+            buffer.name = bufferJSON["name"].asString();
+            buffer.addr = bufferJSON["addr"].asUInt64();
+            buffer.length = bufferJSON["length"].asUInt64();
+            buffer.shm_name = bufferJSON["shm_name"].asString();
+            buffer.protocol = buffer_protocol;
+            if (buffer.name.empty() || !buffer.addr || !buffer.length ||
+                buffer.shm_name.empty()) {
+                LOG(WARNING)
+                    << "Corrupted segment descriptor, name " << segment_name
+                    << " buffer_protocol " << buffer_protocol;
+                return nullptr;
+            }
+            desc->buffers.push_back(buffer);
+        }
+    }
+
+    return desc;
+}
+#endif
+
 std::shared_ptr<TransferMetadata::SegmentDesc>
 TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
                                     const std::string &segment_name) {
+#ifdef ENABLE_MULTI_PROTOCOL
+    // Check if this is a multi-protocol scenario (CXL+TCP or CXL+RDMA)
+    bool is_multi_protocol = false;
+    if (segmentJSON["protocol"].isArray()) {
+        size_t proto_count = segmentJSON["protocol"].size();
+        if (proto_count >= 2) {
+            // Every protocol must have a per-buffer parser in
+            // decodeMultiProtocolSegmentDesc below.
+            is_multi_protocol = true;
+            for (const auto &protocolStr : segmentJSON["protocol"]) {
+                std::string proto = protocolStr.asString();
+                if (proto != "cxl" && proto != "tcp" && proto != "rdma" &&
+                    proto != "hip" && proto != "maca") {
+                    is_multi_protocol = false;
+                    break;
+                }
+            }
+            if (!is_multi_protocol) {
+                LOG(ERROR) << "Unsupported multi-protocol combination in "
+                              "segment: "
+                           << segment_name
+                           << ". Only cxl, tcp, rdma, hip and maca may be "
+                              "combined.";
+                return nullptr;
+            }
+        }
+    }
+
+    // If multi-protocol scenario, use multi-protocol decoding
+    if (is_multi_protocol) {
+        return decodeMultiProtocolSegmentDesc(segmentJSON, segment_name);
+    }
+#endif
+
     auto desc = std::make_shared<SegmentDesc>();
     desc->name = segmentJSON["name"].asString();
     desc->protocol = segmentJSON["protocol"].asString();
     desc->tcp_data_port = segmentJSON["tcp_data_port"].asInt();
+    desc->tcp_proto_version = segmentJSON.isMember("tcp_proto_version")
+                                  ? segmentJSON["tcp_proto_version"].asInt()
+                                  : 1;
     if (segmentJSON.isMember("timestamp"))
         desc->timestamp = segmentJSON["timestamp"].asString();
+    if (segmentJSON.isMember("rdma_server_name"))
+        desc->rdma_server_name = segmentJSON["rdma_server_name"].asString();
 
-    if (desc->protocol == "rdma" || desc->protocol == "barex") {
+    if (desc->protocol == "rdma" || desc->protocol == "barex" ||
+        desc->protocol == "efa" || desc->protocol == "cxi") {
         for (const auto &deviceJSON : segmentJSON["devices"]) {
             DeviceDesc device;
             device.name = deviceJSON["name"].asString();
@@ -339,23 +788,79 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             desc->devices.push_back(device);
         }
 
+        // rdma, efa and cxi pick a device with topology.selectDevice() and
+        // then use that one device_id to index both buffers[].rkey and
+        // devices[] (RdmaTransport::selectDevice / WorkerPool::selectPeerDevice
+        // and their efa/cxi counterparts). A publisher emits exactly one key
+        // per device, so a descriptor whose key vector is longer than its
+        // device list can drive device_id past the end of devices[]. barex is
+        // excluded: it hands the whole rkey vector to the peer rather than
+        // indexing it by device_id, and its key count comes from the mempool
+        // MR set rather than the device list.
+        const bool keys_indexed_by_device = desc->protocol == "rdma" ||
+                                            desc->protocol == "efa" ||
+                                            desc->protocol == "cxi";
+
         for (const auto &bufferJSON : segmentJSON["buffers"]) {
             BufferDesc buffer;
             buffer.name = bufferJSON["name"].asString();
             buffer.addr = bufferJSON["addr"].asUInt64();
             buffer.length = bufferJSON["length"].asUInt64();
             for (const auto &rkeyJSON : bufferJSON["rkey"])
-                buffer.rkey.push_back(rkeyJSON.asUInt());
+                buffer.rkey.push_back(
+                    static_cast<decltype(buffer.rkey)::value_type>(
+                        rkeyJSON.asUInt64()));
             for (const auto &lkeyJSON : bufferJSON["lkey"])
-                buffer.lkey.push_back(lkeyJSON.asUInt());
+                buffer.lkey.push_back(
+                    static_cast<decltype(buffer.lkey)::value_type>(
+                        lkeyJSON.asUInt64()));
             if (buffer.name.empty() || !buffer.addr || !buffer.length ||
-                buffer.rkey.empty() ||
-                buffer.rkey.size() != buffer.lkey.size()) {
+                (!buffer.rkey.empty() &&
+                 (buffer.rkey.size() != buffer.lkey.size() ||
+                  (keys_indexed_by_device &&
+                   buffer.rkey.size() != desc->devices.size())))) {
                 LOG(WARNING)
                     << "Corrupted segment descriptor, name " << segment_name
                     << " protocol " << desc->protocol << ", " << buffer.name
                     << ", " << buffer.addr << ", " << buffer.length << ", "
-                    << buffer.rkey.size() << ", " << buffer.lkey.size();
+                    << buffer.rkey.size() << ", " << buffer.lkey.size() << ", "
+                    << desc->devices.size();
+                return nullptr;
+            }
+            desc->buffers.push_back(buffer);
+        }
+
+        int ret = desc->topology.parse(
+            segmentJSON["priority_matrix"].toStyledString());
+        if (ret) {
+            LOG(WARNING) << "Corrupted segment descriptor, name "
+                         << segment_name << " protocol " << desc->protocol;
+        }
+    } else if (desc->protocol == "ub") {
+        for (const auto &deviceJSON : segmentJSON["devices"]) {
+            DeviceDesc device;
+            device.name = deviceJSON["name"].asString();
+            device.eid = deviceJSON["eid"].asString();
+            if (device.name.empty() || device.eid.empty()) {
+                LOG(WARNING) << "Corrupted segment descriptor, name "
+                             << segment_name << " protocol " << desc->protocol;
+                return nullptr;
+            }
+            desc->devices.push_back(device);
+        }
+
+        for (const auto &bufferJSON : segmentJSON["buffers"]) {
+            BufferDesc buffer;
+            buffer.name = bufferJSON["name"].asString();
+            buffer.addr = bufferJSON["addr"].asUInt64();
+            buffer.length = bufferJSON["length"].asUInt64();
+            for (const auto &tsegJSON : bufferJSON["tseg"]) {
+                buffer.tseg.push_back(tsegJSON.asString());
+            }
+            if (buffer.name.empty() || !buffer.addr || !buffer.length ||
+                buffer.tseg.empty()) {
+                LOG(WARNING) << "Corrupted segment descriptor, name "
+                             << segment_name << " protocol " << desc->protocol;
                 return nullptr;
             }
             desc->buffers.push_back(buffer);
@@ -380,16 +885,42 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
             }
             desc->buffers.push_back(buffer);
         }
+    } else if (desc->protocol == "nccl") {
+        for (const auto &bufferJSON : segmentJSON["buffers"]) {
+            BufferDesc buffer;
+            buffer.name = bufferJSON["name"].asString();
+            buffer.addr = bufferJSON["addr"].asUInt64();
+            buffer.length = bufferJSON["length"].asUInt64();
+            buffer.device_id = bufferJSON.isMember("device_id")
+                                   ? bufferJSON["device_id"].asInt()
+                                   : -1;
+            if (buffer.name.empty() || !buffer.addr || !buffer.length ||
+                buffer.device_id < 0) {
+                LOG(WARNING) << "Corrupted segment descriptor, name "
+                             << segment_name << " protocol " << desc->protocol;
+                return nullptr;
+            }
+            desc->buffers.push_back(buffer);
+        }
     } else if (desc->protocol == "nvlink" || desc->protocol == "nvlink_intra" ||
-               desc->protocol == "hip" || desc->protocol == "ubshmem") {
+               desc->protocol == "hip" || desc->protocol == "maca" ||
+               desc->protocol == "ubshmem" ||
+               desc->protocol == "sunrise_link") {
         for (const auto &bufferJSON : segmentJSON["buffers"]) {
             BufferDesc buffer;
             buffer.name = bufferJSON["name"].asString();
             buffer.addr = bufferJSON["addr"].asUInt64();
             buffer.length = bufferJSON["length"].asUInt64();
             buffer.shm_name = bufferJSON["shm_name"].asString();
-            if (buffer.name.empty() || !buffer.addr || !buffer.length ||
-                buffer.shm_name.empty()) {
+            if (buffer.shm_name.empty()) {
+                // In a multi-protocol build every transport registers each
+                // buffer into this node's single shared segment. Buffers owned
+                // by another transport (e.g. RDMA) carry no HIP IPC handle and
+                // are not reachable via this transport. Skip them instead of
+                // rejecting the whole segment, which would tear down sessions.
+                continue;
+            }
+            if (buffer.name.empty() || !buffer.addr || !buffer.length) {
                 LOG(WARNING) << "Corrupted segment descriptor, name "
                              << segment_name << " protocol " << desc->protocol
                              << "buffer name " << buffer.name << "buffer addr "
@@ -447,6 +978,14 @@ TransferMetadata::decodeSegmentDesc(Json::Value &segmentJSON,
         desc->rank_info.deviceIp = rankInfoJSON["deviceIp"].asString();
         desc->rank_info.devicePort = rankInfoJSON["devicePort"].asUInt64();
         desc->rank_info.pid = rankInfoJSON["pid"].asUInt64();
+        if (rankInfoJSON.isMember("endpoints")) {
+            for (const auto &endpointJSON : rankInfoJSON["endpoints"]) {
+                if (endpointJSON.isString()) {
+                    desc->rank_info.endpoints.push_back(
+                        endpointJSON.asString());
+                }
+            }
+        }
     } else if (desc->protocol == "cxl") {
         desc->cxl_name = segmentJSON["cxl_name"].asString();
         desc->cxl_base_addr = segmentJSON["cxl_base_addr"].asUInt64();
@@ -524,10 +1063,47 @@ std::shared_ptr<TransferMetadata::SegmentDesc> TransferMetadata::getSegmentDesc(
         }
     }
 
-    return decodeSegmentDesc(peer_json, segment_name);
+    auto result = decodeSegmentDesc(peer_json, segment_name);
+
+    // In P2P mode with dual-NIC setups (MC_RDMA_BIND_ADDRESS), the peer's
+    // segment descriptor may contain an rdma_server_name that differs from
+    // the TCP-routable segment_name. Cache the mapping so subsequent
+    // sendHandshake() calls can resolve the peer's TCP address from the
+    // RDMA server name extracted from NIC paths.
+    if (p2p_handshake_mode_ && result && !result->rdma_server_name.empty() &&
+        result->rdma_server_name != segment_name) {
+        auto [tcp_ip, tcp_port] = parseHostNameWithPort(segment_name);
+        RWSpinlock::WriteGuard guard(rpc_meta_lock_);
+        if (!rpc_meta_map_.count(result->rdma_server_name)) {
+            RpcMetaDesc meta;
+            meta.ip_or_host_name = tcp_ip;
+            meta.rpc_port = tcp_port;
+            meta.sockfd = -1;
+            rpc_meta_map_[result->rdma_server_name] = meta;
+            LOG(INFO) << "P2P: cached RDMA->TCP mapping: "
+                      << result->rdma_server_name << " -> " << tcp_ip << ":"
+                      << tcp_port;
+        }
+    }
+
+    return result;
+}
+
+bool TransferMetadata::SegmentDesc::operator==(const SegmentDesc &other) const {
+    // timestamp is intentionally excluded: metadata encoding may refresh it
+    // even when the operational descriptor is unchanged.
+    return name == other.name && protocol == other.protocol &&
+           devices == other.devices && topology == other.topology &&
+           buffers == other.buffers && nvmeof_buffers == other.nvmeof_buffers &&
+           cxl_name == other.cxl_name && cxl_base_addr == other.cxl_base_addr &&
+           rank_info == other.rank_info &&
+           tcp_data_port == other.tcp_data_port &&
+           rdma_server_name == other.rdma_server_name;
 }
 
 int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
+    const auto sync_start = std::chrono::steady_clock::now();
+
     // Collect segment names to sync first, then release lock before network I/O
     std::vector<std::string> names_to_sync;
     {
@@ -540,25 +1116,75 @@ int TransferMetadata::syncSegmentCache(const std::string &segment_name) {
         }
     }
 
+    size_t fetched_count = 0;
+    size_t failed_count = 0;
+    size_t updated_count = 0;
+    size_t unchanged_count = 0;
+    size_t skipped_count = 0;
+
     // Fetch updates without holding lock (may involve network I/O)
     std::vector<std::pair<std::string, std::shared_ptr<SegmentDesc>>> updates;
     for (const auto &name : names_to_sync) {
         auto segment_desc = getSegmentDesc(name);
         if (segment_desc) {
             updates.emplace_back(name, segment_desc);
+            ++fetched_count;
         } else {
+            ++failed_count;
             LOG(WARNING) << "segment " << name << " is now invalid";
         }
     }
 
-    // Apply updates with write lock
-    RWSpinlock::WriteGuard guard(segment_lock_);
-    for (const auto &[name, desc] : updates) {
-        auto it = segment_name_to_id_map_.find(name);
-        if (it != segment_name_to_id_map_.end()) {
-            segment_id_to_desc_map_[it->second] = desc;
+    {
+        // Apply updates with write lock
+        RWSpinlock::WriteGuard guard(segment_lock_);
+        for (const auto &[name, desc] : updates) {
+            auto it = segment_name_to_id_map_.find(name);
+            if (it == segment_name_to_id_map_.end()) {
+                ++skipped_count;
+                continue;
+            }
+
+            const auto segment_id = it->second;
+            auto current_it = segment_id_to_desc_map_.find(segment_id);
+            const auto old_desc = current_it == segment_id_to_desc_map_.end()
+                                      ? nullptr
+                                      : current_it->second;
+            bool changed = true;
+            if (old_desc) {
+                changed = *old_desc != *desc;
+            }
+
+            if (!changed) {
+                ++unchanged_count;
+                continue;
+            }
+
+            segment_id_to_desc_map_[segment_id] = desc;
+            ++updated_count;
+            LOG(WARNING) << "Segment cache descriptor changed, name=" << name
+                         << ", segment_id=" << segment_id;
+            if (old_desc) {
+                LOG(INFO) << "Old segment descriptor:";
+                old_desc->dump();
+            } else {
+                LOG(INFO) << "Old segment descriptor: <missing>";
+            }
+            LOG(INFO) << "New segment descriptor:";
+            desc->dump();
         }
     }
+    const auto sync_duration_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - sync_start)
+            .count();
+    LOG(INFO) << "Segment cache sync finished, requested_segment="
+              << (segment_name.empty() ? "<all>" : segment_name)
+              << ", scanned=" << names_to_sync.size()
+              << ", fetched=" << fetched_count << ", updated=" << updated_count
+              << ", unchanged=" << unchanged_count
+              << ", failed=" << failed_count << ", skipped=" << skipped_count
+              << ", sync_duration_ms=" << sync_duration_ms;
     return 0;
 }
 
@@ -651,8 +1277,16 @@ TransferMetadata::SegmentID TransferMetadata::getSegmentID(
 }
 
 int TransferMetadata::updateLocalSegmentDesc(uint64_t segment_id) {
-    RWSpinlock::ReadGuard guard(segment_lock_);
-    auto desc = segment_id_to_desc_map_[segment_id];
+    std::shared_ptr<SegmentDesc> desc;
+    {
+        RWSpinlock::ReadGuard guard(segment_lock_);
+        auto it = segment_id_to_desc_map_.find(segment_id);
+        if (it == segment_id_to_desc_map_.end() || !it->second) {
+            LOG(ERROR) << "Segment descriptor " << segment_id << " not found";
+            return ERR_METADATA;
+        }
+        desc = it->second;
+    }
     return this->updateSegmentDesc(desc->name, *desc);
 }
 
@@ -732,6 +1366,10 @@ int TransferMetadata::addRpcMetaEntry(const std::string &server_name,
             [this](const Json::Value &peer, Json::Value &local) -> int {
                 return receivePeerNotify(peer, local);
             });
+        handshake_plugin_->registerOnProbeCallBack(
+            [this](const Json::Value &peer, Json::Value &local) -> int {
+                return receivePeerProbe(peer, local);
+            });
 
         int rc = handshake_plugin_->startDaemon(desc.rpc_port, desc.sockfd);
         if (rc != 0) {
@@ -743,7 +1381,7 @@ int TransferMetadata::addRpcMetaEntry(const std::string &server_name,
 
     Json::Value rpcMetaJSON;
     rpcMetaJSON["ip_or_host_name"] = desc.ip_or_host_name;
-    rpcMetaJSON["rpc_port"] = static_cast<Json::UInt64>(desc.rpc_port);
+    rpcMetaJSON["rpc_port"] = static_cast<Json::UInt>(desc.rpc_port);
     if (!storage_plugin_->set(rpc_meta_prefix_ + server_name, rpcMetaJSON)) {
         LOG(ERROR) << "Failed to set location of " << server_name;
         return ERR_METADATA;
@@ -757,6 +1395,32 @@ int TransferMetadata::removeRpcMetaEntry(const std::string &server_name) {
     }
     if (!storage_plugin_->remove(rpc_meta_prefix_ + server_name)) {
         LOG(ERROR) << "Failed to remove location of " << server_name;
+        return ERR_METADATA;
+    }
+    return 0;
+}
+
+int TransferMetadata::rePublishRpcMetaEntry(const std::string &server_name) {
+    if (p2p_handshake_mode_) {
+        return 0;
+    }
+    const std::string full_key = rpc_meta_prefix_ + server_name;
+
+    Json::Value existing;
+    if (storage_plugin_->get(full_key, existing)) {
+        if (existing["ip_or_host_name"].asString() ==
+                local_rpc_meta_.ip_or_host_name &&
+            existing["rpc_port"].asUInt() == local_rpc_meta_.rpc_port) {
+            return 0;
+        }
+    }
+
+    LOG(INFO) << "Re-publishing RPC meta entry for " << server_name;
+    Json::Value rpcMetaJSON;
+    rpcMetaJSON["ip_or_host_name"] = local_rpc_meta_.ip_or_host_name;
+    rpcMetaJSON["rpc_port"] = static_cast<Json::UInt>(local_rpc_meta_.rpc_port);
+    if (!storage_plugin_->set(full_key, rpcMetaJSON)) {
+        LOG(ERROR) << "Failed to re-publish RPC meta entry for " << server_name;
         return ERR_METADATA;
     }
     return 0;
@@ -799,7 +1463,18 @@ int TransferMetadata::startHandshakeDaemon(
             TransferHandshakeUtil::decode(peer, peer_desc);
             if (on_receive_handshake) {
                 int ret = on_receive_handshake(peer_desc, local_desc);
-                if (ret) return ret;
+                if (ret) {
+                    if (local_desc.reply_msg.empty()) {
+                        local_desc.reply_msg =
+                            "Handshake callback failed: " + std::to_string(ret);
+                    }
+                    // The callback failure is a handshake-level rejection, not
+                    // an RPC handler failure. Return a structured reply so the
+                    // peer can report the rejection reason instead of seeing an
+                    // empty/undecodable handshake response.
+                    local = TransferHandshakeUtil::encode(local_desc);
+                    return 0;
+                }
             }
             local = TransferHandshakeUtil::encode(local_desc);
             return 0;
@@ -807,6 +1482,10 @@ int TransferMetadata::startHandshakeDaemon(
     handshake_plugin_->registerOnNotifyCallBack(
         [this](const Json::Value &peer, Json::Value &local) -> int {
             return receivePeerNotify(peer, local);
+        });
+    handshake_plugin_->registerOnProbeCallBack(
+        [this](const Json::Value &peer, Json::Value &local) -> int {
+            return receivePeerProbe(peer, local);
         });
 
     int rc = handshake_plugin_->startDaemon(listen_port, sockfd);
@@ -855,6 +1534,18 @@ int TransferMetadata::sendNotify(const std::string &peer_server_name,
                    << peer_desc.notify_msg;
         return ERR_METADATA;
     }
+    return 0;
+}
+
+int TransferMetadata::sendProbe(const std::string &peer_server_name) {
+    RpcMetaDesc peer_location;
+    if (getRpcMetaEntry(peer_server_name, peer_location)) {
+        return ERR_METADATA;
+    }
+    Json::Value local(Json::objectValue), peer;
+    int ret = handshake_plugin_->sendProbe(peer_location.ip_or_host_name,
+                                           peer_location.rpc_port, local, peer);
+    if (ret) return ret;
     return 0;
 }
 

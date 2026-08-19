@@ -1,19 +1,32 @@
 #pragma once
 
+#include <algorithm>
+#include <cctype>
 #include <cstddef>
 #include <cstdlib>
-#include <functional>
-#include <limits>
+#include <optional>
 #include <linux/memfd.h>
 #include <linux/mman.h>
 #include <string>
-#include <string_view>
+#include <limits>
+#include <type_traits>
 #include <ylt/util/tl/expected.hpp>
 
 #include "rpc_types.h"
 #include "types.h"
 
 namespace mooncake {
+
+struct StringHash {
+    using is_transparent = void;
+    size_t operator()(std::string_view sv) const noexcept {
+        return std::hash<std::string_view>{}(sv);
+    }
+};
+
+inline bool IsZeroUUID(const UUID& uuid) {
+    return uuid.first == 0 && uuid.second == 0;
+}
 
 // Convert ErrorCode to integer for Python bindings
 template <class T>
@@ -170,14 +183,15 @@ std::string expected_to_str(const tl::expected<T, ErrorCode>& expected) {
 }
 
 /**
- * @brief Convert a string representation of size to bytes
+ * @brief Parse a string representation of size to bytes
  * @param str String representation of size (e.g., "1.5 GB", "1024 MB",
  * "1048576")
- * @return uint64_t Number of bytes, or 0 if parsing fails
+ * @return Parsed byte size, or std::nullopt if parsing fails
  */
-[[nodiscard]] inline uint64_t string_to_byte_size(const std::string& str) {
+[[nodiscard]] inline std::optional<uint64_t> try_string_to_byte_size(
+    const std::string& str) {
     if (str.empty()) {
-        return 0;
+        return std::nullopt;
     }
 
     // Create a copy for manipulation
@@ -188,7 +202,7 @@ std::string expected_to_str(const tl::expected<T, ErrorCode>& expected) {
     s.erase(s.find_last_not_of(" \t\r\n") + 1);
 
     if (s.empty()) {
-        return 0;
+        return std::nullopt;
     }
 
     // Handle special case for "infinite"
@@ -203,7 +217,10 @@ std::string expected_to_str(const tl::expected<T, ErrorCode>& expected) {
     try {
         value = std::stod(s, &pos);
     } catch (const std::exception&) {
-        return 0;  // Failed to parse number
+        return std::nullopt;  // Failed to parse number
+    }
+    if (value < 0) {
+        return std::nullopt;
     }
 
     if (pos >= s.length()) {
@@ -217,7 +234,8 @@ std::string expected_to_str(const tl::expected<T, ErrorCode>& expected) {
     unit.erase(0, unit.find_first_not_of(" \t\r\n"));
 
     // Convert to uppercase for comparison
-    std::transform(unit.begin(), unit.end(), unit.begin(), ::toupper);
+    std::transform(unit.begin(), unit.end(), unit.begin(),
+                   [](unsigned char c) -> char { return std::toupper(c); });
 
     // Apply unit multiplier
     const double KB = 1024.0;
@@ -237,42 +255,26 @@ std::string expected_to_str(const tl::expected<T, ErrorCode>& expected) {
         return static_cast<uint64_t>(value);
     } else {
         // Unknown unit
-        return 0;
+        return std::nullopt;
     }
 }
 
 /**
- * @brief Split a string by delimiter into a vector of strings
- * @param str The string to split
- * @param delimiter The delimiter to split by (default is comma)
- * @param trim_spaces Whether to trim leading/trailing spaces from each token
- * @param keep_empty Whether to keep empty tokens in the result
- * @return Vector of split strings
+ * @brief Convert a string representation of size to bytes
+ * @param str String representation of size (e.g., "1.5 GB", "1024 MB",
+ * "1048576")
+ * @return uint64_t Number of bytes, or 0 if parsing fails
  */
-std::vector<std::string> splitString(const std::string& str,
-                                     char delimiter = ',',
-                                     bool trim_spaces = true,
-                                     bool keep_empty = false);
-
-/// @brief Transparent hasher enabling heterogeneous string_view lookup
-/// in unordered containers keyed by std::string.
-/// std::string implicitly converts to string_view, so one overload suffices.
-struct StringHash {
-    using is_transparent = void;
-    size_t operator()(std::string_view sv) const noexcept {
-        return std::hash<std::string_view>{}(sv);
-    }
-};
-
-/** @brief Returns true if the UUID is the all-zero sentinel value. */
-[[nodiscard]] inline bool IsZeroUUID(const UUID& uuid) noexcept {
-    return uuid.first == 0 && uuid.second == 0;
+[[nodiscard]] inline uint64_t string_to_byte_size(const std::string& str) {
+    auto parsed = try_string_to_byte_size(str);
+    return parsed.value_or(0);
 }
 
 // Buffer allocator functions
 
 constexpr size_t SZ_2MB = 2 * 1024 * 1024;
 constexpr size_t SZ_1GB = 1024 * 1024 * 1024;
+constexpr double BYTES_PER_GIB = static_cast<double>(SZ_1GB);
 
 /**
  * @brief Allocates memory for the `BufferAllocator` class.
@@ -281,7 +283,8 @@ constexpr size_t SZ_1GB = 1024 * 1024 * 1024;
  */
 void* allocate_buffer_allocator_memory(
     size_t total_size, const std::string& protocol = "",
-    size_t alignment = facebook::cachelib::Slab::kSize);
+    size_t alignment = facebook::cachelib::Slab::kSize,
+    bool use_spdk_dma = false);
 
 inline size_t align_up(size_t size, size_t alignment) {
     if (alignment == 0) {
@@ -303,9 +306,6 @@ inline size_t align_up(size_t size, size_t alignment) {
     if (use_hp_env == nullptr) {
         return 0;
     }
-
-    constexpr size_t SZ_2MB = 2 * 1024 * 1024;
-    constexpr size_t SZ_1GB = 1024 * 1024 * 1024;
 
     size_t size = SZ_2MB;  // Default to 2MB
 
@@ -350,11 +350,92 @@ inline size_t align_up(size_t size, size_t alignment) {
     return size;
 }
 
-// Hugepage-backed allocation helpers (MAP_HUGETLB + MADV_HUGEPAGE)
+/**
+ * @brief Fault in a fresh HugeTLB mapping with parallel CPU writes.
+ *
+ * Touches one byte per configured hugepage. Call this only for a newly
+ * allocated mapping whose contents may be zeroed.
+ */
+void populate_hugetlb_mapping(void* ptr, size_t total_size);
+
+/**
+ * @brief Fault in an mbind-partitioned HugeTLB mapping with NUMA-local workers.
+ *
+ * The mapping is divided into equal regions in the same order as numa_nodes.
+ * Workers are scheduled on the corresponding node before touching that
+ * region.
+ */
+void populate_hugetlb_numa_mapping(void* ptr, size_t total_size,
+                                   const std::vector<int>& numa_nodes);
+
+/**
+ * Allocate mmap-backed buffer memory for host KV / transfer buffers.
+ *
+ * When the global mmap arena is enabled, this function serves allocations
+ * from the arena and still honors the caller's requested alignment.
+ * Arena-owned allocations remain owned by the arena until process shutdown.
+ *
+ * When the arena is disabled or unavailable, this falls back to a direct
+ * mmap() allocation and returns a pointer aligned to at least the system page
+ * size (or the configured hugepage size when available).
+ *
+ * @param total_size Total buffer size in bytes.
+ * @param alignment Minimum alignment requested by the caller.
+ * @return Pointer to the allocation, or nullptr on failure.
+ */
 void* allocate_buffer_mmap_memory(size_t total_size, size_t alignment);
+
+/**
+ * Allocate mmap-backed memory, optionally deferring direct HugeTLB population.
+ *
+ * When defer_hugetlb_population is true, a direct HugeTLB mmap omits
+ * MAP_POPULATE so the caller can populate the mapping later. Arena allocations
+ * retain their existing eager-population behavior.
+ */
+void* allocate_buffer_mmap_memory(size_t total_size, size_t alignment,
+                                  bool defer_hugetlb_population);
+
+/**
+ * @brief Return whether ptr is backed by the global mmap arena.
+ *
+ * Intended for callers that need to distinguish an eagerly populated arena
+ * allocation from a direct mmap fallback.
+ */
+[[nodiscard]] bool is_mmap_arena_allocation(const void* ptr);
+
+/**
+ * Release memory previously returned by allocate_buffer_mmap_memory().
+ *
+ * Direct-mmap allocations are unmapped immediately. Arena-owned pointers are
+ * intentionally not unmapped individually; in that case this function is a
+ * no-op and the arena releases the backing pool during process teardown.
+ *
+ * @param ptr Pointer previously returned by allocate_buffer_mmap_memory().
+ * @param total_size Original allocation size in bytes.
+ */
 void free_buffer_mmap_memory(void* ptr, size_t total_size);
 
-void free_memory(const std::string& protocol, void* ptr);
+/**
+ * @brief Allocate a contiguous buffer with per-NUMA-region binding.
+ *
+ * Reserves a single VMA via mmap, divides it into N equal regions,
+ * binds each region to the corresponding NUMA node via mbind(MPOL_BIND).
+ * The mapping remains lazy after allocation. The caller may populate it with
+ * NUMA-local workers or let ibv_reg_mr() fault and pin pages while respecting
+ * the mbind policy.
+ *
+ * @param total_size  Total buffer size in bytes
+ * @param numa_nodes  NUMA node IDs to bind regions to (e.g., {1,3,5,7})
+ * @param page_size   Page size for alignment (0 = auto-detect via
+ * getpagesize())
+ * @return Pointer to the allocated buffer, or nullptr on failure
+ */
+void* allocate_buffer_numa_segments(size_t total_size,
+                                    const std::vector<int>& numa_nodes,
+                                    size_t page_size = 0);
+
+void free_memory(const std::string& protocol, void* ptr,
+                 bool use_spdk_dma = false);
 
 // Network utility functions
 
@@ -383,43 +464,34 @@ class AutoPortBinder {
 
     int getPort() const { return port_; }
 
-    int rebind();
-
    private:
-    int tryBindPort();
-
     int socket_fd_;
     int port_;
-    int min_port_;
-    int max_port_;
 };
 
 // HTTP utility: simple GET, returns body on 200, otherwise error code
 tl::expected<std::string, int> httpGet(const std::string& url);
 
+// Network utility: resolve an active interface name to its IPv4 address
+tl::expected<std::string, std::string> GetInterfaceIPv4Address(
+    const std::string& interface_name);
+
 // Network utility: obtain an available TCP port on loopback by binding to 0
 int getFreeTcpPort();
 
+// Obtain multiple unique available TCP ports atomically.
+// All ports are bound simultaneously before any are released, preventing
+// duplicate port assignments that can occur with repeated getFreeTcpPort()
+// calls.
+std::vector<int> getFreeTcpPorts(int count);
+
 int64_t time_gen();
 
-// Helper: Get integer from environment variable, fallback to default
-template <typename T>
-T GetEnvOr(const char* name, T default_value) {
-    const char* env_val = std::getenv(name);
-    if (!env_val || std::string(env_val).empty()) {
-        return default_value;
-    }
-    try {
-        long long value = std::stoll(env_val);
-        // Check range for unsigned types
-        if constexpr (std::is_same_v<T, uint32_t>) {
-            if (value < 0 || value > UINT32_MAX) throw std::out_of_range("");
-        }
-        return static_cast<T>(value);
-    } catch (...) {
-        return default_value;
-    }
-}
+std::string ResolveMooncakeHostId(const std::string& local_hostname);
 
-std::string GetEnvStringOr(const char* name, const std::string& default_value);
+std::string ResolvePathFromKey(const std::string& key,
+                               const std::string& root_dir,
+                               const std::string& fsdir);
+
+// getHostNameWithoutPort is provided by common.h (static inline)
 }  // namespace mooncake

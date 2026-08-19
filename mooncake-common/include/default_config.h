@@ -12,6 +12,8 @@
 #include <unordered_map>
 #include <ylt/easylog.hpp>
 
+#include "ascii_string.h"
+
 namespace mooncake {
 class DefaultConfig {
    public:
@@ -69,6 +71,18 @@ class DefaultConfig {
      */
     void GetUInt64(const std::string& key, uint64_t* val,
                    uint64_t default_value = 0) const;
+
+    /**
+     * @brief GetDurationMs retrieves a duration value from the configuration
+     * and converts it to milliseconds.
+     * @param key The key to look up in the configuration
+     * @param val Pointer to store the retrieved value in milliseconds
+     * @param default_value Default value to return if the key is not found
+     * @note Duration strings may use ms, s, m, or h as suffixes. Bare numbers
+     * are interpreted as milliseconds.
+     */
+    void GetDurationMs(const std::string& key, uint64_t* val,
+                       uint64_t default_value = 0) const;
 
     /**
      * @brief GetDouble retrieves a double value from the configuration
@@ -144,9 +158,7 @@ inline void init_ylt_log_level() {
         easylog::set_min_severity(easylog::Severity::WARN);
         return;
     }
-    std::string level_str(env_level);
-    std::transform(level_str.begin(), level_str.end(), level_str.begin(),
-                   [](unsigned char c) { return std::tolower(c); });
+    const std::string level_str = AsciiToLower(env_level);
     easylog::Severity severity;
     if (level_str == "trace") {
         severity = easylog::Severity::TRACE;

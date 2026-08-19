@@ -34,10 +34,17 @@ namespace mooncake {
 namespace tent {
 
 class GdsFileContext;
+class GdsTransportTestPeer;
 
 struct IOParamRange {
-    size_t base;
-    size_t count;
+    size_t base = 0;
+    size_t count = 0;
+    size_t transferred_bytes = 0;
+    TransferStatusEnum status = TransferStatusEnum::PENDING;
+    // Public status stays PENDING until every slice in this range is
+    // physically terminal. Preserve the first observed failure while sibling
+    // slices drain so cancellation cannot mask the original result.
+    TransferStatusEnum known_failure = TransferStatusEnum::PENDING;
 };
 
 // Wrapper for reusable CUfileBatchHandle_t
@@ -52,7 +59,13 @@ struct GdsSubBatch : public Transport::SubBatch {
     BatchHandle* batch_handle;  // Pointer to reusable handle from pool
     std::vector<IOParamRange> io_param_ranges;
     std::vector<CUfileIOParams_t> io_params;
+    // Scratch buffer populated by cuFileBatchIOGetStatus().
     std::vector<CUfileIOEvents_t> io_events;
+    // Stable per-slice status cache indexed by the cookie carried in each IO.
+    std::vector<CUfileIOEvents_t> cached_events;
+    bool reusable = true;
+    bool cancel_requested = false;
+    std::mutex status_mutex;
     virtual size_t size() const { return io_param_ranges.size(); }
 };
 
@@ -87,6 +100,24 @@ class GdsTransport : public Transport {
     virtual const char* getName() const { return "gds"; }
 
    private:
+    friend class GdsTransportTestPeer;
+
+    static TransferStatus aggregateTransferStatus(
+        const std::vector<CUfileIOEvents_t>& events, size_t base, size_t count,
+        bool& all_terminal);
+
+    Status updateBatchStatus(GdsSubBatch* batch);
+
+    Status cancelBatch(GdsSubBatch* batch);
+
+    static bool allBatchIOsTerminal(const GdsSubBatch* batch);
+
+    static bool isTerminalFailure(TransferStatusEnum status);
+
+    static void destroySubBatch(GdsSubBatch* batch);
+
+    void cleanupQuarantinedBatches();
+
     std::string getGdsFilePath(SegmentID handle);
 
     GdsFileContext* findFileContext(SegmentID target_id);
@@ -112,6 +143,11 @@ class GdsTransport : public Transport {
     // Track all allocated sub-batches to clean up on uninstall
     std::vector<GdsSubBatch*> allocated_batches_;
     std::mutex allocated_batches_lock_;
+
+    // Failed batches may still be referenced by cuFile after cancellation.
+    // Keep their handle and IO storage alive until every slice is terminal.
+    std::vector<GdsSubBatch*> quarantined_batches_;
+    std::mutex quarantined_batches_lock_;
 };
 }  // namespace tent
 }  // namespace mooncake

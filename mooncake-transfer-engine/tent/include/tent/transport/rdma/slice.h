@@ -20,8 +20,10 @@
 #include <cstdint>
 #include <iostream>
 #include <list>
+#include <memory>
 #include <mutex>
 #include <new>
+#include <string>
 #include <thread>
 #include <type_traits>
 #include <vector>
@@ -32,20 +34,46 @@
 namespace mooncake {
 namespace tent {
 struct RdmaSlice;
+class RailMonitor;
 
 struct RdmaSliceList {
     RdmaSlice* first = nullptr;
     int num_slices = 0;
 };
 
+// Forward declarations
+class RdmaEndPoint;
+struct RdmaTask;
+
+using RdmaSliceStorage = Slab<RdmaSlice>;
+using RdmaTaskStorage = Slab<RdmaTask>;
+
 struct RdmaTask {
     int num_slices;
     Request request;
+    // Named QP pool this task's slices should use (RFC #2568 step 3). Empty =
+    // no pool selected: slices spray across all data QPs as before. Resolved
+    // from SelectionResult.qp_pool at task creation.
+    std::string qp_pool;
     volatile TransferStatusEnum status_word;
     volatile size_t transferred_bytes;
-    volatile int success_slices;
-    volatile int resolved_slices;
+    std::atomic<int> success_slices{0};
+    std::atomic<int> resolved_slices{0};
     volatile TransferStatusEnum first_error = PENDING;
+
+    // Set by the control thread. Workers observe this flag before posting or
+    // retrying a slice. Already-posted WRs are allowed to drain normally.
+    std::atomic<bool> cancel_requested{false};
+
+    // Reference counting for UAF protection
+    std::atomic<int> ref_count{0};
+
+    void ref() { ref_count.fetch_add(1, std::memory_order_relaxed); }
+    void deref() {
+        if (ref_count.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+            RdmaTaskStorage::Get().deallocate(this);
+        }
+    }
 };
 
 class RdmaEndPoint;
@@ -62,17 +90,39 @@ struct RdmaSlice {
     uint32_t target_rkey = 0;
     int source_dev_id = -1;
     int target_dev_id = -1;
+    // GPUDirect reachability learning (see GdrReachability). Resolved once per
+    // (re)submit in Workers::generatePostPath. GPU ordinals are -1 for host
+    // memory; the name pointers alias stable Topology::NicEntry / segment
+    // storage and stay valid for the slice's lifetime.
+    int source_gpu_ordinal = -1;
+    int target_gpu_ordinal = -1;
+    const char* source_nic_name = nullptr;
+    const char* target_nic_name = nullptr;
+    const std::string* target_machine_id = nullptr;
 
-    RdmaEndPoint* ep_weak_ptr = nullptr;
+    std::weak_ptr<RdmaEndPoint> ep_weak_ptr;
     TransferStatusEnum word = TransferStatusEnum::INITIAL;
     int qp_index = 0;
     int retry_count = 0;
+    // Flat (source,target) combination index last tried by
+    // selectFallbackDevice; the next fallback resumes just past it so retries
+    // rotate through all combinations with wraparound instead of hammering one.
+    int last_fallback_idx = -1;
     bool failed = false;
+    // True while DeviceSelector accounts this slice against source_dev_id.
+    // The worker clears it exactly once on completion, failure, or cancel.
+    bool quota_charged = false;
     uint64_t enqueue_ts = 0;
     uint64_t submit_ts = 0;
+    // Non-owning pointer to the per-worker RailMonitor for this slice's
+    // target machine, resolved once in generatePostPath. Lets asyncPollCq
+    // and disableEndpoint call markRecovered / markFailed without a
+    // string-keyed map lookup on the RDMA hot path. Stable because
+    // WorkerContext::rails stores values via unique_ptr, so rehashes do
+    // not invalidate the pointee.
+    RailMonitor* rail_monitor = nullptr;
+    int priority = PRIO_HIGH;
 };
-
-using RdmaSliceStorage = Slab<RdmaSlice>;
 
 static inline void updateSliceStatus(RdmaSlice* slice,
                                      TransferStatusEnum status) {
@@ -81,18 +131,22 @@ static inline void updateSliceStatus(RdmaSlice* slice,
     if (!__sync_bool_compare_and_swap(&slice->word, PENDING, status)) return;
     if (status == COMPLETED) {
         __sync_fetch_and_add(&task->transferred_bytes, slice->length);
-        __sync_fetch_and_add(&task->success_slices, 1);
+        task->success_slices.fetch_add(1, std::memory_order_acq_rel);
     } else {
         __sync_bool_compare_and_swap(&task->first_error, PENDING, status);
     }
-    int resolved = __sync_add_and_fetch(&task->resolved_slices, 1);
+    int resolved =
+        task->resolved_slices.fetch_add(1, std::memory_order_acq_rel) + 1;
     if (resolved >= task->num_slices) {
-        TransferStatusEnum final_st = (task->success_slices == task->num_slices)
-                                          ? COMPLETED
-                                          : task->first_error;
+        TransferStatusEnum final_st =
+            (task->success_slices.load(std::memory_order_acquire) ==
+             task->num_slices)
+                ? COMPLETED
+                : task->first_error;
         if (final_st == PENDING) final_st = FAILED;
         __sync_bool_compare_and_swap(&task->status_word, PENDING, final_st);
     }
+    task->deref();
 }
 
 }  // namespace tent

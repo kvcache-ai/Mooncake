@@ -19,7 +19,7 @@ namespace mooncake {
  * - OpLog sequence tracking
  * - Standby replication lag
  * - Error counters (checksum failures, skipped entries)
- * - Performance histograms (OpLog write/apply latency)
+ * - Performance histograms (etcd write latency)
  * - Queue sizes (pending mutations)
  */
 class HAMetricManager {
@@ -59,17 +59,10 @@ class HAMetricManager {
     int64_t get_oplog_pending_entries();
 
     /**
-     * @brief Set the asynchronous OpLog queue size
+     * @brief Set the pending mutation queue size (retry queue)
      */
-    void set_oplog_async_queue_size(int64_t size);
-    int64_t get_oplog_async_queue_size();
-    void set_election_is_leader(bool value);
-    void set_oplog_async_workers_running(bool value);
-    void set_standby_degraded(bool value);
-    void set_primary_degraded(bool value);
-    void set_oplog_last_successful_poll_timestamp_ms(int64_t timestamp_ms);
-    void set_p2p_snapshot_bootstrap_baseline_sequence_id(int64_t seq_id);
-    void set_p2p_bootstrap_catchup_target_sequence_id(int64_t seq_id);
+    void set_pending_mutation_queue_size(int64_t size);
+    int64_t get_pending_mutation_queue_size();
 
     // ========== Error Counters ==========
 
@@ -98,45 +91,16 @@ class HAMetricManager {
     int64_t get_oplog_gap_resolve_success_total();
 
     /**
-     * @brief Increment counter for OpLog persistence failures
+     * @brief Increment counter for etcd write failures
      */
-    void inc_oplog_write_failures(int64_t val = 1);
-    int64_t get_oplog_write_failures_total();
+    void inc_oplog_etcd_write_failures(int64_t val = 1);
+    int64_t get_oplog_etcd_write_failures_total();
 
     /**
-     * @brief Increment counter for OpLog persistence retries
+     * @brief Increment counter for etcd write retries
      */
-    void inc_oplog_write_retries(int64_t val = 1);
-    int64_t get_oplog_write_retries_total();
-
-    void inc_election_attempts(int64_t val = 1);
-    void inc_election_failures(int64_t val = 1);
-    void inc_election_leadership_lost(int64_t val = 1);
-    void inc_election_reconnects(int64_t val = 1);
-    void inc_election_watch_failures(int64_t val = 1);
-    void inc_election_polling_fallbacks(int64_t val = 1);
-
-    void inc_oplog_best_effort_dropped(int64_t val = 1);
-    void inc_oplog_queue_rejected(int64_t val = 1);
-    void inc_oplog_queue_bypassed(int64_t val = 1);
-    void inc_oplog_sync_wait_timeouts(int64_t val = 1);
-    void inc_oplog_read_failures(int64_t val = 1);
-    void inc_oplog_reader_reconnect_attempts(int64_t val = 1);
-    void inc_oplog_reader_reconnect_failures(int64_t val = 1);
-    void inc_oplog_reader_reconnects(int64_t val = 1);
-    void inc_oplog_apply_failures(int64_t val = 1);
-    void inc_oplog_best_effort_apply_skipped(int64_t val = 1);
-    void inc_oplog_confirmed_holes(int64_t val = 1);
-
-    void inc_force_promotions(int64_t val = 1);
-    void inc_promotion_catchup_incomplete(int64_t val = 1);
-    void inc_promotion_restore_failures(int64_t val = 1);
-    void inc_promotion_skipped_replicas(int64_t val = 1);
-    void inc_promotion_skipped_objects(int64_t val = 1);
-    void inc_p2p_snapshot_bootstrap_success(int64_t val = 1);
-    void inc_p2p_snapshot_bootstrap_failures(int64_t val = 1);
-    void inc_p2p_snapshot_resync_success(int64_t val = 1);
-    void inc_p2p_snapshot_resync_failures(int64_t val = 1);
+    void inc_oplog_etcd_write_retries(int64_t val = 1);
+    int64_t get_oplog_etcd_write_retries_total();
 
     /**
      * @brief Increment counter for watch disconnections
@@ -173,15 +137,38 @@ class HAMetricManager {
     // ========== Latency Histograms ==========
 
     /**
-     * @brief Record OpLog persistence latency in microseconds
+     * @brief Record etcd write latency in microseconds
      */
-    void observe_oplog_write_latency_us(int64_t latency_us);
-    void observe_election_duration_ms(int64_t duration_ms);
+    void observe_oplog_etcd_write_latency_us(int64_t latency_us);
 
     /**
      * @brief Record OpLog apply latency in microseconds
      */
     void observe_oplog_apply_latency_us(int64_t latency_us);
+
+    // ========== Batch-record OpLog Metrics ==========
+
+    void inc_batch_record_durable_batches(int64_t val = 1);
+    int64_t get_batch_record_durable_batches_total();
+    void inc_batch_record_durable_entries(int64_t val = 1);
+    int64_t get_batch_record_durable_entries_total();
+    void inc_batch_record_retries(int64_t val = 1);
+    int64_t get_batch_record_retries_total();
+
+    void set_batch_record_committed_queue_depth(int64_t depth);
+    int64_t get_batch_record_committed_queue_depth();
+    void set_batch_record_callback_queue_depth(int64_t depth);
+    int64_t get_batch_record_callback_queue_depth();
+    void set_batch_record_last_batch_id(int64_t batch_id);
+    int64_t get_batch_record_last_batch_id();
+    void set_batch_record_durable_sequence(int64_t sequence_id);
+    int64_t get_batch_record_durable_sequence();
+
+    void observe_batch_record_batch_entries(int64_t entries);
+    void observe_batch_record_batch_bytes(int64_t bytes);
+    void observe_batch_record_txn_latency_us(int64_t latency_us);
+    void observe_batch_record_commit_to_durable_us(int64_t latency_us);
+    void observe_batch_record_callback_latency_us(int64_t latency_us);
 
     // ========== State Machine Metrics ==========
 
@@ -224,48 +211,15 @@ class HAMetricManager {
     ylt::metric::gauge_t oplog_applied_sequence_id_;
     ylt::metric::gauge_t oplog_standby_lag_;
     ylt::metric::gauge_t oplog_pending_entries_;
-    ylt::metric::gauge_t oplog_async_queue_size_;
-    ylt::metric::gauge_t election_is_leader_;
-    ylt::metric::gauge_t oplog_async_workers_running_;
-    ylt::metric::gauge_t standby_degraded_;
-    ylt::metric::gauge_t primary_degraded_;
-    ylt::metric::gauge_t oplog_last_successful_poll_timestamp_ms_;
-    ylt::metric::gauge_t p2p_snapshot_bootstrap_baseline_sequence_id_;
-    ylt::metric::gauge_t p2p_bootstrap_catchup_target_sequence_id_;
+    ylt::metric::gauge_t pending_mutation_queue_size_;
 
     // Error Counters
     ylt::metric::counter_t oplog_skipped_entries_total_;
     ylt::metric::counter_t oplog_checksum_failures_total_;
     ylt::metric::counter_t oplog_gap_resolve_attempts_total_;
     ylt::metric::counter_t oplog_gap_resolve_success_total_;
-    ylt::metric::counter_t oplog_write_failures_total_;
-    ylt::metric::counter_t oplog_write_retries_total_;
-    ylt::metric::counter_t election_attempts_total_;
-    ylt::metric::counter_t election_failures_total_;
-    ylt::metric::counter_t election_leadership_lost_total_;
-    ylt::metric::counter_t election_reconnects_total_;
-    ylt::metric::counter_t election_watch_failures_total_;
-    ylt::metric::counter_t election_polling_fallbacks_total_;
-    ylt::metric::counter_t oplog_best_effort_dropped_total_;
-    ylt::metric::counter_t oplog_queue_rejected_total_;
-    ylt::metric::counter_t oplog_queue_bypassed_total_;
-    ylt::metric::counter_t oplog_sync_wait_timeouts_total_;
-    ylt::metric::counter_t oplog_read_failures_total_;
-    ylt::metric::counter_t oplog_reader_reconnect_attempts_total_;
-    ylt::metric::counter_t oplog_reader_reconnect_failures_total_;
-    ylt::metric::counter_t oplog_reader_reconnects_total_;
-    ylt::metric::counter_t oplog_apply_failures_total_;
-    ylt::metric::counter_t oplog_best_effort_apply_skipped_total_;
-    ylt::metric::counter_t oplog_confirmed_holes_total_;
-    ylt::metric::counter_t force_promotions_total_;
-    ylt::metric::counter_t promotion_catchup_incomplete_total_;
-    ylt::metric::counter_t promotion_restore_failures_total_;
-    ylt::metric::counter_t promotion_skipped_replicas_total_;
-    ylt::metric::counter_t promotion_skipped_objects_total_;
-    ylt::metric::counter_t p2p_snapshot_bootstrap_success_total_;
-    ylt::metric::counter_t p2p_snapshot_bootstrap_failures_total_;
-    ylt::metric::counter_t p2p_snapshot_resync_success_total_;
-    ylt::metric::counter_t p2p_snapshot_resync_failures_total_;
+    ylt::metric::counter_t oplog_etcd_write_failures_total_;
+    ylt::metric::counter_t oplog_etcd_write_retries_total_;
     ylt::metric::counter_t oplog_watch_disconnections_total_;
     ylt::metric::counter_t oplog_applied_entries_total_;
     ylt::metric::counter_t oplog_dropped_put_end_total_;
@@ -274,9 +228,21 @@ class HAMetricManager {
 
     // Latency Histograms (buckets in microseconds: 100us, 500us, 1ms, 5ms,
     // 10ms, 50ms, 100ms, 500ms, 1s)
-    ylt::metric::histogram_t oplog_write_latency_us_;
-    ylt::metric::histogram_t election_duration_ms_;
+    ylt::metric::histogram_t oplog_etcd_write_latency_us_;
     ylt::metric::histogram_t oplog_apply_latency_us_;
+
+    ylt::metric::counter_t batch_record_durable_batches_total_;
+    ylt::metric::counter_t batch_record_durable_entries_total_;
+    ylt::metric::counter_t batch_record_retry_total_;
+    ylt::metric::gauge_t batch_record_committed_queue_depth_;
+    ylt::metric::gauge_t batch_record_callback_queue_depth_;
+    ylt::metric::gauge_t batch_record_last_batch_id_;
+    ylt::metric::gauge_t batch_record_durable_sequence_;
+    ylt::metric::histogram_t batch_record_batch_entries_;
+    ylt::metric::histogram_t batch_record_batch_bytes_;
+    ylt::metric::histogram_t batch_record_txn_latency_us_;
+    ylt::metric::histogram_t batch_record_commit_to_durable_us_;
+    ylt::metric::histogram_t batch_record_callback_latency_us_;
 
     // State Machine
     ylt::metric::gauge_t standby_state_;

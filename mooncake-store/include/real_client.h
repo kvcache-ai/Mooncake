@@ -1,42 +1,59 @@
 #pragma once
 
-#include "client_config_builder.h"
-
 #include <atomic>
 #include <boost/lockfree/queue.hpp>
+#include <chrono>
+#include <condition_variable>
+#include <csignal>
+#include <map>
 #include <memory>
+#include <shared_mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
 #include <vector>
-#include <condition_variable>
-#include <mutex>
 
 #include "pyclient.h"
-#include "client_buffer.hpp"
+#include "client_service.h"
+#include "client_buffer.h"
+#include "device/cuda_ipc_buffer_handle.h"
 #include "mutex.h"
 #include "utils.h"
 #include "rpc_types.h"
+#include "p2p/client/p2p_client_service.h"
+#include "p2p/client_config_builder.h"
+#if defined(USE_SUNRISE)
+#include "sunrise_allocator.h"
+#endif
+#include <ylt/coro_http/coro_http_server.hpp>
+#include <ylt/coro_rpc/coro_rpc_server.hpp>
+#include <ylt/coro_io/coro_io.hpp>
+#include <async_simple/coro/Lazy.h>
 
 namespace mooncake {
 
 class RealClient;
+class RegisteredPinnedRegion;
+class UdsAcceptor;
+class UdsConnection;
 
 // Global resource tracker to handle cleanup on abnormal termination
 class ResourceTracker {
    public:
     // Get the singleton instance
-    static ResourceTracker& getInstance();
+    static ResourceTracker &getInstance();
 
     // Register a DistributedObjectStore instance for cleanup
-    void registerInstance(const std::shared_ptr<PyClient>& instance);
+    void registerInstance(const std::shared_ptr<PyClient> &instance);
 
    private:
     ResourceTracker();
     ~ResourceTracker();
 
     // Prevent copying
-    ResourceTracker(const ResourceTracker&) = delete;
-    ResourceTracker& operator=(const ResourceTracker&) = delete;
+    ResourceTracker(const ResourceTracker &) = delete;
+    ResourceTracker &operator=(const ResourceTracker &) = delete;
 
     // Cleanup all registered resources
     void cleanupAllResources();
@@ -67,54 +84,108 @@ class RealClient : public PyClient {
     // Factory to create shared instances and auto-register to ResourceTracker
     static std::shared_ptr<RealClient> create();
 
-    template <typename ConfigT>
-    int setup(ConfigT& config);
+    int setup_real(
+        const std::string &local_hostname, const std::string &metadata_server,
+        size_t global_segment_size = 1024 * 1024 * 16,
+        size_t local_buffer_size = 1024 * 1024 * 16,
+        const std::string &protocol = "tcp",
+        const std::string &rdma_devices = "",
+        const std::string &master_server_addr = "127.0.0.1:50051",
+        const std::shared_ptr<TransferEngine> &transfer_engine = nullptr,
+        const std::string &ipc_socket_path = "",
+        bool enable_ssd_offload = false,
+        const std::string &ssd_offload_path = "",
+        const std::string &tenant_id = "default",
+        bool enable_client_http_server = false,
+        int client_http_port = DEFAULT_CLIENT_HTTP_PORT);
 
-    int initAll(const std::string& protocol, const std::string& device_name,
-                size_t mount_segment_size = 1024 * 1024 * 16) override;
+    int setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
+                    const std::string &server_address,
+                    const std::string &ipc_socket_path) {
+        // Real client does not support dummy setup
+        return -1;
+    };
 
-    uint64_t alloc_from_mem_pool(size_t size) override { return 0; };
+    // P2P mode support
+    int setup_p2p(const std::string& local_hostname,
+                  const std::string& metadata_server,
+                  const std::string& protocol,
+                  const std::string& device_names,
+                  const std::string& master_server_address,
+                  const std::string& tiered_backend_config,
+                  size_t local_buffer_size,
+                  const std::string& ipc_socket_path,
+                  uint16_t client_rpc_port,
+                  uint32_t rpc_thread_num,
+                  uint64_t lock_shard_count,
+                  size_t route_cache_max_memory,
+                  uint64_t route_cache_ttl_ms,
+                  const std::string& p2p_local_transfer_mode,
+                  size_t local_memcpy_async_worker_num,
+                  uint16_t http_port,
+                  bool enable_http_server,
+                  uint64_t async_sender_thread_count,
+                  uint64_t async_max_batch_size,
+                  uint64_t async_route_queue_size,
+                  uint64_t p2p_key_lease_duration_ms,
+                  uint64_t p2p_key_lease_scan_interval_ms,
+                  const std::string& p2p_transfer_direction_mode,
+                  const std::string& runtime_config,
+                  bool enable_metric_collection,
+                  uint32_t metric_report_interval_seconds);
 
-    DeploymentMode deployment_mode() const override {
-        return client_service_ ? client_service_->deployment_mode()
-                               : DeploymentMode::UNKNOWN;
-    }
+    int initAll(const std::string &protocol, const std::string &device_name,
+                size_t mount_segment_size = 1024 * 1024 * 16);  // Default 16MB
 
-    int put(const std::string& key, std::span<const char> value,
-            const WriteConfig& config) override;
+    uint64_t alloc_from_mem_pool(size_t size) { return 0; };
 
-    int register_buffer(void* buffer, size_t size) override;
+    int put(const std::string &key, std::span<const char> value,
+            const ReplicateConfig &config = ReplicateConfig{});
 
-    int unregister_buffer(void* buffer) override;
+    int register_buffer(void *buffer, size_t size);
+
+    int unregister_buffer(void *buffer);
+
+    struct WritableBufferRegion {
+        void *base{nullptr};
+        size_t size{0};
+        size_t offset{0};
+    };
+
+    std::optional<WritableBufferRegion> resolve_writable_buffer_region(
+        void *buffer) const;
 
     /**
      * @brief Get object data directly into a pre-allocated buffer
      * @param key Key of the object to get
-     * @param buffer Pointer to the pre-allocated buffer (must be registered
-     * with register_buffer)
+     * @param buffer Pointer to a writable Store buffer, either explicitly
+     * registered with register_buffer() or inside the setup-time local buffer
      * @param size Size of the buffer
      * @return Number of bytes read on success, negative value on error
-     * @note The buffer address must be previously registered with
-     * register_buffer() for zero-copy operations
+     * @note The buffer address must resolve to Store-managed registered memory
+     * for zero-copy operations
      */
-    int64_t get_into(const std::string& key, void* buffer, size_t size,
-                     const ReadRouteConfig& config = {}) override;
+    int64_t get_into(const std::string &key, void *buffer, size_t size);
+
+    std::vector<std::vector<std::vector<int64_t>>> get_into_ranges(
+        const std::vector<void *> &buffers,
+        const std::vector<std::vector<std::string>> &all_keys,
+        const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+        const QueryResultCache *query_result_cache = nullptr) override;
 
     /**
-     * @brief Get object data directly into pre-allocated buffers for multiple
-     * keys (batch version)
-     * @param keys Vector of keys of the objects to get
-     * @param buffers Vector of pointers to the pre-allocated buffers
-     * @param sizes Vector of sizes of the buffers
-     * @return Vector of 64-bit integers, where each element is the number of
-     * bytes read on success, or a negative value on error
-     * @note The buffer addresses must be previously registered with
-     * register_buffer() for zero-copy operations
+     * @brief Batch query object placement/lease metadata for later read reuse
+     * @param keys Vector of keys to query
+     * @return Vector of query results in the same order as keys
      */
-    std::vector<int64_t> batch_get_into(
-        const std::vector<std::string>& keys, const std::vector<void*>& buffers,
-        const std::vector<size_t>& sizes,
-        const ReadRouteConfig& config = {}) override;
+    std::vector<tl::expected<QueryResult, ErrorCode>> batch_query(
+        const std::vector<std::string> &keys) override;
+
+    std::vector<int64_t> batch_get_into(const std::vector<std::string> &keys,
+                                        const std::vector<void *> &buffers,
+                                        const std::vector<size_t> &sizes);
 
     /**
      * @brief Get object data directly into pre-allocated buffers for multiple
@@ -125,48 +196,46 @@ class RealClient : public PyClient {
      * @param all_sizes Vector of vectors of sizes of the buffers
      * @return Vector of integers, where each element is the number of bytes
      * read on success, or a negative value on error
-     * @note The buffer addresses must be previously registered with
-     * register_buffer() for zero-copy operations
+     * @note The buffer addresses must resolve to Store-managed registered
+     * memory, either explicit register_buffer() regions or the setup-time local
+     * buffer
      */
     std::vector<int> batch_get_into_multi_buffers(
-        const std::vector<std::string>& keys,
-        const std::vector<std::vector<void*>>& all_buffers,
-        const std::vector<std::vector<size_t>>& all_sizes,
-        bool aggregate_same_segment_task,
-        const ReadRouteConfig& config = {}) override;
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        bool prefer_same_node);
 
     /**
      * @brief Put object data directly from a pre-allocated buffer
      * @param key Key of the object to put
-     * @param buffer Pointer to the buffer containing data (must be registered
-     * with register_buffer)
+     * @param buffer Pointer to Store-managed registered memory, either
+     * explicitly registered with register_buffer() or inside the setup-time
+     * local buffer
      * @param size Size of the data to put
      * @return 0 on success, negative value on error
-     * @note The buffer address must be previously registered with
-     * register_buffer() for zero-copy operations
+     * @note The buffer address must resolve to Store-managed registered memory,
+     * either an explicit register_buffer() region or the setup-time local
+     * buffer
      */
-    int put_from(const std::string& key, void* buffer, size_t size,
-                 const WriteConfig& config) override;
+    int put_from(const std::string &key, void *buffer, size_t size,
+                 const ReplicateConfig &config = ReplicateConfig{});
 
     /**
-     * @brief Put object data directly from pre-allocated buffers for multiple
-     * keys(metadata version, better not be directly used in Python)
-     * @param keys Vector of keys of the objects to put
-     * @param buffers Vector of pointers to the pre-allocated buffers
-     * @param metadata_buffers Vector of pointers to the pre-allocated metadata
-     * buffers
-     * @param size Number of sizes of the buffers
-     * @param metadata_size Number of sizes of the metadata buffers
+     * @brief Put one object directly from a registered data buffer plus a
+     * registered metadata buffer
+     * @param key Key of the object to put
+     * @param buffer Pointer to the registered data buffer
+     * @param metadata_buffer Pointer to the registered metadata buffer
+     * @param size Size of the data buffer in bytes
+     * @param metadata_size Size of the metadata buffer in bytes
      * @param config Replication configuration
-     * @return Vector of integers, where each element is 0 on success, or a
-     * negative value on error
-     * @note The buffer addresses must be previously registered with
-     * register_buffer() for zero-copy operations
+     * @return 0 on success, negative value on error
      */
-    int put_from_with_metadata(const std::string& key, void* buffer,
-                               void* metadata_buffer, size_t size,
-                               size_t metadata_size,
-                               const WriteConfig& config) override;
+    int put_from_with_metadata(
+        const std::string &key, void *buffer, void *metadata_buffer,
+        size_t size, size_t metadata_size,
+        const ReplicateConfig &config = ReplicateConfig{});
 
     /**
      * @brief Put object data directly from pre-allocated buffers for multiple
@@ -177,14 +246,15 @@ class RealClient : public PyClient {
      * @param config Replication configuration
      * @return Vector of integers, where each element is 0 on success, or a
      * negative value on error
-     * @note The buffer addresses must be previously registered with
-     * register_buffer() for zero-copy operations
+     * @note The buffer addresses must resolve to Store-managed registered
+     * memory, either explicit register_buffer() regions or the setup-time local
+     * buffer
      */
 
-    std::vector<int> batch_put_from(const std::vector<std::string>& keys,
-                                    const std::vector<void*>& buffers,
-                                    const std::vector<size_t>& sizes,
-                                    const WriteConfig& config) override;
+    std::vector<int> batch_put_from(
+        const std::vector<std::string> &keys,
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        const ReplicateConfig &config = ReplicateConfig{});
 
     /**
      * @brief Put object data directly from multiple pre-allocated buffers for
@@ -196,24 +266,71 @@ class RealClient : public PyClient {
      * @param config Replication configuration
      * @return Vector of integers, where each element is 0 on success, or a
      * negative value on error
-     * @note The buffer addresses must be previously registered with
-     * register_buffer() for zero-copy operations
+     * @note The buffer addresses must resolve to Store-managed registered
+     * memory, either explicit register_buffer() regions or the setup-time local
+     * buffer
      */
     std::vector<int> batch_put_from_multi_buffers(
-        const std::vector<std::string>& keys,
-        const std::vector<std::vector<void*>>& all_buffers,
-        const std::vector<std::vector<size_t>>& all_sizes,
-        const WriteConfig& config) override;
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const ReplicateConfig &config = ReplicateConfig{});
 
-    int put_parts(const std::string& key,
+    std::vector<int> batch_get_session_start(
+        const std::vector<std::string> &keys) override;
+
+    std::vector<int> batch_get_into_multi_buffer_ranges(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const std::vector<std::vector<size_t>> &all_src_offsets) override;
+
+    int batch_get_session_end(const std::vector<std::string> &keys) override;
+
+    std::vector<int> batch_put_session_start(
+        const std::vector<std::string> &keys, const std::vector<size_t> &sizes,
+        const ReplicateConfig &config = ReplicateConfig{}) override;
+
+    std::vector<int> batch_put_from_multi_buffer_ranges(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const std::vector<std::vector<size_t>> &all_dst_offsets) override;
+
+    std::vector<int> batch_put_session_end(
+        const std::vector<std::string> &keys) override;
+
+    std::vector<int> batch_put_session_revoke(
+        const std::vector<std::string> &keys) override;
+
+    int put_parts(const std::string &key,
                   std::vector<std::span<const char>> values,
-                  const WriteConfig& config) override;
+                  const ReplicateConfig &config = ReplicateConfig{});
 
-    int put_batch(const std::vector<std::string>& keys,
-                  const std::vector<std::span<const char>>& values,
-                  const WriteConfig& config) override;
+    int put_batch(const std::vector<std::string> &keys,
+                  const std::vector<std::span<const char>> &values,
+                  const ReplicateConfig &config = ReplicateConfig{});
 
-    [[nodiscard]] std::string get_hostname() const override;
+    int upsert(const std::string &key, std::span<const char> value,
+               const ReplicateConfig &config = ReplicateConfig{});
+
+    int upsert_from(const std::string &key, void *buffer, size_t size,
+                    const ReplicateConfig &config = ReplicateConfig{});
+
+    std::vector<int> batch_upsert_from(
+        const std::vector<std::string> &keys,
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        const ReplicateConfig &config = ReplicateConfig{});
+
+    int upsert_parts(const std::string &key,
+                     std::vector<std::span<const char>> values,
+                     const ReplicateConfig &config = ReplicateConfig{});
+
+    int upsert_batch(const std::vector<std::string> &keys,
+                     const std::vector<std::span<const char>> &values,
+                     const ReplicateConfig &config = ReplicateConfig{});
+
+    [[nodiscard]] std::string get_hostname() const;
 
     /**
      * @brief Get a buffer containing the data for a key
@@ -221,16 +338,7 @@ class RealClient : public PyClient {
      * @return std::shared_ptr<BufferHandle> Buffer containing the data, or
      * nullptr if error
      */
-    std::shared_ptr<BufferHandle> get_buffer(
-        const std::string& key, const ReadRouteConfig& config = {}) override;
-
-    /**
-     * @brief Get buffer information (address and size) for a key
-     * @param key Key to get buffer information for
-     * @return Tuple containing buffer address and size, or (0, 0) if error
-     */
-    std::tuple<uint64_t, size_t> get_buffer_info(
-        const std::string& key, const ReadRouteConfig& config = {}) override;
+    std::shared_ptr<BufferHandle> get_buffer(const std::string &key);
 
     /**
      * @brief Get buffers containing the data for multiple keys (batch version)
@@ -239,27 +347,34 @@ class RealClient : public PyClient {
      * data, or nullptr for each key if error
      */
     std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer(
-        const std::vector<std::string>& keys,
-        const ReadRouteConfig& config = {}) override;
+        const std::vector<std::string> &keys);
 
-    int remove(const std::string& key, bool force = false) override;
+    int remove(const std::string &key, bool force = false);
 
-    long removeByRegex(const std::string& str, bool force = false) override;
+    long removeByRegex(const std::string &str, bool force = false);
 
-    long removeAll(bool force = false) override;
+    long removeAll(bool force = false);
 
-    long removeAllLocal() override;
+    std::vector<int> batchRemove(const std::vector<std::string> &keys,
+                                 bool force = false);
 
-    int removeLocal(const std::string& key) override;
+    int tearDownAll();
 
-    int tearDownAll() override;
+    int health_check() override;
+
+    // Rate-limited master reachability probe backing health_check().
+    // ClientService::is_ping_healthy only reflects the keepalive thread
+    // state, so an active probe is needed to detect master outages.
+    mutable std::mutex health_probe_mutex_;
+    std::chrono::steady_clock::time_point last_health_probe_time_{};
+    bool last_health_probe_ok_{true};
 
     /**
      * @brief Check if an object exists
      * @param key Key to check
      * @return 1 if exists, 0 if not exists, -1 if error
      */
-    int isExist(const std::string& key) override;
+    int isExist(const std::string &key);
 
     /**
      * @brief Check if multiple objects exist
@@ -267,7 +382,7 @@ class RealClient : public PyClient {
      * @return Vector of existence results: 1 if exists, 0 if not exists, -1 if
      * error
      */
-    std::vector<int> batchIsExist(const std::vector<std::string>& keys);
+    std::vector<int> batchIsExist(const std::vector<std::string> &keys);
 
     /**
      * @brief Get the size of an object
@@ -275,7 +390,7 @@ class RealClient : public PyClient {
      * @return Size of the object in bytes, or -1 if error or object doesn't
      * exist
      */
-    int64_t getSize(const std::string& key) override;
+    int64_t getSize(const std::string &key);
 
     /**
      * @brief Create a copy task to replicate an object's data to target
@@ -286,8 +401,7 @@ class RealClient : public PyClient {
      * failure
      */
     tl::expected<UUID, ErrorCode> create_copy_task(
-        const std::string& key,
-        const std::vector<std::string>& targets) override;
+        const std::string &key, const std::vector<std::string> &targets);
 
     /**
      * @brief Create a move task to move an object's replica from source segment
@@ -298,9 +412,9 @@ class RealClient : public PyClient {
      * @return tl::expected<UUID, ErrorCode> Task ID on success, ErrorCode on
      * failure
      */
-    tl::expected<UUID, ErrorCode> create_move_task(
-        const std::string& key, const std::string& source,
-        const std::string& target) override;
+    tl::expected<UUID, ErrorCode> create_move_task(const std::string &key,
+                                                   const std::string &source,
+                                                   const std::string &target);
 
     /**
      * @brief Query a task by task id
@@ -308,39 +422,131 @@ class RealClient : public PyClient {
      * @return tl::expected<QueryTaskResponse, ErrorCode> Task basic info
      * on success, ErrorCode on failure
      */
-    tl::expected<QueryTaskResponse, ErrorCode> query_task(
-        const UUID& task_id) override;
+    tl::expected<QueryTaskResponse, ErrorCode> query_task(const UUID &task_id);
 
-    // Dummy client helper functions that return tl::expected
-    tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>
-    get_buffer_info_dummy_helper(const std::string& key,
-                                 const ReadRouteConfig& config,
-                                 const UUID& client_id);
+    // Hot cache acquire: returns (offset, size) within the shm region.
+    // Increments ref_count to prevent eviction.
+    tl::expected<std::tuple<uint64_t, size_t>, ErrorCode> acquire_hot_cache(
+        const std::string &key);
 
-    tl::expected<void, ErrorCode> put_dummy_helper(const std::string& key,
-                                                   std::span<const char> value,
-                                                   const WriteConfig& config,
-                                                   const UUID& client_id);
+    // Hot cache release: decrements ref_count after dummy is done reading.
+    tl::expected<void, ErrorCode> release_hot_cache(const std::string &key);
+
+    // Batch hot cache acquire: returns vector of (offset, size).
+    // SIZE_MAX offset indicates cache miss for that key.
+    std::vector<tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>>
+    batch_acquire_hot_cache(const std::vector<std::string> &keys);
+
+    // Batch hot cache release.
+    tl::expected<void, ErrorCode> batch_release_hot_cache(
+        const std::vector<std::string> &keys);
+
+    // Allocator-backed buffer acquire: allocates + fills, keeps handle alive.
+    // Returns (dummy_addr, size).
+    tl::expected<std::tuple<uint64_t, size_t>, ErrorCode> acquire_buffer_dummy(
+        const std::string &key, const UUID &client_id);
+
+    // Allocator-backed buffer release: frees the handle held by acquire.
+    tl::expected<void, ErrorCode> release_buffer_dummy(uint64_t dummy_addr,
+                                                       const UUID &client_id);
+
+    // Batch allocator-backed buffer acquire.
+    // Returns vector of (dummy_addr, size) per key.
+    std::vector<tl::expected<std::tuple<uint64_t, size_t>, ErrorCode>>
+    batch_acquire_buffer_dummy(const std::vector<std::string> &keys,
+                               const UUID &client_id);
+
+    tl::expected<std::tuple<uint64_t, size_t>, ErrorCode> allocate_buffer_dummy(
+        size_t size, const UUID &client_id);
+
+    tl::expected<void, ErrorCode> put_dummy_helper(
+        const std::string &key, std::span<const char> value,
+        const ReplicateConfig &config, const UUID &client_id);
+
+    tl::expected<void, ErrorCode> upsert_dummy_helper(
+        const std::string &key, std::span<const char> value,
+        const ReplicateConfig &config, const UUID &client_id);
+
+    tl::expected<void, ErrorCode> upsert_parts_dummy_helper(
+        const std::string &key, std::vector<std::span<const char>> values,
+        const ReplicateConfig &config, const UUID &client_id);
+
+    tl::expected<void, ErrorCode> upsert_from_dummy_helper(
+        const std::string &key, uint64_t dummy_buffer, size_t size,
+        const ReplicateConfig &config, const UUID &client_id);
+
+    std::vector<tl::expected<void, ErrorCode>> batch_upsert_from_dummy_helper(
+        const std::vector<std::string> &keys,
+        const std::vector<uint64_t> &dummy_buffers,
+        const std::vector<size_t> &sizes, const ReplicateConfig &config,
+        const UUID &client_id);
+
+    tl::expected<void, ErrorCode> upsert_batch_dummy_helper(
+        const std::vector<std::string> &keys,
+        const std::vector<std::span<const char>> &values,
+        const ReplicateConfig &config, const UUID &client_id);
 
     tl::expected<void, ErrorCode> put_batch_dummy_helper(
-        const std::vector<std::string>& keys,
-        const std::vector<std::span<const char>>& values,
-        const WriteConfig& config, const UUID& client_id);
+        const std::vector<std::string> &keys,
+        const std::vector<std::span<const char>> &values,
+        const ReplicateConfig &config, const UUID &client_id);
 
     tl::expected<void, ErrorCode> put_parts_dummy_helper(
-        const std::string& key, std::vector<std::span<const char>> values,
-        const WriteConfig& config, const UUID& client_id);
+        const std::string &key, std::vector<std::span<const char>> values,
+        const ReplicateConfig &config, const UUID &client_id);
 
-    std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_dummy_helper(
-        const std::vector<std::string>& keys,
-        const std::vector<uint64_t>& buffers, const std::vector<size_t>& sizes,
-        const ReadRouteConfig& config, const UUID& client_id);
+    async_simple::coro::Lazy<std::vector<tl::expected<int64_t, ErrorCode>>>
+    batch_get_into_dummy_helper(const std::vector<std::string> &keys,
+                                const std::vector<uint64_t> &buffers,
+                                const std::vector<size_t> &sizes,
+                                int32_t device_id, const UUID &client_id);
 
     std::vector<tl::expected<void, ErrorCode>> batch_put_from_dummy_helper(
-        const std::vector<std::string>& keys,
-        const std::vector<uint64_t>& dummy_buffers,
-        const std::vector<size_t>& sizes, const WriteConfig& config,
-        const UUID& client_id);
+        const std::vector<std::string> &keys,
+        const std::vector<uint64_t> &dummy_buffers,
+        const std::vector<size_t> &sizes, const ReplicateConfig &config,
+        int32_t device_id, const UUID &client_id);
+
+    std::vector<tl::expected<void, ErrorCode>>
+    batch_put_from_multi_buffers_dummy_helper(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<uint64_t>> &dummy_all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const ReplicateConfig &config, int32_t device_id,
+        const UUID &client_id);
+
+    std::vector<tl::expected<void, ErrorCode>>
+    batch_put_from_cuda_ipc_dummy_helper(
+        const std::vector<CudaIpcWriteRequest> &requests,
+        const ReplicateConfig &config, const UUID &client_id);
+
+    std::vector<tl::expected<int64_t, ErrorCode>>
+    batch_get_into_cuda_ipc_dummy_helper(
+        const std::vector<CudaIpcReadRequest> &requests, const UUID &client_id);
+
+    std::vector<tl::expected<int64_t, ErrorCode>>
+    batch_get_into_multi_buffers_dummy_helper(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<uint64_t>> &dummy_all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        bool prefer_alloc_in_same_node, int32_t device_id,
+        const UUID &client_id);
+
+    tl::expected<int64_t, ErrorCode> get_into_range_shm_helper(
+        const std::string &key, uint64_t buffer, size_t dst_offset,
+        size_t src_offset, size_t size, bool size_is_buffer_capacity,
+        bool verify_checksum, const UUID &client_id);
+
+    std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
+    get_into_ranges_shm_helper(
+        const std::vector<uint64_t> &dummy_buffers,
+        const std::vector<std::vector<std::string>> &all_keys,
+        const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+        const std::map<std::string, CachedQueryResultResponse>
+            &cached_query_results,
+        int32_t device_id, const UUID &client_id);
 
     // Share mem management for dummy client
     // Modified: map_shm_internal now takes fd instead of just name
@@ -348,156 +554,476 @@ class RealClient : public PyClient {
                                                    uint64_t shm_base_addr,
                                                    size_t shm_size,
                                                    bool is_local_buffer,
-                                                   const UUID& client_id);
+                                                   const UUID &client_id);
+    tl::expected<void, ErrorCode> map_shm_internal_with_device(
+        int fd, uint64_t shm_base_addr, size_t shm_size, bool is_local_buffer,
+        int32_t physical_device_id, const UUID &client_id);
 
-    tl::expected<void, ErrorCode> unmap_shm_internal(const UUID& client_id);
+    tl::expected<void, ErrorCode> unmap_shm_internal(const UUID &client_id);
+
+    tl::expected<void, ErrorCode> ascend_shm_internal(
+        uint64_t dummy_base_addr, size_t vmm_size, bool is_local_buffer,
+        const std::string &shareable_handle_bytes, int32_t device_id,
+        const UUID &client_id);
+
+    tl::expected<void, ErrorCode> ascend_ipc_shm_internal(
+        uint64_t dummy_base_addr, size_t mem_size, bool is_local_buffer,
+        const std::string &ipc_key_bytes, int32_t device_id,
+        const UUID &client_id);
+
+    tl::expected<void, ErrorCode> ascend_unmap_shm_internal(
+        const UUID &client_id);
+
+    tl::expected<bool, ErrorCode> is_shm_mapped_internal(
+        uint64_t dummy_base_addr, const UUID &client_id);
 
     tl::expected<void, ErrorCode> unregister_shm_buffer_internal(
-        uint64_t dummy_base_addr, const UUID& client_id);
+        uint64_t dummy_base_addr, const UUID &client_id);
 
     // Internal versions that return tl::expected
-    tl::expected<DeploymentMode, ErrorCode> service_ready_internal() {
-        return deployment_mode();
-    }
+    tl::expected<void, ErrorCode> service_ready_internal() { return {}; }
 
-    template <typename ConfigT>
-    tl::expected<void, ErrorCode> setup_internal(ConfigT& config);
+    tl::expected<void, ErrorCode> setup_internal(
+        const std::string &local_hostname, const std::string &metadata_server,
+        size_t global_segment_size = 1024 * 1024 * 16,
+        size_t local_buffer_size = 1024 * 1024 * 16,
+        const std::string &protocol = "tcp",
+        const std::string &rdma_devices = "",
+        const std::string &master_server_addr = "127.0.0.1:50051",
+        const std::shared_ptr<TransferEngine> &transfer_engine = nullptr,
+        const std::string &ipc_socket_path = "", int local_rpc_port = 50052,
+        bool enable_ssd_offload = false, bool start_offload_rpc_server = false,
+        const std::string &ssd_offload_path = "",
+        const std::string &tenant_id = "default",
+        bool enable_client_http_server = false,
+        int client_http_port = DEFAULT_CLIENT_HTTP_PORT);
+
+    // Overload that accepts a configuration dictionary
+    tl::expected<void, ErrorCode> setup_internal(const ConfigDict &config);
 
     tl::expected<void, ErrorCode> initAll_internal(
-        const std::string& protocol, const std::string& device_name,
+        const std::string &protocol, const std::string &device_name,
         size_t mount_segment_size = 1024 * 1024 * 16);
 
-    tl::expected<void, ErrorCode> unregister_buffer_internal(void* buffer);
+    tl::expected<void, ErrorCode> unregister_buffer_internal(void *buffer);
 
     tl::expected<void, ErrorCode> put_internal(
-        const std::string& key, std::span<const char> value,
-        const WriteConfig& config,
-        std::shared_ptr<ClientBufferAllocator> client_buffer_allocator =
+        const std::string &key, std::span<const char> value,
+        const ReplicateConfig &config = ReplicateConfig{},
+        const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator =
             nullptr);
 
-    tl::expected<void, ErrorCode> register_buffer_internal(void* buffer,
+    tl::expected<void, ErrorCode> register_buffer_internal(void *buffer,
                                                            size_t size);
 
-    tl::expected<int64_t, ErrorCode> get_into_internal(
-        const std::string& key, void* buffer, size_t size,
-        const ReadRouteConfig& config = {});
+    struct RangedReadMetadata {
+        QueryResult query_result;
+        Replica::Descriptor replica;
+        uint64_t total_size;
+    };
+
+    tl::expected<RangedReadMetadata, ErrorCode>
+    build_ranged_read_metadata_from_query_result(
+        const std::string &key, tl::expected<QueryResult, ErrorCode> query_result);
+
+    tl::expected<RangedReadMetadata, ErrorCode>
+    build_ranged_read_metadata_from_query_result(
+        const std::string &key,
+        tl::expected<std::unique_ptr<QueryResult>, ErrorCode> query_result);
+
+    tl::expected<RangedReadMetadata, ErrorCode> resolve_ranged_read_metadata(
+        const std::string &key,
+        const QueryResultCache *query_result_cache = nullptr);
+
+    tl::expected<int64_t, ErrorCode> execute_ranged_read(
+        const std::string &key, void *buffer, size_t dst_offset,
+        size_t src_offset, size_t size, const RangedReadMetadata &metadata,
+        bool size_is_buffer_capacity, bool verify_checksum);
+
+    tl::expected<int64_t, ErrorCode> get_into_range_internal(
+        const std::string &key, void *buffer, size_t dst_offset,
+        size_t src_offset, size_t size, bool size_is_buffer_capacity,
+        bool verify_checksum);
+
+    std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
+    get_into_ranges_internal(
+        const std::vector<void *> &buffers,
+        const std::vector<std::vector<std::string>> &all_keys,
+        const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+        const std::vector<size_t> *buffer_capacities = nullptr,
+        const QueryResultCache *query_result_cache = nullptr);
 
     std::vector<tl::expected<int64_t, ErrorCode>> batch_get_into_internal(
-        const std::vector<std::string>& keys, const std::vector<void*>& buffers,
-        const std::vector<size_t>& sizes, const ReadRouteConfig& config = {});
+        const std::vector<std::string> &keys,
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes);
 
     std::vector<tl::expected<int64_t, ErrorCode>>
     batch_get_into_multi_buffers_internal(
-        const std::vector<std::string>& keys,
-        const std::vector<std::vector<void*>>& all_buffers,
-        const std::vector<std::vector<size_t>>& all_sizes,
-        bool aggregate_same_segment_task, const ReadRouteConfig& config = {});
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        bool prefer_same_node);
 
-    tl::expected<void, ErrorCode> put_from_internal(const std::string& key,
-                                                    void* buffer, size_t size,
-                                                    const WriteConfig& config);
+    tl::expected<void, ErrorCode> put_from_internal(
+        const std::string &key, void *buffer, size_t size,
+        const ReplicateConfig &config = ReplicateConfig{});
+
+    tl::expected<void, ErrorCode> upsert_internal(
+        const std::string &key, std::span<const char> value,
+        const ReplicateConfig &config = ReplicateConfig{},
+        std::shared_ptr<ClientBufferAllocator> client_buffer_allocator =
+            nullptr);
+
+    tl::expected<void, ErrorCode> upsert_from_internal(
+        const std::string &key, void *buffer, size_t size,
+        const ReplicateConfig &config = ReplicateConfig{});
+
+    std::vector<tl::expected<void, ErrorCode>> batch_upsert_from_internal(
+        const std::vector<std::string> &keys,
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        const ReplicateConfig &config = ReplicateConfig{});
+
+    tl::expected<void, ErrorCode> upsert_parts_internal(
+        const std::string &key, std::vector<std::span<const char>> values,
+        const ReplicateConfig &config = ReplicateConfig{},
+        std::shared_ptr<ClientBufferAllocator> client_buffer_allocator =
+            nullptr);
+
+    tl::expected<void, ErrorCode> upsert_batch_internal(
+        const std::vector<std::string> &keys,
+        const std::vector<std::span<const char>> &values,
+        const ReplicateConfig &config = ReplicateConfig{},
+        std::shared_ptr<ClientBufferAllocator> client_buffer_allocator =
+            nullptr);
 
     std::vector<tl::expected<void, ErrorCode>> batch_put_from_internal(
-        const std::vector<std::string>& keys, const std::vector<void*>& buffers,
-        const std::vector<size_t>& sizes, const WriteConfig& config);
+        const std::vector<std::string> &keys,
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        const ReplicateConfig &config = ReplicateConfig{});
 
     std::vector<tl::expected<void, ErrorCode>>
     batch_put_from_multi_buffers_internal(
-        const std::vector<std::string>& keys,
-        const std::vector<std::vector<void*>>& all_buffers,
-        const std::vector<std::vector<size_t>>& all_sizes,
-        const WriteConfig& config);
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const ReplicateConfig &config = ReplicateConfig{});
 
     tl::expected<void, ErrorCode> put_parts_internal(
-        const std::string& key, std::vector<std::span<const char>> values,
-        const WriteConfig& config,
-        std::shared_ptr<ClientBufferAllocator> client_buffer_allocator =
+        const std::string &key,
+        const std::vector<std::span<const char>> &values,
+        const ReplicateConfig &config = ReplicateConfig{},
+        const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator =
             nullptr);
 
     tl::expected<void, ErrorCode> put_batch_internal(
-        const std::vector<std::string>& keys,
-        const std::vector<std::span<const char>>& values,
-        const WriteConfig& config,
-        std::shared_ptr<ClientBufferAllocator> client_buffer_allocator =
+        const std::vector<std::string> &keys,
+        const std::vector<std::span<const char>> &values,
+        const ReplicateConfig &config = ReplicateConfig{},
+        const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator =
             nullptr);
 
-    tl::expected<void, ErrorCode> remove_internal(const std::string& key,
+    tl::expected<void, ErrorCode> remove_internal(const std::string &key,
                                                   bool force = false);
 
-    tl::expected<long, ErrorCode> removeByRegex_internal(const std::string& str,
+    tl::expected<long, ErrorCode> removeByRegex_internal(const std::string &str,
                                                          bool force = false);
 
     tl::expected<int64_t, ErrorCode> removeAll_internal(bool force = false);
 
-    tl::expected<int64_t, ErrorCode> removeAllLocal_internal();
-
-    tl::expected<void, ErrorCode> removeLocal_internal(const std::string& key);
+    std::vector<tl::expected<void, ErrorCode>> batchRemove_internal(
+        const std::vector<std::string> &keys, bool force = false);
 
     tl::expected<void, ErrorCode> tearDownAll_internal();
 
-    tl::expected<bool, ErrorCode> isExist_internal(const std::string& key);
+    tl::expected<bool, ErrorCode> isExist_internal(const std::string &key);
 
     std::vector<tl::expected<bool, ErrorCode>> batchIsExist_internal(
-        const std::vector<std::string>& keys);
+        const std::vector<std::string> &keys);
 
-    tl::expected<int64_t, ErrorCode> getSize_internal(const std::string& key);
+    tl::expected<int64_t, ErrorCode> getSize_internal(const std::string &key);
 
     std::shared_ptr<BufferHandle> get_buffer_internal(
-        const std::string& key,
-        std::shared_ptr<ClientBufferAllocator> client_buffer_allocator =
-            nullptr,
-        const ReadRouteConfig& config = {});
+        const std::string &key,
+        const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator =
+            nullptr);
 
     std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer_internal(
-        const std::vector<std::string>& keys,
-        const ReadRouteConfig& config = {});
+        const std::vector<std::string> &keys,
+        const std::shared_ptr<ClientBufferAllocator> &client_buffer_allocator =
+            nullptr);
 
     std::map<std::string, std::vector<Replica::Descriptor>>
-    batch_get_replica_desc(const std::vector<std::string>& keys);
-    std::vector<Replica::Descriptor> get_replica_desc(const std::string& key);
+    batch_get_replica_desc(const std::vector<std::string> &keys);
+    std::vector<CachedQueryResultResponse> batch_get_query_results(
+        const std::vector<std::string> &keys);
+    std::vector<Replica::Descriptor> get_replica_desc(const std::string &key);
 
-    tl::expected<DummyHeartbeatResponse, ErrorCode> ping(const UUID& client_id);
+    std::vector<std::string> batch_replica_clear(
+        const std::vector<std::string> &keys,
+        const std::string &segment_name = "") override;
 
-    tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
-    batch_get_offload_object(const std::vector<std::string>& keys,
-                             const std::vector<int64_t>& sizes);
+    tl::expected<PingResponse, ErrorCode> ping(const UUID &client_id);
 
+    async_simple::coro::Lazy<
+        tl::expected<BatchGetOffloadObjectResponse, ErrorCode>>
+    batch_get_offload_object(const std::vector<std::string> &keys,
+                             const std::vector<int64_t> &sizes);
+
+    /**
+     * @brief Releases buffer associated with a specific batch_id.
+     * Called by remote client after transfer completion.
+     * @param batch_id The unique identifier of the batch to release
+     * @return true if batch was found and released, false otherwise
+     */
+    bool release_offload_buffer(uint64_t batch_id);
+
+    /**
+     * @brief Retrieves multiple stored objects from a remote service.
+     * @param target_rpc_service_addr Address of the remote RPC service (e.g.,
+     "ip:port").
+
+     */
+    struct OffloadReadRange {
+        uint64_t source_offset;
+        int64_t restore_size;
+    };
+
+    tl::expected<void, ErrorCode> batch_get_into_offload_object_internal(
+        const std::string &target_rpc_service_addr,
+        std::unordered_map<std::string, std::vector<Slice>> &objects,
+        const OffloadReadRange *read_range = nullptr);
+
+    bool can_use_pinned_restore_arena(
+        const std::string &target_rpc_service_addr,
+        const std::unordered_map<std::string, std::vector<Slice>> &objects)
+        const;
+
+    int64_t get_offload_rpc_read_count() const {
+        return offload_rpc_read_count_.load(std::memory_order_relaxed);
+    }
+
+    /**
+     * @brief Mount a shared memory file region and return segment ids.
+     *        If size > max_mr_size, it will be split into multiple chunks
+     *        and mounted separately. RealClient will open(path) + mmap
+     *        internally for each chunk.
+     */
+    int mountSegment(const std::string &path, size_t offset, size_t size,
+                     const std::string &protocol, const std::string &location,
+                     std::vector<std::string> &out_segment_ids);
+
+    /**
+     * @brief Unmount segments by their ids and clean up local mmap/fd.
+     * @param grace_period_seconds 0 = immediate unmount (legacy behavior).
+     */
+    int unmountSegment(const std::vector<std::string> &segment_ids,
+                       uint64_t grace_period_seconds = 0);
+
+    /**
+     * @brief Allocate memory internally and mount segments to master.
+     *        If size > max_mr_size, it will be split into multiple chunks.
+     *        Memory is allocated via allocate_buffer_allocator_memory.
+     *        The actual allocated size (aligned up to Slab::kSize) is written
+     *        to out_allocated_size if non-null.
+     */
+    int allocateAndMountSegment(size_t size, const std::string &protocol,
+                                const std::string &location,
+                                std::vector<std::string> &out_segment_ids,
+                                size_t *out_allocated_size = nullptr);
+
+    /**
+     * @brief Unmount segments by their ids and free locally allocated memory.
+     * @param grace_period_seconds 0 = immediate unmount (legacy behavior).
+     */
+    int unmountAndFreeSegment(const std::vector<std::string> &segment_ids,
+                              uint64_t grace_period_seconds = 0);
+
+    struct MountedSegmentRecord {
+        void *mmap_base = nullptr;
+        size_t size = 0;
+        std::string path;
+    };
+
+    struct AllocatedSegmentRecord {
+        void *base = nullptr;
+        size_t size = 0;
+        std::string protocol;
+        std::shared_ptr<RegisteredPinnedRegion> pinned_region;
+    };
+
+    void FreeAllocatedStoreSegment(AllocatedSegmentRecord &record);
+
+    std::unique_ptr<AutoPortBinder> port_binder_ = nullptr;
+
+    struct SegmentDeleter {
+        void operator()(void *ptr) {
+            if (ptr) {
+                free(ptr);
+            }
+        }
+    };
+
+    struct HugepageSegmentDeleter {
+        size_t size = 0;
+        void operator()(void *ptr) const {
+            if (ptr && size > 0) {
+                free_buffer_mmap_memory(ptr, size);
+            }
+        }
+    };
+
+    struct AscendSegmentDeleter {
+        std::string protocol = "ascend";
+        void operator()(void *ptr) {
+            if (ptr) {
+                free_memory(protocol.c_str(), ptr);
+            }
+        }
+    };
+
+    struct UbSegmentDeleter {
+        size_t size = 0;
+        std::string protocol = "ub";
+        void operator()(void *ptr) const {
+            if (ptr && size > 0) {
+                free_memory(protocol.c_str(), ptr);
+            }
+        }
+    };
+
+#ifdef USE_VRAM_SEGMENT
+    struct VRAMSegmentDeleter {
+        void operator()(void *ptr) {
+            if (ptr) {
+                free_memory("vram", ptr);
+            }
+        }
+    };
+#endif
+
+#if defined(USE_SUNRISE)
+    struct SunriseSegmentDeleter {
+        void operator()(void *ptr) {
+            if (ptr) {
+                sunrise_free_memory(ptr);
+            }
+        }
+    };
+#endif
+
+    std::vector<std::unique_ptr<void, HugepageSegmentDeleter>>
+        hugepage_segment_ptrs_;
+    std::vector<std::unique_ptr<void, SegmentDeleter>> segment_ptrs_;
+    std::vector<std::unique_ptr<void, AscendSegmentDeleter>>
+        ascend_segment_ptrs_;
+    std::vector<std::unique_ptr<void, UbSegmentDeleter>> ub_segment_ptrs_;
+#ifdef USE_VRAM_SEGMENT
+    std::vector<std::unique_ptr<void, VRAMSegmentDeleter>> vram_segment_ptrs_;
+#endif
+#if defined(USE_SUNRISE)
+    std::vector<std::unique_ptr<void, SunriseSegmentDeleter>>
+        sunrise_segment_ptrs_;
+#endif
+    std::vector<std::shared_ptr<RegisteredPinnedRegion>>
+        setup_segment_pinned_regions_;
+    bool setup_segment_memory_must_leak_ = false;
     std::string protocol;
     std::string device_name;
+    std::string local_hostname;
+    std::string local_rpc_addr;
+    std::unique_ptr<coro_rpc::coro_rpc_server> offload_rpc_server_;
+    int offload_rpc_port_ = 0;
+    bool use_hugepage_ = false;
 
     struct MappedShm {
         std::string shm_name;
         // Offset = real_base - dummy_base
         uintptr_t shm_addr_offset = 0;
-        void* shm_buffer = nullptr;
+        void *shm_buffer = nullptr;
         size_t shm_size = 0;
         uintptr_t dummy_base_addr = 0;
+        bool is_ascend = false;
+        bool is_ipc = false;
+        // Ascend physical device id from dummy (dummy-real RPC).
+        int32_t device_id = kInvalidPhysicalDeviceId;
+        uint64_t vmm_handle = 0;
+        std::string ipc_key_data;
     };
 
     struct ShmContext {
-        mutable SharedMutex mutex;
-        std::vector<MappedShm> mapped_shms GUARDED_BY(mutex);
-        std::shared_ptr<ClientBufferAllocator> client_buffer_allocator
-            GUARDED_BY(mutex) = nullptr;
+        // List of all mapped shared memory for this client
+        std::vector<MappedShm> mapped_shms;
+        std::shared_ptr<ClientBufferAllocator> client_buffer_allocator =
+            nullptr;
+        // Buffers held by dummy via acquire_buffer; keyed by dummy address
+        std::unordered_map<uint64_t, std::shared_ptr<BufferHandle>>
+            active_handles;
     };
+    mutable std::shared_mutex dummy_client_mutex_;
+    std::unordered_map<UUID, ShmContext, boost::hash<UUID>> shm_contexts_;
 
-    mutable SharedMutex dummy_client_mutex_;
-    std::unordered_map<UUID, std::shared_ptr<ShmContext>, boost::hash<UUID>>
-        shm_contexts_ GUARDED_BY(dummy_client_mutex_);
+    mutable std::shared_mutex registered_buffer_mutex_;
+    std::unordered_map<void *, size_t> registered_buffer_sizes_;
+    std::optional<WritableBufferRegion> local_buffer_region_;
 
-    std::shared_ptr<ShmContext> find_shm_context(const UUID& client_id);
+    // KV transfer sessions (process-local; not shared with DummyClient).
+    // get_sessions_ stores a FilterQueryResult'd QueryResult (single complete
+    // memory replica + lease); ranges only compare lease locally (no Master).
+    // Put sessions track writable + inflight so end/revoke can seal the
+    // session and wait for outstanding range writes before finalize/free.
+    struct PutSessionEntry {
+        std::vector<Replica::Descriptor> replicas;
+        uint64_t object_size{0};
+        ReplicaWriteMode write_mode{ReplicaWriteMode::SINGLE_REPLICA};
+        bool writable{true};
+        size_t inflight_transfers{0};
+    };
+    mutable std::mutex session_mutex_;
+    std::condition_variable session_cv_;
+    std::unordered_map<std::string, QueryResult> get_sessions_;
+    std::unordered_map<std::string, PutSessionEntry> put_sessions_;
+
+    // Dummy VA -> real VA using mapped_shms; last_hit_shm caches locality.
+    bool map_dummy_range_in_shm(const MappedShm &shm, uint64_t dummy_addr,
+                                size_t offset, size_t size,
+                                void *&out_real) const;
+
+    bool map_dummy_buffer_to_real(const ShmContext &shm_ctx,
+                                  uint64_t dummy_addr, size_t buf_size,
+                                  const MappedShm *&last_hit_shm,
+                                  void *&out_real,
+                                  size_t *out_capacity = nullptr) const;
+
+    bool map_dummy_buffer_range_to_real(const ShmContext &shm_ctx,
+                                        uint64_t dummy_addr, size_t dst_offset,
+                                        size_t size, void *&out_real) const;
+
+    tl::expected<std::vector<void *>, ErrorCode> map_dummy_addrs_to_real_ptrs(
+        const ShmContext &context, const std::vector<uint64_t> &dummy_addrs,
+        const std::vector<size_t> &sizes, const UUID &client_id,
+        std::vector<size_t> *capacities = nullptr) const;
+
+    tl::expected<std::vector<std::vector<void *>>, ErrorCode>
+    map_dummy_nested_addrs_to_real_ptrs(
+        const ShmContext &context,
+        const std::vector<std::vector<uint64_t>> &dummy_all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const std::vector<std::string> &keys, const UUID &client_id) const;
 
     // Ensure cleanup executes at most once across multiple entry points
     std::atomic<bool> closed_{false};
 
+    // Counts every LOCAL_DISK read served via peer offload-RPC.
+    std::atomic<int64_t> offload_rpc_read_count_{0};
+
     // Dummy Client manage related members
     void dummy_client_monitor_func();
     int start_dummy_client_monitor();
-    int stop_dummy_client_monitor();
+    void stop_dummy_client_monitor();
     std::thread dummy_client_monitor_thread_;
     std::atomic<bool> dummy_client_monitor_running_{false};
-    std::condition_variable dummy_client_monitor_cv_;
-    std::mutex dummy_client_monitor_cv_mutex_;
     static constexpr uint64_t kDummyClientMonitorSleepMs =
         1000;  // 1000 ms sleep between client monitor checks
     // boost lockfree queue requires trivial assignment operator
@@ -509,16 +1035,39 @@ class RealClient : public PyClient {
         128 * 1024;  // Size of the client ping queue
     boost::lockfree::queue<PodUUID> dummy_client_ping_queue_{
         kDummyClientPingQueueSize};
-    const int64_t dummy_client_live_ttl_sec_ =
-        DEFAULT_DUMMY_CLIENT_LIVE_TTL_SEC;
+    const int64_t dummy_client_live_ttl_sec_ = DEFAULT_CLIENT_LIVE_TTL_SEC;
+    int64_t view_version_ = 0;
 
     // IPC Server members for receiving FD from Dummy Clients
     std::string ipc_socket_path_;
-    std::jthread ipc_thread_;
-    std::atomic<bool> ipc_running_{false};
+    std::unique_ptr<UdsAcceptor> uds_acceptor_;
     int start_ipc_server();
     int stop_ipc_server();
-    void ipc_server_func();
+    // Embedded HTTP server for health-check / metrics
+    std::unique_ptr<coro_http::coro_http_server> http_server_;
+    int start_http_server(int port);
+    void stop_http_server();
+
+    void handle_ipc_shm_register(UdsConnection &connection);
+    void handle_ipc_shm_fd_request(UdsConnection &connection);
+
+    void teardown_ascend_shm_buffer(MappedShm &shm);
+    tl::expected<void, ErrorCode> setup_ascend_internal(
+        size_t local_buffer_size);
+
+   private:
+    std::unordered_map<std::string, MountedSegmentRecord>
+        mounted_segment_records_;
+    std::mutex mounted_segment_records_mutex_;
+
+    std::unordered_map<std::string, AllocatedSegmentRecord>
+        allocated_segment_records_;
+    std::mutex allocated_segment_records_mutex_;
+
+    void ReleaseMountedSegmentRecord(const std::string &segment_id);
+    void ReleaseAllMountedSegmentRecords();
+    void ReleaseAllocatedSegmentRecord(const std::string &segment_id);
+    void ReleaseAllAllocatedSegmentRecords();
 };
 
 }  // namespace mooncake

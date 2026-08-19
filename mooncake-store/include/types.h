@@ -3,14 +3,20 @@
 #include <cstdint>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
+#include <string_view>
+#include <limits>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
-#include <variant>
+#include "tenant_id.h"
+
 #include "Slab.h"
 #include "ylt/struct_json/json_reader.h"
 #include "ylt/struct_json/json_writer.h"
+#include "ylt/struct_pack.hpp"
 
 #ifdef STORE_USE_ETCD
 #include "libetcd_wrapper.h"
@@ -21,17 +27,88 @@ namespace mooncake {
 static constexpr uint64_t WRONG_VERSION = 0;
 static constexpr uint64_t DEFAULT_VALUE = UINT64_MAX;
 static constexpr uint64_t ERRNO_BASE = DEFAULT_VALUE - 1000;
+
+// Sequence ID comparison utilities for wrap-around safety.
+// These functions use signed difference to correctly handle uint64_t overflow
+// (from UINT64_MAX wrapping to 0). Assumes sequence IDs won't differ by more
+// than 2^63, which is reasonable for practical systems.
+//
+// Example: If sequence_id wraps from UINT64_MAX to 0, then:
+//   IsSequenceNewer(0, UINT64_MAX) = true  (0 is newer after wrap)
+//   IsSequenceNewer(UINT64_MAX, 0) = false (UINT64_MAX is older before wrap)
+//
+// Note: We use 'inline' here to allow multiple definition but keep external
+// linkage.
+inline bool IsSequenceNewer(uint64_t a, uint64_t b) {
+    // Cast to int64_t to get signed difference, then check if positive.
+    // This correctly handles wrap-around: if a wrapped from UINT64_MAX to 0,
+    // then (int64_t)(a - b) will be positive (assuming gap < 2^63).
+    return static_cast<int64_t>(a - b) > 0;
+}
+
+inline bool IsSequenceOlder(uint64_t a, uint64_t b) {
+    return static_cast<int64_t>(a - b) < 0;
+}
+
+inline bool IsSequenceEqual(uint64_t a, uint64_t b) { return a == b; }
+
+inline bool IsSequenceNewerOrEqual(uint64_t a, uint64_t b) {
+    return a == b || static_cast<int64_t>(a - b) > 0;
+}
+
+inline bool IsSequenceOlderOrEqual(uint64_t a, uint64_t b) {
+    return a == b || static_cast<int64_t>(a - b) < 0;
+}
+
+// Cluster ID validation utilities.
+//
+// cluster_id is used to construct etcd key prefixes (e.g.
+// "/oplog/<cluster_id>/..."). To avoid key-prefix injection / accidental
+// cross-cluster overlap, we restrict the allowed characters to a conservative
+// safe set. We validate the "component" form (without trailing slash). Trailing
+// slashes should be normalized away before validation.
+inline bool IsValidClusterIdComponent(const std::string& cluster_id) {
+    if (cluster_id.empty()) {
+        return false;
+    }
+    if (cluster_id.size() > 128) {
+        return false;
+    }
+    for (unsigned char c : cluster_id) {
+        const bool ok = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
+                        (c >= 'a' && c <= 'z') || c == '_' || c == '-' ||
+                        c == '.';
+        if (!ok) {
+            return false;
+        }
+    }
+    return true;
+}
+static constexpr int64_t DEFAULT_CLIENT_CRASHED_TTL_SEC = 30;
+static constexpr int64_t DEFAULT_DUMMY_CLIENT_LIVE_TTL_SEC = 30;
 static constexpr uint64_t DEFAULT_DEFAULT_KV_LEASE_TTL =
-    5000;  // in milliseconds
+    10000;  // in milliseconds
 static constexpr uint64_t DEFAULT_KV_SOFT_PIN_TTL_MS =
     30 * 60 * 1000;  // 30 minutes
+static constexpr uint64_t DEFAULT_MAX_KV_SOFT_PIN_TTL_MS =
+    24 * 60 * 60 * 1000;  // 24 hours
 static constexpr bool DEFAULT_ALLOW_EVICT_SOFT_PINNED_OBJECTS = true;
 static constexpr double DEFAULT_EVICTION_RATIO = 0.05;
-static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.95;
-static constexpr int64_t ETCD_MASTER_VIEW_LEASE_TTL = 5;          // in seconds
-static constexpr int64_t DEFAULT_DUMMY_CLIENT_LIVE_TTL_SEC = 30;  // in seconds
-static constexpr int64_t DEFAULT_CLIENT_LIVE_TTL_SEC = 10;        // in seconds
-static constexpr int64_t DEFAULT_CLIENT_CRASHED_TTL_SEC = 30;     // in seconds
+static constexpr double DEFAULT_EVICTION_HIGH_WATERMARK_RATIO = 0.90;
+static constexpr double DEFAULT_NOF_EVICTION_RATIO = 0.05;
+static constexpr double DEFAULT_NOF_EVICTION_HIGH_WATERMARK_RATIO = 0.90;
+static constexpr int64_t DEFAULT_MASTER_VIEW_LEASE_TTL_SEC = 5;  // in seconds
+static constexpr int64_t DEFAULT_CLIENT_LIVE_TTL_SEC = 10;       // in seconds
+static constexpr int64_t DEFAULT_NOF_HEARTBEAT_INTERVAL_SEC = 10;
+static constexpr uint32_t DEFAULT_NOF_HEARTBEAT_PROBE_TIMEOUT_MS = 1000;
+static constexpr uint32_t DEFAULT_NOF_HEARTBEAT_FAILURES_THRESHOLD = 3;
+static constexpr uint64_t DEFAULT_SNAPSHOT_INTERVAL_SEC =
+    60 * 10;  // in seconds
+static constexpr uint64_t DEFAULT_SNAPSHOT_CHILD_TIMEOUT_SEC =
+    60 * 5;  // in seconds
+static constexpr uint32_t DEFAULT_SNAPSHOT_RETENTION_COUNT =
+    2;  // Keep 2 recent snapshots by default
+static const std::string DEFAULT_SNAPSHOT_BACKUP_DIR = "";
 constexpr const char* DEFAULT_CLUSTER_ID = "mooncake_cluster";
 static const std::string DEFAULT_CXL_PATH = "/dev/dax0.0";
 static const size_t DEFAULT_CXL_BASE = 0x100000000ULL;
@@ -56,6 +133,47 @@ static constexpr uint64_t DEFAULT_PENDING_TASK_TIMEOUT_SEC =
     300;  // 0 to be no timeout
 static constexpr uint64_t DEFAULT_PROCESSING_TASK_TIMEOUT_SEC =
     300;  // 0 to be no timeout
+static constexpr uint32_t DEFAULT_MAX_RETRY_ATTEMPTS = 10;
+
+/**
+ * @brief Data type classification for objects stored in Mooncake Store.
+ *
+ * This allows the store to track what kind of data each object holds,
+ * enabling future type-aware policies (eviction priority, replication
+ * strategies, etc.). Defaults to UNKNOWN for backward compatibility.
+ */
+enum class ObjectDataType : uint8_t {
+    UNKNOWN = 0,
+    KVCACHE = 1,
+    TENSOR = 2,
+    WEIGHT = 3,
+    SAMPLE = 4,
+    ACTIVATION = 5,
+    GRADIENT = 6,
+    OPTIMIZER_STATE = 7,
+    METADATA = 8,
+    GENERAL = 9,
+    // 10-255 reserved for future types
+};
+
+inline std::ostream& operator<<(std::ostream& os,
+                                const ObjectDataType& type) noexcept {
+    static const std::unordered_map<ObjectDataType, std::string_view>
+        type_strings{{ObjectDataType::UNKNOWN, "UNKNOWN"},
+                     {ObjectDataType::KVCACHE, "KVCACHE"},
+                     {ObjectDataType::TENSOR, "TENSOR"},
+                     {ObjectDataType::WEIGHT, "WEIGHT"},
+                     {ObjectDataType::SAMPLE, "SAMPLE"},
+                     {ObjectDataType::ACTIVATION, "ACTIVATION"},
+                     {ObjectDataType::GRADIENT, "GRADIENT"},
+                     {ObjectDataType::OPTIMIZER_STATE, "OPTIMIZER_STATE"},
+                     {ObjectDataType::METADATA, "METADATA"},
+                     {ObjectDataType::GENERAL, "GENERAL"}};
+
+    auto it = type_strings.find(type);
+    os << (it != type_strings.end() ? it->second : "UNKNOWN");
+    return os;
+}
 
 // Forward declarations
 class BufferAllocatorBase;
@@ -85,21 +203,83 @@ using ViewVersionId = int64_t;
 using EtcdLeaseId = int64_t;
 #endif
 
-/**
- * @brief Election backend type for leader election in HA mode.
- */
-enum class ElectionBackend { ETCD, REDIS };
-
 using UUID = std::pair<uint64_t, uint64_t>;
 
 using SerializedByte = uint8_t;  // Used as basic unit of serialized data
 static_assert(sizeof(SerializedByte) == 1,
               "SerializedByte must be exactly 1 byte in size");
 
+// Configuration dictionary type for setup_internal
+using ConfigDict = std::unordered_map<std::string, std::string>;
+
+// Store client configuration keys
+constexpr const char* CONFIG_KEY_LOCAL_HOSTNAME = "local_hostname";
+constexpr const char* CONFIG_KEY_METADATA_SERVER = "metadata_server";
+constexpr const char* CONFIG_KEY_GLOBAL_SEGMENT_SIZE = "global_segment_size";
+constexpr const char* CONFIG_KEY_LOCAL_BUFFER_SIZE = "local_buffer_size";
+constexpr const char* CONFIG_KEY_PROTOCOL = "protocol";
+constexpr const char* CONFIG_KEY_RDMA_DEVICES = "rdma_devices";
+constexpr const char* CONFIG_KEY_MASTER_SERVER_ADDR = "master_server_addr";
+constexpr const char* CONFIG_KEY_IPC_SOCKET_PATH = "ipc_socket_path";
+constexpr const char* CONFIG_KEY_TENANT_ID = "tenant_id";
+constexpr const char* CONFIG_KEY_ENABLE_CLIENT_HTTP_SERVER =
+    "enable_client_http_server";
+constexpr const char* CONFIG_KEY_CLIENT_HTTP_PORT = "client_http_port";
+
+// Store client configuration defaults
+static constexpr size_t DEFAULT_GLOBAL_SEGMENT_SIZE = 1024 * 1024 * 16;  // 16MB
+static constexpr size_t DEFAULT_LOCAL_BUFFER_SIZE = 1024 * 1024 * 16;    // 16MB
+constexpr const char* DEFAULT_PROTOCOL = "tcp";
+constexpr const char* DEFAULT_MASTER_SERVER_ADDR = "127.0.0.1:50051";
+static constexpr int DEFAULT_CLIENT_HTTP_PORT = 9300;
+
+struct OffloadTaskItem {
+    std::string tenant_id;
+    std::string key;
+    int64_t size;
+
+    bool operator==(const OffloadTaskItem& other) const {
+        return tenant_id == other.tenant_id && key == other.key &&
+               size == other.size;
+    }
+};
+YLT_REFL(OffloadTaskItem, tenant_id, key, size);
+
+struct PromotionTaskItem {
+    std::string tenant_id;
+    std::string key;
+    int64_t size;
+
+    bool operator==(const PromotionTaskItem& other) const {
+        return tenant_id == other.tenant_id && key == other.key &&
+               size == other.size;
+    }
+};
+YLT_REFL(PromotionTaskItem, tenant_id, key, size);
+
+// Store client configuration validation limits
+static constexpr size_t MIN_SEGMENT_SIZE = 1024;                          // 1KB
+static constexpr size_t MAX_SEGMENT_SIZE = 1024ULL * 1024 * 1024 * 1024;  // 1TB
+
 inline std::ostream& operator<<(std::ostream& os, const UUID& uuid) noexcept {
     os << uuid.first << "-" << uuid.second;
     return os;
 }
+
+/**
+ * @brief Convert UUID to string representation
+ * @param uuid The UUID to convert
+ * @return String representation of the UUID in format "first-second"
+ */
+std::string UuidToString(const UUID& uuid);
+
+/**
+ * @brief Convert string representation back to UUID
+ * @param str String representation of UUID in format "first-second"
+ * @param uuid Output parameter for the parsed UUID
+ * @return true if parsing succeeded, false otherwise
+ */
+bool StringToUuid(const std::string& str, UUID& uuid);
 
 UUID generate_uuid();
 
@@ -107,9 +287,9 @@ UUID generate_uuid();
  * @brief Error codes for various operations in the system
  */
 enum class ErrorCode : int32_t {
-    OK = 0,                ///< Operation successful.
-    INTERNAL_ERROR = -1,   ///< Internal error occurred.
-    NOT_IMPLEMENTED = -2,  ///< Not implemented.
+    OK = 0,               ///< Operation successful.
+    INTERNAL_ERROR = -1,  ///< Internal error occurred.
+    NOT_IMPLEMENTED = -2, ///< Not implemented.
 
     // Buffer allocation errors (Range: -20 to -99)
     BUFFER_OVERFLOW = -10,  ///< Insufficient buffer space.
@@ -146,12 +326,12 @@ enum class ErrorCode : int32_t {
         -602,  ///< Non-contiguous buffer not supported in forward transfer
                ///< mode.
 
-    // Engine operation errors (Range: -700 to -711)
+    // Engine operation errors (Range: -700 to -799)
     INVALID_WRITE = -700,    ///< Invalid write operation.
     INVALID_READ = -701,     ///< Invalid read operation.
     INVALID_REPLICA = -702,  ///< Invalid replica operation.
 
-    // Object errors (Range: -703 to -750)
+    // Object errors (Range: -703 to -712)
     REPLICA_IS_NOT_READY = -703,   ///< Replica is not ready.
     OBJECT_NOT_FOUND = -704,       ///< Object not found.
     OBJECT_ALREADY_EXISTS = -705,  ///< Object already exists.
@@ -164,27 +344,41 @@ enum class ErrorCode : int32_t {
     REPLICA_NOT_FOUND = -710,       ///< Replica not found.
     REPLICA_ALREADY_EXISTS = -711,  ///< Replica already exists.
     REPLICA_IS_GONE = -712,         ///< Replica existed once, but is gone now.
-    REPLICA_NUM_EXCEEDED = -713,    ///< Replica number exceeded.
+    REPLICA_NOT_IN_LOCAL_MEMORY =
+        -713,  ///< Replica does not reside in current node memory.
+    OBJECT_REPLICA_BUSY = -714,  ///< Object replicas have non-zero refcnt.
+    REPLICA_NUM_EXCEEDED = -715,    ///< Replica number exceeded.
     REPLICA_IS_PROCESSING =
-        -714,  ///< Replica is processing an in-flight write.
+        -716,  ///< Replica is processing an in-flight write.
 
     // Transfer errors (Range: -800 to -899)
     TRANSFER_FAIL = -800,  ///< Transfer operation failed.
+    /// Store checksum verification failed.
+    CHECKSUM_MISMATCH = -801,
 
     // RPC errors (Range: -900 to -999)
-    RPC_FAIL = -900,  ///< RPC operation failed.
+    RPC_FAIL = -900,     ///< RPC operation failed.
+    RPC_TIMEOUT = -901,  ///< RPC call timed out (client-side deadline hit).
 
     // High availability errors (Range: -1000 to -1099)
     ETCD_OPERATION_ERROR = -1000,   ///< etcd operation failed.
     ETCD_KEY_NOT_EXIST = -1001,     ///< key not found in etcd.
     ETCD_TRANSACTION_FAIL = -1002,  ///< etcd transaction failed.
     ETCD_CTX_CANCELLED = -1003,     ///< etcd context cancelled.
-    OPLOG_ENTRY_NOT_FOUND = -1004,  ///< OpLog entry not found.
-    OPLOG_TRIMMED = -1005,          ///< Requested OpLog range was trimmed.
+    OPLOG_ENTRY_NOT_FOUND =
+        -1004,  ///< OpLog entry not found (backend-agnostic).
+    K8S_LEASE_OPERATION_ERROR = -1005,  ///< K8s Lease operation failed.
+    K8S_LEASE_NOT_FOUND = -1006,        ///< K8s Lease not found.
+    INCOMPLETE_OPLOG_CATCH_UP =
+        -1007,  ///< Promotion catch-up could not prove all durable OpLog
+                ///< entries were applied, or unresolved skipped/missing
+                ///< gaps remain after final catch-up + second gap resolution.
+    OPLOG_TRIMMED = -1008,  ///< Requested OpLog range was trimmed.
     UNAVAILABLE_IN_CURRENT_STATUS =
         -1010,  ///< Request cannot be done in current status.
     UNAVAILABLE_IN_CURRENT_MODE =
-        -1011,  ///< Request cannot be done in current mode.
+        -1011,              ///< Request cannot be done in current mode.
+    NOT_SUPPORTED = -1012,  ///< Operation is not supported in current mode.
 
     // FILE errors (Range: -1100 to -1199)
     FILE_NOT_FOUND = -1100,       ///< File not found.
@@ -202,20 +396,33 @@ enum class ErrorCode : int32_t {
     UNABLE_OFFLOAD = -1300,     ///< The offload functionality is not enabled
     UNABLE_OFFLOADING = -1301,  ///< Unable offloading.
 
-    // Task errors (Range: -1400 to -1499)
+    SERIALIZE_UNSUPPORTED = -1500,  ///< Serialization unsupported.
+    SERIALIZE_FAIL = -1501,         ///< Serialization failed.
+    DESERIALIZE_FAIL = -1502,       ///< Deserialization failed.
+    PERSISTENT_FAIL = -1503,        ///< Persistent failed.
+    EMPTY_REPLICAS = -1504,  ///< Empty replicas.
+    TIER_NOT_FOUND = -1505,  ///< Tier not found.
+    DATA_COPY_FAILED = -1506,  ///< Data copy failed.
+    // Task and job errors (Range: -1400 to -1499)
     TASK_NOT_FOUND = -1400,  ///< Task not found.
     TASK_PENDING_LIMIT_EXCEEDED =
-        -1401,  ///< Total pending tasks exceed the limit.
+        -1401,              ///< Total pending tasks exceed the limit.
+    JOB_NOT_FOUND = -1402,  ///< Job not found.
 
-    // Tiered backend errors (Range: -1500 to -1599)
-    EMPTY_REPLICAS = -1500,
-    TIER_NOT_FOUND = -1501,
-    DATA_COPY_FAILED = -1502,
-
-    // Store errors (Range: -1600 to -1699)
-    SHUTTING_DOWN = -1600,  ///< Store is shutting down, rejecting new requests.
-    ASYNC_ENQUEUE_FAILED = -1601,  ///< Async metadata notifier enqueue failed
+    // DFS errors (Range: -1600 to -1699)
+    DFS_NETWORK_TIMEOUT = -1600,      ///< DFS network timeout.
+    DFS_SERVICE_UNAVAILABLE = -1601,  ///< DFS service unavailable.
+    DFS_QUOTA_EXCEEDED = -1602,       ///< DFS quota exceeded.
+    DFS_PERMISSION_DENIED = -1603,    ///< DFS permission denied.
+    DFS_STALE_HANDLE = -1604,         ///< DFS file handle expired.
+    DFS_PARTIAL_WRITE = -1605,        ///< DFS partial write success.
+    SHUTTING_DOWN = -1606,  ///< Store is shutting down, rejecting new requests.
+    ASYNC_ENQUEUE_FAILED = -1607,  ///< Async metadata notifier enqueue failed
                                    ///< (queue full/stopped).
+    INACCESSIBLE_MASTER = -1608,  ///< Master is inaccessible.
+    TENANT_QUOTA_EXCEEDED = -1700,    ///< Tenant memory quota exceeded.
+    TENANT_NOT_REGISTERED = -1701,    ///< Tenant has no quota policy.
+    TENANT_NOT_EMPTY = -1702,         ///< Tenant still owns objects or quota.
 };
 
 int32_t toInt(ErrorCode errorCode) noexcept;
@@ -228,35 +435,16 @@ inline std::ostream& operator<<(std::ostream& os,
     return os << toString(errorCode);
 }
 
-// Error codes that mean "the object/replica already exists", i.e. an
-// idempotent rewrite whose failure is surfaced as success end-to-end.
-inline bool IsAlreadyExistsError(ErrorCode err) {
-    return err == ErrorCode::REPLICA_NUM_EXCEEDED ||
-           err == ErrorCode::REPLICA_ALREADY_EXISTS ||
-           err == ErrorCode::OBJECT_ALREADY_EXISTS;
-}
+struct SerializationError {
+    ErrorCode code;
+    std::string message;
 
-enum class DeploymentMode {
-    UNKNOWN = -1,
-    CENTRALIZATION = 0,
-    P2P,
+    SerializationError(ErrorCode c, const std::string& msg)
+        : code(c), message(msg) {}
+
+    // Construct from ErrorCode
+    explicit SerializationError(ErrorCode c) : code(c), message(toString(c)) {}
 };
-
-inline std::ostream& operator<<(std::ostream& os,
-                                const DeploymentMode& mode) noexcept {
-    switch (mode) {
-        case DeploymentMode::CENTRALIZATION:
-            os << "CENTRALIZATION";
-            break;
-        case DeploymentMode::P2P:
-            os << "P2P";
-            break;
-        default:
-            os << "UNKNOWN";
-            break;
-    }
-    return os;
-}
 
 /**
  * @brief Represents a contiguous memory region
@@ -270,21 +458,8 @@ const static uint64_t kMinSliceSize = facebook::cachelib::Slab::kMinAllocSize;
 const static uint64_t kMaxSliceSize =
     facebook::cachelib::Slab::kSize - 16;  // should be lower than limit
 
-struct CentralizedSegmentExtraData {
-    uintptr_t base{0};
-    std::string te_endpoint;
-    std::string protocol;
-
-    YLT_REFL(CentralizedSegmentExtraData, base, te_endpoint, protocol);
-};
-
-/**
- * @enum MemoryType
- * @brief Defines the physical storage medium type for a cache tier.
- */
 enum class MemoryType { DRAM, NVME, ASCEND_NPU, UNKNOWN };
-
-static inline std::string MemoryTypeToString(MemoryType type) {
+inline std::string MemoryTypeToString(MemoryType type) {
     switch (type) {
         case MemoryType::DRAM:
             return "DRAM";
@@ -302,75 +477,67 @@ struct P2PSegmentExtraData {
     std::vector<std::string> tags;
     MemoryType memory_type = MemoryType::DRAM;
     size_t usage = 0;
-    YLT_REFL(P2PSegmentExtraData, priority, tags, memory_type, usage);
 };
+YLT_REFL(P2PSegmentExtraData, priority, tags, memory_type, usage);
 
 /**
- * @brief Represents a contiguous storage region
+ * @brief Represents a contiguous memory region
  */
 struct Segment {
     UUID id{0, 0};
     std::string name{};  // Logical segment name used for preferred allocation
+    uintptr_t base{0};
     size_t size{0};
-
-    // Polymorphic extra data
-    std::variant<std::monostate, CentralizedSegmentExtraData,
-                 P2PSegmentExtraData>
-        extra;
-
-    // Helper to check type
-    bool IsP2PSegment() const {
-        return std::holds_alternative<P2PSegmentExtraData>(extra);
-    }
-
-    bool IsCentralizedSegment() const {
-        return std::holds_alternative<CentralizedSegmentExtraData>(extra);
-    }
-
-    bool IsEmpty() const {
-        return std::holds_alternative<std::monostate>(extra);
-    }
-
-    CentralizedSegmentExtraData& GetCentralizedExtra() {
-        if (IsP2PSegment()) {
-            throw std::runtime_error(
-                "Segment already holds P2PSegmentExtraData; cannot assign "
-                "CentralizedSegmentExtraData");
-        }
-        if (IsEmpty()) extra = CentralizedSegmentExtraData{};
-        return std::get<CentralizedSegmentExtraData>(extra);
-    }
-    const CentralizedSegmentExtraData& GetCentralizedExtra() const {
-        return std::get<CentralizedSegmentExtraData>(extra);
-    }
-
+    // TE p2p endpoint (ip:port) for transport-only addressing
+    std::string te_endpoint{};
+    std::string protocol;
+    std::string host_id{};
+    std::optional<P2PSegmentExtraData> p2p_extra;
+    Segment() = default;
+    bool IsP2PSegment() const { return p2p_extra.has_value(); }
+    const P2PSegmentExtraData& GetP2PExtra() const { return p2p_extra.value(); }
     P2PSegmentExtraData& GetP2PExtra() {
-        if (IsCentralizedSegment()) {
-            throw std::runtime_error(
-                "Segment already holds CentralizedSegmentExtraData; cannot "
-                "assign P2PSegmentExtraData");
-        }
-        if (IsEmpty()) extra = P2PSegmentExtraData{};
-        return std::get<P2PSegmentExtraData>(extra);
+        if (!p2p_extra.has_value()) p2p_extra = P2PSegmentExtraData{};
+        return p2p_extra.value();
     }
-    const P2PSegmentExtraData& GetP2PExtra() const {
-        return std::get<P2PSegmentExtraData>(extra);
-    }
+    bool IsEmpty() const { return !p2p_extra.has_value(); }
 };
-YLT_REFL(Segment, id, name, size, extra);
+YLT_REFL(Segment, id, name, base, size, te_endpoint, protocol, host_id,
+         p2p_extra);
 
 /**
- * @brief Client status from the master's perspective.
- *
- * State machine: HEALTH -> DISCONNECTION (heartbeat timeout)
- *                DISCONNECTION -> HEALTH (heartbeat recovered)
- *                DISCONNECTION -> CRASHED (long-term timeout)
+ * @brief Allocation strategy type for segment allocation
+ */
+enum class AllocationStrategyType {
+    RANDOM = 0,            // Pure random allocation
+    FREE_RATIO_FIRST,      // Free-ratio-first allocation
+    CXL,                   // CXL-specific allocation
+    SSD_FREE_RATIO_FIRST,  // SSD free-ratio-first allocation
+    LOCAL_FIRST            // Prefer local host before ordered remote fallback
+};
+
+/**
+ * @brief Represents a contiguous NoF ssd region
+ */
+struct NoFSegment {
+    UUID id{0, 0};
+    std::string name{};  // Logical segment name used for preferred allocation
+    uintptr_t base{0};
+    size_t size{0};
+    // TE p2p endpoint (ip:port) for transport-only addressing
+    std::string te_endpoint{};
+    NoFSegment() = default;
+};
+YLT_REFL(NoFSegment, id, name, base, size, te_endpoint);
+
+/**
+ * @brief Client status from the master's perspective
  */
 enum class ClientStatus {
-    UNDEFINED = 0,  // Client does not exist
-    HEALTH,         // Normal operation
-    DISCONNECTION,  // Heartbeat lost, waiting for recovery
-    CRASHED,        // Terminal state, all metadata will be cleaned up
+    UNDEFINED = 0,  // Uninitialized
+    OK,             // Client is alive, no need to remount for now
+    NEED_REMOUNT,   // Ping ttl expired, or the first time connect to master,
+                    // so need to remount
 };
 
 /**
@@ -380,116 +547,13 @@ inline std::ostream& operator<<(std::ostream& os,
                                 const ClientStatus& status) noexcept {
     static const std::unordered_map<ClientStatus, std::string_view>
         status_strings{{ClientStatus::UNDEFINED, "UNDEFINED"},
-                       {ClientStatus::HEALTH, "HEALTH"},
-                       {ClientStatus::DISCONNECTION, "DISCONNECTION"},
-                       {ClientStatus::CRASHED, "CRASHED"}};
+                       {ClientStatus::OK, "OK"},
+                       {ClientStatus::NEED_REMOUNT, "NEED_REMOUNT"}};
 
     os << (status_strings.count(status) ? status_strings.at(status)
                                         : "UNKNOWN");
     return os;
 }
-
-/**
- * @enum DummyClientStatus
- * @brief Heartbeat status reported by RealClient back to a DummyClient over the
- *        dummy ping RPC.
- */
-enum class DummyClientStatus {
-    HEALTH = 0,     // Normal operation
-    DISCONNECTION,  // RealClient dropped this client's shm; dummy must
-                    // re-register
-};
-
-/**
- * @brief Stream operator for DummyClientStatus
- */
-inline std::ostream& operator<<(std::ostream& os,
-                                const DummyClientStatus& status) noexcept {
-    static const std::unordered_map<DummyClientStatus, std::string_view>
-        status_strings{{DummyClientStatus::HEALTH, "HEALTH"},
-                       {DummyClientStatus::DISCONNECTION, "DISCONNECTION"}};
-
-    os << (status_strings.count(status) ? status_strings.at(status)
-                                        : "UNKNOWN");
-    return os;
-}
-
-/**
- * @enum HAClientState
- * @brief Client-side HA state for Master crash recovery.
- *        FULL: normal operation
- *        DEGRADED: Master unreachable, local-only mode (still heartbeat probing
- *                  and probing for recovery)
- *        SYNCING: re-syncing metadata to restarted Master
- *        LOCAL_ONLY: intentionally unregistered, stable local-only service
- *                    (NO heartbeat probing, NO auto re-registration)
- */
-enum class HAClientState : int32_t {
-    FULL = 0,
-    DEGRADED = 1,
-    SYNCING = 2,
-    LOCAL_ONLY = 3,
-};
-
-inline std::ostream& operator<<(std::ostream& os,
-                                const HAClientState& state) noexcept {
-    switch (state) {
-        case HAClientState::FULL:
-            os << "FULL";
-            break;
-        case HAClientState::DEGRADED:
-            os << "DEGRADED";
-            break;
-        case HAClientState::SYNCING:
-            os << "SYNCING";
-            break;
-        case HAClientState::LOCAL_ONLY:
-            os << "LOCAL_ONLY";
-            break;
-        default:
-            os << "UNKNOWN";
-            break;
-    }
-    return os;
-}
-
-inline const char* toString(HAClientState state) noexcept {
-    switch (state) {
-        case HAClientState::FULL:
-            return "FULL";
-        case HAClientState::DEGRADED:
-            return "DEGRADED";
-        case HAClientState::SYNCING:
-            return "SYNCING";
-        case HAClientState::LOCAL_ONLY:
-            return "LOCAL_ONLY";
-        default:
-            return "UNKNOWN";
-    }
-}
-
-/**
- * @enum HAEvent
- * @brief Events that drive client-side HA state transitions.
- */
-enum class HAEvent {
-    MASTER_UNREACHABLE,  // Consecutive heartbeat failures exceeded threshold
-    MASTER_RECONNECTED,  // Master connection restored. Triggered on:
-                         // 1. RegisterClient succeeded (Master restarted or
-                         //    client re-registered after reconnection)
-                         // 2. Heartbeat recovered with HEALTH status after
-                         //    a prior MASTER_UNREACHABLE event
-};
-
-/**
- * @struct ReplicaLocation
- * @brief Describes a single replica's key, tier and size.
- */
-struct ReplicaLocation {
-    std::string key;
-    UUID tier_id;
-    size_t size;
-};
 
 enum class BufferAllocatorType {
     CACHELIB = 0,  // CachelibBufferAllocator
@@ -519,110 +583,77 @@ struct StorageObjectMetadata {
              transport_endpoint);
 };
 
-/**
- * @brief object iteration strategy in for-each interface
- */
-enum class ObjectIterateStrategy {
-    // Iterate over objects in order
-    ORDERED = 0,
+inline bool IsAlreadyExistsError(ErrorCode code) {
+    return code == ErrorCode::REPLICA_NUM_EXCEEDED ||
+           code == ErrorCode::REPLICA_ALREADY_EXISTS ||
+           code == ErrorCode::OBJECT_ALREADY_EXISTS;
+}
 
-    // Choose a random object
-    RANDOM = 1,
-
-    // Choose a object with the most available capacity
-    CAPACITY_PRIORITY = 2,
-};
-
-inline std::ostream& operator<<(
-    std::ostream& os, const ObjectIterateStrategy& strategy) noexcept {
-    static const std::unordered_map<ObjectIterateStrategy, std::string_view>
-        strategy_strings{
-            {ObjectIterateStrategy::ORDERED, "ORDERED"},
-            {ObjectIterateStrategy::RANDOM, "RANDOM"},
-            {ObjectIterateStrategy::CAPACITY_PRIORITY, "CAPACITY_PRIORITY"},
-        };
-
-    os << (strategy_strings.count(strategy) ? strategy_strings.at(strategy)
-                                            : "UNKNOWN");
+enum class DeploymentMode { UNKNOWN = -1, CENTRALIZATION = 0, P2P };
+inline std::ostream& operator<<(std::ostream& os, const DeploymentMode& mode) noexcept {
+    static const std::unordered_map<DeploymentMode, std::string_view> mode_strings{
+        {DeploymentMode::UNKNOWN, "UNKNOWN"},
+        {DeploymentMode::CENTRALIZATION, "Centralization"},
+        {DeploymentMode::P2P, "P2P"}};
+    os << (mode_strings.count(mode) ? mode_strings.at(mode) : "UNKNOWN");
     return os;
 }
 
-// Who initiates the cross-node transfer for the data plane: REVERSE matches the
-// historical target-initiated path and is the conventional default when unset
-// optional or client-level config omits an explicit override.
-enum class TransferDirectionMode : uint8_t {
-    REVERSE = 0,
-    FORWARD = 1,
-};
-
-// Logging only: prints REVERSE / FORWARD / UNKNOWN for invalid numeric values.
-inline std::ostream& operator<<(std::ostream& os,
-                                const TransferDirectionMode& mode) noexcept {
-    switch (mode) {
-        case TransferDirectionMode::REVERSE:
-            os << "REVERSE";
-            break;
-        case TransferDirectionMode::FORWARD:
-            os << "FORWARD";
-            break;
-        default:
-            os << "UNKNOWN";
-            break;
-    }
+enum class P2PClientStatus { UNDEFINED = 0, HEALTH, DISCONNECTION, CRASHED };
+inline std::ostream& operator<<(std::ostream& os, const P2PClientStatus& status) noexcept {
+    static const std::unordered_map<P2PClientStatus, std::string_view> status_strings{
+        {P2PClientStatus::UNDEFINED, "UNDEFINED"},
+        {P2PClientStatus::HEALTH, "HEALTH"},
+        {P2PClientStatus::DISCONNECTION, "DISCONNECTION"},
+        {P2PClientStatus::CRASHED, "CRASHED"}};
+    os << (status_strings.count(status) ? status_strings.at(status) : "UNKNOWN");
     return os;
 }
 
-inline bool IsValidClusterIdComponent(const std::string& cluster_id) {
-    if (cluster_id.empty()) {
-        return false;
+enum class HAClientState { FULL = 0, DEGRADED = 1, SYNCING = 2, LOCAL_ONLY = 3 };
+inline std::ostream& operator<<(std::ostream& os, const HAClientState& state) noexcept {
+    static const std::unordered_map<HAClientState, std::string_view> state_strings{
+        {HAClientState::FULL, "FULL"},
+        {HAClientState::DEGRADED, "DEGRADED"},
+        {HAClientState::SYNCING, "SYNCING"},
+        {HAClientState::LOCAL_ONLY, "LOCAL_ONLY"}};
+    os << (state_strings.count(state) ? state_strings.at(state) : "UNKNOWN");
+    return os;
+}
+inline std::string toString(HAClientState state) {
+    switch (state) {
+        case HAClientState::FULL: return "FULL";
+        case HAClientState::DEGRADED: return "DEGRADED";
+        case HAClientState::SYNCING: return "SYNCING";
+        case HAClientState::LOCAL_ONLY: return "LOCAL_ONLY";
+        default: return "UNKNOWN";
     }
-    if (cluster_id.size() > 128) {
-        return false;
-    }
-    for (unsigned char c : cluster_id) {
-        const bool ok = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') ||
-                        (c >= 'a' && c <= 'z') || c == '_' || c == '-' ||
-                        c == '.';
-        if (!ok) {
-            return false;
-        }
-    }
-    return true;
 }
 
-// Sequence ID comparison utilities for OpLog and HA components.
-// These use signed difference to handle uint64_t wrap-around correctly:
-//   IsSequenceNewer(0, UINT64_MAX) = true  (0 is newer after wrap)
-//   IsSequenceNewer(UINT64_MAX, 0) = false (UINT64_MAX is older before wrap)
-//
-// Assumes gap < 2^63, which is always true for sequence IDs in practice.
-inline bool IsSequenceNewer(uint64_t a, uint64_t b) {
-    return static_cast<int64_t>(a - b) > 0;
+enum class HAEvent { MASTER_UNREACHABLE, MASTER_RECONNECTED };
+
+enum class ObjectIterateStrategy { ORDERED = 0, RANDOM = 1, CAPACITY_PRIORITY = 2 };
+inline std::ostream& operator<<(std::ostream& os, const ObjectIterateStrategy& strategy) noexcept {
+    static const std::unordered_map<ObjectIterateStrategy, std::string_view> strategy_strings{
+        {ObjectIterateStrategy::ORDERED, "ORDERED"},
+        {ObjectIterateStrategy::RANDOM, "RANDOM"},
+        {ObjectIterateStrategy::CAPACITY_PRIORITY, "CAPACITY_PRIORITY"}};
+    os << (strategy_strings.count(strategy) ? strategy_strings.at(strategy) : "UNKNOWN");
+    return os;
 }
 
-inline bool IsSequenceOlder(uint64_t a, uint64_t b) {
-    return static_cast<int64_t>(a - b) < 0;
+struct ReplicaLocation {
+    std::string key;
+    UUID tier_id;
+    size_t size;
+};
+
+enum class TransferDirectionMode { REVERSE = 0, FORWARD = 1 };
+inline std::ostream& operator<<(std::ostream& os, const TransferDirectionMode& mode) noexcept {
+    os << (mode == TransferDirectionMode::REVERSE ? "REVERSE" : "FORWARD");
+    return os;
 }
 
-inline bool IsSequenceEqual(uint64_t a, uint64_t b) { return a == b; }
-
-inline bool IsSequenceNewerOrEqual(uint64_t a, uint64_t b) {
-    return a == b || static_cast<int64_t>(a - b) > 0;
-}
-
-inline bool IsSequenceOlderOrEqual(uint64_t a, uint64_t b) {
-    return a == b || static_cast<int64_t>(a - b) < 0;
-}
+enum class ElectionBackend { ETCD, REDIS };
 
 }  // namespace mooncake
-
-namespace std {
-template <>
-struct hash<mooncake::UUID> {
-    std::size_t operator()(const mooncake::UUID& k) const {
-        std::size_t h1 = hash<uint64_t>{}(k.first);
-        std::size_t h2 = hash<uint64_t>{}(k.second);
-        return h1 ^ (h2 << 1);
-    }
-};
-}  // namespace std

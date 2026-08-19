@@ -32,9 +32,8 @@ class ClientTestWrapper {
      * @param client The client instance.
      * @param allocator Allocate slice memory for get and put operations.
      */
-    ClientTestWrapper(std::shared_ptr<ClientService> client,
-                      std::shared_ptr<SimpleAllocator> allocator,
-                      bool is_p2p = false);
+    ClientTestWrapper(std::shared_ptr<Client> client,
+                      std::shared_ptr<SimpleAllocator> allocator);
     ~ClientTestWrapper();
 
     // The client wrapper is not copyable.
@@ -51,10 +50,6 @@ class ClientTestWrapper {
      * @param master_server_entry The master server entry.
      * @param local_buffer_size The local buffer size that will be used for get
      * and put operations.
-     * @param redis_cluster_id Optional Redis HA cluster ID for tests using
-     * redis:// master discovery.
-     * @param enable_http_server Whether to start the client's HTTP metrics
-     * server.
      * @return The client wrapper.
      */
     static std::optional<std::shared_ptr<ClientTestWrapper>>
@@ -63,14 +58,7 @@ class ClientTestWrapper {
                         const std::string& protocol,
                         const std::string& device_name,
                         const std::string& master_server_entry,
-                        size_t local_buffer_size = 1024 * 1024 * 128,
-                        const std::string& redis_cluster_id = "",
-                        bool enable_http_server = true,
-                        const std::string& deployment_mode = "Centralization",
-                        const std::string& p2p_local_transfer_mode = "memcpy",
-                        uint16_t p2p_client_rpc_port = 0,
-                        const std::string& redis_username = "",
-                        const std::string& redis_password = "");
+                        size_t local_buffer_size = 1024 * 1024 * 128);
 
     // Mount a segment. The buffer will be used to unmount the segment.
     ErrorCode Mount(const size_t size, void*& buffer);
@@ -81,6 +69,26 @@ class ClientTestWrapper {
     ErrorCode Get(const std::string& key, std::string& value);
     ErrorCode Put(const std::string& key, const std::string& value);
     ErrorCode Delete(const std::string& key);
+    ErrorCode BatchSmoke(const std::string& key_prefix);
+
+    // Returns true if the key has a DISK replica
+    // (master-assigned, written by PutToLocalFile).
+    bool HasDiskReplica(const std::string& key);
+
+    // Returns true if the key has a LOCAL_DISK replica
+    // (created via the FileStorage offload path).
+    bool HasLocalDiskReplica(const std::string& key);
+
+    // Returns true if the key has a MEMORY replica.
+    bool HasMemoryReplica(const std::string& key);
+
+    // Like Get(), but takes the object size explicitly instead
+    // of extracting it from a memory descriptor. This allows
+    // reading from disk-only replicas where no memory
+    // descriptor exists. Uses Client::Get(key, slices) which
+    // handles routing to memory or disk internally.
+    ErrorCode GetWithExpectedSize(const std::string& key, size_t expected_size,
+                                  std::string& value);
 
    private:
     struct SliceGuard {
@@ -102,8 +110,7 @@ class ClientTestWrapper {
     };
 
     // The client instance.
-    std::shared_ptr<ClientService> client_;
-    bool is_p2p_{false};
+    std::shared_ptr<Client> client_;
     // The segments that are mounted by the client.
     std::unordered_map<uintptr_t, SegmentInfo> segments_;
     // Manage the memory allocation for get and put operations.

@@ -1,7 +1,7 @@
 import unittest
 import os
 import time
-from mooncake.store import MooncakeDistributedStore, ReplicateConfig
+from mooncake.store import MooncakeDistributedStore, ReplicateConfig, SoftPinAction
 
 # The lease time of the kv object, should be set equal to
 # the master's value.
@@ -94,13 +94,13 @@ class TestDistributedObjectStoreReplication(unittest.TestCase):
         self.assertEqual(self.store.remove(key2), 0)
         
         with self.assertRaises(TypeError):
-            result = self.store.put(key_arg_name_error=key, value=test_data, config=config)
+            self.store.put(key_arg_name_error=key, value=test_data, config=config)
         
         with self.assertRaises(TypeError):
-            result = self.store.put(key=key, value_arg_name_error=test_data, config=config)
+            self.store.put(key=key, value_arg_name_error=test_data, config=config)
             
         with self.assertRaises(TypeError):
-            result = self.store.put(key=key, value=test_data, config_arg_name_error=config)
+            self.store.put(key=key, value=test_data, config_arg_name_error=config)
 
     def test_put_batch_with_config_parameter(self):
         """Test put_batch method with config parameter."""
@@ -173,7 +173,8 @@ class TestDistributedObjectStoreReplication(unittest.TestCase):
         # Test with custom config
         config = ReplicateConfig()
         config.replica_num = self.max_replicate_num
-        config.with_soft_pin = False
+        config.soft_pin_action = SoftPinAction.PRESERVE
+        config.with_hard_pin = False
         
         key2 = "test_put_from_config_key2"
         result = self.store.put_from(key=key2, buffer_ptr=buffer_ptr, size=len(test_data), config=config)
@@ -243,7 +244,8 @@ class TestDistributedObjectStoreReplication(unittest.TestCase):
         # Test with custom config
         config = ReplicateConfig()
         config.replica_num = self.max_replicate_num
-        config.with_soft_pin = False
+        config.soft_pin_action = SoftPinAction.PRESERVE
+        config.with_hard_pin = False
 
         keys2 = ["test_batch_put_from_config_key4", "test_batch_put_from_config_key5", "test_batch_put_from_config_key6"]
         results = self.store.batch_put_from(keys=keys2, buffer_ptrs=buffer_ptrs, sizes=buffer_sizes, config=config)

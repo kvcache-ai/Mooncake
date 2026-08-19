@@ -3,7 +3,7 @@ add_custom_command(
     COMMAND bash -c "go mod tidy" && bash -c "go build -buildmode=c-shared -o ${CMAKE_CURRENT_BINARY_DIR}/libetcd_wrapper.so etcd_wrapper.go" && cp ${CMAKE_CURRENT_BINARY_DIR}/libetcd_wrapper.h ${CMAKE_CURRENT_SOURCE_DIR}
     WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}
     COMMENT "Building Go shared library"
-    DEPENDS etcd_wrapper.go
+    DEPENDS etcd_wrapper.go go.mod go.sum build.sh
 )
 
 set(ETCD_WRAPPER_INCLUDE ${CMAKE_CURRENT_BINARY_DIR}/libetcd_wrapper.h)

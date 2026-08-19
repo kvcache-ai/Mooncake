@@ -17,7 +17,6 @@
 #pragma once
 
 #include <atomic>
-#include <array>
 #include <mutex>
 #include <thread>
 #include <unordered_map>

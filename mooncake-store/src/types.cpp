@@ -10,14 +10,18 @@ const std::string& toString(ErrorCode errorCode) noexcept {
     static const std::unordered_map<ErrorCode, std::string> errorCodeMap = {
         {ErrorCode::OK, "OK"},
         {ErrorCode::INTERNAL_ERROR, "INTERNAL_ERROR"},
+        {ErrorCode::NOT_IMPLEMENTED, "NOT_IMPLEMENTED"},
         {ErrorCode::BUFFER_OVERFLOW, "BUFFER_OVERFLOW"},
         {ErrorCode::SHARD_INDEX_OUT_OF_RANGE, "SHARD_INDEX_OUT_OF_RANGE"},
         {ErrorCode::SEGMENT_NOT_FOUND, "SEGMENT_NOT_FOUND"},
         {ErrorCode::SEGMENT_ALREADY_EXISTS, "SEGMENT_ALREADY_EXISTS"},
         {ErrorCode::CLIENT_NOT_FOUND, "CLIENT_NOT_FOUND"},
+        {ErrorCode::CLIENT_ALREADY_EXISTS, "CLIENT_ALREADY_EXISTS"},
+        {ErrorCode::CLIENT_UNHEALTHY, "CLIENT_UNHEALTHY"},
         {ErrorCode::NO_AVAILABLE_CANDIDATE, "NO_AVAILABLE_CANDIDATE"},
         {ErrorCode::NO_AVAILABLE_HANDLE, "NO_AVAILABLE_HANDLE"},
         {ErrorCode::INVALID_VERSION, "INVALID_VERSION"},
+        {ErrorCode::CAS_FAILED, "CAS_FAILED"},
         {ErrorCode::INVALID_KEY, "INVALID_KEY"},
         {ErrorCode::WRITE_FAIL, "WRITE_FAIL"},
         {ErrorCode::INVALID_PARAMS, "INVALID_PARAMS"},
@@ -37,23 +41,28 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::REPLICA_NOT_FOUND, "REPLICA_NOT_FOUND"},
         {ErrorCode::REPLICA_ALREADY_EXISTS, "REPLICA_ALREADY_EXISTS"},
         {ErrorCode::REPLICA_IS_GONE, "REPLICA_IS_GONE"},
-        {ErrorCode::REPLICA_ALREADY_EXISTS, "REPLICA_ALREADY_EXISTS"},
-        {ErrorCode::REPLICA_NOT_FOUND, "REPLICA_NOT_FOUND"},
+        {ErrorCode::REPLICA_NOT_IN_LOCAL_MEMORY,
+         "REPLICA_NOT_IN_LOCAL_MEMORY"},
+        {ErrorCode::OBJECT_REPLICA_BUSY, "OBJECT_REPLICA_BUSY"},
         {ErrorCode::REPLICA_NUM_EXCEEDED, "REPLICA_NUM_EXCEEDED"},
         {ErrorCode::REPLICA_IS_PROCESSING, "REPLICA_IS_PROCESSING"},
         {ErrorCode::TRANSFER_FAIL, "TRANSFER_FAIL"},
+        {ErrorCode::CHECKSUM_MISMATCH, "CHECKSUM_MISMATCH"},
         {ErrorCode::RPC_FAIL, "RPC_FAIL"},
+        {ErrorCode::RPC_TIMEOUT, "RPC_TIMEOUT"},
         {ErrorCode::ETCD_OPERATION_ERROR, "ETCD_OPERATION_ERROR"},
         {ErrorCode::ETCD_KEY_NOT_EXIST, "ETCD_KEY_NOT_EXIST"},
         {ErrorCode::ETCD_TRANSACTION_FAIL, "ETCD_TRANSACTION_FAIL"},
         {ErrorCode::ETCD_CTX_CANCELLED, "ETCD_CTX_CANCELLED"},
         {ErrorCode::OPLOG_ENTRY_NOT_FOUND, "OPLOG_ENTRY_NOT_FOUND"},
+        {ErrorCode::K8S_LEASE_OPERATION_ERROR, "K8S_LEASE_OPERATION_ERROR"},
+        {ErrorCode::K8S_LEASE_NOT_FOUND, "K8S_LEASE_NOT_FOUND"},
+        {ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, "INCOMPLETE_OPLOG_CATCH_UP"},
         {ErrorCode::OPLOG_TRIMMED, "OPLOG_TRIMMED"},
-        {ErrorCode::CLIENT_ALREADY_EXISTS, "CLIENT_ALREADY_EXISTS"},
-        {ErrorCode::CLIENT_UNHEALTHY, "CLIENT_UNHEALTHY"},
         {ErrorCode::UNAVAILABLE_IN_CURRENT_STATUS,
          "UNAVAILABLE_IN_CURRENT_STATUS"},
         {ErrorCode::UNAVAILABLE_IN_CURRENT_MODE, "UNAVAILABLE_IN_CURRENT_MODE"},
+        {ErrorCode::NOT_SUPPORTED, "NOT_SUPPORTED"},
         {ErrorCode::FILE_NOT_FOUND, "FILE_NOT_FOUND"},
         {ErrorCode::FILE_OPEN_FAIL, "FILE_OPEN_FAIL"},
         {ErrorCode::FILE_READ_FAIL, "FILE_READ_FAIL"},
@@ -67,9 +76,28 @@ const std::string& toString(ErrorCode errorCode) noexcept {
         {ErrorCode::KEYS_ULTRA_LIMIT, "KEYS_ULTRA_LIMIT"},
         {ErrorCode::UNABLE_OFFLOAD, "UNABLE_OFFLOAD"},
         {ErrorCode::UNABLE_OFFLOADING, "UNABLE_OFFLOADING"},
+        {ErrorCode::SERIALIZE_UNSUPPORTED, "SERIALIZE_UNSUPPORTED"},
+        {ErrorCode::SERIALIZE_FAIL, "SERIALIZE_FAIL"},
+        {ErrorCode::DESERIALIZE_FAIL, "DESERIALIZE_FAIL"},
+        {ErrorCode::PERSISTENT_FAIL, "PERSISTENT_FAIL"},
+        {ErrorCode::EMPTY_REPLICAS, "EMPTY_REPLICAS"},
+        {ErrorCode::TIER_NOT_FOUND, "TIER_NOT_FOUND"},
+        {ErrorCode::DATA_COPY_FAILED, "DATA_COPY_FAILED"},
+        {ErrorCode::TASK_NOT_FOUND, "TASK_NOT_FOUND"},
+        {ErrorCode::TASK_PENDING_LIMIT_EXCEEDED, "TASK_PENDING_LIMIT_EXCEEDED"},
+        {ErrorCode::JOB_NOT_FOUND, "JOB_NOT_FOUND"},
+        {ErrorCode::DFS_NETWORK_TIMEOUT, "DFS_NETWORK_TIMEOUT"},
+        {ErrorCode::DFS_SERVICE_UNAVAILABLE, "DFS_SERVICE_UNAVAILABLE"},
+        {ErrorCode::DFS_QUOTA_EXCEEDED, "DFS_QUOTA_EXCEEDED"},
+        {ErrorCode::DFS_PERMISSION_DENIED, "DFS_PERMISSION_DENIED"},
+        {ErrorCode::DFS_STALE_HANDLE, "DFS_STALE_HANDLE"},
+        {ErrorCode::DFS_PARTIAL_WRITE, "DFS_PARTIAL_WRITE"},
         {ErrorCode::SHUTTING_DOWN, "SHUTTING_DOWN"},
         {ErrorCode::ASYNC_ENQUEUE_FAILED, "ASYNC_ENQUEUE_FAILED"},
-    };
+        {ErrorCode::INACCESSIBLE_MASTER, "INACCESSIBLE_MASTER"},
+        {ErrorCode::TENANT_QUOTA_EXCEEDED, "TENANT_QUOTA_EXCEEDED"},
+        {ErrorCode::TENANT_NOT_REGISTERED, "TENANT_NOT_REGISTERED"},
+        {ErrorCode::TENANT_NOT_EMPTY, "TENANT_NOT_EMPTY"}};
 
     auto it = errorCodeMap.find(errorCode);
     static const std::string unknownError = "UNKNOWN_ERROR";
@@ -92,6 +120,27 @@ UUID generate_uuid() {
     std::memcpy(&pair_uuid.second, uuid.data + sizeof(uint64_t),
                 sizeof(uint64_t));
     return pair_uuid;
+}
+
+std::string UuidToString(const UUID& uuid) {
+    return std::to_string(uuid.first) + "-" + std::to_string(uuid.second);
+}
+
+bool StringToUuid(const std::string& str, UUID& uuid) {
+    size_t dashPos = str.find('-');
+    if (dashPos == std::string::npos || dashPos == 0 ||
+        dashPos == str.length() - 1) {
+        return false;
+    }
+
+    try {
+        uint64_t first = std::stoull(str.substr(0, dashPos), nullptr, 10);
+        uint64_t second = std::stoull(str.substr(dashPos + 1), nullptr, 10);
+        uuid = UUID{first, second};
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
 }
 
 }  // namespace mooncake

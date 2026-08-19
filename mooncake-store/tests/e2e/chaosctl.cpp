@@ -11,6 +11,8 @@
 // Define command line flags
 USE_engine_flags;
 FLAG_etcd_endpoints;
+FLAG_ha_backend_type;
+FLAG_ha_backend_connstring;
 FLAG_master_path;
 FLAG_client_path;
 FLAG_out_dir;
@@ -173,10 +175,16 @@ int main(int argc, char* argv[]) {
         // Create and start the master processes.
         std::vector<std::unique_ptr<mooncake::testing::MasterProcessHandler>>
             masters;
+        mooncake::testing::MasterRunnerConfig master_config{
+            .enable_ha = true,
+            .ha_backend_type = FLAGS_ha_backend_type,
+            .ha_backend_connstring = FLAGS_ha_backend_connstring,
+            .etcd_endpoints = FLAGS_etcd_endpoints,
+        };
         for (int i = 0; i < master_num; ++i) {
             masters.emplace_back(
                 std::make_unique<mooncake::testing::MasterProcessHandler>(
-                    FLAGS_master_path, FLAGS_etcd_endpoints, 50051 + i, i,
+                    FLAGS_master_path, master_config, 50051 + i, i,
                     FLAGS_out_dir));
             masters.back()->start();
         }
@@ -191,7 +199,8 @@ int main(int argc, char* argv[]) {
                 .mount_prob = std::nullopt,
                 .unmount_prob = std::nullopt,
                 .port = 17812 + i,
-                .master_server_entry = "etcd://" + FLAGS_etcd_endpoints,
+                .master_server_entry =
+                    mooncake::testing::BuildTestMasterServerEntry(),
                 .engine_meta_url = FLAGS_engine_meta_url,
                 .protocol = FLAGS_protocol,
                 .device_name = FLAGS_device_name,

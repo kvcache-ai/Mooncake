@@ -18,12 +18,29 @@
 
 #!/bin/bash
 
+# Try git clone with GitHub mirror fallback via https://ghfast.top/
+git_with_github_mirror_fallback() {
+    local repo_dir="$1"
+    local repo_url="$2"
+    shift 2
+
+    if git clone "$repo_url" "$repo_dir" "$@"; then
+        return 0
+    fi
+
+    echo "Direct clone failed, retrying with mirror https://ghfast.top/"
+    rm -rf "$repo_dir"
+    local mirror_url="https://ghfast.top/${repo_url}"
+    git clone "$mirror_url" "$repo_dir" "$@"
+}
+
 clone_repo_if_not_exists() {
-    local repo_dir=$1
-    local repo_url=$2
+    local repo_dir="$1"
+    local repo_url="$2"
+    shift 2
 
     if [ ! -d "$repo_dir" ]; then
-        git clone "$repo_url"
+        git_with_github_mirror_fallback "$repo_dir" "$repo_url" "$@"
     else
         echo "Directory $repo_dir already exists, skipping clone."
     fi
@@ -48,12 +65,11 @@ if command -v apt-get &> /dev/null; then
             wget \
             libibverbs-dev \
             libgoogle-glog-dev \
-            libgtest-dev \
             libjsoncpp-dev \
             libunwind-dev \
             libnuma-dev \
             libpython3-dev \
-            libboost-all-dev \
+            libboost-dev \
             libssl-dev \
             libgrpc-dev \
             libgrpc++-dev \
@@ -65,7 +81,10 @@ if command -v apt-get &> /dev/null; then
             pkg-config \
             patchelf \
             mpich \
-            libmpich-dev
+            libmpich-dev \
+            libzstd-dev \
+            libxxhash-dev \
+            libmsgpack-dev
     apt purge -y openmpi-bin libopenmpi-dev || true
 elif command -v yum &> /dev/null; then
     echo "Detected yum. Using Red Hat-based package manager."
@@ -75,15 +94,15 @@ elif command -v yum &> /dev/null; then
             glog-devel \
             libibverbs-devel \
             numactl-devel \
-            gtest \
-            gtest-devel \
             boost-devel \
             openssl-devel \
             hiredis-devel \
             libcurl-devel \
             jsoncpp-devel \
             mpich \
-            mpich-devel
+            mpich-devel \
+            zstd-devel \
+            xxhash-devel
     # Install yaml-cpp
     cd "$TARGET_DIR"
     clone_repo_if_not_exists "yaml-cpp" https://github.com/jbeder/yaml-cpp.git
@@ -92,6 +111,17 @@ elif command -v yum &> /dev/null; then
     mkdir -p build && cd build
     cmake ..
     make -j$(nproc)
+    make install
+    cd ../..
+
+    # Install msgpack-c
+    clone_repo_if_not_exists "msgpack-c" "https://github.com/msgpack/msgpack-c.git"
+    cd msgpack-c || exit
+    git checkout cpp-7.0.0
+    rm -rf build
+    mkdir -p build && cd build
+    cmake ..
+    make -j
     make install
     cd ../..
 else
@@ -116,9 +146,3 @@ make install
 cd ../..
 
 echo -e "yalantinglibs installed successfully."
-
-# Add the so package to the environment variables
-cp libascend_transport_mem.so /usr/local/Ascend/ascend-toolkit/latest/python/site-packages
-
-# Pip install whl
-pip install mooncake_transfer_engine*.whl --force

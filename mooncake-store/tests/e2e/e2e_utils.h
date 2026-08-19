@@ -1,6 +1,11 @@
 #pragma once
 
 #include <gflags/gflags.h>
+#include <string>
+
+DECLARE_string(etcd_endpoints);
+DECLARE_string(ha_backend_type);
+DECLARE_string(ha_backend_connstring);
 
 namespace mooncake {
 namespace testing {
@@ -21,6 +26,13 @@ namespace testing {
 // Flags for master and client
 #define FLAG_etcd_endpoints \
     DEFINE_string(etcd_endpoints, "localhost:2379", "Etcd endpoints");
+#define FLAG_ha_backend_type               \
+    DEFINE_string(ha_backend_type, "etcd", \
+                  "HA backend type for tests: etcd | redis | k8s");
+#define FLAG_ha_backend_connstring                                          \
+    DEFINE_string(ha_backend_connstring, "",                                \
+                  "HA backend connection string for tests; if unset, fall " \
+                  "back to etcd_endpoints");
 #define FLAG_master_path                                               \
     DEFINE_string(master_path, "./mooncake-store/src/mooncake_master", \
                   "Path to the master executable");
@@ -34,6 +46,26 @@ namespace testing {
 #define FLAG_rand_seed                  \
     DEFINE_int32(rand_seed, time(NULL), \
                  "Random seed, 0 means use current time as seed");
+
+inline std::string ResolveTestHABackendConnstring() {
+    if (!::FLAGS_ha_backend_connstring.empty()) {
+        return ::FLAGS_ha_backend_connstring;
+    }
+    return ::FLAGS_etcd_endpoints;
+}
+
+inline std::string NormalizeConnstringScheme(const std::string& connstring) {
+    const auto scheme_pos = connstring.find("://");
+    if (scheme_pos == std::string::npos || scheme_pos == 0) {
+        return connstring;
+    }
+    return connstring.substr(scheme_pos + 3);
+}
+
+inline std::string BuildTestMasterServerEntry() {
+    return ::FLAGS_ha_backend_type + "://" +
+           NormalizeConnstringScheme(ResolveTestHABackendConnstring());
+}
 
 }  // namespace testing
 }  // namespace mooncake

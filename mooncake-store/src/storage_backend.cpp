@@ -1,3 +1,4 @@
+#include "serializer.h"
 #include "storage_backend.h"
 
 #include <fcntl.h>
@@ -5,67 +6,57 @@
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <errno.h>
+#include <cstdint>
 #include <cstring>
+#include <limits>
 
+#include <array>
+#include <cctype>
+#include <optional>
 #include <regex>
 #include <string>
+#include <thread>
 #include <vector>
 #include <algorithm>
 #include <chrono>
-#include <exception>
 #include <unordered_set>
 
 #include <ylt/struct_pb.hpp>
 
 #include "mutex.h"
 #include "utils.h"
+#include "crc32c.h"
+#include "ascii_string.h"
+#include "bool_parser.h"
+#include "environ.h"
 
 #include <ylt/util/tl/expected.hpp>
 
-namespace mooncake {
-
 namespace {
-
-std::string MakeTemporaryBucketPath(const std::string& path) {
-    return path + ".tmp";
-}
-
-bool IsBucketTemporaryFile(const std::filesystem::path& path) {
-    if (path.extension() != ".tmp") {
-        return false;
+struct FdGuard {
+    int fd = -1;
+    explicit FdGuard(int f) : fd(f) {}
+    ~FdGuard() {
+        if (fd >= 0) close(fd);
     }
-
-    const auto base_extension = path.stem().extension().string();
-    return base_extension == ".bucket" || base_extension == ".meta";
-}
-
-void RemoveFileIfExists(const std::filesystem::path& path,
-                        const char* failure_context) {
-    std::error_code ec;
-    if (!std::filesystem::exists(path, ec) || ec) {
-        return;
+    FdGuard(const FdGuard&) = delete;
+    FdGuard& operator=(const FdGuard&) = delete;
+    int get() const { return fd; }
+    int release() {
+        int r = fd;
+        fd = -1;
+        return r;
     }
-
-    std::filesystem::remove(path, ec);
-    if (ec) {
-        LOG(ERROR) << failure_context << ": " << path
-                   << ", error: " << ec.message();
-    }
-}
-
-tl::expected<void, ErrorCode> RenameBucketFile(const std::string& from,
-                                               const std::string& to) {
-    std::error_code ec;
-    std::filesystem::rename(from, to, ec);
-    if (ec) {
-        LOG(ERROR) << "Failed to rename bucket file from " << from << " to "
-                   << to << ": " << ec.message();
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-    }
-    return {};
-}
-
+};
 }  // namespace
+
+#include "storage/distributed/distributed_storage_backend.h"
+#include "storage/distributed/posix_fs_adapter.h"
+#ifdef USE_3FS
+#include "storage/distributed/hf3fs_adapter.h"
+#endif
+
+namespace mooncake {
 
 bool FilePerKeyConfig::Validate() const {
     if (fsdir.empty()) {
@@ -90,10 +81,11 @@ bool BucketBackendConfig::Validate() const {
 FilePerKeyConfig FilePerKeyConfig::FromEnvironment() {
     FilePerKeyConfig config;
 
-    config.fsdir = GetEnvStringOr("MOONCAKE_OFFLOAD_FSDIR", config.fsdir);
+    config.fsdir = Environ::GetString("MOONCAKE_OFFLOAD_FSDIR", config.fsdir);
 
-    config.enable_eviction =
-        GetEnvOr<bool>("ENABLE_EVICTION", config.enable_eviction);
+    config.enable_eviction = Environ::GetBool(
+        "MOONCAKE_OFFLOAD_ENABLE_EVICTION",
+        Environ::GetBool("ENABLE_EVICTION", config.enable_eviction));
 
     return config;
 }
@@ -101,74 +93,152 @@ FilePerKeyConfig FilePerKeyConfig::FromEnvironment() {
 BucketBackendConfig BucketBackendConfig::FromEnvironment() {
     BucketBackendConfig config;
 
-    config.bucket_keys_limit = GetEnvOr<int64_t>(
+    config.bucket_keys_limit = Environ::GetInt64(
         "MOONCAKE_OFFLOAD_BUCKET_KEYS_LIMIT", config.bucket_keys_limit);
 
-    config.bucket_size_limit = GetEnvOr<int64_t>(
+    config.bucket_size_limit = Environ::GetInt64(
         "MOONCAKE_OFFLOAD_BUCKET_SIZE_LIMIT_BYTES", config.bucket_size_limit);
+
+    config.max_total_size =
+        Environ::GetInt64("MOONCAKE_OFFLOAD_BUCKET_MAX_TOTAL_SIZE",
+                          Environ::GetInt64("MOONCAKE_BUCKET_MAX_TOTAL_SIZE",
+                                            config.max_total_size));
+
+    const auto policy_str = Environ::GetString(
+        "MOONCAKE_OFFLOAD_BUCKET_EVICTION_POLICY",
+        Environ::GetString("MOONCAKE_BUCKET_EVICTION_POLICY", "fifo"));
+    if (policy_str == "fifo") {
+        config.eviction_policy = BucketEvictionPolicy::FIFO;
+    } else if (policy_str == "lru") {
+        config.eviction_policy = BucketEvictionPolicy::LRU;
+    } else {
+        config.eviction_policy = BucketEvictionPolicy::NONE;
+    }
 
     return config;
 }
 
-void BucketBackendConfig::MergeFromJson(const Json::Value& v) {
-    if (v.isMember("bucket_size_limit")) {
-        const auto& node = v["bucket_size_limit"];
-        if (node.isString()) {
-            bucket_size_limit =
-                static_cast<int64_t>(string_to_byte_size(node.asString()));
-        } else if (node.isIntegral()) {
-            bucket_size_limit = node.asInt64();
-        } else {
-            LOG(WARNING) << "bucket_size_limit has unexpected type, ignored";
+bool OffsetAllocatorBackendConfig::Validate() const {
+    if (persist_mode == OffsetPersistMode::kRelaxed) {
+        if (persist_interval_seconds < 5) {
+            LOG(ERROR) << "OffsetAllocatorBackendConfig: "
+                          "persist_interval_seconds must be >= 5 for "
+                          "kRelaxed mode";
+            return false;
         }
     }
-    if (v.isMember("bucket_keys_limit")) {
-        const auto& node = v["bucket_keys_limit"];
-        if (node.isIntegral()) {
-            bucket_keys_limit = node.asInt64();
-        } else {
-            LOG(WARNING) << "bucket_keys_limit has unexpected type, ignored";
-        }
+    if (high_ratio <= 0.0 || high_ratio > 1.0) {
+        LOG(ERROR)
+            << "OffsetAllocatorBackendConfig: high_ratio must be in (0,1]";
+        return false;
+    }
+    if (low_ratio <= 0.0 || low_ratio >= high_ratio) {
+        LOG(ERROR) << "OffsetAllocatorBackendConfig: low_ratio must be in (0, "
+                      "high_ratio)";
+        return false;
+    }
+    if (keys_high_ratio <= 0.0 || keys_high_ratio > 1.0) {
+        LOG(ERROR)
+            << "OffsetAllocatorBackendConfig: keys_high_ratio must be in (0,1]";
+        return false;
+    }
+    if (keys_low_ratio <= 0.0 || keys_low_ratio >= keys_high_ratio) {
+        LOG(ERROR) << "OffsetAllocatorBackendConfig: keys_low_ratio must be in "
+                      "(0, keys_high_ratio)";
+        return false;
+    }
+    if (max_evict_per_offload == 0) {
+        LOG(ERROR) << "OffsetAllocatorBackendConfig: max_evict_per_offload "
+                      "must be > 0";
+        return false;
+    }
+    if (fallback_evict_batch == 0) {
+        LOG(ERROR)
+            << "OffsetAllocatorBackendConfig: fallback_evict_batch must be > 0";
+        return false;
+    }
+    if (max_capacity_nodes < 0) {
+        LOG(ERROR)
+            << "OffsetAllocatorBackendConfig: max_capacity_nodes must be >= 0";
+        return false;
+    }
+    return true;
+}
+
+static std::optional<double> GetEnvDouble(const char* name) {
+    const char* env = std::getenv(name);
+    if (!env || env[0] == '\0') return std::nullopt;
+    try {
+        return std::stod(env);
+    } catch (...) {
+        return std::nullopt;
     }
 }
 
-void FileStorageConfig::MergeFromJson(const Json::Value& v) {
-    if (v.isMember("storage_backend_type")) {
-        const std::string t = v["storage_backend_type"].asString();
-        if (t == "file_per_key_storage_backend") {
-            storage_backend_type = StorageBackendType::kFilePerKey;
-        } else if (t == "bucket_storage_backend") {
-            storage_backend_type = StorageBackendType::kBucket;
+OffsetAllocatorBackendConfig OffsetAllocatorBackendConfig::FromEnvironment() {
+    OffsetAllocatorBackendConfig cfg;
+
+    const char* pol = std::getenv("MOONCAKE_OFFSET_EVICTION_POLICY");
+    if (pol) {
+        if (AsciiCaseInsensitiveEquals(pol, "fifo")) {
+            cfg.eviction_policy = OffsetEvictionPolicy::FIFO;
+        }
+        // NONE is default; LRU reserved for phase 2
+    }
+
+    if (auto v = GetEnvDouble("MOONCAKE_OFFSET_HIGH_RATIO"))
+        cfg.high_ratio = *v;
+    if (auto v = GetEnvDouble("MOONCAKE_OFFSET_LOW_RATIO")) cfg.low_ratio = *v;
+    // Both byte and key watermarks derive from the same ratio pair.
+    cfg.keys_high_ratio = cfg.high_ratio;
+    cfg.keys_low_ratio = cfg.low_ratio;
+
+    cfg.max_capacity_nodes = Environ::GetInt64(
+        "MOONCAKE_OFFSET_MAX_CAPACITY_NODES", cfg.max_capacity_nodes);
+
+    // Read eviction cap as int64_t to guard against negative env values
+    // which would wrap to SIZE_MAX with an unsigned parser.
+    auto max_evict_raw =
+        Environ::GetInt64("MOONCAKE_OFFSET_MAX_EVICT_PER_OFFLOAD",
+                          static_cast<int64_t>(cfg.max_evict_per_offload));
+    if (max_evict_raw > 0) {
+        cfg.max_evict_per_offload = static_cast<size_t>(max_evict_raw);
+    } else if (max_evict_raw <= 0) {
+        LOG(WARNING) << "MOONCAKE_OFFSET_MAX_EVICT_PER_OFFLOAD="
+                     << max_evict_raw << " is non-positive; using default "
+                     << cfg.max_evict_per_offload;
+    }
+
+    // Persistence mode
+    const char* persist = std::getenv("MOONCAKE_OFFSET_PERSIST_MODE");
+    if (persist) {
+        std::string s(persist);
+        if (AsciiCaseInsensitiveEquals(s, "disabled")) {
+            cfg.persist_mode = OffsetPersistMode::kDisabled;
+        } else if (AsciiCaseInsensitiveEquals(s, "relaxed")) {
+            cfg.persist_mode = OffsetPersistMode::kRelaxed;
+        } else if (AsciiCaseInsensitiveEquals(s, "strict")) {
+            cfg.persist_mode = OffsetPersistMode::kStrict;
         } else {
-            LOG(WARNING) << "Unknown storage_backend_type: " << t
-                         << ", keeping current value";
+            LOG(WARNING) << "Unknown MOONCAKE_OFFSET_PERSIST_MODE=" << s
+                         << "; using default (disabled)";
         }
     }
-    if (v.isMember("storage_filepath")) {
-        storage_filepath = v["storage_filepath"].asString();
-    }
-    if (v.isMember("local_buffer_size")) {
-        const auto& node = v["local_buffer_size"];
-        if (node.isString()) {
-            local_buffer_size =
-                static_cast<int64_t>(string_to_byte_size(node.asString()));
-        } else if (node.isIntegral()) {
-            local_buffer_size = node.asInt64();
-        } else {
-            LOG(WARNING) << "local_buffer_size has unexpected type, ignored";
+
+    cfg.persist_interval_seconds =
+        Environ::GetInt64("MOONCAKE_OFFSET_PERSIST_INTERVAL_SECONDS",
+                          cfg.persist_interval_seconds);
+
+    // Record CRC-32C: "0"/"false"/"off" disables per-record checksums.
+    const char* crc_env = std::getenv("MOONCAKE_OFFSET_RECORD_CRC");
+    if (crc_env) {
+        const auto parsed = TryParseBool(crc_env);
+        if (parsed.has_value() && !*parsed) {
+            cfg.enable_record_crc = false;
         }
     }
-    if (v.isMember("total_size_limit")) {
-        const auto& node = v["total_size_limit"];
-        if (node.isString()) {
-            total_size_limit =
-                static_cast<int64_t>(string_to_byte_size(node.asString()));
-        } else if (node.isIntegral()) {
-            total_size_limit = node.asInt64();
-        } else {
-            LOG(WARNING) << "total_size_limit has unexpected type, ignored";
-        }
-    }
+
+    return cfg;
 }
 
 StorageBackendInterface::StorageBackendInterface(
@@ -177,21 +247,12 @@ StorageBackendInterface::StorageBackendInterface(
 
 void StorageBackendInterface::CleanStoragePath() {
     namespace fs = std::filesystem;
-    // This is best-effort cleanup and is invoked from StorageTier's destructor,
-    // which is implicitly noexcept. Wrap the whole body so that no exception
-    // (filesystem_error from iteration, bad_alloc, ...) can escape into the
-    // destructor and trip std::terminate().
     try {
         const std::string& path = file_storage_config_.storage_filepath;
         if (path.empty()) {
             LOG(WARNING) << "CleanStoragePath: storage path is empty, skipping";
             return;
         }
-
-        // Refuse to wipe dangerous paths. Requiring an absolute, non-root
-        // directory rejects "", ".", ".." and any relative path, so a
-        // misconfigured storage_filepath cannot wipe the current working
-        // directory, its parent, or the filesystem root.
         const fs::path normalized = fs::path(path).lexically_normal();
         if (!normalized.is_absolute() || normalized == normalized.root_path()) {
             LOG(ERROR) << "CleanStoragePath: refusing to clean unsafe path "
@@ -199,22 +260,15 @@ void StorageBackendInterface::CleanStoragePath() {
                        << path;
             return;
         }
-
         std::error_code ec;
         if (!fs::exists(normalized, ec) || ec) {
-            return;  // Nothing to clean (missing path or stat error).
+            return;
         }
         if (!fs::is_directory(normalized, ec) || ec) {
             LOG(WARNING) << "CleanStoragePath: not a directory, skipping: "
                          << path;
             return;
         }
-
-        // Snapshot entries first so removal does not invalidate the iterator.
-        // Use the non-throwing increment(ec) overload: a range-based for loop
-        // would call the throwing operator++(), which ignores the ec passed to
-        // the constructor and raises filesystem_error if the directory changes
-        // mid-traversal.
         std::vector<fs::path> entries;
         for (fs::directory_iterator it(normalized, ec), end; it != end;
              it.increment(ec)) {
@@ -225,7 +279,6 @@ void StorageBackendInterface::CleanStoragePath() {
             }
             entries.push_back(it->path());
         }
-
         size_t removed = 0;
         for (const auto& entry : entries) {
             std::error_code rm_ec;
@@ -256,140 +309,7 @@ std::string StorageBackend::GetActualFsdir() const {
     return actual_fsdir;
 }
 
-LocalStorageSpaceManager::LocalStorageSpaceManager(
-    std::filesystem::path storage_root)
-    : storage_root_(std::move(storage_root)) {}
-
-void LocalStorageSpaceManager::SetStorageRoot(
-    std::filesystem::path storage_root) {
-    std::unique_lock<std::shared_mutex> lock(mutex_);
-    storage_root_ = std::move(storage_root);
-}
-
-tl::expected<void, ErrorCode> LocalStorageSpaceManager::Init(
-    uint64_t used_space_bytes, uint64_t quota_bytes) {
-    namespace fs = std::filesystem;
-
-    std::shared_lock<std::shared_mutex> root_lock(mutex_);
-    if (storage_root_.empty()) {
-        LOG(ERROR) << "Storage root is empty for LocalStorageSpaceManager";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    std::error_code ec;
-    auto space_info = fs::space(storage_root_, ec);
-    if (ec) {
-        LOG(ERROR) << "Failed to query filesystem space for " << storage_root_
-                   << ": " << ec.message();
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-    root_lock.unlock();
-
-    uint64_t total_space = quota_bytes;
-    if (total_space == 0) {
-        constexpr double kDefaultQuotaPercentage = 0.9;
-        total_space = static_cast<uint64_t>(space_info.capacity *
-                                            kDefaultQuotaPercentage);
-    }
-
-    std::unique_lock<std::shared_mutex> lock(mutex_);
-    total_space_ = total_space;
-    used_space_ = used_space_bytes;
-    RecalculateAvailableSpaceLocked();
-    initialized_.store(true, std::memory_order_release);
-    return {};
-}
-
-tl::expected<bool, ErrorCode> LocalStorageSpaceManager::HasPhysicalSpace(
-    uint64_t required_size) const {
-    namespace fs = std::filesystem;
-
-    {
-        std::shared_lock<std::shared_mutex> lock(mutex_);
-        if (!initialized_.load(std::memory_order_acquire)) {
-            LOG(ERROR) << "LocalStorageSpaceManager used before initialization";
-            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-        }
-        if (available_space_ < required_size) {
-            return false;
-        }
-        if (storage_root_.empty()) {
-            LOG(ERROR) << "Storage root is empty for LocalStorageSpaceManager";
-            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-        }
-    }  // namespace std::filesystem;
-
-    std::error_code ec;
-    const auto space_info = fs::space(storage_root_, ec);
-    if (ec) {
-        LOG(ERROR) << "Failed to query filesystem space for " << storage_root_
-                   << ": " << ec.message();
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-
-    return space_info.available >= required_size;
-}
-
-bool LocalStorageSpaceManager::IsInitialized() const {
-    return initialized_.load(std::memory_order_acquire);
-}
-
-bool LocalStorageSpaceManager::TryReserve(uint64_t required_size) {
-    std::unique_lock<std::shared_mutex> lock(mutex_);
-    if (!initialized_.load(std::memory_order_acquire)) {
-        LOG(ERROR) << "LocalStorageSpaceManager used before initialization";
-        return false;
-    }
-
-    if (available_space_ < required_size) {
-        return false;
-    }
-
-    used_space_ += required_size;
-    available_space_ -= required_size;
-    return true;
-}
-
-void LocalStorageSpaceManager::Release(uint64_t size_to_release) {
-    if (size_to_release == 0) {
-        return;
-    }
-
-    std::unique_lock<std::shared_mutex> lock(mutex_);
-    if (!initialized_.load(std::memory_order_acquire)) {
-        LOG(ERROR) << "LocalStorageSpaceManager used before initialization";
-        return;
-    }
-
-    if (size_to_release <= used_space_) {
-        used_space_ -= size_to_release;
-    } else {
-        used_space_ = 0;
-    }
-    RecalculateAvailableSpaceLocked();
-}
-
-uint64_t LocalStorageSpaceManager::TotalSpace() const {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
-    return total_space_;
-}
-
-uint64_t LocalStorageSpaceManager::UsedSpace() const {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
-    return used_space_;
-}
-
-uint64_t LocalStorageSpaceManager::AvailableSpace() const {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
-    return available_space_;
-}
-
-bool LocalStorageSpaceManager::IsOverQuota() const {
-    std::shared_lock<std::shared_mutex> lock(mutex_);
-    return used_space_ > total_space_;
-}
-
-void LocalStorageSpaceManager::RecalculateAvailableSpaceLocked() {
+void StorageBackend::RecalculateAvailableSpace() {
     if (total_space_ >= used_space_) {
         available_space_ = total_space_ - used_space_;
     } else {
@@ -397,23 +317,20 @@ void LocalStorageSpaceManager::RecalculateAvailableSpaceLocked() {
     }
 }
 
-bool StorageBackend::IsEvictionEnabled() const {
-    // First check user configuration
-    if (!enable_eviction_) {
-        return false;
-    }
+bool StorageBackend::IsEvictionEnabled() const { return enable_eviction_; }
 
-#ifdef USE_3FS
-    // Eviction is only enabled for local storage, not for 3FS
-    return !is_3fs_dir_;
-#else
-    // If 3FS is not compiled in, eviction is enabled if user config allows
-    return true;
-#endif
+Mutex& StorageBackend::GetFilePathMutex(const std::string& path) {
+    return file_path_mutexes_[std::hash<std::string>{}(path) %
+                              kFilePathLockCount];
+}
+
+bool StorageBackend::IsFilePendingEviction(const std::string& path) const {
+    std::shared_lock<std::shared_mutex> lock(file_queue_mutex_);
+    return pending_eviction_paths_.find(path) != pending_eviction_paths_.end();
 }
 
 tl::expected<void, ErrorCode> StorageBackend::Init(uint64_t quota_bytes = 0) {
-    // Skip eviction initialization for 3FS mode
+    // Skip eviction initialization if disabled
     if (!IsEvictionEnabled()) {
         initialized_.store(true, std::memory_order_release);
         return {};
@@ -427,7 +344,6 @@ tl::expected<void, ErrorCode> StorageBackend::Init(uint64_t quota_bytes = 0) {
     namespace fs = std::filesystem;
     std::string actual_fsdir = GetActualFsdir();
     fs::path storage_root = fs::path(root_dir_) / actual_fsdir;
-    space_manager_.SetStorageRoot(storage_root);
 
     std::error_code ec;
     if (!fs::exists(storage_root)) {
@@ -437,6 +353,11 @@ tl::expected<void, ErrorCode> StorageBackend::Init(uint64_t quota_bytes = 0) {
                        << storage_root;
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
+    }
+    const auto space_info = fs::space(storage_root, ec);
+    if (ec) {
+        LOG(ERROR) << "Init: Failed to get disk space info: " << ec.message();
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
     LOG(INFO) << "Reconstructing storage state from disk at: " << storage_root;
     std::vector<fs::directory_entry> existing_files;
@@ -470,37 +391,51 @@ tl::expected<void, ErrorCode> StorageBackend::Init(uint64_t quota_bytes = 0) {
                   return stx_a.stx_btime.tv_sec < stx_b.stx_btime.tv_sec;
               });
     bool eviction_needed = false;
-    uint64_t used_space = 0;
     {
+        std::unique_lock<std::shared_mutex> space_lock(space_mutex_);
         std::unique_lock<std::shared_mutex> queue_lock(file_queue_mutex_);
+        used_space_ = 0;
 
         for (const auto& entry : existing_files) {
             uint64_t file_size = entry.file_size(ec);
             if (!ec) {
                 const std::string& path_str = entry.path().string();
-                file_write_queue_.push_back({path_str, file_size});
+                file_write_queue_.push_back({path_str, file_size, ""});
                 file_queue_map_[path_str] = std::prev(file_write_queue_.end());
-                used_space += file_size;
+                used_space_ += file_size;
             } else {
                 LOG(WARNING) << "Could not get size of existing file "
                              << entry.path() << ", skipping.";
             }
         }
+        if (quota_bytes > 0) {
+            total_space_ = quota_bytes;
+        } else {
+            constexpr double kDefaultQuotaPercentage = 0.9;
+            total_space_ = static_cast<uint64_t>(space_info.capacity *
+                                                 kDefaultQuotaPercentage);
+        }
+        if (total_space_ >= used_space_) {
+            RecalculateAvailableSpace();
+        } else {
+            // Only enable eviction for local storage
+            if (IsEvictionEnabled()) {
+                eviction_needed = true;
+                available_space_ = -1;
+                LOG(WARNING)
+                    << "Existing used space (" << used_space_
+                    << ") exceeds the new quota (" << total_space_
+                    << "). Eviction will be triggered after initial setup.";
+            } else {
+                // Eviction disabled, just log a warning but don't trigger
+                // eviction
+                LOG(WARNING) << "Existing used space (" << used_space_
+                             << ") exceeds the new quota (" << total_space_
+                             << "). Eviction is disabled.";
+                RecalculateAvailableSpace();  // Still calculate available space
+            }
+        }
     }
-
-    auto init_space_result = space_manager_.Init(used_space, quota_bytes);
-    if (!init_space_result) {
-        return init_space_result;
-    }
-
-    if (space_manager_.IsOverQuota()) {
-        eviction_needed = true;
-        LOG(WARNING) << "Existing used space (" << space_manager_.UsedSpace()
-                     << ") exceeds the new quota ("
-                     << space_manager_.TotalSpace()
-                     << "). Eviction will be triggered after initial setup.";
-    }
-
     if (eviction_needed) {
         if (!InitQuotaEvict()) {
             LOG(ERROR) << "Initialization failed due to failure in enforcing "
@@ -510,10 +445,14 @@ tl::expected<void, ErrorCode> StorageBackend::Init(uint64_t quota_bytes = 0) {
         }
     }
 
-    LOG(INFO) << "Init: "
-              << "Quota: " << space_manager_.TotalSpace()
-              << ", Used: " << space_manager_.UsedSpace()
-              << ", Available: " << space_manager_.AvailableSpace();
+    {
+        std::unique_lock<std::shared_mutex> lock(space_mutex_);
+        RecalculateAvailableSpace();
+
+        LOG(INFO) << "Init: "
+                  << "Quota: " << total_space_ << ", Used: " << used_space_
+                  << ", Available: " << available_space_;
+    }
 
     initialized_.store(true, std::memory_order_release);
     return {};
@@ -530,12 +469,12 @@ bool StorageBackend::InitQuotaEvict() {
     size_t eviction_attempts = 0;
 
     while (eviction_attempts < kMaxEvictionAttempts) {
-        if (!space_manager_.IsOverQuota()) {
+        if (used_space_ <= total_space_) {
             break;
         }
 
-        std::string evicted_file = EvictFile();
-        if (evicted_file.empty()) {
+        FileRecord evicted = EvictFile();
+        if (evicted.path.empty()) {
             LOG(ERROR) << "Failed to evict file to meet quota. "
                        << "The queue might be empty or a file is unremovable.";
             return false;
@@ -543,23 +482,32 @@ bool StorageBackend::InitQuotaEvict() {
         eviction_attempts++;
     }
 
-    if (space_manager_.IsOverQuota()) {
+    if (used_space_ > total_space_) {
         LOG(ERROR) << "Could not bring storage usage under quota after "
                    << eviction_attempts << " eviction attempts.";
         return false;
     }
 
+    // Recalculate available_space_ after eviction
+    {
+        std::unique_lock<std::shared_mutex> lock(space_mutex_);
+        RecalculateAvailableSpace();
+    }
+
     return true;
 }
 
-tl::expected<void, ErrorCode> StorageBackend::StoreObject(
-    const std::string& path, const std::vector<Slice>& slices) {
+tl::expected<std::vector<std::string>, ErrorCode> StorageBackend::StoreObject(
+    const std::string& path, const std::vector<Slice>& slices,
+    const std::string& key,
+    StorageBackendInterface::EvictionHandler eviction_handler) {
     size_t total_size = 0;
     for (const auto& slice : slices) {
         total_size += slice.size;
     }
 
     // For eviction-enabled mode, check space and reserve
+    std::vector<std::string> evicted_keys;
     uint64_t reserved_size = 0;
     if (IsEvictionEnabled()) {
         if (!initialized_.load(std::memory_order_acquire)) {
@@ -569,11 +517,18 @@ tl::expected<void, ErrorCode> StorageBackend::StoreObject(
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
 
-        auto space_result = EnsureDiskSpace(total_size);
+        auto space_result = EnsureDiskSpace(total_size, eviction_handler);
         if (!space_result) {
-            return space_result;
+            return tl::make_unexpected(space_result.error());
         }
+        evicted_keys = std::move(space_result.value());
         reserved_size = total_size;
+    }
+
+    MutexLocker path_locker(&GetFilePathMutex(path));
+    if (IsEvictionEnabled() && IsFilePendingEviction(path)) {
+        ReleaseSpace(reserved_size);
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
 
     // Create file and write data (common logic for both modes)
@@ -590,22 +545,26 @@ tl::expected<void, ErrorCode> StorageBackend::StoreObject(
 
     // For eviction-enabled mode, add file to tracking queue
     if (IsEvictionEnabled()) {
-        AddFileToWriteQueue(path, total_size);
+        AddFileToWriteQueue(path, total_size, key);
     }
 
-    return {};
+    return evicted_keys;
 }
 
-tl::expected<void, ErrorCode> StorageBackend::StoreObject(
-    const std::string& path, const std::string& str) {
-    return StoreObject(path, std::span<const char>(str.data(), str.size()));
+tl::expected<std::vector<std::string>, ErrorCode> StorageBackend::StoreObject(
+    const std::string& path, const std::string& str, const std::string& key,
+    StorageBackendInterface::EvictionHandler eviction_handler) {
+    return StoreObject(path, std::span<const char>(str.data(), str.size()), key,
+                       eviction_handler);
 }
 
-tl::expected<void, ErrorCode> StorageBackend::StoreObject(
-    const std::string& path, std::span<const char> data) {
+tl::expected<std::vector<std::string>, ErrorCode> StorageBackend::StoreObject(
+    const std::string& path, std::span<const char> data, const std::string& key,
+    StorageBackendInterface::EvictionHandler eviction_handler) {
     size_t file_total_size = data.size();
 
     // For eviction-enabled mode, check space and reserve
+    std::vector<std::string> evicted_keys;
     uint64_t reserved_size = 0;
     if (IsEvictionEnabled()) {
         if (!initialized_.load(std::memory_order_acquire)) {
@@ -615,11 +574,18 @@ tl::expected<void, ErrorCode> StorageBackend::StoreObject(
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
 
-        auto space_result = EnsureDiskSpace(file_total_size);
+        auto space_result = EnsureDiskSpace(file_total_size, eviction_handler);
         if (!space_result) {
-            return space_result;
+            return tl::make_unexpected(space_result.error());
         }
+        evicted_keys = std::move(space_result.value());
         reserved_size = file_total_size;
+    }
+
+    MutexLocker path_locker(&GetFilePathMutex(path));
+    if (IsEvictionEnabled() && IsFilePendingEviction(path)) {
+        ReleaseSpace(reserved_size);
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
 
     // Create file and write data (common logic for both modes)
@@ -636,10 +602,10 @@ tl::expected<void, ErrorCode> StorageBackend::StoreObject(
 
     // For eviction-enabled mode, add file to tracking queue
     if (IsEvictionEnabled()) {
-        AddFileToWriteQueue(path, file_total_size);
+        AddFileToWriteQueue(path, file_total_size, key);
     }
 
-    return {};
+    return evicted_keys;
 }
 
 tl::expected<void, ErrorCode> StorageBackend::LoadObject(
@@ -745,11 +711,19 @@ tl::expected<void, ErrorCode> StorageBackend::LoadObject(
     return {};
 }
 
-tl::expected<void, ErrorCode> StorageBackend::RemoveFile(
-    const std::string& path) {
+void StorageBackend::RemoveFile(const std::string& path) {
     namespace fs = std::filesystem;
+    // TODO: attention: this function is not thread-safe, need to add lock if
+    // used in multi-thread environment Check if the file exists before
+    // attempting to remove it
+    // TODO: add a sleep to ensure the write thread has time to create the
+    // corresponding file it will be fixed in the next version
+    std::this_thread::sleep_for(
+        std::chrono::microseconds(50));  // sleep for 50 us
 
-    // For 3FS mode, use original logic (no queue tracking)
+    MutexLocker path_locker(&GetFilePathMutex(path));
+
+    // Eviction disabled, use simple delete (no queue tracking)
     if (!IsEvictionEnabled()) {
         if (fs::exists(path)) {
             std::error_code ec;
@@ -757,39 +731,27 @@ tl::expected<void, ErrorCode> StorageBackend::RemoveFile(
             if (ec) {
                 LOG(ERROR) << "Failed to delete file: " << path
                            << ", error: " << ec.message();
-                return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
             }
         }
-        return {};
+        return;
     }
 
     // Eviction-enabled logic (local mode)
     uint64_t file_size = 0;
-    bool should_release_space = false;
     std::error_code ec;
     {
         std::shared_lock<std::shared_mutex> lock(file_queue_mutex_);
         auto map_it = file_queue_map_.find(path);
         if (map_it != file_queue_map_.end()) {
             file_size = map_it->second->size;
-            should_release_space = true;
+        } else {
+            lock.unlock();
+            LOG(WARNING) << "File not found in tracking queue, assuming it's "
+                            "already removed or untracked: "
+                         << path;
+            return;
         }
     }
-
-    if (!should_release_space) {
-        file_size = fs::file_size(path, ec);
-        if (ec == std::errc::no_such_file_or_directory) {
-            return {};
-        }
-        if (ec) {
-            LOG(ERROR) << "Failed to query file size before deletion: " << path
-                       << ", error: " << ec.message();
-            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-        }
-        should_release_space = true;
-    }
-
-    ec.clear();
 
     if (fs::remove(path, ec)) {
         LOG(INFO) << "Successfully removed file: " << path;
@@ -797,16 +759,13 @@ tl::expected<void, ErrorCode> StorageBackend::RemoveFile(
         if (ec && ec != std::errc::no_such_file_or_directory) {
             LOG(ERROR) << "Failed to remove file: " << path
                        << ", Error: " << ec.message();
-            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+            return;
         }
     }
 
     RemoveFileFromWriteQueue(path);
 
-    if (should_release_space) {
-        ReleaseSpace(file_size);
-    }
-    return {};
+    ReleaseSpace(file_size);
 }
 
 void StorageBackend::RemoveByRegex(const std::string& regex_pattern) {
@@ -820,7 +779,7 @@ void StorageBackend::RemoveByRegex(const std::string& regex_pattern) {
         return;
     }
 
-    // For 3FS mode, use original logic (no queue tracking)
+    // Eviction disabled, use simple delete (no queue tracking)
     if (!IsEvictionEnabled()) {
         fs::path storage_root = fs::path(root_dir_) / fsdir_;
         if (!fs::exists(storage_root) || !fs::is_directory(storage_root)) {
@@ -843,93 +802,61 @@ void StorageBackend::RemoveByRegex(const std::string& regex_pattern) {
         }
 
         for (const auto& path : paths_to_remove) {
-            std::error_code ec;
-            if (fs::remove(path, ec)) {
-                VLOG(1) << "Removed file by regex: " << path;
-            } else {
-                LOG(ERROR) << "Failed to delete file: " << path
-                           << ", error: " << ec.message();
-            }
+            RemoveFile(path.string());
         }
 
         return;
     }
 
     // Eviction-enabled logic (local mode)
-    std::list<FileRecord> records_to_remove;
-    uint64_t total_freed_space = 0;
+    std::vector<std::string> paths_to_remove;
     {
         std::shared_lock<std::shared_mutex> lock(file_queue_mutex_);
         for (const auto& record : file_write_queue_) {
             std::string filename = fs::path(record.path).filename().string();
             if (std::regex_search(filename, pattern)) {
-                records_to_remove.push_back(record);
+                paths_to_remove.push_back(record.path);
             }
         }
     }
 
-    for (const auto& record : records_to_remove) {
-        std::error_code ec;
-        if (fs::remove(record.path, ec)) {
-            RemoveFileFromWriteQueue(record.path);
-            total_freed_space += record.size;
-            VLOG(1) << "Removed file by regex: " << record.path;
-        } else {
-            if (ec && ec == std::errc::no_such_file_or_directory) {
-                RemoveFileFromWriteQueue(record.path);
-                total_freed_space += record.size;
-            } else {
-                LOG(ERROR) << "Failed to delete file: " << record.path
-                           << ", error: " << ec.message();
-            }
-        }
+    for (const auto& path : paths_to_remove) {
+        RemoveFile(path);
     }
-
-    ReleaseSpace(total_freed_space);
-
-    return;
 }
 
 void StorageBackend::RemoveAll() {
     namespace fs = std::filesystem;
 
-    // For 3FS mode, use original logic (no queue tracking)
+    // Eviction disabled, use simple delete (no queue tracking)
     if (!IsEvictionEnabled()) {
+        std::vector<std::string> paths_to_remove;
         // Iterate through the root directory and remove all files
         for (const auto& entry : fs::directory_iterator(root_dir_)) {
             if (fs::is_regular_file(entry.status())) {
-                std::error_code ec;
-                fs::remove(entry.path(), ec);
-                if (ec) {
-                    LOG(ERROR) << "Failed to delete file: " << entry.path()
-                               << ", error: " << ec.message();
-                }
+                paths_to_remove.push_back(entry.path().string());
             }
+        }
+        for (const auto& path : paths_to_remove) {
+            RemoveFile(path);
         }
         return;
     }
 
     // Eviction-enabled logic (local mode)
     try {
-        std::list<FileRecord> records_to_remove;
+        std::vector<std::string> paths_to_remove;
         {
-            std::unique_lock<std::shared_mutex> lock(file_queue_mutex_);
-            records_to_remove = std::move(file_write_queue_);
-            file_queue_map_.clear();
-        }
-        uint64_t total_freed_space = 0;
-        for (const auto& record : records_to_remove) {
-            total_freed_space += record.size;
-            std::error_code ec;
-            fs::remove(record.path, ec);
-            if (ec && ec != std::errc::no_such_file_or_directory) {
-                LOG(ERROR) << "RemoveAll: Failed to delete file " << record.path
-                           << ", error: " << ec.message();
+            std::shared_lock<std::shared_mutex> lock(file_queue_mutex_);
+            paths_to_remove.reserve(file_write_queue_.size());
+            for (const auto& record : file_write_queue_) {
+                paths_to_remove.push_back(record.path);
             }
         }
 
-        ReleaseSpace(total_freed_space);
-
+        for (const auto& path : paths_to_remove) {
+            RemoveFile(path);
+        }
     } catch (const fs::filesystem_error& e) {
         LOG(ERROR) << "Filesystem error when removing all files: " << e.what();
     }
@@ -1042,86 +969,116 @@ std::unique_ptr<StorageFile> StorageBackend::create_file(
             break;
     }
 
+#ifdef USE_URING
+    // Use O_DIRECT only for reads: write latency is not sensitive in this
+    // scenario, and O_DIRECT writes require 4096-byte alignment padding which
+    // corrupts meta file parsing and wastes disk space on data files.
+    if (use_uring_ && mode == FileMode::Read) {
+        flags |= O_DIRECT;
+    }
+#endif
+
     int fd = open(path.c_str(), flags | access_mode, 0644);
     if (fd < 0) {
         return nullptr;
     }
 
-#ifdef USE_3FS
-    if (is_3fs_dir_) {
-        if (hf3fs_reg_fd(fd, 0) > 0) {
-            close(fd);
-            return nullptr;
-        }
-        return resource_manager_ ? std::make_unique<ThreeFSFile>(
-                                       path, fd, resource_manager_.get())
-                                 : nullptr;
+#ifdef USE_URING
+    if (use_uring_) {
+        // use_direct_io mirrors the O_DIRECT flag: true for reads, false for
+        // writes. This avoids unnecessary bounce-buffer allocation on the write
+        // path while keeping correct alignment enforcement on the read path.
+        bool use_direct_io = (mode == FileMode::Read);
+        return std::make_unique<UringFile>(path, fd, 32, use_direct_io);
     }
 #endif
-
     return std::make_unique<PosixFile>(path, fd);
 }
 
 bool StorageBackend::CheckDiskSpace(size_t required_size) {
-    bool has_enough_space =
-        space_manager_.TryReserve(static_cast<uint64_t>(required_size));
-    if (has_enough_space) {
-        VLOG(2) << "Reserved space. New available: "
-                << space_manager_.AvailableSpace()
-                << ", New used (this session): " << space_manager_.UsedSpace();
+    std::unique_lock<std::shared_mutex> lock(space_mutex_);
+
+    if (!initialized_.load(std::memory_order_acquire)) {
+        LOG(ERROR) << "CheckDiskSpace called before StorageBackend::Init was "
+                      "completed.";
+        return false;
     }
+
+    bool has_enough_space = available_space_ >= required_size;
+
+    if (has_enough_space) {
+        // Also check actual disk space to handle multiple instances
+        // sharing the same filesystem with independent quotas.
+        namespace fs = std::filesystem;
+        fs::path storage_root = fs::path(root_dir_) / GetActualFsdir();
+        std::error_code ec;
+        auto space_info = fs::space(storage_root, ec);
+        if (!ec) {
+            uint64_t actual_available = space_info.available;
+            constexpr uint64_t kMinFreeSpace = 256 * kMB;
+            if (actual_available < required_size + kMinFreeSpace) {
+                VLOG(1) << "Actual disk space low: available="
+                        << actual_available << ", required=" << required_size
+                        << ". Triggering eviction.";
+                has_enough_space = false;
+            }
+        } else {
+            LOG(WARNING) << "Failed to get disk space info for " << storage_root
+                         << ": " << ec.message();
+        }
+    }
+
+    if (has_enough_space) {
+        used_space_ += required_size;
+        available_space_ -= required_size;
+        VLOG(2) << "Reserved space. New available: " << available_space_
+                << ", New used (this session): " << used_space_;
+    }
+
     return has_enough_space;
 }
 
-std::string StorageBackend::EvictFile() {
+FileRecord StorageBackend::EvictFile() {
     // Eviction is only enabled for local storage
     if (!IsEvictionEnabled()) {
-        LOG(WARNING)
-            << "Eviction is disabled for 3FS mode. Cannot evict files.";
-        return "";
+        LOG(WARNING) << "Eviction is disabled. Cannot evict files.";
+        return {};
     }
 
     // Use FIFO based strategy (earliest written first out)
-    FileRecord record_to_evict = SelectFileToEvictByFIFO();
+    FileRecord record_to_evict = PopFileToEvictByFIFO();
 
     if (record_to_evict.path.empty()) {
         LOG(WARNING) << "No file selected for eviction";
-        return "";
+        return {};
     }
 
-    namespace fs = std::filesystem;
-    std::error_code ec;
-    uint64_t file_size = record_to_evict.size;
-
-    if (fs::remove(record_to_evict.path, ec)) {
-        RemoveFileFromWriteQueue(record_to_evict.path);
-        ReleaseSpace(file_size);
-        return record_to_evict.path;
-    } else {
-        if (!ec || ec == std::errc::no_such_file_or_directory) {
-            RemoveFileFromWriteQueue(record_to_evict.path);
-            return record_to_evict.path;
-        } else {
-            LOG(ERROR) << "Failed to evict file: " << record_to_evict.path
-                       << ", error: " << ec.message();
-            RemoveFileFromWriteQueue(record_to_evict.path);
-            return "";
-        }
+    auto delete_result = DeleteEvictedFile(record_to_evict);
+    if (delete_result) {
+        return record_to_evict;
     }
+    RestoreFileToWriteQueueFront(record_to_evict);
+    return {};
 }
 
-void StorageBackend::AddFileToWriteQueue(const std::string& path,
-                                         uint64_t size) {
-    std::unique_lock<std::shared_mutex> lock(file_queue_mutex_);
+void StorageBackend::AddFileToWriteQueue(const std::string& path, uint64_t size,
+                                         const std::string& key) {
+    uint64_t replaced_size = 0;
+    {
+        std::unique_lock<std::shared_mutex> lock(file_queue_mutex_);
 
-    auto it = file_queue_map_.find(path);
-    if (it != file_queue_map_.end()) {
-        file_write_queue_.erase(it->second);
-        file_queue_map_.erase(it);
+        auto it = file_queue_map_.find(path);
+        if (it != file_queue_map_.end()) {
+            replaced_size = it->second->size;
+            file_write_queue_.erase(it->second);
+            file_queue_map_.erase(it);
+        }
+
+        file_write_queue_.push_back({path, size, key});
+        file_queue_map_[path] = std::prev(file_write_queue_.end());
     }
 
-    file_write_queue_.push_back({path, size});
-    file_queue_map_[path] = std::prev(file_write_queue_.end());
+    ReleaseSpace(replaced_size);
 }
 
 void StorageBackend::RemoveFileFromWriteQueue(const std::string& path) {
@@ -1136,50 +1093,319 @@ void StorageBackend::RemoveFileFromWriteQueue(const std::string& path) {
     }
 }
 
-FileRecord StorageBackend::SelectFileToEvictByFIFO() {
-    std::unique_lock<std::shared_mutex> lock(file_queue_mutex_);
-    if (file_write_queue_.empty()) {
-        LOG(WARNING) << "Queue is empty, cannot select file to evict";
+FileRecord StorageBackend::PopFileToEvictByFIFO() {
+    while (true) {
+        std::string candidate_path;
+        {
+            std::shared_lock<std::shared_mutex> lock(file_queue_mutex_);
+            if (file_write_queue_.empty()) {
+                LOG(WARNING) << "Queue is empty, cannot select file to evict";
+                return {};
+            }
+            candidate_path = file_write_queue_.front().path;
+        }
+
+        MutexLocker path_locker(&GetFilePathMutex(candidate_path));
+        std::unique_lock<std::shared_mutex> lock(file_queue_mutex_);
+        if (file_write_queue_.empty() ||
+            file_write_queue_.front().path != candidate_path) {
+            continue;
+        }
+
+        auto map_it = file_queue_map_.find(candidate_path);
+        if (map_it == file_queue_map_.end() ||
+            map_it->second != file_write_queue_.begin()) {
+            continue;
+        }
+
+        FileRecord record = file_write_queue_.front();
+        file_queue_map_.erase(map_it);
+        file_write_queue_.pop_front();
+        pending_eviction_paths_.insert(record.path);
+        return record;
+    }
+}
+
+void StorageBackend::RestoreFileToWriteQueueFront(const FileRecord& record) {
+    if (record.path.empty()) {
+        return;
+    }
+
+    bool was_replaced = false;
+    {
+        MutexLocker path_locker(&GetFilePathMutex(record.path));
+        std::unique_lock<std::shared_mutex> lock(file_queue_mutex_);
+        pending_eviction_paths_.erase(record.path);
+        if (file_queue_map_.find(record.path) != file_queue_map_.end()) {
+            was_replaced = true;
+        } else {
+            file_write_queue_.push_front(record);
+            file_queue_map_[record.path] = file_write_queue_.begin();
+        }
+    }
+
+    if (was_replaced) {
+        LOG(ERROR) << "Cannot restore evicted record because the path was "
+                      "replaced: "
+                   << record.path;
+        ReleaseSpace(record.size);
+    }
+}
+
+tl::expected<void, ErrorCode> StorageBackend::DeleteEvictedFile(
+    const FileRecord& record) {
+    namespace fs = std::filesystem;
+    MutexLocker path_locker(&GetFilePathMutex(record.path));
+
+    bool was_replaced = false;
+    {
+        std::unique_lock<std::shared_mutex> queue_lock(file_queue_mutex_);
+        if (file_queue_map_.find(record.path) != file_queue_map_.end()) {
+            // A newer StoreObject completed after this record was selected.
+            // The old file contents were replaced in place, so release the old
+            // accounting without deleting the new file.
+            was_replaced = true;
+            pending_eviction_paths_.erase(record.path);
+        }
+    }
+    if (was_replaced) {
+        ReleaseSpace(record.size);
         return {};
     }
 
-    return file_write_queue_.front();
+    std::error_code ec;
+
+    if (fs::remove(record.path, ec) || !ec ||
+        ec == std::errc::no_such_file_or_directory) {
+        {
+            std::unique_lock<std::shared_mutex> queue_lock(file_queue_mutex_);
+            pending_eviction_paths_.erase(record.path);
+        }
+        ReleaseSpace(record.size);
+        return {};
+    }
+
+    LOG(ERROR) << "Failed to evict file: " << record.path
+               << ", error: " << ec.message();
+    return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
 }
 
-tl::expected<void, ErrorCode> StorageBackend::EnsureDiskSpace(
-    size_t required_size) {
-    // If eviction is disabled (3FS mode), skip space checking and eviction
-    // Let 3FS filesystem handle space management itself
+tl::expected<std::vector<std::string>, ErrorCode>
+StorageBackend::EnsureDiskSpace(
+    size_t required_size,
+    StorageBackendInterface::EvictionHandler eviction_handler) {
+    std::vector<std::string> evicted_keys;
+    // If eviction is disabled, skip space checking and eviction
     if (!IsEvictionEnabled()) {
-        return {};
+        return evicted_keys;
     }
 
     const size_t kMaxEvictionAttempts = 1000;
     size_t attempts = 0;
 
     bool space_reserved = CheckDiskSpace(required_size);
-
-    while (!space_reserved && attempts < kMaxEvictionAttempts) {
-        std::string evicted_file = EvictFile();
-        if (evicted_file.empty()) {
-            LOG(ERROR) << "Failed to evict file to make space.";
-            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-        }
-        attempts++;
-
-        space_reserved = CheckDiskSpace(required_size);
+    if (space_reserved) {
+        return evicted_keys;
     }
 
+    uint64_t projected_available_space = 0;
+    {
+        std::shared_lock<std::shared_mutex> lock(space_mutex_);
+        projected_available_space = available_space_;
+    }
+
+    std::vector<FileRecord> pending_evictions;
+    while (projected_available_space < required_size &&
+           attempts < kMaxEvictionAttempts) {
+        FileRecord pending = PopFileToEvictByFIFO();
+        if (pending.path.empty()) {
+            LOG(ERROR) << "Failed to evict file to make space.";
+            for (auto it = pending_evictions.rbegin();
+                 it != pending_evictions.rend(); ++it) {
+                RestoreFileToWriteQueueFront(*it);
+            }
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        if (!pending.key.empty()) {
+            evicted_keys.push_back(pending.key);
+        }
+        projected_available_space += pending.size;
+        pending_evictions.push_back(std::move(pending));
+        attempts++;
+    }
+
+    if (projected_available_space < required_size) {
+        for (auto it = pending_evictions.rbegin();
+             it != pending_evictions.rend(); ++it) {
+            RestoreFileToWriteQueueFront(*it);
+        }
+        LOG(ERROR) << "Still insufficient disk space after selecting files for "
+                      "eviction.";
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+
+    if (eviction_handler && !evicted_keys.empty()) {
+        auto notify_result = eviction_handler(evicted_keys);
+        if (!notify_result) {
+            for (auto it = pending_evictions.rbegin();
+                 it != pending_evictions.rend(); ++it) {
+                RestoreFileToWriteQueueFront(*it);
+            }
+            return tl::make_unexpected(notify_result.error());
+        }
+    }
+
+    bool deletion_failed = false;
+    for (auto& pending : pending_evictions) {
+        auto delete_result = DeleteEvictedFile(pending);
+        if (!delete_result) {
+            deletion_failed = true;
+            pending.key.clear();
+            RestoreFileToWriteQueueFront(pending);
+        }
+    }
+    if (deletion_failed) {
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+
+    space_reserved = CheckDiskSpace(required_size);
     if (!space_reserved) {
         LOG(ERROR) << "Still insufficient disk space after evicting files.";
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
 
-    return {};
+    return evicted_keys;
+}
+
+tl::expected<std::vector<std::string>, ErrorCode>
+StorageBackend::EvictAboveDiskWatermark(
+    double high_watermark_ratio, double low_watermark_ratio,
+    StorageBackendInterface::EvictionHandler eviction_handler) {
+    std::vector<std::string> evicted_keys;
+    if (!IsEvictionEnabled()) {
+        return evicted_keys;
+    }
+    if (!initialized_.load(std::memory_order_acquire)) {
+        LOG(ERROR)
+            << "EvictAboveDiskWatermark called before StorageBackend::Init "
+               "was completed.";
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    uint64_t used_space = 0;
+    uint64_t total_space = 0;
+    {
+        std::shared_lock<std::shared_mutex> lock(space_mutex_);
+        used_space = used_space_;
+        total_space = total_space_;
+    }
+    if (total_space == 0) {
+        return evicted_keys;
+    }
+
+    const uint64_t high_watermark_bytes =
+        static_cast<uint64_t>(total_space * high_watermark_ratio);
+    if (used_space <= high_watermark_bytes) {
+        return evicted_keys;
+    }
+
+    const uint64_t target_used_bytes =
+        static_cast<uint64_t>(total_space * low_watermark_ratio);
+    size_t queue_size = 0;
+    {
+        std::shared_lock<std::shared_mutex> lock(file_queue_mutex_);
+        queue_size = file_write_queue_.size();
+    }
+
+    const size_t max_eviction_attempts = queue_size + 100;
+    size_t attempts = 0;
+    uint64_t projected_used_space = used_space;
+    std::vector<FileRecord> pending_evictions;
+    while (projected_used_space > target_used_bytes &&
+           attempts < max_eviction_attempts) {
+        FileRecord pending = PopFileToEvictByFIFO();
+        if (pending.path.empty()) {
+            LOG(WARNING) << "Disk watermark eviction could not select a file "
+                         << "for eviction; used=" << projected_used_space
+                         << ", target=" << target_used_bytes;
+            break;
+        }
+        if (!pending.key.empty()) {
+            evicted_keys.push_back(pending.key);
+        }
+        projected_used_space = pending.size >= projected_used_space
+                                   ? 0
+                                   : projected_used_space - pending.size;
+        pending_evictions.push_back(std::move(pending));
+        attempts++;
+    }
+
+    if (eviction_handler && !evicted_keys.empty()) {
+        auto notify_result = eviction_handler(evicted_keys);
+        if (!notify_result) {
+            for (auto it = pending_evictions.rbegin();
+                 it != pending_evictions.rend(); ++it) {
+                RestoreFileToWriteQueueFront(*it);
+            }
+            return tl::make_unexpected(notify_result.error());
+        }
+    }
+
+    bool deletion_failed = false;
+    for (auto& pending : pending_evictions) {
+        auto delete_result = DeleteEvictedFile(pending);
+        if (!delete_result) {
+            deletion_failed = true;
+            pending.key.clear();
+            RestoreFileToWriteQueueFront(pending);
+        }
+    }
+
+    {
+        std::shared_lock<std::shared_mutex> lock(space_mutex_);
+        used_space = used_space_;
+    }
+
+    if (used_space > target_used_bytes) {
+        LOG(WARNING) << "Disk watermark eviction stopped above target: used="
+                     << used_space << ", target=" << target_used_bytes
+                     << ", attempts=" << attempts;
+    }
+    if (deletion_failed) {
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    return evicted_keys;
+}
+
+void StorageBackend::UpdateFileRecordKey(const std::string& path,
+                                         const std::string& key) {
+    std::unique_lock<std::shared_mutex> lock(file_queue_mutex_);
+    auto it = file_queue_map_.find(path);
+    if (it == file_queue_map_.end()) {
+        return;
+    }
+    it->second->key = key;
 }
 
 void StorageBackend::ReleaseSpace(uint64_t size_to_release) {
-    space_manager_.Release(size_to_release);
+    if (size_to_release == 0) {
+        return;
+    }
+
+    try {
+        std::unique_lock<std::shared_mutex> lock(space_mutex_);
+        if (size_to_release <= used_space_) {
+            used_space_ -= size_to_release;
+            available_space_ += size_to_release;
+        } else {
+            available_space_ += used_space_;
+            used_space_ = 0;
+        }
+
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Failed to acquire lock while updating space tracking: "
+                   << e.what();
+    }
 }
 
 StorageBackendAdaptor::StorageBackendAdaptor(
@@ -1191,54 +1417,35 @@ StorageBackendAdaptor::StorageBackendAdaptor(
       total_size(0) {}
 
 tl::expected<void, ErrorCode> StorageBackendAdaptor::Init() {
+    namespace fs = std::filesystem;
+    // Validate obviously invalid configuration up front. A missing root
+    // directory is fine: StorageBackend::Init() creates it on demand.
+    std::error_code ec;
+    const auto root_status =
+        fs::status(file_storage_config_.storage_filepath, ec);
+    if (!ec && fs::exists(root_status) && !fs::is_directory(root_status)) {
+        LOG(ERROR) << "Storage path exists but is not a directory: "
+                   << file_storage_config_.storage_filepath;
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (file_per_key_config_.fsdir.empty()) {
+        LOG(ERROR) << "FSDIR cannot be empty";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+
     std::string storage_root =
         file_storage_config_.storage_filepath + file_per_key_config_.fsdir;
 
     storage_backend_ = std::make_unique<StorageBackend>(
         file_storage_config_.storage_filepath, file_per_key_config_.fsdir,
         file_per_key_config_.enable_eviction);
+    storage_backend_->use_uring_ = file_storage_config_.use_uring;
     auto init_result = storage_backend_->Init();
     if (!init_result) {
         LOG(ERROR) << "Failed to init storage backend";
         return init_result;
     }
     return {};
-}
-
-std::string StorageBackendAdaptor::SanitizeKey(const std::string& key) const {
-    // Set of invalid filesystem characters to be replaced
-    constexpr std::string_view kInvalidChars = "/\\:*?\"<>|";
-    std::string sanitized_key;
-    sanitized_key.reserve(key.size());
-
-    for (char c : key) {
-        // Replace invalid characters with underscore
-        sanitized_key.push_back(
-            kInvalidChars.find(c) != std::string_view::npos ? '_' : c);
-    }
-    return sanitized_key;
-}
-
-std::string StorageBackendAdaptor::ResolvePath(const std::string& key) const {
-    // Compute hash of the key
-    size_t hash = std::hash<std::string>{}(key);
-
-    // Use low 8 bits to create 2-level directory structure (e.g. "a1/b2")
-    char dir1 =
-        static_cast<char>('a' + (hash & 0x0F));  // Lower 4 bits -> 16 dirs
-    char dir2 = static_cast<char>(
-        'a' + ((hash >> 4) & 0x0F));  // Next 4 bits -> 16 subdirs
-
-    // Safely construct path using std::filesystem
-    namespace fs = std::filesystem;
-    fs::path dir_path = fs::path(std::string(1, dir1)) / std::string(1, dir2);
-
-    // Combine directory path with sanitized filename
-    fs::path full_path = fs::path(file_storage_config_.storage_filepath) /
-                         file_per_key_config_.fsdir / dir_path /
-                         SanitizeKey(key);
-
-    return full_path.lexically_normal().string();
 }
 
 std::string StorageBackendAdaptor::ConcatSlicesToString(
@@ -1263,8 +1470,8 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
     const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
     std::function<ErrorCode(const std::vector<std::string>& keys,
                             std::vector<StorageObjectMetadata>& metadatas)>
-        complete_handler) {
-    MutexLocker scan_lock(&scan_mutex_);
+        complete_handler,
+    EvictionHandler eviction_handler) {
     if (batch_object.empty()) {
         LOG(ERROR) << "batch object is empty";
         return tl::make_unexpected(ErrorCode::INVALID_KEY);
@@ -1294,12 +1501,15 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
             continue;  // Simulate StoreObject failure
         }
 
-        auto path = ResolvePath(kv.key);
+        auto path =
+            ResolvePathFromKey(kv.key, file_storage_config_.storage_filepath,
+                               file_per_key_config_.fsdir);
         kv.value = ConcatSlicesToString(value);
 
         std::string kv_buf;
         struct_pb::to_pb(kv, kv_buf);
-        auto store_result = storage_backend_->StoreObject(path, kv_buf);
+        auto store_result = storage_backend_->StoreObject(path, kv_buf, kv.key,
+                                                          eviction_handler);
         if (!store_result) {
             LOG(ERROR) << "Failed to store object for key: " << kv.key
                        << ", error: " << store_result.error()
@@ -1336,19 +1546,34 @@ tl::expected<int64_t, ErrorCode> StorageBackendAdaptor::BatchOffload(
     return static_cast<int64_t>(keys.size());
 }
 
+tl::expected<std::vector<std::string>, ErrorCode>
+StorageBackendAdaptor::EvictAboveDiskWatermark(
+    double high_watermark_ratio, double low_watermark_ratio,
+    EvictionHandler eviction_handler) {
+    auto eviction_result = storage_backend_->EvictAboveDiskWatermark(
+        high_watermark_ratio, low_watermark_ratio, eviction_handler);
+    if (!eviction_result) {
+        return tl::make_unexpected(eviction_result.error());
+    }
+    return eviction_result;
+}
+
 tl::expected<bool, ErrorCode> StorageBackendAdaptor::IsExist(
     const std::string& key) {
-    auto path = ResolvePath(key);
+    auto path = ResolvePathFromKey(key, file_storage_config_.storage_filepath,
+                                   file_per_key_config_.fsdir);
     namespace fs = std::filesystem;
     return fs::exists(path);
 }
 
 tl::expected<void, ErrorCode> StorageBackendAdaptor::BatchLoad(
-    const std::unordered_map<std::string, Slice>& batched_slices) {
+    std::unordered_map<std::string, Slice>& batched_slices) {
     for (const auto& [key, slice] : batched_slices) {
         KVEntry kv;
         kv.key = key;
-        auto path = ResolvePath(kv.key);
+        auto path =
+            ResolvePathFromKey(kv.key, file_storage_config_.storage_filepath,
+                               file_per_key_config_.fsdir);
 
         kv.value.resize(slice.size);
 
@@ -1389,81 +1614,21 @@ tl::expected<bool, ErrorCode> StorageBackendAdaptor::IsEnableOffloading() {
     return is_enable_offloading;
 }
 
-tl::expected<void, ErrorCode> StorageBackendAdaptor::MarkKeyDeleted(
-    const std::string& key) {
-    namespace fs = std::filesystem;
-    MutexLocker scan_lock(&scan_mutex_);
-
-    if (!storage_backend_) {
-        LOG(ERROR) << "Storage backend adaptor is not initialized";
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-
-    const std::string path = ResolvePath(key);
-    std::error_code ec;
-    if (!fs::exists(path, ec)) {
-        if (ec) {
-            LOG(ERROR) << "Failed to stat file for key deletion: key=" << key
-                       << ", path=" << path << ", error: " << ec.message();
-            return tl::make_unexpected(ErrorCode::FILE_NOT_FOUND);
-        }
-        return {};
-    }
-
-    const uint64_t file_size = fs::file_size(path, ec);
-    if (ec) {
-        LOG(ERROR) << "Failed to get file size before deletion: key=" << key
-                   << ", path=" << path << ", error: " << ec.message();
-        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-    }
-
-    auto remove_result = storage_backend_->RemoveFile(path);
-    if (!remove_result) {
-        LOG(ERROR) << "Failed to remove file for key deletion: key=" << key
-                   << ", path=" << path << ", error: " << remove_result.error();
-        return remove_result;
-    }
-
-    MutexLocker lock(&mutex_);
-    if (total_keys > 0) {
-        total_keys--;
-    }
-    if (total_size >= static_cast<int64_t>(file_size)) {
-        total_size -= static_cast<int64_t>(file_size);
-    } else {
-        LOG(WARNING) << "Per-key physical accounting underflow on delete: key="
-                     << key << ", tracked_bytes=" << total_size
-                     << ", file_bytes=" << file_size;
-        total_size = 0;
-    }
-    return {};
-}
-
 tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
     const std::function<
         ErrorCode(const std::vector<std::string>& keys,
                   std::vector<StorageObjectMetadata>& metadatas)>& handler) {
     namespace fs = std::filesystem;
-    MutexLocker scan_lock(&scan_mutex_);
 
     fs::path root = fs::path(file_storage_config_.storage_filepath) /
                     file_per_key_config_.fsdir;
     if (!fs::exists(root)) {
-        {
-            MutexLocker lock(&mutex_);
-            total_keys = 0;
-            total_size = 0;
-        }
         meta_scanned_.store(true, std::memory_order_release);
         return {};
     }
 
-    meta_scanned_.store(false, std::memory_order_release);
-
     std::vector<std::string> keys;
     std::vector<StorageObjectMetadata> metas;
-    int64_t scanned_total_keys = 0;
-    int64_t scanned_total_size = 0;
 
     auto flush = [&]() -> tl::expected<void, ErrorCode> {
         if (keys.empty()) return {};
@@ -1473,6 +1638,8 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
         metas.clear();
         return {};
     };
+
+    MutexLocker lock(&mutex_);
 
     std::error_code ec_root;
     for (auto it1 = fs::directory_iterator(root, ec_root);
@@ -1508,9 +1675,10 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
 
                 KVEntry kv;
                 struct_pb::from_pb(kv, buf);
+                storage_backend_->UpdateFileRecordKey(p.string(), kv.key);
 
-                scanned_total_keys++;
-                scanned_total_size += static_cast<int64_t>(buf.size());
+                total_keys++;
+                total_size += buf.size();
 
                 keys.emplace_back(std::move(kv.key));
                 metas.emplace_back(StorageObjectMetadata{
@@ -1529,13 +1697,22 @@ tl::expected<void, ErrorCode> StorageBackendAdaptor::ScanMeta(
         }
     }
 
-    {
-        MutexLocker lock(&mutex_);
-        total_keys = scanned_total_keys;
-        total_size = scanned_total_size;
-    }
     meta_scanned_.store(true, std::memory_order_release);
     return {};
+}
+
+void StorageBackendAdaptor::RemoveAll() {
+    if (storage_backend_) {
+        storage_backend_->RemoveAll();
+    }
+    // Reset adaptor-level counters so IsEnableOffloading() reflects the empty
+    // disk. Without this, total_keys/total_size keep their pre-cleanup values
+    // and the node stays unable to offload until a restart (which rescans
+    // metadata and rebuilds them). Applies to the kFilePerKey path; the
+    // OffsetAllocator backend resets its own atomics internally.
+    MutexLocker lock(&mutex_);
+    total_keys = 0;
+    total_size = 0;
 }
 
 BucketIdGenerator::BucketIdGenerator(int64_t start) {
@@ -1560,16 +1737,35 @@ BucketStorageBackend::BucketStorageBackend(
     const BucketBackendConfig& bucket_backend_config_)
     : StorageBackendInterface(file_storage_config_),
       storage_path_(file_storage_config_.storage_filepath),
-      bucket_backend_config_(bucket_backend_config_),
-      space_manager_(storage_path_) {}
+      bucket_backend_config_(bucket_backend_config_) {
+    // Allocate aligned buffer for O_DIRECT I/O operations
+    void* buf = nullptr;
+    int ret = posix_memalign(&buf, kDirectIOAlignment, kAlignedBufferSize);
+    if (ret != 0) {
+        LOG(ERROR)
+            << "BucketStorageBackend: Failed to allocate aligned buffer: "
+            << strerror(ret);
+    } else {
+        aligned_io_buffer_.reset(buf);
+        // Update the deleter to use free
+        aligned_io_buffer_ = std::unique_ptr<void, void (*)(void*)>(
+            buf, [](void* p) { free(p); });
+        LOG(INFO) << "BucketStorageBackend: Allocated " << kAlignedBufferSize
+                  << " bytes aligned buffer at " << buf;
+    }
+}
 
-BucketStorageBackend::~BucketStorageBackend() { StopDeletionWorker(); }
+BucketStorageBackend::~BucketStorageBackend() {
+    StopDeletionWorker();
+    ClearFileCache();
+}
 
 tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
     const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
     std::function<ErrorCode(const std::vector<std::string>& keys,
                             std::vector<StorageObjectMetadata>& metadatas)>
-        complete_handler) {
+        complete_handler,
+    EvictionHandler eviction_handler) {
     if (!initialized_.load(std::memory_order_acquire)) {
         LOG(ERROR)
             << "Storage backend is not initialized. Call Init() before use.";
@@ -1597,29 +1793,119 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BatchOffload(
         return tl::make_unexpected(build_bucket_result.error());
     }
     auto bucket = build_bucket_result.value();
+
+    // Phase 1: eviction — remove oldest buckets from metadata maps to make
+    // room. Must notify master BEFORE deleting files (Phase 2).
+    const int64_t required_size = bucket->data_size + bucket->meta_size;
+    auto prepare_result = PrepareEviction(required_size, bucket->keys);
+    if (!prepare_result) {
+        return tl::make_unexpected(prepare_result.error());
+    }
+    PendingEviction pending = std::move(prepare_result.value());
+
+    // Notify master about evicted keys BEFORE touching the files.
+    if (eviction_handler && !pending.keys.empty()) {
+        auto notify_result = eviction_handler(pending.keys);
+        if (!notify_result) {
+            RestorePreparedEviction(std::move(pending));
+            return tl::make_unexpected(notify_result.error());
+        }
+    }
+    CommitPreparedEviction(pending);
+
+    // Phase 2: delete evicted files NOW, before writing the new bucket, so
+    // that the freed disk space is available for the incoming write.
+    auto finalize_result = FinalizeEviction(pending);
+    if (!finalize_result) {
+        LOG(ERROR)
+            << "FinalizeEviction failed after master committed eviction; "
+               "continuing BatchOffload: "
+            << finalize_result.error();
+    }
+
     auto write_bucket_result = WriteBucket(bucket_id, bucket, iovs);
     if (!write_bucket_result) {
         LOG(ERROR) << "Failed to write bucket with id: " << bucket_id;
+        ReleasePreparedWrite(pending);
         return tl::make_unexpected(write_bucket_result.error());
     }
+    VLOG(1) << "Written bucket with id: " << bucket_id;
+    // Save a copy of bucket->keys before std::move(bucket) into buckets_
+    // consumes the shared_ptr. Needed for complete_handler and rollback.
+    const auto bucket_keys = bucket->keys;
+
+    // Commit to metadata maps under exclusive lock FIRST.
+    // This ensures any concurrent BatchLoad arriving after Master redirects
+    // reads to this node can find the key in object_bucket_map_.
+    // Even if complete_handler fails later, the read path is correct —
+    // RollbackCommittedBucket will undo the commit safely.
+    {
+        SharedMutexLocker lock(&mutex_);
+
+        ReleasePreparedWriteLocked(pending);
+
+        // Pre-check for duplicates before modifying any state
+        bool duplicate_found = false;
+        for (const auto& key : bucket_keys) {
+            if (object_bucket_map_.find(key) != object_bucket_map_.end()) {
+                duplicate_found = true;
+                break;
+            }
+        }
+
+        if (!duplicate_found) {
+            total_size_ += bucket->data_size + bucket->meta_size;
+            object_bucket_map_.reserve(object_bucket_map_.size() +
+                                       bucket_keys.size());
+            for (size_t i = 0; i < bucket_keys.size(); ++i) {
+                auto [it, inserted] =
+                    object_bucket_map_.insert({bucket_keys[i], metadatas[i]});
+                CHECK(inserted)
+                    << "Reserved key became duplicated: " << bucket_keys[i];
+            }
+            auto ts = 0LL;
+            // Update LRU timestamp for in case of eviction.
+            if (bucket_backend_config_.eviction_policy ==
+                BucketEvictionPolicy::LRU) {
+                ts =
+                    std::chrono::steady_clock::now().time_since_epoch().count();
+                bucket->last_access_ns_.store(ts, std::memory_order_relaxed);
+            }
+            buckets_.emplace(bucket_id, std::move(bucket));
+            lru_index_.emplace(ts, bucket_id);
+        }
+        if (duplicate_found) {
+            LOG(ERROR) << "Reserved key became duplicated before commit, "
+                          "bucket_id="
+                       << bucket_id;
+            lock.unlock();
+            CleanupOrphanedBucket(bucket_id);
+            return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+        }
+    }
+    // Lock released. From this point forward, concurrent BatchLoad
+    // can find the keys and read from the committed bucket files.
+
+    // Notify Master AFTER local index is committed.
+    // metadatas[i].transport_endpoint is empty here (it gets populated by
+    // complete_handler before the RPC); int64_t fields carry the metadata
+    // from BuildBucket unchanged.
     if (complete_handler != nullptr) {
-        auto error_code = complete_handler(bucket->keys, metadatas);
+        auto error_code = complete_handler(bucket_keys, metadatas);
         if (error_code != ErrorCode::OK) {
             LOG(ERROR) << "Complete handler failed: " << error_code
-                       << ", Key count: " << bucket->keys.size()
+                       << ", Key count: " << bucket_keys.size()
                        << ", Bucket id: " << bucket_id;
+            // Master was NOT notified. The local index has entries that
+            // Master doesn't know about — a "client can read but Master
+            // doesn't know" ghost replica. Rollback the local commit
+            // (removes index entries + waits for inflight reads + deletes
+            // on-disk files).
+            RollbackCommittedBucket(bucket_id, bucket_keys);
             return tl::make_unexpected(error_code);
         }
     }
-    SharedMutexLocker lock(&mutex_);
-    physical_used_bytes_ += bucket->data_size + bucket->meta_size;
-    object_bucket_map_.reserve(object_bucket_map_.size() + bucket->keys.size());
-    for (size_t i = 0; i < bucket->keys.size(); ++i) {
-        object_bucket_map_.emplace(bucket->keys[i], std::move(metadatas[i]));
-    }
-    // Initialize valid key count for this bucket (before move!)
-    bucket_valid_keys_[bucket_id] = bucket->keys.size();
-    buckets_.emplace(bucket_id, std::move(bucket));
+
     return bucket_id;
 }
 
@@ -1641,36 +1927,178 @@ tl::expected<void, ErrorCode> BucketStorageBackend::BatchQuery(
 }
 
 tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoad(
-    const std::unordered_map<std::string, Slice>& batch_object) {
-    std::unordered_map<int64_t, std::vector<std::string>> bucket_keys_map;
-    std::unordered_map<int64_t, std::vector<StorageObjectMetadata>>
-        bucket_key_metas_map;
+    std::unordered_map<std::string, Slice>& batch_object) {
+    // Step 1: Build read plan by copying metadata under lock
+    // BucketReadGuard increments inflight_reads_ to prevent deletion during IO.
+    // When the guard goes out of scope, it decrements the counter.
+    struct ReadPlan {
+        std::string key;
+        int64_t bucket_id;
+        int64_t offset;
+        int64_t key_size;
+        int64_t data_size;
+        Slice dest_slice;
+    };
+
+    // Group by bucket for efficient file access
+    // BucketReadGuard tracks inflight reads - one guard per bucket being read
+    std::unordered_map<int64_t, std::vector<ReadPlan>> bucket_read_plans;
+    std::vector<BucketReadGuard> bucket_guards;  // RAII guards for all buckets
+
     {
         SharedMutexLocker lock(&mutex_, shared_lock);
-        for (const auto& key_it : batch_object) {
-            auto object_bucket_it = object_bucket_map_.find(key_it.first);
-            if (object_bucket_it == object_bucket_map_.end()) {
-                LOG(ERROR) << "key " << key_it.first << " does not exist";
+        for (const auto& [key, dest_slice] : batch_object) {
+            // Lookup key -> metadata
+            auto object_it = object_bucket_map_.find(key);
+            if (object_it == object_bucket_map_.end()) {
+                LOG(ERROR) << "Key not found: " << key;
                 return tl::make_unexpected(ErrorCode::INVALID_KEY);
             }
-            auto [bucket_keys_it, create_keys_it] =
-                bucket_keys_map.try_emplace(object_bucket_it->second.bucket_id);
-            bucket_keys_it->second.emplace_back(key_it.first);
-            auto [bucket_key_metas_it, create_metas_it] =
-                bucket_key_metas_map.try_emplace(
-                    object_bucket_it->second.bucket_id);
-            bucket_key_metas_it->second.emplace_back(object_bucket_it->second);
+            const auto& metadata = object_it->second;
+
+            // Lookup bucket -> BucketMetadata
+            auto bucket_it = buckets_.find(metadata.bucket_id);
+            if (bucket_it == buckets_.end()) {
+                LOG(ERROR) << "Bucket not found for key: " << key
+                           << ", bucket_id=" << metadata.bucket_id;
+                return tl::make_unexpected(ErrorCode::BUCKET_NOT_FOUND);
+            }
+
+            // Validate size
+            if (metadata.data_size != static_cast<int64_t>(dest_slice.size)) {
+                LOG(ERROR) << "Size mismatch for key: " << key
+                           << ", expected: " << metadata.data_size
+                           << ", got: " << dest_slice.size;
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+
+            // Create guard for this bucket if not already guarded
+            // (one guard per bucket is sufficient - increments refcount once)
+            if (bucket_read_plans.find(metadata.bucket_id) ==
+                bucket_read_plans.end()) {
+                bucket_guards.emplace_back(bucket_it->second);
+
+                // Update LRU timestamp for this bucket.
+                if (bucket_backend_config_.eviction_policy ==
+                    BucketEvictionPolicy::LRU) {
+                    auto now = std::chrono::steady_clock::now()
+                                   .time_since_epoch()
+                                   .count();
+                    bucket_it->second->last_access_ns_.store(
+                        now, std::memory_order_relaxed);
+                }
+            }
+
+            // Copy metadata into read plan
+            bucket_read_plans[metadata.bucket_id].push_back(
+                ReadPlan{key, metadata.bucket_id, metadata.offset,
+                         metadata.key_size, metadata.data_size, dest_slice});
         }
     }
-    for (const auto& bucket_keys_it : bucket_keys_map) {
-        auto result = BatchLoadBucket(
-            bucket_keys_it.first, bucket_keys_it.second,
-            bucket_key_metas_map.at(bucket_keys_it.first), batch_object);
-        if (!result) {
-            LOG(ERROR) << "Failed to load bucket " << bucket_keys_it.first;
-            return result;
+    // Lock released here - bucket files protected by BucketReadGuards
+    // which remain alive until this function returns (~line bucket_guards
+    // destructor), keeping inflight_reads_ > 0 throughout the I/O phase.
+
+    // Step 2: Perform IO without holding any locks
+    for (auto& [bucket_id, read_plans] : bucket_read_plans) {
+        // Open file for this bucket (cheap syscall, no lock needed)
+        auto filepath_res = GetBucketDataPath(bucket_id);
+        if (!filepath_res) {
+            LOG(ERROR) << "Failed to get bucket data path, bucket_id="
+                       << bucket_id;
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+
+        auto file_res = OpenFile(filepath_res.value(), FileMode::Read);
+        if (!file_res) {
+            LOG(ERROR) << "Failed to open bucket file: "
+                       << filepath_res.value();
+            return tl::make_unexpected(file_res.error());
+        }
+        auto& file = file_res.value();
+
+        // Read each key's data
+        for (const auto& plan : read_plans) {
+            int64_t actual_offset = plan.offset + plan.key_size;
+            tl::expected<size_t, ErrorCode> read_res;
+
+#ifdef USE_URING
+            // Try to use read_aligned for O_DIRECT I/O if file is UringFile
+            UringFile* uring_file = dynamic_cast<UringFile*>(file.get());
+            if (uring_file != nullptr) {
+                // Calculate aligned read range
+                int64_t aligned_offset =
+                    align_down(actual_offset, kDirectIOAlignment);
+                int64_t data_end =
+                    actual_offset + static_cast<int64_t>(plan.dest_slice.size);
+                int64_t aligned_end = static_cast<int64_t>(align_up(
+                    static_cast<size_t>(data_end), kDirectIOAlignment));
+                size_t aligned_size =
+                    static_cast<size_t>(aligned_end - aligned_offset);
+                int64_t offset_in_buffer = actual_offset - aligned_offset;
+
+                // Zero-copy path: read directly into the slice buffer.
+                // dest_slice.ptr is 4096-aligned and oversized (from
+                // AllocateBatch) to accommodate the full aligned read range.
+                read_res = uring_file->read_aligned(
+                    plan.dest_slice.ptr, aligned_size, aligned_offset);
+
+                if (read_res) {
+                    // Verify the aligned read returned enough bytes
+                    // to cover the actual data region.  read_aligned
+                    // reads the full aligned range [aligned_offset,
+                    // aligned_end); the caller-visible data starts at
+                    // offset_in_buffer into that buffer and spans
+                    // plan.dest_slice.size bytes.
+                    size_t min_required =
+                        static_cast<size_t>(offset_in_buffer) +
+                        plan.dest_slice.size;
+                    if (read_res.value() < min_required) {
+                        LOG(ERROR)
+                            << "read_aligned short read for key: " << plan.key
+                            << ", bucket_id=" << plan.bucket_id
+                            << ", expected at least: " << min_required
+                            << " (aligned_size=" << aligned_size
+                            << ", data_size=" << plan.dest_slice.size << ")"
+                            << ", got: " << read_res.value();
+                        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                    }
+                    // Adjust ptr to point to actual data start
+                    // (zero-copy: no memcpy, buffer was oversized by
+                    // AllocateBatch to accommodate the aligned read)
+                    batch_object.at(plan.key).ptr =
+                        static_cast<char*>(plan.dest_slice.ptr) +
+                        offset_in_buffer;
+                    // Normalize read_res so the common validation
+                    // below passes.  The real short-read check was
+                    // already done above (min_required).
+                    read_res = plan.dest_slice.size;
+                }
+            } else
+#endif
+            {
+                // Fallback to vector_read for non-UringFile
+                iovec iov{plan.dest_slice.ptr, plan.dest_slice.size};
+                read_res = file->vector_read(&iov, 1, actual_offset);
+            }
+
+            if (!read_res) {
+                LOG(ERROR) << "vector_read failed for key: " << plan.key
+                           << ", bucket_id=" << plan.bucket_id
+                           << ", error: " << read_res.error();
+                return tl::make_unexpected(read_res.error());
+            }
+
+            if (read_res.value() != plan.dest_slice.size) {
+                LOG(ERROR) << "Read size mismatch for key: " << plan.key
+                           << ", expected: " << plan.dest_slice.size
+                           << ", got: " << read_res.value();
+                return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+            }
         }
     }
+
+    // bucket_guards go out of scope here, decrementing inflight_reads_
     return {};
 }
 
@@ -1694,28 +2122,31 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
             LOG(ERROR) << "Storage backend already initialized";
             return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
         }
-        std::error_code ec;
-        if (!fs::exists(storage_path_)) {
-            fs::create_directories(storage_path_, ec);
-            if (ec) {
-                LOG(ERROR) << "Failed to create bucket storage directory: "
-                           << storage_path_ << ", error: " << ec.message();
-                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-            }
-        }
         SharedMutexLocker lock(&mutex_);
         object_bucket_map_.clear();
         buckets_.clear();
-        physical_used_bytes_ = 0;
+        lru_index_.clear();
+        total_size_ = 0;
         int64_t max_bucket_id = BucketIdGenerator::INIT_NEW_START_ID;
+
         for (const auto& entry :
              fs::recursive_directory_iterator(storage_path_)) {
             if (entry.is_regular_file() &&
                 entry.path().extension() == BUCKET_METADATA_FILE_SUFFIX) {
                 const auto& bucket_id_str = entry.path().stem();
-                int64_t bucket_id = std::stoll(bucket_id_str);
+                int64_t bucket_id = 0;
+                try {
+                    bucket_id = std::stoll(bucket_id_str);
+                } catch (const std::exception& e) {
+                    LOG(WARNING)
+                        << "Skipping metadata file with a non-numeric "
+                           "bucket id: "
+                        << entry.path().string() << " (" << e.what() << ")";
+                    continue;
+                }
                 auto [metadata_it, success] = buckets_.try_emplace(
                     bucket_id, std::make_shared<BucketMetadata>());
+                if (success) lru_index_.emplace(0LL, bucket_id);
                 if (!success) {
                     LOG(ERROR) << "Failed to load bucket " << bucket_id_str;
                     return tl::make_unexpected(
@@ -1740,6 +2171,34 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                         fs::remove(bucket_meta_path_res.value());
                     }
 
+                    lru_index_.erase({0LL, bucket_id});
+                    buckets_.erase(bucket_id);
+                    continue;
+                }
+                auto bucket_data_path_res = GetBucketDataPath(bucket_id);
+                if (!bucket_data_path_res) {
+                    LOG(ERROR) << "Failed to get data path for bucket: "
+                               << bucket_id_str;
+                    return tl::make_unexpected(bucket_data_path_res.error());
+                }
+
+                std::error_code bucket_data_ec;
+                const auto bucket_data_status =
+                    fs::status(bucket_data_path_res.value(), bucket_data_ec);
+                if (bucket_data_ec &&
+                    bucket_data_ec != std::errc::no_such_file_or_directory) {
+                    LOG(ERROR) << "Failed to inspect bucket data file: "
+                               << bucket_data_path_res.value()
+                               << ", error: " << bucket_data_ec.message();
+                    return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+                }
+                if (bucket_data_ec == std::errc::no_such_file_or_directory ||
+                    !fs::is_regular_file(bucket_data_status)) {
+                    LOG(ERROR) << "Bucket metadata has no valid data file: "
+                               << entry.path().string()
+                               << ", will delete the bucket's remaining files";
+                    CleanupOrphanedBucket(bucket_id);
+                    lru_index_.erase({0LL, bucket_id});
                     buckets_.erase(bucket_id);
                     continue;
                 }
@@ -1774,14 +2233,15 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                         fs::remove(bucket_meta_path_res.value());
                     }
 
+                    lru_index_.erase({0LL, bucket_id});
                     buckets_.erase(bucket_id);
                     continue;
                 }
                 if (bucket_id > max_bucket_id) {
                     max_bucket_id = bucket_id;
                 }
-                physical_used_bytes_ += metadata_it->second->data_size +
-                                        metadata_it->second->meta_size;
+                total_size_ += metadata_it->second->data_size +
+                               metadata_it->second->meta_size;
                 for (size_t i = 0; i < metadata_it->second->keys.size(); i++) {
                     object_bucket_map_.emplace(
                         metadata_it->second->keys[i],
@@ -1791,40 +2251,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                             metadata_it->second->metadatas[i].key_size,
                             metadata_it->second->metadatas[i].data_size, ""});
                 }
-                // Initialize valid key count for recovered bucket
-                bucket_valid_keys_[bucket_id] =
-                    metadata_it->second->keys.size();
             }
-        }
-
-        uint64_t stale_tmp_files_count = 0;
-        uint64_t stale_tmp_space_freed = 0;
-        for (const auto& entry :
-             fs::recursive_directory_iterator(storage_path_)) {
-            if (!entry.is_regular_file() ||
-                !IsBucketTemporaryFile(entry.path())) {
-                continue;
-            }
-
-            std::error_code cleanup_ec;
-            const uint64_t file_size = entry.file_size(cleanup_ec);
-            if (!cleanup_ec && fs::remove(entry.path(), cleanup_ec)) {
-                stale_tmp_files_count++;
-                stale_tmp_space_freed += file_size;
-                LOG(WARNING) << "Removed stale temporary bucket file: "
-                             << entry.path().string() << " (size: " << file_size
-                             << " bytes)";
-            } else if (cleanup_ec) {
-                LOG(ERROR) << "Failed to remove stale temporary bucket file: "
-                           << entry.path().string()
-                           << ", error: " << cleanup_ec.message();
-            }
-        }
-
-        if (stale_tmp_files_count > 0) {
-            LOG(INFO) << "Temporary bucket cleanup completed: removed "
-                      << stale_tmp_files_count << " stale file(s), freed "
-                      << stale_tmp_space_freed << " bytes";
         }
 
         // Clean up orphaned bucket files (.bucket files without corresponding
@@ -1854,7 +2281,16 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
             // Extract bucket ID from filename (e.g., "12345.bucket" ->
             // "12345")
             auto bucket_id_str = entry.path().stem();
-            int64_t bucket_id = std::stoll(bucket_id_str);
+            int64_t bucket_id = 0;
+            try {
+                bucket_id = std::stoll(bucket_id_str);
+            } catch (const std::exception& e) {
+                LOG(WARNING)
+                    << "Skipping orphan-scan file with a non-numeric "
+                       "bucket id: "
+                    << entry.path().string() << " (" << e.what() << ")";
+                continue;
+            }
 
             // Check if this bucket has valid metadata
             if (valid_bucket_ids.find(bucket_id) != valid_bucket_ids.end()) {
@@ -1886,10 +2322,16 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
                       << orphaned_space_freed << " bytes";
         }
 
-        auto init_space_result =
-            space_manager_.Init(static_cast<uint64_t>(physical_used_bytes_));
-        if (!init_space_result) {
-            return init_space_result;
+        // When max_total_size is not explicitly set (<= 0), default to 90% of
+        // the physical disk capacity to match FilePerKey backend behavior.
+        if (bucket_backend_config_.max_total_size <= 0) {
+            constexpr double kDefaultQuotaPercentage = 0.9;
+            const auto space_info = fs::space(storage_path_);
+            bucket_backend_config_.max_total_size = static_cast<int64_t>(
+                space_info.capacity * kDefaultQuotaPercentage);
+            LOG(INFO) << "Bucket backend max_total_size not set; using "
+                      << kDefaultQuotaPercentage * 100 << "% of disk capacity: "
+                      << bucket_backend_config_.max_total_size << " bytes";
         }
 
         bucket_id_generator_.emplace(max_bucket_id);
@@ -1901,8 +2343,24 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
             LOG(INFO) << "Initialized BucketIdGenerator from existing state. "
                       << "Last used bucket ID was " << max_bucket_id;
         }
-        StartDeletionWorker();
+
+        // Initialize P2P space manager and bucket valid-key accounting
+        space_manager_.SetStorageRoot(storage_path_);
+        uint64_t used_space = 0;
+        for (const auto& [bucket_id, bucket_meta] : buckets_) {
+            used_space += static_cast<uint64_t>(bucket_meta->data_size);
+            bucket_valid_keys_[bucket_id] =
+                static_cast<int>(bucket_meta->keys.size());
+        }
+        auto init_space_result = space_manager_.Init(used_space, 0);
+        if (!init_space_result) {
+            LOG(ERROR) << "Failed to init LocalStorageSpaceManager: "
+                       << init_space_result.error();
+            return tl::make_unexpected(init_space_result.error());
+        }
+
         initialized_.store(true, std::memory_order_release);
+        StartDeletionWorker();
     } catch (const std::exception& e) {
         LOG(ERROR) << "Bucket storage backend initialize error: " << e.what()
                    << std::endl;
@@ -1915,11 +2373,7 @@ tl::expected<void, ErrorCode> BucketStorageBackend::Init() {
 tl::expected<bool, ErrorCode> BucketStorageBackend::IsExist(
     const std::string& key) {
     SharedMutexLocker lock(&mutex_, shared_lock);
-    auto bucket_id_it = object_bucket_map_.find(key);
-    if (bucket_id_it != object_bucket_map_.end()) {
-        return true;
-    }
-    return false;
+    return object_bucket_map_.find(key) != object_bucket_map_.end();
 }
 
 tl::expected<bool, ErrorCode> BucketStorageBackend::IsEnableOffloading() {
@@ -2004,310 +2458,8 @@ tl::expected<int64_t, ErrorCode> BucketStorageBackend::BucketScan(
 tl::expected<OffloadMetadata, ErrorCode>
 BucketStorageBackend::GetStoreMetadata() {
     SharedMutexLocker lock(&mutex_, shared_lock);
-    OffloadMetadata metadata(object_bucket_map_.size(), physical_used_bytes_);
+    OffloadMetadata metadata(object_bucket_map_.size(), total_size_);
     return metadata;
-}
-
-tl::expected<int64_t, ErrorCode> BucketStorageBackend::SelectBucketForEviction()
-    const {
-    SharedMutexLocker lock(&mutex_, shared_lock);
-
-    if (buckets_.empty()) {
-        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-    }
-
-    // Strategy: prioritize buckets with fragmentation > 50%, select oldest
-    constexpr float FRAG_THRESHOLD = 0.5f;
-    int64_t best_fragmented = -1;
-
-    for (const auto& [bucket_id, bucket_meta] : buckets_) {
-        int total_keys = bucket_meta->keys.size();
-        if (total_keys == 0) continue;
-
-        // Get valid key count from tracking map
-        int valid_keys = 0;
-        auto it = bucket_valid_keys_.find(bucket_id);
-        if (it != bucket_valid_keys_.end()) {
-            valid_keys = it->second;
-        }
-
-        float frag_ratio = 1.0f - (float)valid_keys / total_keys;
-
-        if (frag_ratio > FRAG_THRESHOLD) {
-            // Select oldest fragmented bucket (smallest bucket_id)
-            if (best_fragmented == -1 || bucket_id < best_fragmented) {
-                best_fragmented = bucket_id;
-            }
-        }
-    }
-
-    // If found fragmented bucket, return it
-    if (best_fragmented != -1) {
-        LOG(INFO) << "Selected fragmented bucket " << best_fragmented
-                  << " for eviction";
-        return best_fragmented;
-    }
-
-    // Otherwise, select oldest bucket
-    int64_t oldest_bucket = buckets_.begin()->first;
-    LOG(INFO) << "Selected oldest bucket " << oldest_bucket << " for eviction";
-    return oldest_bucket;
-}
-
-tl::expected<size_t, ErrorCode> BucketStorageBackend::EvictBucket(
-    int64_t bucket_id) {
-    size_t freed_size = 0;
-    size_t key_count = 0;
-    uint64_t data_bytes = 0;
-    uint64_t meta_bytes = 0;
-    uint64_t queued_delete_bytes = 0;
-
-    {
-        SharedMutexLocker lock(&mutex_);
-
-        // Find bucket metadata
-        auto bucket_it = buckets_.find(bucket_id);
-        if (bucket_it == buckets_.end()) {
-            LOG(ERROR) << "Bucket " << bucket_id << " not found";
-            return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
-        }
-
-        auto bucket_meta = bucket_it->second;
-        key_count = bucket_meta->keys.size();
-
-        // Remove all live keys from object_bucket_map_ and calculate freed size
-        for (const auto& key : bucket_meta->keys) {
-            auto obj_it = object_bucket_map_.find(key);
-            if (obj_it == object_bucket_map_.end()) {
-                continue;
-            }
-            freed_size += obj_it->second.data_size;
-            object_bucket_map_.erase(obj_it);
-        }
-
-        data_bytes = static_cast<uint64_t>(bucket_meta->data_size);
-        meta_bytes = static_cast<uint64_t>(bucket_meta->meta_size);
-        queued_delete_bytes = data_bytes + meta_bytes;
-
-        buckets_.erase(bucket_it);
-        bucket_valid_keys_.erase(bucket_id);
-    }
-
-    auto data_path_res = GetBucketDataPath(bucket_id);
-    if (!data_path_res) {
-        LOG(ERROR) << "Failed to build data path for bucket " << bucket_id
-                   << ": " << data_path_res.error();
-        return tl::make_unexpected(data_path_res.error());
-    }
-
-    auto meta_path_res = GetBucketMetadataPath(bucket_id);
-    if (!meta_path_res) {
-        LOG(ERROR) << "Failed to build metadata path for bucket " << bucket_id
-                   << ": " << meta_path_res.error();
-        return tl::make_unexpected(meta_path_res.error());
-    }
-
-    EnqueueBucketDeletion(PendingBucketDeletion{
-        bucket_id, data_bytes, meta_bytes, queued_delete_bytes,
-        std::move(data_path_res.value()), std::move(meta_path_res.value())});
-
-    LOG(INFO) << "Evicted bucket " << bucket_id << " with " << key_count
-              << " keys, released " << freed_size
-              << " live bytes and scheduled async file deletion";
-
-    return freed_size;
-}
-
-tl::expected<void, ErrorCode> BucketStorageBackend::MarkKeyDeleted(
-    const std::string& key) {
-    SharedMutexLocker lock(&mutex_);
-
-    // Find which bucket this key belongs to
-    auto obj_it = object_bucket_map_.find(key);
-    if (obj_it == object_bucket_map_.end()) {
-        // Key not found, nothing to do
-        return {};
-    }
-
-    int64_t bucket_id = obj_it->second.bucket_id;
-
-    // Decrement valid key count for this bucket
-    auto bucket_valid_it = bucket_valid_keys_.find(bucket_id);
-    if (bucket_valid_it != bucket_valid_keys_.end() &&
-        bucket_valid_it->second > 0) {
-        bucket_valid_it->second--;
-    }
-
-    // Remove from object_bucket_map_. Physical bytes remain accounted until
-    // async bucket deletion unlinks the underlying files.
-    object_bucket_map_.erase(obj_it);
-
-    return {};
-}
-
-tl::expected<bool, ErrorCode> BucketStorageBackend::CanAcceptAnotherBucket()
-    const {
-    const uint64_t pending_bytes =
-        pending_deletion_bytes_.load(std::memory_order_acquire);
-    const uint64_t pending_count =
-        pending_deletion_count_.load(std::memory_order_acquire);
-    const uint64_t backlog_limit = MaxPendingDeletionBytes();
-    if (pending_bytes > backlog_limit) {
-        LOG(WARNING) << "Bucket deletion backlog is too large: pending_bytes="
-                     << pending_bytes << ", pending_count=" << pending_count
-                     << ", backlog_limit=" << backlog_limit;
-        return false;
-    }
-
-    const uint64_t required_space =
-        static_cast<uint64_t>(bucket_backend_config_.bucket_size_limit);
-    if (!space_manager_.IsInitialized()) {
-        std::error_code ec;
-        const auto space_info = std::filesystem::space(storage_path_, ec);
-        if (ec) {
-            LOG(ERROR) << "Failed to query bucket backend disk space for "
-                       << storage_path_ << ": " << ec.message();
-            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-        }
-        return space_info.available >= required_space;
-    }
-
-    auto physical_space_result =
-        space_manager_.HasPhysicalSpace(required_space);
-    if (!physical_space_result) {
-        return tl::make_unexpected(physical_space_result.error());
-    }
-
-    if (!physical_space_result.value()) {
-        LOG(WARNING) << "Insufficient physical disk space for next bucket: "
-                     << "available_quota=" << space_manager_.AvailableSpace()
-                     << ", required=" << required_space
-                     << ", pending_delete_bytes=" << pending_bytes
-                     << ", pending_delete_count=" << pending_count;
-        return false;
-    }
-
-    return true;
-}
-
-uint64_t BucketStorageBackend::MaxPendingDeletionBytes() const {
-    constexpr uint64_t kMaxPendingDeletionBuckets = 8;
-    const uint64_t bucket_bytes =
-        static_cast<uint64_t>(bucket_backend_config_.bucket_size_limit);
-    return bucket_bytes * kMaxPendingDeletionBuckets;
-}
-
-void BucketStorageBackend::StartDeletionWorker() {
-    std::lock_guard<std::mutex> lock(deletion_mutex_);
-    if (deletion_thread_.joinable()) {
-        return;
-    }
-
-    stop_deletion_worker_ = false;
-    deletion_thread_ =
-        std::thread(&BucketStorageBackend::BucketDeletionWorker, this);
-}
-
-void BucketStorageBackend::StopDeletionWorker() {
-    {
-        std::lock_guard<std::mutex> lock(deletion_mutex_);
-        stop_deletion_worker_ = true;
-    }
-    deletion_cv_.notify_all();
-    if (deletion_thread_.joinable()) {
-        deletion_thread_.join();
-    }
-}
-
-void BucketStorageBackend::EnqueueBucketDeletion(PendingBucketDeletion task) {
-    const uint64_t queued_bytes = task.queued_bytes;
-    {
-        std::lock_guard<std::mutex> lock(deletion_mutex_);
-        pending_bucket_deletions_.push_back(std::move(task));
-    }
-    pending_deletion_count_.fetch_add(1, std::memory_order_acq_rel);
-    pending_deletion_bytes_.fetch_add(queued_bytes, std::memory_order_acq_rel);
-    deletion_cv_.notify_one();
-}
-
-void BucketStorageBackend::BucketDeletionWorker() {
-    namespace fs = std::filesystem;
-
-    for (;;) {
-        PendingBucketDeletion task;
-        {
-            std::unique_lock<std::mutex> lock(deletion_mutex_);
-            deletion_cv_.wait(lock, [this] {
-                return stop_deletion_worker_ ||
-                       !pending_bucket_deletions_.empty();
-            });
-
-            if (stop_deletion_worker_ && pending_bucket_deletions_.empty()) {
-                return;
-            }
-
-            task = std::move(pending_bucket_deletions_.front());
-            pending_bucket_deletions_.pop_front();
-        }
-
-        std::error_code ec;
-        bool release_data_space = false;
-        fs::remove(task.data_path, ec);
-        if (ec) {
-            if (ec == std::errc::no_such_file_or_directory) {
-                release_data_space = true;
-            } else {
-                LOG(WARNING)
-                    << "Failed to remove bucket data file: " << task.data_path
-                    << ", bucket_id=" << task.bucket_id
-                    << ", error: " << ec.message();
-            }
-        } else {
-            release_data_space = true;
-        }
-
-        ec.clear();
-        bool release_meta_space = false;
-        fs::remove(task.meta_path, ec);
-        if (ec) {
-            if (ec == std::errc::no_such_file_or_directory) {
-                release_meta_space = true;
-            } else {
-                LOG(WARNING)
-                    << "Failed to remove bucket metadata file: "
-                    << task.meta_path << ", bucket_id=" << task.bucket_id
-                    << ", error: " << ec.message();
-            }
-        } else {
-            release_meta_space = true;
-        }
-
-        uint64_t released_bytes = 0;
-        if (release_data_space) {
-            released_bytes += task.data_bytes;
-        }
-        if (release_meta_space) {
-            released_bytes += task.meta_bytes;
-        }
-        space_manager_.Release(released_bytes);
-        if (released_bytes > 0) {
-            SharedMutexLocker lock(&mutex_);
-            if (physical_used_bytes_ >= static_cast<int64_t>(released_bytes)) {
-                physical_used_bytes_ -= static_cast<int64_t>(released_bytes);
-            } else {
-                LOG(WARNING)
-                    << "Bucket physical accounting underflow on async delete: "
-                    << "bucket_id=" << task.bucket_id
-                    << ", tracked_bytes=" << physical_used_bytes_
-                    << ", released_bytes=" << released_bytes;
-                physical_used_bytes_ = 0;
-            }
-        }
-
-        pending_deletion_count_.fetch_sub(1, std::memory_order_acq_rel);
-        pending_deletion_bytes_.fetch_sub(task.queued_bytes,
-                                          std::memory_order_acq_rel);
-    }
 }
 
 tl::expected<void, ErrorCode> BucketStorageBackend::AllocateOffloadingBuckets(
@@ -2372,10 +2524,10 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
             }
 
             if (it->second > bucket_backend_config_.bucket_size_limit) {
-                LOG(ERROR) << "Object size exceeds bucket size limit: "
-                           << "key=" << it->first
-                           << ", object_size=" << it->second << ", limit="
-                           << bucket_backend_config_.bucket_size_limit;
+                VLOG(1) << "Object size exceeds bucket size limit: "
+                        << "key=" << it->first << ", object_size=" << it->second
+                        << ", limit="
+                        << bucket_backend_config_.bucket_size_limit;
                 ++it;
                 continue;
             }
@@ -2387,6 +2539,8 @@ tl::expected<void, ErrorCode> BucketStorageBackend::GroupOffloadingKeysByBucket(
                            << ", error=" << is_exist_result.error();
             }
             if (is_exist_result && is_exist_result.value()) {
+                VLOG(1) << "Key already exists in storage backend, skipping: "
+                        << "key=" << it->first;
                 ++it;
                 continue;
             }
@@ -2451,164 +2605,836 @@ BucketStorageBackend::BuildBucket(
     return bucket;
 }
 
-tl::expected<std::string, ErrorCode>
-BucketStorageBackend::SerializeBucketMetadata(
-    const std::shared_ptr<BucketMetadata>& bucket_metadata) {
-    if (!bucket_metadata) {
-        LOG(ERROR) << "Bucket metadata is null";
-        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
-    }
-
-    std::string serialized_metadata;
-    struct_pb::to_pb(*bucket_metadata, serialized_metadata);
-    return serialized_metadata;
-}
-
 tl::expected<void, ErrorCode> BucketStorageBackend::WriteBucket(
     int64_t bucket_id, std::shared_ptr<BucketMetadata> bucket_metadata,
     std::vector<iovec>& iovs) {
     namespace fs = std::filesystem;
-
-    auto serialized_metadata_result = SerializeBucketMetadata(bucket_metadata);
-    if (!serialized_metadata_result) {
-        return tl::make_unexpected(serialized_metadata_result.error());
-    }
-    std::string serialized_metadata =
-        std::move(serialized_metadata_result.value());
-    bucket_metadata->meta_size = serialized_metadata.size();
-
-    const uint64_t reserved_size = static_cast<uint64_t>(
-        bucket_metadata->data_size + bucket_metadata->meta_size);
-    auto physical_space_result = space_manager_.HasPhysicalSpace(reserved_size);
-    if (!physical_space_result) {
-        return tl::make_unexpected(physical_space_result.error());
-    }
-    if (!physical_space_result.value()) {
-        LOG(ERROR) << "Insufficient physical disk space for bucket write: "
-                   << "bucket_id=" << bucket_id
-                   << ", required=" << reserved_size
-                   << ", available=" << space_manager_.AvailableSpace();
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-    }
-    if (!space_manager_.TryReserve(reserved_size)) {
-        LOG(ERROR) << "Failed to reserve bucket write space: bucket_id="
-                   << bucket_id << ", required=" << reserved_size
-                   << ", available=" << space_manager_.AvailableSpace();
-        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-    }
-
     auto bucket_data_path_res = GetBucketDataPath(bucket_id);
     if (!bucket_data_path_res) {
         LOG(ERROR) << "Failed to get bucket data path, bucket_id=" << bucket_id;
-        space_manager_.Release(reserved_size);
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
-    const std::string bucket_data_path = bucket_data_path_res.value();
-    const std::string bucket_data_tmp_path =
-        MakeTemporaryBucketPath(bucket_data_path);
-
-    auto bucket_meta_path_res = GetBucketMetadataPath(bucket_id);
-    if (!bucket_meta_path_res) {
-        LOG(ERROR) << "Failed to get bucket metadata path, bucket_id="
-                   << bucket_id;
-        space_manager_.Release(reserved_size);
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    auto bucket_data_path = bucket_data_path_res.value();
+    auto open_file_result = OpenFile(bucket_data_path, FileMode::Write);
+    if (!open_file_result) {
+        LOG(ERROR) << "Failed to open file for bucket writing: "
+                   << bucket_data_path;
+        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
-    const std::string bucket_meta_path = bucket_meta_path_res.value();
-    const std::string bucket_meta_tmp_path =
-        MakeTemporaryBucketPath(bucket_meta_path);
+    auto file = std::move(open_file_result.value());
 
-    auto cleanup_failed_write = [&]() {
-        RemoveFileIfExists(bucket_data_tmp_path,
-                           "Failed to clean up temporary bucket data file");
-        RemoveFileIfExists(bucket_meta_tmp_path,
-                           "Failed to clean up temporary bucket metadata file");
-        RemoveFileIfExists(bucket_data_path,
-                           "Failed to clean up finalized bucket data file");
-        RemoveFileIfExists(bucket_meta_path,
-                           "Failed to clean up finalized bucket metadata file");
-    };
+#ifdef USE_URING
+    // Try to use write_aligned for O_DIRECT I/O if file is UringFile
+    UringFile* uring_file = dynamic_cast<UringFile*>(file.get());
+    if (uring_file != nullptr) {
+        size_t total_size = static_cast<size_t>(bucket_metadata->data_size);
+        size_t aligned_size = align_up(total_size, kDirectIOAlignment);
 
-    {
-        auto open_file_result = OpenFile(bucket_data_tmp_path, FileMode::Write);
-        if (!open_file_result) {
-            LOG(ERROR) << "Failed to open file for bucket writing: "
-                       << bucket_data_tmp_path;
-            cleanup_failed_write();
-            space_manager_.Release(reserved_size);
-            return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+        // Allocate aligned buffer if needed
+        void* write_buffer = nullptr;
+        std::unique_ptr<void, void (*)(void*)> temp_buffer{nullptr,
+                                                           [](void*) {}};
+
+        if (aligned_size <= kAlignedBufferSize && aligned_io_buffer_) {
+            // Use the pre-allocated buffer
+            write_buffer = aligned_io_buffer_.get();
+        } else {
+            // Allocate a temporary larger buffer
+            void* buf = nullptr;
+            int ret = posix_memalign(&buf, kDirectIOAlignment, aligned_size);
+            if (ret != 0) {
+                LOG(ERROR)
+                    << "Failed to allocate aligned buffer for WriteBucket: "
+                    << strerror(ret);
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            temp_buffer.reset(buf);
+            temp_buffer = std::unique_ptr<void, void (*)(void*)>(
+                buf, [](void* p) { free(p); });
+            write_buffer = buf;
+            LOG(WARNING) << "WriteBucket: bucket_id=" << bucket_id
+                         << " requires " << aligned_size
+                         << " bytes, exceeds buffer size " << kAlignedBufferSize
+                         << ", using temporary allocation";
         }
-        auto file = std::move(open_file_result.value());
 
+        // Aggregate all iovs data into the aligned buffer
+        char* dst = static_cast<char*>(write_buffer);
+        for (const auto& iov : iovs) {
+            memcpy(dst, iov.iov_base, iov.iov_len);
+            dst += iov.iov_len;
+        }
+
+        // Zero-pad the remaining bytes
+        if (aligned_size > total_size) {
+            memset(dst, 0, aligned_size - total_size);
+        }
+
+        // Write using write_aligned
+        auto write_result =
+            uring_file->write_aligned(write_buffer, aligned_size, 0);
+        if (!write_result) {
+            LOG(ERROR) << "write_aligned failed for: " << bucket_id
+                       << ", error: " << write_result.error();
+            return tl::make_unexpected(write_result.error());
+        }
+        if (write_result.value() != aligned_size) {
+            LOG(ERROR) << "Write size mismatch for: " << bucket_data_path
+                       << ", expected: " << aligned_size
+                       << ", got: " << write_result.value();
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+
+        // Flush bucket data to stable storage before writing metadata.
+        // This prevents a crash from leaving valid metadata pointing at
+        // incomplete data (write-ordering durability guarantee).
+        auto sync_result = uring_file->datasync();
+        if (!sync_result) {
+            LOG(ERROR) << "datasync failed for bucket: " << bucket_id;
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+
+        // Invalidate cache for this file since content changed
+        {
+            MutexLocker cache_locker(&file_cache_mutex_);
+            file_cache_.erase(bucket_data_path);
+        }
+    } else
+#endif
+    {
+        // Fallback to vector_write for non-UringFile
         auto write_result = file->vector_write(iovs.data(), iovs.size(), 0);
         if (!write_result) {
             LOG(ERROR) << "vector_write failed for: " << bucket_id
                        << ", error: " << write_result.error();
-            cleanup_failed_write();
-            space_manager_.Release(reserved_size);
             return tl::make_unexpected(write_result.error());
         }
         if (static_cast<int64_t>(write_result.value()) !=
             bucket_metadata->data_size) {
-            LOG(ERROR) << "Write size mismatch for: " << bucket_data_tmp_path
+            LOG(ERROR) << "Write size mismatch for: " << bucket_data_path
                        << ", expected: " << bucket_metadata->data_size
                        << ", got: " << write_result.value();
-            cleanup_failed_write();
-            space_manager_.Release(reserved_size);
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
-    }
 
+        // Invalidate cache for this file since content changed
+        {
+            MutexLocker cache_locker(&file_cache_mutex_);
+            file_cache_.erase(bucket_data_path);
+        }
+    }
     auto store_bucket_metadata_result =
-        StoreBucketMetadata(bucket_meta_tmp_path, serialized_metadata);
+        StoreBucketMetadata(bucket_id, bucket_metadata);
     if (!store_bucket_metadata_result) {
         LOG(ERROR) << "Failed to store bucket metadata, error: "
                    << store_bucket_metadata_result.error();
-        cleanup_failed_write();
-        space_manager_.Release(reserved_size);
+
+        // Clean up the bucket file to prevent orphans
+        std::error_code ec;
+        if (fs::remove(bucket_data_path, ec)) {
+            LOG(WARNING) << "Cleaned up orphaned bucket file after metadata "
+                            "write failure: "
+                         << bucket_data_path;
+        } else if (ec) {
+            LOG(ERROR) << "Failed to clean up bucket file after metadata write "
+                          "failure: "
+                       << bucket_data_path << ", error: " << ec.message();
+        }
+
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
-    }
-
-    auto rename_data_result =
-        RenameBucketFile(bucket_data_tmp_path, bucket_data_path);
-    if (!rename_data_result) {
-        cleanup_failed_write();
-        space_manager_.Release(reserved_size);
-        return rename_data_result;
-    }
-
-    auto rename_meta_result =
-        RenameBucketFile(bucket_meta_tmp_path, bucket_meta_path);
-    if (!rename_meta_result) {
-        cleanup_failed_write();
-        space_manager_.Release(reserved_size);
-        return rename_meta_result;
     }
     return {};
 }
 
+void BucketStorageBackend::CleanupOrphanedBucket(int64_t bucket_id) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+
+    auto data_path_res = GetBucketDataPath(bucket_id);
+    if (data_path_res) {
+        // Evict the cached file handle before deleting the file, matching
+        // the pattern in FinalizeEviction. Without this, a subsequent open
+        // on the same path (e.g. after bucket_id reuse) may return a stale
+        // handle pointing to the now-deleted file.
+        {
+            MutexLocker cache_locker(&file_cache_mutex_);
+            file_cache_.erase(data_path_res.value());
+        }
+        if (fs::remove(data_path_res.value(), ec)) {
+            LOG(INFO) << "Cleaned up orphaned bucket data file: "
+                      << data_path_res.value();
+        } else if (ec && ec != std::errc::no_such_file_or_directory) {
+            LOG(WARNING) << "Failed to cleanup bucket data file: "
+                         << data_path_res.value()
+                         << ", error: " << ec.message();
+        }
+    }
+
+    auto meta_path_res = GetBucketMetadataPath(bucket_id);
+    if (meta_path_res) {
+        ec.clear();
+        if (fs::remove(meta_path_res.value(), ec)) {
+            LOG(INFO) << "Cleaned up orphaned bucket metadata file: "
+                      << meta_path_res.value();
+        } else if (ec && ec != std::errc::no_such_file_or_directory) {
+            LOG(WARNING) << "Failed to cleanup bucket metadata file: "
+                         << meta_path_res.value()
+                         << ", error: " << ec.message();
+        }
+    }
+}
+
+void BucketStorageBackend::RollbackCommittedBucket(
+    int64_t bucket_id, const std::vector<std::string>& keys) {
+    std::shared_ptr<BucketMetadata> bucket_meta;
+
+    // Phase 1: Remove from metadata maps under exclusive lock.
+    // This prevents new readers from finding the keys.
+    {
+        SharedMutexLocker lock(&mutex_);
+
+        auto bucket_it = buckets_.find(bucket_id);
+        if (bucket_it == buckets_.end()) {
+            LOG(WARNING) << "RollbackCommittedBucket: bucket " << bucket_id
+                         << " not found in buckets_ — already removed?";
+            // Still clean up disk files in case they are orphaned
+            CleanupOrphanedBucket(bucket_id);
+            return;
+        }
+
+        // Save a reference for inflight-read waiting
+        bucket_meta = bucket_it->second;
+
+        // Remove all keys from object_bucket_map_
+        for (const auto& key : keys) {
+            auto obj_it = object_bucket_map_.find(key);
+            if (obj_it != object_bucket_map_.end() &&
+                obj_it->second.bucket_id == bucket_id) {
+                total_size_ -=
+                    obj_it->second.data_size + obj_it->second.key_size;
+                object_bucket_map_.erase(obj_it);
+            }
+        }
+
+        // Remove bucket metadata
+        total_size_ -= bucket_meta->meta_size;
+        lru_index_.erase(
+            {bucket_meta->last_access_ns_.load(std::memory_order_relaxed),
+             bucket_id});
+        buckets_.erase(bucket_it);
+    }
+
+    // Phase 2: Wait for inflight reads to drain.
+    // Readers that found the key before we removed it from the map
+    // hold a BucketReadGuard that keeps inflight_reads_ > 0.
+    // In practice this should never block: the bucket was committed and
+    // rolled back within microseconds — no reader had time to acquire a
+    // guard. But guard against the edge case anyway.
+    //
+    // Uses the same spin-then-sleep pattern as DeleteBucket (not the
+    // spin-then-yield pattern of FinalizeEviction) because rollback is a
+    // rare error-recovery path where CPU friendliness matters more than
+    // latency.
+    {
+        constexpr int kMaxSpinIterations = 1000;
+        constexpr auto kSleepDuration = std::chrono::microseconds(100);
+        constexpr auto kMaxWaitTime = std::chrono::seconds(10);
+        int spin_count = 0;
+        auto wait_start = std::chrono::steady_clock::now();
+        while (bucket_meta->inflight_reads_.load(std::memory_order_acquire) >
+               0) {
+            if (++spin_count > kMaxSpinIterations) {
+                std::this_thread::sleep_for(kSleepDuration);
+                spin_count = 0;
+                if (std::chrono::steady_clock::now() - wait_start >
+                    kMaxWaitTime) {
+                    LOG(ERROR)
+                        << "RollbackCommittedBucket: timed out waiting "
+                        << "for inflight reads on bucket " << bucket_id
+                        << " (inflight="
+                        << bucket_meta->inflight_reads_.load(
+                               std::memory_order_relaxed)
+                        << "). Leaving orphaned files on disk; they will "
+                        << "be cleaned up by Init() on next restart.";
+                    // Return WITHOUT deleting files. A reader is still
+                    // holding a guard, so deleting the files could cause
+                    // I/O errors on the read path. This matches
+                    // DeleteBucket's behavior (returns INTERNAL_ERROR
+                    // instead of deleting). The orphan will be recovered
+                    // by Init()'s orphan scan.
+                    return;
+                }
+            } else {
+                PAUSE();
+            }
+        }
+    }
+
+    // Phase 3: Delete on-disk files now that no readers remain.
+    CleanupOrphanedBucket(bucket_id);
+
+    LOG(INFO) << "RollbackCommittedBucket: rolled back bucket " << bucket_id
+              << " with " << keys.size() << " keys";
+}
+
+std::map<int64_t, std::shared_ptr<BucketMetadata>>::iterator
+BucketStorageBackend::SelectEvictionCandidate() {
+    // Must be called with mutex_ held (exclusive).
+    switch (bucket_backend_config_.eviction_policy) {
+        case BucketEvictionPolicy::FIFO:
+            // buckets_ is ordered by bucket_id (monotonically increasing),
+            // so begin() is always the oldest bucket.
+            return buckets_.begin();
+
+        case BucketEvictionPolicy::LRU:
+            // Use lru_index_ (a std::set ordered by {last_access_ns_,
+            // bucket_id}) for O(log N) candidate selection.
+            //
+            // The index may be stale: BatchLoad updates last_access_ns_
+            // atomically under a shared lock without touching lru_index_.
+            // We repair lazily here (called under exclusive lock):
+            //   - If the top entry's timestamp matches the actual
+            //     last_access_ns_, it is the true LRU candidate.
+            //   - If stale, re-insert with the correct timestamp and retry.
+            //   - If the bucket no longer exists, discard the entry.
+            while (!lru_index_.empty()) {
+                auto top_it = lru_index_.begin();
+                auto [ts, id] = *top_it;
+                auto bucket_it = buckets_.find(id);
+                if (bucket_it == buckets_.end()) {
+                    lru_index_.erase(top_it);
+                    continue;
+                }
+                int64_t actual_ts = bucket_it->second->last_access_ns_.load(
+                    std::memory_order_relaxed);
+                if (actual_ts == ts) {
+                    // Correct entry: remove from index (bucket is about to be
+                    // evicted) and return.
+                    lru_index_.erase(top_it);
+                    return bucket_it;
+                }
+                // Stale: repair and retry to find the true minimum.
+                lru_index_.erase(top_it);
+                lru_index_.emplace(actual_ts, id);
+            }
+            return buckets_.end();
+
+        default:
+            return buckets_.end();
+    }
+}
+
+tl::expected<BucketStorageBackend::PendingEviction, ErrorCode>
+BucketStorageBackend::PrepareEviction(
+    int64_t required_size, const std::vector<std::string>& write_keys) {
+    PendingEviction result;
+    SharedMutexLocker lock(&mutex_);
+
+    if (!write_keys.empty()) {
+        for (const auto& key : write_keys) {
+            if (object_bucket_map_.find(key) != object_bucket_map_.end() ||
+                pending_eviction_keys_.find(key) !=
+                    pending_eviction_keys_.end() ||
+                pending_write_keys_.find(key) != pending_write_keys_.end()) {
+                return tl::make_unexpected(ErrorCode::OBJECT_ALREADY_EXISTS);
+            }
+        }
+        result.write_keys = write_keys;
+        result.write_size = required_size;
+        pending_write_size_ += required_size;
+        pending_write_keys_.insert(write_keys.begin(), write_keys.end());
+    }
+
+    if (bucket_backend_config_.eviction_policy == BucketEvictionPolicy::NONE) {
+        return result;
+    }
+
+    // Check actual disk space once before the loop. PrepareEviction only
+    // removes metadata -- files are deleted later in FinalizeEviction -- so
+    // re-checking disk space inside the loop would yield the same result
+    // every iteration and is unnecessary.
+    //
+    // When disk is full, we calculate the space deficit and accumulate
+    // the estimated freed space (data_size + meta_size) per evicted
+    // bucket. Due to block alignment, actual disk usage >= data_size +
+    // meta_size, so this is a safe lower bound -- we will not under-evict.
+    bool initial_disk_full = false;
+    uint64_t deficit = 0;
+    {
+        namespace fs = std::filesystem;
+        std::error_code ec;
+        auto space_info = fs::space(storage_path_, ec);
+        if (!ec) {
+            uint64_t actual_available = space_info.available;
+            constexpr uint64_t kMinFreeSpace = 256 * kMB;
+            // Watermark eviction passes a synthetic required_size to drive
+            // quota-based cleanup. It is not a real incoming write, so it
+            // should not be counted as physical disk free-space demand.
+            uint64_t req_sz = (!write_keys.empty() && required_size > 0)
+                                  ? static_cast<uint64_t>(required_size)
+                                  : 0;
+            initial_disk_full = actual_available < req_sz + kMinFreeSpace;
+            if (initial_disk_full) {
+                deficit = req_sz + kMinFreeSpace - actual_available;
+                LOG(WARNING) << "[Evict] Actual disk space too low: available="
+                             << actual_available << ", required=" << req_sz
+                             << ", deficit=" << deficit
+                             << ". Will evict buckets to free space.";
+            }
+        } else {
+            LOG(WARNING) << "[Evict] Failed to get disk space info for "
+                         << storage_path_ << ": " << ec.message();
+        }
+    }
+
+    size_t evict_count = 0;
+    constexpr size_t kMaxEvictionBuckets = 1000;
+    uint64_t accumulated_freed_space = 0;
+    const int64_t synthetic_required_size =
+        write_keys.empty() ? required_size : 0;
+
+    while (!buckets_.empty() && evict_count < kMaxEvictionBuckets) {
+        bool quota_exceeded = total_size_ + pending_eviction_size_ +
+                                  pending_write_size_ +
+                                  synthetic_required_size >
+                              bucket_backend_config_.max_total_size;
+
+        bool disk_still_full =
+            initial_disk_full && (accumulated_freed_space < deficit);
+
+        if (!quota_exceeded && !disk_still_full) break;
+
+        if (evict_count == 0) {
+            LOG(INFO) << "[Evict] triggered: total=" << total_size_ << "/"
+                      << bucket_backend_config_.max_total_size
+                      << " required=" << required_size
+                      << " disk_full=" << initial_disk_full;
+        }
+
+        auto evict_it = SelectEvictionCandidate();
+        if (evict_it == buckets_.end()) break;
+
+        int64_t evict_id = evict_it->first;
+        std::shared_ptr<BucketMetadata> evict_meta =
+            std::move(evict_it->second);
+        buckets_.erase(evict_it);
+
+        int64_t evicted_size = evict_meta->meta_size;
+        // Remove all keys belonging to this bucket from the object map.
+        for (const auto& key : evict_meta->keys) {
+            auto obj_it = object_bucket_map_.find(key);
+            if (obj_it != object_bucket_map_.end() &&
+                obj_it->second.bucket_id == evict_id) {
+                const int64_t object_size =
+                    obj_it->second.data_size + obj_it->second.key_size;
+                total_size_ -= object_size;
+                evicted_size += object_size;
+                object_bucket_map_.erase(obj_it);
+            }
+        }
+        total_size_ -= evict_meta->meta_size;
+        result.evicted_size += evicted_size;
+
+        // Collect for notification and file deletion.
+        for (const auto& key : evict_meta->keys) {
+            pending_eviction_keys_.insert(key);
+            result.keys.push_back(key);
+        }
+        accumulated_freed_space +=
+            static_cast<uint64_t>(evict_meta->data_size) +
+            static_cast<uint64_t>(evict_meta->meta_size);
+        result.buckets.emplace_back(evict_id, std::move(evict_meta));
+        evict_count++;
+    }
+
+    const bool quota_exceeded = total_size_ + pending_eviction_size_ +
+                                    pending_write_size_ +
+                                    synthetic_required_size >
+                                bucket_backend_config_.max_total_size;
+    pending_eviction_size_ += result.evicted_size;
+    if (!write_keys.empty() && quota_exceeded) {
+        RestorePreparedEvictionLocked(std::move(result));
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+
+    if (!result.buckets.empty()) {
+        LOG(INFO) << "[Evict] prepared: buckets=" << result.buckets.size()
+                  << " keys=" << result.keys.size()
+                  << " total_after=" << total_size_;
+    }
+
+    return result;
+}
+
+void BucketStorageBackend::RestorePreparedEviction(PendingEviction&& pending) {
+    SharedMutexLocker lock(&mutex_);
+    RestorePreparedEvictionLocked(std::move(pending));
+}
+
+void BucketStorageBackend::RestorePreparedEvictionLocked(
+    PendingEviction&& pending) {
+    ReleasePreparedWriteLocked(pending);
+
+    CHECK_GE(pending_eviction_size_, pending.evicted_size);
+    pending_eviction_size_ -= pending.evicted_size;
+    for (const auto& key : pending.keys) {
+        pending_eviction_keys_.erase(key);
+    }
+    for (auto& [bucket_id, bucket_meta] : pending.buckets) {
+        if (!bucket_meta || buckets_.find(bucket_id) != buckets_.end()) {
+            continue;
+        }
+
+        for (size_t i = 0; i < bucket_meta->keys.size(); ++i) {
+            const auto& key = bucket_meta->keys[i];
+            const auto& object_meta = bucket_meta->metadatas[i];
+            object_bucket_map_[key] = StorageObjectMetadata{
+                bucket_id, object_meta.offset, object_meta.key_size,
+                object_meta.data_size, ""};
+            total_size_ += object_meta.data_size + object_meta.key_size;
+        }
+        total_size_ += bucket_meta->meta_size;
+        if (bucket_backend_config_.eviction_policy ==
+            BucketEvictionPolicy::LRU) {
+            lru_index_.emplace(
+                bucket_meta->last_access_ns_.load(std::memory_order_relaxed),
+                bucket_id);
+        }
+        buckets_.emplace(bucket_id, std::move(bucket_meta));
+    }
+}
+
+void BucketStorageBackend::CommitPreparedEviction(
+    const PendingEviction& pending) {
+    if (pending.evicted_size == 0) {
+        return;
+    }
+
+    SharedMutexLocker lock(&mutex_);
+    CHECK_GE(pending_eviction_size_, pending.evicted_size);
+    pending_eviction_size_ -= pending.evicted_size;
+    for (const auto& key : pending.keys) {
+        pending_eviction_keys_.erase(key);
+    }
+}
+
+void BucketStorageBackend::ReleasePreparedWrite(
+    const PendingEviction& pending) {
+    if (pending.write_size == 0) {
+        return;
+    }
+
+    SharedMutexLocker lock(&mutex_);
+    ReleasePreparedWriteLocked(pending);
+}
+
+void BucketStorageBackend::ReleasePreparedWriteLocked(
+    const PendingEviction& pending) {
+    CHECK_GE(pending_write_size_, pending.write_size);
+    pending_write_size_ -= pending.write_size;
+    for (const auto& key : pending.write_keys) {
+        pending_write_keys_.erase(key);
+    }
+}
+
+tl::expected<void, ErrorCode> BucketStorageBackend::FinalizeEviction(
+    const PendingEviction& pending) {
+    namespace fs = std::filesystem;
+
+    constexpr int kMaxSpinIterations = 1000;
+    constexpr auto kMaxWaitTime = std::chrono::seconds(10);
+    size_t cleanup_failed_count = 0;
+
+    for (const auto& [bucket_id, bucket_meta] : pending.buckets) {
+        bool bucket_cleanup_failed = false;
+
+        // The master has already committed the replica removal. Attempt to
+        // remove persisted metadata before waiting for readers. When this
+        // succeeds, a later timeout or data-file deletion failure leaves an
+        // orphan data file instead of a bucket that Init() could recover.
+        std::error_code ec;
+        auto meta_path = GetBucketMetadataPath(bucket_id);
+        if (meta_path) {
+            fs::remove(meta_path.value(), ec);
+            if (ec && ec != std::errc::no_such_file_or_directory) {
+                LOG(ERROR)
+                    << "FinalizeEviction: failed to remove metadata file: "
+                    << meta_path.value() << ", error: " << ec.message();
+                bucket_cleanup_failed = true;
+            }
+        }
+
+        // Wait for in-flight reads that started before the bucket was removed
+        // from the metadata maps in PrepareEviction.
+        bool timed_out = false;
+        int spin_count = 0;
+        auto wait_start = std::chrono::steady_clock::now();
+        while (bucket_meta->inflight_reads_.load(std::memory_order_acquire) >
+               0) {
+            if (++spin_count > kMaxSpinIterations) {
+                std::this_thread::yield();
+                spin_count = 0;
+                if (std::chrono::steady_clock::now() - wait_start >
+                    kMaxWaitTime) {
+                    LOG(ERROR)
+                        << "FinalizeEviction: timed out waiting for in-flight "
+                           "reads, bucket_id="
+                        << bucket_id << ", inflight_reads="
+                        << bucket_meta->inflight_reads_.load(
+                               std::memory_order_relaxed);
+                    timed_out = true;
+                    break;
+                }
+            } else {
+                PAUSE();
+            }
+        }
+        if (timed_out) {
+            cleanup_failed_count++;
+            continue;
+        }
+
+        ec.clear();
+        auto data_path = GetBucketDataPath(bucket_id);
+        if (data_path) {
+            // Evict the cached file handle before deleting the file to prevent
+            // stale handles from accumulating in the cache.
+            {
+                MutexLocker cache_locker(&file_cache_mutex_);
+                file_cache_.erase(data_path.value());
+            }
+            fs::remove(data_path.value(), ec);
+            if (ec && ec != std::errc::no_such_file_or_directory) {
+                // File remains on disk as an orphan; disk space is not freed.
+                // WriteBucket may then fail with ENOSPC. Orphan will be cleaned
+                // up on service restart.
+                LOG(ERROR) << "FinalizeEviction: failed to remove data file: "
+                           << data_path.value() << ", error: " << ec.message();
+                bucket_cleanup_failed = true;
+            }
+        }
+        if (bucket_cleanup_failed) {
+            cleanup_failed_count++;
+        }
+        VLOG(1) << "Evicted bucket with id: " << bucket_id
+                << ", policy: " << bucket_backend_config_.eviction_policy;
+    }
+    if (!pending.buckets.empty()) {
+        LOG(INFO) << "[Evict] finalized: attempted=" << pending.buckets.size()
+                  << " cleanup_failed=" << cleanup_failed_count;
+    }
+    if (cleanup_failed_count != 0) {
+        return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+    }
+    return {};
+}
+
+tl::expected<std::vector<std::string>, ErrorCode>
+BucketStorageBackend::EvictAboveDiskWatermark(
+    double high_watermark_ratio, double low_watermark_ratio,
+    EvictionHandler eviction_handler) {
+    std::vector<std::string> evicted_keys;
+    if (bucket_backend_config_.eviction_policy == BucketEvictionPolicy::NONE ||
+        bucket_backend_config_.max_total_size <= 0) {
+        return evicted_keys;
+    }
+    if (!initialized_.load(std::memory_order_acquire)) {
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+
+    int64_t total_size = 0;
+    int64_t max_total_size = bucket_backend_config_.max_total_size;
+    {
+        SharedMutexLocker lock(&mutex_, shared_lock);
+        total_size = total_size_;
+    }
+
+    const auto high_watermark_bytes =
+        static_cast<int64_t>(max_total_size * high_watermark_ratio);
+    if (total_size <= high_watermark_bytes) {
+        return evicted_keys;
+    }
+
+    const auto target_total_size =
+        static_cast<int64_t>(max_total_size * low_watermark_ratio);
+    const auto synthetic_required_size = max_total_size - target_total_size;
+    auto prepare_result = PrepareEviction(synthetic_required_size);
+    if (!prepare_result) {
+        return tl::make_unexpected(prepare_result.error());
+    }
+    PendingEviction pending = std::move(prepare_result.value());
+    evicted_keys = pending.keys;
+
+    if (eviction_handler && !pending.keys.empty()) {
+        auto notify_result = eviction_handler(pending.keys);
+        if (!notify_result) {
+            RestorePreparedEviction(std::move(pending));
+            return tl::make_unexpected(notify_result.error());
+        }
+    }
+    CommitPreparedEviction(pending);
+    auto finalize_result = FinalizeEviction(pending);
+    if (!finalize_result) {
+        LOG(ERROR)
+            << "FinalizeEviction failed after master committed eviction; "
+               "returning evicted keys: "
+            << finalize_result.error();
+    }
+    return evicted_keys;
+}
+
+tl::expected<void, ErrorCode> BucketStorageBackend::DeleteBucket(
+    int64_t bucket_id) {
+    namespace fs = std::filesystem;
+    std::shared_ptr<BucketMetadata> bucket_metadata;
+    std::vector<std::string> keys_to_remove;
+
+    // Step 1: Remove bucket from metadata maps under exclusive lock
+    {
+        SharedMutexLocker lock(&mutex_);
+
+        auto bucket_it = buckets_.find(bucket_id);
+        if (bucket_it == buckets_.end()) {
+            LOG(WARNING) << "DeleteBucket: bucket not found, bucket_id="
+                         << bucket_id;
+            return tl::make_unexpected(ErrorCode::BUCKET_NOT_FOUND);
+        }
+
+        // Move the shared_ptr out - we now own it
+        bucket_metadata = std::move(bucket_it->second);
+        lru_index_.erase(
+            {bucket_metadata->last_access_ns_.load(std::memory_order_relaxed),
+             bucket_id});
+        buckets_.erase(bucket_it);
+
+        // Collect keys to remove (they reference this bucket)
+        keys_to_remove = bucket_metadata->keys;
+        for (const auto& key : keys_to_remove) {
+            auto obj_it = object_bucket_map_.find(key);
+            if (obj_it != object_bucket_map_.end() &&
+                obj_it->second.bucket_id == bucket_id) {
+                total_size_ -=
+                    obj_it->second.data_size + obj_it->second.key_size;
+                object_bucket_map_.erase(obj_it);
+            }
+        }
+
+        // Subtract metadata size
+        total_size_ -= bucket_metadata->meta_size;
+    }
+    // Lock released - new readers can't find this bucket anymore
+
+    // Step 2: Wait for in-flight reads to complete
+    // Readers that started before we removed from buckets_ still hold guards
+    constexpr int kMaxSpinIterations = 1000;
+    constexpr auto kSleepDuration = std::chrono::microseconds(100);
+    constexpr auto kMaxWaitTime = std::chrono::seconds(10);
+
+    int spin_count = 0;
+    auto wait_start = std::chrono::steady_clock::now();
+    while (bucket_metadata->inflight_reads_.load(std::memory_order_acquire) >
+           0) {
+        if (++spin_count > kMaxSpinIterations) {
+            // After spinning, sleep briefly and check timeout
+            std::this_thread::sleep_for(kSleepDuration);
+            spin_count = 0;  // Reset and continue waiting
+
+            auto elapsed = std::chrono::steady_clock::now() - wait_start;
+            if (elapsed > kMaxWaitTime) {
+                LOG(ERROR)
+                    << "DeleteBucket: timed out waiting for in-flight reads"
+                    << ", bucket_id=" << bucket_id << ", inflight_reads="
+                    << bucket_metadata->inflight_reads_.load(
+                           std::memory_order_relaxed);
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+        } else {
+            PAUSE();
+        }
+    }
+
+    // Step 3: Safe to delete files now - no readers are using them
+    std::error_code ec;
+
+    auto data_path_res = GetBucketDataPath(bucket_id);
+    if (data_path_res) {
+        fs::remove(data_path_res.value(), ec);
+        if (ec && ec != std::errc::no_such_file_or_directory) {
+            LOG(WARNING) << "DeleteBucket: failed to remove data file: "
+                         << data_path_res.value()
+                         << ", error: " << ec.message();
+        }
+    }
+
+    auto meta_path_res = GetBucketMetadataPath(bucket_id);
+    if (meta_path_res) {
+        ec.clear();
+        fs::remove(meta_path_res.value(), ec);
+        if (ec && ec != std::errc::no_such_file_or_directory) {
+            LOG(WARNING) << "DeleteBucket: failed to remove metadata file: "
+                         << meta_path_res.value()
+                         << ", error: " << ec.message();
+        }
+    }
+
+    LOG(INFO) << "DeleteBucket: successfully deleted bucket_id=" << bucket_id
+              << ", keys_removed=" << keys_to_remove.size();
+    return {};
+}
+
+void BucketStorageBackend::RemoveAll() {
+    namespace fs = std::filesystem;
+
+    // Collect all bucket IDs under exclusive lock, then release.
+    std::vector<int64_t> bucket_ids;
+    {
+        SharedMutexLocker lock(&mutex_);
+        bucket_ids.reserve(buckets_.size());
+        for (const auto& [id, _] : buckets_) {
+            bucket_ids.push_back(id);
+        }
+    }
+
+    for (int64_t id : bucket_ids) {
+        auto result = DeleteBucket(id);
+        if (!result) {
+            LOG(WARNING) << "RemoveAll: DeleteBucket failed for bucket_id="
+                         << id << ", error=" << toString(result.error());
+        }
+    }
+
+    LOG(INFO) << "RemoveAll: removed " << bucket_ids.size() << " bucket(s)";
+}
+
 tl::expected<void, ErrorCode> BucketStorageBackend::StoreBucketMetadata(
-    const std::string& metadata_path, const std::string& serialized_metadata) {
-    auto open_file_result = OpenFile(metadata_path, FileMode::Write);
+    int64_t id, std::shared_ptr<BucketMetadata> metadata) {
+    auto meta_path_res = GetBucketMetadataPath(id);
+    if (!meta_path_res) {
+        LOG(ERROR) << "Failed to get bucket metadata path, bucket_id=" << id;
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    auto meta_path = meta_path_res.value();
+    auto open_file_result = OpenFile(meta_path, FileMode::Write);
     if (!open_file_result) {
-        LOG(ERROR) << "Failed to open file for bucket writing: "
-                   << metadata_path;
+        LOG(ERROR) << "Failed to open file for bucket writing: " << meta_path;
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
     auto file = std::move(open_file_result.value());
-    auto write_result =
-        file->write(serialized_metadata, serialized_metadata.size());
+    std::string str;
+    struct_pb::to_pb(*metadata, str);
+    auto write_result = file->write(str, str.size());
     if (!write_result) {
-        LOG(ERROR) << "Write failed for: " << metadata_path
+        LOG(ERROR) << "Write failed for: " << meta_path
                    << ", error: " << write_result.error();
         return tl::make_unexpected(write_result.error());
     }
-    if (write_result.value() != serialized_metadata.size()) {
-        LOG(ERROR) << "Write size mismatch for: " << metadata_path
-                   << ", expected: " << serialized_metadata.size()
+    if (write_result.value() != str.size()) {
+        LOG(ERROR) << "Write size mismatch for: " << meta_path
+                   << ", expected: " << str.size()
                    << ", got: " << write_result.value();
         return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
     }
+    metadata->meta_size = str.size();
     return {};
 }
 
@@ -2653,54 +3479,6 @@ tl::expected<void, ErrorCode> BucketStorageBackend::LoadBucketMetadata(
     return {};
 }
 
-tl::expected<void, ErrorCode> BucketStorageBackend::BatchLoadBucket(
-    int64_t bucket_id, const std::vector<std::string>& keys,
-    const std::vector<StorageObjectMetadata>& metadatas,
-    const std::unordered_map<std::string, Slice>& batched_slices) {
-    SharedMutexLocker locker(&mutex_, shared_lock);
-    auto storage_filepath_res = GetBucketDataPath(bucket_id);
-    if (!storage_filepath_res) {
-        LOG(ERROR) << "Failed to get bucket data path, bucket_id=" << bucket_id;
-        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
-    }
-    const auto& storage_filepath = storage_filepath_res.value();
-    auto open_file_result = OpenFile(storage_filepath, FileMode::Read);
-    if (!open_file_result) {
-        LOG(ERROR) << "Failed to open file for reading: " << storage_filepath;
-        return tl::make_unexpected(open_file_result.error());
-    }
-    auto file = std::move(open_file_result.value());
-    for (size_t i = 0; i < keys.size(); i++) {
-        const auto& key = keys[i];
-        int64_t offset;
-        const auto& slice = batched_slices.at(key);
-        const auto& object_metadata = metadatas[i];
-        if (object_metadata.data_size != static_cast<int64_t>(slice.size)) {
-            LOG(ERROR) << "Read size mismatch for: " << storage_filepath
-                       << ", expected: " << object_metadata.data_size
-                       << ", got: " << slice.size;
-            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-        }
-        offset = object_metadata.offset;
-        std::vector<iovec> iovs;
-        iovs.emplace_back(iovec{slice.ptr, slice.size});
-        auto read_result = file->vector_read(
-            iovs.data(), static_cast<int>(iovs.size()), offset + key.size());
-        if (!read_result) {
-            LOG(ERROR) << "vector_read failed for: " << storage_filepath
-                       << ", error: " << read_result.error();
-            return tl::make_unexpected(read_result.error());
-        }
-        if (read_result.value() != slice.size) {
-            LOG(ERROR) << "Read size mismatch for: " << storage_filepath
-                       << ", expected: " << slice.size
-                       << ", got: " << read_result.value();
-            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
-        }
-    }
-    return {};
-}
-
 tl::expected<std::string, ErrorCode> BucketStorageBackend::GetBucketDataPath(
     int64_t bucket_id) {
     std::string sep =
@@ -2730,11 +3508,62 @@ BucketStorageBackend::OpenFile(const std::string& path, FileMode mode) const {
             break;
     }
 
+#ifdef USE_URING
+    // Use O_DIRECT only for reads: write latency is not sensitive in this
+    // scenario, and O_DIRECT writes require 4096-byte alignment padding which
+    // corrupts meta file parsing and wastes disk space on data files.
+    if (file_storage_config_.use_uring && mode == FileMode::Read) {
+        flags |= O_DIRECT;
+    }
+#endif
+
     int fd = open(path.c_str(), flags | access_mode, 0644);
     if (fd < 0) {
+        LOG(ERROR) << "Failed to open file: " << path << ", errno=" << errno
+                   << " (" << strerror(errno) << ")";
         return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
     }
+#ifdef USE_URING
+    if (file_storage_config_.use_uring && mode == FileMode::Read) {
+        return std::make_unique<UringFile>(path, fd, 32, true);
+    }
+#endif
     return std::make_unique<PosixFile>(path, fd);
+}
+
+tl::expected<std::shared_ptr<StorageFile>, ErrorCode>
+BucketStorageBackend::GetOrOpenFile(const std::string& path,
+                                    FileMode mode) const {
+    // Only cache read-mode files (write mode needs O_TRUNC which invalidates
+    // cache)
+    if (mode == FileMode::Read) {
+        MutexLocker locker(&file_cache_mutex_);
+        auto it = file_cache_.find(path);
+        if (it != file_cache_.end()) {
+            return it->second;
+        }
+    }
+
+    // Open new file
+    auto result = OpenFile(path, mode);
+    if (!result) {
+        return tl::make_unexpected(result.error());
+    }
+
+    auto file = std::shared_ptr<StorageFile>(std::move(result.value()));
+
+    // Cache read-mode files
+    if (mode == FileMode::Read) {
+        MutexLocker locker(&file_cache_mutex_);
+        file_cache_[path] = file;
+    }
+
+    return file;
+}
+
+void BucketStorageBackend::ClearFileCache() {
+    MutexLocker locker(&file_cache_mutex_);
+    file_cache_.clear();
 }
 
 tl::expected<void, ErrorCode> BucketStorageBackend::HandleNext(
@@ -2767,19 +3596,90 @@ tl::expected<bool, ErrorCode> BucketStorageBackend::HasNext() {
     return next_bucket_ != 0;
 }
 
+tl::expected<std::shared_ptr<StorageFile>, ErrorCode>
+BucketStorageBackend::GetFileInstance() const {
+    // Create a temporary file to get access to the file instance
+    // This is used for external buffer registration with UringFile
+    namespace fs = std::filesystem;
+
+    std::string temp_path =
+        (fs::path(storage_path_) / "temp_for_registration").string();
+
+    auto open_result = OpenFile(temp_path, FileMode::Write);
+    if (!open_result) {
+        LOG(ERROR) << "Failed to open temporary file for GetFileInstance: "
+                   << temp_path;
+        return tl::make_unexpected(open_result.error());
+    }
+
+    auto file = std::move(open_result.value());
+
+    // Remove the temporary file from disk now that the fd is open.
+    // The fd remains valid (Unix semantics) until the StorageFile is destroyed.
+    fs::remove(temp_path);
+
+    // Convert unique_ptr to shared_ptr
+    return std::shared_ptr<StorageFile>(std::move(file));
+}
+
 // ============================================================================
 // OffsetAllocatorStorageBackend Implementation
 // ============================================================================
 
 OffsetAllocatorStorageBackend::OffsetAllocatorStorageBackend(
-    const FileStorageConfig& file_storage_config_)
+    const FileStorageConfig& file_storage_config_,
+    const OffsetAllocatorBackendConfig& offset_backend_config)
     : StorageBackendInterface(file_storage_config_),
-      storage_path_(file_storage_config_.storage_filepath) {
+      storage_path_(file_storage_config_.storage_filepath),
+      cfg_(offset_backend_config) {
     capacity_ = file_storage_config_.total_size_limit;
+}
+
+OffsetAllocatorStorageBackend::~OffsetAllocatorStorageBackend() {
+    try {
+        if (cfg_.persist_mode == OffsetPersistMode::kDisabled) return;
+        if (!initialized_.load(std::memory_order_acquire)) return;
+        if (!data_file_) return;
+        if (test_skip_final_checkpoint_.load(std::memory_order_relaxed)) {
+            // Test hook: simulate an abrupt crash (no final checkpoint).
+            return;
+        }
+
+        if (!metadata_dirty_.load(std::memory_order_relaxed)) {
+            // Nothing to persist.
+            return;
+        }
+
+        // Best-effort final checkpoint on graceful shutdown.
+        auto sync_res = data_file_->datasync();
+        if (!sync_res) {
+            LOG(ERROR) << "Final checkpoint datasync failed: "
+                       << static_cast<int>(sync_res.error());
+            return;
+        }
+
+        auto save_res = SaveMetadata(all_evicted_this_batch_);
+        if (!save_res) {
+            LOG(ERROR) << "Final checkpoint SaveMetadata failed: "
+                       << static_cast<int>(save_res.error());
+            return;
+        }
+
+        all_evicted_this_batch_.clear();
+        LOG(INFO) << "Final persistence checkpoint completed on shutdown";
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Final checkpoint threw: " << e.what();
+    } catch (...) {
+        LOG(ERROR) << "Final checkpoint threw unknown exception";
+    }
 }
 
 std::string OffsetAllocatorStorageBackend::GetDataFilePath() const {
     return (std::filesystem::path(storage_path_) / "kv_cache.data").string();
+}
+
+std::string OffsetAllocatorStorageBackend::GetMetaFilePath() const {
+    return (std::filesystem::path(storage_path_) / "kv_cache.meta").string();
 }
 
 //-----------------------------------------------------------------------------
@@ -2799,8 +3699,130 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
             return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
         }
 
+        // Ensure storage path exists
+        {
+            std::error_code ec;
+            fs::create_directories(storage_path_, ec);
+            if (ec) {
+                LOG(ERROR) << "Failed to create storage directory: "
+                           << storage_path_;
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+        }
+
+        // ---- Resolve watermarks ----
+        high_watermark_bytes_ =
+            cfg_.high_watermark_bytes > 0
+                ? cfg_.high_watermark_bytes
+                : static_cast<int64_t>(capacity_ * cfg_.high_ratio);
+        low_watermark_bytes_ =
+            cfg_.low_watermark_bytes > 0
+                ? cfg_.low_watermark_bytes
+                : static_cast<int64_t>(capacity_ * cfg_.low_ratio);
+        high_watermark_keys_ =
+            cfg_.high_watermark_keys > 0
+                ? cfg_.high_watermark_keys
+                : static_cast<int64_t>(file_storage_config_.total_keys_limit *
+                                       cfg_.keys_high_ratio);
+        low_watermark_keys_ =
+            cfg_.low_watermark_keys > 0
+                ? cfg_.low_watermark_keys
+                : static_cast<int64_t>(file_storage_config_.total_keys_limit *
+                                       cfg_.keys_low_ratio);
+
+        // Auto-nudge ratio-derived low watermarks when integer
+        // truncation collapses them to the same value as high
+        if (cfg_.low_watermark_bytes == 0 && high_watermark_bytes_ > 0 &&
+            low_watermark_bytes_ >= high_watermark_bytes_) {
+            low_watermark_bytes_ =
+                std::max<int64_t>(1, high_watermark_bytes_ - 1);
+        }
+        if (cfg_.low_watermark_keys == 0 && high_watermark_keys_ > 0 &&
+            low_watermark_keys_ >= high_watermark_keys_) {
+            low_watermark_keys_ =
+                std::max<int64_t>(1, high_watermark_keys_ - 1);
+        }
+
+        // Validate watermarks
+        if (low_watermark_bytes_ >= high_watermark_bytes_) {
+            LOG(ERROR) << "Invalid watermark: low_bytes="
+                       << low_watermark_bytes_
+                       << " >= high_bytes=" << high_watermark_bytes_;
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+        if (low_watermark_keys_ >= high_watermark_keys_) {
+            LOG(ERROR) << "Invalid watermark: low_keys=" << low_watermark_keys_
+                       << " >= high_keys=" << high_watermark_keys_;
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+
+        // Clamp watermarks to not exceed capacity / total_keys_limit
+        if (high_watermark_bytes_ > static_cast<int64_t>(capacity_)) {
+            LOG(WARNING) << "high_watermark_bytes clamped from "
+                         << high_watermark_bytes_
+                         << " to capacity=" << capacity_;
+            high_watermark_bytes_ = static_cast<int64_t>(capacity_);
+            low_watermark_bytes_ =
+                std::min(low_watermark_bytes_, high_watermark_bytes_ - 1);
+        }
+        if (high_watermark_keys_ > file_storage_config_.total_keys_limit) {
+            LOG(WARNING) << "high_watermark_keys clamped from "
+                         << high_watermark_keys_ << " to total_keys_limit="
+                         << file_storage_config_.total_keys_limit;
+            high_watermark_keys_ = file_storage_config_.total_keys_limit;
+            low_watermark_keys_ =
+                std::min(low_watermark_keys_, high_watermark_keys_ - 1);
+        }
+
+        // Guard against zero low-watermark on very small capacity
+        if (low_watermark_bytes_ <= 0 && high_watermark_bytes_ > 0) {
+            low_watermark_bytes_ =
+                std::max<int64_t>(1, high_watermark_bytes_ / 2);
+        }
+        if (low_watermark_keys_ <= 0 && high_watermark_keys_ > 0) {
+            low_watermark_keys_ =
+                std::max<int64_t>(1, high_watermark_keys_ / 2);
+        }
+
+        // ---- Recovery path ----
+        if (cfg_.persist_mode != OffsetPersistMode::kDisabled) {
+            const RecoveryResult recovery = TryRecoverFromMetadata();
+            if (recovery == RecoveryResult::kTransientError) {
+                // A momentary resource error (fd exhaustion, OOM, I/O
+                // error) must not wipe a recoverable cache: fail Init
+                // and let the operator retry instead of falling through
+                // to the fresh-start path below.
+                LOG(ERROR) << "Transient error during recovery; failing "
+                              "Init to protect persisted data";
+                return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            }
+            if (recovery == RecoveryResult::kRecovered) {
+                last_persist_time_us_.store(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count(),
+                    std::memory_order_relaxed);
+                initialized_.store(true, std::memory_order_release);
+                LOG(INFO) << "OffsetAllocatorStorageBackend recovered: "
+                          << total_keys_.load() << " keys, "
+                          << total_size_.load() << " bytes";
+                return {};
+            }
+            // kNoMeta / kCorrupt: fall through to a fresh start.
+        }
+
+        // ---- Fresh start path ----
+        LOG(INFO) << "Fresh start path";
+
+        // Close any recovery fd and clean up stale metadata
+        data_file_.reset();
+        {
+            std::error_code ec;
+            fs::remove(GetMetaFilePath(), ec);
+            fs::remove(GetMetaFilePath() + ".tmp", ec);
+        }
+
         // Clear in-memory maps (V1: no persistence, start fresh)
-        // Lock all shards to ensure exclusive access during initialization
         {
             std::vector<std::unique_ptr<SharedMutexLocker>> shard_locks;
             shard_locks.reserve(kNumShards);
@@ -2816,27 +3838,7 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
         // Get data file path
         data_file_path_ = GetDataFilePath();
 
-        // RAII wrapper to ensure fd is closed on all error paths
-        struct FdGuard {
-            int fd;
-            explicit FdGuard(int fd) : fd(fd) {}
-            ~FdGuard() {
-                if (fd >= 0) {
-                    close(fd);
-                }
-            }
-            // Release ownership (caller takes responsibility)
-            int release() {
-                int ret = fd;
-                fd = -1;
-                return ret;
-            }
-            // Get fd without releasing (for operations)
-            int get() const { return fd; }
-        };
-
         // Open/truncate data file in read-write mode
-        // We need raw fd for fallocate, so open directly
         int flags = O_CLOEXEC | O_RDWR | O_CREAT | O_TRUNC;
         int raw_fd = open(data_file_path_.c_str(), flags, 0644);
         if (raw_fd < 0) {
@@ -2856,20 +3858,75 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
             }
         }
 
-        // Release fd to PosixFile (PosixFile takes ownership and will close it)
-        data_file_ =
-            std::make_unique<PosixFile>(data_file_path_, fd_guard.release());
+        // Release fd to StorageFile (takes ownership and will close it)
+#ifdef USE_URING
+        if (file_storage_config_.use_uring) {
+            data_file_ = std::make_shared<UringFile>(
+                data_file_path_, fd_guard.release(), 32, true);
+        } else
+#endif
+        {
+            data_file_ = std::make_shared<PosixFile>(data_file_path_,
+                                                     fd_guard.release());
+        }
+        if (cfg_.persist_mode != OffsetPersistMode::kDisabled) {
+            data_file_->SetDeleteOnWriteFail(false);
+        }
 
-        // Create allocator with base=0, size=capacity
-        allocator_ = offset_allocator::OffsetAllocator::create(0, capacity_);
+        // Create allocator with tuned node capacity
+        constexpr int64_t kMinObjectSize = 256;
+        constexpr int64_t kMaxNodeRamBytes =
+            512LL * 1024 * 1024;  // 512MB node RAM budget
+        constexpr uint32_t kRamBasedMaxNodes =
+            static_cast<uint32_t>(kMaxNodeRamBytes / 56);
+        constexpr uint32_t kAbsoluteMaxNodes =
+            std::min<uint32_t>(kRamBasedMaxNodes, 32U << 20);
+
+        uint32_t max_nodes = (1U << 20);  // default 1M nodes
+        if (cfg_.max_capacity_nodes > 0) {
+            if (cfg_.max_capacity_nodes > kAbsoluteMaxNodes) {
+                LOG(WARNING)
+                    << "max_capacity_nodes " << cfg_.max_capacity_nodes
+                    << " exceeds RAM budget; clamped to " << kAbsoluteMaxNodes;
+                max_nodes = kAbsoluteMaxNodes;
+            } else {
+                max_nodes = static_cast<uint32_t>(cfg_.max_capacity_nodes);
+            }
+        } else {
+            int64_t auto_nodes = std::max<int64_t>(
+                1LL << 20, std::min<int64_t>(capacity_ / kMinObjectSize,
+                                             kAbsoluteMaxNodes));
+            max_nodes = static_cast<uint32_t>(auto_nodes);
+        }
+        uint32_t init_nodes = std::min<uint32_t>(128U * 1024, max_nodes);
+        allocator_ = offset_allocator::OffsetAllocator::create(
+            0, capacity_, init_nodes, max_nodes);
         if (!allocator_) {
             LOG(ERROR) << "Failed to create OffsetAllocator";
             return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
         }
 
+        // Initialize eviction index
+        {
+            MutexLocker ev(&eviction_mutex_);
+            fifo_index_.clear();
+            insert_seq_.store(0, std::memory_order_relaxed);
+        }
+
+        // Initialize persist timestamp (avoid immediate checkpoint
+        // on first write)
+        last_persist_time_us_.store(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch())
+                .count(),
+            std::memory_order_relaxed);
+
         initialized_.store(true, std::memory_order_release);
         LOG(INFO) << "OffsetAllocatorStorageBackend initialized, capacity: "
-                  << capacity_ << " bytes, data file: " << data_file_path_;
+                  << capacity_
+                  << " bytes, high_watermark: " << high_watermark_bytes_
+                  << " bytes, " << high_watermark_keys_ << " keys"
+                  << ", data file: " << data_file_path_;
     } catch (const std::exception& e) {
         LOG(ERROR) << "OffsetAllocatorStorageBackend initialize error: "
                    << e.what();
@@ -2879,13 +3936,942 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::Init() {
     return {};
 }
 
+// EvictToMakeRoom
+//-----------------------------------------------------------------------------
+
+//-----------------------------------------------------------------------------
+// ShouldPersistNow
+//-----------------------------------------------------------------------------
+
+bool OffsetAllocatorStorageBackend::ShouldPersistNow() const {
+    if (cfg_.persist_mode == OffsetPersistMode::kDisabled) return false;
+    if (cfg_.persist_mode == OffsetPersistMode::kStrict) return true;
+    using TimePointUs = std::chrono::time_point<std::chrono::steady_clock,
+                                                std::chrono::microseconds>;
+    auto last_tp = TimePointUs(std::chrono::microseconds(
+        last_persist_time_us_.load(std::memory_order_relaxed)));
+    return (std::chrono::steady_clock::now() - last_tp) >=
+           std::chrono::seconds(cfg_.persist_interval_seconds);
+}
+
+//-----------------------------------------------------------------------------
+// SaveMetadata
+//-----------------------------------------------------------------------------
+
+tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::SaveMetadata(
+    const std::unordered_set<std::string>& evicted_keys_this_batch) {
+    namespace fs = std::filesystem;
+
+    if (!metadata_dirty_.exchange(false, std::memory_order_relaxed) &&
+        evicted_keys_this_batch.empty()) {
+        return {};
+    }
+
+    int step = test_metadata_write_failure_step_.exchange(
+        0, std::memory_order_relaxed);
+    try {
+        struct DirtyGuard {
+            std::atomic<bool>& dirty;
+            std::atomic<int64_t>& failures;
+            bool active = true;
+            DirtyGuard(std::atomic<bool>& d, std::atomic<int64_t>& f)
+                : dirty(d), failures(f) {}
+            ~DirtyGuard() {
+                if (active) {
+                    dirty.store(true, std::memory_order_relaxed);
+                    failures.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+            void disarm() { active = false; }
+        } dirty_guard(metadata_dirty_, metadata_save_failures_);
+
+        auto t_start = std::chrono::steady_clock::now();
+
+        // 1. Serialize allocator
+        std::vector<SerializedByte> alloc_buf;
+        ErrorCode ec = serialize_to(*allocator_, alloc_buf);
+        if (ec != ErrorCode::OK || alloc_buf.empty()) {
+            return tl::make_unexpected(
+                ec != ErrorCode::OK ? ec : ErrorCode::INTERNAL_ERROR);
+        }
+        if (step == 1) return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+
+        // 2. Build metadata struct
+        OffsetAllocatorPersistedMetadata meta;
+        meta.version = kOffsetAllocatorPersistVersion;
+        meta.allocator_state.assign(
+            reinterpret_cast<const char*>(alloc_buf.data()), alloc_buf.size());
+        meta.evicted_keys_this_batch.assign(evicted_keys_this_batch.begin(),
+                                            evicted_keys_this_batch.end());
+
+        {
+            MutexLocker ev(&eviction_mutex_);
+            meta.insert_seq = insert_seq_.load(std::memory_order_relaxed);
+            meta.fifo_entries.reserve(fifo_index_.size());
+            for (const auto& [seq, key] : fifo_index_) {
+                meta.fifo_entries.push_back({seq, key});
+            }
+        }
+
+        // 3. Serialize metadata
+        std::string buf;
+        try {
+            struct_pb::to_pb(meta, buf);
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "struct_pb::to_pb failed in SaveMetadata: "
+                       << e.what();
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        if (buf.empty()) {
+            LOG(ERROR) << "struct_pb produced empty metadata buffer";
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+
+        // 4. Atomic write via tmp + rename
+        std::string meta_path = GetMetaFilePath();
+        std::string tmp_path = meta_path + ".tmp";
+
+        int fd = open(tmp_path.c_str(),
+                      O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+        if (fd < 0) {
+            LOG(ERROR) << "Failed to create " << tmp_path << ": "
+                       << strerror(errno);
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+
+        const char* ptr = buf.data();
+        size_t remaining = buf.size();
+        while (remaining > 0) {
+            ssize_t n = write(fd, ptr, remaining);
+            if (n <= 0) {
+                if (n < 0 && errno == EINTR) continue;
+                LOG(ERROR) << "write failed on " << tmp_path << ": "
+                           << (n < 0 ? strerror(errno) : "returned 0");
+                close(fd);
+                unlink(tmp_path.c_str());
+                return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+            }
+            ptr += n;
+            remaining -= n;
+        }
+        if (step == 2) {
+            close(fd);
+            unlink(tmp_path.c_str());
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+
+        // Use fsync (not fdatasync) for the metadata file: metadata is
+        // small and we need inode metadata (file size) durable as well.
+        if (fsync(fd) != 0) {
+            LOG(ERROR) << "fsync failed on " << tmp_path;
+            close(fd);
+            unlink(tmp_path.c_str());
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        close(fd);
+
+        if (rename(tmp_path.c_str(), meta_path.c_str()) != 0) {
+            LOG(ERROR) << "rename " << tmp_path << " -> " << meta_path
+                       << " failed: " << strerror(errno);
+            unlink(tmp_path.c_str());
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        if (step == 3) return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+
+        // fsync parent directory
+        fs::path parent = fs::path(meta_path).parent_path();
+        if (parent.empty()) parent = ".";
+        int dir_fd = open(parent.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (dir_fd < 0) {
+            LOG(ERROR) << "open parent dir failed: " << strerror(errno);
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+        FdGuard dir_guard(dir_fd);
+        if (fsync(dir_fd) != 0) {
+            LOG(ERROR) << "fsync parent dir failed: " << strerror(errno);
+            return tl::make_unexpected(ErrorCode::FILE_WRITE_FAIL);
+        }
+
+        dirty_guard.disarm();
+
+        last_save_metadata_cost_us_.store(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now() - t_start)
+                .count(),
+            std::memory_order_relaxed);
+
+        return {};
+    } catch (const std::exception& e) {
+        // std::bad_alloc or other exception during serialization.
+        // DirtyGuard restores metadata_dirty_ on scope exit.
+        LOG(ERROR) << "SaveMetadata failed with exception: " << e.what();
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+}
+
+//-----------------------------------------------------------------------------
+// LoadMetadata
+//-----------------------------------------------------------------------------
+
+tl::expected<OffsetAllocatorPersistedMetadata, ErrorCode>
+OffsetAllocatorStorageBackend::LoadMetadata() {
+    std::string meta_path = GetMetaFilePath();
+
+    int fd = open(meta_path.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        LOG(ERROR) << "Failed to open " << meta_path << ": " << strerror(errno);
+        return tl::make_unexpected(ErrorCode::FILE_OPEN_FAIL);
+    }
+    FdGuard closer(fd);
+
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        LOG(ERROR) << "fstat failed on " << meta_path << ": "
+                   << strerror(errno);
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+    if (st.st_size == 0) {
+        LOG(ERROR) << "Metadata file is empty: " << meta_path;
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+
+    std::string buf(static_cast<size_t>(st.st_size), '\0');
+    size_t read_bytes = 0;
+    char* ptr = buf.data();
+    while (read_bytes < static_cast<size_t>(st.st_size)) {
+        ssize_t n = pread(fd, ptr, static_cast<size_t>(st.st_size) - read_bytes,
+                          static_cast<off_t>(read_bytes));
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            LOG(ERROR) << "Read failed from " << meta_path << ": "
+                       << strerror(errno);
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+        if (n == 0) {
+            LOG(ERROR) << "Unexpected EOF from " << meta_path;
+            return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+        }
+        read_bytes += static_cast<size_t>(n);
+        ptr += n;
+    }
+
+    OffsetAllocatorPersistedMetadata meta;
+    try {
+        struct_pb::from_pb(meta, buf);
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "struct_pb::from_pb failed for " << meta_path << ": "
+                   << e.what();
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+
+    if (meta.version != kOffsetAllocatorPersistVersion) {
+        LOG(ERROR) << "Unsupported metadata version " << meta.version << " in "
+                   << meta_path << " (expected "
+                   << kOffsetAllocatorPersistVersion << ")";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    if (meta.allocator_state.empty()) {
+        LOG(ERROR) << "Empty allocator_state in " << meta_path;
+        return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
+    }
+
+    return meta;
+}
+
+//-----------------------------------------------------------------------------
+// RebuildShardMapsFromAllocator
+//-----------------------------------------------------------------------------
+
+void OffsetAllocatorStorageBackend::RebuildShardMapsFromAllocator(
+    uint64_t checkpoint_insert_seq) {
+    int64_t rebuilt = 0;
+    int64_t skipped = 0;
+
+    // Lock all shards during rebuild (Init is single-threaded, but
+    // locking documents the invariant).
+    std::vector<std::unique_ptr<SharedMutexLocker>> shard_locks;
+    shard_locks.reserve(kNumShards);
+    for (size_t i = 0; i < kNumShards; ++i) {
+        shard_locks.emplace_back(
+            std::make_unique<SharedMutexLocker>(&shards_[i].mutex));
+    }
+    total_size_.store(0, std::memory_order_relaxed);
+    total_keys_.store(0, std::memory_order_relaxed);
+
+    // Reused across records for CRC streaming (avoids a fresh 1MB
+    // allocation per record).
+    std::vector<char> chunk_buf;
+
+    allocator_->visit_used_nodes([&](uint64_t real_offset, uint64_t alloc_size,
+                                     uint32_t node_index) {
+        // Helper: free a corrupt/unrecoverable node via RAII.  The
+        // temporary handle goes out of scope immediately, returning the
+        // extent to the allocator.  requested_size keeps the
+        // m_allocated_size metric consistent with the serialized state:
+        // when the header parsed, the exact record_size is known (it
+        // equals the requested size passed to allocate()); otherwise the
+        // node's bin size is the best available estimate.
+        auto free_leaked_node = [&](uint64_t requested_size) {
+            auto h = allocator_->createHandleAtNode(node_index, real_offset,
+                                                    requested_size);
+        };
+
+        if (real_offset + RecordHeader::SIZE >
+            static_cast<uint64_t>(capacity_)) {
+            LOG(ERROR) << "[Recover] offset " << real_offset
+                       << " + header exceeds capacity " << capacity_;
+            free_leaked_node(alloc_size);
+            ++skipped;
+            return;
+        }
+
+        char hdr_buf[RecordHeader::SIZE];
+        iovec hdr_iov = {hdr_buf, sizeof(hdr_buf)};
+        auto hdr_res = data_file_->vector_read(&hdr_iov, 1, real_offset);
+        if (!hdr_res || hdr_res.value() != RecordHeader::SIZE) {
+            LOG(ERROR) << "[Recover] Failed to read header at " << real_offset;
+            free_leaked_node(alloc_size);
+            ++skipped;
+            return;
+        }
+        RecordHeader header = RecordHeader::ReadFrom(hdr_buf);
+
+        if (header.key_len > kMaxKeyLen) {
+            LOG(ERROR) << "[Recover] Invalid key_len " << header.key_len
+                       << " at " << real_offset;
+            free_leaked_node(alloc_size);
+            ++skipped;
+            return;
+        }
+
+        // Records carrying flag bits this build does not understand were
+        // written by a newer format; refuse them rather than guess.
+        if ((header.flags & ~RecordHeader::kKnownFlags) != 0) {
+            LOG(ERROR) << "[Recover] Unknown flags " << header.flags << " at "
+                       << real_offset;
+            free_leaked_node(alloc_size);
+            ++skipped;
+            return;
+        }
+
+        uint64_t record_size =
+            RecordHeader::RecordSize(header.key_len, header.value_len);
+        if (record_size > alloc_size) {
+            LOG(ERROR) << "[Recover] record_size " << record_size
+                       << " > alloc_size " << alloc_size << " at "
+                       << real_offset;
+            free_leaked_node(alloc_size);
+            ++skipped;
+            return;
+        }
+        if (record_size >
+            static_cast<uint64_t>(std::numeric_limits<uint32_t>::max())) {
+            LOG(ERROR) << "[Recover] record_size " << record_size
+                       << " exceeds uint32_t at " << real_offset;
+            free_leaked_node(alloc_size);
+            ++skipped;
+            return;
+        }
+        if (real_offset + record_size > static_cast<uint64_t>(capacity_)) {
+            LOG(ERROR) << "[Recover] record past capacity at " << real_offset;
+            free_leaked_node(alloc_size);
+            ++skipped;
+            return;
+        }
+
+        // Post-checkpoint write guard: a record stamped at or after the
+        // checkpoint's insert_seq was written after the checkpoint fired.
+        // Its extent may hold a torn write (the crash hit mid-pwritev), or
+        // it may belong to a different key whose space was freed and reused
+        // after the checkpoint.  Either way the checkpoint cannot vouch for
+        // it, so the node is dropped and freed.
+        if (header.seq >= checkpoint_insert_seq) {
+            LOG(INFO) << "[Recover] record seq " << header.seq
+                      << " >= checkpoint insert_seq " << checkpoint_insert_seq
+                      << " at " << real_offset
+                      << " -- post-checkpoint write, dropping";
+            free_leaked_node(record_size);
+            ++skipped;
+            return;
+        }
+
+        std::string key(header.key_len, '\0');
+        iovec key_iov = {key.data(), static_cast<size_t>(header.key_len)};
+        auto key_res = data_file_->vector_read(
+            &key_iov, 1, real_offset + RecordHeader::SIZE);
+        if (!key_res ||
+            key_res.value() != static_cast<size_t>(header.key_len)) {
+            LOG(ERROR) << "[Recover] Failed to read key at " << real_offset;
+            free_leaked_node(record_size);
+            ++skipped;
+            return;
+        }
+
+        // Integrity check, only for checksummed records: stream the value
+        // in chunks and verify the CRC-32C over header-prefix + key +
+        // value.  This rejects torn writes whose header survived the
+        // crash but whose tail is stale or zero-filled.  Unchecksummed
+        // records (kFlagHasCrc clear, e.g. written with CRC disabled or
+        // by a DMA writer) skip the value scan entirely: they are trusted
+        // via the checkpoint's seq guard alone, and recovery stays
+        // O(header + key) for them.
+        if (header.HasCrc()) {
+            Crc32c crc;
+            crc.Extend(hdr_buf, RecordHeader::PREFIX_SIZE);
+            crc.Extend(key.data(), key.size());
+            {
+                constexpr size_t kCrcChunkSize = 1 << 20;  // 1MB
+                chunk_buf.resize(
+                    std::min<uint64_t>(header.value_len, kCrcChunkSize));
+                uint64_t remaining = header.value_len;
+                uint64_t value_offset =
+                    real_offset +
+                    RecordHeader::ValueOffsetInRecord(header.key_len);
+                bool read_failed = false;
+                while (remaining > 0) {
+                    const size_t chunk =
+                        std::min<uint64_t>(remaining, chunk_buf.size());
+                    iovec value_iov = {chunk_buf.data(), chunk};
+                    auto value_res =
+                        data_file_->vector_read(&value_iov, 1, value_offset);
+                    if (!value_res || value_res.value() != chunk) {
+                        LOG(ERROR) << "[Recover] Failed to read value at "
+                                   << real_offset;
+                        read_failed = true;
+                        break;
+                    }
+                    crc.Extend(chunk_buf.data(), chunk);
+                    value_offset += chunk;
+                    remaining -= chunk;
+                }
+                if (read_failed) {
+                    free_leaked_node(record_size);
+                    ++skipped;
+                    return;
+                }
+            }
+            if (crc.Final() != header.crc32) {
+                LOG(ERROR) << "[Recover] CRC mismatch at " << real_offset
+                           << " (stored " << header.crc32 << ", computed "
+                           << crc.Final() << ") -- torn or stale record";
+                free_leaked_node(record_size);
+                ++skipped;
+                return;
+            }
+        }
+
+        // Duplicate resolution BEFORE constructing any handle: a failed
+        // emplace would have moved allocation_ptr into a discarded
+        // temporary, freeing the very extent we might need to keep.
+        // Note: ObjectEntry.fifo_seq temporarily carries the record's seq
+        // for this comparison; RestoreAndRepairFifoIndex overwrites it
+        // with the persisted (or repaired) FIFO seq later.
+        size_t shard_idx = ShardForKey(key);
+        auto& shard_map = shards_[shard_idx].map;
+        auto existing = shard_map.find(key);
+        if (existing != shard_map.end() &&
+            header.seq <= existing->second.fifo_seq) {
+            // Duplicate key (two extents were both marked used at the
+            // checkpoint, e.g. an overwrite whose old extent was pinned
+            // by a reader) and the already-inserted record is the newer
+            // version.  Free this older extent via RAII.
+            LOG(INFO) << "[Recover] Duplicate key " << key << " at "
+                      << real_offset << " (seq " << header.seq
+                      << ") is older than existing record at "
+                      << existing->second.offset << " (seq "
+                      << existing->second.fifo_seq
+                      << ") -- kept existing, freed duplicate (RAII)";
+            free_leaked_node(record_size);
+            ++skipped;
+            return;
+        }
+
+        auto handle = allocator_->createHandleAtNode(node_index, real_offset,
+                                                     record_size);
+        if (!handle.has_value()) {
+            LOG(ERROR) << "[Recover] createHandleAtNode failed for " << key
+                       << " at " << real_offset;
+            free_leaked_node(record_size);
+            ++skipped;
+            return;
+        }
+
+        auto allocation_ptr = std::make_shared<RefCountedAllocationHandle>(
+            std::move(handle.value()));
+
+        if (existing != shard_map.end()) {
+            // The new record is the newer version: replace the entry.
+            // The replaced handle frees the older extent via RAII with
+            // its own exact requested size.
+            LOG(INFO) << "[Recover] Duplicate key " << key << " at "
+                      << real_offset << " (seq " << header.seq
+                      << ") replaces older record at "
+                      << existing->second.offset << " (seq "
+                      << existing->second.fifo_seq << ")";
+            const int64_t size_delta =
+                static_cast<int64_t>(record_size) -
+                static_cast<int64_t>(existing->second.total_size);
+            existing->second =
+                ObjectEntry(real_offset, static_cast<uint32_t>(record_size),
+                            header.value_len, std::move(allocation_ptr),
+                            /*fifo_seq=*/header.seq);
+            total_size_.fetch_add(size_delta, std::memory_order_relaxed);
+            ++rebuilt;
+            return;
+        }
+
+        shard_map.emplace(
+            key, ObjectEntry(real_offset, static_cast<uint32_t>(record_size),
+                             header.value_len, std::move(allocation_ptr),
+                             /*fifo_seq=*/header.seq));
+
+        total_size_.fetch_add(static_cast<int64_t>(record_size),
+                              std::memory_order_relaxed);
+        total_keys_.fetch_add(1, std::memory_order_relaxed);
+        ++rebuilt;
+    });
+
+    LOG(INFO) << "[Recover] RebuildShardMaps: " << rebuilt << " keys rebuilt, "
+              << skipped << " skipped (corrupt)";
+    if (rebuilt == 0) {
+        LOG(WARNING) << "[Recover] No records recovered -- data file "
+                        "may be empty or corrupt";
+    }
+}
+
+//-----------------------------------------------------------------------------
+// RestoreAndRepairFifoIndex
+//-----------------------------------------------------------------------------
+
+void OffsetAllocatorStorageBackend::RestoreAndRepairFifoIndex(
+    const OffsetAllocatorPersistedMetadata& meta) {
+    uint64_t max_seq = meta.insert_seq;
+    for (const auto& [seq, _] : meta.fifo_entries) {
+        max_seq = std::max(max_seq, seq);
+    }
+    insert_seq_.store(max_seq + 1, std::memory_order_relaxed);
+
+    {
+        MutexLocker ev(&eviction_mutex_);
+        fifo_index_.clear();
+        std::unordered_set<std::string> fifo_keys;
+
+        // Phase A: restore from persisted entries
+        for (const auto& [seq, key] : meta.fifo_entries) {
+            if (seq >= meta.insert_seq) {
+                LOG(WARNING) << "[Recover] seq " << seq << " >= insert_seq "
+                             << meta.insert_seq << " -- skipping";
+                continue;
+            }
+            size_t shard_idx = ShardForKey(key);
+            SharedMutexLocker lk(&shards_[shard_idx].mutex);
+            auto it = shards_[shard_idx].map.find(key);
+            if (it == shards_[shard_idx].map.end()) {
+                LOG(WARNING) << "[Recover] key " << key
+                             << " not in shard map -- skipping";
+                continue;
+            }
+            if (fifo_index_.count(seq)) {
+                LOG(WARNING) << "[Recover] Duplicate seq " << seq
+                             << " -- deferred to Phase B";
+                continue;
+            }
+            fifo_index_[seq] = key;
+            fifo_keys.insert(key);
+            it->second.fifo_seq = seq;
+        }
+
+        // Phase B: repair -- assign new seq to any shard-map entry
+        // not yet in the FIFO index
+        for (size_t s = 0; s < kNumShards; ++s) {
+            SharedMutexLocker lk(&shards_[s].mutex);
+            for (auto& [key, entry] : shards_[s].map) {
+                if (!fifo_keys.count(key)) {
+                    uint64_t new_seq =
+                        insert_seq_.fetch_add(1, std::memory_order_relaxed);
+                    entry.fifo_seq = new_seq;
+                    fifo_index_[new_seq] = key;
+                    fifo_keys.insert(key);
+                }
+            }
+        }
+
+        // Phase C: delete evicted keys that were resurrected
+        for (const auto& key : meta.evicted_keys_this_batch) {
+            size_t shard_idx = ShardForKey(key);
+            SharedMutexLocker lk(&shards_[shard_idx].mutex);
+            auto it = shards_[shard_idx].map.find(key);
+            if (it != shards_[shard_idx].map.end()) {
+                total_size_.fetch_sub(
+                    static_cast<int64_t>(it->second.total_size),
+                    std::memory_order_relaxed);
+                total_keys_.fetch_sub(1, std::memory_order_relaxed);
+                fifo_index_.erase(it->second.fifo_seq);
+                shards_[shard_idx].map.erase(it);
+            }
+        }
+    }
+
+    LOG(INFO) << "[Recover] FIFO index restored: " << fifo_index_.size()
+              << " entries";
+}
+
+//-----------------------------------------------------------------------------
+// TryRecoverFromMetadata
+//-----------------------------------------------------------------------------
+
+OffsetAllocatorStorageBackend::RecoveryResult
+OffsetAllocatorStorageBackend::TryRecoverFromMetadata() {
+    try {
+        namespace fs = std::filesystem;
+
+        struct FallbackGuard {
+            std::atomic<int64_t>& ctr;
+            bool disarmed = false;
+            FallbackGuard(std::atomic<int64_t>& c) : ctr(c) {}
+            ~FallbackGuard() {
+                if (!disarmed) ctr.fetch_add(1, std::memory_order_relaxed);
+            }
+            void disarm() { disarmed = true; }
+        } fallback_guard(metadata_load_fallbacks_);
+
+        std::string meta_path = GetMetaFilePath();
+        std::string tmp_path = meta_path + ".tmp";
+        std::error_code ec_tmp, ec_meta;
+
+        // Clean up stale tmp
+        if (fs::exists(tmp_path, ec_tmp)) {
+            if (!fs::exists(meta_path, ec_meta)) {
+                fs::remove(tmp_path, ec_tmp);
+                LOG(INFO) << "Orphaned .meta.tmp cleaned up";
+                fallback_guard.disarm();
+                return RecoveryResult::kNoMeta;
+            }
+            fs::remove(tmp_path, ec_tmp);
+        }
+
+        if (!fs::exists(meta_path, ec_meta)) {
+            fallback_guard.disarm();
+            return RecoveryResult::kNoMeta;
+        }
+
+        LOG(INFO) << "Recovery path: " << meta_path << " found";
+
+        // Load metadata.  An open failure here (e.g. fd exhaustion,
+        // permission change) is transient: the meta file exists and may
+        // be perfectly fine, so it must not trigger a cache-wiping fresh
+        // start.  Parse/validation failures mean the meta is unusable.
+        auto meta_result = LoadMetadata();
+        if (!meta_result) {
+            if (meta_result.error() == ErrorCode::FILE_OPEN_FAIL) {
+                LOG(ERROR) << "LoadMetadata could not open " << meta_path
+                           << " -- transient error, keeping persisted data";
+                fallback_guard.disarm();
+                return RecoveryResult::kTransientError;
+            }
+            LOG(ERROR) << "LoadMetadata failed, falling back to fresh start";
+            return RecoveryResult::kCorrupt;
+        }
+        OffsetAllocatorPersistedMetadata meta = std::move(meta_result.value());
+
+        // Deserialize allocator into local shared_ptr; only move to
+        // member on full success
+        std::shared_ptr<offset_allocator::OffsetAllocator> alloc;
+        try {
+            const auto* data = reinterpret_cast<const SerializedByte*>(
+                meta.allocator_state.data());
+            std::vector<SerializedByte> alloc_buf(
+                data, data + meta.allocator_state.size());
+            alloc =
+                deserialize_from<offset_allocator::OffsetAllocator>(alloc_buf);
+        } catch (const std::bad_alloc& e) {
+            LOG(ERROR) << "Allocator deserialization OOM: " << e.what()
+                       << " -- transient error, keeping persisted data";
+            fallback_guard.disarm();
+            return RecoveryResult::kTransientError;
+        } catch (const std::exception& e) {
+            LOG(ERROR) << "Allocator deserialization threw: " << e.what()
+                       << " -- fresh start";
+            return RecoveryResult::kCorrupt;
+        }
+        if (!alloc) {
+            LOG(ERROR) << "Allocator deserialization returned null"
+                          " -- fresh start";
+            return RecoveryResult::kCorrupt;
+        }
+
+        // Verify capacity match
+        {
+            auto metrics = alloc->get_metrics();
+            if (static_cast<uint64_t>(metrics.capacity) != capacity_) {
+                LOG(WARNING) << "Allocator capacity mismatch: serialized "
+                             << metrics.capacity << " vs current " << capacity_
+                             << ". total_size_limit may have changed; "
+                                "falling back to fresh start.";
+                return RecoveryResult::kCorrupt;
+            }
+        }
+
+        // Open data file without truncation
+        data_file_path_ = GetDataFilePath();
+        int flags = O_CLOEXEC | O_RDWR;
+        int raw_fd = open(data_file_path_.c_str(), flags, 0644);
+        if (raw_fd < 0) {
+            const int open_errno = errno;
+            LOG(ERROR) << "Failed to open data file: " << data_file_path_
+                       << ": " << strerror(open_errno);
+            // The meta references data that is genuinely gone: nothing
+            // recoverable remains, so a fresh start is appropriate.
+            if (open_errno == ENOENT) {
+                return RecoveryResult::kCorrupt;
+            }
+            // Anything else (fd exhaustion, permissions, I/O error) may
+            // be transient -- do not wipe the persisted cache for it.
+            fallback_guard.disarm();
+            return RecoveryResult::kTransientError;
+        }
+        FdGuard fd_guard(raw_fd);
+
+        // Verify data file size matches capacity_
+        struct stat st;
+        if (fstat(fd_guard.get(), &st) != 0) {
+            LOG(ERROR) << "fstat failed on data file: " << strerror(errno);
+            fallback_guard.disarm();
+            return RecoveryResult::kTransientError;
+        }
+        if (static_cast<uint64_t>(st.st_size) != capacity_) {
+            LOG(WARNING) << "data file size mismatch: expected " << capacity_
+                         << ", got " << st.st_size
+                         << " -- falling back to fresh start";
+            return RecoveryResult::kCorrupt;
+        }
+
+#ifdef USE_URING
+        if (file_storage_config_.use_uring) {
+            data_file_ = std::make_shared<UringFile>(
+                data_file_path_, fd_guard.release(), 32, true);
+        } else
+#endif
+        {
+            data_file_ = std::make_shared<PosixFile>(data_file_path_,
+                                                     fd_guard.release());
+        }
+        data_file_->SetDeleteOnWriteFail(false);
+
+        // Move allocator to member only after all checks pass
+        allocator_ = std::move(alloc);
+
+        // Clear and rebuild shard maps
+        {
+            std::vector<std::unique_ptr<SharedMutexLocker>> locks;
+            locks.reserve(kNumShards);
+            for (size_t i = 0; i < kNumShards; ++i) {
+                locks.emplace_back(
+                    std::make_unique<SharedMutexLocker>(&shards_[i].mutex));
+                shards_[i].map.clear();
+            }
+        }
+        total_size_.store(0, std::memory_order_relaxed);
+        total_keys_.store(0, std::memory_order_relaxed);
+
+        RebuildShardMapsFromAllocator(meta.insert_seq);
+        RestoreAndRepairFifoIndex(meta);
+
+        fallback_guard.disarm();
+
+        LOG(INFO) << "OffsetAllocatorStorageBackend recovered: "
+                  << total_keys_.load() << " keys, " << total_size_.load()
+                  << " bytes";
+        return RecoveryResult::kRecovered;
+    } catch (const std::bad_alloc& e) {
+        LOG(ERROR) << "Recovery OOM: " << e.what()
+                   << " -- transient error, keeping persisted data";
+        return RecoveryResult::kTransientError;
+    } catch (const std::exception& e) {
+        LOG(ERROR) << "Recovery failed with exception: " << e.what();
+        return RecoveryResult::kCorrupt;
+    } catch (...) {
+        LOG(ERROR) << "Recovery failed with unknown exception";
+        return RecoveryResult::kCorrupt;
+    }
+}
+
+void OffsetAllocatorStorageBackend::EvictToMakeRoom(
+    int64_t required_bytes, size_t min_victims,
+    const std::unordered_set<std::string>& batch_keys,
+    PendingEviction& out_pending) {
+    if (cfg_.eviction_policy == OffsetEvictionPolicy::NONE) return;
+
+    MutexLocker ev(&eviction_mutex_);
+    size_t n = 0;
+
+    while (n < cfg_.max_evict_per_offload) {
+        int64_t cur_size = total_size_.load(std::memory_order_relaxed);
+        int64_t cur_keys = total_keys_.load(std::memory_order_relaxed);
+        bool below_bytes = (cur_size + required_bytes <= low_watermark_bytes_);
+        bool below_keys = (cur_keys <= low_watermark_keys_);
+        // Stop when both byte and key-count watermarks are satisfied
+        // and we have met the minimum victim count.
+        if (below_bytes && below_keys && n >= min_victims) break;
+
+        if (fifo_index_.empty()) break;
+
+        auto oldest = fifo_index_.begin();
+        uint64_t vseq = oldest->first;
+        std::string vkey = oldest->second;
+
+        // Skip batch_keys prefix — keys being written in this batch.
+        // Do NOT erase their FIFO slots (they may fail allocate() and
+        // need the slot to remain in the index for future eviction).
+        // Worst-case comparison cost: O(|batch_keys_prefix|), bounded.
+        while (oldest != fifo_index_.end() &&
+               batch_keys.count(oldest->second)) {
+            ++oldest;
+        }
+        if (oldest == fifo_index_.end()) break;  // all are batch_keys
+        vkey = oldest->second;
+        vseq = oldest->first;
+
+        size_t shard_idx = ShardForKey(vkey);
+        auto& shard = shards_[shard_idx];
+        {
+            SharedMutexLocker lk(&shard.mutex);
+            auto it = shard.map.find(vkey);
+            if (it == shard.map.end() || it->second.fifo_seq != vseq) {
+                // Orphan slot in fifo_index_: the key is no longer in
+                // shard.map, or its fifo_seq was replaced by a newer
+                // overwrite.  Overwrites are cleaned up in BatchOffload
+                // Step-4 (fifo_index_.erase(old_seq) under the lock),
+                // so today this branch is only reachable if a future
+                // per-key delete path neglects to also erase from
+                // fifo_index_.  Keep the lazy-repair as a defense.
+                fifo_index_.erase(oldest);
+                metadata_dirty_.store(true, std::memory_order_relaxed);
+                ++n;  // counted toward scan budget
+                continue;
+            }
+            // Defensive assertions against double-evict underflow.
+            // Precondition: single heartbeat_thread_ serialises offload;
+            // if concurrent offload is added, these must be re-evaluated.
+            DCHECK_GE(total_size_.load(std::memory_order_relaxed),
+                      it->second.total_size);
+            DCHECK_GE(total_keys_.load(std::memory_order_relaxed), 1);
+            out_pending.objects.emplace_back(vkey, it->second);
+            total_size_.fetch_sub(it->second.total_size,
+                                  std::memory_order_relaxed);
+            total_keys_.fetch_sub(1, std::memory_order_relaxed);
+            shard.map.erase(it);
+            // NOTE: no eviction tombstone is recorded here.  The
+            // eviction only becomes final when the master accepts the
+            // notification; if it fails, RestorePreparedEviction rolls
+            // the entry back and a tombstone would wrongly delete the
+            // still-valid key on recovery.  Tombstones are recorded at
+            // commit time in NotifyAndCommitPreparedEviction.
+            metadata_dirty_.store(true, std::memory_order_relaxed);
+        }
+        fifo_index_.erase(oldest);
+        ++n;
+    }
+}
+
+//-----------------------------------------------------------------------------
+
+void OffsetAllocatorStorageBackend::RestorePreparedEviction(
+    PendingEviction&& pending) {
+    MutexLocker ev(&eviction_mutex_);
+
+    for (auto& [key, entry] : pending.objects) {
+        const uint32_t restored_size = entry.total_size;
+        const uint64_t restored_seq = entry.fifo_seq;
+        auto& shard = shards_[ShardForKey(key)];
+        SharedMutexLocker lk(&shard.mutex);
+
+        // BatchOffload's single-writer precondition guarantees that no writer
+        // can recreate this key or consume its FIFO sequence while the
+        // eviction notification is in flight. Readers do not mutate either
+        // index, so both entries must still be absent here.
+        const bool map_inserted =
+            shard.map.emplace(key, std::move(entry)).second;
+        CHECK(map_inserted) << "Failed to restore evicted key: " << key;
+        const bool fifo_inserted =
+            fifo_index_.emplace(restored_seq, key).second;
+        CHECK(fifo_inserted)
+            << "Failed to restore FIFO entry for evicted key: " << key;
+        total_size_.fetch_add(restored_size, std::memory_order_relaxed);
+        total_keys_.fetch_add(1, std::memory_order_relaxed);
+    }
+    pending.objects.clear();
+}
+
+//-----------------------------------------------------------------------------
+
+// Records restart-persistence tombstones for evictions that have become
+// final (master notified, or no master to notify).  Must NOT be called
+// for evictions that may still be rolled back.
+void OffsetAllocatorStorageBackend::RecordEvictionTombstones(
+    const PendingEviction& pending) {
+    if (cfg_.persist_mode == OffsetPersistMode::kDisabled) return;
+    for (const auto& [key, _] : pending.objects) {
+        all_evicted_this_batch_.insert(key);
+    }
+    metadata_dirty_.store(true, std::memory_order_relaxed);
+}
+
+tl::expected<void, ErrorCode>
+OffsetAllocatorStorageBackend::NotifyAndCommitPreparedEviction(
+    const EvictionHandler& eviction_handler, PendingEviction& pending) {
+    if (pending.objects.empty()) return {};
+    if (!eviction_handler) {
+        // No master to notify: dropping the handles commits the eviction
+        // locally, so the keys still need tombstones to stay dead across
+        // a restart.
+        RecordEvictionTombstones(pending);
+        pending.objects.clear();
+        return {};
+    }
+
+    std::vector<std::string> evicted_keys;
+    evicted_keys.reserve(pending.objects.size());
+    for (const auto& [key, _] : pending.objects) {
+        evicted_keys.push_back(key);
+    }
+
+    auto notify_result = eviction_handler(evicted_keys);
+    if (!notify_result) {
+        const ErrorCode error = notify_result.error();
+        RestorePreparedEviction(std::move(pending));
+        return tl::make_unexpected(error);
+    }
+
+    // The master accepted the removal: the eviction is now final, so
+    // record the tombstones before dropping the handles.
+    RecordEvictionTombstones(pending);
+    // Dropping the final metadata references commits the eviction and makes
+    // unpinned extents available to the allocator.
+    pending.objects.clear();
+    return {};
+}
+
 //-----------------------------------------------------------------------------
 
 tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
     const std::unordered_map<std::string, std::vector<Slice>>& batch_object,
     std::function<ErrorCode(const std::vector<std::string>& keys,
                             std::vector<StorageObjectMetadata>& metadatas)>
-        complete_handler) {
+        complete_handler,
+    EvictionHandler eviction_handler) {
+    // ================================================================
+    // SINGLE-WRITER PRECONDITION
+    //
+    // BatchOffload, EvictToMakeRoom, and the watermark accounting on
+    // total_size_ / total_keys_ assume only ONE thread calls
+    // BatchOffload at a time (currently guaranteed by FileStorage's
+    // single heartbeat_thread_).  The atomics make individual loads
+    // and stores atomic, but the read-modify-write sequences are NOT
+    // atomic across threads.  If concurrent offload is added, the
+    // DCHECK_GE guards in EvictToMakeRoom must also be re-evaluated.
+    // ================================================================
+
     if (!initialized_.load(std::memory_order_acquire)) {
         LOG(ERROR)
             << "Storage backend is not initialized. Call Init() before use.";
@@ -2904,151 +4890,385 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
         return tl::make_unexpected(ErrorCode::KEYS_ULTRA_LIMIT);
     }
 
+    const bool eviction_on =
+        (cfg_.eviction_policy != OffsetEvictionPolicy::NONE) &&
+        (eviction_handler != nullptr);
+
+    if (cfg_.eviction_policy != OffsetEvictionPolicy::NONE &&
+        eviction_handler == nullptr) {
+        LOG_FIRST_N(WARNING, 1)
+            << "Eviction policy is " << static_cast<int>(cfg_.eviction_policy)
+            << " but eviction_handler is null; eviction is disabled. "
+               "IsEnableOffloading() will still return true.";
+    }
+
+    // Build the set of keys being offloaded in this batch so that
+    // EvictToMakeRoom does not evict them.
+    std::unordered_set<std::string> batch_keys;
+    if (eviction_on) {
+        for (const auto& [k, _] : batch_object) batch_keys.insert(k);
+    }
+
     std::vector<std::string> keys;
     std::vector<StorageObjectMetadata> metadatas;
     keys.reserve(batch_object.size());
     metadatas.reserve(batch_object.size());
 
-    // Process each object in the batch; continue on individual failures to
-    // support partial success
-    for (const auto& [key, slices] : batch_object) {
-        if (slices.empty()) {
-            // Skip empty slices (empty values are allowed but not stored)
-            continue;
-        }
+    // Pin data_file_ for the whole batch so a concurrent RemoveAll() rebuild
+    // (which rebinds the data_file_ member) cannot close the file while a
+    // write is in flight (writes do not hold shard locks during I/O).
+    auto data_file = data_file_;
 
-        // Test-only: Check if this key should fail (deterministic failure
-        // injection)
+    // Prepared victims are held here until the master accepts their removal.
+    // Their allocation handles prevent reuse before notification succeeds.
+    PendingEviction pending_eviction;
+
+    for (const auto& [key, slices] : batch_object) {
+        if (slices.empty()) continue;
+
         if (test_failure_predicate_ && test_failure_predicate_(key)) {
             LOG(INFO) << "[TEST] Injecting failure for key: " << key
                       << " (test failure predicate)";
-            continue;  // Simulate allocation/write failure
+            continue;
         }
 
-        // Calculate total value size
-        uint32_t value_size = 0;
+        if (key.size() > kMaxKeyLen) {
+            // Recovery rejects key_len above kMaxKeyLen; refuse such keys
+            // at write time so they cannot silently vanish on restart.
+            LOG(ERROR) << "Key too large for SSD offload: " << key.size()
+                       << " bytes (max " << kMaxKeyLen << ")";
+            continue;
+        }
+
+        uint64_t total_value_size = 0;
         for (const auto& slice : slices) {
-            value_size += static_cast<uint32_t>(slice.size);
+            total_value_size += slice.size;
+        }
+        if (total_value_size > UINT32_MAX) {
+            LOG(ERROR) << "Object too large for SSD offload for key: " << key
+                       << ", size: " << total_value_size;
+            continue;
+        }
+        uint32_t value_size = static_cast<uint32_t>(total_value_size);
+
+        // Stamp every write with a fresh insert_seq_ value: recovery
+        // rejects any record stamped at/after the checkpoint's insert_seq
+        // (its extent may hold a torn write), so every record must carry
+        // one regardless of the eviction mode.  A failed write simply
+        // burns a seq; gaps in the sequence are harmless.
+        const uint64_t record_seq =
+            insert_seq_.fetch_add(1, std::memory_order_relaxed);
+
+        RecordHeader header{
+            .key_len = static_cast<uint32_t>(key.size()),
+            .value_len = value_size,
+            .seq = record_seq,
+            .flags = cfg_.enable_record_crc ? RecordHeader::kFlagHasCrc : 0u,
+            .crc32 = 0};
+
+        // Aligned layout: header + key + zero padding + value.
+        const uint32_t value_padding =
+            RecordHeader::ValuePadding(header.key_len);
+        uint64_t record_size =
+            RecordHeader::RecordSize(header.key_len, header.value_len);
+
+        if (record_size > UINT32_MAX) {
+            LOG(ERROR) << "Record too large for key: " << key
+                       << ", record_size=" << record_size;
+            continue;
         }
 
-        // Prepare record header
-        RecordHeader header{.key_len = static_cast<uint32_t>(key.size()),
-                            .value_len = value_size};
+        // Serialize the header; when enabled, the CRC covers the header
+        // prefix, the key and the value, and lets recovery detect
+        // torn/stale records.
+        char hdr_buf[RecordHeader::SIZE];
+        header.WritePrefixTo(hdr_buf);
+        if (header.HasCrc()) {
+            Crc32c crc;
+            crc.Extend(hdr_buf, RecordHeader::PREFIX_SIZE);
+            crc.Extend(key.data(), key.size());
+            for (const auto& slice : slices) {
+                crc.Extend(slice.ptr, slice.size);
+            }
+            header.crc32 = crc.Final();
+        }
+        header.WriteTo(hdr_buf);
 
-        // Use size_t for record_size to handle large objects (up to 4GB per
-        // RecordHeader)
-        size_t record_size =
-            RecordHeader::SIZE + header.key_len + header.value_len;
+        // ---- (A) Proactive eviction (watermark-driven) ----
+        if (eviction_on) {
+            int64_t cur_size = total_size_.load(std::memory_order_relaxed);
+            int64_t cur_keys = total_keys_.load(std::memory_order_relaxed);
+            bool over_bytes = (cur_size + static_cast<int64_t>(record_size) >
+                               high_watermark_bytes_);
+            bool over_keys = (cur_keys > high_watermark_keys_);
+            if (over_bytes || over_keys) {
+                size_t min_v = over_keys ? cfg_.fallback_evict_batch : 0;
+                EvictToMakeRoom(static_cast<int64_t>(record_size), min_v,
+                                batch_keys, pending_eviction);
+            }
+        }
 
-        // Step 1: Allocate space (allocator is thread-safe, ensures unique
-        // offsets) No locks held during allocation
+        // ---- (B) Notify master of evicted keys BEFORE allocating ----
+        // Layer-1 (byte safety): BatchLoad pins extents via shared_ptr,
+        // so the allocator cannot re-issue a still-read offset.  Layer-2
+        // (master metadata): the master must be told the key's local-disk
+        // replica is gone before we reuse its space for a new key.
+        // Persistence tombstones for the victims are recorded inside
+        // NotifyAndCommitPreparedEviction once the notification succeeds.
+        if (eviction_on && !pending_eviction.objects.empty()) {
+            auto notify_result = NotifyAndCommitPreparedEviction(
+                eviction_handler, pending_eviction);
+            if (!notify_result) {
+                return tl::make_unexpected(notify_result.error());
+            }
+        }
+
+        // ---- (C) Allocate ----
         auto allocation = allocator_->allocate(record_size);
+
+        // ---- (D) Fallback eviction (nullopt retry loop) ----
+        if (!allocation.has_value() && eviction_on) {
+            uint64_t prev_largest =
+                allocator_->get_metrics().largest_free_region_;
+            size_t fallback_total_evicted = 0;
+            const size_t kMaxFallbackEvicted = cfg_.max_evict_per_offload;
+
+            while (!allocation.has_value() &&
+                   fallback_total_evicted < kMaxFallbackEvicted) {
+                EvictToMakeRoom(static_cast<int64_t>(record_size),
+                                cfg_.fallback_evict_batch, batch_keys,
+                                pending_eviction);
+                size_t evicted_this_turn = pending_eviction.objects.size();
+                fallback_total_evicted += evicted_this_turn;
+
+                // Notify master of fallback victims before retrying.
+                if (!pending_eviction.objects.empty()) {
+                    auto notify_result = NotifyAndCommitPreparedEviction(
+                        eviction_handler, pending_eviction);
+                    if (!notify_result) {
+                        return tl::make_unexpected(notify_result.error());
+                    }
+                }
+
+                uint64_t now_largest =
+                    allocator_->get_metrics().largest_free_region_;
+                if (evicted_this_turn == 0) break;  // no victims at all
+                // Stop if the largest free region did not grow at all.
+                // Using `prev_largest` (rather than `prev_largest +
+                // record_size / 2`) allows gradual coalescence when
+                // many small victims must be evicted for one large
+                // allocation.  The `fallback_total_evicted` cap still
+                // bounds total eviction per key.
+                if (now_largest <= prev_largest) break;
+                prev_largest = now_largest;
+                allocation = allocator_->allocate(record_size);
+            }
+        }
+
         if (!allocation.has_value()) {
-            LOG(ERROR) << "Failed to allocate " << record_size
-                       << " bytes for key: " << key
-                       << " - stopping processing for this batch";
-            break;  // Stop processing other keys as space is likely exhausted
+            if (eviction_on) {
+                eviction_skips_.fetch_add(1, std::memory_order_relaxed);
+                LOG(WARNING) << "Skipping key after eviction attempts: " << key;
+                continue;
+            } else {
+                LOG(ERROR) << "Failed to allocate " << record_size
+                           << " bytes for key: " << key
+                           << " - stopping processing";
+                break;
+            }
         }
 
         uint64_t offset = allocation->address();
 
-        // Step 2: Write data to disk (no metadata locks held during I/O)
+        // ---- (E) Disk write ----
+        // Shared zero page backing the padding iov: the value region must
+        // start at a kValueAlignment boundary within the record, and the
+        // gap between key and value is zero-filled.
+        static constexpr std::array<char, RecordHeader::kValueAlignment>
+            kZeroPadding{};
+
         std::vector<iovec> iovs;
-        iovs.reserve(2 + slices.size());
+        iovs.reserve(3 + slices.size());
 
-        // Header
-        iovs.push_back(
-            {const_cast<char*>(reinterpret_cast<const char*>(&header.key_len)),
-             sizeof(header.key_len)});
-        iovs.push_back({const_cast<char*>(
-                            reinterpret_cast<const char*>(&header.value_len)),
-                        sizeof(header.value_len)});
+        iovs.push_back({hdr_buf, static_cast<size_t>(RecordHeader::SIZE)});
 
-        // Key
         iovs.push_back({const_cast<char*>(key.data()),
                         static_cast<size_t>(header.key_len)});
 
-        // Value slices
+        if (value_padding > 0) {
+            iovs.push_back({const_cast<char*>(kZeroPadding.data()),
+                            static_cast<size_t>(value_padding)});
+        }
+
         for (const auto& slice : slices) {
             iovs.push_back({slice.ptr, slice.size});
         }
 
         auto write_result =
-            data_file_->vector_write(iovs.data(), iovs.size(), offset);
+            data_file->vector_write(iovs.data(), iovs.size(), offset);
         if (!write_result) {
             LOG(ERROR) << "Failed to write record for key: " << key
-                       << ", error: " << write_result.error()
-                       << " - continuing with remaining keys";
-            // Allocation handle is still local (not yet stored in the metadata
-            // map) and will be freed automatically when going out of scope.
-            continue;  // Continue processing other keys
+                       << ", error: " << write_result.error();
+            continue;
         }
-
-        // Handle the case where the data was written partially.
-        size_t written = write_result.value();
-        if (written != record_size) {
+        if (write_result.value() != record_size) {
             LOG(ERROR) << "Write size mismatch for key: " << key
-                       << ", expected: " << record_size << ", got: " << written
-                       << " - continuing with remaining keys";
-            continue;  // Continue processing other keys
+                       << ", expected: " << record_size
+                       << ", got: " << write_result.value();
+            continue;
         }
 
-        // Step 3: Wrap allocation in refcounted handle
-        auto allocation_ptr = std::make_shared<RefCountedAllocationHandle>(
-            std::move(allocation.value()));
-
-        // Step 4: Update metadata map under exclusive shard lock
-        // Lock only the shard for this key (other shards can proceed in
-        // parallel)
+        // ---- (F) Metadata update with FIFO index maintenance ----
         {
+            auto allocation_ptr = std::make_shared<RefCountedAllocationHandle>(
+                std::move(allocation.value()));
             size_t shard_idx = ShardForKey(key);
             auto& shard = shards_[shard_idx];
-            SharedMutexLocker lock(&shard.mutex);
 
-            // Check if key exists to update size accounting
+            std::optional<MutexLocker> ev_lock;
+            if (eviction_on) ev_lock.emplace(&eviction_mutex_);
+            SharedMutexLocker shard_lock(&shard.mutex);
+
             auto it = shard.map.find(key);
             int64_t size_delta = static_cast<int64_t>(record_size);
             bool is_new_key = (it == shard.map.end());
+            // Stamped before the disk write; the record on disk carries
+            // the same seq so recovery can order writes against the
+            // checkpoint's insert_seq.
+            const uint64_t seq = record_seq;
 
             if (!is_new_key) {
-                // Overwrite: subtract old size
                 size_delta -= static_cast<int64_t>(it->second.total_size);
-                // Old AllocationPtr will be dropped, refcount decremented
-                // Physical extent freed when last reader releases it
+                if (eviction_on) fifo_index_.erase(it->second.fifo_seq);
             }
 
-            // Update map (insert_or_assign handles both insert and overwrite)
             shard.map.insert_or_assign(
-                key, ObjectEntry(offset, record_size, value_size,
-                                 std::move(allocation_ptr)));
+                key, ObjectEntry(offset, static_cast<uint32_t>(record_size),
+                                 value_size, std::move(allocation_ptr), seq));
+            metadata_dirty_.store(true, std::memory_order_relaxed);
+            if (eviction_on) fifo_index_.emplace(seq, key);
 
-            // Update total size atomically (lock-free, separate from map
-            // updates)
             total_size_.fetch_add(size_delta, std::memory_order_relaxed);
-
-            // Update total keys only if inserting a new key
             if (is_new_key) {
                 total_keys_.fetch_add(1, std::memory_order_relaxed);
             }
         }
 
         keys.push_back(key);
-        metadatas.push_back(StorageObjectMetadata{
-            0,  // bucket_id not used for this backend
-            static_cast<int64_t>(offset), static_cast<int64_t>(header.key_len),
-            static_cast<int64_t>(value_size), ""});
+        metadatas.push_back(
+            StorageObjectMetadata{0, static_cast<int64_t>(offset),
+                                  static_cast<int64_t>(header.key_len),
+                                  static_cast<int64_t>(value_size), ""});
     }
 
-    // Invoke complete handler only if we have successful keys to report
+    // ---- Post-loop flush: notify master of any evicted keys that
+    // were accumulated by the last (possibly allocate-failing) key.
+    // This runs BEFORE the persistence barrier so that the trailing
+    // victims' tombstones and freed extents are included in this
+    // batch's checkpoint; in kStrict mode that keeps the whole batch
+    // (writes AND evictions) durable, and avoids serializing victim
+    // extents as used only for them to be freed right after.
+    if (eviction_on && !pending_eviction.objects.empty()) {
+        auto notify_result =
+            NotifyAndCommitPreparedEviction(eviction_handler, pending_eviction);
+        if (!notify_result) {
+            // The eviction was rolled back.  The batch is not
+            // checkpointed here (metadata_dirty_ stays set and a later
+            // batch will persist it), which is consistent with
+            // reporting failure to the caller.
+            return tl::make_unexpected(notify_result.error());
+        }
+    }
+
+    // ---- Persistence barrier (kRelaxed / kStrict) ----
+    // Reconstruct set of keys successfully written in this batch
+    std::unordered_set<std::string> successfully_written_keys_set(keys.begin(),
+                                                                  keys.end());
+
+    const bool persist_enabled =
+        (cfg_.persist_mode == OffsetPersistMode::kRelaxed ||
+         cfg_.persist_mode == OffsetPersistMode::kStrict);
+
+    // Filter stale tombstones on EVERY persist-enabled batch,
+    // regardless of whether a checkpoint is triggered.  If we only
+    // filter inside ShouldPersistNow(), a key evicted in batch N
+    // and re-written in batch M (when no checkpoint fires) keeps
+    // its tombstone in all_evicted_this_batch_.  The NEXT checkpoint
+    // would then write the stale tombstone to meta, causing Phase C
+    // to delete the valid re-written key on recovery.
+    if (persist_enabled && !all_evicted_this_batch_.empty() &&
+        !successfully_written_keys_set.empty()) {
+        size_t removed = 0;
+        for (const auto& k : successfully_written_keys_set) {
+            removed += all_evicted_this_batch_.erase(k);
+        }
+        if (removed > 0) {
+            LOG(INFO) << "Cleared " << removed << " stale eviction tombstones";
+        }
+    }
+
+    if (persist_enabled && metadata_dirty_.load(std::memory_order_relaxed) &&
+        ShouldPersistNow()) {
+        // data fsync (REQUIRED: ensures metadata points to
+        // durable data)
+        auto sync_res = data_file_->datasync();
+        if (!sync_res) {
+            auto fails = metadata_consecutive_failures_.fetch_add(
+                             1, std::memory_order_relaxed) +
+                         1;
+            LOG(ERROR) << "datasync failed: "
+                       << static_cast<int>(sync_res.error());
+            if (fails % 10 == 0) {
+                LOG(WARNING) << "Checkpoint datasync " << fails
+                             << " consecutive failures (mode="
+                             << static_cast<int>(cfg_.persist_mode) << ")";
+            }
+            if (cfg_.persist_mode == OffsetPersistMode::kStrict) {
+                return tl::make_unexpected(sync_res.error());
+            }
+            // kRelaxed: skip this checkpoint, retry next interval
+        } else {
+            auto save_res = SaveMetadata(all_evicted_this_batch_);
+            if (!save_res) {
+                auto fails = metadata_consecutive_failures_.fetch_add(
+                                 1, std::memory_order_relaxed) +
+                             1;
+                // Log every 10th consecutive failure (LOG_FIRST_N
+                // counts by call-site, not by content — use LOG(WARNING)).
+                if (fails % 10 == 0) {
+                    LOG(WARNING) << "Checkpoint " << fails
+                                 << " consecutive failures (mode="
+                                 << static_cast<int>(cfg_.persist_mode)
+                                 << "): " << static_cast<int>(save_res.error());
+                }
+                if (cfg_.persist_mode == OffsetPersistMode::kStrict) {
+                    return tl::make_unexpected(save_res.error());
+                }
+                // kRelaxed: keep metadata_dirty_=true (DirtyGuard
+                // restores it), retry next interval
+            } else {
+                metadata_consecutive_failures_.store(0,
+                                                     std::memory_order_relaxed);
+                all_evicted_this_batch_.clear();
+                last_persist_time_us_.store(
+                    std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch())
+                        .count(),
+                    std::memory_order_relaxed);
+            }
+        }
+    }
+
+    // ---- Complete handler ----
     if (complete_handler != nullptr && !keys.empty()) {
         auto error_code = complete_handler(keys, metadatas);
         if (error_code != ErrorCode::OK) {
-            LOG(ERROR)
-                << "Complete handler failed: " << error_code << " - "
-                << keys.size()
-                << " keys were successfully written to disk but master was not "
-                   "notified. "
-                << "Master will learn about them via ScanMeta on next restart.";
+            LOG(ERROR) << "Complete handler failed: " << error_code << " - "
+                       << keys.size()
+                       << " keys were successfully written to disk but "
+                          "master was not notified. "
+                       << "Master will learn about them via ScanMeta on "
+                          "next restart.";
             return tl::make_unexpected(error_code);
         }
     }
@@ -3056,10 +5276,8 @@ tl::expected<int64_t, ErrorCode> OffsetAllocatorStorageBackend::BatchOffload(
     return static_cast<int64_t>(keys.size());
 }
 
-//-----------------------------------------------------------------------------
-
 tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
-    const std::unordered_map<std::string, Slice>& batched_slices) {
+    std::unordered_map<std::string, Slice>& batched_slices) {
     if (!initialized_.load(std::memory_order_acquire)) {
         LOG(ERROR)
             << "Storage backend is not initialized. Call Init() before use.";
@@ -3074,6 +5292,10 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
         uint32_t value_size;
         AllocationPtr allocation;  // Refcounted handle keeps allocation alive
         Slice dest_slice;
+        // Pin the data file so a concurrent RemoveAll() rebuild (which rebinds
+        // the data_file_ member) cannot destroy this file while we still have
+        // pending I/O on it in phase 2 (no shard lock held there).
+        std::shared_ptr<StorageFile> data_file;
     };
 
     std::vector<ReadPlan> read_plans;
@@ -3102,24 +5324,28 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
         }
 
         // Copy metadata and increment refcount on allocation
-        // This keeps the physical extent alive even if key is evicted
+        // This keeps the physical extent alive even if key is evicted.
+        // Also pin data_file_ (shared_ptr copy) so a concurrent RemoveAll
+        // rebuild cannot close it before our phase-2 I/O completes.
         read_plans.push_back(
             ReadPlan{key, entry.offset, entry.value_size,
                      entry.allocation,  // shared_ptr copy, increments refcount
-                     dest_slice});
+                     dest_slice, data_file_});
 
-        // Lock released here; allocation stays alive via shared_ptr
+        // Lock released here; allocation + data_file stay alive via shared_ptr
     }
 
     // Step 2: Perform disk I/O without holding any locks
-    // Allocations are kept alive by shared_ptr references in read_plans
+    // Allocations and data file are kept alive by shared_ptr refs in read_plans
     for (const auto& plan : read_plans) {
-        // Read header first
-        RecordHeader header;
-        iovec header_iovs[2] = {{&header.key_len, sizeof(header.key_len)},
-                                {&header.value_len, sizeof(header.value_len)}};
+        // Read header first.  The CRC is NOT verified here: records are
+        // CRC-validated once during recovery, and during normal operation
+        // a key only becomes visible after its write completed, so the
+        // hot read path stays checksum-free.
+        char hdr_buf[RecordHeader::SIZE];
+        iovec header_iov = {hdr_buf, sizeof(hdr_buf)};
         auto read_header_result =
-            data_file_->vector_read(header_iovs, 2, plan.offset);
+            plan.data_file->vector_read(&header_iov, 1, plan.offset);
         if (!read_header_result) {
             LOG(ERROR) << "Failed to read header for key: " << plan.key
                        << ", error: " << read_header_result.error();
@@ -3130,6 +5356,7 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
             LOG(ERROR) << "Header read size mismatch for key: " << plan.key;
             return tl::make_unexpected(ErrorCode::FILE_READ_FAIL);
         }
+        RecordHeader header = RecordHeader::ReadFrom(hdr_buf);
 
         // Validate header matches metadata
         if (!header.ValidateAgainstMetadata(plan.value_size)) {
@@ -3142,7 +5369,7 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
         // Read key from disk
         std::string stored_key(header.key_len, '\0');
         iovec key_iov = {stored_key.data(), header.key_len};
-        auto read_key_result = data_file_->vector_read(
+        auto read_key_result = plan.data_file->vector_read(
             &key_iov, 1, plan.offset + RecordHeader::SIZE);
         if (!read_key_result) {
             LOG(ERROR) << "Failed to read key for: " << plan.key
@@ -3161,10 +5388,11 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::BatchLoad(
             return tl::make_unexpected(validate_result.error());
         }
 
-        // Read value into destination slice
+        // Read value into destination slice (at its aligned offset)
         iovec value_iov = {plan.dest_slice.ptr, plan.dest_slice.size};
-        auto read_value_result = data_file_->vector_read(
-            &value_iov, 1, plan.offset + RecordHeader::SIZE + header.key_len);
+        auto read_value_result = plan.data_file->vector_read(
+            &value_iov, 1,
+            plan.offset + RecordHeader::ValueOffsetInRecord(header.key_len));
         if (!read_value_result) {
             LOG(ERROR) << "Failed to read value for key: " << plan.key
                        << ", error: " << read_value_result.error();
@@ -3211,15 +5439,17 @@ OffsetAllocatorStorageBackend::IsEnableOffloading() {
         return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
     }
 
-    // TODO: See if free space check is needed here.
-    // Check quota limits only (atomic counters, completely lock-free!)
+    // When eviction is enabled, BatchOffload's EvictToMakeRoom is
+    // responsible for making room — do not block offload here.
+    if (cfg_.eviction_policy != OffsetEvictionPolicy::NONE) {
+        return true;
+    }
+
+    // Eviction disabled: keep the original quota-check behavior.
     bool within_size_limit = total_size_.load(std::memory_order_relaxed) <
                              file_storage_config_.total_size_limit;
-
-    // Check keys limit (atomic counter maintained during BatchOffload)
     bool within_keys_limit = total_keys_.load(std::memory_order_relaxed) <
                              file_storage_config_.total_keys_limit;
-
     return within_size_limit && within_keys_limit;
 }
 
@@ -3283,8 +5513,10 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::ScanMeta(
                 metadatas.push_back(StorageObjectMetadata{
                     0,  // bucket_id not used
                     static_cast<int64_t>(entry.offset),
-                    static_cast<int64_t>(entry.total_size - RecordHeader::SIZE -
-                                         entry.value_size),  // key_size
+                    // key_size comes from the key itself: total_size also
+                    // contains header and alignment padding, so it cannot
+                    // be derived arithmetically.
+                    static_cast<int64_t>(key.size()),
                     static_cast<int64_t>(entry.value_size), ""});
 
                 // Call handler when batch limit is reached
@@ -3308,15 +5540,60 @@ tl::expected<void, ErrorCode> OffsetAllocatorStorageBackend::ScanMeta(
     return {};
 }
 
+void OffsetAllocatorStorageBackend::RemoveAll() {
+    // Acquire exclusive locks on all shards to safely clear the maps and
+    // reset counters. The single-arg SharedMutexLocker constructor takes
+    // exclusive mode (see mutex.h), so map.clear() is safe. The shard locks
+    // also serialize RemoveAll vs RemoveAll (initiator sync + heartbeat
+    // backstop) and vs metadata updates; concurrent readers/writers keep the
+    // old data_file_ alive via shared_ptr pinning (see BatchLoad/BatchStore).
+    std::vector<std::unique_ptr<SharedMutexLocker>> shard_locks;
+    shard_locks.reserve(kNumShards);
+    for (size_t i = 0; i < kNumShards; ++i) {
+        shard_locks.emplace_back(
+            std::make_unique<SharedMutexLocker>(&shards_[i].mutex));
+        shards_[i].map.clear();
+    }
+    total_size_.store(0, std::memory_order_relaxed);
+    total_keys_.store(0, std::memory_order_relaxed);
+
+    // Truncate the data file and rebuild the allocator so the backend
+    // is ready for new writes (same logic as Init's fresh-start path).
+    // Rebinding the shared_ptr drops our ref; any in-flight
+    // BatchLoad/BatchStore that pinned the old data_file_ keeps it alive until
+    // its I/O completes — no use-after-free.
+    if (!data_file_path_.empty()) {
+        int fd = open(data_file_path_.c_str(),
+                      O_CLOEXEC | O_RDWR | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) {
+#ifdef USE_URING
+            if (file_storage_config_.use_uring) {
+                data_file_ =
+                    std::make_shared<UringFile>(data_file_path_, fd, 32, true);
+            } else
+#endif
+            {
+                data_file_ = std::make_shared<PosixFile>(data_file_path_, fd);
+            }
+        } else {
+            LOG(WARNING) << "RemoveAll: failed to truncate data file: "
+                         << data_file_path_;
+        }
+    }
+    if (capacity_ > 0) {
+        allocator_ = offset_allocator::OffsetAllocator::create(0, capacity_);
+    }
+
+    LOG(INFO) << "OffsetAllocatorStorageBackend::RemoveAll: cleared all data";
+}
+
 //-----------------------------------------------------------------------------
 
 tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>
-CreateStorageBackend(const FileStorageConfig& config,
-                     const Json::Value& tier_config) {
+CreateStorageBackend(const FileStorageConfig& config) {
     switch (config.storage_backend_type) {
         case StorageBackendType::kBucket: {
             auto bucket_backend_config = BucketBackendConfig::FromEnvironment();
-            bucket_backend_config.MergeFromJson(tier_config);
             if (!bucket_backend_config.Validate()) {
                 throw std::invalid_argument(
                     "Invalid StorageBackend configuration");
@@ -3335,11 +5612,86 @@ CreateStorageBackend(const FileStorageConfig& config,
                 config, file_per_key_backend_config);
         }
         case StorageBackendType::kOffsetAllocator: {
-            return std::make_shared<OffsetAllocatorStorageBackend>(config);
+            auto offset_backend_config =
+                OffsetAllocatorBackendConfig::FromEnvironment();
+            if (!offset_backend_config.Validate()) {
+                throw std::invalid_argument(
+                    "Invalid OffsetAllocatorBackendConfig");
+            }
+            return std::make_shared<OffsetAllocatorStorageBackend>(
+                config, offset_backend_config);
+        }
+        case StorageBackendType::kDistributed: {
+            auto distributed_config =
+                DistributedStorageConfig::FromEnvironment();
+            if (!distributed_config.Validate()) {
+                throw std::invalid_argument(
+                    "Invalid DistributedStorage configuration");
+            }
+            std::unique_ptr<FileSystemAdapter> adapter;
+            if (distributed_config.fs_adapter_type == "posix") {
+                adapter = std::make_unique<PosixFsAdapter>();
+            } else if (distributed_config.fs_adapter_type == "hf3fs") {
+#ifdef USE_3FS
+                adapter = std::make_unique<Hf3fsAdapter>();
+#else
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+#endif
+            } else {
+                return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+            }
+            return std::make_shared<DistributedStorageBackend>(
+                config, distributed_config, std::move(adapter));
         }
         default: {
-            LOG(FATAL) << "Unsupported backend type";
-            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+            LOG(ERROR) << "Unsupported backend type: "
+                       << static_cast<int>(config.storage_backend_type);
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+}
+
+void FilePerKeyConfig::MergeFromJson(const Json::Value& v) {
+    (void)v;
+}
+
+void BucketBackendConfig::MergeFromJson(const Json::Value& v) {
+    if (v.isMember("bucket_size_limit")) {
+        const auto& node = v["bucket_size_limit"];
+        if (node.isString()) {
+            bucket_size_limit =
+                static_cast<int64_t>(string_to_byte_size(node.asString()));
+        } else if (node.isIntegral()) {
+            bucket_size_limit = node.asInt64();
+        }
+    }
+    if (v.isMember("bucket_keys_limit")) {
+        const auto& node = v["bucket_keys_limit"];
+        if (node.isIntegral()) {
+            bucket_keys_limit = node.asInt64();
+        }
+    }
+}
+
+void FileStorageConfig::MergeFromJson(const Json::Value& v) {
+    if (v.isMember("storage_backend_type")) {
+        const std::string t = v["storage_backend_type"].asString();
+        if (t == "file_per_key_storage_backend") {
+            storage_backend_type = StorageBackendType::kFilePerKey;
+        } else if (t == "bucket_storage_backend") {
+            storage_backend_type = StorageBackendType::kBucket;
+        }
+    }
+    if (v.isMember("storage_filepath")) {
+        storage_filepath = v["storage_filepath"].asString();
+    }
+    if (v.isMember("local_buffer_size")) {
+        const auto& node = v["local_buffer_size"];
+        if (node.isString()) {
+            local_buffer_size =
+                static_cast<int64_t>(string_to_byte_size(node.asString()));
+        } else if (node.isIntegral()) {
+            local_buffer_size = static_cast<int64_t>(node.asUInt64());
         }
     }
 }
@@ -3349,6 +5701,308 @@ CreateStorageBackend(const Json::Value& tier_config) {
     auto config = FileStorageConfig::FromEnvironment();
     config.MergeFromJson(tier_config);
     return CreateStorageBackend(config, tier_config);
+}
+
+tl::expected<std::shared_ptr<StorageBackendInterface>, ErrorCode>
+CreateStorageBackend(const FileStorageConfig& config,
+                     const Json::Value& tier_config) {
+    switch (config.storage_backend_type) {
+        case StorageBackendType::kBucket: {
+            auto bucket_config = BucketBackendConfig::FromEnvironment();
+            bucket_config.MergeFromJson(tier_config);
+            return std::make_shared<BucketStorageBackend>(config, bucket_config);
+        }
+        default:
+            return CreateStorageBackend(config);
+    }
+}
+
+// ============ P2P bucket management methods ============
+
+// ========== LocalStorageSpaceManager ==========
+
+LocalStorageSpaceManager::LocalStorageSpaceManager(
+    std::filesystem::path storage_root)
+    : storage_root_(std::move(storage_root)) {}
+
+void LocalStorageSpaceManager::SetStorageRoot(
+    std::filesystem::path storage_root) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    storage_root_ = std::move(storage_root);
+}
+
+tl::expected<void, ErrorCode> LocalStorageSpaceManager::Init(
+    uint64_t used_space_bytes, uint64_t quota_bytes) {
+    namespace fs = std::filesystem;
+    std::shared_lock<std::shared_mutex> root_lock(mutex_);
+    if (storage_root_.empty()) {
+        LOG(ERROR) << "Storage root is empty for LocalStorageSpaceManager";
+        return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+    }
+    std::error_code ec;
+    auto space_info = fs::space(storage_root_, ec);
+    if (ec) {
+        LOG(ERROR) << "Failed to query filesystem space for " << storage_root_
+                   << ": " << ec.message();
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    root_lock.unlock();
+    uint64_t total_space = quota_bytes;
+    if (total_space == 0) {
+        constexpr double kDefaultQuotaPercentage = 0.9;
+        total_space = static_cast<uint64_t>(space_info.capacity *
+                                            kDefaultQuotaPercentage);
+    }
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    total_space_ = total_space;
+    used_space_ = used_space_bytes;
+    RecalculateAvailableSpaceLocked();
+    initialized_.store(true, std::memory_order_release);
+    return {};
+}
+
+tl::expected<bool, ErrorCode> LocalStorageSpaceManager::HasPhysicalSpace(
+    uint64_t required_size) const {
+    namespace fs = std::filesystem;
+    {
+        std::shared_lock<std::shared_mutex> lock(mutex_);
+        if (!initialized_.load(std::memory_order_acquire)) {
+            LOG(ERROR) << "LocalStorageSpaceManager used before initialization";
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        if (available_space_ < required_size) return false;
+        if (storage_root_.empty()) {
+            LOG(ERROR) << "Storage root is empty for LocalStorageSpaceManager";
+            return tl::make_unexpected(ErrorCode::INVALID_PARAMS);
+        }
+    }
+    std::error_code ec;
+    const auto space_info = fs::space(storage_root_, ec);
+    if (ec) {
+        LOG(ERROR) << "Failed to query filesystem space for " << storage_root_
+                   << ": " << ec.message();
+        return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+    }
+    return space_info.available >= required_size;
+}
+
+bool LocalStorageSpaceManager::IsInitialized() const {
+    return initialized_.load(std::memory_order_acquire);
+}
+
+bool LocalStorageSpaceManager::TryReserve(uint64_t required_size) {
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    if (!initialized_.load(std::memory_order_acquire)) return false;
+    if (available_space_ < required_size) return false;
+    used_space_ += required_size;
+    available_space_ -= required_size;
+    return true;
+}
+
+void LocalStorageSpaceManager::Release(uint64_t size_to_release) {
+    if (size_to_release == 0) return;
+    std::unique_lock<std::shared_mutex> lock(mutex_);
+    if (!initialized_.load(std::memory_order_acquire)) return;
+    if (size_to_release <= used_space_) {
+        used_space_ -= size_to_release;
+    } else {
+        used_space_ = 0;
+    }
+    RecalculateAvailableSpaceLocked();
+}
+
+uint64_t LocalStorageSpaceManager::TotalSpace() const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    return total_space_;
+}
+
+uint64_t LocalStorageSpaceManager::UsedSpace() const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    return used_space_;
+}
+
+uint64_t LocalStorageSpaceManager::AvailableSpace() const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    return available_space_;
+}
+
+bool LocalStorageSpaceManager::IsOverQuota() const {
+    std::shared_lock<std::shared_mutex> lock(mutex_);
+    return total_space_ > 0 && used_space_ > total_space_;
+}
+
+void LocalStorageSpaceManager::RecalculateAvailableSpaceLocked() {
+    available_space_ = (total_space_ > used_space_)
+                           ? total_space_ - used_space_
+                           : 0;
+}
+
+// ========== BucketStorageBackend P2P methods ==========
+
+tl::expected<int64_t, ErrorCode> BucketStorageBackend::SelectBucketForEviction()
+    const {
+    SharedMutexLocker lock(&mutex_, shared_lock);
+    if (buckets_.empty()) {
+        return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    constexpr float FRAG_THRESHOLD = 0.5f;
+    int64_t best_fragmented = -1;
+    for (const auto& [bucket_id, bucket_meta] : buckets_) {
+        int total_keys = static_cast<int>(bucket_meta->keys.size());
+        if (total_keys == 0) continue;
+        int valid_keys = 0;
+        auto it = bucket_valid_keys_.find(bucket_id);
+        if (it != bucket_valid_keys_.end()) valid_keys = it->second;
+        float frag_ratio = 1.0f - static_cast<float>(valid_keys) / total_keys;
+        if (frag_ratio > FRAG_THRESHOLD) {
+            if (best_fragmented == -1 || bucket_id < best_fragmented)
+                best_fragmented = bucket_id;
+        }
+    }
+    if (best_fragmented != -1) return best_fragmented;
+    return buckets_.begin()->first;
+}
+
+tl::expected<size_t, ErrorCode> BucketStorageBackend::EvictBucket(
+    int64_t bucket_id) {
+    size_t freed_size = 0;
+    size_t key_count = 0;
+    uint64_t data_bytes = 0, meta_bytes = 0, queued_delete_bytes = 0;
+    {
+        SharedMutexLocker lock(&mutex_);
+        auto bucket_it = buckets_.find(bucket_id);
+        if (bucket_it == buckets_.end())
+            return tl::make_unexpected(ErrorCode::OBJECT_NOT_FOUND);
+        auto bucket_meta = bucket_it->second;
+        key_count = bucket_meta->keys.size();
+        for (const auto& key : bucket_meta->keys) {
+            auto obj_it = object_bucket_map_.find(key);
+            if (obj_it == object_bucket_map_.end()) continue;
+            freed_size += obj_it->second.data_size;
+            object_bucket_map_.erase(obj_it);
+        }
+        data_bytes = static_cast<uint64_t>(bucket_meta->data_size);
+        meta_bytes = static_cast<uint64_t>(bucket_meta->meta_size);
+        queued_delete_bytes = data_bytes + meta_bytes;
+        buckets_.erase(bucket_it);
+        bucket_valid_keys_.erase(bucket_id);
+    }
+    auto data_path_res = GetBucketDataPath(bucket_id);
+    if (!data_path_res) return tl::make_unexpected(data_path_res.error());
+    auto meta_path_res = GetBucketMetadataPath(bucket_id);
+    if (!meta_path_res) return tl::make_unexpected(meta_path_res.error());
+    EnqueueBucketDeletion(PendingBucketDeletion{
+        bucket_id, data_bytes, meta_bytes, queued_delete_bytes,
+        std::move(data_path_res.value()), std::move(meta_path_res.value())});
+    return freed_size;
+}
+
+tl::expected<void, ErrorCode> BucketStorageBackend::MarkKeyDeleted(
+    const std::string& key) {
+    SharedMutexLocker lock(&mutex_);
+    auto obj_it = object_bucket_map_.find(key);
+    if (obj_it == object_bucket_map_.end()) return {};
+    int64_t bucket_id = obj_it->second.bucket_id;
+    auto bucket_valid_it = bucket_valid_keys_.find(bucket_id);
+    if (bucket_valid_it != bucket_valid_keys_.end() &&
+        bucket_valid_it->second > 0)
+        bucket_valid_it->second--;
+    object_bucket_map_.erase(obj_it);
+    return {};
+}
+
+tl::expected<bool, ErrorCode> BucketStorageBackend::CanAcceptAnotherBucket()
+    const {
+    const uint64_t pending_bytes =
+        pending_deletion_bytes_.load(std::memory_order_acquire);
+    const uint64_t pending_count =
+        pending_deletion_count_.load(std::memory_order_acquire);
+    const uint64_t backlog_limit = MaxPendingDeletionBytes();
+    if (pending_bytes > backlog_limit) {
+        LOG(WARNING) << "Bucket deletion backlog too large: pending_bytes="
+                     << pending_bytes << ", pending_count=" << pending_count;
+        return false;
+    }
+    const uint64_t required_space =
+        static_cast<uint64_t>(bucket_backend_config_.bucket_size_limit);
+    if (!space_manager_.IsInitialized()) {
+        std::error_code ec;
+        const auto space_info = std::filesystem::space(storage_path_, ec);
+        if (ec) {
+            return tl::make_unexpected(ErrorCode::INTERNAL_ERROR);
+        }
+        return space_info.available >= required_space;
+    }
+    return space_manager_.HasPhysicalSpace(required_space);
+}
+
+uint64_t BucketStorageBackend::MaxPendingDeletionBytes() const {
+    constexpr uint64_t kMaxBuckets = 8;
+    return static_cast<uint64_t>(bucket_backend_config_.bucket_size_limit) *
+           kMaxBuckets;
+}
+
+void BucketStorageBackend::StartDeletionWorker() {
+    std::lock_guard<std::mutex> lock(deletion_mutex_);
+    if (deletion_thread_.joinable()) return;
+    stop_deletion_worker_ = false;
+    deletion_thread_ =
+        std::thread(&BucketStorageBackend::BucketDeletionWorker, this);
+}
+
+void BucketStorageBackend::StopDeletionWorker() {
+    {
+        std::lock_guard<std::mutex> lock(deletion_mutex_);
+        stop_deletion_worker_ = true;
+    }
+    deletion_cv_.notify_all();
+    if (deletion_thread_.joinable()) deletion_thread_.join();
+}
+
+void BucketStorageBackend::EnqueueBucketDeletion(PendingBucketDeletion task) {
+    const uint64_t queued_bytes = task.queued_bytes;
+    {
+        std::lock_guard<std::mutex> lock(deletion_mutex_);
+        pending_bucket_deletions_.push_back(std::move(task));
+    }
+    pending_deletion_count_.fetch_add(1, std::memory_order_acq_rel);
+    pending_deletion_bytes_.fetch_add(queued_bytes, std::memory_order_acq_rel);
+    deletion_cv_.notify_one();
+}
+
+void BucketStorageBackend::BucketDeletionWorker() {
+    namespace fs = std::filesystem;
+    for (;;) {
+        PendingBucketDeletion task;
+        {
+            std::unique_lock<std::mutex> lock(deletion_mutex_);
+            deletion_cv_.wait(lock, [this] {
+                return stop_deletion_worker_ ||
+                       !pending_bucket_deletions_.empty();
+            });
+            if (stop_deletion_worker_ && pending_bucket_deletions_.empty())
+                return;
+            task = std::move(pending_bucket_deletions_.front());
+            pending_bucket_deletions_.pop_front();
+        }
+        std::error_code ec;
+        bool release_data = false;
+        fs::remove(task.data_path, ec);
+        if (!ec || ec == std::errc::no_such_file_or_directory)
+            release_data = true;
+        ec.clear();
+        bool release_meta = false;
+        fs::remove(task.meta_path, ec);
+        if (!ec || ec == std::errc::no_such_file_or_directory)
+            release_meta = true;
+        uint64_t released = 0;
+        if (release_data) released += task.data_bytes;
+        if (release_meta) released += task.meta_bytes;
+        space_manager_.Release(released);
+        pending_deletion_bytes_.fetch_sub(task.queued_bytes,
+                                          std::memory_order_acq_rel);
+        pending_deletion_count_.fetch_sub(1, std::memory_order_acq_rel);
+    }
 }
 
 }  // namespace mooncake

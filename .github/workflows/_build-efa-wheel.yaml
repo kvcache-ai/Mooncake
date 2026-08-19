@@ -1,0 +1,223 @@
+name: _build-efa-wheel
+
+# Shared AWS EFA wheel build used by pull-request CI and release workflows.
+# EFA hardware is not required to build: the distro libfabric is used for
+# compilation, then auditwheel leaves libfabric/libefa to the system runtime.
+
+on:
+  workflow_call:
+    inputs:
+      variant:
+        # cuda | cuda13 | non-cuda
+        type: string
+        required: true
+      use-cuda:
+        type: boolean
+        required: true
+      python-versions:
+        # JSON array consumed by the called workflow's Python matrix.
+        type: string
+        required: true
+      build-profile:
+        # ci uses Ninja and CI diagnostics; release preserves the release make build.
+        type: string
+        required: true
+      cmake-args:
+        type: string
+        required: true
+      variant-flag:
+        # build_wheel.sh package variant, e.g. EFA_BUILD.
+        type: string
+        required: true
+      cuda-version:
+        type: string
+        default: '12.8.1'
+      torch-cuda-arch-list:
+        type: string
+        default: ''
+      artifact-prefix:
+        type: string
+        required: true
+
+env:
+  SCCACHE_GHA_ENABLED: "true"
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    strategy:
+      matrix:
+        python-version: ${{ fromJSON(inputs.python-versions) }}
+    env:
+      BUILD_PROFILE: ${{ inputs.build-profile }}
+      CMAKE_ARGS: ${{ inputs.cmake-args }}
+      EFA_VARIANT: ${{ inputs.variant }}
+      USE_CUDA: ${{ inputs.use-cuda }}
+      VARIANT_FLAG: ${{ inputs.variant-flag }}
+      CUDA_VERSION: ${{ inputs.cuda-version }}
+
+    steps:
+      - name: Validate build inputs
+        run: |
+          case "$BUILD_PROFILE" in
+            ci|release) ;;
+            *) echo "::error::Unknown EFA build profile: $BUILD_PROFILE"; exit 1 ;;
+          esac
+
+          case "$EFA_VARIANT:$USE_CUDA:$VARIANT_FLAG" in
+            cuda:true:EFA_BUILD|cuda13:true:EFA_CU13_BUILD|non-cuda:false:EFA_NON_CUDA_BUILD) ;;
+            *) echo "::error::Inconsistent EFA variant inputs"; exit 1 ;;
+          esac
+        shell: bash
+
+      - name: Configure CUDA architecture list
+        if: ${{ inputs.torch-cuda-arch-list != '' }}
+        env:
+          ARCH_LIST: ${{ inputs.torch-cuda-arch-list }}
+        run: echo "TORCH_CUDA_ARCH_LIST=$ARCH_LIST" >> "$GITHUB_ENV"
+        shell: bash
+
+      - name: Checkout source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: ${{ inputs.build-profile == 'release' }}
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Free up disk space
+        uses: ./.github/actions/free-disk-space
+
+      - name: Install CUDA Toolkit
+        if: ${{ inputs.use-cuda }}
+        uses: Jimver/cuda-toolkit@v0.2.29
+        with:
+          cuda: ${{ inputs.cuda-version }}
+          method: 'network'
+          sub-packages: '["nvcc", "nvrtc-dev"]'
+          non-cuda-sub-packages: '["libcusparse-dev", "libcublas-dev", "libcusolver-dev"]'
+
+      - name: Run sccache-cache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Configure sccache
+        uses: actions/github-script@v7
+        with:
+          script: |
+            core.exportVariable('ACTIONS_RESULTS_URL', process.env.ACTIONS_RESULTS_URL || '');
+            core.exportVariable('ACTIONS_RUNTIME_TOKEN', process.env.ACTIONS_RUNTIME_TOKEN || '');
+
+      - name: Install dependencies
+        run: |
+          sudo apt update -y
+          packages=(libfabric-dev libfabric1)
+          if [ "$BUILD_PROFILE" = ci ]; then
+            packages=(ninja-build "${packages[@]}")
+          fi
+          sudo apt install -y "${packages[@]}"
+          sudo bash -x dependencies.sh -y
+          if [ "$BUILD_PROFILE" = ci ]; then
+            df -h
+          fi
+        shell: bash
+
+      - name: Configure project
+        run: |
+          generator=()
+          if [ "$BUILD_PROFILE" = ci ]; then
+            generator=(-G Ninja)
+          fi
+
+          cuda_args=(-DUSE_CUDA=OFF)
+          if [ "$USE_CUDA" = true ]; then
+            cuda_args=(
+              -DUSE_CUDA=ON
+              -DCMAKE_EXE_LINKER_FLAGS=-L/usr/local/cuda/lib64/stubs
+            )
+          fi
+
+          read -r -a profile_args <<< "$CMAKE_ARGS"
+          mkdir build
+          cd build
+          cmake "${generator[@]}" .. \
+            -DUSE_EFA=ON \
+            -DLIBFABRIC_INCLUDE_DIR=/usr/include \
+            -DLIBFABRIC_LIBRARY=/usr/lib/x86_64-linux-gnu/libfabric.so \
+            -DENABLE_SCCACHE=ON \
+            -DCMAKE_BUILD_TYPE=Release \
+            "${profile_args[@]}" \
+            "${cuda_args[@]}"
+        shell: bash
+
+      - name: Build project
+        run: |
+          if [ "$USE_CUDA" = true ]; then
+            export LD_LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LD_LIBRARY_PATH
+            export LIBRARY_PATH=/usr/local/cuda/lib64/stubs:$LIBRARY_PATH
+          fi
+
+          cd build
+          if [ "$BUILD_PROFILE" = release ]; then
+            make -j3
+            sudo make install
+          else
+            cmake --build .
+            sudo cmake --install .
+            df -h
+          fi
+        shell: bash
+
+      - name: Run sccache stat for check
+        if: ${{ env.SCCACHE_PATH != '' }}
+        shell: bash
+        run: ${SCCACHE_PATH} --show-stats
+
+      - name: Generate Python version tag
+        id: python-tag
+        run: |
+          echo "python_version_tag=$(echo ${{ matrix.python-version }} | tr -d '.')" >> "$GITHUB_OUTPUT"
+        shell: bash
+
+      - name: Build Python wheel
+        run: |
+          export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/usr/local/lib
+          export "$VARIANT_FLAG=1"
+          PYTHON_VERSION=${{ matrix.python-version }} \
+            OUTPUT_DIR=dist-py${{ steps.python-tag.outputs.python_version_tag }} \
+            ./scripts/build_wheel.sh
+        shell: bash
+
+      - name: Verify libfabric is excluded from the wheel
+        run: |
+          WHL=$(ls mooncake-wheel/dist-py${{ steps.python-tag.outputs.python_version_tag }}/*.whl | head -1)
+          echo "Inspecting $WHL"
+          if unzip -l "$WHL" | grep -iE 'libfabric|libefa'; then
+            echo "::error::libfabric/libefa must NOT be bundled in the EFA wheel"
+            exit 1
+          fi
+          echo "OK: libfabric/libefa correctly excluded (resolve to system EFA at runtime)"
+        shell: bash
+
+      - name: Verify CUDA runtime dependency
+        if: ${{ inputs.use-cuda }}
+        run: |
+          WHL=$(ls mooncake-wheel/dist-py${{ steps.python-tag.outputs.python_version_tag }}/*.whl | head -1)
+          inspect_dir=$(mktemp -d)
+          unzip -q "$WHL" mooncake/engine.so -d "$inspect_dir"
+          cuda_major=${CUDA_VERSION%%.*}
+          if ! readelf -d "$inspect_dir/mooncake/engine.so" | \
+              grep -Fq "Shared library: [libcudart.so.${cuda_major}]"; then
+            echo "::error::EFA wheel does not depend on libcudart.so.${cuda_major}"
+            readelf -d "$inspect_dir/mooncake/engine.so" | grep NEEDED
+            exit 1
+          fi
+          echo "OK: EFA wheel depends on libcudart.so.${cuda_major}"
+        shell: bash
+
+      - name: Upload Python wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.artifact-prefix }}-py${{ steps.python-tag.outputs.python_version_tag }}
+          path: mooncake-wheel/dist-py${{ steps.python-tag.outputs.python_version_tag }}/*.whl

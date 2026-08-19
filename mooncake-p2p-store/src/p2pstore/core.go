@@ -98,6 +98,14 @@ func (store *P2PStore) Close() error {
 	return retErr
 }
 
+// GetLocalServerName returns the local server name (ip:port) that this
+// P2PStore instance is registered under. In P2P handshake mode the RPC
+// port is allocated dynamically, so callers must use this method to
+// discover the actual address after initialization.
+func (store *P2PStore) GetLocalServerName() (string, error) {
+	return store.transfer.GetLocalIpAndPort()
+}
+
 type Buffer struct {
 	addr uintptr
 	size uint64
@@ -260,6 +268,7 @@ func (store *P2PStore) doGetReplica(ctx context.Context, payload *Payload, addrL
 		if err != nil {
 			return err
 		}
+		offset = 0
 		for ; offset < size; offset += maxShardSize {
 			source := addr + uintptr(offset)
 			shard := payload.Shards[taskID]
@@ -267,7 +276,7 @@ func (store *P2PStore) doGetReplica(ctx context.Context, payload *Payload, addrL
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				err = store.performTransfer(ctx, source, shard)
+				err := store.performTransfer(ctx, source, shard)
 				if err != nil {
 					select {
 					case errChan <- err:

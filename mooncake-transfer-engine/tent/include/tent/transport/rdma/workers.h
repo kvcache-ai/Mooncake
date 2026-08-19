@@ -16,6 +16,7 @@
 #define TENT_WORKERS_H
 
 #include <future>
+#include <memory>
 #include <queue>
 #include <thread>
 #include <unordered_set>
@@ -28,18 +29,23 @@
 #include "rail_monitor.h"
 #include "tent/common/utils/os.h"
 #include "tent/common/concurrent/bounded_mpsc_queue.h"
+#include "tent/common/types.h"
 
 namespace mooncake {
 namespace tent {
 
 class RdmaTransport;
+class DeviceSelector;
+
 class Workers {
+    friend class RdmaTransportTestPeer;
+
    public:
     static constexpr size_t kCapacity = 1024 * 8;
     using BoundedSliceQueue = BoundedMPSCQueue<RdmaSliceList, kCapacity>;
 
    public:
-    Workers(RdmaTransport *transport);
+    Workers(RdmaTransport* transport);
 
     ~Workers();
 
@@ -47,14 +53,17 @@ class Workers {
 
     Status stop();
 
-    Status submit(RdmaSlice *slice);
+    Status submit(RdmaSlice* slice);
 
-    Status submit(RdmaSliceList &slice_list, int worker_id = -1);
+    Status submit(RdmaSliceList& slice_list, int worker_id = -1);
 
-    Status cancel(RdmaSliceList &slice_list);
+    Status cancel(RdmaTask* task);
+
+    DeviceSelector* getDeviceSelector() const { return device_selector_.get(); }
 
    private:
     using Task = std::function<void()>;
+    struct WorkerContext;
 
     void workerThread(int thread_id);
 
@@ -62,37 +71,56 @@ class Workers {
 
     void asyncPollCq();
 
+    bool cancelUnpostedSlice(WorkerContext& worker, RdmaSlice* slice);
+
+    void releaseSliceQuota(RdmaSlice* slice, double latency = 0.0);
+
     void monitorThread();
 
-    int handleContextEvents(std::shared_ptr<RdmaContext> &context);
+    // 1 Hz heartbeat from monitorThread(): drains every context's retiring
+    // endpoints so reclaim is not gated on new insertions, which stall under
+    // failure load.
+    void reclaimEndpoints();
 
-    Status generatePostPath(RdmaSlice *slice);
+    int handleContextEvents(std::shared_ptr<RdmaContext>& context);
+
+    Status generatePostPath(RdmaSlice* slice);
 
    private:
     struct RouteHint {
-        SegmentDesc *segment;
-        BufferDesc *buffer;
-        const Topology::MemEntry *topo_entry;
-        const Topology *topo;
+        // Owning reference to the segment snapshot; keeps all raw pointers
+        // below valid for the lifetime of this hint.
+        SegmentDescRef pin;
+        SegmentDesc* segment;
+        BufferDesc* buffer;
+        const Topology::MemEntry* topo_entry;
+        const Topology* topo;
+        std::string location;
     };
 
-    Status getRouteHint(RouteHint &hint, SegmentID segment_id, uint64_t addr,
+    Status getRouteHint(RouteHint& hint, SegmentID segment_id, uint64_t addr,
                         uint64_t length);
 
-    Status selectOptimalDevice(RouteHint &source, RouteHint &target,
-                               RdmaSlice *slice);
+    Status selectOptimalDevice(RouteHint& source, RouteHint& target,
+                               RdmaSlice* slice);
 
-    Status selectFallbackDevice(RouteHint &source, RouteHint &target,
-                                RdmaSlice *slice);
+    Status selectFallbackDevice(RouteHint& source, RouteHint& target,
+                                RdmaSlice* slice);
 
-    int getDeviceByFlatIndex(const RouteHint &hint, size_t flat_idx);
+    int getDeviceByFlatIndex(const RouteHint& hint, size_t flat_idx);
 
-    int getDeviceRank(const RouteHint &hint, int device_id);
+    // True if the (sdev -> tdev) NIC pair is known-unable to GPUDirect-DMA to
+    // the source/target GPU (learned from prior completion errors). Used to
+    // steer selection away from dead rails before posting.
+    bool gdrPairExcluded(const RouteHint& source, const RouteHint& target,
+                         int sdev, int tdev, int src_gpu, int dst_gpu);
+
+    int getDeviceRank(const RouteHint& hint, int device_id);
 
     void showLatencyInfo();
 
    private:
-    RdmaTransport *transport_;
+    RdmaTransport* transport_;
     size_t num_workers_;
     std::thread monitor_;
 
@@ -103,7 +131,7 @@ class Workers {
         SegmentID remote_segment_id;
         int remote_device_id;
 
-        bool operator==(const PostPath &rhs) const {
+        bool operator==(const PostPath& rhs) const {
             return local_device_id == rhs.local_device_id &&
                    remote_segment_id == rhs.remote_segment_id &&
                    remote_device_id == rhs.remote_device_id;
@@ -111,7 +139,7 @@ class Workers {
     };
 
     struct PostPathHash {
-        size_t operator()(const PostPath &postPath) const {
+        size_t operator()(const PostPath& postPath) const {
             size_t h1 = std::hash<int>{}(postPath.local_device_id);
             size_t h2 = std::hash<SegmentID>{}(postPath.remote_segment_id);
             size_t h3 = std::hash<int>{}(postPath.remote_device_id);
@@ -121,10 +149,10 @@ class Workers {
 
     std::shared_ptr<RdmaEndPoint> getEndpoint(PostPath path);
 
-    void disableEndpoint(RdmaSlice *slice);
+    void disableEndpoint(RdmaSlice* slice);
 
     using GroupedRequests =
-        std::unordered_map<PostPath, std::vector<RdmaSlice *>, PostPathHash>;
+        std::unordered_map<PostPath, std::vector<RdmaSlice*>, PostPathHash>;
 
     struct PerfMetric {
         void add(double val) { samples.push_back(val); }
@@ -175,27 +203,50 @@ class Workers {
         PerfMetric inflight_lat;
     };
 
+    static constexpr int kNumPriorityLevels = PRIO_LOW + 1;
+
     struct WorkerContext {
         std::thread thread;
-        BoundedSliceQueue queue;
+        BoundedSliceQueue queues[kNumPriorityLevels];  // Priority queues
         GroupedRequests requests;
-        std::unordered_set<RdmaSlice *> inflight_slice_set;
+        std::unordered_set<RdmaSlice*> inflight_slice_set;
         std::atomic<int64_t> inflight_slices = 0;
 
         std::mutex mutex;
         std::condition_variable cv;
         volatile bool in_suspend = false;
 
-        std::unordered_map<std::string, RailMonitor> rails;
+        // Next time to check for priority promotions (nanoseconds)
+        uint64_t next_promotion_check_ns = 0;
+
+        // Values are held via unique_ptr so that map rehashing does not
+        // invalidate pointers into RailMonitor stored on in-flight slices
+        // (see RdmaSlice::rail_monitor).
+        std::unordered_map<std::string, std::unique_ptr<RailMonitor>> rails;
         PerfMetricSummary perf;
-        uint64_t padding[16];
+        uint64_t padding[15];
     };
 
-    WorkerContext *worker_context_;
-    uint64_t slice_timeout_ns_;
+    // Promote timed-out low priority requests to higher priority queues
+    void promoteTimedOutRequests(WorkerContext& worker);
 
-    std::unique_ptr<DeviceQuota> device_quota_;
+    WorkerContext* worker_context_;
+    uint64_t slice_timeout_ns_;
+    uint64_t priority_promotion_timeout_ns_;  // Timeout for priority promotion
+    // Opt-in (issue #2528): when true, a promotion pass promotes exactly the
+    // entries that have themselves timed out, instead of promoting the whole
+    // queue whenever only the head has timed out. Default false keeps the
+    // historical "flush the tier" behavior.
+    bool priority_promotion_per_entry_ = false;
+
+    std::unique_ptr<DeviceSelector> device_selector_;
+    // File contents loaded once from workers.rail_topo_path and shared by all
+    // per-worker/per-peer RailMonitor instances.
+    std::string rail_topo_json_;
     bool always_tier1_ = false;
+    // Opt-in deadline-aware bandwidth arbitration within a priority tier
+    // (RFC #2792). Default false = original FIFO order (equal bandwidth split).
+    bool deadline_bw_arbitration_ = false;
 };
 }  // namespace tent
 }  // namespace mooncake

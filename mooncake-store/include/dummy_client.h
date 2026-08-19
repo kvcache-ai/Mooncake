@@ -1,87 +1,20 @@
 #pragma once
 
-#include "client_config_builder.h"
+#include <atomic>
 #include <csignal>
+#include <mutex>
+#include <shared_mutex>
+#include <unordered_map>
 #include <ylt/coro_rpc/coro_rpc_client.hpp>
 
+#include "client_metric.h"
+#include "device/cuda_ipc_buffer_handle.h"
 #include "pyclient.h"
-#include <atomic>
+#include "store_rpc_client_io_context.h"
+#include "shm_helper.h"
 #include <memory>
 
 namespace mooncake {
-
-class ShmHelper {
-   public:
-    struct ShmSegment {
-        int fd = -1;
-        void* base_addr = nullptr;
-        size_t size = 0;
-        std::string name;
-        bool registered = false;
-        bool is_local = false;
-    };
-
-    static ShmHelper* getInstance();
-
-    void* allocate(size_t size);
-    int free(void* addr);
-
-    bool cleanup();
-
-    // Get the shm that contains the given address
-    // Returns a shared_ptr to ensure the segment remains valid
-    std::shared_ptr<ShmSegment> get_shm(void* addr);
-
-    const std::vector<std::shared_ptr<ShmSegment>>& get_shms() const {
-        return shms_;
-    }
-
-    std::vector<std::shared_ptr<ShmSegment>> get_shms_snapshot() const {
-        std::lock_guard<std::mutex> lock(shm_mutex_);
-        return shms_;
-    }
-
-    void set_registered(const std::shared_ptr<ShmSegment>& shm, bool value) {
-        std::lock_guard<std::mutex> lock(shm_mutex_);
-        if (shm) shm->registered = value;
-    }
-
-    bool is_registered(const std::shared_ptr<ShmSegment>& shm) const {
-        std::lock_guard<std::mutex> lock(shm_mutex_);
-        return shm && shm->registered;
-    }
-
-    size_t count_registered() const {
-        std::lock_guard<std::mutex> lock(shm_mutex_);
-        size_t count = 0;
-        for (const auto& shm : shms_) {
-            if (shm->registered) ++count;
-        }
-        return count;
-    }
-
-    std::vector<std::shared_ptr<ShmSegment>> get_registered_snapshot() const {
-        std::lock_guard<std::mutex> lock(shm_mutex_);
-        std::vector<std::shared_ptr<ShmSegment>> registered;
-        for (const auto& shm : shms_) {
-            if (shm->registered) registered.push_back(shm);
-        }
-        return registered;
-    }
-
-    bool is_hugepage() const { return use_hugepage_; }
-
-    ShmHelper(const ShmHelper&) = delete;
-    ShmHelper& operator=(const ShmHelper&) = delete;
-
-   private:
-    ShmHelper();
-    ~ShmHelper();
-
-    std::vector<std::shared_ptr<ShmSegment>> shms_;
-    static std::mutex shm_mutex_;
-    bool use_hugepage_ = false;
-};
 
 class DummyClient : public PyClient {
    public:
@@ -90,122 +23,189 @@ class DummyClient : public PyClient {
 
     int64_t unregister_shm();
 
-    int setup(DummyClientConfig& config);
+    int setup_real(const std::string &local_hostname,
+                   const std::string &metadata_server,
+                   size_t global_segment_size, size_t local_buffer_size,
+                   const std::string &protocol, const std::string &rdma_devices,
+                   const std::string &master_server_addr,
+                   const std::shared_ptr<TransferEngine> &transfer_engine,
+                   const std::string &ipc_socket_path,
+                   bool enable_ssd_offload = false,
+                   const std::string &ssd_offload_path = "",
+                   const std::string &tenant_id = "default",
+                   bool enable_client_http_server = false,
+                   int client_http_port = DEFAULT_CLIENT_HTTP_PORT) {
+        // Dummy client does not support real setup
+        return -1;
+    };
 
-    int initAll(const std::string& protocol, const std::string& device_name,
-                size_t mount_segment_size) override {
+    int setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
+                    const std::string &server_address,
+                    const std::string &ipc_socket_path);
+
+    int initAll(const std::string &protocol, const std::string &device_name,
+                size_t mount_segment_size) {
         // Dummy client does not support real setup
         return -1;
     }
 
-    uint64_t alloc_from_mem_pool(size_t size) override;
+    uint64_t alloc_from_mem_pool(size_t size);
 
-    // if a dummy client has connected to a real client,
-    // return the mode of real client
-    DeploymentMode deployment_mode() const override { return deployment_mode_; }
+    int put(const std::string &key, std::span<const char> value,
+            const ReplicateConfig &config = ReplicateConfig{});
 
-    int put(const std::string& key, std::span<const char> value,
-            const WriteConfig& config) override;
+    int register_buffer(void *buffer, size_t size);
 
-    int register_buffer(void* buffer, size_t size) override;
+    int unregister_buffer(void *buffer);
 
-    int unregister_buffer(void* buffer) override;
+    int64_t get_into(const std::string &key, void *buffer, size_t size);
 
-    int64_t get_into(const std::string& key, void* buffer, size_t size,
-                     const ReadRouteConfig& config = {}) override;
+    std::vector<std::vector<std::vector<int64_t>>> get_into_ranges(
+        const std::vector<void *> &buffers,
+        const std::vector<std::vector<std::string>> &all_keys,
+        const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+        const QueryResultCache *query_result_cache = nullptr) override;
 
-    std::vector<int64_t> batch_get_into(
-        const std::vector<std::string>& keys, const std::vector<void*>& buffers,
-        const std::vector<size_t>& sizes,
-        const ReadRouteConfig& config = {}) override;
+    std::vector<tl::expected<QueryResult, ErrorCode>> batch_query(
+        const std::vector<std::string> &keys) override;
+
+    std::vector<int64_t> batch_get_into(const std::vector<std::string> &keys,
+                                        const std::vector<void *> &buffers,
+                                        const std::vector<size_t> &sizes);
+
+    std::vector<int64_t> batch_get_into_cuda_ipc(
+        const std::vector<CudaIpcReadRequest> &requests);
 
     std::vector<int> batch_get_into_multi_buffers(
-        const std::vector<std::string>& keys,
-        const std::vector<std::vector<void*>>& all_buffers,
-        const std::vector<std::vector<size_t>>& all_sizes,
-        bool aggregate_same_segment_task,
-        const ReadRouteConfig& config = {}) override;
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        bool prefer_same_node);
 
-    int put_from(const std::string& key, void* buffer, size_t size,
-                 const WriteConfig& config) override;
+    int put_from(const std::string &key, void *buffer, size_t size,
+                 const ReplicateConfig &config = ReplicateConfig{});
 
-    int put_from_with_metadata(const std::string& key, void* buffer,
-                               void* metadata_buffer, size_t size,
-                               size_t metadata_size,
-                               const WriteConfig& config) override;
+    int put_from_with_metadata(
+        const std::string &key, void *buffer, void *metadata_buffer,
+        size_t size, size_t metadata_size,
+        const ReplicateConfig &config = ReplicateConfig{});
 
-    std::vector<int> batch_put_from(const std::vector<std::string>& keys,
-                                    const std::vector<void*>& buffers,
-                                    const std::vector<size_t>& sizes,
-                                    const WriteConfig& config) override;
+    std::vector<int> batch_put_from(
+        const std::vector<std::string> &keys,
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        const ReplicateConfig &config = ReplicateConfig{});
 
     std::vector<int> batch_put_from_multi_buffers(
-        const std::vector<std::string>& keys,
-        const std::vector<std::vector<void*>>& all_buffers,
-        const std::vector<std::vector<size_t>>& all_sizes,
-        const WriteConfig& config) override;
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const ReplicateConfig &config = ReplicateConfig{});
 
-    std::shared_ptr<BufferHandle> get_buffer(
-        const std::string& key, const ReadRouteConfig& config = {}) override;
+    std::vector<int> batch_put_from_cuda_ipc(
+        const std::vector<CudaIpcWriteRequest> &requests,
+        const ReplicateConfig &config = ReplicateConfig{});
 
-    std::tuple<uint64_t, size_t> get_buffer_info(
-        const std::string& key, const ReadRouteConfig& config = {}) override;
+    std::shared_ptr<BufferHandle> get_buffer(const std::string &key);
 
     std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer(
-        const std::vector<std::string>& keys,
-        const ReadRouteConfig& config = {}) override;
+        const std::vector<std::string> &keys);
 
-    int put_parts(const std::string& key,
+    int put_parts(const std::string &key,
                   std::vector<std::span<const char>> values,
-                  const WriteConfig& config) override;
+                  const ReplicateConfig &config = ReplicateConfig{});
 
-    int put_batch(const std::vector<std::string>& keys,
-                  const std::vector<std::span<const char>>& values,
-                  const WriteConfig& config) override;
+    int put_batch(const std::vector<std::string> &keys,
+                  const std::vector<std::span<const char>> &values,
+                  const ReplicateConfig &config = ReplicateConfig{});
 
-    [[nodiscard]] std::string get_hostname() const override;
+    int upsert(const std::string &key, std::span<const char> value,
+               const ReplicateConfig &config = ReplicateConfig{});
 
-    int remove(const std::string& key, bool force = false) override;
+    int upsert_from(const std::string &key, void *buffer, size_t size,
+                    const ReplicateConfig &config = ReplicateConfig{});
 
-    long removeByRegex(const std::string& str, bool force = false) override;
+    std::vector<int> batch_upsert_from(
+        const std::vector<std::string> &keys,
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        const ReplicateConfig &config = ReplicateConfig{});
 
-    long removeAll(bool force = false) override;
+    int upsert_parts(const std::string &key,
+                     std::vector<std::span<const char>> values,
+                     const ReplicateConfig &config = ReplicateConfig{});
 
-    long removeAllLocal() override;
+    int upsert_batch(const std::vector<std::string> &keys,
+                     const std::vector<std::span<const char>> &values,
+                     const ReplicateConfig &config = ReplicateConfig{});
 
-    int removeLocal(const std::string& key) override;
+    [[nodiscard]] std::string get_hostname() const;
 
-    int isExist(const std::string& key) override;
+    // Check if a pointer falls within the hot cache shm region
+    bool is_hot_cache_ptr(const void *ptr) const {
+        if (!hot_cache_base_) return false;
+        auto p = reinterpret_cast<uintptr_t>(ptr);
+        auto base = reinterpret_cast<uintptr_t>(hot_cache_base_);
+        return p >= base && p < base + hot_cache_size_;
+    }
 
-    std::vector<int> batchIsExist(
-        const std::vector<std::string>& keys) override;
+    int remove(const std::string &key, bool force = false);
 
-    int64_t getSize(const std::string& key) override;
+    long removeByRegex(const std::string &str, bool force = false);
+
+    long removeAll(bool force = false);
+
+    std::vector<int> batchRemove(const std::vector<std::string> &keys,
+                                 bool force = false);
+
+    int isExist(const std::string &key);
+
+    std::vector<int> batchIsExist(const std::vector<std::string> &keys);
+
+    int64_t getSize(const std::string &key);
 
     std::map<std::string, std::vector<Replica::Descriptor>>
-    batch_get_replica_desc(const std::vector<std::string>& keys);
-    std::vector<Replica::Descriptor> get_replica_desc(const std::string& key);
+    batch_get_replica_desc(const std::vector<std::string> &keys);
+    std::vector<Replica::Descriptor> get_replica_desc(const std::string &key);
 
-    int tearDownAll() override;
+    std::vector<std::string> batch_replica_clear(
+        const std::vector<std::string> &keys,
+        const std::string &segment_name = "") override {
+        return {};
+    }
+
+    int tearDownAll();
+
+    int health_check() override;
 
     tl::expected<UUID, ErrorCode> create_copy_task(
-        const std::string& key,
-        const std::vector<std::string>& targets) override;
+        const std::string &key, const std::vector<std::string> &targets);
 
-    tl::expected<UUID, ErrorCode> create_move_task(
-        const std::string& key, const std::string& source,
-        const std::string& target) override;
+    tl::expected<UUID, ErrorCode> create_move_task(const std::string &key,
+                                                   const std::string &source,
+                                                   const std::string &target);
 
-    tl::expected<QueryTaskResponse, ErrorCode> query_task(
-        const UUID& task_id) override;
+    tl::expected<QueryTaskResponse, ErrorCode> query_task(const UUID &task_id);
+
+    std::optional<BufferHandle> allocate_client_buffer(size_t size) override;
 
    private:
-    ErrorCode connect(const std::string& server_address);
+    ErrorCode connect(const std::string &server_address);
 
-    int register_shm_via_ipc(const ShmHelper::ShmSegment* shm,
+    int register_ascend_shm(const ShmHelper::ShmSegment *shm,
+                            bool is_local = false);
+
+    int register_shm_via_ipc(const ShmHelper::ShmSegment *shm,
                              bool is_local = false);
 
-    bool reregister_all_shms();
+#if defined(USE_ASCEND_DIRECT)
+    int register_device_buffer_for_reconnect(void *buffer, size_t size);
+
+    int unregister_device_buffer_for_reconnect(void *buffer);
+
+    [[nodiscard]] std::vector<ShmHelper::ShmSegment>
+    get_registered_device_buffers() const;
+#endif
 
     /**
      * @brief Generic RPC invocation helper for single-result operations
@@ -217,7 +217,7 @@ class DummyClient : public PyClient {
      */
     template <auto ServiceMethod, typename ReturnType, typename... Args>
     [[nodiscard]] tl::expected<ReturnType, ErrorCode> invoke_rpc(
-        Args&&... args);
+        Args &&...args);
 
     /**
      * @brief Generic RPC invocation helper for batch operations
@@ -230,57 +230,65 @@ class DummyClient : public PyClient {
      */
     template <auto ServiceMethod, typename ResultType, typename... Args>
     [[nodiscard]] std::vector<tl::expected<ResultType, ErrorCode>>
-    invoke_batch_rpc(size_t input_size, Args&&... args);
+    invoke_batch_rpc(size_t input_size, Args &&...args);
 
-    /**
-     * @brief Accessor for the coro_rpc_client pool. Since coro_rpc_client
-     * pool cannot reconnect to a different address, a new coro_rpc_client
-     * pool is created if the address is different from the current one.
-     */
-    class RpcClientAccessor {
-       public:
-        void SetClientPool(
-            std::shared_ptr<coro_io::client_pool<coro_rpc::coro_rpc_client>>
-                client_pool) {
-            std::lock_guard<std::shared_mutex> lock(client_mutex_);
-            client_pool_ = client_pool;
-        }
+    template <auto ServiceMethod, typename... Args>
+    int invoke_observed_void_rpc(TransferOperationKind kind,
+                                 const char *op_name, size_t bytes, bool batch,
+                                 Args &&...args) {
+        auto result = execute_timed_operation<tl::expected<void, ErrorCode>>(
+            [&]() {
+                return invoke_rpc<ServiceMethod, void>(
+                    std::forward<Args>(args)...);
+            },
+            [](const auto &ret) { return ret.has_value(); },
+            [&](uint64_t latency_us, const auto &) {
+                ObserveTransferMetric(kind, op_name, bytes, latency_us, batch);
+            });
+        return to_py_ret(result);
+    }
 
-        std::shared_ptr<coro_io::client_pool<coro_rpc::coro_rpc_client>>
-        GetClientPool() {
-            std::shared_lock<std::shared_mutex> lock(client_mutex_);
-            return client_pool_;
-        }
-
-       private:
-        mutable std::shared_mutex client_mutex_;
-        std::shared_ptr<coro_io::client_pool<coro_rpc::coro_rpc_client>>
-            client_pool_;
-    };
-    RpcClientAccessor client_accessor_;
+    RpcClientPool client_accessor_;
 
     // The client identification.
     const UUID client_id_;
-
-    std::shared_ptr<coro_io::client_pools<coro_rpc::coro_rpc_client>>
-        client_pools_;
 
     // Mutex to insure the Connect function is atomic.
     mutable Mutex connect_mutex_;
     // The address which is passed to the coro_rpc_client
     std::string client_addr_param_ GUARDED_BY(connect_mutex_);
 
-    DeploymentMode deployment_mode_ = DeploymentMode::UNKNOWN;
-
     // For shared memory management
-    ShmHelper* shm_helper_ = nullptr;
+    ShmHelper *shm_helper_ = nullptr;
     std::string ipc_socket_path_;
+    void *local_buffer_base_ = nullptr;
+
+    // Hot cache shm mapping (obtained from real client via IPC)
+    void *hot_cache_base_ = nullptr;
+    size_t hot_cache_size_ = 0;
+    int hot_cache_fd_ = -1;
+
+    int request_hot_cache_fd();
 
     // For high availability
     std::thread ping_thread_;
     std::atomic<bool> ping_running_{false};
+    std::atomic<bool> last_ping_healthy_{false};
     void ping_thread_main();
-    volatile bool connected_ = false;
+    std::atomic<bool> connected_{false};
+
+#if defined(USE_ASCEND_DIRECT)
+    mutable std::mutex registered_device_buffers_mutex_;
+    std::unordered_map<uint64_t, size_t> registered_device_buffers_;
+#endif
+
+    // Ascend physical device id for dummy-real RPC to real, set in setup_dummy
+    int32_t device_id_ = 0;
+
+    std::unique_ptr<ClientMetric> metrics_;
+
+    void ObserveTransferMetric(TransferOperationKind kind, const char *op_name,
+                               size_t bytes, uint64_t latency_us, bool batch);
 };
 
 }  // namespace mooncake

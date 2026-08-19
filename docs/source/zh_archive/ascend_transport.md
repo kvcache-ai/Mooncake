@@ -1,5 +1,8 @@
 # Ascend Transport
 Ascend Transport源代码路径为Mooncake/mooncake-transfer-engine/src/transport/ascend_transport，该路径下还包含自动化编译脚本、README文件。
+
+**Ascend Transport 已不再维护，昇腾平台推荐使用 [Ascend Direct Transport](./ascend_direct_transport.md). **
+
 ## 概述
 Ascend Transport是一个单边语义的高性能零拷贝NPU数据传输库，直接兼容Mooncake Transfer Engine。要编译使用Ascend Transport库，请在mooncake-common\common.cmake文件中将USE_ASCEND开关置于"ON"。
 

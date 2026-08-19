@@ -1,15 +1,81 @@
 #include <gtest/gtest.h>
+#include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "common.h"
 
 namespace {
 
 using namespace mooncake;
+using namespace std::chrono_literals;
 
 const uint16_t kDefaultPort = getDefaultHandshakePort();
+
+//------------------------------------------------------------------------------
+// RWSpinlock
+//------------------------------------------------------------------------------
+
+TEST(RWSpinlockTest, AggressiveWriteLockProgressesAcrossTicketWraparound) {
+    RWSpinlock lock;
+    int protected_value = 0;
+
+    constexpr int kIterations = 65536 + 3;
+    for (int i = 0; i < kIterations; ++i) {
+        lock.writeLockAggressive();
+        ++protected_value;
+        lock.unlock();
+    }
+
+    RWSpinlock::ReadGuard guard(lock);
+    EXPECT_EQ(protected_value, kIterations);
+}
+
+TEST(RWSpinlockTest, DowngradePublishesToReadersAndBlocksWriters) {
+    RWSpinlock lock;
+    int protected_value = 0;
+    std::atomic<bool> writer_started{false};
+    std::atomic<bool> writer_entered{false};
+    std::atomic<bool> reader_observed{false};
+
+    lock.writeLockAggressive();
+    protected_value = 42;
+    lock.unlockAndLockShared();
+
+    std::thread reader([&] {
+        RWSpinlock::ReadGuard guard(lock);
+        reader_observed.store(protected_value == 42, std::memory_order_release);
+    });
+
+    reader.join();
+    EXPECT_TRUE(reader_observed.load(std::memory_order_acquire));
+
+    std::thread writer([&] {
+        writer_started.store(true, std::memory_order_release);
+        lock.writeLockAggressive();
+        writer_entered.store(true, std::memory_order_release);
+        protected_value = 99;
+        lock.unlock();
+    });
+
+    while (!writer_started.load(std::memory_order_acquire)) {
+        std::this_thread::yield();
+    }
+
+    std::this_thread::sleep_for(10ms);
+    EXPECT_FALSE(writer_entered.load(std::memory_order_acquire));
+
+    lock.unlockShared();
+    writer.join();
+
+    RWSpinlock::ReadGuard guard(lock);
+    EXPECT_TRUE(writer_entered.load(std::memory_order_acquire));
+    EXPECT_EQ(protected_value, 99);
+}
 
 //------------------------------------------------------------------------------
 // parseFromString<T>
@@ -110,6 +176,27 @@ TEST(ParseHostNameWithPort, HostWithoutPort) {
     auto [host, port] = parseHostNameWithPort("example.com");
     EXPECT_EQ(host, "example.com");
     EXPECT_EQ(port, kDefaultPort);
+}
+
+TEST(HostPortHelpers, DetectsExplicitPort) {
+    EXPECT_TRUE(hasExplicitPort("8.8.8.8:4321"));
+    EXPECT_TRUE(hasExplicitPort("example.com:4321"));
+    EXPECT_TRUE(hasExplicitPort("[2001:db8::1]:4321"));
+    EXPECT_FALSE(hasExplicitPort("2001:db8::1"));
+    EXPECT_FALSE(hasExplicitPort("[2001:db8::1]"));
+}
+
+TEST(HostPortHelpers, ExtractsHostWithoutPort) {
+    EXPECT_EQ(getHostNameWithoutPort("8.8.8.8:4321"), "8.8.8.8");
+    EXPECT_EQ(getHostNameWithoutPort("example.com:4321"), "example.com");
+    EXPECT_EQ(getHostNameWithoutPort("[2001:db8::1]:4321"), "2001:db8::1");
+    EXPECT_EQ(getHostNameWithoutPort("[2001:db8::1]"), "2001:db8::1");
+    EXPECT_EQ(getHostNameWithoutPort("2001:db8::1"), "2001:db8::1");
+}
+
+TEST(HostPortHelpers, BuildsBracketedIpv6Endpoint) {
+    EXPECT_EQ(buildHostNameWithPort("2001:db8::1", 4321), "[2001:db8::1]:4321");
+    EXPECT_EQ(buildHostNameWithPort("8.8.8.8", 4321), "8.8.8.8:4321");
 }
 
 //------------------------------------------------------------------------------
@@ -258,6 +345,42 @@ TEST(GetHandshakeMaxLengthTest, ReturnsSameValueOnMultipleCalls) {
     size_t first_call = getHandshakeMaxLength();
     size_t second_call = getHandshakeMaxLength();
     EXPECT_EQ(first_call, second_call);
+}
+
+//------------------------------------------------------------------------------
+// bindToSocket
+//------------------------------------------------------------------------------
+
+// Worker pools bind every thread they spawn, so bindToSocket() races inside
+// libnuma's unlocked lazy cache fill and orphans an allocation. The leak is
+// what this guards, so it only fails under ASAN/LSAN; the barrier is what makes
+// it reliable there.
+TEST(BindToSocketTest, ConcurrentCallsDoNotLeakNumaState) {
+    if (numa_available() < 0) GTEST_SKIP() << "platform does not support NUMA";
+
+    constexpr int kThreads = 32;
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+    std::vector<std::thread> threads;
+    std::vector<int> results(kThreads, -1);
+
+    for (int i = 0; i < kThreads; ++i) {
+        threads.emplace_back([&, i] {
+            ready.fetch_add(1, std::memory_order_release);
+            while (!go.load(std::memory_order_acquire))
+                std::this_thread::yield();
+            // Every thread races on the same node, maximizing the window.
+            results[i] = bindToSocket(0);
+        });
+    }
+    while (ready.load(std::memory_order_acquire) < kThreads)
+        std::this_thread::yield();
+    go.store(true, std::memory_order_release);
+    for (auto &thread : threads) thread.join();
+
+    // Serializing the cache fill must not change what callers observe.
+    for (int i = 0; i < kThreads; ++i)
+        EXPECT_EQ(results[i], 0) << "thread " << i << " failed to bind";
 }
 
 }  // namespace

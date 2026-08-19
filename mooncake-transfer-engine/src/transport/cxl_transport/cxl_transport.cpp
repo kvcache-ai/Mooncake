@@ -218,10 +218,15 @@ int CxlTransport::install(std::string &local_server_name,
 }
 
 int CxlTransport::allocateLocalSegmentID() {
-    auto desc = std::make_shared<SegmentDesc>();
-    if (!desc) return ERR_MEMORY;
+    auto desc = metadata_->getSegmentDesc(local_server_name_);
+    if (!desc) desc = std::make_shared<SegmentDesc>();
     desc->name = local_server_name_;
+#ifdef ENABLE_MULTI_PROTOCOL
+    if (!desc->protocol.empty()) desc->protocol += ",";
+    desc->protocol += "cxl";
+#else
     desc->protocol = "cxl";
+#endif
     desc->cxl_base_addr = (uint64_t)cxl_base_addr;
     desc->cxl_name = cxl_dev_path;
     metadata_->addLocalSegment(LOCAL_SEGMENT_ID, local_server_name_,
@@ -254,6 +259,9 @@ int CxlTransport::registerLocalMemory(void *addr, size_t length,
 
     cxl_buffer_desc.offset = (uint64_t)addr - (uint64_t)cxl_base_addr;
     cxl_buffer_desc.length = length;
+#ifdef ENABLE_MULTI_PROTOCOL
+    cxl_buffer_desc.protocol = "cxl";
+#endif
     return metadata_->addLocalMemoryBuffer(cxl_buffer_desc, update_metadata);
 }
 
@@ -264,15 +272,23 @@ int CxlTransport::unregisterLocalMemory(void *addr, bool update_metadata) {
 int CxlTransport::registerLocalMemoryBatch(
     const std::vector<Transport::BufferEntry> &buffer_list,
     const std::string &location) {
-    for (auto &buffer : buffer_list)
-        registerLocalMemory(buffer.addr, buffer.length, location, true, false);
+    for (auto &buffer : buffer_list) {
+        int ret = registerLocalMemory(buffer.addr, buffer.length, location,
+                                      true, false);
+        if (ret) return ret;
+    }
     return metadata_->updateLocalSegmentDesc();
 }
 
 int CxlTransport::unregisterLocalMemoryBatch(
     const std::vector<void *> &addr_list) {
-    for (auto &addr : addr_list) unregisterLocalMemory(addr, false);
-    return metadata_->updateLocalSegmentDesc();
+    int first_error = 0;
+    for (auto &addr : addr_list) {
+        int ret = unregisterLocalMemory(addr, false);
+        if (ret && !first_error) first_error = ret;
+    }
+    int metadata_ret = metadata_->updateLocalSegmentDesc();
+    return first_error ? first_error : metadata_ret;
 }
 
 Status CxlTransport::getTransferStatus(BatchID batch_id, size_t task_id,

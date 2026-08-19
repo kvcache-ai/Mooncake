@@ -1,5 +1,5 @@
 // client_buffer_test.cpp
-#include "client_buffer.hpp"
+#include "client_buffer.h"
 
 #include <glog/logging.h>
 #include <gtest/gtest.h>
@@ -7,6 +7,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstring>
+#include <new>
 #include <thread>
 #include <vector>
 
@@ -58,6 +59,35 @@ TEST_F(ClientBufferTest, ZeroSizeAllocator) {
     auto handle_opt = allocator->allocate(1024);
     EXPECT_FALSE(handle_opt.has_value());
 }
+
+#if defined(USE_NOF)
+TEST_F(ClientBufferTest, SpdkDmaAllocatorDestroysWithSpdkFree) {
+    constexpr size_t buffer_size = 4096;
+    constexpr size_t alloc_size = 64;
+
+    std::shared_ptr<ClientBufferAllocator> allocator;
+    try {
+        allocator = ClientBufferAllocator::create(buffer_size, "tcp",
+                                                  /*use_hugepage=*/false,
+                                                  /*use_spdk_dma=*/true);
+    } catch (const std::bad_alloc&) {
+        GTEST_SKIP()
+            << "SPDK DMA allocation is unavailable in this environment";
+    }
+
+    ASSERT_NE(allocator, nullptr);
+    VerifyAlignment(allocator->getBase());
+
+    {
+        auto handle_opt = allocator->allocate(alloc_size);
+        ASSERT_TRUE(handle_opt.has_value());
+        BufferHandle handle = std::move(handle_opt.value());
+        VerifyBufferHandle(handle, alloc_size);
+    }
+
+    allocator.reset();
+}
+#endif
 
 // Test multiple allocations
 TEST_F(ClientBufferTest, MultipleAllocations) {
@@ -223,6 +253,30 @@ TEST_F(ClientBufferTest, SplitIntoSlicesSmallBuffer) {
     EXPECT_EQ(slices.size(), 1);
     EXPECT_EQ(slices[0].ptr, handle.ptr());
     EXPECT_EQ(slices[0].size, alloc_size);
+}
+
+// Test split_into_slices with ptr and length
+TEST_F(ClientBufferTest, SplitIntoSlicesPtrLength) {
+    const size_t buffer_size = 1024 * 1024;  // 1MB
+    const size_t alloc_size = 300 * 1024;    // 300KB
+    auto allocator = ClientBufferAllocator::create(buffer_size);
+    ASSERT_NE(allocator, nullptr);
+
+    auto handle_opt = allocator->allocate(alloc_size);
+    ASSERT_TRUE(handle_opt.has_value());
+    BufferHandle handle = std::move(handle_opt.value());
+    void* buffer_ptr = handle.ptr();
+    size_t length = handle.size();
+    auto slices = split_into_slices(buffer_ptr, length);
+    // Verify slices cover the entire buffer
+    size_t total_slice_size = 0;
+    for (const auto& slice : slices) {
+        EXPECT_NE(slice.ptr, nullptr);
+        EXPECT_GT(slice.size, 0);
+        EXPECT_LE(slice.size, kMaxSliceSize);
+        total_slice_size += slice.size;
+    }
+    EXPECT_EQ(total_slice_size, alloc_size);
 }
 
 // Test memory exhaustion scenario

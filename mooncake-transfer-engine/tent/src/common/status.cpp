@@ -63,6 +63,8 @@ std::string_view Status::CodeToString(Status::Code code) {
             return "InvalidEntry";
         case Code::kInvalidMetadataType:
             return "InvalidMetadataType";
+        case Code::kNeedsRefreshCache:
+            return "NeedsRefreshCache";
         case Code::kRdmaError:
             return "RdmaError";
         case Code::kCudaError:

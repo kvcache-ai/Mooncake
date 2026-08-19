@@ -20,12 +20,11 @@
 #include <random>
 #include <thread>
 #include <vector>
-#include <future>
 
 #include "gflags/gflags.h"
 #include "glog/logging.h"
 
-#include "centralized_master_client.h"
+#include "master_client.h"
 
 // Size units for better readability
 static constexpr size_t KiB = 1024;
@@ -45,6 +44,10 @@ DEFINE_uint64(num_keys, 10 * 1000,
 DEFINE_uint64(batch_size, 128, "Batch size for batch operations");
 DEFINE_uint64(value_size, 4096, "Size of object values");
 DEFINE_uint64(duration, 60, "Test duration in seconds");
+DEFINE_double(
+    prefill_ratio, 0.0,
+    "Ratio of segment capacity to prefill before test (0.0-1.0). "
+    "E.g., 0.95 means fill segments to 95% before starting benchmark");
 
 static inline void unset_cpu_affinity() {
     // Ensure that the worker threads are not bound to any CPU cores.
@@ -57,7 +60,7 @@ class SegmentClient {
    public:
     SegmentClient(const std::string& name, const std::string& master_server,
                   uintptr_t segment_base, uint64_t segment_size)
-        : client_id_(mooncake::generate_uuid()), master_client_(client_id_) {
+        : master_client_(mooncake::generate_uuid()) {
         auto ec = master_client_.Connect(master_server);
         if (ec != mooncake::ErrorCode::OK) {
             throw std::invalid_argument("Cannot connect to master server at " +
@@ -66,9 +69,9 @@ class SegmentClient {
 
         segment_.id = mooncake::generate_uuid();
         segment_.name = name;
+        segment_.base = segment_base;
         segment_.size = segment_size;
-        segment_.extra = mooncake::CentralizedSegmentExtraData{
-            .base = segment_base, .te_endpoint = name};
+        segment_.te_endpoint = name;
         auto mount_ec = master_client_.MountSegment(segment_);
         if (!mount_ec.has_value()) {
             throw std::runtime_error("Failed to mount segment " + name +
@@ -87,7 +90,7 @@ class SegmentClient {
         }
     }
 
-    void Heartbeat() {
+    void Ping() {
         if (remount_future_.valid() &&
             remount_future_.wait_for(std::chrono::seconds(0)) ==
                 std::future_status::ready) {
@@ -95,31 +98,25 @@ class SegmentClient {
             remount_future_ = std::future<void>();
         }
 
-        mooncake::HeartbeatRequest req;
-        req.client_id = client_id_;
-        auto heartbeat_result = master_client_.Heartbeat(req);
-        if (!heartbeat_result.has_value()) {
-            throw std::runtime_error("Failed to heartbeat to master server");
+        auto ping_result = master_client_.Ping();
+        if (!ping_result.has_value()) {
+            throw std::runtime_error("Failed to ping master server");
         }
 
-        if (heartbeat_result.value().status ==
-                mooncake::ClientStatus::UNDEFINED &&
+        if (ping_result.value().client_status ==
+                mooncake::ClientStatus::NEED_REMOUNT &&
             !remount_future_.valid()) {
             remount_future_ = std::async(std::launch::async, [&]() {
-                mooncake::RegisterClientRequest req;
-                req.client_id = client_id_;
-                req.segments = {segment_};
-                auto reg_ec = master_client_.RegisterClient(req);
-                if (!reg_ec.has_value()) {
-                    throw std::runtime_error("Failed to register client");
+                auto remount_ec = master_client_.ReMountSegment({segment_});
+                if (!remount_ec.has_value()) {
+                    throw std::runtime_error("Failed to remount segment");
                 }
             });
         }
     }
 
    private:
-    mooncake::UUID client_id_;
-    mooncake::CentralizedMasterClient master_client_;
+    mooncake::MasterClient master_client_;
     mooncake::Segment segment_;
     std::future<void> remount_future_;
 };
@@ -198,8 +195,8 @@ class BenchClient {
             return false;
         }
 
-        auto put_end_result =
-            master_client_.PutEnd(key, mooncake::ReplicaType::MEMORY);
+        auto put_end_result = master_client_.PutEnd(
+            {key, std::nullopt}, mooncake::ReplicaType::MEMORY);
         if (!put_end_result.has_value()) {
             return false;
         }
@@ -231,7 +228,12 @@ class BenchClient {
             return 0;
         }
 
-        auto put_end_result = master_client_.BatchPutEnd(started_keys);
+        std::vector<mooncake::ObjectMeta> object_metas;
+        object_metas.reserve(started_keys.size());
+        for (const auto& key : started_keys) {
+            object_metas.emplace_back(mooncake::ObjectMeta{key, std::nullopt});
+        }
+        auto put_end_result = master_client_.BatchPutEnd(object_metas);
         for (auto& result : put_end_result) {
             if (result.has_value()) {
                 success_cnt++;
@@ -243,8 +245,7 @@ class BenchClient {
 
     uint64_t BatchGet(const std::vector<std::string>& keys) {
         uint64_t success_cnt = 0;
-        std::vector<std::string_view> key_views(keys.begin(), keys.end());
-        auto get_results = master_client_.BatchGetReplicaList(key_views);
+        auto get_results = master_client_.BatchGetReplicaList(keys);
         for (auto& get_result : get_results) {
             if (get_result.has_value() ||
                 get_result.error() == mooncake::ErrorCode::OBJECT_NOT_FOUND) {
@@ -357,7 +358,7 @@ class BenchClient {
         }
     }
 
-    mooncake::CentralizedMasterClient master_client_;
+    mooncake::MasterClient master_client_;
 
     std::atomic<bool> running_;
     std::vector<std::thread> threads_;
@@ -385,7 +386,7 @@ int main(int argc, char** argv) {
             {
                 std::lock_guard<std::mutex> guard(segment_clients_mutex);
                 for (auto& segment_client : segment_clients) {
-                    segment_client->Heartbeat();
+                    segment_client->Ping();
                 }
             }
             time_elapsed = std::chrono::steady_clock::now() - start_time;
@@ -407,6 +408,83 @@ int main(int argc, char** argv) {
         }
     }
     LOG(INFO) << "Segments mounted";
+
+    // Prefill segments if requested
+    if (FLAGS_prefill_ratio > 0.0) {
+        LOG(INFO) << "Prefilling segments to " << (FLAGS_prefill_ratio * 100)
+                  << "% capacity...";
+
+        // Calculate total capacity and target fill size
+        uint64_t total_capacity = FLAGS_num_segments * FLAGS_segment_size;
+        uint64_t target_bytes =
+            static_cast<uint64_t>(total_capacity * FLAGS_prefill_ratio);
+        uint64_t bytes_per_object = FLAGS_value_size;
+        uint64_t target_objects = target_bytes / bytes_per_object;
+
+        LOG(INFO) << "Target: " << target_objects << " objects ("
+                  << (target_bytes / GiB) << " GiB)";
+
+        // Create a temporary client for prefilling
+        mooncake::MasterClient prefill_client(mooncake::generate_uuid());
+        auto ec = prefill_client.Connect(FLAGS_master_server);
+        if (ec != mooncake::ErrorCode::OK) {
+            LOG(ERROR) << "Failed to connect prefill client";
+            return 1;
+        }
+
+        const mooncake::ReplicateConfig config;
+        uint64_t filled_objects = 0;
+        uint64_t key_id = 0;
+
+        while (filled_objects < target_objects) {
+            uint64_t batch =
+                std::min(FLAGS_batch_size, target_objects - filled_objects);
+            std::vector<std::string> keys;
+            std::vector<std::vector<uint64_t>> slice_lengths;
+
+            keys.reserve(batch);
+            slice_lengths.reserve(batch);
+
+            for (uint64_t i = 0; i < batch; i++) {
+                keys.push_back("prefill_" + std::to_string(key_id++));
+                slice_lengths.push_back({bytes_per_object});
+            }
+
+            auto put_start_result =
+                prefill_client.BatchPutStart(keys, slice_lengths, config);
+            std::vector<std::string> started_keys;
+            for (size_t i = 0; i < keys.size(); i++) {
+                if (put_start_result[i].has_value()) {
+                    started_keys.push_back(keys[i]);
+                }
+            }
+
+            if (!started_keys.empty()) {
+                std::vector<mooncake::ObjectMeta> object_metas;
+                object_metas.reserve(started_keys.size());
+                for (const auto& key : started_keys) {
+                    object_metas.emplace_back(
+                        mooncake::ObjectMeta{key, std::nullopt});
+                }
+                auto put_end_result = prefill_client.BatchPutEnd(object_metas);
+                for (auto& result : put_end_result) {
+                    if (result.has_value()) {
+                        filled_objects++;
+                    }
+                }
+            }
+
+            if (filled_objects % 10000 == 0) {
+                double progress =
+                    (double)filled_objects / target_objects * 100.0;
+                LOG(INFO) << "Prefill progress: " << filled_objects << "/"
+                          << target_objects << " (" << std::fixed
+                          << std::setprecision(1) << progress << "%)";
+            }
+        }
+
+        LOG(INFO) << "Prefill completed: " << filled_objects << " objects";
+    }
 
     LOG(INFO) << "Starting " << FLAGS_num_clients << " bench clients with "
               << FLAGS_num_threads << " threads for each...";
@@ -445,12 +523,12 @@ int main(int argc, char** argv) {
     }
     LOG(INFO) << "Clients stopped";
 
-    LOG(INFO) << "Stopping heartbeat thread...";
+    LOG(INFO) << "Stopping ping thread...";
     if (ping_thread.joinable()) {
         ping_thread.request_stop();
         ping_thread.join();
     }
-    LOG(INFO) << "Heartbeat thread stopped";
+    LOG(INFO) << "Ping thread stopped";
 
     LOG(INFO) << "Disconnecting from master...";
     bench_clients.clear();

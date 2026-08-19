@@ -201,3 +201,22 @@ func (engine *TransferEngine) syncSegmentCache() error {
 	}
 	return nil
 }
+
+// GetLocalIpAndPort returns the local IP address and port that the
+// TransferEngine is listening on. This is particularly useful in P2P
+// handshake mode (metadata_conn_string == "P2PHANDSHAKE"), where the
+// RPC port is dynamically assigned at initialization time and callers
+// need to discover the actual listening address to share with peers.
+func (engine *TransferEngine) GetLocalIpAndPort() (string, error) {
+	const bufLen = 256
+	buf := make([]byte, bufLen)
+	ret := C.getLocalIpAndPort(engine.engine, (*C.char)(unsafe.Pointer(&buf[0])), C.size_t(bufLen))
+	if ret != 0 {
+		return "", ErrTransferEngine
+	}
+	n := 0
+	for n < len(buf) && buf[n] != 0 {
+		n++
+	}
+	return string(buf[:n]), nil
+}

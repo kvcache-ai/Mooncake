@@ -1,0 +1,979 @@
+#include "hot_standby_service.h"
+
+#include <glog/logging.h>
+#include <gtest/gtest.h>
+
+#include <chrono>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <thread>
+
+#include <xxhash.h>
+
+#include "master_service.h"
+#include "ha/kv/ha_kv_backend.h"
+#include "ha/oplog/oplog_batch_codec.h"
+#include "ha/oplog/oplog_batch_storage.h"
+#include "ha/oplog/oplog_types.h"
+#ifdef STORE_USE_ETCD
+#include "etcd_helper.h"
+#include "ha/kv/etcd_ha_kv_backend.h"
+#endif
+
+namespace mooncake::test {
+
+namespace {
+
+class FakeSnapshotProvider final : public SnapshotProvider {
+   public:
+    explicit FakeSnapshotProvider(
+        tl::expected<std::optional<LoadedSnapshot>, ErrorCode> result)
+        : result_(std::move(result)) {}
+
+    tl::expected<std::optional<LoadedSnapshot>, ErrorCode> LoadLatestSnapshot(
+        const std::string& /*cluster_id*/) override {
+        return result_;
+    }
+
+   private:
+    tl::expected<std::optional<LoadedSnapshot>, ErrorCode> result_;
+};
+
+LoadedSnapshot MakeSnapshot(std::string snapshot_id, uint64_t seq_id,
+                            std::string key, uint64_t size) {
+    LoadedSnapshot snapshot;
+    snapshot.snapshot_id = std::move(snapshot_id);
+    snapshot.snapshot_sequence_id = seq_id;
+
+    StandbyObjectMetadata metadata;
+    metadata.client_id = UUID{1, 2};
+    metadata.size = size;
+    metadata.last_sequence_id = seq_id;
+    snapshot.metadata.emplace_back("default", std::move(key), metadata);
+    return snapshot;
+}
+
+}  // namespace
+
+class HotStandbyServiceTest : public ::testing::Test {
+   protected:
+    void SetUp() override {
+        google::InitGoogleLogging("HotStandbyServiceTest");
+        FLAGS_logtostderr = 1;
+
+        config_.enable_verification = false;
+        config_.max_replication_lag_entries = 1000;
+
+        service_ = std::make_unique<HotStandbyService>(config_);
+        oplog_endpoints_ = "http://localhost:2379";
+        cluster_id_ = "test_cluster_001";
+    }
+
+    void TearDown() override {
+        if (service_) {
+            service_->Stop();
+        }
+        google::ShutdownGoogleLogging();
+    }
+
+    HotStandbyConfig config_;
+    std::unique_ptr<HotStandbyService> service_;
+    std::string oplog_endpoints_;
+    std::string cluster_id_;
+};
+
+namespace {
+
+std::unique_ptr<HotStandbyService> CreateSnapshotOnlyReadyStandby(
+    HotStandbyConfig config, const std::string& cluster_id) {
+    config.enable_snapshot_bootstrap = true;
+    config.enable_oplog_following = false;
+
+    auto service = std::make_unique<HotStandbyService>(config);
+    LoadedSnapshot snapshot;
+    snapshot.snapshot_id = "20260330_120000_000";
+    snapshot.snapshot_sequence_id = 42;
+
+    StandbyObjectMetadata metadata;
+    metadata.client_id = UUID{1, 2};
+    metadata.size = 4096;
+    metadata.last_sequence_id = 42;
+    snapshot.metadata.emplace_back("default", "key-1", metadata);
+
+    service->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
+        std::optional<LoadedSnapshot>(snapshot)));
+    EXPECT_EQ(ErrorCode::OK, service->Start("", "", cluster_id));
+    EXPECT_EQ(StandbyState::WATCHING, service->GetState());
+    return service;
+}
+
+}  // namespace
+
+// ========== 6.1.1 Start/Stop tests ==========
+
+TEST_F(HotStandbyServiceTest, TestStart) {
+#ifdef STORE_USE_ETCD
+    // Requires a real etcd cluster and valid cluster configuration; acts as an
+    // integration placeholder
+    GTEST_SKIP()
+        << "Requires real etcd connection, run in integration environment.";
+#else
+    ErrorCode err =
+        service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err);
+    EXPECT_EQ(StandbyState::FAILED, service_->GetState());
+#endif
+}
+
+TEST_F(HotStandbyServiceTest, TestStart_AlreadyRunning) {
+#ifdef STORE_USE_ETCD
+    GTEST_SKIP()
+        << "Requires real etcd connection to verify double start semantics.";
+#else
+    // After the first Start fails and state becomes FAILED, the second Start
+    // should still return INTERNAL_ERROR
+    ErrorCode err1 =
+        service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err1);
+    ErrorCode err2 =
+        service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err2);
+#endif
+}
+
+TEST_F(HotStandbyServiceTest, TestStart_InvalidEtcdEndpoints) {
+#ifdef STORE_USE_ETCD
+    GTEST_SKIP() << "Requires real etcd to simulate invalid endpoints.";
+#else
+    std::string invalid_endpoints = "invalid_endpoint";
+    ErrorCode err =
+        service_->Start("primary_unused", invalid_endpoints, cluster_id_);
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err);
+#endif
+}
+
+TEST_F(HotStandbyServiceTest, TestStop) {
+    // Stop should be safe and idempotent even if Start was never called
+    service_->Stop();
+    SUCCEED();
+}
+
+TEST_F(HotStandbyServiceTest, TestStop_WhenNotRunning) {
+    // Multiple Stop calls should be idempotent
+    service_->Stop();
+    service_->Stop();
+    SUCCEED();
+}
+
+// ========== 6.1.2 State transition tests ==========
+
+TEST_F(HotStandbyServiceTest, TestStateTransition_StartToWatching) {
+#ifdef STORE_USE_ETCD
+    GTEST_SKIP()
+        << "Requires real etcd to drive full state transition to WATCHING.";
+#else
+    // In non-STORE_USE_ETCD builds, Start will set the state machine directly
+    // to FAILED
+    EXPECT_EQ(StandbyState::STOPPED, service_->GetState());
+    ErrorCode err =
+        service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err);
+    EXPECT_EQ(StandbyState::FAILED, service_->GetState());
+#endif
+}
+
+TEST_F(HotStandbyServiceTest, TestStateTransition_ConnectionFailed) {
+#ifdef STORE_USE_ETCD
+    GTEST_SKIP()
+        << "Connection failure requires real etcd and invalid endpoints.";
+#else
+    // In non-etcd mode we cannot distinguish detailed connection errors; only
+    // verify it doesn't crash
+    ErrorCode err =
+        service_->Start("primary_unused", "bad_endpoint", cluster_id_);
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err);
+#endif
+}
+
+TEST_F(HotStandbyServiceTest, TestStateTransition_SyncFailed) {
+#ifdef STORE_USE_ETCD
+    GTEST_SKIP()
+        << "Sync failure requires real etcd and OpLog watcher behavior.";
+#else
+    // In non-etcd mode, the sync phase is not actually executed; just ensure
+    // the call is safe
+    ErrorCode err =
+        service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
+    EXPECT_EQ(ErrorCode::INTERNAL_ERROR, err);
+#endif
+}
+
+// ========== 6.1.3 Sync status tests ==========
+
+TEST_F(HotStandbyServiceTest, TestGetSyncStatus_InitialState) {
+    StandbySyncStatus status = service_->GetSyncStatus();
+    EXPECT_EQ(0u, status.applied_seq_id);
+    EXPECT_EQ(0u, status.primary_seq_id);
+    EXPECT_EQ(0u, status.lag_entries);
+    EXPECT_FALSE(status.is_syncing);
+    EXPECT_FALSE(status.is_connected);
+    EXPECT_EQ(StandbyState::STOPPED, status.state);
+}
+
+TEST_F(HotStandbyServiceTest, TestGetSyncStatus_AfterSync) {
+#ifdef STORE_USE_ETCD
+    GTEST_SKIP()
+        << "Requires real etcd and OpLog activity to change sync status.";
+#else
+    // In non-etcd mode, calling Start will not change applied/primary, but the
+    // state machine enters FAILED
+    (void)service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
+    StandbySyncStatus status = service_->GetSyncStatus();
+    EXPECT_EQ(StandbyState::FAILED, status.state);
+#endif
+}
+
+TEST_F(HotStandbyServiceTest, TestGetSyncStatus) {
+    // Basic coverage: multiple calls should return consistent values and not
+    // crash
+    StandbySyncStatus s1 = service_->GetSyncStatus();
+    StandbySyncStatus s2 = service_->GetSyncStatus();
+    EXPECT_EQ(s1.state, s2.state);
+}
+
+// ========== 6.1.4 Promotion tests ==========
+
+TEST_F(HotStandbyServiceTest, TestPromote_WhenNotReady) {
+    // In the initial state promotion preconditions are not met, so it should
+    // return an error code (not OK).
+    ErrorCode err = service_->Promote();
+    EXPECT_NE(ErrorCode::OK, err);
+}
+
+TEST_F(HotStandbyServiceTest, TestPromote_WhenReady) {
+    service_ = CreateSnapshotOnlyReadyStandby(config_, cluster_id_);
+
+    ErrorCode err = service_->Promote();
+    EXPECT_EQ(ErrorCode::OK, err);
+    EXPECT_EQ(StandbyState::STOPPED, service_->GetState());
+    EXPECT_EQ(42u, service_->GetLatestAppliedSequenceId());
+}
+
+TEST_F(HotStandbyServiceTest, TestPromoteAndExportSnapshot_FinalCatchUp) {
+    // Setup: snapshot-only standby with baseline seq=10
+    config_.enable_snapshot_bootstrap = true;
+    config_.enable_oplog_following = false;
+    service_ = std::make_unique<HotStandbyService>(config_);
+
+    LoadedSnapshot snapshot;
+    snapshot.snapshot_id = "snap-001";
+    snapshot.snapshot_sequence_id = 10;
+
+    StandbyObjectMetadata metadata;
+    metadata.client_id = UUID{1, 2};
+    metadata.size = 4096;
+    metadata.last_sequence_id = 10;
+    snapshot.metadata.emplace_back("default", "key-1", metadata);
+
+    service_->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
+        std::optional<LoadedSnapshot>(snapshot)));
+
+    ASSERT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+    EXPECT_EQ(10u, service_->GetLatestAppliedSequenceId());
+
+    // Export before promotion: seq should be 10
+    StandbySnapshot pre_snapshot;
+    EXPECT_TRUE(service_->ExportStandbySnapshot(pre_snapshot));
+    EXPECT_EQ(10u, pre_snapshot.oplog_sequence_id);
+
+    // Promote and export atomically
+    StandbySnapshot post_snapshot;
+    ErrorCode err = service_->PromoteAndExportSnapshot(post_snapshot);
+    EXPECT_EQ(ErrorCode::OK, err);
+    EXPECT_EQ(StandbyState::STOPPED, service_->GetState());
+
+    // After promotion, exported seq should still be 10 (no new OpLog in
+    // snapshot-only)
+    EXPECT_EQ(10u, post_snapshot.oplog_sequence_id);
+    ASSERT_EQ(1u, post_snapshot.objects.size());
+    EXPECT_EQ("key-1", post_snapshot.objects[0].key);
+}
+
+// ========== 6.1.5 Warm start tests ==========
+
+TEST_F(HotStandbyServiceTest, TestWarmStart_WithLocalState) {
+#ifdef STORE_USE_ETCD
+    GTEST_SKIP() << "Requires real etcd and pre-populated local metadata to "
+                    "test warm start.";
+#else
+    // In non-etcd mode, only verify that Start is safe to call
+    (void)service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
+    SUCCEED();
+#endif
+}
+
+TEST_F(HotStandbyServiceTest, TestWarmStart_WithoutLocalState) {
+#ifdef STORE_USE_ETCD
+    GTEST_SKIP() << "Requires real etcd and snapshot provider configuration.";
+#else
+    (void)service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
+    SUCCEED();
+#endif
+}
+
+TEST_F(HotStandbyServiceTest, TestWarmStart_WithSnapshot) {
+#ifdef STORE_USE_ETCD
+    GTEST_SKIP() << "Requires snapshot provider and real etcd to exercise "
+                    "snapshot bootstrap.";
+#else
+    config_.enable_snapshot_bootstrap = true;
+    // Recreate service to apply the new configuration
+    service_.reset(new HotStandbyService(config_));
+    (void)service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
+    SUCCEED();
+#endif
+}
+
+TEST_F(HotStandbyServiceTest, TestStart_SnapshotOnlyWithSnapshot) {
+    config_.enable_snapshot_bootstrap = true;
+    config_.enable_oplog_following = false;
+    service_ = std::make_unique<HotStandbyService>(config_);
+
+    auto snapshot = MakeSnapshot("20260330_120000_000", 42, "key-1", 4096);
+
+    service_->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
+        std::optional<LoadedSnapshot>(snapshot)));
+
+    auto err = service_->Start("", "", cluster_id_);
+    EXPECT_EQ(ErrorCode::OK, err);
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+    EXPECT_EQ(1u, service_->GetMetadataCount());
+    EXPECT_EQ(42u, service_->GetLatestAppliedSequenceId());
+
+    auto status = service_->GetSyncStatus();
+    EXPECT_EQ(42u, status.applied_seq_id);
+    EXPECT_EQ(42u, status.primary_seq_id);
+    EXPECT_TRUE(status.is_connected);
+
+    std::vector<StandbyObjectEntry> exported;
+    EXPECT_TRUE(service_->ExportMetadataSnapshot(exported));
+    ASSERT_EQ(1u, exported.size());
+    EXPECT_EQ("key-1", exported[0].key);
+    EXPECT_EQ(4096u, exported[0].metadata.size);
+}
+
+TEST_F(HotStandbyServiceTest,
+       TestStart_SnapshotOnlyRestartRefreshesNewerCatalogSnapshot) {
+    config_.enable_snapshot_bootstrap = true;
+    config_.enable_oplog_following = false;
+    service_ = std::make_unique<HotStandbyService>(config_);
+
+    service_->SetSnapshotProvider(
+        std::make_unique<FakeSnapshotProvider>(std::optional<LoadedSnapshot>(
+            MakeSnapshot("20260330_120000_000", 42, "key-old", 4096))));
+
+    ASSERT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+    EXPECT_EQ(42u, service_->GetLatestAppliedSequenceId());
+    EXPECT_EQ(1u, service_->GetMetadataCount());
+    service_->Stop();
+
+    service_->SetSnapshotProvider(
+        std::make_unique<FakeSnapshotProvider>(std::optional<LoadedSnapshot>(
+            MakeSnapshot("20260330_121500_000", 84, "key-new", 8192))));
+
+    ASSERT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+    EXPECT_EQ(84u, service_->GetLatestAppliedSequenceId());
+    EXPECT_EQ(1u, service_->GetMetadataCount());
+
+    std::vector<StandbyObjectEntry> exported;
+    ASSERT_TRUE(service_->ExportMetadataSnapshot(exported));
+    ASSERT_EQ(1u, exported.size());
+    EXPECT_EQ("key-new", exported[0].key);
+    EXPECT_EQ(8192u, exported[0].metadata.size);
+    EXPECT_EQ(84u, exported[0].metadata.last_sequence_id);
+}
+
+TEST_F(HotStandbyServiceTest, TestStart_SnapshotOnlyWhenProviderFails) {
+    config_.enable_snapshot_bootstrap = true;
+    config_.enable_oplog_following = false;
+    service_ = std::make_unique<HotStandbyService>(config_);
+
+    service_->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
+        tl::make_unexpected(ErrorCode::PERSISTENT_FAIL)));
+
+    auto err = service_->Start("", "", cluster_id_);
+    EXPECT_EQ(ErrorCode::PERSISTENT_FAIL, err);
+    EXPECT_EQ(StandbyState::FAILED, service_->GetState());
+}
+
+// ========== 6.1.6 Metadata operation tests ==========
+
+TEST_F(HotStandbyServiceTest, TestGetMetadataCount) {
+    EXPECT_EQ(0u, service_->GetMetadataCount());
+}
+
+TEST_F(HotStandbyServiceTest, TestExportMetadataSnapshot) {
+    std::vector<StandbyObjectEntry> snapshot;
+    EXPECT_TRUE(service_->ExportMetadataSnapshot(snapshot));
+    EXPECT_TRUE(snapshot.empty());
+}
+
+TEST_F(HotStandbyServiceTest, TestGetLatestAppliedSequenceId) {
+    uint64_t seq = service_->GetLatestAppliedSequenceId();
+    EXPECT_EQ(0u, seq);
+}
+
+// ========== 6.1.6a ExportStandbySnapshot tests ==========
+
+TEST_F(HotStandbyServiceTest, TestExportStandbySnapshot_NotRunning) {
+    StandbySnapshot snapshot;
+    EXPECT_FALSE(service_->ExportStandbySnapshot(snapshot));
+}
+
+TEST_F(HotStandbyServiceTest, TestExportStandbySnapshot_SnapshotOnly) {
+    service_ = CreateSnapshotOnlyReadyStandby(config_, cluster_id_);
+
+    StandbySnapshot snapshot;
+    EXPECT_TRUE(service_->ExportStandbySnapshot(snapshot));
+    EXPECT_EQ(42u, snapshot.oplog_sequence_id);
+    ASSERT_EQ(1u, snapshot.objects.size());
+    EXPECT_EQ("key-1", snapshot.objects[0].key);
+    EXPECT_EQ(4096u, snapshot.objects[0].metadata.size);
+    // Segment registry is empty because snapshot-only standby has no
+    // oplog_applier
+    EXPECT_TRUE(snapshot.segments.empty());
+}
+
+TEST_F(HotStandbyServiceTest, TestExportStandbySnapshot_Empty) {
+    config_.enable_snapshot_bootstrap = true;
+    config_.enable_oplog_following = false;
+    service_ = std::make_unique<HotStandbyService>(config_);
+
+    service_->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
+        std::optional<LoadedSnapshot>(LoadedSnapshot{})));
+
+    EXPECT_EQ(ErrorCode::OK, service_->Start("", "", cluster_id_));
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+
+    StandbySnapshot snapshot;
+    EXPECT_TRUE(service_->ExportStandbySnapshot(snapshot));
+    EXPECT_EQ(0u, snapshot.oplog_sequence_id);
+    EXPECT_TRUE(snapshot.objects.empty());
+    EXPECT_TRUE(snapshot.segments.empty());
+}
+
+// ========== 6.1.7 Replication loop tests ==========
+
+TEST_F(HotStandbyServiceTest, TestReplicationLoop_UpdatesMetrics) {
+#ifdef STORE_USE_ETCD
+    GTEST_SKIP()
+        << "Requires real etcd and running replication loop to update metrics.";
+#else
+    // In non-etcd mode, ReplicationLoop is never started, but calling Stop
+    // should be safe
+    service_->Stop();
+    SUCCEED();
+#endif
+}
+
+TEST_F(HotStandbyServiceTest, TestReplicationLoop_HandlesDisconnect) {
+#ifdef STORE_USE_ETCD
+    GTEST_SKIP() << "Requires real etcd and watcher disconnect to exercise "
+                    "disconnect path.";
+#else
+    // DisconnectFromPrimary is private; verify Stop() is safe instead
+    service_->Stop();
+    SUCCEED();
+#endif
+}
+
+// ========== 6.1.8 Verification loop tests ==========
+
+TEST_F(HotStandbyServiceTest, TestVerificationLoop_WhenEnabled) {
+#ifdef STORE_USE_ETCD
+    GTEST_SKIP() << "Requires real etcd and running verification loop to "
+                    "observe behavior.";
+#else
+    config_.enable_verification = true;
+    service_.reset(new HotStandbyService(config_));
+    (void)service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
+    service_->Stop();
+    SUCCEED();
+#endif
+}
+
+TEST_F(HotStandbyServiceTest, TestVerificationLoop_WhenDisabled) {
+    // By default config_.enable_verification = false, so Start should not spawn
+    // a verification thread
+#ifdef STORE_USE_ETCD
+    GTEST_SKIP() << "Requires real etcd connection to start service.";
+#else
+    (void)service_->Start("primary_unused", oplog_endpoints_, cluster_id_);
+    service_->Stop();
+    SUCCEED();
+#endif
+}
+
+// ========== Issue 2 fail-closed catch-up ==========
+
+namespace {
+
+// Helper to create a valid OpLogEntry with checksum (mirrors the helper in
+// oplog_applier_test.cpp).
+OpLogEntry MakeEntry(uint64_t seq, OpType type, const std::string& key,
+                     const std::string& payload) {
+    OpLogEntry e;
+    e.sequence_id = seq;
+    e.timestamp_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                         std::chrono::steady_clock::now().time_since_epoch())
+                         .count();
+    e.op_type = type;
+    e.object_key = key;
+    e.payload = payload;
+    // Compute checksum and prefix_hash using the production algorithm.
+    e.checksum =
+        static_cast<uint32_t>(XXH32(payload.data(), payload.size(), 0));
+    e.prefix_hash =
+        key.empty() ? 0
+                    : static_cast<uint32_t>(XXH32(key.data(), key.size(), 0));
+    return e;
+}
+
+// Helper to create a valid struct_pack payload for PUT_END
+std::string MakeValidPayload(uint64_t client_id_first = 1,
+                             uint64_t client_id_second = 2,
+                             uint64_t size = 1024) {
+    mooncake::MetadataPayload payload;
+    payload.client_id = {client_id_first, client_id_second};
+    payload.size = size;
+    auto result = struct_pack::serialize(payload);
+    return std::string(result.begin(), result.end());
+}
+
+class FakeHaKvBackend : public HaKvBackend {
+   public:
+    ErrorCode Get(std::string_view key, std::string& value) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (next_get_error_ != ErrorCode::OK) {
+            auto error = next_get_error_;
+            next_get_error_ = ErrorCode::OK;
+            return error;
+        }
+        if (get_error_ != ErrorCode::OK) {
+            return get_error_;
+        }
+        auto it = values_.find(std::string(key));
+        if (it == values_.end()) {
+            return ErrorCode::ETCD_KEY_NOT_EXIST;
+        }
+        value = it->second;
+        return ErrorCode::OK;
+    }
+    ErrorCode Put(std::string_view key, std::string_view value) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        values_[std::string(key)] = std::string(value);
+        return ErrorCode::OK;
+    }
+    ErrorCode Range(std::string_view begin_key, std::string_view end_key,
+                    size_t limit, std::vector<KvPair>& kvs) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (range_error_ != ErrorCode::OK) {
+            return range_error_;
+        }
+        kvs.clear();
+        for (const auto& [key, value] : values_) {
+            if (key >= begin_key && key < end_key) {
+                kvs.push_back({.key = key, .value = value});
+                if (kvs.size() >= limit) break;
+            }
+        }
+        return ErrorCode::OK;
+    }
+    bool SupportsTxn() const override { return true; }
+    ErrorCode Txn(const KvTxn& txn) override {
+        std::lock_guard<std::mutex> lock(mutex_);
+        for (const auto& compare : txn.compares) {
+            auto it = values_.find(compare.key);
+            if (compare.kind == KvCompareKind::kKeyNotExists) {
+                if (it != values_.end()) {
+                    return ErrorCode::ETCD_TRANSACTION_FAIL;
+                }
+            } else if (it == values_.end() ||
+                       it->second != compare.expected_value) {
+                return ErrorCode::ETCD_TRANSACTION_FAIL;
+            }
+        }
+        for (const auto& put : txn.puts) {
+            values_[put.key] = put.value;
+        }
+        return ErrorCode::OK;
+    }
+    void SetGetError(ErrorCode err) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        get_error_ = err;
+    }
+    void SetRangeError(ErrorCode err) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        range_error_ = err;
+    }
+    void FailNextGet(ErrorCode err) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        next_get_error_ = err;
+    }
+
+   private:
+    mutable std::mutex mutex_;
+    std::map<std::string, std::string> values_;
+    ErrorCode get_error_{ErrorCode::OK};
+    ErrorCode range_error_{ErrorCode::OK};
+    ErrorCode next_get_error_{ErrorCode::OK};
+};
+
+OpLogBatchRecord MakeBatch(uint64_t batch_id, uint64_t first_seq,
+                           uint64_t last_seq) {
+    OpLogBatchRecord batch;
+    batch.batch_id = batch_id;
+    batch.first_seq = first_seq;
+    batch.last_seq = last_seq;
+    for (uint64_t seq = first_seq; seq <= last_seq; ++seq) {
+        batch.entries.push_back(MakeEntry(seq, OpType::PUT_END,
+                                          "batch_key_" + std::to_string(seq),
+                                          MakeValidPayload()));
+    }
+    return batch;
+}
+
+}  // namespace
+
+TEST_F(HotStandbyServiceTest,
+       BatchRecordStandbyPollsInjectedBackendWithoutNotifier) {
+    const std::string cluster_id = "batch-standby-injected-backend";
+    auto batch_backend = std::make_shared<FakeHaKvBackend>();
+    ASSERT_EQ(ErrorCode::OK,
+              batch_backend->Put(
+                  BuildDurablePrefixKey(cluster_id),
+                  EncodeDurablePrefix({.batch_id = 1, .last_seq = 1})));
+    ASSERT_EQ(ErrorCode::OK,
+              batch_backend->Put(BuildBatchRecordKey(cluster_id, 1),
+                                 EncodeOpLogBatchRecord(MakeBatch(1, 1, 1))));
+
+    HotStandbyConfig config = config_;
+    config.enable_snapshot_bootstrap = false;
+    config.enable_oplog_following = true;
+    config.oplog_poll_interval_ms = 1;
+
+    auto service = std::make_unique<HotStandbyService>(config);
+    service->SetCatchUpBatchKvBackendForTesting(batch_backend);
+    ASSERT_EQ(ErrorCode::OK,
+              service->Start("primary_unused", "unused", cluster_id));
+
+    for (int i = 0; i < 100 && service->GetLatestAppliedSequenceId() < 1; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+
+    EXPECT_EQ(StandbyState::WATCHING, service->GetState());
+    EXPECT_EQ(1u, service->GetLatestAppliedSequenceId());
+    service->Stop();
+}
+
+TEST_F(HotStandbyServiceTest, BatchRecordRetriesTransientBackendFailure) {
+    const std::string cluster_id = "batch-standby-transient-retry";
+    auto batch_backend = std::make_shared<FakeHaKvBackend>();
+    ASSERT_EQ(ErrorCode::OK,
+              batch_backend->Put(
+                  BuildDurablePrefixKey(cluster_id),
+                  EncodeDurablePrefix({.batch_id = 1, .last_seq = 1})));
+    ASSERT_EQ(ErrorCode::OK,
+              batch_backend->Put(BuildBatchRecordKey(cluster_id, 1),
+                                 EncodeOpLogBatchRecord(MakeBatch(1, 1, 1))));
+    batch_backend->FailNextGet(ErrorCode::ETCD_OPERATION_ERROR);
+
+    HotStandbyConfig config = config_;
+    config.enable_snapshot_bootstrap = false;
+    config.oplog_poll_interval_ms = 1;
+    config.batch_oplog_retry_timeout_sec = 1;
+
+    auto service = std::make_unique<HotStandbyService>(config);
+    service->SetCatchUpBatchKvBackendForTesting(batch_backend);
+    ASSERT_EQ(ErrorCode::OK,
+              service->Start("primary_unused", "unused", cluster_id));
+
+    for (int i = 0;
+         i < 100 && (service->GetLatestAppliedSequenceId() < 1 ||
+                     service->GetSyncStatus().last_error != ErrorCode::OK);
+         ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+
+    EXPECT_EQ(StandbyState::WATCHING, service->GetState());
+    EXPECT_EQ(1u, service->GetLatestAppliedSequenceId());
+    EXPECT_EQ(ErrorCode::OK, service->GetSyncStatus().last_error);
+    service->Stop();
+}
+
+TEST_F(HotStandbyServiceTest, BatchRecordRetryTimeoutTransitionsToFailed) {
+    auto batch_backend = std::make_shared<FakeHaKvBackend>();
+    batch_backend->SetGetError(ErrorCode::ETCD_OPERATION_ERROR);
+
+    HotStandbyConfig config = config_;
+    config.enable_snapshot_bootstrap = false;
+    config.oplog_poll_interval_ms = 1;
+    config.batch_oplog_retry_timeout_sec = 0;
+
+    auto service = std::make_unique<HotStandbyService>(config);
+    service->SetCatchUpBatchKvBackendForTesting(batch_backend);
+    ASSERT_EQ(ErrorCode::OK, service->Start("primary_unused", "unused",
+                                            "batch-standby-timeout"));
+
+    for (int i = 0; i < 100 && service->GetState() != StandbyState::FAILED;
+         ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+
+    EXPECT_EQ(StandbyState::FAILED, service->GetState());
+    EXPECT_EQ(ErrorCode::ETCD_OPERATION_ERROR,
+              service->GetSyncStatus().last_error);
+    service->Stop();
+}
+
+TEST_F(HotStandbyServiceTest, BatchRecordCanRestartAfterRetryTimeout) {
+    auto batch_backend = std::make_shared<FakeHaKvBackend>();
+    batch_backend->SetGetError(ErrorCode::ETCD_OPERATION_ERROR);
+
+    HotStandbyConfig config = config_;
+    config.enable_snapshot_bootstrap = false;
+    config.oplog_poll_interval_ms = 1;
+    config.batch_oplog_retry_timeout_sec = 0;
+
+    auto service = std::make_unique<HotStandbyService>(config);
+    service->SetCatchUpBatchKvBackendForTesting(batch_backend);
+    ASSERT_EQ(ErrorCode::OK, service->Start("primary_unused", "unused",
+                                            "batch-standby-restart"));
+    for (int i = 0; i < 100 && service->GetState() != StandbyState::FAILED;
+         ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    ASSERT_EQ(StandbyState::FAILED, service->GetState());
+
+    batch_backend->SetGetError(ErrorCode::OK);
+    ASSERT_EQ(ErrorCode::OK, service->Start("primary_unused", "unused",
+                                            "batch-standby-restart"));
+
+    EXPECT_EQ(StandbyState::WATCHING, service->GetState());
+    EXPECT_EQ(ErrorCode::OK, service->GetSyncStatus().last_error);
+    service->Stop();
+}
+
+class PromotionCatchUpTest : public HotStandbyServiceTest {
+   protected:
+    void SetUp() override {
+        HotStandbyServiceTest::SetUp();
+        config_.enable_oplog_following = true;
+        config_.enable_snapshot_bootstrap = false;
+        config_.oplog_poll_interval_ms = 1;
+
+        batch_backend_ = std::make_shared<FakeHaKvBackend>();
+        service_ = std::make_unique<HotStandbyService>(config_);
+        service_->SetCatchUpBatchKvBackendForTesting(batch_backend_);
+    }
+
+    std::shared_ptr<FakeHaKvBackend> batch_backend_;
+};
+
+#ifdef STORE_USE_ETCD
+TEST_F(HotStandbyServiceTest,
+       BatchRecordStandbyPollsDurablePrefixInReplicationLoop) {
+    const std::string etcd_endpoints = "127.0.0.1:2379";
+    auto connect_err =
+        EtcdHelper::ConnectToEtcdStoreClient(etcd_endpoints.c_str());
+    if (connect_err != ErrorCode::OK) {
+        GTEST_SKIP() << "etcd is unavailable: " << toString(connect_err);
+    }
+
+    const std::string cluster_id =
+        "batch-standby-loop-" + UuidToString(generate_uuid());
+    EtcdHaKvBackend backend;
+    OpLogBatchStorage storage(cluster_id, backend);
+    DurablePrefix prefix;
+    auto init_err = storage.InitDurablePrefix(prefix);
+    if (init_err != ErrorCode::OK) {
+        GTEST_SKIP() << "etcd is unavailable: " << toString(init_err);
+    }
+    ASSERT_EQ(ErrorCode::OK,
+              storage.WriteBatchAndAdvancePrefix(
+                  MakeBatch(prefix.batch_id + 1, prefix.last_seq + 1,
+                            prefix.last_seq + 1),
+                  prefix));
+
+    HotStandbyConfig config = config_;
+    config.enable_snapshot_bootstrap = false;
+    config.enable_oplog_following = true;
+    config.oplog_poll_interval_ms = 10;
+
+    auto service = std::make_unique<HotStandbyService>(config);
+    ASSERT_EQ(ErrorCode::OK,
+              service->Start("primary_unused", etcd_endpoints, cluster_id));
+
+    const uint64_t expected_seq = prefix.last_seq + 1;
+    constexpr int kMaxAttempts = 100;
+    for (int i = 0; i < kMaxAttempts &&
+                    service->GetLatestAppliedSequenceId() < expected_seq;
+         ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+
+    EXPECT_GE(service->GetLatestAppliedSequenceId(), expected_seq);
+    service->Stop();
+}
+#endif
+
+TEST_F(PromotionCatchUpTest, UsesDurablePrefixLastSeqAsCatchUpTarget) {
+    ASSERT_EQ(ErrorCode::OK,
+              batch_backend_->Put(
+                  BuildDurablePrefixKey(cluster_id_),
+                  EncodeDurablePrefix({.batch_id = 1, .last_seq = 2})));
+    ASSERT_EQ(ErrorCode::OK,
+              batch_backend_->Put(BuildBatchRecordKey(cluster_id_, 1),
+                                  EncodeOpLogBatchRecord(MakeBatch(1, 1, 2))));
+
+    auto err = service_->Start("", oplog_endpoints_, cluster_id_);
+    if (err != ErrorCode::OK) {
+        GTEST_SKIP() << "Service could not reach WATCHING state; "
+                        "skipping promotion test";
+    }
+    EXPECT_EQ(StandbyState::WATCHING, service_->GetState());
+
+    StandbySnapshot out;
+    ErrorCode promote_err = service_->PromoteAndExportSnapshot(out);
+    EXPECT_EQ(ErrorCode::OK, promote_err);
+    EXPECT_EQ(2u, out.oplog_sequence_id);
+}
+
+TEST_F(PromotionCatchUpTest, RetriesTransientDurablePrefixReadFailure) {
+    auto batch_backend = std::make_shared<FakeHaKvBackend>();
+    ASSERT_EQ(ErrorCode::OK,
+              batch_backend->Put(
+                  BuildDurablePrefixKey(cluster_id_),
+                  EncodeDurablePrefix({.batch_id = 1, .last_seq = 1})));
+    ASSERT_EQ(ErrorCode::OK,
+              batch_backend->Put(BuildBatchRecordKey(cluster_id_, 1),
+                                 EncodeOpLogBatchRecord(MakeBatch(1, 1, 1))));
+    service_->SetCatchUpBatchKvBackendForTesting(batch_backend);
+
+    ASSERT_EQ(ErrorCode::OK,
+              service_->Start("", oplog_endpoints_, cluster_id_));
+    batch_backend->FailNextGet(ErrorCode::ETCD_OPERATION_ERROR);
+
+    StandbySnapshot out;
+    EXPECT_EQ(ErrorCode::OK, service_->PromoteAndExportSnapshot(out));
+    EXPECT_EQ(1u, out.oplog_sequence_id);
+}
+
+TEST_F(PromotionCatchUpTest, MissingDurablePrefixPromotesAtSequenceZero) {
+    ASSERT_EQ(ErrorCode::OK,
+              service_->Start("", oplog_endpoints_, cluster_id_));
+    ASSERT_EQ(StandbyState::WATCHING, service_->GetState());
+    StandbySnapshot out;
+    ASSERT_EQ(ErrorCode::OK, service_->PromoteAndExportSnapshot(out));
+    EXPECT_EQ(0u, out.oplog_sequence_id);
+}
+
+TEST_F(PromotionCatchUpTest, MissingDurablePrefixRejectsNonzeroSequence) {
+    config_.enable_snapshot_bootstrap = true;
+    service_ = std::make_unique<HotStandbyService>(config_);
+    service_->SetCatchUpBatchKvBackendForTesting(batch_backend_);
+    service_->SetSnapshotProvider(std::make_unique<FakeSnapshotProvider>(
+        std::optional<LoadedSnapshot>(MakeSnapshot("baseline", 1, "key", 1))));
+
+    ASSERT_EQ(ErrorCode::OK,
+              service_->Start("", oplog_endpoints_, cluster_id_));
+    ASSERT_EQ(StandbyState::WATCHING, service_->GetState());
+    StandbySnapshot out;
+    EXPECT_EQ(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP,
+              service_->PromoteAndExportSnapshot(out));
+    EXPECT_EQ(StandbyState::FAILED, service_->GetState());
+}
+
+TEST_F(PromotionCatchUpTest, CatchesUpPrefixThatAppearsBeforePromotion) {
+    const DurablePrefix initial_prefix{.batch_id = 0, .last_seq = 0};
+    ASSERT_EQ(ErrorCode::OK,
+              batch_backend_->Put(BuildDurablePrefixKey(cluster_id_),
+                                  EncodeDurablePrefix(initial_prefix)));
+    ASSERT_EQ(ErrorCode::OK,
+              service_->Start("", oplog_endpoints_, cluster_id_));
+    ASSERT_EQ(StandbyState::WATCHING, service_->GetState());
+
+    OpLogBatchStorage storage(cluster_id_, *batch_backend_);
+    ASSERT_EQ(ErrorCode::OK, storage.WriteBatchAndAdvancePrefix(
+                                 MakeBatch(1, 1, 1), initial_prefix));
+
+    StandbySnapshot out;
+    ASSERT_EQ(ErrorCode::OK, service_->PromoteAndExportSnapshot(out));
+    EXPECT_EQ(1u, out.oplog_sequence_id);
+}
+
+TEST_F(PromotionCatchUpTest, PaginatesBatchRecords) {
+    constexpr uint64_t kBatchCount = 1025;
+    auto batch_backend = std::make_shared<FakeHaKvBackend>();
+    ASSERT_EQ(
+        ErrorCode::OK,
+        batch_backend->Put(BuildDurablePrefixKey(cluster_id_),
+                           EncodeDurablePrefix({.batch_id = kBatchCount,
+                                                .last_seq = kBatchCount})));
+    for (uint64_t id = 1; id <= kBatchCount; ++id) {
+        ASSERT_EQ(
+            ErrorCode::OK,
+            batch_backend->Put(BuildBatchRecordKey(cluster_id_, id),
+                               EncodeOpLogBatchRecord(MakeBatch(id, id, id))));
+    }
+    service_->SetCatchUpBatchKvBackendForTesting(batch_backend);
+
+    auto err = service_->Start("", oplog_endpoints_, cluster_id_);
+    if (err != ErrorCode::OK) {
+        GTEST_SKIP() << "Service could not reach WATCHING state; "
+                        "skipping promotion test";
+    }
+
+    StandbySnapshot out;
+    ASSERT_EQ(ErrorCode::OK, service_->PromoteAndExportSnapshot(out));
+    EXPECT_EQ(kBatchCount, out.oplog_sequence_id);
+}
+
+TEST_F(PromotionCatchUpTest, FailsPromotionWhenDurablePrefixUnreadable) {
+    ASSERT_EQ(ErrorCode::OK,
+              service_->Start("", oplog_endpoints_, cluster_id_));
+    batch_backend_->SetGetError(ErrorCode::PERSISTENT_FAIL);
+
+    StandbySnapshot out;
+    ErrorCode promote_err = service_->PromoteAndExportSnapshot(out);
+    EXPECT_EQ(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, promote_err);
+    EXPECT_EQ(StandbyState::FAILED, service_->GetState());
+}
+
+TEST_F(PromotionCatchUpTest, FailsPromotionWhenTargetBatchUnreadable) {
+    ASSERT_EQ(ErrorCode::OK,
+              service_->Start("", oplog_endpoints_, cluster_id_));
+    ASSERT_EQ(ErrorCode::OK,
+              batch_backend_->Put(
+                  BuildDurablePrefixKey(cluster_id_),
+                  EncodeDurablePrefix({.batch_id = 1, .last_seq = 1})));
+    batch_backend_->SetRangeError(ErrorCode::PERSISTENT_FAIL);
+
+    StandbySnapshot out;
+    ErrorCode promote_err = service_->PromoteAndExportSnapshot(out);
+    EXPECT_EQ(ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, promote_err);
+    EXPECT_EQ(StandbyState::FAILED, service_->GetState());
+}
+
+}  // namespace mooncake::test
+
+int main(int argc, char** argv) {
+    ::testing::InitGoogleTest(&argc, argv);
+    return RUN_ALL_TESTS();
+}

@@ -2,102 +2,165 @@
 add_subdirectory(cachelib_memory_allocator)
 
 set(MOONCAKE_STORE_SOURCES
-    async_memcpy_executor.cpp
-    replica.cpp
     allocator.cpp
     master_service.cpp
-    centralized_master_service.cpp
+    master_snapshot_manager.cpp
+    master_snapshot_repository.cpp
     client_service.cpp
-    centralized_client_service.cpp
-    p2p_client_service.cpp
-    p2p_client_metric.cpp
     client_metric.cpp
     types.cpp
     master_client.cpp
-    centralized_master_client.cpp
-    p2p_master_client.cpp
     utils.cpp
+    mmap_arena.cpp
     master_metric_manager.cpp
-    centralized_master_metric_manager.cpp
-    p2p_master_metric_manager.cpp
-    client_metrics_aggregator.cpp
     storage_backend.cpp
     thread_pool.cpp
     etcd_helper.cpp
-    ha_helper.cpp
-    centralized_segment_manager.cpp
-    segment_manager.cpp
-    client_meta.cpp
-    client_manager.cpp
-    centralized_client_manager.cpp
-    centralized_client_meta.cpp
-    p2p_client_manager.cpp
-    p2p_master_service.cpp
-    p2p_client_meta.cpp
-    p2p_segment_manager.cpp
+    segment.cpp
     transfer_task.cpp
-    etcd_helper.cpp
-    ha_helper.cpp
+    tenant_quota.cpp
+    tenant_quota_ledger.cpp
+    tenant_quota_policy_store.cpp
     rpc_service.cpp
-    centralized_rpc_service.cpp
-    p2p_rpc_service.cpp
+    master_admin_service.cpp
     offset_allocator.cpp
     posix_file.cpp
     client_buffer.cpp
+    aligned_client_buffer.cpp
     real_client.cpp
+    registered_pinned_memory.cpp
     dummy_client.cpp
+    uds_transport.cpp
+    shm_helper.cpp
     http_metadata_server.cpp
     file_storage.cpp
-    tiered_cache/copier_registry.cpp
-    tiered_cache/data_copier.cpp
-    tiered_cache/tiered_backend.cpp
-    data_manager.cpp
-    route_cache.cpp
-    async_metadata_notifier.cpp
-    ha_recovery_manager.cpp
-    client_rpc_service.cpp
-    peer_client.cpp
-    runtime_config_store.cpp
-    tiered_cache/tiers/dram_tier.cpp
-    tiered_cache/tiers/storage_tier.cpp
-    tiered_cache/scheduler/simple_policy.cpp
-    tiered_cache/scheduler/lru_policy.cpp
-    tiered_cache/scheduler/client_scheduler.cpp
-    tiered_cache/scheduler/scheduler_factory.cpp
-    tiered_cache/event_driven_scheduler/multi_lru_stats_collector.cpp
-    tiered_cache/event_driven_scheduler/multi_lru_policy.cpp
-    tiered_cache/event_driven_scheduler/event_driven_client_scheduler.cpp
+    replica.cpp
+    serialize/serializer.cpp
+    storage/distributed/dfs_global_allocator.cpp
+    storage/distributed/distributed_storage_backend.cpp
+    storage/distributed/posix_fs_adapter.cpp
+    device/accelerator_device.cpp
+    device/accelerator_registry.cpp
+    device/runtime_accelerator.cpp
+    device/cuda_like_accelerator_device.cpp
+    device/cuda_ipc_buffer.cpp
+    device/hip_accelerator_device.cpp
+    device/ascend_accelerator_device.cpp
+    device/sunrise_accelerator_device.cpp
+    ha/leadership/leader_coordinator_factory.cpp
+    ha/leadership/backends/etcd/etcd_leader_coordinator.cpp
+    ha/common/redis/redis_connection.cpp
+    ha/leadership/backends/redis/redis_leader_coordinator.cpp
+    ha/leadership/master_service_supervisor.cpp
+    ha/kv/etcd_ha_kv_backend.cpp
+    ha/standby_controller.cpp
+    ha/snapshot/catalog_backed_snapshot_provider.cpp
+    ha/snapshot/batch_oplog/metadata.cpp
+    ha/snapshot/master_snapshot_codec.cpp
+    ha/snapshot/object/snapshot_object_store.cpp
+    ha/snapshot/object/backends/local/local_file_snapshot_object_store.cpp
+    ha/snapshot/object/backends/s3/s3_snapshot_object_store.cpp
+    ha/snapshot/catalog/backends/embedded/embedded_snapshot_catalog_store.cpp
+    ha/snapshot/catalog/backends/redis/redis_snapshot_catalog_store.cpp
+    utils/file_util.cpp
     task_manager.cpp
-    # HA OpLog components (ported from main branch)
-    ha/oplog/oplog_manager.cpp
-    ha/oplog/oplog_serializer.cpp
-    ha/oplog/localfs_oplog_store.cpp
-    ha/oplog/polling_oplog_change_notifier.cpp
-    ha/oplog/oplog_store_factory.cpp
+    local_hot_cache.cpp
+    ha/oplog/oplog_types.cpp
+    ha/oplog/oplog_batch_codec.cpp
+    ha/oplog/oplog_batch_storage.cpp
+    ha/oplog/oplog_batch_standby_reader.cpp
+    ha/oplog/oplog_batch_types.cpp
+    ha/oplog/ordered_oplog_writer.cpp
+    ha/oplog/oplog_test_failpoint.cpp
     ha/oplog/oplog_applier.cpp
-    ha/oplog/oplog_replicator.cpp
-    # P2P HA OpLog components
-    ha/oplog/p2p_oplog_types.cpp
-    ha/oplog/p2p_oplog_applier.cpp
-    ha/oplog/p2p_standby_metadata_store.cpp
-    ha/oplog/p2p_hot_standby_service.cpp
-    ha/oplog/p2p_standby_snapshot_service.cpp
+    hot_standby_service.cpp
+    metadata_store.cpp
     standby_state_machine.cpp
     ha_metric_manager.cpp
-)
+    store_c.cpp
+    memory_alloc.cpp
+    ssd_register_client.cpp
+    engram/engram_store.cpp
+    p2p/client/p2p_client_service.cpp
+    p2p/p2p_client_metric.cpp
+    p2p/p2p_segment_manager.cpp
+    p2p/client_meta.cpp
+    p2p/p2p_client_meta.cpp
+    p2p/client_manager.cpp
+    p2p/p2p_client_manager.cpp
+    p2p/p2p_master_service.cpp
+    p2p/p2p_rpc_service.cpp
+    p2p/p2p_master_client.cpp
+    p2p/peer_client.cpp
+    p2p/client_rpc_service.cpp
+    p2p/route_cache.cpp
+    p2p/async_metadata_notifier.cpp
+    p2p/ha_recovery_manager.cpp
+    p2p/data_manager.cpp
+    p2p/async_memcpy_executor.cpp
+    p2p/client_metrics_aggregator.cpp
+    p2p/tiered_cache/tiers/dram_tier.cpp
+    p2p/tiered_cache/tiers/storage_tier.cpp
+    p2p/tiered_cache/scheduler/simple_policy.cpp
+    p2p/tiered_cache/scheduler/lru_policy.cpp
+    p2p/tiered_cache/scheduler/client_scheduler.cpp
+    p2p/tiered_cache/scheduler/scheduler_factory.cpp
+    p2p/tiered_cache/event_driven_scheduler/multi_lru_stats_collector.cpp
+    p2p/tiered_cache/event_driven_scheduler/multi_lru_policy.cpp
+    p2p/tiered_cache/event_driven_scheduler/event_driven_client_scheduler.cpp
+    p2p/tiered_cache/copier_registry.cpp
+    p2p/tiered_cache/data_copier.cpp
+    p2p/tiered_cache/tiered_backend.cpp
+    p2p/p2p_ha_metric_manager.cpp
+    p2p/p2p_standby_state_machine.cpp
+    p2p/ha/oplog/p2p_oplog_applier_base.cpp
+    p2p/ha/oplog/oplog_manager.cpp
+    p2p/ha/oplog/oplog_replicator.cpp
+    p2p/ha/oplog/oplog_serializer.cpp
+    p2p/ha/oplog/oplog_store_factory.cpp
+    p2p/ha/oplog/localfs_oplog_store.cpp
+    p2p/ha/oplog/polling_oplog_change_notifier.cpp
+    p2p/ha/oplog/p2p_oplog_applier.cpp
+    p2p/ha/oplog/p2p_oplog_types.cpp
+    p2p/ha/oplog/p2p_standby_metadata_store.cpp
+    p2p/ha/oplog/p2p_standby_snapshot_service.cpp
+    p2p/ha/oplog/p2p_hot_standby_service.cpp
+    client_service_base.cpp
+    runtime_config_store.cpp
+    ha_helper.cpp
+    p2p/client/centralized_client_service.cpp)
 
 set(EXTRA_LIBS "")
+set(SPDK_STATIC_LIBS "")
 
-# Find hiredis for Redis election backend
-if(STORE_USE_REDIS)
-    find_path(HIREDIS_INCLUDE_DIR NAMES hiredis/hiredis.h REQUIRED)
-    find_library(HIREDIS_LIB NAMES hiredis REQUIRED)
-    message(STATUS "Found hiredis: include=${HIREDIS_INCLUDE_DIR} lib=${HIREDIS_LIB}")
-    list(APPEND MOONCAKE_STORE_SOURCES redis_util.cpp)
-    list(APPEND MOONCAKE_STORE_SOURCES redis_election_helper.cpp)
-    list(APPEND MOONCAKE_STORE_SOURCES redis_master_view_helper.cpp)
-    list(APPEND MOONCAKE_STORE_SOURCES ha/oplog/redis_oplog_store.cpp)
-    list(APPEND EXTRA_LIBS ${HIREDIS_LIB})
+# Find AWS SDK
+find_package(AWSSDK QUIET COMPONENTS s3)
+if(AWSSDK_FOUND)
+  message(STATUS "AWS SDK found: ${AWSSDK_VERSION}")
+  set(HAVE_AWS_SDK TRUE)
+  # Add S3 related source files
+  list(APPEND MOONCAKE_STORE_SOURCES utils/s3_helper.cpp)
+else()
+  message(STATUS "AWS SDK not found, S3 functionality will be disabled")
+  set(HAVE_AWS_SDK FALSE)
+endif()
+
+# Find zstd library
+find_library(ZSTD_LIBRARY NAMES zstd)
+if(NOT ZSTD_LIBRARY)
+  message(FATAL_ERROR "zstd library not found")
+endif()
+
+set(EXTRA_LIBS ${ZSTD_LIBRARY})
+
+# If AWS SDK is found, add it to EXTRA_LIBS
+if(HAVE_AWS_SDK)
+  list(APPEND EXTRA_LIBS ${AWSSDK_LINK_LIBRARIES})
+  add_definitions(-DHAVE_AWS_SDK)
+  if(AWS_S3_LIB AND AWS_CORE_LIB)
+    list(APPEND EXTRA_LIBS ${AWS_S3_LIB} ${AWS_CORE_LIB})
+    add_definitions(-DHAVE_AWS_SDK)
+  endif()
 endif()
 
 # Find xxHash (required for ComputeChecksum)
@@ -109,6 +172,31 @@ find_library(
   XXHASH_LIBRARY
   NAMES xxhash libxxhash
   PATHS /usr/lib /usr/local/lib /usr/lib64)
+set(KV_EVENTS_ZMQ_FOUND FALSE)
+if(ENABLE_KV_EVENTS)
+  find_library(
+    ZMQ_LIBRARY
+    NAMES zmq libzmq
+    PATHS /usr/lib /usr/local/lib /usr/lib64)
+  find_path(
+    ZMQ_INCLUDE_DIR
+    NAMES zmq.h
+    PATHS /usr/include /usr/local/include)
+  if(ZMQ_INCLUDE_DIR AND ZMQ_LIBRARY)
+    message(STATUS "Found ZMQ: include=${ZMQ_INCLUDE_DIR} lib=${ZMQ_LIBRARY}")
+    list(APPEND MASTER_EXTRA_INCS ${ZMQ_INCLUDE_DIR})
+    list(APPEND EXTRA_LIBS ${ZMQ_LIBRARY})
+    list(APPEND MOONCAKE_STORE_SOURCES kv_event/kv_event_publisher.cpp)
+    set(KV_EVENTS_ZMQ_FOUND TRUE)
+  else()
+    message(
+      FATAL_ERROR
+        "ENABLE_KV_EVENTS is ON but libzmq was not found. "
+        "Install libzmq3-dev or pass -DENABLE_KV_EVENTS=OFF to configure without ZMQ."
+    )
+  endif()
+endif()
+
 if(XXHASH_INCLUDE_DIR AND XXHASH_LIBRARY)
   message(
     STATUS "Found xxHash: include=${XXHASH_INCLUDE_DIR} lib=${XXHASH_LIBRARY}")
@@ -122,168 +210,356 @@ endif()
 
 if(USE_3FS)
   add_subdirectory(hf3fs)
-  list(APPEND MOONCAKE_STORE_SOURCES  ${HF3FS_SOURCES})
-  find_library(HF3FS_API_LIB hf3fs_api_shared PATHS /usr/lib NO_DEFAULT_PATH)
+  list(APPEND MOONCAKE_STORE_SOURCES ${HF3FS_SOURCES})
+  list(APPEND MOONCAKE_STORE_SOURCES storage/distributed/hf3fs_adapter.cpp)
+  find_library(
+    HF3FS_API_LIB hf3fs_api_shared
+    PATHS /usr/lib
+    NO_DEFAULT_PATH)
   if(NOT HF3FS_API_LIB)
     message(FATAL_ERROR "hf3fs_api_shared library not found in /usr/lib")
   endif()
-  set(EXTRA_LIBS ${HF3FS_API_LIB})
+  list(APPEND EXTRA_LIBS ${HF3FS_API_LIB})
 endif()
 
-# Ascend Cache Tier support
-if(USE_ASCEND_CACHE_TIER)
-  list(APPEND MOONCAKE_STORE_SOURCES tiered_cache/tiers/ascend_tier.cpp)
-  message(STATUS "Ascend Cache Tier enabled")
+# io_uring support (auto-detected)
+find_library(URING_LIB uring PATHS /usr/lib /usr/lib64 /usr/local/lib
+                                   /usr/local/lib64)
+find_path(URING_INCLUDE liburing.h PATHS /usr/include /usr/local/include)
+if(URING_LIB AND URING_INCLUDE)
+  message(STATUS "io_uring: Enabled for mooncake_store")
+  list(APPEND MOONCAKE_STORE_SOURCES uring_file.cpp)
+  list(APPEND EXTRA_LIBS ${URING_LIB})
+else()
+  message(STATUS "io_uring: Disabled (liburing not found)")
 endif()
 
-# Ascend DRAM Tier support (aclrtMallocHost-based DRAM allocation)
-if(USE_ASCEND_DRAM_TIER)
-  message(STATUS "Ascend DRAM Tier enabled")
+if(STORE_USE_REDIS)
+  list(APPEND MOONCAKE_STORE_SOURCES p2p/ha/oplog/redis_oplog_store.cpp)
+  list(APPEND MOONCAKE_STORE_SOURCES p2p/redis_election_helper.cpp)
+  list(APPEND MOONCAKE_STORE_SOURCES p2p/redis_master_view_helper.cpp)
+  list(APPEND EXTRA_LIBS ${MOONCAKE_STORE_HIREDIS_LIBRARY})
+endif()
+
+list(APPEND MOONCAKE_STORE_SOURCES k8s_lease_helper.cpp)
+if(STORE_USE_K8S_LEASE)
+  list(APPEND MOONCAKE_STORE_SOURCES
+       ha/leadership/backends/k8s/k8s_leader_coordinator.cpp)
+  list(APPEND EXTRA_LIBS ${K8S_LEASE_WRAPPER_LIB})
+  set_source_files_properties(
+    k8s_lease_helper.cpp
+    PROPERTIES
+      OBJECT_DEPENDS
+      "${CMAKE_BINARY_DIR}/mooncake-common/k8s-lease/libk8s_lease_wrapper.h")
+endif()
+
+if(USE_NOF)
+  add_subdirectory(spdk)
+  list(APPEND MOONCAKE_STORE_SOURCES ${SPDK_WRAPPER_SOURCES})
+
+  set(SPDK_INCLUDE_DIR
+      "/usr/local/include"
+      CACHE PATH "SPDK include directory")
+  set(DPDK_INCLUDE_DIR
+      "/usr/local/include"
+      CACHE PATH "DPDK include directory")
+  set(SPDK_LIB_DIR
+      "/usr/local/lib"
+      CACHE PATH "SPDK static library directory")
+  set(DPDK_LIB_DIR
+      "/usr/local/lib"
+      CACHE PATH "DPDK static library directory")
+
+  set(SPDK_STATIC_LIBS
+      -Wl,--whole-archive
+      ${SPDK_LIB_DIR}/libspdk_event.a
+      ${SPDK_LIB_DIR}/libspdk_rdma.a
+      ${SPDK_LIB_DIR}/libspdk_nvme.a
+      ${SPDK_LIB_DIR}/libspdk_sock_posix.a
+      -Wl,--no-whole-archive
+      ${SPDK_LIB_DIR}/libspdk_vfio_user.a
+      ${SPDK_LIB_DIR}/libspdk_dma.a
+      ${SPDK_LIB_DIR}/libspdk_init.a
+      ${SPDK_LIB_DIR}/libspdk_env_dpdk.a
+      ${SPDK_LIB_DIR}/libspdk_log.a
+      ${SPDK_LIB_DIR}/libspdk_util.a
+      ${SPDK_LIB_DIR}/libspdk_blob.a
+      ${SPDK_LIB_DIR}/libspdk_blobfs.a
+      ${SPDK_LIB_DIR}/libspdk_bdev.a
+      ${SPDK_LIB_DIR}/libspdk_conf.a
+      ${SPDK_LIB_DIR}/libspdk_json.a
+      ${SPDK_LIB_DIR}/libspdk_jsonrpc.a
+      ${SPDK_LIB_DIR}/libspdk_sock.a
+      ${SPDK_LIB_DIR}/libspdk_thread.a
+      ${SPDK_LIB_DIR}/libspdk_trace.a
+      ${SPDK_LIB_DIR}/libspdk_vmd.a
+      ${SPDK_LIB_DIR}/libspdk_rpc.a
+      ${DPDK_LIB_DIR}/librte_eal.a
+      ${DPDK_LIB_DIR}/librte_mempool.a
+      ${DPDK_LIB_DIR}/librte_ring.a
+      ${DPDK_LIB_DIR}/librte_bus_pci.a
+      ${DPDK_LIB_DIR}/librte_pci.a
+      ${DPDK_LIB_DIR}/librte_timer.a
+      ${DPDK_LIB_DIR}/librte_telemetry.a
+      ${DPDK_LIB_DIR}/librte_kvargs.a
+      ${DPDK_LIB_DIR}/librte_mbuf.a
+      -Wl,--whole-archive
+      ${DPDK_LIB_DIR}/librte_mempool_ring.a
+      -Wl,--no-whole-archive
+      ${DPDK_LIB_DIR}/librte_power.a
+      ${DPDK_LIB_DIR}/librte_ethdev.a
+      ${DPDK_LIB_DIR}/librte_net.a
+      ${DPDK_LIB_DIR}/librte_vhost.a
+      ${DPDK_LIB_DIR}/librte_cryptodev.a
+      ${DPDK_LIB_DIR}/librte_hash.a
+      ${DPDK_LIB_DIR}/librte_rcu.a
+      pthread
+      dl
+      numa
+      rt
+      m
+      uuid
+      crypto
+      aio
+      z
+      isal
+      elf
+      ibverbs
+      rdmacm
+      ssl
+      bsd)
 endif()
 
 # The cache_allocator library
 include_directories(${Python3_INCLUDE_DIRS})
 add_library(mooncake_store ${MOONCAKE_STORE_SOURCES})
-# Note: transfer_engine is PRIVATE to avoid propagating its dependencies (e.g., vendor-specific hardware)
-# to targets that don't need it (e.g., mooncake_master).
-# Targets that need transfer_engine should link it explicitly.
-target_include_directories(mooncake_store PUBLIC ${XXHASH_INCLUDE_DIR})
-if(STORE_USE_REDIS)
-    target_include_directories(mooncake_store PUBLIC ${HIREDIS_INCLUDE_DIR})
-    target_compile_definitions(mooncake_store PUBLIC STORE_USE_REDIS)
-endif()
-target_link_libraries(mooncake_store
-    PUBLIC
-        cachelib_memory_allocator
-        ${ETCD_WRAPPER_LIB}
-        glog::glog
-        gflags::gflags
-        JsonCpp::JsonCpp
-        ${XXHASH_LIBRARY}
-        ${EXTRA_LIBS}
-        asio_shared
-    PRIVATE
-        transfer_engine
-)
 
-# Link Ascend ACL library if USE_ASCEND_CACHE_TIER is enabled
 if(USE_ASCEND_CACHE_TIER)
-  # Try to find Ascend ACL library
-  set(ASCEND_SEARCH_PATHS
-      $ENV{ASCEND_HOME}/lib64
-      /usr/local/Ascend/ascend-toolkit/latest/lib64
-      /usr/local/Ascend/nnrt/latest/lib64
-  )
-  find_library(ASCENDCL_LIB ascendcl PATHS ${ASCEND_SEARCH_PATHS} NO_DEFAULT_PATH)
-
-  if(NOT ASCENDCL_LIB)
-    message(WARNING "ascendcl library not found. Ascend cache tier will use fallback mode (no ACL).")
-  else()
-    message(STATUS "Found ascendcl library: ${ASCENDCL_LIB}")
-    target_link_libraries(mooncake_store PUBLIC ${ASCENDCL_LIB})
-
-    # Add include paths for Ascend headers
-    set(ASCEND_INCLUDE_PATHS
-        $ENV{ASCEND_HOME}/include
-        /usr/local/Ascend/ascend-toolkit/latest/include
-        /usr/local/Ascend/nnrt/latest/include
+    target_sources(mooncake_store PRIVATE
+        p2p/tiered_cache/tiers/ascend_tier.cpp
     )
-    target_include_directories(mooncake_store PUBLIC ${ASCEND_INCLUDE_PATHS})
-
-    # Only define USE_ASCEND_CACHE_TIER when library is found
-    target_compile_definitions(mooncake_store PUBLIC USE_ASCEND_CACHE_TIER)
-  endif()
+endif()
+if(KV_EVENTS_ZMQ_FOUND)
+  target_compile_definitions(mooncake_store PRIVATE MOONCAKE_ENABLE_KV_EVENTS=1)
+endif()
+if(MOONCAKE_ENABLE_OPLOG_PERF_METRICS)
+  target_compile_definitions(mooncake_store
+                             PRIVATE MOONCAKE_ENABLE_OPLOG_PERF_METRICS)
+endif()
+target_include_directories(mooncake_store PUBLIC ${XXHASH_INCLUDE_DIR})
+if(USE_NOF)
+  target_include_directories(mooncake_store PRIVATE ${SPDK_INCLUDE_DIR}
+                                                    ${DPDK_INCLUDE_DIR})
+endif()
+target_link_libraries(mooncake_store PUBLIC ${XXHASH_LIBRARY})
+if(STORE_USE_REDIS)
+  target_include_directories(mooncake_store
+                             PRIVATE ${MOONCAKE_STORE_HIREDIS_INCLUDE_DIR})
+endif()
+# Note: transfer_engine is PRIVATE to avoid propagating its dependencies (e.g.,
+# vendor-specific hardware) to targets that don't need it (e.g.,
+# mooncake_master). Targets that need transfer_engine should link it explicitly.
+target_link_libraries(
+  mooncake_store
+  PUBLIC cachelib_memory_allocator
+         ${ETCD_WRAPPER_LIB}
+         glog::glog
+         gflags::gflags
+         ${EXTRA_LIBS}
+         ${SPDK_STATIC_LIBS}
+         mooncake_common
+         yaml-cpp
+         asio_shared
+         mooncake_common
+         yalantinglibs::yalantinglibs
+  PRIVATE transfer_engine JsonCpp::JsonCpp)
+if(STORE_USE_ETCD)
+  add_dependencies(mooncake_store build_etcd_wrapper)
+endif()
+if(STORE_USE_K8S_LEASE)
+  add_dependencies(mooncake_store build_k8s_lease_wrapper)
 endif()
 
-# Link Ascend ACL library if USE_ASCEND_DRAM_TIER is enabled
-if(USE_ASCEND_DRAM_TIER)
-  set(NEED_LINK_ASCEND FALSE)
-  if(NOT ASCENDCL_LIB)
-    set(NEED_LINK_ASCEND TRUE)
-    set(ASCEND_SEARCH_PATHS
-        $ENV{ASCEND_HOME}/lib64
-        /usr/local/Ascend/ascend-toolkit/latest/lib64
-        /usr/local/Ascend/nnrt/latest/lib64
-    )
-    find_library(ASCENDCL_LIB ascendcl PATHS ${ASCEND_SEARCH_PATHS} NO_DEFAULT_PATH)
-  endif()
-
-  if(NOT ASCENDCL_LIB)
-    message(FATAL_ERROR "ascendcl library not found, USE_ASCEND_DRAM_TIER requires it")
-  else()
-    message(STATUS "Found ascendcl library for DRAM tier: ${ASCENDCL_LIB}")
-    if(NEED_LINK_ASCEND)
-      target_link_libraries(mooncake_store PUBLIC ${ASCENDCL_LIB})
-      set(ASCEND_INCLUDE_PATHS
-          $ENV{ASCEND_HOME}/include
-          /usr/local/Ascend/ascend-toolkit/latest/include
-          /usr/local/Ascend/nnrt/latest/include
-      )
-      target_include_directories(mooncake_store PUBLIC ${ASCEND_INCLUDE_PATHS})
-    endif()
-    target_compile_definitions(mooncake_store PUBLIC USE_ASCEND_DRAM_TIER)
-  endif()
-endif()
-if (STORE_USE_ETCD)
-    add_dependencies(mooncake_store build_etcd_wrapper)
+if(URING_LIB AND URING_INCLUDE)
+  target_compile_definitions(mooncake_store PUBLIC USE_URING)
+  target_include_directories(mooncake_store PRIVATE ${URING_INCLUDE})
 endif()
 
-if (USE_ASCEND_DIRECT)
-    set(ACL_RUNTIME_HEADER_PATH "${ASCEND_INCLUDE_DIR}/acl/acl_rt.h")
-    if(EXISTS "${ACL_RUNTIME_HEADER_PATH}")
-        file(READ "${ACL_RUNTIME_HEADER_PATH}" ACL_RUNTIME_CONTENT)
-        if("${ACL_RUNTIME_CONTENT}" MATCHES "ACL_MEM_P2P_HUGE1G")
-            message(STATUS "ACL_MEM_P2P_HUGE1G exist.")
-            add_compile_definitions(ASCEND_SUPPORT_FABRIC_MEM)
-        else()
-            message(STATUS "ACL_MEM_P2P_HUGE1G is not exist.")
-        endif()
-    else()
-        message(WARNING "Acl runtime header file is not exist")
-    endif()
-endif()
-
-if (BUILD_SHARED_LIBS)
+if(BUILD_SHARED_LIBS)
   install(TARGETS mooncake_store DESTINATION lib)
 endif()
 
 # Master binary
+include(CheckPIESupported)
+check_pie_supported(LANGUAGES CXX)
+
 add_executable(mooncake_master master.cpp)
 
 set(MASTER_EXTRA_INCS)
 set(MASTER_EXTRA_LIBS)
 
-if (STORE_USE_JEMALLOC)
-    find_package(PkgConfig REQUIRED)
-    pkg_check_modules(JEMALLOC REQUIRED jemalloc)
-    list(APPEND MASTER_EXTRA_INCS ${JEMALLOC_INCLUDE_DIRS})
-    list(APPEND MASTER_EXTRA_LIBS ${JEMALLOC_STATIC_LIBRARIES})
+if(STORE_USE_JEMALLOC)
+  find_package(PkgConfig REQUIRED)
+  pkg_check_modules(JEMALLOC REQUIRED jemalloc)
+  list(APPEND MASTER_EXTRA_INCS ${JEMALLOC_INCLUDE_DIRS})
+  list(APPEND MASTER_EXTRA_LIBS ${JEMALLOC_STATIC_LIBRARIES})
 endif()
 
 target_include_directories(mooncake_master PRIVATE ${MASTER_EXTRA_INCS})
-target_link_libraries(mooncake_master PRIVATE
-    mooncake_store
-    cachelib_memory_allocator
-    pthread
-    ibverbs
-    mooncake_common
-    ${ETCD_WRAPPER_LIB}
-    ${MASTER_EXTRA_LIBS}
-    asio_shared
-)
-
-if (STORE_USE_ETCD)
-    add_dependencies(mooncake_master build_etcd_wrapper)
+target_link_libraries(
+  mooncake_master
+  PRIVATE mooncake_store
+          cachelib_memory_allocator
+          pthread
+          ibverbs
+          mooncake_common
+          JsonCpp::JsonCpp
+          ${ETCD_WRAPPER_LIB}
+          ${MASTER_EXTRA_LIBS}
+          asio_shared)
+# mooncake_store is static and propagates optional runtime dependencies to its
+# consumers. The metadata-only master does not use accelerator staging, so drop
+# those dependencies when they do not satisfy any symbols in the final binary.
+target_link_options(mooncake_master PRIVATE "LINKER:--as-needed")
+if(USE_SUNRISE)
+  target_link_directories(mooncake_master PRIVATE ${MC_TANGRT_ROOT}/lib)
 endif()
 
-target_compile_options(mooncake_master PRIVATE -Os)
-target_link_options(mooncake_master PRIVATE -Os -s)
+if(STORE_USE_ETCD)
+  add_dependencies(mooncake_master build_etcd_wrapper)
+endif()
 
 # Client server binary
 add_executable(mooncake_client real_client_main.cpp)
 # Client needs transfer_engine for data transfer operations
-target_link_libraries(mooncake_client PRIVATE mooncake_store transfer_engine asio_shared)
-target_compile_options(mooncake_client PRIVATE -Os)
-target_link_options(mooncake_client PRIVATE -Os -s)
+target_link_libraries(mooncake_client PRIVATE mooncake_store transfer_engine
+                                              asio_shared)
+set_target_properties(mooncake_master mooncake_client
+                      PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
+# Optimize binary sizes only in Release mode
+string(TOUPPER "${CMAKE_BUILD_TYPE}" CMAKE_BUILD_TYPE_UPPER)
+if(CMAKE_BUILD_TYPE_UPPER STREQUAL "RELEASE")
+  target_compile_options(mooncake_master PRIVATE -Os)
+  target_link_options(mooncake_master PRIVATE -Os -s)
+  target_compile_options(mooncake_client PRIVATE -Os)
+  target_link_options(mooncake_client PRIVATE -Os -s)
+endif()
+
+# GPU runtime library for D2H staging in PutToLocalFile / OffloadObjects.
+# transfer_engine is PRIVATE-linked, so its CUDA/HIP/Ascend dependencies are not
+# propagated; we must detect and link them independently.
+#
+# Auto-detect each toolkit regardless of global USE_CUDA/USE_HIP flags, because
+# USE_CUDA may be OFF even when GPU pointers are present (e.g.
+# WITH_NVIDIA_PEERMEM env var uses nvidia-peermem for RDMA without cudart). Each
+# detected toolkit gets both link libraries AND compile definitions, so that
+# AcceleratorDevice implementations and pinned_buffer_pool.h pick the correct
+# backend.
+#
+# NOTE: mooncake_store is a static library (.a). External consumers (Go CGo,
+# Python pybind) that link it must also link the GPU runtime (e.g. -lcudart).
+# Go's build.sh already does this; CI workflows must do the same.
+
+find_package(CUDAToolkit QUIET)
+if(CUDAToolkit_FOUND)
+  message(STATUS "mooncake_store: CUDAToolkit detected, enabling D2H staging")
+  target_compile_definitions(mooncake_store PRIVATE USE_CUDA)
+  target_compile_definitions(mooncake_client PRIVATE USE_CUDA)
+  target_include_directories(mooncake_store PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+  target_include_directories(mooncake_client
+                             PRIVATE ${CUDAToolkit_INCLUDE_DIRS})
+  target_link_libraries(mooncake_store PRIVATE CUDA::cudart)
+  target_link_libraries(mooncake_client PRIVATE CUDA::cudart)
+endif()
+
+if(NOT CUDAToolkit_FOUND)
+  find_package(hip QUIET)
+  if(hip_FOUND)
+    message(STATUS "mooncake_store: HIP detected, enabling D2H staging")
+    target_compile_definitions(mooncake_store PRIVATE USE_HIP)
+    target_compile_definitions(mooncake_client PRIVATE USE_HIP)
+    target_link_libraries(mooncake_store PRIVATE hip::host)
+    target_link_libraries(mooncake_client PRIVATE hip::host)
+  endif()
+endif()
+
+if(USE_ASCEND
+   OR USE_ASCEND_DIRECT
+   OR USE_UBSHMEM)
+  target_include_directories(mooncake_store PRIVATE $ENV{ASCEND_PATH}/include)
+  target_link_libraries(mooncake_store PRIVATE ascendcl)
+  target_include_directories(mooncake_client PRIVATE $ENV{ASCEND_PATH}/include)
+  target_link_libraries(mooncake_client PRIVATE ascendcl)
+endif()
+
+if(USE_SUNRISE)
+  target_link_libraries(
+    mooncake_store PRIVATE ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
+                           ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
+  target_link_libraries(
+    mooncake_client PRIVATE ${MC_TANGRT_ROOT}/lib/libtangrt_shared.so
+                            ${MC_TANGRT_ROOT}/lib/libptml_shared.so dl)
+endif()
 
 install(TARGETS mooncake_master mooncake_client DESTINATION bin)
+
+# ---------------------------------------------------------------------------
+# Optional: a self-contained libmooncake_store.so exporting only the store_c.h
+# C ABI, for consumers that dlopen the store (e.g. the Rust crate's `dlopen`
+# feature). Whole-archives the static mooncake_store + asio_static (objects are
+# -fPIC, see mooncake-common/common.cmake) and localizes everything else via the
+# version script; only system/toolkit libs (and the Go etcd/k8s backends when
+# enabled) stay DT_NEEDED.
+# ---------------------------------------------------------------------------
+if(WITH_STORE_C_SHARED)
+  # ELF/GNU-ld features (--whole-archive, --as-needed, version script, $ORIGIN);
+  # supported by GNU ld, gold, and lld. Linux only.
+  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(
+      FATAL_ERROR
+        "WITH_STORE_C_SHARED currently supports Linux/ELF only "
+        "(got CMAKE_SYSTEM_NAME=${CMAKE_SYSTEM_NAME}).")
+  endif()
+
+  # We whole-archive mooncake_store and reuse its name, so require it to be static
+  # (add_library(mooncake_store) follows BUILD_SHARED_LIBS, which some backends
+  # force ON).
+  get_target_property(_mooncake_store_type mooncake_store TYPE)
+  if(NOT _mooncake_store_type STREQUAL "STATIC_LIBRARY")
+    message(
+      FATAL_ERROR
+        "WITH_STORE_C_SHARED requires mooncake_store to be a STATIC_LIBRARY "
+        "(got ${_mooncake_store_type}); configure with BUILD_SHARED_LIBS=OFF.")
+  endif()
+
+  add_library(mooncake_store_c SHARED store_c_shared.cpp)
+  set_target_properties(
+    mooncake_store_c
+    PROPERTIES OUTPUT_NAME mooncake_store
+               # Separate dir so this .so does not shadow the static
+               # libmooncake_store.a on the Rust `link` backend's -L path.
+               LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/shared"
+               # $ORIGIN so the installed .so finds co-installed deps (CMake
+               # strips the build RUNPATH on install).
+               INSTALL_RPATH "$ORIGIN"
+               # Relink when the version script (a bare link flag) changes.
+               LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/store_c.map")
+  add_dependencies(mooncake_store_c mooncake_store asio_static)
+  # Whole-archive the static lib + asio_static via file paths (no interface-dep
+  # propagation); re-list the mooncake_store target for its transitive deps.
+  # --as-needed drops the now-redundant transitive libasio.so.
+  target_link_libraries(
+    mooncake_store_c
+    PRIVATE -Wl,--whole-archive "$<TARGET_FILE:mooncake_store>"
+            "$<TARGET_FILE:asio_static>" -Wl,--no-whole-archive -Wl,--as-needed
+            mooncake_store)
+  # Export only the C ABI; the version script localizes every other symbol
+  # pulled from the static archives. Strip debug info in Release (it dominates
+  # the .so size).
+  target_link_options(
+    mooncake_store_c PRIVATE
+    "-Wl,--version-script=${CMAKE_CURRENT_SOURCE_DIR}/store_c.map"
+    "$<$<CONFIG:Release>:-Wl,-s>")
+  install(TARGETS mooncake_store_c DESTINATION lib)
+endif()

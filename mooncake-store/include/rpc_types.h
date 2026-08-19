@@ -4,66 +4,68 @@
 
 #include "types.h"
 #include "replica.h"
-#include "heartbeat_type.h"
 #include "task_manager.h"
 
 namespace mooncake {
 
-/**
- * @brief P2P specific configuration for read route
- */
-struct P2PGetReplicaListConfigExtra {
-    // exclude replicas whose segment contains any tag in tag_filters
-    std::vector<std::string> tag_filters;
-    // filter replicas whose segment priority is lower than priority_limit
-    int priority_limit = 0;
+struct ObjectMeta {
+    std::string key;
+    std::optional<uint64_t> object_checksum;
 };
-YLT_REFL(P2PGetReplicaListConfigExtra, tag_filters, priority_limit);
+YLT_REFL(ObjectMeta, key, object_checksum);
 
 /**
- * @brief Request config for getting replica list
+ * @brief Response structure for Ping operation
  */
-struct GetReplicaListRequestConfig {
-    GetReplicaListRequestConfig() = default;
-    GetReplicaListRequestConfig(size_t max_c) : max_candidates(max_c) {}
+struct PingResponse {
+    ViewVersionId view_version_id;
+    ClientStatus client_status;
 
-    // 0 means return all viable replica candidates;
-    // otherwise, return at most max_candidates candidates
-    static const size_t RETURN_ALL_CANDIDATES = 0;
-    size_t max_candidates = RETURN_ALL_CANDIDATES;
-    std::optional<P2PGetReplicaListConfigExtra> p2p_config;
+    PingResponse() = default;
+    PingResponse(ViewVersionId view_version, ClientStatus status)
+        : view_version_id(view_version), client_status(status) {}
+
+    friend std::ostream& operator<<(std::ostream& os,
+                                    const PingResponse& response) noexcept {
+        return os << "PingResponse: { view_version_id: "
+                  << response.view_version_id
+                  << ", client_status: " << response.client_status << " }";
+    }
 };
-YLT_REFL(GetReplicaListRequestConfig, max_candidates, p2p_config);
-
-// config for filter replicas in read route
-typedef GetReplicaListRequestConfig ReadRouteConfig;
-typedef P2PGetReplicaListConfigExtra P2PReadRouteConfigExtra;
-
-/**
- * @brief Extra info for centralized read route response (Internal use)
- */
-struct CentralizedGetReplicaListResponseExtra {
-    CentralizedGetReplicaListResponseExtra() = default;
-    CentralizedGetReplicaListResponseExtra(uint64_t lease_ttl_ms_param)
-        : lease_ttl_ms(lease_ttl_ms_param) {}
-    uint64_t lease_ttl_ms = 0;
-};
-YLT_REFL(CentralizedGetReplicaListResponseExtra, lease_ttl_ms);
+YLT_REFL(PingResponse, view_version_id, client_status);
 
 /**
  * @brief Response structure for GetReplicaList operation
  */
 struct GetReplicaListResponse {
-    GetReplicaListResponse() = default;
-    GetReplicaListResponse(std::vector<Replica::Descriptor>&& replicas_param,
-                           uint64_t lease_ttl_ms_param)
-        : replicas(std::move(replicas_param)),
-          centralized_extra(lease_ttl_ms_param) {}
-
     std::vector<Replica::Descriptor> replicas;
-    std::optional<CentralizedGetReplicaListResponseExtra> centralized_extra;
+    uint64_t lease_ttl_ms;
+    std::optional<uint64_t> object_checksum;
+
+    GetReplicaListResponse() : lease_ttl_ms(0) {}
+    GetReplicaListResponse(
+        std::vector<Replica::Descriptor>&& replicas_param,
+        uint64_t lease_ttl_ms_param,
+        std::optional<uint64_t> object_checksum_param = std::nullopt)
+        : replicas(std::move(replicas_param)),
+          lease_ttl_ms(lease_ttl_ms_param),
+          object_checksum(object_checksum_param) {}
 };
-YLT_REFL(GetReplicaListResponse, replicas, centralized_extra);
+YLT_REFL(GetReplicaListResponse, replicas, lease_ttl_ms, object_checksum);
+
+struct CachedQueryResultResponse {
+    bool success;
+    GetReplicaListResponse value;
+    ErrorCode error;
+
+    CachedQueryResultResponse()
+        : success(false), value(), error(ErrorCode::INVALID_PARAMS) {}
+    CachedQueryResultResponse(GetReplicaListResponse&& value_param)
+        : success(true), value(std::move(value_param)), error(ErrorCode::OK) {}
+    CachedQueryResultResponse(ErrorCode error_param)
+        : success(false), value(), error(error_param) {}
+};
+YLT_REFL(CachedQueryResultResponse, success, value, error);
 
 /**
  * @brief Response structure for GetStorageConfig operation
@@ -82,6 +84,17 @@ struct GetStorageConfigResponse {
 };
 YLT_REFL(GetStorageConfigResponse, fsdir, enable_disk_eviction, quota_bytes);
 
+struct NoFSegmentOwnerInfo {
+    UUID segment_id;
+    UUID client_id;
+
+    NoFSegmentOwnerInfo() = default;
+    NoFSegmentOwnerInfo(const UUID& segment_id_param,
+                        const UUID& client_id_param)
+        : segment_id(segment_id_param), client_id(client_id_param) {}
+};
+YLT_REFL(NoFSegmentOwnerInfo, segment_id, client_id);
+
 /**
  * @brief Response structure for CopyStart operation
  */
@@ -92,6 +105,15 @@ struct CopyStartResponse {
 YLT_REFL(CopyStartResponse, source, targets);
 
 /**
+ * @brief Response structure for PromotionAllocStart (L2->L1 promotion-on-hit).
+ * Carries the staged PROCESSING MEMORY replica descriptor.
+ */
+struct PromotionAllocStartResponse {
+    Replica::Descriptor memory_descriptor;
+};
+YLT_REFL(PromotionAllocStartResponse, memory_descriptor);
+
+/**
  * @brief Response structure for MoveStart operation
  */
 struct MoveStartResponse {
@@ -100,98 +122,82 @@ struct MoveStartResponse {
 };
 YLT_REFL(MoveStartResponse, source, target);
 
-/**
- * @brief Request structure for Heartbeat operation.
- * Client could set HeartbeatTasks for Master to run
- */
-struct HeartbeatRequest {
-    UUID client_id;
-    std::vector<HeartbeatTask> tasks;
+enum class JobType {
+    DRAIN = 0,
 };
-YLT_REFL(HeartbeatRequest, client_id, tasks);
 
-/**
- * @brief Response structure for Heartbeat operation.
- * Always returns view_version; client uses it under UNDEFINED status
- * for crash-recovery decisions, other statuses for defensive checks.
- */
-struct HeartbeatResponse {
-    ClientStatus status;
-    ViewVersionId view_version = 0;
-    std::vector<HeartbeatTaskResult> task_results;
+inline std::ostream& operator<<(std::ostream& os, const JobType& type) {
+    switch (type) {
+        case JobType::DRAIN:
+            os << "DRAIN";
+            break;
+        default:
+            os << "UNKNOWN_JOB_TYPE";
+            break;
+    }
+    return os;
+}
+
+enum class JobStatus {
+    CREATED = 0,
+    PLANNING,
+    RUNNING,
+    SUCCEEDED,
+    FAILED,
+    CANCELED,
 };
-YLT_REFL(HeartbeatResponse, status, view_version, task_results);
 
-/**
- * @brief Response structure for the DummyClient ping RPC (RealClient::ping).
- */
-struct DummyHeartbeatResponse {
-    DummyClientStatus status = DummyClientStatus::HEALTH;
-    uint64_t mapped_shm_count = 0;
+inline std::ostream& operator<<(std::ostream& os, const JobStatus& status) {
+    switch (status) {
+        case JobStatus::CREATED:
+            os << "CREATED";
+            break;
+        case JobStatus::PLANNING:
+            os << "PLANNING";
+            break;
+        case JobStatus::RUNNING:
+            os << "RUNNING";
+            break;
+        case JobStatus::SUCCEEDED:
+            os << "SUCCEEDED";
+            break;
+        case JobStatus::FAILED:
+            os << "FAILED";
+            break;
+        case JobStatus::CANCELED:
+            os << "CANCELED";
+            break;
+        default:
+            os << "UNKNOWN_JOB_STATUS";
+            break;
+    }
+    return os;
+}
+
+struct CreateDrainJobRequest {
+    std::vector<std::string> segments;
+    std::vector<std::string> target_segments;
+    uint32_t max_concurrency{4};
 };
-YLT_REFL(DummyHeartbeatResponse, status, mapped_shm_count);
+YLT_REFL(CreateDrainJobRequest, segments, target_segments, max_concurrency);
 
-/**
- * @brief Request structure for RegisterClient operation.
- * Client calls this on startup to register its UUID and local segments.
- * P2P clients additionally provide ip_address and rpc_port.
- */
-struct RegisterClientRequest {
-    UUID client_id;
-    std::vector<Segment> segments;
-    DeploymentMode deployment_mode = DeploymentMode::CENTRALIZATION;
-
-    // P2P only: network endpoint info
-    std::optional<std::string> ip_address;
-    std::optional<uint16_t> rpc_port;
+struct QueryJobResponse {
+    UUID id;
+    JobType type;
+    JobStatus status;
+    int64_t created_at_ms_epoch;
+    int64_t last_updated_at_ms_epoch;
+    std::vector<std::string> segments;
+    uint64_t succeeded_units;
+    uint64_t failed_units;
+    uint64_t blocked_units;
+    uint64_t active_units;
+    uint64_t migrated_bytes;
+    std::string message;
 };
-YLT_REFL(RegisterClientRequest, client_id, segments, deployment_mode,
-         ip_address, rpc_port);
-
-/**
- * @brief Response structure for RegisterClient operation.
- * Returns the master's view_version to client for crash checking.
- */
-struct RegisterClientResponse {
-    ViewVersionId view_version = 0;
-};
-YLT_REFL(RegisterClientResponse, view_version);
-
-/**
- * @brief Request structure for UnregisterClient operation.
- * Client calls this to proactively deregister itself and all its routing
- * metadata (segments/replicas) from the master
- */
-struct UnregisterClientRequest {
-    UUID client_id;
-    DeploymentMode deployment_mode = DeploymentMode::CENTRALIZATION;
-};
-YLT_REFL(UnregisterClientRequest, client_id, deployment_mode);
-
-/**
- * @brief Response structure for UnregisterClient operation.
- * Returns the master's view_version (mirrors RegisterClientResponse).
- */
-struct UnregisterClientResponse {
-    ViewVersionId view_version = 0;
-};
-YLT_REFL(UnregisterClientResponse, view_version);
-
-/**
- * @brief Request structure for QueryClientStatus operation.
- */
-struct QueryClientStatusRequest {
-    UUID client_id;
-};
-YLT_REFL(QueryClientStatusRequest, client_id);
-
-/**
- * @brief Response structure for QueryClientStatus operation.
- */
-struct QueryClientStatusResponse {
-    ClientStatus status = ClientStatus::UNDEFINED;
-};
-YLT_REFL(QueryClientStatusResponse, status);
+YLT_REFL(QueryJobResponse, id, type, status, created_at_ms_epoch,
+         last_updated_at_ms_epoch, segments, succeeded_units, failed_units,
+         blocked_units, active_units, migrated_bytes, message);
 
 /**
  * @brief Response structure for QueryTask operation
@@ -232,6 +238,7 @@ struct TaskAssignment {
     TaskType type;
     std::string payload;
     int64_t created_at_ms_epoch;
+    uint32_t max_retry_attempts;
 
     TaskAssignment() = default;
     TaskAssignment(const Task& task)
@@ -241,9 +248,11 @@ struct TaskAssignment {
           created_at_ms_epoch(static_cast<int64_t>(
               std::chrono::duration_cast<std::chrono::milliseconds>(
                   task.created_at.time_since_epoch())
-                  .count())) {}
+                  .count())),
+          max_retry_attempts(task.max_retry_attempts) {}
 };
-YLT_REFL(TaskAssignment, id, type, payload, created_at_ms_epoch);
+YLT_REFL(TaskAssignment, id, type, payload, created_at_ms_epoch,
+         max_retry_attempts);
 
 /**
  * @brief Task update structure
@@ -258,19 +267,22 @@ struct TaskCompleteRequest {
 YLT_REFL(TaskCompleteRequest, id, status, message);
 
 struct BatchGetOffloadObjectResponse {
+    uint64_t batch_id;
     std::vector<uint64_t> pointers;
     std::string transfer_engine_addr;
     uint64_t gc_ttl_ms;
 
-    BatchGetOffloadObjectResponse() = default;
-    BatchGetOffloadObjectResponse(std::vector<uint64_t>&& pointers_param,
+    BatchGetOffloadObjectResponse() : batch_id(0), gc_ttl_ms(0) {}
+    BatchGetOffloadObjectResponse(uint64_t batch_id_param,
+                                  std::vector<uint64_t>&& pointers_param,
                                   std::string transfer_engine_addr_param,
                                   uint64_t gc_ttl_ms_param)
-        : pointers(std::move(pointers_param)),
+        : batch_id(batch_id_param),
+          pointers(std::move(pointers_param)),
           transfer_engine_addr(std::move(transfer_engine_addr_param)),
           gc_ttl_ms(gc_ttl_ms_param) {}
 };
-YLT_REFL(BatchGetOffloadObjectResponse, pointers, transfer_engine_addr,
-         gc_ttl_ms);
+YLT_REFL(BatchGetOffloadObjectResponse, batch_id, pointers,
+         transfer_engine_addr, gc_ttl_ms);
 
 }  // namespace mooncake

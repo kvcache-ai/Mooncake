@@ -14,7 +14,9 @@
 
 #include "tent/platform/cuda.h"
 #include "tent/common/status.h"
+#include "tent/common/utils/prefault.h"
 #include "tent/common/utils/random.h"
+#include "char_util.h"
 
 #include <glog/logging.h>
 #include <fstream>
@@ -25,7 +27,6 @@
 #include <utility>
 #include <vector>
 #include <cuda_runtime.h>
-#include <ctype.h>
 #include <dirent.h>
 #include <infiniband/verbs.h>
 #include <limits.h>
@@ -35,7 +36,6 @@
 #include <unordered_set>
 
 #include <algorithm>
-#include <future>
 
 namespace mooncake {
 namespace tent {
@@ -69,7 +69,7 @@ static std::vector<Topology::NicEntry> listInfiniBandDevices() {
         std::ifstream(path) >> numa_node;
 
         devices.push_back(
-            Topology::NicEntry{.name = std::move(device_name),
+            Topology::NicEntry{.name = device_name,
                                .pci_bus_id = std::move(pci_bus_id),
                                .type = Topology::NIC_RDMA,
                                .numa_node = numa_node});
@@ -191,7 +191,7 @@ static void discoverCudaTopology(std::vector<Topology::NicEntry>& nic_list,
                          << cudaGetErrorString(err);
             continue;
         }
-        for (char* ch = pci_bus_id; (*ch = tolower(*ch)); ch++);
+        for (char* ch = pci_bus_id; (*ch = to_lower(*ch)); ch++);
         int numa_node = getNumaNodeFromPciDevice(pci_bus_id);
         int min_distance = INT_MAX;
         std::unordered_map<int, std::vector<int>> distance_map;
@@ -262,10 +262,45 @@ Status CudaPlatform::probe(std::vector<Topology::NicEntry>& nic_list,
     return Status::OK();
 }
 
+namespace {
+bool cudaDevicePresent() {
+    static const bool present = [] {
+        int device_count = 0;
+        if (cudaGetDeviceCount(&device_count) != cudaSuccess ||
+            device_count == 0) {
+            LOG(WARNING) << "No CUDA device detected; treating buffers as "
+                            "host memory";
+            return false;
+        }
+        return true;
+    }();
+    return present;
+}
+
+bool cudaAbiMatches() {
+    static const bool matches = [] {
+        int runtime_version = 0;
+        // Major version only: struct layout changes across CUDA majors.
+        if (cudaRuntimeGetVersion(&runtime_version) == cudaSuccess &&
+            runtime_version / 1000 != CUDART_VERSION / 1000) {
+            LOG(ERROR) << "CUDA ABI mismatch: built against CUDART "
+                       << CUDART_VERSION << ", loaded libcudart is "
+                       << runtime_version
+                       << "; skipping pointer probe, rebuild against a "
+                          "matching CUDA toolkit.";
+            return false;
+        }
+        return true;
+    }();
+    return matches;
+}
+}  // namespace
+
 MemoryType CudaPlatform::getMemoryType(void* addr) {
-    cudaPointerAttributes attributes;
-    cudaError_t result;
-    result = cudaPointerGetAttributes(&attributes, addr);
+    if (!cudaDevicePresent()) return MTYPE_CPU;
+    if (!cudaAbiMatches()) return MTYPE_UNKNOWN;
+    cudaPointerAttributes attributes{};
+    cudaError_t result = cudaPointerGetAttributes(&attributes, addr);
     if (result != cudaSuccess) {
         LOG(WARNING) << "cudaPointerGetAttributes: "
                      << cudaGetErrorString(result);
@@ -291,24 +326,29 @@ static inline std::string genCudaNodeName(int node) {
 }
 
 const std::vector<RangeLocation> CudaPlatform::getLocation(void* start,
-                                                           size_t len) {
+                                                           size_t len,
+                                                           bool skip_prefault) {
     const static size_t kPageSize = 4096;
     std::vector<RangeLocation> entries;
 
-    cudaPointerAttributes attributes;
-    cudaError_t result;
-    result = cudaPointerGetAttributes(&attributes, start);
-    if (result != cudaSuccess) {
-        LOG(WARNING) << "cudaPointerGetAttributes: "
-                     << cudaGetErrorString(result);
+    if (cudaDevicePresent() && !cudaAbiMatches()) {
         entries.push_back({(uint64_t)start, len, kWildcardLocation});
         return entries;
     }
-
-    if (attributes.type == cudaMemoryTypeDevice) {
-        entries.push_back(
-            {(uint64_t)start, len, genCudaNodeName(attributes.device)});
-        return entries;
+    if (cudaDevicePresent()) {
+        cudaPointerAttributes attributes{};
+        cudaError_t result = cudaPointerGetAttributes(&attributes, start);
+        if (result != cudaSuccess) {
+            LOG(WARNING) << "cudaPointerGetAttributes: "
+                         << cudaGetErrorString(result);
+            entries.push_back({(uint64_t)start, len, kWildcardLocation});
+            return entries;
+        }
+        if (attributes.type == cudaMemoryTypeDevice) {
+            entries.push_back(
+                {(uint64_t)start, len, genCudaNodeName(attributes.device)});
+            return entries;
+        }
     }
 
     // start and end address may not be page aligned.
@@ -318,37 +358,13 @@ const std::vector<RangeLocation> CudaPlatform::getLocation(void* start,
     void** pages = (void**)malloc(sizeof(void*) * n);
     int* status = (int*)malloc(sizeof(int) * n);
 
-    // auto start_ts = getCurrentTimeInNano();
-    if (n <= 4096) {
-        for (int i = 0; i < n; i++) {
-            pages[i] = (void*)((char*)aligned_start + i * kPageSize);
-            volatile char* p = (volatile char*)pages[i];
-            *p = *p;
-        }
-    } else {
-        for (int i = 0; i < n; i++) {
-            pages[i] = (void*)((char*)aligned_start + i * kPageSize);
-        }
-        auto pretouch_range = [&](int begin, int end) {
-            for (int i = begin; i < end; ++i) {
-                volatile char* p = reinterpret_cast<volatile char*>(pages[i]);
-                *p = *p;
-            }
-        };
-        const int parts = 4;
-        std::vector<std::future<void>> futs;
-        futs.reserve(parts);
-        const int chunk = (n + parts - 1) / parts;
-        for (int t = 0; t < parts; ++t) {
-            int begin = t * chunk;
-            int end = std::min(n, begin + chunk);
-            if (begin >= end) break;
-            futs.emplace_back(
-                std::async(std::launch::async, pretouch_range, begin, end));
-        }
-        for (auto& f : futs) f.get();
+    for (int i = 0; i < n; i++) {
+        pages[i] = (void*)((char*)aligned_start + i * kPageSize);
     }
-    // auto end_ts = getCurrentTimeInNano();
+
+    if (!skip_prefault) {
+        prefaultBeforeProbe(pages, n, aligned_start, "CudaPlatform");
+    }
 
     int rc = numa_move_pages(0, n, pages, nullptr, status, 0);
     if (rc != 0) {

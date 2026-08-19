@@ -1,46 +1,85 @@
 #pragma once
 
-#include "centralized_client_service.h"
-#include "client_buffer.hpp"
+#include "client_service_base.h"
+#include "client_buffer.h"
 #include "storage_backend.h"
+#include "pinned_buffer_pool.h"
 
 namespace mooncake {
 
-class CentralizedClientService;
+struct SsdMetric;
 
 class FileStorage {
    public:
     FileStorage(const FileStorageConfig& config,
-                std::shared_ptr<CentralizedClientService> client,
-                const std::string& local_rpc_addr);
+                std::shared_ptr<ClientService> client,
+                const std::string& local_rpc_addr,
+                SsdMetric* ssd_metric = nullptr);
     ~FileStorage();
 
     tl::expected<void, ErrorCode> Init();
+
+    void RemoveAll();
+
+    /**
+     * @brief Result of BatchGet operation containing batch_id and buffer
+     * pointers.
+     */
+    struct BatchGetResult {
+        uint64_t batch_id;
+        std::vector<uint64_t> pointers;
+    };
+
+    struct LocalBatchResult {
+        std::vector<uint64_t> pointers;
+
+       private:
+        friend class FileStorage;
+        std::shared_ptr<void> owner;
+    };
 
     /**
      * @brief Reads multiple key-value (KV) entries from local storage and
      * forwards them to a remote node.
      * @param keys                 List of keys to read from the local KV store
      * @param sizes                Expected size in bytes for each value
-     * @return tl::expected<std::vector<uint64_t>, ErrorCode> indicating
-     * operation status.
+     * @return tl::expected<BatchGetResult, ErrorCode> containing batch_id and
+     * buffer pointers.
      */
-    tl::expected<std::vector<uint64_t>, ErrorCode> BatchGet(
+    tl::expected<BatchGetResult, ErrorCode> BatchGet(
         const std::vector<std::string>& keys,
         const std::vector<int64_t>& sizes);
 
+    tl::expected<LocalBatchResult, ErrorCode> BatchGetLocal(
+        const std::vector<std::string>& keys,
+        const std::vector<int64_t>& sizes);
+
+    [[nodiscard]] bool HasPinnedRestoreArena() const {
+        return pinned_restore_arena_allocator_ != nullptr;
+    }
+
     FileStorageConfig config_;
+
+    /**
+     * @brief Releases buffer associated with a specific batch_id.
+     * Called by remote client after transfer completion.
+     * @param batch_id The unique identifier of the batch to release
+     * @return true if batch was found and released, false otherwise
+     */
+    bool ReleaseBuffer(uint64_t batch_id);
 
    private:
     friend class FileStorageTest;
+    friend class FileStoragePromotionTest;
     struct AllocatedBatch {
+        uint64_t batch_id;
         std::vector<BufferHandle> handles;
         std::unordered_map<std::string, Slice> slices;
         std::chrono::steady_clock::time_point lease_timeout;
         std::vector<uint64_t> pointers;
         uint64_t total_size;
 
-        AllocatedBatch() = default;
+        AllocatedBatch() : batch_id(0), total_size(0) {}
         AllocatedBatch(AllocatedBatch&&) = default;
         AllocatedBatch& operator=(AllocatedBatch&&) = default;
 
@@ -55,7 +94,27 @@ class FileStorage {
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<void, ErrorCode> OffloadObjects(
-        const std::unordered_map<std::string, int64_t>& offloading_objects);
+        const std::vector<OffloadTaskItem>& offloading_objects);
+
+    /**
+     * @brief Classifies a BatchOffload error as affecting only the current
+     * bucket rather than the whole offload cycle.
+     *
+     * Such an error means the bucket's keys simply cannot be persisted this
+     * round; OffloadObjects reports them back to the master as failed (so their
+     * offloading tasks and source-replica refcounts are released) and continues
+     * with the remaining buckets, instead of aborting the entire cycle.
+     *
+     *   - INVALID_READ: source data for these keys could not be read/staged.
+     *   - OBJECT_ALREADY_EXISTS: the key(s) were already offloaded, or are
+     *     being offloaded concurrently. The bucket backend rejects the whole
+     *     bucket atomically by design (see BucketStorageBackend::BatchOffload
+     *     and its PrepareEviction duplicate guard). Treating this as fatal
+     *     aborted the cycle, leaked offloading tasks, and left master/SSD
+     *     metadata inconsistent, which surfaced as spurious INVALID_KEY on the
+     *     read path (issue #2827).
+     */
+    static bool IsPerBucketSoftOffloadError(ErrorCode error);
 
     /**
      * @brief Performs a heartbeat operation for the FileStorage component.
@@ -63,34 +122,72 @@ class FileStorage {
      * client.
      * 2. Receives feedback on which objects should be offloaded.
      * 3. Triggers asynchronous offloading of pending objects.
+     * 4. If offload work was returned, pulls and processes any pending L2->L1
+     *    promotion tasks queued by the master (mirror of step 1+2 in the
+     *    reverse direction).
+     * 5. Runs proactive local-disk watermark eviction.
      * @return tl::expected<void, ErrorCode> indicating operation status.
      */
     tl::expected<void, ErrorCode> Heartbeat();
 
+    /**
+     * @brief Drives the L2->L1 promotion pipeline for one heartbeat tick.
+     * Pulls promotion work from the master, stages a MEMORY replica for each
+     * key, copies the bytes from local SSD into that replica, and notifies the
+     * master on success. A failure on any single key is logged and skipped;
+     * the master-side reaper decrements the source replica's refcnt and
+     * erases the task entry on TTL expiry, and any orphaned PROCESSING
+     * MEMORY replica is reaped via the standard discarded-replicas path.
+     * @return tl::expected<void, ErrorCode> indicating operation status.
+     */
+    tl::expected<void, ErrorCode> ProcessPromotionTasks();
+
     tl::expected<bool, ErrorCode> IsEnableOffloading();
 
+    tl::expected<void, ErrorCode> RunDiskWatermarkEviction();
+
+    tl::expected<void, ErrorCode> NotifyEvictedDiskReplicas(
+        const std::vector<std::string>& evicted_keys);
+
     tl::expected<void, ErrorCode> BatchLoad(
-        const std::unordered_map<std::string, Slice>& batch_object);
+        std::unordered_map<std::string, Slice>& batch_object);
 
     tl::expected<void, ErrorCode> BatchQuerySegmentSlices(
-        const std::vector<std::string>& keys,
+        const std::vector<std::string>& keys, const std::string& tenant_id,
         std::unordered_map<std::string, std::vector<Slice>>& batched_slices);
 
     tl::expected<void, ErrorCode> RegisterLocalMemory();
 
     tl::expected<std::shared_ptr<AllocatedBatch>, ErrorCode> AllocateBatch(
-        const std::vector<std::string>& keys,
-        const std::vector<int64_t>& sizes);
+        const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
+        ClientBufferAllocator& allocator);
+
+    tl::expected<std::shared_ptr<AllocatedBatch>, ErrorCode> LoadBatch(
+        const std::vector<std::string>& keys, const std::vector<int64_t>& sizes,
+        bool prefer_pinned);
 
     void ClientBufferGCThreadFunc();
 
-    std::shared_ptr<CentralizedClientService> client_;
+    /**
+     * @brief Re-registers all offloaded objects with the master.
+     * Called after master restart recovery to sync SSD object metadata.
+     * This is the same logic as the ScanMeta step in Init().
+     */
+    tl::expected<void, ErrorCode> ReRegisterOffloadedObjects();
+
+    std::shared_ptr<ClientService> client_;
+    SsdMetric* ssd_metric_{nullptr};
     std::string local_rpc_addr_;
+    // Pinned memory for GPU staging and SSD-to-GPU restores.
+    std::unique_ptr<PinnedBufferPool> pinned_buffer_pool_;
+    PinnedBufferPool::Buffer pinned_restore_arena_;
+    std::shared_ptr<ClientBufferAllocator> pinned_restore_arena_allocator_;
     std::shared_ptr<StorageBackendInterface> storage_backend_;
     std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_;
     mutable Mutex client_buffer_mutex_;
-    std::vector<std::shared_ptr<AllocatedBatch>> GUARDED_BY(
+    std::unordered_map<uint64_t, std::shared_ptr<AllocatedBatch>> GUARDED_BY(
         client_buffer_mutex_) client_buffer_allocated_batches_;
+    std::atomic<uint64_t> next_batch_id_{1};
 
     mutable Mutex offloading_mutex_;
     bool GUARDED_BY(offloading_mutex_) enable_offloading_;
@@ -98,6 +195,8 @@ class FileStorage {
     std::thread heartbeat_thread_;
     std::atomic<bool> client_buffer_gc_running_;
     std::thread client_buffer_gc_thread_;
+    std::future<void> rescan_future_;
+    std::atomic<bool> metadata_resync_pending_{false};
 };
 
 }  // namespace mooncake

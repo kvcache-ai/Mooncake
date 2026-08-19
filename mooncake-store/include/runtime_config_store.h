@@ -7,7 +7,7 @@
 #include <string>
 #include <variant>
 
-#include "p2p_rpc_types.h"
+#include "p2p/p2p_rpc_types.h"
 #include "replica.h"
 #include "rpc_types.h"
 #include "types.h"

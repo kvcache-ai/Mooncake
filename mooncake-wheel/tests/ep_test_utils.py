@@ -1,3 +1,4 @@
+import importlib
 import os
 import sys
 import numpy as np
@@ -5,7 +6,8 @@ import torch
 import torch.distributed as dist
 from typing import Optional
 
-import mooncake.pg
+# Side-effect import: registers the mooncake process-group backend.
+importlib.import_module("mooncake.pg")
 
 
 def init_dist(local_rank: int, num_local_ranks: int):
@@ -26,7 +28,8 @@ def init_dist(local_rank: int, num_local_ranks: int):
     torch.set_default_dtype(torch.bfloat16)
     torch.set_default_device('cuda')
 
-    return dist.get_rank(), dist.get_world_size(), dist.new_group(list(range(num_local_ranks * num_nodes))), dist.new_group(list(range(num_local_ranks * num_nodes)), backend="mooncake-cpu")
+    group = dist.new_group(list(range(num_local_ranks * num_nodes)))
+    return dist.get_rank(), dist.get_world_size(), group
 
 
 def calc_diff(x: torch.Tensor, y: torch.Tensor):

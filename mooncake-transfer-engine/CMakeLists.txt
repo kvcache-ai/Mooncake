@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.16)
 project(mooncake-transfer-engine)
 
+include(CheckCXXSourceCompiles)
+
 if (NOT GLOBAL_CONFIG)
   if (USE_ETCD)
     message(FATAL_ERROR "Cannot enable USE_ETCD while building transfer engine independently")
@@ -9,11 +11,37 @@ if (NOT GLOBAL_CONFIG)
   include(../mooncake-common/FindGLOG.cmake)
   include(../mooncake-common/common.cmake)
 
-  # Build asio_shared library for standalone build
-  # Set compile definitions before add_subdirectory to ensure proper compilation
+  # Build asio_shared in mooncake-common for standalone builds.
+  # Set compile definitions before adding targets that include ASIO headers.
   add_compile_definitions(ASIO_SEPARATE_COMPILATION ASIO_DYN_LINK)
-  add_subdirectory(../mooncake-asio ${CMAKE_CURRENT_BINARY_DIR}/mooncake-asio)
+  add_subdirectory(../mooncake-common/src
+                   ${CMAKE_CURRENT_BINARY_DIR}/mooncake-common-src)
 endif() # GLOBAL_CONFIG
+
+if (USE_CUDA)
+  set(CMAKE_REQUIRED_LIBRARIES mlx5)
+  check_cxx_source_compiles(
+    "#include <infiniband/mlx5dv.h>
+     #include <infiniband/verbs.h>
+     int main() {
+       mlx5dv_devx_umem_in input{};
+       input.comp_mask = MLX5DV_UMEM_MASK_DMABUF;
+       input.dmabuf_fd = -1;
+       auto reg_ex = &mlx5dv_devx_umem_reg_ex;
+       (void)reg_ex;
+       return 0;
+     }"
+    MOONCAKE_HAVE_MLX5_DMABUF_UMEM)
+  unset(CMAKE_REQUIRED_LIBRARIES)
+
+  if (MOONCAKE_HAVE_MLX5_DMABUF_UMEM)
+    add_compile_definitions(MOONCAKE_HAVE_MLX5_DMABUF_UMEM)
+    message(STATUS "CUDA IBGDA DMA-BUF DevX UMEM support enabled")
+  else()
+    message(WARNING
+      "CUDA IBGDA DMA-BUF DevX UMEM support disabled: the installed mlx5 headers or libmlx5 do not provide MLX5DV_UMEM_MASK_DMABUF, mlx5dv_devx_umem_in::dmabuf_fd, and mlx5dv_devx_umem_reg_ex. Update rdma-core/libmlx5 to enable DMA-BUF control memory; Device API will use GPU-VA and host-mapped fallback.")
+  endif()
+endif()
 
 if (USE_ASCEND)
   include(../mooncake-common/FindMpi.cmake)
@@ -60,12 +88,25 @@ if (WITH_RUST_EXAMPLE)
   add_subdirectory(rust)
 endif()
 
-# Non-peermem requires cuMem allocated memory pointers
-if (USE_MNNVL OR NOT WITH_NVIDIA_PEERMEM)
+# Non-peermem requires cuMem allocated memory pointers; since WITH_NVIDIA_PEERMEM
+# is now a runtime environment variable, always build when GPU support is present.
+if (USE_MNNVL OR USE_CUDA OR USE_HIP OR USE_MUSA OR USE_MACA OR USE_SUPA)
   add_subdirectory(nvlink-allocator)
+endif()
+
+# Build ubshmem allocator for Huawei NPU fabric memory
+if (USE_UBSHMEM)
+  add_subdirectory(ubshmem-allocator)
 endif()
 
 if (USE_TENT)
   add_subdirectory(tent)
+endif()
+
+# tebench only needs the classic Transfer Engine for its default "classic"
+# backend; the TENT backend is compiled in conditionally (see benchmark/
+# CMakeLists.txt and main.cpp). Keep it gated solely on BUILD_BENCHMARK so it
+# can be built without enabling USE_TENT.
+if (BUILD_BENCHMARK)
   add_subdirectory(benchmark)
 endif()

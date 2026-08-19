@@ -91,7 +91,7 @@ void RuntimeConfigStore::applyPatch(ReplicateConfig& config,
         }
     }
     if (json.isMember("with_soft_pin") && json["with_soft_pin"].isBool()) {
-        config.with_soft_pin = json["with_soft_pin"].asBool();
+        // config.with_soft_pin = json["with_soft_pin"].asBool();
     }
     if (json.isMember("preferred_segments") &&
         json["preferred_segments"].isArray()) {
@@ -198,7 +198,7 @@ void RuntimeConfigStore::applyPatch(ReadRouteConfig& config,
 Json::Value RuntimeConfigStore::toJson(const ReplicateConfig& config) {
     Json::Value json;
     json["replica_num"] = Json::Value::UInt64(config.replica_num);
-    json["with_soft_pin"] = config.with_soft_pin;
+    // json["with_soft_pin"] = config.with_soft_pin;
     Json::Value segs(Json::arrayValue);
     for (const auto& seg : config.preferred_segments) {
         segs.append(seg);

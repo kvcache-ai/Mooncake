@@ -1,132 +1,517 @@
 #pragma once
 
-#include <string>
+#include <atomic>
+#include <chrono>
+#include <csignal>
+#include <map>
 #include <memory>
+#include <optional>
+#include <string>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
-#include "client_service.h"
-#include "client_buffer.hpp"
+#include "client_service_base.h"
+#include "client_buffer.h"
+#include "mutex.h"
+#include "utils.h"
+#include "file_storage.h"
+#include <ylt/coro_io/coro_io.hpp>
+#include <ylt/coro_rpc/coro_rpc_client.hpp>
 
 namespace mooncake {
 
 #define MOONCAKE_SHM_NAME "mooncake_shm"
-// Protocol structure for IPC registration
+
+// IPC request type discriminator (sent as first 4 bytes on each connection)
+enum IpcRequestType : uint32_t {
+    IPC_SHM_REGISTER = 0,    // dummy → real: register a shm fd
+    IPC_SHM_FD_REQUEST = 1,  // dummy → real: request a shm fd from real
+};
+
+// Segment types for IPC_SHM_FD_REQUEST
+enum ShmSegmentType : uint32_t {
+    SHM_SEG_HOT_CACHE = 0,  // local hot cache backing memory
+};
+
+constexpr int32_t kInvalidPhysicalDeviceId = -1;
+
+// Return codes for health_check()
+enum HealthCheckStatus : int {
+    HC_HEALTHY = 0,          // Fully connected, all links up
+    HC_NOT_INITIALIZED = 1,  // Not initialized or already closed
+    HC_MASTER_UNREACHABLE =
+        2  // Master (or RealClient for DummyClient) unreachable
+};
+
+template <typename ResultValue, typename ErrorFactory>
+inline std::vector<std::vector<std::vector<ResultValue>>>
+build_ranged_read_results_like(
+    size_t buffer_count, const std::vector<std::vector<std::string>> &all_keys,
+    const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+    ErrorFactory &&make_error) {
+    std::vector<std::vector<std::vector<ResultValue>>> results;
+    results.reserve(buffer_count);
+    for (size_t i = 0; i < buffer_count; ++i) {
+        std::vector<std::vector<ResultValue>> key_rows;
+        const size_t key_count = i < all_keys.size() ? all_keys[i].size() : 1;
+        key_rows.reserve(key_count);
+        for (size_t j = 0; j < key_count; ++j) {
+            const size_t fragment_count =
+                (i < all_dst_offsets.size() && j < all_dst_offsets[i].size())
+                    ? all_dst_offsets[i][j].size()
+                    : 1;
+            std::vector<ResultValue> fragments;
+            fragments.reserve(fragment_count);
+            for (size_t k = 0; k < fragment_count; ++k) {
+                fragments.push_back(make_error());
+            }
+            key_rows.emplace_back(std::move(fragments));
+        }
+        results.emplace_back(std::move(key_rows));
+    }
+    return results;
+}
+
+inline std::vector<std::vector<std::vector<int64_t>>>
+convert_ranged_read_results(
+    const std::vector<
+        std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
+        &internal_results) {
+    std::vector<std::vector<std::vector<int64_t>>> results;
+    results.reserve(internal_results.size());
+
+    for (const auto &key_rows : internal_results) {
+        std::vector<std::vector<int64_t>> converted_rows;
+        converted_rows.reserve(key_rows.size());
+        for (const auto &row : key_rows) {
+            std::vector<int64_t> converted;
+            converted.reserve(row.size());
+            for (const auto &result : row) {
+                converted.push_back(to_py_ret(result));
+            }
+            converted_rows.emplace_back(std::move(converted));
+        }
+        results.emplace_back(std::move(converted_rows));
+    }
+
+    return results;
+}
+
+inline std::vector<std::vector<std::vector<int64_t>>>
+build_ranged_read_error_results(
+    size_t buffer_count, const std::vector<std::vector<std::string>> &all_keys,
+    const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+    ErrorCode error) {
+    return build_ranged_read_results_like<int64_t>(
+        buffer_count, all_keys, all_dst_offsets,
+        [error]() { return static_cast<int64_t>(toInt(error)); });
+}
+
+inline std::vector<std::vector<std::vector<tl::expected<int64_t, ErrorCode>>>>
+build_ranged_read_internal_error_results(
+    size_t buffer_count, const std::vector<std::vector<std::string>> &all_keys,
+    const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+    ErrorCode error) {
+    return build_ranged_read_results_like<tl::expected<int64_t, ErrorCode>>(
+        buffer_count, all_keys, all_dst_offsets,
+        [error]() { return tl::unexpected(error); });
+}
+
+// Payload for IPC_SHM_REGISTER (followed by fd via SCM_RIGHTS)
 struct ShmRegisterRequest {
     uint64_t client_id_first;
     uint64_t client_id_second;
     uint64_t dummy_base_addr;
     uint64_t shm_size;
+    int32_t device_id = kInvalidPhysicalDeviceId;
     bool is_local_buffer;
+};
+
+// Payload for IPC_SHM_FD_REQUEST
+struct ShmFdRequest {
+    uint64_t client_id_first;
+    uint64_t client_id_second;
+    ShmSegmentType segment_type;
+};
+
+// Response for IPC_SHM_FD_REQUEST (fd sent back via SCM_RIGHTS)
+struct ShmFdResponse {
+    int32_t status;     // 0 = success, <0 = error
+    uint64_t shm_size;  // size of the shm region
+};
+
+class ClientRequester {
+   public:
+    ClientRequester();
+
+    /**
+     * @brief Retrieves multiple objects from a remote Transfer Engine (TE)
+     * @param client_addr Network address (e.g., "ip:port") of the remote
+     * Transfer Engine service.
+     * @param keys Map from object key to size (bytes);
+     */
+    tl::expected<BatchGetOffloadObjectResponse, ErrorCode>
+    batch_get_offload_object(const std::string &client_addr,
+                             const std::vector<std::string> &keys,
+                             const std::vector<int64_t> &sizes);
+
+    /**
+     * @brief Notifies remote FileStorage to release buffer after transfer
+     * completion. This is a fire-and-forget call - errors are logged but not
+     * propagated.
+     * @param client_addr Network address of the remote FileStorage service.
+     * @param batch_id The batch_id returned from batch_get_offload_object.
+     */
+    void release_offload_buffer(const std::string &client_addr,
+                                uint64_t batch_id);
+
+   private:
+    /**
+     * @brief A batch of allocated memory buffers, tracking both handles and
+     * mapped addresses. This struct holds a collection of buffer resources
+     * obtained from a memory allocator. It includes:
+     * - `handles`: Opaque handles used to manage lifetime and deallocation.
+     * - `pointers`: Direct virtual addresses where the buffers are accessible.
+     */
+    struct AllocatedBatch {
+        std::vector<BufferHandle>
+            handles;  ///< Unique handles for each buffer (used for release)
+        std::vector<uintptr_t>
+            pointers;  ///< Virtual memory addresses where buffers are mapped
+
+        // Allow move semantics
+        AllocatedBatch() = default;
+        AllocatedBatch(AllocatedBatch &&) = default;
+        AllocatedBatch &operator=(AllocatedBatch &&) = default;
+
+        // Prevent copying (because BufferHandle is move-only)
+        AllocatedBatch(const AllocatedBatch &) = delete;
+        AllocatedBatch &operator=(const AllocatedBatch &) = delete;
+
+        ~AllocatedBatch() =
+            default;  // Automatically releases all handles via RAII
+    };
+
+    mutable std::shared_mutex client_pool_mutex_;
+    std::shared_ptr<coro_io::client_pools<coro_rpc::coro_rpc_client>>
+        client_pools_;
+
+    /**
+     * @brief Generic RPC invocation helper for single-result operations
+     * @tparam ServiceMethod Pointer to WrappedMasterService member function
+     * @tparam ReturnType The expected return type of the RPC call
+     * @tparam Args Parameter types for the RPC call
+     * @param args Arguments to pass to the RPC call
+     * @return The result of the RPC call
+     */
+    template <auto ServiceMethod, typename ReturnType, typename... Args>
+    [[nodiscard]] tl::expected<ReturnType, ErrorCode> invoke_rpc(
+        const std::string &client_addr, Args &&...args);
 };
 
 // Python-specific wrapper class for client interface
 class PyClient {
    public:
-    virtual ~PyClient() = 0;
+    // Request-scoped cache of fresh batch_query() results that can be reused by
+    // subsequent ranged reads in the same operation. Callers should not retain
+    // entries across independent requests.
+    using QueryResultCache =
+        std::unordered_map<std::string, tl::expected<QueryResult, ErrorCode>>;
 
-    virtual int initAll(const std::string& protocol,
-                        const std::string& device_name,
+    virtual ~PyClient() = 0;
+    virtual int setup_real(
+        const std::string &local_hostname, const std::string &metadata_server,
+        size_t global_segment_size, size_t local_buffer_size,
+        const std::string &protocol, const std::string &rdma_devices,
+        const std::string &master_server_addr,
+        const std::shared_ptr<TransferEngine> &transfer_engine,
+        const std::string &ipc_socket_path, bool enable_ssd_offload = false,
+        const std::string &ssd_offload_path = "",
+        const std::string &tenant_id = "default",
+        bool enable_client_http_server = false,
+        int client_http_port = DEFAULT_CLIENT_HTTP_PORT) = 0;
+
+    virtual int setup_dummy(size_t mem_pool_size, size_t local_buffer_size,
+                            const std::string &server_address,
+                            const std::string &ipc_socket_path) = 0;
+
+    virtual int initAll(const std::string &protocol,
+                        const std::string &device_name,
                         size_t mount_segment_size) = 0;
 
     virtual uint64_t alloc_from_mem_pool(size_t size) = 0;
 
-    virtual DeploymentMode deployment_mode() const = 0;
+    virtual int put(const std::string &key, std::span<const char> value,
+                    const ReplicateConfig &config = ReplicateConfig{}) = 0;
 
-    virtual int put(const std::string& key, std::span<const char> value,
-                    const WriteConfig& config) = 0;
+    virtual int register_buffer(void *buffer, size_t size) = 0;
 
-    virtual int register_buffer(void* buffer, size_t size) = 0;
+    virtual int unregister_buffer(void *buffer) = 0;
 
-    virtual int unregister_buffer(void* buffer) = 0;
+    virtual int64_t get_into(const std::string &key, void *buffer,
+                             size_t size) = 0;
 
-    virtual int64_t get_into(const std::string& key, void* buffer, size_t size,
-                             const ReadRouteConfig& config = {}) = 0;
+    // query_result_cache is optional and is only used to reuse fresh
+    // batch_query() results for this read; callers still do not provide any
+    // replica-selection or ranged-read metadata directly.
+    virtual std::vector<std::vector<std::vector<int64_t>>> get_into_ranges(
+        const std::vector<void *> &buffers,
+        const std::vector<std::vector<std::string>> &all_keys,
+        const std::vector<std::vector<std::vector<size_t>>> &all_dst_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_src_offsets,
+        const std::vector<std::vector<std::vector<size_t>>> &all_sizes,
+        const QueryResultCache *query_result_cache = nullptr) = 0;
+
+    virtual std::vector<tl::expected<QueryResult, ErrorCode>> batch_query(
+        const std::vector<std::string> &keys) = 0;
 
     virtual std::vector<int64_t> batch_get_into(
-        const std::vector<std::string>& keys, const std::vector<void*>& buffers,
-        const std::vector<size_t>& sizes,
-        const ReadRouteConfig& config = {}) = 0;
+        const std::vector<std::string> &keys,
+        const std::vector<void *> &buffers,
+        const std::vector<size_t> &sizes) = 0;
 
     virtual std::vector<int> batch_get_into_multi_buffers(
-        const std::vector<std::string>& keys,
-        const std::vector<std::vector<void*>>& all_buffers,
-        const std::vector<std::vector<size_t>>& all_sizes,
-        bool aggregate_same_segment_task,
-        const ReadRouteConfig& config = {}) = 0;
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        bool prefer_same_node) = 0;
 
-    virtual int put_from(const std::string& key, void* buffer, size_t size,
-                         const WriteConfig& config) = 0;
+    virtual int put_from(const std::string &key, void *buffer, size_t size,
+                         const ReplicateConfig &config = ReplicateConfig{}) = 0;
 
-    virtual int put_from_with_metadata(const std::string& key, void* buffer,
-                                       void* metadata_buffer, size_t size,
-                                       size_t metadata_size,
-                                       const WriteConfig& config) = 0;
+    virtual int put_from_with_metadata(
+        const std::string &key, void *buffer, void *metadata_buffer,
+        size_t size, size_t metadata_size,
+        const ReplicateConfig &config = ReplicateConfig{}) = 0;
 
     virtual std::vector<int> batch_put_from(
-        const std::vector<std::string>& keys, const std::vector<void*>& buffers,
-        const std::vector<size_t>& sizes, const WriteConfig& config) = 0;
+        const std::vector<std::string> &keys,
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        const ReplicateConfig &config = ReplicateConfig{}) = 0;
 
     virtual std::vector<int> batch_put_from_multi_buffers(
-        const std::vector<std::string>& keys,
-        const std::vector<std::vector<void*>>& all_buffers,
-        const std::vector<std::vector<size_t>>& all_sizes,
-        const WriteConfig& config) = 0;
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> &all_buffers,
+        const std::vector<std::vector<size_t>> &all_sizes,
+        const ReplicateConfig &config = ReplicateConfig{}) = 0;
+
+    // Put/get sessions. Default stubs keep DummyClient unchanged; RealClient
+    // overrides with the real implementations.
+    virtual std::vector<int> batch_get_session_start(
+        const std::vector<std::string> &keys) {
+        return std::vector<int>(
+            keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
+    }
+
+    virtual std::vector<int> batch_get_into_multi_buffer_ranges(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> & /*all_buffers*/,
+        const std::vector<std::vector<size_t>> & /*all_sizes*/,
+        const std::vector<std::vector<size_t>> & /*all_src_offsets*/) {
+        return std::vector<int>(
+            keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
+    }
+
+    virtual int batch_get_session_end(
+        const std::vector<std::string> & /*keys*/) {
+        return static_cast<int>(toInt(ErrorCode::INVALID_PARAMS));
+    }
+
+    virtual std::vector<int> batch_put_session_start(
+        const std::vector<std::string> &keys,
+        const std::vector<size_t> & /*sizes*/,
+        const ReplicateConfig & /*config*/ = ReplicateConfig{}) {
+        return std::vector<int>(
+            keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
+    }
+
+    virtual std::vector<int> batch_put_from_multi_buffer_ranges(
+        const std::vector<std::string> &keys,
+        const std::vector<std::vector<void *>> & /*all_buffers*/,
+        const std::vector<std::vector<size_t>> & /*all_sizes*/,
+        const std::vector<std::vector<size_t>> & /*all_dst_offsets*/) {
+        return std::vector<int>(
+            keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
+    }
+
+    virtual std::vector<int> batch_put_session_end(
+        const std::vector<std::string> &keys) {
+        return std::vector<int>(
+            keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
+    }
+
+    virtual std::vector<int> batch_put_session_revoke(
+        const std::vector<std::string> &keys) {
+        return std::vector<int>(
+            keys.size(), static_cast<int>(toInt(ErrorCode::INVALID_PARAMS)));
+    }
 
     virtual std::shared_ptr<BufferHandle> get_buffer(
-        const std::string& key, const ReadRouteConfig& config = {}) = 0;
-
-    virtual std::tuple<uint64_t, size_t> get_buffer_info(
-        const std::string& key, const ReadRouteConfig& config = {}) = 0;
+        const std::string &key) = 0;
 
     virtual std::vector<std::shared_ptr<BufferHandle>> batch_get_buffer(
-        const std::vector<std::string>& keys,
-        const ReadRouteConfig& config = {}) = 0;
+        const std::vector<std::string> &keys) = 0;
 
-    virtual int put_parts(const std::string& key,
-                          std::vector<std::span<const char>> values,
-                          const WriteConfig& config) = 0;
+    virtual int put_parts(
+        const std::string &key, std::vector<std::span<const char>> values,
+        const ReplicateConfig &config = ReplicateConfig{}) = 0;
 
-    virtual int put_batch(const std::vector<std::string>& keys,
-                          const std::vector<std::span<const char>>& values,
-                          const WriteConfig& config) = 0;
+    virtual int put_batch(
+        const std::vector<std::string> &keys,
+        const std::vector<std::span<const char>> &values,
+        const ReplicateConfig &config = ReplicateConfig{}) = 0;
+
+    virtual int upsert(const std::string &key, std::span<const char> value,
+                       const ReplicateConfig &config = ReplicateConfig{}) = 0;
+
+    virtual int upsert_from(
+        const std::string &key, void *buffer, size_t size,
+        const ReplicateConfig &config = ReplicateConfig{}) = 0;
+
+    virtual std::vector<int> batch_upsert_from(
+        const std::vector<std::string> &keys,
+        const std::vector<void *> &buffers, const std::vector<size_t> &sizes,
+        const ReplicateConfig &config = ReplicateConfig{}) = 0;
+
+    virtual int upsert_parts(
+        const std::string &key, std::vector<std::span<const char>> values,
+        const ReplicateConfig &config = ReplicateConfig{}) = 0;
+
+    virtual int upsert_batch(
+        const std::vector<std::string> &keys,
+        const std::vector<std::span<const char>> &values,
+        const ReplicateConfig &config = ReplicateConfig{}) = 0;
 
     [[nodiscard]] virtual std::string get_hostname() const = 0;
 
-    virtual int remove(const std::string& key, bool force = false) = 0;
+    virtual int remove(const std::string &key, bool force = false) = 0;
 
-    virtual long removeByRegex(const std::string& str, bool force = false) = 0;
+    virtual long removeByRegex(const std::string &str, bool force = false) = 0;
 
     virtual long removeAll(bool force = false) = 0;
 
-    virtual long removeAllLocal() = 0;
+    virtual std::vector<int> batchRemove(const std::vector<std::string> &keys,
+                                         bool force = false) = 0;
 
-    virtual int removeLocal(const std::string& key) = 0;
-
-    virtual int isExist(const std::string& key) = 0;
+    virtual int isExist(const std::string &key) = 0;
 
     virtual std::vector<int> batchIsExist(
-        const std::vector<std::string>& keys) = 0;
+        const std::vector<std::string> &keys) = 0;
 
-    virtual int64_t getSize(const std::string& key) = 0;
+    virtual int64_t getSize(const std::string &key) = 0;
 
     virtual std::map<std::string, std::vector<Replica::Descriptor>>
-    batch_get_replica_desc(const std::vector<std::string>& keys) = 0;
+    batch_get_replica_desc(const std::vector<std::string> &keys) = 0;
     virtual std::vector<Replica::Descriptor> get_replica_desc(
-        const std::string& key) = 0;
+        const std::string &key) = 0;
+
+    virtual std::vector<std::string> batch_replica_clear(
+        const std::vector<std::string> &keys,
+        const std::string &segment_name = "") = 0;
 
     virtual int tearDownAll() = 0;
 
+    virtual int health_check() = 0;
+
     virtual tl::expected<UUID, ErrorCode> create_copy_task(
-        const std::string& key, const std::vector<std::string>& targets) = 0;
+        const std::string &key, const std::vector<std::string> &targets) = 0;
 
     virtual tl::expected<UUID, ErrorCode> create_move_task(
-        const std::string& key, const std::string& source,
-        const std::string& target) = 0;
+        const std::string &key, const std::string &source,
+        const std::string &target) = 0;
 
     virtual tl::expected<QueryTaskResponse, ErrorCode> query_task(
-        const UUID& task_id) = 0;
+        const UUID &task_id) = 0;
 
-    std::shared_ptr<mooncake::ClientService> client_service_ = nullptr;
+    virtual std::optional<BufferHandle> allocate_client_buffer(size_t size) {
+        if (!client_buffer_allocator_) {
+            return std::nullopt;
+        }
+        return client_buffer_allocator_->allocate(size);
+    }
+
+    std::shared_ptr<mooncake::ClientService> client_ = nullptr;
+    std::shared_ptr<mooncake::ClientRequester> client_requester_ = nullptr;
+    std::shared_ptr<mooncake::FileStorage> file_storage_ = nullptr;
+    std::shared_ptr<ClientBufferAllocator> client_buffer_allocator_ = nullptr;
 };
+
+inline uint64_t remaining_lease_ttl_ms(
+    const QueryResult &query_result,
+    std::chrono::steady_clock::time_point now) {
+    if (query_result.IsLeaseExpired(now)) {
+        return 0;
+    }
+    return static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            query_result.lease_timeout - now)
+            .count());
+}
+
+inline CachedQueryResultResponse to_cached_query_result_response(
+    const tl::expected<QueryResult, ErrorCode> &query_result,
+    std::chrono::steady_clock::time_point now) {
+    if (!query_result) {
+        return CachedQueryResultResponse(query_result.error());
+    }
+    if (query_result->IsLeaseExpired(now)) {
+        return CachedQueryResultResponse(ErrorCode::OBJECT_NOT_FOUND);
+    }
+    return CachedQueryResultResponse(GetReplicaListResponse(
+        std::vector<Replica::Descriptor>(query_result->replicas.begin(),
+                                         query_result->replicas.end()),
+        remaining_lease_ttl_ms(*query_result, now),
+        query_result->object_checksum));
+}
+
+inline tl::expected<QueryResult, ErrorCode> from_cached_query_result_response(
+    const CachedQueryResultResponse &cached_result,
+    std::chrono::steady_clock::time_point now) {
+    if (!cached_result.success) {
+        return tl::make_unexpected(cached_result.error);
+    }
+    return QueryResult(
+        std::vector<Replica::Descriptor>(cached_result.value.replicas.begin(),
+                                         cached_result.value.replicas.end()),
+        now + std::chrono::milliseconds(cached_result.value.lease_ttl_ms),
+        cached_result.value.object_checksum);
+}
+
+inline PyClient::QueryResultCache build_query_result_cache_from_cached_results(
+    const std::map<std::string, CachedQueryResultResponse>
+        &cached_query_results) {
+    PyClient::QueryResultCache query_result_cache;
+    query_result_cache.reserve(cached_query_results.size());
+    auto now = std::chrono::steady_clock::now();
+    for (const auto &[key, cached_result] : cached_query_results) {
+        auto query_result =
+            from_cached_query_result_response(cached_result, now);
+        if (!query_result || query_result->IsLeaseExpired(now)) {
+            continue;
+        }
+        query_result_cache.emplace(key, std::move(query_result));
+    }
+    return query_result_cache;
+}
+
+inline std::map<std::string, CachedQueryResultResponse>
+build_cached_query_results_from_query_result_cache(
+    const PyClient::QueryResultCache *query_result_cache) {
+    std::map<std::string, CachedQueryResultResponse> cached_query_results;
+    if (query_result_cache == nullptr) {
+        return cached_query_results;
+    }
+
+    auto now = std::chrono::steady_clock::now();
+    for (const auto &[key, query_result] : *query_result_cache) {
+        if (query_result && query_result->IsLeaseExpired(now)) {
+            continue;
+        }
+        cached_query_results.emplace(
+            key, to_cached_query_result_response(query_result, now));
+    }
+    return cached_query_results;
+}
 
 }  // namespace mooncake

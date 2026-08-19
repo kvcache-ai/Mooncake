@@ -1,5 +1,4 @@
 from enum import Enum
-from time import sleep
 from aiohttp import web
 import threading
 import asyncio

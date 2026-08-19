@@ -35,6 +35,8 @@
 #include "transfer_metadata.h"
 
 namespace mooncake {
+
+class RdmaEndPoint;
 class TransferMetadata;
 /// By default, these functions return 0 (or non-null pointer) on success and
 /// return -1 (or null pointer) on failure. The errno is set accordingly on
@@ -58,12 +60,18 @@ class Transport {
     struct TransferRequest {
         enum OpCode { READ, WRITE };
 
+        static constexpr uint64_t kNoTaskGroup = 0;
+
         OpCode opcode;
         void *source;
         SegmentID target_id;
         uint64_t target_offset;
         size_t length;
         int advise_retry_cnt = 0;
+        // Per-request transport pin, TENT only.
+        int transport_hint = 0;
+        // Adjacent requests in the same group are one transport submission.
+        uint64_t task_group_id = kNoTaskGroup;
     };
 
     enum TransferStatusEnum {
@@ -79,6 +87,12 @@ class Transport {
     struct TransferStatus {
         TransferStatusEnum s;
         size_t transferred_bytes;
+    };
+
+    struct NicLoadStats {
+        std::string device_name;
+        uint64_t inflight_bytes{0};
+        double ewma_bandwidth_bps{0.0};
     };
 
     struct BatchDesc;
@@ -109,25 +123,55 @@ class Transport {
         TransferRequest::OpCode opcode;
         SegmentID target_id;
         std::string peer_nic_path;
+        std::string source_location;
         SliceStatus status;
         TransferTask *task;
-        std::vector<uint32_t> dest_rkeys;
+        // EFA/CXI's libfabric MR keys are 64-bit (fi_mr_key()); RDMA verbs keys
+        // are 32-bit. Use a scoped alias so the width is defined in one place.
+#if defined(USE_EFA) || defined(USE_CXI)
+        using mr_key_t = uint64_t;
+#else
+        using mr_key_t = uint32_t;
+#endif
+        std::vector<mr_key_t> dest_rkeys;
         bool from_cache;
+
+        // Optional resource cleanup invoked exactly once before the slice is
+        // deleted or returned to the thread-local cache. The callback must not
+        // delete the slice.
+        using CleanupCallback = void (*)(Slice *);
+        CleanupCallback cleanup_callback = nullptr;
 
         union {
             struct {
                 uint64_t dest_addr;
-                uint32_t source_lkey;
-                uint32_t dest_rkey;
+                mr_key_t source_lkey;
+                mr_key_t dest_rkey;
                 int lkey_index;
                 int rkey_index;
-                volatile int *qp_depth;
+                std::atomic<int> *qp_depth;
                 uint32_t retry_cnt;
                 uint32_t max_retry_cnt;
+                RdmaEndPoint *endpoint;  // Endpoint used for this transfer
             } rdma;
             struct {
+                uint64_t dest_addr;
+                volatile int *jetty_depth;
+                uint32_t retry_cnt;
+                uint32_t max_retry_cnt;
+                void *r_seg;
+                void *l_seg;
+                void *endpoint;
+            } ub;
+            struct {
                 void *dest_addr;
+                void *cuda_stream;  // cudaStream_t, used by async NVLink
+                                    // transport
             } local;
+            struct {
+                void *event;  // cudaEvent_t
+                int device_id;
+            } nccl;
             struct {
                 uint64_t dest_addr;
             } tcp;
@@ -147,6 +191,7 @@ class Transport {
                 uint64_t dest_addr;
                 void *handle;
                 int64_t start_time;
+                int32_t engine_id;
             } ascend_direct;
             struct {
                 uint64_t dest_addr;
@@ -237,11 +282,6 @@ class Transport {
             for (uint64_t i = tail_; i != head_; i++) {
                 auto slice = lazy_delete_slices_[i % kLazyDeleteSliceCapacity];
                 delete slice;
-                freed_++;
-            }
-            if (allocated_ != freed_) {
-                LOG(WARNING) << "detected slice leak: allocated " << allocated_
-                             << " freed " << freed_;
             }
         }
 
@@ -249,7 +289,6 @@ class Transport {
             Slice *slice;
 
             if (head_ - tail_ == 0) {
-                allocated_++;
                 slice = new Slice();
                 slice->from_cache = false;
             } else {
@@ -262,9 +301,14 @@ class Transport {
         }
 
         void deallocate(Slice *slice) {
+            // Clear before invoking so a cached slice cannot carry a
+            // transport-specific cleanup callback into its next use.
+            auto cleanup = slice->cleanup_callback;
+            slice->cleanup_callback = nullptr;
+            if (cleanup) cleanup(slice);
+
             if (head_ - tail_ == kLazyDeleteSliceCapacity) {
                 delete slice;
-                freed_++;
                 return;
             }
             lazy_delete_slices_[head_ % kLazyDeleteSliceCapacity] = slice;
@@ -274,7 +318,6 @@ class Transport {
         const static size_t kLazyDeleteSliceCapacity = 4096;
         std::vector<Slice *> lazy_delete_slices_;
         uint64_t head_, tail_;
-        uint64_t allocated_ = 0, freed_ = 0;
     };
 
     struct TransferTask {
@@ -285,6 +328,12 @@ class Transport {
         volatile bool is_finished = false;
         uint64_t total_bytes = 0;
         BatchID batch_id = 0;
+
+        // Pointer to the transport that handles this task, set by
+        // MultiTransport::submitTransfer(). Used to delegate
+        // transport-specific completion polling (e.g., CUDA stream
+        // query for NVLink async transfers) in getTransferStatus().
+        Transport *transport_ = nullptr;
 
 #ifdef WITH_METRICS
         std::chrono::steady_clock::time_point start_time;
@@ -352,6 +401,11 @@ class Transport {
         const std::vector<TransferTask *> &task_list) {
         return Status::NotImplemented(
             "Transport::submitTransferTask is not implemented");
+    }
+
+    virtual Status submitTransferTaskGroup(
+        const std::vector<TransferTask *> &task_list) {
+        return submitTransferTask(task_list);
     }
 
     /// @brief Get the status of a submitted transfer. This function shall not

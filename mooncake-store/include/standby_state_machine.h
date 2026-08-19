@@ -108,10 +108,9 @@ inline const char* StandbyStateToString(StandbyState state) {
  */
 enum class StandbyEvent : uint8_t {
     // User/system actions
-    START,          // Start() called
-    STOP,           // Stop() called
-    PROMOTE,        // Promote() called
-    FORCE_PROMOTE,  // Operator-approved promotion from a degraded standby
+    START,    // Start() called
+    STOP,     // Stop() called
+    PROMOTE,  // Promote() called
 
     // Connection events
     CONNECTED,          // Successfully connected to etcd
@@ -123,9 +122,8 @@ enum class StandbyEvent : uint8_t {
     SYNC_FAILED,    // Sync failed
 
     // Watch events
-    WATCH_HEALTHY,    // Watch is healthy and receiving events
-    WATCH_BROKEN,     // Watch connection broken
-    RESYNC_REQUIRED,  // OpLog history was trimmed; full bootstrap is required
+    WATCH_HEALTHY,  // Watch is healthy and receiving events
+    WATCH_BROKEN,   // Watch connection broken
 
     // Recovery events
     RECOVERY_SUCCESS,  // Successfully recovered from error
@@ -148,8 +146,6 @@ inline const char* StandbyEventToString(StandbyEvent event) {
             return "STOP";
         case StandbyEvent::PROMOTE:
             return "PROMOTE";
-        case StandbyEvent::FORCE_PROMOTE:
-            return "FORCE_PROMOTE";
         case StandbyEvent::CONNECTED:
             return "CONNECTED";
         case StandbyEvent::CONNECTION_FAILED:
@@ -164,8 +160,6 @@ inline const char* StandbyEventToString(StandbyEvent event) {
             return "WATCH_HEALTHY";
         case StandbyEvent::WATCH_BROKEN:
             return "WATCH_BROKEN";
-        case StandbyEvent::RESYNC_REQUIRED:
-            return "RESYNC_REQUIRED";
         case StandbyEvent::RECOVERY_SUCCESS:
             return "RECOVERY_SUCCESS";
         case StandbyEvent::RECOVERY_FAILED:
