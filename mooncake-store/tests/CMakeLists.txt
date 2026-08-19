@@ -133,6 +133,12 @@ add_store_test(tenant_quota_test tenant_quota_test.cpp)
 add_store_test(tenant_quota_ledger_test tenant_quota_ledger_test.cpp)
 add_store_test(tenant_id_test tenant_id_test.cpp)
 add_store_test(segment_test segment_test.cpp)
+add_executable(local_ssd_test local_ssd/local_ssd_test.cpp)
+target_include_directories(local_ssd_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(local_ssd_test PRIVATE mooncake_local_ssd gtest
+                                             gtest_main)
+add_test(NAME local_ssd_test COMMAND local_ssd_test)
+add_store_test(local_ssd_codec_test ha/snapshot/local_ssd_codec_test.cpp)
 add_store_test(offset_allocator_test offset_allocator_test.cpp)
 add_store_test(utils_test utils_test.cpp)
 add_store_test(client_buffer_test client_buffer_test.cpp)
@@ -286,6 +292,8 @@ add_ha_test(standby_state_machine_test
             ha/standby/standby_state_machine_test.cpp)
 add_ha_test(ha_metric_manager_test ha/standby/ha_metric_manager_test.cpp)
 add_ha_test(hot_standby_service_test ha/standby/hot_standby_service_test.cpp)
+add_ha_test(standby_metadata_store_test
+            ha/standby/standby_metadata_store_test.cpp)
 add_ha_test(hot_standby_snapshot_bootstrap_test
             ha/standby/hot_standby_snapshot_bootstrap_test.cpp)
 add_ha_test(oplog_applier_test ha/oplog/oplog_applier_test.cpp)

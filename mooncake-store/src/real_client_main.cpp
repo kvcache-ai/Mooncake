@@ -133,8 +133,8 @@ int main(int argc, char *argv[]) {
         FLAGS_master_server_address, nullptr,
         "@mooncake_client_" + std::to_string(FLAGS_port) + ".sock", FLAGS_port,
         FLAGS_enable_offload,
-        /*start_offload_rpc_server=*/false, "",
-        FLAGS_tenant_id, FLAGS_enable_http_server, FLAGS_http_port);
+        /*start_offload_rpc_server=*/false, "", FLAGS_tenant_id,
+        FLAGS_enable_http_server, FLAGS_http_port);
     if (!res) {
         LOG(FATAL) << "Failed to setup client: " << toString(res.error());
         return -1;
@@ -147,9 +147,9 @@ int main(int argc, char *argv[]) {
 
     auto rpc_bind_host = getHostNameWithoutPort(FLAGS_host);
     coro_rpc::coro_rpc_server server(FLAGS_threads, FLAGS_port, rpc_bind_host);
-    RegisterClientRpcService(server, *client_inst,
-                             FLAGS_enable_offload &&
-                                 FLAGS_start_offload_rpc_server);
+    RegisterClientRpcService(
+        server, *client_inst,
+        FLAGS_enable_offload && FLAGS_start_offload_rpc_server);
 
     LOG(INFO) << "Starting real client service on " << rpc_bind_host << ":"
               << FLAGS_port;

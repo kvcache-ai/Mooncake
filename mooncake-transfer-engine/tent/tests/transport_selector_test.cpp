@@ -1074,6 +1074,117 @@ TEST(TransportSelectorTest, ExplicitPolicyNameOverridesIntentFilter) {
     EXPECT_EQ(selector.select(ctx, transports).transport, TCP);
 }
 
+// ---------------------------------------------------------------------------
+// Device mask resolution (names -> mask, once, at setTopology)
+// ---------------------------------------------------------------------------
+
+std::shared_ptr<Config> configWithDeviceList(
+    const std::vector<std::string>& devices) {
+    json policy;
+    policy["name"] = "device_pinned";
+    policy["segment_type"] = "memory";
+    policy["transports"] = {"tcp"};
+    policy["devices"] = devices;
+
+    auto conf = std::make_shared<Config>();
+    conf->set("policy", json::array({policy}));
+    return conf;
+}
+
+std::shared_ptr<Topology> topologyWithNics(size_t count) {
+    auto topology = std::make_shared<Topology>();
+    for (size_t i = 0; i < count; ++i) {
+        Topology::NicEntry nic;
+        nic.name = "mlx5_" + std::to_string(i);
+        nic.type = Topology::NIC_RDMA;
+        topology->nic_list_.push_back(nic);
+    }
+    return topology;
+}
+
+uint64_t selectDeviceMask(TransportSelector& selector) {
+    std::array<std::shared_ptr<Transport>, kSupportedTransportTypes>
+        transports{};
+    transports[TCP] = std::make_shared<FakeTransport>(TCP);
+    static_cast<FakeTransport*>(transports[TCP].get())->setDramToDram(true);
+
+    SelectionContext ctx;
+    ctx.segment_type = SegmentType::Memory;
+    ctx.same_machine = false;
+    ctx.local_memory_type = MTYPE_CPU;
+    ctx.remote_memory_type = MTYPE_CPU;
+    ctx.transfer_size = 4096;
+    ctx.priority_level = PRIO_HIGH;
+    ctx.buffer_transports = nullptr;
+    return selector.select(ctx, transports).device_mask;
+}
+
+TEST(TransportSelectorTest, DeviceMaskResolvesNamedNics) {
+    TransportSelector selector(configWithDeviceList({"mlx5_1", "mlx5_3"}));
+    selector.setTopology(topologyWithNics(4));
+
+    EXPECT_EQ(selectDeviceMask(selector), (1ULL << 1) | (1ULL << 3));
+}
+
+// The mask is resolved at setTopology, so it must be stable no matter how many
+// times select() runs -- this is the regression guard for resolving (and
+// re-logging) per request.
+TEST(TransportSelectorTest, DeviceMaskIsStableAcrossSelects) {
+    TransportSelector selector(configWithDeviceList({"mlx5_0"}));
+    selector.setTopology(topologyWithNics(4));
+
+    EXPECT_EQ(selectDeviceMask(selector), 1ULL << 0);
+    EXPECT_EQ(selectDeviceMask(selector), 1ULL << 0);
+    EXPECT_EQ(selectDeviceMask(selector), 1ULL << 0);
+}
+
+// A replaced topology must re-resolve; a stale mask would name the wrong NICs.
+TEST(TransportSelectorTest, DeviceMaskReresolvesOnNewTopology) {
+    TransportSelector selector(configWithDeviceList({"mlx5_2"}));
+
+    selector.setTopology(topologyWithNics(4));
+    EXPECT_EQ(selectDeviceMask(selector), 1ULL << 2);
+
+    // Same name, fewer NICs: mlx5_2 no longer exists, so the filter empties
+    // and falls open rather than pinning a NIC id that is now someone else's.
+    selector.setTopology(topologyWithNics(2));
+    EXPECT_EQ(selectDeviceMask(selector), ~0ULL);
+}
+
+// Fail-open is deliberate: a typo must not stop transfers. The behavior is
+// pinned here so it stays a decision rather than drifting into a hard failure.
+TEST(TransportSelectorTest, DeviceMaskFailsOpenWhenNothingResolves) {
+    TransportSelector selector(configWithDeviceList({"nope_0", "nope_1"}));
+    selector.setTopology(topologyWithNics(4));
+
+    EXPECT_EQ(selectDeviceMask(selector), ~0ULL);
+}
+
+// Partially unresolved: the names that do resolve still restrict the mask.
+TEST(TransportSelectorTest, DeviceMaskKeepsResolvedNamesOnPartialFailure) {
+    TransportSelector selector(configWithDeviceList({"mlx5_1", "nope"}));
+    selector.setTopology(topologyWithNics(4));
+
+    EXPECT_EQ(selectDeviceMask(selector), 1ULL << 1);
+}
+
+// device_mask is 64 bits wide, so a NIC at index >= 64 cannot be named. It is
+// dropped from the mask, not silently promoted to "all devices".
+TEST(TransportSelectorTest, DeviceMaskDropsNicsPastMaskWidth) {
+    TransportSelector selector(configWithDeviceList({"mlx5_0", "mlx5_64"}));
+    selector.setTopology(topologyWithNics(66));
+
+    EXPECT_EQ(selectDeviceMask(selector), 1ULL << 0);
+}
+
+// No topology bound: nothing to resolve names against, so the policy cannot
+// restrict anything and must not restrict everything either.
+TEST(TransportSelectorTest, DeviceMaskAllowsAllWithoutTopology) {
+    TransportSelector selector(configWithDeviceList({"mlx5_0"}));
+
+    EXPECT_EQ(selectDeviceMask(selector), ~0ULL);
+}
+
 }  // namespace
 }  // namespace tent
 }  // namespace mooncake

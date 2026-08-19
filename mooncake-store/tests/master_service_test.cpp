@@ -169,6 +169,26 @@ class MasterServiceTest : public ::testing::Test {
         return service.soft_pin_deadline_index_.RegistrationCountForTest();
     }
 
+    std::optional<uint32_t> GetReplicaRefcntBySegmentName(
+        MasterService& service, const std::string& key,
+        const std::string& segment_name) {
+        MasterService::MetadataAccessorRO accessor(
+            &service,
+            service.MakeObjectIdentityForRequest(key, TenantId::Default()));
+        if (!accessor.Exists()) {
+            return std::nullopt;
+        }
+
+        for (const auto& replica : accessor.Get().GetAllReplicas()) {
+            for (const auto& name : replica.get_segment_names()) {
+                if (name.has_value() && *name == segment_name) {
+                    return replica.get_refcnt();
+                }
+            }
+        }
+        return std::nullopt;
+    }
+
     void UpsertSoftPinDeadlineIndexForTest(
         MasterService& service, const std::string& key, size_t shard_idx,
         const std::chrono::system_clock::time_point& deadline,
@@ -3464,6 +3484,61 @@ TEST_F(MasterServiceTest, MoveEnd) {
     move_end_result = service_->MoveEnd(client_id, key, TenantId::Default());
     EXPECT_FALSE(move_end_result.has_value());
     EXPECT_EQ(ErrorCode::REPLICA_IS_GONE, move_end_result.error());
+
+    // Remount segment_2 for target-gone test.
+    const auto remounted_context2 =
+        PrepareSimpleSegment(*service_, "segment_2");
+
+    // Put another object with 1 replica on segment_1 for target-gone test.
+    std::string target_gone_key = "target_gone_key";
+    config.preferred_segment = "segment_1";
+    put_start_result = service_->PutStart(
+        client_id, target_gone_key, TenantId::Default(), slice_length, config);
+    ASSERT_TRUE(put_start_result.has_value());
+    put_end_result = service_->PutEnd(client_id, target_gone_key,
+                                      TenantId::Default(), ReplicaType::MEMORY);
+    ASSERT_TRUE(put_end_result.has_value());
+
+    // MoveStart the object from segment_1 to segment_2, then unmount
+    // segment_2
+    move_start_result =
+        service_->MoveStart(client_id, target_gone_key, TenantId::Default(),
+                            "segment_1", "segment_2");
+    ASSERT_TRUE(move_start_result.has_value());
+
+    // Unmount segment_2 to simulate target gone
+    unmount_result = service_->UnmountSegment(remounted_context2.segment_id,
+                                              remounted_context2.client_id);
+    ASSERT_TRUE(unmount_result.has_value());
+
+    // Test Case 7: MoveEnd, should fail because the target is gone, but the
+    // source refcnt must be released before the move task is erased.
+    move_end_result =
+        service_->MoveEnd(client_id, target_gone_key, TenantId::Default());
+    EXPECT_FALSE(move_end_result.has_value());
+    EXPECT_EQ(ErrorCode::REPLICA_IS_GONE, move_end_result.error());
+
+    const auto source_refcnt =
+        GetReplicaRefcntBySegmentName(*service_, target_gone_key, "segment_1");
+    ASSERT_TRUE(source_refcnt.has_value());
+    EXPECT_EQ(0, source_refcnt.value());
+
+    auto upsert_start_result = service_->UpsertStart(
+        client_id, target_gone_key, TenantId::Default(), slice_length, config);
+    EXPECT_TRUE(upsert_start_result.has_value());
+
+    auto move_revoke_result =
+        service_->MoveRevoke(client_id, target_gone_key, TenantId::Default());
+    EXPECT_FALSE(move_revoke_result.has_value());
+    EXPECT_EQ(ErrorCode::OBJECT_NO_REPLICATION_TASK,
+              move_revoke_result.error());
+
+    if (upsert_start_result.has_value()) {
+        EXPECT_TRUE(service_
+                        ->UpsertRevoke(client_id, target_gone_key,
+                                       TenantId::Default(), ReplicaType::MEMORY)
+                        .has_value());
+    }
 }
 
 TEST_F(MasterServiceTest, MoveRevoke) {

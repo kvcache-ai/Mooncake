@@ -34,6 +34,9 @@ class PutOperation;
 class DistributedStorageBackend;
 class RealClient;
 
+std::optional<size_t> GetTransportRegistrationLimit(
+    const std::string& protocol);
+
 /**
  * @brief Result of a query operation containing replica information and lease
  * timeout

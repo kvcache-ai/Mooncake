@@ -423,6 +423,7 @@ class TestMooncakeConfigValidation(unittest.TestCase):
             "  rdma  ": "rdma",
             "cxl": "cxl",
             "ascend": "ascend",
+            "musa": "musa",
             "nvlink_intra": "nvlink_intra",
             "ub": "ub",
             "ubshmem": "ubshmem",

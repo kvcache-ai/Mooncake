@@ -3,10 +3,11 @@
 #include <gtest/gtest.h>
 
 #include <csignal>
+#include <chrono>
 #include <memory>
+#include <set>
 #include <string>
 #include <thread>
-#include <chrono>
 #include <vector>
 
 #include <ylt/coro_http/coro_http_client.hpp>
@@ -33,6 +34,10 @@ namespace mooncake {
 namespace testing {
 
 namespace {
+
+constexpr char kClient1Endpoint[] = "127.0.0.1:18001";
+constexpr char kClient2Endpoint[] = "127.0.0.1:18002";
+constexpr char kClient3Endpoint[] = "127.0.0.1:18003";
 
 struct HttpCreateDrainJobResponse {
     bool success{false};
@@ -133,7 +138,7 @@ class TaskExecutorIntegrationTest : public ::testing::Test {
     void SetUp() override {
         // Create client 1
         auto client1_opt = Client::Create(
-            "127.0.0.1:18001",
+            kClient1Endpoint,
             metadata_url_.empty() ? "P2PHANDSHAKE" : metadata_url_,
             FLAGS_protocol,
             FLAGS_device_name.empty() ? std::nullopt
@@ -144,7 +149,7 @@ class TaskExecutorIntegrationTest : public ::testing::Test {
 
         // Create client 2
         auto client2_opt = Client::Create(
-            "127.0.0.1:18002",
+            kClient2Endpoint,
             metadata_url_.empty() ? "P2PHANDSHAKE" : metadata_url_,
             FLAGS_protocol,
             FLAGS_device_name.empty() ? std::nullopt
@@ -181,11 +186,6 @@ class TaskExecutorIntegrationTest : public ::testing::Test {
 
         // Wait for segments to be registered and clients to ping master
         std::this_thread::sleep_for(std::chrono::milliseconds(1000));
-
-        // Client IDs will be extracted from task assignments when tasks are
-        // created For now, initialize with placeholder values
-        client1_id_ = generate_uuid();
-        client2_id_ = generate_uuid();
     }
 
     void TearDown() override {
@@ -197,21 +197,37 @@ class TaskExecutorIntegrationTest : public ::testing::Test {
             free(client2_segment_ptr_);
             client2_segment_ptr_ = nullptr;
         }
+        if (client3_ && client3_segment_ptr_) {
+            free(client3_segment_ptr_);
+            client3_segment_ptr_ = nullptr;
+        }
     }
 
     static void CleanupClients() {
         // Clients will be cleaned up by shared_ptr
     }
 
-    // Helper to extract client_id from task assignment
-    // When a task is created, we can query it to see which client it's assigned
-    // to
-    UUID GetClientIdFromTask(const UUID& task_id) {
-        auto query_result = master_client_->QueryTask(task_id);
-        if (query_result.has_value()) {
-            return query_result.value().assigned_client;
-        }
-        return generate_uuid();  // Fallback
+    void MountThirdClientSegment() {
+        auto client3_opt = Client::Create(
+            kClient3Endpoint,
+            metadata_url_.empty() ? "P2PHANDSHAKE" : metadata_url_,
+            FLAGS_protocol,
+            FLAGS_device_name.empty() ? std::nullopt
+                                      : std::make_optional(FLAGS_device_name),
+            master_address_);
+        ASSERT_TRUE(client3_opt.has_value());
+        client3_ = client3_opt.value();
+
+        constexpr size_t kSegmentSize = 256 * 1024 * 1024;
+        client3_segment_ptr_ = allocate_buffer_allocator_memory(kSegmentSize);
+        ASSERT_NE(client3_segment_ptr_, nullptr);
+        auto mount_result =
+            client3_->MountSegment(client3_segment_ptr_, kSegmentSize);
+        ASSERT_TRUE(mount_result.has_value())
+            << "Failed to mount segment for client3: "
+            << toString(mount_result.error());
+
+        std::this_thread::sleep_for(std::chrono::milliseconds(1000));
     }
 
     // Wait for task to complete by polling task status
@@ -296,27 +312,25 @@ class TaskExecutorIntegrationTest : public ::testing::Test {
         return false;
     }
 
-    // Get segment name from a query result
-    // Note: segment name is typically the client's hostname (e.g.,
-    // "127.0.0.1:18001")
-    std::string GetSegmentNameFromQuery(const QueryResult& query_result) {
-        if (query_result.replicas.empty()) {
-            return "";
-        }
+    void ExpectReplicaEndpoints(
+        const std::string& key,
+        const std::set<std::string>& expected_endpoints) {
+        auto query_result = client1_->Query(key);
+        ASSERT_TRUE(query_result.has_value())
+            << "Failed to query replicas for key=" << key << ": "
+            << toString(query_result.error());
+        ASSERT_EQ(query_result->replicas.size(), expected_endpoints.size())
+            << "Unexpected replica count for key=" << key;
 
-        const auto& replica = query_result.replicas[0];
-        if (replica.is_memory_replica()) {
-            // Try to get segment name from the replica descriptor
-            // For memory replicas, the segment name is stored in the buffer
-            // descriptor but transport_endpoint_ might not match segment name
-            // We need to extract it from the replica's segment information
-            const auto& mem_desc = replica.get_memory_descriptor();
-            // The segment name is typically embedded in the buffer descriptor
-            // For now, use transport_endpoint_ as a fallback, but we should
-            // verify it matches the actual segment name used during mount
-            return mem_desc.buffer_descriptor.transport_endpoint_;
+        std::set<std::string> actual_endpoints;
+        for (const auto& replica : query_result->replicas) {
+            ASSERT_TRUE(replica.is_memory_replica())
+                << "Expected memory replica for key=" << key;
+            actual_endpoints.insert(replica.get_memory_descriptor()
+                                        .buffer_descriptor.transport_endpoint_);
         }
-        return "";
+        EXPECT_EQ(actual_endpoints, expected_endpoints)
+            << "Unexpected replica placement for key=" << key;
     }
 
    protected:
@@ -326,13 +340,12 @@ class TaskExecutorIntegrationTest : public ::testing::Test {
 
     std::shared_ptr<Client> client1_;
     std::shared_ptr<Client> client2_;
+    std::shared_ptr<Client> client3_;
     std::unique_ptr<MasterClient> master_client_;
-
-    UUID client1_id_;
-    UUID client2_id_;
 
     void* client1_segment_ptr_ = nullptr;
     void* client2_segment_ptr_ = nullptr;
+    void* client3_segment_ptr_ = nullptr;
 };
 
 InProcMaster TaskExecutorIntegrationTest::master_;
@@ -353,7 +366,8 @@ TEST_F(TaskExecutorIntegrationTest, ReplicaCopyCompleteFlow) {
     std::vector<Slice> slices;
     slices.emplace_back(test_data.data(), test_data.size());
     ReplicateConfig config;
-    config.replica_num = 1;  // Start with 1 replica on client1
+    config.replica_num = 1;
+    config.preferred_segment = kClient1Endpoint;
 
     auto put_result = client1_->Put(test_key, slices, config);
     ASSERT_TRUE(put_result.has_value())
@@ -362,66 +376,25 @@ TEST_F(TaskExecutorIntegrationTest, ReplicaCopyCompleteFlow) {
     // Wait a bit for put to complete
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-    // Step 2: Verify that client1's data was put successfully and get actual
-    // segment name
-    auto client1_query_result = client1_->Query(test_key);
-    ASSERT_TRUE(client1_query_result.has_value())
-        << "Failed to query key for verification";
-    ASSERT_FALSE(client1_query_result.value().replicas.empty())
-        << "No replicas found after Put";
+    ExpectReplicaEndpoints(test_key, {kClient1Endpoint});
 
-    // Extract actual segment name from replica
-    std::string source_segment;
-    const auto& replica = client1_query_result.value().replicas[0];
-    ASSERT_TRUE(replica.is_memory_replica()) << "Expected memory replica";
-    source_segment =
-        replica.get_memory_descriptor().buffer_descriptor.transport_endpoint_;
-    ASSERT_FALSE(source_segment.empty())
-        << "Failed to extract source segment name";
-
-    // Step 3: Determine target segment dynamically (must be different from
-    // source) Choose the other client's segment as target to ensure source !=
-    // target
-    std::string target_segment;
-    if (source_segment == "127.0.0.1:18001") {
-        target_segment = "127.0.0.1:18002";
-    } else if (source_segment == "127.0.0.1:18002") {
-        target_segment = "127.0.0.1:18001";
-    } else {
-        // If source is neither, default to client2's segment
-        target_segment = "127.0.0.1:18002";
-    }
-
-    // Verify source and target are different - this test only covers
-    // inconsistent cases
-    ASSERT_NE(source_segment, target_segment)
-        << "Source and target segments must be different for this test. "
-        << "Source: " << source_segment << ", Target: " << target_segment;
-
-    // Step 4: Create copy task via master
-    std::vector<std::string> targets = {target_segment};
+    // Step 2: Create copy task via master
+    std::vector<std::string> targets = {kClient2Endpoint};
     auto copy_result = master_client_->CreateCopyTask(test_key, targets);
     ASSERT_TRUE(copy_result.has_value())
         << "Failed to create copy task: " << toString(copy_result.error());
 
     UUID task_id = copy_result.value();
 
-    // Step 5: Get the actual client_id from the task assignment
-    client1_id_ = GetClientIdFromTask(task_id);
-
-    // Step 6: Wait for task to be fetched and executed by the assigned client
+    // Step 3: Wait for task to be fetched and executed by the assigned client
     bool task_completed =
         WaitForTaskCompletion(task_id, std::chrono::seconds(30));
     ASSERT_TRUE(task_completed) << "Task did not complete within timeout";
 
-    // Step 7: Verify copy was successful by querying from client2
-    auto client2_query_result = client2_->Query(test_key);
-    ASSERT_TRUE(client2_query_result.has_value())
-        << "Failed to query copied key";
-    ASSERT_FALSE(client2_query_result.value().replicas.empty())
-        << "No replicas found for copied key";
+    // Step 4: Copy adds the target and preserves the source replica.
+    ExpectReplicaEndpoints(test_key, {kClient1Endpoint, kClient2Endpoint});
 
-    // Step 8: Verify data integrity by getting data from client2
+    // Step 5: Verify data integrity.
     std::vector<uint8_t> read_buffer(test_data.size());
     std::vector<Slice> read_slices;
     read_slices.emplace_back(read_buffer.data(), read_buffer.size());
@@ -449,7 +422,8 @@ TEST_F(TaskExecutorIntegrationTest, ReplicaMoveCompleteFlow) {
     std::vector<Slice> slices;
     slices.emplace_back(test_data.data(), test_data.size());
     ReplicateConfig config;
-    config.replica_num = 1;  // Start with 1 replica on client1
+    config.replica_num = 1;
+    config.preferred_segment = kClient1Endpoint;
 
     auto put_result = client1_->Put(test_key, slices, config);
     ASSERT_TRUE(put_result.has_value())
@@ -458,67 +432,25 @@ TEST_F(TaskExecutorIntegrationTest, ReplicaMoveCompleteFlow) {
     // Wait a bit for put to complete
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
 
-    // Step 2: Verify that client1's data was put successfully and get actual
-    // segment name
-    auto query_result = client1_->Query(test_key);
-    ASSERT_TRUE(query_result.has_value())
-        << "Failed to query key for verification";
-    ASSERT_FALSE(query_result.value().replicas.empty())
-        << "No replicas found after Put";
+    ExpectReplicaEndpoints(test_key, {kClient1Endpoint});
 
-    // Extract actual segment name from replica
-    std::string source_segment;
-    const auto& replica = query_result.value().replicas[0];
-    ASSERT_TRUE(replica.is_memory_replica()) << "Expected memory replica";
-    source_segment =
-        replica.get_memory_descriptor().buffer_descriptor.transport_endpoint_;
-    ASSERT_FALSE(source_segment.empty())
-        << "Failed to extract source segment name";
-
-    // Step 3: Determine target segment dynamically (must be different from
-    // source) Choose the other client's segment as target to ensure source !=
-    // target
-    std::string target_segment;
-    if (source_segment == "127.0.0.1:18001") {
-        target_segment = "127.0.0.1:18002";
-    } else if (source_segment == "127.0.0.1:18002") {
-        target_segment = "127.0.0.1:18001";
-    } else {
-        // If source is neither, default to client2's segment
-        target_segment = "127.0.0.1:18002";
-    }
-
-    // Verify source and target are different - this test only covers
-    // inconsistent cases
-    ASSERT_NE(source_segment, target_segment)
-        << "Source and target segments must be different for this test. "
-        << "Source: " << source_segment << ", Target: " << target_segment;
-
-    // Step 4: Create move task via master
-    auto move_result = master_client_->CreateMoveTask(test_key, source_segment,
-                                                      target_segment);
+    // Step 2: Create move task via master
+    auto move_result = master_client_->CreateMoveTask(
+        test_key, kClient1Endpoint, kClient2Endpoint);
     ASSERT_TRUE(move_result.has_value())
         << "Failed to create move task: " << toString(move_result.error());
 
     UUID task_id = move_result.value();
 
-    // Step 5: Get the actual client_id from the task assignment
-    client1_id_ = GetClientIdFromTask(task_id);
-
-    // Step 6: Wait for task to be fetched and executed by the assigned client
+    // Step 3: Wait for task to be fetched and executed by the assigned client
     bool task_completed =
         WaitForTaskCompletion(task_id, std::chrono::seconds(30));
     ASSERT_TRUE(task_completed) << "Task did not complete within timeout";
 
-    // Step 7: Verify move was successful
-    // The replica should now be on client2, not client1
-    auto query_result_client2 = client2_->Query(test_key);
-    ASSERT_TRUE(query_result_client2.has_value())
-        << "Failed to query moved key from client2";
-    ASSERT_FALSE(query_result_client2.value().replicas.empty())
-        << "No replicas found on client2 after move";
+    // Step 4: Move adds the target and removes the source replica.
+    ExpectReplicaEndpoints(test_key, {kClient2Endpoint});
 
-    // Step 8: Verify data integrity
+    // Step 5: Verify data integrity.
     std::vector<uint8_t> read_buffer(test_data.size());
     std::vector<Slice> read_slices;
     read_slices.emplace_back(read_buffer.data(), read_buffer.size());
@@ -532,7 +464,7 @@ TEST_F(TaskExecutorIntegrationTest, ReplicaMoveCompleteFlow) {
     ASSERT_EQ(read_data, test_data) << "Data mismatch after move";
 }
 
-// Test copy to multiple target segments
+// Test complete drain job flow
 TEST_F(TaskExecutorIntegrationTest, DrainJobCompleteFlow) {
     const std::string source_segment = "127.0.0.1:18001";
     const std::string target_segment = "127.0.0.1:18002";
@@ -725,7 +657,8 @@ TEST_F(TaskExecutorIntegrationTest, DrainJobCompleteFlow) {
 }
 
 TEST_F(TaskExecutorIntegrationTest, ReplicaCopyToMultipleTargets) {
-    // Step 1: Put data on client1
+    ASSERT_NO_FATAL_FAILURE(MountThirdClientSegment());
+
     std::string test_key =
         "test_multi_target_copy_key_" +
         std::to_string(
@@ -737,48 +670,17 @@ TEST_F(TaskExecutorIntegrationTest, ReplicaCopyToMultipleTargets) {
     slices.emplace_back(test_data.data(), test_data.size());
     ReplicateConfig config;
     config.replica_num = 1;
+    config.preferred_segment = kClient1Endpoint;
 
     auto put_result = client1_->Put(test_key, slices, config);
     ASSERT_TRUE(put_result.has_value())
         << "Failed to put data: " << toString(put_result.error());
 
     std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    ExpectReplicaEndpoints(test_key, {kClient1Endpoint});
 
-    // Step 2: Get actual source segment
-    auto query_result = client1_->Query(test_key);
-    ASSERT_TRUE(query_result.has_value())
-        << "Failed to query key for verification";
-    ASSERT_FALSE(query_result.value().replicas.empty())
-        << "No replicas found after Put";
-
-    std::string source_segment;
-    const auto& replica = query_result.value().replicas[0];
-    ASSERT_TRUE(replica.is_memory_replica()) << "Expected memory replica";
-    source_segment =
-        replica.get_memory_descriptor().buffer_descriptor.transport_endpoint_;
-    ASSERT_FALSE(source_segment.empty())
-        << "Failed to extract source segment name";
-
-    // Step 3: Determine target segments (both client1 and client2, excluding
-    // source)
-    std::vector<std::string> target_segments;
-    if (source_segment == "127.0.0.1:18001") {
-        target_segments = {"127.0.0.1:18002"};  // Copy to client2 only
-    } else if (source_segment == "127.0.0.1:18002") {
-        target_segments = {"127.0.0.1:18001"};  // Copy to client1 only
-    } else {
-        // If source is neither, use both segments
-        target_segments = {"127.0.0.1:18001", "127.0.0.1:18002"};
-    }
-
-    // Ensure source is not in targets
-    for (const auto& target : target_segments) {
-        ASSERT_NE(source_segment, target)
-            << "Source segment must not be in target segments. "
-            << "Source: " << source_segment << ", Target: " << target;
-    }
-
-    // Step 4: Create copy task with multiple targets
+    const std::vector<std::string> target_segments = {kClient2Endpoint,
+                                                      kClient3Endpoint};
     auto copy_result =
         master_client_->CreateCopyTask(test_key, target_segments);
     ASSERT_TRUE(copy_result.has_value())
@@ -786,51 +688,35 @@ TEST_F(TaskExecutorIntegrationTest, ReplicaCopyToMultipleTargets) {
 
     UUID task_id = copy_result.value();
 
-    // Step 5: Wait for task to complete
     bool task_completed =
         WaitForTaskCompletion(task_id, std::chrono::seconds(30));
     ASSERT_TRUE(task_completed) << "Task did not complete within timeout";
 
-    // Step 6: Verify copy was successful on all target segments
-    for (const auto& target_segment : target_segments) {
-        std::shared_ptr<Client> target_client;
-        if (target_segment == "127.0.0.1:18001") {
-            target_client = client1_;
-        } else {
-            target_client = client2_;
-        }
+    ExpectReplicaEndpoints(
+        test_key, {kClient1Endpoint, kClient2Endpoint, kClient3Endpoint});
 
-        auto target_query_result = target_client->Query(test_key);
-        ASSERT_TRUE(target_query_result.has_value())
-            << "Failed to query copied key from target segment: "
-            << target_segment;
-        ASSERT_FALSE(target_query_result.value().replicas.empty())
-            << "No replicas found on target segment: " << target_segment;
+    std::vector<uint8_t> read_buffer(test_data.size());
+    std::vector<Slice> read_slices;
+    read_slices.emplace_back(read_buffer.data(), read_buffer.size());
+    auto get_result = client1_->Get(test_key, read_slices);
+    ASSERT_TRUE(get_result.has_value())
+        << "Failed to get data after multi-target copy: "
+        << toString(get_result.error());
 
-        // Verify data integrity
-        std::vector<uint8_t> read_buffer(test_data.size());
-        std::vector<Slice> read_slices;
-        read_slices.emplace_back(read_buffer.data(), read_buffer.size());
-
-        auto get_result = target_client->Get(test_key, read_slices);
-        ASSERT_TRUE(get_result.has_value())
-            << "Failed to get data from target segment: " << target_segment;
-
-        std::string read_data(reinterpret_cast<const char*>(read_buffer.data()),
-                              test_data.size());
-        ASSERT_EQ(read_data, test_data)
-            << "Data mismatch on target segment: " << target_segment;
-    }
+    std::string read_data(reinterpret_cast<const char*>(read_buffer.data()),
+                          test_data.size());
+    EXPECT_EQ(read_data, test_data);
 }
 
 // Test multiple copy tasks
 TEST_F(TaskExecutorIntegrationTest, MultipleCopyTasks) {
+    ASSERT_NO_FATAL_FAILURE(MountThirdClientSegment());
+
     const int num_keys = 3;
     std::vector<std::string> keys;
     std::vector<std::string> test_data_list;
     std::vector<UUID> task_ids;
 
-    // Step 1: Put multiple keys on client1
     for (int i = 0; i < num_keys; ++i) {
         std::string key =
             "test_multi_copy_key_" + std::to_string(i) + "_" +
@@ -844,6 +730,7 @@ TEST_F(TaskExecutorIntegrationTest, MultipleCopyTasks) {
         slices.emplace_back(data.data(), data.size());
         ReplicateConfig config;
         config.replica_num = 1;
+        config.preferred_segment = kClient1Endpoint;
 
         auto put_result = client1_->Put(key, slices, config);
         ASSERT_TRUE(put_result.has_value()) << "Failed to put key " << i;
@@ -851,75 +738,18 @@ TEST_F(TaskExecutorIntegrationTest, MultipleCopyTasks) {
 
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
 
-    // Step 2: For each key, determine its source segment and create copy task
-    // with appropriate target Each key may be on a different segment, so we
-    // need to check each one individually
-    for (const auto& key : keys) {
-        // Query to get actual source segment for this key
-        auto query_result = client1_->Query(key);
-        ASSERT_TRUE(query_result.has_value()) << "Failed to query key: " << key;
-        ASSERT_FALSE(query_result.value().replicas.empty())
-            << "No replicas found for key: " << key;
-
-        // Extract actual source segment name from replica
-        std::string source_segment;
-        const auto& replica = query_result.value().replicas[0];
-        ASSERT_TRUE(replica.is_memory_replica())
-            << "Expected memory replica for key: " << key;
-        source_segment = replica.get_memory_descriptor()
-                             .buffer_descriptor.transport_endpoint_;
-        ASSERT_FALSE(source_segment.empty())
-            << "Failed to extract source segment name for key: " << key;
-
-        // Determine target segment dynamically (must be different from source)
-        // Choose the other client's segment as target to ensure source !=
-        // target
-        std::string target_segment;
-        if (source_segment == "127.0.0.1:18001") {
-            target_segment = "127.0.0.1:18002";
-        } else if (source_segment == "127.0.0.1:18002") {
-            target_segment = "127.0.0.1:18001";
-        } else {
-            // If source is neither, default to client2's segment
-            target_segment = "127.0.0.1:18002";
-        }
-
-        // Verify source and target are different - this test only covers
-        // inconsistent cases
-        ASSERT_NE(source_segment, target_segment)
-            << "Source and target segments must be different for key: " << key
-            << ". "
-            << "Source: " << source_segment << ", Target: " << target_segment;
-
-        // Step 3: Create copy task for this key
-        // For the last key, use multiple target segments to test multi-target
-        // copy
-        std::vector<std::string> targets;
-        size_t key_index =
-            task_ids.size();  // Current index before adding this task
-        if (key_index == keys.size() - 1 && keys.size() >= 2) {
-            // Last key: use multiple targets if we have at least 2 clients
-            if (source_segment == "127.0.0.1:18001") {
-                targets = {
-                    "127.0.0.1:18002"};  // Only one other segment available
-            } else if (source_segment == "127.0.0.1:18002") {
-                targets = {
-                    "127.0.0.1:18001"};  // Only one other segment available
-            } else {
-                targets = {"127.0.0.1:18001", "127.0.0.1:18002"};
-            }
-        } else {
-            // Other keys: use single target
-            targets = {target_segment};
-        }
-
-        auto copy_result = master_client_->CreateCopyTask(key, targets);
+    for (size_t i = 0; i < keys.size(); ++i) {
+        ExpectReplicaEndpoints(keys[i], {kClient1Endpoint});
+        const std::vector<std::string> targets =
+            i == keys.size() - 1
+                ? std::vector<std::string>{kClient2Endpoint, kClient3Endpoint}
+                : std::vector<std::string>{kClient2Endpoint};
+        auto copy_result = master_client_->CreateCopyTask(keys[i], targets);
         ASSERT_TRUE(copy_result.has_value())
-            << "Failed to create copy task for " << key;
+            << "Failed to create copy task for " << keys[i];
         task_ids.push_back(copy_result.value());
     }
 
-    // Step 4: Wait for all tasks to complete
     for (size_t i = 0; i < task_ids.size(); ++i) {
         bool completed =
             WaitForTaskCompletion(task_ids[i], std::chrono::seconds(30));
@@ -935,98 +765,24 @@ TEST_F(TaskExecutorIntegrationTest, MultipleCopyTasks) {
             << "Task " << i << " (key: " << keys[i] << ") did not complete";
     }
 
-    // Step 5: Verify all keys are accessible on their target segments
-    // For each key, we need to determine which client should have the replica
     for (size_t i = 0; i < keys.size(); ++i) {
-        // Determine source segment for this key
-        auto query_result = client1_->Query(keys[i]);
-        ASSERT_TRUE(query_result.has_value()) << "Failed to query key " << i;
-        ASSERT_FALSE(query_result.value().replicas.empty())
-            << "No replicas found for key " << i;
-
-        std::string source_segment;
-        const auto& replica = query_result.value().replicas[0];
-        ASSERT_TRUE(replica.is_memory_replica())
-            << "Expected memory replica for key " << i;
-        source_segment = replica.get_memory_descriptor()
-                             .buffer_descriptor.transport_endpoint_;
-
-        // For the last key with multiple targets, verify on all target segments
-        bool is_multi_target = (i == keys.size() - 1 && keys.size() >= 2);
-
-        if (is_multi_target) {
-            // Last key: verify on all target segments
-            std::vector<std::string> target_segments;
-            if (source_segment == "127.0.0.1:18001") {
-                target_segments = {"127.0.0.1:18002"};
-            } else if (source_segment == "127.0.0.1:18002") {
-                target_segments = {"127.0.0.1:18001"};
-            } else {
-                target_segments = {"127.0.0.1:18001", "127.0.0.1:18002"};
-            }
-
-            // Verify on each target segment
-            for (const auto& target_seg : target_segments) {
-                std::shared_ptr<Client> target_client =
-                    (target_seg == "127.0.0.1:18001") ? client1_ : client2_;
-
-                auto target_query = target_client->Query(keys[i]);
-                ASSERT_TRUE(target_query.has_value())
-                    << "Failed to query key " << i
-                    << " from target segment: " << target_seg;
-                ASSERT_FALSE(target_query.value().replicas.empty())
-                    << "No replicas found for key " << i
-                    << " on segment: " << target_seg;
-
-                // Verify data integrity
-                std::vector<uint8_t> read_buffer(test_data_list[i].size());
-                std::vector<Slice> read_slices;
-                read_slices.emplace_back(read_buffer.data(),
-                                         read_buffer.size());
-
-                auto get_result = target_client->Get(keys[i], read_slices);
-                ASSERT_TRUE(get_result.has_value())
-                    << "Failed to get key " << i
-                    << " from target segment: " << target_seg;
-
-                std::string read_data(
-                    reinterpret_cast<const char*>(read_buffer.data()),
-                    test_data_list[i].size());
-                ASSERT_EQ(read_data, test_data_list[i])
-                    << "Data mismatch for key " << i
-                    << " on segment: " << target_seg;
-            }
+        if (i == keys.size() - 1) {
+            ExpectReplicaEndpoints(keys[i], {kClient1Endpoint, kClient2Endpoint,
+                                             kClient3Endpoint});
         } else {
-            // Other keys: verify on single target segment
-            std::shared_ptr<Client> target_client;
-            if (source_segment == "127.0.0.1:18001") {
-                target_client = client2_;  // Copy to client2
-            } else {
-                target_client = client1_;  // Copy to client1
-            }
-
-            // Verify the copied replica is accessible
-            auto query_result_target = target_client->Query(keys[i]);
-            ASSERT_TRUE(query_result_target.has_value())
-                << "Failed to query copied key " << i << " from target client";
-            ASSERT_FALSE(query_result_target.value().replicas.empty())
-                << "No replicas found for copied key " << i;
-
-            // Verify data integrity
-            std::vector<uint8_t> read_buffer(test_data_list[i].size());
-            std::vector<Slice> read_slices;
-            read_slices.emplace_back(read_buffer.data(), read_buffer.size());
-
-            auto get_result = target_client->Get(keys[i], read_slices);
-            ASSERT_TRUE(get_result.has_value())
-                << "Failed to get key " << i << " from target client";
-
-            std::string read_data(
-                reinterpret_cast<const char*>(read_buffer.data()),
-                test_data_list[i].size());
-            ASSERT_EQ(read_data, test_data_list[i])
-                << "Data mismatch for key " << i;
+            ExpectReplicaEndpoints(keys[i],
+                                   {kClient1Endpoint, kClient2Endpoint});
         }
+
+        std::vector<uint8_t> read_buffer(test_data_list[i].size());
+        std::vector<Slice> read_slices;
+        read_slices.emplace_back(read_buffer.data(), read_buffer.size());
+        auto get_result = client1_->Get(keys[i], read_slices);
+        ASSERT_TRUE(get_result.has_value()) << "Failed to get copied key " << i;
+        std::string read_data(reinterpret_cast<const char*>(read_buffer.data()),
+                              test_data_list[i].size());
+        EXPECT_EQ(read_data, test_data_list[i])
+            << "Data mismatch for key " << i;
     }
 }
 
@@ -1051,6 +807,7 @@ TEST_F(TaskExecutorIntegrationTest, MultipleMoveTasks) {
         slices.emplace_back(data.data(), data.size());
         ReplicateConfig config;
         config.replica_num = 1;
+        config.preferred_segment = kClient1Endpoint;
 
         auto put_result = client1_->Put(key, slices, config);
         ASSERT_TRUE(put_result.has_value()) << "Failed to put key " << i;
@@ -1058,47 +815,15 @@ TEST_F(TaskExecutorIntegrationTest, MultipleMoveTasks) {
 
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
 
-    // Step 2: For each key, determine source segment and create move task
     for (const auto& key : keys) {
-        // Query to get actual source segment for this key
-        auto query_result = client1_->Query(key);
-        ASSERT_TRUE(query_result.has_value()) << "Failed to query key: " << key;
-        ASSERT_FALSE(query_result.value().replicas.empty())
-            << "No replicas found for key: " << key;
-
-        std::string source_segment;
-        const auto& replica = query_result.value().replicas[0];
-        ASSERT_TRUE(replica.is_memory_replica())
-            << "Expected memory replica for key: " << key;
-        source_segment = replica.get_memory_descriptor()
-                             .buffer_descriptor.transport_endpoint_;
-        ASSERT_FALSE(source_segment.empty())
-            << "Failed to extract source segment name for key: " << key;
-
-        // Determine target segment (must be different from source)
-        std::string target_segment;
-        if (source_segment == "127.0.0.1:18001") {
-            target_segment = "127.0.0.1:18002";
-        } else if (source_segment == "127.0.0.1:18002") {
-            target_segment = "127.0.0.1:18001";
-        } else {
-            target_segment = "127.0.0.1:18002";
-        }
-
-        ASSERT_NE(source_segment, target_segment)
-            << "Source and target segments must be different for key: " << key
-            << ". "
-            << "Source: " << source_segment << ", Target: " << target_segment;
-
-        // Step 3: Create move task
-        auto move_result =
-            master_client_->CreateMoveTask(key, source_segment, target_segment);
+        ExpectReplicaEndpoints(key, {kClient1Endpoint});
+        auto move_result = master_client_->CreateMoveTask(key, kClient1Endpoint,
+                                                          kClient2Endpoint);
         ASSERT_TRUE(move_result.has_value())
             << "Failed to create move task for " << key;
         task_ids.push_back(move_result.value());
     }
 
-    // Step 4: Wait for all tasks to complete
     for (size_t i = 0; i < task_ids.size(); ++i) {
         bool completed =
             WaitForTaskCompletion(task_ids[i], std::chrono::seconds(30));
@@ -1113,45 +838,15 @@ TEST_F(TaskExecutorIntegrationTest, MultipleMoveTasks) {
             << "Task " << i << " (key: " << keys[i] << ") did not complete";
     }
 
-    // Step 5: Verify all keys are moved to target segments
     for (size_t i = 0; i < keys.size(); ++i) {
-        // Determine target client for this key
-        auto query_result = client1_->Query(keys[i]);
-        ASSERT_TRUE(query_result.has_value()) << "Failed to query key " << i;
+        ExpectReplicaEndpoints(keys[i], {kClient2Endpoint});
 
-        std::string source_segment;
-        if (!query_result.value().replicas.empty()) {
-            const auto& replica = query_result.value().replicas[0];
-            if (replica.is_memory_replica()) {
-                source_segment = replica.get_memory_descriptor()
-                                     .buffer_descriptor.transport_endpoint_;
-            }
-        }
-
-        std::shared_ptr<Client> target_client;
-        if (source_segment == "127.0.0.1:18001" || source_segment.empty()) {
-            // Check client2 (may have moved from client1 or was originally on
-            // client1)
-            target_client = client2_;
-        } else {
-            target_client = client1_;
-        }
-
-        // Verify the moved replica is accessible on target client
-        auto target_query_result = target_client->Query(keys[i]);
-        ASSERT_TRUE(target_query_result.has_value())
-            << "Failed to query moved key " << i << " from target client";
-        ASSERT_FALSE(target_query_result.value().replicas.empty())
-            << "No replicas found for moved key " << i;
-
-        // Verify data integrity
         std::vector<uint8_t> read_buffer(test_data_list[i].size());
         std::vector<Slice> read_slices;
         read_slices.emplace_back(read_buffer.data(), read_buffer.size());
 
-        auto get_result = target_client->Get(keys[i], read_slices);
-        ASSERT_TRUE(get_result.has_value())
-            << "Failed to get moved key " << i << " from target client";
+        auto get_result = client1_->Get(keys[i], read_slices);
+        ASSERT_TRUE(get_result.has_value()) << "Failed to get moved key " << i;
 
         std::string read_data(reinterpret_cast<const char*>(read_buffer.data()),
                               test_data_list[i].size());
@@ -1162,13 +857,13 @@ TEST_F(TaskExecutorIntegrationTest, MultipleMoveTasks) {
 
 // Test concurrent copy and move operations
 TEST_F(TaskExecutorIntegrationTest, ConcurrentCopyAndMoveOperations) {
+    ASSERT_NO_FATAL_FAILURE(MountThirdClientSegment());
+
     const int num_copy_keys = 2;
     const int num_move_keys = 2;
     std::vector<std::string> copy_keys, move_keys;
-    std::vector<std::string> copy_data_list, move_data_list;
     std::vector<UUID> copy_task_ids, move_task_ids;
 
-    // Step 1: Put keys for copy operations
     for (int i = 0; i < num_copy_keys; ++i) {
         std::string key =
             "test_concurrent_copy_key_" + std::to_string(i) + "_" +
@@ -1176,18 +871,17 @@ TEST_F(TaskExecutorIntegrationTest, ConcurrentCopyAndMoveOperations) {
                 std::chrono::steady_clock::now().time_since_epoch().count());
         std::string data = "Copy data " + std::to_string(i);
         copy_keys.push_back(key);
-        copy_data_list.push_back(data);
 
         std::vector<Slice> slices;
         slices.emplace_back(data.data(), data.size());
         ReplicateConfig config;
         config.replica_num = 1;
+        config.preferred_segment = kClient1Endpoint;
 
         auto put_result = client1_->Put(key, slices, config);
         ASSERT_TRUE(put_result.has_value()) << "Failed to put copy key " << i;
     }
 
-    // Step 2: Put keys for move operations
     for (int i = 0; i < num_move_keys; ++i) {
         std::string key =
             "test_concurrent_move_key_" + std::to_string(i) + "_" +
@@ -1195,12 +889,12 @@ TEST_F(TaskExecutorIntegrationTest, ConcurrentCopyAndMoveOperations) {
                 std::chrono::steady_clock::now().time_since_epoch().count());
         std::string data = "Move data " + std::to_string(i);
         move_keys.push_back(key);
-        move_data_list.push_back(data);
 
         std::vector<Slice> slices;
         slices.emplace_back(data.data(), data.size());
         ReplicateConfig config;
         config.replica_num = 1;
+        config.preferred_segment = kClient1Endpoint;
 
         auto put_result = client1_->Put(key, slices, config);
         ASSERT_TRUE(put_result.has_value()) << "Failed to put move key " << i;
@@ -1208,72 +902,28 @@ TEST_F(TaskExecutorIntegrationTest, ConcurrentCopyAndMoveOperations) {
 
     std::this_thread::sleep_for(std::chrono::milliseconds(300));
 
-    // Step 3: Create copy tasks concurrently
-    // Use multiple targets for the first copy task to test multi-target copy
-    for (size_t idx = 0; idx < copy_keys.size(); ++idx) {
-        const auto& key = copy_keys[idx];
-        auto query_result = client1_->Query(key);
-        ASSERT_TRUE(query_result.has_value())
-            << "Failed to query copy key: " << key;
-        ASSERT_FALSE(query_result.value().replicas.empty());
-
-        std::string source_segment;
-        const auto& replica = query_result.value().replicas[0];
-        ASSERT_TRUE(replica.is_memory_replica());
-        source_segment = replica.get_memory_descriptor()
-                             .buffer_descriptor.transport_endpoint_;
-
-        std::vector<std::string> targets;
-        if (idx == 0 && copy_keys.size() >= 1) {
-            // First copy task: use multiple targets
-            if (source_segment == "127.0.0.1:18001") {
-                targets = {
-                    "127.0.0.1:18002"};  // Only one other segment available
-            } else if (source_segment == "127.0.0.1:18002") {
-                targets = {
-                    "127.0.0.1:18001"};  // Only one other segment available
-            } else {
-                targets = {"127.0.0.1:18001", "127.0.0.1:18002"};
-            }
-        } else {
-            // Other copy tasks: use single target
-            std::string target_segment = (source_segment == "127.0.0.1:18001")
-                                             ? "127.0.0.1:18002"
-                                             : "127.0.0.1:18001";
-            targets = {target_segment};
-        }
-
-        auto copy_result = master_client_->CreateCopyTask(key, targets);
+    for (size_t i = 0; i < copy_keys.size(); ++i) {
+        ExpectReplicaEndpoints(copy_keys[i], {kClient1Endpoint});
+        const std::vector<std::string> targets =
+            i == 0
+                ? std::vector<std::string>{kClient2Endpoint, kClient3Endpoint}
+                : std::vector<std::string>{kClient2Endpoint};
+        auto copy_result =
+            master_client_->CreateCopyTask(copy_keys[i], targets);
         ASSERT_TRUE(copy_result.has_value())
-            << "Failed to create copy task for " << key;
+            << "Failed to create copy task for " << copy_keys[i];
         copy_task_ids.push_back(copy_result.value());
     }
 
-    // Step 4: Create move tasks concurrently
     for (const auto& key : move_keys) {
-        auto query_result = client1_->Query(key);
-        ASSERT_TRUE(query_result.has_value())
-            << "Failed to query move key: " << key;
-        ASSERT_FALSE(query_result.value().replicas.empty());
-
-        std::string source_segment;
-        const auto& replica = query_result.value().replicas[0];
-        ASSERT_TRUE(replica.is_memory_replica());
-        source_segment = replica.get_memory_descriptor()
-                             .buffer_descriptor.transport_endpoint_;
-
-        std::string target_segment = (source_segment == "127.0.0.1:18001")
-                                         ? "127.0.0.1:18002"
-                                         : "127.0.0.1:18001";
-
-        auto move_result =
-            master_client_->CreateMoveTask(key, source_segment, target_segment);
+        ExpectReplicaEndpoints(key, {kClient1Endpoint});
+        auto move_result = master_client_->CreateMoveTask(key, kClient1Endpoint,
+                                                          kClient2Endpoint);
         ASSERT_TRUE(move_result.has_value())
             << "Failed to create move task for " << key;
         move_task_ids.push_back(move_result.value());
     }
 
-    // Step 5: Wait for all tasks to complete
     for (size_t i = 0; i < copy_task_ids.size(); ++i) {
         bool completed =
             WaitForTaskCompletion(copy_task_ids[i], std::chrono::seconds(30));
@@ -1288,83 +938,19 @@ TEST_F(TaskExecutorIntegrationTest, ConcurrentCopyAndMoveOperations) {
                                << ") did not complete";
     }
 
-    // Step 6: Verify copy results
     for (size_t i = 0; i < copy_keys.size(); ++i) {
-        auto query_result = client1_->Query(copy_keys[i]);
-        ASSERT_TRUE(query_result.has_value());
-
-        std::string source_segment;
-        if (!query_result.value().replicas.empty()) {
-            const auto& replica = query_result.value().replicas[0];
-            if (replica.is_memory_replica()) {
-                source_segment = replica.get_memory_descriptor()
-                                     .buffer_descriptor.transport_endpoint_;
-            }
-        }
-
-        // First copy task uses multiple targets
-        bool is_multi_target = (i == 0 && copy_keys.size() >= 1);
-
-        if (is_multi_target) {
-            // Verify on all target segments
-            std::vector<std::string> target_segments;
-            if (source_segment == "127.0.0.1:18001") {
-                target_segments = {"127.0.0.1:18002"};
-            } else if (source_segment == "127.0.0.1:18002") {
-                target_segments = {"127.0.0.1:18001"};
-            } else {
-                target_segments = {"127.0.0.1:18001", "127.0.0.1:18002"};
-            }
-
-            for (const auto& target_seg : target_segments) {
-                std::shared_ptr<Client> target_client =
-                    (target_seg == "127.0.0.1:18001") ? client1_ : client2_;
-
-                auto target_query = target_client->Query(copy_keys[i]);
-                ASSERT_TRUE(target_query.has_value())
-                    << "Copy key " << i
-                    << " not found on target segment: " << target_seg;
-                ASSERT_FALSE(target_query.value().replicas.empty())
-                    << "No replicas for copy key " << i
-                    << " on segment: " << target_seg;
-            }
+        if (i == 0) {
+            ExpectReplicaEndpoints(
+                copy_keys[i],
+                {kClient1Endpoint, kClient2Endpoint, kClient3Endpoint});
         } else {
-            // Verify on single target segment
-            std::shared_ptr<Client> target_client =
-                (source_segment == "127.0.0.1:18001") ? client2_ : client1_;
-
-            auto target_query = target_client->Query(copy_keys[i]);
-            ASSERT_TRUE(target_query.has_value())
-                << "Copy key " << i << " not found on target";
-            ASSERT_FALSE(target_query.value().replicas.empty())
-                << "No replicas for copy key " << i;
+            ExpectReplicaEndpoints(copy_keys[i],
+                                   {kClient1Endpoint, kClient2Endpoint});
         }
     }
 
-    // Step 7: Verify move results
-    for (size_t i = 0; i < move_keys.size(); ++i) {
-        auto query_result = client1_->Query(move_keys[i]);
-
-        std::string source_segment;
-        if (query_result.has_value() &&
-            !query_result.value().replicas.empty()) {
-            const auto& replica = query_result.value().replicas[0];
-            if (replica.is_memory_replica()) {
-                source_segment = replica.get_memory_descriptor()
-                                     .buffer_descriptor.transport_endpoint_;
-            }
-        }
-
-        std::shared_ptr<Client> target_client =
-            (source_segment == "127.0.0.1:18001" || source_segment.empty())
-                ? client2_
-                : client1_;
-
-        auto target_query = target_client->Query(move_keys[i]);
-        ASSERT_TRUE(target_query.has_value())
-            << "Move key " << i << " not found on target";
-        ASSERT_FALSE(target_query.value().replicas.empty())
-            << "No replicas for move key " << i;
+    for (const auto& key : move_keys) {
+        ExpectReplicaEndpoints(key, {kClient2Endpoint});
     }
 }
 

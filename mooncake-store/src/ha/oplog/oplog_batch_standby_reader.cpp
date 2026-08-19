@@ -63,6 +63,8 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
         last_observed_prefix_ = prefix;
         if (prefix.last_seq != 0) {
             SetPollError(result, ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, false);
+        } else if (applier_.GetExpectedSequenceId() == 1) {
+            last_applied_durable_prefix_ = prefix;
         }
         return result;
     }
@@ -80,6 +82,12 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
     }
     last_observed_prefix_ = prefix;
     if (prefix.batch_id <= last_applied_batch_id_) {
+        const uint64_t expected = applier_.GetExpectedSequenceId();
+        if (prefix.batch_id == last_applied_batch_id_ &&
+            last_scanned_batch_last_seq_ == prefix.last_seq && expected > 0 &&
+            expected - 1 == prefix.last_seq) {
+            last_applied_durable_prefix_ = prefix;
+        }
         return result;
     }
 
@@ -136,6 +144,12 @@ OpLogBatchStandbyPollResult OpLogBatchStandbyReader::PollOnce(
         IsSequenceOlderOrEqual(applier_.GetExpectedSequenceId(),
                                prefix.last_seq)) {
         SetPollError(result, ErrorCode::INCOMPLETE_OPLOG_CATCH_UP, false);
+    } else if (!has_more_pages && last_applied_batch_id_ == prefix.batch_id &&
+               last_scanned_batch_last_seq_ == prefix.last_seq) {
+        const uint64_t expected = applier_.GetExpectedSequenceId();
+        if (expected > 0 && expected - 1 == prefix.last_seq) {
+            last_applied_durable_prefix_ = prefix;
+        }
     }
     return result;
 }
