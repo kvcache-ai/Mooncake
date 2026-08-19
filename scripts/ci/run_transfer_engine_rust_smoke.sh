@@ -22,6 +22,9 @@ cd "$GITHUB_WORKSPACE/mooncake-transfer-engine/rust"
 : "${MOONCAKE_BUILD_DIR:=$GITHUB_WORKSPACE/build}"
 export MOONCAKE_BUILD_DIR
 export LD_LIBRARY_PATH="$MOONCAKE_BUILD_DIR/mooncake-asio:$MOONCAKE_BUILD_DIR/mooncake-transfer-engine/src:$MOONCAKE_BUILD_DIR/mooncake-transfer-engine/src/common/base:$MOONCAKE_BUILD_DIR/mooncake-common:$MOONCAKE_BUILD_DIR/mooncake-common/etcd:${LD_LIBRARY_PATH:-}"
+if [ -d "$MOONCAKE_BUILD_DIR/mooncake-transfer-engine/tent/src" ]; then
+    export LD_LIBRARY_PATH="$MOONCAKE_BUILD_DIR/mooncake-transfer-engine/tent/src:${LD_LIBRARY_PATH}"
+fi
 if [ -d /usr/local/cuda/lib64/stubs ]; then
     export LD_LIBRARY_PATH="/usr/local/cuda/lib64/stubs:${LD_LIBRARY_PATH}"
 fi

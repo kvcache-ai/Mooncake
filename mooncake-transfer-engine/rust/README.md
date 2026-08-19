@@ -39,8 +39,11 @@ cargo test --lib --release
 cargo build --examples --release
 ```
 
-If Transfer Engine was built with etcd or CUDA, set `MOONCAKE_WITH_ETCD=1`
-and/or `MOONCAKE_WITH_CUDA=1` so `build.rs` pulls in the extra link libraries.
+If Transfer Engine was built with etcd, CUDA, or TENT, `build.rs` auto-detects
+the extra archives (`etcd_wrapper`, `cudart`, `libtent.a` / `libtent_xport_*.a`)
+when `MOONCAKE_BUILD_DIR` points at the CMake build tree. You can also force
+this with `MOONCAKE_WITH_ETCD=1`, `MOONCAKE_WITH_CUDA=1`, and
+`MOONCAKE_WITH_TENT=1`.
 
 At runtime, add CMake outputs to `LD_LIBRARY_PATH` if they are not installed:
 

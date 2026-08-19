@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::cmp::Ordering;
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -53,6 +55,55 @@ fn has_library(search_dirs: &[PathBuf], name: &str) -> bool {
             })
 }
 
+fn is_tent_archive(lib: &str) -> bool {
+    lib == "tent"
+        || lib.starts_with("tent_")
+        || lib.starts_with("metastore_")
+        || lib.starts_with("platform_")
+}
+
+/// Collect TENT static archives (`libtent.a`, `libtent_xport_*.a`, …).
+/// `USE_TENT=ON` compiles those into `libtransfer_engine.a` as undefined
+/// `mooncake::tent::*` symbols; CMake wraps them in `--start-group`.
+fn collect_tent_archives(root: &Path, libs: &mut Vec<(PathBuf, String)>) {
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if path.is_dir() {
+                if matches!(name, "CMakeFiles" | "target" | ".git") {
+                    continue;
+                }
+                stack.push(path);
+                continue;
+            }
+            let Some(lib) = name.strip_prefix("lib").and_then(|n| n.strip_suffix(".a")) else {
+                continue;
+            };
+            if !is_tent_archive(lib) || libs.iter().any(|(_, existing)| existing == lib) {
+                continue;
+            }
+            if let Some(parent) = path.parent() {
+                libs.push((parent.to_path_buf(), lib.to_string()));
+            }
+        }
+    }
+}
+
+fn tent_archive_sort(a: &(PathBuf, String), b: &(PathBuf, String)) -> Ordering {
+    match (a.1.as_str() == "tent", b.1.as_str() == "tent") {
+        (true, false) => Ordering::Less,
+        (false, true) => Ordering::Greater,
+        _ => a.1.cmp(&b.1),
+    }
+}
+
 fn compiler_print_file_name(file_name: &str) -> Option<PathBuf> {
     for tool in ["cc", "gcc", "clang", "c++"] {
         let output = match Command::new(tool)
@@ -81,6 +132,7 @@ fn main() {
     println!("cargo:rerun-if-env-changed=MOONCAKE_WITH_ETCD");
     println!("cargo:rerun-if-env-changed=MOONCAKE_WITH_CUDA");
     println!("cargo:rerun-if-env-changed=MOONCAKE_WITHOUT_LIBFABRIC");
+    println!("cargo:rerun-if-env-changed=MOONCAKE_WITH_TENT");
     println!("cargo:rerun-if-env-changed=MOONCAKE_LINK_ASAN");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
     println!("cargo:rerun-if-env-changed=CUDA_PATH");
@@ -88,6 +140,7 @@ fn main() {
 
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let mut search_dirs = Vec::new();
+    let mut tent_libs: Vec<(PathBuf, String)> = Vec::new();
 
     if let Ok(dir) = env::var("MOONCAKE_TE_LIB_DIR") {
         push_dir(&mut search_dirs, PathBuf::from(dir));
@@ -102,11 +155,17 @@ fn main() {
             build_dir.join("mooncake-common"),
             build_dir.join("mooncake-common/src"),
             build_dir.join("mooncake-common/etcd"),
+            build_dir.join("mooncake-transfer-engine/tent/src"),
             build_dir.join("src"),
             build_dir.join("src/common/base"),
         ] {
             push_dir(&mut search_dirs, dir);
         }
+        collect_tent_archives(
+            &build_dir.join("mooncake-transfer-engine/tent"),
+            &mut tent_libs,
+        );
+        collect_tent_archives(&build_dir.join("tent"), &mut tent_libs);
     }
 
     // Standalone cargo from mooncake-transfer-engine/rust, after a top-level
@@ -120,8 +179,21 @@ fn main() {
         manifest_dir.join("../../build/mooncake-asio"),
         manifest_dir.join("../../build/mooncake-common"),
         manifest_dir.join("../../build/mooncake-common/etcd"),
+        manifest_dir.join("../../build/mooncake-transfer-engine/tent/src"),
+        manifest_dir.join("../tent/build/src"),
     ] {
         push_dir(&mut search_dirs, dir);
+    }
+
+    collect_tent_archives(
+        &manifest_dir.join("../../build/mooncake-transfer-engine/tent"),
+        &mut tent_libs,
+    );
+    collect_tent_archives(&manifest_dir.join("../build"), &mut tent_libs);
+
+    tent_libs.sort_by(tent_archive_sort);
+    for (dir, _) in &tent_libs {
+        push_dir(&mut search_dirs, dir.clone());
     }
 
     if Path::new("/opt/amazon/efa/lib").exists() {
@@ -157,8 +229,39 @@ fn main() {
         println!("cargo:rustc-link-lib=asan");
     }
 
-    println!("cargo:rustc-link-lib=static=transfer_engine");
-    println!("cargo:rustc-link-lib=static=base");
+    let has_mooncake_common = has_library(&search_dirs, "mooncake_common");
+    let link_tent =
+        flag_on("MOONCAKE_WITH_TENT") || tent_libs.iter().any(|(_, name)| name == "tent");
+    if link_tent {
+        // USE_TENT compiles mooncake::tent::* refs into libtransfer_engine.a.
+        // Keep transfer_engine inside the same GNU ld rescan group as CMake's
+        // tent_link_group so archive order cannot drop those symbols.
+        println!("cargo:rustc-link-arg=-Wl,--start-group");
+        println!("cargo:rustc-link-arg=-ltransfer_engine");
+        println!("cargo:rustc-link-arg=-lbase");
+        if tent_libs.is_empty() {
+            println!("cargo:rustc-link-arg=-ltent");
+        } else {
+            for (_, name) in &tent_libs {
+                println!("cargo:rustc-link-arg=-l{name}");
+            }
+        }
+        if has_mooncake_common {
+            println!("cargo:rustc-link-arg=-lmooncake_common");
+        }
+        println!("cargo:rustc-link-arg=-Wl,--end-group");
+        println!("cargo:rustc-link-lib=dl");
+        if has_library(&search_dirs, "uring") {
+            println!("cargo:rustc-link-lib=uring");
+        }
+    } else {
+        println!("cargo:rustc-link-lib=static=transfer_engine");
+        println!("cargo:rustc-link-lib=static=base");
+        if has_mooncake_common {
+            println!("cargo:rustc-link-lib=static=mooncake_common");
+        }
+    }
+
     println!("cargo:rustc-link-lib=asio");
     println!("cargo:rustc-link-lib=stdc++");
     println!("cargo:rustc-link-lib=ibverbs");
@@ -191,9 +294,6 @@ fn main() {
 
     println!("cargo:rerun-if-env-changed=MOONCAKE_WITH_LIBFABRIC");
 
-    if has_library(&search_dirs, "mooncake_common") {
-        println!("cargo:rustc-link-lib=static=mooncake_common");
-    }
     if has_library(&search_dirs, "yaml-cpp") {
         println!("cargo:rustc-link-lib=yaml-cpp");
     }
