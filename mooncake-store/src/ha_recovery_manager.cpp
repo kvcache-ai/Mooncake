@@ -11,12 +11,14 @@ HARecoveryManager::HARecoveryManager(
     const UUID& client_id, P2PMasterClient& master_client,
     std::optional<DataManager>& data_manager,
     std::unique_ptr<AsyncMetadataNotifier>& notifier,
-    std::atomic<ViewVersionId>& view_version, HAClientState initial_state)
+    std::atomic<ViewVersionId>& view_version, HAClientState initial_state,
+    HARecoveryManager::RecoveryMode recovery_mode)
     : client_id_(client_id),
       master_client_(master_client),
       data_manager_(data_manager),
       notifier_(notifier),
       view_version_(view_version),
+      recovery_mode_(recovery_mode),
       state_(initial_state) {
     LOG(INFO) << "HA recovery manager initialized with state: "
               << initial_state;
@@ -167,6 +169,13 @@ void HARecoveryManager::RecoveryPipelineMain(AbortToken need_abort) {
         return;
     }
 
+    if (recovery_mode_ == RecoveryMode::RegisterOnly) {
+        LOG(INFO) << "Recovery mode RegisterOnly: skipping full metadata sync";
+        FinishRecovery(need_abort);
+        LOG(INFO) << "Recovery pipeline completed";
+        return;
+    }
+
     auto aborted = [&]() {
         return need_abort->load(std::memory_order_acquire);
     };
@@ -280,7 +289,16 @@ void HARecoveryManager::RecoveryPipelineMain(AbortToken need_abort) {
         }
     }
 
-    // All recovery routes delivered. Notify Master.
+    FinishRecovery(need_abort);
+    LOG(INFO) << "Recovery pipeline completed";
+}
+
+void HARecoveryManager::FinishRecovery(AbortToken need_abort) {
+    auto aborted = [&]() {
+        return need_abort->load(std::memory_order_acquire);
+    };
+
+    // Notify Master that this client's recovery phase is complete.
     // Retry indefinitely until success or abort — if Master restarts again,
     // HandleEvent(MASTER_UNREACHABLE) will set need_abort and this thread
     // exits.
@@ -304,7 +322,6 @@ void HARecoveryManager::RecoveryPipelineMain(AbortToken need_abort) {
                          << ", reason=recovery complete";
         }
     }
-    LOG(INFO) << "Recovery pipeline completed";
 }
 
 // return false when abort

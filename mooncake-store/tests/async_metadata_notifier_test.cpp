@@ -261,6 +261,35 @@ TEST_F(AsyncMetadataNotifierTest, FailureCallbackInvoked) {
     notifier.Stop();
 }
 
+TEST_F(AsyncMetadataNotifierTest, RpcFailureDoesNotInvokeFailureCallback) {
+    auto unreachable_client = std::make_unique<P2PMasterClient>(client_id_);
+    auto unreachable_addr = "127.0.0.1:" + std::to_string(getFreeTcpPort());
+    auto ec = unreachable_client->Connect(unreachable_addr);
+    ASSERT_NE(ec, ErrorCode::OK);
+
+    std::atomic<int> failure_count{0};
+    SyncFailureCallback cb = [&](std::string_view key, const UUID& seg_id,
+                                 ErrorCode err) {
+        failure_count.fetch_add(1, std::memory_order_relaxed);
+    };
+
+    AsyncMetadataNotifier notifier(*unreachable_client, client_id_,
+                                   /*sender_thread_count=*/1,
+                                   /*max_batch_size=*/2000,
+                                   /*queue_capacity=*/4000, std::move(cb));
+    notifier.Start();
+
+    auto r = notifier.EnqueueAdd("rpc_fail_key", segment_.id, 100);
+    ASSERT_TRUE(r.has_value());
+
+    // MaxRetryCount=3 with backoffs 100ms+200ms; add margin for RPC overhead.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+    EXPECT_EQ(failure_count.load(), 0)
+        << "Transport failures should drop only metadata notifications";
+
+    notifier.Stop();
+}
+
 TEST_F(AsyncMetadataNotifierTest, MultipleStartStop) {
     AsyncMetadataNotifier notifier(*master_client_, client_id_,
                                    /*sender_thread_count=*/2,
