@@ -1105,7 +1105,13 @@ auto MasterService::ReMountSegment(const std::vector<Segment>& segments,
         bool ambiguous_endpoint = false;
         bool unsupported_cxl = false;
         std::unordered_set<ObjectMetadata*> affected_objects;
-        for (size_t shard_index = 0; shard_index < kNumShards; ++shard_index) {
+        bool any_standby_kept_alive = std::any_of(
+            segments.begin(), segments.end(), [this](const Segment& segment) {
+                return standby_accounted_memory_bytes_.contains(segment.name);
+            });
+        for (size_t shard_index = 0;
+             any_standby_kept_alive && shard_index < kNumShards;
+             ++shard_index) {
             MetadataShardAccessorRW shard(this, shard_index);
             for (auto& [tenant_id, tenant] : shard->tenants) {
                 (void)tenant_id;
