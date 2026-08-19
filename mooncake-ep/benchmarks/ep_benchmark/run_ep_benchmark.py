@@ -52,6 +52,17 @@ def parse_args():
         help="Device backend label for output JSON (default: cuda)",
     )
     parser.add_argument(
+        "--num-qps-per-rank",
+        type=int,
+        default=None,
+        help="RC QPs per destination EP rank",
+    )
+    parser.add_argument(
+        "--disable-p2p",
+        action="store_true",
+        help="Disable the remote P2P path",
+    )
+    parser.add_argument(
         "--num-ranks",
         type=int,
         default=8,
@@ -227,7 +238,12 @@ class EPBenchmarkWorker:
         num_ep_buffer_bytes = Buffer.get_ep_buffer_size_hint(
             args.num_tokens, args.hidden_size, args.num_ranks, args.num_experts
         )
-        self.buf = Buffer(self.group, num_ep_buffer_bytes)
+        self.buf = Buffer(
+            self.group,
+            num_ep_buffer_bytes,
+            disable_p2p=args.disable_p2p,
+            num_qps_per_rank=args.num_qps_per_rank,
+        )
 
         self.topk_idx, self.topk_weights = ROUTING_MODES[args.routing_mode](
             num_tokens=args.num_tokens,
@@ -404,6 +420,8 @@ class EPBenchmarkWorker:
                 num_tokens=self.args.num_tokens,
                 dtype=self.args.dtype,
                 routing_mode=self.args.routing_mode,
+                num_qps_per_rank=self.args.num_qps_per_rank,
+                disable_p2p=self.args.disable_p2p,
                 zero_copy=self.args.zero_copy,
                 async_finish=self.args.async_finish,
                 return_recv_hook=self.args.return_recv_hook,

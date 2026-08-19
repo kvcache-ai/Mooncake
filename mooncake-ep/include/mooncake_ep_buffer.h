@@ -109,6 +109,7 @@ struct MooncakeEpBuffer {
     // factory functions (EP owns them via owned_p2p_transport_ etc.).
     MooncakeEpBuffer(int rank, int num_ranks, int64_t num_ep_buffer_bytes,
                      bool disable_p2p = false,
+                     std::optional<int> num_qps_per_rank = std::nullopt,
                      TransferEngine* engine = nullptr);
 
     ~MooncakeEpBuffer() noexcept(false);

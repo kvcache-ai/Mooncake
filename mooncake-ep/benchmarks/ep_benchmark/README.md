@@ -45,6 +45,8 @@ python mooncake-ep/benchmarks/ep_benchmark/run_ep_benchmark.py \
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--config` | None | Path to JSON config file (CLI flags override) |
+| `--num-qps-per-rank` | auto | RC QPs per destination EP rank |
+| `--disable-p2p` | off | Disable the remote P2P path |
 | `--num-ranks` | `8` | Number of EP ranks / GPUs |
 | `--num-experts` | `256` | Total experts across all ranks |
 | `--hidden-size` | `7168` | Hidden dimension |
@@ -79,6 +81,8 @@ python mooncake-ep/benchmarks/ep_benchmark/run_ep_benchmark.py \
   "num_experts": 256,
   "hidden_size": 7168,
   "routing_mode": "k_hot",
+  "num_qps_per_rank": 32,
+  "disable_p2p": false,
   "metrics": {
     "dispatch_latency_ms": {"p50": 0, "p90": 0, "p99": 0, "p999": 0, "mean": 0},
     "combine_latency_ms": {"p50": 0, "p90": 0, "p99": 0, "p999": 0, "mean": 0},

@@ -95,6 +95,7 @@ class Buffer:
         group: dist.ProcessGroup,
         num_ep_buffer_bytes: int = 0,
         disable_p2p: bool = False,
+        num_qps_per_rank: Optional[int] = None,
     ):
         from mooncake import ep
 
@@ -106,7 +107,11 @@ class Buffer:
         self.backend = self.group
         # NIC auto-detection happens inside ep.Buffer via Topology::discover().
         self.runtime = ep.Buffer(
-            self.rank, self.group_size, num_ep_buffer_bytes, disable_p2p
+            self.rank,
+            self.group_size,
+            num_ep_buffer_bytes,
+            disable_p2p,
+            num_qps_per_rank,
         )
         # Fallback flag and buffers.
         # Note: `sync_nvlink_ipc_handles()` can mutate C++ `ibgda_disabled_` (True->False when
@@ -183,8 +188,6 @@ class Buffer:
         return wrapped_hook
 
     def connect(self, is_update: bool = False):
-        from mooncake import ep
-
         if not self._use_fallback:
             (raddr, rkey) = self.runtime.get_mr_info()
             # torchada maps the CUDA device namespace to MUSA when enabled.
@@ -205,12 +208,11 @@ class Buffer:
             dist.all_gather(rkeys, rkey, self.group)
             rkeys = torch.cat(rkeys).tolist()
 
-            all_to_all_size = ep.MAX_QP_COUNT // self.group_size
-
             if is_update:
                 self.runtime.update_local_qpns()
 
             local_qpns = self.runtime.get_local_qpns()
+            all_to_all_size = len(local_qpns) // self.group_size
             local_qpns = list(
                 torch.unbind(
                     torch.tensor(local_qpns, dtype=torch.int32, device="cuda").view(

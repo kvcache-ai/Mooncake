@@ -26,9 +26,10 @@ PYBIND11_MODULE(_ep, m) {
     bind_legacy_buffer_perf(m);
 
     py::class_<MooncakeEpBuffer>(m, "Buffer")
-        .def(py::init<int, int, int64_t, bool>(), py::arg("rank"),
-             py::arg("num_ranks"), py::arg("num_ep_buffer_bytes"),
-             py::arg("disable_p2p") = false)
+        .def(py::init<int, int, int64_t, bool, std::optional<int>>(),
+             py::arg("rank"), py::arg("num_ranks"),
+             py::arg("num_ep_buffer_bytes"), py::arg("disable_p2p") = false,
+             py::arg("num_qps_per_rank") = std::optional<int>{})
         .def("ibgda_disabled", &MooncakeEpBuffer::ibgda_disabled)
         .def("p2p_enabled", &MooncakeEpBuffer::p2p_enabled)
         .def("use_fast_path", &MooncakeEpBuffer::use_fast_path)
