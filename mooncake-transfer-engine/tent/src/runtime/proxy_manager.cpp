@@ -115,7 +115,16 @@ Status ProxyManager::deconstruct() {
     };
 
     flushPendingCleanups(false);
+    constexpr auto kShutdownDrainTimeout = std::chrono::seconds(30);
+    const auto drain_deadline =
+        std::chrono::steady_clock::now() + kShutdownDrainTimeout;
     while (has_pending_batches()) {
+        if (std::chrono::steady_clock::now() >= drain_deadline) {
+            LOG(WARNING) << "Timed out waiting for in-flight staging batches "
+                            "to reach a terminal state during shutdown; "
+                            "leaving the remaining cleanups pinned";
+            break;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
         flushPendingCleanups(false);
     }
@@ -129,6 +138,20 @@ Status ProxyManager::deconstruct() {
         has_pending_cleanups_.store(false, std::memory_order_relaxed);
     }
     for (auto& pending : remaining) {
+        if (!pending.batches.empty()) {
+            // The drain deadline above makes non-terminal batches reachable
+            // here; their transport workers may still complete and touch the
+            // remote stage buffers, so keep everything pinned (the deferred
+            // unpin path below assumes the batches already drained).
+            LOG(WARNING) << "Leaving " << pending.remote_addrs.size()
+                         << " remote stage buffers pinned because "
+                         << pending.remote_operations.size()
+                         << " remote staging requests and "
+                         << pending.batches.size()
+                         << " staging batches have not reached a confirmed "
+                            "terminal state";
+            continue;
+        }
         size_t deferred_remote_buffers = 0;
         for (auto& operation : pending.remote_operations) {
             if (!operation) continue;
