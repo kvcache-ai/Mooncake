@@ -1101,6 +1101,53 @@ TEST(ProxyManager, RemoteCleanupProbeDoesNotBlockOnPendingOperation) {
     EXPECT_TRUE(remote_operations.empty());
 }
 
+TEST(ProxyManager, UnconfirmedRemoteCompletionKeepsAbandonedBufferPinned) {
+    auto cleanup_calls = std::make_shared<std::atomic<int>>(0);
+    auto callback_done = std::make_shared<std::atomic<bool>>(false);
+    constexpr uint64_t kRemoteBuffer = 0x1234;
+
+    CoroRpcAgent stopped_server;
+    uint16_t port = 0;
+    ASSERT_TRUE(stopped_server.start(port).ok());
+    ASSERT_TRUE(stopped_server.stop().ok());
+    const std::string server_addr =
+        "127.0.0.1:" + std::to_string(static_cast<unsigned>(port));
+
+    auto operation = std::make_shared<internal::RemoteStageOperation>(
+        server_addr, kRemoteBuffer,
+        [cleanup_calls] {
+            cleanup_calls->fetch_add(1, std::memory_order_relaxed);
+        });
+    operation->abandonForCleanup();
+
+    Request request;
+    request.opcode = Request::WRITE;
+    request.source = reinterpret_cast<void*>(kRemoteBuffer);
+    request.target_id = LOCAL_SEGMENT_ID;
+    request.target_offset = kRemoteBuffer;
+    request.length = 1;
+    ControlClient::delegateAsync(
+        server_addr, request,
+        [operation, callback_done](Status status, auto... completion_info) {
+            operation->complete(std::move(status), completion_info...);
+            callback_done->store(true, std::memory_order_release);
+        });
+
+    const auto deadline =
+        std::chrono::steady_clock::now() + std::chrono::seconds(2);
+    while (!callback_done->load(std::memory_order_acquire) &&
+           std::chrono::steady_clock::now() < deadline) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    ASSERT_TRUE(callback_done->load(std::memory_order_acquire));
+    EXPECT_EQ(cleanup_calls->load(std::memory_order_acquire), 0);
+
+    std::vector<internal::RemoteStageOperationPtr> remote_operations = {
+        operation};
+    EXPECT_FALSE(internal::pollRemoteOperations(remote_operations));
+    EXPECT_EQ(remote_operations.size(), 1);
+}
+
 TEST(ProxyManager, LateRemoteCompletionReleasesAbandonedStageBuffer) {
     auto cfg = makeMinimalP2PConfig();
     TransferEngineImpl engine(cfg);
