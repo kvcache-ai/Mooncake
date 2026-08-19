@@ -5,7 +5,7 @@
 #include "offset_allocator/offset_allocator.h"
 #include "types.h"
 #include "master_service.h"
-#include "segment/segment_pool_view.h"
+#include "segment/pool_view.h"
 #include "utils/zstd_util.h"
 
 namespace mooncake {

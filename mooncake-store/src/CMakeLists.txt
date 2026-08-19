@@ -19,9 +19,9 @@ set(MOONCAKE_STORE_MASTER_SOURCES
     master_snapshot_manager.cpp
     master_snapshot_repository.cpp
     master_metric_manager.cpp
-    segment/segment_pool.cpp
-    segment/segment_pool_access.cpp
-    segment/segment_pool_view.cpp
+    segment/pool.cpp
+    segment/pool_access.cpp
+    segment/pool_view.cpp
     nof_segment_manager.cpp
     segment/region_driver.cpp
     segment/region_initial_state.cpp

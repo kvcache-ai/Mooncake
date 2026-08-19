@@ -14,9 +14,9 @@
 
 #include "ha/snapshot/allocator_snapshot_codec.h"
 #include "ha/snapshot/local_ssd_codec.h"
-#include "segment/segment_pool.h"
-#include "segment/segment_pool_access.h"
-#include "segment/segment_pool_view.h"
+#include "segment/pool.h"
+#include "segment/pool_access.h"
+#include "segment/pool_view.h"
 #include "serialize/serializer.h"
 #include "utils/zstd_util.h"
 

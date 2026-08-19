@@ -12,7 +12,7 @@
 
 #include "allocation_strategy.h"
 #include "segment/region_driver.h"
-#include "segment/segment_pool_types.h"
+#include "segment/pool_types.h"
 
 namespace mooncake {
 

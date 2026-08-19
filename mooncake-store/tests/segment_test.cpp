@@ -1,7 +1,7 @@
 #include "nof_segment_manager.h"
-#include "segment/segment_pool.h"
-#include "segment/segment_pool_access.h"
-#include "segment/segment_pool_view.h"
+#include "segment/pool.h"
+#include "segment/pool_access.h"
+#include "segment/pool_view.h"
 
 #include <gtest/gtest.h>
 

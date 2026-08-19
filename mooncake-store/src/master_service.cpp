@@ -28,8 +28,8 @@
 #include "master_metric_manager.h"
 #include "common.h"
 #include "environ.h"
-#include "segment/segment_pool_access.h"
-#include "segment/segment_pool_view.h"
+#include "segment/pool_access.h"
+#include "segment/pool_view.h"
 #ifdef USE_HTTP
 #include "transfer_metadata_plugin.h"
 #endif
