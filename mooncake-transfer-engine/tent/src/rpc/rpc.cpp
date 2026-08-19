@@ -243,6 +243,17 @@ Status CoroRpcAgent::call(const std::string& server_addr, int func_id,
     return status;
 }
 
+Status CoroRpcAgent::callOwned(const std::string& server_addr, int func_id,
+                               std::string request, std::string& response) {
+    auto [status, resp] = async_simple::coro::syncAwait(
+        callCoroutine(server_addr, func_id, std::move(request)));
+
+    if (status.ok()) {
+        response = std::move(resp);
+    }
+    return status;
+}
+
 void CoroRpcAgent::callAsync(const std::string& server_addr, int func_id,
                              const std::string& request,
                              AsyncCallback callback) {
